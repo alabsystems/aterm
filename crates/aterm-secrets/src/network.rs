@@ -58,92 +58,33 @@ pub fn default_route_of(
     interfaces: &[InterfaceAddress],
     hardware: Option<&[u8]>,
 ) -> String {
+    use std::fmt::Write as _;
+
     let name = interfaces
         .iter()
         .find(|address| address.address == IpAddr::V4(source))
         .map_or("-", |address| address.name.as_str());
-    let hardware = hardware.map_or_else(
-        || "-".to_owned(),
-        |hardware| {
-            hardware
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(":")
-        },
-    );
-    format!("{name} {source} {hardware}")
+    // IPv4's longest spelling takes 15 bytes; both separators and the exact hardware field
+    // fit beside it. Build the key in this buffer rather than materializing its components.
+    let hardware_len = hardware.map_or(1, |bytes| bytes.len().saturating_mul(3).saturating_sub(1));
+    let mut out = String::with_capacity(name.len().saturating_add(17).saturating_add(hardware_len));
+    let _ = write!(out, "{name} {source} ");
+    match hardware {
+        Some(bytes) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for (index, &byte) in bytes.iter().enumerate() {
+                if index != 0 {
+                    out.push(':');
+                }
+                out.push(char::from(HEX[usize::from(byte >> 4)]));
+                out.push(char::from(HEX[usize::from(byte & 0xf)]));
+            }
+        }
+        None => out.push('-'),
+    }
+    out
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn address(name: &str, address: IpAddr) -> InterfaceAddress {
-        InterfaceAddress {
-            name: name.into(),
-            address,
-            netmask: None,
-            flags: 0,
-        }
-    }
-
-    /// The default route's key moves with its interface, its address or its gateway (another
-    /// Wi-Fi network or LAN), and with nothing else: an AirDrop, `llw` or VPN address coming or
-    /// going, or a new temporary IPv6 address, leaves it as it was.
-    /// NEGATIVE CONTROL: a key of every interface address moves with each of those.
-    #[test]
-    fn the_default_route_moves_with_a_real_network_change_only() {
-        let source = Ipv4Addr::new(192, 168, 1, 20);
-        let wifi = address("en0", IpAddr::V4(source));
-        let gateway: &[u8] = &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-        let home = default_route_of(source, std::slice::from_ref(&wifi), Some(gateway));
-        assert_eq!(home, "en0 192.168.1.20 00:11:22:33:44:55");
-        let churned = [
-            wifi.clone(),
-            address("awdl0", "fe80::1".parse().unwrap()),
-            address("llw0", "fe80::2".parse().unwrap()),
-            address("utun4", IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7))),
-            address("en0", "2001:db8::abcd:1".parse().unwrap()),
-        ];
-        assert_eq!(default_route_of(source, &churned, Some(gateway)), home);
-        let other_router: &[u8] = &[0x00, 0x11, 0x22, 0x33, 0x44, 0x66];
-        assert_ne!(
-            default_route_of(source, std::slice::from_ref(&wifi), Some(other_router)),
-            home,
-            "another network numbered alike"
-        );
-        let wired = address("en7", IpAddr::V4(source));
-        assert_ne!(
-            default_route_of(source, &[wired], Some(gateway)),
-            home,
-            "the default route moved to another interface"
-        );
-        let renumbered = Ipv4Addr::new(192, 168, 1, 21);
-        assert_ne!(
-            default_route_of(
-                renumbered,
-                &[address("en0", IpAddr::V4(renumbered))],
-                Some(gateway)
-            ),
-            home
-        );
-        assert_eq!(
-            default_route_of(source, &[], None),
-            "- 192.168.1.20 -",
-            "a part not read yet"
-        );
-        assert!(route_known(&home));
-        assert!(
-            !route_known(&default_route_of(source, std::slice::from_ref(&wifi), None)),
-            "a gateway ARP has not resolved yet is an unknown reading, not a move"
-        );
-        assert_eq!(
-            route_place(&default_route_of(source, std::slice::from_ref(&wifi), None)).as_deref(),
-            Some("en0 192.168.1.20"),
-            "its interface and address are read all the same"
-        );
-        assert_eq!(route_place(&home).as_deref(), Some("en0 192.168.1.20"));
-        assert_eq!(route_place("- 192.168.1.20 -"), None, "no interface read");
-    }
-}
+#[path = "network_tests.rs"]
+mod tests;

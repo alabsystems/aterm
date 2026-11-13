@@ -145,25 +145,27 @@ fn an_unknown_compiler_row_remains_a_conservative_admission_estimate() {
 }
 
 #[test]
-fn serial_parent_keeps_driver_room_inside_the_measured_compiler_margin() {
+fn serial_parent_contains_every_private_claim_and_the_live_driver() {
     // Sweep physical-footprint peaks around every GiB rounding boundary. Neither
-    // a raw-peak claim nor a parent that forgets its driver satisfies this bound.
+    // a raw-peak claim nor a parent that spends its variability margin on the
+    // driver satisfies the nested-ledger bound.
     for gib in 1..=96 {
         for offset in [0, 1, GIB / 5, GIB - 1] {
             let peak = gib * GIB + offset;
             let claim = claim_bytes(peak);
             let parent = serial_parent_bytes(claim);
+            // NEGATIVE CONTROL: the historical raw peak and minimum margin fit.
             assert!(parent >= peak + DRIVER + FLOOR);
+            assert!(
+                parent >= claim.saturating_add(DRIVER),
+                "the private ledger can admit its whole {claim}-byte pool while the driver is live"
+            );
         }
     }
-    // The parent reserves 5/6 of the pool plus the driver and the floor, not the pool:
-    // 0.198.0 on m3 refused a 40 GiB parent on 39.7 GiB available, while the measured
-    // 32.92 GiB link needs 35.92 with them.
+    // A 40 GiB private pool and its one 2 GiB driver require 42 GiB. The 39.7 GiB
+    // observed on m3 cannot safely admit that plan.
     let m3 = serial_parent_bytes(40 * GIB);
-    assert!(
-        (3292 * GIB / 100 + DRIVER + FLOOR..37 * GIB).contains(&m3),
-        "{m3}"
-    );
+    assert_eq!(m3, 42 * GIB);
     // Concurrent smaller units must also leave the driver and floor, rather than
     // relying only on the final link's individual measurement.
     for left in 1..=32 {
@@ -171,27 +173,22 @@ fn serial_parent_keeps_driver_room_inside_the_measured_compiler_margin() {
             let p = left * GIB;
             let q = right * GIB + 1;
             let pool = claim_bytes(p) + claim_bytes(q);
-            assert!(serial_parent_bytes(pool) >= p + q + DRIVER + FLOOR);
+            assert!(serial_parent_bytes(pool) >= pool + DRIVER);
         }
     }
 }
 
 #[cfg(unix)]
 #[test]
-/// Real 0.198.0 cut, 2026-11-10: degraded on m3, the serial wrapper refused `aterm-durable`,
-/// `aterm-codec`, `aterm-hash` and `shlex`, which no earlier build had compiled under it, so a
-/// degraded cut failed on any new crate. An unmeasured unit now claims the whole private pool
-/// and compiles alone; known claims keep their size.
-fn serial_margin_admits_an_unmeasured_unit_alone_and_preserves_known_claims() {
+fn serial_parent_bounds_unknown_units_with_the_whole_private_claim() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let record = dir.path().join("units.json");
     let ledger_path = dir.path().join("ledger");
     let mut records = Records::default();
     records.push(key(NATIVE, &last_unit()), 33 * GIB, 1);
     records.save(&record).unwrap();
-    let mut units = Units::of(&record, &[NATIVE], 1, &ledger_path);
+    let units = Units::of(&record, &[NATIVE], 1, &ledger_path);
     let before = unit_need(NATIVE, &records, &last_unit(), 40 * GIB).mem;
-    use_serial_margin(&mut units);
     assert_eq!(before, 40 * GIB);
     assert_eq!(
         unit_need(NATIVE, &records, &last_unit(), 40 * GIB).mem,
@@ -207,37 +204,32 @@ fn serial_margin_admits_an_unmeasured_unit_alone_and_preserves_known_claims() {
         "lib",
     ]
     .map(OsString::from);
+    let unknown = unit("unmeasured", "unmeasured lib");
     assert_eq!(
-        unit_need(
-            NATIVE,
-            &records,
-            &unit("unmeasured", "unmeasured lib"),
-            40 * GIB
-        )
-        .mem,
-        40 * GIB,
-        "an unmeasured unit holds the whole private pool, so nothing compiles beside it"
+        unit_need(NATIVE, &records, &unknown, 40 * GIB).mem,
+        40 * GIB
     );
-    let status = wrap(
-        &args,
-        Some("unmeasured"),
-        &units[0],
-        Some((&ledger, &machine)),
-    )
-    .expect("the serial wrapper starts an unmeasured unit's compiler");
-    assert_eq!(status, 1, "the compiler ran: /usr/bin/false exits 1");
+    assert_eq!(
+        wrap(
+            &args,
+            Some("unmeasured"),
+            &units[0],
+            Some((&ledger, &machine)),
+        ),
+        Ok(1),
+        "the serial parent contains the whole private claim used by an unknown unit"
+    );
+    assert_eq!(
+        wrap(
+            &[OsString::from("/usr/bin/true")],
+            None,
+            &units[0],
+            Some((&ledger, &machine)),
+        ),
+        Ok(0),
+        "negative control: an unidentified compiler also holds the whole private claim"
+    );
     assert!(ledger.list().unwrap().is_empty());
-    let env = units[0].env(Path::new("wrapper"), dir.path());
-    assert!(
-        env.iter()
-            .any(|(name, value)| *name == DRIVER_IN_MARGIN && value == "1")
-    );
-    let compiler = compiler(&args).unwrap();
-    assert!(
-        compiler
-            .get_envs()
-            .any(|(name, value)| name == DRIVER_IN_MARGIN && value.is_none())
-    );
 }
 
 #[test]
@@ -287,7 +279,6 @@ fn compiler_and_metric_changes_keep_estimates_without_renaming_measurements() {
     let budget_ledger = dir.path().join("private-ledger");
     let units = Units::of(&record, &[NATIVE], 1, &budget_ledger);
     assert_eq!(units[0].budget_bytes(), Some(3 * GIB));
-    assert!(!slice_need(NATIVE, Some(&units[0])).alone);
     let prior = admission_peak(&records, NATIVE, &last_unit()).unwrap();
     assert_eq!(prior, 2 * GIB);
 
@@ -309,7 +300,6 @@ fn compiler_and_metric_changes_keep_estimates_without_renaming_measurements() {
         claiming.budget = Some(Budget {
             ledger: budget_ledger.clone(),
             bytes: MIN_BUDGET,
-            driver_in_margin: false,
         });
         let args = [
             "/usr/bin/true",
@@ -388,6 +378,33 @@ fn prior_compilers_provision_one_parent_while_empty_history_stays_serial() {
     let parent = shared_need(&units, 2).unwrap();
     assert_eq!(parent.mem, 44 * GIB);
 
+    let forecast_ledger = aterm_capacity::Ledger::at(dir.path().join("forecast-ledger"));
+    let mut reading = aterm_capacity::Reading::of_gib(96, 43, 28);
+    reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+    let forecast_machine = aterm_capacity::Fixed::new(reading.clone());
+    let forecast =
+        crate::buildplan::slice_memory_forecast_in(&forecast_ledger, &forecast_machine, &units)
+            .unwrap();
+    assert_eq!(
+        forecast.outcome,
+        crate::buildplan::SliceMemoryOutcome::Serial
+    );
+    assert!(forecast.line.contains("42 GiB parent, 43 GiB available"));
+    reading.available = Some(397 * GIB / 10);
+    forecast_machine.set(reading);
+    let forecast =
+        crate::buildplan::slice_memory_forecast_in(&forecast_ledger, &forecast_machine, &units)
+            .unwrap();
+    assert_eq!(
+        forecast.outcome,
+        crate::buildplan::SliceMemoryOutcome::Exclusive
+    );
+    assert!(forecast.line.contains("42 GiB parent is short too"));
+    assert!(
+        forecast_ledger.list().unwrap().is_empty(),
+        "a forecast retains no claim"
+    );
+
     let ledger = aterm_capacity::Ledger::at(dir.path().join("global-ledger"));
     let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 18));
     let available = 52 * GIB;
@@ -410,9 +427,20 @@ fn prior_compilers_provision_one_parent_while_empty_history_stays_serial() {
     incompatible.save(&record).unwrap();
     let cold = Units::of(&record, &[NATIVE, COMPAT], 2, &private);
     assert!(shared_need(&cold, 2).is_none());
+    assert!(cold_parent_need().alone);
+    let forecast =
+        crate::buildplan::slice_memory_forecast_in(&forecast_ledger, &forecast_machine, &cold)
+            .unwrap();
+    assert_eq!(
+        forecast.outcome,
+        crate::buildplan::SliceMemoryOutcome::Exclusive
+    );
     assert!(
-        cold.iter()
-            .all(|units| slice_need(units.triple(), Some(units)).alone)
+        forecast.line.contains("compiler-unit book is unmeasured")
+            && forecast.line.contains(COLD_PARENT)
+            && forecast
+                .line
+                .contains("holds it through both serial slices")
     );
 
     let mutant_drivers = [NATIVE, COMPAT]
@@ -537,7 +565,6 @@ fn wrapper_timeline_probe() {
         budget: (mode == "claim").then_some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
-            driver_in_margin: false,
         }),
     };
     let mut records = Records::default();
@@ -557,6 +584,14 @@ fn wrapper_timeline_probe() {
 
 /// The record the lock-root probe's wrapper admits against.
 const LOCK_ROOT_PROBE_RECORD: &str = "ATERM_SLICE_LOCK_ROOT_PROBE_RECORD";
+const LOCK_ROOT_PROBE_REPLY: &str = "ATERM_SLICE_LOCK_ROOT_PROBE_REPLY";
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum LockRootReply {
+    Ran(u8),
+    Refused(String),
+}
 
 #[cfg(unix)]
 #[test]
@@ -572,7 +607,6 @@ fn lock_root_probe() {
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
-            driver_in_margin: false,
         }),
     };
     let args = Vec::from(
@@ -588,10 +622,12 @@ fn lock_root_probe() {
     let ledger = aterm_capacity::Ledger::at(&ledger_path);
     let machine = BudgetMachine::new(SYNTHETIC_BUDGET);
     let admission = Some((&ledger, &machine as &dyn aterm_capacity::Machine));
-    println!(
-        "lock-root-probe={:?}",
-        wrap(&args, Some("fixture"), &units, admission)
-    );
+    let reply = std::env::var_os(LOCK_ROOT_PROBE_REPLY).expect("the parent names its reply");
+    let result = match wrap(&args, Some("fixture"), &units, admission) {
+        Ok(code) => LockRootReply::Ran(code),
+        Err(why) => LockRootReply::Refused(why),
+    };
+    std::fs::write(reply, aterm_json::to_vec(&result).unwrap()).unwrap();
 }
 
 /// A REGISTRY PACKAGE'S COMPILER IS ADMITTED UNDER ITS SLICE'S TOOLCHAIN. Cargo starts it in the
@@ -611,6 +647,11 @@ fn a_registry_packages_compiler_is_admitted_through_its_slices_named_root() {
     let registry = dir.path().join("registry-package");
     std::fs::create_dir(&registry).unwrap();
     let run = |root: Option<&Path>| {
+        let reply = dir.path().join(if root.is_some() {
+            "root.json"
+        } else {
+            "no-root.json"
+        });
         let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         command
             .current_dir(&registry)
@@ -620,20 +661,22 @@ fn a_registry_packages_compiler_is_admitted_through_its_slices_named_root() {
                 "--nocapture",
             ])
             .env(LOCK_ROOT_PROBE_RECORD, &record)
+            .env(LOCK_ROOT_PROBE_REPLY, &reply)
             .env_remove(ROOT);
         if let Some(root) = root {
             command.env(ROOT, root);
         }
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("lock-root-probe=").map(str::to_owned))
-            .unwrap()
+        aterm_json::from_slice::<LockRootReply>(&std::fs::read(reply).unwrap()).unwrap()
     };
-    assert_eq!(run(Some(&aterm_tempfile::manifest_dir())), "Ok(1)");
-    let refused = run(None);
+    assert_eq!(
+        run(Some(&aterm_tempfile::manifest_dir())),
+        LockRootReply::Ran(1)
+    );
+    let LockRootReply::Refused(refused) = run(None) else {
+        panic!("the missing root ran a compiler");
+    };
     assert!(
         refused.contains("no compatible footprint for the final link"),
         "NEGATIVE CONTROL: {refused}"
@@ -694,7 +737,6 @@ fn an_unidentified_non_query_compiler_claims_the_whole_private_budget() {
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
-            driver_in_margin: false,
         }),
     };
     let mut records = Records::default();
@@ -754,10 +796,12 @@ fn a_complete_record_builds_one_shared_unit_budget_and_parent() {
     let empty = Units::of(&record, &slices, 2, &ledger);
     assert_eq!(budgets(2), [None, None]);
     assert!(shared_need(&empty, 2).is_none());
-    assert!(slice_need(NATIVE, Some(&empty[0])).alone);
-    assert!(slice_need(COMPAT, Some(&empty[1])).alone);
-    assert!(slice_need(COMPAT, None).alone);
-    assert_eq!(slice_need(NATIVE, Some(&empty[0])).mem, DRIVER);
+    let cold = cold_parent_need();
+    assert_eq!(cold.what, COLD_PARENT);
+    assert_eq!(cold.rank, aterm_capacity::Rank::Release);
+    assert_eq!((cold.mem, cold.margin, cold.alone), (DRIVER, 1, true));
+    assert!(slice_need(COMPAT).alone);
+    assert_eq!(slice_need(NATIVE).mem, DRIVER);
     let wrapper = Path::new("/r/aterm-release");
     let root = Path::new("/private/take/snapshot/src");
     assert!(
@@ -787,9 +831,6 @@ fn a_complete_record_builds_one_shared_unit_budget_and_parent() {
     assert_eq!(budgets(1), [Some(COMPLETE_BUDGET), Some(COMPLETE_BUDGET)]);
     let both = Units::of(&record, &slices, 2, &ledger);
     assert!(both.iter().all(|units| units.budget_bytes().is_some()));
-    assert_eq!(slice_need(NATIVE, Some(&both[0])).mem, DRIVER);
-    assert_eq!(slice_need(COMPAT, Some(&both[1])).mem, DRIVER);
-    assert!(!slice_need(NATIVE, Some(&both[0])).alone);
     assert_eq!(DRIVER, 2 * GIB);
     let parent = shared_need(&both, 2).unwrap();
     assert_eq!(parent.what, "release slice memory budget");
@@ -976,6 +1017,263 @@ fn one_private_budget_serializes_links_and_allows_smaller_units() {
     assert!(ledger.list().unwrap().is_empty());
 }
 
+/// The production wrapper is killed after its compiler proves it is running. The real
+/// private ledger must reclaim the lock and the book must retain only its old measurements.
+#[cfg(unix)]
+#[test]
+fn sigkill_wrapper_reclaims_its_budget_without_learning_a_partial_peak() {
+    use std::time::Duration;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let record = dir.path().join("units.json");
+    let ledger_path = dir.path().join("budget");
+    let ready = dir.path().join("compiler.pid");
+    let mut records = Records::default();
+    records.push(key(NATIVE, &last_unit()), GIB, 1);
+    records.save(&record).unwrap();
+    let before = std::fs::read(&record).unwrap();
+    let units = Units::of(&record, &[NATIVE], 1, &ledger_path).remove(0);
+    let exe = aterm_tempfile::bin_exe("aterm-release");
+    let root = aterm_tempfile::manifest_dir();
+    let mut command = aterm_uds::spawnfd::command(&exe);
+    command
+        .envs(units.env(&exe, &root))
+        .env("CARGO_PKG_NAME", "fixture")
+        .args(["/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 600"])
+        .arg(&ready)
+        .args(["--crate-name", "fixture", "--crate-type", "lib"])
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let mut wrapper = command.spawn().unwrap();
+    let compiler =
+        aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+            std::fs::read_to_string(&ready)
+                .ok()?
+                .trim()
+                .parse::<i32>()
+                .ok()
+        })
+        .expect("compiler ran under its claim");
+    let ledger = aterm_capacity::Ledger::at(&ledger_path);
+    let machine = BudgetMachine::new(units.budget_bytes().unwrap());
+    let need = aterm_capacity::Need::new("next slice").mem(units.budget_bytes().unwrap());
+    assert!(
+        aterm_capacity::admit::try_admit_with(&ledger, &machine, need.clone())
+            .unwrap()
+            .is_none(),
+        "negative control: the live wrapper holds the whole pool"
+    );
+    let old_path = std::fs::read_dir(&ledger_path)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "claim"))
+        .unwrap();
+    let stale_offer = std::fs::File::open(&old_path).unwrap();
+    wrapper.kill().unwrap();
+    assert!(!wrapper.wait().unwrap().success());
+    let gone = aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+        matches!(
+            aterm_uds::process::process_presence(compiler),
+            aterm_uds::process::ProcessPresence::Exited
+                | aterm_uds::process::ProcessPresence::Absent
+        )
+        .then_some(())
+    });
+    if gone.is_none() {
+        crate::interrupt::send(compiler, crate::interrupt::SIGKILL);
+    }
+    assert!(
+        gone.is_some(),
+        "the killed wrapper left its compiler running"
+    );
+    assert!(
+        aterm_capacity::Claim::adopt(stale_offer.into(), &old_path).is_err(),
+        "a reopened dead holder's file is no transferable claim"
+    );
+    let next = aterm_capacity::admit::try_admit_with(&ledger, &machine, need)
+        .unwrap()
+        .expect("next slice admits");
+    assert_eq!(
+        ledger.list().unwrap().len(),
+        1,
+        "only the new holder, never the dead wrapper"
+    );
+    drop(next);
+    assert!(ledger.list().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(&record).unwrap(),
+        before,
+        "a killed unit teaches no peak"
+    );
+}
+
+/// Real Cargo and rustc reach an external linker that handshakes before it blocks. Kill
+/// either the actual wrapper or Cargo at that point, then reuse the book and private ledger.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn real_cargo_and_rustc_recover_from_sigkill_at_the_linker() {
+    use aterm_uds::spawnfd::{Stdio, Tether as _};
+    use std::time::Duration;
+    let cutter_root = std::env::var_os("ATERM_RELEASE_REAL_CUTTER_ROOT").map(PathBuf::from);
+    for kill_wrapper in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = cutter_root.as_deref().unwrap_or_else(|| dir.path());
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"aterm\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let record = root.join("units.json");
+        let mut records = Records::default();
+        records.push(key(NATIVE, &last_unit()), GIB, 1);
+        records.save(&record).unwrap();
+        let before = std::fs::read(&record).unwrap();
+        let ledger_path = root.join("ledger");
+        let units = Units::of(&record, &[NATIVE], 1, &ledger_path).remove(0);
+        let exe = aterm_tempfile::bin_exe("aterm-release");
+        aterm_uds::tether::through(exe.clone());
+        let toolchain = crate::gates::trust_stage2_bin().unwrap();
+        let ready = root.join("linker.pid");
+        let log = std::fs::File::create(root.join("cargo.log")).unwrap();
+        let mut command = aterm_uds::spawnfd::command(toolchain.join("targo"));
+        command
+            .current_dir(root)
+            .process_group(0)
+            .tether()
+            .args(["--unverified", "rustc", "--offline", "--manifest-path"])
+            .arg(root.join("Cargo.toml"))
+            .args(["--", "-C"])
+            .arg(format!("linker={}", exe.display()))
+            .envs(units.env(&exe, &aterm_tempfile::manifest_dir()))
+            .env("ATERM_RELEASE_TEST_LINKER_READY", &ready)
+            .env("CARGO_TARGET_DIR", root.join("build.noindex"))
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("RUSTC", toolchain.join("trustc"))
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .stdin(Stdio::null());
+        let mut cargo = crate::interrupt::GroupChild::spawn(&mut command).unwrap();
+        std::fs::write(root.join("cargo.pid"), cargo.id().to_string()).unwrap();
+        if cutter_root.is_some() {
+            cargo.drain().unwrap();
+            let _ = cargo.wait();
+            return;
+        }
+        let reached =
+            aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+                std::fs::read_to_string(&ready).ok()?.parse::<i32>().ok()
+            });
+        let Some(linker) = reached else {
+            let _ = cargo.kill();
+            let _ = cargo.wait();
+            panic!(
+                "real rustc never reached the linker: {}",
+                std::fs::read_to_string(root.join("cargo.log")).unwrap()
+            );
+        };
+        let ledger = aterm_capacity::Ledger::at(&ledger_path);
+        let claims = ledger.list().unwrap();
+        assert_eq!(claims.len(), 1);
+        let wrapper = claims[0].pid;
+        if kill_wrapper {
+            crate::interrupt::send(wrapper.cast_signed(), crate::interrupt::SIGKILL);
+        } else {
+            cargo.kill().unwrap();
+        }
+        cargo.drain().unwrap();
+        assert!(!cargo.wait().unwrap().success());
+        let gone =
+            aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+                matches!(
+                    aterm_uds::process::process_presence(linker),
+                    aterm_uds::process::ProcessPresence::Exited
+                        | aterm_uds::process::ProcessPresence::Absent
+                )
+                .then_some(())
+            });
+        if gone.is_none() {
+            crate::interrupt::send(linker, crate::interrupt::SIGKILL);
+        }
+        assert!(gone.is_some(), "killed wrapper/driver left a live linker");
+        assert_eq!(std::fs::read(&record).unwrap(), before);
+        let machine = BudgetMachine::new(units.budget_bytes().unwrap());
+        let next = aterm_capacity::admit::try_admit_with(
+            &ledger,
+            &machine,
+            aterm_capacity::Need::new("next release link").mem(units.budget_bytes().unwrap()),
+        )
+        .unwrap()
+        .expect("the same ledger admits the next link");
+        drop(next);
+        assert!(ledger.list().unwrap().is_empty());
+    }
+}
+
+/// Kill the supervisor itself while real Cargo/rustc are at the linker, so no Drop or
+/// in-process signal forwarder can repair the run. Only the production tethers remain.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn real_cutter_sigkill_at_link_reclaims_the_next_runs_ledger() {
+    use std::time::Duration;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "slice_units::tests::real_cargo_and_rustc_recover_from_sigkill_at_the_linker",
+        "--nocapture",
+    ])
+    .env("ATERM_RELEASE_REAL_CUTTER_ROOT", root)
+    .stdout(aterm_uds::spawnfd::Stdio::null());
+    let mut cutter = cmd.spawn().unwrap();
+    let linker =
+        aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+            std::fs::read_to_string(root.join("linker.pid"))
+                .ok()?
+                .parse::<i32>()
+                .ok()
+        })
+        .expect("real cutter reached link");
+    let before = std::fs::read(root.join("units.json")).unwrap();
+    let ledger_path = root.join("ledger");
+    let ledger = aterm_capacity::Ledger::at(&ledger_path);
+    let wrapper = ledger.list().unwrap()[0].pid.cast_signed();
+    let cargo = std::fs::read_to_string(root.join("cargo.pid"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    cutter.kill().unwrap();
+    assert!(!cutter.wait().unwrap().success());
+    for pid in [cargo, wrapper, linker] {
+        let gone =
+            aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+                matches!(
+                    aterm_uds::process::process_presence(pid),
+                    aterm_uds::process::ProcessPresence::Exited
+                        | aterm_uds::process::ProcessPresence::Absent
+                )
+                .then_some(())
+            });
+        if gone.is_none() {
+            crate::interrupt::send(pid, crate::interrupt::SIGKILL);
+        }
+        assert!(gone.is_some(), "the dead cutter left process {pid}");
+    }
+    assert!(ledger.list().unwrap().is_empty());
+    assert_eq!(std::fs::read(root.join("units.json")).unwrap(), before);
+    let units = Units::of(&root.join("units.json"), &[NATIVE], 1, &ledger_path).remove(0);
+    let machine = BudgetMachine::new(units.budget_bytes().unwrap());
+    let next = aterm_capacity::admit::try_admit_with(
+        &ledger,
+        &machine,
+        aterm_capacity::Need::new("next cut").mem(units.budget_bytes().unwrap()),
+    )
+    .unwrap()
+    .unwrap();
+    drop(next);
+}
+
 /// THE COMPILER SEES THE RELEASE'S ENVIRONMENT: the wrapper starts it with Cargo's words,
 /// verbatim, and removes its own variables and `RUSTC_WRAPPER`, which a compiler's build would
 /// otherwise inherit. NEGATIVE CONTROL: no other variable is touched (Cargo's `CARGO_PKG_NAME`
@@ -1000,7 +1298,6 @@ fn the_wrapper_starts_the_compiler_with_the_releases_environment() {
         .collect();
     touched.sort();
     let mut removed: Vec<(String, bool)> = [
-        DRIVER_IN_MARGIN,
         BUDGET_BYTES,
         BUDGET_LEDGER,
         WRAPPER,
@@ -1072,7 +1369,6 @@ fn the_wrapper_runs_each_compiler_under_its_claim_and_keeps_a_finished_ones_peak
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: COMPLETE_BUDGET,
-            driver_in_margin: false,
         }),
     };
     let ledger = aterm_capacity::Ledger::at(&ledger_path);

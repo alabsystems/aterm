@@ -22,9 +22,12 @@ fn keyer(_realm: &str, email: &str) -> Option<String> {
 fn roster() -> Roster {
     Roster::parse_for(
         accounts::Cli::Claude,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n\n\
-         [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/work\"\n\
-         email = \"work@example.com\"\n",
+        at!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"",
+            "/logins/work",
+            "\"\nemail = \"work@example.com\"\n"
+        ),
     )
     .expect("the roster")
 }
@@ -60,11 +63,11 @@ fn a_process_is_on_the_token_only_by_the_descriptor_and_the_marker_together() {
         let full = [
             (DESCRIPTOR_ENV, "3"),
             (MARKER_ENV, WORK),
-            (accounts::LOGIN_ENV, "/logins/work"),
+            (accounts::LOGIN_ENV, at!("/logins/work")),
         ];
         let who = of(&full);
         assert_eq!(who.route, token(WORK), "the full token shape");
-        assert_eq!(who.login.as_deref(), Some("/logins/work"));
+        assert_eq!(who.login.as_deref(), Some(at!("/logins/work")));
         assert_eq!(who.me(&r).route, token(WORK));
         assert_eq!(accounts::judged_label(&r, &who), Some("work"));
 
@@ -104,7 +107,7 @@ fn a_process_is_on_the_token_only_by_the_descriptor_and_the_marker_together() {
         let foreign = of(&[
             (DESCRIPTOR_ENV, "3"),
             (MARKER_ENV, MAIN),
-            (accounts::LOGIN_ENV, "/logins/work"),
+            (accounts::LOGIN_ENV, at!("/logins/work")),
         ]);
         assert_eq!(
             foreign.route,
@@ -306,7 +309,7 @@ fn the_judgment_runs_its_steps_in_order() {
 /// tapped launches read `shape`.
 #[test]
 fn only_session_starting_shapes_are_served() {
-    let tap = crate::harness::tap::settings_value(Path::new("/opt/aterm/bin/aterm"))
+    let tap = crate::harness::tap::settings_value(Path::new(at!("/opt/aterm/bin/aterm")))
         .expect("a tap value");
     for typed in [
         &["claude", "mcp", "list"][..],
@@ -438,7 +441,7 @@ fn the_account_is_the_one_the_launchs_login_resolves() {
             account_of(&stored(None), Some(&r), Named::Auto, &none, &nothing).unwrap();
         assert_eq!(account.named(), "main");
         assert_eq!(found, Some(entry(MAIN)));
-        let work = stored(Some("/logins/work"));
+        let work = stored(Some(at!("/logins/work")));
         assert!(account_of(&work, Some(&r), Named::Label("work"), &none, &nothing).is_ok());
         assert!(
             account_of(
@@ -456,7 +459,7 @@ fn the_account_is_the_one_the_launchs_login_resolves() {
         // A row-less login: the login record names the account.
         let record = |_: Option<&str>| Some("work@example.com".to_owned());
         let (account, found) = account_of(
-            &stored(Some("/logins/elsewhere")),
+            &stored(Some(at!("/logins/elsewhere"))),
             Some(&r),
             Named::Auto,
             &record,
@@ -601,21 +604,21 @@ fn a_running_sessions_account_is_its_logins_row_or_its_records() {
         assert_eq!(account.named(), "main");
         assert_eq!(found, entry(MAIN));
         let (account, found) =
-            session_account(&who(Some("/logins/work")), Some(&r), None).expect("work");
+            session_account(&who(Some(at!("/logins/work"))), Some(&r), None).expect("work");
         assert_eq!(account.named(), "work");
         assert_eq!(found, entry(WORK));
         let (account, found) = session_account(
-            &who(Some("/logins/elsewhere")),
+            &who(Some(at!("/logins/elsewhere"))),
             Some(&r),
             Some("work@example.com".to_owned()),
         )
         .expect("the record's account");
         assert_eq!(account.label, None);
         assert_eq!(found, entry(WORK));
-        assert!(session_account(&who(Some("/logins/elsewhere")), Some(&r), None).is_none());
+        assert!(session_account(&who(Some(at!("/logins/elsewhere"))), Some(&r), None).is_none());
         assert!(
             session_account(
-                &who(Some("/logins/elsewhere")),
+                &who(Some(at!("/logins/elsewhere"))),
                 None,
                 Some("nobody@example.com".to_owned())
             )

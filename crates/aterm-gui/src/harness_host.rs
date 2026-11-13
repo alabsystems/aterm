@@ -18,7 +18,7 @@ use aterm_agent::harness::accounts;
 
 #[cfg(target_os = "macos")]
 use aterm_agent::harness::disk::maintenance as cache_maintenance;
-mod progress;
+pub(crate) mod progress;
 use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
 use aterm_agent::harness::agent_image;
@@ -43,7 +43,7 @@ use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
 use aterm_agent::harness::witness::{self, RouteKey, Target};
 use aterm_agent::supervise::memory::AgentMemory;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, AccountBad, AccountPoint, AskAgain, HeldBy, Reach, Ready,
+    AccountAdvice, AccountAt, AccountBad, AccountPoint, AskAgain, HeldBy, LoginSeen, Reach, Ready,
     RestartAnswer, RestartAsk, RestartClaim, RosterWord, RouteTo, SignInNext,
 };
 use aterm_agent::supervise::policy::{
@@ -622,6 +622,9 @@ struct RestoredAttempt {
     agent_seen: bool,
     carried: bool,
     landed: bool,
+    /// Its step landed and no look at its agent has come back yet ([`LandingLook::Out`]): its
+    /// next steps are looks, and nothing yet says an agent holds its tab.
+    looking: bool,
     faults: u32,
     in_flight_only: bool,
     /// This relaunch's use of its account ([`ColdUse`]).
@@ -631,7 +634,7 @@ struct RestoredAttempt {
 impl RestoredAttempt {
     /// Whether this relaunch has typed its line.
     const fn typed(&self) -> bool {
-        self.resume_wait_since.is_some() || self.landed
+        self.resume_wait_since.is_some() || self.landed || self.looking
     }
 }
 
@@ -813,7 +816,7 @@ thread_local! {
     static PHASE_RINGS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-fn ring_bell() {
+pub(crate) fn ring_bell() {
     let mut rung = BELL.rung.lock().unwrap_or_else(PoisonError::into_inner);
     *rung = rung.wrapping_add(1);
     drop(rung);
@@ -1029,8 +1032,11 @@ fn cleanup_request(args: &[&str]) -> bool {
 
 const STOPPED: &str = "the supervisor was stopped";
 
+type ContinuationReporter = Arc<dyn Fn(&str, Option<u64>) + Send + Sync>;
+
 /// [`RelayCtl`] to this instance's own socket.
 pub(crate) struct HostCtl {
+    continuation: Option<ContinuationReporter>,
     endpoint: Endpoint,
     token: Option<String>,
     /// `token` is the harness's in-memory one ([`Self::as_harness`]).
@@ -1094,6 +1100,7 @@ impl HostCtl {
     /// [`Self::new`] with the token given up front (the tests' scratch servers).
     fn with_token(endpoint: Endpoint, token: Option<String>) -> Self {
         Self {
+            continuation: None,
             inner: RelayCtl::new(endpoint.clone(), token.clone()),
             endpoint,
             token,
@@ -1230,6 +1237,11 @@ fn duty_denied() -> CtlReply {
 }
 
 impl Ctl for HostCtl {
+    fn continuation_activity(&mut self, reason: &str, wait_ms: Option<u64>) {
+        if let Some(report) = &self.continuation {
+            report(reason, wait_ms);
+        }
+    }
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         self.call_checked(args, None)
     }
@@ -2677,6 +2689,8 @@ type StepFn = dyn Fn(&str, u32, upgrade_drive::Tell) -> String + Send + Sync;
 type ResumeFn = dyn Fn(&str, u32, CarryPoint) -> String + Send + Sync;
 /// That carry-on settled with nothing typed where the agent rests at a point its loop withheld from the host ([`Acts::settle`]).
 type SettleFn = dyn Fn(&str) -> String + Send + Sync;
+/// Tab `sid`'s looks past their clock, closed with nothing typed ([`Acts::close_looks`]): the close's word, `None` where nothing closed.
+type CloseLooksFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 /// What a relaunched agent's owed carry-on is told at the tab's idle point ([`Acts::resume`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3652,6 +3666,10 @@ pub(crate) struct Acts {
     pub(crate) resume: Arc<ResumeFn>,
     /// The carry-on [`Self::owed`] names, settled with nothing typed where the agent rests at a point the tab's loop withheld from this host.
     pub(crate) settle: Arc<SettleFn>,
+    /// A restart's looks past their clock, closed at an idle point where no upgrade step runs to
+    /// close them ([`WorkerIdle::idle_step`], live [`upgrade_drive::close_looks`]): it records and
+    /// types nothing.
+    pub(crate) close_looks: Arc<CloseLooksFn>,
     /// The disk resume ([`WorkerIdle::at_idle`]).
     pub(crate) disk_resume: Arc<DiskResumeFn>,
     /// The ask to free disk space ([`WorkerIdle::at_idle`], `harness_disk_ask.rs`).
@@ -4362,6 +4380,21 @@ const fn limit_read_without_session(agent: Program) -> bool {
     }
 }
 
+/// Whether `agent`'s account is known by observation alone: no pool keeps its logins, so its
+/// login store's account is recorded as observed
+/// ([`aterm_agent::harness::observed_account`]): Muse Code's.
+pub(crate) const fn observed_account_only(agent: Program) -> bool {
+    match agent {
+        Program::Muse => true,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Generic => false,
+    }
+}
+
 /// The pooled CLI whose roster and store a session of `agent` reads its accounts from
 /// (`accounts.toml` for Claude Code, `accounts-<cli>.toml` for Codex, Grok Build and Kimi Code):
 /// what its Account fact, menu and a11y node name. A program no pool keeps is `None`. Whether
@@ -4647,7 +4680,21 @@ fn host_wake(note: &Mutex<Option<Owed>>) -> Option<Instant> {
 /// One worker's upgrade, between its steps.
 #[derive(Default)]
 struct UpgradeRun {
+    /// The round's bounded waits ([`upgrade_drive::bounded_wait_as`]) since its last act or word,
+    /// a turn between them or not, save a quiet round's settle ([`Self::settles_here`]).
     waits: u32,
+    /// The bounded waits at this point alone, the quiet settle's among them: started over by a
+    /// turn ([`Self::new_point`]), it bounds the quiet settle's hold on the turn end.
+    point_waits: u32,
+    /// The turn ends this round's quiet settle has held, a turn between them or not
+    /// ([`upgrade_drive::quiet_settle_owned`]).
+    held_points: u32,
+    /// Whether this point is one of them: started over by a turn.
+    point_held: bool,
+    /// Whether the hold on the turn end that stands now is a quiet round's wait at a turn end
+    /// ([`Self::waits_at_turn_end`]), which a look whose read failed lets go, a turn between them
+    /// or not.
+    quiet_holds: bool,
     attended: u32,
     same: u32,
     last: String,
@@ -4665,6 +4712,9 @@ const UNKNOWN_WORDS_WARNED: usize = 8;
 impl UpgradeRun {
     /// Whether the step that said `step` leaves the upgrade owning the session's turn ends ([`upgrade_drive::owns_turn_ends_as`], under [`Self::quiet`]).
     fn owns(&self, step: &str, grace_s: u32) -> bool {
+        if self.settles_here(step) {
+            return self.settle_owned();
+        }
         let looks = if upgrade_drive::attended(step) {
             self.attended
         } else if upgrade_drive::refused(step) {
@@ -4673,6 +4723,39 @@ impl UpgradeRun {
             self.waits
         };
         upgrade_drive::owns_turn_ends_as(step, looks, grace_s, self.quiet)
+    }
+
+    /// Whether `step` is a quiet round's settle (`wait:settling` under [`Self::quiet`]): the
+    /// session at an idle point with its status idle, nothing of its own running, nobody at it, no
+    /// wall, box or draft, and only the settle's clock left. An Autopilot types its continuation at
+    /// once at a turn end nothing holds, so the settle could never run out at a turn end the round
+    /// no longer holds. Its hold has bounds of its own ([`Self::settle_owned`]); what an agent's
+    /// own wake renews at every turn (`wait:not-idle`, `wait:status-stale`, `wait:busy`, and the
+    /// ask flow's drain after its READY) keeps the round's bound ([`Self::waits`]).
+    fn settles_here(&self, step: &str) -> bool {
+        self.quiet && step == "wait:settling"
+    }
+
+    /// Whether `step` is a quiet round's wait on the session's own state at a turn end
+    /// (`wait:settling`, `wait:not-idle`, `wait:busy`, `wait:status-stale` under [`Self::quiet`]).
+    /// The quiet flow asked the agent nothing, so its hold on the turn end only keeps the turn end
+    /// for the round's own next step. A look whose read failed takes no step, so it lets that hold
+    /// go: kept, the hold would withhold the Autopilot's continuation for as long as the read
+    /// fails. The ask flow's holds stand there: a READY'd session waits on the restart it agreed
+    /// to.
+    fn waits_at_turn_end(&self, step: &str) -> bool {
+        self.quiet
+            && matches!(
+                step,
+                "wait:settling" | "wait:not-idle" | "wait:busy" | "wait:status-stale"
+            )
+    }
+
+    /// Whether a quiet settle's look now owns the turn end ([`upgrade_drive::quiet_settle_owned`]):
+    /// [`upgrade_drive::OWNED_SETTLE_LOOKS`] looks at each point ([`Self::point_waits`]), and
+    /// [`upgrade_drive::QUIET_SETTLE_POINTS`] points a round ([`Self::held_points`]).
+    fn settle_owned(&self) -> bool {
+        upgrade_drive::quiet_settle_owned(self.point_waits, self.held_points, self.point_held)
     }
 
     /// Whether `step` is the same person's hold as the step before it at this point (`wait:attended` again, no turn between).
@@ -4704,10 +4787,13 @@ impl UpgradeRun {
         } else {
             0
         };
+        let settle = self.settles_here(step).then(|| self.settle_owned());
         let after = if attended {
             upgrade_drive::after_attended(self.attended, self.same, grace_s)
         } else if upgrade_drive::refused(step) {
             upgrade_drive::after_refused(self.refused, self.same)
+        } else if let Some(owned) = settle {
+            upgrade_drive::after_quiet_settle(owned, self.same)
         } else {
             upgrade_drive::after(step, self.same)
         };
@@ -4725,49 +4811,60 @@ impl UpgradeRun {
             if upgrade_drive::refused(step) {
                 self.refused = self.refused.saturating_add(1);
             } else if upgrade_drive::bounded_wait_as(step, self.quiet) {
-                self.waits = self.waits.saturating_add(1);
+                match settle {
+                    None => self.waits = self.waits.saturating_add(1),
+                    Some(true) if !self.point_held => {
+                        self.point_held = true;
+                        self.held_points = self.held_points.saturating_add(1);
+                    }
+                    Some(_) => {}
+                }
+                self.point_waits = self.point_waits.saturating_add(1);
             }
             self.same = self.same.saturating_add(1);
             step.clone_into(&mut self.last);
         } else {
-            self.waits = 0;
-            self.refused = 0;
-            self.same = 0;
-            self.last.clear();
+            self.round_over();
         }
         after
     }
 
-    /// An act of the upgrade's at a break of the agent's own background work ([`WorkerIdle::at_background`]: a notice, a release, a give-up, a re-arm).
-    fn acted(&mut self) {
+    /// The round's counts start over: an act, a word, or a step that is no wait.
+    fn round_over(&mut self) {
         self.waits = 0;
+        self.point_waits = 0;
+        self.held_points = 0;
+        self.point_held = false;
         self.refused = 0;
         self.same = 0;
         self.last.clear();
+    }
+
+    /// An act of the upgrade's at a break of the agent's own background work ([`WorkerIdle::at_background`]: a notice, a release, a give-up, a re-arm).
+    fn acted(&mut self) {
+        self.round_over();
         self.attended = 0;
     }
 
     /// A word since the last step.
     fn worded(&mut self) {
-        self.waits = 0;
-        self.refused = 0;
-        self.same = 0;
-        self.last.clear();
+        self.round_over();
     }
 
-    /// A turn ran since the last look.
+    /// A turn ran since the last look: the ladder and the point's own waits start over; the
+    /// round's bounds on its waits and on the turn ends its quiet settle holds do not
+    /// ([`Self::settle_owned`]).
     fn new_point(&mut self) {
         self.same = 0;
         self.last.clear();
         self.attended = 0;
+        self.point_waits = 0;
+        self.point_held = false;
     }
 
     /// Nothing to step: every count starts over.
     fn reset(&mut self) {
-        self.waits = 0;
-        self.refused = 0;
-        self.same = 0;
-        self.last.clear();
+        self.round_over();
         self.attended = 0;
         self.unread = 0;
     }
@@ -5930,6 +6027,14 @@ impl IdleHost for WorkerIdle {
         }
         let tell = self.upgrade_tell(point);
         let step = self.act(|| (hooks.acts.notice)(&self.sid, self.grace, tell));
+        // A break's sweep closes a look past its clock, and one whose restore line is lost says
+        // so as the step's whole word: recorded as at an idle point.
+        if step == "done:lost" {
+            (hooks.note)(HostNote::Relaunch {
+                sid: self.sid.clone(),
+                said: RelaunchSay::NotRestored,
+            });
+        }
         if !self.on() {
             return None;
         }
@@ -5945,6 +6050,11 @@ impl IdleHost for WorkerIdle {
         }
         let kind = upgrade_drive::host_turn(&step)?;
         if step.starts_with("announced:") {
+            // The announcement's hold, which no unread look lets go ([`UpgradeRun::quiet_holds`]).
+            self.run
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .quiet_holds = false;
             self.owns.store(true, Ordering::SeqCst);
         }
         Some((format!("upgrade step={step}"), kind))
@@ -6001,6 +6111,21 @@ impl IdleHost for WorkerIdle {
     /// Whether a built-in lane or a scoped Kimi harness can restart this agent, and `[harness] relaunch` allows it.
     fn can_restart(&self) -> bool {
         (self.relaunch_lane() || self.scoped_kimi()) && self.switches.relaunch()
+    }
+
+    /// What the agent's own launch says of its model: the argv of the kept snapshot while its agent
+    /// holds the tab ([`Self::kept_in_tab`]), only for a Claude Code this host relaunches; `Unread`
+    /// for any other, so no other agent is ever moved off a model's limit.
+    fn launch_model(&self) -> aterm_agent::supervise::policy::turn_end::LaunchModel {
+        use aterm_agent::supervise::policy::turn_end::LaunchModel;
+        if !aterm_agent::supervise::policy::turn_end::has_fable_fallback(self.agent)
+            || !relaunches(self.agent)
+        {
+            return LaunchModel::Unread;
+        }
+        self.kept_in_tab()
+            .filter(|snap| matches!(snap.run, relaunch::AgentRun::Claude))
+            .map_or(LaunchModel::Unread, |snap| LaunchModel::of_argv(&snap.argv))
     }
 
     /// The restart in place its loop asks for ([`Restart`]), as `ask` ([`RestartAsk`], which the
@@ -6554,6 +6679,25 @@ impl IdleHost for WorkerIdle {
             },
             Lasting::Wall { wire } => crate::disk_board::Withhold::Wall { wire },
         });
+        // Muse Code alone keeps its account by the login its own store names; the pooled CLIs'
+        // sign-in walls reach their rows through the accounts' own upkeep.
+        let records_its_wall = match self.agent {
+            Program::Muse => true,
+            Program::Claude
+            | Program::Codex
+            | Program::Agy
+            | Program::Grok
+            | Program::Kimi
+            | Program::Generic => false,
+        };
+        if records_its_wall
+            && hold
+                == Some(Lasting::Wall {
+                    wire: aterm_phase::WallKind::Auth.wire(),
+                })
+        {
+            self.note_muse_wall();
+        }
         disk_ask_withheld(self.hooks.acts.disk_board, &self.sid, withhold);
     }
 
@@ -6912,6 +7056,15 @@ impl IdleHost for WorkerIdle {
     /// The account this session moved to answered with a lost login or a usage limit ([`IdleHost::account_answered`]).
     fn account_answered(&self, bad: AccountBad) {
         account_answered(self, bad);
+    }
+
+    /// What the session's own point shows of its login ([`IdleHost::login_seen`]).
+    fn login_seen(&self, seen: LoginSeen) {
+        match accounts::Cli::of(self.agent) {
+            Some(accounts::Cli::Claude) => self.claude_login_seen(seen),
+            Some(cli) => self.pool_login_seen(cli, seen),
+            None => {}
+        }
     }
 
     /// News of the accounts since the host started ([`IdleHost::account_stamp`]; [`Switches::accounts_news`]).
@@ -7355,6 +7508,169 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
 }
 
 impl WorkerIdle {
+    /// A pooled CLI's own sign-in wall or served turn, recorded on the row its process runs on
+    /// ([`accounts_pool::session_seen`]): for every pool, whatever its switches say and
+    /// whoever answers its walls, and nothing is renewed, moved or asked for it.
+    fn pool_login_seen(&self, cli: accounts::Cli, seen: LoginSeen) {
+        let Some(seat) = (self.hooks.acts.account_seat)() else {
+            return;
+        };
+        let Some(config_dir) = seat.roster.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let scoped = (cli == accounts::Cli::Kimi)
+            .then(|| (self.hooks.acts.scoped)(&self.sid))
+            .flatten();
+        let (env, snap) = if let Some(scoped) = &scoped {
+            if restart_stamp::kernel_start(scoped.proven.pid).as_deref()
+                != Some(scoped.proven.start.as_str())
+            {
+                return;
+            }
+            let Some(args) = atpkg::caller_shell::process_args(scoped.proven.pid) else {
+                return;
+            };
+            (args.env, None)
+        } else {
+            let Some(snap) = with_kept_of(&self.kept, |k| k.snapshot.clone()) else {
+                return;
+            };
+            let Some(env) = (self.hooks.acts.account_env)(&snap).filter(|env| !env.is_empty())
+            else {
+                return;
+            };
+            (env, Some(snap))
+        };
+        // The environment is this process's only while it is still the tab's agent.
+        let current = match (&scoped, &snap) {
+            (Some(scoped), _) => (self.hooks.acts.scoped)(&self.sid).as_ref() == Some(scoped),
+            (None, Some(snap)) => with_kept_of(&self.kept, |k| {
+                k.snapshot
+                    .as_ref()
+                    .is_some_and(|now| account_process_matches(now, snap))
+            }),
+            (None, None) => false,
+        };
+        if !current {
+            return;
+        }
+        let pairs = env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .collect::<Vec<_>>();
+        let (point, what) = match seen {
+            LoginSeen::Lost => (accounts::Point::LoginEnded, accounts_pool::LoginSeen::Lost),
+            LoginSeen::Served => (accounts::Point::TurnEnd, accounts_pool::LoginSeen::Served),
+        };
+        let done = accounts_pool::session_seen(
+            &accounts_pool::Seat {
+                config_dir,
+                state: &seat.state,
+                home: &seat.home,
+                now: seat.now,
+            },
+            &accounts_pool::Session {
+                cli,
+                sid: &self.sid,
+                supervisor: accounts::Supervisor::Aterm,
+                env: &pairs,
+                // The fact is the believed row's; the pool writer proves it under its lock.
+                seen: &aterm_agent::harness::observe::Observation::Unread,
+                sample: None,
+                point,
+                mode: self.switches.pool_controls(cli).mode,
+                relaunch: (),
+            },
+            what,
+        );
+        match done {
+            Ok(true) => aterm_log::info!(
+                "harness @{}: {} login {}: recorded",
+                self.sid,
+                self.agent.name(),
+                login_seen_word(seen)
+            ),
+            Ok(false) => {}
+            Err(why) => aterm_log::info!(
+                "harness @{}: {} login {}: not recorded: {why}",
+                self.sid,
+                self.agent.name(),
+                login_seen_word(seen)
+            ),
+        }
+    }
+
+    /// Claude Code's own sign-in wall or served turn, recorded on the row whose stored login
+    /// its process holds: with or without an email, a renewal route, `logins` or `accounts`
+    /// on. The renewal lifecycle keeps its own asks ([`Self::login_ended`],
+    /// [`Self::login_served`]); this starts none. A session the token wrapper served marks
+    /// its token refused instead ([`token_refused_at`]), and a process on a login a renewal
+    /// replaced says nothing of the renewed one.
+    fn claude_login_seen(&self, seen: LoginSeen) {
+        let Some(seat) = (self.hooks.acts.account_seat)() else {
+            return;
+        };
+        let Some(roster) = account_roster(&seat) else {
+            return;
+        };
+        let Some(look) = self.account_look(&seat, &roster) else {
+            return;
+        };
+        if seen == LoginSeen::Lost && token_refused_at(&seat, &roster, &look.who).is_some() {
+            return;
+        }
+        let me = look.me(&roster);
+        let Some(label) = me
+            .account
+            .filter(|_| me.default_home && me.route.is_stored())
+        else {
+            return;
+        };
+        // One unlocked read first: a turn end that changes nothing takes no writer.
+        let Some(row) = roster.row(label) else {
+            return;
+        };
+        let Ok((state, _)) = seat.bounded_claude_store().load(seat.now) else {
+            return;
+        };
+        let account = state.account(label);
+        let word = account.current_auth(row);
+        match seen {
+            LoginSeen::Served => {
+                if account.auth == accounts::Auth::SignedOut
+                    || (account.auth != accounts::Auth::Unseen && word == accounts::Auth::Unseen)
+                {
+                    self.signed_back(&seat, &roster, &look, label);
+                }
+            }
+            LoginSeen::Lost => {
+                let told = word == accounts::Auth::SignedOut;
+                if told {
+                    return;
+                }
+                let done = login_transact_of(
+                    &self.sid,
+                    &self.hooks,
+                    &seat,
+                    &roster,
+                    &look,
+                    label,
+                    |state, logins, now| Ok(accounts::note_login_end(state, logins, label, now)),
+                );
+                match done {
+                    Ok(events) if !events.is_empty() => {
+                        aterm_log::info!("harness @{}: account {label}: its login ended", self.sid);
+                    }
+                    Ok(_) => {}
+                    Err(why) => aterm_log::info!(
+                        "harness @{}: account {label}: its login's end not recorded: {why}",
+                        self.sid
+                    ),
+                }
+            }
+        }
+    }
+
     /// The scoped Kimi session's renewable row and whether its bound credential home changed.
     fn scoped_renewal(&self) -> Option<(String, bool)> {
         if !self.switches.pool_controls(accounts::Cli::Kimi).logins {
@@ -8039,15 +8355,44 @@ impl WorkerIdle {
                 });
             }
             laps::lap("resume");
+            ("carry-on", step)
+        } else if point.carry_only {
+            return None;
+        } else if !(upgraded && self.switches.upgrade()) {
+            // NO UPGRADE STEP RUNS HERE (`[harness] upgrade` off, or an agent no lane upgrades), so
+            // the sweep that closes a restart's look past its clock never comes: this point closes
+            // its tab's looks itself. The close records and nothing else: no line is typed and
+            // nothing restarts under the person's switch, and a look whose restore line is lost
+            // is said as at any other close.
+            if !self.on() {
+                return None;
+            }
+            run.reset();
+            self.owns.store(false, Ordering::SeqCst);
+            let step = (hooks.acts.close_looks)(&self.sid)?;
+            laps::lap("close");
             if step == "done:lost" {
                 (hooks.note)(HostNote::Relaunch {
                     sid: self.sid.clone(),
                     said: RelaunchSay::NotRestored,
                 });
             }
-            ("carry-on", step)
-        } else if point.carry_only {
-            return None;
+            // A close the sweep lock refused (`busy:another-sweep`) leaves the look standing,
+            // and no step of this worker's comes back to it while the switch is off: it is
+            // looked at again later, as a step the lock refuses is. That look closes and
+            // records alone, as this one does.
+            if let After::Later(pause) = run.after(&step, self.grace) {
+                *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Instant::now() + (hooks.pause)(pause));
+                ring();
+            }
+            aterm_log::debug!("harness @{}: idle action=look step={step}", self.sid);
+            return Some(HostStep {
+                line: format!("look step={step}"),
+                moved: false,
+                typed: None,
+                repeat: false,
+            });
         } else {
             let due = due();
             laps::lap("due");
@@ -8073,6 +8418,9 @@ impl WorkerIdle {
                 }
                 Due::Unread(why) => {
                     let pause = run.unread();
+                    if std::mem::take(&mut run.quiet_holds) {
+                        self.owns.store(false, Ordering::SeqCst);
+                    }
                     *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some(Instant::now() + (hooks.pause)(pause));
                     ring();
@@ -8090,13 +8438,23 @@ impl WorkerIdle {
                 }
             }
         };
+        // A look's restore line recorded lost is said here whichever step closed the look: the
+        // carry-on's inside the look's own clock, the upgrade's sweep past it
+        // ([`relaunch::settle`] says it off the point).
+        if step == "done:lost" {
+            (hooks.note)(HostNote::Relaunch {
+                sid: self.sid.clone(),
+                said: RelaunchSay::NotRestored,
+            });
+        }
         if !self.on() {
             return None;
         }
         run.unread = 0;
         run.quiet = !self.switches.ask();
-        self.owns
-            .store(run.owns(&step, self.grace), Ordering::SeqCst);
+        let owns = run.owns(&step, self.grace);
+        run.quiet_holds = owns && run.waits_at_turn_end(&step);
+        self.owns.store(owns, Ordering::SeqCst);
         let repeat = run.repeats(&step);
         note_upgrade_act();
         if relaunched {
@@ -8134,8 +8492,12 @@ impl WorkerIdle {
                 self.upgrade_runs(&mut run);
                 // A carry-on that finished took this point from a move due beside it: the record
                 // it settled can outlive its agent (a press restarted it with no supervisor to
-                // close its look), and no later point may come to an agent left idle.
-                (hooks.acts.owed)(&self.sid, only) || (what == "carry-on" && due() != Due::No)
+                // close its look), and no later point may come to an agent left idle. An
+                // upgrade's step that recorded a look's line lost said nothing else: its lanes
+                // wait for the next look, so a move still due behind that look is looked at
+                // again here too.
+                (hooks.acts.owed)(&self.sid, only)
+                    || ((what == "carry-on" || step == "done:lost") && due() != Due::No)
             }
             After::Broken => {
                 if !std::mem::replace(&mut run.broken, true) {
@@ -8277,25 +8639,27 @@ impl WorkerIdle {
     }
 
     /// What a quiet upgrade round may type to this session's agent while the agent's own work
-    /// holds the move ([`upgrade_drive::Tell`]): nothing while its Autopilot is off, as a person
-    /// then reads what is typed, nor once its task finished or landed under Land (nothing is
-    /// typed after a land's defense until someone else's turn), nor while one of its loop's
-    /// guards holds a host's fact (`held`: a person's grace, their own exchange, a manager's
-    /// wait; under Cruise the last two hold it no more than they hold Cruise's carry at a break,
-    /// which types into such a session all the same); the restart the agent may run itself only
-    /// where the tab offers and promises it ([`Acts::offered`]). A line the loop holds in custody
-    /// that stands holds the whole step before any of this is asked ([`upgrade_held_by_line`]).
+    /// holds the move, and whether it moves over that work ([`upgrade_drive::Tell`]). Nothing,
+    /// and no move over it, while its Autopilot is off, as a person then reads what is typed,
+    /// or while one of its loop's guards holds a host's fact (`held`: a person's grace, their
+    /// own exchange, a manager's wait; under Cruise the last two hold it no more than they hold
+    /// Cruise's carry at a break, which types into such a session all the same). Once its task
+    /// finished or landed under Land no line is typed into it (nothing is typed after a land's
+    /// defense until someone else's turn), but its autopilot still carries it
+    /// ([`upgrade_drive::Tell::Silent`]): the round moves over proved waits and past a deadline
+    /// told before, so leftover waits never hold a finished session's upgrade for good. The
+    /// restart the agent may run itself is named only where the tab offers and promises it
+    /// ([`Acts::offered`]). A line the loop holds in custody that stands holds the whole step
+    /// before any of this is asked ([`upgrade_held_by_line`]).
     fn upgrade_tell(&self, point: IdlePoint) -> upgrade_drive::Tell {
         let autopilot = self.autopilot();
         let held = point.held.filter(|guard| {
             autopilot != Autopilot::Cruise || !matches!(guard, Guard::Exchange | Guard::Managed)
         });
-        if autopilot == Autopilot::Off
-            || held.is_some()
-            || point.done_under_land
-            || self.finished() == Some(true)
-        {
+        if autopilot == Autopilot::Off || held.is_some() {
             upgrade_drive::Tell::Off
+        } else if point.done_under_land || self.finished() == Some(true) {
+            upgrade_drive::Tell::Silent
         } else if (self.hooks.acts.offered)(&self.sid) == Some(true) {
             upgrade_drive::Tell::Verb
         } else {
@@ -9567,20 +9931,13 @@ impl WorkerIdle {
         self.note_sighting(&seat, &roster, &look, &state.machine);
     }
 
-    /// A Muse Code session's sighting ([`observe::sighting_unpooled`]): Muse keeps no pool and
-    /// no roster, so the login its own `auth.json` names is its account, told to the journal
-    /// and the registry when due. The tab is named with the machine id Claude Code's store
-    /// holds, read without writing one.
-    fn note_muse_sighting(&self) {
-        let Some(seat) = (self.hooks.acts.account_seat)() else {
-            return;
-        };
-        let Some(snap) = with_kept_of(&self.kept, |k| k.snapshot.clone()) else {
-            return;
-        };
-        let Some(env) = (self.hooks.acts.account_env)(&snap) else {
-            return;
-        };
+    /// What a Muse Code session's own login store says it runs on now ([`observe::muse`]),
+    /// taken into its account's record ([`aterm_agent::harness::observed_account`]), which tells
+    /// the journal a sign-out or a new sign-in. None where no seat or snapshot is known.
+    fn muse_seen(&self) -> Option<(AccountSeat, Observation)> {
+        let seat = (self.hooks.acts.account_seat)()?;
+        let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
+        let env = (self.hooks.acts.account_env)(&snap)?;
         let seen = observe::muse(
             &observe::Process {
                 argv: &snap.argv,
@@ -9589,6 +9946,34 @@ impl WorkerIdle {
             },
             &seat.home,
         );
+        aterm_agent::harness::observed_account::Store::at(&seat.state, journal::ObservedCli::Muse)
+            .observe(&seen, seat.now);
+        Some((seat, seen))
+    }
+
+    /// A Muse Code session held at its own sign-in wall (`wall:auth`, [`IdleHost::lasting_hold`]):
+    /// the login its store names does not work, so its account's record says signed out and no
+    /// background read starts on it ([`aterm_agent::harness::observed_account::Store::walled`]).
+    fn note_muse_wall(&self) {
+        if let Some((seat, seen)) = self.muse_seen() {
+            aterm_agent::harness::observed_account::Store::at(
+                &seat.state,
+                journal::ObservedCli::Muse,
+            )
+            .walled(&seen, seat.now);
+        }
+    }
+
+    /// A Muse Code session's sighting ([`observe::sighting_unpooled`]): Muse keeps no pool and
+    /// no roster, so the login its own `auth.json` names is its account, told to the journal
+    /// and the registry when due. The tab is named with the machine id Claude Code's store
+    /// holds, read without writing one. The login is taken into its account's record first
+    /// ([`aterm_agent::harness::observed_account`]), which tells the journal a sign-out or a new
+    /// sign-in, signed out included.
+    fn note_muse_sighting(&self) {
+        let Some((seat, seen)) = self.muse_seen() else {
+            return;
+        };
         if seen.seen().is_none() {
             return;
         }
@@ -12377,12 +12762,20 @@ fn self_claimed_exit(
     // has to tell this relaunch from codex-alab's own.
     let mut said = false;
     let cold_use = ColdUse::default();
+    let line_grace = || {
+        (hooks.acts.line_grace)(
+            sid,
+            grace,
+            aterm_agent::harness::upgrade::Agent::Codex,
+            Some(copy.pid),
+        )
+    };
     let gone = relaunch_until_with(
         job,
         hooks,
         pause,
         &decide,
-        None,
+        asked.map(|_| &line_grace as &dyn Fn() -> u32),
         GoneUnread::HandedBack,
         || {
             // Retry admission after each wait, before publishing or typing a new line.
@@ -12565,7 +12958,9 @@ fn relaunch_until_with(
     mut attempt: impl FnMut() -> String,
 ) -> bool {
     let sid = job.sid.as_str();
-    let restarted = restart.is_some();
+    // A self-claimed explicit restart owes its line on the same cadence, but the
+    // process it lands still owns its own exit through the crash rule.
+    let restarted = restart.is_some() && gone_unread == GoneUnread::TriedAgain;
     // The pause is one past a person's keys ([`relaunch::CarryPause::Keys`]): no attempt before
     // it could land, so [`relaunch::CARRY_EVERY`] does not cut it short, and the attempt it times
     // does not climb the back-off while its line is still held.
@@ -12575,7 +12970,7 @@ fn relaunch_until_with(
             settled(job);
             return false;
         }
-        let wait = if restarted && !at_keys {
+        let wait = if restart.is_some() && !at_keys {
             pause.min(relaunch::CARRY_EVERY)
         } else {
             pause
@@ -14941,6 +15336,7 @@ fn queue_restored_guarded(
                         agent_seen: false,
                         carried: false,
                         landed: false,
+                        looking: false,
                         faults: 0,
                         in_flight_only: false,
                         cold_use: Arc::default(),
@@ -15080,7 +15476,7 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
             typed: attempt.typed(),
             seen: attempt.agent_seen,
             carried: attempt.carried,
-            landed: attempt.landed,
+            landed: attempt.landed || attempt.looking,
             cold_use: Arc::clone(&attempt.cold_use),
         };
         drop(queue);
@@ -15630,6 +16026,9 @@ enum LandingLook {
     Gone,
     /// Gone, by the conversation's record.
     Died,
+    /// No look came back: one not back within [`Acts::point_read`], or none started behind another
+    /// still out. It says nothing of the agent.
+    Out,
 }
 
 const LANDED_GONE: &str = "exited-before-read";
@@ -15637,7 +16036,7 @@ const LANDED_GONE: &str = "exited-before-read";
 /// The agent a restored step landed in tab `sid`, looked at off the restored queue's thread
 /// ([`landing_look_of`]) and waited for [`Acts::point_read`] at most, so a slow read holds no other
 /// tab's step behind it. A look not back by then, or asked while an earlier one is still out, is
-/// [`LandingLook::Unread`]: its attempt is kept and looked at again after [`LANDED_LOOK`], and the
+/// [`LandingLook::Out`]: its attempt is kept and looked at again after [`LANDED_LOOK`], and the
 /// look still out lands what it reads as it ends, through [`SnapshotRead::refresh`]'s guard.
 fn restored_landing_look(
     shared: &Shared,
@@ -15662,7 +16061,7 @@ fn restored_landing_look(
         with_kept_of(&kept, |k| k.carry_asked = true);
     }
     if shared.landing_look_out.swap(true, Ordering::SeqCst) {
-        return LandingLook::Unread;
+        return LandingLook::Out;
     }
     let (said, heard) = std::sync::mpsc::sync_channel(1);
     let out = Arc::clone(&shared.landing_look_out);
@@ -15702,9 +16101,9 @@ fn restored_landing_look(
                  still out after {} ms; the queue goes on, and the look lands as it ends",
                 hooks.acts.point_read.as_millis()
             );
-            LandingLook::Unread
+            LandingLook::Out
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LandingLook::Unread,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LandingLook::Out,
     }
 }
 
@@ -15763,7 +16162,16 @@ fn restored_landing_ends(
                 );
             }
             attempt.landed = true;
+            attempt.looking = false;
             attempt.in_flight_only = false;
+            attempt.due = now + next_look;
+            LandingEnd::Keep(attempt)
+        }
+        // Nothing learned: looked at again as though this look were never asked, so a first look
+        // that did not come back leaves the next one first, whose Gone leaves the agent to the
+        // roster and never makes its relaunch again.
+        LandingLook::Out => {
+            attempt.looking = !attempt.landed;
             attempt.due = now + next_look;
             LandingEnd::Keep(attempt)
         }
@@ -15784,6 +16192,7 @@ fn restored_landing_ends(
                 attempt.agent.place
             );
             attempt.landed = false;
+            attempt.looking = false;
             attempt.in_flight_only = false;
             attempt.resume_wait_since = None;
             attempt.native_wait_since = None;
@@ -19979,6 +20388,26 @@ const NO_HOST_SLEEP: &str = "none";
 /// gate `Session::call` holds every input verb to); otherwise it observes.
 fn hosted_body(sock: &str, store: &Store, job: &WorkerJob) -> BodyEnd {
     let mut ctl = HostCtl::as_harness(Endpoint::Socket(sock.to_string()));
+    let activity_store = store.clone();
+    let activity_sid = aterm_session::SessionId::new(&job.sid);
+    ctl.continuation = Some(Arc::new(move |reason, wait_ms| {
+        let ctx = activity_store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&activity_sid)
+            .map(|s| Arc::clone(&s.ctx));
+        if let Some(ctx) = ctx {
+            let native = ctx
+                .meta
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .live_supervisor(crate::metrics::now_us())
+                .is_some_and(|name| name == holder());
+            if native {
+                crate::autopilot_activity::report(&ctx, reason, wait_ms);
+            }
+        }
+    }));
     let acts = store.clone();
     ctl.act = Some(Arc::new(move |sid| crate::agent_act::hosted(&acts, sid)));
     ctl.admission = Some((Arc::clone(&job.switches), job.agent));
@@ -20247,6 +20676,8 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let o_snap = Arc::clone(&opts);
     let o_observe_snapshot = Arc::clone(&opts);
     let o_settle = Arc::clone(&opts);
+    let o_close = Arc::clone(&opts);
+    let w_close = Arc::clone(&row);
     let o_line = Arc::clone(&opts);
     Acts {
         open: Arc::new(move |sid| open(&store, sid)),
@@ -20340,6 +20771,11 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                     relaunch::resume_at_point(&o, carry.done_under_land, carry.only, said)
                 }
             })
+        }),
+        close_looks: Arc::new(move |sid| {
+            let r = upgrade_drive::close_looks(&o_close(sid, 0)?)?;
+            w_close(sid, "look", &r);
+            Some(r.step)
         }),
         settle: Arc::new(move |sid| {
             let Some(o) = o_settle(sid, 0) else {
@@ -22977,7 +23413,7 @@ fn cold_effective_login(
         .or_else(|| {
             seat.home
                 .to_str()
-                .and_then(|home| accounts::profile_configs_dir([("HOME", home)]))
+                .and_then(|home| accounts::profile_configs_dir([(accounts::HOMEDIR_ENV, home)]))
         });
     facts
         .process_login()
@@ -24314,6 +24750,13 @@ fn held_of(
             | accounts::StayWhy::KeyringStore
             | accounts::StayWhy::NoLine,
         ) => Some(HeldBy::Earlier),
+    }
+}
+
+const fn login_seen_word(seen: LoginSeen) -> &'static str {
+    match seen {
+        LoginSeen::Lost => "lost",
+        LoginSeen::Served => "served",
     }
 }
 
@@ -27942,7 +28385,9 @@ pub(crate) fn window_ends() {
 
 /// Arm the window's terminating signals (`crate::owned_endpoint::arm_orderly_quit`): the window
 /// marked ending ([`window_ends`]), `off` (production passes [`claims_off_as_the_window_dies`]),
-/// then the process dies of the signal as it did before, with no clean exit marked
+/// the host's quit step (`crate::host_quit::run`, bounded by its host: the Commons runtime
+/// stops and closes the network history, after the claims went out through it), then the
+/// process dies of the signal as it did before, with no clean exit marked
 /// (`crate::owned_endpoint::die_of_signal`); a second signal ends it at once. A headless
 /// instance arms its own orderly quit instead.
 #[cfg(unix)]
@@ -27950,6 +28395,7 @@ pub(crate) fn arm_claims_off_as_the_window_dies(off: fn()) {
     if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |sig| {
         window_ends();
         off();
+        crate::host_quit::run();
         crate::owned_endpoint::die_of_signal(sig);
     }) {
         aterm_log::warn!(
@@ -28853,6 +29299,7 @@ impl Acts {
             carry_owed: Arc::new(|_, _| false),
             resume: Arc::new(|_, _, _| "current".to_string()),
             settle: Arc::new(|_| "current".to_string()),
+            close_looks: Arc::new(|_| None),
             disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
             disk_free: Arc::new(|_, _, _, _| "wait:inert".to_string()),
             disk_board: {

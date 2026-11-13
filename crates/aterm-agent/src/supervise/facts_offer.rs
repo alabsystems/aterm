@@ -90,6 +90,7 @@ fn served(reading: &FactsReading) -> FactsReading {
     FactsReading {
         as_of_ms: reading.as_of_ms,
         no_progress: reading.no_progress.clone(),
+        waiting: reading.waiting,
         held: None,
         left: None,
     }

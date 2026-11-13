@@ -2951,6 +2951,7 @@ impl Wake {
             | Wake::UpdateCheckCompleted
             | Wake::UpdateCheckerPhase
             | Wake::ConfigReloadObserved(..)
+            | Wake::RefusedUpdateText(..)
             | Wake::ConfigWatchStatus(..)
             | Wake::HarnessPolicyObserved(..)
             | Wake::ThemeCatalogChanged(..)
@@ -3021,6 +3022,7 @@ impl Wake {
             | Wake::SpareSpawned(..)
             | Wake::SpareNote { .. }
             | Wake::CloseSession { .. }
+            | Wake::KeepTabs { .. }
             | Wake::RaiseSession { .. }
             | Wake::ConnectionsChanged
             | Wake::SettingsOverlay { .. }
@@ -3129,6 +3131,8 @@ impl Wake {
             Wake::SystemColorsChanged => None,
             #[cfg(any(target_os = "macos", windows))]
             Wake::ApplyStagedUpdate => None,
+            #[cfg(windows)]
+            Wake::StagedBuildNotice(..) => None,
             #[cfg(a11y_tree)]
             Wake::Accessibility(..) => None,
             #[cfg(target_os = "linux")]
@@ -3153,6 +3157,8 @@ impl Wake {
             Wake::StatusAction { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::StatusMenuOpening { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::FleetAccessChanged => None,
             #[cfg(target_os = "macos")]
             Wake::SiblingRaised { .. } => None,
             #[cfg(target_os = "macos")]
@@ -3190,7 +3196,9 @@ impl Wake {
             #[cfg(all(unix, not(test)))]
             Wake::NetworkPlaceChanged => None,
             Wake::AccountsDrained { .. }
+            | Wake::AccountsOutlived { .. }
             | Wake::MailChanged
+            | Wake::TablesChanged
             | Wake::NoMacosDialog
             | Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsWatch(_)
@@ -3744,17 +3752,21 @@ impl App {
             SlotState::Warming if age >= t_ready => {
                 self.retire_spare("rc_timeout", Some(Verdict::Backoff("rc_timeout")));
             }
-            SlotState::Ready if age >= ready_max_age() => self.retire_spare("age", None),
+            // A verify reply that never came leaves the slot Verifying: it ages out as a Ready one
+            // does, at the age the adoption gate refuses it (G7).
+            SlotState::Verifying | SlotState::Ready if age >= ready_max_age() => {
+                self.retire_spare("age", None);
+            }
             _ => {}
         }
         if let Some(slot) = &self.spares.slot {
             let at = match slot.state {
                 SlotState::Spawned => Some(slot.since + parked_by),
                 SlotState::Warming => Some(slot.since + slot.t_ready),
-                SlotState::Ready => Some(slot.since + ready_max_age()),
+                SlotState::Verifying | SlotState::Ready => Some(slot.since + ready_max_age()),
                 // A parked spare's age is judged at adoption and on a tick something else armed,
                 // never by a timer of its own (design §7.3 G7, §16 D7).
-                SlotState::Parked | SlotState::Booked | SlotState::Verifying => None,
+                SlotState::Parked | SlotState::Booked => None,
             };
             if let Some(at) = at {
                 self.spares.arm(at);
@@ -4459,7 +4471,8 @@ impl App {
         let too_old = match slot.state {
             SlotState::Parked => age >= PARKED_MAX_AGE,
             SlotState::Warming => age >= slot.t_ready,
-            _ => age >= ready_max_age(),
+            SlotState::Verifying | SlotState::Ready => age >= ready_max_age(),
+            SlotState::Booked | SlotState::Spawned => false,
         };
         if too_old {
             // Never adopted now, so the aging rule retires it at once and books its successor.
@@ -4666,39 +4679,8 @@ impl Spares {
 mod tests;
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-mod command_override_tests {
-    use super::*;
-
-    #[test]
-    fn an_explicit_command_leaves_the_spare_for_the_next_ordinary_shell() {
-        let mut app = App::headless_for_test();
-        app.session_factory.shell_override = Some("/bin/zsh".into());
-        let window = WindowId(0);
-        let grid = app.spawn_grid(window);
-        let id = app.next_session_id;
-        app.next_session_id += 1;
-        let cwd = app
-            .focused_pane_folder(window)
-            .map(|folder| folder.reported);
-        app.spares.slot = Some(super::tests::parked_slot_for(&app, id, cwd.as_deref()));
-        let ask = crate::tab_spawn::SpawnAsk {
-            exec_command: Some(vec!["/bin/sh".into()]),
-            ..crate::tab_spawn::SpawnAsk::default()
-        };
-        assert_eq!(
-            app.try_adopt_spare(window, Some(window), grid, &ask)
-                .map(|_| ()),
-            Err("ask")
-        );
-        assert_eq!(app.spares.slot.as_ref().unwrap().id, id);
-        let ordinary = crate::tab_spawn::SpawnAsk::default();
-        let (taken, _) = app
-            .try_adopt_spare(window, Some(window), grid, &ordinary)
-            .expect("the same eligible spare remains available to an ordinary shell");
-        assert_eq!(taken.id, id);
-        assert!(app.spares.slot.is_none());
-    }
-}
+#[path = "spare_command_override_tests.rs"]
+mod command_override_tests;
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "spare_conformance.rs"]

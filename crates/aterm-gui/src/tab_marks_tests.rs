@@ -32,7 +32,7 @@ fn parked_worker(app: &mut App) -> (u64, Arc<SessionCtx>) {
     let id = app.next_session_id;
     app.next_session_id += 1;
     let parent = app.new_tab_parent(WID);
-    app.install_tab_session_parked(WID, stub_session(id), parent);
+    app.install_tab_session_parked(WID, stub_session(id), parent, false);
     app.sync_window(WID);
     (id, ctx(app, id))
 }
@@ -132,6 +132,122 @@ fn a_parked_worker_opens_by_its_manager_and_a_keep_shows_it_by_the_person() {
     assert_eq!(tab_lines(&person_ctx).len(), 1, "CONTROL: its open alone");
 }
 
+/// A REQUEST'S WHY IS ITS TAB'S OPEN (the requests design (2026-11-09) §5): a fleet drive's
+/// plain shell, opened under the act its `spawn why=` named, says `why_text=` beside its `why=`
+/// word, by the drive's node, parked. CONTROL: the same open asking nothing has no `why_text=`.
+#[test]
+fn a_requests_why_is_recorded_in_its_tabs_open() {
+    let mut app = App::headless_for_test();
+    let (_, asked) = {
+        let _act = ActScope::asking(
+            ExitActor::fleet_drive(&"87be5228".repeat(4), None),
+            "spawn",
+            Some("check the m72 disk"),
+            Some(aterm_types::control_verbs::Requester::default()),
+        );
+        parked_worker(&mut app)
+    };
+    let opened = tab_lines(&asked);
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    for (key, want) in [
+        ("act", "open"),
+        ("why", "spawn"),
+        ("why_text", "check%20the%20m72%20disk"),
+        ("parked", "1"),
+        ("by", "fleet:87be5228:-"),
+    ] {
+        assert_eq!(field(&opened[0], key), Some(want), "{key}: {opened:?}");
+    }
+    // The longest line a request admits, its 200 characters at the 256 encoded bytes, is kept
+    // whole, never cut where the open records it.
+    let longest = "w ".repeat(28) + &"w".repeat(144);
+    assert_eq!(
+        aterm_types::control_verbs::request_why(&longest),
+        Ok(longest.as_str())
+    );
+    assert_eq!(
+        aterm_codec::pct::encoded_len(&longest),
+        aterm_types::control_verbs::REQUEST_WHY_BYTES
+    );
+    let (_, whole) = {
+        let _act = ActScope::asking(ExitActor::Ctl, "spawn", Some(&longest), None);
+        parked_worker(&mut app)
+    };
+    let opened = tab_lines(&whole);
+    assert_eq!(
+        field(&opened[0], "why_text"),
+        Some(aterm_codec::pct::encode(&longest).as_str()),
+        "{opened:?}"
+    );
+    let (_, plain) = {
+        let _act = ActScope::enter(ExitActor::Ctl, "spawn");
+        parked_worker(&mut app)
+    };
+    let opened = tab_lines(&plain);
+    assert_eq!(field(&opened[0], "why"), Some("spawn"), "{opened:?}");
+    assert_eq!(field(&opened[0], "why_text"), None, "CONTROL: {opened:?}");
+}
+
+/// A FLEET DRIVE'S SPAWN NAMES ITS REQUESTER ON ITS TAB'S OPEN (ATERM-KI-1109-3): the drive by its
+/// node and the requesting session (`by=fleet:<head>:<sid>`), and the requester's program, model
+/// and account (`agent=`, `model=`, `account=`) beside the `why_text=` its line gave.
+/// NEGATIVE CONTROLS: a requester that names none of them adds none, and an open no drive asked
+/// names no requester at all.
+#[test]
+fn drive_spawn_open_records_requester() {
+    use aterm_types::control_verbs::Requester;
+    let mut app = App::headless_for_test();
+    let sid = "s-0123456789abcdef0123";
+    let node = "87be5228".repeat(4);
+    let requester = Requester::of(
+        Some(sid),
+        Some("claude"),
+        Some("Opus 5.5"),
+        Some("team acct"),
+    );
+    let (_, asked) = {
+        let _act = ActScope::asking(
+            ExitActor::fleet_drive(&node, requester.sid()),
+            "spawn",
+            Some("check the m72 disk"),
+            Some(requester),
+        );
+        parked_worker(&mut app)
+    };
+    let opened = tab_lines(&asked);
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    for (key, want) in [
+        ("act", "open"),
+        ("why_text", "check%20the%20m72%20disk"),
+        ("agent", "claude"),
+        ("model", "opus-5.5"),
+        ("account", "team%20acct"),
+        ("by", &format!("fleet:87be5228:{sid}")),
+    ] {
+        assert_eq!(field(&opened[0], key), Some(want), "{key}: {opened:?}");
+    }
+    let (_, unnamed) = {
+        let _act = ActScope::asking(
+            ExitActor::fleet_drive(&node, None),
+            "spawn",
+            Some("check the m72 disk"),
+            Some(Requester::default()),
+        );
+        parked_worker(&mut app)
+    };
+    let (_, local) = {
+        let _act = ActScope::asking(ExitActor::Ctl, "spawn", Some("check the m72 disk"), None);
+        parked_worker(&mut app)
+    };
+    for (ctx, by) in [(unnamed, "fleet:87be5228:-"), (local, "ctl")] {
+        let opened = tab_lines(&ctx);
+        assert_eq!(field(&opened[0], "by"), Some(by), "{opened:?}");
+        for key in ["agent", "model", "account"] {
+            assert_eq!(field(&opened[0], key), None, "CONTROL: {key}: {opened:?}");
+        }
+    }
+}
+
 /// A CLOSE NAMES ITS REASON AND ITS ACTOR AS THE SESSION'S CLOSE DOES, AND ITS TOTALS: the wall
 /// time from the tab's open, and `unavailable` for what aterm keeps for no tab's life (CPU, peak
 /// memory) or did not read (a shell's tokens and login). It comes before the session's close.
@@ -209,27 +325,43 @@ fn an_unstarted_workers_close_says_unstarted_and_an_opens_reason_never_closes() 
     assert_eq!(field(&close, "why"), None, "CONTROL: {close}");
 }
 
-/// A CLOSE BY A CONTROL CLIENT NAMES IT AS THE EXIT LEDGER DOES: a fleet drive `fleet:<host>` in
-/// both the tab's mark and `exits`, a manager's session by its sid. CONTROL: an unidentified
+/// A CLOSE BY A CONTROL CLIENT NAMES IT AS THE EXIT LEDGER DOES: a fleet drive
+/// `fleet:<head>:<sid>` (its node and its requester's session) in both the tab's mark and
+/// `exits`, a manager's session by its sid. CONTROL: an unidentified
 /// client is `ctl`, and a close attribution's actor opens a tab as that actor with the place's
 /// own reason (a control client's `tab` gesture that opens one under no act).
 #[test]
 fn a_control_clients_close_names_it_as_the_exit_ledger_does() {
     let mut app = App::headless_for_test();
     let (driven, driven_ctx) = person_tab(&mut app);
+    let word = "fleet:n-m9:s-0123456789abcdef0123";
     let by = {
-        let _drive = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
-            node: "n-m9".to_string(),
-            host: "m9".to_string(),
-        });
+        let _drive = crate::fabric::DrivingAs::requested(
+            crate::fabric::Driver {
+                node: "n-m9".to_string(),
+                host: "m9".to_string(),
+            },
+            aterm_types::control_verbs::Requester::of(
+                Some("s-0123456789abcdef0123"),
+                None,
+                None,
+                None,
+            ),
+        );
         crate::control::caller_actor_of(crate::control::Scope::Owner, None, &app.store)
     };
-    assert_eq!(by, ExitActor::Fleet("fleet:m9".to_string()));
+    assert_eq!(
+        by,
+        ExitActor::Fleet {
+            token: word.to_string(),
+            node: "n-m9".to_string()
+        }
+    );
     deregister(&app, driven, ExitReason::CtlClose, by);
     let close = tab_lines(&driven_ctx).pop().expect("its close");
-    assert_eq!(field(&close, "by"), Some("fleet:m9"), "{close}");
+    assert_eq!(field(&close, "by"), Some(word), "{close}");
     let exits = crate::control::cmd_exits(&app.store, "", &[]);
-    assert!(exits.contains(" by=fleet:m9 "), "{exits}");
+    assert!(exits.contains(&format!(" by={word} ")), "{exits}");
     assert_eq!(
         crate::control::caller_actor_of(crate::control::Scope::Owner, None, &app.store),
         ExitActor::Ctl,
@@ -447,6 +579,43 @@ fn a_tabs_tree_spent_each_live_processs_own_and_reaped_time_once() {
     );
 }
 
+/// A TAB'S TREE WROTE WHAT ITS LIVE PROCESSES' COUNTERS HOLD, summed; its request keeps it in
+/// whole MiB. NEGATIVE: a tree where no process's counters hold a figure reads `None`, never 0.
+#[test]
+fn tree_spent_sums_disk_written() {
+    fn written(pid: u32) -> Option<aterm_sysprobe::jobs::Counters> {
+        let mib = |n: u64| aterm_sysprobe::jobs::Counters {
+            disk_written: Some(n * 1024 * 1024),
+            ..tree_counters(pid).expect("a live process")
+        };
+        match pid {
+            100 => Some(mib(1)),
+            200 => Some(mib(300)),
+            300 => Some(mib(12)),
+            _ => None,
+        }
+    }
+    let probe = super::TreeProbe {
+        children: tree_children,
+        counters: written,
+    };
+    let spent = super::tree_spent(100, &probe);
+    assert_eq!(spent.written_bytes, Some(313 * 1024 * 1024), "{spent:?}");
+    assert_eq!(spent.as_spent().written_mb, Some(313));
+    assert_eq!(spent.as_spent().cpu_s, Some(48));
+    assert_eq!(
+        super::tree_counters(100, &probe)
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<_>>(),
+        [100, 200, 300],
+        "each process once"
+    );
+    let unread = super::tree_spent(100, &TREE);
+    assert_eq!(unread.written_bytes, None, "{unread:?}");
+    assert_eq!(unread.as_spent().written_mb, None);
+}
+
 /// A TAB'S CLOSE NAMES WHERE IT STANDS AT ITS CLOSE: a tab moved to a new window closes there,
 /// a pane split inside a parked worker's tab opens and closes parked with it, and Keep as Tab
 /// keeps every session of the worker's tab. CONTROL: the tab that stayed closes in its window.
@@ -490,8 +659,8 @@ fn a_tabs_close_names_the_window_and_parking_it_stands_in_at_its_close() {
 }
 
 /// A QUIT CLOSES EVERY TAB STILL OPEN, by whoever asked for it (`out=app-quit`), with its totals,
-/// once. CONTROL: an unattended quit (`App::on_unattended_quit`'s actor) names nobody, and a
-/// session no tab held writes nothing.
+/// once, but a tab whose program it carries to the next launch. CONTROL: an unattended quit
+/// (`App::on_unattended_quit`'s actor) names nobody, and a session no tab held writes nothing.
 #[test]
 fn a_quit_closes_every_open_tab_by_who_asked_once() {
     let mut app = App::headless_for_test();
@@ -500,8 +669,8 @@ fn a_quit_closes_every_open_tab_by_who_asked_once() {
     let bare_ctx = Arc::clone(&bare.ctx);
     App::register_session(&app.store, &bare, None);
     app.note_quit_by();
-    app.close_tabs_at_quit();
-    app.close_tabs_at_quit();
+    app.close_tabs_at_quit(&[]);
+    app.close_tabs_at_quit(&[]);
     let lines = tab_lines(&tab_ctx);
     assert_eq!(lines.len(), 2, "one open, one close: {lines:?}");
     for (key, want) in [
@@ -518,13 +687,29 @@ fn a_quit_closes_every_open_tab_by_who_asked_once() {
     let (_, tab_ctx) = person_tab(&mut app);
     app.quit_by = Some(ExitActor::Unknown);
     app.note_quit_by();
-    app.close_tabs_at_quit();
+    app.close_tabs_at_quit(&[]);
     let close = tab_lines(&tab_ctx).pop().expect("its close");
     assert_eq!(field(&close, "out"), Some("app-quit"), "{close}");
     assert_eq!(
         field(&close, "by"),
         None,
         "CONTROL: nobody is named: {close}"
+    );
+
+    let mut app = App::headless_for_test();
+    let (carried, carried_ctx) = person_tab(&mut app);
+    let (_, closed_ctx) = person_tab(&mut app);
+    app.note_quit_by();
+    app.close_tabs_at_quit(&[carried]);
+    assert_eq!(
+        tab_lines(&carried_ctx).len(),
+        1,
+        "the carried tab's program runs on: it closes nothing"
+    );
+    assert_eq!(
+        tab_lines(&closed_ctx).len(),
+        2,
+        "CONTROL: its sibling closes"
     );
 }
 
@@ -541,7 +726,7 @@ fn a_quit_closes_each_tab_before_its_session() {
         let mut app = App::headless_for_test();
         let (_, tab_ctx) = person_tab(&mut app);
         app.note_quit_by();
-        app.close_sessions_at_quit();
+        app.close_sessions_at_quit(&[]);
         let reply = crate::control::cmd_log(&tab_ctx, "");
         assert!(reply.starts_with("OK "), "{reply}");
         let lines: Vec<&str> = reply.lines().skip(1).collect();

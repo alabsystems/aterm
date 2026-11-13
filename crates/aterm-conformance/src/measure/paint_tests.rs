@@ -88,13 +88,13 @@ fn lit_video() -> ScanReport {
 
 fn status(style: &str, extra: &str) -> StatusRow {
     StatusRow::new(format!(
-        "trail style=\"{style}\" resolved=rainbow-kitty effective=true ribbon_look=tall {extra}"
+        "trail style=\"{style}\" resolved=rainbow-kitty effective=true ribbon_look=underline {extra}"
     ))
 }
 
-fn flying_rows(frames: usize, extra: &str) -> Ledger {
+fn rainbow_rows(frames: usize, extra: &str) -> Ledger {
     Ledger {
-        rows: Some(vec![status("rainbow kitty flying", extra); frames]),
+        rows: Some(vec![status("rainbow", extra); frames]),
         final_row: None,
         fx_under_frames: 40,
     }
@@ -110,10 +110,10 @@ fn verdict(row: &PaintRow, ledger: &Ledger, scan: &ScanReport) -> ShapeVerdict {
 #[test]
 fn a_healthy_burst_is_ink_and_quiet_is_its_exact_negation() {
     let (ink, quiet) = (
-        row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying),
-        row(Expect::Quiet, Capture::UnpinnedFocused, Style::Flying),
+        row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow),
+        row(Expect::Quiet, Capture::UnpinnedFocused, Style::Rainbow),
     );
-    let ledger = flying_rows(67, "licensed=9 spawns=9");
+    let ledger = rainbow_rows(67, "licensed=9 spawns=9");
     assert_eq!(verdict(&ink, &ledger, &lit_burst()), ShapeVerdict::Pass);
     assert_eq!(verdict(&quiet, &ledger, &lit_burst()), ShapeVerdict::Fail);
     let one_hue = ScanReport {
@@ -130,32 +130,32 @@ fn the_coverage_floor_binds_ink_but_never_buys_the_quiet_control() {
         ribbon_bound: 0,
         ..lit_burst()
     };
-    let ledger = flying_rows(67, "");
-    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
-    let quiet = row(Expect::Quiet, Capture::UnpinnedFocused, Style::Flying);
+    let ledger = rainbow_rows(67, "");
+    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
+    let quiet = row(Expect::Quiet, Capture::UnpinnedFocused, Style::Rainbow);
     assert_eq!(verdict(&ink, &ledger, &uncovered), ShapeVerdict::Fail);
     assert_eq!(verdict(&quiet, &ledger, &uncovered), ShapeVerdict::Fail);
 }
 
 #[test]
 fn ink_needs_the_compose_side_witness() {
-    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
+    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
     let no_witness = Ledger {
         fx_under_frames: 1,
-        ..flying_rows(67, "")
+        ..rainbow_rows(67, "")
     };
     assert_eq!(verdict(&ink, &no_witness, &lit_burst()), ShapeVerdict::Fail);
 }
 
 #[test]
 fn a_driven_claim_over_an_unlit_raster_is_red() {
-    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
+    let ink = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
     let dark = ScanReport {
         ribbon_dark: 2,
         ..lit_burst()
     };
     assert_eq!(
-        verdict(&ink, &flying_rows(67, ""), &dark),
+        verdict(&ink, &rainbow_rows(67, ""), &dark),
         ShapeVerdict::Fail
     );
     let mono_arc = ScanReport {
@@ -163,17 +163,17 @@ fn a_driven_claim_over_an_unlit_raster_is_red() {
         ..lit_burst()
     };
     assert_eq!(
-        verdict(&ink, &flying_rows(67, ""), &mono_arc),
+        verdict(&ink, &rainbow_rows(67, ""), &mono_arc),
         ShapeVerdict::Fail
     );
 }
 
 #[test]
 fn recorded_continuity_tolerates_one_dark_frame_and_refuses_two() {
-    let ink = row(Expect::Ink, Capture::PinnedVideo, Style::Flying);
+    let ink = row(Expect::Ink, Capture::PinnedVideo, Style::Rainbow);
     let ledger = Ledger {
         rows: None,
-        final_row: Some(status("rainbow kitty flying", "")),
+        final_row: Some(status("rainbow", "")),
         fx_under_frames: 40,
     };
     for (dark_us, want) in [
@@ -195,12 +195,12 @@ fn recorded_continuity_tolerates_one_dark_frame_and_refuses_two() {
 
 #[test]
 fn a_recorded_take_that_lost_its_bracket_decides_nothing() {
-    let ink = row(Expect::Ink, Capture::PinnedVideo, Style::Flying);
-    let ledger = flying_rows(67, "");
+    let ink = row(Expect::Ink, Capture::PinnedVideo, Style::Rainbow);
+    let ledger = rainbow_rows(67, "");
     let mut lost = lit_video();
     lost.driven = DrivenWindow::NOT_MEASURED;
     assert!(judge(&ink, &ledger, &lost).is_err());
-    let burst = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
+    let burst = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
     let gapped = ScanReport {
         rainbow_gap: 2,
         ..lit_burst()
@@ -210,28 +210,28 @@ fn a_recorded_take_that_lost_its_bracket_decides_nothing() {
 
 #[test]
 fn a_near_empty_take_is_never_a_dark_pass() {
-    let dark = row(Expect::Dark, Capture::UnpinnedFocused, Style::Flying);
+    let dark = row(Expect::Dark, Capture::UnpinnedFocused, Style::Rainbow);
     let empty = ScanReport {
         frames: 2,
         total_ink: 0,
         ..lit_burst()
     };
-    assert!(judge(&dark, &flying_rows(2, QUIET), &empty).is_err());
+    assert!(judge(&dark, &rainbow_rows(2, QUIET), &empty).is_err());
 }
 
 #[test]
 fn trail_dark_reads_the_engine_ledger_and_refuses_without_one() {
-    let cold = row(Expect::TrailDark, Capture::UnpinnedFocused, Style::Flying);
+    let cold = row(Expect::TrailDark, Capture::UnpinnedFocused, Style::Rainbow);
     let scan = ScanReport {
         total_ink: 400,
         ribbon_claimed: 0,
         ..lit_burst()
     };
     assert_eq!(
-        verdict(&cold, &flying_rows(67, QUIET), &scan),
+        verdict(&cold, &rainbow_rows(67, QUIET), &scan),
         ShapeVerdict::Pass
     );
-    let licensed = flying_rows(67, &QUIET.replace("licensed=0", "licensed=1"));
+    let licensed = rainbow_rows(67, &QUIET.replace("licensed=0", "licensed=1"));
     assert_eq!(verdict(&cold, &licensed, &scan), ShapeVerdict::Fail);
     let blind = Ledger {
         rows: None,
@@ -303,11 +303,11 @@ fn a_recorded_effect_off_window_must_read_dead() {
 
 #[test]
 fn a_spelling_that_resolved_elsewhere_is_red() {
-    let tall = row(Expect::Ink, Capture::UnpinnedFocused, Style::Tall);
+    let tall = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
     let resolved = |resolved: &str| Ledger {
         rows: Some(vec![
             StatusRow::new(format!(
-                "trail style=\"rainbow kitty tall\" resolved={resolved} ribbon_look=tall"
+                "trail style=\"rainbow\" resolved={resolved} ribbon_look=underline"
             ));
             67
         ]),
@@ -343,7 +343,7 @@ fn companion_obligations_ride_on_top_of_ink() {
         ..row(Expect::Ink, Capture::UnpinnedFocused, Style::Default)
     };
     let ledger = Ledger {
-        rows: Some(vec![status("rainbow kitty pet", ""); 36]),
+        rows: Some(vec![status("rainbow", ""); 36]),
         final_row: None,
         fx_under_frames: 40,
     };
@@ -386,7 +386,7 @@ fn companion_obligations_ride_on_top_of_ink() {
     }
     let cat = PaintRow {
         companion: Some(Companion::Cat),
-        style: Style::Flying,
+        style: Style::Rainbow,
         ..pet
     };
     let earned = ScanReport {
@@ -403,7 +403,7 @@ fn companion_obligations_ride_on_top_of_ink() {
         ..lit_burst()
     };
     let flying = Ledger {
-        rows: Some(vec![status("rainbow kitty flying", ""); 36]),
+        rows: Some(vec![status("rainbow", ""); 36]),
         ..ledger
     };
     assert_eq!(verdict(&cat, &flying, &earned), ShapeVerdict::Pass);
@@ -454,10 +454,10 @@ fn a_missing_pet_is_named_by_its_frame_and_claimed_pose() {
     };
     let ledger = Ledger {
         rows: Some(vec![
-            status("rainbow kitty pet", "pet_active=true pet_pose=pet_sleep_1"),
-            status("rainbow kitty pet", "pet_active=true pet_pose=pet_hop"),
-            status("rainbow kitty flying", "pet_active=false cat_active=true"),
-            status("rainbow kitty pet", "pet_active=true"),
+            status("rainbow", "pet_active=true pet_pose=pet_sleep_1"),
+            status("rainbow", "pet_active=true pet_pose=pet_hop"),
+            status("rainbow", "pet_active=false cat_active=true"),
+            status("rainbow", "pet_active=true"),
         ]),
         final_row: None,
         fx_under_frames: 40,
@@ -496,7 +496,7 @@ fn self_contradicting_rows_are_refused() {
     let cat_wrong_style = PaintRow {
         scene: Scene::Prompt,
         companion: Some(Companion::Cat),
-        ..row(Expect::Ink, Capture::UnpinnedFocused, Style::Classic)
+        ..row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow)
     };
     assert!(cat_wrong_style.validate().is_err());
 }
@@ -522,11 +522,11 @@ fn reached(px: usize) -> ScanReport {
 
 #[test]
 fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
-    let ledger = flying_rows(67, "");
-    let tall = reach_row(Reach::Tall, Style::Flying);
+    let ledger = rainbow_rows(67, "");
+    let tall = reach_row(Reach::Underline, Style::Rainbow);
     assert!(tall.validate().is_ok());
     let cell_h = lit_burst().cell.h;
-    let (lo, hi) = Reach::Tall.bounds();
+    let (lo, hi) = Reach::Underline.bounds();
     let lo_px = (lo * cell_h).div_ceil(100);
     let hi_px = hi * cell_h / 100;
     assert!(
@@ -562,7 +562,7 @@ fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
         ..reached(lo_px)
     };
     assert_eq!(verdict(&tall, &ledger, &unlit), ShapeVerdict::Fail);
-    let unbounded = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
+    let unbounded = row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow);
     assert_eq!(
         verdict(&unbounded, &ledger, &reached(0)),
         ShapeVerdict::Pass,
@@ -576,12 +576,11 @@ fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
 
 #[test]
 fn a_reach_row_that_cannot_measure_its_body_is_refused() {
-    assert!(reach_row(Reach::Tall, Style::Underline).validate().is_err());
-    assert!(reach_row(Reach::Tall, Style::Off).validate().is_err());
+    assert!(reach_row(Reach::Underline, Style::Off).validate().is_err());
     assert!(
         PaintRow {
             scene: Scene::Prompt,
-            ..reach_row(Reach::Tall, Style::Flying)
+            ..reach_row(Reach::Underline, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -589,7 +588,7 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             capture: Capture::PinnedVideo,
-            ..reach_row(Reach::Tall, Style::Flying)
+            ..reach_row(Reach::Underline, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -597,7 +596,7 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             split: Some(Split::V),
-            ..reach_row(Reach::Tall, Style::Flying)
+            ..reach_row(Reach::Underline, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -605,14 +604,21 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             keys: "",
-            ..reach_row(Reach::Tall, Style::Flying)
+            ..reach_row(Reach::Underline, Style::Rainbow)
         }
         .validate()
         .is_err()
     );
-    for style in [Style::Classic, Style::Default, Style::Flying, Style::Tall] {
+    for style in [Style::Default, Style::Rainbow] {
         assert!(
-            reach_row(Reach::Tall, style).validate().is_ok(),
+            reach_row(Reach::Underline, style).validate().is_ok(),
+            "{style:?}"
+        );
+    }
+    // No style lays the tall body: the one rainbow theme is the underline.
+    for style in [Style::Default, Style::Rainbow, Style::Off] {
+        assert!(
+            reach_row(Reach::Tall, style).validate().is_err(),
             "{style:?}"
         );
     }
@@ -623,21 +629,21 @@ fn a_companion_row_is_red_for_a_companion_too_short_or_too_tall() {
     let cell_h = lit_burst().cell.h;
     for (companion, style) in [
         (Companion::Pet, Style::Default),
-        (Companion::Cat, Style::Flying),
+        (Companion::Cat, Style::Rainbow),
     ] {
         let companion_row = PaintRow {
             scene: Scene::Prompt,
             companion: Some(companion),
             ..row(Expect::Ink, Capture::UnpinnedFocused, style)
         };
-        assert!(companion_row.validate().is_ok());
-        let style_name = match style {
-            Style::Default => "rainbow kitty pet",
-            Style::Flying => "rainbow kitty flying",
-            _ => unreachable!(),
-        };
+        // The pet is the one companion a style and a `cursor_pet` select; no row can ask for
+        // the flying head, whose verdict is still read below.
+        assert_eq!(
+            companion_row.validate().is_ok(),
+            companion == Companion::Pet
+        );
         let ledger = Ledger {
-            rows: Some(vec![status(style_name, ""); 36]),
+            rows: Some(vec![status("rainbow", ""); 36]),
             final_row: None,
             fx_under_frames: 40,
         };

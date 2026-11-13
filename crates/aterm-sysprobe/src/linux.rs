@@ -1151,6 +1151,12 @@ pub fn throttle_level(zones: &[Zone], counters_rose: Option<bool>) -> Result<Thr
     })
 }
 
+/// A process's user (`Uid:`'s first field, its real uid) from `/proc/<pid>/status`.
+#[must_use]
+pub fn status_uid(text: &str) -> Option<u32> {
+    keyed(text, "Uid").and_then(|u| u32::try_from(u).ok())
+}
+
 /// A process's memory from `/proc/<pid>/status`: its anonymous pages in memory and swapped
 /// (`RssAnon + VmSwap`), bytes.
 #[must_use]
@@ -1242,22 +1248,6 @@ const SYSTEM_NVIDIA: NvidiaRead = no_nvml;
 /// Whether reading an awake card's sysfs figures leaves its runtime power management where it was, from its device's `power/runtime_status`, `power/control` and `boot_vga`.
 pub(crate) fn pm_settled(runtime_status: &str, control: &str, boot_vga: &str) -> bool {
     runtime_status == "unsupported" || control == "on" || boot_vga == "1"
-}
-
-/// The owner of a `/proc/<pid>` directory: the process's user (its effective
-/// uid, dumpable or not: the kernel gives root a non-dumpable process's files
-/// inside the directory, never the directory itself).
-fn owner(entry: &std::fs::DirEntry) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        entry.metadata().ok().map(|m| m.uid())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = entry;
-        None
-    }
 }
 
 /// The wall clock, unix ms, that a sweep reads beside `/proc/uptime` to turn each process's boot-clock start into its birth ([`ProcessReading::birth_ms`]).
@@ -1775,22 +1765,31 @@ impl Root {
         }
     }
 
+    /// `f` over the text of `proc/<pid>/status` up to [`STATUS_CAP`]: `Some(Some(val))`;
+    /// `Some(None)` when the file is past [`STATUS_CAP`]; `None` when it is unreadable.
+    fn status<T>(&self, pid: u32, f: impl FnOnce(&str) -> T) -> Option<Option<T>> {
+        let path = self.at(&format!("proc/{pid}/status"));
+        let mut buf = [0u8; crate::READ_CAP];
+        let (n, cut) = crate::read_into(&path, &mut buf).ok()?;
+        if !cut {
+            return Some(Some(f(crate::utf8_prefix(&buf[..n]))));
+        }
+        let mut whole = vec![0u8; STATUS_CAP];
+        match crate::read_into(&path, &mut whole).ok()? {
+            (n, false) => Some(Some(f(crate::utf8_prefix(&whole[..n])))),
+            (_, true) => Some(None),
+        }
+    }
+
     /// Process `pid`'s footprint and resident anonymous pages from its `status`
     /// ([`status_memory`]): `Some(Some(bytes))`; `Some(None)` when the file is past
     /// [`STATUS_CAP`] (both are unknown, and no other figure stands in for
     /// them); `None` when it is unreadable or names no anonymous memory (a
     /// kernel thread), for the caller's fallback.
     fn status_memory(&self, pid: u32) -> Option<Option<(u64, u64)>> {
-        let path = self.at(&format!("proc/{pid}/status"));
-        let mut buf = [0u8; crate::READ_CAP];
-        let (n, cut) = crate::read_into(&path, &mut buf).ok()?;
-        if !cut {
-            return status_memory(crate::utf8_prefix(&buf[..n])).map(Some);
-        }
-        let mut whole = vec![0u8; STATUS_CAP];
-        match crate::read_into(&path, &mut whole).ok()? {
-            (n, false) => status_memory(crate::utf8_prefix(&whole[..n])).map(Some),
-            (_, true) => Some(None),
+        match self.status(pid, status_memory)? {
+            Some(mem) => mem.map(Some),
+            None => Some(None),
         }
     }
 
@@ -1824,19 +1823,23 @@ impl Root {
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
             let child_ticks = stat.cutime.saturating_add(stat.cstime);
             let child_ns = u128::from(child_ticks) * 1_000_000_000 / u128::from(hz);
-            let (footprint, resident) = if stat.kernel_thread() {
-                (Some(0), None)
+            let (uid, footprint, resident) = if stat.kernel_thread() {
+                (Some(0), Some(0), None)
             } else {
-                let (footprint, resident) = match self.status_memory(pid) {
-                    Some(Some((footprint, anon))) => (Some(footprint), Some(anon)),
-                    Some(None) => (None, None),
-                    None => (
-                        self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
-                            .flatten()
-                            .map(|pages| pages.saturating_mul(page_bytes)),
-                        None,
-                    ),
+                let statm = || {
+                    self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
+                        .flatten()
+                        .map(|pages| pages.saturating_mul(page_bytes))
                 };
+                let (uid, footprint, resident) =
+                    match self.status(pid, |t| (status_uid(t), status_memory(t))) {
+                        Some(Some((uid, Some((footprint, anon))))) => {
+                            (uid, Some(footprint), Some(anon))
+                        }
+                        Some(Some((uid, None))) => (uid, statm(), None),
+                        Some(None) => (None, None, None),
+                        None => (None, statm(), None),
+                    };
                 let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten()
                 else {
                     continue;
@@ -1844,7 +1847,7 @@ impl Root {
                 if confirm.start != stat.start {
                     continue;
                 }
-                (footprint, resident)
+                (uid, footprint, resident)
             };
             let start = u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok();
             procs.push(ProcessReading {
@@ -1859,6 +1862,8 @@ impl Root {
                 resident,
                 disk_read: None,
                 disk_written: None,
+                io_read: None,
+                io_written: None,
                 energy_nj: None,
                 name: crate::procs::whole_name(
                     stat.name.as_bytes(),
@@ -1866,7 +1871,7 @@ impl Root {
                     self.longer_names(pid),
                 ),
                 pgid: stat.pgrp,
-                uid: owner(&entry),
+                uid,
                 state: RunState::from_linux(stat.state),
                 session_leader: Some(stat.session == pid),
                 sid: stat.session,
@@ -1964,6 +1969,7 @@ impl Root {
             },
             volume: Cap::Yes,
             coalitions: Cap::No(Why::Unsupported),
+            more: Vec::new(),
             capacity: self.capacity().source,
         }
     }

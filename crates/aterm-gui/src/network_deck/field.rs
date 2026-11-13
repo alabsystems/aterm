@@ -785,6 +785,14 @@ fn observer_words(
 ) -> String {
     use super::NetworkStatus;
     let status = super::network_status_of(obs);
+    let last_seen = if status == NetworkStatus::Visibility(Visibility::Active) {
+        obs.peers
+            .iter()
+            .filter(|peer| peer.reachability == Reachability::LastSeen)
+            .count()
+    } else {
+        0
+    };
     let (long, short): (String, String) = match status {
         NetworkStatus::HistoryUnavailable => ("History unavailable".into(), "History error".into()),
         NetworkStatus::HistoryRestoring => ("Restoring history".into(), "Restoring".into()),
@@ -794,7 +802,11 @@ fn observer_words(
                 .iter()
                 .filter(|p| p.reachability == Reachability::Reachable)
                 .count();
-            let words = format!("{reachable} reachable");
+            let words = if last_seen == 0 {
+                format!("{reachable} reachable")
+            } else {
+                format!("{reachable} reachable · {last_seen} last seen")
+            };
             (words.clone(), words)
         }
         NetworkStatus::Visibility(Visibility::Checking) => ("Checking".into(), "Checking".into()),
@@ -816,7 +828,7 @@ fn observer_words(
     }
     if let Some(caption) = caption {
         // Place does not establish observer or history health: keep their status first.
-        if super::place_only(status, caption) {
+        if last_seen == 0 && super::place_only(status, caption) {
             // The layout reserved only the status's short form: a caption that does not fit
             // leaves the status.
             if fits(&caption.long) {
@@ -843,10 +855,7 @@ fn observer_words(
 
 /// The shortest observer status: what its words reserve.
 fn observer_words_min(scale: f32, obs: &NetworkObservation) -> f32 {
-    observer_words(scale, obs, None, false, 0.0)
-        .split(" · ")
-        .next()
-        .map_or(0.0, |s| text_w(s, scale))
+    text_w(&observer_words(scale, obs, None, false, 0.0), scale)
 }
 
 /// One group a tally (Tier C) draws: its class, its figure, and where its glyph starts, px.
@@ -1264,6 +1273,7 @@ pub(crate) const fn reach_words(reach: Reach) -> &'static str {
         Reach::NoAnswer => "did not answer in time",
         Reach::NoRoute => "no route from this network",
         Reach::RefusedHere => "refused here",
+        Reach::LanBroker => "LAN broker unavailable",
         Reach::Reset => "connection reset",
         Reach::Connect => "could not connect",
         Reach::NoHandshake => "no handshake",
@@ -1416,6 +1426,14 @@ fn pct(v: Option<u8>) -> String {
     v.map_or_else(|| "–".into(), |v| format!("{v} %"))
 }
 
+/// What is left of a quota window at `used` whole percent (`aterm_agent::harness::left`): the
+/// survey row carries the use, the deck says the share left, as the context figure beside it.
+fn left(used: Option<u8>) -> String {
+    pct(used.map(|used| {
+        u8::try_from(aterm_agent::harness::left::of_whole(u32::from(used))).unwrap_or(0)
+    }))
+}
+
 /// The Fleet's `Now` line.
 pub(crate) fn now_line(field: &Field) -> String {
     let Some(snapshot) = field.snapshot.as_deref() else {
@@ -1520,9 +1538,9 @@ fn fleet_details(field: &Field) -> Vec<(String, String)> {
                     &mut walls,
                     format!("wall:{kind}"),
                     format!(
-                        "{name} · {} · 7d {}",
+                        "{name} · {} · 7d {} left",
                         session.sid,
-                        pct(session.usage_7d_pct)
+                        left(session.usage_7d_pct)
                     ),
                 ),
                 _ => {}
@@ -1817,14 +1835,14 @@ fn seat_details(field: &Field, key: SeatKey) -> Vec<(String, String)> {
                     .iter()
                     .map(|s| {
                         format!(
-                            "{} · {} · {} · {} · ctx {} · 5h/7d {}/{}",
+                            "{} · {} · {} · {} · ctx {} left · 5h/7d {}/{} left",
                             s.sid,
                             s.program.as_deref().unwrap_or("–"),
                             agent_word(&s.agent),
                             s.task.map_or("–", task_word),
                             pct(s.ctx_left_pct),
-                            pct(s.usage_5h_pct),
-                            pct(s.usage_7d_pct),
+                            left(s.usage_5h_pct),
+                            left(s.usage_7d_pct),
                         )
                     })
                     .collect();

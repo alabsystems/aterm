@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::store::Layout;
+use std::os::unix::fs::DirBuilderExt as _;
 
 const PROGRAM: &str = "claude-code-alab";
 const COMMAND: &str = "claude-alab";
@@ -149,7 +150,13 @@ fn managed_current_without_a_local_receipt_is_a_foreign_cas_predecessor() {
     let w = World::new("local-harness-managed-current");
     let lock = w.lock();
     let managed = w.layout.build_dir(PROGRAM, 7);
-    std::fs::create_dir_all(managed.join("bin")).unwrap();
+    // Lay the foreign managed build as the install path does, independently of the umask.
+    crate::store::make_build_parent(&managed).unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(managed.join("bin"))
+        .unwrap();
     crate::store::mark_build_ready(&managed).unwrap();
     std::os::unix::fs::symlink(&managed, w.layout.program_current(PROGRAM)).unwrap();
     assert_eq!(

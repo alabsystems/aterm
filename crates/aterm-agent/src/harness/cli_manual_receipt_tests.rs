@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use crate::harness::accounts_sync::{self, FleetRoster, MANUAL_EARLY_FLEET, OptIn};
 use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
@@ -60,7 +70,9 @@ fn transition_with(state: &State, action: &str, early: bool) -> State {
         std::fs::write(&input, &text).unwrap();
         let future = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
         for path in [&input, &fleet] {
-            std::fs::File::open(path)
+            std::fs::File::options()
+                .write(true)
+                .open(path)
                 .unwrap()
                 .set_modified(future)
                 .unwrap();
@@ -136,6 +148,7 @@ fn transition_with(state: &State, action: &str, early: bool) -> State {
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn manual_add_and_adopt_refine_the_same_durable_receipt() {
     let model = aterm_models_harness::account_manual_receipt_model();

@@ -606,7 +606,7 @@ fn the_hover_follows_a_fire_that_found_the_timer_moved() {
         0,
         Some(aterm_agent::supervise::Autopilot::Cruise),
         Some(land_at),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let before = pushed(&app);
     assert!(
@@ -662,13 +662,13 @@ fn a_timed_write_stamps_each_strip_once() {
     assert!(app.set_session_autopilot(
         0,
         Some(aterm_agent::supervise::Autopilot::Cruise),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let _ = crate::work_counts::take_tooltip_pushes();
     assert!(app.set_session_autopilot(
         0,
         Some(aterm_agent::supervise::Autopilot::Land),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let plain = crate::work_counts::take_tooltip_pushes();
     assert!(plain >= 1, "PRECONDITION: a window write stamps the strip");
@@ -676,9 +676,13 @@ fn a_timed_write_stamps_each_strip_once() {
         0,
         Some(aterm_agent::supervise::Autopilot::Cruise),
         Some(crate::autopilot_timers::wall_ms() + 3_600_000),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
-    assert_eq!(crate::work_counts::take_tooltip_pushes(), plain, "the menu");
+    assert_eq!(
+        crate::work_counts::take_tooltip_pushes(),
+        plain,
+        "a timed write"
+    );
     assert!(
         pushed(&app).contains("driven by aterm (cruise, lands "),
         "{}",

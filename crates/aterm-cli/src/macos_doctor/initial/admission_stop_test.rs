@@ -118,6 +118,7 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
             workstation: NativeHost::over(
                 system(),
                 Box::new(aterm_machines::init::prepare_workstation_selected),
+                completes_nothing,
             ),
         };
         let _lock = HeldLock::take(self.root)?;
@@ -129,42 +130,7 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         input_activation::revision_at(self.root)
     }
 
-    /// The production scoped-task admission over these inert records.
-    pub fn pending_inputs(&self) -> Result<Option<PendingInputAdmission>, String> {
-        input_pass::capture_at(self.root)
-    }
-
-    /// The production scoped coordinator, retaining the original plan while refusing all
-    /// other stages through the inert host.
-    pub fn native_input_pass(
-        &self,
-        expected: &PendingInputAdmission,
-        system: impl Fn() -> Box<dyn aterm_machines::port::System>,
-        hooks: SetupHooks,
-    ) -> Result<Option<InitialInputPass>, String> {
-        let mut host = NativeWorkstationInitial {
-            sys: system(),
-            workstation: NativeHost::over(
-                system(),
-                Box::new(aterm_machines::init::prepare_workstation_selected),
-            ),
-        };
-        let _lock = HeldLock::take(self.root)?;
-        input_pass::run_at(&mut host, self.root, expected, hooks)
-    }
-
-    /// A scoped mark using only the supplied inert console and service facts.
-    pub fn input_park_mark(
-        &self,
-        expected: &PendingInputAdmission,
-        sys: &dyn aterm_machines::port::System,
-    ) -> InitialSetupParkMark {
-        input_pass::park_mark(Some(self.root), expected, ledger::now_secs())
-            .with_console(|| Some(!aterm_machines::console::remote(sys)))
-            .with_keyboard_services(sys)
-    }
-
-    /// The same inert native input ports shared by coordinator and headless startup tests.
+    /// The inert native input ports the keyboard keeper's and headless startup tests share.
     /// The first observation lacks a service model; the attached observation can verify both
     /// current keyboard interfaces without invoking a setter.
     pub fn keyboard_system(attached: bool, unread: &[u64]) -> aterm_machines::port::Fake {
@@ -600,11 +566,7 @@ impl InitialHost for NativeWorkstationInitial {
         Err("no repository port in the native preference fixture".into())
     }
 
-    fn accounts(
-        &mut self,
-        _root: &Path,
-        _on_screen: fn() -> bool,
-    ) -> Result<Option<Report>, String> {
+    fn accounts(&mut self, _root: &Path) -> Result<Option<Report>, String> {
         Err("no account port in the native preference fixture".into())
     }
 
@@ -631,171 +593,5 @@ fn lose_publication(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn admission_stop_target_survives_terminal_publication_capture_loss() {
-        for restart in [false, true] {
-            for fault in [
-                InitialSetupAdmissionFault::BeforeFinalPublicationUnknown,
-                InitialSetupAdmissionFault::FinalPublicationUnknown,
-            ] {
-                let root = aterm_tempfile::tempdir().unwrap();
-                let mut owner = if restart {
-                    InitialSetupAdmissionStopTest::restart(root.path()).unwrap()
-                } else {
-                    InitialSetupAdmissionStopTest::startup(root.path()).unwrap()
-                };
-                assert!(owner.persist(fault).is_err());
-                assert!(!owner.pending());
-                let revision = owner.snapshot().unwrap().revision;
-                assert_eq!(owner.stop_target().unwrap(), Some(revision));
-                let before = owner.snapshot().unwrap().observation;
-                assert_eq!(
-                    owner.persist(InitialSetupAdmissionFault::None).unwrap(),
-                    None
-                );
-                assert_eq!(owner.snapshot().unwrap().observation, before);
-                let replacement = owner.choose().unwrap();
-                assert!(replacement > revision);
-                owner.stop_revision(revision).unwrap();
-                assert!(!owner.snapshot().unwrap().finished);
-                assert_eq!(owner.recover().unwrap(), replacement);
-            }
-        }
-    }
-
-    #[test]
-    fn admission_stop_before_a_confirmed_progress_never_guesses_a_target() {
-        for fault in [
-            InitialSetupAdmissionFault::PlanPublicationUnknown,
-            InitialSetupAdmissionFault::ProgressPublicationUnknown,
-        ] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let mut owner = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
-            assert!(owner.persist(fault).is_err());
-            assert!(!owner.pending());
-            assert!(owner.stop_target().is_err());
-            let revision = owner.choose().unwrap();
-            if fault == InitialSetupAdmissionFault::PlanPublicationUnknown {
-                assert_eq!(
-                    revision, 1,
-                    "a later choice can use the unreserved next revision"
-                );
-            }
-            assert!(owner.stop_target().is_err());
-            let before = owner.snapshot().unwrap().observation;
-            assert_eq!(
-                owner.persist(InitialSetupAdmissionFault::None).unwrap(),
-                None
-            );
-            assert_eq!(owner.snapshot().unwrap().observation, before);
-        }
-    }
-
-    #[test]
-    fn admission_stop_knows_an_ordinary_failed_final_save_without_admitting_again() {
-        for restart in [false, true] {
-            for fault in [
-                InitialSetupAdmissionFault::BeforeFinal,
-                InitialSetupAdmissionFault::AfterFinal,
-            ] {
-                let root = aterm_tempfile::tempdir().unwrap();
-                let mut owner = if restart {
-                    InitialSetupAdmissionStopTest::restart(root.path()).unwrap()
-                } else {
-                    InitialSetupAdmissionStopTest::startup(root.path()).unwrap()
-                };
-                assert!(owner.persist(fault).is_err());
-                assert!(owner.pending());
-                let revision = owner.snapshot().unwrap().revision;
-                assert_eq!(owner.stop_target().unwrap(), Some(revision));
-                owner.stop_revision(revision).unwrap();
-                let before = owner.snapshot().unwrap().observation;
-                assert!(owner.recover().is_err());
-                assert_eq!(owner.snapshot().unwrap().observation, before);
-            }
-        }
-    }
-
-    #[test]
-    fn admission_stop_of_a_staged_target_holds_a_fresh_startup_without_reauthorization() {
-        for (stopped, empty) in [(false, false), (true, false), (true, true)] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let mut owner = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
-            if empty {
-                owner.plan.selection = Selection::none();
-            }
-            assert!(
-                owner
-                    .persist(InitialSetupAdmissionFault::BeforeFinalPublicationUnknown)
-                    .is_err()
-            );
-            let target = owner.snapshot().unwrap().revision;
-            if stopped {
-                owner.stop_revision(target).unwrap();
-                let before = owner.snapshot().unwrap().observation;
-                assert!(
-                    owner.recover().is_err(),
-                    "a stopped staged run was admitted again"
-                );
-                let snapshot = owner.snapshot().unwrap();
-                assert!(snapshot.finished && !snapshot.permissions_allowed);
-                assert_eq!(snapshot.revision, target);
-                assert_eq!(snapshot.observation, before);
-            } else {
-                assert!(
-                    owner.recover().unwrap() > target,
-                    "unstopped staging remains recoverable"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn admission_stop_confirms_only_the_owned_pinned_failed_progress_publication() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut owner = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
-        assert!(
-            owner
-                .persist(InitialSetupAdmissionFault::ProgressAfter)
-                .is_err()
-        );
-        assert!(owner.pending());
-        let target = owner.snapshot().unwrap().revision;
-        assert_eq!(owner.stop_target().unwrap(), Some(target));
-        let newer = owner.choose().unwrap();
-        assert!(newer > target);
-        let before = owner.snapshot().unwrap().observation;
-        assert_eq!(
-            owner.persist(InitialSetupAdmissionFault::None).unwrap(),
-            None
-        );
-        assert_eq!(owner.stop_target().unwrap(), Some(target));
-        assert_eq!(owner.snapshot().unwrap().observation, before);
-    }
-
-    #[test]
-    fn admission_stop_restart_cleanup_failure_keeps_its_successfully_staged_target() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut owner = InitialSetupAdmissionStopTest::restart(root.path()).unwrap();
-        assert!(
-            owner
-                .persist(InitialSetupAdmissionFault::StagedCleanup)
-                .is_err()
-        );
-        assert!(!owner.pending());
-        let target = owner.snapshot().unwrap().revision;
-        assert_eq!(owner.stop_target().unwrap(), Some(target));
-        owner.stop_revision(target).unwrap();
-        let before = owner.snapshot().unwrap().observation;
-        assert!(owner.recover().is_err());
-        assert!(owner.snapshot().unwrap().finished);
-        assert_eq!(
-            owner.persist(InitialSetupAdmissionFault::None).unwrap(),
-            None
-        );
-        assert_eq!(owner.snapshot().unwrap().observation, before);
-    }
-}
+#[path = "admission_stop_test_tests.rs"]
+mod tests;

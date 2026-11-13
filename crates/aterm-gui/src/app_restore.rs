@@ -78,166 +78,8 @@ fn stored_start(pid: u32) -> Option<String> {
 }
 
 #[cfg(test)]
-mod kept_worker_tests {
-    use super::*;
-    use aterm_uds::process::ProcessPresence;
-
-    /// A JOB IN FRONT OF THE SHELL KEEPS THE WORKER WORKING. The leaf names one pid: with a job in
-    /// front of its shell, as a newer agent the image never saw is, that pid's death says nothing
-    /// of what runs there. CONTROL: with the shell leading its terminal, the same death ends it.
-    #[test]
-    fn a_dead_agents_pid_ends_nothing_with_a_job_in_front_of_its_shell() {
-        if !crate::test_alone::alone() {
-            return;
-        }
-        let state = aterm_tempfile::tempdir().unwrap();
-        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
-            let app = App::headless_for_test();
-            let id = app.focused_session_id(WindowId(0)).unwrap();
-            let ctx = app.pool.get(id).unwrap().ctx.clone();
-            crate::task_record::mark_session_task(
-                &ctx,
-                id,
-                &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
-            )
-            .unwrap();
-            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
-            let check = || RestoredWorkerCheck {
-                session: id,
-                nonce: ctx.nonce,
-                record: record.clone(),
-            };
-            for presence in [ProcessPresence::Absent, ProcessPresence::Exited] {
-                assert!(
-                    check()
-                        .observed(123, "original", presence, None, false)
-                        .is_none()
-                );
-                assert!(
-                    check()
-                        .observed(123, "original", presence, None, true)
-                        .is_some(),
-                    "CONTROL: the shell leads"
-                );
-            }
-            assert!(
-                check()
-                    .observed(
-                        123,
-                        "original",
-                        ProcessPresence::Present,
-                        Some("replacement"),
-                        false,
-                    )
-                    .is_none()
-            );
-        });
-    }
-
-    /// The read the worker's end rests on says what the kernel does: yes at a prompt, no with a job
-    /// in front, no for a terminal that answers nothing.
-    #[cfg(unix)]
-    #[test]
-    fn a_shell_leads_its_terminal_only_with_no_job_in_front_of_it() {
-        use crate::app_restore::crash_journal_program_tests::{
-            kill_all, spawn_leader, type_line, wait_for,
-        };
-        assert!(!shell_leads_its_terminal(-1, 1), "no terminal answers");
-        let home = aterm_tempfile::tempdir().unwrap();
-        let (master, shell) = spawn_leader(&["/bin/sh", "-i"], home.path());
-        wait_for("the shell leads its terminal", || {
-            shell_leads_its_terminal(master, shell)
-        });
-        assert!(!shell_leads_its_terminal(master, 0), "pid 0 is no shell");
-        type_line(master, "/bin/sleep 600\n");
-        let mut job = -1;
-        wait_for("the job in front of the shell", || {
-            job = crate::quit_safety::foreground_pgrp(master);
-            job > 0 && job != shell
-        });
-        let leads = shell_leads_its_terminal(master, shell);
-        kill_all(&[shell, job], &[master]);
-        assert!(!leads, "a job stands in front of it");
-    }
-
-    /// A start is compared only where the kernel stores it. Elsewhere a difference is no proof
-    /// that another process holds the pid.
-    #[test]
-    fn a_start_is_read_for_the_comparison_only_where_the_kernel_stores_it() {
-        assert_eq!(
-            stored_start(std::process::id()).is_some(),
-            cfg!(target_vendor = "apple")
-        );
-    }
-
-    #[test]
-    fn restored_worker_closure_requires_positive_identity_evidence_and_the_same_record() {
-        if !crate::test_alone::alone() {
-            return;
-        }
-        let state = aterm_tempfile::tempdir().unwrap();
-        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
-            for (presence, start, ended) in [
-                (ProcessPresence::Present, Some("original"), false),
-                (ProcessPresence::Unknown, None, false),
-                (ProcessPresence::Present, None, false),
-                (ProcessPresence::Absent, None, true),
-                (ProcessPresence::Exited, None, true),
-                (ProcessPresence::Present, Some("replacement"), true),
-            ] {
-                let mut app = App::headless_for_test();
-                let id = app.focused_session_id(WindowId(0)).unwrap();
-                let ctx = app.pool.get(id).unwrap().ctx.clone();
-                crate::task_record::mark_session_task(
-                    &ctx,
-                    id,
-                    &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
-                )
-                .unwrap();
-                let row = crate::task_record::restore_row(&ctx).unwrap();
-                crate::task_record::seed_restored(&ctx, &row, true, true);
-                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
-                assert_eq!(record.why, Some(crate::task_record::WHY_RESTORED));
-                app.finish_restored_worker_check(RestoredWorkerCheck {
-                    session: id,
-                    nonce: aterm_session::LaunchNonce::generate(),
-                    record: record.clone(),
-                });
-                assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&record));
-                let observed = RestoredWorkerCheck {
-                    session: id,
-                    nonce: ctx.nonce,
-                    record: record.clone(),
-                }
-                .observed(123, "original", presence, start, true);
-                assert_eq!(observed.is_some(), ended);
-                if let Some(check) = observed {
-                    app.finish_restored_worker_check(check);
-                    assert_eq!(
-                        ctx.timeline.lock().unwrap().task().unwrap().state,
-                        crate::task_record::TaskState::Exited
-                    );
-                    // An old result cannot overwrite a later working task.
-                    crate::task_record::mark_session_task(
-                        &ctx,
-                        id,
-                        &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
-                    )
-                    .unwrap();
-                    let changed = ctx.timeline.lock().unwrap().task().cloned().unwrap();
-                    app.finish_restored_worker_check(RestoredWorkerCheck {
-                        session: id,
-                        nonce: ctx.nonce,
-                        record,
-                    });
-                    assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&changed));
-                } else {
-                    assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&record));
-                }
-            }
-        });
-    }
-}
+#[path = "app_restore_kept_worker_tests.rs"]
+mod kept_worker_tests;
 
 /// A historical held-tab notice. Codex preparation reads account and executable files, so it
 /// runs off the main thread. Its result is only logged; it never starts or changes a session.
@@ -564,14 +406,26 @@ pub(crate) fn take_handed_off_shell(
     Some(handed_off.remove(index))
 }
 
-/// Removes and returns the handed-off shell adopted as bootstrap session 0.
+/// Removes and returns the handed-off shell adopted as bootstrap session 0. With no layout that
+/// is the first shell no quit kept: one the last window's quit kept past it (the Mac Setup tab's
+/// installer, `keeper_link::Claim::kept`) never becomes the window's first tab, so a launch with
+/// nothing to restore opens its own shell in front and that install lands behind it
+/// ([`App::land_orphan_tab`]).
 pub(crate) fn take_session0_shell(
     handed_off: &mut Vec<crate::spawn::Adopted>,
     layout: Option<&restore::RestoreManifest>,
 ) -> Option<crate::spawn::Adopted> {
     match layout.and_then(|layout| layout.windows.first()) {
         Some(window0) => take_handed_off_shell(handed_off, window0.bootstrap_local_id()),
-        None => (!handed_off.is_empty()).then(|| handed_off.remove(0)),
+        None => {
+            let index = handed_off.iter().position(|shell| {
+                !shell
+                    .keeper
+                    .as_ref()
+                    .is_some_and(crate::keeper_link::Claim::kept)
+            })?;
+            Some(handed_off.remove(index))
+        }
     }
 }
 
@@ -821,9 +675,18 @@ impl App {
                     let _ = (index, wid);
                     restore::WindowShow::UNKNOWN
                 };
+                // A tab of Mac Setup terminals alone is described only to a handoff, as each such
+                // leaf is ([`App::is_developer_tools_session`]); its terminal index goes with it.
                 let terminal_tabs = ws
                     .layouts
                     .iter()
+                    .filter(|tree| {
+                        let mut plain = false;
+                        tree.visit_sessions(&mut |session| {
+                            plain |= !self.is_developer_tools_session(session);
+                        });
+                        handoff || plain
+                    })
                     .map(|tree| tree.to_layout(&|id| self.restore_session_meta(id)))
                     .collect::<Vec<_>>();
                 let mut native_tabs = Vec::new();
@@ -841,7 +704,13 @@ impl App {
                         }
                         restored_tabs.push(restored);
                     }
-                    let entry = if !tab.root.any_leaf(&mut |view| {
+                    let entry = if !handoff
+                        && !tab
+                            .root
+                            .any_leaf(&mut |view| !self.view_is_developer_tools_session(*view))
+                    {
+                        None
+                    } else if !tab.root.any_leaf(&mut |view| {
                         !matches!(
                             self.view_store.get(*view),
                             Some(crate::tab_model::View::Terminal(_))
@@ -902,6 +771,21 @@ impl App {
                 .and_then(|wid| self.windows.keys().position(|live| *live == wid));
             drain.carry_owed(&mut windows, filling_at, &filling_tabs);
         }
+        // A desk with only private documents has nothing a handoff can describe, and a kept image
+        // would hold its update until they closed, though a handoff from any other desk drops the
+        // same tabs. A Recovery tab says where they went, and every sessionless target restores it.
+        // A desk with only that tab, after an earlier handoff, goes the same way.
+        if handoff
+            && !windows
+                .iter()
+                .any(|window| window.kept_in_layout(lone_lists))
+        {
+            for (window, &wid) in windows.iter_mut().zip(self.windows.keys()) {
+                if self.window_holds_no_capture(wid) {
+                    window.stand_in_for_private_documents();
+                }
+            }
+        }
         // After `carry_owed`, which fills by position.
         windows.retain(|window| window.kept_in_layout(lone_lists));
         let mut manifest = restore::RestoreManifest::new(windows);
@@ -951,7 +835,8 @@ impl App {
             }
             crate::native_app::AppKind::Markdown
             | crate::native_app::AppKind::Recovery
-            | crate::native_app::AppKind::Workers => None,
+            | crate::native_app::AppKind::Workers
+            | crate::native_app::AppKind::Tables => None,
         }
     }
 
@@ -965,7 +850,10 @@ impl App {
 
     /// A private document's view ([`App::view_is_private`]) is never described: its values live
     /// only while its reader holds the tab, so a split drops it and its sibling takes its place,
-    /// and a tab that holds nothing else is not restored or reopened.
+    /// and a tab that holds nothing else is not restored or reopened. A Mac Setup tab's terminal
+    /// ([`App::is_developer_tools_session`]) is left out the same way unless `carry_drafts` (an
+    /// update's handoff, whose successor fills its leaf with the same PTY): any other restore
+    /// would bring its one install attempt back as a plain shell.
     fn tab_restore_descriptor_carrying(
         &self,
         tab: &crate::tab_model::Tab,
@@ -988,7 +876,9 @@ impl App {
         ) -> Option<Captured> {
             match node {
                 crate::tab_model::SplitTree::Leaf(view) => {
-                    if app.view_is_private(*view) {
+                    if app.view_has_no_capture(*view)
+                        || (!carry_drafts && app.view_is_developer_tools_session(*view))
+                    {
                         return Some(Captured::Private);
                     }
                     if *view == focus {
@@ -1063,7 +953,9 @@ impl App {
         // A focus on a dropped private leaf moves to the kept tree's first leaf.
         let focused_path = match focused_path {
             Some(path) => path,
-            None if self.view_is_private(tab.focus) => {
+            None if self.view_has_no_capture(tab.focus)
+                || (!carry_drafts && self.view_is_developer_tools_session(tab.focus)) =>
+            {
                 let mut path = Vec::new();
                 let mut node = &*root;
                 while let restore::RestoredSplitTree::Split { first, .. } = node {
@@ -1080,6 +972,7 @@ impl App {
             zoomed: tab.zoomed,
             parked: tab.parked,
             ephemeral: tab.ephemeral,
+            fleet: tab.fleet && (tab.parked || tab.ephemeral),
         })
     }
 
@@ -1097,7 +990,7 @@ impl App {
         carry_drafts: bool,
         worker: bool,
     ) -> Option<restore::RestoredView> {
-        if self.view_is_private(view) {
+        if self.view_has_no_capture(view) {
             return None;
         }
         match self.view_store.get(view).copied()? {
@@ -1251,6 +1144,7 @@ impl App {
                     | crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::Allocation(_)
                     | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Tables(_)
                     | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
@@ -1347,6 +1241,7 @@ impl App {
                 | crate::native_app::AppViewState::Settings(_)
                 | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_)
+                | crate::native_app::AppViewState::Tables(_)
                 | crate::native_app::AppViewState::SystemState(_) => true,
                 crate::native_app::AppViewState::Editor(editor) => {
                     let (Some(text), Some(buffer)) =
@@ -2809,19 +2704,7 @@ impl App {
                         );
                     }
                     self.next_session_id += 1;
-                    Self::register_session(&self.store, &s, None);
-                    let tree = pane::PaneTree::new(id);
-                    let tab = crate::register_terminal_tab(
-                        &mut self.tab_ids,
-                        &mut self.view_store,
-                        &tree,
-                    )
-                    .expect("restored orphan tab identity space");
-                    self.pool_insert(s);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
-                        crate::app_tabs::land_terminal_tab(ws, &self.view_store, tree, tab)
-                            .expect("fresh restored tab id");
-                    }
+                    self.land_orphan_tab(wid, s);
                 }
                 Err(e) => {
                     crate::logging::stderr_line!(
@@ -2837,6 +2720,31 @@ impl App {
             self.sync_active_session();
         } else {
             self.sync_window(wid);
+        }
+    }
+
+    /// Put `session`, adopted from the keeper with no leaf to fill, into window `wid` as a tab
+    /// of its own, in front; but a Mac Setup tab whose install an earlier aterm's quit or crash
+    /// left running ([`App::recover_developer_tools_install`] takes it as it joins the pool)
+    /// lands behind the tab the window shows, as its tries do, so the restored desk keeps its
+    /// front tab. The caller syncs the window.
+    pub(crate) fn land_orphan_tab(&mut self, wid: WindowId, session: Session) {
+        let id = session.id;
+        Self::register_session(&self.store, &session, None);
+        let tree = pane::PaneTree::new(id);
+        let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &tree)
+            .expect("restored orphan tab identity space");
+        self.pool_insert(session);
+        let behind = self.is_developer_tools_session(id);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            let front = ws.tab_set.active_id().filter(|_| behind);
+            crate::app_tabs::land_terminal_tab(ws, &self.view_store, tree, tab)
+                .expect("fresh restored tab id");
+            if let Some(front) = front
+                && ws.tab_set.switch_to(front)
+            {
+                crate::app_tabs::align_terminal_projection_to_active(ws, &self.view_store);
+            }
         }
     }
 
@@ -3349,10 +3257,13 @@ impl App {
             crate::tab_model::Tab::from_root(tab_id, root, focus, record.zoomed, presentation);
         // A tab with no terminal left is a Recovery tab, and one no leaf's task record came with
         // has no row to say what it is and no task to end: each stays where the person sees it,
-        // theirs.
-        let worker = pane_tree.is_some() && self.tab_has_task(&tab);
+        // theirs. A fleet drive's tab is a request's with no task record (a drive's plain shell
+        // has none), so it goes back where the drive put it, parked under the Workers tab
+        // (ATERM-KI-1109-3).
+        let worker = pane_tree.is_some() && (record.fleet || self.tab_has_task(&tab));
         tab.parked = record.parked && worker;
         tab.ephemeral = (record.ephemeral || record.parked) && worker;
+        tab.fleet = record.fleet && tab.ephemeral;
         self.note_restored_opens(wid, &tab);
         Ok((tab, pane_tree))
     }

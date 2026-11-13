@@ -960,6 +960,213 @@ fn a_shallow_submodule_fetched_deeper_than_one_commit_is_no_work() {
     assert_eq!(w.sub_unpushed, 1, "{w:?}");
 }
 
+/// A Cargo source checkout with no tracking refs or usable FETCH_HEAD, as Cargo leaves it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cargo_checkout(base: &Path) -> (PathBuf, PathBuf, String) {
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).expect("source");
+    let source = repo(&source, false);
+    local_commit(&source, "source-tip.txt");
+    let sha = scratch_git(&source, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    // A literal replacement character is valid UTF-8, not evidence of lossy decoding.
+    let cache = base.join("cache with spaces %zz \u{fffd}/git");
+    let database = cache.join("db/example-0123456789abcdef");
+    std::fs::create_dir_all(database.parent().expect("db parent")).expect("db");
+    scratch_git(
+        base,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            source.to_str().expect("source path"),
+            database.to_str().expect("database path"),
+        ],
+    );
+    scratch_git(
+        &database,
+        &["update-ref", &format!("refs/commit/{sha}"), &sha],
+    );
+    let checkout = cache
+        .join("checkouts/example-0123456789abcdef")
+        .join(&sha[..7]);
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    scratch_git(&checkout, &["init", "-q"]);
+    let url = format!(
+        "file://{}",
+        aterm_codec::pct::encode(database.to_str().expect("DB path"))
+    );
+    scratch_git(&checkout, &["remote", "add", "origin", &url]);
+    scratch_git(
+        &checkout,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "-q",
+            "origin",
+            &sha,
+        ],
+    );
+    scratch_git(&checkout, &["checkout", "-q", "-B", "master", "FETCH_HEAD"]);
+    std::fs::write(checkout.join(".git/FETCH_HEAD"), "").expect("empty FETCH_HEAD");
+    std::fs::write(checkout.join(".cargo-ok"), "").expect("Cargo completion marker");
+    assert_eq!(
+        scratch_git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"]
+        ),
+        ""
+    );
+    (checkout, database, sha)
+}
+
+/// Cached source history is not session work; only edits, stashes and new commits are.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cargo_source_snapshots_do_not_hold_fetched_history_or_generated_markers() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (checkout, _, _) = cargo_checkout(tmp.path());
+    let read = probe(&checkout, Some(tmp.path()), PROBE_LIMIT);
+    assert!(read.checked().is_some(), "cached source: {read:?}");
+
+    std::fs::write(checkout.join("a.txt"), "edited\n").expect("source edit");
+    let work = found(&checkout).expect("tracked source edit");
+    assert_eq!(
+        (work.changed, work.untracked, work.unpushed),
+        (1, 0, 0),
+        "{work:?}"
+    );
+    scratch_git(&checkout, &["checkout", "--", "a.txt"]);
+
+    std::fs::write(checkout.join("notes.txt"), "authored\n").expect("new source file");
+    let work = found(&checkout).expect("untracked authored file");
+    assert_eq!(
+        (work.changed, work.untracked, work.unpushed),
+        (0, 1, 0),
+        "{work:?}"
+    );
+    assert_eq!(work.paths, ["notes.txt"]);
+    std::fs::remove_file(checkout.join("notes.txt")).expect("remove owned test file");
+
+    scratch_git(&checkout, &["add", ".cargo-ok"]);
+    let work = found(&checkout).expect("explicitly staged marker is tracked work");
+    assert_eq!((work.changed, work.untracked), (1, 0), "{work:?}");
+    scratch_git(&checkout, &["reset", "-q", "HEAD", "--", ".cargo-ok"]);
+
+    std::fs::write(checkout.join("a.txt"), "stashed\n").expect("stash source edit");
+    scratch_git(&checkout, &["stash", "push", "-q", "-m", "source edit"]);
+    let work = found(&checkout).expect("authored stash");
+    assert_eq!(
+        (work.stashes, work.untracked, work.unpushed),
+        (1, 0, 0),
+        "{work:?}"
+    );
+    scratch_git(&checkout, &["stash", "drop", "-q"]);
+
+    local_commit(&checkout, "local.txt");
+    let work = found(&checkout).expect("commit beyond cached source");
+    assert_eq!((work.unpushed, work.untracked), (1, 0), "{work:?}");
+    never_clean_when_cut(
+        &checkout,
+        &Used::default(),
+        "new commit beyond Cargo source",
+    );
+}
+
+/// A marker alone, a nonempty marker or an unpinned database never excuses work.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cargo_marker_requires_matching_cache_layout_and_pinned_source() {
+    let ordinary = aterm_tempfile::tempdir().expect("ordinary tmp");
+    let ordinary = repo(ordinary.path(), true);
+    std::fs::write(ordinary.join(".cargo-ok"), "").expect("ordinary authored marker");
+    assert_eq!(found(&ordinary).expect("ordinary marker").untracked, 1);
+
+    let tmp = aterm_tempfile::tempdir().expect("Cargo tmp");
+    let (checkout, database, sha) = cargo_checkout(tmp.path());
+    std::fs::write(checkout.join(".cargo-ok"), "authored\n").expect("nonempty marker");
+    let work = found(&checkout).expect("nonempty marker");
+    assert_eq!(work.untracked, 1, "{work:?}");
+    std::fs::write(checkout.join(".cargo-ok"), "").expect("restore generated marker");
+    scratch_git(
+        &database,
+        &["update-ref", "-d", &format!("refs/commit/{sha}")],
+    );
+    let work = found(&checkout).expect("source is not pinned by its configured database");
+    assert_eq!((work.untracked, work.unpushed), (1, 2), "{work:?}");
+}
+
+/// A tracking main behind the cached source does not turn fetched history into unlanded work.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cargo_source_baseline_excludes_fetched_history_beyond_tracking_main() {
+    let tmp = aterm_tempfile::tempdir().expect("Cargo tmp");
+    let (checkout, _, _) = cargo_checkout(tmp.path());
+    let older = scratch_git(&checkout, &["rev-parse", "HEAD^"]);
+    scratch_git(
+        &checkout,
+        &["update-ref", "refs/remotes/origin/main", older.trim()],
+    );
+    let cached = probe(&checkout, Some(tmp.path()), PROBE_LIMIT);
+    assert!(cached.checked().is_some(), "fetched source: {cached:?}");
+
+    local_commit(&checkout, "authored.txt");
+    let work = found(&checkout).expect("authored commit beyond cached source");
+    assert_eq!((work.unpushed, work.unlanded), (1, 1), "{work:?}");
+    assert_eq!(work.main_ref, "origin/main");
+}
+
+/// A malformed file URL or a symlink completion marker never proves fetched source.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cargo_source_requires_a_valid_origin_and_regular_completion_marker() {
+    let tmp = aterm_tempfile::tempdir().expect("Cargo tmp");
+    let (checkout, database, _) = cargo_checkout(tmp.path());
+    let url = scratch_git(&checkout, &["remote", "get-url", "origin"]);
+    let url = url.trim();
+    for invalid in [
+        url.replace("%25", "%"),
+        url.replace("%EF%BF%BD", "%FF"),
+        url.replace("%EF%BF%BD", "%00"),
+        format!("{url}?query=metadata"),
+        format!("{url}#fragment"),
+        url.replacen("file://", "file://localhost", 1),
+    ] {
+        scratch_git(&checkout, &["remote", "set-url", "origin", &invalid]);
+        let work = found(&checkout).expect("invalid origin keeps the work visible");
+        assert_eq!((work.untracked, work.unpushed), (1, 2), "{work:?}");
+    }
+    scratch_git(&checkout, &["remote", "set-url", "origin", url]);
+    let valid = probe(&checkout, Some(tmp.path()), PROBE_LIMIT);
+    assert!(valid.checked().is_some(), "valid escaped origin: {valid:?}");
+
+    // An absolute local path is not a URL: its literal percent remains a filename byte.
+    scratch_git(
+        &checkout,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            database.to_str().expect("DB path"),
+        ],
+    );
+    let local = probe(&checkout, Some(tmp.path()), PROBE_LIMIT);
+    assert!(
+        local.checked().is_some(),
+        "absolute local origin: {local:?}"
+    );
+
+    let marker = checkout.join(".cargo-ok");
+    std::fs::remove_file(&marker).expect("remove generated marker");
+    let target = tmp.path().join("empty-marker");
+    std::fs::write(&target, "").expect("empty symlink target");
+    std::os::unix::fs::symlink(&target, &marker).expect("symlink marker");
+    let work = found(&checkout).expect("a symlink marker is ordinary work");
+    assert_eq!((work.untracked, work.unpushed), (1, 2), "{work:?}");
+}
+
 #[test]
 fn fetch_head_display_url_matches_git_store_updated_refs() {
     assert_eq!(

@@ -19,20 +19,23 @@ impl UsageReader for Fresh<'_> {
         now: i64,
         wait: Duration,
         use_token: crate::harness::provider_read::Use,
-    ) -> Option<IdentifiedUsage> {
-        let _read = use_token
-            .begin_home(
-                crate::harness::provider_read::Read::CodexEndpoint,
-                path,
-                now,
-            )
-            .ok()?;
-        assert!(!wait.is_zero());
-        let mut usage = self.0.answers.get(path)?.clone();
-        usage.usage.sample.at = now;
-        usage.usage.sample.session_read_at = Some(now);
-        usage.usage.sample.week_read_at = Some(now);
-        Some(usage)
+    ) -> IdentifiedRead {
+        (|| -> Option<IdentifiedUsage> {
+            let _read = use_token
+                .begin_home(
+                    crate::harness::provider_read::Read::CodexEndpoint,
+                    path,
+                    now,
+                )
+                .ok()?;
+            assert!(!wait.is_zero());
+            let mut usage = self.0.answers.get(path)?.clone();
+            usage.usage.sample.at = now;
+            usage.usage.sample.session_read_at = Some(now);
+            usage.usage.sample.week_read_at = Some(now);
+            Some(usage)
+        })()
+        .into()
     }
 }
 

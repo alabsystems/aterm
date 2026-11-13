@@ -69,7 +69,7 @@ impl TierB {
 pub const fn rank(name: WaitName) -> u8 {
     match name {
         WaitName::ProgramCheck | WaitName::Translating => 0,
-        WaitName::Memory | WaitName::BuildAdmission => 1,
+        WaitName::Memory | WaitName::BuildAdmission | WaitName::AtermWait => 1,
         WaitName::TtyPassword => 2,
         WaitName::TtyBuiltinRead => 3,
         WaitName::TtyRaw => 4,
@@ -94,6 +94,7 @@ pub const fn standing_of(name: WaitName) -> Standing {
         | WaitName::Translating
         | WaitName::Memory
         | WaitName::BuildAdmission
+        | WaitName::AtermWait
         | WaitName::TtyPassword
         | WaitName::TtyBuiltinRead
         | WaitName::TtyRaw
@@ -147,6 +148,12 @@ pub struct JobFacts {
     pub behind: bool,
 }
 
+/// Whether `name` is a wait another party vouches for (a build-slot ticket, an `await` aterm holds
+/// parked), which excuses only its own leaf ([`name_job`]).
+const fn vouched(name: WaitName) -> bool {
+    matches!(name, WaitName::BuildAdmission | WaitName::AtermWait)
+}
+
 /// Classifies the wait of a job from its waiting `leaves` and `shell`.
 #[must_use]
 pub fn name_job(
@@ -171,7 +178,7 @@ pub fn name_job(
         if w.name == WaitName::Kernel {
             kernel = Some(w.clone());
         }
-        other_unproven |= w.name != WaitName::BuildAdmission && w.standing != Standing::Legit;
+        other_unproven |= !vouched(w.name) && w.standing != Standing::Legit;
         admission_blocked |= w.name == WaitName::BuildAdmission && w.standing != Standing::Legit;
         own_wait |=
             !(*pid == job.reader && w.name == WaitName::EventLoop && reads_terminal(scene, *pid));
@@ -179,11 +186,12 @@ pub fn name_job(
             best = Some(w);
         }
     }
-    if let Some(w) = best.as_mut().filter(|w| w.name == WaitName::BuildAdmission) {
+    if let Some(w) = best.as_mut().filter(|w| vouched(w.name)) {
         if let Some(kernel) = kernel {
             return kernel;
         }
-        // A queued leaf does not excuse another leaf whose dependency is unknown or stuck.
+        // A queued or parked leaf does not excuse another leaf whose dependency is unknown or
+        // stuck.
         if other_unproven {
             w.standing = Standing::Capped;
         } else if admission_blocked && w.standing == Standing::Legit {
@@ -197,10 +205,11 @@ pub fn name_job(
                 | WaitName::Translating
                 | WaitName::Memory
                 | WaitName::BuildAdmission
+                | WaitName::AtermWait
         )
     }) {
-        // A held or translating leaf, and a front waiting for its claim, is not reading the
-        // terminal, whatever mode its program left it in.
+        // A held or translating leaf, a front waiting for its claim, and a process parked in an
+        // aterm `await`, is not reading the terminal, whatever mode its program left it in.
         return w.clone();
     }
     if job.behind {
@@ -294,6 +303,18 @@ fn leaf_wait(
         }
         _ => {}
     }
+    // A process aterm holds an `await` of parked waits on what it asked aterm for, whatever its
+    // descriptors say (its connection is aterm's socket), unless the kernel holds it.
+    if p.aterm_wait {
+        if scene
+            .d_age
+            .get(&pid)
+            .is_some_and(|&ms| ms >= super::KERNEL_WAIT_MS)
+        {
+            return Some(mk(WaitName::Kernel));
+        }
+        return Some(mk(WaitName::AtermWait));
+    }
     // A build's front that runs no child waits for its claim, whatever its descriptors say (its
     // look at the ledger is a timer's; what it inherited is its caller's), unless the kernel holds
     // it.
@@ -359,16 +380,16 @@ fn leaf_wait(
         if !(flagged || (linux_reading && named(f))) {
             continue;
         }
-        let writer = holder(scene, *peer, *handle, true, pid);
+        let writers = holders(scene, *peer, *handle, true, pid);
+        let writer = writers.first().copied();
         if writer.is_some() && writer == consumer {
             let mut w = mk(WaitName::Serves);
             w.peer = writer;
             return Some(w);
         }
         let mut w = mk(WaitName::Pipe);
-        w.peer = writer;
+        (w.peer, w.standing) = pipe_standing(scene, consumer, &writers, depth);
         w.pipe = Some((*handle, *peer));
-        w.standing = peer_standing(scene, consumer, writer, depth);
         return Some(w);
     }
     if wchan == "wait_for_partner" {
@@ -392,15 +413,14 @@ fn leaf_wait(
         if *write_end == Some(false) {
             continue;
         }
-        let reader = holder(scene, *peer, *handle, false, pid);
         let full = scene.lanes.pipe_flags && reader_end_full(scene, *peer, *handle, pid);
         if !(full || (linux_writing && *write_end == Some(true) && named(f))) {
             continue;
         }
+        let readers = holders(scene, *peer, *handle, false, pid);
         let mut w = mk(WaitName::PipeFull);
-        w.peer = reader;
+        (w.peer, w.standing) = pipe_standing(scene, consumer, &readers, depth);
         w.pipe = Some((*handle, *peer));
-        w.standing = peer_standing(scene, consumer, reader, depth);
         return Some(w);
     }
 
@@ -552,8 +572,29 @@ pub fn loop_feeders(scene: &Scene<'_>, w: &Wait) -> Vec<u32> {
     found
 }
 
-fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -> Option<u32> {
-    holders(scene, peer, this, want_write, not).first().copied()
+/// How a pipe wait counts, by every process holding its far end (`peers`, lowest pid first), and
+/// the one it names: legitimate as soon as one of them counts as legitimate (a second writer
+/// that works while the first sits idle), named by the first that does; else the best of their
+/// standings (stuck-capable before capped), named by the first holding it; capped with none.
+fn pipe_standing(
+    scene: &Scene<'_>,
+    consumer: Option<u32>,
+    peers: &[u32],
+    depth: usize,
+) -> (Option<u32>, Standing) {
+    let mut best: Option<(u32, Standing)> = None;
+    for &peer in peers {
+        match peer_standing(scene, consumer, Some(peer), depth) {
+            Standing::Legit => return (Some(peer), Standing::Legit),
+            Standing::Capable if best.is_none_or(|(_, s)| s == Standing::Capped) => {
+                best = Some((peer, Standing::Capable));
+            }
+            s => {
+                best.get_or_insert((peer, s));
+            }
+        }
+    }
+    best.map_or((None, Standing::Capped), |(peer, s)| (Some(peer), s))
 }
 
 /// The pids holding the end `peer` of the pipe whose other end is `this`, lowest first: on

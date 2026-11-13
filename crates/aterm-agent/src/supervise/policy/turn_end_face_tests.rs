@@ -140,7 +140,7 @@ fn a_failed_conclusion_is_its_own_face_until_a_turn_or_cruise_lifts_it() {
 /// THE FACE MOVES WITH THE POLICY'S OWN POINTS, told once each
 /// ([`TurnEndState::face_moved`]): the land act's clean defense lands the
 /// task; a person's quick turn after it opens it again, since Land carries every message but the
-/// session's opening one (owner ruling 2026-10-27), which is theirs.
+/// session's opening one, which is theirs.
 #[test]
 fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
     let mut now = t0();
@@ -251,7 +251,7 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     assert_eq!(st.face(), TaskFace::Open);
 
     // The person's own exchange that opens the session is theirs under Land; Cruise carries it,
-    // so it never shows `theirs` there (owner rulings 2026-10-26 and 2026-10-27).
+    // so it never shows `theirs` there.
     let greeting = TurnEndReading {
         person: Some(Duration::from_secs(8)),
         key: Some(Duration::from_secs(8)),

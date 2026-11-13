@@ -2179,3 +2179,44 @@ fn ordinary_and_bounded_readers_apply_log_progress_without_an_envelope_server() 
         }
     }
 }
+
+/// A membership-log change under the envelope this Mac already holds applies that envelope
+/// again from its own cache ([`cached_log_progress`]), and leaves the cache file as it is: each
+/// such apply wrote the cache's own bytes back over it (1.2 MB on a lab Mac at every records
+/// head change, 2026-11-11). The entry the log moved is still written.
+/// NEGATIVE CONTROL (2026-11-11): with the apply storing the envelope by `fsx::write_atomic`
+/// whatever the state names, the cache after the apply is another file (`the cache is left as
+/// it is`).
+#[test]
+fn log_progress_under_the_held_envelope_leaves_the_cache_file_as_it_is() {
+    let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
+    let before = load_state(&lab.m7).unwrap();
+    let cache = fsx::stamp(&lab.m7.cache_file()).unwrap();
+    let bytes = std::fs::read(lab.m7.cache_file()).unwrap();
+    let admin = admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "shared", b"new")
+        .unwrap();
+    admin_publish(&lab.m22, &admin, &doc).unwrap();
+    save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
+    lab.server.stop();
+
+    let outcome = sync_with_candidates(&lab.m7, None, &[]).unwrap();
+    assert!(
+        matches!(outcome, SyncOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    let after = load_state(&lab.m7).unwrap();
+    assert_eq!((after.seq, after.digest), (before.seq, before.digest));
+    assert_ne!(after.records_digest, before.records_digest);
+    assert_eq!(
+        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        fsx::stamp(&lab.m7.cache_file()),
+        Some(cache),
+        "the cache is left as it is"
+    );
+    assert_eq!(std::fs::read(lab.m7.cache_file()).unwrap(), bytes);
+}

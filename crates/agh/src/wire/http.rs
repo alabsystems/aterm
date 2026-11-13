@@ -6,6 +6,8 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use aterm_http::{Body, Client, ProxyMode, SendError, Trust};
 use aterm_uds::secret::Secret;
@@ -21,6 +23,15 @@ use crate::wire::{
 pub struct HttpTransport {
     client: Client,
     env: Arc<dyn EnvSource + Send + Sync>,
+    boundary: Option<(Instant, Arc<AtomicBool>)>,
+}
+
+#[derive(Debug)]
+struct JobGuard(Arc<AtomicBool>);
+impl aterm_http::Guard for JobGuard {
+    fn is_authorized(&self) -> bool {
+        !self.0.load(Ordering::Acquire)
+    }
 }
 
 impl HttpTransport {
@@ -34,6 +45,7 @@ impl HttpTransport {
                 Deadlines::JSON_BACKSTOP,
             ),
             env,
+            boundary: None,
         }
     }
 
@@ -48,7 +60,17 @@ impl HttpTransport {
                 Deadlines::JSON_BACKSTOP,
             ),
             env,
+            boundary: None,
         }
+    }
+
+    /// Bound every native dispatch and response body by one job's original deadline.
+    /// Stop prevents subsequent dispatch; an in-flight call retains its bounded deadline.
+    /// SDK retry/rate waits are the caller's responsibility, so bounded jobs disable retries.
+    #[must_use]
+    pub fn bounded(mut self, until: Instant, stopped: Arc<AtomicBool>) -> Self {
+        self.boundary = Some((until, stopped));
+        self
     }
 }
 
@@ -255,6 +277,24 @@ impl HttpTransport {
         req: WireRequest<'_>,
         started: crate::fx::NativeRequestStart,
     ) -> Result<WireResponse, WireError> {
+        let left = match &self.boundary {
+            Some((_, stopped)) if stopped.load(Ordering::Acquire) => {
+                return Err(WireError {
+                    phase: Phase::NotSent,
+                    kind: WireKind::Revoked,
+                    detail: "background read was stopped before dispatch".into(),
+                });
+            }
+            Some((until, _)) => Some(started.remaining_until(*until)),
+            None => None,
+        };
+        if left.is_some_and(|left| left.is_zero()) {
+            return Err(WireError {
+                phase: Phase::NotSent,
+                kind: WireKind::Timeout,
+                detail: "background read deadline expired before dispatch".into(),
+            });
+        }
         if let Some(refusal) = guard(&req) {
             return Err(refusal);
         }
@@ -274,7 +314,10 @@ impl HttpTransport {
             atomic_refs: _,
             repo_create: _,
         } = req;
-        let remaining = |within| started.remaining(within);
+        let remaining = |within| {
+            let remaining = started.remaining(within);
+            left.map_or(remaining, |left| remaining.min(left))
+        };
         let connect = remaining(deadlines.connect);
         if connect.is_zero()
             || deadlines
@@ -288,6 +331,11 @@ impl HttpTransport {
             });
         }
         let mut builder = self.client.request(http_method(method), &url);
+        if let Some((until, stopped)) = &self.boundary {
+            builder = builder
+                .until(*until)
+                .guard(Arc::new(JobGuard(Arc::clone(stopped))));
+        }
         for (name, value) in &headers {
             builder = builder.header(name, value);
         }
@@ -297,11 +345,14 @@ impl HttpTransport {
         }
         let mut builder = builder
             .limit(usize::try_from(limit).unwrap_or(usize::MAX))
-            .idle(deadlines.idle)
+            .idle(left.map_or(deadlines.idle, |left| deadlines.idle.min(left)))
             .connect_within(connect);
         builder = match deadlines.backstop {
             Some(backstop) => builder.backstop(remaining(backstop)),
-            None => builder.without_backstop(),
+            None => match left {
+                Some(left) => builder.backstop(left),
+                None => builder.without_backstop(),
+            },
         };
         let body = match body {
             WireBody::Empty => Body::Empty,

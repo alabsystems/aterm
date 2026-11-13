@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance of the setup run's ledger and the kept-by-person record to `SetupLedger`
-//! (`aterm_models_setup::setup_ledger_model`, design §6.9).
+//! Conformance of the setup run's ledger to `SetupLedger`
+//! (`aterm_models_setup::setup_ledger_model`, design §6.9), and of the record of the keys that
+//! changed after aterm set them to `SetupKeptKey` (`aterm_models_setup::setup_kept_key_model`).
 //!
-//! The walk replays every reachable step of the model on the real ledger and record, and at
+//! The ledger's walk replays every reachable step of its model on the real ledger (and the
+//! login job's definition following the progress record, `resume::follow_with`), and at
 //! every reachable state drives each begin the model refuses, which the ledger must refuse
-//! too. The negative control plants each defect in the code under test
-//! ([`ledger::Defect`]), never in the rig, and shows the walk or an invariant catches it.
+//! too. The record's walk replays every reachable step of its model on the real record and
+//! reads the record back after each, as a launch after a process end anywhere would. Each
+//! negative control plants each defect in the code under test ([`ledger::Defect`]), never in
+//! the rig, and shows the walk or an invariant catches it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aterm_models_setup::setup_ledger_model;
+use aterm_models_setup::{setup_kept_key_model, setup_ledger_model};
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::xref::StepEvidence;
@@ -19,7 +23,7 @@ use aterm_spec::xref::StepEvidence;
 use super::*;
 use ledger::{Admit, Defect, Ledger, Software, SoftwareEpoch, Stamp};
 
-const PROJECTED: [&str; 19] = [
+const PROJECTED: [&str; 22] = [
     "alive",
     "software_known_a",
     "software_known_b",
@@ -27,53 +31,56 @@ const PROJECTED: [&str; 19] = [
     "run_a",
     "att_a",
     "park_a",
+    "due_a",
     "ever_a",
     "quit_a",
     "done_b",
     "run_b",
     "att_b",
     "park_b",
+    "due_b",
     "ever_b",
     "quit_b",
     "noting",
-    "applied",
-    "kept",
-    "wrote_kept",
+    "rebooted",
+    "trigger",
+    "strike_a",
+    "strike_b",
 ];
 
-const ANCHORED: [&str; 23] = [
+const ANCHORED: [&str; 21] = [
     "AdoptSoftwareA",
     "AdoptSoftwareB",
-    "ApplyKey",
     "BeginA",
     "BeginB",
+    "BeginDueA",
+    "BeginDueB",
     "CheckAgain",
     "EndA",
     "EndB",
     "FailA",
     "FailB",
-    "GroupOn",
     "HangA",
     "HangB",
+    "Login",
     "NoteQuit",
     "NewSoftwareA",
     "NewSoftwareB",
-    "PersonChanges",
     "RefuseQuit",
     "Relaunch",
-    "Restore",
     "RetainSoftwareA",
     "RetainSoftwareB",
-    "UnattendedPass",
 ];
 
-const MUTANTS: [&str; 6] = [
+const MUTANTS: [&str; 8] = [
     "RerunDone",
     "RelaunchForgetsDone",
     "RelaunchNeverParks",
-    "ApplyKept",
+    "RelaunchParksForGood",
+    "RelaunchCountsRestart",
     "RefuseKeepsNote",
     "BeginWhileQuitting",
+    "DisarmWhileOwed",
 ];
 
 /// The model's two stages: one of the Spotlight lane and one of the vault lane, which lanes run
@@ -81,10 +88,9 @@ const MUTANTS: [&str; 6] = [
 const A: Stage = Stage::Spotlight;
 const B: Stage = Stage::Repositories;
 
-/// The one key the model follows: the Dock's.
-const KEY: &str = "init.dock@conformance";
-
-/// Every begin's stamp: one boot, one hold, one moment.
+/// Every begin's stamp: one hold, one moment, which is also when every park the rig sets begins
+/// its pause, so a begin at it finds every park still ahead, in the rig's first boot (a begin
+/// after a restart is stamped with the boot it runs in, [`Rig::stamp`]).
 const STAMP: Stamp = Stamp {
     boot: Some(7),
     at: 1_800_000_000,
@@ -98,35 +104,94 @@ const SOFTWARE: SoftwareEpoch = SoftwareEpoch {
     commit: [0x11; 20],
 };
 
-/// The real ledger and record, and what the model reads of the environment: whether the
-/// process lives, what the run's progress has done, and whether a pass wrote the kept key.
-/// Whether a quit or a handoff has noted its stages and not yet gone or been refused is the
+/// A begin two days on, past any park's longest pause ([`ledger::PARK_PAUSE`]): every park has
+/// come due.
+const LATER: Stamp = Stamp {
+    at: STAMP.at + 2 * 24 * 60 * 60,
+    ..STAMP
+};
+
+/// The real ledger, and what the model reads of the environment: whether the process lives
+/// and what the run's progress has done. Whether a quit or a handoff has noted its stages and not yet gone or been refused is the
 /// process's own latch for the rig's profile root ([`ledger::quitting`]), which the rig sets
 /// and clears as a quit does and `begin` reads itself: the model's `noting` is bound to it.
 struct Rig {
     ledger: Ledger,
-    kept: kept::Kept,
     /// The profile root the latch is keyed by: the rig's own, so no other test's quit
     /// latches it.
     root: PathBuf,
     dead: bool,
+    /// The Mac's boot now: a restart starts another ([`Rig::stamp`]).
+    boot: u128,
+    /// The Mac restarted since the process last launched: the model's `rebooted`.
+    rebooted: bool,
     done: u16,
     ever: u16,
-    wrote_kept: bool,
+    /// How many times aterm stopped in each stage (a crash while it ran, its hang) since its
+    /// last end, fail, press or fresh budget, a due begin counting as one, at most two: the
+    /// model's `strike_a` and `strike_b`.
+    strike: [i64; 2],
+    /// The run's login job ([`resume::Trigger`]): its definition, as the progress record's saves
+    /// leave it.
+    trigger: Armed,
+}
+
+/// A login job's definition held in memory: armed or not.
+#[derive(Default)]
+struct Armed(std::cell::Cell<bool>);
+
+impl resume::Trigger for Armed {
+    fn arm(&self) -> Result<bool, String> {
+        Ok(!self.0.replace(true))
+    }
+    fn disarm(&self) -> Result<bool, String> {
+        Ok(self.0.replace(false))
+    }
 }
 
 impl Rig {
     fn new() -> Self {
         static RIGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let rig = RIGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
+        let rig = Self {
             ledger: Ledger::of(1),
-            kept: kept::Kept::default(),
             root: PathBuf::from(format!("/nowhere/aterm-ledger-conformance/{rig}")),
             dead: false,
+            boot: STAMP.boot.expect("the first boot"),
+            rebooted: false,
             done: 0,
             ever: 0,
-            wrote_kept: false,
+            strike: [0; 2],
+            trigger: Armed::default(),
+        };
+        // The admission's own save: the run owes a pass from here.
+        rig.save(Progress {
+            admitted: true,
+            ..Progress::default()
+        });
+        rig
+    }
+
+    /// Publish `progress` as `save_progress` does, with the login job following it: no reader
+    /// ever finds a record that owes a pass without its job.
+    fn save(&self, progress: Progress) {
+        resume::follow_with(&self.trigger, &progress, || {
+            assert!(
+                !resume::owes(&progress) || self.trigger.0.get(),
+                "a record that owes a pass is published only with its login job"
+            );
+            Ok(())
+        })
+        .expect("the record saves");
+    }
+
+    /// The progress the run's last save published: its done stages, completed once both are.
+    fn progress(&self) -> Progress {
+        Progress {
+            admitted: true,
+            done: self.done,
+            completed: self.done & (A.bit() | B.bit()) == A.bit() | B.bit(),
+            ..Progress::default()
         }
     }
 
@@ -141,22 +206,23 @@ impl Rig {
         ledger::set_quitting(&self.root, false);
     }
 
-    /// What a launch reads back of the ledger and the record a process ended with.
-    fn read_back(&mut self) {
-        self.ledger = Ledger::parse(&self.ledger.record()).expect("the ledger reads back");
-        self.kept = kept::Kept::parse(&self.kept.record()).expect("the record reads back");
+    /// `stamp` as a begin in the Mac's boot now makes it.
+    const fn stamp(&self, stamp: Stamp) -> Stamp {
+        Stamp {
+            boot: Some(self.boot),
+            ..stamp
+        }
     }
 
-    /// An unattended pass over the kept key: it writes the key unless the record holds it.
-    fn unattended_pass(&mut self) {
-        let mut holds = Vec::new();
-        self.kept.hold(&mut holds, &|_| SETTLED);
-        let held = holds
-            .iter()
-            .any(|(item, hold)| item == KEY && matches!(hold, Hold::AsIs(_)));
-        if !held && self.kept.keeps(KEY) {
-            self.wrote_kept = true;
-        }
+    /// The process launches again: whatever restart came before is behind it.
+    fn relaunched(&mut self) {
+        self.dead = false;
+        self.rebooted = false;
+    }
+
+    /// What a launch reads back of the ledger a process ended with.
+    fn read_back(&mut self) {
+        self.ledger = Ledger::parse(&self.ledger.record()).expect("the ledger reads back");
     }
 }
 
@@ -175,14 +241,21 @@ fn planted<T>(defect: Defect, step: impl FnOnce() -> T) -> T {
     out
 }
 
-fn dock() -> Selection {
-    let mut dock = Selection::none();
-    dock.set(Setting::Dock, true);
-    dock
-}
-
 fn bit(bits: u16, stage: Stage) -> i64 {
     i64::from(bits & stage.bit() != 0)
+}
+
+/// The model's stage `stage` is, as the rig's per-stage counts index it.
+fn slot(stage: Stage) -> usize {
+    usize::from(stage == B)
+}
+
+impl Rig {
+    /// aterm stopped in `stage` once more.
+    fn struck(&mut self, stage: Stage) {
+        let strike = &mut self.strike[slot(stage)];
+        *strike = (*strike + 1).min(2);
+    }
 }
 
 fn project(rig: &Rig, model_state: &State) -> State {
@@ -198,21 +271,27 @@ fn project(rig: &Rig, model_state: &State) -> State {
             )),
         );
     }
-    for (stage, done, run, att, park, ever, quit) in [
-        (A, "done_a", "run_a", "att_a", "park_a", "ever_a", "quit_a"),
-        (B, "done_b", "run_b", "att_b", "park_b", "ever_b", "quit_b"),
+    for (stage, done, run, att, park, due, ever, quit) in [
+        (
+            A, "done_a", "run_a", "att_a", "park_a", "due_a", "ever_a", "quit_a",
+        ),
+        (
+            B, "done_b", "run_b", "att_b", "park_b", "due_b", "ever_b", "quit_b",
+        ),
     ] {
         state.insert(done, bit(rig.done, stage));
         state.insert(run, bit(ledger.running, stage));
         state.insert(att, i64::from(ledger.attempt(stage).began));
         state.insert(park, bit(ledger.crashed | ledger.hung, stage));
+        state.insert(due, i64::from(ledger.park_due(stage, STAMP.at).is_some()));
         state.insert(ever, bit(rig.ever, stage));
         state.insert(quit, bit(ledger.quit, stage));
     }
     state.insert("noting", i64::from(rig.noting()));
-    state.insert("applied", i64::from(rig.kept.applied(KEY)));
-    state.insert("kept", i64::from(rig.kept.keeps(KEY)));
-    state.insert("wrote_kept", i64::from(rig.wrote_kept));
+    state.insert("rebooted", i64::from(rig.rebooted));
+    state.insert("trigger", i64::from(rig.trigger.0.get()));
+    state.insert("strike_a", rig.strike[slot(A)]);
+    state.insert("strike_b", rig.strike[slot(B)]);
     state
 }
 
@@ -222,30 +301,57 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
         "BeginA" | "BeginB" => {
             let stage = stage(action);
             let done = rig.done;
-            let admitted = ev.step(action, || rig.ledger.begin(stage, done, STAMP, &rig.root));
+            let stamp = rig.stamp(STAMP);
+            let admitted = ev.step(action, || rig.ledger.begin(stage, done, stamp, &rig.root));
             assert_eq!(admitted, Admit::Run, "{action}");
+        }
+        // The park's pause is over: the begin lifts it, with no press.
+        "BeginDueA" | "BeginDueB" => {
+            let stage = stage(action);
+            let done = rig.done;
+            let stamp = rig.stamp(LATER);
+            let admitted = ev.step(action, || rig.ledger.begin(stage, done, stamp, &rig.root));
+            assert_eq!(admitted, Admit::Run, "{action}");
+            // The stage's last begin before another stop parks it: as one stop.
+            rig.strike[slot(stage)] = 1;
         }
         "EndA" | "EndB" => {
             let stage = stage(action);
-            // As the pass saves its progress with the stage done, then ends it in the ledger.
+            rig.strike[slot(stage)] = 0;
+            // As the pass saves its progress with the stage done (and, the run's last, its
+            // completion), then ends it in the ledger.
             rig.done |= stage.bit();
             rig.ever |= stage.bit();
+            rig.save(rig.progress());
             ev.step(action, || rig.ledger.end(stage));
         }
         "FailA" | "FailB" => {
             let stage = stage(action);
+            rig.strike[slot(stage)] = 0;
             ev.step(action, || rig.ledger.end(stage));
         }
         "HangA" | "HangB" => {
             let stage = stage(action);
             let at = rig.ledger.attempt(stage).at;
             assert!(
-                ev.step(action, || rig.ledger.mark_hung(stage, at)),
+                ev.step(action, || rig.ledger.mark_hung(stage, at, STAMP.at)),
                 "{action}"
             );
+            rig.struck(stage);
         }
         "CheckAgain" => {
             ev.step(action, || rig.ledger.retry());
+            rig.strike = [0; 2];
+        }
+        // The process ends in the stages it runs, each a stop aterm counts, but one its hang
+        // parked, whose park counted that stop.
+        "Crash" => {
+            for stage in [A, B] {
+                if bit(rig.ledger.running & !rig.ledger.hung, stage) == 1 {
+                    rig.struck(stage);
+                }
+            }
+            rig.ends();
         }
         "AdoptSoftwareA" | "AdoptSoftwareB" => {
             let stage = stage(action);
@@ -259,6 +365,7 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
                 Some(SOFTWARE),
                 &rig.root
             )));
+            rig.strike[slot(stage)] = 0;
         }
         "NewSoftwareA" | "NewSoftwareB" => {
             let stage = stage(action);
@@ -277,6 +384,7 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
                 Some(newer),
                 &rig.root
             )));
+            rig.strike[slot(stage)] = 0;
         }
         "RetainSoftwareA" | "RetainSoftwareB" => {
             let stage = stage(action);
@@ -311,61 +419,38 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
                 assert_eq!(rig.ledger, before, "{action}: {current:?}");
             }
         }
-        "Crash" => rig.ends(),
+        // The Mac restarts: the process, if it runs, ends with it, and the next launch is in
+        // another boot.
+        "Reboot" => {
+            rig.ends();
+            rig.boot += 1;
+            rig.rebooted = true;
+        }
         // As `ledger::interrupt_at`: the latch first, then the note.
         "NoteQuit" => {
             ledger::set_quitting(&rig.root, true);
-            ev.step(action, || rig.ledger.interrupt());
+            ev.step(action, || {
+                rig.ledger
+                    .interrupt(ledger::hold_process(STAMP.run.unwrap_or(0)))
+            });
         }
         // The quit or the Commit goes: the process ends with its notes.
         "CommitQuit" => rig.ends(),
         // As `ledger::refused_at`: the notes taken back, then the latch released.
         "RefuseQuit" => {
-            ev.step(action, || rig.ledger.refused());
+            ev.step(action, || {
+                rig.ledger
+                    .refused(ledger::hold_process(STAMP.run.unwrap_or(0)))
+            });
             ledger::set_quitting(&rig.root, false);
         }
-        "Relaunch" => {
+        // launchd starts the login job, or a person opens aterm: the launch resumes the run.
+        "Login" | "Relaunch" => {
             rig.read_back();
             let done = rig.done;
-            ev.step(action, || rig.ledger.recover(done, None));
-            rig.dead = false;
-        }
-        "ApplyKey" => {
-            ev.step(action, || {
-                rig.kept.note(
-                    &[KEY.to_owned()],
-                    &[(KEY.to_owned(), "as aterm sets it".to_owned())],
-                    &[],
-                    &|_| Some(Setting::Dock),
-                )
-            });
-        }
-        "PersonChanges" => {
-            ev.step(action, || {
-                rig.kept.note(
-                    &[KEY.to_owned()],
-                    &[(KEY.to_owned(), "as the person moved it".to_owned())],
-                    &[KEY.to_owned()],
-                    &|_| Some(Setting::Dock),
-                )
-            });
-        }
-        "UnattendedPass" => {
-            let mut holds = Vec::new();
-            ev.step(action, || rig.kept.hold(&mut holds, &|_| SETTLED));
-            // The pass writes the key unless it is held: a write of a kept key is the defect.
-            let held = holds
-                .iter()
-                .any(|(item, hold)| item == KEY && matches!(hold, Hold::AsIs(_)));
-            if !held && rig.kept.keeps(KEY) {
-                rig.wrote_kept = true;
-            }
-        }
-        "Restore" => {
-            ev.step(action, || rig.kept.forget_all());
-        }
-        "GroupOn" => {
-            ev.step(action, || rig.kept.forget(dock()));
+            let boot = Some(rig.boot);
+            ev.step(action, || rig.ledger.recover(done, None, boot, STAMP.at));
+            rig.relaunched();
         }
         other => panic!("no real step for `{other}`"),
     }
@@ -434,7 +519,9 @@ fn refusals_conform(model: &Model, schedule: &[&'static str], ev: &mut StepEvide
             continue;
         }
         let before = rig.ledger;
-        let admitted = rig.ledger.begin(stage, rig.done, STAMP, &rig.root);
+        let admitted = rig
+            .ledger
+            .begin(stage, rig.done, rig.stamp(STAMP), &rig.root);
         assert_ne!(
             admitted,
             Admit::Run,
@@ -495,7 +582,7 @@ fn the_walk_conforms() {
 }
 
 #[test]
-fn the_ledger_and_the_kept_record_conform_to_the_model() {
+fn the_ledger_conforms_to_its_model() {
     the_walk_conforms();
 
     // These native refusal inputs share the model's RetainSoftware stutter. In particular,
@@ -584,7 +671,7 @@ fn the_ledger_and_the_kept_record_conform_to_the_model() {
     assert_eq!(rig.ledger.parked(B), before_b.parked(B));
     assert_eq!(rig.ledger.running, before_b.running);
     // Once B's own dead work has been recovered, A has not consumed its software change.
-    rig.ledger.recover_scoped(0, None, B.bit());
+    rig.ledger.recover(0, None, Some(rig.boot), STAMP.at);
     assert!(rig.ledger.software_for(B, 0, Some(newer), &rig.root));
     assert_eq!(rig.ledger.software[B as usize], Software::Known(newer));
     assert_eq!(rig.ledger.attempt(B).began, 0);
@@ -598,8 +685,9 @@ fn mutant_step(rig: &mut Rig, action: &str) -> bool {
         // A begin that never asks the progress.
         "RerunDone" => {
             let done = rig.done;
+            let stamp = rig.stamp(STAMP);
             let admitted = planted(Defect::BeginIgnoresDone, || {
-                rig.ledger.begin(A, done, STAMP, &rig.root)
+                rig.ledger.begin(A, done, stamp, &rig.root)
             });
             assert_eq!(admitted, Admit::Run);
             true
@@ -608,8 +696,9 @@ fn mutant_step(rig: &mut Rig, action: &str) -> bool {
         "BeginWhileQuitting" => {
             let done = rig.done;
             assert!(rig.noting(), "a quit decides");
+            let stamp = rig.stamp(STAMP);
             let admitted = planted(Defect::BeginIgnoresQuit, || {
-                rig.ledger.begin(A, done, STAMP, &rig.root)
+                rig.ledger.begin(A, done, stamp, &rig.root)
             });
             assert_eq!(admitted, Admit::Run);
             true
@@ -623,23 +712,53 @@ fn mutant_step(rig: &mut Rig, action: &str) -> bool {
             rig.ledger.hung &= !A.bit();
             rig.ledger.quit &= !A.bit();
             rig.ledger.attempts[A as usize] = ledger::Attempt::default();
-            rig.dead = false;
+            rig.relaunched();
             true
         }
         "RelaunchNeverParks" => {
             rig.read_back();
             let done = rig.done;
-            planted(Defect::RecoverNeverParks, || rig.ledger.recover(done, None));
-            rig.dead = false;
+            let boot = Some(rig.boot);
+            planted(Defect::RecoverNeverParks, || {
+                rig.ledger.recover(done, None, boot, STAMP.at)
+            });
+            rig.relaunched();
             true
         }
-        "ApplyKept" => {
-            planted(Defect::HoldForgetsKept, || rig.unattended_pass());
+        "RelaunchParksForGood" => {
+            rig.read_back();
+            let done = rig.done;
+            let boot = Some(rig.boot);
+            planted(Defect::ParkWithoutDue, || {
+                rig.ledger.recover(done, None, boot, STAMP.at)
+            });
+            rig.relaunched();
+            true
+        }
+        "RelaunchCountsRestart" => {
+            rig.read_back();
+            let done = rig.done;
+            let boot = Some(rig.boot);
+            planted(Defect::RestartCountsAsCrash, || {
+                rig.ledger.recover(done, None, boot, STAMP.at)
+            });
+            rig.relaunched();
             true
         }
         "RefuseKeepsNote" => {
-            planted(Defect::RefusalKeepsNotes, || rig.ledger.refused());
+            planted(Defect::RefusalKeepsNotes, || {
+                rig.ledger
+                    .refused(ledger::hold_process(STAMP.run.unwrap_or(0)))
+            });
             ledger::set_quitting(&rig.root, false);
+            true
+        }
+        // A save that reads an unfinished run as owing nothing: its login job goes with it.
+        "DisarmWhileOwed" => {
+            let progress = rig.progress();
+            planted(Defect::NothingOwed, || {
+                resume::follow_with(&rig.trigger, &progress, || Ok(())).expect("the record saves");
+            });
             true
         }
         _ => false,
@@ -651,33 +770,70 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_ledger() {
     let buggy = interp::with_buggy(&setup_ledger_model(), 1);
     let committed = interp::with_buggy(&setup_ledger_model(), 0);
     let mut ev = StepEvidence::new("SetupLedger");
-    let cases: [(&[&'static str], &str, &[&'static str]); 6] = [
+    let cases: [(&[&'static str], &str, &[&'static str]); 9] = [
         (
             &["BeginA", "EndA", "RerunDone"],
             "NotDoneAndRunning",
-            &["BeginA", "EndA", "Crash", "Relaunch"],
+            &["BeginA", "EndA", "Crash", "Login"],
         ),
         (
             &["BeginA", "EndA", "Crash", "RelaunchForgetsDone"],
             "CrashKeepsDone",
-            &["BeginA", "EndA", "Crash", "Relaunch"],
+            &["BeginA", "EndA", "Crash", "Login"],
         ),
+        (
+            &[
+                "BeginA",
+                "Crash",
+                "Login",
+                "BeginA",
+                "Crash",
+                "RelaunchNeverParks",
+            ],
+            "TwoBeginsPark",
+            &["BeginA", "Crash", "Login", "BeginA", "Crash", "Login"],
+        ),
+        (
+            &[
+                "BeginA",
+                "Crash",
+                "Login",
+                "BeginA",
+                "Crash",
+                "RelaunchParksForGood",
+            ],
+            "EveryParkComesDue",
+            &["BeginA", "Crash", "Login", "BeginA", "Crash", "Login"],
+        ),
+        (
+            &[
+                "BeginA",
+                "Reboot",
+                "RelaunchCountsRestart",
+                "BeginA",
+                "Reboot",
+                "RelaunchCountsRestart",
+            ],
+            "ParksNeedTwoStops",
+            &[
+                "BeginA", "Reboot", "Relaunch", "BeginA", "Reboot", "Relaunch",
+            ],
+        ),
+        // A crash, then a restart counted as a second: one stop behind the park, which a law
+        // that held every park to one stop let pass.
         (
             &[
                 "BeginA",
                 "Crash",
                 "Relaunch",
                 "BeginA",
-                "Crash",
-                "RelaunchNeverParks",
+                "Reboot",
+                "RelaunchCountsRestart",
             ],
-            "TwoBeginsPark",
-            &["BeginA", "Crash", "Relaunch", "BeginA", "Crash", "Relaunch"],
-        ),
-        (
-            &["ApplyKey", "PersonChanges", "ApplyKept"],
-            "KeptNeverWritten",
-            &["ApplyKey", "PersonChanges", "UnattendedPass"],
+            "ParksNeedTwoStops",
+            &[
+                "BeginA", "Crash", "Relaunch", "BeginA", "Reboot", "Relaunch",
+            ],
         ),
         (
             &["BeginA", "NoteQuit", "RefuseKeepsNote"],
@@ -688,6 +844,11 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_ledger() {
             &["NoteQuit", "BeginWhileQuitting"],
             "QuitNotesEveryRunningStage",
             &["BeginA", "NoteQuit"],
+        ),
+        (
+            &["BeginA", "EndA", "DisarmWhileOwed"],
+            "UnfinishedRunArmed",
+            &["BeginA", "EndA", "Crash", "Login"],
         ),
     ];
     for (mutant, invariant, shipping) in cases {
@@ -702,6 +863,25 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_ledger() {
             "{shipping:?} keeps {invariant}: {real:?}"
         );
     }
+}
+
+/// A restart counted as aterm stopping in the stage it cut off: with it planted in the code under
+/// test, the walk fails at the login after a restart, whose begin the model gives back, as a
+/// quit's. Before the ledger read the boot, two restarts during one long stage (the Command
+/// Line Tools installing) parked it as crash-looping.
+#[test]
+fn the_walk_catches_a_restart_counted_as_a_crash() {
+    let caught = planted(Defect::RestartCountsAsCrash, || {
+        std::panic::catch_unwind(the_walk_conforms).expect_err("the walk catches it")
+    });
+    let said = caught
+        .downcast_ref::<String>()
+        .map_or("", String::as_str)
+        .to_owned();
+    assert!(
+        said.contains("after Login") && said.contains("Reboot"),
+        "a restart counted as a crash fails the walk at a relaunch after one: {said}"
+    );
 }
 
 /// The begin defects rounds 21 and 22's reviews found, each a guard `begin` would lose: with
@@ -725,6 +905,268 @@ fn the_walk_catches_a_begin_that_ignores_done_a_park_or_a_quit() {
         assert!(
             said.contains("the model refuses it"),
             "{defect:?} fails the walk at a refused begin: {said}"
+        );
+    }
+}
+
+const KEY_PROJECTED: [&str; 5] = ["applied", "again", "differs", "kept", "wrote_kept"];
+
+const KEY_ANCHORED: [&str; 6] = [
+    "ApplyAgain",
+    "ApplyKey",
+    "GroupOn",
+    "KeepChanged",
+    "Restore",
+    "UnattendedPass",
+];
+
+const KEY_MUTANTS: [&str; 2] = ["ApplyKept", "KeepAnyDrift"];
+
+/// The one key `SetupKeptKey` follows: the Dock's.
+const KEY: &str = "init.dock@conformance";
+
+/// What the key reads as aterm sets it, and as something else left it.
+const WANT: &str = "as aterm sets it";
+const OTHER: &str = "as something else left it";
+
+/// The real record of the keys that changed after aterm set them, what the key reads on the
+/// Mac, and whether an unattended pass wrote a kept key.
+struct KeyRig {
+    kept: kept::Kept,
+    wrote_kept: bool,
+    /// What the key reads on the Mac: [`WANT`] or [`OTHER`].
+    value: &'static str,
+}
+
+impl KeyRig {
+    fn new() -> Self {
+        Self {
+            kept: kept::Kept::default(),
+            wrote_kept: false,
+            value: OTHER,
+        }
+    }
+
+    /// What a launch reads back of the record: the walk reads it back after every step, as a
+    /// process that ends anywhere leaves it to the next launch.
+    fn read_back(&mut self) {
+        self.kept = kept::Kept::parse(&self.kept.record()).expect("the record reads back");
+    }
+
+    /// An unattended pass over the key: it holds what the record says, sets the key where the
+    /// hold lets it (one held as read back is set unless aterm set it again already, as
+    /// `Workstation` resolves it), and notes what it found.
+    fn unattended_pass(&mut self) {
+        let mut holds = Vec::new();
+        self.kept.hold(&mut holds, &|_| None);
+        let left = match holds.iter().find(|(item, _)| item == KEY) {
+            None => false,
+            Some((_, Hold::ReadBack { again, .. })) => *again,
+            Some((_, Hold::AsIs(_) | Hold::Later(_))) => true,
+        };
+        let key = [KEY.to_owned()];
+        let (readings, drifted, changed) = if self.value == WANT {
+            (
+                vec![(KEY.to_owned(), WANT.to_owned())],
+                Vec::new(),
+                Vec::new(),
+            )
+        } else if left {
+            (
+                vec![(KEY.to_owned(), OTHER.to_owned())],
+                key.to_vec(),
+                Vec::new(),
+            )
+        } else {
+            if self.kept.keeps(KEY) {
+                self.wrote_kept = true;
+            }
+            self.value = WANT;
+            (
+                vec![(KEY.to_owned(), WANT.to_owned())],
+                Vec::new(),
+                vec![(KEY.to_owned(), OTHER.to_owned())],
+            )
+        };
+        self.kept.note(
+            &kept::Found {
+                settled: &key,
+                readings: &readings,
+                drifted: &drifted,
+                changed: &changed,
+                new_targets: &[],
+                owed: &|_| false,
+            },
+            &|_| Some(Setting::Dock),
+        );
+    }
+}
+
+fn dock() -> Selection {
+    let mut dock = Selection::none();
+    dock.set(Setting::Dock, true);
+    dock
+}
+
+fn project_key(rig: &KeyRig, model_state: &State) -> State {
+    let mut state = model_state.clone();
+    let tracked = rig.kept.applied(KEY) || rig.kept.keeps(KEY);
+    state.insert("applied", i64::from(rig.kept.applied(KEY)));
+    state.insert("again", i64::from(rig.kept.set_again(KEY)));
+    state.insert("differs", i64::from(tracked && rig.value != WANT));
+    state.insert("kept", i64::from(rig.kept.keeps(KEY)));
+    state.insert("wrote_kept", i64::from(rig.wrote_kept));
+    state
+}
+
+/// Each step of `SetupKeptKey` on the real record, each `Buggy=1` mutant with its defect
+/// planted in the code under test.
+fn drive_key(rig: &mut KeyRig, action: &'static str, ev: &mut StepEvidence) {
+    match action {
+        // The first pass that reaches the key sets it and reads it back.
+        "ApplyKey" => {
+            let before = rig.value;
+            rig.value = WANT;
+            ev.step(action, || {
+                rig.kept.note(
+                    &kept::Found {
+                        settled: &[KEY.to_owned()],
+                        readings: &[(KEY.to_owned(), WANT.to_owned())],
+                        drifted: &[],
+                        changed: &[(KEY.to_owned(), before.to_owned())],
+                        new_targets: &[],
+                        owed: &|_| false,
+                    },
+                    &|_| Some(Setting::Dock),
+                )
+            });
+        }
+        // Something other than aterm changes the key: no code step runs.
+        "OtherWriterChanges" => rig.value = OTHER,
+        // An unattended pass: what the model tells apart by the record and the key is what the
+        // pass does with them. A write of a kept key is the defect.
+        "ApplyAgain" | "KeepChanged" | "UnattendedPass" => {
+            ev.step(action, || rig.unattended_pass());
+        }
+        "Restore" => {
+            ev.step(action, || rig.kept.forget_all());
+        }
+        "GroupOn" => {
+            ev.step(action, || rig.kept.forget(dock()));
+        }
+        "ApplyKept" => planted(Defect::HoldForgetsKept, || rig.unattended_pass()),
+        "KeepAnyDrift" => planted(Defect::KeepsFirstChange, || rig.unattended_pass()),
+        other => panic!("no real step for `{other}`"),
+    }
+}
+
+/// `schedule` replayed on a fresh record, read back after each step, with every projected
+/// variable checked against the model's: the real state it ends in.
+fn replay_key(model: &Model, schedule: &[&'static str], ev: &mut StepEvidence) -> State {
+    let mut rig = KeyRig::new();
+    let mut state = model.init_state();
+    assert_eq!(
+        project_key(&rig, &state),
+        state,
+        "an empty record is the model's start"
+    );
+    for &action in schedule {
+        assert!(
+            model.fire(action, &mut state),
+            "{action} is enabled after {schedule:?}: {state:?}"
+        );
+        drive_key(&mut rig, action, ev);
+        rig.read_back();
+        let real = project_key(&rig, &state);
+        for var in KEY_PROJECTED {
+            assert_eq!(
+                real[var], state[var],
+                "`{var}` after {action} in {schedule:?}, read back: real {real:?}, model {state:?}"
+            );
+        }
+    }
+    project_key(&rig, &state)
+}
+
+#[test]
+fn the_kept_record_conforms_to_its_model() {
+    ledger::setup_ledger_environment();
+    let model = interp::with_buggy(&setup_kept_key_model(), 0);
+    let mut ev = StepEvidence::new("SetupKeptKey");
+    let (_, transitions) = walk(&model);
+    let mut fired: BTreeSet<&str> = BTreeSet::new();
+    for schedule in &transitions {
+        let real = replay_key(&model, schedule, &mut ev);
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, &real),
+                "{} after {schedule:?}",
+                invariant.name
+            );
+        }
+        fired.extend(schedule.iter().copied());
+    }
+    let committed: BTreeSet<&str> = model
+        .actions
+        .iter()
+        .map(|a| a.name)
+        .filter(|name| !KEY_MUTANTS.contains(name))
+        .collect();
+    assert_eq!(fired, committed, "every committed action is driven");
+
+    let audit = ev.audit();
+    let actions: BTreeSet<&str> = audit.actions.iter().copied().collect();
+    assert_eq!(actions, KEY_ANCHORED.into_iter().collect::<BTreeSet<_>>());
+    assert!(audit.uninstrumented.is_empty(), "{audit:?}");
+    assert!(audit.ambiguous.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.undriven.is_empty(), "{audit:?}");
+    assert!(audit.unwitnessed.is_empty(), "{audit:?}");
+    assert!(audit.blind_steps.is_empty(), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+}
+
+#[test]
+fn negative_control_each_key_mutant_breaks_its_invariant_on_the_real_record() {
+    let buggy = interp::with_buggy(&setup_kept_key_model(), 1);
+    let committed = interp::with_buggy(&setup_kept_key_model(), 0);
+    let mut ev = StepEvidence::new("SetupKeptKey");
+    let cases: [(&[&'static str], &str, &[&'static str]); 2] = [
+        (
+            &[
+                "ApplyKey",
+                "OtherWriterChanges",
+                "ApplyAgain",
+                "OtherWriterChanges",
+                "KeepChanged",
+                "ApplyKept",
+            ],
+            "KeptNeverWritten",
+            &[
+                "ApplyKey",
+                "OtherWriterChanges",
+                "ApplyAgain",
+                "OtherWriterChanges",
+                "KeepChanged",
+                "UnattendedPass",
+            ],
+        ),
+        (
+            &["ApplyKey", "OtherWriterChanges", "KeepAnyDrift"],
+            "KeptOnlyAfterSetAgain",
+            &["ApplyKey", "OtherWriterChanges", "ApplyAgain"],
+        ),
+    ];
+    for (mutant, invariant, shipping) in cases {
+        let real = replay_key(&buggy, mutant, &mut ev);
+        assert!(
+            !buggy.check_invariant(invariant, &real),
+            "{mutant:?} breaks {invariant} on the real record: {real:?}"
+        );
+        let real = replay_key(&committed, shipping, &mut ev);
+        assert!(
+            committed.check_invariant(invariant, &real),
+            "{shipping:?} keeps {invariant}: {real:?}"
         );
     }
 }

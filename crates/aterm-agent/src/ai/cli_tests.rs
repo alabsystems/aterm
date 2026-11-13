@@ -686,7 +686,7 @@ fn unreadable_ancestry_never_becomes_a_persons_yolo_review() {
         missing_args: false,
         missing_parent: false,
     };
-    let observed = permission::asker(&person, &|| None);
+    let observed = permission::asker(&person);
     assert_eq!(
         review_level(&settings, observed).expect("proven person").0,
         Level::Yolo
@@ -694,13 +694,10 @@ fn unreadable_ancestry_never_becomes_a_persons_yolo_review() {
     let bad: Vec<_> = [(true, false), (false, true)]
         .into_iter()
         .filter(|&(missing_args, missing_parent)| {
-            let observed = permission::asker(
-                &Tree {
-                    missing_args,
-                    missing_parent,
-                },
-                &|| None,
-            );
+            let observed = permission::asker(&Tree {
+                missing_args,
+                missing_parent,
+            });
             review_level(&settings, observed).is_ok()
         })
         .collect();
@@ -808,7 +805,7 @@ fn login_kimi_renews_its_pool_or_runs_its_own_login_for_a_person() {
 }
 
 /// UNDER AN AGENT, WITH NO TERMINAL, THE DOCTOR MAKES ATERM'S OWN FIXES AND HOLDS ONLY A
-/// PERSON'S (owner ruling R-13: no human user): it installs a CLI that is not installed (`aterm
+/// PERSON'S (no human user): it installs a CLI that is not installed (`aterm
 /// pkg install claude`) and renews a pool row with an email (`aterm harness accounts renew
 /// kimi-one --cli kimi`), starts no CLI's own sign-in (codex has no roster), and says what only
 /// a person can give on one `NEEDS YOU:` line. CONTROL: `--read-only` runs nothing.
@@ -877,6 +874,61 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
         "said once, after the fixes: {out}"
     );
     assert!(!out.contains("ask a person"), "{out}");
+}
+
+/// A DOCTOR RUNS THE SYNC A MOVED DEFAULT LOGIN NAMES, ON A MAC WITH NO WINDOW WHOSE UPKEEP WOULD:
+/// that sync is aterm's own fix, under an agent too. CONTROLS: `--read-only` and `--json` run
+/// nothing, and where no row holds that account no sync is run.
+#[test]
+fn a_doctor_runs_the_sync_a_moved_default_login_names() {
+    let b = machine(&["codex"]);
+    std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
+    std::fs::write(
+        b.home.join(".codex/auth.json"),
+        crate::ai::testing::codex_auth(Some("work@example.com")),
+    )
+    .expect("default login");
+    let work = b.home.join(".aterm/logins/codex/work");
+    std::fs::create_dir_all(&work).expect("work");
+    std::fs::write(
+        work.join("auth.json"),
+        crate::ai::testing::codex_auth(Some("work@example.com")),
+    )
+    .expect("work login");
+    let roster = |work_email: &str| {
+        std::fs::write(
+            b.dir.path().join("accounts-codex.toml"),
+            format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\
+                 email = \"main@example.com\"\n\n[[account]]\nlabel = \"work\"\n\
+                 class = \"dedicated\"\ndir = {:?}\nemail = \"{work_email}\"\n",
+                work.display().to_string()
+            ),
+        )
+        .expect("roster");
+    };
+    roster("work@example.com");
+    let mut env = env_of(&b, ONLY_CODEX, &[("CLAUDECODE", "1")], false);
+    env.harness_state = Some(b.state.clone());
+    let sync_runs = |runner: &FakeRunner| {
+        runner
+            .calls()
+            .iter()
+            .filter(|call| call.args == ["harness", "accounts", "sync", "--cli", "codex"])
+            .count()
+    };
+    let runner = FakeRunner::quiet();
+    for flag in ["--read-only", "--json"] {
+        let _ = run_cli(&env, &runner, &["doctor", flag]);
+        assert_eq!(sync_runs(&runner), 0, "CONTROL: {flag}");
+    }
+    let (_, out, err) = run_cli(&env, &runner, &["doctor"]);
+    assert_eq!(sync_runs(&runner), 1, "{out}{err}");
+
+    roster("someone@example.com");
+    let runner = FakeRunner::quiet();
+    let (_, out, err) = run_cli(&env, &runner, &["doctor"]);
+    assert_eq!(sync_runs(&runner), 0, "CONTROL: {out}{err}");
 }
 
 /// A PERSON'S OFF SWITCH HOLDS EVERY AUTOMATED SIGN-IN (`[harness] logins = "off"` in the
@@ -1228,11 +1280,7 @@ fn look_honours_harness_accounts_off_from_a_custom_config_file_name() {
 fn codex_default_only(held: &str) -> Box3 {
     let b = machine(&["codex"]);
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/old"), false);
-    std::fs::write(
-        b.pkg.agents_dir().join("codex"),
-        crate::harness::codex_alab::twin_text(&exe),
-    )
-    .expect("launcher");
+    std::fs::write(b.twin("codex"), crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
     std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
     std::fs::write(b.home.join(".codex/auth.json"), "{}").expect("default login");
     let work = b.home.join(".aterm/logins/codex/work");

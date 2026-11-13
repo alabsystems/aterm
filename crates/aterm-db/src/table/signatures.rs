@@ -3,7 +3,13 @@
 
 //! Successful Ed25519 checks of immutable table wire bytes. The key includes the
 //! public signer and the whole wire's content identifier, including its signature.
-//! No ciphertext, plaintext, epoch key, writer grant or custody decision is retained.
+//! The global cache retains no ciphertext, plaintext, epoch key, writer grant or custody decision.
+//! An identified wire shares its immutable bytes and successful public-signer check across replay
+//! clones. It can also retain successful authentication of a non-cutoff payload under an HMAC
+//! comparison token for the exact payload key. The caller must first obtain that key and judge
+//! the historical writer grant again; this fact grants no access. Cutoff payloads still decrypt.
+//! The journal cache charges the allocation, including both fixed fact slots. Neither historical
+//! keys, plaintext, source classification nor admission verdicts are kept with the wire.
 
 use super::DOMAIN;
 use crate::{Error, Result, crypto};
@@ -11,7 +17,7 @@ use astream_wire::sync::Digest;
 use aterm_digest::Sha256;
 use std::{
     collections::{BTreeSet, VecDeque},
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 const MAX_SIGNATURES: usize = 4096;
@@ -26,17 +32,25 @@ pub(super) fn verify(signer: &[u8; 32], wire: &[u8]) -> Result<Digest> {
 /// [`verify`] of an identified wire's bytes, under the identifier [`Identified::new`] took of
 /// them, so they are not hashed again.
 pub(super) fn verify_identified(signer: &[u8; 32], wire: &Identified) -> Result<Digest> {
-    CACHE.verify_as(signer, &wire.wire, || wire.id)
+    CACHE.verify_identified(signer, wire)
 }
 
 /// Table wire bytes with their content identifier, `Sha256::digest` of exactly those bytes, which
-/// only [`Self::new`] takes and nothing changes after: a table replay names each record's receipt
-/// by it, and checks an operation record's signature under it ([`verify_identified`]), hashing
-/// that record's bytes once. A conflict certificate is signed by nobody: the signed sources it
-/// holds are checked as any wire is, and hashed for that.
-pub(super) struct Identified {
+/// only [`Self::new`] takes (a clone shares it with the immutable bytes) and nothing changes after: a table
+/// replay names each record's receipt by it, and checks an operation record's signature under it
+/// ([`verify_identified`]), hashing that record's bytes once. A conflict certificate is signed by
+/// nobody: the signed sources it holds are checked as any wire is, and hashed for that.
+#[derive(Clone)]
+pub(super) struct Identified(Arc<Wire>);
+
+struct Wire {
     wire: Vec<u8>,
     id: Digest,
+    /// A successful check under the fixed signature domain, never a historical writer grant.
+    signer: OnceLock<[u8; 32]>,
+    /// The current payload key's comparison token after successful authentication of a payload
+    /// that is not a cutoff. This is neither a key nor a permission to obtain one.
+    non_cut_key: OnceLock<crypto::PayloadKeyIdentity>,
 }
 
 impl Identified {
@@ -44,19 +58,37 @@ impl Identified {
         #[cfg(test)]
         HASHED.set(HASHED.get() + 1);
         let id = Sha256::digest(&wire);
-        Self { wire, id }
+        Self(Arc::new(Wire {
+            wire,
+            id,
+            signer: OnceLock::new(),
+            non_cut_key: OnceLock::new(),
+        }))
     }
 
-    pub(super) const fn id(&self) -> Digest {
-        self.id
+    pub(super) fn id(&self) -> Digest {
+        self.0.id
     }
 
     pub(super) fn wire(&self) -> &[u8] {
-        &self.wire
+        &self.0.wire
     }
 
-    pub(super) fn into_wire(self) -> Vec<u8> {
-        self.wire
+    pub(super) fn verified_non_cut(&self, key_identity: &crypto::PayloadKeyIdentity) -> bool {
+        self.0
+            .non_cut_key
+            .get()
+            .is_some_and(|known| known.matches(key_identity))
+    }
+
+    pub(super) fn remember_non_cut(&self, key_identity: crypto::PayloadKeyIdentity) {
+        let _ = self.0.non_cut_key.set(key_identity);
+    }
+
+    /// Both allocations a retained wire charges: its bytes and the shared wire with its two
+    /// reference counts. Allocator rounding is outside the journal cache's charge.
+    pub(super) fn allocation_bytes(&self) -> usize {
+        self.0.wire.capacity() + size_of::<Wire>() + 2 * size_of::<usize>()
     }
 }
 
@@ -105,6 +137,17 @@ impl Cache {
         })
     }
 
+    fn verify_identified(&self, signer: &[u8; 32], wire: &Identified) -> Result<Digest> {
+        if wire.0.signer.get() == Some(signer) {
+            return Ok(wire.id());
+        }
+        let id = self.verify_as(signer, wire.wire(), || wire.id())?;
+        // Retain successes alone. Another valid signer can still be checked through the global
+        // cache; losing this optional publication never changes a verification result.
+        let _ = wire.0.signer.set(*signer);
+        Ok(id)
+    }
+
     /// [`Self::verify`] where `id` gives `Sha256::digest(wire)`, asked once the wire's shape is
     /// admitted.
     fn verify_as(
@@ -151,100 +194,5 @@ impl Cache {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, atomic::Ordering};
-
-    fn signed(tag: u8, domain: &[u8]) -> ([u8; 32], Vec<u8>) {
-        let seed = [17; 32];
-        let mut wire = vec![tag; 128];
-        let signature = crypto::signed(&seed, domain, &wire).unwrap();
-        wire.extend_from_slice(&signature);
-        (crypto::public(&seed).unwrap(), wire)
-    }
-
-    #[test]
-    fn reuse_requires_the_same_signer_and_complete_signed_bytes() {
-        let cache = Cache::new(4);
-        let (signer, wire) = signed(1, DOMAIN);
-        let id = cache.verify(&signer, &wire).unwrap();
-        assert_eq!(id, Sha256::digest(&wire));
-        assert_eq!(cache.verify(&signer, &wire).unwrap(), id);
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 1);
-
-        let mut changed = wire.clone();
-        changed[0] ^= 1;
-        for _ in 0..2 {
-            assert!(cache.verify(&signer, &changed).is_err());
-        }
-        let mut changed_signature = wire.clone();
-        *changed_signature.last_mut().unwrap() ^= 1;
-        assert!(cache.verify(&signer, &changed_signature).is_err());
-        assert!(
-            cache
-                .verify(&crypto::public(&[18; 32]).unwrap(), &wire)
-                .is_err()
-        );
-        let (_, other_domain) = signed(1, b"another signature domain");
-        assert!(cache.verify(&signer, &other_domain).is_err());
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 6);
-        assert_eq!(cache.verify(&signer, &wire).unwrap(), id);
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 6);
-    }
-
-    #[test]
-    fn successful_checks_are_bounded_and_eviction_requires_verification_again() {
-        let cache = Cache::new(2);
-        let (signer, first) = signed(1, DOMAIN);
-        let (_, second) = signed(2, DOMAIN);
-        let (_, third) = signed(3, DOMAIN);
-        for wire in [&first, &second, &first, &third] {
-            cache.verify(&signer, wire).unwrap();
-        }
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 3);
-        cache.verify(&signer, &first).unwrap();
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 4);
-        let entries = cache.entries.lock().unwrap();
-        assert_eq!(entries.known.len(), 2);
-        assert_eq!(entries.order.len(), 2);
-        assert_eq!(
-            entries.known,
-            entries.order.iter().copied().collect::<BTreeSet<_>>()
-        );
-    }
-
-    #[test]
-    fn contention_and_poison_fall_back_to_fresh_verification() {
-        let cache = Arc::new(Cache::new(2));
-        let (signer, wire) = signed(1, DOMAIN);
-        cache.verify(&signer, &wire).unwrap();
-        let held = cache.entries.lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let worker = {
-            let cache = cache.clone();
-            let wire = wire.clone();
-            std::thread::spawn(move || send.send(cache.verify(&signer, &wire)).unwrap())
-        };
-        let result = receive.recv_timeout(std::time::Duration::from_secs(60));
-        drop(held);
-        worker.join().unwrap();
-        assert!(
-            result
-                .expect("a busy cache cannot block verification")
-                .is_ok()
-        );
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 2);
-
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = cache.entries.lock().unwrap();
-            panic!("test a poisoned optional cache");
-        }));
-        assert!(poisoned.is_err());
-        assert!(cache.verify(&signer, &wire).is_ok());
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 3);
-        let mut changed = wire;
-        changed[0] ^= 1;
-        assert!(cache.verify(&signer, &changed).is_err());
-        assert_eq!(cache.checks.load(Ordering::Relaxed), 4);
-    }
-}
+#[path = "signatures_tests.rs"]
+mod tests;

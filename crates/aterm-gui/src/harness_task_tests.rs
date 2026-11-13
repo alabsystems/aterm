@@ -670,6 +670,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         account: None,
         route: None,
         autopilot: Autopilot::Land,
@@ -703,7 +704,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
 }
 
 /// A KEY TYPED INTO THE APP IS THE PERSON'S TURN THE TASK FACE READS, under Land's rule that a
-/// person's exchange is theirs only where it opens the session (owner ruling 2026-10-27, aterm
+/// person's exchange is theirs only where it opens the session (aterm
 /// 791977cae8): the session's opening message, typed in the app, reads `task=theirs`; a person's
 /// message after a landing is a turn end Land carries on from, so the task reads `open`.
 /// NEGATIVE CONTROL: with no key typed, the opening reply is no person's and never reads theirs.

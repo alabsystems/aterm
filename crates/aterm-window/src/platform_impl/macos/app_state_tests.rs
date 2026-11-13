@@ -44,3 +44,29 @@ fn pending_handler_work_waits_out_a_nested_handler_and_keeps_fifo_order() {
     assert!(!pending.arm(), "an exit barrier leaves no tail to rearm");
     assert!(pending.can_run_inline(), "window destruction can run inline after the barrier");
 }
+
+#[test]
+fn an_owed_batch_takes_the_queue_armed_or_not_but_never_inside_a_batch() {
+    let mut pending = PendingHandlerWork::new();
+    pending.push(1);
+    pending.push(2);
+    assert!(pending.arm());
+    assert!(pending.begin_owed(), "an armed block's work is owed too");
+    assert!(!pending.begin_owed(), "a batch in progress owns its items");
+    assert!(!pending.arm(), "nothing arms during an owed batch");
+    assert_eq!(pending.pop_owed(), Some(1));
+    pending.push(3);
+    assert_eq!(pending.pop_owed(), Some(2));
+    assert_eq!(pending.pop_owed(), Some(3), "work queued while the batch runs joins it");
+    assert_eq!(pending.pop_owed(), None);
+    pending.push(4);
+    let given_up = pending.finish_batch_and_take_tail();
+    assert_eq!(given_up.into_iter().collect::<Vec<_>>(), [4]);
+    assert_eq!(pending.begin_batch(false), 0, "the armed block finds nothing to run");
+    assert!(pending.can_run_inline());
+
+    assert!(pending.begin_owed(), "an empty queue still begins a batch");
+    assert!(!pending.can_run_inline(), "nothing runs inline beside an owed batch");
+    pending.finish_batch();
+    assert!(pending.can_run_inline());
+}

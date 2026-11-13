@@ -1387,7 +1387,7 @@ fn helper_forwarding_accepts_only_the_actual_credential_protocol() {
             .map(std::ffi::OsString::from)
             .collect::<Vec<_>>()
     };
-    for operation in ["get", "store", "erase"] {
+    for operation in ["get", "store", "erase", "capability"] {
         assert_eq!(
             helper_arguments(&words(&["agh", "auth", "git-credential", operation])).unwrap(),
             Some(words(&["auth", "git-credential", operation]))
@@ -1401,7 +1401,6 @@ fn helper_forwarding_accepts_only_the_actual_credential_protocol() {
         vec!["agh"],
         vec!["agh", "api", "user"],
         vec!["agh", "auth", "git-credential", "get", "extra"],
-        vec!["agh", "auth", "git-credential", "unknown"],
     ] {
         assert!(helper_arguments(&words(&args)).is_err());
     }

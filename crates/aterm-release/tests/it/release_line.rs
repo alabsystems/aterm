@@ -52,10 +52,10 @@ fn dry_fix_step_one_judges_the_carried_tree() {
         paths: vec!["CHANGELOG.md".into()],
     };
     let git = Git::new(&f.rival);
-    assert!(crate::gates::changelog_gate_at(&git, &bad, VERSION).is_err());
+    assert!(crate::gates::changelog_gate_at(&git, &bad, VERSION, "").is_err());
     let hops = line::carry(&git, &line, std::slice::from_ref(&fix)).unwrap();
     let planned = &hops[0].commit;
-    crate::gates::changelog_gate_at(&git, planned, VERSION).unwrap();
+    crate::gates::changelog_gate_at(&git, planned, VERSION, "").unwrap();
     assert!(
         !git.git(&["cat-file", "-e", &format!("{planned}:unrelated.txt")])
             .unwrap()
@@ -1367,6 +1367,152 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
     assert!(summary.contains(short(&s.fix_b)), "{summary}");
 }
 
+const OWN_STOP_PROBE: &str = "ATERM_RELEASE_OWN_STOP_PROBE";
+
+/// A LOST FLEET LINE'S OWN STOP STILL SETTLES ITS PRIVATE HEAD, ON THE REAL BACKEND. The fleet
+/// claim's progress worker loses the line as production does (`line_claim::fail`: the loss
+/// recorded and this process sent its own `SIGTERM`, caught by the release's handler), and the
+/// real backend's rewind, the settlement a refusal makes before it lets go of the clone,
+/// then restores the clone from the carried head to its recorded prefix (`own`). A signal from
+/// elsewhere caught as well still refuses that rewind: it starts no child, and main stays at
+/// the carried head, whether it is a person's `SIGINT` (`person`) or a `SIGTERM` another
+/// process sent (`elsewhere`), which only the release's own accounting (`interrupt::stop_self`)
+/// tells from the own stop; that case waits until both `SIGTERM`s are caught
+/// (`interrupt::counts_for_test`), since until the own one is, the other reads as it. The
+/// loss and the caught signals are process-global, so each case runs in this test binary
+/// re-executed as a child. This probe binds rel-settle-own-stop's rewind to production;
+/// release_flow's World models it. NEGATIVE CONTROLS: the rewind's `git reset --keep` ran as
+/// any step's logged child, which starts none once a signal was caught, so the line's own
+/// stop refused it ("not started: the release was interrupted") and main stayed at the
+/// carried head (`own`). And an `interrupt::caught_foreign` that took every caught `SIGTERM`
+/// for the own stop (every signal caught less every `SIGTERM`) let the rewind run under
+/// another process's `SIGTERM`, moving main to the recorded prefix (`elsewhere`).
+#[cfg(unix)]
+#[test]
+fn a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_not() {
+    use aterm_uds::spawnfd::command;
+    if let Some(mode) = std::env::var_os(OWN_STOP_PROBE) {
+        own_stop_probe(mode.to_str().expect("a probe mode"));
+        return;
+    }
+    for mode in ["own", "person", "elsewhere"] {
+        let mut probe = command(std::env::current_exe().unwrap());
+        probe
+            .args([
+                "--exact",
+                "release_line::a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_not",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OWN_STOP_PROBE, mode);
+        // A one-minute hang detector that drains both pipes while it waits.
+        let out = aterm_uds::deadline::output_within(&mut probe, aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|e| panic!("{mode}: the probe did not end: {e}"));
+        let said = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        if let Some(why) = said
+            .lines()
+            .chain(err.lines())
+            .find(|l| l.contains(aterm_spec::host::COULD_NOT_RUN))
+        {
+            aterm_spec::host::could_not_run(why);
+        }
+        assert!(
+            out.status.success() && said.contains(&format!("own-stop probe {mode}: judged")),
+            "{mode}: {:?}\n{said}\n{err}",
+            out.status
+        );
+    }
+}
+
+/// [`a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_not`]'s child.
+#[cfg(unix)]
+fn own_stop_probe(mode: &str) {
+    use crate::interrupt::{SIGINT, SIGTERM, caught, counts_for_test};
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    // SAFETY: SIG_DFL (0) for INT and TERM, which this probe sends itself, whatever this test
+    // binary was started with: `install` leaves an ignored one ignored.
+    unsafe {
+        signal(SIGINT, 0);
+        signal(SIGTERM, 0);
+    }
+    crate::interrupt::install();
+    let fix = Fixture::merging("own-stop");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 1_790_000_000);
+    let mut carried = start.clone();
+    carried.hops = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
+    // A status refreshes the laid template's index, as a release's clean check does.
+    assert!(run(&fix.work, &["status", "--porcelain"]).is_empty());
+    run(&fix.work, &["reset", "-q", "--keep", carried.head()]);
+    let mut real =
+        crate::release_steps::Real::new(&fix.work, Some(&fix.work), true, false).unwrap();
+    let pid = i32::try_from(std::process::id()).unwrap();
+    let until_caught = |what: &str, sig: i32| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (caught() == Some(sig)).then_some(())
+        });
+    };
+    let until_counted = |what: &str, signals: u32| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (counts_for_test().caught >= signals).then_some(())
+        });
+    };
+    if mode == "person" {
+        crate::interrupt::send(pid, SIGINT);
+        until_caught("the person's SIGINT", SIGINT);
+    }
+    if mode == "elsewhere" {
+        let sent = aterm_uds::spawnfd::command(aterm_uds::os_path!("kill"))
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "kill -TERM {pid}: {sent:?}");
+        until_counted("another process's SIGTERM", 1);
+    }
+    crate::line_claim::lose_line_for_test(super::release_flow::FLEET_LOST);
+    assert_eq!(
+        crate::line_claim::failure(),
+        Some(super::release_flow::FLEET_LOST)
+    );
+    if mode == "own" {
+        until_caught("the lost line's own SIGTERM", SIGTERM);
+    }
+    if mode == "elsewhere" {
+        until_counted("the lost line's own SIGTERM after another process's", 2);
+    }
+    let rewound = crate::release::Backend::rewind_selection(&mut real, &carried);
+    match mode {
+        "own" => {
+            assert!(
+                rewound.is_ok(),
+                "the line's own stop refused its settlement: {rewound:?}"
+            );
+            assert_eq!(
+                rev(&fix.work, "HEAD"),
+                start.head(),
+                "the private head is restored to its recorded prefix"
+            );
+        }
+        "person" | "elsewhere" => {
+            let refusal =
+                rewound.expect_err("a signal from elsewhere refuses the settlement's child");
+            assert!(
+                refusal
+                    .detail
+                    .iter()
+                    .any(|l| l.contains("not started: the release was interrupted")),
+                "{refusal:?}"
+            );
+            assert_eq!(rev(&fix.work, "HEAD"), carried.head(), "main is not moved");
+        }
+        other => panic!("unknown own-stop probe mode {other}"),
+    }
+    println!("own-stop probe {mode}: judged");
+}
+
 #[test]
 fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
     let fix = Fixture::merging("conflict");
@@ -1736,6 +1882,102 @@ fn a_neutral_backport_main_does_not_hold_is_refused_by_admit_and_verify() {
             stopped(line::verify_pending(&f.git(), &forged), Reason::OffMain);
         }
     }
+}
+
+/// Two backports authored on the line's head and named in one `--fix` batch both carry and
+/// verify, whichever of them is carried second, onto the hop the first one makes. NEGATIVE
+/// CONTROL: admit judged both against the pre-batch head while verify demanded that a backport's
+/// parent be the previous hop, so the second hop was refused as OffMain ("drop it (--forget)")
+/// after carry built it, and the release flow's dry run exited 1.
+#[test]
+fn two_backports_on_one_head_carry_in_one_batch_and_verify() {
+    for main_first in [true, false] {
+        let f = Fixture::merging("two-backports");
+        let (git, line) = (f.git(), Line::start(VERSION, &f.shas.g, 0));
+        let c = main_backport(&f, line.head(), &["src/c.rs", "src/c2.rs"]);
+        neutral_merge(&f, &c, main_first);
+        let b = main_backport(&f, line.head(), &["src/b.rs"]);
+        neutral_merge(&f, &b, main_first);
+        let landed = line::landed_since(&git, line.head()).unwrap();
+        assert!(!landed.contains(&c) && !landed.contains(&b), "{landed:?}");
+        let (c, b) = (fix_of(&git, &line, &c), fix_of(&git, &line, &b));
+        for named in [[c.clone(), b.clone()], [b.clone(), c.clone()]] {
+            let mut carried = line.clone();
+            carried.hops = line::carry(&git, &line, &named).unwrap();
+            line::verify_pending(&git, &carried).unwrap();
+        }
+        let both = [c, b];
+        let (code, last, rows) = super::release_flow::real_fix_fixture(&f.work, &line, &both, true);
+        assert_eq!(code, 0, "{last}\n{rows:#?}");
+        let mut carried = line.clone();
+        carried.hops =
+            line::carry(&git, &line, &line::order(&git, both.to_vec()).unwrap()).unwrap();
+        for path in ["src/b.rs", "src/c2.rs"] {
+            assert_eq!(
+                run(&f.work, &["show", &format!("{}:{path}", carried.head())]),
+                run(&f.work, &["show", &format!("origin/main:{path}")]),
+                "{path}"
+            );
+        }
+        line::record(
+            &git,
+            &LocalOrigin::new(&f),
+            VERSION,
+            carried.head(),
+            line::MAX_RECORD_ATTEMPTS,
+        )
+        .unwrap();
+        line::verify(&git, &carried).unwrap();
+    }
+}
+
+/// A backport named with an older, unrelated landed fix carries onto the hop that fix makes
+/// and verifies. NEGATIVE CONTROL: carried after that fix (where order() puts an older one), the
+/// backport became hop 2 on H1, and verify refused it as OffMain because its parent was the
+/// line's base, not H1; the release flow's dry run exited 1.
+#[test]
+fn a_backport_carried_after_an_older_landed_fix_verifies() {
+    let f = Fixture::merging("backport-after-fix");
+    let (git, line) = (f.git(), Line::start(VERSION, &f.shas.g, 0));
+    let backport = main_backport(&f, line.head(), &["src/c.rs", "src/c2.rs"]);
+    neutral_merge(&f, &backport, false);
+    let fixes = [
+        fix_of(&git, &line, &f.shas.fix_b),
+        fix_of(&git, &line, &backport),
+    ];
+    let mut carried = line.clone();
+    carried.hops = line::carry(&git, &line, &fixes).unwrap();
+    line::verify_pending(&git, &carried).unwrap();
+    let (code, last, rows) = super::release_flow::real_fix_fixture(&f.work, &line, &fixes, true);
+    assert_eq!(code, 0, "{last}\n{rows:#?}");
+    line::record(
+        &git,
+        &LocalOrigin::new(&f),
+        VERSION,
+        carried.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
+    line::verify(&git, &carried).unwrap();
+}
+
+/// A backport authored on `head`: each of `paths` takes origin/main's content, or is removed
+/// where main has no such file. It is not on main yet ([`neutral_merge`] lands it).
+fn main_backport(f: &Fixture, head: &str, paths: &[&str]) -> String {
+    run(&f.work, &["checkout", "-q", "--detach", head]);
+    for path in paths {
+        if line::tree_has(&f.git(), "origin/main", path).unwrap() {
+            let text = run(&f.work, &["show", &format!("origin/main:{path}")]);
+            fs::write(f.work.join(path), text).unwrap();
+        } else {
+            fs::remove_file(f.work.join(path)).unwrap();
+        }
+    }
+    commit(
+        &f.work,
+        &format!("backport main's {}", paths.join(", ")),
+        &[],
+    )
 }
 
 /// Land a fixture-only history record, in the parent order that today's code fails to follow.

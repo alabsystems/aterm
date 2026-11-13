@@ -10,7 +10,10 @@ use aterm_json::{Map, Value};
 
 use crate::error::{Error, IdentityRef, Kind, Sub};
 
+mod attribution;
+mod cache;
 mod usage;
+pub(crate) use attribution::parent_chain;
 
 /// One resource's limit as GitHub last reported it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +148,14 @@ pub struct RateBook {
     dir: Option<PathBuf>,
 }
 
+/// Held through a background attempt and its quota-header update. Sixteen fixed
+/// lock stripes serialize every local process of an identity without accumulating
+/// lock files when credentials rotate. The cutter takes none of these locks.
+pub(crate) struct BackgroundGuard {
+    #[cfg(unix)]
+    _held: Option<aterm_uds::private_file::PrivateLock>,
+}
+
 /// The longest rate-book file read.
 #[cfg(unix)]
 const BOOK_MAX: usize = 64 * 1024;
@@ -166,6 +177,39 @@ fn usable_key(key: &str) -> bool {
 }
 
 impl RateBook {
+    /// Reserve admission and the previous attempt's returned headers share one
+    /// cross-process lock, so a local burst cannot spend a stale snapshot in parallel.
+    pub(crate) fn background_guard(&self, key: &str) -> crate::error::Result<BackgroundGuard> {
+        #[cfg(unix)]
+        {
+            use aterm_uds::private_file::{PrivateLock, create_private_dir};
+            let Some(dir) = &self.dir else {
+                return Ok(BackgroundGuard { _held: None });
+            };
+            let local = |error| Error::local(format!("background quota admission: {error}"));
+            if let Some(parent) = dir.parent() {
+                if let Some(grand) = parent.parent() {
+                    std::fs::create_dir_all(grand).map_err(local)?;
+                }
+                create_private_dir(parent).map_err(local)?;
+            }
+            create_private_dir(dir).map_err(local)?;
+            let stripe = key.bytes().fold(0u8, u8::wrapping_add) % 16;
+            let held = PrivateLock::take(
+                dir,
+                &format!("background-{stripe}.lock"),
+                std::time::Duration::from_secs(60),
+                "background GitHub request is still locked after 60 seconds",
+            )
+            .map_err(local)?;
+            Ok(BackgroundGuard { _held: Some(held) })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = key;
+            Ok(BackgroundGuard {})
+        }
+    }
     /// The book in `dir` (`Dirs::rate()`).
     #[inline]
     #[must_use]
@@ -209,6 +253,23 @@ impl RateBook {
         )
     }
 
+    /// Background core reads stop before the cutter's reserve. This snapshot is
+    /// shared by every local client of the identity; each fleet Mac enforces it
+    /// against GitHub's shared counter. A 1000-request margin absorbs in-flight
+    /// fleet reads; it is not an independent budget on each Mac.
+    #[must_use]
+    pub fn refuse_background(&self, key: &str, now: u64, reserve: u64) -> Option<Error> {
+        if reserve == 0 {
+            return None;
+        }
+        let snapshot = self
+            .read(key)
+            .into_iter()
+            .find(|s| s.resource == "core" && s.reset > now && s.remaining <= reserve)?;
+        Some(Error::new(Kind::RateLimited, format!("background core read leaves {reserve} requests for the release cutter until {}", snapshot.reset))
+            .with_sub(Sub::PreRefused).with_reset(snapshot.reset).with_rate(snapshot))
+    }
+
     /// Merges `snapshot` into `key`'s advisory rate-book file, ignoring I/O errors.
     pub fn record(&self, key: &str, snapshot: &RateSnapshot) {
         #[cfg(unix)]
@@ -241,7 +302,31 @@ impl RateBook {
             create_private_dir(parent).ok()?;
         }
         create_private_dir(dir).ok()?;
+        let _lock = aterm_uds::private_file::PrivateLock::take(
+            dir,
+            "snapshots.lock",
+            std::time::Duration::from_secs(60),
+            "quota snapshot merge is still locked after 60 seconds",
+        )
+        .ok()?;
         let mut held = self.read(key);
+        let normalized =
+            if let Some(previous) = held.iter().find(|s| s.resource == normalized.resource) {
+                if previous.reset > normalized.reset {
+                    return Some(());
+                }
+                if previous.reset == normalized.reset {
+                    RateSnapshot {
+                        remaining: previous.remaining.min(normalized.remaining),
+                        used: previous.used.max(normalized.used),
+                        ..normalized
+                    }
+                } else {
+                    normalized
+                }
+            } else {
+                normalized
+            };
         held.retain(|s| s.resource != normalized.resource);
         while held.len() >= MAX_RESOURCES {
             // Evict unspent entries before spent (`remaining == 0`) ones so synthetic unspent

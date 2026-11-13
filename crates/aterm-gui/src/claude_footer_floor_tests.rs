@@ -104,7 +104,7 @@ fn every_fact() -> footer::RuleFit {
     footer::RuleFit {
         segments: vec![
             Segment::plain(footer::ACCOUNT_MARK, "main"),
-            Segment::attached(footer::ACCOUNT_MARK, "40%"),
+            Segment::attached(footer::ACCOUNT_MARK, "60% left"),
             Segment::plain(footer::WALL_MARK, "until 3pm"),
             Segment {
                 split: Some("Opus 5.5 ".len()),
@@ -229,7 +229,7 @@ fn every_fact_mark_reads_on_every_ground() {
 /// quieter than the quietest value, by its ink. Every word is terminal text, Normal script at
 /// regular weight (glass design §4.3, S7, 2026-11-07): at full size a stroke covers whole pixels
 /// on either ground, so the bold the subscript size gave the values and a light ground's stub is
-/// gone, and a dark ground's stub stays thin, as main drew it (owner ruling 2026-10-28: the black
+/// gone, and a dark ground's stub stays thin, as main drew it (the black
 /// theme keeps main's stub). NEGATIVE CONTROL: the old fact cell, bold in `Script::Sub`, fails
 /// the weight and script pin.
 #[test]
@@ -396,6 +396,7 @@ fn ghost_glyphs(blank: RenderCell, rule: RenderCell, lit: bool) -> Vec<RenderCel
             face: KeyFace {
                 ghost: Some(lit),
                 tag: None,
+                tag_lit: false,
                 mark: None,
             },
             cell: (7, 14),
@@ -415,7 +416,7 @@ fn ghost_glyphs(blank: RenderCell, rule: RenderCell, lit: bool) -> Vec<RenderCel
 }
 
 /// THE KEY'S GHOST READS ON EVERY GROUND: on every tab over each rule grey, the lit ghost wears
-/// the glass's value ink, one ink, at 4.5:1 or more, and at rest its quiet ink, thin, at 4.5:1
+/// the glass's lit ink, one ink, at 4.5:1 or more, and at rest its quiet ink, thin, at 4.5:1
 /// and quieter than lit, as a stub beside a value. CONTROL: the ghost as it was laid (Claude's
 /// light grey, lifted a third toward the ink) read under the floors on Default Light.
 #[test]
@@ -434,7 +435,7 @@ fn the_keys_ghost_reads_on_every_ground() {
             let lit_k = reads(lit[0].fg, blank.bg);
             for c in &lit {
                 assert!(lit_k >= NAME_CONTRAST, "{what}: lit at {lit_k:.2}:1");
-                assert_eq!(c.fg, rgb_of(glass.value()), "{what}: the value ink");
+                assert_eq!(c.fg, rgb_of(glass.lit()), "{what}: the lit ink");
             }
             // As a stub's beside a value ([`every_fact_word_reads_on_every_ground`]).
             let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;

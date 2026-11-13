@@ -2053,6 +2053,6 @@ fn stranded(report: Obj, story: &Story, cal: &Calibration) -> Obj {
 fn stranded(_: Obj, _: &Story, _: &Calibration) -> Obj {
     fail(
         "--stranded needs a build with debug assertions (the demonstration fault exists only there): \
-         targo --unverified run --profile opt-test -q -p aterm-bench --example aos_harness -- --stranded",
+         targo --unverified run --profile opt-test -q -p aterm-bench --features aos-harness --example aos_harness -- --stranded",
     )
 }

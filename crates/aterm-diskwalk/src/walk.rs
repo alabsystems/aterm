@@ -3,7 +3,7 @@
 
 //! THE WALK: a resumable cursor over one root, advanced in time slices.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use aterm_sysprobe::volumes::Table;
 
 use crate::list::ListerChoice;
 use crate::refuse::{Deny, Refusal, refuse};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::tree::DirId;
 use crate::tree::{Sums, Tree};
 
@@ -46,12 +46,19 @@ impl RootSpec {
 pub struct Policy {
     /// The deny set and allowlist.
     pub deny: Deny,
-    /// The mount table (read with `MNT_NOWAIT`).
+    /// The mount table (read with `MNT_NOWAIT`; the mount manager's volumes on Windows).
     pub mounts: Table,
     /// Read each file's private (unshared-clone) size: about 2.5× the cost.
     pub private: bool,
     /// Keep a `(dev, inode)` map of multiply linked files for the walk's first-seen and shared-out
-    /// figures ([`LinkTotals`]).
+    /// figures ([`LinkTotals`]). On Windows, where a file's link count and its size as it is
+    /// now cost a call of their own, this (or [`Self::private`]) also has the walk make that
+    /// call for every file. Without it the call is made for a file the folder's index lists at
+    /// 1 MiB or more, or as empty; any other file counts as one link at the size the index
+    /// holds, which is its size when it was last closed. So a sizing walk on Windows can count
+    /// a hard link under 1 MiB whole at each of its names, and can count a file that is open
+    /// and growing (one that was neither empty nor 1 MiB when last closed), or the other name
+    /// of a hard link that grew, at its earlier size: under, by however much it grew since.
     pub links_out: bool,
     /// A slice's budget.
     pub slice: Duration,
@@ -111,7 +118,7 @@ enum Status {
     Cancelled,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy)]
 struct Link {
     nlink: u32,
@@ -123,14 +130,20 @@ struct Link {
 pub struct Walk {
     generation: u64,
     tree: Tree,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     stack: Vec<imp::Frame>,
     #[cfg(unix)]
     spare: Vec<Vec<u8>>,
+    /// The level buffers, in the `u64` words the Windows listing's records are aligned to.
+    #[cfg(windows)]
+    spare: Vec<Vec<u64>>,
     root_dev: u64,
-    #[cfg(unix)]
+    /// The root's volume can share blocks between files (ReFS): no private size is claimed.
+    #[cfg(windows)]
+    shares_blocks: bool,
+    #[cfg(any(unix, windows))]
     policy: Policy,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     links: Option<HashMap<(u64, u64), Link>>,
     link_totals: Option<LinkTotals>,
     walked: u64,
@@ -152,11 +165,11 @@ impl std::fmt::Debug for Walk {
     }
 }
 
-/// `path` as a walk or a look names it ([`crate::refuse::canonical`]). Off Unix nothing is
-/// walked or looked at, so every path is [`Refusal::Unsupported`] before its spelling is read: a
-/// drive-letter path is absolute, never [`Refusal::Relative`].
+/// `path` as a walk or a look names it ([`crate::refuse::canonical`]). Where there is no walker
+/// (neither Unix nor Windows) nothing is walked or looked at, so every path is
+/// [`Refusal::Unsupported`] before its spelling is read.
 pub(crate) fn walk_path(path: &Path) -> Result<PathBuf, Refusal> {
-    if cfg!(unix) {
+    if cfg!(any(unix, windows)) {
         crate::refuse::canonical(path).ok_or(Refusal::Relative)
     } else {
         Err(Refusal::Unsupported)
@@ -178,11 +191,11 @@ impl Walk {
         ) {
             return Err(why);
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             imp::begin(canon, policy)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = canon;
             Err(Refusal::Unsupported)
@@ -197,7 +210,7 @@ impl Walk {
             Status::Cancelled => return Step::Cancelled,
             Status::Walking => {}
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let start = now();
             self.slices += 1;
@@ -219,7 +232,7 @@ impl Walk {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = now;
             self.status = Status::Done;
@@ -232,8 +245,22 @@ impl Walk {
         if self.status == Status::Walking {
             self.status = Status::Cancelled;
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.stack.clear();
+    }
+
+    /// Close every directory the walk holds open; its next slice opens them again and goes on
+    /// where it was. For a host that is about to do something else for a while: on Windows a
+    /// directory cannot be renamed while a handle to anything below it is open, so a walk left
+    /// open between slices fails a rename of every folder above its cursor with access denied,
+    /// and a released one fails none. A directory whose listing is more than 16,384 entries in
+    /// stays open until that listing ends (its place would cost too much to find again). A
+    /// directory that is not there when the walk comes back, or is another one of the same
+    /// name, is recorded as [`Refusal::Gone`] with what was counted in it. Does nothing on Unix,
+    /// where an open descriptor denies nobody anything.
+    pub fn release(&mut self) {
+        #[cfg(windows)]
+        self.release_handles();
     }
 
     /// The generation [`Walker`] minted for this walk (0 for a bare walk).
@@ -309,7 +336,7 @@ impl Walk {
         self.link_totals
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish(&mut self) {
         self.status = Status::Done;
         let root = self.tree.rec_mut(DirId::ROOT);
@@ -445,7 +472,9 @@ impl Walker {
             machine = "budgeted_walk",
             action = "CursorRestartsDirectory",
             reason = "Buggy=1 liveness negative control only: the cursor keeps each listing's \
-                      offset in its open descriptor, so a slice never lists a directory twice"
+                      offset in its open descriptor (a Windows walk released between slices \
+                      finds its place again after the last name it was given), so a slice never \
+                      visits a directory's entries twice"
         )
     )]
     pub fn slice(&mut self, ticket: Ticket, now: &mut dyn FnMut() -> Instant) -> Sliced {
@@ -496,6 +525,14 @@ impl Walker {
             w.cancel();
         }
         self.armed = false;
+    }
+
+    /// [`Walk::release`] on the walk in flight: what a host calls before it turns to other
+    /// work between slices.
+    pub fn release(&mut self) {
+        if let Some(w) = self.walk.as_mut() {
+            w.release();
+        }
     }
 
     /// Whether the host owes the walk in flight another slice.
@@ -648,7 +685,11 @@ pub(crate) fn file_root(root: &RootSpec, policy: &Policy) -> Result<Option<SizeF
             links,
         }))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        imp::file_root(parent, name, policy)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (policy, parent, name);
         Err(Refusal::Unsupported)
@@ -698,11 +739,11 @@ pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>,
         None | Some(Refusal::TooBroad) => {}
         Some(why) => return Err(why),
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         imp::one_level(&canon, policy)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         Err(Refusal::Unsupported)
     }
@@ -721,11 +762,19 @@ pub fn entry_count_of(path: &Path, policy: &Policy) -> Result<u32, Refusal> {
     {
         imp::entry_count(&canon)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        imp::entry_count(&canon, policy)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(Refusal::Unsupported)
     }
 }
+
+#[cfg(windows)]
+#[path = "walk_win.rs"]
+pub(crate) mod imp;
 
 #[cfg(unix)]
 pub(crate) mod imp {

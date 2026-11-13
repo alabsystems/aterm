@@ -61,6 +61,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }],
     }])
 }

@@ -33,20 +33,15 @@ const MENU_ROWS: usize = 8;
 pub(crate) enum Slash {
     /// Session-only toggle of the top-effort key (`/effort <key> on` or `off`).
     TopEffort(bool),
-    /// `/model`: Claude's ModelPicker.
-    ModelPicker,
-    /// `/effort`: Claude's EffortSlider.
-    EffortPicker,
     /// `/compact`: compact the conversation context.
     Compact,
-    /// `/model <id>`, `/model default` for `None`: the model switch's first step
-    /// (`crate::claude_facts`'s [`App::switch_model`]).
-    Model(Option<ModelArg>),
-    /// `/effort <level>`: the model switch's second step, typed once its `/model` is answered.
+    /// `/model <id>`: a choice of the model card (`crate::claude_facts::ModelPick`).
+    Model(ModelArg),
+    /// `/effort <level>`: a stop of the effort slider ([`App::pick_effort`]).
     Effort(&'static str),
 }
 
-/// A `/model` argument (`claude-opus-5-5`, `default`), held inline so [`Slash`] stays `Copy`.
+/// A `/model` argument (`claude-opus-5-5`, `opus`), held inline so [`Slash`] stays `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ModelArg {
     len: u8,
@@ -81,11 +76,6 @@ impl ModelArg {
     pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
     }
-
-    /// What `/model` is given for `id`: `default` for none.
-    fn typed(id: &Option<Self>) -> &str {
-        id.as_ref().map_or("default", Self::as_str)
-    }
 }
 
 impl std::fmt::Debug for ModelArg {
@@ -103,10 +93,8 @@ impl Slash {
                 "/effort {CLAUDE_TOP_EFFORT_KEY} {}",
                 if on { "on" } else { "off" }
             ),
-            Slash::ModelPicker => "/model".to_owned(),
-            Slash::EffortPicker => "/effort".to_owned(),
             Slash::Compact => "/compact".to_owned(),
-            Slash::Model(id) => format!("/model {}", ModelArg::typed(&id)),
+            Slash::Model(id) => format!("/model {}", id.as_str()),
             Slash::Effort(level) => format!("/effort {level}"),
         }
     }
@@ -125,8 +113,6 @@ impl Slash {
         match self {
             Slash::TopEffort(true) => "key-on",
             Slash::TopEffort(false) => "key-off",
-            Slash::ModelPicker => "model",
-            Slash::EffortPicker => "effort",
             Slash::Compact => "compact",
             Slash::Model(_) => "set-model",
             Slash::Effort(_) => "set-effort",
@@ -141,27 +127,23 @@ impl Slash {
                 "turning {CLAUDE_TOP_EFFORT_KEY} {}\u{2026}",
                 if on { "on" } else { "off" }
             ),
-            Slash::ModelPicker => "opening /model\u{2026}".to_owned(),
-            Slash::EffortPicker => "opening /effort\u{2026}".to_owned(),
             Slash::Compact => "running /compact\u{2026}".to_owned(),
-            Slash::Model(id) => format!("switching to {}\u{2026}", ModelArg::typed(&id)),
+            Slash::Model(id) => format!("switching to {}\u{2026}", id.as_str()),
             Slash::Effort(level) => format!("setting effort {level}\u{2026}"),
         }
     }
 
-    /// What the title slot says once it is done (none for a picker, which covers the composer
-    /// itself).
+    /// What the title slot says once it is done.
     #[must_use]
-    pub(crate) fn done(self) -> Option<String> {
+    pub(crate) fn done(self) -> String {
         match self {
-            Slash::TopEffort(on) => Some(format!(
+            Slash::TopEffort(on) => format!(
                 "\u{2713} {CLAUDE_TOP_EFFORT_KEY} {} (this session)",
                 if on { "on" } else { "off" }
-            )),
-            Slash::ModelPicker | Slash::EffortPicker => None,
-            Slash::Compact => Some("\u{2713} /compact sent".to_owned()),
-            Slash::Model(id) => Some(format!("\u{2713} model {}", ModelArg::typed(&id))),
-            Slash::Effort(level) => Some(format!("\u{2713} effort {level}")),
+            ),
+            Slash::Compact => "\u{2713} /compact sent".to_owned(),
+            Slash::Model(id) => format!("\u{2713} model {}", id.as_str()),
+            Slash::Effort(level) => format!("\u{2713} effort {level}"),
         }
     }
 }
@@ -276,7 +258,8 @@ pub(crate) enum Stage {
     Probed,
     /// The whole command is written.
     Typed { quiet: Option<(Instant, u64)> },
-    /// The Enter went; Claude's answer, or its picker, is awaited.
+    /// The Enter went; what ends the press is awaited: the composer letting go of the typed
+    /// command, or, for the top-effort key, Claude's answer to it.
     Entered,
 }
 
@@ -486,7 +469,8 @@ pub(crate) enum Step {
     Rest { row: usize },
     /// Quiet with the whole command: Enter, fenced at the cursor's row.
     Enter { row: usize },
-    /// Claude answered as asked, or its picker is up.
+    /// The command was taken: the composer let go of what was typed, or Claude answered the
+    /// top-effort key as asked.
     Done,
     /// It stops, named; a refusal Claude answered latches the key.
     Stop {
@@ -608,7 +592,6 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                         _ => None,
                     }
                 }),
-                Slash::ModelPicker | Slash::EffortPicker if screen.is_none() => Some(Step::Done),
                 // Claude runs a typed command with its argument at once: the composer let go
                 // of it is the answer (the footer's next read says what it set).
                 Slash::Compact | Slash::Model(_) | Slash::Effort(_) if !held => Some(Step::Done),
@@ -910,6 +893,10 @@ impl App {
             {
                 facts.ended = None;
             }
+            // A settled effort pick the footer never took up: the thumb is the footer's again.
+            if facts.effort_wish.is_some_and(|wish| !wish.stands(now)) {
+                facts.effort_wish = None;
+            }
         }
         let sessions: Vec<u64> = self
             .claude_facts
@@ -944,7 +931,13 @@ impl App {
             .foreground_stamp()
             != Some(press.foreground)
         {
-            self.end_slash(session, SlashEnd::Stopped(SlashRefusal::Changed), "", None);
+            self.end_slash(
+                session,
+                SlashEnd::Stopped(SlashRefusal::Changed),
+                "",
+                None,
+                now,
+            );
             return;
         }
         let counts = entry.ctx.human_input.counts();
@@ -952,7 +945,13 @@ impl App {
             .then(|| slash_holds(&entry.ctx))
             .flatten();
         if counts.reached > press.reached_after {
-            self.end_slash(session, SlashEnd::Stopped(SlashRefusal::Person), "", None);
+            self.end_slash(
+                session,
+                SlashEnd::Stopped(SlashRefusal::Person),
+                "",
+                None,
+                now,
+            );
             return;
         }
         if let Some(why) = holds {
@@ -961,7 +960,7 @@ impl App {
             } else {
                 press.text.to_string()
             };
-            self.end_slash(session, SlashEnd::Stopped(why), &left, None);
+            self.end_slash(session, SlashEnd::Stopped(why), &left, None, now);
             return;
         }
         let mut press = press;
@@ -1015,6 +1014,7 @@ impl App {
                             SlashEnd::Stopped(SlashRefusal::InputQueued),
                             "/",
                             None,
+                            now,
                         );
                         return;
                     }
@@ -1030,6 +1030,7 @@ impl App {
                             SlashEnd::Stopped(SlashRefusal::InputRejected),
                             "",
                             None,
+                            now,
                         );
                         return;
                     }
@@ -1068,17 +1069,18 @@ impl App {
                             SlashEnd::Stopped(SlashRefusal::LeftTyped),
                             &press.text,
                             None,
+                            now,
                         );
                         return;
                     }
                 }
             }
             Step::Done => {
-                self.end_slash(session, SlashEnd::Done, "", None);
+                self.end_slash(session, SlashEnd::Done, "", None, now);
                 return;
             }
             Step::Stop { why, left, latch } => {
-                self.end_slash(session, SlashEnd::Stopped(why), &left, latch);
+                self.end_slash(session, SlashEnd::Stopped(why), &left, latch, now);
                 return;
             }
         }
@@ -1114,8 +1116,8 @@ impl App {
         end: SlashEnd,
         left: &str,
         latch: Option<(TopAnswer, Option<String>)>,
+        now: Instant,
     ) {
-        let now = Instant::now();
         let Some(press) = self
             .claude_facts
             .get_mut(&session)
@@ -1139,15 +1141,9 @@ impl App {
         self.claude_facts.entry(session).or_default().ended = Some((press.slash, end, now + shown));
         let words = match end {
             SlashEnd::Done => press.slash.done(),
-            SlashEnd::Stopped(why) => Some(why.says(left, named.as_deref())),
+            SlashEnd::Stopped(why) => why.says(left, named.as_deref()),
         };
-        let woken = match words {
-            Some(words) => self.note_fact_said(press.wid, session, words, shown),
-            None => {
-                self.clear_fact_said(press.wid, session);
-                false
-            }
-        };
+        let woken = self.note_fact_said(press.wid, session, words, shown);
         if end == SlashEnd::Done {
             // The key turned on here exists for this process: its ghost may
             // stand in for Claude's tag once it is off again.
@@ -1159,11 +1155,11 @@ impl App {
         if !woken {
             crate::claude_lights::wake_after(session, shown);
         }
+        // The effort slider's thumb settles on this end, and a pick made meanwhile is typed.
+        self.effort_after(press.wid, session, press.slash, end, now);
         self.refresh_fact_readings(session);
         self.refresh_fact_menu(session);
         self.redraw_claude_footer(session);
-        // A model switch's `/effort` follows its answered `/model`.
-        self.switch_after(press.wid, session, press.slash, end);
     }
 
     /// Ask the resolver to read `session`'s footer now (the account card's store look rides it).

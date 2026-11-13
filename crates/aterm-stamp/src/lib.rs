@@ -23,11 +23,31 @@
 
 use std::sync::OnceLock;
 
+pub mod civil;
+pub mod release_version;
+
 /// Size of the identity record, in bytes: the section's fixed length.
 pub const LEN: usize = 512;
 
 /// The record's first line; a section that does not start with it is not a stamp.
 pub const HEADER: &str = "aterm-stamp 1\n";
+
+/// Describe only the admitted stable products in `git tag`'s output. Exact match
+/// arguments admit Calendar counters without mistaking a preview or arbitrary
+/// glob match for a release. This observes tags; it never allocates a version.
+#[must_use]
+pub fn describe_release_args(tags: &str) -> Option<Vec<String>> {
+    let mut args = vec!["describe".into(), "--tags".into(), "--abbrev=0".into()];
+    for tag in tags.lines() {
+        let Some(version) = tag.strip_prefix('v') else {
+            continue;
+        };
+        if release_version::ReleaseVersion::parse(version).is_some() {
+            args.extend(["--match".into(), tag.into()]);
+        }
+    }
+    (args.len() > 3).then_some(args)
+}
 
 /// The identity fields, in the order [`encode`] writes them.
 pub const KEYS: [&str; 9] = [
@@ -137,6 +157,33 @@ impl Stamp {
     #[must_use]
     pub fn build_id(&self) -> String {
         format!("{}+g{}", self.app_version, self.git_commit)
+    }
+
+    /// Win32's four numeric words: migration epoch `1`, then the stamped build's
+    /// three big-endian 16-bit words. This is a technical artifact version;
+    /// `FileVersion` and `ProductVersion` strings retain the exact public version.
+    ///
+    /// Epoch 1 sorts above historical `0.MINOR.PATCH.0` resources. The remaining
+    /// 48 bits preserve build order without clamping Calendar dates or counters.
+    /// Malformed or unrepresentable builds refuse instead of colliding.
+    pub fn windows_numeric_version(&self) -> Result<[u16; 4], &'static str> {
+        let invalid = "Windows numeric version requires a decimal 48-bit stamped build number";
+        if self.build_number.is_empty()
+            || !self.build_number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid);
+        }
+        let build = self.build_number.parse::<u64>().map_err(|_| invalid)?;
+        if build > 0xffff_ffff_ffff {
+            return Err(invalid);
+        }
+        let [_, _, a, b, c, d, e, f] = build.to_be_bytes();
+        Ok([
+            1,
+            u16::from_be_bytes([a, b]),
+            u16::from_be_bytes([c, d]),
+            u16::from_be_bytes([e, f]),
+        ])
     }
 
     /// The release this stamp's version names, `(MAJOR, MINOR, PATCH)`: its core, before any

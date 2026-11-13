@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here adopt a shared Claude account, whose sign-in opener aterm
+// links only on Unix (`cli::opener_link`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 #[path = "accounts_auto_shared_identity_tests.rs"]
 mod identity_tests;
 
@@ -958,6 +968,7 @@ impl RenewalAdmission {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn blocked_shared_renewal_keeps_the_last_admitted_preparation() {
     let mut fixture = RenewalAdmission::new();
@@ -998,6 +1009,7 @@ pub(crate) fn renewal_admission_transition(
     fixture.observe()
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_renewal_admission_conforms_and_rejects_premature_history() {
     let model = aterm_models_harness::shared_renewal_admission_model();
@@ -1025,6 +1037,7 @@ fn shared_renewal_admission_conforms_and_rejects_premature_history() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_renewal_backoffs_preserve_admission_history() {
     for bot in [false, true] {
@@ -1089,6 +1102,7 @@ fn a_new_shared_preparation_wakes_unchanged_unavailable_routes() {
     assert_eq!(bed.provider.calls.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn uncertain_shared_renewal_requests_recovery_without_replaying_the_provider() {
     let bed = Bed::new(None);
@@ -1483,6 +1497,7 @@ pub(crate) fn recovery_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_recovery_conforms_and_detects_the_silent_noop() {
     let model = aterm_models_harness::shared_recovery_model();
@@ -1896,6 +1911,7 @@ pub(super) fn unstarted_candidate(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn sparse_shared_preparation_passes_do_not_starve_later_candidates() {
     let bed = Bed::with_custody(None, false);
@@ -1927,6 +1943,7 @@ fn sparse_shared_preparation_passes_do_not_starve_later_candidates() {
 
 /// Two accounts' adoptions on one Mac start at least ten minutes apart on the wall clock, whatever
 /// the cooldown's clock allows: the second waits, and starts once the spacing has passed.
+#[cfg(unix)]
 #[test]
 fn two_accounts_adoptions_start_ten_minutes_apart() {
     let bed = Bed::with_custody(None, false);
@@ -1964,6 +1981,7 @@ fn two_accounts_adoptions_start_ten_minutes_apart() {
     assert_eq!(*calls.lock().unwrap(), [1, 2]);
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_candidate_history_is_independent_across_networks() {
     for offsets in [[0, 901, 1802, 2703], [0, 1, 2, 3]] {
@@ -2010,6 +2028,7 @@ fn shared_candidate_history_is_independent_across_networks() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn reissued_shared_candidate_runs_without_resetting_its_peer_cooldown() {
     let bed = Bed::with_custody(None, false);
@@ -2050,6 +2069,7 @@ fn reissued_shared_candidate_runs_without_resetting_its_peer_cooldown() {
     assert_eq!(guard.lock().unwrap().last_attempt[&key], start);
 }
 
+#[cfg(unix)]
 #[test]
 fn held_shared_candidates_preserve_history_and_let_peers_run() {
     for bot in [false, true] {
@@ -2116,6 +2136,7 @@ impl Authority for RevokedAfterRanking {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_candidate_rank_does_not_bypass_live_authorization() {
     let bed = Bed::with_custody(None, false);
@@ -2153,6 +2174,7 @@ fn shared_candidate_rank_does_not_bypass_live_authorization() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_candidates_in_cooldown_do_not_block_an_unseen_candidate() {
     let bed = Bed::with_custody(None, false);
@@ -2181,6 +2203,7 @@ fn shared_candidates_in_cooldown_do_not_block_an_unseen_candidate() {
     assert_eq!(*calls.lock().unwrap(), [1, 2]);
 }
 
+#[cfg(unix)]
 #[test]
 fn steady_native_preparations_give_shared_oauth_the_next_admission() {
     use super::super::native_keys::{self, PreparationTask};
@@ -2292,6 +2315,7 @@ fn unavailable_shared_preparation_falls_back_to_native_without_a_wasted_pass() {
     assert_eq!(shared_reads.load(Ordering::SeqCst), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn unavailable_native_preparation_keeps_first_chance_while_shared_work_progresses() {
     use super::super::native_keys;
@@ -2508,6 +2532,7 @@ pub(crate) fn adoption_progress_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn listed_first_adoption_resumes_the_same_attempt_when_admission_and_cooldown_allow() {
     let model = aterm_models_harness::shared_adoption_progress_model();
@@ -2634,6 +2659,7 @@ pub(crate) fn shared_progress_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_progress_with_live_discovery_and_persistent_guard_conforms() {
     let model = aterm_models_harness::shared_progress_model();

@@ -3,9 +3,10 @@
 
 //! The one shared-lock composition case: the isolated product's version.
 
-use super::{Command, Git, LOCAL};
+use super::{Command, Git, LOCAL, display_git_path};
 use aterm_toml::edit::{DocumentMut, Item};
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Output;
 use std::time::Instant;
 
 const PRODUCT: &[u8] = b"crates/aterm/Cargo.toml";
@@ -14,6 +15,8 @@ const IDENTITY: [&[u8]; 3] = [
     b"crates/aterm-stamp/src/lib.rs",
     b"crates/aterm-census/src/guards/identity_read.rs",
 ];
+/// The four trees [`independent_lock`] reads, in its argument order, as a refusal names them.
+const ENDPOINTS: [&str; 4] = ["the base", "new main", "the checked tree", "the merge"];
 
 #[derive(Clone, PartialEq, Eq)]
 struct Entry {
@@ -41,51 +44,94 @@ struct Version {
     product: String,
 }
 
-/// No unavailable, malformed or unsupported evidence authorizes composition.
+/// Why the isolated product-version exception did not compose a sole shared `Cargo.lock`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// The trees were read, and the change is not that move: what differs.
+    Differs(String),
+    /// The exception could not be judged, and why: a Git read failed or ran out of time, or the
+    /// evidence has a shape this exception does not read. It decides nothing about the move.
+    Unjudged(String),
+}
+
+/// The isolated product version's move, old to new, where a sole shared `Cargo.lock` carries
+/// exactly that; else why not. No unavailable, malformed or unsupported evidence authorizes
+/// composition, and none is reported as a decided difference ([`Refusal::Unjudged`]).
 pub(super) fn independent_lock(
     git: &Git<'_>,
     base: &str,
     main: &str,
     checked: &str,
     merged: &str,
-) -> Option<(String, String)> {
+) -> Result<(String, String), Refusal> {
     let until = Instant::now() + LOCAL;
-    let mut trees = [base, main, checked, merged]
-        .map(|id| tree(git, id, until))
-        .into_iter()
-        .collect::<Option<Vec<_>>>()?;
+    let mut trees = Vec::with_capacity(ENDPOINTS.len());
+    for (id, endpoint) in [base, main, checked, merged].into_iter().zip(ENDPOINTS) {
+        trees.push(
+            tree(git, id, until).map_err(|why| Refusal::Unjudged(format!("{endpoint}: {why}")))?,
+        );
+    }
     // These are the existing source boundary and writer, not a claim that versions are
     // inert. A changed boundary needs a judgment rather than this classification.
     for path in IDENTITY.into_iter().chain([PRODUCT]) {
-        let original = regular(&trees[0], path)?;
-        if trees
-            .iter()
-            .any(|tree| regular(tree, path) != Some(original))
-        {
-            return None;
+        let shown = display_git_path(path);
+        let Some(original) = regular(&trees[0], path) else {
+            return Err(Refusal::Unjudged(format!(
+                "the base has no regular file {shown}"
+            )));
+        };
+        if let Some(endpoint) = differing(&trees, |tree| regular(tree, path) != Some(original)) {
+            return Err(Refusal::Differs(format!(
+                "{endpoint}'s {shown} differs from the base's"
+            )));
         }
     }
-    let mut objects = blobs(git, &trees, until)?;
+    let mut objects = blobs(git, &trees, until).map_err(Refusal::Unjudged)?;
     close_submodules(git, &mut trees, &mut objects, until)?;
-    let views = trees
-        .iter()
-        .map(|tree| version(tree, &objects))
-        .collect::<Option<Vec<_>>>()?;
-    let [base, main, checked, merged] = views.as_slice() else {
-        return None;
+    let view = |index: usize| {
+        version(&trees[index], &objects).ok_or_else(|| {
+            Refusal::Unjudged(format!(
+                "{}'s workspace manifests or Cargo.lock are outside the shapes this exception \
+                 reads",
+                ENDPOINTS[index]
+            ))
+        })
     };
-    if base.workspace.value == main.workspace.value
-        || base.workspace.value != checked.workspace.value
-        || main.workspace.value != merged.workspace.value
-        || base.product != checked.product
-        || !base.workspace.same_surroundings(&main.workspace)
-        || !checked.workspace.same_surroundings(&merged.workspace)
-        || !base.lock.same_surroundings(&main.lock)
-        || !checked.lock.same_surroundings(&merged.lock)
-    {
-        return None;
+    let (base, main, checked, merged) = (view(0)?, view(1)?, view(2)?, view(3)?);
+    let differs = |why: &str| Err(Refusal::Differs(why.to_owned()));
+    if base.workspace.value == main.workspace.value {
+        return differs("new main does not move the workspace version");
     }
-    Some((base.workspace.value.clone(), main.workspace.value.clone()))
+    if base.workspace.value != checked.workspace.value {
+        return differs("the checked tree's workspace version is not the base's");
+    }
+    if main.workspace.value != merged.workspace.value {
+        return differs("the merge's workspace version is not new main's");
+    }
+    if base.product != checked.product {
+        return differs("the checked tree changes the product's lock entry");
+    }
+    if !base.workspace.same_surroundings(&main.workspace) {
+        return differs("new main changes the root manifest beyond its version");
+    }
+    if !checked.workspace.same_surroundings(&merged.workspace) {
+        return differs("the merge changes the checked root manifest beyond its version");
+    }
+    if !base.lock.same_surroundings(&main.lock) {
+        return differs("new main changes Cargo.lock beyond the product version");
+    }
+    if !checked.lock.same_surroundings(&merged.lock) {
+        return differs("the merge changes the checked Cargo.lock beyond the product version");
+    }
+    Ok((base.workspace.value, main.workspace.value))
+}
+
+/// The first of the endpoints whose tree `differs` holds for, as a refusal names it.
+fn differing(trees: &[Tree], differs: impl Fn(&Tree) -> bool) -> Option<&'static str> {
+    trees
+        .iter()
+        .zip(ENDPOINTS)
+        .find_map(|(tree, endpoint)| differs(tree).then_some(endpoint))
 }
 
 fn member_manifest(path: &[u8]) -> bool {
@@ -117,26 +163,52 @@ fn local_command(git: &Git<'_>) -> Command {
     command
 }
 
-fn capture(git: &Git<'_>, args: &[&str], until: Instant) -> Option<std::process::Output> {
+/// A local Git read's complete output, else why there is none: the run failed, ran out of
+/// time or exited unsuccessfully.
+fn capture(git: &Git<'_>, args: &[&str], until: Instant) -> Result<Output, String> {
+    let shown = format!("git {}", args.join(" "));
     let mut command = local_command(git);
     command.args(args);
-    aterm_uds::deadline::output_until_complete_stdout_with_limit(
+    let output = aterm_uds::deadline::output_until_complete_stdout_with_limit(
         &mut command,
         until,
         aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
     )
-    .ok()
-    .filter(|output| output.status.success())
+    .map_err(|error| format!("{shown}: {error}"))?;
+    succeeded(&shown, output)
 }
 
-fn tree(git: &Git<'_>, id: &str, until: Instant) -> Option<Tree> {
-    let out = capture(git, &["ls-tree", "-r", "-z", "--full-tree", id], until)?;
-    if !out.stdout.ends_with(b"\0") {
-        return None;
+/// `output` where its command succeeded, else what the command said, or its status.
+fn succeeded(shown: &str, output: Output) -> Result<Output, String> {
+    if output.status.success() {
+        return Ok(output);
     }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let said = said.trim();
+    Err(if said.is_empty() {
+        format!("{shown}: {}", output.status)
+    } else {
+        format!("{shown}: {said}")
+    })
+}
+
+/// `id`'s recursive tree, holding the entries this exception reads; else why it cannot.
+fn tree(git: &Git<'_>, id: &str, until: Instant) -> Result<Tree, String> {
+    let args = ["ls-tree", "-r", "-z", "--full-tree", id];
+    let out = capture(git, &args, until)?;
+    let unread = || {
+        format!(
+            "git {}: output this exception does not read",
+            args.join(" ")
+        )
+    };
+    let rows = out.stdout.strip_suffix(b"\0").ok_or_else(unread)?;
     let mut entries = Tree::new();
-    for row in out.stdout.strip_suffix(b"\0")?.split(|byte| *byte == 0) {
-        let tab = row.iter().position(|byte| *byte == b'\t')?;
+    for row in rows.split(|byte| *byte == 0) {
+        let tab = row
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(unread)?;
         let path = &row[tab + 1..];
         // Recursive tree output omits ordinary directories. An immediate entry
         // could hide a member manifest behind a symlink or another unsupported shape.
@@ -144,14 +216,17 @@ fn tree(git: &Git<'_>, id: &str, until: Instant) -> Option<Tree> {
             .strip_prefix(b"crates/")
             .is_some_and(|name| !name.contains(&b'/'))
         {
-            return None;
+            return Err(format!(
+                "{} sits directly in crates/ rather than in a member directory",
+                display_git_path(path)
+            ));
         }
         let words: Vec<_> = std::str::from_utf8(&row[..tab])
-            .ok()?
+            .map_err(|_| unread())?
             .split_whitespace()
             .collect();
         if words.len() != 3 || !aterm_types::land_trailer::object_id(words[2]) {
-            return None;
+            return Err(unread());
         }
         if !selected(path) && matches!((words[0], words[1]), ("100644" | "100755", "blob")) {
             continue;
@@ -159,7 +234,15 @@ fn tree(git: &Git<'_>, id: &str, until: Instant) -> Option<Tree> {
         if !matches!(
             (words[0], words[1]),
             ("100644" | "100755" | "120000", "blob") | ("160000", "commit")
-        ) || entries
+        ) {
+            return Err(format!(
+                "{} is a {} {} entry",
+                display_git_path(path),
+                words[0],
+                words[1]
+            ));
+        }
+        if entries
             .insert(
                 path.to_vec(),
                 Entry {
@@ -169,17 +252,22 @@ fn tree(git: &Git<'_>, id: &str, until: Instant) -> Option<Tree> {
             )
             .is_some()
         {
-            return None;
+            return Err(format!("{} is listed twice", display_git_path(path)));
         }
     }
-    Some(entries)
+    Ok(entries)
 }
 
 fn regular<'a>(tree: &'a Tree, path: &[u8]) -> Option<&'a Entry> {
     tree.get(path).filter(|entry| entry.mode == "100644")
 }
 
-fn blobs(git: &Git<'_>, trees: &[Tree], until: Instant) -> Option<BTreeMap<String, String>> {
+/// The text of every lock and manifest blob the trees name, by object; else why not.
+fn blobs(
+    git: &Git<'_>,
+    trees: &[Tree],
+    until: Instant,
+) -> Result<BTreeMap<String, String>, String> {
     let wanted: BTreeSet<_> = trees
         .iter()
         .flat_map(|tree| tree.iter())
@@ -190,6 +278,7 @@ fn blobs(git: &Git<'_>, trees: &[Tree], until: Instant) -> Option<BTreeMap<Strin
         .iter()
         .map(|id| format!("{id}\n"))
         .collect::<String>();
+    let shown = "git cat-file --batch";
     let mut command = local_command(git);
     command.args(["cat-file", "--batch"]);
     let out = aterm_uds::deadline::output_with_input_until(
@@ -198,11 +287,18 @@ fn blobs(git: &Git<'_>, trees: &[Tree], until: Instant) -> Option<BTreeMap<Strin
         until,
         aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
     )
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let mut bytes = out.stdout.as_slice();
+    .map_err(|error| format!("{shown}: {error}"))?;
+    let out = succeeded(shown, out)?;
+    batch(&out.stdout, wanted).ok_or_else(|| {
+        format!(
+            "{shown}: an object it was asked for is missing, is not UTF-8 blob text, or was \
+             cut short"
+        )
+    })
+}
+
+/// `cat-file --batch` output that holds exactly the `wanted` blobs, in order, as UTF-8 text.
+fn batch(mut bytes: &[u8], wanted: BTreeSet<&str>) -> Option<BTreeMap<String, String>> {
     let mut objects = BTreeMap::new();
     for id in wanted {
         let newline = bytes.iter().position(|byte| *byte == b'\n')?;
@@ -235,140 +331,210 @@ fn close_submodules(
     trees: &mut [Tree],
     objects: &mut BTreeMap<String, String>,
     until: Instant,
-) -> Option<()> {
+) -> Result<(), Refusal> {
     let pins = |tree: &Tree| {
         tree.iter()
             .filter(|(_, entry)| entry.mode == "160000")
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect::<Tree>()
     };
-    let original = pins(trees.first()?);
-    if trees.iter().any(|tree| pins(tree) != original) {
-        return None;
+    let original = pins(&trees[0]);
+    if let Some(endpoint) = differing(trees, |tree| pins(tree) != original) {
+        return Err(Refusal::Differs(format!(
+            "{endpoint}'s submodule pins differ from the base's"
+        )));
     }
     if original.is_empty() {
-        return Some(());
+        return Ok(());
     }
     let mut targets = BTreeSet::new();
-    for tree in trees.iter() {
-        for path in tree.keys().filter(|path| manifest(path)) {
-            let path_text = std::str::from_utf8(path).ok()?;
-            let directory = path_text.strip_suffix("/Cargo.toml").unwrap_or("");
-            let doc = text(tree, objects, path)?.parse::<DocumentMut>().ok()?;
-            targets.extend(dependency_targets(&doc, directory)?);
-        }
+    for (tree, endpoint) in trees.iter().zip(ENDPOINTS) {
+        targets.extend(path_targets(tree, objects).ok_or_else(|| {
+            Refusal::Unjudged(format!(
+                "{endpoint}'s path dependencies are outside the shapes this exception reads"
+            ))
+        })?);
     }
     for (prefix, pin) in original {
-        let prefix = std::str::from_utf8(&prefix).ok()?;
-        if local_path("", prefix)? != prefix {
-            return None;
-        }
-        for tree in trees.iter() {
-            let root = text(tree, objects, b"Cargo.toml")?
-                .parse::<DocumentMut>()
-                .ok()?;
-            if !root
-                .get("workspace")?
-                .get("exclude")?
-                .as_array()?
-                .iter()
-                .any(|entry| entry.as_str() == Some(prefix))
-            {
-                return None;
+        close_submodule(git, trees, objects, &targets, &prefix, &pin, until).map_err(|why| {
+            Refusal::Unjudged(format!("submodule {}: {why}", display_git_path(&prefix)))
+        })?;
+    }
+    Ok(())
+}
+
+/// Every local path dependency `tree`'s manifests name, normalized from the root.
+fn path_targets(tree: &Tree, objects: &BTreeMap<String, String>) -> Option<BTreeSet<String>> {
+    let mut targets = BTreeSet::new();
+    for path in tree.keys().filter(|path| manifest(path)) {
+        let path_text = std::str::from_utf8(path).ok()?;
+        let directory = path_text.strip_suffix("/Cargo.toml").unwrap_or("");
+        let doc = text(tree, objects, path)?.parse::<DocumentMut>().ok()?;
+        targets.extend(dependency_targets(&doc, directory)?);
+    }
+    Some(targets)
+}
+
+/// Close one unchanged pin at `prefix` over its child workspace's manifests; else why not.
+fn close_submodule(
+    git: &Git<'_>,
+    trees: &mut [Tree],
+    objects: &mut BTreeMap<String, String>,
+    targets: &BTreeSet<String>,
+    prefix: &[u8],
+    pin: &Entry,
+    until: Instant,
+) -> Result<(), String> {
+    let prefix = std::str::from_utf8(prefix)
+        .ok()
+        .filter(|prefix| local_path("", prefix).as_deref() == Some(*prefix))
+        .ok_or("its path is not canonical")?;
+    for tree in trees.iter() {
+        match excluded(tree, objects, prefix) {
+            Some(true) => {}
+            Some(false) => {
+                return Err("a root manifest's workspace.exclude does not name it".to_owned());
             }
-        }
-        let child_root = git.root.join(prefix);
-        let child_git = Git {
-            root: &child_root,
-            make: git.make,
-        };
-        let commit = format!("{}^{{commit}}", pin.object);
-        let identity = capture(
-            &child_git,
-            &["rev-parse", "--show-prefix", "--verify", &commit],
-            until,
-        )?;
-        if identity.stdout.as_slice() != format!("\n{}\n", pin.object).as_bytes() {
-            return None;
-        }
-        let mut child = tree(&child_git, &pin.object, until)?;
-        if child
-            .values()
-            .any(|entry| !matches!(entry.mode.as_str(), "100644" | "100755"))
-        {
-            return None;
-        }
-        child.retain(|path, _| manifest(path));
-        let child_objects = blobs(&child_git, std::slice::from_ref(&child), until)?;
-        let root = text(&child, &child_objects, b"Cargo.toml")?
-            .parse::<DocumentMut>()
-            .ok()?;
-        root.get("workspace")?.as_table_like()?;
-        root.get("workspace")?
-            .get("package")?
-            .get("version")?
-            .as_str()?;
-        let mut edges = BTreeMap::new();
-        let mut pending = BTreeSet::new();
-        for path in child.keys() {
-            let path_text = std::str::from_utf8(path).ok()?;
-            let directory = path_text.strip_suffix("/Cargo.toml").unwrap_or("");
-            let doc = text(&child, &child_objects, path)?
-                .parse::<DocumentMut>()
-                .ok()?;
-            if doc
-                .get("package")
-                .is_some_and(|package| package.get("workspace").is_some())
-            {
-                return None;
-            }
-            // This inspects even unused fixture manifests for escaping paths. Missing
-            // local targets matter only when the manifest is in the path-edge closure.
-            edges.insert(directory.to_owned(), dependency_targets(&doc, directory)?);
-            if let Some(workspace) = doc.get("workspace") {
-                workspace.as_table_like()?;
-                pending.insert(directory.to_owned());
-            }
-        }
-        for target in &targets {
-            if beneath(target, prefix) {
-                pending.insert(
-                    target
-                        .strip_prefix(prefix)?
-                        .trim_start_matches('/')
+            None => {
+                return Err(
+                    "a root manifest has no workspace.exclude array this exception reads"
                         .to_owned(),
                 );
             }
         }
-        let mut reached = BTreeSet::new();
-        while let Some(directory) = pending.pop_first() {
-            if reached.insert(directory.clone()) {
-                pending.extend(edges.get(&directory)?.iter().cloned());
-            }
-        }
-        for directory in reached {
-            let path = if directory.is_empty() {
-                "Cargo.toml".to_owned()
-            } else {
-                format!("{directory}/Cargo.toml")
-            };
-            let entry = regular(&child, path.as_bytes())?;
-            let joined = format!("{prefix}/{path}").into_bytes();
-            for tree in trees.iter_mut() {
-                if tree.insert(joined.clone(), entry.clone()).is_some() {
-                    return None;
-                }
-            }
-            objects.insert(
-                entry.object.clone(),
-                child_objects.get(&entry.object)?.clone(),
-            );
-        }
+    }
+    let child_root = git.root.join(prefix);
+    let child_git = Git {
+        root: &child_root,
+        make: git.make,
+    };
+    let commit = format!("{}^{{commit}}", pin.object);
+    let identity = capture(
+        &child_git,
+        &["rev-parse", "--show-prefix", "--verify", &commit],
+        until,
+    )?;
+    if identity.stdout.as_slice() != format!("\n{}\n", pin.object).as_bytes() {
+        return Err(format!(
+            "git rev-parse: its pin {} is not a commit at the top of its own checkout",
+            pin.object
+        ));
+    }
+    let mut child = tree(&child_git, &pin.object, until)?;
+    if child
+        .values()
+        .any(|entry| !matches!(entry.mode.as_str(), "100644" | "100755"))
+    {
+        return Err("its tree holds an entry that is not a regular file".to_owned());
+    }
+    child.retain(|path, _| manifest(path));
+    let child_objects = blobs(&child_git, std::slice::from_ref(&child), until)?;
+    let closure = child_closure(&child, &child_objects, targets, prefix)
+        .ok_or("its workspace is outside the shapes this exception reads")?;
+    for (joined, entry, text) in closure {
         for tree in trees.iter_mut() {
-            tree.remove(prefix.as_bytes())?;
+            if tree.insert(joined.clone(), entry.clone()).is_some() {
+                return Err(format!(
+                    "{} is in the parent's tree too",
+                    display_git_path(&joined)
+                ));
+            }
+        }
+        objects.insert(entry.object, text);
+    }
+    for tree in trees.iter_mut() {
+        tree.remove(prefix.as_bytes())
+            .ok_or("its gitlink is missing from a tree")?;
+    }
+    Ok(())
+}
+
+/// Whether `tree`'s root manifest lists `prefix` in `workspace.exclude`; `None` where that
+/// manifest cannot be read or parsed, or has no `workspace.exclude` array.
+fn excluded(tree: &Tree, objects: &BTreeMap<String, String>, prefix: &str) -> Option<bool> {
+    let root = text(tree, objects, b"Cargo.toml")?
+        .parse::<DocumentMut>()
+        .ok()?;
+    Some(
+        root.get("workspace")?
+            .get("exclude")?
+            .as_array()?
+            .iter()
+            .any(|entry| entry.as_str() == Some(prefix)),
+    )
+}
+
+/// The child workspace's manifests the parent reaches by path (its root's included), each as
+/// its joined parent path, entry and text; `None` where the child is not a separate Cargo
+/// workspace this exception reads.
+fn child_closure(
+    child: &Tree,
+    child_objects: &BTreeMap<String, String>,
+    targets: &BTreeSet<String>,
+    prefix: &str,
+) -> Option<Vec<(Vec<u8>, Entry, String)>> {
+    let root = text(child, child_objects, b"Cargo.toml")?
+        .parse::<DocumentMut>()
+        .ok()?;
+    root.get("workspace")?.as_table_like()?;
+    root.get("workspace")?
+        .get("package")?
+        .get("version")?
+        .as_str()?;
+    let mut edges = BTreeMap::new();
+    let mut pending = BTreeSet::new();
+    for path in child.keys() {
+        let path_text = std::str::from_utf8(path).ok()?;
+        let directory = path_text.strip_suffix("/Cargo.toml").unwrap_or("");
+        let doc = text(child, child_objects, path)?
+            .parse::<DocumentMut>()
+            .ok()?;
+        if doc
+            .get("package")
+            .is_some_and(|package| package.get("workspace").is_some())
+        {
+            return None;
+        }
+        // This inspects even unused fixture manifests for escaping paths. Missing
+        // local targets matter only when the manifest is in the path-edge closure.
+        edges.insert(directory.to_owned(), dependency_targets(&doc, directory)?);
+        if let Some(workspace) = doc.get("workspace") {
+            workspace.as_table_like()?;
+            pending.insert(directory.to_owned());
         }
     }
-    Some(())
+    for target in targets {
+        if beneath(target, prefix) {
+            pending.insert(
+                target
+                    .strip_prefix(prefix)?
+                    .trim_start_matches('/')
+                    .to_owned(),
+            );
+        }
+    }
+    let mut reached = BTreeSet::new();
+    while let Some(directory) = pending.pop_first() {
+        if reached.insert(directory.clone()) {
+            pending.extend(edges.get(&directory)?.iter().cloned());
+        }
+    }
+    let mut closure = Vec::new();
+    for directory in reached {
+        let path = if directory.is_empty() {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("{directory}/Cargo.toml")
+        };
+        let entry = regular(child, path.as_bytes())?;
+        let text = child_objects.get(&entry.object)?;
+        closure.push((
+            format!("{prefix}/{path}").into_bytes(),
+            entry.clone(),
+            text.clone(),
+        ));
+    }
+    Some(closure)
 }
 
 /// Only the raw content of a canonical product version may differ. The parser's

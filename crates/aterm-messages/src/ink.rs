@@ -3,6 +3,8 @@
 
 //! The band's colours.
 
+pub use aterm_types::bg_is_light;
+
 use crate::animate::{BandMotion, FineTone, Tone};
 use crate::glass::{CapsuleRole, Presentation};
 use crate::paint::{
@@ -377,13 +379,6 @@ pub const TRACK_TINT: f32 = 0.10;
 
 /// The least contrast a hovered chip's fill stands from a resting chip's.
 pub const HOVER_RISE: f64 = 1.5;
-
-/// Is this background a light one? Light when black text has more contrast on it than white.
-#[inline]
-#[must_use]
-pub fn bg_is_light(bg: [u8; 3]) -> bool {
-    contrast(BLACK, bg) > contrast(WHITE, bg)
-}
 
 /// Linear blend of two RGB triples.
 #[inline]

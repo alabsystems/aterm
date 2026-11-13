@@ -14,7 +14,7 @@ fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> V
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let done = std::sync::Mutex::new(Vec::with_capacity(items.len()));
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let threads = aterm_cores::available_parallelism().map_or(4, std::num::NonZero::get);
     std::thread::scope(|scope| {
         for _ in 0..threads.min(items.len()) {
             scope.spawn(|| {

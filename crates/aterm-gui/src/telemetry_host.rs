@@ -277,9 +277,14 @@ fn take_block_job(session: u64, block: u64) -> Option<(Option<u64>, bool)> {
     got
 }
 
-/// After a jobs pass at host clock `at_ms`: keep what it read of each block's job for that block's
-/// command row, and write a row for each agent call that ended, counted on `calls`'s counts.
-pub(crate) fn jobs_passed(jobs: &mut aterm_vitals::jobs::Jobs, at_ms: u64, calls: &CallWatch) {
+/// After a jobs pass whose clock reads `clock` (host ms, the clock its moments are on): keep what
+/// it read of each block's job for that block's command row, and write a row for each agent call
+/// that ended, counted on `calls`'s counts and written where `calls` writes.
+pub(crate) fn jobs_passed(
+    jobs: &mut aterm_vitals::jobs::Jobs,
+    clock: impl Fn() -> u64,
+    calls: &CallWatch,
+) {
     {
         let mut kept = BLOCK_JOBS.lock().unwrap_or_else(PoisonError::into_inner);
         for m in jobs.block_meters() {
@@ -294,21 +299,26 @@ pub(crate) fn jobs_passed(jobs: &mut aterm_vitals::jobs::Jobs, at_ms: u64, calls
             }
         }
     }
+    // Both clocks read together, after everything the pass read: every moment its calls carry
+    // (the pass's own clock, read before its sweep; a leader's exit, read before this) is at or
+    // before the first, so none is written past the second.
+    let now = (clock(), aterm_telemetry::now_ms());
     calls_ended(
         &jobs.take_ended(),
-        (at_ms, aterm_telemetry::now_ms()),
+        now,
         calls.counts,
-        host(),
-        emit,
+        (calls.rows.host)(),
+        calls.rows.emit,
     );
 }
 
-/// The jobs that `ended` by a pass at host clock `at` (with the wall clock then): each agent call
-/// that ended with no status counted missed on `counts`, whether or not this process writes rows,
-/// and each agent call's row handed to `emit` where it has a `host` to name.
+/// The jobs that `ended` by a pass, with its clock and the wall clock read together then
+/// (`now`): each agent call that ended with no status counted missed on `counts`, whether or not
+/// this process writes rows, and each agent call's row handed to `emit` where it has a `host` to
+/// name.
 fn calls_ended(
     ended: &[aterm_vitals::jobs::Ended],
-    (at_ms, wall_now): (u64, u64),
+    now: (u64, u64),
     counts: &CallCounts,
     host: Option<(&str, Digest)>,
     mut emit: impl FnMut(Row),
@@ -318,16 +328,17 @@ fn calls_ended(
         return;
     };
     for e in ended {
-        if let Some(row) = agent_call_row(e, at_ms, wall_now, host_name, facts, sid_of(e.tab)) {
+        if let Some(row) = agent_call_row(e, now, host_name, facts, sid_of(e.tab)) {
             emit(row);
         }
     }
 }
 
+/// Agent call `e`'s row, its moments put on the wall clock through `(pass_now, wall_now)`, the
+/// pass's clock and the wall clock read together; `None` for any other kind.
 fn agent_call_row(
     e: &aterm_vitals::jobs::Ended,
-    host_at_ms: u64,
-    wall_now: u64,
+    (pass_now, wall_now): (u64, u64),
     host_name: &str,
     facts: Digest,
     sid: Option<String>,
@@ -336,18 +347,22 @@ fn agent_call_row(
     if e.kind != aterm_vitals::jobs::JobKind::AgentCall {
         return None;
     }
-    // A moment on the host's clock as a wall time: the pass's `host_at_ms` read as `wall_now`. A
-    // leader's exit can fall past the pass's start, between it and the read that took it.
-    let to_wall = |ms: u64| {
-        if ms <= host_at_ms {
-            wall_now.saturating_sub(host_at_ms - ms)
-        } else {
-            wall_now.saturating_add(ms - host_at_ms)
-        }
-    };
+    // A moment on the pass's clock as a wall time: as far before `wall_now` as it is before
+    // `pass_now`. Every moment was read before the pair, so none maps past `wall_now`, the row's
+    // own making; one that were would be written at it.
+    let to_wall = |ms: u64| wall_now.saturating_sub(pass_now.saturating_sub(ms));
     // A watched call ended when its leader did, as the watch stamped it; any other at the pass
     // that found it gone, which may come long after (a windowless instance reads at its edges).
     let end_ms = e.leader_exited_ms.unwrap_or(e.ended_ms);
+    // Its leader's own life where both its ends were read (its start from its age at a pass, its
+    // end the watch's moment); else pass to pass, from the first that tracked it to the one that
+    // found it gone. Never one end of each: a pass reads each end late, so a span between two
+    // passes is late at both ends alike, where a pass's end against an exact one is off by that
+    // pass's lag alone.
+    let wall_ms = match (e.leader_born_ms, e.leader_exited_ms) {
+        (Some(born), Some(exited)) => exited.saturating_sub(born),
+        _ => e.ended_ms.saturating_sub(e.opened_ms),
+    };
     // The program the call ran, as the kernel named it: a call no pass saw run one (shell
     // builtins alone) has no label and no key, as a command no read confirmed has none.
     let program = e.ran.as_deref();
@@ -375,7 +390,7 @@ fn agent_call_row(
         on: None,
         host: host_name.to_owned(),
         facts,
-        wall_ms: Fig::Known(end_ms.saturating_sub(e.opened_ms)),
+        wall_ms: Fig::Known(wall_ms),
         cpu_ms: e.cpu_ns.map_or_else(
             || Fig::unknown(source::JOBS),
             |ns| Fig::Known(ns / 1_000_000),
@@ -456,6 +471,21 @@ pub(crate) fn call_counts() -> (u64, u64, u64) {
     CALLS.get()
 }
 
+/// Where a [`CallWatch`]'s rows go: the host they are named by (`None`: no writer, no row) and
+/// what each is handed to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallRows {
+    /// The host's name and facts' digest ([`host`]).
+    pub(crate) host: fn() -> Option<(&'static str, Digest)>,
+    /// The writer ([`emit`]).
+    pub(crate) emit: fn(Row),
+}
+
+impl CallRows {
+    /// This process's writer, once it started ([`start`]).
+    pub(crate) const WINDOW: Self = Self { host, emit };
+}
+
 #[cfg(target_vendor = "apple")]
 fn count(n: &AtomicU64) {
     n.fetch_add(1, Ordering::Relaxed);
@@ -476,6 +506,8 @@ fn count(n: &AtomicU64) {
 pub(crate) struct CallWatch {
     /// Where it counts what it did: [`CALLS`], which the `telemetry` verb reads.
     counts: &'static CallCounts,
+    /// Where its calls' rows go ([`jobs_passed`]): [`CallRows::WINDOW`].
+    rows: CallRows,
     #[cfg(target_vendor = "apple")]
     live: bool,
     #[cfg(target_vendor = "apple")]
@@ -510,12 +542,22 @@ impl CallWatch {
         let _ = live;
         Self {
             counts,
+            rows: CallRows::WINDOW,
             #[cfg(target_vendor = "apple")]
             live,
             #[cfg(target_vendor = "apple")]
             watches: BTreeMap::new(),
             #[cfg(target_vendor = "apple")]
             refused: BTreeSet::new(),
+        }
+    }
+
+    /// [`Self::counting`], its rows written through `rows` (a test's own writer).
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn writing(live: bool, counts: &'static CallCounts, rows: CallRows) -> Self {
+        Self {
+            rows,
+            ..Self::counting(live, counts)
         }
     }
 
@@ -674,6 +716,16 @@ impl CallWatch {
             .values()
             .filter(|w| w.moment.as_ref().is_some_and(|m| m.get().is_some()))
             .count()
+    }
+
+    /// Whether its watch on leader `pid` has stamped an exit not read yet; `None` while it watches
+    /// no leader of that pid.
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn stamped(&self, pid: u32) -> Option<bool> {
+        self.watches
+            .iter()
+            .find(|((p, _), _)| *p == pid)
+            .map(|(_, w)| w.moment.as_ref().is_some_and(|m| m.get().is_some()))
     }
 }
 

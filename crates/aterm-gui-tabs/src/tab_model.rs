@@ -1573,6 +1573,11 @@ pub struct Tab {
     /// [`TabSet::keep`] makes it a person's. Every parked tab is one, and the mark outlives
     /// any other way off the parked tabs.
     pub ephemeral: bool,
+    /// Another Mac's fleet drive asked for the tab: a worker's, or a plain shell with no task
+    /// record, which is no less a request's for that, so a restore keeps it where the drive put
+    /// it. It means something only on a worker's tab ([`Self::ephemeral`]); [`TabSet::keep`]
+    /// clears it with the rest.
+    pub fleet: bool,
 }
 
 impl Tab {
@@ -1586,6 +1591,7 @@ impl Tab {
             presentation,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }
     }
 
@@ -1605,6 +1611,7 @@ impl Tab {
             presentation,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }
     }
 
@@ -1956,11 +1963,13 @@ impl TabSet {
             .position(|tab| tab.id == id && (tab.parked || tab.ephemeral))?;
         if !self.tabs[from].parked {
             self.tabs[from].ephemeral = false;
+            self.tabs[from].fleet = false;
             return Some(from);
         }
         let mut tab = self.tabs.remove(from);
         tab.parked = false;
         tab.ephemeral = false;
+        tab.fleet = false;
         let to = self.shown_len();
         self.tabs.insert(to, tab);
         Some(to)

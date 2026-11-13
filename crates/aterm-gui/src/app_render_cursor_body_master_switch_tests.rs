@@ -5,7 +5,7 @@ use super::CursorFxInputs;
 use crate::{App, WindowId};
 use std::time::Instant;
 
-const BODY_STYLES: [&str; 4] = ["rainbow kitty pet", "water", "comet", "phaser"];
+const BODY_STYLES: [&str; 4] = ["rainbow", "water", "comet", "phaser"];
 
 fn one_focused_block_frame(trail_on: bool, style: &str) -> (usize, bool) {
     let mut app = App::headless_for_test();
@@ -140,7 +140,7 @@ fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
 fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     let t0 = Instant::now();
     let before = crate::metrics::METRICS.window.redraw.fx_under_frames.get();
-    let (app, wid, _) = ribbon_witness_take("rainbow kitty", t0);
+    let (app, wid, _) = ribbon_witness_take("rainbow", t0);
     let window = &app.windows[&wid];
     assert!(
         !window.fx.cursor().glow.under_laid().is_empty(),

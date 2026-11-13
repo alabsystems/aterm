@@ -1530,22 +1530,92 @@ fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
     );
 }
 
-/// A FLEET DRIVER'S ACTOR is `fleet:<host>`, its host held to the id alphabet and cut to fit,
-/// and reads back as itself; the bus names it nobody, as it names an edge's sid with no alias.
+/// A REQUEST'S WHY (ATERM-KI-1109-3) is the last key, a host-tier text
+/// a tab's open carries, percent-encoded as every text value is, beside its `why=` word, and reads back whole. NEGATIVE CONTROL: the
+/// wire encode, which keeps no host text, drops it.
+#[test]
+fn a_requests_why_text_is_appended_host_text_and_reads_back() {
+    assert_eq!(FIELDS.last().map(|(k, ..)| *k), Some(Key::WhyText));
+    assert_eq!(
+        (Key::WhyText.word(), Key::WhyText.tier(), Key::WhyText.cap()),
+        ("why_text", Tier::Host, Cap::Text(256))
+    );
+    let f = Fields::new()
+        .word(Key::Act, "open")
+        .and_then(|f| f.word(Key::Why, "spawn"))
+        .and_then(|f| f.text(Key::WhyText, "rebuild the m72 cache"))
+        .expect("fields");
+    let open = rec(Op::Mark, Node::SESSION, Kind::Tab, f);
+    let host = encode(&open, Tier::Host).expect("fits");
+    assert!(
+        host.contains(" why=spawn ") && host.contains(" why_text=rebuild%20the%20m72%20cache "),
+        "{host}"
+    );
+    let read = decode(&host).expect("decodes");
+    assert_eq!(
+        read.f.get(Key::WhyText).map(|v| match v {
+            aterm_slog::Val::Text(t) => t.as_str().to_owned(),
+            _ => String::new(),
+        }),
+        Some("rebuild the m72 cache".to_owned())
+    );
+    let wire = encode(&open, Tier::Wire).expect("fits");
+    assert!(!wire.contains("why_text"), "CONTROL: {wire}");
+}
+
+/// A FLEET DRIVE'S ACTOR is `fleet:<head>:<sid>` (`Actor::fleet_drive`): the driving node's
+/// first eight characters held to the id alphabet, and the requesting session whole, `-` for a
+/// drive that names none. It reads back as itself.
+/// NEGATIVE CONTROL: no node is nobody.
+#[test]
+fn a_fleet_drives_actor_names_node_head_and_session() {
+    let node = "87be5228c0ffee00112233445566778899";
+    let drive = Actor::fleet_drive(node, None);
+    assert_eq!(drive.word(), "fleet:87be5228:-");
+    assert_eq!(Actor::from_word(drive.word()), drive);
+    assert_eq!(
+        Actor::fleet_drive("m9 node/", None).word(),
+        "fleet:m9-node-:-",
+        "each byte outside the id alphabet as `-`"
+    );
+    assert_eq!(Actor::fleet_drive("  ", None), Actor::Nobody, "CONTROL");
+}
+
+/// A FLEET DRIVE KEEPS THE WHOLE MINTED SID: 6 + 8 + 1 + 22 = 37 bytes, within the 40 an actor
+/// takes, and it reads back as itself.
+#[test]
+fn fleet_drive_keeps_whole_minted_sid() {
+    let sid = "s-0123456789abcdef0123";
+    let drive = Actor::fleet_drive(&"ab".repeat(16), Some(sid));
+    assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
+    assert_eq!(drive.word().len(), 37);
+    assert!(drive.word().len() <= ShortId::MAX);
+    assert_eq!(Actor::from_word(drive.word()), drive);
+}
+
+/// A FLEET DRIVE'S UNMINTED SID IS `-`: a requester names a session only in the shape aterm
+/// mints. NEGATIVE CONTROLS: a short sid, an uppercase one and a chosen name each record `-`.
+#[test]
+fn fleet_drive_unminted_sid_is_dash() {
+    let node = "ab".repeat(16);
+    for unminted in ["s-7725", "s-0123456789ABCDEF0123", "worker", ""] {
+        assert_eq!(
+            Actor::fleet_drive(&node, Some(unminted)).word(),
+            "fleet:abababab:-",
+            "{unminted:?}"
+        );
+    }
+}
+
+/// A FLEET DRIVER'S ACTOR reads back as itself; the bus names it nobody, as it names an edge's
+/// sid with no alias.
 /// NEGATIVE CONTROLS: a bare `fleet:` is no driver; a sid stays a sid; the person stays `human`
 /// on the bus.
 #[test]
 fn a_fleet_drivers_actor_reads_back_and_crosses_the_bus_as_nobody() {
-    let m9 = Actor::fleet("m9");
-    assert_eq!(m9.word(), "fleet:m9");
-    assert_eq!(Actor::from_word("fleet:m9"), m9);
-    assert_eq!(
-        Actor::fleet("Andrew's Mac Pro").word(),
-        "fleet:Andrew-s-Mac-Pro"
-    );
-    let long = Actor::fleet(&"h".repeat(80));
-    assert_eq!(long.word().len(), ShortId::MAX, "{}", long.word());
-    assert_eq!(Actor::fleet("  "), Actor::Nobody, "no host, no driver");
+    let m9 = Actor::fleet_drive("m9", None);
+    assert_eq!(m9.word(), "fleet:m9:-");
+    assert_eq!(Actor::from_word("fleet:m9:-"), m9);
     assert_eq!(
         Actor::from_word("fleet:"),
         Actor::Nobody,
@@ -1569,7 +1639,7 @@ fn a_fleet_drivers_actor_reads_back_and_crosses_the_bus_as_nobody() {
         by,
     };
     let local = encode(&close(m9), Tier::Host).expect("fits");
-    assert!(local.contains(" by=fleet:m9 "), "{local}");
+    assert!(local.contains(" by=fleet:m9:- "), "{local}");
     assert_eq!(decode(&local).map(|r| r.by), Ok(m9));
     let bus = aterm_slog::encode_mirror(&close(m9), Tier::WireMeta, 1, None, &|_| None)
         .expect("a session close crosses");
@@ -1731,10 +1801,11 @@ fn line_and_bus_decoders_reject_plus_prefixed_numbers() {
 /// wrote, survives every encode; `title_fp` planted at the wire tier fails this test.
 #[test]
 fn title_fp_is_appended_content_and_no_encode_below_c_keeps_it() {
+    let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
     assert_eq!(
-        FIELDS.last().map(|(k, ..)| *k),
-        Some(Key::TitleFp),
-        "appended: every earlier key keeps its index"
+        key_at(Key::TitleFp).map(|i| i + 1),
+        key_at(Key::WhyText),
+        "appended: every earlier key keeps its index, a request's why after it"
     );
     assert_eq!(
         (Key::TitleFp.word(), Key::TitleFp.tier(), Key::TitleFp.cap()),

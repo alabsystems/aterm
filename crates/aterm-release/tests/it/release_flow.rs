@@ -11,9 +11,10 @@ use crate::line::{Admitted, Fix, Hop, Line};
 use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
-    CutState, EngineNow, EngineRows, Facts, JOURNAL_FILE, Journal, Prover, PublishGate,
-    RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions, Reservation, SELECTION_FILE,
-    Side, SignedDiscard, StageTarget, Step, run_with,
+    CutJournalUnread, CutState, Discarded, EngineNow, EngineRows, Facts, InputFinding,
+    JOURNAL_FILE, Journal, Preflight, Prover, PublishGate, RUNNING_CHILD_FILE, RUNNING_FILE, Ran,
+    Refusal, ReleaseOptions, Reservation, SELECTION_FILE, Side, SignedDiscard, SourceState,
+    StageTarget, Step, run_with,
 };
 use crate::release_steps::Real;
 
@@ -105,7 +106,8 @@ struct World {
     preview_own: bool,
     gate_repo: Option<PathBuf>,
     gate_revision: bool,
-    input_refusal: Option<Refusal>,
+    /// What step 1's release-input judgment finds.
+    input_finding: Option<InputFinding>,
     fleet_refusal: Option<String>,
     fleet_panics: bool,
     supersede_preflight_refusal: Option<Refusal>,
@@ -125,6 +127,7 @@ struct World {
     out: Vec<String>,
     calls: Vec<String>,
     observations: Vec<&'static str>,
+    slice_memory: Result<crate::buildplan::SliceMemoryForecast, String>,
     pid: u32,
     started: String,
     alive: BTreeMap<u32, String>,
@@ -174,9 +177,16 @@ struct World {
     /// The numbered origin refresh that refuses, and its structured refusal.
     fetch_refusal: Option<(usize, Refusal)>,
     fetches: usize,
+    /// origin/main as the next refresh finds it, once: a main rewritten since selection.
+    main_at_next_fetch: Option<Vec<String>>,
     validation_tools: Result<String, Refusal>,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
+    /// The preflight's note of a candidate whose bump is still to be written: the harness
+    /// versions the bump commit writes.
+    bump_writes: Option<String>,
+    /// How many lines the run had said when it pushed its bump.
+    said_at_bump: Option<usize>,
     audits: VecDeque<Vec<Finding>>,
     /// Each audit's `dry`, in order.
     audited_dry: Vec<bool>,
@@ -237,10 +247,18 @@ struct World {
     stage_sync_fails: bool,
     /// The signal a step's child was ended by, once one arrived.
     signal: Option<i32>,
+    /// `signal` is the release's own stop alone (its fleet line lost, `interrupt::stop_self`):
+    /// no signal from elsewhere was caught (`interrupt::caught_foreign`).
+    own_signal: bool,
     /// The step whose child a signal ends.
     signal_at: Option<&'static str>,
+    /// The step at which another holder adopts the fleet line (a re-executed child only:
+    /// the loss is process-global).
+    fleet_lost_at: Option<&'static str>,
     /// What the world does once `verify release` ends.
     after_verify: Option<fn(&mut World)>,
+    /// What the world does once the synchronous step-4 AppKit child ends.
+    after_appkit: Option<fn(&mut World)>,
     /// What the world does once a stage to the engine ends.
     after_stage: Option<fn(&mut World)>,
     /// What the world does while the release next sleeps (an owner wait).
@@ -295,6 +313,9 @@ struct World {
     /// The half of `verify release` that `verify_passes` and `verify_code` judge (both when
     /// none); the other passes.
     verify_half: Option<Half>,
+    /// The step whose verify run `verify_passes` and `verify_code` judge (every step when none).
+    /// AppKit and measure both have bundle-half identity but run in different steps.
+    verify_step: Option<Step>,
     /// The export's staging push begins (its stop then never fires), and it finishes once a
     /// red was said; the tree's run waits for that push.
     export_pushes: bool,
@@ -309,9 +330,28 @@ struct World {
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
     signed: Option<u64>,
+    /// The draft `cut --sign` journaled in this clone's `dist/`, an agh-fake Lab whose
+    /// release.toml mirrors the world's journal whenever the draft code reads it.
     private_draft: Option<crate::publish::draft::tests::Lab>,
+    /// Drafts a discard withdrew, kept so their fakes can still be read.
+    withdrawn_drafts: Vec<crate::publish::draft::tests::Lab>,
+    /// `cut --sign` stages a private draft (an agh-fake Lab), and the source's `pub publish
+    /// --keep-draft` attaches R's attestation to that draft only: as the engine's cutter_draft,
+    /// it waits for the journaled id and dies once the sign ended without one.
     stage_private_draft: bool,
+    /// This run's `pub publish` recorded R and waits, as cutter_draft, for the draft's id.
+    engine_awaits_draft: bool,
+    /// This run's `cut --sign` ended.
+    sign_ran: bool,
+    /// The next `cut --sign` makes or adopts its private draft, then refuses (exit 1), as one
+    /// whose uploads or proof fail after the draft's POST does.
+    draft_then_red: bool,
+    /// The engine's source signing (in `pub publish` or `pub sign-release --keep-draft`) exits 0
+    /// and attaches nothing to the private draft, as one GitHub had not yet listed the pair for.
+    signing_attaches_nothing: bool,
     source_read_down: bool,
+    /// `dist/cut-state.toml` is there and is not read: why.
+    cut_unreadable: Option<CutJournalUnread>,
     prepared_signature: Option<u64>,
     prepare_code: i32,
     early_overlap: bool,
@@ -323,12 +363,35 @@ struct World {
     /// Fresh cuts that adopted the signed copy, and fresh cuts that signed their own.
     adopted: usize,
     resigned: usize,
+    /// The repair workers the cut's reds open ([`Backend::repair`]).
+    repairs: Repairs,
+}
+
+/// The world's repair spawner, inside an aterm session unless `outside`: every failure the cut
+/// hands it, and every worker it starts, numbered `s-repair<n>`.
+#[derive(Default)]
+struct Repairs {
+    outside: bool,
+    asked: Vec<aterm_release::repair::Failure>,
+    spawned: Vec<(PathBuf, String)>,
+}
+
+impl aterm_release::repair::Spawner for Repairs {
+    fn in_session(&self) -> bool {
+        !self.outside
+    }
+
+    fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
+        self.spawned.push((cwd.to_path_buf(), task.to_string()));
+        Ok(format!("s-repair{}", self.spawned.len()))
+    }
 }
 
 /// How step 7's fake sides meet, so each test's order is the one it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SideOrder {
-    /// The sign does its work once the source's end is told.
+    /// The sign does its work once the source's end is told, or once the source, its push begun,
+    /// awaits the private draft the sign journals (as the engine's cutter_draft).
     SourceFirst,
     /// The source does its work once the sign's end is told.
     SignFirst,
@@ -352,7 +415,7 @@ impl World {
             preview_own: false,
             gate_repo: None,
             gate_revision: false,
-            input_refusal: None,
+            input_finding: None,
             fleet_refusal: None,
             fleet_panics: false,
             supersede_preflight_refusal: None,
@@ -372,6 +435,11 @@ impl World {
             out: Vec::new(),
             calls: Vec::new(),
             observations: Vec::new(),
+            slice_memory: Ok(crate::buildplan::SliceMemoryForecast {
+                outcome: crate::buildplan::SliceMemoryOutcome::Shared,
+                line: "qualify slice memory: shared admits now — 44 GiB parent, 80 GiB available"
+                    .into(),
+            }),
             pid: 4242,
             started: "Thu Oct  9 02:00:00 2026".into(),
             alive: BTreeMap::new(),
@@ -407,8 +475,11 @@ impl World {
             machine_refusals: Vec::new(),
             fetch_refusal: None,
             fetches: 0,
+            main_at_next_fetch: None,
             validation_tools: Ok("pinned tools ready".into()),
             blocks: Vec::new(),
+            bump_writes: None,
+            said_at_bump: None,
             audits: VecDeque::new(),
             audited_dry: Vec::new(),
             audited_profiles: Vec::new(),
@@ -449,8 +520,11 @@ impl World {
             judge_down: false,
             stage_sync_fails: false,
             signal: None,
+            own_signal: false,
             signal_at: None,
+            fleet_lost_at: None,
             after_verify: None,
+            after_appkit: None,
             after_stage: None,
             after_sleep: None,
             local_tags: BTreeSet::new(),
@@ -478,6 +552,7 @@ impl World {
             line_verify: Ok("the line verifies".into()),
             holds: BTreeSet::new(),
             verify_half: None,
+            verify_step: None,
             export_pushes: false,
             build_claims_late: false,
             build_admission_waits: 0,
@@ -486,8 +561,14 @@ impl World {
             sign_code: 0,
             signed: None,
             private_draft: None,
+            withdrawn_drafts: Vec::new(),
             stage_private_draft: false,
+            engine_awaits_draft: false,
+            sign_ran: false,
+            draft_then_red: false,
+            signing_attaches_nothing: false,
             source_read_down: false,
+            cut_unreadable: None,
             prepared_signature: None,
             prepare_code: 0,
             early_overlap: false,
@@ -495,15 +576,32 @@ impl World {
             source_runs: false,
             adopted: 0,
             resigned: 0,
+            repairs: Repairs::default(),
         }
     }
 
     fn interrupt_at(&mut self, step: &str) -> bool {
+        if self.fleet_lost_at == Some(step) {
+            self.lose_line();
+        }
         if self.signal_at == Some(step) {
             self.signal = Some(15);
+            self.own_signal = false;
             return true;
         }
         false
+    }
+
+    /// Another holder adopts the fleet line: the progress worker records the loss and stops
+    /// this process with its own `SIGTERM` (`line_claim::fail`, really, in the re-executed child
+    /// that calls this), which the world catches as its signal, the release's own unless one
+    /// from elsewhere came first.
+    fn lose_line(&mut self) {
+        crate::line_claim::lose_line_for_test(FLEET_LOST);
+        if self.signal.is_none() {
+            self.signal = Some(15);
+            self.own_signal = true;
+        }
     }
 
     fn release_dir(&self) -> PathBuf {
@@ -517,6 +615,8 @@ impl World {
     fn run(&mut self, args: ReleaseOptions) -> (i32, String) {
         self.out.clear();
         self.source_runs = false;
+        self.engine_awaits_draft = false;
+        self.sign_ran = false;
         let _ = std::fs::remove_file(self.dir.path().join("publish-entered"));
         let home = self.dir.path().to_path_buf();
         let outcome = run_with(self, &args, &home);
@@ -581,6 +681,7 @@ impl World {
                     return State::Missing {
                         resume: Vec::new(),
                         lint_resume: Vec::new(),
+                        appkit_resume: Vec::new(),
                     };
                 }
                 match record(check.name(), executable.filter(|_| measure)) {
@@ -589,6 +690,7 @@ impl World {
                     _ => State::Missing {
                         resume: self.resume.clone(),
                         lint_resume: Vec::new(),
+                        appkit_resume: Vec::new(),
                     },
                 }
             },
@@ -871,6 +973,7 @@ impl Branches for WorldBranches<'_> {
     }
     fn verify(
         &self,
+        step: Step,
         c: &Candidate,
         _prover: &Prover,
         run: &VerifyRun,
@@ -878,8 +981,8 @@ impl Branches for WorldBranches<'_> {
         stop: &BranchStop,
     ) -> Result<Ran, Refusal> {
         let tree = run.half == Half::Tree;
-        self.world().verify_called(run);
-        if !tree && self.world().early_overlap {
+        self.world().verify_called(step, run);
+        if step == Step::Bundle && self.world().early_overlap {
             assert!(
                 self.world().prepared_signature.is_some(),
                 "preparation started before bundle"
@@ -899,7 +1002,7 @@ impl Branches for WorldBranches<'_> {
             self.held(Branch::Tree, stop);
             return Ok(ran_code(143));
         }
-        self.world().verify(c, run, artifact)
+        self.world().verify(step, c, run, artifact)
     }
     fn side_log(&self, side: Side) -> PathBuf {
         let w = self.world();
@@ -942,6 +1045,21 @@ impl Branches for WorldBranches<'_> {
         if self.world().source_dies_after_push {
             return Ok(ran_code(1));
         }
+        // As the engine's cutter_draft: with no private draft journaled yet, `pub publish` blocks
+        // after its push until the sign journals one (and dies once the sign ended without one),
+        // so it cannot end first.
+        let awaits = {
+            let w = self.world();
+            order == SideOrder::SourceFirst && w.stage_private_draft && w.private_draft.is_none()
+        };
+        if awaits {
+            self.mark("source-awaits-draft");
+            self.wait(
+                "the sign's end",
+                |seen| seen.contains(&"sign-ended"),
+                &|| false,
+            );
+        }
         Ok(self.world().publish_source())
     }
     fn sign(&self, args: &[String], _prover: &Prover, stop: &BranchStop) -> Ran {
@@ -955,7 +1073,7 @@ impl Branches for WorldBranches<'_> {
             SideOrder::SourceFirst => {
                 self.wait(
                     "the source's end",
-                    |seen| seen.contains(&"source-ended"),
+                    |seen| seen.contains(&"source-ended") || seen.contains(&"source-awaits-draft"),
                     &|| false,
                 );
             }
@@ -977,11 +1095,20 @@ impl Branches for WorldBranches<'_> {
         if w.interrupt_at("cut --sign") {
             return ran(1);
         }
-        if w.sign_code == 0 {
+        w.sign_ran = true;
+        if w.sign_code == 0 || w.draft_then_red {
             w.signed = w.journal().and_then(|j| j.reserved).map(|r| r.build);
             if w.stage_private_draft {
+                let reserved = w.journal().and_then(|j| j.reserved);
                 if let Some(draft) = &mut w.private_draft {
-                    draft.resume();
+                    // `cut --sign` adopts the journaled draft only for the reservation it cuts.
+                    let reserved = reserved.unwrap();
+                    draft.reserve_as(Some(reserved.clone()));
+                    if let Err(error) = draft.resume_as(reserved.build, &reserved.commit) {
+                        w.signed = None;
+                        w.calls.push(format!("cut --sign refused: {error}"));
+                        return ran(1);
+                    }
                 } else {
                     let journal = w.journal().unwrap();
                     let reserved = journal.reserved.unwrap();
@@ -991,10 +1118,18 @@ impl Branches for WorldBranches<'_> {
                         &reserved.commit,
                     );
                     draft.stage().unwrap();
-                    draft.attest();
                     w.private_draft = Some(draft);
                 }
+                // The waiting engine reads the id this sign journaled and attaches R's pair.
+                if std::mem::take(&mut w.engine_awaits_draft) && !w.signing_attaches_nothing {
+                    w.private_draft.as_ref().unwrap().attest();
+                }
             }
+        }
+        if std::mem::take(&mut w.draft_then_red) {
+            w.signed = None;
+            w.calls.push("cut --sign refused after its draft".into());
+            return ran(1);
         }
         ran(w.sign_code)
     }
@@ -1006,23 +1141,35 @@ fn ran_code(code: i32) -> Ran {
 
 impl World {
     /// `pub publish` of R, its push begun: R recorded as the engine's newest row, and its source
-    /// release attested unless it fails at sign-release.
+    /// release attested unless it fails at sign-release. Under `stage_private_draft` the engine
+    /// attests only the private draft: one that exists now, or the one the sign journals later
+    /// (it waits); a sign that already ended without one ends it red, R recorded.
     fn publish_source(&mut self) -> Ran {
         self.calls.push("publish".into());
         let r = self.head.clone();
         self.published.insert(r.clone(), "e1e1e1e1e1".into());
         self.newest = Some(r.clone());
-        if self.publish_code == 0 {
-            self.source_attested.insert(r);
+        if self.publish_code != 0 {
+            return ran(self.publish_code);
         }
-        ran(self.publish_code)
+        if !self.stage_private_draft {
+            self.source_attested.insert(r);
+            return ran(0);
+        }
+        match &self.private_draft {
+            Some(_) if self.signing_attaches_nothing => {}
+            Some(draft) => draft.attest(),
+            None if self.sign_ran => return ran(1),
+            None => self.engine_awaits_draft = true,
+        }
+        ran(0)
     }
 }
 
 impl World {
-    /// Count of `verify release` runs of either half.
+    /// Count of all `verify release` runs, including the early AppKit subset.
     fn verified(&self) -> usize {
-        self.count("verify --tree") + self.count("verify --bundle")
+        self.count("verify --tree") + self.count("verify appkit") + self.count("verify --bundle")
     }
 
     fn stage_fixtures(
@@ -1089,8 +1236,13 @@ impl World {
 
     /// `verify release` of `run`'s half began: its call and what it was asked to run, recorded
     /// as its child starts (the tree's before its claim).
-    fn verify_called(&mut self, run: &VerifyRun) {
-        self.calls.push(format!("verify {}", run.half.flag()));
+    fn verify_called(&mut self, step: Step, run: &VerifyRun) {
+        self.calls
+            .push(if step == Step::Qualify && run.half == Half::Bundle {
+                "verify appkit".to_string()
+            } else {
+                format!("verify {}", run.half.flag())
+            });
         self.verify_runs.push(run.clone());
     }
 
@@ -1098,12 +1250,14 @@ impl World {
     /// bundle half on a bundle the build made.
     fn verify(
         &mut self,
+        step: Step,
         c: &Candidate,
         run: &VerifyRun,
         artifact: Option<&Artifact>,
     ) -> Result<Ran, Refusal> {
         match (run.half, artifact) {
             (Half::Tree, None) => {}
+            (Half::Bundle, None) if run.checks == ["appkit"] => {}
             (Half::Bundle, Some(artifact)) => assert!(
                 self.artifacts
                     .values()
@@ -1112,24 +1266,21 @@ impl World {
             ),
             (half, artifact) => panic!("the {half:?} half was handed {artifact:?}"),
         }
-        if self.interrupt_at(if run.half == Half::Tree {
-            "verify --tree"
-        } else {
-            "verify --bundle"
+        if self.interrupt_at(match (step, run.half) {
+            (Step::Qualify, Half::Tree) => "verify --tree",
+            (Step::Qualify, Half::Bundle) => "verify appkit",
+            (Step::Bundle, Half::Bundle) => "verify --bundle",
+            (step, half) => panic!("unexpected {half:?} verify in {step:?}"),
         }) {
             return Ok(ran(-1));
         }
         if let Some((real, script, dir)) = &mut self.real {
             let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
             cmd.args(["-c", script.as_str(), "sh"]).arg(dir.as_path());
-            let step = if run.half == Half::Tree {
-                Step::Qualify
-            } else {
-                Step::Bundle
-            };
             return Ok(real.logged(step, &mut cmd));
         }
-        let judged = self.verify_half.is_none_or(|half| half == run.half);
+        let judged = self.verify_half.is_none_or(|half| half == run.half)
+            && self.verify_step.is_none_or(|selected| selected == step);
         let (passes, code) = if judged {
             (self.verify_passes, self.verify_code)
         } else {
@@ -1162,7 +1313,11 @@ impl World {
                 "FAIL",
             );
         }
-        if run.half == Half::Bundle
+        if step == Step::Qualify && run.checks == ["appkit"] {
+            if let Some(then) = self.after_appkit {
+                then(self);
+            }
+        } else if step == Step::Bundle
             && let Some(then) = self.after_verify
         {
             then(self);
@@ -1402,6 +1557,7 @@ impl Backend for World {
         }
     }
     fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, Refusal> {
+        self.calls.push("fleet-existing".into());
         let line = self
             .existing_fleet_line
             .clone()
@@ -1420,11 +1576,16 @@ impl Backend for World {
         line: &crate::line::Line,
         _handed: bool,
     ) -> Result<crate::line::Line, String> {
+        self.calls.push("fleet-select".into());
         assert!(!self.fleet_panics, "planted release bug in fleet selection");
         self.fleet_refusal.clone().map_or_else(
             || Ok(self.fleet_selected.clone().unwrap_or_else(|| line.clone())),
             Err,
         )
+    }
+    fn fleet_boundary(&mut self, _line: &Line, _step: Step) -> Result<(), String> {
+        self.calls.push("fleet-boundary".into());
+        Ok(())
     }
     fn fleet_audit(&mut self) -> Result<(), String> {
         self.fleet_audits += 1;
@@ -1522,6 +1683,9 @@ impl Backend for World {
         {
             return Err(refusal.clone());
         }
+        if let Some(main) = self.main_at_next_fetch.take() {
+            self.history = main;
+        }
         Ok(self.tip())
     }
     fn head(&mut self) -> String {
@@ -1572,9 +1736,14 @@ impl Backend for World {
     fn local_tag(&mut self, tag: &str) -> bool {
         self.origin_tags.contains_key(tag) || self.local_tags.contains(tag)
     }
-    fn input_checks(&mut self, base: &str, tip: &str, _prover: &Prover) -> Result<String, Refusal> {
+    fn input_checks(
+        &mut self,
+        base: &str,
+        tip: &str,
+        _prover: &Prover,
+    ) -> Result<String, InputFinding> {
         self.calls.push(format!("input-checks {base} {tip}"));
-        self.input_refusal
+        self.input_finding
             .clone()
             .map_or_else(|| Ok("input clean".into()), Err)
     }
@@ -1615,8 +1784,11 @@ impl Backend for World {
             .candidate_missing
             .then(|| "the qualified candidate was lost".into()))
     }
-    fn cut_journal(&mut self) -> Option<CutState> {
-        self.cut.clone()
+    fn cut_journal_read(&mut self) -> Result<Option<CutState>, CutJournalUnread> {
+        if let Some(unread) = &self.cut_unreadable {
+            return Err(unread.clone());
+        }
+        Ok(self.cut.clone())
     }
     fn is_dir(&mut self, _path: &Path) -> bool {
         true
@@ -1724,12 +1896,17 @@ impl Backend for World {
         }
         self.line_verify.clone()
     }
+    /// With real source admission, the production pending-line proof on that repository, so
+    /// a hop real admission and carry make and the meaning check refuses fails the run.
     fn verify_pending_line(&mut self, line: &Line) -> Result<String, Refusal> {
         self.pending_lines.push(line.clone());
         if let Some(refusal) = self.pending_refusal.clone() {
             return Err(refusal);
         }
         self.calls.push("verify-line".into());
+        if let Some(repo) = &self.admission_repo {
+            crate::line::verify_pending(&crate::ledger::testing::Git::new(repo), line)?;
+        }
         self.line_verify.clone()
     }
     fn failure_hints(&mut self, line: &Line, _evidence: &str, _logs: &[String]) -> Vec<String> {
@@ -1742,8 +1919,10 @@ impl Backend for World {
     }
     fn preview_bump(&mut self, c: &Candidate, _prover: &Prover) -> Result<String, Refusal> {
         self.calls.push("preview-bump".into());
+        // The commit the bump would make (as World::bump names it), private.
         let made = match self.preview_bump_judge.as_mut() {
             Some(judge) => judge(c)?,
+            None if self.history.iter().any(|c| c == BUMP) => BUMP2.into(),
             None => BUMP.into(),
         };
         self.versions.insert(made.clone(), c.version.clone());
@@ -1752,6 +1931,7 @@ impl Backend for World {
     }
     fn bump(&mut self, _from: &str, to: &str, _prover: &Prover) -> Result<String, Refusal> {
         self.calls.push("bump".into());
+        self.said_at_bump = Some(self.out.len());
         let made = if self.history.iter().any(|c| c == BUMP) {
             BUMP2
         } else {
@@ -1825,6 +2005,16 @@ impl Backend for World {
         if let Some(refusal) = self.rewind_refusal.clone() {
             return Err(refusal);
         }
+        // Real::rewind_selection's `git reset --keep` settles the release's own stop: like any
+        // logged child it starts none once a signal from elsewhere was caught, but the own
+        // stop alone leaves it free to run (`interrupt::caught_foreign`).
+        if self.signal.is_some() && !self.own_signal {
+            return Err(Refusal::new(
+                "cannot rewind the locally generated candidate",
+                "inspect the selection log and retry",
+            )
+            .detail(["not started: the release was interrupted".to_string()]));
+        }
         let tip = self.tip();
         let mut prefix = line.clone();
         while !self.is_ancestor(prefix.head(), &tip) {
@@ -1887,7 +2077,7 @@ impl Backend for World {
     fn let_disk_go(&mut self, passed: bool) {
         self.calls.push(format!("disk-let-go {passed}"));
     }
-    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
+    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Preflight {
         self.calls.push(
             if dry {
                 "commit-gates-dry"
@@ -1904,14 +2094,22 @@ impl Backend for World {
             } else {
                 "HEAD"
             };
-            if let Err(why) = crate::gates::changelog_gate_at(&git, revision, &c.version) {
-                found.push(Refusal::new(
-                    format!("changelog — {why}"),
-                    "repair the entry",
-                ));
+            if let Err(why) = crate::gates::changelog_gate_at(&git, revision, &c.version, "") {
+                found.push(
+                    Refusal::new(format!("changelog — {why}"), "repair the entry")
+                        .failing("changelog"),
+                );
             }
         }
-        found
+        Preflight {
+            notes: c
+                .bump_from
+                .as_ref()
+                .and(self.bump_writes.clone())
+                .into_iter()
+                .collect(),
+            found,
+        }
     }
     fn can_check_commit(&mut self, _c: &Candidate) -> bool {
         self.preview_own
@@ -1989,6 +2187,16 @@ impl Backend for World {
         self.withdrawn.push(key.to_string());
         Ok("OK done=7 how=withdrawn".into())
     }
+    fn repair(&mut self, failure: &aterm_release::repair::Failure) -> Vec<String> {
+        self.repairs.asked.push(failure.clone());
+        let record = World::release_dir(self).join(aterm_release::repair::RECORD_FILE);
+        let clone = self.dir.path().to_path_buf();
+        aterm_release::repair::open(&record, &clone, failure, &mut self.repairs).lines(&record)
+    }
+    fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String> {
+        self.calls.push("slice-memory-forecast".into());
+        self.slice_memory.clone()
+    }
     fn origin_tail(&mut self) -> Option<u64> {
         Some(self.tail)
     }
@@ -2035,21 +2243,60 @@ impl Backend for World {
         self.interrupt_at("publish-begin");
         Ok(())
     }
-    fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
+    fn source_publication(&mut self, c: &Candidate, _build: u64) -> Result<SourceState, Refusal> {
         self.calls.push("source-publication".into());
-        if let Some(draft) = &self.private_draft {
-            draft.source_read(self.source_read_down).map_err(|e| {
+        if self.stage_private_draft {
+            // As Real: the journaled draft read by its id, judged by the production judgment;
+            // with none journaled, GitHub's lookup by tag 404s, which is pending.
+            let Some(draft) = &self.private_draft else {
+                return Ok(SourceState::Pending(
+                    crate::release_steps::unjournaled_source(&format!("v{}", c.version)),
+                ));
+            };
+            let release = draft.source_read(self.source_read_down).map_err(|e| {
                 Refusal::new(e.to_string(), "resume once the channel answers").could_not_run()
             })?;
+            return crate::release_steps::judge_source_release(
+                &release,
+                &draft.ctx.slug,
+                &c.version,
+                &draft.ctx.repo,
+                draft.ctx.release_id,
+            );
         }
         if self.source_attested.contains(&c.commit) {
-            Ok(())
+            Ok(SourceState::Attested)
         } else {
+            let sign = crate::publish::sign_release_command(Path::new("/clone"), &c.version, None);
             Err(Refusal::new(
                 "the source publication is incomplete: SHA256SUMS.sig is missing",
-                "finish pub sign-release aterm, then run the release again",
+                format!("finish the source signing ({sign}), then run the release again"),
             ))
         }
+    }
+    /// The engine's source signing onto the journaled private draft: the pair attached to it.
+    fn attest_draft(&mut self, c: &Candidate, _build: u64, _p: &Prover) -> Result<String, Refusal> {
+        self.calls.push("attest-draft".into());
+        let Some(draft) = self
+            .private_draft
+            .as_ref()
+            .filter(|d| d.ctx.release_id.is_some())
+        else {
+            return Err(Refusal::new(
+                format!(
+                    "dist/draft-state.toml names no private draft of v{}",
+                    c.version
+                ),
+                "read the sign's log",
+            ));
+        };
+        if !self.signing_attaches_nothing {
+            draft.attest();
+        }
+        Ok(format!(
+            "the source pair attached to private draft {}",
+            draft.ctx.release_id.unwrap()
+        ))
     }
     fn cut(
         &mut self,
@@ -2116,12 +2363,19 @@ impl Backend for World {
         });
         ran(self.cut_code)
     }
-    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Vec<String> {
+    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Discarded {
         self.calls.push(format!("discard-signed {version} {build}"));
+        let reserved = self.journal().and_then(|j| j.reserved);
         if let Some(draft) = &self.private_draft {
-            let left = draft.discard_signed(reason);
-            if !left.is_empty() || reason == SignedDiscard::CancelPreparation {
+            // The draft code proves its authority from the clone's release.toml.
+            draft.reserve_as(reserved);
+            let left = draft.discard_as(version, build, reason);
+            if !left.complete() || reason == SignedDiscard::CancelPreparation {
                 return left;
+            }
+            if !draft.ctx.journal_path.exists() {
+                let withdrawn = self.private_draft.take().unwrap();
+                self.withdrawn_drafts.push(withdrawn);
             }
         }
         if self.signed == Some(build) {
@@ -2130,7 +2384,7 @@ impl Backend for World {
         if self.prepared_signature == Some(build) {
             self.prepared_signature = None;
         }
-        Vec::new()
+        Discarded::Except(Vec::new())
     }
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal> {
         self.calls.push(format!("after-cut {version}"));
@@ -2638,6 +2892,74 @@ fn superseded_journal_refuses_but_plain_resume_adopts_replacement() {
     assert_eq!(journal.unwrap().line(), new);
 }
 
+/// ONLY THIS VERSION'S UNFINISHED JOURNAL CAN BE SUPERSEDED. A clone whose release.toml is the
+/// finished previous release, while the fleet's line for main's version was superseded,
+/// follows the replacement in a dry run as the real run does.
+/// NEGATIVE CONTROL: follow compared any journal's base with the replacement's, so the dry run
+/// refused "this journal's line was superseded" for a v0.5.0 line nothing superseded, and told
+/// the operator to --forget a finished journal.
+#[test]
+fn a_finished_journal_of_another_version_is_never_the_superseded_line() {
+    let setup = || {
+        let mut world = World::new();
+        world.history.insert(1, NEXT.into());
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.versions.insert(NEXT.into(), "0.6.0".into());
+        let replacement = Line::start("0.6.0", NEXT, 2);
+        world.existing_fleet_line = Some(replacement.clone());
+        world.supersession = Some(crate::line::Supersession {
+            previous: Line::start("0.6.0", TIP, 1),
+            replacement,
+            reason: "explicit retirement".into(),
+        });
+        std::fs::create_dir_all(world.release_dir()).unwrap();
+        Journal {
+            version: "0.5.0".into(),
+            commit: OLD.into(),
+            line: Some(Line::start("0.5.0", OLD, 1)),
+            done: vec!["check".into(), "tap-aligned".into()],
+            ..Journal::default()
+        }
+        .save(&world.release_dir().join(JOURNAL_FILE))
+        .unwrap();
+        assert!(world.journal().unwrap().finished());
+        world
+    };
+    let mut dry = setup();
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert!(
+        !dry.out
+            .iter()
+            .any(|l| l.contains("this journal's line was superseded")),
+        "{last}\n{:?}",
+        dry.out
+    );
+    assert_eq!(code, 0, "{last}\n{:?}", dry.out);
+    assert!(last.contains(&format!("from {}", &NEXT[..9])), "{last}");
+
+    // The same follow, asked directly: the finished journal is no claim on v0.6.0's line.
+    let mut world = setup();
+    let mut candidate = Candidate {
+        commit: TIP.into(),
+        version: "0.6.0".into(),
+        why: String::new(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let mut journal = world.journal();
+    crate::line_claim::follow(&mut world, &mut candidate, &mut journal).unwrap();
+    assert_eq!(candidate.commit, NEXT);
+    assert_eq!(journal.unwrap().line(), Line::start("0.6.0", NEXT, 2));
+
+    // Control: the real run on the same clone follows the replacement.
+    let mut real = setup();
+    let (code, last) = real.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", real.out);
+}
+
 #[test]
 fn fleet_line_adoption_keeps_the_candidates_head_and_drops_other_trees_records() {
     let mut world = World::new();
@@ -2819,6 +3141,132 @@ fn journal_line_notice_precedes_old_cutter_exec_and_survives_continuation() {
             .any(|s| s.contains("adopted/continued line")),
         "same run announces once across exec"
     );
+}
+
+/// The world `adopted_line_notice_names_the_selection_main_gap_and_remedies_once` sets up,
+/// with N2 on main too, and this clone's unfinished release.toml at NEXT.
+fn journal_at_next() -> World {
+    let mut world = World::new();
+    world.history.insert(1, N2.into());
+    world.history.insert(2, NEXT.into());
+    for commit in [N2, NEXT, TIP] {
+        world.versions.insert(commit.into(), "0.6.0".into());
+    }
+    std::fs::create_dir_all(world.release_dir()).unwrap();
+    Journal {
+        version: "0.6.0".into(),
+        commit: NEXT.into(),
+        line: Some(Line::start("0.6.0", NEXT, 123)),
+        ..Journal::default()
+    }
+    .save(&world.release_dir().join(JOURNAL_FILE))
+    .unwrap();
+    world
+}
+
+/// THE LINE NOTICE NAMES THE SETTLED SELECTION, ONCE. A clone resuming its journal's line
+/// while the fleet claim holds another line of that version says one notice, the fleet's;
+/// where the fleet claim agrees, one notice names the journal; and a notice said before an
+/// exec, ahead of the fleet read, says it is provisional.
+/// NEGATIVE CONTROL: the journal's notice was said before fleet discovery, so a run that then
+/// adopted the fleet's line said two contradictory notices, the first that "this release uses
+/// the line's content" of a head the run abandoned.
+#[test]
+fn a_journal_line_the_fleet_replaces_is_announced_once_as_the_fleet_selection() {
+    let notices = |world: &World| -> Vec<String> {
+        world
+            .out
+            .iter()
+            .filter(|s| s.contains("release: adopted/continued line"))
+            .cloned()
+            .collect()
+    };
+    let mut adopted = journal_at_next();
+    adopted.existing_fleet_line = Some(Line::start("0.6.0", N2, 123));
+    let (code, last) = adopted.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", adopted.out);
+    let said = notices(&adopted);
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert!(
+        said[0].contains(&format!("head {N2}"))
+            && said[0].contains("fleet claim refs/aterm-release/line/0.6.0")
+            && said[0].contains("This release uses the line's content"),
+        "{}",
+        said[0]
+    );
+    assert!(!said[0].contains("this clone's journal"), "{}", said[0]);
+
+    // Control: a fleet claim of the journal's own line leaves the journal's selection.
+    let mut same = journal_at_next();
+    same.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 123));
+    let (code, last) = same.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", same.out);
+    let said = notices(&same);
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert!(
+        said[0].contains("this clone's journal") && said[0].contains(&format!("head {NEXT}")),
+        "{}",
+        said[0]
+    );
+
+    // Before an exec into the journal head's older cutter the fleet is still unread.
+    let mut exec = journal_at_next();
+    exec.existing_fleet_line = Some(Line::start("0.6.0", N2, 123));
+    exec.own_cutter = false;
+    exec.exec_result = Ok(());
+    assert_eq!(exec.run(mac()).0, 0);
+    let said = notices(&exec);
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert!(
+        said[0].contains("this clone's journal")
+            && said[0].contains("provisional")
+            && !said[0].contains("This release uses the line's content"),
+        "{}",
+        said[0]
+    );
+}
+
+/// A CLAIMED OR PUBLISHED LINE RESUMES AS IT IS. Its notice offers neither `--fix` nor
+/// `--commit <main> --supersede`, which the cutter refuses for such a line, and says the
+/// release resumes.
+/// NEGATIVE CONTROL: announce_line_selection never asked the cut journal or the engine's rows,
+/// so every resume of a claimed or published release past which main moved offered both.
+#[test]
+fn a_claimed_or_published_line_notice_offers_no_fix_or_supersession() {
+    for state in ["claimed", "published", "unpublished"] {
+        let mut world = journal_at_next();
+        match state {
+            "claimed" => {
+                world.cut = Some(CutState {
+                    version: "0.6.0".into(),
+                    build: 7,
+                    finished: false,
+                });
+            }
+            "published" => {
+                world.published.insert(NEXT.into(), "rev".into());
+            }
+            _ => {}
+        }
+        let _ = world.run(mac());
+        let said: Vec<_> = world
+            .out
+            .iter()
+            .filter(|s| s.contains("release: adopted/continued line"))
+            .collect();
+        assert_eq!(said.len(), 1, "{state}: {:#?}", world.out);
+        let offers = said[0].contains("--fix <c>...") || said[0].contains("--supersede");
+        if state == "unpublished" {
+            assert!(offers, "{}", said[0]);
+            continue;
+        }
+        assert!(!offers, "{state}: {}", said[0]);
+        assert!(
+            said[0].contains(&format!("The {state} release resumes as it is")),
+            "{state}: {}",
+            said[0]
+        );
+    }
 }
 
 #[test]
@@ -3010,7 +3458,14 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .filter(|c| {
             !matches!(
                 *c,
-                "audit" | "lease" | "seal-inputs" | "cut-gates" | "cut --sign-prepare"
+                "audit"
+                    | "lease"
+                    | "seal-inputs"
+                    | "cut-gates"
+                    | "cut --sign-prepare"
+                    | "fleet-existing"
+                    | "fleet-select"
+                    | "fleet-boundary"
             ) && !c.starts_with("ls-remote")
         })
         .collect();
@@ -3049,6 +3504,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             input.as_str(),
             "sync",
             "validation-tools",
+            "verify appkit",
             "disk-claim 30",
             "reserve",
             "stage",
@@ -3068,6 +3524,11 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     );
     assert_eq!(w.count("audit"), 2, "{:?}", w.calls);
     assert_eq!(w.audited_profiles, [None, None]);
+    assert!(
+        w.times.contains("\tqualify-appkit\t"),
+        "a successful gate contributes its synchronous ETA prefix: {}",
+        w.times
+    );
     assert_eq!(
         w.audited_dry,
         [false, false],
@@ -3227,6 +3688,8 @@ fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own(
     let mut w = World::new();
     w.verify_passes = false;
     w.verify_code = 3;
+    // Let the disk-free AppKit gate pass, then make the tree verifier fail under the claim.
+    w.verify_half = Some(Half::Tree);
     let (code, last) = w.run(bump());
     assert_eq!(code, 3, "{last}");
     assert_eq!(
@@ -3379,8 +3842,8 @@ fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own(
     assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
     assert_eq!(
         (w.count("stage"), w.count("build"), w.verified()),
-        (0, 0, 0),
-        "{:?}",
+        (0, 0, 1),
+        "AppKit passes before the full-disk refusal, while no graph branch starts: {:?}",
         w.calls
     );
 }
@@ -3508,6 +3971,7 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
     type Mend = fn(&mut World);
     let unverified: Mend = |w| {
         w.verify_half = None;
+        w.verify_step = None;
         w.verify_passes = true;
         w.verify_code = 0;
     };
@@ -3527,6 +3991,7 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
             3,
             |w| {
                 w.verify_half = Some(Half::Bundle);
+                w.verify_step = Some(Step::Bundle);
                 w.verify_passes = false;
                 w.verify_code = 3;
             },
@@ -3602,6 +4067,7 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
             ("bump", Step::Commit),
             ("reserve", Step::Qualify),
             ("build", Step::Qualify),
+            ("verify appkit", Step::Qualify),
             ("verify --tree", Step::Qualify),
             ("stage", Step::Qualify),
             ("verify --bundle", Step::Bundle),
@@ -3640,6 +4106,28 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
     assert_eq!(w.count("commit-gates-dry"), 1);
     assert!(w.journal().is_none(), "a dry run writes no journal");
     assert!(!w.release_dir().join(RUNNING_FILE).exists());
+    let appkit = w
+        .out
+        .iter()
+        .position(|line| line.contains("appkit: would run") && line.contains("--checks appkit"))
+        .expect("the dry plan names its early AppKit gate");
+    let disk = w
+        .out
+        .iter()
+        .position(|line| line.contains("disk: would claim"))
+        .expect("the dry plan names its graph disk claim");
+    assert!(
+        appkit < disk,
+        "the dry plan must put AppKit ahead of disk admission: {:#?}",
+        w.out
+    );
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains("--checks measure") && line.contains("--app")),
+        "step 5's dry plan names only the bundle-dependent check: {:#?}",
+        w.out
+    );
     for call in [
         "sync",
         "bump",
@@ -3666,6 +4154,103 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
             .any(|c| { c.starts_with("cut ") || c.starts_with("move") || c.starts_with("ask ") }),
         "{:?}",
         w.calls
+    );
+}
+
+/// The fixed reading reaches both the planner and the dry-run verdict. NEGATIVE CONTROL: remove
+/// the `qualify_slice_memory` edge from the dry controller (today's memory-blind path), and the
+/// injected 39.7-GiB reading is never read: this test's forecast-line assertions fail.
+#[test]
+fn a_dry_run_forecasts_qualifys_fixed_slice_memory_reading() {
+    use aterm_capacity::{Fixed, Ledger, Need, Reading};
+    use aterm_sysprobe::MemoryLevel;
+    const GIB: u64 = 1 << 30;
+    let forecast = |available: u64| {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path());
+        let mut reading = Reading::of_gib(96, 40, 28);
+        reading.available = Some(available);
+        reading.pressure = Some(MemoryLevel::Normal);
+        crate::buildplan::slice_memory_forecast_for_needs_in(
+            &ledger,
+            &Fixed::new(reading),
+            Need::new("release slice memory budget")
+                .rank(aterm_capacity::Rank::Release)
+                .mem_gib(44)
+                .margin(1),
+            Need::new(crate::slice_units::SERIAL_PARENT)
+                .rank(aterm_capacity::Rank::Release)
+                .mem(crate::slice_units::serial_parent_bytes(40 * GIB))
+                .margin(1),
+        )
+        .unwrap()
+    };
+
+    let exclusive = forecast(397 * GIB / 10);
+    assert_eq!(
+        exclusive.outcome,
+        crate::buildplan::SliceMemoryOutcome::Exclusive
+    );
+
+    let mut short = World::new();
+    short.slice_memory = Ok(exclusive.clone());
+    let (code, last) = short.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", short.out);
+    assert_eq!(short.count("slice-memory-forecast"), 1);
+    let output = short.out.join("\n");
+    for words in [
+        "shared 44 GiB parent",
+        "42 GiB parent is short too",
+        "alone through both serial slices",
+        "39.7 GiB available",
+        "no claim holds it: other work on this Mac",
+    ] {
+        assert!(output.contains(words), "{words}:\n{output}");
+    }
+    assert!(
+        last.contains("would go ahead") && !last.contains("would refuse"),
+        "{last}"
+    );
+
+    let mut serial = World::new();
+    serial.slice_memory = Ok(forecast(43 * GIB));
+    let (code, last) = serial.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", serial.out);
+    assert_eq!(serial.count("slice-memory-forecast"), 1);
+    assert!(
+        serial
+            .out
+            .iter()
+            .any(|line| line
+                .contains("degrades to serial and admits — 42 GiB parent, 43 GiB available")),
+        "{:#?}",
+        serial.out
+    );
+    assert!(last.contains("would go ahead") && !last.contains("would refuse"));
+
+    let mut waiting = World::new();
+    waiting.slice_memory = Ok(crate::buildplan::SliceMemoryForecast {
+        outcome: crate::buildplan::SliceMemoryOutcome::Wait,
+        line: "qualify slice memory: shared 44 GiB parent would wait (memory short by 4 GiB: needs 44 GiB, 40 GiB available less 8 GiB reserved; pid 123 holds 8 GiB of memory for 1m00s: \"other release\")"
+            .into(),
+    });
+    let (code, last) = waiting.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", waiting.out);
+    assert!(
+        last.contains("a real run would wait at 4/10 qualify")
+            && last.contains("pid 123 holds 8 GiB of memory")
+            && last.contains("work remains after admission")
+            && !last.contains("go ahead"),
+        "{last}"
     );
 }
 
@@ -3895,9 +4480,8 @@ fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
     for dry in [true, false] {
         let mut w = World::new();
         w.versions.insert(TIP.into(), "0.6.0".into());
-        w.input_refusal = Some(Refusal::new(
-            "export-scan: planted forbidden content",
-            "land the fix",
+        w.input_finding = Some(InputFinding::Failed(
+            "export-scan: planted forbidden content".into(),
         ));
         let (code, last) = w.run(ReleaseOptions {
             dry_run: dry,
@@ -3988,10 +4572,7 @@ fn commit_preflight_precedes_input_compile_and_dry_run_collects_both_reds() {
         let mut w = World::new();
         w.versions.insert(TIP.into(), "0.6.0".into());
         w.gate_repo = Some(root.path().join("clone"));
-        w.input_refusal = Some(Refusal::new(
-            "census: planted input defect",
-            "repair census",
-        ));
+        w.input_finding = Some(InputFinding::Failed("census: planted input defect".into()));
         let (code, last) = w.run(ReleaseOptions {
             dry_run: dry,
             ..mac()
@@ -4033,6 +4614,7 @@ fn commit_preflight_precedes_input_compile_and_dry_run_collects_both_reds() {
     }
     // Negative control: a red test has no commit-only evidence and still fails in qualify.
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_passes = false;
     w.verify_code = 1;
     let (code, last) = w.run(bump());
@@ -4072,10 +4654,7 @@ fn dry_run_does_not_hide_commit_findings_behind_an_already_cut_tag() {
     w.versions.insert(TIP.into(), "0.6.0".into());
     w.gate_repo = Some(root.path().join("clone"));
     w.origin_tags.insert("v0.6.0".into(), NEXT.into());
-    w.input_refusal = Some(Refusal::new(
-        "census: planted input defect",
-        "repair census",
-    ));
+    w.input_finding = Some(InputFinding::Failed("census: planted input defect".into()));
     let (code, last) = w.run(ReleaseOptions {
         dry_run: true,
         ..mac()
@@ -4096,10 +4675,7 @@ fn measure_commit_gate_refusal_order() {
         let mut w = World::new();
         w.gate_repo = Some(root.path().join("clone"));
         if dry {
-            w.input_refusal = Some(Refusal::new(
-                "census: planted input defect",
-                "repair census",
-            ));
+            w.input_finding = Some(InputFinding::Failed("census: planted input defect".into()));
         }
         let start = std::time::Instant::now();
         let (code, last) = w.run(ReleaseOptions {
@@ -4312,6 +4888,1170 @@ fn a_refused_candidate_never_stages_or_publishes() {
     }
 }
 
+/// A DRY BUMP ASKS THE CUT'S GATES OF ITS PRIVATE BUMP. The dry plan constructs the bump
+/// before step 1, so it asks the cut's pre-claim gates and R's own-tree gates of that head, as
+/// the real bump asks them of the pushed one.
+/// NEGATIVE CONTROL: still_possible exempted a dry `--bump` from cut_gates and head_gates: a
+/// held release lease printed "a real run would go ahead" while the real bump refused at 1/10.
+#[test]
+fn a_dry_bump_asks_the_cuts_gates_of_its_private_bump() {
+    let mut w = World::new();
+    w.cut_gate_refusals = vec![lease_held()];
+    let (code, dry) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 1, "{dry}\n{:?}", w.out);
+    assert!(dry.contains("would refuse at 1/10 checks"), "{dry}");
+    assert!(dry.contains("the cut would refuse (1 finding(s))"), "{dry}");
+    assert_eq!(w.count("cut-gates"), 1, "{:?}", w.calls);
+    assert_eq!(
+        w.head_gated,
+        [BUMP],
+        "R's own-tree gates ask the private bump"
+    );
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+    assert!(w.journal().is_none());
+
+    let mut real = World::new();
+    real.cut_gate_refusals = vec![lease_held()];
+    let (code, last) = real.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
+}
+
+/// A REAL BUMP SAYS WHAT ITS COMMIT WRITES BEFORE IT WRITES IT. The base preflight of a
+/// `--bump` passes on the harness versions its own commit writes, and the run shows the
+/// gate's line naming them, once, before it pushes that commit.
+/// NEGATIVE CONTROL: prepare_candidate kept only the preflight's refusals, so the line naming
+/// the harness versions the bump commit writes was never shown or logged.
+#[test]
+fn a_real_bump_says_the_harness_versions_its_commit_writes() {
+    let note = "harness versions since v0.5.0: the bump commit writes alab claude harness 0.2";
+    let mut w = World::new();
+    w.preview_own = true;
+    w.bump_writes = Some(note.into());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(w.count("commit-gates-dry") >= 1, "{:?}", w.calls);
+    assert_eq!(w.count("bump"), 1, "{:?}", w.calls);
+    let said = w
+        .out
+        .iter()
+        .position(|line| line == &format!("release: {note}"))
+        .unwrap_or_else(|| panic!("the preflight's note was not said: {:#?}", w.out));
+    assert!(
+        w.said_at_bump.is_some_and(|at| said < at),
+        "said before the bump ({:?}): {:#?}",
+        w.said_at_bump,
+        w.out
+    );
+    assert_eq!(
+        w.out.iter().filter(|line| line.contains(note)).count(),
+        1,
+        "said once: {:#?}",
+        w.out
+    );
+}
+
+/// The two halves of a refused preflight's remedy in `line` (release::blocked): how a finding
+/// in the source is fixed, and the command that runs again once one on this machine is.
+fn remedy_halves(line: &str) -> (&str, &str) {
+    let (_, halves) = line
+        .split_once("the source's: ")
+        .unwrap_or_else(|| panic!("no source half: {line}"));
+    halves
+        .split_once("; this machine's: ")
+        .unwrap_or_else(|| panic!("no machine half: {line}"))
+}
+
+/// Every remedy `out` says with two halves, as (source, machine).
+fn said_remedies(out: &[String]) -> Vec<(String, String)> {
+    let said: Vec<(String, String)> = out
+        .iter()
+        .filter(|line| line.contains("the source's: "))
+        .map(|line| {
+            let (source, machine) = remedy_halves(line);
+            (source.to_owned(), machine.to_owned())
+        })
+        .collect();
+    assert!(!said.is_empty(), "no remedy said: {out:#?}");
+    said
+}
+
+/// A BUMP REFUSED BEFORE ITS COMMIT HAS NO LINE TO CARRY A FIX ONTO. When the base preflight
+/// of a real `--bump` refuses, nothing is bumped and no line exists, so the source's remedy is
+/// to land the fix on main and bump again, and the machine's is to bump again too. The dry
+/// run judges the same gates on its private bump, both R's commit gates and, at step 1, the
+/// cut's own-tree gates (handoff fixtures, handoff policy), as Real asks both of that commit;
+/// every remedy it says names the same bump.
+/// NEGATIVE CONTROL: blocked() always appended fix_remedy, so the refusal said to run
+/// `--fix <the fix's own non-merge commit>`, which refuses a clone with no unfinished line;
+/// blocked()'s machine half was the bare run; and still_possible kept fix_remedy, so the dry
+/// bump's step-1 gate findings named `--fix` and a backport on its private bump, a commit on
+/// no ref.
+#[test]
+fn a_bump_refused_before_its_commit_names_a_bump_not_a_fix() {
+    let block = || {
+        vec![Refusal::new(
+            "handoff fixtures — the handoff fixtures of v0.5.0 are not checked in",
+            "generate them at tag v0.5.0",
+        )]
+    };
+    let command = crate::ledger::RELEASE_COMMAND;
+    let bump_again = format!("land the fix on main, then {command} --bump");
+    let machine_again = format!("fix it, then {command} --bump");
+    let mut dry = World::new();
+    dry.blocks = block();
+    dry.head_gate_refusals.insert(BUMP.into(), block());
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", dry.out);
+    assert_eq!(dry.head_gated, [BUMP], "step 1 asks the private bump");
+    assert!(
+        dry.out
+            .iter()
+            .any(|line| line.contains("the cut would refuse (1 finding(s))")),
+        "{:#?}",
+        dry.out
+    );
+    assert!(
+        dry.out
+            .iter()
+            .any(|line| line.contains("the preflight BLOCKED")),
+        "{:#?}",
+        dry.out
+    );
+    for (source, machine) in said_remedies(&dry.out) {
+        assert_eq!(source, bump_again, "{:#?}", dry.out);
+        assert_eq!(machine, machine_again, "{:#?}", dry.out);
+    }
+
+    let mut w = World::new();
+    w.preview_own = true;
+    w.blocks = block();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+    assert!(w.journal().is_none());
+    assert!(!last.contains("--fix"), "{last}");
+    assert_eq!(remedy_halves(&last), (&*bump_again, &*machine_again));
+}
+
+/// AN UNWRITTEN BUMP REFUSED ON THIS MACHINE RUNS THE BUMP AGAIN. A real `--bump` refused at
+/// its base preflight by a finding on this machine (another judgment holds the checkout the
+/// locked metadata is read in) bumped nothing, so the machine's remedy names `--bump`: in a
+/// clone whose last release finished, the bare run re-checks that release and ends RELEASED of
+/// the old version, exit 0, with nothing bumped or released.
+/// NEGATIVE CONTROL: blocked()'s machine half was always the bare `ship release`.
+#[test]
+fn a_bump_refused_on_this_machine_names_the_bump_again() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let mut w = World::new();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    w.local_tags.insert("v0.6.0".into());
+    w.preview_own = true;
+    w.blocks = vec![
+        Refusal::new(
+            "R-tree locked metadata — another release-input judgment holds the checkout",
+            "let it end, then retry",
+        )
+        .could_not_run(),
+    ];
+    w.calls.clear();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+    assert_eq!(
+        remedy_halves(&last),
+        (
+            &*format!("land the fix on main, then {command} --bump"),
+            &*format!("fix it, then {command} --bump")
+        )
+    );
+
+    // The bare run a machine half without `--bump` names: a false success.
+    w.blocks.clear();
+    w.calls.clear();
+    let (code, bare) = w.run(mac());
+    assert_eq!(code, 0, "{bare}\n{:#?}", w.out);
+    assert!(bare.starts_with("RELEASED aterm 0.6.0"), "{bare}");
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+
+    // The command the machine half names bumps and releases the next version.
+    w.calls.clear();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("bump"), 1, "{:?}", w.calls);
+    assert!(last.starts_with("RELEASED aterm 0.7.0"), "{last}");
+}
+
+/// A FRESH LINE REFUSED BEFORE ITS JOURNAL HAS NO LINE TO CARRY A FIX ONTO. The launcher's
+/// base preflight of a line no journal holds yet (origin/main's tip, `--commit`, or a
+/// supersession's replacement) refuses before anything is journaled, so the source's remedy
+/// lands the fix on main and starts the line at a commit that holds it (a plain run for the
+/// tip and `--commit`), and the machine's runs the same selection again. Following the
+/// source's remedy releases. The dry run, which never journals, names the same.
+/// NEGATIVE CONTROL: source_remedy named `--fix <the fix's own non-merge commit>` for every
+/// candidate but an unwritten bump, and that `--fix` refuses a clone with no unfinished line;
+/// blocked()'s machine half was the bare run whatever the selection.
+#[test]
+fn a_fresh_line_refused_before_its_journal_names_a_start_not_a_fix() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let block = || {
+        vec![Refusal::new(
+            "changelog — CHANGELOG.md has no 0.6.0 section",
+            "add it on main",
+        )]
+    };
+    let at_commit = ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    for (selection, source, machine) in [
+        (
+            mac(),
+            format!("land the fix on main, then {command}"),
+            format!("fix it, then {command}"),
+        ),
+        (
+            at_commit,
+            format!("land the fix on main, then {command}"),
+            format!("fix it, then {command} --commit {TIP}"),
+        ),
+    ] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        w.preview_own = true;
+        w.blocks = block();
+        let (code, last) = w.run(selection.clone());
+        assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+        assert!(last.contains("the preflight BLOCKED"), "{last}");
+        assert!(w.journal().is_none());
+        assert!(!w.release_dir().join(SELECTION_FILE).exists());
+        assert!(!last.contains("--fix"), "{last}");
+        assert_eq!(remedy_halves(&last), (&*source, &*machine));
+
+        // The source's remedy, once the fix is on main, starts the line and releases it.
+        w.blocks.clear();
+        let (code, last) = w.run(mac());
+        assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+        assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+
+        let mut dry = World::new();
+        dry.versions.insert(TIP.into(), "0.6.0".into());
+        dry.blocks = block();
+        let (code, last) = dry.run(ReleaseOptions {
+            dry_run: true,
+            ..selection
+        });
+        assert_eq!(code, 1, "{last}\n{:#?}", dry.out);
+        for said in said_remedies(&dry.out) {
+            assert_eq!(said, (source.clone(), machine.clone()), "{:#?}", dry.out);
+        }
+    }
+
+    // A supersession's replacement, refused before its journal, replaces the line again.
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.versions.insert(NEXT.into(), "0.6.0".into());
+    w.history.insert(1, NEXT.into());
+    w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+    w.preview_own = true;
+    w.blocks = block();
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert!(w.supersession.is_none());
+    assert_eq!(
+        remedy_halves(&last),
+        (
+            &*format!("land the fix on main, then {command} --commit origin/main --supersede"),
+            &*format!("fix it, then {command} --commit {TIP} --supersede")
+        )
+    );
+}
+
+/// A PUBLISHED LINE TAKES NO FIX. Once R's source is published, a source finding of the cut's
+/// gates cannot be carried onto R's line (`--fix` refuses a line already published), so the
+/// source's remedy is the next product version, and the machine's resumes the line.
+/// NEGATIVE CONTROL: still_possible always named fix_remedy, `--fix` onto a published line.
+#[test]
+fn a_published_lines_gate_finding_names_the_next_version_not_a_fix() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let mut w = World::new();
+    w.cut_claims = false;
+    w.cut_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 8/10 cut"), "{last}");
+    assert!(w.published.contains_key(BUMP) && w.cut.is_none());
+
+    w.cut_claims = true;
+    w.cut_code = 0;
+    w.head_gate_refusals.insert(
+        BUMP.into(),
+        vec![Refusal::new(
+            "handoff policy — the policy of v0.5.0 refuses this handoff",
+            "repair the handoff policy on main",
+        )],
+    );
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the cut would refuse"), "{last}");
+    assert_eq!(
+        remedy_halves(&last),
+        (
+            &*format!(
+                "land the fix on main, then release the next product version: {command} \
+                 --forget, then {command} --bump"
+            ),
+            &*format!("fix it, then {command}")
+        )
+    );
+    assert!(w.cut.is_none());
+
+    // The `--fix` the remedy named before refuses: the line is already published.
+    w.head_gate_refusals.clear();
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.calls.clear();
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("already published"), "{last}");
+    assert!(w.cut.is_none());
+}
+
+/// The fix line a dry run says for its first refusal whose words hold `why`.
+fn dry_fix<'a>(out: &'a [String], why: &str) -> &'a str {
+    let at = out
+        .iter()
+        .position(|line| {
+            (line.contains("WOULD REFUSE") || line.contains("COULD NOT RUN")) && line.contains(why)
+        })
+        .unwrap_or_else(|| panic!("no dry refusal of {why}: {out:#?}"));
+    out[at..]
+        .iter()
+        .find_map(|line| line.strip_prefix("        fix: "))
+        .unwrap_or_else(|| panic!("no fix line after {why}: {out:#?}"))
+}
+
+/// A BUMP REFUSED BY A LEFTOVER TAG RUNS THE BUMP AGAIN. A real `--bump` whose next version's
+/// tag is left in this clone is refused at its base preflight, before its bump is written, so
+/// the tag's fix names `--bump`: in a clone whose last release finished, the bare run re-checks
+/// that release and ends RELEASED of the old version, exit 0, with nothing bumped. The dry
+/// `--bump` says the same of both places the tag is asked (the candidate's checks and the
+/// cut's). A bump whose base main dropped since selection runs the bump on main as it is.
+/// NEGATIVE CONTROL: choose_candidate's and cut_still_possible's leftover-tag refusals, and
+/// choose_candidate's not-on-main one, named the bare `ship release` whatever the selection.
+#[test]
+fn a_bump_refused_by_a_leftover_tag_names_the_bump_again() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let mut wrong = Vec::new();
+    let mut w = World::new();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    w.local_tags.insert("v0.6.0".into());
+    w.local_tags.insert("v0.7.0".into());
+    w.preview_own = true;
+    let delete_then_bump = format!("git tag -d v0.7.0, then re-run {command} --bump");
+
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    let said: Vec<&String> = w
+        .out
+        .iter()
+        .filter(|line| line.contains("git tag -d v0.7.0"))
+        .collect();
+    assert_eq!(said.len(), 2, "the candidate's and the cut's: {:#?}", w.out);
+    for line in said {
+        if !line.ends_with(&delete_then_bump) {
+            wrong.push(format!("dry: {line}"));
+        }
+    }
+
+    w.calls.clear();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("tag v0.7.0 exists in this clone and not on origin"),
+        "{last}"
+    );
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+    if !last.ends_with(&delete_then_bump) {
+        wrong.push(format!("real: {last}"));
+    }
+
+    // The bare run a fix line without `--bump` names: a false success.
+    w.local_tags.remove("v0.7.0");
+    w.calls.clear();
+    let (code, bare) = w.run(mac());
+    assert_eq!(code, 0, "{bare}\n{:#?}", w.out);
+    assert!(bare.starts_with("RELEASED aterm 0.6.0"), "{bare}");
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+
+    // The command the fix line names bumps and releases the next version.
+    w.calls.clear();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("bump"), 1, "{:?}", w.calls);
+    assert!(last.starts_with("RELEASED aterm 0.7.0"), "{last}");
+
+    // A bump whose base origin/main dropped between selection and the preflight's refresh.
+    let mut w = World::new();
+    w.preview_own = true;
+    w.versions.insert(NEXT.into(), "0.5.0".into());
+    w.main_at_next_fetch = Some(vec![OLD.into(), NEXT.into()]);
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("is not on origin/main"), "{last}");
+    assert_eq!(w.count("bump"), 0, "{:?}", w.calls);
+    if !last.ends_with(&format!("bump origin/main as it is now: {command} --bump")) {
+        wrong.push(format!("dropped base: {last}"));
+    }
+    let (code, bare) = w.run(mac());
+    assert_eq!(code, 1, "the bare run releases nothing: {bare}");
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A `--commit` REFUSED ON THIS MACHINE RUNS THE SAME COMMIT AGAIN. A line not yet journaled
+/// at X, below origin/main's tip, refused by a leftover local tag of its version (at the base
+/// preflight, and in a dry run at both places the tag is asked), or by X leaving origin/main
+/// between selection and the preflight's refresh, is selected again by `--commit X`, which each
+/// fix line names; following the tag's fix releases X. The bare run would select the tip.
+/// NEGATIVE CONTROL (mutants): each of these three fix lines naming the bare run, as before
+/// Run::again, passed every other test.
+#[test]
+fn a_commit_refused_on_this_machine_names_the_commit_again() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let at = |dry_run| ReleaseOptions {
+        commit: Some(NEXT.into()),
+        dry_run,
+        ..mac()
+    };
+    let setup = || {
+        let mut w = World::new();
+        w.history = vec![OLD.into(), NEXT.into(), TIP.into()];
+        for commit in [NEXT, TIP] {
+            w.versions.insert(commit.into(), "0.6.0".into());
+        }
+        w.preview_own = true;
+        w
+    };
+    let mut wrong = Vec::new();
+    let delete_then_commit = format!("git tag -d v0.6.0, then re-run {command} --commit {NEXT}");
+
+    let mut w = setup();
+    w.local_tags.insert("v0.6.0".into());
+    let (code, last) = w.run(at(true));
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    let said: Vec<&String> = w
+        .out
+        .iter()
+        .filter(|line| line.contains("git tag -d v0.6.0"))
+        .collect();
+    assert_eq!(said.len(), 2, "the candidate's and the cut's: {:#?}", w.out);
+    for line in said {
+        if !line.ends_with(&delete_then_commit) {
+            wrong.push(format!("dry: {line}"));
+        }
+    }
+    let (code, last) = w.run(at(false));
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("tag v0.6.0 exists in this clone and not on origin"),
+        "{last}"
+    );
+    assert!(w.journal().is_none());
+    if !last.ends_with(&delete_then_commit) {
+        wrong.push(format!("real: {last}"));
+    }
+    // The command the fix line names releases X.
+    w.local_tags.remove("v0.6.0");
+    let (code, last) = w.run(at(false));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(w.journal().unwrap().commit, NEXT);
+
+    let mut w = setup();
+    w.main_at_next_fetch = Some(vec![OLD.into(), TIP.into()]);
+    let (code, last) = w.run(at(false));
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("is not on origin/main"), "{last}");
+    if !last.ends_with(&format!(
+        "land it on main first, then re-run {command} --commit {NEXT}"
+    )) {
+        wrong.push(format!("dropped: {last}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// AN INPUT JUDGMENT REFUSED BEFORE A LINE NAMES A START, NOT A FIX. Step 1's release-input
+/// judgment reports what it found, and the one rule (Run::remedy) names the remedy from the
+/// candidate: a dry `--bump` judges its private bump and a dry fresh line journals nothing, so
+/// a source finding lands the fix on main and runs that selection again, and a judgment that
+/// could not be made runs that selection again; a real line, journaled before step 1, takes the
+/// fix by `--fix`, and runs the bare run again once the judgment answers.
+/// NEGATIVE CONTROL (a world whose judgment names fix_remedy(tip), as Real::input_checks did for
+/// every refusal, which the run passed on): in a dry `--bump`, `--fix` and a backport on its
+/// private bump (a commit on no ref); in a dry fresh line, a `--fix` that refuses a clone with no
+/// line; for a judgment that could not be made, a fix.
+#[test]
+fn an_input_judgment_refused_before_a_line_names_a_start_not_a_fix() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    const FAILED: &str = "export-scan: planted forbidden content";
+    const UNANSWERED: &str = "release input could not be judged: the planted scanner is absent";
+    let failed = || InputFinding::Failed(FAILED.into());
+    let unanswered = || InputFinding::Unanswered(UNANSWERED.into());
+    let dry_bump = ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    };
+    let dry_tip = ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    };
+    let mut wrong = Vec::new();
+    for (selection, finding, why, fix) in [
+        (
+            dry_bump.clone(),
+            failed(),
+            FAILED,
+            format!("land the fix on main, then {command} --bump"),
+        ),
+        (
+            dry_bump,
+            unanswered(),
+            UNANSWERED,
+            format!("run {command} --bump again once it answers"),
+        ),
+        (
+            dry_tip.clone(),
+            failed(),
+            FAILED,
+            format!("land the fix on main, then {command}"),
+        ),
+        (
+            dry_tip,
+            unanswered(),
+            UNANSWERED,
+            format!("run {command} again once it answers"),
+        ),
+    ] {
+        let mut w = World::new();
+        if !selection.bump {
+            w.versions.insert(TIP.into(), "0.6.0".into());
+        }
+        w.input_finding = Some(finding);
+        let (code, last) = w.run(selection.clone());
+        assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+        assert!(w.journal().is_none());
+        assert!(!w.release_dir().join(SELECTION_FILE).exists());
+        let judged = if selection.bump { BUMP } else { TIP };
+        assert!(
+            w.calls
+                .iter()
+                .any(|call| call.starts_with("input-checks ") && call.ends_with(judged)),
+            "{:?}",
+            w.calls
+        );
+        let said = dry_fix(&w.out, why);
+        if said != fix {
+            wrong.push(format!(
+                "bump={} {why}: said {said}, want {fix}",
+                selection.bump
+            ));
+        }
+    }
+    for (finding, fix) in [
+        (failed(), crate::release::fix_remedy(TIP)),
+        (unanswered(), format!("run {command} again once it answers")),
+    ] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        let why = finding.why().to_owned();
+        w.input_finding = Some(finding);
+        let (code, last) = w.run(mac());
+        assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+        assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
+        assert!(last.contains(&why), "{last}");
+        let line = Journal::load(&w.release_dir().join(SELECTION_FILE)).unwrap();
+        assert_eq!(
+            line.map(|j| j.commit),
+            Some(TIP.to_owned()),
+            "the line is journaled"
+        );
+        if !last.ends_with(&fix) {
+            wrong.push(format!("real {why}: said {last}, want {fix}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A RELAUNCHED SUPERSESSION RUNS ITS OWN TRANSACTION AGAIN. The launcher of `--commit X
+/// --supersede` journals the transaction in candidate.toml and hands over to X's cutter, whose
+/// own base preflight then refuses. candidate.toml holds that undecided transaction, which
+/// every run but `--commit X --supersede` refuses, so the machine's remedy names it, and the
+/// source's drops it (`--forget`) before superseding the line at a commit that holds the fix.
+/// NEGATIVE CONTROL: Run::remedy read `line` (this clone's unfinished journal is at X) before
+/// the supersession, naming the bare run and `--fix`, each of which the retained transaction
+/// refuses.
+#[test]
+fn a_relaunched_supersession_refused_names_its_transaction_not_the_line() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let mut w = World::new();
+    w.history = vec![OLD.into(), NEXT.into(), TIP.into()];
+    for commit in [NEXT, TIP] {
+        w.versions.insert(commit.into(), "0.6.0".into());
+    }
+    w.head = NEXT.into();
+    w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+    let supersede = ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    };
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    let (code, last) = w.run(supersede.clone());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let pending = Journal::load(&selection).unwrap().unwrap();
+    assert_eq!(pending.commit, TIP);
+    assert!(pending.supersede.is_some());
+
+    w.own_cutter = true;
+    w.preview_own = true;
+    w.blocks = vec![Refusal::new(
+        "changelog — CHANGELOG.md has no 0.6.0 section",
+        "add it on main",
+    )];
+    let (code, last) = w.run(supersede.clone());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(w.count("supersede"), 0, "{:?}", w.calls);
+    assert_eq!(
+        remedy_halves(&last),
+        (
+            &*format!(
+                "land the fix on main, then {command} --forget, then {command} --commit \
+                 origin/main --supersede"
+            ),
+            &*format!("fix it, then {command} --commit {TIP} --supersede")
+        )
+    );
+
+    // The bare run and `--fix` the remedy named before: the transaction refuses both.
+    w.blocks.clear();
+    for other in [mac(), fix(&[TIP])] {
+        let (code, last) = w.run(other);
+        assert_eq!(code, 3, "{last}\n{:#?}", w.out);
+        assert!(
+            last.contains("candidate.toml retains an undecided supersession transaction"),
+            "{last}"
+        );
+    }
+    // The command the machine half names decides it.
+    let (code, last) = w.run(supersede);
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("supersede"), 1, "{:?}", w.calls);
+    assert_eq!(w.journal().unwrap().commit, TIP);
+}
+
+/// Where a written supersession's unfinished line is journaled once a later step refused.
+#[derive(Clone, Copy, Debug)]
+enum Written {
+    /// Refused at step 1: candidate.toml.
+    Candidate,
+    /// Refused after step 2 committed it: release.toml.
+    Release,
+}
+
+/// A clone whose `--commit TIP --supersede` wrote its supersession of the fleet's 0.6.0 line at
+/// NEXT, then refused at a later step, leaving its unfinished line at TIP (journaled where
+/// `at` says) with nothing left to decide. The refusal is cleared, so the next run goes on.
+fn written_supersession(at: Written) -> World {
+    let mut w = World::new();
+    w.history = vec![OLD.into(), NEXT.into(), TIP.into()];
+    for commit in [NEXT, TIP] {
+        w.versions.insert(commit.into(), "0.6.0".into());
+    }
+    w.head = NEXT.into();
+    w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+    match at {
+        Written::Candidate => {
+            w.machine_refusals = vec![Refusal::new("planted step-one refusal", "retry")];
+        }
+        Written::Release => {
+            w.verify_passes = false;
+            w.verify_code = 1;
+        }
+    }
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    });
+    assert_eq!(code, 1, "{at:?}: {last}\n{:#?}", w.out);
+    assert_eq!(w.count("supersede"), 1, "{at:?}: {:?}", w.calls);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let journal = match at {
+        Written::Candidate => {
+            assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
+            Journal::load(&selection).unwrap().unwrap()
+        }
+        Written::Release => {
+            assert!(!selection.exists(), "{at:?}: {last}");
+            w.journal().unwrap()
+        }
+    };
+    assert_eq!(journal.commit, TIP);
+    assert!(!journal.finished() && journal.supersede.is_none());
+    assert!(journal.has("supersession-completed"), "{journal:?}");
+    w.machine_refusals.clear();
+    w.verify_passes = true;
+    w.verify_code = 0;
+    w
+}
+
+/// A WRITTEN SUPERSESSION IS THIS CLONE'S LINE. Once `--commit X --supersede` wrote its
+/// supersession and a later step refused, this clone's unfinished line is at X with nothing
+/// left to decide, and the same command run again skips the supersession and resumes that
+/// line. A source finding of the rerun's base preflight, or of a dry rerun's step 1, is
+/// carried onto the line (`--fix`), and the machine's remedy is the bare run, which resumes
+/// it; following that releases with no second supersession.
+/// NEGATIVE CONTROL: Run::superseding read only the flags, which a rerun keeps until its own
+/// supersession block is passed, so the remedy named a second supersession at origin/main and
+/// `--commit X --supersede`, in place of the line the first one wrote.
+#[test]
+fn a_rerun_of_a_written_supersession_names_its_line() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let supersede = ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    };
+    let written = || {
+        let mut w = written_supersession(Written::Candidate);
+        w.blocks = vec![Refusal::new(
+            "changelog — CHANGELOG.md has no 0.6.0 section",
+            "add it on main",
+        )];
+        w
+    };
+    let want = (
+        crate::release::fix_remedy(TIP),
+        format!("fix it, then {command}"),
+    );
+
+    let mut wrong = Vec::new();
+
+    let mut w = written();
+    w.preview_own = true;
+    let (code, last) = w.run(supersede.clone());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(w.count("supersede"), 1, "{:?}", w.calls);
+    let (source, machine) = remedy_halves(&last);
+    if (source, machine) != (&*want.0, &*want.1) {
+        wrong.push(format!("real: ({source:?}, {machine:?})"));
+    }
+    // The machine's remedy resumes the written line and releases it.
+    w.blocks.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(w.count("supersede"), 1, "{:?}", w.calls);
+
+    let mut dry = written();
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..supersede
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", dry.out);
+    assert_eq!(dry.count("supersede"), 1, "{:?}", dry.calls);
+    for said in said_remedies(&dry.out) {
+        if said != want {
+            wrong.push(format!("dry: {said:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "want {want:?}, said {wrong:#?}");
+}
+
+/// A WRITTEN SUPERSESSION ANSWERS ONLY ITS OWN COMMIT. Once `--commit X --supersede` wrote its
+/// supersession and a later step refused, this clone's unfinished line is at X, journaled in
+/// candidate.toml or, past step 2, in release.toml. At X the fact answers, real and dry alike:
+/// a rerun of `--commit X --supersede` preflights no supersession, so a dry rerun refuses only
+/// where the real one does. `--commit Y --supersede` at a later commit Y of the same version
+/// (the fix landed on main, as the supersession's pre-write remedy says) supersedes that line
+/// in turn, as it would any unfinished line of this clone: it writes its own supersession
+/// (previous = X's line, replacement head Y) and releases Y. Refused before that write, every
+/// remedy it says, real and dry, names the supersession at Y.
+/// NEGATIVE CONTROL: Run::supersession_written answered for any unfinished journal holding the
+/// fact, whatever commit the request named, so the run at Y skipped its supersession, journaled
+/// Y with no transaction over the written line's journal and ended exit 1 having said nothing;
+/// and its remedies named `--commit Y` and, after `--forget`, the bare run, in place of the
+/// supersession. And preflight_dry_supersede never read the fact, so a dry rerun at X
+/// preflighted the supersession the real rerun skips: with that preflight refusing, the dry
+/// rerun said a real run would refuse at 1/10 where the real rerun released.
+#[test]
+fn a_written_supersession_answers_only_its_own_commit() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    for dry_run in [false, true] {
+        let mut w = written_supersession(Written::Candidate);
+        w.calls.clear();
+        w.supersede_preflight_refusal = Some(Refusal::new(
+            "planted supersession preflight refusal",
+            "retry",
+        ));
+        let (code, last) = w.run(ReleaseOptions {
+            commit: Some(TIP.into()),
+            supersede: true,
+            dry_run,
+            ..mac()
+        });
+        assert_eq!(code, 0, "dry {dry_run}: {last}\n{:#?}", w.out);
+        assert_eq!(
+            w.count("supersede-preflight"),
+            0,
+            "dry {dry_run}: {:?}",
+            w.calls
+        );
+        assert_eq!(w.count("supersede"), 0, "dry {dry_run}: {:?}", w.calls);
+    }
+
+    let supersede = ReleaseOptions {
+        commit: Some(N2.into()),
+        supersede: true,
+        ..mac()
+    };
+    // The fix lands on main at N2, still 0.6.0.
+    let landed = |at: Written| {
+        let mut w = written_supersession(at);
+        w.history.push(N2.into());
+        w.versions.insert(N2.into(), "0.6.0".into());
+        w.calls.clear();
+        w
+    };
+
+    for at in [Written::Candidate, Written::Release] {
+        let mut w = landed(at);
+        let first = w
+            .supersession
+            .clone()
+            .expect("the first supersession is written")
+            .replacement;
+        assert_eq!(first.head(), TIP);
+        let (code, last) = w.run(supersede.clone());
+        assert_eq!(code, 0, "{at:?}: {last}\n{:#?}", w.out);
+        assert_eq!(w.count("supersede"), 1, "{at:?}: {:?}", w.calls);
+        assert!(
+            w.out.iter().any(|said| said == "SUPERSEDED"),
+            "{at:?}: {:#?}",
+            w.out
+        );
+        let record = w
+            .supersession
+            .clone()
+            .expect("the second supersession is written");
+        assert_eq!(record.previous, first, "{at:?}");
+        assert_eq!(record.replacement.head(), N2, "{at:?}");
+        assert!(last.starts_with("RELEASED aterm 0.6.0"), "{at:?}: {last}");
+        let journal = w.journal().unwrap();
+        assert_eq!(journal.commit, N2, "{at:?}");
+        assert_eq!(journal.line(), record.replacement, "{at:?}");
+    }
+
+    let want = (
+        format!("land the fix on main, then {command} --commit origin/main --supersede"),
+        format!("fix it, then {command} --commit {N2} --supersede"),
+    );
+    let block = || {
+        vec![Refusal::new(
+            "changelog — CHANGELOG.md has no 0.6.0 section",
+            "add it on main",
+        )]
+    };
+    let mut wrong = Vec::new();
+
+    let mut refused = landed(Written::Candidate);
+    refused.preview_own = true;
+    refused.blocks = block();
+    let (code, last) = refused.run(supersede.clone());
+    assert_eq!(code, 1, "{last}\n{:#?}", refused.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(refused.count("supersede"), 0, "{:?}", refused.calls);
+    let (source, machine) = remedy_halves(&last);
+    if (source, machine) != (&*want.0, &*want.1) {
+        wrong.push(format!("real: ({source:?}, {machine:?})"));
+    }
+
+    let mut dry = landed(Written::Candidate);
+    dry.blocks = block();
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..supersede
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", dry.out);
+    assert_eq!(dry.count("supersede"), 0, "{:?}", dry.calls);
+    for said in said_remedies(&dry.out) {
+        if said != want {
+            wrong.push(format!("dry: {said:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "want {want:?}, said {wrong:#?}");
+}
+
+/// A FINISHED LINE'S SUPERSESSION IS NOT THE NEXT ONE'S. A clone whose last release finished by
+/// `--commit X --supersede` keeps that supersession's fact in its finished release.toml, which
+/// answers only a rerun at X (supersession_is_performed_by_its_replacement_cutter_once). A later
+/// `--commit Y --supersede`, replacing the fleet's line of the next version, writes its own
+/// supersession and releases Y; refused before that write, every remedy it says, real and dry,
+/// still names the supersession. Nor is a finished line the one a supersession retires, so a
+/// clone whose last release finished with no supersession supersedes the same way.
+/// NEGATIVE CONTROL: prepare_candidate's guard and Run::superseding read the fact from whichever
+/// journal this clone held, so the second run skipped its supersession, journaled Y with no
+/// transaction and ended exit 1 having said nothing, and its remedies named `--commit Y` alone;
+/// and the preflight expected the finished release.toml's line, refusing "the fleet line
+/// advanced".
+#[test]
+fn a_finished_supersession_never_skips_the_next_one() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let supersede = |commit: &str| ReleaseOptions {
+        commit: Some(commit.into()),
+        supersede: true,
+        ..mac()
+    };
+    let previous = Line::start("0.7.0", N2, 200);
+    let finished = |by_supersession: bool| {
+        let mut w = World::new();
+        w.history = vec![OLD.into(), NEXT.into(), TIP.into()];
+        for commit in [NEXT, TIP] {
+            w.versions.insert(commit.into(), "0.6.0".into());
+        }
+        w.head = NEXT.into();
+        if by_supersession {
+            w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+        }
+        let (code, last) = w.run(ReleaseOptions {
+            supersede: by_supersession,
+            ..supersede(TIP)
+        });
+        assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+        assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+        assert_eq!(
+            w.count("supersede"),
+            usize::from(by_supersession),
+            "{:?}",
+            w.calls
+        );
+        let journal = w.journal().unwrap();
+        assert!(journal.finished(), "{journal:?}");
+        assert_eq!(journal.commit, TIP);
+        assert_eq!(journal.has("supersession-completed"), by_supersession);
+        assert!(!w.release_dir().join(SELECTION_FILE).exists());
+        // Main moves on to 0.7.0, whose fleet line another machine started at N2. The fleet
+        // keeps one supersession record per version, and 0.7.0's line has none.
+        w.history.extend([N2.into(), N3.into()]);
+        for commit in [N2, N3] {
+            w.versions.insert(commit.into(), "0.7.0".into());
+        }
+        w.existing_fleet_line = Some(previous.clone());
+        w.fleet_selected = None;
+        w.supersession = None;
+        w.calls.clear();
+        w
+    };
+
+    for by_supersession in [true, false] {
+        let mut w = finished(by_supersession);
+        let (code, last) = w.run(supersede(N3));
+        assert_eq!(code, 0, "{by_supersession}: {last}\n{:#?}", w.out);
+        assert_eq!(w.count("supersede"), 1, "{by_supersession}: {:?}", w.calls);
+        assert!(
+            w.out.iter().any(|said| said == "SUPERSEDED"),
+            "{:#?}",
+            w.out
+        );
+        let record = w
+            .supersession
+            .clone()
+            .expect("the second supersession is written");
+        assert_eq!(record.previous, previous);
+        assert_eq!(record.replacement.head(), N3);
+        assert!(last.starts_with("RELEASED aterm 0.7.0"), "{last}");
+        let journal = w.journal().unwrap();
+        assert_eq!(journal.commit, N3);
+        assert_eq!(journal.line(), record.replacement);
+    }
+
+    let want = (
+        format!("land the fix on main, then {command} --commit origin/main --supersede"),
+        format!("fix it, then {command} --commit {N3} --supersede"),
+    );
+    let block = || {
+        vec![Refusal::new(
+            "changelog — CHANGELOG.md has no 0.7.0 section",
+            "add it on main",
+        )]
+    };
+    let mut wrong = Vec::new();
+
+    let mut refused = finished(true);
+    refused.preview_own = true;
+    refused.blocks = block();
+    let (code, last) = refused.run(supersede(N3));
+    assert_eq!(code, 1, "{last}\n{:#?}", refused.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(refused.count("supersede"), 0, "{:?}", refused.calls);
+    assert!(refused.supersession.is_none());
+    let (source, machine) = remedy_halves(&last);
+    if (source, machine) != (&*want.0, &*want.1) {
+        wrong.push(format!("real: ({source:?}, {machine:?})"));
+    }
+
+    let mut dry = finished(true);
+    dry.blocks = block();
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..supersede(N3)
+    });
+    assert_eq!(code, 1, "{last}\n{:#?}", dry.out);
+    assert_eq!(dry.count("supersede"), 0, "{:?}", dry.calls);
+    for said in said_remedies(&dry.out) {
+        if said != want {
+            wrong.push(format!("dry: {said:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "want {want:?}, said {wrong:#?}");
+}
+
+/// A CUT QUESTION THAT COULD NOT BE ASKED RUNS THE SAME SELECTION AGAIN. When step 1 cannot
+/// ask one of the cut's gates of the head it would ship, its COULD NOT RUN names the run that
+/// selects that head again: `--bump` for a dry bump's private bump, `--commit X` for a line not
+/// yet journaled at X.
+/// NEGATIVE CONTROL (mutant): still_possible's could-not-run remedy named the bare run, which
+/// re-checks a finished release in place of a bump, or selects origin/main's tip in place of X.
+#[test]
+fn a_cut_question_that_could_not_be_asked_names_the_selection_again() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let unasked = || {
+        vec![
+            Refusal::new(
+                "handoff fixtures — git could not read v0.5.0's tree",
+                "restore the clone, then retry",
+            )
+            .could_not_run(),
+        ]
+    };
+    const ASKED: &str = "what the cut would refuse could not be asked";
+    let mut w = World::new();
+    w.head_gate_refusals.insert(BUMP.into(), unasked());
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.head_gated, [BUMP]);
+    assert_eq!(
+        dry_fix(&w.out, ASKED),
+        format!("run {command} --bump again once it answers (nothing changed)")
+    );
+
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.head_gate_refusals.insert(TIP.into(), unasked());
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        commit: Some(TIP.into()),
+        ..mac()
+    });
+    assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        dry_fix(&w.out, ASKED),
+        format!("run {command} --commit {TIP} again once it answers (nothing changed)")
+    );
+}
+
+/// A CLAIMED CUT IS WITHDRAWN BEFORE ITS SOURCE FIX SHIPS IN THE NEXT VERSION. A resume of a
+/// cut that claimed its build and did not finish is refused at its base preflight by a source
+/// finding. Its version cannot change, and checks() refuses any other version's run while this
+/// clone holds the unfinished cut, so the source's remedy withdraws the cut (`--abandon`)
+/// before it names the next product version.
+/// NEGATIVE CONTROL: the claimed branch of Run::remedy named the next version alone: its
+/// `--forget, then --bump` wrote and pushed a bump, then refused at 1/10 for the unfinished cut.
+#[test]
+fn a_claimed_cuts_source_finding_names_its_withdrawal_before_the_next_version() {
+    let command = crate::ledger::RELEASE_COMMAND;
+    let mut w = World::new();
+    w.cut_finishes = false;
+    w.cut_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(
+        w.cut
+            .as_ref()
+            .is_some_and(|cut| cut.version == "0.6.0" && !cut.finished),
+        "{:?}",
+        w.cut
+    );
+    // The claim's ledger line.
+    w.ledger.push("0.6.0".into());
+    w.preview_own = true;
+    w.blocks = vec![Refusal::new(
+        "changelog — CHANGELOG.md has no 0.6.0 section",
+        "add it on main",
+    )];
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.contains("the preflight BLOCKED"), "{last}");
+    assert_eq!(
+        remedy_halves(&last),
+        (
+            &*format!(
+                "withdraw its claimed cut first: {command} --abandon v0.6.0; then land the \
+                 fix on main and release the next product version: {command} --forget, then \
+                 {command} --bump"
+            ),
+            &*format!("fix it, then {command}")
+        )
+    );
+
+    // The next version without the withdrawal: a bump is pushed, then refused for the cut.
+    w.blocks.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    w.calls.clear();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("this clone holds an unfinished cut of v0.6.0"),
+        "{last}"
+    );
+    assert_eq!(w.count("bump"), 1, "{:?}", w.calls);
+}
+
 #[test]
 fn an_owner_gap_is_asked_once_the_long_steps_run_and_the_release_waits_then_goes_on() {
     for undelivered in [0, 1] {
@@ -4445,6 +6185,7 @@ fn a_published_candidate_cannot_be_replaced() {
 #[test]
 fn a_fix_after_a_red_carries_a_landed_commit_and_never_reselects_main() {
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_code = 1;
     w.verify_passes = false;
     let (code, last) = w.run(bump());
@@ -4666,53 +6407,281 @@ fn fix_needs_this_clones_unfinished_line_whose_head_knows_lines() {
 /// and the source record and export can run.
 #[test]
 fn a_line_that_fails_its_meaning_check_is_never_exported() {
-    for qualify in [false, true] {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let start = ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    let _ = w.run(start);
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.line_verify = Err(Refusal::new(
+        "hop 1's tree is not 1111's patch onto the previous head",
+        "drop the line",
+    ));
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    });
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 1/10 checks"),
+        "{last}"
+    );
+    assert!(last.contains("is not 1111's patch"), "{last}");
+    assert_eq!(
+        (w.count("carry"), w.count("verify-line")),
+        (1, 1),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        (w.count("stage"), w.count("stage --dry-run")),
+        (0, 0),
+        "{:?}",
+        w.calls
+    );
+}
+
+/// A real cut's red reaches its repair worker once, at the failure exit: one worker opens per
+/// failing input hash, told the step's log and the cut's inputs, its sid kept in the clone's
+/// repair record, and the cut still ends with its own refusal. NEGATIVE CONTROLS: a dry run's
+/// red, a COULD NOT RUN and an operational refusal open none; outside an aterm session the
+/// command is printed and nothing opens.
+#[test]
+fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+        "{last}"
+    );
+    assert_eq!(w.repairs.asked.len(), 1, "the failure exit reaches it once");
+    let failure = w.repairs.asked[0].clone();
+    let r = w.journal().expect("journaled").commit;
+    let log = Backend::log_path(&mut w, Step::Qualify);
+    // An exit 1 that named no FAIL is the run-level check's FAIL, the check the gate names.
+    let gate = format!("verify release: {}", crate::check_record::RUN_LEVEL);
+    assert_eq!(
+        (
+            failure.gate.as_str(),
+            failure.step.as_str(),
+            failure.version.as_str(),
+            failure.commit.as_str()
+        ),
+        (gate.as_str(), "4/10 qualify", "0.6.0", r.as_str())
+    );
+    assert_eq!(failure.log, log);
+    assert_eq!(failure.trustc, prover().commit);
+    assert_eq!(w.repairs.spawned.len(), 1, "one worker");
+    let (cwd, task) = &w.repairs.spawned[0];
+    assert_eq!(cwd, w.dir.path(), "it starts in the release clone");
+    assert!(
+        task.contains(&log.display().to_string()) && task.contains(&r),
+        "{task}"
+    );
+    let record = w.release_dir().join(aterm_release::repair::RECORD_FILE);
+    let kept = aterm_release::repair::Record::load(&record).expect("the record");
+    assert_eq!(
+        kept.workers
+            .iter()
+            .map(|k| k.sid.as_str())
+            .collect::<Vec<_>>(),
+        ["s-repair1"]
+    );
+    let said = w
+        .out
+        .iter()
+        .position(|line| line.starts_with("repair: opened worker s-repair1"))
+        .expect("the cut says it");
+    assert_eq!(
+        w.out.last(),
+        Some(&last),
+        "the refusal is still the final line"
+    );
+    assert!(said < w.out.len() - 1);
+
+    // The same red again: the record names the worker, and none opens.
+    let (code, again) = w.run(mac());
+    assert!(
+        code == 1 && again.starts_with("REFUSED at 4/10 qualify"),
+        "{again}"
+    );
+    assert_eq!(w.repairs.asked.len(), 2);
+    assert_eq!(w.repairs.spawned.len(), 1, "once per failing input hash");
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.starts_with("repair: worker s-repair1 was opened on these inputs")),
+        "{:#?}",
+        w.out
+    );
+
+    // A gate's red at step 1 opens one too, naming the gate; its dry run opens none.
+    let mut gated = World::new();
+    gated.blocks = vec![
+        Refusal::new(
+            "handoff fixtures — the handoff fixtures of v0.5.0 are not checked in",
+            "generate them at tag v0.5.0",
+        )
+        .failing("handoff fixtures"),
+    ];
+    let (code, dry) = gated.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert!(code == 1 && dry.starts_with("DRY RUN"), "{dry}");
+    assert!(gated.repairs.asked.is_empty(), "a dry run opens nothing");
+    let (code, last) = gated.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 1/10 checks"),
+        "{last}"
+    );
+    assert_eq!(
+        gated
+            .repairs
+            .asked
+            .iter()
+            .map(|f| f.gate.as_str())
+            .collect::<Vec<_>>(),
+        ["the preflight's gates: handoff fixtures"]
+    );
+    assert_eq!(gated.repairs.spawned.len(), 1);
+
+    // A preflight finding that judged nothing of R's source (origin unread, the publication
+    // engine's readiness) opens none and leaves the input hash's one worker to R's own red on the
+    // same inputs. NEGATIVE CONTROL: a source gate's red at step 1 on those inputs takes it.
+    for source_red in [false, true] {
         let mut w = World::new();
         w.versions.insert(TIP.into(), "0.6.0".into());
-        w.verify_code = 1;
-        w.verify_passes = false;
-        let start = ReleaseOptions {
-            qualify,
-            commit: Some(TIP.into()),
-            ..mac()
+        w.blocks = if source_red {
+            vec![Refusal::new("changelog — no entry for 0.6.0", "add it").failing("changelog")]
+        } else {
+            vec![
+                Refusal::new(
+                    "changelog — cannot list origin's tags: Could not resolve host: github.com",
+                    "run it again",
+                )
+                .could_not_run(),
+                Refusal::new(
+                    "the publication engine's main has no pre-promote seam",
+                    "name a publication engine whose main carries the seam with --engine",
+                ),
+            ]
         };
-        let _ = w.run(start);
-        w.history.push(FIX.into());
-        w.versions.insert(FIX.into(), "0.6.0".into());
-        w.line_verify = Err(Refusal::new(
-            "hop 1's tree is not 1111's patch onto the previous head",
-            "drop the line",
-        ));
-        w.calls.clear();
-        let (code, last) = w.run(ReleaseOptions {
-            qualify,
-            fix: vec![FIX.into()],
-            ..mac()
-        });
+        let (code, last) = w.run(mac());
         assert!(
             code == 1 && last.starts_with("REFUSED at 1/10 checks"),
-            "qualify {qualify}: {last}"
+            "{last}"
         );
-        assert!(last.contains("is not 1111's patch"), "{last}");
-        assert_eq!(
-            (w.count("carry"), w.count("verify-line")),
-            (1, 1),
-            "{:?}",
-            w.calls
+        assert_eq!(w.repairs.spawned.len(), usize::from(source_red), "{last}");
+        w.blocks.clear();
+        w.verify_code = 1;
+        w.verify_passes = false;
+        let (code, last) = w.run(mac());
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+            "{last}"
         );
+        assert_eq!(w.repairs.asked.len(), 1 + usize::from(source_red));
         assert_eq!(
-            (w.count("stage"), w.count("stage --dry-run")),
-            (0, 0),
-            "qualify {qualify}: {:?}",
-            w.calls
+            w.repairs.spawned.len(),
+            1,
+            "one worker on these inputs, opened by the first red of R's source"
         );
     }
+
+    // Every red the cut names reaches it: a red build branch, the release input's red, and a
+    // `verify release` exit 1 whose FAIL record does not read.
+    let gates = |w: &World| {
+        w.repairs
+            .asked
+            .iter()
+            .map(|f| f.gate.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut built = World::new();
+    built.build_claims_late = true;
+    let (code, last) = built.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+        "{last}"
+    );
+    assert_eq!(gates(&built), ["qualify's build branch"]);
+    let mut input = World::new();
+    input.versions.insert(TIP.into(), "0.6.0".into());
+    input.input_finding = Some(InputFinding::Failed(
+        "export-scan: planted forbidden content".into(),
+    ));
+    let (code, last) = input.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert_eq!(gates(&input), ["verify release-input"]);
+    let mut unread = World::new();
+    // Step 5's bundle half, not AppKit's run of that half at the front of step 4.
+    unread.verify_half = Some(Half::Bundle);
+    unread.verify_step = Some(Step::Bundle);
+    unread.verify_code = 1;
+    unread.verify_passes = false;
+    unread.after_verify = Some(|w| {
+        w.records
+            .retain(|(_, _, check), _| check != crate::check_record::RUN_LEVEL);
+    });
+    let (code, last) = unread.run(bump());
+    assert!(
+        code == 1 && last.contains("no FAIL record of it reads"),
+        "{last}"
+    );
+    assert_eq!(gates(&unread), ["verify release"]);
+
+    // A COULD NOT RUN and an operational refusal decide nothing of R's code.
+    let mut unrun = World::new();
+    unrun.verify_code = 3;
+    unrun.verify_passes = false;
+    assert_eq!(unrun.run(bump()).0, 3);
+    let mut off_main = World::new();
+    off_main.on_main = false;
+    let (code, last) = off_main.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 1/10 checks"),
+        "{last}"
+    );
+    for world in [&unrun, &off_main] {
+        assert!(world.repairs.asked.is_empty(), "{:?}", world.repairs.asked);
+    }
+
+    // Outside an aterm session the red prints the command, and nothing opens.
+    let mut outside = World::new();
+    outside.repairs.outside = true;
+    outside.verify_code = 1;
+    outside.verify_passes = false;
+    assert_eq!(outside.run(bump()).0, 1);
+    assert!(outside.repairs.spawned.is_empty());
+    assert!(
+        outside
+            .out
+            .iter()
+            .any(|line| line.starts_with("aterm ctl @self spawn agent=claude ")),
+        "{:#?}",
+        outside.out
+    );
+    assert!(
+        !outside
+            .release_dir()
+            .join(aterm_release::repair::RECORD_FILE)
+            .exists()
+    );
 }
 
 /// A line started by `--bump` whose `verify release` went red, then FIX landed on main and
 /// `verify release` turns green.
 fn red_line() -> World {
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_code = 1;
     w.verify_passes = false;
     let (code, last) = w.run(bump());
@@ -5717,6 +7686,88 @@ fn a_refused_pending_hop_is_carried_with_the_next_and_both_are_recorded() {
     assert!(!w.unrecorded_hops.contains(&hop_of(FIX2)));
 }
 
+/// A CLONE LEFT AT ITS DURABLE PENDING HEAD IS NO OWNER'S UNPUSHED WORK. An interrupt after
+/// `--fix` moved main to the private hop leaves main there with candidate.toml pending; a dry
+/// `--fix` of the next fix plans the line onward from it and goes ahead, as the real run then
+/// does, while a private commit that is no hop of the line still refuses.
+/// NEGATIVE CONTROL: checks() knew only the in-memory journal's own head, which the dry plan
+/// had replaced with the planned head, so it refused "this clone's main has commits
+/// origin/main does not" and told the operator to push a private hop to main.
+#[test]
+fn a_dry_fix_from_the_durable_pending_head_plans_the_line_onward() {
+    let interrupted = || {
+        let mut w = red_line();
+        let recorded = w.journal().unwrap();
+        w.signal_at = Some("move");
+        let (code, last) = w.run(fix(&[FIX]));
+        assert_eq!(code, 130, "{last}");
+        assert_eq!(
+            w.head,
+            hop_of(FIX),
+            "the interrupt leaves main at the private hop"
+        );
+        let pending = Journal::load(&w.release_dir().join(SELECTION_FILE))
+            .unwrap()
+            .expect("candidate.toml stays pending");
+        assert!(pending.has("locally-carried-line"));
+        assert_eq!(pending.commit, hop_of(FIX));
+        w.signal = None;
+        w.signal_at = None;
+        w.history.push(FIX2.into());
+        w.versions.insert(FIX2.into(), recorded.version.clone());
+        w.existing_fleet_line = Some(recorded.line());
+        w
+    };
+    let mut w = interrupted();
+    let selection = std::fs::read(w.release_dir().join(SELECTION_FILE)).unwrap();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..fix(&[FIX2])
+    });
+    assert!(
+        !w.out
+            .iter()
+            .any(|l| l.contains("has commits origin/main does not")),
+        "{last}\n{:#?}",
+        w.out
+    );
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.head, hop_of(FIX), "a dry run moves nothing");
+    assert_eq!(
+        std::fs::read(w.release_dir().join(SELECTION_FILE)).unwrap(),
+        selection
+    );
+    let (code, last) = w.run(fix(&[FIX2]));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        w.recorded_lines
+            .last()
+            .unwrap()
+            .hops
+            .iter()
+            .map(|hop| hop.carries.as_str())
+            .collect::<Vec<_>>(),
+        [FIX, FIX2]
+    );
+
+    // Control: a private commit that is no hop of this clone's line still refuses.
+    let mut w = interrupted();
+    w.head = N3.into();
+    w.unrecorded_hops.insert(N3.into());
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..fix(&[FIX2])
+    });
+    assert_eq!(code, 1, "{last}");
+    assert!(
+        w.out
+            .iter()
+            .any(|l| l.contains("has commits origin/main does not")),
+        "{:#?}",
+        w.out
+    );
+}
+
 /// A refusal in the frozen head's pre-step preview restores the checkout without erasing the
 /// only exact retry. NEGATIVE CONTROL: omit refusal settlement and main remains at the private
 /// hop; erase candidate.toml and the retry cannot distinguish it from a lost record.
@@ -6407,6 +8458,504 @@ fn a_source_refusal_and_a_claim_both_keep_the_private_draft_for_recovery() {
     assert!(!draft.fake.seen().iter().any(|r| r.method == "DELETE"));
 }
 
+/// A RESERVATION THE RELEASE DROPS TAKES ITS PRIVATE DRAFT WITH IT: run 1 signs build N into a
+/// private draft and refuses before the claim (the source red keeps the draft). Then another
+/// release claims N, or the operator forgets the journal: the re-reservation (or `--forget`)
+/// withdraws N's draft while release.toml still reserves N, and the next run drafts, attests and
+/// claims N' alone. A withdrawal a retry may finish (GitHub's release reads fail) is COULD NOT
+/// RUN and drops nothing. NEGATIVE CONTROL: step 4 journaled N' (and `--forget` deleted
+/// release.toml) first, so authority refused every discard of N's draft and each later
+/// `cut --sign` refused to adopt it, a release blocked with no remedy.
+#[test]
+fn a_dropped_reservation_withdraws_its_private_draft_before_the_next_sign() {
+    let forget_journal = || ReleaseOptions {
+        forget: true,
+        ..mac()
+    };
+    for forget in [false, true] {
+        let (mut w, old) = drafted_and_refused();
+        let draft = w.private_draft.as_ref().unwrap();
+        let (id, slug) = (draft.ctx.release_id.unwrap(), draft.ctx.slug.clone());
+        assert!(draft.fake.release_state(id).unwrap().0.draft);
+        draft.fake.fault_always(
+            agh_fake::Match::api(&format!("/repos/{slug}/releases")).method("GET"),
+            agh_fake::Fault::Status {
+                status: 502,
+                body: "bad gateway".into(),
+                headers: Vec::new(),
+            },
+        );
+        let journals = release_journals(&w);
+        let (code, last) = if forget {
+            w.run(forget_journal())
+        } else {
+            // Another release claims build N before the re-run.
+            w.tail = old.build;
+            w.run(mac())
+        };
+        assert_eq!(code, 3, "{forget}: {last}");
+        let refused = format!(
+            "what step 7 signed privately under build {} could not be withdrawn",
+            old.build
+        );
+        assert!(
+            last.contains("COULD NOT RUN") && last.contains(&refused) && last.contains("502"),
+            "{forget}: {last}"
+        );
+        assert_eq!(release_journals(&w), journals, "{forget}");
+        assert_eq!(w.count("reserve"), 1, "{forget}: nothing reserved anew");
+        let draft = w.private_draft.as_ref().unwrap();
+        assert!(draft.fake.release_state(id).is_some() && draft.ctx.journal_path.exists());
+
+        let (mut w, old) = drafted_and_refused();
+        let draft = w.private_draft.as_ref().unwrap();
+        let (id, slug) = (draft.ctx.release_id.unwrap(), draft.ctx.slug.clone());
+        if forget {
+            let (code, last) = w.run(forget_journal());
+            assert_eq!(code, 0, "{last}");
+            assert!(w.journal().is_none());
+            assert!(
+                last.contains(&format!(
+                    "nothing signed privately under build {} remains",
+                    old.build
+                )),
+                "{last}"
+            );
+        }
+        w.tail = old.build;
+        w.publish_code = 0;
+        w.calls.clear();
+        let (code, last) = w.run(mac());
+        assert_eq!(code, 0, "{forget}: {last}\n{:?}\n{:#?}", w.calls, w.out);
+        let fresh = w.journal().unwrap().reserved.unwrap();
+        assert!(fresh.build > old.build, "{forget}");
+
+        let [withdrawn] = &w.withdrawn_drafts[..] else {
+            panic!("{forget}: N's draft withdrawn once: {:?}", w.calls);
+        };
+        assert!(withdrawn.fake.release_state(id).is_none(), "{forget}");
+        assert!(!withdrawn.ctx.journal_path.exists(), "{forget}");
+        let deletes: Vec<_> = withdrawn
+            .fake
+            .seen()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.path_and_query)
+            .collect();
+        assert_eq!(
+            deletes,
+            [format!("/repos/{slug}/releases/{id}")],
+            "{forget}"
+        );
+        withdrawn.fake.assert_clean();
+        if !forget {
+            let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+            assert!(
+                at(&format!("discard-signed 0.6.0 {}", old.build)) < at("reserve"),
+                "the draft leaves while its reservation stands: {:?}",
+                w.calls
+            );
+        }
+
+        let draft = w.private_draft.as_ref().unwrap();
+        assert_eq!(draft.ctx.build, fresh.build, "{forget}");
+        let state = draft
+            .fake
+            .release_state(draft.ctx.release_id.unwrap())
+            .unwrap();
+        for name in crate::channel::SOURCE_ATTESTATION_ASSETS {
+            assert!(
+                state.1.iter().any(|(asset, _)| asset == name),
+                "{forget}: {name}"
+            );
+        }
+        assert!(
+            w.cut
+                .as_ref()
+                .is_some_and(|cut| cut.finished && cut.build == fresh.build),
+            "{forget}"
+        );
+    }
+}
+
+/// The bytes of the clone's two release journals, to show a refusal left them as they were.
+fn release_journals(w: &World) -> [Option<Vec<u8>>; 2] {
+    [JOURNAL_FILE, SELECTION_FILE].map(|name| std::fs::read(w.release_dir().join(name)).ok())
+}
+
+/// Run 1 of build N: it signs a private draft and refuses before the claim, so the reservation
+/// and its draft stay for the next run.
+fn drafted_and_refused() -> (World, Reservation) {
+    let mut w = World::new();
+    w.sides = SideOrder::SignFirst;
+    w.stage_private_draft = true;
+    w.publish_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    let old = w.journal().unwrap().reserved.unwrap();
+    assert_eq!(w.private_draft.as_ref().unwrap().ctx.build, old.build);
+    (w, old)
+}
+
+/// A WITHDRAWAL NO RETRY CAN FINISH REFUSES AND NAMES THE WAY OUT: run 1's sign issued its
+/// draft's create POST, the answer was lost and nothing is under the tag, so whether that POST
+/// made a draft is undecided. `--forget`, and the re-reservation once another release claims
+/// build N, refuse (exit 1) with both journals and the reservation as they were, and name what a
+/// person does: once the releases page shows no release for the tag, remove the draft journal
+/// and its receipt. Done, the same command finishes. NEGATIVE CONTROL: both were COULD NOT RUN
+/// (exit 3) for good, quoting "retain the journal for digest adoption on resume", so `--forget`,
+/// the remedy every refusal names, looped with no way out.
+#[test]
+fn a_withdrawal_no_retry_can_finish_refuses_and_names_the_way_out() {
+    for forget in [false, true] {
+        let (mut w, old) = drafted_and_refused();
+        let draft = w.private_draft.as_ref().unwrap();
+        let (id, journal_path) = (
+            draft.ctx.release_id.unwrap(),
+            draft.ctx.journal_path.clone(),
+        );
+        let receipt = draft.ctx.dist.join("draft-bytes.toml");
+        let mut journal = crate::publish::Journal::load(&journal_path)
+            .unwrap()
+            .unwrap();
+        journal.release_id = None;
+        journal.upload_intents.clear();
+        assert!(journal.release_intent);
+        journal.save(&journal_path).unwrap();
+        draft
+            .fake
+            .apply(agh_fake::Change::DeleteRelease { release_id: id });
+        let journals = release_journals(&w);
+
+        let (code, last) = if forget {
+            w.run(ReleaseOptions {
+                forget: true,
+                ..mac()
+            })
+        } else {
+            w.tail = old.build;
+            w.run(mac())
+        };
+        assert_eq!(code, 1, "{forget}: {last}");
+        for words in [
+            &format!("build {}", old.build),
+            "undecided",
+            "releases page",
+            "remove dist/draft-state.toml and dist/draft-bytes.toml",
+        ] {
+            assert!(last.contains(words), "{forget}: {words}: {last}");
+        }
+        assert!(!last.contains("retain the journal"), "{forget}: {last}");
+        assert_eq!(release_journals(&w), journals, "{forget}");
+        assert_eq!(w.count("reserve"), 1, "{forget}: nothing reserved anew");
+        assert!(journal_path.exists() && receipt.exists(), "{forget}");
+
+        // The person found no release for the tag on the releases page.
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::remove_file(&receipt).unwrap();
+        if forget {
+            let (code, last) = w.run(ReleaseOptions {
+                forget: true,
+                ..mac()
+            });
+            assert_eq!(code, 0, "{last}");
+            assert!(w.journal().is_none());
+        }
+        w.tail = old.build;
+        w.publish_code = 0;
+        let (code, last) = w.run(mac());
+        assert_eq!(code, 0, "{forget}: {last}\n{:?}", w.calls);
+        assert!(w.journal().unwrap().reserved.unwrap().build > old.build);
+        assert!(w.cut.as_ref().is_some_and(|cut| cut.finished), "{forget}");
+    }
+}
+
+/// A NEW HEAD TAKES THE DROPPED RESERVATION'S PRIVATE DRAFT WITH IT: run 1's sign makes build
+/// N's private draft and then refuses at step 7, before the source's push; `--fix` carries a landed fix onto a new head whose journal
+/// reserves nothing. Step 3 withdraws N's draft before that journal replaces release.toml, and
+/// the fix's run drafts, attests and claims its own reservation. NEGATIVE CONTROL: release.toml
+/// was replaced with nothing withdrawn, so the fix's `cut --sign` met N's draft journal and
+/// refused to adopt it, and only a person's DELETE and two file removals could clear it.
+#[test]
+fn a_fix_withdraws_the_private_draft_of_the_reservation_it_drops() {
+    let mut w = World::new();
+    w.sides = SideOrder::SignFirst;
+    w.stage_private_draft = true;
+    w.draft_then_red = true;
+    let (code, last) = w.run(bump());
+    assert!(code == 1 && last.contains("nothing public"), "{last}");
+    let old = w.journal().unwrap().reserved.unwrap();
+    let id = w.private_draft.as_ref().unwrap().ctx.release_id.unwrap();
+    for moved in [NEXT, N2, N3, FIX] {
+        w.history.push(moved.into());
+        w.versions.insert(moved.into(), "0.6.0".into());
+    }
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:?}", w.calls);
+    let [withdrawn] = &w.withdrawn_drafts[..] else {
+        panic!("N's draft withdrawn once: {:?}", w.calls);
+    };
+    assert_eq!(withdrawn.ctx.build, old.build);
+    assert!(withdrawn.fake.release_state(id).is_none());
+    assert!(!withdrawn.ctx.journal_path.exists());
+    let fresh = w.journal().unwrap().reserved.unwrap();
+    assert_ne!(fresh.commit, old.commit, "the fix's own reservation");
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert!(
+        at(&format!("discard-signed 0.6.0 {}", old.build)) < at("reserve"),
+        "{:?}",
+        w.calls
+    );
+    let draft = w.private_draft.as_ref().unwrap();
+    assert_eq!(draft.ctx.commit, fresh.commit);
+    assert!(
+        w.cut
+            .as_ref()
+            .is_some_and(|cut| cut.finished && cut.build == fresh.build)
+    );
+}
+
+/// A CLAIM THAT LANDED WITH NO CUT JOURNAL IS SPENT, SO ITS PRIVATE DRAFT IS WITHDRAWN: run 1
+/// signs build N into a private draft, its claim pushes, and the cut stops before journaling it
+/// (Spent::words: "build N is spent, a gap in the ledger"). No `cut --resume` and no `recover`
+/// can use build N, so the next run's re-reservation withdraws N's draft while release.toml still
+/// reserves N, before it reserves N', then drafts, attests and claims N' alone; `--forget`
+/// withdraws it the same way. Step 4's spent line says nothing was published under N, never that
+/// nothing was signed under it. NEGATIVE CONTROL: withdraw_signed kept the draft of any
+/// reservation whose commit origin/main holds, so step 4 withdrew nothing, rebuilt N', and step
+/// 7's sign refused to adopt N's draft, naming a DELETE by hand; `--forget` said the claim keeps
+/// a draft no claim can use; and the spent line said "nothing was signed or published under it"
+/// just before the withdrawal of the draft step 7 signed under it.
+#[test]
+fn a_claim_that_landed_with_no_cut_journal_withdraws_its_private_draft() {
+    for forget in [false, true] {
+        let mut w = World::new();
+        w.sides = SideOrder::SignFirst;
+        w.stage_private_draft = true;
+        w.claim_lands_unjournaled = true;
+        let (code, last) = w.run(bump());
+        assert_eq!(code, 1, "{forget}: {last}");
+        assert!(last.starts_with("REFUSED at 8/10 cut"), "{forget}: {last}");
+        assert!(w.cut.is_none(), "{forget}: no cut journal");
+        let old = w.journal().unwrap().reserved.unwrap();
+        let draft = w.private_draft.as_ref().unwrap();
+        assert_eq!(draft.ctx.build, old.build, "{forget}");
+        let (id, slug) = (draft.ctx.release_id.unwrap(), draft.ctx.slug.clone());
+        assert!(draft.fake.release_state(id).unwrap().0.draft, "{forget}");
+
+        w.calls.clear();
+        let (code, last) = if forget {
+            w.run(ReleaseOptions {
+                forget: true,
+                ..mac()
+            })
+        } else {
+            w.run(mac())
+        };
+        assert_eq!(code, 0, "{forget}: {last}\n{:?}", w.calls);
+        let [withdrawn] = &w.withdrawn_drafts[..] else {
+            panic!("{forget}: N's draft withdrawn once: {:?}", w.calls);
+        };
+        assert!(withdrawn.fake.release_state(id).is_none(), "{forget}");
+        assert!(!withdrawn.ctx.journal_path.exists(), "{forget}");
+        let deletes: Vec<_> = withdrawn
+            .fake
+            .seen()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.path_and_query)
+            .collect();
+        assert_eq!(
+            deletes,
+            [format!("/repos/{slug}/releases/{id}")],
+            "{forget}"
+        );
+        if forget {
+            assert!(w.journal().is_none());
+            assert!(
+                last.contains(&format!(
+                    "nothing signed privately under build {} remains",
+                    old.build
+                )),
+                "{last}"
+            );
+            continue;
+        }
+        let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+        assert!(
+            at(&format!("discard-signed 0.6.0 {}", old.build)) < at("reserve"),
+            "the draft leaves while its reservation stands: {:?}",
+            w.calls
+        );
+        // Step 4 says what is spent, then withdraws what step 7 signed under it: it never says
+        // nothing was signed under the build whose signed draft it withdraws.
+        let said = w.out.join("\n");
+        assert!(
+            said.contains("CLAIMED from this clone")
+                && said.contains("nothing was published under it")
+                && said.contains(&format!(
+                    "nothing signed privately under build {} remains",
+                    old.build
+                )),
+            "{said}"
+        );
+        assert!(!said.contains("nothing was signed"), "{said}");
+        let fresh = w.journal().unwrap().reserved.unwrap();
+        assert!(fresh.build > old.build);
+        assert_eq!(w.private_draft.as_ref().unwrap().ctx.build, fresh.build);
+        assert!(
+            w.cut
+                .as_ref()
+                .is_some_and(|cut| cut.finished && cut.build == fresh.build)
+        );
+    }
+}
+
+/// A CUT JOURNAL THAT CANNOT BE READ MAY BE THE CLAIM, SO NOTHING IS WITHDRAWN: its read fails
+/// (a retry may get through), and `--forget` and a spent reservation's re-reservation are COULD
+/// NOT RUN with the private draft, its journal and both release journals in place.
+/// NEGATIVE CONTROL: an unreadable `dist/cut-state.toml` read as no claim, and the withdrawal
+/// deleted the draft a claim may own.
+#[test]
+fn an_unreadable_cut_journal_withdraws_nothing() {
+    for forget in [false, true] {
+        let (mut w, old) = drafted_and_refused();
+        let draft = w.private_draft.as_ref().unwrap();
+        let id = draft.ctx.release_id.unwrap();
+        let journal_path = draft.ctx.journal_path.clone();
+        let journals = release_journals(&w);
+        w.cut_unreadable = Some(CutJournalUnread::Read(
+            "read dist/cut-state.toml: Permission denied (os error 13)".into(),
+        ));
+        let (code, last) = if forget {
+            w.run(ReleaseOptions {
+                forget: true,
+                ..mac()
+            })
+        } else {
+            w.tail = old.build;
+            w.run(mac())
+        };
+        assert_eq!(code, 3, "{forget}: {last}");
+        assert!(
+            last.contains("COULD NOT RUN")
+                && last.contains("cut journal cannot be read")
+                && last.contains("make dist/cut-state.toml readable again"),
+            "{forget}: {last}"
+        );
+        assert_eq!(release_journals(&w), journals, "{forget}");
+        let draft = w.private_draft.as_ref().unwrap();
+        assert!(draft.fake.release_state(id).is_some(), "{forget}");
+        assert!(journal_path.exists(), "{forget}");
+        assert!(!draft.fake.seen().iter().any(|r| r.method == "DELETE"));
+    }
+}
+
+/// A CUT JOURNAL THAT DOES NOT PARSE IS DECIDED, AND THE REFUSAL NAMES THE WAY OUT: every retry
+/// reads the same file, so `--forget` and a spent reservation's re-reservation refuse (exit 1),
+/// withdrawing nothing, and name what a person does: move the file out of `dist/` (no tool reads
+/// it) and, where origin's release lease names a claim of this clone, withdraw its draft with
+/// `--forget` before `ship recover … --no-draft-was-posted` frees the lease, since recover with
+/// no cut journal refuses a draft carrying step 7's source pair
+/// (publish::draft::tests::recover_without_a_journal_refuses_a_draft_carrying_the_source_pair).
+/// Done, the same command finishes. Nothing signed under the reservation decides the same, since
+/// every later sign and cut refuses that file too. NEGATIVE CONTROL: both were COULD NOT RUN
+/// (exit 3) on every retry, the loop an autopilot never leaves, told to "restore
+/// dist/cut-state.toml", which no tool does; then the way out said recover "finishes or
+/// withdraws" the cut without the journal, where it refuses the draft and keeps the lease.
+#[test]
+fn a_cut_journal_that_does_not_parse_refuses_decided_and_names_the_way_out() {
+    for forget in [false, true] {
+        let (mut w, old) = drafted_and_refused();
+        let draft = w.private_draft.as_ref().unwrap();
+        let id = draft.ctx.release_id.unwrap();
+        let journal_path = draft.ctx.journal_path.clone();
+        let journals = release_journals(&w);
+        w.cut_unreadable = Some(not_a_cut_journal());
+        if !forget {
+            w.tail = old.build;
+        }
+        let rerun = |w: &mut World| {
+            if forget {
+                w.run(ReleaseOptions {
+                    forget: true,
+                    ..mac()
+                })
+            } else {
+                w.run(mac())
+            }
+        };
+        let (code, last) = rerun(&mut w);
+        assert_eq!(code, 1, "{forget}: {last}");
+        assert!(!last.contains("COULD NOT RUN"), "{forget}: {last}");
+        assert!(
+            !last.contains("restore dist/cut-state.toml"),
+            "{forget}: {last}"
+        );
+        for words in [
+            "dist/cut-state.toml",
+            "ship recover v0.6.0",
+            "--old-publisher-stopped",
+            &format!("build {}", old.build),
+            // Without a cut journal, recover refuses the claim's draft once it carries step 7's
+            // source pair, so the way out withdraws that draft first and then frees the lease.
+            "ship release --forget",
+            "SHA256SUMS",
+            "--no-draft-was-posted",
+        ] {
+            assert!(last.contains(words), "{forget}: {words}: {last}");
+        }
+        assert!(!last.contains("finishes or withdraws"), "{forget}: {last}");
+        assert_eq!(release_journals(&w), journals, "{forget}");
+        let draft = w.private_draft.as_ref().unwrap();
+        assert!(draft.fake.release_state(id).is_some(), "{forget}");
+        assert!(journal_path.exists(), "{forget}");
+        // A retry decides the same.
+        let (again, said) = rerun(&mut w);
+        assert_eq!((again, &said), (1, &last), "{forget}");
+
+        // The person moved the file aside; origin's lease names no claim of this clone.
+        w.cut_unreadable = None;
+        if forget {
+            let (code, last) = rerun(&mut w);
+            assert_eq!(code, 0, "{last}");
+            assert!(w.journal().is_none());
+            w.tail = old.build;
+        }
+        w.publish_code = 0;
+        let (code, last) = w.run(mac());
+        assert_eq!(code, 0, "{forget}: {last}\n{:?}", w.calls);
+        assert!(w.journal().unwrap().reserved.unwrap().build > old.build);
+        let [withdrawn] = &w.withdrawn_drafts[..] else {
+            panic!("{forget}: N's draft withdrawn once: {:?}", w.calls);
+        };
+        assert!(withdrawn.fake.release_state(id).is_none(), "{forget}");
+    }
+
+    // Nothing signed under the reservation: decided all the same.
+    let mut w = World::new();
+    w.publish_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.journal().unwrap().reserved.is_some());
+    w.cut_unreadable = Some(not_a_cut_journal());
+    let (code, last) = w.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("ship recover"), "{last}");
+}
+
+/// A `dist/cut-state.toml` that does not parse, as Real reads it.
+fn not_a_cut_journal() -> CutJournalUnread {
+    CutJournalUnread::Invalid("parse dist/cut-state.toml: expected `=`".into())
+}
+
 /// NEGATIVE CONTROL: the unconditional exit cleanup deletes the signed source
 /// pair and draft journal on the first unavailable step-7 read.
 #[test]
@@ -6490,19 +9039,83 @@ fn a_sign_red_before_the_push_stops_the_source_and_nothing_is_public() {
     assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
 }
 
+/// THE SOURCE CANNOT PASS AHEAD OF THE DRAFT IT AWAITS: with no private draft journaled, the
+/// engine's cutter_draft holds `pub publish` after its push until the sign journals one, and
+/// dies once the sign ends without one. In the default order (the source first) the sign then
+/// refuses before its draft: the source ends red too, its push begun, nothing claimed.
+/// NEGATIVE CONTROL: the World's source ended exit 0 before the sign, awaiting the draft, so a
+/// source the engine would turn red passed.
+#[test]
+fn the_source_cannot_pass_ahead_of_the_draft_it_awaits() {
+    let mut w = World::new();
+    assert_eq!(w.sides, SideOrder::SourceFirst);
+    w.stage_private_draft = true;
+    w.sign_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 7/10 publish"), "{last}");
+    assert_eq!(side_phases(&w, "source"), ["started", "push-began", "red"]);
+    assert!(w.private_draft.is_none() && w.cut.is_none());
+}
+
+/// A SOURCE SIGNING THAT EXITS 0 AND ATTACHES NOTHING CLAIMS NOTHING: `pub publish` exits 0, R
+/// recorded, yet the private draft still lacks the pair, so step 7 refuses (exit 1) with nothing
+/// claimed. The re-run signs alone and runs `pub sign-release --keep-draft`; when that also exits
+/// 0 having attached nothing it refuses again, and once it attaches the pair the claim follows.
+/// NEGATIVE CONTROL: source_verdict and attest trusted the exit 0, so the claim ran on a draft
+/// that held no source attestation.
+#[test]
+fn a_source_signing_that_attaches_nothing_claims_nothing() {
+    let mut w = World::new();
+    w.sides = SideOrder::SignFirst;
+    w.stage_private_draft = true;
+    w.signing_attaches_nothing = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("pub publish exited 0, and R's source attestation still waits"),
+        "{last}"
+    );
+    assert!(w.published.contains_key(BUMP) && w.cut.is_none(), "{last}");
+
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("the source signing passed and R's source attestation still waits"),
+        "{last}"
+    );
+    assert_eq!(
+        (w.count("publish"), w.count("attest-draft")),
+        (0, 1),
+        "{:?}",
+        w.calls
+    );
+    assert!(w.cut.is_none(), "{last}");
+
+    w.signing_attaches_nothing = false;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("attest-draft"), 1, "{:?}", w.calls);
+    assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
+}
+
+/// NEGATIVE CONTROL: the resume read R's release by tag (no draft id journaled), GitHub
+/// answered 404, and every run ended COULD NOT RUN at 7/10 before the sign that makes the draft.
 #[test]
 fn a_sign_red_after_the_push_leaves_the_source_public_ahead_of_its_binary() {
     let mut w = World::new();
     w.sides = SideOrder::PushThenSign;
+    w.stage_private_draft = true;
     w.sign_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(last.starts_with("REFUSED at 7/10 publish"), "{last}");
     assert!(last.contains("ahead of its binary"), "{last}");
-    assert_eq!(
-        side_phases(&w, "source"),
-        ["started", "push-began", "passed"]
-    );
+    // The engine's cutter_draft dies once the sign ended with no draft id: R recorded.
+    assert_eq!(side_phases(&w, "source"), ["started", "push-began", "red"]);
+    assert!(w.private_draft.is_none());
     assert!(
         w.out
             .iter()
@@ -6512,10 +9125,30 @@ fn a_sign_red_after_the_push_leaves_the_source_public_ahead_of_its_binary() {
     );
     assert!(w.published.contains_key(BUMP) && w.cut.is_none());
 
+    // A dry run says what step 7 would do, and runs none of it.
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        w.out.iter().any(|l| l.contains("[ 7/10] publish")
+            && l.contains("pub sign-release aterm --tag v0.6.0 --keep-draft --draft-state")),
+        "{:#?}",
+        w.out
+    );
+    assert_eq!(
+        (w.count("cut --sign"), w.count("attest-draft")),
+        (0, 0),
+        "{:?}",
+        w.calls
+    );
+
     w.sign_code = 0;
     w.calls.clear();
     let (code, last) = w.run(mac());
-    assert_eq!(code, 0, "{last}");
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(
         w.out
             .iter()
@@ -6525,7 +9158,29 @@ fn a_sign_red_after_the_push_leaves_the_source_public_ahead_of_its_binary() {
     );
     assert_eq!((w.count("publish"), w.count("cut --sign")), (0, 1));
     assert!(side_phases(&w, "source").is_empty());
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert!(
+        at("cut --sign") < at("attest-draft")
+            && at("attest-draft")
+                < w.calls
+                    .iter()
+                    .rposition(|c| c == "source-publication")
+                    .unwrap()
+            && at("attest-draft") < at("cut --mac-only"),
+        "the sign makes the draft, the attestation then lands on it, both before the claim: {:?}",
+        w.calls
+    );
+    assert_eq!(w.count("attest-draft"), 1, "{:?}", w.calls);
+    let draft = w.private_draft.as_ref().unwrap();
+    let state = draft
+        .fake
+        .release_state(draft.ctx.release_id.unwrap())
+        .unwrap();
+    for name in crate::channel::SOURCE_ATTESTATION_ASSETS {
+        assert!(state.1.iter().any(|(asset, _)| asset == name), "{name}");
+    }
     assert_eq!((w.adopted, w.resigned), (1, 0));
+    assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
 }
 
 /// A PERSON'S SIGNAL AT STEP 7 IS NO RED: a cutter the signal cut short exits 1, and the sign
@@ -6654,8 +9309,8 @@ fn early_signature_overlaps_bundle_and_a_bundle_red_discards_it() {
         w.early_overlap = true;
         if red {
             w.verify_half = Some(Half::Bundle);
-            w.verify_code = 1;
-            w.verify_passes = false;
+            w.verify_outcomes.insert("measure", "FAIL");
+            w.verify_code = 0;
         }
         let (code, last) = w.run(bump());
         assert_eq!(code, i32::from(red), "{last}");
@@ -6785,7 +9440,12 @@ fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
 #[test]
 fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     type Setup = fn(&mut World);
-    let cases: [(Setup, &str, &str); 5] = [
+    let cases: [(Setup, &str, &str); 6] = [
+        (
+            |w| w.after_appkit = Some(|w| w.signal = Some(15)),
+            "INTERRUPTED at 4/10 qualify (by SIGTERM)",
+            "disk-claim 30",
+        ),
         (
             |w| w.signal_at = Some("verify --tree"),
             "INTERRUPTED at 4/10 qualify (by SIGTERM)",
@@ -6841,6 +9501,7 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
 
         w.signal = None;
         w.signal_at = None;
+        w.after_appkit = None;
         w.own_cutter = true;
         w.calls.clear();
         let (code, last) = w.run(bump());
@@ -6946,6 +9607,153 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
         last.starts_with("INTERRUPTED at 4/10 qualify (by SIGTERM)"),
         "{last}"
     );
+}
+
+const FLEET_LOSS_PROBE: &str = "ATERM_RELEASE_FLEET_LOSS_PROBE";
+/// What the fleet claim's progress writer records when another holder adopts the line.
+pub(super) const FLEET_LOST: &str = "COULD NOT RUN: fleet line adopted by another holder";
+
+/// A LOST FLEET LINE ENDS THE RUN IN ONE LINE. Once another holder adopts the line, the next
+/// boundary ends a real run COULD NOT RUN (exit 3) with the fleet remedy, and a private head
+/// it had checked out is restored to its recorded prefix with candidate.toml kept. A step that
+/// refuses after the loss ends the same way: the loss, not the step's refusal, is the final
+/// line. The line is lost as production loses it, with the release's own `SIGTERM`, which the
+/// world catches as its signal. The world's rewind models Real's (World::own_signal): that
+/// stop leaves the restore free to run (`move`, `refused`), and a person's signal caught as
+/// well refuses it, and the final line says so (`person`). Real's rewind itself is bound by
+/// release_line's Real-backed probe, not here:
+/// a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_not. The loss
+/// is process-global, so each case runs in this test binary re-executed as a child.
+/// NEGATIVE CONTROLS: halt_if_interrupted refused through final_refusal, whose first act was
+/// halt_if_interrupted again: a real run recursed until its stack overflowed (SIGABRT, no
+/// final line, no settlement). The dry case ended normally before and after. And a model
+/// control: a world whose rewind refused under any caught signal, the line's own included
+/// (as Real's logged child did before rel-settle-own-stop), ended `move` and `refused`
+/// "restoring the release clone from its private head also failed" with main still at the
+/// carried head; that control changes the world, not production.
+#[cfg(unix)]
+#[test]
+fn a_lost_fleet_line_ends_the_run_could_not_run_and_settles_its_head() {
+    use aterm_uds::spawnfd::command;
+    if let Some(mode) = std::env::var_os(FLEET_LOSS_PROBE) {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        // SAFETY: SIG_DFL (0) for SIGTERM, which a lost line sends this probe, whatever this
+        // test binary was started with: `install` leaves an ignored one ignored.
+        unsafe {
+            signal(crate::interrupt::SIGTERM, 0);
+        }
+        crate::interrupt::install();
+        let (code, last, w) = match mode.to_str() {
+            Some(mode @ ("move" | "refused" | "person")) => {
+                let mut w = red_line();
+                w.fleet_lost_at = Some("move");
+                if mode == "refused" {
+                    w.move_refusal = Some(Refusal::new("planted move refusal", "retry"));
+                }
+                if mode == "person" {
+                    w.signal_at = Some("move");
+                }
+                let (code, last) = w.run(fix(&[FIX]));
+                (code, last, w)
+            }
+            Some(mode) => {
+                let mut w = World::new();
+                w.lose_line();
+                let (code, last) = w.run(ReleaseOptions {
+                    dry_run: mode == "dry",
+                    ..bump()
+                });
+                (code, last, w)
+            }
+            None => panic!("a probe mode"),
+        };
+        for line in &w.out {
+            println!("OUT {line}");
+        }
+        println!("LAST {last}");
+        println!("HEAD {}", w.head);
+        println!("PENDING {}", w.release_dir().join(SELECTION_FILE).exists());
+        println!("CLAIMED {}", w.release_dir().join(RUNNING_FILE).exists());
+        drop(w);
+        std::process::exit(code);
+    }
+    for mode in ["bump", "move", "refused", "person", "dry"] {
+        let mut probe = command(std::env::current_exe().unwrap());
+        probe
+            .args([
+                "--exact",
+                "release_flow::a_lost_fleet_line_ends_the_run_could_not_run_and_settles_its_head",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FLEET_LOSS_PROBE, mode);
+        // A one-minute hang detector that drains both pipes while it waits.
+        let out = aterm_uds::deadline::output_within(&mut probe, aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|e| {
+                panic!("{mode}: the release did not end after its fleet line was lost: {e}")
+            });
+        let said = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("overflowed its stack"),
+            "{mode}: {:?}\n{err}",
+            out.status
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{mode}: {:?}\n{said}\n{err}",
+            out.status
+        );
+        let field = |name: &str| {
+            said.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{mode}: no {name}line: {said}"))
+                .to_owned()
+        };
+        let last = field("LAST ");
+        assert!(
+            last.contains("fleet line adopted by another holder"),
+            "{mode}: {last}"
+        );
+        if mode == "dry" {
+            assert!(last.starts_with("DRY RUN"), "{last}");
+            continue;
+        }
+        assert!(
+            last.contains("COULD NOT RUN")
+                && last.contains("resume on the fleet line's current holder"),
+            "{mode}: {last}"
+        );
+        assert_eq!(field("CLAIMED "), "false", "{mode}: the clone claim ends");
+        if mode == "move" || mode == "refused" {
+            assert_eq!(field("HEAD "), BUMP, "the private head is restored: {said}");
+            assert_eq!(field("PENDING "), "true", "candidate.toml is kept: {said}");
+            assert!(last.contains("retains pending line"), "{last}");
+        }
+        if mode == "refused" {
+            assert!(!last.contains("planted move refusal"), "{mode}: {last}");
+        }
+        if mode == "person" {
+            assert_ne!(
+                field("HEAD "),
+                BUMP,
+                "a person's signal leaves main at the private head: {said}"
+            );
+            assert_eq!(field("PENDING "), "true", "candidate.toml is kept: {said}");
+            assert!(
+                last.contains("restoring the release clone from its private head also failed")
+                    && last.contains("main is still at"),
+                "{last}"
+            );
+            assert!(
+                said.contains("not started: the release was interrupted"),
+                "the refused restore says why: {said}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -7402,6 +10210,12 @@ fn private_qualification_preserves_a_live_publishers_lease() {
 fn private_qualification_keeps_the_verified_bundle_and_a_later_release_still_stages() {
     let mut w = World::new();
     w.versions.insert(TIP.into(), "0.6.0".into());
+    w.history.insert(1, NEXT.into());
+    w.versions.insert(NEXT.into(), "0.6.0".into());
+    let fleet = Line::start("0.6.0", NEXT, 123);
+    w.existing_fleet_line = Some(fleet.clone());
+    w.fleet_selected = Some(fleet.clone());
+    w.fleet_refusal = Some("CUTTING ELSEWHERE: the public line has a live holder".into());
     let options = ReleaseOptions {
         qualify: true,
         commit: Some(TIP.into()),
@@ -7419,10 +10233,26 @@ fn private_qualification_keeps_the_verified_bundle_and_a_later_release_still_sta
     ] {
         assert_eq!(w.count(work), 1, "{work}: {:?}", w.calls);
     }
-    for never in ["stage", "bump", "publish", "cut"] {
+    for never in [
+        "stage",
+        "bump",
+        "publish",
+        "cut",
+        "fleet-existing",
+        "fleet-select",
+        "fleet-boundary",
+        "record-line",
+    ] {
         assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
     }
     let journal = w.journal().unwrap();
+    assert_eq!(journal.commit, TIP);
+    assert_eq!(
+        journal.reserved.as_ref().unwrap().commit,
+        format!("e{}", &TIP[1..])
+    );
+    assert_eq!(w.existing_fleet_line.as_ref(), Some(&fleet));
+    assert_eq!(w.fleet_audits, 0);
     assert!(journal.has(crate::release::COMMIT_GATES));
     assert!(journal.artifact.is_some());
     assert!(journal.reserved.is_some());
@@ -7442,7 +10272,21 @@ fn private_qualification_keeps_the_verified_bundle_and_a_later_release_still_sta
     );
     assert_eq!(w.count("build"), 0, "keep the exact verified bytes");
     assert_eq!(w.verified(), 0, "reuse only a matching verification");
+    assert_eq!(w.journal().unwrap().commit, TIP);
+    for never in [
+        "fleet-existing",
+        "fleet-select",
+        "fleet-boundary",
+        "record-line",
+    ] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    assert_eq!(w.fleet_audits, 0);
 
+    // Returning to a public release still consults and claims its fleet line.
+    w.existing_fleet_line = None;
+    w.fleet_selected = None;
+    w.fleet_refusal = None;
     w.calls.clear();
     let (code, last) = w.run(ReleaseOptions {
         commit: Some(TIP.into()),
@@ -7459,6 +10303,38 @@ fn private_qualification_keeps_the_verified_bundle_and_a_later_release_still_sta
     assert!(stage < publish);
     assert_eq!(w.count("build"), 0);
     assert_eq!(w.verified(), 0);
+    assert!(w.count("fleet-existing") > 0);
+    assert!(w.count("fleet-select") > 0);
+    assert!(w.count("fleet-boundary") > 0);
+
+    // A local pending public hop is not permission for private qualification to publish it.
+    let mut pending = World::new();
+    pending.versions.insert(TIP.into(), "0.6.0".into());
+    std::fs::create_dir_all(pending.release_dir()).unwrap();
+    Journal {
+        version: "0.6.0".into(),
+        commit: TIP.into(),
+        line: Some(Line::start("0.6.0", TIP, 123)),
+        done: vec!["locally-carried-line".into()],
+        ..Journal::default()
+    }
+    .save(&pending.release_dir().join(SELECTION_FILE))
+    .unwrap();
+    let (code, _) = pending.run(ReleaseOptions {
+        qualify: true,
+        commit: Some(TIP.into()),
+        ..mac()
+    });
+    assert_ne!(code, 0);
+    for never in [
+        "fleet-existing",
+        "fleet-select",
+        "fleet-boundary",
+        "record-line",
+        "build",
+    ] {
+        assert_eq!(pending.count(never), 0, "{never}: {:?}", pending.calls);
+    }
 }
 
 /// A failed local export is a red: it stops the tree and the build running beside it (each here
@@ -7470,6 +10346,10 @@ fn private_qualification_refuses_failed_exports_and_a_dry_run_builds_nothing() {
     for dry in [false, true] {
         let mut w = World::new();
         w.versions.insert(TIP.into(), "0.6.0".into());
+        w.history.insert(1, NEXT.into());
+        w.versions.insert(NEXT.into(), "0.6.0".into());
+        w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 123));
+        w.fleet_refusal = Some("CUTTING ELSEWHERE: the public line has a live holder".into());
         w.stage_stages = false;
         w.holds = BTreeSet::from([Branch::Tree, Branch::Build]);
         let (code, last) = w.run(ReleaseOptions {
@@ -7506,13 +10386,53 @@ fn private_qualification_refuses_failed_exports_and_a_dry_run_builds_nothing() {
             );
             &[]
         };
-        for never in never
-            .iter()
-            .chain(&["verify --bundle", "stage", "publish", "cut"])
-        {
+        for never in never.iter().chain(&[
+            "verify --bundle",
+            "stage",
+            "publish",
+            "cut",
+            "fleet-existing",
+            "fleet-select",
+            "fleet-boundary",
+            "record-line",
+        ]) {
             assert_eq!(w.count(never), 0, "{dry}: {never}: {:?}", w.calls);
         }
     }
+}
+
+/// A CUT'S DEFERRED EXPORT CHECK REFUSES WITH THE CUT'S REMEDY. A cut runs `pub stage
+/// --dry-run` beside the build and tree; when it finds R unstageable, the refusal is the
+/// stage's (carry a landed fix with --fix, or a backport), not --qualify's.
+/// NEGATIVE CONTROL: the deferred export took --qualify's arm and said "private export
+/// qualification failed … fix the candidate before qualifying it again" in a normal cut, an
+/// edit an immutable line candidate cannot take, and dropped the --fix remedy.
+#[test]
+fn a_cuts_deferred_export_red_names_the_fix_remedy_not_qualify() {
+    let mut w = World::new();
+    w.stage_stages = false;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("REFUSED at 4/10 qualify: "), "{last}");
+    assert!(
+        last.contains(&format!(
+            "pub stage --dry-run found {} unstageable (exit 1)",
+            &BUMP[..9]
+        )),
+        "{last}"
+    );
+    assert!(
+        last.contains("--fix <the fix's own non-merge commit>"),
+        "{last}"
+    );
+    assert!(!last.contains("qualifying it again"), "{last}");
+    assert!(!last.contains("private export qualification"), "{last}");
+    assert_eq!(
+        ["stage --dry-run", "stage", "publish"].map(|c| w.count(c)),
+        [1, 0, 0],
+        "{:?}",
+        w.calls
+    );
 }
 
 /// The `qualify-branch` event phases `branch` said, in order.
@@ -7619,6 +10539,7 @@ fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
 #[test]
 fn a_refused_tree_leaves_nothing_staged_after_export_passes() {
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_outcomes.insert("test", "FAIL");
     w.verify_code = 1;
     w.export_pushes = true;
@@ -7711,7 +10632,7 @@ fn a_could_not_run_stops_nothing() {
 
 #[test]
 fn private_qualification_cannot_select_a_publishing_or_withdrawal_mode() {
-    for incompatible in ["--bump", "--prepare", "--forget", "--abandon"] {
+    for incompatible in ["--bump", "--prepare", "--forget", "--abandon", "--fix"] {
         let mut args = vec![
             "release".to_string(),
             "--qualify".into(),
@@ -7719,6 +10640,8 @@ fn private_qualification_cannot_select_a_publishing_or_withdrawal_mode() {
         ];
         if incompatible == "--abandon" {
             args.push("v0.6.0".into());
+        } else if incompatible == "--fix" {
+            args.push(TIP.into());
         }
         assert!(crate::cli::parse(&args).is_err(), "{args:?}");
     }
@@ -8164,17 +11087,31 @@ fn a_public_version_is_major_minor_zero() {
 
 #[test]
 fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
-    for (code, exit) in [(1, 1), (3, 3), (2, 3), (0, 3)] {
-        let mut w = World::new();
-        w.verify_code = code;
-        w.verify_passes = false;
-        let (got, last) = w.run(bump());
-        assert_eq!(got, exit, "verify exit {code}: {last}");
-        assert!(
-            last.starts_with("REFUSED at 4/10 qualify"),
-            "verify exit {code}: {last}"
-        );
-        assert_eq!(w.count("publish"), 0, "nothing public: {:?}", w.calls);
+    let runs = [
+        ("early AppKit", Half::Bundle, Step::Qualify, "4/10 qualify"),
+        ("tree", Half::Tree, Step::Qualify, "4/10 qualify"),
+        ("measure", Half::Bundle, Step::Bundle, "5/10 bundle"),
+    ];
+    for (name, half, step, at) in runs {
+        for (code, exit) in [(1, 1), (3, 3), (2, 3), (0, 3)] {
+            let mut w = World::new();
+            w.verify_half = Some(half);
+            w.verify_step = Some(step);
+            w.verify_code = code;
+            w.verify_passes = false;
+            let (got, last) = w.run(bump());
+            assert_eq!(got, exit, "{name}, verify exit {code}: {last}");
+            assert!(
+                last.starts_with(&format!("REFUSED at {at}")),
+                "{name}, verify exit {code}: {last}"
+            );
+            assert_eq!(
+                w.count("publish"),
+                0,
+                "{name}: nothing public: {:?}",
+                w.calls
+            );
+        }
     }
 }
 
@@ -8189,13 +11126,18 @@ fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
 #[test]
 fn a_fail_is_never_rerolled_into_a_pass() {
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_outcomes.insert("test", "FAIL");
     w.verify_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
     assert!(last.contains("FAILED test"), "{last}");
-    assert_eq!(w.verified(), 1);
+    assert_eq!(
+        w.verified(),
+        2,
+        "appkit passes first, then the tree run records the planted test red"
+    );
 
     // The flaky test would pass now, and the release's disk claim would be refused: the FAIL is
     // what refuses, before any room is sought.
@@ -8249,6 +11191,7 @@ fn a_fail_is_never_rerolled_into_a_pass() {
 #[test]
 fn a_fail_refuses_its_own_tree_and_a_fix_hop_is_verified_anew() {
     let mut w = World::new();
+    w.verify_half = Some(Half::Tree);
     w.verify_outcomes.insert("test", "FAIL");
     w.verify_code = 1;
     let (code, last) = w.run(bump());
@@ -8285,14 +11228,91 @@ fn a_fail_refuses_its_own_tree_and_a_fix_hop_is_verified_anew() {
     );
 }
 
-/// A staged export can precede a bundle FAIL. Supersession clears the old candidate's
-/// admission, qualifies the selected main tree, and keeps the failed tree refused.
+/// An AppKit FAIL ends a cut-shaped run in step 4 before the full release disk admission, a
+/// reservation or a release slice starts.
+/// NEGATIVE CONTROL: the former bundle-step order builds both slices before asking the same
+/// planted AppKit red, so reversing the asserted order detects the regression this test guards.
+#[test]
+fn an_appkit_red_precedes_the_slices_and_the_old_order_did_not() {
+    let mut early = World::new();
+    early.verify_outcomes.insert("appkit", "FAIL");
+    early.verify_half = Some(Half::Bundle);
+    early.verify_code = 1;
+    let (code, last) = early.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
+    assert_eq!(early.count("verify appkit"), 1, "{:?}", early.calls);
+    assert!(
+        !early
+            .calls
+            .iter()
+            .any(|call| call.starts_with("disk-claim")),
+        "AppKit is ahead of an unbounded disk wait: {:?}",
+        early.calls
+    );
+    assert_eq!(early.count("reserve"), 0, "{:?}", early.calls);
+    assert_eq!(early.count("build"), 0, "{:?}", early.calls);
+    assert_eq!(early.count("verify --tree"), 0, "{:?}", early.calls);
+    assert_eq!(early.count("stage"), 0, "{:?}", early.calls);
+    assert_eq!(early.verify_runs[0].checks, ["appkit"]);
+    assert!(
+        !early.times.contains("\tqualify-appkit\t"),
+        "a red is not historical ETA evidence: {}",
+        early.times
+    );
+
+    // Counterfactual fixture for the old step-5 order: complete the cut's reservation/build
+    // before invoking precisely the same narrowed bundle-half AppKit run.
+    let mut late = World::new();
+    late.verify_outcomes.insert("appkit", "FAIL");
+    late.verify_half = Some(Half::Bundle);
+    late.verify_code = 1;
+    let candidate = Candidate {
+        commit: BUMP.into(),
+        version: "0.7.0".into(),
+        why: "negative control".into(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let reservation = Backend::reserve(&mut late, &candidate).unwrap();
+    let built = late.build(
+        &candidate,
+        &reservation,
+        &prover(),
+        BuildWork {
+            bundle: true,
+            fixtures: false,
+        },
+    );
+    let artifact = built.artifact.unwrap().unwrap();
+    let appkit = Checks::no("negative control")
+        .run_only(Half::Bundle, &[aterm_verify::checks::Check::Appkit]);
+    late.verify_called(Step::Bundle, &appkit);
+    let ran = late
+        .verify(Step::Bundle, &candidate, &appkit, Some(&artifact))
+        .unwrap();
+    assert_eq!(ran.code, 1);
+    let build = late.calls.iter().position(|call| call == "build").unwrap();
+    let red = late
+        .calls
+        .iter()
+        .position(|call| call == "verify --bundle")
+        .unwrap();
+    assert!(
+        build < red,
+        "old order reached AppKit only after slices: {:?}",
+        late.calls
+    );
+}
+
+/// A staged export can precede a bundle-dependent measure FAIL. Supersession clears the old
+/// candidate's admission, qualifies the selected main tree, and keeps the failed tree refused.
 #[test]
 fn a_staged_bundle_failure_can_supersede_onto_main_and_must_qualify_again() {
     let mut w = World::new();
-    w.verify_outcomes.insert("appkit", "FAIL");
+    w.verify_outcomes.insert("measure", "FAIL");
     w.verify_half = Some(Half::Bundle);
-    w.verify_code = 1;
+    w.verify_code = 0;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(last.starts_with("REFUSED at 5/10 bundle"), "{last}");
@@ -8327,7 +11347,7 @@ fn a_staged_bundle_failure_can_supersede_onto_main_and_must_qualify_again() {
         w.checks_of(BUMP, w.macho().as_deref())
             .failed
             .iter()
-            .any(|f| f.check == "appkit")
+            .any(|f| f.check == "measure")
     );
 }
 
@@ -8348,23 +11368,25 @@ fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() 
     let r = w.journal().unwrap().commit;
     assert_eq!(
         w.checks_of(&r, w.macho().as_deref()).missing,
-        ["test", "appkit", "measure"],
-        "the bundle half never ran"
+        ["test", "measure"],
+        "early appkit passed, while the graph's tree and the bundle-dependent check remain"
     );
-    assert_eq!(w.verify_runs.len(), 1);
+    assert_eq!(w.verify_runs.len(), 2);
     assert!(
-        w.verify_runs[0].half == Half::Tree && !w.verify_runs[0].strict_subset(),
-        "the first run asks every tree check"
+        w.verify_runs[0].checks == ["appkit"]
+            && w.verify_runs[1].half == Half::Tree
+            && !w.verify_runs[1].strict_subset(),
+        "appkit runs first, then the first tree run asks every tree check"
     );
 
-    // The tree's resume passes; the bundle half could not run appkit.
+    // The tree's resume passes, carrying the recorded binaries; AppKit is not repeated and the
+    // bundle half asks only the remaining bundle-dependent check.
     w.verify_outcomes.clear();
-    w.verify_outcomes.insert("appkit", "NOT RUN");
-    w.verify_half = Some(Half::Bundle);
+    w.verify_half = None;
+    w.verify_code = 0;
     w.calls.clear();
     let (code, last) = w.run(mac());
-    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
-    assert!(last.starts_with("REFUSED at 5/10 bundle"), "{last}");
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     let [.., tree, bundle] = w.verify_runs.as_slice() else {
         panic!("{:?}", w.verify_runs);
     };
@@ -8373,27 +11395,20 @@ fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() 
         (Half::Tree, ["test".to_owned()].as_slice())
     );
     assert_eq!(tree.passed_binaries, carried);
-    assert!(
-        bundle.half == Half::Bundle && !bundle.strict_subset(),
+    assert_eq!(
+        (bundle.half, bundle.checks.as_slice()),
+        (Half::Bundle, ["measure".to_owned()].as_slice()),
         "{bundle:?}"
     );
-
-    w.verify_outcomes.clear();
-    w.verify_half = None;
-    w.verify_code = 0;
-    w.calls.clear();
-    let (code, last) = w.run(mac());
-    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(
-        (w.count("verify --tree"), w.count("verify --bundle")),
-        (0, 1),
+        (
+            w.count("verify appkit"),
+            w.count("verify --tree"),
+            w.count("verify --bundle")
+        ),
+        (0, 1, 1),
         "{:?}",
         w.calls
-    );
-    let resumed = w.verify_runs.last().unwrap();
-    assert_eq!(
-        (resumed.half, resumed.checks.as_slice()),
-        (Half::Bundle, ["appkit".to_owned()].as_slice())
     );
 }
 
@@ -8425,10 +11440,11 @@ fn a_killed_run_that_failed_a_test_is_refused_never_resumed() {
     }
 }
 
-/// STEP 6 AS AN AGENT RUNS IT: the real backend runs R's recorded, content-proved
-/// `aterm-verify` copy directly as `release --events <file> --app <app>` in the clone (a resume
-/// names its missing `--checks` and its `--passed-binaries`, and
-/// `--app` only when it runs measure), and only a run from a clone at R's tree and clean, before
+/// THE REAL VERIFY BACKEND: R's recorded, content-proved `aterm-verify` copy runs directly in the
+/// clone. Early AppKit is `release --bundle --admit now --checks appkit` with no app and its
+/// step-4 log; a prior executable-group candidate is handed back only for a post-build re-key;
+/// measure is `release --bundle --checks measure --app <app>` with its step-5 log. A tree resume
+/// names its missing `--checks` and `--passed-binaries`, and only a run from a clone at R's tree and clean, before
 /// and after, under one seal, keeps one record per check its events file says finished, a FAIL
 /// included, never what its output says; a moved clone or a changed seal keeps nothing, its
 /// `began` record withdrawn, and could not run. Negative control: records read from the log
@@ -8545,14 +11561,37 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         std::fs::write(&events, said_events).unwrap();
     };
     let every = |half: Half| crate::check_record::Checks::no("none").run(half);
+    let mut appkit = crate::check_record::Checks::no("none")
+        .run_only(Half::Bundle, &[aterm_verify::checks::Check::Appkit]);
+    appkit.passed_appkit_groups.push(
+        aterm_verify::appkit_content::GroupProof::from_executables(
+            aterm_verify::appkit_content::REDRAW_GROUP,
+            &"aa".repeat(32),
+            vec![aterm_verify::appkit_content::Executable {
+                name: aterm_verify::stages::REDRAW_CONFORMANCE_BIN.into(),
+                sha256: "bb".repeat(32),
+            }],
+        )
+        .unwrap(),
+    );
+    let measure = crate::check_record::Checks::no("none")
+        .run_only(Half::Bundle, &[aterm_verify::checks::Check::Measure]);
     let repo_seen = std::fs::canonicalize(&repo).unwrap();
-    let verify = |real: &mut Real, run: &VerifyRun| {
-        Backend::branches(real).verify(&cand, &prover, run, Some(&artifact), &BranchStop::default())
+    let verify = |real: &mut Real, step: Step, run: &VerifyRun| {
+        Backend::branches(real).verify(
+            step,
+            &cand,
+            &prover,
+            run,
+            (step == Step::Bundle).then_some(&artifact),
+            &BranchStop::default(),
+        )
     };
 
     for how in ["dirty", "move"] {
         set("0", how, &finished(&all_ok));
-        let refused = verify(&mut real, &every(Half::Tree)).expect_err("the clone moved");
+        let refused =
+            verify(&mut real, Step::Qualify, &every(Half::Tree)).expect_err("the clone moved");
         assert!(refused.could_not_run, "{refused:?}");
         assert!(nothing(&r), "{how}: nothing is recorded");
         let _ = std::fs::remove_file(repo.join("stray.txt"));
@@ -8566,7 +11605,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     std::fs::write(repo.join("stray.txt"), "before").unwrap();
     std::fs::remove_file(&said).unwrap();
     set("0", "", &finished(&all_ok));
-    let refused = verify(&mut real, &every(Half::Tree)).expect_err("a dirty clone");
+    let refused = verify(&mut real, Step::Qualify, &every(Half::Tree)).expect_err("a dirty clone");
     assert!(refused.could_not_run, "{refused:?}");
     assert!(!said.exists(), "nothing ran");
     assert!(nothing(&r));
@@ -8579,7 +11618,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             .to_string())
     }
     real.build_inputs = changing_inputs;
-    let refused = verify(&mut real, &every(Half::Bundle)).expect_err("inputs changed");
+    let refused = verify(&mut real, Step::Bundle, &measure).expect_err("inputs changed");
     assert!(
         refused.why.contains("compiler or SDK bytes changed"),
         "{refused:?}"
@@ -8604,6 +11643,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         checks: vec!["lint".into(), "test".into()],
         passed_binaries: vec![passed_binary("-p a --lib", &"aa".repeat(32))],
         passed_lint_packages: vec![passed_lint_package("a@1.0.0")],
+        passed_appkit_groups: Vec::new(),
     };
     let binary = |spec: &str, sha: &str, outcome: &str| {
         format!(
@@ -8633,7 +11673,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             binary("-p b --lib", &"bb".repeat(32), "NOT RUN")
         ),
     );
-    let ran = verify(&mut real, &resume).expect("it ran");
+    let ran = verify(&mut real, Step::Qualify, &resume).expect("it ran");
     assert_eq!(ran.code, 3);
     let said_now = std::fs::read_to_string(&said).unwrap();
     let after = |flag: &str| {
@@ -8683,13 +11723,63 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     );
 
     set("0", "", &finished(&all_ok));
-    let ran = verify(&mut real, &every(Half::Tree)).expect("it ran");
+    let ran = verify(&mut real, Step::Qualify, &every(Half::Tree)).expect("it ran");
     assert_eq!(ran.code, 0);
     assert!(
         !judge(&r).complete(),
         "the bundle's checks are not the tree's"
     );
-    let ran = verify(&mut real, &every(Half::Bundle)).expect("it ran");
+    set("0", "", &finished(&[("appkit", "ok")]));
+    let ran = verify(&mut real, Step::Qualify, &appkit).expect("early AppKit ran");
+    assert_eq!(ran.code, 0);
+    let said_now = std::fs::read_to_string(&said).unwrap();
+    let appkit_context = said_now
+        .split_whitespace()
+        .skip_while(|w| *w != "--carry-context")
+        .nth(1)
+        .unwrap_or_else(|| panic!("--carry-context <digest>: {said_now}"))
+        .to_owned();
+    let appkit_events = said_now
+        .split_whitespace()
+        .skip_while(|w| *w != "--events")
+        .nth(1)
+        .unwrap_or_else(|| panic!("--events <path>: {said_now}"))
+        .to_owned();
+    let appkit_groups = said_now
+        .split_whitespace()
+        .skip_while(|w| *w != "--passed-appkit-groups")
+        .nth(1)
+        .unwrap_or_else(|| panic!("--passed-appkit-groups <path>: {said_now}"))
+        .to_owned();
+    assert_eq!(
+        said_now.trim(),
+        format!(
+            "{} release --bundle --admit now --carry-context {appkit_context} \
+             --checks appkit --passed-appkit-groups {appkit_groups} --events {appkit_events}",
+            repo_seen.display(),
+        ),
+        "early AppKit has non-waiting admission and bundle-half identity but no bundle argument"
+    );
+    assert!(
+        appkit_events.contains("04-qualify-appkit"),
+        "AppKit's events use its step-4 side log: {appkit_events}"
+    );
+    assert_eq!(
+        aterm_verify::appkit_content::read_passed(
+            &std::fs::read_to_string(&appkit_groups).unwrap()
+        )
+        .unwrap()
+        .len(),
+        1,
+        "the candidate group is handed to the verifier for post-build re-keying"
+    );
+    assert!(
+        !judge(&r).complete(),
+        "measure still needs the built bundle"
+    );
+
+    set("0", "", &finished(&[("measure", "ok")]));
+    let ran = verify(&mut real, Step::Bundle, &measure).expect("measure ran");
     assert_eq!(ran.code, 0);
     let said_now = std::fs::read_to_string(&said).unwrap();
     let bundle_events = said_now
@@ -8698,16 +11788,21 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         .nth(1)
         .unwrap_or_else(|| panic!("--events <path>: {said_now}"))
         .to_owned();
-    assert_ne!(bundle_events, events_file, "each half has its own events");
+    assert_ne!(appkit_events, events_file, "AppKit has its own events");
+    assert_ne!(bundle_events, appkit_events, "measure has its own events");
     assert_eq!(
         said_now.trim(),
         format!(
-            "{} release --bundle --events {bundle_events} \
+            "{} release --bundle --checks measure --events {bundle_events} \
              --app {}",
             repo_seen.display(),
             artifact.app.display()
         ),
-        "a run of a whole half names no checks"
+        "only measure receives the built bundle"
+    );
+    assert!(
+        !said_now.contains("--admit now"),
+        "the artifact measurement keeps ordinary admission"
     );
     assert!(
         judge(&r).complete(),
@@ -8715,8 +11810,31 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     );
     assert!(!judge(&other).complete(), "another tree has no records");
 
+    std::fs::write(&said, "shape sentinel").unwrap();
+    for (step, run, why) in [
+        (Step::Bundle, appkit.clone(), "late AppKit with an artifact"),
+        (
+            Step::Qualify,
+            measure.clone(),
+            "early measure without an artifact",
+        ),
+        (
+            Step::Qualify,
+            every(Half::Bundle),
+            "a mixed early bundle selection",
+        ),
+    ] {
+        let refused = verify(&mut real, step, &run).expect_err(why);
+        assert!(refused.could_not_run, "{why}: {refused:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&said).unwrap(),
+        "shape sentinel",
+        "an invalid step/selection/artifact shape starts no verifier"
+    );
+
     set("1", "", &finished(&[("fmt", "ok"), ("lint", "FAIL")]));
-    let ran = verify(&mut real, &every(Half::Tree)).expect("it ran");
+    let ran = verify(&mut real, Step::Qualify, &every(Half::Tree)).expect("it ran");
     assert_eq!(ran.code, 1);
     let judged = judge(&r);
     assert_eq!(
@@ -8732,7 +11850,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     let verified = crate::check_record::root(&git).unwrap();
     std::fs::remove_dir_all(&verified).unwrap();
     set("1", "", "");
-    verify(&mut real, &every(Half::Tree)).expect("it ran");
+    verify(&mut real, Step::Qualify, &every(Half::Tree)).expect("it ran");
     assert_eq!(
         judge(&r)
             .failed

@@ -191,6 +191,8 @@ pub enum OpenAppRequest<'a> {
     SystemState,
     /// Show the window's Workers list, where it has one.
     Workers,
+    /// Focus or create the Tables page: the registry's stored tables.
+    Tables,
     /// Focus or create the Settings view at `route`.
     Settings {
         /// Absolute Settings route; `/` is the default landing route.
@@ -334,7 +336,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <allocation [split]|mail|about|system-state|workers|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
@@ -347,6 +349,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         Some("mail") if remainder(input).is_empty() => Ok(OpenAppRequest::Mail),
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("workers") if remainder(input).is_empty() => Ok(OpenAppRequest::Workers),
+        Some("tables") if remainder(input).is_empty() => Ok(OpenAppRequest::Tables),
         Some("settings") => {
             let route = remainder(input);
             let route = if route.is_empty() { "/" } else { route };
@@ -371,7 +374,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <mail|about|system-state|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }

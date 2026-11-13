@@ -87,8 +87,11 @@ fn same_read(kept: &mut RingCell, fresh: &mut RingCell, frame: &[u32], what: &st
     ] {
         assert_eq!(a.to_bits(), b.to_bits(), "{what}: its {part}: {a} {b}");
     }
-    assert_eq!(k.ring_text, f.ring_text, "{what}: its ring text");
-    assert_eq!(kept.ring_text, f.ring_text, "{what}: its ring text kept");
+    assert_eq!(k.ground_text, f.ground_text, "{what}: its ground's text");
+    assert_eq!(
+        kept.ground_text, f.ground_text,
+        "{what}: its ground's text kept"
+    );
     let read = kept.reading(&Px(frame));
     assert_eq!(
         read.to_bits(),
@@ -100,7 +103,11 @@ fn same_read(kept: &mut RingCell, fresh: &mut RingCell, frame: &[u32], what: &st
         (read, true),
         (read.next_up(), read.is_infinite()),
     ] {
-        assert_eq!(kept.holds(&Px(frame), bar), holds, "{what}: holds {bar}");
+        assert_eq!(
+            kept.holds(&Px(frame), bar, 0.0),
+            holds,
+            "{what}: holds {bar}"
+        );
     }
     assert_eq!(
         kept.whole(&Px(frame)).to_bits(),
@@ -306,11 +313,71 @@ fn holds_answers_as_the_whole_reading_at_every_row_s_reading() {
     for bar in inks.iter().map(|ink| ratio(*ink, PAGE)) {
         for bar in [bar.next_down(), bar, bar.next_up()] {
             assert_eq!(
-                cell.holds(&Px(&frame), bar),
+                cell.holds(&Px(&frame), bar, 0.0),
                 reading >= bar,
                 "a bar of {bar} on a reading of {reading}"
             );
         }
+    }
+}
+
+/// [`RingCell::holds`] HOLDS EACH SOLID PIXEL TO ITS LEAST AS WELL AS EACH ROW TO ITS BAR: a stem
+/// three pixels across whose edge pixel on one row is dimmed reads the whole ink by each row's
+/// lower median, the dim pixel never that row's; held to a least at the dim pixel's own reading
+/// it holds, and just over it fails, at the reading's bar and at no bar at all. NEGATIVE
+/// CONTROL: with no least (`0`) the dim pixel is not seen, as the row medians alone hold it.
+#[test]
+fn holds_holds_each_solid_pixel_to_its_least() {
+    let (cw, ch, r) = (6usize, 10usize, 2usize);
+    let (w, h) = (cw + 2 * r, ch + 2 * r);
+    let mut stem = vec![0u8; cw * ch];
+    for y in 2..8 {
+        for x in 1..4 {
+            stem[y * cw + x] = 255;
+        }
+    }
+    let table: RasterTable = vec![GlyphRaster::placed(&stem, cw, (0, 0))].into();
+    let mut cells = [Neighbour::Known {
+        ground: PAGE,
+        base: PAGE,
+        glyph: None,
+    }; 9];
+    cells[4] = Neighbour::Known {
+        ground: PAGE,
+        base: PAGE,
+        glyph: Some((0, INK)),
+    };
+    let mut cell = RingCell::EMPTY;
+    cell.read((w, h), (cw, ch), r, &cells, (&table, false));
+    let mut frame = vec![PAGE; w * h];
+    for y in 2..8 {
+        for x in 1..4 {
+            frame[(r + y) * w + r + x] = INK;
+        }
+    }
+    let dim = 0x0040_5050;
+    frame[(r + 4) * w + r + 3] = dim;
+    let (whole, own) = (ratio(INK, PAGE), ratio(dim, PAGE));
+    assert!(own < whole, "fixture: the dim pixel reads under the ink");
+    let reading = cell.reading(&Px(&frame));
+    assert_eq!(
+        reading.to_bits(),
+        whole.to_bits(),
+        "each row's lower median is the whole ink"
+    );
+    for bar in [reading, f32::NEG_INFINITY] {
+        assert!(
+            cell.holds(&Px(&frame), bar, 0.0),
+            "control: with no least the dim pixel is not seen (bar {bar})"
+        );
+        assert!(
+            cell.holds(&Px(&frame), bar, own),
+            "a least at the dim pixel's reading holds (bar {bar})"
+        );
+        assert!(
+            !cell.holds(&Px(&frame), bar, own.next_up()),
+            "a least over the dim pixel's reading fails (bar {bar})"
+        );
     }
 }
 

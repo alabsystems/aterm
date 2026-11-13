@@ -101,15 +101,25 @@ mod trust_oblig;
 mod verify;
 
 fn main() -> std::process::ExitCode {
+    if let Err(error) = agh::git::HelperHost::Subcommand.record() {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }
     cut_timing::image_arrived();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // SAFETY: this fresh CLI has not started any other thread.
+    if let Some(code) = unsafe { aterm_verify::remote_cli::entry(&args) } {
+        return code;
+    }
     // Cargo's compiler wrapper for a release slice runs nothing else of this tool.
     if let Some(code) = slice_units::entry(&args) {
         return std::process::ExitCode::from(code);
     }
+    #[cfg(debug_assertions)]
+    slice_units::linker_probe_if_asked();
     if let Some(code) = qualify_pilot::slice_child_entry(&args) {
         return code;
     }
@@ -158,17 +168,16 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    #[cfg(all(debug_assertions, not(test)))]
-    if let Some(result) = release_steps::cutter_probe_if_asked(&args) {
-        return match result {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(why) => {
-                eprintln!("cutter child probe: {why}");
-                std::process::ExitCode::from(2)
-            }
-        };
-    }
-    std::process::exit(cli::run());
+    let remote_host = match aterm_verify::remote_host::pin() {
+        Ok(host) => host,
+        Err(why) => {
+            eprintln!("aterm-release: cannot capture remote transport host: {why}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let code = cli::run();
+    drop(remote_host);
+    std::process::exit(code);
 }
 
 /// Create a short `.noindex` temporary directory for unit tests in this crate.

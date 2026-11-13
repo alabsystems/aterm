@@ -128,7 +128,7 @@ fn a_clicks_mode_name_holds_then_fades_a_step_at_a_time_and_goes() {
 
 /// THE NAME FOLLOWS THE GLYPH, IS THE CHIP'S, AND GIVES WAY FIRST: Land at rest is `⤓` alone;
 /// with its name, `⤓ land` in the chip's letter, the whole of it the chip's (a click on the name
-/// cycles too), set off from the next chip as any word is (`⤓ land ─ ○ yolo`),
+/// cycles too), set off from the next chip as any word is (`⤓ land ─ yolo`),
 /// [`super::Block::word`] counting what it adds; a rule with room for the rest alone lays the rest, never a narrower
 /// rung; a name for another mode, or a click in flight, lays none.
 #[test]
@@ -169,14 +169,14 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     let rest_plan = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
-    assert_eq!(text(&rest_plan.lights), "\u{2913} \u{25cb} yolo");
+    assert_eq!(text(&rest_plan.lights), "\u{2913} yolo");
     w.sessions.get_mut(&S).expect("noted").word = word;
     let beside = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(
         text(&beside.lights),
-        "\u{2913} land \u{2500} \u{25cb} yolo",
+        "\u{2913} land \u{2500} yolo",
         "set off as a word is"
     );
     assert_eq!(
@@ -237,7 +237,7 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert!(
-        text(&other.lights).starts_with("\u{25cb} \u{25cb} yolo"),
+        text(&other.lights).starts_with("\u{25cb} yolo"),
         "Land's name never names Off"
     );
     assert_eq!(other.word, 0);
@@ -458,6 +458,82 @@ fn facts(app: &App, wid: WindowId) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// An enabled mode must explain missing evidence, including between supervisor claims.
+#[test]
+fn enabled_footer_names_unavailable_continuation_until_the_current_claim_reports() {
+    let (mut app, wid, session, _reader) = app();
+    let _host = host(&mut app);
+    assert!(app.apply_term_resize(wid, 24, 160));
+    publish_facts(&app, session);
+    draw_claude(&app, session, BYPASS);
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    let paint = |app: &mut App, expected: Option<&str>| {
+        frame(app, wid);
+        assert_eq!(
+            app.windows[&wid].claude_lights.sessions[&session]
+                .continuation
+                .as_deref(),
+            expected,
+        );
+        let row = row_text(app, wid, glyph(app, wid).0);
+        if let Some(expected) = expected {
+            assert!(
+                row.contains(expected),
+                "expected {expected:?} in the painted footer: {row:?}"
+            );
+        } else {
+            assert!(!row.contains("status unavailable"), "Off: {row:?}");
+        }
+    };
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip);
+        assert_eq!(app.session_autopilot(session).1.mode(), Some(mode));
+        // A mode-change name temporarily occupies the same title; let it finish.
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .claude_lights
+            .sessions
+            .entry(session)
+            .or_default()
+            .word = None;
+        paint(&mut app, Some("status unavailable"));
+    }
+    let claim = || {
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("supervisor claim");
+    };
+    claim();
+    paint(&mut app, Some("status unavailable"));
+    crate::autopilot_activity::report(&ctx, "working", None);
+    paint(&mut app, Some("working"));
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    ));
+    paint(&mut app, Some("status unavailable"));
+    claim();
+    paint(&mut app, Some("status unavailable"));
+    crate::autopilot_activity::report(&ctx, "working", Some(0));
+    paint(&mut app, Some("checking continuation"));
+    crate::autopilot_activity::report(&ctx, "retry", None);
+    paint(&mut app, Some("retrying"));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
+    paint(&mut app, None);
+}
+
 /// CLICKING THROUGH THE MODES NAMES EACH, THE GLYPH STAYING UNDER THE POINTER: each click on the
 /// glyph brings up the mode it reached (`⤓ land`, `○ off`, `∞ cruise`) in that mode's tone, the
 /// glyph where it stood so the next click lands on it again; held, the name fades and goes, the
@@ -500,6 +576,10 @@ fn clicking_through_the_modes_names_each_with_the_glyph_under_the_pointer() {
             row.contains(&format!("{mark} {name}")),
             "{name} follows: {row:?}"
         );
+        assert!(
+            !row.contains("status unavailable"),
+            "{name}: explicit feedback takes the default caption's room: {row:?}"
+        );
         assert_eq!(
             cell_at(&app, wid, name_at).ch,
             name.chars().next().unwrap_or(' ')
@@ -539,6 +619,11 @@ fn clicking_through_the_modes_names_each_with_the_glyph_under_the_pointer() {
         app.claude_chip_words_due(gone).contains(&wid),
         "its going owed"
     );
+    app.on_cursor_moved(wid, 0.0, 0.0);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover, None,
+        "pointer off the chips"
+    );
     frame_at(&mut app, wid, gone);
     assert_eq!(
         app.windows[&wid]
@@ -555,97 +640,131 @@ fn clicking_through_the_modes_names_each_with_the_glyph_under_the_pointer() {
         !row_text(&app, wid, at.0).contains("\u{221e} cruise"),
         "the name gone"
     );
+    assert!(
+        row_text(&app, wid, at.0).contains("status unavailable"),
+        "the default continuation caption returns after the mode name fades"
+    );
     assert_eq!(app.claude_chip_word_wake(gone), None, "and no wake");
 }
 
 /// THE NAME TAKES ONLY CELLS THE RULE SPARES: across widths, a frame with the name lays every
-/// cell up to the glyph, every fact and its cells, and a title wherever the frame without it lays
-/// one, as that frame does; the name (` land`, with the ` ─` that sets it off from a chip after
+/// cell up to the glyph, every fact and its cells, and an explicit title wherever the frame without
+/// it lays one; the quiet continuation caption yields. The name (` land`, with the ` ─` that sets it off from a chip after
 /// it) after the glyph, every chip after it moved on by the name's cells, over the rule's own
 /// `─` or a title cut to a narrower form (the title gives way first); where the rest leaves too
 /// few, the frame is the rest's whole. Both happen across the sweep (a control for each).
 #[test]
 fn the_name_takes_only_cells_the_rule_spares() {
-    let (mut laid, mut withheld) = (0, 0);
-    for cols in (30..=96).step_by(3) {
-        let (mut app, wid, session, _reader) = app();
-        let _host = host(&mut app);
-        assert!(app.apply_term_resize(wid, 24, cols));
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
-        frame(&mut app, wid);
-        if !super::gesture_tests::painted(&app, wid, Chip::Autopilot) {
-            continue;
+    for explicit_title in [false, true] {
+        let (mut laid, mut withheld, mut titled_names) = (0, 0, 0);
+        for cols in (30..=96).step_by(3) {
+            let (mut app, wid, session, _reader) = app();
+            let _host = host(&mut app);
+            assert!(app.apply_term_resize(wid, 24, cols));
+            publish_facts(&app, session);
+            draw_claude(&app, session, BYPASS);
+            feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+            frame(&mut app, wid);
+            if !super::gesture_tests::painted(&app, wid, Chip::Autopilot) {
+                continue;
+            }
+            let at = glyph(&app, wid);
+            click(&mut app, wid, at);
+            let t = word_from(&app, wid, session) + WORD_HOLD + WORD_FADE;
+            assert!(
+                app.claude_chip_words_due(t).contains(&wid),
+                "{cols}: the click's name went"
+            );
+            if !explicit_title {
+                app.on_cursor_moved(wid, 0.0, 0.0);
+            }
+            assert_eq!(
+                app.windows[&wid].claude_lights.hover,
+                explicit_title.then_some((session, super::Target::Chip(Chip::Autopilot))),
+                "{cols}: explicit title selection matches the pointer"
+            );
+            frame_at(&mut app, wid, t);
+            let rest = app.windows[&wid].input_scratch.cells[at.0].clone();
+            let (rest_others, rest_facts) = (others(&app, wid), facts(&app, wid));
+            let titled = !app.windows[&wid].claude_lights.title_hits.is_empty();
+            let at = glyph(&app, wid);
+            app.windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
+                .expect("noted")
+                .word = Some(land_at(t, true));
+            frame_at(&mut app, wid, t);
+            let named = app.windows[&wid].input_scratch.cells[at.0].clone();
+            if named == rest {
+                withheld += 1;
+                continue;
+            }
+            laid += 1;
+            assert_eq!(
+                named[..=at.1],
+                rest[..=at.1],
+                "{cols}: up to the glyph, as the rest"
+            );
+            let after = at.1 + 1;
+            let word = if rest_others.is_empty() {
+                " land".len()
+            } else {
+                " land \u{2500}".chars().count()
+            };
+            let laid_name = text(&named[after..after + word]);
+            assert_eq!(
+                laid_name.trim_end_matches(['\u{2500}', ' ']),
+                " land",
+                "{cols}"
+            );
+            assert_eq!(
+                others(&app, wid),
+                rest_others
+                    .iter()
+                    .map(|&(chip, col)| (chip, col + word))
+                    .collect::<Vec<_>>(),
+                "{cols}: every chip after it moved on by the name's cells"
+            );
+            assert!(
+                !rest_facts.is_empty(),
+                "{cols}: CONTROL: the rule lays facts"
+            );
+            assert_eq!(
+                facts(&app, wid),
+                rest_facts,
+                "{cols}: every fact where it stood"
+            );
+            let first = rest_facts.iter().map(|f| f.0).min().unwrap_or(0);
+            assert_eq!(named[first..], rest[first..], "{cols}: and its cells");
+            if explicit_title {
+                titled_names += usize::from(titled);
+                assert_eq!(
+                    !app.windows[&wid].claude_lights.title_hits.is_empty(),
+                    titled,
+                    "{cols}: an explicit title where the rest lays one"
+                );
+            } else {
+                assert!(
+                    !text(&named).contains("status unavailable"),
+                    "{cols}: the quiet caption yields to explicit mode feedback"
+                );
+            }
         }
-        let at = glyph(&app, wid);
-        click(&mut app, wid, at);
-        let t = word_from(&app, wid, session) + WORD_HOLD + WORD_FADE;
         assert!(
-            app.claude_chip_words_due(t).contains(&wid),
-            "{cols}: the click's name went"
+            laid > 0,
+            "CONTROL: some width lays the name ({explicit_title})"
         );
-        frame_at(&mut app, wid, t);
-        let rest = app.windows[&wid].input_scratch.cells[at.0].clone();
-        let (rest_others, rest_facts) = (others(&app, wid), facts(&app, wid));
-        let titled = !app.windows[&wid].claude_lights.title_hits.is_empty();
-        let at = glyph(&app, wid);
-        app.windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .expect("noted")
-            .word = Some(land_at(t, true));
-        frame_at(&mut app, wid, t);
-        let named = app.windows[&wid].input_scratch.cells[at.0].clone();
-        if named == rest {
-            withheld += 1;
-            continue;
+        assert!(
+            withheld > 0,
+            "CONTROL: some width spares it no cells ({explicit_title})"
+        );
+        if explicit_title {
+            assert!(
+                titled_names > 0,
+                "CONTROL: some named width preserves an explicit title"
+            );
         }
-        laid += 1;
-        assert_eq!(
-            named[..=at.1],
-            rest[..=at.1],
-            "{cols}: up to the glyph, as the rest"
-        );
-        let after = at.1 + 1;
-        let word = if rest_others.is_empty() {
-            " land".len()
-        } else {
-            " land \u{2500}".chars().count()
-        };
-        let laid_name = text(&named[after..after + word]);
-        assert_eq!(
-            laid_name.trim_end_matches(['\u{2500}', ' ']),
-            " land",
-            "{cols}"
-        );
-        assert_eq!(
-            others(&app, wid),
-            rest_others
-                .iter()
-                .map(|&(chip, col)| (chip, col + word))
-                .collect::<Vec<_>>(),
-            "{cols}: every chip after it moved on by the name's cells"
-        );
-        assert!(
-            !rest_facts.is_empty(),
-            "{cols}: CONTROL: the rule lays facts"
-        );
-        assert_eq!(
-            facts(&app, wid),
-            rest_facts,
-            "{cols}: every fact where it stood"
-        );
-        let first = rest_facts.iter().map(|f| f.0).min().unwrap_or(0);
-        assert_eq!(named[first..], rest[first..], "{cols}: and its cells");
-        assert_eq!(
-            !app.windows[&wid].claude_lights.title_hits.is_empty(),
-            titled,
-            "{cols}: a title where the rest lays one"
-        );
     }
-    assert!(laid > 0, "CONTROL: some width lays the name");
-    assert!(withheld > 0, "CONTROL: some width spares it no cells");
 }
 
 /// A NAME `word_at` DOES NOT DRAW READS NO CLOCK AND MOVES NO KEY, AND AN OFF SWITCH LETS IT GO:

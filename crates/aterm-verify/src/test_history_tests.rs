@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::{History, ROWS_KEPT, SAMPLES_KEPT, Sample, keep, load};
+use super::{History, ROWS_KEPT, SAMPLES_KEPT, Sample, Settled, keep, load};
 
 fn sample(at_ms: u64) -> Sample {
     Sample {
@@ -16,8 +16,10 @@ fn sample(at_ms: u64) -> Sample {
         starved_ms: Some(0),
         peak_bytes: Some(1 << 30),
         width: 4,
+        cores: None,
         tests: Some(133),
         partition: None,
+        exe_sha256: None,
     }
 }
 
@@ -89,8 +91,94 @@ fn a_history_reads_back_what_it_wrote_and_nothing_from_what_it_cannot_read() {
             ..sample(2)
         },
     );
+    h.push(
+        "-p c --lib",
+        Sample {
+            cores: Some(3),
+            exe_sha256: Some("ab".repeat(32)),
+            ..sample(3)
+        },
+    );
     let text = h.encode();
     assert_eq!(History::decode(&text), h);
+    assert!(text.contains("\"cores\":3"), "{text}");
+    assert!(text.contains(&"ab".repeat(32)), "{text}");
+    // Not held at 3 cores (0.4 per thread), so its row settled there, as that executable.
+    assert_eq!(
+        h.row("-p c --lib").unwrap().settled,
+        Some(Settled {
+            cores: 3,
+            exe_sha256: Some("ab".repeat(32)),
+        })
+    );
+    // A row kept before settled grants has no `settled`: read as none, the rest whole.
+    let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    for row in fields
+        .as_object_mut()
+        .unwrap()
+        .get_mut("rows")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+    {
+        row.as_object_mut().unwrap().remove("settled");
+    }
+    let mut unsettled = h.clone();
+    unsettled.rows[2].settled = None;
+    assert_eq!(History::decode(&fields.to_string()), unsettled);
+    let settled_row = |value: &mut aterm_json::Value| -> aterm_json::Map {
+        let row = value.as_object_mut().unwrap().get_mut("rows").unwrap();
+        let row = row.as_array_mut().unwrap()[2].as_object_mut().unwrap();
+        row.get("settled").unwrap().as_object().unwrap().clone()
+    };
+    for (key, torn) in [
+        (None, aterm_json::Value::from(3)),
+        (Some("cores"), aterm_json::Value::from("3")),
+        (Some("exe_sha256"), aterm_json::Value::from(3)),
+    ] {
+        let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+        let mut settled = settled_row(&mut fields);
+        let value = match key {
+            None => torn,
+            Some(key) => {
+                settled.insert(key.into(), torn);
+                aterm_json::Value::Object(settled)
+            }
+        };
+        let rows = fields.as_object_mut().unwrap().get_mut("rows").unwrap();
+        rows.as_array_mut().unwrap()[2]
+            .as_object_mut()
+            .unwrap()
+            .insert("settled".into(), value);
+        assert_eq!(
+            History::decode(&fields.to_string()),
+            History::default(),
+            "a settled grant it cannot read is a torn row ({key:?})"
+        );
+    }
+    // A sample kept before grants has no `cores`: read as ungranted, the rest whole.
+    let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    first_sample_fields(&mut fields).remove("cores");
+    assert_eq!(History::decode(&fields.to_string()), h);
+    first_sample_fields(&mut fields).insert("cores".into(), aterm_json::Value::from("3"));
+    assert_eq!(
+        History::decode(&fields.to_string()),
+        History::default(),
+        "a grant it cannot read is a torn sample"
+    );
+    let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    first_sample_fields(&mut fields).insert("exe_sha256".into(), aterm_json::Value::from(1));
+    assert_eq!(
+        History::decode(&fields.to_string()),
+        History::default(),
+        "an executable it cannot read is a torn sample"
+    );
+    first_sample_fields(&mut fields).remove("exe_sha256");
+    assert_eq!(
+        History::decode(&fields.to_string()),
+        h,
+        "a sample kept before it"
+    );
     let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
     first_sample_fields(&mut fields).insert("partition".into(), aterm_json::Value::Bool(false));
     assert_eq!(History::decode(&fields.to_string()), History::default());
@@ -327,8 +415,10 @@ fn a_stopped_red_keeps_the_prior_timing_and_marks_the_binary_failed() {
             starved_ms: None,
             peak_bytes: None,
             width: 2,
+            cores: None,
             tests: Some(3),
             partition: None,
+            exe_sha256: None,
         },
     );
 
@@ -362,4 +452,171 @@ fn the_heaviest_run_is_read_for_the_selections_crates() {
     assert_eq!(h.heaviest(&["a".to_owned(), "b".to_owned()]), 500);
     assert_eq!(h.heaviest(&[]), 900);
     assert_eq!(h.heaviest(&["c".to_owned()]), 0);
+}
+
+/// A grant caps what a run can show it needs, so a run its grant held reads as needing twice that
+/// grant, and the binary's charge grows: a pool-heavy binary held at one core, then at two, is
+/// read as needing four. A run not held at a grant at least the largest that held one is what the
+/// binary needs: a single-threaded binary held at one core and then not held at two settles at
+/// one. NEGATIVE CONTROL: a run kept before grants (`cores: None`) is never held, and its own
+/// figure stands; and an unheld run at a smaller grant than the one that held settles nothing.
+#[test]
+fn a_run_its_grant_held_raises_what_the_binary_needs() {
+    // One thread over 10 s: `cpu_ms / 10_000` cores.
+    let at = |at_ms, cpu_ms, cores| {
+        Sample {
+            cores,
+            ..run(10_000, cpu_ms, 1, Some(1), "ok")
+        }
+        .clone_at(at_ms)
+    };
+    let need = |samples: &[Sample]| {
+        let mut h = History::default();
+        for s in samples {
+            h.push("b", s.clone());
+        }
+        h.seen("b").unwrap().per_thread
+    };
+    let pool = [at(1, 9_900, Some(1))];
+    assert!((need(&pool) - 2.0).abs() < 1e-9, "held at one: needs two");
+    let pool = [at(1, 9_900, Some(1)), at(2, 19_800, Some(2))];
+    assert!((need(&pool) - 4.0).abs() < 1e-9, "held at two: needs four");
+    let pool = [
+        at(1, 9_900, Some(1)),
+        at(2, 19_800, Some(2)),
+        at(3, 31_000, Some(4)),
+    ];
+    assert!(
+        (need(&pool) - 3.1).abs() < 1e-9,
+        "not held at four: needs 3.1"
+    );
+    let single = [at(1, 9_950, Some(1)), at(2, 9_950, Some(2))];
+    assert!((need(&single) - 0.995).abs() < 1e-9, "settled at one core");
+    let single = [at(1, 9_950, Some(2)), at(2, 9_950, Some(1))];
+    assert!(
+        (need(&single) - 0.995).abs() < 1e-9,
+        "settled whichever came first"
+    );
+    let legacy = [at(1, 164_000, None)];
+    assert!((need(&legacy) - 16.4).abs() < 1e-9, "CONTROL: ungranted");
+    let legacy = [at(1, 164_000, None), at(2, 9_950, Some(1))];
+    assert!(
+        (need(&legacy) - 16.4).abs() < 1e-9,
+        "CONTROL: an ungranted run settles a later held one"
+    );
+    let smaller = [at(1, 5_000, Some(1)), at(2, 19_900, Some(2))];
+    assert!(
+        (need(&smaller) - 4.0).abs() < 1e-9,
+        "CONTROL: unheld at one does not settle a hold at two"
+    );
+}
+
+/// A settled grant outlives the samples that showed it: a single-threaded binary held at one core,
+/// then not held at two, needs what it used run after run, long after the run at two left the
+/// kept samples, through the file too, so its grant (and with it its content key) stays one core.
+/// A run held at the settled grant or above unsettles it, and the binary is read as needing twice
+/// that grant again. NEGATIVE CONTROL: with no settled grant (a row kept before them) the same
+/// samples re-probe at two cores; a held run below the settled grant, and an unheld one below a
+/// larger held grant, change nothing.
+#[test]
+fn a_settled_grant_outlives_the_samples_that_showed_it() {
+    let at = |at_ms, cpu_ms, cores| {
+        Sample {
+            cores,
+            ..run(10_000, cpu_ms, 1, Some(1), "ok")
+        }
+        .clone_at(at_ms)
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.json");
+    keep(&path, vec![("b".into(), at(1, 9_950, Some(1)))]).unwrap();
+    assert!((load(&path).seen("b").unwrap().per_thread - 2.0).abs() < 1e-9);
+    keep(&path, vec![("b".into(), at(2, 9_950, Some(2)))]).unwrap();
+    for n in 3..3 + 3 * SAMPLES_KEPT as u64 {
+        let h = load(&path);
+        let settled = h.row("b").unwrap().settled.as_ref().map(|s| s.cores);
+        assert_eq!(settled, Some(2), "run {n}");
+        let need = h.seen("b").unwrap().per_thread;
+        assert!((need - 0.995).abs() < 1e-9, "run {n}: needs {need}");
+        keep(&path, vec![("b".into(), at(n, 9_950, Some(1)))]).unwrap();
+    }
+    let h = load(&path);
+    let row = h.row("b").unwrap();
+    assert!(row.samples.iter().all(|s| s.cores == Some(1)));
+    let mut unsettled = h.clone();
+    unsettled.rows[0].settled = None;
+    assert!(
+        (unsettled.seen("b").unwrap().per_thread - 2.0).abs() < 1e-9,
+        "CONTROL: the kept samples alone re-probe at two"
+    );
+    let mut h = load(&path);
+    h.push("b", at(100, 19_800, Some(2)));
+    assert_eq!(
+        h.row("b").unwrap().settled,
+        None,
+        "held at two unsettles it"
+    );
+    assert!((h.seen("b").unwrap().per_thread - 4.0).abs() < 1e-9);
+    let mut h = History::default();
+    h.push("b", at(1, 39_000, Some(4)));
+    h.push("b", at(2, 9_000, Some(2)));
+    assert_eq!(
+        h.row("b").unwrap().settled,
+        None,
+        "CONTROL: unheld at 2 under a hold at 4"
+    );
+}
+
+/// A settled grant is the executable's that showed it: a binary held at one core long after it
+/// settled at two is re-probed at two once a run of another executable is kept, because a
+/// changed binary that now needs more looks, at one core, as it did. NEGATIVE CONTROL: a held run
+/// of the same executable, and one whose executable was not read (a libtest JSON probe's run),
+/// keep it settled; an unheld run of the new executable settles it again, as that executable.
+#[test]
+fn a_changed_executable_unsettles_its_binary() {
+    let exe = |b: &str| Some(b.repeat(32));
+    let at = |at_ms, cpu_ms, cores, exe_sha256| {
+        Sample {
+            cores,
+            exe_sha256,
+            ..run(10_000, cpu_ms, 1, Some(1), "ok")
+        }
+        .clone_at(at_ms)
+    };
+    let mut h = History::default();
+    h.push("b", at(1, 9_950, Some(1), exe("aa")));
+    h.push("b", at(2, 9_950, Some(2), exe("aa")));
+    for n in 3..3 + SAMPLES_KEPT as u64 {
+        h.push("b", at(n, 9_950, Some(1), exe("aa")));
+    }
+    let settled = |h: &History| h.row("b").unwrap().settled.clone();
+    let as_aa = Some(Settled {
+        cores: 2,
+        exe_sha256: exe("aa"),
+    });
+    assert_eq!(settled(&h), as_aa);
+    h.push("b", at(20, 9_950, Some(1), None));
+    assert_eq!(settled(&h), as_aa, "CONTROL: an unread executable");
+    assert!((h.seen("b").unwrap().per_thread - 0.995).abs() < 1e-9);
+    h.push("b", at(21, 9_950, Some(1), exe("bb")));
+    assert_eq!(settled(&h), None, "another executable unsettles it");
+    assert!(
+        (h.seen("b").unwrap().per_thread - 2.0).abs() < 1e-9,
+        "the changed binary is probed at two"
+    );
+    h.push("b", at(22, 9_950, Some(2), exe("bb")));
+    assert_eq!(
+        settled(&h),
+        Some(Settled {
+            cores: 2,
+            exe_sha256: exe("bb"),
+        }),
+        "CONTROL: unheld at two, it settles again as the new executable"
+    );
+}
+
+impl Sample {
+    fn clone_at(self, at_ms: u64) -> Sample {
+        Sample { at_ms, ..self }
+    }
 }

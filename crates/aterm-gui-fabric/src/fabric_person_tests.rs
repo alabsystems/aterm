@@ -204,7 +204,6 @@ fn a_gateway_card_does_not_open_under_a_hold() {
         "tab-menu",
         "overview",
         "connections",
-        "autopilot-menu",
         "fact-menu",
     ];
     for target in gateways {
@@ -226,11 +225,6 @@ fn a_gateway_card_does_not_open_under_a_hold() {
         open_halt_refusal(&store, "open", "fact-menu path")
             .is_some_and(|refusal| refusal.starts_with("ERR halted ")),
         "a fact's menu named by its fact"
-    );
-    assert!(
-        open_halt_refusal(&store, "open", "autopilot-menu at=20,40 by=pointer")
-            .is_some_and(|refusal| refusal.starts_with("ERR halted ")),
-        "the Autopilot menu a program asks for at its own cell"
     );
     for other in ["prefs", "about", "update", "", "app settings"] {
         assert!(

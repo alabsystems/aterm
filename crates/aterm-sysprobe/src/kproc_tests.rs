@@ -381,7 +381,7 @@ mod live {
     /// socket and kqueue of a process it lists (`-d txt` narrows only what it prints), and a read
     /// of one a sibling test closes meanwhile drains it.
     #[test]
-    fn the_image_inode_is_lsofs_first_txt() {
+    fn the_image_file_matches_metadata_and_lsofs_first_txt() {
         use std::os::unix::fs::MetadataExt as _;
         let lsof = |pid: u32| -> Option<u64> {
             let out = Command::new("/usr/sbin/lsof")
@@ -408,9 +408,22 @@ mod live {
             .expect("sleep");
         let me = std::process::id();
         let exe = std::env::current_exe().expect("exe");
+        let meta = std::fs::metadata(exe).expect("exe");
         assert_eq!(
-            image_inode(me),
-            Some(std::fs::metadata(exe).expect("exe").ino())
+            image_file(me),
+            Some(ImageFile {
+                device: meta.dev(),
+                inode: meta.ino(),
+            })
+        );
+        let system_meta = std::fs::metadata("/bin/sleep").expect("sleep");
+        assert_eq!(
+            image_file(sleep.id()),
+            Some(ImageFile {
+                device: system_meta.dev(),
+                inode: system_meta.ino(),
+            }),
+            "the sealed system volume uses the same device convention"
         );
         let slept = image_inode(sleep.id());
         assert_eq!(
@@ -421,6 +434,7 @@ mod live {
         assert_eq!(image_inode(1), lsof(1), "launchd, as this uid reads it");
         end(sleep);
         assert_eq!(image_inode(0), None);
+        assert_eq!(image_file(0), None);
     }
 }
 

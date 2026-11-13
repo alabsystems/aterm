@@ -69,7 +69,7 @@ fn owner(app: &App) -> Option<MenuOwner> {
 }
 
 /// Name the pane's account `label` (its roster label), so line D's unit carries the account
-/// fact: recovery words are the Accounts card's and title's, never the rule's
+/// fact: recovery words are the Account card's and title's, never the rule's
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1).
 fn name_the_account(app: &App, session: u64, label: &str) {
     let entry = app.pool.get(session).expect("session");
@@ -99,30 +99,26 @@ fn a_transcript_limit_without_a_recovery_observation_has_a_menu_and_copy() {
     }
     menu_frame(&mut app, wid);
     press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);
-    let notes = app
+    let rows = app
         .autopilot_menu
         .as_ref()
         .expect("open account menu")
         .rows
-        .iter()
-        .filter_map(|row| match row {
-            MenuRow::Note { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+        .clone();
+    // The card says the wall as its Budget answer and quotes none of the notice's own words;
+    // those are evidence, in the copied report.
     assert!(
-        notes
-            .iter()
-            .any(|text| text.contains("provider reset: tomorrow at 3pm"))
+        rows.iter().any(|row| matches!(
+            row,
+            MenuRow::Fact { label, value, .. } if label == "Budget" && value == "out"
+        )),
+        "{rows:?}"
     );
-    assert!(notes.iter().any(|text| {
-        text.strip_prefix("Limit: ")
-            .is_some_and(|limit| limit.contains("provider reset: tomorrow at 3pm"))
-    }));
-    assert!(notes.iter().any(|text| text == UNOBSERVED_RECOVERY_FINDING));
-    assert!(notes.iter().any(|text| text == "Observed unknown"));
-    assert!(notes.iter().any(|text| text == "Next event unknown"));
-
+    for row in &rows {
+        if let MenuRow::Note { text, .. } | MenuRow::Fact { value: text, .. } = row {
+            assert!(!text.contains("tomorrow at 3pm"), "{text}");
+        }
+    }
     row_of(&app, "fact-menu/account/network-state");
     let copy = row_of(&app, "fact-menu/account/copy-recovery");
     app.choose_autopilot_menu_row(copy);
@@ -130,9 +126,15 @@ fn a_transcript_limit_without_a_recovery_observation_has_a_menu_and_copy() {
         .with(|board| board.borrow().clone())
         .unwrap();
     assert!(copied.contains("Recovery: State unknown"));
-    assert!(copied.contains("Accounts: unknown; eligible: unknown"));
+    assert!(copied.contains("Accounts: not read; eligible: not read"));
     assert!(copied.contains("provider reset: tomorrow at 3pm"));
-    assert!(copied.contains("Next event unknown"));
+    assert!(copied.lines().any(|line| {
+        line.strip_prefix("Limit: ")
+            .is_some_and(|limit| limit.contains("provider reset: tomorrow at 3pm"))
+    }));
+    assert!(copied.contains(UNOBSERVED_RECOVERY_FINDING));
+    assert!(copied.contains("Not observed yet"));
+    assert!(copied.contains("No next event scheduled"));
     assert!(
         app.pool
             .get(session)
@@ -177,7 +179,6 @@ fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
             && l.contains("key=fact-menu/path/copy-path enabled=true")),
         "{lines:?}"
     );
-    assert_eq!(app.autopilot_menu_controls(), ["autopilot-menu open=false"]);
     assert_eq!(
         app.fact_mask(session),
         FactMask::default(),
@@ -192,8 +193,10 @@ fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
     assert!(app.autopilot_menu.is_none(), "a left click opens no menu");
     assert_eq!(
         app.fact_mask(session),
-        FactMask::default().with(FactKind::Path, true)
+        FactMask::default(),
+        "and hides nothing: the folder has nothing to click"
     );
+    assert!(pty(&mut reader, 0).is_empty(), "nor reaches the program");
 }
 
 #[test]
@@ -391,18 +394,20 @@ fn new_tab_here_asks_for_the_cwd() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
 }
 
+/// HIDE AND SHOW FROM A CARD FLIP THE SESSION'S MASK: the model's card, in a session that is no
+/// Claude Code, hides the model and shows it again.
 #[test]
 fn hide_and_show_from_a_menu_flip_the_sessions_mask() {
     let (mut app, wid, session, _reader) = glass(true);
-    press_fact(&mut app, wid, session, Fact::Path, MouseButton::Right);
-    app.choose_autopilot_menu_row(row_of(&app, "fact-menu/path/hide/path"));
+    press_fact(&mut app, wid, session, Fact::Model, MouseButton::Right);
+    app.choose_autopilot_menu_row(row_of(&app, "fact-menu/model/hide/model"));
     assert_eq!(
         app.fact_mask(session),
-        FactMask::default().with(FactKind::Path, true)
+        FactMask::default().with(FactKind::Model, true)
     );
     menu_frame(&mut app, wid);
-    press_fact(&mut app, wid, session, Fact::Branch, MouseButton::Right);
-    app.choose_autopilot_menu_row(row_of(&app, "fact-menu/branch/show/path"));
+    press_fact(&mut app, wid, session, Fact::Model, MouseButton::Right);
+    app.choose_autopilot_menu_row(row_of(&app, "fact-menu/model/show/model"));
     assert_eq!(app.fact_mask(session), FactMask::default());
 }
 
@@ -442,19 +447,17 @@ fn one_menu_at_a_time() {
     let (mut app, wid, _session, _reader) = glass(true);
     let _host = host(&mut app);
     menu_frame(&mut app, wid);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
-    assert_eq!(owner(&app), Some(MenuOwner::Autopilot));
+    app.open_front_fact_menu(Fact::Path)
+        .expect("the folder is on the glass");
+    assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Path)));
     app.open_front_fact_menu(Fact::Branch)
         .expect("the branch is on the glass");
     assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Branch)));
-    assert_eq!(app.autopilot_menu_controls(), ["autopilot-menu open=false"]);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
-    assert_eq!(owner(&app), Some(MenuOwner::Autopilot));
-    assert_eq!(app.fact_menu_controls(), ["fact-menu open=false"]);
+    let lines = app.fact_menu_controls();
+    assert!(lines[0].contains(" fact=branch "), "{lines:?}");
     app.close_fact_menu();
-    assert_eq!(owner(&app), Some(MenuOwner::Autopilot));
+    assert_eq!(owner(&app), None);
+    assert_eq!(app.fact_menu_controls(), ["fact-menu open=false"]);
 }
 
 /// THE KEYBOARD OPENS A SELECTED FACT'S MENU: `↓` on the folder the keyboard
@@ -649,10 +652,6 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
     name_the_account(&app, session, "main");
     menu_frame(&mut app, wid);
     let before = drawn_marks(&app, wid);
-    let autopilot = |app: &mut App| {
-        app.open_front_autopilot_menu()
-            .expect("the chip is on the glass");
-    };
     let effort = |app: &mut App| {
         app.open_front_fact_menu(Fact::Effort)
             .expect("the effort is on the glass");
@@ -661,6 +660,7 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
             room: 44,
             effort: Some("xhigh".into()),
             key_row: Some(true),
+            stops: Some((vec!["medium", "high", "xhigh"], Some(2))),
             ..FactMenuFacts::default()
         };
         app.autopilot_menu.as_mut().expect("open").rows =
@@ -685,7 +685,7 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
             }],
         };
         let enrolled = BTreeSet::from(["main".to_string()]);
-        let (accounts, pool_unpinned) = account_menu_rows_from(
+        let accounts = account_menu_rows_from(
             &roster,
             &State::default(),
             &enrolled,
@@ -696,11 +696,10 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
             1_793_000_000,
         );
         let facts = FactMenuFacts {
-            title: "Accounts \u{b7} tab 1".into(),
+            title: "Account \u{b7} tab 1".into(),
             room: 44,
             cli: Some(Cli::Claude),
             accounts,
-            pool_unpinned,
             ..FactMenuFacts::default()
         };
         app.autopilot_menu.as_mut().expect("open").rows =
@@ -712,25 +711,14 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         &'static [BandIcon],
         &'static [char],
     );
-    let cases: [Case; 4] = [
-        (
-            "Autopilot",
-            autopilot,
-            &[BandIcon::ToBar, BandIcon::Ring, BandIcon::Disc],
-            &['\u{221e}', '\u{2699}'],
-        ),
+    let cases: [Case; 3] = [
         (
             "effort",
             effort,
-            &[BandIcon::Fisheye, BandIcon::InsetDiamond, BandIcon::Ring],
-            &['\u{22ef}'],
+            &[BandIcon::Fisheye, BandIcon::Disc, BandIcon::Ring],
+            &[],
         ),
-        (
-            "folder",
-            folder,
-            &[BandIcon::House, BandIcon::Ring],
-            &['+', '\u{29c9}'],
-        ),
+        ("folder", folder, &[BandIcon::House], &['+', '\u{29c9}']),
         ("account", account, &[BandIcon::Enter], &['\u{22ef}']),
     ];
     for (what, open, want, plain) in cases {
@@ -850,7 +838,7 @@ fn a_fact_card_is_named_in_its_words_never_its_glyphs() {
 /// an older reading's bound as an exact figure
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1). CONTROL: a line
 /// of words alone is said as it reads; trimming `≥` as a mark (the words
-/// before 2026-11-07) says the bound as `weekly 38% used`.
+/// before 2026-11-07) says the bound as `weekly 62% left`.
 #[test]
 fn a_lines_spoken_words_leave_its_glyphs_out() {
     use crate::autopilot_menu::spoken_words;
@@ -859,11 +847,11 @@ fn a_lines_spoken_words_leave_its_glyphs_out() {
             "\u{2386}  sol@example.test \u{b7} max 20x",
             "sol@example.test, max 20x",
         ),
-        ("   weekly \u{2265}38% used", "weekly at least 38% used"),
-        ("   weekly 38% used", "weekly 38% used"),
+        ("   weekly \u{2264}62% left", "weekly at most 62% left"),
+        ("   weekly 62% left", "weekly 62% left"),
         (
-            "\u{2386} main   75%  Max 20x   \u{21ba} Sat 10:00",
-            "main 75% Max 20x Sat 10:00",
+            "\u{2386} main   25% left  Max 20x   \u{21ba} Sat 10:00",
+            "main 25% left Max 20x Sat 10:00",
         ),
         (
             "No rotation accounts configured \u{2014} run aterm init",

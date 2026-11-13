@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Close-only custody of an original ordinary memory reservation.
+//! Close-only custody of an original ordinary resource reservation.
 
 use std::fs::{File, Metadata};
 use std::io;
@@ -13,7 +13,7 @@ use aterm_toolchain::record_lock::CloseOnlyLock;
 
 use crate::{Accounting, Ledger, Record};
 
-/// An actual detached ordinary memory claim, held until the last kernel guard closes.
+/// An actual detached ordinary reservation, held until the last kernel guard closes.
 ///
 /// The original record and declared peak are preserved; its detached accounting ignores
 /// numeric holder credit, ancestry and coverage. This type cannot mutate a claim, bind or
@@ -27,6 +27,14 @@ pub struct RetainedClaim {
 }
 
 impl RetainedClaim {
+    /// The memory-and-CPU reservation schema this implementation writes and reads.
+    /// This type also represents memory-only guards; this static schema name
+    /// does not describe an instance or grant permission to detach one.
+    #[must_use]
+    pub fn reservation_protocol_marker() -> &'static [u8] {
+        crate::ledger::DETACHED_RESERVATION
+    }
+
     pub(crate) fn original(guard: CloseOnlyLock, path: PathBuf, record: Record) -> Self {
         Self {
             guard,
@@ -62,7 +70,7 @@ impl RetainedClaim {
         &self.record
     }
 
-    /// Adopt an actual inherited detached memory guard in an independently selected ledger.
+    /// Adopt an actual inherited detached reservation in an independently selected ledger.
     /// No pathname or numeric budget on the command line creates a reservation.
     ///
     /// # Safety
@@ -74,7 +82,7 @@ impl RetainedClaim {
     ///
     /// # Errors
     /// The legacy ledger, exact leaf/inode/OFD, detached marker, stable bounded original
-    /// record, admission or non-covering memory-only budget cannot be established.
+    /// record, admission or non-covering memory/CPU budget cannot be established.
     pub unsafe fn adopt_inherited(fd: RawFd, ledger: &Ledger, leaf: &str) -> io::Result<Self> {
         if ledger.cohort_aware()?
             || !ledger.dir().is_absolute()
@@ -91,7 +99,7 @@ impl RetainedClaim {
                 !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit() || b == b'-')
             })
         {
-            return Err(invalid("invalid original memory claim leaf"));
+            return Err(invalid("invalid original reservation leaf"));
         }
         let path = ledger.dir().join(leaf);
         // SAFETY: the caller supplies the startup ownership and continuous original chain;
@@ -115,11 +123,11 @@ pub(crate) fn check_record(record: &Record, path: &Path, accounting: Accounting)
     let leaf = format!("{}.claim", record.cover_marker());
     if record.accounting != accounting
         || record.held.is_none()
-        || !crate::ledger::memory_only(&record.need)
+        || !crate::ledger::retained_reservation(&record.need)
         || path.file_name() != Some(std::ffi::OsStr::new(&leaf))
     {
         return Err(invalid(
-            "the original admitted memory-only record does not match its exact claim leaf",
+            "the original admitted reservation does not match its exact claim leaf",
         ));
     }
     Ok(())
@@ -147,7 +155,7 @@ pub(crate) fn read_record(fd: OwnedFd, path: &Path) -> io::Result<Record> {
         || before.len() > crate::ledger::RECORD_MAX
     {
         return Err(invalid(
-            "original memory guard inode or bounded record is unavailable",
+            "original reservation inode or bounded record is unavailable",
         ));
     }
     let mut bytes = vec![0; before.len() as usize];
@@ -164,7 +172,13 @@ pub(crate) fn read_record(fd: OwnedFd, path: &Path) -> io::Result<Record> {
         std::str::from_utf8(&bytes).map_err(|_| invalid("original memory record is not UTF-8"))?;
     let record = Record::decode(text, true)
         .ok_or_else(|| invalid("original memory record cannot be decoded"))?;
-    if record.accounting == Accounting::Detached && !bytes.ends_with(crate::ledger::DETACHED_MEMORY)
+    if record.accounting == Accounting::Detached
+        && ![
+            crate::ledger::DETACHED_MEMORY,
+            crate::ledger::DETACHED_RESERVATION,
+        ]
+        .into_iter()
+        .any(|marker| bytes.ends_with(marker))
     {
         return Err(invalid(
             "detached memory intent is not the complete final record event",

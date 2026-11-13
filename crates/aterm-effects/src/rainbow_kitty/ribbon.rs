@@ -289,6 +289,27 @@ pub const FOOT_CLEAR_PX: f32 = crate::cursor_glow::LETTER_GUARD_RING as f32 + 1.
 /// The run over which the in-row rail eases in beside a foot, px.
 pub const FOOT_EASE_PX: f32 = 3.0;
 
+/// The pitch the in-row rail ([`ROW_RAIL_CH`]) is laid at beside a foot's ink and a thin
+/// caret, px ([`part_row_rail`]): a slab is flat at the light of its middle, so the gap round
+/// a descender is cut to the pixel.
+pub const ROW_RAIL_PITCH_PX: f32 = 1.0;
+
+/// The run over which the in-row rail ([`ROW_RAIL_CH`]) eases in beside a foot's ink, px,
+/// where the host's face names that ink ([`KeepOut::foot_gap`]): the rail keeps
+/// [`FOOT_CLEAR_PX`] off the ink's columns (the judge's ring and a pixel; laid a pixel apart,
+/// its slabs carry no light across that) and is whole two pixels on, a gap as wide as the
+/// descender and its ring, as a typeset underline's skip is.
+pub const ROW_RAIL_INK_EASE_PX: f32 = 2.0;
+
+/// How far the in-row rail ([`ROW_RAIL_CH`]) keeps off a bar or an underline caret's cell,
+/// px: the judge's ring and a pixel, as off a foot ([`FOOT_CLEAR_PX`]), so the line under the
+/// words ends in a clean gap before the caret and none of its light lies in the caret's cell,
+/// where a bar stands the cell's whole height and an underline in the foot band itself.
+pub const CARET_CLEAR_PX: f32 = FOOT_CLEAR_PX;
+
+/// The run over which the in-row rail eases out before a thin caret ([`CARET_CLEAR_PX`]), px.
+pub const CARET_EASE_PX: f32 = 2.0;
+
 /// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, and never
 /// inside the judge's ring round a descender's foot
 /// ([`crate::cursor_glow::LETTER_GUARD_RING`]), as a bed's rail on a lit page
@@ -339,6 +360,110 @@ use crate::cursor_glow::{BODY_CONTRAST_BAR, BODY_CONTRAST_GUARD};
 /// A place in a stream laid through a [`RampSink`]: its quads' length and
 /// its ramps' mark ([`BeamRows::mark`]).
 pub type StreamMark = (usize, RampMark);
+
+/// What [`Ribbon::emit`] lays of a run: its body, the vivid rail under its row, or the rail
+/// in its own row's foot band ([`ROW_RAIL_CH`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lay {
+    Body,
+    Rail,
+    RowRail,
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static BODY_BAND_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static FEATHER_BY_ROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with the head feather laid finely only in a frame under
+/// [`FEATHER_ROOM_SHARE`] of the quad budget, as it was: a long line's feather was a stair of
+/// flat slabs that walked under it as the line flowed into its fold. Debug and test builds
+/// only; the flag is this thread's and is put back as it was when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_head_feather_by_room<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            FEATHER_BY_ROOM.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(FEATHER_BY_ROOM.with(|c| c.replace(true)));
+    f()
+}
+
+/// A test's negative control: `f` run with the underline's body laid whole in its row's foot
+/// band under a parted rail, as it was: its light lay in every gap the rail leaves round a
+/// descender and before a thin caret. Debug and test builds only; the flag is this thread's
+/// and is put back as it was when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_body_band_whole<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            BODY_BAND_WHOLE.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(BODY_BAND_WHOLE.with(|c| c.replace(true)));
+    f()
+}
+
+/// `verts`, a rail in its own row's foot band, laid every [`ROW_RAIL_PITCH_PX`] wherever
+/// `near` (asked of a span of x) says its light changes, each vertex passed through `part`;
+/// `head` is the head's vertex, and its place in the result is returned. The plan's own
+/// vertices stand a few to a cell and a beam lerps between them, so a gap cut at them alone
+/// would be a ramp a cell wide either side of a descender.
+#[inline]
+fn part_row_rail(
+    verts: &mut Vec<RibbonVertex>,
+    out: &mut Vec<RibbonVertex>,
+    head: usize,
+    near: impl Fn(f32, f32) -> bool,
+    part: impl Fn(RibbonVertex) -> RibbonVertex,
+) -> usize {
+    out.clear();
+    let mut head_out = 0;
+    let mut i = 0;
+    while i < verts.len() {
+        let b = verts[i];
+        if i > 0 {
+            let a = verts[i - 1];
+            let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+            if near(lo, hi) {
+                let n = ((hi - lo) / ROW_RAIL_PITCH_PX).ceil().max(1.0) as usize;
+                let mut j = 1;
+                while j < n {
+                    let t = j as f32 / n as f32;
+                    let lerp = |u: f32, v: f32| u + (v - u) * t;
+                    out.push(part(RibbonVertex {
+                        x: lerp(a.x, b.x),
+                        spine: lerp(a.spine, b.spine),
+                        up: lerp(a.up, b.up),
+                        dn: lerp(a.dn, b.dn),
+                        core_up: lerp(a.core_up, b.core_up),
+                        core_dn: lerp(a.core_dn, b.core_dn),
+                        color: crate::effect_util::lerp_rgb(a.color, b.color, t),
+                        cov: lerp(a.cov, b.cov),
+                        lift: lerp(a.lift, b.lift),
+                        lift_span: lerp(a.lift_span, b.lift_span),
+                    }));
+                    j += 1;
+                }
+            }
+        }
+        if i == head {
+            head_out = out.len();
+        }
+        out.push(part(b));
+        i += 1;
+    }
+    mem::swap(verts, out);
+    head_out
+}
 
 /// Whether the stream laid up to `to` still stands within the stream at
 /// `at`: a rail span past it was cut away with what it drew.
@@ -3252,6 +3377,15 @@ pub struct Ribbon {
     /// (looks9 Q9's negative control, [`ROW_RAIL_DIP_GAP_PX`]).
     #[cfg(test)]
     pub(crate) row_rail_parted: bool,
+    /// Test-only: a row held over letters, and the pane's last row, lay no rail in their own
+    /// foot band, as they did: the row a person types on had a dim foot band and no line
+    /// (CT-05's negative control).
+    #[cfg(test)]
+    pub(crate) held_rail_off: bool,
+    /// The caret is a bar or an underline ([`Self::set_thin_caret`]).
+    thin_caret: bool,
+    /// The in-row rail's vertices laid finely ([`part_row_rail`]).
+    parted: Vec<RibbonVertex>,
     /// Test-only: draw the pet's and the flat ribbon alike on paper (no
     /// rail, one body), the negative control of their reading apart there.
     #[cfg(test)]
@@ -3554,6 +3688,10 @@ impl Ribbon {
             #[cfg(test)]
             row_rail_off: false,
             #[cfg(test)]
+            held_rail_off: false,
+            thin_caret: false,
+            parted: Vec::new(),
+            #[cfg(test)]
             row_rail_parted: false,
             #[cfg(test)]
             paper_alike: false,
@@ -3842,6 +3980,14 @@ impl Ribbon {
     #[must_use]
     pub const fn rail_spans(&self) -> &[(StreamMark, StreamMark, bool)] {
         self.rail_spans.as_slice()
+    }
+
+    /// Whether the caret is a bar or an underline: the rail in the caret's row's foot band
+    /// ends in a gap before its cell ([`CARET_CLEAR_PX`]). Under a block it runs on, and the
+    /// block covers it.
+    #[inline]
+    pub const fn set_thin_caret(&mut self, thin: bool) {
+        self.thin_caret = thin;
     }
 
     /// Forget the rails' spans: the frame drew none, or what it drew was cut away.
@@ -8879,6 +9025,24 @@ impl Ribbon {
         let row_rail_parted = self.row_rail_parted;
         #[cfg(not(test))]
         let row_rail_parted = false;
+        #[cfg(test)]
+        let held_rail_off = self.held_rail_off;
+        #[cfg(not(test))]
+        let held_rail_off = false;
+        #[cfg(any(test, debug_assertions))]
+        let feather_by_room = FEATHER_BY_ROOM.with(std::cell::Cell::get);
+        #[cfg(any(test, debug_assertions))]
+        let body_band_whole = BODY_BAND_WHOLE.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let body_band_whole = false;
+        let mut parted = mem::take(&mut self.parted);
+        // A bar or an underline caret's cell, which the in-row rail of its row ends before.
+        let caret_gap = if self.thin_caret {
+            let x0 = f32::from(ctx.geom.origin_x) + f32::from(ctx.caret.1) * ctx.geom.cw as f32;
+            Some((ctx.caret.0, x0, x0 + ctx.geom.cw as f32))
+        } else {
+            None
+        };
         let row_rail = (ROW_RAIL_CH * chf).floor().max(1.0);
         // A slab spans to the next vertex at its own light: the in-row
         // rail keeps a slab more off a foot.
@@ -8930,31 +9094,55 @@ impl Ribbon {
                 < RIBBON_QUAD_BUDGET as f32 * RUN_END_ROOM_SHARE
         };
         {
-            let mut paint = |out: &mut RampSink<'_>, run: &Run, rail_layer: bool| -> bool {
+            let mut paint = |out: &mut RampSink<'_>, run: &Run, layer: Lay| -> bool {
+                let rail_layer = !matches!(layer, Lay::Body);
                 // A span past the stream's end was cut away with what it
                 // drew (the body-first repaint): it is spent.
                 let at = out.mark();
                 rail_spans.retain(|&(_, to, _)| rail_within(to, at));
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
-                // Over a filled cell the rail lies in its own row's bottom
-                // band ([`ROW_RAIL_CH`]), whole: the row's hold keeps the
-                // body off the row below, and this rail never leaves its row.
-                let in_row = rail_layer
-                    && rail
+                // The rail lies in its own row's bottom band ([`ROW_RAIL_CH`]) wherever it
+                // may not lie under the row, on a row whose glyphs the host named:
+                // - over a filled cell, whole (the row's hold keeps the body off the row
+                //   below, and this rail never leaves its row);
+                // - on the pane's last row, whole (no row is under it);
+                // - on a row held over letters, by its hold: the rail under the row dims as
+                //   the row settles into itself and this one takes its light, so the row a
+                //   person types on (a prompt over a full page's last row, a composer over
+                //   its rule) keeps the vivid line under its words. Before, such a row laid
+                //   its dim foot band and no rail.
+                let row_top_i = (row_bottom - chf) as i32;
+                let feet_known = rail
                     && !row_rail_off
                     && run.hi > run.lo
-                    && self
-                        .keep_out
-                        .knows_feet(((row_bottom - chf) as i32, row_bottom as i32))
-                    && {
-                        let (a, b) = (plan[run.lo].x, plan[run.hi - 1].x);
-                        let below = row_bottom + rail_gap;
-                        self.keep_out.fills(
-                            (a.min(b).floor() as i32, a.max(b).ceil() as i32 + 1),
-                            (below as i32, (below + rail_reach_max).ceil() as i32),
-                        )
-                    };
-                if rail_layer && (!rail || (run.hold >= 1.0 && !in_row) || row_bottom >= pane_bot) {
+                    && self.keep_out.knows_feet((row_top_i, row_bottom as i32));
+                let over_fill = feet_known && {
+                    let (a, b) = (plan[run.lo].x, plan[run.hi - 1].x);
+                    let below = row_bottom + rail_gap;
+                    self.keep_out.fills(
+                        (a.min(b).floor() as i32, a.max(b).ceil() as i32 + 1),
+                        (below as i32, (below + rail_reach_max).ceil() as i32),
+                    )
+                };
+                let floor_row = row_bottom >= pane_bot;
+                let row_share = if !feet_known {
+                    0.0
+                } else if over_fill {
+                    1.0
+                } else if held_rail_off {
+                    0.0
+                } else if floor_row {
+                    1.0
+                } else {
+                    run.hold
+                };
+                let in_row = matches!(layer, Lay::RowRail);
+                let dark = match layer {
+                    Lay::Body => false,
+                    Lay::Rail => !rail || over_fill || run.hold >= 1.0 || floor_row,
+                    Lay::RowRail => row_share <= 0.0,
+                };
+                if dark {
                     return true;
                 }
                 // A glass run nowhere [`GLASS_MIN_PX`] tall draws nothing: the glass is whole
@@ -8967,7 +9155,12 @@ impl Ribbon {
                 {
                     return true;
                 }
-                let hold = if in_row { 0.0 } else { run.hold };
+                let hold = if in_row { 1.0 - row_share } else { run.hold };
+                // The face named the ink of this row's feet: the in-row rail parts round the
+                // ink ([`part_row_rail`]), not round each foot's cell. Over a filled row it
+                // keeps its dip under each foot's cell, as it was laid before this lay had a
+                // row of its own to hold.
+                let inked = in_row && !over_fill && self.keep_out.inks_row(row_top_i);
                 // The glass's run ends where its height does (§15.2 1.8): no head feather.
                 let head_feather_of = if glass && !rail_layer {
                     HeadFeather {
@@ -8978,9 +9171,23 @@ impl Ribbon {
                 } else {
                     self.head_feather(ctx, run)
                 };
+                // The head feather is laid a pixel apart wherever the frame's estimate, with
+                // this feather's own windows, stays within the budget, not only under
+                // [`FEATHER_ROOM_SHARE`] of it. Laid at the plan's strides it is a stair of
+                // flat slabs, and a line that flows into the fold carries its boundaries along
+                // under the feather ([`RetractX`]): the stair then walks through the feather's
+                // 1.2 cells and every pixel there steps up and down 20 times a second for the
+                // flow's 1.5 s. A line of 50 cells or more was over the share.
+                let fine = roomy
+                    || (self.plan.len() as f32 + head_feather_of.width / FEATHER_FINE_PX)
+                        * FEATHER_ROOM_ROWS
+                        * chf
+                        < RIBBON_QUAD_BUDGET as f32;
                 #[cfg(test)]
-                let roomy = roomy && !coarse;
-                let fine_feather = if roomy {
+                let fine = fine && !coarse;
+                #[cfg(any(test, debug_assertions))]
+                let fine = if feather_by_room { roomy } else { fine };
+                let fine_feather = if fine {
                     head_feather_of
                 } else {
                     HeadFeather {
@@ -9007,7 +9214,14 @@ impl Ribbon {
                 } else {
                     (0.0, 0.0)
                 };
+                // A bar or an underline caret on this row: what lies in the row's foot band ends
+                // before its cell.
+                let gap = match caret_gap {
+                    Some((row, x0, x1)) if row == run.row => Some((x0, x1)),
+                    _ => None,
+                };
                 if rail_layer {
+                    let gap = if in_row { gap } else { None };
                     let rail_scale = RAIL_GAIN * (1.0 - hold);
                     let flat_dim_scale = FLAT_DIM_RAIL_GAIN * (1.0 - hold);
                     let rail_core = if flat_dim {
@@ -9049,7 +9263,7 @@ impl Ribbon {
                         } else {
                             (row_bottom + rail_gap).max(seg.spine)
                         };
-                        let (top, foot, dipped) = if in_row {
+                        let (top, foot, dipped) = if in_row && !inked {
                             let share = self.keep_out.foot_share(
                                 (seg.x, row_bottom - 1.0),
                                 foot_clear,
@@ -9091,6 +9305,54 @@ impl Ribbon {
                             lift_span: 0.0,
                         });
                     });
+                    if inked || gap.is_some() {
+                        let ring = crate::cursor_glow::LETTER_GUARD_RING as f32;
+                        let clear = FOOT_CLEAR_PX;
+                        let reach = clear + ROW_RAIL_INK_EASE_PX;
+                        let caret_reach = CARET_CLEAR_PX + CARET_EASE_PX;
+                        let keep_out = &self.keep_out;
+                        head_rev = part_row_rail(
+                            &mut verts,
+                            &mut parted,
+                            head_rev,
+                            |lo, hi| {
+                                (inked && keep_out.ink_near((lo, hi), row_top_i, reach))
+                                    || matches!(gap, Some((x0, x1))
+                                        if x0 - caret_reach <= hi && lo <= x1 + caret_reach)
+                            },
+                            |mut v| {
+                                let g = keep_out.foot_gap(
+                                    v.x,
+                                    row_top_i,
+                                    (clear, ROW_RAIL_INK_EASE_PX),
+                                );
+                                // The ink's ring ends over the band's top: nothing to leave.
+                                let lane = g.end as f32 + ring;
+                                if inked && g.keep < 1.0 && lane > v.spine {
+                                    // Under the ink and its ring, over the ink below and its
+                                    // ring and inside the pane, the rail runs on, whole
+                                    // ([`ROW_RAIL_DIP_GAP_PX`]); with no such room (the
+                                    // pane's last row, a tall letter below) it parts round
+                                    // the ink, as a typeset underline skips a descender.
+                                    let room = (g.below as f32 - ring).min(pane_bot) - lane;
+                                    if room >= dip_rail.min(2.0) && !row_rail_parted {
+                                        let depth = room.min(row_rail);
+                                        let core = if v.dn > 0.0 { v.core_dn / v.dn } else { 0.0 };
+                                        v.spine = lane + (v.spine - lane) * g.keep;
+                                        v.dn = depth + (v.dn - depth) * g.keep;
+                                        v.core_dn = v.dn * core;
+                                    } else {
+                                        v.cov *= g.keep;
+                                    }
+                                }
+                                if let Some((x0, x1)) = gap {
+                                    let d = (x0 - v.x).max(v.x - x1) - CARET_CLEAR_PX;
+                                    v.cov *= smoothstep01(d * (1.0 / CARET_EASE_PX));
+                                }
+                                v
+                            },
+                        );
+                    }
                 } else if glass {
                     // The glass stands on its row's bottom with no reach below it, as tall as
                     // the plan's glass reach where the row's keep-outs and the box's rise
@@ -9171,6 +9433,57 @@ impl Ribbon {
                             lift_span: lift_span.min((seg.spine - box_top).max(0.0)),
                         });
                     });
+                    // The underline's body on a row that keeps its line in its own foot band
+                    // is a band there too ([`UNDERLINE_UP_CH`]), under the rail: it parts
+                    // where the rail does, by the row's share, round the ink of a foot the
+                    // face named and before a thin caret. Left whole, it lay in the gaps the
+                    // rail leaves (a bottom prompt's `q` on GitHub Light stood in a mint band
+                    // that touched its ink, and the band ran on to the bar caret). The tall
+                    // body is a wash behind its row's letters, not a band under them, and a
+                    // filled row's rail keeps its cell-wide parting: both are left as laid.
+                    let share = if prof.tall || over_fill || body_band_whole {
+                        0.0
+                    } else {
+                        row_share
+                    };
+                    let inked = share > 0.0 && self.keep_out.inks_row(row_top_i);
+                    let gap = if share > 0.0 { gap } else { None };
+                    if inked || gap.is_some() {
+                        let reach = FOOT_CLEAR_PX + ROW_RAIL_INK_EASE_PX;
+                        let caret_reach = CARET_CLEAR_PX + CARET_EASE_PX;
+                        let keep_out = &self.keep_out;
+                        head_rev = part_row_rail(
+                            &mut verts,
+                            &mut parted,
+                            head_rev,
+                            |lo, hi| {
+                                (inked && keep_out.ink_near((lo, hi), row_top_i, reach))
+                                    || matches!(gap, Some((x0, x1))
+                                        if x0 - caret_reach <= hi && lo <= x1 + caret_reach)
+                            },
+                            |mut v| {
+                                let mut keep = if inked {
+                                    keep_out
+                                        .foot_gap(
+                                            v.x,
+                                            row_top_i,
+                                            (FOOT_CLEAR_PX, ROW_RAIL_INK_EASE_PX),
+                                        )
+                                        .keep
+                                } else {
+                                    1.0
+                                };
+                                if let Some((x0, x1)) = gap {
+                                    let d = (x0 - v.x).max(v.x - x1) - CARET_CLEAR_PX;
+                                    keep *= smoothstep01(d * (1.0 / CARET_EASE_PX));
+                                }
+                                let keep = 1.0 - share * (1.0 - keep);
+                                v.cov *= keep;
+                                v.lift *= keep;
+                                v
+                            },
+                        );
+                    }
                 }
                 let start = out.mark();
                 let lay = if rail_layer {
@@ -9216,12 +9529,12 @@ impl Ribbon {
             let mut i = 0;
             while i < runs.len() {
                 let run = &runs[i];
-                if !paint(under, run, false) {
+                if !paint(under, run, Lay::Body) {
                     retry_body_first = prior_rail_drawn && focused_multi_run_row == Some(run.row);
                     break;
                 }
                 let rail_from = under.laid();
-                if !paint(under, run, true) {
+                if !(paint(under, run, Lay::Rail) && paint(under, run, Lay::RowRail)) {
                     retry_body_first = if let Some(row) = focused_multi_run_row {
                         let mut later_on_row = false;
                         let mut li = i + 1;
@@ -9248,7 +9561,7 @@ impl Ribbon {
                 let mut bi = 0;
                 while bi < runs.len() {
                     let run = &runs[bi];
-                    if run.row == row && !paint(under, run, false) {
+                    if run.row == row && !paint(under, run, Lay::Body) {
                         bodies_complete = false;
                         break;
                     }
@@ -9259,7 +9572,9 @@ impl Ribbon {
                     let mut ri = 0;
                     while ri < runs.len() {
                         let run = &runs[ri];
-                        if run.row == row && !paint(under, run, true) {
+                        if run.row == row
+                            && !(paint(under, run, Lay::Rail) && paint(under, run, Lay::RowRail))
+                        {
                             rails_complete = false;
                             break;
                         }
@@ -9270,7 +9585,9 @@ impl Ribbon {
                         while oi < runs.len() {
                             let run = &runs[oi];
                             if run.row != row
-                                && (!paint(under, run, false) || !paint(under, run, true))
+                                && !(paint(under, run, Lay::Body)
+                                    && paint(under, run, Lay::Rail)
+                                    && paint(under, run, Lay::RowRail))
                             {
                                 break;
                             }
@@ -9288,6 +9605,7 @@ impl Ribbon {
         self.rail_spans = rail_spans;
         self.runs = runs;
         self.verts = verts;
+        self.parted = parted;
         self.emit_hot_edge(ctx, frame);
         #[inline]
         const fn end_reads_as_ink(

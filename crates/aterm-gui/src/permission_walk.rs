@@ -9,23 +9,40 @@
 //! macOS asks after it is gone. Debugger access is no page of the walk's: setup's one early
 //! elevation turns developer mode on (`aterm_machines::root_steps`).
 //!
-//! * It starts by itself once, on a cold first launch or in an update's successor
-//!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before and no typing
-//!   ([`START_KEYS_QUIET`]), the Mac Setup tab not the next macOS ask
-//!   (`App::mac_setup_tab_comes_next`), System Settings
-//!   asking nothing (`App::system_settings_may_ask`). Automatic acquisition requires no visit
-//!   to System State and no recent keyboard activity.
+//! * It starts by itself in a process the owner started or an update's successor ([`starts`],
+//!   [`WalkLane::note_successor`]), with no typing ([`START_KEYS_QUIET`]), the Mac Setup tab not
+//!   the next macOS ask (`App::mac_setup_tab_comes_next`), no install of Apple's tools running
+//!   that may still ask or that a quit would cut off (this launch's tab,
+//!   `App::access_gesture_up`; an adopted one or an installer,
+//!   `App::developer_tools_install_elsewhere`; neither once this launch's tabs are carried past
+//!   their password, `App::developer_tools_install_carried`), and System Settings asking nothing
+//!   (`App::system_settings_may_ask`), over the pages an earlier walk had still to show whose
+//!   time has come ([`WALK_RECORD`], [`KeptPage::due`]); else, on a Mac where aterm never
+//!   brought a page up, over every grant
+//!   missing (the first walk); else over Accessibility alone, once per approved revision, when
+//!   the setup run's reading says the sign-outs need it (`App::look_for_walk_start`). Automatic
+//!   acquisition requires no visit to System State and no recent keyboard activity.
 //!   `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
 //!   and the Permissions row's press start one; the verb sent while one is under way joins it
 //!   ([`WalkLane::join`]) and takes back a page the walk passed
 //!   only as often as it may start one. A verb's ask its control lane gave up before the main
 //!   thread took it (the client answered `ERR late`, or gone) starts none
 //!   ([`App::take_permission_walk_ask`]).
-//! * A walk under way when System Settings' Quit & Reopen ends this process (the question macOS
-//!   asks once Full Disk Access is switched on) leaves its pages, from the one it is at on, in
-//!   `<state>` for the aterm that opens again ([`App::leave_walk_at_quit`]); that aterm's first
-//!   look takes them, and they start a walk under the start's other rules though its pages came
-//!   up before ([`App::take_walk_reopen`]).
+//! * A walk keeps the pages it has still to show, from the one it is at on, in `<state>`'s walk
+//!   record ([`WALK_RECORD`]) at its start and at each turn, for this `.app` on this Mac under
+//!   the approved revision ([`WalkLane::keep_ahead`]), so however this process ends (aterm's quit,
+//!   System Settings' Quit & Reopen once Full Disk Access is switched on, an update's handoff, a
+//!   logout, a crash) the next one walks on from there under the start's other rules, though its
+//!   pages came up before. The record goes once the walk ends by the person's answer (the close
+//!   box, a Not now that ends it, System Settings quit under its page) or runs out
+//!   ([`WalkLane::end`]), and a page the person left for its ten minutes leaves it alone
+//!   ([`WalkLane::lapse`]): what the person left is theirs, offered on System State's Permissions
+//!   row, never brought up again by itself: offered, never nagged. A walk that stops because aterm
+//!   could not show a page (its panel gone or replaced, a page that could not open) keeps its
+//!   pages, each counting one more walk in a row that left it so ([`WalkLane::stop`]): such a page
+//!   comes back by itself on [`WALK_AGAIN`]'s schedule, whose tries and last time the record keeps,
+//!   so in this process or the next, never at every launch and never left to a press. A walk that
+//!   gives way to a press elsewhere counts none ([`WalkLane::give_way`]).
 //! * It is the owner's press (`devtools_helper::Origin::Walk`): no quiet moment, no ten-minute
 //!   gap between its pages. A Not now holds the page it was said on, as on any panel. On a page
 //!   asked for by name (the verb's subjects, the row pressed) the walk goes on only to another
@@ -39,13 +56,18 @@
 //! * A grant already held is skipped without opening its page ([`Walk::advance`]), and the
 //!   panel's "Step 1 of N" counts only the pages that come up ([`Walk::position`]); while a page
 //!   is up and the person is at the Mac the window reads its grant every [`GRANT_POLL`]. A
-//!   page's ten minutes count only the person's time: behind a lock, or while nobody touches the
-//!   Mac, they stop, and nothing is read (`App::count_walk_page_time`), so the page is there when
-//!   they come back. A page that lapses after ten minutes of theirs ends the walk giving way:
-//!   the pages after it start again at the next quiet moment, the page that lapsed does not
-//!   ([`WalkLane::lapse`]), so no page comes back again and again. Accessibility reading on asks
-//!   macOS's Automation question too, and a walk that asked it opens no page while it is out
-//!   ([`WalkReach::automation_out`]), so its next page never comes up beside that question.
+//!   page's ten minutes count only the person's time: behind a lock, while nobody touches the
+//!   Mac, or while a quit is asked of this process, they stop, and nothing is read
+//!   (`App::count_walk_page_time`), so the page is there when they come back, and a going
+//!   process never lapses its page. A page that lapses after ten minutes of theirs ends the walk
+//!   giving way: the pages after it start again at the next quiet moment, and the page that
+//!   lapsed leaves the walk record, the person's to give from System State
+//!   ([`WalkLane::lapse`]), so no page comes back again and again. Accessibility
+//!   reading on asks macOS's Automation question too, and a walk that asked it opens no page while
+//!   it is out ([`WalkReach::automation_out`]), so its next page never comes up beside that
+//!   question. Where Accessibility already reads on, so no walk comes to its page, the window
+//!   asks the question by itself once per approved revision while the setup run's rows say a
+//!   sign-out waits for its answer (`App::look_for_automation_ask`).
 //!   Full Disk Access reading on brings macOS's Quit & Reopen sheet over System Settings: the
 //!   page's done words wait, naming the next page, until that sheet is gone and no quit is asked
 //!   of this process ([`App::turn_after_fda`]), so the next page's link is never lost under it.
@@ -54,6 +76,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::{Access, AccessOutcome};
+use aterm_types::retry_schedule::Backoff;
 
 use crate::App;
 use crate::devtools_helper::{Closed, HandOver, Moment, Origin, Page};
@@ -81,23 +104,36 @@ pub(crate) const VERB_AGAIN_AFTER: Duration = Duration::from_secs(60);
 /// probe) before it opens, or is tried, without one.
 pub(crate) const UNREAD_WAIT: Duration = Duration::from_secs(3);
 
-/// The marker in `<state>` a walk under way leaves at System Settings' Quit & Reopen for the
-/// aterm that opens again ([`App::leave_walk_at_quit`]).
-pub(crate) const REOPEN_MARKER: &str = "permission-walk-reopen";
+/// The walk record in `<state>`: for each `.app` and Mac, the pages its walk has still to show
+/// under an approved revision, each with the walks in a row that left it unanswered
+/// ([`keep_pages_in`], [`left_pages_in`]). `<state>` is shared by a network home's Macs and by a
+/// dev bundle beside the release, so each keeps a line of its own.
+pub(crate) const WALK_RECORD: &str = "permission-walk";
 
-/// The most a reopen marker holds: a line of seconds and words, a bundle's path and a Mac's
-/// hardware UUID.
-const MAX_REOPEN_BYTES: usize = 4096;
+/// The Quit & Reopen marker an aterm before the walk record wrote in `<state>`: the quit's unix
+/// seconds and the walk's pages' words on its first line, the `.app`'s path on the second, the
+/// Mac's hardware UUID on the third. A Quit & Reopen under such an aterm can open into this one
+/// (a staged update), so the first read of the walk record takes this `.app`'s marker on this
+/// Mac into it and removes it ([`left_pages_in`]).
+const OLD_REOPEN_MARKER: &str = "permission-walk-reopen";
 
-/// How long after the quit that wrote it a reopen marker starts a walk: the Quit & Reopen helper
-/// opens aterm within [`crate::quit_reopen::REOPEN_CEILING`] of that quit (three minutes and
-/// five seconds: its waits for the quitting aterm to be gone, for LaunchServices to drop it, and
-/// for `open`), and the reopened aterm's first look comes seconds after its launch, a minute
-/// allowed. One older is from a quit whose reopen never came, and an aterm the person opens
-/// later starts no walk from it; one within it that another bundle or Mac wrote is left for the
-/// aterm it names.
-pub(crate) const REOPEN_WITHIN: Duration =
-    Duration::from_secs(crate::quit_reopen::REOPEN_CEILING.as_secs() + 60);
+/// The most the walk record holds, and the most of [`OLD_REOPEN_MARKER`] read.
+const MAX_RECORD_BYTES: usize = 4096;
+
+/// The most lines the walk record keeps, the newest: a line for each `.app` and Mac.
+const MAX_RECORD_LINES: usize = 16;
+
+/// When a page a walk left because aterm could not show it (its panel went or never came,
+/// another panel replaced it, it could not open) comes back by itself: a day after the first
+/// walk that left it so, twice the last pause after each later one in a row, never more than a
+/// Not now's own hold (`atpkg::devtools::DECLINE_HOLD_S`), so an unanswered page neither comes
+/// back at every launch nor waits on the person's press ([`KeptPage::due`]). The tries and the
+/// last one's time live in the walk record, so a relaunch, an update or a reboot reads the same
+/// due time, in this process or the next.
+pub(crate) const WALK_AGAIN: Backoff = Backoff::new(
+    Duration::from_secs(86_400),
+    Duration::from_secs(atpkg::devtools::DECLINE_HOLD_S),
+);
 
 /// A grant the walk asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,80 +283,302 @@ pub(crate) fn subjects(named: &[Subject], missing: impl Fn(Subject) -> bool) -> 
         .collect()
 }
 
-/// What a walk under way left at System Settings' Quit & Reopen ([`reopen_text`]).
+/// A page the walk record keeps: its subject, how many walks in a row left it unanswered
+/// (`tries`) and when the last of them did (`at`, unix seconds). It comes back by itself once
+/// [`WALK_AGAIN`] says ([`Self::due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeptPage {
+    pub(crate) subject: Subject,
+    /// The walks in a row that left the page because aterm could not show it ([`WalkLane::stop`]).
+    pub(crate) tries: u32,
+    /// The unix second the last of them did; nothing while `tries` is none.
+    pub(crate) at: u64,
+}
+
+impl KeptPage {
+    /// A page no walk left unanswered: due at once.
+    pub(crate) const fn new(subject: Subject) -> Self {
+        Self {
+            subject,
+            tries: 0,
+            at: 0,
+        }
+    }
+
+    /// The unix second the page comes back by itself; none for one no walk left unanswered.
+    pub(crate) fn due_at(self) -> Option<u64> {
+        (self.tries > 0).then(|| WALK_AGAIN.due(self.at, self.tries))
+    }
+
+    /// Whether a walk that starts by itself may take the page at `now` (unix seconds, `None`
+    /// unread): no walk left it unanswered, or [`WALK_AGAIN`]'s pause after the last that did has
+    /// passed. A page that waits waits on an unread clock too.
+    pub(crate) fn due(self, now: Option<u64>) -> bool {
+        self.due_at()
+            .is_none_or(|due| now.is_some_and(|now| now >= due))
+    }
+
+    /// The page as one more walk in a row left it unanswered at `now` (unix seconds).
+    const fn left_unanswered(self, now: u64) -> Self {
+        Self {
+            tries: self.tries.saturating_add(1),
+            at: now,
+            ..self
+        }
+    }
+
+    /// The page's word in a record line: the subject's [`Subject::word`], with `:<tries>:<at>`
+    /// after it once a walk left it unanswered. Pure.
+    fn token(self) -> String {
+        if self.tries == 0 {
+            self.subject.word().to_owned()
+        } else {
+            format!("{}:{}:{}", self.subject.word(), self.tries, self.at)
+        }
+    }
+
+    /// [`Self::token`] read back; `None` for a word this aterm does not know, or numbers that do
+    /// not read whole. Pure.
+    fn read_token(token: &str) -> Option<Self> {
+        let digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+        let mut fields = token.split(':');
+        let subject = Subject::parse(fields.next()?)?;
+        match (fields.next(), fields.next(), fields.next()) {
+            (None, None, None) => Some(Self::new(subject)),
+            (Some(tries), Some(at), None) if digits(tries) && digits(at) => Some(Self {
+                subject,
+                tries: tries.parse().ok()?,
+                at: at.parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// When the window put macOS's Automation question for System Events under a walk record line's
+/// revision, by itself or at the walk's Accessibility page: the `tries`-th time in a row, the
+/// last at `at` (unix seconds). The question is asked again only on [`WALK_AGAIN`]'s pause after
+/// it, and only while a sign-out still reads it unanswered
+/// ([`aterm_types::macos_setup::StageRow::AUTOMATION_UNANSWERED`]); a new revision asks again by
+/// itself, its line starting over. Kept in the walk record, so a relaunch, a Quit & Reopen or an
+/// update's successor asks no sooner than the process that asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomationAsked {
+    pub(crate) tries: u32,
+    pub(crate) at: u64,
+}
+
+impl AutomationAsked {
+    /// The record word that names it, before `:<tries>:<at>`: no subject's word.
+    const WORD: &'static str = "automation";
+
+    /// The question asked once more at `now` (unix seconds), after `last` (`None`: the first time
+    /// under the revision).
+    pub(crate) const fn after(last: Option<Self>, now: u64) -> Self {
+        Self {
+            tries: match last {
+                Some(last) => last.tries.saturating_add(1),
+                None => 1,
+            },
+            at: now,
+        }
+    }
+
+    /// The unix second it may be asked again at `now` ([`WALK_AGAIN`]'s pause, read by
+    /// [`Backoff::due_by`], so a clock set back asks at once rather than never).
+    pub(crate) fn due_by(self, now: u64) -> u64 {
+        WALK_AGAIN.due_by(self.at, self.tries, now)
+    }
+
+    /// Its word in a record line: `automation:<tries>:<at>`. Pure.
+    fn token(self) -> String {
+        format!("{}:{}:{}", Self::WORD, self.tries, self.at)
+    }
+
+    /// [`Self::token`] read back; `None` for any other word. Pure.
+    fn read_token(token: &str) -> Option<Self> {
+        let digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+        let mut fields = token.split(':');
+        if fields.next()? != Self::WORD {
+            return None;
+        }
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(tries), Some(at), None) if digits(tries) && digits(at) => Some(Self {
+                tries: tries.parse().ok()?,
+                at: at.parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// One line of the walk record ([`record_line`]): the pages the walk of `bundle` on `mac` had
+/// still to show under `revision`, and when the window asked macOS's Automation question under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Reopen {
-    /// The quit's unix seconds.
-    at: u64,
-    /// The walk's pages from the one it was at on, in its order.
-    subjects: Vec<Subject>,
-    /// The `.app` the Quit & Reopen opens again.
-    bundle: PathBuf,
-    /// The Mac it runs on, by its hardware UUID: `<state>` is shared by a network home's Macs.
+struct Line {
+    /// The Mac, by its hardware UUID: `<state>` is shared by a network home's Macs.
     mac: String,
+    /// The approved setup revision the pages were kept under: a newer one asks again by itself.
+    revision: u64,
+    /// The pages, in the walk's order, the one it was at first, then any that wait for their
+    /// time outside it.
+    pages: Vec<KeptPage>,
+    /// When macOS's Automation question was put under `revision` ([`AutomationAsked`]).
+    automation: Option<AutomationAsked>,
+    /// The `.app` whose walk kept them.
+    bundle: PathBuf,
 }
 
-/// A reopen marker's text: the quit's unix seconds and the pages' words on the first line, the
-/// bundle's path (spaces and all) on the second, the Mac's hardware UUID on the third. Pure.
-fn reopen_text(at: u64, subjects: &[Subject], bundle: &str, mac: &str) -> String {
-    let words: Vec<&str> = subjects.iter().map(|subject| subject.word()).collect();
-    format!("{at} {}\n{bundle}\n{mac}\n", words.join(" "))
+/// A walk record line: the Mac's hardware UUID, the revision, the pages' words
+/// ([`KeptPage::token`], spaces between, then [`AutomationAsked::token`] where one was asked)
+/// and the bundle's path (spaces and all), with a tab between each; `None` for a bundle path
+/// that is not UTF-8. Pure.
+fn record_line(line: &Line) -> Option<String> {
+    let words: Vec<String> = line
+        .pages
+        .iter()
+        .map(|page| page.token())
+        .chain(line.automation.map(AutomationAsked::token))
+        .collect();
+    Some(format!(
+        "{}\t{}\t{}\t{}",
+        line.mac,
+        line.revision,
+        words.join(" "),
+        line.bundle.to_str()?
+    ))
 }
 
-/// Whether `mac` can stand as a reopen marker's Mac: one word on its own line. Pure.
+/// Whether `mac` can stand as a record's Mac: one word. Pure.
 fn one_word(mac: &str) -> bool {
     !mac.is_empty() && !mac.contains(char::is_whitespace)
 }
 
-/// [`reopen_text`] read back: each page once, in its order, a word this aterm does not know
-/// left out. `None` for anything else: no seconds, no page, a bundle path that is not absolute,
-/// a Mac that is not one word, or a line more or fewer. Pure.
-fn read_reopen(text: &str) -> Option<Reopen> {
-    let mut lines = text.lines();
-    let (first, bundle, mac) = (lines.next()?, lines.next()?, lines.next()?);
-    if lines.next().is_some() || !one_word(mac) {
+/// The pages `words` name ([`KeptPage::read_token`]), each once, in their order, a word that does
+/// not read left out. Pure.
+fn read_pages<'a>(words: impl Iterator<Item = &'a str>) -> Vec<KeptPage> {
+    let mut seen = [false; Subject::ORDER.len()];
+    words
+        .filter_map(KeptPage::read_token)
+        .filter(|page| !std::mem::replace(&mut seen[page.subject.index()], true))
+        .collect()
+}
+
+/// [`record_line`] read back: each page once, in its order, a word that does not read left out,
+/// and the Automation question's ask (the first that reads). `None` for anything else: a Mac
+/// that is not one word, no revision, neither a page nor an ask, a bundle path that is not
+/// absolute, or a field more or fewer. Pure.
+fn read_line(line: &str) -> Option<Line> {
+    let mut fields = line.split('\t');
+    let (mac, revision, words, bundle) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if fields.next().is_some() || !one_word(mac) {
         return None;
     }
-    let mut words = first.split(' ');
-    let at = words
-        .next()
-        .filter(|w| w.bytes().all(|b| b.is_ascii_digit()))?
-        .parse::<u64>()
-        .ok()?;
-    let mut seen = [false; Subject::ORDER.len()];
-    let subjects: Vec<Subject> = words
-        .filter_map(Subject::parse)
-        .filter(|subject| !std::mem::replace(&mut seen[subject.index()], true))
-        .collect();
+    if revision.is_empty() || !revision.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let revision = revision.parse::<u64>().ok()?;
+    let pages = read_pages(words.split(' '));
+    let automation = words.split(' ').find_map(AutomationAsked::read_token);
     let bundle = PathBuf::from(bundle);
-    (!subjects.is_empty() && bundle.is_absolute()).then_some(Reopen {
-        at,
-        subjects,
-        bundle,
+    ((!pages.is_empty() || automation.is_some()) && bundle.is_absolute()).then(|| Line {
         mac: mac.to_owned(),
+        revision,
+        pages,
+        automation,
+        bundle,
     })
 }
 
-/// Leave `subjects`, a walk's pages, in `state`'s reopen marker for the aterm `bundle` opens
-/// again on the Mac `mac` (its hardware UUID) after a quit at `at` (unix seconds).
+/// The lines of `state`'s walk record that read whole ([`read_line`]); none for no record.
+fn read_record(state: &Path) -> Vec<Line> {
+    crate::config_marker::read_marker(&state.join(WALK_RECORD), MAX_RECORD_BYTES)
+        .map(|text| text.lines().filter_map(read_line).collect())
+        .unwrap_or_default()
+}
+
+/// Keep `pages`, the pages the walk of `bundle` on the Mac `mac` (its hardware UUID) has still
+/// to show and those outside it the record still holds, in `state`'s walk record under `revision`, in
+/// place of the pages that `.app` on that Mac had: no page removes its line, unless it holds no
+/// Automation ask under `revision` either ([`keep_automation_ask_in`], which these pages keep),
+/// and the record goes with its last line. Other `.app`s' and Macs' lines stay, the newest that
+/// fit in [`MAX_RECORD_LINES`] and [`MAX_RECORD_BYTES`]; a line that does not read whole goes.
+/// The record is written whole in place of the last (`config_marker::write_marker`, ordered
+/// before the rename), so a process that ends at any moment leaves the old record or the new one.
 ///
 /// # Errors
-/// `bundle`'s path is not one line of UTF-8, `mac` is not one word, or the marker could not be
-/// written (`config_marker::write_marker`).
-pub(crate) fn leave_reopen_in(
+/// `bundle`'s path is not one tab-free line of UTF-8, `mac` is not one word, the line is larger
+/// than the record may hold, or the record could not be written or removed
+/// (`config_marker::write_marker`, `config_marker::remove_marker`).
+pub(crate) fn keep_pages_in(
     state: &Path,
-    at: u64,
-    subjects: &[Subject],
     bundle: &Path,
     mac: &str,
+    revision: u64,
+    pages: &[KeptPage],
 ) -> std::io::Result<()> {
-    let bundle = bundle
+    write_line_in(state, bundle, mac, revision, |line| {
+        (pages.to_vec(), line.and_then(|line| line.automation))
+    })
+}
+
+/// Keep `asked`, the window's last ask of macOS's Automation question under `revision`, in
+/// `state`'s walk record line for `bundle` on `mac`, beside the pages it holds under that
+/// revision ([`keep_pages_in`], which keeps the ask in turn).
+///
+/// # Errors
+/// As [`keep_pages_in`].
+pub(crate) fn keep_automation_ask_in(
+    state: &Path,
+    bundle: &Path,
+    mac: &str,
+    revision: u64,
+    asked: AutomationAsked,
+) -> std::io::Result<()> {
+    write_line_in(state, bundle, mac, revision, |line| {
+        (
+            line.map(|line| line.pages.clone()).unwrap_or_default(),
+            Some(asked),
+        )
+    })
+}
+
+/// The window's last ask of macOS's Automation question that `state`'s walk record keeps for
+/// `bundle` on `mac` under `revision` ([`keep_automation_ask_in`]); none under another revision.
+pub(crate) fn automation_asked_in(
+    state: &Path,
+    bundle: &Path,
+    mac: &str,
+    revision: u64,
+) -> Option<AutomationAsked> {
+    read_record(state)
+        .into_iter()
+        .find(|line| line.mac == mac && line.bundle == bundle && line.revision == revision)?
+        .automation
+}
+
+/// Write `state`'s walk record line for `bundle` on `mac` under `revision` as `line` makes it
+/// from the line it had under that revision (`None` for none, or one under another revision): its
+/// pages and Automation ask, the line going where it holds neither. As [`keep_pages_in`] says.
+fn write_line_in(
+    state: &Path,
+    bundle: &Path,
+    mac: &str,
+    revision: u64,
+    line: impl FnOnce(Option<&Line>) -> (Vec<KeptPage>, Option<AutomationAsked>),
+) -> std::io::Result<()> {
+    bundle
         .to_str()
-        .filter(|path| !path.contains(['\n', '\r']))
+        .filter(|path| !path.contains(['\n', '\r', '\t']))
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "the bundle's path is not one line of UTF-8",
+                "the bundle's path is not one tab-free line of UTF-8",
             )
         })?;
     if !one_word(mac) {
@@ -329,62 +587,152 @@ pub(crate) fn leave_reopen_in(
             "the Mac's hardware UUID is not one word",
         ));
     }
+    let (mut lines, this): (Vec<Line>, Vec<Line>) = read_record(state)
+        .into_iter()
+        .partition(|line| line.mac != mac || line.bundle != bundle);
+    let (pages, automation) = line(this.iter().find(|line| line.revision == revision));
+    if !pages.is_empty() || automation.is_some() {
+        lines.push(Line {
+            mac: mac.to_owned(),
+            revision,
+            pages,
+            automation,
+            bundle: bundle.to_path_buf(),
+        });
+    }
+    let record = state.join(WALK_RECORD);
+    if lines.is_empty() {
+        return crate::config_marker::remove_marker(&record);
+    }
+    let mut newest: Vec<String> = Vec::new();
+    let mut bytes = 0;
+    for line in lines.iter().rev().filter_map(record_line) {
+        bytes += line.len() + 1;
+        if newest.len() == MAX_RECORD_LINES || bytes > MAX_RECORD_BYTES {
+            break;
+        }
+        newest.push(line);
+    }
+    if newest.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the line is larger than the walk record may hold",
+        ));
+    }
+    let text: String = newest
+        .iter()
+        .rev()
+        .map(|line| format!("{line}\n"))
+        .collect();
     crate::config_marker::write_marker(
-        &state.join(REOPEN_MARKER),
-        &reopen_text(at, subjects, bundle, mac),
-        MAX_REOPEN_BYTES,
+        &record,
+        &text,
+        MAX_RECORD_BYTES,
         crate::durable::Flush::Ordered,
     )
 }
 
-/// Take `state`'s reopen marker when it is this aterm's: its pages when the quit that wrote it
-/// was `bundle`'s (the `.app` this aterm runs from) on `mac` (this Mac's hardware UUID) within
-/// [`REOPEN_WITHIN`] of `now` (unix seconds, either side, for a clock set back between the two
-/// processes), the marker then removed so it starts no second walk. `None` for no marker, junk
-/// or one outside that bound, each removed, and for another bundle's or Mac's within it, or any
-/// while this aterm cannot name its bundle or Mac, left in place for the aterm it names: `<state>`
-/// is shared by a network home's Macs and by a dev bundle beside the release.
-pub(crate) fn take_reopen_in(
+/// The pages `state`'s walk record holds for `bundle` (the `.app` this aterm runs from) on `mac`
+/// (this Mac's hardware UUID) under `revision`: what this `.app`'s walk on this Mac had still to
+/// show when the process that kept them ended, however it ended, each with the walks in a row
+/// that left it unanswered. Its line under another revision is removed, starting nothing: a new
+/// revision asks again by itself. Another `.app`'s or Mac's line is left for the aterm it names.
+/// None for no line.
+///
+/// An [`OLD_REOPEN_MARKER`] this `.app` wrote on this Mac is taken in first: its pages, due at
+/// once (its Quit & Reopen left them), lead this line under `revision`, and the marker goes. One
+/// that does not read goes too; another `.app`'s or Mac's stays for the aterm it names.
+pub(crate) fn left_pages_in(
     state: &Path,
-    now: u64,
-    bundle: Option<&Path>,
-    mac: Option<&str>,
-) -> Option<Vec<Subject>> {
-    let path = state.join(REOPEN_MARKER);
-    let text = crate::config_marker::read_marker(&path, MAX_REOPEN_BYTES);
-    let remove = || {
-        if let Err(error) = crate::config_marker::remove_marker(&path) {
-            aterm_log::warn!("permission walk: the Quit & Reopen marker was not removed: {error}");
+    bundle: &Path,
+    mac: &str,
+    revision: u64,
+) -> Vec<KeptPage> {
+    let old = take_old_reopen_in(state, bundle, mac);
+    let line = read_record(state)
+        .into_iter()
+        .find(|line| line.mac == mac && line.bundle == bundle);
+    let kept = match line {
+        Some(line) if line.revision == revision => line.pages,
+        Some(line) => {
+            aterm_log::info!(
+                "permission walk: the pages kept under revision {} are no walk under revision \
+                 {revision}; their line goes",
+                line.revision
+            );
+            if old.is_none()
+                && let Err(error) =
+                    write_line_in(state, bundle, mac, line.revision, |_| (Vec::new(), None))
+            {
+                aterm_log::warn!(
+                    "permission walk: the walk record's old line was not removed: {error}"
+                );
+            }
+            Vec::new()
         }
+        None => Vec::new(),
     };
-    let Some(reopen) = text.as_deref().and_then(read_reopen) else {
-        remove();
-        if text.is_some() {
-            aterm_log::info!("permission walk: a Quit & Reopen marker held no walk; it is removed");
-        }
-        return None;
+    let Some(old) = old else {
+        return kept;
     };
-    if now.abs_diff(reopen.at) > REOPEN_WITHIN.as_secs() {
-        remove();
-        aterm_log::info!(
-            "permission walk: the Quit & Reopen marker was written at {}, {} s from now; no \
-             walk, and it is removed",
-            reopen.at,
-            now.abs_diff(reopen.at)
-        );
+    let pages: Vec<KeptPage> = old
+        .iter()
+        .copied()
+        .map(KeptPage::new)
+        .chain(kept.into_iter().filter(|page| !old.contains(&page.subject)))
+        .collect();
+    aterm_log::info!(
+        "permission walk: an older aterm's Quit & Reopen left {}; the walk record keeps them",
+        old.iter()
+            .map(|subject| subject.word())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Err(error) = keep_pages_in(state, bundle, mac, revision, &pages) {
+        aterm_log::warn!("permission walk: the walk record was not written: {error}");
+    }
+    pages
+}
+
+/// [`OLD_REOPEN_MARKER`]'s pages, when `state` holds one `bundle` wrote on `mac`, the marker then
+/// removed; one that does not read is removed, and another `.app`'s or Mac's is left in place.
+fn take_old_reopen_in(state: &Path, bundle: &Path, mac: &str) -> Option<Vec<Subject>> {
+    let path = state.join(OLD_REOPEN_MARKER);
+    let text = crate::config_marker::read_marker(&path, MAX_RECORD_BYTES)?;
+    let read = read_old_reopen(&text);
+    if read
+        .as_ref()
+        .is_some_and(|(of, on, _)| of != bundle || on != mac)
+    {
         return None;
     }
-    if bundle != Some(reopen.bundle.as_path()) || mac != Some(reopen.mac.as_str()) {
-        aterm_log::info!(
-            "permission walk: the Quit & Reopen marker is {}'s on the Mac {}, not this aterm's; \
-             no walk, and it is left for that aterm",
-            reopen.bundle.display(),
-            reopen.mac
-        );
+    if let Err(error) = crate::config_marker::remove_marker(&path) {
+        aterm_log::warn!("permission walk: the old Quit & Reopen marker was not removed: {error}");
+    }
+    read.map(|(_, _, pages)| pages)
+}
+
+/// An [`OLD_REOPEN_MARKER`]'s text read back: the bundle, the Mac and the pages (each once, in
+/// their order, a word this aterm does not know left out). `None` for anything else: no seconds,
+/// no page, a bundle path that is not absolute, a Mac that is not one word, or a line more or
+/// fewer. Pure.
+fn read_old_reopen(text: &str) -> Option<(PathBuf, String, Vec<Subject>)> {
+    let mut lines = text.lines();
+    let (first, bundle, mac) = (lines.next()?, lines.next()?, lines.next()?);
+    if lines.next().is_some() || !one_word(mac) {
         return None;
     }
-    remove();
-    Some(reopen.subjects)
+    let mut words = first.split(' ');
+    let seconds = words.next()?;
+    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pages: Vec<Subject> = read_pages(words.filter(|word| !word.contains(':')))
+        .into_iter()
+        .map(|page| page.subject)
+        .collect();
+    let bundle = PathBuf::from(bundle);
+    (!pages.is_empty() && bundle.is_absolute()).then(|| (bundle, mac.to_owned(), pages))
 }
 
 /// Where the walk's current page stands.
@@ -589,19 +937,25 @@ pub(crate) struct WalkReach {
     pub(crate) note_ax_declined: fn(&str),
     /// Whether the system or System Settings' Quit & Reopen asked this process to quit, by a
     /// quit nobody cancelled (`crate::system_quit::asked`): it is going, so the walk opens no
-    /// page.
+    /// page and its page's time stands still.
     pub(crate) quit_asked: fn() -> bool,
-    /// Leave a walk's pages in `<state>`'s reopen marker for the aterm System Settings' Quit &
-    /// Reopen opens again, with the quit's time, the `.app` this aterm runs from and this Mac.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "only macOS's quit leaves a Quit & Reopen marker")
-    )]
-    pub(crate) leave_reopen: fn(&[Subject]),
-    /// Take `<state>`'s reopen marker when it is this aterm's ([`take_reopen_in`]): the pages a
-    /// walk left at a Quit & Reopen of this `.app` on this Mac within [`REOPEN_WITHIN`], the
-    /// marker removed; another bundle's or Mac's is left in place for the aterm it names.
-    pub(crate) take_reopen: fn() -> Option<Vec<Subject>>,
+    /// Keep, in `<state>`'s walk record, the pages a walk has still to show and those that wait
+    /// for their time under an approved revision, for the `.app` this aterm runs from on this Mac
+    /// ([`keep_pages_in`]); no page removes that line.
+    pub(crate) keep_pages: fn(u64, &[KeptPage]),
+    /// The pages `<state>`'s walk record holds for the `.app` this aterm runs from on this Mac
+    /// under an approved revision ([`left_pages_in`]): what its walk had still to show when the
+    /// process that kept them ended, each with the walks in a row that left it unanswered.
+    pub(crate) left_pages: fn(u64) -> Vec<KeptPage>,
+    /// Keep, in the same line of `<state>`'s walk record, the window's last ask of macOS's
+    /// Automation question under an approved revision ([`keep_automation_ask_in`]).
+    pub(crate) keep_automation_ask: fn(u64, AutomationAsked),
+    /// The window's last ask of macOS's Automation question that line keeps under an approved
+    /// revision ([`automation_asked_in`]).
+    pub(crate) automation_asked: fn(u64) -> Option<AutomationAsked>,
+    /// The clock the walk record's times are read and written by, in unix seconds
+    /// (`aterm_time::unix_secs`); `None` unread.
+    pub(crate) unix_now: fn() -> Option<u64>,
 }
 
 impl std::fmt::Debug for WalkReach {
@@ -612,7 +966,7 @@ impl std::fmt::Debug for WalkReach {
 
 impl WalkReach {
     /// Nothing reached: never trusted, nothing asked, nothing out, no Not now read or noted, no
-    /// quit asked, no reopen marker left or taken.
+    /// quit asked, no walk record kept or read, no clock read.
     pub(crate) const INERT: Self = Self {
         ax_trusted: || false,
         ask_automation: || {},
@@ -621,8 +975,11 @@ impl WalkReach {
         ax_declined: || false,
         note_ax_declined: |_| {},
         quit_asked: || false,
-        leave_reopen: |_| {},
-        take_reopen: || None,
+        keep_pages: |_, _| {},
+        left_pages: |_| Vec::new(),
+        keep_automation_ask: |_, _| {},
+        automation_asked: |_| None,
+        unix_now: || None,
     };
 
     /// The live arms of a windowed macOS instance.
@@ -635,8 +992,11 @@ impl WalkReach {
             ax_declined: live_ax_declined,
             note_ax_declined: live_note_ax_declined,
             quit_asked: crate::system_quit::asked,
-            leave_reopen: live_leave_reopen,
-            take_reopen: live_take_reopen,
+            keep_pages: live_keep_pages,
+            left_pages: live_left_pages,
+            keep_automation_ask: live_keep_automation_ask,
+            automation_asked: live_automation_asked,
+            unix_now: aterm_time::unix_secs,
         }
     }
 }
@@ -648,38 +1008,45 @@ fn this_bundle() -> Option<PathBuf> {
         .and_then(|exe| aterm_containment::consent::app_bundle_root(&exe))
 }
 
-fn live_leave_reopen(subjects: &[Subject]) {
-    let (Some(state), Some(at), Some(bundle), Some(mac)) = (
-        aterm_types::dirs::state_dir(),
-        aterm_time::unix_secs(),
-        this_bundle(),
-        aterm_containment::consent::host_uuid(),
-    ) else {
-        aterm_log::warn!(
-            "permission walk: no Quit & Reopen marker (no <state>, clock, .app or Mac to name)"
-        );
+/// Where the walk record's line for this aterm is: `<state>`, the `.app` this aterm runs from
+/// and this Mac's hardware UUID.
+fn record_place() -> Option<(PathBuf, PathBuf, String)> {
+    Some((
+        aterm_types::dirs::state_dir()?,
+        this_bundle()?,
+        aterm_containment::consent::host_uuid()?,
+    ))
+}
+
+fn live_keep_pages(revision: u64, pages: &[KeptPage]) {
+    let Some((state, bundle, mac)) = record_place() else {
+        aterm_log::warn!("permission walk: no walk record (no <state>, .app or Mac to name)");
         return;
     };
-    let words: Vec<&str> = subjects.iter().map(|subject| subject.word()).collect();
-    match leave_reopen_in(&state, at, subjects, &bundle, &mac) {
-        Ok(()) => aterm_log::info!(
-            "permission walk: Quit & Reopen; the aterm {} opens walks on from {}",
-            bundle.display(),
-            words.join(", ")
-        ),
-        Err(error) => {
-            aterm_log::warn!("permission walk: the Quit & Reopen marker was not written: {error}");
-        }
+    if let Err(error) = keep_pages_in(&state, &bundle, &mac, revision, pages) {
+        aterm_log::warn!("permission walk: the walk record was not written: {error}");
     }
 }
 
-fn live_take_reopen() -> Option<Vec<Subject>> {
-    take_reopen_in(
-        &aterm_types::dirs::state_dir()?,
-        aterm_time::unix_secs()?,
-        this_bundle().as_deref(),
-        aterm_containment::consent::host_uuid().as_deref(),
-    )
+fn live_left_pages(revision: u64) -> Vec<KeptPage> {
+    record_place().map_or_else(Vec::new, |(state, bundle, mac)| {
+        left_pages_in(&state, &bundle, &mac, revision)
+    })
+}
+
+fn live_keep_automation_ask(revision: u64, asked: AutomationAsked) {
+    let Some((state, bundle, mac)) = record_place() else {
+        aterm_log::warn!("permission walk: no walk record (no <state>, .app or Mac to name)");
+        return;
+    };
+    if let Err(error) = keep_automation_ask_in(&state, &bundle, &mac, revision, asked) {
+        aterm_log::warn!("permission walk: the walk record was not written: {error}");
+    }
+}
+
+fn live_automation_asked(revision: u64) -> Option<AutomationAsked> {
+    let (state, bundle, mac) = record_place()?;
+    automation_asked_in(&state, &bundle, &mac, revision)
 }
 
 fn live_ax_last_declined() -> Option<(String, u64)> {
@@ -694,17 +1061,24 @@ fn live_note_ax_declined(key: &str) {
     atpkg::devtools::ACCESSIBILITY.note_declined(key);
 }
 
-/// The App-owned walk lane: the walk under way, the subjects walks took this process, and the
-/// reach.
+/// The App-owned walk lane: the walk under way, the subjects walks took this process, the walk
+/// record as this process knows it, and the reach.
 #[derive(Debug)]
 pub(crate) struct WalkLane {
     reach: WalkReach,
     walk: Option<Walk>,
-    /// Subjects a walk took in this process, by [`Subject::ORDER`]: a later walk that starts by
-    /// itself takes only a subject none took (Accessibility, once the sign-outs say they need it).
+    /// Subjects a walk took in this process, by [`Subject::ORDER`]: no walk that starts by
+    /// itself takes one again in this process, unless the walk that took it left it in the walk
+    /// record unanswered ([`Self::stop`], [`Self::give_way`], [`Self::lapse`]), whose time for it
+    /// then decides ([`KeptPage::due`]) in this process as in the next.
     walked: [bool; Subject::ORDER.len()],
     /// Who started the walk under way, for aterm.log.
     by: &'static str,
+    /// The approved revision the walk under way started under ([`Self::start`]): the walk record
+    /// keeps its pages under it, and nothing for a walk started while none stood.
+    walk_revision: Option<u64>,
+    /// The walk record's line for this `.app` on this Mac, as this process knows it.
+    record: Record,
     /// When the control verb last started a walk, or took back a page the walk under way passed
     /// ([`VERB_AGAIN_AFTER`]).
     verb_started_at: Option<Instant>,
@@ -721,10 +1095,6 @@ pub(crate) struct WalkLane {
     /// no walk starts by itself for the first time, and the markers are never read again in
     /// this process ([`App::fresh_mac`]).
     page_seen: bool,
-    /// A walk gave way to a person's press elsewhere ([`Self::give_way`]): the subjects it had
-    /// not gone past are free for the next walk that starts by itself, which no page marker then
-    /// holds back.
-    gave_way: bool,
     /// The key of the last look that found an opening that might be another bundle's or Mac's
     /// ([`Found::ThisKey`]): a look under the same key finds the same, so it reads no marker.
     held_under: Option<String>,
@@ -732,27 +1102,32 @@ pub(crate) struct WalkLane {
     /// opens no page while that question is out ([`WalkReach::automation_out`]), unless a
     /// person's press takes it over ([`Self::pressed`]).
     asked_automation: bool,
+    /// The window's last ask of macOS's Automation question under an approved revision, as the
+    /// walk record keeps it ([`AutomationAsked`], [`Self::automation_asked`]): read once per
+    /// revision, and kept as this process asks.
+    automation_ask: Option<(u64, Option<AutomationAsked>)>,
     /// Whether `<state>` holds the Accessibility page back from the control verb
     /// ([`App::accessibility_declined_for_the_verb`]), and the key it was read under: read once
     /// per key, since the walk's start looks at every park, and held from the moment this
     /// process notes a Not now ([`Self::note_ax_declined`]).
     ax_declined: Option<(String, bool)>,
-    /// What a walk left at a Quit & Reopen for this process ([`App::take_walk_reopen`]).
-    reopened: Reopened,
+    /// The approved revision under which a look found the Accessibility page handed in the
+    /// access record ([`App::accessibility_handed`]): a line the record never loses, so it is
+    /// not read again under that revision.
+    ax_handed: Option<u64>,
     /// This process is an update's successor ([`Self::note_successor`]).
     successor: bool,
 }
 
-/// The pages a walk under way left for the aterm System Settings' Quit & Reopen opened, as this
-/// process holds them.
+/// The walk record's line for this `.app` on this Mac ([`WALK_RECORD`]), as this process knows
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Reopened {
-    /// The reopen marker is still to be taken: the first look takes it.
+enum Record {
+    /// Not read yet: the first look that would start a walk, or the first walk that keeps its
+    /// pages, reads it ([`WalkLane::take_left`]).
     Unread,
-    /// Its pages wait for the start's other rules.
-    Waits(Vec<Subject>),
-    /// Taken: they started a walk, there were none, or another walk started first.
-    Spent,
+    /// The pages it holds under an approved revision, as read or as this process last kept them.
+    Holds(u64, Vec<KeptPage>),
 }
 
 impl WalkLane {
@@ -773,24 +1148,26 @@ impl WalkLane {
             walk: None,
             walked: [false; Subject::ORDER.len()],
             by: "",
+            walk_revision: None,
+            record: Record::Unread,
             verb_started_at: None,
             yields: false,
             slot_won: false,
             page_seen: false,
-            gave_way: false,
             held_under: None,
             asked_automation: false,
+            automation_ask: None,
             ax_declined: None,
-            reopened: Reopened::Unread,
+            ax_handed: None,
             successor: false,
         }
     }
 
     /// This process is an update's successor (a launch into a staged update, a seamless
-    /// hand-over, a relaunch of the running aterm), not one the owner started: it starts this
-    /// Mac's first walk by itself as a cold launch does ([`StartFacts::cold`]), on a Mac that
-    /// never had one ([`App::fresh_mac`]), and walks on from the pages a Quit & Reopen left when
-    /// it opened into the update ([`App::take_walk_reopen`]). Its settle and the Full Disk
+    /// hand-over, a relaunch of the running aterm), not one the owner started: it starts a walk
+    /// by itself as a cold launch does ([`StartFacts::cold`]): the first walk on a Mac that never
+    /// had one ([`App::fresh_mac`]), and, as every process does, the walk on from the pages an
+    /// earlier walk left in the walk record ([`WALK_RECORD`]). Its settle and the Full Disk
     /// Access page's Later stay a successor's (`devtools_helper::Lane::note_cold_start`).
     pub(crate) const fn note_successor(&mut self) {
         self.successor = true;
@@ -838,16 +1215,100 @@ impl WalkLane {
         self.walked.iter().any(|walked| *walked)
     }
 
-    /// Start `walk`, started `by` (aterm.log's words); it replaces any under way and takes the
-    /// pages it opens as the owner's press would. Pages a Quit & Reopen left that wait for the
-    /// start's rules wait no more: this walk (a person's press, the control verb) came first.
-    pub(crate) fn start(&mut self, walk: Walk, by: &'static str) {
+    /// Keep `pages` in the walk record under `revision` ([`WalkReach::keep_pages`]) unless it
+    /// holds them already as this process knows it.
+    fn keep(&mut self, revision: u64, pages: Vec<KeptPage>) {
+        if matches!(&self.record, Record::Holds(held, kept) if *held == revision && *kept == pages)
+        {
+            return;
+        }
+        (self.reach.keep_pages)(revision, &pages);
+        self.record = Record::Holds(revision, pages);
+    }
+
+    /// Keep the pages the walk under way has still to show ([`Walk::ahead`]) under the revision
+    /// it started under, each with the walks in a row the record has leaving it unanswered, and
+    /// beside them the record's pages outside the walk ([`walk_pages`]); the record is read
+    /// first if this process has not read it. Nothing under no revision.
+    fn keep_ahead(&mut self) {
+        let Some(revision) = self.walk_revision.filter(|_| self.walk.is_some()) else {
+            return;
+        };
+        self.take_left(revision);
+        let Some(walk) = self.walk.as_ref() else {
+            return;
+        };
+        let pages = walk_pages(walk, self.kept(revision));
+        self.keep(revision, pages);
+    }
+
+    /// Read the walk record's line under `revision` ([`WalkReach::left_pages`]) unless this
+    /// process knows what it holds under that revision already: the pages an earlier process's
+    /// walk had still to show, however that process ended, each with the walks in a row that
+    /// left it unanswered. A page whose last such walk reads later than the clock's now (a clock
+    /// set back, a walk that ended while the clock was unread) is kept as left unanswered now,
+    /// so its pause counts from a time the clock has seen.
+    pub(crate) fn take_left(&mut self, revision: u64) {
+        if matches!(&self.record, Record::Holds(held, _) if *held == revision) {
+            return;
+        }
+        let mut left = (self.reach.left_pages)(revision);
+        if !left.is_empty() {
+            aterm_log::info!(
+                "permission walk: the walk record keeps {} from an earlier process",
+                words(&left)
+            );
+        }
+        if let Some(now) = (self.reach.unix_now)()
+            && left.iter().any(|page| page.tries > 0 && page.at > now)
+        {
+            for page in &mut left {
+                if page.tries > 0 && page.at > now {
+                    page.at = now;
+                }
+            }
+            (self.reach.keep_pages)(revision, &left);
+        }
+        self.record = Record::Holds(revision, left);
+    }
+
+    /// The pages the walk record holds under `revision`, as this process knows it: none before
+    /// [`Self::take_left`] read it.
+    pub(crate) fn kept(&self, revision: u64) -> &[KeptPage] {
+        match &self.record {
+            Record::Holds(held, pages) if *held == revision => pages,
+            Record::Holds(..) | Record::Unread => &[],
+        }
+    }
+
+    /// When the soonest page the walk record keeps that waits for its time comes back by itself
+    /// ([`KeptPage::due_at`]), as an instant from `now`; none with no such page or an unread
+    /// clock. The park wakes for it, so a page comes back in a process that outlives its pause.
+    pub(crate) fn next_due(&self, now: Instant) -> Option<Instant> {
+        let Record::Holds(_, pages) = &self.record else {
+            return None;
+        };
+        let unix = (self.reach.unix_now)()?;
+        pages
+            .iter()
+            .filter_map(|page| page.due_at())
+            .filter(|due| *due > unix)
+            .min()
+            .map(|due| now + Duration::from_secs(due - unix))
+    }
+
+    /// Start `walk`, started `by` (aterm.log's words) under the approved `revision`; it replaces
+    /// any under way and takes the pages it opens as the owner's press would. The walk record
+    /// keeps its pages under that revision from now on ([`Self::keep_ahead`]), in place of the
+    /// line an earlier walk left: a page that line had keeps its walks in a row left unanswered,
+    /// and one outside this walk stays.
+    pub(crate) fn start(&mut self, walk: Walk, by: &'static str, revision: Option<u64>) {
         self.yields = false;
         self.slot_won = false;
-        self.asked_automation = false;
-        if self.reopened != Reopened::Unread {
-            self.reopened = Reopened::Spent;
-        }
+        // macOS's Automation question the window put just before ([`App::look_for_automation_ask`],
+        // asked ahead of the walk's pages) holds its first page as the walk's own ask would: the
+        // pages follow the answer, never beside the alert.
+        self.asked_automation = (self.reach.automation_out)();
         for subject in walk.subjects() {
             self.walked[subject.index()] = true;
         }
@@ -860,7 +1321,9 @@ impl WalkLane {
                 .join(", ")
         );
         self.by = by;
+        self.walk_revision = revision;
         self.walk = Some(walk);
+        self.keep_ahead();
     }
 
     /// The walk under way takes `take` too, asked `by` (aterm.log's words), counting those in
@@ -886,7 +1349,50 @@ impl WalkLane {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        self.keep_ahead();
         true
+    }
+
+    /// The walk under way on to its next subject at `now` ([`Walk::advance`]), the walk record
+    /// keeping the pages it has still to show: the next subject, `None` once it is over or with
+    /// no walk under way.
+    pub(crate) fn advance(&mut self, now: Instant) -> Option<Subject> {
+        let next = self.walk.as_mut()?.advance(now);
+        self.keep_ahead();
+        next
+    }
+
+    /// [`Self::advance`] on to the next subject asked for by name ([`Walk::advance_to_named`]).
+    pub(crate) fn advance_to_named(&mut self, now: Instant) -> Option<Subject> {
+        let next = self.walk.as_mut()?.advance_to_named(now);
+        self.keep_ahead();
+        next
+    }
+
+    /// The window's last ask of macOS's Automation question under `revision`
+    /// ([`AutomationAsked`]): the walk record's, read once per revision.
+    fn automation_asked(&mut self, revision: u64) -> Option<AutomationAsked> {
+        match self.automation_ask {
+            Some((under, asked)) if under == revision => asked,
+            _ => {
+                let asked = (self.reach.automation_asked)(revision);
+                self.automation_ask = Some((revision, asked));
+                asked
+            }
+        }
+    }
+
+    /// The window asked macOS's Automation question under `revision` just now: kept in the walk
+    /// record ([`WalkReach::keep_automation_ask`]) once the clock reads, and in this process
+    /// either way, so neither asks again before [`AutomationAsked::due_by`].
+    fn note_automation_ask(&mut self, revision: u64) {
+        let last = self.automation_asked(revision);
+        let clock = (self.reach.unix_now)();
+        let asked = AutomationAsked::after(last, clock.unwrap_or_default());
+        if clock.is_some() {
+            (self.reach.keep_automation_ask)(revision, asked);
+        }
+        self.automation_ask = Some((revision, Some(asked)));
     }
 
     /// A person pressed the row of the page the walk is at: the walk under way is theirs from
@@ -903,17 +1409,41 @@ impl WalkLane {
         }
     }
 
-    /// The walk is over (every page answered, or the close box).
+    /// The walk is over by the person's answer, or ran out (every page answered, the close box,
+    /// a Not now that ends it): the walk record keeps none of its pages, only those outside it
+    /// (a person's press walked one page while the record held others for the walk that starts
+    /// by itself, or held pages that wait for their time).
     pub(crate) fn end(&mut self, why: &str) {
-        if self.walk.take().is_some() {
-            aterm_log::info!("permission walk ({}): over ({why})", self.by);
+        let Some(walk) = self.walk.take() else {
+            return;
+        };
+        if let Some(revision) = self.walk_revision {
+            let rest: Vec<KeptPage> = self
+                .kept(revision)
+                .iter()
+                .filter(|page| !walk.subjects().contains(&page.subject))
+                .copied()
+                .collect();
+            self.keep(revision, rest);
         }
+        aterm_log::info!("permission walk ({}): over ({why})", self.by);
     }
 
-    /// The walk steps aside for a person's press elsewhere (`App::press_meets_unseen_panel`):
-    /// it ends, and the subjects it had not gone past, its current page's included, are free
-    /// again, so the walk that starts by itself at the next quiet moment (a cold first launch's,
-    /// `App::look_for_walk_start`) takes them up. A press is no answer to a page it never saw.
+    /// The walk stops because aterm could not show the pages it has still to show (its panel
+    /// went or never came, another panel replaced it, its page could not open): each counts one
+    /// more walk in a row that left it so, and the walk record keeps them, free in this process
+    /// too, so they come back by themselves once [`WALK_AGAIN`] says, in this process or the
+    /// next, and not at every launch ([`Self::leave`]). System Settings quit under a page is the
+    /// person's answer, which ends the walk ([`Self::end`]).
+    pub(crate) fn stop(&mut self, why: &str) {
+        self.leave(|_| true, None, why);
+    }
+
+    /// The walk steps aside for a person's press elsewhere (`App::press_meets_unseen_panel`, a
+    /// press on another row): the subjects it had not gone past, its current page's included,
+    /// stay in the walk record with no walk counted against them, and are free again in this
+    /// process too, so the walk that starts by itself at the next quiet moment walks on from them
+    /// (`App::look_for_walk_start`). A press is no answer to a page it never saw.
     pub(crate) fn give_way(&mut self, why: &str) {
         let Some(walk) = self.walk.as_ref() else {
             return;
@@ -921,15 +1451,16 @@ impl WalkLane {
         for subject in walk.ahead() {
             self.walked[subject.index()] = false;
         }
-        self.gave_way = true;
-        self.end(why);
+        self.leave(|_| false, None, why);
     }
 
     /// The walk's page lapsed: its ten minutes of the person's time at the Mac
     /// (`devtools_helper::Panel::count_time`) passed with no answer. The walk gives way as to a
-    /// press ([`Self::give_way`]), freeing the pages after it for the walk that starts by itself
-    /// at the next quiet moment, but the page that lapsed stays walked: an unanswered page never
-    /// comes back by itself, so no walk opens it again and again.
+    /// press ([`Self::give_way`]) for the pages after it, which the walk that starts by itself
+    /// takes up at the next quiet moment; the page that lapsed leaves the walk record: the
+    /// person had it in front of them and left it, so it is theirs to give from System State's
+    /// Permissions row, and no walk brings it up by itself again: offered, never nagged. It
+    /// stays walked in this process.
     pub(crate) fn lapse(&mut self) {
         let Some(walk) = self.walk.as_ref() else {
             return;
@@ -940,9 +1471,81 @@ impl WalkLane {
                 self.walked[subject.index()] = false;
             }
         }
-        self.gave_way = true;
-        self.end("its page lapsed");
+        self.leave(|_| false, lapsed, "its page lapsed");
     }
+
+    /// The walk under way ends `why` with the pages it has still to show unanswered: each that
+    /// `unanswered` names counts one more walk in a row that left it so, at the clock's now (or,
+    /// unread, at a time the next read takes as now, [`Self::take_left`]); every one but
+    /// `dropped` stays in the walk record and is free in this process, so whether a walk that
+    /// starts by itself takes it is the record's to say ([`KeptPage::due`]). `dropped` leaves the
+    /// record and stays walked here. Under no revision nothing is kept, and they stay walked
+    /// here.
+    fn leave(&mut self, unanswered: impl Fn(Subject) -> bool, dropped: Option<Subject>, why: &str) {
+        self.keep_ahead();
+        let Some(walk) = self.walk.take() else {
+            return;
+        };
+        let Some(revision) = self.walk_revision else {
+            aterm_log::info!("permission walk ({}): stops ({why})", self.by);
+            return;
+        };
+        let at = (self.reach.unix_now)().unwrap_or(u64::MAX);
+        let ahead = walk.ahead();
+        let pages: Vec<KeptPage> = self
+            .kept(revision)
+            .iter()
+            .filter(|page| Some(page.subject) != dropped)
+            .map(|page| {
+                if ahead.contains(&page.subject) && unanswered(page.subject) {
+                    page.left_unanswered(at)
+                } else {
+                    *page
+                }
+            })
+            .collect();
+        for subject in ahead.iter().filter(|subject| Some(**subject) != dropped) {
+            self.walked[subject.index()] = false;
+        }
+        aterm_log::info!(
+            "permission walk ({}): stops ({why}); the walk record keeps {}",
+            self.by,
+            words(&pages)
+        );
+        self.keep(revision, pages);
+    }
+}
+
+/// The walk record's pages for `walk` over `kept`, what the record holds: the pages `walk` has
+/// still to show, each with the walks in a row `kept` has leaving it unanswered, then those of
+/// `kept` that are none of the walk's subjects, due or not ([`KeptPage::due`]): a page leaves the
+/// record only by its walk's answer or by a look that reads it no longer wanted
+/// (`App::look_for_walk_start`). Pure.
+fn walk_pages(walk: &Walk, kept: &[KeptPage]) -> Vec<KeptPage> {
+    let of = |subject: Subject| {
+        kept.iter()
+            .find(|page| page.subject == subject)
+            .copied()
+            .unwrap_or(KeptPage::new(subject))
+    };
+    walk.ahead()
+        .iter()
+        .map(|subject| of(*subject))
+        .chain(
+            kept.iter()
+                .filter(|page| !walk.subjects().contains(&page.subject))
+                .copied(),
+        )
+        .collect()
+}
+
+/// The record words of `pages` ([`KeptPage::token`]), for aterm.log.
+fn words(pages: &[KeptPage]) -> String {
+    pages
+        .iter()
+        .map(|page| page.token())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the window's walk answered a start (`aterm ctl permissions walk now`, a row's press).
@@ -1021,46 +1624,148 @@ enum Opened {
 }
 
 impl App {
-    /// The walk's turn before the hand-overs: on a cold first launch with the person at System
-    /// State, start one by itself ([`starts`]); then [`Self::drive_permission_walk`].
+    /// The walk's turn before the hand-overs: with none under way, start one by itself when its
+    /// rules say so ([`Self::look_for_walk_start`]); then [`Self::drive_permission_walk`].
     pub(crate) fn tick_permission_walk(&mut self, now: Instant) {
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
         }
         self.count_walk_page_time(now);
+        // macOS's Automation question goes first, at the same look, so the walk that starts
+        // beside it opens its pages after the answer (`WalkLane::start`): one sitting.
+        if !self.permission_walk.active() {
+            self.look_for_automation_ask(now);
+        }
         if !self.permission_walk.active() {
             self.look_for_walk_start(now);
         }
         self.drive_permission_walk(now);
     }
 
-    /// Start a walk by itself when [`starts`] says so: the subjects missing that no walk of this
-    /// process took (one that gave way to a press elsewhere leaves those it had not gone past,
-    /// [`WalkLane::give_way`]) and the owner's Not now does not hold back
-    /// ([`Self::declined_for_the_verb`]: a re-ask after a decline waits for a quiet moment on the
-    /// automatic hand-overs). A walk the setup run has not admitted (no approved revision, a
-    /// `[privacy]` switch off) never starts by itself, nor one while another of the window's
-    /// gestures or a macOS dialog of aterm's is up, nor one while the Mac Setup tab comes next
-    /// ([`Self::mac_setup_tab_comes_next`]) or System Settings asks something
-    /// ([`Self::system_settings_may_ask`], a question seen asking that lapsed off screen among
-    /// them: the walk opens its pages). Readiness does not require a focused System State page or
-    /// a recent-input signal. This runs at every park, so the in-memory readings come first, then
-    /// the page markers ([`Self::fresh_mac`]), the declines and the subjects missing (files and
-    /// grants read), and System Settings asking last (it may read the window list), read once per
-    /// look and only at a look that would start a walk. Pages a walk left at System Settings'
-    /// Quit & Reopen, which the first look takes ([`Self::take_walk_reopen`]), start a walk under
-    /// these rules in place of the page markers: those still missing and not held back by the
-    /// owner's Not now, in the walk's order.
-    fn look_for_walk_start(&mut self, now: Instant) {
-        self.take_walk_reopen();
+    /// Ask macOS's Automation question for System Events by itself, early and batched with the
+    /// walk (H27): at a look where the plan in force signs out of Messages or FaceTime, whose
+    /// clicks go through System Events, and Accessibility already reads on, so no walk comes to its
+    /// page, whose grant asks it ([`Self::read_walk_grant`]). The first look of a process that
+    /// may start a walk by itself asks it, ahead of any walk's pages (`WalkLane::start` holds them
+    /// for the answer), with no sign-out row needed: the sign-outs come last in the setup run,
+    /// and asking then would be late and alone. Under the walk's own start rules
+    /// ([`Self::look_for_walk_start`]): an admitted revision, a process that may start a walk by
+    /// itself, no typing, none of the window's gestures or aterm's macOS dialogs up, the Mac
+    /// Setup tab not next, no install of the tools running outside this launch's tab
+    /// (`App::developer_tools_install_elsewhere`), and System Settings asking nothing; and only
+    /// with a person at the Mac, its screen in use (`App::screen_away`) and touched within
+    /// [`START_PRESENT_WITHIN`], as a walk page's time counts ([`Self::walk_page_time_stands`]),
+    /// so the question never goes up behind a lock. The ask's Apple event is a macOS dialog up
+    /// until it returns ([`WalkReach::automation_out`]), and the sign-out's run reads the answer
+    /// itself at its next look. The walk record keeps when it was asked under the revision
+    /// ([`AutomationAsked`]), as does the walk's own ask: it is asked again, on [`WALK_AGAIN`]'s
+    /// pause after the last ask, only while a sign-out still reads macOS's answer missing
+    /// ([`aterm_types::macos_setup::StageRow::AUTOMATION_UNANSWERED`]), and a new revision asks
+    /// it again by itself. Nothing nags.
+    fn look_for_automation_ask(&mut self, now: Instant) {
         let cold = self.walk_may_start_by_itself();
-        if self
+        let Some(revision) = self
             .access_revision()
             .filter(|_| cold && self.access_steps_allowed() && self.permission_steps_admitted())
-            .is_none()
+        else {
+            return;
+        };
+        if (self.permission_walk.reach().automation_out)() {
+            return;
+        }
+        let status = self.system_state_host.latest_status();
+        let signs_out = status
+            .plan
+            .as_ref()
+            .is_some_and(|plan| Access::Accessibility.needed_for(plan.selection));
+        let unanswered = status.rows.iter().any(|row| {
+            row.detail
+                .contains(aterm_types::macos_setup::StageRow::AUTOMATION_UNANSWERED)
+        });
+        let facts = StartFacts {
+            cold,
+            typing: self
+                .last_keystroke_at
+                .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
+        };
+        if !signs_out
+            || !starts(facts)
+            || (self.screen_away)()
+            || !self.person_present_within(START_PRESENT_WITHIN, now)
+            || !(self.permission_walk.reach().ax_trusted)()
+            || self.access_gesture_up(now)
+            || self.access_dialog_up()
+            || self.mac_setup_tab_comes_next()
         {
             return;
         }
+        if let Some(last) = self.permission_walk.automation_asked(revision) {
+            let clock = (self.permission_walk.reach().unix_now)();
+            if !unanswered || !clock.is_some_and(|clock| clock >= last.due_by(clock)) {
+                return;
+            }
+        }
+        // Read last, as the walk's own start reads them (`Self::look_for_walk_start`): System
+        // Settings asking, and an install of the tools outside this launch's tab, whose prompt or
+        // installer window macOS's alert in front would take the keyboard from.
+        if self.system_settings_may_ask() || self.developer_tools_install_elsewhere() {
+            return;
+        }
+        aterm_log::info!(
+            "permission walk: Accessibility reads on and the plan signs out of an account, whose \
+             clicks go through System Events; asking macOS's Automation question"
+        );
+        (self.permission_walk.reach().ask_automation)();
+        self.permission_walk.note_automation_ask(revision);
+    }
+
+    /// Start a walk by itself when [`starts`] says so, over the first of these that holds a page:
+    ///
+    /// 1. The pages the walk record keeps under the approved revision ([`WalkLane::take_left`]:
+    ///    an earlier process's walk, however that process ended, or a walk of this one that
+    ///    stopped, gave way or lapsed) whose time has come ([`KeptPage::due`]: none for a page no
+    ///    walk left unanswered, [`WALK_AGAIN`]'s pause for one a walk did) and that no walk of
+    ///    this process took since, still missing, not held back by the owner's Not now and, for
+    ///    Accessibility, still offered by the setup run's reading ([`Self::walk_missing`]; until
+    ///    the run's status is in, the look waits, [`Self::setup_run_read`]), in the order kept.
+    ///    Their pages came up before, so neither the page markers nor this process's walks hold
+    ///    them back. A due one this look reads no longer wanted leaves the record, whether or not
+    ///    the others start a walk; no other look drops a page.
+    /// 2. The subjects missing that no walk of this process took, the walk record does not keep
+    ///    (a page that waits for its time comes back by that time alone) and the owner's Not now
+    ///    does not hold back ([`Self::declined_for_the_verb`]: a re-ask after a decline waits for
+    ///    a quiet moment on the automatic hand-overs): Full Disk Access and Developer Tools on a
+    ///    Mac where aterm never brought either page up ([`Self::fresh_mac`]), or once a walk ran
+    ///    in this process; Accessibility whenever the setup run's reading says the sign-outs
+    ///    need it ([`Self::walk_missing`]), once per approved revision: not once the access
+    ///    record holds its page handed under it ([`Self::accessibility_handed`]), whichever
+    ///    process handed it.
+    ///
+    /// A walk the setup run has not admitted (no approved revision, a `[privacy]` switch off)
+    /// never starts by itself, nor one while another of the window's gestures or a macOS dialog
+    /// of aterm's is up, nor one while the Mac Setup tab comes next
+    /// ([`Self::mac_setup_tab_comes_next`]) or an install of Apple's tools runs that may still ask
+    /// or that a quit would cut off (this launch's tab is a gesture up while it may ask; an
+    /// adopted tab or an installer, [`Self::developer_tools_install_elsewhere`]: Full Disk Access
+    /// switched on brings macOS's Quit & Reopen, whose quit would hang up mid-install a tab no
+    /// keeper carries; neither once this launch's tabs are carried past their password,
+    /// [`Self::developer_tools_install_carried`]), or System Settings asks
+    /// something
+    /// ([`Self::system_settings_may_ask`], a question seen asking that lapsed off screen among
+    /// them: the walk opens its pages). Readiness does not require a focused System State page or
+    /// a recent-input signal. This runs at every park, so the in-memory readings come first, then
+    /// the walk record, the page markers, the declines, the subjects missing and the access
+    /// record (files and grants read), and System Settings asking and an install of the tools
+    /// elsewhere last (one may read the window list, the other this Mac's processes), read once
+    /// per look and only at a look that would start a walk.
+    fn look_for_walk_start(&mut self, now: Instant) {
+        let cold = self.walk_may_start_by_itself();
+        let Some(revision) = self
+            .access_revision()
+            .filter(|_| cold && self.access_steps_allowed() && self.permission_steps_admitted())
+        else {
+            return;
+        };
         let facts = StartFacts {
             cold,
             typing: self
@@ -1074,106 +1779,102 @@ impl App {
         {
             return;
         }
-        let reopened = matches!(self.permission_walk.reopened, Reopened::Waits(_));
-        let walk = if let Reopened::Waits(left) = &self.permission_walk.reopened {
-            let left = left.clone();
+        self.permission_walk.take_left(revision);
+        let clock = (self.permission_walk.reach().unix_now)();
+        let kept = self.permission_walk.kept(revision).to_vec();
+        let left: Vec<Subject> = kept
+            .iter()
+            .filter(|page| page.due(clock) && !self.permission_walk.walked(page.subject))
+            .map(|page| page.subject)
+            .collect();
+        let (walk, by) = if left.is_empty() {
+            let first = self.permission_walk.any_walked() || self.fresh_mac();
+            let missing = Subject::ORDER.map(|subject| {
+                !self.permission_walk.walked(subject)
+                    && !kept.iter().any(|page| page.subject == subject)
+                    && (first || subject == Subject::Accessibility)
+                    && !self.declined_for_the_verb(subject)
+                    && self.walk_missing(subject, false)
+                    && (subject != Subject::Accessibility || !self.accessibility_handed(revision))
+            });
+            let walk = Walk::new(subjects(&[], |subject| missing[subject.index()]), now);
+            let by = if walk
+                .as_ref()
+                .is_some_and(|walk| walk.subjects() == [Subject::Accessibility])
+            {
+                "the sign-outs"
+            } else {
+                "first launch"
+            };
+            (walk, by)
+        } else {
+            if left.contains(&Subject::Accessibility) && !self.setup_run_read() {
+                // Whether the sign-outs still need it is the run's to say; unread is no answer.
+                return;
+            }
             let missing = Subject::ORDER.map(|subject| {
                 left.contains(&subject)
                     && !self.declined_for_the_verb(subject)
                     && self.walk_missing(subject, false)
             });
+            let wanted: Vec<KeptPage> = kept
+                .iter()
+                .filter(|page| !left.contains(&page.subject) || missing[page.subject.index()])
+                .copied()
+                .collect();
+            if wanted.len() < kept.len() {
+                aterm_log::info!(
+                    "permission walk: of the pages the walk record keeps that are due, {} read \
+                     held, declined or no longer wanted; they leave it",
+                    left.iter()
+                        .filter(|subject| !missing[subject.index()])
+                        .map(|subject| subject.word())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                self.permission_walk.keep(revision, wanted);
+            }
             let walk = Walk::new(subjects(&left, |subject| missing[subject.index()]), now);
             if walk.is_none() {
-                self.permission_walk.reopened = Reopened::Spent;
-                aterm_log::info!(
-                    "permission walk: every page Quit & Reopen left reads held or declined"
-                );
                 return;
             }
-            walk
-        } else {
-            if !self.permission_walk.any_walked()
-                && !self.permission_walk.gave_way
-                && !self.fresh_mac()
-            {
-                return;
-            }
-            let missing = Subject::ORDER.map(|subject| {
-                !self.permission_walk.walked(subject)
-                    && !self.declined_for_the_verb(subject)
-                    && self.walk_missing(subject, false)
-            });
-            Walk::new(subjects(&[], |subject| missing[subject.index()]), now)
+            (walk, "walks on")
         };
         let Some(walk) = walk else {
             return;
         };
         // Read last, once per look, and only at a look that would start the walk: one that opens
-        // System Settings' pages, so a question seen asking that lapsed off screen holds it too.
-        if self.system_settings_may_ask() {
+        // System Settings' pages, so a question seen asking that lapsed off screen holds it too;
+        // and an install of the tools outside this launch's tab, whose probe reads this Mac's
+        // processes, which no park should pay for.
+        if self.system_settings_may_ask() || self.developer_tools_install_elsewhere() {
             return;
         }
-        if reopened {
-            self.permission_walk.reopened = Reopened::Spent;
-            self.permission_walk.start(walk, "Quit & Reopen");
-        } else {
-            self.permission_walk.start(walk, "first launch");
-        }
+        self.permission_walk.start(walk, by, Some(revision));
     }
 
-    /// Take, once per process, the pages a walk under way left when System Settings' Quit &
-    /// Reopen ended the process before this one ([`Self::leave_walk_at_quit`]): the reopen
-    /// marker is read and removed at the first look ([`WalkReach::take_reopen`]: this `.app`'s,
-    /// within [`REOPEN_WITHIN`]), and its pages wait in memory, not on disk, until the start's
-    /// other rules hold ([`Self::look_for_walk_start`]). Switching Full Disk Access on brings that
-    /// question, and its Quit & Reopen ends the walk with its next pages still to show
-    /// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1); the
-    /// aterm it opens, a cold start or, when an update was staged, the update's successor
-    /// ([`WalkLane::note_successor`]), is one whose pages came up before ([`Self::fresh_mac`]),
-    /// so without them it would start none. A walk that started in this process before the look
-    /// (a person's press, the control verb) ends the wait.
-    fn take_walk_reopen(&mut self) {
-        if self.permission_walk.reopened != Reopened::Unread {
-            return;
+    /// Whether the access record holds the Accessibility page handed under `revision`
+    /// ([`Self::handed_this_revision`]): a walk of this process or an earlier one brought it up
+    /// then (`Self::open_walk_page` records it as it opens), so no walk takes it by itself again
+    /// under that revision, and a new revision offers it again. Read once found
+    /// (`WalkLane::ax_handed`): the record keeps that line.
+    fn accessibility_handed(&mut self, revision: u64) -> bool {
+        if self.permission_walk.ax_handed == Some(revision) {
+            return true;
         }
-        let left = (self.permission_walk.reach().take_reopen)();
-        self.permission_walk.reopened = match left {
-            Some(left) if !self.permission_walk.any_walked() => {
-                aterm_log::info!(
-                    "permission walk: Quit & Reopen left {}; they wait for the walk's start",
-                    left.iter()
-                        .map(|subject| subject.word())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                Reopened::Waits(left)
-            }
-            Some(_) => {
-                aterm_log::info!(
-                    "permission walk: a walk started before the pages Quit & Reopen left were \
-                     taken; they start none"
-                );
-                Reopened::Spent
-            }
-            None => Reopened::Spent,
-        };
+        let handed = self.access_revision() == Some(revision)
+            && self.handed_this_revision(Access::Accessibility);
+        if handed {
+            self.permission_walk.ax_handed = Some(revision);
+        }
+        handed
     }
 
-    /// At this process's quit, when System Settings' Quit & Reopen asked for it (`reopens`,
-    /// `crate::system_quit::reopens`), leave the walk under way's pages, from the one it is at on,
-    /// for the aterm that opens again ([`WalkReach::leave_reopen`]), which walks on from there
-    /// ([`Self::take_walk_reopen`]). The page it is at is left too: the reopened aterm reads its
-    /// grant and skips a page whose grant reads held. A person's quit, a logout's, or no walk
-    /// under way leaves nothing. Called where the quit leaves the Quit & Reopen helper, before
-    /// it, so the marker stands before that aterm can start.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn leave_walk_at_quit(&self, reopens: bool) {
-        let Some(walk) = self.permission_walk.walk() else {
-            return;
-        };
-        if reopens && !walk.ahead().is_empty() {
-            (self.permission_walk.reach().leave_reopen)(walk.ahead());
-        }
+    /// Whether the setup run's status is in: its plan published (`system_state_host`), so
+    /// [`Self::system_state_offers`] answers from a reading. Before it, a row it does not offer
+    /// is unread, not unwanted.
+    fn setup_run_read(&self) -> bool {
+        self.system_state_host.latest_status().plan.is_some()
     }
 
     /// Whether aterm never brought the Full Disk Access or Developer Tools page up for this
@@ -1326,7 +2027,8 @@ impl App {
             };
         };
         let pages = walk.subjects().to_vec();
-        self.permission_walk.start(walk, by);
+        let revision = self.access_revision();
+        self.permission_walk.start(walk, by, revision);
         self.permission_walk.yields = verb;
         if verb {
             self.permission_walk.verb_started_at = Some(now);
@@ -1565,8 +2267,9 @@ impl App {
             && !self.devtools_helper.walk_page_alive(page)
         {
             // Its panel never came up (or went without a close the walk heard): the page in
-            // System Settings stays, as after a press with no panel; nothing walks on from it.
-            self.permission_walk.end("its panel is gone");
+            // System Settings stays, as after a press with no panel; nothing in this process
+            // walks on from it, and the walk record keeps its pages for the next.
+            self.permission_walk.stop("its panel is gone");
         }
         self.read_walk_grant(now);
         self.turn_after_fda(now);
@@ -1623,11 +2326,17 @@ impl App {
     /// A walk page closed `why`: done or switched on goes on to the next page, and so does a
     /// Not now on a page the walk added; a Not now on a page asked for by name (a row's press,
     /// the control verb) goes on only to another page asked for by name, and otherwise ends the
-    /// walk there, as do the close box (on done words that wait for macOS's question too), System
-    /// Settings quitting, another panel and a give-way to a press elsewhere (whose walk already
-    /// stepped aside, `WalkLane::give_way`). The page's ten minutes of the person's time
-    /// (`devtools_helper::Panel::count_time`) end it giving way, the pages after it free for the
-    /// walk that starts by itself, the page that lapsed not (`WalkLane::lapse`). A Not now or the
+    /// walk there, as does the close box (on done words that wait for macOS's question too):
+    /// those are the person's answers, so the walk record keeps none of the pages the walk
+    /// passed or ended on (`WalkLane::end`), and so is System Settings quit under its page: the
+    /// person left it, and what they left is theirs, offered on System State, never brought up
+    /// again by itself. Another panel replacing it answers no page: the walk stops, its pages
+    /// kept, each counting one more walk that left it unanswered, to come back by itself once
+    /// `WALK_AGAIN` says (`WalkLane::stop`). A give-way to a press elsewhere (whose walk already
+    /// stepped aside) counts none (`WalkLane::give_way`). The page's ten minutes of the person's
+    /// time (`devtools_helper::Panel::count_time`) end it giving way, the pages after it free for
+    /// the walk that starts by itself, the page that lapsed leaving the record
+    /// (`WalkLane::lapse`). A Not now or the
     /// close box on the Accessibility page, the walk's alone, is noted as its decline
     /// (`WalkLane::note_ax_declined`), as the lane notes the other pages'.
     fn walk_page_closed(&mut self, page: Page, why: Closed, now: Instant) {
@@ -1635,32 +2344,31 @@ impl App {
             let key = self.access_marks().fda;
             self.permission_walk.note_ax_declined(key);
         }
-        let Some(walk) = self.permission_walk.walk_mut() else {
+        let Some(walk) = self.permission_walk.walk() else {
             return;
         };
         if walk.current().map(Subject::page) != Some(page) || walk.step() != Step::Up {
             return;
         }
+        let named = walk.at_named();
+        let lane = &mut self.permission_walk;
         match why {
             Closed::Done | Closed::SwitchedOn => {
-                let _ = walk.advance(now);
+                let _ = lane.advance(now);
             }
-            Closed::NotNow if !walk.at_named() => {
-                let _ = walk.advance(now);
+            Closed::NotNow if !named => {
+                let _ = lane.advance(now);
             }
             Closed::NotNow => {
-                if walk.advance_to_named(now).is_none() {
-                    self.permission_walk
-                        .end("Not now on the last page asked for");
+                if lane.advance_to_named(now).is_none() {
+                    lane.end("Not now on the last page asked for");
                 }
             }
-            Closed::CloseBox | Closed::Waiting => self.permission_walk.end("the close box"),
-            Closed::Lapsed => self.permission_walk.lapse(),
-            Closed::SettingsGone => self.permission_walk.end("System Settings quit"),
-            Closed::Replaced => self.permission_walk.end("another panel replaced its page"),
-            Closed::GaveWay => self
-                .permission_walk
-                .end("its panel gave way to a person's press elsewhere"),
+            Closed::CloseBox | Closed::Waiting => lane.end("the close box"),
+            Closed::Lapsed => lane.lapse(),
+            Closed::SettingsGone => lane.end("System Settings quit under its page"),
+            Closed::Replaced => lane.stop("another panel replaced its page"),
+            Closed::GaveWay => lane.give_way("its panel gave way to a person's press elsewhere"),
         }
     }
 
@@ -1703,16 +2411,22 @@ impl App {
     /// while nobody touches the Mac, is there when they come back and spends nothing meanwhile.
     /// The person is away once the screen is locked, asleep or another user's
     /// (`App::screen_away`), or nobody has touched the Mac for [`START_PRESENT_WITHIN`]
-    /// ([`Self::person_present_within`]). The page behind another app does not stop its time: a
-    /// person who moved on to other work leaves it, and it lapses ten minutes into theirs.
+    /// ([`Self::person_present_within`]). While a quit is asked of this process
+    /// ([`WalkReach::quit_asked`]) the time stands too: the process is going, and a page that
+    /// lapsed while it went would leave the walk record without it. The page behind another app
+    /// does not stop its time: a person who moved on to other work leaves it, and it lapses ten
+    /// minutes into theirs.
     fn count_walk_page_time(&mut self, now: Instant) {
-        let present = !self.permission_walk.active() || !self.walk_person_away(now);
+        let present = !self.permission_walk.active() || !self.walk_page_time_stands(now);
         self.devtools_helper.count_walk_page_time(now, present);
     }
 
-    /// Whether the person is away from the walk's page ([`Self::count_walk_page_time`]).
-    fn walk_person_away(&self, now: Instant) -> bool {
-        (self.screen_away)() || !self.person_present_within(START_PRESENT_WITHIN, now)
+    /// Whether the walk's page time stands still ([`Self::count_walk_page_time`]): the person is
+    /// away from it, or this process is going.
+    fn walk_page_time_stands(&self, now: Instant) -> bool {
+        (self.screen_away)()
+            || !self.person_present_within(START_PRESENT_WITHIN, now)
+            || (self.permission_walk.reach().quit_asked)()
     }
 
     /// While a walk page is up, read its grant every [`GRANT_POLL`] until the page shows its done
@@ -1755,6 +2469,9 @@ impl App {
                     self.record_access_step(Access::Accessibility, AccessOutcome::Granted);
                     (self.permission_walk.reach().ask_automation)();
                     self.permission_walk.asked_automation = true;
+                    if let Some(revision) = self.permission_walk.walk_revision {
+                        self.permission_walk.note_automation_ask(revision);
+                    }
                 }
             }
             Some(Subject::DeveloperTools) | None => {}
@@ -1779,7 +2496,7 @@ impl App {
             match self.walk_held(subject) {
                 Held::Yes => {
                     aterm_log::info!("permission walk: {} reads held; skipped", subject.word());
-                    self.advance_walk(now);
+                    let _ = self.permission_walk.advance(now);
                     continue;
                 }
                 Held::Unread if !waited => return,
@@ -1793,30 +2510,25 @@ impl App {
                     return;
                 }
                 Opened::Wait => {
-                    // A page held off as long as a panel stays up ends the walk, so a dialog
-                    // slot that never frees keeps no walk looking for it. Only the person's time
-                    // at the Mac counts, as the page's own does: a walk held off while they are
-                    // away is there when they come back.
-                    let present = !self.walk_person_away(now);
+                    // A page held off as long as a panel stays up stops the walk, so a dialog
+                    // slot that never frees keeps no walk of this process looking for it; the
+                    // walk record keeps its pages for the next. Only the person's time at the
+                    // Mac counts, as the page's own does: a walk held off while they are away,
+                    // or while this process is going, is there when they come back.
+                    let present = !self.walk_page_time_stands(now);
                     if self.permission_walk.walk_mut().is_some_and(|walk| {
                         walk.count_held_off(now, present) >= crate::devtools_helper::PANEL_FOR
                     }) {
                         self.permission_walk
-                            .end("its page could not open for ten minutes");
+                            .stop("its page could not open for ten minutes");
                     }
                     return;
                 }
                 Opened::Skip(why) => {
                     aterm_log::info!("permission walk: {} skipped ({why})", subject.word());
-                    self.advance_walk(now);
+                    let _ = self.permission_walk.advance(now);
                 }
             }
-        }
-    }
-
-    fn advance_walk(&mut self, now: Instant) {
-        if let Some(walk) = self.permission_walk.walk_mut() {
-            let _ = walk.advance(now);
         }
     }
 
@@ -1926,14 +2638,19 @@ impl App {
     /// due as another ends opens in the same turn ([`Self::drive_permission_walk`]), so nothing
     /// waits on this deadline to open at once, and a page that cannot open never spins the park.
     /// While the person is away from a page that is up ([`Self::count_walk_page_time`]) the walk
-    /// looks every [`crate::devtools_helper::PANEL_TICK`] instead, for their return.
+    /// looks every [`crate::devtools_helper::PANEL_TICK`] instead, for their return. With none
+    /// under way, the park wakes when the soonest page the walk record keeps that waits for its
+    /// time comes back ([`WalkLane::next_due`]), so it does in a process that outlives its pause.
     pub(crate) fn next_permission_walk_deadline(&self, now: Instant) -> Option<Instant> {
         let every = if self.devtools_helper.walk_page_rests() {
             crate::devtools_helper::PANEL_TICK
         } else {
             GRANT_POLL
         };
-        self.permission_walk.walk().map(|_| now + every)
+        match self.permission_walk.walk() {
+            Some(_) => Some(now + every),
+            None => self.permission_walk.next_due(now),
+        }
     }
 }
 
@@ -2061,252 +2778,5 @@ mod live {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const fn facts() -> StartFacts {
-        StartFacts {
-            cold: true,
-            typing: false,
-        }
-    }
-
-    /// Automatic acquisition starts without opening System State or a recent-input requirement.
-    #[test]
-    fn the_walk_starts_automatically_after_the_keyboard_rests() {
-        assert!(starts(facts()));
-        assert!(
-            !starts(StartFacts {
-                typing: true,
-                ..facts()
-            }),
-            "a key typed 1 s ago waits for the keyboard to rest 2 s"
-        );
-        assert!(
-            !starts(StartFacts {
-                cold: false,
-                ..facts()
-            }),
-            "a process that may not start one by itself never"
-        );
-    }
-
-    /// An opening found for a key read before the bundle id or the Mac holds the walk for good
-    /// only when it names neither beyond what the key carries: one that names a Mac the key
-    /// lacks may be another Mac's.
-    #[test]
-    fn only_an_opening_that_names_no_more_than_the_key_holds_the_walk_for_good() {
-        for (word, key, want) in [
-            ("r1@com.aterm.aterm@A", "r1@com.aterm.aterm@A", true),
-            ("r1", "r1@com.aterm.aterm@A", true),
-            ("0.146.0", "r1@com.aterm.aterm", true),
-            ("r1@com.aterm.aterm", "r1@com.aterm.aterm", true),
-            ("r1@com.aterm.aterm@A", "r1@com.aterm.aterm", false),
-            ("r1@com.aterm.aterm", "r1", false),
-        ] {
-            assert_eq!(found_for_good(word, key), want, "{word} for {key}");
-        }
-    }
-
-    /// The named subjects lead in their order, the rest follow in the walk's own, each once and
-    /// only while missing.
-    #[test]
-    fn named_subjects_lead_and_the_walk_continues_with_the_rest() {
-        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
-        assert_eq!(
-            subjects(&[], |_| true),
-            vec![FullDiskAccess, DeveloperTools, Accessibility]
-        );
-        assert_eq!(
-            subjects(&[DeveloperTools], |subject| subject != Accessibility),
-            vec![DeveloperTools, FullDiskAccess],
-            "doctor's Developer Tools hand-over: Full Disk Access right after it"
-        );
-        assert_eq!(
-            subjects(&[Accessibility, Accessibility], |subject| subject
-                == Accessibility),
-            vec![Accessibility]
-        );
-        assert!(subjects(&[FullDiskAccess], |_| false).is_empty());
-    }
-
-    /// The walk counts the pages the person sees: a page that came up counts, and so does each
-    /// later one whose grant does not read held; a page skipped without coming up does not.
-    #[test]
-    fn a_walk_counts_its_pages_and_ends_after_the_last() {
-        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
-        let now = Instant::now();
-        let none_held = |_| false;
-        let mut walk = Walk::new(vec![FullDiskAccess, Accessibility], now).expect("two pages");
-        assert_eq!(walk.position(none_held), (1, 2));
-        assert_eq!(walk.next(), Some(Accessibility));
-        walk.opened();
-        assert_eq!(walk.step(), Step::Up);
-        assert_eq!(walk.advance(now), Some(Accessibility));
-        assert_eq!((walk.position(none_held), walk.step()), ((2, 2), Step::Due));
-        assert_eq!(walk.next(), None);
-        assert_eq!(walk.advance(now), None);
-        assert_eq!(walk.advance(now), None, "stays over");
-        assert!(Walk::new(Vec::new(), now).is_none());
-
-        let mut walk = Walk::new(vec![FullDiskAccess, DeveloperTools, Accessibility], now)
-            .expect("three pages");
-        assert_eq!(
-            walk.position(|subject| subject == DeveloperTools),
-            (1, 2),
-            "a later page whose grant reads held is not counted"
-        );
-        assert_eq!(walk.advance(now), Some(DeveloperTools), "skipped, never up");
-        assert_eq!(walk.position(none_held), (1, 2), "nor is a page skipped");
-    }
-
-    #[test]
-    fn each_subject_has_its_word_and_the_rows_name() {
-        for subject in Subject::ORDER {
-            assert_eq!(Subject::parse(subject.word()), Some(subject));
-        }
-        assert_eq!(
-            Subject::parse("full-disk-access"),
-            Some(Subject::FullDiskAccess)
-        );
-        assert_eq!(
-            Subject::parse("developer-tools"),
-            Some(Subject::DeveloperTools)
-        );
-        assert_eq!(Subject::parse("camera"), None);
-    }
-
-    /// An absolute path to a `.app`, spaces and all, on the host the test runs on.
-    fn host_bundle(name: &str) -> PathBuf {
-        PathBuf::from(if cfg!(windows) {
-            r"C:\Applications"
-        } else {
-            "/Applications"
-        })
-        .join(name)
-    }
-
-    /// A hardware UUID, one word.
-    const MAC: &str = "1D683F62-5C4B-4E3A-9F21-7B8C6D5E4A30";
-
-    /// A reopen marker reads back the quit's seconds, the pages in their order, the bundle and the
-    /// Mac, a page's word this aterm does not know left out and each page once; anything else is
-    /// junk.
-    #[test]
-    fn a_reopen_marker_reads_back_what_the_quit_wrote_and_nothing_else() {
-        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
-        let bundle = host_bundle("aterm (dev).app");
-        let path = bundle.to_str().expect("a UTF-8 path");
-        let text = reopen_text(1_793_161_729, &[DeveloperTools, Accessibility], path, MAC);
-        assert_eq!(
-            text,
-            format!("1793161729 devtools accessibility\n{path}\n{MAC}\n")
-        );
-        assert_eq!(
-            read_reopen(&text),
-            Some(Reopen {
-                at: 1_793_161_729,
-                subjects: vec![DeveloperTools, Accessibility],
-                bundle: bundle.clone(),
-                mac: MAC.to_owned(),
-            })
-        );
-        assert_eq!(
-            read_reopen(&format!("5 camera devtools devtools fda\n{path}\n{MAC}\n"))
-                .map(|reopen| reopen.subjects),
-            Some(vec![DeveloperTools, FullDiskAccess])
-        );
-        for junk in [
-            String::new(),
-            "\n".to_owned(),
-            format!("devtools\n{path}\n{MAC}\n"),
-            format!("-5 devtools\n{path}\n{MAC}\n"),
-            format!("5\n{path}\n{MAC}\n"),
-            format!("5 camera\n{path}\n{MAC}\n"),
-            format!("5 devtools\n{MAC}\n"),
-            format!("5 devtools\nApplications/aterm.app\n{MAC}\n"),
-            format!("5 devtools\n{path}\n"),
-            format!("5 devtools\n{path}\n\n"),
-            format!("5 devtools\n{path}\nMAC A\n"),
-            format!("5 devtools\n{path}\n{MAC}\nmore\n"),
-        ] {
-            assert_eq!(read_reopen(&junk), None, "{junk:?}");
-        }
-    }
-
-    /// The marker is taken once, by the bundle that wrote it on the Mac it was written on, within
-    /// [`REOPEN_WITHIN`] of the quit (a clock set back a little too), and removed then. Another
-    /// bundle's or Mac's within the bound, or any while this aterm names no bundle or Mac, starts
-    /// nothing and is left in place, so the aterm it names still takes it; an older one or junk
-    /// starts nothing and is gone. A bundle path no line can hold, or a Mac that is not one word,
-    /// writes none.
-    #[test]
-    fn a_reopen_marker_is_taken_once_and_only_by_its_bundle_on_its_mac_within_its_bound() {
-        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
-        const OTHER_MAC: &str = "8F2E6A41-0B3C-4D5E-A697-C8D9E0F1A2B3";
-        let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
-        let state = dir.path();
-        let marker = state.join(REOPEN_MARKER);
-        let (bundle, other) = (host_bundle("aterm.app"), host_bundle("aterm (dev).app"));
-        let pages = [FullDiskAccess, DeveloperTools, Accessibility];
-        let at = 1_793_161_750;
-        let within = REOPEN_WITHIN.as_secs();
-        let leave = || leave_reopen_in(state, at, &pages, &bundle, MAC).expect("the marker");
-        let ours = Some(bundle.as_path());
-
-        leave();
-        assert_eq!(
-            take_reopen_in(state, at + within, ours, Some(MAC)),
-            Some(pages.to_vec())
-        );
-        assert!(!marker.exists(), "taken");
-        assert_eq!(take_reopen_in(state, at + within, ours, Some(MAC)), None);
-
-        leave();
-        assert_eq!(
-            take_reopen_in(state, at - 30, ours, Some(MAC)),
-            Some(pages.to_vec()),
-            "a clock set back"
-        );
-        leave();
-        for (this, mac) in [
-            (Some(other.as_path()), Some(MAC)),
-            (ours, Some(OTHER_MAC)),
-            (None, Some(MAC)),
-            (ours, None),
-        ] {
-            assert_eq!(
-                take_reopen_in(state, at + 1, this, mac),
-                None,
-                "{this:?} on {mac:?}"
-            );
-            assert!(
-                marker.exists(),
-                "left for its own aterm: {this:?} on {mac:?}"
-            );
-        }
-        assert_eq!(
-            take_reopen_in(state, at + 1, ours, Some(MAC)),
-            Some(pages.to_vec()),
-            "its own aterm takes it after them"
-        );
-
-        for this in [ours, Some(other.as_path())] {
-            leave();
-            assert_eq!(
-                take_reopen_in(state, at + within + 1, this, Some(MAC)),
-                None
-            );
-            assert!(!marker.exists(), "an older one is removed: {this:?}");
-        }
-        std::fs::write(&marker, "junk\n").expect("junk");
-        assert_eq!(take_reopen_in(state, at, ours, Some(MAC)), None);
-        assert!(!marker.exists(), "junk removed");
-
-        let split = PathBuf::from(format!("{}\nx.app", bundle.display()));
-        assert!(leave_reopen_in(state, at, &pages, &split, MAC).is_err());
-        assert!(leave_reopen_in(state, at, &pages, &bundle, "MAC A").is_err());
-        assert!(leave_reopen_in(state, at, &pages, &bundle, "").is_err());
-        assert!(!marker.exists());
-    }
-}
+#[path = "permission_walk_tests.rs"]
+mod tests;

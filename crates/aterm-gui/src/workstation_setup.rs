@@ -59,11 +59,117 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
 static PROXY: Mutex<Option<EventLoopProxy<Wake>>> = Mutex::new(None);
 
 pub(crate) fn send_setup_wake(wake: Wake) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(window) = SetupLoopForTest::standing_in() {
+        return window.offer(&wake);
+    }
     PROXY
         .lock()
         .ok()
         .and_then(|proxy| proxy.clone())
         .is_some_and(|proxy| proxy.send_event(wake).is_ok())
+}
+
+/// A test's stand-in, on its own thread, for the window's loop as the setup worker's
+/// publications meet it. While it lives, every [`send_setup_wake`] of its thread goes to it and
+/// not to the registered proxy, and that thread's record of the readings the loop took
+/// ([`crate::initial_setup_readings_undelivered`]) is the stand-in's own, begun as a launch's
+/// is. No other thread is touched, so a test that publishes beside it changes nothing it
+/// counts.
+#[cfg(any(test, debug_assertions))]
+pub struct SetupLoopForTest(std::rc::Rc<LoopStandIn>);
+
+/// What a [`SetupLoopForTest`] keeps for its thread.
+#[cfg(any(test, debug_assertions))]
+pub(crate) struct LoopStandIn {
+    /// Whether the loop has registered its proxy and not closed since.
+    registered: std::cell::Cell<bool>,
+    statuses: std::cell::Cell<u32>,
+    readings: std::cell::Cell<u32>,
+    pub(crate) delivery: crate::system_state_host::ReadingsDelivery,
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static LOOP_STAND_IN: std::cell::RefCell<Option<std::rc::Rc<LoopStandIn>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(any(test, debug_assertions))]
+impl LoopStandIn {
+    /// Count `wake` if it is a setup publication, and say whether the loop took it.
+    fn offer(&self, wake: &Wake) -> bool {
+        match wake {
+            Wake::InitialSetupStatus { .. } => self.statuses.set(self.statuses.get() + 1),
+            Wake::InitialSetupReadings(_) => self.readings.set(self.readings.get() + 1),
+            _ => {}
+        }
+        self.registered.get()
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl SetupLoopForTest {
+    /// Stand in on this thread for a window whose loop has not registered its proxy: each
+    /// publication is dropped until [`Self::register`].
+    ///
+    /// # Panics
+    /// If this thread already has a stand-in.
+    #[must_use]
+    pub fn before_its_proxy() -> Self {
+        let window = std::rc::Rc::new(LoopStandIn {
+            registered: std::cell::Cell::new(false),
+            statuses: std::cell::Cell::new(0),
+            readings: std::cell::Cell::new(0),
+            delivery: crate::system_state_host::ReadingsDelivery::new(),
+        });
+        LOOP_STAND_IN.with(|standing| {
+            let earlier = standing.borrow_mut().replace(std::rc::Rc::clone(&window));
+            assert!(earlier.is_none(), "one stand-in for the loop a thread");
+        });
+        Self(window)
+    }
+
+    /// The loop registers its proxy, for the first time or again after [`Self::close`]: it
+    /// takes every publication from here on.
+    pub fn register(&self) {
+        self.0.registered.set(true);
+    }
+
+    /// The loop closed: a publication finds nobody, as one made before the proxy registered.
+    pub fn close(&self) {
+        self.0.registered.set(false);
+    }
+
+    /// The status publications sent on this thread since the stand-in began, taken or dropped.
+    #[must_use]
+    pub fn statuses_sent(&self) -> u32 {
+        self.0.statuses.get()
+    }
+
+    /// The readings publications sent on this thread since the stand-in began, taken or
+    /// dropped.
+    #[must_use]
+    pub fn readings_sent(&self) -> u32 {
+        self.0.readings.get()
+    }
+
+    /// This thread's stand-in, if a test holds one. A thread that is ending, its thread-locals
+    /// gone, has none: a wake sent from another thread-local's drop goes to the proxy.
+    pub(crate) fn standing_in() -> Option<std::rc::Rc<LoopStandIn>> {
+        LOOP_STAND_IN
+            .try_with(|standing| standing.borrow().clone())
+            .ok()
+            .flatten()
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for SetupLoopForTest {
+    fn drop(&mut self) {
+        let _ = LOOP_STAND_IN.try_with(|standing| standing.borrow_mut().take());
+    }
 }
 
 /// Wake nonblocking maintenance after its worker ends, including while unwinding.
@@ -147,6 +253,25 @@ pub(crate) fn window_focus_gained() {
     }
 }
 
+/// This login's screen came back to a person (unlocked, awake, switched back to this login) while
+/// the setup run's sign-outs wait on it (`App::watch_session_return`): the worker's focus wake
+/// ([`on_window_focus_gained`]), which ends a park waiting on the sign-outs, so they look again
+/// at once rather than at their next timed look. No focus gain is counted.
+pub(crate) fn session_returned() {
+    #[cfg(test)]
+    SESSION_RETURNS.with(|returns| returns.set(returns.get() + 1));
+    let wake = *FOCUS_WAKE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(wake) = wake {
+        wake();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The returns [`session_returned`] said on this thread.
+    pub(crate) static SESSION_RETURNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Count a focus gain, as a window's `Focused(true)` does.
 #[cfg(any(test, debug_assertions))]
 pub fn gain_window_focus_for_test() {
@@ -218,7 +343,8 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
-    #[cfg(test)]
+    /// An inert handoff for tests and the development-only System State gallery.
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
     pub(crate) fn new(initial: impl Into<Plan>, reply: mpsc::Sender<SetupAnswer>) -> Self {
         Self::with_handoff(initial.into(), reply, || {})
     }
@@ -314,6 +440,39 @@ pub(crate) enum PagePress {
     Nobody,
 }
 
+/// When a reader of the elevation's other steps whose thread could not start is started again
+/// ([`Host::start_root_steps_read`]): a minute after the first failed start, doubling, never more
+/// than ten minutes. A launch reads them afresh, so the schedule lives with the window.
+const ROOT_STEPS_READ_AGAIN: aterm_types::retry_schedule::Backoff =
+    aterm_types::retry_schedule::Backoff::new(Duration::from_secs(60), Duration::from_secs(600));
+
+/// How long the setup page's own answer to a launch's offer (its answer, a queued page action, a
+/// Stop under way) may hold an update: the page settles each at its next 250 ms tick, and a
+/// Stop's save within its own settle, so one standing this long is a page that will not settle
+/// it. Past it the offer holds only for a person's draft in it.
+pub(crate) const SETUP_ANSWER_BACKSTOP: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    SETUP_ANSWER_BACKSTOP.as_secs() < crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+);
+
+/// What the offer's hold `raw` is once the page's own answer has held past
+/// [`SETUP_ANSWER_BACKSTOP`] (`overdue`): nothing, unless a person's draft is in it (`draft`),
+/// which stays theirs. Any other hold, or one inside the backstop, is `raw`.
+#[must_use]
+#[cfg(any(unix, test))]
+pub(crate) fn offer_hold_past_backstop(
+    raw: Option<crate::native_update_lane_hold::LaneHold>,
+    overdue: bool,
+    draft: impl FnOnce() -> bool,
+) -> Option<crate::native_update_lane_hold::LaneHold> {
+    use crate::native_update_lane_hold::LaneHold;
+    match raw {
+        Some(LaneHold::SetupAnswer) if overdue => draft().then_some(LaneHold::SetupDraft),
+        raw => raw,
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Host {
     startup: Option<fn() -> bool>,
@@ -326,15 +485,18 @@ pub(crate) struct Host {
     proxy_registered: bool,
     /// The Command Line Tools install a setup run asked for this launch.
     pub(crate) developer_tools: crate::clt_install::Install,
-    /// Its dedicated children, including recovered ones: any live child owns the prompt slot.
+    /// Its dedicated children, including recovered ones: a live child owns the prompt slot while
+    /// it may still ask ([`App::developer_tools_install_may_ask`]).
     pub(crate) developer_tools_session: Vec<crate::clt_install::Terminal>,
     pub(crate) developer_tools_stop: crate::clt_install::StopReach,
     /// The attempt whose result may change the install's state. Kept after its terminal leaves,
     /// so an older child's delayed status cannot become current again.
     pub(crate) developer_tools_attempt: Option<u64>,
-    /// The account-wide hold on automatic administrator-password prompts, shared by Mac Setup
-    /// and the package follow-up's `aterm init` ([`crate::clt_install::Mark`]). Updates preserve
-    /// a consumed episode; a person can explicitly retry.
+    /// The account's record of setup's administrator ask, which its tab and the package
+    /// follow-up's `aterm init` share ([`crate::clt_install::Mark`]): aterm asks by itself only
+    /// where it lets an automatic ask go now, and again by itself after an attempt that did not
+    /// finish, once its next try is due. Updates keep it; a person's own Install… claims it
+    /// whatever it says.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
     /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]), probed
     /// live at a dispatch boundary; none in a headless instance or a test, which never look at
@@ -347,6 +509,12 @@ pub(crate) struct Host {
     /// Read-only C compiler presence, asked only while its missing-tools exception is
     /// unresolved; none in headless instances and tests, which inject their own reading.
     pub(crate) developer_tools_installed: Option<fn() -> Option<bool>>,
+    /// Whether this process's keeper holds a session's master and keeps it past a quit whose
+    /// BYE names it ([`crate::keeper_link::carries_at_quit`]), which lets a quit leave a Mac
+    /// Setup tab's program running for the next launch
+    /// ([`App::developer_tools_custody_at_exit`]); none in headless instances and tests, which
+    /// carry none unless they inject one.
+    pub(crate) developer_tools_keeper_carries: Option<fn(u64) -> bool>,
     /// What the page says of the install beyond its tab and this Mac's installers: the tab said
     /// the tools are installed, or a person's press opened nothing, and why.
     pub(crate) developer_tools_after: crate::clt_install::Aftermath,
@@ -365,13 +533,12 @@ pub(crate) struct Host {
     /// nothing. `None` before the first.
     pub(crate) developer_tools_shim_said: std::cell::Cell<Option<bool>>,
     /// An install of the tools ended unfinished (the tab said why, or ended without saying), or
-    /// aterm asked for them for this account on this build already (the tab at an earlier launch,
-    /// or the package follow-up, whose own install may be under way now) and no tab of this
-    /// window's has started one since: no tab opens by itself until a person presses Install…,
-    /// so the shim says they are missing and not on their way, though a pass still wants them,
-    /// unless an install of them is under way on this Mac ([`App::developer_tools_on_their_way`]).
-    /// A tab that starts the install, or one adopted alive from an earlier aterm, clears it; a
-    /// newer build's launch starts without it, as its own automatic tab may open.
+    /// the account's record held the automatic ask at launch (another asker's attempt, whose own
+    /// install may be under way now, a try not due yet, a person's decline) and no tab of this
+    /// window's has started one since: the shim says they are missing and not on their way,
+    /// though a want stands, unless an install of them is under way on this Mac
+    /// ([`App::developer_tools_on_their_way`]). A tab that starts the install, or one adopted
+    /// alive from an earlier aterm, clears it.
     pub(crate) developer_tools_unfinished: bool,
     /// A package pass said `c-toolchain: missing` while an install of the tools was on its way
     /// ([`App::developer_tools_on_their_way`]): its only-you entry waits, since it would ask a
@@ -391,11 +558,12 @@ pub(crate) struct Host {
     /// Whether the window reads this Mac's network and account for the install; none in a
     /// headless instance or a test.
     pub(crate) developer_tools_reads_mac: bool,
-    /// Whether setup's one early elevation owes this Mac a root step beside the tools (developer
-    /// mode off, or no rule to name the Mac by after admission), as the launch read it off the loop
-    /// ([`crate::clt_install::read_root_steps`]): a Mac that has the tools still gets the
-    /// automatic tab, whose one password does those steps ([`App::root_steps_owed`]).
-    pub(crate) developer_tools_root_owed: bool,
+    /// What setup's one early elevation owes this Mac beside the tools (developer mode off, no
+    /// rule to name the Mac by after admission, the LAN broker), as the last reading off the loop
+    /// said ([`crate::clt_install::read_root_steps`]: at launch, and again after an attempt that
+    /// did not finish): a Mac that has the tools still gets the automatic tab, whose one password
+    /// does those steps ([`App::root_steps_owed`]).
+    pub(crate) developer_tools_root_owed: crate::clt_install::RootSteps,
     /// The launch runs in a scratch world ([`aterm_types::world::MARKER`] or `CI` set, read as
     /// [`crate::converge_lane::runs`] reads them): a check's or a lab's bundle, whose automatic
     /// tab would put a password ask on the desk and take the keys the check types into its own
@@ -405,8 +573,18 @@ pub(crate) struct Host {
     /// launch where the window reads this Mac, outside a scratch world, and this build's tab
     /// never opened for the account.
     root_steps_unread: bool,
-    /// A reader whose thread could not start is tried again at this existing host deadline.
+    /// A reader whose thread could not start is tried again at this host deadline
+    /// ([`ROOT_STEPS_READ_AGAIN`] after [`Self::root_steps_misses`] failed starts in a row).
     root_steps_retry: Option<Instant>,
+    /// Starts of the reader that failed in a row; none once one starts.
+    root_steps_misses: u32,
+    /// An earlier aterm's adopted tab whose attempt could not be carried into the account's
+    /// record is carried again at this host deadline
+    /// ([`crate::App::carry_earlier_developer_tools_tabs`], after
+    /// [`Self::developer_tools_carry_misses`] carries that failed in a row).
+    pub(crate) developer_tools_carry_retry: Option<Instant>,
+    /// Passes in a row whose carry of such a tab failed; none once every due one is carried.
+    pub(crate) developer_tools_carry_misses: u32,
     /// The launch reads the elevation's other steps and their answer has not landed
     /// ([`crate::App::root_steps_owed`]): set where [`Self::root_steps_unread`] is, cleared by
     /// that answer or a reading that could not start. Until then the Mac Setup tab may still be
@@ -416,6 +594,9 @@ pub(crate) struct Host {
     /// The last reason the automatic tab was held that the window logged
     /// ([`crate::App::developer_tools_install_held`]), so each new one is said once.
     pub(crate) developer_tools_held_said: std::cell::Cell<Option<&'static str>>,
+    /// The record's due (unix seconds, [`crate::clt_install::Mark::due`]) whose passing the
+    /// window last looked at ([`App::tick_workstation_setup`]), so each due wakes one look.
+    developer_tools_due_looked: Option<u64>,
 }
 
 impl Host {
@@ -428,8 +609,8 @@ impl Host {
     /// registered (`registered`), as the reading's answer is a wake that a window without its
     /// proxy drops, which left a Mac that has the tools with no automatic tab (round 9, the CLT
     /// base: the reading landed 55 ms before the window's first present registered the proxy).
-    /// A failed spawn retains the reading for a later host deadline, with no answer in flight
-    /// holding the window's other macOS asks while it waits.
+    /// A failed spawn retains the reading for a later host deadline on [`ROOT_STEPS_READ_AGAIN`],
+    /// with no answer in flight holding the window's other macOS asks while it waits.
     fn start_root_steps_read(
         &mut self,
         registered: bool,
@@ -446,9 +627,47 @@ impl Host {
         if self.root_steps_awaited {
             self.root_steps_unread = false;
             self.root_steps_retry = None;
+            self.root_steps_misses = 0;
         } else {
-            self.root_steps_retry = Some(now + Duration::from_secs(60));
+            self.root_steps_misses = self.root_steps_misses.saturating_add(1);
+            self.root_steps_retry = Some(now + ROOT_STEPS_READ_AGAIN.after(self.root_steps_misses));
         }
+    }
+
+    /// Read the elevation's other steps again ([`Self::start_root_steps_read`]), where the window
+    /// reads this Mac outside a scratch world: an attempt that did not finish may have done some
+    /// of them, so what is owed now comes from a fresh reading, never the launch's. That is a new
+    /// fact, so the reader starts at the window's next pass, whatever an earlier failed start's
+    /// pause still said ([`Self::root_steps_retry`]); a start that fails again waits on
+    /// [`ROOT_STEPS_READ_AGAIN`] for the failed starts in a row.
+    pub(crate) fn read_root_steps_again(&mut self) {
+        let read = self.developer_tools_reads_mac && !self.developer_tools_scratch_world;
+        self.developer_tools_root_owed = crate::clt_install::RootSteps::default();
+        self.root_steps_unread = read;
+        self.root_steps_awaited = read;
+        if read {
+            self.root_steps_retry = None;
+        }
+    }
+
+    /// Whether a due of the record passed that the window has not looked at since
+    /// ([`Self::developer_tools_due_looked`]), for a want the record holds: the due's wake
+    /// ([`Self::deadline`]) then looks again, with no status or watch to ride.
+    fn developer_tools_due_passed(&mut self) -> bool {
+        if !matches!(self.developer_tools, crate::clt_install::Install::Wanted(_)) {
+            return false;
+        }
+        let Some(due) = self.developer_tools_mark.due() else {
+            return false;
+        };
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if due > unix || self.developer_tools_due_looked == Some(due) {
+            return false;
+        }
+        self.developer_tools_due_looked = Some(due);
+        true
     }
 
     /// The window's setup host at launch, keeping the Command Line Tools `shim` the launch
@@ -457,21 +676,24 @@ impl Host {
         startup: Option<fn() -> bool>,
         headless: bool,
         shim: crate::clt_shim::Shim,
+        successor: bool,
     ) -> Self {
         Self::for_launch_marked(
             startup,
             headless,
-            crate::clt_install::Mark::for_launch(),
+            crate::clt_install::Mark::for_launch(successor),
             shim,
         )
     }
 
-    /// [`Self::for_launch`] with this account's Mac Setup tab `mark` as the launch read
-    /// it: a tab that opened at an earlier launch of this build, with nothing installing the tools
-    /// since, leaves them unfinished ([`Self::developer_tools_unfinished`]). A window whose `shim`
-    /// finds the tools missing wants them from here, as the launch's early step with no pass and no
-    /// page ([`crate::clt_install::LAUNCH_WANT`]), unless the mark says its tab opened on this
-    /// build before, and watches for their arrival where it reads this Mac.
+    /// [`Self::for_launch`] with this account's ask record `mark` as the launch read it: a record
+    /// that holds the automatic ask now (another asker's attempt, a try not due yet, a person's
+    /// decline, a record that cannot be read) leaves the tools unfinished
+    /// ([`Self::developer_tools_unfinished`]) until an install starts. A window whose `shim` finds
+    /// the tools missing wants them from here, as the launch's early step with no pass and no page
+    /// ([`crate::clt_install::LAUNCH_WANT`]), unless no automatic ask may come (a decline, a
+    /// record with no place: [`crate::clt_install::Mark::may_come`]), and watches for their
+    /// arrival where it reads this Mac.
     pub(crate) fn for_launch_marked(
         startup: Option<fn() -> bool>,
         headless: bool,
@@ -483,7 +705,7 @@ impl Host {
             !headless,
             reads_mac,
             shim.tools_missing(),
-            mark.opened(),
+            !mark.may_come(),
         );
         if launch.watch {
             crate::clt_install::watch_for_tools();
@@ -491,7 +713,7 @@ impl Host {
         let scratch_world = !cfg!(test)
             && (crate::converge_lane::env_set(aterm_types::world::MARKER)
                 || crate::converge_lane::env_set("CI"));
-        let root_steps_unread = reads_mac && !scratch_world && !mark.opened();
+        let root_steps_unread = reads_mac && !scratch_world && mark.may_come();
         let preview = aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP");
         let mode = preview_mode(
             preview.is_some(),
@@ -519,7 +741,7 @@ impl Host {
             developer_tools_session: Vec::new(),
             developer_tools_stop: crate::clt_install::StopReach::for_launch(headless),
             developer_tools_attempt: None,
-            developer_tools_unfinished: mark.opened(),
+            developer_tools_unfinished: mark.held().is_some(),
             c_toolchain_missing_held: false,
             developer_tools_mark: mark,
             developer_tools_probe: (!headless && !cfg!(test)).then_some(
@@ -528,6 +750,8 @@ impl Host {
             developer_tools_seen: None,
             developer_tools_installed: (!headless && !cfg!(test))
                 .then_some(crate::clt_install::c_toolchain_installed as fn() -> Option<bool>),
+            developer_tools_keeper_carries: (!headless && !cfg!(test))
+                .then_some(crate::keeper_link::carries_at_quit as fn(u64) -> bool),
             developer_tools_after: crate::clt_install::Aftermath::default(),
             developer_tools_want: launch.want(),
             developer_tools_shim: shim,
@@ -536,12 +760,16 @@ impl Host {
             developer_tools_network: None,
             developer_tools_not_admin: false,
             developer_tools_reads_mac: reads_mac,
-            developer_tools_root_owed: false,
+            developer_tools_root_owed: crate::clt_install::RootSteps::default(),
             developer_tools_scratch_world: scratch_world,
             root_steps_unread,
             root_steps_retry: None,
+            developer_tools_carry_retry: None,
+            developer_tools_carry_misses: 0,
+            root_steps_misses: 0,
             root_steps_awaited: root_steps_unread,
             developer_tools_held_said: std::cell::Cell::new(None),
+            developer_tools_due_looked: None,
         }
     }
 
@@ -565,9 +793,27 @@ impl Host {
             .map(|_| now + Duration::from_millis(250))
             .into_iter()
             .chain(self.startup_retry)
+            .chain(self.developer_tools_due(now))
             .chain(self.root_steps_retry)
+            .chain(self.developer_tools_carry_retry)
             .chain(self.maintenance_due)
             .min()
+    }
+
+    /// When a want of the tools held only by the record may go (its next try, or the next look at
+    /// a record another asker holds or that cannot be read): the window wakes then to look again
+    /// ([`crate::clt_install::Mark::due`], [`App::tick_workstation_setup`]), so an attempt that
+    /// did not finish is asked again by itself with no other wake (a Mac whose tools are there
+    /// has no watch).
+    fn developer_tools_due(&self, now: Instant) -> Option<Instant> {
+        if !matches!(self.developer_tools, crate::clt_install::Install::Wanted(_)) {
+            return None;
+        }
+        let due = self.developer_tools_mark.due()?;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        (due > unix).then(|| now + Duration::from_secs(due - unix))
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -737,17 +983,32 @@ impl App {
     ///
     /// [`LaneHold::SetupDraft`]: crate::native_update_lane_hold::LaneHold::SetupDraft
     /// [`LaneHold::SetupAnswer`]: crate::native_update_lane_hold::LaneHold::SetupAnswer
+    ///
+    /// The page's own answer holds at most [`SETUP_ANSWER_BACKSTOP`] of the automatic lane's
+    /// attempts in a row ([`crate::native_update_lane_hold::LaneHoldClocks::setup_answer`]): a
+    /// page that has not settled it by then will not, and past it the offer holds only for a
+    /// person's draft in it, which stays theirs.
     #[cfg(unix)]
     pub(crate) fn workstation_setup_handoff_hold(
         &self,
     ) -> Option<crate::native_update_lane_hold::LaneHold> {
+        let overdue = self
+            .lane_hold_clocks
+            .setup_answer
+            .overdue(SETUP_ANSWER_BACKSTOP, std::time::Instant::now());
+        offer_hold_past_backstop(self.workstation_setup_offer_hold(), overdue, || {
+            self.workstation_setup_offer_draft()
+        })
+    }
+
+    /// The offer's hold as the page states it, before [`SETUP_ANSWER_BACKSTOP`].
+    #[cfg(unix)]
+    pub(crate) fn workstation_setup_offer_hold(
+        &self,
+    ) -> Option<crate::native_update_lane_hold::LaneHold> {
         use crate::native_update_lane_hold::LaneHold;
         use crate::system_state::OfferHold;
-        let request = self
-            .workstation_setup
-            .request
-            .as_ref()
-            .filter(|request| request.pending())?;
+        let request = self.pending_setup_offer()?;
         let state = self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::SystemState)
@@ -759,6 +1020,30 @@ impl App {
             OfferHold::Draft => LaneHold::SetupDraft,
             OfferHold::Answer => LaneHold::SetupAnswer,
         })
+    }
+
+    /// Whether a person's draft is in the pending offer's page ([`SystemStateApp::offer_draft`]).
+    ///
+    /// [`SystemStateApp::offer_draft`]: crate::system_state::SystemStateApp::offer_draft
+    #[cfg(unix)]
+    fn workstation_setup_offer_draft(&self) -> bool {
+        let Some(request) = self.pending_setup_offer() else {
+            return false;
+        };
+        matches!(
+            self.native_runtime
+                .instance_by_kind(crate::native_app::AppKind::SystemState)
+                .and_then(|instance| self.native_runtime.app(instance)),
+            Some(crate::native_app::NativeApp::SystemState(state)) if state.offer_draft(request)
+        )
+    }
+
+    #[cfg(unix)]
+    fn pending_setup_offer(&self) -> Option<&Request> {
+        self.workstation_setup
+            .request
+            .as_ref()
+            .filter(|request| request.pending())
     }
 
     pub(crate) fn hold_initial_setup_permissions(&mut self) {
@@ -779,6 +1064,33 @@ impl App {
 
     pub(crate) fn accepted_initial_setup_apply(&mut self) {
         self.workstation_setup.permissions.accepted();
+    }
+
+    /// A person's own Set up now ([`Self::note_system_state_apply`]) is their yes to setup's
+    /// password ask: a decline the account's record holds (their Stop, a Ctrl-C at the prompt, a
+    /// closed Mac Setup tab) is lifted, and the elevation's steps are read again, so the automatic
+    /// ask comes by itself where anything is owed ([`crate::clt_install::Mark::lift`]).
+    fn persons_yes_lifts_a_decline(&mut self) {
+        if !self.workstation_setup.developer_tools_mark.lift() {
+            return;
+        }
+        aterm_log::info!("System State: a person's Set up now lifted the declined password ask");
+        let setup = &mut self.workstation_setup;
+        setup.developer_tools_unfinished = setup.developer_tools_mark.held().is_some();
+        if setup.developer_tools_shim.tools_missing() && setup.developer_tools_want.is_none() {
+            setup.developer_tools_want = Some(crate::clt_install::LAUNCH_WANT);
+        }
+        if setup.developer_tools == crate::clt_install::Install::Unasked
+            && setup.developer_tools_shim.tools_missing()
+        {
+            setup.developer_tools = crate::clt_install::Install::Wanted(
+                setup
+                    .developer_tools_want
+                    .unwrap_or(crate::clt_install::LAUNCH_WANT),
+            );
+        }
+        setup.read_root_steps_again();
+        self.settle_developer_tools_want();
     }
 
     pub(crate) fn recheck_initial_setup_permissions(&mut self) {
@@ -843,6 +1155,9 @@ impl App {
         self.workstation_setup
             .permissions
             .apply_started(answers_offer, press);
+        if press == PagePress::Person {
+            self.persons_yes_lifts_a_decline();
+        }
     }
 
     /// Whether the Apply being handled is a person's own press ([`Self::note_system_state_apply`]).
@@ -859,6 +1174,7 @@ impl App {
     /// Whether the admitted setup can start its permission steps automatically.
     pub(crate) fn permission_steps_admitted(&self) -> bool {
         self.workstation_setup.permissions.steps_admitted()
+            && !self.system_state_host.stopped_access()
     }
 
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
@@ -881,6 +1197,9 @@ impl App {
             self.tick_system_state_fixture(now);
             return;
         }
+        // An earlier aterm's live Mac Setup tab, adopted in the handoff now in, holds the
+        // account's record before anything here may ask beside it.
+        self.carry_earlier_developer_tools_tabs(now);
         if !self.workstation_setup.proxy_registered {
             if let Ok(mut proxy) = PROXY.lock() {
                 *proxy = self.proxy.clone();
@@ -896,6 +1215,12 @@ impl App {
             now,
             crate::clt_install::read_root_steps,
         );
+        // The record's due passed (its next try, or the next look at it): look again now, as no
+        // status or watch may come to (a finished run polls none; a Mac with the tools has no
+        // watch).
+        if self.workstation_setup.developer_tools_due_passed() {
+            self.tick_developer_tools_install();
+        }
         self.workstation_setup.start(now);
         self.tick_system_state(now);
         if self
@@ -910,701 +1235,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The elevation's reading waits for its wake proxy and retries only a failed thread spawn.
-    /// A started reader runs once, and a launch that owes no reading starts none.
-    #[test]
-    fn the_root_steps_read_waits_for_the_wake_proxy_and_runs_once() {
-        let mut host = Host::default();
-        host.root_steps_unread = true;
-        host.root_steps_awaited = true;
-        let now = Instant::now();
-        let attempts = std::cell::Cell::new(0);
-        let attempt = || {
-            attempts.set(attempts.get() + 1);
-            attempts.get() > 1
-        };
-        host.start_root_steps_read(false, now, attempt);
-        assert_eq!(attempts.get(), 0, "no proxy: no read yet");
-        host.start_root_steps_read(true, now, attempt);
-        assert_eq!(attempts.get(), 1);
-        assert!(host.root_steps_unread, "a failed spawn owes its read");
-        assert!(!host.root_steps_awaited, "no answer is in flight");
-        assert_eq!(host.deadline(now), Some(now + Duration::from_secs(60)));
-        host.start_root_steps_read(true, now + Duration::from_secs(59), attempt);
-        assert_eq!(
-            attempts.get(),
-            1,
-            "no spawn on intervening event-loop turns"
-        );
-        host.start_root_steps_read(false, now + Duration::from_secs(60), attempt);
-        assert_eq!(attempts.get(), 1, "a retry still requires the proxy");
-        host.start_root_steps_read(true, now + Duration::from_secs(60), attempt);
-        assert_eq!(attempts.get(), 2);
-        assert!(!host.root_steps_unread, "the reader started");
-        assert!(host.root_steps_awaited, "the window awaits its answer");
-        assert_eq!(
-            host.deadline(now),
-            None,
-            "a started reader adds no idle clock"
-        );
-        host.start_root_steps_read(true, now + Duration::from_secs(120), attempt);
-        assert_eq!(attempts.get(), 2, "a started reader is not duplicated");
-        Host::default().start_root_steps_read(true, now, || {
-            panic!("a launch that owes no reading starts none")
-        });
-    }
-
-    #[test]
-    fn automatic_setup_starts_permission_steps() {
-        let mut gate = PermissionGate::default();
-        gate.apply_started(true, PagePress::Nobody);
-        gate.accepted();
-        gate.observe(policy(7, true));
-        assert!(gate.own_admission_stands());
-        assert!(gate.steps_admitted());
-
-        gate.apply_started(false, PagePress::Person);
-        gate.accepted();
-        gate.observe(policy(8, true));
-        assert!(gate.steps_admitted());
-    }
-
-    #[test]
-    fn permission_policy_holds_until_admission_and_a_fresh_authoritative_snapshot() {
-        let allowed = Some(crate::InitialSetupPermissionPolicy {
-            revision: 7,
-            allowed: true,
-        });
-        let mut gate = PermissionGate::default();
-        assert!(!gate.allowed());
-        gate.observe(allowed);
-        assert!(
-            gate.allowed(),
-            "completed startup can restore guidance without an offer"
-        );
-        gate.hold();
-        gate.observe(allowed);
-        assert!(
-            !gate.allowed(),
-            "an old durable plan cannot undo a pending Apply"
-        );
-        gate.accepted();
-        assert!(
-            !gate.allowed(),
-            "admission cannot release a cached earlier snapshot"
-        );
-        gate.observe(allowed);
-        assert!(gate.allowed());
-        gate.observe(None);
-        assert!(!gate.allowed(), "an unreadable snapshot holds guidance");
-        gate.observe(Some(crate::InitialSetupPermissionPolicy {
-            revision: 8,
-            allowed: false,
-        }));
-        gate.observe(allowed);
-        assert!(!gate.allowed(), "an older run cannot re-enable guidance");
-    }
-
-    /// A pending offer with no System State page has no draft and no answer in flight: a
-    /// page's close lets its offer go, and the successor offers the plan again (§6.1).
-    #[cfg(unix)]
-    #[test]
-    fn a_pending_setup_offer_with_no_page_holds_no_handoff() {
-        let mut app = App::headless_for_test();
-        let (send, _receive) = mpsc::channel();
-        let request = Request::new(Plan::default(), send);
-        app.workstation_setup.request = Some(request.clone());
-        assert!(request.pending(), "PRECONDITION: the offer is unanswered");
-        assert!(
-            app.native_runtime
-                .instance_by_kind(crate::native_app::AppKind::SystemState)
-                .is_none(),
-            "PRECONDITION: no System State page"
-        );
-        assert!(!app.workstation_setup_holds_handoff());
-
-        let mut app = App::headless_for_test();
-        app.headless = false;
-        app.user_input_recent = |_| false;
-        app.windows
-            .get_mut(&crate::WindowId(0))
-            .expect("window 0")
-            .os_window_for_test = true;
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Plan::default(), send);
-        app.offer_workstation_setup(request.clone());
-        let instance = app
-            .native_runtime
-            .instance_by_kind(crate::native_app::AppKind::SystemState)
-            .expect("the offer opened its page");
-        assert!(request.pending());
-        app.finish_system_state_close(instance, crate::native_app::CloseScope::Tab);
-        assert!(!request.pending(), "a page's close lets its offer go");
-        assert_eq!(
-            receive.try_recv().map(|answer| answer.decision),
-            Ok(WorkstationSetupDecision::Unavailable),
-            "the launch's offer is made again where a page can answer it"
-        );
-        assert!(!app.workstation_setup_holds_handoff());
-    }
-
-    fn policy(revision: u64, allowed: bool) -> Option<crate::InitialSetupPermissionPolicy> {
-        Some(crate::InitialSetupPermissionPolicy { revision, allowed })
-    }
-
-    /// One Apply through the gate as the host runs it: the hold, who it came
-    /// from, the receipt, and the fresh status naming `revision`. Returns
-    /// whether that status established the window's own admission.
-    fn apply(gate: &mut PermissionGate, offer: bool, press: PagePress, revision: u64) -> bool {
-        gate.hold();
-        gate.apply_started(offer, press);
-        gate.accepted();
-        gate.observe(policy(revision, true))
-    }
-
-    /// A person's admission is the window's own Apply of a person's press, for the revision it
-    /// named, while that plan stands; the page's automatic answer is the window's own admission
-    /// but no person's.
-    #[test]
-    fn the_standing_yes_is_the_windows_own_admission_of_the_plan_in_force() {
-        let mut gate = PermissionGate::default();
-        assert!(apply(&mut gate, true, PagePress::Nobody, 3));
-        assert!(
-            gate.own_admission_stands() && gate.steps_admitted(),
-            "automatic setup starts permission acquisition"
-        );
-
-        let mut gate = PermissionGate::default();
-        assert!(apply(&mut gate, false, PagePress::Person, 4));
-        assert!(gate.steps_admitted(), "a person's press on the page");
-
-        // A newer status naming another plan, a held intent, a plan withdrawn
-        // or an unreadable status each end it.
-        gate.observe(policy(5, true));
-        assert!(
-            gate.allowed() && !gate.own_admission_stands(),
-            "another plan"
-        );
-        assert!(apply(&mut gate, true, PagePress::Nobody, 6));
-        gate.hold();
-        assert!(!gate.own_admission_stands(), "a newer intent held");
-        gate.accepted();
-        gate.observe(policy(6, true));
-        assert!(!gate.own_admission_stands(), "an Apply of nobody's own");
-        assert!(apply(&mut gate, true, PagePress::Nobody, 7));
-        gate.observe(policy(7, false));
-        assert!(!gate.own_admission_stands(), "Permissions not admitted");
-        assert!(apply(&mut gate, true, PagePress::Nobody, 8));
-        gate.observe(None);
-        assert!(!gate.own_admission_stands(), "an unreadable status");
-    }
-
-    /// A control client's Apply, a status poll or a hand-edited record allows the page's
-    /// guidance but makes no admission of the window's own.
-    #[test]
-    fn no_control_client_status_poll_or_record_mints_the_standing_yes() {
-        let mut gate = PermissionGate::default();
-        assert!(!apply(&mut gate, true, PagePress::Controller, 2));
-        assert!(gate.allowed(), "the plan is admitted");
-        assert!(!gate.own_admission_stands(), "a control client's Apply");
-
-        let mut gate = PermissionGate::default();
-        assert!(!gate.observe(policy(2, true)), "a status poll");
-        assert!(gate.allowed() && !gate.own_admission_stands());
-
-        let mut gate = PermissionGate::default();
-        assert!(!apply(&mut gate, false, PagePress::Nobody, 2));
-        assert!(
-            !gate.own_admission_stands(),
-            "an Apply that answers no offer"
-        );
-    }
-
-    /// A control client's gesture since the page's previous action, anywhere or on the page,
-    /// taints the press; a person's touch alone is a person's press, and no touch is nobody's.
-    /// Each take starts afresh.
-    #[test]
-    fn a_control_clients_gesture_is_never_a_persons_press() {
-        let mut gate = PermissionGate::default();
-        assert_eq!(gate.take_press(0), PagePress::Nobody);
-        gate.note_touch(false);
-        assert_eq!(gate.take_press(0), PagePress::Person);
-        assert_eq!(gate.take_press(0), PagePress::Nobody, "taken once");
-        gate.note_touch(false);
-        assert_eq!(gate.take_press(1), PagePress::Controller, "the count moved");
-        gate.note_touch(true);
-        assert_eq!(
-            gate.take_press(1),
-            PagePress::Controller,
-            "a controller's touch on the page"
-        );
-        assert_eq!(gate.take_press(1), PagePress::Nobody, "taken once");
-        assert_eq!(gate.take_press(u64::MAX), PagePress::Controller);
-        assert_eq!(gate.take_press(u64::MAX), PagePress::Nobody);
-    }
-
-    /// The page's own answer to the startup offer, end to end through the host, comes on the
-    /// first tick, as the offered plan stands, even after a control
-    /// client touched the page: a touch holds no answer since design revision 4. It makes the
-    /// window's own admission (`AdmittedBy::Window`) while a control client drives another tab;
-    /// a control client's touch on the page itself leaves the plan standing with no standing
-    /// yes for the access steps.
-    #[test]
-    fn the_pages_own_answer_is_the_windows_own_admission() {
-        for (elsewhere, on_page) in [(false, false), (true, false), (false, true)] {
-            let mut app = App::headless_for_test();
-            app.headless = false;
-            app.user_input_recent = |_| true;
-            let wid = crate::WindowId(0);
-            app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-            let (send, receive) = std::sync::mpsc::channel();
-            app.offer_system_state(Request::new(Plan::default(), send));
-            if elsewhere {
-                app.with_gesture_source(true, |_| ());
-            }
-            if on_page {
-                app.with_gesture_source(true, |app| app.interact_system_state(wid));
-            }
-            let start = Instant::now();
-            app.tick_system_state(start);
-            let mut answer = receive
-                .try_recv()
-                .expect("the first tick answers the offer");
-            assert_eq!(
-                answer.decision,
-                WorkstationSetupDecision::Begin(Plan::default())
-            );
-            let receipt = answer.receipt.take().expect("an answer's receipt");
-            assert_eq!(
-                receipt.admission(),
-                crate::system_state::Admission::Automatic
-            );
-            receipt.accept();
-            app.tick_system_state(start + Duration::from_secs(1));
-            app.observe_initial_setup_permissions(policy(3, true));
-            let admitted = app.permission_steps_admitted();
-            if on_page {
-                assert!(admitted, "the admitted plan starts automatically");
-                assert!(
-                    app.workstation_setup.permissions.allowed(),
-                    "the plan stands"
-                );
-            } else {
-                assert!(admitted, "elsewhere {elsewhere}");
-            }
-        }
-    }
-
-    fn stopped_launch_offer() -> (App, Request, std::sync::mpsc::Receiver<SetupAnswer>) {
-        let mut app = App::headless_for_test();
-        app.headless = false;
-        let wid = crate::WindowId(0);
-        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-        app.workstation_setup =
-            Host::for_launch(Some(|| true), false, crate::clt_shim::Shim::default());
-        app.observe_initial_setup_permissions(policy(4, true));
-        assert_eq!(app.access_revision(), Some(4));
-        app.stop_initial_setup_permissions();
-        assert!(app.access_revision().is_none());
-        let (send, receive) = std::sync::mpsc::channel();
-        let request = Request::new(Plan::default(), send);
-        app.offer_system_state(request.clone());
-        assert!(app.prepare_native_input_scratch(wid));
-        assert!(app.commit_glassless_native_frame(wid));
-        assert!(request.pending());
-        assert!(app.access_revision().is_none());
-        (app, request, receive)
-    }
-
-    #[test]
-    fn a_withdrawn_launch_offer_cannot_release_an_earlier_local_stop() {
-        let (mut app, request, receive) = stopped_launch_offer();
-        request.finish(WorkstationSetupDecision::Unavailable);
-        app.tick_system_state(Instant::now());
-        assert_eq!(
-            receive.try_recv().unwrap().decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert!(!request.pending());
-        // This is the unchanged policy from before Stop, read after the
-        // withdrawn offer released its temporary hold. It admits no choice.
-        app.observe_initial_setup_permissions(policy(4, true));
-        assert!(
-            app.access_revision().is_none(),
-            "a withdrawn offer must not release the earlier local Stop"
-        );
-        assert!(!app.permission_steps_admitted());
-        assert!(app.workstation_setup.suppresses_permissions());
-    }
-
-    #[test]
-    fn an_accepted_press_after_a_stop_rearms_after_its_fresh_policy() {
-        let (mut app, _, receive) = stopped_launch_offer();
-        let wid = crate::WindowId(0);
-        let (_, view) = app.active_native_view(wid).unwrap();
-        app.with_gesture_source(false, |app| {
-            app.interact_system_state(wid);
-            app.dispatch_native_view_event(
-                wid,
-                view,
-                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                    id: crate::native_ui::ActionId::new("system-state/group/1/leave"),
-                    value: None,
-                }),
-            )
-        })
-        .unwrap();
-        let mut answer = receive.try_recv().unwrap();
-        assert!(matches!(
-            answer.decision,
-            WorkstationSetupDecision::Begin(_)
-        ));
-        let receipt = answer.receipt.take().unwrap();
-        assert_eq!(receipt.admission(), crate::system_state::Admission::Person);
-        app.observe_initial_setup_permissions(policy(4, true));
-        assert!(
-            app.access_revision().is_none(),
-            "delivery is not acceptance"
-        );
-        receipt.accept();
-        app.resolve_system_state_apply();
-        assert!(
-            app.access_revision().is_none(),
-            "acceptance still needs a fresh read"
-        );
-        app.observe_initial_setup_permissions(policy(5, true));
-        assert_eq!(app.access_revision(), Some(5));
-        assert!(app.permission_steps_admitted(), "a person's own admission");
-    }
-
-    #[test]
-    fn startup_waits_for_both_first_paint_and_commit() {
-        assert!(!may_start(false, false, false));
-        assert!(!may_start(false, true, true));
-        assert!(!may_start(true, true, false));
-        assert!(may_start(false, true, false));
-    }
-
-    #[test]
-    fn command_payload_only_qualifies_when_carried_by_a_validated_handoff() {
-        assert!(eligible_launch_command(true, true, false, false));
-        assert!(eligible_launch_command(true, false, true, true));
-        assert!(!eligible_launch_command(true, false, true, false));
-        assert!(!eligible_launch_command(true, false, false, true));
-        assert!(!eligible_launch_command(true, false, false, false));
-    }
-
-    /// A copy that goes away (its posture is not Installed) never offers setup, however it was
-    /// launched — it installs itself and relaunches first (design §6.8).
-    #[test]
-    fn a_copy_that_goes_away_never_offers_setup() {
-        assert!(!eligible_launch_command(false, true, false, false));
-        assert!(!eligible_launch_command(false, false, true, true));
-        assert!(!eligible_launch_command(false, true, true, true));
-    }
-
-    #[test]
-    fn preview_replaces_production_only_in_a_private_window() {
-        assert_eq!(preview_mode(true, false, true), PreviewMode::Preview);
-        assert_eq!(preview_mode(true, true, true), PreviewMode::Refused);
-        assert_eq!(preview_mode(true, false, false), PreviewMode::Refused);
-        assert_eq!(preview_mode(false, false, false), PreviewMode::Ordinary);
-    }
-
-    #[test]
-    fn a_failed_worker_spawn_is_retried_after_backoff_and_success_consumes_startup() {
-        thread_local! { static ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
-        fn attempt() -> bool {
-            ATTEMPTS.set(ATTEMPTS.get() + 1);
-            ATTEMPTS.get() > 1
-        }
-        ATTEMPTS.set(0);
-        let now = Instant::now();
-        let mut host = Host::default();
-        host.startup = Some(attempt);
-        host.start(now);
-        assert_eq!(ATTEMPTS.get(), 1);
-        assert_eq!(host.deadline(now), Some(now + Duration::from_secs(60)));
-        host.start(now + Duration::from_secs(59));
-        assert_eq!(ATTEMPTS.get(), 1);
-        host.start(now + Duration::from_secs(60));
-        host.start(now + Duration::from_secs(120));
-        assert_eq!(ATTEMPTS.get(), 2);
-        assert!(host.startup.is_none());
-        assert_eq!(host.deadline(now), None);
-    }
-
-    #[test]
-    fn host_maintenance_survives_startup_and_keeps_only_its_owed_deadline() {
-        let now = Instant::now();
-        let due = now + Duration::from_secs(5);
-        let mut first = true;
-        let mut host = Host::default().with_maintenance(Some(Box::new(move || {
-            std::mem::take(&mut first).then_some(due)
-        })));
-        host.startup = Some(|| true);
-        host.start(now);
-        assert!(host.startup.is_none());
-        assert_eq!(host.deadline(now), Some(due));
-        host.start(due);
-        assert_eq!(
-            host.deadline(due),
-            None,
-            "a healthy keeper adds no idle clock"
-        );
-        assert!(
-            host.maintenance.is_some(),
-            "setup completion retains the host's owner"
-        );
-    }
-
-    #[test]
-    fn completion_elsewhere_withdraws_a_still_waiting_offer() {
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(preview_subset(), send);
-        assert_eq!(request.initial.selection, preview_subset());
-        assert_eq!(
-            wait_for_decision(
-                Arc::downgrade(&request.reply),
-                receive,
-                || true,
-                Duration::ZERO
-            )
-            .decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert!(!request.pending());
-        request.finish(WorkstationSetupDecision::Begin(Selection::all().into()));
-    }
-
-    #[test]
-    fn closing_the_event_loop_before_dispatch_does_not_leave_the_worker_waiting() {
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Selection::all(), send);
-        let pending = Arc::downgrade(&request.reply);
-        drop(request); // the queued Wake was discarded when the event loop closed
-        assert_eq!(
-            wait_for_decision(pending, receive, || false, Duration::from_secs(60)).decision,
-            WorkstationSetupDecision::Unavailable
-        );
-    }
-
-    #[test]
-    fn a_closed_window_cannot_be_overtaken_by_a_late_choice() {
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Selection::all(), send);
-        request.finish(WorkstationSetupDecision::Unavailable);
-        request.finish(WorkstationSetupDecision::Begin(Selection::all().into()));
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert!(!request.pending());
-    }
-
-    #[test]
-    fn the_first_choice_cannot_be_replaced_by_a_closing_window_or_another_choice() {
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Selection::all(), send);
-        let chosen = preview_subset();
-        assert!(request.finish_answer(WorkstationSetupDecision::Begin(chosen.into()).into()));
-        assert!(!request.finish_answer(WorkstationSetupDecision::Unavailable.into()));
-        assert!(
-            !request
-                .finish_answer(WorkstationSetupDecision::Begin(Selection::none().into()).into())
-        );
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Begin(chosen.into())
-        );
-        assert!(!request.pending());
-
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Selection::all(), send);
-        drop(receive);
-        assert!(!request.finish_answer(WorkstationSetupDecision::Begin(chosen.into()).into()));
-        assert!(!request.pending());
-    }
-
-    /// An offer its page let go ([`Request::let_go`]) admits nothing: it comes back as one no
-    /// window showed, so the worker makes it again and the page answers it at its first tick,
-    /// and no Begin handoff runs.
-    #[test]
-    fn an_offer_its_page_let_go_admits_nothing() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let calls = Arc::new(AtomicUsize::new(0));
-        let called = calls.clone();
-        let (send, receive) = mpsc::channel();
-        let request = Request::with_handoff(Plan::default(), send, move || {
-            called.fetch_add(1, Ordering::AcqRel);
-        });
-        request.let_go();
-        assert_eq!(
-            receive.try_recv().unwrap().decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 0);
-        assert!(!request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into()));
-        assert!(receive.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_delivered_answer_handoff_precedes_the_return_and_preserves_the_receipt() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let handoffs = Arc::new(AtomicUsize::new(0));
-        let count = handoffs.clone();
-        let (send, receive) = mpsc::channel();
-        let request = Request::with_handoff(Plan::default(), send, move || {
-            count.fetch_add(1, Ordering::AcqRel);
-        });
-        let (receipt, accepted) = crate::InitialSetupApplyReceipt::detached(true);
-        let mut answer: SetupAnswer = WorkstationSetupDecision::Begin(Plan::default()).into();
-        answer.receipt = Some(receipt);
-        assert!(request.finish_answer(answer));
-        assert_eq!(handoffs.load(Ordering::Acquire), 1);
-        let mut answer = receive.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert!(matches!(
-            answer.decision,
-            WorkstationSetupDecision::Begin(_)
-        ));
-        assert_eq!(accepted.try_recv(), Err(mpsc::TryRecvError::Empty));
-        answer.receipt.take().unwrap().accept();
-        assert_eq!(accepted.recv_timeout(Duration::from_secs(60)), Ok(true));
-        assert!(
-            !request
-                .clone()
-                .finish_answer(WorkstationSetupDecision::Unavailable.into())
-        );
-        assert!(!request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into()));
-        assert_eq!(handoffs.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn a_withdrawn_or_disconnected_answer_owns_no_handoff() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        for disconnected in [false, true] {
-            let handoffs = Arc::new(AtomicUsize::new(0));
-            let count = handoffs.clone();
-            let (send, receive) = mpsc::channel();
-            let request = Request::with_handoff(Plan::default(), send, move || {
-                count.fetch_add(1, Ordering::AcqRel);
-            });
-            if disconnected {
-                drop(receive);
-            } else {
-                request.finish(WorkstationSetupDecision::Unavailable);
-                assert_eq!(
-                    receive
-                        .recv_timeout(Duration::from_secs(60))
-                        .unwrap()
-                        .decision,
-                    WorkstationSetupDecision::Unavailable
-                );
-            }
-            assert!(
-                !request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into())
-            );
-            assert!(!request.pending());
-            assert_eq!(handoffs.load(Ordering::Acquire), 0);
-        }
-    }
-
-    #[test]
-    fn closing_window_releases_a_waiting_worker() {
-        let (send, receive) = mpsc::channel();
-        let mut host = Host::default();
-        host.offer(Request::new(Selection::all(), send));
-        drop(host);
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Unavailable
-        );
-    }
-
-    #[test]
-    fn losing_the_last_window_releases_the_worker_while_the_app_lives() {
-        let (send, receive) = mpsc::channel();
-        let mut app = App::headless_for_test();
-        app.workstation_setup
-            .offer(Request::new(Selection::all(), send));
-        app.tick_workstation_setup(Instant::now());
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert!(!app.workstation_setup.pending());
-    }
-
-    #[test]
-    fn a_window_gaining_focus_counts_as_a_focus_gain() {
-        let mut app = App::headless_for_test();
-        let seen = window_focus_gains();
-        app.window_focus_event(crate::WindowId(0), true);
-        assert!(window_focus_gains() > seen);
-    }
-
-    /// An offer that reaches a window nobody has focused is shown in System State at once, not
-    /// answered Unavailable for the worker to try again a minute later, and the page answers it
-    /// on its first tick.
-    #[test]
-    fn an_offer_to_an_unfocused_window_is_shown_and_answered_at_once() {
-        let (send, receive) = mpsc::channel();
-        let mut app = App::headless_for_test();
-        app.headless = false;
-        app.user_input_recent = |_| true;
-        let wid = crate::WindowId(0);
-        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-        app.window_focus_event(wid, false);
-        assert!(!app.any_os_window_focused());
-        let request = Request::new(Plan::default(), send);
-        app.offer_workstation_setup(request.clone());
-        assert!(receive.try_recv().is_err(), "not refused for want of focus");
-        assert!(app.workstation_setup.pending());
-        assert!(
-            app.native_runtime
-                .instance_by_kind(crate::native_app::AppKind::SystemState)
-                .is_some(),
-            "System State shows it"
-        );
-        app.tick_system_state(Instant::now());
-        let mut answer = receive.try_recv().expect("the first tick answers it");
-        assert_eq!(
-            answer.decision,
-            WorkstationSetupDecision::Begin(Plan::default())
-        );
-        answer.receipt.take().unwrap().accept();
-        app.resolve_system_state_apply();
-        assert!(!request.pending());
-    }
-
-    #[test]
-    fn an_offer_after_the_last_window_closed_is_unavailable() {
-        let (send, receive) = mpsc::channel();
-        let mut app = App::headless_for_test();
-        app.headless = false;
-        app.offer_workstation_setup(Request::new(Selection::all(), send));
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Unavailable
-        );
-        assert!(!app.workstation_setup.pending());
-    }
-}
+#[path = "workstation_setup_tests.rs"]
+mod tests;

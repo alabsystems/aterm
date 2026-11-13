@@ -48,6 +48,15 @@ impl Backoff {
         at.saturating_add(self.after(tries).as_secs())
     }
 
+    /// [`Self::due`] as read at `now` (unix seconds): a last try recorded after `now` means the
+    /// clock was set back since, which leaves a pause that cannot be measured, so the next try is
+    /// due at once rather than at a time the clock may take far longer than [`Self::longest`] to
+    /// reach. The try then made records the corrected time, and the schedule goes on from it.
+    #[must_use]
+    pub fn due_by(self, at: u64, tries: u32, now: u64) -> u64 {
+        if at > now { now } else { self.due(at, tries) }
+    }
+
     /// The longest pause this schedule ever waits.
     #[must_use]
     pub const fn longest(self) -> Duration {

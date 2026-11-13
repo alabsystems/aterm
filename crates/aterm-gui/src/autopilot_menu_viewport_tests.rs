@@ -14,7 +14,7 @@ use aterm_window::event::MouseScrollDelta;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-fn accounts(disabled: usize) -> (Vec<AccountMenuRow>, bool) {
+fn accounts(disabled: usize) -> Vec<AccountMenuRow> {
     let roster = Roster {
         rows: (0..64)
             .map(|n| Row {
@@ -50,7 +50,7 @@ fn fixture(cols: u16, disabled: usize) -> (App, WindowId, u64) {
     let mut facts = probe::facts();
     facts.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
         email: Some("pool-00@example.test".into()),
-        weekly: Some("weekly 58% used".into()),
+        weekly: Some("weekly 42% left".into()),
         label: Some("pool-00".into()),
         ..Default::default()
     });
@@ -76,8 +76,10 @@ fn fixture(cols: u16, disabled: usize) -> (App, WindowId, u64) {
         .fact_anchor(wid, session, Fact::Account)
         .expect("real account footer");
     app.open_fact_menu(wid, session, Fact::Account, anchor, true);
-    let (choices, unpinned) = accounts(disabled);
-    assert!(app.complete_account_menu_read_for_test(Ok((choices, unpinned))));
+    let choices = accounts(disabled);
+    assert!(app.complete_account_menu_read_for_test(
+        crate::account_menu_read::AccountRead::for_test(Ok(choices))
+    ));
     assert_eq!(
         app.autopilot_menu
             .as_ref()
@@ -202,8 +204,21 @@ fn large_account_popup_viewport_gallery() {
         let file = format!("pool-initial-{cols}.png");
         capture(&mut app, wid, &gallery.join(&file));
         manifest.push_str(&format!("initial\t{cols}\t14\t{file}\n"));
+        // The pin row is enabled, so the keys reach it, only where the manual sign-in queue is
+        // (`accounts::manual_signin_capability`: not on Windows).
+        let rotate = aterm_agent::harness::accounts::manual_signin_capability()
+            == aterm_agent::harness::accounts::ManualSigninCapability::Available;
+        let expected: BTreeSet<_> = (0..64)
+            .map(|n| format!("fact-menu/account/use/pool-{n:02}"))
+            .chain(rotate.then(|| "fact-menu/account/auto-rotate".into()))
+            .chain([
+                "fact-menu/account/copy-recovery".into(),
+                "fact-menu/account/account-settings".into(),
+            ])
+            .collect();
         let mut seen = BTreeSet::new();
-        for _ in 0..66 {
+        // One Down per action walks each once and wraps to the first.
+        for _ in 0..expected.len() {
             let at = selected(&app, wid);
             seen.insert(at.clone());
             let scene = match at.as_str() {
@@ -219,13 +234,6 @@ fn large_account_popup_viewport_gallery() {
             key(&mut app, wid, NamedKey::ArrowDown);
             frame(&mut app, wid);
         }
-        let expected: BTreeSet<_> = (0..64)
-            .map(|n| format!("fact-menu/account/use/pool-{n:02}"))
-            .chain([
-                "fact-menu/account/auto-rotate".into(),
-                "fact-menu/account/account-settings".into(),
-            ])
-            .collect();
         assert_eq!(seen, expected);
         assert_eq!(
             selected(&app, wid),
@@ -250,6 +258,12 @@ fn large_account_popup_viewport_gallery() {
         app.close_autopilot_menu();
     }
     std::fs::write(gallery.join("manifest.tsv"), manifest).unwrap();
+}
+
+/// The session's Autopilot word and its landing clock, which no account card row writes.
+fn pair(app: &App, session: u64) -> (Option<String>, Option<i64>) {
+    let meta = app.pool.get(session).unwrap().ctx.meta.lock().unwrap();
+    (meta.autopilot.clone(), meta.land_at)
 }
 
 #[test]
@@ -289,7 +303,9 @@ fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
             .fact_anchor(wid, session, Fact::Account)
             .expect("resized real footer");
         app.open_fact_menu(wid, session, Fact::Account, anchor, true);
-        assert!(app.complete_account_menu_read_for_test(Ok(accounts(56))));
+        assert!(app.complete_account_menu_read_for_test(
+            crate::account_menu_read::AccountRead::for_test(Ok(accounts(56)))
+        ));
         frame(&mut app, wid);
         key(&mut app, wid, NamedKey::End);
         frame(&mut app, wid);
@@ -308,7 +324,7 @@ fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
         },
     );
     let menu = app.autopilot_menu.as_mut().unwrap();
-    assert!(menu.refresh_rows(fresh, "Replacement pool".into(), None));
+    assert!(menu.refresh_rows(fresh, "Replacement pool".into()));
     frame(&mut app, wid);
     assert_eq!(selected(&app, wid), "fact-menu/account/account-settings");
     assert_eq!(app.autopilot_menu.as_ref().unwrap().viewport.first(), 0);
@@ -325,7 +341,9 @@ fn page_keys_start_at_the_visible_page_after_pointer_scrolling() {
     app.close_autopilot_menu();
     let anchor = app.fact_anchor(wid, session, Fact::Account).unwrap();
     app.open_fact_menu(wid, session, Fact::Account, anchor, false);
-    assert!(app.complete_account_menu_read_for_test(Ok(accounts(0))));
+    assert!(app.complete_account_menu_read_for_test(
+        crate::account_menu_read::AccountRead::for_test(Ok(accounts(0)))
+    ));
     frame(&mut app, wid);
     assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
     key(&mut app, wid, NamedKey::PageUp);
@@ -361,14 +379,17 @@ fn popup_wheel_residuals_and_end_phases_do_not_change_the_covered_pane() {
     let (mut app, wid, session) = fixture(60, 0);
     frame(&mut app, wid);
     // A partial gesture already owned by the pane cannot advance the new popup.
+    let first = app.autopilot_menu.as_ref().unwrap().viewport.first();
     app.windows.get_mut(&wid).unwrap().scroll_residual = -0.75;
     app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -0.25));
-    assert_eq!(app.autopilot_menu.as_ref().unwrap().viewport.first(), 0);
+    assert_eq!(app.autopilot_menu.as_ref().unwrap().viewport.first(), first);
     assert_eq!(app.windows[&wid].scroll_residual, -0.75);
     app.close_autopilot_menu();
     let anchor = app.fact_anchor(wid, session, Fact::Account).unwrap();
     app.open_fact_menu(wid, session, Fact::Account, anchor, false);
-    assert!(app.complete_account_menu_read_for_test(Ok(accounts(0))));
+    assert!(app.complete_account_menu_read_for_test(
+        crate::account_menu_read::AccountRead::for_test(Ok(accounts(0)))
+    ));
     frame(&mut app, wid);
     app.windows.get_mut(&wid).unwrap().scroll_residual = 0.0;
     app.windows.get_mut(&wid).unwrap().scroll_residual_x = 0.0;
@@ -408,7 +429,7 @@ fn popup_wheel_residuals_and_end_phases_do_not_change_the_covered_pane() {
     // Remove the owned fixture's glide before resuming pane input.
     app.windows.get_mut(&wid).unwrap().scroll_glide = None;
     key(&mut app, wid, NamedKey::Escape);
-    let (x, y) = app.frame_cell_centre(wid, (5, 2));
+    let (x, y) = cell_centre(&app, wid, (5, 2));
     app.on_cursor_moved(wid, x, y);
     for delta in [
         MouseScrollDelta::LineDelta(0.0, -0.25),
@@ -431,7 +452,9 @@ fn native_wheel_stays_with_the_popup_and_moved_rows_require_a_fresh_pointer() {
     let menu = app.autopilot_menu.as_ref().unwrap();
     let rect = menu.rect.unwrap();
     let hit = menu.highlight.unwrap();
-    let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + hit, rect.col + 2));
+    // The card opens scrolled to its first choice, below the answers.
+    let first = menu.viewport.first();
+    let (x, y) = cell_centre(&app, wid, (rect.row + 1 + hit - first, rect.col + 2));
     app.on_cursor_moved(wid, x, y);
     let before = pair(&app, session);
     let term = app.pool.get(session).unwrap().term.clone();
@@ -442,7 +465,7 @@ fn native_wheel_stays_with_the_popup_and_moved_rows_require_a_fresh_pointer() {
     assert_ne!(fingerprint(app.autopilot_menu.as_ref(), wid), fp);
     frame(&mut app, wid);
     let menu = app.autopilot_menu.as_ref().unwrap();
-    assert_eq!(menu.viewport.first(), 3);
+    assert_eq!(menu.viewport.first(), first + 3);
     assert!(menu.highlight.is_none());
     assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
     assert!(
@@ -460,14 +483,20 @@ fn native_wheel_stays_with_the_popup_and_moved_rows_require_a_fresh_pointer() {
     ] {
         app.on_mouse_wheel(wid, delta);
         assert!(app.autopilot_menu.is_some());
-        assert_eq!(app.autopilot_menu.as_ref().unwrap().viewport.first(), 3);
+        assert_eq!(
+            app.autopilot_menu.as_ref().unwrap().viewport.first(),
+            first + 3
+        );
     }
     app.on_mouse_wheel(
         wid,
         MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(0.0, -cell_h)),
     );
     frame(&mut app, wid);
-    assert_eq!(app.autopilot_menu.as_ref().unwrap().viewport.first(), 4);
+    assert_eq!(
+        app.autopilot_menu.as_ref().unwrap().viewport.first(),
+        first + 4
+    );
     assert_eq!(term_lock(&term).grid().display_offset(), scroll);
     assert_eq!(app.windows[&wid].scroll_frac_px, 0);
     app.close_autopilot_menu();

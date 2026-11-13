@@ -41,40 +41,8 @@ pub mod retirement;
 /// where a test sets what refuses that rename after the check. Unix test builds alone: only this
 /// crate's Unix tests call it.
 #[cfg(all(test, unix))]
-pub(crate) mod seams {
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    type Hook = Box<dyn FnMut(&Path)>;
-
-    thread_local! {
-        static STAGING: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// Call `then` with the entry's path each time a pass on this thread is about to rename an
-    /// entry aside, its intent on record.
-    pub(crate) fn on_staging(then: impl FnMut(&Path) + 'static) {
-        STAGING.with(|h| *h.borrow_mut() = Some(Box::new(then)));
-    }
-
-    /// Forget the call of this thread.
-    pub(crate) fn clear() {
-        STAGING.with(|h| *h.borrow_mut() = None);
-    }
-
-    pub(super) fn staging(entry: &Path) {
-        let call = STAGING.with(|h| h.borrow_mut().take());
-        if let Some(mut call) = call {
-            call(entry);
-            STAGING.with(|h| {
-                let mut slot = h.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(call);
-                }
-            });
-        }
-    }
-}
+#[path = "build_cache_seams_tests.rs"]
+pub(crate) mod seams;
 
 #[cfg(not(all(test, unix)))]
 mod seams {
@@ -165,34 +133,8 @@ fn stage_unkept(from: &Path, holder: &Path, base: &OsStr) -> std::io::Result<Opt
 /// parts), before custody is read again: a test publishes a keep at that instant, on this
 /// thread. Unix test builds alone: only this crate's Unix tests set it.
 #[cfg(all(test, unix))]
-pub(crate) mod staged {
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    type Hook = Box<dyn FnMut(&Path)>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// Call `then` with each stage just filled on this thread, until [`clear`].
-    pub(crate) fn on(then: impl FnMut(&Path) + 'static) {
-        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(then)));
-    }
-
-    /// No hook on this thread.
-    pub(crate) fn clear() {
-        HOOK.with(|hook| *hook.borrow_mut() = None);
-    }
-
-    pub(super) fn at(stage: &Path) {
-        HOOK.with(|hook| {
-            if let Some(then) = hook.borrow_mut().as_mut() {
-                then(stage);
-            }
-        });
-    }
-}
+#[path = "build_cache_staged_tests.rs"]
+pub(crate) mod staged;
 
 #[cfg(not(all(test, unix)))]
 mod staged {
@@ -354,25 +296,27 @@ impl ReclaimPolicy<'_> {
 }
 
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
-/// shell builtins only.
+/// Shell builtins and the system's physical-directory probe; a shell's cached `pwd` can
+/// preserve case aliases that the compiler front's current directory does not.
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/.ubd/cargo-build.noindex
-__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r=
+__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r= __atb_query= __atb_configured= __atb_fresh=
 case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
 case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
 case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
 case ${PWD-} in "$__atb_c" | "$__atb_c"/*) __atb= ;; esac
-[ -n "${CARGO_BUILD_BUILD_DIR+1}" ] && __atb=
+[ -n "${CARGO_BUILD_BUILD_DIR+1}${TARGO_BUILD_BUILD_DIR+1}" ] && __atb=
 __atb_scan() {
   for __atb_f in "$1/config.toml" "$1/config"; do
     [ -f "$__atb_f" ] || continue
+    __atb_configured=1
     [ -r "$__atb_f" ] || { __atb=; return; }
     __atb_s=
     while IFS= read -r __atb_l || [ -n "$__atb_l" ]; do
       __atb_x=${__atb_l#"${__atb_l%%[![:blank:]]*}"}
       case $__atb_x in [#]*) continue ;; esac
-      case $__atb_l in *build-dir*) __atb=; return ;; esac
+      case $__atb_l in *build-dir* | *include*) __atb=; return ;; esac
       case $__atb_l in *target-dir*) __atb_tn=1 ;; esac
       case $__atb_x in
         "["*) case $__atb_x in "[alias]"*) __atb_s=1 ;; *) __atb_s= ;; esac; continue ;;
@@ -389,45 +333,128 @@ __atb_scan() {
         case $__atb_x in [[:blank:]]* | '['* | '"'* | "'"*) __atb_x=${__atb_x#?} ;; *) break ;; esac
       done
       case ${__atb_x%%[![:alnum:]_-]*} in
-        build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | clippy | tippy | fix | clean) __atb_ab=1 ;;
+        @ATB_BUILD_VERBS@) __atb_ab=1 ;;
       esac
     done < "$__atb_f"
   done
 }
+__atb_cl() {
+  # A cluster of short options, read as clap reads one: letters that take no value, then one that takes the rest of the word (one `=` dropped) or, when nothing
+  # is left after it (`__atb_y` one letter), the next word where clap takes it (`takes_next`):
+  # `-j`'s whatever it is (`s`), another ASCII letter's unless it starts with `-` and is no lone
+  # `-` (`o`); `__atb_y` is that letter and its rest.
+  __atb_y=${1#-}
+  while :; do
+    case $__atb_y in
+      h*)
+        case $__atb_v in
+          trust | fmt | tippy | clippy | miri) [ -z "$__atb_first" ] || __atb_query=1 ;;
+          "" | @ATB_BUILTIN_COMMANDS@) __atb_query=1 ;;
+        esac
+        __atb_y=${__atb_y#?}
+        ;;
+      [rqvnwlbadV]*) __atb_y=${__atb_y#?} ;;
+      *) break ;;
+    esac
+  done
+}
 __atb_ok() {
   case $1 in
-    c) case $2 in *target-dir* | *build-dir*) __atb= ;; *=*) ;; *) __atb= ;; esac ;;
-    m) case $2 in *..* | *[{}]* | "$__atb_c"/*) __atb= ;; "$HOME"/* | [!/]*) ;; *) __atb= ;; esac ;;
+    c) case $2 in *target-dir* | *build-dir* | *include* | *\\*) __atb= ;; *=*) ;; *) __atb= ;; esac ;;
+    m) case $2 in *..* | *//* | */./* | */. | *[{}]* | "$__atb_c" | "$__atb_c"/*) __atb= ;; "$HOME" | "$HOME"/* | [!/]*) ;; *) __atb= ;; esac ;;
     t) __atb_T=$2 __atb_tf=1 ;;
   esac
 }
 if [ -n "$__atb" ]; then
-  __atb_v=$__atb_t __atb_u= __atb_n=
+  __atb_v=$__atb_t __atb_u= __atb_n= __atb_M=${__atb_t:+1} __atb_dd= __atb_P=
   for __atb_a in "$@"; do
+    # The lane's consent, as targo reads it: any `--unverified` before `--`, whatever it follows.
+    case $__atb_a in
+      --) __atb_dd=1 ;;
+      --unverified) [ -n "$__atb_dd" ] || __atb_u=1 ;;
+    esac
+    __atb_first=$__atb_fresh __atb_fresh=
+    # A trailing verb's program words are the program's (`own_words`, `__atb_P`, set below).
+    [ -z "$__atb_P" ] || continue
     case $__atb_n in
       c | m | t) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
       s) __atb_n=; continue ;;
+      o) __atb_n=; case $__atb_a in -?*) ;; *) continue ;; esac ;;
     esac
     case $__atb_a in
       --) break ;;
-      --unverified) __atb_u=1 ;;
+      --help | -h | --version | -V)
+        case $__atb_v in
+          trust | fmt) [ -z "$__atb_first" ] || __atb_query=1 ;;
+          *) __atb_query=1 ;;
+        esac
+        ;;
       --config) __atb_n=c ;;
       --config=*) __atb_ok c "${__atb_a#--config=}" ;;
       --manifest-path) __atb_n=m ;;
       --manifest-path=*) __atb_ok m "${__atb_a#--manifest-path=}" ;;
-      --target-dir) __atb_n=t ;;
-      --target-dir=*) __atb_ok t "${__atb_a#--target-dir=}" ;;
+      # After a name a user alias may take, the words may be its program's: as typed.
+      --target-dir) case $__atb_v in "" | @ATB_BUILTIN_COMMANDS@) __atb_n=t ;; *) __atb= ;; esac ;;
+      --target-dir=*) case $__atb_v in "" | @ATB_BUILTIN_COMMANDS@) __atb_ok t "${__atb_a#--target-dir=}" ;; *) __atb= ;; esac ;;
+      --profile) __atb_n=s ;;
       -C | -C?*) __atb= ;;
-      -Z | --color | --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
+      --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
+      # After the verb a long option takes the word clap gives it (`long_takes_next`): `--jobs`
+      # any, `--color` and the others none that starts with `-` and is no lone `-`.
+      --color) [ -n "$__atb_v" ] && __atb_n=o || __atb_n=s ;;
+      --jobs) [ -z "$__atb_v" ] || __atb_n=s ;;
+      @ATB_VALUED_LONGS@) [ -z "$__atb_v" ] || __atb_n=o ;;
+      -) [ "$__atb_M" != 2 ] || __atb_M=- __atb_P=1 ;;
+      -[!-]*)
+        __atb_cl "$__atb_a"
+        case $__atb_y in
+          C*) __atb= ;;
+          m*)
+            # Its `-m` only among Targo's own words: after a verb that takes one, and not in a
+            # trailing verb's program words (`__atb_M`, set with the verb below).
+            case $__atb_M in
+              1 | 2)
+                case $__atb_y in
+                  m) __atb_n=m ;;
+                  m=*) __atb_ok m "${__atb_y#m=}" ;;
+                  *) __atb_ok m "${__atb_y#m}" ;;
+                esac
+                ;;
+              *) [ "$__atb_y" != m ] || __atb_n=o ;;
+            esac
+            ;;
+          # Any other letter's value left to the next word is that word where clap takes it
+          # (`-vZ x`, `-p x`, not `-p -m`). One the line ends without leaves no verb before it,
+          # or is a program's.
+          j) __atb_n=s ;;
+          [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]) __atb_n=o ;;
+        esac
+        ;;
       -*) ;;
-      *) [ -n "$__atb_v" ] || __atb_v=$__atb_a ;;
+      *)
+        if [ -z "$__atb_v" ]; then
+          # An empty verb is still the verb, one no name matches: a newline no line holds.
+          __atb_v=${__atb_a:-'
+'}
+          __atb_fresh=1
+          case $__atb_a in
+            @ATB_TRAILING_VERBS@) __atb_M=2 ;;
+            @ATB_MANIFEST_VERBS@) __atb_M=1 ;;
+            *) __atb_M=- ;;
+          esac
+        elif [ "$__atb_M" = 2 ]; then
+          __atb_M=- __atb_P=1
+        fi
+        ;;
     esac
   done
-  [ -z "$__atb_n" ] || __atb=
+  # With no tool argument, `trust` itself answers its usage without compiling.
+  [ "$__atb_v" != trust ] || [ -z "$__atb_fresh" ] || __atb_query=1
+  case $__atb_n in "" | s | o) ;; *) __atb= ;; esac
   case $__atb_v in
     clean | tippy | clippy) __atb_k=1 ;;
     trust) __atb_e=1 ;;
-    build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix) [ -n "$__atb_u" ] && __atb_k=1 || __atb= ;;
+    @ATB_LANE_VERBS@) [ -n "$__atb_u" ] && __atb_k=1 || __atb= ;;
     "") __atb= ;;
     *) [ -n "$__atb_u" ] && __atb_k=1 __atb_al=1 || __atb= ;;
   esac
@@ -454,27 +481,47 @@ if [ -n "$__atb" ]; then
   done
 fi
 [ -n "$__atb" ] && __atb_scan "${CARGO_HOME:-$HOME/.cargo}"
+# aterm: targo reads each TARGO_ variable for its unset CARGO_ twin; the store's takes its home
+# from CARGO_HOME alone and Trust's main from TARGO_HOME instead, so both homes are read.
+[ -n "$__atb" ] && [ -z "${CARGO_HOME+1}" ] && [ -n "${TARGO_HOME-}" ] && __atb_scan "$TARGO_HOME"
 [ -z "$__atb_al" ] || [ -n "$__atb_ab" ] || __atb=
+# A caller config may replace a short alias: its help words may be a program's.
+if [ -n "$__atb_query" ]; then
+  case $__atb_v in
+    @ATB_BUILTIN_COMMANDS@) __atb= ;;
+    *) [ -n "$__atb_configured" ] || __atb= ;;
+  esac
+fi
+if [ -n "$__atb" ]; then
+  __atb_p=$(/bin/pwd -P 2>/dev/null && printf .) || {
+    printf '%s\n' 'atpkg: cannot resolve the physical working directory; no build started' >&2
+    exit 75
+  }
+  [ "$__atb_p" = "$PWD
+." ] || __atb=
+fi
 if [ -n "$__atb" ] && [ -z "$__atb_tf" ]; then
   if [ -n "${CARGO_TARGET_DIR+1}" ]; then __atb_T=$CARGO_TARGET_DIR __atb_tf=1
+  elif [ -n "${TARGO_TARGET_DIR+1}" ]; then __atb_T=$TARGO_TARGET_DIR __atb_tf=1
   elif [ -n "${CARGO_BUILD_TARGET_DIR+1}" ]; then __atb_T=$CARGO_BUILD_TARGET_DIR __atb_tf=1
+  elif [ -n "${TARGO_BUILD_TARGET_DIR+1}" ]; then __atb_T=$TARGO_BUILD_TARGET_DIR __atb_tf=1
   fi
 fi
 if [ -n "$__atb" ] && [ -n "$__atb_tf" ]; then
   case $__atb_T in "") __atb= ;; /*) ;; *) __atb_T=$PWD/$__atb_T ;; esac
-  case $__atb_T/ in *.noindex/*) __atb= ;; esac
   case $__atb_T in *[\'{}[:cntrl:]]*) __atb= ;; esac
-  __atb_D=$__atb_T/build.noindex
+  __atb_D=$__atb_T/.ubd/build.noindex
 elif [ -n "$__atb" ]; then
-  [ -z "$__atb_tn" ] || __atb=
   if [ -n "$__atb_k" ]; then
     if [ -d "$__atb_c" ]; then [ -w "$__atb_c" ] || __atb_k=
     elif [ -d "${__atb_c%/*}" ]; then [ -w "${__atb_c%/*}" ] || __atb_k=
     else [ -w "$HOME/Library/Caches" ] || __atb_k=
     fi
   fi
-  case $PWD/ in *.noindex/*) [ -n "$__atb_k" ] || __atb= ;; esac
-  [ -n "$__atb_k" ] || __atb_D='{workspace-root}/target/build.noindex'
+  if [ -z "$__atb_k" ]; then
+    [ -z "$__atb_tn" ] || __atb=
+    __atb_D='{workspace-root}/target/.ubd/build.noindex'
+  fi
 fi
 if [ -z "$__atb" ]; then __atb_D=
 else
@@ -504,7 +551,7 @@ fi
 # The tippy shim needs no scan to know it builds: its name is baked in above.
 case $__atb_t in tippy) __atb_r=1 ;; esac
 case $__atb_v in
-  build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix | clippy | tippy | trust) __atb_r=1 ;;
+  @ATB_LANE_VERBS@ | clippy | tippy | trust) __atb_r=1 ;;
   *) [ -n "$__atb_ab" ] && __atb_r=1 ;;
 esac
 if [ -n "$__atb_r" ]; then
@@ -535,7 +582,39 @@ pub fn shim_block(name: &str) -> Option<String> {
     // (`aterm_uds::spawnfd::SOFT_NOFILE_FLOOR`) so the script and the Rust
     // raises can never drift apart.
     let floor = aterm_uds::spawnfd::SOFT_NOFILE_FLOOR.to_string();
-    let block = SH_BLOCK.replace("@ATB_NOFILE_FLOOR@", &floor);
+    // The verbs that set where a cluster's `-m` is Targo's (`short_manifest_scope`), the long
+    // options whose value it skips (`long_takes_next`), the builtin commands no alias takes
+    // (`BUILTIN_COMMANDS`), the verbs that build and those a lane places (`BUILD_VERBS`, but for
+    // `clean` and the lint), each from theirs.
+    let verbs = |verbs: &mut dyn Iterator<Item = &str>| verbs.collect::<Vec<_>>().join(" | ");
+    let block = SH_BLOCK
+        .replace(
+            "@ATB_TRAILING_VERBS@",
+            &verbs(&mut TRAILING_VERBS.iter().copied()),
+        )
+        .replace("@ATB_MANIFEST_VERBS@", &verbs(&mut short_manifest_verbs()))
+        .replace(
+            "@ATB_VALUED_LONGS@",
+            &verbs(&mut VALUED_LONGS.iter().copied()),
+        )
+        .replace(
+            "@ATB_BUILTIN_COMMANDS@",
+            &verbs(&mut BUILTIN_COMMANDS.iter().copied()),
+        )
+        .replace(
+            "@ATB_BUILD_VERBS@",
+            &verbs(&mut BUILD_VERBS.iter().copied()),
+        )
+        .replace(
+            "@ATB_LANE_VERBS@",
+            &verbs(
+                &mut BUILD_VERBS
+                    .iter()
+                    .copied()
+                    .filter(|verb| !matches!(*verb, "clean" | "tippy" | "clippy")),
+            ),
+        )
+        .replace("@ATB_NOFILE_FLOOR@", &floor);
     match name {
         "targo" => Some(block),
         "targo-tippy" => Some(block.replacen("\n__atb_t=\n", "\n__atb_t=tippy\n", 1)),
@@ -566,8 +645,8 @@ pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
 }
 
 /// [`with_build_dir`] on this process's machine for a nested `targo` it starts at `cwd`, a
-/// checkout it names: what the shim on `$PATH` hands a build typed there, in the cache root that
-/// shim names ([`shim_root`]; Trust's `$CARGO` is the store's `targo` itself, past the shim);
+/// checkout it names, using this version's quiet cache root. Trust's `$CARGO` is the store's
+/// `targo` itself, past the shim;
 /// `None` off macOS.
 #[must_use]
 pub fn with_build_dir_from(args: &[String], tool: Tool, cwd: &Path) -> Option<Vec<String>> {
@@ -575,12 +654,9 @@ pub fn with_build_dir_from(args: &[String], tool: Tool, cwd: &Path) -> Option<Ve
         return None;
     }
     let home = aterm_types::dirs::home_dir();
-    let root = home
-        .as_deref()
-        .map(|home| shim_root(home, &std::env::var_os("PATH").unwrap_or_default()));
     let m = Machine {
         home: home.as_deref(),
-        root: root.as_deref(),
+        root: None,
         cwd: None,
         env: &|name| std::env::var_os(name),
         read: &read_config,

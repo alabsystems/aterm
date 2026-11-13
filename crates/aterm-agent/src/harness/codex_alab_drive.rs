@@ -399,6 +399,7 @@ pub(super) fn self_claimed_after_exit(
         salt: now,
         exited_at: now,
         phase: Phase::Exiting { at_s: now },
+        line_input: super::super::relaunch::restart_input(opts, snap, cause),
         ..St::default()
     };
     save(opts, &session, &st);

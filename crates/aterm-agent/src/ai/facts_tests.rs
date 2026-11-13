@@ -206,7 +206,9 @@ fn hidden_codex_backends_do_not_inherit_file_activity_or_rollout_limits() {
         .concat(),
     )
     .unwrap();
-    std::fs::File::open(log)
+    std::fs::File::options()
+        .write(true)
+        .open(log)
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64))
         .unwrap();
@@ -1165,11 +1167,7 @@ fn claude_on_a_default_row_says_when_it_was_recorded_signed_out_and_signed_in_on
 /// keeps `CODEX_AUTH_PATH`'s login its own where `reads`.
 fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), reads);
-    std::fs::write(
-        b.pkg.agents_dir().join("codex"),
-        crate::harness::codex_alab::twin_text(&exe),
-    )
-    .expect("launcher");
+    std::fs::write(b.twin("codex"), crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
 }
 
 /// ON A MANAGED CODEX THAT KEEPS NO ROW'S LOGIN ITS OWN, A REVIEW SERVES THIS MACHINE'S OWN

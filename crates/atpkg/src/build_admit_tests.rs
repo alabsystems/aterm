@@ -108,6 +108,7 @@ fn the_classifier_claims_for_compiling_verbs_and_nothing_else() {
             "targo build",
         ),
         (&["+stable", "build"], Tool::Cargo, "cargo build"),
+        (&["+trust", "build"], Tool::CargoCompat, "cargo build"),
         (&["test", "--workspace"], Tool::Cargo, "cargo test"),
     ] {
         assert_eq!(stage(args, tool).as_deref(), Some(want), "{args:?}");
@@ -1192,11 +1193,52 @@ fn a_builds_row_is_held_to_the_folder_this_users_ledger_opens() {
     assert!(rows.is_empty(), "another ledger's claim: {rows:?}");
 }
 
+/// A COHORT BUILD UNDER `--admit now` SHORT OF ROOM IS REFUSED (TM-1 review): a cohort-aware
+/// ledger admits only what fits, so its forced look is [`Error::Refused`], which starts no build
+/// and forces no claim: [`Admission::Refused`], the front's exit 75, as the ledger error that
+/// look was before came to, never [`Admission::Stopped`], an interrupt's exit 1. The claim it
+/// does not fit beside is held by this process, so the build is asked as another's.
+/// NEGATIVE CONTROL (by hand: the refusal taken as a stopped wait, as the fifth review's fix
+/// took it): `Admission::Stopped`.
+#[cfg(unix)]
+#[test]
+fn a_cohort_build_under_admit_now_short_of_room_is_refused() {
+    let m = machine();
+    let world = aterm_tempfile::tempdir().expect("scratch");
+    let (mut seat, _namespace) = cohort_world(world.path(), &m);
+    let ledger = seat.ledger.clone().expect("a ledger");
+    let held = aterm_capacity::admit_with(
+        &ledger,
+        &m,
+        Need::new("hold").mem(19 * GIB),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("held");
+    seat.mode = Admit::Now;
+    seat.pid = std::process::id().wrapping_add(59);
+    let mut said = Vec::new();
+    let got = admit_cohort(&test_build(), world.path(), &seat, &mut |line| {
+        said.push(line.to_owned());
+    });
+    assert!(matches!(got, Admission::Refused(_)), "{got:?}");
+    assert!(
+        said.last()
+            .is_some_and(|line| line.contains("refused") && line.contains("no build started")),
+        "{said:?}"
+    );
+    assert_eq!(ledger.list().expect("its claims").len(), 1, "none forced");
+    drop(held);
+}
+
 /// A HOST JOB'S ADMISSION WRITES ONE ROW WHERE ITS LOOK DECIDES (TM-1 review): it admits through
 /// one look of a [`aterm_capacity::Waiter`] of its own, not `admit_with`, so its `kind=admission`
-/// row is written where that look decides: one, admitted, for a job that fits; one, not admitted,
-/// for a job that does not fit beside it. NEGATIVE CONTROL (by hand: this path writing no row, as
-/// before): no row for either.
+/// row is written where that look decides: one, admitted, for a job that fits, whose wait is the
+/// one its build's row says once it ends; one, `outcome=refused`, for a job that does not fit
+/// beside it, which its one look could not wait for. NEGATIVE CONTROLS (by hand): this path
+/// writing no row, as before: no row for either; the look's shortfall taken as a stopped wait, as
+/// before: `outcome=fail`.
 #[cfg(unix)]
 #[test]
 fn a_host_jobs_one_look_writes_one_row() {
@@ -1220,19 +1262,12 @@ fn a_host_jobs_one_look_writes_one_row() {
             aterm_telemetry::Meter::Exact
         )
     );
-    assert_eq!(
-        rows[0].wait_ms,
-        aterm_capacity::telemetry::wait(
-            first.claim().asked_ms(),
-            first.claim().record().held.map(|h| h.admitted_ms)
-        ),
-        "the wait its build's row will say"
-    );
-    let (second, rows) = telemetry::capture(user, || {
+    let admitted_wait = rows[0].wait_ms.clone();
+    let (second, rows) = telemetry::capture(user.clone(), || {
         admit_cohort_job(&build, world.path(), &seat, &mut |_| {})
     });
     assert!(
-        matches!(second, Admission::Stopped(_)),
+        matches!(second, Admission::Refused(_)),
         "the second does not fit beside it: {second:?}"
     );
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1240,11 +1275,62 @@ fn a_host_jobs_one_look_writes_one_row() {
         (&rows[0].kind, rows[0].outcome, rows[0].stop),
         (
             &aterm_telemetry::Kind::Admission,
-            aterm_telemetry::Outcome::Fail,
+            aterm_telemetry::Outcome::Refused,
             aterm_telemetry::Stop::Exit
         )
     );
-    drop(first);
+    let (_, built) =
+        telemetry::capture(user, || first.end(BuildEnd::Success(true), 1, &mut |_| {}));
+    assert_eq!(built.len(), 1, "{built:?}");
+    assert_eq!(
+        (&built[0].kind, &built[0].wait_ms),
+        (&aterm_telemetry::Kind::Build, &admitted_wait),
+        "the wait its build's row says is its admission's"
+    );
+}
+
+/// A CLAIM WHOSE ROOT ENDED UNMETERED STILL ENDS WITH ITS ROW (TM-1 review): a cohort root its
+/// capture reaped before a meter could start runs unmetered ([`supervise_launch`]; here
+/// [`reap_at_launch`] reaps it there, deterministically), and its claim ends all the same, its
+/// row saying how the root ended and its peak the root's own, from the reap that consumed its
+/// exit. NEGATIVE CONTROL (by hand: the end matched on a meter, as before): no row.
+#[cfg(unix)]
+#[test]
+fn a_claim_whose_root_ended_unmetered_still_ends_with_its_row() {
+    let m = machine();
+    let world = aterm_tempfile::tempdir().expect("scratch");
+    let (seat, _namespace) = cohort_world(world.path(), &m);
+    let user = seat.ledger.clone().expect("a ledger");
+    let build = classify(&words(&["--unverified", "build"]), Tool::Targo).expect("claims");
+    let Admission::Claimed(held) = admit_cohort_job(&build, world.path(), &seat, &mut |_| {})
+    else {
+        panic!("a host job's claim");
+    };
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command.args(["-c", "exit 3"]);
+    let (status, rows) = telemetry::capture(user, || {
+        reap_at_launch();
+        supervise(Some(*held), &mut command, &mut |_| {})
+    });
+    assert_eq!(status.expect("supervised").code(), Some(3));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome, rows[0].code),
+        (
+            &aterm_telemetry::Kind::Build,
+            aterm_telemetry::Outcome::Fail,
+            Some(3)
+        )
+    );
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    assert!(
+        matches!(rows[0].peak_bytes, aterm_telemetry::Fig::Known(peak) if peak > 0),
+        "the root's own peak: {:?}",
+        rows[0].peak_bytes
+    );
 }
 
 /// A failed build keeps its peak when it would claim more than its claim did, since its peak is
@@ -2695,8 +2781,9 @@ fn an_unproven_nested_lock_takes_its_turn_at_the_ledgers_lock() {
 /// unproven lock it admits through a [`aterm_capacity::Waiter`] of its own, not `admit_with`, so
 /// its `kind=admission` row is written once its look decides, however many looks met the
 /// ledger's lock: here three looks met it before one admitted, and one row says it, admitted.
-/// A look short of memory writes one row, not admitted. NEGATIVE CONTROLS (by hand: this path
-/// writing no row, as before: none; a row each look: four for the first).
+/// A look short of memory writes one row, `outcome=refused`. NEGATIVE CONTROLS (by hand): this
+/// path writing no row, as before: none; a row each look: four for the first; the look's
+/// shortfall taken as a stopped wait, as before: `outcome=fail`.
 #[test]
 fn a_nested_builds_look_in_its_turn_writes_one_row_where_it_decides() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -2778,10 +2865,11 @@ fn a_nested_builds_look_in_its_turn_writes_one_row_where_it_decides() {
     assert!(matches!(refused, Admission::Refused(_)), "{refused:?}");
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(
-        (&rows[0].kind, rows[0].outcome),
+        (&rows[0].kind, rows[0].outcome, rows[0].stop),
         (
             &aterm_telemetry::Kind::Admission,
-            aterm_telemetry::Outcome::Fail
+            aterm_telemetry::Outcome::Refused,
+            aterm_telemetry::Stop::Exit
         )
     );
     drop(alone);
@@ -2942,4 +3030,18 @@ fn claims_of_other_processes_ahead_of_a_front_are_counted() {
         Some(FrontClaim::Held)
     );
     assert_eq!(front_claim_in(&later, 4700), None);
+}
+
+#[test]
+fn trust_cargo_admission_uses_cargo_words_and_lane() {
+    for args in [
+        vec!["build"],
+        vec!["+trust", "test", "-p", "demo"],
+        vec!["+trust", "check"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let stock = classify(&args, Tool::Cargo);
+        assert!(stock.is_some());
+        assert_eq!(classify(&args, Tool::CargoCompat), stock);
+    }
 }

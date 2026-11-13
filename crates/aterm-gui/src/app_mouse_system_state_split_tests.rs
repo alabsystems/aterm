@@ -194,13 +194,40 @@ fn split_terminal_wheel_preserves_the_focused_page() {
     assert!(split.app.structural_invariants_ok());
 }
 
+/// The page beside a Settings sibling whose list runs past its pane, so a wheel over it has
+/// somewhere to go: Security's where this host's faces lay it that long (macOS's), else the
+/// first page's that runs past it (its list paints a thumb). How tall a list stands is the
+/// faces' to say: Windows' lays Security in the pane whole.
 fn page_with_settings_sibling() -> (Split, ViewId) {
+    let route = std::iter::once(SettingsRoute::Security)
+        .chain(SettingsRoute::ALL)
+        .find(|&route| settings_sibling_scrolls(route))
+        .expect("a Settings page whose list runs past its pane");
+    page_with_settings_route(route)
+}
+
+/// Whether `route`'s list runs past its pane beside the page (it paints a thumb).
+fn settings_sibling_scrolls(route: SettingsRoute) -> bool {
+    let (split, settings_view) = page_with_settings_route(route);
+    split
+        .app
+        .retained_native_leaf_artifact(split.window, settings_view, true)
+        .is_some_and(|artifact| {
+            artifact
+                .compiled
+                .paint
+                .iter()
+                .any(|node| node.key.as_str().ends_with("/list/thumb"))
+        })
+}
+
+fn page_with_settings_route(route: SettingsRoute) -> (Split, ViewId) {
     let mut split = page_beside_terminal();
-    assert!(split.app.open_settings_tab(SettingsRoute::Security));
+    assert!(split.app.open_settings_tab(route));
     let (settings, _) = split.app.active_native_view(split.window).unwrap();
     assert!(split.app.open_system_state_tab());
     let mut state = SettingsViewState::new(&split.app.config);
-    state.route = SettingsRoute::Security;
+    state.route = route;
     let settings_view = split
         .app
         .split_active_with_native(

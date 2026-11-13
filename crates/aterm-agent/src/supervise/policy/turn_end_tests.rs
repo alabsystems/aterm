@@ -67,6 +67,7 @@ fn t0() -> Instant {
 
 fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
+        launch_model: crate::supervise::policy::turn_end::LaunchModel::Unread,
         phase: if said.trim_end().ends_with('?') {
             Phase::Question
         } else {
@@ -1558,8 +1559,8 @@ fn a_limits_end_types_no_keep_going_into_a_done_report() {
                     ));
                 }
             }
-            // A record that left the task to a person holds no Cruise session (owner ruling
-            // 2026-10-26): the done report is checked as any other.
+            // A record that left the task to a person holds no Cruise session:
+            // the done report is checked as any other.
             let left = TurnEndReading {
                 left_record: true,
                 ..point(done)
@@ -1724,8 +1725,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 wrong.push(format!("fired row {fired_row}, {reply:?}: {a:?}"));
             }
         }
-        // A record that left the task to a person holds no Cruise session (owner ruling
-        // 2026-10-26): the done report is checked as any other.
+        // A record that left the task to a person holds no Cruise session:
+        // the done report is checked as any other.
         let rows = replied_after_the_reset(done, fired_row);
         let (a, _) = ended(&armed, &wall(AUTO_CONTINUE_ARMED), &rows, true);
         if a != checked() {
@@ -3292,7 +3293,8 @@ fn a_sonnet_bucket_under_the_generic_banner_waits_out_its_countdown() {
 }
 
 /// A MODEL BUCKET WAITS FOR ITS RESET AND RELAUNCHES NOTHING: under the default config a bucket
-/// with a named reset, in a tab whose host can relaunch, waits for that reset and its grace; and
+/// with a named reset, in a tab whose host can relaunch but never read the launch's model (the
+/// Fable launch's move onto Opus is `turn_end_fable_tests`'), waits for that reset and its grace; and
 /// under every setting of consent, `continue_policy`, `resume_limits` and `usage_credits`, with a
 /// reset named or none, at the wall, inside its wait and past it, no decision is a restart.
 /// NEGATIVE CONTROL: the same tab at a memory wall restarts.
@@ -4820,7 +4822,7 @@ fn limits_place_rule_is_in_limits_place() {
 /// A no-progress fact a reading may carry ([`crate::supervise::facts`]).
 fn hung_fact() -> crate::supervise::facts::Fact {
     crate::supervise::facts::Fact {
-        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7),
+        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7, 1),
         text: "shell task bplle5dxj (pid 27098) has made no progress for 31 min".to_string(),
         as_of_ms: 0,
     }
@@ -6743,8 +6745,8 @@ fn a_done_check_answered_with_progress_is_continued() {
 
 #[test]
 fn a_persons_exchange_a_loop_left_stays_theirs_in_a_new_loop_and_a_relaunch() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let now = t0();
     for said in [
@@ -6825,12 +6827,12 @@ fn fresh_left(said: &str, now: Instant) -> TurnEndState {
 /// 2026-10-24 under cruise: the person's message was answered with a question to them, the
 /// harness then upgraded Claude Code and typed its restore notice ("Nothing else is asked."),
 /// and the 15 s reply to that notice was still read as the person's exchange: nothing was typed.
-/// Cruise leaves no exchange now (owner ruling 2026-10-26); Land still does where it opens the
-/// session (owner ruling 2026-10-27), and the host's turn after it is the host's.
+/// Cruise leaves no exchange now; Land still does where it opens the
+/// session, and the host's turn after it is the host's.
 #[test]
 fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let asked = "Should I go ahead on the new account? Or tell me how much quota to spend.";
     let quick = Duration::from_secs(15);
@@ -6856,7 +6858,7 @@ fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
         }
     }
     // CONTROL: the same short reply to the person's own next message is no exchange of theirs
-    // either: the session's opening message was (owner ruling 2026-10-27), so Land carries it once
+    // either: the session's opening message was, so Land carries it once
     // their hands are off the keys.
     for reply in replies {
         let mut now = t0();
@@ -6878,8 +6880,8 @@ fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
 
 #[test]
 fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
         land(walled(kind, message, worked))
@@ -7002,7 +7004,7 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
     at(&mut left, &land(thanks), now);
     assert!(
         !left.left_to_person(),
-        "Land carries it too: the session worked before it (owner ruling 2026-10-27)"
+        "Land carries it too: the session worked before it"
     );
     let mut fresh = TurnEndState::default();
     at(&mut fresh, &check_in, now);
@@ -7023,10 +7025,10 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
 
 #[test]
 fn a_task_never_passes_to_a_person_mid_session_under_land() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE only where it opens the session (owner ruling
-    // 2026-10-27, `under_land_a_persons_message_mid_job_does_not_park_the_work`): once the session
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE only where it opens the session
+    // (`under_land_a_persons_message_mid_job_does_not_park_the_work`): once the session
     // worked, a person's message, after a done claim or an interrupted turn included, is carried;
-    // Cruise carries every one (owner ruling 2026-10-26).
+    // Cruise carries every one.
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let quick = Some(Duration::from_secs(5));
     let theirs = |said: &str, worked: Option<Duration>| TurnEndReading {
@@ -7093,7 +7095,7 @@ fn a_turn_read_running_before_the_loop_is_a_persons_only_by_a_key_inside_it() {
         let mut st = TurnEndState::default();
         st.seed_acts(acts, now);
         st.seed_ran_turn(ran, point, now);
-        // Land's: Cruise leaves no exchange (owner ruling 2026-10-26).
+        // Land's: Cruise leaves no exchange.
         let r = TurnEndReading {
             person: Some(key),
             key: Some(key),
@@ -7110,8 +7112,8 @@ fn a_turn_read_running_before_the_loop_is_a_persons_only_by_a_key_inside_it() {
 
 #[test]
 fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
         land(walled(kind, message, worked))
@@ -7161,8 +7163,8 @@ fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
 
 #[test]
 fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
         land(walled(kind, message, worked))
@@ -14319,8 +14321,7 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     assert_eq!(tracked.wall_attempts(WallKind::UsageSession), Some(0));
     assert!(!gate(&tracked, &again, &cfg()), "a wall track");
     assert_eq!(word(&tracked, &again, &cfg()), Some("wall"));
-    // A task done by the person's own exchange, which only Land leaves to them (owner ruling
-    // 2026-10-26).
+    // A task done by the person's own exchange, which only Land leaves to them.
     let mut done = TurnEndState::default();
     done.observe(
         &land(TurnEndReading {
@@ -16463,8 +16464,8 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
     }
 }
 
-/// UNDER LAND A PERSON'S EXCHANGE IS THEIRS ONLY WHERE IT OPENS THE SESSION (owner ruling
-/// 2026-10-27): a person's message once the session has worked, at a point this loop judged or
+/// UNDER LAND A PERSON'S EXCHANGE IS THEIRS ONLY WHERE IT OPENS THE SESSION:
+/// a person's message once the session has worked, at a point this loop judged or
 /// under a loop before it ([`TurnEndState::seed_worked`]), interrupts that work, and Land carries
 /// it on after the reply. Measured: a worker spawned on a landing task, asked mid-job "are you
 /// working on anything?", was left quiet with its work unlanded. Off still leaves it.
@@ -16686,7 +16687,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     }
 }
 
-/// LAND TAKES BACK AN EXCHANGE OFF LEFT AFTER WORK (owner ruling 2026-10-27): a person's message
+/// LAND TAKES BACK AN EXCHANGE OFF LEFT AFTER WORK: a person's message
 /// mid-job answered while the session was Off is left to them and parks; once the word is Land
 /// again, the point judged again (no work since, no record read: the loop's rejudge after
 /// UNPARKED) is a turn end like any other, and Land carries the work on. Before the fix the
@@ -16757,8 +16758,8 @@ fn land_takes_back_an_exchange_off_left_after_work() {
     }
 }
 
-/// LAND CARRIES AN EXCHANGE OFF LEFT AFTER WORK WHEN ITS RECORD IS READ AGAIN (owner ruling
-/// 2026-10-27): the loop's own `LEFT` row for the reply Off left is read at the same turn once
+/// LAND CARRIES AN EXCHANGE OFF LEFT AFTER WORK WHEN ITS RECORD IS READ AGAIN:
+/// the loop's own `LEFT` row for the reply Off left is read at the same turn once
 /// the word is Land, where the turn it names is still that exchange's: the answer to the retry
 /// Land typed at its wall (the row's key, kept through the retry by `approvals::left_after_typed`,
 /// names the turn the retry opened), or a relaunch's start-up. That row came after work, as a
@@ -16848,7 +16849,7 @@ fn land_carries_an_exchange_off_left_after_work_when_its_record_is_read_again() 
     }
 }
 
-/// CRUISE NEVER PARKS AT A REPLY TO THE PERSON'S OWN MESSAGE (owner ruling 2026-10-26): the
+/// CRUISE NEVER PARKS AT A REPLY TO THE PERSON'S OWN MESSAGE: the
 /// person's own exchange (their message, answered within 10 minutes) is theirs under Land and Off
 /// alone; under Cruise it is a turn end like any other, whatever the reply says (a greeting, a
 /// question to them, a done report, a `NEEDS YOU:` line, an answer at length), held only while
@@ -16980,7 +16981,7 @@ fn a_landing_and_a_persons_own_exchange_compose() {
         st
     };
     let thanks = land(idle("You're welcome!", quick));
-    // A person's message after the landing is no exchange of theirs (owner ruling 2026-10-27):
+    // A person's message after the landing is no exchange of theirs:
     // it is someone else's turn, so the landing no longer stands, and Land carries the session on.
     let st = landed(Some(hand(thanks.clone())));
     assert!(!st.left_to_person() && !st.landed());
@@ -17045,8 +17046,8 @@ fn an_off_park_ends_the_carry_and_land_begins_again_after_a_persons_greeting() {
             Autopilot::Land => land_nudged(),
             _ => continued_held(),
         };
-        // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land carries one
-        // the session did not open (owner ruling 2026-10-27), beginning again where the park
+        // Cruise carries the person's own exchange; Land carries one
+        // the session did not open, beginning again where the park
         // ended its carry.
         let parked = match mode {
             Autopilot::Land => (false, land_instruction()),
@@ -17159,8 +17160,8 @@ fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
     at(&mut st, &idle("Waiting for your word.", None), now);
     assert!(!st.left_to_person());
     st.took();
-    // The person's own exchange after it: Cruise carries it (owner ruling 2026-10-26), and so
-    // does Land, since the session worked before it (owner ruling 2026-10-27).
+    // The person's own exchange after it: Cruise carries it, and so
+    // does Land, since the session worked before it.
     let hello = TurnEndReading {
         person: Some(Duration::from_secs(5)),
         key: Some(Duration::from_secs(5)),
@@ -17399,8 +17400,8 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
                 decide_turn_end(&st, &r, &cfg(), now + 10 * MIN),
             )
         };
-        // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land carries one
-        // the session did not open (owner ruling 2026-10-27), beginning again where the park
+        // Cruise carries the person's own exchange; Land carries one
+        // the session did not open, beginning again where the park
         // ended its carry, whatever the turn's length. Off types nothing, and the bound alone
         // says whose the turn is: a short one the person's, a job's not. Cruise's continuation
         // comes ten minutes after the person's turn, inside its hold.
@@ -17470,8 +17471,8 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
             decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 90 * MIN),
         )
     };
-    // Cruise carries the person's own exchange (owner ruling 2026-10-26), and so does Land after
-    // a point, unseen or not (owner ruling 2026-10-27).
+    // Cruise carries the person's own exchange, and so does Land after
+    // a point, unseen or not.
     assert_eq!(
         after_an_unseen_first_point(Autopilot::Land, minutes),
         (false, land_instruction())
@@ -17489,7 +17490,7 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
 #[test]
 fn a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park() {
     let now = t0();
-    // Land's: Cruise leaves no exchange to a person (owner ruling 2026-10-26).
+    // Land's: Cruise leaves no exchange to a person.
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let run = |before: Duration, after: Duration, park: bool| {
         let mut st = TurnEndState::default();
@@ -17582,7 +17583,7 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
             _ => typed(RULE_CONTINUE),
         };
         // Land's instruction waits no back-off (v6 §14.10); Cruise, which never takes the turn
-        // for the person's (owner ruling 2026-10-26), backs off first or types at once, within
+        // for the person's, backs off first or types at once, within
         // the hour of the person's key without saying the go-ahead is no need.
         if mode == Autopilot::Land {
             assert_eq!(first, want, "{mode:?}: at once");
@@ -17600,7 +17601,7 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
                 "{mode:?}: {later:?}"
             );
         } else {
-            // Cruise carries the person's own exchange (owner ruling 2026-10-26).
+            // Cruise carries the person's own exchange.
             assert!(
                 !left && later == typed(RULE_CONTINUE),
                 "{mode:?}: {later:?}"
@@ -18589,8 +18590,8 @@ fn a_superseded_logins_held_follow_is_waited_for_and_asks_nothing() {
 
 #[test]
 fn a_wall_splits_a_job_in_a_new_loop_too() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
         land(walled(kind, message, worked))
@@ -18686,8 +18687,8 @@ fn a_wall_inside_the_restarts_check_keeps_the_check_it_cut() {
 
 #[test]
 fn a_loop_started_as_off_lifted_leaves_a_first_point_an_earlier_loop_left() {
-    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
-    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it
+    // (`cruise_never_parks_at_a_reply_to_the_persons_own_message`).
     let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let later = t0() + 10 * MIN;
     for said in [
@@ -19563,8 +19564,8 @@ fn the_exchange_a_lost_login_swallowed_is_carried_through_its_sign_in() {
     };
     let t = t0();
     let secs = Duration::from_secs;
-    // The owner's exchange after the session worked: Cruise carries it (owner ruling 2026-10-26),
-    // and so does Land (owner ruling 2026-10-27), leaving nothing to the owner.
+    // The owner's exchange after the session worked: Cruise carries it,
+    // and so does Land, leaving nothing to the owner.
     for (mode, aterm_presses) in [
         (Autopilot::Land, true),
         (Autopilot::Land, false),
@@ -22155,8 +22156,8 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
             (2, judged),
             "{program:?}"
         );
-        // The person's own exchange after the session's first point: Cruise carries it (owner
-        // ruling 2026-10-26), and so does Land (owner ruling 2026-10-27).
+        // The person's own exchange after the session's first point: Cruise carries it,
+        // and so does Land.
         let mut st = start();
         let a = at(
             &mut st,
@@ -23898,4 +23899,115 @@ fn a_transcript_quoting_a_revoked_token_is_no_lost_login() {
     };
     let point = st.account_point(&walled, &cfg());
     assert!(lost(point), "{point:?}");
+}
+
+/// WHAT A TAB SHOWS OF ITS OWN LOGIN IS SAID FOR EVERY PROGRAM, WHATEVER THE ACCOUNTS' SWITCHES
+/// SAY: a sign-in wall drawn now is the login lost, on Codex, Grok, Kimi Code and agy as on
+/// Claude Code, with no roster row named, accounts off and nothing to relaunch; a point a turn
+/// worked to with no wall is the login serving.
+/// CONTROLS: a wall only remembered, a login back, a reading that is not authoritative, a
+/// survey's look and an upgrade's restart say nothing of the login; a quota wall is no word on
+/// the sign-in; a point no turn worked to, an interrupted turn and a draft are no served turn.
+#[test]
+fn a_tabs_own_login_is_seen_lost_at_its_wall_and_served_at_a_worked_point() {
+    let t = t0();
+    let seen = |r: &TurnEndReading| {
+        let mut st = TurnEndState::default();
+        st.observe(r, t + MIN);
+        st.login_seen(r)
+    };
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in",
+        Some(Duration::from_secs(2)),
+    );
+    let served = idle("Done.", Some(Duration::from_secs(40)));
+    for program in [
+        Program::Claude,
+        Program::Codex,
+        Program::Grok,
+        Program::Kimi,
+        Program::Agy,
+        Program::Muse,
+    ] {
+        let lost = TurnEndReading {
+            program,
+            ..gone.clone()
+        };
+        assert_eq!(seen(&lost), Some(LoginSeen::Lost), "{program:?}");
+        let worked = TurnEndReading {
+            program,
+            ..served.clone()
+        };
+        assert_eq!(seen(&worked), Some(LoginSeen::Served), "{program:?}");
+        for (what, r) in [
+            (
+                "a remembered wall",
+                TurnEndReading {
+                    wall_remembered: true,
+                    ..lost.clone()
+                },
+            ),
+            (
+                "a login back",
+                TurnEndReading {
+                    login_back: true,
+                    ..lost.clone()
+                },
+            ),
+            (
+                "not authoritative",
+                TurnEndReading {
+                    authoritative: false,
+                    ..lost.clone()
+                },
+            ),
+            (
+                "a survey",
+                TurnEndReading {
+                    survey: true,
+                    ..lost.clone()
+                },
+            ),
+            (
+                "an upgrade",
+                TurnEndReading {
+                    upgrading: true,
+                    ..worked.clone()
+                },
+            ),
+            (
+                "no turn worked",
+                TurnEndReading {
+                    worked: None,
+                    ..worked.clone()
+                },
+            ),
+            (
+                "an interrupted turn",
+                TurnEndReading {
+                    interrupted: true,
+                    ..worked.clone()
+                },
+            ),
+            (
+                "a draft",
+                TurnEndReading {
+                    pending_input: true,
+                    ..worked.clone()
+                },
+            ),
+        ] {
+            assert_eq!(seen(&r), None, "CONTROL {what}: {program:?}");
+        }
+        let quota = TurnEndReading {
+            program,
+            ..walled(
+                WallKind::UsageSession,
+                "limit reached",
+                Some(Duration::from_secs(2)),
+            )
+        };
+        assert_eq!(seen(&quota), None, "CONTROL a quota wall: {program:?}");
+    }
 }

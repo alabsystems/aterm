@@ -224,7 +224,7 @@ impl World {
 
 fn nothing(_: &mut World) {}
 
-/// Claude in plan mode: the light, `○ yolo`, drawn beside Autopilot.
+/// Claude in plan mode: the light, `yolo`, drawn beside Autopilot.
 fn planned(w: &mut World) {
     w.session().shown = Reading {
         mode: Some(Mode::Plan),

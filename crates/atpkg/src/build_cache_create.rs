@@ -156,7 +156,7 @@ fn valid_cache_tag(root: &aterm_dirfd::OwnedFd) -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn ensure_parent(home: &Path, parent: &Path) -> Option<aterm_dirfd::OwnedFd> {
+pub(super) fn ensure_parent(home: &Path, parent: &Path) -> Option<aterm_dirfd::OwnedFd> {
     let relative = parent.strip_prefix(home).ok()?;
     let mut held = pin(home)?;
     let mut at = home.to_path_buf();
@@ -337,26 +337,8 @@ pub(super) enum Point {
 }
 
 #[cfg(all(test, unix))]
-pub(super) mod faults {
-    use super::Point;
-    type Hook = Box<dyn FnMut(Point) -> Option<()>>;
-    thread_local! {
-        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
-    }
-    pub(in crate::build_cache::registered) fn set(hook: impl FnMut(Point) -> Option<()> + 'static) {
-        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    }
-    pub(in crate::build_cache::registered) fn clear() {
-        HOOK.with(|slot| *slot.borrow_mut() = None);
-    }
-    pub(super) fn at(point: Point) -> Option<()> {
-        HOOK.with(|slot| {
-            slot.borrow_mut()
-                .as_mut()
-                .map_or(Some(()), |hook| hook(point))
-        })
-    }
-}
+#[path = "build_cache_create_faults_tests.rs"]
+pub(super) mod faults;
 
 #[cfg(unix)]
 pub(super) fn step(point: Point) -> Option<()> {

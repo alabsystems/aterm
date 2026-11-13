@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local contention experiments. Builds release products without executing or publishing them.
+//! Local qualify measurements of builds, checks and fixtures, without publication.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -19,6 +19,49 @@ pub(crate) struct Options {
     tree_work: TreeShape,
     export_seconds: Option<u64>,
     real_export: bool,
+    planted_red: bool,
+    warmup: bool,
+    warm_slices: bool,
+    cold_tree: bool,
+    build_return: BuildReturn,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BuildReturn {
+    #[default]
+    Early,
+    Retained,
+    Matched,
+}
+
+impl BuildReturn {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Early => "early",
+            Self::Retained => "retained",
+            Self::Matched => "matched",
+        }
+    }
+
+    fn drain(self, shares: &aterm_capacity::BranchShares) {
+        match self {
+            Self::Early => shares.build_compilers_drained(),
+            Self::Retained => shares.serial_bundle_drained(),
+            Self::Matched => unreachable!("select the take's build-return policy before draining"),
+        }
+    }
+
+    fn for_take(self, take: &str) -> Self {
+        if self == Self::Matched {
+            match take {
+                "before" | "warmup" => Self::Retained,
+                "after" => Self::Early,
+                _ => unreachable!("matched build returns require a named before or after take"),
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// The measured 0.187.0 export wall. The release-shaped pilot holds the production export
@@ -41,8 +84,11 @@ pub(crate) fn slice_child_entry(args: &[OsString]) -> Option<std::process::ExitC
         return None;
     }
     let result = (|| {
-        let [_, repo, root, commit, demoted] = args else {
-            return Err("qualify pilot slice child needs repo, root, commit and priority".into());
+        let [_, repo, root, commit, demoted, cache, build] = args else {
+            return Err(
+                "qualify pilot slice child needs repo, root, commit, priority, cache and build policy"
+                    .into(),
+            );
         };
         let commit = commit
             .to_str()
@@ -52,7 +98,24 @@ pub(crate) fn slice_child_entry(args: &[OsString]) -> Option<std::process::ExitC
             Some("demoted") => true,
             _ => return Err("qualify pilot slice child priority is invalid".into()),
         };
-        slice_child(Path::new(repo), Path::new(root), commit, demoted)
+        let warm = match cache.to_str() {
+            Some("warm") => true,
+            Some("cold") => false,
+            _ => return Err("qualify pilot slice cache policy is invalid".into()),
+        };
+        let full = match build.to_str() {
+            Some("full") => true,
+            Some("slices") => false,
+            _ => return Err("qualify pilot build policy is invalid".into()),
+        };
+        slice_child(
+            Path::new(repo),
+            Path::new(root),
+            commit,
+            demoted,
+            warm,
+            full,
+        )
     })();
     Some(match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -69,9 +132,58 @@ fn emit_slice_child(event: aterm_json::Value) -> Result<(), String> {
     std::io::stdout().flush().map_err(|error| error.to_string())
 }
 
-fn slice_child(repo: &Path, root: &Path, commit: &str, demoted: bool) -> Result<(), String> {
+fn require_unsigned_build(ended: &aterm_json::Value, commit: &str) -> Result<(), String> {
+    let built = &ended["postlink"];
+    let mut archs = built["architectures"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    archs.sort_unstable();
+    let digests = [
+        "snapshot_digest",
+        "macho_sha256",
+        "bundle_digest",
+        "content_digest",
+        "inputs",
+    ];
+    if built["success"].as_bool() == Some(true)
+        && built["kind"].as_str() == Some("real-unsigned-build-finishing")
+        && built["commit"].as_str() == Some(commit)
+        && archs == ["arm64", "x86_64"]
+        && digests.iter().all(|key| {
+            built[*key].as_str().is_some_and(|text| {
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        })
+    {
+        Ok(())
+    } else {
+        Err("the real build child did not complete unsigned post-link and bundle stages".into())
+    }
+}
+
+fn slice_child(
+    repo: &Path,
+    root: &Path,
+    commit: &str,
+    demoted: bool,
+    warm: bool,
+    full: bool,
+) -> Result<(), String> {
+    let preparing = Instant::now();
+    let preparation_started_ms = crate::cut_timing::epoch_ms();
+    let compilers = full.then(crate::artifact::compilers).transpose()?;
     let take = crate::buildplan::Take::prepare(repo, commit)?;
-    emit_slice_child(aterm_json::json!({"event":"prepared"}))?;
+    let plan = crate::buildplan::contention_plan(repo, &take, root, full)?;
+    emit_slice_child(aterm_json::json!({
+        "event":"prepared", "wall_s":preparing.elapsed().as_secs_f64(),
+        "started_at_unix_ms":preparation_started_ms,
+        "ended_at_unix_ms":crate::cut_timing::epoch_ms(),
+    }))?;
     let pool = aterm_capacity::Jobserver::inherited()
         .ok_or("qualify pilot slice child was not handed its jobserver")?
         .map_err(|error| format!("adopt qualify pilot jobserver: {error}"))?;
@@ -83,14 +195,30 @@ fn slice_child(repo: &Path, root: &Path, commit: &str, demoted: bool) -> Result<
             }
             Ok(())
         });
-        let slices = crate::buildplan::contention_slices(&take, root, &pool, demoted, Some(ready));
+        let slices = crate::buildplan::contention_slices(
+            &plan,
+            &take,
+            root,
+            &pool,
+            demoted,
+            warm,
+            Some(ready),
+        );
         reporter
             .join()
             .map_err(|_| "slice admission reporter panicked".to_owned())??;
         slices
     })?;
+    let postlink = match &compilers {
+        Some(compilers) => Some(crate::buildplan::finish_contention_build(
+            &plan, &take, root, &slices, compilers,
+        )?),
+        None => None,
+    };
     take.verify()?;
-    emit_slice_child(aterm_json::json!({"event":"ended","slices":slices}))
+    emit_slice_child(
+        aterm_json::json!({"event":"ended","slices":slices.reports(),"postlink":postlink}),
+    )
 }
 
 pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -101,10 +229,35 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     let mut tree_work = None;
     let mut export_seconds = None;
     let mut real_export = false;
+    let mut planted_red = false;
+    let mut warmup = false;
+    let mut warm_slices = None;
+    let mut cold_tree = None;
+    let mut build_return = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
+            "--build-return"
+                if build_return.is_none()
+                    && matches!(value.as_str(), "early" | "retained" | "matched") =>
+            {
+                build_return = Some(match value.as_str() {
+                    "early" => BuildReturn::Early,
+                    "retained" => BuildReturn::Retained,
+                    _ => BuildReturn::Matched,
+                });
+            }
             "--export-work" if value == "real" && !real_export => real_export = true,
+            "--plant-red" if value == "test" && !planted_red => planted_red = true,
+            "--warmup" if value == "full" && !warmup => warmup = true,
+            "--slice-cache"
+                if warm_slices.is_none() && matches!(value.as_str(), "warm" | "cold") =>
+            {
+                warm_slices = Some(value == "warm");
+            }
+            "--tree-cache" if cold_tree.is_none() && matches!(value.as_str(), "warm" | "cold") => {
+                cold_tree = Some(value == "cold");
+            }
             "--verify" if verify.is_none() => verify = Some(PathBuf::from(value)),
             "--before-verify" if before.is_none() => before = Some(PathBuf::from(value)),
             "--tree-work"
@@ -127,7 +280,14 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                 if mode.is_none()
                     && matches!(
                         value.as_str(),
-                        "alone" | "shared" | "chain" | "tree" | "series" | "export" | "matched"
+                        "alone"
+                            | "shared"
+                            | "chain"
+                            | "tree"
+                            | "series"
+                            | "export"
+                            | "matched"
+                            | "fixtures"
                     ) =>
             {
                 mode = Some(value)
@@ -142,17 +302,92 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         tree_work: tree_work.unwrap_or_default(),
         export_seconds,
         real_export,
+        planted_red,
+        warmup,
+        warm_slices: warm_slices.unwrap_or(real_export),
+        cold_tree: cold_tree.unwrap_or(false),
+        build_return: build_return.unwrap_or_default(),
     };
     if matches!(options.mode.as_str(), "series" | "matched") != options.before.is_some() {
         return Err("series and matched require --before-verify PATH".into());
     }
+    if options.build_return == BuildReturn::Matched && options.mode != "matched" {
+        return Err("matched build returns require --mode matched".into());
+    }
+    if options.build_return == BuildReturn::Matched
+        && options.before.as_ref() != Some(&options.verify)
+    {
+        return Err(
+            "matched build returns require the same --verify and --before-verify path".into(),
+        );
+    }
     if options.real_export && options.export_seconds.is_some() {
         return Err("real export cannot use a surrogate duration".into());
+    }
+    if options.real_export && options.mode != "export" && options.tree_work != TreeShape::Release {
+        return Err("real export and fixtures require --tree-work release".into());
+    }
+    if options.real_export
+        && !matches!(
+            options.mode.as_str(),
+            "shared" | "chain" | "matched" | "export"
+        )
+    {
+        return Err("real work requires shared, chain, matched or export mode".into());
+    }
+    if options.planted_red && (!options.real_export || options.mode == "export") {
+        return Err("a planted red requires the full real local workload".into());
+    }
+    if options.warmup && (options.mode != "matched" || !options.real_export) {
+        return Err("a full warmup requires the matched real local workload".into());
+    }
+    if options.cold_tree && (!options.real_export || options.mode == "export") {
+        return Err("a cold native tree requires the full real local workload".into());
     }
     Ok(options)
 }
 
 impl Options {
+    /// Calibration uses the same held grant as the following ABBA. Its complete green
+    /// control run learns that width's memory peak before either measured arm starts.
+    fn order(&self) -> Vec<&str> {
+        let mut takes = order(&self.mode);
+        if self.warmup {
+            takes.insert(0, "warmup");
+        }
+        takes
+    }
+
+    fn take(&self, mode: &str) -> Result<Self, String> {
+        let control = (self.mode == "series" && matches!(mode, "shared" | "tree"))
+            || (self.mode == "matched" && matches!(mode, "before" | "warmup"));
+        let verify = if control {
+            self.before
+                .as_ref()
+                .ok_or("the control take requires --before-verify PATH")?
+        } else {
+            &self.verify
+        };
+        Ok(Self {
+            verify: verify.clone(),
+            before: None,
+            mode: if self.mode == "matched" {
+                "chain"
+            } else {
+                mode
+            }
+            .to_owned(),
+            tree_work: self.tree_work,
+            export_seconds: self.export_seconds,
+            real_export: self.real_export,
+            planted_red: self.planted_red && mode != "warmup",
+            warmup: false,
+            warm_slices: self.warm_slices,
+            cold_tree: self.cold_tree,
+            build_return: self.build_return.for_take(mode),
+        })
+    }
+
     fn export_seconds(&self) -> Option<u64> {
         if self.real_export {
             return Some(0);
@@ -200,6 +435,7 @@ fn ledger_snapshot(ledger: Option<aterm_capacity::Ledger>) -> aterm_json::Value 
         Some(ledger) => match ledger.list() {
             Ok(records) => aterm_json::json!({
                 "error":null,
+                "directory":ledger.dir(),
                 "records":records.into_iter().map(|record| aterm_json::json!({
                     "pid":record.pid,
                     "start_ms":record.start_ms,
@@ -208,13 +444,20 @@ fn ledger_snapshot(ledger: Option<aterm_capacity::Ledger>) -> aterm_json::Value 
                     "rank":format!("{:?}",record.need.rank),
                     "mem":record.need.mem,
                     "mem_now":record.need.mem_now(),
+                    "margin":record.need.margin,
+                    "requested_cores":record.need.cores,
+                    "granted_cores":record.held.map(|held|held.cores),
+                    "asked_alone":record.need.alone,
+                    "held_alone":record.held.map(|held|held.alone),
                     "held":record.held.is_some(),
                     "admitted_ms":record.held.map(|held|held.admitted_ms),
                 })).collect::<Vec<_>>()
             }),
-            Err(error) => aterm_json::json!({"error":error.to_string(),"records":null}),
+            Err(error) => {
+                aterm_json::json!({"error":error.to_string(),"directory":ledger.dir(),"records":null})
+            }
         },
-        None => aterm_json::json!({"error":"no capacity ledger","records":null}),
+        None => aterm_json::json!({"error":"no capacity ledger","directory":null,"records":null}),
     }
 }
 
@@ -708,6 +951,7 @@ fn tree<'a>(
     shares: &'a aterm_capacity::BranchShares,
     admission_barrier: Option<&std::sync::Mutex<Option<aterm_capacity::InitialReservation<'a>>>>,
     admission: Option<TreeAdmissionSignal>,
+    environment: Option<&aterm_verify::EnvSnapshot>,
 ) -> Result<Vec<aterm_json::Value>, String> {
     let _finished = FinishPilotShare {
         shares,
@@ -730,11 +974,23 @@ fn tree<'a>(
             cmd.args(prefix).args(work.arguments());
             cmd.current_dir(repo)
                 .env(aterm_capacity::RELEASE_RUN_ENV, "1")
-                .env("CARGO_TARGET_DIR", root.join(format!("tree-{check}.noindex")))
                 .arg("--log").arg(root.join(format!("tree-{check}.log")))
                 .arg("--events").arg(root.join(format!("tree-{check}.events")));
+            if !opts.real_export {
+                cmd.env("CARGO_TARGET_DIR", root.join(format!("tree-{check}.noindex")));
+            } else {
+                apply_real_tree_environment(
+                    &mut cmd,
+                    environment.ok_or("real tree has no captured release environment")?,
+                );
+            }
             if root.join("test-history.json").is_file() {
                 cmd.arg("--test-history").arg(root.join("test-history.json"));
+            }
+            if opts.planted_red {
+                cmd.env("ATERM_QUALIFY_RED_MARKER", root.join("planted-red.json"));
+            } else {
+                cmd.env_remove("ATERM_QUALIFY_RED_MARKER");
             }
             shares
                 .hand_to(&mut cmd, true)
@@ -761,10 +1017,14 @@ fn tree<'a>(
                 }
                 std::thread::sleep(Duration::from_millis(25));
             };
-            let row = aterm_json::json!({"check":check,"wall_s":started.elapsed().as_secs_f64(),"cpu_s":usage.cpu.as_secs_f64(),"success":usage.status.success()});
+            let expected_red = opts.planted_red && usage.status.code() == Some(1)
+                && planted_red_only(root, &root.join(format!("tree-{check}.events")));
+            let row = aterm_json::json!({"check":check,"wall_s":started.elapsed().as_secs_f64(),"cpu_s":usage.cpu.as_secs_f64(),"success":usage.status.success(),"expected_red":expected_red});
             crate::durable::write_fresh(&root.join(format!("tree-{check}.result.json")), row.to_string())
                 .map_err(|e| e.to_string())?;
-            if !usage.status.success() { return Err(format!("pilot tree {check}: {row}")); }
+            if (opts.planted_red && !expected_red) || (!opts.planted_red && !usage.status.success()) {
+                return Err(format!("pilot tree {check}: {row}"));
+            }
             Ok(row)
         })}).collect();
         handles
@@ -772,6 +1032,54 @@ fn tree<'a>(
             .map(|h| h.join().map_err(|_| "pilot tree panicked".to_owned())?)
             .collect()
     })
+}
+
+fn planted_red_only(root: &Path, events: &Path) -> bool {
+    let marker = std::fs::read_to_string(root.join("planted-red.json"))
+        .ok()
+        .and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok());
+    if !marker.is_some_and(|marker| {
+        marker["test"].as_str() == Some("qualify_pilot::tests::planted_red_measurement_control")
+    }) {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(events) else {
+        return false;
+    };
+    let parsed: Result<Vec<aterm_json::Value>, _> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap_or(line)))
+        .collect();
+    let Ok(events) = parsed else {
+        return false;
+    };
+    if events
+        .iter()
+        .filter(|row| {
+            row["event"].as_str() == Some("run-finished") && row["code"].as_u64() == Some(1)
+        })
+        .count()
+        != 1
+    {
+        return false;
+    }
+    let rows: Vec<_> = events
+        .iter()
+        .filter(|row| {
+            row["event"].as_str() == Some("check-finished")
+                && row["outcome"].as_str() == Some("FAIL")
+        })
+        .collect();
+    rows.len() == 1
+        && rows[0]["check"].as_str() == Some("test")
+        && rows[0]["findings_total"].as_u64() == Some(1)
+        && rows[0]["findings"].as_array().is_some_and(|findings| {
+            findings.len() == 1
+                && findings[0].as_str().is_some_and(|finding| {
+                finding == "-p aterm-release --test it -- qualify_pilot::tests::planted_red_measurement_control"
+                })
+        })
 }
 
 pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
@@ -782,6 +1090,12 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
     let release = crate::release::release_dir(&git)?;
     let commit = crate::snapshot::git_text(repo, &["rev-parse", "HEAD"])?;
     crate::release_tools::clean_at(repo, commit.trim())?;
+    if opts.real_export
+        && opts.mode != "export"
+        && crate::slice_units::live_shared_floor(2) == u64::MAX
+    {
+        return Err("real gate measurements need complete slice history; calibrate with --mode alone --slice-cache warm first".into());
+    }
     if opts.real_export || opts.mode == "export" {
         match crate::cutter::running_stamp() {
             Ok(crate::cutter::Stamp::Proved(source)) if source == commit.trim() => {}
@@ -793,14 +1107,31 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                     );
                 }
                 let image = std::env::current_exe().map_err(|error| error.to_string())?;
-                let tools =
-                    crate::release_tools::stage(&release, commit.trim(), &image, &opts.verify)?;
-                let proof = crate::release_tools::publish(&release, &tools)?;
-                let mut command = aterm_uds::spawnfd::command(&tools.cutter.path);
+                let cutter = crate::release_tools::stage_cutter(
+                    &release,
+                    commit.trim(),
+                    &image,
+                    &release.join("qualify-freeze.log"),
+                    None,
+                )?;
+                crate::release_tools::publish_cutter(&release, &cutter)?;
+                let tools = crate::release_tools::stage(
+                    &release,
+                    commit.trim(),
+                    &cutter.tool.path,
+                    &opts.verify,
+                )?;
+                crate::release_tools::publish(&release, &tools)?;
+                let proof = crate::release_tools::cutter_record_path(&release);
+                let mut command = aterm_uds::spawnfd::command(&cutter.tool.path);
                 command
                     .current_dir(repo)
                     .args(frozen_arguments(opts, &tools.verify.path))
                     .env(crate::release_tools::RECORD_ENV, proof);
+                apply_real_tree_environment(
+                    &mut command,
+                    &crate::release_steps::verify_environment(),
+                );
                 let status = command.status().map_err(|error| error.to_string())?;
                 return if status.success() {
                     Ok(())
@@ -808,6 +1139,38 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                     Err(format!("frozen qualify pilot exited {status}"))
                 };
             }
+        }
+    }
+    // Freeze the tools under their original build layout before moving the graph's
+    // artifacts. The proved images then stay outside the target cleared between takes.
+    if opts.cold_tree {
+        let target = cold_tree_target(repo)?;
+        let image = std::env::current_exe().map_err(|error| error.to_string())?;
+        let mut images = vec![image.clone(), opts.verify.clone()];
+        images.extend(opts.before.iter().cloned());
+        images_outside_target(repo, &target, &images)?;
+        if std::env::var_os("CARGO_TARGET_DIR").as_deref() != Some(target.as_os_str())
+            || [
+                "CARGO_BUILD_TARGET_DIR",
+                "CARGO_BUILD_BUILD_DIR",
+                "CARGO_HOME",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            let mut command = aterm_uds::spawnfd::command(image);
+            command
+                .current_dir(repo)
+                .args(frozen_arguments(opts, &opts.verify));
+            let mut environment = crate::release_steps::verify_environment();
+            environment.cargo_target_dir = Some(target);
+            apply_real_tree_environment(&mut command, &environment);
+            let status = command.status().map_err(|error| error.to_string())?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("cold-target qualify pilot exited {status}"))
+            };
         }
     }
     let pid = std::process::id();
@@ -864,7 +1227,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     eprintln!("qualify-pilot-admission: {admission}");
     require_series_grant(&opts.mode, aterm_capacity::cores(), claim.cores())?;
-    let modes = order(&opts.mode);
+    let modes = opts.order();
     let history = aterm_types::dirs::account_state_dir()
         .map(|root| {
             aterm_verify::test_history::load(&root.join(aterm_capacity::book::TEST_HISTORY))
@@ -879,45 +1242,193 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         std::fs::create_dir(&at).map_err(|e| e.to_string())?;
         crate::durable::write_fresh(&at.join("test-history.json"), &history)
             .map_err(|error| error.to_string())?;
-        let verifier = if (opts.mode == "series" && matches!(*mode, "shared" | "tree"))
-            || (opts.mode == "matched" && *mode == "before")
-        {
-            opts.before
-                .as_ref()
-                .ok_or("series requires --before-verify PATH for its controls")?
-        } else {
-            &opts.verify
-        };
-        let options = Options {
-            verify: verifier.clone(),
-            before: None,
-            mode: if opts.mode == "matched" {
-                "chain"
-            } else {
-                mode
-            }
-            .to_string(),
-            tree_work: opts.tree_work,
-            export_seconds: opts.export_seconds,
-            real_export: opts.real_export,
-        };
-        if *mode == "export" {
+        let options = opts.take(mode)?;
+        let take = aterm_json::json!({
+            "source":commit.trim(), "arm":mode, "measured":*mode != "warmup",
+            "slots":claim.cores(), "verify":options.verify,
+            "planted_red":options.planted_red, "build_return":options.build_return.as_str(),
+        });
+        crate::durable::write_fresh(&at.join("take.json"), take.to_string())
+            .map_err(|error| error.to_string())?;
+        if *mode == "fixtures" {
+            let result = crate::release_steps::measure_local_fixtures(
+                repo,
+                &at,
+                commit.trim(),
+                &std::sync::atomic::AtomicBool::new(true),
+                None,
+            )?;
+            println!("qualify-fixtures-result: {result}");
+        } else if *mode == "export" {
             let result = crate::release_steps::measure_local_export(
                 repo,
                 &at,
                 commit.trim(),
                 claim.cores(),
+                None,
             )?;
             println!("qualify-export-result: {result}");
             if result["success"].as_bool() != Some(true) {
                 return Err(format!("local full export did not pass: {result}"));
             }
         } else {
-            one(repo, &at, &options, claim.cores(), commit.trim())?;
+            let environment = opts
+                .real_export
+                .then(|| {
+                    let mut environment = crate::release_steps::verify_environment();
+                    if opts.cold_tree {
+                        environment.cargo_target_dir = Some(cold_tree_target(repo)?);
+                    }
+                    Ok::<_, String>(environment)
+                })
+                .transpose()?;
+            let target = environment
+                .as_ref()
+                .map(|environment| prepare_real_tree(repo, opts, environment))
+                .transpose()?;
+            let result = one(
+                repo,
+                &at,
+                &options,
+                claim.cores(),
+                commit.trim(),
+                environment.as_ref(),
+                mode,
+            );
+            if opts.cold_tree {
+                // The next take clears the native target. Preserve the complete compiler
+                // index beside this take's verdicts before discarding its artifacts.
+                let index = target
+                    .as_ref()
+                    .ok_or("cold tree has no captured target")?
+                    .join("verify/test-executables.json");
+                match crate::durable::read_text(&index) {
+                    Ok(index) => {
+                        crate::durable::write_fresh(&at.join("test-executables.json"), index)
+                            .map_err(|error| error.to_string())?
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && result.is_err() => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            result?;
         }
         crate::release_tools::clean_at(repo, commit.trim())?;
     }
     Ok(())
+}
+
+fn apply_real_tree_environment(
+    command: &mut aterm_uds::spawnfd::Command,
+    environment: &aterm_verify::EnvSnapshot,
+) {
+    environment.apply_cargo_selectors(command);
+    command.env("HOME", &environment.home);
+}
+
+fn cold_tree_target(repo: &Path) -> Result<PathBuf, String> {
+    let target = crate::snapshot::CacheRoot::for_repo(repo)?
+        .path()
+        .join(".ubd/qualify-native.noindex");
+    Ok(aterm_verify::physical(&target))
+}
+
+/// The private target may be cleared only while every measurement image lives elsewhere.
+/// Resolve symlinks before the containment test; relative image paths belong to the repo.
+fn images_outside_target(repo: &Path, target: &Path, images: &[PathBuf]) -> Result<(), String> {
+    let target = match std::fs::canonicalize(target) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::path::absolute(target).map_err(|error| error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    for image in images {
+        let image = if image.is_absolute() {
+            image.clone()
+        } else {
+            repo.join(image)
+        };
+        let image = std::fs::canonicalize(&image)
+            .map_err(|error| format!("resolve measurement image {}: {error}", image.display()))?;
+        if image.starts_with(&target) {
+            return Err(format!(
+                "measurement image {} is inside the cold native target {}; run the tools from outside it",
+                image.display(),
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_real_tree(
+    repo: &Path,
+    opts: &Options,
+    environment: &aterm_verify::EnvSnapshot,
+) -> Result<PathBuf, String> {
+    let repo = aterm_verify::physical(repo);
+    let plan = aterm_verify::NativeBuildPlan::capture(environment, &repo)
+        .map_err(|error| error.to_string())?;
+    let ctx = aterm_verify::Ctx::new(
+        repo.clone(),
+        aterm_verify::Scope::workspace(),
+        environment.clone(),
+        repo.join("target/qualify-prepare"),
+    );
+    if ctx.target_dir.as_path() != plan.target()
+        || ctx.main_build_dir.as_deref() != plan.build_dir()
+    {
+        return Err("real tree layout changed while capturing its cleanup context".into());
+    }
+    if opts.cold_tree {
+        let target = cold_tree_target(&repo)?;
+        let main = aterm_verify::plan::lane_dir(&ctx, aterm_verify::plan::Lane::MainTarget)
+            .ok_or("the full tree has no native target")?;
+        if main != target {
+            return Err("the cold native target was not handed to the measurement process".into());
+        }
+        if ctx.cached_lanes_dir.is_some()
+            || aterm_verify::fallback_build_dir(&ctx.env, &repo, &target).is_none()
+        {
+            return Err("cold native measurements require intermediates inside the owned target; an active Cargo build-directory configuration moves them elsewhere".into());
+        }
+        let mut images = vec![
+            std::env::current_exe().map_err(|error| error.to_string())?,
+            opts.verify.clone(),
+        ];
+        images.extend(opts.before.iter().cloned());
+        let oracle = aterm_verify::plan::lane_dir(&ctx, aterm_verify::plan::Lane::LibcOracleTarget)
+            .ok_or("the full tree has no libc oracle target")?;
+        images_outside_target(&repo, &target, &images)?;
+        images_outside_target(&repo, &oracle, &images)?;
+        if target.exists()
+            && !atpkg::build_cache::remove_unbuilt(&target).map_err(|error| error.to_string())?
+        {
+            return Err("the owned native target is in use; no matched take started".into());
+        }
+        if oracle.exists()
+            && !atpkg::build_cache::remove_unbuilt(&oracle).map_err(|error| error.to_string())?
+        {
+            return Err("the owned libc oracle target is in use; no matched take started".into());
+        }
+    }
+    let lint = aterm_verify::plan::lane_dir(&ctx, aterm_verify::plan::Lane::TippyTarget)
+        .ok_or("the full tree has no lint lane")?;
+    if lint.exists()
+        && !atpkg::build_cache::remove_unbuilt(&lint).map_err(|error| error.to_string())?
+    {
+        return Err("the owned lint lane is in use; no matched take started".into());
+    }
+    let index = ctx.target_dir.join("verify/test-executables.json");
+    match std::fs::remove_file(index) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    plan.prepare().map_err(|error| error.to_string())?;
+    Ok(ctx.target_dir)
 }
 
 fn frozen_arguments(opts: &Options, verify: &Path) -> Vec<OsString> {
@@ -929,13 +1440,32 @@ fn frozen_arguments(opts: &Options, verify: &Path) -> Vec<OsString> {
         opts.mode.clone().into(),
         "--tree-work".into(),
         opts.tree_work.as_str().into(),
+        "--build-return".into(),
+        opts.build_return.as_str().into(),
     ];
     if let Some(before) = &opts.before {
-        args.extend(["--before-verify".into(), before.clone().into()]);
+        let before = if opts.build_return == BuildReturn::Matched {
+            verify
+        } else {
+            before
+        };
+        args.extend(["--before-verify".into(), before.as_os_str().to_owned()]);
     }
     if opts.real_export {
         args.extend(["--export-work".into(), "real".into()]);
     }
+    if opts.planted_red {
+        args.extend(["--plant-red".into(), "test".into()]);
+    }
+    if opts.warmup {
+        args.extend(["--warmup".into(), "full".into()]);
+    }
+    args.extend([
+        "--slice-cache".into(),
+        if opts.warm_slices { "warm" } else { "cold" }.into(),
+        "--tree-cache".into(),
+        if opts.cold_tree { "cold" } else { "warm" }.into(),
+    ]);
     if let Some(seconds) = opts.export_seconds {
         args.extend(["--export-seconds".into(), seconds.to_string().into()]);
     }
@@ -982,7 +1512,7 @@ fn slice_child_command(
     repo: &Path,
     root: &Path,
     commit: &str,
-    demoted: bool,
+    opts: &Options,
     shares: &aterm_capacity::BranchShares,
 ) -> Result<aterm_uds::spawnfd::Command, String> {
     let mut command = aterm_uds::spawnfd::command(image);
@@ -991,7 +1521,13 @@ fn slice_child_command(
         .arg(repo)
         .arg(root)
         .arg(commit)
-        .arg(if demoted { "demoted" } else { "normal" })
+        .arg(if opts.mode == "tree" {
+            "demoted"
+        } else {
+            "normal"
+        })
+        .arg(if opts.warm_slices { "warm" } else { "cold" })
+        .arg(if opts.real_export { "full" } else { "slices" })
         .current_dir(repo);
     shares
         .hand_to(&mut command, false)
@@ -1044,12 +1580,96 @@ fn next_slice_child_event(
     }
 }
 
-fn shared_ready_shape(event: &aterm_json::Value, minimum: u64) -> bool {
+trait PilotSliceProcess {
+    fn owns_unreaped(&self) -> bool;
+    fn kill_for_custody(&mut self) -> std::io::Result<()>;
+    fn reap_for_custody(&mut self) -> std::io::Result<()>;
+}
+
+impl PilotSliceProcess for aterm_uds::spawnfd::Child {
+    fn owns_unreaped(&self) -> bool {
+        aterm_uds::spawnfd::Child::owns_unreaped(self)
+    }
+
+    fn kill_for_custody(&mut self) -> std::io::Result<()> {
+        aterm_uds::spawnfd::Child::kill(self)
+    }
+
+    fn reap_for_custody(&mut self) -> std::io::Result<()> {
+        aterm_uds::spawnfd::Child::wait(self).map(|_| ())
+    }
+}
+
+/// Keeps the actual slice child owned across every early return from the pilot.
+struct PilotSliceChild<Process: PilotSliceProcess>(Process);
+
+impl<Process: PilotSliceProcess> PilotSliceChild<Process> {
+    fn new(process: Process) -> Self {
+        Self(process)
+    }
+}
+
+impl<Process: PilotSliceProcess> std::ops::Deref for PilotSliceChild<Process> {
+    type Target = Process;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<Process: PilotSliceProcess> std::ops::DerefMut for PilotSliceChild<Process> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<Process: PilotSliceProcess> Drop for PilotSliceChild<Process> {
+    fn drop(&mut self) {
+        if self.0.owns_unreaped() {
+            let _ = self.0.kill_for_custody();
+            let _ = self.0.reap_for_custody();
+        }
+    }
+}
+
+fn ready_shape(event: &aterm_json::Value, minimum: u64) -> bool {
+    let label = match event["mode"].as_str() {
+        Some("shared") => "release slice memory budget",
+        Some("serial") => crate::slice_units::SERIAL_PARENT,
+        Some("cold") => crate::slice_units::COLD_PARENT,
+        _ => return false,
+    };
+    let Some(mem) = event["mem"].as_u64() else {
+        return false;
+    };
     event["event"].as_str() == Some("slice-memory-ready")
         && event["held"].as_bool() == Some(true)
-        && event["mode"].as_str() == Some("shared")
-        && event["label"].as_str() == Some("release slice memory budget")
-        && event["mem"].as_u64().is_some_and(|mem| mem >= minimum)
+        && event["label"].as_str() == Some(label)
+        && if event["mode"].as_str() == Some("cold") {
+            mem == minimum
+        } else {
+            mem >= minimum
+        }
+}
+
+fn ready_record_matches(
+    event: &aterm_json::Value,
+    child_pid: u32,
+    alone: bool,
+    record: &aterm_capacity::Record,
+) -> bool {
+    let identity = &event["claim"];
+    record.pid == child_pid
+        && identity["pid"].as_u64() == Some(u64::from(child_pid))
+        && identity["start_ms"].as_u64() == Some(record.start_ms)
+        && identity["seq"].as_u64() == Some(record.seq)
+        && event["label"].as_str() == Some(record.need.what.as_str())
+        && event["mem"].as_u64() == Some(record.need.mem)
+        && record.accounting == aterm_capacity::Accounting::Holder
+        && record.need.rank == aterm_capacity::Rank::Release
+        && record.need.margin == 1
+        && record.need.alone == alone
+        && record.held.is_some_and(|held| held.alone == alone)
 }
 
 fn ready_claim_is_live(event: &aterm_json::Value, child_pid: u32) -> Result<bool, String> {
@@ -1058,41 +1678,51 @@ fn ready_claim_is_live(event: &aterm_json::Value, child_pid: u32) -> Result<bool
     {
         return Err(format!("slice child reported no held memory gate: {event}"));
     }
-    if event["mode"].as_str() == Some("build-ended") {
-        return Ok(true);
-    }
-    if event["mode"].as_str() != Some("shared") {
-        return Err(format!("slice child memory gate has unknown mode: {event}"));
-    }
-    let minimum = crate::slice_units::live_shared_floor(2);
-    if !shared_ready_shape(event, minimum) {
+    let shared = crate::slice_units::live_shared_floor(2);
+    let (minimum, alone) = match event["mode"].as_str() {
+        Some("shared") => (shared, false),
+        Some("serial") => (
+            crate::slice_units::serial_parent_bytes(
+                shared.saturating_sub(2 * crate::slice_units::DRIVER),
+            ),
+            false,
+        ),
+        Some("cold") => (crate::slice_units::DRIVER, true),
+        _ => return Err(format!("slice child memory gate has unknown mode: {event}")),
+    };
+    if !ready_shape(event, minimum) {
         return Err(format!(
-            "slice child shared memory gate has the wrong label or reservation: {event}"
+            "slice child memory gate has the wrong label or reservation: {event}"
         ));
     }
     let identities = [event];
     let ledger = aterm_capacity::Ledger::user().ok_or("no user capacity ledger")?;
     let matches = |records: &[aterm_capacity::Record]| {
         identities.iter().all(|claim| {
-            let identity = &claim["claim"];
-            records.iter().any(|record| {
-                record.pid == child_pid
-                    && identity["pid"].as_u64() == Some(u64::from(child_pid))
-                    && identity["start_ms"].as_u64() == Some(record.start_ms)
-                    && identity["seq"].as_u64() == Some(record.seq)
-                    && claim["label"].as_str() == Some(record.need.what.as_str())
-                    && claim["mem"].as_u64() == Some(record.need.mem)
-                    && record.accounting == aterm_capacity::Accounting::Holder
-                    && record.need.rank == aterm_capacity::Rank::Release
-                    && record.need.margin == 1
-                    && record.held.is_some_and(|held| !held.alone)
-            })
+            records
+                .iter()
+                .any(|record| ready_record_matches(claim, child_pid, alone, record))
         })
     };
     // Two complete scans reject a directory read that straddled a claim's removal.
     let first = ledger.list().map_err(|error| error.to_string())?;
     let second = ledger.list().map_err(|error| error.to_string())?;
     Ok(matches(&first) && matches(&second))
+}
+
+fn serial_before_tree<T>(
+    serial: bool,
+    release: impl FnOnce() -> Result<(), String>,
+    completed: impl FnOnce() -> Result<T, String>,
+    drained: impl FnOnce(),
+) -> Result<Option<T>, String> {
+    if !serial {
+        return Ok(None);
+    }
+    release()?;
+    let result = completed()?;
+    drained();
+    Ok(Some(result))
 }
 
 /// The release-shaped shared and chain takes use the fixed admission order. `tree` deliberately
@@ -1254,8 +1884,17 @@ fn export_surrogate(
     })
 }
 
-fn one(repo: &Path, root: &Path, opts: &Options, slots: u32, commit: &str) -> Result<(), String> {
+fn one(
+    repo: &Path,
+    root: &Path,
+    opts: &Options,
+    slots: u32,
+    commit: &str,
+    environment: Option<&aterm_verify::EnvSnapshot>,
+    arm: &str,
+) -> Result<(), String> {
     let pid = std::process::id();
+    let cpu_before = aterm_sysprobe::jobs::cpu_with_reaped_ns(pid);
     println!(
         "qualify-pilot: {} S={} mode={}",
         root.display(),
@@ -1266,13 +1905,17 @@ fn one(repo: &Path, root: &Path, opts: &Options, slots: u32, commit: &str) -> Re
     let mut samples =
         crate::durable::create_fresh(&root.join("processes.jsonl")).map_err(|e| e.to_string())?;
     let started = Instant::now();
+    let started_at_unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs_f64());
     let export_seconds = opts.export_seconds();
     let export_share = crate::release_steps::export_share(slots, export_seconds.is_some(), true);
     let shares = aterm_capacity::BranchShares::new(
         &root.join("qualify.jobs"),
         slots,
         export_share,
-        [true, true],
+        [true, opts.mode != "alone"],
     )
     .map_err(|error| format!("create the qualify branch shares: {error}"))?;
     let barrier_slots = admission_barrier_share(opts, slots, export_share);
@@ -1292,6 +1935,7 @@ fn one(repo: &Path, root: &Path, opts: &Options, slots: u32, commit: &str) -> Re
                 format!("reserve the admission barrier's {barrier_slots} branch tokens: {error}")
             })?,
     );
+    let export_client = std::sync::OnceLock::new();
     if barrier
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1307,720 +1951,373 @@ fn one(repo: &Path, root: &Path, opts: &Options, slots: u32, commit: &str) -> Re
                 .map_or(0, aterm_capacity::InitialReservation::len)
         ));
     }
-    let (slices, tree, export, memory_ready, tree_memory_ready, build_usage) = std::thread::scope(
-        |scope| -> Result<_, String> {
-            let (done, receiver) = std::sync::mpsc::channel::<()>();
-            let sampler = scope.spawn(move || -> Result<(), String> {
-                let mut global = BTreeMap::new();
-                loop {
-                    writeln!(
-                        samples,
-                        "{}",
-                        sample(pid, root, started.elapsed().as_secs_f64(), &mut global)
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if receiver.recv_timeout(Duration::from_secs(1))
-                        != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    {
-                        break;
-                    }
-                }
-                Ok(())
-            });
-
-            let image = std::env::current_exe()
-                .map_err(|error| format!("find qualify pilot executable: {error}"))?;
-            let build_finished = FinishPilotShare {
-                shares: &shares,
-                branch: 0,
-                admission_barrier: Some(&barrier),
-            };
-            let mut command =
-                slice_child_command(&image, repo, root, commit, opts.mode == "tree", &shares)?;
-            let stderr = crate::durable::create_fresh(&root.join("slice-child.stderr"))
-                .map_err(|error| error.to_string())?;
-            let transcript = crate::durable::create_fresh(&root.join("slice-child.stdout"))
-                .map_err(|error| error.to_string())?;
-            command
-                .stdout(aterm_uds::spawnfd::Stdio::piped())
-                .stderr(stderr);
-            let mut child = command
-                .spawn()
-                .map_err(|error| format!("start qualify pilot slice child: {error}"))?;
-            let child_pid = child.id();
-            let Some(stdout) = child.stdout.take() else {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("qualify pilot slice child has no output pipe".into());
-            };
-            let (send_event, events) = std::sync::mpsc::channel();
-            let relay =
-                scope.spawn(move || relay_slice_child_events(stdout, transcript, send_event));
-            let prepared = next_slice_child_event(&events, &mut child, "preparation")?;
-            if prepared["event"].as_str() != Some("prepared") {
-                return Err(format!(
-                    "slice child did not prepare its sealed source: {prepared}"
-                ));
-            }
-            let tree_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let tree_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (tree_started, tree_pid) = std::sync::mpsc::channel();
-            let admission =
-                (barrier_slots > 0 || opts.mode == "tree").then_some(TreeAdmissionSignal {
-                    started: tree_started,
-                    ended: std::sync::Arc::clone(&tree_ended),
-                    stop: std::sync::Arc::clone(&tree_stop),
-                });
-            let (memory_ready, tree, old_order_tree_pid) = start_tree_around_memory(
-                &opts.mode,
-                || {
-                    let ready = next_slice_child_event(&events, &mut child, "memory admission")?;
-                    if !ready_claim_is_live(&ready, child_pid)? {
-                        return Err("slice child memory gate was not durably live".into());
-                    }
-                    Ok(ready)
-                },
-                || scope.spawn(|| tree(repo, root, opts, &shares, Some(&barrier), admission)),
-                || {
-                    tree_pid
-                        .recv()
-                        .map_err(|_| "release tree ended before reporting its process".to_owned())
-                },
-            )?;
-            let tree_memory_ready = if barrier_slots > 0 {
-                let tree_pid = match old_order_tree_pid {
-                    Some(pid) => pid,
-                    None => tree_pid.recv().map_err(|_| {
-                        "release tree ended before reporting its process".to_owned()
-                    })?,
-                };
-                let ready = await_tree_memory(tree_pid, &tree_ended, barrier_slots)?;
-                if ready["queued"].as_bool() == Some(true)
-                    || ready["invalid"].as_bool() == Some(true)
+    let (
+        slices,
+        tree,
+        export,
+        fixtures,
+        serial_export,
+        graph_wall_s,
+        memory_ready,
+        tree_memory_ready,
+        build_usage,
+        appkit,
+    ) = std::thread::scope(|scope| -> Result<_, String> {
+        let (done, receiver) = std::sync::mpsc::channel::<()>();
+        let sampler = scope.spawn(move || -> Result<(), String> {
+            let mut global = BTreeMap::new();
+            loop {
+                writeln!(
+                    samples,
+                    "{}",
+                    sample(pid, root, started.elapsed().as_secs_f64(), &mut global)
+                )
+                .map_err(|e| e.to_string())?;
+                if receiver.recv_timeout(Duration::from_secs(1))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 {
-                    if let Some(reservation) = barrier
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                    {
-                        reservation
-                            .release_to_build()
-                            .map_err(|error| format!("serialize qualify onto build: {error}"))?;
-                    }
-                    if ready["invalid"].as_bool() == Some(true) {
-                        tree_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                } else {
-                    barrier
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
+                    break;
                 }
-                ready
-            } else {
-                aterm_json::json!({
-                    "event":"tree-memory-ready",
-                    "held":false,
-                    "mode":if opts.mode == "tree" { "tree-first-probe" } else { "not-release-shaped" },
-                    "barrier_slots":0,
+            }
+            Ok(())
+        });
+
+        // The common series reservation holds the matched grant throughout each take.
+        // AppKit adopts no branch pool: its production --admit now command runs alone,
+        // before either slice memory parent or the tree starts.
+        let appkit = opts
+            .real_export
+            .then(|| crate::release_steps::measure_local_appkit(repo, &root.join("appkit"), commit))
+            .transpose()?;
+        if opts.real_export {
+            let client = crate::release_steps::prepare_local_export_client(
+                repo,
+                &root.join("preparation"),
+                commit,
+                slots,
+            )?;
+            export_client
+                .set(client)
+                .map_err(|_| "the export client was already prepared".to_owned())?;
+        }
+        let client = export_client.get();
+
+        let image = std::env::current_exe()
+            .map_err(|error| format!("find qualify pilot executable: {error}"))?;
+        let build_finished = FinishPilotShare {
+            shares: &shares,
+            branch: 0,
+            admission_barrier: Some(&barrier),
+        };
+        let mut command = slice_child_command(&image, repo, root, commit, opts, &shares)?;
+        let stderr = crate::durable::create_fresh(&root.join("slice-child.stderr"))
+            .map_err(|error| error.to_string())?;
+        let transcript = crate::durable::create_fresh(&root.join("slice-child.stdout"))
+            .map_err(|error| error.to_string())?;
+        command
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(stderr);
+        let mut child = PilotSliceChild::new(
+            command
+                .spawn()
+                .map_err(|error| format!("start qualify pilot slice child: {error}"))?,
+        );
+        let child_pid = child.id();
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("qualify pilot slice child has no output pipe".into());
+        };
+        let (send_event, events) = std::sync::mpsc::channel();
+        let relay = scope.spawn(move || relay_slice_child_events(stdout, transcript, send_event));
+        let prepared = next_slice_child_event(&events, &mut child, "preparation")?;
+        if prepared["event"].as_str() != Some("prepared") {
+            return Err(format!(
+                "slice child did not prepare its sealed source: {prepared}"
+            ));
+        }
+        let tree_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tree_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tree_started, tree_pid) = std::sync::mpsc::channel();
+        let admission = (barrier_slots > 0 || opts.mode == "tree").then_some(TreeAdmissionSignal {
+            started: tree_started,
+            ended: std::sync::Arc::clone(&tree_ended),
+            stop: std::sync::Arc::clone(&tree_stop),
+        });
+        let serial_ended = std::sync::Mutex::new(None);
+        let (memory_ready, tree, old_order_tree_pid) = start_tree_around_memory(
+            &opts.mode,
+            || {
+                let mut ready = next_slice_child_event(&events, &mut child, "memory admission")?;
+                if !ready_claim_is_live(&ready, child_pid)? {
+                    return Err("slice child memory gate was not durably live".into());
+                }
+                let serial_start = started.elapsed().as_secs_f64();
+                let ended = serial_before_tree(
+                    barrier_slots > 0 && matches!(ready["mode"].as_str(), Some("serial" | "cold")),
+                    || {
+                        if let Some(reservation) = barrier
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
+                            reservation
+                                .release_to_build()
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(())
+                    },
+                    || {
+                        let ended =
+                            next_slice_child_event(&events, &mut child, "serial slice results")?;
+                        if ended["event"].as_str() != Some("ended") {
+                            return Err(format!("serial slices did not drain: {ended}"));
+                        }
+                        Ok(ended)
+                    },
+                    || opts.build_return.drain(&shares),
+                )?;
+                if let Some(ended) = ended {
+                    let details = ready
+                        .as_object_mut()
+                        .ok_or("slice admission is not an object")?;
+                    details.insert("serial_build_start_s".into(), serial_start.into());
+                    details.insert(
+                        "serial_build_end_s".into(),
+                        started.elapsed().as_secs_f64().into(),
+                    );
+                    *serial_ended
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ended);
+                }
+                Ok(ready)
+            },
+            || {
+                scope.spawn(|| {
+                    tree(
+                        repo,
+                        root,
+                        opts,
+                        &shares,
+                        Some(&barrier),
+                        admission,
+                        environment,
+                    )
                 })
+            },
+            || {
+                tree_pid
+                    .recv()
+                    .map_err(|_| "release tree ended before reporting its process".to_owned())
+            },
+        )?;
+        let tree_memory_ready = if barrier_slots > 0 {
+            let tree_pid = match old_order_tree_pid {
+                Some(pid) => pid,
+                None => tree_pid
+                    .recv()
+                    .map_err(|_| "release tree ended before reporting its process".to_owned())?,
             };
-            let export = export_seconds.map(|seconds| {
-                let shares = &shares;
-                scope.spawn(move || {
-                    if opts.real_export {
-                        let _finished = FinishPilotShare {
-                            shares,
-                            branch: 2,
-                            admission_barrier: None,
-                        };
-                        crate::release_steps::measure_local_export(
-                            repo,
-                            &root.join("export"),
-                            commit,
-                            export_share,
-                        )
-                    } else {
-                        Ok(export_surrogate(shares, export_share, seconds))
-                    }
-                })
-            });
-            let ended = next_slice_child_event(&events, &mut child, "slice results")?;
-            if ended["event"].as_str() != Some("ended") {
-                return Err(format!("slice child did not report its results: {ended}"));
+            let ready = await_tree_memory(tree_pid, &tree_ended, barrier_slots)?;
+            if ready["queued"].as_bool() == Some(true) || ready["invalid"].as_bool() == Some(true) {
+                if let Some(reservation) = barrier
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    reservation
+                        .release_to_build()
+                        .map_err(|error| format!("serialize qualify onto build: {error}"))?;
+                }
+                if ready["invalid"].as_bool() == Some(true) {
+                    tree_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            } else {
+                barrier
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
             }
-            let slices = ended["slices"]
-                .as_array()
-                .cloned()
-                .ok_or("slice child result is not an array")?;
-            let build_usage = child
-                .wait_with_rusage()
-                .map_err(|error| format!("wait for qualify pilot slice child: {error}"))?;
-            drop(build_finished);
-            let relayed = relay
-                .join()
-                .map_err(|_| "slice child event relay panicked".to_owned())?;
-            relayed?;
-            if !build_usage.status.success() {
-                return Err(format!(
-                    "qualify pilot slice child failed ({}) — see {}",
-                    build_usage.status,
-                    root.join("slice-child.stderr").display()
-                ));
-            }
-            let tree = tree.join().map_err(|_| "pilot tree panicked")??;
-            let export = export
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| "pilot export panicked".to_owned())?
-                })
-                .transpose()?;
-            drop(done);
-            sampler.join().map_err(|_| "pilot sampler panicked")??;
-            Ok((
-                slices,
-                tree,
-                export,
-                memory_ready,
-                tree_memory_ready,
-                aterm_json::json!({
-                    "pid":child_pid,
-                    "cpu_s":build_usage.cpu.as_secs_f64(),
-                    "peak_bytes":build_usage.maxrss,
-                }),
-            ))
-        },
-    )?;
+            ready
+        } else {
+            aterm_json::json!({
+                "event":"tree-memory-ready",
+                "held":false,
+                "mode":if opts.mode == "tree" { "tree-first-probe" } else { "not-release-shaped" },
+                "barrier_slots":0,
+            })
+        };
+        let export = export_seconds.map(|seconds| {
+            let shares = &shares;
+            scope.spawn(move || {
+                if opts.real_export {
+                    let _finished = FinishPilotShare {
+                        shares,
+                        branch: 2,
+                        admission_barrier: None,
+                    };
+                    crate::release_steps::measure_local_export(
+                        repo,
+                        &root.join("export"),
+                        commit,
+                        export_share,
+                        client,
+                    )
+                } else {
+                    Ok(export_surrogate(shares, export_share, seconds))
+                }
+            })
+        });
+        let prefetched = serial_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let ended = match prefetched {
+            Some(ended) => ended,
+            None => next_slice_child_event(&events, &mut child, "slice results")?,
+        };
+        if ended["event"].as_str() != Some("ended") {
+            return Err(format!("slice child did not report its results: {ended}"));
+        }
+        let slices = ended["slices"]
+            .as_array()
+            .cloned()
+            .ok_or("slice child result is not an array")?;
+        let build_usage = child
+            .wait_with_rusage()
+            .map_err(|error| format!("wait for qualify pilot slice child: {error}"))?;
+        if opts.real_export {
+            require_unsigned_build(&ended, commit)?;
+        }
+        let fixtures = if opts.real_export {
+            opts.build_return.drain(&shares);
+            Some(crate::release_steps::measure_local_fixtures(
+                repo,
+                &root.join("fixtures"),
+                commit,
+                &tree_ended,
+                (opts.build_return == BuildReturn::Early).then_some(&shares),
+            )?)
+        } else {
+            None
+        };
+        drop(build_finished);
+        let relayed = relay
+            .join()
+            .map_err(|_| "slice child event relay panicked".to_owned())?;
+        relayed?;
+        if !build_usage.status.success() {
+            return Err(format!(
+                "qualify pilot slice child failed ({}) — see {}",
+                build_usage.status,
+                root.join("slice-child.stderr").display()
+            ));
+        }
+        let tree = tree.join().map_err(|_| "pilot tree panicked")??;
+        let export = export
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "pilot export panicked".to_owned())?
+            })
+            .transpose()?;
+        let graph_wall_s = started.elapsed().as_secs_f64();
+        let serial_export = if opts.real_export
+            && !opts.planted_red
+            && export
+                .as_ref()
+                .is_some_and(|value| value["success"].as_bool() == Some(true))
+        {
+            Some(crate::release_steps::measure_local_export(
+                repo,
+                &root.join("serial-export"),
+                commit,
+                slots,
+                client,
+            )?)
+        } else {
+            None
+        };
+        drop(done);
+        sampler.join().map_err(|_| "pilot sampler panicked")??;
+        Ok((
+            slices,
+            tree,
+            export,
+            fixtures,
+            serial_export,
+            graph_wall_s,
+            memory_ready,
+            tree_memory_ready,
+            aterm_json::json!({
+                "pid":child_pid,
+                "cpu_s":build_usage.cpu.as_secs_f64(),
+                "peak_bytes":build_usage.maxrss,
+                "preparation":prepared,
+                "postlink":ended["postlink"],
+            }),
+            appkit,
+        ))
+    })?;
     let (verify_sha256, _) = crate::dmg::sha256_and_size(&opts.verify)?;
-    let report = aterm_json::json!({"mode":opts.mode,"tree_work":opts.tree_work.as_str(),"source":commit,"slots":slots,"wall_s":started.elapsed().as_secs_f64(),"slices":slices,"tree":tree,"export":export,"export_share":export_share,"branch_fifos":{"build":shares.pool(false).path(),"tree":shares.pool(true).path()},"slice_memory_ready":memory_ready,"tree_memory_ready":tree_memory_ready,"build_child":build_usage,"verify_sha256":verify_sha256,"verify":opts.verify});
+    let marker = std::fs::read_to_string(root.join("planted-red.json"))
+        .ok()
+        .and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok());
+    let planted_failure_marker_s = marker
+        .as_ref()
+        .and_then(|marker| marker["at_unix_ns"].as_str())
+        .and_then(|stamp| stamp.parse::<u128>().ok())
+        .zip(started_at_unix_s)
+        .map(|(stamp, start)| stamp as f64 / 1e9 - start)
+        .filter(|elapsed| *elapsed >= 0.0);
+    // Every branch child has been reaped and the sampler has joined. A single kernel delta
+    // counts the coordinator and reaped descendants once despite overlapping branch timers.
+    let cpu_s = cpu_before
+        .zip(aterm_sysprobe::jobs::cpu_with_reaped_ns(pid))
+        .and_then(|(before, after)| after.checked_sub(before))
+        .map(|ns| ns as f64 / 1e9);
+    let report = aterm_json::json!({
+        "mode":opts.mode, "tree_work":opts.tree_work.as_str(),
+        "build_return":opts.build_return.as_str(),
+        "tree_cache":if opts.cold_tree {"cold"} else {"warm"},
+        "slice_cache":if opts.warm_slices {"warm"} else {"cold"},
+        "source":commit, "slots":slots, "started_at_unix_s":started_at_unix_s,
+        "arm":arm, "measured":arm != "warmup",
+        "wall_s":started.elapsed().as_secs_f64(), "cpu_s":cpu_s,
+        "cpu_scope":"coordinator-and-reaped-descendants",
+        "preparation":export_client.get().map(crate::release_steps::LocalExportClient::record),
+        "appkit":appkit,
+        "graph_wall_s":graph_wall_s, "slices":slices, "tree":tree, "export":export,
+        "fixtures":fixtures, "serial_export":serial_export, "planted_red":marker,
+        "planted_failure_marker_s":planted_failure_marker_s, "serial_staging_push_s":null,
+        "export_share":export_share,
+        "branch_fifos":{"build":shares.pool(false).path(),"tree":shares.pool(true).path()},
+        "slice_memory_ready":memory_ready, "tree_memory_ready":tree_memory_ready,
+        "build_child":build_usage, "verify_sha256":verify_sha256, "verify":opts.verify,
+    });
     crate::durable::write_fresh(&root.join("result.json"), report.to_string())
         .map_err(|e| e.to_string())?;
-    println!("qualify-pilot-result: {report}");
+    let prefix = if arm == "warmup" {
+        "qualify-pilot-warmup-result"
+    } else {
+        "qualify-pilot-result"
+    };
+    println!("{prefix}: {report}");
+    if opts.planted_red && planted_failure_marker_s.is_none() {
+        return Err("the expected red has no measured failure timestamp".into());
+    }
     if opts.real_export && report["export"]["success"].as_bool() != Some(true) {
         return Err("the full export failed; the take is not a passing gate".into());
+    }
+    if opts.real_export
+        && !opts.planted_red
+        && report["serial_export"]["success"].as_bool() != Some(true)
+    {
+        return Err("the serial local revalidation failed; the take is not a passing gate".into());
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(unix)]
-    #[test]
-    fn observing_a_private_fifo_does_not_spend_its_tokens() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.jobs");
-        let pool = aterm_capacity::Jobserver::new(&path, 3).unwrap();
-        assert_eq!(fifo_snapshot(&path)["available_tokens"].as_u64(), Some(3));
-        let token = pool.try_acquire().unwrap().unwrap();
-        assert_eq!(fifo_snapshot(&path)["available_tokens"].as_u64(), Some(2));
-        assert_eq!(fifo_snapshot(&path)["available_tokens"].as_u64(), Some(2));
-        drop(token);
-        assert_eq!(fifo_snapshot(&path)["available_tokens"].as_u64(), Some(3));
-        assert!(fifo_snapshot(&dir.path().join("missing"))["available_tokens"].is_null());
-    }
-    #[test]
-    fn matched_takes_use_one_priority_and_real_export_cannot_take_a_surrogate_wall() {
-        let options = parse(
-            [
-                "--verify",
-                "after",
-                "--before-verify",
-                "before",
-                "--mode",
-                "matched",
-                "--tree-work",
-                "release",
-                "--export-work",
-                "real",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )
-        .unwrap();
-        assert_eq!(order(&options.mode), ["before", "after", "after", "before"]);
-        assert!(options.real_export);
-        assert_eq!(options.export_seconds(), Some(0));
-        let mut frozen = options.clone();
-        frozen.verify = PathBuf::from("/frozen/aterm-verify");
-        let arguments = frozen_arguments(&options, &frozen.verify);
-        let decoded = parse(
-            arguments
-                .into_iter()
-                .skip(1)
-                .map(|argument| argument.into_string().unwrap()),
-        )
-        .unwrap();
-        assert_eq!(decoded, frozen);
-        assert!(
-            parse(
-                ["--verify", "after", "--mode", "matched",]
-                    .into_iter()
-                    .map(str::to_owned)
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                [
-                    "--verify",
-                    "after",
-                    "--mode",
-                    "shared",
-                    "--export-work",
-                    "real",
-                    "--export-seconds",
-                    "763",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn series_refuses_a_partial_grant_before_any_take_but_single_takes_can_measure_it() {
-        assert_eq!(reservation().rank, aterm_capacity::Rank::Release);
-        assert_eq!(reservation().cores, 0);
-        assert_eq!(reservation().mem, 0);
-        assert!(require_series_grant("series", 18, 18).is_ok());
-        assert!(require_series_grant("series", 18, 4).is_err());
-        assert!(require_series_grant("alone", 18, 4).is_ok());
-    }
-    #[test]
-    fn tree_first_probe_starts_tree_before_slice_memory_admission() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let (memory, tree, started) = start_tree_around_memory(
-            "tree",
-            || {
-                events.borrow_mut().push("memory");
-                Ok(1)
-            },
-            || {
-                events.borrow_mut().push("tree");
-                2
-            },
-            || {
-                events.borrow_mut().push("tree-started");
-                Ok(3)
-            },
-        )
-        .unwrap();
-        assert_eq!((memory, tree), (1, 2));
-        assert_eq!(started, Some(3));
-        assert_eq!(&*events.borrow(), &["tree", "tree-started", "memory"]);
-
-        events.borrow_mut().clear();
-        let (_, _, started) = start_tree_around_memory(
-            "shared",
-            || {
-                events.borrow_mut().push("memory");
-                Ok(())
-            },
-            || events.borrow_mut().push("tree"),
-            || -> Result<(), String> {
-                panic!("the fixed order consumes its start handshake after memory admission")
-            },
-        )
-        .unwrap();
-        assert_eq!(started, None);
-        assert_eq!(
-            &*events.borrow(),
-            &["memory", "tree"],
-            "moving the control to the fixed order is the negative mutation"
-        );
-    }
-    #[test]
-    fn snapshotting_starts_under_a_live_reservation_and_failure_releases_it() {
-        struct Guard<'a>(&'a std::cell::Cell<bool>);
-        impl Drop for Guard<'_> {
-            fn drop(&mut self) {
-                self.0.set(false);
-            }
-        }
-        let live = std::cell::Cell::new(false);
-        let reserve = || {
-            live.set(true);
-            Ok(Guard(&live))
-        };
-        let (guard, ()) = under_reservation(reserve, || {
-            assert!(live.get(), "snapshot preparation must already see Release");
-            Ok(())
-        })
-        .unwrap();
-        assert!(live.get());
-        drop(guard);
-        assert!(!live.get());
-        // Negative control: a failed snapshot must not strand a Release reservation.
-        let failed = under_reservation(reserve, || Err::<(), _>("snapshot failed".into()));
-        assert!(failed.is_err());
-        assert!(!live.get());
-    }
-    #[test]
-    fn contention_workload_matches_release_checks_without_pulled_cells_or_wasm() {
-        use aterm_verify::checks::Check;
-        for (work, expected) in [
-            (TreeWork::CompileTests, Check::Test),
-            (TreeWork::Lint, Check::Lint),
-        ] {
-            let parsed = aterm_verify::cli::parse(work.arguments()).unwrap();
-            assert_eq!(parsed.wanted(|_| true), vec![expected]);
-            assert_eq!(parsed.compile_only, expected == Check::Test);
-            assert!(!aterm_verify::checks::pulls_cells(
-                &parsed.wanted(|_| true),
-                parsed.release,
-                true
-            ));
-        }
-        // Negative controls: standalone invocations add work no release tree runs.
-        let old_test = aterm_verify::cli::parse(["test", "--all", "--compile-only"]).unwrap();
-        assert!(old_test.wanted(|_| true).contains(&Check::WasmSmoke));
-        let old_lint = aterm_verify::cli::parse(["lint", "--all"]).unwrap();
-        assert!(aterm_verify::checks::pulls_cells(
-            &old_lint.wanted(|_| true),
-            old_lint.release,
-            true
-        ));
-    }
-    #[test]
-    fn a_tree_cargo_stays_tree_work_and_an_unrelated_cargo_does_not() {
-        let tree = aterm_json::json!({"pid":2,"ppid":1,"name":"aterm-verify"});
-        let cargo = aterm_json::json!({"pid":3,"ppid":2,"name":"targo"});
-        let compiler = aterm_json::json!({"pid":4,"ppid":3,"name":"trustc"});
-        let other = aterm_json::json!({"pid":5,"ppid":1,"name":"cargo"});
-        let rows = BTreeMap::from([(2, &tree), (3, &cargo), (4, &compiler), (5, &other)]);
-        assert_eq!(branch(&compiler, &rows, "aterm-verify"), "tree");
-        assert_eq!(branch(&cargo, &rows, "aterm-verify"), "tree");
-        assert_eq!(branch(&other, &rows, "aterm-verify"), "compat");
-        let renamed = aterm_json::json!({"pid":2,"ppid":1,"name":"verify-before"});
-        let renamed_rows = BTreeMap::from([(2, &renamed), (3, &cargo), (4, &compiler)]);
-        assert_eq!(branch(&compiler, &renamed_rows, "verify-before"), "tree");
-        assert_eq!(branch(&compiler, &renamed_rows, "aterm-verify"), "native");
-        let missing: Result<u64, i32> = Err(3);
-        assert!(observation(missing)["value"].is_null());
-        assert_eq!(observation(Ok(0_u64))["value"].as_u64(), Some(0));
-    }
-    #[test]
-    fn cargo_nested_unit_events_survive_summary_and_a_partial_chain_is_refused() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("result.json"), "{\"slots\":1}").unwrap();
-        let sample = aterm_json::json!({"elapsed_s":1.0,"at_unix_s":100.0,"capacity":{
-            "global":{"error":null,"records":[{"what":"release slice memory budget","mem":49478023296_u64}]},
-            "slice_budget":{"error":null,"records":[{"what":"release slice x86_64 unit aterm link","mem":24696061952_u64}]}
-        },"members":[
-            {"pid":4,"start":1,"name":"trustc","cpu_ns":1000000000_u64,"runnable_ns":1200000000_u64},
-            {"pid":5,"start":1,"name":"trustc","cpu_ns":1000000000_u64,"runnable_ns":1200000000_u64}
-        ]});
-        let private_unread = aterm_json::json!({"elapsed_s":2.0,"at_unix_s":101.0,"capacity":{
-            "global":{"error":null,"records":[]},
-            "slice_budget":{"error":"unread","records":null}
-        },"members":[]});
-        std::fs::write(
-            dir.path().join("processes.jsonl"),
-            format!("{sample}\n{private_unread}\n"),
-        )
-        .unwrap();
-        for triple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
-            let start = aterm_json::json!({"reason":"compiler-message","message":{"event":"release-slice-unit","phase":"started","pid":3,"compiler_pid":4,"queued_unix_s":10.0,"at_unix_s":11.0,"package":"aterm","unit":"aterm bin","memory_waiting_s":0.5,"memory_waited_for":{"reason":"memory short","holders":[{"pid":8,"what":"release slice x86_64 unit aterm link","claimed_bytes":24696061952_u64}]}}});
-            let end = aterm_json::json!({"reason":"compiler-message","message":{"event":"release-slice-unit","phase":"ended","pid":3,"queued_unix_s":10.0,"at_unix_s":15.0,"cpu_s":2.0,"package":"aterm","unit":"aterm bin","success":true}});
-            std::fs::write(
-                dir.path().join(format!("{triple}.messages.jsonl")),
-                format!("{start}\n{end}\n{{\"reason\":\"compiler-artifact\",\"fresh\":false,\"filenames\":[]}}\n{{\"reason\":\"compiler-artifact\",\"fresh\":true,\"filenames\":[]}}\n"),
-            )
-            .unwrap();
-        }
-        summarize(dir.path()).unwrap();
-        let summary: aterm_json::Value = aterm_json::from_str(
-            &std::fs::read_to_string(dir.path().join("summary.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(summary["completed_units"].as_u64(), Some(2));
-        assert_eq!(summary["artifacts"][0]["compiled"].as_u64(), Some(1));
-        assert_eq!(summary["artifacts"][0]["fresh"].as_u64(), Some(1));
-        assert_eq!(summary["compiler_count_over_slots_s"].as_f64(), Some(1.0));
-        assert_eq!(summary["global_capacity_samples"].as_u64(), Some(2));
-        assert_eq!(summary["private_capacity_samples"].as_u64(), Some(1));
-        assert_eq!(
-            summary["private_capacity_unavailable_samples"].as_u64(),
-            Some(1),
-            "NEGATIVE CONTROL: global readability cannot stand in for the private ledger"
-        );
-        assert_eq!(summary["capacity_timeline"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            summary["capacity_timeline"][0]["at_unix_s"].as_f64(),
-            Some(100.0),
-            "unit events and holder snapshots retain the same epoch clock"
-        );
-        assert_eq!(
-            summary["slice_unit_admission_wait"]["waited_units"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            summary["slice_unit_admission_wait"]["waited_units"][0]["memory_waited_for"]["holders"]
-                [0]["what"]
-                .as_str(),
-            Some("release slice x86_64 unit aterm link")
-        );
-        let units = summary["critical_units"].as_array().unwrap();
-        assert_eq!(units.len(), 2);
-        assert_eq!(units[0]["wall_s"].as_f64(), Some(4.0));
-        assert_eq!(units[0]["cpu_s"].as_f64(), Some(2.0));
-        assert_eq!(units[0]["pre_spawn_s"].as_f64(), Some(1.0));
-        assert_eq!(units[0]["sampled_compiler_cpu_s"].as_f64(), Some(1.0));
-        assert_eq!(units[0]["sampled_compiler_cpu_wait_s"].as_f64(), Some(0.2));
-        // Negative control: no complete result may be inferred from a start without its end.
-        let start = aterm_json::json!({"message":{"event":"release-slice-unit","phase":"started","pid":9,"queued_unix_s":20.0,"at_unix_s":21.0}});
-        std::fs::write(
-            dir.path().join("aarch64-apple-darwin.messages.jsonl"),
-            format!("{start}\n"),
-        )
-        .unwrap();
-        assert!(summarize(dir.path()).is_err());
-    }
-    #[test]
-    fn a_missing_or_reused_compiler_pid_has_no_invented_lifetime_counter() {
-        let mut counters = BTreeMap::new();
-        assert!(compiler_counters(4, &counters).is_none());
-        counters.insert((4, 1), Counters::default());
-        assert!(compiler_counters(4, &counters).is_some());
-        counters.insert((4, 2), Counters::default());
-        assert!(compiler_counters(4, &counters).is_none());
-    }
-    #[test]
-    fn descendant_sampling_follows_grandchildren_out_of_order_and_excludes_other_sessions() {
-        use aterm_sysprobe::procs::ProcessReading;
-        let row = |pid, ppid| ProcessReading {
-            pid,
-            ppid,
-            ..ProcessReading::default()
-        };
-        let rows = [row(3, 2), row(90, 80), row(2, 1), row(4, 3), row(80, 0)];
-        assert_eq!(descendants(&rows, 1), BTreeSet::from([1, 2, 3, 4]));
-        assert_eq!(descendants(&rows, 80), BTreeSet::from([80, 90]));
-    }
-    #[test]
-    fn experimental_modes_require_an_explicit_verifier_and_reject_unknown_priorities() {
-        let parse_words = |s: &str| parse(s.split_whitespace().map(str::to_owned));
-        for mode in ["alone", "shared", "chain", "tree", "series"] {
-            let before = if mode == "series" {
-                " --before-verify /old"
-            } else {
-                ""
-            };
-            assert_eq!(
-                parse_words(&format!("--verify /v --mode {mode}{before}"))
-                    .unwrap()
-                    .mode,
-                mode
-            );
-        }
-        assert!(parse_words("--mode chain").is_err());
-        assert!(parse_words("--verify /v --mode fastest").is_err());
-        assert!(parse_words("--verify /v --mode chain --mode tree").is_err());
-        assert!(parse_words("--verify /v --mode series").is_err());
-        assert!(parse_words("--verify /v --mode chain --before-verify /old").is_err());
-        assert_eq!(
-            order("series"),
-            ["alone", "shared", "chain", "chain", "shared", "tree"]
-        );
-        assert_eq!(order("shared"), ["shared"]);
-        let release = parse_words("--verify /v --mode shared --tree-work release").unwrap();
-        assert_eq!(release.tree_work, TreeShape::Release);
-        assert_eq!(release.export_seconds(), Some(RELEASE_EXPORT_SECONDS));
-        let override_export =
-            parse_words("--verify /v --mode shared --tree-work release --export-seconds 5")
-                .unwrap();
-        assert_eq!(override_export.export_seconds(), Some(5));
-        let no_export =
-            parse_words("--verify /v --mode shared --tree-work release --export-seconds 0")
-                .unwrap();
-        assert_eq!(no_export.export_seconds(), None);
-        assert!(parse_words("--verify /v --mode shared --tree-work almost").is_err());
-        assert!(parse_words("--verify /v --mode shared --export-seconds soon").is_err());
-    }
-
-    #[test]
-    fn release_shared_and_chain_hold_every_non_export_token_but_tree_is_only_a_probe() {
-        let parse_words = |words: &str| parse(words.split_whitespace().map(str::to_owned)).unwrap();
-        let shared = parse_words("--verify /v --mode shared --tree-work release");
-        let chain = parse_words("--verify /v --mode chain --tree-work release");
-        let old = parse_words("--verify /v --mode tree --tree-work release");
-        let compile_lint = parse_words("--verify /v --mode shared");
-        assert_eq!(admission_barrier_share(&shared, 18, 4), 14);
-        assert_eq!(admission_barrier_share(&chain, 18, 4), 14);
-        assert_eq!(admission_barrier_share(&old, 18, 4), 0);
-        assert_eq!(admission_barrier_share(&compile_lint, 18, 4), 0);
-        // Negative control: omitting the barrier leaves every non-export compiler token live.
-        assert_eq!(18 - 4 - admission_barrier_share(&old, 18, 4), 14);
-        assert_eq!(18 - 4 - admission_barrier_share(&shared, 18, 4), 0);
-    }
-
-    #[test]
-    fn only_a_live_exact_tippy_request_in_the_tree_opens_the_compiler_barrier() {
-        use aterm_sysprobe::procs::ProcessReading;
-        let shapes = tippy_claim_shapes().unwrap();
-        let process = |pid, ppid| ProcessReading {
-            pid,
-            ppid,
-            ..ProcessReading::default()
-        };
-        let processes = [process(100, 1), process(110, 100), process(200, 1)];
-        let held = aterm_capacity::Held {
-            admitted_ms: 2,
-            cores: 0,
-            alone: false,
-        };
-        let record = |label: &str, bytes: u64| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::Holder,
-            pid: 110,
-            start_ms: 1,
-            seq: 2,
-            checkout: "/release".into(),
-            need: aterm_capacity::Need::new(label)
-                .rank(aterm_capacity::Rank::Release)
-                .mem(bytes)
-                .margin(1)
-                .covers(),
-            timing: aterm_capacity::TimingEvidence::default(),
-            held: Some(held),
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        for shape in &shapes {
-            let valid = record(&shape.label, shape.bytes);
-            assert_eq!(
-                matching_tree_claim(std::slice::from_ref(&valid), &processes, 100, &shapes)
-                    .map(|(_, state)| state),
-                Some(crate::release_steps::TreeLintClaim::Held)
-            );
-            let mut waiting = valid;
-            waiting.held = None;
-            assert_eq!(
-                matching_tree_claim(&[waiting], &processes, 100, &shapes).map(|(_, state)| state),
-                Some(crate::release_steps::TreeLintClaim::Waiting),
-                "an exact queued request selects the bounded escape"
-            );
-        }
-
-        let whole = &shapes[0];
-        let valid = record(&whole.label, whole.bytes);
-        let mut invalid = valid.clone();
-        invalid.need.mem -= 1;
-        assert_eq!(
-            matching_tree_claim(std::slice::from_ref(&invalid), &processes, 100, &shapes)
-                .map(|(_, state)| state),
-            Some(crate::release_steps::TreeLintClaim::Invalid),
-            "an undersized whole-stage claim refuses the tree instead of opening its barrier"
-        );
-        let mut lookalike = valid.clone();
-        lookalike.need.what.push_str(" later");
-        let mut ordinary = valid.clone();
-        ordinary.need.rank = aterm_capacity::Rank::Ordinary;
-        let mut uncovered = valid.clone();
-        uncovered.need.covers = false;
-        let mut foreign = valid.clone();
-        foreign.pid = 200;
-        assert!(matching_tree_claim(&[lookalike], &processes, 100, &shapes).is_none());
-        for mutant in [ordinary, uncovered] {
-            assert_eq!(
-                matching_tree_claim(&[mutant], &processes, 100, &shapes).map(|(_, state)| state),
-                Some(crate::release_steps::TreeLintClaim::Invalid)
-            );
-        }
-        assert!(matching_tree_claim(&[foreign], &processes, 100, &shapes).is_none());
-
-        let mut waiting = valid.clone();
-        waiting.held = None;
-        for records in [
-            vec![invalid.clone(), waiting.clone(), valid.clone()],
-            vec![valid, waiting, invalid],
-        ] {
-            assert_eq!(
-                matching_tree_claim(&records, &processes, 100, &shapes).map(|(_, state)| state),
-                Some(crate::release_steps::TreeLintClaim::Held),
-                "duplicate file order cannot override the held valid request"
-            );
-        }
-        assert!(
-            matching_tree_claim(&[], &processes[1..], 100, &shapes).is_none(),
-            "a missing tree root cannot authenticate a stale claim"
-        );
-    }
-
-    #[test]
-    fn shared_ready_events_name_the_full_release_budget_and_relay_without_inference() {
-        let event = aterm_json::json!({
-            "event":"slice-memory-ready",
-            "mode":"shared",
-            "held":true,
-            "label":"release slice memory budget",
-            "mem":crate::slice_units::MIN_SHARED,
-            "claim":{"pid":7,"start_ms":8,"seq":9},
-        });
-        assert!(shared_ready_shape(&event, crate::slice_units::MIN_SHARED));
-        assert!(
-            !shared_ready_shape(&event, crate::slice_units::MIN_SHARED + (1 << 30)),
-            "NEGATIVE CONTROL: a calibrated parent cannot be authenticated at the code floor"
-        );
-        for mutant in [
-            aterm_json::json!({
-                "event":"slice-memory-ready", "mode":"shared", "held":true,
-                "label":"release slice aarch64-apple-darwin",
-                "mem":crate::slice_units::MIN_SHARED,
-            }),
-            aterm_json::json!({
-                "event":"slice-memory-ready", "mode":"shared", "held":true,
-                "label":"release slice memory budget",
-                "mem":crate::slice_units::MIN_SHARED - 1,
-            }),
-            aterm_json::json!({
-                "event":"slice-memory-ready", "mode":"shared", "held":false,
-                "label":"release slice memory budget",
-                "mem":crate::slice_units::MIN_SHARED,
-            }),
-        ] {
-            assert!(!shared_ready_shape(&mutant, crate::slice_units::MIN_SHARED));
-        }
-
-        let input = format!("unrelated output\n{SLICE_CHILD_EVENT}{event}\n");
-        let mut transcript = Vec::new();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        relay_slice_child_events(input.as_bytes(), &mut transcript, sender).unwrap();
-        assert_eq!(receiver.recv().unwrap().unwrap(), event);
-        assert_eq!(String::from_utf8(transcript).unwrap(), input);
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        assert!(
-            relay_slice_child_events(
-                format!("{SLICE_CHILD_EVENT}not-json\n").as_bytes(),
-                Vec::new(),
-                sender,
-            )
-            .is_ok()
-        );
-        assert!(receiver.recv().unwrap().is_err());
-    }
-    #[test]
-    fn only_lower_priority_invocations_gain_nice_and_keep_the_original_program() {
-        let program = Path::new("/compiler path/tool");
-        assert_eq!(invocation(program, false), (program.to_owned(), Vec::new()));
-        if cfg!(unix) {
-            assert_eq!(
-                invocation(program, true),
-                (
-                    PathBuf::from("/usr/bin/nice"),
-                    vec![
-                        OsString::from("-n"),
-                        "10".into(),
-                        program.as_os_str().to_owned()
-                    ]
-                )
-            );
-        }
-    }
-}
+#[path = "qualify_pilot_tests.rs"]
+mod tests;

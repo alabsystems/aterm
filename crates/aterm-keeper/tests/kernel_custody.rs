@@ -187,7 +187,12 @@ fn window_role(holder: bool) -> ! {
     report(&line);
     std::mem::forget(leader);
     match await_go().as_str() {
-        "bye" => client.send(&Frame::Bye, None).expect("bye"),
+        "bye" => client
+            .send(&Frame::Bye { keep: Vec::new() }, None)
+            .expect("bye"),
+        "bye-keep" => client
+            .send(&Frame::Bye { keep: vec![rdev] }, None)
+            .expect("bye"),
         "poke" => {
             client.send(&Frame::RestartWhenSafe, None).expect("a frame");
             note("poked");
@@ -274,9 +279,10 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
         assert_eq!(o.tag, b"sid=s-test", "the tag travels opaque");
     }
     report(&format!(
-        "offers={} rdevs={}",
+        "offers={} rdevs={} kept={}",
         offers.len(),
-        rdevs.join(",")
+        rdevs.join(","),
+        offers.iter().filter(|o| o.kept).count()
     ));
     await_go();
     for (i, o) in offers.iter().enumerate() {
@@ -288,7 +294,9 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
         }
     }
     if bye {
-        client.send(&Frame::Bye, None).expect("bye");
+        client
+            .send(&Frame::Bye { keep: Vec::new() }, None)
+            .expect("bye");
     }
     std::process::exit(0)
 }
@@ -365,7 +373,9 @@ fn old_window_role() -> ! {
     }
     report("claimed");
     await_said("quit");
-    client.send(&Frame::Bye, None).expect("bye");
+    client
+        .send(&Frame::Bye { keep: Vec::new() }, None)
+        .expect("bye");
     std::process::exit(0)
 }
 
@@ -388,7 +398,10 @@ fn unplaced_window_role() -> ! {
     for rdev in &rdevs {
         assert!(link.enqueue(LinkOp::Release { rdev: *rdev }), "queued");
     }
-    assert!(link.send_and_wait(LinkOp::Bye, HANG), "the BYE is written");
+    assert!(
+        link.send_and_wait(LinkOp::Bye { keep: Vec::new() }, HANG),
+        "the BYE is written"
+    );
     report(&format!("released={}", rdevs.len()));
     std::process::exit(0)
 }
@@ -733,8 +746,8 @@ fn a_killed_window_s_shell_lives_and_is_offered_once() {
     let got = s.line(next, "offers=");
     assert_eq!(
         got,
-        format!("offers=1 rdevs={rdev}"),
-        "exactly one OFFER, for that rdev"
+        format!("offers=1 rdevs={rdev} kept=0"),
+        "exactly one OFFER, for that rdev, a crash's"
     );
     let st = s.await_status("offered", |t| t.contains("offered=1"));
     assert!(
@@ -763,6 +776,47 @@ fn a_killed_window_s_shell_lives_and_is_offered_once() {
         aterm_uds::holders::process_holds_rdev(keeper_pid, rdev),
         Some(false)
     );
+}
+
+const T_KEPT: &str = "a_quit_that_keeps_a_shell_offers_it_to_the_next_window_as_kept";
+
+/// A quit whose BYE names its master (the Mac Setup tab's installer,
+/// `KeeperCore::bye_keeping`) leaves the shell running with no relaunch, and the next window is
+/// offered it as one the quit kept, not a crash's (`Offered::kept`), so its launch tells of no
+/// crash; that window's own quit then hangs it up.
+///
+/// NEGATIVE CONTROL: [`a_killed_window_s_shell_lives_and_is_offered_once`], whose crash's orphan
+/// is offered as not kept.
+#[test]
+fn a_quit_that_keeps_a_shell_offers_it_to_the_next_window_as_kept() {
+    dispatch_role();
+    let mut s = Scratch::new("kept");
+    s.keeper(T_KEPT, false);
+    let w = s.spawn(T_KEPT, "window", &[]);
+    let reg = s.line(w, "leader=");
+    let (leader, rdev) = (field(&reg, "leader") as u32, field(&reg, "rdev"));
+    s.pids.push(leader);
+    let leader_watch = ExitWatch::watch(leader).expect("watch the leader");
+    s.await_status("registered", |t| t.contains("claimed=1"));
+    s.say(w, "bye-keep");
+    let _ = s.kids[w].wait();
+    let st = s.await_status("kept", |t| {
+        t.contains("orphaned=1") && t.contains(" kept=1")
+    });
+    assert_eq!(leader_watch.exit_status(), None, "the leader lives:\n{st}");
+    assert_eq!(relaunch_lines(&s), 0, "a quit relaunches nothing:\n{st}");
+
+    let next = s.spawn(T_KEPT, "next-window", &[]);
+    assert_eq!(
+        s.line(next, "offers="),
+        format!("offers=1 rdevs={rdev} kept=1"),
+        "offered as the quit's, not a crash's"
+    );
+    s.say(next, "go");
+    let _ = s.kids[next].wait();
+    assert_eq!(await_exit(&leader_watch), 1, "its own quit hung it up");
+    let st = s.await_status("closed", |t| t.contains("masters=0"));
+    assert_eq!(relaunch_lines(&s), 0, "no relaunch throughout:\n{st}");
 }
 
 const T_CONTROL: &str = "without_the_custody_copy_a_killed_window_hangs_its_shell_up";
@@ -814,7 +868,7 @@ fn a_master_another_process_holds_is_never_offered() {
     let _ = s.kids[w].wait();
     s.await_status("held", |t| t.contains("held=1"));
     let early = s.spawn(T_HOLDER, "next-window", &[]);
-    assert_eq!(s.line(early, "offers="), "offers=0 rdevs=");
+    assert_eq!(s.line(early, "offers="), "offers=0 rdevs= kept=0");
     s.say(early, "go");
     let _ = s.kids[early].wait();
     assert_eq!(relaunch_lines(&s), 0, "no relaunch over a live holder");
@@ -825,7 +879,10 @@ fn a_master_another_process_holds_is_never_offered() {
         t.contains("orphaned=1") || t.contains("state=launching")
     });
     let next = s.spawn(T_HOLDER, "next-window", &[]);
-    assert_eq!(s.line(next, "offers="), format!("offers=1 rdevs={rdev}"));
+    assert_eq!(
+        s.line(next, "offers="),
+        format!("offers=1 rdevs={rdev} kept=0")
+    );
     assert_eq!(
         leader_watch.exit_status(),
         None,
@@ -1441,7 +1498,9 @@ fn journal_window_role(journaled: Journaled) -> ! {
     std::mem::forget(leader);
     match await_go().as_str() {
         "die" => aterm_uds::process::kill_self_now(),
-        _ => client.send(&Frame::Bye, None).expect("bye"),
+        _ => client
+            .send(&Frame::Bye { keep: Vec::new() }, None)
+            .expect("bye"),
     }
     drop((writer, kept, master));
     std::process::exit(0)
@@ -1507,7 +1566,9 @@ fn journal_next_window_role() -> ! {
             .companion_release(o.header.rdev)
             .expect("no region of its own");
     }
-    client.send(&Frame::Bye, None).expect("bye");
+    client
+        .send(&Frame::Bye { keep: Vec::new() }, None)
+        .expect("bye");
     std::process::exit(0)
 }
 

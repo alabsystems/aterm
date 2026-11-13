@@ -311,6 +311,16 @@ impl Ring {
         secs / self.period_s
     }
 
+    /// Every period a window on the clock at `now` can hold, whatever the state: the current
+    /// period is the clock's or the next (`RingState::current`), so a window
+    /// (`RingState::window`) starts no earlier than the period before the clock's and ends no
+    /// later than two after it. A reader reads a ring's state only for a table of this reach
+    /// (`Directory::ring_of`, `Directory::ring_tables_among`).
+    pub(crate) fn reach(&self, now: u64) -> RangeInclusive<u64> {
+        let clock = self.epoch_of(now);
+        clock.saturating_sub(1)..=clock.saturating_add(2)
+    }
+
     pub(crate) fn state_name(&self) -> String {
         format!("ring-{}-{}.state", self.application, self.role)
     }
@@ -336,7 +346,8 @@ impl RingState {
     /// far: the window is the clock's, so this Mac reads and takes up its peers' tables of those
     /// days again, while it writes nothing until the clock reaches the floor
     /// (`accounts::claims::target`), and never below the floor (`Directory::enroll_ring`), in a
-    /// table it deleted, whose own signed history a fresh write would fork.
+    /// table it deleted, whose own signed history a fresh write would fork. Either way it is the
+    /// clock's period or the next, so `Ring::reach` bounds every window it places.
     pub(crate) fn current(&self, ring: &Ring, now: u64) -> u64 {
         let clock = ring.epoch_of(now);
         if clock < self.floor {
@@ -472,6 +483,23 @@ fn rebuilt_floor(claims: &Path, ring: &Ring, held: &BTreeSet<u64>) -> u64 {
 
 /// How many damaged ring states one claim directory keeps moved aside (`move_aside`).
 const MAX_DAMAGED: u32 = 64;
+
+/// Reserved claim-directory metadata, including bounded retained repair evidence.
+pub(super) fn claim_metadata() -> BTreeMap<String, usize> {
+    let mut names = BTreeMap::new();
+    for ring in RINGS {
+        for (name, limit) in [
+            (ring.state_name(), STATE_MAX),
+            (ring.floor_name(), FLOOR_LEN),
+        ] {
+            for index in 1..=MAX_DAMAGED {
+                names.insert(format!("{name}.damaged-{index}"), limit);
+            }
+            names.insert(name, limit);
+        }
+    }
+    names
+}
 
 /// Move `name` in `dir` (the claim directory) aside to the first free
 /// `<name>.damaged-<n>`, kept for a person to look at, under the control writer, which no other
@@ -660,11 +688,7 @@ impl Directory {
                     return Err(Error::new("ring table storage is not private"));
                 }
             }
-            match std::fs::remove_file(claims.join(claim_name(scope))) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            crate::table::store::remove_claim_files(&claims, &claim_name(scope))?;
         }
         for dir in [&self.root, &claims] {
             if dir.try_exists()? {
@@ -955,7 +979,8 @@ impl Directory {
     /// Whether `id` names a table of some ring's current window, which reaches below the floor
     /// only on a clock more than a period behind it (`RingState::current`): a period retired on a
     /// clock set back a period stays refused however a repair round reaches it. A damaged ring
-    /// state permits the clock's window (`ring_view`).
+    /// state permits the clock's window (`ring_view`). It reads a ring's state only where that
+    /// ring's reach holds `id` (`ring_of`).
     ///
     /// # Errors
     /// A ring table's scope cannot be formed.
@@ -963,23 +988,54 @@ impl Directory {
         Ok(self.ring_of(session, id, now)?.is_some())
     }
 
-    /// Every table of every ring's current window (`RingState::current`); a damaged ring state
-    /// reads as none yet (`ring_view`), so it stops no repair round.
+    /// The tables among `ids` of some ring's current window (`RingState::current`); a damaged
+    /// ring state reads as none yet (`ring_view`), so it stops no repair round. It reads a ring's
+    /// state only where that ring's reach (`Ring::reach`) holds one of `ids`, and none for an
+    /// empty `ids`.
     ///
     /// # Errors
     /// A ring table's scope cannot be formed.
-    pub(crate) fn ring_window(&self, session: &Session<'_>, now: u64) -> Result<BTreeSet<Digest>> {
-        let mut ids = BTreeSet::new();
+    pub(crate) fn ring_tables_among(
+        &self,
+        session: &Session<'_>,
+        now: u64,
+        ids: &BTreeSet<Digest>,
+    ) -> Result<BTreeSet<Digest>> {
+        let mut among = BTreeSet::new();
+        if ids.is_empty() {
+            return Ok(among);
+        }
         for ring in RINGS {
+            if !self.reaches(ring, now, |digest| ids.contains(digest))? {
+                continue;
+            }
             let state = self.ring_view(session, ring);
             for epoch in state.window(ring, now) {
-                ids.insert(ring.scope(self.trust, epoch)?.digest());
+                let digest = ring.scope(self.trust, epoch)?.digest();
+                if ids.contains(&digest) {
+                    among.insert(digest);
+                }
             }
         }
-        Ok(ids)
+        Ok(among)
+    }
+
+    /// Whether some table of `ring`'s reach on the clock at `now` is `wanted`: where none is, no
+    /// window of `ring` holds one, whatever its state (`Ring::reach`).
+    ///
+    /// # Errors
+    /// A ring table's scope cannot be formed.
+    fn reaches(&self, ring: &Ring, now: u64, wanted: impl Fn(&Digest) -> bool) -> Result<bool> {
+        for epoch in ring.reach(now) {
+            if wanted(&ring.scope(self.trust, epoch)?.digest()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `id`'s ring and period, where it names a table of a ring's current window (`ring_view`'s).
+    /// It reads a ring's state only where that ring's reach (`Ring::reach`) holds `id`.
     ///
     /// # Errors
     /// A ring table's scope cannot be formed.
@@ -990,7 +1046,15 @@ impl Directory {
         now: u64,
     ) -> Result<Option<(&'static Ring, u64, Scope)>> {
         for ring in RINGS {
+            if !self.reaches(ring, now, |digest| *digest == id)? {
+                continue;
+            }
             let state = self.ring_view(session, ring);
+            debug_assert!(
+                state.window(ring, now).start() >= ring.reach(now).start()
+                    && state.window(ring, now).end() <= ring.reach(now).end(),
+                "a window lies within its ring's reach"
+            );
             for epoch in state.window(ring, now) {
                 let scope = ring.scope(self.trust, epoch)?;
                 if scope.digest() == id {

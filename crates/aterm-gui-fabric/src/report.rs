@@ -66,6 +66,19 @@ impl std::fmt::Display for Unsent {
             ),
             Self::Refused(answer) => write!(f, "the bus refused it: {answer}"),
             Self::NoDrive { node, why } => write!(f, "no fleet drive reached {node}: {why}"),
+            // The other Mac's fleet access is below Read and Write: no fault, and nothing a
+            // retry mends, so the record says what still reads the worker.
+            Self::Answered { node, answer }
+                if let Some((level, _)) =
+                    aterm_types::fleet_access::FleetAccess::refused_at(answer) =>
+            {
+                write!(
+                    f,
+                    "{node}'s fleet access is {}, so it takes no mail: its manager reads this \
+                     worker with await task and @<sid> result",
+                    level.short()
+                )
+            }
             Self::Answered { node, answer } => {
                 write!(f, "{node} refused the direct fleet mail: {answer}")
             }

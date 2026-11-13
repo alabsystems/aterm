@@ -46,9 +46,6 @@ pub(super) fn run(args: &[OsString], gnu: Option<[OwnedFd; 2]>) -> std::process:
         // The compiled stand-in tests native helper/store/resource custody;
         // it does not claim to compile a Rust crate or implement bank startup.
         metadata(gnu, "trustc native fixture metadata");
-    } else if matches!(args, [arg] if arg == "--print=sysroot" || arg == "--print=target-list") {
-        assert!(gnu.is_none());
-        metadata(None, args[0].to_str().unwrap());
     } else if matches!(args, [arg] if arg == "fixture-host" || arg == "fixture-host-unknown") {
         host(args[0] == "fixture-host-unknown");
     } else if matches!(args, [arg] if arg == "fixture-root") {
@@ -383,7 +380,7 @@ fn host(unknown: bool) {
     );
     assert_eq!(
         submissions,
-        if unknown { 1 } else { 6 },
+        if unknown { 1 } else { 4 },
         "actual root: {}",
         fs::read_to_string(&root_log).unwrap()
     );
@@ -395,7 +392,10 @@ fn host(unknown: bool) {
         );
         assert_eq!(fs::read(&marker).unwrap(), b"metadata-executed\n");
     } else {
-        assert_eq!(fs::read(&marker).unwrap(), b"metadata-executed\nmetadata-failed\nmetadata-cancel-ready\n--print=sysroot\n--print=target-list\nroot-finished\n");
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"metadata-executed\nmetadata-failed\nmetadata-cancel-ready\nroot-finished\n"
+        );
     }
     assert_eq!(world.owner.debt.reserved().unwrap(), 0);
     assert!(
@@ -743,12 +743,6 @@ fn root() {
     original.read_exact(&mut token).unwrap();
     assert_eq!(token, *b"+");
     assert!(original.read(&mut token).is_err());
-    for (index, query) in ["--print=sysroot", "--print=target-list"]
-        .into_iter()
-        .enumerate()
-    {
-        probe::run(&client, &request, &lease, query, index as u8 + 20);
-    }
     fs::OpenOptions::new()
         .append(true)
         .open(marker)
@@ -829,6 +823,3 @@ fn metadata(gnu: Option<[OwnedFd; 2]>, value: &str) {
     println!("{value}");
     trace("metadata-output-enqueued");
 }
-
-#[path = "member_native_probe.rs"]
-mod probe;

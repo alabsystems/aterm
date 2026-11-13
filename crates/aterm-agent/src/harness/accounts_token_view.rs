@@ -21,6 +21,7 @@
 //!
 //! Nothing here reads, holds or prints a token: the vault's standings are value-free.
 
+pub use super::account_card::{ENDING_S, LoginHalf};
 use super::accounts::{self, Cli, Store, TokenEntry};
 use super::accounts_step::Step;
 use super::accounts_tokens::{
@@ -32,71 +33,6 @@ use aterm_secrets::claude_token::{Key, Lookup, Standing};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-
-/// How near its end a stored login reads as `ending` (§5.9: about a week).
-pub const ENDING_S: i64 = 7 * 86_400;
-
-/// The login half of the offer's pair (§5.9): the account's stored login on this Mac.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoginHalf {
-    /// A token is in use: it carries the sessions past the login's end (`-`).
-    InUse,
-    /// [`ENDING_S`] or more left, or no end known.
-    Ok,
-    /// Under [`ENDING_S`] left, ending at `end` (unix seconds).
-    Ending {
-        /// The forecast end.
-        end: i64,
-    },
-    /// Ended, at `at` where it is known.
-    Ended {
-        /// When.
-        at: Option<i64>,
-    },
-}
-
-impl LoginHalf {
-    /// The half of `row`'s stored login here at `now`, from its records
-    /// ([`accounts::signed_out_here`], [`accounts::login_forecast`]).
-    #[must_use]
-    pub fn of_row(
-        row: &accounts::Row,
-        logins: &accounts::Logins,
-        state: &accounts::State,
-        now: i64,
-    ) -> Self {
-        if accounts::signed_out_here(row, state) {
-            return Self::Ended {
-                at: accounts::login_ended_at(row, logins, state),
-            };
-        }
-        match accounts::login_forecast(row, logins, state) {
-            Some(end) if end <= now => Self::Ended { at: Some(end) },
-            Some(end) if end - now < ENDING_S => Self::Ending { end },
-            _ => Self::Ok,
-        }
-    }
-
-    /// The half's word in the pair.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Self::InUse => "-",
-            Self::Ok => "ok",
-            Self::Ending { .. } => "ending",
-            Self::Ended { .. } => "ended",
-        }
-    }
-
-    /// When the half began, where a date says it.
-    const fn since(self) -> Option<i64> {
-        match self {
-            Self::Ending { end } => Some(end - ENDING_S),
-            Self::Ended { at } => at,
-            Self::InUse | Self::Ok => None,
-        }
-    }
-}
 
 /// An account the surfaces cover.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,7 +192,8 @@ impl AccountToken {
         })
     }
 
-    /// The Accounts card's and the Lab page's one quiet line while an offer stands (§5.9).
+    /// The Lab page's one quiet line while an offer stands (§5.9); the Account card says the
+    /// offer as its own item.
     #[must_use]
     pub fn offer_line(&self) -> Option<String> {
         let offer = self.offer.as_ref()?;

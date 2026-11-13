@@ -4,30 +4,78 @@
 //! NVIDIA's proprietary driver, through NVML: a card's device-wide busy figure, its board power
 //! draw, its name, and whether it works in the system's memory.
 
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_int, c_uint};
-use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Why;
+#[cfg(target_os = "linux")]
 use crate::linux::NvidiaCard;
 
+#[cfg(target_os = "linux")]
 type NvmlReturn = c_int;
 
+#[cfg(target_os = "linux")]
 const SUCCESS: NvmlReturn = 0;
+#[cfg(target_os = "linux")]
 const ERROR_NOT_SUPPORTED: NvmlReturn = 3;
+#[cfg(target_os = "linux")]
 const ERROR_NO_PERMISSION: NvmlReturn = 4;
+
+/// A value opened and initialised once on a background thread of its own (`"aterm-nvml"`), so the
+/// caller never blocks on it: [`Self::get`] starts the thread on its first call and answers
+/// [`Why::NotRead`] until the thread finishes, then the thread's answer from then on.
+pub(crate) struct OneShot<T> {
+    started: AtomicBool,
+    ready: OnceLock<Result<T, Why>>,
+}
+
+impl<T: Send + Sync + 'static> OneShot<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            ready: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn get(&'static self, init: fn() -> Result<T, Why>) -> Result<&'static T, Why> {
+        if !self.started.swap(true, Ordering::AcqRel)
+            && std::thread::Builder::new()
+                .name("aterm-nvml".to_owned())
+                .spawn(move || {
+                    let _ = self.ready.set(init());
+                })
+                .is_err()
+        {
+            let _ = self.ready.set(Err(Why::NotRead));
+        }
+        match self.ready.get() {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(why)) => Err(*why),
+            None => Err(Why::NotRead),
+        }
+    }
+}
 
 /// `NVML_DEVICE_NAME_V2_BUFFER_SIZE`: room for any name `nvmlDeviceGetName` gives, its NUL
 /// included.
+#[cfg(target_os = "linux")]
 const NAME_BUFFER: usize = 96;
 
 /// `NVML_DEVICE_ADDRESSING_MODE_ATS`: the card and the CPUs share one set of page tables.
+#[cfg(target_os = "linux")]
 const ADDRESSING_MODE_ATS: c_uint = 2;
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct NvmlDevice {
     _opaque: [u8; 0],
 }
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Utilization {
@@ -36,6 +84,7 @@ struct Utilization {
 }
 
 /// `nvmlMemory_t`: the card's own memory.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Memory {
@@ -45,6 +94,7 @@ struct Memory {
 }
 
 /// `nvmlDeviceAddressingMode_v1_t`.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct AddressingMode {
@@ -54,8 +104,10 @@ struct AddressingMode {
 
 /// `nvmlDeviceAddressingMode_v1`: `NVML_STRUCT_VERSION(DeviceAddressingMode, 1)`, the struct's
 /// size with the version in the top byte.
+#[cfg(target_os = "linux")]
 const ADDRESSING_MODE_V1: c_uint = size_of::<AddressingMode>() as c_uint | (1 << 24);
 
+#[cfg(target_os = "linux")]
 aterm_dl::table! {
     struct Nvml {
         init = c"nvmlInit_v2": unsafe extern "C" fn() -> NvmlReturn;
@@ -80,9 +132,11 @@ aterm_dl::table! {
 }
 
 /// The soname the driver's runtime package installs.
+#[cfg(target_os = "linux")]
 pub(crate) static SONAMES: &[&CStr] = &[c"libnvidia-ml.so.1"];
 
 /// The [`Why`] of an NVML return code other than `NVML_SUCCESS`.
+#[cfg(target_os = "linux")]
 pub(crate) const fn why(code: NvmlReturn) -> Why {
     match code {
         ERROR_NOT_SUPPORTED => Why::Unsupported,
@@ -91,6 +145,7 @@ pub(crate) const fn why(code: NvmlReturn) -> Why {
     }
 }
 
+#[cfg(target_os = "linux")]
 const fn ok(code: NvmlReturn) -> Result<(), Why> {
     if code == SUCCESS {
         Ok(())
@@ -99,26 +154,29 @@ const fn ok(code: NvmlReturn) -> Result<(), Why> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn open_nvml() -> Result<Nvml, Why> {
+    let lib = aterm_dl::Library::open(SONAMES).map_err(|_| Why::NotRead)?;
+    // SAFETY: every row transcribes nvml.h's prototype (`nvmlReturn_t` is a C enum, an int;
+    // `nvmlDevice_t` a pointer to an opaque struct; `nvmlMemory_t` three `unsigned long
+    // long`s; `nvmlDeviceAddressingMode_t` two `unsigned int`s).
+    let nvml = unsafe { Nvml::load(&lib) }.map_err(|_| Why::NotRead)?;
+    // SAFETY: nvmlInit_v2 takes nothing and is thread-safe; it runs once per process (this
+    // OneShot) and is never undone, so every handle and call after it stands on a live init.
+    ok(unsafe { (nvml.init)() })?;
+    Ok(nvml)
+}
+
+#[cfg(target_os = "linux")]
 fn nvml() -> Result<&'static Nvml, Why> {
-    static NVML: OnceLock<Result<Nvml, Why>> = OnceLock::new();
-    NVML.get_or_init(|| {
-        let lib = aterm_dl::Library::open(SONAMES).map_err(|_| Why::NotRead)?;
-        // SAFETY: every row transcribes nvml.h's prototype (`nvmlReturn_t` is a C enum, an int;
-        // `nvmlDevice_t` a pointer to an opaque struct; `nvmlMemory_t` three `unsigned long
-        // long`s; `nvmlDeviceAddressingMode_t` two `unsigned int`s).
-        let nvml = unsafe { Nvml::load(&lib) }.map_err(|_| Why::NotRead)?;
-        // SAFETY: nvmlInit_v2 takes nothing and is thread-safe; it runs once per process (this
-        // OnceLock) and is never undone, so every handle and call after it stands on a live init.
-        ok(unsafe { (nvml.init)() })?;
-        Ok(nvml)
-    })
-    .as_ref()
-    .map_err(|why| *why)
+    static NVML: OneShot<Nvml> = OneShot::new();
+    NVML.get(open_nvml)
 }
 
 /// The NVIDIA card in PCI slot `slot`, read through NVML: its device-wide busy percent (at most
 /// 100) and board power draw every call, and its name and whether it works in the system's
 /// memory, which do not change while the driver runs, read once per process ([`facts`]).
+#[cfg(target_os = "linux")]
 pub(crate) fn card(slot: &str) -> NvidiaCard {
     let nvml = match nvml() {
         Ok(nvml) => nvml,
@@ -148,6 +206,7 @@ pub(crate) fn card(slot: &str) -> NvidiaCard {
 }
 
 /// The handle of the card in PCI slot `slot`.
+#[cfg(target_os = "linux")]
 fn handle(nvml: &Nvml, slot: &str) -> Result<*mut NvmlDevice, Why> {
     let bus_id = CString::new(slot).map_err(|_| Why::NotRead)?;
     let mut device: *mut NvmlDevice = std::ptr::null_mut();
@@ -166,6 +225,7 @@ fn handle(nvml: &Nvml, slot: &str) -> Result<*mut NvmlDevice, Why> {
 /// for it (`nvmlDeviceGetMemoryInfo` answers not supported) and it addresses system memory through
 /// ATS (`nvmlDeviceGetAddressingMode`), as a GB10 does; a card with memory of its own (a discrete
 /// card, a Grace Hopper's HBM) or a driver without the addressing call does not.
+#[cfg(target_os = "linux")]
 fn facts(nvml: &Nvml, slot: &str, device: *mut NvmlDevice) -> (Option<String>, bool) {
     static KEPT: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
     let mut kept = KEPT

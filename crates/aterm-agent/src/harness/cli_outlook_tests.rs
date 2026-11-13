@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The report's outlook (`aterm harness accounts`, `docs/DESIGN-accounts-outlook-2026-10-25.md`
+//! The report's outlook (`aterm harness accounts`, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
 //! §9): the text and the JSON say the card's numbers for the same seed, and the report writes
 //! nothing.
 
 use super::*;
 use crate::harness::account_series::{self, Fig};
-use crate::harness::outlook::{self, CardRow};
+use crate::harness::outlook;
 
 const H: i64 = 3600;
 const D: i64 = 86_400;
@@ -191,17 +191,11 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
         "the text's outlook block is the card's:\n{text}"
     );
     let mut figures = 0;
-    for row in card.card_rows("me", None, true, 30, None) {
-        // Words only at 30 cells: `me 58% ↺ Thu`, the figure used second.
-        if let CardRow::Account {
-            label, text: item, ..
-        } = row
-            && let Some(pct) = item
-                .split_whitespace()
-                .nth(1)
-                .filter(|part| part.ends_with('%'))
-                .map(|part| format!("{part} used"))
-        {
+    for row in &card.rows {
+        // The row's figure as the glass says it: `42% left`.
+        let label = &row.label;
+        let pct = row.figure(card.as_of).words();
+        if pct.ends_with("% left") {
             // The row's own line, then the lines indented under it.
             let lines: Vec<&str> = text.lines().collect();
             let at = lines

@@ -205,70 +205,30 @@ fn completed_successor_keeps_transport_until_its_preserved_source_changes() {
 }
 
 #[test]
-fn native_source_holds_the_completed_successor_and_all_ancestor_controls() {
-    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
-    let original = lab.paths[0].clone();
-    let registry = crate::alab::Registry::at(original.clone());
-    registry.open().unwrap();
-    let config = original.home.join("config.toml");
-    let old = registry
-        .with_admitted_source(&config, None, |source| Ok(source.revision().clone()))
-        .unwrap();
-    let mut selection = reserved(&lab);
-    let next = move_admitted_candidate(&mut lab);
-    import(&mut selection).unwrap();
-    assert!(
-        registry
-            .with_admitted_source::<()>(&config, Some(&old), |_| panic!("stale actor admitted"))
-            .is_err()
-    );
-    registry
-        .with_admitted_source(&config, None, |_| {
-            for paths in [&original, &next] {
-                for (dir, name) in [
-                    (paths.dir.clone(), ".lock"),
-                    (paths.dir.join("commons/control"), "control.lock"),
-                ] {
-                    assert_eq!(
-                        PrivateLock::take(&dir, name, Duration::ZERO, "source held")
-                            .err()
-                            .map(|error| error.kind()),
-                        Some(std::io::ErrorKind::WouldBlock),
-                        "{} / {name}",
-                        dir.display()
-                    );
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-    for paths in [&original, &next] {
-        drop(PrivateLock::take(&paths.dir, ".lock", Duration::ZERO, "released").unwrap());
-        drop(
-            PrivateLock::take(
-                &paths.dir.join("commons/control"),
-                "control.lock",
-                Duration::ZERO,
-                "released",
-            )
-            .unwrap(),
-        );
-    }
-}
-
-#[test]
 fn native_projection_retains_both_entry_vaults_across_completed_succession() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
     let original = lab.paths[0].clone();
     let registry = crate::alab::Registry::at(original.clone());
     registry.open().unwrap();
     let config = original.home.join("config.toml");
+    let old = registry.observe_projection(&config).unwrap();
     let mut selection = reserved(&lab);
     let next = move_admitted_candidate(&mut lab);
     import(&mut selection).unwrap();
     let before = [files(&original.dir), files(&next.dir)];
     for entry_vault in [&original, &next] {
         let expected = client::config(entry_vault).unwrap().unwrap();
+        assert!(
+            registry
+                .with_admitted_projection::<()>(
+                    &config,
+                    entry_vault,
+                    &expected,
+                    Some(old.revision()),
+                    |_, _| panic!("pre-succession source admitted")
+                )
+                .is_err()
+        );
         registry
             .with_admitted_projection(&config, entry_vault, &expected, None, |_, reader| {
                 assert!(matches!(
@@ -295,6 +255,14 @@ fn native_projection_retains_both_entry_vaults_across_completed_succession() {
             .unwrap();
     }
     assert_eq!([files(&original.dir), files(&next.dir)], before);
+    for paths in [&original, &next] {
+        for (dir, name) in [
+            (paths.dir.clone(), ".lock"),
+            (paths.dir.join("commons/control"), "control.lock"),
+        ] {
+            drop(PrivateLock::take(&dir, name, Duration::ZERO, "released").unwrap());
+        }
+    }
 }
 
 #[test]
@@ -475,7 +443,8 @@ fn comparison_never_repairs_an_ancestor_while_selecting_a_completed_successor() 
     );
     assert_eq!(files(lab._home.path()), before);
     let saved_complete = selection.complete;
-    selection.complete = None;
+    // A later source receipt invalidates the completion: the successor may have authored since.
+    selection.complete = Some([0; 32]);
     selection.save().unwrap();
     let before = files(lab._home.path());
     assert!(db.compare(&source).is_err());
@@ -2007,7 +1976,11 @@ fn shared_application_observation_keeps_deadline_custody_and_catalog_refusals_re
                 admission_deadline()
             }
             6 => {
-                reserved(&lab);
+                // A pending succession's original still reads what it holds (FL-14) until its
+                // import completes; a completed successor supersedes the read.
+                let mut selection = reserved(&lab);
+                selection.complete = Some(seal(&lab.paths[0]).unwrap());
+                selection.save().unwrap();
                 admission_deadline()
             }
             _ => unreachable!(),
@@ -2564,34 +2537,177 @@ fn a_vault_writer_during_a_check_is_busy_not_a_changed_generation() {
     );
 }
 
-/// A read of a successor home whose succession is still preserving old records refuses, as
-/// observing it always did, rather than naming the candidate: so a peek never opens the
-/// candidate's custody before it is complete or answers as if no table were there
-/// (`registry: not imported`).
-/// NEGATIVE CONTROL: with `observed_generation_until` following a selection that is not complete,
-/// it names the candidate and the declaration peek answers `None`.
+/// The refusal every read of a pending succession used to give (ATERM-KI-1109-1, FL-14).
+const PRESERVING: &str = "Commons writer succession is still preserving old records";
+
+/// The writer recovery m22 and m73 were stuck in (FL-14, ATERM-KI-1109-1): the successor home's
+/// plain join is never admitted, so the import stops at the candidate's missing custody and
+/// `import_complete` stays false, pass after pass. The records the original home holds stay
+/// readable from it: a table read, the registry view and a declaration peek answer from the
+/// original, never from the incomplete candidate; nothing writes or authors there, and nothing
+/// the strict selection serves (a writer, `commons-status`'s `ready`) proceeds.
+/// NEGATIVE CONTROL: with `observed_generation_until` refusing a succession that is not
+/// complete, as it did on m73, each read fails with "still preserving old records"; with it
+/// following that selection to the candidate, it names the candidate rather than the original.
 #[test]
-fn a_pending_succession_refuses_a_read_rather_than_naming_its_candidate() {
+fn a_writer_recovery_that_stops_with_import_incomplete_still_reads_held_records() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    data(&lab);
+    crate::alab::Registry::at(original.clone()).open().unwrap();
+    let mut selection = reserved(&lab);
+    let next = candidate(&original);
+    // The candidate was never admitted: its import stops before any record moves, every pass.
+    assert!(import(&mut selection).is_err());
+    assert!(import(&mut selection).is_err());
+    let read_by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let (report, chosen) = status(&original, read_by).unwrap();
+    assert_eq!(report["state"].as_str(), Some("pending"), "{report}");
+    assert_eq!(
+        report["sources"][0]["import_complete"].as_bool(),
+        Some(false),
+        "{report}"
+    );
+    assert_eq!(chosen.err().unwrap().to_string(), PRESERVING);
+    let candidate_files = files(&next.dir);
+    let original_files = files(&original.dir);
+
+    assert_eq!(
+        observed_generation_until(&original, read_by).unwrap(),
+        original
+    );
+    let read = crate::documents::application::observe_store_if_declared_within(
+        &original,
+        records,
+        read_by,
+        &|| read_by,
+        rows,
+    );
+    assert_eq!(read.unwrap(), Some(1), "the held record reads");
+    assert!(
+        crate::documents::application::peek_declaration(&original, records, read_by)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        crate::alab::Registry::at(original.clone())
+            .view_until(read_by)
+            .unwrap()
+            .complete
+    );
+
+    // Still fenced: no authoring, mutation or writer session on the original.
+    assert_eq!(
+        completed_generation_until(&original, read_by)
+            .err()
+            .unwrap()
+            .to_string(),
+        PRESERVING
+    );
+    assert!(guard(&original, true).is_err());
+    assert!(allow_mutation(&original).is_err());
+    assert!(selected(&original).is_err());
+    assert_eq!(
+        files(&next.dir),
+        candidate_files,
+        "the candidate is untouched"
+    );
+    assert_eq!(
+        files(&original.dir),
+        original_files,
+        "the reads wrote nothing"
+    );
+
+    // CONTROL: a completion a later source receipt invalidated is not "never imported": its
+    // successor may have authored since, so the original's records are not the newest and the
+    // read refuses as before.
+    selection.complete = Some([0; 32]);
+    selection.save().unwrap();
+    assert_eq!(
+        observed_generation_until(&original, read_by)
+            .err()
+            .unwrap()
+            .to_string(),
+        PRESERVING
+    );
+    assert!(
+        crate::alab::Registry::at(original.clone())
+            .view_until(read_by)
+            .is_err()
+    );
+}
+
+/// A session opened on the original before its writer recovery began keeps reading the records
+/// it holds while the import has never completed (FL-14), and refuses once that completion is
+/// invalidated by a later source receipt, as its successor may have authored since; a retained
+/// subscriber of a fenced home refuses throughout.
+/// NEGATIVE CONTROL: with `held_here` accepting any selection, the invalidated read answers; with
+/// it refusing every fence, as `guard_until(.., true, ..)` did, the pending read refuses; with
+/// `Session::subscriber` using the read check, the fenced subscriber passes.
+#[test]
+fn an_open_session_reads_while_pending_and_refuses_an_invalidated_completion() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    data(&lab);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let descriptor = records(&bootstrap).unwrap();
+    let read = |session: &Session<'_>, store: &Store, _| Ok(store.catalog(session)?.len());
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    let before = files(lab._home.path());
+    assert_eq!(
+        crate::documents::application::observe_store_in_session(
+            &session,
+            descriptor.clone(),
+            admission_deadline(),
+            read
+        )
+        .unwrap(),
+        1
+    );
+    assert!(session.subscriber(admission_deadline()).is_err());
+    assert_eq!(
+        files(lab._home.path()),
+        before,
+        "the pending read wrote nothing"
+    );
+    selection.complete = Some([0; 32]);
+    selection.save().unwrap();
+    let before_invalidated = files(lab._home.path());
+    assert_eq!(
+        crate::documents::application::observe_store_in_session(
+            &session,
+            descriptor,
+            admission_deadline(),
+            read
+        )
+        .err()
+        .unwrap()
+        .to_string(),
+        PRESERVING
+    );
+    assert_eq!(files(lab._home.path()), before_invalidated);
+}
+
+/// A candidate that was admitted but whose import has not finished is never read: a read of the
+/// original names the original and answers its own declaration, rather than opening the
+/// candidate's custody and answering as if no table were there (`registry: not imported`).
+/// NEGATIVE CONTROL: with `observed_generation_until` following a selection that is not
+/// complete, it names the candidate and the declaration peek answers `None`.
+#[test]
+fn a_pending_succession_reads_the_original_rather_than_its_candidate() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
     let original = lab.paths[0].clone();
     data(&lab);
     let _selection = reserved(&lab);
     move_admitted_candidate(&mut lab);
     let given_time = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let pending = observed_generation_until(&original, given_time)
-        .err()
-        .unwrap()
-        .to_string();
     assert_eq!(
-        pending,
-        "Commons writer succession is still preserving old records"
+        observed_generation_until(&original, given_time).unwrap(),
+        original
     );
-    let declared = crate::documents::application::peek_declaration(
-        &original,
-        |bootstrap| Descriptor::application(bootstrap.trust(), "recovery-test", "records", 1),
-        given_time,
-    );
-    assert_eq!(declared.err().unwrap().to_string(), pending);
+    let declared = crate::documents::application::peek_declaration(&original, records, given_time);
+    assert!(declared.unwrap().is_some());
 }
 
 /// A fleet label's registry generation ([`crate::att::current_within`]) is the read's to answer:
@@ -2617,4 +2733,1104 @@ fn a_busy_vault_keeps_a_labels_registry_generation_busy_not_the_first() {
     assert!(busy.is_busy(), "{busy}");
     let current = crate::att::current_within(&original, &crate::att::REGISTRY, given_time).unwrap();
     assert_eq!(current.generation, crate::att::REGISTRY.generation);
+}
+
+/// A lab vault a server on loopback serves, founded with a membership log and one member, `m1`:
+/// what [`Lab`] builds, with its vault read from a URL as the default ALab's is, so a member's
+/// log admission can hand a bundle (`client::HandedVault`), and read on this thread as the
+/// default ALab's ([`seams::alab_is`]) so a succession enrolls a successor by itself.
+struct Served {
+    lab: Lab,
+    url: String,
+    server: Option<aterm_secrets::server::Running>,
+    /// Every read of the server this fixture started waits the hang detector on this thread,
+    /// never a product's latency budget: the server is on loopback and answers.
+    _answering: client::ServersAnswering,
+}
+impl Drop for Served {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.stop();
+        }
+    }
+}
+
+fn served() -> Served {
+    aterm_spec::fs_lane::join();
+    let home = aterm_tempfile::tempdir().unwrap();
+    let store = home.path().join("served");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = listener.local_addr().unwrap();
+    let server = aterm_secrets::server::start(
+        listener,
+        &aterm_secrets::server::Options {
+            listen,
+            store: store.clone(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(10),
+            keep_awake: false,
+        },
+    )
+    .unwrap();
+    let url = format!("http://{listen}/v1/team");
+    let m1 = Paths::for_home(&home.path().join("m1"));
+    let created = client::create(&m1, &url, None, Some("m1")).unwrap();
+    client::seed_vault_genesis(&m1, &home.path().join("genesis.v2")).unwrap();
+    seams::alab_is(client::config(&m1).unwrap().unwrap().signer.unwrap());
+    Served {
+        lab: Lab {
+            _home: home,
+            paths: vec![m1],
+            signer: created.signer,
+            source: store.join("team.vault"),
+        },
+        url,
+        server: Some(server),
+        _answering: client::ServersAnswering::within(aterm_spec::wait::MUST_HAPPEN),
+    }
+}
+
+/// A deadline no step of a test's pass reaches unless it hangs.
+fn hang() -> Instant {
+    Instant::now() + aterm_spec::wait::MUST_HAPPEN
+}
+
+type Trust = aterm_secrets::commons::journal::Trust;
+type Binding = aterm_secrets::commons::binding::Binding;
+type Actor = aterm_secrets::membership_log::MemberId;
+
+/// The membership the log `paths` holds evaluates to.
+fn membership(paths: &Paths) -> aterm_secrets::membership_log::Membership {
+    client::load_records(paths)
+        .unwrap()
+        .log()
+        .unwrap()
+        .membership()
+}
+
+/// Whether the log `viewer` holds seats exactly `binding`.
+fn seats(viewer: &Paths, binding: &Binding) -> bool {
+    membership(viewer)
+        .get(&binding.actor())
+        .is_some_and(|seat| seat.binding == *binding)
+}
+
+/// How many seats the log `viewer` holds stand on an `Admit` `actor` signed.
+fn admitted_by(viewer: &Paths, actor: &Actor) -> usize {
+    membership(viewer)
+        .members()
+        .values()
+        .filter(|seat| seat.admitted_by == Some(*actor))
+        .count()
+}
+
+/// The `Admit`s of `binding` the log `viewer` holds: each one's evidence.
+fn admits_of(viewer: &Paths, binding: &Binding) -> Vec<aterm_secrets::membership_log::Evidence> {
+    client::load_records(viewer)
+        .unwrap()
+        .log()
+        .unwrap()
+        .records()
+        .filter_map(|record| match record.body() {
+            aterm_secrets::membership_log::Body::Admit { entrant, evidence }
+                if entrant.request.binding() == binding =>
+            {
+                Some(*evidence)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `to` takes every membership record `from` holds, as the vault's exchange carries them.
+fn carry(from: &Paths, to: &Paths) {
+    client::save_records(to, &client::load_records(from).unwrap().encode()).unwrap();
+}
+
+/// The device request the home `paths` holds asks with, under `trust`.
+fn request_of(paths: &Paths, trust: &Trust) -> aterm_secrets::commons::binding::Request {
+    Device::open(paths)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap()
+}
+
+/// The device of `signer`'s own word for the key `home` holds, as [`admit_by_statement`] signs
+/// the original's.
+fn statement_by(signer: &Paths, home: &Paths, trust: &Trust) -> Allowed {
+    statement_named(signer, home, trust, "m1")
+}
+
+/// [`statement_by`], naming the successor's home `name`.
+fn statement_named(signer: &Paths, home: &Paths, trust: &Trust, name: &str) -> Allowed {
+    let request = request_of(home, trust);
+    Device::open(signer)
+        .unwrap()
+        .unwrap()
+        .with_seed(|seed| Allowed::sign(request.binding(), name, seed))
+        .unwrap()
+}
+
+/// The member at `member` is presented `statement` for the key the home `home` holds.
+fn present(member: &Paths, home: &Paths, trust: &Trust, statement: &Allowed) -> client::Succession {
+    let device = Device::open(home).unwrap().unwrap();
+    let request = device.request(trust.network, trust.authority).unwrap();
+    let reader = Reader::BoundedLog(
+        client::records_bound(home, &client::load_records(home).unwrap()).unwrap(),
+    );
+    client::admit_successor(
+        member,
+        &client::Succeeding {
+            request: &request,
+            statement,
+            reader,
+            lab: device.lab().is_some(),
+        },
+        aterm_time::unix_millis().unwrap(),
+        hang(),
+    )
+    .unwrap()
+}
+
+/// A second Mac a person allowed into the served lab at its first member's desk, before any
+/// loss: a current member that is no part of the first member's writer lineage.
+fn allowed_member(served: &mut Served, name: &str) -> Paths {
+    let lab = &served.lab;
+    let home = Paths::for_home(&lab._home.path().join(name));
+    client::machine_identity(&home).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let request = request_of(&home, &bootstrap.trust());
+    let allowed = bootstrap
+        .device()
+        .with_seed(|seed| Allowed::sign(request.binding(), name, seed))
+        .unwrap();
+    let handout = client::hand_over(
+        &lab.paths[0],
+        &aterm_secrets::members::desk::Handing {
+            request: &request,
+            node: request.binding().recipient().0,
+            name: allowed.name(),
+            allowed: &allowed,
+            reader: Reader::LegacyLog,
+            restore: false,
+            node_proven: false,
+            held: None,
+        },
+    )
+    .unwrap();
+    assert!(handout.logged);
+    client::write_from_log_bundle(&home, &Bundle::decode(handout.bundle.as_slice()).unwrap())
+        .unwrap();
+    served.lab.paths.push(home.clone());
+    home
+}
+
+/// Whether the succession `original` fenced is sealed and selects its successor home.
+fn completes(original: &Paths) -> bool {
+    Selection::read(original)
+        .ok()
+        .flatten()
+        .is_some_and(|selection| seal(original).is_ok_and(|seal| selection.complete == Some(seal)))
+        && selected(original).is_ok_and(|paths| paths == candidate(original))
+}
+
+/// The Commons table records `paths` holds, or `None` where it holds no table.
+fn tables(paths: &Paths) -> Option<BTreeMap<std::path::PathBuf, Vec<u8>>> {
+    let dir = paths.dir.join("commons/tables");
+    dir.exists().then(|| files(&dir))
+}
+
+/// Whether the fenced writer at `paths` authored a Commons table record since `before`, or
+/// could: its table files changed, or its session still opens for writing.
+fn authors(paths: &Paths, before: &Option<BTreeMap<std::path::PathBuf, Vec<u8>>>) -> bool {
+    let opens = fenced(paths).unwrap()
+        && Bootstrap::cached(paths)
+            .ok()
+            .flatten()
+            .is_some_and(|bootstrap| {
+                Session::open(&bootstrap).is_ok_and(|session| session.writer().is_ok())
+            });
+    opens || tables(paths) != *before
+}
+
+/// SF-A's exit (ATERM-KI-1109-1, the never-completed branch): a writer whose table binding was
+/// lost fences itself and, still a current member of its vault, signs one statement naming the
+/// device key its successor home holds; the vault's membership log seats the successor on it,
+/// as every other member's evaluator then does, and the same recovery pass imports the
+/// witnessed prefix and seals the succession. No person answers anything in it: the pass is the
+/// runtime's own [`advance`], no successor was admitted beforehand, and the one Allow in this
+/// test let the second member in before the loss. The original stays fenced and authors
+/// nothing.
+#[test]
+fn a_fenced_originals_signed_statement_admits_its_successor_and_the_succession_completes_with_no_person()
+ {
+    let mut served = served();
+    let peer = allowed_member(&mut served, "m2");
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    let (scope, id) = data(lab);
+    changed_device(lab);
+    let old = lab.bootstrap(0);
+    let trust = old.trust();
+    let old_actor = Session::observe(&old).unwrap().actor();
+    let claims_before = files(&original.dir.join("commons/table-claims"));
+    let records_before = tables(&original);
+    assert_eq!(membership(&original).members().len(), 2);
+    assert!(
+        !candidate(&original).dir.exists(),
+        "no successor home, key or seat exists before the pass"
+    );
+
+    // The recovery pass, twice as the runtime runs it between transport lifetimes: the first
+    // fences, signs, admits and imports; the second finds the sealed succession.
+    let next = advance(&original, &config).unwrap();
+    assert_eq!(next, candidate(&original));
+    let selection = Selection::read(&original).unwrap().unwrap();
+    assert_eq!(
+        selection.complete,
+        Some(seal(&original).unwrap()),
+        "the succession is sealed in the pass that admitted its successor"
+    );
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(completes(&original));
+    assert_eq!(crate::application_paths(&original).unwrap(), next);
+    assert_eq!(statement_refused(&original), None);
+
+    // The statement: the original's own device key names exactly the successor's key.
+    let request = request_of(&next, &trust);
+    let binding = request.binding();
+    let kept = fsx::read_private(&root(&original).join(STATEMENT), MAX_STATE)
+        .unwrap()
+        .unwrap();
+    let statement = Allowed::decode(kept.as_slice()).unwrap();
+    assert_eq!(statement.signer()[..], old_actor[..32]);
+    assert_eq!(statement.binding(), binding);
+    assert_ne!(binding.actor(), old_actor);
+
+    // The log seats the successor as one more seat, admitted once by the original with no
+    // person's phrase and no fleet node key, beside the original, whose seat stays. The other
+    // member, which signed nothing, seats it from the same records.
+    carry(&original, &peer);
+    for viewer in [&original, &peer, &next] {
+        let members = membership(viewer);
+        assert_eq!(members.members().len(), 3);
+        assert!(members.contains(&old_actor));
+        let seat = members.get(&binding.actor()).unwrap();
+        assert_eq!(seat.binding, *binding);
+        assert_eq!(seat.admitted_by, Some(old_actor));
+        assert_eq!(seat.node_key, None);
+        assert_eq!(seat.name, "m1");
+        assert_eq!(
+            admits_of(viewer, binding),
+            vec![aterm_secrets::membership_log::Evidence::Manual]
+        );
+    }
+    assert!(matches!(
+        client::status(&next).unwrap().membership,
+        client::Membership::In { .. }
+    ));
+
+    // The successor authors with a new actor over the exact old operations.
+    let fresh = Bootstrap::required(&next).unwrap();
+    let session = Session::open(&fresh).unwrap();
+    assert_eq!(session.actor(), binding.actor());
+    session.writer().unwrap();
+    let directory = Directory::new(&next, fresh.trust());
+    let mut store = Store::open(&session, &directory.path(scope).unwrap(), scope).unwrap();
+    let retained = store.catalog(&session).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].header().id, id);
+    assert_eq!(
+        retained[0].payload(),
+        b"retained before device-number change"
+    );
+    store
+        .commit_catalog(&session, b"new writer operation")
+        .unwrap();
+    assert_eq!(store.catalog(&session).unwrap().len(), 2);
+    drop(store);
+    drop(session);
+
+    // The fence, the old actor's records and its claims are as the loss left them.
+    assert!(guard(&original, true).is_err());
+    assert!(!authors(&original, &records_before));
+    assert_eq!(
+        files(&original.dir.join("commons/table-claims")),
+        claims_before
+    );
+}
+
+/// The member's `Admit` is durable and the successor's home never wrote the bundle (the pass
+/// died between the two): the next pass finds the kept statement, signs no second `Admit`, and
+/// completes on the seat the log already holds.
+#[test]
+fn a_pass_that_died_after_the_admission_resumes_on_the_kept_statement_without_a_second_admit() {
+    let served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    reserved(lab);
+    let next = candidate(&original);
+    client::machine_identity(&next).unwrap();
+    let statement = statement_by(&original, &next, &trust);
+    fsx::write_new(&root(&original).join(STATEMENT), statement.bytes(), 0o600).unwrap();
+    let client::Succession::Let { signed, .. } = present(&original, &next, &trust, &statement)
+    else {
+        panic!("the original's own statement admits its successor");
+    };
+    assert!(signed > 0);
+    let binding = request_of(&next, &trust).binding().clone();
+    assert!(seats(&original, &binding));
+    assert!(client::config(&next).unwrap().is_none());
+    let held = client::load_records(&original).unwrap().encode();
+
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(completes(&original));
+    assert_eq!(
+        admits_of(&original, &binding),
+        vec![aterm_secrets::membership_log::Evidence::Manual]
+    );
+    assert_eq!(
+        client::load_records(&original).unwrap().encode(),
+        held,
+        "the resumed pass signs nothing more"
+    );
+    assert_eq!(
+        fsx::read_private(&root(&original).join(STATEMENT), MAX_STATE)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        statement.bytes()
+    );
+}
+
+/// The state the stuck Macs are in (ATERM-KI-1109-1): the successor home asked plainly on an
+/// earlier pass, nobody answered, and it has waited since, configured and pending. The next
+/// pass admits that same home, with the key it asked under, on the original's statement.
+#[test]
+fn a_successor_whose_plain_ask_nobody_answered_is_admitted_on_the_statement() {
+    let served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    reserved(lab);
+    let next = candidate(&original);
+    let asked = client::join_if_unchanged_until(
+        &next,
+        &client::JoinOptions {
+            source: format!("{}#{}", served.url, lab.signer),
+            host: Some("m1".to_owned()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| false,
+            password: client::JoinPassword::Given(None),
+            fetched: None,
+            requested: &|| {},
+            say: &|_| {},
+        },
+        None,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert!(
+        matches!(
+            client::status(&next).unwrap().membership,
+            client::Membership::Pending
+        ),
+        "{:?}",
+        asked.map(|_| ())
+    );
+    let binding = request_of(&next, &trust).binding().clone();
+    assert!(!seats(&original, &binding));
+    let mut selection = Selection::read(&original).unwrap().unwrap();
+    assert!(
+        import(&mut selection).is_err(),
+        "a pending home imports nothing"
+    );
+    // An earlier pass kept why its statement admitted nothing.
+    note_statement(&original, Some(&Error::new("an earlier pass's reason")));
+    assert_eq!(
+        statement_refused(&original).as_deref(),
+        Some("an earlier pass's reason")
+    );
+
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(completes(&original));
+    assert_eq!(
+        statement_refused(&original),
+        None,
+        "the reason is forgotten once the statement admits"
+    );
+    let (report, _) = status(&original, hang()).unwrap();
+    assert!(report["sources"][0]["statement_refused"].is_null());
+    assert_eq!(request_of(&next, &trust).binding(), &binding);
+    assert!(seats(&original, &binding));
+    assert!(matches!(
+        client::status(&next).unwrap().membership,
+        client::Membership::In { .. }
+    ));
+    Session::open(&Bootstrap::required(&next).unwrap())
+        .unwrap()
+        .writer()
+        .unwrap();
+}
+
+/// A new seat is signed only by a member that just read the vault's newest records and whose
+/// clock is set: with either missing, the original's own valid statement signs nothing, the
+/// successor stays out, and the pass leaves the succession pending for the next one.
+#[test]
+fn a_member_with_no_clock_or_no_read_of_the_newest_records_signs_no_successor_seat() {
+    let mut served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    reserved(lab);
+    let next = candidate(&original);
+    client::machine_identity(&next).unwrap();
+    let statement = statement_by(&original, &next, &trust);
+    let device = Device::open(&next).unwrap().unwrap();
+    let request = device.request(trust.network, trust.authority).unwrap();
+    let held = client::load_records(&original).unwrap().encode();
+    let unset = client::admit_successor(
+        &original,
+        &client::Succeeding {
+            request: &request,
+            statement: &statement,
+            reader: Reader::BoundedLog(
+                client::records_bound(&next, &client::load_records(&next).unwrap()).unwrap(),
+            ),
+            lab: device.lab().is_some(),
+        },
+        0,
+        hang(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&unset, client::Succession::Refused(why) if why.contains("clock")),
+        "{unset:?}"
+    );
+    served.server.take().unwrap().stop();
+    let stale = present(&original, &next, &trust, &statement);
+    assert!(
+        matches!(&stale, client::Succession::Refused(_)),
+        "{stale:?}"
+    );
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(!completes(&original));
+    assert!(!seats(&original, request.binding()));
+    assert_eq!(client::load_records(&original).unwrap().encode(), held);
+    assert!(guard(&original, true).is_err());
+    // The pass kept why, and the status a person reads names it beside the pending source.
+    let why = statement_refused(&original).unwrap();
+    assert!(why.contains("newest records"), "{why}");
+    let (report, _) = status(&original, hang()).unwrap();
+    assert_eq!(report["state"].as_str(), Some("pending"));
+    assert_eq!(
+        report["sources"][0]["statement_refused"].as_str(),
+        Some(why.as_str())
+    );
+    // The same reason on the next pass rewrites nothing.
+    let noted = std::fs::metadata(root(&original).join(REFUSED))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert_eq!(
+        std::fs::metadata(root(&original).join(REFUSED))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        noted
+    );
+}
+
+/// No wait of the statement's admission outlasts its pass: with the pass's deadline already
+/// gone, the member reads nothing, waits for nothing and signs nothing, and the successor home
+/// takes no bundle. (Before the deadline reached them, the member's device custody and the
+/// successor home's state were each waited for without limit.)
+#[test]
+fn a_statement_whose_pass_has_ended_waits_for_nothing_and_signs_nothing() {
+    let served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    reserved(lab);
+    let next = candidate(&original);
+    client::machine_identity(&next).unwrap();
+    let statement = statement_by(&original, &next, &trust);
+    let device = Device::open(&next).unwrap().unwrap();
+    let request = device.request(trust.network, trust.authority).unwrap();
+    let held = client::load_records(&original).unwrap().encode();
+    let ended = Instant::now();
+    let late = client::admit_successor(
+        &original,
+        &client::Succeeding {
+            request: &request,
+            statement: &statement,
+            reader: Reader::BoundedLog(
+                client::records_bound(&next, &client::load_records(&next).unwrap()).unwrap(),
+            ),
+            lab: device.lab().is_some(),
+        },
+        aterm_time::unix_millis().unwrap(),
+        ended,
+    );
+    assert!(
+        !matches!(late, Ok(client::Succession::Let { .. })),
+        "{late:?}"
+    );
+    assert_eq!(client::load_records(&original).unwrap().encode(), held);
+    assert!(!seats(&original, request.binding()));
+
+    // The bundle of a real admission, offered to the successor home after the pass ended.
+    let client::Succession::Let { bundle, .. } = present(&original, &next, &trust, &statement)
+    else {
+        panic!("the original's own statement admits its successor");
+    };
+    let bundle = Bundle::decode(bundle.as_slice()).unwrap();
+    assert!(client::readmit_from_log_bundle_until(&next, &bundle, ended).is_err());
+    assert!(client::config(&next).unwrap().is_none());
+    client::readmit_from_log_bundle_until(&next, &bundle, hang()).unwrap();
+    assert!(matches!(
+        client::status(&next).unwrap().membership,
+        client::Membership::In { .. }
+    ));
+}
+
+/// Whether every newest `[everyone]` epoch the log `viewer` holds is wrapped to the age
+/// recipient of `binding`: whether its Mac can open what the vault's members write now.
+fn wrapped_newest(viewer: &Paths, binding: &Binding) -> bool {
+    client::load_records(viewer)
+        .unwrap()
+        .log()
+        .unwrap()
+        .wraps_maximal_audience_to(
+            &aterm_secrets::membership_log::EpochAudience::Everyone,
+            &binding.recipient(),
+        )
+}
+
+/// The durable fixture a path of [`aterm_models_db::writer_succession_model`]'s actions runs
+/// on: a served lab of two members, the first of which (`m1`, the original) lost a table
+/// binding. The second (`m2`, the peer) signs nothing of the succession; its log, with every
+/// record the original holds carried to it, is the one the model's variables are read from.
+struct Lineage {
+    served: Served,
+    peer: Paths,
+    original: Paths,
+    config: std::path::PathBuf,
+    trust: Trust,
+    old_actor: Actor,
+    /// The original's Commons table records before any action.
+    tables: Option<BTreeMap<std::path::PathBuf, Vec<u8>>>,
+    /// The seats that stood on the original's admissions before any action: the peer's.
+    baseline: usize,
+    /// The key the log first seated on the original's statement.
+    first: Option<Binding>,
+    /// Which statement that is not the original's own was presented (the model's `presented`),
+    /// and the keys it was presented for.
+    presented: i64,
+    foreign: Vec<Binding>,
+}
+
+impl Lineage {
+    fn new() -> Self {
+        let mut served = served();
+        let peer = allowed_member(&mut served, "m2");
+        let original = served.lab.paths[0].clone();
+        let config = original.home.join("config.toml");
+        data(&served.lab);
+        changed_device(&served.lab);
+        let old = served.lab.bootstrap(0);
+        let trust = old.trust();
+        let old_actor = Session::observe(&old).unwrap().actor();
+        let tables = tables(&original);
+        let baseline = admitted_by(&peer, &old_actor);
+        Self {
+            served,
+            peer,
+            original,
+            config,
+            trust,
+            old_actor,
+            tables,
+            baseline,
+            first: None,
+            presented: 0,
+            foreign: Vec::new(),
+        }
+    }
+
+    fn next(&self) -> Paths {
+        candidate(&self.original)
+    }
+
+    fn pass(&self) -> Paths {
+        advance(&self.original, &self.config).unwrap()
+    }
+
+    /// The statement kept beside the original's fence, if it decodes.
+    fn kept(&self) -> Option<Allowed> {
+        let kept = fsx::read_private(&root(&self.original).join(STATEMENT), MAX_STATE).unwrap()?;
+        Allowed::decode(kept.as_slice()).ok()
+    }
+
+    /// Run the model's `action` on the stores.
+    fn apply(&mut self, action: &str) {
+        let next = self.next();
+        match action {
+            // The fenced original signs for the device its reserved successor home holds.
+            "Statement" => {
+                assert_eq!(self.pass(), next);
+                let binding = request_of(&next, &self.trust).binding().clone();
+                if !membership(&self.peer).contains(&self.old_actor) {
+                    // The other member removed the original, which had not heard: its pass
+                    // signed and its own side seats the successor. The removal voids the
+                    // admission wherever both are held, and once it has heard it signs nothing.
+                    assert!(seats(&self.original, &binding), "the split side seats it");
+                    carry(&self.original, &self.peer);
+                    carry(&self.peer, &self.original);
+                    assert!(!matches!(
+                        present(&self.original, &next, &self.trust, &self.kept().unwrap()),
+                        client::Succession::Let { .. }
+                    ));
+                }
+                self.first = Some(binding);
+            }
+            // A person removes the original's Mac at the other member, by the name its seat
+            // and its successor's seat both carry.
+            "Remove" => {
+                carry(&self.original, &self.peer);
+                if let Some(successor) = &self.first {
+                    assert!(seats(&self.peer, successor));
+                    assert!(
+                        wrapped_newest(&self.peer, successor),
+                        "the successor opens the vault's newest epoch before the removal"
+                    );
+                }
+                assert!(client::test_remove_unposted(&self.peer, "m1").unwrap() > 0);
+                let own = request_of(&self.peer, &self.trust).binding().clone();
+                assert!(wrapped_newest(&self.peer, &own));
+                if let Some(successor) = &self.first {
+                    assert!(
+                        !wrapped_newest(&self.peer, successor),
+                        "no epoch minted after the removal is wrapped to the successor's key"
+                    );
+                    // The removed Mac hears of it.
+                    carry(&self.peer, &self.original);
+                }
+            }
+            // The home is restored from a backup taken before the fence: nothing of the
+            // succession is left on it (no reservation, selection, statement or successor
+            // home), and its read of the vault brought the membership log back, the first
+            // successor's seat with it. Its pass fences again and mints another device.
+            "Rekey" => {
+                let first = self.first.clone().unwrap();
+                assert!(seats(&self.original, &first));
+                std::fs::remove_dir_all(root(&self.original)).unwrap();
+                assert!(!fenced(&self.original).unwrap());
+                assert_eq!(self.pass(), next);
+                assert_ne!(
+                    request_of(&next, &self.trust).binding().actor(),
+                    first.actor()
+                );
+            }
+            // The original's statement names another key than the one its successor home
+            // holds.
+            "OtherKey" => {
+                reserved(&self.served.lab);
+                client::machine_identity(&next).unwrap();
+                let other = Paths::for_home(&self.served.lab._home.path().join("other"));
+                client::machine_identity(&other).unwrap();
+                let statement = statement_by(&self.original, &other, &self.trust);
+                assert!(matches!(
+                    present(&self.original, &next, &self.trust, &statement),
+                    client::Succession::Refused(_)
+                ));
+                fsx::write_atomic(
+                    &root(&self.original).join(STATEMENT),
+                    statement.bytes(),
+                    0o600,
+                )
+                .unwrap();
+                assert_eq!(self.pass(), next);
+                self.presented = 2;
+                self.foreign = vec![
+                    request_of(&next, &self.trust).binding().clone(),
+                    request_of(&other, &self.trust).binding().clone(),
+                ];
+            }
+            // Another current member signs for the original's successor home.
+            "OtherSigner" => {
+                reserved(&self.served.lab);
+                client::machine_identity(&next).unwrap();
+                let statement = statement_by(&self.peer, &next, &self.trust);
+                assert!(matches!(
+                    present(&self.original, &next, &self.trust, &statement),
+                    client::Succession::Refused(_)
+                ));
+                fsx::write_atomic(
+                    &root(&self.original).join(STATEMENT),
+                    statement.bytes(),
+                    0o600,
+                )
+                .unwrap();
+                assert_eq!(self.pass(), next);
+                self.presented = 3;
+                self.foreign = vec![request_of(&next, &self.trust).binding().clone()];
+            }
+            // A Mac that holds the vault's log and no seat in it signs for a home of its own,
+            // at its own desk and at a member's.
+            "NonMember" => {
+                let lab = &self.served.lab;
+                let stranger = Paths::for_home(&lab._home.path().join("stranger"));
+                client::configure_log_member(
+                    &stranger,
+                    &format!("{}#{}", self.served.url, lab.signer),
+                    "m9",
+                )
+                .unwrap();
+                client::machine_identity(&stranger).unwrap();
+                carry(&self.original, &stranger);
+                let heir = Paths::for_home(&lab._home.path().join("heir"));
+                client::machine_identity(&heir).unwrap();
+                let statement = statement_by(&stranger, &heir, &self.trust);
+                for member in [&stranger, &self.original] {
+                    assert!(!matches!(
+                        present(member, &heir, &self.trust, &statement),
+                        client::Succession::Let { .. }
+                    ));
+                }
+                carry(&stranger, &self.original);
+                self.presented = 4;
+                self.foreign = vec![request_of(&heir, &self.trust).binding().clone()];
+            }
+            _ => panic!("unknown succession action {action}"),
+        }
+    }
+
+    /// The stores, read back as the model's variables, with every record the original holds
+    /// carried to the other member.
+    fn state(&self, before: &aterm_spec::interp::State) -> aterm_spec::interp::State {
+        carry(&self.original, &self.peer);
+        let next = self.next();
+        let held = Device::open(&next)
+            .ok()
+            .flatten()
+            .and_then(|device| {
+                device
+                    .request(self.trust.network, self.trust.authority)
+                    .ok()
+            })
+            .map(|request| request.binding().clone());
+        // The original's pass ran on its own statement: the one kept beside its fence carries
+        // its device signature and names the device its successor home holds.
+        let passed = self.kept().is_some_and(|statement| {
+            statement.signer()[..] == self.old_actor[..32]
+                && held
+                    .as_ref()
+                    .is_some_and(|held| statement.binding() == held)
+        });
+        let rekeyed = match (&self.first, &held) {
+            (Some(first), Some(held)) => first.actor() != held.actor(),
+            _ => false,
+        };
+        let mut after = before.clone();
+        after.insert(
+            "member",
+            i64::from(membership(&self.peer).contains(&self.old_actor)),
+        );
+        after.insert("passed", i64::from(passed));
+        after.insert(
+            "seated",
+            i64::try_from(admitted_by(&self.peer, &self.old_actor)).unwrap()
+                - i64::try_from(self.baseline).unwrap(),
+        );
+        after.insert("completed", i64::from(completes(&self.original)));
+        after.insert("rekeyed", i64::from(rekeyed));
+        after.insert("authored", i64::from(authors(&self.original, &self.tables)));
+        after.insert("presented", self.presented);
+        after.insert(
+            "foreign",
+            i64::from(
+                self.foreign
+                    .iter()
+                    .any(|binding| seats(&self.peer, binding)),
+            ),
+        );
+        after
+    }
+}
+
+/// Run `path`, the model's actions in order, each on the stores the one before left, and hold
+/// every step to the model: the stores' state after it is a successor of their state before
+/// it. Returns the fixture and its last state.
+fn succession_path(
+    model: &aterm_spec::derive::Model,
+    path: &[&str],
+) -> (Lineage, aterm_spec::interp::State) {
+    let mut lineage = Lineage::new();
+    let mut state = lineage.state(&model.init_state());
+    assert_eq!(
+        state,
+        model.init_state(),
+        "the fixture starts at the model's start"
+    );
+    for action in path {
+        lineage.apply(action);
+        let after = lineage.state(&state);
+        assert!(
+            model.successors(action, &state).contains(&after),
+            "{path:?} at {action}: {state:?} -> {after:?}"
+        );
+        state = after;
+    }
+    (lineage, state)
+}
+
+/// The succession's code refines its model: along each path of its actions the real stores
+/// step as the model does, so every law holds of what they came to. The paths cover every
+/// action, a person's removal of the Mac both before and after its statement, and a home
+/// restored with nothing of its fence.
+///
+/// NEGATIVE CONTROLS, each a state the model has no step to and that breaks the law named:
+/// - with the member's one-successor rule off ([`client::SecondSuccessor`]), the restored home
+///   gets a second statement and the log seats two successors of one member (`OneSuccessor`);
+/// - a removal of the original's one seat that sweeps nothing (the runtime's removal of an
+///   actor, which takes that seat alone) leaves the Mac's successor seated
+///   (`RemovedMacKeepsNoSuccessor`).
+#[test]
+fn writer_succession_conforms_and_a_second_successor_or_an_unswept_one_is_detected() {
+    let model = aterm_models_db::writer_succession_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    let paths: [&[&str]; 6] = [
+        &["Statement", "Rekey", "Remove"],
+        &["Statement", "Remove"],
+        &["Remove", "Statement"],
+        &["OtherKey"],
+        &["OtherSigner"],
+        &["NonMember"],
+    ];
+    let ran: std::collections::BTreeSet<&str> =
+        paths.iter().flat_map(|path| path.iter().copied()).collect();
+    assert_eq!(
+        ran,
+        aterm_spec::interp::fired_actions(&model),
+        "every action of the model runs on real stores"
+    );
+    assert_eq!(ran.len(), model.actions.len());
+    for path in paths {
+        let (lineage, _) = succession_path(&model, path);
+        if matches!(path[0], "OtherKey" | "OtherSigner") {
+            // What kept the successor out was the statement alone: with it gone, the same
+            // fence signs its own and completes.
+            std::fs::remove_file(root(&lineage.original).join(STATEMENT)).unwrap();
+            lineage.pass();
+            assert!(
+                completes(&lineage.original),
+                "{path:?}: the fixture's fence completes on its own statement"
+            );
+        }
+    }
+
+    let (mut lineage, state) = succession_path(&model, &["Statement"]);
+    let twice = {
+        let _second = client::SecondSuccessor::allowed();
+        lineage.apply("Rekey");
+        lineage.state(&state)
+    };
+    assert_eq!(
+        twice["seated"], 2,
+        "the negative control must seat a second successor of one member"
+    );
+    assert!(!model.successors("Rekey", &state).contains(&twice));
+    assert!(!model.check_invariant("OneSuccessor", &twice));
+
+    let (lineage, state) = succession_path(&model, &["Statement"]);
+    carry(&lineage.original, &lineage.peer);
+    assert!(
+        !client::remove_member_in_log(&lineage.peer, lineage.old_actor)
+            .unwrap()
+            .is_empty()
+    );
+    let unswept = lineage.state(&state);
+    assert_eq!(
+        (unswept["member"], unswept["seated"]),
+        (0, 1),
+        "the negative control must leave the removed Mac's successor seated"
+    );
+    assert!(!model.successors("Remove", &state).contains(&unswept));
+    assert!(!model.check_invariant("RemovedMacKeepsNoSuccessor", &unswept));
+}
+
+/// A person's `aterm members remove <Mac> --stolen` after the Mac's writer was succeeded on its
+/// own statement: the Mac's name names its seat and its successor's, the removal resolves it to
+/// the Mac and takes both seats out in one batch, and the keys rotated because of the theft
+/// are wrapped to neither. The member a person allowed at the removed Mac's desk, a Mac of its
+/// own, stays.
+#[test]
+fn a_persons_removal_of_a_stolen_mac_takes_its_statement_admitted_successor_out_with_it() {
+    let mut served = served();
+    let peer = allowed_member(&mut served, "m2");
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    let old = lab.bootstrap(0);
+    let trust = old.trust();
+    let old_actor = Session::observe(&old).unwrap().actor();
+    let next = advance(&original, &config).unwrap();
+    assert!(completes(&original));
+    let successor = request_of(&next, &trust).binding().clone();
+    let own = request_of(&peer, &trust).binding().clone();
+    let stolen = request_of(&original, &trust).binding().clone();
+    carry(&original, &peer);
+    let before = membership(&peer);
+    assert_eq!(before.members().len(), 3);
+    let seat = before.get(&successor.actor()).unwrap();
+    assert_eq!(
+        (seat.name.as_str(), seat.admitted_by, seat.node_key),
+        ("m1", Some(old_actor), None)
+    );
+    assert_ne!(successor.recipient(), stolen.recipient());
+    for binding in [&successor, &stolen, &own] {
+        assert!(wrapped_newest(&peer, binding));
+    }
+
+    let removal = client::remove_member(&peer, "m1", true).unwrap();
+    assert_eq!(removal.label, before.get(&old_actor).unwrap().label);
+    assert!(
+        removal
+            .rotated
+            .iter()
+            .any(|audience| audience == "everyone")
+    );
+    let after = membership(&peer);
+    assert_eq!(after.members().len(), 1);
+    assert!(after.contains(&own.actor()));
+    for gone in [&successor, &stolen] {
+        assert!(!after.contains(&gone.actor()));
+        assert!(after.removal(&gone.actor()).is_some());
+        assert!(
+            !wrapped_newest(&peer, gone),
+            "the epoch minted because of the theft is wrapped to no key on the stolen disk"
+        );
+    }
+    assert!(wrapped_newest(&peer, &own));
+
+    // Neither seat is left to name: the Mac is removed already.
+    let again = client::remove_member(&peer, "m1", true).unwrap_err();
+    assert!(again.to_string().contains("removed already"), "{again}");
+}
+
+/// What ties a successor's seat to its Mac is the name the log gave the Mac's own seat, never
+/// one this Mac's files supply: a statement that names the successor's home otherwise (a Mac
+/// whose host name changed since it joined) still seats the successor under the log's name,
+/// and a person's removal of the Mac by that name takes the successor out with it.
+#[test]
+fn a_successors_seat_carries_the_name_the_log_gave_its_mac_whatever_the_statement_says() {
+    let mut served = served();
+    let peer = allowed_member(&mut served, "m2");
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    reserved(lab);
+    let next = candidate(&original);
+    client::machine_identity(&next).unwrap();
+    let statement = statement_named(&original, &next, &trust, "renamed");
+    let client::Succession::Let { bundle, .. } = present(&original, &next, &trust, &statement)
+    else {
+        panic!("the original's own statement admits its successor");
+    };
+    let successor = request_of(&next, &trust).binding().clone();
+    assert_eq!(
+        membership(&original).get(&successor.actor()).unwrap().name,
+        "m1"
+    );
+    // The successor's home is still named as its Mac names it now.
+    client::readmit_from_log_bundle_until(
+        &next,
+        &Bundle::decode(bundle.as_slice()).unwrap(),
+        hang(),
+    )
+    .unwrap();
+    assert_eq!(client::config(&next).unwrap().unwrap().host, "renamed");
+
+    carry(&original, &peer);
+    assert!(client::test_remove_unposted(&peer, "m1").unwrap() > 0);
+    let after = membership(&peer);
+    assert!(after.removal(&successor.actor()).is_some());
+    assert_eq!(after.members().len(), 1);
+}
+
+/// A first generation's statement presented as the second's admits nothing, and is read at the
+/// second generation's own fence: the first succession completes, its successor loses a binding
+/// in turn, and the statement the original signed for it is planted beside the successor's
+/// fence. It differs from the successor's own in both its signer (the original, not the
+/// successor) and the key it names (the successor's, not its successor's), so each of those
+/// checks refuses it. With it gone, the successor signs its own, under the name the log gave
+/// the original's seat, and the lineage is two successions deep.
+#[test]
+fn a_first_generations_statement_presented_as_the_seconds_admits_nothing() {
+    let served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    let trust = lab.bootstrap(0).trust();
+    let next = candidate(&original);
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(completes(&original));
+    let replayed = fsx::read_private(&root(&original).join(STATEMENT), MAX_STATE)
+        .unwrap()
+        .unwrap();
+    let successor = request_of(&next, &trust).binding().clone();
+
+    changed_device_at(&next);
+    aterm_journal::create_private_dir_durable(&root(&next)).unwrap();
+    reserve(&next, &config, &Bootstrap::required(&next).unwrap()).unwrap();
+    let newest = candidate(&next);
+    fsx::write_atomic(&root(&next).join(STATEMENT), replayed.as_slice(), 0o600).unwrap();
+    assert_eq!(advance(&original, &config).unwrap(), newest);
+    let second = request_of(&newest, &trust).binding().clone();
+    assert_ne!(second.actor(), successor.actor());
+    let statement = Allowed::decode(replayed.as_slice()).unwrap();
+    assert_ne!(statement.signer()[..], successor.actor()[..32]);
+    assert_ne!(statement.binding(), &second);
+    // Read where a second generation's admission would be signed: the successor's own log.
+    assert!(!seats(&next, &second));
+    assert_eq!(admitted_by(&next, &successor.actor()), 0);
+    assert!(!completes(&next));
+    assert!(
+        statement_refused(&next).is_some(),
+        "the second generation's status names why its statement admitted nothing"
+    );
+
+    std::fs::remove_file(root(&next).join(STATEMENT)).unwrap();
+    assert_eq!(advance(&original, &config).unwrap(), newest);
+    assert!(completes(&next));
+    assert_eq!(statement_refused(&next), None);
+    let members = membership(&next);
+    let seat = members.get(&second.actor()).unwrap();
+    assert_eq!(
+        (seat.name.as_str(), seat.admitted_by, seat.node_key),
+        ("m1", Some(successor.actor()), None)
+    );
 }

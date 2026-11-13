@@ -189,7 +189,7 @@ fn pointer_gesture(app: &mut App, wid: WindowId, gesture: Gesture) {
 fn rainbow_app() -> (App, i32, crate::cursor_glow::GlowConfig) {
     let (mut app, pipe) = app_observing_pty();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let cfg = app.glow_config();
     let _ = glow_tick(&mut app, &cfg, (0, 0), std::time::Instant::now());
     (app, pipe, cfg)
@@ -1313,7 +1313,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         let (mut app, pipe) = app_observing_pty();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let glow_cfg = app.glow_config();
         let mut out = Vec::new();
         let mut seq = 0u64;
@@ -1544,7 +1544,7 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
         let (mut app, pipe) = app_observing_pty();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let cfg = app.glow_config();
         let term = app.front_terminal(wid).expect("terminal").term.clone();
         term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
@@ -1754,7 +1754,7 @@ fn an_escape_or_ctrl_c_in_an_agent_s_composer_keeps_its_keys_lit() {
             app_observing_pty_with(matches!(boundary, Boundary::GuardedControlKeyEsc));
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let cfg = app.glow_config();
         let term = app.front_terminal(wid).expect("terminal").term.clone();
         // Claude's fullscreen composer frame and the footer under it, its caret in the composer.
@@ -2183,7 +2183,7 @@ fn a_key_typed_before_claude_shows_insert_lights_on_the_frame_that_shows_it() {
             let (mut app, pipe) = app_observing_pty();
             let wid = WindowId(0);
             app.config.cursor_trail = Some(true);
-            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            app.config.cursor_trail_style = Some("rainbow".to_string());
             let front = app.front_terminal(wid).expect("terminal").clone();
             app.session_factory.fg_probe = |master| master;
             app.session_factory.handed_terminal = |_| false;
@@ -2462,7 +2462,7 @@ fn a_split_reads_vim_s_mode_from_the_focused_pane_s_own_terminal() {
     let tape = Tape::new();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let left = app.front_terminal(wid).expect("terminal").clone();
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -2617,7 +2617,7 @@ fn a_tab_or_ctrl_v_arms_an_insert_under_rainbow_kitty_only() {
     use aterm_types::keyboard::NamedKey;
 
     let tab = Key::Named(NamedKey::Tab);
-    for (style, armed) in [("rainbow kitty", 2u64), ("lumen", 0), ("comet", 0)] {
+    for (style, armed) in [("rainbow", 2u64), ("lumen", 0), ("comet", 0)] {
         let (mut app, pipe) = app_observing_pty();
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some(style.to_string());

@@ -9,7 +9,7 @@
 //! report gives, per unit kind, the count, p50, p99 and most of one unit, and the units a frame
 //! can run inside [`FRAME_BUDGET_US`] at the most costly unit.
 //!
-//! `targo --unverified run --release -p aterm-bench --example prism_glass_units`
+//! `targo --unverified run --release -p aterm-bench --features prism-glass --example prism_glass_units`
 
 use std::collections::BTreeMap;
 use std::hint::black_box;

@@ -962,7 +962,7 @@ const NO_SEAT: &str = "no seat binds this node key, the machine did not prove th
 const NOT_HERE: &str = "this member admits nobody through the membership log";
 
 /// Why a member that may not know of a removal lets no new key in.
-const NOT_FRESH: &str = "this member did not read all of the vault's newest records just now (no \
+pub(super) const NOT_FRESH: &str = "this member did not read all of the vault's newest records just now (no \
                          server or peer answered, one holds records this build cannot take, or \
                          only servers of a build before the crossed fence, which state no \
                          records bound, answered), so it may not know of a removal: another \
@@ -972,15 +972,13 @@ const NOT_FRESH: &str = "this member did not read all of the vault's newest reco
 /// (within [`FRESH_WITHIN`]), a server that states its records bound among those that answered
 /// ([`crate::crossing`], [`super::RecordsPass::fresh`]).
 fn read_newest(paths: &Paths) -> bool {
-    super::sync_records_until(
-        paths,
-        None,
-        &[],
-        None,
-        Some(Instant::now() + FRESH_WITHIN),
-        None,
-    )
-    .is_ok_and(|pass| pass.fresh())
+    read_newest_by(paths, Instant::now() + FRESH_WITHIN)
+}
+
+/// [`read_newest`] with its pulls ending by `deadline`, which the caller sets.
+pub(super) fn read_newest_by(paths: &Paths, deadline: Instant) -> bool {
+    super::sync_records_until(paths, None, &[], None, Some(deadline), None)
+        .is_ok_and(|pass| pass.fresh())
 }
 
 /// Whether a Mac under `node` has nothing in `log` that gives it a claim: no seat, no `Admit` and no
@@ -1404,7 +1402,7 @@ pub fn prove_at_ms(
 
 /// Post this Mac's records to every vault server it reaches ([`post_records_to_servers`]), on a
 /// thread of its own: the bundle goes back to the Mac first.
-fn post_aside(paths: &Paths) {
+pub(super) fn post_aside(paths: &Paths) {
     let paths = paths.clone();
     let _ = std::thread::Builder::new()
         .name("readmit-post".to_owned())

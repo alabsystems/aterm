@@ -14,7 +14,10 @@ use crate::{
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 
 mod retained;
-pub(crate) use retained::with_retained_store;
+pub(crate) use retained::{
+    ProjectionCustody, RetainedCatalog, with_retained_catalog, with_retained_store,
+    with_selected_store,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -192,84 +195,6 @@ pub(crate) fn observe_store<T>(
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<T> {
     observe_store_until(paths, descriptor, admission_deadline(), action)
-}
-
-/// Observe one selected, already-established application session. Descriptor
-/// selection belongs inside `action`, so a preliminary catalog peek cannot
-/// initialize custody or select a different generation. No writer is acquired;
-/// an initially busy vault refuses immediately, as a cache observation does.
-pub(crate) fn observe_existing_session<T>(
-    paths: &Paths,
-    deadline: std::time::Instant,
-    action: impl FnOnce(&Session<'_>) -> Result<T>,
-) -> Result<Option<T>> {
-    use aterm_secrets::commons::{Observation, Unavailable};
-    pass_current(deadline)?;
-    let selected = crate::generation::observed_generation_until(paths, deadline)?;
-    let known = selected != *paths
-        || crate::generation::is_candidate(&selected)
-        || aterm_secrets::commons::bootstrap::custody_opened(&selected)
-            .map_err(crate::table::failure)?;
-    match aterm_secrets::commons::observe(&selected).map_err(crate::table::failure)? {
-        Observation::Unavailable(Unavailable::Unconfigured | Unavailable::ControlNotVisible)
-            if !known =>
-        {
-            return Ok(None);
-        }
-        Observation::Unavailable(reason) => {
-            return Err(aterm_secrets::Error::of_kind(
-                if reason == Unavailable::Busy {
-                    aterm_secrets::ErrorKind::VaultBusy
-                } else {
-                    aterm_secrets::ErrorKind::Other
-                },
-                format!(
-                    "application custody unavailable ({}): {}",
-                    reason.code(),
-                    reason.explanation()
-                ),
-            )
-            .into());
-        }
-        Observation::Visible(_) => {}
-    }
-    let (bootstrap, journal) = Bootstrap::established_with_journal_until(&selected, deadline)
-        .map_err(crate::table::failure)?;
-    let session = observed_session(&bootstrap, journal, deadline, &|| deadline)?;
-    session.require_current_application_generation(deadline)?;
-    let control = session.observation()?;
-    let result = action(&session)?;
-    if session.observation_afresh()? != control {
-        return Err(Error::new("application control changed during observation"));
-    }
-    session.require_current_application_generation(deadline)?;
-    pass_current(deadline)?;
-    Ok(Some(result))
-}
-
-/// Hold an existing application's current local source through a bounded local
-/// receipt write. Vault sources and lineage control writers precede the table
-/// writer. The callback receives no mutable store and must not perform network
-/// I/O, reenter Commons, or acquire an account writer. Opening the table may
-/// recover an interrupted append, but creates no application or declaration.
-pub(crate) fn with_admitted_store<T, C>(
-    paths: &Paths,
-    descriptor: impl FnOnce(&Session<'_>) -> Result<(Descriptor, C)>,
-    deadline: std::time::Instant,
-    action: impl FnOnce(&Session<'_>, &Store, Scope, C) -> Result<T>,
-) -> Result<T> {
-    crate::generation::with_admitted_session(paths, deadline, |bootstrap, session| {
-        let (descriptor, context) = descriptor(session)?;
-        in_session(
-            bootstrap,
-            session,
-            false,
-            |_| Ok(descriptor),
-            deadline,
-            |_, _, _| Ok(()),
-            |session, store, scope| action(session, store, scope, context),
-        )
-    })
 }
 
 pub(crate) fn observe_store_until<T>(
@@ -558,6 +483,43 @@ pub(crate) fn observed_bootstrap(paths: &Paths) -> Result<Option<Box<Bootstrap>>
     }
 }
 
+/// Whether this installation never configured a Commons: no generation or opened custody
+/// names one, and the vault observes as unconfigured or shows this Mac no Commons control
+/// entry. Its one vault observation is a nonblocking shared read: it waits on no lock, takes
+/// no writer and initializes nothing, so an initially busy vault refuses at once, as a cache
+/// observation does, instead of waiting out a retained admission. A known vault that is
+/// unavailable is an error.
+pub(crate) fn never_configured(paths: &Paths, deadline: std::time::Instant) -> Result<bool> {
+    use aterm_secrets::commons::{Observation, Unavailable};
+    pass_current(deadline)?;
+    let selected = crate::generation::observed_generation_until(paths, deadline)?;
+    let known = selected != *paths
+        || crate::generation::is_candidate(&selected)
+        || aterm_secrets::commons::bootstrap::custody_opened(&selected)
+            .map_err(crate::table::failure)?;
+    match aterm_secrets::commons::observe(&selected).map_err(crate::table::failure)? {
+        Observation::Unavailable(Unavailable::Unconfigured | Unavailable::ControlNotVisible)
+            if !known =>
+        {
+            Ok(true)
+        }
+        Observation::Unavailable(reason) => Err(aterm_secrets::Error::of_kind(
+            if reason == Unavailable::Busy {
+                aterm_secrets::ErrorKind::VaultBusy
+            } else {
+                aterm_secrets::ErrorKind::Other
+            },
+            format!(
+                "application custody unavailable ({}): {}",
+                reason.code(),
+                reason.explanation()
+            ),
+        )
+        .into()),
+        Observation::Visible(_) => Ok(false),
+    }
+}
+
 /// Whether an existing, readable Commons source is available for an application read.
 fn commons_here(paths: &Paths) -> Result<bool> {
     observed_bootstrap(paths).map(|bootstrap| bootstrap.is_some())
@@ -573,40 +535,5 @@ fn pass_current(deadline: std::time::Instant) -> Result<()> {
 
 /// Test seams of the observation path.
 #[cfg(test)]
-pub(crate) mod seams {
-    use std::cell::RefCell;
-
-    thread_local! {
-        /// Run once a read on this thread has opened the selected home's custody, before it
-        /// observes the home's predecessors.
-        static OPENED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
-        /// Run once a read on this thread has selected its generation, before its session opens.
-        static SELECTED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
-    }
-
-    /// Run `hook` once this thread's next read through [`super::observed_session`] has opened the
-    /// selected home's custody, before it observes that home's predecessors.
-    pub(crate) fn after_custody(hook: impl FnMut() + 'static) {
-        OPENED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    pub(super) fn opened() {
-        let hook = OPENED.with(|slot| slot.borrow_mut().take());
-        if let Some(mut hook) = hook {
-            hook();
-        }
-    }
-
-    /// Run `hook` once this thread's next read through [`super::observed_session`] has selected
-    /// its generation, before it opens the selected home's session.
-    pub(crate) fn after_selection(hook: impl FnMut() + 'static) {
-        SELECTED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    pub(super) fn selected() {
-        let hook = SELECTED.with(|slot| slot.borrow_mut().take());
-        if let Some(mut hook) = hook {
-            hook();
-        }
-    }
-}
+#[path = "application_seams_tests.rs"]
+pub(crate) mod seams;

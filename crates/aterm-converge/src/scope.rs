@@ -221,13 +221,21 @@ impl Item for Aside<'_> {
 /// Wrap `items` so pending changes report `Blocked` with `why` instead of applying.
 #[must_use]
 pub fn held_back<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
-    hold(items, why, true, false)
+    hold(items, why, true, Leaves::Blocked)
+}
+
+/// `items` whose change waits for a later run: a pending change reads `Deferred` with `why`
+/// instead of applying, so this run neither makes it nor counts it as blocked or failed, and the
+/// caller's own timer (a Mac setting's next try) is what brings it back.
+#[must_use]
+pub fn put_off<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
+    hold(items, why, true, Leaves::Later)
 }
 
 /// `items` a run leaves as they are now.
 #[must_use]
 pub fn left_as_is<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
-    hold(items, why, true, true)
+    hold(items, why, true, Leaves::AsIs)
 }
 
 /// `items` another run is laying now (an install pass holding the store): each is left as it is,
@@ -235,14 +243,25 @@ pub fn left_as_is<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn 
 /// probe waits on another item (that run lays both) reads as left too.
 #[must_use]
 pub fn left_to_another<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
-    hold(items, why, false, true)
+    hold(items, why, false, Leaves::AsIs)
+}
+
+/// How a held item reads a change it does not make.
+#[derive(Clone, Copy)]
+enum Leaves {
+    /// [`held_back`]: `Blocked`.
+    Blocked,
+    /// [`put_off`]: `Deferred`, for a later run.
+    Later,
+    /// [`left_as_is`], [`left_to_another`]: `NotApplicable`, as it is.
+    AsIs,
 }
 
 fn hold<'a>(
     items: Vec<Box<dyn Item + 'a>>,
     why: &str,
     waits: bool,
-    as_is: bool,
+    leaves: Leaves,
 ) -> Vec<Box<dyn Item + 'a>> {
     items
         .into_iter()
@@ -251,7 +270,7 @@ fn hold<'a>(
                 inner,
                 why: why.to_owned(),
                 waits,
-                as_is,
+                leaves,
             }) as Box<dyn Item + 'a>
         })
         .collect()
@@ -262,8 +281,8 @@ struct HeldBack<'a> {
     why: String,
     /// The item's own `after`: false for [`left_to_another`], which waits on nothing.
     waits: bool,
-    /// [`left_as_is`]: a change reads `NotApplicable`, not `Blocked`.
-    as_is: bool,
+    /// How a change it does not make reads.
+    leaves: Leaves,
 }
 
 impl Item for HeldBack<'_> {
@@ -287,11 +306,16 @@ impl Item for HeldBack<'_> {
     }
     fn probe(&self) -> Probe {
         match self.inner.probe() {
-            Probe::Change { from, .. } if self.as_is => Probe::NotApplicable {
-                why: format!("{from}; left as it is: {}", self.why),
-            },
-            Probe::Change { from, .. } => Probe::Blocked {
-                why: format!("{from}; not changed: {}", self.why),
+            Probe::Change { from, .. } => match self.leaves {
+                Leaves::Blocked => Probe::Blocked {
+                    why: format!("{from}; not changed: {}", self.why),
+                },
+                Leaves::Later => Probe::Deferred {
+                    why: format!("{from}; not changed yet: {}", self.why),
+                },
+                Leaves::AsIs => Probe::NotApplicable {
+                    why: format!("{from}; left as it is: {}", self.why),
+                },
             },
             Probe::Waits { on, .. } if !self.waits => Probe::NotApplicable {
                 why: format!("waits for {on}; left as it is: {}", self.why),

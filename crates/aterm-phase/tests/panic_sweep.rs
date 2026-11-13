@@ -340,7 +340,7 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     );
     jobs.sort_by_key(|(s, _, _)| std::cmp::Reverse(s.rows.len()));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = aterm_cores::available_parallelism().map_or(4, |n| n.get());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {

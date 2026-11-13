@@ -576,7 +576,7 @@ pub(in crate::harness) fn adopt(
                     )?,
                 );
                 Ok(vec![
-                    accounts::Event::new(env.now, accounts::Kind::SignIn, &row.label)
+                    accounts::Event::sign_in(env.now, &row.label, accounts::SignInStep::Begun)
                         .because(accounts::SHARED_ADOPTION_BEGUN),
                 ])
             },

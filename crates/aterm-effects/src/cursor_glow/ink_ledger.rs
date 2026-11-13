@@ -11,8 +11,8 @@ mod letter_guard;
 mod state_words;
 pub use letter_guard::letter_bar;
 pub(crate) use letter_guard::{
-    LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING, ThinCaret,
-    foot_ring_light,
+    FootRing, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING,
+    ThinCaret, foot_ring,
 };
 #[cfg(any(test, debug_assertions))]
 pub use letter_guard::{with_aa_unrounded, with_share_over_aa};

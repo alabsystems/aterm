@@ -41,8 +41,8 @@ use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart, RestartAnswer,
-    RestartAsk, RestartClaim,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, LoginSeen, Reach, Restart,
+    RestartAnswer, RestartAsk, RestartClaim,
 };
 use crate::supervise::policy::turn_end::{AskAgain, HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
@@ -276,6 +276,7 @@ tape_arg_debug!(
     UsageSeen,
     AccountPoint,
     AccountBad,
+    LoginSeen,
     ProbeMiss,
     ResetAsk,
     ResetEnd,
@@ -839,17 +840,22 @@ impl TapeValue for Option<(String, HostTurn)> {
 }
 
 /// One background call as a tape holds it ([`BackgroundCall`]). A tape from a build before the
-/// leader's birth was read holds none (`birth` absent).
+/// leader's birth was read holds none (`birth` absent); one from a build before the engine's
+/// episode and the wait's holder were read holds neither (episode 0, no holder); one from a build
+/// that kept the program's name holds an `exe` the reading ignores.
 #[derive(Serialize, Deserialize)]
 struct CallWire {
     pid: u32,
     pgid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     birth: Option<u64>,
-    exe: String,
+    #[serde(default)]
+    episode: u32,
     task: Option<String>,
     quiet_ms: u64,
     wait: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_by: Option<u32>,
 }
 
 /// [`BackgroundCall`] as its wire.
@@ -858,19 +864,21 @@ fn call_wire(call: &BackgroundCall) -> CallWire {
         pid,
         pgid,
         birth,
-        exe,
+        episode,
         task,
         quiet_ms,
         wait,
+        held_by,
     } = call;
     CallWire {
         pid: *pid,
         pgid: *pgid,
         birth: *birth,
-        exe: exe.clone(),
+        episode: *episode,
         task: task.clone(),
         quiet_ms: *quiet_ms,
         wait: wait.clone(),
+        held_by: *held_by,
     }
 }
 
@@ -880,19 +888,21 @@ fn call_of(w: CallWire) -> BackgroundCall {
         pid: w.pid,
         pgid: w.pgid,
         birth: w.birth,
-        exe: w.exe,
+        episode: w.episode,
         task: w.task,
         quiet_ms: w.quiet_ms,
         wait: w.wait,
+        held_by: w.held_by,
     }
 }
 
 /// `background_jobs`'s answer as a tape holds it
-/// ([`BackgroundEvidence`]): `"unknown"`, or the call that made no progress.
+/// ([`BackgroundEvidence`]): `"unknown"`, `"waiting"`, or the call that made no progress.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum EvidenceWire {
     Unknown,
+    Waiting,
     NoProgress(CallWire),
 }
 
@@ -900,6 +910,7 @@ impl TapeValue for BackgroundEvidence {
     fn to_tape(&self) -> Vec<u8> {
         json(&match self {
             BackgroundEvidence::Unknown => EvidenceWire::Unknown,
+            BackgroundEvidence::Waiting => EvidenceWire::Waiting,
             BackgroundEvidence::NoProgress { worst } => EvidenceWire::NoProgress(call_wire(worst)),
         })
     }
@@ -907,6 +918,7 @@ impl TapeValue for BackgroundEvidence {
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
         Ok(match of_json(bytes)? {
             EvidenceWire::Unknown => BackgroundEvidence::Unknown,
+            EvidenceWire::Waiting => BackgroundEvidence::Waiting,
             EvidenceWire::NoProgress(w) => BackgroundEvidence::NoProgress { worst: call_of(w) },
         })
     }
@@ -921,6 +933,8 @@ impl TapeValue for BackgroundEvidence {
 struct FactsWire {
     as_of_ms: i64,
     no_progress: Vec<CallWire>,
+    #[serde(default)]
+    waiting: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     held: Option<HeldWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -964,6 +978,7 @@ impl TapeValue for Option<FactsReading> {
         json(&self.as_ref().map(|r| FactsWire {
             as_of_ms: r.as_of_ms,
             no_progress: r.no_progress.iter().map(call_wire).collect(),
+            waiting: r.waiting,
             held: r.held.as_ref().map(|h| {
                 HeldWire {
                     as_of_ms: h.as_of_ms,
@@ -990,6 +1005,7 @@ impl TapeValue for Option<FactsReading> {
         Ok(of_json::<Option<FactsWire>>(bytes)?.map(|w| FactsReading {
             as_of_ms: w.as_of_ms,
             no_progress: w.no_progress.into_iter().map(call_of).collect(),
+            waiting: w.waiting,
             held: w.held.map(|h| HeldReading {
                 as_of_ms: h.as_of_ms,
                 programs: h
@@ -1128,6 +1144,41 @@ struct LeftWire {
     pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started: Option<i64>,
+}
+
+/// `launch_model`'s answer as a tape holds it ([`crate::supervise::policy::turn_end::LaunchModel`]):
+/// `unread`, `unnamed`, or the `--model` value the launch named.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LaunchModelWire {
+    Unread,
+    Unnamed,
+    Named(String),
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.launch_model` asked nothing there,
+/// and its loop moved no session off a model's limit ([`TapeValue::absent`]: `Unread`), where the
+/// tape's header says that build lacked the door, and only there.
+impl TapeValue for crate::supervise::policy::turn_end::LaunchModel {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            Self::Unread => LaunchModelWire::Unread,
+            Self::Unnamed => LaunchModelWire::Unnamed,
+            Self::Named(m) => LaunchModelWire::Named(m.clone()),
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json::<LaunchModelWire>(bytes)? {
+            LaunchModelWire::Unread => Self::Unread,
+            LaunchModelWire::Unnamed => Self::Unnamed,
+            LaunchModelWire::Named(m) => Self::Named(m),
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Unread)
+    }
 }
 
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.restart_left` asked nothing there,

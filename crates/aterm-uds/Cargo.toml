@@ -72,7 +72,10 @@ libc = { workspace = true }
 # astream-sys: astream's OS cordon, zero dependencies. `private_file` holds every
 # file and directory it admits to astream's one owner-only rule
 # (`open_nonblocking`, `owner_private`, `owner_private_dir`: the kind, the owner,
-# the macOS access list, the mode), so the ACL FFI it needs lives there, not here;
+# the macOS access list, the mode; a directory judged from its path's attributes,
+# `owner_private_dir_by_path`, where they decide it, and a refused open's
+# metadata by `kind_and_owner_of`), so the ACL FFI and the FFI of the rule's
+# attribute reads (`lstatx_np`, the filesec calls) live there, not here;
 # this boot's id (`process::kin::boot_id`, which a verify run's record names)
 # is its one reader's (`boot_session`: the all-zero id refused); and
 # `keep_out_of_children` is its `close_on_fork` (`FD_CLOFORK`).
@@ -89,6 +92,16 @@ aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "tether_startup"
+path = "tests/tether_startup.rs"
+harness = false
+
+[[test]]
+name = "tether_image"
+path = "tests/tether_image.rs"
+harness = false
 
 # What a spawn costs a process shaped like the window: a benchmark run by hand
 # (`targo --unverified bench -p aterm-uds --bench spawn_cost`), never a gate.

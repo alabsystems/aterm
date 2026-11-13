@@ -344,7 +344,8 @@ fn failed_normalization_retains_every_durable_stay_until_recovery() {
     assert_eq!(failed.written, durable);
     assert_eq!(failed.written.record.stays.as_ptr(), storage);
     assert_eq!(failed.next_change_ms, None);
-    assert!(!next_wait(&failed.place, failed.next_change_ms, now + 64).is_zero());
+    assert!(failed.unwritten);
+    assert!(!next_wait(Some(UNWATCHED_EVERY), failed.next_change_ms, now + 64).is_zero());
     std::fs::remove_dir(dir.join(record::FILE)).unwrap();
     let recovered = keep_once(&dir, failed.written, &facts, now + 65, now);
     assert_eq!(recovered.written.record.stays.len(), 1);
@@ -353,7 +354,7 @@ fn failed_normalization_retains_every_durable_stay_until_recovery() {
 }
 
 #[test]
-fn internet_expiry_schedules_the_actual_keeper_before_its_fact_cap() {
+fn internet_expiry_schedules_the_actual_keeper_with_no_fact_cap() {
     let root = aterm_tempfile::tempdir().unwrap();
     let dir = record::dir(root.path());
     let now = 10_000_000;
@@ -373,12 +374,16 @@ fn internet_expiry_schedules_the_actual_keeper_before_its_fact_cap() {
         crate::place::InternetSource::ApiProbe
     );
     assert_eq!(
-        next_wait(&before.place, before.next_change_ms, last),
+        next_wait(next_look(&before.place, true), before.next_change_ms, last),
         Duration::from_millis(1)
     );
     // Publication/logging time is already spent when the wait is chosen.
     assert_eq!(
-        next_wait(&before.place, before.next_change_ms, last + 1),
+        next_wait(
+            next_look(&before.place, true),
+            before.next_change_ms,
+            last + 1
+        ),
         Duration::ZERO
     );
     let after = keep_once(&dir, before.written, &facts, last + 1, now);
@@ -386,10 +391,26 @@ fn internet_expiry_schedules_the_actual_keeper_before_its_fact_cap() {
         after.place.internet.source,
         crate::place::InternetSource::Path
     );
-    let cap = next_look(&after.place);
-    assert_eq!(next_wait(&after.place, None, last), cap);
-    assert_eq!(next_wait(&after.place, Some(u64::MAX), last), cap);
-    assert_eq!(next_wait(&after.place, Some(last + 1), 0), cap);
+    // Watched, a settled place has no bounded look: only its own deadline or a change wakes
+    // it, and a deadline past `REST` (or a clock read back to 0) sleeps `REST` at most.
+    // NEGATIVE CONTROL: a fixed look at rest (`_ => Some(UNWATCHED_EVERY)` in `next_look`)
+    // answers 60 s here, not `REST`.
+    assert_eq!(next_look(&after.place, true), None);
+    assert_eq!(next_wait(next_look(&after.place, true), None, last), REST);
+    assert_eq!(next_wait(None, Some(u64::MAX), last), REST);
+    assert_eq!(
+        next_wait(None, Some(last + 1), last),
+        Duration::from_millis(1)
+    );
+    // Unwatched, it looks on the bounded slow look, which a nearer deadline still beats.
+    let cap = next_look(&after.place, false);
+    assert_eq!(cap, Some(UNWATCHED_EVERY));
+    assert_eq!(next_wait(cap, None, last), UNWATCHED_EVERY);
+    assert_eq!(next_wait(cap, Some(u64::MAX), last), UNWATCHED_EVERY);
+    assert_eq!(
+        next_wait(cap, Some(last + 1), last),
+        Duration::from_millis(1)
+    );
 }
 
 #[test]
@@ -461,7 +482,11 @@ fn confirmation_deadline_persists_a_record_change_without_a_place_change() {
     let due = now + crate::place::CONFIRM_EVERY_MS;
     let before = keep_once(&dir, held.clone(), &facts, due - 1, now);
     assert_eq!(
-        next_wait(&before.place, before.next_change_ms, due - 1),
+        next_wait(
+            next_look(&before.place, true),
+            before.next_change_ms,
+            due - 1
+        ),
         Duration::from_millis(1)
     );
     let at = keep_once(&dir, before.written.clone(), &facts, due, now);
@@ -489,11 +514,14 @@ fn failed_publication_keeps_the_old_record_and_a_positive_retry() {
         "a refused write retains the owned durable history"
     );
     assert_eq!(failed.next_change_ms, None);
-    assert_eq!(
-        next_wait(&failed.place, failed.next_change_ms, now + 1),
-        next_look(&failed.place)
+    assert!(
+        failed.unwritten,
+        "a refused write is retried on the bounded slow look"
     );
-    assert!(!next_wait(&failed.place, failed.next_change_ms, now + 1).is_zero());
+    assert_eq!(
+        next_wait(Some(UNWATCHED_EVERY), failed.next_change_ms, now + 1),
+        UNWATCHED_EVERY
+    );
     std::fs::remove_dir(dir.join(record::FILE)).unwrap();
     let recovered = keep_once(&dir, failed.written, &facts(6), now + 2, now);
     assert_eq!(recovered.written.revision, held.revision + 1);
@@ -518,6 +546,48 @@ fn facts(hw: u8) -> Facts {
             link: Link::Wifi,
         }),
     }
+}
+
+/// A READER KNOWS WHEN ONLY THE TIME CHANGES ITS PLACE: an internet answer goes stale with no
+/// file written and no route changed, so a reader that caches the place (the window's follower)
+/// reads again at the deadline [`read_projected_with`] answers, the same one the keeper's own
+/// step schedules, and the place read then is the changed one.
+/// NEGATIVE CONTROL: answering `None` for the deadline (as [`read_with`] alone did) fails "the
+/// answer going stale is the reader's deadline".
+#[test]
+fn a_readers_deadline_is_the_places_own_time_only_change() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = record::dir(root.path());
+    let now = 10_000_000;
+    let facts = facts(5);
+    let kept = keep_once(&dir, Written::default(), &facts, now, now);
+    crate::heard::note_internet(
+        &dir,
+        true,
+        crate::place::InternetSource::ApiProbe,
+        "fixture",
+        now,
+    );
+    let last = now + crate::place::INTERNET_FRESH_MS;
+    let (fresh, due) = read_projected_with(root.path(), facts.clone(), last);
+    assert_eq!(
+        fresh.internet.source,
+        crate::place::InternetSource::ApiProbe
+    );
+    assert_eq!(
+        due,
+        Some(last + 1),
+        "the answer going stale is the reader's deadline"
+    );
+    let keeper_due = keep_once(&dir, kept.written, &facts, last, now).next_change_ms;
+    assert_eq!(due, keeper_due, "the keeper's own deadline");
+    let (stale, _) = read_projected_with(root.path(), facts.clone(), last + 1);
+    assert_eq!(stale.internet.source, crate::place::InternetSource::Path);
+    assert_eq!(
+        read_with(root.path(), facts, last),
+        fresh,
+        "the projection reads the same place"
+    );
 }
 
 /// Waits up to the one-minute hang detector for `done`, polling the record.
@@ -679,4 +749,278 @@ fn a_reader_works_the_place_out_and_writes_nothing() {
         "the record lags this move"
     );
     crate::heard::note_answer(&dir, (Lane::Fleet, "m1"), None, (None, true), (now, now));
+}
+
+/// Three fleet members' answers on `facts`' network, noted into `dir` now.
+fn three_members_answer(dir: &Path, facts: &Facts) {
+    let route = facts.route.as_ref().unwrap();
+    let network = crate::place::NetworkId::of(route).unwrap();
+    let now = crate::unix_ms_now();
+    let answers = (1..=crate::place::LEARN_AT)
+        .map(|n| crate::place::Answer {
+            lane: Lane::Fleet,
+            member: crate::place::member_key(Lane::Fleet, &format!("m{n}")),
+            addr: Some(std::net::IpAddr::V4(Ipv4Addr::new(
+                192,
+                168,
+                4,
+                100 + n as u8,
+            ))),
+            via: Some(route.address),
+            iface: Some(route.interface.clone()),
+            network: Some(network.clone()),
+            logged: true,
+            began_ms: now,
+            at_ms: now,
+        })
+        .collect();
+    crate::heard::note_answers(dir, answers);
+}
+
+/// A KEEPER AT REST ASKS NO CLOCK FOR A LOOK, AND A WRITE TO ITS FILES WAKES IT (ATERM-KI-1105-20):
+/// on a strong network with nothing pending, every wait the actual keeper asks of its facts is
+/// `REST` (no 10 or 60 s look), and members' answers written into the evidence afterwards reach
+/// the record (its stay turns `alab-lan`) through the watch of its files alone: nothing else
+/// could wake a wait of `REST` within the one-minute hang detector.
+/// NEGATIVE CONTROL: `keep` without the arm (`watch` answering `None` while `next_look` is still
+/// told the files are watched) never reads the answers, and "the evidence write woke the
+/// keeper" fails at the hang detector; the old fact cap (`next_look` answering 10 or 60 s for a
+/// settled place) fails "every wait at rest is REST".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_resting_keeper_waits_on_no_clock_and_wakes_on_an_evidence_write() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = record::dir(root.path());
+    let sensor = Arc::new(Scripted::new(facts(5)));
+    let worker_sensor = Arc::clone(&sensor);
+    let (candidate, worker) =
+        spawn_owned(dir.clone(), Box::new(move || Box::new(worker_sensor))).unwrap();
+    let first = until(&dir, |w| w.record.current().is_some());
+    until_true("the keeper's wait", || sensor.waits() > 0);
+    three_members_answer(&dir, &facts(5));
+    let home = |w: &Written| {
+        w.record
+            .current()
+            .is_some_and(|stay| stay.at == crate::place::StayAt::AlabLan)
+    };
+    let woke = observed(|| record::read(&dir).is_some_and(|w| home(&w)));
+    let asked = sensor.asked();
+    candidate.stop();
+    join_stopped(worker, || sensor.set(facts(5)));
+    assert!(!home(&first), "no member heard before the write");
+    assert!(woke, "the evidence write woke the keeper");
+    assert!(
+        asked.iter().all(|wait| *wait == REST),
+        "every wait at rest is REST: {asked:?}"
+    );
+}
+
+/// A sense whose next look, once `armed`, is told a file changed while it reads: a write that
+/// lands between the keeper's read and its sleep.
+struct WriteDuringRead {
+    facts: Arc<Scripted>,
+    armed: AtomicBool,
+    nudged_at: std::sync::atomic::AtomicUsize,
+}
+
+impl Sense for Arc<WriteDuringRead> {
+    fn facts(&self) -> Facts {
+        let facts = self.facts.facts();
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.nudged_at.store(self.facts.looks(), Ordering::SeqCst);
+            self.facts.stop_wake().unwrap().nudge();
+        }
+        facts
+    }
+    fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
+        self.facts.wait(most, stop)
+    }
+    fn stop_wake(&self) -> std::io::Result<StopWake> {
+        self.facts.stop_wake()
+    }
+}
+
+/// A WRITE BETWEEN THE READ AND THE SLEEP IS NEVER SLEPT THROUGH: a change told while the keeper
+/// reads (after its wait returned, before it waits again) ends the next wait at once, so the
+/// keeper looks again with no other stimulus, though that wait is `REST`.
+/// NEGATIVE CONTROL: a nudge that only signals (`StopWake::nudge`'s scripted arm notifying the
+/// condition variable without counting a change, as a bell with no latch would) is lost while
+/// no one waits, and "the keeper looked again" fails at the hang detector.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_write_while_the_keeper_reads_ends_its_next_wait() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = record::dir(root.path());
+    let sensor = Arc::new(WriteDuringRead {
+        facts: Arc::new(Scripted::new(facts(5))),
+        armed: AtomicBool::new(false),
+        nudged_at: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let worker_sensor = Arc::clone(&sensor);
+    let (candidate, worker) =
+        spawn_owned(dir.clone(), Box::new(move || Box::new(worker_sensor))).unwrap();
+    until(&dir, |w| w.record.current().is_some());
+    until_true("the keeper's wait", || sensor.facts.waits() > 0);
+    sensor.armed.store(true, Ordering::SeqCst);
+    // One scripted wake for the look that is told the write while it reads.
+    sensor.facts.set(facts(5));
+    let looked_again = observed(|| {
+        let at = sensor.nudged_at.load(Ordering::SeqCst);
+        at > 0 && sensor.facts.looks() > at
+    });
+    candidate.stop();
+    join_stopped(worker, || sensor.facts.set(facts(5)));
+    assert!(looked_again, "the keeper looked again");
+}
+
+/// A sense whose system announces a wall move when its test tells it ([`Sense::wall`]).
+struct Walled {
+    facts: Arc<Scripted>,
+    wall: Arc<aterm_uds::wall_watch::WallWatch>,
+}
+
+impl Sense for Arc<Walled> {
+    fn facts(&self) -> Facts {
+        self.facts.facts()
+    }
+    fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
+        self.facts.wait(most, stop)
+    }
+    fn stop_wake(&self) -> std::io::Result<StopWake> {
+        self.facts.stop_wake()
+    }
+    fn wall(&self) -> Option<Arc<aterm_uds::wall_watch::WallWatch>> {
+        Some(Arc::clone(&self.wall))
+    }
+}
+
+/// A WALL MOVE ENDS THE KEEPER'S REST: an announced wake or wall-clock step is an input change,
+/// so a keeper resting on a deadline the move made due (or moved) steps again at the wall's new
+/// now instead of at the next network change (ATERM-KI-1105-20).
+/// NEGATIVE CONTROL: a keeper that never arms the wall watch (`crate::watch::wall` not called in
+/// `keep`) rests through the move, and "the keeper looked again" fails at the hang detector.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_wall_move_ends_the_keepers_rest() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = record::dir(root.path());
+    let sensor = Arc::new(Walled {
+        facts: Arc::new(Scripted::new(facts(5))),
+        wall: Arc::new(aterm_uds::wall_watch::WallWatch::by_hand().unwrap()),
+    });
+    let worker_sensor = Arc::clone(&sensor);
+    let (candidate, worker) =
+        spawn_owned(dir.clone(), Box::new(move || Box::new(worker_sensor))).unwrap();
+    until(&dir, |w| w.record.current().is_some());
+    // Settled: past the first look the watch of its files tells, resting with no deadline.
+    until_true("the keeper's rest", || {
+        let asked = sensor.facts.asked();
+        asked.len() >= 2 && asked.last() == Some(&REST)
+    });
+    let at = sensor.facts.looks();
+    sensor.wall.tell(aterm_uds::wall_watch::Moved {
+        stepped: true,
+        ..Default::default()
+    });
+    let looked_again = observed(|| sensor.facts.looks() > at);
+    candidate.stop();
+    join_stopped(worker, || sensor.facts.set(facts(5)));
+    assert!(looked_again, "the keeper looked again");
+}
+
+/// The keeper's own cost at rest, measured: the actual keeper over this Mac's live facts (route
+/// socket, path monitor) in a scratch state root, its looks counted by a wrapper sense, and this
+/// process's interrupt wakeups (`proc_pid_rusage`, `ri_interrupt_wkups`) over a span after it
+/// settles. `ATERM_MEASURE_REST_SECS` sets the span (default 65); `ATERM_MEASURE_REST_HOME=1`
+/// seeds the record with this network remembered as the ALab LAN, so the place rests at
+/// `alab-lan` with no member heard. A manual measurement, never a timing gate (ATERM-KI-1105-20).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "manual idle measurement of the keeper at rest, not a timing gate"]
+fn keeper_rest_wakeups() {
+    struct Counted {
+        live: crate::facts::Live,
+        looks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Sense for Counted {
+        fn facts(&self) -> Facts {
+            self.looks.fetch_add(1, Ordering::SeqCst);
+            self.live.facts()
+        }
+        fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
+            self.live.wait(most, stop)
+        }
+        fn stop_wake(&self) -> std::io::Result<StopWake> {
+            self.live.stop_wake()
+        }
+    }
+    fn wakeups() -> (u64, u64) {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // SAFETY: a V4 buffer of the right size for this process's own usage.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                info.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: proc_pid_rusage filled it.
+        let info = unsafe { info.assume_init() };
+        (info.ri_interrupt_wkups, info.ri_pkg_idle_wkups)
+    }
+    let span = Duration::from_secs(
+        std::env::var("ATERM_MEASURE_REST_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(65),
+    );
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = record::dir(root.path());
+    if std::env::var_os("ATERM_MEASURE_REST_HOME").is_some() {
+        let now = crate::unix_ms_now();
+        let network = crate::facts::network_now().expect("a strong network here");
+        let mut seed = Written::default();
+        seed.record.remembered.push(crate::place::Known {
+            network,
+            learned_ms: now,
+            confirmed_ms: now,
+        });
+        record::write(&dir, &seed).unwrap();
+    }
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&looks);
+    let (candidate, worker) = spawn_owned(
+        dir.clone(),
+        Box::new(move || {
+            Box::new(Counted {
+                live: crate::facts::Live::start().unwrap(),
+                looks: counted,
+            }) as Box<dyn Sense>
+        }),
+    )
+    .unwrap();
+    until(&dir, |w| w.record.current().is_some());
+    // Past a move's settle, so the place is the one it rests in.
+    std::thread::sleep(Duration::from_secs(25));
+    let place = read_with(
+        root.path(),
+        crate::facts::reader_facts(),
+        crate::unix_ms_now(),
+    );
+    let (wake0, idle0) = wakeups();
+    let looks0 = looks.load(Ordering::SeqCst);
+    std::thread::sleep(span);
+    let (wake1, idle1) = wakeups();
+    let looks1 = looks.load(Ordering::SeqCst);
+    candidate.stop();
+    worker.join().unwrap();
+    eprintln!(
+        "keeper at rest: at={:?} span_s={} looks={} interrupt_wkups={} pkg_idle_wkups={}",
+        place.at,
+        span.as_secs(),
+        looks1 - looks0,
+        wake1 - wake0,
+        idle1 - idle0
+    );
 }

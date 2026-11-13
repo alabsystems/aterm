@@ -151,7 +151,7 @@ fn service(provider: &str) -> &'static str {
         keys::ANTHROPIC => "claude-code",
         keys::OPENAI => "codex",
         keys::GOOGLE => "agy",
-        keys::META => "muse",
+        keys::META => "muse-code",
         keys::KIMI => "kimi-code",
         _ => "grok",
     }

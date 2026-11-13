@@ -255,6 +255,10 @@ struct Job {
     /// How an agent call's leader ended and when, host ms, once the host read it
     /// ([`JobTick::exits`]): one reading, so neither is kept without the other.
     ended_by: Option<(ExitOf, u64)>,
+    /// When an agent call's leader started, host ms: the probe's clock of the first pass that read
+    /// it under the call's start, less the age it read, where the clock had run that long
+    /// ([`Ended::leader_born_ms`]).
+    leader_born_ms: Option<u64>,
     members: MemberMap,
     outputs: HashMap<(u64, u64), u64>,
     pty_bytes: Option<u64>,
@@ -1319,7 +1323,11 @@ impl Jobs {
                 continue;
             };
             let s = row.standing.unwrap_or(Standing::Legit);
-            let s = if row.class == Class::Running {
+            // A job that works (it prints, burns CPU, or a detached descendant of it does) is
+            // progress for whatever waits on it: a pipe it holds, a lock, a claim.
+            let s = if matches!(row.class, Class::Running | Class::BusySilent)
+                || row.working_descendant.is_some()
+            {
                 Standing::Legit
             } else {
                 s
@@ -2188,6 +2196,7 @@ impl Jobs {
             let mut rebased = false;
             let mut cpu: u64 = 0;
             let mut child_work: u64 = 0;
+            let mut reaped: u64 = 0;
             let mut calls: u64 = 0;
             let mut side: u64 = 0;
             let mut pageins: u64 = 0;
@@ -2234,8 +2243,9 @@ impl Jobs {
                 match was {
                     Some(p) => {
                         cpu = cpu.saturating_add(c.cpu_ns.saturating_sub(p.cpu_ns));
-                        child_work =
-                            child_work.saturating_add(delta(c.child_cpu_ns, p.child_cpu_ns));
+                        let reaped_now = delta(c.child_cpu_ns, p.child_cpu_ns);
+                        reaped = reaped.saturating_add(reaped_now);
+                        child_work = child_work.saturating_add(reaped_now);
                         calls = calls
                             .saturating_add(delta(c.syscalls, p.syscalls))
                             .saturating_add(delta(
@@ -2754,6 +2764,11 @@ impl Jobs {
                 refused,
                 cpu_unread: refused || rebased,
                 cpu_ns: (!refused).then_some(cpu),
+                reaped_cpu_ns: reaped,
+                tree_work: job
+                    .row
+                    .as_ref()
+                    .is_some_and(|r| r.working_descendant.is_some()),
                 calls: (!refused).then_some(calls),
                 churn,
                 churn_work,
@@ -2797,6 +2812,18 @@ impl Jobs {
             {
                 job.ran = ran;
             }
+            // The leader's start on the pass's clock: the probe's clock less the age it read, from
+            // the first reading of the process the call's start names (a pid taken anew is
+            // another's). A leader whose age is longer than that clock has run (it started
+            // before this process's reader did, as across a seamless update, or a sleep the age
+            // counts and the clock does not came before that reading) has no start on it.
+            if job.kind == JobKind::AgentCall && job.leader_born_ms.is_none() {
+                job.leader_born_ms = facts
+                    .get(&job.key.leader)
+                    .filter(|f| f.start.is_some() && f.start == job.key.start)
+                    .and_then(|f| f.age_ms)
+                    .and_then(|age| tick.probe_ms.checked_sub(age));
+            }
             job.last_name.clone_from(&leader_name);
             job.meter.read(&now, job.shell);
             // The pass that finds the job gone judges it `exited`, never stuck: what its row keeps
@@ -2826,6 +2853,7 @@ impl Jobs {
                     exit: job.exit,
                     ended_by: job.ended_by.map(|(end, _)| end),
                     leader_exited_ms: job.ended_by.map(|(_, at_ms)| at_ms),
+                    leader_born_ms: job.leader_born_ms,
                     ran: (job.kind == JobKind::AgentCall && !job.ran.is_empty())
                         .then(|| job.ran.clone()),
                     peak_bytes: job.meter.peak,
@@ -2938,6 +2966,18 @@ impl Jobs {
                 &shell_members,
                 tick.machine.stretch_milli,
             );
+            // Kept on each job's own row, so its next step restarts its suspect run on that work
+            // (`Evidence::tree_work`) and the next pass's waiters count it as progress.
+            for row in &r {
+                if let Some(job) = self
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.key.tab == row.tab && j.id == row.id)
+                    && let Some(own) = job.row.as_mut()
+                {
+                    own.working_descendant = row.working_descendant;
+                }
+            }
             r
         };
         let findings = self.findings(tick, &sweep, &flat_on_dylib);
@@ -3302,6 +3342,7 @@ impl Job {
             member_name: String::new(),
             ran: String::new(),
             ended_by: None,
+            leader_born_ms: None,
             members: BTreeMap::new(),
             outputs: HashMap::new(),
             pty_bytes: None,
@@ -3372,6 +3413,7 @@ impl Job {
             member_name: m.name.clone(),
             ran: String::new(),
             ended_by: None,
+            leader_born_ms: None,
             members,
             outputs: HashMap::new(),
             pty_bytes: None,

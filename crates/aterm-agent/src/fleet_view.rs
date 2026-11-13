@@ -2,18 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm fleet [--json]` (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.12, §4.16, §11 B9): the
-//! lab's status line and one row per seat, read from what this Mac holds. It spawns nothing and
-//! dials no other Mac.
+//! lab's status line and one row per seat. The command reads bounded fleet survey facts;
+//! cached UI composition reads only what this Mac holds and never dials a peer.
 //!
 //! **Where each column comes from.** The seats are this Mac's membership log's current seats
 //! (their label, the host name the log gives, the node id of the node key they bound), and any
-//! seat the node's view holds that the log does not, under no label. Up or
-//! silent, each seat's build and whether its tables are in step come from presence, read from
-//! the node service's view (`aterm_mesh::view`): the node judges who is up from the rows that
-//! advanced while it ran, so a reader of its own would read every seat silent for a period. Where
-//! a seat has no presence row, its build is the one its own signed entry in this Mac's fleet book
-//! names (before wave B, §4.12; never a poll). The log's fill is this Mac's own records against
-//! the bound.
+//! seat the cached node view holds that the log does not, under no label. The command joins
+//! survey answers through the full public key in a seat and its signed book entry. Unproved,
+//! ambiguous or unread observations stay unknown. Builds from the book remain explicitly
+//! distinguished from builds just observed. Free disk, sessions and account use come only
+//! from the survey. Cached GUI composition still accepts its node view without network I/O.
 //!
 //! **Needs update** names a member whose build is below what the lab needs now: below the record
 //! fence ([`RECORD_FENCE`]) once this Mac's log has crossed past what such builds hold; or, while
@@ -29,6 +27,7 @@ use aterm_mesh::view::{Unserved, View};
 use aterm_net::fleet_member::{LIVE_WITHIN_MS, Peer};
 use aterm_netplace::words::{self, InStep, Seats};
 use aterm_secrets::membership_log::{Log, MAX_HELD_RECORDS};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
@@ -47,11 +46,13 @@ pub struct SeatRow {
     pub name: String,
     /// Its node id (`n-<16 hex>`), where it bound a node key.
     pub node: Option<String>,
+    /// Complete public key bound to this seat; the shortened display principal is not authority.
+    pub node_key: Option<[u8; 32]>,
     /// Whether it is this Mac.
     pub me: bool,
     /// Up or silent, as this Mac's presence reads it; `None` where no presence was read.
     pub presence: Option<Presence>,
-    /// Its build: its presence row's, else its signed book entry's.
+    /// Its observed build (survey or cached presence), else its signed book entry's.
     pub build: Option<String>,
     /// Whether it needs an update.
     pub needs_update: bool,
@@ -68,6 +69,19 @@ pub struct Fleet {
     pub rows: Vec<SeatRow>,
     /// Why no presence was read, where none was.
     pub unserved: Option<String>,
+    /// Authenticated survey observations, keyed by the membership seat's label.
+    pub observations: BTreeMap<String, Observation>,
+}
+
+/// Facts read from a bound peer during this invocation, rather than its last book entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observation {
+    /// Local time at which this survey completed (Unix ms).
+    pub at_ms: u64,
+    /// The peer's validated instance and account facts.
+    pub facts: crate::survey_facts::SwarmSurveyFacts,
+    /// Whether the instance declared its account rows (older peers may omit them).
+    pub accounts_known: bool,
 }
 
 /// A current seat of this Mac's membership log, as `aterm fleet` lists it.
@@ -163,6 +177,7 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
             rows.push(SeatRow {
                 label: seat.label.clone(),
                 name: seat.name.clone(),
+                node_key: seat.node_key,
                 me: held.is_some_and(|s| s.me)
                     || view.is_some_and(|v| node.as_deref() == Some(v.me.as_str())),
                 presence: view
@@ -196,6 +211,7 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
                 label: "-".to_owned(),
                 name: "-".to_owned(),
                 node: Some(seat.principal.clone()),
+                node_key: Some(seat.key),
                 me: seat.me,
                 presence: Some(seat.standing),
                 needs_update: needs_update(build.as_deref(), seat.row.is_some(), None),
@@ -262,7 +278,187 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
         seats,
         rows,
         unserved: facts.view.as_ref().err().cloned(),
+        observations: BTreeMap::new(),
     }
+}
+
+/// Project an authenticated fleet read onto membership seats, using the signed book's
+/// key-to-transport-node binding. Names and addresses never establish this association.
+fn observe(
+    mut fleet: Fleet,
+    book: &[Peer],
+    read: Result<&aterm_ctl::FleetRead, String>,
+    now_ms: u64,
+    crossed: bool,
+) -> Fleet {
+    fleet.observations.clear();
+    fleet.seats.up = None;
+    fleet.seats.in_step = None;
+    for row in &mut fleet.rows {
+        row.presence = None;
+        row.behind = None;
+    }
+    let read = match read {
+        Ok(read) => read,
+        Err(why) => {
+            fleet.unserved = Some(why);
+            return fleet;
+        }
+    };
+    fleet.unserved = read.note.clone().or_else(|| read.alone.clone());
+    let mut bindings: BTreeMap<&str, BTreeSet<[u8; 32]>> = BTreeMap::new();
+    for peer in book {
+        if let (Some(node), Some(key)) = (peer.node.as_deref(), peer.key)
+            && peer.signature_holds()
+        {
+            bindings.entry(node).or_default().insert(*key.bytes());
+        }
+    }
+    let mut by_key: BTreeMap<[u8; 32], Vec<&aterm_ctl::PeerSurvey>> = BTreeMap::new();
+    let mut unread: BTreeMap<String, usize> = BTreeMap::new();
+    for peer in &read.peers {
+        let node = if peer.answer.is_ok() {
+            peer.authenticated
+                .as_ref()
+                .map(|identity| identity.node.as_str())
+        } else {
+            peer.node.as_deref()
+        };
+        if !peer.unproven
+            && let Some(keys) = node.and_then(|node| bindings.get(node))
+            && keys.len() == 1
+            && let Some(key) = keys.first()
+            && (peer.answer.is_err()
+                || peer
+                    .authenticated
+                    .as_ref()
+                    .is_some_and(|identity| &identity.key == key))
+        {
+            by_key.entry(*key).or_default().push(peer);
+        } else {
+            let why = if peer.unproven {
+                "unproved peer"
+            } else {
+                "no unique signed node binding"
+            };
+            *unread.entry(why.to_owned()).or_default() += 1;
+        }
+    }
+    for row in &mut fleet.rows {
+        let Some(key) = &row.node_key else { continue };
+        let candidates = by_key.get(key).map_or(&[][..], Vec::as_slice);
+        // An identity answering at several different nodes is ambiguous, not several seats up.
+        let [peer] = candidates else {
+            if !candidates.is_empty() {
+                *unread
+                    .entry("ambiguous node answers".to_owned())
+                    .or_default() += 1;
+            }
+            continue;
+        };
+        row.node = peer
+            .authenticated
+            .as_ref()
+            .map(|identity| identity.node.clone())
+            .or_else(|| peer.node.clone());
+        let lines = match &peer.answer {
+            Ok(lines) => lines,
+            Err(_) => {
+                *unread
+                    .entry(format!("peer: {}", peer.reason.unwrap_or("read failed")))
+                    .or_default() += 1;
+                if matches!(
+                    peer.fault,
+                    aterm_ctl::PeerFault::NoRoute
+                        | aterm_ctl::PeerFault::Unserved
+                        | aterm_ctl::PeerFault::HostAnswered
+                ) {
+                    row.presence = Some(Presence::Silent { last_seen_ms: None });
+                }
+                continue;
+            }
+        };
+        let facts =
+            match crate::survey_facts::SwarmSurveyFacts::from_survey_reply(&lines.join("\n")) {
+                Ok(facts) => facts,
+                Err(why) => {
+                    *unread.entry(format!("facts: {why}")).or_default() += 1;
+                    continue;
+                }
+            };
+        if facts.node.as_deref().is_some_and(|node| {
+            peer.authenticated
+                .as_ref()
+                .is_none_or(|identity| node != identity.node)
+        }) {
+            *unread
+                .entry("survey header node disagrees with proved node".to_owned())
+                .or_default() += 1;
+            continue;
+        }
+        let accounts_known = lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("instance "))
+            .is_some_and(|line| {
+                line.split_ascii_whitespace()
+                    .any(|field| field.starts_with("accounts="))
+            });
+        row.presence = Some(Presence::Up);
+        row.build = Some(facts.version.clone());
+        row.needs_update = crossed && below(&facts.version, RECORD_FENCE);
+        fleet.observations.insert(
+            row.label.clone(),
+            Observation {
+                at_ms: now_ms,
+                facts,
+                accounts_known,
+            },
+        );
+    }
+    if !unread.is_empty() {
+        let why = unread
+            .into_iter()
+            .map(|(why, count)| format!("{count} × {why}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        fleet.unserved = Some(match fleet.unserved {
+            Some(note) => format!("{note}; observations unread: {why}"),
+            None => format!("observations unread: {why}"),
+        });
+    }
+    fleet.seats.up = Some(
+        fleet
+            .rows
+            .iter()
+            .filter(|row| row.presence == Some(Presence::Up))
+            .count(),
+    );
+    if fleet.seats.up == Some(0) && fleet.unserved.is_none() {
+        fleet.unserved = Some(format!(
+            "no current observations: {} peer rows, {} answers, {} bound survey keys, {} keyed seats",
+            read.peers.len(),
+            read.peers.iter().filter(|peer| peer.answer.is_ok()).count(),
+            by_key.len(),
+            fleet
+                .rows
+                .iter()
+                .filter(|row| row.node_key.is_some())
+                .count(),
+        ));
+    }
+    fleet.seats.needs_update = fleet
+        .rows
+        .iter()
+        .filter(|row| row.needs_update)
+        .map(|row| {
+            (
+                row.label.clone(),
+                row.build.clone().unwrap_or_else(|| "-".to_owned()),
+            )
+        })
+        .collect();
+    fleet
 }
 
 /// `m<N>` labels in their number's order, then the rest by text.
@@ -285,23 +481,42 @@ fn up_words(presence: Option<Presence>, at_ms: Option<u64>) -> String {
             Some(now) => format!("silent {}", words::age_words(now.saturating_sub(seen))),
             None => "silent".to_owned(),
         },
-        Some(Presence::Silent { last_seen_ms: None }) => "silent, never seen up".to_owned(),
+        Some(Presence::Silent { last_seen_ms: None }) => "unanswered".to_owned(),
     }
 }
 
-/// A seat's tables column.
-fn step_words(behind: Option<Behind>, me: bool) -> String {
-    if me {
+fn usage_words(observation: Option<&Observation>, week: bool) -> String {
+    let Some(observation) = observation.filter(|observation| observation.accounts_known) else {
         return "-".to_owned();
-    }
-    match behind {
-        None | Some(Behind::Unknown) => "-".to_owned(),
-        Some(Behind::InStep) => "in step".to_owned(),
-        Some(Behind::Behind { at_least }) => format!(
-            "{} behind",
-            words::age_words(u64::try_from(at_least.as_millis()).unwrap_or(u64::MAX))
-        ),
-        Some(Behind::Apart) => "apart".to_owned(),
+    };
+    let mut words: Vec<_> = observation
+        .facts
+        .accounts
+        .iter()
+        .map(|account| {
+            let pct = if week {
+                account.usage_7d_pct
+            } else {
+                account.usage_5h_pct
+            };
+            format!(
+                "{}:{}",
+                account.pool,
+                pct.map_or_else(|| "?".to_owned(), |pct| format!("{pct}%"))
+            )
+        })
+        .collect();
+    words.extend(
+        observation
+            .facts
+            .accounts_unread
+            .iter()
+            .map(|pool| format!("{pool}:?")),
+    );
+    if words.is_empty() {
+        "none".to_owned()
+    } else {
+        words.join(",")
     }
 }
 
@@ -314,10 +529,11 @@ pub fn render(fleet: &Fleet, at_ms: Option<u64>) -> String {
     if let Some(why) = &fleet.unserved {
         let _ = writeln!(out, "presence: {why}");
     }
-    let table: Vec<[String; 6]> = fleet
+    let table: Vec<[String; 9]> = fleet
         .rows
         .iter()
         .map(|row| {
+            let observation = fleet.observations.get(&row.label);
             [
                 row.label.clone(),
                 if row.me {
@@ -333,11 +549,22 @@ pub fn render(fleet: &Fleet, at_ms: Option<u64>) -> String {
                     (Some(build), false) => build.clone(),
                     (None, false) => "-".to_owned(),
                 },
-                step_words(row.behind, row.me),
+                observation
+                    .and_then(|observation| observation.facts.home_free_mb)
+                    .map_or_else(|| "-".to_owned(), |free| free.to_string()),
+                observation.map_or_else(
+                    || "-".to_owned(),
+                    |observation| observation.facts.sessions.to_string(),
+                ),
+                usage_words(observation, false),
+                usage_words(observation, true),
             ]
         })
         .collect();
-    let head = ["LABEL", "NAME", "NODE", "UP", "BUILD", "TABLES"].map(str::to_owned);
+    let head = [
+        "LABEL", "NAME", "NODE", "UP", "BUILD", "FREE_MB", "SESSIONS", "5H", "7D",
+    ]
+    .map(str::to_owned);
     let mut widths = head.clone().map(|h| h.chars().count());
     for cells in &table {
         for (width, cell) in widths.iter_mut().zip(cells) {
@@ -375,16 +602,15 @@ pub fn to_json(fleet: &Fleet) -> Value {
                     last_seen_ms.map_or(Value::Null, Value::from),
                 ),
             };
-            let (tables, behind_ms) = match row.behind {
-                None => (Value::Null, Value::Null),
-                Some(Behind::InStep) => (Value::from("in_step"), Value::Null),
-                Some(Behind::Behind { at_least }) => (
-                    Value::from("behind"),
-                    Value::from(u64::try_from(at_least.as_millis()).unwrap_or(u64::MAX)),
-                ),
-                Some(Behind::Apart) => (Value::from("apart"), Value::Null),
-                Some(Behind::Unknown) => (Value::from("unknown"), Value::Null),
-            };
+            let observation = fleet.observations.get(&row.label);
+            let accounts = observation.filter(|observation| observation.accounts_known).map(|observation| {
+                observation.facts.accounts.iter().map(|account| json!({
+                    "pool": account.pool.as_str(), "id": account.id.as_str(),
+                    "pct5": account.usage_5h_pct, "pct7": account.usage_7d_pct,
+                    "enrolled": account.enrolled, "condition": account.condition.as_str(),
+                    "read_at": account.read_at,
+                })).collect::<Vec<_>>()
+            });
             json!({
                 "label": row.label.as_str(),
                 "name": row.name.as_str(),
@@ -394,8 +620,12 @@ pub fn to_json(fleet: &Fleet) -> Value {
                 "silent_since_ms": silent_since_ms,
                 "build": row.build.as_deref().map_or(Value::Null, Value::from),
                 "needs_update": row.needs_update,
-                "tables": tables,
-                "behind_ms": behind_ms,
+                "build_source": if observation.is_some() { Some("survey") } else if row.build.is_some() { Some("book") } else { None },
+                "observed_at_ms": observation.map(|observation| observation.at_ms),
+                "home_free_mb": observation.and_then(|observation| observation.facts.home_free_mb),
+                "sessions": observation.map(|observation| observation.facts.sessions),
+                "accounts": accounts,
+                "accounts_unread": observation.map(|observation| &observation.facts.accounts_unread),
             })
         })
         .collect();
@@ -403,17 +633,12 @@ pub fn to_json(fleet: &Fleet) -> Value {
         "status": words::status_line(seats),
         "members": seats.members as u64,
         "up": seats.up.map_or(Value::Null, |up| Value::from(up as u64)),
+        "unknown": fleet.rows.iter().filter(|row| row.presence.is_none()).count(),
         "needs_update": seats
             .needs_update
             .iter()
             .map(|(label, build)| json!({"label": label.as_str(), "build": build.as_str()}))
             .collect::<Vec<Value>>(),
-        "in_step": seats.in_step.map_or(Value::Null, |step| json!({
-            "with": step.with as u64,
-            "of": step.of as u64,
-            "slowest_ms": step.slowest_ms.map_or(Value::Null, Value::from),
-            "apart": step.apart as u64,
-        })),
         "log": seats.log.map_or(Value::Null, |(held, bound)| json!({"held": held, "bound": bound})),
         "presence": fleet.unserved.as_deref().map_or(Value::from("served"), Value::from),
         "seats": rows,
@@ -458,26 +683,38 @@ pub fn compose_here(
     paths: Option<&aterm_secrets::client::Paths>,
     view: Result<&View, String>,
 ) -> Fleet {
+    gather_here(state, paths, view).0
+}
+
+fn gather_here(
+    state: &Path,
+    paths: Option<&aterm_secrets::client::Paths>,
+    view: Result<&View, String>,
+) -> (Fleet, Vec<Peer>, bool) {
     let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
     let read =
         paths.and_then(|paths| aterm_secrets::client::load_acknowledged_and_ahead(paths).ok());
-    let records = paths.and_then(|paths| {
-        let store = aterm_secrets::client::load_records(paths).ok()?;
-        let crossed =
-            aterm_secrets::client::records_bound(paths, &store).is_ok_and(|bound| bound.crossed);
-        Some((store.len() as u64, crossed))
-    });
+    let records = held_records(paths);
     let seats = read
         .as_ref()
         .and_then(|read| read.acknowledged.log())
         .map(log_seats);
-    compose(&Facts {
+    let fleet = compose(&Facts {
         seats: seats.as_deref(),
         records,
         view,
         book: &book,
         now_ms: aterm_netplace::unix_ms_now(),
-    })
+    });
+    (fleet, book, records.is_some_and(|(_, crossed)| crossed))
+}
+
+fn held_records(paths: Option<&aterm_secrets::client::Paths>) -> Option<(u64, bool)> {
+    let paths = paths?;
+    let store = aterm_secrets::client::load_records(paths).ok()?;
+    let crossed =
+        aterm_secrets::client::records_bound(paths, &store).is_ok_and(|bound| bound.crossed);
+    Some((store.len() as u64, crossed))
 }
 
 /// Ask the node service under the state directory `state` for its view ([`ask_node`]) and
@@ -531,13 +768,26 @@ pub fn main_entry(args: &[std::ffi::OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
     let paths = aterm_secrets::client::Paths::live().ok();
-    let (fleet, at_ms) = read(&state, paths.as_ref());
+    let surveyed = crate::fleet_member::survey_all_facts(std::time::Duration::from_secs(3));
+    let at_ms = aterm_netplace::unix_ms_now();
+    let (fleet, book, crossed) = gather_here(
+        &state,
+        paths.as_ref(),
+        Err("fleet survey not read".to_owned()),
+    );
+    let fleet = observe(
+        fleet,
+        &book,
+        surveyed.as_ref().map_err(ToString::to_string),
+        at_ms,
+        crossed,
+    );
     let text = if json {
         let mut text = aterm_json::to_string(&to_json(&fleet)).unwrap_or_default();
         text.push('\n');
         text
     } else {
-        render(&fleet, at_ms)
+        render(&fleet, Some(at_ms))
     };
     aterm_uds::stdout::answer_exit("aterm fleet", &text, 0)
 }

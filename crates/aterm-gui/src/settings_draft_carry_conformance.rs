@@ -757,18 +757,18 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
     let token = app
         .revalidate_native_update_safety()
         .expect("a failed checkpoint whose draft is journaled no longer holds the update");
-    assert_eq!((token.failed_checkpoints(), token.carried_drafts()), (1, 1));
+    assert_eq!(token.carried_drafts(), 1);
     let cold = lane_carry_refusal(&token, ApplyLane::Cold, RUNNING, RUNNING)
         .expect("the cold lane reopens no editor");
     assert!(
         cold.starts_with(crate::app_native::DIRTY_DOCUMENTS_BLOCK),
         "{cold}"
     );
-    let clean_but_failed = NativeUpdateSafetyToken::carrying_for_test(0, 0, 1);
-    let cold = lane_carry_refusal(&clean_but_failed, ApplyLane::Cold, RUNNING, RUNNING).unwrap();
-    assert!(
-        cold.starts_with(crate::app_native::FAILED_CHECKPOINTS_BLOCK),
-        "the cold lane keeps the failed-checkpoint hold: {cold}"
+    let clean_but_failed = NativeUpdateSafetyToken::carrying_for_test(0, 0);
+    assert_eq!(
+        lane_carry_refusal(&clean_but_failed, ApplyLane::Cold, RUNNING, RUNNING),
+        None,
+        "a clean document whose last save failed has no text the cold lane could lose"
     );
     assert_eq!(
         lane_carry_refusal(&token, ApplyLane::Seamless, RUNNING, RUNNING),
@@ -821,8 +821,8 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
     assert!(
         reasons
             .iter()
-            .any(|reason| reason.starts_with(crate::app_native::FAILED_CHECKPOINTS_BLOCK)),
-        "{reasons:?}"
+            .any(|reason| reason.starts_with(crate::app_native::DIRTY_DOCUMENTS_BLOCK)),
+        "the unsaved text is the person's to save or close: {reasons:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

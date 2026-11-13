@@ -3619,8 +3619,8 @@ fn toolset_findings(
             Class::Person,
             format!("{program}'s dev link"),
             format!(
-                "{program}: dev-linked from {from} (not the index build; `aterm pkg unlink \
-                 {program}` returns it to the index)"
+                "{program}: dev-linked from {from}; automatic updates skip this program. \
+                 `aterm pkg unlink {program}` returns it to the index"
             ),
         ));
     }

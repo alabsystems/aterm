@@ -2350,7 +2350,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_footprint_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check \
              program_check_stranded left syspolicyd syspolicyd_workers syspolicyd_full_ms \
-             syspolicyd_pid syspolicyd_up_ms service_mem \
+             syspolicyd_pid syspolicyd_up_ms syspolicyd_age_ms service_mem \
              service_mem_top occupancy \
              occupancy_hold ready slots \
              idle_ready_min waits waits_ready supervisor_contract supervisor_scope \
@@ -3870,6 +3870,7 @@ fn a_codex_box_needs_you_on_every_reader() {
     let here = crate::survey::Here {
         host: None,
         instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: false,
         facts: None,
     };
@@ -5617,6 +5618,7 @@ fn a_front_waiting_for_memory_reads_as_its_build_on_status_and_the_survey() {
         let here = crate::survey::Here {
             host: None,
             instances: 1,
+            access: aterm_types::fleet_access::FleetAccess::ReadOnly,
             drive: false,
             facts: None,
         };

@@ -14,8 +14,7 @@ use aterm_time::Instant;
 use super::{
     PetBrain, PetInputKind, PetSense, SETTLE_CAP, VIGIL_AFTER, WATCH_GATE, WATCH_HUG_ROWS,
 };
-use crate::companion::{CompanionFrame, CompanionOwner, GlowOwnership, PetFacts};
-use crate::cursor_glow::GlowStyle;
+use crate::companion::{CompanionFrame, CompanionOwner, PetFacts, PetOwnership};
 use crate::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use crate::pet_world::{PetPane, PetWorldFacts};
 use crate::word_decorations::{DecoConfig, WordDecorations};
@@ -224,15 +223,7 @@ impl Host {
         );
         let stare_before = self.owner.brain().watch_t;
         let tick = self.owner.prepare(
-            PetFacts::new(
-                &facts,
-                &host,
-                GlowOwnership {
-                    enabled: true,
-                    style: GlowStyle::RainbowKitty,
-                    style_raw_names_pet: true,
-                },
-            ),
+            PetFacts::new(&facts, &host, PetOwnership { on: true }),
             &mut self.decos,
         );
         let burst = tick.output_burst();

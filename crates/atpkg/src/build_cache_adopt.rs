@@ -5,14 +5,12 @@
 //!
 //! Cargo writes its `CACHEDIR.TAG` into a build directory only as it makes it, in a private
 //! stage it renames into place; a folder that stood before cargo was pointed at it gets none.
-//! It also tags its own home's git and registry caches, which may stand before it, but never
-//! builds in them, and a build leaves the rustc facts cargo keeps (`.rustc_info.json`) in its
-//! build directory. So that tag, cargo's exact bytes in this user's own file at the top of
-//! this user's private folder, with those facts at its top or in its build leaf, and no source
-//! and no custody, proves cargo made the folder as its build directory. Adoption records the
-//! folder's own identity and the producer's workspace, as creation does, and writes nothing in
-//! it but the custody marker: nothing is moved, replaced or removed. Any other existing folder
-//! stays unmanaged, and a producer requiring managed output refuses it.
+//! It also tags its own home's git and registry caches, which may stand before it. Resolving
+//! queries can leave `.rustc_info.json` there without compiling, so that file alone grants no
+//! custody. Require a compilation invocation fingerprint in a known Cargo or Trust layout as
+//! well, through bounded, owned, non-writable-by-others directories without following links.
+//! Adoption records the folder's identity and producer workspace and writes only its custody
+//! marker: nothing is moved, replaced or removed. Unrecognized layouts stay unmanaged.
 
 #[cfg(unix)]
 use super::{CUSTODY_MARKERS, Identity, MARKER, Receipt, clearance, creation, same, write};
@@ -22,11 +20,11 @@ use std::path::{Path, PathBuf};
 /// What cargo writes into the `CACHEDIR.TAG` of a build directory it makes (cargo 1.47 onward,
 /// targo included); atpkg's own tag is its first line alone.
 #[cfg(unix)]
-const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+pub(super) const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
                          # This file is a cache directory tag created by cargo.\n\
                          # For information about cache directory tags see https://bford.info/cachedir/\n";
 
-/// The rustc facts cargo keeps at the top of a build directory it built in.
+/// The compiler probe cache, also written by resolving queries.
 #[cfg(unix)]
 const RUSTC_INFO: &str = ".rustc_info.json";
 
@@ -97,21 +95,43 @@ pub(super) fn proven(home: &Path, root: &Path, record: &Path) -> Option<Proven> 
     clearance(home, root, record.file_name()).ok()?;
     let held = creation::pin(root)?;
     let stat = aterm_dirfd::fstat(&held).ok()?;
-    if !SOURCE
-        .iter()
-        .chain(CUSTODY_MARKERS)
-        .all(|name| absent(&held, name))
+    if !source_free(&held)
+        || !CUSTODY_MARKERS.iter().all(|name| absent(&held, name))
         || !cargo_tag(&held)
     {
         return None;
     }
-    let leaf = super::super::TARGET_BUILD_LEAF;
-    let leaf = match aterm_dirfd::fstatat(&held, leaf, aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW) {
+    // Hold each component separately: a quiet folder that is a symlink grants no adoption
+    // authority over what it reaches.
+    let quiet = match aterm_dirfd::fstatat(&held, ".ubd", aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW) {
         Err(error) if error.is_noent() => None,
-        Ok(at) if aterm_dirfd::FileType::from_raw_mode(at.st_mode).is_dir() => {
-            let leaf = aterm_dirfd::openat(
+        Ok(at) if aterm_dirfd::FileType::from_raw_mode(at.st_mode).is_dir() => Some(
+            aterm_dirfd::openat(
                 &held,
-                leaf,
+                ".ubd",
+                aterm_dirfd::OFlags::RDONLY
+                    | aterm_dirfd::OFlags::DIRECTORY
+                    | aterm_dirfd::OFlags::NOFOLLOW
+                    | aterm_dirfd::OFlags::CLOEXEC,
+                aterm_dirfd::Mode::empty(),
+            )
+            .ok()?,
+        ),
+        _ => return None,
+    };
+    let leaf = match quiet.as_ref().map(|quiet| {
+        aterm_dirfd::fstatat(
+            quiet,
+            "build.noindex",
+            aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW,
+        )
+    }) {
+        None => None,
+        Some(Err(error)) if error.is_noent() => None,
+        Some(Ok(at)) if aterm_dirfd::FileType::from_raw_mode(at.st_mode).is_dir() => {
+            let leaf = aterm_dirfd::openat(
+                quiet.as_ref()?,
+                "build.noindex",
                 aterm_dirfd::OFlags::RDONLY
                     | aterm_dirfd::OFlags::DIRECTORY
                     | aterm_dirfd::OFlags::NOFOLLOW
@@ -233,18 +253,115 @@ fn absent(dir: &aterm_dirfd::OwnedFd, name: &str) -> bool {
         .is_err_and(|error| error.is_noent())
 }
 
-/// Whether cargo built in the folder `dir` holds: its [`RUSTC_INFO`] stands there, a regular
-/// file, no link.
+/// Whether the held directory contains none of the bounded source-root declarations.
 #[cfg(unix)]
-fn built(dir: &aterm_dirfd::OwnedFd) -> bool {
+pub(super) fn source_free(dir: &aterm_dirfd::OwnedFd) -> bool {
+    SOURCE.iter().all(|name| absent(dir, name))
+}
+
+/// Whether the compiler probe is a regular file, for read-only layout observation only.
+#[cfg(unix)]
+pub(super) fn compiler_info(dir: &aterm_dirfd::OwnedFd) -> bool {
     aterm_dirfd::fstatat(dir, RUSTC_INFO, aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW)
         .is_ok_and(|at| aterm_dirfd::FileType::from_raw_mode(at.st_mode).is_file())
+}
+
+/// Compiler invocation evidence, not a claim that compilation succeeded. Resolving queries
+/// write the probe but never an invocation fingerprint. Profiles can have arbitrary names;
+/// cross compilation adds one target component. Trust keeps fingerprints in its unit layout.
+#[cfg(unix)]
+fn built(dir: &aterm_dirfd::OwnedFd) -> bool {
+    if !compiler_info(dir) {
+        return false;
+    }
+    let layouts: &[&[Option<&str>]] = &[
+        &[None, Some(".fingerprint"), None],
+        &[None, None, Some(".fingerprint"), None],
+        &[None, Some("build"), None, None, Some("fingerprint")],
+        &[None, None, Some("build"), None, None, Some("fingerprint")],
+    ];
+    let mut remaining = 16_384;
+    layouts
+        .iter()
+        .any(|layout| invocation_at(dir, layout, &mut remaining) == Some(true))
+}
+
+/// Only open a held directory's direct child, without following a link or trusting a
+/// directory writable by another user. Its owner can already create the tag we require.
+#[cfg(unix)]
+fn evidence_dir(
+    parent: &aterm_dirfd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> Option<aterm_dirfd::OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let held = aterm_dirfd::openat(
+        parent,
+        std::ffi::OsStr::from_bytes(name.to_bytes()),
+        aterm_dirfd::OFlags::RDONLY
+            | aterm_dirfd::OFlags::DIRECTORY
+            | aterm_dirfd::OFlags::NOFOLLOW
+            | aterm_dirfd::OFlags::CLOEXEC,
+        aterm_dirfd::Mode::empty(),
+    )
+    .ok()?;
+    let at = aterm_dirfd::fstat(&held).ok()?;
+    super::private(at.st_uid, at.st_mode, super::euid()).then_some(held)
+}
+
+/// A fixed layout bounds depth; one shared entry budget bounds the whole observation.
+/// An unreadable or oversized search never supplies custody evidence.
+#[cfg(unix)]
+fn invocation_at(
+    dir: &aterm_dirfd::OwnedFd,
+    layout: &[Option<&str>],
+    remaining: &mut usize,
+) -> Option<bool> {
+    let Some((component, rest)) = layout.split_first() else {
+        return Some(
+            aterm_dirfd::fstatat(
+                dir,
+                "invoked.timestamp",
+                aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .is_ok_and(|at| {
+                aterm_dirfd::FileType::from_raw_mode(at.st_mode).is_file()
+                    && super::private(at.st_uid, at.st_mode, super::euid())
+                    && at.st_nlink == 1
+            }),
+        );
+    };
+    if *remaining == 0 {
+        return None;
+    }
+    if let Some(name) = component {
+        *remaining -= 1;
+        let name = std::ffi::CString::new(*name).ok()?;
+        return match evidence_dir(dir, &name) {
+            Some(child) => invocation_at(&child, rest, remaining),
+            None => Some(false),
+        };
+    }
+    let mut entries = aterm_dirfd::Dir::read_from(dir).ok()?;
+    for entry in &mut entries {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        *remaining = remaining.checked_sub(1)?;
+        if let Some(child) = evidence_dir(dir, name)
+            && invocation_at(&child, rest, remaining)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Whether the folder `root` holds has cargo's tag at its top: a file of this user's, no link,
 /// its only name, writable by no group or other user, that reads as [`CARGO_TAG`] exactly.
 #[cfg(unix)]
-fn cargo_tag(root: &aterm_dirfd::OwnedFd) -> bool {
+pub(super) fn cargo_tag(root: &aterm_dirfd::OwnedFd) -> bool {
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
     let Ok(file) = aterm_dirfd::openat(
@@ -276,3 +393,7 @@ fn cargo_tag(root: &aterm_dirfd::OwnedFd) -> bool {
         .is_ok()
         && bytes == CARGO_TAG.as_bytes()
 }
+
+#[cfg(all(test, unix))]
+#[path = "build_cache_adopt_tests.rs"]
+mod tests;

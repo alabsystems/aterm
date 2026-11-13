@@ -84,7 +84,8 @@ pub struct Reading {
     pub pressure: Option<aterm_sysprobe::MemoryLevel>,
     /// How busy the GPU is, percent: the accelerator's own device utilization
     /// (`aterm_sysprobe::gpu`), the work every process keeps on the GPU that timed work renders
-    /// on. `None` where it is unread.
+    /// on. `None` where it is unread, as on Windows in a process that has not read the GPU
+    /// (`aterm_sysprobe::gpu_if_read`; [`Machine::gpu_busy`] reads it).
     pub gpu_busy: Option<u8>,
 }
 
@@ -119,7 +120,8 @@ impl Reading {
         })
     }
 
-    /// The live machine now, its volume the one holding `path` ([`Live`]).
+    /// The live machine now, its volume the one holding `path` ([`Live`]); a caller that wants
+    /// the volume alone reads [`read_volume`].
     #[must_use]
     pub fn now(path: &Path) -> Reading {
         Live.read(Some(path))
@@ -416,6 +418,15 @@ pub trait Machine {
     /// The machine now, its volume the one holding `path` (`None`: no volume).
     fn read(&self, path: Option<&Path>) -> Reading;
 
+    /// The volume holding `path` now, alone: what [`Self::read`] reads as [`Reading::volume`],
+    /// for a caller that wants nothing else. By default the whole reading's; [`Live`] reads the
+    /// volume alone ([`read_volume`]), so a caller that asks where a path lands pays for no CPU,
+    /// memory or GPU read (on Windows a process's first GPU read opens PDH's query, about a third
+    /// of a second).
+    fn volume(&self, path: &Path) -> Option<Volume> {
+        self.read(Some(path)).volume
+    }
+
     /// Every process now; `None` where the platform has no sweep.
     fn procs(&self) -> Option<Procs>;
 
@@ -570,8 +581,15 @@ impl Machine for Live {
             swap_total: detail.map(|d| d.swap_total),
             volume,
             pressure: detail.and_then(|d| d.pressure),
-            gpu_busy: aterm_sysprobe::gpu().and_then(|g| g.device_pct),
+            // On Windows only where this process already reads the GPU (a quiet claim's look
+            // reads it first, `Machine::gpu_busy`): opening the reader costs a one-shot verb a
+            // third of a second.
+            gpu_busy: aterm_sysprobe::gpu_if_read().and_then(|g| g.device_pct),
         }
+    }
+
+    fn volume(&self, path: &Path) -> Option<Volume> {
+        read_volume(path)
     }
 
     fn gpu_busy(&self, stopped: &dyn Fn() -> bool) -> Option<u8> {

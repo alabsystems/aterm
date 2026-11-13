@@ -58,7 +58,7 @@ macro_rules! bind {
                 true
             }
 
-            /// Configure the cursor aurora with the native knobs and clamps: `style` is any native `cursor_trail_style` spelling, read through the native table (`aterm_effects::cursor_glow::spellings`), aliases included (`rainbow kitty`, `nyan`, `lightning`, …); `off` draws nothing and an unknown spelling draws lumen.
+            /// Configure the cursor aurora with the native knobs and clamps: `style` is any native `cursor_trail_style` spelling, read through the native table (`aterm_effects::cursor_glow::spellings`), one row per style and no alias (`rainbow`, `laser`, …); `off` draws nothing and an unknown or retired spelling draws lumen. The pet is its own setting: `set_cursor_pet_kind`.
             #[allow(clippy::too_many_arguments)]
             pub fn set_cursor_glow(
                 &mut self,
@@ -368,6 +368,19 @@ macro_rules! bind {
             pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
                 self.note_host_visual_change();
                 self.effects.set_cursor_pet(enabled, seed);
+            }
+
+            /// Choose the resident pet as the native `cursor_pet` setting spells it (`off`, `cat`, `dog`, `flying cat`): `off` disables it and a walker enables it under `seed`; the flier keeps no walker, and its flight is the native host's, so a page draws none. False, and nothing changed, for a name that is no row of `aterm_effects::cursor_pet::PETS`.
+            pub fn set_cursor_pet_kind(&mut self, pet: &str, seed: u64) -> bool {
+                let Some(row) = aterm_effects::cursor_pet::row(pet) else {
+                    return false;
+                };
+                self.note_host_visual_change();
+                if let Some(species) = row.species {
+                    self.effects.set_cursor_pet_species(species);
+                }
+                self.effects.set_cursor_pet(row.species.is_some(), seed);
+                true
             }
 
             /// Whether the resident pet is enabled (the host's opt-in, not whether it is drawn; see `cursor_pet_alpha`).

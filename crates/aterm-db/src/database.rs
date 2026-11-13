@@ -453,9 +453,10 @@ pub struct View {
 #[derive(Clone)]
 pub struct History {
     /// Rebuildable transport-independent astream synchronization index.
-    pub index: Index,
+    index: Index,
     records: BTreeMap<Digest, (Opened, Command)>,
     refused: BTreeMap<Digest, (Opened, String)>,
+    writers: BTreeMap<Actor, (usize, usize)>,
     root: [u8; 32],
     no_authority: bool,
 }
@@ -466,6 +467,7 @@ impl History {
             index: Index::new(MAX_RECORDS),
             records: BTreeMap::new(),
             refused: BTreeMap::new(),
+            writers: BTreeMap::new(),
             root,
             no_authority: false,
         }
@@ -480,17 +482,23 @@ impl History {
             ..Self::new(root)
         }
     }
+    /// Retained causal metadata. Only history admission mutates this index, keeping its
+    /// authenticated records and derived writer quotas in step.
+    #[must_use]
+    pub const fn index(&self) -> &Index {
+        &self.index
+    }
+
     /// The operations and ciphertext bytes retained for `actor`, which its quotas bound.
     pub(crate) fn writer_usage(&self, actor: &Actor) -> (usize, usize) {
-        self.records
-            .values()
-            .map(|(o, _)| o)
-            .chain(self.refused.values().map(|(o, _)| o))
-            .filter(|old| old.header.actor == *actor)
-            .fold((0, 0), |(count, bytes), old| {
-                (count + 1, usize::saturating_add(bytes, old.wire.len()))
-            })
+        self.writers.get(actor).copied().unwrap_or_default()
     }
+    fn count_writer(&mut self, opened: &Opened) {
+        let (count, bytes) = self.writers.entry(opened.header.actor).or_default();
+        *count += 1;
+        *bytes = bytes.saturating_add(opened.wire.len());
+    }
+
     /// Retain an authenticated causal record without applying side effects.
     /// Unsupported or unauthorized application payloads are inert evidence. They
     /// remain in inventories and fork detection, so one cannot poison every repair.
@@ -568,6 +576,7 @@ impl History {
             }
             Ok(command)
         });
+        self.count_writer(&opened);
         match decoded {
             Ok(command) => {
                 self.records.insert(id, (opened, command));
@@ -670,12 +679,14 @@ impl History {
                 past.index.insert(opened.header.clone()).map_err(|_| {
                     Error::new("causal header refused or history capacity exhausted")
                 })?;
+                past.count_writer(opened);
                 past.records
                     .insert(*prior, (opened.clone(), command.clone()));
             } else if let Some((opened, reason)) = self.refused.get(prior) {
                 past.index.insert(opened.header.clone()).map_err(|_| {
                     Error::new("causal header refused or history capacity exhausted")
                 })?;
+                past.count_writer(opened);
                 past.refused
                     .insert(*prior, (opened.clone(), reason.clone()));
             } else {

@@ -373,7 +373,7 @@ pub struct UsageCache {
 }
 
 /// How the plan bills Fable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FablePlan {
     /// Fable counts against the plan's own limits.
     Included,
@@ -1139,6 +1139,23 @@ pub struct SubscriptionDisplay {
     /// footer's display name drops; read with the figure so the frame does no IO. `None` with no
     /// reading.
     pub model_id: Option<String>,
+    /// The account state says this login is signed out ([`super::agy_gate`]): the display then
+    /// names no email, plan or week (none is known true of it any more), nothing on the screen
+    /// refills them, and the glass says it is not signed in. `agy`'s footer only.
+    pub signed_out: bool,
+    /// How the selected profile's plan bills Fable ([`Profile::fable`]), which a session's
+    /// model card says beside its Fable choice. `None` where no Claude profile was read.
+    pub fable: Option<FablePlan>,
+    /// The account's five-hour window, where a read gave one whose window still runs: Claude
+    /// Code's cached `/usage` row here, which the footer's resolver replaces with this process's
+    /// newer usage-tap reading. Held in a [`WeeklyFigure`] (a share used, a reset, a read time)
+    /// though its window is five hours: the Account card says it under the one age rule. `None`
+    /// for Muse Code and `agy`, which report no such window.
+    pub five_hour: Option<WeeklyFigure>,
+    /// Whether usage credits can cover the account's sends, as the selected profile's cache says
+    /// ([`Credits::state`]): `on`, `out` or `off`. `None` where it says nothing, and where no
+    /// Claude profile was read.
+    pub credits: Option<&'static str>,
 }
 
 /// One weekly figure, whichever source read it (Claude Code's `/usage` cache, this process's usage
@@ -1154,18 +1171,19 @@ pub struct WeeklyFigure {
 }
 
 impl WeeklyFigure {
-    /// The one age rule of every weekly source, its words at `now`: `weekly 63% used` while the
-    /// figure is at most [`USAGE_CURRENT_S`] old (or stamped at most [`USAGE_SKEW_S`] ahead),
-    /// the lower bound `weekly ≥63% used` up to [`USAGE_SHOWN_S`] (use only rises within a
-    /// window), and nothing for an older figure, one from further in the future, or one whose
-    /// window has reset. The share is [`super::outlook::Figure`]'s, so these words and the
-    /// glass's agree (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3.2: no `% left`).
+    /// The one age rule of every weekly source, its words at `now`: `weekly 37% left` (of 63%
+    /// used) while the figure is at most [`USAGE_CURRENT_S`] old (or stamped at most
+    /// [`USAGE_SKEW_S`] ahead), the upper bound `weekly ≤37% left` up to [`USAGE_SHOWN_S`] (use
+    /// only rises within a window, so no more can be left), and nothing for an older figure, one
+    /// from further in the future, or one whose window has reset. The share is
+    /// [`super::outlook::Figure`]'s, so these words and the glass's agree: what is left
+    /// ([`super::left`]), never a bare percentage.
     #[must_use]
     pub fn words(&self, now: i64) -> Option<String> {
         usage_read_age(self.at, now).filter(|age| *age <= USAGE_SHOWN_S)?;
         match super::outlook::Figure::of_weekly(self, now) {
             figure @ (super::outlook::Figure::Exact(_) | super::outlook::Figure::AtLeast(_)) => {
-                Some(format!("weekly {} used", figure.words()))
+                Some(format!("weekly {}", figure.words()))
             }
             super::outlook::Figure::Out | super::outlook::Figure::Unread => None,
         }
@@ -1188,7 +1206,7 @@ impl WeeklyFigure {
 }
 
 /// Why a Claude Code footer has no weekly figure ([`SubscriptionDisplay::weekly_gap`]). Its
-/// words state the fact and never ask the person to act (owner ruling R-12: the harness reads
+/// words state the fact and never ask the person to act (the harness reads
 /// the week itself, and where it cannot, says so plainly). The rule itself shows no unknown
 /// value: these words are the account's hover title's, the Accounts menu's and a screen
 /// reader's.
@@ -1248,17 +1266,59 @@ impl WeeklyGap {
     }
 }
 
+/// Weekly words of a screen's own figure, as a vendor's usage card gives one in whole percent
+/// used: `weekly 78% left` of 22% used, the form [`WeeklyFigure::words`] says and
+/// [`weekly_figure_said`] reads back.
+#[must_use]
+pub fn weekly_words_of_used(used_pct: u32) -> String {
+    format!(
+        "weekly {}% {}",
+        super::left::of_whole(used_pct),
+        super::left::WORD
+    )
+}
+
 /// The figure alone of weekly words ([`WeeklyFigure::words`], [`WEEKLY_OUT`], a screen's
-/// `weekly 22% used`): `63%`, `≥63%` or `out`, for line D's words-only unit where no outlook
-/// serves (`footer::account_unit`); `None` for words that carry no figure (a [`WeeklyGap`]'s).
+/// [`weekly_words_of_used`]): `37% left`, `≤37% left` or `out`, for line D's words-only unit
+/// where no outlook serves (`footer::account_unit`); `None` for words that carry no figure (a
+/// [`WeeklyGap`]'s) and for a percentage that does not say it is what is left.
 #[must_use]
 pub fn weekly_figure_words(words: &str) -> Option<&str> {
     let rest = words.strip_prefix("weekly ")?;
-    if rest == "out" {
-        return Some(rest);
+    let said_left = rest
+        .strip_suffix(super::left::WORD)
+        .and_then(|share| share.strip_suffix(' '))
+        .is_some_and(|share| share.ends_with('%'));
+    (rest == "out" || said_left).then_some(rest)
+}
+
+/// The figure weekly words say, held as the use it is: `weekly 61% left` is 39% used, exact; the
+/// bound `weekly ≤62% left` a lower bound of 38% used; a wall's `weekly out` out; `None` for
+/// words with no figure (a gap's). The inverse of [`WeeklyFigure::words`] to the whole percent,
+/// for a screen's words, which have no reading behind them.
+#[must_use]
+pub fn weekly_figure_said(words: &str) -> Option<super::outlook::Figure> {
+    use super::outlook::Figure;
+    let said = weekly_figure_words(words)?;
+    if said == "out" {
+        return Some(Figure::Out);
     }
-    rest.strip_suffix(" used")
-        .filter(|share| share.ends_with('%'))
+    let share = said.strip_suffix(super::left::WORD)?.strip_suffix("% ")?;
+    let (bound, share) = match share.strip_prefix('\u{2264}') {
+        Some(share) => (true, share),
+        None => (false, share),
+    };
+    let left = share
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| share.parse::<u16>().ok())
+        .flatten()?;
+    let x10 = (100 - left.min(100)) * 10;
+    Some(if bound {
+        Figure::AtLeast(x10)
+    } else {
+        Figure::Exact(x10)
+    })
 }
 
 /// One reset occurrence, placed when the card is first observed.
@@ -1364,51 +1424,37 @@ fn footer_read_use(
     Some(super::provider_read::Use::session_read_use(running))
 }
 
-type MuseUsageCacheKey = (PathBuf, String);
-
-/// One account's usage cache: when a fetch was last kicked or landed, and the last
-/// reading that ever landed (its figure where the mint named one, its plan). The two
-/// are kept apart so a failed fetch backoff never erases a good reading, and a
-/// plan-only success is a success, not a failure to retry every minute.
-#[derive(Clone)]
-struct MuseUsageEntry {
-    attempted_at: i64,
-    reading: Option<(Option<WeeklyFigure>, Option<String>)>,
-}
-
-type MuseUsageCacheMap = std::collections::HashMap<MuseUsageCacheKey, MuseUsageEntry>;
-
-/// Whether `entry` can be served without fetching: a landed figure inside
-/// [`USAGE_CURRENT_S`], or a plan-only landing no older.
-fn muse_usage_fresh(entry: Option<&MuseUsageEntry>, now: i64) -> bool {
-    match entry.and_then(|entry| entry.reading.as_ref().map(|reading| (entry, reading))) {
-        Some((_, (Some(figure), _))) => figure.current(now),
-        Some((entry, (None, _))) => now.saturating_sub(entry.attempted_at) <= USAGE_CURRENT_S,
-        None => false,
+/// Whether a record's week can be served without a read: a figure inside [`USAGE_CURRENT_S`],
+/// or a read that answered with no figure (a plan alone) no older.
+fn muse_usage_fresh(record: &super::observed_account::Record, now: i64) -> bool {
+    match record.week {
+        Some(figure) => figure.current(now),
+        None => {
+            record.auth == super::accounts::Auth::Ok
+                && record.failed_at.is_none()
+                && record
+                    .read_at
+                    .is_some_and(|at| (0..=USAGE_CURRENT_S).contains(&now.saturating_sub(at)))
+        }
     }
 }
 
-/// Whether a fetch was kicked too recently to kick another ([`MUSE_USAGE_RETRY_S`]).
-fn muse_usage_attempt_recent(entry: Option<&MuseUsageEntry>, now: i64) -> bool {
-    entry.is_some_and(|entry| now.saturating_sub(entry.attempted_at) < MUSE_USAGE_RETRY_S)
-}
-
 /// Whether a Muse footer pass reads usage: once per session on an account (`read_here`, its
-/// [`SubscriptionDisplay::usage_read`]), and not while a figure is current or a fetch just ran.
-fn muse_usage_owed(entry: Option<&MuseUsageEntry>, read_here: bool, now: i64) -> bool {
-    !read_here && !muse_usage_fresh(entry, now) && !muse_usage_attempt_recent(entry, now)
+/// [`SubscriptionDisplay::usage_read`]) and not while a figure is current, once for a login
+/// nothing was read of yet, or whenever a person asked ([`muse_usage_forget`]). Whether the
+/// read may start is the gate's
+/// ([`super::observed_account::Store::admit`]).
+fn muse_usage_owed(record: &super::observed_account::Record, read_here: bool, now: i64) -> bool {
+    // A login nothing was ever read of (a first sighting, a sign-in since a sign-out) is read
+    // once, whatever this session read of the login before it.
+    let unread = record.auth == super::accounts::Auth::Unseen && record.read_at.is_none();
+    record.asked || unread || (!read_here && !muse_usage_fresh(record, now))
 }
 
-static MUSE_USAGE_CACHE: std::sync::Mutex<Option<MuseUsageCacheMap>> = std::sync::Mutex::new(None);
-
-/// One Muse usage fetch at a time ([`super::muse_usage::fetch`]): the mint is bounded
-/// per host, and parallel footer reads share the one answer through the cache instead.
+/// One Muse usage fetch at a time in this process ([`super::muse_usage::fetch`]): the mint is
+/// bounded per host, and parallel footer reads share the one answer through the record instead.
 static MUSE_USAGE_FETCHING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// How long a failed Muse usage fetch waits before another read tries again: the host's
-/// own mint bound, so a retry never asks sooner than the mint could answer.
-const MUSE_USAGE_RETRY_S: i64 = 60;
 
 fn non_empty_env_var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
     env.iter().find_map(|entry| {
@@ -1431,19 +1477,26 @@ fn abs_home_dir(env: &[String], user_home: &Path) -> PathBuf {
 pub enum MuseLogin {
     /// `auth.json` names Meta's OAuth account `email`.
     Seen { email: String, path: PathBuf },
-    /// `auth.json` is there and names no OAuth account.
+    /// `auth.json` is there and names no OAuth account, or Muse Code's config home holds none.
     SignedOut { path: PathBuf },
     /// Nothing to read: `META_API_KEY` is set, another provider is selected, the settings
-    /// could not be read, or there is no readable `auth.json`.
+    /// could not be read, Muse Code made no config home, or `auth.json` is unreadable.
     Unread,
 }
 
-/// The `muse` configuration directory of a process with environment `env` whose home is
-/// `home_dir`: `$XDG_CONFIG_HOME/muse` where that is absolute, else `<home>/.config/muse`.
-fn muse_config_dir(env: &[String], home_dir: &Path) -> PathBuf {
+/// The file in Muse Code's config home that names its login ([`muse_login_for`]).
+pub const MUSE_AUTH_FILE: &str = "auth.json";
+
+/// Muse Code's config home for a process whose exec environment is `env`: `muse` under an
+/// absolute `XDG_CONFIG_HOME`, else under `.config` of its `HOME` (the user's where `env` names
+/// no absolute one). The one resolver of the three readers that need it: the login
+/// ([`muse_login_for`]), the usage read's own environment ([`muse_serve_env`]) and the read's
+/// account ([`super::muse_usage::fetch`]).
+#[must_use]
+pub fn muse_config_home(env: &[String], user_home: &Path) -> PathBuf {
     match non_empty_env_var(env, "XDG_CONFIG_HOME").map(PathBuf::from) {
         Some(xdg) if xdg.is_absolute() => xdg,
-        _ => home_dir.join(".config"),
+        _ => abs_home_dir(env, user_home).join(".config"),
     }
     .join("muse")
 }
@@ -1456,7 +1509,7 @@ pub fn muse_login_for(argv: &[String], env: &[String], user_home: &Path) -> Muse
     if non_empty_env_var(env, "META_API_KEY").is_some() {
         return MuseLogin::Unread;
     }
-    let config = muse_config_dir(env, &abs_home_dir(env, user_home));
+    let config = muse_config_home(env, user_home);
     let provider = match muse_provider_arg(argv) {
         Some(provider) => Some(provider),
         None => match read_with(&config.join("settings.json"), |bytes| {
@@ -1479,7 +1532,7 @@ pub fn muse_login_for(argv: &[String], env: &[String], user_home: &Path) -> Muse
     {
         return MuseLogin::Unread;
     }
-    let path = config.join("auth.json");
+    let path = config.join(MUSE_AUTH_FILE);
     let email = read_with(&path, |bytes| {
         let Obj(raw) =
             aterm_json::from_slice::<Obj<RawMuseAuth>>(bytes).map_err(|_| NoProfile::Unreadable)?;
@@ -1495,17 +1548,129 @@ pub fn muse_login_for(argv: &[String], env: &[String], user_home: &Path) -> Muse
     match email {
         Ok(Some(email)) => MuseLogin::Seen { email, path },
         Ok(None) => MuseLogin::SignedOut { path },
+        // `muse logout` may remove the file rather than empty it: a config home Muse Code made
+        // that holds no `auth.json` holds no login.
+        Err(NoProfile::Missing) if config.is_dir() => MuseLogin::SignedOut { path },
         Err(_) => MuseLogin::Unread,
     }
 }
 
+/// The store of Muse Code's observed accounts on this machine
+/// ([`super::observed_account::Store::of_machine`]).
+#[must_use]
+pub fn muse_accounts() -> Option<super::observed_account::Store> {
+    super::observed_account::Store::of_machine(super::journal::ObservedCli::Muse)
+}
+
 /// The account a Muse Code process is signed in as, with its weekly quota
-/// ([`SubscriptionDisplay`]): the login `~/.config/muse/auth.json` names ([`muse_login_for`]),
-/// and the week a bounded `muse serve` usage refresh reads ([`super::muse_usage`]), cached per
-/// config and account under the one age rule ([`WeeklyFigure::words`]). The refresh runs only
-/// where the process's own binary resolves; a screen card's words in `prev` stand while
-/// no figure is current, as agy's do ([`agy_subscription_for`]).
+/// ([`SubscriptionDisplay`]), from the account's record in `store`
+/// ([`super::observed_account`]): the login its own store names ([`super::observe::muse`]),
+/// taken into the record on every pass, and the week the record holds under the one age rule
+/// ([`WeeklyFigure::words`]). `None` where the store names no Meta login (signed out, an API
+/// key, another provider): there is no account to show, and nothing is read.
+///
+/// A stale week starts one bounded `muse serve` usage read ([`super::muse_usage`]) on a thread
+/// of its own, only through the record's gate ([`super::observed_account::Store::admit`]): a
+/// login on record as signed out starts no process. What the read says lands in the record
+/// and shows at the next pass. A screen card's words in `prev` stand while no figure is
+/// current, as agy's do ([`agy_subscription_for`]).
 /// A provider read additionally requires `host` to own this process's arguments and environment.
+#[must_use]
+pub fn muse_subscription_in(
+    store: &super::observed_account::Store,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    now: i64,
+    host: &dyn super::provider_read::FooterHost,
+) -> Option<SubscriptionDisplay> {
+    let seen = super::observe::muse(
+        &super::observe::Process {
+            argv,
+            env,
+            cwd: None,
+        },
+        user_home,
+    );
+    let record = store.observe(&seen, now);
+    let login = seen.seen()?;
+    let email = login.email.clone();
+    let same_email = prev.email.as_deref() == Some(email.as_str());
+    let prev_figure = same_email.then_some(prev.weekly_figure).flatten();
+    // The fetch never runs on this (the footer's one resolver) thread: a hung
+    // `muse serve` would stall every session's facts behind its budget. A stale
+    // record kicks a fetch thread and serves what it has; the landed reading shows
+    // at the next resolver pass.
+    let read_here = same_email && prev.usage_read;
+    let mut usage_read = read_here
+        || record
+            .as_ref()
+            .is_some_and(|record| muse_usage_fresh(record, now));
+    if let Some(record) = record.as_ref()
+        && muse_usage_owed(record, read_here, now)
+        && record.standing(record.asked, now).is_ok()
+        && let Some(exe) = muse_exe_for(argv, env, user_home)
+    {
+        let home_dir = abs_home_dir(env, user_home);
+        let config = muse_config_home(env, user_home);
+        // A footer whose host does not own this process reads nothing; the account it runs on
+        // is still the one its login file names.
+        if let Some(use_token) = footer_read_use(
+            host,
+            argv,
+            env,
+            super::provider_read::Read::MuseUsage,
+            &config,
+        ) {
+            usage_read |= kick_muse_usage_fetch(
+                store,
+                MuseRead {
+                    place: login.path.clone(),
+                    email: email.clone(),
+                    config,
+                    exe,
+                    serve_env: muse_serve_env(env, &home_dir),
+                    home_dir,
+                },
+                now,
+                use_token,
+            );
+        }
+    }
+    let signed_out = record
+        .as_ref()
+        .is_some_and(|record| record.auth == super::accounts::Auth::SignedOut);
+    let shown = |figure: Option<WeeklyFigure>| figure.filter(|figure| figure.words(now).is_some());
+    // A login on record as signed out has no week to show, whatever was read before it ended.
+    let figure = if signed_out {
+        None
+    } else {
+        WeeklyFigure::newer(
+            shown(record.as_ref().and_then(|record| record.week)),
+            shown(prev_figure),
+        )
+    };
+    let weekly = figure.and_then(|fig| fig.words(now)).or_else(|| {
+        (same_email && !signed_out && prev.weekly_figure.is_none())
+            .then(|| prev.weekly.clone())
+            .flatten()
+    });
+    Some(SubscriptionDisplay {
+        email: Some(email),
+        plan: record
+            .and_then(|record| record.plan)
+            .or_else(|| same_email.then(|| prev.plan.clone()).flatten()),
+        weekly,
+        weekly_figure: figure,
+        weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
+        usage_read,
+        ..SubscriptionDisplay::default()
+    })
+}
+
+/// [`muse_subscription_in`] this machine's record ([`muse_accounts`]); with no harness state
+/// directory there is no record, so no account is shown and nothing is read.
 #[must_use]
 pub fn muse_subscription_for(
     argv: &[String],
@@ -1515,190 +1680,112 @@ pub fn muse_subscription_for(
     now: i64,
     host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
-    let MuseLogin::Seen { email, .. } = muse_login_for(argv, env, user_home) else {
-        return None;
-    };
-    let home_dir = abs_home_dir(env, user_home);
-    let config = muse_config_dir(env, &home_dir);
-    let same_email = prev.email.as_deref() == Some(email.as_str());
-    let key = (config.clone(), email.clone());
-    let cached = {
-        let guard = MUSE_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().and_then(|map| map.get(&key).cloned())
-    };
-    let prev_figure = same_email.then_some(prev.weekly_figure).flatten();
-    // The fetch never runs on this (the footer's one resolver) thread: a hung
-    // `muse serve` would stall every session's facts behind its budget. A stale
-    // cache kicks a fetch thread and serves what it has; the landed reading shows
-    // at the next resolver pass. An explicit `muse_usage_forget` clears `cached`
-    // so the person's fact-menu refresh mints one fresh figure.
-    let read_here = same_email && prev.usage_read && cached.is_some();
-    let mut usage_read = read_here || muse_usage_fresh(cached.as_ref(), now);
-    if muse_usage_owed(cached.as_ref(), read_here, now)
-        && let Some(exe) = muse_exe_for(argv, env, user_home)
-    {
-        usage_read = kick_muse_usage_fetch(
-            key.clone(),
-            exe,
-            muse_serve_env(env, &home_dir),
-            home_dir,
-            now,
-            footer_read_use(
-                host,
-                argv,
-                env,
-                super::provider_read::Read::MuseUsage,
-                &config,
-            )?,
-        );
-    }
-    let (figure, fetched_plan) = match cached.and_then(|entry| entry.reading) {
-        Some((figure, plan)) => (figure, plan),
-        None => (None, None),
-    };
-    let shown = |figure: Option<WeeklyFigure>| figure.filter(|figure| figure.words(now).is_some());
-    let figure = WeeklyFigure::newer(shown(figure), shown(prev_figure));
-    let weekly = figure.and_then(|fig| fig.words(now)).or_else(|| {
-        (same_email && prev.weekly_figure.is_none())
-            .then(|| prev.weekly.clone())
-            .flatten()
-    });
-    Some(SubscriptionDisplay {
-        email: Some(email),
-        plan: fetched_plan.or_else(|| same_email.then(|| prev.plan.clone()).flatten()),
-        weekly,
-        weekly_figure: figure,
-        weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
-        usage_read,
-        ..SubscriptionDisplay::default()
-    })
+    muse_subscription_in(&muse_accounts()?, argv, env, user_home, prev, now, host)
 }
 
-/// Kicks the one in-flight Muse usage fetch (`MUSE_USAGE_FETCHING`) on its own
-/// thread for `key`, marking the attempt now so the reads behind it serve the
-/// cache instead of kicking again. A landed reading replaces the cache's; a
-/// failed one only moves the attempt stamp, keeping the last good reading. Returns whether a
-/// fetch started.
-fn kick_muse_usage_fetch(
-    key: MuseUsageCacheKey,
+/// One Muse usage read's process: the login it reads, and what `muse serve` runs as.
+struct MuseRead {
+    place: PathBuf,
+    email: String,
+    config: PathBuf,
     exe: PathBuf,
     serve_env: Vec<(&'static str, std::ffi::OsString)>,
     home_dir: PathBuf,
+}
+
+/// Kicks the one in-flight Muse usage fetch (`MUSE_USAGE_FETCHING`) on its own thread for
+/// `read`'s login, once the record's gate admits it
+/// ([`super::observed_account::Store::admit`]: never a login on record as signed out). What the
+/// read says lands in the record ([`super::observed_account::Store::landed`]): a reading, the
+/// vendor's sign-in words, or nothing. Returns whether a fetch started.
+fn kick_muse_usage_fetch(
+    store: &super::observed_account::Store,
+    read: MuseRead,
     now: i64,
     use_token: super::provider_read::Use,
 ) -> bool {
+    use super::observed_account::Landing;
     if MUSE_USAGE_FETCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return false;
     }
-    let previous = {
-        let mut guard = MUSE_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let map = guard.get_or_insert_with(std::collections::HashMap::new);
-        let prev = map.get(&key).cloned();
-        let slot = map.entry(key.clone()).or_insert(MuseUsageEntry {
-            attempted_at: now,
-            reading: None,
-        });
-        slot.attempted_at = now;
-        prev
+    struct FetchDone;
+    impl Drop for FetchDone {
+        fn drop(&mut self) {
+            MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let done = FetchDone;
+    let Ok(pass) = store.admit(&read.place, &read.email, false, now) else {
+        return false;
     };
-    let spawned_key = key.clone();
-    let spawned = std::thread::Builder::new()
+    let store = store.clone();
+    std::thread::Builder::new()
         .name("aterm-muse-usage".to_string())
         .spawn(move || {
-            struct FetchDone;
-            impl Drop for FetchDone {
-                fn drop(&mut self) {
-                    MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
-                }
-            }
-            let _done = FetchDone;
-            let Ok(permit) = use_token.begin(
+            let _done = done;
+            let landing = match use_token.begin(
                 super::provider_read::Account::in_home(
                     super::provider_read::Read::MuseUsage,
-                    &spawned_key.0,
+                    &read.config,
                     None,
                 ),
-                now,
-                super::journal::realm_key("meta", &spawned_key.1),
-            ) else {
-                return;
+                pass.at(),
+                super::observed_account::account_key(
+                    super::journal::ObservedCli::Muse,
+                    &read.email,
+                ),
+            ) {
+                Ok(permit) => {
+                    match super::muse_usage::fetch(
+                        &read.exe,
+                        read.serve_env,
+                        &read.home_dir,
+                        permit,
+                    ) {
+                        Ok(reading) => Some(muse_landing(reading, pass.at())),
+                        Err(super::muse_usage::Missed::SignedOut) => Some(Landing::SignedOut),
+                        Err(super::muse_usage::Missed::Unanswered) => Some(Landing::Nothing),
+                    }
+                }
+                // No provider was contacted, so nothing is known of the login.
+                Err(_) => None,
             };
-            let reading = super::muse_usage::fetch(&exe, serve_env, &home_dir, permit);
-            let done = aterm_time::unix_secs()
+            let done_at = aterm_time::unix_secs()
                 .and_then(|secs| i64::try_from(secs).ok())
-                .unwrap_or(now);
-            let mut guard = MUSE_USAGE_CACHE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            land_muse_usage(
-                guard.get_or_insert_with(std::collections::HashMap::new),
-                &spawned_key,
-                reading,
-                done,
-            );
-        });
-    if spawned.is_ok() {
-        true
-    } else {
-        let mut guard = MUSE_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(map) = guard.as_mut() {
-            match previous {
-                Some(entry) => {
-                    map.insert(key, entry);
-                }
-                None => {
-                    map.remove(&key);
-                }
+                .unwrap_or(pass.at());
+            if let Some(landing) = landing {
+                store.landed(pass, landing, done_at);
             }
-        }
-        MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
-        false
-    }
+        })
+        .is_ok()
 }
 
-/// Records a finished fetch in `map`: the attempt stamp always moves to `done`, a
-/// landed reading replaces the cached one, and a failure keeps the last good one.
-/// The entry is created where [`muse_usage_forget`] removed it mid-flight: that
-/// forget asked for a fresh mint, and the reading this fetch just minted is it —
-/// dropping it would only spend the host's next mint bound re-asking.
-fn land_muse_usage(
-    map: &mut MuseUsageCacheMap,
-    key: &MuseUsageCacheKey,
-    reading: Option<super::muse_usage::Reading>,
+/// A fetched reading as the record takes it: its plan, and its week where the mint named both
+/// the share and the reset (read at the provider's stamp, else at `done`).
+fn muse_landing(
+    reading: super::muse_usage::Reading,
     done: i64,
-) {
-    let slot = map.entry(key.clone()).or_insert(MuseUsageEntry {
-        attempted_at: done,
-        reading: None,
-    });
-    slot.attempted_at = done;
-    if let Some(reading) = reading {
-        let figure = match (reading.weekly_used_x10, reading.weekly_resets_at) {
-            (Some(used_x10), Some(resets_at)) => Some(WeeklyFigure {
-                used_x10,
-                resets_at,
-                at: reading.observed_at.unwrap_or(done),
-            }),
-            _ => None,
-        };
-        slot.reading = Some((figure, reading.plan));
+) -> super::observed_account::Landing {
+    let week = match (reading.weekly_used_x10, reading.weekly_resets_at) {
+        (Some(used_x10), Some(resets_at)) => Some(WeeklyFigure {
+            used_x10,
+            resets_at,
+            at: reading.observed_at.unwrap_or(done),
+        }),
+        _ => None,
+    };
+    super::observed_account::Landing::Read {
+        plan: reading.plan,
+        week,
     }
 }
 
-/// Forgets every cached Muse usage reading for `email` (the account menu's refresh): the
-/// next [`muse_subscription_for`] read mints a fresh figure instead of serving the cache.
+/// A person asked for a fresh Muse usage reading for `email` (the account menu's refresh): the
+/// next [`muse_subscription_for`] pass reads once instead of serving the record, unless the
+/// login is on record as signed out.
 pub fn muse_usage_forget(email: &str) {
-    let mut guard = MUSE_USAGE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(map) = guard.as_mut() {
-        map.retain(|(_, kept_email), _| kept_email != email);
+    if let Some(store) = muse_accounts() {
+        store.ask(email);
     }
 }
 
@@ -2422,6 +2509,53 @@ pub fn agy_excerpts_for(
     Some((excerpts, transcript_len))
 }
 
+/// When the running `agy` session last served a turn, as its own transcript says it: the
+/// newest complete row of the conversation it holds is the model's answer (`PLANNER_RESPONSE`),
+/// so the file's last write, Unix seconds, is that answer's. `None` while the newest row is
+/// anything else (a prompt still unanswered, a tool's row), no conversation is uniquely held, or
+/// the answer was written before the process started at `born` (Unix seconds): a conversation
+/// it resumed was served by an earlier session, whose login may have ended since.
+/// A served turn is the evidence that marks the session's login working
+/// ([`super::agy_gate::Gate::served`]): the model answered on it, and nothing was probed.
+#[must_use]
+pub fn agy_served_at(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    files: Option<&[PathBuf]>,
+    born: Option<u64>,
+) -> Option<i64> {
+    const WINDOW: u64 = 64 * 1024;
+    let var = |key: &str| non_empty_env_var(env, key);
+    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
+    };
+    let config = std::fs::canonicalize(config).ok()?;
+    let conversation = agy_active_conversation(argv, &config, files)?;
+    let transcript = config
+        .join("brain")
+        .join(&conversation)
+        .join(".system_generated/logs/transcript.jsonl");
+    // The time first: a row written after it only makes the evidence older than it is.
+    let written = std::fs::metadata(&transcript)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let (tail, _) = read_jsonl_tail(&transcript, WINDOW)?;
+    let text = String::from_utf8_lossy(&tail);
+    let newest = text
+        .lines()
+        .rev()
+        .find_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())?;
+    (newest.get("type").and_then(aterm_json::Value::as_str) == Some("PLANNER_RESPONSE")
+        && born.is_some_and(|born| written.as_secs() >= born))
+    .then(|| i64::try_from(written.as_secs()).ok())
+    .flatten()
+}
+
 fn muse_active_session_lock(
     pid: u32,
     argv: &[String],
@@ -2546,12 +2680,14 @@ fn agy_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<Path
     launched_exe_for(argv, env, user_home, "agy")
 }
 
-/// agy's `/usage` doc, read whole within `budget` ([`super::align::capture_bounded_until`], as the
-/// quota store reads it; a running agy's subscription read spends
-/// [`super::agy_quota_store::LAUNCH_READ_BUDGET`], the budget a launch's own read has): at the
-/// budget agy and whatever it started that still holds its stdout are killed, and there is no doc.
-/// An agy that prints its sign-in prompt ([`super::agy_quota_store::SIGN_IN_PROMPT`]) is killed
-/// then, never left waiting for a person, and the failure says it is signed out.
+/// agy's `/usage` doc, read whole within `budget` through the account gate
+/// ([`super::agy_gate::Gate::read`], as the quota store reads it; a running agy's subscription
+/// read spends [`super::agy_quota_store::LAUNCH_READ_BUDGET`], the budget a launch's own read
+/// has): at the budget agy and whatever it started that still holds its stdout are killed, and
+/// there is no doc. `pass` is the gate's leave for this one process, which runs off the screen;
+/// an agy that prints its sign-in prompt ([`super::agy_quota_store::SIGN_IN_PROMPT`]) is killed
+/// then, never left waiting for a person, the gate records `email`'s login signed out, and the
+/// failure says so.
 #[expect(
     clippy::too_many_arguments,
     reason = "the bound read carries the process environment, deadline and journal context explicitly"
@@ -2565,7 +2701,7 @@ fn fetch_agy_usage_doc(
     budget: std::time::Duration,
     use_token: super::provider_read::Use,
     now: i64,
-    login: Option<super::journal::Key>,
+    (gate, pass, email): (&super::agy_gate::Gate, super::agy_gate::Pass, &str),
 ) -> Result<Vec<u8>, &'static str> {
     let config = cfg_var
         .map(PathBuf::from)
@@ -2574,38 +2710,88 @@ fn fetch_agy_usage_doc(
     let _permit = use_token.begin(
         super::provider_read::Account::in_home(super::provider_read::Read::AgyUsage, &config, None),
         now,
-        login,
+        super::journal::realm_key("google", email),
     )?;
-    let mut cmd = aterm_uds::spawnfd::command(exe);
-    cmd.args(super::upgrade_agy::config_flags(argv))
-        .arg("--log-file")
-        .arg("/dev/null")
-        .args(super::agy_quota::USAGE_ARGS)
-        .env("HOME", home);
+    let args: Vec<std::ffi::OsString> = super::upgrade_agy::config_flags(argv)
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .chain(["--log-file", "/dev/null"].map(std::ffi::OsString::from))
+        .chain(super::agy_quota::USAGE_ARGS.map(std::ffi::OsString::from))
+        .collect();
+    let mut pairs = vec![(
+        "HOME".to_owned(),
+        home.to_str().ok_or("agy home unavailable")?.to_owned(),
+    )];
     if let Some(cfg) = cfg_var {
-        cmd.env("AGY_CLI_CONFIG_DIR", cfg);
+        pairs.push(("AGY_CLI_CONFIG_DIR".to_owned(), cfg.to_owned()));
     }
     // The session's `SSH_CONNECTION` selects agy's grant store (its file backend over SSH, the OS
     // keyring otherwise): the probe asks the store the session signed in with.
     if let Some(ssh) = ssh {
-        cmd.env("SSH_CONNECTION", ssh);
+        pairs.push(("SSH_CONNECTION".to_owned(), ssh.to_owned()));
     }
-    match super::align::capture_bounded_until(
-        cmd,
-        budget,
-        super::agy_quota::MAX_STDOUT,
-        super::agy_quota_store::SIGN_IN_PROMPT,
+    match gate.read(
+        pass,
+        exe.as_os_str(),
+        &args,
+        &pairs,
+        (budget, super::agy_quota::MAX_STDOUT),
+        Some(email),
     ) {
-        Ok(super::align::Ended::Exited(got)) if got.success() => Ok(got.stdout),
-        Ok(super::align::Ended::Stopped) => Err(SIGNED_OUT_FOOTER),
+        Ok(got) if got.success() => Ok(got.stdout),
+        Err(why) if super::agy_quota_store::is_signed_out(&why) => Err(SIGNED_OUT_FOOTER),
         _ => Err("footer usage read failed"),
     }
 }
 
-/// The failure a footer read notes when agy met its sign-in prompt: the running session's grant
-/// no longer serves a new process.
+/// The failure a footer read answers when agy met its sign-in prompt: the running session's
+/// grant no longer serves a new process, and the gate has recorded its login signed out.
 const SIGNED_OUT_FOOTER: &str = "signed-out (expired): agy asked for a Google sign-in on a \
                                  footer usage read; `aterm harness agy login <account>` signs it in again";
+
+/// What a running agy's own files say of its sign-in, for the gate: its grant file where its
+/// session runs agy's file backend ([`super::agy_quota_store::grant_file_in`]).
+fn agy_session_proof(env: &[String], config: &Path) -> super::agy_gate::Proof {
+    super::agy_gate::Proof::of_grant(super::agy_quota_store::grant_file_in(config, &|name| {
+        non_empty_env_var(env, name).map(str::to_owned)
+    }))
+}
+
+/// Drop every figure this process caches of the login in `config`: a login on record as signed
+/// out has none.
+fn forget_agy_usage(config: &Path) {
+    if let Some(map) = AGY_USAGE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        map.retain(|(held, _, _), _| held != config);
+    }
+}
+
+/// The account gate of the running agy's login ([`super::agy_gate::Gate`]), under the limits
+/// [`agy_quota_store_for`] keeps: this machine's state is the account's only where aterm runs as
+/// the user whose home it is, and a config moved by `AGY_CLI_CONFIG_DIR` answers to no account
+/// on record. `None` there, and a login no gate knows is never read.
+fn agy_gate_for(
+    home_var: Option<&str>,
+    cfg_var: Option<&str>,
+    user_home: &Path,
+) -> Option<super::agy_gate::Gate> {
+    let abs_cfg = cfg_var.filter(|dir| Path::new(dir).is_absolute());
+    if abs_cfg.is_some() || !std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home) {
+        return None;
+    }
+    let state = super::agy_quota_store::machine_state()?;
+    Some(super::agy_gate::Gate::at(
+        &state,
+        user_home,
+        aterm_types::dirs::aterm_config_path().as_deref(),
+        home_var
+            .filter(|h| Path::new(h).is_absolute())
+            .map(Path::new),
+    ))
+}
 
 fn agy_quota_store_for(
     argv: &[String],
@@ -2796,11 +2982,13 @@ pub fn agy_subscription_for(
     now: i64,
     host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
-    agy_subscription_in_dir(argv, env, None, user_home, prev, model, now, host)
+    agy_subscription_in_dir(argv, env, None, user_home, prev, model, (now, None), host)
 }
 
 /// [`agy_subscription_for`] resolving a relative `--settings` file path against `cwd` when `cwd`
-/// is an absolute directory.
+/// is an absolute directory. `served_at` is when the session last served a turn
+/// ([`agy_served_at`]), the evidence that marks its login working in the account state; the
+/// read itself runs only for a login that state knows signed in ([`super::agy_gate`]).
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -2813,11 +3001,12 @@ pub fn agy_subscription_in_dir(
     user_home: &Path,
     prev: &SubscriptionDisplay,
     model: Option<&str>,
-    now: i64,
+    (now, served_at): (i64, Option<i64>),
     host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
     let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
+    let gate = agy_gate_for(var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
     agy_subscription_with_store_in_dir(
         argv,
         env,
@@ -2826,7 +3015,7 @@ pub fn agy_subscription_in_dir(
         prev,
         model,
         now,
-        store.as_ref(),
+        (store.as_ref(), gate.as_ref(), served_at),
         host,
     )
 }
@@ -2843,7 +3032,11 @@ fn agy_subscription_with_store_in_dir(
     prev: &SubscriptionDisplay,
     model: Option<&str>,
     now: i64,
-    store: Option<&super::agy_quota_store::Store>,
+    (store, gate, served_at): (
+        Option<&super::agy_quota_store::Store>,
+        Option<&super::agy_gate::Gate>,
+        Option<i64>,
+    ),
     host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
@@ -2857,9 +3050,32 @@ fn agy_subscription_with_store_in_dir(
         return None;
     };
     let home_dir = abs_home_dir(env, user_home);
+    if matches!(record, Some((None, _))) {
+        return None;
+    }
+    // The account state, before anything else is said of the login: a turn this session served
+    // marks it working, and a login on record as signed out shows no email, plan or week (none
+    // is known true of it now) however fresh a figure this footer or the store still holds.
+    let proof = agy_session_proof(env, &config);
+    let observed = record.as_ref().and_then(|(email, _)| email.clone());
+    if let (Some(gate), Some(served_at)) = (gate, served_at) {
+        gate.served(observed.as_deref(), served_at, now);
+    }
+    let standing = gate.map(|gate| gate.standing(&proof, now));
+    if let Some(super::agy_gate::Standing::Out(refusal)) = &standing
+        && refusal.signed_out()
+    {
+        forget_agy_usage(&config);
+        return Some(SubscriptionDisplay {
+            signed_out: true,
+            ..SubscriptionDisplay::default()
+        });
+    }
+    let signed_in = matches!(standing, Some(super::agy_gate::Standing::SignedIn { .. }));
     let email = match record {
         Some((Some(email), _)) => email,
         Some((None, _)) => return None,
+        // A display that said signed out named no email; the screen's card may name one again.
         None => prev.email.clone()?,
     };
     let active_model = model.map(str::to_owned).or_else(|| {
@@ -2882,6 +3098,19 @@ fn agy_subscription_with_store_in_dir(
     });
     let same_email = prev.email.as_deref() == Some(email.as_str());
     let account_switched = prev.email.is_some() && !same_email;
+    if !signed_in {
+        // Not known signed in (nothing on record of the login, or no account answers to it):
+        // its own log or card still names it, but no figure kept of it is answered and no read
+        // runs. The read is made on a later pass, once a served turn or a sign-in is on record.
+        let on_screen = same_email && prev.weekly_figure.is_none();
+        return Some(SubscriptionDisplay {
+            email: Some(email),
+            plan: same_email.then(|| prev.plan.clone()).flatten(),
+            weekly: on_screen.then(|| prev.weekly.clone()).flatten(),
+            weekly_reset: on_screen.then(|| prev.weekly_reset.clone()).flatten(),
+            ..SubscriptionDisplay::default()
+        });
+    }
     let key = (config.clone(), email.clone(), third_party);
     let other_key = (config.clone(), email.clone(), !third_party);
     let (cached, other_cached) = {
@@ -2939,9 +3168,14 @@ fn agy_subscription_with_store_in_dir(
                 fallback
             } else {
                 let lock = store.map(super::agy_quota_store::Store::try_lock);
-                if matches!(lock, Some(None)) {
-                    fallback
-                } else if let Some(exe) = agy_exe_for(argv, env, user_home) {
+                // The gate, before any process: only a login the account state knows signed in
+                // is read, and a pass skipped here is made later, once it is known.
+                let pass = gate
+                    .filter(|_| signed_in && !matches!(lock, Some(None)))
+                    .and_then(|gate| gate.admit(&proof, now).ok().map(|pass| (gate, pass)));
+                if let Some((gate, pass)) = pass
+                    && let Some(exe) = agy_exe_for(argv, env, user_home)
+                {
                     usage_read = true;
                     let fetch = fetch_agy_usage_doc(
                         &exe,
@@ -2958,9 +3192,22 @@ fn agy_subscription_with_store_in_dir(
                             &config,
                         )?,
                         now,
-                        super::journal::realm_key("google", &email),
+                        (gate, pass, &email),
                     );
                     let failed = fetch.as_ref().err().copied();
+                    if failed == Some(SIGNED_OUT_FOOTER) {
+                        // The read met agy's sign-in prompt and the gate recorded it: the
+                        // display says so now, and no figure of the login is kept. The store's
+                        // backoff holds a home no account answers to, which has no record.
+                        if let Some(store) = store {
+                            store.note_failure(SIGNED_OUT_FOOTER, now);
+                        }
+                        forget_agy_usage(&config);
+                        return Some(SubscriptionDisplay {
+                            signed_out: true,
+                            ..SubscriptionDisplay::default()
+                        });
+                    }
                     let bytes = fetch.ok();
                     let fetched = bytes
                         .as_deref()
@@ -3143,6 +3390,14 @@ impl Selected {
             usage_read: false,
             tap_own: false,
             model_id: None,
+            signed_out: false,
+            fable: Some(self.profile.fable.clone()),
+            five_hour: self
+                .profile
+                .usage
+                .as_ref()
+                .and_then(|usage| cached_figure(usage, Bucket::FiveHour, now)),
+            credits: self.profile.credits.state(),
         }
     }
 
@@ -3200,9 +3455,16 @@ fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &Cached
 /// read when Claude Code fetched it: its age is [`WeeklyFigure::words`]' to judge, not
 /// [`current_windows`]'.
 fn cached_weekly(usage: &UsageCache, now: i64) -> Option<WeeklyFigure> {
-    let row = usage.windows.iter().find(|row| {
-        row.bucket == Bucket::SevenDay && row.resets_at.is_some_and(|reset| reset > now)
-    })?;
+    cached_figure(usage, Bucket::SevenDay, now)
+}
+
+/// [`cached_weekly`] for any one `bucket` of the reading: its row whose window still runs at
+/// `now`, as read when Claude Code fetched it.
+fn cached_figure(usage: &UsageCache, bucket: Bucket, now: i64) -> Option<WeeklyFigure> {
+    let row = usage
+        .windows
+        .iter()
+        .find(|row| row.bucket == bucket && row.resets_at.is_some_and(|reset| reset > now))?;
     Some(WeeklyFigure {
         used_x10: u32::from(row.used_pct_x10?),
         resets_at: row.resets_at?,
@@ -4121,56 +4383,5 @@ impl<'de> Deserialize<'de> for IsFable {
 mod tests;
 
 #[cfg(test)]
-mod cold_identity_evidence_tests {
-    use super::*;
-    #[test]
-    fn missing_unknown_and_unavailable_identity_evidence_are_distinct() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        assert_eq!(
-            identity_evidence_in_home(dir.path(), "expected@example.test").unwrap(),
-            IdentityEvidence::Missing
-        );
-        let plain = dir.path().join(".claude.json");
-        std::fs::write(&plain, b"{}").unwrap();
-        assert_eq!(
-            identity_evidence_in_home(dir.path(), "expected@example.test").unwrap(),
-            IdentityEvidence::Present {
-                observation: IdentityObservation::default(),
-                email_digest: None
-            }
-        );
-        std::fs::write(&plain, b"not JSON").unwrap();
-        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
-        std::fs::remove_file(&plain).unwrap();
-        std::fs::create_dir(&plain).unwrap();
-        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
-    }
-    #[test]
-    fn email_only_identity_evidence_binds_normalized_email_without_principal() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join(".claude.json");
-        let write = |email: &str| {
-            std::fs::write(
-                &path,
-                aterm_json::to_vec(&aterm_json::json!({"oauthAccount":{"emailAddress":email}}))
-                    .unwrap(),
-            )
-            .unwrap()
-        };
-        write("First@Example.Test");
-        let first = identity_evidence_in_home(dir.path(), "").unwrap();
-        write(" first@example.test ");
-        assert_eq!(identity_evidence_in_home(dir.path(), "").unwrap(), first);
-        write("second@example.test");
-        assert_ne!(identity_evidence_in_home(dir.path(), "").unwrap(), first);
-        assert!(!format!("{first:?}").contains("example"));
-    }
-    #[test]
-    #[cfg(unix)]
-    fn dangling_selected_profile_is_unavailable_not_missing() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(dir.path().join("absent"), dir.path().join(".claude.json"))
-            .unwrap();
-        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
-    }
-}
+#[path = "profile_cold_identity_evidence_tests.rs"]
+mod cold_identity_evidence_tests;

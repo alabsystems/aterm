@@ -7547,9 +7547,6 @@ pub fn drive_cdp_oauth(
 /// between its reads apart ([`drive_cdp_oauth_with_webmail`], [`BotCheckClock`]).
 const MAX_OAUTH_STEPS: usize = 120;
 
-/// A bot challenge goes to the visible central browser well before the 90-second OAuth deadline.
-const BOT_CHECK_RELAY_AFTER: Duration = Duration::from_secs(5);
-
 /// A Claude sign-in's end on Cloudflare's bot check ([`bot_check`]) that did not clear within
 /// [`VENDOR_STALL`] or the drive's deadline.
 pub const BOT_CHECK_UNCLEARED: &str =
@@ -7559,25 +7556,29 @@ pub const BOT_CHECK_UNCLEARED: &str =
 pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
-const CHALLENGE_UNAVAILABLE: &str = "the fleet challenge service cannot admit account work";
-pub const CHALLENGE_FAILED: &str = "the fleet challenge service did not complete the sign-in";
-
-fn challenge_failed(error: &super::challenge_relay::RequestError) {
-    note_met(MetWord::ChallengeFailed, None);
-    #[cfg(not(test))]
-    eprintln!(
-        "aterm: central Claude challenge failed: {}",
-        super::one_line(&error.to_string(), 320)
-    );
-    #[cfg(test)]
-    let _ = error;
-}
-
 thread_local! {
     /// Why this thread's last headless Claude sign-in ended without the callback
     /// ([`note_met`], [`take_met`]).
     static MET: std::cell::RefCell<Option<super::open_url::Met>> =
         const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Whether this thread's sign-in handed a callback to the waiting CLI
+    /// ([`note_callback_offered`], [`take_callback_offered`]).
+    static CALLBACK_OFFERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notes that this thread's sign-in is handing a callback to the waiting CLI (its loopback
+/// listener, or the hosted code's file): from here only the CLI knows whether it holds the code.
+pub(super) fn note_callback_offered() {
+    CALLBACK_OFFERED.with(|offered| offered.set(true));
+}
+
+/// Whether this thread's sign-in handed a callback to the waiting CLI since the last take; a
+/// failing opener then publishes no failure of its own (`open_url::publish_failed_exit`).
+pub(super) fn take_callback_offered() -> bool {
+    CALLBACK_OFFERED.with(|offered| offered.replace(false))
 }
 
 /// Notes why this thread's headless sign-in ended, with a host only for a page outcome.
@@ -7619,12 +7620,11 @@ pub(super) fn finish_deadline<T>(
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
 /// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
-/// [`BotCheckClock`]) not counted against the drive's steps. Once it has stood for
-/// [`BOT_CHECK_RELAY_AFTER`], or its block page is read, a Claude flow asks the fleet issuer's visible
-/// challenge service for the exact callback; software never operates that challenge. An
-/// unavailable service returns [`CHALLENGE_UNAVAILABLE`]; another service failure returns
-/// [`CHALLENGE_FAILED`] instead of being misreported as the provider's challenge. Page outcomes
-/// are noted for [`take_met`], as is a drive that reached no callback in time.
+/// [`BotCheckClock`]) not counted against the drive's steps. Once it has stood for the drive's
+/// stall, or its block page is read, the drive ends there ([`BOT_CHECK_UNCLEARED`],
+/// [`BLOCK_PAGE_MET`]): software never operates that challenge, and no other Mac is asked to
+/// open a browser for it. The account's own record of the stop is what a person acts on. Page
+/// outcomes are noted for [`take_met`], as is a drive that reached no callback in time.
 pub fn drive_cdp_oauth_with_webmail(
     cdp: &mut CdpClient,
     authorize_url: &str,
@@ -7722,20 +7722,6 @@ fn drive_cdp_oauth_until(
         mailbox_credential,
         deliver_callback,
     )
-}
-
-fn central_callback(
-    flow: &MailboxFlow,
-    authorize_url: &str,
-    email: Option<&str>,
-) -> Result<String, super::challenge_relay::RequestError> {
-    let callback = super::challenge_relay::request_central(authorize_url, email)?;
-    if !flow.is_callback(&callback) {
-        return Err(super::challenge_relay::RequestError::Unconfirmed(
-            "the fleet challenge service returned another OAuth flow's callback".into(),
-        ));
-    }
-    Ok(callback)
 }
 
 fn drive_cdp_oauth_flow_until(
@@ -7937,41 +7923,11 @@ fn drive_cdp_oauth_flow_until(
             }
             match state {
                 "block_page" => {
-                    if google_config.is_none() {
-                        match central_callback(&flow, authorize_url, email.as_deref()) {
-                            Ok(callback) => {
-                                return callback_delivery_result(deliver_callback(&callback));
-                            }
-                            Err(super::challenge_relay::RequestError::Unavailable) => {
-                                note_met(MetWord::ServiceUnavailable, None);
-                                return Err(CHALLENGE_UNAVAILABLE);
-                            }
-                            Err(error) => {
-                                challenge_failed(&error);
-                                return Err(CHALLENGE_FAILED);
-                            }
-                        }
-                    }
                     note_met(MetWord::BlockPage, last_host.as_deref());
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
-                    if bot.check(url, deadline.now()) >= bot_stall.min(BOT_CHECK_RELAY_AFTER) {
-                        if google_config.is_none() {
-                            match central_callback(&flow, authorize_url, email.as_deref()) {
-                                Ok(callback) => {
-                                    return callback_delivery_result(deliver_callback(&callback));
-                                }
-                                Err(super::challenge_relay::RequestError::Unavailable) => {
-                                    note_met(MetWord::ServiceUnavailable, None);
-                                    return Err(CHALLENGE_UNAVAILABLE);
-                                }
-                                Err(error) => {
-                                    challenge_failed(&error);
-                                    return Err(CHALLENGE_FAILED);
-                                }
-                            }
-                        }
+                    if bot.check(url, deadline.now()) >= bot_stall {
                         note_met(MetWord::BotCheck, last_host.as_deref());
                         return Err(BOT_CHECK_UNCLEARED);
                     }
@@ -8408,6 +8364,7 @@ fn authorize_pinned_browser_until(
                 },
                 |cb_url| {
                     deadline.left()?;
+                    note_callback_offered();
                     if cb_url.split('?').next()
                         == Some("https://platform.claude.com/oauth/code/callback")
                     {
@@ -10460,71 +10417,8 @@ pub(super) mod vendor_tests;
 mod cdp_scope_tests;
 
 #[cfg(all(test, unix))]
-mod browser_start_tests {
-    use super::*;
-
-    #[test]
-    fn discovery_and_rejected_browser_spawn_reach_a_hostless_outcome() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        note_met(MetWord::BotCheck, Some("old.example"));
-        assert!(browser_for_start(None).is_err());
-        assert_eq!(
-            take_met(),
-            Some(super::super::open_url::Met::new(
-                MetWord::BrowserStart,
-                None
-            ))
-        );
-
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let executable = tmp.path().join("private-launch-detail");
-        std::fs::write(&executable, b"not executable").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let browser = browser_for_start(find_headless_browser_with(
-            None,
-            &|name| (name == BROWSER_BIN_ENV).then(|| executable.as_os_str().to_owned()),
-            false,
-        ))
-        .unwrap();
-        note_met(MetWord::BlockPage, Some("old.example"));
-        let cmd = headless_browser_command(&browser, tmp.path(), &|_| None);
-        let (cmd_read, _cmd_write) = std::io::pipe().unwrap();
-        let (_out_read, out_write) = std::io::pipe().unwrap();
-        let error = start_browser(cmd, cmd_read.into(), out_write.into()).unwrap_err();
-        assert!(!error.contains("private"));
-        let expected = super::super::open_url::Met::new(MetWord::BrowserStart, None);
-        let produced = take_met().unwrap();
-        assert_eq!(produced, expected);
-        let path = tmp.path().join("outcome");
-        super::super::open_url::write_outcome(&path, &produced);
-        let retained = super::super::open_url::read_outcome(&path).unwrap();
-        assert_eq!(retained, expected);
-        let history = super::super::sign_in_ladder::how_it_ended(
-            super::super::cli::Renewal::Failed,
-            None,
-            Some(&retained),
-        );
-        assert!(history.ends_with(&expected.words()));
-        assert!(!history.contains("private") && !history.contains("old.example"));
-        assert_eq!(take_met(), None);
-    }
-
-    #[test]
-    fn a_new_headless_flow_clears_an_old_outcome_before_url_validation() {
-        note_met(MetWord::BotCheck, Some("old.example"));
-        let result = authorize_with_headless_browser_config_and_credential(
-            "not-an-authorization-url",
-            None,
-            None,
-            None,
-            Duration::ZERO,
-            None,
-        );
-        assert!(result.is_err());
-        assert_eq!(take_met(), None);
-    }
-}
+#[path = "headless_oauth_browser_start_tests.rs"]
+mod browser_start_tests;
 
 #[cfg(test)]
 #[path = "headless_mailbox_tests.rs"]
@@ -10535,625 +10429,23 @@ mod mailbox_tests;
 mod auth_deadline_tests;
 
 #[cfg(test)]
-mod uri_authority_tests {
-    #[test]
-    fn userinfo_ends_before_path_query_and_fragment() {
-        for (url, embedded) in [
-            ("https://user:password@mail.example", true),
-            ("http://user@mail.example?to=a@b", true),
-            ("https://user:password@mail.example#fragment@tail", true),
-            ("https://mail.example?to=a@b", false),
-            ("https://mail.example#fragment@tail", false),
-            ("https://mail.example/path@tail", false),
-            ("https://mail.example/?to=a@b", false),
-            ("https://@mail.example", false),
-            ("https://mail.example", false),
-            ("https://?to=a@b", false),
-            ("ftp://user:password@mail.example", false),
-            ("HTTPS://user@mail.example", true),
-        ] {
-            assert_eq!(super::url_has_embedded_userinfo(url), embedded, "{url}");
-        }
-
-        for (url, selected) in [
-            ("http://localhost:1777", true),
-            ("http://user:password@127.0.0.1:1777?to=a@b", true),
-            ("http://[::1]:1777?to=a@b", true),
-            ("http://[2001:db8::1]:1777?to=a@b", false),
-            ("http://remote.example?to=owner@127.0.0.1:1777", false),
-            ("http://remote.example#owner@localhost:1777", false),
-            ("http://remote.example/path@127.0.0.1:1777", false),
-            ("http://remote.example\\@127.0.0.1:1777", false),
-            ("http://127.0.0.1:1777\\path", false),
-            ("http://::1:1777", false),
-            ("https://localhost:1777", false),
-        ] {
-            assert_eq!(super::is_loopback_http_url(url), selected, "{url}");
-        }
-        assert!(super::cleartext_refusal("http://remote.example\\@127.0.0.1:1777/").is_some());
-        assert!(super::cleartext_refusal("imap://remote.example\\@127.0.0.1/INBOX").is_some());
-
-        for (url, authority, userinfo, target) in [
-            ("http://localhost:1777", "localhost:1777", None, "/"),
-            (
-                "http://[::1]:1777?to=a@b#fragment@tail",
-                "[::1]:1777",
-                None,
-                "/?to=a@b",
-            ),
-            (
-                "http://user:password@127.0.0.1:1777?to=a@b#fragment@tail",
-                "127.0.0.1:1777",
-                Some("user:password"),
-                "/?to=a@b",
-            ),
-            (
-                "http://localhost:1777/mail?to=a@b#fragment@tail",
-                "localhost:1777",
-                None,
-                "/mail?to=a@b",
-            ),
-            (
-                "http://@localhost:1777#tail",
-                "localhost:1777",
-                Some(""),
-                "/",
-            ),
-        ] {
-            let parsed = super::parse_loopback_http_url(url).unwrap();
-            assert_eq!(parsed.authority, authority, "{url}");
-            assert_eq!(parsed.userinfo, userinfo, "{url}");
-            assert_eq!(parsed.port, 1777, "{url}");
-            assert_eq!(parsed.target, target, "{url}");
-        }
-        assert!(
-            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", ".")
-                .is_empty()
-        );
-        assert!(
-            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "..")
-                .is_empty()
-        );
-        assert!(
-            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "%2e%2e")
-                .is_empty()
-        );
-        let plain =
-            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "msg-42");
-        assert_eq!(
-            plain,
-            vec![
-                "http://127.0.0.1:8025/api/v1/message/msg-42".to_owned(),
-                "http://127.0.0.1:8025/api/v1/messages/msg-42".to_owned(),
-            ]
-        );
-        for suffix in ["#inbox", "?unread=1", "?unread=1#inbox"] {
-            assert_eq!(
-                super::candidate_http_detail_urls(
-                    &format!("http://127.0.0.1:8025/api/v1/messages{suffix}"),
-                    "msg-42",
-                ),
-                plain,
-            );
-        }
-    }
-}
+#[path = "headless_oauth_uri_authority_tests.rs"]
+mod uri_authority_tests;
 
 #[cfg(test)]
-mod cdp_error_tests {
-    use super::*;
-
-    /// The late write's test reads its pipe's readiness, which only unix has here.
-    #[cfg(unix)]
-    mod late_write {
-        use super::*;
-        use std::os::fd::AsFd as _;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        /// More than a pipe holds unread, so a command this long cannot finish going out until its
-        /// reader reads.
-        const UNREAD_FRAME: usize = 1024 * 1024;
-
-        /// A stand-in browser that reads nothing until `go`. Once the first command starts to arrive,
-        /// it makes `slept` say the host slept two hours, which ends a deadline that counts sleep on
-        /// it after that write began and before it can finish. After `go` it answers each command
-        /// with its id until its pipe ends, and returns each command's id and expression length.
-        fn unread_until(
-            mut commands: std::io::PipeReader,
-            mut replies: std::io::PipeWriter,
-            slept: Arc<AtomicU64>,
-            go: Receiver<()>,
-        ) -> std::thread::JoinHandle<Vec<(u64, usize)>> {
-            std::thread::spawn(move || {
-                let began = aterm_uds::ready::any_until(
-                    &[commands.as_fd()],
-                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-                )
-                .is_ok_and(|ready| !ready.is_empty());
-                assert!(began, "the first command reached its pipe");
-                slept.store(7200 * 1_000_000_000, Ordering::Release);
-                let mut seen = Vec::new();
-                if go.recv().is_err() {
-                    return seen;
-                }
-                let mut pending = Vec::new();
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    match commands.read(&mut buf) {
-                        Ok(0) | Err(_) => return seen,
-                        Ok(n) => pending.extend_from_slice(&buf[..n]),
-                    }
-                    for msg in split_nul_messages(&mut pending) {
-                        let id = msg["id"].as_u64().unwrap_or(0);
-                        let expression = msg
-                            .pointer("/params/expression")
-                            .and_then(Value::as_str)
-                            .map_or(0, str::len);
-                        seen.push((id, expression));
-                        let mut reply =
-                            aterm_json::to_vec(&json!({"id": id, "result": {"id": id}})).unwrap();
-                        reply.push(0);
-                        if replies.write_all(&reply).is_err() {
-                            return seen;
-                        }
-                    }
-                }
-            })
-        }
-
-        #[test]
-        fn a_late_write_holds_later_commands_back_until_it_finishes_and_poisons_none() {
-            let (commands, command_write) = std::io::pipe().unwrap();
-            let (event_read, replies) = std::io::pipe().unwrap();
-            let slept = Arc::new(AtomicU64::new(0));
-            let (go, start) = std::sync::mpsc::channel();
-            let browser = unread_until(commands, replies, slept.clone(), start);
-            let mut client = CdpClient::new(command_write, event_read);
-            let continuous = || Some(slept.load(Ordering::Acquire));
-            let first = client.call_by(
-                None,
-                "Runtime.evaluate",
-                json!({"expression": "x".repeat(UNREAD_FRAME)}),
-                Deadline::with_clocks(aterm_spec::wait::MUST_HAPPEN, &Instant::now, &continuous),
-            );
-            // A call with no time left reports the unfinished write and sends nothing.
-            let held = client.call(
-                None,
-                "Runtime.evaluate",
-                json!({"expression": "held"}),
-                Duration::ZERO,
-            );
-            let _ = go.send(());
-            let next = client.call(
-                None,
-                "Runtime.evaluate",
-                json!({"expression": "next"}),
-                aterm_spec::wait::MUST_HAPPEN,
-            );
-            // Its pipe's end ends the stand-in.
-            drop(client);
-            let seen = browser.join().unwrap();
-            assert_eq!(first, Err("timed out writing to browser DevTools pipe"));
-            assert_eq!(held, Err("timed out writing to browser DevTools pipe"));
-            assert_eq!(next, Ok(json!({"id": 2})));
-            assert_eq!(seen, vec![(1, UNREAD_FRAME), (2, "next".len())]);
-        }
-    }
-
-    #[test]
-    fn a_failed_write_refuses_every_later_command() {
-        let (commands, command_write) = std::io::pipe().unwrap();
-        let (event_read, _replies) = std::io::pipe().unwrap();
-        // The browser is gone: a write fails.
-        drop(commands);
-        let mut client = CdpClient::new(command_write, event_read);
-        let first = client.call(
-            None,
-            "Browser.getVersion",
-            json!({}),
-            aterm_spec::wait::MUST_HAPPEN,
-        );
-        let next = client.call(
-            None,
-            "Browser.getVersion",
-            json!({}),
-            aterm_spec::wait::MUST_HAPPEN,
-        );
-        assert_eq!(first, Err("failed writing to browser DevTools pipe"));
-        assert_eq!(next, Err("browser DevTools pipe is unavailable"));
-    }
-
-    #[test]
-    fn a_word_the_writer_gave_counts_after_its_deadline_passed() {
-        let (done, ack) = std::sync::mpsc::sync_channel(1);
-        done.send(true).unwrap();
-        drop(done);
-        let gone = Deadline::after(Duration::ZERO);
-        assert!(matches!(receive_written(&ack, gone, None), Ok(true)));
-    }
-
-    #[test]
-    fn navigation_errors_are_distinct_from_protocol_failures() {
-        for message in [
-            "Execution context was destroyed.",
-            "Cannot find context with specified id",
-            "Cannot find default execution context",
-        ] {
-            assert_eq!(
-                cdp_response_error(&json!({"code":-32000,"message":message})),
-                "browser execution context changed"
-            );
-        }
-        for message in [
-            "Session with given id not found.",
-            "No target with given id found",
-            "Target closed",
-            "Session closed",
-        ] {
-            assert_eq!(
-                cdp_response_error(&json!({"code":-32001,"message":message})),
-                "browser DevTools session closed"
-            );
-        }
-        for error in [
-            json!({"code":-32602,"message":"Invalid parameters"}),
-            json!({"code":-32000,"message":"Arbitrary private page error"}),
-        ] {
-            assert_eq!(
-                cdp_response_error(&error),
-                "browser DevTools protocol returned an error"
-            );
-        }
-    }
-}
+#[path = "headless_oauth_cdp_error_tests.rs"]
+mod cdp_error_tests;
 
 #[cfg(test)]
-mod credential_debug_tests {
-    use super::{MailboxConfig, MailboxCredential};
-
-    #[test]
-    fn mailbox_credential_debug_hides_codes_and_magic_links() {
-        for credential in [
-            MailboxCredential::Otp("674291".into()),
-            MailboxCredential::MagicLink("https://example.invalid/synthetic-private-link".into()),
-        ] {
-            for output in [format!("{credential:?}"), format!("{credential:#?}")] {
-                assert!(!output.contains("674291"));
-                assert!(!output.contains("synthetic-private-link"));
-                assert!(output.contains("<redacted>"));
-            }
-        }
-    }
-
-    #[test]
-    fn mailbox_debug_does_not_disclose_credentials_or_identity() {
-        let marker = "synthetic-private-mailbox-value";
-        let config = MailboxConfig {
-            bearer_token: Some(marker.into()),
-            password: Some(marker.into()),
-            mailbox_password: Some(marker.into()),
-            totp_secret: Some(marker.into()),
-            user: Some(marker.into()),
-            http_url: Some(marker.into()),
-            passwords: [(marker.into(), marker.into())].into(),
-            mailbox_passwords: [(marker.into(), marker.into())].into(),
-            totp_secrets: [(marker.into(), marker.into())].into(),
-            ..MailboxConfig::default()
-        };
-        for output in [format!("{config:?}"), format!("{config:#?}")] {
-            assert!(!output.contains(marker));
-            assert!(output.contains("MailboxConfig"));
-        }
-    }
-}
+#[path = "headless_oauth_credential_debug_tests.rs"]
+mod credential_debug_tests;
 
 /// The mailbox readers resolve from the lab registry's rows (one-mesh design step A9), with no
 /// `ai-mailbox.toml`, sheet or `~/.secrets` file present. Every value is a synthetic fixture.
 #[cfg(test)]
-pub(super) mod registry_tests {
-    use super::super::alab_roster::{self, LabMailbox, Part};
-    use super::*;
-
-    /// RFC 6238's SHA-1 test seed, `12345678901234567890` in Base32.
-    pub(in super::super) const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
-
-    /// The registry's mailbox `mb-fixture`: login `owner@example.test`, webmail only, receiving
-    /// `ai1@example.test` and all of `pm.example.test`, its three credentials held.
-    pub(in super::super) fn mailbox() -> LabMailbox {
-        LabMailbox {
-            pk: "mb-fixture".into(),
-            login: "owner@example.test".into(),
-            service: Some("other".into()),
-            webmail: Some("https://mail.example.test/inbox".into()),
-            receives: vec!["ai1@example.test".into(), "*@pm.example.test".into()],
-            held: vec![Part::Password, Part::MailboxPassword, Part::Totp],
-        }
-    }
-
-    /// What the registry's cells open to for [`mailbox`].
-    pub(in super::super) fn secrets() -> Vec<((&'static str, Part), &'static str)> {
-        vec![
-            (("mb-fixture", Part::Password), "fixture-login-pass"), // gitleaks:allow
-            (("mb-fixture", Part::MailboxPassword), "fixture-second-pass"), // gitleaks:allow
-            (("mb-fixture", Part::Totp), SEED),
-        ]
-    }
-
-    /// An empty HOME: no mailbox file, no sheet, no `~/.secrets`.
-    fn bare_home() -> aterm_tempfile::TempDir {
-        let home = aterm_tempfile::tempdir().unwrap();
-        assert!(!home.path().join(".secrets").exists());
-        home
-    }
-
-    /// With no file present, discovery finds the registry's mailbox for the addresses it
-    /// receives, by its login; the value getters reveal its login password, second password and
-    /// TOTP seed, each once per discovery, and the seed yields the sign-in code RFC 6238 gives.
-    /// NEGATIVE CONTROL: with `merge_lab` left out of `discover_mailbox_config_sources`, the
-    /// discovery is not configured (`None`) and the first assertion fails.
-    #[test]
-    fn a_registry_mailbox_resolves_its_login_passwords_and_totp_code_with_no_file() {
-        let home = bare_home();
-        alab_roster::with_mail(vec![mailbox()], secrets(), || {
-            let cfg = discover_mailbox_config_files(Some(home.path()), None, None)
-                .expect("the registry's mailbox configures discovery");
-            for email in [
-                "ai1@example.test",
-                "ai1+grok@example.test",
-                "x@pm.example.test",
-            ] {
-                let target = Some(email);
-                assert_eq!(
-                    cfg.webmail_user_for(target).as_deref(),
-                    Some("owner@example.test"),
-                    "{email}"
-                );
-                assert!(cfg.is_configured_for(target), "{email}");
-                assert_eq!(
-                    cfg.effective_webmail_url(target).as_deref(),
-                    Some("https://mail.example.test/inbox")
-                );
-            }
-            assert_eq!(
-                alab_roster::reveals(),
-                0,
-                "routing and presence reveal nothing"
-            );
-            let target = Some("ai1@example.test");
-            assert_eq!(
-                cfg.password_for(target).as_deref(),
-                Some("fixture-login-pass")
-            );
-            assert_eq!(
-                cfg.mailbox_password_for(target).as_deref(),
-                Some("fixture-second-pass")
-            );
-            let seed = cfg.totp_secret_for(target).unwrap();
-            assert_eq!(generate_totp_at(&seed, 59).as_deref(), Some("287082"));
-            assert_eq!(alab_roster::reveals(), 3);
-            // A poller reads the routed view, as the webmail reader does each step.
-            let view = cfg.routed_for(target);
-            for _ in 0..3 {
-                assert_eq!(
-                    view.password_for(target).as_deref(),
-                    Some("fixture-login-pass")
-                );
-                assert_eq!(
-                    view.totp_secret_for(target)
-                        .and_then(|seed| generate_totp_at(&seed, 59)),
-                    Some("287082".to_owned())
-                );
-            }
-            assert_eq!(
-                alab_roster::reveals(),
-                3,
-                "one discovery reveals each part once"
-            );
-            assert!(
-                cfg.route_for(Some("stranger@other.test")).is_none(),
-                "an address the registry's mailbox does not receive has no route"
-            );
-        });
-    }
-
-    /// The upkeep's look at a row (`route_for`, `routed_for`, `is_configured_for`,
-    /// `masked_login_for`, `holds_for`, the cleartext refusal) reveals nothing; a part the
-    /// registry does not hold is none; a mailbox whose password the registry lacks is unready
-    /// and never tried.
-    /// NEGATIVE CONTROL: with `routed_for` filling its password from `self.password_for`, the
-    /// first `reveals() == 0` assertion reads 3.
-    #[test]
-    fn looking_at_a_registry_mailbox_reveals_nothing() {
-        let home = bare_home();
-        let mut partial = mailbox();
-        partial.held = vec![Part::Password];
-        alab_roster::with_mail(vec![partial], secrets(), || {
-            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
-            let target = Some("ai1@example.test");
-            let route = cfg.route_for(target).expect("routed");
-            assert!(route.ready() && route.registry.is_some());
-            let view = cfg.routed_for(target);
-            assert!(view.is_configured_for(target));
-            assert!(view.masked_login_for(target).is_some());
-            assert!(cfg.holds_for(Part::Password, target));
-            assert!(!cfg.holds_for(Part::Totp, target));
-            assert!(plaintext_credential_refusal(&cfg, target).is_none());
-            assert_eq!(alab_roster::reveals(), 0);
-            assert_eq!(cfg.totp_secret_for(target), None, "a part not held is none");
-            assert_eq!(alab_roster::reveals(), 0);
-        });
-        let mut unready = mailbox();
-        unready.held.clear();
-        alab_roster::with_mail(vec![unready], Vec::new(), || {
-            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
-            let target = Some("ai1@example.test");
-            assert!(!cfg.is_configured_for(target));
-            assert_eq!(
-                cfg.unready_words(target),
-                Some("mailbox ow…@… has no password yet")
-            );
-            assert_eq!(cfg.password_for(target), None);
-            assert_eq!(alab_roster::reveals(), 0);
-        });
-    }
-
-    /// The registry decides before a file: an `ai-mailbox.toml` entry for the same login fills
-    /// only what the registry leaves empty, and an entry for another login stays a fallback for
-    /// the addresses only it receives (until B13).
-    /// NEGATIVE CONTROL: with `merge_lab` appending the registry's routes after the files', the
-    /// shared address `ai1@example.test` resolves to the file's other mailbox.
-    #[test]
-    fn the_registry_decides_before_the_mailbox_file() {
-        let home = bare_home();
-        let secrets_dir = home.path().join(".secrets");
-        std::fs::create_dir_all(&secrets_dir).unwrap();
-        std::fs::write(
-            secrets_dir.join(SECRETS_MAILBOX_TOML_FILE),
-            "[[mailboxes]]\n\
-             login = \"other@example.test\"\n\
-             password = \"fixture-file-other\"\n\
-             webmail_url = \"https://other.example.test/inbox\"\n\
-             receives = [\"ai1@example.test\", \"ai2@example.test\"]\n\
-             [[mailboxes]]\n\
-             login = \"OWNER@example.test\"\n\
-             password = \"fixture-file-owner\"\n\
-             totp_secret = \"fixture-file-seed\"\n\
-             receives = [\"ai3@example.test\"]\n", // gitleaks:allow
-        )
-        .unwrap();
-        let mut registry = mailbox();
-        registry.held = vec![Part::Password];
-        alab_roster::with_mail(vec![registry], secrets(), || {
-            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
-            assert_eq!(
-                cfg.webmail_user_for(Some("ai1@example.test")).as_deref(),
-                Some("owner@example.test"),
-                "the registry's route comes first among equal patterns"
-            );
-            assert_eq!(
-                cfg.password_for(Some("ai1@example.test")).as_deref(),
-                Some("fixture-login-pass"),
-                "the registry's held password, not the file's"
-            );
-            assert_eq!(
-                cfg.totp_secret_for(Some("ai1@example.test")).as_deref(),
-                Some("fixture-file-seed"),
-                "a part the registry holds no cell for falls back to the file's entry"
-            );
-            assert_eq!(
-                cfg.webmail_user_for(Some("ai2@example.test")).as_deref(),
-                Some("other@example.test"),
-                "an address only the file routes keeps its route"
-            );
-            assert_eq!(
-                cfg.mailboxes
-                    .iter()
-                    .filter(|m| m.login.eq_ignore_ascii_case("owner@example.test"))
-                    .count(),
-                1,
-                "one login is one route"
-            );
-        });
-    }
-
-    /// `VendorApprover::new`, which every sign-in driver (`login_drive`, `grok_signin`) builds,
-    /// finds the registry's mailbox for its row with no file present.
-    #[test]
-    fn a_vendor_sign_in_takes_the_registry_mailbox() {
-        let home = bare_home();
-        let shared = home.path().join("store");
-        alab_roster::with_mail(vec![mailbox()], secrets(), || {
-            let approver = VendorApprover::new(
-                super::super::accounts::Cli::Claude,
-                "claude-1",
-                Some("ai1@example.test"),
-                &shared,
-                Some(home.path()),
-            );
-            let mailbox = approver.mailbox.as_ref().expect("a mailbox for the row");
-            assert_eq!(
-                mailbox.password_for(Some("ai1@example.test")).as_deref(),
-                Some("fixture-login-pass")
-            );
-            assert_eq!(approver.mailbox_unready, None);
-        });
-    }
-}
+#[path = "headless_oauth_registry_tests.rs"]
+pub(super) mod registry_tests;
 
 #[cfg(test)]
-mod wire_hardening_tests {
-    use super::*;
-
-    /// AN IMAP QUOTED STRING HOLDS NO NUL: a NUL in a login or mailbox name is dropped as CR and
-    /// LF are, and `\` and `"` are escaped. CONTROL: plain text is written as it is.
-    #[test]
-    fn a_quoted_imap_string_drops_nul_cr_and_lf() {
-        assert_eq!(escape_imap_quoted("a\0b\""), "ab\\\"");
-        assert_eq!(escape_imap_quoted("x\r\ny\0\\z"), "xy\\\\z");
-        assert_eq!(
-            escape_imap_quoted("work@example.test"),
-            "work@example.test",
-            "CONTROL"
-        );
-    }
-
-    /// A pipe read the browser's reader takes once from its script, then the pipe's end.
-    struct Script(Vec<std::io::Result<&'static [u8]>>);
-
-    impl Read for Script {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.0.is_empty() {
-                return Ok(0);
-            }
-            let bytes = self.0.remove(0)?;
-            buf[..bytes.len()].copy_from_slice(bytes);
-            Ok(bytes.len())
-        }
-    }
-
-    /// AN INTERRUPTED READ OF THE BROWSER'S PIPE IS READ AGAIN: the message after it is delivered,
-    /// not lost with the browser's whole session. CONTROL: a read that fails ends the pump, and
-    /// nothing after it is delivered.
-    #[test]
-    fn the_browser_reader_reads_again_after_an_interrupted_read() {
-        let pumped = |script: Script| {
-            let (tx, rx) = channel();
-            pump_cdp_reader(script, &tx);
-            drop(tx);
-            rx.iter().collect::<Vec<Value>>()
-        };
-        let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
-        assert_eq!(
-            pumped(Script(vec![Err(interrupted), Ok(b"{\"id\":1}\0")])),
-            vec![json!({"id": 1})]
-        );
-        let broke = std::io::Error::other("the pipe broke");
-        assert_eq!(
-            pumped(Script(vec![Err(broke), Ok(b"{\"id\":1}\0")])),
-            Vec::<Value>::new(),
-            "CONTROL"
-        );
-        assert_eq!(
-            pumped(Script(vec![Ok(b"{\"id\":2}\0")])),
-            vec![json!({"id": 2})],
-            "CONTROL: a plain read"
-        );
-    }
-
-    /// THE FLEET'S RELAY IS READ ONLY WHERE ITS READER IS BUILT, unix: on, for an email, there.
-    /// CONTROLS: no email, or the relay off, reads no relay anywhere.
-    #[test]
-    fn the_relay_is_read_for_an_email_where_its_reader_is_built() {
-        let relay = MailboxConfig {
-            relay_enabled: true,
-            ..MailboxConfig::default()
-        };
-        assert_eq!(relay.reads_relay_for(Some("work@example.test")), cfg!(unix));
-        assert!(!relay.reads_relay_for(None), "CONTROL: no email");
-        assert!(
-            !MailboxConfig::default().reads_relay_for(Some("work@example.test")),
-            "CONTROL: the relay off"
-        );
-    }
-}
+#[path = "headless_oauth_wire_hardening_tests.rs"]
+mod wire_hardening_tests;

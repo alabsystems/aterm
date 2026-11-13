@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use std::cell::{Cell, RefCell};
 
@@ -128,6 +138,7 @@ impl AttemptHost<'_> {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn completed_cli_signins_recover_all_records_without_another_provider_login() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -526,6 +537,7 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
 /// A person's vendor sign-in goes by what the sign-in they waited for left: one that renewed their
 /// row leaves nothing to run, and one that renewed another row, which moves the clock every parent
 /// reads, lets theirs run. The refusal above holds only for whoever did not wait.
+#[cfg(unix)]
 #[test]
 fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
     for cli in [Cli::Codex, Cli::Kimi] {
@@ -614,6 +626,7 @@ fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn login_and_renewal_generation_admission_conform_for_every_provider() {
     let model = aterm_models_harness::account_attempt_generation_model();

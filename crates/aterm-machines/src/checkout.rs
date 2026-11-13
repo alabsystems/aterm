@@ -6,6 +6,7 @@
 
 use crate::model::{Probe, User};
 use crate::port::{Cmd, Ran, System};
+use crate::repository_progress::{FailureKind, PreservationReason, Progress};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
@@ -174,17 +175,19 @@ pub(crate) fn network(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd
     )
 }
 
+/// The read of the commit `path`'s HEAD names (`rev-parse --verify --quiet HEAD^{commit}`): exit
+/// 0 with the commit, 1 with no commit there (an unborn branch, or a commit never fetched), and
+/// with [`git`]'s `GIT_NO_LAZY_FETCH=1` never a fetch of a commit a partial clone lacks.
+pub(crate) fn head_commit(sys: &dyn System, user: &User, path: &Path) -> Cmd {
+    git(sys, user, Some(path)).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+}
+
 /// An absent HEAD is an unfinished branch only when its symbolic branch has no ref.
 /// A missing object, detached HEAD or unreadable ref is not an empty checkout.
 pub(crate) fn unborn(sys: &dyn System, user: &User, path: &Path) -> Result<Option<String>, String> {
     let git = git(sys, user, Some(path));
     let head = sys
-        .run_complete_stdout(&git.clone().args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "HEAD^{commit}",
-        ]))
+        .run_complete_stdout(&head_commit(sys, user, path))
         .map_err(|why| why.to_string())?;
     if head.success() {
         return if oid(head.out().trim()) {
@@ -416,6 +419,15 @@ impl AcquisitionFailure {
     pub(crate) const fn is_network(&self) -> bool {
         matches!(self, Self::Network(_))
     }
+
+    /// Publish only the typed classification. Error text may contain transport diagnostics.
+    pub(crate) fn record_progress(&self, progress: &mut Progress) {
+        progress.fail(if self.is_network() {
+            FailureKind::Network
+        } else {
+            FailureKind::Local
+        });
+    }
 }
 
 impl From<String> for AcquisitionFailure {
@@ -571,6 +583,48 @@ impl Origin {
     }
 }
 
+/// Existing human-readable detail plus a source-owned safe reason for repository snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Preserved {
+    why: String,
+    reason: PreservationReason,
+}
+
+impl Preserved {
+    fn new(reason: PreservationReason, why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            reason,
+        }
+    }
+}
+
+impl From<String> for Preserved {
+    fn from(why: String) -> Self {
+        Self::new(PreservationReason::Unrecorded, why)
+    }
+}
+
+impl From<&str> for Preserved {
+    fn from(why: &str) -> Self {
+        Self::from(why.to_owned())
+    }
+}
+
+impl std::ops::Deref for Preserved {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.why
+    }
+}
+
+impl std::fmt::Display for Preserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// Where a checkout stands against its origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Stands {
@@ -599,7 +653,7 @@ pub(crate) enum Stands {
         tip: String,
     },
     /// Left as it is, and why (dirty, ahead, diverged, detached, foreign origin, …).
-    Kept(String),
+    Kept(Preserved),
 }
 
 impl Stands {
@@ -664,7 +718,7 @@ fn commits(n: u64) -> String {
 
 /// Why a read stopped: the checkout is left as it is (`Kept`), or it could not be read.
 enum Stop {
-    Kept(String),
+    Kept(Preserved),
     Failed(Unread),
 }
 
@@ -722,25 +776,36 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
     )?;
     match urls.status {
         Some(0) => {}
-        Some(1) => return Err(Stop::Kept("it has no origin remote".into())),
+        Some(1) => {
+            return Err(Stop::Kept(Preserved::new(
+                PreservationReason::MissingOrigin,
+                "it has no origin remote",
+            )));
+        }
         _ => return Err(Stop::from("cannot read the checkout's origin".to_owned())),
     }
     let urls = stdout(&urls);
     let urls: Vec<&str> = urls.lines().collect();
     if urls.len() != 1 {
-        return Err(Stop::Kept("origin has more than one URL".into()));
+        return Err(Stop::Kept(Preserved::new(
+            PreservationReason::MultipleOrigins,
+            "origin has more than one URL",
+        )));
     }
     if !origin.admits(urls[0]) {
-        return Err(Stop::Kept(format!(
-            "its origin is not {}",
-            origin.describe()
+        return Err(Stop::Kept(Preserved::new(
+            PreservationReason::DifferentOrigin,
+            format!("its origin is not {}", origin.describe()),
         )));
     }
     let effective = read_ok(sys, user, path, &["ls-remote", "--get-url", "origin"])?;
     if !origin.admits(&effective) {
-        return Err(Stop::Kept(format!(
-            "git rewrites its origin to a remote that is not {} (url.*.insteadOf)",
-            origin.describe()
+        return Err(Stop::Kept(Preserved::new(
+            PreservationReason::RewrittenOrigin,
+            format!(
+                "git rewrites its origin to a remote that is not {} (url.*.insteadOf)",
+                origin.describe()
+            ),
         )));
     }
     let symbolic = run(
@@ -753,20 +818,31 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
             let reference = stdout(&symbolic);
             match reference.strip_prefix("refs/heads/") {
                 Some(branch) if !branch.is_empty() => branch.to_owned(),
-                _ => return Err(Stop::Kept("HEAD is not on a branch".into())),
+                _ => {
+                    return Err(Stop::Kept(Preserved::new(
+                        PreservationReason::Detached,
+                        "HEAD is not on a branch",
+                    )));
+                }
             }
         }
-        Some(1) => return Err(Stop::Kept("HEAD is detached".into())),
+        Some(1) => {
+            return Err(Stop::Kept(Preserved::new(
+                PreservationReason::Detached,
+                "HEAD is detached",
+            )));
+        }
         _ => return Err(Stop::from("cannot read the checkout's HEAD".to_owned())),
     };
-    let head = run(
-        sys,
-        &git(sys, user, Some(path)).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
-        "rev-parse",
-    )?;
+    let head = run(sys, &head_commit(sys, user, path), "rev-parse")?;
     let head = match head.status {
         Some(0) => stdout(&head),
-        Some(1) => return Err(Stop::Kept(format!("{branch} has no commit yet"))),
+        Some(1) => {
+            return Err(Stop::Kept(Preserved::new(
+                PreservationReason::NoLocalCommit,
+                format!("{branch} has no commit yet"),
+            )));
+        }
         _ => return Err(Stop::from("cannot read the checkout's HEAD".to_owned())),
     };
     // Even a status can invoke configured filters or fsmonitor. The same
@@ -788,9 +864,10 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
         return Err(Stop::from("git status failed in the checkout".to_owned()));
     }
     if !stdout(&status).is_empty() {
-        return Err(Stop::Kept(
-            "it has uncommitted changes or untracked files".into(),
-        ));
+        return Err(Stop::Kept(Preserved::new(
+            PreservationReason::LocalChanges,
+            "it has uncommitted changes or untracked files",
+        )));
     }
     Ok(Local { branch, head })
 }
@@ -830,7 +907,10 @@ fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, St
     }
     match (branch, tip) {
         (Some(branch), Some(tip)) => Ok((branch, tip)),
-        (_, None) => Err(Stop::Kept("origin has no commit yet".into())),
+        (_, None) => Err(Stop::Kept(Preserved::new(
+            PreservationReason::NoRemoteCommit,
+            "origin has no commit yet",
+        ))),
         (None, Some(_)) => Err(Stop::from(
             "origin did not name its default branch".to_owned(),
         )),
@@ -972,8 +1052,9 @@ fn judge(
 ) -> Result<Stands, String> {
     let Local { branch, head } = local;
     if branch != default {
-        return Ok(Stands::Kept(format!(
-            "it is on {branch}, not origin's default branch {default}"
+        return Ok(Stands::Kept(Preserved::new(
+            PreservationReason::DifferentBranch,
+            format!("it is on {branch}, not origin's default branch {default}"),
         )));
     }
     if head == tip {
@@ -1007,9 +1088,12 @@ fn judge(
                 &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
             )?;
             return Ok(if own > 0 {
-                Stands::Kept(format!(
-                    "it has {} that origin lacks (as last fetched)",
-                    commits(own)
+                Stands::Kept(Preserved::new(
+                    PreservationReason::Ahead,
+                    format!(
+                        "it has {} that origin lacks (as last fetched)",
+                        commits(own)
+                    ),
                 ))
             } else {
                 Stands::Unfetched {
@@ -1040,9 +1124,9 @@ fn judge(
         &["rev-list", "--count", &format!("{tip}..{head}")],
     )?;
     if is_ancestor(sys, user, path, tip, head)? {
-        return Ok(Stands::Kept(format!(
-            "it has {} that origin/{branch} lacks",
-            commits(ahead)
+        return Ok(Stands::Kept(Preserved::new(
+            PreservationReason::Ahead,
+            format!("it has {} that origin/{branch} lacks", commits(ahead)),
         )));
     }
     let behind = count(
@@ -1051,10 +1135,13 @@ fn judge(
         path,
         &["rev-list", "--count", &format!("{head}..{tip}")],
     )?;
-    Ok(Stands::Kept(format!(
-        "it has diverged from origin/{branch} ({} here, {} there)",
-        commits(ahead),
-        commits(behind)
+    Ok(Stands::Kept(Preserved::new(
+        PreservationReason::Diverged,
+        format!(
+            "it has diverged from origin/{branch} ({} here, {} there)",
+            commits(ahead),
+            commits(behind)
+        ),
     )))
 }
 
@@ -1071,7 +1158,7 @@ pub(crate) fn kept_here(
 ) -> Result<Option<String>, String> {
     match local(sys, user, path, origin) {
         Ok(_) => Ok(None),
-        Err(Stop::Kept(why)) => Ok(Some(why)),
+        Err(Stop::Kept(why)) => Ok(Some(why.why)),
         Err(Stop::Failed(unread)) => Err(unread.why),
     }
 }
@@ -1165,23 +1252,62 @@ pub(crate) fn align_guarded(
     origin: &Origin,
     current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Stands, Unread> {
+    use crate::repository_progress::{Phase, Progress};
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repository");
+    let mut progress = Progress::new(name, path.to_owned());
+    progress.placed = true;
+    // Alignment updates an existing checkout. Its last known usability stands
+    // independently of connecting to its origin or fetching new commits.
+    progress.usable = true;
+    progress.enter(Phase::Checking);
+    sys.repository_progress(&progress);
+    let result = align_observed(sys, user, path, origin, current, &mut progress);
+    match &result {
+        Ok(Stands::Kept(kept)) => progress.defer(kept.reason),
+        Ok(_) => progress.enter(Phase::Ready),
+        Err(unread) => progress.fail(if unread.network {
+            FailureKind::Network
+        } else {
+            FailureKind::Local
+        }),
+    }
+    sys.repository_progress(&progress);
+    result
+}
+
+fn align_observed(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+    progress: &mut crate::repository_progress::Progress,
+) -> Result<Stands, Unread> {
+    use crate::repository_progress::Phase;
     current().map_err(Unread::from)?;
     let before = read(sys, user, path, origin)?;
+    progress.usable = true;
     let default = match &before {
         Stands::Behind { branch, .. } | Stands::Unfetched { branch, .. } => branch.clone(),
         Stands::Current { .. } | Stands::Kept(_) => return Ok(before),
     };
     let programs = Programs::named(sys, git(sys, user, Some(path)))?;
     current().map_err(Unread::from)?;
-    let fetch = run(
-        sys,
-        &programs
-            .off(network(sys, user, Some(path)))
-            .budget(FETCH_BUDGET)
-            .args(NO_SIDE_RUNS)
-            .args(["fetch", "--quiet", "--no-recurse-submodules", "origin"]),
-        "fetch",
-    )?;
+    progress.enter(Phase::Fetching);
+    sys.repository_progress(progress);
+    let fetch = sys
+        .run_repository(
+            &programs
+                .off(network(sys, user, Some(path)))
+                .budget(FETCH_BUDGET)
+                .args(NO_SIDE_RUNS)
+                .args(["fetch", "--progress", "--no-recurse-submodules", "origin"]),
+            progress,
+        )
+        .map_err(|_| Unread::from("git fetch origin did not finish".to_owned()))?;
     if !fetch.success() {
         return Err(if unreachable(&fetch.stderr) {
             Unread {
@@ -1225,6 +1351,8 @@ pub(crate) fn align_guarded(
     };
     let programs = Programs::named(sys, git(sys, user, Some(path)))?;
     current().map_err(Unread::from)?;
+    progress.enter(Phase::Updating);
+    sys.repository_progress(progress);
     let merge = run(
         sys,
         &programs

@@ -94,6 +94,26 @@ fn a_sweep_reading_is_a_member() {
             peak_footprint: 0,
         }
     );
+    // A Windows row holds no disk bytes, and the bytes it moved through any handle are what
+    // says it is doing something. NEGATIVE CONTROL: where both are read the handle bytes
+    // stand alone, never added to the disk bytes inside them.
+    let windows = ProcessReading {
+        pid: 44,
+        io_read: Some(30),
+        io_written: Some(40),
+        ..ProcessReading::default()
+    };
+    assert_eq!(member(&windows).io_bytes, 70);
+    let both = ProcessReading {
+        disk_read: Some(3),
+        disk_written: Some(4),
+        ..windows.clone()
+    };
+    assert_eq!(member(&both).io_bytes, 70);
+    assert!(
+        !between(&Members::new(), [member(&windows)]).0.idle(),
+        "a process that only moved bytes is not idle"
+    );
     let unread = ProcessReading {
         pid: 43,
         ..ProcessReading::default()

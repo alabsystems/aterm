@@ -517,6 +517,7 @@ fn a_dropped_session_closes_its_pseudoconsole() {
             conhost,
             job: 0,
             outside_job_ended: Mutex::new(false),
+            programs: outside_job::Learned::of_shell(None),
             close_evt: 0,
             pid: 0,
             exit_code: Mutex::new(None),

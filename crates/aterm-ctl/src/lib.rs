@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use aterm_types::control_socket;
-use aterm_types::control_verbs::{MAX_REQUEST_LINE, MAX_TASK_BYTES};
+use aterm_types::control_verbs::{Body, MAX_REQUEST_LINE, MAX_TASK_BYTES};
 use aterm_uds::CtlStream;
 
 #[cfg(test)]
@@ -50,6 +50,7 @@ mod drift;
 pub mod edit;
 /// The telemetry rows a fleet spawn and a worker's board close write (Continuum TM-1).
 pub mod fleet_telemetry;
+pub mod github_usage;
 mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
@@ -62,10 +63,10 @@ pub use remote::{
 mod survey;
 mod verb_first;
 pub use survey::{
-    DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_UNREAD, FLEET_WITHIN,
-    FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault,
-    PeerSurvey, UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, masked_label,
-    survey_rank, survey_urgent,
+    AuthenticatedPeer, DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT,
+    FLEET_UNREAD, FLEET_WITHIN, FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD,
+    NO_ROUTE_NOTE, PeerFault, PeerSurvey, UNANSWERED_REASON_CHARS, UNANSWERED_ROOM,
+    agent_word_shown, survey_rank, survey_urgent,
 };
 
 const SYNOPSIS: &str =
@@ -87,8 +88,12 @@ OPTIONS:
                   MacbookAir-m27-…; a name two Macs answer to is refused,
                   naming both), when its person
                   lets this Mac (`aterm fleet allow drive --from <this Mac>`,
-                  or `--all` for every member, there): a worker's verbs
-                  alone, each session by its sid —
+                  or `--all` for every member, there) and as far as that
+                  Mac's fleet access admits the act (`aterm fleet access`
+                  there: Read Only, every Mac's default, admits the reads;
+                  `write` also turn, key, send, post, hold and close; `full`
+                  also spawn; its survey header says which, `access=`): a
+                  worker's verbs alone, each session by its sid —
                   spawn agent=claude [cwd=<absolute>] - < task, await task
                   @<w> since=0 (the first wait; later ones @<w>:<rev>),
                   @<w> result|status|text|screen|turn|key|send|close,
@@ -96,7 +101,8 @@ OPTIONS:
                   task board, its board of the workers it started (a spawn's
                   label=<word> stays on this Mac's). `aterm help workers`.
                   `--host any spawn agent=<claude|codex> - < task` picks the
-                  member: of those that let this Mac drive them and would start
+                  member: of those that let this Mac drive them, are at Full
+                  Access (`access=full`) and would start
                   it on an account of that program with no known wall or
                   sign-out, one read working before an unseen one and an unseen
                   one before a low one, then the least used week, five hours and
@@ -162,7 +168,10 @@ EXIT CODES:
          grant, or its books bind this Mac's node no more): its rows print
          first, and stderr says so, whatever its timeout. Any other denial
          ends it in its own words; a worker the peer hosts no more is a
-         closed row, as on one Mac.
+         closed row, as on one Mac. With --host, an act above the peer's
+         fleet access: `ERR denied access=<level> needs=<level>: …` (its
+         grant stands; its person raises the level at its menu-bar lock or
+         with `aterm fleet access write|full` there, and no agent does).
     2    could not reach: the instance accepted the connection but did not
          serve it within 60 s (or a shorter --timeout; --timeout 0 waits
          without bound), so the request was not sent. With --host, an aterm
@@ -238,6 +247,7 @@ STDIN PAYLOADS:
                   paste the STDIN bytes (<= 256 KiB) with the server's paste
                   handling (control bytes sanitized; ESC[200~/201~ bracketing
                   when the app enabled DECSET 2004), not as a raw feed.
+    paste-bin     the frame `paste -` sends (no inline argument).
     spawn agent=<a> [model=<m>] [cwd=<path>] [label=<word>] -
                   the worker's task (1 byte to 64 KiB); the client writes len=
                   itself, adds cwd=<this directory> when absent, and makes a
@@ -4240,14 +4250,15 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
-    if verb_tok == Some("feed-bin") {
-        // The payload is stdin, not an inline argument; an inline token (e.g. a
-        // bare length) has no client path and would only desync the frame.
-        if !verb_args.is_empty() {
-            return Err(feed_bin_inline_error());
-        }
+    if let Some(refusal) = verb_tok.and_then(|verb| inline_body_refusal(verb, verb_args)) {
+        return Err(refusal);
+    }
+    if let Some(verb) =
+        verb_tok.filter(|verb| matches!(body_of(verb, &verb_args.join(" ")), Body::Counted { .. }))
+    {
+        // A counted body (`feed-bin`, `paste-bin`) is stdin, framed here.
         let payload = read_stdin_payload()?;
-        let prefix = binary_frame_prefix(selector, "feed-bin");
+        let prefix = binary_frame_prefix(selector, verb);
         return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
     if matches!(verb_tok, Some("send") | Some("paste"))
@@ -4493,11 +4504,44 @@ pub(crate) fn instant_after(
 
 const MAX_FEED_BIN: usize = 256 * 1024;
 
-fn feed_bin_inline_error() -> io::Error {
+/// What follows the request line `verb rest` before it is answered, by the server's own verb
+/// table (the sub-form row `rest` names, when the table lists one).
+fn body_of(verb: &str, rest: &str) -> Body {
+    aterm_types::control_verbs::spec_for(verb, rest).map_or(Body::None, |form| form.row.body)
+}
+
+/// The refusal of a request whose body is announced on its line (`paste-bin 5`, a `len=` among a
+/// `post`'s leading options): no client path sends those bytes, and the server would wait for
+/// them until the exchange's deadline. A counted body comes from stdin with no inline argument;
+/// a `len=` word in a post's text announces nothing and is sent as text.
+fn inline_body_refusal(verb: &str, args: &[String]) -> Option<io::Error> {
+    let rest = args.join(" ");
+    match body_of(verb, &rest) {
+        Body::None => None,
+        Body::Counted { .. } => (!args.is_empty()).then(|| counted_inline_error(verb)),
+        Body::PostLen => aterm_types::control_verbs::post_announced_len(&rest)
+            .is_some()
+            .then(|| post_len_inline_error(verb)),
+    }
+}
+
+fn counted_inline_error(verb: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "feed-bin reads its binary payload from stdin: pipe the bytes in \
-         (e.g. `printf ... | aterm-ctl feed-bin`); no inline length is accepted",
+        format!(
+            "{verb} reads its binary payload from stdin: pipe the bytes in \
+             (e.g. `printf ... | aterm-ctl {verb}`); no inline length is accepted"
+        ),
+    )
+}
+
+fn post_len_inline_error(verb: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{verb}'s len= among its leading options announces bytes after the request line, \
+             which this command does not send: drop len= and put the text after --"
+        ),
     )
 }
 
@@ -4557,6 +4601,29 @@ fn validate_task_payload(task: &[u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Who asks for a fleet drive from this shell (ATERM-KI-1109-3): the tab's session
+/// (`ATERM_PARENT_SESSION_ID`, as a worker's starter reads it), and the program, model and account
+/// that session's row of its own instance's survey names, each left out where it cannot be read.
+/// Only a client run in that shell asks this: a process aterm runs of its own (a window, the node
+/// job) names no requester, whatever its environment says.
+#[must_use]
+pub fn requester_here() -> aterm_types::control_verbs::Requester {
+    let Some(sid) = worker_starter(env::var(SELF_SID_ENV).ok())
+        .filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))
+    else {
+        return aterm_types::control_verbs::Requester::default();
+    };
+    let [program, model, account] = resolve_sock_for(Some(&sid))
+        .map(|sock| survey::session_identity(&sock, &sid))
+        .unwrap_or_default();
+    aterm_types::control_verbs::Requester::of(
+        Some(&sid),
+        program.as_deref(),
+        model.as_deref(),
+        account.as_deref(),
+    )
 }
 
 fn worker_starter(self_sid: Option<String>) -> Option<String> {
@@ -5935,12 +6002,35 @@ fn stdout_handle() -> io::Stdout {
     None::<io::Stdout>.unwrap_or_else(io::stdout)
 }
 
+/// What a test reads at each line printed ([`stdout_lines_watched`]).
+#[cfg(test)]
+type LineWatch = Box<dyn FnMut(&str)>;
+
 #[cfg(test)]
 thread_local! {
     /// This thread's stdout in a test ([`stdout_lines_of`]): the lines printed, and whether its
     /// reader closed it.
     static STDOUT_LINES: std::cell::RefCell<Option<(Vec<String>, bool)>> =
         const { std::cell::RefCell::new(None) };
+    /// What a test reads at each print on this thread ([`stdout_lines_watched`]).
+    static STDOUT_WATCH: std::cell::RefCell<Option<LineWatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`stdout_lines_of`], with `watch` run on each line as it is printed, before the print
+/// answers: a test reads there what the call had done by the time it printed.
+#[cfg(test)]
+fn stdout_lines_watched<R>(
+    closed: bool,
+    watch: impl FnMut(&str) + 'static,
+    act: impl FnOnce() -> R,
+) -> (R, Vec<String>) {
+    let before = STDOUT_WATCH.replace(Some(Box::new(watch)));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stdout_lines_of(closed, act)
+    }));
+    STDOUT_WATCH.replace(before);
+    done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// `act` with this thread's stdout kept from the process's, closed by its reader where `closed`
@@ -5959,6 +6049,11 @@ fn stdout_lines_of<R>(closed: bool, act: impl FnOnce() -> R) -> (R, Vec<String>)
 }
 
 fn print_stdout_line(line: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(mut watch) = STDOUT_WATCH.with_borrow_mut(Option::take) {
+        watch(line);
+        STDOUT_WATCH.with_borrow_mut(|seam| *seam = Some(watch));
+    }
     #[cfg(test)]
     if let Some(closed) = STDOUT_LINES.with_borrow_mut(|seam| {
         seam.as_mut().map(|(lines, closed)| {

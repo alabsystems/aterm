@@ -708,9 +708,43 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                 );
                 assert_eq!(current.proved_email.as_deref(), Some(EMAIL));
                 assert!(old.is_dir(), "old profile retained");
+                // The sign-in that took renewed the row: no login end is written over it.
+                let state = store.load(env.now).unwrap().0;
+                assert_ne!(state.account("one").auth, accounts::Auth::SignedOut);
+                assert!(
+                    store
+                        .tail(64)
+                        .unwrap()
+                        .iter()
+                        .all(|event| event.kind != accounts::Kind::LoginEnded)
+                );
             } else {
                 assert_ne!(result, Renewal::Renewed, "case {case}");
                 assert_eq!(current.dir, before.dir, "failure changed live binding");
+                // A REFUSED REFRESH TOKEN SIGNS ITS ROW OUT ON RECORD, however the attempt
+                // that met the refusal ended: held for a person, short of a browser or a
+                // program, or failed after its new sign-in. CONTROL: an outage (2) and a
+                // profile with no receipt of a refusal (5) write no word.
+                let state = store.load(env.now).unwrap().0;
+                let ended = store
+                    .tail(64)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| {
+                        event.kind == accounts::Kind::LoginEnded && event.account == "one"
+                    })
+                    .count();
+                let refused = !matches!(case, 2 | 5);
+                assert_eq!(
+                    state.account("one").auth == accounts::Auth::SignedOut,
+                    refused,
+                    "case {case}, default={default_profile}"
+                );
+                assert_eq!(
+                    ended,
+                    usize::from(refused),
+                    "case {case}, default={default_profile}"
+                );
                 if case == 6 {
                     assert!(
                         host.stage.borrow().as_ref().unwrap().is_dir(),

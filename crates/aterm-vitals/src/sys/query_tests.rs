@@ -260,3 +260,25 @@ fn scopes_default_by_view() {
     );
     assert_eq!(SysQuery::parse("tab").unwrap().effective_scope(), None);
 }
+
+/// `scope=request` is a scope of jobs, disk and procs (cores, gpu, mem and net take it), never
+/// of `left`, and it reads tabs beyond the target's, so it is the owner's.
+#[test]
+fn request_scope_reads_jobs_disk_and_procs_beyond_the_target_and_is_no_scope_of_left() {
+    for text in [
+        "jobs scope=request",
+        "disk scope=request",
+        "procs scope=request --json",
+    ] {
+        let q = SysQuery::parse(text).expect(text);
+        assert_eq!(q.effective_scope(), Some(ScopeArg::Request), "{text}");
+        assert!(!q.target_rows_only(), "{text}");
+    }
+    // mem prints the same rows whatever the scope: the target's read.
+    let mem = SysQuery::parse("mem scope=request").unwrap();
+    assert_eq!(mem.effective_scope(), Some(ScopeArg::Request));
+    assert!(mem.target_rows_only());
+    assert_eq!(SysQuery::parse("left scope=request"), Err(USAGE));
+    assert_eq!(SysQuery::parse("overview scope=request"), Err(USAGE));
+    assert_eq!(ScopeArg::Request.word(), "request");
+}

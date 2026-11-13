@@ -45,7 +45,10 @@ pub const PROVIDERS: [&str; 6] = [ANTHROPIC, OPENAI, GOOGLE, META, KIMI, XAI];
 
 /// The canonical realm for `raw`: the claims ring's spelling for a pooled provider (it agrees
 /// with `harness/claims.rs` `canonical_pool_realm` on every spelling that accepts, the empty
-/// default included), or the provider word for an unpooled one.
+/// default included), or the provider word for an unpooled one. agy is the one pooled CLI whose
+/// claims realm is not its account realm: its accounts are Google's, so the claims ring's `agy`
+/// (and `antigravity`) key as `google`, the realm a read of agy is attributed by and the
+/// importer files its rows under.
 pub fn canonical_realm(raw: &str) -> Option<&'static str> {
     let trimmed = raw.trim_ascii();
     if trimmed.is_empty()
@@ -71,7 +74,11 @@ pub fn canonical_realm(raw: &str) -> Option<&'static str> {
         || trimmed.eq_ignore_ascii_case("kimi-cn")
     {
         Some("kimi:mainland-cn")
-    } else if trimmed.eq_ignore_ascii_case("google") || trimmed.eq_ignore_ascii_case("gemini") {
+    } else if trimmed.eq_ignore_ascii_case("google")
+        || trimmed.eq_ignore_ascii_case("gemini")
+        || trimmed.eq_ignore_ascii_case("agy")
+        || trimmed.eq_ignore_ascii_case("antigravity")
+    {
         Some("google")
     } else if trimmed.eq_ignore_ascii_case("meta") {
         Some("meta")

@@ -783,7 +783,8 @@ const PERSON_PACE: Duration = Duration::from_millis(60);
 /// past the record says it has written the last of that page's files.
 struct Pager {
     child: Option<aterm_uds::spawnfd::Child>,
-    journal: PathBuf,
+    /// Its state dir, whose journal `aterm_link::notify::journal_lines` reads.
+    state: PathBuf,
     cursor: PathBuf,
     /// Its flush tally (`aterm_link::notify::FLUSH_TALLY_SEAM`).
     tally: PathBuf,
@@ -829,7 +830,7 @@ impl Pager {
             .stderr(err);
         Pager {
             child: Some(cmd.spawn().expect("spawn aterm link notify")),
-            journal: dir.join("notify/journal"),
+            state: dir.clone(),
             cursor: dir.join("notify/cur").join(sel.key()),
             tally: dir.join("notify").join(aterm_link::notify::FLUSH_TALLY),
             stamps: dir.join("notify").join(aterm_link::notify::EXEC_STAMPS),
@@ -873,8 +874,9 @@ impl Pager {
     fn paged(&self, clock: Clock, off: u64) -> u64 {
         let want = format!("{off} fired ");
         self.until(clock, &format!("page @{off}"), || {
-            std::fs::read_to_string(&self.journal)
-                .is_ok_and(|j| j.lines().any(|l| l.starts_with(&want)))
+            aterm_link::notify::journal_lines(&self.state)
+                .iter()
+                .any(|l| l.starts_with(&want))
         })
     }
 

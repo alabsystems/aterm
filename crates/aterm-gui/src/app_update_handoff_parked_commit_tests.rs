@@ -230,6 +230,92 @@ fn assert_whole(frame: &[u8]) {
 
 const WRITTEN: &str = "attempt-bound Commit pipe closed before its atomic write";
 
+/// AppKit can begin waiting after the broad Commit facts were collected and before its wake is
+/// dispatched. The final callback-free gate must see that thread-local wait and refuse the write.
+///
+/// NEGATIVE CONTROL: with no late quit, the same parked handoff reaches the atomic write.
+#[test]
+fn an_appkit_quit_that_starts_after_collected_facts_holds_the_commit() {
+    use crate::menu::TerminateReply;
+    use crate::system_quit::Asker;
+
+    let _serial = crate::menu::terminate_test_serial();
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    {
+        let mut control = Parked::new(b"");
+        let completion = control.proof_ready();
+        assert_eq!(
+            control.run_to_verdict(completion),
+            WRITTEN,
+            "NEGATIVE CONTROL: no AppKit reply is pending"
+        );
+    }
+
+    let mut parked = Parked::new(b"");
+    parked.app.handoff_before_egress_fence = Some(Box::new(|| {
+        let reply = crate::menu::offer_terminate(
+            crate::menu::ask_native_terminate(Asker::System, true),
+            |_| true,
+        );
+        assert!(
+            matches!(reply, TerminateReply::Later(_)),
+            "AppKit waits on the system quit: {reply:?}"
+        );
+    }));
+    let completion = parked.proof_ready();
+    let verdict = parked.run_to_verdict(completion);
+    assert!(
+        verdict.contains("destructive intent revoked Commit"),
+        "the late AppKit wait stands down the Commit: {verdict}"
+    );
+    assert!(
+        crate::menu::appkit_awaits_quit_reply(),
+        "PRECONDITION: the wake has not yet replayed or cancelled the quit"
+    );
+    assert!(crate::menu::cancel_current_native_termination());
+    assert_eq!(
+        crate::menu::take_refusals_for_test().len(),
+        1,
+        "AppKit hears the one NO the returned handoff owes"
+    );
+}
+
+/// A destructive request dispatched by a callback after the broad facts snapshot changes both
+/// the activity epoch and the current teardown. The final edge must bind the live attempt, not
+/// the stale boolean in those facts.
+#[test]
+fn a_teardown_deferred_after_collected_facts_holds_the_commit() {
+    fn defer_clean_quit(app: &mut crate::App) {
+        assert!(
+            app.defer_pending_update_handoff_teardown(
+                crate::DeferredHandoffTeardown::CleanQuitReady
+            )
+        );
+    }
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut parked = Parked::new(b"");
+    super::BEFORE_FINAL_SETUP_CHECK.set(Some(defer_clean_quit));
+    let completion = parked.proof_ready();
+    let verdict = parked.run_to_verdict(completion);
+    assert!(
+        verdict.contains("structural activity"),
+        "the late destructive activity stands down the Commit: {verdict}"
+    );
+    assert!(
+        super::BEFORE_FINAL_SETUP_CHECK.take().is_none(),
+        "the late teardown hook ran"
+    );
+    assert!(matches!(
+        parked
+            .app
+            .pending_update_handoff
+            .as_ref()
+            .map(|pending| &pending.teardown),
+        Some(crate::DeferredHandoffTeardown::CleanQuitReady)
+    ));
+}
+
 #[test]
 fn a_setup_offer_edited_after_collected_facts_cannot_reach_the_commit_write() {
     use crate::native_app::{ActionInvocation, AppEvent, SemanticInput};
@@ -995,7 +1081,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
         .set_system_state_handlers_for_test(crate::InitialSetupHandlers {
             apply: |_, _, _, _| false,
             own_console: || true,
-            check: |_| crate::CheckStarted::default(),
+            check: |_, _| crate::CheckStarted::default(),
             restore: || false,
             status: crate::SetupStatus::default,
             observe: |_| false,
@@ -1017,6 +1103,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
             sync_on: || false,
             ask_access: || false,
             fda_granted: || {},
+            fda_off: || {},
             tools_installed: || {},
             join_phrase: |_, _| false,
         });

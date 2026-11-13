@@ -452,7 +452,10 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
 /// (`Bootstrap::access_in_observed`), finds this Mac denied, with the files it read.
 fn denial(paths: &Paths, lock: &StateLock) -> (bool, BTreeMap<PathBuf, usize>) {
     let (denied, read) = reads_during(paths, || {
-        local_recipient_denied_under(paths, lock, &crate::fsx::Glance::new())
+        local_recipient_denied_under(
+            paths,
+            vault_memo::Under::of(lock, &vault_memo::Moment::new(paths)),
+        )
     });
     (denied.expect("the denial check reads"), read)
 }
@@ -473,7 +476,7 @@ fn observation(paths: &Paths) -> StateLock {
 /// the next call.
 ///
 /// NEGATIVE CONTROLS (2026-11-08): with `observe_commons_quiet`'s memo not quiet
-/// (`Memo::keyed(observation_inputs, false)`), the custody check under the writer is given the
+/// (`Memo::of(Set::Observation, false)`), the custody check under the writer is given the
 /// observation kept from before it (`left: "visible", right: "vault-busy"`); with
 /// `local_recipient_denied_under`'s not quiet, the writer's own check reads nothing
 /// (`a writer's denial check reads afresh`).
@@ -638,7 +641,7 @@ fn a_table_sessions_custody_and_access_keep_their_reads_until_a_file_moves() {
 /// lock nothing kept is given: the roster for the log refuses the busy vault and the roster read
 /// finds it busy, as each did before, so a busy writer never yields a permissive verdict.
 ///
-/// NEGATIVE CONTROLS (2026-11-06): with the memos not quiet (`Memo::keyed(inputs, false)`), the
+/// NEGATIVE CONTROLS (2026-11-06): with the memos not quiet (`Memo::of(Set::Vault, false)`), the
 /// kept roster for the log is given under the writer (`a writer holding the vault meets the
 /// read`); with `local_swarm_roster_for_log_now` keyed by no log's heads (`[0; 32]`), the grown
 /// log gets the roster kept for the log before it (`the roster for another log is read for it`:
@@ -764,7 +767,7 @@ fn heard(paths: &Paths) -> u64 {
 /// NEGATIVE CONTROLS (2026-11-09): with `state_look` finding a kept look by its path alone (`*stamp
 /// == before` dropped), the next call after the vault's newer word gives the earlier one (`the
 /// vault's newer word at the next call`, `left: Some(1794270305), right: Some(1794270365)`); with
-/// the memo not quiet (`Memo::keyed(observation_inputs, false)`), the call under the writer is
+/// the memo not quiet (`Memo::of(Set::Observation, false)`), the call under the writer is
 /// given the answer kept from before it (`a writer holding the vault meets the read`); keyed by
 /// nothing (`&false` for the registration), the registration is not read (`a registration after a
 /// first read`).
@@ -932,8 +935,9 @@ fn the_configuration_is_read_again_only_when_its_files_move() {
 
 /// The members desk's inputs ([`desk_inputs`], which a window's desk lane and the node's automatic
 /// admission keep a member by) stand over a round of the vault's subscriber that brings nothing
-/// new, which rewrites `state.toml` with its receipt and, a minute apart at most, the time the
-/// vault last heard this Mac: about every 25 s on a member, and each one read the desk again. A
+/// new, which rewrites `state.toml` with its receipt and the time the vault last heard this Mac,
+/// each about once a minute (about every 25 s on a member when this was measured, 2026-11-09),
+/// and each one read the desk again. A
 /// change of what the state holds moves them at once.
 ///
 /// NEGATIVE CONTROLS (2026-11-09): with `desk_files` keeping `state.toml` among the files stamped
@@ -971,10 +975,11 @@ fn the_desk_inputs_stand_over_a_round_and_move_with_the_state() {
 }
 
 /// A round of the vault's subscriber that brings nothing new rewrites `state.toml` with its
-/// receipt and, a minute apart at most, the time the vault last heard this Mac: about every 25 s
-/// on a member. Each rewrite read every memo of the vault again ([`vault_memo`]), the deny list a
-/// node's watch asks every two seconds, the roster, the records, the Commons observation and the
-/// LAN presence, each reading the held vault whole, though none is read from those fields. Now
+/// receipt and the time the vault last heard this Mac, each about once a minute (about every
+/// 25 s on a member when this was measured, 2026-11-09). Each rewrite read every memo of the
+/// vault again ([`vault_memo`]), the deny list a node's watch asks every two seconds, the roster,
+/// the records, the Commons observation and the LAN presence, each reading the held vault whole,
+/// though none is read from those fields. Now
 /// each stamps the state by what it holds but them: the round reads `state.toml` once, and
 /// nothing else, and the LAN presence gives the vault's newer word; a change of what the state
 /// holds reads them again at once.

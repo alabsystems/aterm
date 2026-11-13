@@ -1036,7 +1036,7 @@ pub(crate) fn landed<T>(
 }
 
 /// The cargo that runs the lab (`$CARGO`: the lab's own PATH holds no toolchain).
-fn targo() -> std::ffi::OsString {
+pub(crate) fn targo() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "targo".into())
 }
 

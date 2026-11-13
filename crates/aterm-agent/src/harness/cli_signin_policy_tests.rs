@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use crate::ai::connector::{Flow, Region};
 use crate::harness::accounts_overlay::model_provider;
@@ -518,6 +528,7 @@ pub(crate) fn policy_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn vendor_login_and_renewal_policy_conform_with_independent_edits_allowed() {
     let model = aterm_models_harness::account_signin_policy_model();
@@ -704,6 +715,7 @@ fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
     matches!(result, Renewal::WrongAccount | Renewal::NeedsPerson)
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_login_observations_never_publish_without_their_history() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -721,6 +733,7 @@ fn failed_login_observations_never_publish_without_their_history() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unscoped_legacy_guidance_is_history_until_its_own_fresh_observation() {
     let world = World::new(Cli::Kimi);
@@ -870,6 +883,7 @@ fn unscoped_legacy_guidance_is_history_until_its_own_fresh_observation() {
     );
 }
 
+#[cfg(unix)]
 fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
     let world = World::new(cli);
     let initial = world.records();
@@ -964,6 +978,7 @@ fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
     [accepted, guarded, coherent, once, preserved, quiet]
 }
 
+#[cfg(unix)]
 pub(crate) fn observation_commit_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -1005,6 +1020,7 @@ pub(crate) fn observation_commit_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn signin_observations_conform_to_durable_publication() {
     let model = aterm_models_harness::account_signin_observation_commit_model();
@@ -1035,6 +1051,7 @@ fn signin_observations_conform_to_durable_publication() {
     assert!(!model.check_invariant("RefusalOrPendingFence", &admitted));
 }
 
+#[cfg(unix)]
 #[test]
 fn secondary_codex_identity_observations_recover_without_another_login() {
     for operation in [6, 7] {

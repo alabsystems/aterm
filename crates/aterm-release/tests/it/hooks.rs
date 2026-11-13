@@ -127,15 +127,15 @@ fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
     let (_dir, root, git) = scratch();
     let (repo, first) = repo_with_history(&root, &git);
     for (target, want_target, verdict) in [
-        (None, repo.join("target/pre-promote.noindex"), 1),
+        (None, repo.join("target/.ubd/pre-promote.noindex"), 1),
         (
             Some(PathBuf::from("build/shared")),
-            repo.join("build/shared/pre-promote.noindex"),
+            repo.join("build/shared/.ubd/pre-promote.noindex"),
             0,
         ),
         (
             Some(root.join("elsewhere")),
-            root.join("elsewhere/pre-promote.noindex"),
+            root.join("elsewhere/.ubd/pre-promote.noindex"),
             1,
         ),
     ] {
@@ -1098,7 +1098,7 @@ fn transforms_reuse_only_the_exact_proved_running_build_even_with_ignored_output
     let there = |rules: &str, full: &str| Ran::There {
         rules: rules.into(),
         full: full.into(),
-        target: repo.join("build/shared/pre-promote.noindex"),
+        target: repo.join("build/shared/.ubd/pre-promote.noindex"),
     };
 
     let (code, ran, said) = dispatch(&facts("HEAD"));
@@ -1198,7 +1198,7 @@ fn a_handed_cutter_runs_the_transforms_only_as_the_captured_commits_build() {
     let own = || Ran::There {
         rules: "// TWO\n".into(),
         full: c2.clone(),
-        target: repo.join("target/pre-promote.noindex"),
+        target: repo.join("target/.ubd/pre-promote.noindex"),
     };
 
     let (code, ran, said) = dispatch(&facts(Some(Ok(c2.clone()))));

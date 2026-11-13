@@ -761,6 +761,9 @@ fn gather(
             .map(|p| p.display().to_string())
     };
     let cwd = cwd_of(term).or_else(|| shell_cwd(session));
+    let request = (q.effective_scope() == Some(ScopeArg::Request))
+        .then(|| request_facts(store, &sid_of(session)))
+        .flatten();
     let target = Target {
         key: session,
         sid: sid_of(session),
@@ -770,6 +773,7 @@ fn gather(
         window_sessions: window_sessions.clone(),
         cwd: cwd.clone(),
         fg_pgid: fg_pgid(master),
+        request: request.clone(),
     };
     let tabs: Vec<TabFact> = panes
         .iter()
@@ -801,6 +805,7 @@ fn gather(
             ScopeArg::Pane => vec![session],
             ScopeArg::Tab => panes_of_tab,
             ScopeArg::Window => window_sessions,
+            ScopeArg::Request => request.map_or_else(|| vec![session], |r| r.sessions),
             ScopeArg::Aterm | ScopeArg::Global => panes.iter().map(|p| p.key).collect(),
         };
         let mut cwds: Vec<PaneCwd> = Vec::new();
@@ -858,6 +863,81 @@ fn gather(
         caller_panes,
         home,
     }
+}
+
+/// The kernel reads `scope=request` takes of its live tabs' trees: none in a test.
+#[cfg(not(test))]
+const REQUEST_TREE: crate::tab_marks::TreeProbe = crate::tab_marks::TreeProbe::HOST;
+#[cfg(test)]
+const REQUEST_TREE: crate::tab_marks::TreeProbe = crate::tab_marks::TreeProbe::INERT;
+
+/// The request that owns tab `sid` (ATERM-KI-1109-3), as `scope=request` reads it: its tabs
+/// this instance hosts, what its tabs' trees spent (each tab that left as its `spent` record
+/// says, each live one as a read now or its samples say, whichever is more), and its claimed
+/// folders with what they hold where every one was measured. `None` where no request owns it.
+pub(crate) fn request_facts(store: &Store, sid: &str) -> Option<aterm_vitals::sys::RequestFacts> {
+    let placed = crate::requests_host::placed(sid, None)?;
+    let dir = crate::requests_host::dir().ok().flatten()?;
+    let request = crate::requests_host::with_store(&dir, |requests| {
+        Ok(requests.requests().find(|r| r.id == placed.id).cloned())
+    })
+    .ok()
+    .flatten()?;
+    let live: Vec<(u64, String, i32)> = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.live_handles()
+            .filter(|h| {
+                crate::requests_host::placed(h.sid.as_str(), None)
+                    .is_some_and(|other| other.id == placed.id)
+            })
+            .map(|h| (h.local_id, h.sid.as_str().to_owned(), h.shell_identity.pid))
+            .collect()
+    };
+    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (a, b) => a.or(b),
+    };
+    let mut spent = request.spent();
+    for (_, tab, pid) in &live {
+        if request
+            .tabs
+            .iter()
+            .any(|t| t.sid == *tab && t.spent.is_some())
+        {
+            continue;
+        }
+        let read = crate::tab_marks::tree_spent(*pid, &REQUEST_TREE).as_spent();
+        let now =
+            crate::requests_footprint::spend_of(tab).map_or(read, |sampled| read.max(sampled));
+        spent = aterm_requests::Spent {
+            cpu_s: add(spent.cpu_s, now.cpu_s),
+            peak_mb: spent.peak_mb.max(now.peak_mb),
+            written_mb: add(spent.written_mb, now.written_mb),
+        };
+    }
+    let now_ms = crate::requests_host::now_unix_ms();
+    let claimed_mb = request
+        .claims
+        .iter()
+        .map(|held| {
+            // A walk that could not read the folder, or was cut short, has no figure to add.
+            crate::requests_footprint::measured(&held.claim.path, now_ms)
+                .and_then(|m| m.bytes.filter(|_| m.complete))
+        })
+        .sum::<Option<u64>>()
+        .map(|bytes| bytes / (1024 * 1024));
+    let mut sessions: Vec<u64> = live.iter().map(|(key, ..)| *key).collect();
+    sessions.sort_unstable();
+    Some(aterm_vitals::sys::RequestFacts {
+        id: request.id,
+        sessions,
+        tabs: request.tabs.len(),
+        cpu_s: spent.cpu_s,
+        peak_mb: spent.peak_mb,
+        written_mb: spent.written_mb,
+        claims: request.claims.len(),
+        claimed_mb,
+    })
 }
 
 /// One pane of the asked scope and the folder its shell works in.
@@ -924,10 +1004,11 @@ impl DiskAsk<'_> {
 /// board, at look pace.
 pub(crate) fn disk_roots(ask: &DiskAsk<'_>, cwds: &[PaneCwd]) -> (Vec<Root>, Option<DiskTotals>) {
     use crate::diskwalk_host::{DISKWALK, Detail, Pace, WalkerState, disk_reports};
+    let now = Instant::now();
     if DISKWALK.walker_state() != WalkerState::Running {
+        ask_unstarted(&DISKWALK, &ask.asked(), now);
         return (cwd_roots(cwds, RootSize::NotSampled), None);
     }
-    let now = Instant::now();
     let (board, reports) = disk_reports(&ask.asked(), Detail::Sizes, Pace::Look, now);
     let home = aterm_types::dirs::home_dir();
     let volume = if ask.lines {
@@ -938,6 +1019,25 @@ pub(crate) fn disk_roots(ask: &DiskAsk<'_>, cwds: &[PaneCwd]) -> (Vec<Root>, Opt
     let used = volume.as_ref().map(|v| (v.used(), v.total));
     let (roots, totals) = disk_view(&board, &reports, ask, cwds, used, now);
     (roots, Some(totals))
+}
+
+/// Demand `scopes` of `walk` when its walker has not started, as [`disk_roots`] would of one
+/// that runs: a headless instance starts its walker only once a scope is demanded
+/// (`App::service_diskwalk`), so this ask starts it and a later one reads its sizes. A walker
+/// whose thread failed is asked nothing: nothing will measure. Whether it asked.
+pub(crate) fn ask_unstarted(
+    walk: &crate::diskwalk_host::Shared,
+    scopes: &[crate::diskwalk_host::DiskScope],
+    now: Instant,
+) -> bool {
+    use crate::diskwalk_host::{Detail, Pace, WalkerState};
+    if walk.walker_state() != WalkerState::NotStarted {
+        return false;
+    }
+    for &scope in scopes {
+        walk.demand(scope, Detail::Sizes, Pace::Look, now);
+    }
+    !scopes.is_empty()
 }
 
 fn cwd_roots(cwds: &[PaneCwd], size: RootSize) -> Vec<Root> {
@@ -1464,6 +1564,12 @@ pub(crate) fn cmd_sys(
         &q,
         held.as_ref().map(|h| h.snap.as_ref()),
     );
+    if q.effective_scope() == Some(ScopeArg::Request) && g.target.request.is_none() {
+        return format!(
+            "ERR sys scope=request: {} belongs to no request\n",
+            g.target.sid
+        );
+    }
     answer(&SYS, &q, held.as_ref(), state, &machine, &g, owner_class)
 }
 

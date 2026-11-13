@@ -33,6 +33,7 @@ const WALL: &str = "You've hit your weekly limit · resets 4pm (America/Los_Ange
 /// [`TYPING`] ago where `person`.
 fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase: Phase::Idle,
         authoritative: true,
         survey: false,

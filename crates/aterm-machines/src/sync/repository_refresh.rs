@@ -92,6 +92,12 @@ pub struct Observer {
     state: RefreshState,
 }
 
+/// The shared receipt [`Observer::read`] reads under the account's state folder `state`.
+#[must_use]
+pub fn record_path(state: &Path) -> PathBuf {
+    state.join(FileJournal::DIR).join(super::RECORD)
+}
+
 impl Observer {
     pub fn read(
         &mut self,
@@ -99,9 +105,7 @@ impl Observer {
         state: &Path,
         now_ms: u64,
     ) -> RefreshObservation {
-        let version = sys
-            .file_version(&state.join(FileJournal::DIR).join(super::RECORD))
-            .map_err(|e| e.kind());
+        let version = sys.file_version(&record_path(state)).map_err(|e| e.kind());
         if self.version.as_ref() != Some(&version)
             || version
                 .as_ref()

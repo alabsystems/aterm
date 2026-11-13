@@ -390,6 +390,212 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     );
 }
 
+/// The import guard reads a round the live observer just completed, before the observer's next
+/// checkpoint puts it in the retained history, and reads that history once no observer answers.
+#[test]
+fn the_latest_rounds_are_the_live_observers_before_they_reach_its_history() {
+    use crate::network_state::{ObservationHandle, Observer, read_history};
+    use aterm_types::network_state::{
+        MachineIdentity, RepairObservation, RepairOutcome, Visibility,
+    };
+    let identity = |n: u8| MachineIdentity {
+        machine_id: [n; 16],
+        incarnation: [n; 16],
+        label: None,
+    };
+    // The observer's socket needs a short path.
+    let root = aterm_tempfile::Builder::new()
+        .prefix("rounds-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let config = root.path().join("aterm.toml");
+    assert!(latest_rounds(&config).unwrap().peers.is_empty());
+    let mut observer = Observer::open(&config, ObservationHandle::default()).unwrap();
+    let trust = aterm_secrets::commons::journal::Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    observer.local(identity(1), trust).unwrap();
+    let at = std::time::Instant::now();
+    let wall = aterm_time::unix_millis().unwrap();
+    observer.contact(identity(2), wall, at);
+    observer.observe(Visibility::Active, 0, "observing", wall, at);
+    // A round that brought registry records ends just after that checkpoint.
+    let round = RepairObservation {
+        completed_at_ms: wall,
+        outbound: true,
+        stage: None,
+        outcome: RepairOutcome::Exchanged,
+        table: Some([3; 32]),
+        sent: Some(0),
+        received: Some(4),
+        deferred: Some(0),
+    };
+    observer.repair(&identity(2), round.clone(), at);
+    observer.observe(Visibility::Active, 0, "observing", wall, at);
+    assert_eq!(read_history(&config).unwrap().peers[0].last_repair, None);
+    let live = latest_rounds(&config).unwrap();
+    assert_eq!(live.via_local_process, Some(std::process::id()));
+    assert_eq!(live.peers[0].last_repair, Some(round.clone()));
+    assert!(
+        empty_view_wait(
+            Some([3; 32]),
+            None,
+            live.peers.iter().map(|peer| peer.last_repair.as_ref()),
+            wall
+        )
+        .is_some()
+    );
+    // The observer stops: its pending round is written, and the history answers.
+    drop(observer);
+    let retained = latest_rounds(&config).unwrap();
+    assert_eq!(retained.via_local_process, None);
+    assert_eq!(retained.peers[0].last_repair, Some(round));
+}
+
+/// A history its observer has not closed does not speak for the latest rounds: that observer is
+/// running and did not answer, or was killed, and either may know a round the history lacks. A
+/// running one is asked again within a bound and its answer read; where it gives none, or none
+/// is listening, the guard cannot read whether the lab holds the registry, where the open
+/// history alone would let the import go, and its error says which.
+#[test]
+fn an_open_history_does_not_speak_for_the_latest_rounds() {
+    use crate::network_state::{ObservationHandle, Observer, Publication, read_history};
+    use aterm_types::network_state::{
+        MachineIdentity, RepairObservation, RepairOutcome, Visibility,
+    };
+    let identity = |n: u8| MachineIdentity {
+        machine_id: [n; 16],
+        incarnation: [n; 16],
+        label: None,
+    };
+    let trust = aterm_secrets::commons::journal::Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    let round = |outcome, completed_at_ms| RepairObservation {
+        completed_at_ms,
+        outbound: true,
+        stage: None,
+        outcome,
+        table: Some([3; 32]),
+        sent: Some(0),
+        received: Some(0),
+        deferred: Some(0),
+    };
+    // What the retained history alone says of an import into the registry `[3; 32]`.
+    let history_waits = |config: &Path, now_ms| {
+        let history = read_history(config).unwrap();
+        empty_view_wait(
+            Some([3; 32]),
+            None,
+            history.peers.iter().map(|peer| peer.last_repair.as_ref()),
+            now_ms,
+        )
+    };
+    // The observer's socket needs a short path.
+    let root = aterm_tempfile::Builder::new()
+        .prefix("rounds-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let config = root.path().join("aterm.toml");
+    let published = ObservationHandle::default();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    observer.local(identity(1), trust).unwrap();
+    let at = std::time::Instant::now();
+    let wall = aterm_time::unix_millis().unwrap();
+    observer.contact(identity(2), wall, at);
+    observer.repair(&identity(2), round(RepairOutcome::Exchanged, wall), at);
+    observer.observe(Visibility::Active, 0, "observing", wall, at);
+    // The checkpoint has a round that exchanged and brought nothing: by it the import may go.
+    assert_eq!(history_waits(&config, wall), None);
+    // The next round defers registry records, inside the settle interval.
+    let deferred = round(RepairOutcome::Deferred(None), wall);
+    observer.repair(&identity(2), deferred.clone(), at);
+    observer.observe(Visibility::Active, 0, "observing", wall, at);
+    assert_eq!(history_waits(&config, wall), None, "not yet in the history");
+    assert_eq!(
+        latest_rounds(&config).unwrap().peers[0].last_repair,
+        Some(deferred.clone())
+    );
+    // The observer is running and refuses the read (its publication is no longer current):
+    // the open history is not read in its place.
+    let mut current = published.try_publication();
+    assert!(current.is_some());
+    let stale = Publication::new(
+        published.snapshot(),
+        at.checked_sub(std::time::Duration::from_secs(60)).unwrap(),
+    );
+    published.replace_publication(stale);
+    let refused = crate::network_state::read_live_observation(&config).unwrap_err();
+    assert!(
+        !crate::network_state::no_live_observer(&refused),
+        "an observer that refuses a read is listening: {refused}"
+    );
+    let mut live = || crate::network_state::read_live_observation(&config);
+    let hang = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    // Past its bound the read gives up, and says the observer runs and did not answer.
+    let unanswered =
+        latest_rounds_asking(&config, std::time::Instant::now(), &mut live, &mut || {
+            panic!("no ask after the bound")
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(unanswered.contains("did not answer"), "{unanswered}");
+    assert!(unanswered.contains("frame-header"), "{unanswered}");
+    // Inside it the observer is asked again, and answers once it has published: a running
+    // observer is not read as absent. Negative control: a read that gives up at the first
+    // refusal fails here.
+    let mut asks = 0;
+    let answered = latest_rounds_asking(&config, hang(), &mut live, &mut || {
+        asks += 1;
+        if let Some(current) = current.take() {
+            published.replace_publication(current);
+        }
+    })
+    .unwrap();
+    assert_eq!(asks, 1);
+    assert_eq!(answered.via_local_process, Some(std::process::id()));
+    assert_eq!(answered.peers[0].last_repair, Some(deferred));
+    // The observer's process is killed: nothing listens, the history stays open, and the read
+    // fails at once, saying so.
+    observer.die();
+    assert_eq!(history_waits(&config, wall), None);
+    let killed = latest_rounds_asking(&config, hang(), &mut live, &mut || {
+        panic!("no ask where no observer listens")
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(killed.contains("left open"), "{killed}");
+    assert!(killed.contains("endpoint"), "{killed}");
+    assert!(latest_rounds(&config).is_err());
+    // The next observer has the peer and none of its rounds, so the guard waits for one.
+    let mut restarted = Observer::open(&config, ObservationHandle::default()).unwrap();
+    restarted.local(identity(1), trust).unwrap();
+    let wall = aterm_time::unix_millis().unwrap();
+    restarted.observe(
+        Visibility::Active,
+        0,
+        "observing",
+        wall,
+        std::time::Instant::now(),
+    );
+    let live = latest_rounds(&config).unwrap();
+    assert_eq!(live.via_local_process, Some(std::process::id()));
+    assert_eq!(live.peers.len(), 1);
+    assert!(
+        empty_view_wait(
+            Some([3; 32]),
+            None,
+            live.peers.iter().map(|peer| peer.last_repair.as_ref()),
+            wall
+        )
+        .is_some()
+    );
+}
+
 /// Before the lab's first import no Mac holds the registry, so no repair round ever covers it,
 /// and a round over the catalog speaks instead, where this Mac's catalog holds no other Mac's
 /// declaration of the registry (the guard passes the catalog's id only then): one that exchanged
@@ -2378,7 +2584,7 @@ fn a_password_beside_a_concurrent_protected_mark_is_uncovered() {
     let carry = |from: &crate::local::Database, to: &mut crate::local::Database| {
         let wires: Vec<Vec<u8>> = from
             .history
-            .index
+            .index()
             .inventory()
             .map(|id| from.history.wire(id).unwrap().to_vec())
             .collect();
@@ -2450,7 +2656,7 @@ fn a_spelling_is_not_reported_beside_a_column_that_really_disagrees() {
     let carry = |from: &crate::local::Database, to: &mut crate::local::Database| {
         let wires: Vec<Vec<u8>> = from
             .history
-            .index
+            .index()
             .inventory()
             .map(|id| from.history.wire(id).unwrap().to_vec())
             .collect();
@@ -2501,12 +2707,12 @@ fn an_import_does_not_cover_a_record_the_dump_withholds() {
     let mut wires = Vec::new();
     for i in 2..=3 {
         let before: std::collections::BTreeSet<_> =
-            peer.history.index.inventory().copied().collect();
+            peer.history.index().inventory().copied().collect();
         let (email, row) = email_row(i, "active");
         crate::fleet_db::put_row(&mut peer, "emails", &email, row).unwrap();
         let new = peer
             .history
-            .index
+            .index()
             .inventory()
             .copied()
             .find(|id| !before.contains(id))

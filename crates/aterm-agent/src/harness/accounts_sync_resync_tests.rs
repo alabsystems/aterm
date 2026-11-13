@@ -9,6 +9,16 @@
 //! ladder, and `add` lists its row where the next sync reads it, or refuses by the source's name.
 //! Every fixture email is `example.test`.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -238,6 +248,7 @@ fn the_rows_a_resync_leaves_without_a_login_are_reported_and_left_for_a_person()
 /// machine, so the next sync (from init, a window's upkeep or a person's `accounts sync`) keeps
 /// it with its own login directory; the file still says `discovered`. CONTROL: a row with no
 /// email, which a fleet cannot list, is refused and nothing is written.
+#[cfg(unix)]
 #[test]
 fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
     let desk = discovered_desk();
@@ -298,6 +309,7 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
 /// Where a source this machine reads and does not write makes the roster (the vault's fleet of
 /// several machines, `[fleet] accounts_source`), `accounts add` refuses by that source's name and
 /// writes nothing: the row would be dropped at the next sync.
+#[cfg(unix)]
 #[test]
 fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
     let desk = Desk::new("m27");

@@ -22,6 +22,19 @@ fn never_overflows_into_a_stop() {
 }
 
 #[test]
+fn a_clock_set_back_past_the_last_try_makes_the_next_due_at_once() {
+    let schedule = Backoff::new(MINUTE, 60 * MINUTE);
+    assert_eq!(schedule.due_by(1_000, 2, 1_000), 1_000 + 120, "as `due`");
+    assert_eq!(
+        schedule.due_by(1_000, 2, 5_000),
+        1_000 + 120,
+        "a past due stays"
+    );
+    // Recorded a day ahead of the clock now: due now, never a day and a pause away.
+    assert_eq!(schedule.due_by(1_000 + 86_400, 2, 1_000), 1_000);
+}
+
+#[test]
 fn a_first_pause_past_the_longest_waits_the_longest() {
     let schedule = Backoff::new(60 * MINUTE, 15 * MINUTE);
     assert_eq!(schedule.after(1), 15 * MINUTE);

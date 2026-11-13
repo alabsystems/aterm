@@ -25,7 +25,10 @@
 //!   the end its last row told (`told=`), so its last task row is its end. A row the log's lock
 //!   (or its disk) refused is owed (`owed=`) under the board's lock, and written by a later apply
 //!   of its row or the keeper's settle at its own close's time and `wall_ms`, never also said
-//!   lost; one the board gives up is said lost once. `outcome` is the
+//!   lost; one the board gives up is said lost once. A board row records what it writes to the
+//!   log as paying (`paying=`) before the append, with the end it told before (`was_told=`), so
+//!   a row whose write after it failed asks the log, and writes again only what the log does not
+//!   hold, unless a writer that knows no `paying=` told a newer end since. `outcome` is the
 //!   conclusion (`finished` ok, `failed` fail), `stop` its `why=` (`exit` or `exit-status` exit, a
 //!   stall stalled, any other word unknown), `code` the record's `exit=` (none from an earlier
 //!   report), and `wall_ms` the time from its spawn to when this Mac's board took the close. A
@@ -105,6 +108,18 @@ pub fn spawn_outcome<T, E>(sid: Result<&Option<T>, E>) -> Outcome {
 /// exchange's result (what it answered, before anything of it is printed, and the sid its answer
 /// named; `Err` where it was lost).
 pub(crate) type Dialled<C> = std::io::Result<std::io::Result<(C, Option<String>)>>;
+
+/// This Mac's telemetry log, which a sender's row goes to: its state folder's
+/// ([`aterm_telemetry::log::default_dir`]), the one its board's task rows go to; in a test, the
+/// log [`log_of`] finds beside the board a [`crate::board::HereGuard`] points at (none for a
+/// folder not named [`crate::board::DIR`]).
+pub(crate) fn here_log() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(board) = crate::board::here_override() {
+        return log_of(&board);
+    }
+    aterm_telemetry::log::default_dir()
+}
 
 /// After a fleet spawn's dial and exchange: write the sender's row of the worker `args` asked for
 /// (`agent=`, `cwd=`), dialled at `began` to the node `on` and answered `exchanged`, to the log in
@@ -305,9 +320,10 @@ pub(crate) fn log_of(board_dir: &std::path::Path) -> Option<std::path::PathBuf> 
 /// A close is the board's reading of a tab it no longer finds, which a later answer can reverse
 /// ([`crate::board::Row::merge`] reopens the row). So a worker writes a row again only where its
 /// end changed: none where its outcome and stop are those of the newest row its board row owes
-/// ([`crate::board::Row::owed`]), or, owing none, of the row it last told
-/// ([`crate::board::Row::told`]), both of which the board keeps under its lock with the row, past
-/// every rotation of the log. A worker's
+/// ([`crate::board::Row::owed`]), or, with none, of the row it last told
+/// ([`crate::board::Row::told`]: while it pays rows, [`crate::board::Row::paying`], theirs, unless
+/// a writer that knows no `paying=` told a newer one since), all of which the board
+/// keeps under its lock with the row, past every rotation of the log. A worker's
 /// last task row is its end. One that closed once, the usual flow, writes one; a record applied
 /// after the close that wrote, or a reopen at the close's rev and a second close, writes no
 /// second; a close that reversed and ended otherwise writes the end it came to. The board's lock
@@ -319,7 +335,8 @@ pub(crate) fn log_of(board_dir: &std::path::Path) -> Option<std::path::PathBuf> 
 /// filled) in the board row until a later write takes them, each at its own close's time and
 /// `wall_ms`, so the worker's last task row is still its end. A row written late is never also
 /// said lost; one the board gives up (its board row pruned or written over, past [`OWED_KEPT`],
-/// a line that holds no row, or past [`OWED_MAX`]) is said lost once
+/// a line that holds no row, or past [`OWED_MAX`]) is said lost once, and one it was paying when
+/// a write after the append failed is settled by what the log holds, never written twice
 /// ([`crate::board::BoundBoard::pay`]).
 pub(crate) fn task_end(
     board_dir: &std::path::Path,
@@ -358,7 +375,9 @@ pub(crate) fn task_end(
     log_of(board_dir)?;
     let (facts, digest) = aterm_telemetry::direct::facts();
     let task = task_row(&ended, record, now_ms, &facts.host, *digest);
-    // The end the board last told or owes: a row it owes is the one its log will say last.
+    // The end the board last told or owes: the newest row it owes is the one its log will say
+    // last, else the end it told, which while it pays rows is theirs, or a newer one a writer
+    // that knows no `paying=` told since.
     let last = row
         .owed
         .iter()

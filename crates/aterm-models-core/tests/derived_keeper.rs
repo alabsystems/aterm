@@ -254,6 +254,10 @@ fn pty_keeper_custody_the_defects_are_caught_on_every_invariant() {
         ),
         ("NoRelaunchAfterQuit", ["bye", "r_live", "relaunches"]),
         (
+            "KeptMasterOutlivesTheQuitA",
+            ["keep_a", "k_holds_a", "closed_a"],
+        ),
+        (
             "LossNeedsKeeperFaultA",
             ["lost_a", "k_faults", "ever_registered_a"],
         ),

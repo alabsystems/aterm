@@ -922,8 +922,14 @@ fn the_user_cache_follows_each_platform_convention() {
 
 #[test]
 fn installed_tools_can_be_selected_without_restoring_the_test_home() {
-    let owner = Path::new("/fixture/installed-tools");
-    let isolated = Path::new("/fixture/release-state");
+    // Absolute in this platform's spelling: Windows reads a path without a drive as relative.
+    let root = if cfg!(windows) {
+        r"C:\fixture"
+    } else {
+        "/fixture"
+    };
+    let owner = &Path::new(root).join("installed-tools");
+    let isolated = &Path::new(root).join("release-state");
     assert_eq!(
         tool_home_from(Some(owner.into()), Some(isolated.into())),
         Some(owner.into())
@@ -936,6 +942,16 @@ fn installed_tools_can_be_selected_without_restoring_the_test_home() {
         tool_home_from(Some("relative".into()), Some(isolated.into())),
         Some(isolated.into())
     );
+    if cfg!(windows) {
+        assert_eq!(
+            tool_home_from(
+                Some(r"\fixture\installed-tools".into()),
+                Some(isolated.into())
+            ),
+            Some(isolated.into()),
+            "a rooted path with no drive names a folder on whichever drive is current"
+        );
+    }
 }
 
 /// A SITE SPAWNS THE OS'S OWN PROGRAM BY THE ONE PATH ITS ROW LISTS (§9 A41): the first of

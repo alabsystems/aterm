@@ -97,6 +97,7 @@ fn row() -> ItemReport {
             },
         }),
         stood_aside: Some(StoodAside::Offline("no network".into())),
+        waits_on: None,
         essential: true,
         elapsed_ms: Some(12),
     }
@@ -160,6 +161,17 @@ fn a_row_round_trips_through_json_with_every_new_field() {
             remedy,
         });
         r.stood_aside = Some(StoodAside::Lock("held".into()));
+        rows.push(r);
+    }
+    for aside in [
+        StoodAside::Lock("held".into()),
+        StoodAside::Offline("silent".into()),
+        StoodAside::Absent("none there".into()),
+        StoodAside::Waiting("an admin".into()),
+        StoodAside::Permission("refused".into()),
+    ] {
+        let mut r = row();
+        r.stood_aside = Some(aside);
         rows.push(r);
     }
     for r in rows {
@@ -235,6 +247,7 @@ fn a_report_round_trips_in_the_one_schema() {
 fn standing_aside_ends_with_the_reason_specific_exit_status() {
     assert_eq!(StoodAside::Lock(String::new()).exit_status(), 75);
     assert_eq!(StoodAside::Offline(String::new()).exit_status(), 69);
+    assert_eq!(StoodAside::Absent(String::new()).exit_status(), 69);
     assert_eq!(StoodAside::Waiting(String::new()).exit_status(), 75);
     assert_eq!(StoodAside::Permission(String::new()).exit_status(), 77);
 }

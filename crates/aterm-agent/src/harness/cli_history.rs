@@ -7,24 +7,26 @@
 //! beneath ([`alab_seen::history`]); with no name, every roster row's, in roster order. Only the
 //! account's own readings count: its label's series and, by its keys, any other of this Mac's
 //! series that holds its rows (a renamed row's), each row judged by the keys it carries
-//! ([`judged`]). On a Mac whose roster has one login, the walls its home's transcripts record of
+//! (the fold is [`crate::harness::account_history`]'s, which the Account card shares). On a Mac whose roster has one login, the walls its home's transcripts record of
 //! windows the series holds no word of join the home's row's days ([`account_backfill`], marked
 //! `(backfill)`). It stores nothing of its own: no compaction runs and no derived or backfilled
 //! row is kept. Nothing calls a provider, and neither a ledger row's free text nor a transcript's
 //! text is printed.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use aterm_json::{Map, Value};
 
 use super::{Cli, Env, home_profile, no_home_for, put_time, stats_label};
 use crate::harness::account_backfill::{self, Cut, Walls};
-use crate::harness::account_series::{self, Day, DayFive, DayWeek, Keys, Said, SeriesRow, Stored};
-use crate::harness::account_stats::{self, day_of, hm, percent, span as span_word};
+use crate::harness::account_history::{
+    Happened, HistoryDay, HistoryWho, RESET_USED, Series, Span, by_key, days_of, gather,
+};
+use crate::harness::account_series::{self, SeriesRow};
+use crate::harness::account_stats::{self, day_of, hm, span as span_word};
 use crate::harness::accounts::{self, SESSION_LIMIT, WEEK_LIMIT, WEEK_WINDOW_S};
 use crate::harness::alab_seen;
 use crate::harness::profile::AccountKey;
@@ -32,40 +34,20 @@ use crate::harness::profile::AccountKey;
 const DOT: &str = " \u{b7} ";
 const DAY_S: i64 = 86_400;
 
-/// The account a block is about: its row's label here, its lab key and its account key, as many
-/// as are known, and the name the block goes by.
+/// The account a block is about ([`HistoryWho`]: its row's label here, its lab key and its
+/// account key, as many as are known) and the name the block goes by.
 #[derive(Debug, Clone)]
 struct Who {
-    label: Option<String>,
-    pk: Option<String>,
-    key: Option<AccountKey>,
+    of: HistoryWho,
     name: String,
 }
 
 impl Who {
     fn asked(&self) -> alab_seen::Asked {
         alab_seen::Asked {
-            label: self.label.clone(),
-            pk: self.pk.clone(),
+            label: self.of.label.clone(),
+            pk: self.of.pk.clone(),
         }
-    }
-
-    /// The keys that tell this account's series rows from another's.
-    fn keys(&self) -> Keys<'_> {
-        Keys {
-            ac: self.pk.as_deref(),
-            key: self.key,
-        }
-    }
-
-    /// The texts a series row of this account carries (its lab key, its account key), which a
-    /// file that may hold one contains ([`by_key`]).
-    fn needles(&self) -> Vec<String> {
-        self.pk
-            .iter()
-            .cloned()
-            .chain(self.key.map(|key| key.to_string()))
-            .collect()
     }
 }
 
@@ -104,9 +86,11 @@ fn resolve(
     if let Some(asked) = alab_seen::resolve(cli, name, &records.roster, lab) {
         let key = key_in(state, asked.label.as_deref(), asked.pk.as_deref());
         return Some(Who {
-            label: asked.label,
-            pk: asked.pk,
-            key,
+            of: HistoryWho {
+                label: asked.label,
+                pk: asked.pk,
+                key,
+            },
             name: name.to_owned(),
         });
     }
@@ -142,590 +126,18 @@ fn resolve(
     };
     Some(Who {
         name: label.clone().unwrap_or_else(|| name.to_owned()),
-        label,
-        pk,
-        key: Some(key),
+        of: HistoryWho {
+            label,
+            pk,
+            key: Some(key),
+        },
     })
 }
 
-/// The span a history covers: `[from, to]`, `s` seconds.
-#[derive(Debug, Clone, Copy)]
-struct Span {
-    from: i64,
-    to: i64,
-    s: i64,
-}
-
-impl Span {
-    const fn holds(self, t: i64) -> bool {
-        t >= self.from && t <= self.to
-    }
-}
-
-/// Whose a series row is ([`judged`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Whose {
-    /// It carries a key of the account and none of another.
-    Mine,
-    /// It carries another account's key.
-    Theirs,
-    /// Its keys say neither: it carries none, or none of a kind the account's are known in.
-    Unknown,
-}
-
-/// The lines of one series file that are the account `keys` names, in time order (a tie in file
-/// order, so an event precedes the reading of its transaction): a `fig`, `close` or `day` row by
-/// the keys it carries ([`Keys::names`], [`Keys::others`]); any other line (a beat, a plan, an
-/// event, a kind this build does not read) as the last `fig` row before it, the reading it
-/// follows, so another account's sign-in is in the history of the account that held the home. A
-/// line whose keys say neither counts only in the label's own file (`own`): where a record held
-/// no key, its label's rows are its.
-fn judged(mut lines: Vec<Stored>, keys: Keys<'_>, own: bool) -> Vec<Stored> {
-    lines.sort_by_key(|line| line.t);
-    let mut holder = Whose::Unknown;
-    let mut out = Vec::new();
-    for line in lines {
-        let whose = match line.row.as_ref().and_then(|row| Some((row, row.keys()?))) {
-            Some((row, carried)) => {
-                let whose = if keys.others(carried) {
-                    Whose::Theirs
-                } else if keys.names(carried) {
-                    Whose::Mine
-                } else {
-                    Whose::Unknown
-                };
-                if matches!(row.said, Said::Fig { .. }) {
-                    holder = whose;
-                }
-                whose
-            }
-            None => holder,
-        };
-        if whose == Whose::Mine || (own && whose == Whose::Unknown) {
-            out.push(line);
-        }
-    }
-    out
-}
-
-/// For each of `whos` (an account and its label's own series file, where it has one), the other
-/// series files of `machine`'s in the series directory `dir` whose text names one of its keys
-/// ([`Who::needles`]): where a reading of it may be, which [`judged`] then tells row by row.
-/// Another machine's file is never one: a history is of this Mac's readings. Each file is read
-/// once, whatever the number of accounts.
-fn by_key(dir: &Path, machine: &str, whos: &[(Who, Option<PathBuf>)]) -> Vec<Vec<PathBuf>> {
-    let mut out = vec![Vec::new(); whos.len()];
-    let needles: Vec<Vec<String>> = whos.iter().map(|(who, _)| who.needles()).collect();
-    if needles.iter().all(Vec::is_empty) {
-        return out;
-    }
-    let paths = account_series::series_paths(dir).unwrap_or_default();
-    for path in paths
-        .iter()
-        .filter(|path| account_series::is_of_machine(path, machine))
-    {
-        let Ok(Some(text)) = accounts::read_bounded(path, account_series::READ_MAX) else {
-            continue;
-        };
-        for (found, ((_, own), needles)) in out.iter_mut().zip(whos.iter().zip(&needles)) {
-            if own.as_ref() != Some(path) && needles.iter().any(|n| text.contains(n.as_str())) {
-                found.push(path.clone());
-            }
-        }
-    }
-    out
-}
-
-/// What this Mac's series hold of one account.
-#[derive(Debug, Default)]
-struct Series {
-    /// Each file's rows of the account, by `t`.
-    files: Vec<Vec<SeriesRow>>,
-    /// The closes the backfill booked to it inside the span ([`account_backfill::book`]), by
-    /// `t`: in memory only.
-    backfill: Vec<SeriesRow>,
-    /// The newest instant its files saw the home taken over by it from another account
-    /// ([`account_series::taken_over`], over every row of them, another account's among them).
-    taken_over: Option<i64>,
-    /// Their stored lines inside the span, by `t`, where `--rows` asked for them.
-    stored: Vec<(i64, String)>,
-    /// The oldest of their rows' `t`.
-    oldest: Option<i64>,
-}
-
-/// The account `who`'s rows of `files` (each with whether it is the label's own), read once
-/// each ([`account_series::stored_rows`]) and judged ([`judged`]), with `stored`, its lines
-/// inside `span` as stored, and, from every row of them, when they saw the home taken over by
-/// it at `now` ([`Series::taken_over`]).
-fn gather(files: &[(PathBuf, bool)], who: &Who, span: Span, stored: bool, now: i64) -> Series {
-    let keys = who.keys();
-    let mut series = Series::default();
-    let mut every: Vec<SeriesRow> = Vec::new();
-    for (path, own) in files {
-        let lines = account_series::stored_rows(path);
-        every.extend(lines.iter().filter_map(|line| line.row.clone()));
-        let kept = judged(lines, keys, *own);
-        if kept.is_empty() {
-            continue;
-        }
-        let mut rows = Vec::with_capacity(kept.len());
-        for line in kept {
-            series.oldest = Some(series.oldest.map_or(line.t, |t| t.min(line.t)));
-            if stored && span.holds(line.t) {
-                series.stored.push((line.t, line.line));
-            }
-            rows.extend(line.row);
-        }
-        series.files.push(rows);
-    }
-    series.stored.sort_by_key(|(t, _)| *t);
-    series.taken_over = account_series::taken_over(&every, keys, now);
-    series
-}
-
-/// One file's closes: those it stores and those its compaction would derive
-/// ([`account_series::derive_closes`]), one per window anchor.
-fn file_closes(rows: &[SeriesRow], now: i64) -> Vec<SeriesRow> {
-    rows.iter()
-        .filter(|row| matches!(row.said, Said::Close(_)))
-        .cloned()
-        .chain(account_series::derive_closes(rows, now))
-        .collect()
-}
-
-/// `b`'s close of an anchor folded into `a`'s: one window whose figures two files hold (a row
-/// renamed inside it), from its first figure to its last, its peak, its readings and its resets
-/// used, ended at the earlier end either says.
-fn fold_close(a: &mut SeriesRow, b: SeriesRow) {
-    let ended = a.t.min(b.t);
-    let (Said::Close(into), Said::Close(other)) = (&mut a.said, b.said) else {
-        return;
-    };
-    if other.last > into.last {
-        into.last = other.last;
-        into.end = other.end;
-    }
-    into.first = into.first.min(other.first);
-    into.peak = into.peak.max(other.peak);
-    into.walled = into.peak >= 1000;
-    into.n = into.n.saturating_add(other.n);
-    into.early |= other.early;
-    let epochs: BTreeSet<i64> = into.epochs.iter().copied().chain(other.epochs).collect();
-    let epochs: Vec<i64> = epochs.into_iter().collect();
-    into.epochs = epochs[epochs.len().saturating_sub(account_series::EPOCHS_MAX)..].to_vec();
-    into.ac = into.ac.take().or(other.ac);
-    into.key = into.key.or(other.key);
-    let last = into.last;
-    a.t = ended.max(last);
-}
-
-/// The account's closes across its files, one per window anchor ([`fold_close`]), by `t`.
-fn merged_closes(closes: impl IntoIterator<Item = SeriesRow>) -> Vec<SeriesRow> {
-    let mut by: BTreeMap<(&'static str, i64), SeriesRow> = BTreeMap::new();
-    for row in closes {
-        let Said::Close(c) = &row.said else {
-            continue;
-        };
-        let at = (c.w, c.reset);
-        match by.remove(&at) {
-            Some(mut held) => {
-                fold_close(&mut held, row);
-                by.insert(at, held);
-            }
-            None => {
-                by.insert(at, row);
-            }
-        }
-    }
-    let mut out: Vec<SeriesRow> = by.into_values().collect();
-    out.sort_by_key(|row| row.t);
-    out
-}
-
-/// One file's days inside `span`: its stored `day` rows (`true`), each made from every reading
-/// of its day in that file and naming, beside the anchors it stores, those of the five-hour
-/// `closes` the file still holds inside it (so a row that stores none, written before rows named
-/// them, names the windows its file's closes still do), and the summaries
-/// ([`account_series::day_summaries`], `false`) of its readings and `closes` that no stored row
-/// covers, by instant, so a day stored under another zone is not counted again. A beat counts
-/// as the reading it repeats.
-fn file_days(
-    rows: &[SeriesRow],
-    closes: &[SeriesRow],
-    span: Span,
-    tz_at: fn(i64) -> i64,
-) -> Vec<(SeriesRow, bool)> {
-    let stored: Vec<&SeriesRow> = rows
-        .iter()
-        .filter(|row| matches!(row.said, Said::Day(_)))
-        .collect();
-    let covers: BTreeMap<i64, i64> = stored
-        .iter()
-        .filter_map(|row| match &row.said {
-            Said::Day(d) => Some((row.t, row.t.saturating_add(d.span_s))),
-            _ => None,
-        })
-        .collect();
-    let covered = |t: i64| {
-        covers
-            .range(..=t)
-            .next_back()
-            .is_some_and(|(_, end)| t < *end)
-    };
-    let mut last_fig: Option<&Said> = None;
-    let mut loose: Vec<SeriesRow> = Vec::new();
-    for row in rows {
-        let said = match &row.said {
-            Said::Fig { .. } => {
-                last_fig = Some(&row.said);
-                &row.said
-            }
-            Said::Beat => last_fig.unwrap_or(&row.said),
-            Said::Plan(_) | Said::Close(_) | Said::Day(_) | Said::Event(_) => continue,
-        };
-        if !covered(row.t) {
-            loose.push(SeriesRow {
-                t: row.t,
-                by: row.by.clone(),
-                said: said.clone(),
-            });
-        }
-    }
-    loose.extend(closes.iter().filter(|c| !covered(c.t)).cloned());
-    let summaries =
-        account_series::day_summaries(&loose, span.from, span.to.saturating_add(1), tz_at);
-    stored
-        .into_iter()
-        .filter(|row| {
-            matches!(&row.said, Said::Day(d)
-                if row.t <= span.to && row.t.saturating_add(d.span_s) > span.from)
-        })
-        .map(|row| {
-            let mut row = row.clone();
-            let t = row.t;
-            if let Said::Day(d) = &mut row.said
-                && let Some(five) = d.five_hour.as_mut()
-            {
-                let end = t.saturating_add(d.span_s);
-                let mut anchors: BTreeMap<i64, bool> = five.anchors.iter().copied().collect();
-                for close in closes.iter().filter(|c| c.t >= t && c.t < end) {
-                    if let Said::Close(c) = &close.said
-                        && c.w == SESSION_LIMIT
-                    {
-                        *anchors.entry(c.reset).or_default() |= c.walled;
-                    }
-                }
-                five.anchors = anchors.into_iter().collect();
-            }
-            (row, true)
-        })
-        .chain(summaries.into_iter().map(|row| (row, false)))
-        .collect()
-}
-
-/// A count of things as a day's count.
-fn counted(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
-}
-
-/// The windows `f` counts but names no anchor of ([`DayFive::anchors`]), and how many of those
-/// read full.
-fn unnamed(f: &DayFive) -> (u32, u32) {
-    let full = f.anchors.iter().filter(|(_, walled)| *walled).count();
-    (
-        f.closed.saturating_sub(counted(f.anchors.len())),
-        f.walled.saturating_sub(counted(full)),
-    )
-}
-
-/// `f` naming `anchors` in place of its own, with every window it counts but names no anchor of.
-fn naming(f: &DayFive, anchors: BTreeMap<i64, bool>) -> DayFive {
-    let (closed, walled) = unnamed(f);
-    let full = anchors.values().filter(|walled| **walled).count();
-    DayFive {
-        closed: counted(anchors.len()).saturating_add(closed),
-        peak: f.peak,
-        walled: counted(full).saturating_add(walled),
-        anchors: anchors.into_iter().collect(),
-    }
-}
-
-/// Two parts of one local day's five-hour windows as one (from two files, or two parts of one):
-/// each window once by its anchor, full where either part read it full, and beside those every
-/// window a part counted but names no anchor of, which nothing tells from another's; the higher
-/// peak.
-fn add_five(a: &DayFive, b: &DayFive) -> DayFive {
-    let mut anchors: BTreeMap<i64, bool> = BTreeMap::new();
-    for (reset, walled) in a.anchors.iter().chain(&b.anchors) {
-        *anchors.entry(*reset).or_default() |= *walled;
-    }
-    let (closed, walled) = unnamed(b);
-    let mut sum = naming(a, anchors);
-    sum.closed = sum.closed.saturating_add(closed);
-    sum.walled = sum.walled.saturating_add(walled);
-    sum.peak = a.peak.max(b.peak);
-    sum
-}
-
-/// Each five-hour window `parts` (local days by date, from every file) name by anchor, named only
-/// on the earliest date a part names it, full where any part read it full: two files' closes of
-/// one window end on two dates where one file saw the next window begin early (a limit reset
-/// used, another login on the home) and the other, a renamed label's, did not and closed it at
-/// its reset, and the window ended at the earlier. A part keeps every window it counts but names
-/// no anchor of.
-fn on_first_dates(parts: &mut [(i64, Day)]) {
-    let mut first: BTreeMap<i64, (i64, bool)> = BTreeMap::new();
-    for (date, d) in parts.iter() {
-        for (reset, walled) in d.five_hour.iter().flat_map(|f| &f.anchors) {
-            let at = first.entry(*reset).or_insert((*date, false));
-            at.0 = at.0.min(*date);
-            at.1 |= *walled;
-        }
-    }
-    for (date, d) in parts.iter_mut() {
-        if let Some(five) = d.five_hour.as_mut() {
-            let kept: BTreeMap<i64, bool> = five
-                .anchors
-                .iter()
-                .filter_map(|(reset, _)| {
-                    let (on, full) = first.get(reset)?;
-                    (on == date).then_some((*reset, *full))
-                })
-                .collect();
-            *five = naming(five, kept);
-        }
-    }
-}
-
-/// `d` added to `into`, the same local day from another file or another part of one: readings
-/// summed, each five-hour window once ([`add_five`]), the earlier week's first figure and the
-/// later one's last (by its reset, then by its figure: in one week a figure only rises but where
-/// a limit reset was used).
-fn add_day(into: &mut Option<Day>, d: &Day) {
-    let Some(a) = into.as_mut() else {
-        *into = Some(d.clone());
-        return;
-    };
-    a.n = a.n.saturating_add(d.n);
-    a.five_hour = match (a.five_hour.take(), &d.five_hour) {
-        (Some(x), Some(y)) => Some(add_five(&x, y)),
-        (x, y) => x.or_else(|| y.clone()),
-    };
-    a.seven_day = match (a.seven_day, d.seven_day) {
-        (Some(x), Some(y)) => {
-            let first = if (y.reset, y.first) < (x.reset, x.first) {
-                y.first
-            } else {
-                x.first
-            };
-            let last = if (y.reset, y.last) > (x.reset, x.last) {
-                y
-            } else {
-                x
-            };
-            Some(DayWeek {
-                first,
-                last: last.last,
-                reset: last.reset,
-                closed: x.closed || y.closed,
-            })
-        }
-        (x, y) => x.or(y),
-    };
-}
-
-/// Something that happened on a day: a series `event` row's word, or `reset-used`.
-#[derive(Debug, Clone)]
-struct Happened {
-    t: i64,
-    e: String,
-    w: Option<String>,
-}
-
-/// The word a limit reset used is said by.
-const RESET_USED: &str = "reset-used";
-
-/// One local day of a history.
-#[derive(Debug)]
-struct DayOut {
-    /// Its local midnight.
-    t: i64,
-    /// The zone's offset then.
-    tz_s: i64,
-    /// Its length.
-    span_s: i64,
-    /// Whether a stored `day` row gave `t`, `tz_s` and `span_s` (the zone it was stored under).
-    stored: bool,
-    /// What the series says of it.
-    sum: Option<Day>,
-    /// The five-hour window still open, its last figure, on the day of the row that read it.
-    open_x10: Option<u32>,
-    /// What happened, by when.
-    events: Vec<Happened>,
-    /// Its ledger and journal lines, oldest first.
-    lines: Vec<String>,
-    /// The windows whose part of the day counts a close the backfill booked.
-    backfilled: BTreeSet<&'static str>,
-}
-
-impl DayOut {
-    /// When a new week began this day: its week's reset less a week, inside the day.
-    fn new_week(&self) -> Option<i64> {
-        let week = self.sum.as_ref()?.seven_day?;
-        let began = week.reset.saturating_sub(WEEK_WINDOW_S);
-        (began >= self.t && began < self.t.saturating_add(self.span_s)).then_some(began)
-    }
-}
-
-/// Local day `day`'s entry in `days`, made empty under `tz_at` where it holds none yet.
-fn day_entry(days: &mut BTreeMap<i64, DayOut>, day: i64, tz_at: fn(i64) -> i64) -> &mut DayOut {
-    days.entry(day).or_insert_with(|| {
-        let t = account_series::midnight(day, tz_at);
-        DayOut {
-            t,
-            tz_s: tz_at(t),
-            span_s: account_series::midnight(day.saturating_add(1), tz_at).saturating_sub(t),
-            stored: false,
-            sum: None,
-            open_x10: None,
-            events: Vec::new(),
-            lines: Vec::new(),
-            backfilled: BTreeSet::new(),
-        }
-    })
-}
-
-/// The days of `span` that hold anything, oldest first, under `tz_at`. Each file gives its days
-/// ([`file_days`]: its stored `day` rows and, over what they do not cover, the summaries of its
-/// readings and closes), and so do the backfill's closes, as one more file of closes alone, each
-/// part of a day they count in marked ([`DayOut::backfilled`]); these are added up by local date
-/// ([`add_day`]), so on a day two files both hold (a row renamed that day) each five-hour window
-/// counts once by its anchor, whether a file names it by a `day` row alone or by a close it
-/// still holds, and a window two files' closes put on two dates counts on the earlier
-/// ([`on_first_dates`]). Over the account's rows of every file with their closes folded by anchor
-/// ([`merged_closes`]): the five-hour window still open, on the day of the row that read it,
-/// the series' events and each limit reset used ([`account_series::resets_used`]). And
-/// `lines`, the ledger and journal lines, each on its day.
-fn days_of(
-    series: &Series,
-    lines: &[(i64, String)],
-    span: Span,
-    tz_at: fn(i64) -> i64,
-    now: i64,
-) -> Vec<DayOut> {
-    let mut days: BTreeMap<i64, DayOut> = BTreeMap::new();
-    let local = |t: i64| account_series::local_day(t, tz_at);
-    // The account's files, and last the backfill's closes.
-    let files: Vec<&Vec<SeriesRow>> = series
-        .files
-        .iter()
-        .chain(std::iter::once(&series.backfill))
-        .collect();
-    let backfill_at = series.files.len();
-    let own_closes: Vec<Vec<SeriesRow>> = files.iter().map(|rows| file_closes(rows, now)).collect();
-    let closes = merged_closes(own_closes.iter().flatten().cloned());
-    // Each file's days by date, with where each came from: its file, and its stored row's
-    // midnight (the row's zone and length are its day's own, which `on_first_dates` keeps).
-    let mut from: Vec<(usize, Option<i64>)> = Vec::new();
-    let mut parts: Vec<(i64, Day)> = Vec::new();
-    for (f, (rows, closes)) in files.iter().zip(&own_closes).enumerate() {
-        for (row, stored) in file_days(rows, closes, span, tz_at) {
-            let Said::Day(d) = row.said else {
-                continue;
-            };
-            let date = row.t.saturating_add(d.tz_s).div_euclid(DAY_S);
-            from.push((f, stored.then_some(row.t)));
-            parts.push((date, d));
-        }
-    }
-    on_first_dates(&mut parts);
-    for ((f, stored), (date, d)) in from.into_iter().zip(&parts) {
-        let day = day_entry(&mut days, *date, tz_at);
-        if let Some(t) = stored
-            && !day.stored
-        {
-            (day.t, day.tz_s, day.span_s) = (t, d.tz_s, d.span_s);
-            day.stored = true;
-        }
-        if f == backfill_at {
-            if d.five_hour.as_ref().is_some_and(|five| five.closed > 0) {
-                day.backfilled.insert(SESSION_LIMIT);
-            }
-            if d.seven_day.is_some() {
-                day.backfilled.insert(WEEK_LIMIT);
-            }
-        }
-        add_day(&mut day.sum, d);
-    }
-    // Every file's rows of the account as one series, its closes folded by anchor.
-    let mut rows: Vec<SeriesRow> = files
-        .iter()
-        .copied()
-        .flatten()
-        .filter(|row| !matches!(row.said, Said::Close(_)))
-        .cloned()
-        .chain(closes.iter().cloned())
-        .collect();
-    rows.sort_by_key(|row| row.t);
-    let closed: BTreeSet<i64> = closes
-        .iter()
-        .filter_map(|row| match &row.said {
-            Said::Close(c) if c.w == SESSION_LIMIT => Some(c.reset),
-            _ => None,
-        })
-        .collect();
-    if let Some((t, open)) = rows
-        .iter()
-        .filter_map(|row| Some((row.t, row.fig(SESSION_LIMIT)?)))
-        .filter(|(t, f)| !closed.contains(&f.reset) && f.reset > now && span.holds(*t))
-        .max_by_key(|(t, _)| *t)
-    {
-        day_entry(&mut days, local(t), tz_at).open_x10 = Some(open.pct_x10);
-    }
-    for row in &rows {
-        if let Said::Event(e) = &row.said {
-            let at = e.at.unwrap_or(row.t);
-            if span.holds(at) {
-                day_entry(&mut days, local(at), tz_at)
-                    .events
-                    .push(Happened {
-                        t: at,
-                        e: e.e.as_str().to_owned(),
-                        w: e.w.clone(),
-                    });
-            }
-        }
-    }
-    for w in [SESSION_LIMIT, WEEK_LIMIT] {
-        for at in account_series::resets_used(&rows, w, now) {
-            if span.holds(at) {
-                day_entry(&mut days, local(at), tz_at)
-                    .events
-                    .push(Happened {
-                        t: at,
-                        e: RESET_USED.to_owned(),
-                        w: Some(w.to_owned()),
-                    });
-            }
-        }
-    }
-    for (t, line) in lines {
-        if span.holds(*t) {
-            day_entry(&mut days, local(*t), tz_at)
-                .lines
-                .push(line.clone());
-        }
-    }
-    let mut out: Vec<DayOut> = days.into_values().collect();
-    for day in &mut out {
-        day.events.sort_by_key(|e| e.t);
-    }
-    out
-}
-
-/// A whole percent.
-fn pct(x10: u32) -> String {
-    percent(x10, false)
+/// What is left of a window at `x10` tenths used, in whole percent: `29% left`
+/// ([`crate::harness::left`]).
+fn left(x10: u32) -> String {
+    crate::harness::left::words(x10)
 }
 
 /// An instant on its own local clock: `14:10`.
@@ -747,10 +159,11 @@ fn happened_words(e: &Happened, tz_at: fn(i64) -> i64) -> String {
     }
 }
 
-/// One day's line: `Sat Nov 7  week 58% → 71% (resets Sun Nov 8 20:50) · 5h 3 windows, peak
-/// 100%, 1 full · reset used 14:10`; the five-hour peak is the day's highest five-hour figure. A
-/// part that counts a close the backfill booked ends `(backfill)`.
-fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
+/// One day's line: `Sat Nov 7  week 42% → 29% left (resets Sun Nov 8 20:50) · 5h 3 windows,
+/// lowest 0% left, 1 used up · reset used 14:10`; the five-hour lowest is what was left at the
+/// day's highest five-hour figure. A part that counts a close the backfill booked ends
+/// `(backfill)`.
+fn day_line(day: &HistoryDay, tz_at: fn(i64) -> i64) -> String {
     let marked = |w: &str| {
         if day.backfilled.contains(w) {
             " (backfill)"
@@ -762,9 +175,13 @@ fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
     let mut parts = Vec::new();
     if let Some(week) = day.sum.as_ref().and_then(|s| s.seven_day) {
         let figures = if week.first == week.last {
-            pct(week.last)
+            left(week.last)
         } else {
-            format!("{} \u{2192} {}", pct(week.first), pct(week.last))
+            format!(
+                "{}% \u{2192} {}",
+                crate::harness::left::exact(week.first),
+                left(week.last)
+            )
         };
         let mut words = format!("resets {}", at(week.reset));
         if let Some(began) = day.new_week() {
@@ -779,12 +196,12 @@ fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
             1 => bits.push("1 window".to_owned()),
             n => bits.push(format!("{n} windows")),
         }
-        bits.push(format!("peak {}", pct(five.peak)));
+        bits.push(format!("lowest {}", left(five.peak)));
         if five.walled > 0 {
-            bits.push(format!("{} full", five.walled));
+            bits.push(format!("{} used up", five.walled));
         }
         if let Some(open) = day.open_x10 {
-            bits.push(format!("open {}", pct(open)));
+            bits.push(format!("open {}", left(open)));
         }
         parts.push(format!("5h {}{}", bits.join(", "), marked(SESSION_LIMIT)));
     }
@@ -803,7 +220,7 @@ fn date_of(t: i64, tz_s: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn day_json(day: &DayOut) -> Value {
+fn day_json(day: &HistoryDay) -> Value {
     let mut o = Map::new();
     o.insert("date".to_owned(), Value::from(date_of(day.t, day.tz_s)));
     put_time(&mut o, "t", Some(day.t));
@@ -947,14 +364,14 @@ struct Booked {
 struct Block {
     who: Who,
     lines: Vec<(i64, String)>,
-    series: Option<(Series, Vec<DayOut>, Booked)>,
+    series: Option<(Series, Vec<HistoryDay>, Booked)>,
 }
 
 impl Block {
     /// Whether the block holds nothing to go by: no row, no lab key and no series row.
     fn is_unknown(&self) -> bool {
-        self.who.label.is_none()
-            && self.who.pk.is_none()
+        self.who.of.label.is_none()
+            && self.who.of.pk.is_none()
             && self
                 .series
                 .as_ref()
@@ -968,8 +385,8 @@ impl Block {
     /// `series: false`.
     fn json(&self, span: Span, (machine, journal, rows): (&str, bool, bool)) -> Map {
         let mut o = Map::new();
-        o.insert("label".to_owned(), Value::from(self.who.label.clone()));
-        o.insert("ac".to_owned(), Value::from(self.who.pk.clone()));
+        o.insert("label".to_owned(), Value::from(self.who.of.label.clone()));
+        o.insert("ac".to_owned(), Value::from(self.who.of.pk.clone()));
         o.insert("journal".to_owned(), Value::from(journal));
         o.insert(
             "lines".to_owned(),
@@ -1135,9 +552,11 @@ pub(super) fn run(
             .map(|row| {
                 let pk = alab_seen::row_key(cli, row);
                 Who {
-                    label: Some(row.label.clone()),
-                    key: key_in(&records.state, Some(&row.label), pk.as_deref()),
-                    pk,
+                    of: HistoryWho {
+                        label: Some(row.label.clone()),
+                        key: key_in(&records.state, Some(&row.label), pk.as_deref()),
+                        pk,
+                    },
                     name: row.label.clone(),
                 }
             })
@@ -1154,6 +573,7 @@ pub(super) fn run(
         .into_iter()
         .map(|who| {
             let own = who
+                .of
                 .label
                 .as_deref()
                 .filter(|_| cli == Cli::Claude)
@@ -1162,7 +582,11 @@ pub(super) fn run(
         })
         .collect();
     let elsewhere = if cli == Cli::Claude {
-        by_key(&account_series::dir_in(&env.state), machine, &whos)
+        let asked: Vec<(&HistoryWho, Option<&std::path::Path>)> = whos
+            .iter()
+            .map(|(who, own)| (&who.of, own.as_deref()))
+            .collect();
+        by_key(&account_series::dir_in(&env.state), machine, &asked)
     } else {
         vec![Vec::new(); whos.len()]
     };
@@ -1173,13 +597,13 @@ pub(super) fn run(
     let home = (cli == Cli::Claude).then(|| {
         Home::of(env, &records, span, |label| {
             whos.iter()
-                .any(|(who, _)| who.label.as_deref() == Some(label))
+                .any(|(who, _)| who.of.label.as_deref() == Some(label))
         })
     });
     let block_of = |who: Who, own: Option<PathBuf>, elsewhere: Vec<PathBuf>| {
         let journal = seen
             .as_deref()
-            .zip(who.pk.as_deref())
+            .zip(who.of.pk.as_deref())
             .and_then(|(seen, pk)| seen.accounts.get(pk));
         let lines = alab_seen::history(&who.asked(), &ledger, journal);
         let series = home.as_ref().map(|home| {
@@ -1188,9 +612,9 @@ pub(super) fn run(
                 .map(|path| (path, true))
                 .chain(elsewhere.into_iter().map(|path| (path, false)))
                 .collect();
-            let mut series = gather(&files, &who, span, rows, env.now);
+            let mut series = gather(&files, &who.of, span, rows, env.now);
             let booked = match &home.read {
-                _ if who.label.as_deref() != Some(home.label.as_str()) => Booked {
+                _ if who.of.label.as_deref() != Some(home.label.as_str()) => Booked {
                     booked: 0,
                     cut: None,
                     why: Some("not-the-home"),
@@ -1205,7 +629,7 @@ pub(super) fn run(
                         walls,
                         &series.files,
                         (*another_seen).max(series.taken_over),
-                        ((who.pk.as_deref(), who.key), machine),
+                        ((who.of.pk.as_deref(), who.of.key), machine),
                         env.now,
                     );
                     series.backfill.retain(|close| span.holds(close.t));

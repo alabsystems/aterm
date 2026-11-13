@@ -17,6 +17,8 @@ description = "aterm crash restore, headless: the per-session journal region's l
 workspace = true
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # The engine the journal checkpoints and the recovery replays into, with the
 # serde seam on: a keyframe's scalars are a `CheckpointMeta` (the screen
 # carry's own wire form), its grids the binary Line codec.

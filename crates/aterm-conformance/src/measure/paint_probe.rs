@@ -57,7 +57,7 @@ const WARM_ROW: PaintRow = PaintRow {
     keys: "r,a,i,n,b,o,w,k,i,t,t,y",
     expect: Expect::Ink,
     capture: Capture::PinnedVideo,
-    style: Style::Flying,
+    style: Style::Rainbow,
     companion: None,
     split: None,
     reach: None,

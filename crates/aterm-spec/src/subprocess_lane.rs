@@ -19,7 +19,7 @@
 //! authoritative: a missing, malformed, saturated, or unsupported pool refuses the
 //! test before it spawns. Only an absent configuration uses the process-local pool,
 //! bounded from `RUST_TEST_THREADS`, `CARGO_BUILD_JOBS`, or
-//! `std::thread::available_parallelism`.
+//! `aterm_cores::available_parallelism`.
 //! The verifier owns that private layout until its children finish. Admission detects same-path
 //! replacement during acquisition and thread-local re-entry, and refuses link/reparse-point
 //! members, but this protocol is not a confinement boundary against same-account code deliberately
@@ -57,8 +57,10 @@ const POLL_CAP: Duration = Duration::from_millis(20);
 /// Compute the number of concurrent multi-process test stacks admitted for `cores` granted CPUs.
 ///
 /// Single-core grants admit one stack; multi-core grants admit `(cores / 2).clamp(2, 8)` stacks so
-/// concurrent test binaries share one host-wide process-tree ceiling without starving multi-step
-/// suites on loaded hosts.
+/// one run's concurrent test binaries share one process-tree ceiling without starving multi-step
+/// suites on loaded hosts. Each run has its own pool; across runs, each test binary under
+/// `aterm-verify` claims its measured use, its stacks' included, in the capacity ledger, up to the
+/// stage share, and a plain `targo --unverified test` claims nothing (KI-1103-3).
 #[must_use]
 pub const fn slots_for_cores(cores: u32) -> usize {
     if cores <= 1 {
@@ -120,7 +122,7 @@ pub fn default_cores_from(
 }
 
 fn default_cores() -> u32 {
-    let host = std::thread::available_parallelism()
+    let host = aterm_cores::available_parallelism()
         .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
         .unwrap_or(2);
     default_cores_from(

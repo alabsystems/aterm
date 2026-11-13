@@ -1313,10 +1313,9 @@ fn fetch_main_reads_main_into_the_record_ref_alone_agh() {
     on_agh(case_fetch_main_reads_main_into_the_record_ref_alone);
 }
 
-/// The API names the main of record: a fetch that brings another main (the API read before
-/// main moved, or git transported another) is `Unreachable`, and the record ref is removed.
+/// A stale REST replica cannot determine main or consume any core quota.
 #[test]
-fn a_fetched_main_the_api_does_not_name_is_unreachable_and_dropped() {
+fn main_of_record_uses_git_even_when_rest_names_another_commit_without_rest_quota() {
     use atpkg_publish::artifact::package::MAIN_OF_RECORD;
     let w = AghWorld::new();
     let first = bare_repo(&w.dir().join("work"), &w.remote());
@@ -1324,19 +1323,15 @@ fn a_fetched_main_the_api_does_not_name_is_unreachable_and_dropped() {
     let tree = super::git(&w.remote(), &["rev-parse", "main^{tree}"]);
     let stale = super::git(&w.remote(), &["commit-tree", &tree, "-m", "stale"]);
     w.set_main(&stale);
-    let err = w
-        .host()
-        .fetch_main(&w.slug(), &checkout, MAIN_OF_RECORD)
-        .expect_err("the fetched main is not the API's");
-    assert!(matches!(err, HostError::Unreachable(_)), "{err:?}");
-    assert!(
-        super::git(&checkout, &["for-each-ref", "refs/atpkg-publish/"]).is_empty(),
-        "the record ref is removed"
-    );
-    w.set_main(&first);
+    w.fake.clear_seen();
     w.host()
         .fetch_main(&w.slug(), &checkout, MAIN_OF_RECORD)
-        .expect("the API's main");
+        .expect("the Git main is the main of record");
+    assert_eq!(super::git(&checkout, &["rev-parse", MAIN_OF_RECORD]), first);
+    assert!(
+        w.fake.seen().is_empty(),
+        "main-of-record reads consume zero REST requests, previously one"
+    );
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 

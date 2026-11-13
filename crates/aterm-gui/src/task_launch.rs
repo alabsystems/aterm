@@ -1025,7 +1025,7 @@ fn run_worker_launch(work: &Launch) {
         Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
         _ => work.model.as_deref(),
     };
-    // A worker runs with its parent's permissions (owner ruling 2026-11-02), held to its CLI's
+    // A worker runs with its parent's permissions, held to its CLI's
     // floor (`aterm_agent::harness::worker::WorkerCli::unnamed_posture`; Claude Code's auto, by
     // `aterm_agent::harness::worker::starter`), the disk-free worker included. A credit claim
     // worker (`work.chrome`) names its own mode and tools ([`worker_fresh`]).
@@ -2374,7 +2374,7 @@ fn worker_starter_of(
     };
     // A worker no session started (the harness's own, or a spawn from outside a session) has as
     // its parent the session `ls` names: its program and login stay the worker's own, and its
-    // permissions are that session's (owner ruling 2026-11-02), held to its CLI's floor as
+    // permissions are that session's, held to its CLI's floor as
     // `aterm_agent::harness::worker::starter` read them (`WorkerCli::unnamed_posture`). A parent
     // of another CLI lends nothing, and the worker keeps the posture its unstarted line names
     // (`WorkerCli::unstarted`). A claim worker names its own mode and tools ([`worker_fresh`]).

@@ -7,9 +7,9 @@ use crate::explain::WhySubject;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
 pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report|left] \
-                         [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
-                         [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
-                         jobs disk procs (cores gpu mem net take it, rows unchanged), \
+                         [scope=pane|tab|window|request|aterm|global] [instances=all] \
+                         [top=<1-64>] [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; \
+                         scope= on jobs disk procs (cores gpu mem net take it, rows unchanged), \
                          scope=pane|tab|aterm on left, depth= on \
                          disk, instances=all on overview aterm global cores gpu mem net and procs \
                          scope=aterm; or sys name job=<id>|task=<id> [--json], sys policy \
@@ -125,6 +125,8 @@ pub enum ScopeArg {
     Tab,
     /// The target's window.
     Window,
+    /// Every tab of the request that owns the target's tab (ATERM-KI-1109-3).
+    Request,
     /// This aterm instance.
     Aterm,
     /// The machine.
@@ -139,6 +141,7 @@ impl ScopeArg {
             Self::Pane => "pane",
             Self::Tab => "tab",
             Self::Window => "window",
+            Self::Request => "request",
             Self::Aterm => "aterm",
             Self::Global => "global",
         }
@@ -149,6 +152,7 @@ impl ScopeArg {
             "pane" => Self::Pane,
             "tab" => Self::Tab,
             "window" => Self::Window,
+            "request" => Self::Request,
             "aterm" => Self::Aterm,
             "global" => Self::Global,
             _ => return None,
@@ -358,7 +362,12 @@ impl SysQuery {
         if q.depth.is_some() && q.view != View::Disk {
             return Err(USAGE);
         }
-        if q.view == View::Left && matches!(q.scope, Some(ScopeArg::Window | ScopeArg::Global)) {
+        if q.view == View::Left
+            && matches!(
+                q.scope,
+                Some(ScopeArg::Window | ScopeArg::Request | ScopeArg::Global)
+            )
+        {
             return Err(USAGE);
         }
         if q.instances_all {

@@ -79,7 +79,7 @@ pub(super) fn pending_custody_fixture(
 
 #[path = "codex_grant_catalogue.rs"]
 mod catalogue;
-pub(super) use catalogue::CatalogueTransition;
+pub(super) use catalogue::{CatalogueTransition, retire_settled_refusal};
 
 #[path = "codex_grant_published_source.rs"]
 mod published_source;
@@ -2944,7 +2944,18 @@ fn with_canonical_owner_held<R>(
     if issuance.catalogue_scope.is_some() && publication.is_none() {
         return Err("global owner has no authenticated canonical publication".into());
     }
-    let anchor = codex_enrollment::OwnerAnchorWriter::new(store, writer, binding, env.now);
+    let anchor = codex_enrollment::OwnerAnchorWriter::new(
+        store,
+        writer,
+        binding,
+        accounts::RenewalPolicy {
+            roster_path,
+            roster: &records.raw_roster,
+            row,
+            logins: &records.logins,
+        },
+        env.now,
+    );
     let witness = anchor
         .read()?
         .ok_or("published owner has no canonical activation witness")?;
@@ -3190,24 +3201,5 @@ pub(in crate::harness) fn with_unattached_native_rows_fixture(
 pub(in crate::harness) use refresh::fixture_promote_received_response;
 
 #[cfg(test)]
-mod metadata_tests {
-    use super::*;
-
-    #[test]
-    fn grant_reference_codec_is_portable_strict_and_redacted() {
-        let value = aterm_json::json!({
-            "operation": "a".repeat(32), "capability": "b".repeat(64),
-            "issuance_digest": "c".repeat(64), "producer_mac": "d".repeat(64)
-        });
-        let reference: GrantReference = aterm_json::from_value(value.clone()).unwrap();
-        assert!(reference.valid());
-        assert_eq!(aterm_json::to_value(&reference).unwrap(), value);
-        assert!(!format!("{reference:?}").contains(&"b".repeat(64)));
-        let mut unknown = value;
-        unknown
-            .as_object_mut()
-            .unwrap()
-            .insert("unknown".into(), true.into());
-        assert!(aterm_json::from_value::<GrantReference>(unknown).is_err());
-    }
-}
+#[path = "codex_grant_owner_metadata_tests.rs"]
+mod metadata_tests;

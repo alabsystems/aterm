@@ -30,6 +30,9 @@
 //! and so of the vault it was taken under: a heartbeat that refills the book from a member under
 //! the shared secret writes no vault, so no entry another Mac sends moves which vault the book is
 //! of.
+//! Recorded tenure also gates fleet traffic ([`traffic_in_effect`]): a mismatch or unreadable
+//! record refuses handshakes, stream admission and CLI credential reuse, and ends the listener
+//! generation so its heartbeat exchanges stop. A cached deny list cannot override that gate.
 //!
 //! A vault is told from another as the history this Mac acknowledged ties a vault's membership to
 //! it ([`Vault`]): its name, and a key line that keeps a key of the one before. That survives a
@@ -39,17 +42,12 @@
 //! the vault configured to be the one recorded widens the record by the keys of the line
 //! configured now, so a chain of rotations stays one vault.
 //!
-//! A record written by no take (a fleet joined by an older build, or under no vault) is adopted:
-//! readers read it as the vault configured now, and the first writer that reads a vault
-//! configured under the book's lock records that one ([`keep`]: every heartbeat round, a read of
-//! the issuer's book), or the vault a sync read its code under where that sync finds this Mac in
-//! the vault's fleet or rekeys it ([`keep_as`]). A state that holds no fleet's key records none.
-//! A Mac that moved to another vault before any such writer ran keeps the defect the record
-//! ends: the vault it adopts is the one it moved to, and a join of the same fleet again keeps
-//! the grants, as the record is of the vault configured by then. A record that cannot be read,
-//! or a vault configuration that cannot, admits no grant ([`Tenure::Unread`]), and a take of the
-//! fleet under the vault configured takes the grants out, as it cannot tell they were made under
-//! it.
+//! Missing custody is unknown and refuses traffic and grants under an account's vault paths.
+//! Only an explicit init, join or default-fleet sync records a take. A take without a vault has
+//! its own standalone record; it remains valid with no configured vault and refuses under a
+//! configured vault until explicitly taken there. Background writers only widen an existing
+//! matching vault's signer line. They never adopt missing or standalone custody. A private
+//! state root reads no vault and remains outside account-vault admission.
 
 use aterm_net::fleet::DriveGrant;
 use aterm_net::fleet_member::{self, Began, HeldBook};
@@ -77,12 +75,20 @@ const HEAD: &str = "# The vault this machine's fleet state (its key, its book an
                     taken under: written by aterm at each fleet join, init and sync, never by hand.";
 
 impl Vault {
-    /// The vault `paths` configures now: `None` with none, one whose configuration does not
-    /// read, or one that pins no signer. Read through the configuration's memo
+    /// The vault `paths` configures now: `None` only with none. Read through the configuration's memo
     /// ([`aterm_secrets::client::config_now`]), as [`tenure`] reads it: the node's heartbeat
     /// ([`keep`]) and its membership log's reads ask it too.
-    pub(crate) fn configured(paths: &Paths) -> Option<Self> {
-        Self::of_config(&aterm_secrets::client::config_now(paths).ok().flatten()?)
+    /// # Errors
+    /// The configuration cannot be read or the configured vault pins no signer.
+    pub(crate) fn configured(paths: &Paths) -> Result<Option<Self>, aterm_secrets::Error> {
+        let Some(config) = aterm_secrets::client::config_now(paths)? else {
+            return Ok(None);
+        };
+        Self::of_config(&config).map(Some).ok_or_else(|| {
+            aterm_secrets::Error::new(
+                "the configured vault has no pinned signer, so no standalone take can be inferred",
+            )
+        })
     }
 
     /// The vault `config` configures: `None` where it pins no signer.
@@ -110,8 +116,8 @@ impl Vault {
         })
     }
 
-    /// Its [`fleet_member::VAULT_FILE`] text: the head, `name <hex of its UTF-8>`, then one
-    /// `key <64 hex>` line for each key of its line.
+    /// The vault identity portion of a take: its header, `name <hex of its UTF-8>`, then one
+    /// `key <64 hex>` line for each key of its line. The enclosing take supplies its identity.
     fn text(&self) -> String {
         let mut text = format!(
             "{HEAD}\nname {}\n",
@@ -153,17 +159,18 @@ impl Vault {
 /// in `vault` is the one that fleet state was taken under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tenure {
-    /// They admit: the fleet state was taken under the vault configured now, or no take recorded
-    /// one (a fleet an older build or no vault took, adopted as the vault configured now), or
-    /// this process reads no vault (under a private state root: a test, a lab's scratch state).
+    /// They admit: the recorded take matches the configured vault, an explicit standalone take
+    /// matches no configured vault, or this process reads no account vault (a private state root).
     Here,
+    /// No explicit take establishes historical custody.
+    Unknown,
     /// They admit no Mac: the fleet state was taken under the vault `taken` names, and the one
     /// it is read against (configured now, or the one a take is decided under: [`tenure_under`])
     /// is another (`now`, its name: another name, or the same name on a key line that keeps no
     /// key of the one it was taken under), or none (`None`).
     Elsewhere {
         /// The name of the vault the fleet state was taken under.
-        taken: String,
+        taken: Option<String>,
         /// The name of the vault it is read against, if any.
         now: Option<String>,
     },
@@ -180,7 +187,9 @@ impl Tenure {
     pub fn void(&self) -> Option<String> {
         match self {
             Self::Here => None,
-            Self::Elsewhere { taken, now } => Some(format!(
+            Self::Unknown => Some("this Mac's fleet has no recorded take; join or sync it explicitly before any grant admits a Mac".to_owned()),
+            Self::Elsewhere { taken: None, .. } => Some("this Mac's fleet was taken without a vault; join or sync it under the configured vault before any grant admits a Mac".to_owned()),
+            Self::Elsewhere { taken: Some(taken), now } => Some(format!(
                 "this Mac's fleet, its book and its drive grants were taken under vault \"{}\", \
                  and {}, so no drive grant made under it lets a Mac drive this one",
                 aterm_codec::tty::one_line(taken, 80),
@@ -217,7 +226,7 @@ pub fn tenure(state: &Path, vault: Option<&Paths>) -> Tenure {
         return Tenure::Here;
     };
     let taken = match recorded(state) {
-        Ok(None) => return Tenure::Here,
+        Ok(None) => return Tenure::Unknown,
         Ok(Some(taken)) => taken,
         Err(why) => return Tenure::Unread(why),
     };
@@ -229,13 +238,21 @@ pub fn tenure(state: &Path, vault: Option<&Paths>) -> Tenure {
             ));
         }
     };
-    match config.as_ref().and_then(Vault::of_config) {
-        Some(now) if taken.is(&now) => Tenure::Here,
-        _ => Tenure::Elsewhere {
-            taken: taken.name,
-            now: config.map(|config| config.name),
+    let now = match config.as_ref() {
+        None => None,
+        Some(config) => match Vault::of_config(config) {
+            Some(now) => Some(now),
+            None => return Tenure::Unread("the configured vault has no pinned signer".into()),
         },
-    }
+    };
+    taken.against(now.as_ref())
+}
+
+/// A recorded vault mismatch or unreadable tenure refuses all fleet traffic, including reads.
+/// Private state and records with no take use the same policy as [`tenure`].
+#[must_use]
+pub fn traffic_in_effect(state: &Path, vault: Option<&Paths>) -> bool {
+    matches!(tenure(state, vault), Tenure::Here)
 }
 
 /// Where the fleet state in `state` stands against `under`, the vault a take of the fleet is
@@ -248,25 +265,136 @@ pub(crate) fn tenure_under(state: &Path, vault: Option<&Paths>, under: Option<&V
         return Tenure::Here;
     }
     match recorded(state) {
-        Ok(None) => Tenure::Here,
-        Ok(Some(taken)) if under.is_some_and(|under| taken.is(under)) => Tenure::Here,
-        Ok(Some(taken)) => Tenure::Elsewhere {
-            taken: taken.name,
-            now: under.map(|under| under.name.clone()),
-        },
+        Ok(None) => Tenure::Unknown,
+        Ok(Some(taken)) => taken.against(under),
         Err(why) => Tenure::Unread(why),
     }
 }
 
-/// The vault the record in `state` names (`None`: no record), or why it cannot be read.
-fn recorded(state: &Path) -> Result<Option<Vault>, String> {
+/// The identity portion of an explicit take made without a configured vault.
+const STANDALONE: &str = "# aterm fleet take v1\nstandalone\n";
+
+#[derive(Clone)]
+enum Taken {
+    Standalone,
+    Vault(Vault),
+}
+
+impl Taken {
+    fn against(&self, now: Option<&Vault>) -> Tenure {
+        match (self, now) {
+            (Self::Standalone, None) => Tenure::Here,
+            (Self::Vault(taken), Some(now)) if taken.is(now) => Tenure::Here,
+            (Self::Vault(taken), now) => Tenure::Elsewhere {
+                taken: Some(taken.name.clone()),
+                now: now.map(|vault| vault.name.clone()),
+            },
+            (Self::Standalone, Some(now)) => Tenure::Elsewhere {
+                taken: None,
+                now: Some(now.name.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Take {
+    id: String,
+    kind: Taken,
+}
+
+impl Take {
+    fn parse(text: &str) -> Option<Self> {
+        let mut ids = text.lines().filter_map(|line| line.strip_prefix("# take "));
+        let id = ids.next()?.to_owned();
+        if ids.next().is_some() || !aterm_codec::hex::is_lower(&id, 32) {
+            return None;
+        }
+        let body: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
+        let kind = if body == ["standalone"] {
+            Taken::Standalone
+        } else {
+            Taken::Vault(Vault::of_text(text)?)
+        };
+        Some(Self { id, kind })
+    }
+
+    fn text(&self) -> String {
+        let body = match &self.kind {
+            Taken::Standalone => STANDALONE.to_owned(),
+            Taken::Vault(vault) => vault.text(),
+        };
+        format!("# take {}\n{body}", self.id)
+    }
+
+    fn against(&self, now: Option<&Vault>) -> Tenure {
+        self.kind.against(now)
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        self.id == other.id
+            && match (&self.kind, &other.kind) {
+                (Taken::Standalone, Taken::Standalone) => true,
+                (Taken::Vault(was), Taken::Vault(now)) => was.is(now),
+                _ => false,
+            }
+    }
+}
+
+fn recorded(state: &Path) -> Result<Option<Take>, String> {
     let record = state.join(fleet_member::VAULT_FILE);
     match fleet_member::read_vault(state) {
         Ok(None) => Ok(None),
-        Ok(Some(text)) => Vault::of_text(&text)
+        Ok(Some(text)) => Take::parse(&text)
             .map(Some)
-            .ok_or_else(|| format!("{} holds no vault's name and keys", record.display())),
+            .ok_or_else(|| format!("{} holds no valid fleet take", record.display())),
         Err(e) => Err(format!("{} cannot be read: {e}", record.display())),
+    }
+}
+
+/// The take under which an asynchronous exchange or listener generation began.
+#[derive(Clone)]
+pub struct Traffic {
+    state: std::path::PathBuf,
+    vault: Option<Paths>,
+    taken: Option<Take>,
+}
+
+impl Traffic {
+    /// Capture only a currently admitted take. Private state reads no account vault.
+    #[must_use]
+    pub fn capture(state: &Path, vault: Option<&Paths>) -> Option<Self> {
+        if !traffic_in_effect(state, vault) {
+            return None;
+        }
+        Some(Self {
+            state: state.to_path_buf(),
+            vault: vault.cloned(),
+            taken: if vault.is_none() {
+                None
+            } else {
+                Some(recorded(state).ok()??)
+            },
+        })
+    }
+
+    /// Whether the captured take still authorizes this exchange. A new explicit take ends it,
+    /// even if the fleet secret and configured vault have returned to their former values.
+    #[must_use]
+    pub fn current(&self) -> bool {
+        let state = &self.state;
+        let vault = self.vault.as_ref();
+        match (&self.taken, vault) {
+            (None, None) => true,
+            (Some(taken), Some(_)) => {
+                traffic_in_effect(state, vault)
+                    && recorded(state)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|now| taken.same(&now))
+            }
+            _ => false,
+        }
     }
 }
 
@@ -290,19 +418,39 @@ pub fn grants_in_effect(
 /// (a person's verb began, or a sync read the code it follows), never one read here, so a move
 /// while a join dialled leaves a record of the vault left, beside which no grant admits under
 /// the one moved to. With none (no vault, none read by this process, or one that pins no
-/// signer), no record, which the first writer to read a vault adopts ([`keep`]).
+/// signer), an explicit standalone record.
 /// # Errors
-/// The record cannot be written or removed.
+/// The take identity cannot be minted, or the record cannot be written.
 pub(crate) fn take(book: &HeldBook<'_>, under: Option<&Vault>) -> std::io::Result<()> {
-    book.keep_vault(under.map(Vault::text).as_deref())
+    let taken = Take {
+        id: aterm_uds::rand::hex_token::<16>()?,
+        kind: under.cloned().map_or(Taken::Standalone, Taken::Vault),
+    };
+    book.keep_vault(Some(&taken.text()))
 }
 
-/// What a writer under the book's lock keeps of the record in `state`: with none there, the
-/// vault `vault` configures now, adopted; with one of the vault configured, the keys of the line
-/// configured now added; nothing else. Best effort: a lock not taken, or a record that cannot be
+/// Establish explicit custody for an isolated consumer fleet fixture.
+/// # Errors
+/// The vault configuration, book lock or custody record cannot be read or written.
+#[cfg(any(test, debug_assertions))]
+pub fn take_fixture(state: &Path, vault: Option<&Paths>) -> std::io::Result<()> {
+    let under = vault
+        .map(Vault::configured)
+        .transpose()
+        .map_err(std::io::Error::other)?
+        .flatten();
+    fleet_member::write_held(state, Began::Here, |book| take(book, under.as_ref()))
+        .map_err(std::io::Error::other)?
+}
+
+/// Widen an existing matching vault record by the configured signer line. Missing, standalone
+/// and mismatched custody stay unchanged. Best effort: a lock not taken, or a record that cannot be
 /// read or written, keeps the record as it is, and the next writer tries again.
 pub fn keep(state: &Path, vault: Option<&Paths>) {
-    keep_as(state, vault.and_then(Vault::configured));
+    keep_as(
+        state,
+        vault.and_then(|paths| Vault::configured(paths).ok().flatten()),
+    );
 }
 
 /// [`keep`] for the vault `now` (none: nothing): a heartbeat's, the vault configured now; a sync's
@@ -330,18 +478,19 @@ pub(crate) fn keep_in(book: &HeldBook<'_>, state: &Path, now: Option<Vault>) {
         && let Ok(text) = fleet_member::read_vault(state)
         && let Some(kept) = kept(text.as_deref(), &now)
     {
-        let _ = book.keep_vault(Some(&kept.text()));
+        let _ = book.keep_vault(Some(&kept));
     }
 }
 
-/// The record a writer keeps in place of `text` (none there: `None`) for the vault `now`
-/// configured now: `now`, adopted, where there is none; the record widened by `now`'s keys where
-/// it is of `now` and lacks some; `None` where it stays as it is.
-fn kept(text: Option<&str>, now: &Vault) -> Option<Vault> {
-    match text {
-        None => Some(now.clone()),
-        Some(text) => Vault::of_text(text)?.widened(now),
-    }
+/// Widen `text` only when it records `now` and lacks keys from its acknowledged signer line.
+/// Missing, standalone, invalid and mismatched records stay unchanged.
+fn kept(text: Option<&str>, now: &Vault) -> Option<String> {
+    let mut taken = Take::parse(text?)?;
+    let Taken::Vault(vault) = &taken.kind else {
+        return None;
+    };
+    taken.kind = Taken::Vault(vault.widened(now)?);
+    Some(taken.text())
 }
 
 /// The vault a fleet state directory `state` reads its deny list, its membership log and the
@@ -361,74 +510,5 @@ pub(crate) fn vault_paths_for(state: &Path) -> Option<Paths> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vault(name: &str, keys: &[u8]) -> Vault {
-        Vault {
-            name: name.to_owned(),
-            keys: keys.iter().map(|byte| [*byte; 32]).collect(),
-        }
-    }
-
-    /// A record reads back as the vault it records, and nothing else reads as one.
-    #[test]
-    fn a_record_reads_back_as_its_vault_and_nothing_else_does() {
-        let alab = vault("alab", &[1, 2]);
-        assert_eq!(Vault::of_text(&alab.text()), Some(alab.clone()));
-        let named = vault("a vault, named \"so\"", &[3]);
-        assert_eq!(Vault::of_text(&named.text()), Some(named));
-        let text = alab.text();
-        for broken in [
-            String::new(),
-            HEAD.to_owned(),
-            text.replace("name ", "nom "),
-            text.lines()
-                .filter(|line| !line.starts_with("key"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            text.lines()
-                .filter(|line| !line.starts_with("name"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            format!("{text}name 61\n"),
-            format!("{text}key {}\n", "01".repeat(32)),
-            format!("{text}key {}\n", "AB".repeat(32)),
-            format!("{text}key 01\n"),
-            "name \nkey 0101010101010101010101010101010101010101010101010101010101010101\n"
-                .to_owned(),
-        ] {
-            assert_eq!(Vault::of_text(&broken), None, "{broken:?}");
-        }
-    }
-
-    /// The same vault through a rotation, and none other: the name kept and a key of the line
-    /// kept. A record widened by the line configured now stays that vault through a chain of
-    /// rotations whose line alone keeps no key of the first.
-    #[test]
-    fn a_vault_is_itself_through_its_rotations_and_no_other() {
-        let first = vault("alab", &[1]);
-        assert!(first.is(&vault("alab", &[2, 1])), "a rotation");
-        assert!(
-            !first.is(&vault("alab", &[3])),
-            "another line under the name"
-        );
-        assert!(!first.is(&vault("other", &[1])), "another name");
-        let widened = first.widened(&vault("alab", &[2, 1])).expect("a key added");
-        assert_eq!(widened, vault("alab", &[1, 2]));
-        assert_eq!(
-            widened.widened(&vault("alab", &[2])),
-            None,
-            "nothing to add"
-        );
-        assert!(
-            widened.is(&vault("alab", &[2])),
-            "the line re-pinned at the rotated key alone (a join at another place)"
-        );
-        assert!(
-            !first.is(&vault("alab", &[2])),
-            "CONTROL: the record not widened"
-        );
-        assert_eq!(first.widened(&vault("other", &[1])), None);
-    }
-}
+#[path = "fleet_vault_tests.rs"]
+mod tests;

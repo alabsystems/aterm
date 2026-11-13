@@ -60,6 +60,10 @@ rustflags = ["-Zthreads=4"]
 [unstable]
 checksum-freshness = true
 
+# No [build] target-dir: the atpkg shim in released apps resolves a target only from
+# --target-dir or CARGO_TARGET_DIR and refuses a configured one, so no build would start.
+# Check runners choose their own (aterm_toolchain::build_cache::DEFAULT_TARGET).
+
 # Development source dependencies use the same authenticated Git transport as
 # normal repository pulls. No caller-specific Git or credential wrapper needed.
 [net]

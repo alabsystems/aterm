@@ -75,7 +75,7 @@ fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
     let selected = crate::records_storage::selected(&paths.records_file())?;
     let records =
         match fsx::read_private(selected.path(), crate::membership_log::MAX_RECORDS_STREAM)? {
-            Some(bytes) => crate::membership_log::decode_records(bytes.as_slice())?,
+            Some(bytes) => crate::membership_log::decode_records_before_cut(bytes.as_slice())?,
             None => Vec::new(),
         };
     selected.confirm()?;
@@ -86,7 +86,9 @@ fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
         return Ok(false);
     }
     // A broken layout or stream is not a new private realm. Keep strict verification here;
-    // the ordinary recovery reader deliberately keeps valid fragments of a damaged file.
+    // the ordinary recovery reader deliberately keeps valid fragments of a damaged file. The
+    // one thing read past is a last record cut short, which an append of this Mac's own writer
+    // leaves where it died or is read mid-write: the file holds the records before it.
     if store
         .ingest_classified(records)
         .iter()

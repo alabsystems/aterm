@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A hung libtest-JSON probe is one completed red binary, not a reason to lose its peers.
+//! Native probe hangs and dispatch cancellation preserve each child's actual verdict.
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt as _;
@@ -22,6 +22,152 @@ const INVOKED: &str = "ATERM_VERIFY_PROBE_HANG_INVOKED";
 const PEER: &str = "ATERM_VERIFY_PROBE_HANG_PEER";
 const PEER_PROBED: &str = "ATERM_VERIFY_PROBE_HANG_PEER_PROBED";
 const ARMED: &str = "ATERM_VERIFY_PROBE_HANG_ARMED";
+const CANCEL: &str = "ATERM_VERIFY_DISPATCH_CANCEL_WORLD";
+const CANCEL_KIND: &str = "ATERM_VERIFY_DISPATCH_CANCEL_KIND";
+
+/// A private process so the actual interrupt handler can end its active stage group without
+/// touching another test's children. The queued binary shares the single dispatch slot.
+#[test]
+fn standin_cancelled_dispatch() {
+    let Some(world) = std::env::var_os(CANCEL).map(PathBuf::from) else {
+        return;
+    };
+    let kind = std::env::var(CANCEL_KIND).unwrap();
+    crate::exec::group::set_report_grace_for_test(MUST_HAPPEN);
+    crate::exec::group::kill_on_interrupt();
+    let marker = world.join("active-ran");
+    let queued_marker = world.join("queued-ran");
+    let active = world.join("active");
+    let queued = world.join("queued");
+    crate::standin_body(
+        &active,
+        if kind == "failed" {
+            "printf active > \"$MARKER\"; exit 23"
+        } else {
+            "printf active > \"$MARKER\"; exec /bin/sleep 600"
+        },
+    );
+    crate::standin_body(&queued, "printf queued > \"$MARKER\"");
+    let mut first = binary("-p fixture --test active", &active, &[("MARKER", &marker)]);
+    let mut second = binary(
+        "-p fixture --test queued",
+        &queued,
+        &[("MARKER", &queued_marker)],
+    );
+    first.harness = false;
+    second.harness = false;
+    let scratch = world.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let ceiling = match kind.as_str() {
+        "unbounded" => None,
+        "ceiling" => Some(Duration::ZERO),
+        _ => Some(Duration::from_secs(10_800)),
+    };
+    let ctx = Ctx::new(
+        world.clone(),
+        Scope::workspace(),
+        EnvSnapshot::default(),
+        scratch,
+    )
+    .with_child_ceiling(ceiling)
+    .with_halt(crate::halt_of(&crate::cli::Args {
+        fail_fast: true,
+        ..crate::cli::Args::default()
+    }))
+    .with_events(Some(
+        crate::event_log::EventLog::open(&world.join("events")).unwrap(),
+    ));
+    let mut report = crate::ladder::Report::new("test");
+    run_planned_with_probe_window(
+        &ctx,
+        &mut report,
+        "test",
+        RunPlan::fixture(vec![first, second], 1),
+        crate::checks::Check::Test,
+        MUST_HAPPEN,
+    );
+    std::fs::write(world.join("report"), report.render()).unwrap();
+    std::fs::write(world.join("done"), "done\n").unwrap();
+    crate::exec::group::end_interrupted();
+}
+
+/// Cancellation is NOT RUN for both the active and queued binary, including with a configured
+/// three-hour ceiling. Negative controls retain actual zero-ceiling and exit-23 failures.
+#[test]
+fn cancellation_does_not_invent_an_expired_test_ceiling() {
+    use std::os::unix::process::ExitStatusExt as _;
+    for kind in ["cancel", "unbounded", "ceiling", "failed"] {
+        let dir = scratch();
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "testrun::probe_hang_tests::standin_cancelled_dispatch",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CANCEL, dir.path())
+            .env(CANCEL_KIND, kind)
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(std::fs::File::create(dir.path().join("stderr")).unwrap());
+        let mut child = Standin(command.spawn().unwrap());
+        if matches!(kind, "cancel" | "unbounded") {
+            until_within(MUST_HAPPEN, "active dispatch child execution", || {
+                std::fs::read_to_string(dir.path().join("active-ran"))
+                    .ok()
+                    .filter(|text| text == "active")
+            });
+            // SAFETY: this live owned child is the isolated verifier, never this test's group.
+            assert_eq!(
+                unsafe { libc::kill(i32::try_from(child.0.id()).unwrap(), libc::SIGTERM) },
+                0
+            );
+        }
+        let status = until_within(MUST_HAPPEN, "isolated dispatch completion", || {
+            child.0.try_wait().unwrap()
+        });
+        let report = std::fs::read_to_string(dir.path().join("report")).unwrap_or_default();
+        let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap_or_default();
+        let all = format!("kind={kind}: {status}\n{report}\n{stderr}");
+        assert!(dir.path().join("done").exists(), "{all}");
+        assert!(!dir.path().join("queued-ran").exists(), "{all}");
+        if matches!(kind, "cancel" | "unbounded") {
+            assert_eq!(status.signal(), Some(libc::SIGTERM), "{all}");
+            assert!(!report.contains(crate::findings::CEILING_KILL), "{all}");
+            let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
+            let outcomes: Vec<_> = events
+                .lines()
+                .filter_map(|line| line.strip_prefix("verify-event: "))
+                .map(|line| aterm_json::from_str::<aterm_json::Value>(line).unwrap())
+                .filter(|e| e["event"].as_str() == Some("test-binary-finished"))
+                .collect();
+            assert_eq!(outcomes.len(), 2, "{all}\n{events}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|e| e["outcome"].as_str() == Some("NOT RUN")),
+                "{all}\n{events}"
+            );
+            assert!(
+                outcomes.iter().all(|e| e["detail"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("interrupted"))),
+                "{all}\n{events}"
+            );
+        } else {
+            assert!(
+                status.success(),
+                "the fixture reports a red without failing itself: {all}"
+            );
+            assert!(report.contains("FAIL"), "{all}");
+            assert_eq!(
+                report.contains(crate::findings::CEILING_KILL),
+                kind == "ceiling",
+                "{all}"
+            );
+        }
+    }
+}
 
 fn binary(spec: &str, executable: &Path, variables: &[(&str, &Path)]) -> Binary {
     // These shell stand-ins read only their declared fixture variables and cat.
@@ -226,7 +372,9 @@ fn a_hung_probe_is_one_red_and_halt_off_continues_its_peers() {
 /// candidate stays carried without starting, while the drifted candidate becomes NOT RUN and
 /// makes the check incomplete. The miss's own final proof names the fixture bytes dispatch read.
 /// NEGATIVE CONTROLS: moving carry below `probe_json` creates a carried marker; omitting the final
-/// fresh rehash records the drifted candidate OK; reusing pre-probe miss evidence records old bytes.
+/// fresh rehash records the drifted candidate OK; reusing pre-probe miss evidence records old bytes;
+/// a development run that brackets its inputs (`verify land`'s judgment) carries nothing, so the
+/// same proofs leave every binary to be probed and run.
 #[test]
 fn a_carried_harness_is_never_started_by_the_json_probe() {
     for release in [true, false] {
@@ -348,15 +496,16 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
             EnvSnapshot::default(),
             scratch.clone(),
         )
-        .with_carry_context(Some("11".repeat(32)))
+        .with_carry_context(release.then(|| "11".repeat(32)))
+        .with_input_drift(!release)
         .with_events(Some(crate::event_log::EventLog::open(&events).unwrap()));
         ctx.release = release;
         let builder = crate::test_content::EvidenceBuilder::new(
-            ctx.carry_context.clone(),
+            crate::testrun::evidence_context(&ctx),
             crate::report::running_driver().map(str::to_owned),
             scratch.clone(),
         );
-        let command = final_binary_cmd(&ctx, &carried, 1, false, Watch::default());
+        let command = final_binary_cmd(&ctx, &carried, 1, 1, false, Watch::default());
         let command = crate::exec::finalize_exact_command(command, ctx.exec_env()).unwrap();
         let evidence = builder.evidence(&carried, &command);
         assert!(evidence.bounded(), "{evidence:?}");
@@ -368,7 +517,7 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
         assert_eq!(
             evidence,
             crate::test_content::EvidenceBuilder::new(
-                ctx.carry_context.clone(),
+                crate::testrun::evidence_context(&ctx),
                 crate::report::running_driver().map(str::to_owned),
                 scratch.clone(),
             )
@@ -377,14 +526,14 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
         );
         let mut proof = CarryProof::passed(&carried.spec, &evidence, first_execution);
         proof.json = false;
-        let drift_command = final_binary_cmd(&ctx, &drift, 1, false, Watch::default());
+        let drift_command = final_binary_cmd(&ctx, &drift, 1, 1, false, Watch::default());
         let drift_command =
             crate::exec::finalize_exact_command(drift_command, ctx.exec_env()).unwrap();
         let drift_evidence = builder.evidence(&drift, &drift_command);
         assert!(drift_evidence.bounded(), "{drift_evidence:?}");
         let mut drift_proof = CarryProof::passed(&drift.spec, &drift_evidence, 1.0);
         drift_proof.json = false;
-        let miss_command = final_binary_cmd(&ctx, &miss, 1, false, Watch::default());
+        let miss_command = final_binary_cmd(&ctx, &miss, 1, 1, false, Watch::default());
         let miss_command =
             crate::exec::finalize_exact_command(miss_command, ctx.exec_env()).unwrap();
         let miss_before_probe = builder.evidence(&miss, &miss_command);
@@ -410,6 +559,18 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
             Duration::from_secs(60),
         );
         let report = report.render();
+        if !release {
+            // A development run that brackets its inputs carries nothing, even handed proofs
+            // that match: every binary is probed and run again.
+            assert!(report.contains("0 of 3 carried"), "{report}");
+            assert_eq!(
+                std::fs::read_to_string(&carried_marker).unwrap(),
+                "invokedinvokedinvoked",
+                "a development run runs the candidate a release would carry: {report}"
+            );
+            assert!(drift_marker.exists(), "{report}");
+            continue;
+        }
         assert_eq!(
             std::fs::read_to_string(&carried_marker).unwrap(),
             "invoked",
@@ -436,6 +597,7 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
             &ctx,
             &miss,
             1,
+            1,
             false,
             Watch {
                 json: true,
@@ -445,7 +607,7 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
         let after_command =
             crate::exec::finalize_exact_command(after_command, ctx.exec_env()).unwrap();
         let after = crate::test_content::EvidenceBuilder::new(
-            ctx.carry_context.clone(),
+            crate::testrun::evidence_context(&ctx),
             crate::report::running_driver().map(str::to_owned),
             scratch.clone(),
         )
@@ -541,8 +703,9 @@ fn a_carried_harness_is_never_started_by_the_json_probe() {
 /// Runtime-input evidence brackets the execution it describes. With one dispatch slot, the
 /// second binary must hash a fixture changed by the first, not the bytes seen at probe end. A
 /// successful binary which changes its own declared input violates `read-only = true` and keeps
-/// no content key. NEGATIVE CONTROLS: hashing all misses before dispatch gives the reader the
-/// old key; omitting the post-run rehash gives the self-mutator a bounded proof.
+/// no content key, in a release and in a development run that brackets its inputs (`verify
+/// land`'s judgment) alike. NEGATIVE CONTROLS: hashing all misses before dispatch gives the reader
+/// the old key; omitting the post-run rehash gives the self-mutator a bounded proof.
 #[test]
 fn miss_evidence_brackets_each_successful_execution() {
     for release in [true, false] {
@@ -632,7 +795,8 @@ fn miss_evidence_brackets_each_successful_execution() {
             EnvSnapshot::default(),
             scratch.clone(),
         )
-        .with_carry_context(Some("11".repeat(32)))
+        .with_carry_context(release.then(|| "11".repeat(32)))
+        .with_input_drift(!release)
         .with_events(Some(
             crate::event_log::EventLog::open(&events_path).unwrap(),
         ));
@@ -663,6 +827,7 @@ fn miss_evidence_brackets_each_successful_execution() {
             &ctx,
             &reader,
             1,
+            1,
             false,
             Watch {
                 json: true,
@@ -672,7 +837,7 @@ fn miss_evidence_brackets_each_successful_execution() {
         let reader_command =
             crate::exec::finalize_exact_command(reader_command, ctx.exec_env()).unwrap();
         let reader_after = crate::test_content::EvidenceBuilder::new(
-            ctx.carry_context.clone(),
+            crate::testrun::evidence_context(&ctx),
             crate::report::running_driver().map(str::to_owned),
             scratch,
         )

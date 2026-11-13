@@ -189,6 +189,8 @@ fn config_of_m2(
                 ..NodePassPace::LIVE
             },
             pass_converge: Arc::new(|_| None),
+            // Its LAN gate is a stand-in: the pass hears no broker, this Mac's least of all.
+            pass_broker: false,
             bus: None,
             ..NodeMesh::live()
         },
@@ -206,6 +208,11 @@ fn a_windowless_node_heals_a_gap_and_materializes_with_no_subscriber() {
     let clock = Arc::new(AtomicU64::new(start));
     let stop = Arc::new(Stop::new());
     let cfg = config_of_m2(&state, &relay, &lab, true, &clock, &stop);
+    let rung = cfg
+        .mesh
+        .pass_rung
+        .clone()
+        .expect("the live mesh makes the pass's bell");
     let node = std::thread::spawn(move || run_node_serve_with(cfg));
 
     aterm_spec::wait::until_within(
@@ -213,7 +220,9 @@ fn a_windowless_node_heals_a_gap_and_materializes_with_no_subscriber() {
         "the node's first pass sees the gap",
         || node_pass_receipt(&lab.m2).map(|_| ()),
     );
+    // The pass waits on what it hears, and no watch hears a test's clock: what moves it rings.
     clock.store(start + PAST_EVERY_RANK, Ordering::Release);
+    rung.ring();
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "a timer's pass heals the gap",

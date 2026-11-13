@@ -1282,6 +1282,68 @@ fn a_targo_that_is_not_the_pinned_toolchain_is_refused_not_adopted() {
     fs::remove_dir_all(&tmp).ok();
 }
 
+/// A driver that is no program for this machine is no compiler, answered at once and with no
+/// system box: the probe starts it with this thread's error boxes off, where Windows'
+/// CreateProcess would otherwise raise "This version of %1 is not compatible" and wait for a
+/// person to answer it, with std's process-wide spawn lock held over every other start. The
+/// probe runs in a re-exec given the default error mode (`CREATE_DEFAULT_ERROR_MODE`), where
+/// the box is on whatever mode this run inherited. NEGATIVE CONTROL: start the probe without
+/// `aterm_sysprobe::quiet_errors` and the re-exec waits on the box until the hang detector.
+#[cfg(windows)]
+#[test]
+fn a_driver_that_is_no_program_is_no_compiler_and_raises_no_box() {
+    const NAME: &str =
+        "discovery::tests::a_driver_that_is_no_program_is_no_compiler_and_raises_no_box";
+    const ISOLATED: &str = "ATERM_TOOLCHAIN_NO_PROGRAM_DRIVER";
+    /// `CREATE_DEFAULT_ERROR_MODE` (`WinBase.h`): the child does not inherit this error mode.
+    const CREATE_DEFAULT_ERROR_MODE: u32 = 0x0400_0000;
+    /// `SEM_FAILCRITICALERRORS` (`WinBase.h`): the process's critical-error boxes are off.
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetErrorMode() -> u32;
+    }
+    if let Some(dir) = std::env::var_os(ISOLATED) {
+        // SAFETY: no arguments; it reads this process's error mode.
+        let mode = unsafe { GetErrorMode() };
+        assert_eq!(
+            mode & SEM_FAILCRITICALERRORS,
+            0,
+            "the box is on here: {mode:#x}"
+        );
+        let t = Toolchain::discover(
+            Some(Path::new(&dir)),
+            Path::new("/unused"),
+            OsStr::new(""),
+            Some("trust"),
+            None,
+        );
+        assert!(
+            !t.have_targo(),
+            "a driver that is no program is not the pin"
+        );
+        assert!(t.refused.is_some());
+        return;
+    }
+    let tmp = mktemp_dir("atv-noprogram").expect("mktemp");
+    exec_stub(&tmp.join("targo"));
+    exec_stub(&tmp.join("trustc"));
+    let mut isolated = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+    isolated
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED, &tmp);
+    aterm_uds::spawn::set_flags(&mut isolated, CREATE_DEFAULT_ERROR_MODE);
+    let output = aterm_uds::deadline::output_within(&mut isolated, aterm_spec::wait::MUST_HAPPEN)
+        .expect("the probe answers within the hang detector");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the probe in a process whose box is on:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(&tmp).ok();
+}
+
 #[test]
 fn the_path_fallback_adopts_only_the_pinned_toolchain() {
     let tmp = mktemp_dir("atv-pinpath").expect("mktemp");

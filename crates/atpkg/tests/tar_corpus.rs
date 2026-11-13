@@ -153,7 +153,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let cores = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
         let part = self.0.len().div_ceil(cores).max(1);
         let walks: Vec<Vec<Walk>> = std::thread::scope(|scope| {
             let workers: Vec<_> = self
@@ -1365,11 +1365,11 @@ const CHECKSUM_REPAIRED_HEADER_MUTATIONS: &str = if cfg!(windows) {
 } else {
     "2f62c6b7a9a2b5e6"
 };
-// The non-Windows pin moved when `374ea68192` made the tar octal parser reject
-// a leading `+`: mutated headers carrying one now error where they parsed. The
-// Windows pin predates that change and wants the same repin from a Windows run.
+// Both pins moved when `374ea68192` made the tar octal parser reject a leading
+// `+`: mutated headers carrying one now error where they parsed. They differ
+// because Windows refuses a name that is not UTF-8, which Unix reads as bytes.
 const REPAIRED_MUTATIONS_OF_REAL_ARCHIVES: &str = if cfg!(windows) {
-    "255d8b6a7a638e0f"
+    "d71682ce1a5033e8"
 } else {
     "30482623466091eb"
 };

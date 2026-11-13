@@ -26,7 +26,9 @@ use crate::tls::TlsTransport;
 
 pub mod fleet_seed;
 pub mod name_record;
+mod seen;
 mod self_entry;
+pub use seen::{SEEN_BEHIND_MS, SEEN_FILE, SEEN_FLUSH_EVERY};
 pub use self_entry::{self_entry, self_entry_while};
 
 const MAX_WITHIN: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -47,7 +49,10 @@ pub const NODE_FILE: &str = "fleet-node";
 /// Ed25519 key pair, as 64 lowercase hex digits and a newline, under the key file's rules.
 pub const NODE_KEY_FILE: &str = "fleet-node-key";
 
-/// The book of peers' file in the state directory.
+/// The book of peers' file in the state directory. Written whole when an entry is added, taken
+/// out or changed; a contact that only moves when an entry was last heard writes
+/// [`SEEN_FILE`] beside it, and every read of the book through this module raises the entry to
+/// that time ([`read_peers`]).
 pub const PEERS_FILE: &str = "fleet-peers";
 
 /// A member's copy of its issuer's book, in the state directory: a file of its own, so an
@@ -72,15 +77,15 @@ pub const OFF_FILE: &str = "fleet-off";
 /// ([`heartbeat_members`]), and `missed-heard node=<id> ms=<unix ms>` for each of those misses
 /// that came while the member was marked missed and heard from since ([`read_missed_heard`]). A
 /// file of its own, never a field of the book: the book's lines are shared with members, and the
-/// copy of the issuer's book is written whole at each read. An older aterm never reads it.
+/// copy of the issuer's book is written whole at each read that changed it. An older aterm never
+/// reads it.
 pub const ANSWERED_FILE: &str = "fleet-answered";
 
 /// The vault this machine's fleet state — its key, its book and `[fleet] drive_from`'s grants —
 /// was taken under, in the state directory (`docs/DESIGN-fluid-swarm-2026-10-28.md` F17,
 /// `docs/KNOWN_ISSUES.md` ATERM-KI-1105-10): written in an init's take of its key, a join's take
-/// of aterm.toml, and an issuer's sync's take of the vault's default fleet again, and where none
-/// is there yet by the first writer that reads a vault configured ([`HeldBook::keep_vault`]),
-/// removed by a leave. What its lines mean is
+/// of aterm.toml, and an issuer's sync's explicit take of the vault's default fleet again;
+/// removed by a leave. Background writers never create missing custody. What its lines mean is
 /// `aterm_agent::fleet_vault`'s: this crate stores and reads its text alone ([`read_vault`]). A
 /// file of its own, never a field of a book entry: the book refills from every member under the
 /// shared secret, and no entry another Mac sent names the vault this one took its fleet under.
@@ -1224,7 +1229,8 @@ pub struct Peer {
     pub port: u16,
     /// The aterm version it registered with.
     pub version: Option<String>,
-    /// When it registered (Unix milliseconds): the last this book heard of it.
+    /// When it registered (Unix milliseconds): the last this book heard of it, which is the
+    /// later of its line's `seen_ms` and its time in [`SEEN_FILE`] ([`read_peers`]).
     pub seen_ms: Option<u64>,
     /// How it came into the book.
     pub via: Via,
@@ -2001,8 +2007,31 @@ fn held_mark(dir: &Path) -> Option<FleetMark> {
 }
 
 /// The book in `dir` as the fleet `held` marks it: its entries of that fleet
-/// ([`read_peers`]), then those of another fleet.
+/// ([`read_peers`]), then those of another fleet, each last heard when the later of its line
+/// and [`SEEN_FILE`] says ([`seen::Times::raise`]), the times taken before the book is read
+/// ([`seen::before`]): this takes no lock.
 fn read_book(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
+    let (times, read) = seen::before(dir, || read_book_as_written(dir, held));
+    let (mut book, mut others) = read?;
+    times.raise(seen::Of::Book, &mut book);
+    times.raise(seen::Of::Book, &mut others);
+    Ok((book, others))
+}
+
+/// Write the times this process noted of `dir`'s books and holds unwritten
+/// ([`HeldBook::update_paced`]) to [`SEEN_FILE`] now, waiting `within` for the book's lock: for
+/// a process that stays, as it ends in order, so the next reader loses none of them.
+/// # Errors
+/// The lock is not free in time, or the file cannot be written.
+pub fn write_seen_noted(dir: &Path, within: Duration) -> io::Result<()> {
+    seen::flush_now(dir, within)
+}
+
+/// [`read_book`] with each entry's `seen_ms` as [`PEERS_FILE`] itself holds it.
+fn read_book_as_written(
+    dir: &Path,
+    held: Option<FleetMark>,
+) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
     static BOOKS: KeptParse<Result<Vec<Peer>, usize>> = KeptParse::new(KEPT_BOOKS);
     let book = match BOOKS.read(dir, PEERS_FILE, PEERS_FILE_MAX, parse_book) {
         Ok(book) => book.map_err(PeersError::Line)?,
@@ -2055,8 +2084,8 @@ struct IssuerCopy {
     copies: Option<Vec<Peer>>,
 }
 
-/// [`ISSUER_BOOK_FILE`] in `dir`, read under [`read_private`]'s rules: `None` when it is
-/// missing or refused.
+/// [`ISSUER_BOOK_FILE`] in `dir`, read under [`read_private`]'s rules, each copy's `seen_ms` as
+/// the file itself holds it: `None` when it is missing or refused.
 fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
     static COPIES: KeptParse<IssuerCopy> = KeptParse::new(KEPT_BOOKS);
     COPIES
@@ -2086,13 +2115,18 @@ fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
 
 /// The member's copy of its issuer's book in `dir` ([`ISSUER_BOOK_FILE`]), at most
 /// [`PEERS_MAX`]: empty unless the file is private, names `issuer` (the node this machine's
-/// book names as its issuer) at its head, and holds only copies.
+/// book names as its issuer) at its head, and holds only copies. Each copy was last heard when
+/// the later of its line and [`SEEN_FILE`] says ([`seen::Times::raise`]), the times taken
+/// before the copy is read ([`seen::before`]): this takes no lock.
 #[must_use]
 pub fn read_issuer_book(dir: &Path, issuer: &str) -> Vec<Peer> {
-    issuer_copy(dir)
+    let (times, copy) = seen::before(dir, || issuer_copy(dir));
+    let mut copies = copy
         .filter(|copy| copy.issuer.as_deref() == Some(issuer))
         .and_then(|copy| copy.copies)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    times.raise(seen::Of::Copy, &mut copies);
+    copies
 }
 
 /// The word [`ANSWERED_FILE`] keys `peer`'s answers by: `node=<id>`, or `place=<host:port>` for
@@ -2250,10 +2284,17 @@ fn rewrite_mesh_book(dir: &Path) -> io::Result<usize> {
         let mut count = 0;
         for line in text.lines() {
             if let Some(mut peer) = Peer::parse(line)
-                && let (Some(old), Some(key)) = (&peer.node, peer.key)
+                && let (Some(old), Some(key)) = (peer.node.clone(), peer.key)
             {
                 let new = node_principal(key);
-                if old != &new {
+                if old != new {
+                    // The time [`SEEN_FILE`] holds under the old id goes into the line.
+                    let of = if name == PEERS_FILE {
+                        seen::Of::Book
+                    } else {
+                        seen::Of::Copy
+                    };
+                    seen::times(dir).raise(of, std::slice::from_mut(&mut peer));
                     let alias = format!("{old} {new}\n");
                     if !aliases.lines().any(|line| line == alias.trim_end()) {
                         aliases.push_str(&alias);
@@ -2380,7 +2421,7 @@ impl fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`OFF_FILE`], [`VAULT_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for until the one-minute hang detector ([`LOCK_WAIT`]); aterm.toml's write lock, where `write` takes it, comes after it.
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`SEEN_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`OFF_FILE`], [`VAULT_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for until the one-minute hang detector ([`LOCK_WAIT`]); aterm.toml's write lock, where `write` takes it, comes after it.
 /// # Errors
 /// [`Unwritten::Lock`]: another writer holds the lock past its wait, the lock cannot be
 /// taken, or a leave's directory open to others cannot be narrowed; [`Unwritten::Moved`]:
@@ -2403,6 +2444,24 @@ pub fn write_held<R>(
         return Err(Unwritten::Moved);
     }
     Ok(write(&book))
+}
+
+/// A write of this machine's fleet access at a level above Read Only (`aterm_agent::fleet_access`), made in `raise` under the book's lock in `dir`, waited for `within` at most (`None`: as long as any writer of the book waits): every write of another fleet's key removes the stored level under that lock ([`HeldBook::write_key`]) and a leave removes it under it, so such a write reads the fleet held and writes its level with no join, init or leave between the two. `dir` is there and private already.
+/// # Errors
+/// [`Unwritten::Lock`]: the lock was not taken within the wait.
+pub fn access_held<R>(
+    dir: &Path,
+    within: Option<Duration>,
+    raise: impl FnOnce() -> R,
+) -> Result<R, Unwritten> {
+    let lock = match within {
+        Some(within) => BookLock::take(dir, within),
+        None => BookLock::take_default_at(dir, Instant::now()),
+    }
+    .map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
+    let ran = raise();
+    drop(lock);
+    Ok(ran)
 }
 
 /// A leave's write, a first write of its own ([`write_held`]): the directory made private first, as an init or a join makes it (made where there is none, narrowed where it is open to others: [`Leaving::narrowed`]), then the book's lock taken there (one that is there but could not be made private decided by its lock, as any directory is), and gone on without the lock only where no writer could make the directory or take the lock either ([`stops_every_edit`]), so no odd state directory keeps a machine in a fleet. `remove` is handed a [`Leaving`], which removes the fleet's files and writes only [`OFF_FILE`].
@@ -2464,11 +2523,20 @@ fn unnamed_held(dir: &Path) -> Result<(Option<u32>, Option<BookLock>), Unwritten
     Ok((narrowed, lock))
 }
 
-/// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`VAULT_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
+/// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`SEEN_FILE`] (by a thread of a process that stays too, under the same lock: [`HeldBook::update_paced`]), [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`VAULT_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
 pub struct HeldBook<'a> {
     dir: &'a Path,
     held: Held,
     _lock: BookLock,
+}
+
+impl Drop for HeldBook<'_> {
+    /// The hold ends: what its writes noted and settled of [`SEEN_FILE`] is applied as one
+    /// change of the file, while the lock (a field, dropped after this) is still held
+    /// ([`seen::finish`]).
+    fn drop(&mut self) {
+        seen::finish(self.dir);
+    }
 }
 
 /// A leave's hold on a state directory ([`leave_held`]): the book's lock, or none where no writer could take it either. It removes the fleet's files and writes only [`OFF_FILE`] and [`fleet_seed::DIGEST_FILE`].
@@ -2506,10 +2574,16 @@ impl Leaving<'_> {
         self._lock.is_some()
     }
 
-    /// Remove the state directory's file `name`: whether it was there.
+    /// Remove the state directory's file `name`: whether it was there. With the book
+    /// ([`PEERS_FILE`]) goes [`SEEN_FILE`], which holds only when the books' entries were last
+    /// heard; one that cannot be removed stops no leave, and raises no entry of a later book
+    /// that it does not name.
     /// # Errors
     /// `name` is no one file name, or the file is there and cannot be removed.
     pub fn remove(&self, name: &str) -> io::Result<bool> {
+        if name == PEERS_FILE {
+            let _ = seen::forget(self.dir);
+        }
         match remove_private(self.dir, name) {
             Err(e)
                 if !self.locked() && stops_every_edit(&e) && check_owned_dir(self.dir).is_err() =>
@@ -2580,46 +2654,124 @@ impl HeldBook<'_> {
         &self.held
     }
 
-    /// Edit the book: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it or a key is held beside entries of another fleet, those entries kept while no key is held and dropped while one is (by an `edit` that changes nothing too), so an older aterm, which reads no [`Peer::fleet`], never reads the old issuer as the new key's.
+    /// Edit the book: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it or a key is held beside entries of another fleet, those entries kept while no key is held and dropped while one is (by an `edit` that changes nothing too), so an older aterm, which reads no [`Peer::fleet`], never reads the old issuer as the new key's. An `edit` that only moved when entries were last heard later ([`seen::advances`]), none past [`SEEN_BEHIND_MS`] after the time the book's file has for it ([`seen::trails`]), has those times written to [`SEEN_FILE`] as this hold of the lock ends (the one change of that file a hold makes, [`seen::finish`]; a write that fails keeps them noted in this process and fails no edit) and leaves the book's file as it is: every read raises the entries to them, and the next whole write carries them.
     /// # Errors
     /// The book cannot be read or written, or `edit` refuses.
     pub fn update<R>(
         &self,
         edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
     ) -> Result<R, String> {
+        self.update_at(edit, seen::Pace::Now)
+    }
+
+    /// [`Self::update`] for a process that stays (a served registration, a heartbeat round):
+    /// the times an `edit` only moved later may wait in this process, where every read of the
+    /// book finds them, for [`SEEN_FLUSH_EVERY`] at most before [`SEEN_FILE`] holds them, so
+    /// members registering one after another cost one small write a minute and not a book
+    /// each. A process that ends before then loses the times it had not written.
+    /// # Errors
+    /// As [`Self::update`].
+    pub fn update_paced<R>(
+        &self,
+        edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.update_at(edit, seen::Pace::Within(Instant::now()))
+    }
+
+    fn update_at<R>(
+        &self,
+        edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
+        pace: seen::Pace,
+    ) -> Result<R, String> {
         let held = held_mark(self.dir);
-        let (mut book, mut others) = read_book(self.dir, held).map_err(|e| e.to_string())?;
+        let (mut book, mut others) =
+            read_book_as_written(self.dir, held).map_err(|e| e.to_string())?;
+        let own: Vec<Option<u64>> = book.iter().map(|peer| peer.seen_ms).collect();
+        // Under the book's lock the times noted and the book move together.
+        let times = seen::times(self.dir);
+        times.raise(seen::Of::Book, &mut book);
+        times.raise(seen::Of::Book, &mut others);
         let before = book.clone();
         let out = edit(&mut book)?;
         let drops = held.is_some() && !others.is_empty();
-        if book != before || drops {
-            if held.is_none() {
-                book.append(&mut others);
-            }
-            write_private(self.dir, PEERS_FILE, book_text(&book).as_bytes())
-                .map_err(|e| format!("{PEERS_FILE}: {e}"))?;
+        if book == before && !drops {
+            return Ok(out);
         }
+        if !drops
+            && let Some(stamps) = seen::advances(&before, &book)
+            && !seen::trails(&own, &book)
+        {
+            seen::note(self.dir, seen::Of::Book, stamps, pace);
+            return Ok(out);
+        }
+        if held.is_none() {
+            book.append(&mut others);
+        }
+        write_private(self.dir, PEERS_FILE, book_text(&book).as_bytes())
+            .map_err(|e| format!("{PEERS_FILE}: {e}"))?;
+        // The book is written: its lines beside it go as this hold ends ([`seen::finish`]).
+        seen::settle(self.dir, seen::Of::Book);
         Ok(out)
     }
 
-    /// Keep `copy` as the copy of the issuer's book ([`ISSUER_BOOK_FILE`]), whole: the copies [`copies_of`] made of the answer of the issuer `issuer` (a node id), or none for `None`.
+    /// Keep `copy` as the copy of the issuer's book ([`ISSUER_BOOK_FILE`]): the copies [`copies_of`] made of the answer of the issuer `issuer` (a node id), or none for `None`. Written whole unless the file holds that issuer's copies already and they differ from these in nothing, where nothing is written, or only in when copies were last heard, later ([`seen::advances`]) and none past [`SEEN_BEHIND_MS`] after the time the file has for it ([`seen::trails`]), where [`SEEN_FILE`] takes those times as this hold of the lock ends.
     /// # Errors
     /// The copy cannot be written or removed.
     pub fn keep_issuer_book(&self, copy: Option<(&str, &[Peer])>) -> io::Result<()> {
+        self.keep_issuer_book_at(copy, seen::Pace::Now)
+    }
+
+    /// [`Self::keep_issuer_book`] for a process that stays, its times paced as
+    /// [`Self::update_paced`]'s are.
+    /// # Errors
+    /// As [`Self::keep_issuer_book`].
+    pub fn keep_issuer_book_paced(&self, copy: Option<(&str, &[Peer])>) -> io::Result<()> {
+        self.keep_issuer_book_at(copy, seen::Pace::Within(Instant::now()))
+    }
+
+    fn keep_issuer_book_at(
+        &self,
+        copy: Option<(&str, &[Peer])>,
+        pace: seen::Pace,
+    ) -> io::Result<()> {
         let Some((issuer, copies)) = copy else {
             return self.remove(ISSUER_BOOK_FILE).map(|_| ());
         };
+        let copies: Vec<Peer> = copies
+            .iter()
+            .filter(|copy| copy.via == Via::IssuerBook)
+            .cloned()
+            .collect();
+        if let Some(kept) = issuer_copy(self.dir)
+            && kept.issuer.as_deref() == Some(issuer)
+            && let Some(mut kept) = kept.copies
+        {
+            let own: Vec<Option<u64>> = kept.iter().map(|copy| copy.seen_ms).collect();
+            seen::times(self.dir).raise(seen::Of::Copy, &mut kept);
+            if kept == copies {
+                return Ok(());
+            }
+            if let Some(stamps) = seen::advances(&kept, &copies)
+                && !seen::trails(&own, &copies)
+            {
+                seen::note(self.dir, seen::Of::Copy, stamps, pace);
+                return Ok(());
+            }
+        }
         let mut text = format!(
-            "# A copy of this machine's fleet issuer's book: written by aterm at each read of \
-             that book (`aterm fleet peers`, `aterm ctl survey --fleet`, a heartbeat that reaches \
-             it), never by hand.\n\
+            "# A copy of this machine's fleet issuer's book: written by aterm at a read of that \
+             book that changed it (`aterm fleet peers`, `aterm ctl survey --fleet`, a heartbeat \
+             that reaches it), never by hand.\n\
              {ISSUER_BOOK_HEAD}{issuer}\n"
         );
-        for copy in copies.iter().filter(|copy| copy.via == Via::IssuerBook) {
+        for copy in &copies {
             text.push_str(&copy.line());
             text.push('\n');
         }
-        write_private(self.dir, ISSUER_BOOK_FILE, text.as_bytes())
+        write_private(self.dir, ISSUER_BOOK_FILE, text.as_bytes())?;
+        // As the book's ([`Self::update`]): its lines beside it go as this hold ends.
+        seen::settle(self.dir, seen::Of::Copy);
+        Ok(())
     }
 
     /// Note `answers`, each a member's key ([`answer_key`]) and the time it answered this machine
@@ -2694,12 +2846,36 @@ impl HeldBook<'_> {
         write_private(self.dir, ANSWERED_FILE, text.as_bytes())
     }
 
-    /// Write `secret` as this machine's [`KEY_FILE`], in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key every 2 s, and never sees half of one.
+    /// Write `secret` as this machine's [`KEY_FILE`], in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key every 2 s, and never sees half of one. A secret other than the one held is another fleet's (a join of another fleet or of an issuer's new secret, an init): this machine's stored fleet access ([`aterm_types::fleet_access::FILE`]), a level its person chose for the fleet it held, is removed first, so the members the new key admits find this machine Read Only, as a leave leaves it. A level above Read Only is written under this lock ([`access_held`]), so none comes between the removal and the key.
+    /// # Errors
+    /// `secret` is no fleet secret, the stored fleet access of another fleet could not be removed (the key is then not written), or the key cannot be written.
+    pub fn write_key(&self, secret: &[u8]) -> io::Result<()> {
+        let new = FleetSecret::new(secret)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if self.held.secret() != Some(&new) {
+            remove_private(self.dir, aterm_types::fleet_access::FILE).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: {e} (this machine's fleet access, chosen for the fleet it held, goes before another fleet's key is written)",
+                        self.dir.join(aterm_types::fleet_access::FILE).display()
+                    ),
+                )
+            })?;
+        }
+        self.write_key_text(secret)
+    }
+
+    /// Write `secret`, the rotated secret of the fleet held, as this machine's [`KEY_FILE`] ([`Self::write_key`]): the fleet is the same Macs, so this machine's fleet access stays as its person set it, as its drive grants do.
     /// # Errors
     /// `secret` is no fleet secret, or the key cannot be written.
-    pub fn write_key(&self, secret: &[u8]) -> io::Result<()> {
+    pub fn write_rotated_key(&self, secret: &[u8]) -> io::Result<()> {
         FleetSecret::new(secret)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        self.write_key_text(secret)
+    }
+
+    fn write_key_text(&self, secret: &[u8]) -> io::Result<()> {
         let mut text = aterm_codec::hex::encode_lower(secret);
         text.push('\n');
         write_private(self.dir, KEY_FILE, text.as_bytes())
@@ -2922,11 +3098,19 @@ impl HeldBook<'_> {
         read_join_code(self.dir).is_ok() && !names_an_issuer(self.dir, Some(me.node()))
     }
 
-    /// Remove the state directory's file `name`: whether it was there.
+    /// Remove the state directory's file `name`: whether it was there. With a book
+    /// ([`PEERS_FILE`], [`ISSUER_BOOK_FILE`]) go the times [`SEEN_FILE`] holds for its entries.
     /// # Errors
     /// `name` is no one file name, or the file is there and cannot be removed.
     pub fn remove(&self, name: &str) -> io::Result<bool> {
-        remove_private(self.dir, name)
+        let had = remove_private(self.dir, name)?;
+        // The lines go as this hold ends ([`seen::finish`]).
+        match name {
+            PEERS_FILE => seen::settle(self.dir, seen::Of::Book),
+            ISSUER_BOOK_FILE => seen::settle(self.dir, seen::Of::Copy),
+            _ => {}
+        }
+        Ok(had)
     }
 }
 
@@ -4454,6 +4638,7 @@ pub fn serve_join<S: Read + Write>(
         member,
         now_ms,
         (&[], None),
+        &|| true,
     )
 }
 
@@ -4461,6 +4646,9 @@ pub fn serve_join<S: Read + Write>(
 /// entries from the book; with `log`, this Mac's membership log's keys, also refusing a joiner
 /// whose proved key the log took out ([`NOT_ADMITTED`]), whatever secret it holds. A node this
 /// Mac's copy of its issuer's book binds to another key is refused too ([`copy_rebinds`]).
+/// `current` is checked after parsing and under the book lock before recording the join.
+/// # Errors
+/// Reading or writing the stream fails, or the current authorization refuses the response.
 pub fn serve_join_with_denied<S: Read + Write>(
     stream: &mut S,
     (from, proof): (IpAddr, Option<&NodeProof>),
@@ -4468,6 +4656,7 @@ pub fn serve_join_with_denied<S: Read + Write>(
     member: impl FnOnce() -> Result<Issuer, String>,
     now_ms: u64,
     (denied_nodes, log): (&[String], Option<&MemberKeys>),
+    current: &dyn Fn() -> bool,
 ) -> io::Result<Result<(Recorded, Peer), String>> {
     let line = read_record(stream)?;
     let outcome = match Registration::parse(&line) {
@@ -4500,6 +4689,7 @@ pub fn serve_join_with_denied<S: Read + Write>(
             "the registration's signature does not hold over what it names under its key"
                 .to_owned(),
         ),
+        Ok(_) if !current() => Err(MOVED_ON.to_owned()),
         Ok(reg) => admitted(&reg, proof, log)
             .and_then(|()| {
                 member()
@@ -4538,7 +4728,10 @@ pub fn serve_join_with_denied<S: Read + Write>(
                     state_dir,
                     Began::Under(&Held::Key(secret.clone())),
                     |book| {
-                        book.update(|book| {
+                        if !current() {
+                            return Err(MOVED_ON.to_owned());
+                        }
+                        book.update_paced(|book| {
                             copy_rebinds(&copied_keys(state_dir, book), &peer, log, denied_nodes)?;
                             unbind_replaced(book, &peer, log, denied_nodes)?;
                             record_with_denied(book, peer, denied_nodes)
@@ -4567,6 +4760,9 @@ pub fn serve_join_with_denied<S: Read + Write>(
             (format!("ERR {why}"), Err(why))
         }
     };
+    if !current() {
+        return Err(io::Error::other(MOVED_ON));
+    }
     stream.write_all(format!("{answer}\n").as_bytes())?;
     stream.flush()?;
     Ok(outcome)
@@ -4891,6 +5087,7 @@ pub fn heartbeat_members_with_denied(
         within,
         (log, denied_nodes, hints),
         &Stop::new(),
+        &|| true,
     )
 }
 
@@ -4899,6 +5096,8 @@ pub fn heartbeat_members_with_denied(
 /// descriptor version after a newer generation's publication. An exchange already sent can
 /// finish remotely; its descriptor precedes a newer generation's. Under a log that cannot be read
 /// now ([`MemberKeys::unreadable`]) the round dials no one and changes no book.
+/// `current` is rechecked at exchange and commit boundaries and under the descriptor writer
+/// lock. A false verdict ends the round without publishing its pending results.
 /// # Errors
 /// The book could not be read or updated, or the local signed descriptor could not be committed.
 pub fn heartbeat_members_while(
@@ -4908,15 +5107,17 @@ pub fn heartbeat_members_while(
     within: Duration,
     (log, denied_nodes, hints): (Option<&MemberKeys>, &[String], &dyn Fn() -> Vec<SocketAddr>),
     ended: &Stop,
+    current: &dyn Fn() -> bool,
 ) -> Result<Vec<Answered>, String> {
+    let active = || current() && !ended.is_set();
     // A log that cannot be read now admits no member to dial and judges no book entry: the
     // round dials no one and leaves the book as it is, as a listener with no deny list read.
-    if ended.is_set() || log.is_some_and(|log| log.unread().is_some()) {
+    if !active() || log.is_some_and(|log| log.unread().is_some()) {
         return Ok(Vec::new());
     }
     let Some(reg) = reg
         .clone()
-        .signed_in_while(state_dir, me, ended)
+        .signed_in_while(state_dir, me, ended, current)
         .map_err(|e| e.to_string())?
     else {
         return Ok(Vec::new());
@@ -4930,11 +5131,17 @@ pub fn heartbeat_members_while(
         .as_deref()
         .map(|node| read_issuer_book(state_dir, node))
         .unwrap_or_default();
-    if ended.is_set() {
+    if !active() {
         return Ok(Vec::new());
     }
-    prune_pushed_facts_peer_slices(state_dir, &[&peers, &issuer_copies], denied_nodes, log);
-    if ended.is_set() {
+    prune_pushed_facts_peer_slices(
+        state_dir,
+        &[&peers, &issuer_copies],
+        denied_nodes,
+        log,
+        current,
+    );
+    if !active() {
         return Ok(Vec::new());
     }
     let keys = Keyring::of(peers.iter().chain(&issuer_copies));
@@ -4980,7 +5187,7 @@ pub fn heartbeat_members_while(
         .iter()
         .filter_map(|peer| Some((peer.node.clone()?, peer.addr)))
         .collect();
-    if ended.is_set() {
+    if !active() {
         return Ok(Vec::new());
     }
     // Away from the ALab LAN the round passes over the members behind it, save the first round
@@ -5020,7 +5227,7 @@ pub fn heartbeat_members_while(
     // members gone dark for good cost a round one dial past its three answers, by its share.
     let mut missed_again = false;
     for member in members {
-        if ended.is_set() {
+        if !active() {
             return Ok(Vec::new());
         }
         if Instant::now() >= members_until {
@@ -5051,7 +5258,7 @@ pub fn heartbeat_members_while(
         };
         let beat = match reach_node(&target, &keys, (secret, me), FleetOp::Join, by) {
             Ok((reached, node)) => {
-                let beat = beat(reached, &node, (secret, me), &reg, bounds, ended);
+                let beat = beat(reached, &node, (secret, me), &reg, bounds, (ended, current));
                 if beat.is_none() {
                     blocked += 1;
                 }
@@ -5075,7 +5282,7 @@ pub fn heartbeat_members_while(
             }
         }
     }
-    if ended.is_set() {
+    if !active() {
         return Ok(Vec::new());
     }
     // The adverts are resolved only for a round the book's members did not fill.
@@ -5085,7 +5292,7 @@ pub fn heartbeat_members_while(
         Vec::new()
     };
     for hint in &hints {
-        if ended.is_set() {
+        if !active() {
             return Ok(Vec::new());
         }
         if answered.len() >= HEARTBEAT_MEMBERS || Instant::now() >= deadline.0 {
@@ -5125,11 +5332,18 @@ pub fn heartbeat_members_while(
             deadline.0.max(deadline_after(Duration::from_secs(1))),
             deadline,
         );
-        if let Some(beat) = beat(reached, &proof.node, (secret, me), &reg, bounds, ended) {
+        if let Some(beat) = beat(
+            reached,
+            &proof.node,
+            (secret, me),
+            &reg,
+            bounds,
+            (ended, current),
+        ) {
             answered.push(beat);
         }
     }
-    if ended.is_set() {
+    if !active() {
         return Ok(Vec::new());
     }
     // A member a hint reached answered, whatever its dial from the book came to.
@@ -5147,7 +5361,7 @@ pub fn heartbeat_members_while(
     };
     let has_barred = peers.iter().any(is_barred) || issuer_copies.iter().any(is_barred);
     if answered.is_empty() && missed.is_empty() && !has_barred {
-        if !ended.is_set() {
+        if active() {
             pace.end(state_dir);
         }
         return Ok(Vec::new());
@@ -5157,7 +5371,7 @@ pub fn heartbeat_members_while(
         state_dir,
         Began::Under(&Held::Key(secret.clone())),
         |book| -> Result<bool, String> {
-            if ended.is_set() {
+            if !active() {
                 return Ok(false);
             }
             book.observe_self_entries(
@@ -5171,7 +5385,7 @@ pub fn heartbeat_members_while(
                 .as_deref()
                 .map(|node| read_issuer_book(state_dir, node))
                 .unwrap_or_default();
-            let updated_peers = book.update(|book| {
+            let updated_peers = book.update_paced(|book| {
                 // A member this Mac's book dropped while the round was out (`aterm fleet peers
                 // rm`) stays dropped: a book fetched before its issuer dropped it too would bind
                 // it here again, and no later round takes an entry of this book out.
@@ -5191,7 +5405,13 @@ pub fn heartbeat_members_while(
                     .filter_map(|(_, fetched, _)| Some(fetched.as_ref()?.peers.as_slice()))
                     .collect();
                 if !fetched_slices.is_empty() {
-                    prune_pushed_facts_peer_slices(state_dir, &fetched_slices, denied_nodes, log);
+                    prune_pushed_facts_peer_slices(
+                        state_dir,
+                        &fetched_slices,
+                        denied_nodes,
+                        log,
+                        current,
+                    );
                 }
                 let copies = match issuer_of(book).and_then(|peer| peer.node.as_deref()) {
                     Some(node) if Some(node) == issuer.as_deref() => {
@@ -5265,7 +5485,7 @@ pub fn heartbeat_members_while(
                 Some((done, Some(fetched), _)) => {
                     let mut copies = copies_of(fetched, Some(own));
                     copies.retain(|copy| !is_barred(copy));
-                    book.keep_issuer_book(Some((&done.node, &copies)))
+                    book.keep_issuer_book_paced(Some((&done.node, &copies)))
                         .map(|()| copies)
                         .map_err(|e| format!("{ISSUER_BOOK_FILE}: {e}"))
                 }
@@ -5273,7 +5493,7 @@ pub fn heartbeat_members_while(
                     if let Some(issuer_node) = issuer.as_deref() {
                         let mut copies = issuer_copies.clone();
                         copies.retain(|copy| !is_barred(copy));
-                        book.keep_issuer_book(Some((issuer_node, &copies)))
+                        book.keep_issuer_book_paced(Some((issuer_node, &copies)))
                             .map(|()| copies)
                             .map_err(|e| format!("{ISSUER_BOOK_FILE}: {e}"))
                     } else {
@@ -5326,7 +5546,7 @@ pub fn heartbeat_members_while(
         Err(Unwritten::Moved) => return Ok(Vec::new()),
         Err(why) => return Err(why.to_string()),
     }
-    if ended.is_set() {
+    if !active() {
         return Ok(Vec::new());
     }
     pace.end(state_dir);
@@ -5573,9 +5793,10 @@ fn beat(
     (secret, me): (&FleetSecret, &NodeIdentity),
     reg: &Registration,
     (register_until, deadline): (Instant, (Instant, Duration)),
-    ended: &Stop,
+    (ended, current): (&Stop, &dyn Fn() -> bool),
 ) -> Option<(Answered, Option<Book>, Option<NodeKey>)> {
-    if ended.is_set() {
+    let active = || current() && !ended.is_set();
+    if !active() {
         return None;
     }
     let at = reached.addr;
@@ -5586,7 +5807,7 @@ fn beat(
         return None;
     }
     let mut fetched = None;
-    if !ended.is_set() && Instant::now() < deadline.0 {
+    if active() && Instant::now() < deadline.0 {
         let target = Target {
             host: at.ip().to_canonical().to_string(),
             addr: Some(at.ip().to_canonical()),
@@ -6604,6 +6825,7 @@ pub const REASONS: &[&str] = &[
     "no-answer",
     "no-route",
     "refused-here",
+    "lan-broker",
     "reset",
     "connect",
     "no-handshake",
@@ -6719,6 +6941,7 @@ impl Unreached {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::Resolve(_) | Self::Lookup(..) => "no-name",
+            Self::Connect(_, e) if aterm_uds::lan::Unavailable::of(e).is_some() => "lan-broker",
             Self::Connect(_, e) => match e.kind() {
                 io::ErrorKind::ConnectionRefused => "nothing-listens",
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "no-answer",
@@ -6826,13 +7049,15 @@ impl Unreached {
 
     /// Whether a connect to the peer was tried: `false` for a name that did not resolve (or
     /// not in time), an address no fleet dials, and a failure of this machine's own before any
-    /// connect, none of which says anything of this machine's route into the LAN.
+    /// connect, including an unavailable LAN broker. None says anything of this machine's
+    /// route into the LAN.
     #[must_use]
-    pub const fn dialled(&self) -> bool {
-        !matches!(
-            self,
-            Self::Resolve(_) | Self::Lookup(..) | Self::NotFleet(_) | Self::Local(_)
-        )
+    pub fn dialled(&self) -> bool {
+        match self {
+            Self::Resolve(_) | Self::Lookup(..) | Self::NotFleet(_) | Self::Local(_) => false,
+            Self::Connect(_, error) if aterm_uds::lan::Unavailable::of(error).is_some() => false,
+            _ => true,
+        }
     }
 
     /// Whether the connect was refused to this process itself (`EPERM`, `EACCES`): a sandbox
@@ -9415,7 +9640,73 @@ fn store_pushed_facts_started(
         .map_or(Duration::MAX, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
-    store_pushed_facts_using(state_dir, node, key, payload, within, held, write_private)
+    store_pushed_facts_using(
+        state_dir,
+        node,
+        key,
+        payload,
+        within,
+        held,
+        publish_pushed_facts,
+    )
+}
+
+/// The token of a facts payload's `instance` header that says when its sender rendered it.
+const FACTS_RENDERED_AT: &[u8] = b" at_ms=";
+
+/// `record` (a `<node>.facts` record: a line of magic and one of key, then a C16 payload) around
+/// the time its sender rendered it, the `at_ms=<ms>` token of the payload's `instance` header
+/// (its second line, the record's fourth): what a member's next push repeats when none of its facts moved. A record with
+/// no such header or token is itself and nothing after.
+fn around_rendered_at(record: &[u8]) -> (&[u8], &[u8]) {
+    let whole = (record, &[][..]);
+    let mut lines = record
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .map(|(at, _)| at + 1);
+    let Some(head) = lines.nth(2) else {
+        return whole;
+    };
+    let end = lines.next().map_or(record.len(), |next| next - 1);
+    let line = &record[head..end];
+    let Some(at) = line
+        .starts_with(b"instance ")
+        .then(|| {
+            line.windows(FACTS_RENDERED_AT.len())
+                .position(|window| window == FACTS_RENDERED_AT)
+        })
+        .flatten()
+    else {
+        return whole;
+    };
+    let time = head + at + FACTS_RENDERED_AT.len();
+    let digits = record[time..end]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    (&record[..head + at], &record[time + digits..])
+}
+
+/// Publish `record` as `file` in the facts cache `dir`, under the cache's lock: where the record
+/// there names the same key and says the same facts, differing only in when its sender rendered
+/// them ([`around_rendered_at`]), its bytes stay and only its modification time moves to now,
+/// which is all a reader takes from such a push ([`PushedFactsRecord::received_at`], and the
+/// order the cache evicts in); the kept payload's `at_ms` is then that of the first push that
+/// said these facts, which nothing reads. Any other record is written whole
+/// ([`write_private`]), and so is one whose time cannot be moved. A moved time is not flushed:
+/// after a power loss the record may read as received at its earlier push, until the member's
+/// next one.
+fn publish_pushed_facts(dir: &Path, file: &str, record: &[u8]) -> io::Result<()> {
+    let same = read_private(dir, file, PUSHED_FACTS_MAX)
+        .is_ok_and(|kept| around_rendered_at(&kept) == around_rendered_at(record));
+    if same
+        && aterm_uds::private_file::open_private_rw(dir, file)
+            .is_ok_and(|kept| kept.set_modified(std::time::SystemTime::now()).is_ok())
+    {
+        return Ok(());
+    }
+    write_private(dir, file, record)
 }
 
 fn store_pushed_facts_using(
@@ -9471,13 +9762,15 @@ fn store_pushed_facts_using(
 /// cannot be read now ([`MemberKeys::unreadable`]) removes nothing: it judges no key, and
 /// [`read_admitted_pushed_facts`] admits none under it. Cleanup is best effort, including when
 /// the cache lock is unavailable; admission must use [`read_admitted_pushed_facts`].
+/// `current` is checked under the cache lock before removing any record.
 pub fn prune_pushed_facts(
     state_dir: &Path,
     peers: &[Peer],
     denied_nodes: &[String],
     log: Option<&MemberKeys>,
+    current: &dyn Fn() -> bool,
 ) {
-    prune_pushed_facts_peer_slices(state_dir, &[peers], denied_nodes, log);
+    prune_pushed_facts_peer_slices(state_dir, &[peers], denied_nodes, log, current);
 }
 
 /// [`prune_pushed_facts`] across multiple peer slices in a single lock acquisition and directory
@@ -9487,6 +9780,7 @@ pub fn prune_pushed_facts_peer_slices(
     peer_slices: &[&[Peer]],
     denied_nodes: &[String],
     log: Option<&MemberKeys>,
+    current: &dyn Fn() -> bool,
 ) {
     prune_pushed_facts_slices_using(
         state_dir,
@@ -9495,6 +9789,7 @@ pub fn prune_pushed_facts_peer_slices(
         log,
         Duration::from_secs(2),
         || {},
+        current,
     );
 }
 
@@ -9507,7 +9802,15 @@ fn prune_pushed_facts_using(
     within: Duration,
     held: impl FnMut(),
 ) {
-    prune_pushed_facts_slices_using(state_dir, &[peers], denied_nodes, log, within, held);
+    prune_pushed_facts_slices_using(
+        state_dir,
+        &[peers],
+        denied_nodes,
+        log,
+        within,
+        held,
+        &|| true,
+    );
 }
 
 fn prune_pushed_facts_slices_using(
@@ -9517,6 +9820,7 @@ fn prune_pushed_facts_slices_using(
     log: Option<&MemberKeys>,
     within: Duration,
     held: impl FnMut(),
+    current: &dyn Fn() -> bool,
 ) {
     let log = log.filter(|log| log.unread().is_none());
     if denied_nodes.is_empty() && !log.is_some_and(|l| !l.out().is_empty()) {
@@ -9526,6 +9830,9 @@ fn prune_pushed_facts_slices_using(
     let Ok(_lock) = pushed_facts_lock(&dir, within, held) else {
         return;
     };
+    if !current() {
+        return;
+    }
     let remove_node_facts = |node: &str| {
         remove_pushed_facts(&dir, node);
     };
@@ -9733,20 +10040,23 @@ pub fn serve_facts<S: Read + Write>(
     state_dir: &Path,
     validate: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> io::Result<Result<String, String>> {
-    serve_facts_with_denied(stream, proof, state_dir, (&[], None), validate)
+    serve_facts_with_denied(stream, proof, state_dir, (&[], None), validate, &|| true)
 }
 
 /// [`serve_facts`], also refusing any node on `denied_nodes`, any key `log` holds out, or any
 /// node id that `state_dir` (its own identity or [`Keyring::read`]) binds to a different key.
+/// `current` is rechecked before persistence and under the cache writer lock.
 ///
 /// # Errors
-/// Returns an I/O error if the stream cannot be read or written.
+/// Returns an I/O error if the stream cannot be read or written, or authorization is revoked
+/// before persistence.
 pub fn serve_facts_with_denied<S: Read + Write>(
     stream: &mut S,
     proof: Option<&NodeProof>,
     state_dir: &Path,
     (denied_nodes, log): (&[String], Option<&MemberKeys>),
     validate: impl FnOnce(&str) -> Result<Option<String>, String>,
+    current: &dyn Fn() -> bool,
 ) -> io::Result<Result<String, String>> {
     let Some(proof) = proof else {
         stream.write_all(b"ERR unproved: facts push requires a proved node key\n")?;
@@ -9842,9 +10152,23 @@ pub fn serve_facts_with_denied<S: Read + Write>(
     }
     match validate(&payload) {
         Ok(Some(claimed)) if claimed == proof.node => {
-            if let Err(e) =
-                store_pushed_facts_with_key(state_dir, &proof.node, Some(proof.key), &payload)
-            {
+            if !current() {
+                return Err(io::Error::other(MOVED_ON));
+            }
+            if let Err(e) = store_pushed_facts_using(
+                state_dir,
+                &proof.node,
+                Some(proof.key),
+                &payload,
+                FACTS_WRITE_HANG,
+                || {},
+                |dir, file, bytes| {
+                    if !current() {
+                        return Err(io::Error::other(MOVED_ON));
+                    }
+                    publish_pushed_facts(dir, file, bytes)
+                },
+            ) {
                 stream.write_all(b"ERR store: could not persist facts\n")?;
                 stream.flush()?;
                 return Ok(Err(format!("storing facts: {e}")));
@@ -9921,14 +10245,19 @@ fn verify_bound_peer_proof(
 ///
 /// # Errors
 /// Returns why the log cannot be read now, or why the peer could not be dialled, failed
-/// node-proof verification, or refused the pushed facts.
+/// node-proof verification, or refused the pushed facts, or why current custody no longer admits
+/// the exchange.
 pub fn push_facts_to_bound_peer(
     peer: &Peer,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     (denied_nodes, log): (&[String], Option<&MemberKeys>),
     payload: &str,
     within: Duration,
+    current: &dyn Fn() -> bool,
 ) -> Result<(), String> {
+    if !current() {
+        return Err(MOVED_ON.to_owned());
+    }
     if let Some(why) = log.and_then(MemberKeys::unread) {
         return Err(why.to_owned());
     }
@@ -9942,6 +10271,9 @@ pub fn push_facts_to_bound_peer(
         within,
     )
     .map_err(|e| e.to_string())?;
+    if !current() {
+        return Err(MOVED_ON.to_owned());
+    }
     verify_bound_peer_proof(peer, reached.peer.as_ref(), (denied_nodes, log))?;
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -9953,6 +10285,9 @@ pub fn push_facts_to_bound_peer(
         .map_err(|e| e.to_string())?;
     let watchdog = HandshakeWatchdog::arm(tcp, left).map_err(|e| e.to_string())?;
     let exchange = (|| -> Result<(), String> {
+        if !current() {
+            return Err(MOVED_ON.to_owned());
+        }
         let stream = reached.transport.stream();
         stream
             .write_all(payload.as_bytes())
@@ -10006,7 +10341,7 @@ pub fn push_facts_to_peer(
         fleet: None,
         signed: None,
     };
-    push_facts_to_bound_peer(&peer, (secret, me), (&[], None), payload, within)
+    push_facts_to_bound_peer(&peer, (secret, me), (&[], None), payload, within, &|| true)
 }
 
 const MAX_MAIL_CODE_REQUEST: u64 = 1024;

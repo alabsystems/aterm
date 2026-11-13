@@ -2,22 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::harness::accounts::Mode;
+use crate::harness::accounts::{Cli, Mode};
+use crate::harness::accounts_step::Step;
 use crate::harness::codex_alab::DefaultRow;
 
 fn auth(email: Option<&str>) -> Vec<u8> {
-    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
-        "email": email,
-        "https://api.openai.com/auth": {
-            "chatgpt_user_id": "fixture-user",
-            "chatgpt_account_id": "fixture-account"
-        }
-    }));
-    aterm_json::to_vec(&aterm_json::json!({
-        "auth_mode": "chatgpt",
-        "tokens": {"id_token": token, "access_token": token}
-    }))
-    .unwrap()
+    crate::ai::testing::codex_auth(email)
 }
 
 #[test]
@@ -89,6 +79,33 @@ fn a_refused_launch_does_not_preserve_mismatched_default_attribution() {
     assert_eq!(view.serving_login, None);
     assert_eq!(view.serving_login_file, None);
     assert_eq!(std::fs::read(path).unwrap(), replaced);
+}
+
+/// A MOVED DEFAULT-ROW FACT SURVIVES AN UNRELATED LAUNCH REFUSAL: a nonexistent pin owns the
+/// launch refusal, while the independent moved-login fact still names the sync that repairs it.
+/// CONTROL: a matching default login removes only the moved fact.
+#[test]
+fn a_moved_default_fact_survives_an_unrelated_pin_refusal() {
+    let pool = DoctorPool::new(true, Some(Mode::Early));
+    pool.state(|state| {
+        state.active = Some("gone".to_owned());
+        state.pinned = true;
+    });
+    let path = pool.b.home.join(".codex/auth.json");
+    std::fs::write(&path, auth(Some("work@example.com"))).unwrap();
+    let facts = pool.facts();
+    let view = facts.pool.as_ref().unwrap();
+    assert_eq!(
+        view.default_moved,
+        Some(("main".to_owned(), Step::Sync(Cli::Codex)))
+    );
+    assert_eq!(view.launch_end, Some(LaunchEnd::Owner));
+
+    std::fs::write(&path, auth(Some("main@example.com"))).unwrap();
+    let control = pool.facts();
+    let view = control.pool.as_ref().unwrap();
+    assert_eq!(view.default_moved, None, "CONTROL");
+    assert_eq!(view.launch_end, Some(LaunchEnd::Owner), "CONTROL");
 }
 
 #[test]
@@ -300,7 +317,7 @@ fn non_file_codex_facts_do_not_judge_a_contradictory_stale_auth_file() {
 }
 
 /// A POOL WHOSE LAUNCH IS REFUSED FOR WHAT ITS DEFAULT LOGIN NAMES COUNTS IN `health:`, by the CLI's
-/// name, and asks a person for the sign-in that ends it. CONTROL: the login its row names is OK.
+/// name, and aterm's own renewal ends it, asking no person. CONTROL: the login its row names is OK.
 #[test]
 fn a_launch_refused_for_a_moved_default_counts_in_health() {
     let pool = DoctorPool::new(true, Some(Mode::Early));
@@ -318,12 +335,13 @@ fn a_launch_refused_for_a_moved_default_counts_in_health() {
     let health = health_of();
     assert_eq!(health.word, "WARN", "{health:?}");
     assert_eq!(health.warning, ["codex"], "{health:?}");
-    assert_eq!(health.mends.len(), 1, "{health:?}");
+    assert_eq!(health.by_aterm, ["codex"], "{health:?}");
+    assert!(health.mends.is_empty(), "{health:?}");
 }
 
 /// A SYNC ASKS NO PERSON FOR ANYTHING: where a sync moves the row off a moved default login, the
 /// doctor's row is a note that names no person and mends nothing, and aterm's upkeep runs that sync.
-/// CONTROL: where no row holds that account, a person's sign-in ends it, and the row asks for it.
+/// CONTROL: where no row holds that account, the row's own renewal ends it, which aterm runs.
 #[test]
 fn a_moved_default_a_sync_ends_asks_no_person() {
     use crate::ai::state::{Actor, Mark, assess};
@@ -337,8 +355,9 @@ fn a_moved_default_a_sync_ends_asks_no_person() {
     });
     let control = assess(&pool.facts(), true, DoctorPool::NOW);
     assert_eq!(control.mark, Mark::Warn, "CONTROL: {control:?}");
-    assert_eq!(control.actor, Some(Actor::Person), "CONTROL: {control:?}");
-    assert!(control.mend.is_some(), "CONTROL: {control:?}");
+    assert_eq!(control.actor, Some(Actor::Aterm), "CONTROL: {control:?}");
+    assert!(control.fix.is_some(), "CONTROL: {control:?}");
+    assert!(control.mend.is_none(), "CONTROL: {control:?}");
 
     let work = pool.b.home.join(".aterm/logins/codex/work");
     std::fs::write(work.join("auth.json"), auth(Some("other@example.com"))).unwrap();
@@ -347,8 +366,8 @@ fn a_moved_default_a_sync_ends_asks_no_person() {
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n\n\
              [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"other@example.com\"\n\
-             dir = \"{}\"\n",
-            work.display()
+             dir = {}\n",
+            crate::harness::host_path::toml(&work)
         ),
     )
     .unwrap();

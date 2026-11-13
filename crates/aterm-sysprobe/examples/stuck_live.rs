@@ -477,6 +477,7 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         becomes: None,
         claims_ahead: None,
         build_admission: None,
+        aterm_wait: false,
         exec_version: None,
     }
 }

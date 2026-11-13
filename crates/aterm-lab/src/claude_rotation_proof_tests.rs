@@ -69,8 +69,8 @@ const DRIVE_LEDGER: &str = r#"{"detail":"SIGTERM","from":"2.1.310","pid":65070,"
 "#;
 
 /// Where the run's two logins lived.
-const DIR_A: &str = "/private/tmp/at.lab-501/aterm-8dd99024/runs/rp1/scratch/home/.claude";
-const DIR_B: &str = "/private/tmp/at.lab-501/aterm-8dd99024/runs/rp1/scratch/state/harness/claude-harness/accounts/logins/lab-b";
+const DIR_A: &str = "/private/tmp/.ubd/at.lab-501/aterm-8dd99024/runs/rp1/scratch/home/.claude";
+const DIR_B: &str = "/private/tmp/.ubd/at.lab-501/aterm-8dd99024/runs/rp1/scratch/state/harness/claude-harness/accounts/logins/lab-b";
 
 fn dirs() -> Vec<(String, String)> {
     vec![
@@ -788,7 +788,7 @@ fn the_fleet_names_three_rows_of_one_machine_and_the_synced_roster_is_checked_ag
 const DAY2: i64 = 1_793_084_400_000;
 
 /// lab-b's login directory in rp2.
-const DIR_B2: &str = "/private/tmp/at.lab-501/aterm-8dd99024/runs/rp2/scratch/state/harness/claude-harness/accounts/logins/lab-b";
+const DIR_B2: &str = "/private/tmp/.ubd/at.lab-501/aterm-8dd99024/runs/rp2/scratch/state/harness/claude-harness/accounts/logins/lab-b";
 
 /// rp2's stub log from R3's served turn through R4's (their `RL200[…]` tails cut).
 const STUB_LOG_R4: &str = r#"10:04:50.195 POST /v1/messages -> 200 body=55060B mode=ok kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=8 tools=13 sys=6082c last_user="Write one sentence about tides, then stop. [aterm harness] The usage ~" auth=oat:lab-a RL limit lifted (reset passed) sse=4 deltas
@@ -1325,7 +1325,7 @@ fn r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_el
 // Lab `rp6` (Claude Code 2.1.311, 2026-10-27): R2 (its local midnight is DAY2's).
 
 /// lab-c's login directory in rp6.
-const DIR_C6: &str = "/private/tmp/at.lab-501/aterm-8dd99024/runs/rp6/scratch/state/harness/claude-harness/accounts/logins/lab-c";
+const DIR_C6: &str = "/private/tmp/.ubd/at.lab-501/aterm-8dd99024/runs/rp6/scratch/state/harness/claude-harness/accounts/logins/lab-c";
 
 /// rp6's journal at R2's move: P7's turn end, the move ahead, the new process's start, P8's.
 const JOURNAL_R2: &str = r#"{"t":1793130061546,"sid":"s-8a81eae7abf4dbbd0e21","kind":"event","phase":"idle","seq":2495,"line":"EVENT idle seq=2495 ⏺ Hi! I am the local lab stub, not a model. (reply 10)"}
@@ -1709,7 +1709,7 @@ const DAY6: i64 = 1_793_692_800_000;
 /// `rp1103b`'s tab (Claude Code 2.1.317, 2026-11-03).
 const SID6: &str = "s-2ace6a33337999bc00a0";
 /// `rp1103b`'s `lab-c` login, R6's walled row.
-const DIR_C_R6: &str = "/private/tmp/at.lab-501/rotation-s-d9bdc-58e7f358/runs/rp1103b/scratch/state/harness/claude-harness/accounts/logins/lab-c";
+const DIR_C_R6: &str = "/private/tmp/.ubd/at.lab-501/rotation-s-d9bdc-58e7f358/runs/rp1103b/scratch/state/harness/claude-harness/accounts/logins/lab-c";
 
 /// `rp1103b`'s stub log at R6, cut as [`STUB_LOG`]: `lab-c`'s wall at P10, Claude Code's own turn
 /// for the job's end (its `<task-notification>`) at that wall again, and `lab-a`'s turn once the

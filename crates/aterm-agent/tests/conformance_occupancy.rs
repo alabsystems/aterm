@@ -68,6 +68,9 @@ struct Real {
     /// The hung call's leader's birth: an episode closed in an odd variant's run reopens on a
     /// call born later in the same group.
     birth: u64,
+    /// The engine's episode of the hung call: each close opens the next run of no progress (the
+    /// call progressed between), never the told one again.
+    run: u32,
     /// The K clock, fed as the loop's `door_k` feeds it. Its clock, `look`, moves only at
     /// `Sample` and `SampleLast`, so the hold's and the pace's clocks never age it.
     due: DueClock<EpisodeKey>,
@@ -99,15 +102,16 @@ struct Run {
 /// The hung call's group, which every episode of the stuck runs is of.
 const PGID: u32 = 27_098;
 
-fn hung(birth: u64) -> BackgroundCall {
+fn hung(birth: u64, run: u32) -> BackgroundCall {
     BackgroundCall {
         pid: PGID,
         pgid: PGID,
         birth: Some(birth),
-        exe: String::from("cargo"),
+        episode: run,
         task: Some(String::from("bplle5dxj")),
         quiet_ms: 31 * 60_000,
         wait: None,
+        held_by: None,
     }
 }
 
@@ -116,7 +120,7 @@ fn facts_read(r: &Real, names: bool) -> FactsReading {
     FactsReading {
         as_of_ms: r.now,
         no_progress: if names {
-            vec![hung(r.birth)]
+            vec![hung(r.birth, r.run)]
         } else {
             Vec::new()
         },
@@ -667,8 +671,11 @@ fn mirror(
             if rule == RuleId::HoldRoom && !run.stuck {
                 r.now += HOLD_ROOM_APART_MS;
             }
-            if run.stuck && run.variant % 2 == 1 {
-                r.birth += 1;
+            if run.stuck {
+                r.run += 1;
+                if run.variant % 2 == 1 {
+                    r.birth += 1;
+                }
             }
             if rule == RuleId::Wake && !run.stuck {
                 // The told wake leaves the book, and the agent declares its next.
@@ -679,7 +686,7 @@ fn mirror(
         }
         "Intend" => {
             let key = if run.stuck {
-                EpisodeKey::no_progress(PGID, r.birth)
+                EpisodeKey::no_progress(PGID, r.birth, r.run)
             } else {
                 episode_now(r, rule)
             };
@@ -835,6 +842,7 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
             host_line: false,
             facts: FactsState::default(),
             birth: 11,
+            run: 1,
             due: DueClock::default(),
             look: T0,
             k_key: None,

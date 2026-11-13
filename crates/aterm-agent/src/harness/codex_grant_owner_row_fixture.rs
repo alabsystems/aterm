@@ -138,6 +138,7 @@ fn create_rows_in<const N: usize>(
         claude_pid: None,
         codex_thread: None,
         codex_home: None,
+        xdg_config_home: None,
         codex_login: None,
         agy_conversation: None,
         now: match layout {
@@ -271,7 +272,7 @@ fn stage_row(
     )
 }
 
-fn prepare_row(
+pub(super) fn prepare_row(
     env: &Env,
     caller: &str,
     label: &str,

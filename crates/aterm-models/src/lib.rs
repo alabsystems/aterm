@@ -79,10 +79,10 @@ const DOMAINS: [Domain; 17] = [
 #[must_use]
 pub fn link_all() -> Vec<&'static str> {
     let domains = std::hint::black_box(DOMAINS);
-    let locations: Vec<&'static str> =
-        aterm_spec::registry::iter::<aterm_spec::xref::RegisteredModel>()
-            .map(|r| r.location)
-            .collect();
+    // A location is `file!()`, spelled with the building host's separator (`\` on Windows).
+    let locations: Vec<String> = aterm_spec::registry::iter::<aterm_spec::xref::RegisteredModel>()
+        .map(|r| r.location.replace('\\', "/"))
+        .collect();
     domains
         .iter()
         .map(|(krate, model)| {

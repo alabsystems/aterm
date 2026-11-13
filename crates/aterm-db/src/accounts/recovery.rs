@@ -225,7 +225,7 @@ impl Recovery {
     )]
     fn pending_at_until(&self, now: u64, deadline: Instant) -> Result<Vec<Request>> {
         require_time(deadline)?;
-        let paths = crate::generation::observed_generation_until(&self.paths, deadline)?;
+        let paths = crate::generation::completed_generation_until(&self.paths, deadline)?;
         let bootstrap =
             Bootstrap::required_until(&paths, deadline).map_err(crate::table::failure)?;
         let session = Session::observe_named_until(&bootstrap, deadline)?;

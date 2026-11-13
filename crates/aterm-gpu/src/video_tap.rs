@@ -530,7 +530,7 @@ pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 /// are independent, so a few convert side by side and the store takes them in capture order.
 #[cfg(not(target_arch = "wasm32"))]
 fn convert_workers() -> usize {
-    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 4).clamp(1, 3))
+    aterm_cores::available_parallelism().map_or(1, |cores| (cores.get() / 4).clamp(1, 3))
 }
 
 /// One mapped slot's raw padded bytes and per-frame inputs for [`mapped_to_rgba8`].

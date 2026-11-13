@@ -13,7 +13,46 @@ fn stamp(pid: u32, start: &str, cause: Cause, at: u64) -> Stamp {
         start: start.to_string(),
         cause,
         at,
+        input: None,
     }
+}
+
+#[test]
+fn a_restart_input_receipt_roundtrips_and_malformed_evidence_grants_nothing() {
+    let mut accepted = stamp(4242, "Wed Sep 23 20:13:55 2026", Cause::Asked, 100);
+    accepted.input = Some(Input {
+        host: "aterm-harness@42".to_string(),
+        seq: 7,
+    });
+    assert_eq!(
+        Stamp::from_json(&accepted.to_json()),
+        Some(accepted.clone())
+    );
+    let mut value: aterm_json::Value = aterm_json::from_str(&accepted.to_json()).expect("stamp");
+    for malformed in [
+        "null",
+        "{}",
+        "{\"host\":\"\",\"seq\":7}",
+        "{\"host\":\" aterm-harness@42\",\"seq\":7}",
+        "{\"host\":\"aterm-harness@42\",\"seq\":\"7\"}",
+        "{\"host\":\"aterm-harness@42\",\"seq\":-1}",
+    ] {
+        value.as_object_mut().expect("stamp").insert(
+            "input".into(),
+            aterm_json::from_str(malformed).expect("malformed receipt value"),
+        );
+        let read = Stamp::from_json(&aterm_json::to_string(&value).expect("stamp"))
+            .expect("the restart itself remains recorded");
+        assert_eq!(read.input, None, "{malformed}");
+        assert!(read.names(accepted.pid, &accepted.start));
+    }
+    value.as_object_mut().expect("stamp").remove("input");
+    assert_eq!(
+        Stamp::from_json(&aterm_json::to_string(&value).expect("stamp"))
+            .expect("stamp with no input receipt")
+            .input,
+        None
+    );
 }
 
 /// NEGATIVE CONTROL: a symlinked `state` or `<state>/upgrade` directory is refused on read, write, and take.
@@ -231,10 +270,10 @@ fn the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by() {
     assert_eq!(read(state, "s-1"), Some(s), "asking removes nothing");
 }
 
-/// The act reads a start in the snapshot's own spelling: on macOS by syscall, never a `ps`, and
-/// equal to what `ps -o lstart=` in UTC and the C locale says of the same process. A stamp stands a
-/// second short of going stale.
-#[cfg(unix)]
+/// The act reads a start in the snapshot's own spelling, by syscall, never a `ps`: on Unix equal
+/// to what `ps -o lstart=` in UTC and the C locale says of the same process, on Windows the
+/// creation `FILETIME` Claude Code writes as its `procStart`. A stamp stands a second short of
+/// going stale.
 #[test]
 fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     let me = std::process::id();
@@ -242,7 +281,7 @@ fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     assert_eq!(
         Some(start),
         super::super::upgrade_drive::kernel_start(me),
-        "the syscall's spelling is ps's"
+        "the stamp's spelling is the snapshot's"
     );
     let s = stamp(me, "x", Cause::Asked, 1_000);
     let stale_at = 1_000 + super::super::relaunch::STALE_S;

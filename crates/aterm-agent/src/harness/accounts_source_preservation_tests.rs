@@ -56,7 +56,12 @@ fn transition_with(state: &State, action: &str, mutant: u8) -> State {
             // Migration uses durable retirement instead of timestamp order.
             let future = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
             for path in [&copy, &desk.fleet_file()] {
-                fs::File::open(path).unwrap().set_modified(future).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(future)
+                    .unwrap();
             }
             copy.clone()
         }

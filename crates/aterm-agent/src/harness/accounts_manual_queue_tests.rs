@@ -341,7 +341,7 @@ fn delayed_manual_failure_retires_only_its_exact_uncancelled_intent() {
 }
 
 #[test]
-fn only_typed_unsupported_retires_its_exact_next_without_provider_history() {
+fn only_typed_unsupported_retires_its_exact_selection_without_provider_history() {
     let root = aterm_tempfile::tempdir().unwrap();
     let store = accounts::Store::at(root.path());
     let first = store.request_next(NOW).unwrap();
@@ -383,9 +383,42 @@ fn only_typed_unsupported_retires_its_exact_next_without_provider_history() {
         RenewalDispatch::Unavailable
     );
     assert!(store.load(NOW + 1).unwrap().0.pending_pin.is_none());
+    // An Account selection follows the same rule: upkeep resumes it before any other
+    // sign-in, so one this platform can never run is retired, never kept for good.
+    let older = store.request_pin("same", NOW + 2).unwrap();
+    let older = accounts::PendingSelection::Account(older);
+    assert_eq!(
+        manual_queue_refused(
+            &store,
+            &older,
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            NOW + 2
+        ),
+        RenewalDispatch::Fenced
+    );
+    assert_eq!(
+        store.load(NOW + 2).unwrap().0.pending_pin.as_ref(),
+        Some(&older),
+        "a refusal that may pass keeps the Account intent for a later upkeep"
+    );
     let request = store.request_pin("same", NOW + 2).unwrap();
     let account = accounts::PendingSelection::Account(request);
-    let before = fs::read(store.state_file()).unwrap();
+    assert_eq!(
+        manual_queue_refused(
+            &store,
+            &older,
+            io::Error::from(io::ErrorKind::Unsupported),
+            NOW + 2
+        ),
+        RenewalDispatch::Unavailable
+    );
+    assert_eq!(
+        store.load(NOW + 2).unwrap().0.pending_pin.as_ref(),
+        Some(&account),
+        "retiring an older Account intent keeps the newer one"
+    );
+    let mut expected = store.load(NOW + 2).unwrap().0;
+    expected.pending_pin = None;
     assert_eq!(
         manual_queue_refused(
             &store,
@@ -396,9 +429,9 @@ fn only_typed_unsupported_retires_its_exact_next_without_provider_history() {
         RenewalDispatch::Unavailable
     );
     assert_eq!(
-        fs::read(store.state_file()).unwrap(),
-        before,
-        "Account intent and durable pin metadata remain exact"
+        store.load(NOW + 2).unwrap().0,
+        expected,
+        "only the exact Account intent is retired; durable pin metadata remain exact"
     );
     assert_eq!(
         fs::read(store.logins_file()).ok(),
@@ -587,7 +620,15 @@ fn a_saved_next_intent_reattaches_without_a_new_nonce_and_no_candidate_retires_i
     let mut fx = live_effects();
     fx.renew_guard = &restarted;
     let result = with_scope_effects(lifetime.enter().unwrap(), fx, |fx| {
-        manual_selection_owned(Cli::Claude, &home, &state, &roster, owner, NOW, fx)
+        manual_selection_owned(
+            Cli::Claude,
+            &home,
+            &state,
+            &roster,
+            (owner, Gesture::Clicked),
+            NOW,
+            fx,
+        )
     });
     assert_eq!(result, RenewalDispatch::Retired);
     assert!(store.load(NOW).unwrap().0.pending_pin.is_none());
@@ -630,7 +671,15 @@ fn queued_next_rechecks_cancellation_replacement_and_policy_before_admission() {
                 let mut fx = live_effects();
                 fx.renew_guard = &into;
                 let result = with_scope_effects(scope, fx, |fx| {
-                    manual_selection_owned(Cli::Claude, &home, &state, &roster, owner, NOW, fx)
+                    manual_selection_owned(
+                        Cli::Claude,
+                        &home,
+                        &state,
+                        &roster,
+                        (owner, Gesture::Clicked),
+                        NOW,
+                        fx,
+                    )
                 });
                 let _ = tx.send(result);
             })

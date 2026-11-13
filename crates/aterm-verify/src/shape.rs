@@ -273,7 +273,8 @@ fn kept(book: &Shaping<'_>, piece: &Piece, variant: Option<&str>) -> Option<Esti
 /// would hold if every one compiled at once, an upper bound of what they hold together, which
 /// counts the units a warm build directory has fresh too. So it stands in only where no record of
 /// the selection is kept: measured 2026-10-29, S1 less aterm-gui held 13 GiB where its units
-/// summed 21 GiB. `None` with none kept.
+/// summed 21 GiB. `None` unless every named unit has a kept peak: omitting an unknown unit would
+/// make this a lower bound, not the conservative upper bound the shaper needs.
 fn unit_sum(book: &Shaping<'_>, graph: &Graph) -> Option<Estimate> {
     named_unit_sum(book, graph.names().into_iter())
 }
@@ -282,17 +283,16 @@ fn named_unit_sum<'a>(
     book: &Shaping<'_>,
     names: impl Iterator<Item = &'a UnitName>,
 ) -> Option<Estimate> {
-    let mut found: Vec<(u64, &UnitName)> = names
-        .filter_map(|n| {
-            most(
-                book.records,
-                UNIT_STAGE,
-                std::slice::from_ref(&n.package),
-                Some(&n.kind),
-            )
-            .map(|(peak, _)| (peak, n))
-        })
-        .collect();
+    let mut found = Vec::new();
+    for name in names {
+        let (peak, _) = most(
+            book.records,
+            UNIT_STAGE,
+            std::slice::from_ref(&name.package),
+            Some(&name.kind),
+        )?;
+        found.push((peak, name));
+    }
     if found.is_empty() {
         return None;
     }
@@ -504,7 +504,7 @@ struct Planner<'a, 'p> {
     book: &'a Shaping<'a>,
     whole: Piece,
     interner: Interner,
-    probe: &'p mut dyn FnMut(&Piece) -> Result<String, String>,
+    probe: &'p mut dyn FnMut(&Piece, bool, &mut Interner) -> Result<Graph, String>,
     why_not: Vec<String>,
     /// The cuts it did not take because a run refused them ([`Part::refused`]).
     refused: Vec<Piece>,
@@ -512,7 +512,8 @@ struct Planner<'a, 'p> {
 
 impl Planner<'_, '_> {
     fn read(&mut self, piece: &Piece) -> Result<Graph, String> {
-        (self.probe)(piece).and_then(|t| Graph::read(&t, &mut self.interner))
+        let closing = piece == &self.whole;
+        (self.probe)(piece, closing, &mut self.interner)
     }
 
     /// What `piece` holds, called after `after`: a lib-test call by its own record, else its
@@ -653,7 +654,8 @@ impl Planner<'_, '_> {
 }
 
 /// THE CALLS A TEST COMPILE OVER `selection` MAKES (VERIFY-SHAPE), by `book`, reading each call's
-/// unit graph through `probe` (its `--unit-graph`, resolved and never built). [`Shaped::Whole`],
+/// unit graph through `probe` (resolved and never built); the probe is told which piece is the
+/// exact closing call, whose graph includes every command folded into its stage. [`Shaped::Whole`],
 /// with its estimate, when the stage is not shaped: its estimate claims less than the budget, or
 /// nothing is known of it. The estimate is the largest of its own record in any checkout, a plain
 /// build's ([`crate::memory::plain_like`]), the cover of the narrower selections it holds, and its
@@ -677,7 +679,7 @@ impl Planner<'_, '_> {
 pub fn shape(
     selection: &[String],
     book: &Shaping<'_>,
-    probe: &mut dyn FnMut(&Piece) -> Result<String, String>,
+    probe: &mut dyn FnMut(&Piece, bool, &mut Interner) -> Result<Graph, String>,
 ) -> Shaped {
     let whole = Piece::of(selection, false);
     if whole.crates.is_empty() {
@@ -812,7 +814,7 @@ pub fn shape(
             .into_iter(),
     )
     .filter(|e| aterm_capacity::peak_claim(e.peak) < whole_claim);
-    let calls = in_order(&pieces)
+    let calls: Vec<Call> = in_order(&pieces)
         .into_iter()
         .map(|mut part| {
             let i = part.index;
@@ -890,6 +892,18 @@ pub fn shape(
             Call { part, mem }
         })
         .collect();
+    if let Some(call) = calls.iter().find(|call| call.mem >= book.budget) {
+        let mut whole = alone(format!(
+            "call {} of {} (`{}`) would still claim {}, not below the {} shaping budget",
+            call.part.index + 1,
+            call.part.of,
+            call.part.piece.label(),
+            aterm_capacity::size(call.mem),
+            aterm_capacity::size(book.budget)
+        ));
+        whole[0].part.refused = std::mem::take(&mut planner.refused);
+        return Shaped::Calls(whole);
+    }
     Shaped::Calls(calls)
 }
 
@@ -999,6 +1013,9 @@ pub type Built = (
 pub struct Run {
     /// Each cut that passed ([`Built`]).
     pub built: Vec<Built>,
+    /// Cuts a later nonclosing call rebuilt. Their refusal is persisted only by the exact
+    /// closing call, whose [`Part::piece`] names the complete selection for the refusal key.
+    pub pending_refusals: Vec<Piece>,
     /// What the fresh check said for each call, by its index.
     pub said: std::collections::BTreeMap<usize, String>,
     /// The units of the main lane's build directory each call's artifacts are outputs of, fresh
@@ -1006,6 +1023,9 @@ pub struct Run {
     /// release run that passes keeps as the record the cache's bound reads
     /// ([`crate::disk::keep_used`], `atpkg::build_cache::stale::USED`).
     pub used: atpkg::build_cache::stale::Used,
+    /// The shared-cache binding admitted before these unit observations, retained through
+    /// publication so a replacement directory cannot inherit the earlier cache's unit set.
+    pub(crate) used_cache: Option<std::sync::Arc<atpkg::build_cache::registered::KnownCargoCache>>,
 }
 
 /// THE FRESH CHECK: whether what the cuts `built` built came back fresh in a later call's

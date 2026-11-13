@@ -6,7 +6,7 @@
 //! unless `--show-addresses` is given, and no refusal quotes a value. JSON output is for
 //! scripts and agents; there is no MCP server.
 
-use super::{Capacity, Entry, Handle, Roll, TABLES, Usage, View, edit, find};
+use super::{Capacity, Entry, Handle, Roll, Saved, TABLES, Usage, View, edit, find};
 use crate::{
     Error, Result,
     database::decode_hex,
@@ -35,7 +35,7 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
   get <app>/<role> <collection> <pk>    one row\n\
   scan <app>/<role> <collection> [--where col=val]... [--tsv|--json]\n\
   history <app>/<role> [<collection> [<pk>]]\n\
-                                        who changed what, oldest first\n\
+                                        who changed what, in causal order\n\
   check <app>/<role>                    conflicts, dangling references, unique clashes\n\
   revert <app>/<role> <operation> [--request <hex>]\n\
   export <app>/<role> <collection> --tsv <file> [--where col=val]...\n\
@@ -770,6 +770,7 @@ fn history(
                 "operation": hex::encode_lower(&entry.operation),
                 "machine": entry.machine.as_ref().map(keys::uuid32),
                 "authored_ms": entry.authored_ms,
+                "hlc": {"ms": entry.hlc.ms, "counter": entry.hlc.counter},
                 "request": entry.request.as_ref().map(|r| hex::encode_lower(r)),
                 "reverts": entry.reverts.as_ref().map(|r| hex::encode_lower(r)),
                 "changes": entry.changes.iter().filter(|c| wanted(c))
@@ -825,22 +826,15 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     let compiled = handle.compiled();
     let collection = compiled.collection(&base.collection)?;
     let text = read_capped(file, "grid file")?;
-    let view = handle.view()?;
-    let birth = |c: &Collection, values: &_| compiled.born(c, values, &view.cells);
-    let problems = |problems: &[grid::Problem]| {
-        Output::Json(json!({"written": 0, "problems": problems
-            .iter()
-            .map(|p| json!({"at": edit::place(&base, p), "line": p.line, "rule": p.rule}))
-            .collect::<Vec<_>>()}))
+    let (plan, applied) = match handle.save(collection, &base, &text)? {
+        Saved::Written { plan, applied } => (plan, applied),
+        Saved::Problems(found) => {
+            return Ok(Output::Json(json!({"written": 0, "problems": found
+                .iter()
+                .map(|p| json!({"at": edit::place(&base, p), "line": p.line, "rule": p.rule}))
+                .collect::<Vec<_>>()})));
+        }
     };
-    let plan = match grid::plan(compiled.table, collection, &base, &text, &birth) {
-        Ok(plan) => plan,
-        Err(found) => return Ok(problems(&found)),
-    };
-    let applied = handle.apply(collection, &plan)?;
-    if let Some(refused) = &applied.refused {
-        return Ok(problems(&[edit::refused_problem(&plan, refused)]));
-    }
     let fresh = grid::export(
         compiled.table,
         collection,
@@ -865,98 +859,5 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
 }
 
 #[cfg(test)]
-mod secret_tests {
-    use super::*;
-    use crate::typed::{
-        Column, Derive, Writers,
-        secret::{Cell, MASK, Secret},
-    };
-
-    const COLLECTION: Collection = Collection {
-        name: "mailbox",
-        version: 2,
-        kind: Kind::Cells,
-        writers: Writers::Owner,
-        prefix: "mb",
-        derive: Derive::Random,
-        columns: &[
-            Column::new("row", Ty::Enum(&["live"])),
-            Column::new("password", Ty::Secret),
-        ],
-        unique: &[],
-        max_row: 1024,
-    };
-
-    #[test]
-    fn secret_get_scan_export_history_and_unknown_reader() {
-        let password = "synthetic-display-password";
-        let token = Secret::new(password.into())
-            .seal(
-                &[3; 32],
-                &[4; 32],
-                Cell {
-                    table: "alab/registry",
-                    collection: "mailbox",
-                    row: "mb-fixture",
-                    column: "password",
-                },
-            )
-            .unwrap();
-        let change = crate::typed::cell::change(
-            &COLLECTION,
-            CellKey {
-                pk: "mb-fixture",
-                col: "password",
-                elem: None,
-            },
-            &CellValue::owner(2, Value::String(token.clone())),
-        )
-        .unwrap();
-        let cells = std::collections::BTreeMap::from([(
-            (change.collection.clone(), change.key.clone()),
-            crate::database::Cell {
-                stopped: false,
-                candidates: vec![crate::database::Candidate {
-                    operation: [1; 32],
-                    value: change.value.clone().unwrap(),
-                }],
-            },
-        )]);
-        let view = View {
-            ops: vec![],
-            quota: Default::default(),
-            cells,
-            owned: Default::default(),
-            complete: true,
-            refused: vec![],
-        };
-        const OLD: Collection = Collection {
-            columns: &[Column::new("row", Ty::Enum(&["live"]))],
-            ..COLLECTION
-        };
-        let old_row = view.project(&OLD).rows.remove("mb-fixture").unwrap();
-        assert!(old_row.raw.contains("password"));
-        assert_eq!(
-            old_row.get("password").and_then(Value::as_str),
-            Some(token.as_str())
-        );
-        for reveal in [false, true] {
-            for value in [
-                get(&view, &COLLECTION, "mb-fixture", reveal).unwrap(),
-                scan(&view, &COLLECTION, &[], reveal).unwrap(),
-            ] {
-                let text = aterm_json::to_string(&value).unwrap();
-                assert!(text.contains(MASK));
-                assert!(!text.contains(password));
-                assert!(!text.contains(&token));
-            }
-            assert_eq!(
-                grid::show(&Ty::Secret, &Value::String(token.clone()), reveal),
-                MASK
-            );
-            // Unknown-column history uses this recursive renderer on the stored cell.
-            let history = grid::raw_masked(change.value.as_ref().unwrap(), reveal);
-            assert!(aterm_json::to_string(&history).unwrap().contains(MASK));
-        }
-    }
-}
+#[path = "command_secret_tests.rs"]
+mod secret_tests;

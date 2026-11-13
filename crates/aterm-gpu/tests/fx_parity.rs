@@ -648,11 +648,11 @@ fn fx_texel_bytes_survive_the_arm() {
 }
 
 /// The integer nearest map (`docs/DESIGN-card-engine-2026-10-19.md` §4.1)
-/// at odd scales and mirrors, under both laws: an Exact sprite is byte-exact
-/// whatever its texels, and a Linear one is byte-exact wherever its texels
-/// and ink are opaque (its blend has nothing to round), so a delta there is
-/// a texel picked differently. Translucent Linear texels hold
-/// `FxBlend::Linear.parity()`.
+/// at odd scales and mirrors, under both laws: a sprite is byte-exact
+/// wherever its texels and ink are opaque (its blend has nothing to round),
+/// so a delta there is a texel picked differently. Translucent texels hold
+/// their blend's rounding: an Exact one's source-over
+/// [`common::SOURCE_OVER_LSB`], a Linear one's `FxBlend::Linear.parity()`.
 #[test]
 fn sprites_map_texels_exactly_at_odd_scales_under_both_laws() {
     let theme = Theme::default();
@@ -677,7 +677,12 @@ fn sprites_map_texels_exactly_at_odd_scales_under_both_laws() {
     let art = |texels, data| Arc::new(FxArt::new(aw, ah, texels, data).expect("sized"));
     let arts = [
         (
-            "exact premul",
+            "exact opaque",
+            FxBlend::Exact,
+            art(FxTexels::Rgba8Premul, opaque.clone()),
+        ),
+        (
+            "exact translucent",
             FxBlend::Exact,
             art(FxTexels::Rgba8Premul, premul),
         ),
@@ -739,13 +744,16 @@ fn sprites_map_texels_exactly_at_odd_scales_under_both_laws() {
                 worst = worst.max(max_channel_delta(&c.pixels, &g.pixels));
             }
             eprintln!("{arm}: odd scales: {name} delta {worst}");
-            if *name == "linear translucent" {
-                assert!(
+            match *name {
+                "linear translucent" => assert!(
                     worst <= i32::from(FxBlend::Linear.parity()),
                     "{arm}: {name}: the Linear bar, got {worst}"
-                );
-            } else {
-                assert_eq!(worst, 0, "{arm}: {name}: the integer map is byte-exact");
+                ),
+                "exact translucent" => assert!(
+                    worst <= common::SOURCE_OVER_LSB,
+                    "{arm}: {name}: the source-over's rounding, got {worst}"
+                ),
+                _ => assert_eq!(worst, 0, "{arm}: {name}: the integer map is byte-exact"),
             }
         }
     }
@@ -922,6 +930,10 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
     }
 }
 
+/// Dropped residency is refilled and draws the same bytes. The every-kind
+/// frame's translucent inks and texels are source-overs, so each GPU frame is
+/// held to the CPU's within [`common::SOURCE_OVER_LSB`]; the refill to the
+/// first frame byte for byte.
 #[test]
 fn fx_residency_refills_after_a_device_rebuild() {
     let theme = Theme::default();
@@ -933,7 +945,11 @@ fn fx_residency_refills_after_a_device_rebuild() {
         let want = cpu.render_input(&input).pixels;
         let first = gpu.render_input(&mut win, &input, None).pixels;
         assert_arm(arm, &gpu);
-        assert_eq!(max_channel_delta(&want, &first), 0, "{arm}: first frame");
+        let delta = max_channel_delta(&want, &first);
+        assert!(
+            delta <= common::SOURCE_OVER_LSB,
+            "{arm}: first frame, delta {delta}"
+        );
         gpu.drop_fx_arm_residency_for_test();
         let mut win2 = aterm_gpu::WindowGpu::new();
         let again = gpu.render_input(&mut win2, &input, None).pixels;
@@ -951,10 +967,10 @@ fn fx_residency_refills_after_a_device_rebuild() {
     let (mut cpu, _) = common::backends(18.0, theme);
     let want = cpu.render_input(&input).pixels;
     let got = fresh.render_input(&mut win, &input, None).pixels;
-    assert_eq!(
-        max_channel_delta(&want, &got),
-        0,
-        "a fresh renderer refills"
+    let delta = max_channel_delta(&want, &got);
+    assert!(
+        delta <= common::SOURCE_OVER_LSB,
+        "a fresh renderer refills, delta {delta}"
     );
 }
 

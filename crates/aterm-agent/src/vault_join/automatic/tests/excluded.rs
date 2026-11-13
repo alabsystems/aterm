@@ -51,7 +51,7 @@ impl Backend for Excluded {
 
 /// A member whose Commons control the current epochs took away still lets a Mac on its home ALab
 /// LAN in with no window open: the worker's snapshot is the member's desk, which its membership
-/// log seat alone makes (owner, 2026-11-02), and the Mac's proof on the node's port gets the log
+/// log seat alone makes, and the Mac's proof on the node's port gets the log
 /// bundle the Mac writes and is in by.
 /// The owned component path includes the real worker publication, public generation notifier,
 /// loopback READY receiver and fresh solicitation before that proof. The home network remains

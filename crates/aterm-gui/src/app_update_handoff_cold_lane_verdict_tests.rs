@@ -150,7 +150,12 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
         }
     };
     app.handoff_preverify_in_flight = Some(ended_passing(&passing_reason, Instant::now()));
-    app.preverify_read_waited = Some((target, Instant::now()));
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: crate::app_native::decode_dmg_sha256(&artifact())
+            .expect("fixture artifact digest"),
+        until: Instant::now(),
+    });
 
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
         let error = app
@@ -523,6 +528,7 @@ fn the_cold_lane_budget_round_trips_for_its_own_artifact_only() {
     let full = ColdLaneBudget {
         failures: Some(CarriedFailures {
             cycles: 7,
+            epoch_failures: 1,
             since_secs: 21_600,
             activation: false,
         }),
@@ -553,6 +559,23 @@ fn the_cold_lane_budget_round_trips_for_its_own_artifact_only() {
             failures: None,
             ..full
         })
+    );
+    assert_eq!(
+        ColdLaneBudget::decode(&encoded.replace("epoch=1", "epoch=300"), 11, &digest),
+        Some(ColdLaneBudget {
+            failures: None,
+            ..full
+        }),
+        "an epoch place no u8 holds is no carried count"
+    );
+    assert_eq!(
+        ColdLaneBudget::decode(&encoded.replace(";epoch=1", ""), 11, &digest)
+            .and_then(|budget| budget.failures),
+        Some(CarriedFailures {
+            epoch_failures: 0,
+            ..full.failures.expect("the full budget's failures")
+        }),
+        "a parent that wrote no epoch place keeps its count, and its next failure opens an epoch"
     );
     let running = crate::build_info::build_number();
     let relaunch = ColdRelaunch::from_values(

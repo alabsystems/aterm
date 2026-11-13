@@ -241,3 +241,46 @@ fn fire_contrast_halo_clips_at_its_own_row_floor() {
         "multi-row fire halo CPU-vs-GPU max per-channel delta must stay <= 24 (got {delta})"
     );
 }
+
+/// The halo of `█` at (2, 4) lifts into the row above under that row's ink on both backends
+/// (SPECS `layer-z-order`): the GPU draws its halo stream before its glyph stream, and the CPU
+/// stamps the lift in the row above's band before that row's ink, so the twins agree there.
+#[test]
+fn a_lifted_fire_halo_lies_under_the_row_aboves_ink_on_both_backends() {
+    let theme = Theme::default();
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (4usize, 10usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[38;2;255;255;255m\x1b[2;5H\xe2\x96\x88\x1b[3;5H\xe2\x96\x88");
+    let (cw, ch) = cpu.cell_size();
+    let mut input = term.cell_frame(rows, cols);
+    input.fire_patch = vec![
+        bright_fire(1, ch, cw, 8 * cw, 255),
+        bright_fire(2, ch, cw, 8 * cw, 255),
+    ];
+    input.fire_halo = vec![halo(2, 4, 255)];
+    let c = cpu.render_input(&input);
+    let (width, top) = (c.width, cpu.grid_top());
+    let cpu_px = c.pixels.clone();
+    let gpu_px = gpu.render_input(&mut win, &input, None).pixels;
+    let x0 = cpu.pad() + 4 * cw;
+    let cell = |px: &[u32]| -> Vec<u32> {
+        (top + ch..top + 2 * ch)
+            .flat_map(|y| px[y * width + x0..y * width + x0 + cw].iter().copied())
+            .collect()
+    };
+    assert_eq!(
+        cell(&cpu_px)
+            .iter()
+            .filter(|&&p| p & 0x00FF_FFFF != 0x00FF_FFFF)
+            .count(),
+        0,
+        "the CPU recoloured the row above's ink"
+    );
+    let delta = max_channel_delta(&cell(&cpu_px), &cell(&gpu_px));
+    assert!(
+        delta <= 24,
+        "the row above's ink under a lifted halo: CPU and GPU differ by {delta}"
+    );
+}

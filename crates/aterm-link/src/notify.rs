@@ -18,6 +18,14 @@ use crate::notify_need::{NeedWatch, Pair, Step};
 use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn};
 
+#[path = "notify_journal.rs"]
+mod journal;
+
+#[cfg(any(test, debug_assertions))]
+pub use journal::rewind_cursor;
+use journal::StepsFile;
+pub use journal::{cursor_of, journal_lines, suppressed_count, FILE as JOURNAL_FILE};
+
 const PAGE: u32 = crate::transport::POST_PAGE;
 
 /// Verdicts kept in `journal` (must exceed [`PAGE`]).
@@ -79,8 +87,9 @@ pub const DURABLE_WAIT_WORDS: &str = "waits for each record until the broker say
 pub const FLUSH_TALLY_SEAM: &str = "ATERM_LINK_NOTIFY_FLUSH_TALLY";
 
 /// The file under `<state>/notify/` a notifier on [`FLUSH_TALLY_SEAM`] rewrites, unflushed,
-/// after each notice that flushed: `notify-flushes v=1 pid=<pid> durable=<n> ordered=<n>`, the
-/// file and directory flushes its stores asked for since it started, by kind.
+/// after each notice that flushed or wrote: `notify-flushes v=1 pid=<pid> durable=<n>
+/// ordered=<n> bytes=<n>`, the file and directory flushes its stores asked for since it
+/// started, by kind, and the bytes they wrote ([`BYTES`]).
 pub const FLUSH_TALLY: &str = "flush-tally";
 
 /// The development seam that has a following notifier tell the fabric bench, after each fresh
@@ -105,6 +114,21 @@ static FLUSHES: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// The bytes this process's notify stores wrote ([`FLUSH_TALLY`]'s `bytes=`): every replace's
+/// ([`Store::put_bytes`]) and every append to a journal ([`journal::StepsFile::write`]).
+static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_bytes(n: usize) {
+    BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    BYTES_NOTED.with(|noted| noted.set(noted.get() + n as u64));
+}
+
+/// [`BYTES`].
+fn written_bytes() -> u64 {
+    BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn note_flush(flush: Flush) {
     FLUSHES[usize::from(flush.is_ordered())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -127,6 +151,10 @@ enum Notice {
     /// ([`crate::notify_need::warm`]).
     Warm(usize, u64, String, Vec<u8>),
     Checkpoint(usize, u64),
+    /// A reader's start at the head it found with no cursor: the notifier writes it as the
+    /// selector's cursor, ordered, and answers once it is on the media (or why not), before the
+    /// reader reads a record ([`connect_for_reader`]).
+    Start(usize, u64, mpsc::SyncSender<io::Result<()>>),
     Log(usize, ReadLog),
     Durable(usize, u64),
 }
@@ -161,8 +189,9 @@ struct Lag {
 }
 
 /// A part of the notifier's state that a judged record changes in memory and the store holds
-/// whole ([`Notifier::save`]), in the order a rewrite writes them: a verdict ahead of the
-/// stamps it spends and the count it bumps, those ahead of a standing value.
+/// ([`Notifier::save`]), in the order a write puts them on the store: a verdict ahead of the
+/// stamps it spends and the count it bumps (one step of the journal, where the log's store is
+/// the root's, [`journal`]), those ahead of a standing value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Part {
     Journal,
@@ -577,11 +606,298 @@ struct Store {
     root: PathBuf,
 }
 
+/// The file a notifier holds its store by, in the root store ([`Store::hold`]).
+const LOCK: &str = "lock";
+
+/// [`Store::hold`]'s hold on a notify store for one notifier's life, released by `LOCK_UN`
+/// before the close (`clippy.toml`'s flock release rule). A `flock(2)` holds the open file,
+/// not its path, so it keeps the path it took and the file's `(dev, ino)`: while this
+/// descriptor is open no other file takes that inode number on its device, so the path names
+/// the locked file exactly when its `lstat` answers the same pair ([`StoreLock::moved`]).
+struct StoreLock {
+    file: std::fs::File,
+    path: PathBuf,
+    id: (u64, u64),
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// How many times [`Store::hold`] takes [`LOCK`] again where the path was replaced between
+/// its open and its take, before it refuses.
+const HOLD_TRIES: usize = 3;
+
+/// A file's `(dev, ino)`, what [`StoreLock`] holds it by.
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+impl StoreLock {
+    /// The `(dev, ino)` its path names now (`lstat`, never following a link), or None where it
+    /// names nothing (`ENOENT`, or `ENOTDIR` where `notify/` was replaced by a file).
+    ///
+    /// # Errors
+    /// The `lstat`'s errno but `ENOENT` and `ENOTDIR`.
+    fn named(&self) -> io::Result<Option<(u64, u64)>> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) => Ok(Some(file_id(&meta))),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// THE STORE BY ITS PATH: None while the path it took still names the file it locked, else
+    /// what it names instead. A `notify/` (or `notify/lock`) removed or replaced under a running
+    /// notifier is a new store a second notifier can take, while this lock goes on holding a
+    /// file no path names; a notifier that wrote on would write a store it no longer holds.
+    ///
+    /// # Errors
+    /// The `lstat`'s errno ([`StoreLock::named`]): a read that did not answer, which says
+    /// nothing of whether the path names the lock.
+    fn moved(&self) -> io::Result<Option<Moved>> {
+        Ok(match self.named()? {
+            Some(id) if id == self.id => None,
+            Some(other) => Some(Moved::Replaced(other)),
+            None => Some(Moved::Removed),
+        })
+    }
+
+    /// The refusal a running notifier gives once its store `moved` ([`Hold::check`]): kind
+    /// [`io::ErrorKind::NotFound`] where the path names nothing, [`io::ErrorKind::Other`] where
+    /// it names another file, the words naming the store either way.
+    fn lost(&self, moved: Moved) -> io::Error {
+        let store = self.path.parent().unwrap_or(&self.path).display();
+        let (kind, now) = match moved {
+            Moved::Removed => (io::ErrorKind::NotFound, "names nothing".to_string()),
+            Moved::Replaced((dev, ino)) => (io::ErrorKind::Other, format!("names {dev}:{ino}")),
+        };
+        io::Error::new(
+            kind,
+            format!(
+                "the notify store {store} was removed or replaced under this notifier: {} {now}, \
+                 not the lock it holds ({}:{}); it stops rather than write a store another \
+                 notifier may now hold",
+                self.path.display(),
+                self.id.0,
+                self.id.1
+            ),
+        )
+    }
+}
+
+/// What a [`StoreLock`]'s path names in place of the file it locked ([`StoreLock::moved`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moved {
+    /// Nothing: `notify/lock`, or `notify/` itself, was removed.
+    Removed,
+    /// Another file, by its `(dev, ino)`.
+    Replaced((u64, u64)),
+}
+
+/// THE STORE BY ITS PATH, for the notifier and each of its readers: the root store's lock
+/// ([`Store::hold`]) and, once its path no longer names it, the refusal every write after
+/// answers. Every write to the store, the notifier's ([`Notifier::held`]) and a reader's
+/// ([`reader_store`]), runs [`Hold::check`] first. One `lstat` before a write that goes by
+/// path narrows the window a removal can fall in to that write's own; it does not close it
+/// (ATERM-KI-1112-97).
+struct Hold {
+    /// The root store's directory, `notify/`.
+    root: PathBuf,
+    lock: StoreLock,
+    /// The refusal's kind and words, set by the first check that found the path moved.
+    lost: std::sync::OnceLock<(io::ErrorKind, String)>,
+    /// A test's mutant: the store is held by its lock's file only, its path never checked, as a
+    /// build before the check held it.
+    #[cfg(test)]
+    by_file: std::sync::atomic::AtomicBool,
+}
+
+impl Hold {
+    fn new(root: PathBuf, lock: StoreLock) -> Self {
+        Self {
+            root,
+            lock,
+            lost: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            by_file: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the store's path still names the lock held ([`StoreLock::moved`], one `lstat`).
+    /// Once it does not, the store was removed or replaced and is a new store a second
+    /// notifier can take: the first check to find it warns once and records the refusal, and
+    /// it and every check after answer that refusal, which ends the run.
+    ///
+    /// # Errors
+    /// The refusal ([`StoreLock::lost`]), recorded; or an `lstat` that did not answer, its errno
+    /// as it is and not recorded: a write the state dir refuses, retried like any other
+    /// (`Notifier::fail`).
+    fn check(&self) -> io::Result<()> {
+        if let Some(e) = self.lost() {
+            return Err(e);
+        }
+        #[cfg(test)]
+        if self.by_file.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(moved) = self.lock.moved()? else {
+            return Ok(());
+        };
+        let e = self.lock.lost(moved);
+        if self.lost.set((e.kind(), e.to_string())).is_ok() {
+            warn(&e.to_string());
+        }
+        Err(self.lost().unwrap_or(e))
+    }
+
+    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its lock.
+    fn lost(&self) -> Option<io::Error> {
+        self.lost
+            .get()
+            .map(|(kind, said)| io::Error::new(*kind, said.clone()))
+    }
+}
+
 impl Store {
     fn open(state_dir: &str) -> io::Result<Self> {
         let root = Path::new(state_dir).join("notify");
-        std::fs::create_dir_all(root.join("cur"))?;
+        std::fs::create_dir_all(&root)?;
         Ok(Self { root })
+    }
+
+    /// ONE NOTIFIER PER STORE: take this root store, and with it every log's store under
+    /// `logs/`, for one notifier's life, by an exclusive `flock(2)` on [`LOCK`], and write this
+    /// process's pid into it. A second notifier on the same state dir is refused at its start,
+    /// naming the holder's pid, and never waits: it would page what the first pages. The lock
+    /// goes with the last descriptor on its open file description, so a crash, a `SIGKILL`
+    /// and a clean exit all let go and the next start takes it. A refused start has read and
+    /// written no journal or cursor (it may have made `notify/` and the [`LOCK`] file). A file system that takes no lock is refused too
+    /// ([`Store::judge_take`]): the journal appends to a descriptor it holds on the strength of
+    /// this lock, so a store it cannot hold is no store to run on. A take is checked against
+    /// the path after it ([`StoreLock::moved`], one `lstat`): a [`LOCK`] removed or replaced
+    /// between the open and the take is a lock of no store, let go and taken again, up to
+    /// [`HOLD_TRIES`] takes in all.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::WouldBlock`] where another notifier holds it,
+    /// [`io::ErrorKind::Unsupported`] where its file system takes no lock; the open (a [`LOCK`]
+    /// that is a link or not a regular file is refused), `flock(2)`'s other errno, the
+    /// `lstat`'s errno after a take ([`StoreLock::named`]), or [`io::ErrorKind::Other`] naming
+    /// the lock and the store where the path was removed or replaced under each of
+    /// [`HOLD_TRIES`] takes.
+    fn hold(&self) -> io::Result<StoreLock> {
+        let path = self.root.join(LOCK);
+        for _ in 0..HOLD_TRIES {
+            let lock = self.take()?;
+            if lock.moved()?.is_none() {
+                let mut file = &lock.file;
+                file.set_len(0)?;
+                file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                return Ok(lock);
+            }
+        }
+        Err(io::Error::other(format!(
+            "the notify lock {} was removed or replaced between the open and the take of each \
+             of {HOLD_TRIES} tries: something is removing or replacing the notify store {} as \
+             this notifier starts, and it does not start on a store it cannot hold",
+            path.display(),
+            self.root.display()
+        )))
+    }
+
+    /// One open and `flock(2)` take of [`LOCK`] ([`Store::hold`]), not yet checked against its
+    /// path.
+    ///
+    /// # Errors
+    /// As [`Store::hold`]'s, but the path's.
+    fn take(&self) -> io::Result<StoreLock> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = self.root.join(LOCK);
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(&path)
+        })?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the notify lock {} is not a regular file", path.display()),
+            ));
+        }
+        #[cfg(test)]
+        BEFORE_TAKE.with(|seam| {
+            if let Some(seam) = seam.borrow_mut().as_mut() {
+                seam(&path);
+            }
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: StoreLock's Drop releases by LOCK_UN"
+        )]
+        let taken = file.try_lock();
+        self.judge_take(taken)?;
+        Ok(StoreLock {
+            file,
+            path,
+            id: file_id(&meta),
+        })
+    }
+
+    /// What [`Store::hold`]'s `flock(2)` take of [`LOCK`] answered, judged: taken, or the
+    /// refusal it is. Another holder is [`io::ErrorKind::WouldBlock`], naming the pid it wrote;
+    /// a file system that takes no lock is [`io::ErrorKind::Unsupported`], never a take, for a
+    /// second notifier there would append to a journal the first renamed away.
+    ///
+    /// # Errors
+    /// Every answer but a take.
+    fn judge_take(&self, taken: Result<(), std::fs::TryLockError>) -> io::Result<()> {
+        match taken {
+            Ok(()) => Ok(()),
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "the file system of the notify store {} takes no lock ({e}), so one \
+                         notifier per store cannot be held there: give this one a --state on a \
+                         volume that locks",
+                        self.root.display()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let holder = read_bounded_text(&self.root.join(LOCK), 64)
+                    .ok()
+                    .and_then(|text| crate::parse_uint::<u32>(text.trim()))
+                    .map_or_else(String::new, |pid| format!(" (pid {pid})"));
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "the notify store {} is held by another `aterm link notify`{holder}: one \
+                         notifier runs per state dir, and it takes every selector (`--on \
+                         ask:<person>,need`); stop that one, or give this one its own --state",
+                        self.root.display()
+                    ),
+                ))
+            }
+        }
     }
 
     /// Replace `name` with `value` ([`Store::put`]), then flush its directory by `flush`
@@ -593,35 +909,23 @@ impl Store {
         flush_dir(&dir, flush)
     }
 
-    /// Write `value` beside `name`, order its bytes (`aterm_durable::ordered_or_fsync`) and
-    /// rename it over `name`, and return the directory whose entry that moved, unflushed: the
-    /// caller flushes it ([`Store::write`]).
+    /// [`Store::put_bytes`] of `value` and a newline: a file of lines.
     fn put(&self, name: &str, value: &str) -> io::Result<PathBuf> {
-        #[cfg(test)]
-        if PUT_FAULT.with(|left| {
-            let dead = left.get() == Some(0);
-            left.set(left.get().map(|n| n.saturating_sub(1)));
-            dead
-        }) {
-            return Err(io::Error::other("PUT_FAULT: killed before this write"));
-        }
-        #[cfg(test)]
-        if let Some(errno) = refused(name) {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
-        #[cfg(test)]
-        PUT_NAMES.with(|names| {
-            if let Some(names) = names.borrow_mut().as_mut() {
-                names.push(name.to_string());
-            }
-        });
+        self.put_bytes(name, format!("{value}\n").as_bytes())
+    }
+
+    /// Write `bytes` beside `name`, order them (`aterm_durable::ordered_or_fsync`) and rename
+    /// them over `name`, and return the directory whose entry that moved, unflushed: the caller
+    /// flushes it ([`Store::write`]).
+    fn put_bytes(&self, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        test_fault(name)?;
         let target = self.root.join(name);
         let dir = target.parent().unwrap_or(&self.root).to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let (tmp, mut f) = crate::enable::create_temp_beside(&target, 0o600)?;
         let staged = (|| {
-            f.write_all(value.as_bytes())?;
-            f.write_all(b"\n")?;
+            f.write_all(bytes)?;
+            note_bytes(bytes.len());
             aterm_durable::ordered_or_fsync(&f)?;
             note_flush(Flush::Ordered);
             drop(f);
@@ -685,7 +989,7 @@ impl Store {
                         self.carry(&from, &root, fork)?;
                     }
                 }
-                std::fs::create_dir_all(root.join("cur"))?;
+                std::fs::create_dir_all(&root)?;
                 if let Err(e) = self.prune_logs(&name) {
                     eprintln!(
                         "aterm-link notify: could not prune the stores of old logs under {}: {e}",
@@ -746,6 +1050,12 @@ impl Store {
         }
     }
 
+    /// Build the store `to`, a log's that continues `from`'s from `fork`, whole or not at all
+    /// (in a scratch directory renamed to `to`): `from`'s verdicts below `fork`, its standing
+    /// values, and each of its selectors' cursors clamped to `fork`, read through
+    /// [`Store::read_verdicts`], which writes nothing to `from` (an old store's cursor files and
+    /// line files included). Its journal is written even where it holds nothing, so the store
+    /// built is never an empty directory a later rename could replace.
     fn carry(&self, from: &Store, to: &Path, fork: u64) -> io::Result<()> {
         let logs = to.parent().unwrap_or(&self.root).to_path_buf();
         std::fs::create_dir_all(&logs)?;
@@ -756,62 +1066,23 @@ impl Store {
         let built = Store {
             root: scratch.path().to_path_buf(),
         };
-        std::fs::create_dir(built.root.join("cur"))?;
         let carried = (|| -> io::Result<()> {
-            match std::fs::read_dir(from.root.join("cur")) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let entry = entry?;
-                        let name = entry.file_name();
-                        let Some(key) = name
-                            .to_str()
-                            .filter(|k| !k.starts_with('.') && !k.ends_with(".tmp"))
-                        else {
-                            continue;
-                        };
-                        let text = read_bounded_text(&entry.path(), 4096)?;
-                        let off = crate::parse_uint::<u64>(text.trim()).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "invalid carried notifier cursor",
-                            )
-                        })?;
-                        built.write(
-                            &format!("cur/{key}"),
-                            &off.min(fork).to_string(),
-                            Flush::Ordered,
-                        )?;
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    match std::fs::symlink_metadata(from.root.join("cur")) {
-                        Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
-                        Err(other) => return Err(other),
-                        Ok(_) => return Err(e),
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-            let journal = from.carry_text("journal")?.unwrap_or_default();
-            let below: Vec<String> = journal
-                .lines()
-                .filter(|line| {
-                    line.split_whitespace()
-                        .next()
-                        .and_then(crate::parse_uint::<u64>)
-                        .is_some_and(|off| off < fork)
-                })
-                .map(str::to_string)
-                .collect();
-            if !below.is_empty() {
-                built.set_journal(&below, Flush::Ordered)?;
-            }
-            if let Some(standing) = from.carry_text("standing")? {
-                if !standing.is_empty() {
-                    built.write("standing", &standing, Flush::Ordered)?;
-                }
-            }
-            flush_dir(&built.root.join("cur"), Flush::Durable)?;
+            let held = from.read_verdicts()?;
+            let below = journal::Verdicts {
+                lines: held
+                    .lines
+                    .into_iter()
+                    .filter(|line| journal::offset_of(line).is_some_and(|off| off < fork))
+                    .collect(),
+                standing: held.standing,
+                cursors: held
+                    .cursors
+                    .into_iter()
+                    .map(|(key, off)| (key, off.min(fork)))
+                    .collect(),
+                ..journal::Verdicts::default()
+            };
+            built.set_verdicts(&below, Flush::Ordered)?;
             flush_dir(&built.root, Flush::Durable)
         })();
         carried?;
@@ -820,7 +1091,7 @@ impl Store {
                 let _ = scratch.keep();
                 flush_dir(&logs, Flush::Durable)
             }
-            Err(_) if to.join("cur").is_dir() => Ok(()),
+            Err(_) if std::fs::symlink_metadata(to).is_ok_and(|m| m.is_dir()) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -855,83 +1126,71 @@ impl Store {
         Ok(())
     }
 
+    /// `key`'s cursor as the store holds it, read and never written ([`Store::read_cursor`]:
+    /// an old store's `cur/<key>` file read as its migration would): none where it holds none
+    /// or does not read. A reader's start, before the notifier that
+    /// writes the store has its own copy ([`Notifier::cursor`]).
     fn cursor(&self, key: &str) -> Option<u64> {
-        self.read(&format!("cur/{key}"))
-            .and_then(|s| crate::parse_uint(s.trim()))
+        self.read_cursor(key)
     }
 
-    /// Move `key`'s cursor forward to `off` (never back), ordered: a cursor a power loss takes
-    /// re-reads records the journal and the standing values dedup.
+    /// A test's write of `key`'s cursor to this store outside a notifier: forward to `off`
+    /// (never back), one step of its journal ([`Store::load`]), ordered, as
+    /// [`Notifier::put_cursor`] writes it.
+    #[cfg(test)]
     fn set_cursor(&self, key: &str, off: u64) -> io::Result<()> {
-        if self.cursor(key).is_some_and(|have| have >= off) {
+        if self
+            .load()?
+            .held
+            .cursors
+            .get(key)
+            .is_some_and(|&have| have >= off)
+        {
             return Ok(());
         }
-        self.write(&format!("cur/{key}"), &off.to_string(), Flush::Ordered)
+        self.put_cursor_at(key, off)
     }
 
-    fn journal(&self) -> Vec<String> {
-        self.read("journal")
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
+    /// A test's write of `key`'s cursor at `off`, back or forward: one step of the store's
+    /// journal, ordered, as the store would hold it had its cursor never passed `off`.
+    #[cfg(test)]
+    fn put_cursor_at(&self, key: &str, off: u64) -> io::Result<()> {
+        self.load()?.write(
+            &[journal::Step {
+                cursor: vec![(key.to_string(), off)],
+                ..journal::Step::default()
+            }],
+            Flush::Ordered,
+            None,
+        )
     }
+}
 
-    fn set_journal(&self, lines: &[String], flush: Flush) -> io::Result<()> {
-        self.write("journal", &lines.join("\n"), flush)
+/// What a test has a store's write meet before it writes ([`PUT_FAULT`], [`REFUSE`],
+/// [`PUT_NAMES`]): a replace's and a journal append's alike. Nothing outside a test.
+#[allow(clippy::unnecessary_wraps)]
+fn test_fault(name: &str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if PUT_FAULT.with(|left| {
+            let dead = left.get() == Some(0);
+            left.set(left.get().map(|n| n.saturating_sub(1)));
+            dead
+        }) {
+            return Err(io::Error::other("PUT_FAULT: killed before this write"));
+        }
+        if let Some(errno) = refused(name) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        PUT_NAMES.with(|names| {
+            if let Some(names) = names.borrow_mut().as_mut() {
+                names.push(name.to_string());
+            }
+        });
     }
-
-    fn stamps(&self) -> Vec<u64> {
-        self.read("rate")
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|t| crate::parse_uint(t.trim()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Put the rate stamps in place, ordered, and return the directory whose entry moved,
-    /// unflushed ([`Notifier::charge`] flushes it with the page's `firing` line).
-    fn set_stamps(&self, stamps: &[u64]) -> io::Result<PathBuf> {
-        let joined: Vec<String> = stamps.iter().map(u64::to_string).collect();
-        self.put("rate", &joined.join(","))
-    }
-
-    /// `<subject> <attention token>` per line, the oldest first ([`escalation`]).
-    fn standing(&self) -> Vec<(String, String)> {
-        self.read("standing")
-            .map(|s| {
-                s.lines()
-                    .filter_map(|l| {
-                        let (subject, token) = l.split_once(' ')?;
-                        (!subject.is_empty() && !token.is_empty() && !token.contains(' '))
-                            .then(|| (subject.to_string(), token.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn set_standing(&self, rows: &[(String, String)]) -> io::Result<()> {
-        let lines: Vec<String> = rows.iter().map(|(s, t)| format!("{s} {t}")).collect();
-        self.write("standing", &lines.join("\n"), Flush::Ordered)
-    }
-
-    /// The suppressed count, and the `t=` of the newest `dropped` line it counts (0 for none):
-    /// `<n> t=<mark>` ([`Notifier::restore`]).
-    fn suppressed(&self) -> (u64, u64) {
-        let text = self.read("suppressed").unwrap_or_default();
-        let mut words = text.split_whitespace();
-        let n = words.next().and_then(crate::parse_uint).unwrap_or(0);
-        let mark = words
-            .find_map(|w| w.strip_prefix("t="))
-            .and_then(crate::parse_uint)
-            .unwrap_or(0);
-        (n, mark)
-    }
-
-    fn set_suppressed(&self, n: u64, mark: u64) -> io::Result<()> {
-        self.write("suppressed", &format!("{n} t={mark}"), Flush::Ordered)
-    }
+    #[cfg(not(test))]
+    let _ = name;
+    Ok(())
 }
 
 /// Flush `dir`'s entries by `flush`, going on where they cannot be flushed here by astream's
@@ -940,6 +1199,12 @@ impl Store {
 /// sees it.
 fn flush_dir(dir: &Path, flush: Flush) -> io::Result<()> {
     note_flush(flush);
+    #[cfg(test)]
+    DIRS_FLUSHED.with(|dirs| {
+        if let Some(dirs) = dirs.borrow_mut().as_mut() {
+            dirs.push(dir.to_path_buf());
+        }
+    });
     flush.dir_best_effort(dir).map(drop)
 }
 
@@ -976,6 +1241,13 @@ impl Fault {
 }
 
 fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let bytes = read_bounded_bytes(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// The bytes of the regular file at `path`, not following a link and not waiting on a FIFO:
+/// `InvalidInput` for another kind of file, `InvalidData` past `max_bytes`.
+fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let bound = max_bytes
@@ -1006,7 +1278,7 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
             format!("{}: exceeds {max_bytes} bytes", path.display()),
         ));
     }
-    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Ok(bytes)
 }
 
 /// Replace `path` with `bytes`, owner-only, whole by a rename and flushed by nothing: the dev
@@ -1045,15 +1317,31 @@ pub struct Counts {
 
 struct Notifier {
     cfg: Config,
+    /// The root store's lock, held for the notifier's life ([`Store::hold`]) and shared with its
+    /// readers: it is the one writer of every store under it while the store's path names it
+    /// ([`Hold::check`]).
+    hold: std::sync::Arc<Hold>,
     store: Store,
     /// The store of the log this notifier is reading NOW ([`Store::for_log`]).
     log_store: Store,
     log_now: Option<astream_broker::LogIdentity>,
     /// The log each follow-mode reader's connection last reached ([`Notice::Log`]).
     reader_log: Vec<ReadLog>,
-    journal: Vec<String>,
-    /// The log in hand's `standing` ([`Store::standing`]).
+    /// The verdicts of the log in hand, oldest first ([`journal::note`]).
+    journal: std::collections::VecDeque<String>,
+    /// The root store's journal: the stamps and the suppressed count, and the root log's
+    /// verdicts ([`journal`]).
+    root_file: StepsFile,
+    /// The journal of the log in hand's own store, where that is not the root's.
+    log_file: Option<StepsFile>,
+    /// The verdicts noted and not yet written, oldest first ([`Part::Journal`]).
+    owed_verdicts: Vec<String>,
+    /// The stamps spent and not yet written ([`Part::Stamps`]).
+    owed_spent: Vec<u64>,
+    /// The log in hand's standing values, the oldest set first ([`journal::Verdicts::standing`]).
     standing: Vec<(String, String)>,
+    /// The changes of [`Self::standing`] not yet written, in order ([`Part::Standing`]).
+    owed_stand: Vec<journal::Stand>,
     stamps: Vec<u64>,
     suppressed: u64,
     /// The `t=` of the newest `dropped` line [`Self::suppressed`] counts ([`Store::suppressed`]).
@@ -1101,7 +1389,7 @@ struct Notifier {
     dirty: std::collections::BTreeSet<Part>,
     /// By selector key, the record whose change of a standing value is not yet written: one at
     /// most, since no record is judged while a part is unwritten ([`Notifier::owing`]); the
-    /// key's cursor is written at it before the values are ([`Notifier::put_standing`]).
+    /// key's cursor is written at it in the values' step ([`Notifier::put_standing`]).
     standing_at: BTreeMap<String, u64>,
     /// What a refused write left to do, in order ([`Notifier::drain`]).
     left: std::collections::VecDeque<Left>,
@@ -1115,8 +1403,22 @@ struct Notifier {
     /// A test's clock ([`Notifier::now`]).
     #[cfg(test)]
     clock: Option<Instant>,
-    /// Where [`FLUSH_TALLY_SEAM`] has the flushes told, and the counts last told there.
-    flush_tally: Option<(PathBuf, (u64, u64))>,
+    /// A test's mutant: each change of the standing values replaces the line-format `standing`
+    /// file whole, the write a build before the steps made ([`Notifier::put_standing`]).
+    #[cfg(test)]
+    standing_whole: bool,
+    /// A test's mutant: a change of the standing values and the cursor it orders are written as
+    /// two steps, the change's first, in one append ([`Notifier::put_standing`]).
+    #[cfg(test)]
+    standing_split: bool,
+    /// A test's mutant: each cursor is written as a file of its own, `cur/<key>` replaced and
+    /// its directory ordered, ahead of the standing change it orders, as a build before the
+    /// cursor steps wrote it ([`Notifier::put_cursor`], [`Notifier::put_standing`]).
+    #[cfg(test)]
+    cursor_file: bool,
+    /// Where [`FLUSH_TALLY_SEAM`] has the flushes told, and the counts last told there: the
+    /// flushes by kind, then the bytes.
+    flush_tally: Option<(PathBuf, (u64, u64, u64))>,
     /// Where [`EXEC_STAMPS_SEAM`] has each fresh page's stamps told.
     exec_stamps: Option<ExecStamps>,
 }
@@ -1133,9 +1435,10 @@ struct ExecStamps {
 impl Notifier {
     fn new(cfg: Config) -> io::Result<Self> {
         let store = Store::open(&cfg.state_dir)?;
+        let lock = store.hold()?;
         let fault = Fault::from_env(&store);
         let flush_tally = aterm_types::dev_seam!(FLUSH_TALLY_SEAM)
-            .map(|_| (store.root.join(FLUSH_TALLY), (u64::MAX, u64::MAX)));
+            .map(|_| (store.root.join(FLUSH_TALLY), (u64::MAX, u64::MAX, u64::MAX)));
         let exec_stamps = aterm_types::dev_seam!(EXEC_STAMPS_SEAM).map(|_| ExecStamps {
             path: store.root.join(EXEC_STAMPS),
             origin: Instant::now(),
@@ -1143,11 +1446,20 @@ impl Notifier {
         });
         let n = cfg.on.len();
         let need = NeedWatch::new(&cfg.fleet);
-        let (suppressed, suppressed_mark) = store.suppressed();
+        let root_file = store.load()?;
+        let mut held = root_file.held.clone();
+        held.keep_stamps(cfg.limit as usize);
+        let (suppressed, suppressed_mark) = held.suppressed;
         Ok(Self {
-            journal: store.journal(),
-            standing: store.standing(),
-            stamps: store.stamps(),
+            hold: std::sync::Arc::new(Hold::new(store.root.clone(), lock)),
+            journal: held.lines,
+            root_file,
+            log_file: None,
+            owed_verdicts: Vec::new(),
+            owed_spent: Vec::new(),
+            standing: held.standing,
+            owed_stand: Vec::new(),
+            stamps: held.stamps,
             suppressed,
             suppressed_mark,
             restore_due: true,
@@ -1179,6 +1491,12 @@ impl Notifier {
             retry_every: RETRY_EVERY,
             #[cfg(test)]
             clock: None,
+            #[cfg(test)]
+            standing_whole: false,
+            #[cfg(test)]
+            standing_split: false,
+            #[cfg(test)]
+            cursor_file: false,
             flush_tally,
             exec_stamps,
         })
@@ -1230,16 +1548,16 @@ impl Notifier {
         let Some((path, told)) = self.flush_tally.as_mut() else {
             return;
         };
-        let now = flushes();
+        let (durable, ordered) = flushes();
+        let now = (durable, ordered, written_bytes());
         if *told == now {
             return;
         }
         *told = now;
         let tally = format!(
-            "notify-flushes v=1 pid={} durable={} ordered={}\n",
+            "notify-flushes v=1 pid={} durable={durable} ordered={ordered} bytes={}\n",
             std::process::id(),
-            now.0,
-            now.1
+            now.2
         );
         if let Err(e) = write_unflushed_private(path, tally.as_bytes()) {
             warn(&format!("{FLUSH_TALLY_SEAM}: {e}"));
@@ -1260,6 +1578,7 @@ impl Notifier {
         if log == self.log_now {
             return Ok(());
         }
+        self.held()?;
         self.persist()?;
         let scoped = self.store.for_log(log, read.lineage.as_ref())?;
         if scoped.root != self.log_store.root {
@@ -1271,8 +1590,14 @@ impl Notifier {
                 ),
                 scoped.root.display()
             );
-            self.journal = scoped.journal();
-            self.standing = scoped.standing();
+            self.log_file = if scoped.root == self.store.root {
+                None
+            } else {
+                Some(scoped.load()?)
+            };
+            let held = &self.log_file.as_ref().unwrap_or(&self.root_file).held;
+            self.journal = held.lines.clone();
+            self.standing = held.standing.clone();
             self.restore_due = true;
         }
         self.log_store = scoped;
@@ -1448,10 +1773,10 @@ impl Notifier {
     }
 
     /// Make `token` the escalation standing on `subject` ([`STANDING_KEEP`]), as the record at
-    /// `off` that selector `key` is judging says. A change is written at once, ordered, after
-    /// `key`'s cursor is written AT `off` ([`Notifier::put_standing`]): whatever a power loss
-    /// keeps of the two, the selector re-reads no record but `off` under a standing value that a
-    /// later record set, so a value a record left standing never pages it again. Until the
+    /// `off` that selector `key` is judging says. A change is written at once, ordered, in one
+    /// step with `key`'s cursor AT `off` ([`Notifier::put_standing`]): a power loss keeps both
+    /// or neither, so the selector re-reads no record but `off` under a standing value that a
+    /// later record set, and a value a record left standing never pages it again. Until the
     /// change is written (the state dir refused it, [`Notifier::save`]), no cursor is written
     /// ([`Notifier::checkpoint`]) and no later record is judged ([`Notifier::owing`]), so a
     /// second change never waits behind it: one cursor write could not keep the law for both.
@@ -1459,42 +1784,54 @@ impl Notifier {
         if self.standing_of(subject) == token {
             return;
         }
-        self.standing.retain(|(s, _)| s != subject);
-        if let Some(token) = token {
-            self.standing.push((subject.to_string(), token.to_string()));
-        }
+        let token = token.map(str::to_string);
+        journal::note_stand(&mut self.standing, subject.to_string(), token.clone());
+        self.owe_stand(subject.to_string(), token);
         while self.standing.len() > STANDING_KEEP {
             let at = self
                 .standing
                 .iter()
                 .position(|(s, _)| !self.need.holds(s))
                 .unwrap_or(0);
-            self.standing.remove(at);
+            let (gone, _) = self.standing.remove(at);
+            self.owe_stand(gone, None);
         }
         self.standing_at.entry(key.to_string()).or_insert(off);
-        self.save(Part::Standing);
+        self.save(&[Part::Standing]);
+    }
+
+    /// Owe the journal one change of the standing values ([`Notifier::put_standing`]): a step
+    /// carries any subject and value but an empty one ([`journal::Step`]), so the journal never
+    /// holds an older value than the notifier. An empty value is owed as a clear, and an empty
+    /// subject (no bus subject is one) owes nothing, since no step ever set one.
+    fn owe_stand(&mut self, subject: String, token: Option<String>) {
+        if !subject.is_empty() {
+            self.owed_stand
+                .push((subject, token.filter(|t| !t.is_empty())));
+        }
     }
 
     /// Note one verdict in the journal, replacing the offset's old one, keeping the newest
-    /// [`JOURNAL_KEEP`]: the verdict is the journal's newest line ([`Notifier::restore`]).
+    /// [`JOURNAL_KEEP`]: the verdict is the journal's newest line ([`journal::note`],
+    /// [`Notifier::restore`]).
     fn note_verdict(&mut self, off: u64, line: String) {
-        self.journal.retain(|l| {
-            l.split_whitespace()
-                .next()
-                .and_then(crate::parse_uint::<u64>)
-                != Some(off)
-        });
-        self.journal.push(line);
-        while self.journal.len() > JOURNAL_KEEP {
-            self.journal.remove(0);
-        }
+        debug_assert_eq!(journal::offset_of(&line), Some(off));
+        journal::note(&mut self.journal, line);
     }
 
-    /// Write one verdict ([`Notifier::note_verdict`]): the journal, its directory flushed
-    /// ordered ([`Notifier::save`]). A page's `firing` line goes through [`Notifier::arm`].
+    /// Note one verdict ([`Notifier::note_verdict`]) as owed to the journal, unwritten.
+    fn owe_verdict(&mut self, off: u64, line: String) {
+        self.note_verdict(off, line.clone());
+        self.owed_verdicts.push(line);
+    }
+
+    /// Write one verdict ([`Notifier::note_verdict`]): one step appended to the journal, ordered
+    /// ([`Notifier::save`]), as a page's `fired` line is ([`Notifier::fire`]); a `firing` line
+    /// goes through [`Notifier::arm`], and a `dropped` line with its count.
+    #[cfg(test)]
     fn record(&mut self, off: u64, line: String) {
-        self.note_verdict(off, line);
-        self.save(Part::Journal);
+        self.owe_verdict(off, line);
+        self.save(&[Part::Journal]);
     }
 
     fn has_room(&mut self, now: u64) -> bool {
@@ -1514,56 +1851,45 @@ impl Notifier {
     }
 
     /// Spend `t`, a page's stamp ([`Notifier::stamp`]), once however often it is asked, keeping
-    /// the newest `limit` stamps, and write them ([`Notifier::put_stamps`]).
-    fn charge(&mut self, t: u64) -> io::Result<()> {
+    /// the newest `limit` stamps, owed to the journal ([`Part::Stamps`]).
+    fn spend(&mut self, t: u64) {
         if !self.stamps.contains(&t) {
             self.stamps.push(t);
             self.trim_stamps();
         }
-        self.put_stamps()
+        self.owed_spent.push(t);
+    }
+
+    /// [`Notifier::spend`] `t`, and write it at once, ordered.
+    #[cfg(test)]
+    fn charge(&mut self, t: u64) -> io::Result<()> {
+        self.spend(t);
+        self.dirty.insert(Part::Stamps);
+        self.rewrite(self.now())
     }
 
     /// Keep the newest `limit` stamps.
     fn trim_stamps(&mut self) {
-        let limit = self.cfg.limit as usize;
-        while self.stamps.len() > limit {
-            self.stamps.remove(0);
-        }
+        let over = self.stamps.len().saturating_sub(self.cfg.limit as usize);
+        self.stamps.drain(..over);
     }
 
-    /// Write the stamps, ordered after the page's `firing` line and ahead of the full flush of
-    /// the journal's directory ([`Notifier::arm`]): that flush covers their rename where the
-    /// two share a directory, and their own directory is flushed otherwise, in full only where
-    /// it is on another device. A kill between the line and the stamps leaves the line pending
-    /// with its stamp unspent, and [`Notifier::restore`] spends it.
-    fn put_stamps(&self) -> io::Result<()> {
-        let dir = self.store.set_stamps(&self.stamps)?;
-        if dir != self.log_store.root {
-            flush_dir(
-                &dir,
-                Flush::ordered_if_same_device(&dir, &self.log_store.root),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Count one drop whose `dropped` line, `t=mark`, is noted: the count is written after its
-    /// line ([`Part`]), so a kill between the two leaves the line uncounted, and
-    /// [`Notifier::restore`] counts it.
+    /// Count one drop whose `dropped` line, `t=mark`, is noted: the count goes in the line's
+    /// step, or, in a log's own store, is written after the line ([`Part`]), so a kill between
+    /// the two leaves the line uncounted, and [`Notifier::restore`] counts it.
     fn count_drop(&mut self, mark: u64) {
         self.suppressed += 1;
         self.suppressed_mark = mark;
-        self.save(Part::Suppressed);
     }
 
     /// Finish what a kill cut short after the newest verdict of the log in hand, before its
-    /// first record is judged: a verdict is written ahead of what it spends or counts, so only
-    /// that one can be ahead of it. A `firing` line whose `t=` the stamps do not hold spends
-    /// it ([`Notifier::charge`]); a `dropped` line whose `t=` is past the newest drop the
-    /// suppressed count holds is counted ([`Notifier::count_drop`]). Otherwise it writes
-    /// nothing.
+    /// first record is judged: a verdict is written with what it spends or counts, in one step
+    /// where the log's store is the root's, and ahead of it in a log's own store, so only that
+    /// one can be ahead of it. A `firing` line whose `t=` the stamps do not hold spends it; a
+    /// `dropped` line whose `t=` is past the newest drop the suppressed count holds is counted
+    /// ([`Notifier::count_drop`]). Otherwise it writes nothing.
     fn restore(&mut self) {
-        let Some(newest) = self.journal.last() else {
+        let Some(newest) = self.journal.back() else {
             return;
         };
         let mut words = newest.split_whitespace();
@@ -1579,66 +1905,277 @@ impl Notifier {
                 let at = self.stamps.partition_point(|&s| s < t);
                 self.stamps.insert(at, t);
                 self.trim_stamps();
-                self.save(Part::Stamps);
+                self.owed_spent.push(t);
+                self.save(&[Part::Stamps]);
             }
-            Some("dropped") if t > self.suppressed_mark => self.count_drop(t),
+            Some("dropped") if t > self.suppressed_mark => {
+                self.count_drop(t);
+                self.save(&[Part::Suppressed]);
+            }
             _ => {}
         }
     }
 
-    /// Mark `part` changed in memory, and write what is owed at once ([`Notifier::rewrite`]),
+    /// Mark `parts` changed in memory, and write what is owed at once ([`Notifier::rewrite`]),
     /// unless the state dir refused a write and its retry is not due: then the next settle
     /// past it writes it ([`Notifier::settle`]).
-    fn save(&mut self, part: Part) {
-        self.dirty.insert(part);
+    fn save(&mut self, parts: &[Part]) {
+        self.dirty.extend(parts.iter().copied());
         let now = self.now();
         if self.writable(now) {
             let _ = self.rewrite(now);
         }
     }
 
-    /// Write each changed part whole, in [`Part`]'s order (a standing value through
-    /// [`Notifier::put_standing`]), stopping at the first the state dir refuses
+    /// Write what is owed in [`Part`]'s order ([`Notifier::put_steps`], then a standing value
+    /// through [`Notifier::put_standing`]), stopping at the first the state dir refuses
     /// ([`Notifier::fail`]), so no part reaches the store ahead of one before it.
     fn rewrite(&mut self, now: Instant) -> io::Result<()> {
-        while let Some(&part) = self.dirty.first() {
-            let written = match part {
-                Part::Journal => self
-                    .log_store
-                    .put("journal", &self.journal.join("\n"))
-                    .and_then(|dir| flush_dir(&dir, Flush::Ordered)),
-                Part::Stamps => self.put_stamps(),
-                Part::Suppressed => self
-                    .store
-                    .set_suppressed(self.suppressed, self.suppressed_mark),
-                Part::Standing => self.put_standing(),
-            };
-            if let Err(e) = written {
-                self.fail(&e, now, part.what());
+        if let Err((part, e)) = self.put_steps(Flush::Ordered) {
+            self.fail(&e, now, part.what());
+            return Err(e);
+        }
+        if self.dirty.contains(&Part::Standing) {
+            if let Err(e) = self.put_standing() {
+                self.fail(&e, now, Part::Standing.what());
                 return Err(e);
             }
+            self.dirty.remove(&Part::Standing);
+        }
+        Ok(())
+    }
+
+    /// Write the verdicts, stamps and suppressed count owed, the last write flushed by `last`.
+    /// Where the log in hand's store is the root's, they are one journal: each verdict a step,
+    /// what is spent and counted in the last (a step of its own with no verdict), one append.
+    /// Otherwise the verdicts go to the log's own journal first, ordered ahead of the root's
+    /// (in full where that is on another device), and what is spent and counted to the root's
+    /// after them. Err names the first part not written; what is written is no longer owed.
+    fn put_steps(&mut self, last: Flush) -> Result<(), (Part, io::Error)> {
+        let parts = [Part::Journal, Part::Stamps, Part::Suppressed];
+        if !parts.iter().any(|part| self.dirty.contains(part)) {
+            return Ok(());
+        }
+        let mut verdicts: Vec<journal::Step> = self
+            .owed_verdicts
+            .iter()
+            .map(|line| journal::Step {
+                verdict: Some(line.clone()),
+                ..journal::Step::default()
+            })
+            .collect();
+        let state = journal::Step {
+            verdict: None,
+            spent: self.owed_spent.clone(),
+            suppressed: self
+                .dirty
+                .contains(&Part::Suppressed)
+                .then_some((self.suppressed, self.suppressed_mark)),
+            ..journal::Step::default()
+        };
+        let failed = |dirty: &std::collections::BTreeSet<Part>, among: &[Part]| {
+            among
+                .iter()
+                .copied()
+                .find(|part| dirty.contains(part))
+                .unwrap_or(Part::Journal)
+        };
+        if let Err(e) = self.held() {
+            return Err((failed(&self.dirty, &parts), e));
+        }
+        match self.log_file.as_mut() {
+            None => {
+                if !state.is_empty() {
+                    match verdicts.last_mut() {
+                        Some(step) => {
+                            step.spent = state.spent;
+                            step.suppressed = state.suppressed;
+                        }
+                        None => verdicts.push(state),
+                    }
+                }
+                if let Err(e) = self.root_file.write(&verdicts, last, Some(&self.stamps)) {
+                    return Err((failed(&self.dirty, &parts), e));
+                }
+            }
+            Some(log) => {
+                let first = Flush::ordered_if_same_device(log.root(), self.root_file.root());
+                if let Err(e) = log.write(&verdicts, first, None) {
+                    return Err((Part::Journal, e));
+                }
+                self.owed_verdicts.clear();
+                self.dirty.remove(&Part::Journal);
+                if !state.is_empty() {
+                    if let Err(e) = self.root_file.write(&[state], last, Some(&self.stamps)) {
+                        return Err((failed(&self.dirty, &parts), e));
+                    }
+                }
+            }
+        }
+        self.owed_verdicts.clear();
+        self.owed_spent.clear();
+        for part in parts {
             self.dirty.remove(&part);
         }
         Ok(())
     }
 
-    /// Write the standing values, each selector's cursor first at the record that changed one
-    /// ([`Notifier::set_standing`]), forgetting the cursor it owed up to there.
+    /// Write the changes of the standing values owed, with each selector's cursor at the record
+    /// that changed one ([`Notifier::set_standing`]), in one step appended to the log in hand's
+    /// journal, ordered, forgetting the cursor each owed up to there: a step reads whole or not
+    /// at all, so no standing value reaches the media ahead of the cursor it orders, and a
+    /// flood of changes writes each change's own step, never every value standing. A cursor
+    /// the journal already holds at or past its record is not written again. A rewrite of the
+    /// root's journal carries the stamps the notifier holds.
     fn put_standing(&mut self) -> io::Result<()> {
+        self.held()?;
         let at: Vec<(String, u64)> = self
             .standing_at
             .iter()
             .map(|(key, &at)| (key.clone(), at))
             .collect();
+        let cursor: Vec<(String, u64)> = at
+            .iter()
+            .filter(|(key, at)| self.cursor(key).is_none_or(|have| have < *at))
+            .cloned()
+            .collect();
+        #[cfg(test)]
+        let cursor = if self.cursor_file {
+            for (key, at) in cursor {
+                self.log_store.write(
+                    &format!("{}/{key}", journal::CURSORS),
+                    &at.to_string(),
+                    Flush::Ordered,
+                )?;
+            }
+            Vec::new()
+        } else {
+            cursor
+        };
+        for (key, _) in &cursor {
+            test_fault(&format!("{}/{key}", journal::CURSORS))?;
+        }
+        #[cfg(test)]
+        if self.standing_whole {
+            let lines: Vec<String> = self
+                .standing
+                .iter()
+                .map(|(s, t)| format!("{s} {t}"))
+                .collect();
+            self.log_store
+                .write(journal::STANDING, &lines.join("\n"), Flush::Ordered)?;
+            self.owed_stand.clear();
+        }
+        if !self.owed_stand.is_empty() {
+            test_fault(journal::STANDING)?;
+        }
+        let step = journal::Step {
+            stand: self.owed_stand.clone(),
+            cursor,
+            ..journal::Step::default()
+        };
+        #[cfg(test)]
+        let step = if self.standing_split && !step.stand.is_empty() && !step.cursor.is_empty() {
+            let cursor = journal::Step {
+                cursor: step.cursor.clone(),
+                ..journal::Step::default()
+            };
+            self.write_log(
+                &[
+                    journal::Step {
+                        stand: step.stand,
+                        ..journal::Step::default()
+                    },
+                    cursor,
+                ],
+                Flush::Ordered,
+            )?;
+            journal::Step::default()
+        } else {
+            step
+        };
+        if !step.is_empty() {
+            self.write_log(&[step], Flush::Ordered)?;
+        }
+        self.owed_stand.clear();
         for (key, at) in at {
-            self.log_store.set_cursor(&key, at)?;
             if self.lag.get(&key).is_some_and(|lag| lag.want <= at) {
                 self.lag.remove(&key);
             }
         }
-        self.log_store.set_standing(&self.standing)?;
         self.standing_at.clear();
         Ok(())
+    }
+
+    /// THE STORE BY ITS PATH: before each write to a store (a part owed, a standing change, a
+    /// cursor, another log's store taken up), the root store's path still names the lock this
+    /// notifier holds ([`Hold::check`]). Once it does not, this one writes nothing more, to that
+    /// store or to the descriptors of the one removed, and every write after answers the same
+    /// refusal ([`Notifier::lost`]), which ends its run.
+    ///
+    /// # Errors
+    /// As [`Hold::check`]'s.
+    fn held(&self) -> io::Result<()> {
+        self.hold.check()
+    }
+
+    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its lock.
+    fn lost(&self) -> Option<io::Error> {
+        self.hold.lost()
+    }
+
+    /// The journal of the log in hand ([`Self::log_file`], or the root's where it reads the
+    /// root's log), as this notifier holds it.
+    fn log_journal(&self) -> &journal::StepsFile {
+        self.log_file.as_ref().unwrap_or(&self.root_file)
+    }
+
+    /// Append `steps` to the log in hand's journal, flushed by `flush`; a rewrite of the root's
+    /// carries the stamps the notifier holds ([`journal::StepsFile::write`]).
+    fn write_log(&mut self, steps: &[journal::Step], flush: Flush) -> io::Result<()> {
+        match self.log_file.as_mut() {
+            Some(log) => log.write(steps, flush, None),
+            None => self.root_file.write(steps, flush, Some(&self.stamps)),
+        }
+    }
+
+    /// `key`'s cursor as the log in hand's journal holds it, the newest written: none before
+    /// the first.
+    fn cursor(&self, key: &str) -> Option<u64> {
+        #[cfg(test)]
+        if self.cursor_file {
+            return self
+                .log_store
+                .read(&format!("{}/{key}", journal::CURSORS))
+                .and_then(|s| crate::parse_uint(s.trim()));
+        }
+        self.log_journal().held.cursors.get(key).copied()
+    }
+
+    /// Move `key`'s cursor forward to `off` (never back): one step of the log in hand's journal,
+    /// `cursor <key> <off>`, ordered, where it holds the key's cursor below `off` or none. A
+    /// cursor a power loss takes re-reads records the journal and the standing values dedup.
+    fn put_cursor(&mut self, key: &str, off: u64) -> io::Result<()> {
+        if self.cursor(key).is_some_and(|have| have >= off) {
+            return Ok(());
+        }
+        self.held()?;
+        #[cfg(test)]
+        if self.cursor_file {
+            return self.log_store.write(
+                &format!("{}/{key}", journal::CURSORS),
+                &off.to_string(),
+                Flush::Ordered,
+            );
+        }
+        test_fault(&format!("{}/{key}", journal::CURSORS))?;
+        self.write_log(
+            &[journal::Step {
+                cursor: vec![(key.to_string(), off)],
+                ..journal::Step::default()
+            }],
+            Flush::Ordered,
+        )
     }
 
     /// Whether to write what is owed now: no write was refused, or its retry is due.
@@ -1651,6 +2188,9 @@ impl Notifier {
     /// already set where that is still to come (a refusal before it moves it no later). A
     /// warning names the error and its errno the first time and whenever it changes.
     fn fail(&mut self, e: &io::Error, now: Instant, what: &str) {
+        if self.hold.lost.get().is_some() {
+            return;
+        }
         let (errno, kind) = (e.raw_os_error(), e.kind());
         let told = self
             .failing
@@ -1693,7 +2233,7 @@ impl Notifier {
     /// Whether a part a judged record changed is still unwritten ([`Self::dirty`]): then no
     /// further record is judged (it is left, [`Left`]) until the part is written, so a record's
     /// changes never wait behind another's. That keeps every law the store holds for one
-    /// record: a standing value written after its selector's cursor at its record
+    /// record: a standing value written in one step with its selector's cursor at its record
     /// ([`Notifier::put_standing`]), a drop's count trailing its `dropped` line by that line
     /// at most ([`Notifier::restore`]). Some, it is the refusal the record waits behind
     /// ([`Self::failing`]) and what that write held.
@@ -1720,7 +2260,7 @@ impl Notifier {
         let now = self.now();
         let held = !self.dirty.is_empty();
         if !held && self.writable(now) {
-            match self.log_store.set_cursor(key, off) {
+            match self.put_cursor(key, off) {
                 Ok(()) => {
                     if self.lag.get(key).is_some_and(|lag| lag.want <= off) {
                         self.lag.remove(key);
@@ -1802,7 +2342,7 @@ impl Notifier {
             .map(|(key, lag)| (key.clone(), lag.want))
             .collect();
         for (key, want) in owed {
-            if let Err(e) = self.log_store.set_cursor(&key, want) {
+            if let Err(e) = self.put_cursor(&key, want) {
                 self.fail(&e, now, "a cursor");
                 if let Some(lag) = self.lag.get_mut(&key) {
                     lag.retry = true;
@@ -1972,7 +2512,7 @@ impl Notifier {
                 let now = crate::now_ms();
                 if !self.has_room(now) {
                     let mark = now.max(self.suppressed_mark.saturating_add(1));
-                    self.record(
+                    self.owe_verdict(
                         off,
                         format!(
                             "{off} dropped on={} reason=rate limit={}/{}ms suppressed={} t={mark}",
@@ -1983,6 +2523,7 @@ impl Notifier {
                         ),
                     );
                     self.count_drop(mark);
+                    self.save(&[Part::Journal, Part::Suppressed]);
                     if let Some(stand) = &raised {
                         self.owe(&key, off, stand);
                     }
@@ -2041,16 +2582,18 @@ impl Notifier {
         if self.fault == Fault::KillAfterExec {
             self.fault.fire(&self.store);
         }
-        self.record(
+        self.owe_verdict(
             off,
             format!("{off} fired on={} {verdict} dup={}", hit.on, u8::from(dup)),
         );
-        if let Some(stamps) = self.exec_stamps.as_mut().filter(|_| !dup) {
-            stamps.untold = Some((off, [armed, exited, Instant::now()]));
-        }
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
-            self.save(Part::Suppressed);
+            self.save(&[Part::Journal, Part::Suppressed]);
+        } else {
+            self.save(&[Part::Journal]);
+        }
+        if let Some(stamps) = self.exec_stamps.as_mut().filter(|_| !dup) {
+            stamps.untold = Some((off, [armed, exited, Instant::now()]));
         }
         match raised.as_ref() {
             Some(stand) if verdict == "rc=0" => self.stand(&key, off, &subject, stand),
@@ -2065,30 +2608,34 @@ impl Notifier {
     }
 
     /// Put a fresh page's `firing` line (`t=` its stamp) and the stamp spent on the media before
-    /// its command runs: the line and then the stamps written ordered ([`Notifier::charge`]),
-    /// then the journal's directory flushed in full ([`Self::firing`]), the page's one full
-    /// flush, so a power loss mid-command runs it again with `ATERM_NOTIFY_DUP=1`. Refused, it
-    /// leaves the journal and the stamps in memory as they were, so the page, done again, writes
-    /// the same line and spends its stamp once.
+    /// its command runs ([`Notifier::put_steps`]): one step, the line and the stamp, appended to
+    /// the journal and flushed in full ([`Self::firing`]), the page's one full flush, so a power
+    /// loss mid-command runs it again with `ATERM_NOTIFY_DUP=1`; in a log's own store the line's
+    /// step ordered ahead of the stamp's, whose flush is that one. Refused, it leaves the
+    /// journal, the stamps and what is owed in memory as they were, so the page, done again,
+    /// writes the same line and spends its stamp once.
     fn arm(&mut self, off: u64, line: String, t: u64) -> io::Result<()> {
-        let (journal, stamps) = (self.journal.clone(), self.stamps.clone());
-        self.note_verdict(off, line);
-        let armed = self.put_firing(t);
+        let held = (
+            self.journal.clone(),
+            self.stamps.clone(),
+            self.owed_verdicts.clone(),
+            self.owed_spent.clone(),
+            self.dirty.clone(),
+        );
+        self.owe_verdict(off, line);
+        self.spend(t);
+        self.dirty.extend([Part::Journal, Part::Stamps]);
+        let armed = self.put_steps(self.firing).map_err(|(_, e)| e);
         if armed.is_err() {
-            self.journal = journal;
-            self.stamps = stamps;
-        } else {
-            self.dirty.remove(&Part::Journal);
-            self.dirty.remove(&Part::Stamps);
+            (
+                self.journal,
+                self.stamps,
+                self.owed_verdicts,
+                self.owed_spent,
+                self.dirty,
+            ) = held;
         }
         armed
-    }
-
-    /// [`Notifier::arm`]'s writes: the journal, the stamps with `t` spent, the full flush.
-    fn put_firing(&mut self, t: u64) -> io::Result<()> {
-        let dir = self.log_store.put("journal", &self.journal.join("\n"))?;
-        self.charge(t)?;
-        flush_dir(&dir, self.firing)
     }
 
     fn exec(&self, hit: &Hit, dup: bool, suppressed: u64) -> String {
@@ -2184,7 +2731,7 @@ impl Notifier {
     }
 
     fn start_offset(&self, conn: &mut Conn, sel: &Sel) -> io::Result<u64> {
-        if let Some(off) = self.log_store.cursor(&sel.key()) {
+        if let Some(off) = self.cursor(&sel.key()) {
             return Ok(off);
         }
         Ok(match self.cfg.since {
@@ -2197,11 +2744,12 @@ impl Notifier {
     /// Read every selector up to the broker's head (`--once`), then write what is owed
     /// ([`Notifier::persist`]): Err when a page's `firing` line or anything owed could not be
     /// written, its cursor left before what is not done, for the next run; a record behind a
-    /// part the state dir refused is not judged ([`Notifier::owing`]).
+    /// part the state dir refused is not judged ([`Notifier::owing`]); Err with the refusal
+    /// where the store was removed or replaced under it ([`Notifier::held`]).
     fn catch_up(&mut self) -> io::Result<()> {
         let caught = self.catch_up_to_head();
         let persisted = self.persist();
-        caught.and(persisted)
+        self.lost().map_or(caught.and(persisted), Err)
     }
 
     fn catch_up_to_head(&mut self) -> io::Result<()> {
@@ -2275,10 +2823,10 @@ impl Notifier {
             let cfg = self.cfg.clone();
             let sel = sel.clone();
             let tx = tx.clone();
-            let root = self.store.root.clone();
+            let hold = std::sync::Arc::clone(&self.hold);
             std::thread::Builder::new()
                 .name(format!("notify-{}", sel.key()))
-                .spawn(move || reader(idx, &sel, &cfg, &root, &tx))?;
+                .spawn(move || reader(idx, &sel, &cfg, &hold, &tx))?;
         }
         drop(tx);
         self.serve(&rx)
@@ -2294,8 +2842,13 @@ impl Notifier {
     /// whose `firing` line it refuses, or a record behind a verdict, count or standing value it
     /// refuses ([`Notifier::owing`]), stops the loop, which takes no notice (its readers wait in
     /// the rendezvous) until that page has run or that part is written ([`Notifier::drain`]).
+    /// A store removed or replaced under it does end it, Err with that refusal
+    /// ([`Notifier::held`]): it writes nothing more.
     fn serve(&mut self, rx: &mpsc::Receiver<Notice>) -> io::Result<()> {
         loop {
+            if let Some(e) = self.lost() {
+                return Err(e);
+            }
             if self.stalled {
                 let wait = self.failing.map_or(Duration::ZERO, |f| {
                     f.next.saturating_duration_since(self.now())
@@ -2324,10 +2877,9 @@ impl Notifier {
             self.tell();
         }
         let _ = self.persist();
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "every subscription ended",
-        ))
+        Err(self.lost().unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "every subscription ended")
+        }))
     }
 
     /// Take one [`Notice`] from a follow-mode reader in read order ([`Notice::Durable`]), after
@@ -2502,6 +3054,19 @@ impl Notifier {
                     self.scanned[idx] = Some(self.scanned[idx].map_or(next, |s| s.max(next)));
                 }
             }
+            Notice::Start(idx, head, done) => {
+                let Some(key) = self.cfg.on.get(idx).map(Sel::key) else {
+                    return Ok(());
+                };
+                let log = self.reader_log[idx].clone();
+                let wrote = self
+                    .scope_to(&log)
+                    .and_then(|()| self.put_cursor(&key, head));
+                if wrote.is_ok() && self.lag.get(&key).is_some_and(|lag| lag.want <= head) {
+                    self.lag.remove(&key);
+                }
+                let _ = done.send(wrote);
+            }
             Notice::Durable(idx, durable) => {
                 let Some(slot) = self.durable.get_mut(idx) else {
                     return Ok(());
@@ -2573,7 +3138,7 @@ impl Notifier {
     }
 }
 
-fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSender<Notice>) {
+fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Hold, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
@@ -2586,10 +3151,24 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
         }
     };
     loop {
-        let wait = match connect_for_reader(cfg, root, &key, &filter, &mut seen, &mut seen_on) {
-            Ok((mut conn, closer, mut from, log)) => {
+        let wait = match connect_for_reader(cfg, hold, &key, &filter, &mut seen, &mut seen_on) {
+            Ok((mut conn, closer, mut from, log, start)) => 'attached: {
                 if tx.send(Notice::Log(idx, log)).is_err() {
                     return;
+                }
+                if let Some(head) = start {
+                    let (done, wrote) = mpsc::sync_channel(1);
+                    if tx.send(Notice::Start(idx, head, done)).is_err() {
+                        return;
+                    }
+                    match wrote.recv() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            say(outage.failed(Instant::now(), &e));
+                            break 'attached Some(backoff.failed());
+                        }
+                        Err(_) => return,
+                    }
                 }
                 backoff.attached(Instant::now());
                 let mut closed = false;
@@ -2700,6 +3279,7 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                 }
                 backoff.lost(Instant::now())
             }
+            Err(_) if hold.lost.get().is_some() => return,
             Err(e) => {
                 say(outage.failed(Instant::now(), &e));
                 Some(backoff.failed())
@@ -2711,26 +3291,32 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
     }
 }
 
+/// Connect reader `key` to the broker and find where it reads from: its cursor in the store of
+/// the log it reaches ([`Store::cursor`]), or past what this reader already handed on
+/// (`seen`), or `--since`. A reader writes nothing to the store's journal, whose one writer is
+/// the notifier ([`Store::hold`]): a start at the head it found with no cursor is handed back
+/// (the last item) for the notifier to write ([`Notice::Start`]), and the reader reads no
+/// record until the notifier answers that it is on the media, so a restart after any record
+/// was read re-reads from that head, never from a later one; where the write is refused the
+/// reader connects again after its backoff, as a refused connect does.
 fn connect_for_reader(
     cfg: &Config,
-    root: &Path,
+    hold: &Hold,
     key: &str,
     filter: &str,
     seen: &mut Option<u64>,
     seen_on: &mut Option<PathBuf>,
-) -> io::Result<(Conn, Closer, u64, ReadLog)> {
+) -> io::Result<(Conn, Closer, u64, ReadLog, Option<u64>)> {
     let (mut conn, closer) = transport::connect(&cfg.broker, ack_deadline())?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     let log = log_of(&mut conn, cfg)?;
-    let store = Store {
-        root: root.to_path_buf(),
-    }
-    .for_log(log.id, log.lineage.as_ref())?;
+    let store = reader_store(hold, &log)?;
     if seen_on.as_ref().is_some_and(|on| *on != store.root) {
         *seen = None;
     }
     *seen_on = Some(store.root.clone());
     let seen = *seen;
+    let mut start = None;
     let from = match (store.cursor(key), seen) {
         (Some(c), Some(s)) => c.max(s),
         (Some(c), None) => c,
@@ -2740,12 +3326,27 @@ fn connect_for_reader(
             Since::At(n) => n,
             Since::Head => {
                 let head = conn.fetch(0, filter, 0)?.1 .1;
-                store.set_cursor(key, head)?;
+                start = Some(head);
                 head
             }
         },
     };
-    Ok((conn, closer, from, log))
+    Ok((conn, closer, from, log, start))
+}
+
+/// The store of the log a reader reached ([`Store::for_log`] of the root store), which can write
+/// the root's `log` file, carry a moved generation's store and prune old ones: so it runs
+/// [`Hold::check`] first, as every write of the notifier's does, and a reader whose store was
+/// removed or replaced under the notifier writes nothing and ends ([`reader`]).
+///
+/// # Errors
+/// [`Hold::check`]'s refusal, or [`Store::for_log`]'s.
+fn reader_store(hold: &Hold, log: &ReadLog) -> io::Result<Store> {
+    hold.check()?;
+    Store {
+        root: hold.root.clone(),
+    }
+    .for_log(log.id, log.lineage.as_ref())
 }
 
 /// The log `conn` reaches ([`astream_broker::Client::log_lineage`]).
@@ -2770,6 +3371,9 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
 
 #[cfg(test)]
 thread_local! {
+    /// Called by [`Store::take`] between its open of [`LOCK`] and its `flock(2)`, so a test can
+    /// replace or remove the path there.
+    static BEFORE_TAKE: std::cell::RefCell<Option<TakeSeam>> = const { std::cell::RefCell::new(None) };
     static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Called as [`Notifier::exec`] starts a command, so a test can ask what was flushed
     /// before it.
@@ -2783,6 +3387,8 @@ thread_local! {
     /// The [`Store::put`]s left before a test's kill: at `Some(0)` every put fails before it
     /// writes, as if the process had died there.
     static PUT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// The bytes [`note_bytes`] tallied on this thread.
+    static BYTES_NOTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The flushes [`note_flush`] tallied on this thread, so a test can compare them with what
     /// it asked of `aterm_durable`.
     static NOTED: std::cell::RefCell<Vec<Flush>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2792,6 +3398,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// While `Some`, the name of each [`Store::put`] this thread made, in order.
     static PUT_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+    /// While `Some`, each directory [`flush_dir`] flushed on this thread, in order.
+    static DIRS_FLUSHED: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
     /// What the notifier warned of on this thread ([`Notifier::fail`], [`Notifier::settle`],
     /// [`Notifier::take_one`]).
@@ -2831,6 +3440,10 @@ fn refused(name: &str) -> Option<i32> {
 #[cfg(test)]
 type ExecSeam = Box<dyn FnMut(&Hit)>;
 
+/// What [`BEFORE_TAKE`] calls with the lock's path.
+#[cfg(test)]
+type TakeSeam = Box<dyn FnMut(&Path)>;
+
 /// What [`BEFORE_EXIT_WAIT`] calls with the command just spawned.
 #[cfg(test)]
 type ChildSeam = Box<dyn FnMut(&mut aterm_uds::spawnfd::Child)>;
@@ -2864,7 +3477,10 @@ aterm link notify — run a command when the fabric needs a human
   --since head|start|<n> where a selector with no cursor starts (default `head`)
   --once                 catch up to the head, then exit
   --exec-timeout <ms>    SIGKILL a command still running after this (default `30000`)
-  --state <dir>          state dir (`<dir>/notify/` holds cursors and the journal)
+  --state <dir>          state dir (`<dir>/notify/` holds cursors and the journal); one
+                         notifier runs per state dir, and a second is refused at its start:
+                         give one notifier every selector (`--on ask:<person>,need`), or
+                         each its own --state
 
 Dedups across restarts by offset, `attention` by each subject's standing value (clearing it
 and raising it again pages again), and `need` by each session's standing needs: a need is

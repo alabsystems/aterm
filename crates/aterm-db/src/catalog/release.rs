@@ -189,6 +189,10 @@ const SEEN: &str = "release-seen";
 /// Its largest size: a line per retired table.
 const SEEN_MAX: usize = 4096;
 
+pub(super) fn claim_metadata() -> [(&'static str, usize); 2] {
+    [(PASSED, 32), (SEEN, SEEN_MAX)]
+}
+
 fn read_seen(dir: &std::path::Path) -> Result<BTreeMap<Digest, u64>> {
     let bytes = match private_file::read_private(dir, SEEN, SEEN_MAX) {
         Ok(bytes) => bytes,
@@ -223,14 +227,6 @@ fn remove_storage(path: &std::path::Path) -> Result<()> {
         PrivateDir::Missing => Ok(()),
         PrivateDir::Private => Ok(std::fs::remove_dir_all(path)?),
         PrivateDir::Open(_) => Err(Error::new("sealed table storage is not private")),
-    }
-}
-
-fn remove_claim(dir: &std::path::Path, name: &str) -> Result<()> {
-    match std::fs::remove_file(dir.join(name)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -360,7 +356,7 @@ impl Directory {
             remove_storage(&self.recovery().path(scope)?)?;
             let name = claim_name(scope);
             for dir in [&claims, &recovery_claims] {
-                remove_claim(dir, &name)?;
+                crate::table::store::remove_claim_files(dir, &name)?;
             }
             released.released.push(id);
         }

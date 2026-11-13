@@ -1,0 +1,3248 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+use crate::init::Workstation;
+use crate::items::defaults::tests::{ctx, export, user};
+use crate::model::{Mode, Outcome};
+use crate::port::{Fake, Ran, Stat};
+
+const WIDGETS: &str = crate::init_activation::WIDGETS_MARKER;
+
+const NOTIFICATION_CENTER: &str = "com.apple.notificationcenterui";
+
+fn desktop(who: &User, kind: DesktopKind) -> Desktop {
+    Desktop::new(
+        who,
+        kind,
+        &Arc::new(DesktopActivation::new(who, Reach::all(Some(true)))),
+    )
+}
+
+fn usual_dock_apps() -> Vec<DockApp> {
+    DOCK_APPS
+        .into_iter()
+        .map(|(path, bundle, label)| (path.to_owned(), bundle, label))
+        .collect()
+}
+
+pub(crate) fn installed_dock_apps(sys: &Fake, who: &User) {
+    for (path, bundle, _) in DOCK_APPS {
+        installed_at(sys, who, path, bundle);
+    }
+}
+
+fn installed_at(sys: &Fake, who: &User, path: &str, bundle: &str) {
+    sys.stat_of(
+        &format!("{path}/Contents"),
+        Stat {
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+            dir: true,
+            symlink: false,
+            len: 0,
+        },
+    );
+    let cmd = Cmd::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", "--"])
+        .arg(format!("{path}/Contents/Info.plist"))
+        .as_user(who);
+    sys.on(&cmd.display(), Ran::ok(bundle));
+}
+
+#[test]
+fn hidutil_table_keeps_services_distinct_and_preserves_their_existing_user_rules() {
+    let table = "RegistryID Key Value\n100000001 UserKeyMapping (\n{ HIDKeyboardModifierMappingDst = 30064771297; HIDKeyboardModifierMappingSrc = 30064771303; },\n{ HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771241; }\n)\n100000002 UserKeyMapping (null)\n";
+    let maps: Vec<_> = parse_hid_mappings(table)
+        .unwrap()
+        .into_iter()
+        .map(|(registry, user)| HidMapping {
+            registry,
+            prefix: KeyboardPrefix::default(),
+            native: Vec::new(),
+            user,
+        })
+        .collect();
+    assert_eq!(maps.len(), 2);
+    let changes = merged_mapping(&maps).unwrap().unwrap();
+    assert_eq!(changes.len(), 2);
+    for (before, change) in maps.into_iter().zip(changes) {
+        assert_eq!(change.registry, before.registry);
+        assert_eq!(change.before_user, before.user);
+        assert_eq!(change.user, None);
+        let after = after_change(before, change);
+        assert_eq!(after.caps_lock(), keyboard::LEFT_CONTROL);
+        assert_eq!(merged_mapping(&[after]).unwrap(), None);
+    }
+    assert!(parse_hid_mappings("100000001 UserKeyMapping (garbage)").is_err());
+}
+
+fn after_change(before: HidMapping, change: KeyboardMapChange) -> HidMapping {
+    HidMapping {
+        registry: before.registry,
+        prefix: before.prefix,
+        native: change.native.unwrap_or(before.native),
+        user: change.user.unwrap_or(before.user),
+    }
+}
+
+pub(crate) type HidDumpRow<'a> = (u64, &'a [(i64, i64)], &'a [(i64, i64)]);
+
+pub(crate) fn hid_dump(maps: &[HidDumpRow<'_>]) -> String {
+    hid_dump_with_prefix(maps, &crate::port::keyboard_prefix::tests::fields())
+}
+
+fn hid_dump_with_prefix(maps: &[HidDumpRow<'_>], prefix: &[(String, PValue)]) -> String {
+    let pairs = |map: &[(i64, i64)]| {
+        PValue::Array(
+            map.iter()
+                .map(|(source, destination)| {
+                    PValue::Dict(vec![
+                        ("Src".into(), PValue::Int(*source)),
+                        ("Dst".into(), PValue::Int(*destination)),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    crate::plist::document(&PValue::Dict(vec![(
+        "ServiceRecords".into(),
+        PValue::Array(
+            maps.iter()
+                .map(|(registry, native, user)| {
+                    PValue::Dict(vec![
+                        (
+                            "IORegistryEntryID".into(),
+                            PValue::Int(i64::try_from(*registry).unwrap()),
+                        ),
+                        ("PrimaryUsagePage".into(), PValue::Int(1)),
+                        ("PrimaryUsage".into(), PValue::Int(6)),
+                        (
+                            "ServiceFilterDebug".into(),
+                            PValue::Array(vec![PValue::Dict(vec![(
+                                "plugin".into(),
+                                PValue::Dict(
+                                    [
+                                        ("Class".into(), PValue::Str("IOHIDKeyboardFilter".into())),
+                                        (NATIVE_MAPPING.into(), pairs(native)),
+                                        ("UserKeyMapping".into(), pairs(user)),
+                                    ]
+                                    .into_iter()
+                                    .chain(prefix.iter().cloned())
+                                    .collect(),
+                                ),
+                            )])]),
+                        ),
+                    ])
+                })
+                .collect(),
+        ),
+    )]))
+}
+
+fn hid_dump_command(who: &User) -> Cmd {
+    Cmd::new(HIDUTIL)
+        .args(["dump", "services", "-f", "xml"])
+        .as_user(who)
+}
+
+fn attachment(who: &User, vendor: u32, product: u32) -> Attachment {
+    Attachment {
+        inner: AttachedKeyboard {
+            model: keyboard::Model { vendor, product },
+            user: who.clone(),
+            reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
+        },
+        registries: vec![2],
+        observed: Mutex::default(),
+        verified: Mutex::default(),
+    }
+}
+
+fn hid_user_row(registry: u64, pairs: &[(i64, i64)]) -> String {
+    let map = if pairs.is_empty() {
+        "(null)".into()
+    } else {
+        format!(
+            "( {} )",
+            pairs
+                .iter()
+                .map(|(src, dst)| format!("{{ {SRC} = {src}; {DST} = {dst}; }}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    format!("RegistryID Key Value\n{registry:x} UserKeyMapping {map}\n")
+}
+
+#[test]
+fn automatic_attachment_targets_only_new_services_and_preserves_unrelated_remaps() {
+    let who = user("alice", 501);
+    let item = attachment(&who, 65534, 169);
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    let option = 0x7_0000_00e2;
+    let command = 0x7_0000_00e3;
+    let native = [(option, command)];
+    let user_map = [(keyboard::LEFT_CONTROL, option)];
+    sys.on(
+        &item
+            .inner
+            .command()
+            .args(["--get", "UserKeyMapping"])
+            .display(),
+        Ran::ok(&hid_user_row(2, &user_map)),
+    );
+    sys.on(
+        &hid_dump_command(&who).display(),
+        Ran::ok(&composite_keyboard_dump(
+            &[
+                (1, &[(keyboard::CAPS_LOCK, option)], &[]),
+                (2, &native, &user_map),
+            ],
+            true,
+        )),
+    );
+    sys.on(
+        &Target::host("-g", &item.inner.model.key(), &who)
+            .export_cmd()
+            .display(),
+        export("<dict/>"),
+    );
+    let context = ctx(std::slice::from_ref(&who));
+    assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+    assert!(item.observed_services().covers(&[2]));
+    assert!(item.verified().is_none(), "a before-image is not a receipt");
+    item.apply(&sys, &context).unwrap();
+    assert!(item.verified().is_none(), "a setter is not its read-back");
+    let changes = sys.keyboard_changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].registry, 2);
+    assert_eq!(changes[0].user, None);
+    assert_eq!(
+        changes[0].native,
+        Some(vec![
+            (option, command),
+            (keyboard::CAPS_LOCK, keyboard::RIGHT_CONTROL)
+        ])
+    );
+    let other = attachment(&who, 1452, 999);
+    sys.on(
+        &other
+            .inner
+            .command()
+            .args(["--get", "UserKeyMapping"])
+            .display(),
+        Ran::ok("RegistryID Key Value\n3 UserKeyMapping (null)\n"),
+    );
+    let before = sys.calls().len();
+    assert!(matches!(
+        other.probe(&sys, &context),
+        Probe::NotApplicable { .. }
+    ));
+    assert!(!other.observed_services().covers(&[2]));
+    assert_eq!(
+        sys.calls().len(),
+        before + 1,
+        "another model reads no preference or live filter when it owns no new service"
+    );
+    assert_eq!(sys.keyboard_changes().len(), 1);
+
+    // The final successful probe, not the pre-apply observation or a later passive
+    // read, supplies the receipt. Passive reads reuse this exact modeled data.
+    sys.logged_in(&who);
+    sys.keyboard_services = Some(Ok(vec![2]));
+    let verified_native = changes[0].native.clone().unwrap();
+    let final_dump =
+        composite_keyboard_dump(&[(1, &[], &[]), (2, &verified_native, &user_map)], true);
+    sys.simulate(move |_, cmd| {
+        (cmd.args.first().and_then(|arg| arg.to_str()) == Some("dump"))
+            .then(|| Ran::ok(&final_dump))
+    });
+    assert!(matches!(item.probe(&sys, &context), Probe::Ok { .. }));
+    let receipt = item.verified().unwrap();
+    let calls = sys.calls();
+    let observed = sys.keyboard_service_observations().unwrap();
+    assert_eq!(receipt.registries(), [2]);
+    assert!(receipt.matches(&observed[0]));
+    assert_eq!(
+        receipt.live_mapping(&observed),
+        Some(LiveKeyboardMapping {
+            control: 1,
+            explicit_other: 0,
+            held: 0,
+        })
+    );
+    assert!(receipt.live_mapping(&[]).is_none());
+    assert!(
+        receipt
+            .live_mapping(&[observed[0].clone(), observed[0].clone()])
+            .is_none()
+    );
+    assert_eq!(sys.calls()[..calls.len()], calls);
+    assert_eq!(&sys.calls()[calls.len()..], &["keyboard-service-ids"]);
+
+    let reset_dump = composite_keyboard_dump(&[(1, &[], &[]), (2, &native, &user_map)], true);
+    sys.simulate(move |_, _| Some(Ran::ok(&reset_dump)));
+    let reset = sys.keyboard_service_observations().unwrap();
+    assert!(
+        !receipt.matches(&reset[0]),
+        "same identity, different native map"
+    );
+    assert!(receipt.live_mapping(&reset).is_none());
+    let unknown_dump = composite_keyboard_dump(&[(1, &[], &[]), (2, &native, &user_map)], true)
+        .replace("UserKeyMapping", "UnknownMapping");
+    sys.simulate(move |_, _| Some(Ran::ok(&unknown_dump)));
+    let unknown = sys.keyboard_service_observations().unwrap();
+    assert!(unknown[0].unread().is_some());
+    assert!(!receipt.matches(&unknown[0]));
+    assert!(receipt.live_mapping(&unknown).is_none());
+
+    // One physical/composite model can expose several HID services. Preserve an
+    // explicit non-Control choice beside the genuinely verified Control service.
+    let mut explicit = attachment(&who, 65534, 169);
+    explicit.registries = vec![1];
+    let get = explicit
+        .inner
+        .command()
+        .args(["--get", "UserKeyMapping"])
+        .display();
+    let mixed_dump = composite_keyboard_dump(
+        &[
+            (1, &[(keyboard::CAPS_LOCK, option)], &[]),
+            (2, &verified_native, &user_map),
+        ],
+        true,
+    );
+    let second_user = hid_user_row(2, &user_map);
+    let users = format!(
+        "{}{}",
+        hid_user_row(1, &[]),
+        second_user.strip_prefix("RegistryID Key Value\n").unwrap()
+    );
+    sys.simulate(move |_, cmd| {
+        if cmd.display() == get {
+            Some(Ran::ok(&users))
+        } else if cmd.args.first().and_then(|arg| arg.to_str()) == Some("dump") {
+            Some(Ran::ok(&mixed_dump))
+        } else {
+            None
+        }
+    });
+    assert!(matches!(
+        explicit.probe(&sys, &context),
+        Probe::NotApplicable { .. }
+    ));
+    sys.keyboard_services = Some(Ok(vec![1, 2]));
+    let current = sys.keyboard_service_observations().unwrap();
+    let mut mixed = receipt;
+    mixed.merge(explicit.verified().unwrap());
+    assert_eq!(
+        mixed.live_mapping(&current),
+        Some(LiveKeyboardMapping {
+            control: 1,
+            explicit_other: 1,
+            held: 0,
+        })
+    );
+    mixed.merge(explicit.kept_receipt(&explicit.observed_services()));
+    assert_eq!(
+        mixed.live_mapping(&current),
+        Some(LiveKeyboardMapping {
+            control: 1,
+            explicit_other: 0,
+            held: 1,
+        })
+    );
+    assert_eq!(sys.keyboard_changes().len(), 1, "passive reads never write");
+}
+
+#[test]
+fn automatic_attachments_preserve_explicit_saved_and_live_caps_choices() {
+    let who = user("alice", 501);
+    let option = 0x7_0000_00e2;
+    let caps = keyboard::CAPS_LOCK;
+    let as_value = |map: &[(i64, i64)]| {
+        PValue::Array(
+            map.iter()
+                .map(|(src, dst)| {
+                    PValue::Dict(vec![
+                        (SRC.into(), PValue::Int(*src)),
+                        (DST.into(), PValue::Int(*dst)),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    for (saved, native, user_map) in [
+        (Some(as_value(&[])), vec![], vec![]),
+        (Some(as_value(&[(caps, caps)])), vec![], vec![]),
+        (Some(as_value(&[(caps, option)])), vec![], vec![]),
+        (None, vec![(caps, caps)], vec![]),
+        (None, vec![], vec![(caps, caps)]),
+        (None, vec![(caps, option)], vec![]),
+        (
+            None,
+            vec![(caps, option)],
+            vec![(caps, keyboard::LEFT_CONTROL)],
+        ),
+    ] {
+        let item = attachment(&who, 65534, 169);
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let entries = saved.map_or_else(Vec::new, |value| vec![(item.inner.model.key(), value)]);
+        let domain = crate::plist::document(&PValue::Dict(entries));
+        sys.on(
+            &Target::host("-g", &item.inner.model.key(), &who)
+                .export_cmd()
+                .display(),
+            Ran::ok(&domain),
+        );
+        sys.on(
+            &item
+                .inner
+                .command()
+                .args(["--get", "UserKeyMapping"])
+                .display(),
+            Ran::ok(&hid_user_row(2, &user_map)),
+        );
+        sys.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&composite_keyboard_dump(
+                &[(1, &[], &[]), (2, &native, &user_map)],
+                true,
+            )),
+        );
+        let context = ctx(std::slice::from_ref(&who));
+        assert!(matches!(
+            item.probe(&sys, &context),
+            Probe::NotApplicable { .. }
+        ));
+        assert!(
+            item.observed_services().covers(&[2]),
+            "an observed explicit choice resolves that service without changing it"
+        );
+        sys.logged_in(&who);
+        sys.keyboard_services = Some(Ok(vec![2]));
+        let receipt = item.verified().unwrap();
+        let current = sys.keyboard_service_observations().unwrap();
+        assert!(receipt.matches(&current[0]));
+        assert_eq!(
+            receipt.live_mapping(&current),
+            Some(LiveKeyboardMapping {
+                control: 0,
+                explicit_other: 1,
+                held: 0,
+            }),
+            "a user Caps entry cannot bypass the earlier native output"
+        );
+        item.apply(&sys, &context).unwrap();
+        assert!(
+            item.verified().is_none(),
+            "apply alone cannot publish a receipt"
+        );
+        assert!(sys.keyboard_changes().is_empty());
+    }
+}
+
+#[test]
+fn attachment_coverage_discards_an_earlier_read_when_the_next_probe_sees_no_service() {
+    let who = user("alice", 501);
+    let item = attachment(&who, 65534, 169);
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    let get = item.inner.command().args(["--get", "UserKeyMapping"]);
+    sys.on(&get.display(), Ran::ok(&hid_user_row(2, &[])));
+    sys.on(&get.display(), Ran::ok("RegistryID Key Value\n"));
+    sys.on(
+        &hid_dump_command(&who).display(),
+        Ran::ok(&hid_dump(&[(2, &[], &[])])),
+    );
+    sys.on(
+        &Target::host("-g", &item.inner.model.key(), &who)
+            .export_cmd()
+            .display(),
+        export("<dict/>"),
+    );
+    let context = ctx(std::slice::from_ref(&who));
+    assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+    assert!(item.observed_services().covers(&[2]));
+    assert!(matches!(
+        item.probe(&sys, &context),
+        Probe::NotApplicable { .. }
+    ));
+    assert!(!item.observed_services().covers(&[2]));
+    assert!(sys.keyboard_changes().is_empty());
+}
+
+fn composite_keyboard_dump(maps: &[HidDumpRow<'_>], keyboard_usage: bool) -> String {
+    let mut value = crate::plist::parse(hid_dump(maps).as_bytes()).unwrap();
+    let PValue::Dict(fields) = &mut value else {
+        unreachable!()
+    };
+    let (_, PValue::Array(services)) = &mut fields[0] else {
+        unreachable!()
+    };
+    let PValue::Dict(service) = &mut services[1] else {
+        unreachable!()
+    };
+    *service
+        .iter_mut()
+        .find(|(key, _)| key == "PrimaryUsage")
+        .unwrap() = ("PrimaryUsage".into(), PValue::Int(2));
+    let pair = |usage| {
+        PValue::Dict(vec![
+            ("DeviceUsagePage".into(), PValue::Int(1)),
+            ("DeviceUsage".into(), PValue::Int(usage)),
+        ])
+    };
+    let mut pairs = vec![pair(2)];
+    if keyboard_usage {
+        pairs.push(pair(6));
+    }
+    service.push(("DeviceUsagePairs".into(), PValue::Array(pairs)));
+    crate::plist::document(&value)
+}
+
+#[test]
+fn a_composite_mouse_collection_carrying_keyboard_events_is_repaired_and_verified() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 65534,
+            product: 169,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+    let get = item.command().args(["--get", "UserKeyMapping"]).display();
+    for _ in 0..4 {
+        sys.on(&get, Ran::ok("RegistryID Key Value\n1 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n2 UserKeyMapping (null)\n"));
+    }
+    sys.on(
+        &get,
+        Ran::ok("RegistryID Key Value\n2 UserKeyMapping (null)\n2 UserKeyMapping (null)\n"),
+    );
+    let dump = hid_dump_command(&who).display();
+    for fixture in [
+        composite_keyboard_dump(&[(1, &[], &mapped), (2, &[], &[])], true),
+        composite_keyboard_dump(&[(1, &[], &mapped), (2, &[], &[])], true),
+        composite_keyboard_dump(&[(1, &[], &mapped), (2, &mapped, &[])], true),
+        composite_keyboard_dump(&[(1, &[], &mapped), (2, &mapped, &[])], false),
+    ] {
+        sys.on(&dump, Ran::ok(&fixture));
+    }
+    let context = ctx(&[who]);
+    assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+    item.apply(&sys, &context).unwrap();
+    let changes = sys.keyboard_changes();
+    assert_eq!(
+        changes.len(),
+        1,
+        "the already-correct primary interface is preserved"
+    );
+    assert_eq!(changes[0].registry, 2);
+    assert_eq!(changes[0].native, Some(mapped.to_vec()));
+    assert_eq!(changes[0].user, None);
+    assert!(matches!(item.probe(&sys, &context), Probe::Ok { .. }));
+    assert!(
+        matches!(item.probe(&sys, &context), Probe::Unusable { .. }),
+        "a true mouse cannot become a keyboard write target"
+    );
+    assert!(
+        matches!(item.probe(&sys, &context), Probe::Unusable { .. }),
+        "an OR matcher returning a service twice cannot trigger duplicate writes"
+    );
+    assert_eq!(sys.keyboard_changes().len(), 1);
+}
+
+#[test]
+fn effective_caps_uses_native_then_user_mapping_and_activation_keeps_other_keys() {
+    let caps = keyboard::CAPS_LOCK;
+    let control = keyboard::LEFT_CONTROL;
+    let option = 0x7_0000_00E2;
+    let native = HidMapping {
+        registry: 1,
+        prefix: KeyboardPrefix::default(),
+        native: vec![(caps, control)],
+        user: Vec::new(),
+    };
+    assert_eq!(native.caps_lock(), control);
+    assert_eq!(
+        merged_mapping(&[native]).unwrap(),
+        None,
+        "native Control needs no user mapping"
+    );
+
+    for (native, user) in [
+        (
+            vec![(caps, option), (option, keyboard::RIGHT_CONTROL)],
+            vec![(caps, control)],
+        ),
+        (
+            vec![(caps, control), (option, keyboard::RIGHT_CONTROL)],
+            vec![(caps, control), (control, option)],
+        ),
+    ] {
+        let before = HidMapping {
+            registry: 1,
+            prefix: KeyboardPrefix::default(),
+            native,
+            user,
+        };
+        let other_keys = [control, keyboard::RIGHT_CONTROL, option, 0x7_0000_00E3];
+        let other_outputs = other_keys.map(|key| before.output(key));
+        assert_eq!(
+            before.caps_lock(),
+            option,
+            "a user Caps entry cannot bypass the earlier native lookup"
+        );
+        let mut change = merged_mapping(std::slice::from_ref(&before))
+            .unwrap()
+            .unwrap();
+        let change = change.remove(0);
+        assert_eq!(change.user, None);
+        assert_eq!(change.before_user, before.user);
+        let after = after_change(before, change);
+        assert!(matches!(
+            after.caps_lock(),
+            keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+        ));
+        assert!(after.native.contains(&(option, keyboard::RIGHT_CONTROL)));
+        assert_eq!(other_keys.map(|key| after.output(key)), other_outputs);
+        assert_eq!(merged_mapping(&[after]).unwrap(), None);
+    }
+}
+
+#[test]
+fn activation_preserves_other_physical_keys_that_enter_the_user_caps_mapping() {
+    let caps = keyboard::CAPS_LOCK;
+    let left = keyboard::LEFT_CONTROL;
+    let right = keyboard::RIGHT_CONTROL;
+    let option = 0x7_0000_00E2;
+    let command = 0x7_0000_00E3;
+    let before = HidMapping {
+        registry: 1,
+        prefix: KeyboardPrefix::default(),
+        native: vec![(caps, option), (command, caps)],
+        user: vec![(left, option)],
+    };
+    let command_before = before.output(command);
+    let mut changes = merged_mapping(std::slice::from_ref(&before))
+        .unwrap()
+        .unwrap();
+    let change = changes.remove(0);
+    assert_eq!(
+        change.user, None,
+        "adding user Caps would also change physical Command"
+    );
+    let after = after_change(before, change);
+    assert_eq!(after.caps_lock(), right);
+    assert_eq!(after.output(command), command_before);
+    assert!(after.native.contains(&(command, caps)));
+    assert!(!after.user.iter().any(|(source, _)| *source == caps));
+
+    let blocked = HidMapping {
+        registry: 2,
+        prefix: KeyboardPrefix::default(),
+        native: vec![(caps, option), (command, caps)],
+        user: vec![(left, option), (right, option)],
+    };
+    assert!(
+        merged_mapping(&[blocked]).is_err(),
+        "no safe Control preimage can be invented"
+    );
+
+    let safe = HidMapping {
+        registry: 3,
+        prefix: KeyboardPrefix::default(),
+        native: vec![(caps, option), (command, option)],
+        user: vec![(left, option), (right, option)],
+    };
+    let command_before = safe.output(command);
+    let mut changes = merged_mapping(std::slice::from_ref(&safe))
+        .unwrap()
+        .unwrap();
+    let after = after_change(safe, changes.remove(0));
+    assert_eq!(after.caps_lock(), left);
+    assert_eq!(after.output(command), command_before);
+    assert!(after.native.contains(&(command, option)));
+    assert_eq!(
+        after.user.iter().find(|(source, _)| *source == left),
+        Some(&(left, option))
+    );
+}
+
+#[test]
+fn filter_state_is_bound_by_service_identity_and_never_guessed_from_row_order() {
+    let caps = keyboard::CAPS_LOCK;
+    let control = keyboard::LEFT_CONTROL;
+    let user = vec![(caps, control)];
+    let matched = vec![(1, user.clone()), (2, user.clone())];
+    let native = vec![(caps, 0x7_0000_00E2)];
+    let dump = hid_dump(&[(2, &native, &user), (1, &[], &user)]);
+    let observed = live_hid_mappings(&dump, &matched).unwrap();
+    assert_eq!(observed[0].caps_lock(), control);
+    assert_eq!(observed[1].caps_lock(), 0x7_0000_00E2);
+    for incomplete in [
+        hid_dump(&[(1, &[], &user)]),
+        hid_dump(&[(1, &[], &user), (1, &[], &user), (2, &native, &user)]),
+        hid_dump(&[(1, &[], &user), (2, &native, &[])]),
+        dump.replace("IOHIDKeyboardFilter", "UnknownFilter"),
+        dump.replace("HIDKeyboardModifierMappingPairs", "UnknownMapping"),
+        dump.replace("<key>Dst</key>", "<key>Unknown</key>"),
+    ] {
+        assert!(live_hid_mappings(&incomplete, &matched).is_err());
+    }
+    assert!(parse_hid_mappings("1 UserKeyMapping (null)\n1 UserKeyMapping (null)").is_err());
+    assert!(parse_hid_mappings("garbage\n1 UserKeyMapping (null)").is_err());
+}
+
+#[test]
+fn immediate_mapping_sets_only_the_matched_keyboard_and_verifies_the_real_hid_output() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 1452,
+            product: 598,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    let get = item.command().args(["--get", "UserKeyMapping"]).display();
+    sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping (null)\n100021604 UserKeyMapping (null)\n"));
+    let dump = hid_dump_command(&who).display();
+    sys.simulate(move |sys, cmd| {
+        if cmd.display() != dump {
+            return None;
+        }
+        let changes = sys.keyboard_changes();
+        let rows: Vec<_> = if changes.is_empty() {
+            vec![
+                (0x10002160e, &[][..], &[][..]),
+                (0x100021604, &[][..], &[][..]),
+            ]
+        } else {
+            changes
+                .iter()
+                .rev()
+                .map(|change| {
+                    (
+                        change.registry,
+                        change.native.as_deref().unwrap_or(&change.before_native),
+                        change.user.as_deref().unwrap_or(&change.before_user),
+                    )
+                })
+                .collect()
+        };
+        Some(Ran::ok(&hid_dump(&rows)))
+    });
+    let c = ctx(&[who]);
+    assert!(matches!(item.probe(&sys, &c), Probe::Change { .. }));
+    // No service maps Caps Lock yet: System State reads the key as Caps Lock.
+    assert_eq!(item.detail(&sys, &c), Some(Reading::CapsLock.token()));
+    item.apply(&sys, &c).unwrap();
+    let changes = sys.keyboard_changes();
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change.registry)
+            .collect::<Vec<_>>(),
+        [0x10002160e, 0x100021604]
+    );
+    assert!(changes.iter().all(|change| change.user.is_none()));
+    assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
+    assert_eq!(item.detail(&sys, &c), None);
+}
+
+#[test]
+fn a_successful_set_cannot_verify_caps_while_the_native_table_still_redirects_it() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 1452,
+            product: 598,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+    let native = [(keyboard::CAPS_LOCK, 0x7_0000_00E2)];
+    sys.on(&item.command().args(["--get", "UserKeyMapping"]).display(), Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"));
+    sys.on(
+        &hid_dump_command(&who).display(),
+        Ran::ok(&hid_dump(&[(0x100021604, &native, &mapped)])),
+    );
+    let rows = crate::engine::run(
+        &[Box::new(item)],
+        crate::model::Mode::Apply,
+        &sys,
+        &ctx(&[who]),
+        &mut crate::engine::NoJournal,
+    );
+    assert_eq!(rows[0].outcome, crate::model::Outcome::Failed);
+    assert_eq!(sys.keyboard_changes().len(), 1);
+    assert_eq!(sys.keyboard_changes()[0].registry, 0x100021604);
+}
+
+#[test]
+fn upstream_caps_remaps_are_never_reported_ready_or_rewritten_as_native_caps() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 1452,
+            product: 598,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    sys.on(
+        &item.command().args(["--get", "UserKeyMapping"]).display(),
+        Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping (null)\n"),
+    );
+    let native = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+    let mut prefix = crate::port::keyboard_prefix::tests::fields();
+    let fn_map = &mut prefix
+        .iter_mut()
+        .find(|(name, _)| name == "FnFunctionUsageMap")
+        .unwrap()
+        .1;
+    *fn_map = crate::port::keyboard_prefix::tests::pairs(&[(keyboard::CAPS_LOCK, 0x7_0000_00e2)]);
+    // With FnKeyMode=0 and no Fn held, Apple applies Caps→Option before the native
+    // table. A native Caps→Control entry therefore does not establish physical Control.
+    sys.on(
+        &hid_dump_command(&who).display(),
+        Ran::ok(&hid_dump_with_prefix(
+            &[(0x100021604, &native, &[])],
+            &prefix,
+        )),
+    );
+    let context = ctx(std::slice::from_ref(&who));
+    assert!(matches!(item.probe(&sys, &context), Probe::Unusable { .. }));
+    assert!(item.apply(&sys, &context).is_err());
+    assert!(sys.keyboard_changes().is_empty());
+
+    *prefix
+        .iter_mut()
+        .find(|(name, _)| name == "FnFunctionUsageMap")
+        .unwrap() = (
+        "FnFunctionUsageMap".into(),
+        crate::port::keyboard_prefix::tests::pairs(&[
+            (0x7_0000_003a, 0xc_0000_006f),
+            (keyboard::CAPS_LOCK, keyboard::CAPS_LOCK),
+        ]),
+    );
+    let mut ordinary = Fake::root();
+    ordinary.euid = who.uid;
+    ordinary.on(
+        &item.command().args(["--get", "UserKeyMapping"]).display(),
+        Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping (null)\n"),
+    );
+    ordinary.on(
+        &hid_dump_command(&who).display(),
+        Ran::ok(&hid_dump_with_prefix(
+            &[(0x100021604, &native, &[])],
+            &prefix,
+        )),
+    );
+    assert!(
+        matches!(item.probe(&ordinary, &context), Probe::Ok { .. }),
+        "ordinary function maps and identity Caps remain usable"
+    );
+
+    let historical = crate::port::keyboard_prefix::tests::historical_fields();
+    let old_dump = hid_dump_with_prefix(&[(0x100021604, &[], &[])], &historical);
+    let old_maps = live_hid_mappings(&old_dump, &[(0x100021604, Vec::new())]).unwrap();
+    let mut changes = merged_mapping(&old_maps).unwrap().unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "complete historical state still permits setup"
+    );
+    assert_eq!(changes[0].before_prefix, old_maps[0].prefix);
+    assert_eq!(
+        after_change(old_maps.into_iter().next().unwrap(), changes.remove(0)).caps_lock(),
+        keyboard::LEFT_CONTROL
+    );
+}
+
+#[test]
+fn activation_for_another_user_never_reaches_the_native_writer() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 1452,
+            product: 598,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    for actor in [0, 502] {
+        let mut sys = Fake::root();
+        sys.euid = actor;
+        assert!(item.apply(&sys, &ctx(std::slice::from_ref(&who))).is_err());
+        assert!(sys.keyboard_changes().is_empty());
+        assert!(sys.calls().is_empty());
+    }
+}
+
+#[test]
+fn an_incomplete_hid_record_never_overwrites_an_omitted_services_remaps() {
+    let who = user("alice", 501);
+    let item = AttachedKeyboard {
+        model: keyboard::Model {
+            vendor: 1452,
+            product: 598,
+        },
+        user: who.clone(),
+        reading: LastReading::default(),
+        expected: KeyboardCoverage::default(),
+    };
+    let sys = Fake::root();
+    let get = item.command().args(["--get", "UserKeyMapping"]).display();
+    sys.on(
+        &get,
+        Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping (null)\n"),
+    );
+    sys.refuse_complete_stdout(&get, "stdout exceeds complete capture bound");
+    let rows = crate::engine::run(
+        &[Box::new(item)],
+        crate::model::Mode::Apply,
+        &sys,
+        &ctx(&[who]),
+        &mut crate::engine::NoJournal,
+    );
+    assert_eq!(rows[0].outcome, crate::model::Outcome::Unknown);
+    assert!(sys.calls().iter().all(|call| !call.contains("--set")));
+    assert!(sys.keyboard_changes().is_empty());
+}
+
+#[test]
+fn dock_metadata_is_ignored_but_pin_order_extra_pins_and_stacks_are_not() {
+    let want = dock_apps(&usual_dock_apps());
+    let PValue::Array(mut pins) = want.clone() else {
+        unreachable!()
+    };
+    let PValue::Dict(first) = &mut pins[0] else {
+        unreachable!()
+    };
+    first.push(("GUID".into(), PValue::Int(123)));
+    assert!(same_apps(
+        &Fake::root(),
+        &PValue::Array(pins.clone()),
+        &want
+    ));
+    pins.swap(0, 1);
+    assert!(!same_apps(
+        &Fake::root(),
+        &PValue::Array(pins.clone()),
+        &want
+    ));
+    pins.push(PValue::Dict(vec![]));
+    assert!(!same_apps(&Fake::root(), &PValue::Array(pins), &want));
+}
+
+#[test]
+fn dock_bundle_labels_cannot_hide_missing_or_different_file_targets() {
+    let want = dock_apps(&usual_dock_apps());
+    let xml = crate::plist::fragment(&want);
+    for wrong in [
+        "file:///Applications/Missing.app/",
+        "file://another-host/Applications/aterm.app/",
+        "file:///Applications/aterm.app/?different-target",
+        "file:///Applications/aterm.app/#different-target",
+        "file:///Applications/%QQaterm.app/",
+        "file:///Applications/%00aterm.app/",
+    ] {
+        let changed = xml.replace("file:///Applications/aterm.app/", wrong);
+        let changed = crate::plist::parse(changed.as_bytes()).unwrap();
+        assert!(!same_apps(&Fake::root(), &changed, &want), "{wrong}");
+    }
+    let missing = xml.replacen("<key>file-data</key>", "<key>unusable-file-data</key>", 1);
+    assert!(!same_apps(
+        &Fake::root(),
+        &crate::plist::parse(missing.as_bytes()).unwrap(),
+        &want
+    ));
+    let normalized = xml
+        .replace(
+            "file:///Applications/aterm.app/",
+            "file://localhost/Applications/%61term.app",
+        )
+        .replace(
+            "file:///Applications/Safari.app/",
+            "file:///Applications/Safari.app",
+        );
+    assert!(same_apps(
+        &Fake::root(),
+        &crate::plist::parse(normalized.as_bytes()).unwrap(),
+        &want
+    ));
+}
+
+#[test]
+fn missing_or_wrong_installed_dock_apps_cannot_be_reported_configured() {
+    let who = user("alice", 501);
+    let safari = DOCK_APPS[2].0;
+    for (identity, expected) in [
+        (None, format!("Safari is not installed at {safari}")),
+        (
+            Some("com.example.another-app"),
+            format!("{safari} is not the requested Safari application"),
+        ),
+    ] {
+        let (sys, desk) = desktop_with(&who, Desk::before(), false);
+        for (path, bundle, _) in &DOCK_APPS[..2] {
+            installed_at(&sys, &who, path, bundle);
+        }
+        if let Some(bundle) = identity {
+            installed_at(&sys, &who, safari, bundle);
+        }
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Dock]),
+            Mode::Apply,
+        );
+        assert_eq!(run.rows[0].outcome, Outcome::Unknown, "{:?}", run.rows);
+        assert_eq!(
+            run.rows[0].why.as_deref(),
+            Some(format!("{expected}; Dock left untouched").as_str())
+        );
+        let desk = desk.lock().unwrap();
+        assert!(
+            !desk
+                .events
+                .iter()
+                .any(|e| e.starts_with("write ") || e.starts_with("kill ")),
+            "{:?}",
+            desk.events
+        );
+    }
+}
+
+#[test]
+fn the_dock_pins_the_aterm_in_the_accounts_own_applications_folder() {
+    let who = user("alice", 501);
+    let usual_path = DOCK_APPS[0].0;
+    let own = "/Users//alice/Applications/aterm.app";
+    let pins_at = |aterm: &str| {
+        let mut apps = vec![(aterm.to_owned(), DOCK_APPS[0].1, DOCK_APPS[0].2)];
+        apps.extend(
+            DOCK_APPS[1..]
+                .iter()
+                .map(|&(path, bundle, label)| (path.to_owned(), bundle, label)),
+        );
+        dock_apps(&apps)
+    };
+    let aterm = Some("com.aterm.aterm");
+    for (usual, home, running, pinned) in [
+        (None, aterm, None, Ok(own)),
+        (Some("com.example.another-app"), aterm, None, Ok(own)),
+        (aterm, aterm, None, Ok(usual_path)),
+        (aterm, aterm, Some(own), Ok(own)),
+        (aterm, aterm, Some(usual_path), Ok(usual_path)),
+        (aterm, None, Some(own), Ok(usual_path)),
+        (
+            None,
+            None,
+            None,
+            Err(format!("aterm is not installed at {usual_path} or {own}")),
+        ),
+        (
+            Some("com.example.another-app"),
+            None,
+            None,
+            Err(format!(
+                "no aterm to pin ({usual_path} is not the requested aterm application, \
+                 nothing at {own})"
+            )),
+        ),
+        (
+            None,
+            Some("com.aterm.aterm.dev"),
+            Some(own),
+            Err(format!(
+                "no aterm to pin ({own} is not the requested aterm application, nothing at \
+                 {usual_path})"
+            )),
+        ),
+    ] {
+        let (mut sys, desk) = desktop_with(&who, Desk::before(), false);
+        sys.running_app = running.map(PathBuf::from);
+        for (path, bundle, _) in &DOCK_APPS[1..] {
+            installed_at(&sys, &who, path, bundle);
+        }
+        if let Some(bundle) = usual {
+            installed_at(&sys, &who, usual_path, bundle);
+        }
+        if let Some(bundle) = home {
+            installed_at(&sys, &who, own, bundle);
+        }
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Dock]),
+            Mode::Apply,
+        );
+        let case = format!("{usual:?} {home:?} {running:?}");
+        match pinned {
+            Ok(aterm) => {
+                assert_eq!(
+                    run.rows[0].outcome,
+                    Outcome::Changed,
+                    "{case}: {:?}",
+                    run.rows
+                );
+                let desk = desk.lock().unwrap();
+                let now = desk.read(DOCK, "persistent-apps").unwrap();
+                assert!(same_apps(&sys, now, &pins_at(aterm)), "{case}: {now:?}");
+            }
+            Err(expected) => {
+                assert_eq!(
+                    run.rows[0].outcome,
+                    Outcome::Unknown,
+                    "{case}: {:?}",
+                    run.rows
+                );
+                let why = run.rows[0].why.clone().unwrap_or_default();
+                assert_eq!(why, format!("{expected}; Dock left untouched"), "{case}");
+                assert!(
+                    !desk
+                        .lock()
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|e| e.starts_with("write ")),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// The pin is the copy this aterm runs from wherever that copy lasts, and never a copy
+/// that goes away (an App Translocation copy, a disk image): with nothing installed where
+/// aterm installs, the row says it runs from such a copy, and the Dock is left untouched.
+/// Negative control: a pin limited to `/Applications` and `~/Applications` reads this
+/// lasting copy as not installed.
+#[test]
+fn the_dock_pins_the_running_copy_where_it_lasts_and_never_a_copy_that_goes_away() {
+    let who = user("alice", 501);
+    let usual_path = DOCK_APPS[0].0;
+    let own = "/Users//alice/Applications/aterm.app";
+    let lasting = "/Users//alice/Developer/aterm.app";
+    let translocated = "/private/var/folders/x/AppTranslocation/Y/d/aterm.app";
+    for (running, usual, pinned) in [
+        (lasting, false, Ok(lasting)),
+        (translocated, true, Ok(usual_path)),
+        (
+            translocated,
+            false,
+            Err(format!(
+                "aterm is not installed at {usual_path} or {own}; it runs from \
+                 {translocated}, a copy that goes away (a disk image or App Translocation \
+                 copy): move aterm.app to /Applications; Dock left untouched"
+            )),
+        ),
+    ] {
+        let (mut sys, desk) = desktop_with(&who, Desk::before(), false);
+        sys.running_app = Some(PathBuf::from(running));
+        for (path, bundle, _) in &DOCK_APPS[1..] {
+            installed_at(&sys, &who, path, bundle);
+        }
+        installed_at(&sys, &who, running, "com.aterm.aterm");
+        if usual {
+            installed_at(&sys, &who, usual_path, "com.aterm.aterm");
+        }
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Dock]),
+            Mode::Apply,
+        );
+        let case = format!("{running} {usual}");
+        match pinned {
+            Ok(aterm) => {
+                assert_eq!(
+                    run.rows[0].outcome,
+                    Outcome::Changed,
+                    "{case}: {:?}",
+                    run.rows
+                );
+                let mut apps = vec![(aterm.to_owned(), DOCK_APPS[0].1, DOCK_APPS[0].2)];
+                apps.extend(
+                    DOCK_APPS[1..]
+                        .iter()
+                        .map(|&(path, bundle, label)| (path.to_owned(), bundle, label)),
+                );
+                let desk = desk.lock().unwrap();
+                let now = desk.read(DOCK, "persistent-apps").unwrap();
+                assert!(same_apps(&sys, now, &dock_apps(&apps)), "{case}: {now:?}");
+            }
+            Err(expected) => {
+                assert_eq!(
+                    run.rows[0].outcome,
+                    Outcome::Unknown,
+                    "{case}: {:?}",
+                    run.rows
+                );
+                assert_eq!(
+                    run.rows[0].why.as_deref(),
+                    Some(expected.as_str()),
+                    "{case}"
+                );
+                assert!(
+                    !desk
+                        .lock()
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|e| e.starts_with("write ")),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_pin_reads_back_as_the_path_it_was_made_from() {
+    for path in [
+        "/Applications/aterm.app",
+        "/System/Applications/System Settings.app",
+        "/Volumes/Work #2/bob/Applications/aterm.app",
+        "/Users//what?/Applications/aterm.app",
+        "/Volumes/100%/bob/Applications/aterm.app",
+        "/Volumes/50%20off/bob/Applications/aterm.app",
+        "/Users//zo\u{eb} (old)+new/Applications/aterm.app",
+    ] {
+        let PValue::Array(pins) = dock_apps(&[(path.to_owned(), "com.aterm.aterm", "aterm")])
+        else {
+            unreachable!()
+        };
+        assert_eq!(dock_app_path(&pins[0]), Some(PathBuf::from(path)), "{path}");
+    }
+    assert_eq!(
+        file_url("/System/Applications/System Settings.app"),
+        "file:///System/Applications/System%20Settings.app/",
+        "the URL the Dock itself writes for a space"
+    );
+}
+
+#[test]
+fn an_applications_folder_reached_through_a_link_still_pins_the_running_copy() {
+    let who = user("alice", 501);
+    let own = "/Users//alice/Applications/aterm.app";
+    let real = "/Volumes/Apps/alice/aterm.app";
+    let pins_at = |aterm: &str| {
+        let mut apps = usual_dock_apps();
+        apps[0].0 = aterm.to_owned();
+        dock_apps(&apps)
+    };
+    let (mut sys, desk) = desktop_of(&who, Desk::before());
+    installed_at(&sys, &who, own, DOCK_APPS[0].1);
+    sys.link("/Users//alice/Applications", "/Volumes/Apps/alice");
+    sys.running_app = Some(PathBuf::from(real));
+    let run = pass(
+        &sys,
+        selected_desktop_items(&who, &[Setting::Dock]),
+        Mode::Apply,
+    );
+    assert_eq!(run.rows[0].outcome, Outcome::Changed, "{:?}", run.rows);
+    let desk = desk.lock().unwrap();
+    let now = desk.read(DOCK, "persistent-apps").unwrap();
+    assert!(same_apps(&Fake::root(), now, &pins_at(own)), "{now:?}");
+    assert!(same_apps(&sys, &pins_at(real), &pins_at(own)));
+    assert!(!same_apps(&sys, &pins_at(real), &pins_at(DOCK_APPS[0].0)));
+}
+
+#[test]
+fn dock_plan_is_read_only_and_covers_every_persistent_static_and_recent_section() {
+    let who = user("alice", 501);
+    let item = desktop(&who, DesktopKind::Dock);
+    let sys = Fake::root();
+    installed_dock_apps(&sys, &who);
+    sys.on(
+        "alice$ /usr/bin/defaults export com.apple.dock -",
+        export("<dict/>"),
+    );
+    let changes = item.changes(&sys).unwrap();
+    let keys: Vec<_> = changes
+        .iter()
+        .map(|(target, _, _)| target.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "autohide",
+            "persistent-apps",
+            "persistent-others",
+            "static-apps",
+            "static-others",
+            "recent-apps",
+            "show-recents",
+            "static-only",
+            "minimize-to-application"
+        ]
+    );
+    assert!(sys.calls().iter().all(|call| call.contains(" export ")
+        || call.contains("/usr/bin/plutil -extract CFBundleIdentifier")));
+    let mut c = ctx(&[who]);
+    c.disrupt = false;
+    assert!(matches!(item.probe(&sys, &c), Probe::Deferred { .. }));
+    let undo = item.revert().unwrap();
+    assert_eq!(undo.lines().count(), keys.len());
+    assert!(
+        undo.lines()
+            .all(|line| line.contains("/usr/bin/defaults delete") && line.contains("  # "))
+    );
+}
+
+#[test]
+fn a_desktop_reading_names_only_values_it_read_and_three_other_apps_are_not_the_three() {
+    let who = user("alice", 501);
+    let target = |domain: &str, key: &str| Target::user(domain, key, &who);
+    let pin = || PValue::Dict(Vec::new());
+    let dock = |pins: usize| -> Changes {
+        vec![(
+            target("com.apple.dock", "persistent-apps"),
+            Read::Value(PValue::Array(vec![pin(); pins])),
+            dock_apps(&usual_dock_apps()),
+        )]
+    };
+    let PValue::Array(wanted) = dock_apps(&usual_dock_apps()) else {
+        panic!("the Dock's pins are a list");
+    };
+    assert_eq!(
+        DesktopKind::Dock.reading(&dock(wanted.len())),
+        Some(Reading::Apps {
+            pinned: wanted.len(),
+            wanted: wanted.len()
+        })
+    );
+    assert_eq!(
+        Reading::Apps {
+            pinned: wanted.len(),
+            wanted: wanted.len()
+        }
+        .word()
+        .as_deref(),
+        Some("Other apps")
+    );
+    let hidden: Changes = vec![(
+        target("com.apple.finder", "CreateDesktop"),
+        Read::Value(PValue::Bool(false)),
+        PValue::Bool(true),
+    )];
+    assert_eq!(
+        DesktopKind::Desktop.reading(&hidden),
+        Some(Reading::IconsHidden)
+    );
+    // An absent key holds macOS's default, which this does not read.
+    let absent: Changes = vec![(
+        target("com.apple.finder", "CreateDesktop"),
+        Read::Absent,
+        PValue::Bool(true),
+    )];
+    assert_eq!(DesktopKind::Desktop.reading(&absent), None);
+    assert_eq!(DesktopKind::Dock.reading(&absent), None);
+}
+
+/// The marker's barriers ([`crate::init_activation::begin`]) come before any write: a pass
+/// whose barrier fails writes nothing, and its retry, which finds the marker the failed pass
+/// left, orders the whole chain again before its first write. A first pass orders only the
+/// directories whose entries it changed (the marker's, and the parent of each it created),
+/// and a later marker in the directory that is there orders that directory alone.
+#[test]
+fn a_failed_namespace_flush_allows_no_write_and_a_retry_flushes_the_whole_chain() {
+    let who = user("alice", 501);
+    let windowmanager = "alice$ /usr/bin/defaults export com.apple.WindowManager -";
+    let finder = "alice$ /usr/bin/defaults export com.apple.finder -";
+    let c = ctx(std::slice::from_ref(&who));
+    let chain = [
+        "/Users//alice/Library/Application Support/aterm/init-activation",
+        "/Users//alice/Library/Application Support/aterm",
+        "/Users//alice/Library/Application Support",
+        "/Users//alice/Library",
+        "/Users//alice",
+        "/Users",
+        "/",
+    ];
+    let ordered = |calls: &[String]| -> Vec<String> {
+        calls
+            .iter()
+            .filter(|call| call.starts_with("ordered-dir "))
+            .cloned()
+            .collect()
+    };
+    let expected: Vec<String> = chain
+        .iter()
+        .map(|dir| format!("ordered-dir {dir}"))
+        .collect();
+    // The first pass creates `aterm` and `init-activation`: it changes the entries of
+    // those two and of `Application Support`.
+    for (failed_at, directory) in chain[..3].iter().enumerate() {
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        for home in &chain[2..5] {
+            sys.stat_of(
+                home,
+                Stat {
+                    uid: who.uid,
+                    gid: who.gid,
+                    mode: 0o700,
+                    dir: true,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+        }
+        sys.on(windowmanager, export("<dict><key>EnableStandardClickToShowDesktop</key><false/><key>StandardHideDesktopIcons</key><true/><key>StageManagerHideDesktopIcons</key><true/></dict>"));
+        sys.on(
+            finder,
+            export("<dict><key>CreateDesktop</key><true/></dict>"),
+        );
+        for key in ["StandardHideDesktopIcons", "StageManagerHideDesktopIcons"] {
+            let cmd =
+                Target::user("com.apple.WindowManager", key, &who).write_cmd(&PValue::Bool(false));
+            sys.on(&cmd.display(), Ran::ok(""));
+        }
+        sys.durable_dir_fails(Path::new(directory), Some(std::io::ErrorKind::Other));
+        let item = desktop(&who, DesktopKind::Desktop);
+        assert!(item.apply(&sys, &c).is_err());
+        assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.contains("/usr/bin/defaults write")
+                    && !call.contains("pgrep")
+                    && !call.contains("killall"))
+        );
+        assert_eq!(ordered(&calls), expected[..=failed_at]);
+        sys.durable_dir_fails(Path::new(directory), None);
+        let retry = calls.len();
+        item.apply(&sys, &c).unwrap();
+        assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
+        let calls = sys.calls();
+        let retry_calls = &calls[retry..];
+        let first_write = retry_calls
+            .iter()
+            .position(|call| call.contains("/usr/bin/defaults write"))
+            .unwrap();
+        assert_eq!(ordered(&retry_calls[..first_write]), expected);
+        assert_eq!(
+            retry_calls
+                .iter()
+                .filter(|call| call.contains("/usr/bin/defaults write"))
+                .count(),
+            2
+        );
+        // Another family's first marker in the directory that is there.
+        let later = sys.calls().len();
+        crate::init_activation::begin(&sys, &who, "dock").unwrap();
+        assert_eq!(ordered(&sys.calls()[later..]), expected[..1]);
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.starts_with("durable-dir ")),
+            "a barrier, never a full flush: {:?}",
+            sys.calls()
+        );
+    }
+}
+
+const TILES: [&str; 3] = ["persistent-apps", "persistent-others", "recent-apps"];
+
+type Loaded = Vec<(&'static str, PValue)>;
+
+type Starting = Option<(Loaded, u32)>;
+
+struct Desk {
+    prefs: Vec<(String, String, PValue)>,
+    /// Each running process, its pid, and, while it is starting, the tiles it read and
+    /// the sleeps ([`System::sleep`]) left until its start is past.
+    running: Vec<(&'static str, u32, Starting)>,
+    next_pid: u32,
+    /// How many sleeps a Dock takes to get past its start.
+    start: u32,
+    /// The pins a managed Dock shows once it is past its start, whatever was written.
+    managed: Option<PValue>,
+    /// A process launchd does not start again once it is killed.
+    stays_down: Option<&'static str>,
+    /// A process whose `killall` fails (exit 2) and signals nothing.
+    unkillable: Option<&'static str>,
+    /// A `defaults write` of this domain and key fails, writing nothing.
+    unwritable: Option<(&'static str, &'static str)>,
+    /// How many `launchctl print` session checks fail before one answers.
+    session_failures: u32,
+    /// A domain macOS keeps from the reader, as it keeps another app's container from a
+    /// process without Full Disk Access: its export prints an empty dictionary
+    /// (measured); a write is assumed to exit 0 and never be read back (not measured).
+    denied: Option<&'static str>,
+    /// What happened, in order: `write <domain> <key>`, `kill <process>`, `<process>
+    /// <pid> wrote back what it read at its start`, `Dock <pid> past its start`.
+    events: Vec<String>,
+}
+
+fn pin(label: &str) -> PValue {
+    PValue::Dict(vec![(
+        "tile-data".into(),
+        PValue::Dict(vec![("file-label".into(), PValue::Str(label.into()))]),
+    )])
+}
+
+impl Desk {
+    fn before() -> Self {
+        Self {
+            prefs: vec![
+                (
+                    DOCK.into(),
+                    "persistent-apps".into(),
+                    PValue::Array(vec![pin("Mail"), pin("Music")]),
+                ),
+                (
+                    DOCK.into(),
+                    "persistent-others".into(),
+                    PValue::Array(vec![pin("Downloads")]),
+                ),
+                (
+                    DOCK.into(),
+                    "recent-apps".into(),
+                    PValue::Array(vec![pin("Notes")]),
+                ),
+                (DOCK.into(), "show-recents".into(), PValue::Bool(true)),
+                (
+                    WINDOW_MANAGER.into(),
+                    "StandardHideDesktopIcons".into(),
+                    PValue::Bool(true),
+                ),
+                (
+                    NOTIFICATION_CENTER.into(),
+                    "widgets".into(),
+                    PValue::Dict(vec![
+                        ("vers".into(), PValue::Int(1)),
+                        (
+                            "instances".into(),
+                            PValue::Array(vec![PValue::Data(vec![42])]),
+                        ),
+                    ]),
+                ),
+            ],
+            running: vec![
+                ("Dock", 100, None),
+                ("Finder", 200, None),
+                ("NotificationCenter", 300, None),
+            ],
+            next_pid: 1000,
+            start: 1,
+            managed: None,
+            stays_down: None,
+            unkillable: None,
+            unwritable: None,
+            session_failures: 0,
+            denied: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn read(&self, domain: &str, key: &str) -> Option<&PValue> {
+        self.prefs
+            .iter()
+            .find(|(d, k, _)| d == domain && k == key)
+            .map(|(_, _, value)| value)
+    }
+
+    fn write(&mut self, domain: &str, key: &str, value: PValue) {
+        self.prefs.retain(|(d, k, _)| !(d == domain && k == key));
+        self.prefs.push((domain.into(), key.into(), value));
+    }
+
+    fn count(&self, event: &str) -> usize {
+        self.events.iter().filter(|e| *e == event).count()
+    }
+
+    fn starting(&self) -> Vec<(&'static str, u32)> {
+        self.running
+            .iter()
+            .filter(|(_, _, starting)| starting.is_some())
+            .map(|(name, pid, _)| (*name, *pid))
+            .collect()
+    }
+
+    fn answer(&mut self, fake: &Fake, cmd: &Cmd) -> Option<Ran> {
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match (cmd.program.to_str()?, args.as_slice()) {
+            ("/usr/bin/defaults", ["export", domain, "-"]) if self.denied == Some(*domain) => {
+                Some(Ran::ok(&crate::plist::document(&PValue::Dict(Vec::new()))))
+            }
+            ("/usr/bin/defaults", ["export", domain, "-"]) => {
+                let entries = self
+                    .prefs
+                    .iter()
+                    .filter(|(d, _, _)| d == domain)
+                    .map(|(_, key, value)| (key.clone(), value.clone()))
+                    .collect();
+                Some(Ran::ok(&crate::plist::document(&PValue::Dict(entries))))
+            }
+            ("/usr/bin/defaults", ["write", domain, key, value @ ..]) => {
+                let value = match value {
+                    ["-bool", b] => PValue::Bool(*b == "true"),
+                    ["-int", i] => PValue::Int(i.parse().ok()?),
+                    ["-string", text] => PValue::Str((*text).into()),
+                    [fragment] => crate::plist::parse(fragment.as_bytes()).ok()?,
+                    _ => return None,
+                };
+                if self.unwritable == Some((domain, key)) {
+                    return Some(Ran::exit(1, "injected write failure"));
+                }
+                if self.denied == Some(*domain) {
+                    self.events.push(format!("write {domain} {key}"));
+                    return Some(Ran::ok(""));
+                }
+                self.events.push(format!("write {domain} {key}"));
+                self.write(domain, key, value);
+                Some(Ran::ok(""))
+            }
+            ("/usr/bin/pgrep", ["-u", _, "-x", process]) => {
+                let pids: String = self
+                    .running
+                    .iter()
+                    .filter(|(name, _, _)| name == process)
+                    .map(|(_, pid, _)| format!("{pid}\n"))
+                    .collect();
+                Some(if pids.is_empty() {
+                    Ran {
+                        status: Some(1),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }
+                } else {
+                    Ran::ok(&pids)
+                })
+            }
+            ("/bin/launchctl", ["print", _]) => Some(if self.session_failures > 0 {
+                self.session_failures -= 1;
+                Ran::exit(2, "injected session lookup failure")
+            } else {
+                Ran::ok("")
+            }),
+            ("/usr/bin/killall", ["-u", _, process]) => {
+                if self.unkillable == Some(*process) {
+                    return Some(Ran::exit(2, "injected killall failure"));
+                }
+                self.kill(fake, process);
+                Some(Ran::ok(""))
+            }
+            _ => None,
+        }
+    }
+
+    fn kill(&mut self, fake: &Fake, process: &str) {
+        let dying: Vec<_> = self
+            .running
+            .iter()
+            .filter(|(name, _, _)| *name == process)
+            .cloned()
+            .collect();
+        self.running.retain(|(name, _, _)| *name != process);
+        for (name, pid, starting) in dying {
+            if let Some((tiles, _)) = starting {
+                for (key, value) in tiles {
+                    self.write(DOCK, key, value);
+                }
+                self.events
+                    .push(format!("{name} {pid} wrote back what it read at its start"));
+            }
+            fake.exited(pid);
+            self.events.push(format!("kill {name}"));
+            if self.stays_down == Some(name) {
+                continue;
+            }
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            let starting = (name == "Dock").then(|| {
+                let tiles = TILES
+                    .iter()
+                    .filter_map(|key| self.read(DOCK, key).map(|value| (*key, value.clone())))
+                    .collect();
+                (tiles, self.start)
+            });
+            self.running.push((name, pid, starting));
+            fake.alive(pid);
+        }
+    }
+
+    fn tick(&mut self) {
+        let mut started = Vec::new();
+        for (name, pid, starting) in &mut self.running {
+            if let Some((_, left)) = starting {
+                *left = left.saturating_sub(1);
+                if *left == 0
+                    && let Some((tiles, _)) = starting.take()
+                {
+                    started.push((*name, *pid, tiles));
+                }
+            }
+        }
+        for (name, pid, tiles) in started {
+            for (key, value) in tiles {
+                let value = match (&self.managed, key) {
+                    (Some(managed), "persistent-apps") => managed.clone(),
+                    _ => value,
+                };
+                self.write(DOCK, key, with_guids(value, i64::from(pid)));
+            }
+            self.events.push(format!("{name} {pid} past its start"));
+        }
+    }
+}
+
+fn with_guids(tiles: PValue, guid: i64) -> PValue {
+    let PValue::Array(pins) = tiles else {
+        return tiles;
+    };
+    PValue::Array(
+        pins.into_iter()
+            .map(|pin| match pin {
+                PValue::Dict(mut fields) => {
+                    if !fields.iter().any(|(key, _)| key == "GUID") {
+                        fields.push(("GUID".into(), PValue::Int(guid)));
+                    }
+                    PValue::Dict(fields)
+                }
+                other => other,
+            })
+            .collect(),
+    )
+}
+
+fn desktop_of(who: &User, desk: Desk) -> (Fake, Arc<Mutex<Desk>>) {
+    desktop_with(who, desk, true)
+}
+
+fn desktop_with(who: &User, desk: Desk, dock_apps: bool) -> (Fake, Arc<Mutex<Desk>>) {
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    if dock_apps {
+        installed_dock_apps(&sys, who);
+    }
+    for (_, pid, _) in &desk.running {
+        sys.alive(*pid);
+    }
+    let desk = Arc::new(Mutex::new(desk));
+    let model = Arc::clone(&desk);
+    sys.simulate(move |fake, cmd| model.lock().unwrap().answer(fake, cmd));
+    let model = Arc::clone(&desk);
+    sys.on_sleep(move |_, _| model.lock().unwrap().tick());
+    (sys, desk)
+}
+
+fn desktop_items(who: &User) -> Vec<Box<dyn Item>> {
+    selected_desktop_items(who, &[Setting::Widgets, Setting::Desktop, Setting::Dock])
+}
+
+fn selected_desktop_items(who: &User, settings: &[Setting]) -> Vec<Box<dyn Item>> {
+    selected_desktop_items_at(who, Some(true), settings)
+}
+
+fn desktop_items_at(who: &User, full_disk_access: Option<bool>) -> Vec<Box<dyn Item>> {
+    selected_desktop_items_at(
+        who,
+        full_disk_access,
+        &[Setting::Widgets, Setting::Desktop, Setting::Dock],
+    )
+}
+
+fn selected_desktop_items_at(
+    who: &User,
+    full_disk_access: Option<bool>,
+    settings: &[Setting],
+) -> Vec<Box<dyn Item>> {
+    let mut selected = Selection::none();
+    for &setting in settings {
+        selected.set(setting, true);
+    }
+    let mut context = ctx(std::slice::from_ref(who));
+    context.facts.full_disk_access = full_disk_access;
+    selected_items(&context, selected).unwrap()
+}
+
+fn journaled(sys: &Fake) -> Vec<(String, String)> {
+    String::from_utf8(sys.written(Fake::JOURNAL).unwrap())
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let line: aterm_json::Value = aterm_json::from_str(line).unwrap();
+            (
+                line["id"].as_str().unwrap().to_owned(),
+                line["to"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn verified(pass: &crate::init::WorkstationRun) -> Vec<(&str, bool)> {
+    pass.attempts
+        .iter()
+        .map(|attempt| (attempt.id.as_str(), attempt.verified))
+        .collect()
+}
+
+fn pass(sys: &Fake, items: Vec<Box<dyn Item>>, mode: Mode) -> crate::init::WorkstationRun {
+    Workstation::of(items).run_recording(sys, mode).unwrap()
+}
+
+fn outcomes(pass: &crate::init::WorkstationRun) -> Vec<(&str, Outcome)> {
+    pass.rows
+        .iter()
+        .map(|row| (row.id.as_str(), row.outcome))
+        .collect()
+}
+
+const WIDGET_IDS: [&str; 3] = [
+    "consumer.widgets.desktop@alice",
+    "consumer.widgets.stage-manager@alice",
+    NC_ID,
+];
+
+const NC_ID: &str = "consumer.widgets.notification-center@alice";
+
+const DESKTOP_IDS: [&str; 5] = [
+    WIDGET_IDS[0],
+    WIDGET_IDS[1],
+    WIDGET_IDS[2],
+    "init.desktop@alice",
+    "init.dock@alice",
+];
+
+#[test]
+fn inits_widget_items_are_the_catalogs_rows_and_the_clear_reads_back() {
+    let who = user("alice", 501);
+    let mut context = ctx(std::slice::from_ref(&who));
+    context.facts.full_disk_access = Some(true);
+    let fleet = crate::items::catalog::expand(
+        &crate::items::catalog::Table {
+            widgets: Some(false),
+            ..crate::items::catalog::Table::default()
+        },
+        &context,
+    )
+    .unwrap();
+    let init = selected_desktop_items(&who, &[Setting::Widgets]);
+    let ids = |items: &[Box<dyn Item>]| items.iter().map(|item| item.id()).collect::<Vec<_>>();
+    assert_eq!(ids(&init), ids(&fleet));
+    assert_eq!(ids(&init), WIDGET_IDS);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let keys = |item: &dyn Item| -> Vec<(String, String)> {
+        item.preference_changes(&sys, &context)
+            .unwrap()
+            .into_iter()
+            .map(|(target, _)| (target.domain, target.key))
+            .collect()
+    };
+    let rows: Vec<&CatalogRow> = CATALOG
+        .iter()
+        .filter(|row| row.preset == "widgets")
+        .collect();
+    assert_eq!(rows.len(), WIDGET_IDS.len());
+    for ((row, init), fleet) in rows.iter().zip(&init).zip(&fleet) {
+        let own = vec![(row.domain.to_owned(), row.key.to_owned())];
+        assert_eq!(keys(init.as_ref()), own, "{}", init.id());
+        assert_eq!(keys(fleet.as_ref()), own, "{}", fleet.id());
+    }
+    desk.lock().unwrap().write(
+        NOTIFICATION_CENTER,
+        "widgets",
+        PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            ("future".into(), PValue::Bool(true)),
+            (
+                "instances".into(),
+                PValue::Array(vec![PValue::Data(vec![42])]),
+            ),
+        ]),
+    );
+    let run = pass(&sys, init, Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        WIDGET_IDS.map(|id| (id, Outcome::Changed)),
+        "{:?}",
+        run.rows
+    );
+    assert!(run.attempts.iter().all(|attempt| attempt.verified));
+    let desk = desk.lock().unwrap();
+    let Some(PValue::Dict(list)) = desk.read(NOTIFICATION_CENTER, "widgets") else {
+        panic!("{:?}", desk.read(NOTIFICATION_CENTER, "widgets"));
+    };
+    assert!(
+        list.contains(&("instances".into(), PValue::Array(Vec::new())))
+            && list.contains(&("future".into(), PValue::Bool(true))),
+        "{list:?}"
+    );
+    assert_eq!(
+        desk.count("kill NotificationCenter"),
+        1,
+        "{:?}",
+        desk.events
+    );
+}
+
+#[test]
+fn a_widgets_row_already_set_reads_ok_beside_one_that_begins_the_shared_marker() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    desk.lock().unwrap().write(
+        WINDOW_MANAGER,
+        "StageManagerHideWidgets",
+        PValue::Bool(true),
+    );
+    let run = pass(
+        &sys,
+        selected_desktop_items(&who, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Ok),
+            (WIDGET_IDS[2], Outcome::Changed),
+        ],
+        "{:?}",
+        run.rows
+    );
+    assert!(
+        journaled(&sys).iter().all(|(id, _)| id != WIDGET_IDS[1]),
+        "{:?}",
+        journaled(&sys)
+    );
+    assert_eq!(desk.lock().unwrap().count("kill Dock"), 1);
+    assert!(!crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
+        desk.lock()
+            .unwrap()
+            .write(WINDOW_MANAGER, key, PValue::Bool(true));
+    }
+    crate::init_activation::begin(&sys, &who, WIDGETS).unwrap();
+    let run = pass(
+        &sys,
+        selected_desktop_items(&who, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&run)[..2],
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+        ],
+        "{:?}",
+        run.rows
+    );
+    for row in &run.rows[..2] {
+        assert!(
+            row.from
+                .as_deref()
+                .is_some_and(|from| from.contains("after an earlier write")),
+            "{row:?}"
+        );
+    }
+    assert_eq!(desk.lock().unwrap().count("kill Dock"), 1);
+    assert!(!crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+}
+
+#[test]
+fn an_initially_correct_dock_is_rechecked_after_another_desktop_item_relaunches_it() {
+    for (change_desktop, managed) in [(false, true), (true, false), (true, true)] {
+        let who = user("alice", 501);
+        let settings = [Setting::Desktop, Setting::Dock];
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let first = pass(&sys, selected_desktop_items(&who, &settings), Mode::Apply);
+        assert!(first.rows.iter().all(|row| row.outcome == Outcome::Changed));
+        let recorded = journaled(&sys).len();
+        {
+            let mut state = desk.lock().unwrap();
+            state.events.clear();
+            if change_desktop {
+                state.write(
+                    WINDOW_MANAGER,
+                    "EnableStandardClickToShowDesktop",
+                    PValue::Bool(true),
+                );
+            }
+            state.managed = managed.then(|| PValue::Array(vec![pin("Mail")]));
+        }
+        let run = pass(&sys, selected_desktop_items(&who, &settings), Mode::Apply);
+        let after = pass(&sys, selected_desktop_items(&who, &settings), Mode::Plan);
+        let repinned = change_desktop && managed;
+        assert_eq!(
+            after.rows[1].outcome,
+            if repinned {
+                Outcome::Planned
+            } else {
+                Outcome::Ok
+            },
+            "{:?}",
+            after.rows
+        );
+        {
+            let state = desk.lock().unwrap();
+            assert_eq!(state.count("kill Dock"), usize::from(change_desktop));
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|e| e.starts_with(&format!("write {DOCK}"))),
+                "{:?}",
+                state.events
+            );
+            assert_eq!(
+                same_apps(
+                    &sys,
+                    state.read(DOCK, "persistent-apps").unwrap(),
+                    &dock_apps(&usual_dock_apps())
+                ),
+                !repinned
+            );
+        }
+        assert!(
+            journaled(&sys)[recorded..]
+                .iter()
+                .all(|(id, _)| id != "init.dock@alice"),
+            "{:?}",
+            journaled(&sys)
+        );
+        assert!(
+            run.attempts
+                .iter()
+                .all(|attempt| attempt.id != "init.dock@alice")
+        );
+        assert_eq!(
+            outcomes(&run),
+            [
+                (
+                    "init.desktop@alice",
+                    if change_desktop {
+                        Outcome::Changed
+                    } else {
+                        Outcome::Ok
+                    }
+                ),
+                (
+                    "init.dock@alice",
+                    if repinned {
+                        Outcome::Failed
+                    } else {
+                        Outcome::Ok
+                    }
+                ),
+            ],
+            "{:?}",
+            run.rows
+        );
+    }
+}
+
+#[test]
+fn a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_with(&who, Desk::before(), false);
+    let mut first = Workstation::of(desktop_items(&who));
+    let snapshot = first.preference_changes(&sys).unwrap();
+    assert!(
+        snapshot.iter().all(|(target, _)| target.domain != DOCK),
+        "{snapshot:?}"
+    );
+    let run = first.run_recording(&sys, Mode::Apply).unwrap();
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Changed),
+            ("init.desktop@alice", Outcome::Changed),
+            ("init.dock@alice", Outcome::Unknown),
+        ],
+        "{:?}",
+        run.rows
+    );
+    assert_eq!(
+        run.rows[4].why.as_deref(),
+        Some(
+            "aterm is not installed at /Applications/aterm.app or \
+             /Users//alice/Applications/aterm.app; Dock left untouched"
+        ),
+        "{:?}",
+        run.rows[4]
+    );
+    assert_eq!(
+        verified(&run),
+        [
+            (WIDGET_IDS[0], true),
+            (WIDGET_IDS[1], true),
+            (WIDGET_IDS[2], true),
+            ("init.desktop@alice", true)
+        ]
+    );
+    assert!(!crate::init_activation::pending(&sys, &who, "dock").unwrap());
+    let desk = desk.lock().unwrap();
+    assert!(
+        !desk
+            .events
+            .iter()
+            .any(|e| e.starts_with(&format!("write {DOCK}"))),
+        "{:?}",
+        desk.events
+    );
+    let Some(PValue::Array(pins)) = desk.read(DOCK, "persistent-apps") else {
+        panic!("{:?}", desk.read(DOCK, "persistent-apps"));
+    };
+    let labels: Vec<&PValue> = pins
+        .iter()
+        .filter_map(|pin| field(field(pin, "tile-data")?, "file-label"))
+        .collect();
+    assert_eq!(
+        labels,
+        [&PValue::Str("Mail".into()), &PValue::Str("Music".into())]
+    );
+    assert_eq!(
+        desk.read(WINDOW_MANAGER, "StandardHideWidgets"),
+        Some(&PValue::Bool(true))
+    );
+    assert_eq!(
+        (
+            desk.count("kill Dock"),
+            desk.count("kill Finder"),
+            desk.count("kill NotificationCenter")
+        ),
+        (1, 1, 1),
+        "{:?}",
+        desk.events
+    );
+}
+
+#[test]
+fn one_pass_writes_every_desktop_key_before_it_relaunches_each_reader_once() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let run = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        DESKTOP_IDS.map(|id| (id, Outcome::Changed)),
+        "{:?}",
+        run.rows
+    );
+    assert!(run.attempts.iter().all(|attempt| attempt.verified));
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        (
+            desk.count("kill Dock"),
+            desk.count("kill Finder"),
+            desk.count("kill NotificationCenter")
+        ),
+        (1, 1, 1),
+        "{:?}",
+        desk.events
+    );
+    let first_kill = desk
+        .events
+        .iter()
+        .position(|e| e.starts_with("kill "))
+        .unwrap();
+    let last_write = desk
+        .events
+        .iter()
+        .rposition(|e| e.starts_with("write "))
+        .unwrap();
+    assert!(last_write < first_kill, "{:?}", desk.events);
+    assert_eq!(
+        desk.events
+            .iter()
+            .filter(|e| e.starts_with("Dock ") && e.ends_with(" past its start"))
+            .count(),
+        1,
+        "{:#?}",
+        desk.events
+    );
+    assert!(same_apps(
+        &sys,
+        desk.read(DOCK, "persistent-apps").unwrap(),
+        &dock_apps(&usual_dock_apps())
+    ));
+    let ids: Vec<String> = journaled(&sys).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        ids,
+        [
+            WIDGET_IDS[0],
+            WIDGET_IDS[1],
+            WIDGET_IDS[2],
+            "init.desktop@alice",
+            "init.dock@alice",
+            "init.relaunch@alice"
+        ]
+    );
+    for family in [WIDGETS, "desktop", "dock"] {
+        assert!(!crate::init_activation::pending(&sys, &who, family).unwrap());
+    }
+    drop(desk);
+
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let pins = Target::user(DOCK, "persistent-apps", &who);
+    defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
+    sys.run(&pins.write_cmd(&dock_apps(&usual_dock_apps())))
+        .unwrap();
+    defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        desk.read(DOCK, "persistent-apps"),
+        Some(&PValue::Array(vec![pin("Mail"), pin("Music")])),
+        "{:?}",
+        desk.events
+    );
+}
+
+/// `sys` answering as `who`, logged in at this Mac's console, the way
+/// `init::prepare_workstation_selected` resolves the account.
+fn at_console(sys: &Fake, who: &User) {
+    sys.logged_in(who);
+    sys.stat_of(
+        "/dev/console",
+        Stat {
+            uid: who.uid,
+            gid: who.gid,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: 0,
+        },
+    );
+}
+
+/// One Workstation pass as setup and the doctor build and run it
+/// (`init::prepare_workstation_selected`) with the widgets, desktop and Dock all to change:
+/// each reader relaunches once and every item reads back changed, tagged with its own setting.
+#[test]
+fn a_tagged_pass_relaunches_each_reader_once() {
+    let who = user("alice", 501);
+    let settings = [Setting::Widgets, Setting::Desktop, Setting::Dock];
+    let mut selected = Selection::none();
+    for setting in settings {
+        selected.set(setting, true);
+    }
+    let (mut sys, desk) = desktop_of(&who, Desk::before());
+    // With Full Disk Access, as the control's items have it: without it the widgets
+    // item leaves Notification Center alone.
+    sys.full_disk_access = Some(true);
+    at_console(&sys, &who);
+    let mut prepared = crate::init::prepare_workstation_selected(
+        &sys,
+        crate::init::WorkstationGroup::All,
+        selected,
+    )
+    .unwrap();
+    prepared.preference_changes(&sys).unwrap();
+    let run = prepared.run_recording(&sys, Mode::Apply).unwrap();
+    assert_eq!(
+        outcomes(&run),
+        DESKTOP_IDS.map(|id| (id, Outcome::Changed)),
+        "{:?}",
+        run.rows
+    );
+    assert!(run.attempts.iter().all(|attempt| attempt.verified));
+    let tagged: Vec<(Setting, &str)> = run
+        .tagged()
+        .into_iter()
+        .map(|(setting, row)| (setting, row.id.as_str()))
+        .collect();
+    let mut want = vec![Setting::Widgets; WIDGET_IDS.len()];
+    want.extend([Setting::Desktop, Setting::Dock]);
+    assert_eq!(
+        tagged,
+        want.into_iter().zip(DESKTOP_IDS).collect::<Vec<_>>()
+    );
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        (
+            desk.count("kill Dock"),
+            desk.count("kill Finder"),
+            desk.count("kill NotificationCenter")
+        ),
+        (1, 1, 1),
+        "{:?}",
+        desk.events
+    );
+}
+
+/// One whole desktop pass (widgets, desktop and Dock, at the console) waits in this process
+/// and reads each preference domain once per reading: one write per changed key, no `sleep`
+/// child, one Dock relaunch without a `launchctl print`, no command for the account or the Mac,
+/// no full flush; a pass with nothing to change writes and relaunches nothing. Before
+/// (05b421fb69) the same pass ran 2 `sleep` children, 85 exports, 35 full flushes,
+/// 3 `launchctl print`s and 5 context
+/// commands, and the no-op pass 45 exports.
+///
+/// Negative control: repeat a write in `Desktop::apply`; the extra write has no matching
+/// snapshot entry and the comparison fails, even though the final preference value is right.
+#[test]
+fn a_whole_desktop_pass_waits_in_process_and_reads_each_domain_once_per_reading() {
+    let who = user("alice", 501);
+    let mut selected = Selection::none();
+    for setting in [Setting::Widgets, Setting::Desktop, Setting::Dock] {
+        selected.set(setting, true);
+    }
+    let (mut sys, desk) = desktop_of(&who, Desk::before());
+    sys.full_disk_access = Some(true);
+    at_console(&sys, &who);
+    let count = |calls: &[String], what: &str| calls.iter().filter(|c| c.contains(what)).count();
+    for (changes, exports) in [(true, 34), (false, 18)] {
+        let before = sys.calls().len();
+        let before_events = desk.lock().unwrap().events.len();
+        let mut prepared = crate::init::prepare_workstation_selected(
+            &sys,
+            crate::init::WorkstationGroup::All,
+            selected,
+        )
+        .unwrap();
+        let preferences = prepared.preference_changes(&sys).unwrap();
+        let run = prepared.run_recording(&sys, Mode::Apply).unwrap();
+        let expected = if changes {
+            Outcome::Changed
+        } else {
+            Outcome::Ok
+        };
+        assert!(
+            outcomes(&run)
+                .iter()
+                .all(|(_, outcome)| *outcome == expected),
+            "{:?}",
+            outcomes(&run)
+        );
+        let calls = &sys.calls()[before..];
+        assert_eq!(count(calls, "/bin/sleep"), 0, "{calls:?}");
+        assert_eq!(count(calls, "killall -u alice Dock"), usize::from(changes));
+        assert_eq!(count(calls, "launchctl print"), 0, "{calls:?}");
+        assert_eq!(count(calls, "durable-dir"), 0, "{calls:?}");
+        for context in [
+            "/usr/bin/id",
+            "/usr/bin/dscl",
+            "/usr/bin/uname",
+            "/usr/bin/sw_vers",
+        ] {
+            assert_eq!(count(calls, context), 0, "{calls:?}");
+        }
+        assert_eq!(count(calls, "identity"), 1, "{calls:?}");
+        let read = count(calls, "defaults export") + count(calls, "defaults -currentHost export");
+        assert!(read <= exports, "{read} exports: {calls:?}");
+        // The work grows with the selected preferences. Compare the actual writes to the
+        // snapshot instead of counting a fixed number of commands from an older selection.
+        let mut expected_writes: Vec<_> = preferences
+            .iter()
+            .map(|(target, _)| format!("write {} {}", target.domain, target.key))
+            .collect();
+        let mut writes: Vec<_> = desk.lock().unwrap().events[before_events..]
+            .iter()
+            .filter(|event| event.starts_with("write "))
+            .cloned()
+            .collect();
+        expected_writes.sort_unstable();
+        writes.sort_unstable();
+        assert_eq!(writes, expected_writes, "one write per changed key");
+    }
+}
+
+#[test]
+fn the_read_back_waits_until_the_relaunched_dock_is_past_its_start() {
+    let who = user("alice", 501);
+    let mut managed = Desk::before();
+    managed.managed = Some(PValue::Array(vec![pin("Mail")]));
+    let (sys, _desk) = desktop_of(&who, managed);
+    let run = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Changed),
+            ("init.desktop@alice", Outcome::Changed),
+            ("init.dock@alice", Outcome::Failed),
+        ]
+    );
+    assert_eq!(
+        run.rows[4].why.as_deref(),
+        Some("applied, but it still reads com.apple.dock persistent-apps")
+    );
+    assert_eq!(
+        verified(&run),
+        [
+            (WIDGET_IDS[0], true),
+            (WIDGET_IDS[1], true),
+            (WIDGET_IDS[2], true),
+            ("init.desktop@alice", true),
+            ("init.dock@alice", false)
+        ]
+    );
+    let mut slow = Desk::before();
+    slow.managed = Some(PValue::Array(vec![pin("Mail")]));
+    slow.start = 3;
+    let (sys, desk) = desktop_of(&who, slow);
+    let run = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Changed),
+            ("init.desktop@alice", Outcome::Changed),
+            ("init.dock@alice", Outcome::Failed),
+        ],
+        "{:#?}",
+        desk.lock().unwrap().events
+    );
+    assert!(desk.lock().unwrap().starting().is_empty());
+}
+
+#[test]
+fn a_pass_that_ends_between_its_writes_and_the_relaunch_relaunches_on_the_next() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let c = ctx(std::slice::from_ref(&who));
+    for item in desktop_items(&who) {
+        item.apply(&sys, &c).unwrap();
+    }
+    for family in [WIDGETS, "desktop", "dock"] {
+        assert!(crate::init_activation::pending(&sys, &who, family).unwrap());
+    }
+    let writes = {
+        let desk = desk.lock().unwrap();
+        assert!(!desk.events.iter().any(|e| e.starts_with("kill ")));
+        desk.events
+            .iter()
+            .filter(|e| e.starts_with("write "))
+            .count()
+    };
+    let checked = pass(&sys, desktop_items(&who), Mode::Plan);
+    assert_eq!(
+        outcomes(&checked),
+        DESKTOP_IDS.map(|id| (id, Outcome::Planned))
+    );
+    let next = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&next),
+        DESKTOP_IDS.map(|id| (id, Outcome::Changed))
+    );
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        desk.events
+            .iter()
+            .filter(|e| e.starts_with("write "))
+            .count(),
+        writes
+    );
+    assert_eq!(
+        (
+            desk.count("kill Dock"),
+            desk.count("kill Finder"),
+            desk.count("kill NotificationCenter")
+        ),
+        (1, 1, 1)
+    );
+    for family in [WIDGETS, "desktop", "dock"] {
+        assert!(!crate::init_activation::pending(&sys, &who, family).unwrap());
+    }
+}
+
+#[test]
+fn a_relaunch_that_fails_keeps_the_writes_pending_for_the_next_pass() {
+    let who = user("alice", 501);
+    let mut failing = Desk::before();
+    failing.session_failures = 1;
+    let (sys, desk) = desktop_of(&who, failing);
+    let first = pass(&sys, desktop_items(&who), Mode::Apply);
+    let but_center = |center: Outcome, rest: Outcome| {
+        DESKTOP_IDS.map(|id| (id, if id == NC_ID { center } else { rest }))
+    };
+    assert_eq!(
+        outcomes(&first),
+        but_center(Outcome::Changed, Outcome::Failed)
+    );
+    for row in first.rows.iter().filter(|row| row.id != NC_ID) {
+        let why = row.why.as_deref().unwrap();
+        assert!(
+            why.starts_with("applied, but not activated: /bin/launchctl print gui/501"),
+            "{why}"
+        );
+    }
+    for family in [WIDGETS, "desktop", "dock"] {
+        assert!(crate::init_activation::pending(&sys, &who, family).unwrap());
+    }
+    assert!(
+        !crate::init_activation::pending(&sys, &who, crate::init_activation::CONTAINED_MARKER)
+            .unwrap()
+    );
+    let (writes, kills) = {
+        let desk = desk.lock().unwrap();
+        let kills = (
+            desk.count("kill Dock"),
+            desk.count("kill Finder"),
+            desk.count("kill NotificationCenter"),
+        );
+        assert_eq!(kills, (0, 1, 1), "{:?}", desk.events);
+        assert_eq!(desk.starting(), []);
+        let writes = desk
+            .events
+            .iter()
+            .filter(|e| e.starts_with("write "))
+            .count();
+        (writes, kills)
+    };
+    assert!(writes > 0);
+    let checked = pass(&sys, desktop_items(&who), Mode::Plan);
+    assert_eq!(
+        outcomes(&checked),
+        but_center(Outcome::Ok, Outcome::Planned)
+    );
+    let recovered = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&recovered),
+        but_center(Outcome::Ok, Outcome::Changed)
+    );
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        desk.events
+            .iter()
+            .filter(|e| e.starts_with("write "))
+            .count(),
+        writes
+    );
+    assert_eq!(
+        (
+            desk.count("kill Dock") - kills.0,
+            desk.count("kill Finder") - kills.1,
+            desk.count("kill NotificationCenter") - kills.2
+        ),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+fn a_reader_that_does_not_start_again_fails_only_the_families_whose_keys_it_reads() {
+    let who = user("alice", 501);
+    let mut down = Desk::before();
+    down.stays_down = Some("NotificationCenter");
+    let (sys, desk) = desktop_of(&who, down);
+    let run = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Failed),
+            ("init.desktop@alice", Outcome::Changed),
+            ("init.dock@alice", Outcome::Changed),
+        ],
+        "{:?}",
+        run.rows
+    );
+    assert_eq!(
+        run.rows[2].why.as_deref(),
+        Some(
+            "applied, but not activated: NotificationCenter has not started again a \
+             minute after its relaunch; activation remains pending"
+        )
+    );
+    assert_eq!(
+        verified(&run),
+        [
+            (WIDGET_IDS[0], true),
+            (WIDGET_IDS[1], true),
+            (WIDGET_IDS[2], false),
+            ("init.desktop@alice", true),
+            ("init.dock@alice", true)
+        ]
+    );
+    for (family, pending) in [
+        (WIDGETS, false),
+        (crate::init_activation::CONTAINED_MARKER, true),
+        ("desktop", false),
+        ("dock", false),
+    ] {
+        assert_eq!(
+            crate::init_activation::pending(&sys, &who, family).unwrap(),
+            pending,
+            "{family}"
+        );
+    }
+    let desk = desk.lock().unwrap();
+    assert!(same_apps(
+        &sys,
+        desk.read(DOCK, "persistent-apps").unwrap(),
+        &dock_apps(&usual_dock_apps())
+    ));
+    assert_eq!(desk.count("kill Dock"), 1, "{:?}", desk.events);
+}
+
+#[test]
+fn a_relaunch_that_cannot_be_made_still_waits_for_the_readers_already_relaunched() {
+    let who = user("alice", 501);
+    let mut stuck = Desk::before();
+    stuck.unkillable = Some("Finder");
+    stuck.start = 2;
+    let (sys, desk) = desktop_of(&who, stuck);
+    let run = pass(&sys, desktop_items(&who), Mode::Apply);
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Changed),
+            ("init.desktop@alice", Outcome::Failed),
+            ("init.dock@alice", Outcome::Changed),
+        ],
+        "{:?}",
+        run.rows
+    );
+    let why = run.rows[3].why.as_deref().unwrap();
+    assert!(
+        why.starts_with("applied, but not activated: ") && why.contains("killall -u alice Finder"),
+        "{why}"
+    );
+    assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
+    assert_eq!(desk.lock().unwrap().starting(), []);
+    let icons = Target::user(WINDOW_MANAGER, "StandardHideDesktopIcons", &who);
+    sys.run(&icons.write_cmd(&PValue::Bool(true))).unwrap();
+    defaults::relaunch(&sys, &who, defaults::Session::Ask, "Dock").unwrap();
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        desk.read(WINDOW_MANAGER, "StandardHideDesktopIcons"),
+        Some(&PValue::Bool(true))
+    );
+    assert!(
+        !desk
+            .events
+            .iter()
+            .any(|e| e.ends_with("wrote back what it read at its start")),
+        "{:#?}",
+        desk.events
+    );
+    assert!(same_apps(
+        &sys,
+        desk.read(DOCK, "persistent-apps").unwrap(),
+        &dock_apps(&usual_dock_apps())
+    ));
+}
+
+#[test]
+fn a_family_whose_write_fails_part_way_is_relaunched_for_what_it_wrote() {
+    let who = user("alice", 501);
+    let mut partial = Desk::before();
+    partial.unwritable = Some((DOCK, "static-apps"));
+    let (sys, desk) = desktop_of(&who, partial);
+    let run = pass(
+        &sys,
+        selected_desktop_items(&who, &[Setting::Widgets, Setting::Dock]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&run),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (WIDGET_IDS[2], Outcome::Changed),
+            ("init.dock@alice", Outcome::Failed),
+        ],
+        "{:?}",
+        run.rows
+    );
+    assert!(
+        run.rows[3]
+            .why
+            .as_deref()
+            .is_some_and(|why| why.contains("static-apps")),
+        "{:?}",
+        run.rows[3]
+    );
+    {
+        let desk = desk.lock().unwrap();
+        let wrote = desk
+            .events
+            .iter()
+            .position(|e| e == "write com.apple.dock persistent-apps")
+            .unwrap();
+        let killed = desk.events.iter().position(|e| e == "kill Dock").unwrap();
+        assert!(wrote < killed, "{:?}", desk.events);
+    }
+    assert!(!crate::init_activation::pending(&sys, &who, "dock").unwrap());
+    let relaunch = journaled(&sys)
+        .into_iter()
+        .find(|(id, _)| id == "init.relaunch@alice")
+        .unwrap();
+    assert!(relaunch.1.contains("init.dock@alice"), "{relaunch:?}");
+}
+
+fn touches_notification_center(call: &str) -> bool {
+    call.contains(NOTIFICATION_CENTER) || call.contains("NotificationCenter")
+}
+
+#[test]
+fn without_full_disk_access_a_pass_never_touches_notification_center_and_settles() {
+    let who = user("alice", 501);
+    for unknown in [None, Some(false)] {
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let mut first = Workstation::of(desktop_items_at(&who, unknown));
+        let snapshot = first.preference_changes(&sys).unwrap();
+        assert!(
+            snapshot
+                .iter()
+                .all(|(target, _)| target.domain != NOTIFICATION_CENTER),
+            "{snapshot:?}"
+        );
+        let run = first.run_recording(&sys, Mode::Apply).unwrap();
+        assert_eq!(
+            outcomes(&run),
+            DESKTOP_IDS.map(|id| (
+                id,
+                if id == NC_ID {
+                    Outcome::Ok
+                } else {
+                    Outcome::Changed
+                }
+            )),
+            "{:?}",
+            run.rows
+        );
+        assert_eq!(run.withheld, [NC_ID]);
+        let widgets = &run.rows[2];
+        assert_eq!(
+            widgets.title,
+            "No Notification Center widgets; they wait for Full Disk Access"
+        );
+        assert!(
+            widgets
+                .to
+                .as_deref()
+                .is_some_and(|to| to.contains("com.apple.notificationcenterui")),
+            "{widgets:?}"
+        );
+        let calls = sys.calls();
+        assert!(
+            !calls.iter().any(|call| touches_notification_center(call)),
+            "{calls:#?}"
+        );
+        {
+            let desk = desk.lock().unwrap();
+            assert_eq!(
+                (
+                    desk.count("kill Dock"),
+                    desk.count("kill Finder"),
+                    desk.count("kill NotificationCenter")
+                ),
+                (1, 1, 0),
+                "{:?}",
+                desk.events
+            );
+            assert_eq!(
+                desk.read(WINDOW_MANAGER, "StandardHideWidgets"),
+                Some(&PValue::Bool(true))
+            );
+            let PValue::Dict(widgets) = desk.read(NOTIFICATION_CENTER, "widgets").unwrap() else {
+                unreachable!()
+            };
+            assert!(
+                widgets.iter().any(|(key, value)| key == "instances"
+                    && *value == PValue::Array(vec![PValue::Data(vec![42])])),
+                "{widgets:?}"
+            );
+        }
+        for family in [WIDGETS, "desktop", "dock"] {
+            assert!(!crate::init_activation::pending(&sys, &who, family).unwrap());
+        }
+        let lines = journaled(&sys).len();
+        let (events, calls) = (desk.lock().unwrap().events.len(), sys.calls().len());
+        for mode in [Mode::Plan, Mode::Apply] {
+            let again = pass(&sys, desktop_items_at(&who, unknown), mode);
+            assert_eq!(
+                outcomes(&again),
+                DESKTOP_IDS.map(|id| (id, Outcome::Ok)),
+                "{mode:?}: {:?}",
+                again.rows
+            );
+        }
+        assert_eq!(
+            desk.lock().unwrap().events.len(),
+            events,
+            "{:?}",
+            desk.lock().unwrap().events
+        );
+        assert_eq!(journaled(&sys).len(), lines);
+        let later = &sys.calls()[calls..];
+        assert!(
+            !later.iter().any(|call| touches_notification_center(call)
+                || call.contains("killall")
+                || call.contains(" write ")),
+            "{later:#?}"
+        );
+    }
+
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let run = pass(&sys, desktop_items_at(&who, Some(true)), Mode::Apply);
+    assert_eq!(
+        run.rows
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect::<Vec<_>>()[..3],
+        [
+            "No desktop widgets",
+            "No Stage Manager widgets",
+            "No Notification Center widgets"
+        ]
+    );
+    assert!(run.withheld.is_empty());
+    assert!(
+        sys.calls()
+            .iter()
+            .any(|call| touches_notification_center(call))
+    );
+    assert!(
+        sys.calls().contains(
+            &"alice$ /usr/bin/defaults export com.apple.notificationcenterui -".to_owned()
+        )
+    );
+    assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 1);
+}
+
+#[test]
+fn a_pass_that_reaches_a_container_it_cannot_read_never_settles_and_one_that_waits_does() {
+    let who = user("alice", 501);
+    let mut hidden = Desk::before();
+    hidden.denied = Some(NOTIFICATION_CENTER);
+    let (sys, desk) = desktop_of(&who, hidden);
+    for first in [true, false] {
+        let run = pass(
+            &sys,
+            selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
+            Mode::Apply,
+        );
+        let window_manager = if first { Outcome::Changed } else { Outcome::Ok };
+        assert_eq!(
+            outcomes(&run),
+            [
+                (WIDGET_IDS[0], window_manager),
+                (WIDGET_IDS[1], window_manager),
+                (NC_ID, Outcome::Failed)
+            ]
+        );
+        assert_eq!(
+            run.rows[2].why.as_deref(),
+            Some("applied, but it still reads com.apple.notificationcenterui widgets")
+        );
+    }
+    assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 2);
+    assert_eq!(
+        desk.lock()
+            .unwrap()
+            .count("write com.apple.notificationcenterui widgets"),
+        2
+    );
+
+    let mut hidden = Desk::before();
+    hidden.denied = Some(NOTIFICATION_CENTER);
+    let (sys, desk) = desktop_of(&who, hidden);
+    let widgets = || selected_desktop_items_at(&who, None, &[Setting::Widgets]);
+    let first = pass(&sys, widgets(), Mode::Apply);
+    assert_eq!(
+        outcomes(&first),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (NC_ID, Outcome::Ok)
+        ]
+    );
+    let second = pass(&sys, widgets(), Mode::Apply);
+    assert_eq!(outcomes(&second), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
+    let desk = desk.lock().unwrap();
+    assert_eq!(
+        (
+            desk.count("kill Dock"),
+            desk.count("kill NotificationCenter")
+        ),
+        (1, 0),
+        "{:?}",
+        desk.events
+    );
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|call| touches_notification_center(call))
+    );
+}
+
+fn follow_up_items(
+    who: &User,
+    full_disk_access: Option<bool>,
+    settings: &[Setting],
+) -> Vec<Box<dyn Item>> {
+    let mut selected = Selection::none();
+    for &setting in settings {
+        selected.set(setting, true);
+    }
+    let mut context = ctx(std::slice::from_ref(who));
+    context.facts.full_disk_access = full_disk_access;
+    withheld_items(&context, selected)
+        .unwrap()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect()
+}
+
+#[test]
+fn a_follow_up_with_the_grant_clears_notification_center_alone_and_once() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let first = pass(
+        &sys,
+        selected_desktop_items_at(&who, None, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&first),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (NC_ID, Outcome::Ok)
+        ]
+    );
+    assert_eq!(first.withheld, [NC_ID]);
+    desk.lock()
+        .unwrap()
+        .write(WINDOW_MANAGER, "StandardHideWidgets", PValue::Bool(false));
+
+    let calls = sys.calls().len();
+    let waiting = pass(
+        &sys,
+        follow_up_items(&who, None, &[Setting::Widgets, Setting::Dock]),
+        Mode::Apply,
+    );
+    assert_eq!(outcomes(&waiting), [(NC_ID, Outcome::Ok)]);
+    assert_eq!(waiting.withheld, [NC_ID]);
+    assert!(
+        !sys.calls()[calls..]
+            .iter()
+            .any(|call| touches_notification_center(call) || call.contains(" write ")),
+        "{:#?}",
+        &sys.calls()[calls..]
+    );
+
+    let calls = sys.calls().len();
+    let kills = desk.lock().unwrap().count("kill Dock");
+    let follow_up = pass(
+        &sys,
+        follow_up_items(&who, Some(true), &[Setting::Widgets, Setting::Dock]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&follow_up),
+        [(NC_ID, Outcome::Changed)],
+        "{:?}",
+        follow_up.rows
+    );
+    assert_eq!(follow_up.rows[0].title, "No Notification Center widgets");
+    assert!(follow_up.withheld.is_empty());
+    {
+        let desk = desk.lock().unwrap();
+        let PValue::Dict(widgets) = desk.read(NOTIFICATION_CENTER, "widgets").unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            widgets
+                .iter()
+                .any(|(key, value)| key == "instances" && *value == PValue::Array(Vec::new())),
+            "{widgets:?}"
+        );
+        assert_eq!(
+            desk.read(WINDOW_MANAGER, "StandardHideWidgets"),
+            Some(&PValue::Bool(false)),
+            "the person's change stays"
+        );
+        assert_eq!(
+            desk.count("kill NotificationCenter"),
+            1,
+            "{:?}",
+            desk.events
+        );
+        assert_eq!(desk.count("kill Dock"), kills, "{:?}", desk.events);
+    }
+    assert!(
+        !sys.calls()[calls..]
+            .iter()
+            .any(|call| call.contains(WINDOW_MANAGER) || call.contains(DOCK)),
+        "{:#?}",
+        &sys.calls()[calls..]
+    );
+    for marker in [WIDGETS, crate::init_activation::CONTAINED_MARKER] {
+        assert!(!crate::init_activation::pending(&sys, &who, marker).unwrap());
+    }
+
+    let events = desk.lock().unwrap().events.len();
+    let again = pass(
+        &sys,
+        follow_up_items(&who, Some(true), &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(outcomes(&again), [(NC_ID, Outcome::Ok)]);
+    assert_eq!(desk.lock().unwrap().events.len(), events);
+
+    let granted = pass(
+        &sys,
+        selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
+        Mode::Plan,
+    );
+    assert!(granted.withheld.is_empty());
+}
+
+#[test]
+fn a_pass_without_the_grant_never_clears_what_notification_center_still_owes() {
+    let who = user("alice", 501);
+    let (sys, desk) = desktop_of(&who, Desk::before());
+    let mut c = ctx(std::slice::from_ref(&who));
+    c.facts.full_disk_access = Some(true);
+    for item in selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]) {
+        item.apply(&sys, &c).unwrap();
+    }
+    let owed = |marker: &str| crate::init_activation::pending(&sys, &who, marker).unwrap();
+    assert!(owed(WIDGETS) && owed(crate::init_activation::CONTAINED_MARKER));
+    assert_eq!(
+        desk.lock()
+            .unwrap()
+            .count("write com.apple.notificationcenterui widgets"),
+        1
+    );
+
+    let calls = sys.calls().len();
+    let waiting = pass(
+        &sys,
+        selected_desktop_items_at(&who, None, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&waiting),
+        [
+            (WIDGET_IDS[0], Outcome::Changed),
+            (WIDGET_IDS[1], Outcome::Changed),
+            (NC_ID, Outcome::Ok)
+        ]
+    );
+    let quiet = pass(
+        &sys,
+        selected_desktop_items_at(&who, None, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(outcomes(&quiet), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
+    assert!(!owed(WIDGETS));
+    assert!(owed(crate::init_activation::CONTAINED_MARKER));
+    assert!(
+        !sys.calls()[calls..]
+            .iter()
+            .any(|call| touches_notification_center(call)
+                || call.contains(crate::init_activation::CONTAINED_MARKER)),
+        "{:#?}",
+        &sys.calls()[calls..]
+    );
+    {
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            (
+                desk.count("kill Dock"),
+                desk.count("kill NotificationCenter")
+            ),
+            (1, 0),
+            "{:?}",
+            desk.events
+        );
+    }
+
+    let granted = pass(
+        &sys,
+        selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(
+        outcomes(&granted),
+        [
+            (WIDGET_IDS[0], Outcome::Ok),
+            (WIDGET_IDS[1], Outcome::Ok),
+            (NC_ID, Outcome::Changed)
+        ]
+    );
+    assert!(!owed(crate::init_activation::CONTAINED_MARKER));
+    {
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            (
+                desk.count("kill Dock"),
+                desk.count("kill NotificationCenter"),
+                desk.count("write com.apple.notificationcenterui widgets")
+            ),
+            (1, 1, 1),
+            "{:?}",
+            desk.events
+        );
+    }
+
+    let mut cleared = Desk::before();
+    cleared.write(
+        NOTIFICATION_CENTER,
+        "widgets",
+        PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            ("instances".into(), PValue::Array(Vec::new())),
+        ]),
+    );
+    let (sys, desk) = desktop_of(&who, cleared);
+    for item in selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]) {
+        item.apply(&sys, &c).unwrap();
+    }
+    assert!(
+        !crate::init_activation::pending(&sys, &who, crate::init_activation::CONTAINED_MARKER)
+            .unwrap()
+    );
+    pass(
+        &sys,
+        selected_desktop_items_at(&who, None, &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    let granted = pass(
+        &sys,
+        selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
+        Mode::Apply,
+    );
+    assert_eq!(outcomes(&granted), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
+    assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 0);
+}
+
+#[test]
+fn an_older_aterms_widgets_marker_relaunches_notification_center_once_with_the_grant() {
+    let who = user("alice", 501);
+    let written = || {
+        let mut desk = Desk::before();
+        for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
+            desk.write(WINDOW_MANAGER, key, PValue::Bool(true));
+        }
+        desk.write(
+            NOTIFICATION_CENTER,
+            "widgets",
+            PValue::Dict(vec![
+                ("vers".into(), PValue::Int(1)),
+                ("instances".into(), PValue::Array(Vec::new())),
+            ]),
+        );
+        desk
+    };
+    let kills = |desk: &Arc<Mutex<Desk>>| {
+        let desk = desk.lock().unwrap();
+        (
+            desk.count("kill Dock"),
+            desk.count("kill NotificationCenter"),
+            desk.events
+                .iter()
+                .filter(|e| e.starts_with("write "))
+                .count(),
+        )
+    };
+    let widgets =
+        |granted: Option<bool>| selected_desktop_items_at(&who, granted, &[Setting::Widgets]);
+    for marker in [crate::init_activation::LEGACY_WIDGETS_MARKER, WIDGETS] {
+        let legacy = marker == crate::init_activation::LEGACY_WIDGETS_MARKER;
+        for granted in [Some(true), None] {
+            let (sys, desk) = desktop_of(&who, written());
+            crate::init_activation::begin(&sys, &who, marker).unwrap();
+            let owed = |marker: &str| crate::init_activation::pending(&sys, &who, marker).unwrap();
+            let calls = sys.calls().len();
+            let first = pass(&sys, widgets(granted), Mode::Apply);
+            assert!(
+                granted.is_some()
+                    || !sys.calls()[calls..]
+                        .iter()
+                        .any(|call| touches_notification_center(call)),
+                "{:#?}",
+                &sys.calls()[calls..]
+            );
+            let center = if legacy && granted.is_some() {
+                Outcome::Changed
+            } else {
+                Outcome::Ok
+            };
+            assert_eq!(
+                outcomes(&first),
+                [
+                    (WIDGET_IDS[0], Outcome::Changed),
+                    (WIDGET_IDS[1], Outcome::Changed),
+                    (NC_ID, center)
+                ],
+                "{marker} {granted:?}: {:?}",
+                first.rows
+            );
+            let nc_owed = legacy && granted.is_none();
+            assert_eq!(
+                kills(&desk),
+                (1, usize::from(legacy && granted.is_some()), 0),
+                "{marker} {granted:?}: {:?}",
+                desk.lock().unwrap().events
+            );
+            for marker in [crate::init_activation::LEGACY_WIDGETS_MARKER, WIDGETS] {
+                assert!(!owed(marker), "{marker} {granted:?}");
+            }
+            assert_eq!(
+                owed(crate::init_activation::CONTAINED_MARKER),
+                nc_owed,
+                "{marker} {granted:?}"
+            );
+            let again = pass(&sys, widgets(Some(true)), Mode::Apply);
+            assert_eq!(
+                outcomes(&again),
+                [
+                    (WIDGET_IDS[0], Outcome::Ok),
+                    (WIDGET_IDS[1], Outcome::Ok),
+                    (
+                        NC_ID,
+                        if nc_owed {
+                            Outcome::Changed
+                        } else {
+                            Outcome::Ok
+                        }
+                    )
+                ],
+                "{marker} {granted:?}"
+            );
+            let quiet = pass(&sys, widgets(Some(true)), Mode::Apply);
+            assert_eq!(outcomes(&quiet), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
+            assert!(!owed(crate::init_activation::CONTAINED_MARKER));
+            assert_eq!(
+                kills(&desk),
+                (1, usize::from(legacy), 0),
+                "{marker} {granted:?}: {:?}",
+                desk.lock().unwrap().events
+            );
+        }
+    }
+}

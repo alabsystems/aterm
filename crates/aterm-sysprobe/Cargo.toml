@@ -25,9 +25,13 @@ description = "aterm's in-process readers of another process (working directory,
 # Linux arm reads `/proc` and `/sys` through std (bounded reads; the page size
 # from `/proc/self/auxv`), a volume's free space by `statvfs`, and
 # `getloadavg` and `getrlimit`.
-# The Windows arm (64-bit) declares its few kernel32 and ntdll calls itself
+# The Windows arm (64-bit) declares its few kernel32, ntdll, iphlpapi and advapi32 calls itself
 # (`src/win.rs`, raw-dylib, no import library and no dependency); their buffers are decoded
-# by `src/windows.rs`, compiled and tested on every host. The volume, identity,
+# by `src/windows.rs` and `src/win_net.rs`, compiled and tested on every host, and read live
+# against other Windows calls by `src/win_live_tests.rs`. The GPU and thermal readers'
+# counters come through the Performance Data Helper, whose `pdh.dll` is loaded at the first read
+# and never imported (`src/win_pdh.rs`; decoded by `src/win_gpu.rs` on every host), so a process
+# that reads no GPU maps none of it. The volume, identity,
 # path-spelling and process-parameter readers' calls (the mount and object
 # managers, a volume's free space, a file's `FILE_ID_INFO`, another process's
 # image and environment block) are declared in `src/win_paths.rs`, which std

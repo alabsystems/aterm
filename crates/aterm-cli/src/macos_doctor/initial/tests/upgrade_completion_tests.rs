@@ -7,7 +7,7 @@ use super::*;
 
 fn partial(root: &Path, applied: Selection) -> Plan {
     let explicit = save_explicit_workstation_plan(root, applied).unwrap();
-    complete_explicit_workstation_plan(root, explicit).unwrap();
+    complete_explicit_workstation_plan_for_test(root, explicit).unwrap();
     let plan = saved_plan(root).unwrap().unwrap();
     assert!(saved_plan_provisional(root).unwrap());
     assert_eq!(plan.selection.workstation(), applied);

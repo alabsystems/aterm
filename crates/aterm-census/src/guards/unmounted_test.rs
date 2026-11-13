@@ -10,11 +10,11 @@
 //! - `[package]` sets `autotests = false` (or a file sits under `tests/<sub/>`), and neither a
 //!   `[[test]]` table nor a `mod` / `#[path]` / `include!` from a target root mounts the file.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::rules::PRODUCT;
 use super::stock_label::where_cargo_looks;
-use super::{Corpus, Finding, LoadKind, Rule, SourceFile, Tree, after_ws, joined};
+use super::{Finding, Reach, Rule, SourceFile, Tree, after_ws, joined};
 use crate::scan_set::ManifestTargets;
 
 pub(super) const UNMOUNTED_TEST: Rule = Rule {
@@ -26,9 +26,14 @@ pub(super) const UNMOUNTED_TEST: Rule = Rule {
     check: unmounted_test,
 };
 
-struct PkgRoots {
-    all: BTreeSet<String>,
+pub(super) struct PkgRoots {
+    /// Every target's root: library, binaries, tests, benches, examples, build script.
+    pub(super) all: BTreeSet<String>,
     libtest: BTreeSet<String>,
+    /// The roots a build without tests compiles: library, binaries, build script.
+    pub(super) shipped: BTreeSet<String>,
+    /// The build script's root, if the package has one.
+    pub(super) build: Option<String>,
 }
 
 fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -50,7 +55,7 @@ fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let roots = pkg_roots(dir, targets, files);
         // Every libtest root is a root of some target, so what the libtest roots reach is
         // reached again from every root; the walk goes on from there, once.
-        let mut reach = Reach::new(tree.corpus, dir);
+        let mut reach = Reach::new(tree.corpus, dir, false);
         reach.from(&roots.libtest);
         let libtest = reach.files();
         if roots.all.len() == roots.libtest.len() {
@@ -124,9 +129,10 @@ fn owner_dir<'a>(rel: &str, dirs: &[&'a str]) -> Option<&'a str> {
 }
 
 /// Declared and Cargo-discovered target roots for package `dir`.
-fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> PkgRoots {
+pub(super) fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> PkgRoots {
     let mut all = BTreeSet::new();
     let mut libtest = BTreeSet::new();
+    let mut shipped = BTreeSet::new();
     let mut claimed = BTreeSet::new();
     let has_lib = targets.declared.iter().any(|&(k, _, _)| k == "lib");
     for ((kind, name, path), &runs) in targets.declared.iter().zip(&targets.runs_libtest) {
@@ -143,17 +149,24 @@ fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> Pkg
         for cand in cands {
             claimed.insert(cand.clone());
             all.insert(cand.clone());
+            if matches!(*kind, "lib" | "bin") {
+                shipped.insert(cand.clone());
+            }
             if runs {
                 libtest.insert(cand);
             }
         }
     }
+    let build = match &targets.build {
+        Some(Some(path)) => Some(joined(dir, path)),
+        Some(None) => None,
+        None => files
+            .iter()
+            .any(|file| file.rel.len() == dir.len() + 9 && file.rel.ends_with("/build.rs"))
+            .then(|| format!("{dir}/build.rs")),
+    };
     for &file in files {
         let sub = &file.rel[dir.len() + 1..];
-        if sub == "build.rs" {
-            all.insert(file.rel.clone());
-            continue;
-        }
         let mut it = sub.split('/');
         let (kind, default_libtest) = match (it.next(), it.next(), it.next(), it.next(), it.next())
         {
@@ -171,68 +184,21 @@ fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> Pkg
         };
         if !targets.undiscovered.contains(&kind) && !claimed.contains(&file.rel) {
             all.insert(file.rel.clone());
+            if matches!(kind, "lib" | "bin") {
+                shipped.insert(file.rel.clone());
+            }
             if default_libtest {
                 libtest.insert(file.rel.clone());
             }
         }
     }
-    PkgRoots { all, libtest }
-}
-
-/// The transitive closure of files in a corpus that roots load (`mod`, `#[path]`, `include!`),
-/// in one package, walked on as roots are added: what a file loads depends on the file, on
-/// whether it owns its directory and on the package alone, so reaching from more roots only
-/// adds to what was reached.
-struct Reach<'a> {
-    corpus: &'a Corpus,
-    manifest_dir: &'a str,
-    /// Each file reached, and whether it was reached owning its directory.
-    seen: BTreeSet<(String, bool)>,
-}
-
-impl<'a> Reach<'a> {
-    const fn new(corpus: &'a Corpus, manifest_dir: &'a str) -> Self {
-        Self {
-            corpus,
-            manifest_dir,
-            seen: BTreeSet::new(),
-        }
-    }
-
-    /// Reach on from `roots`, each owning its directory.
-    fn from(&mut self, roots: &BTreeSet<String>) {
-        let corpus = self.corpus;
-        let mut queue: VecDeque<(String, bool)> = VecDeque::new();
-        for root in roots {
-            if corpus.get(root).is_some() && self.seen.insert((root.clone(), true)) {
-                queue.push_back((root.clone(), true));
-            }
-        }
-        while let Some((rel, dir_owner)) = queue.pop_front() {
-            let Some(file) = corpus.get(&rel) else {
-                continue;
-            };
-            for load in file.loads_in(dir_owner, Some(self.manifest_dir)) {
-                for child in load.files {
-                    let Some(target) = corpus.get(&child) else {
-                        continue;
-                    };
-                    let child_owner = match load.kind {
-                        LoadKind::Mod => target.name() == "mod.rs",
-                        LoadKind::PathMod => true,
-                        LoadKind::Include => dir_owner,
-                    };
-                    if self.seen.insert((child.clone(), child_owner)) {
-                        queue.push_back((child, child_owner));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Every file reached so far.
-    fn files(&self) -> BTreeSet<String> {
-        self.seen.iter().map(|(rel, _)| rel.clone()).collect()
+    all.extend(build.clone());
+    shipped.extend(build.clone());
+    PkgRoots {
+        all,
+        libtest,
+        shipped,
+        build,
     }
 }
 
@@ -264,135 +230,5 @@ fn code_line_has_test_attr(code: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::UNMOUNTED_TEST;
-    use crate::guards::tests::{run, spots};
-
-    /// NEGATIVE CONTROL: `[lib] test = false` silently drops inline `#[test]` functions in `src/`
-    /// unless an integration test target mounts the module.
-    #[test]
-    fn lib_test_false_flags_orphaned_unit_test_and_passes_path_mounted_module() {
-        let found = run(
-            &UNMOUNTED_TEST,
-            &[
-                (
-                    "crates/a/Cargo.toml",
-                    "[package]\nname = \"a\"\n\n[lib]\ntest = false\n",
-                ),
-                (
-                    "crates/a/src/lib.rs",
-                    "mod orphan;\nmod shared;\n/// Doc mentioning `#[test]` in a comment.\npub fn f() {}\n",
-                ),
-                (
-                    "crates/a/src/orphan.rs",
-                    "#[cfg(test)]\nmod tests {\n    #[test]\n    fn dead() {}\n}\n",
-                ),
-                ("crates/a/src/shared.rs", "#[test]\nfn runs_in_it() {}\n"),
-                (
-                    "crates/a/tests/it.rs",
-                    "#[path = \"../src/shared.rs\"]\nmod shared;\n",
-                ),
-            ],
-        );
-        assert_eq!(spots(&found), ["crates/a/src/orphan.rs:3"]);
-    }
-
-    /// NEGATIVE CONTROL: `autotests = false` silently drops any `tests/*.rs` file that is neither
-    /// a `[[test]]` root nor mounted by `mod` / `#[path]` / `include!`.
-    #[test]
-    fn autotests_false_flags_unlisted_test_file_and_passes_suite_modules() {
-        let found = run(
-            &UNMOUNTED_TEST,
-            &[
-                (
-                    "crates/b/Cargo.toml",
-                    "[package]\nname = \"b\"\nautotests = false\n\n[[test]]\nname = \"suite\"\npath = \"tests/suite.rs\"\n",
-                ),
-                ("crates/b/src/lib.rs", "pub fn ok() {}\n"),
-                ("crates/b/tests/suite.rs", "mod mounted;\n"),
-                ("crates/b/tests/mounted.rs", "#[test]\nfn live() {}\n"),
-                ("crates/b/tests/forgotten.rs", "#[test]\nfn dead() {}\n"),
-            ],
-        );
-        assert_eq!(spots(&found), ["crates/b/tests/forgotten.rs:0"]);
-    }
-
-    /// NEGATIVE CONTROL: an unloaded `src/extra_tests.rs` or a `harness = false` target holding
-    /// `#[test]` is flagged, while a nested Cargo package under `tests/toy/` owns its own tree.
-    #[test]
-    fn unloaded_module_and_harness_false_are_flagged_while_nested_package_is_isolated() {
-        let found = run(
-            &UNMOUNTED_TEST,
-            &[
-                (
-                    "crates/c/Cargo.toml",
-                    "[package]\nname = \"c\"\n\n[[test]]\nname = \"drv\"\npath = \"tests/drv.rs\"\nharness = false\n",
-                ),
-                (
-                    "crates/c/src/lib.rs",
-                    "pub fn live() { let _ = \"#[test]\"; }\n",
-                ),
-                (
-                    "crates/c/src/dangling_tests.rs",
-                    "#[test]\nfn never_loaded() {}\n",
-                ),
-                (
-                    "crates/c/tests/drv.rs",
-                    "#[test]\nfn no_harness() {}\nfn main() {}\n",
-                ),
-                (
-                    "crates/c/tests/toy/Cargo.toml",
-                    "[package]\nname = \"toy\"\n",
-                ),
-                (
-                    "crates/c/tests/toy/src/lib.rs",
-                    "#[test]\nfn toy_unit() {}\n",
-                ),
-            ],
-        );
-        assert_eq!(
-            spots(&found),
-            [
-                "crates/c/src/dangling_tests.rs:1",
-                "crates/c/tests/drv.rs:1",
-            ]
-        );
-    }
-
-    /// NEGATIVE CONTROL: Cargo skips `examples/*.rs` under `targo test --tests` unless `[[example]]`
-    /// sets `test = true`, whereas cross-crate `#[path]` plus `CARGO_MANIFEST_DIR` `include!` resolves
-    /// per compiling package.
-    #[test]
-    fn example_without_test_true_is_flagged_and_manifest_dir_include_resolves_per_pkg() {
-        let found = run(
-            &UNMOUNTED_TEST,
-            &[
-                (
-                    "crates/d/Cargo.toml",
-                    "[package]\nname = \"d\"\n\n[[example]]\nname = \"live_ex\"\ntest = true\n",
-                ),
-                ("crates/d/src/lib.rs", "mod api;\npub fn d() {}\n"),
-                (
-                    "crates/d/src/api.rs",
-                    "#[cfg(test)]\nmod tests {\n    include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/api_tests.rs\"));\n}\n",
-                ),
-                ("crates/d/src/api_tests.rs", "#[test]\nfn d_api() {}\n"),
-                (
-                    "crates/d/examples/live_ex.rs",
-                    "fn main() {}\n#[test]\nfn ok() {}\n",
-                ),
-                (
-                    "crates/d/examples/dead_ex.rs",
-                    "fn main() {}\n#[test]\nfn skipped() {}\n",
-                ),
-                ("crates/e/Cargo.toml", "[package]\nname = \"e\"\n"),
-                (
-                    "crates/e/src/lib.rs",
-                    "#[path = \"../../d/src/api.rs\"]\nmod api;\n",
-                ),
-                ("crates/e/src/api_tests.rs", "#[test]\nfn e_api() {}\n"),
-            ],
-        );
-        assert_eq!(spots(&found), ["crates/d/examples/dead_ex.rs:2"]);
-    }
-}
+#[path = "unmounted_test_tests.rs"]
+mod tests;

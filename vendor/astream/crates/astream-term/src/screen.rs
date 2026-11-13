@@ -1265,6 +1265,10 @@ struct Charsets {
 }
 
 impl Charsets {
+    const fn ascii_gl(self) -> bool {
+        matches!(if self.shifted { self.g1 } else { self.g0 }, Charset::Ascii)
+    }
+
     /// The glyph an ASCII byte paints through GL.
     const fn translate(self, b: u8) -> char {
         let set = if self.shifted { self.g1 } else { self.g0 };
@@ -1390,12 +1394,348 @@ impl Pen {
     }
 }
 
+// Tiny runs keep the scalar path. The test-only switch retains the original
+// byte-at-a-time loop as an oracle without affecting the production benchmark.
+const ASCII_SPAN_MIN: usize = 2;
+
+#[cfg(test)]
+mod ascii_work {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(true) };
+        static WORK: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+    pub(super) fn enabled() -> bool {
+        ENABLED.with(Cell::get)
+    }
+    pub(super) fn set(enabled: bool) {
+        ENABLED.with(|value| value.set(enabled));
+    }
+    pub(super) fn record(bytes: usize) {
+        WORK.with(|value| {
+            let (runs, total) = value.get();
+            value.set((runs.saturating_add(1), total.saturating_add(bytes)));
+        });
+    }
+    pub(super) fn take() -> (usize, usize) {
+        WORK.with(|value| value.replace((0, 0)))
+    }
+}
+
+#[cfg(test)]
+#[path = "ascii_span_tests.rs"]
+mod ascii_span_tests;
+
+// Width controls at 80/120/240 columns place the fixed setup crossover near
+// twelve cells. Shorter spans retain the original point-copy kernel.
+const ROW_COPY_MIN: usize = 12;
+// Bound each transfer to the ordinary-row regime: one 240-cell memcpy
+// regressed, while two transfers of at most 128 cells retained the gains.
+const ROW_COPY_CHUNK: usize = 128;
+
+#[cfg(test)]
+#[path = "serialization_scan_tests.rs"]
+mod serialization_scan_tests;
+
+/// Contiguous physical rows with a logical origin. Only whole-viewport scrolls
+/// rotate the origin; every exposed cell, range, encoding and equality is logical.
+#[derive(Clone)]
+struct Grid {
+    cells: Vec<Cell>,
+    origin: usize,
+}
+
+/// Exact extension counts gathered while writing the mandatory base encoding.
+/// They are local to one immutable serialization, with no cached mutation state.
+#[derive(Clone, Copy, Default)]
+struct CellExtensionCounts {
+    extended: u32,
+    wide: u32,
+    deep: u32,
+    underline: u32,
+}
+
+impl CellExtensionCounts {
+    #[inline]
+    fn observe(&mut self, cell: &Cell) {
+        if cell_has_ext(cell) {
+            self.extended = self.extended.saturating_add(1);
+        }
+        if cell.width != 1 {
+            self.wide = self.wide.saturating_add(1);
+        }
+        if cell_has_deep_combining(cell) {
+            self.deep = self.deep.saturating_add(1);
+        }
+        if cell_underline_ext(cell) {
+            self.underline = self.underline.saturating_add(1);
+        }
+    }
+}
+
+type GridCells<'a> = std::iter::Chain<std::slice::Iter<'a, Cell>, std::slice::Iter<'a, Cell>>;
+
+impl Grid {
+    fn new(cells: Vec<Cell>) -> Self {
+        Self { cells, origin: 0 }
+    }
+    const fn len(&self) -> usize {
+        self.cells.len()
+    }
+    #[inline]
+    fn physical(&self, index: usize) -> usize {
+        let len = self.cells.len();
+        // The flat case has exactly Vec's own bounds check. Invalid logical
+        // indices remain invalid rather than wrapping into a live physical cell.
+        if self.origin == 0 || index >= len {
+            return index;
+        }
+        let before_wrap = len.saturating_sub(self.origin);
+        if index < before_wrap {
+            self.origin + index
+        } else {
+            index - before_wrap
+        }
+    }
+    #[inline]
+    fn get(&self, index: usize) -> Option<&Cell> {
+        self.cells.get(self.physical(index))
+    }
+    #[inline]
+    fn get_mut(&mut self, index: usize) -> Option<&mut Cell> {
+        let at = self.physical(index);
+        self.cells.get_mut(at)
+    }
+    // A row never crosses the physical cut: every rotation is row-aligned.
+    fn span(&self, from: usize, to: usize) -> Option<&[Cell]> {
+        if from > to || to > self.len() {
+            return None;
+        }
+        if from == to {
+            return self.cells.get(0..0);
+        }
+        let at = self.physical(from);
+        self.cells.get(at..at.saturating_add(to - from))
+    }
+    fn span_mut(&mut self, from: usize, to: usize) -> Option<&mut [Cell]> {
+        if from > to || to > self.len() {
+            return None;
+        }
+        if from == to {
+            return self.cells.get_mut(0..0);
+        }
+        let at = self.physical(from);
+        self.cells.get_mut(at..at.saturating_add(to - from))
+    }
+    /// Copy a complete contiguous logical span between disjoint physical spans.
+    /// Whole-row alignment makes each scroll source/destination contiguous even
+    /// across the logical origin. Other ranges can use the caller's cell path.
+    #[inline(never)]
+    fn copy_span(&mut self, from: usize, to: usize, len: usize) -> bool {
+        if from == to || len == 0 {
+            return true;
+        }
+        let Some(from_end) = from.checked_add(len) else {
+            return false;
+        };
+        let Some(to_end) = to.checked_add(len) else {
+            return false;
+        };
+        if from_end > self.len() || to_end > self.len() {
+            return false;
+        }
+        let from = self.physical(from);
+        let to = self.physical(to);
+        let (source, dest) = if from < to {
+            let Some((before, after)) = self.cells.split_at_mut_checked(to) else {
+                return false;
+            };
+            let Some(end) = from.checked_add(len) else {
+                return false;
+            };
+            let Some(source) = before.get(from..end) else {
+                return false;
+            };
+            let Some(dest) = after.get_mut(..len) else {
+                return false;
+            };
+            (source, dest)
+        } else {
+            let Some((before, after)) = self.cells.split_at_mut_checked(from) else {
+                return false;
+            };
+            let Some(end) = to.checked_add(len) else {
+                return false;
+            };
+            let Some(source) = after.get(..len) else {
+                return false;
+            };
+            let Some(dest) = before.get_mut(to..end) else {
+                return false;
+            };
+            (source, dest)
+        };
+        // Both checked slices have len cells. Bound each transfer to the
+        // ordinary-row copy regime while mapping a large row only once.
+        for (dest, source) in dest
+            .chunks_mut(ROW_COPY_CHUNK)
+            .zip(source.chunks(ROW_COPY_CHUNK))
+        {
+            dest.copy_from_slice(source);
+        }
+        true
+    }
+
+    fn slices(&self) -> [&[Cell]; 2] {
+        let (before, after) = self.cells.split_at(self.origin);
+        [after, before]
+    }
+    fn for_each(&self, mut f: impl FnMut(&Cell)) {
+        for span in self.slices() {
+            for cell in span {
+                f(cell);
+            }
+        }
+    }
+    fn for_each_indexed(&self, mut f: impl FnMut(usize, &Cell)) {
+        let mut base = 0;
+        for span in self.slices() {
+            for (at, cell) in span.iter().enumerate() {
+                f(base + at, cell);
+            }
+            base += span.len();
+        }
+    }
+    #[cfg(test)]
+    fn any(&self, mut predicate: impl FnMut(&Cell) -> bool) -> bool {
+        let [after, before] = self.slices();
+        after.iter().any(&mut predicate) || before.iter().any(predicate)
+    }
+    #[cfg(test)]
+    fn count_if(&self, mut predicate: impl FnMut(&Cell) -> bool) -> u32 {
+        let mut count = 0u32;
+        self.for_each(|cell| {
+            if predicate(cell) {
+                count = count.saturating_add(1);
+            }
+        });
+        count
+    }
+    fn with_range_mut(&mut self, from: usize, to: usize, mut f: impl FnMut(&mut [Cell])) {
+        if from > to || to > self.len() || from == to {
+            return;
+        }
+        let at = self.physical(from);
+        let first = (to - from).min(self.len().saturating_sub(at));
+        if let Some(span) = self.cells.get_mut(at..at.saturating_add(first)) {
+            f(span);
+        }
+        let rest = (to - from).saturating_sub(first);
+        if rest > 0 {
+            if let Some(span) = self.cells.get_mut(..rest) {
+                f(span);
+            }
+        }
+    }
+    fn fill(&mut self, from: usize, to: usize, blank: Cell) {
+        self.with_range_mut(from, to, |span| span.fill(blank));
+    }
+    fn iter(&self) -> GridCells<'_> {
+        let (before, after) = self.cells.split_at(self.origin);
+        after.iter().chain(before.iter())
+    }
+    fn rotate_up(&mut self, cells: usize) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let shift = cells % self.len();
+        let before_wrap = self.len() - self.origin;
+        self.origin = if shift >= before_wrap {
+            shift - before_wrap
+        } else {
+            self.origin + shift
+        };
+    }
+    fn rotate_down(&mut self, cells: usize) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let shift = cells % self.len();
+        self.origin = if shift <= self.origin {
+            self.origin - shift
+        } else {
+            self.len() - (shift - self.origin)
+        };
+    }
+}
+
+impl<'a> IntoIterator for &'a Grid {
+    type Item = &'a Cell;
+    type IntoIter = GridCells<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq for Grid {
+    fn eq(&self, other: &Self) -> bool {
+        if self.origin == other.origin {
+            self.cells == other.cells
+        } else {
+            self.iter().eq(other.iter())
+        }
+    }
+}
+impl Eq for Grid {}
+impl std::fmt::Debug for Grid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self).finish()
+    }
+}
+
+#[inline]
+fn rotated_scroll_enabled() -> bool {
+    #[cfg(test)]
+    {
+        scroll_work::enabled()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+#[cfg(test)]
+mod scroll_work {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(true) };
+        static MOVED: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(super) fn enabled() -> bool {
+        ENABLED.with(Cell::get)
+    }
+    pub(super) fn set(enabled: bool) {
+        ENABLED.with(|value| value.set(enabled));
+    }
+    pub(super) fn moved(n: usize) {
+        MOVED.with(|value| value.set(value.get().saturating_add(n)));
+    }
+    pub(super) fn take() -> usize {
+        MOVED.with(|value| value.replace(0))
+    }
+}
+
+#[cfg(test)]
+#[path = "scroll_grid_tests.rs"]
+mod scroll_grid_tests;
+
 /// A terminal screen: the foldable state. Build one with [`fold`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
     cols: u16,
     rows: u16,
-    grid: Vec<Cell>,
+    grid: Grid,
     row: u16,
     col: u16,
     pen: Pen,
@@ -1404,7 +1744,7 @@ pub struct Screen {
     /// The buffer not on screen: the main grid while the alternate screen is
     /// up, and the alternate grid while the main one is (`None` until the
     /// alternate screen is first entered).
-    inactive: Option<Vec<Cell>>,
+    inactive: Option<Grid>,
     /// The main screen's DECSC slot (`ESC 7` / `CSI s`, and the `?1049` round
     /// trip). Never consumed by a restore.
     saved_cursor: Option<SavedCursor>,
@@ -1704,7 +2044,7 @@ contract_fn! {
 /// Maximum total cells a single screen grid may allocate (`MAX_DIM * MAX_DIM`).
 const MAX_GRID_CELLS: usize = (MAX_DIM as usize) * (MAX_DIM as usize);
 
-fn blank_grid(cols: u16, rows: u16) -> Vec<Cell> {
+fn blank_grid(cols: u16, rows: u16) -> Grid {
     let n = (cols as usize)
         .saturating_mul(rows as usize)
         .min(MAX_GRID_CELLS);
@@ -1719,7 +2059,7 @@ fn blank_grid(cols: u16, rows: u16) -> Vec<Cell> {
         grid.push(Cell::BLANK);
         i = i.saturating_add(1);
     }
-    grid
+    Grid::new(grid)
 }
 
 impl Screen {
@@ -1855,7 +2195,7 @@ impl Screen {
         let start = self.idx(row, 0);
         let end = start.saturating_add(self.cols as usize);
         let mut line = String::new();
-        for c in self.grid.get(start..end).unwrap_or(&[]) {
+        for c in self.grid.span(start, end).unwrap_or(&[]) {
             if c.width == 0 {
                 continue;
             }
@@ -1891,9 +2231,11 @@ impl Screen {
             self.cursor_visible,
             self.altscreen,
         ));
-        for cell in &self.grid {
+        let mut active_counts = CellExtensionCounts::default();
+        self.grid.for_each(|cell| {
             out.extend_from_slice(&encode_cell_bytes(cell));
-        }
+            active_counts.observe(cell);
+        });
         // Internal state that derived `Eq` distinguishes but the grid alone does
         // not — without these, two unequal screens could serialize identically
         // (e.g. a pending SGR pen with nothing yet printed). The grid length is
@@ -1923,13 +2265,15 @@ impl Screen {
             )),
             None => out.extend_from_slice(&[0]),
         }
+        let mut inactive_counts = CellExtensionCounts::default();
         match &self.inactive {
             Some(cells) => {
                 out.extend_from_slice(&[1]);
                 out.extend_from_slice(&encode_u32_le_bytes(cells.len() as u32));
-                for cell in cells {
+                cells.for_each(|cell| {
                     out.extend_from_slice(&encode_cell_bytes(cell));
-                }
+                    inactive_counts.observe(cell);
+                });
             }
             None => out.extend_from_slice(&[0]),
         }
@@ -1977,10 +2321,6 @@ impl Screen {
         // non-truecolour / non-combining screen byte-identical to its pinned digest
         // while preserving strict `s1 == s2 <=> s1.serialize() == s2.serialize()`
         // injectivity across all reachable and caller-constructed `Cell` values.
-        let inactive_has_ext = match &self.inactive {
-            Some(cells) => slice_has_ext_cells(cells),
-            None => false,
-        };
         let saved_has_rgb = match self.saved_cursor {
             Some(s) => pen_has_rgb(s.pen),
             None => false,
@@ -1992,8 +2332,8 @@ impl Screen {
         if pen_has_rgb(self.pen)
             || saved_has_rgb
             || alt_saved_has_rgb
-            || slice_has_ext_cells(&self.grid)
-            || inactive_has_ext
+            || active_counts.extended > 0
+            || inactive_counts.extended > 0
         {
             out.extend_from_slice(&[2]);
             emit_opt_rgb(out, self.pen.fg_rgb);
@@ -2006,24 +2346,20 @@ impl Screen {
                 emit_opt_rgb(out, s.pen.fg_rgb);
                 emit_opt_rgb(out, s.pen.bg_rgb);
             }
-            emit_ext_cells(out, &self.grid);
+            emit_ext_cells(out, &self.grid, active_counts.extended);
             if let Some(cells) = &self.inactive {
-                emit_ext_cells(out, cells);
+                emit_ext_cells(out, cells, inactive_counts.extended);
             }
         }
         // Tag-3 extension trailer for non-unit cell widths (`width != 1`, e.g. wide
         // CJK/emoji lead `width = 2` and spacer `width = 0`): emitted ONLY when some
         // cell carries `width != 1`, keeping every narrow screen byte-identical to its
         // pinned digest while preserving strict `Eq <=> serialize()` injectivity.
-        let inactive_has_wide = match &self.inactive {
-            Some(cells) => slice_has_wide_cells(cells),
-            None => false,
-        };
-        if slice_has_wide_cells(&self.grid) || inactive_has_wide {
+        if active_counts.wide > 0 || inactive_counts.wide > 0 {
             out.extend_from_slice(&[3]);
-            emit_wide_cells(out, &self.grid);
+            emit_wide_cells(out, &self.grid, active_counts.wide);
             if let Some(cells) = &self.inactive {
-                emit_wide_cells(out, cells);
+                emit_wide_cells(out, cells, inactive_counts.wide);
             }
         }
         // Tag-4 extension trailer for session DEC private modes (`?1` DECCKM,
@@ -2044,15 +2380,11 @@ impl Screen {
         // `combining_len > 4`): emitted ONLY when some cell carries more than 4 combining
         // marks, keeping every <=4-mark screen byte-identical to its pinned digest while
         // preserving strict `Eq <=> serialize()` injectivity up to `MAX_COMBINING = 16`.
-        let inactive_has_deep = match &self.inactive {
-            Some(cells) => slice_has_deep_combining_cells(cells),
-            None => false,
-        };
-        if slice_has_deep_combining_cells(&self.grid) || inactive_has_deep {
+        if active_counts.deep > 0 || inactive_counts.deep > 0 {
             out.extend_from_slice(&[5]);
-            emit_deep_combining_cells(out, &self.grid);
+            emit_deep_combining_cells(out, &self.grid, active_counts.deep);
             if let Some(cells) = &self.inactive {
-                emit_deep_combining_cells(out, cells);
+                emit_deep_combining_cells(out, cells, inactive_counts.deep);
             }
         }
         // Tag-6 extension trailer for the underline beyond the attribute byte's
@@ -2063,15 +2395,11 @@ impl Screen {
         // pen and each saved pen in full, then the cells that need it by index.
         let saved_ul = self.saved_cursor.is_some_and(|s| s.pen.underline_ext());
         let alt_saved_ul = self.alt_saved_cursor.is_some_and(|s| s.pen.underline_ext());
-        let inactive_ul = self
-            .inactive
-            .as_deref()
-            .is_some_and(slice_has_underline_ext);
         if self.pen.underline_ext()
             || saved_ul
             || alt_saved_ul
-            || slice_has_underline_ext(&self.grid)
-            || inactive_ul
+            || active_counts.underline > 0
+            || inactive_counts.underline > 0
         {
             out.extend_from_slice(&[6]);
             emit_underline_pen(out, self.pen);
@@ -2081,9 +2409,9 @@ impl Screen {
             if let Some(s) = self.alt_saved_cursor {
                 emit_underline_pen(out, s.pen);
             }
-            emit_underline_cells(out, &self.grid);
+            emit_underline_cells(out, &self.grid, active_counts.underline);
             if let Some(cells) = &self.inactive {
-                emit_underline_cells(out, cells);
+                emit_underline_cells(out, cells, inactive_counts.underline);
             }
         }
     }
@@ -2202,9 +2530,8 @@ impl Screen {
         }
         let blank = self.bce_blank();
         let i = self.idx(row, b);
-        if let Some(cells) = self.grid.get_mut(i.saturating_sub(1)..=i) {
-            cells.fill(blank);
-        }
+        self.grid
+            .fill(i.saturating_sub(1), i.saturating_add(1), blank);
     }
 
     /// A cell in the current pen: a glyph (`width` 1, or 2 for a wide one's
@@ -2321,6 +2648,76 @@ impl Screen {
         true
     }
 
+    /// Borrow one logical row; rotated storage can map the row once here.
+    fn row_cells_mut(&mut self, row: u16) -> Option<&mut [Cell]> {
+        let from = self.idx(row, 0);
+        self.grid
+            .span_mut(from, from.saturating_add(self.cols as usize))
+    }
+
+    /// Paint a printable GL-byte prefix within this row. ASCII cannot continue
+    /// a grapheme cluster; DEC glyphs are narrow and can join only after a ZWJ.
+    /// Every interior cell is fully overwritten, so only wide pairs crossing
+    /// external boundaries need a surviving BCE blank. Wrap and insert mode
+    /// retain scalar paths, as do DEC glyphs while a ZWJ join remains open.
+    fn put_ascii_run<const DEC: bool>(&mut self, bytes: &[u8]) -> usize {
+        if self.insert || self.wrap_pending() || (DEC && self.joiner_open) {
+            return 0;
+        }
+        let col = self.col;
+        let end = self.line_end(col);
+        let available = end.saturating_sub(col).saturating_add(1) as usize;
+        let count = bytes
+            .iter()
+            .take(available)
+            .take_while(|&&b| (0x20..=0x7e).contains(&b))
+            .count();
+        if count < ASCII_SPAN_MIN {
+            return 0;
+        }
+        let blank = self.bce_blank();
+        let template = self.pen_cell(' ', 1);
+        let start = col as usize;
+        let stop = start.saturating_add(count);
+        let Some(row) = self.row_cells_mut(self.row) else {
+            return 0;
+        };
+        if start > 0 && row.get(start).is_some_and(|cell| cell.width == 0) {
+            if let Some(cell) = row.get_mut(start - 1) {
+                *cell = blank;
+            }
+        }
+        if row.get(stop).is_some_and(|cell| cell.width == 0) {
+            if let Some(cell) = row.get_mut(stop) {
+                *cell = blank;
+            }
+        }
+        let Some(span) = row.get_mut(start..stop) else {
+            return 0;
+        };
+        for (cell, &b) in span.iter_mut().zip(bytes) {
+            *cell = Cell {
+                ch: if DEC {
+                    dec_special_graphic(b)
+                } else {
+                    b as char
+                },
+                ..template
+            };
+        }
+        self.joiner_open = false;
+        let last = col.saturating_add(count as u16).saturating_sub(1);
+        if last >= end {
+            self.set_wrap_at(last);
+        } else {
+            self.col = last.saturating_add(1);
+        }
+        self.note_print_end();
+        #[cfg(test)]
+        ascii_work::record(count);
+        count
+    }
+
     fn put(&mut self, ch: char) {
         // Each codepoint measured alone; the clamp keeps a width the cells can
         // hold (`wide_island`).
@@ -2343,7 +2740,12 @@ impl Screen {
         // A glyph that continues the grapheme cluster before it attaches to
         // that cell without advancing the cursor or resolving a pending wrap
         // ([`joins_cluster`]).
-        if self.has_active_base() {
+        let may_join = is_emoji_modifier(ch)
+            || is_regional_indicator(ch)
+            || (self.joiner_open && !ch.is_ascii());
+        #[cfg(test)]
+        let may_join = may_join || !scroll_work::enabled();
+        if may_join && self.has_active_base() {
             let joiner_open = self.joiner_open;
             let base_idx = self.idx(self.row, self.active_base_col());
             if let Some(base) = self.grid.get_mut(base_idx) {
@@ -2392,6 +2794,58 @@ impl Screen {
         let row = self.row;
         let col = self.col;
         let end = self.line_end(col);
+        #[cfg(test)]
+        if !scroll_work::enabled() {
+            self.place_glyph_at_points(row, col, end, ch, width);
+        } else {
+            self.place_glyph_in_row(row, col, end, ch, width);
+        }
+        #[cfg(not(test))]
+        self.place_glyph_in_row(row, col, end, ch, width);
+        // The next glyph goes to the right, or wraps once the line ends at
+        // the glyph's last column.
+        let last = col.saturating_add(columns.saturating_sub(1));
+        if last >= end {
+            self.set_wrap_at(last);
+        } else {
+            self.col = last.saturating_add(1);
+        }
+        self.note_print_end();
+    }
+
+    /// Complete a scalar write after wrapping and insert-mode shifting. Both
+    /// wide-pair boundary repairs and the lead/spacer writes share one row map.
+    fn place_glyph_in_row(&mut self, row: u16, col: u16, end: u16, ch: char, width: u8) {
+        let lead = self.pen_cell(ch, width);
+        let spacer = self.pen_cell(' ', 0);
+        let blank = self.bce_blank();
+        let Some(row) = self.row_cells_mut(row) else {
+            return;
+        };
+        // Keep the same left-then-right repair order as split_at, including
+        // orphan spacers installed through the public cell overlay API.
+        for boundary in [col as usize, col.saturating_add(width as u16) as usize] {
+            if boundary > 0 && row.get(boundary).is_some_and(|cell| cell.width == 0) {
+                if let Some(pair) = row.get_mut(boundary - 1..=boundary) {
+                    pair.fill(blank);
+                }
+            }
+        }
+        if let Some(slot) = row.get_mut(col as usize) {
+            *slot = lead;
+        }
+        if width == 2 {
+            let spacer_col = wide_spacer_col_clamp(col.saturating_add(1) as u64, end as u64);
+            if let Some(slot) = row.get_mut(spacer_col as usize) {
+                *slot = spacer;
+            }
+        }
+    }
+
+    // Retain the original point-placement sequence as an independent oracle.
+    #[cfg(test)]
+    fn place_glyph_at_points(&mut self, row: u16, col: u16, end: u16, ch: char, width: u8) {
+        let columns = width as u16;
         // A wide glyph the write cuts into, on either side, goes whole.
         self.split_at(row, col);
         self.split_at(row, col.saturating_add(columns));
@@ -2409,15 +2863,6 @@ impl Screen {
                 *slot = spacer;
             }
         }
-        // The next glyph goes to the right, or wraps once the line ends at
-        // the glyph's last column.
-        let last = col.saturating_add(columns.saturating_sub(1));
-        if last >= end {
-            self.set_wrap_at(last);
-        } else {
-            self.col = last.saturating_add(1);
-        }
-        self.note_print_end();
     }
 
     /// A print moved the cursor: onto the left margin past column 0 only from outside it, with
@@ -2473,10 +2918,22 @@ impl Screen {
 
     /// Copy row `src`'s span between the left and right margins onto row
     /// `dst`'s (the whole row without DECSLRM margins).
+    #[inline]
     fn copy_span(&mut self, src: u16, dst: u16) {
         let from = self.idx(src, self.left);
         let to = self.idx(dst, self.left);
         let len = (self.right.saturating_sub(self.left) as usize).saturating_add(1);
+        #[cfg(test)]
+        scroll_work::moved(len);
+        if len >= ROW_COPY_MIN && rotated_scroll_enabled() && self.grid.copy_span(from, to, len) {
+            return;
+        }
+        self.copy_span_cells(from, to, len);
+    }
+
+    /// Original scalar copy, retained as the dense oracle and for ranges that
+    /// are invalid, overlap, or do not fit contiguous physical slices.
+    fn copy_span_cells(&mut self, from: usize, to: usize, len: usize) {
         let mut i = 0usize;
         while i < len {
             if let Some(&cell) = self.grid.get(from.saturating_add(i)) {
@@ -2502,6 +2959,24 @@ impl Screen {
     /// outside the margins stay (xterm scrolls the rectangle). The scroll
     /// (`from == scroll_top`) and DL (`from == row`).
     fn shift_up(&mut self, from: u16, n: u16) {
+        // Zero-count typed ops keep the historical dense fallback (which blanks
+        // the region); parsed CSI counts are normalized before they reach here.
+        if n > 0
+            && from == 0
+            && self.scroll_bottom == self.rows.saturating_sub(1)
+            && self.left == 0
+            && self.right >= self.cols.saturating_sub(1)
+            && rotated_scroll_enabled()
+        {
+            let cells = (n as usize)
+                .saturating_mul(self.cols as usize)
+                .min(self.grid.len());
+            self.grid.rotate_up(cells);
+            let from = self.grid.len().saturating_sub(cells);
+            let blank = self.bce_blank();
+            self.grid.fill(from, self.grid.len(), blank);
+            return;
+        }
         self.split_margins(from);
         let bottom = self.scroll_bottom;
         let mut r = from;
@@ -2525,6 +3000,21 @@ impl Screen {
     /// the margins stay. RI's reverse scroll (`from == scroll_top`) and IL
     /// (`from == row`).
     fn shift_down(&mut self, from: u16, n: u16) {
+        if n > 0
+            && from == 0
+            && self.scroll_bottom == self.rows.saturating_sub(1)
+            && self.left == 0
+            && self.right >= self.cols.saturating_sub(1)
+            && rotated_scroll_enabled()
+        {
+            let cells = (n as usize)
+                .saturating_mul(self.cols as usize)
+                .min(self.grid.len());
+            self.grid.rotate_down(cells);
+            let blank = self.bce_blank();
+            self.grid.fill(0, cells, blank);
+            return;
+        }
         self.split_margins(from);
         let mut r = self.scroll_bottom;
         while r >= from {
@@ -2568,14 +3058,14 @@ impl Screen {
     /// each cell keeping its colours and attributes.
     fn unpair(&mut self, row: u16, lead: u16) {
         let i = self.idx(row, lead);
-        if let Some(cells) = self.grid.get_mut(i..=i.saturating_add(1)) {
+        self.grid.with_range_mut(i, i.saturating_add(2), |cells| {
             for cell in cells {
                 cell.ch = ' ';
                 cell.width = 1;
                 cell.combining = ['\0'; MAX_COMBINING];
                 cell.combining_len = 0;
             }
-        }
+        });
     }
 
     /// RI (`ESC M`, xterm `RevIndex`): at the top margin, for a cursor within
@@ -2628,9 +3118,7 @@ impl Screen {
             }
         }
         let blank = self.bce_blank();
-        if let Some(slice) = self.grid.get_mut(at..dst_start) {
-            slice.fill(blank);
-        }
+        self.grid.fill(at, dst_start, blank);
     }
 
     /// DCH (xterm `DeleteChar`): for a cursor within the left/right margins
@@ -2669,9 +3157,7 @@ impl Screen {
         }
         let blank = self.bce_blank();
         let fill_start = end.saturating_sub(n).max(at);
-        if let Some(slice) = self.grid.get_mut(fill_start..end) {
-            slice.fill(blank);
-        }
+        self.grid.fill(fill_start, end, blank);
     }
 
     /// ECH (xterm `do_erase_char` -> `ClearRight(n)`): `n` cells from the
@@ -3000,9 +3486,7 @@ impl Screen {
     fn fill(&mut self, from: usize, to: usize) {
         let blank = self.bce_blank();
         let to = to.min(self.grid.len());
-        if let Some(slice) = self.grid.get_mut(from..to) {
-            slice.fill(blank);
-        }
+        self.grid.fill(from, to, blank);
     }
 
     /// Apply an SGR parameter list. `sub[i]` marks `params[i]` as a `:`
@@ -3648,21 +4132,19 @@ fn emit_underline_pen<S: ByteSink>(out: &mut S, pen: Pen) {
     emit_underline(out, pen.attrs, pen.underline, pen.ul, pen.ul_rgb);
 }
 
-fn slice_has_underline_ext(cells: &[Cell]) -> bool {
-    cells.iter().any(cell_underline_ext)
-}
-
 /// Every cell [`cell_underline_ext`] holds for: their count, then each one's index
 /// and [`emit_underline`].
-fn emit_underline_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
-    let count = cells.iter().filter(|c| cell_underline_ext(c)).count();
-    out.extend_from_slice(&encode_u32_le_bytes(count as u32));
-    for (idx, c) in cells.iter().enumerate() {
+fn emit_underline_cells<S: ByteSink>(out: &mut S, cells: &Grid, count: u32) {
+    out.extend_from_slice(&encode_u32_le_bytes(count));
+    if count == 0 {
+        return;
+    }
+    cells.for_each_indexed(|idx, c| {
         if cell_underline_ext(c) {
             out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
             emit_underline(out, c.attrs, c.underline, c.ul, c.ul_rgb);
         }
-    }
+    });
 }
 
 const fn cell_has_ext(c: &Cell) -> bool {
@@ -3675,15 +4157,6 @@ const fn cell_has_ext(c: &Cell) -> bool {
         || c.combining[3] != '\0'
 }
 
-fn slice_has_ext_cells(cells: &[Cell]) -> bool {
-    for c in cells {
-        if cell_has_ext(c) {
-            return true;
-        }
-    }
-    false
-}
-
 fn emit_opt_rgb<S: ByteSink>(out: &mut S, rgb: Option<(u8, u8, u8)>) {
     match rgb {
         None => out.extend_from_slice(&[0]),
@@ -3691,15 +4164,12 @@ fn emit_opt_rgb<S: ByteSink>(out: &mut S, rgb: Option<(u8, u8, u8)>) {
     }
 }
 
-fn emit_ext_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
-    let mut count = 0u32;
-    for c in cells {
-        if cell_has_ext(c) {
-            count = count.saturating_add(1);
-        }
-    }
+fn emit_ext_cells<S: ByteSink>(out: &mut S, cells: &Grid, count: u32) {
     out.extend_from_slice(&encode_u32_le_bytes(count));
-    for (idx, c) in cells.iter().enumerate() {
+    if count == 0 {
+        return;
+    }
+    cells.for_each_indexed(|idx, c| {
         if cell_has_ext(c) {
             out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
             emit_opt_rgb(out, c.fg_rgb);
@@ -3709,7 +4179,7 @@ fn emit_ext_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
                 out.extend_from_slice(&encode_u32_le_bytes(m as u32));
             }
         }
-    }
+    });
 }
 
 const fn cell_has_deep_combining(c: &Cell) -> bool {
@@ -3726,31 +4196,19 @@ const fn cell_has_deep_combining(c: &Cell) -> bool {
     false
 }
 
-fn slice_has_deep_combining_cells(cells: &[Cell]) -> bool {
-    for c in cells {
-        if cell_has_deep_combining(c) {
-            return true;
-        }
-    }
-    false
-}
-
-fn emit_deep_combining_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
-    let mut count = 0u32;
-    for c in cells {
-        if cell_has_deep_combining(c) {
-            count = count.saturating_add(1);
-        }
-    }
+fn emit_deep_combining_cells<S: ByteSink>(out: &mut S, cells: &Grid, count: u32) {
     out.extend_from_slice(&encode_u32_le_bytes(count));
-    for (idx, c) in cells.iter().enumerate() {
+    if count == 0 {
+        return;
+    }
+    cells.for_each_indexed(|idx, c| {
         if cell_has_deep_combining(c) {
             out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
             for &m in &c.combining[4..MAX_COMBINING] {
                 out.extend_from_slice(&encode_u32_le_bytes(m as u32));
             }
         }
-    }
+    });
 }
 
 /// Whether glyph `ch` continues the grapheme cluster that `base`, the glyph
@@ -3772,29 +4230,17 @@ fn joins_cluster(base: &Cell, ch: char, joiner_open: bool) -> bool {
         || (joiner_open && !ch.is_ascii() && base.last_combining() == Some('\u{200D}'))
 }
 
-fn slice_has_wide_cells(cells: &[Cell]) -> bool {
-    for c in cells {
-        if c.width != 1 {
-            return true;
-        }
-    }
-    false
-}
-
-fn emit_wide_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
-    let mut count = 0u32;
-    for c in cells {
-        if c.width != 1 {
-            count = count.saturating_add(1);
-        }
-    }
+fn emit_wide_cells<S: ByteSink>(out: &mut S, cells: &Grid, count: u32) {
     out.extend_from_slice(&encode_u32_le_bytes(count));
-    for (idx, c) in cells.iter().enumerate() {
+    if count == 0 {
+        return;
+    }
+    cells.for_each_indexed(|idx, c| {
         if c.width != 1 {
             out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
             out.extend_from_slice(&[c.width]);
         }
-    }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3806,7 +4252,7 @@ enum ExtendedColor {
 /// Clip/extend a grid into new dimensions, copying the overlapping top-left
 /// region and healing any wide character split by a narrower `new_cols` clip.
 /// Does not reflow wrapped lines (a later rung).
-fn reflow(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16) -> Vec<Cell> {
+fn reflow(old: &Grid, old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16) -> Grid {
     let new_cols = new_cols.clamp(1, MAX_DIM);
     let new_rows = new_rows.clamp(1, MAX_DIM);
     let mut g = blank_grid(new_cols, new_rows);
@@ -4250,7 +4696,10 @@ impl Parser {
         }
     }
 
-    fn feed(
+    // Preserve the original for-loop independently of the batched loop, so a
+    // test can compare parser transitions and byte accounting as well as paint.
+    #[cfg(test)]
+    fn feed_scalar(
         &mut self,
         screen: &mut Screen,
         title: &mut String,
@@ -4273,6 +4722,84 @@ impl Parser {
                     hi,
                 } => self.utf8_cont(screen, b, needed, acc, (lo, hi)),
             }
+            if screen.synchronized_output && was_sync {
+                *sync_bytes = crate::events::sync_bytes_clamp(
+                    (*sync_bytes as u64).saturating_add(1),
+                    crate::events::MAX_SYNC_OUTPUT_BYTES as u64,
+                ) as usize;
+            } else {
+                *sync_bytes = 0;
+            }
+        }
+    }
+
+    fn feed(
+        &mut self,
+        screen: &mut Screen,
+        title: &mut String,
+        cwd: &mut String,
+        sync_bytes: &mut usize,
+        bytes: &[u8],
+    ) {
+        #[cfg(test)]
+        if !ascii_work::enabled() {
+            self.feed_scalar(screen, title, cwd, sync_bytes, bytes);
+            return;
+        }
+        let mut remaining = bytes;
+        while let Some((&b, tail)) = remaining.split_first() {
+            let was_sync = screen.synchronized_output;
+            match self.state {
+                State::Ground => {
+                    if (0x20..=0x7e).contains(&b) && remaining.len() >= ASCII_SPAN_MIN {
+                        let ascii = screen.charsets.ascii_gl();
+                        let consumed = if ascii {
+                            screen.put_ascii_run::<false>(remaining)
+                        } else {
+                            screen.put_ascii_run::<true>(remaining)
+                        };
+                        if consumed > 0 {
+                            if self.recording {
+                                if ascii {
+                                    self.ops.extend(
+                                        remaining[..consumed]
+                                            .iter()
+                                            .map(|&byte| ScreenOp::Print(byte as char)),
+                                    );
+                                } else {
+                                    self.ops.extend(
+                                        remaining[..consumed].iter().map(|&byte| {
+                                            ScreenOp::Print(dec_special_graphic(byte))
+                                        }),
+                                    );
+                                }
+                            }
+                            remaining = &remaining[consumed..];
+                            *sync_bytes = if screen.synchronized_output && was_sync {
+                                crate::events::sync_bytes_clamp(
+                                    (*sync_bytes as u64).saturating_add(consumed as u64),
+                                    crate::events::MAX_SYNC_OUTPUT_BYTES as u64,
+                                ) as usize
+                            } else {
+                                0
+                            };
+                            continue;
+                        }
+                    }
+                    self.ground(screen, b);
+                }
+                State::Esc => self.escape(screen, title, cwd, b),
+                State::EscIntermediate => self.esc_intermediate(screen, b),
+                State::Csi => self.csi(screen, b),
+                State::Str { bel_ends } => self.string(title, cwd, b, bel_ends),
+                State::Utf8 {
+                    needed,
+                    acc,
+                    lo,
+                    hi,
+                } => self.utf8_cont(screen, b, needed, acc, (lo, hi)),
+            }
+            remaining = tail;
             if screen.synchronized_output && was_sync {
                 *sync_bytes = crate::events::sync_bytes_clamp(
                     (*sync_bytes as u64).saturating_add(1),

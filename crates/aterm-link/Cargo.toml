@@ -26,6 +26,8 @@ publish = false
 dev-seams = []
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # Exclusively owned notifier carry stages, removed on error/drop.
 aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its

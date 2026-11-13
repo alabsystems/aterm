@@ -16,6 +16,120 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Discriminators emitted by this verifier, including its two explicit measurement imports.
+/// Recognizing a kind establishes no execution, payload truth, custody or verdict authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventKind {
+    InvocationStarted,
+    ObservationUnavailable,
+    MeasureDriver,
+    CellPrerequisiteUnavailable,
+    Disk,
+    RunFinished,
+    StageStarted,
+    StageFinished,
+    RowStarted,
+    RowFinished,
+    CheckFinished,
+    CompileUnitMessageUnavailable,
+    CompileUnitDispatched,
+    CompileUnitFinished,
+    CompileUnitTimed,
+    CompileAdmissionWait,
+    CompileFinished,
+    CompileMessageObserved,
+    TestCaseRunningLong,
+    TestCaseFailed,
+    TestBinaryFinished,
+    TestDispatchWait,
+    TestCpuAccounted,
+    TestPhaseStarted,
+    TestPhaseEnded,
+    InputItemPart,
+    InputItemFinished,
+    LintPackageFinished,
+    AppkitGroupFinished,
+    MeasureRowStarted,
+    MeasureRowFinished,
+}
+
+impl EventKind {
+    /// The existing release-status outcome projections, not a check verdict.
+    #[must_use]
+    pub const fn projects_failure(self) -> bool {
+        matches!(
+            self,
+            Self::StageFinished
+                | Self::CheckFinished
+                | Self::TestCaseFailed
+                | Self::TestBinaryFinished
+        )
+    }
+}
+
+/// Construct an ordinary producer envelope from a typed discriminator and unwrapped metadata.
+/// A malformed producer payload loses this observation rather than inventing a check result.
+pub(crate) fn event_value(kind: EventKind, mut payload: aterm_json::Value) -> aterm_json::Value {
+    if let Some(fields) = payload.as_object_mut()
+        && !fields.contains_key("schema")
+        && !fields.contains_key("event")
+    {
+        fields.insert("schema".into(), 1_u64.into());
+        fields.insert("event".into(), aterm_json::json!(kind));
+        return payload;
+    }
+    aterm_json::json!({"schema":1,"event":EventKind::ObservationUnavailable,
+        "producer_event":kind,"reason":"producer payload is not an unwrapped object"})
+}
+
+/// Diagnostic classification only. Known metadata need not have a semantic projection.
+pub enum Observation {
+    /// A known kind and valid envelope; supported strict progress payloads also passed their decoder.
+    Known {
+        kind: EventKind,
+        value: aterm_json::Value,
+    },
+    /// An exact private storage marker, not an invocation or execution observation.
+    StorageMarker,
+    /// A valid envelope with an unsupported discriminator.
+    UnknownKind,
+    /// Invalid JSON/envelope or malformed fields of a supported strict progress record.
+    Malformed,
+}
+
+/// Read a raw diagnostic without granting its metadata execution or qualification authority.
+/// Envelope bounds and duplicate-header checks are shared with all verifier log readers.
+#[must_use]
+pub fn observation(json: &str) -> Observation {
+    if [
+        crate::run_log::PRIVATE_EVENTS_HEADER,
+        crate::run_log::PRIVATE_HUMAN_HEADER,
+    ]
+    .iter()
+    .any(|header| {
+        header
+            .strip_prefix("verify-event: ")
+            .and_then(|s| s.strip_suffix('\n'))
+            == Some(json)
+    }) {
+        return Observation::StorageMarker;
+    }
+    let Some(record) = raw_event(json) else {
+        return Observation::Malformed;
+    };
+    let Ok(kind) = aterm_json::from_value::<EventKind>(record.value["event"].clone()) else {
+        return Observation::UnknownKind;
+    };
+    if crate::status::supported_progress_payload(kind, json) == Some(false) {
+        return Observation::Malformed;
+    }
+    Observation::Known {
+        kind,
+        value: record.value,
+    }
+}
+
 /// Prepare once, mirror without holding a file lock, then persist the identical bytes.
 pub(crate) fn emit(events: Option<&EventLog>, event: &str) -> String {
     let line = events.map_or_else(|| terminated(event), |events| events.prepare(event));
@@ -272,12 +386,12 @@ struct Sinks {
 }
 
 /// One invocation's optional external append stream and private retained companion.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EventLog {
-    prepared: AtomicBool,
+    prepared: Arc<AtomicBool>,
     id: Option<String>,
     context: Option<Context>,
-    sinks: Mutex<Sinks>,
+    sinks: Arc<Mutex<Sinks>>,
 }
 
 impl EventLog {
@@ -287,10 +401,10 @@ impl EventLog {
 
     fn with_entropy(entropy: impl FnOnce() -> io::Result<String>) -> Self {
         Self {
-            prepared: AtomicBool::new(false),
+            prepared: Arc::new(AtomicBool::new(false)),
             id: entropy().ok(),
             context: None,
-            sinks: Mutex::new(Sinks::default()),
+            sinks: Arc::new(Mutex::new(Sinks::default())),
         }
     }
 
@@ -306,9 +420,9 @@ impl EventLog {
     }
 
     pub(crate) fn retain(&mut self, retained: Retained) {
-        let sinks = self
+        let mut sinks = self
             .sinks
-            .get_mut()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         sinks.retained = Some(retained);
     }
@@ -336,9 +450,9 @@ impl EventLog {
                 "private managed logs cannot be opened as public append streams",
             ));
         }
-        let mut log = Self::unrecorded();
+        let log = Self::unrecorded();
         log.sinks
-            .get_mut()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .external = Some(file);
         Ok(log)
@@ -372,11 +486,13 @@ impl EventLog {
         // An unreadable-sized diagnostic is unknown, never a clipped invented check row.
         format!(
             "verify-event: {}\n",
-            aterm_json::json!({
-                "schema":1, "event":"observation-unavailable",
-                "producer_event":value["event"].as_str().map(|s| crate::report::clip_json(s, 128)),
-                "reason":"record exceeds encoded line bound", "invocation":value["invocation"],
-            })
+            crate::event_log::event_value(
+                crate::event_log::EventKind::ObservationUnavailable,
+                aterm_json::json!({
+                    "producer_event":value["event"].as_str().map(|s| crate::report::clip_json(s, 128)),
+                    "reason":"record exceeds encoded line bound", "invocation":value["invocation"],
+                })
+            )
         )
     }
 
@@ -578,44 +694,5 @@ impl CheckRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Lines from many threads, each far longer than a pipe writes at once, land whole and one
-    /// per line, a missing newline added and a present one kept single.
-    #[test]
-    fn each_line_lands_whole_whatever_writes_beside_it() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let at = dir.path().join("06-verify.events");
-        let log = EventLog::open(&at).unwrap();
-        let long = |t: usize, i: usize| {
-            format!(
-                "verify-event: {{\"t\":{t},\"i\":{i},\"pad\":\"{}\"}}",
-                "x".repeat(20_000)
-            )
-        };
-        std::thread::scope(|s| {
-            for t in 0..4 {
-                let log = &log;
-                s.spawn(move || {
-                    for i in 0..20 {
-                        let line = long(t, i);
-                        log.write(&if i % 2 == 0 {
-                            line
-                        } else {
-                            format!("{line}\n")
-                        });
-                    }
-                });
-            }
-        });
-        let text = std::fs::read_to_string(&at).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 80);
-        for line in lines {
-            let json = line.strip_prefix("verify-event: ").expect("a whole line");
-            let event: aterm_json::Value = aterm_json::from_str(json).unwrap();
-            assert_eq!(event["pad"].as_str().map(str::len), Some(20_000));
-        }
-    }
-}
+#[path = "event_log_tests.rs"]
+mod tests;

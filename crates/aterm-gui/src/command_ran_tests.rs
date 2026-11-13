@@ -1162,7 +1162,7 @@ fn scripted_job(shell: i32, listings: Vec<Vec<(u32, &str)>>) -> ListJob {
                 .collect()
         })
         .collect();
-    Box::new(move |asked| {
+    Box::new(move |asked, _| {
         assert_eq!(asked, shell, "the job of the session's own shell");
         listings.pop_front().unwrap_or_default()
     })
@@ -1281,21 +1281,22 @@ fn a_windows_images_name_is_its_file_name_in_any_case_and_a_unix_ones_is_exact()
 /// Instants are set by hand. NEGATIVE CONTROLS (scratch): a batch's C not looked for
 /// (`J01_NC=start`) fails the third assertion, a start that leaves the next batch to the pace
 /// (`J01_NC=armed`) the fourth, and a batch's D not looked for (J0-1 lander, `J01_NC=end`) the
-/// first assertion about an end.
+/// first assertion about an end. Which listing each is ([`JobListing`]) is asserted whole: a
+/// pace listing passed as a mark (`Some(JobListing::Mark)` in the pace arm) fails it.
 #[test]
 fn a_windows_job_is_listed_at_its_pace_and_at_once_at_a_blocks_start_and_end() {
-    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listings = Arc::new(Mutex::new(Vec::new()));
     let counted = Arc::clone(&listings);
     let mut feed = RanJob::listing(
         Arc::new(Ran::default()),
         100,
         None,
-        Box::new(move |_| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::new(move |_, listing| {
+            counted.lock().unwrap().push(listing);
             Vec::new()
         }),
     );
-    let listed = || listings.load(std::sync::atomic::Ordering::SeqCst);
+    let listed = || listings.lock().unwrap().len();
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     feed.batch(b"out", at(0), 0);
@@ -1330,6 +1331,17 @@ fn a_windows_job_is_listed_at_its_pace_and_at_once_at_a_blocks_start_and_end() {
     assert_eq!(listed(), 10, "an end cut across two batches");
     feed.batch(b"x", at(350), 0);
     assert_eq!(listed(), 11);
+    {
+        use JobListing::{Mark, Pace};
+        assert_eq!(
+            *listings.lock().unwrap(),
+            [
+                Mark, Mark, Mark, Pace, Mark, Mark, Pace, Mark, Mark, Mark, Mark
+            ],
+            "a listing the pace alone brought never walks below the shell; a gather's first, \
+             a block's start or end and the batch after each may"
+        );
+    }
     feed.batch(b"\x1b]133;A\x07PS> \x1b]133;B\x07", at(360), 0);
     assert_eq!(listed(), 11, "a prompt's marks are no block's start or end");
 }

@@ -156,7 +156,7 @@ pub const CLAIM_WORKER_FIX: &str = "Go on without it on the claim page, or end w
                                     whose first line is `Could not finish: NOT CLAIMED:` and \
                                     why, with no `Nothing left:` line";
 
-/// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
+/// A question dialog answered under the priority word `long-term` ([`PriorityWord::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
 /// The same under `short-term` ([`super::question::SHORT_TERM_TEXT`]).
 pub const RULE_ANSWER_SHORT_TERM: &str = "answer-short-term@v1";
@@ -169,10 +169,10 @@ pub const RULE_PROSE_LONG_TERM: &str = "prose-long-term@v1";
 pub const RULE_PROSE_SHORT_TERM: &str = "prose-short-term@v1";
 
 /// A priority a person sets: what the `[harness] question_priority` key and a session's
-/// `questions` word spell. It is [`QuestionPriority`] less Land's, which no person sets, so no
-/// configuration carries Land's priority: a dialog takes Land's from the approval loop (the
-/// session's Autopilot) or from a box's facts ([`QuestionPriority::of_fact`]), and a prose
-/// question under Land gets the turn-end policy's own Land answer.
+/// `questions` word spell. It holds no Land, which no person sets, so no configuration carries
+/// Land's priority: a dialog takes Land's from the approval loop (the session's Autopilot) or
+/// from a box's facts ([`QuestionPriority::of_fact`]), and a prose question under Land gets the
+/// turn-end policy's own Land answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum PriorityWord {
     #[default]
@@ -218,45 +218,53 @@ impl PriorityWord {
     }
 
     /// Its policy text, which a prose question is answered with and a dialog's free-text row is
-    /// written with: its [`QuestionPriority`]'s.
+    /// written with; `recommended` has none (it takes the recommended option).
     #[must_use]
-    pub fn text(self) -> Option<&'static str> {
-        QuestionPriority::from(self).text()
+    pub const fn text(self) -> Option<&'static str> {
+        match self {
+            Self::Recommended => None,
+            Self::LongTerm => Some(super::question::LONG_TERM_TEXT),
+            Self::ShortTerm => Some(super::question::SHORT_TERM_TEXT),
+        }
     }
 }
 
 impl From<PriorityWord> for QuestionPriority {
     fn from(word: PriorityWord) -> Self {
-        match word {
-            PriorityWord::Recommended => Self::Recommended,
-            PriorityWord::LongTerm => Self::LongTerm,
-            PriorityWord::ShortTerm => Self::ShortTerm,
-        }
+        Self::Word(word)
     }
 }
 
 /// How a question dialog is answered once [`ApprovalCtx::answer_questions`] says it is: under a
-/// person's [`PriorityWord`] or under Land's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// person's [`PriorityWord`] or under Land's. Land is a variant of its own beside the words, so
+/// no word a person sets can name or become it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QuestionPriority {
-    #[default]
-    Recommended,
-    LongTerm,
-    ShortTerm,
+    /// A person's word's: the config key's or the session's `questions` word.
+    Word(PriorityWord),
     /// Autopilot Land's: never a word a person sets; the approval loop takes it for a session
     /// whose Autopilot is Land.
     Land,
 }
 
+impl Default for QuestionPriority {
+    fn default() -> Self {
+        Self::Word(PriorityWord::default())
+    }
+}
+
 impl QuestionPriority {
-    /// Every priority: each [`PriorityWord`]'s, in [`PriorityWord::ALL`]'s order, and
+    /// Every priority: each [`PriorityWord`]'s, in [`PriorityWord::ALL`]'s order, then
     /// [`Self::Land`].
-    pub const EVERY: [Self; 4] = [
-        Self::Recommended,
-        Self::LongTerm,
-        Self::ShortTerm,
-        Self::Land,
-    ];
+    pub const EVERY: [Self; PriorityWord::ALL.len() + 1] = {
+        let mut every = [Self::Land; PriorityWord::ALL.len() + 1];
+        let mut i = 0;
+        while i < PriorityWord::ALL.len() {
+            every[i] = Self::Word(PriorityWord::ALL[i]);
+            i += 1;
+        }
+        every
+    };
 
     /// The priority a box's facts or a tape name by its [`Self::word`], `land` included.
     #[must_use]
@@ -268,9 +276,7 @@ impl QuestionPriority {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
-            Self::Recommended => PriorityWord::Recommended.word(),
-            Self::LongTerm => PriorityWord::LongTerm.word(),
-            Self::ShortTerm => PriorityWord::ShortTerm.word(),
+            Self::Word(word) => word.word(),
             Self::Land => "land",
         }
     }
@@ -279,21 +285,19 @@ impl QuestionPriority {
     #[must_use]
     pub const fn rule_id(self) -> &'static str {
         match self {
-            Self::Recommended => super::question::RULE_ANSWER_RECOMMENDED,
-            Self::LongTerm => RULE_ANSWER_LONG_TERM,
-            Self::ShortTerm => RULE_ANSWER_SHORT_TERM,
+            Self::Word(PriorityWord::Recommended) => super::question::RULE_ANSWER_RECOMMENDED,
+            Self::Word(PriorityWord::LongTerm) => RULE_ANSWER_LONG_TERM,
+            Self::Word(PriorityWord::ShortTerm) => RULE_ANSWER_SHORT_TERM,
             Self::Land => RULE_ANSWER_LAND,
         }
     }
 
-    /// The fixed policy text written into a free-text row; a [`PriorityWord`]'s answers a prose
-    /// question too ([`PriorityWord::text`]).
+    /// The fixed policy text written into a free-text row: its [`PriorityWord::text`], or
+    /// Land's.
     #[must_use]
     pub const fn text(self) -> Option<&'static str> {
         match self {
-            Self::Recommended => None,
-            Self::LongTerm => Some(super::question::LONG_TERM_TEXT),
-            Self::ShortTerm => Some(super::question::SHORT_TERM_TEXT),
+            Self::Word(word) => word.text(),
             Self::Land => Some(super::question::LAND_TEXT),
         }
     }
@@ -2121,6 +2125,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let runs_on = prompt.runs_on();
     let proven = readings_proven(&readings, &ctx.python_allow)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
+        .and_then(|()| home_loads_unwritten(&readings, ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| secrets_unreached_in(&readings, ctx, &|_| false))
@@ -2170,7 +2175,8 @@ fn disk_passed(seg: &[String]) -> bool {
 /// one, no rm circuit breaker, no bypass session, this machine's shell, and no socket or brace
 /// expansion ([`disk_words`]; else [`NotDiskVerb::Fenced`]), under every other proof [`bash`]
 /// holds a read to: no unshown blank or proof gap, the shell startup read and its names clear,
-/// git reads clear, and no secret read by a command other than aterm's (else
+/// no reader loading a place below a home the worker writes ([`home_loads_unwritten`]), git reads
+/// clear, and no secret read by a command other than aterm's (else
 /// [`NotDiskVerb::Unproven`]).
 fn disk_verbs(
     prompt: &PromptV2,
@@ -2182,7 +2188,9 @@ fn disk_verbs(
     blanks_shown(&readings)
         .and_then(|()| proof_gaps_clear(&readings))
         .and_then(|()| environment_unread(&readings))
+        .and_then(|()| env_driven_readers(&readings))
         .and_then(|()| shell_models_hold(&readings, None, ctx))
+        .and_then(|()| home_loads_unwritten(&readings, ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, None, ctx))
         .and_then(|()| secrets_unreached_in(&readings, ctx, &disk_passed))
@@ -2497,13 +2505,15 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
 }
 
 /// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds
-/// no brace expansion, turns on no blank the screen cannot show, holds no proof gap, and prints
-/// no value of the environment ([`environment_unread`]).
+/// no brace expansion, turns on no blank the screen cannot show, holds no proof gap, prints
+/// no value of the environment ([`environment_unread`]), and runs no reader the environment
+/// redirects into a command ([`env_driven_readers`]).
 pub(crate) fn readings_proven(readings: &[String], python_allow: &[String]) -> Result<(), String> {
     read_only_every_reading(readings, python_allow)?;
     blanks_shown(readings)?;
     proof_gaps_clear(readings)?;
-    environment_unread(readings)
+    environment_unread(readings)?;
+    env_driven_readers(readings)
 }
 
 /// The filter jq's `args` give it: its first operand past the options and their values; `None`
@@ -2631,6 +2641,157 @@ fn environment_unread(readings: &[String]) -> Result<(), String> {
                     "{} prints the environment ({name}), whose values may be secrets",
                     program(&seg[run.at])
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The readers the classifier approves that read an input no word of the line names and no
+/// recorded probe reads, which may make them run a command or read another file, each with why
+/// (MEASURED 2026-11-05 on macOS 27.0.1, `docs/measured/classifier-audit-3-fixes-2026-10-29.md`).
+/// A reader whose only such input is one variable of the environment is held by the shell
+/// startup's reading of it instead ([`super::shell_startup::READER_ENV`]).
+const ENV_DRIVEN_READERS: &[(&str, &str)] = &[
+    (
+        "less",
+        "it runs $LESSOPEN and $LESSCLOSE as commands on the file it opens, and a lesskey file \
+         ($LESSKEYIN, ~/.lesskey, $XDG_CONFIG_HOME/lesskey) may set them by its #env (MEASURED, \
+         less 668); read the file with cat or head",
+    ),
+    (
+        "more",
+        "it is less, which runs $LESSOPEN and $LESSCLOSE as commands on the file it opens, and a \
+         lesskey file may set them (MEASURED, less 668); read the file with cat or head",
+    ),
+    (
+        "file",
+        "it reads the magic file $MAGIC names (else ~/.magic.mgc or ~/.magic) and prints a line \
+         of it in a warning (MEASURED: MAGIC=<a file> printed its first line)",
+    ),
+    (
+        "shasum",
+        "it is a Perl script, and perl loads the modules $PERL5OPT and $PERL5LIB name (MEASURED: \
+         PERL5OPT=-M<module> ran it); use sha256sum or md5",
+    ),
+    (
+        "strings",
+        "macOS's is an xcrun shim that runs the strings the developer directory holds, which \
+         $DEVELOPER_DIR names (MEASURED: DEVELOPER_DIR=<dir> ran <dir>/usr/bin/xcrun)",
+    ),
+];
+
+/// `Ok` when no reading runs a reader of [`ENV_DRIVEN_READERS`]: directly, behind a wrapper or
+/// `xargs` ([`runs`]), in a substitution, or as a `find -exec`, `-execdir`, `-ok` or `-okdir`
+/// command. This check reads the worker's environment only through recorded probes (git's
+/// config, the shell's startup), and these readers' inputs lie past them (a lesskey or magic file
+/// on the disk, perl's and xcrun's own variables), so a box that runs one goes to a person.
+///
+/// # Errors
+///
+/// The first reading that runs one, named.
+fn env_driven_readers(readings: &[String]) -> Result<(), String> {
+    for line in readings {
+        let name = reading_name(line);
+        for seg in &command_words(line).map_err(|why| format!("not read-only ({name}): {why}"))? {
+            for p in programs_run(seg) {
+                if let Some((p, why)) = ENV_DRIVEN_READERS.iter().find(|(r, _)| *r == p) {
+                    return Err(format!(
+                        "{p} reads what the environment names ({name}): {why}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The programs segment `seg` runs: its command past any wrapper or `xargs` ([`runs`]), and for
+/// a `find`, each `-exec`, `-execdir`, `-ok` and `-okdir` command.
+fn programs_run(seg: &[String]) -> Vec<&str> {
+    let Ok(Some(run)) = runs(seg) else {
+        return Vec::new();
+    };
+    let head = program(&seg[run.at]);
+    let mut out = vec![head];
+    if head == "find" {
+        out.extend(
+            seg[run.at + 1..]
+                .windows(2)
+                .filter(|w| matches!(w[0].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .map(|w| program(&w[1])),
+        );
+    }
+    out
+}
+
+/// The readers the classifier approves that load code from a place below the home on their own,
+/// each with those places (relative to the home) and what they load: jq sources `~/.jq` when it
+/// is a file (MEASURED 2026-11-05 with jq-1.7.1-apple: a `~/.jq` of `def keys: env;` made
+/// `jq -c keys x.json` print the whole environment), and python imports a `usercustomize` and
+/// runs the `.pth` lines of its user site, `~/Library/Python/<version>/lib/python/site-packages`
+/// in a macOS framework build (MEASURED the same day: python 3.9.6's ran a planted
+/// `usercustomize.py`), `~/.local/lib/python<version>/site-packages` elsewhere, and
+/// `%APPDATA%\Python` on Windows, below the home where `APPDATA` keeps its default (REASONED from
+/// `site`'s documentation). A `HOME` Claude Code's settings give the Bash tool other than the
+/// worker's fails the shell startup's reading whole (`shell_startup::read`).
+const HOME_LOADED: &[(&[&str], &[&str], &str)] = &[
+    (
+        &["jq"],
+        &[".jq"],
+        "sources ~/.jq, whose definitions may print the environment",
+    ),
+    (
+        &["python", "python2", "python3"],
+        &["Library/Python", ".local", "AppData/Roaming/Python"],
+        "runs the usercustomize and .pth lines of its user site below the home",
+    ),
+];
+
+/// `Ok` when no reading runs a [`HOME_LOADED`] reader ([`programs_run`]) one of whose places below
+/// the home (the worker's `HOME`, else the session's) the worker may write without approval
+/// ([`WorkerWrites`]): a place it writes holds that place, or the session's cwd or a Bash tool's
+/// stand lies below it. A relative home, or none known, is taken as written. Paths are compared as
+/// written (Claude Code records its cwd and the Bash tool's as the kernel resolves them), and a
+/// scratch root counts where it holds a place, not where it lies below one.
+///
+/// # Errors
+///
+/// The first reading that runs one, named.
+fn home_loads_unwritten(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String> {
+    let writes = WorkerWrites::of(ctx);
+    let bases = ctx.shell_dirs();
+    let worker_home = ctx.worker.as_ref().map(|w| w.var("HOME"));
+    let homes: Vec<&Path> = match worker_home {
+        Ok(Some(h)) if !h.is_empty() => vec![Path::new(h)],
+        Ok(_) => ctx.home.as_deref().into_iter().collect(),
+        Err(_) => Vec::new(),
+    };
+    let written = |place: &Path| {
+        writes.holds(place, &|p| p.to_path_buf()) || bases.iter().any(|b| b.starts_with(place))
+    };
+    for line in readings {
+        let name = reading_name(line);
+        for seg in &command_words(line).map_err(|why| format!("not read-only ({name}): {why}"))? {
+            for p in programs_run(seg) {
+                let Some((_, places, what)) = HOME_LOADED.iter().find(|(r, _, _)| r.contains(&p))
+                else {
+                    continue;
+                };
+                let unplaced = homes.is_empty() || homes.iter().any(|h| !h.is_absolute());
+                let held = homes
+                    .iter()
+                    .flat_map(|h| places.iter().map(move |rel| h.join(rel)))
+                    .find(|place| written(place));
+                if unplaced || held.is_some() {
+                    let place = held.map_or_else(
+                        || "a home this check cannot place".to_string(),
+                        |place| place.display().to_string(),
+                    );
+                    return Err(format!(
+                        "{p} {what} ({name}), and the worker may write {place} without approval"
+                    ));
+                }
             }
         }
     }
@@ -2776,6 +2937,7 @@ fn breaker_read_only(
     let runs_on = prompt.runs_on();
     let proven = readings_proven(&readings, &ctx.python_allow)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
+        .and_then(|()| home_loads_unwritten(&readings, ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| secrets_unreached_in(&readings, ctx, &|_| false));
@@ -3502,13 +3664,17 @@ enum Start<'a> {
 impl Start<'_> {
     /// Its [`Bases`] before the line moves.
     fn bases(self) -> Bases {
+        let placed = || Floating {
+            rel: String::new(),
+            cdpath: false,
+        };
         let (dirs, floating, lost) = match self {
             Self::Known(dirs) => (
                 dirs.iter()
                     .map(|d| d.to_string_lossy().into_owned())
                     .collect(),
                 if dirs.iter().any(|d| d == Path::new("/")) {
-                    vec![String::new()]
+                    vec![placed()]
                 } else {
                     Vec::new()
                 },
@@ -3519,7 +3685,7 @@ impl Start<'_> {
                 Vec::new(),
                 Some("with the session's cwd unknown (meta cwd=-)".to_string()),
             ),
-            Self::Unplaced => (Vec::new(), vec![String::new()], None),
+            Self::Unplaced => (Vec::new(), vec![placed()], None),
         };
         Bases {
             dirs,
@@ -3644,8 +3810,15 @@ fn secrets_unreached(
             .map_err(not_read)?;
         let segments = command_words(line).map_err(not_read)?;
         let bases = line_bases(&segments, start, home);
+        let targets = cd_targets(&segments);
         for op in &operands {
-            let reach = windows_reach(op, home, &bases, true, windows);
+            let mut reach = windows_reach(op, home, &bases, true, windows);
+            // A `cd` target is the directory it moves to, not a read below one a `CDPATH` placed;
+            // a word the line also reads otherwise keeps the doubt.
+            let as_target = targets.iter().filter(|t| **t == op.as_str()).count();
+            if as_target >= operands.iter().filter(|o| *o == op).count() {
+                reach.cdpath = None;
+            }
             let dot = if theirs.contains(op) {
                 LeadingDot::Any
             } else {
@@ -4069,17 +4242,43 @@ fn names_only(opts: &[&str]) -> bool {
     })
 }
 
+/// The target of each `cd` and `pushd` the line's `segments` run ([`cd_operand`]).
+fn cd_targets(segments: &[Vec<String>]) -> Vec<&str> {
+    segments
+        .iter()
+        .filter_map(|seg| {
+            let run = runs(seg).ok()??;
+            matches!(program(&seg[run.at]), "cd" | "pushd")
+                .then(|| cd_operand(&seg[run.at + 1..]).ok().flatten())
+                .flatten()
+        })
+        .collect()
+}
+
+/// A directory a line's commands may run in that this check cannot place, as a path from it
+/// (`""` for that directory itself), and whether a `CDPATH` lookup may have placed it.
+#[derive(Clone)]
+struct Floating {
+    /// The path from the directory this check cannot place.
+    rel: String,
+    /// Whether a `cd` target `CDPATH` (zsh's `cdpath`) may have placed this directory, so the
+    /// directory itself may lie inside a secret (the worker's environment or a `.zshenv` may set
+    /// `CDPATH`, which this check does not read). A read below it is then unproven
+    /// ([`operand_reach`]), over the lexical and alias hits [`secret_led`] still catches.
+    cdpath: bool,
+}
+
 /// The directories a line's commands may run in, as written, and the first move after which
 /// a relative path may name any file ([`Start::Unknown`]'s, or a move this check cannot follow).
 struct Bases {
     dirs: Vec<String>,
-    /// Directories named from one this check cannot place, each as a path from it (`""` for that
-    /// directory itself): the advisory word's start ([`Start::Unplaced`]), and a `cd` or `pushd`
-    /// target bash and zsh may look up in a `CDPATH` (zsh's `cdpath`), which the worker's
-    /// environment or a `.zshenv` may set ([`cdpath_searched`]), with every relative move after
-    /// either. That directory is taken to lie outside every secret: a read below it is held to
-    /// the rules by [`secret_led`].
-    floating: Vec<String>,
+    /// Directories named from one this check cannot place ([`Floating`]): the advisory word's
+    /// start ([`Start::Unplaced`]), and a `cd` or `pushd` target bash and zsh may look up in a
+    /// `CDPATH` (zsh's `cdpath`), which the worker's environment or a `.zshenv` may set
+    /// ([`cdpath_searched`]), with every relative move after either. A non-`CDPATH` floating
+    /// directory is taken to lie outside every secret: a read below it is held to the rules by
+    /// [`secret_led`]. A `CDPATH` one may lie inside a secret, so a read below it is unproven.
+    floating: Vec<Floating>,
     lost: Option<String>,
 }
 
@@ -4139,12 +4338,22 @@ fn line_bases(segments: &[Vec<String>], start: Start<'_>, home: Option<&Path>) -
                 && !rooted(t)
                 && !t.starts_with('~')
             {
-                let looked_up = (cd && cdpath_searched(t)).then(|| t.to_string());
-                let floated: Vec<String> = b.floating.iter().map(|f| joined(f, t)).collect();
+                let looked_up = (cd && cdpath_searched(t)).then(|| Floating {
+                    rel: t.to_string(),
+                    cdpath: true,
+                });
+                let floated: Vec<Floating> = b
+                    .floating
+                    .iter()
+                    .map(|f| Floating {
+                        rel: joined(&f.rel, t),
+                        cdpath: f.cdpath,
+                    })
+                    .collect();
                 b.floating.extend(floated.into_iter().chain(looked_up));
             }
             distinct(&mut b.dirs);
-            distinct(&mut b.floating);
+            distinct_floating(&mut b.floating);
             if b.dirs.len() + b.floating.len() > STANDS_MAX {
                 b.lost.get_or_insert(format!(
                     "on a line whose commands may stand in more than {STANDS_MAX} directories"
@@ -4165,6 +4374,20 @@ fn distinct(v: &mut Vec<String>) {
     let mut k = 0;
     while k < v.len() {
         if v[..k].contains(&v[k]) {
+            v.remove(k);
+        } else {
+            k += 1;
+        }
+    }
+}
+
+/// `v` without the repeats of a floating directory it holds, in order, each kept `cdpath` when
+/// any spelling of it was (the stricter reading).
+fn distinct_floating(v: &mut Vec<Floating>) {
+    let mut k = 0;
+    while k < v.len() {
+        if let Some(j) = v[..k].iter().position(|f| f.rel == v[k].rel) {
+            v[j].cdpath |= v[k].cdpath;
             v.remove(k);
         } else {
             k += 1;
@@ -4212,7 +4435,7 @@ fn git_dirs(seg: &[String], at: usize) -> Vec<Result<&str, ()>> {
 }
 
 /// Whether `t` names a path from the root: `/…`, `\…`, or a drive path (`C:\…`, `C:/…`).
-fn rooted(t: &str) -> bool {
+pub(super) fn rooted(t: &str) -> bool {
     let b = t.as_bytes();
     t.starts_with(['/', '\\'])
         || (b.len() > 2
@@ -4262,6 +4485,10 @@ struct Reach {
     tails: Vec<Vec<String>>,
     /// Why it may name another file this check cannot see.
     unsure: Option<String>,
+    /// Set when a relative read is below a `CDPATH` floating directory ([`Floating::cdpath`]),
+    /// which may itself lie inside a secret: the last-resort doubt, under any `unsure` or
+    /// [`handle_read`] that names a more specific reason.
+    cdpath: Option<String>,
 }
 
 impl Reach {
@@ -4283,10 +4510,12 @@ impl Reach {
     }
 
     /// Why it may name a file no rule sees: its `unsure`, else a read by a handle
-    /// ([`handle_read`]) among its components or its tails.
+    /// ([`handle_read`]) among its components or its tails, else a read below a `CDPATH`
+    /// floating directory ([`Self::cdpath`]).
     fn doubt(self) -> Option<String> {
         self.unsure
             .or_else(|| handle_read(self.comps.iter().chain(&self.tails)))
+            .or(self.cdpath)
     }
 }
 
@@ -4302,6 +4531,7 @@ fn operand_reach(op: &str, home: Option<&Path>, bases: &Bases, literal: bool) ->
         comps,
         tails: Vec::new(),
         unsure,
+        cdpath: None,
     };
     // A `~` (a user's home) or an expansion leading the word names the home or a place the
     // environment sets; with no home known, the home's own rules are not in the list to hold it
@@ -4361,11 +4591,20 @@ fn operand_reach(op: &str, home: Option<&Path>, bases: &Bases, literal: bool) ->
     let tails: Vec<Vec<String>> = bases
         .floating
         .iter()
-        .flat_map(|f| lexical_tails(&joined(f, rel)))
+        .flat_map(|f| lexical_tails(&joined(&f.rel, rel)))
         .collect();
     // A directory it cannot place may be the root: a tail an alias of the root leads is also
     // read from there.
     comps.extend(tails.iter().flat_map(|t| below_aliases(t)));
+    // A `cd` target a `CDPATH` may look up lands in a directory this check cannot see, which may
+    // itself lie inside a secret: a relative read below it is unproven, over the lexical and
+    // alias hits caught above. `cd ./sub` and `cd ../sub` are not `CDPATH`-searched and still
+    // read where they stand.
+    let cdpath = bases.floating.iter().any(|f| f.cdpath).then(|| {
+        "a read below a `cd` target a CDPATH (zsh's `cdpath`, which the worker's environment or a \
+         .zshenv may set) may place inside a secret directory this check cannot see"
+            .to_string()
+    });
     let unsure = bases
         .lost
         .as_ref()
@@ -4374,6 +4613,7 @@ fn operand_reach(op: &str, home: Option<&Path>, bases: &Bases, literal: bool) ->
         comps,
         tails,
         unsure,
+        cdpath,
     }
 }
 
@@ -4444,6 +4684,7 @@ fn windows_reach(
                  root"
                     .into(),
             ),
+            cdpath: None,
         };
     }
     let mut reach = match op.get(2..).filter(|_| drive_led(op) && !rooted(op)) {

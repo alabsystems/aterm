@@ -258,3 +258,56 @@ fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
         "the person's Take Over took the tab"
     );
 }
+
+/// A DRIVE'S REQUESTER IS HELD APART FROM ITS PROVEN DRIVER, for exactly as long as its guard:
+/// the node stays the one the handshake proved whoever the requester claims to be, a nested drive
+/// gives back the outer one's requester, and none is served once the last guard drops.
+/// NEGATIVE CONTROL: a drive entered without a requester line's claim names nobody.
+#[test]
+fn a_drives_requester_is_kept_apart_from_its_driver_for_the_guard() {
+    let driver = mac(7, "m7.local");
+    let asked = Requester::of(
+        Some("s-0123456789abcdef0123"),
+        Some("claude"),
+        Some("Opus 5.5"),
+        Some("team"),
+    );
+    assert_eq!(serving_requester(), None);
+    {
+        let _driving = DrivingAs::requested(driver.clone(), asked.clone());
+        assert_eq!(serving_driver(), Some(driver.clone()));
+        assert_eq!(serving_requester(), Some(asked.clone()));
+        {
+            let _inner = DrivingAs::enter(mac(8, "m8.local"));
+            assert_eq!(serving_requester(), Some(Requester::default()), "CONTROL");
+        }
+        assert_eq!(serving_driver(), Some(driver));
+        assert_eq!(serving_requester(), Some(asked));
+    }
+    assert_eq!(serving_driver(), None);
+    assert_eq!(serving_requester(), None);
+}
+
+/// A REQUESTER'S SID SHAPE IS THE ONE ATERM MINTS: `aterm_types`' copy of the check answers as
+/// `aterm_session::is_minted_sid` does, for a minted id and for each near miss.
+#[test]
+fn requester_sid_shape_matches_minted_sid() {
+    let minted = SessionId::generate();
+    let mut cases = vec![minted.as_str().to_owned()];
+    for (at, swap) in [(0, 'S'), (1, '_'), (2, 'A'), (21, 'g'), (5, 'f'), (9, '0')] {
+        let mut chars: Vec<char> = minted.as_str().chars().collect();
+        chars[at] = swap;
+        cases.push(chars.into_iter().collect());
+    }
+    cases.push(minted.as_str()[..21].to_owned());
+    cases.push(format!("{}0", minted.as_str()));
+    cases.extend(["", "s-", "s-7725", "worker"].map(str::to_owned));
+    for case in &cases {
+        assert_eq!(
+            aterm_types::control_verbs::is_minted_sid(case),
+            aterm_session::is_minted_sid(case),
+            "{case:?}"
+        );
+    }
+    assert!(aterm_types::control_verbs::is_minted_sid(minted.as_str()));
+}

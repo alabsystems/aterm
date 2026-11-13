@@ -10,25 +10,53 @@
 //! Every area is read by the reader its own verb uses (`aterm members status`, `aterm secrets
 //! status`, `aterm fleet sync`'s read-only check, `aterm pkg doctor`'s toolset row, the setup
 //! snapshot System State reads, the Command Line Tools presence check the shims share, and
-//! `aterm ai status`'s look), from local files alone: no dial, no prompt, no write. Each reader
+//! `aterm ai status`'s look), from local files, and for the setup's Mac settings from the running
+//! aterm's own answer over its local control socket (`setup status`, as `aterm init --check`
+//! reads it): no network dial, no prompt, no write. A setup record says what its run did, never
+//! that a setting is in place now, so the setup area is `ok` only on that answer. Each reader
 //! runs on a thread of its own and an area not read within [`READ_WITHIN`] says so. The output
 //! passes through [`scrub`], so no email address reaches it, and no secret value is ever read.
+//!
+//! On Windows (`machine_status_windows.rs`) the read is this build and where it runs from, the
+//! tools, git, the AI CLIs, the disk and the aterm instances here; each area whose subsystem is
+//! Unix-only (setup, membership, vault, fleet, name) is one `off` line that says so.
 
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use aterm_agent::FleetCheck;
+#[cfg(unix)]
 use aterm_agent::members_cli::Standing;
 use aterm_converge::{ItemReport, Outcome, Remedy};
-use aterm_machines::init::OwedClone;
+#[cfg(unix)]
+use aterm_machines::init::{OwedClone, WorkstationObservation};
+#[cfg(unix)]
 use aterm_secrets::alab_join::JoinPlace;
+#[cfg(unix)]
+use aterm_types::macos_setup::{Selection, Setting};
+
+#[cfg(windows)]
+#[path = "machine_status_windows.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::read_areas;
 
 /// The longest `aterm status` waits for any one area's reader.
 const READ_WITHIN: Duration = Duration::from_secs(3);
 
+#[cfg(windows)]
+const USAGE: &str = "aterm status [--json]: this machine at a glance — this aterm, its tools, git, \
+agents, disk and running instances, and one line for each area not available on Windows yet \
+(setup, membership, vault, fleet, name) — each with its state (ok | working | due | off | \
+unknown), its next step and who takes it (aterm | agent | person). It reads local state only \
+and changes nothing; `aterm help status` explains each area.";
+
+#[cfg(unix)]
 const USAGE: &str = "aterm status [--json]: this machine at a glance — setup (macOS), membership, \
 vault, fleet, name, tools, repos and agents — each with its state (ok | working | due | off | \
 unknown), its next step and who takes it (aterm | agent | person). It reads local state only \
@@ -146,6 +174,7 @@ impl Area {
 
 /// One System State stage row: its name, `pending | running | waiting | applied | stopped`, and
 /// its words.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StageRow {
     pub(crate) name: String,
@@ -154,6 +183,7 @@ pub(crate) struct StageRow {
 }
 
 /// The first-launch setup, as System State reads it.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
@@ -182,9 +212,19 @@ pub(crate) enum Setup {
         cancelled: bool,
         /// The stages its plan selects.
         stages: Vec<StageRow>,
+        /// What its plan selects.
+        plan: Selection,
+        /// What the running aterm's setup answers now (`setup status`) of the rows `plan`
+        /// selects that this area judges ([`judged`]), read as `aterm init --check` reads it;
+        /// `None` where it did not answer within [`READ_WITHIN`].
+        current: Option<WorkstationObservation>,
+        /// This Mac's clock (Unix seconds) as `current` was answered, against which its
+        /// reading's age is told; `None` where no clock was read.
+        clock: Option<u64>,
     },
 }
 
+#[cfg(unix)]
 impl Setup {
     fn stage(&self, name: &str) -> Option<&StageRow> {
         match self {
@@ -209,6 +249,7 @@ impl Setup {
 }
 
 /// The vault subscriber that keeps this machine following the vault.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Follows {
     Runs,
@@ -219,6 +260,7 @@ pub(crate) enum Follows {
 }
 
 /// The secrets vault, as `aterm secrets status` reads it: names only.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Vault {
     Unread(String),
@@ -246,6 +288,13 @@ pub(crate) enum Vault {
 
 /// Apple's Command Line Tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "Windows has no Command Line Tools: its read builds `NotHere` alone"
+    )
+)]
 pub(crate) enum Clt {
     NotHere,
     Present,
@@ -279,6 +328,7 @@ pub(crate) struct Agents {
 // Judging each area.
 
 /// The first-launch setup's area; `None` off macOS.
+#[cfg(unix)]
 pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
     const NAME: &str = "setup";
     Some(match setup {
@@ -308,6 +358,9 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
         Setup::Read {
             finished: true,
             stages,
+            plan,
+            current,
+            clock,
             ..
         } => {
             let stopped: Vec<&str> = stages
@@ -335,9 +388,11 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                     })
                     .collect();
                 if unfinished.is_empty() {
-                    Area::ok(
-                        NAME,
-                        format!("selected setup completed ({} steps)", stages.len()),
+                    nothing_left(
+                        &format!("its run reached its end ({} steps)", stages.len()),
+                        *plan,
+                        current.as_ref(),
+                        *clock,
                     )
                 } else {
                     use std::fmt::Write as _;
@@ -368,53 +423,146 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                 }
             }
         }
-        Setup::Read { stages, .. } => {
-            let held: Vec<&str> = stages
+        Setup::Read {
+            stages,
+            plan,
+            current,
+            clock,
+            ..
+        } => {
+            // A stage aterm parked after it stopped there waits out its pause and runs again by
+            // itself: still to finish, with nobody needed.
+            let open: Vec<&str> = stages
                 .iter()
-                .filter(|stage| {
-                    stage
-                        .detail
-                        .ends_with(aterm_types::macos_setup::StageRow::HELD_TAIL)
-                })
+                .filter(|stage| matches!(stage.status.as_str(), "pending" | "running" | "waiting"))
                 .map(|stage| stage.name.as_str())
                 .collect();
-            if !held.is_empty() {
-                Area::due(
-                    NAME,
-                    format!("held after aterm stopped twice in: {}", held.join(", ")),
-                    Who::Person,
-                    "press Check again in System State",
-                )
-            } else {
-                let open: Vec<&str> = stages
+            if open.is_empty() {
+                let done = stages
                     .iter()
                     .filter(|stage| {
-                        matches!(stage.status.as_str(), "pending" | "running" | "waiting")
+                        matches!(
+                            stage.status.as_str(),
+                            "ok" | "done" | "applied" | "not-applicable"
+                        )
                     })
-                    .map(|stage| stage.name.as_str())
-                    .collect();
-                if open.is_empty() {
-                    Area::ok(NAME, "nothing left to run")
-                } else {
-                    Area::working(
-                        NAME,
-                        format!("still to finish: {}", open.join(", ")),
-                        "aterm runs each step by itself",
-                    )
-                }
+                    .count();
+                nothing_left(
+                    &format!(
+                        "no step left to run, though its run is not marked finished ({done} of \
+                         {} steps recorded done)",
+                        stages.len()
+                    ),
+                    *plan,
+                    current.as_ref(),
+                    *clock,
+                )
+            } else {
+                Area::working(
+                    NAME,
+                    format!("still to finish: {}", open.join(", ")),
+                    "aterm runs each step by itself",
+                )
             }
         }
     })
 }
 
+/// The setup area once its record leaves no step to run (`record`, what that record holds): a
+/// record says what its run did, never that a setting is in place now, so the area is `ok` only
+/// where the running aterm's own reading (`current`, answered at `clock` of the rows it judges,
+/// [`judged`]) has read back as wanted every row `plan` selects that it reads privately (the Mac
+/// settings and Rust in Spotlight, [`Selection::private`]) and reads each selected grant as
+/// wanted or on offer, or where `plan` selects none of them and no Permissions (its vault and
+/// repositories have areas of their own, read now). A reading that still stands
+/// ([`aterm_types::macos_setup::Read::current_at`]) is told as of its age; one past its standing
+/// is told as set up when last read, with that age and who reads them again, never as in place
+/// now (design §3.5): nothing reads such a row without a person there, so a finished Mac nobody
+/// watches is not left unknown for it. A grant reading has no age to tell, so it is said as last
+/// read, never as now, and a grant on offer is named as offered, never as granted. Anything
+/// short of a read-back is `unknown`, in its words: no answer, rows nothing has read (or read
+/// at a time this Mac's clock cannot date), and one that waits or names a step only a person
+/// takes. Once a run has no step left, no pass of it runs, so its wait is nothing aterm is on;
+/// and a grant on offer is offered, never waited on (the owner's 2026-11-02 ruling), so it is no
+/// person's step either.
+#[cfg(unix)]
+fn nothing_left(
+    record: &str,
+    plan: Selection,
+    current: Option<&WorkstationObservation>,
+    clock: Option<u64>,
+) -> Area {
+    const NAME: &str = "setup";
+    if plan.private().is_empty() && !plan.contains(Setting::Permissions) {
+        return Area::ok(
+            NAME,
+            format!("{record}; it sets nothing here that the vault and repos areas do not read"),
+        );
+    }
+    // A completion that has not read back every judged row is a wait, and the rows it does not
+    // judge say nothing of it ([`WorkstationObservation::for_scope`]).
+    let current = current.cloned().map(|seen| seen.for_scope(judged(plan)));
+    let why = match current {
+        // No private row asked about: the grants read as wanted when it last read them.
+        Some(WorkstationObservation::Complete(read_back)) if read_back.read_at.is_none() => {
+            let offered = read_back.said("", clock);
+            return Area::ok(
+                NAME,
+                if offered.is_empty() {
+                    format!("{record}; the running aterm last read each selected grant as wanted")
+                } else {
+                    format!(
+                        "{record}; aterm is set up as the running aterm last read it: {offered}"
+                    )
+                },
+            );
+        }
+        Some(WorkstationObservation::Complete(read_back)) if read_back.dated_at(clock) => {
+            return Area::ok(
+                NAME,
+                format!(
+                    "{record}; {}",
+                    read_back.said("each selected setting", clock)
+                ),
+            );
+        }
+        // Dated after this Mac's clock: no age to tell, so no reading of any time it can name.
+        Some(WorkstationObservation::Complete(read_back)) => {
+            read_back.said("each selected setting", clock)
+        }
+        // Unread is no failure and no wait: nothing read these rows here.
+        Some(WorkstationObservation::Unread { rows, .. }) => format!("not read yet: {rows}"),
+        Some(
+            WorkstationObservation::Waiting(why)
+            | WorkstationObservation::Permission(why)
+            | WorkstationObservation::Unavailable(why),
+        ) => why,
+        None => format!(
+            "the running aterm did not answer within {} s",
+            READ_WITHIN.as_secs()
+        ),
+    };
+    Area::of(
+        NAME,
+        Level::Unknown,
+        format!("{record}; the running aterm has not read back each selected setting ({why})"),
+        Some((
+            Who::Agent,
+            "System State, or `aterm init --check` at this Mac's console, reads them".into(),
+        )),
+    )
+}
+
 /// The step of a Mac a rotation dropped ([`Vault::Dropped`], [`Standing::Dropped`]); both areas
 /// carry it, since each is read on its own and either may be late. No admin's approve and no
 /// person's Allow brings that key back, so it comes back as a new Mac.
+#[cfg(unix)]
 const DROPPED_STEP: &str = "set the vault folder named here aside (rename it; nothing is \
                             deleted), then join its vault again as a new Mac (`aterm members \
                             join` for ALab)";
 
 /// The ALab membership area: `aterm members status`'s standing.
+#[cfg(unix)]
 pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
     const NAME: &str = "membership";
     let says = standing.line();
@@ -467,6 +615,7 @@ pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
 }
 
 /// The secrets vault area.
+#[cfg(unix)]
 pub(crate) fn vault_area(vault: &Vault, setup: &Setup) -> Area {
     const NAME: &str = "vault";
     match vault {
@@ -552,6 +701,7 @@ pub(crate) fn vault_area(vault: &Vault, setup: &Setup) -> Area {
 
 /// The fleet area: the read-only check of what a sync would do, and this Mac's own presence row
 /// (`own`, [`aterm_agent::fleet_view::own_line`]; one-mesh §4.16).
+#[cfg(unix)]
 pub(crate) fn fleet_area(check: &Result<FleetCheck, String>, own: &str) -> Area {
     const NAME: &str = "fleet";
     match check {
@@ -582,6 +732,7 @@ pub(crate) fn fleet_area(check: &Result<FleetCheck, String>, own: &str) -> Area 
 /// The name area: the one name this Mac goes by (`sync.identity`'s: the person's `[identity]
 /// name`, else the swarm `m<N>` label the vault's roster gave it), its fleet name against it, and
 /// whether the Mac's own names (Computer Name, Local hostname) say it yet.
+#[cfg(unix)]
 pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area {
     use crate::converge::{MacName, MacNamePending};
     use aterm_agent::FleetName;
@@ -749,6 +900,7 @@ pub(crate) fn tools_area(clt: Clt, toolset: &Result<Option<ItemReport>, String>)
 /// The repositories area: the setup's GitHub repositories step and what it waits on, or, where
 /// no setup clones them (off macOS, or before aterm.app's first launch), the clone `aterm init`
 /// owes (`owed`, as `sync.clone` reads it).
+#[cfg(unix)]
 pub(crate) fn repos_area(
     setup: &Setup,
     git: bool,
@@ -784,17 +936,6 @@ pub(crate) fn repos_area(
                 "applied" => owed_area(owed, token),
                 "stopped" => Area::off(NAME, "a Stop ended the setup before it cloned them"),
                 "running" => Area::working(NAME, "cloning", "the setup clones them"),
-                _ if stage
-                    .detail
-                    .ends_with(aterm_types::macos_setup::StageRow::HELD_TAIL) =>
-                {
-                    Area::due(
-                        NAME,
-                        stage.detail.clone(),
-                        Who::Person,
-                        "press Check again in System State",
-                    )
-                }
                 _ => Area::working(
                     NAME,
                     waits().unwrap_or("to be cloned"),
@@ -808,6 +949,7 @@ pub(crate) fn repos_area(
 /// The repositories where no setup clones them: what `aterm init`'s owed clone says. With none
 /// owed, `aterm init` either cloned what it found or has not run. Neither the absence of
 /// debt nor a token proves repositories are present: ask init to reconcile the inventory.
+#[cfg(unix)]
 fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
     const NAME: &str = "repos";
     match owed {
@@ -861,7 +1003,13 @@ fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
 
 /// The agents area: the AI CLIs someone asked for. One nobody asked for, signed out, is a note
 /// on demand and never a step.
+#[cfg(unix)]
 pub(crate) fn agents_area(agents: &Agents) -> Area {
+    agents_area_at(agents, "this Mac")
+}
+
+/// [`agents_area`] where a person signs in at `place` (`this Mac`; `this PC` on Windows).
+pub(crate) fn agents_area_at(agents: &Agents, place: &str) -> Area {
     use std::fmt::Write as _;
     const NAME: &str = "agents";
     let mut says = String::new();
@@ -894,7 +1042,7 @@ pub(crate) fn agents_area(agents: &Agents) -> Area {
             says,
             Who::Person,
             format!(
-                "sign {} in once at this Mac ({})",
+                "sign {} in once at {place} ({})",
                 agents.by_person.join(", "),
                 agents.person_steps.join("; ")
             ),
@@ -1070,6 +1218,9 @@ fn read_setup() -> Setup {
                 finished: snapshot.finished,
                 cancelled: snapshot.cancelled,
                 stages,
+                plan: snapshot.plan.selection,
+                current: None,
+                clock: None,
             }
         }
         Err(InitialSetupSnapshotError::Updating) => Setup::Changing,
@@ -1078,13 +1229,43 @@ fn read_setup() -> Setup {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn read_setup() -> Setup {
     Setup::NotHere
 }
 
+/// The running aterm's `setup status` answer as asked, judged once the record names its plan
+/// ([`judged`]).
+#[cfg(unix)]
+type Answer = Box<dyn Fn(Selection) -> WorkstationObservation + Send>;
+
+/// What the running aterm's setup answers now, as `aterm init --check` reads it: a question to
+/// its local control socket, which starts nothing and asks for nothing. Asked beside the record's
+/// read, and judged once that record names its plan ([`judged`]).
+#[cfg(target_os = "macos")]
+fn read_current_setup() -> Answer {
+    let answer = aterm_cli::macos_doctor::ask_background_setup();
+    Box::new(move |judged| answer.observation(judged))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_current_setup() -> Answer {
+    Box::new(|_| WorkstationObservation::Unavailable("no first-launch setup off macOS".into()))
+}
+
+/// The rows of `plan` the setup area judges by the running aterm's answer: the ones it reads
+/// privately ([`Selection::private`]), and its grants where `plan` selects the Permissions rows.
+/// Its vault and repositories have areas of their own, read now.
+#[cfg(unix)]
+fn judged(plan: Selection) -> Selection {
+    let mut judged = plan.private();
+    judged.set(Setting::Permissions, plan.contains(Setting::Permissions));
+    judged
+}
+
 /// `aterm secrets status`'s read as a [`Vault`]: a Mac its vault let go is [`Vault::Dropped`]
 /// where no act it can read took it out (`client::dropped_words`), [`Vault::Revoked`] otherwise.
+#[cfg(unix)]
 fn read_vault(paths: &aterm_secrets::client::Paths) -> Vault {
     use aterm_secrets::client::{self, Membership};
     let status = match client::status(paths) {
@@ -1106,6 +1287,7 @@ fn read_vault(paths: &aterm_secrets::client::Paths) -> Vault {
     }
 }
 
+#[cfg(unix)]
 fn read_follows(home: &Path) -> Follows {
     use aterm_secrets::service::{self, Job, State};
     match service::state(home, Job::Subscriber) {
@@ -1116,6 +1298,7 @@ fn read_follows(home: &Path) -> Follows {
     }
 }
 
+#[cfg(unix)]
 fn read_clt() -> Clt {
     if !cfg!(target_os = "macos") {
         Clt::NotHere
@@ -1157,6 +1340,7 @@ fn read_agents() -> Agents {
 }
 
 /// Every area, each read on its own thread under one [`READ_WITHIN`] bound.
+#[cfg(unix)]
 fn read_areas() -> Vec<Area> {
     let deadline = Instant::now() + READ_WITHIN;
     let late = |name: &'static str, reader: &str| {
@@ -1171,6 +1355,7 @@ fn read_areas() -> Vec<Area> {
     };
     let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string());
     let setup = bounded(read_setup);
+    let current = bounded(read_current_setup);
     let standing = {
         let paths = paths.clone();
         bounded(move || paths.map(|paths| Standing::live(&paths)))
@@ -1215,7 +1400,17 @@ fn read_areas() -> Vec<Area> {
         )
     });
 
-    let setup = setup(deadline);
+    let mut setup = setup(deadline);
+    if let Some(Setup::Read {
+        current: slot,
+        clock,
+        plan,
+        ..
+    }) = setup.as_mut()
+    {
+        *slot = current(deadline).map(|answer| answer(judged(*plan)));
+        *clock = aterm_time::unix_secs();
+    }
     let mut areas = Vec::with_capacity(9);
     let setup = match setup {
         Some(setup) => {
@@ -1304,6 +1499,6 @@ pub(crate) fn main_entry(args: &[OsString]) -> ExitCode {
     aterm_uds::stdout::answer_exit("aterm status", &text, 0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "machine_status_tests.rs"]
 mod tests;

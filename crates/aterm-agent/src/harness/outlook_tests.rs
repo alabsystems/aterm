@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the accounts outlook ([`super::outlook`]): the appendix scenarios of
-//! `docs/DESIGN-accounts-outlook-2026-10-25.md`, all synthetic, at a fixed `now`.
+//! `docs/DESIGN-harness-glass-rainbow-2026-11-05.md`, all synthetic, at a fixed `now`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,6 +12,7 @@ use crate::harness::accounts::{Class, Mode, State};
 pub(crate) use crate::harness::quota_scenes::{
     D, Fx, H, MACHINE, MIN, NOW, SAT7, SAT14, T5, case_b, utc,
 };
+use crate::harness::quota_view::Role;
 
 /// Thu 29 Oct 09:00: `me`'s week resets.
 const THU9: i64 = NOW + 307_800;
@@ -459,14 +460,6 @@ fn quota_clock_admission_survives_the_codec_without_current_claims() {
             assert_eq!(week.used_x10, None);
             assert_eq!(week.projection, None);
             assert_eq!(out.demand.week, Err(Refusal::Skew));
-            for width in [44, 60] {
-                let cards = out.card_rows("me", None, true, width, None);
-                assert!(
-                    cards
-                        .iter()
-                        .any(|row| matches!(row, CardRow::Account { label, .. } if label == "me"))
-                );
-            }
         }
         assert_eq!(fx.state, before);
     }
@@ -509,17 +502,6 @@ fn access_classes_cannot_admit_a_rejected_quota_clock() {
         );
         assert_eq!((week.at, week.reset), (Some(NOW + 120), Some(THU9)));
         assert_eq!(week.used_x10, None);
-        for room in [60, 30] {
-            let item = out
-                .card_rows("me", None, true, room, None)
-                .into_iter()
-                .find_map(|r| match r {
-                    CardRow::Account { label, text, .. } if label == "me" => Some(text),
-                    _ => None,
-                })
-                .expect("me's item");
-            assert!(!item.contains(RESET_MARK), "{room}: {item}");
-        }
         let five = row.window(Window::Five).unwrap();
         let mut without_source = five.clone();
         without_source.at = None;
@@ -1374,7 +1356,7 @@ fn a_custody_refused_pin_holds_only_while_the_active_account_runs() {
 }
 
 #[test]
-fn unavailable_pool_cards_keep_the_reason_and_observed_rows() {
+fn an_unavailable_pool_keeps_its_reason_and_projects_nothing() {
     let mut fx = scenario_b();
     for label in ["me", "alt1"] {
         accounts::note_auth(&mut fx.state, label, accounts::Auth::SignedOut, NOW);
@@ -1388,27 +1370,14 @@ fn unavailable_pool_cards_keep_the_reason_and_observed_rows() {
         let json = out.json();
         assert_eq!(json["verdict"]["why"].as_str(), Some(why.word()));
         assert!(json["passes"].as_array().unwrap().is_empty());
-        assert!(!projects(&out.card_rows("me", None, true, 60, None)));
         assert!(
             out.rows
                 .iter()
                 .flat_map(|row| &row.windows)
                 .all(|window| window.projection.is_none())
         );
-        for room in [60, 44, 30] {
-            let rows = out.card_rows("me", None, true, room, None);
-            assert!(rows.iter().all(|row| row.width() <= room));
-            assert!(matches!(rows[0], CardRow::Note { .. }));
-            assert!(row_text(&rows[0]).contains(&why.words()));
-            let labels: Vec<_> = rows
-                .iter()
-                .filter_map(|row| match row {
-                    CardRow::Account { label, .. } => Some(label.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(labels, ["me", "alt1"]);
-        }
+        let labels: Vec<_> = out.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(labels, ["me", "alt1"]);
     }
 }
 
@@ -1465,27 +1434,6 @@ fn a_paused_session_keeps_pool_observations_without_service_advice() {
             );
             assert!(shown.projection.is_none());
         }
-    }
-    for width in [60, 44, 30] {
-        let labels: Vec<_> = view
-            .card_rows("me", None, true, width, None)
-            .into_iter()
-            .filter_map(|row| {
-                if let CardRow::Account { label, .. } = row {
-                    Some(label)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            raw.rows
-                .iter()
-                .map(|row| row.label.clone())
-                .collect::<Vec<_>>()
-        );
-        assert!(!projects(&view.card_rows("me", None, true, width, None)));
     }
     assert_eq!(raw, before);
     let mut busy = view.clone();
@@ -1778,7 +1726,7 @@ fn plan_multiples() {
     assert!(scaled(&mixed), "{:?}", mixed.approx);
     assert!(mixed.text().contains(&format!(
         "  \u{2248} {}\n",
-        mixed.approx_words(&Approx::MultiplesScaled, false)[0]
+        mixed.approx_words(&Approx::MultiplesScaled)
     )));
     assert!(!scaled(&scenario_b().outlook()), "B: both rows Max 20x");
 }
@@ -1898,759 +1846,6 @@ fn the_clis_projection_is_never_said_full_short_of_a_fill() {
         [99, 99, 99, 100, 100]
     );
     assert_eq!([0, 4, 5, 625].map(whole), [0, 0, 1, 63]);
-}
-
-/// The scenarios the card and the footer are drawn for.
-fn scenes() -> Vec<(&'static str, Outlook)> {
-    vec![
-        ("A", scenario_a().outlook()),
-        ("B", scenario_b().outlook()),
-        ("C", scenario_c().outlook()),
-        ("D", scenario_d().outlook()),
-    ]
-}
-
-fn row_text(row: &CardRow) -> String {
-    match row {
-        CardRow::Note { text, .. } | CardRow::Account { text, .. } => text.clone(),
-        CardRow::Plot { cells, .. } => cells.iter().map(|c| c.0).collect(),
-        CardRow::Rule => String::new(),
-    }
-}
-
-fn caption(row: &CardRow) -> Option<&str> {
-    match row {
-        CardRow::Plot { spoken, .. } => Some(spoken),
-        _ => None,
-    }
-}
-
-/// The work row: the quota view's chart under the day axis.
-fn is_work(row: &CardRow) -> bool {
-    caption(row).is_some_and(|s| s.starts_with("Work,"))
-}
-
-fn is_axis(row: &CardRow) -> bool {
-    caption(row).is_some_and(|s| s.starts_with("Days across"))
-}
-
-/// An item's lane, where the card draws one under it.
-fn lane_of(row: &CardRow) -> Option<&CardLane> {
-    match row {
-        CardRow::Account { lane, .. } => lane.as_ref(),
-        _ => None,
-    }
-}
-
-/// Every caption the card's rows carry: each drawn row's and each lane's.
-fn captions(rows: &[CardRow]) -> impl Iterator<Item = &str> {
-    rows.iter().flat_map(|row| {
-        caption(row)
-            .into_iter()
-            .chain(lane_of(row).map(|lane| lane.spoken.as_str()))
-    })
-}
-
-fn has_lane(row: &CardRow) -> bool {
-    lane_of(row).is_some()
-}
-
-fn is_legend(row: &CardRow) -> bool {
-    row.is_legend()
-}
-
-fn is_pace(row: &CardRow) -> bool {
-    matches!(row, CardRow::Note { text, .. } if text.starts_with("  at "))
-}
-
-/// A lean's worst case, a row not needed or an assumption.
-fn is_extra_note(row: &CardRow) -> bool {
-    matches!(row, CardRow::Note { text, .. }
-        if ["  if ", "  not needed", "  \u{2248}"].iter().any(|p| text.starts_with(p))
-            || text.ends_with(" rows not needed"))
-}
-
-/// A lane's out cell: its line at the lane's ceiling, in the warn ink.
-fn is_out(cell: &(char, CardInk)) -> bool {
-    *cell == (crate::harness::quota_view::Cell::Out.glyph(), CardInk::Warn)
-}
-
-/// The card draws a projection: a cell in the projected line's ink outside the legend, on the
-/// work row or a lane.
-fn projects(rows: &[CardRow]) -> bool {
-    let ahead = |cells: &[(char, CardInk)]| cells.iter().any(|c| c.1 == CardInk::Ahead);
-    rows.iter().any(|r| match r {
-        CardRow::Plot { cells, .. } => !r.is_legend() && ahead(cells),
-        _ => lane_of(r).is_some_and(|lane| ahead(&lane.cells)),
-    })
-}
-
-/// The items in card order, each with the label its lane's caption names.
-fn items_of(rows: &[CardRow]) -> Vec<(String, Option<String>)> {
-    rows.iter()
-        .filter_map(|row| match row {
-            CardRow::Account { label, lane, .. } => Some((
-                label.clone(),
-                lane.as_ref()
-                    .and_then(|lane| lane.spoken.split("'s week").next().map(str::to_owned)),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The card's items in the order the quota view names them: its named, then its folded.
-fn view_order(out: &Outlook, tab: &str) -> Vec<String> {
-    let view = out.quota(tab, None, true);
-    view.named
-        .iter()
-        .map(|n| n.label.clone())
-        .chain(view.folded.iter().cloned())
-        .collect()
-}
-
-/// The column of `▕` in a row's cells.
-fn now_col(cells: &[(char, CardInk)]) -> usize {
-    cells
-        .iter()
-        .position(|c| c.0 == crate::harness::quota_view::NOW_MARK)
-        .expect("now's mark")
-}
-
-/// The work row's cells.
-fn work_cells(rows: &[CardRow]) -> &[(char, CardInk)] {
-    match rows.iter().find(|r| is_work(r)) {
-        Some(CardRow::Plot { cells, .. }) => cells,
-        _ => panic!("the work row"),
-    }
-}
-
-/// T22 (the agent's half): ACCESSIBILITY. No spoken or title string holds a box, block,
-/// legacy-computing or braille glyph (U+2500-259F, U+1FB00-1FBFF, U+2800-28FF); every drawn row
-/// and every lane carries a caption; the work row's caption names the chain in its order.
-/// Negative controls: a work caption that names the chain backwards fails scenario A (`me` then
-/// `alt1`); a lane's `↺` or a level in its caption fails every scene.
-#[test]
-fn spoken_words_carry_no_glyph_and_name_the_chain() {
-    let drawn = |s: &str| {
-        s.chars().any(|c| {
-            ('\u{2500}'..='\u{259f}').contains(&c)
-                || ('\u{2800}'..='\u{28ff}').contains(&c)
-                || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
-        })
-    };
-    for (name, out) in scenes() {
-        for room in [60, 44, 30] {
-            let rows = out.card_rows("me", None, true, room, None);
-            for row in &rows {
-                match row {
-                    CardRow::Note {
-                        spoken: Some(s), ..
-                    } => assert!(!drawn(s), "{name}: {s}"),
-                    CardRow::Account { spoken, .. } => assert!(!drawn(spoken), "{name}: {spoken}"),
-                    _ => {}
-                }
-            }
-            for spoken in captions(&rows) {
-                assert!(
-                    !spoken.is_empty(),
-                    "{name} {room}: a plot without a caption"
-                );
-                assert!(!drawn(spoken), "{name}: {spoken}");
-            }
-        }
-        for label in ["me", "alt1"] {
-            let view = out.quota(label, None, true);
-            for s in [&view.title, &view.spoken] {
-                assert!(!drawn(s), "{name}: {s}");
-            }
-        }
-        let pass = out.week.as_ref().expect("the week pass");
-        let mut order: Vec<&str> = Vec::new();
-        for link in pass.chain.iter().filter(|l| l.to > l.from) {
-            if order.last() != Some(&link.label.as_str()) {
-                order.push(&link.label);
-            }
-        }
-        let rows = out.card_rows("me", None, true, 60, None);
-        let caption = rows
-            .iter()
-            .find(|r| is_work(r))
-            .and_then(caption)
-            .expect("the work row");
-        // Each label as a word, after the one before it.
-        let word = |from: usize, label: &str| {
-            caption[from..]
-                .match_indices(label)
-                .map(|(i, _)| from + i)
-                .find(|&i| {
-                    let before = caption[..i].chars().next_back();
-                    let after = caption[i + label.len()..].chars().next();
-                    !before.is_some_and(char::is_alphanumeric)
-                        && !after.is_some_and(char::is_alphanumeric)
-                })
-        };
-        let mut at = 0;
-        for label in &order {
-            let found =
-                word(at, label).unwrap_or_else(|| panic!("{name}: {label} in order in {caption}"));
-            at = found + label.len();
-        }
-    }
-}
-
-/// T23: THE CARD FITS. At every room from 30 to 60 cells every row fits and none of the
-/// scenarios' rows is cut: the pace, a lean's worst case, the rows not needed and every
-/// assumption each have a form that fits from 31 cells; the items come in the quota view's
-/// order (its named, then its folded); at 30 cells or fewer the card is words only. With less
-/// height, rows give way in one order (the extra notes, the legend, the day axis, the lanes, the
-/// work row, the pace) while the verdict and every item stay. Negative controls: dropping the
-/// work row before the lanes breaks the order; a card that always takes an item's widest words
-/// cuts scenario A's items at 30; the pace with its one form is cut at 31 to 39 cells.
-#[test]
-fn card_rows_fit() {
-    for (name, out) in scenes() {
-        let order = view_order(&out, "me");
-        for room in CARD_WORDS_ONLY..=60 {
-            let rows = out.card_rows("me", None, true, room, None);
-            for row in &rows {
-                let text = row_text(row);
-                assert!(row.width() <= room, "{name} {room}: {text}");
-                assert!(!text.ends_with('\u{2026}'), "{name} {room}: cut: {text}");
-            }
-            let items: Vec<String> = items_of(&rows).into_iter().map(|(l, _)| l).collect();
-            assert_eq!(items, order, "{name} {room}: the view's order");
-            assert!(
-                matches!(rows[0], CardRow::Note { .. }),
-                "{name}: the verdict leads"
-            );
-            if room <= CARD_WORDS_ONLY {
-                assert!(rows.iter().all(|r| !matches!(r, CardRow::Plot { .. })));
-                assert!(!rows.iter().any(has_lane));
-            }
-        }
-        // The height ladder.
-        let full = out.card_rows("me", None, true, 60, None);
-        let taken = |rows: &[CardRow]| rows.iter().map(CardRow::rows).sum::<usize>();
-        let kinds = |rows: &[CardRow]| -> [bool; 6] {
-            [
-                rows.iter().any(is_extra_note),
-                rows.iter().any(is_legend),
-                rows.iter().any(is_axis),
-                rows.iter().any(has_lane),
-                rows.iter().any(is_work),
-                rows.iter().any(is_pace),
-            ]
-        };
-        let had = kinds(&full);
-        let mut last_score = 0usize;
-        for h in (0..=taken(&full)).rev() {
-            let rows = out.card_rows("me", None, true, 60, Some(h));
-            assert_eq!(rows[0], full[0], "{name} h{h}: the verdict stays");
-            let items: Vec<String> = items_of(&rows).into_iter().map(|(l, _)| l).collect();
-            assert_eq!(items, order, "{name} h{h}: every item stays");
-            let present = kinds(&rows);
-            // The first kind still present that the full card had: every earlier one is gone,
-            // every later one the full card had is still there.
-            let score = (0..6).find(|&i| had[i] && present[i]).unwrap_or(6);
-            for i in 0..6 {
-                if had[i] {
-                    assert_eq!(
-                        present[i],
-                        i >= score,
-                        "{name} h{h}: kind {i} ({present:?})"
-                    );
-                }
-            }
-            assert!(score >= last_score, "{name} h{h}: a later kind went first");
-            last_score = score;
-            if h >= taken(&full) {
-                assert_eq!(rows, full, "{name}: room enough drops nothing");
-            }
-        }
-    }
-}
-
-/// THE CARD'S LANES ARE THE ROWS NAMED THREE: a lane under each account the quota view names,
-/// in its order, each lane its own account's, and none under a folded item. On `pool1`'s pane
-/// in scenario A the view names `me`, `alt1` and `pool1` (the pane's account takes `alt2`'s
-/// place), so `alt2` is folded. Negative control: lanes for the roster's first three draw one
-/// under `alt2` and none under `pool1`.
-#[test]
-fn the_cards_lanes_are_the_rows_named_three() {
-    let out = scenario_a().outlook();
-    let view = out.quota("pool1", None, true);
-    let named: Vec<&str> = view.named.iter().map(|n| n.label.as_str()).collect();
-    assert_eq!(named, ["me", "alt1", "pool1"]);
-    assert_eq!(view.folded, ["alt2"]);
-    for room in [60, 44] {
-        let items = items_of(&out.card_rows("pool1", None, true, room, None));
-        let laned: Vec<&str> = items
-            .iter()
-            .filter_map(|(label, lane)| {
-                let lane = lane.as_deref()?;
-                assert_eq!(lane, label, "{room}: {label}'s lane is its own");
-                Some(label.as_str())
-            })
-            .collect();
-        assert_eq!(laned, named, "{room}: a lane per named account");
-        assert_eq!(
-            items.last(),
-            Some(&("alt2".to_owned(), None)),
-            "{room}: the folded item last, laneless"
-        );
-    }
-}
-
-/// THE LANES SHARE THE WORK ROW'S CLOCK: every lane's `▕` sits in the work row's `▕` column and
-/// each of its cells spans the instants the work row's cell above it does, so the day axis
-/// reads across every lane. Negative control: lanes right-aligned so their `↺` share a column
-/// (the first S6 layout) put `me`'s `▕` and `alt1`'s in different columns from the work row's.
-#[test]
-fn the_lanes_share_the_work_rows_clock() {
-    for (name, out) in scenes() {
-        for room in [60, 44, 36] {
-            let rows = out.card_rows("me", None, true, room, None);
-            let bar = now_col(work_cells(&rows));
-            let lanes: Vec<&CardLane> = rows.iter().filter_map(lane_of).collect();
-            assert!(!lanes.is_empty(), "{name} {room}: lanes");
-            for lane in lanes {
-                assert_eq!(now_col(&lane.cells), bar, "{name} {room}: {}", lane.spoken);
-                assert!(
-                    lane.cells[..WORK_WORD.len()].iter().all(|c| c.0 == ' '),
-                    "{name} {room}: the work word's cells stay blank"
-                );
-            }
-        }
-    }
-}
-
-/// A BURN-UP IS BLANK BEFORE ITS FIRST READING: in scenario A `alt1` was first read this week
-/// now, so each of its lane's past cells is blank but the last (which ends now and holds the
-/// reading), and `me`, read from 24 h ago, has a measured level in every past cell (never `▁`
-/// for a span nobody read). Negative control: a lane that carries its first reading back to the
-/// week's start draws a level in `alt1`'s first cell.
-#[test]
-fn a_burn_up_is_blank_before_its_first_reading() {
-    let out = scenario_a().outlook();
-    assert_eq!(out.rows[1].read.first().map(|r| r.t), Some(NOW));
-    for (room, k) in [(60, 6usize), (44, 4)] {
-        let rows = out.card_rows("me", None, true, room, None);
-        let lane = |label: &str| {
-            rows.iter()
-                .filter_map(lane_of)
-                .find(|l| l.spoken.starts_with(&format!("{label}'s week")))
-                .unwrap_or_else(|| panic!("{label}'s lane"))
-        };
-        let past = |lane: &CardLane| lane.cells[WORK_WORD.len()..now_col(&lane.cells)].to_vec();
-        let alt1 = past(lane("alt1"));
-        assert_eq!(alt1.len(), k, "{room}: a day of past cells");
-        assert!(
-            alt1[..k - 1].iter().all(|c| c.0 == ' '),
-            "{room}: blank before alt1's reading: {alt1:?}"
-        );
-        assert_eq!(alt1[k - 1].1, CardInk::Read, "{room}: the reading now");
-        for (glyph, ink) in past(lane("me")) {
-            assert_eq!(ink, CardInk::Read, "{room}: me is read all day");
-            assert!(
-                ('\u{2581}'..='\u{2588}').contains(&glyph),
-                "{room}: {glyph}"
-            );
-        }
-    }
-}
-
-/// A BURN-UP ENDS AT ITS RESET: each lane runs from now to its own account's reset and ends
-/// with `↺` in the cell that holds it, the cell of the work row's clock the reset falls in, so
-/// each `↺` sits under its reset on the day axis. Negative control: a lane drawn a week past
-/// now, to the chart's edge, runs past its reset.
-#[test]
-fn a_burn_up_ends_at_its_reset() {
-    let out = scenario_a().outlook();
-    for (room, k) in [(60, 6i64), (44, 4)] {
-        let rows = out.card_rows("me", None, true, room, None);
-        let lanes: Vec<&CardLane> = rows.iter().filter_map(lane_of).collect();
-        assert!(lanes.len() >= 2, "{room}: me's and alt1's lanes");
-        let bar = now_col(work_cells(&rows));
-        for (lane, reset) in lanes.iter().zip([THU9, FRI14]) {
-            let s = D / k;
-            let at = bar + 1 + usize::try_from((reset - NOW) / s).unwrap();
-            assert_eq!(lane.cells.len(), at + 1, "{room}: {}", lane.spoken);
-            assert_eq!(lane.cells[at].0, RESET_MARK, "{room}");
-            assert!(
-                lane.cells[bar + 1..at]
-                    .iter()
-                    .all(|c| c.1 == CardInk::Ahead || c.1 == CardInk::Track),
-                "{room}: the line to the reset"
-            );
-        }
-    }
-}
-
-/// A LANE IS OUT ONLY WHERE ITS OWN PASS FILLS IT (§1.4, §3.2): an item says `out ~T`, and its
-/// lane draws its out line, only for a fill the drawn pass itself projects, never for the worst case a
-/// lean assumes past it (an unread row walled at the lean's instant, never an inferred 100%);
-/// past the lean the lane is `┄` to its reset, as the work row is. In scenario A with `alt1`
-/// idle here the week pass leans on `alt1`, whose worst case walls it at the lean, so nothing
-/// is out from the lean on. Negative control: taking
-/// `out_at` from the row's projection (the bars' [`Pass::projections`], the lean's worst case
-/// included) says `out ~` at the lean and draws the out line past it.
-#[test]
-fn a_lane_is_out_only_where_its_own_pass_fills_it() {
-    let out = scenario_a_idle().outlook();
-    let week = out.week.as_ref().expect("the week pass");
-    let lean = week.lean.as_ref().expect("the work leans on alt1").at;
-    for room in [60, 44] {
-        let k = i64::from(card_per_day(room));
-        let s = D / k;
-        let rows = out.card_rows("me", None, true, room, None);
-        let bar = now_col(work_cells(&rows));
-        for row in &rows {
-            let CardRow::Account {
-                label, text, lane, ..
-            } = row
-            else {
-                continue;
-            };
-            let lane = lane.as_ref().map_or(&[][..], |l| &l.cells[..]);
-            for (j, cell) in lane.iter().enumerate().skip(bar + 1) {
-                let from = NOW + i64::try_from(j - bar - 1).unwrap() * s;
-                if from >= lean && cell.0 != RESET_MARK {
-                    assert_eq!(cell.0, '\u{2504}', "{room} {label}: unknown past the lean");
-                }
-            }
-            let reset = out
-                .row(label)
-                .and_then(|row| crate::harness::quota_view::reset_ahead(row, NOW));
-            let fills = week.fills.get(label).is_some_and(|k| {
-                k.iter().any(|k| {
-                    k.x10.is_some_and(|x| x >= 1000) && k.t > NOW && reset.is_some_and(|r| k.t < r)
-                })
-            });
-            assert_eq!(
-                text.contains("out ~"),
-                fills,
-                "{room} {label}: out only where the pass fills it: {text}"
-            );
-            assert_eq!(
-                lane.iter().any(is_out),
-                fills,
-                "{room} {label}: out only where the pass fills it"
-            );
-        }
-    }
-}
-
-/// AN ITEM SAYS ITS RUN-OUT BEFORE ITS PLAN: the lane under an item draws its out line where its account
-/// runs out, and the item says it in words whatever the card's width (§1.4), so the plan gives
-/// way first, at every width that draws a lane. With a name of 12 cells (the most a name takes)
-/// at 44 cells, `alab-pool-01`'s item has no room for its plan, its run-out and its reset
-/// together, and from 31 to 35 cells not for its padded columns and its run-out either, where
-/// its compact form (`alab-pool-01 58% out ~Thu`) says it. Negative controls: the forms in their
-/// first S6 order (the plan before the run-out) keep `Max 20x` and drop `out ~`; the forms the
-/// review fixed them to (the plan form after the run-out's, no compact form) keep `Max 20x` at
-/// 31 to 35 cells, as the recheck found.
-#[test]
-fn an_item_says_its_run_out_before_its_plan() {
-    let mut fx = Fx::new(&[
-        ("alab-pool-01", Class::Preferred),
-        ("alt1", Class::Preferred),
-    ]);
-    at_today_as(&mut fx, "alab-pool-01", 580);
-    alt1_read(&mut fx, 920);
-    let out = fx.outlook();
-    for room in (CARD_WORDS_ONLY + 1)..=60 {
-        let rows = out.card_rows("alab-pool-01", None, true, room, None);
-        let mut drawn = 0;
-        for row in &rows {
-            let CardRow::Account {
-                label,
-                text,
-                lane: Some(lane),
-                ..
-            } = row
-            else {
-                continue;
-            };
-            if lane.cells.iter().any(is_out) {
-                drawn += 1;
-                assert!(text.contains("out ~"), "{room} {label}: {text}");
-            }
-        }
-        assert!(drawn >= 1, "{room}: a lane runs out");
-    }
-}
-
-/// A TAB THE ROTATION CANNOT MOVE IS PROJECTED NOWHERE ON THE CARD (§2.2, §2.3): its footer
-/// draws `┄` and says no verdict, so its card draws no projected cell on the work row or a lane,
-/// says no `╳` (nor a pace or a lean's worst case), and says why; a refused outlook (a paused
-/// session's) says its refusal, the reason nothing is projected for anyone, whatever the tab.
-/// Negative controls: the card built as movable (the first S6 call, whatever the pane's route)
-/// draws scenario B's projection and its `╳` headline; a card whose route check comes before
-/// the refusal says `not projected` for a paused session.
-#[test]
-fn a_card_for_a_tab_the_rotation_cannot_move_projects_nothing() {
-    for (name, out) in scenes() {
-        for room in [60, 44, 30] {
-            let rows = out.card_rows("me", None, false, room, None);
-            assert!(!projects(&rows), "{name} {room}: nothing projected");
-            let head = row_text(&rows[0]);
-            assert!(!head.contains(GAP_MARK), "{name} {room}: {head}");
-            assert!(head.contains("not projected"), "{name} {room}: {head}");
-            assert!(
-                !rows.iter().any(|r| is_pace(r) || is_extra_note(r)),
-                "{name} {room}"
-            );
-        }
-    }
-    let b = scenario_b().outlook();
-    let rows = b.card_rows("me", None, true, 60, None);
-    assert!(projects(&rows) && row_text(&rows[0]).contains(GAP_MARK));
-    let paused = b.observations_only(Refusal::SessionPaused);
-    for movable in [true, false] {
-        let rows = paused.card_rows("me", None, movable, 60, None);
-        let head = row_text(&rows[0]);
-        assert!(
-            head.contains(&Refusal::SessionPaused.words()),
-            "{movable}: {head}"
-        );
-    }
-}
-
-/// A LANE SAYS A READING AS ITS ITEM DOES: a week read at 99.9% is `99 percent` in the lane's
-/// caption, as the item's figure is `99%`; 100 only for a reading of 100 (§2.1). Negative
-/// control: the caption's percent rounded half up with no cap says `100 percent`.
-#[test]
-fn a_lane_says_a_reading_as_its_item_does() {
-    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
-    me_at(&mut fx, 999);
-    alt1_read(&mut fx, 310);
-    let out = fx.outlook();
-    let rows = out.card_rows("me", None, true, 60, None);
-    let lane = captions(&rows)
-        .find(|s| s.starts_with("me's week"))
-        .expect("me's lane");
-    assert!(lane.contains("to 99 percent"), "{lane}");
-    assert!(!lane.contains("100 percent"), "{lane}");
-}
-
-/// A FOLDED ACCOUNT KEEPS ITS ITEM: scenario A's fourth account, `pool1`, is folded from the
-/// named three on `me`'s pane, yet it keeps its item (its figure and its reset) under a rule at
-/// every width and every height, never folded into a count. Negative control: a card that draws
-/// only the named three loses `pool1` at every size.
-#[test]
-fn a_folded_account_keeps_its_item() {
-    let out = scenario_a().outlook();
-    assert_eq!(out.quota("me", None, true).folded, ["pool1"]);
-    let full = out.card_rows("me", None, true, 60, None);
-    for (room, h) in [60, 44, 30]
-        .into_iter()
-        .flat_map(|room| (0..=full.len() * 2).map(move |h| (room, Some(h))))
-        .chain([(60, None), (44, None), (30, None)])
-    {
-        let rows = out.card_rows("me", None, true, room, h);
-        let at = rows
-            .iter()
-            .position(|r| matches!(r, CardRow::Account { label, .. } if label == "pool1"))
-            .unwrap_or_else(|| panic!("{room} {h:?}: pool1's item"));
-        assert_eq!(rows[at - 1], CardRow::Rule, "{room} {h:?}: under a rule");
-        let text = row_text(&rows[at]);
-        assert!(text.contains("40%"), "{room} {h:?}: {text}");
-        assert!(text.contains(RESET_MARK), "{room} {h:?}: {text}");
-        assert!(
-            !rows.iter().any(|r| row_text(r).contains("+1")),
-            "{room} {h:?}"
-        );
-    }
-}
-
-/// THE DAY AXIS LABELS THE CELL THAT HOLDS EACH MIDNIGHT (§1.4): a weekday sits over the cell
-/// its midnight falls in, so the hand-off a cell holds reads under its own day, and never over
-/// the `▕` column. On a +05:30 clock a local midnight falls an hour before now, inside the last
-/// past cell: at 60 cells its label moves to the first cell after `▕`, which is still that day;
-/// at 44 that would crowd out the next day's label, which keeps its own cell. Negative
-/// controls: the labels from the first cell beginning after each midnight (the first S6 axis)
-/// put Monday's label over `▕`, and every later one a cell late.
-#[test]
-fn the_day_axis_labels_the_cell_that_holds_each_midnight() {
-    let mut fx = scenario_a();
-    fx.offset = |_| 5 * H + 30 * MIN;
-    let out = fx.outlook();
-    for room in [60, 44] {
-        let k = i64::from(card_per_day(room));
-        let s = D / k;
-        let rows = out.card_rows("me", None, true, room, None);
-        let bar = now_col(work_cells(&rows));
-        let Some(CardRow::Plot { cells, .. }) = rows.iter().find(|r| is_axis(r)) else {
-            panic!("the axis");
-        };
-        let text: Vec<char> = cells.iter().map(|c| c.0).collect();
-        let at = |col: usize| -> String { text[col..col + 3].iter().collect() };
-        assert_eq!(text[bar], ' ', "{room}: nothing over `▕`: {text:?}");
-        // Mon 00:00 local, an hour ago: its label just after `▕`, where it crowds no other.
-        if room == 60 {
-            assert_eq!(at(bar + 1), "Mon", "{room}: {text:?}");
-        }
-        // Each later midnight, 23 h on and then a day apart: over the cell that holds it.
-        for (i, day) in ["Tue", "Wed", "Thu"].iter().enumerate() {
-            let m = NOW - H + (i64::try_from(i).unwrap() + 1) * D;
-            let col = bar + 1 + usize::try_from((m - NOW) / s).unwrap();
-            assert_eq!(at(col), *day, "{room}: {text:?}");
-        }
-    }
-}
-
-/// A clock that springs forward over a local midnight, as Santiago's does: −4 h until Sun 8 Nov
-/// begins (04:00 UTC), then −3 h, so that day has no 00:00 and begins at 01:00 on the new offset.
-const SPRING: i64 = (T5 + 3 * D).div_euclid(D) * D + 4 * H;
-
-fn springs(t: i64) -> i64 {
-    if t < SPRING { -4 * H } else { -3 * H }
-}
-
-/// The instant a card tick's `place` (from its row's left edge) stands for, on a row whose chart
-/// starts after the work row's word at `per_day` cells a day around `now`: the inverse of the
-/// placement, read from the cells' spans (§2.2), so a place off its midnight's sub-cell place
-/// reads as another instant. `None` in the word's cells and in the `▕` cell, which holds no time.
-fn instant_of(place: i64, per_day: u8, now: i64) -> Option<i64> {
-    use crate::harness::quota_view::CELL_PLACES;
-    let k = i64::from(per_day);
-    let s = D / k;
-    let cell = place.div_euclid(CELL_PLACES) - i64::try_from(WORK_WORD.len()).ok()?;
-    let into = place.rem_euclid(CELL_PLACES) * s / CELL_PLACES;
-    if (0..k).contains(&cell) {
-        Some(now - D + cell * s + into)
-    } else if cell > k {
-        Some(now + (cell - k - 1) * s + into)
-    } else {
-        None
-    }
-}
-
-/// Whether a card cell may hold a midnight's tick (§1.4, §2.2): one that draws a level (a
-/// measured step, the projected line, a lane's out line) or `┄`, or, on the work row only,
-/// nothing (a lane's blank cell is the card's ground); never a name, `→`, `↺`, `▕`, `╳` or `$`.
-fn takes_tick(cell: (char, CardInk), lane: bool) -> bool {
-    use crate::harness::quota_view::Cell;
-    (cell.0 == ' ' && !lane)
-        || matches!(cell.1, CardInk::Read | CardInk::Ahead | CardInk::Track)
-        || cell == (Cell::Out.glyph(), CardInk::Warn)
-}
-
-/// THE CARD'S MIDNIGHTS TICK WHERE THE WORK ROW AND THE LANES DRAW A LEVEL (§1.4, §2.2): on case
-/// (c)'s card at 60 and 44 cells (6 and 4 cells a day), on clocks that put each midnight at
-/// another place in its cell (UTC, +05:30, +09:45) and on one that springs forward over midnight
-/// ([`springs`]), the work row and every lane hold, for each local midnight whose cell draws a
-/// level or `┄` (or, on the work row, nothing), one tick at exactly that midnight's place, and
-/// nothing else: no tick in a cell that holds a name, `→`, `↺`, `▕`, `╳` or `$`, none on a
-/// lane's blank cell (`alt1` and `alt2` are read only now, so yesterday's midnight falls on
-/// their ground) and none past a lane's `↺`; the spring day's tick stands where that day
-/// begins, an hour after the 00:00 it never had; the axis and the legend have none. Negative
-/// controls: the card with no ticks (as S6 drew it) misses every midnight; ticks at every
-/// midnight's cell, whatever it holds, strike `→alt1` and the lanes' `↺`; a lane that admits a
-/// blank cell (`Cell::ticks` for `Cell::lane_ticks`, as the card first drew its lanes) stands
-/// a tick on `alt1`'s ground; a tick at its cell's left edge reads as an earlier instant; a
-/// spring day placed at the 00:00 it never had reads as Saturday 23:00.
-#[test]
-fn the_cards_midnights_tick_where_a_level_is_drawn() {
-    use crate::harness::quota_view::CELL_PLACES;
-    /// A clock's name and its offset from UTC at an instant.
-    type Clock = (&'static str, fn(i64) -> i64);
-    /// A drawn row's name, cells and midnights' tick places.
-    type Drawn<'a> = (String, &'a [(char, CardInk)], &'a [i64]);
-    let clocks: [Clock; 4] = [
-        ("UTC", |_| 0),
-        ("+05:30", |_| 5 * H + 30 * MIN),
-        ("+09:45", |_| 9 * H + 45 * MIN),
-        ("spring", springs),
-    ];
-    let (mut ticks, mut skipped, mut letters, mut spring, mut past_reset) = (0, 0, 0, 0, 0);
-    let mut ground = 0;
-    for (clock, offset) in clocks {
-        let mut fx = crate::harness::quota_scenes::case_c();
-        fx.offset = offset;
-        let out = fx.outlook();
-        let view = out.quota("main", None, true);
-        for room in [60, 44] {
-            let k = card_per_day(room);
-            let rows = out.card_rows("main", None, true, room, None);
-            let mut drawn: Vec<Drawn<'_>> = Vec::new();
-            for row in &rows {
-                match row {
-                    CardRow::Plot { cells, ticks, .. } if is_work(row) => {
-                        drawn.push(("work".into(), cells, ticks));
-                    }
-                    CardRow::Plot { ticks, .. } => {
-                        assert!(ticks.is_empty(), "{clock} {room}: {}", row_text(row));
-                    }
-                    CardRow::Account { label, lane, .. } => {
-                        let lane = lane.as_ref().expect("a lane");
-                        drawn.push((label.clone(), &lane.cells, &lane.ticks));
-                    }
-                    _ => {}
-                }
-            }
-            assert_eq!(
-                drawn.len(),
-                4,
-                "{clock} {room}: the work row and three lanes"
-            );
-            for (name, cells, places) in drawn {
-                let what = format!("{clock} {room} {name}");
-                let lane = name != "work";
-                let text: String = cells.iter().map(|c| c.0).collect();
-                // Each tick: a midnight's own instant, in a cell that takes one.
-                let at: Vec<i64> = places
-                    .iter()
-                    .map(|&place| {
-                        let cell = usize::try_from(place / CELL_PLACES).expect("a cell");
-                        assert!(
-                            takes_tick(cells[cell], lane),
-                            "{what}: a tick over {:?} in {text}",
-                            cells[cell].0
-                        );
-                        instant_of(place, k, out.as_of)
-                            .unwrap_or_else(|| panic!("{what}: a tick at {place} holds no time"))
-                    })
-                    .collect();
-                let mut want = Vec::new();
-                for &m in &view.chart.midnights {
-                    let s = D / i64::from(k);
-                    let cell = WORK_WORD.len()
-                        + usize::try_from(if m < out.as_of {
-                            (m - (out.as_of - D)) / s
-                        } else {
-                            i64::from(k) + 1 + (m - out.as_of) / s
-                        })
-                        .expect("a cell");
-                    match cells.get(cell) {
-                        Some(&c) if takes_tick(c, lane) => want.push(m),
-                        Some(&(ch, _)) => {
-                            skipped += 1;
-                            letters += usize::from(ch.is_alphanumeric() || ch == HANDOFF_MARK);
-                            ground += usize::from(ch == ' ');
-                        }
-                        None => past_reset += 1,
-                    }
-                }
-                assert_eq!(at, want, "{what}: {text}");
-                ticks += at.len();
-                if clock == "spring" {
-                    assert!(!at.contains(&(SPRING - H)), "{what}: no tick at Sat 23:00");
-                    spring += usize::from(at.contains(&SPRING));
-                }
-            }
-        }
-    }
-    assert!(
-        ticks > 0 && spring > 0,
-        "{ticks} ticks, {spring} on the spring day"
-    );
-    assert!(
-        skipped > 0 && letters > 0 && ground > 0 && past_reset > 0,
-        "the cases hold midnights in a letter's or a mark's cell ({letters} of {skipped}), on a \
-         lane's ground ({ground}) and past a lane's reset ({past_reset})"
-    );
 }
 
 /// A 5-HOUR WALL IS NOT A SPENT WEEK: `me` hit its 5-hour limit five minutes ago (it resets in
@@ -2798,32 +1993,11 @@ fn an_unseen_carrier_tier_counts_every_row_alike() {
     }
 }
 
-/// A LEAN'S STOP ENDS ON ITS OWN WORDS: in C the worst case stops to `me`'s reset, the vendor's
-/// instant, said exactly, as a stop's end is, and the stop is a projected gap: `╳`, never the
-/// wall's `⧗`. Negative controls: the end said as a forecast instant (`~`, rounded down) says
-/// the reset 0 minutes early with a `~`; the note marked `⧗` (the words before the glass design)
-/// fails the mark.
+/// A LEAN'S STOP IS SPOKEN TO THE RESET: in C the worst case stops to `me`'s reset, the vendor's
+/// instant, which a reader hears exactly, as a stop's end is.
 #[test]
-fn a_leans_stop_ends_on_the_reset() {
+fn a_leans_stop_is_spoken_to_the_reset() {
     let out = scenario_c().outlook();
-    let rows: Vec<String> = out
-        .card_rows("me", None, true, 60, None)
-        .iter()
-        .map(row_text)
-        .collect();
-    let note = rows
-        .iter()
-        .find(|r| r.contains("has nothing"))
-        .expect("the lean's worst case");
-    assert!(
-        note.ends_with(&format!("\u{2013}{}", out.when(THU9))),
-        "{note}"
-    );
-    assert!(!note.contains(&format!("~{}", out.when(THU9))), "{note}");
-    assert!(
-        note.contains("\u{2573} ") && !note.contains('\u{29d7}'),
-        "{note}"
-    );
     assert!(
         out.verdict_spoken().contains(&out.spoken_when(THU9)),
         "{}",
@@ -2831,11 +2005,10 @@ fn a_leans_stop_ends_on_the_reset() {
     );
 }
 
-/// EVERY ASSUMPTION IS SAID ON THE CARD AND IN THE TEXT: an unseen plan and mixed multiples
-/// each show, in the words the one renderer gives. Negative control: a card that leaves an
-/// assumption kind out misses it.
+/// EVERY ASSUMPTION IS SAID IN THE TEXT: an unseen plan and mixed multiples each show, in the
+/// words the one renderer gives.
 #[test]
-fn every_assumption_is_said_on_the_card_and_in_the_text() {
+fn every_assumption_is_said_in_the_text() {
     let mut fx = scenario_a();
     fx.series.remove("alt1");
     let out = fx.outlook();
@@ -2851,20 +2024,9 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
     for kind in ["plan", "scaled"] {
         assert!(kinds.contains(&kind), "A says {kind}: {:?}", out.approx);
     }
-    let card: Vec<String> = out
-        .card_rows("me", None, true, 60, None)
-        .iter()
-        .map(row_text)
-        .collect();
     let text = out.text();
     for a in &out.approx {
-        assert!(
-            out.approx_words(a, true)
-                .iter()
-                .any(|w| card.contains(&format!("  \u{2248} {w}"))),
-            "the card says {a:?}: {card:#?}"
-        );
-        let said = out.approx_words(a, false).into_iter().next().unwrap();
+        let said = out.approx_words(a);
         assert!(text.contains(&format!("  \u{2248} {said}\n")), "{text}");
     }
 }
@@ -2912,29 +2074,6 @@ fn a_stops_words_lead_with_its_mark() {
     }
 }
 
-/// THE CARD SAYS ITS RESET ALOUD: the card's item for the account says its week's reset, and its
-/// lane the same reset, on the clock it falls on. Negative controls: `card_item`'s spoken words
-/// without their `resets` clause fail the first assertion; a lane caption that stops at now
-/// (the chart's span, not the account's own week) fails the second.
-#[test]
-fn the_card_says_its_reset_aloud() {
-    let out = scenario_a().outlook();
-    let reset = out.spoken_when(THU9);
-    let card = out.card_rows("me", None, true, 60, None);
-    let item = card
-        .iter()
-        .find_map(|r| match r {
-            CardRow::Account { label, spoken, .. } if label == "me" => Some(spoken.clone()),
-            _ => None,
-        })
-        .expect("me's item");
-    assert!(item.contains(&format!("resets {reset}")), "{item}");
-    let lane = captions(&card)
-        .find(|s| s.starts_with("me's week"))
-        .expect("me's lane");
-    assert!(lane.contains(&format!("to its reset {reset}")), "{lane}");
-}
-
 /// A RESET PAST A DAYLIGHT CHANGE IS SAID ON ITS OWN CLOCK: on Los Angeles' clock (PDT until
 /// 1 Nov 09:00 UTC, PST after), a reset at 1 Nov 18:30 UTC is 10:30 local. Negative control: one
 /// offset for the whole week (now's PDT) says 11:30.
@@ -2955,6 +2094,39 @@ fn a_reset_past_a_daylight_change_is_said_on_its_own_clock() {
         Some("Sun 1 Nov 10:30")
     );
     assert_eq!(when(reset, NOW, &Offsets::fixed(-7 * H)), "Sun 1 Nov 11:30");
+}
+
+/// A DATE IS SAID WITH ITS YEAR ONLY IN ANOTHER YEAR, ON THE LOCAL CLOCK. An instant an hour
+/// before UTC midnight is that day seven hours west and the next day two hours east; a date in
+/// the local year `now` is in carries no year, one a year off does, and no clock time is said.
+#[test]
+fn date_words_say_the_local_date_and_the_year_only_when_it_differs() {
+    let (_, m, d) = aterm_types::rfc3339::civil_from_days(NOW.div_euclid(D));
+    let (y, _, _) = aterm_types::rfc3339::civil_from_days(NOW.div_euclid(D));
+    let midnight = NOW.div_euclid(D) * D;
+    let late = midnight + 23 * H;
+    let here = date_words(late, NOW, &utc());
+    assert_eq!(
+        here,
+        format!("{d} {}", MONTHS[usize::try_from(m - 1).expect("a month")])
+    );
+    let east = date_words(late, NOW, &Offsets::fixed(2 * H));
+    let (_, m2, d2) = aterm_types::rfc3339::civil_from_days(NOW.div_euclid(D) + 1);
+    assert_eq!(
+        east,
+        format!("{d2} {}", MONTHS[usize::try_from(m2 - 1).expect("a month")])
+    );
+    assert_ne!(east, here, "the local day, not UTC's");
+    let next_year = date_words(NOW + 366 * D, NOW, &utc());
+    assert!(next_year.ends_with(&format!(" {}", y + 1)), "{next_year}");
+    let last_year = date_words(NOW - 366 * D, NOW, &utc());
+    assert!(last_year.ends_with(&format!(" {}", y - 1)), "{last_year}");
+    assert!(!here.contains(':') && !next_year.contains(':'));
+    assert_eq!(date_words(1_762_128_000, 1_762_900_000, &utc()), "3 Nov");
+    assert_eq!(
+        date_words(1_762_128_000, 1_780_000_000, &utc()),
+        "3 Nov 2025"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3105,13 +2277,9 @@ fn a_stop_nothing_ends_is_open() {
     };
     assert_eq!(from, NOW + 6 * D + 12 * H);
     assert_eq!(end, StopEnd::Open);
-    let said = format!("\u{2573} from {}", out.about(from));
-    assert_eq!(said, "\u{2573} from ~Sun 1 Nov 07:00");
+    let said = "\u{2573} from ~Sun 1 Nov 07:00";
     let words = out.verdict_phrase().unwrap();
-    assert_eq!(
-        (words.full.as_str(), words.short.as_str()),
-        (said.as_str(), said.as_str())
-    );
+    assert_eq!((words.full.as_str(), words.short.as_str()), (said, said));
     assert!(
         out.verdict_spoken().contains("with no end in reach"),
         "{}",
@@ -3358,10 +2526,11 @@ fn a_wall_says_out_never_100() {
     );
 }
 
-/// A LOWER BOUND SAYS AT LEAST: a reading of now is exact (`58%`); a preferred row idle here
-/// since a reading three hours old, or a pool row's, is a bound (`≥31%`, `≥40%`), since another
-/// Mac may have used it since; so is the carrier's own reading an hour and a half old while in
-/// use (`stale`, whose pace is refused but whose figure stays true: `≥58%`, as
+/// A LOWER BOUND OF USE SAYS AT MOST LEFT: a reading of now is exact (`42% left`); a preferred
+/// row idle here since a reading three hours old, or a pool row's, is a bound (`≤69% left`,
+/// `≤60% left`), since another Mac may have used it since; so is the carrier's own reading an
+/// hour and a half old while in use (`stale`, whose pace is refused but whose figure stays true:
+/// `≤42% left`, as
 /// [`Figure::of_reading`] says the same reading); a reading whose reset passed is unread (`?`);
 /// under 100 is never said 100; and a bound rounds down, so it stays true (62.5% is `≥62%`),
 /// where an exact figure rounds half up (`63%`). Negative controls: an aged reading said exact
@@ -3375,15 +2544,15 @@ fn a_lower_bound_says_at_least() {
         Figure::of_week(row.window(Window::Week).unwrap(), out.as_of)
     };
     assert_eq!(fig("me"), Figure::Exact(580));
-    assert_eq!(fig("me").words(), "58%");
+    assert_eq!(fig("me").words(), "42% left");
     assert_eq!(fig("alt1"), Figure::AtLeast(310));
-    assert_eq!(fig("alt1").words(), "\u{2265}31%");
-    assert_eq!(fig("alt1").spoken(), "at least 31 percent used");
-    assert_eq!(fig("pool1").words(), "\u{2265}40%");
+    assert_eq!(fig("alt1").words(), "\u{2264}69% left");
+    assert_eq!(fig("alt1").spoken(), "at most 69 percent left");
+    assert_eq!(fig("pool1").words(), "\u{2264}60% left");
     assert_eq!(fig("alt2"), Figure::Unread);
     assert_eq!(fig("alt2").words(), "?");
-    assert_eq!(Figure::of_reading(996, THU9, NOW, NOW).words(), "99%");
-    assert_eq!(Figure::of_reading(1000, THU9, NOW, NOW).words(), "100%");
+    assert_eq!(Figure::of_reading(996, THU9, NOW, NOW).words(), "1% left");
+    assert_eq!(Figure::of_reading(1000, THU9, NOW, NOW).words(), "0% left");
     assert_eq!(
         Figure::of_reading(580, THU9, NOW - 2 * H, NOW),
         Figure::AtLeast(580)
@@ -3400,12 +2569,17 @@ fn a_lower_bound_says_at_least() {
         me.figure(stale.as_of),
         Figure::of_reading(580, THU9, NOW - 90 * MIN, NOW)
     );
-    assert_eq!(me.figure(stale.as_of).words(), "\u{2265}58%");
+    assert_eq!(me.figure(stale.as_of).words(), "\u{2264}42% left");
 
-    assert_eq!(Figure::AtLeast(625).words(), "\u{2265}62%");
-    assert_eq!(Figure::AtLeast(625).spoken(), "at least 62 percent used");
-    assert_eq!(Figure::AtLeast(999).words(), "\u{2265}99%");
-    assert_eq!(Figure::AtLeast(1000).words(), "\u{2265}100%");
-    assert_eq!(Figure::Exact(625).words(), "63%");
-    assert_eq!(Figure::Exact(995).words(), "99%");
+    assert_eq!(Figure::AtLeast(625).words(), "\u{2264}38% left");
+    assert_eq!(Figure::AtLeast(625).spoken(), "at most 38 percent left");
+    assert_eq!(Figure::AtLeast(999).words(), "\u{2264}1% left");
+    assert_eq!(
+        Figure::AtLeast(1000).words(),
+        "0% left",
+        "use cannot pass 100"
+    );
+    assert_eq!(Figure::Exact(625).words(), "37% left");
+    assert_eq!(Figure::Exact(995).words(), "1% left");
+    assert_eq!(Figure::Out.words(), "out");
 }

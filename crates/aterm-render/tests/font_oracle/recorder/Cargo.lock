@@ -26,6 +26,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-dirfd"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "aterm-dl"
 version = "0.0.0"
 dependencies = [
@@ -77,6 +84,10 @@ name = "aterm-macro-support"
 version = "0.0.0"
 
 [[package]]
+name = "aterm-objc"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-serde"
 version = "0.0.0"
 
@@ -104,6 +115,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-dl",
  "aterm-json",
+ "aterm-objc",
  "libc",
 ]
 
@@ -127,9 +139,11 @@ dependencies = [
  "aterm-json",
  "aterm-log",
  "aterm-spec-anchor",
+ "aterm-stamp",
  "aterm-tempfile",
  "aterm-time",
  "aterm-uds",
+ "trust-resource-controller",
 ]
 
 [[package]]
@@ -137,11 +151,14 @@ name = "aterm-uds"
 version = "0.0.0"
 dependencies = [
  "astream-sys",
+ "aterm-dirfd",
  "aterm-durable",
  "aterm-stamp",
  "aterm-sysprobe",
+ "aterm-tempfile",
  "aterm-vitals",
  "libc",
+ "trust-exec-policy",
 ]
 
 [[package]]
@@ -301,6 +318,17 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "trust-exec-policy"
+version = "0.13.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "trust-resource-controller"
+version = "0.13.0"
 
 [[package]]
 name = "ttf-parser"

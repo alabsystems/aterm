@@ -49,7 +49,7 @@ fn stage_one_build(app: &mut App) -> u64 {
     build
 }
 
-/// Whether a latch deadline is a structural verdict's single re-sample a day out.
+/// Whether a latch deadline is a structural verdict's re-sample a day out.
 fn is_structural_resample(retry_at: Option<std::time::Instant>) -> bool {
     retry_at.is_some_and(|at| {
         let wait = at.saturating_duration_since(std::time::Instant::now());
@@ -176,9 +176,11 @@ fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
         .expect("with a deadline, on its first failure")
         .saturating_duration_since(std::time::Instant::now());
     assert!(
-        latched > std::time::Duration::from_secs(500)
-            && latched <= std::time::Duration::from_secs(600),
-        "and on the physical schedule's first rung (~600s), got {latched:?}"
+        latched
+            > crate::app_native::TRANSIENT_FIRST_RETRY_AFTER - std::time::Duration::from_secs(10)
+            && latched <= crate::app_native::TRANSIENT_FIRST_RETRY_AFTER,
+        "THE STALL: a switch whose proof came too late is tried again within the minute, not \
+         latched off for the ten minutes it cost before, got {latched:?}"
     );
     assert!(
         app.auto_apply_intent.is_none(),
@@ -359,9 +361,10 @@ fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one
         .expect("a transient failure two attempts in is still coming back")
         .saturating_duration_since(std::time::Instant::now());
     assert!(
-        transient > std::time::Duration::from_secs(1700)
-            && transient <= std::time::Duration::from_secs(1800),
-        "the transient lane must be on its second rung (~1800s), got {transient:?}"
+        transient > std::time::Duration::from_secs(500)
+            && transient <= std::time::Duration::from_secs(600),
+        "the transient lane must be on its second rung (~600s), past its quick first retry, got \
+         {transient:?}"
     );
 }
 
@@ -1049,10 +1052,10 @@ fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
         )
         .saturating_duration_since(std::time::Instant::now());
     assert!(
-        still_coming > std::time::Duration::from_secs(1700)
-            && still_coming <= std::time::Duration::from_secs(1800),
-        "and it rides the epoch schedule's second rung (~1800s), which is what \
-         proves it took the machine-shaped lane rather than a shortened one: \
+        still_coming > std::time::Duration::from_secs(500)
+            && still_coming <= std::time::Duration::from_secs(600),
+        "and it rides the transient schedule's second rung (~600s), which is what \
+         proves it took the machine-shaped lane rather than a converging one: \
          got {still_coming:?}"
     );
 
@@ -1122,7 +1125,7 @@ fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
         is_structural_resample(deadline(&app)),
         "twice told that this successor will not become our successor is not a \
          busy afternoon: the lane's schedule is done with these bytes, and only \
-         the verdict's ONE re-sample, a day out, is left: {:?}",
+         the verdict's re-sample, a day out, is left: {:?}",
         deadline(&app)
     );
     assert!(
@@ -1198,9 +1201,9 @@ fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
         .expect("a moment always has a deadline")
         .saturating_duration_since(std::time::Instant::now());
     assert!(
-        wait > std::time::Duration::from_secs(1700) && wait <= std::time::Duration::from_secs(1800),
+        wait > std::time::Duration::from_secs(500) && wait <= std::time::Duration::from_secs(600),
         "the structural lane's whole lifetime later, a deferred swap is on the \
-         transient schedule's second rung (~1800 s), got {wait:?}"
+         transient schedule's second rung (~600 s), got {wait:?}"
     );
     assert!(
         app.auto_apply_structural_verdict.is_none(),
@@ -1294,6 +1297,7 @@ fn an_unconfirmed_trial_rearms_without_spending_prior_failures() {
         dmg_sha256: [0xab; 32],
         activation: false,
         cycles: 2,
+        epoch_failures: 2,
         last_attempt: Instant::now(),
     };
     app.auto_apply_physical_retry = Some(prior);
@@ -1363,7 +1367,7 @@ fn an_unconfirmed_trial_rearms_without_spending_prior_failures() {
 #[test]
 fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
     use crate::app_native::{
-        PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, PHYSICAL_FAILURES_PER_EPOCH,
+        PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, PhysicalFailureShape,
         UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS,
     };
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1387,7 +1391,10 @@ fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
         }
     };
 
-    spend(&mut app, PHYSICAL_FAILURES_PER_EPOCH);
+    spend(
+        &mut app,
+        PhysicalFailureShape::Unexplained.failures_per_epoch(),
+    );
     let stand_down = deadline(&app)
         .expect("the first epoch ends in a stand-down, not in convergence")
         .saturating_duration_since(std::time::Instant::now());
@@ -1399,7 +1406,8 @@ fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
 
     spend(
         &mut app,
-        UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS - PHYSICAL_FAILURES_PER_EPOCH,
+        UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS
+            - PhysicalFailureShape::Unexplained.failures_per_epoch(),
     );
     let resample = deadline(&app)
         .expect("a spent unexplained budget re-samples after the cooldown")

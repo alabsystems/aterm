@@ -91,6 +91,13 @@
 //!   macOS no access-list entry that allows anyone anything (`acl_get_fd_np`), because
 //!   macOS checks an extended ACL before the mode bits. astream-cap's `capfile` reads
 //!   every secret file through it (claim `cap.secret-file-owner-only`).
+//!   [`owner_private_dir_by_path`] (macOS arm64) gives `owner_private_dir`'s verdict on a
+//!   path from one `lstatx_np` of it, never an open, where the path's attributes decide
+//!   it (a [`DirByPath`]): a missing path, a link, a kind or owner refusal of an object
+//!   with no access list, and this user's directory with no list and its owner read and
+//!   search bits set; every other path is left to the open ([`PathUndecided`]). Both
+//!   entries judge through one set of clauses, the private `owner_rule` module, which
+//!   [`kind_and_owner_of`] also holds a caller's own metadata to.
 //!
 //! ## The cordon
 //!
@@ -104,7 +111,9 @@
 //! behind [`install_sighup_handler`]. `owner`
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], on Apple
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
-//! [`owner_private`] and [`owner_private_dir`], and off Apple `fsync` behind
+//! [`owner_private`] and [`owner_private_dir`], on macOS arm64 `lstatx_np`,
+//! `filesec_init`, `filesec_get_property`, `filesec_query_property` and `filesec_free`
+//! behind [`owner_private_dir_by_path`], and off Apple `fsync` behind
 //! [`plain_fsync`]; the per-OS `O_NONBLOCK` and `O_NOFOLLOW` numbers
 //! [`open_nonblocking`] and [`open_nonblocking_rw`] pass to safe `std` live there too.
 //! `file_identity` (`cfg(windows)`) reads the kernel's volume and file index for
@@ -148,7 +157,9 @@
 //! astream-broker's client, whose `Closer` it bounds both ways on every dial), and
 //! never installs the `SIGHUP` handler. Its private files are held to
 //! the owner rule: aterm-uds's `private_file` judges each file it reads with
-//! [`owner_private`] and each private directory with [`owner_private_dir`], and
+//! [`owner_private`] and each private directory with [`owner_private_dir_by_path`],
+//! opening it and judging the descriptor with [`owner_private_dir`] where the path's
+//! attributes cannot decide (its refused open judged with [`kind_and_owner_of`]), and
 //! aterm-link reads the fabric's mint secret through capfile's `read_secret_at`, and
 //! `fabric on --dry-run` through its `read_secret_at_narrowed`.
 
@@ -238,6 +249,9 @@ mod apple;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod owner;
+
+#[cfg(unix)]
+mod owner_rule;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -1033,7 +1047,8 @@ fn open_flagged(path: &std::path::Path, links: Links, write: bool) -> io::Result
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotPrivate {
     /// It is not the kind of file asked for: what it is instead (`"a FIFO"`, `"a
-    /// directory"`, `"a regular file"`, `"a socket"`, `"a device"`).
+    /// directory"`, `"a regular file"`, `"a socket"`, `"a device"`, `"a symlink"`, or
+    /// `"not a regular file"` for any other type).
     Kind(&'static str),
     /// It is another user's: its owner's uid (the reader's is [`euid`]).
     Owner(u32),
@@ -1057,21 +1072,10 @@ impl core::fmt::Display for NotPrivate {
     }
 }
 
-/// The word [`NotPrivate::Kind`] names a file type by.
+/// The word [`NotPrivate::Kind`] names a file type by, off Unix (on Unix the owner
+/// rule's `kind_word` names it from `st_mode`).
+#[cfg(not(unix))]
 fn kind_of(file_type: std::fs::FileType) -> &'static str {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt as _;
-        if file_type.is_fifo() {
-            return "a FIFO";
-        }
-        if file_type.is_socket() {
-            return "a socket";
-        }
-        if file_type.is_char_device() || file_type.is_block_device() {
-            return "a device";
-        }
-    }
     if file_type.is_dir() {
         "a directory"
     } else if file_type.is_file() {
@@ -1115,32 +1119,188 @@ pub fn owner_private_dir(dir: &File) -> io::Result<Result<std::fs::Metadata, Not
     owner_only(dir, true)
 }
 
+/// The descriptor entry: one `fstat` and the kind and owner clauses over it; only once
+/// both held, the access list (`acl_allows`, read after `kind_and_owner` made the `Owned`
+/// that `list_and_mode` needs) and then the mode.
 fn owner_only(file: &File, dir: bool) -> io::Result<Result<std::fs::Metadata, NotPrivate>> {
     let meta = file.metadata()?;
-    let file_type = meta.file_type();
-    let kind_ok = if dir {
-        file_type.is_dir()
-    } else {
-        file_type.is_file()
-    };
-    if !kind_ok {
-        return Ok(Err(NotPrivate::Kind(kind_of(file_type))));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != owner::euid() {
-            return Ok(Err(NotPrivate::Owner(meta.uid())));
-        }
-        if owner::acl_allows(file)? {
-            return Ok(Err(NotPrivate::Acl));
-        }
-        let mode = meta.mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Ok(Err(NotPrivate::Mode(mode)));
+        let seen = owner_rule::Seen {
+            st_mode: meta.mode(),
+            uid: meta.uid(),
+        };
+        let owned = match owner_rule::kind_and_owner(seen, dir, owner::euid()) {
+            Ok(owned) => owned,
+            Err(broken) => return Ok(Err(broken)),
+        };
+        let allows = owner::acl_allows(file)?;
+        match owned.list_and_mode(allows) {
+            Ok(()) => Ok(Ok(meta)),
+            Err(broken) => Ok(Err(broken)),
         }
     }
-    Ok(Ok(meta))
+    #[cfg(not(unix))]
+    {
+        let file_type = meta.file_type();
+        let kind_ok = if dir {
+            file_type.is_dir()
+        } else {
+            file_type.is_file()
+        };
+        if !kind_ok {
+            return Ok(Err(NotPrivate::Kind(kind_of(file_type))));
+        }
+        Ok(Ok(meta))
+    }
+}
+
+/// The kind and owner clauses of [`owner_private`] and [`owner_private_dir`] (a regular
+/// file, or a directory when `dir`; then owned by [`euid`]) over metadata a caller read
+/// itself, in that order: the first one broken, or `Ok(())` when both hold, which says
+/// nothing of the access list or the mode. For a caller that judges an object it could
+/// not open, from its `symlink_metadata` (aterm-uds, where a directory's open is refused),
+/// so it holds no kind or owner comparison of its own. A symlink's metadata is
+/// `Kind("a symlink")`.
+#[cfg(unix)]
+pub fn kind_and_owner_of(meta: &std::fs::Metadata, dir: bool) -> Result<(), NotPrivate> {
+    use std::os::unix::fs::MetadataExt as _;
+    let seen = owner_rule::Seen {
+        st_mode: meta.mode(),
+        uid: meta.uid(),
+    };
+    match owner_rule::kind_and_owner(seen, dir, owner::euid()) {
+        Ok(_owned) => Ok(()),
+        Err(broken) => Err(broken),
+    }
+}
+
+/// What [`owner_private_dir_by_path`] read of a path, without opening it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirByPath {
+    /// The lookup found nothing (`ENOENT`, at the last component or on the way), where
+    /// `open_nonblocking` fails `NotFound`.
+    Missing,
+    /// A symbolic link at the last component, which [`Links::Refuse`] refuses (`ELOOP`).
+    Symlink,
+    /// [`owner_private_dir`]'s verdict, given only for an object that carries no access
+    /// list. `Err(Kind)` and `Err(Owner)` belong to the object and are given whatever an
+    /// open would do. `Ok(())` and `Err(Mode)` are given only for this user's directory
+    /// whose owner read and search bits are set: there the read open is authorized from
+    /// exactly these attributes, so this is the verdict `owner_private_dir` gives on the
+    /// descriptor `open_nonblocking(path, Links::Refuse)` opens, but for refusals only that
+    /// open meets. The open needs only the read bit; the search bit is asked for because
+    /// devfs's `/dev/fd/N` node of a held directory, whose open dups the held descriptor,
+    /// shows every search bit clear ([`PathUndecided::NoOwnerRead`]), so no such node is
+    /// judged by its own mode. Never `Err(Acl)`: a list sends the path to the open.
+    Judged(Result<(), NotPrivate>),
+    /// The attributes cannot stand for the opened verdict: open the path and judge the
+    /// descriptor.
+    Undecided(PathUndecided),
+}
+
+/// Why [`owner_private_dir_by_path`] left a path to the open.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PathUndecided {
+    /// No path entry on this target (only macOS on arm64 has one).
+    Unsupported,
+    /// The lookup or the stat failed other than `ENOENT` (`ENOTDIR`, `EACCES`, `ELOOP`,
+    /// `ENAMETOOLONG`, a refused READ_SECURITY or MAC stat), or the path holds a NUL.
+    Lookup,
+    /// Libc's answer is incomplete: `filesec_init` failed, statx1's first malloc failed
+    /// (it returns 12), its realloc failed (0 with the owner and mode unset), or the list
+    /// query refused.
+    Unread,
+    /// The object carries an extended access list.
+    Listed,
+    /// This user's directory without its owner read or search bit (devfs's `/dev/fd/N`
+    /// node of a held directory clears every search bit and opens the held directory, a
+    /// dup: XNU bsd/miscfs/devfs/devfs_fdesc_support.c:453-463, 497-505).
+    NoOwnerRead,
+}
+
+/// [`owner_private_dir`]'s verdict on `path` where the path's attributes decide it, from
+/// one `lstatx_np` of the path (one lookup that does not follow a link at its last
+/// component, unless the path ends in a slash, where the lookup follows it as the read
+/// open does too, and one `vnode_getattr`; statx1 repeats the pair, keeping the last
+/// reading, while the access list outgrows its buffer, first sized for 16 entries, Libc
+/// sys/statx_np.c:34, 168-189: twice for a list of more than 16 entries that does not
+/// change, which is [`PathUndecided::Listed`] and goes to the open), never an open: the
+/// owner, the mode and whether an access list is held, read through the filesec (no
+/// `struct stat` field is read), and judged by the same clauses as the descriptor. The
+/// only readings it decides from are the lookup's `ENOENT` ([`DirByPath::Missing`]) and
+/// a complete stat of an object that carries no access list; everything else is
+/// [`DirByPath::Undecided`], for the caller to open the path and judge the descriptor.
+/// macOS arm64 only; elsewhere every path is `Undecided(Unsupported)`, with no call.
+#[cfg(unix)]
+#[must_use]
+pub fn owner_private_dir_by_path(path: &std::path::Path) -> DirByPath {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let Ok(named) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return DirByPath::Undecided(PathUndecided::Lookup);
+        };
+        by_path(
+            owner::look(&named, &mut [0; owner::STAT_WORDS]),
+            owner::euid(),
+        )
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = path;
+        DirByPath::Undecided(PathUndecided::Unsupported)
+    }
+}
+
+/// `<sys/stat.h>`'s owner read and search bits (SDK sys/_types/_s_ifmt.h:50, 52).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const S_IRUSR: u32 = 0o400;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const S_IXUSR: u32 = 0o100;
+
+/// The path entry's decision over what one look read. It is pure, so every Libc outcome,
+/// reachable or not, is a row of law A4. Decided: `rc` -1 with `ENOENT`, and `rc` 0 with
+/// the owner, the mode and a clear list bit; every other reading is `Undecided`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn by_path(looked: Option<owner::Looked>, euid: u32) -> DirByPath {
+    let Some(looked) = looked else {
+        return DirByPath::Undecided(PathUndecided::Unread);
+    };
+    if looked.rc == -1 {
+        return if looked.errno == Some(owner::ENOENT) {
+            DirByPath::Missing
+        } else {
+            DirByPath::Undecided(PathUndecided::Lookup)
+        };
+    }
+    if looked.rc != 0 {
+        return DirByPath::Undecided(PathUndecided::Unread);
+    }
+    let (Some(uid), Some(mode)) = (looked.uid, looked.mode) else {
+        return DirByPath::Undecided(PathUndecided::Unread);
+    };
+    match looked.listed {
+        Some(false) => {}
+        Some(true) => return DirByPath::Undecided(PathUndecided::Listed),
+        None => return DirByPath::Undecided(PathUndecided::Unread),
+    }
+    let st_mode = u32::from(mode);
+    if st_mode & owner_rule::S_IFMT == owner_rule::S_IFLNK {
+        return DirByPath::Symlink;
+    }
+    let owned = match owner_rule::kind_and_owner(owner_rule::Seen { st_mode, uid }, true, euid) {
+        Ok(owned) => owned,
+        Err(broken) => return DirByPath::Judged(Err(broken)),
+    };
+    if st_mode & (S_IRUSR | S_IXUSR) != (S_IRUSR | S_IXUSR) {
+        return DirByPath::Undecided(PathUndecided::NoOwnerRead);
+    }
+    DirByPath::Judged(owned.list_and_mode(false))
 }
 
 #[cfg(test)]

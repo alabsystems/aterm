@@ -11,7 +11,7 @@ use aterm_agent::harness::profile::{WEEKLY_OUT, WeeklyFigure, WeeklyGap};
 use aterm_agent::harness::session_usage::{TrafficView, runtime_short, tokens_short};
 
 use crate::autopilot_menu::{
-    self, AutopilotMenu, MenuAct, MenuOwner, MenuRow, PlotCell, PlotInk, PointerRest,
+    self, AutopilotMenu, MenuAct, MenuOwner, MenuRow, PlotCell, PlotInk, PointerRest, Stop,
     TRAFFIC_MAX_CONTENT, content_room, content_room_up_to, step,
 };
 use crate::claude_facts::{runtime_spoken, tokens_spoken};
@@ -71,9 +71,15 @@ pub(crate) enum FactAct {
     Show(FactKind),
     /// Type Claude's own command (`crate::claude_slash`).
     Type(Slash),
-    /// Switch the session to its switch target and back, as a click on the model does
-    /// ([`App::switch_model`]).
-    SwitchModel,
+    /// A choice of the model card: type `/model` with the family's newest model on the session's
+    /// build (`crate::claude_facts::ModelPick`; `None`: the build offers none, and the row
+    /// cannot be chosen).
+    SetModel(
+        crate::claude_facts::ModelFamily,
+        Option<crate::claude_slash::ModelArg>,
+    ),
+    /// A stop of the effort slider: type `/effort <level>` ([`App::pick_effort`]).
+    SetEffort(&'static str),
     /// Switch/pin onto the account named by the displayed roster row.
     UseAccount(AccountLabel),
     /// Request this machine's CLI-pool pin release and normal upkeep, without changing
@@ -104,7 +110,8 @@ impl FactAct {
             Self::Hide(kind) => format!("hide/{}", Fact::of(kind).key()),
             Self::Show(kind) => format!("show/{}", Fact::of(kind).key()),
             Self::Type(slash) => format!("type/{}", slash.key()),
-            Self::SwitchModel => "switch-model".to_string(),
+            Self::SetModel(family, _) => format!("set-model/{}", family.word()),
+            Self::SetEffort(level) => format!("set-effort/{level}"),
             Self::UseAccount(label) => format!("use/{}", label.as_str()),
             Self::AutoRotate => "auto-rotate".to_string(),
             Self::AccountSettings => "account-settings".to_string(),
@@ -120,42 +127,19 @@ impl FactAct {
 pub(crate) struct AccountMenuRow {
     /// The canonical identity, independent of the formatted label and row order.
     pub(crate) account: AccountLabel,
-    /// The row's label on the card: its email (its roster label where it has none) and its week
-    /// used (`m27@example.com · preferred · 39% used`, an older reading's lower bound
-    /// `≥39% used`; a wall's `out (limited)`), never what is left.
-    pub(crate) label: String,
-    /// What a screen reader is told of it (`m27@example.com, preferred, at least 39 percent
-    /// used`).
+    /// The account's name on the card: its email (its roster label where it has none).
+    pub(crate) name: String,
+    /// What the row stands at, apart from its name: what is left of its week (`61% left`, an
+    /// older reading's upper bound `≤61% left`, a wall's `out`), or why it has none (`signed
+    /// out`, `not signed in`, `not read`); never a bare percentage.
+    pub(crate) trail: String,
+    /// What a screen reader is told of it (`m27@example.com, at most 61 percent left, this
+    /// tab's account`).
     pub(crate) spoken: String,
     /// Whether this account is currently active (`●` at the right edge).
     pub(crate) active: bool,
     /// Whether clicking this row can switch to or enrol this account.
     pub(crate) enabled: bool,
-}
-
-/// The figure weekly words say, as they say it: `weekly 39% used` exact, the bound `weekly ≥38%
-/// used` a lower bound, a wall's `weekly out` out; `None` for words with no figure (a gap's).
-fn said_figure(text: &str) -> Option<Figure> {
-    let words = aterm_agent::harness::profile::weekly_figure_words(text)?;
-    if words == "out" {
-        return Some(Figure::Out);
-    }
-    let (bound, share) = match words.strip_prefix('\u{2265}') {
-        Some(share) => (true, share),
-        None => (false, words),
-    };
-    let share = share.strip_suffix('%')?;
-    let used = share
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| share.parse::<u16>().ok())
-        .flatten()?;
-    let x10 = used.min(100) * 10;
-    Some(if bound {
-        Figure::AtLeast(x10)
-    } else {
-        Figure::Exact(x10)
-    })
 }
 
 /// Whether `figure` says the week is spent: a wall, or a reading of 100% (now or before), which
@@ -267,7 +251,7 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
 /// in its transcript): the session's own row week (as [`row_figure`] gives it), the footer's
 /// weekly words, and the footer's gap where there is neither. A figure whose week has reset or whose
 /// observation clock is not admitted gives no row figure and no words; a screen's words, with no
-/// figure behind them, give the figure they say ([`said_figure`]), a wall's ([`WEEKLY_OUT`])
+/// figure behind them, give the figure they say (`profile::weekly_figure_said`), a wall's ([`WEEKLY_OUT`])
 /// [`Figure::Out`].
 pub(crate) fn weekly_facts(
     sub: &aterm_agent::harness::profile::SubscriptionDisplay,
@@ -285,7 +269,7 @@ pub(crate) fn weekly_facts(
         Some(weekly) => {
             let row = match held {
                 Some(figure) => row_figure(figure, now),
-                None => said_figure(&weekly),
+                None => aterm_agent::harness::profile::weekly_figure_said(&weekly),
             };
             (row, Some(weekly), None)
         }
@@ -309,7 +293,7 @@ pub(crate) fn session_figure(
 }
 
 /// An account row's week of a reading at `now` ([`Figure::of_weekly`]): exact while current, a
-/// lower bound after (`≥39%`, never an age), none once its window reset. Its caller admits
+/// lower bound of use after (said `≤62% left`, never an age), none once its window reset. Its caller admits
 /// observation time first.
 fn row_figure(figure: WeeklyFigure, now: i64) -> Option<Figure> {
     Some(Figure::of_weekly(&figure, now)).filter(|figure| *figure != Figure::Unread)
@@ -335,22 +319,49 @@ pub(crate) struct FactMenuFacts {
     pub(crate) branch: Option<String>,
     /// The context window's indicator (`ctx 84% left`).
     pub(crate) context: Option<String>,
-    /// The active subscription summary (`sol-m27@example.test · max 20x`).
-    pub(crate) subscription: Option<String>,
-    /// The footer's weekly words (`weekly 39% used`; a wall's `weekly out`), which a card with
-    /// no outlook says.
-    pub(crate) weekly: Option<String>,
-    /// The session's own week figure while its week runs ([`session_figure`]): the work row's
-    /// lead on the Accounts card, as on line E (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-    /// §2.2, one figure at now).
+    /// The address of the account the footer names (`sol-m27@example.test`).
+    pub(crate) email: Option<String>,
+    /// Its plan as the footer says it (`Max 20x`).
+    pub(crate) plan: Option<String>,
+    /// The footer says the program is signed out.
+    pub(crate) signed_out: bool,
+    /// How the tab's program is signed in, where the footer knows.
+    pub(crate) route: Option<aterm_agent::harness::accounts::AuthRoute>,
+    /// The session's own week figure, as the footer holds it ([`weekly_facts`]: a reading while
+    /// its week runs, a wall's `Out`): the Budget verdict's first source.
     pub(crate) own: Option<aterm_agent::harness::outlook::Figure>,
+    /// When that week resets and when it was read, where a reading stands behind it.
+    pub(crate) own_reset: Option<i64>,
+    pub(crate) own_at: Option<i64>,
+    /// The session's own five-hour figure, where its tap read one.
+    pub(crate) five_hour: Option<WeeklyFigure>,
+    /// The footer's word for extra-usage credits (`SubscriptionDisplay::credits`).
+    pub(crate) credits: Option<&'static str>,
+    /// The window of the limit the session's transcript shows it stopped at (`5h`, `7d`); the
+    /// notice's own words are never quoted.
+    pub(crate) wall: Option<&'static str>,
+    /// Why the session's recovery permits no forecast, where it refuses one.
+    pub(crate) forecast_refusal: Option<aterm_agent::harness::outlook::Refusal>,
+    /// How many of this process's tabs run on the account, this one included; `None` where
+    /// nothing names this tab's account to count the others by.
+    pub(crate) tabs_here: Option<usize>,
+    /// What the token read found (`None`: nothing read yet).
+    pub(crate) tokens_read: Option<crate::token_shown::TokensRead>,
+    /// The account's card, once the account reader answered ([`crate::account_menu_read`]).
+    pub(crate) card: Option<aterm_agent::harness::account_card::AccountCard>,
+    /// The shown name of the account this Mac's pool is pinned to (empty where it has none).
+    pub(crate) pinned: Option<String>,
+    /// The local clock's offset from UTC now, in seconds, for a card with no account read.
+    pub(crate) offset_s: i64,
+    /// The instant the card is built at.
+    pub(crate) now: i64,
+    /// The program's name in a sentence (`Codex`, `Muse`, `Claude Code`).
+    pub(crate) product: &'static str,
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
     /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: the
     /// program keeps its own login and has no rotation pool).
     pub(crate) cli: Option<aterm_agent::harness::accounts::Cli>,
-    /// Where a program with no rotation pool keeps its login, for the account menu's note.
-    pub(crate) own_login: Option<&'static str>,
     /// The account menu offers to mint a fresh Muse usage reading.
     pub(crate) refresh_usage: bool,
     /// The rotation accounts in roster order (dedicated first, then pool).
@@ -363,11 +374,12 @@ pub(crate) struct FactMenuFacts {
     pub(crate) account_queue: Option<String>,
     /// Manual queue capability is unavailable; this does not disable existing-account pins.
     pub(crate) manual_signin_unavailable: bool,
-    /// This CLI pool on this machine has no committed account pin (`!state.pinned`).
-    /// A pending selection may still exist; this is not session recovery authority.
-    pub(crate) pool_unpinned: bool,
     /// The facts hidden in this session.
     pub(crate) off: FactMask,
+    /// The facts the session's program starts with hidden, its own status line printing them
+    /// (`claude_facts::default_mask_for`): the folder's, the branch's and the context's cards
+    /// hide and show theirs only there.
+    pub(crate) starts_off: FactMask,
     /// The session's absolute working directory.
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) repo_root: Option<PathBuf>,
@@ -382,31 +394,24 @@ pub(crate) struct FactMenuFacts {
     pub(crate) note: Option<String>,
     /// A slash press is in flight for the session: the typed rows wait.
     pub(crate) typing: bool,
-    /// Where the model switch goes, on the model's and the effort's menus.
-    pub(crate) switch_to: Option<crate::claude_facts::SwitchPlan>,
+    /// The model card's choices (`crate::claude_facts::model_picks`); `None` where the session
+    /// is no Claude Code, whose model card only hides and shows.
+    pub(crate) picks: Option<Vec<crate::claude_facts::ModelPick>>,
+    /// The effort slider's stops and the one its thumb stands on
+    /// (`crate::claude_facts::effort_stops`); `None` where the session is no Claude Code.
+    pub(crate) stops: Option<(Vec<&'static str>, Option<usize>)>,
     /// The accounts outlook of Claude Code's pool, from the resolver's snapshot
     /// ([`crate::accounts_outlook::snapshot`]).
     pub(crate) outlook: Option<std::sync::Arc<aterm_agent::harness::outlook::Outlook>>,
     /// The roster label of this session's own account, the outlook's row for "this tab".
     pub(crate) account_row: Option<String>,
     /// The rotation can move this tab ([`aterm_agent::harness::accounts::AuthRoute::on_account`]
-    /// of the footer's route, as its glance reads it): else the card projects nothing and says
-    /// no verdict (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).
+    /// of the footer's route, as its glance reads it): else the card's `Forecast` row says so
+    /// and projects nothing (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).
     pub(crate) movable: bool,
-    /// The pane's rows the card may take, where its height is known.
-    pub(crate) height: Option<usize>,
     /// This tab's account's vault token, on a Claude Code card
     /// ([`crate::token_shown::shown`]).
     pub(crate) token: Option<crate::token_shown::TokenFact>,
-}
-
-/// The card's token rows (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9): its state,
-/// value-free, and the quiet offer's one step where it stands.
-fn token_rows(out: &mut Vec<MenuRow>, fact: Fact, token: &crate::token_shown::TokenFact) {
-    out.push(MenuRow::note(format!("vault token: {}", token.words)));
-    if let Some(offer) = &token.offer {
-        out.push(item(fact, "+", &offer.line, FactAct::Token, true));
-    }
 }
 
 const HIDEABLE: [FactKind; 5] = [
@@ -417,16 +422,52 @@ const HIDEABLE: [FactKind; 5] = [
     FactKind::Context,
 ];
 
-/// The model switch's row, what a click on the model or its effort does.
-fn switch_row(out: &mut Vec<MenuRow>, fact: Fact, facts: &FactMenuFacts, typed: bool) {
-    if let Some(plan) = facts.switch_to {
-        let label = if plan.back {
-            format!("Back to {}", plan.to.words())
-        } else {
-            format!("Switch to {}", plan.to.words())
-        };
-        out.push(item(fact, "\u{21c4}", &label, FactAct::SwitchModel, typed));
+/// The model card's choices: one item a pick, the session's own checked, and under a pick the
+/// quiet line it carries (how the plan bills Fable).
+fn pick_rows(
+    out: &mut Vec<MenuRow>,
+    fact: Fact,
+    picks: &[crate::claude_facts::ModelPick],
+    typed: bool,
+) {
+    for pick in picks {
+        out.push(MenuRow::Item {
+            glyph: "\u{25c6}",
+            label: pick.label.clone(),
+            // The one in use is said as itself, checked; the other as the switch it is.
+            spoken: if pick.current {
+                pick.label.clone()
+            } else {
+                format!("Switch to {}", pick.label)
+            },
+            act: MenuAct::Fact(fact, FactAct::SetModel(pick.family, pick.arg)),
+            enabled: typed && pick.arg.is_some(),
+            checked: pick.current,
+            trail: String::new(),
+        });
+        if let Some(note) = &pick.note {
+            out.push(MenuRow::note_spoken(
+                format!("   {note}"),
+                format!("{}: {note}", pick.label),
+            ));
+        }
     }
+}
+
+/// What the effort card says where the shown model takes none of the slider's levels.
+const NO_STOPS: &str = "this model takes no effort level";
+
+/// The effort card's slider: a stop a level, the thumb on `at`.
+fn stops_row(fact: Fact, stops: &[&'static str], at: Option<usize>) -> MenuRow {
+    let stops: Vec<Stop> = stops
+        .iter()
+        .map(|level| Stop {
+            label: (*level).to_owned(),
+            act: MenuAct::Fact(fact, FactAct::SetEffort(level)),
+            enabled: true,
+        })
+        .collect();
+    MenuRow::stops("Effort", stops, at)
 }
 
 fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: bool) -> MenuRow {
@@ -437,32 +478,7 @@ fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: boo
         act: MenuAct::Fact(fact, act),
         enabled,
         checked: false,
-    }
-}
-
-/// A roster row's item on the Accounts card: it chooses `acct` ([`FactAct::UseAccount`]), its
-/// check and its enabling the store's, its words `label` and `spoken`.
-fn account_item(fact: Fact, acct: &AccountMenuRow, label: String, spoken: String) -> MenuRow {
-    MenuRow::Item {
-        glyph: "\u{2386}",
-        label,
-        spoken,
-        act: MenuAct::Fact(fact, FactAct::UseAccount(acct.account)),
-        enabled: acct.enabled,
-        checked: acct.active,
-    }
-}
-
-/// The account card's last item, on every path the card takes (§1.4): one label, so a
-/// selection kept across a refresh stays on it.
-fn settings_item(fact: Fact) -> MenuRow {
-    MenuRow::Item {
-        glyph: "\u{22ef}",
-        label: "Account settings\u{2026}".to_string(),
-        spoken: "Account settings: open the configuration folder".to_string(),
-        act: MenuAct::Fact(fact, FactAct::AccountSettings),
-        enabled: true,
-        checked: false,
+        trail: String::new(),
     }
 }
 
@@ -470,257 +486,6 @@ fn settings_item(fact: Fact) -> MenuRow {
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.2): `⇄`, never `↻`, which reads as the
 /// reset's `↺`.
 pub(crate) const PIN_GLYPH: &str = "\u{21c4}";
-
-const fn plot_ink(ink: aterm_agent::harness::outlook::CardInk) -> PlotInk {
-    use aterm_agent::harness::outlook::CardInk;
-    match ink {
-        CardInk::Read => PlotInk::Read,
-        CardInk::Ahead => PlotInk::Ahead,
-        CardInk::Mark => PlotInk::Mark,
-        CardInk::Track => PlotInk::Track,
-        CardInk::Warn => PlotInk::Warn,
-        CardInk::Value => PlotInk::Value,
-        CardInk::Axis => PlotInk::Axis,
-    }
-}
-
-/// The outlook's card rows ([`aterm_agent::harness::outlook::Outlook::card_rows`]) as menu
-/// rows, in the card's order (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4): its
-/// notes, plots and rules as they come, and each roster row's item where the card puts it (the
-/// named accounts with their lanes, then the folded ones under a rule) with the act, the check
-/// and the enabling of [`FactMenuFacts::accounts`]. An item and its lane are one unit: a card
-/// account the store does not list draws neither. A row the store lists and the outlook has no
-/// words for keeps the store's words, after the card's own items. With them, whether the rows
-/// end on the card's legend, which closes the drawn rows in place of a rule.
-fn outlook_rows(
-    fact: Fact,
-    outlook: &aterm_agent::harness::outlook::Outlook,
-    facts: &FactMenuFacts,
-    height: Option<usize>,
-) -> (Vec<MenuRow>, bool) {
-    use aterm_agent::harness::outlook::CardRow;
-    let tab = facts.account_row.as_deref().unwrap_or_default();
-    let mut card = outlook.card_rows(tab, facts.own, facts.movable, facts.room, height);
-    // The card is 60 cells wide only beside a drawn row (`autopilot_menu::max_content`).
-    if facts.room > autopilot_menu::MAX_CONTENT
-        && !card.iter().any(|row| matches!(row, CardRow::Plot { .. }))
-    {
-        card = outlook.card_rows(
-            tab,
-            facts.own,
-            facts.movable,
-            autopilot_menu::MAX_CONTENT,
-            height,
-        );
-    }
-    let mut legend_last = card.last().is_some_and(CardRow::is_legend);
-    let plot = |cells: Vec<(char, aterm_agent::harness::outlook::CardInk)>,
-                spoken: String,
-                ticks: Vec<i64>| {
-        MenuRow::plot_ticked(
-            cells
-                .into_iter()
-                .map(|(ch, ink)| PlotCell {
-                    ch,
-                    ink: plot_ink(ink),
-                    busy: false,
-                })
-                .collect::<Vec<_>>(),
-            spoken,
-            ticks,
-        )
-    };
-    let mut out = Vec::with_capacity(card.len() + 1);
-    let mut placed: Vec<&str> = Vec::new();
-    for row in card {
-        match row {
-            CardRow::Note {
-                text,
-                spoken,
-                warn,
-                value,
-            } => out.push(MenuRow::Note {
-                spoken: spoken.unwrap_or_else(|| autopilot_menu::spoken_words(&text)),
-                text,
-                tone: if warn {
-                    autopilot_menu::NoteTone::Warn
-                } else if value {
-                    autopilot_menu::NoteTone::Value
-                } else {
-                    autopilot_menu::NoteTone::Label
-                },
-            }),
-            CardRow::Plot {
-                cells,
-                spoken,
-                ticks,
-            } => out.push(plot(cells, spoken, ticks)),
-            CardRow::Rule => out.push(MenuRow::Rule),
-            CardRow::Account {
-                label,
-                text,
-                spoken,
-                lane,
-            } => {
-                let Some(acct) = facts
-                    .accounts
-                    .iter()
-                    .find(|acct| acct.account.as_str() == label)
-                else {
-                    continue;
-                };
-                placed.push(acct.account.as_str());
-                out.push(account_item(fact, acct, text, spoken));
-                if let Some(lane) = lane {
-                    out.push(plot(lane.cells, lane.spoken, lane.ticks));
-                }
-            }
-        }
-    }
-    let rest: Vec<&AccountMenuRow> = facts
-        .accounts
-        .iter()
-        .filter(|acct| !placed.contains(&acct.account.as_str()))
-        .collect();
-    if !rest.is_empty() {
-        legend_last = false;
-        // After the legend, the store's own rows sit under a rule of their own.
-        if !matches!(out.last(), Some(MenuRow::Rule)) {
-            out.push(MenuRow::Rule);
-        }
-        for acct in rest {
-            out.push(account_item(
-                fact,
-                acct,
-                acct.label.clone(),
-                acct.spoken.clone(),
-            ));
-        }
-    }
-    (out, legend_last)
-}
-
-fn recovery_observed_line(at: i64) -> String {
-    if at > 0 {
-        format!("Observed {}", aterm_agent::harness::usage::rfc3339_utc(at))
-    } else {
-        "Observed unknown".into()
-    }
-}
-
-fn recovery_next_line(at: Option<i64>) -> String {
-    at.filter(|at| *at > 0).map_or_else(
-        || "Next event unknown".into(),
-        |at| {
-            format!(
-                "Next event {}",
-                aterm_agent::harness::usage::rfc3339_utc(at)
-            )
-        },
-    )
-}
-
-fn pool_work_observed_line(at: i64) -> String {
-    if at > 0 {
-        format!(
-            "Pool work observed {}",
-            aterm_agent::harness::usage::rfc3339_utc(at)
-        )
-    } else {
-        "Pool work observation time unknown".into()
-    }
-}
-
-/// Full observed recovery evidence, without the menu's display-width limit.
-fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountProgress) -> String {
-    let count = |value: Option<usize>| value.map_or_else(|| "unknown".into(), |n| n.to_string());
-    let mut lines = vec![
-        format!(
-            "{}: {}",
-            if progress.independent_work.is_empty() {
-                "Recovery"
-            } else {
-                "Recorded decision"
-            },
-            aterm_agent::harness::footer::account_progress_phase(progress)
-        ),
-        format!(
-            "Account: {}",
-            progress.account.as_deref().unwrap_or("unknown")
-        ),
-        format!(
-            "Accounts: {}; eligible: {}",
-            count(progress.known),
-            count(progress.eligible)
-        ),
-        format!(
-            "Limit: {}",
-            progress.wall.as_deref().unwrap_or("not observed")
-        ),
-    ];
-    for work in &progress.independent_work {
-        lines.push(aterm_agent::harness::footer::account_pool_work_text(work));
-        lines.push(pool_work_observed_line(work.observed_at));
-    }
-    lines.extend(progress.details.iter().cloned());
-    for diagnostic in &progress.login_diagnostics {
-        lines.push(format!(
-            "Last local sign-in for {}: {}",
-            diagnostic.label(),
-            diagnostic.words(),
-        ));
-        lines.push(format!(
-            "Attempt finished at {}",
-            aterm_agent::harness::usage::rfc3339_utc(diagnostic.completed_at),
-        ));
-    }
-    lines.push(recovery_observed_line(progress.observed_at));
-    lines.push(recovery_next_line(progress.next_at));
-    lines.join("\n")
-}
-
-fn wrapped_note_rows(out: &mut Vec<MenuRow>, words: &str, room: usize) {
-    wrapped_note_rows_marked(out, words, room, "-");
-}
-
-fn wrapped_note_rows_marked(out: &mut Vec<MenuRow>, words: &str, room: usize, mark: &str) {
-    let width = if room == 0 {
-        autopilot_menu::MAX_CONTENT
-    } else {
-        room.min(autopilot_menu::MAX_CONTENT)
-    };
-    let wrapped = crate::native_settings::wrap_to_box_marked(
-        words,
-        width as f32,
-        &|text| crate::tab_menu::display_cells(text) as f32,
-        mark,
-    );
-    let mut spoken = Some(words);
-    for line in wrapped {
-        out.push(MenuRow::note_spoken(
-            line,
-            spoken.take().unwrap_or_default(),
-        ));
-    }
-}
-
-fn login_diagnostic_rows(
-    out: &mut Vec<MenuRow>,
-    diagnostic: &aterm_agent::harness::accounts_sync::LoginDiagnostic,
-    room: usize,
-) {
-    wrapped_note_rows_marked(
-        out,
-        &format!("Last local sign-in: {}", diagnostic.label()),
-        room,
-        "",
-    );
-    wrapped_note_rows(out, &diagnostic.words(), room);
-    out.push(MenuRow::note(format!(
-        "Finished {}",
-        aterm_agent::harness::usage::rfc3339_utc(diagnostic.completed_at),
-    )));
-}
 
 /// Build the menu rows for `fact` from `facts`.
 #[must_use]
@@ -737,22 +502,27 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         Fact::Model => {
             out.push(MenuRow::note(format!("\u{25c6}  {}", value(&facts.model))));
             note(&mut out);
-            switch_row(&mut out, fact, facts, typed);
-            out.push(item(
-                fact,
-                "\u{22ef}",
-                "Change model\u{2026}  /model",
-                FactAct::Type(Slash::ModelPicker),
-                typed,
-            ));
+            // A Claude Code session's card is its two choices alone; elsewhere, where nothing
+            // types `/model`, it hides and shows.
+            if let Some(picks) = &facts.picks {
+                pick_rows(&mut out, fact, picks, typed);
+                return out;
+            }
         }
         Fact::Effort | Fact::TopEffort => {
             out.push(MenuRow::note(format!("\u{25c9}  {}", value(&facts.effort))));
             note(&mut out);
-            if fact == Fact::Effort {
-                switch_row(&mut out, fact, facts, typed);
+            // The slider stays live under a refusal's note and while a press is in flight: a
+            // pick is then said in place, or waits its turn ([`App::pick_effort`]).
+            // The slider is the effort's own card's: the top rule's key's card keeps its row.
+            match facts.stops.as_ref().filter(|_| fact == Fact::Effort) {
+                Some((stops, _)) if stops.is_empty() => out.push(MenuRow::note(NO_STOPS)),
+                Some((stops, at)) => out.push(stops_row(fact, stops, *at)),
+                None => {}
             }
-            if let Some(on) = facts.key_row {
+            // The key's toggle is its own card's: the effort's card is the slider alone, so
+            // Return one row down from it types no other command.
+            if let Some(on) = facts.key_row.filter(|_| fact == Fact::TopEffort) {
                 out.push(item(
                     fact,
                     "\u{25c8}",
@@ -765,13 +535,6 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     typed,
                 ));
             }
-            out.push(item(
-                fact,
-                "\u{22ef}",
-                "Effort slider\u{2026}  /effort",
-                FactAct::Type(Slash::EffortPicker),
-                typed,
-            ));
         }
         Fact::Path => {
             out.push(MenuRow::note(format!("\u{2302}  {}", value(&facts.path))));
@@ -819,212 +582,18 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 typed,
             ));
         }
-        Fact::Account => {
-            if let Some(progress) = &facts.account_progress {
-                let mut summary = progress.clone();
-                summary.details.clear();
-                summary.independent_work.clear();
-                summary.next_at = summary.next_at.filter(|at| *at > 0);
-                let summary = aterm_agent::harness::footer::account_progress_text(&summary);
-                out.push(MenuRow::note(if progress.independent_work.is_empty() {
-                    summary
-                } else {
-                    format!("Recorded decision: {summary}")
-                }));
-                out.push(item(
-                    fact,
-                    "\u{29c9}",
-                    "Copy recovery details",
-                    FactAct::CopyRecovery,
-                    true,
-                ));
-                if let Some(limit) = &progress.wall {
-                    out.push(MenuRow::note(format!("Limit: {limit}")));
-                }
-                if progress.phase == aterm_agent::harness::account_progress::ProgressPhase::Watching
-                    && progress.wall.is_none()
-                {
-                    out.push(MenuRow::note(
-                        aterm_agent::harness::footer::account_progress_phase(progress),
-                    ));
-                }
-                if let Some(detail) = progress.details.first() {
-                    out.push(MenuRow::note(detail.clone()));
-                }
-                // Keep timing visible before a long list of retained route details.
-                out.push(MenuRow::note(recovery_observed_line(progress.observed_at)));
-                out.push(MenuRow::note(recovery_next_line(progress.next_at)));
-                for work in &progress.independent_work {
-                    wrapped_note_rows(
-                        &mut out,
-                        &aterm_agent::harness::footer::account_pool_work_text(work),
-                        facts.room,
-                    );
-                    out.push(MenuRow::note(pool_work_observed_line(work.observed_at)));
-                }
-                let mut diagnostics: Vec<_> = progress.login_diagnostics.iter().collect();
-                diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.completed_at));
-                for diagnostic in diagnostics {
-                    login_diagnostic_rows(&mut out, diagnostic, facts.room);
-                }
-                for detail in progress.details.iter().skip(1) {
-                    out.push(MenuRow::note(detail.clone()));
-                }
-                out.push(MenuRow::Item {
-                    glyph: "⋯",
-                    label: "Network State…".into(),
-                    spoken: "Network State and shared-service access".into(),
-                    act: MenuAct::Fact(fact, FactAct::NetworkState),
-                    enabled: true,
-                    checked: false,
-                });
-                out.push(MenuRow::Rule);
-            }
-            // Under the outlook each item says its email and plan
-            // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5).
-            if let Some(sub) = facts
-                .subscription
-                .as_ref()
-                .filter(|_| facts.outlook.is_none())
-            {
-                out.push(MenuRow::note(format!(
-                    "{}  {sub}",
-                    aterm_agent::harness::footer::ACCOUNT_MARK
-                )));
-            }
-            if let Some(token) = &facts.token {
-                token_rows(&mut out, fact, token);
-            }
-            // Under the outlook the work row and the lanes say the week
-            // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4); without one the week's
-            // words lead with no mark of their own: `◷` left the glass (§4.2).
-            if let Some(weekly) = facts.weekly.as_ref().filter(|_| facts.outlook.is_none()) {
-                out.push(MenuRow::note(format!("   {weekly}")));
-            } else if let Some(gap) = facts.weekly_gap {
-                out.push(MenuRow::note_spoken(
-                    format!("   {}", gap.words()),
-                    gap.spoken(),
-                ));
-                // The why is prose wrapped to the card: a reader hears it whole,
-                // on its first line, not cut at each wrap.
-                let why = weekly_gap_why(gap);
-                let mut said = Some(why.join(" "));
-                for line in why {
-                    out.push(MenuRow::note_spoken(*line, said.take().unwrap_or_default()));
-                }
-            }
-            note(&mut out);
-            let Some(cli) = facts.cli else {
-                if let Some(own) = facts.own_login {
-                    out.push(MenuRow::note(own.to_string()));
-                }
-                if facts.refresh_usage {
-                    out.push(item(
-                        fact,
-                        PIN_GLYPH,
-                        "Refresh usage",
-                        FactAct::RefreshUsage,
-                        true,
-                    ));
-                }
-                return out;
-            };
-            if facts.accounts_loading {
-                out.push(MenuRow::note("Loading account choices…"));
-                return out;
-            }
-            if !facts.manual_signin_unavailable
-                && let Some(queue) = &facts.account_queue
-            {
-                out.push(MenuRow::note(queue.clone()));
-            }
-            if facts.manual_signin_unavailable {
-                out.push(MenuRow::note("Manual sign-in is unavailable on this platform; signed-in accounts can still be selected."));
-            }
-            if let Some(why) = &facts.accounts_refused {
-                out.push(MenuRow::note(format!("Account state unavailable: {why}")));
-                out.push(settings_item(fact));
-                return out;
-            }
-            let other = (cli != aterm_agent::harness::accounts::Cli::Claude).then_some(cli);
-            if facts.accounts.is_empty()
-                && let Some(cli) = other
-            {
-                out.push(MenuRow::note(format!(
-                    "No {} rotation accounts listed",
-                    cli.connector().product
-                )));
-                out.push(MenuRow::note(format!(
-                    "run aterm harness accounts add --cli {} <label>",
-                    cli.id()
-                )));
-                out.push(MenuRow::Rule);
-                out.push(settings_item(fact));
-                return out;
-            }
-            if facts.accounts.is_empty() {
-                out.push(MenuRow::note(
-                    "No rotation accounts configured \u{2014} run aterm init",
-                ));
-                out.push(MenuRow::Rule);
-                out.push(MenuRow::Item {
-                    glyph: PIN_GLYPH,
-                    label: "Sync accounts & clear this machine’s pin".to_string(),
-                    spoken: format!(
-                        "Sync accounts and clear this machine's {} pool pin",
-                        cli.connector().product
-                    ),
-                    act: MenuAct::Fact(fact, FactAct::AutoRotate),
-                    enabled: !facts.manual_signin_unavailable,
-                    checked: false,
-                });
-                out.push(settings_item(fact));
-                return out;
-            }
-            let mut legend_last = false;
-            match &facts.outlook {
-                Some(outlook) => {
-                    // The rows below the head, the auto-rotate and the settings items.
-                    let height = facts.height.map(|h| h.saturating_sub(out.len() + 3));
-                    let (card, legend) = outlook_rows(fact, outlook, facts, height);
-                    out.extend(card);
-                    legend_last = legend;
-                }
-                None => {
-                    out.push(MenuRow::Rule);
-                    for acct in &facts.accounts {
-                        out.push(account_item(
-                            fact,
-                            acct,
-                            acct.label.clone(),
-                            acct.spoken.clone(),
-                        ));
-                    }
-                }
-            }
-            // The card's legend closes its drawn rows; the pin and settings items follow it
-            // (§1.4), as they follow a rule under anything else, a lane included.
-            if !legend_last {
-                out.push(MenuRow::Rule);
-            }
-            out.push(MenuRow::Item {
-                glyph: PIN_GLYPH,
-                label: "No pinned account · this machine".to_string(),
-                spoken: format!(
-                    "No pinned account in this machine's {} pool",
-                    cli.connector().product
-                ),
-                act: MenuAct::Fact(fact, FactAct::AutoRotate),
-                enabled: !facts.manual_signin_unavailable,
-                checked: facts.pool_unpinned,
-            });
-            out.push(settings_item(fact));
-            return out;
-        }
+        Fact::Account => return account_rows(facts),
         Fact::Usage => return out,
     }
-    out.push(MenuRow::Rule);
     let own = fact.kind().unwrap_or(FactKind::Effort);
+    // A click on the folder, the branch or the context does nothing, so their cards hide
+    // nothing either: only where the program's own line prints the fact and the rule starts
+    // with it behind a stub does its card put it back there, or show it again.
+    let inert = !fact.clicks(false);
+    if inert && !facts.starts_off.has(own) {
+        return out;
+    }
+    out.push(MenuRow::Rule);
     let show = |kind: FactKind| {
         item(
             fact,
@@ -1048,7 +617,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
     out.extend(
         HIDEABLE
             .into_iter()
-            .filter(|kind| *kind != own && facts.off.has(*kind))
+            .filter(|kind| !inert && *kind != own && facts.off.has(*kind))
             .map(show),
     );
     out
@@ -1237,58 +806,99 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Reads the pool's roster, judged state and queue observation off the event-loop thread.
-/// Claude keeps its existing enrollment and session-week projection; other providers use
-/// their own default home and headless sign-in policy.
-/// # Errors
-/// The roster, state or login bindings could not be read, or a provider needs an unavailable home.
-pub(crate) fn pool_menu_rows(
-    cli: aterm_agent::harness::accounts::Cli,
-    (config, state_dir, home): (&std::path::Path, &std::path::Path, Option<&std::path::Path>),
-    (session_account, session_email): (Option<&str>, Option<&str>),
-    week: SessionWeek,
-    now: i64,
-) -> crate::account_menu_read::ResultRows {
-    use aterm_agent::harness::accounts;
-    let path =
-        accounts::roster_beside_for(config, cli).ok_or("account roster path is unavailable")?;
-    let roster = accounts::Roster::load_for(cli, &path)?;
-    let store = match (cli, home) {
-        (_, Some(home)) => accounts::Store::at_for(state_dir, cli, home),
-        (accounts::Cli::Claude, None) => accounts::Store::at(state_dir),
-        (_, None) => return Err("account home is unavailable".into()),
-    };
-    let roster = store.bound(&roster, now)?;
-    let (state, _) = store.load_judged(now, &roster)?;
-    let enrolled = if cli == accounts::Cli::Claude {
-        accounts::enrolled(&roster)
-    } else {
-        accounts::enrolled_in(cli, &roster, home.ok_or("account home is unavailable")?)
-    };
-    let (mut rows, unpinned) = account_menu_rows_from(
-        &roster,
-        &state,
-        &enrolled,
-        cli == accounts::Cli::Claude || cli.renews_headlessly(),
-        session_account,
-        session_email,
-        if cli == accounts::Cli::Claude {
-            week
+/// What one read of a CLI's pool holds, off the event-loop thread: its bound roster, its judged
+/// state, the rows whose login is made on this Mac, and the store they came from. The pool's
+/// rows ([`Self::rows`]) and the account's card ([`crate::account_menu_read`]) are both built
+/// from this one read, so they never disagree about a row.
+pub(crate) struct PoolRead {
+    pub(crate) cli: aterm_agent::harness::accounts::Cli,
+    pub(crate) store: aterm_agent::harness::accounts::Store,
+    pub(crate) roster: aterm_agent::harness::accounts::Roster,
+    pub(crate) state: aterm_agent::harness::accounts::State,
+    pub(crate) enrolled: std::collections::BTreeSet<String>,
+}
+
+impl PoolRead {
+    /// Reads `cli`'s roster beside `config`, and its store under `state_dir` (for `home`).
+    /// Claude keeps its existing enrollment; other providers use their own default home.
+    /// # Errors
+    /// The roster, state or login bindings could not be read, or a provider needs an
+    /// unavailable home.
+    pub(crate) fn load(
+        cli: aterm_agent::harness::accounts::Cli,
+        (config, state_dir, home): (&std::path::Path, &std::path::Path, Option<&std::path::Path>),
+        now: i64,
+    ) -> Result<Self, String> {
+        use aterm_agent::harness::accounts;
+        let path =
+            accounts::roster_beside_for(config, cli).ok_or("account roster path is unavailable")?;
+        let roster = accounts::Roster::load_for(cli, &path)?;
+        let store = match (cli, home) {
+            (_, Some(home)) => accounts::Store::at_for(state_dir, cli, home),
+            (accounts::Cli::Claude, None) => accounts::Store::at(state_dir),
+            (_, None) => return Err("account home is unavailable".into()),
+        };
+        let roster = store.bound(&roster, now)?;
+        let (state, _) = store.load_judged(now, &roster)?;
+        let enrolled = if cli == accounts::Cli::Claude {
+            accounts::enrolled(&roster)
         } else {
-            SessionWeek::default()
-        },
-        now,
-    );
-    apply_manual_signin_capability(
-        &mut rows,
-        &roster,
-        &state,
-        &enrolled,
-        now,
-        accounts::manual_signin_capability(),
-    );
-    let queue = crate::account_menu_read::queue_status(&store, cli, &roster, &state, now);
-    Ok((rows, unpinned, queue))
+            accounts::enrolled_in(cli, &roster, home.ok_or("account home is unavailable")?)
+        };
+        Ok(Self {
+            cli,
+            store,
+            roster,
+            state,
+            enrolled,
+        })
+    }
+
+    /// The pool's rows for a session on `session_account` and `session_email` whose own week
+    /// is `week` (Claude Code's alone), with the pin and the queue observation.
+    pub(crate) fn rows(
+        &self,
+        (session_account, session_email): (Option<&str>, Option<&str>),
+        week: SessionWeek,
+        now: i64,
+    ) -> crate::account_menu_read::PoolRows {
+        use aterm_agent::harness::accounts;
+        let (cli, roster, state) = (self.cli, &self.roster, &self.state);
+        let mut rows = account_menu_rows_from(
+            roster,
+            state,
+            &self.enrolled,
+            cli == accounts::Cli::Claude || cli.renews_headlessly(),
+            session_account,
+            session_email,
+            if cli == accounts::Cli::Claude {
+                week
+            } else {
+                SessionWeek::default()
+            },
+            now,
+        );
+        apply_manual_signin_capability(
+            &mut rows,
+            roster,
+            state,
+            &self.enrolled,
+            now,
+            accounts::manual_signin_capability(),
+        );
+        crate::account_menu_read::PoolRows {
+            rows,
+            pinned: state.pinned.then(|| {
+                state.active.as_deref().map_or_else(String::new, |label| {
+                    roster
+                        .row(label)
+                        .map_or(label, accounts::Row::shown_name)
+                        .to_owned()
+                })
+            }),
+            queue: crate::account_menu_read::queue_status(&self.store, cli, roster, state, now),
+        }
+    }
 }
 
 fn apply_manual_signin_capability(
@@ -1374,7 +984,8 @@ pub(crate) struct SessionWeek {
 /// chosen. `auto_login` is whether choosing a row with an email starts its sign-in with nobody at
 /// the page (Claude Code's, and another CLI's whose renewal approves its page headlessly,
 /// `Cli::renews_headlessly`): such
-/// a row that is signed out or not enrolled says `(auto-login)` and can be chosen. Where it is
+/// a row that is signed out or not signed in can be chosen, and a screen reader is told that
+/// choosing it signs it in. Where it is
 /// false (Grok Build's, whose background renewal never starts) that row is as one with no email:
 /// it names its condition and cannot be chosen, since a choice would start no sign-in.
 #[must_use]
@@ -1391,25 +1002,16 @@ pub(crate) fn account_menu_rows_from(
     session_email: Option<&str>,
     session: SessionWeek,
     now: i64,
-) -> (Vec<AccountMenuRow>, bool) {
+) -> Vec<AccountMenuRow> {
     use aterm_agent::harness::accounts;
     // The session's week is its own account's: the row its login is judged to (on a one-row
     // roster too, where the footer names no account), else the one its profile's email names;
     // never a row whose email contradicts the profile's, nor the store's active fallback.
-    let session_row = match session.label.as_deref().or(session_account) {
-        Some(label) => roster.row(label).filter(|row| {
-            session_email.is_none_or(|email| {
-                row.expected_identity_email()
-                    .is_none_or(|expected| accounts::email_matches(expected, email))
-            })
-        }),
-        None => session_email.and_then(|email| {
-            roster.rows.iter().find(|row| {
-                row.expected_identity_email()
-                    .is_some_and(|expected| accounts::email_matches(expected, email))
-            })
-        }),
-    };
+    let session_row = aterm_agent::harness::account_card::session_row(
+        roster,
+        session.label.as_deref().or(session_account),
+        session_email,
+    );
     let session_label = session_row.map(|row| row.label.as_str());
     let session_admitted = session.figure.is_none_or(|figure| {
         figure.resets_at > now
@@ -1478,64 +1080,134 @@ pub(crate) fn account_menu_rows_from(
                     })
                 })
         };
-        let class_word = match row.class {
-            accounts::Class::Preferred => "preferred",
-            accounts::Class::Pool => "pool",
-        };
         let has_email = auto_login && row.email.is_some();
-        // The week is said used, as the glass says it, never what is left
-        // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): a wall is `out`, never a
-        // percentage; `100%` only where a reading said 100.
-        let (avail, said): (String, String) = match (cond, week, has_email) {
-            (accounts::Condition::Limited { .. }, _, _) | (_, Some(Figure::Out), _) => {
-                ("out (limited)".into(), "out, limited".into())
+        // What the row stands at, the first that holds: a wall is `out`, never a percentage;
+        // `0% left` only where a reading said 100; a login that is gone or was never made
+        // before any figure, which nothing can spend until it is signed in; then the week as
+        // what is left, as the glass says it (`harness::left`).
+        let (trail, said): (String, String) = match (cond, week) {
+            (accounts::Condition::Limited { .. }, _) | (_, Some(Figure::Out)) => {
+                ("out".into(), "out".into())
             }
-            (_, Some(figure), _) if spent(figure) => (
-                "100% used (limited)".into(),
-                "100 percent used, limited".into(),
-            ),
-            (accounts::Condition::SignedOut, _, true) => (
-                "signed out (auto-login)".into(),
-                "signed out, auto-login".into(),
-            ),
-            (accounts::Condition::SignedOut, _, false) => {
-                ("signed out".into(), "signed out".into())
+            (_, Some(figure)) if spent(figure) => ("0% left".into(), "0 percent left".into()),
+            (accounts::Condition::SignedOut, _) => ("signed out".into(), "signed out".into()),
+            (accounts::Condition::NotEnrolled, _) => {
+                ("not signed in".into(), "not signed in".into())
             }
-            (accounts::Condition::NotEnrolled, Some(figure), true) => (
-                format!("{} used (auto-login)", figure.words()),
-                format!("{}, auto-login", figure.spoken()),
-            ),
-            (accounts::Condition::NotEnrolled, _, false) => {
-                ("not enrolled".into(), "not enrolled".into())
-            }
-            (_, Some(figure), _) => (format!("{} used", figure.words()), figure.spoken()),
-            (accounts::Condition::NotEnrolled, None, true) => (
-                format!("{}; quota unknown (auto-login)", cond.as_str()),
-                format!("{}, quota unknown, auto-login", cond.as_str()),
-            ),
-            (_, None, _) => (
-                format!("{}; quota unknown", cond.as_str()),
-                format!("{}, quota unknown", cond.as_str()),
-            ),
+            (_, Some(figure)) => (figure.words(), figure.spoken()),
+            (_, None) => ("not read".into(), "not read".into()),
         };
+        let signs_in = has_email
+            && matches!(
+                cond,
+                accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
+            );
         let enabled = !matches!(
             cond,
             accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
         ) || has_email;
         // Named by its email, as the glass names it (§2.5); the label stays the row's key.
         let name = row.shown_name();
+        let mut spoken = format!("{name}, {said}");
+        if signs_in {
+            spoken.push_str(", choosing it signs it in");
+        }
+        if session_label == Some(row.label.as_str()) {
+            spoken.push_str(", this tab's account");
+        } else if is_active {
+            spoken.push_str(", this Mac's current account");
+        }
         rows.push(AccountMenuRow {
             account,
-            label: format!("{name} \u{b7} {class_word} \u{b7} {avail}"),
-            spoken: format!("{name}, {class_word}, {said}"),
+            name: name.to_owned(),
+            trail,
+            spoken,
             active: is_active,
             enabled,
         });
     }
-    (rows, !state.pinned)
+    rows
+}
+
+/// The program's name in a sentence on the Account card: the pooled CLI's, else the program the
+/// tab's reader names.
+fn product_of(
+    cli: Option<aterm_agent::harness::accounts::Cli>,
+    program: Option<aterm_phase::Program>,
+) -> &'static str {
+    use aterm_agent::harness::accounts::Cli;
+    match (cli, program) {
+        (Some(Cli::Claude), _) => "Claude Code",
+        (Some(Cli::Codex), _) => "Codex",
+        (Some(Cli::Grok), _) => "Grok",
+        (Some(Cli::Kimi), _) => "Kimi",
+        (Some(Cli::Agy), _) => "Antigravity",
+        (None, Some(aterm_phase::Program::Muse)) => "Muse",
+        (None, Some(aterm_phase::Program::Agy)) => "Antigravity",
+        // A tab whose reader names no program yet, or one whose pool this tab is not on:
+        // the card claims nothing of its login.
+        (
+            None,
+            Some(
+                aterm_phase::Program::Claude
+                | aterm_phase::Program::Codex
+                | aterm_phase::Program::Grok
+                | aterm_phase::Program::Kimi
+                | aterm_phase::Program::Generic,
+            )
+            | None,
+        ) => "",
+    }
 }
 
 impl App {
+    /// How many live tabs run on `session`'s account, itself included, from each tab's footer
+    /// in memory. Another pooled CLI's tabs all run on its store's active row (their footers
+    /// name no login), so every tab of that CLI counts. A Claude Code tab counts those whose
+    /// footer names the same `email`, or, where either names none, the same roster `label`.
+    /// `None` where nothing names the account to count by: the card then claims no count.
+    fn tabs_on_account(
+        &self,
+        session: u64,
+        cli: Option<aterm_agent::harness::accounts::Cli>,
+        email: Option<&str>,
+        label: Option<&str>,
+    ) -> Option<usize> {
+        use aterm_agent::harness::accounts::{Cli, email_matches};
+        let cli = cli?;
+        if cli == Cli::Claude && email.is_none() && label.is_none() {
+            return None;
+        }
+        let others = self
+            .pool
+            .iter()
+            .filter(|entry| entry.id != session && self.session_cli(entry.id) == Some(cli))
+            .filter(|entry| {
+                if cli != Cli::Claude {
+                    return true;
+                }
+                let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(facts) = timeline.claude_footer() else {
+                    return false;
+                };
+                let sub = facts.subscription.as_ref();
+                let same_row = || {
+                    label.is_some()
+                        && sub
+                            .and_then(|sub| sub.label.as_deref())
+                            .or(facts.account.as_deref())
+                            == label
+                };
+                // By address where both name one; a tab that names none, by its roster row.
+                match (email, sub.and_then(|sub| sub.email.as_deref())) {
+                    (Some(email), Some(other)) => email_matches(other, email),
+                    _ => same_row(),
+                }
+            })
+            .count();
+        Some(others + 1)
+    }
+
     /// The pooled CLI `session` runs ([`crate::harness_host::pool_cli`] of the program its screen
     /// reader names), Claude Code's where it names none.
     pub(crate) fn session_cli(&self, session: u64) -> Option<aterm_agent::harness::accounts::Cli> {
@@ -1548,7 +1220,7 @@ impl App {
         })
     }
 
-    fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
+    pub(crate) fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
         let (place, name) = self.menu_place_and_name(session);
         let what = fact.name();
         let spoken = match &name {
@@ -1564,20 +1236,26 @@ impl App {
             room: autopilot_menu::MAX_CONTENT,
             spoken,
             off: self.fact_mask(session),
+            starts_off: self.starting_fact_mask(session),
             note: state
                 .and_then(|f| f.menu_note.as_ref())
                 .filter(|(of, _)| *of == fact)
                 .map(|(_, note)| note.clone()),
             typing: state.is_some_and(|f| f.press.is_some()),
-            switch_to: matches!(fact, Fact::Model | Fact::Effort)
-                .then(|| self.switch_plan(session))
+            picks: (fact == Fact::Model)
+                .then(|| self.model_picks(session))
+                .flatten(),
+            stops: (fact == Fact::Effort)
+                .then(|| self.effort_stops(session))
                 .flatten(),
             ..FactMenuFacts::default()
         };
+        let now = aterm_time::unix_secs()
+            .and_then(|n| i64::try_from(n).ok())
+            .unwrap_or(0);
+        out.now = now;
         let mut key = false;
-        let mut forecast_refusal = None;
         let mut program: Option<aterm_phase::Program> = None;
-        let mut email: Option<String> = None;
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             program = timeline
@@ -1586,7 +1264,7 @@ impl App {
                 .as_deref()
                 .and_then(aterm_phase::program_of);
             if let Some(facts) = timeline.claude_footer() {
-                forecast_refusal = facts.account_forecast_refusal();
+                out.forecast_refusal = facts.account_forecast_refusal();
                 out.account_progress = facts
                     .account_progress_view()
                     .map(std::borrow::Cow::into_owned);
@@ -1594,7 +1272,7 @@ impl App {
                 let latched = state
                     .and_then(|f| f.latch.as_ref())
                     .is_some_and(|latch| latch.holds(pgid, facts.model.as_deref()));
-                key = matches!(fact, Fact::Effort | Fact::TopEffort)
+                key = fact == Fact::TopEffort
                     && !latched
                     && facts
                         .version
@@ -1610,32 +1288,31 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.label.clone())
                     .or_else(|| facts.account.clone());
+                out.route = facts.route;
+                out.wall = facts
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.wall.as_ref())
+                    .and_then(|wall| match wall.label {
+                        "5h" => Some("5h"),
+                        "7d" => Some("7d"),
+                        _ => None,
+                    });
                 if let Some(sub) = &facts.subscription {
-                    email.clone_from(&sub.email);
-                    let email_str = sub.email.as_deref().filter(|s| !s.is_empty());
-                    let plan_str = sub.plan.as_deref().filter(|s| !s.is_empty());
-                    let summary = match (email_str, plan_str) {
-                        (Some(email), Some(plan)) => format!("{email} \u{b7} {plan}"),
-                        (Some(email), None) => email.to_string(),
-                        (None, Some(plan)) => plan.to_string(),
-                        (None, None) => String::new(),
-                    };
-                    if !summary.is_empty() {
-                        out.subscription = Some(summary);
-                    }
-                    let walled = facts
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.wall.as_ref())
-                        .is_some_and(|w| w.label == "7d");
-                    let now = aterm_time::unix_secs()
-                        .and_then(|n| i64::try_from(n).ok())
-                        .unwrap_or(0);
-                    let (_, weekly, weekly_gap) = weekly_facts(sub, walled, now);
-                    out.weekly = weekly;
+                    out.email = sub.email.clone().filter(|email| !email.is_empty());
+                    out.plan = sub.plan.clone().filter(|plan| !plan.is_empty());
+                    out.signed_out = sub.signed_out;
+                    out.five_hour = sub.five_hour;
+                    out.credits = sub.credits;
+                    let (own, _, weekly_gap) = weekly_facts(sub, out.wall == Some("7d"), now);
+                    out.own = own;
                     out.weekly_gap = weekly_gap;
-                    out.own = session_figure(sub, now)
-                        .map(|f| aterm_agent::harness::outlook::Figure::of_weekly(&f, now));
+                    let held = session_figure(sub, now);
+                    out.own_reset = held.map(|figure| figure.resets_at);
+                    out.own_at = held.map(|figure| figure.at);
+                } else if out.wall == Some("7d") {
+                    // A weekly wall in the transcript says the week whatever else is known.
+                    out.own = Some(Figure::Out);
                 }
                 (out.model, out.effort, out.path, out.branch, out.context) = (
                     facts.model,
@@ -1653,60 +1330,66 @@ impl App {
         if fact == Fact::Account {
             let cli = self.session_cli(session);
             out.cli = cli;
-            // The outlook the resolver last posted (`docs/DESIGN-accounts-outlook-2026-10-25.md`
-            // §10): no file is read on this thread, and the rows stay the account reader's.
-            out.outlook = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
+            let claude = cli == Some(aterm_agent::harness::accounts::Cli::Claude);
+            out.product = product_of(cli, program);
+            out.offset_s = crate::autopilot_timers::local_offset_at(now).unwrap_or(0);
+            // The outlook the resolver last posted: no file is read on this thread. A recovery
+            // that permits no forecast is said on the card's `Forecast` row, and the outlook's
+            // observations are read as they are.
+            out.outlook = claude
                 .then(crate::accounts_outlook::snapshot)
                 .flatten()
-                .and_then(|s| s.outlook.clone())
-                .map(|outlook| {
-                    if let Some(refusal) = forecast_refusal {
-                        std::sync::Arc::new(outlook.observations_only(refusal))
-                    } else {
-                        outlook
-                    }
-                });
-            // The recovery's words name its accounts as the card's items do, by email (§2.5).
-            if let (Some(progress), Some(outlook)) =
-                (out.account_progress.as_mut(), out.outlook.as_deref())
-            {
-                *progress = progress.named(|label| outlook.name_of(label).to_owned());
-            }
-            out.token = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
-                .then(crate::token_shown::shown)
-                .flatten()
-                .and_then(|tokens| {
-                    tokens
-                        .of(out.account_row.as_deref(), email.as_deref())
-                        .cloned()
-                });
-            (out.refresh_usage, out.own_login) = match program {
-                Some(aterm_phase::Program::Muse) => (
-                    true,
-                    Some("Muse's own login — no rotation pool; switch with its /login"),
-                ),
-                Some(aterm_phase::Program::Agy) => {
-                    (false, Some("Antigravity's own login — no rotation pool"))
-                }
+                .and_then(|s| s.outlook.clone());
+            let tokens = claude.then(crate::token_shown::shown).flatten();
+            out.tokens_read = tokens.as_ref().map(|tokens| tokens.read);
+            out.token = tokens.and_then(|tokens| {
+                tokens
+                    .of(out.account_row.as_deref(), out.email.as_deref())
+                    .cloned()
+            });
+            // Muse Code alone has a usage figure a press reads again.
+            out.refresh_usage = match program {
+                Some(aterm_phase::Program::Muse) => true,
                 Some(
                     aterm_phase::Program::Claude
                     | aterm_phase::Program::Codex
+                    | aterm_phase::Program::Agy
                     | aterm_phase::Program::Grok
                     | aterm_phase::Program::Kimi
                     | aterm_phase::Program::Generic,
                 )
-                | None => (false, None),
+                | None => false,
             };
+            out.tabs_here = self.tabs_on_account(
+                session,
+                cli,
+                out.email.as_deref(),
+                out.account_row.as_deref(),
+            );
             if cli.is_some() {
                 match self.account_menu_rows_cached(session) {
-                    Some(Ok((accounts, pool_unpinned, queue))) => {
-                        out.accounts.clone_from(accounts);
-                        out.pool_unpinned = *pool_unpinned;
-                        out.account_queue.clone_from(queue);
+                    Some(read) => {
+                        out.card.clone_from(&read.card);
+                        match &read.pool {
+                            Ok(pool) => {
+                                out.accounts.clone_from(&pool.rows);
+                                out.pinned.clone_from(&pool.pinned);
+                                out.account_queue.clone_from(&pool.queue);
+                            }
+                            Err(why) => out.accounts_refused = Some(why.clone()),
+                        }
                     }
-                    Some(Err(why)) => out.accounts_refused = Some(why.clone()),
                     None => out.accounts_loading = true,
                 }
+            }
+            // The recovery's words name its accounts as the card's items do, by email (§2.5).
+            if let Some(progress) = out.account_progress.as_mut() {
+                let (card, outlook) = (out.card.as_ref(), out.outlook.as_deref());
+                *progress = progress.named(|label| {
+                    card.and_then(|card| card.names.get(label).cloned())
+                        .or_else(|| outlook.map(|outlook| outlook.name_of(label).to_owned()))
+                        .unwrap_or_else(|| label.to_owned())
+                });
             }
         }
         if matches!(fact, Fact::Path | Fact::Branch)
@@ -1731,22 +1414,18 @@ impl App {
     }
 
     fn fact_menu_rows(&self, wid: WindowId, session: u64, fact: Fact) -> (Vec<MenuRow>, String) {
-        let (pane_rows, pane_cols) = self.autopilot_menu_pane(wid, session);
+        let (_, pane_cols) = self.autopilot_menu_pane(wid, session);
         let pane_cols = pane_cols.len();
         if fact != Fact::Usage {
             let facts = self.fact_menu_facts(session, fact);
-            // The Accounts card under the outlook is up to 60 cells wide, as the traffic card
-            // (§8.1), and as tall as the pane less its border.
+            // The Account card is up to 60 cells wide, as the traffic card (§8.1); it takes the
+            // width only beside a chart (`account_rows`).
             let facts = FactMenuFacts {
-                room: if facts.outlook.is_some() {
+                room: if fact == Fact::Account {
                     content_room_up_to(pane_cols, TRAFFIC_MAX_CONTENT)
                 } else {
                     content_room(pane_cols)
                 },
-                height: facts
-                    .outlook
-                    .is_some()
-                    .then(|| pane_rows.len().saturating_sub(2)),
                 ..facts
             };
             return (rows(fact, &facts), facts.spoken);
@@ -1851,7 +1530,16 @@ impl App {
             self.request_account_read(session);
         }
         let (rows, spoken) = self.fact_menu_rows(wid, session, fact);
-        let highlight = keyboard.then(|| step(&rows, None, true)).flatten();
+        // A keyboard open of the Account card selects its first item. While the account
+        // reader has not answered, that item is not on the card yet: the selection waits for
+        // the first result ([`crate::account_menu_read`]) and does not settle on the one
+        // item a card still being read has.
+        let pending = fact == Fact::Account
+            && self.session_cli(session).is_some()
+            && self.account_menu_rows_cached(session).is_none();
+        let highlight = (keyboard && !pending)
+            .then(|| step(&rows, None, true))
+            .flatten();
         let focus = self.focused_session_id(wid);
         let px = self
             .windows
@@ -1866,7 +1554,6 @@ impl App {
             anchor,
             rows,
             spoken,
-            cancels: None,
             highlight,
             viewport: crate::menu_viewport::MenuViewport::default(),
             page_rows: 0,
@@ -1876,7 +1563,7 @@ impl App {
             laid: None,
             generation: 0,
             rest: PointerRest::at_open(px),
-            ticks: crate::autopilot_menu::CardTicks::default(),
+            told: None,
         });
         if fact == Fact::Account {
             self.account_menu_read
@@ -1903,9 +1590,10 @@ impl App {
         let Some((wid, fact)) = self
             .autopilot_menu
             .as_ref()
+            .filter(|menu| menu.session == session)
             .and_then(|menu| match menu.owner {
-                MenuOwner::Fact(fact) if menu.session == session => Some((menu.wid, fact)),
-                _ => None,
+                MenuOwner::Fact(fact) => Some((menu.wid, fact)),
+                MenuOwner::Permission => None,
             })
         else {
             return;
@@ -1921,9 +1609,10 @@ impl App {
         let Some((wid, fact)) = self
             .autopilot_menu
             .as_ref()
+            .filter(|menu| menu.session == session)
             .and_then(|menu| match menu.owner {
-                MenuOwner::Fact(fact) if menu.session == session => Some((menu.wid, fact)),
-                _ => None,
+                MenuOwner::Fact(fact) => Some((menu.wid, fact)),
+                MenuOwner::Permission => None,
             })
         else {
             return;
@@ -1932,12 +1621,12 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_mut() else {
             return;
         };
-        if menu.refresh_rows(fresh, spoken, None) {
+        if menu.refresh_rows(fresh, spoken) {
             self.request_menu_frame(wid);
         }
     }
 
-    /// Execute a typing row (`act`: a [`FactAct::Type`] or [`FactAct::SwitchModel`]) from
+    /// Execute a typing row (`act`: a [`FactAct::Type`] or [`FactAct::SetModel`]) from
     /// `session`'s `fact` menu in window `wid`.
     pub(crate) fn choose_fact_type(
         &mut self,
@@ -1950,7 +1639,9 @@ impl App {
     ) {
         let pressed = match act {
             FactAct::Type(slash) => self.press_slash(wid, session, slash),
-            FactAct::SwitchModel => self.switch_model(wid, session),
+            FactAct::SetModel(_, Some(model)) => {
+                self.press_slash(wid, session, Slash::Model(model))
+            }
             _ => return,
         };
         match pressed {
@@ -1966,6 +1657,27 @@ impl App {
                 self.open_fact_menu_keeping_note(wid, session, fact, anchor, keyboard);
             }
         }
+    }
+
+    /// Pick a slider's stop (`act`: a [`FactAct::SetEffort`]) on `session`'s `fact` card in
+    /// window `wid`, which stays open: the thumb moves to the pick at once and then follows
+    /// the footer, and a refusal is the card's note in place.
+    pub(crate) fn choose_fact_stop(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        fact: Fact,
+        act: FactAct,
+    ) {
+        let FactAct::SetEffort(level) = act else {
+            return;
+        };
+        let refused = self
+            .pick_effort(wid, session, level)
+            .err()
+            .map(|why| (fact, why.says("", None)));
+        self.claude_facts.entry(session).or_default().menu_note = refused;
+        self.rebuild_fact_menu_rows(session);
     }
 
     /// Execute non-typed action `act` from `session`'s fact menu in window `wid`.
@@ -1997,11 +1709,12 @@ impl App {
             FactAct::CopyRecovery | FactAct::CopyPath | FactAct::CopyBranch
                 if self.refuse_clipboard_gesture("fact-menu copy") => {}
             FactAct::CopyRecovery => {
-                if let Some(progress) = self
-                    .fact_menu_facts(session, Fact::Account)
-                    .account_progress
-                    && crate::control::pbcopy(&recovery_report(&progress))
-                {
+                // Only what the card offers now: a row left on a stale card copies nothing.
+                let facts = self.fact_menu_facts(session, Fact::Account);
+                let offered = facts.account_progress.is_some()
+                    || (facts.cli == Some(aterm_agent::harness::accounts::Cli::Claude)
+                        && facts.email.is_some());
+                if offered && crate::control::pbcopy(&details_report(&facts)) {
                     self.note_fact_notice(wid, session, FactNotice::Copied);
                 }
             }
@@ -2195,7 +1908,7 @@ impl App {
                     self.redraw_claude_footer(session);
                 }
             }
-            FactAct::Type(_) | FactAct::SwitchModel => {}
+            FactAct::Type(_) | FactAct::SetModel(..) | FactAct::SetEffort(_) => {}
         }
     }
 
@@ -2214,23 +1927,19 @@ impl App {
         Ok(())
     }
 
-    /// Close any open fact menu while leaving an open Autopilot menu intact.
+    /// Close any open fact menu (`open fact-menu close`).
     pub(crate) fn close_fact_menu(&mut self) {
-        if self
-            .autopilot_menu
-            .as_ref()
-            .is_some_and(|menu| matches!(menu.owner, MenuOwner::Fact(_)))
-        {
-            self.close_autopilot_menu();
-        }
+        self.close_autopilot_menu();
     }
 
     /// Return `controls fact-menu` lines for the front window.
     #[must_use]
     pub(crate) fn fact_menu_controls(&self) -> Vec<String> {
-        match self.autopilot_menu.as_ref().filter(|m| {
-            Some(m.wid) == self.frontmost_window && matches!(m.owner, MenuOwner::Fact(_))
-        }) {
+        match self
+            .autopilot_menu
+            .as_ref()
+            .filter(|m| Some(m.wid) == self.frontmost_window)
+        {
             Some(menu) => {
                 let sid = self
                     .pool
@@ -2258,6 +1967,10 @@ impl App {
         true
     }
 }
+
+#[path = "fact_menu_account.rs"]
+mod account;
+pub(crate) use account::{account_rows, details_report};
 
 #[cfg(test)]
 #[path = "fact_menu_tests.rs"]

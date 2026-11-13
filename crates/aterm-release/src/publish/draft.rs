@@ -6,11 +6,15 @@
 
 use super::*;
 
-const JOURNAL: &str = "draft-state.toml";
+/// The private draft's journal in `dist/`, the file the engine's `--draft-state` reads.
+pub(super) const JOURNAL: &str = "draft-state.toml";
 const RECEIPT: &str = "draft-bytes.toml";
 
-pub(super) fn has_journal(dist: &Path) -> Result<bool> {
-    Journal::load(&dist.join(JOURNAL)).map(|draft| draft.is_some())
+/// The private draft journal names build `build` of `version`: that draft owns the build's
+/// signed bytes. A journal of another build or version owns nothing of this one.
+pub(super) fn has_journal_for(dist: &Path, version: &str, build: u64) -> Result<bool> {
+    Ok(Journal::load(&dist.join(JOURNAL))?
+        .is_some_and(|draft| draft.version == version && draft.build_number == build))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -24,24 +28,48 @@ struct FileDigest {
     sha256: String,
 }
 
-pub(super) fn authority(repo: &Path, commit: &str, build: u64) -> Result<()> {
+/// The clone's release journal (`release.toml`), which holds the reservation a draft serves.
+fn release_journal(repo: &Path) -> Result<Option<crate::release::Journal>> {
     let git = GitCli::new(repo);
     let path = crate::release::release_dir(&git)
         .map_err(|e| Error::new(e.to_string()))?
         .join(crate::release::JOURNAL_FILE);
-    let release = crate::release::Journal::load(&path)
-        .map_err(|e| Error::new(e.to_string()))?
-        .ok_or_else(|| Error::new("private upload has no release journal"))?;
-    if !release
+    crate::release::Journal::load(&path).map_err(|e| Error::new(e.to_string()))
+}
+
+fn reserves(release: &crate::release::Journal, commit: &str, build: u64) -> bool {
+    release
         .reserved
         .as_ref()
         .is_some_and(|r| r.commit == commit && r.build == build)
-    {
+}
+
+pub(super) fn authority(repo: &Path, commit: &str, build: u64) -> Result<()> {
+    let release = release_journal(repo)?
+        .ok_or_else(|| Error::new("private upload has no release journal"))?;
+    if !reserves(&release, commit, build) {
         return Err(Error::new(
             "private upload's reservation no longer belongs to this release",
         ));
     }
     Ok(())
+}
+
+/// Why [`discard`] left the journaled draft where it is.
+#[derive(Debug)]
+pub(super) enum Kept {
+    /// A read, a DELETE or a file failed, or GitHub's reads disagree on whether a release whose
+    /// DELETE was journaled is gone; a retry may get through.
+    Failed(Error),
+    /// Decided, and a retry decides the same: this clone cannot prove the draft its own, or cannot
+    /// see what its create POST made. A person does what `remedy` says.
+    Held { why: String, remedy: String },
+}
+
+impl From<Error> for Kept {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 fn snapshot(ctx: &CutCtx) -> Journal {
@@ -62,11 +90,20 @@ fn snapshot(ctx: &CutCtx) -> Journal {
         release_id: ctx.release_id,
         release_intent: ctx.release_intent,
         upload_intents: ctx.upload_intents.clone(),
+        delete_intent: None,
         done: Vec::new(),
     }
 }
 
 fn agrees(ctx: &CutCtx, draft: &Journal) -> Result<()> {
+    if let Some(id) = draft.delete_intent {
+        return Err(Error::new(format!(
+            "the private draft dist/{JOURNAL} journals ({}) is being withdrawn: the DELETE of \
+             release {id} was issued, so no cut adopts it — {}",
+            journaled_words(draft),
+            withdraw_remedy(&ctx.repo, &ctx.slug, draft)
+        )));
+    }
     if draft.version != ctx.version
         || draft.build_number != ctx.build
         || draft.commit != ctx.commit
@@ -77,11 +114,73 @@ fn agrees(ctx: &CutCtx, draft: &Journal) -> Result<()> {
         || draft.signature_pubkey != ctx.signature_pubkey
         || draft.signature_machine_id != ctx.signature_machine_id
     {
-        return Err(Error::new(
-            "private draft identity, floor or signer differs from this cut; refusing adoption",
-        ));
+        return Err(Error::new(format!(
+            "the private draft dist/{JOURNAL} journals ({}) differs from this cut (v{} build {} \
+             at {}) in identity, floor or signer; refusing adoption — {}",
+            journaled_words(draft),
+            ctx.version,
+            ctx.build,
+            short_commit(&ctx.commit),
+            withdraw_remedy(&ctx.repo, &ctx.slug, draft)
+        )));
     }
     Ok(())
+}
+
+/// The journaled draft as a person finds it: version, build, reservation commit, release id.
+fn journaled_words(draft: &Journal) -> String {
+    let release = draft
+        .release_id
+        .map_or_else(|| "no release id".to_string(), |id| format!("release {id}"));
+    format!(
+        "v{} build {} at {}, {release}",
+        draft.version,
+        draft.build_number,
+        short_commit(&draft.commit)
+    )
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
+/// How `draft` leaves this clone. While release.toml still reserves its build and commit, the
+/// release's `--forget` withdraws it under that reservation ([`discard`]). Once the reservation is
+/// gone nothing can prove the draft this clone's, so a person deletes the release and the journal.
+fn withdraw_remedy(repo: &Path, slug: &str, draft: &Journal) -> String {
+    let forgets = release_journal(repo).ok().flatten().is_some_and(|release| {
+        release.version == draft.version && reserves(&release, &draft.commit, draft.build_number)
+    });
+    if forgets {
+        return format!(
+            "`{} --forget` withdraws it with its reservation, then `{}` reserves anew",
+            crate::release::RELEASE_COMMAND,
+            crate::release::RELEASE_COMMAND
+        );
+    }
+    format!(
+        "release.toml no longer reserves its build, so no tool can prove the draft this clone's: \
+         {}",
+        removal(slug, draft.release_id)
+    )
+}
+
+/// A person's removal of a private draft no tool withdraws: its release, where the journal names
+/// one, then the journal and its receipt.
+fn removal(slug: &str, release_id: Option<u64>) -> String {
+    let release = release_id.map_or_else(String::new, |id| {
+        format!(
+            "delete its draft release ({}), then ",
+            delete_command(slug, id)
+        )
+    });
+    format!("{release}remove dist/{JOURNAL} and dist/{RECEIPT}")
+}
+
+/// The `agh` write that deletes release `id` of `slug`.
+pub(super) fn delete_command(slug: &str, id: impl std::fmt::Display) -> String {
+    let path = format!("repos/{slug}/releases/{id}");
+    format!("agh api {path} -X DELETE --confirm {path}")
 }
 
 fn record_bytes(ctx: &CutCtx) -> Result<()> {
@@ -209,39 +308,164 @@ pub(super) fn prepare(ctx: &mut CutCtx, opts: &CutOptions) -> Result<()> {
     })
 }
 
-/// The release id this clone's private-draft journal names for `version`, when it names one.
-pub(super) fn journaled_release(dist: &Path, version: &str) -> Result<Option<u64>> {
+/// The release id this clone's private-draft journal names for build `build` of `version`, when
+/// it names one; a journal of another build or version names none of this one's.
+pub(super) fn journaled_release(dist: &Path, version: &str, build: u64) -> Result<Option<u64>> {
     Ok(Journal::load(&dist.join(JOURNAL))?
-        .filter(|draft| draft.version == version)
+        .filter(|draft| draft.version == version && draft.build_number == build)
         .and_then(|draft| draft.release_id))
 }
 
-/// Delete only this journal's exact draft. A published release is never withdrawn.
-pub(super) fn discard(dist: &Path, version: &str, build: u64) -> Result<()> {
+/// Withdraw this journal's exact draft and forget the journal. The draft is found by the id the
+/// journal binds, or, where its create POST was issued and no id bound, as the tag's one release.
+/// A journal with no create POST withdraws nothing on GitHub. The DELETE is journaled
+/// (`delete_intent`) before it goes out, so a retry reads that release's absence (its id
+/// answering 404 and the releases listing, drafts included, without it) as this withdrawal's own;
+/// the receipt goes before the journal, so no journal leaves no receipt (one a withdrawal cut
+/// short left goes too). Held, a retry deciding the same: a journal this cutter cannot read,
+/// another reservation's draft, a reservation release.toml no longer holds, a bound id GitHub no
+/// longer answers and this clone never journaled deleting, a release that is public or under
+/// another tag, a create POST with no release or several under the tag. A read, DELETE, journal
+/// write or file removal that fails, and a journaled DELETE's release that answers 404 by its id
+/// while the listing still holds it, are [`Kept::Failed`].
+pub(super) fn discard(dist: &Path, version: &str, build: u64) -> std::result::Result<(), Kept> {
     let path = dist.join(JOURNAL);
-    let Some(draft) = Journal::load(&path)? else {
-        return Ok(());
+    let text = match read_journal_text(&path) {
+        Ok(Some(text)) => Ok(text),
+        Ok(None) => {
+            forget_copy_record(&dist.join(RECEIPT))?;
+            return Ok(());
+        }
+        Err(JournalUnread::Read(error)) => return Err(Kept::Failed(error)),
+        Err(JournalUnread::Invalid(error)) => Err(error),
     };
-    if draft.version != version || draft.build_number != build {
-        return Err(Error::new(
-            "refusing to discard another reservation's private draft",
-        ));
-    }
     let repo = dist
         .parent()
         .ok_or_else(|| Error::new("draft has no repository"))?;
-    authority(repo, &draft.commit, draft.build_number)?;
     let slug = workspace_channel_slug(repo)?;
     let tag = format!("v{version}");
-    let observed = unique_release_object_by_tag(&slug, &tag)?;
-    if let Some(release) = observed {
-        if draft.release_id.is_some_and(|id| id != release.id)
-            || !draft.release_intent
-            || !release.draft
-        {
-            return Err(Error::new(
-                "private draft cleanup refuses a replacement, unowned or published release",
-            ));
+    let unreadable = |error: Error| Kept::Held {
+        why: format!("dist/{JOURNAL} cannot be read as a private-draft journal: {error}"),
+        remedy: format!(
+            "delete by hand any draft of {tag} this clone made on {slug}, then {}",
+            removal(&slug, None)
+        ),
+    };
+    let draft = text
+        .and_then(|text| Journal::from_text(&text, &path))
+        .map_err(unreadable)?;
+    if draft.version != version || draft.build_number != build {
+        return Err(Kept::Held {
+            why: format!(
+                "dist/{JOURNAL} journals another reservation's private draft ({}), not v{version} \
+                 build {build}",
+                journaled_words(&draft)
+            ),
+            remedy: withdraw_remedy(repo, &slug, &draft),
+        });
+    }
+    if !release_journal(repo)?
+        .is_some_and(|release| reserves(&release, &draft.commit, draft.build_number))
+    {
+        return Err(Kept::Held {
+            why: format!(
+                "release.toml does not reserve the private draft's build ({})",
+                journaled_words(&draft)
+            ),
+            remedy: withdraw_remedy(repo, &slug, &draft),
+        });
+    }
+    let release = match draft.release_id.or(draft.delete_intent) {
+        Some(id) => match release_object_by_id(&slug, id)? {
+            Some(release) => Some(release),
+            // This clone journaled its DELETE of `id` before issuing it, so the DELETE may never
+            // have gone out (the run stopped after the journal, or the guard's first read
+            // failed): the release is gone only where the releases listing, drafts included,
+            // agrees with the 404. One it still lists is a read that missed it, or a deletion
+            // GitHub has not settled, and a retry decides.
+            None if draft.delete_intent == Some(id) => {
+                if release_listed(&slug, id)? {
+                    return Err(Kept::Failed(Error::new(format!(
+                        "GitHub answers no release {id} by its ID, yet {slug}'s releases listing \
+                         still lists release {id}, whose DELETE dist/{JOURNAL} journals"
+                    ))));
+                }
+                None
+            }
+            None => {
+                return Err(Kept::Held {
+                    why: format!(
+                        "GitHub answers no release {id}, the private draft dist/{JOURNAL} binds"
+                    ),
+                    remedy: format!(
+                        "once {slug}'s releases page shows no draft of {tag} this clone made, {}",
+                        removal(&slug, None)
+                    ),
+                });
+            }
+        },
+        None if !draft.release_intent => None,
+        None => match release_objects_by_tag(&slug, &tag)?.as_slice() {
+            [] => {
+                return Err(Kept::Held {
+                    why: format!(
+                        "dist/{JOURNAL} journals a create POST of {tag}'s private draft, and no \
+                         release under {tag} is visible on {slug}, so whether it created one is \
+                         undecided"
+                    ),
+                    remedy: format!(
+                        "if {slug}'s releases page, drafts included, shows no release for {tag}, \
+                         the POST created nothing: {} (a draft that appears there is withdrawn by \
+                         the next run)",
+                        removal(&slug, None)
+                    ),
+                });
+            }
+            [release] => Some(release.clone()),
+            several => {
+                let mut ids: Vec<u64> = several.iter().map(|r| r.id).collect();
+                ids.sort_unstable();
+                let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
+                return Err(Kept::Held {
+                    why: format!(
+                        "{tag} names {} releases on {slug} (IDs {}) and dist/{JOURNAL} binds none \
+                         of them, so which is this clone's draft is undecided",
+                        several.len(),
+                        ids.join(", ")
+                    ),
+                    remedy: format!(
+                        "delete by hand each that is not this clone's draft ({}), so its own is \
+                         the one left",
+                        delete_command(&slug, "<id>")
+                    ),
+                });
+            }
+        },
+    };
+    if let Some(release) = release {
+        if !release.draft || release.tag != tag {
+            let state = if release.draft {
+                format!("now a draft under {}", release.tag)
+            } else {
+                "public".to_string()
+            };
+            return Err(Kept::Held {
+                why: format!(
+                    "release {} on {slug}, the private draft of {tag} this clone journaled, is \
+                     {state}, and only this clone's unpublished draft of its tag is withdrawn",
+                    release.id
+                ),
+                remedy: format!(
+                    "decide release {} by hand; once it no longer serves this clone's cut, {}",
+                    release.id,
+                    removal(&slug, None)
+                ),
+            });
+        }
+        if draft.delete_intent != Some(release.id) {
+            let mut withdrawing = draft.clone();
+            withdrawing.delete_intent = Some(release.id);
+            withdrawing.save(&path)?;
         }
         delete_release_object_by_id_with_guard(
             &slug,
@@ -250,13 +474,10 @@ pub(super) fn discard(dist: &Path, version: &str, build: u64) -> Result<()> {
             || authority(repo, &draft.commit, build),
             || authority(repo, &draft.commit, build),
         )?;
-    } else if draft.release_intent {
-        return Err(Error::new(
-            "private draft POST outcome is not visible; retain the journal for digest adoption on resume",
-        ));
     }
+    forget_copy_record(&dist.join(RECEIPT))?;
     forget_copy_record(&path)?;
-    forget_copy_record(&dist.join(RECEIPT))
+    Ok(())
 }
 
 pub(super) fn forget_published(ctx: &CutCtx) -> Result<()> {
@@ -274,581 +495,5 @@ pub(super) fn forget_published(ctx: &CutCtx) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::channel::ChannelRelease;
-
-    pub(crate) struct Lab {
-        _dir: aterm_tempfile::TempDir,
-        pub(crate) fake: agh_fake::FakeGithub,
-        pub(crate) ctx: CutCtx,
-        route: crate::github::Fixture,
-        _route: crate::github::FixtureGuard,
-    }
-
-    impl Lab {
-        fn new() -> Self {
-            Self::for_cut("0.191.0", 191, &"a".repeat(40))
-        }
-
-        pub(crate) fn for_cut(version: &str, build: u64, commit: &str) -> Self {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let repo = dir.path().to_path_buf();
-            assert!(
-                command("git")
-                    .args(["init", "-q"])
-                    .arg(&repo)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            let dist = repo.join("dist");
-            fs::create_dir(&dist).unwrap();
-            let slug = "draft-fixture/aterm";
-            fs::write(
-                repo.join("Cargo.toml"),
-                format!("[workspace.package]\nrepository = \"https://github.com/{slug}\"\n"),
-            )
-            .unwrap();
-            let fake = agh_fake::FakeGithub::start();
-            let token = agh_fake::token("private-draft-cutter");
-            fake.add_token(&token, "cutter");
-            fake.add_repo(slug, agh_fake::RepoSpec::public().push("cutter"));
-            fake.add_release(
-                slug,
-                agh_fake::ReleaseSpec::published("v0.190.0", "2026-11-08T00:00:00Z"),
-            );
-            let ports = fake.ports();
-            let fixture = crate::github::Fixture {
-                origins: aterm_update_core::github_rest::Origins::loopback(
-                    ports.api,
-                    ports.uploads,
-                    ports.web,
-                    ports.cdn,
-                ),
-                token: Some(token),
-                spawn: None,
-            };
-            let route = fixture.clone().enter();
-            let mut ctx = CutCtx {
-                credentials: None,
-                apple: sign::AppleTier::Inactive,
-                repo: repo.clone(),
-                tree: repo.clone(),
-                dist: dist.clone(),
-                journal_path: dist.join(JOURNAL),
-                slug: slug.into(),
-                version: version.into(),
-                tag: format!("v{version}"),
-                build,
-                commit: commit.into(),
-                min_build: None,
-                artifact: Some("b".repeat(64)),
-                macho_sha256: Some("c".repeat(64)),
-                linux: None,
-                manifest_signed: false,
-                signature_required: false,
-                signature_pubkey: None,
-                verify_pubkey: None,
-                signature_machine_id: None,
-                attribution: None,
-                roster: None,
-                release_id: None,
-                release_intent: false,
-                upload_intents: Vec::new(),
-                kind: CutKind::Draft,
-                lease: None,
-                fence: None,
-                notes_section: "Unreleased".into(),
-                journal: None,
-                adopted: false,
-            };
-            let release = crate::release::Journal {
-                version: ctx.version.clone(),
-                commit: "d".repeat(40),
-                reserved: Some(crate::release::Reservation {
-                    build: ctx.build,
-                    commit: ctx.commit.clone(),
-                    line: format!("{build} {version}"),
-                }),
-                ..Default::default()
-            };
-            release
-                .save(
-                    &crate::release::release_dir(&GitCli::new(&repo))
-                        .unwrap()
-                        .join(crate::release::JOURNAL_FILE),
-                )
-                .unwrap();
-            for name in ctx.channel_asset_names() {
-                fs::write(dist.join(&name), format!("signed fixture: {name}")).unwrap();
-            }
-            fs::write(ctx.notes_path(), "Private fixture release").unwrap();
-            record_bytes(&ctx).unwrap();
-            let journal = snapshot(&ctx);
-            journal.save(&ctx.journal_path).unwrap();
-            ctx.journal = Some(journal);
-            Self {
-                _dir: dir,
-                fake,
-                ctx,
-                route: fixture,
-                _route: route,
-            }
-        }
-
-        pub(crate) fn stage(&mut self) -> Result<()> {
-            let _route = self.route.clone().enter();
-            let slug = self.ctx.slug.clone();
-            channel::stage_on_channel(&mut NetworkOnly(LiveChannelRelease {
-                ctx: &mut self.ctx,
-                slug: &slug,
-                bound: None,
-            }))
-        }
-
-        pub(crate) fn publish(&mut self) -> Result<()> {
-            let _route = self.route.clone().enter();
-            // The native ledger/fence are separately exercised by the claimed
-            // pipeline's tests. This fixture exercises the real REST/asset path.
-            self.ctx.kind = CutKind::DryRun;
-            let slug = self.ctx.slug.clone();
-            channel::publish_staged_on_channel(&mut NetworkOnly(LiveChannelRelease {
-                ctx: &mut self.ctx,
-                slug: &slug,
-                bound: None,
-            }))
-        }
-
-        pub(crate) fn posts(&self) -> usize {
-            self.fake
-                .seen()
-                .iter()
-                .filter(|r| r.method == "POST")
-                .count()
-        }
-
-        pub(crate) fn attest(&self) {
-            for name in channel::SOURCE_ATTESTATION_ASSETS {
-                self.fake.apply(agh_fake::Change::AddAsset {
-                    release_id: self.ctx.release_id.unwrap(),
-                    spec: agh_fake::AssetSpec::uploaded(name, b"source evidence"),
-                });
-            }
-        }
-
-        pub(crate) fn source_read(&self, unavailable: bool) -> Result<()> {
-            let _route = self.route.clone().enter();
-            let path = format!(
-                "repos/{}/releases/{}",
-                self.ctx.slug,
-                self.ctx.release_id.unwrap()
-            );
-            if unavailable {
-                self.fake.fault(
-                    agh_fake::Match::api(&format!("/{path}")).method("GET"),
-                    agh_fake::Fault::Status {
-                        status: 404,
-                        body: "unavailable source read".into(),
-                        headers: Vec::new(),
-                    },
-                );
-            }
-            crate::github::get(&path).map(|_| ())
-        }
-
-        pub(crate) fn resume(&mut self) {
-            self.ctx.kind = CutKind::Draft;
-            self.ctx.release_id = None;
-            self.ctx.release_intent = false;
-            self.ctx.upload_intents.clear();
-            adopt(&mut self.ctx).unwrap();
-            self.stage().unwrap();
-        }
-
-        pub(crate) fn discard_signed(&self, reason: crate::release::SignedDiscard) -> Vec<String> {
-            let _route = self.route.clone().enter();
-            super::discard_signed(&self.ctx.dist, &self.ctx.version, self.ctx.build, reason)
-        }
-    }
-
-    /// Only product execution and native claims are injected. Upload, byte
-    /// proof, draft capability and the public PATCH use the production code.
-    struct NetworkOnly<'a>(LiveChannelRelease<'a>);
-
-    impl ChannelRelease for NetworkOnly<'_> {
-        fn head_made(&mut self) -> Result<bool> {
-            self.0.head_made()
-        }
-        fn artifacts(&mut self) -> Result<Vec<PathBuf>> {
-            Ok(self.0.ctx.channel_asset_paths())
-        }
-        fn upload(&mut self, file: &Path) -> Result<()> {
-            self.0.upload(file)
-        }
-        fn upload_payloads(&mut self, files: &[PathBuf]) -> Result<()> {
-            self.0.upload_payloads(files)
-        }
-        fn prove_assets(&mut self) -> Result<()> {
-            self.0.prove_assets()
-        }
-        fn ratchet_head(&mut self) -> Result<()> {
-            Ok(())
-        }
-        fn ratchet(&mut self) -> Result<()> {
-            Ok(())
-        }
-        fn bind(&mut self) -> Result<()> {
-            self.0.bind()
-        }
-        fn make_head(&mut self) -> Result<()> {
-            self.0.make_head()
-        }
-        fn prove_head(&mut self) -> Result<()> {
-            let release = crate::github::get(&format!("repos/{}/releases/latest", self.0.slug))?;
-            assert_eq!(release["id"].as_u64(), self.0.ctx.release_id);
-            Ok(())
-        }
-    }
-
-    /// NEGATIVE CONTROL: serializing upload after the source finishes deadlocks
-    /// this rendezvous; the minute is a hang detector, not a timing assertion.
-    #[test]
-    fn private_draft_uploads_while_source_publish_is_pending() {
-        let mut lab = Lab::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (staged, source) = crate::cut_timing::independent(
-            ("private uploads", || {
-                let r = lab.stage();
-                tx.send(()).unwrap();
-                r
-            }),
-            ("source publish", move || {
-                rx.recv_timeout(Duration::from_secs(60))
-            }),
-        );
-        staged.unwrap();
-        source.unwrap();
-        let id = lab.ctx.release_id.unwrap();
-        assert!(lab.fake.release_state(id).unwrap().0.draft);
-        assert_eq!(
-            Journal::load(&lab.ctx.journal_path)
-                .unwrap()
-                .unwrap()
-                .release_id,
-            Some(id)
-        );
-        let latest =
-            crate::github::get(&format!("repos/{}/releases/latest", lab.ctx.slug)).unwrap();
-        assert_ne!(latest["id"].as_u64(), Some(id));
-        let ports = lab.fake.ports();
-        let name = channel::dmg_asset_name(&lab.ctx.version);
-        let url = format!(
-            "http://127.0.0.1:{}/{}/releases/download/{}/{}",
-            ports.web, lab.ctx.slug, lab.ctx.tag, name
-        );
-        let anonymous = command("/usr/bin/curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--output",
-                "/dev/null",
-                "--write-out",
-                "%{http_code}",
-                &url,
-            ])
-            .output()
-            .unwrap();
-        assert!(anonymous.status.success());
-        assert_eq!(
-            String::from_utf8(anonymous.stdout).unwrap(),
-            "404",
-            "draft asset URLs are private"
-        );
-        lab.attest();
-        assert!(lab.source_read(true).is_err());
-        lab.source_read(false).unwrap();
-        lab.publish().unwrap();
-        assert!(!lab.fake.release_state(id).unwrap().0.draft);
-        let patches: Vec<_> = lab
-            .fake
-            .seen()
-            .into_iter()
-            .filter(|r| r.method == "PATCH")
-            .collect();
-        assert_eq!(patches.len(), 1);
-        let posts = lab.posts();
-        lab.ctx.kind = CutKind::Draft;
-        assert!(lab.stage().is_err(), "a published release is never re-cut");
-        assert_eq!(lab.posts(), posts);
-        lab.fake.assert_clean();
-    }
-
-    #[test]
-    fn lost_reservation_discards_only_the_owned_private_release() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        lab.attest();
-        let id = lab.ctx.release_id.unwrap();
-        assert!(
-            lab.discard_signed(crate::release::SignedDiscard::LostReservation)
-                .is_empty()
-        );
-        assert!(lab.fake.release_state(id).is_none());
-        assert_eq!(lab.fake.release_ids(&lab.ctx.slug).len(), 1);
-        assert!(!lab.ctx.journal_path.exists());
-        assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
-        lab.fake.assert_clean();
-    }
-
-    #[test]
-    fn cancelling_sign_preparation_keeps_an_existing_attested_draft_and_its_bytes() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        lab.attest();
-        let id = lab.ctx.release_id.unwrap();
-        let state = lab.fake.release_state(id).unwrap();
-        let journal = fs::read(&lab.ctx.journal_path).unwrap();
-        assert!(
-            discard_signed(
-                &lab.ctx.dist,
-                &lab.ctx.version,
-                lab.ctx.build,
-                crate::release::SignedDiscard::CancelPreparation
-            )
-            .is_empty()
-        );
-        assert_eq!(lab.fake.release_state(id), Some(state));
-        assert_eq!(fs::read(&lab.ctx.journal_path).unwrap(), journal);
-        check_bytes(&lab.ctx).unwrap();
-        lab.fake.assert_clean();
-    }
-
-    #[test]
-    fn matching_resume_adopts_without_another_upload_and_mismatch_refuses() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        let posts = lab.posts();
-        lab.resume();
-        assert_eq!(
-            lab.posts(),
-            posts,
-            "matching bytes must never be re-uploaded"
-        );
-        let name = channel::dmg_asset_name(&lab.ctx.version);
-        let wrong = vec![b'x'; fs::metadata(lab.ctx.dist.join(&name)).unwrap().len() as usize];
-        lab.fake.apply(agh_fake::Change::AddAsset {
-            release_id: lab.ctx.release_id.unwrap(),
-            spec: agh_fake::AssetSpec::uploaded(&name, &wrong),
-        });
-        let error = lab.stage().unwrap_err();
-        assert!(error.to_string().contains("bytes differ"), "{error}");
-        assert_eq!(lab.posts(), posts, "a mismatch must never clobber");
-        assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
-    }
-
-    /// NEGATIVE CONTROL: the cut has no upload path. Removing a required draft
-    /// asset must refuse before its head PATCH, even with all local bytes present.
-    #[test]
-    fn cut_refuses_an_incomplete_draft_instead_of_repairing_or_publishing_it() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        let id = lab.ctx.release_id.unwrap();
-        let name = channel::dmg_asset_name(&lab.ctx.version);
-        let (asset, _) = release_asset_identity_for_release_id(&lab.ctx.slug, id, &name).unwrap();
-        crate::github::send_once(
-            aterm_update_core::github_rest::Method::Delete,
-            &format!("repos/{}/releases/assets/{asset}", lab.ctx.slug),
-            None,
-        )
-        .unwrap();
-        let posts = lab.posts();
-        assert!(lab.publish().is_err());
-        assert_eq!(posts, lab.posts());
-        assert!(lab.fake.release_state(id).unwrap().0.draft);
-        assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
-    }
-
-    /// NEGATIVE CONTROL: today's make_head publishes each incomplete source pair.
-    #[test]
-    fn cut_requires_both_source_attestations_on_the_bound_release_before_patch() {
-        for missing in [
-            vec!["SHA256SUMS", "SHA256SUMS.sig"],
-            vec!["SHA256SUMS"],
-            vec!["SHA256SUMS.sig"],
-        ] {
-            let mut lab = Lab::new();
-            lab.stage().unwrap();
-            for name in channel::SOURCE_ATTESTATION_ASSETS {
-                if !missing.contains(&name) {
-                    lab.fake.apply(agh_fake::Change::AddAsset {
-                        release_id: lab.ctx.release_id.unwrap(),
-                        spec: agh_fake::AssetSpec::uploaded(name, b"source evidence"),
-                    });
-                }
-            }
-            // A complete pair on another release cannot authorize this cut.
-            let other = lab.fake.release_ids(&lab.ctx.slug)[0];
-            for name in channel::SOURCE_ATTESTATION_ASSETS {
-                lab.fake.apply(agh_fake::Change::AddAsset {
-                    release_id: other,
-                    spec: agh_fake::AssetSpec::uploaded(name, b"foreign source evidence"),
-                });
-            }
-            let posts = lab.posts();
-            let error = lab.publish().unwrap_err().to_string();
-            assert!(error.contains("pub sign-release aterm"), "{error}");
-            for name in missing {
-                assert!(error.contains(name), "{error}");
-            }
-            assert_eq!(lab.posts(), posts);
-            assert!(
-                lab.fake
-                    .release_state(lab.ctx.release_id.unwrap())
-                    .unwrap()
-                    .0
-                    .draft
-            );
-            assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
-            lab.attest();
-            lab.publish().unwrap();
-            lab.fake.assert_clean();
-        }
-    }
-
-    #[test]
-    fn head_patch_refuses_each_duplicated_source_attestation() {
-        for name in channel::SOURCE_ATTESTATION_ASSETS {
-            let mut lab = Lab::new();
-            lab.stage().unwrap();
-            lab.attest();
-            let id = lab.ctx.release_id.unwrap();
-            let path = format!("repos/{}/releases/{id}", lab.ctx.slug);
-            let mut release = crate::github::get(&path).unwrap();
-            let duplicate = release["assets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|a| a["name"].as_str() == Some(name))
-                .unwrap()
-                .clone();
-            release
-                .as_object_mut()
-                .unwrap()
-                .get_mut("assets")
-                .unwrap()
-                .as_array_mut()
-                .unwrap()
-                .push(duplicate);
-            lab.fake.fault(
-                agh_fake::Match::api(&format!("/{path}")).method("GET"),
-                agh_fake::Fault::Status {
-                    status: 200,
-                    body: release.to_string(),
-                    headers: Vec::new(),
-                },
-            );
-            lab.ctx.kind = CutKind::DryRun;
-            let slug = lab.ctx.slug.clone();
-            let error = LiveChannelRelease {
-                ctx: &mut lab.ctx,
-                slug: &slug,
-                bound: Some((id, false)),
-            }
-            .make_head()
-            .unwrap_err()
-            .to_string();
-            assert!(
-                error.contains(name) && error.contains("pub sign-release aterm"),
-                "{error}"
-            );
-            assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
-            lab.fake.assert_clean();
-        }
-    }
-
-    #[test]
-    fn head_patch_rechecks_source_attestations_before_retrying() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        lab.attest();
-        let id = lab.ctx.release_id.unwrap();
-        let path = format!("/repos/{}/releases/{id}", lab.ctx.slug);
-        let release = crate::github::get(&path).unwrap();
-        let mut incomplete = release.clone();
-        incomplete
-            .as_object_mut()
-            .unwrap()
-            .get_mut("assets")
-            .unwrap()
-            .as_array_mut()
-            .unwrap()
-            .retain(|a| a["name"].as_str() != Some("SHA256SUMS.sig"));
-        for response in [release, incomplete] {
-            lab.fake.fault(
-                agh_fake::Match::api(&path).method("GET"),
-                agh_fake::Fault::Status {
-                    status: 200,
-                    body: response.to_string(),
-                    headers: Vec::new(),
-                },
-            );
-        }
-        lab.fake.fault(
-            agh_fake::Match::api(&path).method("PATCH"),
-            agh_fake::Fault::Status {
-                status: 502,
-                body: "transient patch refusal".into(),
-                headers: Vec::new(),
-            },
-        );
-        lab.ctx.kind = CutKind::DryRun;
-        let slug = lab.ctx.slug.clone();
-        let error = LiveChannelRelease {
-            ctx: &mut lab.ctx,
-            slug: &slug,
-            bound: Some((id, false)),
-        }
-        .make_head()
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("SHA256SUMS.sig") && error.contains("pub sign-release aterm"),
-            "{error}"
-        );
-        assert_eq!(
-            lab.fake
-                .seen()
-                .iter()
-                .filter(|r| r.method == "PATCH")
-                .count(),
-            1
-        );
-        assert!(lab.fake.release_state(id).unwrap().0.draft);
-        lab.fake.assert_clean();
-    }
-
-    #[test]
-    fn changing_local_signed_bytes_or_the_reservation_refuses_adoption() {
-        let mut lab = Lab::new();
-        lab.stage().unwrap();
-        check_bytes(&lab.ctx).unwrap();
-        fs::write(lab.ctx.dmg_path(), b"changed").unwrap();
-        assert!(check_bytes(&lab.ctx).is_err());
-        assert!(authority(&lab.ctx.repo, &"f".repeat(40), lab.ctx.build).is_err());
-        lab.publish().unwrap_err();
-    }
-
-    #[test]
-    fn an_unowned_draft_is_never_adopted_even_when_empty() {
-        let mut lab = Lab::new();
-        let foreign = lab.fake.add_release(
-            &lab.ctx.slug,
-            agh_fake::ReleaseSpec::draft(&lab.ctx.tag, "2026-11-09T00:00:00Z"),
-        );
-        assert!(lab.stage().is_err());
-        assert_eq!(lab.posts(), 0);
-        assert!(lab.fake.release_state(foreign).unwrap().1.is_empty());
-        assert!(!lab.ctx.release_intent);
-    }
-}
+#[path = "draft_tests.rs"]
+pub(crate) mod tests;

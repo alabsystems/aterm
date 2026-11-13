@@ -1,4 +1,4 @@
-# claude-code 2.1.318 · MEASURED 2026-11-06, `aterm ctl text` of a private headless aterm (170x40, aterm 0.158.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the usage tap's row in its week form (a stand-in statusLine command, refreshInterval 1, that prints `week 63% used · resets Sat 10:00`) mid-turn while a slow Bash tool runs (`echo waiting && sleep 30 && echo done`, allowed in settings), 170x40: the row stays directly under the composer's bottom rule, from column 2
+# claude-code 2.1.318 · MEASURED 2026-11-06, `aterm ctl text` of a private headless aterm (170x40, aterm 0.158.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the usage tap's row in its week form (a stand-in statusLine command, refreshInterval 1, that prints `week 37% left · resets Sat 10:00`) mid-turn while a slow Bash tool runs (`echo waiting && sleep 30 && echo done`, allowed in settings), 170x40: the row stays directly under the composer's bottom rule, from column 2
  ▐▛███▛█   Claude Code v2.1.318
 ▝▜██████▀  Sonnet 5.5 · Claude API
  ▝▝   ▝▝   /private/tmp/at.lT6Q/proj
@@ -16,5 +16,5 @@
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  week 63% used · resets Sat 10:00
+  week 37% left · resets Sat 10:00
   ⏵⏵ auto mode on (shift+tab to cycle)

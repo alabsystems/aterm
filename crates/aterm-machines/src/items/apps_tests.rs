@@ -1,0 +1,2197 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+use crate::model::{HostFacts, Outcome};
+use crate::port::{Fake, Ran, Stat};
+
+/// Sample `hdiutil attach -plist` output for `Caffeine.dmg`.
+pub(crate) const ATTACH_CAFFEINE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>system-entities</key>
+	<array>
+		<dict>
+			<key>content-hint</key>
+			<string>Apple_HFS</string>
+			<key>dev-entry</key>
+			<string>/dev/disk6s1</string>
+			<key>mount-point</key>
+			<string>/private/tmp/swteam/stage/dmg.9CxWxv</string>
+			<key>potentially-mountable</key>
+			<true/>
+			<key>unmapped-content-hint</key>
+			<string>48465300-0000-11AA-AA11-00306543ECAC</string>
+			<key>volume-kind</key>
+			<string>hfs</string>
+		</dict>
+		<dict>
+			<key>content-hint</key>
+			<string>GUID_partition_scheme</string>
+			<key>dev-entry</key>
+			<string>/dev/disk6</string>
+			<key>potentially-mountable</key>
+			<false/>
+			<key>unmapped-content-hint</key>
+			<string>GUID_partition_scheme</string>
+		</dict>
+	</array>
+</dict>
+</plist>
+"#;
+
+/// `spctl -a -vv -t exec` on the mounted Caffeine.app, VM (Gatekeeper off), stderr.
+const SPCTL_CAFFEINE_OFF: &str = "/private/tmp/swteam/stage/dmg.9CxWxv/Caffeine.app: accepted\nsource=Notarized Developer ID\noverride=security disabled\norigin=Developer ID Application: Michael Jones (YD6LEYT6WZ)\n";
+
+/// The same check on an ad hoc signed app, VM (Gatekeeper off): accepted all the same.
+const SPCTL_ADHOC_OFF: &str =
+    "/private/tmp/swteam/adhoc/X.app: accepted\noverride=security disabled\n";
+
+/// Sample `spctl -a -vv -t exec` output for `KeepingYouAwake.app` with Gatekeeper enabled.
+pub(crate) const SPCTL_KYA_ON: &str = "kya/KeepingYouAwake.app: accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Marcel Dierkes (5KESHV9W85)\n";
+
+/// `spctl -a -vv -t exec` on an ad hoc signed app, this Mac (Gatekeeper on): exit 3.
+const SPCTL_ADHOC_ON: &str = "/private/tmp/sw-adhoc/X.app: rejected\n";
+
+/// Sample `codesign --verify` stderr on Team ID mismatch.
+pub(crate) const CODESIGN_WRONG_TEAM: &str =
+    "test-requirement: code failed to satisfy specified code requirement(s)\n";
+
+/// `codesign --verify` on an unsigned binary, VM: exit 1, stderr.
+const CODESIGN_UNSIGNED: &str =
+    "./unsigned-ls: code object is not signed at all\nIn architecture: arm64e.x1\n";
+
+/// Sample `pkgutil --check-signature` stdout for `Homebrew-7.0.9.pkg`.
+pub(crate) const PKGUTIL_HOMEBREW: &str = r#"Package "Homebrew-7.0.9.pkg":
+   Status: signed by a developer certificate issued by Apple for distribution
+   Notarization: trusted by the Apple notary service
+   Signed with a trusted timestamp on: 2026-10-08 10:47:18 +0000
+   Certificate Chain:
+    1. Developer ID Installer: Patrick Linnane (927JGANW46)
+       Expires: 2029-07-02 15:50:33 +0000
+       SHA256 Fingerprint:
+           3C 5D AA 66 55 A8 89 1F C1 E0 C0 60 8A EB 6B 3D 06 54 9E 05 A6 7C
+           1D C9 03 CE A8 D5 21 20 AA C0
+       ------------------------------------------------------------------------
+    2. Developer ID Certification Authority
+       Expires: 2031-09-17 00:00:00 +0000
+       SHA256 Fingerprint:
+           F1 6C D3 C5 4C 7F 83 CE A4 BF 1A 3E 6A 08 19 C8 AA A8 E4 A1 52 8F
+           D1 44 71 5F 35 06 43 D2 DF 3A
+       ------------------------------------------------------------------------
+    3. Apple Root CA
+       Expires: 2035-02-09 21:40:36 +0000
+       SHA256 Fingerprint:
+           B0 B1 73 0E CB C7 FF 45 05 14 2C 49 F1 29 5E 6E DA 6B CA ED 7E 2C
+           68 C5 BE 91 B5 A1 10 01 F0 24
+
+"#;
+
+/// `pkgutil --check-signature gh_2.102.0_macOS_universal.pkg`, VM: exit 1, stdout.
+const PKGUTIL_GH: &str = "Package \"gh_2.102.0_macOS_universal.pkg\":\n   Status: no signature\n";
+
+/// Sample `spctl -a -vv -t install` stderr for `Homebrew-7.0.9.pkg` with Gatekeeper disabled.
+pub(crate) const SPCTL_HOMEBREW_OFF: &str = "Homebrew-7.0.9.pkg: accepted\nsource=Notarized Developer ID\noverride=security disabled\norigin=Developer ID Installer: Patrick Linnane (927JGANW46)\n";
+
+/// `installer -pkg gh_2.102.0_macOS_universal.pkg -target /`, VM: exit 0, stdout.
+const INSTALLER_GH: &str = "installer: Package name is GitHub CLI\ninstaller: Installing at base path /\ninstaller: The install was successful.\n";
+
+/// `pkgutil --pkg-info com.github.cli` after that install, VM.
+const PKGINFO_GH: &str = "package-id: com.github.cli\nversion: 2.102.0\nvolume: /\nlocation: \ninstall-time: 1792192481\n";
+
+/// `pkgutil --pkg-info com.github.cli` before it, VM: exit 1, stderr.
+const PKGINFO_ABSENT: &str = "No receipt for 'com.github.cli' found at '/'.\n";
+
+/// `PlistBuddy -c 'Print :NoSuchKey' …/Info.plist`, VM: exit 1.
+const PLISTBUDDY_NO_KEY: &str = "Print: Entry, \":NoSuchKey\", Does Not Exist\n";
+
+pub(crate) const CAFFEINE_SHA: &str =
+    "1ad34c3299a0c866873c4feb432c3e11186375adb6f43c5f481ae9d46d06d723";
+const KYA_SHA: &str = "8001a149b4490c008fdac19898bce9902d516c4aa6412a7eb0f9a37443b15c6b";
+const GH_SHA: &str = "1787e65f36626245a6b3cee353a458f6ea4372008548ceb8fb5d5dfb55b006d0";
+
+pub(crate) fn ok(out: &str) -> Ran {
+    Ran::ok(out)
+}
+
+pub(crate) fn err(status: i32, stderr: &str) -> Ran {
+    Ran::exit(status, stderr)
+}
+
+pub(crate) fn out_status(status: i32, stdout: &str) -> Ran {
+    Ran {
+        status: Some(status),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
+}
+
+pub(crate) fn dir() -> Stat {
+    Stat {
+        uid: 0,
+        gid: 0,
+        mode: 0o755,
+        dir: true,
+        symlink: false,
+        len: 0,
+    }
+}
+
+pub(crate) fn file() -> Stat {
+    Stat {
+        dir: false,
+        mode: 0o644,
+        ..dir()
+    }
+}
+
+pub(crate) fn admin() -> User {
+    User {
+        name: "admin".into(),
+        uid: 501,
+        gid: 20,
+        home: "/Users//admin".into(),
+        shell: "/bin/zsh".into(),
+        admin: true,
+    }
+}
+
+/// Returns the staging directory path for `sequence` in the fake backend.
+pub(crate) fn stage_path(sequence: u64) -> String {
+    Fake::scratch_path(Some(Path::new(STAGE_ROOT)), "install", sequence)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Builds a test [`Ctx`] with `cached` artifacts seeded in `sys`.
+pub(crate) fn ctx_with(sys: &Fake, cached: &[(&str, &[u8])], disrupt: bool) -> Ctx {
+    let mut facts = HostFacts {
+        arch: "arm64".into(),
+        ..HostFacts::default()
+    };
+    for (sha, bytes) in cached {
+        sys.file(&format!("/c/{sha}"), bytes);
+        facts.cached.push((*sha).to_owned());
+    }
+    sys.stat_of(crate::AGENT_ROOT, dir()).stat_of(
+        STAGE_ROOT,
+        Stat {
+            mode: 0o700,
+            ..dir()
+        },
+    );
+    Ctx {
+        facts,
+        users: vec![admin()],
+        console: Some(admin()),
+        host_name: "lab-07".into(),
+        cache_dir: "/c".into(),
+        disrupt,
+    }
+}
+
+/// Returns the hex SHA-256 digest of `bytes`.
+pub(crate) fn sha_of(bytes: &[u8]) -> String {
+    let mut h = aterm_digest::Sha256::new();
+    h.update(bytes);
+    aterm_codec::hex::encode_lower(&h.finalize())
+}
+
+pub(crate) fn codesign_key(path: &str, team: &str) -> String {
+    codesign_cmd(Path::new(path), team).display()
+}
+
+fn caffeine_row(sha: &str) -> Row {
+    Row {
+        name: "Caffeine".into(),
+        kind: Kind::DmgApp,
+        url: "https://github.com/IntelliScape/caffeine/releases/download/1.1.4/Caffeine.dmg".into(),
+        sha256: sha.into(),
+        team_id: Some("YD6LEYT6WZ".into()),
+        unsigned: false,
+        bundle: Some("Caffeine.app".into()),
+        pkg_id: None,
+        binary: None,
+        version: "1.1.4".into(),
+    }
+}
+
+fn kya_row(sha: &str) -> Row {
+    Row {
+        name: "KeepingYouAwake".into(),
+        kind: Kind::ZipApp,
+        url: "https://github.com/newmarcel/KeepingYouAwake/releases/download/1.6.8/KeepingYouAwake-1.6.8.zip".into(),
+        sha256: sha.into(),
+        team_id: Some("5KESHV9W85".into()),
+        unsigned: false,
+        bundle: Some("KeepingYouAwake.app".into()),
+        pkg_id: None,
+        binary: None,
+        version: "1.6.8".into(),
+    }
+}
+
+fn gh_row(sha: &str) -> Row {
+    Row {
+        name: "gh".into(),
+        kind: Kind::Pkg,
+        url: "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_universal.pkg"
+            .into(),
+        sha256: sha.into(),
+        team_id: Some("VEKTX9H2N7".into()),
+        unsigned: true,
+        bundle: None,
+        pkg_id: Some("com.github.cli".into()),
+        binary: Some("/usr/local/bin/gh".into()),
+        version: "2.102.0".into(),
+    }
+}
+
+fn plistbuddy(bundle: &str, key: &str) -> String {
+    format!("/usr/libexec/PlistBuddy -c 'Print :{key}' {bundle}/Contents/Info.plist")
+}
+
+fn one(row: &Row, sys: &Fake, ctx: &Ctx, mode: crate::model::Mode) -> crate::model::ItemReport {
+    let items = expand(std::slice::from_ref(row), ctx).unwrap();
+    crate::engine::run(&items, mode, sys, ctx, &mut crate::engine::NoJournal)
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn the_team_requirement_is_install_sh_s_developer_id_chain() {
+    assert_eq!(
+        codesign_key("/Applications/Caffeine.app", "YD6LEYT6WZ"),
+        "/usr/bin/codesign --verify --deep --strict '-R=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"YD6LEYT6WZ\"' /Applications/Caffeine.app"
+    );
+}
+
+#[test]
+fn codesign_exit_3_is_another_team_and_exit_1_is_unsigned() {
+    let sys = Fake::root();
+    let key = codesign_key("/x", "VEKTX9H2N7");
+    sys.on(&key, ok(""));
+    assert_eq!(
+        verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"),
+        Signed::Team
+    );
+    let sys = Fake::root();
+    sys.on(&key, err(3, CODESIGN_WRONG_TEAM));
+    assert!(
+        matches!(verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"), Signed::Other(w) if w.contains("not by Developer ID team VEKTX9H2N7"))
+    );
+    let sys = Fake::root();
+    sys.on(&key, err(1, CODESIGN_UNSIGNED));
+    assert!(
+        matches!(verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"), Signed::Other(w) if w.contains("not signed at all"))
+    );
+    let sys = Fake::root();
+    assert!(matches!(
+        verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"),
+        Signed::Unusable(_)
+    ));
+}
+
+#[test]
+fn a_malformed_team_never_reaches_a_code_requirement() {
+    let sys = Fake::root();
+    assert!(matches!(
+        verify_team(&sys, Path::new("/x"), "X\" or true"),
+        Signed::Other(_)
+    ));
+    assert!(sys.calls().is_empty());
+}
+
+#[test]
+fn gatekeeper_off_is_an_override_not_a_pass_even_for_an_ad_hoc_app() {
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/spctl -a -vv -t exec /a",
+        err(0, SPCTL_CAFFEINE_OFF),
+    );
+    sys.on("/usr/sbin/spctl -a -vv -t exec /b", err(0, SPCTL_ADHOC_OFF));
+    sys.on("/usr/sbin/spctl -a -vv -t exec /c", err(0, SPCTL_KYA_ON));
+    sys.on("/usr/sbin/spctl -a -vv -t exec /d", err(3, SPCTL_ADHOC_ON));
+    assert_eq!(
+        assess(&sys, Path::new("/a"), Assess::Exec),
+        Gatekeeper::Overridden {
+            how: "security disabled".into(),
+            source: "Notarized Developer ID".into()
+        }
+    );
+    assert_eq!(
+        assess(&sys, Path::new("/b"), Assess::Exec),
+        Gatekeeper::Overridden {
+            how: "security disabled".into(),
+            source: String::new()
+        }
+    );
+    assert_eq!(
+        assess(&sys, Path::new("/c"), Assess::Exec),
+        Gatekeeper::Accepted("Notarized Developer ID".into())
+    );
+    assert!(matches!(
+        assess(&sys, Path::new("/d"), Assess::Exec),
+        Gatekeeper::Rejected(_)
+    ));
+}
+
+#[test]
+fn a_rejection_on_an_app_store_only_mac_says_it_is_the_mac_s_setting() {
+    let rejected = "/s/Caffeine.app: rejected\nsource=Notarized Developer ID\norigin=Developer ID Application: Michael Jones (YD6LEYT6WZ)\n";
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/spctl -a -vv -t exec /s/Caffeine.app",
+        err(3, rejected),
+    );
+    sys.on(
+        "/usr/sbin/spctl --status -v",
+        out_status(0, "assessments enabled\ndeveloper id disabled\n"),
+    );
+    let why = require_gatekeeper(
+        &sys,
+        Path::new("/s/Caffeine.app"),
+        Assess::Exec,
+        &Notes::default(),
+    )
+    .unwrap_err();
+    assert!(why.contains("App Store only"), "{why}");
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/spctl -a -vv -t exec /s/Caffeine.app",
+        err(3, rejected),
+    );
+    sys.on(
+        "/usr/sbin/spctl --status -v",
+        out_status(0, "assessments enabled\ndeveloper id enabled\n"),
+    );
+    let why = require_gatekeeper(
+        &sys,
+        Path::new("/s/Caffeine.app"),
+        Assess::Exec,
+        &Notes::default(),
+    )
+    .unwrap_err();
+    assert!(!why.contains("App Store only"), "{why}");
+}
+
+#[test]
+fn the_mount_point_comes_from_hdiutil_s_plist() {
+    assert_eq!(
+        mount_points(ATTACH_CAFFEINE),
+        [PathBuf::from("/private/tmp/swteam/stage/dmg.9CxWxv")]
+    );
+    assert_eq!(
+        mount_points("<key>mount-point</key>\n<string>/a &amp; b</string>"),
+        [PathBuf::from("/a & b")]
+    );
+    assert!(mount_points("<plist/>").is_empty());
+}
+
+#[test]
+fn an_image_is_detached_even_when_the_work_on_it_fails() {
+    let sys = Fake::root();
+    sys.on(
+        "/usr/bin/hdiutil attach -readonly -nobrowse -noautoopen -mountrandom /s -plist /i.dmg",
+        ok(ATTACH_CAFFEINE),
+    );
+    sys.on(
+        "/usr/bin/hdiutil detach /private/tmp/swteam/stage/dmg.9CxWxv",
+        ok("\"disk6\" ejected.\n"),
+    );
+    let r: Result<(), String> = with_image(&sys, Path::new("/i.dmg"), Path::new("/s"), |_| {
+        Err("copy failed".into())
+    });
+    assert_eq!(r, Err("copy failed".into()));
+    assert_eq!(
+        sys.calls().last().map(String::as_str),
+        Some("/usr/bin/hdiutil detach /private/tmp/swteam/stage/dmg.9CxWxv")
+    );
+}
+
+#[test]
+fn a_refused_detach_is_forced() {
+    let sys = Fake::root();
+    sys.on(
+        "/usr/bin/hdiutil detach /m",
+        err(16, "hdiutil: couldn't unmount \"disk6\" - Resource busy"),
+    );
+    sys.on("/usr/bin/hdiutil detach -force /m", ok(""));
+    assert_eq!(detach(&sys, Path::new("/m")), Ok(()));
+}
+
+#[test]
+fn exactly_one_real_app_at_the_root_is_required() {
+    let sys = Fake::root();
+    sys.file("/m/Caffeine.app", b"")
+        .stat_of("/m/Caffeine.app", dir());
+    sys.file("/m/.DS_Store", b"");
+    sys.file("/m/Applications", b"").stat_of(
+        "/m/Applications",
+        Stat {
+            symlink: true,
+            ..file()
+        },
+    );
+    assert_eq!(one_app_in(&sys, Path::new("/m")), Ok("Caffeine.app".into()));
+    sys.file("/m/Other.app", b"").stat_of("/m/Other.app", dir());
+    assert!(
+        one_app_in(&sys, Path::new("/m"))
+            .unwrap_err()
+            .contains("2 .app")
+    );
+    let sys = Fake::root();
+    sys.file("/z/Link.app", b"").stat_of(
+        "/z/Link.app",
+        Stat {
+            symlink: true,
+            ..dir()
+        },
+    );
+    assert!(
+        one_app_in(&sys, Path::new("/z"))
+            .unwrap_err()
+            .contains("0 .app")
+    );
+}
+
+#[test]
+fn the_mach_o_magic_tells_a_universal_binary_from_a_java_class() {
+    assert!(is_macho(&[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0x01]));
+    assert!(is_macho(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]));
+    assert!(!is_macho(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52]));
+    assert!(!is_macho(b"#!/bin/sh\n"));
+    assert!(!is_macho(&[0xcf, 0xfa]));
+}
+
+#[test]
+fn pkgutil_names_the_installer_leaf_and_its_team() {
+    assert_eq!(
+        parse_pkg_signature(Some(0), PKGUTIL_HOMEBREW),
+        PkgSignature::Signed {
+            status: "signed by a developer certificate issued by Apple for distribution".into(),
+            leaf: "Developer ID Installer: Patrick Linnane (927JGANW46)".into(),
+            team: "927JGANW46".into(),
+            notarized: true
+        }
+    );
+    assert_eq!(
+        parse_pkg_signature(Some(1), PKGUTIL_GH),
+        PkgSignature::Unsigned
+    );
+    assert!(matches!(
+        parse_pkg_signature(None, ""),
+        PkgSignature::Unusable(_)
+    ));
+}
+
+#[test]
+fn a_receipt_reads_its_version_and_pkgutil_s_no_receipt_is_absent() {
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/pkgutil --pkg-info com.github.cli",
+        ok(PKGINFO_GH),
+    );
+    assert_eq!(
+        receipt_version(&sys, "com.github.cli"),
+        Read::Value("2.102.0".into())
+    );
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/pkgutil --pkg-info com.github.cli",
+        err(1, PKGINFO_ABSENT),
+    );
+    assert_eq!(receipt_version(&sys, "com.github.cli"), Read::Absent);
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/pkgutil --pkg-info com.github.cli",
+        err(2, "boom"),
+    );
+    assert!(matches!(
+        receipt_version(&sys, "com.github.cli"),
+        Read::Unusable(_)
+    ));
+}
+
+#[test]
+fn a_missing_key_is_absent_and_a_failed_read_is_not() {
+    let sys = Fake::root();
+    sys.file("/A.app/Contents/Info.plist", b"");
+    sys.on(
+        &plistbuddy("/A.app", "CFBundleShortVersionString"),
+        ok("1.1.4\n"),
+    );
+    sys.on(
+        &plistbuddy("/A.app", "NoSuchKey"),
+        out_status(1, PLISTBUDDY_NO_KEY),
+    );
+    assert_eq!(
+        bundle_info(&sys, Path::new("/A.app"), "CFBundleShortVersionString"),
+        Read::Value("1.1.4".into())
+    );
+    assert_eq!(
+        bundle_info(&sys, Path::new("/A.app"), "NoSuchKey"),
+        Read::Absent
+    );
+    assert!(matches!(
+        bundle_info(&sys, Path::new("/A.app"), "Other"),
+        Read::Unusable(_)
+    ));
+    assert_eq!(bundle_info(&sys, Path::new("/B.app"), "X"), Read::Absent);
+}
+
+#[test]
+fn a_row_without_a_team_or_a_bundle_or_an_https_url_is_refused() {
+    let ctx = ctx_with(&Fake::root(), &[], true);
+    let mut row = caffeine_row(CAFFEINE_SHA);
+    row.team_id = None;
+    assert!(
+        expand(&[row], &ctx)
+            .err()
+            .unwrap()
+            .contains("team_id is required")
+    );
+    let mut row = caffeine_row(CAFFEINE_SHA);
+    row.bundle = None;
+    assert!(
+        expand(&[row], &ctx)
+            .err()
+            .unwrap()
+            .contains("names its bundle")
+    );
+    let mut row = caffeine_row(CAFFEINE_SHA);
+    row.url = "http://example.com/x.dmg".into();
+    assert!(expand(&[row], &ctx).err().unwrap().contains("not https"));
+    let mut row = gh_row(GH_SHA);
+    row.pkg_id = None;
+    assert!(expand(&[row], &ctx).err().unwrap().contains("pkg_id"));
+    let mut row = caffeine_row("abc");
+    row.sha256 = "abc".into();
+    assert!(
+        expand(&[row], &ctx)
+            .err()
+            .unwrap()
+            .contains("64 hexadecimal")
+    );
+}
+
+/// The installed Caffeine.app at 1.1.4, signed by its team.
+fn installed_caffeine(sys: &Fake, version: &str) {
+    sys.file("/Applications/Caffeine.app", b"")
+        .stat_of("/Applications/Caffeine.app", dir());
+    sys.file("/Applications/Caffeine.app/Contents/Info.plist", b"");
+    sys.on(
+        &plistbuddy("/Applications/Caffeine.app", "CFBundleShortVersionString"),
+        ok(&format!("{version}\n")),
+    );
+    sys.on(
+        &codesign_key("/Applications/Caffeine.app", "YD6LEYT6WZ"),
+        ok(""),
+    );
+}
+
+#[test]
+fn an_installed_bundle_at_the_pinned_version_and_team_is_ok() {
+    let sys = Fake::root();
+    installed_caffeine(&sys, "1.1.4");
+    let ctx = ctx_with(&sys, &[], false);
+    let row = one(
+        &caffeine_row(CAFFEINE_SHA),
+        &sys,
+        &ctx,
+        crate::model::Mode::Apply,
+    );
+    assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+    assert_eq!(
+        row.to.as_deref(),
+        Some("Caffeine.app 1.1.4 (team YD6LEYT6WZ)")
+    );
+    assert_eq!(row.id, "app.Caffeine");
+}
+
+#[test]
+fn a_missing_artifact_blocks_the_install() {
+    let sys = Fake::root();
+    let ctx = ctx_with(&sys, &[], true);
+    let row = one(
+        &caffeine_row(CAFFEINE_SHA),
+        &sys,
+        &ctx,
+        crate::model::Mode::Plan,
+    );
+    assert_eq!(row.outcome, Outcome::Blocked);
+    assert!(
+        row.why
+            .unwrap()
+            .contains("not in the cache; the controller uploads it")
+    );
+}
+
+#[test]
+fn an_older_bundle_that_is_running_waits_for_an_idle_mac() {
+    let sys = Fake::root();
+    installed_caffeine(&sys, "1.1.3");
+    sys.running(&["/Applications/Caffeine.app/Contents/MacOS/Caffeine"]);
+    let bytes = b"dmg";
+    let sha = sha_of(bytes);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], false);
+    let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Plan);
+    assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Plan);
+    assert_eq!(row.outcome, Outcome::Planned);
+    assert_eq!(row.from.as_deref(), Some("1.1.3"));
+}
+
+/// The pid [`judged`] reads the table as.
+const ME: u32 = 4000;
+
+/// One row of a process table: a program launchd started, so with no controlling terminal.
+fn proc_row(pid: u32, exe: Option<&str>, comm: &str) -> crate::port::Process {
+    crate::port::Process {
+        pid,
+        ppid: crate::port::Process::LAUNCHD,
+        terminal: false,
+        exe: exe.map(PathBuf::from),
+        comm: comm.into(),
+    }
+}
+
+/// [`running_in`] for Caffeine.app as [`running`] reads it ([`caffeine`]), read by [`ME`]:
+/// [`judged_by`] that bundle.
+fn judged(rows: &[crate::port::Process], words: &[(u32, &str)]) -> (bool, Vec<u32>) {
+    judged_by(&caffeine(), rows, words)
+}
+
+/// [`running_in`] for `bundle`, read by [`ME`], `words` being the first argument word a pid's
+/// read finds, before `-v` (any other pid's read finds nothing, as a held program's): whether
+/// it runs, and the pids whose arguments were read.
+fn judged_by(
+    bundle: &Programs,
+    rows: &[crate::port::Process],
+    words: &[(u32, &str)],
+) -> (bool, Vec<u32>) {
+    let mut read = Vec::new();
+    let running = running_in(rows, ME, bundle, |row| {
+        read.push(row.pid);
+        words
+            .iter()
+            .find(|(pid, _)| *pid == row.pid)
+            .map(|(_, first)| vec![std::ffi::OsString::from(first), "-v".into()])
+    });
+    (running, read)
+}
+
+const CAFFEINE: &str = "/Applications/Caffeine.app";
+const CAFFEINE_EXE: &str = "/Applications/Caffeine.app/Contents/MacOS/Caffeine";
+/// The first bytes of a 64-bit Mach-O executable: a program that is no script.
+const MACH_O: &[u8] = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01";
+
+/// Caffeine.app as [`running`] reads it ([`Programs::of`]) where its `Contents/MacOS` holds the
+/// one program `Caffeine`, no script, and its path is canonical.
+fn caffeine() -> Programs {
+    let sys = Fake::root();
+    sys.file(CAFFEINE_EXE, MACH_O);
+    Programs::of(&sys, Path::new(CAFFEINE))
+}
+
+/// [`running`] judges a table against the bundle as given and as the kernel spells it once
+/// its links are followed (a bundle under a linked folder, as `/var` is `/private/var`), and
+/// [`judged`] against what [`running`] reads for Caffeine.app: its one canonical spelling, no
+/// other the kernel never names. NEGATIVE CONTROL (scratch): a [`Programs::of`] that adds no
+/// canonical spelling (`roots.extend(..)` dropped) fails the first assertion.
+#[test]
+fn a_bundle_counts_in_the_spelling_the_kernel_names_it() {
+    let sys = Fake::root();
+    sys.link(CAFFEINE, "/Volumes/Apps/Caffeine.app");
+    sys.running(&["/Volumes/Apps/Caffeine.app/Contents/MacOS/Caffeine"]);
+    assert_eq!(
+        running(&sys, Path::new(CAFFEINE)),
+        Read::Value(true),
+        "at its link's target"
+    );
+    sys.running(&["/Volumes/Apps/Other.app/Contents/MacOS/Caffeine"]);
+    assert_eq!(running(&sys, Path::new(CAFFEINE)), Read::Value(false));
+    assert_eq!(
+        caffeine(),
+        Programs {
+            roots: vec![PathBuf::from(CAFFEINE)],
+            names: vec!["Caffeine".into()],
+            interpreters: Vec::new(),
+        }
+    );
+}
+
+/// [`running`] reads the words of a process that runs one of the bundle's programs from
+/// elsewhere (the bundle an earlier replacement moved aside), and it counts by its first word
+/// naming a path inside the bundle; one whose first word is bare (a `PATH` lookup) does not.
+/// NEGATIVE CONTROL (scratch): a [`running`] that reads no process's words (`|row|
+/// sys.process_argv(row)` made `|_| None`) fails the second assertion.
+#[test]
+fn a_moved_aside_program_counts_by_the_words_running_reads() {
+    let sys = Fake::root();
+    sys.file(CAFFEINE_EXE, MACH_O);
+    let aside = "/Library/Management/aterm/stage/0/old/Caffeine.app/Contents/MacOS/Caffeine";
+    sys.process(
+        proc_row(Fake::PIDS, Some(aside), "Caffeine"),
+        Some(&["Caffeine", CAFFEINE_EXE]),
+    );
+    let bundle = Path::new(CAFFEINE);
+    assert_eq!(
+        running(&sys, bundle),
+        Read::Value(false),
+        "a bare first word"
+    );
+    sys.process(
+        proc_row(Fake::PIDS + 1, Some(aside), "Caffeine"),
+        Some(&[CAFFEINE_EXE, "-v"]),
+    );
+    assert_eq!(running(&sys, bundle), Read::Value(true), "its first word");
+}
+
+/// [`interpreters`] names what each `#!` line runs under: `/bin/sh` also as the shell
+/// `/private/var/select/sh` links to, `env`'s program, an absolute interpreter also by the
+/// file its path resolves to (a link `qsh -> /bin/bash` runs as `bash`, Homebrew's or conda's
+/// `bin/python3 -> python3.13` as `python3.13`), a Python also as `Python` (a framework Python
+/// re-execs into its `Python.app`, measured on macOS 27); none for a Mach-O or a file it
+/// cannot read. NEGATIVE CONTROLS (scratch): no `Python` arm fails the three Python rows;
+/// following no interpreter's link (`real` made `None`) fails the `qsh` and `python3` rows.
+#[test]
+fn a_script_s_line_names_what_its_interpreter_runs_under() {
+    let sys = Fake::root();
+    sys.link("/private/var/select/sh", "/bin/bash");
+    sys.link("/usr/local/bin/python3", "../Cellar/python/bin/python3.13");
+    sys.link("/opt/tools/bin/qsh", "/bin/bash");
+    let qs = "/Applications/Qs.app/Contents/MacOS";
+    for (line, names) in [
+        ("#!/bin/sh\nexec sleep 40\n", &["bash", "sh"][..]),
+        ("#! /bin/zsh -f\n", &["zsh"]),
+        ("#!/usr/bin/env -S LANG=C perl -w\n", &["env", "perl"]),
+        ("#!/usr/bin/env sh", &["bash", "env", "sh"]),
+        ("#!/opt/tools/bin/qsh -e\n", &["bash", "qsh"]),
+        (
+            "#!/usr/local/bin/python3\n",
+            &["Python", "python3", "python3.13"],
+        ),
+        ("#!/usr/bin/env python3\n", &["Python", "env", "python3"]),
+        (
+            "#!/opt/homebrew/bin/python3.13\n",
+            &["Python", "python3.13"],
+        ),
+        ("#!\n", &[]),
+    ] {
+        sys.file(&format!("{qs}/Qs"), line.as_bytes());
+        let mut got = interpreters(&sys, Path::new(&format!("{qs}/Qs")));
+        got.sort();
+        got.dedup();
+        assert_eq!(got, names, "{line:?}");
+    }
+    sys.file(&format!("{qs}/Qs"), MACH_O);
+    assert!(
+        interpreters(&sys, Path::new(&format!("{qs}/Qs"))).is_empty(),
+        "a Mach-O"
+    );
+    assert!(
+        interpreters(&sys, Path::new(&format!("{qs}/None"))).is_empty(),
+        "unread"
+    );
+}
+
+/// A program of the bundle that links to a file elsewhere in it (`../Resources/run.sh`, which
+/// the kernel runs as the link's path, inside the bundle) gives its file's interpreter, the
+/// bundle spelled through a link too; one that links out of the bundle, by an absolute path or
+/// by `..`, gives none, so no file outside the bundle is read. NEGATIVE CONTROLS (scratch):
+/// reading each program's first line at its path in `Contents/MacOS` (its `canonicalize(..)`
+/// dropped) loses `zsh`; reading wherever it resolves (the `starts_with(real)` filter
+/// dropped) adds `ksh` and `perl`.
+#[test]
+fn a_program_linked_inside_the_bundle_is_read_and_one_linked_out_of_it_is_not() {
+    let sys = Fake::root();
+    sys.link("/Volumes/Apps", "/Applications");
+    sys.file(
+        "/Applications/Qs.app/Contents/Resources/run.sh",
+        b"#!/bin/zsh\n",
+    );
+    sys.link(
+        "/Applications/Qs.app/Contents/MacOS/Qs",
+        "../Resources/run.sh",
+    );
+    sys.file("/Users//alice/outside.sh", b"#!/usr/bin/perl\n");
+    sys.link(
+        "/Applications/Qs.app/Contents/MacOS/Out",
+        "/Users//alice/outside.sh",
+    );
+    sys.file(
+        "/Applications/Other.app/Contents/MacOS/run",
+        b"#!/bin/ksh\n",
+    );
+    sys.link(
+        "/Applications/Qs.app/Contents/MacOS/Up",
+        "../../../Other.app/Contents/MacOS/run",
+    );
+    let qs = Programs::of(&sys, Path::new("/Volumes/Apps/Qs.app"));
+    assert_eq!(
+        (qs.names, qs.interpreters),
+        (
+            vec!["Out".to_owned(), "Qs".to_owned(), "Up".to_owned()],
+            vec!["zsh".to_owned()]
+        )
+    );
+}
+
+const QS: &str = "/Applications/Qs.app";
+/// Qs.app's `sh` script, its `env perl` script and its Python script.
+const QS_SH: &str = "/Applications/Qs.app/Contents/MacOS/Qs";
+const QS_PERL: &str = "/Applications/Qs.app/Contents/MacOS/Tool";
+const QS_PY: &str = "/Applications/Qs.app/Contents/MacOS/Py";
+
+/// A Mac whose `/bin/sh` runs `bash`, with Qs.app installed: its programs are the three
+/// scripts [`QS_SH`], [`QS_PERL`] and [`QS_PY`].
+fn qs_installed() -> Fake {
+    let sys = Fake::root();
+    sys.link("/private/var/select/sh", "/bin/bash");
+    sys.file(QS_SH, b"#!/bin/sh\nexec sleep 40\n");
+    sys.file(QS_PERL, b"#!/usr/bin/env perl\n");
+    sys.file(QS_PY, b"#!/usr/bin/python3\n");
+    sys
+}
+
+/// A program of the bundle that is a script, started as an app, runs as its interpreter,
+/// outside the bundle, under one of the names [`interpreters`] gives: [`running`] counts a
+/// process launchd started under one of those names any of whose words is the script's path,
+/// whether a shell, `perl` or a framework `Python`. NEGATIVE CONTROLS (scratch): a
+/// [`running_in`] that reads no interpreter's words (its `bundle.interpreters.contains(..)`
+/// arm dropped) fails all three; no `Python` arm in [`interpreters`] fails the `Python` one.
+#[test]
+fn a_script_of_the_bundle_started_as_an_app_counts_by_its_interpreter_s_words() {
+    let python = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/\
+                  Versions/3.9/Resources/Python.app/Contents/MacOS/Python";
+    for (exe, comm, words) in [
+        ("/bin/bash", "bash", ["/bin/sh", QS_SH]),
+        ("/usr/bin/perl", "perl", ["perl", QS_PERL]),
+        (python, "Python", [python, QS_PY]),
+    ] {
+        let sys = qs_installed();
+        sys.process(proc_row(Fake::PIDS, Some(exe), comm), Some(&words));
+        assert_eq!(running(&sys, Path::new(QS)), Read::Value(true), "{comm}");
+    }
+}
+
+/// For a bundle with a `#!/bin/sh` program, [`running`] reads the words of a shell launchd
+/// started (its parent launchd, with no controlling terminal) and of no other: not a
+/// terminal's shells, whether the terminal is their parent or launchd adopted them when it
+/// restarted (as it does each aterm tab's shell that outlives an aterm), nor the script one
+/// runs, nor a child a shell forked that has not exec'd yet (whose exec into a program macOS's
+/// program check holds can hang an argument read, §6.4), whatever their words would say, so
+/// the shells of the Mac's tabs are never all read (M29); and no shell's words are read for a
+/// bundle with no script. NEGATIVE CONTROLS (scratch): reading every shell launchd is the
+/// parent of (`!row.terminal &&` dropped) puts pid 24 among the pids read; reading
+/// every shell of the names (`row.ppid == Process::LAUNCHD &&` dropped as well) puts 21 there.
+#[test]
+fn no_terminal_s_shell_is_read_for_a_script_of_the_bundle_even_once_launchd_adopts_it() {
+    let qs = Programs::of(&qs_installed(), Path::new(QS));
+    let child_of = |pid, ppid, exe, comm| crate::port::Process {
+        ppid,
+        terminal: true,
+        ..proc_row(pid, Some(exe), comm)
+    };
+    let terminal = [
+        child_of(20, 19, "/bin/zsh", "zsh"),
+        child_of(21, 20, "/bin/bash", "bash"),
+        child_of(22, 21, "/bin/bash", "bash"),
+        child_of(24, crate::port::Process::LAUNCHD, "/bin/bash", "bash"),
+        child_of(25, crate::port::Process::LAUNCHD, "/bin/sh", "sh"),
+    ];
+    let words = [
+        (20, QS_SH),
+        (21, QS_SH),
+        (22, QS_SH),
+        (23, QS_SH),
+        (24, QS_SH),
+        (25, QS_SH),
+    ];
+    assert_eq!(
+        judged_by(&qs, &terminal, &words),
+        (false, Vec::new()),
+        "a terminal's shells, launchd's or not"
+    );
+    let mut launched = terminal.to_vec();
+    launched.push(proc_row(23, Some("/bin/bash"), "bash"));
+    assert_eq!(judged_by(&qs, &launched, &words), (true, vec![23]));
+    let rows = [proc_row(30, Some("/bin/bash"), "bash")];
+    assert_eq!(judged(&rows, &[(30, CAFFEINE_EXE)]), (false, Vec::new()));
+}
+
+/// The process that reads the table never counts, by any of the rules, but a parent of
+/// it that runs from the bundle does (the aterm window whose tab runs `aterm init`): only the
+/// reader's own pid is left out. NEGATIVE CONTROL (scratch): leaving every row in
+/// (`filter(move |row| row.pid != me)` dropped) makes the first assertion fail.
+#[test]
+fn the_reading_process_never_counts_but_its_parent_does() {
+    let me = [
+        proc_row(ME, Some(CAFFEINE_EXE), "Caffeine"),
+        proc_row(ME, None, "Caffeine"),
+        proc_row(ME, Some("/private/tmp/stage/old/Caffeine.app"), "Caffeine"),
+    ];
+    assert_eq!(judged(&me, &[(ME, CAFFEINE_EXE)]), (false, Vec::new()));
+    let mut with_parent = me.to_vec();
+    with_parent.push(proc_row(ME - 1, Some(CAFFEINE_EXE), "Caffeine"));
+    assert_eq!(judged(&with_parent, &[]), (true, Vec::new()));
+}
+
+/// A process whose executable the kernel names inside the bundle counts by that alone, at any
+/// depth (a helper app, which `pgrep -f '<bundle>/Contents/MacOS/'` missed), held at macOS's
+/// program check or not, with no process's arguments read; one in a bundle whose name merely
+/// starts the same (`Caffeine.app2`) or in another bundle does not. [`running`] reads no
+/// table it cannot read as `Unusable`. NEGATIVE CONTROL (scratch): comparing paths as strings
+/// (`path.to_string_lossy().starts_with(..)`) makes the `Caffeine.app2` row count.
+#[test]
+fn an_executable_inside_the_bundle_counts_by_its_image_alone() {
+    for exe in [
+        CAFFEINE_EXE,
+        "/Applications/Caffeine.app/Contents/Frameworks/Caffeine Helper.app/Contents/MacOS/Caffeine Helper",
+        "/Applications/Caffeine.app/Contents/Library/LoginItems/Starter.app/Contents/MacOS/Starter",
+    ] {
+        let rows = [
+            proc_row(1, Some("/sbin/launchd"), "launchd"),
+            proc_row(77, Some(exe), "Caffeine"),
+        ];
+        assert_eq!(judged(&rows, &[]), (true, Vec::new()), "{exe}");
+    }
+    for exe in [
+        "/Applications/Caffeine.app2/Contents/MacOS/Caffeine",
+        "/Applications/Other.app/Contents/MacOS/Other",
+        "/Applications/Caffeine",
+    ] {
+        let rows = [proc_row(77, Some(exe), "Other")];
+        assert_eq!(judged(&rows, &[]), (false, Vec::new()), "{exe}");
+    }
+    let sys = Fake::root();
+    assert!(
+        matches!(running(&sys, Path::new("/Applications/Caffeine.app")), Read::Unusable(why) if why.contains("process table")),
+        "an unread table"
+    );
+    sys.running(&[]);
+    assert_eq!(
+        running(&sys, Path::new("/Applications/Caffeine.app")),
+        Read::Value(false)
+    );
+}
+
+/// A process that runs one of the bundle's programs from elsewhere (the bundle an earlier
+/// replacement moved aside) counts when its first argument word is a full path inside the
+/// bundle, its words read only for a process of one of the bundle's names; a bare first word
+/// (a `PATH` lookup) or one inside another bundle does not count, and neither does one whose
+/// words read nothing (a program macOS's program check holds, whose arguments are never read
+/// before its thread ran). NEGATIVE CONTROL (scratch): reading every row's words (the
+/// `named(row) &&` guard dropped) puts pid 30 among the pids read.
+#[test]
+fn a_program_started_from_the_bundle_counts_by_its_first_word() {
+    let aside = "/Library/Management/aterm/stage/0/old/Caffeine.app/Contents/MacOS/Caffeine";
+    let rows = [
+        proc_row(30, Some("/bin/zsh"), "zsh"),
+        proc_row(10, Some(aside), "Caffeine"),
+    ];
+    assert_eq!(
+        judged(&rows, &[(10, CAFFEINE_EXE), (30, CAFFEINE_EXE)]),
+        (true, vec![10])
+    );
+    for first in [
+        "Caffeine",
+        "/Applications/Caffeine.app2/Contents/MacOS/Caffeine",
+        aside,
+    ] {
+        assert_eq!(judged(&rows, &[(10, first)]), (false, vec![10]), "{first}");
+    }
+    assert_eq!(judged(&rows, &[]), (false, vec![10]), "a held program");
+}
+
+/// A process whose executable the kernel no longer names (its file deleted, as a replacement
+/// does to a running program) counts when its short name is one of the bundle's programs',
+/// cut to the kernel's 16 bytes, and not otherwise, nor when the bundle's programs cannot be
+/// listed. NEGATIVE CONTROL (scratch): counting no unnamed row (`|| named(row)` made
+/// `|| false`) fails the first assertion.
+#[test]
+fn an_unnamed_process_counts_by_its_short_name() {
+    let rows = [proc_row(55, None, "Caffeine")];
+    assert_eq!(judged(&rows, &[]), (true, Vec::new()));
+    let rows = [proc_row(55, None, "zsh")];
+    assert_eq!(judged(&rows, &[(55, CAFFEINE_EXE)]), (false, vec![]));
+    let sys = Fake::root();
+    let long = "/Applications/Caffeine.app/Contents/MacOS/CaffeineLoginHelper";
+    sys.file(long, b"");
+    sys.process(proc_row(55, None, "CaffeineLoginHe"), None);
+    let bundle = Path::new("/Applications/Caffeine.app");
+    assert_eq!(running(&sys, bundle), Read::Value(false), "15 bytes");
+    sys.process(proc_row(56, None, "CaffeineLoginHel"), None);
+    assert_eq!(running(&sys, bundle), Read::Value(true), "16 bytes");
+    sys.list_fails_once(
+        "/Applications/Caffeine.app/Contents/MacOS",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    assert_eq!(running(&sys, bundle), Read::Value(false), "none listed");
+}
+
+/// A real program run from a scratch bundle (a copy of `cat`, signed ad hoc, started by the
+/// bare word a `PATH` lookup gives, so its words name no bundle) reads as running by its
+/// executable alone; once a replacement moved its bundle aside, put another in its place and
+/// deleted the old one (as [`swap_into`] and the stage's cleanup do), by its short name, since
+/// the kernel then names no executable for it (a file deleted and re-made in the same folder
+/// is named again, at its new file); and not once it is gone. The bundle is spelled through a
+/// link of the test's own, which the kernel names at its target, so the canonical spelling is
+/// what finds it whether or not `TMPDIR` is canonical. The copy is named after this test
+/// process (`qz<pid>`), so no other run's program, unnamed once its bundle is deleted, counts
+/// as this one. The live readers list it under its short name and on-disk path, and read its
+/// words once its thread ran. Its bundle is moved and deleted only after it echoed a line
+/// (AGENTS.md). NEGATIVE CONTROLS (scratch): a [`running`] that adds no canonical spelling to
+/// the roots fails the first assertion, with `TMPDIR` canonical or not; one that counts no
+/// unnamed row fails the second; the fixed name `qzrunning`, while another process of that
+/// name whose file was deleted runs, fails the third.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_program_run_from_a_scratch_bundle_runs_until_it_is_gone() {
+    use aterm_uds::spawnfd::Stdio;
+    let sys = crate::port::Live::new();
+    let mut kept = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::tempdir().expect("a scratch dir").keep(),
+    );
+    let target = kept.path().join("target");
+    let spelled = kept.path().join("spelled");
+    std::fs::create_dir(&target).expect("the link's target");
+    std::os::unix::fs::symlink(&target, &spelled).expect("the link");
+    let bundle = spelled.join("Qz.app");
+    std::fs::create_dir_all(bundle.join("Contents/MacOS")).expect("the bundle");
+    let name = format!("qz{}", std::process::id());
+    let exe = bundle.join("Contents/MacOS").join(&name);
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &exe);
+    let mut child = aterm_uds::spawnfd::command(&exe)
+        .arg0(&name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the copy");
+    let fed = aterm_uds::deadline::cat_echoes(&mut child);
+    kept.ran();
+    let ran = running(&sys, &bundle);
+    let row = sys
+        .processes()
+        .and_then(|rows| rows.into_iter().find(|row| row.pid == child.id()));
+    let words = row.as_ref().and_then(|row| sys.process_argv(row));
+    let aside = kept.path().join("aside");
+    let replaced = std::fs::rename(&bundle, &aside)
+        .and_then(|()| std::fs::create_dir_all(bundle.join("Contents/MacOS")))
+        .and_then(|()| std::fs::write(&exe, b""))
+        .and_then(|()| std::fs::remove_dir_all(&aside));
+    let unnamed = running(&sys, &bundle);
+    drop(fed);
+    aterm_uds::deadline::kill_within(&mut child, aterm_uds::deadline::ECHO_HANG);
+    let gone = running(&sys, &bundle);
+    let real = std::fs::canonicalize(&exe).expect("the copy's real path");
+    assert_eq!(ran, Read::Value(true), "by its executable");
+    replaced.expect("its bundle replaced");
+    assert_eq!(unnamed, Read::Value(true), "by its short name");
+    assert_eq!(gone, Read::Value(false), "once it is gone");
+    assert!(
+        !real.starts_with(&bundle),
+        "spelled as the kernel names it: no canonical root tested"
+    );
+    let row = row.expect("the child listed");
+    assert_eq!((row.exe, row.comm.as_str()), (Some(real), name.as_str()));
+    assert_eq!(words, Some(vec![name.into()]), "its words");
+}
+
+/// A real script run from a scratch bundle as an app runs (started in the background by a
+/// shell in a session of its own that has then ended, so its parent is launchd and it has no
+/// controlling terminal) reads as running by its interpreter's words, though the kernel names
+/// the interpreter's executable, outside the bundle, and its short name, none of the bundle's;
+/// and not before it starts. Three programs, each `qs<pid>` in a bundle of its own: a
+/// `#!/bin/sh` script, which macOS's `/bin/sh` runs as the shell `/private/var/select/sh`
+/// links to; a link to `../Resources/qs.sh`, that script, which the kernel runs at the link's
+/// path; and a script whose line names a link of the test's own to `/bin/bash`, which runs as
+/// `bash`. Each bundle is spelled through a link of the test's own, so its programs' first
+/// lines are read only at their canonical paths, where no link lies on the path. Each script is
+/// read only after it echoed a line, so its thread ran, and it ends at the end of its input
+/// before the test does. NEGATIVE CONTROLS (scratch): a [`running_in`] that reads no
+/// interpreter's words (its `bundle.interpreters.contains(..)` arm dropped), and a table read
+/// that keeps no parent (`ppid: 0`) or gives every process a terminal (`terminal: true`), each
+/// fail the first program's `ran` assertion; a [`Programs::of`] that reads each program at its
+/// path in `Contents/MacOS` fails the linked program's, and an [`interpreters`] that follows no
+/// interpreter's link fails the third's.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_script_started_from_a_scratch_bundle_as_an_app_runs_by_its_interpreter() {
+    let sys = crate::port::Live::new();
+    let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
+    let target = scratch.path().join("target");
+    let spelled = scratch.path().join("spelled");
+    std::fs::create_dir(&target).expect("the link's target");
+    std::os::unix::fs::symlink(&target, &spelled).expect("the link");
+    let shell = scratch.path().join("qsh");
+    std::os::unix::fs::symlink("/bin/bash", &shell).expect("the interpreter's link");
+    let echo = "while read -r line; do echo \"$line\"; done\n";
+    let name = format!("qs{}", std::process::id());
+    for (case, line, linked) in [
+        ("Sh", "#!/bin/sh".to_owned(), false),
+        ("Linked", "#!/bin/sh".to_owned(), true),
+        ("Renamed", format!("#!{}", shell.display()), false),
+    ] {
+        let bundle = spelled.join(format!("{case}.app"));
+        let program = bundle.join("Contents/MacOS").join(&name);
+        let script = if linked {
+            bundle.join("Contents/Resources/qs.sh")
+        } else {
+            program.clone()
+        };
+        for folder in ["Contents/MacOS", "Contents/Resources"] {
+            std::fs::create_dir_all(bundle.join(folder)).expect("the bundle");
+        }
+        std::fs::write(&script, format!("{line}\n{echo}")).expect("the script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("make it runnable");
+        if linked {
+            std::os::unix::fs::symlink("../Resources/qs.sh", &program).expect("the program");
+        }
+        let before = running(&sys, &bundle);
+        let (ran, row) = started_as_an_app(&sys, &bundle, &program);
+        assert_eq!(before, Read::Value(false), "{case}: before it starts");
+        assert_eq!(ran, Read::Value(true), "{case}: by its interpreter's words");
+        assert_eq!(
+            (row.ppid, row.terminal),
+            (crate::port::Process::LAUNCHD, false),
+            "{case}: {row:?}: launchd's, with no terminal"
+        );
+        let real = std::fs::canonicalize(&bundle).expect("the bundle's real path");
+        assert!(
+            row.exe.as_ref().is_some_and(|exe| !exe.starts_with(&real)),
+            "{case}: {row:?}: run by an interpreter outside the bundle"
+        );
+        assert!(
+            Programs::of(&sys, &bundle).interpreters.contains(&row.comm),
+            "{case}: {row:?}: under its interpreter's name"
+        );
+    }
+}
+
+/// `program` of `bundle` started as an app runs (in the background by `/bin/sh` in a session
+/// of its own, which is then killed), and once it echoed a line, whether [`running`] reads
+/// `bundle` as running and its row in the process table. It ends at the end of its input, which
+/// this closes, before this returns.
+#[cfg(target_os = "macos")]
+fn started_as_an_app(
+    sys: &crate::port::Live,
+    bundle: &Path,
+    program: &Path,
+) -> (Read<bool>, crate::port::Process) {
+    use aterm_uds::deadline::ECHO_HANG;
+    use aterm_uds::spawnfd::Stdio;
+    use std::io::{BufRead as _, Write as _};
+    let mut parent = aterm_uds::spawnfd::command("/bin/sh")
+        .arg("-c")
+        .arg("exec 3<&0; \"$0\" <&3 3<&- & echo \"$!\"")
+        .arg(program)
+        .setsid(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the script's parent");
+    let mut fed = parent.stdin.take().expect("its input");
+    let out = std::io::BufReader::new(parent.stdout.take().expect("its output"));
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in out.lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let next = || {
+        lines
+            .recv_timeout(ECHO_HANG)
+            .expect("a line, within the hang detector")
+    };
+    let pid: u32 = next().parse().expect("the script's pid");
+    aterm_uds::deadline::kill_within(&mut parent, ECHO_HANG);
+    fed.write_all(b"ran\n").expect("feed the script");
+    assert_eq!(next(), "ran", "the script echoes");
+    let ran = running(sys, bundle);
+    let row = sys
+        .processes()
+        .and_then(|rows| rows.into_iter().find(|row| row.pid == pid));
+    drop(fed);
+    assert_eq!(
+        lines.recv_timeout(ECHO_HANG),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "it ends at the end of its input"
+    );
+    (ran, row.expect("the script listed"))
+}
+
+#[test]
+fn a_disk_image_install_stages_vets_swaps_and_cleans_up() {
+    let sys = Fake::root();
+    let bytes = b"caffeine dmg";
+    let sha = sha_of(bytes);
+    let stage = stage_path(0);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    installed_caffeine(&sys, "1.1.3");
+    sys.on(
+        &plistbuddy("/Applications/Caffeine.app", "CFBundleShortVersionString"),
+        ok("1.1.4\n"),
+    );
+    let mount = "/private/tmp/swteam/stage/dmg.9CxWxv";
+    sys.on(
+        &format!("/usr/bin/hdiutil attach -readonly -nobrowse -noautoopen -mountrandom {stage} -plist /c/{sha}"),
+        ok(ATTACH_CAFFEINE),
+    );
+    sys.file(&format!("{mount}/Caffeine.app"), b"")
+        .stat_of(&format!("{mount}/Caffeine.app"), dir());
+    let staged = format!("{stage}/new/Caffeine.app");
+    sys.on(
+        &format!("/usr/bin/ditto --noacl --noqtn {mount}/Caffeine.app {staged}"),
+        ok(""),
+    );
+    sys.on(
+        &format!("/usr/bin/hdiutil detach {mount}"),
+        ok("\"disk6\" ejected.\n"),
+    );
+    sys.on(&format!("/usr/sbin/chown -R 0:0 {staged}"), ok(""));
+    sys.on(&format!("/bin/chmod -R go-w,ug-s {staged}"), ok(""));
+    sys.on(&codesign_key(&staged, "YD6LEYT6WZ"), ok(""));
+    sys.on(
+        &format!("/usr/sbin/spctl -a -vv -t exec {staged}"),
+        err(0, SPCTL_CAFFEINE_OFF),
+    );
+    sys.on_write(
+        &format!("/usr/bin/ditto --noacl --noqtn {mount}/Caffeine.app {staged}"),
+        Path::new(&format!("{staged}/Contents/Info.plist")),
+        b"",
+    );
+    sys.on(
+        &plistbuddy(&staged, "CFBundleShortVersionString"),
+        ok("1.1.4\n"),
+    );
+    let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Apply);
+    assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+    assert!(row.detail.as_deref().unwrap().contains("gatekeeper: not assessed for Caffeine.app (spctl: override=security disabled, source=Notarized Developer ID)"));
+    assert!(row.revert.unwrap().contains("none kept"));
+    let calls = sys.calls();
+    let pos = |needle: &str| {
+        calls
+            .iter()
+            .position(|c| c.starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle} not run: {calls:#?}"))
+    };
+    let last = |needle: &str| calls.iter().rposition(|c| c.starts_with(needle)).unwrap();
+    assert!(pos("/usr/bin/ditto") < pos("/usr/bin/hdiutil detach"));
+    assert!(pos("/usr/bin/hdiutil detach") < pos("/usr/sbin/chown -R 0:0"));
+    assert!(
+        pos("/usr/sbin/chown")
+            < pos(
+                "/usr/bin/codesign --verify --deep --strict '-R=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"YD6LEYT6WZ\"' /Library"
+            )
+    );
+    let aside = pos(&format!(
+        "rename /Applications/Caffeine.app {stage}/old/Caffeine.app"
+    ));
+    let into = pos(&format!("rename {staged} /Applications/Caffeine.app"));
+    assert!(pos("/usr/sbin/spctl") < aside && aside < into);
+    assert!(last(&format!("scratch closed {stage}")) > into);
+}
+
+#[test]
+fn a_bundle_from_another_team_is_never_swapped_in() {
+    let sys = Fake::root();
+    let bytes = b"kya zip";
+    let sha = sha_of(bytes);
+    let stage = stage_path(0);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    sys.on(
+        &format!("/usr/bin/ditto -x -k --noacl --noqtn /c/{sha} {stage}/new"),
+        ok(""),
+    );
+    let staged = format!("{stage}/new/KeepingYouAwake.app");
+    sys.on_write(
+        &format!("/usr/bin/ditto -x -k --noacl --noqtn /c/{sha} {stage}/new"),
+        Path::new(&staged),
+        b"",
+    )
+    .on_stat(
+        &format!("/usr/bin/ditto -x -k --noacl --noqtn /c/{sha} {stage}/new"),
+        Path::new(&staged),
+        dir(),
+    );
+    sys.on(&format!("/usr/sbin/chown -R 0:0 {staged}"), ok(""));
+    sys.on(&format!("/bin/chmod -R go-w,ug-s {staged}"), ok(""));
+    sys.on(
+        &codesign_key(&staged, "5KESHV9W85"),
+        err(3, CODESIGN_WRONG_TEAM),
+    );
+    let row = one(&kya_row(&sha), &sys, &ctx, crate::model::Mode::Apply);
+    assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+    assert!(
+        row.why
+            .unwrap()
+            .contains("not by Developer ID team 5KESHV9W85")
+    );
+    assert!(!sys.calls().iter().any(|c| c.starts_with("rename")));
+    assert_eq!(
+        sys.calls().last().unwrap(),
+        &format!("scratch closed {stage}")
+    );
+}
+
+#[test]
+fn a_cached_artifact_that_no_longer_hashes_to_its_name_is_not_used() {
+    let sys = Fake::root();
+    let ctx = ctx_with(&sys, &[(KYA_SHA, b"not the zip")], true);
+    let items = expand(&[kya_row(KYA_SHA)], &ctx).unwrap();
+    let why = items[0].apply(&sys, &ctx).unwrap_err();
+    assert!(why.contains("hashes to"), "{why}");
+    assert!(sys.calls().is_empty());
+}
+
+#[test]
+fn a_failed_swap_puts_the_previous_bundle_back() {
+    struct NoSecondRename(
+        Fake,
+        std::sync::atomic::AtomicU32,
+        std::sync::Mutex<Vec<String>>,
+    );
+    impl System for NoSecondRename {
+        fn scratch_dir(
+            &self,
+            parent: Option<&Path>,
+            label: &str,
+        ) -> std::io::Result<crate::port::Scratch<'_>> {
+            self.0.scratch_dir(parent, label)
+        }
+        fn run(&self, c: &Cmd) -> Result<Ran, crate::port::RunFailed> {
+            self.0.run(c)
+        }
+        fn run_tty(
+            &self,
+            c: &Cmd,
+            before: &mut dyn FnMut(&mut Cmd) -> Result<(), crate::port::RunFailed>,
+        ) -> Result<Option<i32>, crate::port::RunFailed> {
+            self.0.run_tty(c, before)
+        }
+        fn read_file(&self, p: &Path) -> std::io::Result<Vec<u8>> {
+            self.0.read_file(p)
+        }
+        fn write_file(&self, p: &Path, b: &[u8], m: u32) -> std::io::Result<()> {
+            self.0.write_file(p, b, m)
+        }
+        fn write_user_file(&self, u: &User, p: &Path, b: &[u8], m: u32) -> std::io::Result<()> {
+            self.0.write_user_file(u, p, b, m)
+        }
+        fn remove(&self, p: &Path) -> std::io::Result<()> {
+            self.0.remove(p)
+        }
+        fn create_dir_all(&self, p: &Path, m: u32) -> std::io::Result<()> {
+            self.0.create_dir_all(p, m)
+        }
+        fn chown(&self, p: &Path, u: u32, g: u32) -> std::io::Result<()> {
+            self.0.chown(p, u, g)
+        }
+        fn stat(&self, p: &Path) -> std::io::Result<Stat> {
+            self.0.stat(p)
+        }
+        fn list_dir(&self, p: &Path) -> std::io::Result<Vec<String>> {
+            self.0.list_dir(p)
+        }
+        fn sha256(&self, p: &Path) -> std::io::Result<String> {
+            self.0.sha256(p)
+        }
+        fn copy_file(&self, f: &Path, t: &Path, m: u32) -> std::io::Result<()> {
+            self.0.copy_file(f, t, m)
+        }
+        fn rename(&self, f: &Path, t: &Path) -> std::io::Result<()> {
+            let n = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.2
+                .lock()
+                .unwrap()
+                .push(format!("rename {} {}", f.display(), t.display()));
+            if n == 1 {
+                return Err(std::io::Error::other("EXDEV"));
+            }
+            self.0.rename(f, t)
+        }
+        fn euid(&self) -> u32 {
+            0
+        }
+        fn now(&self) -> u64 {
+            0
+        }
+    }
+    let sys = NoSecondRename(
+        Fake::root(),
+        std::sync::atomic::AtomicU32::new(0),
+        std::sync::Mutex::new(Vec::new()),
+    );
+    sys.0
+        .file("/Applications/A.app", b"old")
+        .stat_of("/Applications/A.app", dir());
+    let stage = Stage::new(crate::port::Scratch::new_in(&sys, Path::new("/s"), "swap").unwrap());
+    let stage_path = stage.to_path_buf();
+    let err = swap_into(
+        &sys,
+        &stage.join("new/A.app"),
+        Path::new("/Applications/A.app"),
+        &stage,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("the previous bundle is back in place"),
+        "{err}"
+    );
+    assert_eq!(
+        sys.0.read_file(Path::new("/Applications/A.app")).unwrap(),
+        b"old"
+    );
+    assert_eq!(
+        sys.2.lock().unwrap().clone(),
+        [
+            format!(
+                "rename /Applications/A.app {}/old/A.app",
+                stage_path.display()
+            ),
+            format!(
+                "rename {}/new/A.app /Applications/A.app",
+                stage_path.display()
+            ),
+            format!(
+                "rename {}/old/A.app /Applications/A.app",
+                stage_path.display()
+            )
+        ]
+    );
+}
+
+#[test]
+fn an_unsigned_pkg_installs_only_when_every_mach_o_in_it_carries_the_team() {
+    let sys = Fake::root();
+    let bytes = b"gh pkg";
+    let sha = sha_of(bytes);
+    let stage = stage_path(0);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    sys.on(
+        "/usr/sbin/pkgutil --pkg-info com.github.cli",
+        err(1, PKGINFO_ABSENT),
+    );
+    sys.on(
+        "/usr/sbin/pkgutil --pkg-info com.github.cli",
+        ok(PKGINFO_GH),
+    );
+    let x = format!("{stage}/expanded");
+    sys.on(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        ok(""),
+    );
+    let gh = format!("{x}/com.github.cli.pkg/Payload/usr/local/bin/gh");
+    let man = format!("{x}/com.github.cli.pkg/Payload/usr/local/share/man/man1/gh.1");
+    sys.on(
+        &format!("/usr/bin/find {x} -type f -print0"),
+        ok(&format!("{x}/Distribution\0{gh}\0{man}\0")),
+    );
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&format!("{x}/Distribution")),
+        b"<?xml version=\"1.0\"?>",
+    );
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&gh),
+        &[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2, 0, 0],
+    );
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&man),
+        b".TH GH 1",
+    );
+    sys.on(&codesign_key(&gh, "VEKTX9H2N7"), ok(""));
+    sys.on(
+        &format!("/usr/sbin/installer -pkg {stage}/gh_2.102.0_macOS_universal.pkg -target /"),
+        ok(INSTALLER_GH),
+    );
+    sys.file("/usr/local/bin/gh", b"");
+    sys.on(&codesign_key("/usr/local/bin/gh", "VEKTX9H2N7"), ok(""));
+    let row = one(&gh_row(&sha), &sys, &ctx, crate::model::Mode::Apply);
+    assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+    assert_eq!(row.from.as_deref(), Some("absent (no receipt)"));
+    assert!(
+        row.detail
+            .unwrap()
+            .contains("1 Mach-O file(s) verified as team VEKTX9H2N7")
+    );
+    assert_eq!(
+        sys.calls()
+            .iter()
+            .filter(|c| c.starts_with("/usr/bin/codesign"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn an_unsigned_pkg_with_scripts_is_refused() {
+    let sys = Fake::root();
+    let bytes = b"scripted pkg";
+    let sha = sha_of(bytes);
+    let stage = stage_path(0);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    let x = format!("{stage}/expanded");
+    sys.on(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        ok(""),
+    );
+    sys.on(
+        &format!("/usr/bin/find {x} -type f -print0"),
+        ok(&format!("{x}/a.pkg/Scripts/postinstall\0")),
+    );
+    let items = expand(&[gh_row(&sha)], &ctx).unwrap();
+    let why = items[0].apply(&sys, &ctx).unwrap_err();
+    assert!(why.contains("installer scripts"), "{why}");
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|c| c.starts_with("/usr/sbin/installer"))
+    );
+}
+
+/// An unsigned pkg's apply up to its `find` listing, which answers `listing`.
+fn unsigned_pkg_listing(listing: &dyn Fn(&str) -> String) -> (Fake, Ctx, String) {
+    let sys = Fake::root();
+    let bytes = b"component pkg";
+    let sha = sha_of(bytes);
+    let stage = stage_path(0);
+    let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
+    let x = format!("{stage}/expanded");
+    sys.on(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        ok(""),
+    );
+    sys.on(
+        &format!("/usr/bin/find {x} -type f -print0"),
+        ok(&listing(&x)),
+    );
+    (sys, ctx, sha)
+}
+
+#[test]
+fn a_component_pkg_s_top_level_scripts_are_refused_too() {
+    let (sys, ctx, sha) = unsigned_pkg_listing(&|x| {
+        format!("{x}/Bom\0{x}/PackageInfo\0{x}/Payload/usr/local/bin/gh\0{x}/Scripts/postinstall\0")
+    });
+    let stage = stage_path(0);
+    let x = format!("{stage}/expanded");
+    let gh = format!("{x}/Payload/usr/local/bin/gh");
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&gh),
+        &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0],
+    );
+    sys.on(&codesign_key(&gh, "VEKTX9H2N7"), ok(""));
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&format!("{x}/Bom")),
+        b"BOMStore",
+    );
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&format!("{x}/PackageInfo")),
+        b"<pkg-info/>",
+    );
+    let items = expand(&[gh_row(&sha)], &ctx).unwrap();
+    let why = items[0].apply(&sys, &ctx).unwrap_err();
+    assert!(
+        why.contains("installer scripts (Scripts/postinstall)"),
+        "{why}"
+    );
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|c| c.starts_with("/usr/sbin/installer"))
+    );
+}
+
+#[test]
+fn an_unsigned_pkg_whose_distribution_may_run_programs_is_refused() {
+    let (sys, ctx, sha) = unsigned_pkg_listing(&|x| format!("{x}/Distribution\0"));
+    let stage = stage_path(0);
+    let x = format!("{stage}/expanded");
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"), Path::new(&format!("{x}/Distribution")),
+        br#"<installer-gui-script><options allow-external-scripts="true"/><script>system.run('/bin/sh');</script></installer-gui-script>"#,
+    );
+    let items = expand(&[gh_row(&sha)], &ctx).unwrap();
+    let why = items[0].apply(&sys, &ctx).unwrap_err();
+    assert!(why.contains("allows external scripts"), "{why}");
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|c| c.starts_with("/usr/sbin/installer"))
+    );
+}
+
+#[test]
+fn only_an_explicit_false_keeps_a_distribution_s_javascript_from_running_programs() {
+    assert!(!allows_external_scripts(
+        r#"<options hostArchitectures="arm64,x86_64" customize="never" require-scripts="true" allow-external-scripts="false"/>"#
+    ));
+    assert!(!allows_external_scripts("<options/>"));
+    assert!(!allows_external_scripts("allow-external-scripts = 'no'"));
+    assert!(allows_external_scripts(r#"allow-external-scripts="yes""#));
+    assert!(allows_external_scripts(
+        r#"allow-external-scripts="false" allow-external-scripts="true""#
+    ));
+    assert!(allows_external_scripts("allow-external-scripts"));
+    assert!(allows_external_scripts(r#"allow-external-scripts="false"#));
+}
+
+/// A UTF-16 Distribution hides `allow-external-scripts` from the byte scan (each ASCII
+/// letter is followed by a NUL), so it is refused as unread, not admitted. NEGATIVE
+/// CONTROL: the same document in UTF-8 is refused for its external scripts, and a clean
+/// UTF-8 one passes.
+#[test]
+fn an_unsigned_pkg_whose_distribution_is_not_utf8_is_refused_before_its_scan() {
+    let doc = r#"<?xml version="1.0" encoding="UTF-16"?><installer-gui-script><options allow-external-scripts="yes"/></installer-gui-script>"#;
+    let mut utf16le = vec![0xff, 0xfe];
+    for unit in doc.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
+    }
+    let (sys, ctx, sha) = unsigned_pkg_listing(&|x| format!("{x}/Distribution\0"));
+    let stage = stage_path(0);
+    let x = format!("{stage}/expanded");
+    sys.on_write(
+        &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+        Path::new(&format!("{x}/Distribution")),
+        &utf16le,
+    );
+    let items = expand(&[gh_row(&sha)], &ctx).unwrap();
+    let why = items[0].apply(&sys, &ctx).unwrap_err();
+    assert!(why.contains("is not UTF-8"), "{why}");
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|c| c.starts_with("/usr/sbin/installer"))
+    );
+
+    let utf8 = doc.replace("UTF-16", "UTF-8");
+    let why = vet_distribution(utf8.as_bytes()).unwrap_err();
+    assert!(why.contains("allows external scripts"), "{why}");
+    vet_distribution(
+        br#"<?xml version="1.0" encoding="utf-8" standalone="no"?><installer-gui-script minSpecVersion="1"><options customize="never" allow-external-scripts="no"/></installer-gui-script>"#,
+    )
+    .unwrap();
+    vet_distribution(b"\xef\xbb\xbf<installer-gui-script><options/></installer-gui-script>")
+        .unwrap();
+}
+
+/// Text an entity, an attribute default, a NUL or a foreign encoding could rewrite before
+/// Installer reads its options is refused; a declaration naming UTF-8 is not.
+#[test]
+fn a_distribution_the_scan_cannot_read_as_installer_does_is_refused() {
+    for (doc, says) in [
+        (
+            "<!DOCTYPE installer-gui-script [ <!ATTLIST options allow-external-scripts CDATA \"true\"> ]><options/>",
+            "declares a DTD",
+        ),
+        ("<!doctype x><options/>", "declares a DTD"),
+        ("<!ENTITY x \"y\"><options/>", "declares a DTD"),
+        ("<options/>\0", "holds a NUL byte"),
+        (
+            "<?xml version=\"1.0\" encoding=\"UTF-7\"?><options/>",
+            "declares the encoding \"utf-7\"",
+        ),
+        (
+            "<?xml version='1.0' encoding = 'ISO-8859-1' ?><options/>",
+            "declares the encoding \"iso-8859-1\"",
+        ),
+        (
+            "<?xml version=\"1.0\" encoding=utf-8?><options/>",
+            "encoding is unread",
+        ),
+        (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"",
+            "unterminated XML declaration",
+        ),
+    ] {
+        let why = vet_distribution(doc.as_bytes()).unwrap_err();
+        assert!(why.contains(says), "{doc:?}: {why}");
+        assert!(why.contains("cannot be vetted"), "{doc:?}: {why}");
+    }
+    vet_distribution(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><?xml-stylesheet href=\"encoding.xsl\"?><options/>",
+    )
+    .unwrap();
+}
+
+#[test]
+fn fresh_staging_never_adopts_or_removes_an_earlier_attempt() {
+    let sys = Fake::root();
+    sys.stat_of(crate::AGENT_ROOT, dir()).stat_of(
+        STAGE_ROOT,
+        Stat {
+            mode: 0o700,
+            ..dir()
+        },
+    );
+    let old = Path::new(STAGE_ROOT)
+        .join("0".repeat(64))
+        .join("old/A.app/receipt");
+    let occupied = PathBuf::from(stage_path(0)).join("old/A.app/receipt");
+    sys.file(old.to_str().unwrap(), b"older retained bundle");
+    sys.file(occupied.to_str().unwrap(), b"another retained bundle");
+    let first = fresh_stage(&sys).unwrap();
+    assert_eq!(first.to_path_buf(), PathBuf::from(stage_path(1)));
+    sys.write_file(&first.join("new/file"), b"scratch", 0o600)
+        .unwrap();
+    let first_path = first.to_path_buf();
+    drop(first);
+    assert!(sys.stat(&first_path).is_err());
+    let next = fresh_stage(&sys).unwrap();
+    assert_ne!(next.to_path_buf(), first_path);
+    drop(next);
+    assert_eq!(sys.read_file(&old).unwrap(), b"older retained bundle");
+    assert_eq!(
+        sys.read_file(&occupied).unwrap(),
+        b"another retained bundle"
+    );
+    for bad in [
+        Stat { uid: 501, ..dir() },
+        Stat {
+            mode: 0o775,
+            ..dir()
+        },
+        Stat {
+            symlink: true,
+            dir: false,
+            ..dir()
+        },
+    ] {
+        let sys = Fake::root();
+        sys.stat_of(crate::AGENT_ROOT, dir())
+            .stat_of(STAGE_ROOT, bad)
+            .file(old.to_str().unwrap(), b"unproven owner bytes");
+        assert!(fresh_stage(&sys).is_err());
+        assert_eq!(sys.read_file(&old).unwrap(), b"unproven owner bytes");
+        assert!(
+            sys.calls().is_empty(),
+            "unadmitted parent is never allocated below"
+        );
+    }
+    let sys = Fake::root();
+    sys.stat_of(crate::AGENT_ROOT, dir());
+    assert!(
+        fresh_stage(&sys).is_err(),
+        "missing staging parent is not recreated"
+    );
+    assert!(sys.calls().is_empty());
+}
+
+#[test]
+fn a_path_codesign_cannot_read_is_no_verdict_on_its_signer() {
+    let sys = Fake::root();
+    sys.on(
+        &codesign_key("/x", "VEKTX9H2N7"),
+        err(1, "/x: Permission denied"),
+    );
+    assert!(matches!(
+        verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"),
+        Signed::Unusable(_)
+    ));
+}
+
+#[test]
+fn a_pkg_row_names_what_it_installs_and_two_rows_never_share_a_bundle() {
+    let ctx = ctx_with(&Fake::root(), &[], true);
+    let mut row = gh_row(GH_SHA);
+    row.binary = None;
+    assert!(
+        expand(&[row], &ctx)
+            .err()
+            .unwrap()
+            .contains("names the bundle or the binary")
+    );
+    let mut again = caffeine_row(CAFFEINE_SHA);
+    again.name = "Caffeine-again".into();
+    again.bundle = Some("caffeine.app".into());
+    assert!(
+        expand(&[caffeine_row(CAFFEINE_SHA), again], &ctx)
+            .err()
+            .unwrap()
+            .contains("already installed by [[app]] Caffeine")
+    );
+    let mut gh2 = gh_row(GH_SHA);
+    gh2.name = "gh2".into();
+    gh2.binary = Some("/usr/local/bin/gh2".into());
+    assert!(
+        expand(&[gh_row(GH_SHA), gh2], &ctx)
+            .err()
+            .unwrap()
+            .contains("receipt com.github.cli")
+    );
+}
+
+#[test]
+fn a_signed_pkg_pkgutil_does_not_trust_is_refused() {
+    let sys = Fake::root();
+    let art = Artifact {
+        url: "https://example.com/x.pkg".into(),
+        sha256: "0".repeat(64),
+        team_id: Some("927JGANW46".into()),
+        unsigned: false,
+    };
+    sys.on(
+        "/usr/sbin/pkgutil --check-signature /p.pkg",
+        ok(&PKGUTIL_HOMEBREW.replace(
+            "signed by a developer certificate issued by Apple for distribution",
+            "signed by untrusted certificate",
+        )),
+    );
+    let why = vet_pkg(
+        &sys,
+        Path::new("/p.pkg"),
+        &art,
+        Path::new("/s"),
+        &Notes::default(),
+    )
+    .unwrap_err();
+    assert!(why.contains("does not trust"), "{why}");
+    assert!(!sys.calls().iter().any(|c| c.contains("spctl")));
+}
+
+#[test]
+fn a_signed_pkg_must_name_the_row_s_team() {
+    let sys = Fake::root();
+    let notes = Notes::default();
+    let art = Artifact {
+        url: "https://example.com/x.pkg".into(),
+        sha256: "0".repeat(64),
+        team_id: Some("AAAAAAAAAA".into()),
+        unsigned: false,
+    };
+    sys.on(
+        "/usr/sbin/pkgutil --check-signature /p.pkg",
+        ok(PKGUTIL_HOMEBREW),
+    );
+    let why = vet_pkg(&sys, Path::new("/p.pkg"), &art, Path::new("/s"), &notes).unwrap_err();
+    assert!(
+        why.contains("not a Developer ID Installer of team AAAAAAAAAA"),
+        "{why}"
+    );
+    let art = Artifact {
+        team_id: Some("927JGANW46".into()),
+        ..art
+    };
+    sys.on(
+        "/usr/sbin/spctl -a -vv -t install /p.pkg",
+        err(0, SPCTL_HOMEBREW_OFF),
+    );
+    assert_eq!(
+        vet_pkg(&sys, Path::new("/p.pkg"), &art, Path::new("/s"), &notes),
+        Ok(())
+    );
+    assert!(notes.joined().unwrap().contains("not assessed for p.pkg"));
+}
+
+#[test]
+fn a_stage_never_recreates_an_agent_root_an_uninstall_removed() {
+    let sys = Fake::root();
+    let why = fresh_stage(&sys).unwrap_err();
+    assert!(why.contains("the agent is not installed here"), "{why}");
+    assert!(sys.calls().is_empty());
+}
+
+#[test]
+fn the_staged_pkg_takes_its_url_s_name_or_a_safe_one() {
+    let sys = Fake::root();
+    sys.file("/c/x", b"pkg bytes");
+    let mut art = gh_row(&sha_of(b"pkg bytes")).artifact();
+    assert_eq!(
+        stage_pkg(&sys, Path::new("/c/x"), Path::new("/s"), &art),
+        Ok(PathBuf::from("/s/gh_2.102.0_macOS_universal.pkg"))
+    );
+    art.url = "https://example.com/download?file=x.pkg".into();
+    assert_eq!(
+        stage_pkg(&sys, Path::new("/c/x"), Path::new("/s"), &art),
+        Ok(PathBuf::from("/s/artifact.pkg"))
+    );
+    art.url = "https://example.com/..pkg".into();
+    assert_eq!(
+        stage_pkg(&sys, Path::new("/c/x"), Path::new("/s"), &art),
+        Ok(PathBuf::from("/s/artifact.pkg"))
+    );
+    art.sha256 = "0".repeat(64);
+    assert!(
+        stage_pkg(&sys, Path::new("/c/x"), Path::new("/s"), &art)
+            .unwrap_err()
+            .contains("hashes to")
+    );
+}
+
+/// The actual swap -> cleanup sequence retains displaced original bytes on
+/// failed restoration.
+#[test]
+fn a_failed_restore_keeps_the_old_bundle_out_of_stage_cleanup() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct SwapFaults {
+        inner: Fake,
+        renames: AtomicU32,
+        fail_new: bool,
+        fail_restore: bool,
+        panic_publish: bool,
+    }
+    impl System for SwapFaults {
+        fn scratch_dir(
+            &self,
+            parent: Option<&Path>,
+            label: &str,
+        ) -> std::io::Result<crate::port::Scratch<'_>> {
+            self.inner.scratch_dir(parent, label)
+        }
+        fn run(&self, c: &Cmd) -> Result<Ran, crate::port::RunFailed> {
+            self.inner.run(c)
+        }
+        fn run_tty(
+            &self,
+            c: &Cmd,
+            before: &mut dyn FnMut(&mut Cmd) -> Result<(), crate::port::RunFailed>,
+        ) -> Result<Option<i32>, crate::port::RunFailed> {
+            self.inner.run_tty(c, before)
+        }
+        fn read_file(&self, p: &Path) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file(p)
+        }
+        fn write_file(&self, p: &Path, b: &[u8], m: u32) -> std::io::Result<()> {
+            self.inner.write_file(p, b, m)
+        }
+        fn write_user_file(&self, u: &User, p: &Path, b: &[u8], m: u32) -> std::io::Result<()> {
+            self.inner.write_user_file(u, p, b, m)
+        }
+        fn remove(&self, p: &Path) -> std::io::Result<()> {
+            self.inner.remove(p)
+        }
+        fn create_dir_all(&self, p: &Path, m: u32) -> std::io::Result<()> {
+            self.inner.create_dir_all(p, m)
+        }
+        fn chown(&self, p: &Path, u: u32, g: u32) -> std::io::Result<()> {
+            self.inner.chown(p, u, g)
+        }
+        fn stat(&self, p: &Path) -> std::io::Result<Stat> {
+            self.inner.stat(p)
+        }
+        fn list_dir(&self, p: &Path) -> std::io::Result<Vec<String>> {
+            self.inner.list_dir(p)
+        }
+        fn sha256(&self, p: &Path) -> std::io::Result<String> {
+            self.inner.sha256(p)
+        }
+        fn copy_file(&self, f: &Path, t: &Path, m: u32) -> std::io::Result<()> {
+            self.inner.copy_file(f, t, m)
+        }
+        fn rename(&self, f: &Path, t: &Path) -> std::io::Result<()> {
+            let n = self
+                .renames
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 1 && self.panic_publish {
+                panic!("injected unwind after original moved");
+            }
+            if (n == 1 && self.fail_new) || (n == 2 && self.fail_restore) {
+                // A refused rename changes nothing, unlike a post-mutation error.
+                return Err(std::io::Error::other("injected rename refusal"));
+            }
+            self.inner.rename(f, t)
+        }
+        fn euid(&self) -> u32 {
+            0
+        }
+        fn now(&self) -> u64 {
+            0
+        }
+    }
+    let scenario = |fail_new, fail_restore, panic_publish| {
+        let inner = Fake::root();
+        inner
+            .stat_of(crate::AGENT_ROOT, dir())
+            .stat_of(
+                STAGE_ROOT,
+                Stat {
+                    mode: 0o700,
+                    ..dir()
+                },
+            )
+            .file("/Applications/A.app/receipt", b"original personal bytes")
+            .stat_of("/Applications/A.app", dir());
+        SwapFaults {
+            inner,
+            renames: AtomicU32::new(0),
+            fail_new,
+            fail_restore,
+            panic_publish,
+        }
+    };
+    let target = Path::new("/Applications/A.app");
+    let receipt = target.join("receipt");
+    for (fail_new, want) in [
+        (false, b"new bytes".as_slice()),
+        (true, b"original personal bytes".as_slice()),
+    ] {
+        let sys = scenario(fail_new, false, false);
+        let stage = fresh_stage(&sys).unwrap();
+        let path = stage.to_path_buf();
+        sys.inner.file(
+            stage.join("new/A.app/receipt").to_str().unwrap(),
+            b"new bytes",
+        );
+        let done = swap_into(&sys, &stage.join("new/A.app"), target, &stage);
+        assert_eq!(done.is_err(), fail_new, "positive control: {done:?}");
+        let result = clear_stage(stage, done, &Notes::default());
+        assert_eq!(result.is_err(), fail_new, "positive control: {result:?}");
+        assert_eq!(sys.inner.read_file(&receipt).unwrap(), want);
+        assert!(sys.inner.stat(&path).is_err(), "ordinary scratch is closed");
+    }
+
+    let sys = scenario(true, true, false);
+    let notes = Notes::default();
+    let stage = fresh_stage(&sys).unwrap();
+    let path = stage.to_path_buf();
+    sys.inner.file(
+        stage.join("new/A.app/receipt").to_str().unwrap(),
+        b"new bytes",
+    );
+    let why = swap_into(&sys, &stage.join("new/A.app"), target, &stage)
+        .expect_err("both publication and restoration refuse");
+    let retained = stage.join("old/A.app/receipt");
+    assert!(why.contains("the previous bundle is at"), "{why}");
+    assert_eq!(
+        sys.renames.load(Ordering::SeqCst),
+        3,
+        "restore was attempted"
+    );
+    assert_eq!(
+        sys.inner.read_file(&retained).unwrap(),
+        b"original personal bytes"
+    );
+    assert_eq!(clear_stage(stage, Err(why.clone()), &notes), Err(why));
+    assert_eq!(
+        sys.inner.read_file(&retained).unwrap(),
+        b"original personal bytes"
+    );
+    assert!(notes.joined().unwrap().contains(path.to_str().unwrap()));
+    let retry = fresh_stage(&sys).unwrap();
+    assert_ne!(retry.to_path_buf(), path);
+    drop(retry);
+    assert_eq!(
+        sys.inner.read_file(&retained).unwrap(),
+        b"original personal bytes"
+    );
+
+    let sys = scenario(false, false, true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let stage = fresh_stage(&sys).unwrap();
+        sys.inner.file(
+            stage.join("new/A.app/receipt").to_str().unwrap(),
+            b"new bytes",
+        );
+        let _ = swap_into(&sys, &stage.join("new/A.app"), target, &stage);
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        sys.renames.load(Ordering::SeqCst),
+        2,
+        "unwind occurs at publication"
+    );
+    let retained = Path::new(&stage_path(0)).join("old/A.app/receipt");
+    assert_eq!(
+        sys.inner.read_file(&retained).unwrap(),
+        b"original personal bytes"
+    );
+    let retry = fresh_stage(&sys).unwrap();
+    drop(retry);
+    assert_eq!(
+        sys.inner.read_file(&retained).unwrap(),
+        b"original personal bytes"
+    );
+}
+
+#[test]
+fn an_unsigned_pkg_inventory_must_be_a_complete_record_before_code_is_admitted() {
+    let stage = Path::new("/scratch");
+    let code = "/scratch/expanded/Payload/bin/program";
+    let listing = format!("{code}\0");
+    let find = "/usr/bin/find /scratch/expanded -type f -print0";
+    let fixture = || {
+        let sys = Fake::root();
+        sys.on(
+            "/usr/sbin/pkgutil --expand-full /input.pkg /scratch/expanded",
+            ok(""),
+        );
+        sys.on(find, ok(&listing));
+        sys.file(code, &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]);
+        sys.on(&codesign_key(code, "VEKTX9H2N7"), ok(""));
+        sys
+    };
+    let sys = fixture();
+    let notes = Notes::default();
+    vet_unsigned_pkg(&sys, Path::new("/input.pkg"), "VEKTX9H2N7", stage, &notes)
+        .expect("ordinary complete inventory admits the signed Mach-O control");
+    assert!(notes.joined().unwrap().contains("1 Mach-O file(s)"));
+    assert!(
+        sys.calls()
+            .iter()
+            .any(|call| call.starts_with("/usr/bin/codesign"))
+    );
+
+    let mut refused = Vec::new();
+    for why in [
+        "stdout did not reach EOF",
+        "stdout read failed after a partial record",
+    ] {
+        let sys = fixture();
+        sys.refuse_complete_stdout(find, why);
+        let notes = Notes::default();
+        let result = vet_unsigned_pkg(&sys, Path::new("/input.pkg"), "VEKTX9H2N7", stage, &notes);
+        assert!(
+            sys.calls().iter().any(|call| call == find),
+            "actual inventory-read route reached"
+        );
+        refused.push((
+            result.is_err(),
+            notes.joined().is_none(),
+            !sys.calls()
+                .iter()
+                .any(|call| call.starts_with("/usr/bin/codesign")),
+        ));
+    }
+    let sys = Fake::root();
+    sys.on(
+        "/usr/sbin/pkgutil --expand-full /input.pkg /scratch/expanded",
+        ok(""),
+    );
+    let lossy = "/scratch/expanded/Payload/bin/\u{fffd}";
+    sys.on(
+        find,
+        Ran {
+            status: Some(0),
+            stdout: b"/scratch/expanded/Payload/bin/\xff\0".to_vec(),
+            stderr: Vec::new(),
+        },
+    );
+    sys.file(lossy, &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]);
+    sys.on(&codesign_key(lossy, "VEKTX9H2N7"), ok(""));
+    let notes = Notes::default();
+    let result = vet_unsigned_pkg(&sys, Path::new("/input.pkg"), "VEKTX9H2N7", stage, &notes);
+    refused.push((
+        result.is_err(),
+        notes.joined().is_none(),
+        !sys.calls()
+            .iter()
+            .any(|call| call.starts_with("/usr/bin/codesign")),
+    ));
+    assert_eq!(
+        refused,
+        [(true, true, true); 3],
+        "every unproven inventory refuses before code admission"
+    );
+}

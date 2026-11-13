@@ -20,13 +20,17 @@
 //! * [`FactKind::NoProgress`]: a live background call of this session's agent that the host's
 //!   jobs reading says has made no progress (the hung-call design's R2 and R3;
 //!   [`crate::supervise::BackgroundCall`]), read through [`FactsReading`]
-//!   (`IdleHost::facts`). Its episode is the call's run of no progress, keyed by its process
-//!   group and its leader's birth ([`EpisodeKey::no_progress`]), a stable fold a successor reads
-//!   back exactly. It rides a prompt the turn-end policy types anyway
-//!   (`policy::turn_end::FACT_RIDES`) and, with `[harness] stuck_break_note` on, is typed at a
-//!   break of the agent's own background work (the occupancy design's §2.1 rank 4). It is
-//!   forgotten only on a present, fresh reading that no longer names it ([`FactsState::observe`]),
-//!   so an absent or stale reading never makes a told fact new again.
+//!   (`IdleHost::facts`). Its episode is the engine's run of no progress of that call, keyed by
+//!   its process group, its leader's birth and the engine's episode number
+//!   ([`EpisodeKey::no_progress`]), a stable fold a successor reads back exactly: told once,
+//!   never again for that run, and a reading that stops naming it forgets nothing (only progress
+//!   opens the next run, under a new number). It is told only where nothing else will wake the
+//!   agent (the reading names no other live call of its, [`FactsReading::waiting`]), and one
+//!   withheld so is journaled once ([`FactsState::withheld`]). The supervise loop tells at most
+//!   one a quiet period, the stretch between two of the agent's own turns (`FactsWatch`).
+//!   It rides a prompt the turn-end policy types anyway (`policy::turn_end::FACT_RIDES`) and,
+//!   with `[harness] stuck_break_note` on, is typed at a break of the agent's own background work
+//!   (the occupancy design's §2.1 rank 4).
 //! * [`FactKind::ProgramCheck`]: programs macOS's program check holds before their first
 //!   instruction, in this session's agent's calls and the orphans they left
 //!   (`docs/DESIGN-leftover-processes-2026-10-16.md` §6.3), read through [`FactsReading::held`]
@@ -163,7 +167,7 @@ impl FactKind {
     }
 
     /// Whether the stuck line may tell it at a break of the agent's own background work
-    /// (`[harness] stuck_break_note`; [`FactsState::pending_at_break`]): a call at no progress and
+    /// (`[harness] stuck_break_note`; [`FactsState::pending_of`]): a call at no progress and
     /// a held program, which the background work waits on, and neither a leftover nor an overlap,
     /// which ride only a prompt typed anyway.
     #[must_use]
@@ -172,7 +176,8 @@ impl FactKind {
     }
 }
 
-/// One episode of a kind's condition: the kind and an id (a job's `(pgid, leader birth)` folded,
+/// One episode of a kind's condition: the kind and an id (a job's `(pgid, leader birth, engine
+/// episode)` folded,
 /// [`Self::no_progress`], which survives a restart; for the held programs and the leftovers, the
 /// opening reading's time, and for the hold, the episode's start, each in Unix milliseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -184,14 +189,16 @@ pub struct EpisodeKey {
 }
 
 impl EpisodeKey {
-    /// The no-progress episode of the call whose process group is `pgid` and whose leader was born
-    /// at `birth`: FNV-1a over the two, little endian, never std's `DefaultHasher`, whose output
-    /// may change between builds, since a key is read back from the ledger by a later one.
+    /// The no-progress episode `episode` (the engine's, `JobRow::episode`) of the call whose
+    /// process group is `pgid` and whose leader was born at `birth`: FNV-1a over the three,
+    /// little endian, never std's `DefaultHasher`, whose output may change between builds, since a
+    /// key is read back from the ledger by a later one.
     #[must_use]
-    pub fn no_progress(pgid: u32, birth: u64) -> Self {
-        let mut bytes = [0u8; 12];
+    pub fn no_progress(pgid: u32, birth: u64, episode: u32) -> Self {
+        let mut bytes = [0u8; 16];
         bytes[..4].copy_from_slice(&pgid.to_le_bytes());
-        bytes[4..].copy_from_slice(&birth.to_le_bytes());
+        bytes[4..12].copy_from_slice(&birth.to_le_bytes());
+        bytes[12..].copy_from_slice(&episode.to_le_bytes());
         Self {
             kind: FactKind::NoProgress,
             id: aterm_hash::fnv1a_64(&bytes),
@@ -202,7 +209,8 @@ impl EpisodeKey {
     /// tell from a later process in a reused group.
     #[must_use]
     pub fn of_call(call: &BackgroundCall) -> Option<Self> {
-        call.birth.map(|birth| Self::no_progress(call.pgid, birth))
+        call.birth
+            .map(|birth| Self::no_progress(call.pgid, birth, call.episode))
     }
 
     /// The overlap episode with the sessions `peers`: FNV-1a over their sids, sorted and joined
@@ -235,6 +243,11 @@ pub const NO_PROGRESS_FRESH_MS: i64 = 60_000;
 /// After a restart, a kind told this recently waits for its condition to clear once before any
 /// episode of it is told again.
 pub const SEED_HOLD_MS: i64 = 30 * 60_000;
+
+/// How long a told no-progress episode is kept: its key names one run of no progress of one call,
+/// which never comes back once over, so it is kept past any run a call makes rather than until a
+/// reading stops naming it.
+pub const NO_PROGRESS_KEEP_MS: i64 = 24 * 60 * 60_000;
 
 /// What a ledger row says of an episode, for [`FactsState::seed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +363,10 @@ pub struct FactsReading {
     pub as_of_ms: i64,
     /// Each call at no progress.
     pub no_progress: Vec<BackgroundCall>,
+    /// How many other live background calls of the agent's the reading names, each progressing or
+    /// waiting on what it declared: each one's end wakes the agent, so a call at no progress is
+    /// not told while any stands ([`FactsState::pending`]).
+    pub waiting: u32,
     /// The held programs ([`FactKind::ProgramCheck`]): `None` where they were not read, which
     /// neither opens nor closes an episode; `Some` with no program where none is held, which
     /// closes one.
@@ -546,6 +563,12 @@ pub struct FactsState {
     /// Each episode whose line stands left in the composer ([`Self::leave`]), until a look
     /// settles it ([`Self::look`]).
     left: BTreeMap<EpisodeKey, Left>,
+    /// Each no-progress episode withheld while another of the agent's calls stood
+    /// ([`Self::withheld`]), journaled once.
+    withheld: BTreeMap<EpisodeKey, i64>,
+    /// How many times a call at no progress was told in this process, by any door: a seed counts
+    /// none ([`Self::no_progress_told`]).
+    no_progress_told: u64,
 }
 
 impl FactsState {
@@ -567,10 +590,10 @@ impl FactsState {
     /// program, it opens the held episode where none is open (keyed by its own time) and keeps
     /// the open one whichever programs it names; naming none, it closes the episode and forgets
     /// it. The leftover part ([`FactKind::Leftover`]), present and fresh
-    /// ([`LeftoverReading::fresh_at`]), opens and closes its own episode the same way. The
-    /// no-progress part ([`FactKind::NoProgress`]), present and fresh: a told episode it no longer
-    /// names is over (the call made progress or ended) and forgotten. An absent or stale part
-    /// opens, closes and forgets nothing.
+    /// ([`LeftoverReading::fresh_at`]), opens and closes its own episode the same way. An absent or
+    /// stale part opens, closes and forgets nothing. A told no-progress episode
+    /// ([`FactKind::NoProgress`]) is never forgotten by a reading: its key names one run of no
+    /// progress, so it is kept [`NO_PROGRESS_KEEP_MS`] and dropped then whatever the reading.
     pub fn observe(&mut self, reading: Option<&FactsReading>, now_ms: i64) {
         let Some(r) = reading else {
             return;
@@ -599,33 +622,47 @@ impl FactsState {
                 self.observe_closed(FactKind::ProgramCheck, &[key]);
             }
         }
-        if r.fresh_at(now_ms) {
-            let open: Vec<EpisodeKey> = r.open().into_iter().map(|(key, ..)| key).collect();
-            self.observe_closed(FactKind::NoProgress, &open);
-        }
+        let keep = |key: &EpisodeKey, at_ms: &mut i64| {
+            key.kind != FactKind::NoProgress || now_ms.saturating_sub(*at_ms) < NO_PROGRESS_KEEP_MS
+        };
+        self.told.retain(keep);
+        self.noted.retain(keep);
+        self.withheld.retain(keep);
+    }
+
+    /// THE CALL AT NO PROGRESS WITHHELD NOW, first seen so: the first open, untold episode the
+    /// reading names while another of the agent's calls stands ([`FactsReading::waiting`]), not
+    /// withheld before; marked so it is journaled once. `None` otherwise.
+    pub fn withheld(&mut self, reading: Option<&FactsReading>, now_ms: i64) -> Option<EpisodeKey> {
+        let r = reading.filter(|r| r.waiting > 0 && r.tells_at(now_ms))?;
+        let key = r
+            .open()
+            .into_iter()
+            .map(|(key, ..)| key)
+            .find(|key| !self.is_spoken_for(*key) && !self.withheld.contains_key(key))?;
+        self.withheld.insert(key, now_ms);
+        Some(key)
     }
 
     /// THE FACT TO TELL NOW: the highest-priority open episode that was not told and stands left
     /// in no composer, its sentence within [`FACT_CAP`]; else `None`. A call at no progress comes
     /// from the reading's own part, told only while it is at most [`FACT_FRESH_MS`] old
-    /// ([`FactsReading::tells_at`]); the held programs from the episode [`Self::observe`] opened,
+    /// ([`FactsReading::tells_at`]) and names no other live call of the agent's
+    /// ([`FactsReading::waiting`]), whose end would wake it; the held programs from the episode [`Self::observe`] opened,
     /// told only while the held part names one and is that young by its own time
     /// ([`HeldReading::tells_at`]); the leftovers likewise, by their own part's time
     /// ([`LeftoverReading::tells_at`]). The others wait, and one whose episode closes meanwhile is
     /// never told late. The fact a prompt typed at a turn end carries; a break's is
-    /// [`Self::pending_at_break`].
+    /// [`Self::pending_of`] with [`FactKind::rides_breaks`].
     #[must_use]
     pub fn pending(&self, reading: Option<&FactsReading>, now_ms: i64) -> Option<Fact> {
         self.pending_of(reading, now_ms, |_| true)
     }
 
-    /// [`Self::pending`] among the kinds a break's stuck line tells ([`FactKind::rides_breaks`]).
+    /// [`Self::pending`] among the kinds `admits` lets through: a break's stuck line, those that
+    /// ride breaks ([`FactKind::rides_breaks`]).
     #[must_use]
-    pub fn pending_at_break(&self, reading: Option<&FactsReading>, now_ms: i64) -> Option<Fact> {
-        self.pending_of(reading, now_ms, FactKind::rides_breaks)
-    }
-
-    fn pending_of(
+    pub fn pending_of(
         &self,
         reading: Option<&FactsReading>,
         now_ms: i64,
@@ -649,7 +686,7 @@ impl FactsState {
         ) {
             open.push((key, left.told(), left.as_of_ms));
         }
-        if r.tells_at(now_ms) {
+        if r.tells_at(now_ms) && r.waiting == 0 {
             open.extend(
                 r.open()
                     .into_iter()
@@ -711,6 +748,21 @@ impl FactsState {
     )]
     pub fn told(&mut self, key: EpisodeKey, at_ms: i64) {
         self.told.insert(key, at_ms);
+        self.count_told(key);
+    }
+
+    fn count_told(&mut self, key: EpisodeKey) {
+        if key.kind == FactKind::NoProgress {
+            self.no_progress_told += 1;
+        }
+    }
+
+    /// How many times a call at no progress was told in this process, by any door (a line left in
+    /// the composer and sent included; a seed's rows not): the supervise loop's quiet period
+    /// compares it with its count at the agent's last turn of its own.
+    #[must_use]
+    pub const fn no_progress_told(&self) -> u64 {
+        self.no_progress_told
     }
 
     /// The task door booked `key` at `at_ms` ([`Self::noted`]).
@@ -893,6 +945,7 @@ impl FactsState {
         for (key, _, end) in &settled {
             if matches!(end, Settled::Told(_)) {
                 self.told.insert(*key, now_ms);
+                self.count_told(*key);
             }
         }
         settled

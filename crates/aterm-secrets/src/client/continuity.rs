@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A Mac that comes back with a new vault key keeps its seat and its label by its proof alone
-//! (owner, 2026-11-02: the owner's labels drifting is a defect;
+//! (labels drifting is a defect;
 //! `docs/DESIGN-automatic-lan-admission-2026-11-02.md` "Seat continuity").
 //!
 //! These labels are log display hints. Owner labels and aliases belong to the registry;

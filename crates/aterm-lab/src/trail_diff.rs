@@ -1467,7 +1467,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     let base_built = t.elapsed();
     let jobs = a
         .jobs
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)))
+        .unwrap_or_else(|| aterm_cores::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)))
         .min(scripts.len());
     let t = Instant::now();
     let [head_dump, base_dump] = dump_all([&head_bin, &base_bin], &scripts, &head, &out, jobs)?;

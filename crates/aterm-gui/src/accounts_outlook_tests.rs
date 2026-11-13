@@ -634,7 +634,7 @@ fn me_facts(quota: Option<QuotaView>) -> FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some("weekly 58% used".into()),
+            weekly: Some("weekly 42% left".into()),
             label: Some("me".into()),
             ..SubscriptionDisplay::default()
         }),
@@ -695,7 +695,7 @@ fn a_walled_accounts_hover_says_out_once() {
     set_dir(None);
 }
 
-/// The roster labels of the Accounts card's items, in order.
+/// The roster labels of the Account card's items, in order.
 fn item_labels(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .filter_map(|row| match row {
@@ -790,13 +790,18 @@ fn unavailable_outlook_gallery() {
                 .fact_anchor(wid, session, Fact::Account)
                 .expect("account anchor");
             app.open_fact_menu(wid, session, Fact::Account, anchor, true);
-            assert!(app.complete_account_menu_read_for_test(Ok(worker_rows.clone())));
+            assert!(app.complete_account_menu_read_for_test(
+                crate::account_menu_read::AccountRead::with_card_for_test(
+                    worker_rows.clone(),
+                    card_of_me(&roster, &read, &enrolled),
+                )
+            ));
             app.on_claude_footer_changed(session);
             let menu = app.autopilot_menu.as_ref().unwrap();
             assert_eq!(item_labels(&menu.rows), ["me", "alt1"]);
-            assert!(menu.rows.iter().any(|row| matches!(row,
-                MenuRow::Note { text, .. } if text.contains(&why.words())
-            )));
+            // The Forecast row says why there is none, whole, however the room wraps it.
+            let said = fact_of(&menu.rows, "Forecast").expect("a Forecast row");
+            assert!(said.contains(&why.words()), "{said}");
             let png = crate::scripted_redraw_fixture::headless(&mut app, |app| {
                 let (reply, receive) = std::sync::mpsc::channel();
                 app.render_image(crate::control::ImageReq {
@@ -958,15 +963,24 @@ fn paused_outlook_gallery() {
                 .fact_anchor(wid, session, Fact::Account)
                 .expect("account anchor");
             app.open_fact_menu(wid, session, Fact::Account, anchor, true);
-            assert!(app.complete_account_menu_read_for_test(Ok(worker_rows.clone())));
+            assert!(app.complete_account_menu_read_for_test(
+                crate::account_menu_read::AccountRead::with_card_for_test(
+                    worker_rows.clone(),
+                    card_of_me(&roster, &read, &enrolled),
+                )
+            ));
             app.on_claude_footer_changed(session);
             assert_eq!(
                 item_labels(&app.autopilot_menu.as_ref().unwrap().rows),
                 ["me", "alt1"]
             );
-            assert_eq!(app.autopilot_menu.as_ref().unwrap().rows.iter().any(|row| {
-                matches!(row, MenuRow::Note { text, .. } if text.contains(&Refusal::SessionPaused.words()))
-            }), paused);
+            let said = fact_of(&app.autopilot_menu.as_ref().unwrap().rows, "Forecast")
+                .expect("a Forecast row");
+            assert_eq!(
+                said.contains(&Refusal::SessionPaused.words()),
+                paused,
+                "{said}"
+            );
             let png = crate::scripted_redraw_fixture::headless(&mut app, |app| {
                 let (reply, receive) = std::sync::mpsc::channel();
                 app.render_image(crate::control::ImageReq {
@@ -1209,11 +1223,11 @@ fn watching_account_observations_gallery() {
             assert_eq!((observed.known, observed.eligible), (Some(2), None));
             // The view's words where the outlook replayed; the profile's own without one.
             let (title_week, spoken_week) = if unavailable {
-                (weekly.clone(), weekly.replace('\u{2265}', "at least "))
+                (weekly.clone(), weekly.replace('\u{2264}', "at most "))
             } else {
                 (
-                    "at least 25% of its week used".to_owned(),
-                    "at least 25 percent of its week used".to_owned(),
+                    "\u{2264}75% left of its week".to_owned(),
+                    "at most 75 percent left of its week".to_owned(),
                 )
             };
             for (said, expected_week) in [
@@ -1243,7 +1257,9 @@ fn watching_account_observations_gallery() {
                 .fact_anchor(wid, session, Fact::Account)
                 .expect("actual account anchor");
             app.open_fact_menu(wid, session, Fact::Account, anchor, true);
-            assert!(app.complete_account_menu_read_for_test(result.clone()));
+            assert!(app.complete_account_menu_read_for_test(
+                crate::account_menu_read::AccountRead::for_test(result.clone())
+            ));
             app.on_claude_footer_changed(session);
             let rows = &app.autopilot_menu.as_ref().unwrap().rows;
             if unavailable {
@@ -1296,18 +1312,23 @@ fn watching_account_observations_gallery() {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            // The admitted figure, used (never `% left`, on either card): the outlook's card says
-            // its bound; the card without one says the pane's own weekly words.
-            assert!(!drawn.contains("% left"), "{cols}: {drawn}");
+            // The admitted figure, as what is left (never `% used`, on either card): the
+            // outlook's card says its bound; the card without one says the pane's own weekly
+            // words.
+            assert!(!drawn.contains("% used"), "{cols}: {drawn}");
             let figure = if unavailable {
                 weekly.clone()
             } else {
-                format!("\u{2265}{}%", admitted.used_x10 / 10)
+                format!(
+                    "\u{2264}{}% left",
+                    aterm_agent::harness::left::at_most(admitted.used_x10)
+                )
             };
-            assert!(drawn.contains(&figure), "{cols}: {figure:?} in {drawn}");
+            let figure = figure.strip_prefix("weekly ").unwrap_or(&figure);
+            assert!(drawn.contains(figure), "{cols}: {figure:?} in {drawn}");
             if unavailable {
                 assert!(
-                    drawn.contains("Account state unavailable"),
+                    drawn.contains("This Mac's accounts could not be read"),
                     "{cols}: {drawn}"
                 );
             }
@@ -1392,7 +1413,9 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
     app.hold_account_menu_reads_for_test();
     app.open_fact_menu(wid, session, Fact::Account, (0, 0), false);
     assert!(
-        app.complete_account_menu_read_for_test(Ok(worker_rows)),
+        app.complete_account_menu_read_for_test(crate::account_menu_read::AccountRead::for_test(
+            Ok(worker_rows)
+        )),
         "the card asked the account reader"
     );
     app.on_claude_footer_changed(session);
@@ -1411,8 +1434,12 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
         "roster order"
     );
     assert!(
-        menu.rows.iter().any(|r| matches!(r, MenuRow::Plot { .. })),
-        "the outlook's work row and lanes are on the card"
+        menu.rows.iter().any(|r| matches!(
+            r,
+            MenuRow::Fact { label, value, .. } if label == "Budget" && value.contains("% left")
+        )),
+        "the snapshot's week is the card's Budget answer: {:?}",
+        menu.rows
     );
     app.close_autopilot_menu();
     assert_eq!(crate::work_counts::take_account_store_reads(), 0);
@@ -1421,21 +1448,23 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
     set_dir(None);
 }
 
-/// T22 and T23 on the card the window draws: at 60, 44 and 30 cells and with room for every row
-/// or a short pane, every drawn row fits, every `Plot` is captioned, no spoken word and no
-/// hover title holds a box, block, braille or legacy-computing glyph, and the items keep the
-/// quota view's order (here the roster's) and choose their own account. Negative controls: an
-/// uncaptioned plot; a lane's levels in its caption; items in the outlook's order reversed.
-#[test]
-fn the_cards_rows_fit_speak_and_keep_roster_order() {
+/// The seeded outlook over `roster`, the store's rows for it and the card of `me`'s account as
+/// the account reader builds it from the same store read.
+fn seeded_card(
+    roster: &Roster,
+) -> (
+    aterm_tempfile::TempDir,
+    Arc<aterm_agent::harness::outlook::Outlook>,
+    Vec<crate::fact_menu::AccountMenuRow>,
+    aterm_agent::harness::account_card::AccountCard,
+) {
     let dir = seeded_stop();
-    let roster = pool_roster();
     let mut memo = OutlookMemo {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
     let outlook = Arc::new(
-        memo.at(Instant::now(), NOW, Some(&roster), false, false)
+        memo.at(Instant::now(), NOW, Some(roster), false, false)
             .expect("an outlook")
             .clone(),
     );
@@ -1444,57 +1473,122 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
         .as_ref()
         .and_then(|h| h.read.clone().ok())
         .expect("read");
-    let (state, enrolled) = (&state, &enrolled);
-    let (accounts, _) = crate::fact_menu::account_menu_rows_from(
-        &roster,
-        state,
-        enrolled,
+    let rows = crate::fact_menu::account_menu_rows_from(
+        roster,
+        &state,
+        &enrolled,
         true,
         Some("me"),
         Some("me@example.test"),
         crate::fact_menu::SessionWeek::default(),
         NOW,
     );
-    let mut plots = 0;
+    let card = card_of_me(roster, &state, &enrolled);
+    (dir, outlook, rows, card)
+}
+
+/// The card a worker builds for `me`'s tab over `state`: no pool file, claims table or journal.
+fn card_of_me(
+    roster: &Roster,
+    state: &aterm_agent::harness::accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+) -> aterm_agent::harness::account_card::AccountCard {
+    use aterm_agent::harness::{account_card, accounts, alab_seen};
+    account_card::build(&account_card::Inputs {
+        cli: accounts::Cli::Claude,
+        roster,
+        state,
+        enrolled,
+        logins: &accounts::Logins::default(),
+        session: account_card::Session {
+            label: Some("me"),
+            email: Some("me@example.test"),
+            profile_key: None,
+        },
+        pool: None,
+        claims: &Ok(None),
+        journal: &alab_seen::Journal::Off,
+        history: account_card::HistoryIn::NotRead,
+        now: NOW,
+        tz_at: |_| 0,
+    })
+}
+
+/// The card's rows for `me`'s pane at `room`, the tab `movable` or not.
+fn card_menu(
+    (outlook, accounts, card): (
+        &Arc<aterm_agent::harness::outlook::Outlook>,
+        &[crate::fact_menu::AccountMenuRow],
+        &aterm_agent::harness::account_card::AccountCard,
+    ),
+    room: usize,
+    movable: bool,
+) -> Vec<MenuRow> {
+    let facts = crate::fact_menu::FactMenuFacts {
+        title: "Account \u{b7} tab 1".into(),
+        spoken: "Account, tab 1".into(),
+        room,
+        email: Some("me@example.test".into()),
+        product: "Claude Code",
+        now: NOW,
+        accounts: accounts.to_vec(),
+        outlook: Some(Arc::clone(outlook)),
+        card: Some(card.clone()),
+        account_row: Some("me".into()),
+        movable,
+        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
+        ..crate::fact_menu::FactMenuFacts::default()
+    };
+    crate::fact_menu::rows(Fact::Account, &facts)
+}
+
+/// A named fact's whole value on the card, its wrapped rows joined.
+fn fact_of(rows: &[MenuRow], name: &str) -> Option<String> {
+    let at = rows
+        .iter()
+        .position(|row| matches!(row, MenuRow::Fact { label, .. } if label == name))?;
+    let parts: Vec<&str> = rows[at..]
+        .iter()
+        .enumerate()
+        .map_while(|(i, row)| match row {
+            MenuRow::Fact { label, value, .. } if i == 0 || label.is_empty() => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    Some(parts.join(" "))
+}
+
+/// T22 and T23 on the card the window draws: at 60, 44 and 30 cells every row fits its room,
+/// no spoken word and no hover title holds a box, block, braille or legacy-computing glyph,
+/// and the items keep the quota view's order (here the roster's) and choose their own account.
+#[test]
+fn the_cards_rows_fit_speak_and_keep_roster_order() {
+    let (dir, outlook, accounts, card) = seeded_card(&pool_roster());
+    let mut facts_seen = 0;
     for room in [60, 44, 30] {
-        for height in [None, Some(12)] {
-            let facts = crate::fact_menu::FactMenuFacts {
-                title: "Accounts \u{b7} tab 1".into(),
-                spoken: "Accounts, tab 1".into(),
-                room,
-                accounts: accounts.clone(),
-                outlook: Some(Arc::clone(&outlook)),
-                account_row: Some("me".into()),
-                movable: true,
-                height,
-                cli: Some(aterm_agent::harness::accounts::Cli::Claude),
-                ..crate::fact_menu::FactMenuFacts::default()
-            };
-            let rows = crate::fact_menu::rows(Fact::Account, &facts);
-            let what = format!("{room} cells, height {height:?}");
-            assert_eq!(item_labels(&rows), ["me", "alt1", "pool1"], "{what}");
-            for row in &rows {
-                match row {
-                    MenuRow::Plot { cells, spoken, .. } => {
-                        assert!(cells.len() <= room, "{what}: a plot of {}", cells.len());
-                        assert!(!spoken.trim().is_empty(), "{what}: an uncaptioned plot");
-                        assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");
-                        plots += 1;
-                    }
-                    MenuRow::Note { text, spoken, .. } => {
-                        let w = crate::tab_menu::display_cells(text);
-                        assert!(w <= room, "{what}: {text:?} is {w} cells");
-                        assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");
-                    }
-                    MenuRow::Item { spoken, .. } => {
-                        assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");
-                    }
-                    _ => {}
+        let rows = card_menu((&outlook, &accounts, &card), room, true);
+        let what = format!("{room} cells");
+        assert_eq!(item_labels(&rows), ["me", "alt1", "pool1"], "{what}");
+        for row in &rows {
+            let w = crate::autopilot_menu::row_width(row);
+            assert!(w <= room, "{what}: {row:?} is {w} cells");
+            match row {
+                MenuRow::Plot { spoken, .. }
+                | MenuRow::Note { spoken, .. }
+                | MenuRow::Item { spoken, .. } => {
+                    assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");
                 }
+                MenuRow::Fact { spoken, .. } => {
+                    assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");
+                    facts_seen += 1;
+                }
+                _ => {}
             }
         }
     }
-    assert!(plots > 0, "the card draws its work row and lanes");
+    assert!(facts_seen > 0, "the card states its facts");
     let facts = me_facts(Some(outlook.quota("me", Some(Figure::Exact(580)), true)));
     let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
     let (spoken, _) = crate::claude_facts::fact_spoken_of(
@@ -1512,179 +1606,98 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
     set_dir(None);
 }
 
-/// The card's rows for the store's `accounts` at `height`, on `me`'s pane, `movable` or not.
-fn card_menu(
-    outlook: &Arc<aterm_agent::harness::outlook::Outlook>,
-    accounts: &[crate::fact_menu::AccountMenuRow],
-    height: Option<usize>,
-    movable: bool,
-) -> Vec<MenuRow> {
-    let facts = crate::fact_menu::FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
-        spoken: "Accounts, tab 1".into(),
-        room: 60,
-        accounts: accounts.to_vec(),
-        outlook: Some(Arc::clone(outlook)),
-        account_row: Some("me".into()),
-        movable,
-        height,
-        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
-        ..crate::fact_menu::FactMenuFacts::default()
-    };
-    crate::fact_menu::rows(Fact::Account, &facts)
-}
-
-/// The seeded outlook over `roster` and the store's rows for it.
-fn seeded_card(
-    roster: &Roster,
-) -> (
-    aterm_tempfile::TempDir,
-    Arc<aterm_agent::harness::outlook::Outlook>,
-    Vec<crate::fact_menu::AccountMenuRow>,
-) {
-    let dir = seeded_stop();
-    let mut memo = OutlookMemo {
-        reads: Some(scratch_reads()),
-        ..OutlookMemo::default()
-    };
-    let outlook = Arc::new(
-        memo.at(Instant::now(), NOW, Some(roster), false, false)
-            .expect("an outlook")
-            .clone(),
-    );
-    let (state, enrolled) = memo
-        .held
-        .as_ref()
-        .and_then(|h| h.read.clone().ok())
-        .expect("read");
-    let (accounts, _) = crate::fact_menu::account_menu_rows_from(
-        roster,
-        &state,
-        &enrolled,
-        true,
-        Some("me"),
-        Some("me@example.test"),
-        crate::fact_menu::SessionWeek::default(),
-        NOW,
-    );
-    (dir, outlook, accounts)
-}
-
-/// A lane row's account: its caption names its week (`alt1's week, …`).
-/// The roster label of the account whose lane `row` is: a lane is said by its account's email
-/// (§2.5), each of these rosters' `<label>@example.test`.
-fn lane_label(row: &MenuRow) -> Option<&str> {
-    match row {
-        MenuRow::Plot { spoken, .. } => spoken
-            .split_once("'s week, ")
-            .map(|(name, _)| name.split_once('@').map_or(name, |(label, _)| label)),
-        _ => None,
-    }
-}
-
-fn is_legend(row: &MenuRow) -> bool {
-    matches!(row, MenuRow::Plot { spoken, .. } if spoken.starts_with("Legend:"))
-}
-
-/// AN ITEM AND ITS LANE ARE ONE UNIT, AND ONLY THE LEGEND CLOSES THE CARD'S DRAWN ROWS (§1.4):
-/// each lane follows its own account's item; a card account the store does not list draws
-/// neither its item nor its lane; the pin item follows the legend directly and a rule under
-/// anything else, a lane included, at every height. Negative controls: a mapping that skips an
-/// unlisted item but keeps its lane leaves `alt1`'s lane under `me`'s; a rule skipped whenever the
-/// card ends on any drawn row puts the pin item straight under `alt1`'s lane once the legend
-/// gives way.
+/// THE CARD'S FORECAST IS THE SNAPSHOT'S PROJECTION OF THE TAB'S OWN WEEK, AND A TAB THE
+/// ROTATION CANNOT MOVE IS PROJECTED NOWHERE (§1.4, §2.2): the `Forecast` row says what the
+/// resolver's outlook projects for the account's week (that it lasts to its reset, or about
+/// when it runs out, in the warn ink, the instant said to its lead's grain as line E says its
+/// own, never to the minute a pace cannot place) with the pool's pace a day; with the footer's route off
+/// the account ([`crate::fact_menu::FactMenuFacts::movable`] false) it says the tab cannot be
+/// switched and no row says a stop. The card draws no projected line at all. Negative
+/// control: the same card for a movable tab says the seeded projection.
 #[test]
-fn an_item_and_its_lane_are_one_unit_and_the_legend_closes_the_card() {
-    let (dir, outlook, accounts) = seeded_card(&roster());
-    let mut ended_on_a_lane = false;
-    let heights = std::iter::once(None).chain((0..=40).map(Some));
-    for height in heights {
-        let rows = card_menu(&outlook, &accounts, height, true);
-        for (i, row) in rows.iter().enumerate() {
-            if let Some(label) = lane_label(row) {
-                assert_eq!(
-                    item_labels(&rows[i - 1..i]),
-                    [label],
-                    "h{height:?}: {label}'s lane under its own item"
-                );
-            }
-        }
-        let pin = rows
-            .iter()
-            .position(|r| {
-                matches!(r, MenuRow::Item { glyph, label, .. }
-                if *glyph == crate::fact_menu::PIN_GLYPH && label.starts_with("No pinned"))
-            })
-            .expect("the pin item");
-        let before = &rows[pin - 1];
-        assert!(
-            is_legend(before) || matches!(before, MenuRow::Rule),
-            "h{height:?}: the pin item under {before:?}"
-        );
-        if pin >= 2 && matches!(before, MenuRow::Rule) && lane_label(&rows[pin - 2]).is_some() {
-            ended_on_a_lane = true;
-        }
-    }
-    assert!(
-        ended_on_a_lane,
-        "some height drops the legend and keeps the lanes"
-    );
-    drop(dir);
-    set_dir(None);
-
-    let (dir, outlook, accounts) = seeded_card(&pool_roster());
-    let listed: Vec<_> = accounts
+fn the_cards_forecast_is_the_snapshots_projection_and_follows_the_tabs_route() {
+    use aterm_agent::harness::outlook::{self, Window};
+    let (dir, outlook, accounts, card) = seeded_card(&pool_roster());
+    let projection = outlook
+        .rows
         .iter()
-        // A store row is named by its email (§2.5), each of these `<label>@example.test`.
-        .filter(|a| a.label.split(['@', ' ']).next() != Some("alt1"))
-        .cloned()
-        .collect();
-    let rows = card_menu(&outlook, &listed, None, true);
-    assert_eq!(item_labels(&rows), ["me", "pool1"]);
+        .find(|row| row.label == "me")
+        .and_then(|row| row.window(Window::Week))
+        .and_then(|week| week.projection);
+    let pace = outlook
+        .day_pct()
+        .map_or_else(String::new, |pct| format!(" at {pct}% of a week a day"));
+    let want = match projection {
+        Some(projection) => match projection.fills_at {
+            Some(at) => format!(
+                "runs out ~{}{pace}",
+                outlook::when(
+                    outlook::round_down(at, outlook.as_of, &outlook.offsets),
+                    NOW,
+                    &outlook.offsets
+                )
+            ),
+            None => format!("lasts to its reset{pace}"),
+        },
+        None => "not worked out yet".to_owned(),
+    };
+    assert!(projection.is_some(), "the seeded store projects me's week");
+    let moved = card_menu((&outlook, &accounts, &card), 60, true);
+    assert_eq!(fact_of(&moved, "Forecast").as_deref(), Some(want.as_str()));
+    // An instant 30 hours and 7 minutes ahead is said to the hour. CONTROL: its own minute is
+    // another word, and the card does not say it.
+    let mut ahead = (*outlook).clone();
+    let at = ahead.as_of + 30 * 3600 + 7 * 60;
+    for week in ahead
+        .rows
+        .iter_mut()
+        .filter(|row| row.label == "me")
+        .flat_map(|row| row.windows.iter_mut())
+        .filter(|window| window.window == Window::Week)
+    {
+        week.projection.as_mut().expect("a projection").fills_at = Some(at);
+    }
+    let (exact, hour) = (
+        outlook::when(at, NOW, &ahead.offsets),
+        outlook::when(
+            outlook::round_down(at, ahead.as_of, &ahead.offsets),
+            NOW,
+            &ahead.offsets,
+        ),
+    );
+    assert_ne!(exact, hour);
+    let ahead = Arc::new(ahead);
+    let said =
+        fact_of(&card_menu((&ahead, &accounts, &card), 60, true), "Forecast").expect("a forecast");
     assert!(
-        rows.iter().all(|r| lane_label(r) != Some("alt1")),
-        "alt1's lane went with its item"
+        said.starts_with(&format!("runs out ~{hour}")) && !said.contains(&exact),
+        "{said}"
+    );
+    let still = card_menu((&outlook, &accounts, &card), 60, false);
+    assert_eq!(
+        fact_of(&still, "Forecast").as_deref(),
+        Some("none: aterm cannot switch this tab")
     );
     assert!(
-        rows.iter().any(|r| lane_label(r) == Some("me")),
-        "CONTROL: me's lane stands"
-    );
-    drop(dir);
-    set_dir(None);
-}
-
-/// A TAB THE ROTATION CANNOT MOVE IS PROJECTED NOWHERE ON THE CARD THE WINDOW DRAWS (§2.2): with
-/// the footer's route off the account ([`crate::fact_menu::FactMenuFacts::movable`] false) no
-/// drawn row outside the legend holds the projected line's ink and no note says `╳`.
-/// Negative control: the same card for a movable tab projects the seeded stop.
-#[test]
-fn a_card_for_a_tab_the_rotation_cannot_move_projects_nothing() {
-    let (dir, outlook, accounts) = seeded_card(&pool_roster());
-    let projects = |rows: &[MenuRow]| {
-        rows.iter().any(|r| match r {
-            MenuRow::Plot { cells, .. } if !is_legend(r) => cells
-                .iter()
-                .any(|c| c.ink == crate::autopilot_menu::PlotInk::Ahead),
+        !still.iter().any(|row| match row {
+            MenuRow::Fact { value, .. } => value.contains("runs out"),
+            MenuRow::Note { text, .. } => text.contains('\u{2573}'),
             _ => false,
-        })
-    };
-    let verdict_warns = |rows: &[MenuRow]| {
-        rows.iter()
-            .any(|r| matches!(r, MenuRow::Note { text, .. } if text.contains('\u{2573}')))
-    };
-    let moved = card_menu(&outlook, &accounts, None, true);
-    assert!(
-        projects(&moved) && verdict_warns(&moved),
-        "CONTROL: {moved:?}"
-    );
-    let still = card_menu(&outlook, &accounts, None, false);
-    assert!(!projects(&still), "{still:?}");
-    assert!(!verdict_warns(&still), "{still:?}");
-    assert!(
-        still
-            .iter()
-            .any(|r| matches!(r, MenuRow::Note { text, .. } if text.contains("not projected"))),
+        }),
         "{still:?}"
+    );
+    // The Budget answer under the outlook is the snapshot's own figure of the row.
+    let figure = outlook
+        .rows
+        .iter()
+        .find(|row| row.label == "me")
+        .map(|row| row.figure(outlook.as_of))
+        .expect("me's row");
+    assert!(
+        fact_of(&moved, "Budget").is_some_and(|budget| budget.starts_with(&figure.words())),
+        "{:?} begins {}",
+        fact_of(&moved, "Budget"),
+        figure.words()
     );
     drop(dir);
     set_dir(None);
@@ -1719,7 +1732,7 @@ impl Raised {
 }
 
 /// ACCEPTANCE 5: A FORECAST INTERRUPTS NOBODY. A replay that projects a stop reaches the pane's
-/// rule in its warn words, the Accounts card opens on it, a later replay refreshes the open
+/// rule in its warn words, the Account card opens on it, a later replay refreshes the open
 /// card, and it closes: no message is shown or logged, no digest entry or `NEEDS YOU` is raised,
 /// no bell rings, the border does not flash and no wake is armed for motion. Control: the same
 /// observation sees a posted account entry.

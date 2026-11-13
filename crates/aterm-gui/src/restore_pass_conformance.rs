@@ -9,8 +9,8 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use crate::{
-    App, RestorePassSite, WindowId, WindowState, handoff_paint_proven, restore_pass_due,
-    restore_pass_sliced,
+    App, RESTORE_GLASS_PATIENCE, RestoreGlassWait, RestorePassSite, WindowId, WindowState,
+    handoff_paint_proven, restore_pass_due, restore_pass_sliced,
 };
 
 struct Real {
@@ -102,6 +102,11 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
     let queued = app.restore_pass_queued();
     let carries_shells = app.restore_pass_carries_shells();
     let first_present_done = s["painted0"] == 1 || s["painted_extras"] == 1;
+    let now = std::time::Instant::now();
+    app.restore_glass = RestoreGlassWait {
+        since: (s["waited"] == 1).then(|| now - RESTORE_GLASS_PATIENCE),
+        said: false,
+    };
     let at_attach = restore_pass_due(
         RestorePassSite::FirstAttach,
         handoff_lane,
@@ -118,13 +123,7 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
         1 => {
             steps.insert("LeaveResume");
         }
-        2 if restore_pass_due(
-            RestorePassSite::Park,
-            handoff_lane,
-            first_present_done,
-            queued,
-        ) =>
-        {
+        2 if app.restore_pass_due_at_park(first_present_done, now) => {
             steps.insert("RebuildAtPark");
             if restore_pass_sliced(RestorePassSite::Park, carries_shells) {
                 steps.insert("SliceAtPark");
@@ -207,6 +206,7 @@ fn the_shipping_rebuild_sites_and_proof_gate_conform_to_the_model() {
     );
     let mut attach_passes = 0;
     let mut cold_slices = 0;
+    let mut glassless_rebuilds = 0;
     for s in &states {
         let want = model_steps(&model, s);
         let got = real_steps(&mut real, s);
@@ -217,6 +217,12 @@ fn the_shipping_rebuild_sites_and_proof_gate_conform_to_the_model() {
         if s["draining"] == 1 && s["queued"] == 1 && got.contains("SliceAtPark") {
             cold_slices += 1;
         }
+        if s["waited"] == 1
+            && s["painted0"] + s["painted_extras"] == 0
+            && got.contains("RebuildAtPark")
+        {
+            glassless_rebuilds += 1;
+        }
     }
     assert!(
         attach_passes > 0,
@@ -225,6 +231,59 @@ fn the_shipping_rebuild_sites_and_proof_gate_conform_to_the_model() {
     assert!(
         cold_slices > 0,
         "a drain under way is reached, and its next park slices again"
+    );
+    assert!(
+        glassless_rebuilds > 0,
+        "a park whose first window never reached the glass rebuilds once its patience is spent"
+    );
+}
+
+/// A cold drain whose first window never reaches the glass waits [`RESTORE_GLASS_PATIENCE`]
+/// once, not once per slice: a wait its own slices started again held a twenty-slice restore,
+/// and every update behind it, for ten minutes. The model's `waited` stays set through
+/// `RebuildSliceAtPark` (its `GlassWaitRearms` mutant is that bug); here the park's own method
+/// holds the code to it along one run.
+#[test]
+fn a_cold_drain_waits_for_its_glass_once_not_once_per_slice() {
+    use std::time::Duration;
+    let mut app = App::headless_for_test();
+    app.restore_drain = Some(Box::new(crate::app_restore::RestoreDrain::new(None)));
+    let start = std::time::Instant::now();
+    assert!(
+        !app.restore_pass_due_at_park(false, start),
+        "inside its patience the pass waits for the glass"
+    );
+    assert_eq!(
+        app.restore_glass.deadline(start),
+        Some(start + RESTORE_GLASS_PATIENCE),
+        "the loop wakes for the wait's end"
+    );
+    let out = start + RESTORE_GLASS_PATIENCE;
+    assert!(
+        app.restore_pass_due_at_park(false, out),
+        "past it the pass runs without glass"
+    );
+    for slice in 1..=20 {
+        assert!(
+            app.restore_pass_due_at_park(false, out + Duration::from_millis(4 * slice)),
+            "slice {slice}: the drain under way slices again at the next park"
+        );
+    }
+    assert_eq!(
+        app.restore_glass.deadline(out),
+        None,
+        "no wake for a wait run out"
+    );
+    assert!(
+        !app.restore_glass.say_once(),
+        "the glassless run was said once"
+    );
+    app.restore_drain = None;
+    assert!(!app.restore_pass_due_at_park(false, out + Duration::from_secs(1)));
+    app.restore_drain = Some(Box::new(crate::app_restore::RestoreDrain::new(None)));
+    assert!(
+        !app.restore_pass_due_at_park(false, out + Duration::from_secs(2)),
+        "a restore queued afresh waits afresh"
     );
 }
 

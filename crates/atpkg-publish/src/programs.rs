@@ -84,7 +84,7 @@ pub enum Shape {
 /// on `origin/main` of the staging owner's repo, and a build number that is not the checkout's
 /// `HEAD` commit count. It builds `--locked` and calls the pack `MAJOR.MINOR.0+g<9-hex HEAD>`,
 /// the publication rule's spelling of a dev build. Its pin installs it on every client, as any
-/// program's does (owner ruling 2026-10-27, that page's §11 D45).
+/// program's does (that page's §11 D45).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Harness {
     /// The one tool it ships and shims: the repo's binary. A repo that declares no `expose`

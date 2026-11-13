@@ -58,7 +58,7 @@ const HEARD_WRITTEN_EVERY: Duration = Duration::from_secs(300);
 const WORD_MAX: usize = 64;
 
 /// The row's keys, in the order a row is written.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 31] = [
     "sid",
     "label",
     "node",
@@ -88,6 +88,8 @@ const KEYS: [&str; 29] = [
     "ended",
     "ended_why",
     "owed",
+    "paying",
+    "was_told",
 ];
 
 /// One worker this Mac started.
@@ -146,7 +148,11 @@ pub struct Row {
     pub area: Option<String>,
     /// The end its last `kind=task` telemetry row told (`<outcome>.<stop>`,
     /// [`crate::fleet_telemetry::task_end`]): a close that comes to the same end writes no second
-    /// row. Kept under the board's lock with the row, so no read of the log decides it.
+    /// row. Kept under the board's lock with the row, so no read of the log decides it. While the
+    /// row is paying ([`Self::paying`]) it is the end of the newest row it pays, so a board
+    /// writer that knows no `paying=` (an older aterm) takes a close to that end as told, and the
+    /// end before it is [`Self::was_told`]; unless such a writer told a newer end since, which
+    /// the next pay keeps ([`BoundBoard::pay`]).
     pub told: Option<String>,
     /// The last end its Mac reported while the row stood open: a conclusion of any state but
     /// `stalled` (a stall's `failed` stands only while the stall does, and its record takes it
@@ -163,6 +169,17 @@ pub struct Row {
     /// board gives them up, which counts each lost once
     /// ([`crate::fleet_telemetry::task_end`]).
     pub owed: Vec<String>,
+    /// The task rows a pay of the board's was writing to its log when it last wrote this row,
+    /// oldest first, each as [`Row::owed`] holds it: the row records them before the append
+    /// ([`BoundBoard::pay`]), so where a write after it fails or its process exits, the log
+    /// says which of them it holds, and the board writes again only those it does not, and
+    /// never says lost a row the log holds.
+    pub paying: Vec<String>,
+    /// While the row is paying ([`Self::paying`]), the end it told before the pay told theirs
+    /// ([`Self::told`]): the end of the newest task row the log held of it then, or of a paying
+    /// row dropped unsaid (taken as told, so the log may lack it), which it tells again where the
+    /// log holds none of those still paying. `None` while it pays nothing.
+    pub was_told: Option<String>,
     /// Words of keys this aterm does not know (a later aterm's), as read: written back unchanged.
     pub extra: Vec<(String, String)>,
 }
@@ -184,6 +201,13 @@ impl Row {
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.state != "closed"
+    }
+
+    /// Whether it holds task rows its board owes its log, or was writing there
+    /// ([`Self::owed`], [`Self::paying`]): the keeper settles it ([`keep`]).
+    #[must_use]
+    pub fn owes(&self) -> bool {
+        !self.owed.is_empty() || !self.paying.is_empty()
     }
 
     /// Whether `from` and `label` (a [`Filter`]) both take this row.
@@ -209,7 +233,14 @@ impl Row {
         let num = |n: u64| n.to_string();
         let opt_num = |n: Option<u64>| n.map_or_else(|| "-".to_owned(), |n| n.to_string());
         let word = |s: &Option<String>| s.as_deref().map_or_else(|| "-".to_owned(), encode);
-        let values: [String; 29] = [
+        let lines = |lines: &[String]| {
+            if lines.is_empty() {
+                "-".to_owned()
+            } else {
+                encode(&lines.concat())
+            }
+        };
+        let values: [String; 31] = [
             encode(&self.sid),
             word(&self.label),
             word(&self.node),
@@ -238,11 +269,9 @@ impl Row {
             word(&self.told),
             word(&self.ended),
             word(&self.ended_why),
-            if self.owed.is_empty() {
-                "-".to_owned()
-            } else {
-                encode(&self.owed.concat())
-            },
+            lines(&self.owed),
+            lines(&self.paying),
+            word(&self.was_told),
         ];
         KEYS.iter()
             .zip(values)
@@ -317,11 +346,9 @@ impl Row {
                 "told" => row.told = text(),
                 "ended" => row.ended = text(),
                 "ended_why" => row.ended_why = text(),
-                "owed" => {
-                    row.owed = text().map_or_else(Vec::new, |lines| {
-                        lines.split_inclusive('\n').map(str::to_owned).collect()
-                    });
-                }
+                "owed" => row.owed = text().map_or_else(Vec::new, |text| split_lines(&text)),
+                "paying" => row.paying = text().map_or_else(Vec::new, |text| split_lines(&text)),
+                "was_told" => row.was_told = text(),
                 // Kept in the board's own encoding, so no byte a peer sent reaches a terminal.
                 _ => row.extra.push((key.to_owned(), encode(&decode(value)))),
             }
@@ -487,9 +514,17 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// While it lives, [`Board::here`] on this thread is the board in its folder (a test's own).
+/// While it lives, [`Board::here`] on this thread is the board in its folder (a test's own), and
+/// this Mac's log is the one beside it where that folder is named [`DIR`], as a state folder's
+/// board is ([`crate::fleet_telemetry::here_log`]; none for a folder named otherwise).
 #[cfg(test)]
 pub(crate) struct HereGuard;
+
+/// The board folder a [`HereGuard`] points this thread at, where one lives.
+#[cfg(test)]
+pub(crate) fn here_override() -> Option<PathBuf> {
+    HERE_OVERRIDE.with(|cell| cell.borrow().clone())
+}
 
 #[cfg(test)]
 impl HereGuard {
@@ -763,7 +798,8 @@ impl BoundBoard {
     /// fails.
     pub fn record(&self, row: &Row) -> io::Result<()> {
         let _lock = self.lock()?;
-        // A row of its sid written over drops what that row owed its log: given up.
+        // A row of its sid written over drops what that row owed its log: given up. What it was
+        // writing there the log may hold: dropped unsaid (missing at worst, never said twice).
         let replaced = self.row(&row.sid).map_or(0, |was| {
             was.owed
                 .iter()
@@ -809,10 +845,10 @@ impl BoundBoard {
                 changed += 1;
                 h.write = true;
                 // A close's task row is owed, and goes to the log with every row this apply's
-                // rows owe ([`Self::pay`]) before the board keeps the close: an exit between the
-                // two leaves the close unkept, which the next answer merges and tells again (a
-                // second row of one end, never none). Only a board still at its path names the
-                // state folder whose log it is.
+                // rows owe ([`Self::pay`]), which keeps the close, its row paying, before it
+                // appends: an exit anywhere leaves either the close unkept, which the next answer
+                // merges and tells again, or its row paying, which the log settles. Only a board
+                // still at its path names the state folder whose log it is.
                 if self.is_current()
                     && let Some(end) =
                         crate::fleet_telemetry::task_end(&self.dir, &was, row, seen, now_ms)
@@ -841,92 +877,209 @@ impl BoundBoard {
         let held = sids
             .iter()
             .filter_map(|sid| self.row(sid))
-            .filter(|row| !row.owed.is_empty())
+            .filter(Row::owes)
             .map(Held::of)
             .collect();
         self.keep_held(held, now_ms)
     }
 
     /// With the board's lock held: pay what `held` owe the log ([`Self::pay`]), write each row
-    /// that moved, and only then say lost what it gave up of each: an exit between the two
-    /// leaves those rows unsaid, missing and never said twice. A row whose write fails keeps its
-    /// file as it was, and says nothing; every other row is still written, so one row's failure
-    /// leaves no other row owing what the log already holds. The first failure is the answer.
+    /// that moved, and only then say lost what it gave up of each ([`Self::publish`]): an exit
+    /// between the two leaves those rows unsaid, missing and never said twice. A row whose write
+    /// fails keeps its file as it was ([`Self::write`]), and says nothing; every other row is
+    /// still written, so one row's failure leaves no other row paying what the log already
+    /// holds. The first failure is the answer.
     fn keep_held(&self, mut held: Vec<Held>, now_ms: u64) -> io::Result<()> {
-        self.pay(&mut held, now_ms);
-        let mut failed = None;
-        for h in held.iter().filter(|h| h.write) {
-            match self.write(&h.row) {
-                Ok(()) => self.give_up(h.given_up),
-                Err(e) => {
-                    failed.get_or_insert(e);
-                }
+        let mut failed = self.pay(&mut held, now_ms);
+        for h in held.iter_mut().filter(|h| h.write && !h.failed) {
+            if let Err(e) = self.publish(h) {
+                failed.get_or_insert(e);
             }
         }
         failed.map_or(Ok(()), Err)
     }
 
+    /// Write `h`'s row and, once its file holds it, say lost what it gave up until then.
+    fn publish(&self, h: &mut Held) -> io::Result<()> {
+        match self.write(&h.row) {
+            Ok(()) => {
+                self.give_up(std::mem::take(&mut h.given_up));
+                Ok(())
+            }
+            Err(e) => {
+                h.failed = true;
+                Err(e)
+            }
+        }
+    }
+
     /// Write the task rows `held` owe the board's log ([`Row::owed`]), oldest first, in one
     /// append: one wait of at most [`aterm_telemetry::direct::LOCK_WAIT`] for the log's lock,
-    /// however many rows owe. Each row it wrote is the end its row's last told (`told=`), and
-    /// its row owes none; none of them is counted lost ([`aterm_telemetry::direct::write_kept`]).
-    /// Where the append fails, the rows owed since a close
-    /// [`crate::fleet_telemetry::OWED_KEPT`] or more before `now_ms` are given up, and a line
-    /// that holds no task row is given up at once: each counted in its row's `given_up`, said
-    /// lost once the board no longer holds it ([`Self::keep_held`]). A board no longer at its
-    /// path writes none: its state folder's log is no longer its own.
-    fn pay(&self, held: &mut [Held], now_ms: u64) {
-        use crate::fleet_telemetry::{OWED_KEPT, owed_row, told_of};
-        if held.iter().all(|h| h.row.owed.is_empty()) {
-            return;
+    /// however many rows owe, and one more where a row holds rows it was paying. Each row records
+    /// what it pays as paying ([`Row::paying`]) before the append, and tells their end (`told=`,
+    /// the newest's), the end it told before kept beside them ([`Row::was_told`]), so a board
+    /// writer that knows no `paying=` (an older aterm) takes a close to that end as one told. A
+    /// write after the append that fails, an exit, or an append that failed and could not be cut
+    /// back ([`aterm_telemetry::direct::Kept::Unsure`]) so leaves its row paying rows the log may
+    /// hold, never owing them: the next pay asks the log which it holds
+    /// ([`aterm_telemetry::direct::holds`]), each line as the row's file holds it, tells the end
+    /// of the newest it holds, else the end told before them, and owes again the rest that hold
+    /// a task row, ahead of what the row owes since. Where the row tells another end than the
+    /// paying write told, a board writer that knows no `paying=` wrote a newer row since, which
+    /// the log holds after them: that end stays told, and those the log does not hold are given
+    /// up, since written now they would follow it. A row whose paying write fails pays nothing
+    /// (its file keeps what it owed, and what it told), and one whose paying rows the log could
+    /// not judge pays nothing newer, so its log's last task row is still its end. A row the
+    /// append wrote pays none; none of them is counted lost
+    /// ([`aterm_telemetry::direct::write_kept`]).
+    ///
+    /// Where the append is refused (its lock not had, or a failed write cut back: the log holds
+    /// none of it), its rows are owed again, told the end told before them, and the rows owed
+    /// since a close [`crate::fleet_telemetry::OWED_KEPT`] or more before `now_ms` are given up,
+    /// as are the oldest past [`crate::fleet_telemetry::OWED_MAX`] once paying rows are owed
+    /// again, and a line that holds no task row at once (a paying one once the log says it does
+    /// not hold it): each counted in its row's `given_up`, said lost once the board's file holds
+    /// the row without it ([`Self::publish`]). A paying row the log could not judge for as long
+    /// is dropped unsaid, its end told: the log may hold it, so it is missing at worst, and a
+    /// reopen and a second close to it write no second; beside rows still paying, its end is
+    /// the one told before them ([`Row::was_told`]). A board no longer at its path writes
+    /// none: its state folder's log is no longer its own. Answers the first paying write that
+    /// failed.
+    fn pay(&self, held: &mut [Held], now_ms: u64) -> Option<io::Error> {
+        use crate::fleet_telemetry::{OWED_KEPT, OWED_MAX, owed_row, told_of};
+        use aterm_telemetry::direct::Kept;
+        if !held.iter().any(|h| h.row.owes()) {
+            return None;
         }
-        let Some(log) = self.log() else {
-            return;
+        let log = self.log()?;
+        let kept = |line: &String| {
+            owed_row(line).is_some_and(|row| now_ms.saturating_sub(row.at_ms) < millis(OWED_KEPT))
         };
-        let mut lines = Vec::new();
+        let end_of = |lines: &[String]| {
+            lines
+                .last()
+                .and_then(|line| owed_row(line))
+                .map(|row| told_of(&row))
+        };
+        // Only whole task rows are owed: a line that holds none is given up at once. What a row
+        // is paying stays as its file holds it: the bytes the log is asked for.
         for h in held.iter_mut().filter(|h| !h.row.owed.is_empty()) {
-            let rows: Vec<aterm_telemetry::Row> = h
+            let was = h.row.owed.len();
+            h.row.owed = h
                 .row
                 .owed
                 .iter()
                 .filter_map(|line| owed_row(line))
+                .map(|row| row.line())
                 .collect();
-            let bad = h.row.owed.len() - rows.len();
+            let bad = was - h.row.owed.len();
             if bad > 0 {
                 h.given_up += bad as u64;
                 h.write = true;
             }
-            h.row.owed = rows.iter().map(aterm_telemetry::Row::line).collect();
-            lines.extend(h.row.owed.iter().cloned());
         }
-        if lines.is_empty() {
-            return;
-        }
-        if aterm_telemetry::direct::write_kept(log, &lines) {
-            for h in held.iter_mut().filter(|h| !h.row.owed.is_empty()) {
-                h.row.told = h
-                    .row
-                    .owed
-                    .last()
-                    .and_then(|line| owed_row(line))
-                    .map(|row| told_of(&row));
-                h.row.owed.clear();
-                h.write = true;
+        // What a pay recorded as paying and lost its record of: the log says which it holds.
+        let maybe: Vec<String> = held
+            .iter()
+            .flat_map(|h| h.row.paying.iter().cloned())
+            .collect();
+        if !maybe.is_empty() {
+            match aterm_telemetry::direct::holds(log.clone(), &maybe) {
+                Ok(found) => {
+                    let mut found = found.into_iter();
+                    for h in held.iter_mut().filter(|h| !h.row.paying.is_empty()) {
+                        // Another end than its paying write told is a newer row's, which a writer
+                        // that knows no `paying=` put in the log after them.
+                        let newer = h.row.told != end_of(&h.row.paying);
+                        let mut told = h.row.was_told.take();
+                        let mut again = Vec::new();
+                        for line in std::mem::take(&mut h.row.paying) {
+                            let held_it = found.next().unwrap_or(false);
+                            match owed_row(&line) {
+                                Some(row) if held_it => told = Some(told_of(&row)),
+                                _ if held_it => {}
+                                Some(row) if !newer => again.push(row.line()),
+                                _ => h.given_up += 1,
+                            }
+                        }
+                        if !newer {
+                            h.row.told = told;
+                        }
+                        again.append(&mut h.row.owed);
+                        let over = again.len().saturating_sub(OWED_MAX);
+                        again.drain(..over);
+                        h.given_up += over as u64;
+                        h.row.owed = again;
+                        h.write = true;
+                    }
+                }
+                Err(_) => {
+                    for h in held.iter_mut().filter(|h| !h.row.paying.is_empty()) {
+                        let (paying, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut h.row.paying)
+                            .into_iter()
+                            .partition(kept);
+                        h.row.paying = paying;
+                        // A line dropped unsaid is taken as told (the log may hold it), so the
+                        // end told before those still paying is the newest dropped one's.
+                        if let Some(end) = dropped.iter().rev().find_map(|line| owed_row(line)) {
+                            h.row.was_told = Some(told_of(&end));
+                        }
+                        if h.row.paying.is_empty() {
+                            h.row.was_told = None;
+                        }
+                        h.write |= !dropped.is_empty();
+                    }
+                }
             }
-            return;
         }
-        for h in held.iter_mut() {
+        // Each row that owes and pays nothing unjudged records what it pays, and tells its end,
+        // the end it told before kept beside them, before the append.
+        let mut failed = None;
+        let mut lines = Vec::new();
+        let mut paying = Vec::new();
+        for (i, h) in held.iter_mut().enumerate() {
+            if h.row.owed.is_empty() || !h.row.paying.is_empty() {
+                continue;
+            }
+            h.row.paying = std::mem::take(&mut h.row.owed);
+            h.row.was_told = std::mem::replace(&mut h.row.told, end_of(&h.row.paying));
+            if let Err(e) = self.publish(h) {
+                h.row.owed = std::mem::take(&mut h.row.paying);
+                h.row.told = h.row.was_told.take();
+                failed.get_or_insert(e);
+                continue;
+            }
+            h.write = true;
+            lines.extend(h.row.paying.iter().cloned());
+            paying.push(i);
+        }
+        let came = (!lines.is_empty()).then(|| append_kept(log, &lines));
+        for i in paying {
+            let h = &mut held[i];
+            match came {
+                Some(Kept::Written) => {
+                    h.row.paying.clear();
+                    h.row.was_told = None;
+                }
+                // The log may hold some of them: they stay paying, for the next pay to ask.
+                Some(Kept::Unsure) => {}
+                Some(Kept::Refused) | None => {
+                    h.row.owed = std::mem::take(&mut h.row.paying);
+                    h.row.told = h.row.was_told.take();
+                }
+            }
+        }
+        // What is still owed past its time is given up.
+        for h in held.iter_mut().filter(|h| !h.failed) {
             let owed = h.row.owed.len();
-            h.row.owed.retain(|line| {
-                owed_row(line)
-                    .is_some_and(|row| now_ms.saturating_sub(row.at_ms) < millis(OWED_KEPT))
-            });
+            h.row.owed.retain(kept);
             let exhausted = owed - h.row.owed.len();
             if exhausted > 0 {
                 h.given_up += exhausted as u64;
                 h.write = true;
             }
         }
+        failed
     }
 
     /// The log of the state folder this board sits in, where it is still at its path.
@@ -1007,7 +1160,8 @@ impl BoundBoard {
         Ok(row)
     }
 
-    /// Remove the rows closed for [`CLOSED_KEPT`], and those unheard for [`UNHEARD_KEPT`].
+    /// Remove the rows closed for [`CLOSED_KEPT`], and those unheard for [`UNHEARD_KEPT`]: what
+    /// one owed its log is given up, and what it was writing there dropped unsaid.
     pub fn prune(&self) {
         if let Ok(_lock) = self.lock() {
             self.prune_locked(now_ms());
@@ -1067,11 +1221,37 @@ impl BoundBoard {
         self.lock()
     }
 
+    /// Write `row` over its file. A write whose error came after its rename published it (the
+    /// folder's flush) is no failure: every reader reads the row, so its write is answered `Ok`
+    /// once a read finds the file holding it, and a failed write is one whose file holds what it
+    /// held.
     #[cfg(unix)]
     fn write(&self, row: &Row) -> io::Result<()> {
-        self.root
-            .view()?
-            .write(&row.sid, format!("{}\n", row.line()).as_bytes())
+        let bytes = format!("{}\n", row.line());
+        #[cfg(test)]
+        let fault = WRITE_FAULTS.with(|f| f.borrow_mut().as_mut().and_then(|f| f(row)));
+        #[cfg(test)]
+        let wrote = if fault == Some(WriteFault::Before) {
+            Err(io::Error::other("the test refused the board write"))
+        } else {
+            self.root.view()?.write(&row.sid, bytes.as_bytes())
+        };
+        #[cfg(not(test))]
+        let wrote = self.root.view()?.write(&row.sid, bytes.as_bytes());
+        #[cfg(test)]
+        let wrote = match fault {
+            Some(WriteFault::After) => {
+                wrote.and(Err(io::Error::other("the test failed the folder's flush")))
+            }
+            _ => wrote,
+        };
+        wrote.or_else(|e| {
+            let holds = self.root.view().is_ok_and(|view| {
+                view.read(&row.sid, ROW_MAX_BYTES)
+                    .is_ok_and(|held| held == bytes.as_bytes())
+            });
+            if holds { Ok(()) } else { Err(e) }
+        })
     }
 
     #[cfg(not(unix))]
@@ -1080,13 +1260,79 @@ impl BoundBoard {
     }
 }
 
+/// Append `lines`, a pay's, to the log in `log` ([`aterm_telemetry::direct::write_kept`]): what
+/// came of it, or in a test, what this thread's next pay is told came of it once it wrote them
+/// ([`pay_says`]).
+fn append_kept(log: PathBuf, lines: &[String]) -> aterm_telemetry::direct::Kept {
+    let kept = aterm_telemetry::direct::write_kept(log, lines);
+    #[cfg(test)]
+    if let Some(said) = PAY_SAYS.with(std::cell::Cell::take) {
+        return said;
+    }
+    kept
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAY_SAYS: std::cell::Cell<Option<aterm_telemetry::direct::Kept>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Tell this thread's next pay its append came to `kept`, whatever it did ([`append_kept`]): a
+/// write the log took whole, said `Unsure`, is one a failed cut back left.
+#[cfg(test)]
+pub(crate) fn pay_says(kept: aterm_telemetry::direct::Kept) {
+    PAY_SAYS.with(|said| said.set(Some(kept)));
+}
+
+/// A test's fault in this thread's board writes ([`BoundBoard::write`]): `Before` refuses the
+/// write, its file left as it was; `After` writes it, then answers the error of a folder's flush
+/// that failed after the rename.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFault {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+type FaultOf = Box<dyn FnMut(&Row) -> Option<WriteFault>>;
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_FAULTS: std::cell::RefCell<Option<FaultOf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fault this thread's board writes as `fault` says of each row written, until the guard drops.
+#[cfg(test)]
+pub(crate) fn fault_writes(
+    fault: impl FnMut(&Row) -> Option<WriteFault> + 'static,
+) -> FaultedWrites {
+    WRITE_FAULTS.with(|f| *f.borrow_mut() = Some(Box::new(fault)));
+    FaultedWrites
+}
+
+/// This thread's board writes faulted ([`fault_writes`]) until it drops.
+#[cfg(test)]
+pub(crate) struct FaultedWrites;
+
+#[cfg(test)]
+impl Drop for FaultedWrites {
+    fn drop(&mut self) {
+        WRITE_FAULTS.with(|f| *f.borrow_mut() = None);
+    }
+}
+
 /// A row an apply or a keeper's settle holds under the board's lock: whether it is to be
-/// written, and how many task rows it owed the board gave up, said lost once it is written
-/// ([`BoundBoard::keep_held`]).
+/// written, how many task rows it owed the board gave up, said lost once it is written
+/// ([`BoundBoard::publish`]), and whether a write of it failed, which leaves its file as it was
+/// and writes it no more ([`BoundBoard::keep_held`]).
 struct Held {
     row: Row,
     write: bool,
     given_up: u64,
+    failed: bool,
 }
 
 impl Held {
@@ -1095,6 +1341,7 @@ impl Held {
             row,
             write: false,
             given_up: 0,
+            failed: false,
         }
     }
 }
@@ -1250,7 +1497,8 @@ const CLOSED_ASKED_EVERY: Duration = Duration::from_secs(600);
 
 /// How often a keeper whose board owes its log task rows writes them again
 /// ([`BoundBoard::settle`]): one append for them all, waiting at most
-/// [`aterm_telemetry::direct::LOCK_WAIT`] for the log's lock, the first a period after it found
+/// [`aterm_telemetry::direct::LOCK_WAIT`] for the log's lock, and one read of the log under it
+/// first, as long again, where a row holds rows it was paying; the first a period after it found
 /// them owed. Over [`crate::fleet_telemetry::OWED_KEPT`] that is at most 60 settles.
 #[cfg(unix)]
 const OWED_SETTLED_EVERY: Duration = Duration::from_secs(60);
@@ -1344,11 +1592,11 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
                 let at = Instant::now();
                 closed_asked.retain(|_, next| *next > at);
                 let rows = board.scan().rows;
-                // The task rows its board owes its log: written again once a period after they
-                // were found owed, and every period after, until none is owed.
+                // The task rows its board owes its log, or was writing there: written again once
+                // a period after they were found owed, and every period after, until none is.
                 let owing: Vec<String> = rows
                     .iter()
-                    .filter(|row| !row.owed.is_empty())
+                    .filter(|row| row.owes())
                     .map(|row| row.sid.clone())
                     .collect();
                 let (settle_now, due) = settle_step(!owing.is_empty(), settle, at);
@@ -1913,6 +2161,11 @@ fn parse_u64(v: &str) -> Option<u64> {
     (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .then(|| v.parse().ok())
         .flatten()
+}
+
+/// The lines of a row's `owed=` or `paying=`, each ending in its line feed.
+fn split_lines(text: &str) -> Vec<String> {
+    text.split_inclusive('\n').map(str::to_owned).collect()
 }
 
 fn encode(s: &str) -> String {

@@ -120,7 +120,7 @@ pub struct PrePromote {
     pub commit: Option<String>,
     /// `PUB_VERSION`, named in the transcript.
     pub version: Option<String>,
-    /// `CARGO_TARGET_DIR`: the build goes in its `pre-promote.noindex` directory.
+    /// `CARGO_TARGET_DIR`: the build goes in its `.ubd/pre-promote.noindex` directory.
     pub target: Option<PathBuf>,
     /// `ATERM_RELEASE_CUTTER`.
     pub cutter: Option<PathBuf>,
@@ -290,14 +290,14 @@ fn commit_of(root: &Path, env: &[(String, String)], rev: &str) -> Option<String>
     .filter(|s| !s.is_empty())
 }
 
-/// Named `*.noindex` so Spotlight skips the build with all it holds.
+/// A quiet child of the selected target; its `*.noindex` name also keeps Spotlight out.
 fn worktree_target(root: &Path, target: Option<&Path>) -> PathBuf {
     let base = match target {
         Some(t) if t.is_absolute() => t.to_path_buf(),
         Some(t) => root.join(t),
         None => root.join("target"),
     };
-    base.join("pre-promote.noindex")
+    base.join(".ubd/pre-promote.noindex")
 }
 
 fn toplevel(cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
@@ -507,7 +507,7 @@ pub const DELEGATED: &str = "ATERM_HOOK_TRANSFORMS_DELEGATED";
 pub struct Transforms {
     /// `ROOT`, `EXPORT`, `CAPTURED_COMMIT`.
     pub inputs: crate::transforms::Inputs,
-    /// `CARGO_TARGET_DIR`: the captured commit's cutter builds in its `pre-promote.noindex`.
+    /// `CARGO_TARGET_DIR`: the captured commit's cutter builds in its `.ubd/pre-promote.noindex`.
     pub target: Option<PathBuf>,
     /// [`DELEGATED`], when a delegating run set it.
     pub delegated: Option<String>,

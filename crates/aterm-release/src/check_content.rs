@@ -39,6 +39,15 @@ impl ReleaseHalf {
     }
 }
 
+/// Whether the canonical verifier invocation uses its ordinary waiting admission or the early
+/// AppKit gate's non-waiting admission. Admission changes observable execution and therefore the
+/// context of every proof made under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    WaitDefault,
+    Now,
+}
+
 /// One immutable entry in a commit's tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -75,11 +84,20 @@ impl Input {
     }
 }
 
-/// Every release check's declared input identity at one commit, under one execution context.
+/// Every release check's declared input identity at one commit. `context` is the fallback for an
+/// unknown check; a separately scheduled check can carry its own canonical half's context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub context: String,
     pub checks: BTreeMap<String, Input>,
+}
+
+/// The AppKit driver's canonical early bundle-half context. Its whole-check input remains
+/// unbounded: the verifier first rebuilds the exact driver groups and only then may carry a
+/// matching executable proof from the immediately preceding hop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AppkitContext<'a> {
+    pub context: &'a str,
 }
 
 impl Plan {
@@ -111,6 +129,7 @@ pub fn context(
     seal: &str,
     command: &Command,
     half: ReleaseHalf,
+    admission: Admission,
 ) -> String {
     let mut environment: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
         .map(|(name, value)| (os_bytes(&name), os_bytes(&value)))
@@ -137,6 +156,10 @@ pub fn context(
     // behavior-affecting verifier argument shared by every verdict in this plan.
     part(&mut h, b"release");
     part(&mut h, half.flag());
+    if admission == Admission::Now {
+        part(&mut h, b"--admit");
+        part(&mut h, b"now");
+    }
     let cwd = command.get_current_dir().map_or_else(
         || std::env::current_dir().unwrap_or_default(),
         PathBuf::from,
@@ -184,7 +207,12 @@ fn os_bytes(value: &OsStr) -> Vec<u8> {
 ///
 /// # Errors
 /// Git cannot list the tree, or prints a record this reader cannot bind.
-pub fn plan(git: &dyn GitRunner, commit: &str, context: &str) -> Result<Plan, String> {
+pub fn plan(
+    git: &dyn GitRunner,
+    commit: &str,
+    context: &str,
+    appkit: Option<AppkitContext<'_>>,
+) -> Result<Plan, String> {
     let out = git
         .git(&["ls-tree", "-r", "-z", "--full-tree", commit])
         .map_err(|e| e.to_string())?;
@@ -196,7 +224,7 @@ pub fn plan(git: &dyn GitRunner, commit: &str, context: &str) -> Result<Plan, St
         ));
     }
     let entries = parse_entries(&out.stdout)?;
-    Ok(from_entries(&entries, context))
+    Ok(from_entries(&entries, context, appkit))
 }
 
 fn short(commit: &str) -> &str {
@@ -242,7 +270,7 @@ fn parse_entries(bytes: &[u8]) -> Result<Vec<Entry>, String> {
     Ok(entries)
 }
 
-fn from_entries(entries: &[Entry], context: &str) -> Plan {
+fn from_entries(entries: &[Entry], context: &str, appkit: Option<AppkitContext<'_>>) -> Plan {
     let mut checks = BTreeMap::new();
     for check in aterm_verify::checks::RELEASE_TREE {
         let declaration = declaration(check);
@@ -265,6 +293,17 @@ fn from_entries(entries: &[Entry], context: &str) -> Plan {
             }
         };
         checks.insert(check.name().to_owned(), input);
+    }
+    if let Some(appkit) = appkit {
+        checks.insert(
+            Check::Appkit.name().to_owned(),
+            Input {
+                context: appkit.context.to_owned(),
+                key: None,
+                declaration: "AppKit rebuilds and hashes its exact driver executables before carrying either windowed group"
+                    .to_owned(),
+            },
+        );
     }
     Plan {
         context: context.to_owned(),
@@ -342,225 +381,5 @@ fn part(h: &mut aterm_digest::Sha256, bytes: &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn e(path: &str, byte: char) -> Entry {
-        Entry {
-            mode: "100644".into(),
-            object: byte.to_string().repeat(40),
-            path: path.into(),
-        }
-    }
-
-    fn plan(entries: &[Entry], context: &str) -> Plan {
-        from_entries(entries, context)
-    }
-
-    /// A cfg(test)-only edit changes the bounded readers. Readers whose complete closure is not
-    /// declared have no key at either tree and therefore must run. Negative control: salting the
-    /// context differently moves every bounded key, as a verifier, harness, environment or
-    /// toolchain change must.
-    #[test]
-    fn a_test_only_edit_moves_only_the_bounded_check_inputs() {
-        let base = vec![
-            e("Cargo.toml", '1'),
-            e("Cargo.lock", '2'),
-            e("crates/aterm-gui/Cargo.toml", '3'),
-            e("crates/aterm-gui/src/app.rs", '4'),
-            e("crates/aterm-db/Cargo.toml", '5'),
-            e("crates/aterm-db/src/lib.rs", '6'),
-            e("crates/aterm-forge/src/lib.rs", '7'),
-            e("crates/aterm-libc/src/lib.rs", '8'),
-            e("crates/aterm-models-gui/src/lib.rs", '9'),
-        ];
-        let mut hop = base.clone();
-        hop[3].object = "a".repeat(40);
-        let before = plan(&base, "context-a");
-        let after = plan(&hop, "context-a");
-        assert_ne!(before.input("test").key, after.input("test").key);
-        for undeclared in ["fmt", "lint", "doc", "census", "forge", "libc", "spec"] {
-            assert!(!before.input(undeclared).bounded(), "{undeclared}");
-            assert!(!after.input(undeclared).bounded(), "{undeclared}");
-        }
-
-        let other_context = plan(&base, "context-b");
-        for check in aterm_verify::checks::RELEASE_TREE {
-            let a = before.input(check.name());
-            let b = other_context.input(check.name());
-            if a.bounded() {
-                assert_ne!(a.key, b.key, "{} binds the execution context", check.name());
-            } else {
-                assert_eq!(a.key, None, "{} stays fail-closed", check.name());
-                assert_eq!(b.key, None, "{} stays fail-closed", check.name());
-            }
-        }
-    }
-
-    /// A fixture is part of the aggregate test input even when no executable byte names it. It is
-    /// outside fmt's declared reader; every check with an undeclared closure still runs. This is
-    /// the check-level half of the binary fixture negative control: the binary key further
-    /// narrows which reader runs.
-    #[test]
-    fn a_fixture_change_moves_the_test_input_without_pretending_it_is_source() {
-        let base = vec![
-            e("Cargo.toml", '1'),
-            e("Cargo.lock", '2'),
-            e("crates/aterm-db/Cargo.toml", '3'),
-            e("crates/aterm-db/src/lib.rs", '4'),
-            e("crates/aterm-db/tests/fixtures/rows.bin", '5'),
-        ];
-        let mut hop = base.clone();
-        hop[4].object = "6".repeat(40);
-        let before = plan(&base, "context");
-        let after = plan(&hop, "context");
-        assert_ne!(before.input("test").key, after.input("test").key);
-        for undeclared in ["fmt", "lint", "doc", "census", "forge", "libc", "spec"] {
-            assert!(!before.input(undeclared).bounded(), "{undeclared}");
-            assert!(!after.input(undeclared).bounded(), "{undeclared}");
-        }
-    }
-
-    /// `fmt` is deliberately unbounded: ignored/untracked source or config files and repository
-    /// or global Git exclude state can change its reader set without changing the commit tree.
-    #[test]
-    fn fmt_has_no_cross_hop_key_for_a_commit_tree_alone() {
-        let base = vec![
-            e("Cargo.toml", '1'),
-            e("crates/a/Cargo.toml", '2'),
-            e("crates/a/src/lib.rs", '3'),
-            e("crates/a/.gitignore", '4'),
-        ];
-        let mut hop = base.clone();
-        hop[3].object = "5".repeat(40);
-        assert!(!plan(&base, "context").input("fmt").bounded());
-        assert!(!plan(&hop, "context").input("fmt").bounded());
-    }
-
-    /// Facts are compared before the qualify pool exists, while the actual verifier runs inside
-    /// it. No currently bounded whole-check verdict can cross a changed tree, but the context is
-    /// still recorded with the aggregate test receipt and must stay identical across this
-    /// production boundary. NEGATIVE CONTROL: an ordinary effective-environment change moves it.
-    #[test]
-    fn release_pool_coordination_does_not_move_whole_check_context() {
-        let command = |pool: Option<&str>, ordinary: &str| {
-            let mut command = Command::new("verify-fixture");
-            command
-                .current_dir("fixture-repository")
-                .env("ATERM_CONTENT_CONTROL", ordinary);
-            match pool {
-                Some(value) => {
-                    command.env(aterm_capacity::POOL_ENV, value);
-                }
-                None => {
-                    command.env_remove(aterm_capacity::POOL_ENV);
-                }
-            }
-            command
-        };
-        let outside = context("tools", "seal", &command(None, "same"), ReleaseHalf::Tree);
-        let inside = context(
-            "tools",
-            "seal",
-            &command(Some("12:/tmp/qualify.jobs"), "same"),
-            ReleaseHalf::Tree,
-        );
-        assert_eq!(outside, inside);
-        assert_ne!(
-            outside,
-            context(
-                "tools",
-                "seal",
-                &command(None, "changed"),
-                ReleaseHalf::Tree,
-            )
-        );
-        assert_ne!(
-            inside,
-            context(
-                "tools",
-                "seal",
-                &command(Some("12:/tmp/qualify.jobs"), "same"),
-                ReleaseHalf::Bundle,
-            ),
-            "a behavior-affecting verifier mode is part of the context"
-        );
-    }
-
-    /// The Unix tree wrapper is part of the child that a whole-check context describes, not a
-    /// scheduling decoration. NEGATIVE CONTROLS: changing only its program, or each one of its
-    /// arguments in turn, must move the context independently.
-    #[test]
-    fn whole_check_context_binds_the_verifier_program_and_each_argument() {
-        let command = |program: &str, arguments: &[&str]| {
-            let mut command = Command::new(program);
-            command
-                .args(arguments)
-                .current_dir("fixture-repository")
-                .env("ATERM_CONTENT_CONTROL", "same");
-            command
-        };
-        let arguments = ["-n", "10", "/frozen/verifier"];
-        let base = context(
-            "tools",
-            "seal",
-            &command("/usr/bin/nice", &arguments),
-            ReleaseHalf::Tree,
-        );
-        assert_ne!(
-            base,
-            context(
-                "tools",
-                "seal",
-                &command("/fixture/not-nice", &arguments),
-                ReleaseHalf::Tree,
-            ),
-            "the wrapper program is an input even when every argument is equal"
-        );
-        for (index, replacement) in ["--adjustment", "11", "/other/verifier"]
-            .into_iter()
-            .enumerate()
-        {
-            let mut changed = arguments;
-            changed[index] = replacement;
-            assert_ne!(
-                base,
-                context(
-                    "tools",
-                    "seal",
-                    &command("/usr/bin/nice", &changed),
-                    ReleaseHalf::Tree,
-                ),
-                "wrapper argument {index} is an independent context input"
-            );
-        }
-    }
-
-    /// Fine-grained test and lint receipts share one hop-stable salt. A changed frozen tool set
-    /// or build-input seal invalidates every item even when its own bytes are equal.
-    #[test]
-    fn item_context_binds_the_frozen_tools_and_build_inputs() {
-        let base = item_context("tools-a", "seal-a");
-        assert_eq!(base, item_context("tools-a", "seal-a"));
-        assert_ne!(base, item_context("tools-b", "seal-a"));
-        assert_ne!(base, item_context("tools-a", "seal-b"));
-    }
-
-    #[test]
-    fn ls_tree_records_are_bounded_before_they_are_keys() {
-        let text = format!(
-            "100644 blob {}\tcrates/a/Cargo.toml\0100644 blob {}\tcrates/a/src/lib.rs\0",
-            "a".repeat(40),
-            "b".repeat(40)
-        );
-        let entries = parse_entries(text.as_bytes()).unwrap();
-        assert_eq!(entries.len(), 2);
-        for bad in [
-            b"100644 blob abc\tp\0".as_slice(),
-            b"100644 tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tp\0".as_slice(),
-            b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa p\0".as_slice(),
-        ] {
-            assert!(parse_entries(bad).is_err(), "{bad:?}");
-        }
-    }
-}
+#[path = "check_content_tests.rs"]
+mod tests;

@@ -1,0 +1,4624 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+
+const fn geom() -> Geom {
+    Geom {
+        cw: 9,
+        ch: 18,
+        rows: 40,
+        cols: 120,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 1080,
+        win_h: 720,
+        head: 0,
+    }
+}
+
+const fn config() -> Config {
+    Config {
+        dark_theme: true,
+        intensity: 1.0,
+        duration: Duration::from_millis(900),
+        ribbon_tall: true,
+        ribbon_flat: false,
+        theme_fg: 0x00E8_E8F0,
+        theme_bg: 0x0016_161C,
+        reduced_motion: false,
+        light: Light::OFF,
+        head_dx: 0.5,
+    }
+}
+
+#[derive(Default)]
+struct Scratch {
+    under: Vec<GlowQuad>,
+    out: Vec<GlowQuad>,
+    under_ramps: aterm_render::GlowRamps,
+    out_ramps: aterm_render::GlowRamps,
+    halos: Vec<RainHalo>,
+    beams: Vec<BeamVertex>,
+    cues: Vec<SoundCue>,
+}
+
+impl Scratch {
+    const fn frame(&mut self) -> Frame<'_> {
+        Frame {
+            under: &mut self.under,
+            out: &mut self.out,
+            under_ramps: &mut self.under_ramps,
+            out_ramps: &mut self.out_ramps,
+            halos: &mut self.halos,
+            beams: &mut self.beams,
+            cues: &mut self.cues,
+            caret: CaretSeam::EMPTY,
+            companion: None,
+            fp: 0,
+            rows_cost: Some(aterm_render::RampCost::NEVER),
+        }
+    }
+}
+
+#[test]
+fn a_disengaged_engine_is_inert_at_every_seam_point() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = Engine::new();
+    assert!(!eng.engaged());
+    let mut sc = Scratch::default();
+
+    eng.on_event(
+        Event::Typed {
+            cells: 1,
+            shifted: false,
+            class: TypedClass::Glyph,
+        },
+        t0,
+    );
+    eng.on_event(
+        Event::Move {
+            from: (3, 0),
+            to: (3, 80),
+            licence: Licence::Nav,
+            dir: Dir::Right,
+        },
+        t0,
+    );
+    eng.celebrate(t0, 1.0);
+    eng.earn_hero(t0, 3, 4);
+    eng.translate_scroll(1, 18);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(fr.fp, 0);
+    assert!(sc.under.is_empty() && sc.out.is_empty() && sc.halos.is_empty());
+    assert!(sc.cues.is_empty(), "a disengaged engine mints no cue");
+    assert!(!eng.needs_frame_cadence());
+    assert!(eng.next_change_deadline(t0).is_none());
+    assert_eq!(
+        eng.momentum_display(),
+        0.0,
+        "a disengaged spine never builds, not even under a sing-along"
+    );
+    assert_eq!(eng.status().stars, 0, "a disengaged engine earns no hero");
+    assert!(eng.take_companion_impulse().is_none());
+    assert!(eng.drain_sound_cues().next().is_none());
+}
+
+fn engaged() -> Engine {
+    let mut eng = Engine::new();
+    eng.set_engaged(true);
+    eng
+}
+
+fn blank_row(eng: &mut Engine, row: u16) {
+    eng.probe_mut().probe_row(i32::from(row), &[false; 120]);
+}
+
+const fn typed(n: u16) -> Event {
+    Event::Typed {
+        cells: n,
+        shifted: false,
+        class: TypedClass::Glyph,
+    }
+}
+
+const fn mv(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
+    Event::Move {
+        from,
+        to,
+        licence,
+        dir: Dir::of(to.1 as i32 - from.1 as i32, to.0 as i32 - from.0 as i32),
+    }
+}
+
+fn tick_at(eng: &mut Engine, t: Instant) {
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(t, geom(), &config(), &mut fr);
+}
+
+fn type_key_at(eng: &mut Engine, t: Instant, col: u16) -> Instant {
+    eng.on_event(typed(1), t);
+    tick_at(eng, t);
+    let echo = t + Duration::from_millis(8);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: col,
+            col1: col + 1,
+        },
+        t,
+    );
+    eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), echo);
+    tick_at(eng, echo);
+    echo
+}
+
+fn three_typed_cells(eng: &mut Engine, t0: Instant) -> Instant {
+    blank_row(eng, 2);
+    eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+    tick_at(eng, t0);
+    let mut t = t0;
+    for col in 2..5u16 {
+        t += Duration::from_millis(100);
+        t = type_key_at(eng, t, col);
+    }
+    t
+}
+
+/// Typing a row and taking a Return on paper, no painted star comes within a cell of the
+/// caret; on dark (the control) the strikes lay stars there.
+#[test]
+fn paper_stars_stand_a_cell_clear_of_the_caret() {
+    let ms = Duration::from_millis;
+    let g = geom();
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let near = |dark: bool| -> usize {
+        let mut cfg = config();
+        cfg.dark_theme = dark;
+        if !dark {
+            cfg.theme_fg = 0x0024_292F;
+            cfg.theme_bg = 0x00FF_FFFF;
+        }
+        let mut eng = engaged();
+        for row in 1..8u16 {
+            blank_row(&mut eng, row);
+        }
+        let mut sc = Scratch::default();
+        let mut caret = (3u16, 2u16);
+        let mut found = 0;
+        let mut look = |eng: &mut Engine, t: Instant, caret: (u16, u16), sc: &mut Scratch| {
+            let mut fr = sc.frame();
+            eng.tick(t, g, &cfg, &mut fr);
+            let x0 = i32::from(g.origin_x) + i32::from(caret.1) * cw;
+            let y0 = i32::from(g.origin_y) + i32::from(caret.0) * ch;
+            found += eng
+                .sky_marks()
+                .iter()
+                .filter(|m| {
+                    let (mx0, mx1, my0, my1) = m.rect;
+                    mx0 < x0 + 2 * cw && mx1 > x0 - cw && my0 < y0 + 2 * ch && my1 > y0 - ch
+                })
+                .count();
+        };
+        let t0 = Instant::now();
+        eng.on_event(mv((3, 0), caret, Licence::Typed), t0);
+        look(&mut eng, t0, caret, &mut sc);
+        let mut t = t0;
+        for col in 2..24u16 {
+            t += ms(70);
+            eng.on_event(typed(1), t);
+            look(&mut eng, t, caret, &mut sc);
+            let echo = t + ms(8);
+            eng.on_event(
+                Event::Sweep {
+                    row: 3,
+                    col0: col,
+                    col1: col + 1,
+                },
+                t,
+            );
+            eng.on_event(mv(caret, (3, col + 1), Licence::Typed), echo);
+            caret = (3, col + 1);
+            look(&mut eng, echo, caret, &mut sc);
+            t = echo;
+        }
+        t += ms(120);
+        eng.on_event(mv(caret, (4, 2), Licence::Return), t);
+        caret = (4, 2);
+        for _ in 0..30 {
+            look(&mut eng, t, caret, &mut sc);
+            t += ms(16);
+        }
+        found
+    };
+    let paper = near(false);
+    assert_eq!(paper, 0, "{paper} stars within a cell of the paper caret");
+    assert!(
+        near(true) > 0,
+        "control: on dark no star stood by the caret"
+    );
+}
+
+fn echo_band_fence_model() -> aterm_spec::derive::Model {
+    aterm_spec::ty_model! {
+        EchoBandFence {
+            const Buggy = 0;
+            var pending = 1;
+            var translated = 0;
+            var done = 0;
+            action Noop when (done == 0) { done = 1; }
+            action Translate when (done == 0) {
+                done = 1;
+                translated = 1;
+                pending = if Buggy == 0 { 0 } else { pending };
+            }
+            invariant NoCreditAcrossBand: translated == 0 || pending == 0;
+            invariant Bounds: pending <= 1 && translated <= 1 && done <= 1;
+        }
+    }
+}
+
+#[test]
+fn real_band_transforms_retire_echo_credits_without_resetting_earned_light() {
+    let model = echo_band_fence_model();
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut negative_controls = 0;
+    for (top, bottom, delta) in [
+        (2, 10, 1),  // Codex composer moves down.
+        (2, 10, -1), // Transcript moves up.
+        (8, 10, 1),  // Composer is outside the changed band.
+        (3, 3, 1),   // Old marks leave; the caret position saturates.
+        (2, 10, 0),  // No movement: no fence.
+        (10, 2, 1),  // Invalid band: no fence.
+    ] {
+        let valid = delta != 0 && top <= bottom;
+        for restore_stale_credit in [false, true] {
+            if restore_stale_credit && !valid {
+                continue;
+            }
+            let mut eng = engaged();
+            let at = three_typed_cells(&mut eng, t0) + ms(100);
+            assert_eq!(eng.echo.total(), 0, "the earlier keys were acknowledged");
+            eng.on_event(typed(1), at);
+            tick_at(&mut eng, at);
+            assert_eq!(
+                eng.echo.total(),
+                1,
+                "one press is still waiting for its echo"
+            );
+            let stale = eng.echo;
+            let momentum = eng.spine.momentum(at);
+            let display = eng.momentum_display();
+            assert!(momentum > 0.0 && display > 0.0, "earned light must be live");
+            let field = eng.field_at(3, 4).expect("the acknowledged cohort is lit");
+
+            eng.translate_band(top, bottom, delta, geom().ch as u16, 0);
+            let action = if valid { "Translate" } else { "Noop" };
+            let post = std::collections::BTreeMap::from([
+                ("pending", i64::from(eng.echo.total() > 0)),
+                ("translated", i64::from(valid)),
+                ("done", 1),
+            ]);
+            assert!(
+                model
+                    .successors(action, &model.init_state())
+                    .contains(&post)
+            );
+            assert!(model.check_invariant("NoCreditAcrossBand", &post));
+            assert_eq!(
+                eng.spine.momentum(at),
+                momentum,
+                "scroll is not a key reset"
+            );
+            assert_eq!(
+                eng.momentum_display(),
+                display,
+                "the transform advances no clock"
+            );
+            let row = if valid {
+                band_pos(3, top, bottom, delta)
+            } else {
+                3
+            };
+            assert_eq!(eng.caret, (row, 5));
+            let mark = if valid {
+                band_row(3, top, bottom, delta)
+            } else {
+                Some(3)
+            };
+            if let Some(mark_row) = mark {
+                assert_eq!(
+                    eng.field_at(mark_row, 4),
+                    Some(field),
+                    "earned field moves with text"
+                );
+            } else {
+                assert_eq!(
+                    eng.field_at(3, 4),
+                    None,
+                    "departed light must not clamp to the edge"
+                );
+            }
+            if !valid {
+                continue;
+            }
+            if restore_stale_credit {
+                eng.echo = stale;
+                let mut omitted = post.clone();
+                omitted.insert("pending", i64::from(eng.echo.total() > 0));
+                assert!(
+                    !model
+                        .successors(action, &model.init_state())
+                        .contains(&omitted)
+                );
+                assert!(!model.check_invariant("NoCreditAcrossBand", &omitted));
+                negative_controls += 1;
+            }
+
+            let press = at + ms(300);
+            eng.on_event(typed(1), press);
+            tick_at(&mut eng, press);
+            eng.on_event(
+                Event::Sweep {
+                    row,
+                    col0: 6,
+                    col1: 7,
+                },
+                press,
+            );
+            eng.on_event(mv((row, 6), (row, 7), Licence::Typed), press + ms(8));
+            tick_at(&mut eng, press + ms(8));
+            assert_eq!(
+                eng.field_at(row, 5).is_some(),
+                restore_stale_credit,
+                "only the missing-fence control can paint the program's gap"
+            );
+            assert!(
+                eng.field_at(row, 6).is_some(),
+                "the new licensed key still paints"
+            );
+            assert_eq!(eng.status().bridged, u32::from(restore_stale_credit));
+        }
+    }
+    assert_eq!(negative_controls, 4);
+}
+
+#[test]
+fn a_cold_engine_s_first_coalesced_echo_lays_the_keys_it_held() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let drive = |presses: u16| -> Engine {
+        let mut eng = engaged();
+        blank_row(&mut eng, 4);
+        let mut t = t0;
+        for _ in 0..presses {
+            eng.on_event(typed(1), t);
+            tick_at(&mut eng, t);
+            t += ms(83);
+        }
+        let echo = t + ms(30);
+        eng.on_event(mv((5, 2), (5, 4), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        eng
+    };
+    let cold = drive(2);
+    assert!(
+        cold.field_at(5, 2).is_some() && cold.field_at(5, 3).is_some(),
+        "both held keys' cells are laid by the line's first echo: {:?}",
+        cold.ribbon()
+            .cells()
+            .iter()
+            .map(|c| (c.row, c.col, c.typing))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        cold.field_at(5, 4).is_none(),
+        "the landing is the caret's own cell, not a glyph's"
+    );
+    assert_eq!(cold.status().bridged, 2, "two cells laid from the ledger");
+    assert_eq!(cold.echo.total(), 0, "both presses spent");
+    assert_eq!(cold.caret_mirror(), (5, 4), "…and the mirror is seeded");
+    let control = drive(0);
+    assert!(
+        control.field_at(5, 2).is_none() && control.field_at(5, 3).is_none(),
+        "a cold hop no press explains is not typing"
+    );
+    assert_eq!(control.status().bridged, 0);
+    let short = drive(1);
+    assert!(
+        short.field_at(5, 2).is_none() && short.field_at(5, 3).is_none(),
+        "one press, two cells: refused"
+    );
+    assert_eq!(short.status().bridged, 0);
+}
+
+#[test]
+fn a_reset_or_a_curtain_forgets_the_presses() {
+    let ms = Duration::from_millis;
+    type Cut = fn(&mut Engine, Instant);
+    let cuts: [(&str, Cut); 2] = [
+        ("reset", |eng, _| eng.reset()),
+        ("curtain", |eng, t| eng.curtain(t)),
+    ];
+    for (what, cut) in cuts {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0) + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        assert_eq!(eng.echo.total(), 1, "{what}: PRECONDITION: one press waits");
+        cut(&mut eng, t);
+        let hop = t + ms(30);
+        eng.on_event(mv((3, 5), (3, 6), Licence::Typed), hop);
+        tick_at(&mut eng, hop);
+        assert_eq!(
+            eng.status().bridged,
+            0,
+            "{what}: a press banked before the cut paid for the first move after it"
+        );
+    }
+}
+
+#[test]
+fn a_rewrite_offers_no_impulse_drains_no_spine_throws_no_star_and_keeps_the_ledger() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let t = three_typed_cells(&mut eng, t0);
+    let t = t + ms(100);
+    eng.on_event(typed(1), t);
+    tick_at(&mut eng, t);
+    assert_eq!(eng.echo.total(), 1, "PRECONDITION: one press on the ledger");
+    let stars_before = eng.status().stars;
+    let disp_before = eng.spine().disp();
+    let t = t + ms(300);
+    eng.on_event(
+        Event::Rewrite {
+            row: 3,
+            col: 3,
+            cells: 2,
+        },
+        t,
+    );
+    assert_eq!(
+        eng.spine().disp(),
+        disp_before,
+        "a rewrite drains no spine at its edge"
+    );
+    assert_eq!(eng.caret, (3, 3), "the caret mirror moves to the rewrite");
+    assert_eq!(eng.echo.total(), 1, "the ledger is kept");
+    let mut fr = sc.frame();
+    eng.tick(t, geom(), &cfg, &mut fr);
+    assert!(fr.companion.is_none(), "no impulse on the rewrite's frame");
+    assert!(eng.take_companion_impulse().is_none(), "no Wince");
+    assert!(sc.cues.is_empty(), "a rewrite sounds nothing");
+    assert!(
+        eng.status().stars <= stars_before,
+        "a rewrite throws no star (the retracted cells' field stars may finish): {} > {stars_before}",
+        eng.status().stars
+    );
+    let done = t + ms((12 * 2 + 240) + 240 + 20);
+    tick_at(&mut eng, done);
+    assert!(
+        eng.field_at(3, 3).is_none() && eng.field_at(3, 4).is_none(),
+        "the cells right of the rewrite's caret are retracted"
+    );
+    let bridged = eng.status().bridged;
+    let t = type_key_at(&mut eng, done + ms(50), 3);
+    tick_at(&mut eng, t);
+    assert_eq!(
+        eng.status().bridged,
+        bridged,
+        "no gap opened, nothing bridged"
+    );
+    assert!(
+        eng.field_at(3, 3).is_some(),
+        "the key after the rewrite lays at the new caret"
+    );
+}
+
+#[test]
+fn an_inserts_sweep_pays_the_hole_a_late_key_left_before_it() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let key = t + ms(100);
+    eng.on_event(typed(1), key);
+    tick_at(&mut eng, key);
+    let delivered = key + ms(400);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 6,
+            col1: 17,
+        },
+        delivered,
+    );
+    eng.on_event(mv((3, 6), (3, 17), Licence::Insert), delivered + ms(20));
+    tick_at(&mut eng, delivered + ms(20));
+    assert!(
+        eng.field_at(3, 5).is_some(),
+        "the late key's cell is paid by its own press through the insert's sweep"
+    );
+    assert!(
+        (6..17u16).all(|col| eng.field_at(3, col).is_some()),
+        "the insert's span is lit"
+    );
+    assert_eq!(eng.status().bridged, 1, "one bridged cell — the key's");
+    assert_eq!(eng.echo.total(), 0, "the press is spent");
+    assert_eq!(eng.caret, (3, 17));
+    let mut typed_eng = engaged();
+    let t = three_typed_cells(&mut typed_eng, t0);
+    let key = t + ms(100);
+    typed_eng.on_event(typed(1), key);
+    tick_at(&mut typed_eng, key);
+    let delivered = key + ms(400);
+    typed_eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 6,
+            col1: 17,
+        },
+        delivered,
+    );
+    typed_eng.on_event(mv((3, 6), (3, 17), Licence::Typed), delivered + ms(20));
+    tick_at(&mut typed_eng, delivered + ms(20));
+    assert!(typed_eng.field_at(3, 5).is_none());
+    assert_eq!(typed_eng.echo.total(), 0, "…and the press is forfeited");
+}
+
+#[test]
+fn a_sweep_on_the_origin_row_before_a_fold_move_lays_the_last_column_and_clears_the_ledger() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let key = t + ms(100);
+    eng.on_event(typed(1), key);
+    tick_at(&mut eng, key);
+    assert_eq!(eng.echo.total(), 1, "PRECONDITION: one press on the ledger");
+    let echo = key + ms(400);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 39,
+            col1: 40,
+        },
+        echo - ms(250),
+    );
+    eng.on_event(mv((3, 39), (4, 0), Licence::Typed), echo);
+    tick_at(&mut eng, echo);
+    assert!(
+        eng.field_at(3, 39).is_some(),
+        "the origin row's last column is lit by the seam's sweep"
+    );
+    assert_eq!(eng.echo.total(), 0, "a row change clears the ledger");
+    assert_eq!(eng.status().bridged, 0, "…and bridges nothing");
+    assert_eq!(eng.caret, (4, 0), "the mirror lands on the new row");
+}
+
+#[test]
+fn the_real_engine_conforms_to_the_echo_ledger_model() {
+    let model = aterm_models_effects::echo_ledger_bridge_model();
+    let ms = Duration::from_millis;
+    let patience = Duration::from_secs_f32(ECHO_PATIENCE_S);
+    type State = aterm_spec::interp::State;
+
+    #[derive(Clone, Copy, Default)]
+    struct Last {
+        laid_hole: i64,
+        bridged_delta: i64,
+        last_older: i64,
+        just_refused: i64,
+    }
+    let n = |v: usize| i64::try_from(v).expect("bounded ledger");
+    let project = |eng: &Engine, now: Instant, key: Instant, host_col: u16, last: Last| {
+        let (older, younger, stale) = eng.echo.partition(key, now);
+        let tally = eng.echo.tally;
+        let mut st = model.init_state();
+        st.insert("older", n(older));
+        st.insert("younger", n(younger));
+        st.insert("stale", n(stale));
+        st.insert("hole", i64::from(host_col - eng.caret.1));
+        st.insert("banked", i64::from(tally.banked));
+        st.insert("spent", i64::from(tally.spent));
+        st.insert("forfeited", i64::from(tally.forfeited));
+        st.insert("expired", i64::from(tally.expired));
+        st.insert("stale_gone", i64::from(tally.expired) + n(stale));
+        st.insert("bridged", i64::from(eng.status().bridged));
+        st.insert("laid_hole", last.laid_hole);
+        st.insert("bridged_delta", last.bridged_delta);
+        st.insert("last_older", last.last_older);
+        st.insert("just_refused", last.just_refused);
+        st
+    };
+    let bind = |prev: &State, next: &State, action: &str, label: &str| {
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            prev,
+            next,
+            Some(action),
+            label,
+        );
+        assert!(ok, "{label}: real engine step rejected by the model: {why}");
+    };
+    let refuse = |prev: &State, next: &State, action: &str, label: &str| {
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            prev,
+            next,
+            Some(action),
+            label,
+        );
+        assert!(!ok, "{label}: the model must refuse this step");
+    };
+    let seeded = |t0: Instant, col: u16| -> Engine {
+        let mut eng = engaged();
+        eng.on_event(mv((3, 0), (3, col), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        eng
+    };
+    let press = |eng: &mut Engine, t: Instant| {
+        eng.on_event(typed(1), t);
+        tick_at(eng, t);
+    };
+    let moved = |eng: &mut Engine,
+                 from: (u16, u16),
+                 to: (u16, u16),
+                 licence: Licence,
+                 key: Option<Instant>,
+                 at: Instant,
+                 prev: &State,
+                 just_refused: i64|
+     -> Last {
+        let before = eng.status().bridged;
+        if let Some(key) = key {
+            eng.on_event(
+                Event::Sweep {
+                    row: to.0,
+                    col0: from.1,
+                    col1: to.1,
+                },
+                key,
+            );
+        }
+        eng.on_event(mv(from, to, licence), at);
+        tick_at(eng, at);
+        assert_eq!(
+            eng.last_host_sweep_at(),
+            key,
+            "the engine partitions by the host's sweep clock, the key's"
+        );
+        let delta = eng.status().bridged - before;
+        let past_from = if key.is_some() {
+            0
+        } else {
+            u32::from(to.1.saturating_sub(from.1))
+        };
+        Last {
+            laid_hole: i64::from(delta.saturating_sub(past_from)),
+            bridged_delta: i64::from(delta),
+            last_older: prev["older"],
+            just_refused,
+        }
+    };
+    let cleared = |eng: &mut Engine, ev: Event, at: Instant, last: Last| -> Last {
+        let before = eng.status().bridged;
+        eng.on_event(ev, at);
+        tick_at(eng, at);
+        let delta = i64::from(eng.status().bridged - before);
+        Last {
+            laid_hole: delta,
+            bridged_delta: delta,
+            ..last
+        }
+    };
+
+    let t0 = Instant::now();
+    let mut eng = seeded(t0, 2);
+    let mut last = Last::default();
+    let s0 = project(&eng, t0, t0, 2, last);
+    assert_eq!(
+        s0,
+        model.init_state(),
+        "a seeded engine is the model's init"
+    );
+
+    let t1 = t0 + ms(100);
+    press(&mut eng, t1);
+    let s1 = project(&eng, t1, t1, 2, last);
+    assert_eq!((s1["older"], s1["younger"], s1["banked"]), (0, 1, 1));
+    bind(&s0, &s1, "KeyPressed", "Engine press");
+    let mut predrawn = s1.clone();
+    predrawn.insert("bridged", 1);
+    refuse(
+        &s0,
+        &predrawn,
+        "KeyPressed",
+        "Engine keydown pre-draw control",
+    );
+
+    let e1 = t1 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 2),
+        (3, 3),
+        Licence::Typed,
+        Some(t1),
+        e1,
+        &s1,
+        0,
+    );
+    let s2 = project(&eng, e1, t1, 3, last);
+    assert_eq!((s2["spent"], s2["bridged"], s2["younger"]), (1, 0, 0));
+    assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+    bind(&s1, &s2, "SweptMovePays", "Engine on-time echo");
+    let mut reused = s2.clone();
+    reused.insert("younger", 1);
+    refuse(
+        &s1,
+        &reused,
+        "SweptMovePays",
+        "Engine one-press-one-cell control",
+    );
+
+    let t2 = e1 + ms(300);
+    press(&mut eng, t2);
+    let s3 = project(&eng, t2, t2, 3, last);
+    bind(&s2, &s3, "KeyPressed", "Engine stalled press");
+    let s4 = project(&eng, t2 + ms(300), t2, 4, last);
+    assert_eq!(s4["hole"], 1, "the caret advanced with no licensed move");
+    bind(&s3, &s4, "UnlicensedAdvance", "Engine refused echo");
+
+    let t3 = t2 + ms(400);
+    press(&mut eng, t3);
+    let s5 = project(&eng, t3, t3, 4, last);
+    assert_eq!((s5["older"], s5["younger"], s5["hole"]), (1, 1, 1));
+    bind(&s4, &s5, "KeyPressed", "Engine next key");
+
+    let e3 = t3 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 4),
+        (3, 5),
+        Licence::Typed,
+        Some(t3),
+        e3,
+        &s5,
+        0,
+    );
+    let s6 = project(&eng, e3, t3, 5, last);
+    assert_eq!(s6["bridged"], 1, "the refused key's cell is relit");
+    assert!(eng.field_at(3, 3).is_some(), "…and is a ribbon cell");
+    assert_eq!(
+        (last.laid_hole, last.bridged_delta, last.last_older),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (s6["spent"], s6["older"] + s6["younger"], s6["hole"]),
+        (3, 0, 0)
+    );
+    bind(&s5, &s6, "SweptMovePays", "Engine relight");
+    let mut overlaid = s6.clone();
+    overlaid.insert("bridged", 2);
+    overlaid.insert("bridged_delta", 2);
+    overlaid.insert("laid_hole", 2);
+    refuse(
+        &s5,
+        &overlaid,
+        "SweptMovePays",
+        "Engine one-older-press-two-cells control",
+    );
+
+    let u0 = Instant::now();
+    let mut eng = seeded(u0, 5);
+    let mut last = Last::default();
+    let b0 = project(&eng, u0, u0, 5, last);
+    let b1 = project(&eng, u0 + ms(100), u0, 6, last);
+    bind(&b0, &b1, "UnlicensedAdvance", "Engine program nudge");
+    let u1 = u0 + ms(300);
+    press(&mut eng, u1);
+    let b2 = project(&eng, u1, u1, 6, last);
+    bind(&b1, &b2, "KeyPressed", "Engine burst key 1");
+    let u2 = u1 + ms(40);
+    press(&mut eng, u2);
+    let b3 = project(&eng, u2, u1, 6, last);
+    assert_eq!((b3["older"], b3["younger"], b3["hole"]), (0, 2, 1));
+    bind(&b2, &b3, "PressInFlight", "Engine burst key 2");
+    let e1 = u2 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 6),
+        (3, 7),
+        Licence::Typed,
+        Some(u1),
+        e1,
+        &b3,
+        1,
+    );
+    let b4 = project(&eng, e1, u1, 7, last);
+    assert_eq!(b4["bridged"], 0, "the nudge's cell is not the burst's");
+    assert!(eng.field_at(3, 5).is_none(), "…and stays dark");
+    assert_eq!((b4["forfeited"], b4["older"] + b4["younger"]), (2, 0));
+    assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+    bind(&b3, &b4, "SweptMoveRefuses", "Engine burst refusal");
+    let mut kept = b4.clone();
+    kept.insert("younger", 2);
+    kept.insert("forfeited", 0);
+    refuse(
+        &b3,
+        &kept,
+        "SweptMoveRefuses",
+        "Engine forfeited-credits control",
+    );
+    let mut laid_anyway = b4.clone();
+    laid_anyway.insert("bridged", 1);
+    laid_anyway.insert("bridged_delta", 1);
+    refuse(
+        &b3,
+        &laid_anyway,
+        "SweptMoveRefuses",
+        "Engine no-bridge-on-a-refusal control",
+    );
+    let e2 = e1 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 7),
+        (3, 8),
+        Licence::Typed,
+        Some(u2),
+        e2,
+        &b4,
+        1,
+    );
+    let b5 = project(&eng, e2, u2, 8, last);
+    assert_eq!(b5["bridged"], 0);
+    assert!(
+        eng.field_at(3, 7).is_some(),
+        "the key's own glyph is the host's"
+    );
+    bind(&b4, &b5, "SweptMoveRefuses", "Engine burst key 2 echo");
+
+    let v0 = Instant::now();
+    let mut eng = seeded(v0, 5);
+    let mut last = Last::default();
+    let p0 = project(&eng, v0, v0, 5, last);
+    let v1 = v0 + ms(100);
+    press(&mut eng, v1);
+    let p1 = project(&eng, v1, v1, 5, last);
+    bind(&p0, &p1, "KeyPressed", "Engine swallowed press");
+    let v2 = v1 + ms(200);
+    press(&mut eng, v2);
+    let p2 = project(&eng, v2, v2, 5, last);
+    assert_eq!((p2["older"], p2["younger"], p2["hole"]), (1, 1, 0));
+    bind(&p1, &p2, "KeyPressed", "Engine ordinary key");
+    let e2 = v2 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 5),
+        (3, 6),
+        Licence::Typed,
+        Some(v2),
+        e2,
+        &p2,
+        1,
+    );
+    let p3 = project(&eng, e2, v2, 6, last);
+    assert_eq!((p3["forfeited"], p3["older"] + p3["younger"]), (2, 0));
+    bind(&p2, &p3, "SweptMoveRefuses", "Engine phantom dropped");
+    let p4 = project(&eng, e2 + ms(100), v2, 7, last);
+    bind(
+        &p3,
+        &p4,
+        "UnlicensedAdvance",
+        "Engine nudge after the phantom",
+    );
+    let v3 = e2 + ms(200);
+    press(&mut eng, v3);
+    last.just_refused = 0;
+    let p5 = project(&eng, v3, v3, 7, last);
+    bind(&p4, &p5, "KeyPressed", "Engine key after the nudge");
+    let e3 = v3 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 7),
+        (3, 8),
+        Licence::Typed,
+        Some(v3),
+        e3,
+        &p5,
+        1,
+    );
+    let p6 = project(&eng, e3, v3, 8, last);
+    assert_eq!(p6["bridged"], 0, "the phantom credit never rolled forward");
+    assert!(eng.field_at(3, 6).is_none());
+    bind(&p5, &p6, "SweptMoveRefuses", "Engine phantom cannot pay");
+
+    let w0 = Instant::now();
+    let mut eng = seeded(w0, 5);
+    let mut last = Last::default();
+    let r0 = project(&eng, w0, w0, 5, last);
+    let w1 = w0 + ms(100);
+    press(&mut eng, w1);
+    let r1 = project(&eng, w1, w1, 5, last);
+    bind(&r0, &r1, "KeyPressed", "Engine press before a retreat");
+    let r2 = project(&eng, w1 + ms(100), w1, 6, last);
+    bind(&r1, &r2, "UnlicensedAdvance", "Engine hop before a retreat");
+    let w2 = w1 + ms(200);
+    last = moved(&mut eng, (3, 6), (3, 4), Licence::Typed, None, w2, &r2, 0);
+    let r3 = project(&eng, w2, w1, 4, last);
+    assert_eq!((r3["younger"], r3["hole"], r3["forfeited"]), (1, 0, 0));
+    bind(&r2, &r3, "RetreatKeepsPresses", "Engine fresh retreat");
+    let w3 = w2 + ms(200);
+    last = moved(&mut eng, (3, 4), (3, 9), Licence::Nav, None, w3, &r3, 0);
+    let r4 = project(&eng, w3, w1, 9, last);
+    assert_eq!((r4["older"] + r4["younger"], r4["forfeited"]), (0, 1));
+    bind(&r3, &r4, "LedgerForgotten", "Engine nav hop");
+    let w4 = w3 + ms(100);
+    press(&mut eng, w4);
+    let r5 = project(&eng, w4, w4, 9, last);
+    bind(
+        &r4,
+        &r5,
+        "KeyPressed",
+        "Engine press before a stale retreat",
+    );
+    let w5 = w4 + patience + ms(100);
+    let r6 = project(&eng, w5, w4, 9, last);
+    assert_eq!((r6["stale"], r6["younger"]), (1, 0));
+    bind(&r5, &r6, "TimePasses", "Engine patience before a retreat");
+    last = moved(&mut eng, (3, 9), (3, 8), Licence::Typed, None, w5, &r6, 0);
+    let r7 = project(&eng, w5, w4, 8, last);
+    assert_eq!(
+        (r7["stale"], r7["expired"], r7["younger"], r7["hole"]),
+        (0, 1, 0, 0)
+    );
+    bind(&r6, &r7, "RetreatKeepsPresses", "Engine stale retreat");
+
+    let d0 = Instant::now();
+    let mut eng = seeded(d0, 8);
+    let mut last = Last::default();
+    let a0 = project(&eng, d0, d0, 8, last);
+    let d1 = d0 + ms(100);
+    press(&mut eng, d1);
+    let a1 = project(&eng, d1, d1, 8, last);
+    bind(&a0, &a1, "KeyPressed", "Engine press before an erase");
+    let d2 = d1 + patience + ms(100);
+    let a2 = project(&eng, d2, d1, 8, last);
+    bind(&a1, &a2, "TimePasses", "Engine patience before an erase");
+    last = cleared(&mut eng, Event::Erase, d2, last);
+    let a3 = project(&eng, d2, d1, 8, last);
+    assert_eq!((a3["stale"], a3["expired"], a3["forfeited"]), (0, 1, 0));
+    bind(
+        &a2,
+        &a3,
+        "LedgerClearedInPlace",
+        "Engine erase over a stale press",
+    );
+    let d3 = d2 + ms(100);
+    press(&mut eng, d3);
+    let a4 = project(&eng, d3, d3, 8, last);
+    bind(&a3, &a4, "KeyPressed", "Engine press before a kill");
+    let a5 = project(&eng, d3 + ms(50), d3, 9, last);
+    bind(&a4, &a5, "UnlicensedAdvance", "Engine hop before a kill");
+    let d4 = d3 + ms(100);
+    last = cleared(
+        &mut eng,
+        Event::Kill {
+            cells: 1,
+            scope: KillScope::Word,
+        },
+        d4,
+        last,
+    );
+    let a6 = project(&eng, d4, d3, 9, last);
+    assert_eq!((a6["younger"], a6["forfeited"], a6["hole"]), (0, 1, 1));
+    bind(
+        &a5,
+        &a6,
+        "LedgerClearedInPlace",
+        "Engine kill beside a hole",
+    );
+    let d5 = d4 + ms(100);
+    press(&mut eng, d5);
+    let a7 = project(&eng, d5, d5, 9, last);
+    bind(&a6, &a7, "KeyPressed", "Engine press before a focus loss");
+    let d6 = d5 + ms(100);
+    last = cleared(&mut eng, Event::Focus(false), d6, last);
+    let a8 = project(&eng, d6, d5, 9, last);
+    assert_eq!((a8["forfeited"], a8["hole"]), (2, 1));
+    bind(&a7, &a8, "LedgerClearedInPlace", "Engine focus loss");
+
+    let z0 = Instant::now();
+    let mut eng = seeded(z0, 5);
+    let mut last = Last::default();
+    let c0 = project(&eng, z0, z0, 5, last);
+    let z1 = z0 + ms(100);
+    press(&mut eng, z1);
+    let c1 = project(&eng, z1, z1, 5, last);
+    bind(&c0, &c1, "KeyPressed", "Engine press before vim's w");
+    let z2 = z1 + ms(50);
+    last = moved(&mut eng, (3, 5), (3, 8), Licence::Typed, None, z2, &c1, 1);
+    let c2 = project(&eng, z2, z1, 8, last);
+    assert_eq!(
+        (c2["forfeited"], c2["bridged"], c2["older"] + c2["younger"]),
+        (1, 0, 0)
+    );
+    assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+    bind(&c1, &c2, "UnsweptMoveRefuses", "Engine vim's w");
+
+    let x0 = Instant::now();
+    let mut eng = seeded(x0, 5);
+    let mut last = Last::default();
+    let q0 = project(&eng, x0, x0, 5, last);
+    let x1 = x0 + ms(100);
+    press(&mut eng, x1);
+    let q1 = project(&eng, x1, x1, 5, last);
+    bind(&q0, &q1, "KeyPressed", "Engine press before the patience");
+    let x2 = x1 + patience + ms(500);
+    let q2 = project(&eng, x2, x1, 5, last);
+    assert_eq!((q2["stale"], q2["younger"], q2["stale_gone"]), (1, 0, 1));
+    bind(&q1, &q2, "TimePasses", "Engine patience elapses");
+    let q3 = project(&eng, x2, x1, 6, last);
+    bind(
+        &q2,
+        &q3,
+        "UnlicensedAdvance",
+        "Engine hop after the patience",
+    );
+    press(&mut eng, x2);
+    let q4 = project(&eng, x2, x2, 6, last);
+    assert_eq!((q4["older"], q4["younger"], q4["stale"]), (0, 1, 1));
+    bind(&q3, &q4, "KeyPressed", "Engine key after the patience");
+    let e2 = x2 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 6),
+        (3, 7),
+        Licence::Typed,
+        Some(x2),
+        e2,
+        &q4,
+        1,
+    );
+    let q5 = project(&eng, e2, x2, 7, last);
+    assert_eq!((q5["expired"], q5["forfeited"], q5["bridged"]), (1, 1, 0));
+    assert!(eng.field_at(3, 5).is_none(), "a swallowed key buys no cell");
+    bind(&q4, &q5, "SweptMoveRefuses", "Engine expired press");
+
+    let f0 = Instant::now();
+    let mut eng = seeded(f0, 5);
+    let mut last = Last::default();
+    let g0 = project(&eng, f0, f0, 5, last);
+    let f1 = f0 + ms(100);
+    press(&mut eng, f1);
+    let g1 = project(&eng, f1, f1, 5, last);
+    bind(
+        &g0,
+        &g1,
+        "KeyPressed",
+        "Engine press before a partial expiry",
+    );
+    let f2 = f1 + ms(1500);
+    press(&mut eng, f2);
+    let g2 = project(&eng, f2, f2, 5, last);
+    assert_eq!((g2["older"], g2["younger"], g2["stale"]), (1, 1, 0));
+    bind(&g1, &g2, "KeyPressed", "Engine key before a partial expiry");
+    let f3 = f1 + patience + ms(100);
+    let g3 = project(&eng, f3, f2, 5, last);
+    assert_eq!((g3["older"], g3["younger"], g3["stale"]), (0, 1, 1));
+    bind(
+        &g2,
+        &g3,
+        "OnePressGoesStale",
+        "Engine oldest press goes stale",
+    );
+    last = moved(
+        &mut eng,
+        (3, 5),
+        (3, 6),
+        Licence::Typed,
+        Some(f2),
+        f3,
+        &g3,
+        0,
+    );
+    let g4 = project(&eng, f3, f2, 6, last);
+    assert_eq!(
+        (
+            g4["expired"],
+            g4["stale"],
+            g4["younger"],
+            g4["spent"],
+            g4["bridged"]
+        ),
+        (1, 0, 0, 1, 0)
+    );
+    bind(
+        &g3,
+        &g4,
+        "SweptMovePays",
+        "Engine echo after a partial expiry",
+    );
+
+    let h0 = Instant::now();
+    let mut eng = seeded(h0, 5);
+    let mut last = Last::default();
+    let k0 = project(&eng, h0, h0, 5, last);
+    let h1 = h0 + ms(100);
+    press(&mut eng, h1);
+    let k1 = project(&eng, h1, h1, 5, last);
+    bind(&k0, &k1, "KeyPressed", "Engine press that will go stale");
+    let h2 = h1 + patience + ms(100);
+    let k2 = project(&eng, h2, h1, 5, last);
+    bind(&k1, &k2, "TimePasses", "Engine press gone stale");
+    press(&mut eng, h2);
+    let k3 = project(&eng, h2, h2, 5, last);
+    assert_eq!(
+        (k3["older"], k3["younger"], k3["stale"], k3["hole"]),
+        (0, 1, 1, 0)
+    );
+    bind(&k2, &k3, "KeyPressed", "Engine key beside a stale press");
+    let e3 = h2 + ms(8);
+    last = moved(
+        &mut eng,
+        (3, 5),
+        (3, 6),
+        Licence::Typed,
+        Some(h2),
+        e3,
+        &k3,
+        0,
+    );
+    let k4 = project(&eng, e3, h2, 6, last);
+    assert_eq!(
+        (k4["expired"], k4["stale"], k4["younger"], k4["spent"]),
+        (1, 0, 0, 1)
+    );
+    bind(
+        &k3,
+        &k4,
+        "SweptMovePays",
+        "Engine key pays beside a stale press",
+    );
+    let mut stale_paid = k4.clone();
+    stale_paid.insert("expired", 0);
+    stale_paid.insert("younger", 1);
+    stale_paid.insert("spent", 1);
+    refuse(
+        &k3,
+        &stale_paid,
+        "SweptMovePays",
+        "Engine stale-press-pays control",
+    );
+
+    let y0 = Instant::now();
+    let mut eng = seeded(y0, 5);
+    let mut last = Last::default();
+    let m0 = project(&eng, y0, y0, 5, last);
+    let y1 = y0 + ms(100);
+    press(&mut eng, y1);
+    let m1 = project(&eng, y1, y1, 5, last);
+    bind(&m0, &m1, "KeyPressed", "Engine batch press 1");
+    press(&mut eng, y1 + ms(700));
+    let m2 = project(&eng, y1 + ms(700), y1, 5, last);
+    bind(&m1, &m2, "PressInFlight", "Engine batch press 2");
+    let y2 = y1 + ms(750);
+    last = moved(&mut eng, (3, 5), (3, 7), Licence::Typed, None, y2, &m2, 0);
+    let m3 = project(&eng, y2, y1, 7, last);
+    assert_eq!(
+        (m3["bridged"], m3["spent"], m3["older"] + m3["younger"]),
+        (2, 2, 0)
+    );
+    assert_eq!(
+        (last.laid_hole, last.bridged_delta),
+        (0, 2),
+        "both cells are the key's and the one behind it, none the hole's"
+    );
+    assert!(eng.field_at(3, 5).is_some() && eng.field_at(3, 6).is_some());
+    bind(&m2, &m3, "UnsweptMovePays", "Engine unswept batch");
+    let y3 = y2 + ms(200);
+    press(&mut eng, y3);
+    let m4 = project(&eng, y3, y3, 7, last);
+    bind(&m3, &m4, "KeyPressed", "Engine batch press 3");
+    press(&mut eng, y3 + ms(100));
+    let m5 = project(&eng, y3 + ms(100), y3, 7, last);
+    bind(&m4, &m5, "PressInFlight", "Engine batch press 4");
+    let m6 = project(&eng, y3 + ms(120), y3, 8, last);
+    bind(&m5, &m6, "UnlicensedAdvance", "Engine hop before a batch");
+    let y4 = y3 + ms(150);
+    last = moved(&mut eng, (3, 8), (3, 10), Licence::Typed, None, y4, &m6, 1);
+    let m7 = project(&eng, y4, y3, 10, last);
+    assert_eq!((m7["bridged"], m7["forfeited"]), (2, 2));
+    assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+    assert!(eng.field_at(3, 7).is_none(), "the hop's cell stays dark");
+    bind(
+        &m6,
+        &m7,
+        "UnsweptMoveRefuses",
+        "Engine unswept batch after a hop",
+    );
+
+    let v0 = Instant::now();
+    let mut eng = seeded(v0, 5);
+    let mut last = Last::default();
+    let o0 = project(&eng, v0, v0, 5, last);
+    let v1 = v0 + ms(100);
+    press(&mut eng, v1);
+    let o1 = project(&eng, v1, v1, 5, last);
+    bind(&o0, &o1, "KeyPressed", "Engine press before a relocation");
+    let o2 = project(&eng, v1 + ms(50), v1, 6, last);
+    bind(
+        &o1,
+        &o2,
+        "UnlicensedAdvance",
+        "Engine hop before a relocation",
+    );
+    let v2 = v1 + ms(100);
+    let before = eng.status().bridged;
+    eng.observe_caret((4, 2));
+    tick_at(&mut eng, v2);
+    assert_eq!(
+        eng.caret_mirror(),
+        (4, 2),
+        "the mirror followed the observed row"
+    );
+    last = Last {
+        laid_hole: 0,
+        bridged_delta: i64::from(eng.status().bridged - before),
+        last_older: o2["older"],
+        ..last
+    };
+    let o3 = project(&eng, v2, v1, 2, last);
+    assert_eq!(
+        (o3["older"] + o3["younger"], o3["forfeited"], o3["hole"]),
+        (0, 1, 0),
+        "the press is forfeited and the hole is measured on the new row"
+    );
+    bind(&o2, &o3, "LedgerForgotten", "Engine declined relocation");
+    let v3 = v2 + ms(100);
+    press(&mut eng, v3);
+    let o4 = project(&eng, v3, v3, 2, last);
+    bind(
+        &o3,
+        &o4,
+        "KeyPressed",
+        "Engine press that goes stale before a relocation",
+    );
+    let v4 = v3 + patience + ms(100);
+    let o5 = project(&eng, v4, v3, 2, last);
+    bind(
+        &o4,
+        &o5,
+        "TimePasses",
+        "Engine patience before a relocation",
+    );
+    eng.observe_caret((6, 0));
+    tick_at(&mut eng, v4);
+    last = Last {
+        laid_hole: 0,
+        bridged_delta: 0,
+        last_older: o5["older"],
+        ..last
+    };
+    let o6 = project(&eng, v4, v3, 0, last);
+    assert_eq!((o6["expired"], o6["forfeited"], o6["stale"]), (1, 1, 0));
+    bind(
+        &o5,
+        &o6,
+        "LedgerForgotten",
+        "Engine relocation over a stale press",
+    );
+}
+
+#[test]
+fn a_declined_row_change_moves_the_mirror_after_the_ingest_and_the_next_key_lays_on_the_new_row() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    assert_eq!(eng.caret_mirror(), (3, 5));
+    let t1 = t0 + Duration::from_millis(100);
+    eng.on_event(typed(1), t1);
+    eng.observe_caret((5, 2));
+    assert_eq!(
+        eng.caret_mirror(),
+        (3, 5),
+        "the mirror moves at the END of the tick"
+    );
+    tick_at(&mut eng, t1);
+    assert!(
+        eng.field_at(3, 4).is_none(),
+        "the buffered key is held at the caret it was typed at, not laid"
+    );
+    assert!(
+        eng.field_at(5, 1).is_none(),
+        "…and nothing on the new row yet"
+    );
+    assert_eq!(
+        eng.caret_mirror(),
+        (5, 2),
+        "from the next tick the mirror is the observed caret"
+    );
+    assert_eq!(eng.echo.total(), 0, "the press was forgotten with the row");
+    let t2 = t1 + Duration::from_millis(100);
+    eng.on_event(typed(1), t2);
+    tick_at(&mut eng, t2);
+    assert!(
+        eng.field_at(5, 1).is_none(),
+        "a key whose echo has not landed lays nothing — not the marker's cell"
+    );
+    assert!(
+        eng.field_at(3, 5).is_none() && eng.field_at(3, 6).is_none(),
+        "…and nothing new on the row the caret left"
+    );
+    let e2 = t2 + Duration::from_millis(8);
+    eng.on_event(
+        Event::Sweep {
+            row: 5,
+            col0: 2,
+            col1: 3,
+        },
+        t2,
+    );
+    eng.on_event(mv((5, 2), (5, 3), Licence::Typed), e2);
+    tick_at(&mut eng, e2);
+    assert_eq!(eng.status().bridged, 0, "no phantom credit lit a cell");
+    assert!(
+        eng.field_at(5, 2).is_some(),
+        "the host's sweep laid the glyph cell"
+    );
+    assert!(
+        eng.field_at(5, 1).is_none(),
+        "the key after the relocation lays on the new row, at its own cell only"
+    );
+}
+
+#[test]
+fn a_same_row_observation_leaves_the_mirror_for_the_ledger_to_measure() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    let t1 = t0 + Duration::from_millis(100);
+    eng.on_event(typed(1), t1);
+    tick_at(&mut eng, t1);
+    eng.observe_caret((3, 6));
+    tick_at(&mut eng, t1 + Duration::from_millis(300));
+    assert_eq!(
+        eng.caret_mirror(),
+        (3, 5),
+        "a same-row observation is not a move"
+    );
+    assert_eq!(eng.echo.total(), 1, "…and the press keeps waiting");
+    let t2 = t1 + Duration::from_millis(400);
+    eng.on_event(typed(1), t2);
+    tick_at(&mut eng, t2);
+    let e2 = t2 + Duration::from_millis(8);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 6,
+            col1: 7,
+        },
+        t2,
+    );
+    eng.on_event(mv((3, 6), (3, 7), Licence::Typed), e2);
+    tick_at(&mut eng, e2);
+    assert_eq!(
+        eng.status().bridged,
+        1,
+        "the late echo's cell was relit by the ledger"
+    );
+    assert!(eng.field_at(3, 5).is_some(), "…at the hole");
+}
+
+#[test]
+fn a_fresh_engine_ignores_an_observed_caret_until_a_licensed_move_seeds_the_mirror() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    eng.observe_caret((5, 0));
+    tick_at(&mut eng, t0);
+    assert_eq!(eng.caret_mirror(), (0, 0), "an observation seeds nothing");
+    let t1 = t0 + Duration::from_millis(100);
+    eng.on_event(typed(1), t1);
+    tick_at(&mut eng, t1);
+    assert_eq!(
+        eng.status().cells,
+        0,
+        "a key before the first licensed move lays nothing — not on row 4's last cell either"
+    );
+}
+
+#[test]
+fn successive_partial_redraws_restore_the_whole_typed_ribbon_before_its_expiry() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let original: Vec<char> = "  abcdefgh".chars().collect();
+    let mut failures = Vec::new();
+    for releases in [4u16, 5] {
+        for return_delay_ms in [1u64, 300] {
+            let mut eng = engaged();
+            eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+            tick_at(&mut eng, t0);
+            let mut t = t0;
+            for col in 2..10u16 {
+                t = type_key_at(&mut eng, t + ms(40), col);
+            }
+            assert_eq!(eng.ribbon().cohorts().len(), 1, "one typed run");
+            let cohort = eng.ribbon().cohorts()[0].id;
+            assert_eq!(eng.ribbon().cells().len(), 8);
+            assert!((2..10).all(|col| eng.field_at(3, col).is_some()));
+            let original_cells: Vec<(u16, u16, Instant)> = eng
+                .ribbon()
+                .cells()
+                .iter()
+                .map(|cell| (cell.row, cell.col, cell.born))
+                .collect();
+            assert_eq!(
+                eng.witness_rows(
+                    &[RowSample {
+                        row: 3,
+                        cols: &original
+                    }],
+                    t
+                ),
+                0,
+                "the original glyphs arm the witness"
+            );
+
+            let mut partial = original.clone();
+            for step in 0..releases {
+                t += ms(20);
+                partial[usize::from(9 - step)] = ' ';
+                assert_eq!(
+                    eng.witness_rows(
+                        &[RowSample {
+                            row: 3,
+                            cols: &partial
+                        }],
+                        t
+                    ),
+                    1,
+                    "each sampled redraw releases one more suffix glyph"
+                );
+                tick_at(&mut eng, t);
+                assert_eq!(eng.ribbon().cohorts().len(), 1);
+                assert_eq!(eng.ribbon().cohorts()[0].id, cohort);
+                assert_eq!(
+                    eng.ribbon().cells().len(),
+                    8,
+                    "all original cells are resident"
+                );
+                let stamps: Vec<Instant> = eng
+                    .ribbon()
+                    .cells()
+                    .iter()
+                    .filter_map(|cell| cell.released_at)
+                    .collect();
+                assert_eq!(stamps.len(), usize::from(step + 1));
+                assert_eq!(stamps.iter().filter(|&&stamp| stamp == t).count(), 1);
+            }
+
+            let before_return = t + ms(return_delay_ms);
+            assert!(
+                !eng.ribbon().cohorts()[0].leaving_at(before_return),
+                "the original run has not begun its natural exit"
+            );
+            assert_eq!(
+                eng.witness_rows(
+                    &[RowSample {
+                        row: 3,
+                        cols: &partial
+                    }],
+                    before_return
+                ),
+                0,
+                "a repeated partial frame releases nothing else"
+            );
+            tick_at(&mut eng, before_return);
+            assert!(
+                eng.field_at(3, 2).is_some(),
+                "the unchanged prefix still stands"
+            );
+            let resident: Vec<u16> = eng.ribbon().cells().iter().map(|cell| cell.col).collect();
+            if return_delay_ms == 1 {
+                assert_eq!(
+                    resident.len(),
+                    8,
+                    "return before any release finishes fading"
+                );
+            }
+
+            let returned = before_return + ms(1);
+            assert_eq!(
+                eng.witness_rows(
+                    &[RowSample {
+                        row: 3,
+                        cols: &original
+                    }],
+                    returned
+                ),
+                0,
+                "the identical row restores rather than replaces its glyphs"
+            );
+            tick_at(&mut eng, returned);
+            if return_delay_ms == 1 {
+                assert_eq!(eng.ribbon().cells().len(), original_cells.len());
+                assert!(
+                    eng.ribbon()
+                        .cells()
+                        .iter()
+                        .all(|cell| original_cells.contains(&(cell.row, cell.col, cell.born))),
+                    "the immediate return still owns every original cell identity"
+                );
+            }
+            let still_released: Vec<(u16, bool, bool)> = eng
+                .ribbon()
+                .cells()
+                .iter()
+                .filter(|cell| {
+                    original_cells.contains(&(cell.row, cell.col, cell.born))
+                        && (cell.released_at.is_some() || cell.retract_at.is_some())
+                })
+                .map(|cell| {
+                    (
+                        cell.col,
+                        cell.released_at.is_some(),
+                        cell.retract_at.is_some(),
+                    )
+                })
+                .collect();
+            let dark: Vec<u16> = (2..10)
+                .filter(|&col| eng.field_at(3, col).is_none())
+                .collect();
+            if !dark.is_empty() || !still_released.is_empty() {
+                failures.push(format!(
+                    "{releases} partial releases, return after {return_delay_ms} ms: \
+                     cells resident before return {resident:?}, original cells still \
+                     (column, released, retracting) {still_released:?}, restored glyphs still dark {dark:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn a_witness_retirement_is_counted_survives_a_reset_and_is_never_undone_by_a_payout() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    let mut t = t0;
+    for col in 2..5u16 {
+        t = type_key_at(&mut eng, t + Duration::from_millis(100), col);
+    }
+    assert_eq!(eng.status().cells, 3, "three cells: `abc`");
+    assert!(
+        eng.field_at(3, 1).is_none(),
+        "no neighbour cell before the run"
+    );
+    let abc: Vec<char> = "  abc".chars().collect();
+    let axc: Vec<char> = "  abX".chars().collect();
+    let seen_abc = [RowSample { row: 3, cols: &abc }];
+    let seen_axc = [RowSample { row: 3, cols: &axc }];
+    assert_eq!(
+        eng.witness_rows(&seen_abc, t),
+        0,
+        "the first glyph seen arms"
+    );
+    assert_eq!(
+        eng.witness_rows(&seen_abc, t),
+        0,
+        "the same glyph retires nothing"
+    );
+    let fired = t + Duration::from_millis(50);
+    assert_eq!(
+        eng.witness_rows(&seen_axc, fired),
+        1,
+        "c -> X retires the `c` cell"
+    );
+    assert_eq!(eng.status().retired, 1);
+    let leaving = |eng: &Engine| -> Vec<u16> {
+        let mut v: Vec<u16> = eng
+            .ribbon()
+            .cells()
+            .iter()
+            .filter(|c| c.leaving())
+            .map(|c| c.col)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        leaving(&eng),
+        vec![4],
+        "`c` is on the melt; `a` and `b` stand"
+    );
+    let p1 = fired + Duration::from_millis(10);
+    eng.on_event(typed(1), p1);
+    tick_at(&mut eng, p1);
+    let p2 = p1 + Duration::from_millis(20);
+    eng.on_event(typed(1), p2);
+    tick_at(&mut eng, p2);
+    let e2 = p2 + Duration::from_millis(8);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 6,
+            col1: 7,
+        },
+        p2,
+    );
+    eng.on_event(mv((3, 6), (3, 7), Licence::Typed), e2);
+    tick_at(&mut eng, e2);
+    assert_eq!(eng.status().bridged, 1, "the hole was paid");
+    assert!(eng.field_at(3, 5).is_some() && eng.field_at(3, 6).is_some());
+    assert_eq!(
+        leaving(&eng),
+        vec![4],
+        "the payout did not revive the retired cell"
+    );
+    tick_at(&mut eng, e2 + Duration::from_millis(200));
+    assert!(
+        leaving(&eng).is_empty(),
+        "the melt ended: nothing is leaving"
+    );
+    assert!(
+        eng.field_at(3, 4).is_none(),
+        "…and the retired cell is out of the pool"
+    );
+    assert!(
+        eng.field_at(3, 2).is_some()
+            && eng.field_at(3, 3).is_some()
+            && eng.field_at(3, 5).is_some(),
+        "…while `a`, `b` and the paid cell stand"
+    );
+    eng.reset();
+    assert_eq!(
+        eng.status().retired,
+        1,
+        "the window's tally survives a reset"
+    );
+    assert!(eng.witness.is_empty());
+}
+
+#[test]
+fn three_disjoint_cohorts_keep_the_hands_lower_follow_row_in_the_witness() {
+    let ms = Duration::from_millis;
+    let (mut eng, t) = typed_runs(&[3, 7, 11]);
+    let text: Vec<char> = "  ab".chars().collect();
+    let blank: Vec<char> = "    ".chars().collect();
+    let mut wanted = [0u16; witness::WITNESS_ROWS];
+    let n = eng.ribbon_rows_for(None, &mut wanted);
+    assert!(
+        wanted[..n].contains(&12),
+        "the hand's run on row 11 needs row 12 to follow its text; requested {:?}",
+        &wanted[..n]
+    );
+    let original = wanted[..n]
+        .iter()
+        .map(|&row| RowSample {
+            row,
+            cols: if row == 3 || row == 7 || row == 11 {
+                &text
+            } else {
+                &blank
+            },
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(eng.witness_rows(&original, t), 0, "arm the three runs");
+    let moved = wanted[..n]
+        .iter()
+        .map(|&row| RowSample {
+            row,
+            cols: if row == 12 || row == 3 || row == 7 {
+                &text
+            } else {
+                &blank
+            },
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(eng.follow_rows(&moved, &wanted[..n], t + ms(5)), 2);
+    tick_at(&mut eng, t + ms(5));
+    assert!(
+        eng.field_at(12, 2).is_some() && eng.field_at(12, 3).is_some(),
+        "the lit run followed its text onto row 12"
+    );
+}
+
+#[test]
+fn a_box_redrawn_in_place_under_a_scroll_carries_its_lines_back() {
+    let ms = Duration::from_millis;
+    let (mut eng, t) = typed_runs(&[14, 15]);
+    let text: Vec<char> = "  ab".chars().collect();
+    let blank: Vec<char> = "    ".chars().collect();
+    let sample = |asked: &[u16], lines: &[u16]| {
+        asked
+            .iter()
+            .map(|&row| RowSample {
+                row,
+                cols: if lines.contains(&row) { &text } else { &blank },
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut asked = [0u16; witness::WITNESS_ROWS];
+    let n = eng.ribbon_rows_for(None, &mut asked);
+    assert_eq!(eng.witness_rows(&sample(&asked[..n], &[14, 15]), t), 0);
+    eng.translate_scroll(3, 16);
+    assert!(
+        eng.field_at(11, 2).is_some() && eng.field_at(12, 2).is_some(),
+        "fixture: the scroll carried both runs up three rows"
+    );
+    assert_eq!(eng.witness.scroll_carry(), 3);
+    let n = eng.ribbon_rows_for(None, &mut asked);
+    let asked = &asked[..n];
+    assert!(
+        asked.contains(&14) && asked.contains(&15),
+        "the rows the lines stood on are named: {asked:?}"
+    );
+    let redrawn = sample(asked, &[14, 15]);
+    let now = t + ms(5);
+    assert_eq!(eng.follow_rows(&redrawn, asked, now), 4);
+    tick_at(&mut eng, now);
+    assert_eq!(eng.witness_rows(&redrawn, now), 0, "nothing retired");
+    for row in [14, 15] {
+        assert!(
+            eng.field_at(row, 2).is_some() && eng.field_at(row, 3).is_some(),
+            "row {row}'s run is back under its text"
+        );
+    }
+    assert!(
+        eng.ribbon()
+            .cells()
+            .iter()
+            .all(|c| c.row == 14 || c.row == 15),
+        "no cell is left where the scroll put it"
+    );
+    assert_eq!(
+        eng.witness.scroll_carry(),
+        0,
+        "the follow pass ends the carry"
+    );
+    eng.translate_scroll(2, 16);
+    assert_eq!(
+        eng.witness.scroll_carry(),
+        0,
+        "two rows are within the follow offsets"
+    );
+}
+
+#[test]
+fn a_box_pushed_past_the_follow_offsets_follows_the_caret() {
+    fn sample<'a>(lines: &[(u16, &'a [char])]) -> Vec<RowSample<'a>> {
+        const BLANK: [char; 4] = [' '; 4];
+        (9..=15u16)
+            .map(|row| RowSample {
+                row,
+                cols: lines
+                    .iter()
+                    .find(|(r, _)| *r == row)
+                    .map_or(&BLANK[..], |(_, l)| l),
+            })
+            .collect()
+    }
+    let ms = Duration::from_millis;
+    let text: Vec<char> = "  ab".chars().collect();
+    let other: Vec<char> = "  xy".chars().collect();
+    let asked: Vec<u16> = (9..=15).collect();
+    let take = |caret: bool, old_row: &[char]| {
+        let (mut eng, t) = typed_runs(&[10]);
+        assert_eq!(eng.witness_rows(&sample(&[(10, &text)]), t), 0);
+        let now = t + ms(300);
+        tick_at(&mut eng, now);
+        let mut named = [0u16; witness::WITNESS_ROWS];
+        let n = eng.ribbon_rows_at_caret(None, caret.then_some((10, 14)), &mut named);
+        assert_eq!(
+            named[..n].contains(&14),
+            caret,
+            "row 14 is named exactly when the caret went there: {:?}",
+            &named[..n]
+        );
+        if caret {
+            eng.observe_caret((14, 4));
+            eng.carry_caret(4);
+        }
+        let pushed = sample(&[(10, old_row), (14, &text)]);
+        let followed = eng.follow_rows(&pushed, &asked, now);
+        tick_at(&mut eng, now);
+        let retired = eng.witness_rows(&pushed, now);
+        (eng, followed, retired)
+    };
+    let (eng, followed, retired) = take(true, &other);
+    assert_eq!(followed, 2, "the run followed the caret");
+    assert_eq!(retired, 0, "nothing melts");
+    assert!(
+        eng.field_at(14, 2).is_some() && eng.field_at(14, 3).is_some(),
+        "the run is under its text on row 14"
+    );
+    assert!(
+        eng.ribbon().cells().iter().all(|c| c.row == 14),
+        "nothing is left on row 10"
+    );
+    assert_eq!(eng.caret.0, 14, "the hand rode with its line");
+    let (_, followed, retired) = take(false, &other);
+    assert_eq!(followed, 0, "control: no caret, no search four rows down");
+    assert_eq!(retired, 2, "control: the run melts under the new text");
+    let (eng, followed, retired) = take(true, &text);
+    assert_eq!(followed, 0, "control: the text stayed, so nothing moved");
+    assert_eq!(retired, 0, "control: and nothing melts");
+    assert!(
+        eng.ribbon().cells().iter().all(|c| c.row == 10),
+        "control: the run stays on row 10"
+    );
+}
+
+#[test]
+fn a_box_shifted_within_the_follow_offsets_keeps_the_hand_on_its_line() {
+    fn sample<'a>(lines: &[(u16, &'a [char])]) -> Vec<RowSample<'a>> {
+        const BLANK: [char; 4] = [' '; 4];
+        (8..=12u16)
+            .map(|row| RowSample {
+                row,
+                cols: lines
+                    .iter()
+                    .find(|(r, _)| *r == row)
+                    .map_or(&BLANK[..], |(_, l)| l),
+            })
+            .collect()
+    }
+    let ms = Duration::from_millis;
+    let text: Vec<char> = "  ab".chars().collect();
+    let other: Vec<char> = "  xy".chars().collect();
+    let asked: Vec<u16> = (8..=12).collect();
+    for target in [8u16, 9, 11, 12] {
+        let (mut eng, t) = typed_runs(&[10]);
+        assert_eq!(eng.witness_rows(&sample(&[(10, &text)]), t), 0);
+        let now = t + ms(600);
+        tick_at(&mut eng, now);
+        eng.observe_caret((target, 4));
+        let shifted = sample(&[(10, &other), (target, &text)]);
+        let followed = eng.follow_rows(&shifted, &asked, now);
+        assert_eq!(followed, 2, "target {target}: the run followed the caret");
+        assert_eq!(
+            eng.caret.0, target,
+            "target {target}: the hand rode with its line"
+        );
+        assert_eq!(
+            eng.take_hand_lift(),
+            Some((10, target)),
+            "target {target}: the host is notified of the hand lift"
+        );
+        tick_at(&mut eng, now + ms(350));
+        assert!(
+            eng.field_at(target, 2).is_some() && eng.field_at(target, 3).is_some(),
+            "target {target}: the run was not flowed away as an abandoned line"
+        );
+    }
+}
+
+#[test]
+fn an_unrelated_follow_on_the_parked_row_does_not_prove_the_park() {
+    let model = aterm_models_effects::rainbow_short_wrap_park_model();
+    let held = model.successors("Hold", &model.init_state())[0].clone();
+    for (origin, landing, local_run, should_prove) in [(4, 3, false, true), (32, 31, true, false)] {
+        let (mut eng, mut t) = typed_runs(&[3]);
+        if local_run {
+            eng.observe_caret((3, 31));
+            tick_at(&mut eng, t);
+            let key = t + Duration::from_millis(10);
+            eng.on_event(typed(1), key);
+            tick_at(&mut eng, key);
+            let echo = key + Duration::from_millis(1);
+            eng.on_event(
+                Event::Sweep {
+                    row: 3,
+                    col0: 31,
+                    col1: 32,
+                },
+                key,
+            );
+            eng.on_event(mv((3, 31), (3, 32), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+            t = echo;
+            let far = eng
+                .ribbon()
+                .cells()
+                .iter()
+                .find(|cell| cell.row == 3 && cell.col == 2)
+                .expect("the moving run stands at col 2")
+                .cohort;
+            let local = eng
+                .ribbon()
+                .cells()
+                .iter()
+                .find(|cell| cell.row == 3 && cell.col == 31)
+                .expect("the parked caret has its own typed run")
+                .cohort;
+            assert_ne!(far, local, "premise: only the distant run moves");
+        } else {
+            eng.observe_caret((3, origin));
+            tick_at(&mut eng, t);
+        }
+        let mut moving_text = vec![' '; 36];
+        moving_text[2] = 'a';
+        moving_text[3] = 'b';
+        let mut text = moving_text.clone();
+        if local_run {
+            text[31] = 'z';
+        }
+        let blank = vec![' '; 36];
+        let mut remaining = blank.clone();
+        if local_run {
+            remaining[31] = 'z';
+        }
+        let before = [
+            RowSample {
+                row: 3,
+                cols: &text,
+            },
+            RowSample {
+                row: 4,
+                cols: &blank,
+            },
+        ];
+        assert_eq!(eng.witness_rows(&before, t), 0);
+        let after = [
+            RowSample {
+                row: 3,
+                cols: &remaining,
+            },
+            RowSample {
+                row: 4,
+                cols: &moving_text,
+            },
+        ];
+        let (moved, proved) = eng.follow_rows_with_park(
+            &after,
+            &[3, 4],
+            t + Duration::from_millis(5),
+            Some(((3, origin), (3, landing))),
+            false,
+        );
+        assert_eq!(moved, 2, "the unrelated run still follows its text");
+        let action = if should_prove {
+            "FollowExact"
+        } else {
+            "FollowOther"
+        };
+        let projected = model.successors(action, &held)[0].clone();
+        assert_eq!(projected.get("content_moved"), Some(&1));
+        assert_eq!(
+            proved,
+            projected.get("exact") == Some(&1),
+            "the parked origin {origin} must borrow only its own run"
+        );
+    }
+}
+
+#[test]
+fn a_withheld_follow_lifts_the_hand_once() {
+    let ms = Duration::from_millis;
+    let (mut eng, t) = typed_runs(&[4, 3]);
+    assert_eq!(eng.caret, (3, 4), "fixture: the hand on row 3");
+    let mut hand = [' '; 36];
+    hand[2] = 'a';
+    hand[3] = 'b';
+    let mut lower = [' '; 36];
+    lower[2] = 'c';
+    lower[3] = 'd';
+    let blank = [' '; 36];
+    const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        RowSample { row, cols }
+    }
+    eng.witness_rows(
+        &[at(2, &blank), at(3, &hand), at(4, &lower), at(5, &blank)],
+        t,
+    );
+    let (moved, _) = eng.follow_rows_with_park(
+        &[at(2, &blank), at(3, &blank), at(4, &hand), at(5, &lower)],
+        &[2, 3, 4, 5],
+        t + ms(5),
+        None,
+        true,
+    );
+    assert_eq!(moved, 4, "fixture: both lines followed");
+    assert_eq!(eng.caret, (4, 4), "the hand rides its own line, once");
+    assert_eq!(
+        eng.take_hand_lift(),
+        Some((3, 4)),
+        "the seam is told the hand's own lift"
+    );
+    assert_eq!(
+        eng.ribbon.seam_row(),
+        None,
+        "the hand's line is no new line"
+    );
+}
+
+#[test]
+fn the_seam_rides_with_the_hands_line() {
+    let ms = Duration::from_millis;
+    let (mut eng, t) = typed_runs(&[3]);
+    eng.ribbon.arm_seam(3, t);
+    let mut hand = [' '; 36];
+    hand[2] = 'a';
+    hand[3] = 'b';
+    let blank = [' '; 36];
+    const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        RowSample { row, cols }
+    }
+    eng.witness_rows(&[at(2, &blank), at(3, &hand), at(4, &blank)], t);
+    eng.follow_rows_with_park(
+        &[at(2, &hand), at(3, &blank), at(4, &blank)],
+        &[2, 3, 4],
+        t + ms(5),
+        None,
+        true,
+    );
+    assert_eq!(eng.caret, (2, 4), "fixture: the hand rode");
+    assert_eq!(
+        eng.ribbon.seam_row(),
+        Some(2),
+        "the seam rides with its line"
+    );
+}
+
+#[test]
+fn the_hands_floor_rides_with_its_line() {
+    let ms = Duration::from_millis;
+    let (mut eng, t) = typed_runs(&[3]);
+    assert_eq!(
+        eng.ribbon.hand_floor_cell(),
+        Some((3, 2)),
+        "fixture: the floor at the run's start"
+    );
+    let mut hand = [' '; 36];
+    hand[2] = 'a';
+    hand[3] = 'b';
+    let blank = [' '; 36];
+    const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        RowSample { row, cols }
+    }
+    eng.witness_rows(&[at(2, &blank), at(3, &hand), at(4, &blank)], t);
+    eng.follow_rows_with_park(
+        &[at(2, &hand), at(3, &blank), at(4, &blank)],
+        &[2, 3, 4],
+        t + ms(5),
+        None,
+        true,
+    );
+    assert_eq!(eng.caret, (2, 4), "fixture: the hand rode");
+    let key = t + ms(20);
+    eng.on_event(typed(1), key);
+    eng.on_event(
+        Event::Sweep {
+            row: 2,
+            col0: 4,
+            col1: 5,
+        },
+        key,
+    );
+    eng.on_event(mv((2, 4), (2, 5), Licence::Typed), key + ms(1));
+    tick_at(&mut eng, key + ms(1));
+    assert_eq!(
+        eng.ribbon.hand_floor_cell(),
+        Some((2, 2)),
+        "the floor rode with the hand's line"
+    );
+}
+
+fn typed_runs(rows: &[u16]) -> (Engine, Instant) {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    eng.on_event(mv((rows[0], 0), (rows[0], 2), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    let mut t = t0;
+    for &row in rows {
+        if row != rows[0] {
+            eng.observe_caret((row, 2));
+            tick_at(&mut eng, t);
+        }
+        for col in 2..4u16 {
+            t += ms(12);
+            eng.on_event(typed(1), t);
+            tick_at(&mut eng, t);
+            let echo = t + ms(1);
+            eng.on_event(
+                Event::Sweep {
+                    row,
+                    col0: col,
+                    col1: col + 1,
+                },
+                t,
+            );
+            eng.on_event(mv((row, col), (row, col + 1), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+            t = echo;
+        }
+        assert!(
+            eng.field_at(row, 2).is_some(),
+            "fixture: a typed ribbon run on row {row}"
+        );
+    }
+    (eng, t)
+}
+
+#[test]
+fn a_waiting_key_s_arming_rows_have_slots_of_their_own() {
+    let (eng, _) = typed_runs(&[3, 7, 11, 15]);
+    let mut bands = [0u16; witness::WITNESS_ROWS];
+    let b = eng.ribbon_rows_for(None, &mut bands);
+    assert_eq!(
+        b,
+        witness::WITNESS_ROWS,
+        "fixture: the bands fill their budget"
+    );
+    assert_eq!(
+        bands[..3],
+        [15, 14, 16],
+        "the hand's run and its landing rows lead: {bands:?}"
+    );
+    let mut out = [0u16; witness::WITNESS_ROWS + witness::ARMING_ROWS];
+    let n = eng.ribbon_rows_for(Some(19), &mut out);
+    assert_eq!(n, witness::WITNESS_ROWS + witness::ARMING_ROWS);
+    assert_eq!(out[..b], bands, "the bands' rows are untouched: {out:?}");
+    assert_eq!(
+        out[b..n],
+        [19, 18, 20],
+        "the arming row and its neighbours in their own slots: {out:?}"
+    );
+    assert!(
+        !out.contains(&17) && !out.contains(&21),
+        "no row two away from the arming row: {out:?}"
+    );
+    let mut short = [0u16; witness::WITNESS_ROWS];
+    assert_eq!(
+        eng.ribbon_rows_for(Some(19), &mut short),
+        witness::WITNESS_ROWS
+    );
+    assert_eq!(short, bands, "a short caller keeps every band's row");
+    let last = u16::try_from(geom().rows - 1).expect("a small grid");
+    let n = eng.ribbon_rows_for(Some(last), &mut out);
+    assert_eq!(
+        out[b..n],
+        [last, last - 1],
+        "the rows past the grid are not neighbours: {:?}",
+        &out[..n]
+    );
+}
+
+#[test]
+fn withheld_is_what_the_host_was_asked_for_and_did_not_deliver() {
+    let (mut eng, t) = typed_runs(&[3, 7, 11, 15]);
+    let blank: Vec<char> = "    ".chars().collect();
+    let deliver = |rows: &[u16]| {
+        rows.iter()
+            .map(|&row| RowSample { row, cols: &blank })
+            .collect::<Vec<_>>()
+    };
+    let withheld = |eng: &Engine| eng.withheld[..eng.withheld_n].to_vec();
+    let mut asked = [0u16; witness::WITNESS_ROWS + witness::ARMING_ROWS];
+    let n = eng.ribbon_rows_for(Some(19), &mut asked);
+    let asked = &asked[..n];
+    assert_eq!(
+        asked[n - 3..],
+        [19, 18, 20],
+        "fixture: the arming rows are asked for"
+    );
+    eng.follow_rows(&deliver(asked), asked, t);
+    assert_eq!(
+        withheld(&eng),
+        Vec::<u16>::new(),
+        "every row asked for came"
+    );
+    let far = asked[n - 1];
+    let without_far: Vec<u16> = asked.iter().copied().filter(|&r| r != far).collect();
+    eng.follow_rows(&deliver(&without_far), asked, t);
+    assert_eq!(withheld(&eng), vec![far], "one row asked for did not come");
+    eng.set_pane_rows(Some((0, 17)));
+    let in_pane: Vec<u16> = asked.iter().copied().filter(|&r| r <= 16).collect();
+    eng.follow_rows(&deliver(&in_pane), asked, t);
+    assert_eq!(
+        withheld(&eng),
+        Vec::<u16>::new(),
+        "rows outside the pane are not withheld"
+    );
+    eng.follow_rows(&deliver(&without_far), asked, t);
+    assert_eq!(
+        withheld(&eng),
+        Vec::<u16>::new(),
+        "row 20 is outside the pane"
+    );
+    let inside = asked[0];
+    let without_inside: Vec<u16> = in_pane.iter().copied().filter(|&r| r != inside).collect();
+    eng.follow_rows(&deliver(&without_inside), asked, t);
+    assert_eq!(
+        withheld(&eng),
+        vec![inside],
+        "…and a row inside it still is"
+    );
+    eng.set_pane_rows(None);
+    let past = u16::try_from(geom().rows).expect("a small grid");
+    eng.follow_rows(&deliver(&[15]), &[15, past, past + 1], t);
+    assert_eq!(
+        withheld(&eng),
+        Vec::<u16>::new(),
+        "rows past the grid are not withheld"
+    );
+}
+
+#[test]
+fn a_licensed_jump_mints_one_meteor_cue_on_the_shared_clock() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((3, 0), (3, 20), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+
+    assert_eq!(sc.cues.len(), 1, "one gesture on the observed move");
+    let cue = sc.cues[0];
+    let SoundKind::Meteor { dir, cells, armed } = cue.kind else {
+        panic!("a nav jump is a Meteor cue, got {:?}", cue.kind);
+    };
+    assert_eq!((dir, cells, armed), (1, 20, false));
+    assert_eq!(cue.col, 20, "the cue pans to the landing column");
+    assert_eq!(cue.dir, 1);
+    assert!(!cue.shifted, "an echo has no key behind it");
+    let Some(CompanionImpulse::Meteor {
+        t_flight, t0: at, ..
+    }) = eng.take_companion_impulse()
+    else {
+        panic!("the spawn frame carries the kitty's meteor impulse");
+    };
+    assert_eq!(at, t0);
+    assert_eq!(
+        timing::flight(f32::from(cells)),
+        t_flight,
+        "the bell's delay and the landing edge must be one number"
+    );
+    assert_eq!(
+        eng.budget().tokens(),
+        0.0,
+        "a meteor empties the typing bucket on its move edge (§13)"
+    );
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(8), geom(), &cfg, &mut fr);
+    assert_eq!(sc.cues.len(), 1);
+}
+
+#[test]
+fn a_return_is_the_cadence_and_a_pty_feed_is_the_cascade() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((5, 60), (6, 0), Licence::Return), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    let caret = fr.caret;
+    assert_eq!(sc.cues.len(), 1);
+    let SoundKind::Enter { cells } = sc.cues[0].kind else {
+        panic!("a keyed Enter is the cadence, got {:?}", sc.cues[0].kind);
+    };
+    assert_eq!(cells, 60, "the true path of the down-left vector, in cells");
+    assert_eq!(sc.cues[0].col, 0);
+    let Some(CompanionImpulse::Meteor { t_flight, .. }) = eng.take_companion_impulse() else {
+        panic!("a credited Enter carries the kitty's meteor impulse");
+    };
+    assert_eq!(
+        timing::flight(f32::from(cells)),
+        t_flight,
+        "the cadence's delay and the landing edge are one number on a diagonal path"
+    );
+    assert_eq!(caret.flare_at, Some(t0), "an Enter is credited: it flares");
+    assert_eq!(caret.paint, 1.0, "never dimmed at the destination");
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((10, 0), (11, 0), Licence::Pty), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    let caret = fr.caret;
+    assert_eq!(sc.cues.len(), 1);
+    assert_eq!(sc.cues[0].kind, SoundKind::Jump, "the brrrring lane");
+    assert!(
+        eng.take_companion_impulse().is_none(),
+        "program output offers the kitty nothing (§8.2)"
+    );
+    assert_eq!(caret.flare_at, None, "no credit, no flare");
+    assert_eq!(caret.paint, 0.0, "no credit, no paint");
+    assert!(
+        eng.status().meteors > 0,
+        "…but the meteor still flies (D18)"
+    );
+}
+
+#[test]
+fn a_sub_floor_hop_is_one_nav_tick_and_a_no_op_is_silent() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let ms = Duration::from_millis;
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let mut t = t0;
+    for k in 0..20u16 {
+        t += ms(30);
+        eng.on_event(mv((3, k), (3, k + 1), Licence::Typed), t);
+        eng.on_event(typed(1), t);
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+    }
+    let before = eng.momentum_display();
+    let hop = t + ms(30);
+    eng.on_event(mv((3, 20), (3, 15), Licence::Nav), hop);
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(hop, geom(), &cfg, &mut fr);
+    let cue = sc
+        .cues
+        .iter()
+        .find(|c| c.kind == SoundKind::Navigation)
+        .expect("the hop ticked");
+    assert_eq!(
+        sc.cues
+            .iter()
+            .filter(|c| c.kind == SoundKind::Navigation)
+            .count(),
+        1
+    );
+    assert_ne!(
+        eng.momentum_display(),
+        before,
+        "the hop frame's update moved the spine, so the two frames differ"
+    );
+    assert_eq!(
+        cue.heat,
+        eng.momentum_display(),
+        "the tick is priced by the hop frame's own spine"
+    );
+    assert_eq!(
+        cue.hue,
+        eng.field_at(3, 15).expect("column 15 is laid"),
+        "C2: the tick wears the landing cell's stop"
+    );
+    assert_eq!((cue.col, cue.dir), (15, -1));
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((3, 10), (3, 15), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(sc.cues.len(), 1);
+    assert_eq!(sc.cues[0].kind, SoundKind::Navigation);
+    assert_eq!((sc.cues[0].col, sc.cues[0].dir), (15, 1));
+    assert!(
+        eng.status().stars > 0,
+        "the mini-fan is on glass with its tick"
+    );
+    assert_eq!(eng.status().meteors, 0, "…and nothing flew");
+    assert!(
+        eng.take_companion_impulse().is_none(),
+        "a hop is not a kitty event"
+    );
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((3, 10), (3, 9), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(sc.cues.len(), 1, "an arrow ticks");
+    assert_eq!(sc.cues[0].kind, SoundKind::Navigation);
+    assert_eq!(sc.cues[0].dir, -1);
+    assert_eq!(eng.status().stars, 0, "a one-cell move draws no mini-fan");
+
+    for (from, to, licence) in [
+        ((3, 10), (3, 10), Licence::Nav),
+        ((3, 10), (3, 15), Licence::Pty),
+        ((3, 10), (3, 11), Licence::Typed),
+    ] {
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        eng.on_event(mv(from, to, licence), t0);
+        let mut fr = sc.frame();
+        eng.tick(t0, geom(), &cfg, &mut fr);
+        assert!(
+            sc.cues.is_empty(),
+            "{licence:?} {from:?}→{to:?} must be silent"
+        );
+    }
+}
+
+#[test]
+fn an_erase_winces_the_kitty_and_a_meteor_outranks_it() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+
+    eng.on_event(Event::Erase, t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert!(matches!(fr.companion, Some(CompanionImpulse::Wince)));
+    assert!(matches!(
+        eng.take_companion_impulse(),
+        Some(CompanionImpulse::Wince)
+    ));
+    assert!(
+        eng.take_companion_impulse().is_none(),
+        "the take transfers it"
+    );
+
+    eng.on_event(
+        Event::Kill {
+            cells: 6,
+            scope: KillScope::Word,
+        },
+        t0,
+    );
+    assert!(matches!(
+        eng.take_companion_impulse(),
+        Some(CompanionImpulse::Wince)
+    ));
+
+    eng.on_event(Event::Erase, t0);
+    eng.on_event(mv((3, 40), (3, 0), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert!(matches!(
+        fr.companion,
+        Some(CompanionImpulse::Meteor { dir: Dir::Left, .. })
+    ));
+    eng.on_event(Event::Erase, t0 + Duration::from_millis(1));
+    assert!(matches!(
+        eng.take_companion_impulse(),
+        Some(CompanionImpulse::Meteor { .. })
+    ));
+}
+
+const TICK: Duration = Duration::from_micros(8_333);
+
+fn drive_ticks(
+    eng: &mut Engine,
+    sc: &mut Scratch,
+    t0: Instant,
+    ticks: std::ops::RangeInclusive<u64>,
+    sched: &[(u64, Event)],
+) {
+    let cfg = config();
+    for i in ticks {
+        let now = t0 + TICK * u32::try_from(i).expect("a short script");
+        for (_, ev) in sched.iter().filter(|(at, _)| *at == i) {
+            eng.on_event(*ev, now);
+        }
+        let mut fr = sc.frame();
+        eng.tick(now, geom(), &cfg, &mut fr);
+    }
+}
+
+fn flow_run(
+    eng: &mut Engine,
+    sc: &mut Scratch,
+    t0: Instant,
+    keys: u32,
+    period_ms: u64,
+) -> Vec<(f32, Flow)> {
+    let cfg = config();
+    let period = Duration::from_millis(period_ms);
+    let mut out = Vec::new();
+    let mut t = t0;
+    for (col, k) in (4u16..).zip(1..=keys) {
+        let key = t0 + period * k;
+        while t + TICK <= key {
+            t += TICK;
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+        }
+        t = key;
+        eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), t);
+        eng.on_event(typed(1), t);
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        out.push((
+            key.saturating_duration_since(t0 + period).as_secs_f32(),
+            eng.status().flow,
+        ));
+    }
+    out
+}
+
+#[test]
+fn a_run_of_fast_clean_keys_opens_the_theme_and_a_delete_closes_it() {
+    let cfg = config();
+    for (label, period_ms) in [("12 cps", 83u64), ("8 cps", 125)] {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let rows = flow_run(&mut eng, &mut sc, t0, 44, period_ms);
+
+        assert!(
+            rows.iter().any(|(_, f)| f.combo == spine::FLOW_ENTRY_KEYS),
+            "{label}: a clean run at speed must reach the entry"
+        );
+
+        let mut last = 0.0f32;
+        for (_, f) in &rows {
+            assert!(
+                f.heat >= last - 1e-6 || f.combo == 0,
+                "the heat fell inside an unbroken run"
+            );
+            last = f.heat;
+            if f.combo <= spine::FLOW_ENTRY_KEYS - spine::FLOW_OPEN_EASE_KEYS {
+                assert_eq!(
+                    f.heat, 0.0,
+                    "{label}: combo {} must be EXACTLY identity",
+                    f.combo
+                );
+            } else if f.combo >= spine::FLOW_ENTRY_KEYS {
+                assert_eq!(f.heat, 1.0, "{label}: combo {} must be open", f.combo);
+            } else {
+                assert!(
+                    f.heat > 0.0 && f.heat < 1.0,
+                    "{label}: combo {} must be easing, got {}",
+                    f.combo,
+                    f.heat
+                );
+            }
+            assert!(f.best >= f.combo);
+        }
+        let held = eng.status().flow;
+        assert!(held.open(), "{label}: the run must still be open");
+
+        let t = t0 + Duration::from_millis(period_ms) * 45;
+        eng.on_event(Event::Erase, t);
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        let after = eng.status().flow;
+        assert_eq!(after.combo, 0, "{label}: a delete must break the run");
+        assert_eq!(after.heat, 0.0, "{label}: …and close the theme");
+        assert_eq!(
+            after.best, held.best,
+            "{label}: a broken run does not un-earn the run already held"
+        );
+
+        let mut t2 = t;
+        for k in 1..=2u32 {
+            t2 = t + Duration::from_millis(period_ms) * k;
+            eng.on_event(typed(1), t2);
+            let mut fr = sc.frame();
+            eng.tick(t2, geom(), &cfg, &mut fr);
+        }
+        assert!(eng.status().flow.combo > 0, "{label}: the run restarted");
+        t2 += Duration::from_millis(period_ms);
+        eng.on_event(
+            Event::Kill {
+                cells: 4,
+                scope: KillScope::Word,
+            },
+            t2,
+        );
+        let mut fr = sc.frame();
+        eng.tick(t2, geom(), &cfg, &mut fr);
+        assert_eq!(
+            eng.status().flow.combo,
+            0,
+            "{label}: a kill must break the run"
+        );
+
+        let cold = t2 + Duration::from_secs(30);
+        eng.on_event(typed(1), cold);
+        let mut fr = sc.frame();
+        eng.tick(cold, geom(), &cfg, &mut fr);
+        assert_eq!(
+            eng.status().flow.combo,
+            0,
+            "{label}: a key born under the floor may not count"
+        );
+    }
+}
+
+#[test]
+fn flow_draws_nothing_of_its_own() {
+    let cfg = config();
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let rows = flow_run(&mut eng, &mut sc, t0, 44, 83);
+    assert!(
+        rows.last().expect("keys").1.open(),
+        "the fixture must reach flow first"
+    );
+
+    let last_key = t0 + Duration::from_millis(83) * 44;
+    let mut dark_from = None;
+    let mut t = last_key;
+    while t < last_key + Duration::from_secs(5) {
+        t += TICK;
+        sc.under.clear();
+        sc.out.clear();
+        sc.halos.clear();
+        sc.cues.clear();
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        let fp = fr.fp;
+        let empty =
+            sc.under.is_empty() && sc.out.is_empty() && sc.halos.is_empty() && sc.cues.is_empty();
+        match dark_from {
+            None if fp == 0 && empty => dark_from = Some(t),
+            None => {}
+            Some(from) => {
+                assert_eq!(
+                    fp,
+                    0,
+                    "an OPEN theme lit a frame with no keystroke behind it, {:.3} s after the glass went dark",
+                    t.saturating_duration_since(from).as_secs_f32()
+                );
+                assert!(empty, "an OPEN theme wrote a quad with no key behind it");
+                assert!(
+                    !eng.needs_frame_cadence(),
+                    "an OPEN theme held the host awake"
+                );
+            }
+        }
+    }
+    assert!(
+        dark_from.is_some(),
+        "the glass must go dark inside five seconds"
+    );
+    let held = eng.status().flow;
+    assert!(
+        held.open() && held.heat == 1.0,
+        "the run is unbroken through the silence — that is what an agent holds its turn on: {held:?}"
+    );
+    assert!(
+        eng.next_change_deadline(t).is_none(),
+        "an OPEN theme names a deadline over dark glass"
+    );
+}
+
+fn exit_sample(eng: &mut Engine, now: Instant) -> (i64, i64) {
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(now, geom(), &config(), &mut fr);
+    let fp = fr.fp;
+    let visible = fp != 0
+        || !sc.under.is_empty()
+        || !sc.out.is_empty()
+        || !sc.halos.is_empty()
+        || !sc.beams.is_empty();
+    let active = eng.needs_frame_cadence() || eng.next_change_deadline(now).is_some();
+    (i64::from(visible), i64::from(active))
+}
+
+type ExitFault = fn(&mut Engine, Instant);
+
+type TypingShape = fn(&mut Engine, Instant) -> Instant;
+
+fn no_exit_fault(_: &mut Engine, _: Instant) {}
+
+fn callback_relative_swoosh(eng: &mut Engine, late: Instant) {
+    eng.ribbon.restart_unobserved_swooshes(late);
+}
+
+fn exit_sampling_walk(
+    model: &aterm_spec::derive::Model,
+    fault: ExitFault,
+) -> Result<usize, String> {
+    let shapes: [(&str, TypingShape); 3] = [
+        ("one key", |eng, t0| {
+            blank_row(eng, 2);
+            eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+            tick_at(eng, t0);
+            type_key_at(eng, t0 + Duration::from_millis(100), 2)
+        }),
+        ("a slow word", three_typed_cells),
+        ("a flow run", |eng, t0| {
+            flow_run(eng, &mut Scratch::default(), t0, 44, 83);
+            t0 + Duration::from_millis(83) * 44
+        }),
+    ];
+    let mut observed = 0usize;
+    for (shape, type_it) in shapes {
+        for silence in [5u64, 30, 600] {
+            let at = |state: &aterm_spec::interp::State| format!("{shape}, {silence} s: {state:?}");
+            let mut eng = engaged();
+            let last = type_it(&mut eng, Instant::now());
+            let (visible, active) = exit_sample(&mut eng, last);
+            let lit = std::collections::BTreeMap::from([
+                ("logical_done", 0),
+                ("sampled", 0),
+                ("visible", visible),
+                ("active", active),
+            ]);
+            if lit != model.init_state() {
+                return Err(format!(
+                    "the last key does not leave a live ribbon: {}",
+                    at(&lit)
+                ));
+            }
+            let mut elapsed = lit.clone();
+            elapsed.insert("logical_done", 1);
+            if model.successors("ElapseDone", &lit) != vec![elapsed.clone()] {
+                return Err(format!(
+                    "the silence is not the model's ElapseDone: {}",
+                    at(&lit)
+                ));
+            }
+            let late = last + Duration::from_secs(silence);
+            fault(&mut eng, late);
+            let (visible, active) = exit_sample(&mut eng, late);
+            let mut sampled = elapsed.clone();
+            sampled.insert("sampled", 1);
+            sampled.insert("visible", visible);
+            sampled.insert("active", active);
+            let expected = model.successors("ObserveDone", &elapsed);
+            if expected != vec![sampled.clone()] {
+                return Err(format!(
+                    "real ObserveDone took {} to {sampled:?}, the model's ObserveDone to \
+                     {expected:?}",
+                    at(&elapsed)
+                ));
+            }
+            observed += 1;
+        }
+    }
+    Ok(observed)
+}
+
+#[test]
+fn a_late_tick_samples_the_settled_exit_swoosh() {
+    let model = aterm_models_effects::rainbow_exit_sampling_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let observed = exit_sampling_walk(&model, no_exit_fault).unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(observed, 9, "three typing shapes, three silences each");
+    let refused = exit_sampling_walk(&model, callback_relative_swoosh)
+        .expect_err("the healthy model must refuse a callback-relative swoosh");
+    assert!(refused.contains("real ObserveDone"), "{refused}");
+    exit_sampling_walk(&buggy, callback_relative_swoosh).unwrap_or_else(|why| {
+        panic!("the buggy model must describe the callback-relative swoosh: {why}")
+    });
+    exit_sampling_walk(&buggy, no_exit_fault)
+        .expect_err("the shipped engine must not conform to the callback-relative model");
+}
+
+fn live_cell(eng: &Engine, row: u16, col: u16) -> Option<ribbon::Cell> {
+    eng.ribbon
+        .cells()
+        .iter()
+        .find(|c| c.row == row && c.col == col && c.retract_at.is_none())
+        .copied()
+}
+
+fn typo_script(erase_after: u64, deletes: u16, fix_after: u64) -> (Vec<(u64, Event)>, u64, u64) {
+    let mut out = Vec::new();
+    let mut col = 4u16;
+    for k in 0..8u64 {
+        out.push((15 * k, typed(1)));
+        out.push((15 * k, mv((3, col), (3, col + 1), Licence::Typed)));
+        col += 1;
+    }
+    let erase = 15 * 7 + erase_after;
+    let mut last_erase = erase;
+    for d in 0..deletes {
+        last_erase = erase + 15 * u64::from(d);
+        out.push((last_erase, Event::Erase));
+        out.push((last_erase, mv((3, col), (3, col - 1), Licence::Typed)));
+        col -= 1;
+    }
+    let fix = last_erase + fix_after;
+    out.push((fix, typed(1)));
+    out.push((fix, mv((3, col), (3, col + 1), Licence::Typed)));
+    (out, last_erase, fix)
+}
+
+#[test]
+fn a_typo_fixed_within_a_breath_is_born_at_the_momentum_it_interrupted() {
+    for (label, erase_after, deletes, fix_after) in [
+        ("one-slot fix", 15u64, 1u16, 15u64),
+        ("500 ms fix", 15, 1, 60),
+        ("250 ms pause, two deletes", 30, 2, 15),
+    ] {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let (sched, erase, fix) = typo_script(erase_after, deletes, fix_after);
+        let first_erase = erase - 15 * (u64::from(deletes) - 1);
+        drive_ticks(&mut eng, &mut sc, t0, 0..=first_erase - 1, &sched);
+        let interrupted = eng.spine().birth_disp();
+        drive_ticks(&mut eng, &mut sc, t0, first_erase..=erase, &sched);
+        let fix_col = 12 - deletes;
+        assert!(
+            live_cell(&eng, 3, fix_col).is_none(),
+            "{label}: the erased cell is retracting on the erase frame (T5)"
+        );
+        let retracting = eng
+            .ribbon
+            .cells()
+            .iter()
+            .find(|c| c.row == 3 && c.col == fix_col)
+            .copied()
+            .expect("the erased cell is still on glass, retracting");
+        assert_eq!(
+            retracting.retract_at,
+            Some(t0 + TICK * u32::try_from(erase).expect("short")),
+            "{label}: the erased cell's retract starts on the erase edge, as before"
+        );
+        assert_eq!(
+            eng.erased,
+            (3, fix_col),
+            "{label}: the erased cell is known"
+        );
+
+        drive_ticks(&mut eng, &mut sc, t0, erase + 1..=fix, &sched);
+        let fixed =
+            live_cell(&eng, 3, fix_col).expect("the fix key owns its light on its own frame");
+        let left = live_cell(&eng, 3, fix_col - 1).expect("the neighbour is still laid");
+        assert_eq!(
+            fixed.born,
+            t0 + TICK * u32::try_from(fix).expect("short"),
+            "{label}: frame-0 — the fix cell is born on the fix key's frame"
+        );
+        assert!(
+            fixed.birth_disp >= interrupted - 1e-4,
+            "{label}: born at {:.4}, the delete interrupted {interrupted:.4} — a {:.4} dip of the birth spine ({:.1} %); live birth_disp {:.4}",
+            fixed.birth_disp,
+            interrupted - fixed.birth_disp,
+            (interrupted - fixed.birth_disp) / interrupted * 100.0,
+            eng.spine().birth_disp()
+        );
+        assert!(
+            fixed.cov0 >= left.cov0 && fixed.life_s >= left.life_s,
+            "{label}: the fix ({:.4}, {:.3} s) is not below its left neighbour ({:.4}, {:.3} s)",
+            fixed.cov0,
+            fixed.life_s,
+            left.cov0,
+            left.life_s
+        );
+        assert!(
+            eng.mend.is_none() && eng.spine().erase_mark().is_none(),
+            "{label}: the fix spends the mark"
+        );
+    }
+}
+
+#[test]
+fn a_slow_correction_is_not_a_mend() {
+    for (label, deletes, fix_after) in [("2 s later", 1u16, 240u64), ("three deletes", 3, 15)] {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let (sched, erase, fix) = typo_script(15, deletes, fix_after);
+        let first_erase = erase - 15 * (u64::from(deletes) - 1);
+        drive_ticks(&mut eng, &mut sc, t0, 0..=first_erase - 1, &sched);
+        let interrupted = eng.spine().birth_disp();
+        drive_ticks(&mut eng, &mut sc, t0, first_erase..=fix - 1, &sched);
+        let t_fix = t0 + TICK * u32::try_from(fix).expect("short");
+        let mark = eng
+            .spine()
+            .erase_mark()
+            .expect("the mark is a value, still there");
+        assert_eq!(mark.count, u8::try_from(deletes).expect("small"));
+        assert_eq!(
+            eng.spine().mend(t_fix),
+            None,
+            "{label}: the key that comes now is not a fix"
+        );
+        drive_ticks(&mut eng, &mut sc, t0, fix..=fix, &sched);
+        let fix_col = 12 - deletes;
+        let fixed = live_cell(&eng, 3, fix_col).expect("the key still lays its cell");
+        let live = eng.spine().birth_disp();
+        assert!(
+            (fixed.birth_disp - live).abs() < 1e-6,
+            "{label}: priced live — born at {:.4}, live birth_disp {live:.4}",
+            fixed.birth_disp
+        );
+        assert!(
+            fixed.birth_disp < interrupted,
+            "{label}: and the live price ({:.4}) is below the momentum interrupted ({interrupted:.4}) — the honest re-earn",
+            fixed.birth_disp
+        );
+        assert!(
+            eng.spine().erase_mark().is_none(),
+            "{label}: the key closes the run"
+        );
+    }
+}
+
+#[test]
+fn the_mend_mark_is_a_value_not_a_timer() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let sched = [
+        (0, typed(1)),
+        (0, mv((3, 4), (3, 5), Licence::Typed)),
+        (15, Event::Erase),
+        (15, mv((3, 5), (3, 4), Licence::Typed)),
+    ];
+    let t_erase = t0 + TICK * 15;
+    let window = Duration::from_secs_f32(spine::MEND_WINDOW_S);
+    drive_ticks(&mut eng, &mut sc, t0, 0..=15, &sched);
+    let mark = eng
+        .spine()
+        .erase_mark()
+        .expect("the Backspace leaves its mark");
+
+    let mut i = 15u64;
+    let dark = loop {
+        i += 1;
+        let now = t0 + TICK * u32::try_from(i).expect("short");
+        drive_ticks(&mut eng, &mut sc, t0, i..=i, &sched);
+        if eng.fingerprint() == 0 && eng.next_change_deadline(now).is_none() {
+            break i;
+        }
+        assert!(
+            now < t_erase + window,
+            "the precondition: a lone erased key must go dark inside the mend window"
+        );
+    };
+    let t_dark = t0 + TICK * u32::try_from(dark).expect("short");
+    assert_eq!(
+        eng.spine().mend(t_dark),
+        Some(mark),
+        "the mend is still live over the dark glass"
+    );
+    assert!(!eng.needs_frame_cadence(), "…and asks for no cadence");
+    assert_eq!(
+        eng.next_change_deadline(t_dark),
+        None,
+        "…and names no deadline"
+    );
+
+    let mut mended = eng.clone();
+    let mut sc2 = Scratch::default();
+    let fix = dark + 1;
+    let fix_sched = [(fix, typed(1)), (fix, mv((3, 4), (3, 5), Licence::Typed))];
+    drive_ticks(&mut mended, &mut sc2, t0, fix..=fix, &fix_sched);
+    let cell = live_cell(&mended, 3, 4).expect("the key lays its cell");
+    let live = mended
+        .spine()
+        .disp()
+        .max(spine::DISP_PEAK_FLOOR_SHARE * mended.spine().disp_peak());
+    assert!(
+        (cell.birth_disp - mark.disp).abs() < 1e-6 && mark.disp > live + 0.01,
+        "born at {:.4}: the mark {:.4}, over a live price of {live:.4}",
+        cell.birth_disp,
+        mark.disp
+    );
+
+    let past = 15 + (window.as_micros() as u64 + 100_000).div_ceil(TICK.as_micros() as u64);
+    for j in dark + 1..=past {
+        let now = t0 + TICK * u32::try_from(j).expect("short");
+        drive_ticks(&mut eng, &mut sc, t0, j..=j, &sched);
+        assert_eq!(eng.fingerprint(), 0, "idle → zero, mark or no mark");
+        assert!(!eng.needs_frame_cadence());
+        assert_eq!(
+            eng.next_change_deadline(now),
+            None,
+            "a pending mark names no deadline (tick {j})"
+        );
+    }
+    let t_past = t0 + TICK * u32::try_from(past).expect("short");
+    assert_eq!(
+        eng.spine().erase_mark(),
+        Some(mark),
+        "the mark is a value: still there, unchanged, after the window"
+    );
+    assert_eq!(eng.spine().mend(t_past), None, "…and not a mend any more");
+}
+
+#[test]
+fn reduced_motion_lands_the_kitty_without_a_flight_or_a_flash() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(Event::ReducedMotion(true), t0);
+    eng.on_event(mv((3, 0), (3, 30), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert!(matches!(fr.companion, Some(CompanionImpulse::Land)));
+    assert_eq!(fr.caret.flare_at, None, "no flash under reduced motion");
+    assert_eq!(fr.caret.paint, 1.0, "…but the caret is still not dimmed");
+    assert_eq!(sc.cues.len(), 1);
+    assert!(matches!(sc.cues[0].kind, SoundKind::Meteor { .. }));
+}
+
+#[test]
+fn the_caret_flare_is_one_edge_that_ages_out() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(mv((3, 0), (3, 30), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.flare_at, Some(t0));
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(100), geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.flare_at, Some(t0), "live through the relax");
+    let settled = t0 + Duration::from_secs_f32(SPRING_SNAP_RESPONSE_S) + Duration::from_millis(1);
+    let mut fr = sc.frame();
+    eng.tick(settled, geom(), &cfg, &mut fr);
+    assert_eq!(
+        fr.caret.flare_at, None,
+        "cleared once spring-snap has settled"
+    );
+}
+
+#[test]
+fn the_caret_paint_is_the_display_spine_floored_by_the_landing_relight() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let ms = Duration::from_millis;
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.paint, 0.0, "idle: nothing lit, nothing landed");
+
+    let mut t = t0;
+    let mut while_typing = 0.0;
+    for _ in 0..30 {
+        t += ms(30);
+        eng.on_event(typed(1), t);
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        while_typing = fr.caret.paint;
+    }
+    let typing = eng.momentum_display();
+    assert!(typing > 0.3, "sustained typing lit the spine: {typing}");
+    assert_eq!(while_typing, typing, "while typing, paint is the spine");
+
+    let quiet = t + ms(220);
+    let mut fr = sc.frame();
+    eng.tick(quiet, geom(), &cfg, &mut fr);
+    let disp = eng.momentum_display();
+    assert!(disp < typing, "the release is under way");
+    assert_eq!(fr.caret.paint, disp, "paint is the spine, to the bit");
+    assert_eq!(eng.caret_paint(quiet), disp, "the pure read agrees");
+    assert!(
+        disp >= 0.7 * typing,
+        "220 ms into a τ 0.85 s release keeps ≥ 70 %: {disp} of {typing}"
+    );
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    eng.on_event(typed(1), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0 + ms(16), geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.paint, eng.momentum_display());
+    assert!(fr.caret.paint < 0.5, "one key is not a landing");
+
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let land = t0 + ms(1);
+    eng.on_event(mv((3, 1), (3, 40), Licence::Nav), land);
+    let mut fr = sc.frame();
+    eng.tick(land, geom(), &cfg, &mut fr);
+    assert_eq!(eng.momentum_display(), 0.0, "a jump builds no momentum");
+    assert_eq!(fr.caret.paint, 1.0, "never dimmed at the destination");
+
+    let hold = Duration::from_secs_f32(SPRING_SNAP_RESPONSE_S);
+    let mut fr = sc.frame();
+    eng.tick(land + hold - ms(1), geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.paint, 1.0, "held through the flare's relax");
+
+    let mut fr = sc.frame();
+    eng.tick(land + hold + hold, geom(), &cfg, &mut fr);
+    assert!(
+        (fr.caret.paint - 0.5).abs() < 1e-4,
+        "half one constant after the hold: {}",
+        fr.caret.paint
+    );
+    assert!(
+        fr.caret.paint >= eng.momentum_display(),
+        "the re-light is a floor under the spine, never a ceiling"
+    );
+
+    let dead = land + Duration::from_secs_f32(RELIGHT_LIFE_S) + ms(1);
+    let mut fr = sc.frame();
+    eng.tick(dead, geom(), &cfg, &mut fr);
+    assert_eq!(fr.caret.paint, 0.0, "back to the bare spine at its life");
+    assert_eq!(eng.caret_paint(dead), 0.0);
+}
+
+#[test]
+fn delight_earns_one_hero_that_chimes_only_with_a_token() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let ms = Duration::from_millis;
+
+    let rows = [3u16, 6, 9, 12];
+    for (k, &row) in rows.iter().enumerate() {
+        let at = t0 + ms(k as u64);
+        blank_row(&mut eng, row - 1);
+        eng.earn_hero(at, row, 5);
+        let mut fr = sc.frame();
+        eng.tick(at, geom(), &cfg, &mut fr);
+        assert!(
+            matches!(fr.companion, Some(CompanionImpulse::Delight)),
+            "the frame carries the pose"
+        );
+        eng.take_companion_impulse();
+        assert_eq!(
+            eng.status().stars as usize,
+            k + 1,
+            "an earned hero is always born (delight {k})"
+        );
+    }
+    assert_eq!(
+        sc.cues.len(),
+        3,
+        "three tokens, three glints, the fourth silent"
+    );
+    for (cue, _) in sc.cues.iter().zip(rows) {
+        assert!(matches!(cue.kind, SoundKind::Stardust { .. }));
+        assert_eq!(cue.col, 5, "the glint sits at its star's column");
+    }
+}
+
+#[test]
+fn a_reported_bar_mints_its_fan_and_a_withdrawn_one_mints_nothing() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut sc = Scratch::default();
+
+    let mut eng = engaged();
+    for row in 0..26u16 {
+        blank_row(&mut eng, row);
+    }
+    eng.on_event(mv((3, 5), (3, 6), Licence::Typed), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    let before = eng.status().stars;
+    eng.party(
+        t0 + Duration::from_millis(1),
+        crate::kitty_sing::BAR_FAN_CAP,
+        true,
+    );
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(2), geom(), &cfg, &mut fr);
+    let after = eng.status().stars;
+    assert!(
+        after > before,
+        "the host's bar minted NOTHING: stars {before} -> {after}"
+    );
+
+    let mut eng = engaged();
+    for row in 0..26u16 {
+        blank_row(&mut eng, row);
+    }
+    eng.on_event(mv((3, 5), (3, 6), Licence::Typed), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    eng.party(
+        t0 + Duration::from_millis(1),
+        crate::kitty_sing::BAR_FAN_CAP,
+        true,
+    );
+    eng.reset();
+    for row in 0..26u16 {
+        blank_row(&mut eng, row);
+    }
+    eng.on_event(
+        mv((9, 40), (9, 41), Licence::Typed),
+        t0 + Duration::from_millis(2),
+    );
+    let before = eng.status().stars;
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(3), geom(), &cfg, &mut fr);
+    assert_eq!(
+        eng.status().stars,
+        before,
+        "a bar banked before a space cut fanned into the new space"
+    );
+
+    let mut eng = engaged();
+    for row in 0..26u16 {
+        blank_row(&mut eng, row);
+    }
+    eng.party(t0, crate::kitty_sing::BAR_FAN_CAP, true);
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(1), geom(), &cfg, &mut fr);
+    assert_eq!(
+        eng.status().stars,
+        0,
+        "a bar laid before the caret was ever observed"
+    );
+}
+
+#[test]
+fn an_unprobed_sky_bears_no_star() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    assert!(eng.probe().is_empty());
+    eng.earn_hero(t0, 3, 5);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(eng.status().stars, 0, "unknown → no star");
+    assert!(sc.cues.is_empty(), "…and no glint for a star not born");
+
+    blank_row(&mut eng, 2);
+    eng.earn_hero(t0 + Duration::from_millis(1), 3, 5);
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(1), geom(), &cfg, &mut fr);
+    assert_eq!(eng.status().stars, 1, "probed blank → born");
+}
+
+#[test]
+fn a_band_move_moves_the_caret_with_its_band_and_keeps_the_spine() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let g = geom();
+    let ch = g.ch as u16;
+    let ms = Duration::from_millis;
+    let lay = |eng: &mut Engine| {
+        for row in 2..=4 {
+            blank_row(eng, row);
+        }
+        let mut sc = Scratch::default();
+        for k in 0..6u16 {
+            let at = t0 + ms(80 * u64::from(k));
+            eng.on_event(mv((3, k), (3, k + 1), Licence::Typed), at);
+            eng.on_event(typed(1), at);
+            let mut fr = sc.frame();
+            eng.tick(at, g, &cfg, &mut fr);
+        }
+    };
+    let mut eng = engaged();
+    lay(&mut eng);
+    let t_last = t0 + ms(400);
+    let disp_before = eng.status().disp;
+    assert!(disp_before > 0.0, "fixture: the hand earned momentum");
+    let field_before = eng.field_at(3, 5).expect("fixture: the cell is laid");
+    assert_eq!(eng.caret, (3, 6));
+    eng.erased = (3, 2);
+    eng.earned.push(((3, 4), t_last));
+    eng.earned.push(((10, 4), t_last));
+    eng.earned.push(((20, 4), t_last));
+
+    eng.translate_band(2, 10, 1, ch, 0);
+
+    assert_eq!(eng.caret, (4, 6), "the caret rides its band");
+    assert_eq!(eng.erased, (4, 2), "so does the erased cell");
+    assert_eq!(
+        eng.earned.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        vec![(4, 4), (20, 4)],
+        "a hero owed inside the band moves, one outside it stays, one pushed past the edge is owed nowhere"
+    );
+    assert_eq!(
+        eng.field_at(4, 5),
+        Some(field_before),
+        "the field moved with its cell"
+    );
+    assert_eq!(eng.field_at(3, 5), None, "the vacated cell answers nothing");
+    assert_eq!(eng.status().disp, disp_before, "a transform ticks nothing");
+    let t1 = t_last + ms(8);
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(t1, g, &cfg, &mut fr);
+    let disp_after = eng.status().disp;
+    assert!(
+        disp_after > 0.0 && (disp_after - disp_before).abs() < 0.05,
+        "the spine kept going across the band move: {disp_before} → {disp_after}"
+    );
+    assert!(
+        eng.ribbon_segments() >= 1,
+        "the ribbon is lit on the moved row"
+    );
+
+    let mut reset = engaged();
+    lay(&mut reset);
+    reset.reset();
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    reset.tick(t1, g, &cfg, &mut fr);
+    assert_eq!(
+        reset.status().disp,
+        0.0,
+        "the reset is what the owner saw: 0.99 → 0"
+    );
+
+    eng.translate_band(20, 30, 1, ch, 0);
+    assert_eq!(eng.caret, (4, 6));
+    assert_eq!(eng.field_at(4, 5), Some(field_before));
+    eng.translate_band(2, 4, 1, ch, 0);
+    assert_eq!(
+        eng.caret,
+        (4, 6),
+        "a position saturates; it cannot be dropped"
+    );
+    assert_eq!(eng.field_at(4, 5), None);
+    assert_eq!(eng.field_at(5, 5), None, "nothing is parked past the edge");
+    let mut idle = Engine::new();
+    idle.caret = (3, 3);
+    idle.translate_band(2, 10, 1, ch, 0);
+    assert_eq!(idle.caret, (3, 3));
+    eng.translate_band(5, 4, 1, ch, 0);
+    eng.translate_band(2, 10, 0, ch, 0);
+    assert_eq!(eng.caret, (4, 6));
+}
+
+#[test]
+fn a_scroll_moves_every_live_star_and_the_caret_with_the_viewport() {
+    for dark_theme in [true, false] {
+        scroll_moves_every_mark(&Config {
+            dark_theme,
+            ..config()
+        });
+    }
+}
+
+fn scroll_moves_every_mark(cfg: &Config) {
+    let theme = if cfg.dark_theme { "dark" } else { "light" };
+    let t0 = Instant::now();
+    let g = geom();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let ms = Duration::from_millis;
+
+    blank_row(&mut eng, 2);
+    eng.earn_hero(t0, 3, 5);
+    eng.on_event(mv((3, 0), (3, 6), Licence::Typed), t0);
+    eng.on_event(typed(6), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, g, cfg, &mut fr);
+    let t0 = t0 + ms(1);
+    eng.on_event(mv((3, 6), (3, 5), Licence::Nav), t0);
+    let mut sc = Scratch::default();
+    let mut fr = sc.frame();
+    eng.tick(t0, g, cfg, &mut fr);
+    let live = eng.status().stars;
+    assert!(live >= 1, "{theme}: the earned hero is on glass");
+    let quads: Vec<(u16, u16)> = sc.out.iter().map(|q| (q.row, q.y)).collect();
+    let halos: Vec<(u16, u16, u16)> = sc.halos.iter().map(|a| (a.row, a.y, a.cy)).collect();
+    if cfg.dark_theme {
+        assert!(
+            !quads.is_empty(),
+            "{theme}: the star and the hot edge wrote additive quads"
+        );
+    } else {
+        assert!(!halos.is_empty(), "{theme}: the ink fork wrote its halos");
+    }
+    let t_caret = eng.field();
+    assert_eq!(
+        eng.field_at(3, 5),
+        Some(t_caret),
+        "the caret sits on a laid cell, so field() is that cell's t"
+    );
+    assert_ne!(
+        eng.field_at(3, 4),
+        eng.field_at(3, 5),
+        "the two laid cells differ, so a stale caret would read the other"
+    );
+
+    eng.translate_scroll(1, g.ch as u16);
+    let mut sc2 = Scratch::default();
+    let mut fr = sc2.frame();
+    eng.tick(t0, g, cfg, &mut fr);
+    assert_eq!(
+        eng.status().stars,
+        live,
+        "{theme}: one row up keeps every star"
+    );
+    let ch = g.ch as u32;
+    let quads2: Vec<(u16, u16)> = sc2.out.iter().map(|q| (q.row, q.y)).collect();
+    let halos2: Vec<(u16, u16, u16)> = sc2.halos.iter().map(|a| (a.row, a.y, a.cy)).collect();
+    assert_eq!(quads.len(), quads2.len(), "{theme}: every quad survived");
+    assert_eq!(halos.len(), halos2.len(), "{theme}: every halo survived");
+    for (b, a) in quads.iter().zip(&quads2) {
+        assert_eq!(a.0 + 1, b.0, "{theme}: every quad moved up one row");
+        assert_eq!(
+            u32::from(a.1) + ch,
+            u32::from(b.1),
+            "{theme}: …by exactly ch px"
+        );
+    }
+    for (b, a) in halos.iter().zip(&halos2) {
+        assert_eq!(a.0 + 1, b.0, "{theme}: every halo moved up one row");
+        assert_eq!(
+            u32::from(a.1) + ch,
+            u32::from(b.1),
+            "{theme}: …its band by exactly ch px"
+        );
+        assert_eq!(
+            u32::from(a.2) + ch,
+            u32::from(b.2),
+            "{theme}: …and its centre with it"
+        );
+    }
+    assert_eq!(
+        eng.field(),
+        t_caret,
+        "{theme}: the caret moved with its cell: field() still reads the same t"
+    );
+    assert_eq!(eng.field_at(2, 5), Some(t_caret));
+
+    eng.translate_scroll(g.rows as u16, g.ch as u16);
+    let mut fr = sc2.frame();
+    eng.tick(t0 + ms(2), g, cfg, &mut fr);
+    assert_eq!(
+        eng.status().stars,
+        0,
+        "{theme}: a star that left the grid is dropped"
+    );
+    assert_eq!(eng.status().cells, 0, "{theme}: so is the ribbon");
+}
+
+#[test]
+fn a_hide_is_taken_by_one_frame_and_an_un_taken_one_is_dropped_by_a_reset_or_a_curtain() {
+    let cfg = config();
+    let ms = |base: Instant, ms: u64| base + Duration::from_millis(ms);
+    let drawn = |eng: &mut Engine, at: Instant| -> usize {
+        let mut sc = Scratch::default();
+        let mut f = sc.frame();
+        eng.tick(at, geom(), &cfg, &mut f);
+        f.under.len()
+    };
+
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    assert!(drawn(&mut eng, ms(t, 8)) > 0, "fixture: a band is drawn");
+    eng.hide_next_frame();
+    assert!(eng.hide_armed());
+    let cells = eng.status().cells;
+    assert_eq!(
+        drawn(&mut eng, ms(t, 16)),
+        0,
+        "the hidden frame writes nothing"
+    );
+    assert_eq!(
+        (eng.status().quads, eng.fingerprint(), eng.status().cells),
+        (0, 0, cells),
+        "…reports nothing written, and keeps every cell"
+    );
+    assert!(!eng.hide_armed(), "…and the tick took the arm");
+    assert!(drawn(&mut eng, ms(t, 24)) > 0, "the next frame draws again");
+
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    assert!(drawn(&mut eng, ms(t, 8)) > 0);
+    eng.hide_next_frame();
+    eng.reset();
+    assert!(!eng.hide_armed(), "a reset drops an un-taken hide");
+
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    assert!(drawn(&mut eng, ms(t, 8)) > 0);
+    eng.hide_next_frame();
+    eng.curtain(ms(t, 12));
+    assert!(!eng.hide_armed(), "a curtain drops an un-taken hide");
+    assert!(
+        !eng.caret_known,
+        "a curtain forgets the caret: it is learned from the next observed move"
+    );
+    assert!(
+        drawn(&mut eng, ms(t, 20)) > 0,
+        "the curtain's first frame was eaten by a hide armed before it"
+    );
+}
+
+#[test]
+fn a_falling_curtain_is_reported_drawn_on_every_frame_it_composites() {
+    let cfg = config();
+    let ms = |base: Instant, ms: u64| base + Duration::from_millis(ms);
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let quads = |eng: &mut Engine, at: Instant| -> (usize, bool) {
+        let mut sc = Scratch::default();
+        let mut f = sc.frame();
+        eng.tick(at, geom(), &cfg, &mut f);
+        let ink = f.under.iter().any(|q| {
+            ribbon::reads_as_ink(aterm_render::over_premul(cfg.theme_bg, q.color, q.alpha))
+        });
+        (f.under.len(), ink)
+    };
+    assert!(quads(&mut eng, ms(t, 8)).1);
+    let fell = ms(t, 16);
+    eng.curtain(fell);
+    let mut lied = Vec::new();
+    let mut honest = 0;
+    let mut covered = 0;
+    for at in (0..=240u64).step_by(8) {
+        let (n, ink) = quads(&mut eng, ms(fell, at));
+        let drawn = eng.ribbon_drawn();
+        let left = eng.curtain_left_ms(ms(fell, at));
+        if n > 0 {
+            assert!(
+                left.is_some(),
+                "+{at} ms: {n} quads composited and the row says no curtain is falling"
+            );
+        }
+        if ink {
+            if drawn == 0 {
+                lied.push((at, n));
+            } else {
+                honest += 1;
+            }
+            if eng.ribbon_segments() == 0 {
+                covered += 1;
+                assert!(
+                    left.is_some_and(|ms| ms > 0),
+                    "+{at} ms: the claim is at zero over a visible band and the row does \
+                     not say a curtain is why"
+                );
+            }
+        }
+    }
+    assert!(
+        honest >= 10,
+        "the sweep never saw a visible curtain frame ({honest})"
+    );
+    assert!(
+        lied.is_empty(),
+        "the row reported `ribbon_drawn=0` on frames whose own pixels read as band ink: \
+         {lied:?}"
+    );
+    assert!(
+        covered >= 2,
+        "the sweep never reached the window the defect lives in: \
+         {covered} frames with the claim at zero over a visible band"
+    );
+}
+
+#[test]
+fn a_style_switch_drops_an_unticked_event_and_never_a_minted_cue() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+
+    eng.on_event(mv((3, 10), (3, 15), Licence::Nav), t0);
+    assert!(
+        eng.drain_sound_cues().next().is_none(),
+        "nothing is minted on the edge"
+    );
+    eng.set_engaged(false);
+    assert!(eng.drain_sound_cues().next().is_none());
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert!(sc.cues.is_empty(), "the unticked hop went with the switch");
+    eng.set_engaged(true);
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(1), geom(), &cfg, &mut fr);
+    assert!(sc.cues.is_empty(), "…and does not resurface on re-engage");
+    assert_eq!(eng.status().stars, 0, "nor does its light");
+
+    eng.on_event(
+        mv((3, 10), (3, 15), Licence::Nav),
+        t0 + Duration::from_millis(2),
+    );
+    let mut fr = sc.frame();
+    eng.tick(t0 + Duration::from_millis(2), geom(), &cfg, &mut fr);
+    assert_eq!(sc.cues.len(), 1, "the ticked hop rode out on its frame");
+    assert!(
+        eng.drain_sound_cues().next().is_none(),
+        "the frame is the one sink: nothing is left for the drain"
+    );
+    eng.set_engaged(false);
+    assert!(eng.drain_sound_cues().next().is_none());
+}
+
+const fn cat(row: u16, col: f32, settled: bool, purr: f32) -> companion::PetOnGlass {
+    companion::PetOnGlass {
+        col,
+        width: 6.0,
+        row,
+        settled,
+        purr,
+        contented: false,
+    }
+}
+
+#[test]
+fn the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+
+    eng.on_event(mv((3, 0), (3, 40), Licence::Nav), t0);
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    let imp = fr.companion.expect("the spawn frame carries the impulse");
+
+    assert_eq!(eng.meteor.live.len(), 1, "the jump must have flown");
+    let arrival = eng.meteor.live[0].arrival();
+    let flight = arrival.saturating_duration_since(t0);
+    assert!(
+        (60..=120).contains(&flight.as_millis()),
+        "fixture: T must be a real flight, got {flight:?}"
+    );
+
+    let offer = eng.pet_offer(geom(), Some(cat(3, 12.0, true, 0.4)));
+    assert_eq!(
+        offer.perk_at,
+        Some(arrival),
+        "the perk edge must be the meteor's own arrival edge"
+    );
+    assert_ne!(
+        offer.perk_at,
+        Some(t0),
+        "the perk is the LANDING's instant, never the launch's"
+    );
+
+    let mut t = t0;
+    let mut pinned = None;
+    for _ in 0..16 {
+        t += Duration::from_millis(8);
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        if let Some(l) = eng.meteor.landings.first() {
+            pinned = Some(l.pin.at);
+            break;
+        }
+    }
+    assert_eq!(
+        pinned,
+        Some(arrival),
+        "the landing pin is born on the arrival edge"
+    );
+    assert_eq!(
+        offer.perk_at, pinned,
+        "the pet's perk and the landing pin must be the SAME instant"
+    );
+    assert!(
+        eng.caret_seam.flare_at.is_some() || eng.paint_at.is_some(),
+        "fixture: the caret's own edge is live for the same landing"
+    );
+
+    assert_eq!(
+        companion::impulse_for(companion::Body::Pet, imp),
+        companion::BodyImpulse::Perk { at: arrival }
+    );
+
+    assert_eq!(eng.pet_offer(geom(), None).perk_at, Some(arrival));
+
+    let mut slow = engaged();
+    let mut sc2 = Scratch::default();
+    let reduced = Config {
+        reduced_motion: true,
+        ..config()
+    };
+    slow.on_event(mv((3, 0), (3, 40), Licence::Nav), t0);
+    let mut fr2 = sc2.frame();
+    slow.tick(t0, geom(), &reduced, &mut fr2);
+    assert!(matches!(fr2.companion, Some(CompanionImpulse::Land)));
+    assert_eq!(
+        slow.pet_offer(geom(), Some(cat(3, 12.0, true, 0.4)))
+            .perk_at,
+        None,
+        "a landing with no flight behind it is a pose, not an edge"
+    );
+}
+
+#[test]
+fn a_gold_star_near_a_contented_cat_is_offered_and_caught() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = engaged();
+    let mut sc = Scratch::default();
+    let ms = Duration::from_millis;
+    blank_row(&mut eng, 2);
+
+    let mut gold_col = None;
+    for col in (6u16..90).step_by(4) {
+        let at = t0 + ms(u64::from(col));
+        blank_row(&mut eng, 2);
+        eng.earn_hero(at, 3, col);
+        let mut fr = sc.frame();
+        eng.tick(at, geom(), &cfg, &mut fr);
+        if eng
+            .stardust
+            .live_iter()
+            .any(|s| s.gold && s.class == stardust::StarClass::M1)
+        {
+            gold_col = Some((col, at));
+            break;
+        }
+    }
+    let (col, born_at) = gold_col.expect("fixture: the deal must produce a gold m1");
+    let stars_before = eng.status().stars;
+    assert!(stars_before >= 1);
+
+    let near = cat(3, f32::from(col) + 4.0, true, 0.4);
+    let offer = eng.pet_offer(geom(), Some(near));
+    let star = offer.catch.expect("a gold m1 in reach is offered");
+    assert_eq!(star.born, born_at, "the offer names the star's own edge");
+    assert!(
+        near.columns_to(star.col) <= companion::CATCH_REACH_CELLS,
+        "the offered star must be inside the reach it was offered under"
+    );
+
+    assert_eq!(
+        eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 4.0, false, 0.4)))
+            .catch,
+        None,
+        "a cat that is not settled is offered nothing"
+    );
+    assert_eq!(
+        eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 4.0, true, 0.0)))
+            .catch,
+        None,
+        "a cat that is not purring is offered nothing"
+    );
+    assert_eq!(
+        eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 24.0, true, 0.4)))
+            .catch,
+        None,
+        "a star out of reach is not offered"
+    );
+    assert_eq!(
+        eng.pet_offer(geom(), Some(cat(9, f32::from(col) + 4.0, true, 0.4)))
+            .catch,
+        None,
+        "a paw reaches along its own line, not three lines up"
+    );
+
+    let paw = born_at + ms(200);
+    let others: Vec<(f32, f32, Option<stardust::Finish>)> = eng
+        .stardust
+        .live_iter()
+        .filter(|s| s.born != star.born || s.x != star.x)
+        .map(|s| (s.x, s.y, s.finish))
+        .collect();
+    let deadline_before = eng.next_change_deadline(paw);
+    assert!(eng.catch_star(star, paw), "the offered star must be there");
+
+    let caught = eng
+        .stardust
+        .live_iter()
+        .find(|s| s.born == star.born && s.x == star.x && s.y == star.y)
+        .expect("the caught star is still in the pool on the paw's frame");
+    assert_eq!(
+        caught.finish,
+        Some(stardust::Finish {
+            at: paw,
+            span_s: stardust::CATCH_FINISH_MS / 1000.0,
+        }),
+        "the catch spends the star on the sky's own 40 ms finish"
+    );
+    for (x, y, finish) in &others {
+        let s = eng
+            .stardust
+            .live_iter()
+            .find(|s| s.x == *x && s.y == *y)
+            .expect("a bystander must not leave the pool");
+        assert_eq!(s.finish, *finish, "a bystander's life was shortened too");
+    }
+
+    assert!(
+        !caught.dead(paw + ms(10)),
+        "the catch is a finish, not a pop"
+    );
+    assert!(
+        caught.dead(paw + ms(40)),
+        "the caught star must be off the glass within 40 ms"
+    );
+
+    let cues = sc.cues.len();
+    let mut fr = sc.frame();
+    eng.tick(paw, geom(), &cfg, &mut fr);
+    assert!(
+        eng.status().stars <= stars_before,
+        "the catch minted a star"
+    );
+    assert_eq!(sc.cues.len(), cues, "the catch minted a sound");
+    assert_eq!(
+        eng.pet_offer(geom(), Some(near)).catch,
+        None,
+        "an already-caught star is not offered again"
+    );
+
+    if let (Some(before), Some(after)) = (deadline_before, eng.next_change_deadline(paw)) {
+        assert!(
+            after <= before,
+            "the catch may not ask for a later frame than the sky already wanted"
+        );
+    }
+
+    assert!(
+        !eng.catch_star(star, paw + ms(10)),
+        "a second catch during the finish must return false"
+    );
+    let still = eng
+        .stardust
+        .live_iter()
+        .find(|s| s.born == star.born && s.x == star.x)
+        .expect("still finishing at +10 ms");
+    assert_eq!(
+        still.finish.map(|f| f.at),
+        Some(paw),
+        "a second catch must never give the star more time"
+    );
+    assert!(
+        !eng.catch_star(star, paw + ms(300)),
+        "a catch after the star died must return false"
+    );
+}
+
+#[test]
+fn the_fingerprint_folds_only_this_ticks_own_marks() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut eng = Engine::new();
+    eng.set_engaged(true);
+    let mut sc = Scratch::default();
+    sc.out.push(GlowQuad {
+        row: 2,
+        x: 40,
+        y: 40,
+        w: 3,
+        h: 3,
+        color: 0x0011_2233,
+        alpha: 0,
+        color2: 0x0011_2233,
+        alpha2: 0,
+    });
+    let mut fr = sc.frame();
+    eng.tick(t0, geom(), &cfg, &mut fr);
+    assert_eq!(fr.fp, 0, "a foreign quad is not v2's light");
+    assert_eq!(sc.out.len(), 1, "and v2 must not disturb it");
+}
+
+const SIM_MIN: Duration = Duration::from_millis(1);
+
+const SIM_ROW: u16 = 12;
+
+type Turn = (Instant, Option<Instant>, bool);
+
+type Ask<'a> = &'a dyn Fn(&Engine, Instant) -> Option<Instant>;
+
+fn engine_with_sky() -> Engine {
+    let mut eng = Engine::new();
+    eng.set_engaged(true);
+    let blank = vec![false; geom().cols];
+    for r in [SIM_ROW - 1, SIM_ROW, SIM_ROW + 1] {
+        eng.probe_mut().probe_row(i32::from(r), &blank);
+    }
+    eng
+}
+
+fn secs(s: f32) -> Duration {
+    Duration::from_secs_f32(s)
+}
+
+fn prose_script(t0: Instant, keys: usize) -> Vec<(Instant, Event)> {
+    const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog and keeps on going ";
+    let mut out = Vec::with_capacity(keys * 2);
+    for k in 0..keys {
+        let at = t0 + secs(k as f32 / 12.0);
+        let ch = TEXT[k % TEXT.len()] as char;
+        let col = 4 + k as u16;
+        out.push((
+            at,
+            Event::Move {
+                from: (SIM_ROW, col),
+                to: (SIM_ROW, col + 1),
+                licence: Licence::Typed,
+                dir: Dir::Right,
+            },
+        ));
+        let class = if ch == ' ' {
+            TypedClass::Space
+        } else if ch.is_ascii_uppercase() {
+            TypedClass::Capital
+        } else {
+            TypedClass::Glyph
+        };
+        out.push((
+            at,
+            Event::Typed {
+                cells: 1,
+                shifted: class == TypedClass::Capital,
+                class,
+            },
+        ));
+    }
+    out
+}
+
+fn meteor_script(t0: Instant) -> Vec<(Instant, Event)> {
+    vec![(
+        t0,
+        Event::Move {
+            from: (SIM_ROW, 10),
+            to: (SIM_ROW, 50),
+            licence: Licence::Nav,
+            dir: Dir::Right,
+        },
+    )]
+}
+
+fn drive(
+    eng: &mut Engine,
+    cfg: &Config,
+    script: &[(Instant, Event)],
+    from: Instant,
+    until: Instant,
+    ask: Ask<'_>,
+) -> Vec<Turn> {
+    let mut sc = Scratch::default();
+    let mut turns = Vec::new();
+    let mut next = 0usize;
+    let mut now = from;
+    loop {
+        while let Some(&(at, ev)) = script.get(next)
+            && at <= now
+        {
+            eng.on_event(ev, at);
+            next += 1;
+        }
+        sc.under.clear();
+        sc.out.clear();
+        sc.halos.clear();
+        sc.cues.clear();
+        let mut fr = sc.frame();
+        eng.tick(now, geom(), cfg, &mut fr);
+        let d = ask(eng, now);
+        turns.push((now, d, eng.needs_frame_cadence()));
+        let wake = d.map(|d| d.max(now + SIM_MIN));
+        let ev = script.get(next).map(|e| e.0);
+        let Some(n) = (match (wake, ev) {
+            (Some(w), Some(e)) => Some(w.min(e)),
+            (w, e) => w.or(e),
+        }) else {
+            break;
+        };
+        if n >= until {
+            break;
+        }
+        now = n;
+    }
+    turns
+}
+
+fn arms_in(turns: &[Turn], origin: Instant, a: f32, b: f32) -> usize {
+    turns
+        .iter()
+        .filter(|(t, d, _)| d.is_some() && *t >= origin + secs(a) && *t < origin + secs(b))
+        .count()
+}
+
+#[test]
+fn a_settling_sky_asks_for_no_more_frames_than_its_light_can_show() {
+    let cfg = config();
+    let t0 = Instant::now();
+    let script = prose_script(t0, 24);
+    let last = script.last().map(|e| e.0).unwrap_or(t0);
+    let mut eng = engine_with_sky();
+    let turns = drive(&mut eng, &cfg, &script, t0, last + secs(2.6), &|e, now| {
+        e.next_change_deadline(now)
+    });
+    let budget = |a: f32, b: f32| ((b - a) * 25.0).ceil() as usize + 1;
+    let grace = arms_in(&turns, last, 0.50, 0.75);
+    assert!(
+        grace <= budget(0.50, 0.75),
+        "grace tail: {grace} arms in 250 ms (budget {})",
+        budget(0.50, 0.75)
+    );
+    let (f0, f1) = (ribbon::SWOOSH_TOTAL_S - 0.24, ribbon::SWOOSH_TOTAL_S);
+    let fade = arms_in(&turns, last, f0, f1);
+    assert!(
+        fade <= budget(f0, f1),
+        "swoosh fade: {fade} arms in 240 ms (budget {})",
+        budget(f0, f1)
+    );
+    for (t, d, _) in &turns {
+        if let Some(d) = d {
+            assert!(
+                *d >= *t + ARM_MIN,
+                "a deadline {:?} before now + 1 ms at +{:.1} ms",
+                d.saturating_duration_since(*t),
+                t.saturating_duration_since(last).as_secs_f32() * 1000.0
+            );
+        }
+    }
+    let idle_at = turns
+        .iter()
+        .find(|(t, d, _)| *t >= last && d.is_none())
+        .map(|(t, _, _)| *t)
+        .expect("the engine never reached idle");
+    assert!(
+        idle_at <= last + secs(2.5),
+        "idle only at +{:?}",
+        idle_at.saturating_duration_since(last)
+    );
+    assert!(
+        turns.iter().all(|(t, _, _)| *t <= idle_at),
+        "the sim woke after idle"
+    );
+    assert!(!eng.needs_frame_cadence());
+    assert!(eng.next_change_deadline(idle_at + secs(1.0)).is_none());
+    let st = eng.status();
+    assert_eq!((st.stars, st.cells, st.meteors), (0, 0, 0));
+}
+
+#[test]
+fn the_cadence_fold_floors_tails_and_ignores_past_edges() {
+    let now = Instant::now();
+    assert!(Cadence::at(now).take().is_none());
+    let mut c = Cadence::at(now);
+    c.edge(now - secs(0.5));
+    assert!(c.take().is_none(), "a past edge is not a next change");
+    let mut c = Cadence::at(now);
+    c.tail(0.010);
+    assert_eq!(c.take(), Some(now + TAIL_FLOOR), "a 10 ms step is floored");
+    let mut c = Cadence::at(now);
+    c.tail(0.080);
+    assert_eq!(c.take(), Some(now + secs(0.080)), "an 80 ms step stands");
+    let mut c = Cadence::at(now);
+    c.tail_at(now - secs(1.0));
+    assert_eq!(c.take(), Some(now + TAIL_FLOOR), "a past tail is the floor");
+    let mut c = Cadence::at(now);
+    c.tail(0.080);
+    c.edge(now + secs(0.030));
+    assert_eq!(
+        c.take(),
+        Some(now + secs(0.030)),
+        "an edge inside a tail wins"
+    );
+    let mut c = Cadence::at(now);
+    c.edge(now + secs(0.002));
+    c.brisk();
+    assert_eq!(
+        c.take(),
+        Some(now + FRAME_CADENCE),
+        "brisk is the next frame"
+    );
+}
+
+#[test]
+fn a_flight_asks_for_every_frame() {
+    let cfg = config();
+    let t0 = Instant::now();
+    let mut eng = engine_with_sky();
+    let flight = timing::flight(40.0);
+    let until = t0 + flight + secs(0.150);
+    let turns = drive(&mut eng, &cfg, &meteor_script(t0), t0, until, &|e, now| {
+        e.next_change_deadline(now)
+    });
+    let expect = FRAME_CADENCE.as_secs_f32();
+    assert!(
+        turns.len() >= 20,
+        "only {} turns over the flight",
+        turns.len()
+    );
+    for w in turns.windows(2) {
+        let gap = w[1].0.saturating_duration_since(w[0].0).as_secs_f32();
+        assert!(
+            (gap - expect).abs() < 1e-4,
+            "a {:.2} ms wake at +{:.1} ms; the flight asks for {:.2} ms",
+            gap * 1000.0,
+            w[0].0.saturating_duration_since(t0).as_secs_f32() * 1000.0,
+            expect * 1000.0
+        );
+    }
+    assert!(
+        turns.iter().all(|(_, _, brisk)| *brisk),
+        "seam point 8 said no cadence during the flight"
+    );
+}
+
+#[test]
+fn a_typed_fold_wraps_at_the_pane_edge_not_the_grid_edge() {
+    let t0 = Instant::now();
+    let cfg = config();
+    let mut g = geom();
+    g.cols = 100;
+    g.win_w = 900;
+    let drive = |pane: Option<(u16, u16)>| -> Engine {
+        let mut eng = engaged();
+        eng.set_pane(pane);
+        eng.on_event(mv((2, 50), (2, 51), Licence::Typed), t0);
+        eng.on_event(typed(1), t0);
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        eng.tick(t0, g, &cfg, &mut fr);
+        let fold = t0 + Duration::from_millis(20);
+        eng.on_event(typed(1), fold);
+        eng.on_event(mv((2, 51), (3, 12), Licence::Typed), fold);
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        eng.tick(fold, g, &cfg, &mut fr);
+        eng
+    };
+    let paned = drive(Some((12, 40)));
+    assert!(
+        paned.field_at(2, 51).is_some(),
+        "the fold's glyph is the pane's last cell"
+    );
+    assert!(
+        paned.field_at(2, 99).is_none(),
+        "no ribbon cell leaks into the neighbouring pane"
+    );
+    let whole = drive(None);
+    assert!(
+        whole.field_at(3, 11).is_some() && whole.field_at(2, 51).is_none(),
+        "the control: told nothing of the pane, the fold lights the cell \
+         before the caret in the neighbouring pane — the frame this law \
+         is about"
+    );
+}
+
+#[test]
+fn forty_presses_typed_into_a_stall_fit_the_ledger() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let first = t + ms(100);
+    let mut last = first;
+    for k in 0..40u64 {
+        last = first + ms(85 * k);
+        eng.on_event(typed(1), last);
+        tick_at(&mut eng, last);
+    }
+    let echo = last + ms(400);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 5,
+            col1: 45,
+        },
+        first,
+    );
+    eng.on_event(mv((3, 5), (3, 45), Licence::Typed), echo);
+    tick_at(&mut eng, echo);
+    let tally = eng.echo.tally;
+    assert_eq!(
+        (tally.spent, tally.forfeited, tally.expired),
+        (43, 0, 0),
+        "the three pre-roll presses and the forty of the batch are spent, none forfeited"
+    );
+    for col in 5..45u16 {
+        assert!(eng.field_at(3, col).is_some(), "col {col} is dark");
+    }
+}
+
+#[test]
+fn a_batch_sweep_on_the_oldest_press_clock_is_born_no_earlier_than_the_birth_floor() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let first = t + ms(100);
+    let mut last = first;
+    for k in 0..12u64 {
+        last = first + ms(85 * k);
+        eng.on_event(typed(1), last);
+        tick_at(&mut eng, last);
+    }
+    let echo = last + ms(3000);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 5,
+            col1: 17,
+        },
+        first,
+    );
+    eng.on_event(mv((3, 5), (3, 17), Licence::Typed), echo);
+    tick_at(&mut eng, echo);
+    for col in 5..17u16 {
+        assert!(
+            eng.field_at(3, col).is_some(),
+            "col {col} is dark in the echoing frame"
+        );
+    }
+    tick_at(&mut eng, echo + ms(100));
+    for col in 5..17u16 {
+        assert!(
+            eng.field_at(3, col).is_some(),
+            "col {col} is dark 100 ms after the echo"
+        );
+    }
+}
+
+#[test]
+fn a_scroll_or_a_band_move_carries_the_pre_move_caret_with_the_text_it_names() {
+    type Seam = (&'static str, fn(&mut Engine));
+    let seams: [Seam; 2] = [
+        ("scroll", |eng| eng.translate_scroll(1, geom().ch as u16)),
+        ("band", |eng| {
+            eng.translate_band(0, 10, -1, geom().ch as u16, 0)
+        }),
+    ];
+    for (seam, shift) in seams {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        blank_row(&mut eng, 2);
+        blank_row(&mut eng, 3);
+        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        eng.on_event(typed(1), t0 + ms(100));
+        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
+        shift(&mut eng);
+        tick_at(&mut eng, t0 + ms(120));
+        assert!(
+            eng.ribbon()
+                .cells()
+                .iter()
+                .any(|c| c.typing && (c.row, c.col) == (2, 4)),
+            "the key rides the {seam} with its glyph: {:?}",
+            typing_cells(&eng)
+        );
+        assert!(
+            eng.ribbon().cells().iter().all(|c| !c.typing || c.row != 3),
+            "…and nothing of it is left a row below ({seam}): {:?}",
+            typing_cells(&eng)
+        );
+    }
+}
+
+#[test]
+fn a_pre_move_caret_carried_off_the_top_is_forgotten_not_clamped() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    blank_row(&mut eng, 0);
+    blank_row(&mut eng, 3);
+    eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    eng.on_event(typed(1), t0 + ms(100));
+    eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
+    eng.translate_scroll(4, geom().ch as u16);
+    tick_at(&mut eng, t0 + ms(120));
+    assert!(
+        eng.ribbon().cells().iter().all(|c| !c.typing),
+        "the key whose row scrolled away lays nowhere — not at row 0, not \
+         on the row it was typed on: {:?}",
+        typing_cells(&eng)
+    );
+}
+
+fn typing_cells(eng: &Engine) -> Vec<(u16, u16)> {
+    eng.ribbon()
+        .cells()
+        .iter()
+        .filter(|c| c.typing)
+        .map(|c| (c.row, c.col))
+        .collect()
+}
+
+#[test]
+fn a_bridge_sweep_inserted_after_a_one_shot_move_does_not_shift_the_pre_move_caret() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    blank_row(&mut eng, 2);
+    eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    let k = t0 + ms(100);
+    eng.on_event(typed(1), k);
+    eng.on_event(mv((3, 5), (3, 20), Licence::Nav), k + ms(10));
+    eng.on_event(typed(1), k + ms(20));
+    eng.on_event(mv((3, 20), (3, 21), Licence::Typed), k + ms(30));
+    tick_at(&mut eng, k + ms(30));
+    assert_eq!(
+        eng.status().bridged,
+        1,
+        "the second glyph's unswept echo is the ledger's bridge — the insert at index 0"
+    );
+    assert!(
+        eng.field_at(3, 4).is_some(),
+        "the glyph typed before the arrow's hop replays at the caret before it"
+    );
+}
+
+#[test]
+fn a_reset_or_a_curtain_forgets_the_pre_move_caret_with_the_events_it_indexed() {
+    let ms = Duration::from_millis;
+    type Seam = (&'static str, fn(&mut Engine, Instant), u64);
+    let seams: [Seam; 2] = [
+        ("reset", |eng, _| eng.reset(), 200),
+        (
+            "curtain",
+            |eng, t0| eng.curtain(t0 + Duration::from_millis(120)),
+            900,
+        ),
+    ];
+    for (seam, forget, key_ms) in seams {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        blank_row(&mut eng, 2);
+        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        eng.on_event(typed(1), t0 + ms(100));
+        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
+        forget(&mut eng, t0);
+        let k = t0 + ms(key_ms);
+        eng.on_event(typed(1), k);
+        eng.on_event(mv((7, 0), (7, 10), Licence::Typed), k + ms(8));
+        tick_at(&mut eng, k + ms(8));
+        assert!(
+            eng.field_at(3, 4).is_none(),
+            "the key is not replayed at a caret the {seam} forgot"
+        );
+        assert!(
+            eng.field_at(7, 9).is_some(),
+            "…it lays at its own echo ({seam})"
+        );
+    }
+}
+
+#[test]
+fn a_key_typed_before_the_first_licensed_move_is_held_not_laid_at_an_unset_mirror() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    blank_row(&mut eng, 2);
+    eng.on_event(typed(1), t0);
+    eng.on_event(mv((3, 10), (5, 2), Licence::Nav), t0 + ms(10));
+    tick_at(&mut eng, t0 + ms(10));
+    assert!(
+        eng.ribbon().cells().iter().all(|c| !c.typing),
+        "nothing typed is lit — not at the unset mirror, not at the landing's neighbour: {:?}",
+        eng.ribbon()
+            .cells()
+            .iter()
+            .map(|c| (c.row, c.col, c.typing))
+            .collect::<Vec<_>>()
+    );
+    let echo = t0 + ms(30);
+    eng.on_event(
+        Event::Sweep {
+            row: 5,
+            col0: 2,
+            col1: 3,
+        },
+        t0,
+    );
+    eng.on_event(mv((5, 2), (5, 3), Licence::Typed), echo);
+    tick_at(&mut eng, echo);
+    assert!(
+        eng.field_at(5, 2).is_some(),
+        "the key's cell comes with its echo"
+    );
+}
+
+#[test]
+fn a_held_space_measures_the_word_the_composer_moves_from_its_own_cell() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    blank_row(&mut eng, 2);
+    eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+    tick_at(&mut eng, t0);
+    let mut t = t0;
+    for col in 2..4u16 {
+        t += ms(100);
+        t = type_key_at(&mut eng, t, col);
+    }
+    let space_at = t + ms(100);
+    eng.on_event(
+        Event::Typed {
+            cells: 1,
+            shifted: false,
+            class: TypedClass::Space,
+        },
+        space_at,
+    );
+    tick_at(&mut eng, space_at);
+    let echo = space_at + ms(16);
+    eng.on_event(
+        Event::Sweep {
+            row: 3,
+            col0: 4,
+            col1: 5,
+        },
+        space_at,
+    );
+    eng.on_event(mv((3, 4), (3, 5), Licence::Typed), echo);
+    tick_at(&mut eng, echo);
+    let mut t = echo;
+    for col in 5..7u16 {
+        t += ms(100);
+        t = type_key_at(&mut eng, t, col);
+    }
+    let k = t + ms(100);
+    eng.on_event(typed(1), k);
+    eng.on_event(mv((3, 7), (4, 5), Licence::Typed), k + ms(8));
+    tick_at(&mut eng, k + ms(8));
+    assert!(
+        eng.field_at(4, 2).is_some() && eng.field_at(4, 3).is_some(),
+        "the moved word's two cells are relaid"
+    );
+    assert!(
+        eng.field_at(4, 1).is_none(),
+        "the word is `cd`, two cells — not three from a Space measured one cell left"
+    );
+}
+
+#[test]
+fn the_meteor_pool_is_handed_the_hand_s_floor() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    for row in 5..=7 {
+        blank_row(&mut eng, row);
+    }
+    assert_eq!(
+        eng.meteor.hand_floor_cell(),
+        None,
+        "a pool that has seen no hand is bounded by nothing"
+    );
+
+    let mut t = t0;
+    for col in 28..43_u16 {
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + Duration::from_millis(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 6,
+                col0: col,
+                col1: col + 1,
+            },
+            t,
+        );
+        eng.on_event(mv((6, col), (6, col + 1), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        t = echo + Duration::from_millis(60);
+    }
+    assert_eq!(
+        eng.meteor.hand_floor_cell(),
+        Some((6, 28)),
+        "the typing's own leftmost column is the floor"
+    );
+
+    eng.on_event(mv((6, 43), (6, 28), Licence::Nav), t);
+    tick_at(&mut eng, t);
+    assert_eq!(
+        eng.meteor.hand_floor_cell(),
+        Some((6, 28)),
+        "the ^A's landing is the hand reaching a column, and the pool has it on \
+         the tick the flight is born"
+    );
+}
+
+#[test]
+fn curtain_updates_fingerprint_and_brisk_and_translate_scroll_carries_erased_and_earned() {
+    let t0 = Instant::now();
+    let mut eng = engaged();
+    let t = three_typed_cells(&mut eng, t0);
+    let settle = t + Duration::from_millis(60);
+    tick_at(&mut eng, settle);
+    assert_eq!(eng.fingerprint(), 1);
+    assert!(
+        !eng.needs_frame_cadence(),
+        "settled in Grace: no per-frame motion before the curtain"
+    );
+
+    eng.curtain(settle);
+    assert_eq!(
+        eng.fingerprint(),
+        1,
+        "a falling curtain over laid cells must stay live (fingerprint != 0)"
+    );
+    assert!(
+        eng.needs_frame_cadence(),
+        "a falling curtain over laid cells must immediately report brisk frame cadence"
+    );
+    assert_eq!(eng.status().cells, 3);
+
+    let mut flight_only = engaged();
+    flight_only.on_event(mv((3, 5), (10, 5), Licence::Nav), t0);
+    tick_at(&mut flight_only, t0);
+    assert!(flight_only.needs_frame_cadence());
+    flight_only.curtain(t0 + Duration::from_millis(10));
+    assert_eq!(flight_only.fingerprint(), 0);
+    assert!(!flight_only.needs_frame_cadence());
+
+    let mut sc_eng = engaged();
+    let t_end = three_typed_cells(&mut sc_eng, t0);
+    sc_eng.on_event(Event::Erase, t_end + Duration::from_millis(20));
+    sc_eng.on_event(
+        mv((3, 7), (3, 6), Licence::Typed),
+        t_end + Duration::from_millis(20),
+    );
+    tick_at(&mut sc_eng, t_end + Duration::from_millis(20));
+    assert_eq!(sc_eng.erased, (3, 6));
+    sc_eng.observe_caret((5, 2));
+    sc_eng.earn_hero(t_end + Duration::from_millis(25), 3, 6);
+    sc_eng.translate_scroll(2, 18);
+    assert_eq!(
+        sc_eng.erased,
+        (1, 6),
+        "erased cell row translates with scroll"
+    );
+    assert_eq!(
+        sc_eng.caret_seen,
+        Some((3, 2)),
+        "pending observe_caret row translates with scroll"
+    );
+    assert_eq!(
+        sc_eng.earned.first().map(|(c, _)| *c),
+        Some((1, 6)),
+        "pending earned hero cell translates with scroll"
+    );
+
+    sc_eng.note_lift(
+        ribbon::Lift {
+            origin: (4, 10),
+            landing: (4, 5),
+            dst: (3, 70),
+        },
+        Some(t_end),
+    );
+    sc_eng.note_soft_wrap(
+        ribbon::SoftWrap {
+            origin: (4, 79),
+            landing: (5, 0),
+            word_col0: 72,
+        },
+        Some(t_end),
+    );
+    sc_eng.translate_scroll(1, 18);
+    assert_eq!(
+        sc_eng.lift.map(|(l, _)| (l.origin, l.landing, l.dst)),
+        Some(((3, 10), (3, 5), (2, 70))),
+        "pending lift verdict translates with scroll"
+    );
+    assert!(
+        sc_eng.soft_wrap.is_none(),
+        "pending soft_wrap verdict is cleared by scroll"
+    );
+    sc_eng.earn_hero(t_end + Duration::from_millis(30), 3, 9);
+    sc_eng.prove_short_reanchor((3, 10), (3, 9), t_end);
+    sc_eng.lift_caret(3, 2);
+    assert_eq!(
+        sc_eng.lift.map(|(l, _)| (l.origin, l.landing, l.dst)),
+        Some(((2, 10), (2, 5), (2, 70))),
+        "lift_caret translates pending lift verdict on the lifted row"
+    );
+    assert_eq!(
+        sc_eng.earned.last().map(|(c, _)| *c),
+        Some((2, 9)),
+        "lift_caret translates pending earned hero cell on the lifted row"
+    );
+
+    sc_eng.hand_lift = Some((3, 2));
+    sc_eng.withheld_n = 1;
+    sc_eng.set_flush_clock(Some(t_end));
+    sc_eng.curtain(t_end + Duration::from_millis(40));
+    assert!(sc_eng.take_hand_lift().is_none());
+    assert_eq!(sc_eng.withheld_n, 0);
+    assert!(sc_eng.flush_clock.is_none());
+
+    sc_eng.hand_lift = Some((3, 2));
+    sc_eng.withheld_n = 1;
+    sc_eng.set_flush_clock(Some(t_end));
+    sc_eng.reset();
+    assert!(sc_eng.take_hand_lift().is_none());
+    assert_eq!(sc_eng.withheld_n, 0);
+    assert!(sc_eng.flush_clock.is_none());
+
+    let mut fold = Cadence::at(t_end);
+    fold.tail(f32::MAX);
+    assert!(fold.take().is_some());
+}

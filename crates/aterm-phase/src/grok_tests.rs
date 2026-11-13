@@ -209,7 +209,7 @@ fn the_signed_out_screen_is_grok_s_own_and_its_sign_in_wall() {
     let w = wall(&rows).expect("a sign-in wall");
     assert_eq!(
         (w.kind, w.row, w.placement),
-        (WallKind::Auth, at, Placement::Banner)
+        (WallKind::Auth, at, Placement::SignIn)
     );
     assert_eq!(w.message, "Approve in your browser to finish signing in.");
     // By its process name, and by its screen alone.
@@ -737,7 +737,6 @@ const PHASES: &[(&str, Phase, bool)] = &[
     ("turn-ended-suggestion", Phase::Idle, true),
     ("wall-401", Phase::Idle, true),
     ("wall-429", Phase::Idle, true),
-    ("wall-429-retrying", Phase::Idle, true),
     ("wall-free-usage", Phase::Idle, true),
     ("wall-free-usage-dismissed", Phase::Idle, true),
     ("wall-weekly-limit", Phase::Idle, true),
@@ -1153,5 +1152,153 @@ fn a_running_turn_reads_no_wall_from_a_turn_before() {
             .map(|w| w.kind),
         Some(WallKind::Auth),
         "CONTROL"
+    );
+}
+
+/// A WALL ROW A LATER TURN SUPERSEDED IS NO WALL: measured on 1.0.70's `resume-last` frame, where
+/// a 401's failure stands in the live zone over a later prompt, its reply and its `Worked for`
+/// row, and on the measured 401 frame with a later prompt (the review's probe: `❯ hello again with
+/// the new key`, a reply and `Worked for 1.2s`), or a `Worked for` row alone, drawn under the
+/// failure. Each reads no wall, and the idle composer under it publishes idle, never `wall:auth`.
+/// CONTROLS: the failure with a reply row of its own turn under it, or a reply row that opens
+/// with `Worked for` and no duration, is still the wall. NEGATIVE CONTROL for the mutant that
+/// reads a wall anywhere in the live zone, a later turn or not.
+#[test]
+fn a_wall_row_a_later_turn_superseded_is_no_wall() {
+    let resumed = frame("resume-last");
+    let failure = resumed
+        .iter()
+        .position(|r| r.contains("Authentication required:"))
+        .expect("PRECONDITION: the 401's failure");
+    assert!(live_from(&resumed) <= failure, "PRECONDITION: in the zone");
+    assert_eq!(wall(&resumed), None, "resume-last");
+    let r = read(Some("grok"), &resumed, None);
+    assert_eq!(
+        (r.phase, r.phase_authoritative, r.wall),
+        (Phase::Idle, true, None),
+        "resume-last: the reading"
+    );
+
+    let failed = frame("wall-401");
+    let below = failed
+        .iter()
+        .position(|r| r.contains("Authentication required:"))
+        .expect("the failure")
+        + 2;
+    let with = |extra: &[&str]| -> Vec<String> {
+        let mut rows = failed.clone();
+        rows.splice(below..below, extra.iter().map(|r| (*r).to_string()));
+        rows
+    };
+    for (what, extra) in [
+        (
+            "a later prompt, its reply and its end",
+            &[
+                "      ❯ hello again with the new key                      2:07 PM",
+                "",
+                "      Hi! I am the local lab stub, not a model.           2:07 PM",
+                "",
+                "      Worked for 1.2s",
+            ][..],
+        ),
+        (
+            "a later prompt",
+            &["      ❯ hello again with the new key"][..],
+        ),
+        ("a turn that worked", &["      Worked for 0.3s"][..]),
+    ] {
+        let rows = with(extra);
+        assert_eq!(wall(&rows), None, "{what}");
+        let r = read(Some("grok"), &rows, None);
+        assert_eq!(
+            (r.phase, r.phase_authoritative, r.wall),
+            (Phase::Idle, true, None),
+            "{what}: the reading"
+        );
+    }
+    for (what, extra) in [
+        (
+            "CONTROL: a reply row of its own turn",
+            &["      the lab stub said more"][..],
+        ),
+        (
+            "CONTROL: prose opening with Worked for",
+            &["      Worked for the lab all day"][..],
+        ),
+    ] {
+        assert_eq!(
+            wall(&with(extra)).map(|w| w.kind),
+            Some(WallKind::Auth),
+            "{what}"
+        );
+    }
+}
+
+/// THE CANCEL KEY UNDER THE BOX KEEPS A TURN FROM READING IDLE: a running turn's frame whose
+/// status row is caught redrawn (a reply's row over the box, no `[stop]` and no spinner) while the
+/// key row under the box still offers `Ctrl+c:cancel` decides nothing, never idle. NEGATIVE
+/// CONTROL for the mutant that reads idle wherever the status row has neither `[stop]` nor a
+/// spinner, whatever the key row offers.
+#[test]
+fn a_cancel_key_under_the_box_keeps_a_turn_from_reading_idle() {
+    let mut rows = frame("busy-streaming");
+    let (top, _, _) = composer_rows(&rows).expect("the box");
+    let status = rows[..top]
+        .iter()
+        .rposition(|r| worded(r))
+        .expect("the status row");
+    assert!(stops(&rows[status]), "PRECONDITION: the status row");
+    rows[status] = "     tick 10 tick 11 tick 12".to_string();
+    assert_eq!(phase(&rows), (Phase::Busy, false));
+    assert!(!read(Some("grok"), &rows, None).phase_authoritative);
+}
+
+/// THE ROWS AROUND THE BOX ARE READ PAST THE SCROLLBAR'S GUTTER: the gutter's `█` at the screen's
+/// right edge, drawn at the end of a running turn's status row or on a row of its own between that
+/// row and the box (as 1.0.70 draws it on every row its thumb covers, measured on the 401 and
+/// streaming frames), leaves the turn busy; and the key row is the first worded row under the box,
+/// so a row under it that names `Ctrl+c:cancel` (a list of the program's keys) leaves an ended
+/// turn idle. NEGATIVE CONTROLS for the mutants that read `[stop]` with the gutter's block still
+/// on the row, that take a gutter's row for the status row, and that read the cancel key off any
+/// row under the box.
+#[test]
+fn the_rows_around_the_box_are_read_past_the_scrollbars_gutter() {
+    let busy = frame("busy-streaming");
+    let (top, _, _) = composer_rows(&busy).expect("the box");
+    let status = busy[..top]
+        .iter()
+        .rposition(|r| worded(r))
+        .expect("the status row");
+    assert!(
+        crate::text::blank(&busy[status + 1]) && status + 1 < top,
+        "PRECONDITION: a blank row between the status row and the box"
+    );
+    let gutter = busy
+        .iter()
+        .find(|r| crate::text::trim(r) == "█")
+        .expect("PRECONDITION: a gutter row")
+        .clone();
+    let mut ended = busy.clone();
+    ended[status] = format!("{} █", ended[status]);
+    assert_eq!(
+        phase(&ended),
+        (Phase::Busy, true),
+        "the status row ends in the gutter"
+    );
+    let mut parted = busy.clone();
+    parted[status + 1] = gutter;
+    assert_eq!(
+        phase(&parted),
+        (Phase::Busy, true),
+        "a gutter row under the status row"
+    );
+
+    let mut listed = frame("turn-ended-empty");
+    assert_eq!(phase(&listed), (Phase::Idle, true), "PRECONDITION");
+    listed.push("  Ctrl+c:cancel  cancel the running turn".to_string());
+    assert_eq!(
+        phase(&listed),
+        (Phase::Idle, true),
+        "a row under the key row"
     );
 }

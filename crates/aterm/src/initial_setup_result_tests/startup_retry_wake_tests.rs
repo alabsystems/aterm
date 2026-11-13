@@ -35,7 +35,7 @@ fn startup_retry_wake_check_again_releases_recovery_without_another_focus_gain()
     // A reserved setup slot refuses the backend Check, while the real Check again
     // entry still accepts the forced, inert reading and wakes setup's recovery.
     let busy = take_initial_setup_slot().unwrap();
-    let checked = check_initial_setup(Plan::default());
+    let checked = check_initial_setup(Plan::default(), aterm_gui::CheckBy::Press);
     assert!(checked.reading && !checked.check);
     wait_until("the forced reading finishes", observe_idle);
     assert_eq!(aterm_gui::window_focus_gains(), focus);

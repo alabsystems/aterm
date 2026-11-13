@@ -342,10 +342,10 @@ fn the_backfill_books_a_one_login_homes_walls_the_series_holds_no_word_of() {
     assert_eq!(
         day_lines(&text),
         [
-            "  Sat Sep 13  week 100% (resets Sat Sep 13 00:00) (backfill)",
-            "  Tue Sep 16  5h 1 window, peak 100%, 1 full (backfill)",
-            "  Thu Sep 18  week 30% \u{2192} 32% (resets Tue Sep 23 00:00) \u{b7} 5h 1 window, peak 40%",
-            "  Fri Sep 19  5h 1 window, peak 100%, 1 full (backfill)",
+            "  Sat Sep 13  week 0% left (resets Sat Sep 13 00:00) (backfill)",
+            "  Tue Sep 16  5h 1 window, lowest 0% left, 1 used up (backfill)",
+            "  Thu Sep 18  week 70% \u{2192} 68% left (resets Tue Sep 23 00:00) \u{b7} 5h 1 window, lowest 60% left",
+            "  Fri Sep 19  5h 1 window, lowest 0% left, 1 used up (backfill)",
         ],
         "{text}"
     );
@@ -456,8 +456,8 @@ fn a_day_the_series_holds_by_its_row_alone_takes_no_window_of_it() {
     assert_eq!(
         day_lines(&text),
         [
-            "  Tue Sep 16  5h 1 window, peak 100%, 1 full (backfill)",
-            "  Thu Sep 18  week 30% \u{2192} 32% (resets Tue Sep 23 00:00) \u{b7} 5h 3 windows, peak 100%, 1 full",
+            "  Tue Sep 16  5h 1 window, lowest 0% left, 1 used up (backfill)",
+            "  Thu Sep 18  week 70% \u{2192} 68% left (resets Tue Sep 23 00:00) \u{b7} 5h 3 windows, lowest 0% left, 1 used up",
         ],
         "{text}"
     );

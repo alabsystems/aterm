@@ -165,11 +165,21 @@ pub fn scan(listing: &Listing<'_>, engine: Option<&Engine>, changed: Option<&[St
             {
                 continue;
             }
+            // The engine joins the link text with pathlib (`md.parent / t`), whose
+            // parse drops every "" and "." component before anything is stat'ed:
+            // `contrib/README.md/.` names the file itself, not ENOTDIR. ".." stays,
+            // as pathlib keeps it. A symlink's own target keeps the kernel's
+            // reading in `Namespace::resolve`.
+            let text = target
+                .split('/')
+                .filter(|c| !matches!(*c, "" | "."))
+                .collect::<Vec<_>>()
+                .join("/");
             let path = if target.starts_with('/') {
-                target.trim_start_matches('/').to_string()
+                text
             } else {
                 format!(
-                    "{}{target}",
+                    "{}{text}",
                     md.rsplit_once('/')
                         .map_or(String::new(), |(p, _)| format!("{p}/"))
                 )

@@ -30,7 +30,9 @@ pub mod cli_path;
 pub mod clt_mark;
 pub mod clt_shim;
 
+pub mod fleet_access;
 pub mod fleet_name;
+pub mod hidden_char;
 mod hyperlink;
 pub mod identity;
 pub mod installed_command;
@@ -116,6 +118,7 @@ pub mod paragraph_direction;
 pub mod selection;
 mod shell_blocks;
 mod shell_types;
+pub mod status_click;
 mod terminal_core;
 mod terminal_modes;
 pub mod text_shaping;
@@ -197,6 +200,19 @@ pub const DEFAULT_FOREGROUND: Rgb = Rgb::new(229, 229, 229);
 
 /// Default engine background (`#000000`).
 pub const DEFAULT_BACKGROUND: Rgb = Rgb::new(0, 0, 0);
+
+/// Whether black text has more WCAG contrast on this background than white text.
+/// Chrome and decorative surfaces share this ground-polarity decision.
+#[inline]
+#[must_use]
+pub fn bg_is_light(bg: [u8; 3]) -> bool {
+    let luminance = Rgb::new(bg[0], bg[1], bg[2]).luminance().clamp(0.0, 1.0);
+    // Black and white have luminance 0 and 1: compare their WCAG ratios after
+    // linearizing the background once, rather than once for each contrast call.
+    let black = (luminance + 0.05) / 0.05;
+    let white = 1.05 / (luminance + 0.05);
+    black > white
+}
 
 impl Rgb {
     /// Create a new RGB color.

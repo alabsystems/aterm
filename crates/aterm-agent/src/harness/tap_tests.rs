@@ -184,8 +184,8 @@ fn the_tap_names_the_console_image_beside_a_windowed_one() {
     assert_eq!(tap_image(&console, |_| false), Some(console.clone()));
 }
 
-/// The row the tap prints at [`NOW`] for a week 61% used that resets Mon 19 Oct 08:06:36 UTC.
-const WEEK_61: &str = "week 61% used \u{b7} resets Mon 08:06\n";
+/// The row the tap prints at [`NOW`] for a week 39% left that resets Mon 19 Oct 08:06:36 UTC.
+const WEEK_61: &str = "week 39% left \u{b7} resets Mon 08:06\n";
 
 /// A payload with figures writes a v1 file (0600 in a 0700 directory) and prints the week; no
 /// figures, a five-hour window alone, non-JSON, empty or oversized stdin prints [`NO_WEEK`] and
@@ -386,7 +386,7 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
     assert!(
-        stdout.contains("week 9% used\n") && !stdout.contains("5h") && !stdout.contains("7%"),
+        stdout.contains("week 91% left\n") && !stdout.contains("5h") && !stdout.contains("7%"),
         "{stdout}"
     );
     let file = state
@@ -488,7 +488,10 @@ fn a_re_report_keeps_the_first_reports_stamp() {
     precise.five_hour.as_mut().expect("five hour").pct_x10 = Some(420);
     precise.seven_day.as_mut().expect("week").pct_x10 = Some(610);
     let path = dir.join(&name);
-    assert_eq!(first_reported(&path, &precise), 1396);
+    assert_eq!(
+        first_reported(read_regular(&path).as_deref(), &precise),
+        1396
+    );
     for five in [true, false] {
         let mut moved = precise.clone();
         let window = if five {
@@ -498,8 +501,85 @@ fn a_re_report_keeps_the_first_reports_stamp() {
         }
         .expect("window");
         window.pct_x10 = Some(window.x10() + 1);
-        assert_eq!(first_reported(&path, &moved), 1406, "a tenth moved");
+        assert_eq!(
+            first_reported(read_regular(&path).as_deref(), &moved),
+            1406,
+            "a tenth moved"
+        );
     }
+}
+
+/// AN IDLE RE-REPORT WRITES NO BYTES AND STILL READS FRESH: Claude Code re-runs the tap every
+/// [`TAP_REFRESH_S`] seconds while idle with the figures the file holds, and each such run keeps
+/// the file (its inode and every byte, the first run's `dur_us` among them) and moves its
+/// modification time to now, which is the age every reader takes: the file set an hour back
+/// reads as heard again after the run. A run that reports anything new (here the API time a
+/// served turn moved) replaces the file. Negative control: a `record` that writes every reading
+/// (no `heard_again`) replaces the file on the re-report, so its inode moves.
+#[cfg(unix)]
+#[test]
+fn an_idle_re_report_moves_the_files_time_and_writes_no_bytes() {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = scratch("re-report");
+    let dir = root.path().to_path_buf();
+    let week = Some((61, 1_792_397_196));
+    let report = |api_ms: u64| {
+        let (code, line) = tap(payload(api_ms, None, week).as_bytes(), &vars(), Some(&dir));
+        assert_eq!(
+            (code, line.as_str()),
+            (std::process::ExitCode::SUCCESS, WEEK_61)
+        );
+    };
+    let path = dir.join(file_name(SID, 68537).expect("name"));
+    let seen = || {
+        let meta = std::fs::metadata(&path).expect("the reading's file");
+        let text = std::fs::read_to_string(&path).expect("its text");
+        (meta.ino(), text, meta.modified().expect("its time"))
+    };
+    report(18);
+    let (first_file, first_text, _) = seen();
+    // An hour back: the run that follows is the only thing that can make the file fresh again.
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_modified(stale))
+        .expect("set the file's time back");
+    // A process born a minute ago: older than the file's time set back, younger than a run's.
+    let born = i64::try_from(
+        (stale + std::time::Duration::from_secs(3540))
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs(),
+    )
+    .expect("seconds");
+    assert_eq!(
+        Reading::read(&dir, SID, 68537, born),
+        None,
+        "a file older than its process is not read"
+    );
+    report(18);
+    let (file, text, time) = seen();
+    assert_eq!(file, first_file, "the re-report kept the file");
+    assert_eq!(text, first_text, "and every byte of it");
+    assert!(
+        time > stale + std::time::Duration::from_secs(1800),
+        "{time:?}"
+    );
+    let (read, mtime) = Reading::read(&dir, SID, 68537, born).expect("fresh again");
+    assert_eq!((read.api_ms, read.at), (18, NOW));
+    assert!(mtime >= born, "{mtime}");
+    let names = std::fs::read_dir(&dir).expect("ls").count();
+    assert_eq!(names, 1, "no temporary is left or made");
+
+    report(31);
+    let (file, text, _) = seen();
+    assert_ne!(file, first_file, "a served turn's report replaces the file");
+    assert_ne!(text, first_text);
+    assert_eq!(
+        Reading::read(&dir, SID, 68537, born).map(|(r, _)| r.api_ms),
+        Some(31)
+    );
 }
 
 /// A WINDOW THAT ONLY DROPPED OUT AT ITS RESET IS NO NEW REPORT: Claude Code hands a window
@@ -636,7 +716,7 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
             1_792_050_000,
             Some(&super::super::outlook::Offsets::fixed(0))
         ),
-        "week 61% used \u{b7} resets Mon 08:06"
+        "week 39% left \u{b7} resets Mon 08:06"
     );
     assert_eq!(
         r.seven_day.and_then(|w| w.pct_x10),
@@ -659,18 +739,19 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
 
 /// NO READING UNDER 100 IS SAID AS 100, AND A BOUND STAYS TRUE
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): the tenths of a `used_percentage`
-/// round down, so `99.96` is 999 tenths, said `99%` now and `≥99%` once aged, and `62.999` is
-/// 629, whose bound `≥62%` the reading meets; only a reading of 100 is 1000 and `100%`. The
+/// round down, so `99.96` is 999 tenths, said `1% left` now and `≤1% left` once aged, and
+/// `62.999` is 629, whose bound `≤38% left` the reading meets; only a reading of 100 is 1000 and
+/// `0% left`. The
 /// whole-percent field the usage line and the survey print holds the same rule: half up from the
 /// tenths (62.96 is 63), but 99 at 99.5, 99.96 and 99.999999999999999, and 100 only at 100. The
 /// exact JSON lexeme decides the boundary: a decimal just below 63 stays below it even where
 /// `f64` would round it to 63, while exact `63.0` stays 630.
 /// NEGATIVE CONTROLS: rounding through hundredths makes 62.999 630; parsing
-/// 62.999999999999999 through `f64` makes it 63. Both falsely say the aged bound is 63%.
+/// 62.999999999999999 through `f64` makes it 63. Both falsely say the aged bound is `≤37% left`.
 /// Rounding the whole field plainly half up from the tenths (`(x10 + 5) / 10`) makes 99.96 a
 /// whole 100 (run once, restored).
 /// The earlier negative control (run once, restored): rounding the tenths half up
-/// (`(f * 10.0).round()`) gives 99.96 1000 and fails at `99%`.
+/// (`(f * 10.0).round()`) gives 99.96 1000 and fails at `1% left`.
 #[test]
 fn no_reading_under_a_hundred_is_said_as_a_hundred() {
     use super::super::outlook::Figure;
@@ -693,32 +774,35 @@ fn no_reading_under_a_hundred_is_said_as_a_hundred() {
         )
     };
     let said = |pct: u32, x10: u32, now: &str, aged: &str| (pct, x10, now.into(), aged.into());
-    assert_eq!(read("99.96"), said(99, 999, "99%", "\u{2265}99%"));
-    assert_eq!(read("99.5"), said(99, 995, "99%", "\u{2265}99%"));
-    assert_eq!(read("99.49"), said(99, 994, "99%", "\u{2265}99%"));
-    assert_eq!(read("62.96"), said(63, 629, "63%", "\u{2265}62%"));
-    assert_eq!(read("62.999"), said(63, 629, "63%", "\u{2265}62%"));
+    assert_eq!(read("99.96"), said(99, 999, "1% left", "\u{2264}1% left"));
+    assert_eq!(read("99.5"), said(99, 995, "1% left", "\u{2264}1% left"));
+    assert_eq!(read("99.49"), said(99, 994, "1% left", "\u{2264}1% left"));
+    assert_eq!(read("62.96"), said(63, 629, "37% left", "\u{2264}38% left"));
+    assert_eq!(
+        read("62.999"),
+        said(63, 629, "37% left", "\u{2264}38% left")
+    );
     assert_eq!(
         read("62.999999999999999"),
-        said(63, 629, "63%", "\u{2265}62%")
+        said(63, 629, "37% left", "\u{2264}38% left")
     );
     assert_eq!(
         read("6.2999999999999999e1"),
-        said(63, 629, "63%", "\u{2265}62%")
+        said(63, 629, "37% left", "\u{2264}38% left")
     );
-    assert_eq!(read("63.0"), said(63, 630, "63%", "\u{2265}63%"));
-    assert_eq!(read("62.6"), said(63, 626, "63%", "\u{2265}62%"));
+    assert_eq!(read("63.0"), said(63, 630, "37% left", "\u{2264}37% left"));
+    assert_eq!(read("62.6"), said(63, 626, "37% left", "\u{2264}38% left"));
     assert_eq!(
         read("99.999999999999999"),
-        said(99, 999, "99%", "\u{2265}99%")
+        said(99, 999, "1% left", "\u{2264}1% left")
     );
     assert_eq!(
         read("100.0"),
-        said(100, 1000, "100%", "\u{2265}100%"),
-        "CONTROL: a reading of 100 is 100"
+        said(100, 1000, "0% left", "0% left"),
+        "CONTROL: a reading of 100 is 0% left, a bound of it too"
     );
-    assert_eq!(read("100"), said(100, 1000, "100%", "\u{2265}100%"));
-    assert_eq!(read("1e2"), said(100, 1000, "100%", "\u{2265}100%"));
+    assert_eq!(read("100"), said(100, 1000, "0% left", "0% left"));
+    assert_eq!(read("1e2"), said(100, 1000, "0% left", "0% left"));
 }
 
 /// THE CONTEXT LEFT (Claude Code 2.1.311's status-line payload): `context_window` carries
@@ -1153,8 +1237,8 @@ fn each_guard_alone_refuses_the_tap() {
 #[cfg(unix)]
 const OWNER_SETTINGS_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-user-settings.json");
 
-/// THE OWNER'S OWN STATUSLINE IS CARRIED, NOT A REFUSAL (owner ruling R-12, 2026-10-24: "THE
-/// HARNESS MUST DO THIS STOP ASKING THE USER"). On the measured machine every Claude Code footer
+/// THE PERSON'S OWN STATUSLINE IS CARRIED, NOT A REFUSAL (docs/OWNER_RULINGS.md, 2026-10-24).
+/// On the measured machine every Claude Code footer
 /// read `weekly ? · /usage` because the person's `~/.claude/settings.json` held another app's
 /// statusLine, and the gate refused the tap over any statusLine, so no line carried it and no
 /// figure was ever read. The gate now carries that command (`--carry`, which names no command:
@@ -1413,7 +1497,7 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
         week(0, NOW - 1).week_words(NOW, Some(&utc)),
         NO_WEEK.to_string(),
     ];
-    assert_eq!(lines[2], "week 100% used \u{b7} resets Thu 22 Oct 08:07");
+    assert_eq!(lines[2], "week 0% left \u{b7} resets Thu 22 Oct 08:07");
     for rows in tap_screens() {
         let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
         let measured = &rows[bottom + 1];
@@ -1495,7 +1579,7 @@ struct WeekRow {
 
 /// The 2.1.318 captures, at a turn end, at launch and mid-turn.
 fn week_rows() -> [WeekRow; 15] {
-    const WEEK: &str = "week 63% used \u{b7} resets Sat 10:00";
+    const WEEK: &str = "week 37% left \u{b7} resets Sat 10:00";
     const CREDITS: &str = "Now using usage credits";
     macro_rules! row {
         ($name:literal, $words:expr, $notice:expr, $busy:expr) => {
@@ -1524,7 +1608,7 @@ fn week_rows() -> [WeekRow; 15] {
         ),
         row!(
             "claude-2.1.318-tap-row-week-30col.txt",
-            Some("week 63% used \u{b7} resets Sa\u{2026}"),
+            Some("week 37% left \u{b7} resets Sa\u{2026}"),
             None,
             false
         ),
@@ -1860,7 +1944,7 @@ fn a_week_only_payload_reads_the_week_and_no_five_hour_window() {
     );
     let line = String::from_utf8(out).expect("utf-8");
     assert_eq!(code, std::process::ExitCode::SUCCESS);
-    assert_eq!(line, "week 1% used \u{b7} resets Sat 7 Nov 19:00\n");
+    assert_eq!(line, "week 99% left \u{b7} resets Sat 7 Nov 19:00\n");
     let (reading, _) = Reading::read(dir.path(), SID, 68537, 0).expect("the reading");
     assert_eq!(reading.five_hour, None);
     assert_eq!(
@@ -1932,7 +2016,7 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
     assert_eq!(own, Carried::Own);
     assert_eq!(
         String::from_utf8_lossy(&out),
-        "week 12% used \u{b7} resets Sat 31 Oct 19:00\n"
+        "week 88% left \u{b7} resets Sat 31 Oct 19:00\n"
     );
     let over = vec![b' '; STDIN_MAX + 1];
     let mut out = Vec::new();
@@ -2075,15 +2159,15 @@ fn the_tap_always_prints_one_line() {
     for resets_at in [i64::MAX, NOW + 30 * DAY] {
         let stdin = payload(9, None, Some((5, resets_at)));
         for out in both_taps(stdin.as_bytes(), false, &own, root.path(), tokyo) {
-            assert_eq!(out, "week 5% used\n", "a reset at {resets_at}");
-            assert_eq!(parse_line(out.trim_end()), Some(12));
+            assert_eq!(out, "week 95% left\n", "a reset at {resets_at}");
+            assert_eq!(parse_line(out.trim_end()), Some(13));
         }
     }
 }
 
 /// THE TAP SAYS NO RESET WHERE THE LOCAL ZONE DOES NOT READ (`aterm_uds::zone::local_offset_at`
 /// answers `None` on a platform it cannot read): a week resetting Mon 19 Oct 08:06:36 UTC prints
-/// `week 61% used`, through the plain tap and the carrying one, and so does a zone that fails at
+/// `week 39% left`, through the plain tap and the carrying one, and so does a zone that fails at
 /// one instant of the span it is asked over ([`super::super::outlook::Offsets::read_around`]),
 /// rather than an instant said on UTC that the glass, on the local clock, says otherwise. The
 /// control: a zone that reads (UTC, and UTC−8) says the reset on its own clock. Negative control:
@@ -2097,14 +2181,14 @@ fn the_tap_says_no_reset_where_the_local_zone_does_not_read() {
     let gap: fn(i64) -> Option<i64> = |t| (t != NOW + 6 * 3600).then_some(0);
     for zone in [unread, gap] {
         for out in both_taps(stdin.as_bytes(), false, &vars(), root.path(), zone) {
-            assert_eq!(out, "week 61% used\n");
+            assert_eq!(out, "week 39% left\n");
             assert_eq!(parse_line(out.trim_end()), Some(13));
         }
     }
     let pacific: fn(i64) -> Option<i64> = |_| Some(-8 * 3600);
     for (zone, said) in [
         (utc as fn(i64) -> Option<i64>, WEEK_61),
-        (pacific, "week 61% used \u{b7} resets Mon 00:06\n"),
+        (pacific, "week 39% left \u{b7} resets Mon 00:06\n"),
     ] {
         for out in both_taps(stdin.as_bytes(), false, &vars(), root.path(), zone) {
             assert_eq!(out, said);
@@ -2221,8 +2305,8 @@ fn a_new_reading_keeps_format_one() {
 /// stand-in draws them, aterm-phase's `-30col`), at every width and each form of the words.
 /// Negative controls: a parser that takes any `week ` head fails the refusals; a printer that
 /// says tenths (`63.4%`) fails the round trip; S2's parser, which ended the words only at a gap,
-/// fails the one-blank notice; S5b's, which ended them at any blank, read the cuts `week 63% used
-/// ·…` and `week 63% used …` (19 to 27 columns) as the bare form.
+/// fails the one-blank notice; S5b's, which ended them at any blank, read the cuts `week 37% left
+/// ·…` and `week 37% left …` (19 to 27 columns) as the bare form.
 #[test]
 fn parse_line_reads_every_line_the_tap_prints() {
     use super::super::outlook::Offsets;
@@ -2283,7 +2367,7 @@ fn parse_line_reads_every_line_the_tap_prints() {
     // An owner's command that prints the tap's head reads as its words: whose row it is, the
     // reading says (`Reading::claimable`), not the text.
     assert_eq!(
-        parse_line("week 63% used \u{b7} resets Sat 10:00 \u{b7} mine"),
+        parse_line("week 37% left \u{b7} resets Sat 10:00 \u{b7} mine"),
         Some(32)
     );
     for refused in [
@@ -2292,22 +2376,22 @@ fn parse_line_reads_every_line_the_tap_prints() {
         "5h \u{2013} \u{b7} 7d 42%",
         "5h \u{2013} \u{b7} 7d \u{2013}",
         "",
-        " week 61% used",
-        "week 101% used",
-        "week 07% used",
-        "week 63.5% used",
-        "week 63% left",
-        "week \u{2265}63% used",
-        "week 63% used \u{b7} resets soon",
-        "week 63% used \u{b7} resets 24:00",
-        "week 63% used \u{b7} resets 23:60",
-        "week 63% used \u{b7} resets Thx 05:00",
-        "week 63% used \u{b7} resets Thu 32 Nov 05:00",
-        "week 63% used \u{b7} resets Thu 05 Nov 05:00",
-        "week 63% used \u{b7} resets Thu 5 Now 05:00",
-        "week 63% used \u{b7} resets Sat 10:000",
-        "week 63% used \u{b7} resets Sat 10:00\u{b7} mine",
-        "week 63% usedX",
+        " week 39% left",
+        "week 101% left",
+        "week 07% left",
+        "week 63.5% left",
+        "week 63% used",
+        "week \u{2264}37% left",
+        "week 37% left \u{b7} resets soon",
+        "week 37% left \u{b7} resets 24:00",
+        "week 37% left \u{b7} resets 23:60",
+        "week 37% left \u{b7} resets Thx 05:00",
+        "week 37% left \u{b7} resets Thu 32 Nov 05:00",
+        "week 37% left \u{b7} resets Thu 05 Nov 05:00",
+        "week 37% left \u{b7} resets Thu 5 Now 05:00",
+        "week 37% left \u{b7} resets Sat 10:000",
+        "week 37% left \u{b7} resets Sat 10:00\u{b7} mine",
+        "week 37% leftX",
         "week \u{b7} no figure",
         "main \u{b7} Opus 5.5 \u{b7} 42%",
         "~/aterm main* opus",
@@ -2318,9 +2402,9 @@ fn parse_line_reads_every_line_the_tap_prints() {
     // wherever the words do not fit `cols − 4` (the lab stand-in's `status_row`).
     let mut cuts = 0;
     for line in [
-        "week 63% used \u{b7} resets Sat 10:00",
-        "week 7% used \u{b7} resets 15:00",
-        "week 100% used \u{b7} resets Thu 12 Nov 05:00",
+        "week 37% left \u{b7} resets Sat 10:00",
+        "week 93% left \u{b7} resets 15:00",
+        "week 0% left \u{b7} resets Thu 12 Nov 05:00",
         NO_WEEK,
     ] {
         let n = line.chars().count();
@@ -2331,7 +2415,7 @@ fn parse_line_reads_every_line_the_tap_prints() {
             cuts += 1;
         }
     }
-    assert_eq!(cuts, 31 + 26 + 39 + 19, "every cut width of each form");
+    assert_eq!(cuts, 31 + 27 + 37 + 19, "every cut width of each form");
 }
 
 /// THE OWNER'S COMMAND RUNS AS CLAUDE CODE RUNS IT: `/bin/sh -c`, the payload on its stdin

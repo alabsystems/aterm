@@ -40,38 +40,11 @@ pub const SCOPES: usize = 16;
 pub const EVERY: Duration = Duration::from_secs(60);
 
 /// How many times as long as its last walk took a [`Meter`] rests before its next, at least
-/// ([`EVERY`] or a test's pace where that is longer): so it walks at most a tenth of the time,
+/// (the requested interval, normally [`EVERY`], where that is longer): it walks at most a tenth of the time,
 /// however much its directories hold, and its walks stay its holder's upkeep, which a waiter
 /// does not take for progress (`aterm_toolchain::stall::BUSY`, a quarter). A walk of the whole
 /// shared build cache, 583,000 entries, took 5.8-6.5 s on this Mac (2026-11-06), under it.
 pub const RESTS: u32 = 9;
-
-/// The pace a test set for the meters this process starts ([`pace_meters`]), milliseconds; 0
-/// for none.
-#[cfg(any(test, debug_assertions))]
-static PACED_MS: AtomicU64 = AtomicU64::new(0);
-
-/// A test's seam: every [`Meter`] this process starts from now on ([`Meter::start`]) measures
-/// every `every` instead of [`EVERY`], a run's meter compressed in time.
-#[cfg(any(test, debug_assertions))]
-pub fn pace_meters(every: Duration) {
-    PACED_MS.store(
-        u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
-}
-
-/// The pace [`Meter::start`] measures at: [`EVERY`], or the one a test set ([`pace_meters`]).
-fn pace() -> Duration {
-    #[cfg(any(test, debug_assertions))]
-    {
-        let ms = PACED_MS.load(Ordering::Relaxed);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    EVERY
-}
 
 /// The walks of a run's directories this process began ([`allocated_until`] over any): what
 /// verify's run reports it made (`verify-event: … "event":"disk"`), since one walk of a release
@@ -566,7 +539,7 @@ impl fmt::Debug for Meter {
 }
 
 impl Meter {
-    /// Measure `dirs` ([`allocated_until`]) every [`EVERY`] (a test's pace, [`pace_meters`])
+    /// Measure `dirs` ([`allocated_until`]) every [`EVERY`]
     /// from `start`, the bytes they held when the run began, holding `claim` for the run; `tag`
     /// names them in the run's [`Footprint`] ([`Footprint::dirs`]), and `scope` what it builds
     /// there ([`Footprint::scope`]).
@@ -582,7 +555,7 @@ impl Meter {
             start,
             Box::new(move |stopped| allocated_until(&dirs, stopped)),
             claim,
-            pace(),
+            EVERY,
         );
         meter.dirs = Some(tag);
         meter.scope = scope;

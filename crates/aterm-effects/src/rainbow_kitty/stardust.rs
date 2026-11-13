@@ -192,16 +192,29 @@ pub const fn px_at(ch: f32, at_1x: i32) -> i32 {
     if scaled > 1 { scaled } else { 1 }
 }
 
-/// Lower bound of the seeded arm-size scintillation rate, Hz (§5.5, D12).
+/// Lower bound of a star's seeded chime tremolo, Hz ([`Glint::f`]). It is heard, never drawn: the
+/// arm it once stepped on glass (16 to 24 size steps a second at the arm's tip, under an area
+/// exemption nobody ruled) is drawn at its peak for the star's whole life.
 pub const SCINT_F_MIN: f32 = 8.0;
 
-/// Upper bound of the seeded arm-size rate, Hz (§5.5, D12).
+/// Upper bound of the seeded chime tremolo, Hz.
 pub const SCINT_F_MAX: f32 = 12.0;
 
-/// The photosensitivity exemption bound, device px at 2× (§5.5): a mark whose bbox is at or under
-/// this may scintillate in size at 8-12 Hz, since a general-flash threshold is an area threshold.
-#[cfg(test)]
-pub const SCINT_BBOX_MAX_PX: i32 = 10;
+/// How long a pixel of paper rests after a star is born on it, seconds: no other star is stood
+/// within reach of it sooner ([`Stardust::stand`]). A star on paper darkens its pixels once and
+/// lets them go once, two turns of the flash law; a third of a second and a frame between births
+/// keeps any pixel at three such stars a second or fewer, whatever the hand does.
+pub const PAPER_REST_S: f32 = 1.0 / 3.0 + 0.017;
+
+/// How many places along its flight, and how many steps to each side of the first clear one, a
+/// paper star is offered ([`Stardust::stand`]).
+pub const STAND_TRIES: u32 = 8;
+/// The heights [`Stardust::stand`] looks along: the first place's own and those above it.
+pub const STAND_ROWS: u32 = 3;
+
+/// The births [`Stardust::stand`] remembers: more than a full pool born inside one
+/// [`PAPER_REST_S`].
+pub const STOOD_CAP: usize = 96;
 
 /// The m2's integer arm floor, px (§5.2, §5.5: "m2 … (2 ↔ 3 px)").
 pub const M2_ARM_MIN_PX: i32 = 2;
@@ -676,8 +689,8 @@ impl StarClass {
         }
     }
 
-    /// The arm clock's floor, as a share of the nominal arm (§5.5): m2/m3 swing at full depth, m1
-    /// only ±12 %.
+    /// The paper star's mass, as a share of the nominal arm: [`Paint::draw_over`] builds its body
+    /// on this arm and lays the rest of the reach as its points (m1 0.88, m2 and m3 0.55).
     #[inline]
     #[must_use]
     pub const fn arm_floor(self) -> f32 {
@@ -687,8 +700,7 @@ impl StarClass {
         }
     }
 
-    /// The smallest integer arm this class is ever drawn at, at cell height `ch` (§5.5 at `ch` 18:
-    /// m1 3 ↔ 4, m2 2 ↔ 3, m3 1 ↔ 2 px).
+    /// The smallest integer arm this class has, at cell height `ch`.
     #[inline]
     #[must_use]
     pub const fn arm_min_px(self, ch: f32) -> i32 {
@@ -700,7 +712,9 @@ impl StarClass {
 
     #[inline]
     #[must_use]
-    const fn arms(self, ch: f32) -> (f32, i32, f32, i32, i32) {
+    /// `(mass arm, drawn arm)` px at cell height `ch`: the arm a paper star's body is built on
+    /// ([`Self::arm_floor`]) and the one arm every star is drawn at for its whole life.
+    const fn arms(self, ch: f32) -> (i32, i32) {
         let nominal = star_arm(ch, self.arm_ratio());
         let min_arm = self.arm_min_px(ch);
         let arm_floor = self.arm_floor();
@@ -708,7 +722,7 @@ impl StarClass {
         let arm_lo = if raw_lo > min_arm { raw_lo } else { min_arm };
         let raw_hi = nominal.round() as i32;
         let arm_hi = if raw_hi > min_arm { raw_hi } else { min_arm };
-        (nominal, min_arm, arm_floor, arm_lo, arm_hi)
+        (arm_lo, arm_hi)
     }
 
     /// The core-brightness floor on the luminance clock (§5.5's table): m1 `0.85 + 0.15·e`, m2
@@ -936,7 +950,8 @@ pub struct Star {
     /// Birth velocity in px/ms, `(vx, vy)`: the throw for erase / fan / mini-fan, the inherited
     /// `0.12·v_head` for a shed fragment, the −3 px/s lift for a sky m1/m2.
     pub v0: (f32, f32),
-    /// The seeded arm-size scintillation rate, Hz, in `[SCINT_F_MIN, SCINT_F_MAX]` (§5.5, D12).
+    /// The seeded chime tremolo, Hz, in `[SCINT_F_MIN, SCINT_F_MAX]`: what [`Glint::f`] is cued
+    /// with. Nothing drawn reads it.
     pub f: f32,
     /// The slipstream's travel, px ≥ 0: how far this star drifts backward over [`STREAM_END_MS`],
     /// priced once at birth from the observed key interval (T4) and clamped to its row's blank
@@ -957,6 +972,12 @@ pub struct Star {
     /// judged afresh each frame, a star whose glints swell to the edge and
     /// shrink off it again blinked with its scintillation.
     pub edge_cut: bool,
+    /// On paper, where this star stands for its whole life, as an offset from its home pixel
+    /// ([`Stardust::stand`]); `None` on a dark page, where it flies. Ink on paper does not move: a
+    /// grain crossing a pixel darkens it and lets it go, and the grains of one typed line cross the
+    /// same pixels in turn, sixteen to twenty times a second at a fast hand. Stood still, the grain
+    /// is born once where its flight would have shown it and only cools.
+    pub still: Option<(i32, i32)>,
 }
 
 const _: () = assert!(
@@ -987,8 +1008,8 @@ impl Star {
         self.class.life_s(self.lane)
     }
 
-    /// Born at full: true inside the class hold `H` (§5.6), when a star draws at its nominal arm
-    /// and full core; both scintillation clocks take over at `age ≥ H`, still reading `now − born`.
+    /// Born at full: true inside the class hold `H` (§5.6), when a star draws its full core; on a
+    /// dark page the luminance clock takes over at `age ≥ H`, still reading `now − born`.
     #[inline]
     #[must_use]
     pub fn in_hold(&self, now: Instant) -> bool {
@@ -1112,6 +1133,9 @@ impl Star {
     #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
+        if self.still.is_some() {
+            return self.lane == StarLane::Field && self.age_s(now) < EDGE_IN_S;
+        }
         let motion = self.lane.motion();
         let has_vel = self.v0.0 != 0.0 || self.v0.1 != 0.0;
         if matches!(motion, Motion::Drag) && has_vel {
@@ -1140,58 +1164,26 @@ impl Star {
         }
     }
 
-    /// Seconds until this star's integer arm next steps on §5.5's size clock,
-    /// `arm = round(A·(floor + (1 − floor)·sin²(2π·f·age + φ)))` at cell height `ch`, solved in
-    /// closed form: the arm toggles where `sin²` crosses `((k + 0.5)/A − floor)/(1 − floor)`, twice
-    /// per `1/(2f)` period, so it is never more than 62.5 ms away.
+    /// Whether what this star draws is changing at `age_s`, past its class hold, with nothing
+    /// else of its own asking for a frame: a fade's tail ([`Cadence::tail`]).
+    ///
+    /// A flying star (a dark page's) is on its luminance clock for the rest of its life. A
+    /// star stood on paper ([`Self::still`]) has no clock and only cools: off the field lane
+    /// its half-life runs from the hold's end to its cull; on the field lane it is held whole
+    /// while its row is typed on and cools from [`FIELD_HOLD_MS`] after the row's last key,
+    /// and melts over the last [`EXPIRY_MELT_SHARE`] of its life. The arm's size clock used to
+    /// ask for these frames by the way (a step at least every 62.5 ms); with the arm steady
+    /// nothing did, and where the ribbon and the pet were at rest a paper star held its last
+    /// painted strength and then was gone, and a dark star's twinkle was drawn at its lift's
+    /// three steps a second.
     #[inline]
     #[must_use]
-    pub fn next_arm_step_s(&self, ch: f32, now: Instant) -> Option<f32> {
-        self.next_arm_step_at_age_s(ch, self.age_s(now))
-    }
-
-    #[inline]
-    #[must_use]
-    fn next_arm_step_at_age_s(&self, ch: f32, age_s: f32) -> Option<f32> {
-        let nominal = star_arm(ch, self.class.arm_ratio());
-        let floor = self.class.arm_floor();
-        let depth = 1.0 - floor;
-        if !(nominal.is_finite() && depth.is_finite() && self.f.is_finite())
-            || nominal <= 0.0
-            || depth <= 0.0
-            || self.f <= 0.0
-        {
-            return None;
+    fn turning(&self, age_s: f32, now: Instant) -> bool {
+        if self.still.is_none() || self.lane != StarLane::Field {
+            return true;
         }
-        let min = self.class.arm_min_px(ch) as f32;
-        let omega = std::f32::consts::TAU * self.f;
-        let theta = omega * age_s + self.lum_phase();
-        let base = sine_crossing_base(theta, omega)?;
-        let k0 = (nominal * floor - 0.5).ceil().max(min) as i32;
-        let k1 = (nominal - 0.5).floor() as i32;
-        let inv_nominal = 1.0 / nominal;
-        let inv_depth = 1.0 / depth;
-        let inv_omega = 1.0 / omega;
-        let mut best: Option<f32> = None;
-        let mut k = k0;
-        while k <= k1 {
-            let c = ((k as f32 + 0.5) * inv_nominal - floor) * inv_depth;
-            if c > 0.0
-                && c < 1.0
-                && let Some(dt) = next_sine_crossing_from_base(
-                    base,
-                    crate::color_math::asin_f32(crate::color_math::sqrt_f32(c)),
-                    inv_omega,
-                )
-            {
-                best = Some(match best {
-                    Some(b) => b.min(dt),
-                    None => dt,
-                });
-            }
-            k += 1;
-        }
-        best
+        self.idle_s(now) >= FIELD_HOLD_MS / 1000.0
+            || age_s >= FIELD_LIFE_S * (1.0 - EXPIRY_MELT_SHARE)
     }
 
     /// Seconds until a gold star's diagonal glints next switch (`|sin(ω·age + φ)| ≥ 0.92`, §5.2,
@@ -1205,7 +1197,7 @@ impl Star {
     #[inline]
     #[must_use]
     fn next_glint_toggle_at_age_s(&self, age_s: f32) -> Option<f32> {
-        if !self.gold {
+        if !self.gold || self.still.is_some() {
             return None;
         }
         const TWINKLE_GLINT_ASIN: f32 = {
@@ -1234,7 +1226,10 @@ impl Star {
     #[inline]
     #[must_use]
     fn next_lift_step_at_age_s(&self, age_s: f32) -> Option<f32> {
-        if (self.v0.0 == 0.0 && self.v0.1 == 0.0) || !matches!(self.lane.motion(), Motion::Lift) {
+        if self.still.is_some()
+            || (self.v0.0 == 0.0 && self.v0.1 == 0.0)
+            || !matches!(self.lane.motion(), Motion::Lift)
+        {
             return None;
         }
         let age_ms = age_s * 1000.0;
@@ -1278,7 +1273,7 @@ impl Star {
     #[inline]
     #[must_use]
     fn next_stream_step_at_age_s(&self, age_s: f32) -> Option<f32> {
-        if self.stream <= 0.0 || !self.stream.is_finite() {
+        if self.still.is_some() || self.stream <= 0.0 || !self.stream.is_finite() {
             return None;
         }
         let age_ms = age_s * 1000.0;
@@ -1315,6 +1310,17 @@ impl Star {
     #[inline]
     #[must_use]
     const fn pos_at_age(&self, age_s: f32) -> (i32, i32) {
+        if let Some((dx, dy)) = self.still {
+            let (x, y) = self.origin();
+            return (x + dx, y + dy);
+        }
+        self.flight_at_age(age_s)
+    }
+
+    /// Where the star's flight has it at `age_s`, whether or not it stands still.
+    #[inline]
+    #[must_use]
+    const fn flight_at_age(&self, age_s: f32) -> (i32, i32) {
         let age_ms = age_s * 1000.0;
         let (x, y) = if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
             self.origin()
@@ -1877,6 +1883,8 @@ pub struct Stardust {
     /// The marks' lights' keys ([`SkyMark::lights`]).
     mark_lights: Vec<u64>,
     paper_ink: PaperInkMemo,
+    /// Where paper's stars were stood within the last [`PAPER_REST_S`] ([`Self::stand`]).
+    stood: Vec<Stood>,
     /// A test's negative control: a dark star kept off the caret's row
     /// beside it decided every frame from the caret then, as looks9 round 3
     /// decided it ([`Self::beside_caret`]).
@@ -1991,6 +1999,35 @@ pub const fn sky_halo_key(h: &RainHalo) -> u64 {
     aterm_hash::fnv_mix_u64(aterm_hash::fnv_mix_u64(seed, shape), h.color as u64)
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static PAPER_FLIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with paper's stars flying as a dark page's do, as they did
+/// before [`Stardust::stand`] ([`Star::still`]). Debug and test builds only; the flag is this
+/// thread's and is put back as it was when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_paper_stars_flying<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            PAPER_FLIES.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(PAPER_FLIES.with(|c| c.replace(true)));
+    f()
+}
+
+/// One star stood on paper: its centre and reach, px, and its birth ([`Stardust::stand`]).
+#[derive(Clone, Copy, Debug)]
+struct Stood {
+    x: i32,
+    y: i32,
+    reach: i32,
+    born: Instant,
+}
+
 impl Default for Stardust {
     #[inline]
     fn default() -> Self {
@@ -2020,6 +2057,7 @@ impl Stardust {
             marks: Vec::with_capacity(STAR_POOL_MAX),
             mark_lights: Vec::with_capacity(STAR_POOL_MAX * 8),
             paper_ink: PaperInkMemo::EMPTY,
+            stood: Vec::with_capacity(STOOD_CAP),
             #[cfg(test)]
             beside_caret_each_frame: false,
         }
@@ -2130,6 +2168,99 @@ impl Stardust {
     fn sow(&mut self, star: Star) {
         self.make_room(star.born);
         self.stars.push(star);
+    }
+
+    /// Stand a newborn star still on paper ([`Star::still`]); a dark page's star flies and is left
+    /// as it is. `false` when paper has no rested place for it.
+    ///
+    /// The star stands at a seeded point of its own flight (the slipstream's drift, a throw, a
+    /// shed fragment's drag), so a line's dust lies strewn along it as the flying grains did in
+    /// any one frame; a star with no flight stands where it was born. The place must be rested:
+    /// no star born within [`PAPER_REST_S`] may reach a pixel this one reaches, so no pixel is
+    /// darkened and let go more than three times a second however fast grains are dealt. A place
+    /// that is not rested is passed over for the next point of the flight, then for steps to each
+    /// side of it along the row, [`STAND_TRIES`] of each, then for the same steps one star's
+    /// height up at a time, [`STAND_ROWS`] heights in all.
+    fn stand(&mut self, star: &mut Star, ctx: &Ctx<'_>) -> bool {
+        if ctx.cfg.dark_theme {
+            return true;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if PAPER_FLIES.with(std::cell::Cell::get) {
+            return true;
+        }
+        let at = star.born;
+        self.stood
+            .retain(|s| at.saturating_duration_since(s.born).as_secs_f32() < PAPER_REST_S);
+        let geom = ctx.geom;
+        let reach = star.class.arms(geom.ch as f32).1 + 1;
+        let origin = star.origin();
+        let life_ms = star.life_s() * 1000.0;
+        let flown = star.v0.0 != 0.0 || star.v0.1 != 0.0;
+        let mut end_ms: f32 = 0.0;
+        if flown {
+            end_ms = star.lane.motion().end_ms(life_ms);
+        }
+        if star.stream > 0.0 {
+            end_ms = end_ms.max(STREAM_END_MS);
+        }
+        let end_s = end_ms.min(life_ms) * (1.0 / 1000.0);
+        let sky = star.lane.is_sky();
+        let h0 = hash01(mix32(star.seed ^ SALT_STAND));
+        let step = 2 * reach + 1;
+        let tries = if end_s > 0.0 { STAND_TRIES } else { 1 };
+        let mut first = None;
+        let mut k = 0;
+        while k < tries + 2 * STAND_TRIES * STAND_ROWS {
+            let p = if k < tries {
+                // The golden ratio's steps spread the tries along the flight from a seeded start.
+                let u = (h0 + k as f32 * 0.618_034).fract();
+                star.flight_at_age(u * end_s)
+            } else {
+                let Some((x, y)): Option<(i32, i32)> = first else {
+                    break;
+                };
+                let j = ((k - tries) % (2 * STAND_TRIES)) as i32;
+                let up = ((k - tries) / (2 * STAND_TRIES)) as i32;
+                let side = if j % 2 == 0 { 1 } else { -1 };
+                (x + side * (j / 2 + 1 - up.min(1)) * step, y - up * step)
+            };
+            k += 1;
+            let clear = on_glass(p, geom)
+                && if sky {
+                    let col = px_col(p.0 as f32, geom);
+                    col >= 0
+                        && self
+                            .probe
+                            .sky_at(px_row(p.1 as f32, geom), col as u16, geom.rows)
+                            == Some(false)
+                } else {
+                    !matches!(self.probe.at_px(p.0, p.1, geom), Some(true))
+                };
+            if !clear {
+                continue;
+            }
+            if first.is_none() {
+                first = Some(p);
+            }
+            let rested = !self.stood.iter().any(|s| {
+                (p.0 - s.x).abs() <= reach + s.reach && (p.1 - s.y).abs() <= reach + s.reach
+            });
+            if rested {
+                star.still = Some((p.0 - origin.0, p.1 - origin.1));
+                if self.stood.len() == STOOD_CAP {
+                    self.stood.remove(0);
+                }
+                self.stood.push(Stood {
+                    x: p.0,
+                    y: p.1,
+                    reach,
+                    born: at,
+                });
+                return true;
+            }
+        }
+        false
     }
 
     /// The cat catches a star: put the one live, unfinished gold sky m1 whose home pixel and birth
@@ -2574,6 +2705,9 @@ impl Stardust {
                 } else if idle < FIELD_HOLD_S {
                     cad.tail(FIELD_HOLD_S - idle);
                 }
+                if !self.reduced && age < FIELD_MELT_START {
+                    cad.tail(FIELD_MELT_START - age);
+                }
                 cad.tail(fade_life - idle);
             }
             if self.reduced {
@@ -2588,8 +2722,8 @@ impl Stardust {
             let (hold, _) = s.class.envelope_s(s.lane);
             if age < hold {
                 cad.tail(hold - age);
-            } else if let Some(step) = s.next_arm_step_at_age_s(self.cell_h, age) {
-                cad.tail(step);
+            } else if s.turning(age, now) {
+                cad.tail(0.0);
             }
             if cad.at_tail_floor() {
                 return cad.take();
@@ -2615,6 +2749,7 @@ impl Stardust {
         self.budget = StarBudget::new();
         self.probe.clear();
         self.glints.clear();
+        self.stood.clear();
         self.minted = 0;
         self.last_typed = None;
         self.ioi_ms = STREAM_IOI_MAX_MS;
@@ -2641,6 +2776,9 @@ impl Stardust {
                 s.y -= dy;
                 s.y >= 0.0
             });
+            for s in &mut self.stood {
+                s.y -= dy as i32;
+            }
         }
         self.veil.retain_mut(|v| {
             let Some(row) = v.row.checked_sub(rows) else {
@@ -2681,6 +2819,7 @@ impl Stardust {
                     px.point(&mut s.y)
                 }
             });
+            self.stood.clear();
         }
         self.veil
             .retain_mut(|v| match band_row(v.row, top, bottom, delta) {
@@ -3081,13 +3220,7 @@ impl Stardust {
             _ => (0.0, 0.0),
         };
         let f = scint_rate(seed);
-        if glint {
-            self.glints.push(Glint {
-                col: spec.cell.1,
-                f,
-            });
-        }
-        let star = Star {
+        let mut star = Star {
             class,
             lane: spec.lane,
             x,
@@ -3105,7 +3238,17 @@ impl Stardust {
             finish: None,
             beside_caret: None,
             edge_cut: false,
+            still: None,
         };
+        if !self.stand(&mut star, ctx) {
+            return false;
+        }
+        if glint {
+            self.glints.push(Glint {
+                col: spec.cell.1,
+                f,
+            });
+        }
         match grabbed {
             Some(Some(i)) => self.stars[i] = star,
             _ => self.sow(star),
@@ -3133,8 +3276,9 @@ impl Stardust {
             finish: None,
             beside_caret: None,
             edge_cut: false,
+            still: None,
         };
-        if self.settle(&mut star, spec.fixed, ctx) {
+        if self.settle(&mut star, spec.fixed, ctx) && self.stand(&mut star, ctx) {
             self.sow(star);
         }
     }
@@ -3799,10 +3943,8 @@ struct Paint {
 }
 
 impl Paint {
-    /// Its arm's peak reach plus one, px: the reach every cull keys on
-    /// ([`Self::kept_out`], [`SkyMark::reach`]). Only the drawn arm
-    /// scintillates; a cull keyed on it would add and drop a star on a cull's
-    /// edge at 16-24 Hz, past [`crate::TWINKLE_FLASH_BOUND_HZ`].
+    /// Its arm's reach plus one, px: the reach every cull keys on
+    /// ([`Self::kept_out`], [`SkyMark::reach`]).
     #[inline]
     const fn reach(&self) -> i32 {
         let hi = if self.arm_hi > self.arm_lo {
@@ -3844,7 +3986,7 @@ impl Paint {
         shade: &PetShade,
         keep_out: &KeepOut,
         ctx: &Ctx<'_>,
-        arms: (f32, i32, f32, i32, i32),
+        arms: (i32, i32),
     ) -> Option<Self> {
         Self::of_inner(star, probe, shade, Some(keep_out), ctx, arms)
     }
@@ -3856,7 +3998,7 @@ impl Paint {
         shade: &PetShade,
         keep_out: Option<&KeepOut>,
         ctx: &Ctx<'_>,
-        (nominal, min_arm, arm_floor, arm_lo, arm_hi): (f32, i32, f32, i32, i32),
+        (arm_lo, arm_hi): (i32, i32),
     ) -> Option<Self> {
         let rm = ctx.cfg.reduced_motion;
         let age_s = star.age_s(ctx.now);
@@ -3878,13 +4020,19 @@ impl Paint {
         {
             return None;
         }
-        let held = rm || age_s < star.class.envelope_s(star.lane).0;
+        let in_hold = age_s < star.class.envelope_s(star.lane).0;
+        // Ink on paper only cools: born at its full core with its glints, it drops the glints
+        // once at the hold's end and fades on its envelope, with no luminance clock. The clock's
+        // dip to its trough and back is a flash of every pixel of the star on paper (ink at
+        // 0.55 of its coverage reads a quarter of the page's light brighter), 5.7 turns a
+        // second, which leaves no room under the bound for the star's own birth.
+        let paper = !ctx.cfg.dark_theme;
+        let held = rm || paper || in_hold;
         let can_glint = !rm && star.gold && star.class == StarClass::M1;
-        let (phase, tw) = if !held || can_glint {
-            let phase = star.lum_phase();
-            (phase, twinkle_env(age_s, phase))
+        let tw = if !held || (can_glint && !paper) {
+            twinkle_env(age_s, star.lum_phase())
         } else {
-            (0.0, 1.0)
+            1.0
         };
         let (env, e) = if held {
             (1.0, 1.0)
@@ -3896,12 +4044,9 @@ impl Paint {
         if star.lane.is_transient() && probe.at_px(x, y, ctx.geom) != Some(false) {
             c *= 1.0 / TEXT_SAFE_DIV;
         }
-        let arm = if held {
-            arm_hi
-        } else {
-            let s = crate::supernova::sin_cos_f32(std::f32::consts::TAU * star.f * age_s + phase).0;
-            ((nominal * (arm_floor + (1.0 - arm_floor) * s * s)).round() as i32).max(min_arm)
-        };
+        // One arm for the star's life. It stepped between two sizes 16 to 24 times a second
+        // (`sin²` at 8 to 12 Hz), which is that many flashes of the arm's tip.
+        let arm = arm_hi;
         Some(Self {
             class: star.class,
             lane: star.lane,
@@ -3919,7 +4064,7 @@ impl Paint {
             },
             env,
             tint: star.tint,
-            glints: can_glint && twinkle_peak(tw),
+            glints: can_glint && if paper { in_hold } else { twinkle_peak(tw) },
             gold: star.gold,
         })
     }
@@ -4223,33 +4368,14 @@ const M3_NEEDLE_HALOS: usize = 4;
 #[cfg(test)]
 #[inline]
 const fn arm_trough_px(class: StarClass, ch: f32) -> i32 {
-    class.arms(ch).3
+    class.arms(ch).0
 }
 
-/// A star's arm at its scintillation's peak (and while held), px: no
-/// drawn arm is longer ([`arm_px_with`]).
+/// The arm every star is drawn at, px.
 #[cfg(test)]
 #[inline]
 const fn arm_peak_px(class: StarClass, ch: f32) -> i32 {
-    class.arms(ch).4
-}
-
-#[cfg(test)]
-#[inline]
-const fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
-    let (nominal, min, floor, _, arm_hi) = star.class.arms(ch);
-    if held {
-        return arm_hi;
-    }
-    let s = crate::supernova::sin_cos_f32(std::f32::consts::TAU * star.f * age_s + phase).0;
-    let rounded = (nominal * (floor + (1.0 - floor) * s * s)).round() as i32;
-    if rounded > min { rounded } else { min }
-}
-
-#[cfg(test)]
-#[inline]
-fn arm_px(star: &Star, ch: f32, held: bool, now: Instant) -> i32 {
-    arm_px_with(star, ch, held, star.age_s(now), star.lum_phase())
+    class.arms(ch).1
 }
 
 #[inline]
@@ -4298,6 +4424,7 @@ const SALT_JITTER: u32 = 0x0000_0909;
 const SALT_ERASE: u32 = 0x0000_0A0A;
 const SALT_LIGHT: u32 = 0x0000_0B0B;
 const SALT_EXHAUST: u32 = 0x0000_0E7A;
+const SALT_STAND: u32 = 0x0000_0F5D;
 
 /// The family's avalanche mix (the rounds `cursor_glow` uses).
 #[inline]

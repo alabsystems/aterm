@@ -8,7 +8,7 @@
 //! proven read-only, only `aterm harness disk` ([`runs_harness_disk`]); every other box of the
 //! worker's is declined.
 //!
-//! The worker runs with its parent's permissions (owner ruling 2026-11-02), held to Claude Code's
+//! The worker runs with its parent's permissions, held to Claude Code's
 //! auto floor (`worker::starter`), so this fence holds only where its mode raises boxes: auto
 //! mode's classifier decides most actions with none, bypass raises none, and what keeps it to
 //! `aterm harness disk free` then is its task's words alone.

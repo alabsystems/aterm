@@ -1716,12 +1716,7 @@ fn an_unknown_session_word_hands_the_dialog_over_under_a_text_global() {
     let _ = hosted_run(&mut m, &hosted_by(LONG), None);
     assert!(m.writes().is_empty(), "{:#?}", m.requests);
     let badge = badge(&m).expect("handed over");
-    assert!(
-        badge.contains(
-            "this session's `questions` word longest-term is not one this supervisor knows"
-        ),
-        "{badge}"
-    );
+    assert!(badge.contains("longest-term"), "{badge}");
 }
 
 /// A preview under `long-term` has no free-text row: its recommended option is pressed, told

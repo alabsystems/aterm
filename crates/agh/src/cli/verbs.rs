@@ -20,7 +20,7 @@ pub enum Class {
     /// This machine only (`whoami --verify` also asks GitHub as each profile, and with no
     /// agh.toml, `whoami` and `auth status` learn a vault token's login once, design §6.10).
     Local,
-    /// Provisions an identity (an agent as a person does, owner ruling 2026-10-26).
+    /// Provisions an identity (an agent as a person does).
     Provision,
     /// As its method says (`api`).
     ByMethod,
@@ -403,6 +403,19 @@ pub static VERBS: &[Verb] = &[
         flags: &[],
         positionals: &["REPO"],
         run: cmd_git::tags,
+    },
+    Verb {
+        path: &["repo", "refs"],
+        class: Class::Read,
+        usage: "agh repo refs REPO [--ref REF]",
+        summary: "authenticated Git ref advertisement without REST quota",
+        example: "agh repo refs alabsystems/aterm --ref refs/heads/main",
+        noun: Noun::Repo,
+        gh: "git ls-remote",
+        milestone: 2,
+        flags: &[value("--ref", "one exact full ref, with no prefix matches")],
+        positionals: &["REPO"],
+        run: cmd_repo::repo_refs,
     },
     Verb {
         path: &["repo", "public-refs"],
@@ -1088,16 +1101,22 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["rate"],
         class: Class::Read,
-        usage: "agh rate [--as PROFILE | --anonymous] [--calls-hour UNIX_HOUR]",
+        usage: "agh rate [--as PROFILE | --anonymous] [--calls-hour UNIX_HOUR [--summary]]",
         summary: "rate limits of each present profile and anonymous: GitHub's (no quota) and agh's rate book",
         example: "agh rate --anonymous",
         noun: Noun::Rate,
         gh: "gh api rate_limit",
         milestone: 1,
-        flags: &[value(
-            "--calls-hour",
-            "local per-attempt attribution for Unix seconds / 3600; no network; storage errors and the 64 MiB/hour bound are reported at the caller",
-        )],
+        flags: &[
+            on(
+                "--summary",
+                "group local attempts by identity, caller, endpoint and parent chain",
+            ),
+            value(
+                "--calls-hour",
+                "local per-attempt attribution for Unix seconds / 3600; no network; last 24 hours, 8 MiB/hour, incomplete hours refuse",
+            ),
+        ],
         positionals: &[],
         run: cmd_rate::rate,
     },

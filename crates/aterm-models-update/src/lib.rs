@@ -29,6 +29,7 @@ mod models_update_roster_freshness;
 mod models_update_settings_draft_carry;
 mod models_update_successor_warm;
 mod models_update_trial_give_back;
+mod models_update_trial_settle;
 mod models_update_web_cache;
 mod models_update_window_show;
 
@@ -42,9 +43,11 @@ pub use models_update_activation_observation::native_update_activation_observati
 pub use models_update_boot_image::native_update_boot_image_model;
 pub use models_update_carried_health::native_update_carried_health_model;
 pub use models_update_check_coordination::{
-    native_update_boot_health_confirmation_model, native_update_boot_health_lock_model,
-    native_update_check_join_model, native_update_check_receipt_model,
-    native_update_check_wait_model, native_update_two_process_apply_model,
+    native_update_boot_health_confirmation_liveness, native_update_boot_health_confirmation_model,
+    native_update_boot_health_lock_model, native_update_check_join_model,
+    native_update_check_receipt_model, native_update_check_wait_model,
+    native_update_installed_cache_model, native_update_progress_delivery_model,
+    native_update_two_process_apply_model,
 };
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;
@@ -54,6 +57,7 @@ pub use models_update_launched_dial_wait::{
 };
 pub use models_update_parallel_attach::{
     native_update_successor_attach_liveness, native_update_successor_attach_model,
+    native_update_successor_restore_runs_liveness,
 };
 pub use models_update_parent_diet::{
     native_update_speculative_sidecar_liveness, native_update_speculative_sidecar_model,
@@ -69,5 +73,8 @@ pub use models_update_successor_warm::{
     native_update_successor_warm_before_claim_model,
 };
 pub use models_update_trial_give_back::native_update_trial_give_back_model;
+pub use models_update_trial_settle::{
+    native_update_trial_settle_liveness, native_update_trial_settle_model,
+};
 pub use models_update_web_cache::native_update_web_cache_model;
 pub use models_update_window_show::native_update_window_show_model;

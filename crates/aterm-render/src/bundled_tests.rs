@@ -95,6 +95,11 @@ fn the_letter_floor_is_the_familys_deepest_latin_letter() {
             assert_eq!(per_em(id), Some(-0.256), "{id}");
         }
     }
+    if IOSEVKA_NL_ACTIVE {
+        for id in IOSEVKA_NL_FACES {
+            assert_eq!(per_em(id), Some(-0.256), "{id}");
+        }
+    }
     if IOSEVKA_SEMIBOLD_ACTIVE {
         for id in IOSEVKA_SEMIBOLD_FACES {
             assert_eq!(per_em(id), Some(-0.259), "{id}");
@@ -132,6 +137,7 @@ fn every_bundled_face_parses_and_each_family_is_a_real_monospace_family() {
     let expected_count = usize::from(ACTIVE) * 7
         + usize::from(CASCADIA_ACTIVE) * 4
         + usize::from(IOSEVKA_ACTIVE) * 4
+        + usize::from(IOSEVKA_NL_ACTIVE) * 4
         + usize::from(IOSEVKA_SEMIBOLD_ACTIVE) * 4;
     assert_eq!(served.len(), expected_count, "{served:?}");
     for id in &served {
@@ -150,6 +156,10 @@ fn every_bundled_face_parses_and_each_family_is_a_real_monospace_family() {
     }
     if CASCADIA_ACTIVE {
         families.push((CASCADIA_FACES, [CASCADIA_FAMILY; 4], PLAIN));
+    }
+    if IOSEVKA_NL_ACTIVE {
+        // The cut keeps the file's name table: the family is spelled in the identity alone.
+        families.push((IOSEVKA_NL_FACES, [IOSEVKA_FAMILY; 4], PLAIN));
     }
     if IOSEVKA_SEMIBOLD_ACTIVE {
         let extrabold = "Iosevka Term Extrabold";
@@ -188,7 +198,7 @@ fn every_bundled_face_parses_and_each_family_is_a_real_monospace_family() {
             .collect();
         assert_eq!(weights, expected, "{}", names[0]);
     }
-    for id in IOSEVKA_SEMIBOLD_FACES {
+    for id in IOSEVKA_NL_FACES.iter().chain(&IOSEVKA_SEMIBOLD_FACES) {
         if let Some(bytes) = face_for_id(id) {
             assert!(
                 !crate::ligature_shaping::font_has_ligature_features(bytes, 0),
@@ -203,11 +213,24 @@ use crate::{FaceId, GlyphClass};
 #[cfg(feature = "embedded-font")]
 use crate::{Renderer, Theme};
 
+/// Whether `id` is a face the Iosevka Term grid treatments reach: the sets Windows has drawn by default, Iosevka Term NL and the Semibold set.
+fn windows_iosevka(id: &str) -> bool {
+    IOSEVKA_NL_FACES.contains(&id) || IOSEVKA_SEMIBOLD_FACES.contains(&id)
+}
+
 #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
 fn default_sealed() -> Renderer {
     let mut r = Renderer::from_system(18.0, Theme::default()).expect("a default face");
     r.seal_admitted_font_sources();
     r
+}
+
+/// Iosevka Term as its file is, the face a user gets by name: the glyphs of Windows' default, Iosevka Term NL, with none of the treatments keyed on the default's bytes. It is the CONTROL of each test of one.
+#[cfg(all(windows, feature = "embedded-font"))]
+fn untreated_iosevka(px: f32) -> Renderer {
+    let bytes = face_for_id(IOSEVKA_ID).unwrap();
+    assert!(!is_grid_fitted_iosevka(bytes));
+    Renderer::from_bytes(bytes, px, Theme::default()).unwrap()
 }
 
 #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
@@ -241,7 +264,7 @@ fn resolved_face(r: &mut Renderer, ch: char) -> String {
 #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
 fn the_default_primary_is_the_bundled_platform_face() {
     let expected = if cfg!(windows) {
-        IOSEVKA_SEMIBOLD_ID
+        IOSEVKA_NL_ID
     } else {
         JETBRAINS_ID
     };
@@ -271,6 +294,9 @@ fn a_configured_font_still_wins_over_the_bundled_default() {
     }
     if IOSEVKA_SEMIBOLD_ACTIVE {
         families.push(IOSEVKA_SEMIBOLD_FAMILY);
+    }
+    if IOSEVKA_NL_ACTIVE {
+        families.push(IOSEVKA_NL_FAMILY);
     }
     for family in families {
         assert!(
@@ -604,12 +630,7 @@ fn the_bundled_primary_resolves_real_bold_italic_and_bold_italic_faces() {
             (parsed.weight().to_number(), parsed.is_italic())
         })
         .collect();
-    let expected = if cfg!(windows) {
-        [(800, false), (600, true), (800, true)]
-    } else {
-        [(700, false), (400, true), (700, true)]
-    };
-    assert_eq!(styles, expected);
+    assert_eq!(styles, [(700, false), (400, true), (700, true)]);
     for (slot, id) in
         r.styled_faces
             .iter()
@@ -622,27 +643,53 @@ fn the_bundled_primary_resolves_real_bold_italic_and_bold_italic_faces() {
 
 #[test]
 #[cfg(all(feature = "embedded-font", windows))]
-fn the_windows_default_slots_are_the_semibold_and_extrabold_subsets() {
+fn the_windows_default_slots_are_the_regular_and_bold_files_without_their_ligature_features() {
+    use crate::no_ligatures::{LIGATURE_FEATURES, TAKEN_OUT, without_ligature_features};
     let r = default_sealed();
     let (primary, _) = r.chrome_primary_face().expect("primary bytes");
-    assert_eq!(
-        &primary[..],
-        include_bytes!("../assets/bundled/IosevkaTerm-SemiBold.ttf")
-    );
-    let files: [&[u8]; 3] = [
-        include_bytes!("../assets/bundled/IosevkaTerm-ExtraBold.ttf"),
-        include_bytes!("../assets/bundled/IosevkaTerm-SemiBoldItalic.ttf"),
-        include_bytes!("../assets/bundled/IosevkaTerm-ExtraBoldItalic.ttf"),
+    let drawn: Vec<&[u8]> = std::iter::once(&primary[..])
+        .chain(
+            r.styled_faces
+                .iter()
+                .map(|slot| &slot.as_ref().expect("slot filled").bytes[..]),
+        )
+        .collect();
+    let files: [&[u8]; 4] = [
+        include_bytes!("../assets/bundled/IosevkaTerm-Regular.ttf"),
+        include_bytes!("../assets/bundled/IosevkaTerm-Bold.ttf"),
+        include_bytes!("../assets/bundled/IosevkaTerm-Italic.ttf"),
+        include_bytes!("../assets/bundled/IosevkaTerm-BoldItalic.ttf"),
     ];
-    for (slot, file) in r.styled_faces.iter().zip(files) {
-        let face = slot.as_ref().expect("slot filled");
-        assert_eq!(&face.bytes[..], file);
+    for ((face, file), id) in drawn.into_iter().zip(files).zip(IOSEVKA_NL_FACES) {
+        assert_eq!(face, face_for_id(id).unwrap(), "{id}");
+        let cut = without_ligature_features(file).unwrap_or_else(|| panic!("{id}: nothing cut"));
+        assert_eq!(face, &cut[..], "{id}: the build's cut of the bundled file");
+        assert_eq!(face.len(), file.len(), "{id}");
+        let moved: Vec<usize> = (0..file.len()).filter(|&at| face[at] != file[at]).collect();
+        assert!(!moved.is_empty() && moved.len() <= 4, "{id}: {moved:?}");
+        let tag = moved[0]..moved[0] + 4;
+        assert!(moved.iter().all(|at| tag.contains(at)), "{id}: {moved:?}");
+        // A tag differs from `TAKEN_OUT` in its first byte at least, so `moved[0]` starts it.
+        assert_eq!(&face[tag.clone()], &TAKEN_OUT, "{id}");
+        assert_eq!(
+            &file[tag], b"calt",
+            "{id}: the one feature record the cut renames"
+        );
+        assert!(LIGATURE_FEATURES.contains(b"calt"));
+        assert_eq!(
+            without_ligature_features(face),
+            None,
+            "{id}: nothing is left to take out"
+        );
+        assert!(
+            crate::ligature_shaping::font_has_ligature_features(file, 0)
+                && !crate::ligature_shaping::font_has_ligature_features(face, 0),
+            "{id}"
+        );
     }
-    for id in IOSEVKA_FACES {
-        assert_ne!(&primary[..], face_for_id(id).unwrap(), "{id}");
-    }
+    assert_eq!(without_ligature_features(b"not a font"), None);
+    assert_eq!(without_ligature_features(&files[0][..64]), None);
 }
-
 #[test]
 #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
 fn the_test_set_resolves_in_the_declared_order_and_never_to_notdef() {
@@ -1117,9 +1164,12 @@ fn the_windows_default_draws_no_programming_ligatures() {
     for id in IOSEVKA_SEMIBOLD_FACES {
         assert_eq!(shaped_on(id), None, "{id} substitutes a glyph in {text:?}");
     }
+    for id in IOSEVKA_NL_FACES {
+        assert_eq!(shaped_on(id), None, "{id} substitutes a glyph in {text:?}");
+    }
     assert!(
         shaped_on(IOSEVKA_ID).is_some(),
-        "CONTROL: Iosevka Term (Regular) no longer ligates {text:?}"
+        "CONTROL: Iosevka Term, the file the default is cut from, no longer ligates {text:?}"
     );
 
     let cols = u16::try_from(chars.len()).unwrap();
@@ -1150,13 +1200,12 @@ fn the_windows_default_draws_no_programming_ligatures() {
             "{ch}"
         );
     }
-    let mut control =
-        Renderer::from_bytes(face_for_id(IOSEVKA_ID).unwrap(), 17.0, Theme::default()).unwrap();
+    let mut control = untreated_iosevka(WINDOWS_DEFAULT_PX);
     control.seal_admitted_font_sources();
     let plan = plan_of(&mut control);
     assert!(
         plan.iter().any(|c| *c != ColumnGlyph::PerCell),
-        "CONTROL: a renderer on Iosevka Term (Regular) planned no ligature: {plan:?}"
+        "CONTROL: a renderer on Iosevka Term by name planned no ligature: {plan:?}"
     );
 }
 
@@ -1252,7 +1301,7 @@ fn a_resolved_bundled_identity_reads_as_its_compiled_in_bytes() {
 }
 
 #[test]
-fn the_two_cell_glyphs_are_the_measured_fourteen_and_only_the_semibold_set_fits_them() {
+fn the_two_cell_glyphs_are_the_measured_fourteen_and_only_windows_iosevka_sets_fit_them() {
     let two_cell = |id: &str| -> Option<Vec<char>> {
         let face = aterm_font::Face::parse(face_for_id(id)?, 0).unwrap();
         let cell = face.glyph_hor_advance(face.glyph_index('M').unwrap())?;
@@ -1296,7 +1345,7 @@ fn the_two_cell_glyphs_are_the_measured_fourteen_and_only_the_semibold_set_fits_
             continue;
         };
         let fits = fits_two_cell_glyphs(bytes);
-        assert_eq!(fits, IOSEVKA_SEMIBOLD_FACES.contains(&id), "{id}");
+        assert_eq!(fits, windows_iosevka(id), "{id}");
         let copy = bytes.to_vec();
         assert_eq!(fits_two_cell_glyphs(&copy), fits, "{id}: a copy");
     }
@@ -1345,18 +1394,13 @@ fn the_windows_defaults_two_cell_glyphs_are_fitted_into_their_column() {
     let (key, ..) = cell_of(&mut r, '⇒');
     assert_eq!((key.source, key.cell_span), (FaceId::Primary, 0), "⇒");
 
-    let mut control = Renderer::from_bytes(
-        face_for_id(IOSEVKA_ID).unwrap(),
-        WINDOWS_DEFAULT_PX,
-        Theme::default(),
-    )
-    .unwrap();
+    let mut control = untreated_iosevka(WINDOWS_DEFAULT_PX);
     control.seal_admitted_font_sources();
     let (key, _, right) = cell_of(&mut control, '⟹');
     assert_eq!((key.source, key.cell_span), (FaceId::Primary, 0));
     assert!(
         right > i32::try_from(control.cell_size().0).unwrap(),
-        "CONTROL: Iosevka Term (Regular)'s own ⟹ fits its column ({right}), so this test \
+        "CONTROL: Iosevka Term by name's own ⟹ fits its column ({right}), so this test \
          cannot see the overflow it guards against"
     );
 }
@@ -1391,7 +1435,7 @@ fn wide_characters_of(id: &str) -> Option<Vec<(char, bool)>> {
 }
 
 #[test]
-fn the_wide_characters_are_the_measured_thirty_eight_and_only_the_semibold_set_yields_them() {
+fn the_wide_characters_are_the_measured_thirty_eight_and_only_windows_iosevka_sets_yield_them() {
     let expected: Vec<(char, bool)> = IOSEVKA_WIDE_CHARACTERS
         .iter()
         .map(|&ch| (ch, true))
@@ -1428,7 +1472,7 @@ fn the_wide_characters_are_the_measured_thirty_eight_and_only_the_semibold_set_y
             continue;
         };
         let yields = yields_wide_characters(bytes);
-        assert_eq!(yields, IOSEVKA_SEMIBOLD_FACES.contains(&id), "{id}");
+        assert_eq!(yields, windows_iosevka(id), "{id}");
         let copy = bytes.to_vec();
         assert_eq!(yields_wide_characters(&copy), yields, "{id}: a copy");
     }
@@ -1463,7 +1507,7 @@ fn the_windows_defaults_wide_characters_draw_centred_across_their_two_columns() 
     let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
     r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
     r.seal_admitted_font_sources();
-    assert_eq!(r.primary_source_path(), Some(IOSEVKA_SEMIBOLD_ID));
+    assert_eq!(r.primary_source_path(), Some(IOSEVKA_NL_ID));
     let mut cascadia = cascadia_sealed(WINDOWS_DEFAULT_PX);
     let cascadia_primary = format!("primary:{CASCADIA_ID}");
     for ch in IOSEVKA_WIDE_CHARACTERS {
@@ -1494,19 +1538,14 @@ fn the_windows_defaults_wide_characters_draw_centred_across_their_two_columns() 
         );
     }
 
-    let mut control = Renderer::from_bytes(
-        face_for_id(IOSEVKA_ID).unwrap(),
-        WINDOWS_DEFAULT_PX,
-        Theme::default(),
-    )
-    .unwrap();
+    let mut control = untreated_iosevka(WINDOWS_DEFAULT_PX);
     control.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
     control.seal_admitted_font_sources();
     let (key, left, right) = ink_of(&mut control, '✅');
     assert_eq!(key.source, FaceId::Primary);
     assert!(
         left >= 0 && right <= cw,
-        "CONTROL: Iosevka Term (Regular)'s own ✅ ({left}..{right}) leaves its left column, \
+        "CONTROL: Iosevka Term by name's own ✅ ({left}..{right}) leaves its left column, \
          so this test cannot see the half-width glyph it guards against"
     );
 }
@@ -1526,7 +1565,7 @@ fn windows_default_sealed() -> Renderer {
     let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
     r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
     r.seal_admitted_font_sources();
-    assert_eq!(r.primary_source_path(), Some(IOSEVKA_SEMIBOLD_ID));
+    assert_eq!(r.primary_source_path(), Some(IOSEVKA_NL_ID));
     r
 }
 
@@ -1631,50 +1670,114 @@ fn the_windows_default_evens_its_faces_spinner_frames() {
             .fold((f32::MAX, 0.0f32), |(lo, hi), &i| (lo.min(i), hi.max(i)));
         hi / lo
     };
-    for px in [32.0, 34.0, 42.5, 51.0] {
-        let mut r = Renderer::from_system(px, Theme::default()).unwrap();
-        r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
-        r.seal_admitted_font_sources();
-        let (cw, chh) = r.cell_size();
-        let (mut drawn, mut face) = (Vec::new(), Vec::new());
-        for ch in SPINNER_STARS {
-            let key = r.glyph_key(ch);
-            assert_ne!(key.source, FaceId::Procedural, "{ch} at {px} px");
-            let own = r.fitted_fallback_regular(key, ch).5;
-            let img = r.glyph_image(key).clone();
-            let top = r.baseline() - img.height() as i32 - img.ymin();
-            assert!(
-                img.xmin() >= 0
-                    && img.xmin() as usize + img.width() <= cw
-                    && top >= 0
-                    && top as usize + img.height() <= chh,
-                "{ch} at {px} px: leaves its {cw}x{chh} cell"
+    let rest_at = SPINNER_STARS
+        .iter()
+        .position(|&ch| ch == SPINNER_REST)
+        .unwrap();
+    // The default, and the Semibold set by name, whose heavier `*` the frames need no move for.
+    for family in [None, Some(IOSEVKA_SEMIBOLD_ID)] {
+        for px in [32.0, 34.0, 42.5, 51.0] {
+            let mut r = Renderer::from_system_with_family(family, px, Theme::default()).unwrap();
+            r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+            r.seal_admitted_font_sources();
+            assert_eq!(
+                r.primary_source_path(),
+                Some(family.unwrap_or(IOSEVKA_NL_ID))
             );
-            assert_eq!(img.bytes().iter().max(), Some(&255), "{ch} at {px} px");
-            if ch != '✳' {
-                let inked = img.bytes().iter().filter(|&&c| c > 0).count();
-                let solid = img.bytes().iter().filter(|&&c| c >= 230).count();
+            let (cw, chh) = r.cell_size();
+            let (mut drawn, mut face) = (Vec::new(), Vec::new());
+            let mut rest_is_the_faces = false;
+            for ch in SPINNER_STARS {
+                let key = r.glyph_key(ch);
+                assert_ne!(key.source, FaceId::Procedural, "{ch} at {px} px");
+                let own = r.fitted_fallback_regular(key, ch).5;
+                let img = r.glyph_image(key).clone();
+                let top = r.baseline() - img.height() as i32 - img.ymin();
                 assert!(
-                    7 * solid >= inked,
-                    "{ch} at {px} px: {solid} of {inked} solid"
+                    img.xmin() >= 0
+                        && img.xmin() as usize + img.width() <= cw
+                        && top >= 0
+                        && top as usize + img.height() <= chh,
+                    "{ch} at {px} px: leaves its {cw}x{chh} cell"
                 );
+                assert_eq!(img.bytes().iter().max(), Some(&255), "{ch} at {px} px");
+                if ch != '✳' {
+                    let inked = img.bytes().iter().filter(|&&c| c > 0).count();
+                    let solid = img.bytes().iter().filter(|&&c| c >= 230).count();
+                    assert!(
+                        7 * solid >= inked,
+                        "{ch} at {px} px: {solid} of {inked} solid"
+                    );
+                }
+                if ch == SPINNER_REST {
+                    rest_is_the_faces = img.bytes() == own;
+                }
+                drawn.push(ink(img.bytes()));
+                face.push(ink(&own));
             }
-            if ch == SPINNER_REST {
-                assert_eq!(img.bytes(), own, "{ch} at {px} px: the face's own");
-            }
-            drawn.push(ink(img.bytes()));
-            face.push(ink(&own));
-        }
-        assert!(
-            spread(&drawn) <= SPINNER_FRAME_SPREAD + 0.01,
-            "{px} px: frame inks {drawn:?}"
-        );
-        assert!(spread(&face) >= 2.0, "control at {px} px: {face:?}");
-        if px == 34.0 {
+            assert!(
+                spread(&drawn) <= SPINNER_FRAME_SPREAD + 0.01,
+                "{family:?} at {px} px: frame inks {drawn:?}"
+            );
+            assert!(
+                spread(&face) >= 2.0,
+                "control, {family:?} at {px} px: {face:?}"
+            );
+            // Claude Code's cycle shows the primary's own `*` where `✳` stands. The frames
+            // stay within the cycle's spread of it, or within the rest's own ratio to it where
+            // the rest, kept as the face draws it, lies past that.
             let key = r.glyph_key('*');
             let star = ink(r.glyph_image(key).bytes());
-            let cycle = [drawn[0], star, drawn[2], drawn[3], drawn[4]];
-            assert!(spread(&cycle) <= 1.5, "Claude Code's cycle {cycle:?}");
+            let cycle = |frames: &[f32]| [frames[0], star, frames[2], frames[3], frames[4]];
+            assert!(
+                rest_is_the_faces,
+                "{family:?}: {SPINNER_REST} at {px} px is the face's own"
+            );
+            let bound = SPINNER_CYCLE_SPREAD.max(face[rest_at] / star);
+            assert!(
+                spread(&cycle(&drawn)) <= bound + 0.01,
+                "{family:?} at {px} px: Claude Code's cycle {:?} past {bound}",
+                cycle(&drawn)
+            );
+            assert!(
+                spread(&cycle(&face)) >= 2.0,
+                "control, {family:?} at {px} px: the face's own cycle {:?}",
+                cycle(&face)
+            );
+            if px != 34.0 {
+                continue;
+            }
+            // Evened about the rest alone, the heaviest frame's ink.
+            let uncapped =
+                crate::evened_ink(&face, face[4], Some(face[rest_at]), SPINNER_FRAME_SPREAD)
+                    .expect("the face's frames span more than the spread");
+            if family.is_some() {
+                // The Semibold's `*` holds every evened frame within the cycle's spread.
+                assert!(
+                    spread(&cycle(&drawn)) <= SPINNER_CYCLE_SPREAD,
+                    "the Semibold's cycle {:?}",
+                    cycle(&drawn)
+                );
+                assert!((drawn[4] - uncapped).abs() <= 0.02 * uncapped, "{drawn:?}");
+            } else {
+                // The Regular's lighter `*` does not hold even the rest within it, so the
+                // heavier frame comes down to the rest (evened alone it measured 1.74 of the
+                // `*`).
+                assert!(
+                    face[rest_at] > SPINNER_CYCLE_SPREAD * star,
+                    "{face:?} {star}"
+                );
+                assert!(
+                    uncapped > 1.05 * face[rest_at] && uncapped > 1.7 * star,
+                    "control: evened alone the heaviest frame holds {uncapped}"
+                );
+                assert!(
+                    drawn[4] <= 1.01 * face[rest_at],
+                    "the heaviest frame {} outweighs the rest {}",
+                    drawn[4],
+                    face[rest_at]
+                );
+            }
         }
     }
 }
@@ -1728,19 +1831,14 @@ fn the_windows_defaults_asterisk_sits_level_with_the_spinner_frames() {
         }
     }
     assert!(off.is_empty(), "{off:#?}");
-    let mut control = Renderer::from_bytes(
-        face_for_id(IOSEVKA_ID).unwrap(),
-        WINDOWS_DEFAULT_PX,
-        Theme::default(),
-    )
-    .unwrap();
+    let mut control = untreated_iosevka(WINDOWS_DEFAULT_PX);
     control.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
     control.seal_admitted_font_sources();
     let (_, _, star) = ink_band(&mut control, '*', StyleBits::REGULAR);
     let (_, _, plus) = ink_band(&mut control, '+', StyleBits::REGULAR);
     assert!(
         plus - star >= 4.0,
-        "CONTROL: Iosevka Term (Regular)'s `*` (row {star}) is not raised above its `+` \
+        "CONTROL: Iosevka Term by name's `*` (row {star}) is not raised above its `+` \
          ({plus}), so this test cannot see the hop it guards against"
     );
 }
@@ -1755,10 +1853,9 @@ const STYLES: [crate::StyleBits; 4] = [
 
 #[test]
 #[cfg(all(windows, feature = "embedded-font"))]
-fn only_the_semibold_faces_lower_their_own_asterisk() {
+fn only_the_windows_iosevka_faces_lower_their_own_asterisk() {
     use crate::hinted::{HintBank, HintMode, hinted_glyph_raster};
-    let mut r = windows_default_sealed();
-    for (id, style) in IOSEVKA_SEMIBOLD_FACES.into_iter().zip(STYLES) {
+    let lowered_of = |id: &str| {
         let bytes = face_for_id(id).unwrap();
         let lowered = lowered_asterisk(bytes).unwrap_or_else(|| panic!("{id}"));
         let copy = bytes.to_vec();
@@ -1769,6 +1866,14 @@ fn only_the_semibold_faces_lower_their_own_asterisk() {
             Some(lowered.gid),
             "{id}"
         );
+        (bytes, lowered, face.is_italic())
+    };
+    for id in IOSEVKA_SEMIBOLD_FACES {
+        lowered_of(id);
+    }
+    let mut r = windows_default_sealed();
+    for (id, style) in IOSEVKA_NL_FACES.into_iter().zip(STYLES) {
+        let (bytes, lowered, italic) = lowered_of(id);
         let inst = HintBank::default()
             .instance(1, bytes, 0, WINDOWS_DEFAULT_PX, HintMode::Full, &[], 0)
             .unwrap();
@@ -1783,7 +1888,7 @@ fn only_the_semibold_faces_lower_their_own_asterisk() {
         );
         assert_eq!(img.ymin(), ymin - 5, "{id}: 5 rows lower");
         let left = xmin - img.xmin();
-        let reach = if face.is_italic() { 0..=1 } else { 0..=0 };
+        let reach = if italic { 0..=1 } else { 0..=0 };
         assert!(reach.contains(&left), "{id}: moved {left} px left");
     }
     for id in IOSEVKA_FACES
@@ -1796,35 +1901,53 @@ fn only_the_semibold_faces_lower_their_own_asterisk() {
         assert_eq!(lowered_asterisk(bytes), None, "{id}");
     }
 }
+
 #[test]
 #[cfg(all(windows, feature = "embedded-font"))]
 fn the_windows_defaults_cjk_comes_in_the_cut_nearest_its_weight() {
-    let fonts = std::path::Path::new("C:\\Windows\\Fonts");
-    let needed = ["msyh.ttc", "msyhbd.ttc", "malgun.ttf", "malgunbd.ttf"];
+    // Han and kana come from the face the user's languages read first (`han_reading_order`):
+    // Microsoft YaHei, whose cut nearest a 600 primary is its Bold, or (for a user who reads
+    // Japanese first) Yu Gothic, whose nearest is its Medium.
+    let (han_heavy, han_plain, han_gain) = if crate::win_locale::user_reads_japanese_first() {
+        ("YuGothM.ttc", "YuGothR.ttc", 5)
+    } else {
+        ("msyhbd.ttc", "msyh.ttc", 6)
+    };
+    let fonts = crate::windows_fonts_dir();
+    let needed = [han_heavy, han_plain, "malgun.ttf", "malgunbd.ttf"];
     if let Some(absent) = needed.iter().find(|f| !fonts.join(f).is_file()) {
         aterm_spec::host::could_not_run(format!("{absent} is not installed here"));
     }
-    let mut r = windows_default_sealed();
-    let mut regular = cascadia_sealed(WINDOWS_DEFAULT_PX);
-    regular.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
-    for (ch, bold, plain) in [
-        ('中', "msyhbd.ttc", "msyh.ttc"),
-        ('確', "msyhbd.ttc", "msyh.ttc"),
-        ('つ', "msyhbd.ttc", "msyh.ttc"),
-        ('한', "malgunbd.ttf", "malgun.ttf"),
+    let mut regular = windows_default_sealed();
+    let mut heavy = Renderer::from_system_with_family(
+        Some(IOSEVKA_SEMIBOLD_ID),
+        WINDOWS_DEFAULT_PX,
+        Theme::default(),
+    )
+    .unwrap();
+    heavy.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+    heavy.seal_admitted_font_sources();
+    assert_eq!(heavy.primary_source_path(), Some(IOSEVKA_SEMIBOLD_ID));
+    for (ch, bold, plain, gain) in [
+        ('中', han_heavy, han_plain, han_gain),
+        ('確', han_heavy, han_plain, han_gain),
+        ('つ', han_heavy, han_plain, han_gain),
+        ('한', "malgunbd.ttf", "malgun.ttf", 5),
     ] {
-        let got = r.debug_fallback_pick_path(ch).unwrap_or_default();
-        assert!(got.ends_with(bold), "{ch}: drawn from {got}, not {bold}");
+        let got = heavy.debug_fallback_pick_path(ch).unwrap_or_default();
+        assert!(
+            got.ends_with(bold),
+            "{ch} (Semibold primary): drawn from {got}, not {bold}"
+        );
         let got = regular.debug_fallback_pick_path(ch).unwrap_or_default();
         assert!(
             got.ends_with(plain),
-            "{ch} (Regular primary): drawn from {got}"
+            "{ch} (the Regular default): drawn from {got}, not {plain}"
         );
-        let ((heavy, _), (light, _)) = (ink_of(&mut r, ch), ink_of(&mut regular, ch));
-        let gain = if bold.starts_with("msyh") { 6 } else { 5 };
+        let ((dark, _), (light, _)) = (ink_of(&mut heavy, ch), ink_of(&mut regular, ch));
         assert!(
-            5 * heavy > gain * light,
-            "{ch}: the Bold cut inks {heavy} texels, the Regular {light}"
+            5 * dark > gain * light,
+            "{ch}: the heavier cut inks {dark} texels, the Regular {light}"
         );
     }
 }

@@ -23,8 +23,8 @@ pub use record::{
 pub use stamp::{ProgramStamp, stamp_path};
 pub(crate) use table::LEGACY_CEILING;
 pub use table::{
-    AccountState, Anchor, DocPin, GROK_SIGNIN_GATE, NEVER_INDEX_PINNED, SigninGate, VENDORS,
-    VendorSpec, Warm, is_vendor, served_here, spec,
+    AccountState, Anchor, DocPin, GROK_SIGNIN_GATE, Login, NEVER_INDEX_PINNED, Profile, SigninGate,
+    VENDORS, VendorSpec, Warm, is_vendor, served_here, spec,
 };
 pub use version::{BuildDate, VENDOR_BUILD_BASE, Version, is_vendor_build};
 
@@ -69,12 +69,18 @@ pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u6
     if crate::alab::build_is_alab(layout, program, build) {
         return crate::alab::build_words(layout, program, build);
     }
-    if let Some(v) =
-        stamp::ProgramStamp::read(layout, program).and_then(|stamp| stamp.legacy_version_of(build))
-    {
+    if let Some(v) = legacy_version(layout, program, build) {
         return v.to_string();
     }
     build_words(build)
+}
+
+/// The version `program`'s legacy index build `build` carries, as an earlier pass of the lane
+/// read it from the build's signed manifest and kept it in the program's stamp
+/// ([`ProgramStamp`]); `None` for a vendor build id, and for a build no pass has read. Offline.
+#[must_use]
+pub fn legacy_version(layout: &crate::store::Layout, program: &str, build: u64) -> Option<Version> {
+    stamp::ProgramStamp::read(layout, program).and_then(|stamp| stamp.legacy_version_of(build))
 }
 
 /// Format `build` for a table column (version for vendor-direct builds, number for index builds).

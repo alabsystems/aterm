@@ -8,6 +8,9 @@ use aterm_spec::interp::State;
 use aterm_uds::private_file::PrivateLock;
 use std::time::Duration;
 
+#[path = "local_projection_tests.rs"]
+mod local;
+
 fn locked(dir: &Path, name: &str) -> bool {
     match PrivateLock::take(dir, name, Duration::ZERO, "projection custody") {
         Ok(_) => false,
@@ -17,6 +20,9 @@ fn locked(dir: &Path, name: &str) -> bool {
 }
 
 fn check(scenario: i64, mutant: u8) -> State {
+    if scenario >= 11 {
+        return local::check(scenario, mutant);
+    }
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
@@ -30,13 +36,13 @@ fn check(scenario: i64, mutant: u8) -> State {
     let table = directory.path(scope).unwrap();
     let catalog = directory.path(directory.catalog_scope()).unwrap();
     let control = paths.dir.join("commons/control");
-    let mut expected = registry.observe_source(&config).unwrap().unwrap().revision;
+    let mut expected = registry.observe_projection(&config).unwrap().revision;
     let mut vault_config = client::config(paths).unwrap().unwrap();
     let wrong = Paths::for_home(&paths.home.join("foreign-vault"));
     let entry_vault = if scenario == 6 { &wrong } else { paths };
     let mut table_owner = None;
     match scenario {
-        2 => expected.inventory.0[0] ^= 1,
+        2 => expected.source.revision.inventory.0[0] ^= 1,
         3 => fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap(),
         4 => std::fs::rename(catalog.join("table.lock"), catalog.join("saved-lock")).unwrap(),
         5 => {
@@ -156,15 +162,32 @@ fn native_projection_refines_current_subscriber_and_data_custody() {
             }
         }
     }
-    assert_eq!(cases, 11);
+    assert_eq!(cases, 39);
     for (mutant, scenario, law) in [
         (1, 2, "AdmittedInputs"),
         (2, 0, "DataCustody"),
         (3, 1, "ReaderAndWriterAvailable"),
+        (1, 26, "AdmittedInputs"),
+        (1, 27, "AdmittedInputs"),
+        (1, 28, "AdmittedInputs"),
+        (1, 29, "AdmittedInputs"),
+        (1, 30, "AdmittedInputs"),
+        (1, 31, "AdmittedInputs"),
+        (2, 11, "DataCustody"),
+        (3, 17, "ReaderAndWriterAvailable"),
+        (4, 15, "ReaderAndWriterAvailable"),
+        (4, 16, "ReaderAndWriterAvailable"),
+        (5, 15, "ReaderAndWriterAvailable"),
+        (5, 16, "ReaderAndWriterAvailable"),
+        (4, 36, "AdmittedInputs"),
+        (4, 37, "AdmittedInputs"),
+        (5, 34, "AdmittedInputs"),
+        (5, 35, "AdmittedInputs"),
     ] {
+        let result = check(scenario, mutant);
         assert!(
-            !model.check_invariant(law, &check(scenario, mutant)),
-            "{law}"
+            !model.check_invariant(law, &result),
+            "{law}: mutant={mutant} {result:?}"
         );
     }
 }
@@ -196,6 +219,40 @@ fn retained_subscriber_keeps_read_only_session_authority() {
     )
     .unwrap();
     assert_eq!(crate::tests::files(&paths.dir), before);
+}
+
+/// A retained session's checks (`ReadValidation::current`) each judge the vault afresh through the
+/// retained look's glance, as each did before a look kept what it derived
+/// (`client::VaultLook::forget_derived`): a check after another stamps the Commons observation's
+/// files and looks at `state.toml` again (`client::test_look_derivations`). Each judges through
+/// the glance, each file's `lstat` as the look first saw it, so a file changed during the look
+/// without the state lock can be given the look's first answer (`client::VaultLook`); the next
+/// session's open judges it afresh.
+/// NEGATIVE CONTROL (2026-11-11): with `with_retained_session` letting its looks keep what they
+/// derived across its checks (no `forget_derived`), the next check stamps nothing (every count 0,
+/// `a retained session's next check stamps the vault afresh`).
+#[test]
+fn a_retained_sessions_checks_each_judge_the_vault_afresh() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    Registry::at(paths.clone()).open().unwrap();
+    crate::generation::with_retained_session(
+        paths,
+        paths,
+        crate::admission::deadline(),
+        |_, _, validate| {
+            (validate.current)()?;
+            let before = client::test_look_derivations();
+            (validate.current)()?;
+            let derived = client::test_look_derivations().since(before);
+            assert!(
+                derived.derived.observation_stamps >= 1 && derived.derived.state_looks >= 1,
+                "a retained session's next check stamps the vault afresh: {derived:?}"
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -232,7 +289,8 @@ fn native_projection_refuses_a_hidden_successor_declaration() {
     let registry = Registry::at(paths.clone());
     let scope = registry.open().unwrap();
     let config = paths.home.join("source.toml");
-    let expected = registry.observe_source(&config).unwrap().unwrap();
+    let expected = registry.observe_projection(&config).unwrap();
+    assert_eq!(expected.table(), scope.digest());
     let vault = client::config(paths).unwrap().unwrap();
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
@@ -266,10 +324,7 @@ fn native_projection_refuses_a_hidden_successor_declaration() {
     .unwrap();
     catalog.ingest(&session, &wire).unwrap();
     drop((catalog, session));
-    assert_eq!(
-        registry.observe_source(&config).unwrap().unwrap().table(),
-        scope.digest()
-    );
+    assert!(registry.observe_projection(&config).is_err());
     let before = crate::tests::files(&paths.dir);
     let mut called = false;
     let result = registry.with_admitted_projection(

@@ -584,17 +584,25 @@ fn bounded_stdout_at(
     if started.elapsed() >= bound {
         return None;
     }
+    // A file that is no program for this machine (a script, a truncated download) makes
+    // Windows' CreateProcess raise a system box ("This version of %1 is not compatible") and
+    // wait for a person to answer it, unless an error mode turns the box off. The bound is read
+    // only once the start returns, so it could not end that wait, and std's process-wide
+    // spawn lock would hold every other start of this process behind it. With this thread's
+    // boxes off the start fails at once and the probe answers no compiler.
+    let quiet = aterm_sysprobe::quiet_errors();
     #[expect(
         clippy::disallowed_types,
         reason = "a std-only probe: this crate takes no dependency, so it cannot reach aterm-uds"
     )]
-    let mut child = std::process::Command::new(program)
+    let started_child = std::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .spawn();
+    drop(quiet);
+    let mut child = started_child.ok()?;
     let pipe = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {

@@ -190,6 +190,8 @@ dev-seams = [
 ]
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 # `plain_durable_flushes_in_tests!`: fabric_world, aterm_suite and the binary's own unit tests
 # mark their process trees as a test's, so their durable writes, and the instances and brokers
 # they start, take a plain `fsync(2)`.

@@ -20,7 +20,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use aterm_net::fleet::link::{
 use aterm_net::fleet::{FleetOp, FleetScope, NodeIdentity};
 use aterm_session::SessionId;
 use aterm_types::MutexExt as _;
+use aterm_types::fleet_access::{DriveKind, FleetAccess};
 use aterm_uds::stop::Stop;
 use aterm_uds::{CtlListener, CtlStream};
 
@@ -44,9 +45,9 @@ mod window_start;
 
 use super::{
     CENSUS_REFRESH_EVERY, DENY_LIST_UNREAD, DeniedCache, FACTS_HEARTBEAT_EVERY, HeartbeatClock,
-    Serving, Wanted, admit_driver_at, admit_linked_driver_at, denied_under, fleet_event,
-    fleet_slots, grants_of, heartbeat_every, holds_in, judge_vault_join_at, level_of, lifetime,
-    lists_driver_at, lists_linked_driver_at, maybe_refresh_local_census_at, note_refused_driver,
+    Serving, Wanted, admit_driver_at, admit_linked_driver_at, fleet_event, fleet_slots, grants_of,
+    heartbeat_every, holds_in, judge_vault_join_at, level_of, lifetime, lists_driver_at,
+    lists_linked_driver_at, maybe_refresh_local_census_at, note_refused_driver,
     push_facts_to_issuer_with_denied, receive_pushed_facts_at, refuse_driver, register_member_at,
     retry, serve_census_request_at, serve_mail_code_request_at, share_book_at, share_units,
     spawn_member_heartbeat_at, update_denied_nodes_cache,
@@ -55,8 +56,11 @@ use super::{
 const RELAY_PREFIX: &str = "wf-";
 const RELAY_SUFFIX: &str = ".sock";
 /// A relay header's bound, and a window's answer to one: a drive's carries the sessions its line
-/// names (an `await task` may name many), so the line's own bound plus the rest of the header.
-const RELAY_HEADER_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE + 1024;
+/// names (an `await task` may name many), so the line's own bound, its requester line
+/// percent-encoded (three bytes a byte at most), and the rest of the header.
+const RELAY_HEADER_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE
+    + 3 * aterm_types::control_verbs::REQUESTER_LINE_MAX
+    + 1024;
 #[cfg(not(test))]
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// A unit test's window relays are its own, which answer, and its hand-overs run on node-job
@@ -67,9 +71,9 @@ const RELAY_CONNECT_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// hand-over, within aterm-net's `HANDSHAKE_WITHIN`; a unit test's dialers and windows are its
 /// own, which answer, so theirs wait the hang detector.
 #[cfg(not(test))]
-const HANDSHAKE: Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
+pub(crate) const HANDSHAKE: Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
 #[cfg(test)]
-const HANDSHAKE: Duration = aterm_spec::wait::MUST_HAPPEN;
+pub(crate) const HANDSHAKE: Duration = aterm_spec::wait::MUST_HAPPEN;
 const DEFAULT_WAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_COOLDOWN: Duration = Duration::from_secs(5);
 /// How long `open -g -a` may take to hand the app to Launch Services before the spawn reports it
@@ -80,6 +84,8 @@ const DEFAULT_FLEET_LISTEN: &str = "0.0.0.0:7100";
 
 static WINDOW_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
 static WINDOW_RELAY_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The `applies` [`start_window_fleet_relay`] was given, which its thread reads as it starts.
+static WINDOW_RELAY_APPLIES: AtomicBool = AtomicBool::new(false);
 
 /// Run `open` (described as `what`) to its end within `within`: past it, the run is killed and
 /// reported stuck, and a non-zero exit is reported with what it wrote to stderr.
@@ -252,10 +258,19 @@ pub(crate) enum RelayHeader {
         /// window takes it only if it hosts or keeps every one, and answers `ELSEWHERE` if not
         /// ([`handle_relay_accept`]). Empty: any window takes it.
         sids: Vec<SessionId>,
+        /// Who on the driving Mac asked for it, as the drive's first line named them
+        /// ([`aterm_types::control_verbs::Requester`]): the node job read that line and hands it
+        /// on here, in the header a window of another build refuses as a whole (`unknown DRIVE
+        /// key`, `missing requester`), never as a line ahead of the drive's requests that such
+        /// a window would serve as one.
+        requester: aterm_types::control_verbs::Requester,
     },
     /// A Mac with no fleet secret asking to join ALab from `peer`: the window's members desk
     /// serves it once the node job writes `go` (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
     Ask { peer: SocketAddr },
+    /// The node job asking whether this process applies this Mac's staged updates now (§4.13): it
+    /// answers `yes` or `no` ([`WindowApplies::answer`]) and takes nothing over.
+    Applies,
     /// The node job's read of the window's needs (`docs/DESIGN-alab-one-mesh-2026-11-05.md`
     /// §4.14): once the node job writes `go`, the window writes its needs row as one frame
     /// ([`write_needs_frame`]) and another each time it changes, until the node job hangs up.
@@ -280,6 +295,7 @@ impl RelayHeader {
                 key,
                 peer,
                 sids,
+                requester,
             } => {
                 let mut line = format!(
                     "DRIVE node={} host={}",
@@ -296,10 +312,14 @@ impl RelayHeader {
                 if !sids.is_empty() {
                     line.push_str(&format!(" sids={}", sid_list(sids)));
                 }
+                let named = requester.line();
+                line.push_str(" requester=");
+                aterm_codec::pct::encode_into(&mut line, named.trim_end_matches('\n'));
                 line.push('\n');
                 line
             }
             Self::Ask { peer } => format!("ASK peer={peer}\n"),
+            Self::Applies => "APPLIES\n".to_owned(),
             Self::Needs => "NEEDS\n".to_owned(),
         }
     }
@@ -365,6 +385,7 @@ impl RelayHeader {
                 let mut key = None;
                 let mut peer = None;
                 let mut sids = None;
+                let mut requester = None;
                 for word in words {
                     let Some((k, v)) = word.split_once('=') else {
                         return Err("malformed DRIVE token");
@@ -413,6 +434,14 @@ impl RelayHeader {
                                 return Err("duplicate DRIVE key");
                             }
                         }
+                        "requester" => {
+                            let parsed = aterm_types::control_verbs::Requester::parse(
+                                &aterm_codec::pct::decode(v),
+                            )?;
+                            if requester.replace(parsed).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
+                        }
                         _ => return Err("unknown DRIVE key"),
                     }
                 }
@@ -424,6 +453,7 @@ impl RelayHeader {
                     key,
                     peer: peer.ok_or("missing peer field")?,
                     sids: sids.unwrap_or_default(),
+                    requester: requester.ok_or("missing requester")?,
                 })
             }
             "ASK" => match (words.next(), words.next()) {
@@ -435,6 +465,10 @@ impl RelayHeader {
                         .map_err(|_| "invalid peer addr")?,
                 }),
                 _ => Err("malformed ASK header"),
+            },
+            "APPLIES" => match words.next() {
+                None => Ok(Self::Applies),
+                Some(_) => Err("malformed APPLIES header"),
             },
             "NEEDS" => match words.next() {
                 None => Ok(Self::Needs),
@@ -477,9 +511,261 @@ fn sweep_dead_relay_sockets(relay_dir: &Path) {
     }
 }
 
+/// Whether this process may apply this Mac's staged updates at all, read once for the process: a
+/// window on a copy the updater may replace. A headless process starts no checker and reconciles
+/// nothing, and a dev bundle, a bare build or a mounted or translocated copy is not installable, so
+/// the node job must not wait on one. Off macOS nothing asks (`LiveNodeUpdater`). Where it may,
+/// [`WindowApplies::answer`] says whether it does now.
+pub(crate) const fn window_applies_updates(headless: bool, installable: Option<bool>) -> bool {
+    !headless && !matches!(installable, Some(false))
+}
+
+/// How long the node job defers a staged build to a window whose automatic lane may still land it
+/// (§4.13): as long as a newer build may wait on this machine before it is overdue. That is many
+/// times the automatic lane's own bound (asserted at least four times), so a window that lands its
+/// update by itself always has the time. Past it, the window lets the job install the build on
+/// disk and switches to it as an installed activation. Its own switch still waits for unsaved
+/// work and never loses a session.
+pub(crate) const WINDOW_HOLDS_AN_UPDATE_WITHIN: Duration =
+    Duration::from_secs(aterm_update::PENDING_UPDATE_OVERDUE_SECS);
+
+/// How far apart the node job's asks may come and still be one run of deferring
+/// ([`WindowHold::ask`]). Its looks come every [`UPDATE_LOOK_EVERY`], and a boot that found the
+/// build and failed to run it pauses them for [`RETRY_LEFT_AFTER`]; neither pause restarts the
+/// window's bound. A longer silence means the job stopped deferring (nothing newer, or no job).
+const ASKS_UNBROKEN_WITHIN: Duration =
+    Duration::from_secs(2 * aterm_update::PENDING_UPDATE_OVERDUE_SECS);
+
+const _: () = assert!(
+    WINDOW_HOLDS_AN_UPDATE_WITHIN.as_secs()
+        >= 4 * (crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+            + crate::native_update_auto_intent::SWITCH_ALLOWANCE.as_secs())
+        && ASKS_UNBROKEN_WITHIN.as_secs()
+            > RETRY_LEFT_AFTER.as_secs() + UPDATE_LOOK_EVERY.as_secs()
+        && ASKS_UNBROKEN_WITHIN.as_secs() > WINDOW_HOLDS_AN_UPDATE_WITHIN.as_secs(),
+    "a window that lands its update by itself must have its own lane's bound several times over \
+     before the node job installs it, and neither the job's look interval nor its hour's pause \
+     after a failed boot may restart the window's bound, or a hold renews itself for good"
+);
+
+/// What a window's update lane says of this Mac's staged build, as its event loop last saw it
+/// ([`WindowApplies::note_lane`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WindowUpdateLane {
+    /// Its automatic lane may land the build by itself: its intent is armed, waiting for a quiet
+    /// moment or for unsaved work, or nothing is staged in its view. It holds the node job for
+    /// [`WINDOW_HOLDS_AN_UPDATE_WITHIN`].
+    Lands = 0,
+    /// A person's setting holds updates here (`[update] auto_apply = false` in the window's
+    /// config, or the relaunch-nudge seam). It holds the job with no bound. The window owns its
+    /// boot trial whatever the setting, and the job, which reads the same setting itself, would
+    /// install nothing either.
+    PersonHolds = 1,
+    /// Its automatic lane will not land the staged download by itself now. The in-session
+    /// handoff cannot run here, the lane stood down for that build, or the kept image installs it
+    /// only at the next launch. It holds nothing: the job installs the build on disk through the
+    /// same verification, under a boot trial of its own. A window that can hand off then
+    /// switches to it as an installed activation, and one that cannot runs it at its next launch.
+    Leaves = 2,
+    /// Its staged build is already installed in its place, so the job has nothing to install; what
+    /// is left is this window's switch to it. That boot trial waits on this window's launch, so a
+    /// start of the job on those bytes would not count against it (`aterm_update`'s window wait).
+    /// A job crash-looping on them would then go unreverted for that wait. It holds the job,
+    /// as every window did, until it switches, its lane installs something newer, or it exits.
+    Activates = 3,
+}
+
+impl WindowUpdateLane {
+    /// The lane of a window whose person's setting `holds` updates, and whose staged build, if
+    /// any, has `posture` ([`crate::App::apply_posture_for`]) and is an installed activation
+    /// where `activation`.
+    pub(crate) const fn of(
+        holds: bool,
+        activation: bool,
+        posture: Option<crate::update_words::ApplyPosture>,
+    ) -> Self {
+        use crate::update_words::ApplyPosture as P;
+        if holds {
+            return Self::PersonHolds;
+        }
+        if activation && posture.is_some() {
+            return Self::Activates;
+        }
+        match posture {
+            None | Some(P::Automatic) => Self::Lands,
+            Some(
+                P::ManualByConfig
+                | P::VetoedByEnv { .. }
+                | P::HandoffDisabled { veto: Some(_), .. },
+            ) => Self::PersonHolds,
+            Some(
+                P::HandoffDisabled { veto: None, .. }
+                | P::ManualOnlyLatched { .. }
+                | P::TrialSpent
+                | P::AtNextLaunch,
+            ) => Self::Leaves,
+        }
+    }
+
+    const fn from_u8(lane: u8) -> Self {
+        match lane {
+            1 => Self::PersonHolds,
+            2 => Self::Leaves,
+            3 => Self::Activates,
+            _ => Self::Lands,
+        }
+    }
+}
+
+/// How long the node job has deferred a build to this window: the run of its asks this window held,
+/// for the staged build its event loop last named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowHold {
+    /// The staged build the run is for, `0` where none is staged in the window's view.
+    staged: u64,
+    /// The first ask of the run, and the latest.
+    since: Option<(Instant, Instant)>,
+    /// Whether the log has said this run outlasted the bound.
+    told: bool,
+}
+
+/// What [`WindowHold::ask`] answers and whether the hold has just run out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HoldAnswer {
+    pub(crate) holds: bool,
+    /// The hold ran out at this ask, after holding the job this long, and nothing said so yet.
+    pub(crate) ran_out: Option<Duration>,
+}
+
+impl WindowHold {
+    /// Whether the window still holds the node job at its ask at `now`, its lane `lane` and its
+    /// staged build `staged`. Only [`WindowUpdateLane::Lands`] runs the clock. Any other lane ends
+    /// the run, as do another staged build and a silence longer than [`ASKS_UNBROKEN_WITHIN`].
+    pub(crate) fn ask(&mut self, lane: WindowUpdateLane, staged: u64, now: Instant) -> HoldAnswer {
+        let holds = |holds| HoldAnswer {
+            holds,
+            ran_out: None,
+        };
+        match lane {
+            WindowUpdateLane::PersonHolds | WindowUpdateLane::Activates => {
+                *self = Self::default();
+                holds(true)
+            }
+            WindowUpdateLane::Leaves => {
+                *self = Self::default();
+                holds(false)
+            }
+            WindowUpdateLane::Lands => {
+                let first = match self.since {
+                    Some((first, latest))
+                        if self.staged == staged
+                            && now.saturating_duration_since(latest) <= ASKS_UNBROKEN_WITHIN =>
+                    {
+                        first
+                    }
+                    _ => {
+                        *self = Self {
+                            staged,
+                            ..Self::default()
+                        };
+                        now
+                    }
+                };
+                self.since = Some((first, now));
+                let held = now.saturating_duration_since(first);
+                if held < WINDOW_HOLDS_AN_UPDATE_WITHIN {
+                    return holds(true);
+                }
+                let ran_out = (!self.told).then_some(held);
+                self.told = true;
+                HoldAnswer {
+                    holds: false,
+                    ran_out,
+                }
+            }
+        }
+    }
+}
+
+/// This window's live answer to [`RelayHeader::Applies`] (§4.13). Its event loop publishes its
+/// update lane on every turn ([`Self::note_lane`]), and the relay's own threads keep
+/// [`WindowHold`]'s clock from the node job's asks. A window whose event loop is stuck therefore
+/// still lets the job install within the bound.
+pub(crate) struct WindowApplies {
+    /// Set once this window's event loop has ended ([`window_stops_applying`]).
+    stopped: AtomicBool,
+    /// The [`WindowUpdateLane`] its event loop last published.
+    lane: AtomicU8,
+    /// The staged build its event loop last published, `0` for none.
+    staged: AtomicU64,
+    hold: Mutex<WindowHold>,
+}
+
+impl WindowApplies {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stopped: AtomicBool::new(false),
+            lane: AtomicU8::new(WindowUpdateLane::Lands as u8),
+            staged: AtomicU64::new(0),
+            hold: Mutex::new(WindowHold {
+                staged: 0,
+                since: None,
+                told: false,
+            }),
+        }
+    }
+
+    /// The event loop's word on its lane and its staged build, which it gives on every turn. Two
+    /// stores without a lock: an ask between them reads the old lane with the new build, and the
+    /// next ask reads both.
+    pub(crate) fn note_lane(&self, lane: WindowUpdateLane, staged: Option<u64>) {
+        self.staged.store(staged.unwrap_or(0), Ordering::Release);
+        self.lane.store(lane as u8, Ordering::Release);
+    }
+
+    /// From here on it answers `no` ([`window_stops_applying`]).
+    pub(crate) fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// What the relay answers at `now`, of the `applies` [`window_applies_updates`] read once for
+    /// the process.
+    pub(crate) fn answer(&self, applies: bool, now: Instant) -> bool {
+        if !applies || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let lane = WindowUpdateLane::from_u8(self.lane.load(Ordering::Acquire));
+        let staged = self.staged.load(Ordering::Acquire);
+        let answer = self.hold.lock_or_recover().ask(lane, staged, now);
+        if let Some(held) = answer.ran_out {
+            aterm_log::info!(
+                "window fleet relay: the node job has deferred this Mac's waiting build to this \
+                 window for {} min without it landing (staged build {staged}, 0 for none in this \
+                 window's view): it now says it does not apply it, so the job installs it on disk \
+                 and this window switches to it as an installed activation",
+                held.as_secs() / 60
+            );
+        }
+        answer.holds
+    }
+}
+
+/// This process's [`WindowApplies`], which its relay answers from.
+pub(crate) static WINDOW_APPLIES: WindowApplies = WindowApplies::new();
+
+/// This window applies nothing from here on, whatever its lane last said: its update lane ended
+/// with its event loop, while the relay thread answers through a teardown that can outlast it (a
+/// stuck export's wait has no bound). The node job takes over at its next look.
+pub(crate) fn window_stops_applying() {
+    WINDOW_APPLIES.stop();
+}
+
 /// Start the current window's `wf-<pid>.sock` relay inside `sock_dir` once `BRIDGE_CONTEXT` is
 /// published, so `aterm node serve` can forward `Survey` and `Drive` connections to this window.
-pub(crate) fn start_window_fleet_relay(sock_dir: &Path) {
+/// `applies` is [`window_applies_updates`], read once for the process; what the relay answers
+/// within it is live ([`WindowApplies::answer`]).
+pub(crate) fn start_window_fleet_relay(sock_dir: &Path, applies: bool) {
     if WINDOW_RELAY_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -492,6 +778,9 @@ pub(crate) fn start_window_fleet_relay(sock_dir: &Path) {
             .unwrap_or_else(PoisonError::into_inner);
         *slot = Some(sock_dir.to_path_buf());
     }
+    WINDOW_RELAY_APPLIES.store(applies, Ordering::Release);
+    // The thread is named by its fn, not a closure that calls it, so the main-loop census reads
+    // the relay's serving as the thread's, not the event loop's; what it needs goes in statics.
     if let Err(err) = std::thread::Builder::new()
         .name("aterm-window-fleet-relay".to_owned())
         .spawn(run_window_fleet_relay)
@@ -503,6 +792,7 @@ pub(crate) fn start_window_fleet_relay(sock_dir: &Path) {
 
 fn run_window_fleet_relay() {
     crate::qos::set_self(crate::qos::Role::Responsive);
+    let applies = WINDOW_RELAY_APPLIES.load(Ordering::Acquire);
     let dir = {
         let slot = WINDOW_RELAY_DIR
             .lock()
@@ -514,14 +804,18 @@ fn run_window_fleet_relay() {
     };
     let pid = std::process::id();
     let hosts = |sid: &SessionId| crate::control::hosts_or_keeps(sid);
-    let _ = serve_window_relay_at(&dir, pid, None, hosts, |header, stream| match header {
+    let _ = serve_window_relay_at(&dir, pid, None, hosts, move |header, stream| match header {
         RelayHeader::Survey {
             content,
             drive,
             peer,
         } => crate::control::attach_fleet_connection(stream, (content, drive), peer),
         RelayHeader::Drive {
-            driver, key, peer, ..
+            driver,
+            key,
+            peer,
+            requester,
+            ..
         } => {
             if let Some(key) = key {
                 super::note_admitted_driver(&driver.node, key);
@@ -529,11 +823,29 @@ fn run_window_fleet_relay() {
             // Service repair is handled by the node before relay, where its configured
             // vault and state can be checked. A later command on this relayed connection
             // must not reinterpret a custom node context as the window's live context.
-            crate::control::attach_fleet_drive(stream, peer, driver, key, false)
+            crate::control::attach_fleet_drive(
+                stream,
+                peer,
+                driver,
+                key,
+                false,
+                crate::control::DriveRequester::Relayed(requester),
+            )
         }
         RelayHeader::Ask { peer } => crate::members_desk::attach_relayed(stream, peer),
+        RelayHeader::Applies => {
+            answer_applies(stream, WINDOW_APPLIES.answer(applies, Instant::now()))
+        }
         RelayHeader::Needs => crate::control::attach_needs_stream(stream),
     });
+}
+
+/// Answer [`RelayHeader::Applies`] on `stream`, ahead of the relay's `OK`, which the asker never
+/// reads ([`relay_reply_applies`]).
+fn answer_applies(mut stream: CtlStream, applies: bool) -> bool {
+    let _ = stream.write_all(if applies { b"yes\n" } else { b"no\n" });
+    let _ = stream.flush();
+    true
 }
 
 /// The node job's `ask` handler: each asking Mac's exchange relayed to the window's members
@@ -706,7 +1018,10 @@ fn handle_relay_accept(
 }
 
 /// Read a single `\n`-terminated UTF-8 line byte-by-byte without buffering past `\n`.
-fn read_line_raw(stream: &mut impl Read, max_bytes: usize) -> std::io::Result<Option<String>> {
+pub(crate) fn read_line_raw(
+    stream: &mut impl Read,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
     let mut buf = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
     loop {
@@ -740,9 +1055,13 @@ fn read_line_raw(stream: &mut impl Read, max_bytes: usize) -> std::io::Result<Op
 }
 
 fn live_relay_candidates(relay_dir: &Path) -> Vec<(u32, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(relay_dir) else {
-        return Vec::new();
-    };
+    read_live_relays(relay_dir).unwrap_or_default()
+}
+
+/// The live windows' relays in `relay_dir`, newest process first, a dead one's removed; the
+/// folder's read error where it cannot be listed.
+fn read_live_relays(relay_dir: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
+    let entries = std::fs::read_dir(relay_dir)?;
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -758,7 +1077,29 @@ fn live_relay_candidates(relay_dir: &Path) -> Vec<(u32, PathBuf)> {
         }
     }
     out.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    out
+    Ok(out)
+}
+
+/// How many live aterm windows other than this process keep a relay in this one's relay folder
+/// (every window with a control socket on this state home keeps one there); `None` where it
+/// cannot say: this process keeps none, its folder cannot be listed, or the listing lacks this
+/// process's own relay (a folder removed or replaced under it). It lists a folder and removes a
+/// dead window's relay, so the main thread never asks it.
+pub(crate) fn other_live_windows() -> Option<usize> {
+    let dir = WINDOW_RELAY_DIR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()?;
+    others_beside(std::process::id(), &dir)
+}
+
+/// The live windows other than process `me` with a relay in `relay_dir`; `None` where the folder
+/// cannot be listed or lists no relay of `me`'s.
+fn others_beside(me: u32, relay_dir: &Path) -> Option<usize> {
+    let live = read_live_relays(relay_dir).ok()?;
+    live.iter()
+        .any(|(pid, _)| *pid == me)
+        .then(|| live.iter().filter(|(pid, _)| *pid != me).count())
 }
 
 fn has_live_window_relay(relay_dir: &Path) -> bool {
@@ -996,20 +1337,101 @@ const SURVEY_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SURVEY_ANSWER_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// How many bytes of a window's counted answer one `read(2)` may take ([`read_counted_through`]).
+const SURVEY_READ_BUFFER: usize = 8 * 1024;
+
 /// Read a counted answer (`OK <n>` and `n` lines, within [`SURVEY_LINES_MAX`] lines and
 /// `aterm_net::fleet::REPLY_MAX` bytes) from `stream` by `deadline`: `Ok` its whole text, `Err` its
-/// one line where it answered otherwise (`None`: nothing whole by then).
+/// one line where it answered otherwise (`None`: nothing whole by then). The answer is read
+/// through a buffer ([`read_counted_through`]), which may take bytes that follow it: the caller
+/// reads nothing more of `stream` ([`ask_window_survey`] hangs it up).
 fn read_counted(stream: &mut CtlStream, deadline: Instant) -> Result<String, Option<String>> {
-    let line = |stream: &mut CtlStream| {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())?;
+    read_counted_through(stream, deadline, |stream, left| {
         // macOS refuses the option (`EINVAL`) on a socket its peer closed, whose answer may still
         // wait unread; a closed peer cannot hold the read past it.
         let _ = stream.set_read_timeout(Some(left));
-        read_line_raw(stream, SURVEY_LINE_MAX).ok().flatten()
-    };
-    let head = line(stream).ok_or(None)?;
+    })
+}
+
+/// [`read_counted`] of any reader, at most [`SURVEY_READ_BUFFER`] bytes at a read. Each line
+/// starts only while `deadline` is ahead, and `bound` gives `stream` what was left to it then as
+/// the longest any read of that line waits: before the line's first read, and not at all for a
+/// line the buffer already holds whole, which reads nothing.
+fn read_counted_through<S: Read>(
+    stream: &mut S,
+    deadline: Instant,
+    bound: impl FnMut(&mut S, Duration),
+) -> Result<String, Option<String>> {
+    let mut lines = std::io::BufReader::with_capacity(
+        SURVEY_READ_BUFFER,
+        LineBound {
+            stream,
+            bound,
+            owed: None,
+        },
+    );
+    counted_answer(|| {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())?;
+        lines.get_mut().owed = Some(left);
+        read_line_buffered(&mut lines, SURVEY_LINE_MAX)
+            .ok()
+            .flatten()
+    })
+}
+
+/// A reader that gives its stream the wait its line is owed ([`read_counted_through`]) before
+/// the next read, once.
+struct LineBound<'a, S, B> {
+    stream: &'a mut S,
+    bound: B,
+    owed: Option<Duration>,
+}
+
+impl<S: Read, B: FnMut(&mut S, Duration)> Read for LineBound<'_, S, B> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(left) = self.owed.take() {
+            (self.bound)(self.stream, left);
+        }
+        self.stream.read(buf)
+    }
+}
+
+/// [`read_line_raw`]'s line of a buffered reader, with its bound and its errors: a `read` is
+/// made only where the buffer holds no whole line, and what it took past the line stays in the
+/// buffer for the next.
+fn read_line_buffered(
+    reader: &mut impl std::io::BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    use std::io::BufRead as _;
+    let mut buf = Vec::with_capacity(128);
+    // One byte past the bound tells a line that ends there from one that runs on.
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    reader.take(limit).read_until(b'\n', &mut buf)?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes && buf.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line exceeds maximum length",
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// A counted answer (`OK <n>` and `n` lines, within [`SURVEY_LINES_MAX`] lines and
+/// `aterm_net::fleet::REPLY_MAX` bytes) from `line`, which gives the next line or `None` where
+/// none came whole: `Ok` its whole text, `Err` its one line where it answered otherwise (`None`:
+/// nothing whole).
+fn counted_answer(mut line: impl FnMut() -> Option<String>) -> Result<String, Option<String>> {
+    let head = line().ok_or(None)?;
     let trimmed = head.trim_end_matches(['\r', '\n']);
     let Some(count) = trimmed
         .strip_prefix("OK ")
@@ -1026,7 +1448,7 @@ fn read_counted(stream: &mut CtlStream, deadline: Instant) -> Result<String, Opt
     .ok_or(None)?;
     let mut wire = head;
     for _ in 0..count {
-        let line = line(stream).ok_or(None)?;
+        let line = line().ok_or(None)?;
         if wire.len() + line.len() > aterm_net::fleet::REPLY_MAX {
             return Err(None);
         }
@@ -1388,6 +1810,13 @@ pub struct NodeMesh {
     pub pass_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// The vault pass's pace.
     pub pass_pace: aterm_secrets::client::NodePassPace,
+    /// The vault pass's bell ([`aterm_secrets::client::NodePassHost::rung`]): its host's watch
+    /// over the switches it reads rings it, as does a test that moves [`Self::pass_now_ms`].
+    /// `None`: the pass looks at its pace.
+    pub pass_rung: Option<Arc<aterm_uds::ready::Doorbell>>,
+    /// Whether the vault pass hears the LAN broker arrive
+    /// ([`aterm_secrets::client::NodePassHost::broker`]): where the job's LAN gate reads it.
+    pub pass_broker: bool,
     /// Starts the converge pass's retained request after local progress or a refresh boundary.
     pub pass_converge: Arc<
         dyn Fn(aterm_secrets::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>
@@ -1415,6 +1844,8 @@ impl NodeMesh {
             bus: live_bus(),
             pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
             pass_pace: aterm_secrets::client::NodePassPace::LIVE,
+            pass_rung: aterm_uds::ready::Doorbell::new().ok().map(Arc::new),
+            pass_broker: true,
             pass_converge: Arc::new(|request| {
                 let exe = std::env::current_exe().ok()?;
                 aterm_secrets::converge::start_requested(
@@ -1443,6 +1874,8 @@ impl NodeMesh {
             bus: None,
             pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
             pass_pace: aterm_secrets::client::NodePassPace::LIVE,
+            pass_rung: None,
+            pass_broker: false,
             pass_converge: Arc::new(|_| None),
         }
     }
@@ -1476,20 +1909,22 @@ impl NodeMesh {
 }
 
 /// How often the node job's updater looks again, beside each notice its checker gives, for a
-/// newer build it may end its run for: a window that quits with a stage waiting is seen within
-/// it.
+/// newer build it may end its run for: a window that quits with a stage waiting, or that stops
+/// saying it applies it, is seen within it.
 const UPDATE_LOOK_EVERY: Duration = Duration::from_secs(60);
 
 /// How long after a start that found a newer build and did not run it (its boot apply refused)
 /// the job may end its run for that same build again: a refusal that passes (a held apply lock,
 /// a roster not yet re-confirmed) is retried within the hour, and one that stands costs one
-/// restart an hour, never a loop of them.
+/// restart an hour, never a loop of them. A trial the updater keeps refusing to settle gives way to a
+/// newer build after as long ([`restart_for`]).
 const RETRY_LEFT_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// The node job's updater (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, A4). The job checks
 /// and stages as a window does, whether or not a window runs. With no window here, it runs what
 /// it staged by ending its run, so launchd starts it again, and that start's boot applies the
-/// stage before the job binds its listener. With a window, the window applies its own. A test
+/// stage before the job binds its listener. With a window that says it applies it, the window
+/// applies its own, and one that says it does not leaves the job to install it. A test
 /// injects its own updater, so it needs no launchd job, no bundle and no network; production's
 /// is `LiveNodeUpdater` (macOS).
 pub trait NodeUpdater: Send + Sync {
@@ -1499,8 +1934,9 @@ pub trait NodeUpdater: Send + Sync {
     /// The newer build a start of this job would run: one staged and ready for a boot apply, or
     /// one another process already installed over this job's image.
     fn newer_build(&self) -> Option<u64>;
-    /// `[update] auto_apply`: whether a newer build goes in by itself (a setting that cannot be
-    /// read reads as no).
+    /// `[update] auto_apply`: whether a newer build goes in by itself. Text that names it unreadably
+    /// reads as no, as does a read that hits a fault that can pass or does not answer: that look
+    /// holds, and the next asks again.
     fn auto_apply(&self) -> bool;
     /// The boot apply, which first counts this start against any boot trial of this build:
     /// where a stage is ready it swaps the stage in and execs the build it installed, and never
@@ -1519,10 +1955,22 @@ pub trait NodeUpdater: Send + Sync {
     /// Whether automatic checks (`[update] enabled`) as saved now differ from those this run's
     /// checker started under, which reads the setting once, at its start.
     fn checks_setting_moved(&self) -> bool;
+    /// The installed activation a window here failed to switch to, with the newer stage ready to
+    /// take its place, `(activation, newer)` ([`aterm_update::failed_activation_waiting`]): a
+    /// read of a few small files, `None` where nothing waits.
+    fn failed_activation(&self) -> Option<(u64, u64)>;
+    /// Retire the activation [`Self::failed_activation`] found `waiting` and install the newer
+    /// stage over the window's retained build ([`aterm_update::install_over_failed_activation`]).
+    /// The words this run ends with where the install path changed, so the job's next start runs
+    /// what it holds; `None` where it stays as it was, which this says once for each reason.
+    fn install_over_failed_activation(&self, waiting: (u64, u64)) -> Option<String>;
     /// Look at the checker [`Self::start_checker`] started, and replace one that stopped
     /// stamping its heartbeat, as a window's watchdog replaces its own: with no window here,
-    /// nothing else would.
-    fn mind_checker(&self);
+    /// nothing else would; it also runs an update lane's start that got no thread to wait on its
+    /// launch setting, once that setting answers ([`aterm_update::start_owed_launch_waits`]). Why
+    /// this run ends where no replacement can check ([`mind_node_checker`]), once no trial is active
+    /// ([`the_checker_ends_the_run`]), else `None`.
+    fn mind_checker(&self) -> Option<String>;
     /// End this run so it is started again, saying `why`.
     fn restart(&self, why: &str);
     /// The clock [`RETRY_LEFT_AFTER`] is read on.
@@ -1530,6 +1978,13 @@ pub trait NodeUpdater: Send + Sync {
     /// How often the updater looks again without a notice.
     fn look_every(&self) -> Duration {
         UPDATE_LOOK_EVERY
+    }
+    /// Run `look` on its own thread, or say why it could not start.
+    fn spawn_look(&self, look: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name("aterm-node-updates".to_owned())
+            .spawn(look)
+            .map(drop)
     }
 }
 
@@ -1552,33 +2007,147 @@ impl NodeBoot {
     }
 }
 
+/// How long a node run's active trial goes on looking before what it found decides
+/// ([`NodeUpdates::trial_unprovable`], [`NodeUpdates::trial_proof_missed`]). A loaded Mac misses a
+/// self-dial (each has [`HANDSHAKE`]) for seconds, a vault writer holds its state for moments and a
+/// window hands the port over within its tick; a build whose listener does not answer misses every
+/// look.
+const TRIAL_SETTLES_WITHIN: Duration = Duration::from_secs(5 * 60);
+
+/// Since when this run's looks have met each kind of thing that settled nothing, with nothing since
+/// that said otherwise ([`NodeUpdates::trial_answered`]). A look that could not ask does not clear
+/// `missed_since`, so a flapping input cannot keep a build that never answers from being decided.
+#[derive(Default)]
+struct TrialLooks {
+    unprovable_since: Option<Instant>,
+    missed_since: Option<Instant>,
+    /// The updater would not settle this trial at its bound, and the log has said so once.
+    refusal_said: bool,
+}
+
 /// A node run's updater and what its boot found ([`NodeServeConfig::updates`]).
 #[derive(Clone)]
 pub struct NodeUpdates {
     updater: Arc<dyn NodeUpdater>,
     boot: NodeBoot,
+    /// A look could not start, so one is still owed ([`Self::start_owed_look`]).
+    look_owed: Arc<AtomicBool>,
+    trial_looks: Arc<std::sync::Mutex<TrialLooks>>,
 }
 
 impl NodeUpdates {
     /// `updater` for a run whose boot found `boot`.
     #[must_use]
     pub fn new(updater: Arc<dyn NodeUpdater>, boot: NodeBoot) -> Self {
-        Self { updater, boot }
+        Self {
+            updater,
+            boot,
+            look_owed: Arc::new(AtomicBool::new(false)),
+            trial_looks: Arc::default(),
+        }
+    }
+
+    /// Start the look one that could not start still owes. The job's loop asks between generations
+    /// and a serving generation's watch at each tick, since a generation can last as long as the job.
+    /// The checker's notices went with the look that could not start, so this one looks on the clock
+    /// alone: this channel's sender goes with this line.
+    fn start_owed_look(&self, relay_dir: &Path, stop: &Arc<Stop>) {
+        if self.look_owed.swap(false, Ordering::AcqRel)
+            && !spawn_node_look(
+                self,
+                relay_dir.to_path_buf(),
+                Arc::clone(stop),
+                std::sync::mpsc::sync_channel::<()>(1).1,
+            )
+        {
+            self.look_owed.store(true, Ordering::Release);
+        }
     }
 
     fn active_trial(&self) -> bool {
         // Window custody can expire or move after a look. Only the canonical
         // trial receipt, not this process's earlier checkpoint, owns that truth.
-        self.updater.trial_pending()
+        let pending = self.updater.trial_pending();
+        if !pending {
+            *self.trial_looks.lock_or_recover() = TrialLooks::default();
+        }
+        pending
     }
 
-    fn confirm_checkpoint(&self, stop: &Stop) {
-        if !stop.is_set() && self.active_trial() && !stop.is_set() {
-            // Confirmation rechecks headless ownership under the apply lock. A
-            // window may have acquired it since active_trial; its true return
-            // can leave that window's trial armed, so never cache the result.
-            let _ = self.updater.confirm_trial();
+    /// What the updater said of confirming the active trial, or `None` where nothing asked it.
+    fn confirm_checkpoint(&self, stop: &Stop) -> Option<bool> {
+        // Confirmation rechecks headless ownership under the apply lock. A
+        // window may have acquired it since active_trial; its true return
+        // can leave that window's trial armed, so never cache the result.
+        (!stop.is_set() && self.active_trial() && !stop.is_set())
+            .then(|| self.updater.confirm_trial())
+    }
+
+    /// This look settled what the earlier ones could not: a later miss or fault starts again.
+    fn trial_answered(&self, stop: &Stop) {
+        *self.trial_looks.lock_or_recover() = TrialLooks::default();
+        let _ = self.confirm_checkpoint(stop);
+    }
+
+    /// Nothing can be asked of this build's listener now, for a reason the build did not bring: a
+    /// config file the job will not serve from, a vault read mid-apply, a key that does not read, a
+    /// port or address held elsewhere. A revert cures none of them and the next release would meet
+    /// the same, so this look holds and the next asks again. Past [`TRIAL_SETTLES_WITHIN`] of such
+    /// looks with no miss among them the trial is confirmed where the updater can, since a trial
+    /// nothing confirms refuses every later update. Where it cannot, the trial stays armed and each
+    /// look asks again: ending the run would count a launch against a build for a held lock.
+    fn trial_unprovable(&self, stop: &Stop, why: &str) {
+        let waited = self.trial_looked_for(|looks| &mut looks.unprovable_since, why);
+        if waited < TRIAL_SETTLES_WITHIN {
+            return;
         }
+        match self.confirm_checkpoint(stop) {
+            Some(true) => aterm_log::warn!(
+                "aterm node serve: this run's boot trial settled unproven after {} s, since \
+                 nothing here says anything of this build: {why}",
+                waited.as_secs()
+            ),
+            Some(false)
+                if !std::mem::replace(
+                    &mut self.trial_looks.lock_or_recover().refusal_said,
+                    true,
+                ) =>
+            {
+                aterm_log::warn!(
+                    "aterm node serve: this run's boot trial is past its {} s and did not settle, \
+                     so later looks ask again: {why}",
+                    TRIAL_SETTLES_WITHIN.as_secs()
+                );
+            }
+            Some(false) | None => {}
+        }
+    }
+
+    /// This build's listener did not answer its own authenticated dial. One miss says little on a
+    /// loaded Mac, so the run ends only once misses have lasted [`TRIAL_SETTLES_WITHIN`] with no
+    /// answer among them: the next start then counts against the trial, and with no window answering
+    /// here a build that never answers reaches the revert.
+    fn trial_proof_missed(&self, stop: &Stop, why: &str) {
+        self.trial_looks.lock_or_recover().unprovable_since = None;
+        let waited = self.trial_looked_for(|looks| &mut looks.missed_since, why);
+        if waited >= TRIAL_SETTLES_WITHIN {
+            self.failed_trial(stop, why);
+        }
+    }
+
+    /// How long this run has met what `since` records, which this look may be the first of.
+    fn trial_looked_for(
+        &self,
+        since: fn(&mut TrialLooks) -> &mut Option<Instant>,
+        why: &str,
+    ) -> Duration {
+        let now = self.updater.now();
+        let mut looks = self.trial_looks.lock_or_recover();
+        let first = *since(&mut looks).get_or_insert_with(|| {
+            aterm_log::info!("aterm node serve: this run's boot trial asks again: {why}");
+            now
+        });
+        now.saturating_duration_since(first)
     }
 
     fn failed_trial(&self, stop: &Stop, why: &str) {
@@ -1608,7 +2177,7 @@ impl NodeUpdates {
     fn settle_service_with(
         &self,
         inputs: &health::Inputs,
-        (_addr, secret, node, listen): (
+        (addr, secret, node, listen): (
             SocketAddr,
             &aterm_net::fleet::FleetSecret,
             &Option<(String, aterm_net::fleet::NodeKey)>,
@@ -1626,13 +2195,13 @@ impl NodeUpdates {
         let before = match inputs.observe() {
             health::Standing::Held => {
                 if !stop.is_set() {
-                    self.confirm_checkpoint(stop);
+                    self.trial_answered(stop);
                 }
                 return !stop.is_set();
             }
             health::Standing::Unread(why) => {
-                self.failed_trial(stop, why);
-                return false;
+                self.trial_unprovable(stop, why);
+                return !stop.is_set();
             }
             health::Standing::Admitted(basis) => basis,
         };
@@ -1658,16 +2227,21 @@ impl NodeUpdates {
             {
                 match proof {
                     Ok(proof) => self.confirm_service(stop, proof),
-                    Err(why) => self.failed_trial(stop, &why),
+                    Err(why) => match health::self_dial_says_nothing(addr) {
+                        Some(unprovable) => self.trial_unprovable(stop, unprovable),
+                        None => self.trial_proof_missed(stop, &why),
+                    },
                 }
             }
+            // A fault that met this read says what one that met the read before the dial does.
+            health::Standing::Unread(why) => self.trial_unprovable(stop, why),
             _ => return false,
         }
         !stop.is_set()
     }
 
     fn confirm_service(&self, stop: &Stop, _proof: health::Proven) {
-        self.confirm_checkpoint(stop);
+        self.trial_answered(stop);
     }
 }
 
@@ -1698,10 +2272,12 @@ fn checkpoint_idle_with(
         return;
     }
     match standing {
-        health::Standing::Held => updates.confirm_checkpoint(&cfg.stop),
-        health::Standing::Unread(why) => updates.failed_trial(&cfg.stop, why),
+        health::Standing::Held => updates.trial_answered(&cfg.stop),
+        health::Standing::Unread(why) => updates.trial_unprovable(&cfg.stop, why),
         health::Standing::Admitted(before) => match why {
-            IdleCheckpoint::Waiting => {}
+            IdleCheckpoint::Waiting => {
+                updates.trial_unprovable(&cfg.stop, "the job is waiting to serve");
+            }
             IdleCheckpoint::PortOwnedElsewhere => {
                 let answers = window_answers();
                 if cfg.stop.is_set() {
@@ -1714,32 +2290,52 @@ fn checkpoint_idle_with(
                     return;
                 }
                 if answers {
-                    updates.confirm_checkpoint(&cfg.stop);
+                    updates.trial_answered(&cfg.stop);
                 } else {
-                    updates.failed_trial(&cfg.stop, "node port is held but no window answers");
+                    updates.trial_unprovable(&cfg.stop, "node port is held but no window answers");
                 }
             }
-            IdleCheckpoint::Failed(why) => updates.failed_trial(&cfg.stop, why),
+            IdleCheckpoint::Failed(why) => updates.trial_unprovable(&cfg.stop, why),
         },
     }
 }
 
-/// Whether a window runs here, as the node job's updater asks it (§4.13): a `wf-<pid>.sock` in
-/// `relay_dir` that takes a connect from this account. A relay file nothing listens on (its
-/// window crashed, or its pid went to another process) is no window. It never asks
-/// WindowServer.
+/// Whether a window that applies this Mac's updates runs here, as the node job's updater asks it
+/// (§4.13): a `wf-<pid>.sock` in `relay_dir` that takes a connect from this account and does not
+/// say it does not apply them now ([`relay_reply_applies`]). A relay file nothing listens on (its
+/// window crashed, or its pid went to another process) is no window. It never asks WindowServer.
+/// Every relay is asked, not only those up to the first that applies: each window's hold runs
+/// from the asks it hears ([`WindowHold::ask`]), so several windows hold the job no longer than
+/// the longest of them would alone.
+fn a_window_that_applies_answers(relay_dir: &Path) -> bool {
+    let mut applies = false;
+    for relay in window_relay_paths(relay_dir) {
+        applies |= relay_applies(&relay);
+    }
+    applies
+}
+
+/// Whether any process's relay answers here, whether or not it applies updates: the node health
+/// check asks it of `node-port.lock` held elsewhere ([`checkpoint_idle`]), where an answer is all it
+/// needs. A relay file nothing listens on is no answer. It never asks WindowServer.
 fn a_window_relay_answers(relay_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(relay_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .and_then(parse_relay_filename)
-            .is_some()
-            && relay_answers(&entry.path())
-    })
+    window_relay_paths(relay_dir).any(|relay| relay_answers(&relay))
+}
+
+/// The `wf-<pid>.sock` files in `relay_dir`, live or not.
+fn window_relay_paths(relay_dir: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(relay_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(parse_relay_filename)
+                .is_some()
+        })
+        .map(|entry| entry.path())
 }
 
 /// Whether the relay socket at `path` takes a connect from this account; the connection is hung
@@ -1753,22 +2349,57 @@ fn relay_answers(path: &Path) -> bool {
     ours
 }
 
+/// Whether the relay socket at `path` takes a connect from this account and its process applies
+/// updates, by what it answers to [`RelayHeader::Applies`].
+fn relay_applies(path: &Path) -> bool {
+    let Ok(mut stream) = aterm_uds::connect::until(path, Instant::now() + RELAY_CONNECT_TIMEOUT)
+    else {
+        return false;
+    };
+    let ours = crate::control_auth::peer_check(&stream).is_ok();
+    let applies = ours && {
+        let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
+        let asked = stream
+            .write_all(RelayHeader::Applies.encode().as_bytes())
+            .and_then(|()| stream.flush());
+        let reply = asked
+            .ok()
+            .and_then(|()| read_line_raw(&mut stream, RELAY_HEADER_MAX).ok().flatten());
+        relay_reply_applies(reply.as_deref())
+    };
+    aterm_uds::hangup::hang_up(&stream);
+    applies
+}
+
+/// Whether a relay's reply to [`RelayHeader::Applies`] leaves the applying to its process. Only
+/// `no` says otherwise: an older build refuses a command it does not know, and a relay that answers
+/// nothing cannot be told from a window that applies, so each is held for as a window has always
+/// been. Such an older headless or dev process holds the job until it exits or updates, as does an
+/// older window, whose answer is read once for its process and never runs out.
+fn relay_reply_applies(reply: Option<&str>) -> bool {
+    reply != Some("no\n")
+}
+
 /// The node job's boot (§4.13, A4), before its Commons runtime, listener or checker starts. The
-/// boot apply runs with `[update] auto_apply` on and no window here (a window applies its own),
-/// whatever this job's look at the stage finds, since the apply reads the stage itself. With
-/// automatic installation off, a windowless start only counts and recovers an already-armed
-/// trial. A build that crash-loops under launchd is therefore reverted and the restored build
-/// re-execed (`ImageReplacement::Replaceable`) without admitting a stage while Install owns
-/// that decision. A boot that applies a stage never returns.
+/// boot apply runs with `[update] auto_apply` on and no window here that applies it (a window that
+/// says it does applies its own), whatever this job's look at the stage finds, since the apply reads
+/// the stage itself. With
+/// automatic installation off, or a setting that could not be read, a windowless start only counts and
+/// recovers an already-armed trial, so a build that crash-loops under launchd is still reverted and the
+/// restored build re-execed (`ImageReplacement::Replaceable`) without admitting a stage: Install, or a
+/// later look, owns that decision. A boot that applies a stage never returns.
 pub(crate) fn apply_at_node_boot(updater: &dyn NodeUpdater, relay_dir: &Path) -> NodeBoot {
     let started = updater.now();
     let newer = updater.newer_build();
-    let held = if a_window_relay_answers(relay_dir) {
+    let held = if a_window_that_applies_answers(relay_dir) {
         Some("a window runs here, which applies it")
     } else if !updater.auto_apply() {
         let recovery = updater.recover_trial_at_boot();
         aterm_log::info!("aterm node serve: boot trial recovery with auto-apply off: {recovery}");
-        Some("[update] auto_apply is off, so Install applies it")
+        Some(
+            "[update] auto_apply is off or could not be read, so Install or a later look applies it",
+        )
     } else {
         None
     };
@@ -1796,24 +2427,45 @@ pub(crate) fn apply_at_node_boot(updater: &dyn NodeUpdater, relay_dir: &Path) ->
 }
 
 /// The build a node run ends for now, so its next start runs it (§4.13): a newer build waits,
-/// this run's boot did not already find it and fail to run it (unless [`RETRY_LEFT_AFTER`] has
-/// passed since), `[update] auto_apply` is on, and no window runs here. Each question is asked
-/// only once those before it say go, so the relays are dialled last.
+/// `[update] auto_apply` is on, no window here says it applies it, and within [`RETRY_LEFT_AFTER`]
+/// of this run's start neither of these holds: its boot already found that build and failed to run
+/// it, or a trial is active. A start during a trial counts against a build whose listener has not missed and runs
+/// nothing newer, since an armed trial applies nothing, so the build waits for it to settle. A trial
+/// the updater still refuses to settle an hour on gives way, each such start counted: three revert it,
+/// and the waiting build follows. Each question is asked only once those before it say go, so the
+/// relays are dialled last.
 fn restart_for(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> Option<u64> {
     let build = updater.newer_build()?;
-    if boot.left.is_some_and(|left| left >= build)
-        && updater.now().saturating_duration_since(boot.started) < RETRY_LEFT_AFTER
+    if updater.now().saturating_duration_since(boot.started) < RETRY_LEFT_AFTER
+        && (boot.left.is_some_and(|left| left >= build) || updater.trial_pending())
     {
         return None;
     }
-    (updater.auto_apply() && !a_window_relay_answers(relay_dir)).then_some(build)
+    (updater.auto_apply() && !a_window_that_applies_answers(relay_dir)).then_some(build)
+}
+
+/// The install over an activation the window here failed to switch to, with `[update] auto_apply`
+/// on, window or not: that window applies nothing newer while it waits on an activation it cannot
+/// reach, so a newer build would otherwise wait for it for good. That the window then takes the
+/// newer build from the install path is read in its code, not tested
+/// ([`aterm_update::install_over_failed_activation`]). The words the run ends with where the
+/// install path changed, else `None`.
+fn install_over_a_failed_activation(updater: &dyn NodeUpdater) -> Option<String> {
+    let waiting = updater.failed_activation()?;
+    if !updater.auto_apply() {
+        return None;
+    }
+    updater.install_over_failed_activation(waiting)
 }
 
 /// Why a node run ends now, so that its next start runs as it should (§4.13), or `None`. An
 /// older build put back in this copy's place goes first, window or not: this job serves a build
 /// that was reverted, or that no longer stands here. Then a changed `[update] enabled`, which
 /// this run's checker read once: Settings tells the person a change takes effect at the next
-/// launch, and only a restart is this job's next launch. Then [`restart_for`]'s newer build.
+/// launch, and only a restart is this job's next launch. It waits for a trial to settle, since that
+/// start would count against a build whose listener has not missed. Then a newer stage installed
+/// over an activation the window here failed to switch to ([`install_over_a_failed_activation`]),
+/// window or not. Then [`restart_for`]'s newer build.
 fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> Option<String> {
     if let Some(build) = updater.older_build_installed() {
         return Some(format!(
@@ -1822,7 +2474,7 @@ fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path)
              job again, and that start runs build {build}"
         ));
     }
-    if updater.checks_setting_moved() {
+    if updater.checks_setting_moved() && !updater.trial_pending() {
         return Some(
             "automatic update checks ([update] enabled) changed since this run started, which \
              reads them once: this run ends so launchd starts the job again under the saved \
@@ -1830,49 +2482,193 @@ fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path)
                 .to_owned(),
         );
     }
+    if let Some(why) = install_over_a_failed_activation(updater) {
+        return Some(why);
+    }
     restart_for(updater, boot, relay_dir).map(|build| {
         format!(
-            "build {build} waits here (staged, or installed over this image) and no window runs: \
-             this run ends so launchd starts the job again, and that start runs build {build}"
+            "build {build} waits here (staged, or installed over this image) and no window here \
+             applies it: this run ends so launchd starts the job again, and that start runs build \
+             {build}, or counts against this build's trial if one still stands"
         )
     })
 }
 
 /// Start `updates`' checker and its look (§4.13): at each notice from the checker, and every
-/// [`NodeUpdater::look_every`], the look minds the checker ([`NodeUpdater::mind_checker`]) and
-/// [`why_the_run_ends`] decides. Once it names a reason the run ends through
-/// [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set.
+/// [`NodeUpdater::look_every`], the look minds the checker ([`the_checker_ends_the_run`]) and
+/// [`why_the_run_ends`] decides. Once either names a reason the run ends through
+/// [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set. A look that panics
+/// costs that look alone, and one that could not start stays owed
+/// ([`NodeUpdates::start_owed_look`]).
 fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Stop>) {
     let (noticed, notices) = std::sync::mpsc::sync_channel::<()>(1);
-    let updater = Arc::clone(&updates.updater);
-    let boot = updates.boot;
-    updater.start_checker(Box::new(move || {
+    updates.updater.start_checker(Box::new(move || {
         let _ = noticed.try_send(());
     }));
-    let spawned = std::thread::Builder::new()
-        .name("aterm-node-updates".to_owned())
-        .spawn(move || {
-            let every = updater.look_every();
-            while !stop.is_set() {
-                updater.mind_checker();
-                if let Some(why) = why_the_run_ends(&*updater, boot, &relay_dir) {
+    if !spawn_node_look(updates, relay_dir, stop, notices) {
+        updates.look_owed.store(true, Ordering::Release);
+    }
+}
+
+/// Start the look [`spawn_node_updates`] describes, on `notices` and the clock. One that cannot start
+/// (this process is out of threads) ends no run, since a run ended here would count a launch against
+/// a boot trial each time and revert a good build. It says so and returns `false`.
+fn spawn_node_look(
+    updates: &NodeUpdates,
+    relay_dir: PathBuf,
+    stop: Arc<Stop>,
+    notices: std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let updater = Arc::clone(&updates.updater);
+    let boot = updates.boot;
+    let spawned = updates.updater.spawn_look(Box::new(move || {
+        let every = updater.look_every();
+        let mut checker_owes = None;
+        while !stop.is_set() {
+            let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                the_checker_ends_the_run(&*updater, &mut checker_owes)
+                    .or_else(|| why_the_run_ends(&*updater, boot, &relay_dir))
+            }));
+            match decided {
+                Ok(Some(why)) => {
                     updater.restart(&why);
                     return;
                 }
-                if notices.recv_timeout(every)
-                    == Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-                {
-                    // The checker let its notices go (automatic checks are off): look on the
-                    // clock alone, for a build another process staged or installed.
-                    stop.sleep(every);
-                }
+                Ok(None) => {}
+                Err(_) => aterm_log::warn!(
+                    "aterm node serve: the updater's look panicked; it looks again within {} s",
+                    every.as_secs()
+                ),
             }
-        });
-    if let Err(err) = spawned {
+            if notices.recv_timeout(every) == Err(std::sync::mpsc::RecvTimeoutError::Disconnected) {
+                // The checker let its notices go (automatic checks are off): look on the
+                // clock alone, for a build another process staged or installed.
+                stop.sleep(every);
+            }
+        }
+    }));
+    if let Err(err) = &spawned {
         aterm_log::warn!(
-            "aterm node serve: the updater's look could not start ({err}); this job stages, and \
-             runs a newer build only once something else restarts it"
+            "aterm node serve: the updater's look could not start ({err}); the job asks again"
         );
+    }
+    spawned.is_ok()
+}
+
+/// What the checker's watchdog says ends this run, once no trial is active: the next start would count
+/// against a build whose listener has not missed, and three such starts revert it. The watchdog says it
+/// once for a generation, so `owes` keeps it for the look after the trial settles. A replacement it
+/// could start has started by then, whatever the trial.
+fn the_checker_ends_the_run(
+    updater: &dyn NodeUpdater,
+    owes: &mut Option<String>,
+) -> Option<String> {
+    if let Some(why) = updater.mind_checker() {
+        *owes = Some(why);
+    }
+    if owes.is_some() && updater.trial_pending() {
+        return None;
+    }
+    owes.take()
+}
+
+/// How long a run [`NodeUpdater::restart`] asked to end may take to return before the process ends
+/// itself, once a look has decided. The job's main loop and its watch thread read the stop far
+/// sooner: only a read a volume or a dialog never answers, or a thread that died, takes this long.
+#[cfg(target_os = "macos")]
+const RUN_ENDS_WITHIN: Duration = Duration::from_secs(5 * 60);
+
+/// How long a look of the updater's may stay out. A slow file read under a loaded Mac stays well
+/// inside it, and only a file that does not answer goes past it: the look goes on with its fallback,
+/// and the next asks again once that read has returned.
+#[cfg(target_os = "macos")]
+const LOOK_ANSWERS_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// The helper threads the looks at a waiting or an older build run on; while one stays out the next
+/// is refused at once.
+#[cfg(target_os = "macos")]
+static STAGE_LOOKS: aterm_uds::deadline::Gate =
+    aterm_uds::deadline::Gate::new("aterm-node-stage-look");
+
+/// The helper threads the reads of `[update]` run on, apart from [`STAGE_LOOKS`]: a stuck look at
+/// the updates root says nothing of a file on another volume.
+#[cfg(target_os = "macos")]
+static AUTO_APPLY_LOOKS: aterm_uds::deadline::Gate =
+    aterm_uds::deadline::Gate::new("aterm-node-auto-apply-look");
+
+/// `read` on a helper thread of `gate`, or `fallback` once it has been out for `within`, so a file
+/// that never answers (a followed symlink onto a volume that stopped, a dialog nobody answers) costs
+/// one bound and not the rest of the job's run.
+#[cfg(any(target_os = "macos", test))]
+fn look_within<T: Send + 'static>(
+    gate: &'static aterm_uds::deadline::Gate,
+    within: Duration,
+    what: &str,
+    fallback: T,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    gate.run(within, within, read).unwrap_or_else(|refused| {
+        aterm_log::warn!(
+            "aterm node serve: {what} did not answer within {} s ({refused:?}); this look goes on \
+             without it",
+            within.as_secs()
+        );
+        fallback
+    })
+}
+
+/// `read` of `[update] auto_apply` by [`look_within`]. One that does not answer holds this look: a
+/// person's `false` may be behind it, and installing over that is the worse mistake. Answering on
+/// here also installed nothing a person wanted, since the swap's budget had run out by then.
+#[cfg(any(target_os = "macos", test))]
+fn auto_apply_look(
+    gate: &'static aterm_uds::deadline::Gate,
+    within: Duration,
+    read: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    look_within(gate, within, "the read of [update] auto_apply", false, read)
+}
+
+/// Run `end` once `within` has passed, on a thread of its own, so that nothing the job is stuck in
+/// can hold it. A thread that cannot start runs it at once.
+#[cfg(any(target_os = "macos", test))]
+fn end_run_within(within: Duration, end: fn()) {
+    let spawned = std::thread::Builder::new()
+        .name("aterm-node-run-end".to_owned())
+        .spawn(move || {
+            std::thread::sleep(within);
+            end();
+        });
+    if spawned.is_err() {
+        end();
+    }
+}
+
+/// End this process, for launchd's `KeepAlive` to start the job again. The line goes on a thread of
+/// its own, since a log on a volume that stopped answering must not hold the end.
+#[cfg(target_os = "macos")]
+fn end_stuck_run() {
+    let _ = std::thread::Builder::new()
+        .name("aterm-node-run-end-log".to_owned())
+        .spawn(|| {
+            aterm_log::warn!(
+                "aterm node serve: this run did not return within {} s of being asked to end; it \
+                 ends here so launchd starts the job again",
+                RUN_ENDS_WITHIN.as_secs()
+            );
+        });
+    std::thread::sleep(Duration::from_millis(250));
+    aterm_uds::process::kill_self_now();
+}
+
+/// Ends a serving generation with its watch thread, however that thread ends. The serve loop reads
+/// only `listener_stop`, and only this thread turns `stop` into it, so a panic in a look would
+/// otherwise leave the generation serving for good, with `stop` unread.
+struct EndsTheGeneration(Arc<Stop>);
+
+impl Drop for EndsTheGeneration {
+    fn drop(&mut self) {
+        self.0.set();
     }
 }
 
@@ -1884,6 +2680,82 @@ struct LiveNodeUpdater {
     stop: Arc<Stop>,
     /// What the job's checker watchdog remembers between looks ([`mind_node_checker`]).
     checker_watch: Mutex<crate::update_checker_watch::CheckerWatchState>,
+    /// What this run's installs over a failed activation held for.
+    failed_activation_holds: Arc<Mutex<FailedActivationHolds>>,
+}
+
+/// What a node run remembers of its installs over a failed activation
+/// ([`NodeUpdater::install_over_failed_activation`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FailedActivationHolds {
+    /// Why the last one held, said once until it changes.
+    said: Option<String>,
+    /// The `(activation, newer)` the verified bundles refused
+    /// ([`aterm_update::FailedActivationInstall::Refused`]): only a change to those bundles lets
+    /// it through, so this run does not verify them again each look. A hold for now, or one read
+    /// from small files before any verification, is never kept.
+    settled: Option<(u64, u64)>,
+}
+
+/// What a node run says of an install over the failed activation `waiting`
+/// ([`NodeUpdater::install_over_failed_activation`]): the words it ends with where the install
+/// path changed, else `None`, having said once, in `holds`, why the activation stays.
+#[cfg(any(target_os = "macos", test))]
+fn failed_activation_words(
+    waiting: (u64, u64),
+    outcome: aterm_update::FailedActivationInstall,
+    holds: &Mutex<FailedActivationHolds>,
+) -> Option<String> {
+    use aterm_update::FailedActivationInstall::{
+        Held, Installed, NoneFailed, Refused, RetiredOnly,
+    };
+    let mut holds = holds.lock().unwrap_or_else(PoisonError::into_inner);
+    if !matches!(outcome, Held(_) | Refused(_)) {
+        *holds = FailedActivationHolds::default();
+    }
+    let (why, refused) = match outcome {
+        Held(refusal) => (refusal.reason().to_owned(), false),
+        Refused(why) => (why, true),
+        NoneFailed => return None,
+        Installed {
+            retired,
+            installed_build,
+        } => {
+            return Some(format!(
+                "a window here failed to switch to the installed build {}, so this run retired \
+                 it and installed build {installed_build} over build {}, which stays at the fixed \
+                 rollback path: this run ends so launchd starts the job again, and that start \
+                 runs build {installed_build}",
+                retired.activation_build, retired.restored_build
+            ));
+        }
+        RetiredOnly { retired, why } => {
+            aterm_log::warn!(
+                "aterm node serve: retired the installed build {}, which a window here failed to \
+                 switch to, and build {} is back at the install path, but {why}",
+                retired.activation_build,
+                retired.restored_build
+            );
+            return Some(format!(
+                "the installed build {} was retired and build {} put back in its place: this run \
+                 ends so launchd starts the job again, and that start runs what the install path \
+                 holds",
+                retired.activation_build, retired.restored_build
+            ));
+        }
+    };
+    if holds.said.as_deref() != Some(why.as_str()) {
+        aterm_log::info!(
+            "aterm node serve: a window here failed to switch to the installed build {}, and \
+             build {} waits: {why}",
+            waiting.0,
+            waiting.1
+        );
+        holds.said = Some(why);
+    }
+    holds.settled = refused.then_some(waiting);
+    None
 }
 
 /// The older installed build a node run ends for ([`NodeUpdater::older_build_installed`]):
@@ -1898,34 +2770,38 @@ fn older_build_to_run(older: Option<u64>, image_replaced: impl FnOnce() -> bool)
 
 /// One look of the node job's checker watchdog at `beat`, at `now_secs` (§4.13): a stall the
 /// window's watchdog would act on ([`crate::update_checker_watch::judge`], which confirms late
-/// heartbeats and backs off known failed starts) is replaced through `respawn`, as the window replaces its own,
-/// and logged. The stall it acted on, and the generation `respawn` started in its place.
+/// heartbeats and backs off known failed starts) is replaced through `respawn`, as the window
+/// replaces its own, and logged. Why this run ends where no replacement can check: one stuck inside
+/// its check holds the check lane, which a replacement in this process could not take until it lets
+/// go, so none starts, and `respawn` may answer no (its budget is spent, or this process is out of
+/// threads). Without that, a stuck check would mean no check here for as long as the job stayed up;
+/// launchd's next start checks afresh.
 #[cfg(any(target_os = "macos", test))]
 fn mind_node_checker(
     watch: &mut crate::update_checker_watch::CheckerWatchState,
     beat: Option<aterm_update::checker_watch::CheckerBeat>,
     now_secs: u64,
     respawn: impl FnOnce(u64) -> Option<u64>,
-) -> Option<(crate::update_checker_watch::CheckerStall, Option<u64>)> {
+) -> Option<String> {
     let stall = crate::update_checker_watch::judge(watch, beat, now_secs)?;
-    let replacement = respawn(stall.generation);
-    match replacement {
-        Some(next) => aterm_log::warn!(
+    if !stall.holds_lane
+        && let Some(next) = respawn(stall.generation)
+    {
+        aterm_log::warn!(
             "aterm node serve: the update checker stalled (generation {} has not stamped its \
              heartbeat for {} s, last in {}); started generation {next} in its place",
             stall.generation,
             stall.for_secs,
             stall.phase.as_str()
-        ),
-        None => aterm_log::warn!(
-            "aterm node serve: the update checker stalled (generation {} has not stamped its \
-             heartbeat for {} s, last in {}) and no replacement started",
-            stall.generation,
-            stall.for_secs,
-            stall.phase.as_str()
-        ),
+        );
+        return None;
     }
-    Some((stall, replacement))
+    Some(format!(
+        "the update check has not moved for {} s (last in {}) and no replacement can take it over: \
+         this run ends so launchd starts the job again, and that start checks afresh",
+        stall.for_secs,
+        stall.phase.as_str()
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -1942,11 +2818,21 @@ impl NodeUpdater for LiveNodeUpdater {
     }
 
     fn newer_build(&self) -> Option<u64> {
-        aterm_update::newer_build_for_a_start(crate::running_build_number())
+        // An updates root that does not answer lands nothing in any process, so it finds no build.
+        let build = crate::running_build_number();
+        look_within(
+            &STAGE_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the look at a waiting build",
+            None,
+            move || aterm_update::newer_build_for_a_start(build),
+        )
     }
 
     fn auto_apply(&self) -> bool {
-        crate::app_config::update_check_settings_setting().is_some_and(|s| s.auto_apply)
+        auto_apply_look(&AUTO_APPLY_LOOKS, LOOK_ANSWERS_WITHIN, || {
+            crate::app_config::update_check_settings_setting().is_some_and(|s| s.auto_apply)
+        })
     }
 
     fn apply_at_boot(&self) -> String {
@@ -1972,11 +2858,15 @@ impl NodeUpdater for LiveNodeUpdater {
     }
 
     fn confirm_trial(&self) -> bool {
+        // The service is up: this is its checkpoint. A trial a window launched answers
+        // `Pending` (no longer "nothing to retry"), so a later look asks again.
         aterm_update::confirm_boot_health_exact(
             crate::running_build_number(),
             crate::build_info::git_commit(),
             aterm_update::TrialWitness::Headless,
+            true,
         )
+        .opens_gate()
     }
 
     fn trial_pending(&self) -> bool {
@@ -1984,21 +2874,74 @@ impl NodeUpdater for LiveNodeUpdater {
     }
 
     fn older_build_installed(&self) -> Option<u64> {
-        older_build_to_run(
-            aterm_update::older_build_installed(crate::running_build_number()),
-            || {
-                std::env::current_exe().is_ok_and(|exe| {
-                    aterm_agent::node_service::image_replaced(std::process::id(), &exe)
+        // A bundle on a volume that does not answer finds no older build, as it finds no newer one.
+        let build = crate::running_build_number();
+        look_within(
+            &STAGE_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the look at an older build",
+            None,
+            move || {
+                older_build_to_run(aterm_update::older_build_installed(build), || {
+                    std::env::current_exe().is_ok_and(|exe| {
+                        aterm_agent::node_service::image_replaced(std::process::id(), &exe)
+                    })
                 })
             },
         )
     }
 
     fn checks_setting_moved(&self) -> bool {
-        aterm_update::automatic() != aterm_update::automatic_as_saved()
+        // A read with no answer is no change, now or at launch: the next look asks again.
+        look_within(
+            &AUTO_APPLY_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the look at [update] enabled",
+            false,
+            || {
+                aterm_update::automatic_as_saved()
+                    .zip(aterm_update::automatic_at_launch())
+                    .is_some_and(|(saved, launch)| saved != launch)
+            },
+        )
     }
 
-    fn mind_checker(&self) {
+    fn failed_activation(&self) -> Option<(u64, u64)> {
+        // An updates root that does not answer holds no failed activation, as it holds no stage.
+        look_within(
+            &STAGE_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the look at a failed activation",
+            None,
+            aterm_update::failed_activation_waiting,
+        )
+    }
+
+    fn install_over_failed_activation(&self, waiting: (u64, u64)) -> Option<String> {
+        let holds = Arc::clone(&self.failed_activation_holds);
+        if holds.lock().unwrap_or_else(PoisonError::into_inner).settled == Some(waiting) {
+            return None;
+        }
+        look_within(
+            &STAGE_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the install over a failed activation",
+            None,
+            move || {
+                failed_activation_words(
+                    waiting,
+                    aterm_update::install_over_failed_activation(
+                        crate::running_build_number(),
+                        crate::build_info::git_commit(),
+                    ),
+                    &holds,
+                )
+            },
+        )
+    }
+
+    fn mind_checker(&self) -> Option<String> {
+        aterm_update::start_owed_launch_waits();
         let mut watch = self
             .checker_watch
             .lock()
@@ -2008,12 +2951,14 @@ impl NodeUpdater for LiveNodeUpdater {
             aterm_update::checker_watch::checker_snapshot(),
             aterm_update::checker_watch::now_secs(),
             aterm_update::respawn_stalled_checker,
-        );
+        )
     }
 
     fn restart(&self, why: &str) {
-        aterm_log::info!("aterm node serve: {why}");
+        // The stop and its deadline first: a log on a volume that stopped answering holds neither.
         self.stop.set();
+        end_run_within(RUN_ENDS_WITHIN, end_stuck_run);
+        aterm_log::info!("aterm node serve: {why}");
     }
 
     fn now(&self) -> Instant {
@@ -2047,6 +2992,7 @@ fn live_node_updater(stop: &Arc<Stop>) -> Option<Arc<dyn NodeUpdater>> {
         Some(Arc::new(LiveNodeUpdater {
             stop: Arc::clone(stop),
             checker_watch: Mutex::new(crate::update_checker_watch::CheckerWatchState::default()),
+            failed_activation_holds: Arc::new(Mutex::new(FailedActivationHolds::default())),
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -2113,11 +3059,11 @@ pub fn run_node_serve_owning(startup: impl FnOnce() -> Option<NodeMaintenance>) 
 
 /// Take `<state_dir>/node-job.lock`, then run `boot`, `startup` and `serve` under it, in that
 /// order. A lock another instance holds ends the start at once, with none of them run, as a
-/// second instance. A lock that cannot be opened orders no start, so `boot` still runs, as it
-/// did before the lock came first: each start of a new build that fails there is counted against
-/// its boot trial, and the crash-loop revert still reaches it. That start then fails, with no
-/// service started. The lock is close-on-exec, so a boot that execs the build it installed lets
-/// it go, and that build's start takes it again before it counts or confirms its trial.
+/// second instance. A lock that cannot be opened does too, and fails the start: it cannot rule out
+/// a second instance, and a file's mode or owner says nothing of a build, so no boot swaps or counts
+/// a launch against its trial for it. The lock is close-on-exec, so a boot that execs the build it
+/// installed lets it go, and that build's start takes it again before it counts or confirms its
+/// trial.
 fn own_node_job<S>(
     state_dir: &Path,
     boot: impl FnOnce() -> NodeBoot,
@@ -2131,10 +3077,7 @@ fn own_node_job<S>(
             serve(boot, job_lock, maintenance)
         }
         JobLock::HeldElsewhere => ExitCode::SUCCESS,
-        JobLock::Unopenable => {
-            let _ = boot();
-            ExitCode::FAILURE
-        }
+        JobLock::Unopenable => ExitCode::FAILURE,
     }
 }
 
@@ -2220,6 +3163,7 @@ fn run_node_serve(
         spawn_claims_upkeep(cfg.relay_dir.clone(), Arc::clone(&cfg.stop));
         arm_claims_off_on_quit(
             cfg.relay_dir.clone(),
+            cfg.state_dir.clone(),
             crate::harness_host::claims_off_as_the_node_job_stops,
         );
     }
@@ -2254,12 +3198,18 @@ fn claims_off_on_quit(relay_dir: &Path, off: &dyn Fn()) -> bool {
 }
 
 /// Arm the node job's orderly quit: on SIGTERM (or SIGINT or SIGHUP) [`claims_off_on_quit`] with
-/// `off` (production passes `harness_host::claims_off_as_the_node_job_stops`), then the job dies
-/// of that signal as it did before (`crate::owned_endpoint::arm_orderly_quit`; a second signal
-/// ends it at once).
-fn arm_claims_off_on_quit(relay_dir: PathBuf, off: fn()) {
+/// `off` (production passes `harness_host::claims_off_as_the_node_job_stops`), the host's quit
+/// step (`crate::host_quit::run`, bounded by its host: the job's Commons runtime stops and
+/// closes the network history), and `state_dir`'s fleet times this job noted and holds
+/// unwritten ([`write_seen_at_quit`]); then the job dies of that signal as it did before
+/// (`crate::owned_endpoint::arm_orderly_quit`; a second signal ends it at once). This is the
+/// job's usual end: launchd stops it with SIGTERM, and its serve loop returns only for an
+/// update's restart.
+fn arm_claims_off_on_quit(relay_dir: PathBuf, state_dir: PathBuf, off: fn()) {
     if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |_sig| {
         claims_off_on_quit(&relay_dir, &off);
+        crate::host_quit::run();
+        write_seen_at_quit(&state_dir);
         // The quit ends the process without the keepers' drops: all three logs close first, so
         // its weak tier is flushed in full and marked closed (C2).
         aterm_mesh::logs::close_bus_at_quit();
@@ -2370,6 +3320,9 @@ fn serve_node_job(
     mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
 
     while !cfg.stop.is_set() {
+        if let Some(updates) = cfg.updates.as_ref() {
+            updates.start_owed_look(&cfg.relay_dir, &cfg.stop);
+        }
         if let Some(maintain) = &maintenance {
             maintain();
         }
@@ -2381,6 +3334,15 @@ fn serve_node_job(
             continue;
         }
         let Some(wanted) = wanted_for_node(&cfg) else {
+            advertiser.stop();
+            port_lock = None;
+            cfg.stop.sleep(cfg.tick_every);
+            checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
+            continue;
+        };
+        let Some(traffic) =
+            aterm_agent::fleet_vault::Traffic::capture(&cfg.state_dir, cfg.vault_paths.as_ref())
+        else {
             advertiser.stop();
             port_lock = None;
             cfg.stop.sleep(cfg.tick_every);
@@ -2515,6 +3477,7 @@ fn serve_node_job(
             node.ok().flatten(),
             mesh_now.as_ref(),
             maintenance.as_ref(),
+            traffic,
         ) {
             port_lock = None;
             checkpoint_idle(
@@ -2525,7 +3488,18 @@ fn serve_node_job(
     }
 
     advertiser.stop();
+    // The loop returned (an update's restart): the same write the job's terminating signal
+    // makes ([`arm_claims_off_on_quit`]).
+    write_seen_at_quit(&cfg.state_dir);
     ExitCode::SUCCESS
+}
+
+/// When members were last heard, where this job still holds it unwritten, goes to disk as the
+/// job ends in order, by its serve loop's return or by a terminating signal, waiting at most a
+/// second for the book's lock. A job that is killed, or that ends by a signal it could not arm
+/// for, loses at most a minute of it.
+fn write_seen_at_quit(state_dir: &Path) {
+    let _ = aterm_net::fleet_member::write_seen_noted(state_dir, Duration::from_secs(1));
 }
 
 /// The vault pass (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, B10), with the mesh on and a
@@ -2543,9 +3517,16 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
     let now_ms = Arc::clone(&cfg.mesh.pass_now_ms);
     let start_converge = Arc::clone(&cfg.mesh.pass_converge);
     let pace = cfg.mesh.pass_pace;
+    let rung = cfg.mesh.pass_rung.clone();
+    let broker = cfg.mesh.pass_broker;
     std::thread::Builder::new()
         .name("node-vault-pass".into())
         .spawn(move || {
+            let switches = rung
+                .as_ref()
+                .and_then(|rung| watch_pass_switches(&state_dir, config_path.as_deref(), rung));
+            // A pass whose switches go unheard looks at its pace.
+            let rung = rung.filter(|_| switches.is_some());
             aterm_secrets::client::run_node_pass(&aterm_secrets::client::NodePassHost {
                 paths: &paths,
                 stop: &stop,
@@ -2553,19 +3534,50 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
                 may_post: &|| lan_unavailable().is_none(),
                 routes: &aterm_secrets::server::route_sources,
                 make_inputs: &|| {
+                    // The observer rings the pass as an input it reads changes.
                     aterm_secrets::client::convergence_inputs(
                         &paths,
                         aterm_secrets::client::ConvergenceRole::Node,
+                        rung.clone(),
                     )
                 },
                 start_converge: &*start_converge,
                 now_ms: &*now_ms,
                 log: &|line| aterm_log::info!("node: {line}"),
                 pace,
+                rung: rung.clone(),
+                broker,
             });
         })
         .map_err(|error| aterm_log::warn!("node: the vault pass did not start: {error}"))
         .ok()
+}
+
+/// A watch over what [`sharing_held`] reads of `state_dir` and `config_path` (the fleet's off
+/// switch and key, and `[swarm] enabled`), ringing `rung` as one changes, so the vault pass hears a
+/// hold lift. `None` where it cannot start.
+fn watch_pass_switches(
+    state_dir: &Path,
+    config_path: Option<&Path>,
+    rung: &Arc<aterm_uds::ready::Doorbell>,
+) -> Option<aterm_uds::file_watch::FileWatch> {
+    let ringing = Arc::clone(rung);
+    let watch = aterm_uds::file_watch::FileWatch::platform(
+        "node-pass-switches",
+        Box::new(move |_| ringing.ring()),
+    )
+    .map_err(|error| {
+        aterm_log::warn!(
+            "node: the vault pass cannot watch its switches, so it looks each second: {error}"
+        );
+    })
+    .ok()?;
+    watch.watch(0, state_dir.join(aterm_net::fleet_member::OFF_FILE));
+    watch.watch(1, state_dir.join(aterm_net::fleet::KEY_FILE));
+    if let Some(path) = config_path {
+        watch.watch(2, path.to_path_buf());
+    }
+    Some(watch)
 }
 
 /// One generation's neighbour links: the table, its re-proof timer, and the mesh overlay over it,
@@ -3421,10 +4433,15 @@ fn wanted_for_node(cfg: &NodeServeConfig) -> Option<Wanted> {
 /// `None` until one was read, under which every proved dialer is refused
 /// ([`super::update_denied_nodes_cache`]). A job that reads no vault (`vault_paths` `None`: one
 /// under a private state root, [`super::vault_under`]) has a deny list that names no one.
+/// A vault-tenure mismatch refuses traffic independently of the cached denial list.
 fn denied_nodes_for(
+    state: &Path,
     vault_paths: Option<&aterm_secrets::client::Paths>,
     cache: &Mutex<DeniedCache>,
 ) -> Option<Arc<[String]>> {
+    if !aterm_agent::fleet_vault::traffic_in_effect(state, vault_paths) {
+        return None;
+    }
     let observed = match vault_paths {
         Some(paths) => aterm_secrets::client::swarm_denial_snapshot_now(paths),
         None => Ok(aterm_secrets::client::SwarmDenialSnapshot::Available(
@@ -3593,7 +4610,11 @@ fn serve_one_node_generation(
     node: Option<NodeIdentity>,
     mesh_logs: Option<&Arc<aterm_mesh::Mesh>>,
     maintenance: Option<&NodeMaintenance>,
+    traffic: aterm_agent::fleet_vault::Traffic,
 ) -> bool {
+    if !traffic.current() {
+        return false;
+    }
     // Announcements belong to this listener generation. Stop them before its
     // socket is released, including every early return while starting workers. Closing the
     // admission callback also precedes joining its worker on an early return or unwind.
@@ -3669,11 +4690,14 @@ fn serve_one_node_generation(
     let deny_now: aterm_net::fleet::DenyFn = {
         let members = cfg.members.clone();
         let vault = cfg.vault_paths.clone();
+        let state = cfg.state_dir.clone();
         let cache = Arc::clone(denied_cache);
-        Arc::new(move || {
+        super::denial_under_take(traffic.clone(), move || {
             let log = members.as_ref().and_then(|members| members.keys());
-            denied_under(
-                denied_nodes_for(vault.as_ref(), &cache).as_deref(),
+            super::denied_for_fleet(
+                &state,
+                vault.as_ref(),
+                denied_nodes_for(&state, vault.as_ref(), &cache).as_deref(),
                 log.as_deref(),
             )
         })
@@ -3687,6 +4711,7 @@ fn serve_one_node_generation(
                 config_path: cfg.config_path.clone(),
                 vault_paths: cfg.vault_paths.clone(),
                 members: cfg.members.clone(),
+                deny: Arc::clone(&deny_now),
                 denied: Arc::clone(denied_cache),
                 open: Arc::clone(&open_table),
                 serving: Arc::new(serving_fn.clone()),
@@ -3768,15 +4793,18 @@ fn serve_one_node_generation(
         let denied_watch = Arc::clone(denied_cache);
         let adv_watch = Arc::clone(advertiser);
         let members_watch = cfg.members.clone();
+        let traffic_watch = traffic.clone();
         let browse_watch = browse.cloned();
         let discovery = Arc::clone(discovery);
         let automatic = automatic_handle.clone();
         let updates_watch = cfg.updates.clone();
+        let relay_dir = cfg.relay_dir.clone();
         let health_inputs = health::Inputs::of(cfg);
         let maintenance = maintenance.cloned();
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
+                let _ends_the_generation = EndsTheGeneration(Arc::clone(&listener_stop));
                 if !cfg!(test) {
                     crate::qos::set_self(crate::qos::Role::Background);
                 }
@@ -3827,6 +4855,9 @@ fn serve_one_node_generation(
                     if Instant::now() < next_tick {
                         continue;
                     }
+                    if let Some(updates) = &updates_watch {
+                        updates.start_owed_look(&relay_dir, &stop);
+                    }
                     if let Some(maintain) = &maintenance {
                         maintain();
                     }
@@ -3843,6 +4874,10 @@ fn serve_one_node_generation(
                         && now_wanted.as_ref().map(|w| w.listen.as_str())
                             != Some(initial_listen.as_str())
                     {
+                        listener_stop.set();
+                        return;
+                    }
+                    if !traffic_watch.current() {
                         listener_stop.set();
                         return;
                     }
@@ -3871,7 +4906,7 @@ fn serve_one_node_generation(
                     if let Some(automatic) = &automatic {
                         automatic.observe_membership(log.as_ref());
                     }
-                    let denied = denied_nodes_for(vault_paths.as_ref(), &denied_watch);
+                    let denied = denied_nodes_for(&state_dir, vault_paths.as_ref(), &denied_watch);
                     if !open_watch.is_empty() {
                         // No deny list read yet: every open drive or content read is cut, as the
                         // handshake refuses each new connection, until one is read.
@@ -3956,7 +4991,7 @@ fn serve_one_node_generation(
                             config_path.as_deref(),
                             &secret_watch,
                             (denied, log.as_deref()),
-                        );
+                         &|| traffic_watch.current(),);
                     }
                     if last_census_refresh.elapsed() >= CENSUS_REFRESH_EVERY {
                         last_census_refresh = Instant::now();
@@ -3965,8 +5000,7 @@ fn serve_one_node_generation(
                     // A round still out takes no move: the move waits for the round after it.
                     if let Some(woke) = heartbeat
                         .dispatch_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire), || {
-                        // A record of the vault the fleet state is of, adopted where an older
-                        // build left none.
+                        // Widen only an existing matching vault record.
                         aterm_agent::fleet_vault::keep(&state_dir, vault_paths.as_ref());
                         if log.as_deref().is_some_and(|keys| {
                             proved.as_ref().is_some_and(|(_, key)| !keys.admits(key))
@@ -3990,6 +5024,7 @@ fn serve_one_node_generation(
                                 secret_watch.clone(),
                                 (&listener_stop, &hb_in_flight),
                                 (denied, log, browse_watch.clone()),
+                                traffic_watch.clone(),
                             ),
                             None => {
                                 aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}");
@@ -4069,7 +5104,9 @@ fn serve_one_node_generation(
             let peer = served.peer_addr();
             // The handshake refused this connection while no deny list was read; one read since
             // is kept, so this is defense in depth: an unread list serves no op.
-            let Some(denied) = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve) else {
+            let Some(denied) =
+                denied_nodes_for(&state_dir, vault_paths.as_ref(), &denied_for_serve)
+            else {
                 if op == FleetOp::Drive {
                     return refuse_driver(served, peer, DENY_LIST_UNREAD, false);
                 }
@@ -4114,12 +5151,14 @@ fn serve_one_node_generation(
                 let secret = Arc::clone(&join_secret);
                 return served.answer(|stream| {
                     stream.set_read_timeout(Some(HANDSHAKE))?;
+                    let authorize = stream.authorization();
                     register_member_at(
                         stream,
                         &st,
                         (peer, proof.as_ref()),
                         (addr, &secret),
                         (&denied, log.as_deref()),
+                        &|| authorize().is_ok(),
                     )
                 });
             }
@@ -4127,12 +5166,14 @@ fn serve_one_node_generation(
                 let st = state_dir.clone();
                 return served.answer(|stream| {
                     stream.set_write_timeout(Some(HANDSHAKE))?;
+                    let authorize = stream.authorization();
                     share_book_at(
                         stream,
                         &st,
                         peer,
                         (&denied, log.as_deref()),
                         (addr, &serving_generation),
+                        &|| authorize().is_ok(),
                     )
                 });
             }
@@ -4142,12 +5183,14 @@ fn serve_one_node_generation(
                 return served.answer(|stream| {
                     stream.set_read_timeout(Some(HANDSHAKE))?;
                     stream.set_write_timeout(Some(HANDSHAKE))?;
+                    let authorize = stream.authorization();
                     receive_pushed_facts_at(
                         stream,
                         &st,
                         proof.as_ref(),
                         peer,
                         (&denied, log.as_deref()),
+                        &|| authorize().is_ok(),
                     )
                 });
             }
@@ -4216,8 +5259,8 @@ fn serve_one_node_generation(
                         let now_keys = std::cell::OnceCell::new();
                         let now_log = members.as_ref().and_then(|m| m.keys());
                         // No deny list read now: nothing is served.
-                        denied_nodes_for(vault_paths.as_ref(), &denied_for_serve).is_some_and(
-                            |now_denied| {
+                        denied_nodes_for(&state_dir, vault_paths.as_ref(), &denied_for_serve)
+                            .is_some_and(|now_denied| {
                                 now_serving.serves(
                                     content,
                                     grant_ref,
@@ -4229,8 +5272,7 @@ fn serve_one_node_generation(
                                     },
                                     &now_denied,
                                 )
-                            },
-                        )
+                            })
                     };
                 let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;
                 let Some(open) =
@@ -4336,6 +5378,7 @@ fn push_node_facts_heartbeat(
     config_path: Option<&Path>,
     secret: &aterm_net::fleet::FleetSecret,
     (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
+    current: &dyn Fn() -> bool,
 ) {
     let window = has_live_window_relay(windows.dir());
     let node = aterm_net::fleet_member::read_node_id(state_dir)
@@ -4368,10 +5411,16 @@ fn push_node_facts_heartbeat(
     let at_ms = aterm_time::unix_millis().unwrap_or(0);
     let host = aterm_uds::process::lan_host_name();
     let instances = usize::from(window);
-    let payload =
-        facts.to_survey_reply(std::process::id(), host.as_deref(), at_ms, instances, false);
+    let access = aterm_agent::fleet_access::read(state_dir).level;
+    let payload = facts.to_survey_reply(
+        std::process::id(),
+        host.as_deref(),
+        at_ms,
+        instances,
+        (access, false),
+    );
     if let Err(why) =
-        push_facts_to_issuer_with_denied(state_dir, secret, (denied_nodes, log), &payload)
+        push_facts_to_issuer_with_denied(state_dir, secret, (denied_nodes, log), &payload, current)
     {
         aterm_log::debug!(
             "node job: survey facts heartbeat push skipped: {}",
@@ -4449,6 +5498,31 @@ fn spawn_node_survey(
             aterm_uds::hangup::hang_up(&near);
         })
         .map(|_| ())
+}
+
+/// The fleet access level the last connection this node job judged was served at.
+static NODE_ACCESS_SEEN: Mutex<Option<FleetAccess>> = Mutex::new(None);
+
+/// This Mac's fleet access as `state_dir` stores it now, read per connection and failing closed
+/// ([`aterm_agent::fleet_access::read`]). The first connection to read a level other than the
+/// last this job served journals the change, and what made it.
+fn node_access(state_dir: &Path) -> FleetAccess {
+    let reading = aterm_agent::fleet_access::read(state_dir);
+    let was = NODE_ACCESS_SEEN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(reading.level);
+    if let Some(was) = was.filter(|was| *was != reading.level) {
+        aterm_log::info!(
+            "aterm node serve: fleet access is now {} (was {}; set by {})",
+            reading.level.word(),
+            was.word(),
+            reading
+                .by
+                .map_or("a writer its file does not name", |by| by.said()),
+        );
+    }
+    reading.level
 }
 
 fn spawn_windowless_survey(
@@ -4529,6 +5603,7 @@ fn spawn_windowless_survey(
                         let here = crate::survey::Here {
                             host: aterm_uds::process::lan_host_name(),
                             instances: 0,
+                            access: aterm_agent::fleet_access::read(&state_dir).level,
                             drive,
                             facts: Some(facts),
                         };
@@ -4570,6 +5645,18 @@ fn spawn_node_drive(
     std::thread::Builder::new()
         .name("aterm-node-drive".to_owned())
         .spawn(move || {
+            // The requester line first: refused, nothing of the drive is served or routed. A
+            // window gets it in the relay header ([`RelayHeader::Drive`]), which a window of
+            // another build refuses whole, so none serves a drive that names no requester.
+            let requester = match crate::control::read_requester(&mut near) {
+                Ok(requester) => requester,
+                Err(why) => {
+                    let _ = near.write_all(format!("ERR drive: {why}\n").as_bytes());
+                    let _ = near.flush();
+                    aterm_uds::hangup::hang_up(&near);
+                    return;
+                }
+            };
             let _ = near.set_read_timeout(Some(HANDSHAKE));
             let first_line =
                 match read_line_raw(&mut near, aterm_types::control_verbs::MAX_REQUEST_LINE) {
@@ -4601,6 +5688,22 @@ fn spawn_node_drive(
             let (verb, rest) = trimmed
                 .split_once(char::is_whitespace)
                 .map_or((trimmed, ""), |(verb, rest)| (verb, rest.trim_start()));
+            // The lock, before anything this job serves itself or routes: the line's lexical
+            // kind against this Mac's stored level. A line with no kind is no act the lock
+            // names, and whoever serves it refuses it in its own words.
+            let kind = crate::control::drive_kind_of_line(trimmed);
+            if let Ok(kind) = kind
+                && let Some(refusal) = crate::control::drive_locked(node_access(&state_dir), kind)
+            {
+                note_refused_driver(
+                    peer,
+                    &format!("{} driving `{}`: fleet access", driver.host, kind.word()),
+                );
+                let _ = near.write_all(refusal.as_bytes());
+                let _ = near.flush();
+                aterm_uds::hangup::hang_up(&near);
+                return;
+            }
             if verb == "vault" {
                 let reply = aterm_secrets::client::admin_service::serve_at(
                     vault_paths.as_ref(),
@@ -4664,6 +5767,7 @@ fn spawn_node_drive(
                 key: Some(driver_key),
                 peer,
                 sids: Vec::new(),
+                requester,
             };
             let answer = match route_drive(&windows, &header, &first_line) {
                 DriveRoute::Window(win) => {
@@ -4676,7 +5780,9 @@ fn spawn_node_drive(
                 }
                 DriveRoute::Answer(answer) => answer,
                 DriveRoute::Busy(why) => busy(&why),
-                DriveRoute::NoWindow if verb == "spawn" => String::new(),
+                // A window is launched only for an admitted spawn: the same parse decided the
+                // lock above, so a locked Mac launches none for any line.
+                DriveRoute::NoWindow if kind == Ok(DriveKind::Spawn) => String::new(),
                 DriveRoute::NoWindow => "ERR no window open on this Mac\n".to_owned(),
             };
             if !answer.is_empty() {
@@ -4731,6 +5837,8 @@ fn spawn_node_drive(
         .map(|_| ())
 }
 
+/// Hand `near` to the window on `win`, which reads `first_line` first: a drive's first request,
+/// or a survey connection's first line.
 fn forward_node_drive(near: CtlStream, mut win: CtlStream, open: &NodeOpened, first_line: &str) {
     if !open.attach_line(&win)
         || win.write_all(first_line.as_bytes()).is_err()
@@ -4781,17 +5889,7 @@ struct AwaitShare {
 fn route_drive(windows: &WindowRelays, header: &RelayHeader, first_line: &str) -> DriveRoute {
     let mut sids = crate::control::drive_line_sessions(first_line);
     sids.retain(|sid| relay_names(sid.as_str()));
-    let naming = |sids: Vec<SessionId>| match header.clone() {
-        RelayHeader::Drive {
-            driver, key, peer, ..
-        } => RelayHeader::Drive {
-            driver,
-            key,
-            peer,
-            sids,
-        },
-        other => other,
-    };
+    let naming = |sids: Vec<SessionId>| share_header(header, &sids);
     let declined = match hand_over_in_order(windows, &naming(sids.clone())) {
         Ok(stream) => return DriveRoute::Window(stream),
         Err(declined) => declined,
@@ -5096,12 +6194,17 @@ fn read_share_now(
 fn share_header(header: &RelayHeader, sids: &[SessionId]) -> RelayHeader {
     match header.clone() {
         RelayHeader::Drive {
-            driver, key, peer, ..
+            driver,
+            key,
+            peer,
+            requester,
+            ..
         } => RelayHeader::Drive {
             driver,
             key,
             peer,
             sids: sids.to_vec(),
+            requester,
         },
         other => other,
     }
@@ -5328,6 +6431,7 @@ impl atpkg::peers::UnitConn for UnitsOver<'_> {
 /// connection is served, judged again for each stream by the `[fleet]` table, the deny list and
 /// the membership log read now.
 struct LinkServe {
+    deny: aterm_net::fleet::DenyFn,
     state_dir: PathBuf,
     windows: WindowRelays,
     home_dir: Option<PathBuf>,
@@ -5351,10 +6455,15 @@ impl LinkServe {
     }
 
     fn serve(&self, incoming: Incoming) {
+        if (self.deny)().refuses(Some(incoming.peer())) {
+            return incoming.refuse("admission changed");
+        }
         let peer = Some(incoming.peer_addr());
         let op = incoming.op();
         // No deny list read now: no stream is served, as no connection is.
-        let Some(denied) = denied_nodes_for(self.vault_paths.as_ref(), &self.denied) else {
+        let Some(denied) =
+            denied_nodes_for(&self.state_dir, self.vault_paths.as_ref(), &self.denied)
+        else {
             return incoming.refuse("unread");
         };
         // `Bus` is each mesh log's broker (B7a), which judges the peer's key itself, and
@@ -5389,6 +6498,18 @@ impl LinkServe {
                         "ERR denied: "
                     };
                     return incoming.refuse(&format!("{head}{why}"));
+                }
+                // Admitted as a driver, and judged as one: the stream is the mesh's cross-Mac
+                // message path, which this Mac's fleet access admits from Read and Write. A
+                // stream already open is not cut on a drop, as on a grant taken back.
+                if let Some(refusal) =
+                    crate::control::drive_locked(node_access(&self.state_dir), DriveKind::BusLog)
+                {
+                    aterm_log::info!(
+                        "aterm node serve: refused {}'s bus.log stream: fleet access",
+                        incoming.peer().node
+                    );
+                    return incoming.refuse(refusal.trim_end());
                 }
             }
             return mesh.serve_bus(incoming);
@@ -5520,19 +6641,21 @@ impl LinkServe {
             let now_serving = (self.serving)();
             let now_keys = std::cell::OnceCell::new();
             let now_log = self.members.as_ref().and_then(|m| m.keys());
-            denied_nodes_for(self.vault_paths.as_ref(), &self.denied).is_some_and(|now_denied| {
-                now_serving.serves(
-                    content,
-                    grant,
-                    &|n, key| {
-                        let now_keys = now_keys.get_or_init(|| {
-                            aterm_net::fleet_member::Keyring::read(&self.state_dir)
-                        });
-                        holds_in(now_keys, now_log.as_deref(), n, key)
-                    },
-                    &now_denied,
-                )
-            })
+            denied_nodes_for(&self.state_dir, self.vault_paths.as_ref(), &self.denied).is_some_and(
+                |now_denied| {
+                    now_serving.serves(
+                        content,
+                        grant,
+                        &|n, key| {
+                            let now_keys = now_keys.get_or_init(|| {
+                                aterm_net::fleet_member::Keyring::read(&self.state_dir)
+                            });
+                            holds_in(now_keys, now_log.as_deref(), n, key)
+                        },
+                        &now_denied,
+                    )
+                },
+            )
         };
         let Ok((near, far)) = aterm_uds::kept_out(CtlStream::pair) else {
             return incoming.refuse("busy");

@@ -465,13 +465,17 @@ fn number_token(n: Option<u64>) -> String {
 #[cfg(any(unix, test))]
 pub(crate) const FACTS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Host-level survey header fields ([`survey_rows`]).
-#[derive(Clone, Default)]
+/// Host-level survey header fields ([`survey_rows`]). No field has a default: a site that
+/// builds one says each, this machine's fleet access among them.
+#[derive(Clone)]
 pub(crate) struct Here {
     /// LAN hostname for this machine.
     pub(crate) host: Option<String>,
     /// Live `aterm` instance count for this user.
     pub(crate) instances: usize,
+    /// This machine's fleet access as stored now (`access=<word>`): what a reader its grants
+    /// let drive may do here. Never cached: a listener's snapshot reads it afresh.
+    pub(crate) access: aterm_types::fleet_access::FleetAccess,
     /// Whether the reader is permitted to drive this machine.
     pub(crate) drive: bool,
     /// C16 swarm survey facts (`None` in session-only unit fixtures).
@@ -489,6 +493,7 @@ impl Here {
         Here {
             host: aterm_uds::process::lan_host_name(),
             instances: 1 + crate::sibling_scan::live_siblings(),
+            access: crate::control::fleet_access_now(),
             drive: false,
             facts: Some(aterm_agent::survey_facts::SwarmSurveyFacts::collect(
                 0, true, node,
@@ -517,6 +522,8 @@ impl Here {
                 // snapshot says the latest one, never one a minute behind it.
                 let mut here = cached.clone();
                 drop(guard);
+                // The level is a toggle: the one stored now, whatever the snapshot held.
+                here.access = crate::control::fleet_access_now();
                 refresh_home_repos();
                 if let Some(facts) = here.facts.as_mut() {
                     facts.take_latest_repos();
@@ -598,11 +605,13 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
         .as_ref()
         .map_or_else(Vec::new, |f| f.extra_lines(level == SurveyLevel::Content));
     let extra_bytes: usize = extra_lines.iter().map(|l| l.len() + 1).sum();
+    let access = here.access.word();
     let drive = if here.drive { " drive=1" } else { "" };
     let head = |cut: usize, sent: usize, extra_count: usize| {
         format!(
             "OK {}\ninstance pid={} host={host} version={version} sessions={} level={} \
-             cut={cut} at_ms={now_unix_ms} node={node} instances={instances}{facts_tokens}{drive}\n",
+             cut={cut} at_ms={now_unix_ms} node={node} instances={instances}{facts_tokens} \
+             access={access}{drive}\n",
             sent + 1 + extra_count,
             std::process::id(),
             snapshot.len(),
@@ -799,6 +808,7 @@ fn session_row(
         goal,
         build_wait,
         work,
+        lineage,
     ) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
@@ -833,6 +843,7 @@ fn session_row(
             (level == SurveyLevel::Content)
                 .then(|| timeline.work().cloned())
                 .flatten(),
+            timeline.slog().lineage().map(|id| id.as_str().to_owned()),
         )
     };
     let (user_title, role, supervisor, attention) = {
@@ -858,10 +869,17 @@ fn session_row(
         None => (agent.word, agent.age_ms()),
     };
     let codex_facts = codex.as_ref().map(|c| &c.facts);
-    // The account it runs on: Claude Code's as its footer judges its login against the roster,
-    // another pooled CLI's as its pool last read the session.
+    // The account it runs on, by its address where one is known: Claude Code's as its footer
+    // judges its login against the roster, another pooled CLI's as its pool last read the
+    // session, and Muse Code's (no pool keeps its logins) by the address its own login store
+    // names, as its account's record gave the footer (`aterm_agent::harness::observed_account`).
     let account = match agent.reader.and_then(crate::harness_host::pool_cli) {
-        Some(Cli::Claude) => footer.as_ref().and_then(|f| f.account.clone()),
+        Some(Cli::Claude) => footer.as_ref().and_then(|f| {
+            f.account_email
+                .clone()
+                .filter(|email| !email.is_empty())
+                .or_else(|| f.account.clone())
+        }),
         Some(cli) => facts
             .and_then(|facts| {
                 facts
@@ -869,6 +887,14 @@ fn session_row(
                     .get(&(cli.id().to_owned(), h.sid.as_str().to_owned()))
             })
             .cloned(),
+        None if agent
+            .reader
+            .is_some_and(crate::harness_host::observed_account_only) =>
+        {
+            footer
+                .as_ref()
+                .and_then(|f| f.subscription.as_ref()?.email.clone())
+        }
         None => None,
     };
     // How a Claude Code session authenticates, and on the token route its token's account key
@@ -910,6 +936,10 @@ fn session_row(
         SurveyLevel::Content => Some(t.by.words()),
     });
     let held_from = h.ctx.fabric.holds().remote().map(|hold| hold.node.clone());
+    let request = request_fields(
+        crate::requests_host::placed(h.sid.as_str(), lineage.as_deref()).as_deref(),
+        level == SurveyLevel::Content && crate::fabric::serving_driver().is_none(),
+    );
     let mut row = format!(
         "session local={} sid={} state={} program={} program_kind={}{} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} \
@@ -918,7 +948,7 @@ fn session_row(
          token={token} detail={} \
          doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
-         held_from={} typed_by={} typed_ms={} {}",
+         held_from={} typed_by={} typed_ms={} {request} {}",
         h.local_id,
         h.sid.as_str(),
         h.state.as_str(),
@@ -952,7 +982,7 @@ fn session_row(
         number_token(usage.ctx_left.map(u64::from)),
         number_token(usage.five_hour.map(u64::from)),
         number_token(usage.seven_day.map(u64::from)),
-        word_token(account.as_deref().map(aterm_ctl::masked_label).as_deref()),
+        word_token(account.as_deref()),
         word_token(engine.detail.as_deref()),
         word_token(doing),
         role_token(role.as_deref(), level),
@@ -1018,6 +1048,41 @@ fn session_row(
         keep,
         cut: false,
     }
+}
+
+/// A row's `request= request_from= request_why=` fields for the request that owns its tab
+/// (`placed`, [`crate::requests_host::placed`]): its id, its requester's Mac (its host, else its
+/// node's head) and its why. Unless the row serves the requests' content tier (`content`: a
+/// content row for this Mac's own connection, never at `facts` nor to another Mac's drive, as
+/// `requests` serves none to a drive), a why a fallback took from the requester's brief, goal or
+/// asked line reads `1`; the requester's own `why=` and `(none given)` are the request's host
+/// tier.
+fn request_fields(placed: Option<&crate::requests_host::Placed>, content: bool) -> String {
+    let Some(placed) = placed else {
+        return "request=- request_from=- request_why=-".to_owned();
+    };
+    let from = if !placed.host.is_empty() {
+        pct_encode(&placed.host)
+    } else if !placed.node.is_empty() {
+        aterm_requests::id::head_of(&placed.node)
+    } else {
+        "-".to_owned()
+    };
+    let fallback = matches!(
+        placed.why_src,
+        aterm_requests::WhySrc::Brief
+            | aterm_requests::WhySrc::Goal
+            | aterm_requests::WhySrc::Asked
+    );
+    let why = if fallback && !content {
+        "1".to_owned()
+    } else {
+        excerpt_token(Some(&placed.why))
+    };
+    format!(
+        "request={} request_from={from} request_why={why}",
+        placed.id
+    )
 }
 
 /// How many hex digits of a commit a row shows.
@@ -1149,6 +1214,54 @@ fn logical_line(t: &aterm_core::terminal::Terminal, first: i32, last: i32) -> St
     }
     line.truncate(line.trim_end().len());
     line
+}
+
+/// A tab whose agent asks this Mac for something (a local `spawn`, ATERM-KI-1109-3), as its
+/// request records it: the program and model its session row names, the account a Claude Code
+/// footer judged (masked as the row shows it; another pooled CLI's account is the swarm's facts',
+/// which this read does not take), its goal line and its last asked line. `None` for a tab where
+/// no agent runs (a person's shell).
+pub(crate) struct Asking {
+    pub(crate) program: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) account: Option<String>,
+    pub(crate) goal: Option<String>,
+    pub(crate) asked: Option<String>,
+}
+
+/// [`Asking`] of session `h`, read as its survey row reads it.
+pub(crate) fn asking_of(h: &SessionHandle) -> Option<Asking> {
+    let (agent, footer, codex, goal, tasked, excerpts) = {
+        let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            timeline.agent().clone(),
+            timeline.claude_footer_shown(),
+            timeline.codex_survey().cloned(),
+            timeline.goal().map(str::to_owned),
+            timeline.task().is_some(),
+            timeline.claude_excerpts().cloned(),
+        )
+    };
+    let reader = agent.reader?;
+    let model = footer
+        .as_ref()
+        .and_then(|f| f.model.clone())
+        .or_else(|| codex.as_ref().and_then(|c| c.facts.model.clone()));
+    // The account it asks from, by its address where its footer read one, as the survey names it.
+    let account = match crate::harness_host::pool_cli(reader) {
+        Some(Cli::Claude) => footer
+            .as_ref()
+            .and_then(|f| f.account_email.clone().or_else(|| f.account.clone())),
+        _ => None,
+    };
+    let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
+    Some(Asking {
+        program: agent.program,
+        model,
+        account,
+        goal,
+        asked: prompt_of(h, tasked, excerpts.as_ref()),
+    })
 }
 
 fn prompt_of(h: &SessionHandle, tasked: bool, excerpts: Option<&ClaudeExcerpts>) -> Option<String> {

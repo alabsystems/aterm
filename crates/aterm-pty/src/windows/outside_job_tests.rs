@@ -240,11 +240,17 @@ impl Drop for Watched {
 /// A tab running an interactive `cmd.exe`, its output read to the end on a
 /// thread of its own; the receiver hears when the end comes.
 fn tab() -> (crate::SpawnedShell, mpsc::Receiver<()>) {
+    tab_whose_job(true)
+}
+
+/// [`tab`], its job letting its programs go (`lets_go`, as a packaged shell's leave it) or
+/// keeping them, as an ordinary shell's job does.
+fn tab_whose_job(lets_go: bool) -> (crate::SpawnedShell, mpsc::Receiver<()>) {
     // SAFETY: test-process mint; the trusted-launcher contract trivially holds.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-    JOB_LETS_GO.with(|lets_go| lets_go.set(true));
+    JOB_LETS_GO.with(|flag| flag.set(lets_go));
     let shell = spawn_shell_with_pid(
         24,
         80,
@@ -259,7 +265,7 @@ fn tab() -> (crate::SpawnedShell, mpsc::Receiver<()>) {
         None,
         aterm_sandbox::Limits::inherit(),
     );
-    JOB_LETS_GO.with(|lets_go| lets_go.set(false));
+    JOB_LETS_GO.with(|flag| flag.set(false));
     let shell = shell.expect("a ConPTY spawn of cmd.exe");
     let (tx, rx) = mpsc::channel();
     let master = shell.master;
@@ -316,6 +322,43 @@ impl Programs {
 }
 
 #[test]
+fn the_programs_the_shell_runs_outside_its_job_are_listed_with_its_jobs() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (shell, eof) = tab();
+    let programs = Programs::start(&shell);
+    let listed = super::super::job_images(shell.pid);
+    let names = |pid: u32| -> Vec<String> {
+        listed
+            .iter()
+            .filter(|(p, _)| *p == pid)
+            .filter_map(|(_, image)| image.file_name())
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .collect()
+    };
+    assert_eq!(names(programs.outside.pid), ["cmd.exe"], "{listed:?}");
+    assert_eq!(names(programs.ping.pid), ["ping.exe"], "{listed:?}");
+    assert!(
+        names(programs.stranger.pid).is_empty() && names(programs.stranger_ping.pid).is_empty(),
+        "a program outside the tab's tree is no command's: {listed:?}"
+    );
+    assert!(
+        names(shell.pid as u32).is_empty(),
+        "the shell is no command's program: {listed:?}"
+    );
+    assert!(
+        programs.outside.running() && programs.ping.running(),
+        "a listing ends nothing"
+    );
+    super::super::hangup(shell.pid);
+    programs.assert_only_the_tabs_ended();
+    eof.recv_timeout(Duration::from_secs(60))
+        .expect("the tab's output ends");
+    close_master(shell.master);
+}
+
+#[test]
 fn a_close_ends_the_programs_the_shell_runs_outside_its_job() {
     let _one = ONE_AT_A_TIME
         .lock()
@@ -365,6 +408,162 @@ fn a_quit_ends_the_programs_every_shell_runs_outside_its_job() {
     assert!(shell_runs, "the shell is the quit's to end");
     drop(s);
     super::super::hangup(shell.pid);
+    eof.recv_timeout(Duration::from_secs(60))
+        .expect("the tab's output ends");
+    close_master(shell.master);
+}
+
+/// How many walks of the machine's processes this thread's listings have taken.
+fn walks_taken() -> usize {
+    WALKS.with(std::cell::Cell::get)
+}
+
+/// End the tab and hear its output end.
+fn close(shell: &crate::SpawnedShell, eof: &mpsc::Receiver<()>) {
+    super::super::hangup(shell.pid);
+    eof.recv_timeout(Duration::from_secs(60))
+        .expect("the tab's output ends");
+    close_master(shell.master);
+}
+
+#[test]
+fn only_a_shell_not_known_to_keep_its_programs_is_walked() {
+    use ProgramsRun::{InJob, OutsideJob, Unknown};
+    assert!(walks(OutsideJob, true) && walks(OutsideJob, false));
+    assert!(!walks(InJob, true) && !walks(InJob, false));
+    assert!(walks(Unknown, true), "a discovering listing finds out");
+    assert!(!walks(Unknown, false), "the pace between never asks");
+}
+
+#[test]
+fn what_a_session_learns_first_of_its_shell_stays() {
+    let learned = Learned::of_shell(Some(Path::new(r"C:\Windows\System32\cmd.exe")));
+    assert_eq!(learned.get(), ProgramsRun::Unknown);
+    learned.found(ProgramsRun::Unknown);
+    assert_eq!(learned.get(), ProgramsRun::Unknown);
+    learned.found(ProgramsRun::InJob);
+    learned.found(ProgramsRun::OutsideJob);
+    assert_eq!(learned.get(), ProgramsRun::InJob);
+    let unread = Learned::of_shell(None);
+    unread.found(ProgramsRun::OutsideJob);
+    unread.found(ProgramsRun::InJob);
+    assert_eq!(unread.get(), ProgramsRun::OutsideJob);
+}
+
+#[test]
+fn a_packaged_shell_is_known_to_run_its_programs_outside_its_job_from_its_start() {
+    for image in [
+        r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.5.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+        r"C:\Users\someone\AppData\Local\Microsoft\windowsapps\pwsh.exe",
+    ] {
+        assert!(packaged(Path::new(image)), "{image}");
+        assert_eq!(
+            Learned::of_shell(Some(Path::new(image))).get(),
+            ProgramsRun::OutsideJob,
+            "{image}"
+        );
+    }
+    for image in [
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\tools\WindowsApps.exe",
+        r"C:\WindowsAppsOld\pwsh.exe",
+    ] {
+        assert!(!packaged(Path::new(image)), "{image}");
+    }
+}
+
+/// A shell at rest whose job keeps its programs: the listing at a pace takes no walk, and the
+/// one that may discover takes one and learns nothing from an empty answer.
+#[test]
+fn a_shell_at_rest_is_walked_only_by_a_listing_that_may_find_out() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (shell, eof) = tab_whose_job(false);
+    let s = session(shell.master).expect("the tab's session");
+    let before = walks_taken();
+    assert!(super::super::job_images_at_pace(shell.pid).is_empty());
+    assert_eq!(walks_taken(), before, "the pace takes no walk");
+    assert!(super::super::job_images(shell.pid).is_empty());
+    assert_eq!(
+        walks_taken(),
+        before + 1,
+        "a block's start or end takes one"
+    );
+    assert_eq!(s.programs.get(), ProgramsRun::Unknown);
+    drop(s);
+    close(&shell, &eof);
+}
+
+/// Once the job has held a program the shell is known to run its programs there: the same
+/// listing that walked a shell nothing was known of (the test above) takes no walk now.
+#[test]
+fn a_shell_whose_job_held_a_program_is_not_walked_again() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (shell, eof) = tab_whose_job(false);
+    let s = session(shell.master).expect("the tab's session");
+    let program = Watched::start(Some(shell.pid as u32));
+    let ping = program.child();
+    assert!(
+        program.in_job(s.job) && ping.in_job(s.job),
+        "the job keeps them"
+    );
+    let before = walks_taken();
+    let listed = super::super::job_images(shell.pid);
+    assert!(listed.iter().any(|&(pid, _)| pid == ping.pid), "{listed:?}");
+    assert_eq!(
+        walks_taken(),
+        before,
+        "a job that holds a program is enough"
+    );
+    assert_eq!(s.programs.get(), ProgramsRun::InJob);
+    let (program_pid, ping_pid) = (program.pid, ping.pid);
+    drop((program, ping));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while console_guard::pids_in(s.job)
+        .iter()
+        .any(|&pid| pid == program_pid || pid == ping_pid)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job never let its ended programs go"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(super::super::job_images(shell.pid).is_empty());
+    assert_eq!(walks_taken(), before, "its empty job is a shell at rest");
+    drop(s);
+    close(&shell, &eof);
+}
+
+/// A shell found running its programs outside its job is walked at the pace too; before any
+/// listing found that out, the pace listed none of them and took no walk.
+#[test]
+fn a_shell_found_running_programs_outside_its_job_is_walked_at_the_pace_too() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (shell, eof) = tab();
+    let s = session(shell.master).expect("the tab's session");
+    let programs = Programs::start(&shell);
+    let holds = |listed: &[(u32, PathBuf)]| listed.iter().any(|&(pid, _)| pid == programs.ping.pid);
+    let before = walks_taken();
+    assert!(!holds(&super::super::job_images_at_pace(shell.pid)));
+    assert_eq!(
+        walks_taken(),
+        before,
+        "nothing known yet: the pace takes no walk"
+    );
+    assert!(holds(&super::super::job_images(shell.pid)));
+    assert_eq!(s.programs.get(), ProgramsRun::OutsideJob);
+    assert!(holds(&super::super::job_images_at_pace(shell.pid)));
+    assert_eq!(walks_taken(), before + 2);
+    drop(s);
+    super::super::hangup(shell.pid);
+    programs.assert_only_the_tabs_ended();
     eof.recv_timeout(Duration::from_secs(60))
         .expect("the tab's output ends");
     close_master(shell.master);

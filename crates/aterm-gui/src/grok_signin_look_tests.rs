@@ -15,6 +15,13 @@ use aterm_spec::wait::{MUST_HAPPEN, within};
 
 /// A headless App whose one stub session's agent reads Grok Build on its sign-in wall.
 fn walled_grok() -> (crate::App, u64) {
+    grok_on_wall(Some(crate::presence::SIGN_IN_SCREEN))
+}
+
+/// A headless App whose one stub session's agent reads Grok Build on a login wall whose subject is
+/// `subject` (the sign-in screen's, [`crate::presence::SIGN_IN_SCREEN`], or none for a 401's
+/// failure row).
+fn grok_on_wall(subject: Option<&str>) -> (crate::App, u64) {
     let mut app = crate::App::headless_for_test();
     let sid = app.next_session_id;
     app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
@@ -22,7 +29,7 @@ fn walled_grok() -> (crate::App, u64) {
     ctx.timeline.lock().unwrap().publish_agent(
         "wall:auth",
         None,
-        None,
+        subject.map(str::to_string),
         Some(aterm_phase::Program::Grok),
         crate::session_timeline::AgentStamp {
             generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
@@ -141,6 +148,39 @@ fn a_signed_out_machine_the_look_reads_raises_the_walls_need() {
     assert_eq!(
         (shown(&app, sid).as_deref(), needs(&app, sid)),
         (Some(GROK_SIGNIN_WHAT), true)
+    );
+}
+
+/// A GROK LOGIN WALL OFF ITS SIGN-IN SCREEN IS NO MACHINE SIGN-IN: a 401's failure row (or a
+/// login-ended text) publishes `wall:auth` with no sign-in subject, so the need it raises is the
+/// plain login's, never the machine sign-in's "approve the sign-in on its screen" (no sign-in runs
+/// on that screen), and no look runs, so none can mark the machine's login refused for a grok
+/// that drew no sign-in screen over it. CONTROL: the sign-in screen's wall asks the look.
+#[test]
+fn a_grok_login_wall_off_its_sign_in_screen_is_no_machine_sign_in() {
+    let (script, looks) = Script::looks(Vec::new(), GrokSignin::Idle);
+    let (mut app, sid) = grok_on_wall(None);
+    app.grok_looks = looks;
+    app.publish_need(sid);
+    assert_eq!(
+        (shown(&app, sid).as_deref(), needs(&app, sid)),
+        (Some("logged out: log in there"), true)
+    );
+    app.publish_need(sid);
+    assert_eq!(app.grok_looks.settled(), 0, "no look ran");
+    assert!(script.started.lock().unwrap().is_empty(), "no look started");
+
+    let (script, looks) = Script::looks(Vec::new(), GrokSignin::Idle);
+    let (mut app, sid) = walled_grok();
+    app.grok_looks = looks;
+    app.publish_need(sid);
+    assert_eq!(script.started(1).len(), 1, "CONTROL: the look started");
+    settled(&app.grok_looks, 1);
+    app.publish_need(sid);
+    assert_eq!(
+        shown(&app, sid).as_deref(),
+        Some(GROK_SIGNIN_WHAT),
+        "CONTROL: the machine's sign-in"
     );
 }
 

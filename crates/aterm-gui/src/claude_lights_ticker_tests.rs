@@ -20,7 +20,7 @@ use crate::harness_glass::{Arrival, on_act, on_act_at};
 type Switch = (&'static str, fn(&mut App, bool));
 
 /// The chips at rest on a hosted bypass pane: Cruise's glyph and the bit.
-const CHIPS: &str = "\u{221e} \u{25cf} yolo";
+const CHIPS: &str = "\u{221e} yolo";
 
 fn ticker_app(cols: u16) -> (App, WindowId, u64, (Hosted, UnixStream)) {
     let (mut app, wid, session, reader) = app();
@@ -288,10 +288,7 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     frame(&mut app, wid);
     let v1 = rule(&app, wid);
     assert!(
-        v1.contains(&format!(
-            "{} \u{b7} right-click: more",
-            crate::autopilot::AutopilotView::Cruise.title()
-        )) && !v1.contains("last:"),
+        v1.contains(&crate::autopilot::AutopilotView::Cruise.title()) && !v1.contains("last:"),
         "CONTROL: {v1:?}"
     );
     app.hover_claude_chip(wid, None);
@@ -591,7 +588,7 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
     let (ox, oy) = app.frame_origin(wid);
     let x = ox as f64 + (app.win_pad(wid) + col * cw + cw / 2) as f64;
     let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + row * ch + ch / 2) as f64;
-    assert_eq!(app.claude_chips_at(wid, x, y), None);
+    assert_eq!(app.claude_glass_at(wid, x, y), None);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
     assert_eq!(
         autopilot(&app, session),
@@ -614,12 +611,15 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     use aterm_agent::harness::permission_click::Look;
     let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
     // What a screen reader hears of the light in `mode`: the mode in Claude's own words first,
-    // then what a press does: on the off chip it turns yolo on, on the on chip nothing (no press
-    // is offered, only what bypass means), as sentences with none of the hover's separators.
+    // then what a press does: on the off chip it turns yolo on, on the on chip it leaves yolo
+    // for the settings' default, as sentences with none of the hover's separators.
     let spoken = |description: Option<&str>, mode: Mode| {
         let said = description.unwrap_or_else(|| panic!("{mode:?}: a description"));
         let (head, last) = match mode {
-            Mode::Bypass => ("Bypass permissions on.", " No prompts."),
+            Mode::Bypass => (
+                "Bypass permissions on.",
+                " Click to leave yolo for the settings' default mode.",
+            ),
             Mode::Plan => ("Plan mode on.", " Click to turn yolo on."),
             _ => ("Manual mode on.", " Click to turn yolo on."),
         };
@@ -631,10 +631,9 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
             said.ends_with(last),
             "{mode:?}: what a press does, last: {said:?}"
         );
-        assert_eq!(
+        assert!(
             said.contains("Click"),
-            mode != Mode::Bypass,
-            "{mode:?}: a press is offered on the off chip alone: {said:?}"
+            "{mode:?}: a press is offered: {said:?}"
         );
         assert!(
             !said.contains('\u{2014}') && !said.contains('\u{b7}'),
@@ -661,9 +660,9 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let strip = usize::from(app.chrome_rows(wid));
-    // The light says the bit: bypass reads `yolo on`, its description says the mode and what it
-    // means, and a press on it does nothing: yolo is never turned off by a press, nothing is
-    // typed and no click stands.
+    // The light says the bit: bypass reads `yolo on`, its description says the mode and what a
+    // press does, and a press on it types nothing and stands the click that leaves yolo for
+    // the settings' default, its box open beside it.
     let yolo = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
     assert_eq!(yolo.label, "Permission mode: yolo on.");
     spoken(yolo.description.as_deref(), Mode::Bypass);
@@ -677,11 +676,21 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         pty(&mut reader, 0).is_empty(),
         "a press on yolo types nothing"
     );
-    assert!(
-        standing(&app, session).is_none(),
-        "and stands no click: a press never turns yolo off"
+    assert_eq!(
+        standing(&app, session).map(|s| s.click.to),
+        Some(aterm_agent::supervise::policy::turn_end::PermissionTo::Settings),
+        "and stands the click that leaves yolo"
+    );
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|menu| menu.owner),
+        Some(crate::autopilot_menu::MenuOwner::Permission),
+        "the click's box"
     );
     clickable(&mut app, session, Look::Done);
+    let tab = super::gesture_tests::sid_of(&app, session);
+    app.step_click(&tab);
+    assert!(standing(&app, session).is_none(), "the restart landed");
+    assert!(app.autopilot_menu.is_none(), "and its box closed with it");
     draw_claude(
         &app,
         session,
@@ -720,7 +729,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         .expect("the switch is drawn");
     assert_eq!(
         (switch.row, switch.col, switch.width),
-        (drawn.frame_row - strip, drawn.cols.start, drawn.cols.len())
+        (drawn.frame_row - strip, drawn.ink.start, drawn.ink.len()),
+        "the node is the cells a press turns the switch on"
     );
     assert!(
         row_text(&app, wid, drawn.frame_row)[..].contains(&format!(
@@ -729,7 +739,13 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         )),
         "the glass says what the node says"
     );
-    assert_eq!(of(&chips, HarnessChip::Title), None, "{chips:?}");
+    let continuation = app.continuation_words(session).into_owned();
+    let quiet = of(&chips, HarnessChip::Title).expect("the default continuation status");
+    assert_eq!(quiet.label, continuation);
+    assert_eq!(quiet.description, None);
+    assert_eq!(quiet.toggled, None);
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Title);
+    assert!(pty(&mut reader, 0).is_empty(), "the status is passive");
     let (x, y) = px_of(&app, wid, (row, col));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
@@ -745,6 +761,26 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         "the slot's words as drawn: {:?} in {:?}",
         title.label,
         rule(&app, wid)
+    );
+    app.windows.get_mut(&wid).unwrap().claude_lights.selected =
+        Some((session, super::Target::Chip(MODE)));
+    app.on_cursor_moved(wid, 0.0, 0.0);
+    frame(&mut app, wid);
+    assert_eq!(
+        of(&app.claude_chips_a11y(wid), HarnessChip::Title)
+            .unwrap()
+            .label,
+        title.label,
+        "keyboard selection keeps the explicit title after the pointer leaves"
+    );
+    app.windows.get_mut(&wid).unwrap().claude_lights.selected = None;
+    frame(&mut app, wid);
+    assert_eq!(
+        of(&app.claude_chips_a11y(wid), HarnessChip::Title)
+            .unwrap()
+            .label,
+        continuation,
+        "the quiet status returns when explicit focus leaves"
     );
     // A press of its own, not a double click's second: the first press was stamped a minute ago.
     app.windows
@@ -862,17 +898,15 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
 }
 
 #[test]
-fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
+fn a_hovered_title_gives_up_its_trail_then_its_words() {
     let t0 = Instant::now();
     let (mut app, wid, session, _host) = ticker_app(241);
     let (act, at) = arrival_now(t0, 0);
     on_act_at(&mut app, session, Act::Approved, act);
     let v1 = &crate::autopilot::AutopilotView::Cruise.title();
-    let menu = format!("{v1} \u{b7} right-click: more");
     let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
     let click = "autopilot: cruise \u{b7} click: land";
-    let clicks = format!("{click} \u{b7} right-click: more");
-    let tail = format!("{at} \u{b7} click: land \u{b7} right-click: more");
+    let tail = format!("{at} \u{b7} click: land");
     let mut seen: Vec<(u16, u8)> = Vec::new();
     for width in (60..=240u16).rev() {
         assert!(app.apply_term_resize(wid, 24, width));
@@ -886,22 +920,13 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
             "autopilot: cruise \u{2014} {cruise} \u{b7} last: \u{2713} approved "
         )) && rule.contains(&tail)
         {
-            6
-        } else if rule.contains(&menu) {
-            assert!(!rule.contains("last:"), "{width}: {rule:?}");
-            5
-        } else if rule.contains(v1) {
-            assert!(!rule.contains("right-click"), "{width}: {rule:?}");
             4
-        } else if rule.contains(&clicks) {
-            assert!(
-                !rule.contains("last:") && !rule.contains("\u{2014}"),
-                "{width}: {rule:?}"
-            );
+        } else if rule.contains(v1) {
+            assert!(!rule.contains("last:"), "{width}: {rule:?}");
             3
         } else if rule.contains(click) {
             assert!(
-                !rule.contains("right-click") && !rule.contains("\u{2014}"),
+                !rule.contains("last:") && !rule.contains("\u{2014}"),
                 "{width}: {rule:?}"
             );
             2
@@ -933,7 +958,7 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
         seen.push((width, form));
     }
     let met = |form: u8| seen.iter().any(|(_, f)| *f == form);
-    assert!((0..=6).all(met), "CONTROL: every form is met: {seen:?}");
+    assert!((0..=4).all(met), "CONTROL: every form is met: {seen:?}");
     let from = |form: u8| {
         seen.iter()
             .filter(|(_, f)| *f == form)
@@ -941,10 +966,8 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
             .min()
     };
     eprintln!(
-        "with one act: whole from {:?}, without the trail from {:?}, v1's words from {:?}, \
-         both clicks from {:?}, the click from {:?}, short from {:?}",
-        from(6),
-        from(5),
+        "with one act: whole from {:?}, without the trail from {:?}, the click from {:?}, \
+         short from {:?}",
         from(4),
         from(3),
         from(2),

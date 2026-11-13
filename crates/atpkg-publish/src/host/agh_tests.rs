@@ -32,6 +32,25 @@ fn refusal(text: Option<&str>) -> String {
     }
 }
 
+/// A REFUSAL KEEPS THE STEP THAT CLEARS IT: agh's refusal of a group-writable source
+/// config names the chmod that clears the bit as its next, and the lane's line carries it,
+/// while an error with only its kind's generic next carries the why alone. NEGATIVE
+/// CONTROL: with `host_error` mapping the why alone, the chmod was dropped.
+#[test]
+fn a_refusal_keeps_its_own_next_step_and_drops_the_generic_one() {
+    let host = production(None).expect("a host");
+    let why = "source common config /w/engine.git/config: /w/engine.git is group-writable";
+    let own = agh::Error::refused(why).with_next("chmod g-w /w/engine.git");
+    assert_eq!(
+        host.host_error(&own),
+        super::HostError::Refused(format!("{why}; next: chmod g-w /w/engine.git"))
+    );
+    assert_eq!(
+        host.host_error(&agh::Error::refused(why)),
+        super::HostError::Refused(why.to_owned())
+    );
+}
+
 #[test]
 fn production_allows_missing_or_vault_config_but_refuses_invalid_config() {
     assert!(production(None).is_ok());

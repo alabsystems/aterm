@@ -164,45 +164,24 @@ fn a_tick_comes_every_minute_or_just_after_a_closer_deadline() {
     }
 }
 
+/// The mug's own rule over the shared classifier (`aterm_types::status_click`, where the
+/// classifier's cases are tested): every primary click toggles, a double-click's second
+/// release included, since the mug does not ask `status_click::repeated`.
 #[test]
-fn a_right_release_or_a_control_click_opens_the_menu() {
-    const LEFT_UP: usize = 2;
-    assert_eq!(click_of(Some((LEFT_UP, 0))), Click::Toggle);
-    assert_eq!(click_of(Some((EVENT_TYPE_RIGHT_MOUSE_UP, 0))), Click::Menu);
-    assert_eq!(
-        click_of(Some((LEFT_UP, MODIFIER_FLAG_CONTROL))),
-        Click::Menu
-    );
-    assert_eq!(
-        click_of(Some((EVENT_TYPE_RIGHT_MOUSE_UP, MODIFIER_FLAG_CONTROL))),
-        Click::Menu
-    );
-    let others = (1 << 17) | (1 << 19) | (1 << 20);
-    assert_eq!(click_of(Some((LEFT_UP, others))), Click::Toggle);
-    assert_eq!(click_of(None), Click::Toggle);
-}
-
-#[test]
-fn a_press_finding_a_stale_event_toggles() {
-    let right = |at: f64| EventKey {
-        kind: EVENT_TYPE_RIGHT_MOUSE_UP,
+fn a_double_clicks_second_release_toggles_the_mug_again() {
+    let left = |at: f64, clicks: isize| EventKey {
+        kind: status_click::LEFT_MOUSE_UP,
         flags: 0,
         at,
+        clicks,
     };
-    let control = EventKey {
-        kind: 2,
-        flags: MODIFIER_FLAG_CONTROL,
-        at: 9.0,
-    };
-    assert_eq!(click_from(Some(right(1.0)), None), Click::Menu);
-    assert_eq!(click_from(Some(right(2.0)), Some(right(1.0))), Click::Menu);
-    assert_eq!(click_from(Some(control), Some(right(1.0))), Click::Menu);
+    let (first, second) = (left(1.0, 1), left(1.2, 2));
+    assert_eq!(status_click::classify(Some(first), None), Click::Primary);
     assert_eq!(
-        click_from(Some(right(1.0)), Some(right(1.0))),
-        Click::Toggle
+        status_click::classify(Some(second), Some(first)),
+        Click::Primary
     );
-    assert_eq!(click_from(Some(control), Some(control)), Click::Toggle);
-    assert_eq!(click_from(None, Some(right(1.0))), Click::Toggle);
+    assert!(status_click::repeated(Some(second), Some(first)));
 }
 
 #[test]
@@ -1578,7 +1557,6 @@ fn every_send_here_has_the_prototype_the_runtime_reports() {
             false,
             types(b, &[q]),
         ),
-        (c"NSApplication", sel!(currentEvent), false, types(id, &[])),
         (c"NSApplication", sel!(run), false, types(v, &[])),
         (c"NSApplication", sel!(stop:), false, types(v, &[id])),
         (c"NSApplication", sel!(setDelegate:), false, types(v, &[id])),
@@ -1618,9 +1596,6 @@ fn every_send_here_has_the_prototype_the_runtime_reports() {
             true,
             types(id, &[uq, pt, uq, d, q, id, s, q, q]),
         ),
-        (c"NSEvent", sel!(type), false, types(uq, &[])),
-        (c"NSEvent", sel!(modifierFlags), false, types(uq, &[])),
-        (c"NSEvent", sel!(timestamp), false, types(d, &[])),
         (c"NSMenuItem", sel!(tag), false, types(q, &[])),
         (c"NSMenuItem", sel!(state), false, types(q, &[])),
         (c"NSWorkspace", sel!(sharedWorkspace), true, types(id, &[])),

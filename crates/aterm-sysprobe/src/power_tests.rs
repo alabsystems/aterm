@@ -79,6 +79,12 @@ fn a_name_with_a_nul_holds_nothing() {
 #[test]
 fn off_macos_no_assertion_is_listed() {
     assert!(assertions_of(1).is_err());
-    assert!(hold(PREVENT_SYSTEM_SLEEP, "aterm-sysprobe").is_none());
     assert_eq!(lid_closed(), None);
+}
+
+/// Linux has no hold; Windows holds a power request (`win_power_tests.rs`).
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn on_linux_nothing_is_held() {
+    assert!(hold(PREVENT_SYSTEM_SLEEP, "aterm-sysprobe").is_none());
 }

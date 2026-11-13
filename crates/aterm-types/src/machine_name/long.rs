@@ -141,23 +141,34 @@ impl OsSlot {
         }
     }
 
-    /// A numeric Bonjour alias of the exact expected DNS label. This diagnoses a
-    /// collision without treating it as alignment or asking the setter to fight it.
+    /// A numeric collision alias of the exact expected macOS name: ` (N)` for
+    /// ComputerName and `-N` for LocalHostName. It is never alignment or setter work.
     #[must_use]
     pub fn collision(self, expected: &str, observed: &str) -> bool {
-        self == Self::MacLocalHostName
-            && !expected.is_empty()
-            && expected.len() <= DNS_LABEL_MAX
-            && !expected.starts_with('-')
-            && !expected.ends_with('-')
-            && expected
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && observed
+        if expected.is_empty() || expected.len() > DNS_LABEL_MAX {
+            return false;
+        }
+        let suffix = match self {
+            Self::MacComputerName => observed
                 .strip_prefix(expected)
-                .and_then(|rest| rest.strip_prefix('-'))
-                .and_then(|suffix| suffix.parse::<u32>().ok().map(|n| (suffix, n)))
-                .is_some_and(|(suffix, n)| n >= 2 && n.to_string() == suffix)
+                .and_then(|rest| rest.strip_prefix(" ("))
+                .and_then(|rest| rest.strip_suffix(')')),
+            Self::MacLocalHostName
+                if !expected.starts_with('-')
+                    && !expected.ends_with('-')
+                    && expected
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+            {
+                observed
+                    .strip_prefix(expected)
+                    .and_then(|rest| rest.strip_prefix('-'))
+            }
+            _ => None,
+        };
+        suffix
+            .and_then(|suffix| suffix.parse::<u32>().ok().map(|n| (suffix, n)))
+            .is_some_and(|(suffix, n)| n >= 2 && n.to_string() == suffix)
     }
 
     /// The most bytes the slot holds as aterm writes it.

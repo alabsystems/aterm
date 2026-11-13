@@ -1633,7 +1633,9 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
 /// required: …`, measured on 1.0.70), where the binary's own sentence says `grok login`. The
 /// running turn's `[stop]` at its status row's end, the busy key row's `Ctrl+c:cancel` (composed
 /// from the key bindings) and the plan approval's `plan approval` in the composer's bottom edge
-/// are read as 1.0.70's busy and plan frames draw them ([`crate::grok::phase`]), and so are the
+/// are read as 1.0.70's busy and plan frames draw them ([`crate::grok::phase`]), the `Worked for `
+/// row under a turn that worked as its turn-ended frames draw it (a later turn, which supersedes
+/// a wall row over it, [`crate::grok::wall`]), and so are the
 /// boxes that wait on the person: the plan approval's `a:approve` key, a card's key row in either
 /// focus (`Tab:next option`, `Tab:next answer`, `Esc:scrollback`, `Tab/Space:permission`,
 /// composed from the key bindings) and the file card's `Allow Edit to ` title
@@ -1835,6 +1837,7 @@ pub const GROK_ANCHORS: &[Anchor] = &[
         "1.0.70",
     ),
     lit("grok.busy.stop", "[stop]", "1.0.70"),
+    lit("grok.turn.worked", "Worked for ", "1.0.70"),
     hint("grok.keys.cancel", "Ctrl+c:cancel", "1.0.70"),
     lit("grok.plan.edge", "plan approval", "1.0.70"),
     hint("grok.plan.keys.approve", "a:approve", "1.0.70"),
@@ -1860,8 +1863,9 @@ pub const GROK_ANCHORS: &[Anchor] = &[
 /// (`exceeded_current_quota_error`, and for an OpenAI-type provider `insufficient_quota` too),
 /// fail at once with no retry, and show the error as `[provider.api_error] <server's message>`
 /// (`formatErrorPayload`): no code is drawn, so only the server's words, which 2.3.3's patterns
-/// matched, say a quota on screen. The spinner's `Working…`, the exit hint a first Ctrl-C puts in
-/// the footer and the notice a resume draws over the composer are read as 2.4.0 drew them
+/// matched, say a quota on screen. The spinner's `Working…`, the exit hints a first Ctrl-C or
+/// Ctrl-D puts in the footer and the notice a resume draws over the composer are read as 2.4.0
+/// drew them (its Ctrl-D hint recorded in the exit's frame, not captured on one)
 /// ([`crate::kimi::phase`]), and so are the titles of the boxes it draws in the composer's place
 /// (a command's approval, a plan's, a question and the folder-trust prompt, [`crate::kimi::prompt`]).
 /// The approval panel's key row ends `↵ confirm` as 2.4.0 drew it, and `· ctrl+e preview` over
@@ -1877,6 +1881,11 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
     lit(
         "kimi.footer.exit_confirm",
         "Press Ctrl+C again to exit",
+        "2.4.0",
+    ),
+    lit(
+        "kimi.footer.exit_confirm.ctrl_d",
+        "Press Ctrl+D again to exit",
         "2.4.0",
     ),
     lit("kimi.busy.working", "Working\u{2026}", "2.4.0"),

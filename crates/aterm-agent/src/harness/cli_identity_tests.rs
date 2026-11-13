@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use std::cell::RefCell;
 
@@ -156,6 +166,7 @@ fn publication_credential(kind: i64, variant: u8) -> String {
     .to_string()
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_publication_refuses_credential_identity_changed_after_the_report() {
     for path in ["login", "renew-probe", "renew-status"] {
@@ -239,6 +250,7 @@ fn command(line: &str, env: &Env, host: &dyn AccountsHost) -> (String, String, S
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn completed_held_codex_renewal_keeps_its_staging_without_publishing_or_probing() {
     use crate::harness::login_drive::Outcome;
@@ -313,6 +325,7 @@ fn completed_held_codex_renewal_keeps_its_staging_without_publishing_or_probing(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_login_alias_is_separate_from_reported_identity_and_round_trips() {
     let tmp = tmp_dir("codex-login-identity");
@@ -376,6 +389,7 @@ fn codex_login_alias_is_separate_from_reported_identity_and_round_trips() {
 /// nothing and leave it unbound, naming Codex's own sign-in in the default home, since a staged
 /// login of its own is one that build never runs. CONTROL: on a codex-alab that keeps
 /// `CODEX_AUTH_PATH`'s login, the same sign-in binds `main` to its staged login.
+#[cfg(unix)]
 #[test]
 fn no_pool_sign_in_moves_the_default_row_off_a_codex_that_ignores_codex_auth_path() {
     let tmp = tmp_dir("codex-default-row-staging");
@@ -437,6 +451,7 @@ fn no_pool_sign_in_moves_the_default_row_off_a_codex_that_ignores_codex_auth_pat
 /// sign-in runs `new` (as `~/.local/bin/codex`), the by-hand line is the control's, unconditioned,
 /// and only the worker clause differs; where a sign-in runs a codex-alab from before it (`old`),
 /// the by-hand line differs and the worker clause is the control's.
+#[cfg(unix)]
 #[test]
 fn a_codex_sign_ins_by_hand_line_is_judged_by_the_program_a_sign_in_runs() {
     fn new(root: &Path) -> PathBuf {
@@ -488,6 +503,7 @@ fn a_codex_sign_ins_by_hand_line_is_judged_by_the_program_a_sign_in_runs() {
     assert_eq!(renewed, control.0, "a worker takes it");
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding() {
     for reported in [Some("another@example.test"), None] {
@@ -531,6 +547,7 @@ fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_credential_lost_during_the_identity_probe_cannot_publish() {
     for verb in ["login", "renew"] {
@@ -578,6 +595,7 @@ fn a_credential_lost_during_the_identity_probe_cannot_publish() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() {
     for change in ["email", "removed", "malformed", "missing", "binding"] {
@@ -662,6 +680,7 @@ fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() 
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plain_claude_login_preserves_the_bound_directory_and_adopts_only_staging() {
     let tmp = tmp_dir("plain-login-bound-directory");
@@ -756,6 +775,7 @@ fn duplicate_canonical_identities_and_unsupported_alias_options_refuse() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn changed_or_removed_policy_cannot_publish_a_completed_login() {
     for (verb, during_probe) in [("login", false), ("login", true), ("renew", false)] {
@@ -827,6 +847,7 @@ fn invalid_adoption_identity_is_rejected_before_a_provider_probe() {
     assert!(host.probes.borrow().is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_recovery_requires_scoped_identity_and_a_status_check() {
     for (proof, changed) in [
@@ -956,6 +977,7 @@ pub(crate) fn identity_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn identity_binding_conforms_and_a_fabricated_proof_is_rejected() {
     let model = aterm_models_harness::account_identity_model();
@@ -1237,6 +1259,7 @@ pub(crate) fn publication_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn signin_publication_conforms_and_missing_credentials_cannot_bind() {
     let model = aterm_models_harness::signin_publication_model();

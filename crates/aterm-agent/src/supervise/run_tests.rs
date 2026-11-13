@@ -217,6 +217,9 @@ struct Mock {
     offscreen: VecDeque<CtlReply>,
     verb_replies: BTreeMap<&'static str, VecDeque<CtlReply>>,
     turn_releases: Option<usize>,
+    /// Screen `.0` stands until `.1` is set: a move the host made (a restart) moves the screen on,
+    /// as [`Self::turn_releases`] waits on the loop's `turn`.
+    host_releases: Option<(usize, Arc<AtomicBool>)>,
     key_releases: Option<usize>,
     keyed: bool,
     keys: usize,
@@ -328,6 +331,13 @@ struct Mock {
     hand_during_idle: Option<(&'static str, &'static str)>,
     human_seq: Option<u64>,
     human_seq_from: BTreeMap<usize, u64>,
+    /// A WINDOW'S HOST ([`Ctl::builtin_authority`], [`Ctl::call_for_duty`]): the duty ownership
+    /// it reports, under which it refuses every write that names no duty, a duty the authority
+    /// does not keep, or another revision, as the window's own adapter does. `None`: an ordinary
+    /// adapter, which reports nothing and takes every write.
+    hosted: Option<BuiltinAuthority>,
+    /// The duty an admitted write is being served under ([`Self::serve_duty`]).
+    serving_duty: bool,
     human_seq_on: BTreeMap<usize, Option<u64>>,
     submits_on: BTreeMap<usize, u64>,
     open_on: std::collections::BTreeSet<usize>,
@@ -1132,6 +1142,7 @@ impl Mock {
             offscreen: VecDeque::new(),
             verb_replies: BTreeMap::new(),
             turn_releases: None,
+            host_releases: None,
             key_releases: None,
             keys: 0,
             key_gates: Vec::new(),
@@ -1161,9 +1172,11 @@ impl Mock {
             supervisor_owner: None,
             stop_on_meta: None,
             foreign_attention: None,
-            cwd: std::fs::canonicalize(std::env::temp_dir())
-                .ok()
-                .map(|d| d.to_string_lossy().into_owned()),
+            cwd: Some(
+                crate::supervise::test_canonical(&std::env::temp_dir())
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             agent_cwd: None,
             trusted_cwd: None,
             help: "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string(),
@@ -1221,6 +1234,8 @@ impl Mock {
             gen_skipped: 0,
             human_seq: None,
             human_seq_from: BTreeMap::new(),
+            hosted: None,
+            serving_duty: false,
             human_seq_on: BTreeMap::new(),
             submits_on: BTreeMap::new(),
             open_on: std::collections::BTreeSet::new(),
@@ -1896,6 +1911,10 @@ impl Mock {
             || self
                 .turn_releases
                 .is_some_and(|i| self.served == i + 1 && !self.turned)
+            || self
+                .host_releases
+                .as_ref()
+                .is_some_and(|(i, moved)| self.served == i + 1 && !moved.load(Ordering::SeqCst))
             || self
                 .key_releases
                 .is_some_and(|i| self.served == i + 1 && !self.keyed)
@@ -3571,6 +3590,9 @@ impl Ctl for Mock {
             "timed out after {:?} waiting for a run on the run's clock to end",
             aterm_spec::wait::MUST_HAPPEN
         );
+        if self.hosted.is_some() && !self.serving_duty && super::claim::is_write(args) {
+            return Ok(Self::duty_denied());
+        }
         if let Some(clock) = self.waits.as_deref() {
             clock.skip(self.round_trip);
         }
@@ -3586,6 +3608,19 @@ impl Ctl for Mock {
         self.call(args)
     }
 
+    fn builtin_authority(&mut self, _: &str) -> BuiltinAuthority {
+        self.hosted.unwrap_or_default()
+    }
+
+    fn call_for_duty(
+        &mut self,
+        duty: Scope,
+        revision: u64,
+        args: &[&str],
+    ) -> Option<Result<CtlReply, String>> {
+        self.serve_duty(duty, revision, |mock| mock.call(args))
+    }
+
     /// The table's act ([`Mode`]), read through the identity predicate ([`table_image_act`]);
     /// every other test's mock is a confirmed agent's host.
     fn agent_act(&mut self, _: &str) -> Act {
@@ -3598,6 +3633,34 @@ impl Ctl for Mock {
 }
 
 impl Mock {
+    /// What a window's host answers a write it refuses ([`Self::hosted`]).
+    fn duty_denied() -> CtlReply {
+        CtlReply {
+            code: 1,
+            stdout: String::new(),
+            stderr: "aterm-ctl: ERR denied supervisor input authority\n".to_string(),
+        }
+    }
+
+    /// A typed write under `duty` at `revision` on a window's host ([`Self::hosted`]): `serve`
+    /// runs it where the reported authority keeps that duty at that revision, and it is refused
+    /// otherwise; `None` on an ordinary adapter. A wrapper that logs calls serves through itself.
+    fn serve_duty(
+        &mut self,
+        duty: Scope,
+        revision: u64,
+        serve: impl FnOnce(&mut Self) -> Result<CtlReply, String>,
+    ) -> Option<Result<CtlReply, String>> {
+        let authority = self.hosted?;
+        if authority.revision() != Some(revision) || !authority.keeps(duty) {
+            return Some(Ok(Self::duty_denied()));
+        }
+        self.serving_duty = true;
+        let reply = serve(self);
+        self.serving_duty = false;
+        Some(reply)
+    }
+
     fn answer_call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         let words: Vec<&str> = args
             .iter()
@@ -11556,6 +11619,9 @@ mod box_head_loop {
 
 #[path = "turn_end_loop_tests.rs"]
 mod turn_end;
+
+#[path = "turn_end_loop_fable_tests.rs"]
+mod turn_end_fable;
 
 #[path = "run_point_key_tests.rs"]
 mod point_key;

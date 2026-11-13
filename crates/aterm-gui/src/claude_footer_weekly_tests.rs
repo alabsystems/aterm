@@ -189,7 +189,7 @@ fn own_home_dir() -> PathBuf {
 }
 
 /// Save this machine's accounts store with the machine's own account (`main`) holding a tap
-/// figure of the week 40% used read at `fig`, where one is given, and a standing weekly wall
+/// figure of the week 60% left read at `fig`, where one is given, and a standing weekly wall
 /// when `walled`.
 fn save_main(fig: Option<i64>, walled: bool) {
     save_as(aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL, fig, walled);
@@ -403,7 +403,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     reading(pid, NOW - 60, (380, RESET), None, None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly 38% used"),
+        words("weekly 62% left"),
         "this tab's own reading"
     );
     let figure = |at: i64| {
@@ -421,7 +421,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     );
     assert_eq!(
         weekly(asks(tapped, unarmed)),
-        words("weekly 38% used"),
+        words("weekly 62% left"),
         "a process that carries the tap is read with the switch since turned off"
     );
     assert_eq!(
@@ -439,7 +439,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     reading(pid, NOW - 16 * 60, (380, RESET), None, None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly \u{2265}38% used"),
+        words("weekly \u{2264}62% left"),
         "past fifteen minutes, a lower bound"
     );
     assert_eq!(
@@ -502,18 +502,18 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     );
 
     profile(Some((71, NOW - 120)));
-    assert_eq!(weekly(tap_on), words("weekly 38% used"), "the tap is newer");
+    assert_eq!(weekly(tap_on), words("weekly 62% left"), "the tap is newer");
     profile(Some((71, NOW - 30)));
     assert_eq!(
         weekly(tap_on),
-        words("weekly 71% used"),
+        words("weekly 29% left"),
         "the cache is newer"
     );
     reading(pid, NOW - 20 * 60, (380, RESET), None, None);
     profile(Some((71, NOW - 30 * 60)));
     assert_eq!(
         weekly(tap_on),
-        words("weekly \u{2265}38% used"),
+        words("weekly \u{2264}62% left"),
         "the newer of two aged figures, a lower bound"
     );
     let _ = std::fs::remove_dir_all(root());
@@ -584,7 +584,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
     reading(pid, NOW - 60, (380, RESET), Some(LOGIN), None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly 38% used"),
+        words("weekly 62% left"),
         "its own login's tap"
     );
     reading(pid, NOW - 60, (380, RESET), Some("/logins/work-2"), None);
@@ -732,14 +732,14 @@ fn a_footer_kept_over_a_registry_miss_keeps_its_taps_week() {
     let shown = reread(&timeline, &mut identity, asks(tapped, armed));
     assert_eq!(
         (shown.weekly, shown.weekly_gap),
-        words("weekly 38% used"),
+        words("weekly 62% left"),
         "the control: the registry row read"
     );
     std::fs::remove_file(records().join(format!("sessions/{PID}.json"))).unwrap();
     let kept = reread(&timeline, &mut identity, asks(tapped, armed));
     assert_eq!(
         (kept.weekly, kept.weekly_gap),
-        words("weekly 38% used"),
+        words("weekly 62% left"),
         "the registry row missed once"
     );
     let _ = std::fs::remove_dir_all(root());
@@ -987,13 +987,13 @@ fn the_resolver_reads_the_stores_week_under_the_same_rule() {
     save(Some(NOW - 5 * 60), false);
     assert_eq!(
         weekly(asks(tapped, stored)),
-        words("weekly 40% used"),
+        words("weekly 60% left"),
         "the store's newer figure over the footer's own aged one"
     );
     save(Some(NOW - 30 * 60), false);
     assert_eq!(
         weekly(asks(tapped, stored)),
-        words("weekly \u{2265}38% used"),
+        words("weekly \u{2264}62% left"),
         "the footer's own over an older one"
     );
     save(Some(NOW - 60), true);
@@ -1038,11 +1038,11 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     };
     assert_eq!(
         words(&with(Some(fig(380, NOW - 60)), None)),
-        (false, Some("weekly 38% used".into()))
+        (false, Some("weekly 62% left".into()))
     );
     assert_eq!(
         words(&with(Some(fig(380, NOW - 20 * 60)), None)),
-        (false, Some("weekly \u{2265}38% used".into()))
+        (false, Some("weekly \u{2264}62% left".into()))
     );
     assert_eq!(
         words(&with(Some(fig(380, NOW - 2 * 86_400)), None)),
@@ -1065,7 +1065,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 20 * 60)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 40% used".into())),
+        (false, Some("weekly 60% left".into())),
         "the newer of the two"
     );
     assert_eq!(
@@ -1073,7 +1073,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 3 * 3600)),
             Some(sample(38, NOW - 60))
         )),
-        (false, Some("weekly 38% used".into())),
+        (false, Some("weekly 62% left".into())),
         "equal values do not make a newer panel sample a tap heartbeat"
     );
     assert_eq!(
@@ -1081,7 +1081,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 20 * 60)),
             Some(sample(38, NOW - 60))
         )),
-        (false, Some("weekly 38% used".into())),
+        (false, Some("weekly 62% left".into())),
         "older records with no per-window time retain the sample's actual timestamp"
     );
     assert_eq!(
@@ -1089,7 +1089,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW + 60)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 38% used".into())),
+        (false, Some("weekly 62% left".into())),
         "a reading stamped a minute ahead of this clock is just read"
     );
     assert_eq!(
@@ -1097,7 +1097,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW + 61)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 40% used".into())),
+        (false, Some("weekly 60% left".into())),
         "one stamped further ahead loses to one it can show"
     );
     let mut walled = with(None, None);
@@ -1171,7 +1171,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     );
     assert_eq!(
         words(&legacy.accounts["main"]),
-        (false, Some("weekly 38% used".into())),
+        (false, Some("weekly 62% left".into())),
         "legacy absence retains its timestamp; values cannot reconstruct an observation's origin"
     );
 
@@ -1183,7 +1183,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     state = reload(&state, NOW);
     assert_eq!(
         words(&state.accounts["main"]),
-        (false, Some("weekly 38% used".into())),
+        (false, Some("weekly 62% left".into())),
         "the real fresh probe survives storage and reaches the weekly consumer"
     );
     let beat = NOW + accounts::READING_HEARTBEAT_S;
@@ -1202,7 +1202,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
         store_week(&state.accounts["main"], beat)
             .figure
             .and_then(|figure| figure.words(beat)),
-        Some("weekly 38% used".into())
+        Some("weekly 62% left".into())
     );
     let kept = state.clone();
     assert!(accounts::note_reading(&mut state, "main", &read, beat + 1).is_empty());
@@ -1223,7 +1223,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     save_main(Some(NOW - 60), false);
     assert_eq!(
         weekly(asks(untapped, stored)),
-        words("weekly 40% used"),
+        words("weekly 60% left"),
         "the control: the default home's own account's week"
     );
     let dir = own_config_dir();
@@ -1278,7 +1278,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     // week is the one the store keeps under `main`.
     assert_eq!(
         (shown.email.as_deref(), shown.weekly.as_deref()),
-        (Some("tap@example.test"), Some("weekly 40% used")),
+        (Some("tap@example.test"), Some("weekly 60% left")),
         "the one row's address is the login this process runs on: its row's week"
     );
     fn personal() -> Option<accounts::Roster> {
@@ -1306,7 +1306,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     let shown = read(on_personal);
     assert_eq!(
         (shown.weekly.as_deref(), shown.label.as_deref()),
-        (Some("weekly 40% used"), Some("personal")),
+        (Some("weekly 60% left"), Some("personal")),
         "the store's week under the label this process's login is judged to"
     );
     let _ = std::fs::remove_dir_all(root());
@@ -1405,7 +1405,7 @@ fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     reading(PID as u32, NOW - 20 * 60, (970, RESET), None, None);
     assert_eq!(
         weekly(asks(tapped, armed)),
-        words("weekly \u{2265}97% used"),
+        words("weekly \u{2264}3% left"),
         "the control: no wall"
     );
     weekly_wall();
@@ -1417,7 +1417,7 @@ fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     reading(PID as u32, NOW - 60, (970, RESET), None, None);
     assert_eq!(
         weekly(asks(tapped, armed)),
-        words("weekly 97% used"),
+        words("weekly 3% left"),
         "a current reading says its own"
     );
     let _ = std::fs::remove_dir_all(root());

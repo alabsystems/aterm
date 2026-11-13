@@ -3,8 +3,8 @@
 
 //! aterm's usage tap at launch: the block a managed agent program's twin and `bin/` shim carry,
 //! so a Claude Code started inside an aterm tab carries aterm's status-line usage tap from its
-//! start, with no relaunch and nothing for the person to do (owner ruling R-12 of
-//! `docs/DESIGN-claude-accounts-v2-2026-10-15.md`). The judgment is aterm's own
+//! start, with no relaunch and nothing for the person to do
+//! (`docs/DESIGN-claude-accounts-v2-2026-10-15.md`). The judgment is aterm's own
 //! (`aterm harness tap --launch`, which prints the `--settings` value or nothing); the block only
 //! asks it and puts what it printed ahead of the launch's own arguments.
 

@@ -2,6 +2,8 @@
 # ~/.claude/projects/-Users-person-aterm/*/subagents/workflows/*/journal.jsonl
 # (land:/fix:/simplify:/port:/wire: results) before LAND_FAMILIES was opened.
 # label<TAB>id<TAB>prov<TAB>source<TAB>reply ("\n" is a line break)
+# Row A016 is a worker's report as written: it repeats a 2026-10-16 "no proof lane" ruling
+# that the owner never made (docs/OWNER_RULINGS.md, 2026-11-09: "that is not my ruling").
 # label: open = names something of the job still undone, unrun, failing, flaky,
 #   deferred, partial, unlanded or needing a person; clean = everything stated
 #   is landed, done, settled or not owed; debatable = the facts do not decide.

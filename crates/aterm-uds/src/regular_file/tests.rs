@@ -26,6 +26,8 @@ fn native_clone_uses_the_held_inode_and_keeps_copies_independent() {
     let descriptor_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
     std::fs::rename(&source_path, dir.path().join("held-original")).unwrap();
     std::fs::write(&source_path, b"replacement must not be cloned").unwrap();
+    std::fs::remove_file(dir.path().join("held-original")).unwrap();
+    assert_eq!(source.metadata().unwrap().nlink(), 0);
     let destination = dir.path().join("clone");
     assert!(
         clone_held(&source, &destination).unwrap(),

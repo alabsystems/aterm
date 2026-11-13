@@ -18,6 +18,8 @@ name = "aterm-census"
 path = "src/main.rs"
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # Export materialization stages new files without APFS cloning source inodes.
 aterm-tempfile = { workspace = true }
 # Only aterm's own std-only crates, so the censuses still run offline and build

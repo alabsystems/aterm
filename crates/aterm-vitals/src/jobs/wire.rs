@@ -331,6 +331,7 @@ fn wait_words(w: &Wait) -> String {
         WaitName::ProgramCheck => "macOS's program check".to_owned(),
         WaitName::Memory => "its memory claim".to_owned(),
         WaitName::BuildAdmission => "legacy build-slot admission (no grant observed)".to_owned(),
+        WaitName::AtermWait => "an aterm await it asked for".to_owned(),
         WaitName::Kernel => "an uninterruptible kernel wait".to_owned(),
         WaitName::EventLoop => "an event loop, nothing pending".to_owned(),
         WaitName::Unnamed => "a wait not named".to_owned(),

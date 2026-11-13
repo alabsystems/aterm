@@ -448,6 +448,99 @@ fn a_main_thread_request_shows_a_switch_before_its_reply() {
     assert_eq!(tail_facts(set.as_bytes(), None).effort.shown(), Some("low"));
 }
 
+/// 2.1.322's row for a command typed while a turn runs: `system`, subtype `local_command`, the
+/// text at the top level (trimmed of ids, cwd and branch), stamped with the moment it was typed.
+fn mid_turn_command(at: &str, content: &str) -> String {
+    let content = aterm_json::to_string(content).unwrap();
+    format!(
+        r#"{{"isSidechain":false,"type":"system","subtype":"local_command","content":{content},"level":"info","timestamp":"{at}","isMeta":false,"sessionId":"6397","version":"2.1.322"}}"#
+    )
+}
+
+/// A 2.1.322 request row at `at`.
+fn request_at(at: &str, effort: &str) -> String {
+    format!(
+        r#"{{"type":"api-request","sessionId":"6397","timestamp":"{at}","version":"2.1.322","querySource":"repl_main_thread","params":{{"model":"claude-opus-5-5","output_config":{{"effort":"{effort}"}}}}}}"#
+    )
+}
+
+#[test]
+fn a_command_typed_mid_turn_shows_once_its_rows_land() {
+    // Measured 2026-11-11 on 2.1.322 (lab, stub tool mode): `/effort high` typed while the
+    // turn's Bash call ran wrote nothing to the transcript then (only the user settings file's
+    // `modelSettings`, and the screen's notice); the turn's second request still went at `low`;
+    // once the reply landed, Claude Code wrote the command and its result as two `system`
+    // `local_command` rows stamped with the moment it was typed, then `turn_duration`.
+    let start = crate::harness::unix_time::parse_utc("2026-11-11T03:55:00Z");
+    let turn = [
+        r#"{"type":"user","isSidechain":false,"timestamp":"2026-11-11T03:55:45.011Z","message":{"role":"user","content":"toolstart"}}"#.to_owned(),
+        request_at("2026-11-11T03:55:45.021Z", "low"),
+        r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-11-11T03:55:45.024Z","effort":"low","message":{"model":"claude-opus-5-5"}}"#.to_owned(),
+        request_at("2026-11-11T03:55:57.088Z", "low"),
+        r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-11-11T03:55:57.090Z","effort":"low","message":{"model":"claude-opus-5-5"}}"#.to_owned(),
+    ];
+    let typed = "2026-11-11T03:55:49.135Z";
+    let landed = [
+        mid_turn_command(
+            typed,
+            "<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>high</command-args>",
+        ),
+        mid_turn_command(
+            typed,
+            "<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>",
+        ),
+        r#"{"type":"system","subtype":"turn_duration","isSidechain":false,"timestamp":"2026-11-11T03:55:57.092Z","durationMs":12081}"#.to_owned(),
+    ];
+    let read = |rows: &[String]| {
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        tail_facts(body(&rows).as_bytes(), start)
+    };
+    assert_eq!(
+        read(&turn).effort.shown(),
+        Some("low"),
+        "CONTROL: before the rows land, the turn's requests say what they were sent with"
+    );
+    let ended: Vec<String> = turn.iter().chain(&landed).cloned().collect();
+    let facts = read(&ended);
+    assert_eq!(
+        facts.effort.shown(),
+        Some("high"),
+        "the switch, at the turn's end"
+    );
+    assert_eq!(facts.model.shown(), Some("Opus 5.5"), "the model stands");
+
+    // The next request is the authority once it is sent.
+    let mut next = ended.clone();
+    next.push(request_at("2026-11-11T03:56:10.000Z", "xhigh"));
+    assert_eq!(read(&next).effort.shown(), Some("xhigh"));
+
+    // The top-effort key turned off mid-turn (measured the same day): its result reads too.
+    let key = capital_key();
+    let mut off = turn.to_vec();
+    off.push(mid_turn_command(
+        typed,
+        &format!(
+            "<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>{CLAUDE_TOP_EFFORT_KEY} off</command-args>"
+        ),
+    ));
+    off.push(mid_turn_command(
+        typed,
+        &format!("<local-command-stdout>{key} off. Effort stays medium.</local-command-stdout>"),
+    ));
+    let facts = read(&off);
+    assert_eq!(
+        (facts.effort.shown(), facts.top),
+        (Some("medium"), Some(false))
+    );
+
+    // Another system row quoting a command result is no command.
+    let mut quoted = turn.to_vec();
+    quoted.push(
+        r#"{"type":"system","subtype":"informational","isSidechain":false,"timestamp":"2026-11-11T03:55:58.000Z","content":"<local-command-stdout>Set effort level to max</local-command-stdout>"}"#.to_owned(),
+    );
+    assert_eq!(read(&quoted).effort.shown(), Some("low"));
+}
+
 #[test]
 fn the_tail_takes_the_newest_main_thread_model_and_effort() {
     let body = concat!(
@@ -1990,7 +2083,7 @@ fn the_path_shows_home_as_a_tilde() {
     assert_eq!(path("/Users//ana/a\u{1b}[2J"), None);
 }
 
-/// LINE D LEADS WITH THE MODEL (owner, 2026-11-09; glass design §1.2): model and effort stand at
+/// LINE D LEADS WITH THE MODEL (glass design §1.2): model and effort stand at
 /// the far left, then the wall, then the account unit, then the workspace facts.
 #[test]
 fn the_model_leads_then_the_wall_then_the_account() {
@@ -2960,7 +3053,7 @@ fn the_facts_are_set_as_a_line_of_type() {
     };
     check(
         &unit,
-        "\u{25C6} Opus 5.5 xhigh   \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \
+        "\u{25C6} Opus 5.5 xhigh   \u{2386} main 37% left \u{b7} \u{21ba} Sat 10:00 \u{b7} \
          \u{2573} ~Thu 12 Nov 04:00   \u{2302} ~/aterm   \u{2387} main",
     );
     assert!(set_facts(&[]).glyphs.is_empty());
@@ -3072,7 +3165,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         ]
     );
     let leaner = lights.map(|l| LightsWidth {
-        lean: [32, 29, 26, 23],
+        lean: [32, 29, 26],
         ..l
     });
     let steps: Vec<(usize, TitleFit, bool)> = (0..=120)
@@ -3089,13 +3182,12 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             acc
         });
     assert_eq!(
-        steps[..7],
+        steps[..6],
         [
             (3, TitleFit::Full, true),
             (3, TitleFit::Lean(0), true),
             (3, TitleFit::Lean(1), true),
             (3, TitleFit::Lean(2), true),
-            (3, TitleFit::Lean(3), true),
             (3, TitleFit::Short, true),
             (3, TitleFit::None, true),
         ]
@@ -3113,7 +3205,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             })
     };
     assert_eq!(
-        titles([0, 25, 0, 0]),
+        titles([0, 25, 0]),
         [
             TitleFit::Full,
             TitleFit::Lean(1),
@@ -3122,11 +3214,11 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         ]
     );
     assert_eq!(
-        titles([0, 25, 0, 22]),
+        titles([0, 25, 22]),
         [
             TitleFit::Full,
             TitleFit::Lean(1),
-            TitleFit::Lean(3),
+            TitleFit::Lean(2),
             TitleFit::Short,
             TitleFit::None
         ]
@@ -3305,7 +3397,7 @@ fn the_unit_outlasts_workspace_details_without_overflow() {
     let facts = unit_facts();
     let short = fit_rule(&facts, 45, None);
     assert!(
-        unit_text(&short.segments).is_some_and(|unit| unit.starts_with("main 63%")),
+        unit_text(&short.segments).is_some_and(|unit| unit.starts_with("main 37% left")),
         "{short:?}"
     );
     assert!(
@@ -3346,7 +3438,7 @@ fn unit_facts() -> FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: Some("owner@example.com".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some("weekly 63% used".into()),
+            weekly: Some("weekly 37% left".into()),
             label: Some("main".into()),
             ..Default::default()
         }),
@@ -3374,8 +3466,10 @@ fn unit_text(rung: &[Segment]) -> Option<String> {
 /// E is not the glass's, one `⎆` leads the roster label, then the week's figure, `↺` and its
 /// reset, and the verdict, each part attached to the one before and each `·` quiet; the name and
 /// `↺` are lit, the figure and the time values, the gap warn. The unit stands after the model and
-/// the wall as one fact's span. Negative control: the retired unit's words (the email's
-/// name, the plan, `weekly … left`) are nowhere on the rule.
+/// the wall as one fact's span. The figure says what is left (`37% left`, owner 2026-11-09).
+/// Negative controls: the retired unit's words (the email's name, the plan, `weekly …`) are
+/// nowhere on the rule; the figure without its word (`63%`, the unit before the rule) fails its
+/// pin.
 #[test]
 fn the_fallback_unit_reads_name_figure_then_milestones() {
     let facts = unit_facts();
@@ -3389,7 +3483,7 @@ fn the_fallback_unit_reads_name_figure_then_milestones() {
         unit,
         [
             ("main", false, Tone::Lit),
-            ("63%", true, Tone::Value),
+            ("37% left", true, Tone::Value),
             ("\u{b7}", true, Tone::Quiet),
             ("\u{21ba}", true, Tone::Lit),
             ("Sat 10:00", true, Tone::Value),
@@ -3414,7 +3508,7 @@ fn the_fallback_unit_reads_name_figure_then_milestones() {
         "one span"
     );
     let words: Vec<&str> = shown.iter().map(|s| s.text.as_str()).collect();
-    for gone in ["owner", "Max 20x", "weekly", "left"] {
+    for gone in ["owner", "Max 20x", "weekly"] {
         assert!(
             !words.iter().any(|w| w.contains(gone)),
             "NEGATIVE CONTROL: {gone}: {words:?}"
@@ -3448,9 +3542,9 @@ fn the_fallback_unit_narrows_after_the_facts() {
     assert_eq!(
         forms,
         [
-            "main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00",
-            "main 63% \u{b7} \u{2573} ~Thu 12 Nov 04:00",
-            "main 63%",
+            "main 37% left \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00",
+            "main 37% left \u{b7} \u{2573} ~Thu 12 Nov 04:00",
+            "main 37% left",
             "main",
         ]
     );
@@ -3502,7 +3596,7 @@ fn the_fallback_unit_narrows_after_the_facts() {
     );
 }
 
-/// THE FALLBACK UNIT NAMES THE EMAIL (§2.5, owner ruling 2026-11-09): a pane with no quota view
+/// THE FALLBACK UNIT NAMES THE EMAIL (§2.5): a pane with no quota view
 /// (agy, Muse Code, a roster not read yet) names a login the roster names by the email its
 /// profile names, whether or not the roster names it, else by its roster label (cut as the glass
 /// cuts one), and a login with a figure that neither names `this login`; then its
@@ -3530,15 +3624,15 @@ fn the_fallback_unit_names_the_email() {
         (
             Some("work-2"),
             owner,
-            Some("weekly 38% used"),
-            "owner@example.com 38%",
+            Some("weekly 62% left"),
+            "owner@example.com 62% left",
             "owner",
         ),
         (
             Some("work-2"),
             owner,
-            Some("weekly \u{2265}38% used"),
-            "owner@example.com \u{2265}38%",
+            Some("weekly \u{2264}62% left"),
+            "owner@example.com \u{2264}62% left",
             "owner",
         ),
         (
@@ -3551,8 +3645,8 @@ fn the_fallback_unit_names_the_email() {
         (
             None,
             owner,
-            Some("weekly 22% used"),
-            "owner@example.com 22%",
+            Some("weekly 78% left"),
+            "owner@example.com 78% left",
             "owner",
         ),
         (Some("work-2"), owner, None, "owner@example.com", "owner"),
@@ -3560,15 +3654,15 @@ fn the_fallback_unit_names_the_email() {
         (
             Some("work-2"),
             None,
-            Some("weekly 38% used"),
-            "work-2 38%",
+            Some("weekly 62% left"),
+            "work-2 62% left",
             "work-2",
         ),
         (
             None,
             None,
-            Some("weekly 22% used"),
-            "this login 22%",
+            Some("weekly 78% left"),
+            "this login 78% left",
             "this login",
         ),
         (Some("work-2"), None, None, "work-2", "work-2"),
@@ -3587,21 +3681,21 @@ fn the_fallback_unit_names_the_email() {
     }
     assert_eq!(widest(&with(None, None, None)), None);
     assert_eq!(
-        widest(&with(Some(long), None, Some("weekly 38% used"))),
-        Some(format!("{} 38%", super::super::quota_view::cut(long)))
+        widest(&with(Some(long), None, Some("weekly 62% left"))),
+        Some(format!("{} 62% left", super::super::quota_view::cut(long)))
     );
     let viewed = FooterFacts {
         account: Some("work-2".into()),
         ..unit_facts()
     };
     assert!(
-        widest(&viewed).is_some_and(|unit| unit.starts_with("main 63%")),
+        widest(&viewed).is_some_and(|unit| unit.starts_with("main 37% left")),
         "the view names its own row"
     );
 }
 
-/// THE UNIT NAMES THE ADDRESS THE LOGIN FILE NAMES (owner ruling 2026-11-09;
-/// `docs/DESIGN-account-discovery-2026-11-09.md`): with no profile email, a login is named by the
+/// THE UNIT NAMES THE ADDRESS THE LOGIN FILE NAMES:
+/// with no profile email, a login is named by the
 /// address its login file names ([`FooterFacts::account_email`]), ahead of a roster label and
 /// with no roster row at all (a Mac with no roster file); the profile's email, where both are
 /// read, is the one said. Negative control: with the observed address left out of `unit_name`,
@@ -3621,8 +3715,8 @@ fn the_unit_names_the_address_its_login_file_names() {
     };
     let widest = |facts: &FooterFacts| account_unit(facts).first().and_then(|f| unit_text(f));
     assert_eq!(
-        widest(&with(None, None, Some("weekly 22% used"))).as_deref(),
-        Some("seen@example.com 22%")
+        widest(&with(None, None, Some("weekly 78% left"))).as_deref(),
+        Some("seen@example.com 78% left")
     );
     assert_eq!(
         widest(&with(Some("work-2"), None, None)).as_deref(),
@@ -3658,7 +3752,7 @@ fn the_rule_carries_no_account_while_the_row_does() {
     let view = claimed.quota_view().expect("the pane's view");
     let mut row = super::super::quota_view::QuotaLine::default();
     assert!(view.lay(100, &mut row), "the row lays at 100");
-    assert!(row.text().contains("main 63%"), "{:?}", row.text());
+    assert!(row.text().contains("main 37% left"), "{:?}", row.text());
     let full = segments_width(&segments(&unit_facts())) + 2;
     for room in 0..=full {
         let fit = fit_rule(&claimed, room, None);
@@ -3814,7 +3908,7 @@ fn a_paused_recovery_keeps_the_unit_to_observations() {
         let observed = widest(&facts).expect("the unit");
         assert!(!observed.contains('\u{2573}'), "{phase:?}: {observed}");
         assert!(
-            observed.starts_with("main 63%") && observed.contains("\u{21ba} Sat 10:00"),
+            observed.starts_with("main 37% left") && observed.contains("\u{21ba} Sat 10:00"),
             "{phase:?}: {observed}"
         );
     }
@@ -3864,12 +3958,12 @@ fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
         subscription: Some(super::super::profile::SubscriptionDisplay {
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
-            weekly: Some("weekly 71% used".into()),
+            weekly: Some("weekly 29% left".into()),
             ..Default::default()
         }),
         ..narrow_rule_facts()
     };
-    for (facts, figure) in [(unit_facts(), "63%"), (wide, "71%")] {
+    for (facts, figure) in [(unit_facts(), "37%"), (wide, "29%")] {
         for columns in [80, 100, 120] {
             let room = rule_room(&(0..columns));
             let budget = chips_room(&facts, room);
@@ -4616,21 +4710,12 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     };
     let sentence =
         crate::supervise::mode_words::mode_words(crate::supervise::Autopilot::Cruise).chip;
-    let whole_title = format!(
-        "autopilot: cruise \u{2014} {sentence} \u{b7} click: land \u{b7} right-click: more"
-    );
-    let v1 = format!("autopilot: cruise \u{2014} {sentence} \u{b7} click: land");
-    let clicks = "autopilot: cruise \u{b7} click: land \u{b7} right-click: more";
+    let whole_title = format!("autopilot: cruise \u{2014} {sentence} \u{b7} click: land");
     let click = "autopilot: cruise \u{b7} click: land";
     let hover = LightsWidth {
         chips,
         title: whole_title.chars().count() + 2,
-        lean: [
-            0,
-            v1.chars().count() + 2,
-            clicks.chars().count() + 2,
-            click.chars().count() + 2,
-        ],
+        lean: [0, 0, click.chars().count() + 2],
         short: "autopilot: cruise".chars().count() + 2,
         reason: false,
     };
@@ -4645,7 +4730,6 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         TitleFit::Lean(0),
         TitleFit::Lean(1),
         TitleFit::Lean(2),
-        TitleFit::Lean(3),
         TitleFit::Short,
     ];
     for lights in [label, hover] {
@@ -4701,7 +4785,7 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     let hovered = fit_rule(&facts, room, Some(hover));
     assert!(
         cut(&hovered) && hovered.title == TitleFit::Lean(2),
-        "the phrase and its clicks beside `…/proj-claude`: {hovered:?}"
+        "the phrase and its click beside `…/proj-claude`: {hovered:?}"
     );
     assert!(
         (0..=320).any(|room| {
@@ -5797,7 +5881,7 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         subscription: Some(crate::harness::profile::SubscriptionDisplay {
             email: Some("person@example.com".into()),
             plan: Some("Max".into()),
-            weekly: Some("weekly 71% used".into()),
+            weekly: Some("weekly 29% left".into()),
             ..Default::default()
         }),
         ..facts.clone()
@@ -6334,7 +6418,7 @@ fn agents_panel_under_reads_agy_active_subagents_and_skips_background_tasks() {
         }
     );
 }
-/// The Accounts card's recovery words follow the next check and the phase, and none of them is
+/// The recovery's words follow the next check and the phase, and none of them is
 /// on the rule at any room (§5.1).
 #[test]
 fn account_progress_words_follow_the_check_and_stay_off_the_rule() {
@@ -6966,7 +7050,7 @@ fn healthy_account_inventory_does_not_present_a_pending_recovery_event() {
 
 /// NO ACCOUNT OBSERVATION IS ON THE RULE (§5.1): a watch that knows nothing, one that knows its
 /// inventory, and one that records a limit all leave the rule its facts and lay no `⧗`; the
-/// observation stays on the facts for the hover and the Accounts card. Negative control: a
+/// observation stays on the facts for the hover and the Account card. Negative control: a
 /// transcript wall is on the rule.
 #[test]
 fn no_account_observation_is_on_the_rule() {
@@ -7040,8 +7124,25 @@ fn the_rotation_words_name_accounts_by_their_shown_names() {
         "m22" => "m22@example.com".to_owned(),
         other => other.to_owned(),
     };
+    progress.details = vec![
+        "m22: signed out".into(),
+        "pool-B: CLI sign-in needed".into(),
+        "Previous execution check: m22: signed out".into(),
+        "Usage check requested".into(),
+    ];
     let named = progress.named(email);
     assert_eq!(named.account.as_deref(), Some("m22@example.com"));
+    assert_eq!(
+        named.details,
+        [
+            "m22@example.com: signed out",
+            "pool-B: CLI sign-in needed",
+            "Previous execution check: m22: signed out",
+            "Usage check requested",
+        ],
+        "a detail's leading label is renamed; fixed words and an unnamed label are kept"
+    );
+    assert_eq!(named.stay, progress.stay);
     let words = rotation_words(&named, |at| at.to_string());
     assert!(words.contains("switching to m22@example.com"), "{words}");
     assert!(words.contains("local pool sign-in: pool-B"), "{words}");
@@ -7054,5 +7155,46 @@ fn the_rotation_words_name_accounts_by_their_shown_names() {
     assert_eq!(
         account_progress_phase(&progress.named(email)),
         "Signing in m22@example.com via browser"
+    );
+}
+
+/// A login the account state says is signed out (agy's account gate) is named `not signed in`
+/// on line D, as a warning and at every width, and by no email, label or figure: none is known
+/// true of it any more. Negative control: the same facts not signed out name the email.
+#[test]
+fn a_signed_out_login_is_named_not_signed_in() {
+    use super::super::profile::SubscriptionDisplay;
+    let with = |signed_out: bool| FooterFacts {
+        account: Some("work-2".to_owned()),
+        subscription: Some(SubscriptionDisplay {
+            email: Some("owner@example.com".to_owned()),
+            weekly: Some("weekly 62% left".to_owned()),
+            signed_out,
+            ..Default::default()
+        }),
+        ..narrow_rule_facts()
+    };
+    let out = with(true);
+    assert_eq!(
+        unit_name(&out),
+        Some(super::super::quota_view::NOT_SIGNED_IN)
+    );
+    let forms = account_unit(&out);
+    assert!(!forms.is_empty());
+    for form in &forms {
+        assert_eq!(unit_text(form).as_deref(), Some("not signed in"));
+        assert!(
+            form.iter()
+                .all(|s| s.tone == Tone::of(super::super::quota_view::Role::Warn))
+        );
+    }
+    let control = with(false);
+    assert_eq!(unit_name(&control), Some("owner@example.com"));
+    assert_eq!(
+        account_unit(&control)
+            .first()
+            .and_then(|f| unit_text(f))
+            .as_deref(),
+        Some("owner@example.com 62% left")
     );
 }

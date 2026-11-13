@@ -125,7 +125,8 @@ const USAGE: &str =
                     or number as •••••• when set, a conflict as ⚠ a ‖ b
                     (`ai-accounts` adds seen_on, the Macs a tab ran it on in the last two
                     hours, and last_seen, from every Mac's account-obs rows and the journal's
-                    seen events; a pending account a Mac runs reads `signed in · on <mac>`)
+                    seen events; a pending account a Mac runs reads `signed in · on <mac>`,
+                    and a paused, broken or banned one `<status> · signed in on <mac>`)
   aterm db emails --show-passwords | aterm db phones --show-numbers
                     the same with the secret column in plaintext: only in a person's own aterm
                     tab or terminal (not one `aterm ctl spawn` started, held, driven, or running
@@ -564,16 +565,24 @@ fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) 
             ),
             None => (String::new(), String::new()),
         };
+        // A Mac running the account now is an observation, and the status says it where the
+        // owner's word does not already: a pending (or unset) account reads as signed in there;
+        // a held one (paused, broken, banned: always a person's word, which bars sign-ins) keeps
+        // that word first, since a Mac running it anyway is what the owner needs to see, not a
+        // reason to drop the hold; an active one already says it serves.
         let running = held.and_then(|held| held.macs.keys().next());
-        if let Some(mac) = running
-            && fields
-                .get("status")
-                .is_none_or(|status| status.is_null() || status.as_str() == Some("pending"))
-        {
-            fields.insert(
-                "status".to_owned(),
-                json!(format!("signed in \u{b7} on {mac}")),
-            );
+        if let Some(mac) = running {
+            let status = fields.get("status").and_then(Value::as_str);
+            let shown = match status {
+                None | Some("pending") => Some(format!("signed in \u{b7} on {mac}")),
+                Some(hold @ ("paused" | "broken" | "banned")) => {
+                    Some(format!("{hold} \u{b7} signed in on {mac}"))
+                }
+                Some(_) => None,
+            };
+            if let Some(shown) = shown {
+                fields.insert("status".to_owned(), json!(shown));
+            }
         }
         for (column, value) in [("seen_on", on), ("last_seen", last)] {
             fields.insert(

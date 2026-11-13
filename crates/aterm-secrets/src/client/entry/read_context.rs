@@ -118,7 +118,7 @@ impl VaultLook<'_> {
         if expected.signer.is_none() {
             return Ok(EntryAdmission::Unavailable);
         }
-        let Some((observation, _)) = self.held_at(paths) else {
+        let Some(observation) = self.held_at(paths).map(super::super::Under::lock) else {
             #[cfg(test)]
             if VIEW_MUTANT.get() == 2
                 && let StateObservation::Held(lock) = StateLock::observe_classified(paths)?
@@ -198,7 +198,7 @@ impl EntrySnapshot {
         if self.config.signer.is_none() {
             return Ok(EntryAdmission::Unavailable);
         }
-        let Some((observation, _)) = look.held_at(paths) else {
+        let Some(observation) = look.held_at(paths).map(super::super::Under::lock) else {
             #[cfg(test)]
             if MUTANT.get() == 3
                 && let StateObservation::Held(lock) = StateLock::observe_classified(paths)?

@@ -35,6 +35,8 @@ pub struct Proc {
     pub claims_ahead: Option<Vec<u32>>,
     /// Native held legacy build-admission ticket, sampled with this process birth.
     pub build_admission: Option<Vec<u32>>,
+    /// The aterm serving its control connection holds an `await` of it parked.
+    pub aterm_wait: bool,
     pub state: ProcState,
     /// Its controlling terminal is the tab's.
     pub tty: bool,
@@ -98,6 +100,7 @@ impl Proc {
             becomes: None,
             claims_ahead: None,
             build_admission: None,
+            aterm_wait: false,
             state: ProcState::Sleeping,
             tty: false,
             uid: UID,
@@ -614,6 +617,7 @@ impl World {
             becomes: p.becomes.clone().filter(|_| !zombie),
             claims_ahead: p.claims_ahead.clone().filter(|_| !zombie),
             build_admission: p.build_admission.clone().filter(|_| !zombie),
+            aterm_wait: p.aterm_wait && !zombie,
             state: if p.d_state {
                 ProcState::Uninterruptible
             } else {

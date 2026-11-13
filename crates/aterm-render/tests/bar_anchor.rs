@@ -34,10 +34,10 @@ fn typed_bar_band(style: &str, look: Look, bar: bool, anchored: bool, band: bool
 
 /// The ribbon styles whose band runs under the caret's cell (`Ribbon::plan_run`'s attach).
 const RIBBONS: [&str; 4] = [
-    "rainbow kitty pet",
-    "rainbow dog",
-    "flat rainbow",
-    "nyan rainbow",
+    "tall rainbow + cat",
+    "tall rainbow + dog",
+    "flat rainbow + cat",
+    "tall rainbow",
 ];
 
 /// The light the effects add (frame over clean twin, summed channel steps over 12) across
@@ -141,7 +141,7 @@ fn a_bar_caret_s_lights_sit_on_the_bar() {
             wide / off
         );
     }
-    for style in ["laser", "classic", "rainbow kitty pet"] {
+    for style in ["laser", "classic", "tall rainbow + cat"] {
         let pixels = |anchored: bool| -> Vec<Vec<u32>> {
             typed_bar(style, DARK, false, anchored)
                 .into_iter()

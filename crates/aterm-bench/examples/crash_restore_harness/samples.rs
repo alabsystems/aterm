@@ -85,7 +85,7 @@ impl Batch {
 
 fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
     (numerator.is_finite() && numerator >= 0.0 && denominator.is_finite() && denominator > 0.0)
-        .then(|| numerator / denominator)
+        .then_some(numerator / denominator)
         .filter(|value| value.is_finite())
 }
 

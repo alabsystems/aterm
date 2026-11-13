@@ -29,6 +29,11 @@ use crate::session_store::ExitActor;
 pub(crate) struct Acting {
     pub(crate) by: ExitActor,
     pub(crate) why: Option<&'static str>,
+    /// The request's own line (`spawn why=`), which a tab it opens records as `why_text=`.
+    pub(crate) asked: Option<Arc<str>>,
+    /// Who on another Mac asked, for a fleet drive's act: a tab it opens records the requester's
+    /// program, model and account (`agent=`, `model=`, `account=`).
+    pub(crate) requester: Option<Arc<aterm_types::control_verbs::Requester>>,
     /// The act closes a tab (`unstarted`): its `why=` is the close's, never an open's.
     closes: bool,
 }
@@ -46,9 +51,23 @@ impl ActScope {
     /// An act by `by` that places tabs, for `why`.
     #[must_use = "the act lasts exactly as long as this guard lives"]
     pub(crate) fn enter(by: ExitActor, why: &'static str) -> Self {
+        Self::asking(by, why, None, None)
+    }
+
+    /// [`Self::enter`] for a request that said what it is for in `asked` (`spawn why=`), from
+    /// `requester` on another Mac where a fleet drive asked it.
+    #[must_use = "the act lasts exactly as long as this guard lives"]
+    pub(crate) fn asking(
+        by: ExitActor,
+        why: &'static str,
+        asked: Option<&str>,
+        requester: Option<aterm_types::control_verbs::Requester>,
+    ) -> Self {
         Self::resume(Some(Acting {
             by,
             why: Some(why),
+            asked: asked.map(Arc::from),
+            requester: requester.map(Arc::new),
             closes: false,
         }))
     }
@@ -73,6 +92,8 @@ impl ActScope {
         Self::resume(Some(Acting {
             by,
             why: Some(why),
+            asked: None,
+            requester: None,
             closes: true,
         }))
     }
@@ -110,6 +131,8 @@ pub(crate) fn acting() -> Option<Acting> {
         (by != ExitActor::Unknown).then_some(Acting {
             by,
             why: None,
+            asked: None,
+            requester: None,
             closes: false,
         })
     })
@@ -127,17 +150,35 @@ pub(crate) fn close_why(reason: crate::session_store::ExitReason) -> Option<&'st
         .and_then(|acting| acting.why)
 }
 
-/// The open's actor and reason: the act under way's, its reason else `place_why`; a person's
-/// gesture where none is.
-fn open_by(place_why: &'static str) -> (ExitActor, &'static str) {
+/// The open's actor, reason, request line and requester: the act under way's, its reason else
+/// `place_why`; a person's gesture, asking nothing, where none is.
+fn open_by(place_why: &'static str) -> (ExitActor, &'static str, crate::session_log::TabAsked) {
     match acting() {
-        Some(acting) if !acting.closes => (acting.by, acting.why.unwrap_or(place_why)),
-        _ => (ExitActor::Human, place_why),
+        Some(acting) if !acting.closes => (
+            acting.by,
+            acting.why.unwrap_or(place_why),
+            crate::session_log::TabAsked {
+                why_text: acting.asked,
+                requester: acting.requester,
+            },
+        ),
+        _ => (
+            ExitActor::Human,
+            place_why,
+            crate::session_log::TabAsked::default(),
+        ),
     }
 }
 
 /// The most processes one read of a tab's tree visits ([`tree_spent`]).
 pub(crate) const TREE_MAX: usize = 512;
+
+/// Who a Keep as Tab is by: the act it runs under, else the person.
+pub(crate) fn keep_actor() -> ExitActor {
+    acting()
+        .filter(|acting| !acting.closes)
+        .map_or(ExitActor::Human, |acting| acting.by)
+}
 
 /// The kernel reads [`tree_spent`] takes, injected so a test's table stands in for the host's.
 #[derive(Clone, Copy)]
@@ -163,27 +204,20 @@ impl TreeProbe {
     };
 }
 
-/// What the process tree under `shell` spent over its life, as one read finds it.
-///
-/// CPU is each live process's own time plus what it reaped of its children: the kernel adds a
-/// reaped child's time, its own reaped children's included, to its parent's, so every process that
-/// ran in the tab counts once, alive or reaped by a live member. A process that reaps its children
-/// unwaited is charged their time twice by the kernel, and an orphan that left the tree took its
-/// time with it: the figure is what the tree's counters hold. Peak memory is the largest lifetime
-/// footprint of a process alive at the read, a floor of the tab's own peak. Both are `None` where
-/// the shell's own counters cannot be read (it is gone, or refused); at most [`TREE_MAX`]
-/// processes are read.
-pub(crate) fn tree_spent(shell: i32, probe: &TreeProbe) -> crate::session_log::TreeSpent {
+/// The processes of the tree under `shell` and each one's counters, as one read finds them: the
+/// shell first, then each process once, at most [`TREE_MAX`]; a process whose counters are
+/// refused is left out, and nothing at all where the shell's own are (it is gone, or refused).
+pub(crate) fn tree_counters(
+    shell: i32,
+    probe: &TreeProbe,
+) -> Vec<(u32, aterm_sysprobe::jobs::Counters)> {
     let Some(root) = u32::try_from(shell).ok().filter(|pid| *pid > 1) else {
-        return crate::session_log::TreeSpent::default();
+        return Vec::new();
     };
     let Some(first) = (probe.counters)(root) else {
-        return crate::session_log::TreeSpent::default();
+        return Vec::new();
     };
-    let lifetime =
-        |c: &aterm_sysprobe::jobs::Counters| c.cpu_ns.saturating_add(c.child_cpu_ns.unwrap_or(0));
-    let mut cpu = lifetime(&first);
-    let mut peak = first.peak_footprint;
+    let mut read = vec![(root, first)];
     let mut seen = std::collections::BTreeSet::from([root]);
     let mut next: Vec<u32> = (probe.children)(root).unwrap_or_default();
     while let Some(pid) = next.pop() {
@@ -191,18 +225,51 @@ pub(crate) fn tree_spent(shell: i32, probe: &TreeProbe) -> crate::session_log::T
             continue;
         }
         if let Some(c) = (probe.counters)(pid) {
-            cpu = cpu.saturating_add(lifetime(&c));
-            peak = match (peak, c.peak_footprint) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
+            read.push((pid, c));
         }
         next.extend((probe.children)(pid).unwrap_or_default());
     }
-    crate::session_log::TreeSpent {
-        cpu_ns: Some(cpu),
-        peak_bytes: peak,
+    read
+}
+
+/// What the process tree under `shell` spent over its life, as one read finds it
+/// ([`tree_counters`]).
+///
+/// CPU is each live process's own time plus what it reaped of its children: the kernel adds a
+/// reaped child's time, its own reaped children's included, to its parent's, so every process that
+/// ran in the tab counts once, alive or reaped by a live member. A process that reaps its children
+/// unwaited is charged their time twice by the kernel, and an orphan that left the tree took its
+/// time with it: the figure is what the tree's counters hold. Peak memory is the largest lifetime
+/// footprint of a process alive at the read, a floor of the tab's own peak. Disk written is what
+/// the processes alive at the read wrote, a floor too: the kernel adds no reaped child's writes
+/// to its parent's. Each is `None` where the shell's own counters cannot be read (it is gone, or
+/// refused), or where no process's counters hold it.
+pub(crate) fn tree_spent(shell: i32, probe: &TreeProbe) -> crate::session_log::TreeSpent {
+    let read = tree_counters(shell, probe);
+    if read.is_empty() {
+        return crate::session_log::TreeSpent::default();
     }
+    let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (a, b) => a.or(b),
+    };
+    read.iter().fold(
+        crate::session_log::TreeSpent {
+            cpu_ns: Some(0),
+            ..crate::session_log::TreeSpent::default()
+        },
+        |spent, (_, c)| crate::session_log::TreeSpent {
+            cpu_ns: sum(
+                spent.cpu_ns,
+                Some(c.cpu_ns.saturating_add(c.child_cpu_ns.unwrap_or(0))),
+            ),
+            peak_bytes: match (spent.peak_bytes, c.peak_footprint) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+            written_bytes: sum(spent.written_bytes, c.disk_written),
+        },
+    )
 }
 
 /// A worker's task as its close says it: `<state>` or `<state>:<why>`.
@@ -235,7 +302,7 @@ impl crate::App {
         else {
             return;
         };
-        let (by, why) = open_by(place_why);
+        let (by, why, asked) = open_by(place_why);
         let mut tl = ctx
             .timeline
             .lock()
@@ -248,7 +315,7 @@ impl crate::App {
             parent: parent.and_then(|p| aterm_slog::ShortId::new(p.as_str())),
         };
         let by = crate::session_log::exit_actor(&by);
-        tl.slog_mut().open_tab(place, why, by, at);
+        tl.slog_mut().open_tab(place, why, &asked, by, at);
     }
 
     /// The launch's first tab (session 0 of window 0, built before the App was): opened by
@@ -290,14 +357,13 @@ impl crate::App {
     /// THE KEEP CHOKE POINT: the worker tab holding `sessions` became the person's (Keep as Tab):
     /// each session of it writes its keep.
     pub(crate) fn note_tab_keep(&self, sessions: &[u64]) {
-        let by = acting()
-            .filter(|acting| !acting.closes)
-            .map_or(ExitActor::Human, |acting| acting.by);
-        let by = crate::session_log::exit_actor(&by);
+        let by = crate::session_log::exit_actor(&keep_actor());
         for local in sessions {
             let Some(ctx) = self.pool.get(*local).map(|s| Arc::clone(&s.ctx)) else {
                 continue;
             };
+            // Keeping a plain fleet shell adopts it without typing or raising a hold.
+            crate::control::forget_driven_shell(&ctx.self_id);
             let mut tl = ctx
                 .timeline
                 .lock()
@@ -365,11 +431,16 @@ impl crate::App {
     /// AT A QUIT, every tab still placed closes (`act=close out=app-quit`) with its totals, by
     /// whoever asked for the quit ([`crate::App::quit_by`], `-` where nothing said): a quit hangs
     /// up its terminals past the close's choke point, so its tabs would otherwise end with no
-    /// close. A seamless update's handover never comes here; its tabs go on in the successor.
-    pub(crate) fn close_tabs_at_quit(&self) {
+    /// close. A seamless update's handover never comes here; its tabs go on in the successor, as
+    /// the tabs of `carried` go on in the next launch, their programs left running in the keeper's
+    /// custody (`App::carry_developer_tools_install_at_exit`), so they close nothing.
+    pub(crate) fn close_tabs_at_quit(&self, carried: &[u64]) {
         let by =
             crate::session_log::exit_actor(self.quit_by.as_ref().unwrap_or(&ExitActor::Unknown));
         for local in self.pool.ids() {
+            if carried.contains(&local) {
+                continue;
+            }
             self.note_tab_spent(local);
             let Some(ctx) = self.pool.get(local).map(|s| Arc::clone(&s.ctx)) else {
                 continue;
@@ -393,14 +464,15 @@ impl crate::App {
     }
 
     /// THE QUIT'S CLOSES, in the order every close takes (`SessionStore::deregister_closing`):
-    /// each tab still placed closes first ([`Self::close_tabs_at_quit`]), then each live session's log
+    /// each tab still placed closes first, but the tabs of `carried`, whose programs the quit
+    /// leaves to the keeper ([`Self::close_tabs_at_quit`]), then each live session's log
     /// closes `out=app-quit` (`session_log::close_logs_at_quit`), which on unix reaches the bus
     /// before the bridge hears `bye quit` (`fabric_launch::bye_at_quit`, fix unit Q1). A
     /// session's close is the last record its log takes (a mark after it is refused,
     /// `Refused::SessionClosed`), so a tab close written after it would be lost, from the
     /// journal and the bus alike.
-    pub(crate) fn close_sessions_at_quit(&self) {
-        self.close_tabs_at_quit();
+    pub(crate) fn close_sessions_at_quit(&self, carried: &[u64]) {
+        self.close_tabs_at_quit(carried);
         #[cfg(unix)]
         crate::fabric_launch::bye_at_quit(&self.store);
         #[cfg(not(unix))]

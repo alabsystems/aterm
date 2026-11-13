@@ -347,28 +347,26 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
         account_progress: Some(value),
         ..Default::default()
     };
+    // The card states no activity row and no RFC 3339 instant: it offers the details, and the
+    // clipboard report holds the blocker and the activity with its time, whole.
     let rows = crate::fact_menu::rows(crate::claude_lights::Fact::Account, &facts);
-    let theme = aterm_render::Theme {
-        fg: 0x00E0_E0E0,
-        bg: 0x0018_1818,
-        cursor: 0x00FF_FFFF,
-        selection: 0x0044_4466,
-    };
-    for cols in [60, 120] {
-        let rect = crate::autopilot_menu::place(&rows, (25, 0), (0..26, 0..cols), (cols, 26), 0)
-            .expect("account menu fits");
-        let painted =
-            crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme, None);
-        assert!(
-            painted.iter().any(|row| {
-                row.iter()
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .contains(&timestamp)
-            }),
-            "the activity time must survive the menu's content-width cap"
-        );
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        crate::autopilot_menu::MenuRow::Item { act, .. }
+            if *act == crate::autopilot_menu::MenuAct::Fact(
+                crate::claude_lights::Fact::Account,
+                crate::fact_menu::FactAct::CopyRecovery,
+            )
+    )));
+    for row in &rows {
+        assert!(!row.text().contains(&timestamp), "{row:?}");
     }
+    let report = crate::fact_menu::details_report(&facts);
+    assert!(report.contains("existing blocker"), "{report}");
+    assert!(
+        report.contains(&timestamp),
+        "the activity time is in the details: {report}"
+    );
 }
 
 #[test]
@@ -703,28 +701,18 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
         account_progress: Some(value),
         ..Default::default()
     };
+    // A sign-in diagnostic is no row of the card: it reaches the menu through Copy details.
     let menu = crate::fact_menu::rows(crate::claude_lights::Fact::Account, &facts);
-    let theme = aterm_render::Theme {
-        fg: 0x00E0_E0E0,
-        bg: 0x0018_1818,
-        cursor: 0x00FF_FFFF,
-        selection: 0x0044_4466,
-    };
-    for cols in [60, 120] {
-        let rect = crate::autopilot_menu::place(&menu, (25, 0), (0..26, 0..cols), (cols, 26), 0)
-            .expect("account menu fits");
-        let painted =
-            crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None);
-        let text: String = painted
-            .iter()
-            .flat_map(|line| line.iter().map(|cell| cell.ch))
-            .collect();
-        assert!(
-            text.contains("headless") && text.contains("browser"),
-            "{text}"
-        );
-        assert!(!text.contains("must-not-appear"));
+    for row in &menu {
+        let text = row.text();
+        assert!(!text.contains("headless") && !text.contains("must-not-appear"));
     }
+    let report = crate::fact_menu::details_report(&facts);
+    assert!(
+        report.contains("headless") && report.contains("browser"),
+        "{report}"
+    );
+    assert!(!report.contains("must-not-appear"));
 }
 
 #[test]
@@ -1742,18 +1730,25 @@ fn an_unavailable_supervisor_read_withdraws_current_claims_across_execution_expi
                 (0, 0),
                 false,
             );
+            // The card states no finding; its details are what Copy details copies, built
+            // from the same production facts the open card was.
             let menu = &app.autopilot_menu.as_ref().unwrap().rows;
-            let notes: Vec<_> = menu
-                .iter()
-                .filter_map(|row| match row {
-                    crate::autopilot_menu::MenuRow::Note { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
+            assert!(
+                menu.iter().all(|row| {
+                    let text = row.text();
+                    !text.contains(&old_next) && !text.contains(EXECUTION_PREPARED_FINDING)
+                }),
+                "{menu:?}"
+            );
+            let report = crate::fact_menu::details_report(
+                &app.fact_menu_facts(local, crate::claude_lights::Fact::Account),
+            );
+            let notes: Vec<&str> = report.lines().collect();
             assert!(
                 notes
                     .iter()
-                    .any(|line| line.contains(OBSERVER_BUSY_FINDING))
+                    .any(|line| line.contains(OBSERVER_BUSY_FINDING)),
+                "{report}"
             );
             assert!(notes.iter().all(|line| !line.contains(&old_next)));
             assert!(!notes.contains(&EXECUTION_PREPARED_FINDING));

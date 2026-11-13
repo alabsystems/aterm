@@ -8,7 +8,7 @@
 use super::accounts::{self, Cli, Point, Row, Supervisor};
 use super::accounts_pool::{self, Seat, Session, SessionPlan};
 use super::cli::Env;
-use super::codex_app_login::{self, IdentifiedUsage};
+use super::codex_app_login::{self, IdentifiedRead, IdentifiedUsage};
 use super::codex_renewal::{self as renewal, Identity, Receipt, ReceiptWriter, Successor};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub trait UsageReader {
         now: i64,
         wait: Duration,
         use_token: super::provider_read::Use,
-    ) -> Option<IdentifiedUsage> {
+    ) -> IdentifiedRead {
         let _ = seat;
         self.read(home, expected_email, now, wait, use_token)
     }
@@ -43,16 +43,21 @@ pub trait UsageReader {
         now: i64,
         wait: Duration,
         use_token: super::provider_read::Use,
-    ) -> Option<IdentifiedUsage>;
+    ) -> IdentifiedRead;
 }
 
-/// Whether this build's host can run a weekly-limit handoff at all: the sealed renewal service's
+/// Whether this build's host can run a usage-limit handoff at all: the sealed renewal service's
 /// native host and provider pair is qualified on Apple Silicon macOS only.
 pub const QUOTA_ROTATION_QUALIFIED: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
-/// Whether aterm.toml (`policy`, as it read with `warnings`) lets a weekly-limit handoff run: a
+/// What a usage-limit handoff keeps of its ask's deadline to record its reads, past the provider
+/// reads themselves: the first steps of [`accounts::LOCK_LADDER`], so a read the deadline cut
+/// short is still on record while another session holds the store's lock briefly.
+pub(super) const RECORD_WITHIN: Duration = Duration::from_millis(300);
+
+/// Whether aterm.toml (`policy`, as it read with `warnings`) lets a usage-limit handoff run: a
 /// handoff needs rotation on, relaunch and limit resumption on, and a file with nothing to warn
-/// of. What [`with_prepared_writer`] refuses and the accounts report's `at a weekly limit:` line
+/// of. What [`with_prepared_writer`] refuses and the accounts report's `at a usage limit:` line
 /// leaves out, read from the one place.
 #[must_use]
 pub fn policy_allows_handoff(
@@ -79,8 +84,10 @@ impl UsageReader for LiveUsage<'_> {
         now: i64,
         wait: Duration,
         use_token: super::provider_read::Use,
-    ) -> Option<IdentifiedUsage> {
-        let directory = home.parent()?;
+    ) -> IdentifiedRead {
+        let Some(directory) = home.parent() else {
+            return IdentifiedRead::Unread;
+        };
         super::cli::cleanup_codex_enrollments(
             &seat.store(Cli::Codex),
             &seat.config_dir.join(Cli::Codex.accounts().roster_file),
@@ -96,7 +103,7 @@ impl UsageReader for LiveUsage<'_> {
         now: i64,
         wait: Duration,
         use_token: super::provider_read::Use,
-    ) -> Option<IdentifiedUsage> {
+    ) -> IdentifiedRead {
         codex_app_login::read_identified_login_with_config(
             home,
             self.config_home,
@@ -464,13 +471,45 @@ fn row_auth(seat: &Seat<'_>, row: &Row) -> PathBuf {
         .join("auth.json")
 }
 
-fn weekly_exhausted(usage: &IdentifiedUsage) -> bool {
-    usage.usage.sample.week_pct.is_some_and(|used| used >= 100)
-        && usage
+/// The point a host asks [`prepare`] or [`prepare_exec`] at: a usage wall its session's proven
+/// turn ended on, seen at `at`, of no window. A caller names none, since the handoff's own fresh
+/// read of the session's login says which limit stands ([`walled_window`]).
+#[must_use]
+pub fn wall_asked(at: i64) -> Point {
+    Point::Wall {
+        window: String::new(),
+        at: Some(at),
+    }
+}
+
+/// The limit a fresh read of the session's login shows it walled at, where a handoff moves it off
+/// that login: the week's ([`accounts::WEEK_LIMIT`]) where the week is spent and the read names
+/// its wall; else the five-hour window's ([`accounts::SESSION_LIMIT`]) where that is spent, the
+/// read names its wall and a reset more than [`accounts::RESET_SOON_S`] away. Nearer than that,
+/// waiting out the reset costs less than a relaunch on another login, so the session stays, as it
+/// does where neither limit is reached (`None`). It stays too where the read names no reset: a
+/// wall with none stands by rungs up to six hours ([`accounts::NO_RESET_WALL_S`]), longer than
+/// the window itself, so a session with no row to move to would be held past the reset it could
+/// have waited out. The week is judged first,
+/// as it was when only the week's wall moved a session: where both limits stand, the handoff
+/// leaves and records the week's.
+fn walled_window(usage: &IdentifiedUsage, now: i64) -> Option<&'static str> {
+    let sample = &usage.usage.sample;
+    let wall = |window: &str| {
+        usage
             .usage
             .walls
             .iter()
-            .any(|(window, _)| *window == "seven_day")
+            .find(|(name, _)| *name == window)
+            .map(|(_, reset)| *reset)
+    };
+    if sample.week_pct.is_some_and(|used| used >= 100) && wall(accounts::WEEK_LIMIT).is_some() {
+        return Some(accounts::WEEK_LIMIT);
+    }
+    let reset = wall(accounts::SESSION_LIMIT)?;
+    (sample.session_pct.is_some_and(|used| used >= 100)
+        && reset.is_some_and(|reset| reset.saturating_sub(now) > accounts::RESET_SOON_S))
+    .then_some(accounts::SESSION_LIMIT)
 }
 
 /// Whether a fresh read lets a session move to its row, by the rule its writer holds a sample on
@@ -483,24 +522,34 @@ fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
 }
 
 /// Whether `why`, what [`prepare`] refused a session for, stands however often it is asked: this
-/// session's login is no row of the pool, or a login the pool does not manage. A wait would change
-/// nothing, so its control answers that no handoff is coming rather than to wait.
+/// session's login is no row of the pool, a login the pool does not manage, one that names
+/// another account than its row's, or one whose fresh read shows no limit a handoff leaves
+/// ([`walled_window`]). A wait would change nothing, so its control answers that no handoff is
+/// coming rather than to wait.
 #[must_use]
 pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
     match why {
-        "not-weekly-exhausted" => Some(NoHandoff::LimitNotReached),
+        "not-walled" => Some(NoHandoff::NoWallToLeave),
         "source-unbound" | "source-missing" | "source-unmanaged" => Some(NoHandoff::NoRowOfThePool),
+        SOURCE_NAMES_ANOTHER => Some(NoHandoff::LoginNamesAnother),
         _ => None,
     }
 }
 
+/// [`prepare`]'s refusal of a session whose row's login names another account than the row's.
+const SOURCE_NAMES_ANOTHER: &str = "source-names-another";
+
 /// Why no handoff is coming to a session, however often it asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoHandoff {
-    /// The session's login has not reached its weekly limit.
-    LimitNotReached,
+    /// A fresh read of the session's login shows no limit a handoff leaves: its week is not
+    /// spent, and its five-hour window is not spent, resets within [`accounts::RESET_SOON_S`] or
+    /// names no reset.
+    NoWallToLeave,
     /// The session's login is no row the pool hands off.
     NoRowOfThePool,
+    /// The session's row's login names another account, which only a sign-in or a sync ends.
+    LoginNamesAnother,
 }
 
 impl NoHandoff {
@@ -508,14 +557,19 @@ impl NoHandoff {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LimitNotReached => "its login has not reached its weekly limit",
+            Self::NoWallToLeave => {
+                "its login stands at no weekly limit, and at no five-hour limit more than 15 \
+                 minutes from its reset"
+            }
             Self::NoRowOfThePool => "its login is no row the pool hands off",
+            Self::LoginNamesAnother => "its row's login names another account",
         }
     }
 }
 
 /// Resolve only host-observed session paths. The source must still identify
-/// the account of the failed request and freshly report weekly exhaustion.
+/// the account of the failed request and freshly report a limit a handoff
+/// leaves ([`walled_window`]): the week's, or a five-hour one not about to reset.
 /// Every destination is freshly read using its own immutable credential
 /// snapshot. One total deadline bounds all candidate reads.
 pub fn prepare(
@@ -578,10 +632,9 @@ fn prepare_quota_wall<T, R: Clone>(
     if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
         return Err("not-native-codex");
     }
-    if !matches!(&session.point, Point::Wall { window, at: Some(at) }
-        if window == "seven_day" && *at <= seat.now)
-    {
-        return Err("not-weekly-wall");
+    // The caller's window is no evidence and is not read: the fresh read below names the limit.
+    if !matches!(&session.point, Point::Wall { at: Some(at), .. } if *at <= seat.now) {
+        return Err("not-a-wall");
     }
     let mode = seat.mode_for(Cli::Codex);
     if mode == accounts::Mode::Off || session.mode != mode || seat.keyring_held(Cli::Codex) {
@@ -610,13 +663,66 @@ fn prepare_quota_wall<T, R: Clone>(
     if state.pinned && state.active.as_deref() != Some(source.label.as_str()) {
         return Ok(None);
     }
+    // The source login contradicts its row before any provider request; repeating that request
+    // cannot hand the session off.
+    if accounts_pool::check_login_identity(Cli::Codex, &source, seat.home).is_err() {
+        return Err(SOURCE_NAMES_ANOTHER);
+    }
+    // Nor while this wall is on record and the handoff, as recorded, has no target
+    // ([`accounts_pool::native_quota_target_at`]: what the plan below selects where each read admits
+    // its candidate, low rows and held, pinned or moved-off defaults refused): no read here could
+    // make one, and nothing reads a provider on a timer. Its client asks again every few seconds
+    // while the wall stands; what can bring a target (a row's wall ending, another row read again,
+    // a row added) is on record, and the first ask after it reads. The first ask at a wall the
+    // record lacks still reads, and the plan records it; a wall whose reset is unknown stands for
+    // its retry rung, after which the next ask reads it again. A wall lifted with nothing recorded
+    // holds until its recorded reset. The wall on record is the week's or the five-hour window's,
+    // whichever stands on this row: a five-hour one stands to that window's own reset and its
+    // grace ([`accounts::Wall::stands_until`]), never to the week's, so the first ask after it
+    // reads, and a login that read shows with room again is answered that no handoff is coming
+    // ([`prepare_refusal_stands`]). A read that answered no figure is on record too
+    // ([`accounts::Unanswered`]), of this login or a candidate: that row is neither read nor a
+    // target before its wait ends ([`accounts_pool::handoff_reads`]). The run is the row's, not
+    // this session's: every session here reads a row's one login file, under its row's identity,
+    // through one provider endpoint, so another session's failed read of this login also holds
+    // this one's for a rung, as its own would.
+    let wall_recorded = [accounts::WEEK_LIMIT, accounts::SESSION_LIMIT]
+        .into_iter()
+        .find(|window| {
+            state
+                .accounts
+                .get(&source.label)
+                .and_then(|account| account.walls.get(*window))
+                .and_then(accounts::Wall::stands_until)
+                .is_some_and(|until| until > seat.now)
+        });
+    let no_target = wall_recorded.is_some_and(|window| {
+        accounts_pool::native_quota_target_at(
+            (Cli::Codex, mode),
+            (
+                &roster,
+                &state,
+                &accounts::enrolled_in(Cli::Codex, &roster, seat.home),
+            ),
+            (&source, window),
+            (
+                accounts::default_login_address(Cli::Codex, seat.home).as_deref(),
+                seat.home,
+            ),
+            seat.now,
+        )
+        .is_none()
+    });
+    if no_target || !accounts_pool::handoff_reads(&source, &state, seat.now) {
+        return Ok(None);
+    }
     let old_auth = who
         .login
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| seat.home.join(Cli::Codex.accounts().default_home))
         .join("auth.json");
-    let left = remaining();
+    let left = remaining().saturating_sub(RECORD_WITHIN);
     if left.is_zero() {
         return Ok(None);
     }
@@ -626,37 +732,69 @@ fn prepare_quota_wall<T, R: Clone>(
             &old_auth,
             Some(&source.label),
         )));
-    let Some(observed) = reader.read_on(
+    // The session's own row, where its process still holds that row's login: a login a
+    // renewal replaced says nothing of the row, and what its read answered is not recorded.
+    let reads_row = me.account.is_some() && row_auth(seat, &source) == old_auth;
+    let source_context = reads_row
+        .then(|| seat.store(Cli::Codex).capture_auth_context(&source))
+        .flatten();
+    let note_own = |answer| {
+        if reads_row {
+            let read = accounts_pool::FreshRead {
+                label: source.label.clone(),
+                context: source_context,
+                answer,
+            };
+            let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &[read], remaining());
+        }
+    };
+    let observed = match reader.read_on(
         seat,
         &old_auth,
         source.expected_identity_email(),
         seat.now,
         left,
         use_token,
-    ) else {
-        return Ok(None);
+    ) {
+        IdentifiedRead::Usage(observed) => observed,
+        // No handoff is proposed off a login that reads signed out, and the row says so.
+        IdentifiedRead::SignedOut => {
+            note_own(accounts_pool::FreshAnswer::SignedOut);
+            return Ok(None);
+        }
+        // Nor off one that answered no figure: the row's run holds the next ask's read.
+        IdentifiedRead::Unread => {
+            note_own(accounts_pool::FreshAnswer::Unanswered);
+            return Ok(None);
+        }
     };
     if observed.identity != *expected_source {
         return Err("source-identity-changed");
     }
-    if !weekly_exhausted(&observed) {
-        return Err("not-weekly-exhausted");
-    }
+    let Some(window) = walled_window(&observed, seat.now) else {
+        return Err("not-walled");
+    };
     if remaining().is_zero() {
         return Ok(None);
     }
+    // The plan records the wall under the window this read named, with that window's own reset
+    // from the same read ([`accounts::Sample::reached_reset`]): a five-hour wall holds its row to
+    // the five-hour reset, never to the week's.
     let mut session = session.clone();
     session.sample = Some(observed.usage.sample);
     session.point = Point::Wall {
-        window: "seven_day".into(),
+        window: window.into(),
         at: Some(seat.now),
     };
     let mut selected = None;
     let mut launch = super::provider_read::Launch::launch_use(LaunchUse(()));
     let mut reads = Vec::new();
     let mut admit = |row: &Row| {
-        let left = remaining();
-        if left.is_zero() {
+        if accounts_pool::check_login_identity(Cli::Codex, row, seat.home).is_err() {
+            return false;
+        }
+        let left = remaining().saturating_sub(RECORD_WITHIN);
+        if left.is_zero() || !accounts_pool::handoff_reads(row, &state, seat.now) {
             return false;
         }
         let new_auth = row_auth(seat, row);
@@ -671,20 +809,38 @@ fn prepare_quota_wall<T, R: Clone>(
         ) else {
             return false;
         };
-        let Some(usage) = reader.read_on(
+        let usage = match reader.read_on(
             seat,
             &new_auth,
             row.expected_identity_email(),
             seat.now,
             left,
             use_token,
-        ) else {
-            return false;
+        ) {
+            IdentifiedRead::Usage(usage) => usage,
+            // A candidate whose login reads signed out is passed over on the record, not
+            // silently: the next pick does not offer it again.
+            IdentifiedRead::SignedOut => {
+                reads.push(accounts_pool::FreshRead {
+                    label: row.label.clone(),
+                    context,
+                    answer: accounts_pool::FreshAnswer::SignedOut,
+                });
+                return false;
+            }
+            IdentifiedRead::Unread => {
+                reads.push(accounts_pool::FreshRead {
+                    label: row.label.clone(),
+                    context,
+                    answer: accounts_pool::FreshAnswer::Unanswered,
+                });
+                return false;
+            }
         };
         reads.push(accounts_pool::FreshRead {
             label: row.label.clone(),
             context,
-            usage: usage.usage.clone(),
+            answer: accounts_pool::FreshAnswer::Usage(usage.usage.clone()),
         });
         if !usable(&usage, seat.now) || usage.identity.account == expected_source.account {
             return false;

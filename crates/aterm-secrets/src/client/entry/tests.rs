@@ -416,6 +416,48 @@ fn mailbox_component_index_is_bound_to_verified_source_and_exact_fields() {
     );
 }
 
+/// A verified read of the registered entry finds the index already saying what it would write
+/// and leaves the file as it is: an authorized component read and an explicit refresh each
+/// came with the same text and replaced the file (a new inode every read, 2026-11-11). An
+/// index that is gone is written again by the same refresh.
+/// NEGATIVE CONTROL (2026-11-11): with the index written by `fsx::write_atomic` again, the stamp
+/// after the reads is another file's (`the index is left as it is`).
+#[test]
+fn mailbox_component_index_is_not_rewritten_with_what_it_holds() {
+    use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
+    let f = Fixture::new();
+    let password =
+        Component::for_mailbox("https://mail.example/", "owner@example", Part::Password).unwrap();
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, SOURCE_ENTRY, b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-login'\n").unwrap();
+    });
+    let index = f.paths.dir.join("mailbox-components.toml");
+    let written = fsx::stamp(&index).unwrap();
+    let reads = MAILBOX_READS.with(std::cell::Cell::get);
+    assert_eq!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"fixture-login"
+    );
+    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
+    assert!(
+        MAILBOX_READS.with(std::cell::Cell::get) > reads,
+        "each was a verified read of the entry"
+    );
+    assert_eq!(
+        fsx::stamp(&index),
+        Some(written),
+        "the index is left as it is"
+    );
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+
+    std::fs::remove_file(&index).unwrap();
+    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+}
+
 #[test]
 fn mailbox_component_index_excludes_ambiguous_fields_and_stale_versions() {
     use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};

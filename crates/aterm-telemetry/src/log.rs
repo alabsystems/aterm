@@ -25,7 +25,7 @@
 //! account ran, and no other account reads them.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,13 @@ pub struct Log {
     /// ([`Self::cut_after`]); `None` for a log no test cuts.
     #[cfg(test)]
     cut: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Whether a write that fails is left as it was, never cut back ([`Self::never_cut_back`]).
+    #[cfg(test)]
+    uncut: bool,
+    /// Whether a write left uncut cannot read the file's length after it
+    /// ([`Self::never_measured`]).
+    #[cfg(test)]
+    unmeasured: bool,
 }
 
 #[cfg(test)]
@@ -137,7 +144,29 @@ impl Log {
             lock_wait: LOCK_WAIT,
             #[cfg(test)]
             cut: None,
+            #[cfg(test)]
+            uncut: false,
+            #[cfg(test)]
+            unmeasured: false,
         }
+    }
+
+    /// This log, a write that fails left as it was, never cut back ([`Self::put`]): as a disk
+    /// whose truncate fails too leaves it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn never_cut_back(mut self) -> Self {
+        self.uncut = true;
+        self
+    }
+
+    /// This log, a write it could not cut back unable to read the file's length after it
+    /// ([`Self::length`]), as a file whose `fstat` fails leaves it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn never_measured(mut self) -> Self {
+        self.unmeasured = true;
+        self
     }
 
     /// This log, its writes cut short once they would put more than `left` holds (each write
@@ -150,16 +179,48 @@ impl Log {
         self
     }
 
-    /// Write all of `bytes` to `file`, `at` bytes long, with the lock held: a write that fails
-    /// is cut back to `at`, so it leaves none of its bytes for a reader to take as a line (a
-    /// gap line cut only of its line feed is whole) or as a row the caller counts lost. Where the
-    /// cut itself fails, what the write put stays, as after a crash mid-write.
+    /// Write all of `bytes` to `file` at its end, `at` bytes in, with the lock held: a write
+    /// that fails is cut back to `at`, so it leaves none of its bytes for a reader to take as a
+    /// line (a gap line cut only of its line feed is whole) or as a row the caller counts lost.
+    /// Where the cut itself fails, what the write put stays, as after a crash mid-write, and its
+    /// error says so ([`left_lines`]); a write that could not start there put none of them.
     fn put(&self, file: &mut File, at: u64, bytes: &[u8]) -> io::Result<()> {
+        file.seek(SeekFrom::Start(at))?;
         let wrote = self.put_all(file, bytes);
-        if wrote.is_err() {
-            let _ = file.set_len(at);
+        #[cfg(test)]
+        let cut = |file: &File| {
+            if self.uncut {
+                Err(io::ErrorKind::Other.into())
+            } else {
+                file.set_len(at)
+            }
+        };
+        #[cfg(not(test))]
+        let cut = |file: &File| file.set_len(at);
+        match wrote {
+            Err(e) if cut(file).is_err() => {
+                let landed = self.length(file).ok().map(|n| n.saturating_sub(at));
+                Err(io::Error::new(
+                    e.kind(),
+                    Uncut {
+                        error: e,
+                        landed,
+                        whole: None,
+                    },
+                ))
+            }
+            wrote => wrote,
         }
-        wrote
+    }
+
+    /// The length of `file`, read under the lock after a write that could not be cut back: what
+    /// it holds of that write is the length less where the write began.
+    fn length(&self, file: &File) -> io::Result<u64> {
+        #[cfg(test)]
+        if self.unmeasured {
+            return Err(io::ErrorKind::Other.into());
+        }
+        file.metadata().map(|meta| meta.len())
     }
 
     fn put_all(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -237,9 +298,10 @@ impl Log {
     /// [`Self::append`] under one wait for the lock, its gap line also saying `said` rows the
     /// caller lost and kept no record of (a direct writer's own count, or the window's queue's).
     /// The gap line is a write of its own, so a batch that fails after it never leaves its rows
-    /// to be said again. `Err`
-    /// says whether the gap line was written: where it was not, the folder's records it took are
-    /// left again as one, and the caller's `said` rows are still its own to say.
+    /// to be said again. `Err` says whether the gap line was written, or may have been (a failed
+    /// write of it whose cut back failed too, which writes none of `lines`: its rows are taken as
+    /// said, missing at worst, never said twice); where it was not, the folder's records it took
+    /// are left again as one, and the caller's `said` rows are still its own to say.
     ///
     /// # Errors
     /// As [`Self::append`].
@@ -258,6 +320,7 @@ impl Log {
             let line = [crate::row::gap_line(crate::now_ms(), rows)];
             gap = match self.append_held(&line) {
                 Ok(done) => done,
+                Err(e) if left_lines(&e) => return Err((wrote_none(e), true)),
                 Err(e) => {
                     if taken > 0 {
                         // Taken off the folder and not said: left again as one record.
@@ -275,6 +338,43 @@ impl Log {
         })
     }
 
+    /// Which of `lines` (rows' lines, [`crate::Row::line`]) the log holds, read under one wait
+    /// for its lock, so no append or rotation moves a line while it reads: its files newest
+    /// first, until it found them all. A line its file holds but for its final line feed counts,
+    /// as [`read`] reads it. A writer that may have written `lines` and lost its record of it
+    /// writes again only those the log does not hold.
+    ///
+    /// # Errors
+    /// The lock was not had within its wait, or a file that exists could not be read.
+    pub fn holds(&self, lines: &[String]) -> io::Result<Vec<bool>> {
+        let mut found = vec![false; lines.len()];
+        if lines.is_empty() {
+            return Ok(found);
+        }
+        let wanted: Vec<&[u8]> = lines
+            .iter()
+            .map(|line| line.strip_suffix('\n').unwrap_or(line).as_bytes())
+            .collect();
+        let _held = self.lock()?;
+        for n in 0..self.limits.files.max(1) {
+            let text =
+                match aterm_uds::atomic_file::read_regular(&file_path(&self.dir, n), 64 << 20) {
+                    Ok((bytes, _)) => bytes,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+            for raw in text.split(|b| *b == b'\n') {
+                for (seen, want) in found.iter_mut().zip(&wanted) {
+                    *seen |= raw == *want;
+                }
+            }
+            if found.iter().all(|seen| *seen) {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     /// [`Self::append`] with the lock held.
     fn append_held(&self, lines: &[String]) -> io::Result<Appended> {
         let mut done = Appended {
@@ -283,8 +383,9 @@ impl Log {
         };
         let batch: usize = lines.iter().map(String::len).sum();
         let (mut file, mut len) = self.open_current()?;
+        // A mend that failed wrote none of `lines`, whatever it left of its own line feed.
         if len > 0 && !ends_in_line_feed(&mut file, len)? {
-            self.put(&mut file, len, b"\n")?;
+            self.put(&mut file, len, b"\n").map_err(wrote_none)?;
             len += 1;
             done.mended = true;
         }
@@ -295,23 +396,36 @@ impl Log {
             (file, len) = self.open_current()?;
         }
         if len > 0 && lines.len() == 1 {
-            self.put(&mut file, len, lines[0].as_bytes())?;
+            self.put(&mut file, len, lines[0].as_bytes())
+                .map_err(|e| counted(e, 0, lines))?;
             return Ok(done);
         }
         let mut out = String::with_capacity(if len == 0 { batch + 256 } else { batch });
         if len == 0 {
             self.facts.write_line_into(crate::now_ms(), &mut out);
         }
+        let lead = out.len();
         for line in lines {
             out.push_str(line);
         }
-        self.put(&mut file, len, out.as_bytes())?;
+        self.put(&mut file, len, out.as_bytes())
+            .map_err(|e| counted(e, lead, lines))?;
         Ok(done)
     }
 
+    /// The newest file, opened to write at any offset ([`Self::put`] writes at its length, read
+    /// here under the lock, which keeps every other writer out): an append-only handle could
+    /// not cut a failed write back, since on Windows it lacks the right to write the file's data,
+    /// which changing its length needs.
     fn open_current(&self) -> io::Result<(File, u64)> {
-        let file = own_file(OpenOptions::new().read(true).append(true).create(true))
-            .open(file_path(&self.dir, 0))?;
+        let file = own_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+        .open(file_path(&self.dir, 0))?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::new(
@@ -344,6 +458,91 @@ impl Log {
         }
         Ok(())
     }
+}
+
+/// A write [`Log::put`] could not cut back: what it wrote stays in the log.
+#[derive(Debug)]
+struct Uncut {
+    /// The write's own failure.
+    error: io::Error,
+    /// How many bytes of the write the file holds, where its length could be read after it.
+    landed: Option<u64>,
+    /// How many of the append's lines those bytes hold whole, once the append counted them
+    /// ([`counted`]).
+    whole: Option<usize>,
+}
+
+impl std::fmt::Display for Uncut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}, and its cut back failed: what it wrote stays",
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for Uncut {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// `e`, a failed write of `lines` after `lead` bytes of its own (the facts line a new file
+/// opens with), saying how many of `lines` it left whole where it could not be cut back and
+/// the file's length was read after it ([`whole_lines`]): each line whose bytes all landed, a
+/// line short only of its line feed included, as [`read`] reads it. Byte offsets, not the
+/// lines' text, decide it, so a line written twice is counted as often as it landed.
+fn counted(mut e: io::Error, lead: usize, lines: &[String]) -> io::Error {
+    if let Some(uncut) = e.get_mut().and_then(|inner| inner.downcast_mut::<Uncut>()) {
+        uncut.whole = uncut.landed.map(|landed| {
+            let mut end = lead as u64;
+            let mut whole = 0;
+            for line in lines {
+                let body = line.strip_suffix('\n').unwrap_or(line).len() as u64;
+                if end.saturating_add(body) > landed {
+                    break;
+                }
+                whole += 1;
+                end = end.saturating_add(line.len() as u64);
+            }
+            whole
+        });
+    }
+    e
+}
+
+/// `e`, a failed write's ([`Log::put`]), as one that wrote none of the lines it was asked for:
+/// a write that put only a line feed of its own, or a gap line taken as said.
+fn wrote_none(e: io::Error) -> io::Error {
+    if !left_lines(&e) {
+        return e;
+    }
+    let kind = e.kind();
+    match e.into_inner().map(|e| e.downcast::<Uncut>()) {
+        Some(Ok(uncut)) => uncut.error,
+        Some(Err(other)) => io::Error::new(kind, other),
+        None => kind.into(),
+    }
+}
+
+/// Whether `e`, an append's error ([`Log::append_saying`]), is a write's whose cut back failed,
+/// so the log may hold some of the lines it was writing: a writer that keeps them asks the log
+/// before it writes them again ([`Log::holds`]), or counts those it left ([`whole_lines`]).
+#[must_use]
+pub fn left_lines(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Uncut>())
+}
+
+/// How many of the lines an append was writing `e`, its error ([`Log::append_saying`]), left
+/// whole in the log, the first that many, where its write could not be cut back
+/// ([`left_lines`]) and the file's length could be read after it, under the lock the append
+/// held: `None` where the log cannot say.
+#[must_use]
+pub fn whole_lines(e: &io::Error) -> Option<usize> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Uncut>())
+        .and_then(|uncut| uncut.whole)
 }
 
 /// The prefix of a loss record's name: `lost-<writer>-<rows>`.

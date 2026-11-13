@@ -24,30 +24,86 @@ pub(crate) struct AskpassSheet {
     window: crate::WindowId,
     session: u64,
     owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
-    field: Obj,
-    panel: Obj,
-    parent: Obj,
+    /// When it went up, for the untouched-sheet backstop (`App::refuse_untouched_askpass_sheet`).
+    raised: Instant,
+    /// Whether a person has touched it (`crate::askpass::PasswordInput::touched`).
+    input: std::sync::Arc<crate::askpass::PasswordInput>,
     reply: Sender<AskpassAnswer>,
-    _details: aterm_objc::Retained<PasswordDetailsTarget>,
-    _keys: crate::alert_keys::PasswordKeyWatch,
-    _input_fence: crate::askpass::PromptInputFence<'static>,
+    /// What AppKit shows of it, dropped last, as its key watch and input fence always were.
+    chrome: SheetChrome,
+}
+
+/// The AppKit side of a password sheet: its secure field, its panel and the window it hangs
+/// from, and the disclosure, key watch and input fence that live as long as it does.
+enum SheetChrome {
+    Shown {
+        field: Obj,
+        panel: Obj,
+        parent: Obj,
+        _details: aterm_objc::Retained<PasswordDetailsTarget>,
+        _keys: crate::alert_keys::PasswordKeyWatch,
+        _input_fence: crate::askpass::PromptInputFence<'static>,
+    },
+    /// A headless test's sheet, which no window shows: the update lane's hold and refusal read
+    /// only the rest of [`AskpassSheet`].
+    #[cfg(test)]
+    Headless,
 }
 
 impl Drop for AskpassSheet {
     fn drop(&mut self) {
+        let (field, panel, parent) = match &self.chrome {
+            SheetChrome::Shown {
+                field,
+                panel,
+                parent,
+                ..
+            } => (field, panel, parent),
+            #[cfg(test)]
+            SheetChrome::Headless => return,
+        };
         unsafe {
             if let Some(empty) = appkit::nsstring("") {
-                appkit::send_v_id(self.field.id(), sel!(setStringValue:), empty.id());
+                appkit::send_v_id(field.id(), sel!(setStringValue:), empty.id());
             }
-            if appkit::send_id(self.panel.id(), sel!(sheetParent)) == self.parent.id() {
+            if appkit::send_id(panel.id(), sel!(sheetParent)) == parent.id() {
                 appkit::send_v_id_isize(
-                    self.parent.id(),
+                    parent.id(),
                     sel!(endSheet:returnCode:),
-                    self.panel.id(),
+                    panel.id(),
                     appkit::consts::NS_ALERT_SECOND_BUTTON_RETURN,
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl AskpassSheet {
+    /// A sheet raised at `raised` for `session` in `window` that no window shows, answering on
+    /// `reply`, and its input, which a test touches as a person would.
+    pub(crate) fn headless_for_test(
+        window: crate::WindowId,
+        session: u64,
+        raised: Instant,
+        reply: Sender<AskpassAnswer>,
+    ) -> (Self, std::sync::Arc<crate::askpass::PasswordInput>) {
+        let input = std::sync::Arc::new(crate::askpass::PasswordInput::new());
+        let sheet = Self {
+            id: 1,
+            ticket: std::sync::Arc::new(crate::askpass::AskpassTicket::new(
+                1,
+                raised + crate::askpass::ASKPASS_DEADLINE,
+            )),
+            window,
+            session,
+            owned: None,
+            raised,
+            input: std::sync::Arc::clone(&input),
+            reply,
+            chrome: SheetChrome::Headless,
+        };
+        (sheet, input)
     }
 }
 
@@ -326,6 +382,7 @@ impl App {
             return refuse(reply, "could not create the details disclosure");
         };
 
+        let input = std::sync::Arc::new(crate::askpass::PasswordInput::new());
         // SAFETY: standard NSAlert setters on the main thread; text setters
         // copy, `-addButtonWithTitle:` returns +0, `-setAccessoryView:` retains
         // the field, and `-beginSheetModalForWindow:completionHandler:` copies
@@ -372,10 +429,12 @@ impl App {
             let Some(panel) = panel else {
                 return Err("the alert reported no panel");
             };
-            let input = std::sync::Arc::new(crate::askpass::PasswordInput::new());
-            let Some(keys) =
-                crate::alert_keys::watch_password_keys(&panel, &ns_window, &field, input)
-            else {
+            let Some(keys) = crate::alert_keys::watch_password_keys(
+                &panel,
+                &ns_window,
+                &field,
+                std::sync::Arc::clone(&input),
+            ) else {
                 return Err("could not guard the password field's input");
             };
             let begin_sheet: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
@@ -399,14 +458,18 @@ impl App {
             ticket,
             window: wid,
             session,
-            field,
-            panel,
-            parent: ns_window,
-            reply,
-            _details: details_target,
-            _keys: keys,
-            _input_fence: input_fence,
             owned,
+            raised: Instant::now(),
+            input,
+            reply,
+            chrome: SheetChrome::Shown {
+                field,
+                panel,
+                parent: ns_window,
+                _details: details_target,
+                _keys: keys,
+                _input_fence: input_fence,
+            },
         });
     }
 
@@ -427,7 +490,12 @@ impl App {
             return;
         }
         if proceed {
-            let Some(secret) = read_secure_field(&sheet.field) else {
+            let field = match &sheet.chrome {
+                SheetChrome::Shown { field, .. } => Some(field),
+                #[cfg(test)]
+                SheetChrome::Headless => None,
+            };
+            let Some(secret) = field.and_then(read_secure_field) else {
                 let _ = sheet.reply.send(AskpassAnswer::Refused(
                     "the password is invalid or longer than 1023 UTF-8 bytes".into(),
                 ));
@@ -457,6 +525,38 @@ impl App {
             let _ = sheet.reply.send(AskpassAnswer::Cancel);
             self.askpass_backoff.on_cancel(sheet.window.0, now);
         }
+    }
+
+    /// Whether aterm's own password sheet stands, and if it does, whether it has stood untouched
+    /// for [`crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP`].
+    pub(crate) fn askpass_sheet_untouched_overdue(&self, now: Instant) -> Option<bool> {
+        self.askpass_sheet.as_ref().map(|sheet| {
+            crate::askpass::untouched_sheet_overdue(sheet.raised, sheet.input.touched(), now)
+        })
+    }
+
+    /// Refuse aterm's own password sheet when an update waits on it and it has stood untouched
+    /// for [`crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP`]: an unanswered prompt is recorded and
+    /// the rest goes on. The `sudo` that asked is told why and may ask again once the window's
+    /// decline spacing passes; a sheet a person has touched is never refused here. Returns
+    /// whether it refused one.
+    pub(crate) fn refuse_untouched_askpass_sheet(&mut self, now: Instant) -> bool {
+        let Some(sheet) = self.askpass_sheet.take_if(|sheet| {
+            crate::askpass::untouched_sheet_overdue(sheet.raised, sheet.input.touched(), now)
+        }) else {
+            return false;
+        };
+        let backstop = crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP.as_secs();
+        aterm_log::info!(
+            "update: session {}'s password prompt stood untouched for {backstop}s while an \
+             update waited; aterm refused it and the update goes on",
+            sheet.session
+        );
+        let _ = sheet.reply.send(AskpassAnswer::Refused(format!(
+            "nobody answered it within {backstop}s while an update waited; ask again"
+        )));
+        self.askpass_backoff.on_cancel(sheet.window.0, now);
+        true
     }
 
     pub(crate) fn withdraw_askpass_sheet(&mut self, id: u64) {
@@ -549,3 +649,7 @@ pub(crate) fn check_password_disclosure(mtm: MainThread) -> Result<(), &'static 
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "askpass_sheet_tests.rs"]
+mod tests;

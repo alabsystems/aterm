@@ -10,11 +10,37 @@ use aterm_agent::harness::outlook::Figure;
 use aterm_agent::harness::session_usage::TrafficView;
 
 use super::{
-    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, SessionWeek, account_menu_rows_from,
-    band_glyphs, band_level, rows, traffic_rows, weekly_facts, weekly_gap_why,
+    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, PoolRead, SessionWeek,
+    account_menu_rows_from, band_glyphs, band_level, rows, traffic_rows, weekly_facts,
+    weekly_gap_why,
 };
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
+
+/// An account row's name and standing on one line, as the tests below read it.
+trait Standing {
+    fn standing(&self) -> String;
+}
+
+impl Standing for AccountMenuRow {
+    fn standing(&self) -> String {
+        format!("{} \u{b7} {}", self.name, self.trail)
+    }
+}
+
+/// The rows of one read of `cli`'s pool as the card's worker makes it ([`PoolRead::load`], then
+/// its rows).
+fn pool_menu_rows(
+    cli: aterm_agent::harness::accounts::Cli,
+    places: (&std::path::Path, &std::path::Path, Option<&std::path::Path>),
+    session: (Option<&str>, Option<&str>),
+    week: SessionWeek,
+    now: i64,
+) -> Result<Vec<AccountMenuRow>, String> {
+    Ok(PoolRead::load(cli, places, now)?
+        .rows(session, week, now)
+        .rows)
+}
 
 #[test]
 fn unavailable_manual_admission_disables_only_signin_choices_and_next() {
@@ -36,7 +62,7 @@ fn unavailable_manual_admission_disables_only_signin_choices_and_next() {
     state.lapsed_logins.insert("signed-out".into());
     let before = state.clone();
     let enrolled = std::collections::BTreeSet::from(["ready".into(), "signed-out".into()]);
-    let (initial, _) = account_menu_rows_from(
+    let initial = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -109,146 +135,53 @@ fn unavailable_manual_admission_disables_only_signin_choices_and_next() {
     )));
 }
 
+/// A sign-in's last failure is clipboard evidence, not a card row: Copy details holds its
+/// words whole, the account it was for and when the attempt finished on both clocks; the card
+/// itself draws none of it.
 #[test]
-fn typed_login_diagnostic_is_wrapped_spoken_once_and_preserved_in_copy() {
+fn a_typed_login_diagnostic_is_preserved_in_copy_and_is_no_card_row() {
     use aterm_agent::harness::{
         account_progress::AccountProgress,
         accounts::Row,
         accounts_sync::LoginDiagnostic,
         open_url::{Met, MetWord},
     };
-    let row = Row {
-        label: "shared".into(),
-        ..Row::default()
+    let failed = |label: &str, at: i64, word: MetWord| {
+        LoginDiagnostic::from_exit_for_test(
+            &Row {
+                label: label.into(),
+                ..Row::default()
+            },
+            at,
+            1,
+            Some(Met::new(word, None)),
+        )
     };
-    let diagnostic = LoginDiagnostic::from_exit_for_test(
-        &row,
-        80,
-        1,
-        Some(Met::new(MetWord::BrowserControl, None)),
-    );
-    let words = diagnostic.words();
+    let older = failed("alpha", 70, MetWord::Stall);
+    let newest = failed("zeta", 90, MetWord::BrowserControl);
     let mut progress = AccountProgress::unknown(100);
-    progress.login_diagnostics.push(diagnostic.clone());
-    let report = super::recovery_report(&progress);
-    assert!(report.contains(&words));
-    assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(80)));
-    assert!(report.contains("shared"));
-    for room in [32, 44] {
-        let mut rows = Vec::new();
-        super::login_diagnostic_rows(&mut rows, &diagnostic, room);
-        assert!(rows.iter().all(|row| match row {
-            crate::autopilot_menu::MenuRow::Note { text, .. } =>
-                crate::tab_menu::display_cells(text) <= room,
-            _ => false,
-        }));
-        let spoken = rows
-            .iter()
-            .filter(|row| match row {
-                crate::autopilot_menu::MenuRow::Note { spoken, .. } => spoken == &words,
-                _ => false,
-            })
-            .count();
-        assert_eq!(spoken, 1);
-        let text = rows
-            .iter()
-            .filter_map(|row| match row {
-                crate::autopilot_menu::MenuRow::Note { text, .. }
-                    if !text.starts_with("Last local") && !text.starts_with("Finished") =>
-                {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(text, words);
-    }
-}
-
-#[test]
-fn the_newest_login_failure_remains_visible_in_a_short_account_menu() {
-    use aterm_agent::harness::{
-        account_progress::{AccountProgress, ProgressPhase},
-        accounts::Row,
-        accounts_sync::LoginDiagnostic,
-        open_url::{Met, MetWord},
-    };
-    let older = LoginDiagnostic::from_exit_for_test(
-        &Row {
-            label: "alpha".into(),
-            ..Row::default()
-        },
-        70,
-        1,
-        Some(Met::new(MetWord::Stall, None)),
-    );
-    let newest = LoginDiagnostic::from_exit_for_test(
-        &Row {
-            label: "zeta".into(),
-            ..Row::default()
-        },
-        90,
-        1,
-        Some(Met::new(MetWord::BrowserControl, None)),
-    );
-    let mut progress = AccountProgress::unknown(100);
-    progress.phase = ProgressPhase::Waiting;
-    progress.known = Some(2);
-    progress.eligible = Some(0);
-    progress.wall = Some("weekly".into());
-    progress.next_at = Some(160);
-    progress
-        .details
-        .push("No eligible alternate account".into());
     progress.login_diagnostics = vec![older.clone(), newest.clone()];
-    let before = progress.clone();
-    let theme = aterm_render::Theme {
-        fg: 0x00E0_E0E0,
-        bg: 0x0018_1818,
-        cursor: 0x00FF_FFFF,
-        selection: 0x0044_4466,
+    let facts = FactMenuFacts {
+        account_progress: Some(progress),
+        now: 100,
+        ..menu_facts(FactMask::default(), false)
     };
-    for cols in [40, 60] {
-        let facts = FactMenuFacts {
-            account_progress: Some(progress.clone()),
-            title: "Accounts · tab 1".into(),
-            room: crate::autopilot_menu::content_room(cols),
-            ..Default::default()
-        };
-        let menu = rows(Fact::Account, &facts);
-        let rect = crate::autopilot_menu::place(&menu, (12, 0), (0..14, 0..cols), (cols, 14), 0)
-            .expect("short account menu");
-        let text = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None)
-            .into_iter()
-            .map(|line| {
-                line.iter()
-                    .skip(1)
-                    .take(line.len().saturating_sub(2))
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .trim()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains("Last local sign-in: zeta"), "{text}");
-        assert!(text.contains(&newest.words()), "{text}");
+    let before = facts.clone();
+    let report = super::details_report(&facts);
+    for diagnostic in [&older, &newest] {
+        assert!(report.contains(diagnostic.label()), "{report}");
+        assert!(report.contains(&diagnostic.words()), "{report}");
         assert!(
-            text.contains(&aterm_agent::harness::usage::rfc3339_utc(90)),
-            "{text}"
-        );
-        assert!(!text.contains(&older.words()), "{text}");
-        let report = super::recovery_report(facts.account_progress.as_ref().unwrap());
-        for diagnostic in [&older, &newest] {
-            assert!(report.contains(diagnostic.label()));
-            assert!(report.contains(&diagnostic.words()));
-            assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(
+            report.contains(&aterm_agent::harness::usage::rfc3339_utc(
                 diagnostic.completed_at
-            )));
-        }
-        assert_eq!(facts.account_progress.as_ref(), Some(&before));
+            )),
+            "{report}"
+        );
     }
+    assert_eq!(facts, before);
+    let card = shown(&rows(Fact::Account, &facts)).join("\n");
+    assert!(!card.contains(&newest.words()), "{card}");
+    assert!(!card.contains("Last local sign-in"), "{card}");
 }
 
 fn mask(kinds: &[FactKind]) -> FactMask {
@@ -271,18 +204,15 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         path: Some("~/aterm".into()),
         branch: Some("main".into()),
         context: Some("ctx 84% left".into()),
-        subscription: None,
-        weekly: None,
         own: None,
         weekly_gap: None,
         cli: None,
-        own_login: None,
         refresh_usage: false,
         accounts: Vec::new(),
         accounts_refused: None,
         accounts_loading: false,
-        pool_unpinned: true,
         off,
+        starts_off: FactMask::default(),
         cwd: side.then(|| PathBuf::from("/Users//someone/aterm")),
         repo_root: side.then(|| PathBuf::from("/Users//someone")),
         git_hygiene: Vec::new(),
@@ -290,40 +220,41 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         key_row: Some(true),
         note: None,
         typing: false,
-        switch_to: None,
+        picks: None,
+        stops: None,
         token: None,
         outlook: None,
         account_row: None,
         movable: true,
-        height: None,
+        product: "Claude Code",
+        tabs_here: Some(1),
+        ..FactMenuFacts::default()
     }
 }
 
+/// What automatic switching does for the tab is one sentence from the session's own recovery
+/// observation, whatever this Mac's pin: pinning changes the `Pin` fact and its item and no
+/// other row. The observation's timing is in the sentence only as the next look, on the local
+/// clock, and an unknown clock is never said as an epoch date.
 #[test]
-fn account_recovery_notes_are_independent_of_pool_pin() {
+fn the_recovery_sentence_is_independent_of_the_pool_pin() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
     progress.phase = ProgressPhase::Waiting;
     progress.details.push("synthetic recovery blocker".into());
     progress.next_at = Some(160);
     let mut facts = menu_facts(FactMask::default(), false);
-    facts.account_progress = Some(progress.clone());
-    facts.pool_unpinned = true;
-    let before = rows(Fact::Account, &facts);
-    assert!(
-        before
-            .iter()
-            .any(|row| matches!(row, MenuRow::Note { text, .. } if text == &progress.details[0]))
-    );
-    assert!(before.iter().any(|row| matches!(
-        row,
-        MenuRow::Item {
-            act: MenuAct::Fact(Fact::Account, FactAct::NetworkState),
-            ..
-        }
-    )));
-    facts.pool_unpinned = false;
-    let after = rows(Fact::Account, &facts);
+    facts.cli = Some(aterm_agent::harness::accounts::Cli::Claude);
+    facts.now = 100;
+    facts.accounts = vec![AccountMenuRow {
+        account: AccountLabel::new("main").unwrap(),
+        name: "main@example.test".into(),
+        trail: "61% left".into(),
+        spoken: "main@example.test, 61 percent left".into(),
+        active: true,
+        enabled: true,
+    }];
+    facts.account_progress = Some(progress);
     let notes = |rows: &[MenuRow]| {
         rows.iter()
             .filter_map(|row| match row {
@@ -332,29 +263,39 @@ fn account_recovery_notes_are_independent_of_pool_pin() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(notes(&before), notes(&after));
-    facts.account_progress.as_mut().unwrap().next_at = None;
-    let unknown = notes(&rows(Fact::Account, &facts));
+    let before = rows(Fact::Account, &facts);
     assert_eq!(
-        notes(&after).len(),
-        unknown.len(),
-        "unknown timing must remain visible"
+        notes(&before),
+        ["At its limit. aterm looks again 00:02."],
+        "the sentence; a detail is clipboard evidence"
     );
-    assert_ne!(notes(&after), unknown);
-    for at in [0, -1] {
-        let progress = facts.account_progress.as_mut().unwrap();
-        progress.observed_at = at;
-        progress.next_at = Some(at);
-        assert!(
-            !notes(&rows(Fact::Account, &facts))
-                .iter()
-                .any(|line| line.contains(&aterm_agent::harness::usage::rfc3339_utc(at)))
+    assert!(before.iter().any(|row| matches!(
+        row,
+        MenuRow::Item {
+            act: MenuAct::Fact(Fact::Account, FactAct::NetworkState),
+            ..
+        }
+    )));
+    facts.pinned = Some("main@example.test".into());
+    let after = rows(Fact::Account, &facts);
+    assert_eq!(notes(&before), notes(&after));
+    assert_ne!(before, after, "the pin is said on its own rows");
+    for at in [None, Some(0), Some(-1)] {
+        facts.account_progress.as_mut().unwrap().next_at = at;
+        assert_eq!(
+            notes(&rows(Fact::Account, &facts)),
+            ["At its limit."],
+            "{at:?}"
         );
     }
 }
 
+/// COPY DETAILS PRESERVES FULL EVIDENCE: every recovery detail however many, the phase, and
+/// both times on both clocks, with the observation unchanged; an unknown clock is never an
+/// epoch date. The item is on every Claude Code card with an observation or an address, and on
+/// no other.
 #[test]
-fn recovery_copy_preserves_full_evidence_and_stays_reachable_in_a_short_menu() {
+fn copy_details_preserves_full_recovery_evidence() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
     progress.phase = ProgressPhase::SigningIn {
@@ -368,9 +309,19 @@ fn recovery_copy_preserves_full_evidence_and_stays_reachable_in_a_short_menu() {
     progress.next_at = Some(160);
     let detail = "current: no usable sign-in route; profile(none) mailbox(none configured) vault(no new credential) hosts(none configured)";
     progress.details = vec![detail.into(); 30];
-    let before = progress.clone();
-    let report = super::recovery_report(&progress);
-    assert!(report.contains(detail));
+    let mut facts = menu_facts(FactMask::default(), false);
+    facts.cli = Some(aterm_agent::harness::accounts::Cli::Claude);
+    facts.now = 200;
+    facts.accounts = vec![AccountMenuRow {
+        account: AccountLabel::new("current").unwrap(),
+        name: "current@example.test".into(),
+        trail: "not read".into(),
+        spoken: "current@example.test, not read".into(),
+        active: true,
+        enabled: true,
+    }];
+    facts.account_progress = Some(progress.clone());
+    let report = super::details_report(&facts);
     assert_eq!(report.matches(detail).count(), 30);
     for at in [100, 160] {
         assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(at)));
@@ -380,65 +331,38 @@ fn recovery_copy_preserves_full_evidence_and_stays_reachable_in_a_short_menu() {
             &progress
         ))
     );
-    assert_eq!(progress, before);
+    assert_eq!(facts.account_progress.as_ref(), Some(&progress));
     for at in [0, -1] {
         let mut unknown = AccountProgress::unknown(at);
         unknown.next_at = Some(at);
-        let report = super::recovery_report(&unknown);
+        facts.account_progress = Some(unknown);
+        let report = super::details_report(&facts);
         assert!(
             !report.contains(&aterm_agent::harness::usage::rfc3339_utc(at)),
             "an unknown clock must not become an epoch date"
         );
     }
-    let mut facts = menu_facts(FactMask::default(), false);
-    facts.account_progress = Some(progress);
-    for next_at in [Some(160), None] {
-        facts.account_progress.as_mut().unwrap().next_at = next_at;
-        let rows = rows(Fact::Account, &facts);
-        let copy = rows
+    let copy = |facts: &FactMenuFacts| {
+        rows(Fact::Account, facts)
             .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    MenuRow::Item {
-                        act: MenuAct::Fact(Fact::Account, FactAct::CopyRecovery),
-                        enabled: true,
-                        ..
-                    }
-                )
-            })
-            .expect("copy action");
-        let next_line = super::recovery_next_line(next_at);
-        let next = rows
-            .iter()
-            .position(|row| {
-                matches!(row,
-            MenuRow::Note { text, .. } if text == &next_line)
-            })
-            .expect("timing row");
-        for cols in [40, 60, 120] {
-            let rect =
-                crate::autopilot_menu::place(&rows, (12, 0), (0..14, 0..cols), (cols, 14), 0)
-                    .expect("short account menu");
-            assert!(
-                copy < rect.h - 2,
-                "long notes must not hide the copy action"
-            );
-            assert!(next < rect.h - 2, "long notes must not hide the timing row");
-        }
-    }
-    facts.account_progress = None;
-    assert!(
-        !super::rows(Fact::Account, &facts)
-            .iter()
-            .any(|row| matches!(
-                row,
+            .filter_map(|row| match row {
                 MenuRow::Item {
                     act: MenuAct::Fact(Fact::Account, FactAct::CopyRecovery),
+                    label,
+                    enabled: true,
                     ..
-                }
-            ))
-    );
+                } => Some(label.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(copy(&facts), ["Copy details"]);
+    facts.account_progress = None;
+    assert!(copy(&facts).is_empty(), "no observation and no address");
+    facts.email = Some("current@example.test".into());
+    assert_eq!(copy(&facts), ["Copy details"]);
+    facts.cli = Some(aterm_agent::harness::accounts::Cli::Codex);
+    assert!(copy(&facts).is_empty(), "Claude Code's alone");
 }
 
 fn shown(rows: &[MenuRow]) -> Vec<String> {
@@ -454,13 +378,24 @@ fn shown(rows: &[MenuRow]) -> Vec<String> {
             MenuRow::Header(t) => format!("header {t}"),
             MenuRow::Note { text, .. } => format!("note {text}"),
             MenuRow::Rule => "rule".into(),
+            MenuRow::Stops { stops, at, .. } => format!(
+                "slider {} at {at:?}",
+                stops
+                    .iter()
+                    .map(|stop| format!("{} [{}] {}", stop.label, stop.act.key(), stop.enabled))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
             other => format!("{other:?}"),
         })
         .collect()
 }
 
+/// EACH FACT'S CARD OFFERS ITS ROWS, AND HIDES ONLY WHAT A CLICK HIDES: the folder's, the
+/// branch's and the context's cards carry their own rows and no `Hide`, since a click on them
+/// does nothing; another program's model and effort, which a click hides, keep theirs.
 #[test]
-fn each_fact_menu_offers_its_rows_and_its_hide() {
+fn each_fact_menu_offers_its_rows_and_only_a_clickable_fact_its_hide() {
     let on = menu_facts(FactMask::default(), true);
     assert_eq!(
         shown(&rows(Fact::Path, &on)),
@@ -469,8 +404,6 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
             "note \u{2302}  ~/aterm",
             "+ New tab here [fact-menu/path/new-tab-here] true",
             "\u{29c9} Copy path [fact-menu/path/copy-path] true",
-            "rule",
-            "\u{25cb} Hide folder [fact-menu/path/hide/path] true",
         ]
     );
     assert_eq!(
@@ -479,40 +412,31 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
             "note \u{2387}  main",
             "\u{29c9} Copy branch name [fact-menu/branch/copy-branch] true",
             "+ New tab at the repository root [fact-menu/branch/new-tab-at-root] true",
-            "rule",
-            "\u{25cb} Hide branch [fact-menu/branch/hide/branch] true",
         ]
     );
     assert_eq!(
         shown(&rows(Fact::Model, &on))[1..],
         [
             "note \u{25c6}  Opus 5.5",
-            "\u{22ef} Change model\u{2026}  /model [fact-menu/model/type/model] true",
             "rule",
             "\u{25cb} Hide model [fact-menu/model/hide/model] true",
-        ]
+        ],
+        "no Claude Code: nothing types `/model`, and the card hides and shows"
     );
     assert_eq!(
         shown(&rows(Fact::Effort, &on))[1..],
         [
-            "note \u{25c9}  xhigh".to_owned(),
-            format!(
-                "\u{25c8} Turn {} on for this session [fact-menu/effort/type/key-on] true",
-                aterm_primer::CLAUDE_TOP_EFFORT_KEY
-            ),
-            "\u{22ef} Effort slider\u{2026}  /effort [fact-menu/effort/type/effort] true"
-                .to_owned(),
-            "rule".to_owned(),
-            "\u{25cb} Hide effort [fact-menu/effort/hide/effort] true".to_owned(),
-        ]
+            "note \u{25c9}  xhigh",
+            "rule",
+            "\u{25cb} Hide effort [fact-menu/effort/hide/effort] true",
+        ],
+        "the key's on/off row is the key's own card's"
     );
     assert_eq!(
         shown(&rows(Fact::Context, &on))[1..],
         [
             "note \u{25d0}  ctx 84% left",
             "\u{22ef} Compact context\u{2026}  /compact [fact-menu/context/type/compact] true",
-            "rule",
-            "\u{25cb} Hide context [fact-menu/context/hide/context] true",
         ]
     );
     let with_hygiene = FactMenuFacts {
@@ -562,57 +486,150 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
     assert!(rows(Fact::Usage, &on).iter().all(|r| !r.selectable()));
 }
 
+fn pick(
+    family: crate::claude_facts::ModelFamily,
+    label: &str,
+    arg: Option<&str>,
+    current: bool,
+    note: Option<&str>,
+) -> crate::claude_facts::ModelPick {
+    crate::claude_facts::ModelPick {
+        family,
+        label: label.into(),
+        arg: arg.map(|arg| crate::claude_slash::ModelArg::new(arg).expect("a `/model` argument")),
+        current,
+        note: note.map(str::to_owned),
+    }
+}
+
+/// A CLAUDE CODE SESSION'S MODEL CARD IS ITS TWO CHOICES: each under its own key, the session's
+/// own checked, the Fable choice's billing line under it, and no hide or show row.
 #[test]
-fn the_model_and_effort_menus_offer_the_switch_a_click_makes() {
-    use crate::claude_facts::{ModelSwitch, SwitchTarget};
-    let unread = SwitchTarget::unread().expect("the seed's first id is a `/model` argument");
-    let switch_plan = |facts: &aterm_agent::harness::footer::FooterFacts, switch: &ModelSwitch| {
-        crate::claude_facts::switch_plan(facts, switch, unread)
+fn the_model_card_is_its_two_choices_and_nothing_else() {
+    use crate::claude_facts::ModelFamily;
+    let card = FactMenuFacts {
+        picks: Some(vec![
+            pick(
+                ModelFamily::Fable,
+                "Fable 5.1",
+                Some("claude-fable-5-1"),
+                false,
+                Some("billed to usage credits on this plan"),
+            ),
+            pick(
+                ModelFamily::Opus,
+                "Opus 5.5",
+                Some("claude-opus-5-5"),
+                true,
+                None,
+            ),
+        ]),
+        off: mask(&[FactKind::Path]),
+        ..menu_facts(FactMask::default(), true)
     };
-    let shown = |model: &str, effort: &str| aterm_agent::harness::footer::FooterFacts {
-        model: Some(model.into()),
-        effort: Some(effort.into()),
-        ..Default::default()
+    let model = rows(Fact::Model, &card);
+    assert_eq!(
+        shown(&model)[1..],
+        [
+            "note \u{25c6}  Opus 5.5",
+            "\u{25c6} Fable 5.1 [fact-menu/model/set-model/fable] true",
+            "note    billed to usage credits on this plan",
+            "\u{25c6} Opus 5.5 [fact-menu/model/set-model/opus] true",
+        ],
+        "no hide row, and no row shows the hidden folder again"
+    );
+    let checked: Vec<bool> = model
+        .iter()
+        .filter_map(|row| match row {
+            MenuRow::Item { checked, .. } => Some(*checked),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checked, [false, true], "the session's own");
+    let Some(MenuRow::Note { spoken, .. }) = model.get(3) else {
+        panic!("the billing line: {model:?}");
     };
-    let toward = FactMenuFacts {
-        switch_to: Some(switch_plan(
-            &shown("Sonnet 4.5", "high"),
-            &ModelSwitch::default(),
-        )),
+    assert_eq!(spoken, "Fable 5.1: billed to usage credits on this plan");
+    // A family the build does not offer is shown and cannot be chosen.
+    let unoffered = FactMenuFacts {
+        picks: Some(vec![pick(
+            ModelFamily::Fable,
+            "Fable",
+            None,
+            false,
+            Some("not offered by this Claude Code build"),
+        )]),
         ..menu_facts(FactMask::default(), true)
     };
     assert_eq!(
-        shown_rows(Fact::Model, &toward)[2],
-        "\u{21c4} Switch to Opus 5.5 xhigh [fact-menu/model/switch-model] true"
+        shown_rows(Fact::Model, &unoffered)[2],
+        "\u{25c6} Fable [fact-menu/model/set-model/fable] false"
     );
+}
+
+/// A CLAUDE CODE SESSION'S EFFORT CARD IS A SLIDER: one row of its stops, each a level under
+/// its own key, the thumb on the level shown; live under a refusal's note and while a press is
+/// in flight, where an item waits.
+#[test]
+fn the_effort_card_is_a_slider_of_its_stops() {
+    let slider = |stops: &[&'static str], at| FactMenuFacts {
+        stops: Some((stops.to_vec(), at)),
+        ..menu_facts(FactMask::default(), true)
+    };
+    let all = "slider medium [fact-menu/effort/set-effort/medium] true | \
+               high [fact-menu/effort/set-effort/high] true | \
+               xhigh [fact-menu/effort/set-effort/xhigh] true";
     assert_eq!(
-        shown_rows(Fact::Effort, &toward)[2],
-        "\u{21c4} Switch to Opus 5.5 xhigh [fact-menu/effort/switch-model] true"
+        shown_rows(Fact::Effort, &slider(&["medium", "high", "xhigh"], Some(2)))[1..],
+        [
+            "note \u{25c9}  xhigh".to_owned(),
+            format!("{all} at Some(2)"),
+            "rule".to_owned(),
+            "\u{25cb} Hide effort [fact-menu/effort/hide/effort] true".to_owned(),
+        ]
     );
-    assert!(
-        shown_rows(Fact::Model, &toward)
-            .iter()
-            .any(|r| r.ends_with("[fact-menu/model/type/model] true")),
-        "Change model\u{2026} stays"
+    let off_stops = FactMenuFacts {
+        effort: Some("max".into()),
+        ..slider(&["medium", "high", "xhigh"], None)
+    };
+    assert_eq!(
+        shown_rows(Fact::Effort, &off_stops)[1..3],
+        ["note \u{25c9}  max".to_owned(), format!("{all} at None")],
+        "a level that is no stop: no thumb, and the note says the level"
     );
-    let back = FactMenuFacts {
-        switch_to: Some(switch_plan(
-            &shown("Opus 5.5", "xhigh"),
-            &ModelSwitch::default(),
-        )),
+    let waiting = FactMenuFacts {
+        note: Some("Claude is working; click when the turn ends".into()),
         typing: true,
-        ..menu_facts(FactMask::default(), true)
+        ..slider(&["medium", "high"], Some(0))
     };
     assert_eq!(
-        shown_rows(Fact::Model, &back)[2],
-        "\u{21c4} Back to the default model at auto effort [fact-menu/model/switch-model] false",
-        "it waits while a press is in flight"
+        shown_rows(Fact::Effort, &waiting)[2..4],
+        [
+            "note Claude is working; click when the turn ends",
+            "slider medium [fact-menu/effort/set-effort/medium] true | \
+             high [fact-menu/effort/set-effort/high] true at Some(0)",
+        ],
+        "the slider stays live: its pick is said in place, or waits its turn"
+    );
+    assert_eq!(
+        shown_rows(Fact::Effort, &slider(&[], None))[2],
+        "note this model takes no effort level"
     );
     assert!(
-        !shown_rows(Fact::TopEffort, &toward)
+        !shown_rows(Fact::TopEffort, &slider(&["medium"], Some(0)))
             .iter()
-            .any(|r| r.contains("switch-model")),
-        "the top rule's key menu has no switch"
+            .any(|r| r.starts_with("slider")),
+        "the top rule's key's card has no slider"
+    );
+    let keyed = |fact| {
+        shown_rows(fact, &slider(&["medium"], Some(0)))
+            .iter()
+            .any(|r| r.contains("/type/key-on]"))
+    };
+    assert!(keyed(Fact::TopEffort), "the key's card keeps its row");
+    assert!(
+        !keyed(Fact::Effort),
+        "and the slider's card has no row that types another command"
     );
 }
 
@@ -622,17 +639,28 @@ fn shown_rows(fact: Fact, facts: &FactMenuFacts) -> Vec<String> {
 
 #[test]
 fn the_typed_rows_say_what_they_type_and_wait_under_a_note() {
+    use crate::claude_facts::ModelFamily;
     let key = aterm_primer::CLAUDE_TOP_EFFORT_KEY;
     let tagged = FactMenuFacts {
         key_row: Some(false),
         ..menu_facts(FactMask::default(), true)
     };
     assert_eq!(
-        shown(&rows(Fact::Effort, &tagged))[2],
-        format!("\u{25c8} Turn {key} off for this session [fact-menu/effort/type/key-off] true")
+        shown(&rows(Fact::TopEffort, &tagged))[2],
+        format!(
+            "\u{25c8} Turn {key} off for this session [fact-menu/top-effort/type/key-off] true"
+        )
     );
+    let picks = Some(vec![pick(
+        ModelFamily::Opus,
+        "Opus 5.5",
+        Some("claude-opus-5-5"),
+        true,
+        None,
+    )]);
     let noted = FactMenuFacts {
         note: Some("Claude is working; click when the turn ends".into()),
+        picks: picks.clone(),
         ..menu_facts(FactMask::default(), true)
     };
     assert_eq!(
@@ -640,44 +668,90 @@ fn the_typed_rows_say_what_they_type_and_wait_under_a_note() {
         [
             "note \u{25c6}  Opus 5.5",
             "note Claude is working; click when the turn ends",
-            "\u{22ef} Change model\u{2026}  /model [fact-menu/model/type/model] false",
+            "\u{25c6} Opus 5.5 [fact-menu/model/set-model/opus] false",
         ]
     );
     let typing = FactMenuFacts {
         typing: true,
+        picks,
         ..menu_facts(FactMask::default(), true)
     };
+    assert!(shown(&rows(Fact::Model, &typing))[2].ends_with("set-model/opus] false"));
+    let top = shown(&rows(Fact::TopEffort, &typing));
+    assert!(top[2].ends_with("[fact-menu/top-effort/type/key-on] false"));
     let effort = shown(&rows(Fact::Effort, &typing));
-    assert!(effort[2].ends_with("[fact-menu/effort/type/key-on] false"));
-    assert!(effort[3].ends_with("[fact-menu/effort/type/effort] false"));
-    assert!(effort[5].ends_with("[fact-menu/effort/hide/effort] true"));
+    assert!(
+        effort
+            .iter()
+            .any(|r| r.ends_with("[fact-menu/effort/hide/effort] true")),
+        "a row that types nothing does not wait: {effort:?}"
+    );
+    let context = shown(&rows(Fact::Context, &typing));
+    assert!(context[2].ends_with("[fact-menu/context/type/compact] false"));
     let unkeyed = FactMenuFacts {
         key_row: None,
         ..menu_facts(FactMask::default(), true)
     };
-    let effort = shown(&rows(Fact::Effort, &unkeyed));
-    assert!(!effort.iter().any(|r| r.contains(key)));
-    assert!(effort[2].ends_with("[fact-menu/effort/type/effort] true"));
+    assert!(
+        !shown(&rows(Fact::TopEffort, &unkeyed))
+            .iter()
+            .any(|r| r.contains(key))
+    );
 }
 
+/// A CARD THAT HIDES SHOWS EVERY HIDDEN FACT AGAIN, AND A STARTING STUB'S CARD ITS OWN: the
+/// model's card (no Claude Code) ends in its own `Hide` and a `Show` for each other hidden
+/// fact. The folder's card carries neither in a program that shows the folder from the start;
+/// where the program's own line prints the folder and the rule starts with it behind a stub
+/// (`starts_off`), its card shows it again, or puts it back, and names no other fact.
 #[test]
 fn a_menu_shows_every_hidden_fact_again() {
-    let hid = menu_facts(mask(&[FactKind::Path, FactKind::Model]), true);
+    let hid = menu_facts(mask(&[FactKind::Path, FactKind::Branch]), true);
+    let model = shown(&rows(Fact::Model, &hid));
     assert_eq!(
-        shown(&rows(Fact::Path, &hid))[5..],
+        model[model.len() - 4..],
         [
-            "\u{25cf} Show folder [fact-menu/path/show/path] true",
-            "\u{25cf} Show model [fact-menu/path/show/model] true",
+            "rule",
+            "\u{25cb} Hide model [fact-menu/model/hide/model] true",
+            "\u{25cf} Show folder [fact-menu/model/show/path] true",
+            "\u{25cf} Show branch [fact-menu/model/show/branch] true",
         ]
     );
-    let branch = shown(&rows(Fact::Branch, &hid));
+    let folder = shown(&rows(Fact::Path, &hid));
+    assert!(
+        !folder
+            .iter()
+            .any(|row| row.contains("Hide") || row.contains("Show")),
+        "a folder shown from the start: no hide or show row: {folder:?}"
+    );
+    let starts = FactMenuFacts {
+        starts_off: mask(&[FactKind::Path]),
+        ..menu_facts(mask(&[FactKind::Path, FactKind::Branch]), true)
+    };
+    let folder = shown(&rows(Fact::Path, &starts));
     assert_eq!(
-        branch[branch.len() - 3..],
+        folder[folder.len() - 2..],
         [
-            "\u{25cb} Hide branch [fact-menu/branch/hide/branch] true",
-            "\u{25cf} Show model [fact-menu/branch/show/model] true",
-            "\u{25cf} Show folder [fact-menu/branch/show/path] true",
-        ]
+            "rule",
+            "\u{25cf} Show folder [fact-menu/path/show/path] true",
+        ],
+        "a starting stub's card shows its own fact, and no other"
+    );
+    let back = FactMenuFacts {
+        starts_off: mask(&[FactKind::Path]),
+        ..menu_facts(FactMask::default(), true)
+    };
+    assert_eq!(
+        shown(&rows(Fact::Path, &back)).last().map(String::as_str),
+        Some("\u{25cb} Hide folder [fact-menu/path/hide/path] true"),
+        "shown, it goes back behind its stub"
+    );
+    let branch = shown(&rows(Fact::Branch, &starts));
+    assert!(
+        !branch
+            .iter()
+            .any(|row| row.contains("Hide") || row.contains("Show")),
+        "the branch starts shown there: {branch:?}"
     );
 }
 
@@ -801,10 +875,10 @@ fn busy_columns_take_the_shaded_ground() {
     assert_eq!(row[lead].bg, c.card_bg);
 }
 
-/// THE ACCOUNT MENU GIVES THE FULL WHY of a weekly figure the footer has not got, under the
-/// footer's own short word, in lines the card's widest content holds; a meter, where there is
-/// one, says it instead. A reader hears the word as the chip speaks it and the why whole, once,
-/// never cut at each line the card wraps it to.
+/// THE ACCOUNT CARD SAYS WHY THE WEEK IS MISSING, in its Budget answer: `not read:` and the
+/// footer's own short reason, never a figure and never `none`; a reader hears it as the chip
+/// speaks it. The full why is clipboard evidence (Copy details), whole. A figure, where there
+/// is one, is the answer instead.
 #[test]
 fn the_account_menu_says_why_the_week_is_missing() {
     use aterm_agent::harness::profile::WeeklyGap;
@@ -825,55 +899,53 @@ fn the_account_menu_says_why_the_week_is_missing() {
         WeeklyGap::ClockInvalid,
     ] {
         let facts = FactMenuFacts {
-            title: "Accounts \u{b7} tab 1".into(),
+            title: "Account \u{b7} tab 1".into(),
+            cli: Some(aterm_agent::harness::accounts::Cli::Claude),
             weekly_gap: Some(gap),
+            room: 60,
             ..menu_facts(FactMask::default(), true)
         };
-        let menu = shown(&rows(Fact::Account, &facts));
-        let head = format!("note    {}", gap.words());
-        let at = menu
-            .iter()
-            .position(|row| *row == head)
-            .expect("the footer's word");
-        let why: Vec<String> = weekly_gap_why(gap)
-            .iter()
-            .map(|line| format!("note {line}"))
-            .collect();
-        assert_eq!(menu[at + 1..at + 1 + why.len()], why[..], "{gap:?}");
-        let built = rows(Fact::Account, &facts);
-        let heard: Vec<&str> = built[at..=at + why.len()]
-            .iter()
-            .map(|row| match row {
-                MenuRow::Note { spoken, .. } => spoken.as_str(),
-                other => panic!("{gap:?}: a note, not {other:?}"),
-            })
-            .collect();
-        let whole = weekly_gap_why(gap).join(" ");
-        let mut said = vec![gap.spoken(), whole.as_str()];
-        said.resize(heard.len(), "");
+        let reason = gap.words().rsplit(" \u{b7} ").next().unwrap();
+        let budget = |facts: &FactMenuFacts| {
+            rows(Fact::Account, facts)
+                .into_iter()
+                .find_map(|row| match row {
+                    MenuRow::Fact {
+                        label,
+                        value,
+                        spoken,
+                        ..
+                    } if label == "Budget" => Some((value, spoken)),
+                    _ => None,
+                })
+                .expect("the Budget answer")
+        };
         assert_eq!(
-            heard, said,
-            "{gap:?}: the word in the chip's words, then the why whole, once"
+            budget(&facts),
+            (
+                format!("not read: {reason}"),
+                format!("Budget: {}", gap.spoken())
+            ),
+            "{gap:?}"
         );
-        for line in weekly_gap_why(gap) {
-            assert!(
-                crate::tab_menu::display_cells(line) <= crate::autopilot_menu::MAX_CONTENT,
-                "{line:?}"
-            );
-        }
+        assert!(!reason.contains('%') && !reason.is_empty(), "{gap:?}");
+        let whole = weekly_gap_why(gap).join(" ");
+        assert!(super::details_report(&facts).contains(&whole), "{gap:?}");
         let metered = FactMenuFacts {
-            weekly: Some("weekly 38% used".into()),
+            own: Some(Figure::Exact(380)),
             ..facts
         };
-        assert!(
-            !shown(&rows(Fact::Account, &metered)).contains(&head),
-            "the footer's words say the week instead"
+        assert_eq!(
+            budget(&metered).0,
+            "62% left",
+            "a figure says the week instead"
         );
+        assert!(!super::details_report(&metered).contains(&whole));
     }
 }
 
 /// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (`weekly 39%
-/// used`, a bound `weekly ≥38% used`) give the card's weekly words as said and the session's row
+/// used`, a bound `weekly ≤62% left`) give the card's weekly words as said and the session's row
 /// the same figure used (exact, or the bound), the session's own figure read past fifteen minutes
 /// a lower bound, a 7d wall gives `weekly out` (never a percentage) and the session's row
 /// [`Figure::Out`], and with neither the footer's reason goes to the menu's why.
@@ -887,21 +959,21 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         ..SubscriptionDisplay::default()
     };
     assert_eq!(
-        weekly_facts(&sub(Some("weekly 39% used"), None), false, NOW),
+        weekly_facts(&sub(Some("weekly 61% left"), None), false, NOW),
         (
             Some(Figure::Exact(390)),
-            Some("weekly 39% used".into()),
+            Some("weekly 61% left".into()),
             None
         ),
         "the words are said as they are and give the row the figure they say"
     );
     assert_eq!(
-        weekly_facts(&sub(Some("weekly \u{2265}38% used"), None), false, NOW).0,
+        weekly_facts(&sub(Some("weekly \u{2264}62% left"), None), false, NOW).0,
         Some(Figure::AtLeast(380)),
         "an aged figure's words with no figure behind them: the bound they say"
     );
     assert_eq!(
-        weekly_facts(&sub(Some("weekly 100% used"), None), false, NOW).0,
+        weekly_facts(&sub(Some("weekly 0% left"), None), false, NOW).0,
         Some(Figure::Exact(1000)),
         "a reading's 100, said as read"
     );
@@ -911,7 +983,7 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
             resets_at: NOW + 86_400,
             at: NOW - 40 * 60,
         }),
-        ..sub(Some("weekly \u{2265}38% used"), None)
+        ..sub(Some("weekly \u{2264}62% left"), None)
     };
     assert_eq!(
         weekly_facts(&aged, false, NOW).0,
@@ -955,10 +1027,10 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
 }
 
 /// AN ACCOUNT ROW SAYS ITS AGED STORE FIGURE AS A LOWER BOUND (the footer's one age rule,
-/// `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): exact for fifteen minutes (`39%
-/// used`), then, however old, a bound rounded down (`≥38% used`) while its week runs, since use
-/// only rises within a week; never an old figure read as exact, nor an inferred `100%` for an
-/// account nobody read, nor an age. Each source is dated by its own reading: a tap's or a
+/// `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1, said as what is left, `harness::left`):
+/// exact for fifteen minutes (`61% left`), then, however old, a bound of use rounded down
+/// (`≤62% left`) while its week runs, since use only rises within a week; never an old figure
+/// read as exact, nor an inferred `0% left` for an account nobody read, nor an age. Each source is dated by its own reading: a tap's or a
 /// sample's beyond the clock's skew is not one.
 #[test]
 fn an_account_rows_aged_store_figure_is_a_lower_bound() {
@@ -993,7 +1065,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
         state.accounts.insert("main".into(), acct);
         let state = accounts::State::from_json(&state.to_json(), NOW).unwrap();
         assert_eq!(state.accounts["main"].windows["seven_day"].at, at);
-        let (rows, _) = account_menu_rows_from(
+        let rows = account_menu_rows_from(
             &roster,
             &state,
             &enrolled,
@@ -1003,10 +1075,10 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             SessionWeek::default(),
             NOW,
         );
-        rows[0].label.clone()
+        rows[0].standing().clone()
     };
     let label = |at: i64| label_with(at, None);
-    assert_eq!(label(NOW - 60), "main \u{b7} preferred \u{b7} 39% used");
+    assert_eq!(label(NOW - 60), "main \u{b7} 61% left");
     assert_eq!(label(NOW + 60), label(NOW - 60));
     let mut observed = accounts::State::default();
     accounts::note_auth(&mut observed, "main", accounts::Auth::Ok, NOW);
@@ -1019,10 +1091,9 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
         None,
         SessionWeek::default(),
         NOW,
-    )
-    .0[0]
-        .label
-        .clone();
+    )[0]
+    .standing()
+    .clone();
     assert_eq!(label(NOW + 61), unknown);
     assert_eq!(label(NOW + 120), unknown);
     assert_eq!(label(0), unknown);
@@ -1035,7 +1106,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
     };
     assert_eq!(
         label_with(NOW + 120, Some(sampled(NOW - 20 * 60))),
-        "main \u{b7} preferred \u{b7} \u{2265}41% used",
+        "main \u{b7} \u{2264}59% left",
         "a tap beyond the skew is no reading: the sample's"
     );
     assert_eq!(
@@ -1050,8 +1121,8 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
     ] {
         assert_eq!(
             label(NOW - age),
-            "main \u{b7} preferred \u{b7} \u{2265}38% used",
-            "{what}: a bound rounded down, never `≥39%`, and no age"
+            "main \u{b7} \u{2264}62% left",
+            "{what}: a bound rounded down, never `\u{2264}61% left`, and no age"
         );
     }
     let restamped = accounts::Sample {
@@ -1063,10 +1134,10 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
     };
     assert_eq!(
         label_with(NOW - 3 * 3600, Some(restamped)),
-        "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        "main \u{b7} \u{2264}62% left",
         "a tap's note re-stamps the week it holds: as old as the window's reading, never read now"
     );
-    let (rows, _) = account_menu_rows_from(
+    let rows = account_menu_rows_from(
         &roster,
         &accounts::State::default(),
         &enrolled,
@@ -1081,11 +1152,12 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
         NOW,
     );
     assert_eq!(
-        rows[0].label, "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        rows[0].standing(),
+        "main \u{b7} \u{2264}62% left",
         "no store figure: the session's own, its bound kept"
     );
     assert_eq!(
-        rows[0].spoken, "main, preferred, at least 38 percent used",
+        rows[0].spoken, "main, at most 62 percent left, this tab's account",
         "a reader hears the bound in words"
     );
     let beside = |session: Option<&str>, at: i64| {
@@ -1108,7 +1180,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             resets_at: NOW + 86_400,
             at,
         };
-        let (rows, _) = account_menu_rows_from(
+        let rows = account_menu_rows_from(
             &roster,
             &state,
             &enrolled,
@@ -1122,21 +1194,21 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             },
             NOW,
         );
-        rows[0].label.clone()
+        rows[0].standing().clone()
     };
     assert_eq!(
         beside(Some("main"), NOW - 60),
-        "main \u{b7} preferred \u{b7} 60% used",
+        "main \u{b7} 40% left",
         "the session's own figure, read since the store's, on its own account's row"
     );
     assert_eq!(
         beside(Some("main"), NOW - 3 * 86_400),
-        "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        "main \u{b7} \u{2264}62% left",
         "the store's, read since the session's"
     );
     assert_eq!(
         beside(Some("other"), NOW - 60),
-        "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        "main \u{b7} \u{2264}62% left",
         "the control: another account's session figure never reaches this row"
     );
     {
@@ -1155,7 +1227,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             resets_at: NOW + 86_400,
             at: NOW - 25 * 60,
         };
-        let (rows, _) = account_menu_rows_from(
+        let rows = account_menu_rows_from(
             &roster,
             &state,
             &enrolled,
@@ -1170,7 +1242,8 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             NOW,
         );
         assert_eq!(
-            rows[0].label, "main \u{b7} preferred \u{b7} \u{2265}60% used",
+            rows[0].standing(),
+            "main \u{b7} \u{2264}40% left",
             "the session's own figure wins over a warned_week when no store window figure exists"
         );
     }
@@ -1232,13 +1305,12 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             },
             NOW,
         )
-        .0
     };
     let rows = menu(None, Some("main@example.test"), true);
     assert!(rows[0].active && !rows[1].active);
-    assert!(rows[0].label.ends_with("\u{b7} 60% used"));
+    assert!(rows[0].standing().ends_with("\u{b7} 40% left"));
     assert!(
-        rows[1].label.ends_with("\u{b7} \u{2265}20% used"),
+        rows[1].standing().ends_with("\u{b7} \u{2264}80% left"),
         "a custom-home session identified only by email cannot replace machine-active work's figure"
     );
     for (label, email) in [
@@ -1251,26 +1323,26 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             !rows[0].active && rows[1].active,
             "the machine's UI fallback"
         );
-        assert!(rows[0].label.ends_with("\u{b7} \u{2265}38% used"));
+        assert!(rows[0].standing().ends_with("\u{b7} \u{2264}62% left"));
         assert!(
-            rows[1].label.ends_with("\u{b7} \u{2265}20% used"),
+            rows[1].standing().ends_with("\u{b7} \u{2264}80% left"),
             "an unknown or contradictory session identity lends no figure to the active row"
         );
         let rows = menu(label, email, false);
         assert!(
-            rows.iter().all(|row| !row.label.contains('%')),
+            rows.iter().all(|row| !row.standing().contains('%')),
             "nor can its weekly words fill an unobserved active row"
         );
     }
     let rows = menu(Some("main"), None, true);
     assert!(
-        rows[0].label.ends_with("\u{b7} 60% used"),
+        rows[0].standing().ends_with("\u{b7} 40% left"),
         "its own explicit label"
     );
     let rows = menu(None, Some("main@example.test"), false);
-    assert!(rows[0].label.ends_with("\u{b7} 60% used"));
+    assert!(rows[0].standing().ends_with("\u{b7} 40% left"));
     assert!(
-        !rows[1].label.contains('%'),
+        !rows[1].standing().contains('%'),
         "only the email's own row takes its words"
     );
 }
@@ -1297,7 +1369,6 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
             session,
             now,
         )
-        .0
         .remove(0)
     };
     let mut observed = accounts::State::default();
@@ -1343,11 +1414,14 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
             assert_eq!(got, row(&control, session, NOW));
         } else if sample_after {
             assert_eq!(got, row(&state, SessionWeek::default(), NOW));
-            assert_ne!(got.label, empty.label);
+            assert_ne!(got.standing(), empty.standing());
         } else {
-            assert_eq!(got.label, empty.label);
+            assert_eq!(got.standing(), empty.standing());
         }
-        assert_eq!(row(&state, SessionWeek::default(), 0).label, empty.label);
+        assert_eq!(
+            row(&state, SessionWeek::default(), 0).standing(),
+            empty.standing()
+        );
         assert_eq!(state, before);
     }
     let mut state = accounts::State::default();
@@ -1356,7 +1430,10 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
         reset: Some(NOW + 86400),
         at: NOW + 120,
     });
-    assert_eq!(row(&state, SessionWeek::default(), NOW).label, empty.label);
+    assert_eq!(
+        row(&state, SessionWeek::default(), NOW).standing(),
+        empty.standing()
+    );
     accounts::note_wall(
         &mut state,
         "main",
@@ -1406,7 +1483,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     );
     state.accounts.insert("main".into(), acct);
     let row = |label: Option<&str>, email: Option<&str>| {
-        let (rows, _) = account_menu_rows_from(
+        let rows = account_menu_rows_from(
             &roster,
             &state,
             &enrolled,
@@ -1424,27 +1501,21 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
             },
             NOW,
         );
-        (rows[0].label.clone(), rows[0].active)
+        (rows[0].standing().clone(), rows[0].active)
     };
     assert_eq!(
         row(Some("main"), None),
-        (
-            "main@example.test \u{b7} preferred \u{b7} 90% used".into(),
-            true
-        ),
+        ("main@example.test \u{b7} 10% left".into(), true),
         "the row its login is judged to takes its newer figure, with no email to match"
     );
     let kept = (
-        "main@example.test \u{b7} preferred \u{b7} \u{2265}38% used".to_string(),
+        "main@example.test \u{b7} \u{2264}62% left".to_string(),
         true,
     );
     for label in [Some("main"), None] {
         assert_eq!(
             row(label, Some("canonical@example.test")),
-            (
-                "main@example.test \u{b7} preferred \u{b7} 90% used".into(),
-                true
-            ),
+            ("main@example.test \u{b7} 10% left".into(), true),
             "the provider identity selects the alias row's newer figure"
         );
         assert_eq!(
@@ -1465,47 +1536,55 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     );
 }
 
+/// The card says the account, the week as its Budget verdict, and one item for each of this
+/// Mac's accounts under their heading, each choosing its own account; the pin's item is never
+/// checked.
 #[test]
-fn account_menu_shows_weekly_words_and_rotation_accounts() {
+fn account_menu_shows_the_week_and_rotation_accounts() {
     let facts = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
-        spoken: "Accounts, tab 1".into(),
-        subscription: Some("sol-m27@example.test \u{b7} max 20x".into()),
-        weekly: Some("weekly 100% used".into()),
+        title: "Account \u{b7} tab 1".into(),
+        spoken: "Account, tab 1".into(),
+        email: Some("sol-m27@example.test".into()),
+        plan: Some("Max 20x".into()),
+        own: Some(Figure::Exact(1000)),
         cli: Some(aterm_agent::harness::accounts::Cli::Claude),
         accounts: vec![
             AccountMenuRow {
                 account: AccountLabel::new("m27").unwrap(),
-                label: "m27 \u{b7} dedicated \u{b7} 100% used (limited)".into(),
-                spoken: "m27, dedicated, 100 percent used, limited".into(),
+                name: "m27".into(),
+                trail: "0% left".into(),
+                spoken: "m27, 0 percent left".into(),
                 active: true,
                 enabled: true,
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-2").unwrap(),
-                label: "m27-2 \u{b7} dedicated \u{b7} not-enrolled; quota unknown (auto-login)"
-                    .into(),
-                spoken: "m27-2, dedicated, not-enrolled, quota unknown, auto-login".into(),
+                name: "m27-2".into(),
+                trail: "not signed in".into(),
+                spoken: "m27-2, not signed in, choosing it signs it in".into(),
                 active: false,
                 enabled: true,
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-3").unwrap(),
-                label: "m27-3 \u{b7} pool \u{b7} not-enrolled; quota unknown (auto-login)".into(),
-                spoken: "m27-3, pool, not-enrolled, quota unknown, auto-login".into(),
+                name: "m27-3".into(),
+                trail: "not signed in".into(),
+                spoken: "m27-3, not signed in, choosing it signs it in".into(),
                 active: false,
                 enabled: true,
             },
         ],
-        pool_unpinned: true,
         ..menu_facts(FactMask::default(), true)
     };
     let menu = rows(Fact::Account, &facts);
-    for value in [&facts.subscription, &facts.weekly].into_iter().flatten() {
-        assert!(
-            menu.iter()
-                .any(|row| matches!(row, MenuRow::Note { text, .. } if text.ends_with(value)))
-        );
+    let said = shown(&menu);
+    for want in [
+        "header \u{2386}  sol-m27@example.test",
+        "Fact { label: \"Budget\", value: \"0% left\", spoken: \"Budget: 0 percent left\", tone: Value }",
+        "Fact { label: \"Plan\", value: \"Max 20x\", spoken: \"Plan: Max 20x\", tone: Value }",
+        "Section(\"Switch this Mac to\")",
+    ] {
+        assert!(said.contains(&want.to_owned()), "{want}: {said:#?}");
     }
     let actions: Vec<_> = menu
         .iter()
@@ -1537,7 +1616,8 @@ fn account_menu_shows_weekly_words_and_rotation_accounts() {
                 true,
                 false
             ),
-            (FactAct::AutoRotate, true, true),
+            (FactAct::AutoRotate, true, false),
+            (FactAct::CopyRecovery, true, false),
             (FactAct::AccountSettings, true, false),
         ]
     );
@@ -1606,10 +1686,10 @@ fn account_menu_shows_weekly_words_and_rotation_accounts() {
     assert_eq!(state, before);
 }
 
-/// The Account menu's rows tell an auto-login row from a disabled one, and a walled row says
-/// `out (limited)`, never a percentage (glass design §2.1: never an inferred 100%). Negative
-/// control: a limited row or a footer's wall said with a percentage (`0% left (limited)`, the S1
-/// slice before its review; an inferred `100% used (limited)`) fails the walled row.
+/// The Account menu's rows tell a row a choice signs in from a disabled one (a reader is told
+/// that choosing it signs it in; the row itself says only its condition), and a walled row says
+/// `out`, never a percentage (glass design §2.1: never an inferred 100%). Negative control: a
+/// limited row or a footer's wall said with a percentage fails the walled row.
 #[test]
 fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     use aterm_agent::harness::accounts;
@@ -1669,7 +1749,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     let _ = accounts::note_auth(&mut state, "m15-5", accounts::Auth::SignedOut, NOW);
     let _ = accounts::note_auth(&mut state, "m15-6", accounts::Auth::SignedOut, NOW);
 
-    let (menu_rows, pool_unpinned) = account_menu_rows_from(
+    let menu_rows = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -1683,7 +1763,6 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         },
         NOW,
     );
-    assert!(pool_unpinned);
     assert_eq!(
         menu_rows
             .iter()
@@ -1706,18 +1785,40 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     );
     // A wall says `out`, never a percentage (never an inferred 100% used).
     assert!(
-        menu_rows[0].label.ends_with("\u{b7} out (limited)"),
+        menu_rows[0].standing().ends_with("\u{b7} out"),
         "{menu_rows:?}"
     );
-    assert!(menu_rows.iter().all(|row| !row.label.contains('%')));
-    assert!(
-        menu_rows[3].label.ends_with("signed out (auto-login)"),
+    assert_eq!(
+        menu_rows[0].spoken,
+        "m15-2@example.test, out, this tab's account"
+    );
+    assert!(menu_rows.iter().all(|row| !row.standing().contains('%')));
+    assert_eq!(
+        menu_rows
+            .iter()
+            .map(|row| row.trail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "out",
+            "not signed in",
+            "not signed in",
+            "signed out",
+            "signed out"
+        ],
+        "{menu_rows:?}"
+    );
+    assert_eq!(
+        menu_rows
+            .iter()
+            .map(|row| row.spoken.ends_with(", choosing it signs it in"))
+            .collect::<Vec<_>>(),
+        [false, true, false, true, false],
         "{menu_rows:?}"
     );
 
     // Where no row signs in by itself (Grok Build's pool), a row with an email that is signed
     // out or not enrolled is as one with none: it names its condition and cannot be chosen.
-    let (menu_rows, _) = account_menu_rows_from(
+    let menu_rows = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -1734,7 +1835,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     assert!(
         menu_rows
             .iter()
-            .all(|row| !row.label.contains("auto-login")),
+            .all(|row| !row.spoken.contains("signs it in")),
         "{menu_rows:?}"
     );
 }
@@ -1742,7 +1843,9 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
 /// A GROK SESSION'S ACCOUNT MENU OFFERS NO AUTOMATIC SIGN-IN: no Grok renewal starts in the
 /// background (`Cli::renews_headlessly`), so a Grok row with an email that is not enrolled here
 /// cannot be chosen, where choosing it would start nothing. CONTROL: the same row in Kimi's pool
-/// can be chosen, its renewal starting by itself.
+/// can be chosen, its renewal starting by itself. Unix only, as the manual sign-in queue is
+/// (`accounts::manual_signin_capability`): elsewhere no not-enrolled row can be chosen.
+#[cfg(unix)]
 #[test]
 fn a_grok_pools_menu_offers_no_automatic_sign_in() {
     use aterm_agent::harness::accounts::Cli;
@@ -1770,7 +1873,7 @@ fn a_grok_pools_menu_offers_no_automatic_sign_in() {
             ),
         )
         .unwrap();
-        let (rows, _, _) = super::pool_menu_rows(
+        let rows = pool_menu_rows(
             cli,
             (&aterm_toml, &state, Some(home.as_path())),
             (None, None),
@@ -1814,7 +1917,7 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
     )
     .unwrap();
     let main_row = || {
-        let (rows, _, _) = super::pool_menu_rows(
+        let rows = pool_menu_rows(
             Cli::Codex,
             (&aterm_toml, &state, Some(home.as_path())),
             (None, None),
@@ -1839,13 +1942,13 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
         )
     };
     let gone = main_row();
-    assert!(gone.label.contains("not enrolled"), "{gone:?}");
+    assert_eq!(gone.trail, "not signed in", "{gone:?}");
     assert!(!gone.enabled, "{gone:?}");
     assert!(select().is_err(), "a row not signed in here is not pinned");
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
     let back = main_row();
-    assert!(!back.label.contains("not enrolled"), "{back:?}");
+    assert_ne!(back.trail, "not signed in", "{back:?}");
     assert!(back.enabled, "{back:?}");
     assert!(
         matches!(select(), Ok(PinSelection::Pinned)),
@@ -1877,7 +1980,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         "[[account]]\nlabel = \"m16\"\nemail = \"claude-one@example.com\"\n",
     )
     .unwrap();
-    let (none, _, _) = super::pool_menu_rows(
+    let none = pool_menu_rows(
         Cli::Kimi,
         (&aterm_toml, &state, Some(home.as_path())),
         (None, None),
@@ -1896,7 +1999,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         ),
     )
     .unwrap();
-    let (listed, _, _) = super::pool_menu_rows(
+    let listed = pool_menu_rows(
         Cli::Kimi,
         (&aterm_toml, &state, Some(home.as_path())),
         (None, None),
@@ -1917,7 +2020,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
             store.logins_file()
         };
         std::fs::write(&path, "{").unwrap();
-        let why = super::pool_menu_rows(
+        let why = pool_menu_rows(
             Cli::Kimi,
             (&aterm_toml, &dir, Some(home.as_path())),
             (None, None),
@@ -1934,7 +2037,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         let menu = shown(&menu_rows);
         assert!(
             menu.iter()
-                .any(|row| row.contains("Account state unavailable:")),
+                .any(|row| row.contains("This Mac's accounts could not be read:")),
             "{menu:?}"
         );
         assert!(
@@ -1955,18 +2058,20 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     }
 
     let empty = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
+        title: "Account \u{b7} tab 1".into(),
         cli: Some(Cli::Kimi),
+        product: "Kimi",
         ..menu_facts(FactMask::default(), true)
     };
     let menu_rows = rows(Fact::Account, &empty);
     let menu = shown(&menu_rows);
     assert!(
-        menu.contains(&"note No Kimi Code CLI rotation accounts listed".to_string()),
+        menu.contains(&"note No Kimi accounts are listed on this Mac.".to_string()),
         "{menu:?}"
     );
     assert!(
-        menu.contains(&"note run aterm harness accounts add --cli kimi <label>".to_string()),
+        menu.join(" ")
+            .contains("note Add one: aterm harness accounts add --cli note kimi <label>"),
         "{menu:?}"
     );
     assert!(
@@ -1980,9 +2085,9 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
             )),
         "{menu:?}"
     );
-    let claude_empty = "note No rotation accounts configured \u{2014} run aterm init".to_string();
+    let claude_empty = "note with aterm init.".to_string();
     let claude = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
+        title: "Account \u{b7} tab 1".into(),
         cli: Some(Cli::Claude),
         ..menu_facts(FactMask::default(), true)
     };
@@ -1999,17 +2104,19 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
 #[test]
 fn a_muse_sessions_account_menu_is_its_own_login() {
     let facts = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
-        spoken: "Accounts, tab 1".into(),
-        subscription: Some("someone@example.test \u{b7} max usage".into()),
-        weekly: Some("weekly 49% used".into()),
-        own_login: Some("Muse's own login \u{2014} no rotation pool; switch with its /login"),
+        title: "Account \u{b7} tab 1".into(),
+        spoken: "Account, tab 1".into(),
+        email: Some("someone@example.test".into()),
+        plan: Some("max usage".into()),
+        own: Some(Figure::Exact(490)),
+        product: "Muse",
         refresh_usage: true,
         ..menu_facts(FactMask::default(), true)
     };
     let menu = shown(&rows(Fact::Account, &facts));
     assert!(
-        menu.iter().any(|row| row.contains("Muse's own login")),
+        menu.iter()
+            .any(|row| row.contains("Muse keeps its own login")),
         "{menu:?}"
     );
     assert!(
@@ -2024,7 +2131,6 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
         _ => true,
     }));
     let plain = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
         refresh_usage: false,
         ..facts
     };
@@ -2035,6 +2141,9 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
     );
 }
 
+// Unix only, as the manual sign-in queue a not-enrolled row's selection needs is
+// (`accounts::manual_signin_capability`): elsewhere selecting one refuses.
+#[cfg(unix)]
 #[test]
 fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_pool() {
     use aterm_agent::harness::accounts::{self, Cli};
@@ -2174,7 +2283,7 @@ fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_
     assert_eq!(codex_store.load(NOW + 5).unwrap().0, before);
 }
 
-/// THE ACCOUNT MENU'S WHY NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12): no line under
+/// THE ACCOUNT MENU'S WHY NEVER ASKS THE PERSON FOR THE WEEK: no line under
 /// the footer's reason names `/usage` or a command for the person to type; it says why the
 /// harness has no figure.
 #[test]
@@ -2202,13 +2311,13 @@ fn no_weekly_why_tells_the_person_to_open_usage() {
     }
 }
 
-/// T8 (`docs/DESIGN-accounts-outlook-2026-10-25.md` §6, §11): AN ACCOUNT ROW WITH NO FIGURE
+/// T8 (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`): AN ACCOUNT ROW WITH NO FIGURE
 /// SHOWS NO NUMBER, NEVER AN INFERRED ONE (an unread week as `0% used`, as `100% left` was):
 /// an account nobody read here (`Unseen`), one whose login is not made here but signs in by
 /// itself (`NotEnrolled` with an email), and one on record with no figure of its week (`Usable`,
-/// its login proven only) may each be spent elsewhere, so each says its condition and that its
-/// quota is unknown, and the one that signs in by itself keeps its `(auto-login)`. Negative
-/// control: an unread week given a figure (the old `100% left` fallback) restored.
+/// its login proven only) may each be spent elsewhere, so each says `not read`, or that it is not
+/// signed in, and a reader is told the one a choice signs in. Negative control: an unread week
+/// given a figure (the old `100% left` fallback) restored.
 #[test]
 fn no_row_reads_full_without_a_figure() {
     use aterm_agent::harness::accounts;
@@ -2239,7 +2348,7 @@ fn no_row_reads_full_without_a_figure() {
         .map(|r| accounts::condition(r, &state, r.dir.is_none() || r.label != "away", NOW).as_str())
         .collect();
     assert_eq!(conditions, ["unseen", "not-enrolled", "usable"]);
-    let (rows, _) = account_menu_rows_from(
+    let rows = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -2249,27 +2358,36 @@ fn no_row_reads_full_without_a_figure() {
         SessionWeek::default(),
         NOW,
     );
-    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels.len(), 3);
-    for (label, cond) in labels.iter().zip(&conditions) {
-        assert!(!label.contains('%'), "no number: {label}");
-        assert!(label.contains(cond), "its condition: {label}");
+    let trails: Vec<&str> = rows.iter().map(|row| row.trail.as_str()).collect();
+    assert_eq!(trails, ["not read", "not signed in", "not read"]);
+    for row in &rows {
+        assert!(
+            !row.standing()
+                .contains(|c: char| c == '%' || c.is_ascii_digit())
+                || row.name.contains(|c: char| c.is_ascii_digit()),
+            "no number: {row:?}"
+        );
+        assert!(!row.spoken.contains("percent"), "{row:?}");
     }
-    assert!(labels[1].ends_with("(auto-login)"), "{}", labels[1]);
-    assert!(!labels[0].ends_with("(auto-login)") && !labels[2].ends_with("(auto-login)"));
+    let signs_in: Vec<bool> = rows
+        .iter()
+        .map(|row| row.spoken.ends_with(", choosing it signs it in"))
+        .collect();
+    assert_eq!(signs_in, [false, true, false]);
 }
 
-/// NO GLASS WEEK FIGURE SAYS LEFT (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: "Use"
-/// is the owner's word, and `% left` leaves the glass). Over Account menu rows of every condition
-/// and figure (a wall, signed out and not enrolled each with and without auto-login, a fresh
-/// reading, an aged one, one of 99.5% and one of 100%, a warned week, and none), each label says
-/// its week used in the glass's forms (`39% used`, an older reading's bound `≥38% used`, a wall's
-/// `out (limited)`, `100%` only where a reading said 100) and each spoken row says it in words
-/// (`at least 38 percent used`), and no row says `left`. Negative control: the rows' words before
-/// 2026-11-07 (`row_figure`'s `61% left`, an aged one's `61% left · 3h ago`, a read 100's `0% left
-/// (limited)`) fail it.
+/// EVERY GLASS WEEK FIGURE SAYS LEFT (owner, 2026-11-09, asked "used or left": "left
+/// everywhere"; `harness::left`). Over Account menu rows of every condition and figure (a wall,
+/// signed out and not signed in each with and without a sign-in a choice starts, a fresh
+/// reading, an aged one, one of 99.5% used and one of 100%, a warned week, and none), each
+/// trail says what is left of its week (`61% left`, an older reading's bound `≤62% left`, a
+/// wall's `out`, `0% left` only where a reading said 100) or the condition that stands before
+/// any figure (`signed out`, `not signed in`, `not read`), each spoken row says it in words
+/// (`at most 62 percent left`), and no row says `used`. Negative control: the rows' words of 2026-11-07 to 2026-11-09
+/// (`row_figure`'s `39% used`, an aged one's `≥38% used`, a read 100's `100% used (limited)`)
+/// fail it.
 #[test]
-fn no_glass_week_figure_says_left() {
+fn every_glass_week_figure_says_left() {
     use aterm_agent::harness::accounts;
     const NOW: i64 = 1_790_000_000;
     let row = |label: &str, dir: &str, email: bool| accounts::Row {
@@ -2359,12 +2477,8 @@ fn no_glass_week_figure_says_left() {
             SessionWeek::default(),
             NOW,
         )
-        .0
         .into_iter()
-        .map(|row| {
-            let (label, week) = row.label.split_once(" \u{b7} pool \u{b7} ").unwrap();
-            (label.to_owned(), week.to_owned(), row.spoken)
-        })
+        .map(|row| (row.name.clone(), row.trail.clone(), row.spoken))
         .collect::<Vec<_>>()
     };
     // A row with an email is named by it (§2.5), one with none by its roster label.
@@ -2374,35 +2488,31 @@ fn no_glass_week_figure_says_left() {
         } else {
             label.to_owned()
         };
-        (
-            name.clone(),
-            week.to_owned(),
-            format!("{name}, pool, {spoken}"),
-        )
+        (name.clone(), week.to_owned(), format!("{name}, {spoken}"))
     };
     assert_eq!(
         words(true),
         [
-            said("walled", "out (limited)", "out, limited"),
-            said("fresh", "39% used", "39 percent used"),
-            said("aged", "\u{2265}38% used", "at least 38 percent used"),
-            said("nearly", "99% used", "99 percent used"),
-            said("spent", "100% used (limited)", "100 percent used, limited"),
-            said("warned", "70% used", "70 percent used"),
-            said("gone", "signed out (auto-login)", "signed out, auto-login"),
+            said("walled", "out", "out"),
+            said("fresh", "61% left", "61 percent left"),
+            said("aged", "\u{2264}62% left", "at most 62 percent left"),
+            said("nearly", "1% left", "1 percent left"),
+            said("spent", "0% left", "0 percent left"),
+            said("warned", "30% left", "30 percent left"),
+            said("gone", "signed out", "signed out, choosing it signs it in"),
             said("gone-quiet", "signed out", "signed out"),
             said(
                 "away",
-                "\u{2265}50% used (auto-login)",
-                "at least 50 percent used, auto-login"
+                "not signed in",
+                "not signed in, choosing it signs it in"
             ),
-            said("away-quiet", "not enrolled", "not enrolled"),
+            said("away-quiet", "not signed in", "not signed in"),
             said(
                 "away-unread",
-                "not-enrolled; quota unknown (auto-login)",
-                "not-enrolled, quota unknown, auto-login"
+                "not signed in",
+                "not signed in, choosing it signs it in"
             ),
-            said("unread", "usable; quota unknown", "usable, quota unknown"),
+            said("unread", "not read", "not read"),
         ]
     );
     for auto_login in [true, false] {
@@ -2412,22 +2522,22 @@ fn no_glass_week_figure_says_left() {
                 .map_or(name.as_str(), |(label, _)| label);
             let what = format!("{label} (auto-login {auto_login}): {week:?}, {spoken:?}");
             assert!(
-                !week.contains("left") && !spoken.contains("left"),
-                "the week is said used, never left: {what}"
+                !week.contains("used") && !spoken.contains("used"),
+                "the week is said left, never used: {what}"
             );
             assert!(
                 week.match_indices('%')
-                    .all(|(at, _)| week[at..].starts_with("% used")),
-                "every figure says used: {what}"
+                    .all(|(at, _)| week[at..].starts_with("% left")),
+                "every figure says left: {what}"
             );
             assert!(
-                !spoken.contains(['%', '\u{2265}']),
+                !spoken.contains(['%', '\u{2264}', '\u{2265}']),
                 "a reader hears the figure in words: {what}"
             );
             assert_eq!(
-                week.contains("100%"),
+                week.starts_with("0% left"),
                 label == "spent",
-                "100% only where a reading said 100: {what}"
+                "nothing left only where a reading said 100: {what}"
             );
             if label == "walled" {
                 assert!(

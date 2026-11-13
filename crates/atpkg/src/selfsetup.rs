@@ -11,6 +11,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+#[path = "selfsetup_app_swap.rs"]
+mod app_swap;
+#[cfg(target_os = "macos")]
+pub use app_swap::verb as app_swap_verb;
+
 /// Start marker of the managed shell-profile block.
 pub const PATH_BLOCK_START: &str = "# >>> aterm ALab toolset (managed by install.sh) >>>";
 /// End marker of the managed shell-profile block.
@@ -464,8 +470,7 @@ fn bundle_programs(app: &Path) -> Result<Vec<PathBuf>, String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot read an entry in {}: {e}", dir.display()))?;
         let path = entry.path();
-        let metadata = entry
-            .metadata()
+        let metadata = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
             programs.push(path);
@@ -917,6 +922,32 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
         })
 }
 
+struct UninstallHelper {
+    root: PathBuf,
+    program: PathBuf,
+    args: &'static [&'static str],
+    stored: bool,
+}
+
+fn uninstall_helper(p: &Places) -> Option<UninstallHelper> {
+    if let Some(app) = uninstall_bundle(p) {
+        return Some(UninstallHelper {
+            program: app.join("Contents/MacOS/atpkg"),
+            root: app,
+            args: &["uninstall", "--all"],
+            stored: false,
+        });
+    }
+    let program = p.store_dir.join("aterm");
+    let run_as = runs_as(aterm_uds::peer::our_uid(), &p.home, &program);
+    (store_left(p).is_none() && answers_as_aterm(&program, run_as)).then(|| UninstallHelper {
+        root: program.clone(),
+        program,
+        args: &["pkg", "uninstall", "--all"],
+        stored: true,
+    })
+}
+
 const CAFFEINE_CODE: &str = "acaffeine-code.noindex";
 
 /// aCaffeine's files under the support folder.
@@ -991,6 +1022,21 @@ fn label_of(label: &str, installed: &str) -> bool {
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
+}
+
+/// The login job that resumes an unfinished first-run setup with no window
+/// (`aterm_types::macos_setup::SETUP_RESUME_LABEL`): its definition runs the aterm this sweep
+/// removes, so one left behind would fail at every login. It goes as an old Caffeine login item
+/// does, the job launchd loaded ending with this login; a sweep that leaves an aterm outside its
+/// scope leaves it for that one.
+fn sweep_setup_job(s: &mut Sweep<'_>, p: &Places) {
+    let plist = p.home.join("Library/LaunchAgents").join(format!(
+        "{}.plist",
+        aterm_types::macos_setup::SETUP_RESUME_LABEL
+    ));
+    if std::fs::symlink_metadata(&plist).is_ok_and(|meta| meta.is_file()) {
+        s.rm_shared(&plist, "setup login item");
+    }
 }
 
 /// What the mug left under its old name, which no build since 0.145.0 has as a verb, so no helper
@@ -1728,25 +1774,24 @@ fn self_uninstall_with_acaffeine(
     let decline_before = present(&decline) && !decline_tagged;
     let app_dirs = p.app_dirs();
 
-    let atpkg_app = uninstall_bundle(p);
+    let atpkg_helper = uninstall_helper(p);
     let mut swept = false;
     let mut atpkg_kept: Option<PathBuf> = None;
     // The atpkg whose run this sweep saw exit: past macOS's check of it.
     let mut atpkg_proven: Option<PathBuf> = None;
-    match (&atpkg_app, s.outsider.is_some()) {
+    match (&atpkg_helper, s.outsider.is_some()) {
         (Some(_), true) => {
             s.say("left in place: the ALab toolchain store");
             s.kept += 1;
             s.shared_kept += 1;
         }
-        (Some(app), false) => {
-            let atpkg = app.join("Contents/MacOS/atpkg");
+        (Some(helper), false) => {
+            let app = &helper.root;
+            let atpkg = helper.program.clone();
+            let invocation = format!("{} {}", atpkg.display(), helper.args.join(" "));
             if dry {
                 let act = s.act();
-                s.say(&format!(
-                    "{act} the ALab toolchain store: {} uninstall --all",
-                    atpkg.display()
-                ));
+                s.say(&format!("{act} the ALab toolchain store: {invocation}"));
                 s.removed += 1;
                 swept = true;
             } else {
@@ -1760,16 +1805,13 @@ fn self_uninstall_with_acaffeine(
                 let mut cmd = match run_as {
                     RunAs::Account(uid) => {
                         let mut cmd = aterm_uds::spawnfd::command(Path::new(SUDO));
-                        cmd.env("LC_ALL", "C").args(as_account_argv(
-                            uid,
-                            &atpkg,
-                            &["uninstall", "--all"],
-                        ));
+                        cmd.env("LC_ALL", "C")
+                            .args(as_account_argv(uid, &atpkg, helper.args));
                         cmd
                     }
                     RunAs::Me | RunAs::Nobody => {
                         let mut cmd = aterm_uds::spawnfd::command(&atpkg);
-                        cmd.args(["uninstall", "--all"]);
+                        cmd.args(helper.args);
                         cmd
                     }
                 };
@@ -1842,11 +1884,13 @@ fn self_uninstall_with_acaffeine(
                     s.skip(
                         "the ALab toolchain store",
                         &format!(
-                            "`{} uninstall --all` could not run (exit {rc}) — reinstall aterm, \
-                             then uninstall again",
-                            atpkg.display()
+                            "`{invocation}` could not run (exit {rc}) — reinstall aterm, \
+                             then uninstall again"
                         ),
                     );
+                    if helper.stored {
+                        atpkg_kept = Some(app.clone());
+                    }
                 } else {
                     let why = match ran {
                         Err(why) => why,
@@ -1860,9 +1904,8 @@ fn self_uninstall_with_acaffeine(
                     s.skip(
                         "the ALab toolchain store",
                         &format!(
-                            "`{} uninstall --all`: {why}; {} is kept for it — then uninstall \
+                            "`{invocation}`: {why}; {} is kept for it — then uninstall \
                              again",
-                            atpkg.display(),
                             app.display()
                         ),
                     );
@@ -1873,7 +1916,11 @@ fn self_uninstall_with_acaffeine(
         (None, _) => {}
     }
 
-    let acaffeine_kept = acaffeine(&mut s, p, &app_dirs);
+    let mut acaffeine_kept = acaffeine(&mut s, p, &app_dirs);
+    if let Some(kept) = &atpkg_kept {
+        acaffeine_kept.push(kept.clone());
+    }
+    sweep_setup_job(&mut s, p);
 
     for dir in &app_dirs {
         for name in ["aterm.app", "aterm.app.rollback"] {
@@ -2098,7 +2145,7 @@ fn self_uninstall_with_acaffeine(
     let removed = s.removed;
     s.say(&format!("{verb} complete — {removed} item(s){tail}"));
     let settings = p.xdg_config.join("aterm");
-    if swept || (atpkg_app.is_some() && s.outsider.is_some()) {
+    if swept || (atpkg_helper.is_some() && s.outsider.is_some()) {
         s.say(&format!(
             "left in place: your settings and themes in {}",
             settings.display()

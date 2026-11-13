@@ -137,75 +137,17 @@ fn under_home(
 fn zshenv_safe(
     home: &Path,
     file: &Path,
-    mut metadata: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
-    mut read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+    metadata: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
 ) -> Result<(), String> {
-    use std::path::Component;
-    let protected = |path: &Path| crate::protected::under_protected_root(home, path);
-    let parts = |path: &Path| {
-        path.components()
-            .map(|part| part.as_os_str().to_os_string())
-            .collect::<std::collections::VecDeque<_>>()
-    };
-    let named = lexical(file).ok_or_else(|| "its path is not absolute".to_owned())?;
-    if protected(&named) {
-        return Err("it is under a folder macOS guards with a consent dialog".to_owned());
+    let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let (_, metadata) = crate::protected::resolve_path(&canonical_home, file, metadata, read_link)
+        .map_err(|why| why.to_string())?;
+    if metadata.is_some_and(|meta| meta.is_file()) {
+        Ok(())
+    } else {
+        Err("it is not a regular zshenv file".to_owned())
     }
-    let mut pending = parts(file);
-    let mut resolved = PathBuf::new();
-    let mut links = 0;
-    while let Some(part) = pending.pop_front() {
-        match Path::new(&part).components().next() {
-            Some(Component::Prefix(_) | Component::RootDir) => {
-                resolved.push(part);
-                continue;
-            }
-            Some(Component::CurDir) => continue,
-            Some(Component::ParentDir) => {
-                resolved.pop();
-                continue;
-            }
-            Some(Component::Normal(_)) => {}
-            None => return Err("its path has an empty component".to_owned()),
-        }
-        let next = resolved.join(&part);
-        if protected(&next) {
-            return Err("it resolves under a folder macOS guards with a consent dialog".to_owned());
-        }
-        let meta =
-            metadata(&next).map_err(|error| format!("its path cannot be checked ({error})"))?;
-        if meta.file_type().is_symlink() {
-            links += 1;
-            if links > 32 {
-                return Err("its path has too many symbolic links".to_owned());
-            }
-            let target = read_link(&next)
-                .map_err(|error| format!("its symbolic link cannot be read ({error})"))?;
-            let target = if target.is_absolute() {
-                target
-            } else {
-                resolved.join(target)
-            };
-            let named = lexical(&target)
-                .ok_or_else(|| "its symbolic link has no absolute target".to_owned())?;
-            if protected(&named) {
-                return Err(
-                    "it resolves under a folder macOS guards with a consent dialog".to_owned(),
-                );
-            }
-            let mut target_parts = parts(&target);
-            target_parts.append(&mut pending);
-            pending = target_parts;
-            resolved = PathBuf::new();
-        } else if pending.is_empty() && meta.is_file() {
-            return Ok(());
-        } else if meta.is_dir() && !pending.is_empty() {
-            resolved = next;
-        } else {
-            return Err("it is not a regular zshenv file".to_owned());
-        }
-    }
-    Err("it is not a regular zshenv file".to_owned())
 }
 
 /// Where zsh reads `.zshrc` from.
@@ -319,10 +261,9 @@ pub(crate) fn resolve(
     if zshenv.is_empty() {
         return ZshDir::Home;
     }
-    let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     for file in zshenv {
         if let Err(why) = zshenv_safe(
-            &canonical_home,
+            home,
             file,
             |path| std::fs::symlink_metadata(path),
             |path| std::fs::read_link(path),
@@ -352,14 +293,21 @@ fn named(home: &Path, dir: PathBuf) -> ZshDir {
     }
 }
 
-/// The zshenv files under `home`'s account that exist, in zsh's order.
+/// The zshenv paths under `home`'s account not known to be missing, in zsh's order.
+/// Inspection errors stay in the inventory so [`resolve`] can refuse an unknown startup path
+/// instead of assuming no file sets `ZDOTDIR` and wiring the wrong `.zshrc`.
 #[must_use]
 pub(crate) fn zshenv_files(home: &Path) -> Vec<PathBuf> {
     SYSTEM_ZSHENV
         .iter()
         .map(PathBuf::from)
         .chain(std::iter::once(home.join(".zshenv")))
-        .filter(|file| std::fs::symlink_metadata(file).is_ok())
+        .filter(|file| {
+            !matches!(
+                std::fs::symlink_metadata(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
         .collect()
 }
 

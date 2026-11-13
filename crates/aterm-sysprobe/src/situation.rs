@@ -24,15 +24,17 @@
 //!   wake times and the power manager's reason for that sleep (`Last Sleep Reason`, which it
 //!   keeps for the last sleep only), and the lid again.
 //!
-//! Off macOS there is no reader for any of them yet ([`LID_READER`] and its siblings say so),
-//! and every value is `None`.
+//! On Windows the power source and the battery are read (`GetSystemPowerStatus`, at each
+//! reading: [`crate::power::windows`]); the lid, the displays and the last sleep have no reader
+//! there yet. On Linux there is no reader for any of them ([`LID_READER`] and its siblings say
+//! so), and every value is `None`.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Whether this OS has a lid reader.
 pub const LID_READER: bool = cfg!(target_os = "macos");
 /// Whether this OS has a power-source reader.
-pub const POWER_READER: bool = cfg!(target_os = "macos");
+pub const POWER_READER: bool = cfg!(any(target_os = "macos", windows));
 /// Whether this OS has an external-display reader: Apple silicon's display pipes. An Intel Mac
 /// publishes none, so it has no reader rather than a count that always reads zero.
 pub const DISPLAY_READER: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
@@ -279,7 +281,9 @@ impl PowerLatch {
 }
 
 /// The power sources, read on change: two check tokens a reading checks, and the reads they
-/// gate ([`PowerLatch`]). Off macOS it reads nothing.
+/// gate ([`PowerLatch`]). Windows posts no such token to a process without a window, so there
+/// every reading reads `GetSystemPowerStatus`, which asks no other process. On Linux it reads
+/// nothing.
 #[derive(Debug)]
 pub struct PowerWatch {
     latch: PowerLatch,
@@ -312,7 +316,16 @@ impl PowerWatch {
                 crate::situation_macos::adapter_watts,
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        {
+            let posted = Posted {
+                source: false,
+                charge: true,
+            };
+            let read = crate::power::windows::power_reading;
+            self.latch.step(posted, now_ms, read, || None)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             self.latch.step(Posted::default(), now_ms, || None, || None)
         }
@@ -335,7 +348,11 @@ pub fn power_sources() -> Option<PowerReading> {
     {
         crate::situation_macos::power_reading()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        crate::power::windows::power_reading()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         None
     }

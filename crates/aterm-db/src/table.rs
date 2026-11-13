@@ -180,13 +180,35 @@ pub struct Session<'a> {
     history: std::cell::RefCell<std::collections::BTreeMap<Digest, Historical>>,
     generation: Option<crate::generation::Observation>,
     generation_deadline: Option<std::time::Instant>,
-    /// The look at this session's vault its checks judge through, where its admission kept one
-    /// ([`Self::keep_look`]): a table-repair read batch's, standing on the batch's source read of
-    /// the vault, so the batch is one moment of it, and the source read of the vault its store
-    /// opens and store read batches take ([`Self::local_source_reads`]); or a retained
-    /// subscriber's ([`Self::retain_selected`]), standing on its retained source read.
-    /// `None` for every other session, whose checks each observe the vault on their own call.
-    look: Option<aterm_secrets::client::VaultLook<'a>>,
+    /// The look at this session's vault its checks judge through ([`Self::look`]), where its
+    /// admission kept one or was lent one: a table-repair read batch's, standing on a source read
+    /// of the vault held from before the batch's admission until the batch returns, so the batch
+    /// is one moment of it, and the source read of the vault its store opens and store read
+    /// batches take ([`Self::local_source_reads`]); or a retained subscriber's
+    /// ([`Self::retain_selected`]), standing on its retained source read. `None` for every other
+    /// session, whose checks each observe the vault on their own call.
+    look: Option<SessionLook<'a>>,
+}
+
+/// The look a session's checks judge through ([`Session::keep_look`], [`Session::lend_look`]).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a session holds the look it keeps inline, as it did before a look could be lent; \
+              boxing it would allocate at every kept look"
+)]
+enum SessionLook<'a> {
+    /// Its own: a retained subscriber's ([`Session::retain_selected`]), and a table-repair read
+    /// batch's admitted outside a round group (`replica::GroupLook`): the mesh's rounds and a
+    /// round a test builds directly, and, in a round with a group, a read the group does not take
+    /// (a writer generation's candidate home, a read of more than one source or of another vault:
+    /// `Replica::lead`) or one inside another admission's batch, whose batch's own source read the
+    /// look stands on.
+    Kept(aterm_secrets::client::VaultLook<'a>),
+    /// A table-repair read batch's admitted through its round's group (`replica::GroupLook`):
+    /// the group's look, which an earlier read admission's source read stands under and which
+    /// the group kept for it, or the batch's own source read's, which the group keeps after the
+    /// batch where the batch succeeded and its glance first saw the control anchor settled.
+    Lent(&'a aterm_secrets::client::VaultLook<'a>),
 }
 
 /// `bootstrap`'s custody checked again ([`Bootstrap::revalidate_custody`]), the vault observed,
@@ -215,19 +237,25 @@ thread_local! {
     /// (`Session::current_in`: a peer's, an observation's, an endpoint's context, a writer's;
     /// `Session::current_observed`: a store's context, `Session::context`), and a peer's roster
     /// (`Session::peer_member_in`). A check handed a look, or judged through the look its session
-    /// keeps ([`Session::keep_look`]), counts as served by it, though where the look observes
+    /// keeps or was lent ([`Session::look`]), counts as served by it, though where the look observes
     /// nothing or looks at another vault `aterm-secrets` answers on its own call uncounted; a
     /// peer's roster read on its own call because its look is at another vault counts. A session's
-    /// other checks (a store read batch's custody, its opening and closing context
-    /// (`Session::read_context`, asked afresh by design), its records' keys and history, ...) are
-    /// not counted.
+    /// other checks (a store read batch's opening fence (`Session::read_context`, asked afresh by
+    /// design), its closing (`Session::close_read`, whose custody and currency are judged through a
+    /// look of its own, made after the read, and whose fence's context (`Session::fenced`) is
+    /// asked afresh where the session has a generation or is not log-backed), its records' keys
+    /// and history, ...) are not counted.
     pub(crate) static OWN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many of this thread's store read batch fences (`Session::read_context`'s context)
-    /// asked the session's currency afresh, on their own calls, as they do whatever look the
-    /// session keeps.
+    /// How many of this thread's store read batch fences (`Session::fenced`'s context, at
+    /// `Session::read_context` and `Session::close_read`) asked the session's currency afresh, on
+    /// their own calls, as they do whatever look the session keeps.
     pub(crate) static FENCES_AFRESH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many store read batch fences (`Session::read_context`) this thread asked.
+    /// How many store read batch fences (`Session::read_context`, `Session::close_read`) this
+    /// thread asked.
     pub(crate) static FENCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many store read batch closings this thread judged through a look of their own
+    /// (`Session::close_read`).
+    pub(crate) static CLOSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many keys this thread's store read batches reused and checked again, afresh, before
     /// returning (`ReadBatch::revalidate`).
     pub(crate) static KEYS_REVALIDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -257,15 +285,16 @@ enum ControlHead {
 
 struct ReadKey {
     value: Zeroizing<[u8; 32]>,
+    identity: std::cell::OnceCell<crypto::PayloadKeyIdentity>,
     reused: bool,
 }
 
 type ReadKeys = std::cell::RefCell<std::collections::BTreeMap<Digest, ReadKey>>;
 
 /// Local source guards bound to the exact session they protect. Reusing these
-/// guards avoids nesting read locks behind a waiting vault writer. Where the session keeps a look
-/// that holds its vault (a table-repair read batch's, [`Session::keep_look`]), that look is this
-/// vault's guard, and the borrow of the session keeps it for as long as these guards live.
+/// guards avoids nesting read locks behind a waiting vault writer. Where the session keeps or was
+/// lent a look that holds its vault (a table-repair read batch's, [`Session::look`]), that look is
+/// this vault's guard, and the borrow of the session keeps it for as long as these guards live.
 struct SourceReads<'s, 'b> {
     session: &'s Session<'b>,
     _reads: Vec<aterm_secrets::client::CommonsSourceRead>,
@@ -287,11 +316,7 @@ impl SourceReads<'_, '_> {
         let result = read(&batch)?;
         batch.revalidate()?;
         drop(batch);
-        self.session
-            .bootstrap
-            .revalidate_custody()
-            .map_err(failure)?;
-        self.session.read_context(scope)?;
+        self.session.close_read(scope)?;
         Ok(result)
     }
 
@@ -335,7 +360,7 @@ impl ReadBatch<'_, '_> {
             return Err(Error::snapshot_changed());
         }
         if let Some(keys) = &self.keys {
-            // Asked afresh, on their own calls, as the batch's fences are, whatever look its
+            // Asked afresh, on their own calls, as the batch's opening fence is, whatever look its
             // session keeps.
             let histories = self.session.history.borrow();
             for (roster, key) in &*keys.borrow() {
@@ -359,6 +384,50 @@ impl ReadBatch<'_, '_> {
         self.session
             .decode_envelope(self.scope, envelope, false, self.keys.as_ref())?
             .ok_or_else(|| Error::new("table payload authentication failed"))
+    }
+
+    /// Replay needs the authenticated header and cutoff, never an application's plaintext.
+    /// Only a non-cutoff fact can be reused, after the same historical grant and current key
+    /// read as a full opening. The enclosing batch still revalidates reused keys and custody.
+    fn replay_metadata(
+        &self,
+        wire: &signatures::Identified,
+        envelope: Envelope<'_>,
+    ) -> Result<(Header, Option<store::cutoff::Cut>)> {
+        if envelope.header.id != wire.id() {
+            return Err(Error::new(
+                "replay envelope differs from identified ciphertext",
+            ));
+        }
+        let cut = self
+            .session
+            .with_payload_key(
+                self.scope,
+                &envelope,
+                false,
+                self.keys.as_ref(),
+                |key, identity| {
+                    let identity = identity.get_or_init(|| crypto::payload_key_identity(key));
+                    if wire.verified_non_cut(identity) {
+                        return Ok(Some(None));
+                    }
+                    let mut payload = Zeroizing::new(envelope.body.to_vec());
+                    let opened = crypto::cipher(key, &envelope.salt, envelope.aad)?
+                        .open_in_place(
+                            aead::Nonce::assume_unique_for_key([0; 12]),
+                            aead::Aad::from(envelope.aad),
+                            &mut payload,
+                        )
+                        .ok()
+                        .map(|plain| store::cutoff::decode(plain));
+                    if matches!(opened, Some(None)) {
+                        wire.remember_non_cut(*identity);
+                    }
+                    Ok(opened)
+                },
+            )?
+            .ok_or_else(|| Error::new("table payload authentication failed"))?;
+        Ok((envelope.header, cut))
     }
 }
 
@@ -475,7 +544,7 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
-        self.observation_in(self.look.as_ref())
+        self.observation_in(self.look())
     }
 
     /// [`Self::observation`], its currency judged through `look` where given
@@ -526,11 +595,7 @@ impl<'a> Session<'a> {
     /// Every current member's binding, for an application that names who has answered.
     pub(crate) fn members(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
         let deadline = crate::admission::deadline();
-        let roster = match self
-            .look
-            .as_ref()
-            .filter(|look| look.paths() == self.paths())
-        {
+        let roster = match self.look().filter(|look| look.paths() == self.paths()) {
             Some(look) => look.swarm_roster_until(deadline),
             None => aterm_secrets::client::swarm_roster_until(self.paths(), deadline),
         }
@@ -562,7 +627,7 @@ impl<'a> Session<'a> {
     /// Whether this session's access is current, judged through the look it keeps where it keeps
     /// one ([`Self::current_in`]).
     fn current(&self) -> bool {
-        self.current_in(self.look.as_ref())
+        self.current_in(self.look())
     }
 
     /// Whether this session's access is current ([`Access::is_current`]), judged through `look`
@@ -581,7 +646,7 @@ impl<'a> Session<'a> {
     /// [`Access::is_current_observed`], judged through the look this session keeps where it keeps
     /// one ([`Access::is_current_observed_in`]).
     fn current_observed(&self) -> Result<bool> {
-        match &self.look {
+        match self.look() {
             Some(look) => self.access.is_current_observed_in(&self.journal, look),
             None => {
                 #[cfg(test)]
@@ -593,12 +658,18 @@ impl<'a> Session<'a> {
     }
 
     /// Keep `look`, the look at this session's vault its admission judged through, for every check
-    /// this session makes after it until the session drops: a table-repair read batch's, which
-    /// stands on the batch's source read of the vault (`Replica::observe`), so the batch's own
-    /// checks of its currency, its store contexts and its peers' roster stand for the moment its
-    /// admission judged, as its admission's did, and its store opens and store read batches hold
-    /// the vault through it ([`Self::local_source_reads`]); or a retained subscriber's, which
-    /// stands on its retained source read of the vault ([`Self::retain_selected`]).
+    /// this session makes after it until the session drops: a table-repair read batch's admitted
+    /// outside a round group (`Replica::admit`: the mesh's rounds, which take no group; a round a
+    /// test builds directly; and, in a round with a group, a writer generation's candidate home, a
+    /// read of more than one source or of another vault, which the group does not take
+    /// (`Replica::lead`), and one inside another admission's batch), which stands on the batch's
+    /// source read of the vault, so
+    /// the batch's own checks of its currency, its store contexts and its peers' roster stand for
+    /// the moment its admission judged, as its admission's did, and its store opens and store read
+    /// batches hold the vault through it ([`Self::local_source_reads`]); or a retained
+    /// subscriber's, which stands on its retained source read of the vault
+    /// ([`Self::retain_selected`]). A read batch admitted through its round's group is lent the
+    /// look instead ([`Self::lend_look`]).
     ///
     /// # Errors
     ///
@@ -606,17 +677,72 @@ impl<'a> Session<'a> {
     /// each check a write makes observes the vault on its own call, so a write is judged by the
     /// vault as it stands, never by the moment its admission looked.
     pub(crate) fn keep_look(&mut self, look: aterm_secrets::client::VaultLook<'a>) -> Result<()> {
+        self.reader()?;
+        self.look = Some(SessionLook::Kept(look));
+        Ok(())
+    }
+
+    /// Judge every check this session makes after it, until the session drops, through `look`,
+    /// the look at this session's vault its admission judged through, which outlives the session:
+    /// a table-repair read batch's admitted through its round's group (`replica::GroupLook`),
+    /// standing on a source read of the vault held from before the admission until after the
+    /// batch returns (the group's first admission's, which the group keeps for the read
+    /// admissions after it, where it keeps one, until the group ends). The batch's checks stand
+    /// for the moment its admission judged, and its store opens and store read batches hold the
+    /// vault through it, as through a look it keeps ([`Self::keep_look`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::keep_look`]: a session that holds the control journal's writer lock is lent no
+    /// look.
+    pub(crate) fn lend_look(
+        &mut self,
+        look: &'a aterm_secrets::client::VaultLook<'a>,
+    ) -> Result<()> {
+        self.reader()?;
+        self.look = Some(SessionLook::Lent(look));
+        Ok(())
+    }
+
+    /// Refuse a session that holds the control journal's writer lock a look
+    /// ([`Self::keep_look`], [`Self::lend_look`]).
+    fn reader(&self) -> Result<()> {
         if self.journal.is_writer() {
             return Err(Error::new(
                 "a table writer session judges each check on its own call and keeps no look",
             ));
         }
-        self.look = Some(look);
         Ok(())
     }
 
+    /// The look this session's checks judge through, where it keeps one ([`Self::keep_look`]) or
+    /// was lent one ([`Self::lend_look`]).
+    pub(crate) fn look(&self) -> Option<&aterm_secrets::client::VaultLook<'a>> {
+        match self.look.as_ref()? {
+            SessionLook::Kept(look) => Some(look),
+            SessionLook::Lent(look) => Some(look),
+        }
+    }
+
+    /// Whether this session's bootstrap still stands ([`Bootstrap::stands`]): where it judges
+    /// through a look it keeps or was lent ([`Self::look`]), its vault observation and pinned
+    /// files' digests through that look, and its control journal by the control view its
+    /// admission read, so as its admission judged them, and the rest (the vault's folders, its
+    /// custody locks and its creation claim) as they stand now ([`Bootstrap::stands_in`]);
+    /// otherwise all of it on its own calls, as the vault stands now.
+    ///
+    /// # Errors
+    /// As [`Bootstrap::stands`] or [`Bootstrap::stands_in`].
+    pub(crate) fn bootstrap_stands(&self) -> Result<()> {
+        match self.look() {
+            Some(look) => self.bootstrap.stands_in(look, &self.journal),
+            None => self.bootstrap.stands(),
+        }
+        .map_err(failure)
+    }
+
     fn peer_member(&self, actor: Actor) -> Result<&aterm_secrets::commons::roster::Member> {
-        self.peer_member_in(actor, self.look.as_ref())
+        self.peer_member_in(actor, self.look())
     }
 
     /// [`Self::peer_member`], the session's currency judged, and its roster read, through `look`
@@ -655,7 +781,7 @@ impl<'a> Session<'a> {
 
     /// Current peer membership for an already channel-authenticated actor.
     pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
-        self.peer_in(actor, self.look.as_ref())
+        self.peer_in(actor, self.look())
     }
 
     /// [`Self::peer`], the session's currency judged, and its roster read, through `look` where
@@ -841,7 +967,7 @@ impl<'a> Session<'a> {
         // derived from its `[everyone]` epochs (one-mesh M6): a member admitted after one holds
         // no `Wrap` of it and asks a peer for its table key.
         if self.access.is_log_backed()
-            && let Some((log, _)) = match self.look.as_ref() {
+            && let Some((log, _)) = match self.look() {
                 Some(look) if look.paths() == self.bootstrap.paths() => {
                     look.trusted_commons_log(self.bootstrap.trust())
                 }
@@ -871,17 +997,14 @@ impl<'a> Session<'a> {
         // answers and the handoffs it opens; a fallback to the control journal still checks the
         // membership for each id. A table-repair read batch's lease, its membership checks (the
         // lease's and the control journal's) and its reads of the log judge through the look its
-        // session keeps; a handoff it opens checks on its own calls. It asks whether each opens, not for its key: an epoch this Mac
+        // session keeps or was lent; a handoff it opens checks on its own calls. It asks whether each opens, not for its key: an epoch this Mac
         // opened under the same log is answered without its key unwrapped again, and no asked
         // epoch's key is kept, so this round's asks leave the keys its table reads take where those
         // find them. An epoch this Mac holds only through a handoff opens the handoff at each ask,
         // which reads the handoff's issuance epoch through the kept keys as the historical reads do.
-        let held = self.bootstrap.holds_histories_in(
-            &self.journal,
-            &self.access,
-            &unknown,
-            self.look.as_ref(),
-        );
+        let held =
+            self.bootstrap
+                .holds_histories_in(&self.journal, &self.access, &unknown, self.look());
         let needed = unknown
             .into_iter()
             .zip(held)
@@ -1027,6 +1150,30 @@ impl<'a> Session<'a> {
         Self::from_observed_journal_in(bootstrap, journal, None, look)
     }
 
+    /// [`Self::observe_in`] through `look`, a look at this session's vault taken before this
+    /// session's own control journal read, which earlier admissions asked through (a
+    /// table-repair round group's, `replica::GroupLook`): the control journal read first, as
+    /// `observe_in` reads it, then `stands` asked, and the session opened through the look only
+    /// where it holds; `None` where it does not, with nothing else judged. The round asks there
+    /// whether the look's observation still guards the state lock at the vault's path and the look
+    /// still shows the control anchor as it first saw it, so the files the lock guards, and the
+    /// anchor the journal read reads, stand for this session as of after that read.
+    ///
+    /// # Errors
+    /// As [`Self::observe_in`].
+    pub(crate) fn observe_after_in(
+        bootstrap: &'a Bootstrap,
+        look: &aterm_secrets::client::VaultLook<'_>,
+        stands: impl FnOnce() -> bool,
+    ) -> Result<Option<Self>> {
+        let journal =
+            Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        if !stands() {
+            return Ok(None);
+        }
+        Self::from_observed_journal_in(bootstrap, journal, None, Some(look)).map(Some)
+    }
+
     /// [`Self::observe`] by `deadline`, which bounds each wait of a successor home's predecessor
     /// observation and stays this session's bound on its later generation checks.
     pub(crate) fn observe_until(
@@ -1164,28 +1311,6 @@ impl<'a> Session<'a> {
         Self::with_generation(bootstrap, journal, generation, Some(read_by), None)
     }
 
-    /// A writer session whose caller retains every ancestor control writer and
-    /// vault source. Reuse its non-repairing generation observation instead of
-    /// reopening ancestor custody through the writer-succession repair path.
-    pub(crate) fn admit_selected(
-        bootstrap: &'a Bootstrap,
-        journal: Journal,
-        selection: crate::generation::Observation,
-        deadline: std::time::Instant,
-    ) -> Result<Self> {
-        if journal.directory() != bootstrap.journal_dir()
-            || !journal.is_writer()
-            || selection.paths() != bootstrap.paths()
-        {
-            return Err(Error::new(
-                "application admission belongs to another custody",
-            ));
-        }
-        bootstrap.revalidate_custody().map_err(failure)?;
-        selection.check(true, false, deadline)?;
-        Self::with_generation(bootstrap, journal, Some(selection), Some(deadline), None)
-    }
-
     /// A current subscriber backed by retained source/control custody. The
     /// caller keeps control guards separately; this journal grants no writer.
     pub(crate) fn retain_selected(
@@ -1219,13 +1344,15 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn retained_look(&self) -> Option<&aterm_secrets::client::VaultLook<'a>> {
-        self.look.as_ref()
+        self.look()
     }
 
     /// Current read authorization, including completed generation and local
     /// recipient denial, without conferring table-authoring or ingestion rights.
+    /// A retained subscriber stays strict: its home may not be fenced by a succession of its own,
+    /// even one whose import never completed, since a retained session can persist a projection.
     pub(crate) fn subscriber(&self, deadline: std::time::Instant) -> Result<()> {
-        self.require_current_application_generation(deadline)?;
+        self.require_completed_application_generation(deadline)?;
         if !self.current_observed()?
             || !self
                 .members()?
@@ -1452,11 +1579,12 @@ impl<'a> Session<'a> {
         Scope::fresh(self.journal.trust())
     }
     fn local_source_reads(&self) -> Result<SourceReads<'_, 'a>> {
-        // A table-repair read batch's session keeps the look its admission judged through, which
-        // stands on the batch's own source read of this vault until the batch returns: that read
-        // holds the vault for each store open and store read batch too, its custody judged
+        // A table-repair read batch's session keeps, or was lent, the look its admission judged
+        // through, which stands on a source read of this vault held from before the admission
+        // until the batch returns (the batch's own, or its round group's first admission's): that
+        // read holds the vault for each store open and store read batch too, its custody judged
         // through the look.
-        let own = match &self.look {
+        let own = match self.look() {
             Some(look) => self.bootstrap.local_source_read_in(look),
             None => self.bootstrap.local_source_read().map(Some),
         }
@@ -1476,7 +1604,7 @@ impl<'a> Session<'a> {
     }
 
     /// [`Self::context`], its currency asked on its own call where `afresh`, whatever look the
-    /// session keeps: a store read batch's opening and closing fences ([`Self::read_context`]).
+    /// session keeps: a store read batch's opening and closing fences ([`Self::fenced`]).
     fn context_judged(&self, scope: Scope, afresh: bool) -> Result<()> {
         if self.generation.is_some() {
             self.generation_guard(false)?;
@@ -1561,12 +1689,26 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Require the selected completed application generation for one local read.
-    /// This grants no writer role and does not change historical read semantics.
+    /// Require, for one local read, that every predecessor of this session's home completed its
+    /// succession ([`crate::generation::Observation::check_read`]). A home whose own writer
+    /// recovery is pending still reads the records it holds. This grants no writer role and
+    /// does not change historical read semantics.
     pub(crate) fn require_current_application_generation(
         &self,
         deadline: std::time::Instant,
     ) -> Result<()> {
+        let deadline = self
+            .generation_deadline
+            .map_or(deadline, |bound| bound.min(deadline));
+        match &self.generation {
+            Some(observation) => observation.check_read(deadline),
+            None => crate::generation::guard_read_until(self.paths(), deadline),
+        }
+    }
+
+    /// [`Self::require_current_application_generation`] as authoring judges it: every
+    /// generation complete and this home not fenced by a succession of its own.
+    fn require_completed_application_generation(&self, deadline: std::time::Instant) -> Result<()> {
         let deadline = self
             .generation_deadline
             .map_or(deadline, |bound| bound.min(deadline));
@@ -1768,6 +1910,9 @@ impl<'a> Session<'a> {
         self.local_source_reads()?.with_read_batch(scope, read)
     }
 
+    /// A store read batch's opening fence: the control journal read again, its inventory held to
+    /// the session's and the session's currency asked afresh, on their own calls, then
+    /// [`Self::fenced`].
     fn read_context(&self, scope: Scope) -> Result<()> {
         #[cfg(test)]
         FENCES.set(FENCES.get() + 1);
@@ -1778,6 +1923,42 @@ impl<'a> Session<'a> {
         if !current.inventory().eq(self.journal.inventory()) || !self.access.is_current(&current) {
             return Err(Error::snapshot_changed());
         }
+        self.fenced(scope, &current)
+    }
+
+    /// A store read batch's closing, once its read and its reused keys' checks are done: the
+    /// control journal read again, then the bootstrap's custody and the session's currency judged
+    /// through one look at the vault of its own ([`aterm_secrets::client::VaultLook::new`]), with
+    /// the journal's inventory held to the session's, then [`Self::fenced`]. The look is made
+    /// after the batch's read and the journal read, so its glance's first look at each file
+    /// follows both; never the session's kept look, whose first looks came before the read.
+    fn close_read(&self, scope: Scope) -> Result<()> {
+        #[cfg(test)]
+        {
+            FENCES.set(FENCES.get() + 1);
+            CLOSES.set(CLOSES.get() + 1);
+        }
+        let current = Journal::read_existing(self.bootstrap.journal_dir(), self.bootstrap.trust())
+            .map_err(failure)?;
+        {
+            let look = aterm_secrets::client::VaultLook::new(self.bootstrap.paths());
+            self.bootstrap
+                .revalidate_custody_in(&look)
+                .map_err(failure)?;
+            // As at the opening fence: a changed prefix needs a fresh complete observation.
+            if !current.inventory().eq(self.journal.inventory())
+                || !self.access.is_current_in(&current, &look)
+            {
+                return Err(Error::snapshot_changed());
+            }
+        } // The look ends before `fenced`'s generation check, which can wait, asks on its own call.
+        self.fenced(scope, &current)
+    }
+
+    /// What both of a store read batch's fences ([`Self::read_context`], [`Self::close_read`])
+    /// ask once they have read the control journal again (`current`) and judged its inventory and
+    /// the session's currency.
+    fn fenced(&self, scope: Scope, current: &Journal) -> Result<()> {
         // A generation's check can wait, so what follows it is asked afresh (on its own call, not
         // through a look the session keeps), and a journal's own head is its handle's to answer.
         // Under a log with neither, currency asks the log and holds a journal only to its trust:
@@ -1817,22 +1998,53 @@ impl<'a> Session<'a> {
         negative: bool,
         keys: Option<&ReadKeys>,
     ) -> Result<Option<Record>> {
-        let Envelope {
-            roster,
-            epoch,
-            header,
-            authored_ms,
-            salt,
-            aad,
-            body,
-        } = envelope;
-        let actor = header.actor;
+        let payload = self.with_payload_key(scope, &envelope, negative, keys, |key, _| {
+            let mut payload = Zeroizing::new(envelope.body.to_vec());
+            let len = crypto::cipher(key, &envelope.salt, envelope.aad)?
+                .open_in_place(
+                    aead::Nonce::assume_unique_for_key([0; 12]),
+                    aead::Aad::from(envelope.aad),
+                    &mut payload,
+                )
+                .ok()
+                .map(|plain| plain.len());
+            let Some(len) = len else { return Ok(None) };
+            payload.truncate(len);
+            Ok(Some(SecretBytes::new(std::mem::take(&mut *payload))))
+        })?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        Ok(Some(Record {
+            scope,
+            roster: envelope.roster,
+            epoch: envelope.epoch,
+            header: envelope.header,
+            authored_ms: envelope.authored_ms,
+            payload,
+        }))
+    }
+
+    /// The shared historical writer and current key admission for full payloads and replay
+    /// metadata. An optional cryptographic fact is consulted only inside `open`, after this ask.
+    fn with_payload_key<T>(
+        &self,
+        scope: Scope,
+        envelope: &Envelope<'_>,
+        negative: bool,
+        keys: Option<&ReadKeys>,
+        open: impl FnOnce(
+            &[u8; 32],
+            &std::cell::OnceCell<crypto::PayloadKeyIdentity>,
+        ) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let (roster, epoch, actor) = (envelope.roster, envelope.epoch, envelope.header.actor);
         if !self.history.borrow().contains_key(&roster) {
             // A roster this Mac has not seen, or holds no access to, waits for its view to
             // grow; local contention stays busy.
             let history = self
                 .bootstrap
-                .historical_in(&self.journal, &self.access, roster, self.look.as_ref())
+                .historical_in(&self.journal, &self.access, roster, self.look())
                 .map_err(|error| {
                     let error = failure(error);
                     if error.is_busy() {
@@ -1858,18 +2070,7 @@ impl<'a> Session<'a> {
                 "record lacks an exact historical writer grant",
             ));
         }
-        let mut payload = Zeroizing::new(body.to_vec());
-        let mut open = |key: &[u8; 32]| -> Result<Option<usize>> {
-            Ok(crypto::cipher(key, &salt, aad)?
-                .open_in_place(
-                    aead::Nonce::assume_unique_for_key([0; 12]),
-                    aead::Aad::from(aad),
-                    &mut payload,
-                )
-                .ok()
-                .map(|plain| plain.len()))
-        };
-        let len = if let Some(keys) = keys {
+        if let Some(keys) = keys {
             // Only a source-pinned ReadBatch supplies this map. It validates
             // each historical key at acquisition, revalidates reused keys
             // before returning, and erases the derived keys with the batch.
@@ -1882,31 +2083,25 @@ impl<'a> Session<'a> {
                 }
                 std::collections::btree_map::Entry::Vacant(entry) => entry.insert(ReadKey {
                     value: history
-                        .with_key_in(&self.journal, self.look.as_ref(), |network_key| {
+                        .with_key_in(&self.journal, self.look(), |network_key| {
                             scope.key(&roster, epoch, network_key)
                         })
                         .map_err(failure)?,
+                    identity: std::cell::OnceCell::new(),
                     reused: false,
                 }),
             };
-            open(&key.value)?
+            open(&key.value, &key.identity)
         } else {
             history
-                .with_key_in(&self.journal, self.look.as_ref(), |network_key| {
-                    open(&scope.key(&roster, epoch, network_key))
+                .with_key_in(&self.journal, self.look(), |network_key| {
+                    open(
+                        &scope.key(&roster, epoch, network_key),
+                        &std::cell::OnceCell::new(),
+                    )
                 })
-                .map_err(failure)??
-        };
-        let Some(len) = len else { return Ok(None) };
-        payload.truncate(len);
-        Ok(Some(Record {
-            scope,
-            roster,
-            epoch,
-            header,
-            authored_ms,
-            payload: SecretBytes::new(std::mem::take(&mut *payload)),
-        }))
+                .map_err(failure)?
+        }
     }
 
     // Only classifies source metadata. The store must first prove these exact

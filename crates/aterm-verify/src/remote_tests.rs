@@ -9,6 +9,36 @@ const BEFORE: &str = "1111111111111111111111111111111111111111";
 const AFTER: &str = "2222222222222222222222222222222222222222";
 const ZERO: &str = "0000000000000000000000000000000000000000";
 
+#[test]
+fn github_commands_use_the_linked_host_instead_of_path_agh() {
+    let _host = crate::remote_host::pin().unwrap();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let git = |_: &Path| aterm_uds::spawnfd::command("git");
+    let cmd = command(
+        root.path(),
+        &git,
+        Tool::Agh,
+        &words(&["repo", "refs", "a/b"]),
+    )
+    .unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(cmd.get_program(), "/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    assert_eq!(cmd.get_program(), crate::remote_host::image().unwrap());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(cmd.get_program(), std::env::current_exe().unwrap());
+    assert_eq!(
+        cmd.get_args().collect::<Vec<_>>(),
+        words(&[
+            "--remote-agh",
+            &std::process::id().to_string(),
+            "repo",
+            "refs",
+            "a/b"
+        ])
+    );
+}
+
 fn out(code: i32, text: &str) -> Output {
     Output {
         status: std::process::ExitStatus::from_raw(code << 8),
@@ -25,6 +55,9 @@ fn out(code: i32, text: &str) -> Output {
 /// is shared by every scripted GitHub read/write below, including all failure arms.
 fn url(tool: Tool, args: &[OsString]) -> Option<Output> {
     if tool != Tool::Git {
+        return None;
+    }
+    if args.first().is_some_and(|a| a == "cat-file") {
         return None;
     }
     assert!(
@@ -154,20 +187,13 @@ fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
             if call == 0 {
                 assert_eq!(
                     args,
-                    words(&[
-                        "api",
-                        &format!(
-                            "repos/fixture/repo/git/matching-refs/{}",
-                            reference.strip_prefix("refs/").unwrap()
-                        )
-                    ])
+                    words(&["repo", "refs", "fixture/repo", "--ref", reference])
                 );
                 // Prefix matches are not the exact ref, and must not determine its object.
                 // The published ref advances after the API snapshot, before the import.
                 current.set(AFTER);
-                Ok(out(0, &json!([{"ref":format!("{reference}-other"),"object":{"sha":AFTER,"type":"commit"}}, {"ref":reference,"object":{"sha":BEFORE,"type":"commit"}}]).to_string()))
-            } else {
-                assert_eq!(call, 1, "no retry");
+                Ok(out(0, &json!([{"ref":format!("{reference}-other"),"oid":AFTER}, {"ref":reference,"oid":BEFORE}]).to_string()))
+            } else if call == 1 {
                 assert_eq!(&args[..3], words(&["repo", "fetch", "fixture/repo"]));
                 assert_eq!(args[3], root.path().as_os_str());
                 let batch = input(args);
@@ -189,11 +215,20 @@ fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
                 assert_eq!(batch[0]["into"].as_str(), Some(into.as_str()));
                 imported.set(true);
                 Ok(out(0, ""))
+            } else {
+                assert_eq!(call, 2);
+                assert_eq!(tool, Tool::Git);
+                assert_eq!(args, words(&["cat-file", "-t", BEFORE]));
+                Ok(out(0, "commit\n"))
             }
         };
         let remote = Remote::open(root.path(), "origin", &run).unwrap();
         assert_eq!(remote.fetch(reference), Ok(Some(BEFORE.into())));
-        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            calls.get(),
+            3,
+            "two quota-free Git operations and one local type check; no REST"
+        );
         assert!(imported.get());
     }
 }
@@ -208,11 +243,10 @@ fn only_a_successful_exact_ref_listing_can_report_absence() {
                 return Ok(out);
             }
             calls.set(calls.get() + 1);
-            assert_eq!(args[0], "api");
+            assert_eq!(&args[..2], words(&["repo", "refs"]));
             Ok(out(
                 code,
-                &json!([{"ref":"refs/aterm/judged-other","object":{"sha":BEFORE,"type":"commit"}}])
-                    .to_string(),
+                &json!([{"ref":"refs/aterm/judged-other","oid":BEFORE}]).to_string(),
             ))
         };
         let remote = Remote::open(root.path(), "origin", &run).unwrap();
@@ -231,21 +265,52 @@ fn malformed_or_duplicate_refs_are_never_imported() {
     let root = aterm_tempfile::tempdir().unwrap();
     for rows in [
         json!({"not":"an array"}),
-        json!([{"ref":"refs/heads/main","object":{"sha":"bad","type":"commit"}}]),
-        json!([{"ref":"refs/heads/main","object":{"sha":BEFORE,"type":"tag"}}]),
-        json!([{"ref":"refs/heads/main","object":{"sha":BEFORE,"type":"commit"}}, {"ref":"refs/heads/main","object":{"sha":AFTER,"type":"commit"}}]),
+        json!([{"ref":"refs/heads/main","oid":"bad"}]),
+        json!([{"ref":"refs/heads/main","oid":BEFORE}, {"ref":"refs/heads/main","oid":AFTER}]),
     ] {
         let run = |tool, args: &[OsString]| {
             if let Some(out) = url(tool, args) {
                 return Ok(out);
             }
-            assert_eq!(args[0], "api", "never import invalid observations");
+            assert_eq!(
+                &args[..2],
+                words(&["repo", "refs"]),
+                "never import invalid observations"
+            );
             Ok(out(0, &rows.to_string()))
         };
         assert!(
             Remote::open(root.path(), "origin", &run)
                 .unwrap()
                 .fetch("refs/heads/main")
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    for object_type in ["tag\n", "blob\n"] {
+        let run = |tool, args: &[OsString]| {
+            if let Some(out) = url(tool, args) {
+                return Ok(out);
+            }
+            if tool == Tool::Git {
+                return Ok(out(0, object_type));
+            }
+            if args[1] == "refs" {
+                return Ok(out(
+                    0,
+                    &json!([{"ref":"refs/aterm/judged", "oid":BEFORE}]).to_string(),
+                ));
+            }
+            Ok(out(0, ""))
+        };
+        assert!(
+            Remote::open(root.path(), "origin", &run)
+                .unwrap()
+                .fetch("refs/aterm/judged")
                 .is_err()
         );
     }
@@ -593,7 +658,7 @@ fn a_github_object_import_lands_in_a_real_partial_clone_through_its_worktree() {
     let temp = aterm_tempfile::tempdir().expect("root");
     let base = temp.path();
     let git = |dir: &Path, args: &[&str]| -> String {
-        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        let mut cmd = crate::git_provider::command();
         cmd.current_dir(dir).args(args);
         for (key, _) in std::env::vars_os() {
             if key.as_encoded_bytes().starts_with(b"GIT_") {
@@ -670,7 +735,7 @@ fn a_github_object_import_lands_in_a_real_partial_clone_through_its_worktree() {
         ],
     );
     let holds = || {
-        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        let mut cmd = crate::git_provider::command();
         cmd.current_dir(&tree)
             .args(["cat-file", "-e", &blob])
             .env("GIT_NO_LAZY_FETCH", "1");
@@ -686,7 +751,7 @@ fn a_github_object_import_lands_in_a_real_partial_clone_through_its_worktree() {
     );
     let refs = git(&clone, &["for-each-ref"]);
     let make = |root: &Path| {
-        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        let mut cmd = crate::git_provider::command();
         cmd.current_dir(root);
         cmd
     };
@@ -717,4 +782,96 @@ fn a_github_object_import_lands_in_a_real_partial_clone_through_its_worktree() {
         refs,
         "an object import publishes no ref"
     );
+}
+
+#[test]
+fn push_source_admission_is_strict_for_github_and_absent_for_local_remotes() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    for (code, answer, admitted) in [
+        (0, "false\n", true),
+        (0, "true\n", false),
+        (0, "false", false),
+        (0, "false\ntrue\n", false),
+        (0, "", false),
+        (128, "false\n", false),
+    ] {
+        let reads = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            assert_eq!(tool, Tool::Git);
+            assert_eq!(args, words(&["rev-parse", "--is-shallow-repository"]));
+            reads.set(reads.get() + 1);
+            Ok(out(code, answer))
+        };
+        for github in [false, true] {
+            reads.set(0);
+            let remote = Remote {
+                root: root.path(),
+                name: "origin",
+                kind: if github {
+                    Kind::Github("fixture/repo".into())
+                } else {
+                    Kind::Local("../origin.git".into())
+                },
+                run: &run,
+            };
+            assert_eq!(remote.admit_push_source().is_ok(), !github || admitted);
+            assert_eq!(reads.get(), usize::from(github));
+        }
+    }
+}
+
+/// A GITHUB COMMIT IMPORT (a gitlink's pin, which need be no ref's tip) is one exact agh fetch of
+/// that object into the named ref, then a local type check; raw git never reaches the network.
+/// NEGATIVE CONTROLS: a malformed ID asks nothing; a refused fetch is not type-checked; an object
+/// that arrives as anything but a commit is refused.
+#[test]
+fn a_github_commit_import_is_one_exact_agh_fetch_then_a_type_check() {
+    let root = aterm_tempfile::tempdir().expect("root");
+    for (fetched, object, landed) in [
+        (0, "commit\n", true),
+        (9, "commit\n", false),
+        (0, "blob\n", false),
+    ] {
+        let calls = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            if tool == Tool::Git && args[0] == "remote" {
+                return Ok(url(tool, args).expect("URL discovery"));
+            }
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                assert_eq!(tool, Tool::Agh);
+                assert_eq!(&args[..3], words(&["repo", "fetch", "fixture/repo"]));
+                assert_eq!(args[3], root.path().as_os_str());
+                assert_eq!(
+                    input(args),
+                    json!([{"source":BEFORE,"into":"refs/agh/verify/gitlink","expected_oid":BEFORE}])
+                );
+                Ok(out(fetched, ""))
+            } else {
+                assert_eq!(call, 1, "nothing after the type check");
+                assert_eq!(tool, Tool::Git);
+                assert_eq!(args, words(&["cat-file", "-t", BEFORE]));
+                Ok(out(0, object))
+            }
+        };
+        let remote = Remote::open(root.path(), "origin", &run).unwrap();
+        assert_eq!(
+            remote
+                .import_commit(BEFORE, "refs/agh/verify/gitlink")
+                .is_ok(),
+            landed
+        );
+        assert_eq!(calls.get(), if fetched == 0 { 2 } else { 1 });
+        assert!(
+            remote
+                .import_commit("not-an-object", "refs/agh/verify/gitlink")
+                .is_err()
+        );
+        assert_eq!(
+            calls.get(),
+            if fetched == 0 { 2 } else { 1 },
+            "asks nothing"
+        );
+    }
 }

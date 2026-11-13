@@ -5,6 +5,11 @@
 
 use super::*;
 
+/// How long a retained outcome stands before a pass that ends the same way is retained in its
+/// place ([`retain`]): the subscriber's passes complete about every 25 s, and each one that
+/// ended as the one before replaced `state.toml` for its completion time alone (2026-11-11).
+const PERSIST_AGAIN_MS: u64 = 60_000;
+
 /// Result of an actual network-refresh pass, without its endpoint or error payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VaultNetworkRefreshOutcome {
@@ -22,7 +27,9 @@ pub struct VaultNetworkRefresh {
 }
 
 impl VaultNetworkRefresh {
-    /// Original completion time; metadata reads never advance it.
+    /// Original completion time; metadata reads never advance it. Persistence is coalesced
+    /// ([`PERSIST_AGAIN_MS`]), so under one outcome this is a retained completion rather than
+    /// the latest one.
     pub const fn completed_at_ms(self) -> u64 {
         self.completed_at_ms
     }
@@ -201,6 +208,7 @@ fn retain(
         }
         let recipient = read_identity(paths)?.map(|key| key.recipient().0);
         let mut state = load_state(paths)?;
+        let retained = state.network_refresh.clone();
         if record(
             &mut state,
             expected,
@@ -208,11 +216,30 @@ fn retain(
             attempt,
             outcome,
             completed_at_ms,
-        ) {
+        ) && !stands(retained.as_ref(), state.network_refresh.as_ref())
+        {
             save_state(paths, &state)?;
         }
         Ok(())
     })();
+}
+
+/// Whether the `retained` receipt still stands for the one a pass just `recorded`: the same
+/// configuration, recipient and outcome, completed less than [`PERSIST_AGAIN_MS`] before it.
+/// Another outcome, another context, a first receipt and one completed before the retained one
+/// (the clock was set back) are retained at once.
+fn stands(retained: Option<&Receipt>, recorded: Option<&Receipt>) -> bool {
+    let (Some(retained), Some(recorded)) = (retained, recorded) else {
+        return false;
+    };
+    retained.configuration == recorded.configuration
+        && retained.recipient == recorded.recipient
+        && retained.observation.outcome == recorded.observation.outcome
+        && recorded
+            .observation
+            .completed_at_ms
+            .checked_sub(retained.observation.completed_at_ms)
+            .is_some_and(|since| since < PERSIST_AGAIN_MS)
 }
 
 #[cfg_attr(

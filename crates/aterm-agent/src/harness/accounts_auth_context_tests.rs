@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+
 use super::*;
 
 const NOW: i64 = 1_792_660_000;
@@ -176,6 +179,51 @@ fn forgetting_an_account_also_retires_its_staged_auth_observation() {
     assert!(state.pending_auth.is_empty());
 }
 
+/// A WEEKLY HANDOFF'S RUN OF UNANSWERED READS ENDS WITH THE LOGIN IT WAS OF (ATERM-KI-1110-116): a
+/// published checked sign-in of the row clears it, and so does another credential published for
+/// it. CONTROL: an auth word published again for the same credential leaves it.
+#[test]
+fn a_published_sign_in_or_new_credential_ends_an_unanswered_run() {
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let home = scratch.path().join("home");
+    let store = Store::at_for(&scratch.path().join("state"), Cli::Codex, &home);
+    login(&home.join(".codex"), 1);
+    let row = Row {
+        label: "b".into(),
+        email: Some("b@example.test".into()),
+        ..Row::default()
+    };
+    let publish = |at: i64, checked: bool| {
+        let context = store.capture_auth_context(&row).unwrap();
+        store
+            .transact_logins(at, &mut None, |state, logins| {
+                if checked {
+                    stage_checked_sign_in(state, &row, logins, context.clone(), at);
+                } else {
+                    stage_auth(state, &row, logins, context.clone(), Auth::Ok, at);
+                }
+                Ok(Vec::new())
+            })
+            .unwrap();
+        store.load(at).unwrap().0.accounts["b"].unanswered
+    };
+    let fail = |at: i64| {
+        store
+            .transact(at, &mut None, |state| {
+                note_unanswered(state, "b", at);
+                Ok(Vec::new())
+            })
+            .unwrap();
+    };
+    publish(NOW, false);
+    fail(NOW + 1);
+    assert!(publish(NOW + 2, false).is_some(), "CONTROL: the same login");
+    assert_eq!(publish(NOW + 3, true), None, "a checked sign-in");
+    fail(NOW + 4);
+    login(&home.join(".codex"), 2);
+    assert_eq!(publish(NOW + 5, false), None, "another credential");
+}
+
 #[test]
 fn replacement_credentials_do_not_inherit_renewal_or_served_metadata() {
     for due in [false, true] {
@@ -281,6 +329,7 @@ fn replacement_credentials_do_not_inherit_renewal_or_served_metadata() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unscoped_codex_failure_keeps_history_without_ending_the_current_pin() {
     let scratch = aterm_tempfile::TempDir::new().unwrap();

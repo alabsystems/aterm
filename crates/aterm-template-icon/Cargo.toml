@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-template-icon"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Menu-bar template icons: a signed-distance shape supersampled to one coverage byte per pixel and encoded as a black RGBA PNG with the coverage as alpha. Pure, so it compiles and is tested on every OS; the mug (`aterm-acaffeine`) and the fleet access lock (`aterm-gui`) draw with it."
+
+[dependencies]
+# The coverage leaves here as an 8-bit RGBA PNG AppKit decodes into a bitmap.
+aterm-png = { workspace = true }
+
+[lints]
+workspace = true

@@ -65,6 +65,8 @@ aterm-grapheme = { workspace = true }
 aterm-bidi = { workspace = true }
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 # The tests find aterm-render's committed faces and corpora from the package directory when they
 # run (`aterm_tempfile::manifest_dir`). A zero-dependency crate.
 aterm-tempfile = { workspace = true }

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-cores"
+# A constant version: nothing here names the product version.
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cores a process's own thread pools may use: the machine's parallelism, bounded by the grant aterm-verify hands a test binary."
+
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+# No dependencies: every crate that sizes a pool depends on this one, so it depends on nothing.
+[dependencies]
+
+[dev-dependencies]
+# The grant test reruns this test binary as a child with the variable set and unset: built
+# with `spawnfd::command`, bounded by `deadline`. A dev-dependency only, so no cycle forms.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

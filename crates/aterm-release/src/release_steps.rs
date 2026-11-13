@@ -20,8 +20,9 @@ use crate::line::{Fix, Hop, Line};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
-    CutState, EngineNow, EngineRows, Facts, PUBLISH_GATE_ENV, Prover, PublishGate, RELEASE_COMMAND,
-    Ran, Refusal, Reservation, Side, SignedDiscard, StageTarget, Step, SupersedeResult,
+    CutJournalUnread, CutState, Discarded, EngineNow, EngineRows, Facts, InputFinding,
+    PUBLISH_GATE_ENV, Preflight, Prover, PublishGate, RELEASE_COMMAND, Ran, Refusal, Reservation,
+    Side, SignedDiscard, SourceState, StageTarget, Step, SupersedeResult,
 };
 
 #[path = "release_scanner_tools.rs"]
@@ -33,8 +34,6 @@ mod export_remedy;
 #[cfg(not(test))]
 #[path = "release_cutter_probe.rs"]
 mod cutter_probe;
-#[cfg(all(debug_assertions, not(test)))]
-pub(crate) use cutter_probe::cutter_probe_if_asked;
 #[cfg(not(test))]
 pub(crate) use cutter_probe::step_one_probe_if_asked;
 
@@ -277,6 +276,10 @@ pub(crate) fn started_of(pid: u32) -> Option<String> {
 /// (`inputs-seal/`, [`crate::build_inputs::arm`]).
 const RELEASE_STATE: &str = ".local/state/aterm-release";
 
+/// The commit step's last lines a dry run's refusal carries, since its logs do not outlive it
+/// ([`Real::commit_log_refusal`]).
+const COMMIT_LOG_TAIL: usize = 20;
+
 /// The release state's directory: [`RELEASE_STATE`] below `home`, or below a Cargo test binary's
 /// own root ([`aterm_uds::test_binary::scratch_root`]), so that no test writes a run's logs, its
 /// step times, its disk footprints or a kept seal into the person's, which the next real release
@@ -299,6 +302,7 @@ pub(crate) fn cutter_cache_dir(release: &Path) -> PathBuf {
 
 type VerifyHalf = fn(
     &Real,
+    Step,
     &Candidate,
     &Prover,
     &crate::check_record::VerifyRun,
@@ -362,8 +366,9 @@ pub struct Real {
     engine_source: PathBuf,
     /// The engine this release runs, syncs, reads and hands every child as `PUBLICATION_ENGINE`:
     /// its own copy ([`aterm_verify::engine::engine_copy`], made from `engine_source`'s origin by
-    /// [`Real::engine_copy`]); in a dry run, which never makes or moves one, `engine_source` until a
-    /// real run has made it.
+    /// [`Real::engine_copy`], at a real run's step 1 where the clone has none
+    /// ([`Real::engine_first_copy`])); in a dry run, which never makes or moves one,
+    /// `engine_source` until a real run has made it.
     engine: PathBuf,
     /// Captured once, when the release starts, and handed with `engine_source` to its own frozen
     /// cutter on exec ([`hand_engine_capture`], [`engine_authority`]); a missing engine defers
@@ -809,8 +814,9 @@ impl Branches for RealBranches<'_> {
     fn build_admitted(&self, ended: &dyn Fn() -> bool) {
         let _timing = crate::cut_timing::Timer::parallel_parent()("qualify slice memory barrier")
             .with_log(Some(&self.real.side_log(Step::Qualify, "admission")));
-        // With no initial build token, neither slice can finish. Tree must run first even
-        // when memory admits only one slice, so waiting for both memory claims would deadlock.
+        // With no initial build token, the slice branch cannot finish. Tree must run first even
+        // when its parent holds memory, so waiting for the parent while retaining every token
+        // would deadlock.
         if self
             .real
             .pool
@@ -916,6 +922,7 @@ impl Branches for RealBranches<'_> {
 
     fn verify(
         &self,
+        step: Step,
         c: &Candidate,
         prover: &Prover,
         run: &crate::check_record::VerifyRun,
@@ -929,10 +936,10 @@ impl Branches for RealBranches<'_> {
                 admission_barrier: &self.admission_barrier,
             };
             with_tree_index_completion(&self.tree_index, stop, || {
-                (self.real.verify_half_op)(self.real, c, prover, run, artifact, stop)
+                (self.real.verify_half_op)(self.real, step, c, prover, run, artifact, stop)
             })
         } else {
-            (self.real.verify_half_op)(self.real, c, prover, run, artifact, stop)
+            (self.real.verify_half_op)(self.real, step, c, prover, run, artifact, stop)
         }
     }
 
@@ -968,6 +975,7 @@ impl Branches for RealBranches<'_> {
                 stop: Some((stop, interrupt::SIGINT)),
                 push: None,
                 arrivals: true,
+                settles: false,
             },
             &mut cmd,
         ))
@@ -983,6 +991,7 @@ impl Branches for RealBranches<'_> {
                     stop: Some((stop, interrupt::SIGTERM)),
                     push: None,
                     arrivals: false,
+                    settles: false,
                 },
                 &mut cmd,
             ),
@@ -994,18 +1003,28 @@ impl Branches for RealBranches<'_> {
     }
 }
 
-/// Both slices must have their claims before the tree can compete for memory. A build
-/// that fails or serializes on a smaller machine releases the wait by ending instead.
+/// The slices' one shared, serial or cold-learning parent must hold before the tree can compete
+/// for memory. A build that fails or serializes on a smaller machine releases the wait by ending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SliceMemory {
+pub(crate) enum SliceMemory {
     Held,
-    /// One exclusive learning claim is held and the other is queued behind it or not yet
-    /// present. Let the build consume its tokens and finish both slices before tree starts.
+    /// A serial parent is held: either the continuous cold-learning exclusion, or a calibrated
+    /// parent after the shared plan degraded. Let build finish both slices before tree starts.
     Serial,
-    /// The held parent has the correct shape but its footprint book has grown.
+    /// The held parent has the correct shape but is smaller than the current complete envelope.
     StaleBudget,
     Pending,
     Unavailable,
+}
+
+/// How slice admission lets the tree proceed. A serialized build has already received every
+/// non-export token and ended before this result is returned. `Ended` means the build ended
+/// before a memory state could be observed, so its caller must release any remaining barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceAdmission {
+    Concurrent,
+    Serialized,
+    Ended,
 }
 
 /// Wait for the slice parent without making process inspection a liveness dependency. If the
@@ -1016,46 +1035,47 @@ fn await_slice_memory(
     mut observe: impl FnMut() -> SliceMemory,
     mut release: impl FnMut(),
     mut pause: impl FnMut(),
-) {
+) -> SliceAdmission {
     while !ended() {
         let observe_reason = observe();
         match observe_reason {
-            SliceMemory::Held => return,
+            SliceMemory::Held => return SliceAdmission::Concurrent,
             SliceMemory::Pending => pause(),
             SliceMemory::Serial | SliceMemory::Unavailable | SliceMemory::StaleBudget => {
                 if matches!(observe_reason, SliceMemory::StaleBudget) {
                     eprintln!(
-                        "qualify: held slice budget is smaller than current footprint history; waiting for build with tree compiler tokens withheld"
+                        "qualify: held slice budget is smaller than the current complete envelope; waiting for build with tree compiler tokens withheld"
                     );
                 }
                 release();
                 while !ended() {
                     pause();
                 }
-                return;
+                return SliceAdmission::Serialized;
             }
         }
     }
+    SliceAdmission::Ended
 }
 
 /// Production binding from the exact slice-memory observation to the private-FIFO transfer.
 /// Keeping the reservation in this seam makes the serial escape's token effect testable without
 /// constructing a release backend.
-fn await_slice_memory_with_barrier(
+pub(crate) fn await_slice_memory_with_barrier(
     barrier: &std::sync::Mutex<Option<aterm_capacity::InitialReservation<'_>>>,
     ended: &dyn Fn() -> bool,
     observe: impl FnMut() -> SliceMemory,
     pause: impl FnMut(),
-) {
+) -> SliceAdmission {
     await_slice_memory(
         ended,
         observe,
         || release_admission_barrier_to_build(barrier),
         pause,
-    );
+    )
 }
 
-fn slices_hold_memory(me: u32) -> SliceMemory {
+pub(crate) fn slices_hold_memory(me: u32) -> SliceMemory {
     let Some(ledger) = aterm_capacity::Ledger::user() else {
         return SliceMemory::Unavailable;
     };
@@ -1074,9 +1094,9 @@ fn slices_hold_memory(me: u32) -> SliceMemory {
 }
 
 /// How the build branch has reserved the slice memory which the tree must fit around. A complete
-/// unit record has one shared parent. With incomplete history each slice learns under ALONE;
-/// where one is held and the other is queued or not yet present, the build must run serially
-/// before the tree. An exact but invalid row authorizes neither schedule.
+/// unit record has one shared parent. With incomplete history one cold parent stays ALONE across
+/// both serial slices. A calibrated shared plan can instead degrade to its smaller serial parent.
+/// An exact but invalid row authorizes neither schedule.
 fn slices_hold_memory_in(
     me: u32,
     shared_minimum: u64,
@@ -1093,7 +1113,10 @@ fn slices_hold_memory_in(
 
     let parent: std::collections::BTreeMap<i32, i32> =
         procs.iter().map(|p| (p.pid, p.parent)).collect();
-    let descends = |pid: u32| {
+    let self_or_descendant = |pid: u32| {
+        if pid == me {
+            return true;
+        }
         let mut at = i32::try_from(pid).unwrap_or(0);
         for _ in 0..64 {
             match parent.get(&at) {
@@ -1109,11 +1132,12 @@ fn slices_hold_memory_in(
         let mut valid = false;
         for record in records
             .iter()
-            .filter(|record| record.need.what == what && descends(record.pid))
+            .filter(|record| record.need.what == what && self_or_descendant(record.pid))
         {
             exact = true;
             if record.accounting != aterm_capacity::Accounting::Holder
                 || record.need.mem < minimum
+                || (exclusive && record.need.mem != minimum)
                 || record.need.margin != 1
                 || record.need.rank != aterm_capacity::Rank::Release
                 || record.need.alone != exclusive
@@ -1156,6 +1180,15 @@ fn slices_hold_memory_in(
         }
         ClaimState::Missing => {}
     }
+    match descendant(
+        crate::slice_units::COLD_PARENT,
+        crate::slice_units::DRIVER,
+        true,
+    ) {
+        ClaimState::Held => return SliceMemory::Serial,
+        ClaimState::Waiting | ClaimState::Invalid => return SliceMemory::Pending,
+        ClaimState::Missing => {}
+    }
     match descendant(SHARED, shared_minimum, false) {
         ClaimState::Held => return SliceMemory::Held,
         ClaimState::Waiting => return SliceMemory::Pending,
@@ -1172,38 +1205,19 @@ fn slices_hold_memory_in(
         }
     }
 
-    let native = descendant(
-        "release slice aarch64-apple-darwin",
-        crate::slice_units::DRIVER,
-        true,
-    );
-    let compat = descendant(
-        "release slice x86_64-apple-darwin",
-        crate::slice_units::DRIVER,
-        true,
-    );
-    match (native, compat) {
-        (ClaimState::Held, ClaimState::Waiting | ClaimState::Missing)
-        | (ClaimState::Waiting | ClaimState::Missing, ClaimState::Held) => SliceMemory::Serial,
-        _ => SliceMemory::Pending,
-    }
+    SliceMemory::Pending
 }
 
 /// The pooled release tree's whole-stage Tippy reservation. Branded Tippy deliberately removes
 /// outer compiler wrappers, so a driver-only claim would have no unit claims beneath it. The
 /// exact workspace label distinguishes this reservation from a later narrow lint, another
-/// release's row and queued lookalikes; the measured claim must retain the safe cold floor,
-/// cover its compiler descendants and carry Release rank.
+/// release's row and queued lookalikes; the claim must reserve memory, cover its compiler
+/// descendants and carry Release rank. Its size is the verifier's
+/// ([`aterm_verify::compile_width::lint_claim`]: a measured peak, or the machine's memory alone
+/// where none is kept), so no figure is repeated here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TreeLintClaimShape {
     pub(crate) label: String,
-    pub(crate) bytes: u64,
-}
-
-impl TreeLintClaimShape {
-    pub(crate) fn accepts(&self, bytes: u64) -> bool {
-        bytes >= self.bytes
-    }
 }
 
 pub(crate) fn tree_lint_claim_shapes() -> Option<[TreeLintClaimShape; 1]> {
@@ -1212,7 +1226,6 @@ pub(crate) fn tree_lint_claim_shapes() -> Option<[TreeLintClaimShape; 1]> {
         .find(|stage| stage.id == aterm_verify::plan::StageId::Tippy)?;
     Some([TreeLintClaimShape {
         label: format!("verify {}", stage.title),
-        bytes: aterm_verify::compile_width::TIPPY_CLAIM_FLOOR,
     }])
 }
 
@@ -1242,7 +1255,7 @@ fn await_tree_memory(
                 return true;
             }
             TreeLintObservation::Claim(TreeLintClaim::Invalid) => {
-                // A malformed cold claim may reserve less than the compile can use. Keep build's
+                // A malformed Tippy claim may reserve less than the compile can use. Keep build's
                 // private budget and stop the tree; reminting tokens to that claim after build
                 // drains would otherwise let an unbounded cold compile start.
                 serialize();
@@ -1339,16 +1352,14 @@ pub(crate) fn classify_tree_lint_claim(
     record: &aterm_capacity::Record,
     shapes: &[TreeLintClaimShape],
 ) -> Option<TreeLintClaim> {
-    let shape = shapes
+    shapes
         .iter()
         .find(|shape| record.need.what == shape.label)?;
     Some(
         if record.accounting == aterm_capacity::Accounting::Holder
-            && shape.accepts(record.need.mem)
-            && record.need.margin == 1
+            && record.need.mem > 0
             && record.need.rank == aterm_capacity::Rank::Release
             && record.need.covers
-            && record.held.is_none_or(|held| !held.alone)
         {
             if record.held.is_some() {
                 TreeLintClaim::Held
@@ -1638,6 +1649,39 @@ impl Real {
                 "not started: another branch went red",
             ));
         }
+        self.spawn_noted(step, cmd, |group| match stop {
+            Some((stop, sig)) => interrupt::Running::enter_stoppable(group, stop.clone(), sig),
+            None => interrupt::Running::enter(group),
+        })
+    }
+
+    /// [`Real::spawn_stoppable`] for a child that settles this process's own stop
+    /// ([`interrupt::stop_self`]: the fleet line lost), started after it: it starts unless a
+    /// signal from elsewhere was caught, and its group is forwarded only such a signal
+    /// ([`interrupt::Running::settling`]), never the stop it settles.
+    fn spawn_settling(
+        &self,
+        step: Step,
+        cmd: &mut Command,
+    ) -> std::io::Result<(aterm_uds::spawnfd::Child, Forwarded)> {
+        if interrupt::caught_foreign() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "not started: the release was interrupted",
+            ));
+        }
+        self.spawn_noted(step, cmd, interrupt::Running::settling)
+    }
+
+    /// Start `cmd` as `step`'s child, leading a session of its own (inside preparation's group
+    /// while a prefreeze claim is held, [`step_process_group`]), noted while it runs, and its
+    /// group forwarded caught signals by the guard `forward` starts for that group.
+    fn spawn_noted(
+        &self,
+        step: Step,
+        cmd: &mut Command,
+        forward: impl FnOnce(u32) -> interrupt::Running,
+    ) -> std::io::Result<(aterm_uds::spawnfd::Child, Forwarded)> {
         self.finalize_spawn_environment(cmd)
             .map_err(std::io::Error::other)?;
         let prefreeze = self.prefreeze_claim.is_some();
@@ -1648,10 +1692,7 @@ impl Real {
         } else {
             child.id()
         };
-        let running = match stop {
-            Some((stop, sig)) => interrupt::Running::enter_stoppable(group, stop.clone(), sig),
-            None => interrupt::Running::enter(group),
-        };
+        let running = forward(group);
         let note = self.note_child(step, child.id());
         let meter = Some(aterm_verify::exec::UsageMeter::start(child.id()));
         Ok((
@@ -1968,6 +2009,7 @@ impl Real {
                 stop: None,
                 push: None,
                 arrivals: false,
+                settles: false,
             },
             &mut command,
         );
@@ -2012,7 +2054,7 @@ impl Real {
     fn publish_command(&self, prover: &Prover) -> Result<Command, Refusal> {
         let mut cmd = self.with_scanners(self.engine_child(&self.engine, Some(prover))?);
         cmd.args(["publish", "aterm", "--keep-draft", "--draft-state"])
-            .arg(self.repo.join("dist/draft-state.toml"))
+            .arg(crate::publish::draft_journal_path(&self.repo))
             .args([
                 "--skip-site",
                 "--release-remote",
@@ -2032,6 +2074,24 @@ impl Real {
         self.logged_to(step, cmd, stream)
     }
 
+    /// [`Real::logged`] for a child that settles this process's own stop
+    /// ([`interrupt::stop_self`]: the fleet line lost): that stop neither refuses it nor is
+    /// forwarded to it; a signal from elsewhere does both ([`Real::spawn_settling`]).
+    fn logged_settling(&self, step: Step, cmd: &mut Command) -> Ran {
+        self.logged_in(
+            Logged {
+                step,
+                log: self.step_log(step),
+                stream: self.verbose,
+                stop: None,
+                push: None,
+                arrivals: false,
+                settles: true,
+            },
+            cmd,
+        )
+    }
+
     fn logged_to(&self, step: Step, cmd: &mut Command, stream: bool) -> Ran {
         self.logged_in(
             Logged {
@@ -2041,6 +2101,7 @@ impl Real {
                 stop: None,
                 push: None,
                 arrivals: step == Step::Publish,
+                settles: false,
             },
             cmd,
         )
@@ -2070,6 +2131,7 @@ impl Real {
             stop,
             push,
             arrivals,
+            settles,
         } = at;
         let mut file = match crate::durable::open_append(&log, true) {
             Ok(f) => f,
@@ -2094,7 +2156,12 @@ impl Real {
             code: 130,
             detail: vec!["not started: the release was interrupted".into()],
         };
-        if interrupt::caught().is_some() {
+        let interrupted = if settles {
+            interrupt::caught_foreign()
+        } else {
+            interrupt::caught().is_some()
+        };
+        if interrupted {
             return not_started();
         }
         cmd.stdin(Stdio::null());
@@ -2129,7 +2196,11 @@ impl Real {
             None
         };
         let started_at_unix_ms = now_ms();
-        let spawned = self.spawn_stoppable(step, cmd, stop);
+        let spawned = if settles {
+            self.spawn_settling(step, cmd)
+        } else {
+            self.spawn_stoppable(step, cmd, stop)
+        };
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let (mut child, mut forwarded) = match spawned {
             Ok(spawned) => spawned,
@@ -2235,6 +2306,32 @@ impl Real {
             .join(format!("{:02}-{}.log", step.number(), step.name()))
     }
 
+    /// A refusal of the bump's edit whose cause the commit step's log holds; `undone` says the
+    /// edit was rolled back. A run that keeps its logs names that log. A dry run's logs are
+    /// scratch, which `Drop` removes when the run ends, so its refusal carries the log's last
+    /// [`COMMIT_LOG_TAIL`] lines instead, which a dry refusal prints above its fix line, or says
+    /// that the reason it gives is all it recorded.
+    fn commit_log_refusal(&self, why: impl Into<String>, undone: bool) -> Refusal {
+        let undone = if undone { "; the bump is undone" } else { "" };
+        if !self.scratch_logs {
+            return Refusal::new(why, format!("read the commit step's log{undone}"));
+        }
+        let text = crate::durable::read_text(&self.step_log(Step::Commit)).unwrap_or_default();
+        let mut tail: Vec<String> = text
+            .lines()
+            .rev()
+            .take(COMMIT_LOG_TAIL)
+            .map(str::to_owned)
+            .collect();
+        tail.reverse();
+        let remedy = if tail.is_empty() {
+            format!("the reason above is all this dry run recorded{undone}")
+        } else {
+            format!("read the commit step's output above; a dry run keeps no log{undone}")
+        };
+        Refusal::new(why, remedy).detail(tail)
+    }
+
     /// The run's own log: what the cutter says ([`Backend::say`]), beside each step's log.
     fn transcript(&self) -> PathBuf {
         self.logs.join(crate::release_timeline::TRANSCRIPT)
@@ -2325,6 +2422,23 @@ impl Real {
         Ok(())
     }
 
+    /// A real run's first engine: where this clone holds no copy of its own yet, make it
+    /// ([`Real::engine_copy`]) as step 1 fetches the engine's origin, so nothing step 1 asks
+    /// after that fetch meets a checkout that is not there: its input judgment
+    /// ([`Backend::input_checks`]) seals the HEAD of the engine it hands its verifier, a step
+    /// before the sync. A copy that is there is the sync's to point and fast-forward
+    /// ([`Real::engine_sync`]); a dry run makes none and keeps the engine it was named; an
+    /// engine that names no origin is step 1's own refusal ([`Real::engine_unready`]).
+    ///
+    /// # Errors
+    /// The copy could not be made: [`Real::engine_copy`]'s refusal, as COULD NOT RUN.
+    fn engine_first_copy(&self) -> Result<(), Refusal> {
+        if self.scratch_logs || self.engine.join(".git").exists() || self.source_origin().is_err() {
+            return Ok(());
+        }
+        self.engine_copy().map_err(Refusal::could_not_run)
+    }
+
     /// Refresh source refs before admitting `--fix`, without reading the engine or roster.
     /// Fleet discovery and step 1 consume this same snapshot rather than fetching it again.
     fn prefetch_source(&mut self) -> Result<(), Refusal> {
@@ -2340,7 +2454,8 @@ impl Real {
 
     /// Step 1's reads of both origins: aterm's main and tags through `aterm` (agh's fetch, in
     /// `Backend::fetch`), then the engine's main ([`Real::fetch_engine_origin`]), which step 1
-    /// judges the ledger and `bin/pub` on until step 2 syncs the release's engine; aterm's main.
+    /// judges the ledger and `bin/pub` on until step 2 syncs the release's engine, and a real
+    /// run's first copy of that engine ([`Real::engine_first_copy`]); aterm's main.
     fn fetch_origins(
         &mut self,
         aterm: impl FnOnce(&Path) -> Result<crate::github_remote::FetchedOrigin, String>,
@@ -2357,6 +2472,7 @@ impl Real {
             .map_err(|why| cut_refusal("owned bump recovery", &why))?;
         }
         self.fetch_engine_origin()?;
+        self.engine_first_copy()?;
         Ok(origin.main)
     }
 
@@ -2932,11 +3048,13 @@ impl Real {
         &self,
         what: &str,
         args: &[std::ffi::OsString],
+        plan: &aterm_verify::NativeBuildPlan,
     ) -> Result<Vec<u8>, String> {
         use aterm_verify::provision::Host as _;
         let targo = aterm_verify::provision::System::new(&self.repo).targo()?;
         let mut cmd = self.child(targo, None);
         cmd.args(args);
+        plan.apply_to_command(&mut cmd).map_err(|e| e.to_string())?;
         let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
         if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
             let _ = log.write_all(&out.stdout);
@@ -2962,13 +3080,23 @@ impl Real {
     ) -> Result<(PathBuf, Vec<u8>), String> {
         let _phase =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "frozen-tool-build");
-        let layout = verify_layout(&self.repo).1;
-        let args = Self::frozen_tool_args(&self.repo, bin, profile, layout.as_deref());
+        let plan = verify_plan(&self.repo)
+            .map_err(|e| format!("select {} build directory: {e}", bin.what))?;
+        let layout = plan.build_dir();
+        let args = Self::frozen_tool_args(&self.repo, bin, profile, layout);
         let mut command = self.child(prover.bin.join("targo"), Some(prover));
-        command.args(&args).current_dir(&self.repo);
+        command
+            .args(&args)
+            .arg("--target-dir")
+            .arg(plan.target())
+            .current_dir(&self.repo);
         // Keep Cargo's actual dirty-unit reasons beside the artifact counts. A
         // later cut must distinguish a source delta from cache invalidation.
         command.env("CARGO_LOG", "targo::compiler::fingerprint=info");
+        plan.apply_to_command(&mut command)
+            .map_err(|e| format!("configure {} build environment: {e}", bin.what))?;
+        plan.prepare()
+            .map_err(|e| format!("prepare {} build directory: {e}", bin.what))?;
         let (output, accounting) = self
             .output_accounted(self.step, &mut command)
             .map_err(|e| format!("{} build: {e}", bin.what))?;
@@ -2979,7 +3107,7 @@ impl Real {
             let _ = writeln!(
                 log,
                 "{}",
-                frozen_build_event(bin.package, profile, layout.as_deref(), &output.stdout)
+                frozen_build_event(bin.package, profile, layout, &output.stdout)
             );
         }
         if !output.status.success() {
@@ -3452,11 +3580,22 @@ impl Real {
     /// resolved to `aterm` before it runs (`aterm help: unknown topic 'repo'`) and as old as that
     /// install.
     fn engine_agh(&self) -> Result<PathBuf, Refusal> {
+        self.engine_agh_with_jobs(None)
+    }
+
+    fn engine_agh_with_jobs(&self, jobs: Option<u32>) -> Result<PathBuf, Refusal> {
         let explicit = self.engine_agh_explicit.as_deref();
-        crate::checkout_bin::prepare(&self.repo, &ENGINE_AGH, explicit, |args| {
-            println!("export guards: building this checkout's agh, the engine's GitHub client");
-            (self.checkout_build)(self, ENGINE_AGH.what, args)
-        })
+        crate::checkout_bin::prepare_with_jobs(
+            &self.repo,
+            &ENGINE_AGH,
+            explicit,
+            &verify_environment(),
+            jobs,
+            |args, plan| {
+                println!("export guards: building this checkout's agh, the engine's GitHub client");
+                (self.checkout_build)(self, ENGINE_AGH.what, args, plan)
+            },
+        )
         .map_err(|why| {
             Refusal::new(
                 format!(
@@ -4034,6 +4173,7 @@ impl Real {
                 stop: branch.map(|(stop, _)| (stop, interrupt::SIGINT)),
                 push,
                 arrivals: false,
+                settles: false,
             },
             &mut cmd,
         );
@@ -4143,7 +4283,24 @@ impl Real {
         cmd: &mut Command,
         stop: Option<&BranchStop>,
     ) -> std::io::Result<std::process::Output> {
+        self.captured_with_jobs(step, prover, log, cmd, stop, None)
+    }
+
+    fn captured_with_jobs(
+        &self,
+        step: Step,
+        prover: &Prover,
+        log: &Path,
+        cmd: &mut Command,
+        stop: Option<&BranchStop>,
+        jobs: Option<&aterm_capacity::BranchShares>,
+    ) -> std::io::Result<std::process::Output> {
         scrub_fixture_command(cmd);
+        if step == Step::Qualify
+            && let Some(jobs) = jobs
+        {
+            jobs.hand_to(cmd, false)?;
+        }
         cmd.env("TRUST_STAGE2_BIN", &prover.bin);
         let (out, record) = self.output_accounted_with_stop(step, cmd, stop)?;
         append_output(log, &out);
@@ -4190,7 +4347,16 @@ impl Real {
         }
         let pins = fixture_pins(c, reserved);
         let root = fixture_root(&self.repo)?;
-        let mut run = |cmd: &mut Command| self.captured_with_stop(step, prover, log, cmd, stop);
+        let mut run = |cmd: &mut Command| {
+            self.captured_with_jobs(
+                step,
+                prover,
+                log,
+                cmd,
+                stop,
+                self.pool.as_ref().map(|pool| &pool.jobs),
+            )
+        };
         crate::fixtures::stage(
             &prover.bin.join("targo"),
             &self.repo,
@@ -4234,11 +4400,13 @@ impl Real {
         }
     }
 
-    /// `verify release` of `run`'s half in the clone at R ([`Branches::verify`]): the tree's in
-    /// step 4's tree branch, the bundle's in step 5 on `artifact`, each into its own log and
-    /// events; its records kept only where R's tree stayed clean and the seal held throughout.
+    /// `verify release` of `run`'s half in the clone at R ([`Branches::verify`]): step 4's tree
+    /// branch or early bundle-context AppKit gate, and step 5's artifact-dependent bundle checks,
+    /// each into its own log and events; records are kept only where R's tree stayed clean and the
+    /// seal held throughout.
     fn verify_half(
         &self,
+        step: Step,
         c: &Candidate,
         prover: &Prover,
         run: &crate::check_record::VerifyRun,
@@ -4275,13 +4443,33 @@ impl Real {
                 )
                 .could_not_run()
             })?;
-        let (step, log) = match run.half {
-            crate::check_record::Half::Tree => (
-                Step::Qualify,
-                self.side_log(Step::Qualify, Branch::Tree.name()),
-            ),
-            crate::check_record::Half::Bundle => (Step::Bundle, self.step_log(Step::Bundle)),
+        let exact = |name: &str| run.checks.len() == 1 && run.checks[0] == name;
+        let log = match (step, run.half, artifact) {
+            (Step::Qualify, crate::check_record::Half::Tree, None) => {
+                self.side_log(Step::Qualify, Branch::Tree.name())
+            }
+            (Step::Qualify, crate::check_record::Half::Bundle, None) if exact("appkit") => {
+                self.side_log(Step::Qualify, "appkit")
+            }
+            (Step::Bundle, crate::check_record::Half::Bundle, Some(_)) if exact("measure") => {
+                self.step_log(Step::Bundle)
+            }
+            (_, half, _) => {
+                return Err(Refusal::new(
+                    format!(
+                        "the {half:?} release selection {:?} cannot run in step {} with this artifact",
+                        run.checks,
+                        step.name(),
+                    ),
+                    format!("run {RELEASE_COMMAND} again with the selected cutter"),
+                )
+                .could_not_run());
+            }
         };
+        let early_appkit = step == Step::Qualify
+            && run.half == crate::check_record::Half::Bundle
+            && artifact.is_none()
+            && exact("appkit");
         let side = |what: &str| log.with_extension(what);
         let cannot = |path: &Path, e: std::io::Error| {
             Refusal::new(
@@ -4303,24 +4491,41 @@ impl Real {
         // Build an identical one-use mirror and finalize that mutation now, so content evidence
         // binds the effective verifier environment without applying PATH prepends twice to the
         // command which will actually spawn.
-        let content_plan = self
-            .check_content_context(
-                &frozen.verify.path,
-                &frozen.set_sha256,
-                &seal,
-                prover,
-                run.half,
-            )
-            .and_then(|context| crate::check_content::plan(&self.git(), &c.commit, &context))
+        let admission = if early_appkit {
+            crate::check_content::Admission::Now
+        } else {
+            crate::check_content::Admission::WaitDefault
+        };
+        let content_context = self.check_content_context(
+            &frozen.verify.path,
+            &frozen.set_sha256,
+            &seal,
+            prover,
+            run.half,
+            admission,
+        );
+        let content_plan = content_context
+            .as_ref()
+            .map_err(|why| why.clone())
+            .and_then(|context| {
+                let appkit =
+                    early_appkit.then_some(crate::check_content::AppkitContext { context });
+                crate::check_content::plan(&self.git(), &c.commit, context, appkit)
+            })
             .ok();
         let item_context = crate::check_content::item_context(&frozen.set_sha256, &seal);
         cmd.arg("release").arg(run.half.flag());
+        if early_appkit {
+            cmd.args(["--admit", "now"]);
+        }
         if run
             .checks
             .iter()
             .any(|check| matches!(check.as_str(), "test" | "lint"))
         {
             cmd.arg("--carry-context").arg(&item_context);
+        } else if early_appkit && let Ok(context) = &content_context {
+            cmd.arg("--carry-context").arg(context);
         }
         if run.strict_subset() {
             cmd.arg("--checks").arg(run.checks.join(","));
@@ -4362,6 +4567,25 @@ impl Real {
             crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
                 .map_err(|error| cannot(&path, error))?;
             cmd.arg("--passed-lint-packages").arg(&path);
+        }
+        if !run.passed_appkit_groups.is_empty() && content_context.is_ok() {
+            let path = side("passed-appkit-groups");
+            let proofs: aterm_verify::appkit_content::Passed = run
+                .passed_appkit_groups
+                .iter()
+                .cloned()
+                .map(|proof| (proof.group.clone(), proof))
+                .collect();
+            let text = aterm_verify::appkit_content::encode_passed(&proofs).map_err(|error| {
+                Refusal::new(
+                    format!("cannot encode prior AppKit executable-group proofs: {error}"),
+                    format!("remove {}, then {RELEASE_COMMAND}", path.display()),
+                )
+                .could_not_run()
+            })?;
+            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+                .map_err(|error| cannot(&path, error))?;
+            cmd.arg("--passed-appkit-groups").arg(&path);
         }
         // The records are read from verify's own events file, which no child and no other writer
         // shares, never from its output; it starts empty, so it holds this run's alone.
@@ -4414,6 +4638,7 @@ impl Real {
                 stop: Some((stop, interrupt::SIGTERM)),
                 push: None,
                 arrivals: false,
+                settles: false,
             },
             &mut cmd,
         );
@@ -4513,9 +4738,30 @@ impl Real {
             if tree_index.expected()
                 && let Some(pool) = &self.pool
             {
-                pool.jobs.serial_bundle_drained();
+                pool.jobs.build_compilers_drained();
             }
             (self.await_fixture_index_op)(self, c, prover, tree_index, stop).and_then(|()| {
+                let _share = {
+                    let _timing =
+                        crate::cut_timing::Timer::parallel_parent()("qualify fixture core wait")
+                            .with_log(Some(&log));
+                    self.pool
+                        .as_ref()
+                        .filter(|_| tree_index.expected())
+                        .map(|pool| {
+                            pool.jobs
+                                .fixture_share(&|| stop.fired() || interrupt::caught().is_some())
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            let refusal = fixture_refusal(c, &error.to_string());
+                            if error.kind() == std::io::ErrorKind::Interrupted {
+                                refusal.could_not_run()
+                            } else {
+                                refusal
+                            }
+                        })?
+                };
                 (self.stage_fixtures_run_op)(
                     self,
                     Step::Qualify,
@@ -4547,7 +4793,10 @@ impl Real {
                 )
             })?;
         self.hand_pool(&mut cmd, false)?;
-        cmd.env(crate::buildplan::SLICE_LOGS_ENV, &self.logs);
+        // A killed cutter cannot forward a stop. Tie the build worker to it; the
+        // worker similarly ties each Cargo group to its own lifetime.
+        cmd.tether()
+            .env(crate::buildplan::SLICE_LOGS_ENV, &self.logs);
         let ran = self.logged_in(
             Logged {
                 step: Step::Qualify,
@@ -4556,6 +4805,7 @@ impl Real {
                 stop: Some((stop, interrupt::SIGTERM)),
                 push: None,
                 arrivals: false,
+                settles: false,
             },
             &mut cmd,
         );
@@ -4676,6 +4926,13 @@ impl Real {
         let spawn: std::sync::Arc<dyn aterm_update_core::github_rest::Spawn> =
             std::sync::Arc::new(crate::github::Launched(self.step_children()));
         crate::github::get_via(Some(&spawn), path).map_err(|e| e.to_string())
+    }
+
+    /// [`Real::github_read`], `None` for GitHub's 404 (an answer, never retried).
+    fn github_read_optional(&self, path: &str) -> Result<Option<aterm_json::Value>, String> {
+        let spawn: std::sync::Arc<dyn aterm_update_core::github_rest::Spawn> =
+            std::sync::Arc::new(crate::github::Launched(self.step_children()));
+        crate::github::get_optional_via(Some(&spawn), path).map_err(|e| e.to_string())
     }
 
     fn site(&self, slug: &str) -> Result<AfterCut, Refusal> {
@@ -4968,6 +5225,10 @@ struct Logged<'a> {
     /// Its lines' arrivals are kept as `publish-line` records ([`Arrivals`]): the engine's
     /// publish.
     arrivals: bool,
+    /// It settles this process's own stop ([`interrupt::stop_self`], the fleet line lost):
+    /// it starts unless a signal from elsewhere was caught ([`interrupt::caught_foreign`]),
+    /// and only such a signal is forwarded to it ([`Real::spawn_settling`]).
+    settles: bool,
 }
 
 /// The engine's line that its export's public-clone check passed: what `pub stage` prints right
@@ -5403,6 +5664,24 @@ fn cut_refusal(gate: &str, why: &str) -> Refusal {
     )
 }
 
+/// The private bump's construction, not its editor, failed at `gate`: nothing was judged, so
+/// the dry run could not run; `remedy` says what to restore or wait for.
+fn private_bump_unavailable(gate: &str, why: &str, remedy: String) -> Refusal {
+    let mut refusal = cut_refusal(gate, why).could_not_run();
+    refusal.remedy = remedy;
+    refusal
+}
+
+/// What restores the private checkout `place` when the private bump's own cleanup failed: a
+/// command that runs as pasted, naming `place` as one shell word.
+fn private_bump_cleanup_remedy(place: &Path) -> String {
+    format!(
+        "restore the private checkout before the next dry run: git -C {} restore \
+         --source=HEAD --staged --worktree -- .",
+        crate::release::shell_word(&place.to_string_lossy())
+    )
+}
+
 fn append_output(log: &Path, out: &std::process::Output) {
     if let Ok(mut f) = crate::durable::open_append(log, true) {
         let _ = f.write_all(&out.stdout);
@@ -5528,24 +5807,158 @@ pub(crate) struct Scratch {
     pub(crate) cache: PathBuf,
 }
 
-/// Run the full export branch locally in owned scratch, including its public-clone check.
-/// The engine's dry run cannot stage or publish, and its audit rows are never pushed.
+/// Candidate-bound export client prepared before qualify's branches start.
+pub(crate) struct LocalExportClient {
+    path: PathBuf,
+    source: String,
+    sha256: String,
+    jobs: u32,
+    wall_s: f64,
+}
+
+impl LocalExportClient {
+    pub(crate) fn record(&self) -> aterm_json::Value {
+        aterm_json::json!({
+            "kind":"qualify-export-client", "source":self.source,
+            "path":self.path, "sha256":self.sha256,
+            "requested_jobs":self.jobs, "wall_s":self.wall_s,
+        })
+    }
+
+    fn validate(&self, source: &str) -> Result<(), String> {
+        if source != self.source {
+            return Err("the prepared export client belongs to another candidate".into());
+        }
+        let (sha256, _) = crate::dmg::sha256_and_size(&self.path)?;
+        if sha256 != self.sha256 {
+            return Err("the prepared export client changed before use".into());
+        }
+        Ok(())
+    }
+}
+
+/// Match qualify preparation: build the engine client before any graph branch starts.
+/// The caller's measured CPU allocation bounds this build, including with a cold target.
+pub(crate) fn prepare_local_export_client(
+    repo: &Path,
+    root: &Path,
+    source: &str,
+    jobs: u32,
+) -> Result<LocalExportClient, String> {
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let _phase = crate::cut_timing::Timer::start(
+        &root.join("gate.log"),
+        "qualify export client preparation",
+    );
+    let mut real = Real::new(repo, None, true, false)?;
+    real.logs = root.to_owned();
+    real.scratch_logs = false;
+    real.step = Step::Qualify;
+    let path = real
+        .engine_agh_with_jobs(Some(jobs))
+        .map_err(|why| why.why)?;
+    let (sha256, _) = crate::dmg::sha256_and_size(&path)?;
+    let client = LocalExportClient {
+        path,
+        source: source.to_owned(),
+        sha256,
+        jobs,
+        wall_s: started.elapsed().as_secs_f64(),
+    };
+    crate::durable::write_fresh(&root.join("result.json"), client.record().to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(client)
+}
+
+/// Run qualify's serial AppKit prefix through its production bundle-half path. Every take
+/// asks for the complete check, with no carried groups and no built-bundle input.
+pub(crate) fn measure_local_appkit(
+    repo: &Path,
+    root: &Path,
+    commit: &str,
+) -> Result<aterm_json::Value, String> {
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let started_at_unix_ms = crate::cut_timing::epoch_ms();
+    let _phase = crate::cut_timing::Timer::parallel_parent()("qualify serial AppKit prefix")
+        .with_log(Some(&root.join("gate.log")));
+    let mut real = Real::new(repo, None, true, false)?;
+    real.logs = root.to_owned();
+    real.scratch_logs = false;
+    real.step = Step::Qualify;
+    let prover = real.prover(None)?;
+    let candidate = Candidate {
+        commit: commit.to_owned(),
+        version: real
+            .version_at(commit)
+            .ok_or("the AppKit candidate has no release version")?,
+        why: "local full-gate measurement".to_owned(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let run = crate::check_record::VerifyRun {
+        half: crate::check_record::Half::Bundle,
+        checks: vec!["appkit".to_owned()],
+        passed_binaries: Vec::new(),
+        passed_lint_packages: Vec::new(),
+        passed_appkit_groups: Vec::new(),
+    };
+    let frozen = crate::release_tools::recorded(&real.release, commit)?;
+    let ran = real.verify_half(
+        Step::Qualify,
+        &candidate,
+        &prover,
+        &run,
+        None,
+        &BranchStop::default(),
+    );
+    let success = ran.as_ref().is_ok_and(|ran| ran.code == 0);
+    let result = aterm_json::json!({
+        "kind":"real-serial-appkit", "commit":commit, "success":success,
+        "wall_s":started.elapsed().as_secs_f64(),
+        "started_at_unix_ms":started_at_unix_ms,
+        "ended_at_unix_ms":crate::cut_timing::epoch_ms(),
+        "verifier":frozen.verify.path, "verifier_sha256":frozen.verify.sha256,
+        "outcome":format!("{ran:?}"),
+    });
+    crate::durable::write_fresh(&root.join("result.json"), result.to_string())
+        .map_err(|error| error.to_string())?;
+    if !success {
+        return Err(format!("the serial AppKit prefix did not pass: {result}"));
+    }
+    Ok(result)
+}
+
+/// Run all local export guards with a candidate-bound client prepared within the CPU budget.
 pub(crate) fn measure_local_export(
     repo: &Path,
     root: &Path,
     commit: &str,
     jobs: u32,
+    prepared: Option<&LocalExportClient>,
 ) -> Result<aterm_json::Value, String> {
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let _phase = crate::cut_timing::Timer::parallel_parent()("qualify local full export")
+        .with_log(Some(&root.join("gate.log")));
     let mut real = Real::new(repo, None, true, false)?;
     real.logs = root.to_owned();
     real.scratch_logs = false;
     real.step = Step::Qualify;
+    let owned;
+    let client = if let Some(client) = prepared {
+        client
+    } else {
+        owned = prepare_local_export_client(repo, &root.join("client"), commit, jobs)?;
+        &owned
+    };
+    client.validate(commit)?;
+    real.engine_agh_explicit = Some(client.path.as_os_str().to_owned());
     let scratch = Scratch {
         dir: root.to_owned(),
         cache: root.join("cache"),
     };
-    let started = std::time::Instant::now();
     let (outcome, _) = real.export_gate_with_check(&scratch, commit, Some(jobs));
     let success = matches!(outcome, Outcome::Pass(_));
     let result = aterm_json::json!({
@@ -5558,6 +5971,99 @@ pub(crate) fn measure_local_export(
     });
     crate::durable::write_fresh(&root.join("result.json"), result.to_string())
         .map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+/// The real fixture producer after both slice clients have drained. Keep the same index
+/// dependency as the cut, with fresh output for every take instead of carrying a prior stage.
+pub(crate) fn measure_local_fixtures(
+    repo: &Path,
+    root: &Path,
+    commit: &str,
+    tree_ended: &std::sync::atomic::AtomicBool,
+    jobs: Option<&aterm_capacity::BranchShares>,
+) -> Result<aterm_json::Value, String> {
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let _phase = crate::cut_timing::Timer::parallel_parent()("qualify real fixtures")
+        .with_log(Some(&root.join("gate.log")));
+    let mut real = Real::new(repo, None, true, false)?;
+    real.logs = root.to_owned();
+    real.scratch_logs = false;
+    real.step = Step::Qualify;
+    let prover = real.prover(None)?;
+    let targo = prover.bin.join("targo");
+    let layout = diagnostic_verify_layout(repo).map_err(|error| error.to_string())?;
+    let index = crate::fixtures::GeneratorIndex::from_plan(&targo, repo, layout.clone())
+        .map_err(|error| error.to_string())?;
+    let waiting = std::time::Instant::now();
+    let handoff = TreeIndexHandoff::default();
+    handoff.expect();
+    let answer = {
+        let _timing = crate::cut_timing::Timer::parallel_parent()("qualify fixture index wait")
+            .with_log(Some(&root.join("fixtures.log")));
+        await_tree_index(
+            &handoff,
+            || index.ready(),
+            || tree_ended.load(std::sync::atomic::Ordering::SeqCst) && !index.ready(),
+            || std::thread::sleep(std::time::Duration::from_millis(250)),
+        )
+    };
+    let index_wait_s = waiting.elapsed().as_secs_f64();
+    if answer != TreeIndexAnswer::Ready {
+        return Err("the full tree ended without the fixture executable index".into());
+    }
+    let waiting = std::time::Instant::now();
+    let _share = {
+        let _timing = crate::cut_timing::Timer::parallel_parent()("qualify fixture core wait")
+            .with_log(Some(&root.join("fixtures.log")));
+        jobs.map(|jobs| jobs.fixture_share(&|| interrupt::caught().is_some()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+    };
+    let core_wait_s = waiting.elapsed().as_secs_f64();
+    // The producer derives aged desk timestamps from SOURCE_DATE_EPOCH. Use one real,
+    // deterministic epoch for every take of this candidate, as a cut's reservation does.
+    let build = crate::snapshot::git_text(repo, &["show", "-s", "--format=%ct", commit])?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("candidate fixture epoch is invalid: {error}"))?;
+    let pins = crate::fixtures::Pins {
+        version: real
+            .version_at(commit)
+            .ok_or("the fixture candidate has no release version")?,
+        build,
+        commit: commit.to_owned(),
+    };
+    let started = std::time::Instant::now();
+    let outcome = crate::fixtures::stage_with_layout(
+        &targo,
+        repo,
+        &root.join("stage"),
+        &pins,
+        Some(&layout),
+        &mut |cmd| {
+            real.captured_with_jobs(
+                Step::Qualify,
+                &prover,
+                &root.join("fixtures.log"),
+                cmd,
+                None,
+                jobs,
+            )
+        },
+    );
+    let result = aterm_json::json!({
+        "kind":"real-handoff-fixtures", "index_wait_s":index_wait_s, "core_wait_s":core_wait_s,
+        "build":build,
+        "execution_s":started.elapsed().as_secs_f64(),
+        "success":outcome.is_ok(), "outcome":format!("{outcome:?}"),
+    });
+    crate::durable::write_fresh(&root.join("result.json"), result.to_string())
+        .map_err(|error| error.to_string())?;
+    if outcome.is_err() {
+        eprintln!("qualify-pilot: fixture phase failed; draining the tree: {result}");
+        return Err(format!("fixture stage did not pass: {result}"));
+    }
     Ok(result)
 }
 
@@ -5623,7 +6129,12 @@ fn rustup_dir() -> Result<PathBuf, aterm_uds::host::Absent> {
 /// How [`Real`] builds a dev binary of its checkout: `targo` with the arguments it is handed (and
 /// what the binary is called in its error), answering cargo's JSON messages
 /// ([`Real::build_checkout_bin`]).
-type CheckoutBuild = fn(&Real, &str, &[std::ffi::OsString]) -> Result<Vec<u8>, String>;
+type CheckoutBuild = fn(
+    &Real,
+    &str,
+    &[std::ffi::OsString],
+    &aterm_verify::NativeBuildPlan,
+) -> Result<Vec<u8>, String>;
 
 /// The variable the publication engine's GitHub transport (`bin/pub_github.py`) reads for the
 /// agh it runs, an absolute path; with none it runs the `agh` on PATH.
@@ -6031,19 +6542,49 @@ fn tap_bootstrap(
 /// Cargo layout variable removed, as `Real::child` does) and the clone by its physical path, as
 /// verify reads its root; so what the release builds beside its `verify` runs, and the
 /// directories its disk claim keeps (`crate::release_disk::own_dirs`), are the ones they choose.
-pub(crate) fn verify_layout(repo: &Path) -> (PathBuf, Option<String>) {
-    let env = aterm_verify::EnvSnapshot {
+///
+/// # Errors
+/// Cargo's target configuration cannot be resolved to a concrete selected directory.
+pub(crate) fn verify_plan(repo: &Path) -> std::io::Result<aterm_verify::NativeBuildPlan> {
+    let env = verify_environment();
+    let repo = aterm_verify::physical(repo);
+    aterm_verify::NativeBuildPlan::capture(&env, &repo)
+}
+
+/// A fixture compiler's actual source/configuration root and a separate stable generated
+/// artifact root. Selecting the plan is read-only; its producer prepares it before compiling.
+pub(crate) fn verify_plan_for_default_target(
+    repo: &Path,
+    target_root: &Path,
+) -> aterm_verify::NativeBuildPlan {
+    aterm_verify::NativeBuildPlan::for_default_target(&verify_environment(), repo, target_root)
+}
+
+/// The release compiler policy, with caller Cargo layout overrides excluded as in `Real::child`.
+pub(crate) fn verify_environment() -> aterm_verify::EnvSnapshot {
+    aterm_verify::EnvSnapshot {
         home: std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default(),
         path: publication_path(),
         ..Default::default()
-    };
-    let repo = aterm_verify::physical(repo);
-    let target = aterm_verify::physical_target(&env, &repo);
-    let layout = aterm_verify::main_build_dir(&env, &repo)
-        .or_else(|| aterm_verify::fallback_build_dir(&env, &repo, &target));
-    (target, layout)
+    }
+}
+
+/// The diagnostic verifier inherits explicit Cargo layout variables; its fixture reader must
+/// inherit that same layout rather than the production child's scrubbed defaults.
+pub(crate) fn diagnostic_verify_layout(
+    repo: &Path,
+) -> std::io::Result<crate::fixtures::CompileLayout> {
+    let env = aterm_verify::EnvSnapshot::capture();
+    diagnostic_verify_layout_from_env(repo, &env)
+}
+
+fn diagnostic_verify_layout_from_env(
+    repo: &Path,
+    env: &aterm_verify::EnvSnapshot,
+) -> std::io::Result<crate::fixtures::CompileLayout> {
+    aterm_verify::NativeBuildPlan::capture(env, repo)
 }
 
 /// The remaining publication PATH supplies ordinary tools and the pinned rustup.
@@ -6391,6 +6932,67 @@ fn source_release_path(slug: &str, tag: &str, draft: Option<u64>) -> String {
     }
 }
 
+/// Step 7's pending state where no private draft id is journaled and GitHub's lookup of `tag`
+/// answers 404: no release, or a draft (that lookup serves none). The sign makes or adopts the
+/// draft and journals its id; the source signing then attaches R's pair to it.
+pub(crate) fn unjournaled_source(tag: &str) -> String {
+    format!(
+        "no private draft of {tag} is journaled, and GitHub serves no published release of it \
+         (its lookup by tag never serves a draft)"
+    )
+}
+
+/// Step 7's judgment of the release it read for R's source publication (`version` at `repo`): the
+/// private draft `draft` the clone journals, read by its id, else R's published release, read by
+/// its tag. Attested when the pair stands; pending when the journaled draft lacks only whole
+/// assets of it (the source signing attaches them); else refused, with the sign-release form
+/// that reaches that release.
+pub(crate) fn judge_source_release(
+    release: &aterm_json::Value,
+    slug: &str,
+    version: &str,
+    repo: &Path,
+    draft: Option<u64>,
+) -> Result<SourceState, Refusal> {
+    let tag = format!("v{version}");
+    if let Some((why, fix)) = source_binding_problem(release, slug, &tag, draft) {
+        return Err(Refusal::new(
+            why,
+            format!("{fix}, then {RELEASE_COMMAND} (nothing was claimed)"),
+        ));
+    }
+    let findings = source_attestation_findings(release);
+    if findings.is_empty() {
+        return Ok(SourceState::Attested);
+    }
+    if let Some(id) = draft
+        && findings
+            .iter()
+            .all(|f| matches!(f, crate::channel::AttestationFinding::Missing(_)))
+    {
+        return Ok(SourceState::Pending(format!(
+            "private draft {id} lacks its source attestation: {}",
+            crate::channel::attestation_words(slug, &findings)
+        )));
+    }
+    Err(Refusal::new(
+        format!(
+            "the source publication of {tag} is incomplete: {}",
+            crate::channel::attestation_words(slug, &findings)
+        ),
+        format!(
+            "finish the source signing ({}), then {RELEASE_COMMAND} (nothing was claimed)",
+            crate::publish::sign_release_command(
+                repo,
+                version,
+                draft
+                    .map(|_| crate::publish::draft_journal_path(repo))
+                    .as_deref()
+            )
+        ),
+    ))
+}
+
 /// Why the release read for `tag` is not the one this cut publishes, and its remedy: another
 /// release than the journaled draft, or a draft GitHub no longer binds to `tag` (it names one
 /// `untagged-…` after an edit that names no tag).
@@ -6409,7 +7011,10 @@ fn source_binding_problem(
             format!(
                 "{slug}'s release read for {tag} is {read}, not the private draft {want} dist/draft-state.toml journals"
             ),
-            "finish or abandon the journaled draft (ship cut --abandon)".to_string(),
+            format!(
+                "withdraw the journaled draft with its reservation ({RELEASE_COMMAND} --forget), \
+                 then {RELEASE_COMMAND}"
+            ),
         ));
     }
     let bound = release
@@ -6428,9 +7033,9 @@ fn source_binding_problem(
     ))
 }
 
-/// The lean-download shape of a published release, from what GitHub serves (its release JSON, never the files the cut wrote): the problems, empty when it carries the shape.
+/// The lean-download shape of a published release on `slug`, from what GitHub serves (its release JSON, never the files the cut wrote): the problems, empty when it carries the shape.
 #[must_use]
-pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> {
+pub fn release_shape(release: &aterm_json::Value, slug: &str, version: &str) -> Vec<String> {
     const MAX_DMG_BYTES: u64 = 200 * 1000 * 1000;
     let mut assets: std::collections::BTreeMap<&str, Option<u64>> = Default::default();
     for a in release
@@ -6493,7 +7098,11 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
             "aterm-appcast.toml is missing — installed copies read it to find this release".into(),
         );
     }
-    bad.extend(source_attestation_findings(release));
+    bad.extend(
+        source_attestation_findings(release)
+            .iter()
+            .map(|finding| finding.words(slug)),
+    );
     let retired: Vec<&str> = assets
         .keys()
         .copied()
@@ -7042,8 +7651,9 @@ impl Real {
             self.fetch_engine_origin()
                 .map_err(SupersedeCheck::Unavailable)?;
         }
-        // Retirement must also recover a hop whose old, tip-bound content proof expired.
-        // supersede verifies the replacement and the old head's ancestry. Publication
+        // Retirement must also recover a hop whose content proof fails, such as one an older,
+        // tip-bound cutter admitted. supersede verifies the replacement and the old head's
+        // ancestry, never the old line. Publication
         // checks below still cover every commit of the retired line.
         let ledger = self
             .git_out(&["show", "origin/main:RELEASES.ledger"])
@@ -7115,6 +7725,7 @@ impl Real {
         seal: &str,
         prover: &Prover,
         half: crate::check_record::Half,
+        admission: crate::check_content::Admission,
     ) -> Result<String, String> {
         let mut command = self.verifier_child(verifier, Some(prover), half);
         self.hand_pool(&mut command, true)
@@ -7129,6 +7740,7 @@ impl Real {
             seal,
             &command,
             half,
+            admission,
         ))
     }
 
@@ -7146,8 +7758,25 @@ impl Real {
             seal,
             prover,
             crate::check_record::Half::Tree,
+            crate::check_content::Admission::WaitDefault,
         )?;
-        crate::check_content::plan(&self.git(), commit, &context)
+        let appkit_context = self.check_content_context(
+            &frozen.verify.path,
+            &frozen.set_sha256,
+            seal,
+            prover,
+            crate::check_record::Half::Bundle,
+            crate::check_content::Admission::Now,
+        )?;
+        let git = self.git();
+        crate::check_content::plan(
+            &git,
+            commit,
+            &context,
+            Some(crate::check_content::AppkitContext {
+                context: &appkit_context,
+            }),
+        )
     }
 
     /// Materialize equal OK records from the immediately preceding line head. A failure to
@@ -7215,15 +7844,12 @@ impl Real {
             Ok(followed) => followed,
             Err(why) => {
                 undo(self);
-                return Err(Refusal::new(why, "read the commit step's log"));
+                return Err(self.commit_log_refusal(why, false));
             }
         };
         if let Err(why) = self.validate_bumped_locks(prover, &followed) {
             undo(self);
-            return Err(Refusal::new(
-                why,
-                "read the commit step's log; the bump is undone",
-            ));
+            return Err(self.commit_log_refusal(why, true));
         }
         drop(lock_timing);
         let inspected = [
@@ -7237,7 +7863,7 @@ impl Real {
             Ok(inspected) => inspected,
             Err(why) => {
                 undo(self);
-                return Err(Refusal::new(why, "read the commit step's log"));
+                return Err(self.commit_log_refusal(why, false));
             }
         };
         let moved: Vec<String> = inspected
@@ -7247,9 +7873,9 @@ impl Real {
             .collect();
         let Some(diff) = self.git_out(&["diff", "-U0"]) else {
             undo(self);
-            return Err(Refusal::new(
+            return Err(self.commit_log_refusal(
                 "could not inspect the bump's diff; the bump is undone",
-                "read the commit step's log",
+                false,
             ));
         };
         let stray = diff.lines().any(|l| {
@@ -7275,9 +7901,9 @@ impl Real {
             Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
             Err(e) => {
                 undo(self);
-                return Err(Refusal::new(
+                return Err(self.commit_log_refusal(
                     format!("the harness versions could not be bumped ({e}); the bump is undone"),
-                    "read the commit step's log",
+                    false,
                 ));
             }
         };
@@ -7301,18 +7927,42 @@ impl Real {
         Ok((msg, declared))
     }
 
+    /// The bump `c` names, committed in this release's private input checkout and on no ref.
+    /// The editor's own refusals ([`Real::edit_bump`]) are verdicts on the tree; a failure of
+    /// the construction around it (the checkout, its path, a git step, the cleanup) judged
+    /// nothing, so it could not run, with a remedy naming that checkout.
     fn preview_bump_from_origin(
         &mut self,
         c: &Candidate,
         prover: &Prover,
         origin: &dyn crate::ledger::Origin,
     ) -> Result<String, Refusal> {
-        let (root, _claim) = self
-            .candidate_checkout(&c.commit)
-            .map_err(|why| cut_refusal("private bump checkout", &why))?;
+        let checkout = crate::input_record::directory(&self.release);
+        let place = checkout.display().to_string();
+        let plumbing = |gate: &str, why: &str| {
+            private_bump_unavailable(
+                gate,
+                why,
+                format!(
+                    "read the error above, then retry the dry run; no ref changed and the \
+                     private checkout {place} keeps no edit"
+                ),
+            )
+        };
+        let (root, _claim) = self.candidate_checkout(&c.commit).map_err(|why| {
+            private_bump_unavailable(
+                "private bump checkout",
+                &why,
+                format!(
+                    "retry once no other release-input judgment of this clone runs (ship \
+                     input-check, another dry run); if the error is about the private \
+                     checkout {place} itself, inspect it first"
+                ),
+            )
+        })?;
         let root = root
             .canonicalize()
-            .map_err(|e| cut_refusal("private bump path", &e.to_string()))?;
+            .map_err(|e| plumbing("private bump path", &e.to_string()))?;
         let original = std::mem::replace(&mut self.repo, root);
         let result = (|| {
             let (message, paths) = self.edit_bump(
@@ -7325,12 +7975,12 @@ impl Real {
             let mut add = vec!["add", "--"];
             add.extend(paths.iter().map(String::as_str));
             crate::ledger::git_ok(&git, &add)
-                .map_err(|e| cut_refusal("private bump index", &e.to_string()))?;
+                .map_err(|e| plumbing("private bump index", &e.to_string()))?;
             let tree = crate::ledger::git_ok(&git, &["write-tree"])
-                .map_err(|e| cut_refusal("private bump tree", &e.to_string()))?
+                .map_err(|e| plumbing("private bump tree", &e.to_string()))?
                 .stdout_utf8();
             let date = crate::ledger::git_ok(&git, &["show", "-s", "--format=%ct", &c.commit])
-                .map_err(|e| cut_refusal("private bump date", &e.to_string()))?
+                .map_err(|e| plumbing("private bump date", &e.to_string()))?
                 .stdout_utf8();
             let date = format!("{} +0000", date.trim());
             let out = git
@@ -7345,9 +7995,9 @@ impl Real {
                         ("GIT_COMMITTER_DATE", &date),
                     ],
                 )
-                .map_err(|e| cut_refusal("private bump commit", &e.to_string()))?;
+                .map_err(|e| plumbing("private bump commit", &e.to_string()))?;
             if !out.success() {
-                return Err(cut_refusal("private bump commit", &out.stderr_utf8()));
+                return Err(plumbing("private bump commit", &out.stderr_utf8()));
             }
             Ok(out.stdout_utf8().trim().to_owned())
         })();
@@ -7365,7 +8015,13 @@ impl Real {
             ],
         );
         self.repo = original;
-        cleaned.map_err(|why| cut_refusal("private bump cleanup", &why.to_string()))?;
+        cleaned.map_err(|why| {
+            private_bump_unavailable(
+                "private bump cleanup",
+                &why.to_string(),
+                private_bump_cleanup_remedy(&checkout),
+            )
+        })?;
         result
     }
 
@@ -7393,7 +8049,7 @@ impl Real {
         c: &Candidate,
         dry: bool,
         origin: crate::ledger::Result<crate::github_remote::Remote>,
-    ) -> Vec<Refusal> {
+    ) -> Preflight {
         let _timing =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "commit-preflight");
         let mut blocks: Vec<Refusal> = Vec::new();
@@ -7417,43 +8073,54 @@ impl Real {
                     .tag_fingerprint()
             })
         });
-        let with_origin =
-            |check: &dyn Fn(&dyn crate::ledger::Origin) -> crate::ledger::Result<()>| match &origin
-            {
-                Ok(origin) => check(origin),
-                Err(error) => Err(crate::ledger::Error::new(error.to_string())),
-            };
+        // Each gate's refusal, or what it says the run must show once the preflight passes.
+        let asked = || {
+            origin
+                .as_ref()
+                .map(|origin| origin as &dyn crate::ledger::Origin)
+        };
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
+        let mut notes = Vec::new();
         let _ = check_commit_gate("changelog", &mut blocks, &mut report, || {
             crate::cut_timing::measure("commit-gate changelog", || {
-                crate::gates::changelog_gate_at(&git, commit, version).map(|_| ())
-            })
-            .map_err(|error| cut_refusal("changelog", &error.to_string()))
-        });
-        let _ = check_commit_gate("harness versions", &mut blocks, &mut report, || {
-            crate::cut_timing::measure("commit-gate harness versions", || {
-                with_origin(&|origin| {
-                    crate::gates::harness_versions_gate_at(&git, origin, commit, version)
-                        .map(|_| ())
+                origin_gate("changelog", asked(), &|origin| {
+                    let catalog = origin.tag_catalog().map_err(crate::ledger::Error::new)?;
+                    crate::gates::changelog_gate_at(&git, commit, version, &catalog).map(|_| ())
                 })
             })
-            .map_err(|error| cut_refusal("harness versions", &error.to_string()))
         });
+        let harness = check_commit_gate("harness versions", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate harness versions", || {
+                origin_gate("harness versions", asked(), &|origin| {
+                    // A bump still to be written (the real launcher's base preflight) owes its
+                    // harness versions to its own commit, which the preflight names; R is held
+                    // to the strict gate.
+                    match c.bump_from.as_deref() {
+                        Some(from) => crate::gates::harness_versions_before_bump_at(
+                            &git, origin, commit, from, version,
+                        ),
+                        None => {
+                            crate::gates::harness_versions_gate_at(&git, origin, commit, version)
+                                .map(|_| None)
+                        }
+                    }
+                })
+            })
+        });
+        notes.extend(harness.flatten());
         let _ = check_commit_gate("handoff fixtures", &mut blocks, &mut report, || {
             crate::cut_timing::measure("commit-gate handoff fixtures", || {
-                with_origin(&|origin| {
+                origin_gate("handoff fixtures", asked(), &|origin| {
                     crate::gates::handoff_fixture_gate_at(&git, origin, commit, version).map(|_| ())
                 })
             })
-            .map_err(|error| cut_refusal("handoff fixtures", &error.to_string()))
         });
         let _ = check_commit_gate("handoff policy", &mut blocks, &mut report, || {
             crate::cut_timing::measure("commit-gate handoff policy", || {
-                with_origin(&|origin| {
+                origin_gate("handoff policy", asked(), &|origin| {
                     crate::gates::handoff_policy_gate_at(&git, origin, commit, version).map(|_| ())
                 })
             })
-            .map_err(|error| cut_refusal("handoff policy", &error.to_string()))
         });
         let checkout = if dry {
             let Some(checkout) =
@@ -7462,7 +8129,10 @@ impl Real {
                         .map_err(|why| cut_refusal("R-tree locked metadata", &why).could_not_run())
                 })
             else {
-                return blocks;
+                return Preflight {
+                    notes,
+                    found: blocks,
+                };
             };
             Some(checkout)
         } else {
@@ -7479,7 +8149,9 @@ impl Real {
                 let refusal = cut_refusal("locked metadata", &error.to_string());
                 match error {
                     crate::gates::LockedMetadataError::Unavailable(_) => refusal.could_not_run(),
-                    crate::gates::LockedMetadataError::Lockfile(_) => refusal,
+                    crate::gates::LockedMetadataError::Lockfile(_) => {
+                        refusal.failing("locked metadata")
+                    }
                 }
             })
         });
@@ -7516,7 +8188,10 @@ impl Real {
                     });
             }
         }
-        blocks
+        Preflight {
+            notes,
+            found: blocks,
+        }
     }
 }
 
@@ -7535,6 +8210,100 @@ pub(crate) fn check_commit_gate<T>(
             blocks.push(refusal);
             None
         }
+    }
+}
+
+/// R's commit-only gate `gate`, which reads origin in `check`. Its refusal is R's red
+/// ([`Refusal::failing`]) when every read of origin answered; with no origin, or a read of it
+/// that failed while the gate judged, the gate could not ask: COULD NOT RUN, deciding nothing of
+/// R's source, so no repair worker opens on a remote's failure.
+fn origin_gate<T>(
+    gate: &str,
+    origin: Result<&dyn crate::ledger::Origin, &crate::ledger::Error>,
+    check: &dyn Fn(&dyn crate::ledger::Origin) -> crate::ledger::Result<T>,
+) -> Result<T, Refusal> {
+    let origin = origin.map_err(|error| cut_refusal(gate, &error.to_string()).could_not_run())?;
+    let asked = Asked {
+        origin,
+        failed: std::cell::Cell::new(false),
+    };
+    check(&asked).map_err(|error| {
+        let refusal = cut_refusal(gate, &error.to_string());
+        if asked.failed.get() {
+            refusal.could_not_run()
+        } else {
+            refusal.failing(gate)
+        }
+    })
+}
+
+/// The origin one gate asks ([`origin_gate`]): each call passes through, and `failed` keeps
+/// whether any of them failed.
+struct Asked<'a> {
+    origin: &'a dyn crate::ledger::Origin,
+    failed: std::cell::Cell<bool>,
+}
+
+impl Asked<'_> {
+    fn noted<T>(&self, answer: Result<T, String>) -> Result<T, String> {
+        if answer.is_err() {
+            self.failed.set(true);
+        }
+        answer
+    }
+}
+
+impl crate::ledger::Origin for Asked<'_> {
+    fn refresh_main(&self) -> Result<String, String> {
+        self.noted(self.origin.refresh_main())
+    }
+    fn tag_catalog(&self) -> Result<String, String> {
+        self.noted(self.origin.tag_catalog())
+    }
+    fn tag_commit(&self, tag: &str) -> Result<Option<String>, String> {
+        self.noted(self.origin.tag_commit(tag))
+    }
+    fn first_tag_commit(&self, tags: &[String]) -> Result<Option<(String, String)>, String> {
+        self.noted(self.origin.first_tag_commit(tags))
+    }
+    fn submodule_tip(&self, path: &Path, reference: &str) -> Result<String, String> {
+        self.noted(self.origin.submodule_tip(path, reference))
+    }
+    fn get(&self, reference: &str) -> Result<Option<String>, String> {
+        self.noted(self.origin.get(reference))
+    }
+    fn publisher_controls(&self) -> Result<(Option<String>, Option<String>), String> {
+        self.noted(self.origin.publisher_controls())
+    }
+    fn import(&self, oid: &str) -> Result<(), String> {
+        self.noted(self.origin.import(oid))
+    }
+    fn peel(&self, oid: &str) -> Result<Option<String>, String> {
+        self.noted(self.origin.peel(oid))
+    }
+    fn tag_object(&self, oid: &str) -> Result<Vec<u8>, String> {
+        self.noted(self.origin.tag_object(oid))
+    }
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<crate::ledger::RefWrite, String> {
+        self.noted(self.origin.write(reference, before, after))
+    }
+    fn delete(
+        &self,
+        reference: &str,
+        expected_oid: &str,
+    ) -> Result<crate::ledger::RefWrite, String> {
+        self.noted(self.origin.delete(reference, expected_oid))
+    }
+    fn control_transaction(
+        &self,
+        transaction: crate::ledger::ControlRefTransaction,
+    ) -> Result<crate::ledger::RefWrite, String> {
+        self.noted(self.origin.control_transaction(transaction))
     }
 }
 
@@ -7756,7 +8525,12 @@ impl Backend for Real {
             claim.audit()?;
             return Ok(line.clone());
         }
-        let claim = crate::line_claim::Claim::take(&self.repo, &prefix, &self.logs, continued)?;
+        let take = if continued {
+            crate::line_claim::Take::Continue
+        } else {
+            crate::line_claim::Take::Contend
+        };
+        let claim = crate::line_claim::Claim::take(&self.repo, &prefix, &self.logs, take)?;
         let selected = if claim.line == prefix {
             line.clone()
         } else {
@@ -7850,11 +8624,15 @@ impl Backend for Real {
             Ok(None) => return refused("no existing fleet line to supersede".into()),
             Err(why) => return refused(why),
         };
-        let mut claim =
-            match crate::line_claim::Claim::take(&self.repo, &previous, &self.logs, false) {
-                Ok(claim) => claim,
-                Err(why) => return self.classify_after_claim_stop(&requested, why),
-            };
+        let mut claim = match crate::line_claim::Claim::take(
+            &self.repo,
+            &previous,
+            &self.logs,
+            crate::line_claim::Take::Supersede,
+        ) {
+            Ok(claim) => claim,
+            Err(why) => return self.classify_after_claim_stop(&requested, why),
+        };
         let previous = claim.line.clone();
         self.prefetched_origin = None;
         if let Err(error) = self.prefetch_source() {
@@ -8306,14 +9084,14 @@ impl Backend for Real {
         self.git_out(&["rev-parse", "HEAD"]).unwrap_or_default()
     }
 
-    fn input_checks(&mut self, base: &str, tip: &str, prover: &Prover) -> Result<String, Refusal> {
-        let remedy = crate::release::fix_remedy(tip);
+    fn input_checks(
+        &mut self,
+        base: &str,
+        tip: &str,
+        prover: &Prover,
+    ) -> Result<String, InputFinding> {
         let unavailable = |why: String| {
-            Refusal::new(
-                format!("release input could not be judged: {why}"),
-                remedy.clone(),
-            )
-            .could_not_run()
+            InputFinding::Unanswered(format!("release input could not be judged: {why}"))
         };
         // Both a dry preflight and its eventual cut use this one owned checkout. A temporary
         // dry-run path followed by the release clone changes every compiler path input even
@@ -8340,15 +9118,62 @@ impl Backend for Real {
                 if let Some(note) = input.no_work_note() {
                     return Ok(note);
                 }
-                let mut child = self.child(prover.bin.join("targo"), Some(prover));
-                if let Some(layout) = verify_layout(root).1 {
-                    child.args(["--config", &layout]);
+                let environment = verify_environment();
+                let plan =
+                    aterm_verify::NativeBuildPlan::capture(&environment, root).map_err(|e| {
+                        unavailable(format!("select release-input build directory: {e}"))
+                    })?;
+                let mut bootstrap = aterm_verify::native_verifier::build_command(
+                    root,
+                    &prover.bin.join("targo"),
+                    &plan,
+                )
+                .map_err(unavailable)?;
+                publication_environment(&self.engine, &mut bootstrap);
+                let mut bootstrap =
+                    self.configure_child(self.scrubbed_command(bootstrap), Some(prover));
+                bootstrap.current_dir(root);
+                crate::input_record::detach_launcher(&mut bootstrap);
+                plan.apply_to_command(&mut bootstrap).map_err(|e| {
+                    unavailable(format!("configure release-input build environment: {e}"))
+                })?;
+                let (built, accounting) = self
+                    .output_accounted(Step::Checks, &mut bootstrap)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Checks), true)
+                {
+                    let _ = log.write_all(&built.stdout);
+                    let _ = log.write_all(&built.stderr);
+                    let _ = writeln!(log, "{accounting}");
                 }
-                child
-                    .args(["--unverified", "verify", "release-input", "--base", base])
-                    .env("PUBLICATION_ENGINE", &self.engine)
-                    .current_dir(root);
-                crate::input_record::detach_launcher(&mut child);
+                if !built.status.success() {
+                    return Err(unavailable(format!(
+                        "release-input verifier bootstrap exited {}: {}",
+                        built.status,
+                        String::from_utf8_lossy(&built.stderr)
+                    )));
+                }
+                let verifier = aterm_verify::native_verifier::built(root, &built.stdout)
+                    .map_err(unavailable)?;
+                let runtime = || -> Result<Command, InputFinding> {
+                    let mut command =
+                        aterm_verify::native_verifier::command(&verifier, root, &environment)
+                            .map_err(unavailable)?;
+                    publication_environment(&self.engine, &mut command);
+                    let mut command =
+                        self.configure_child(self.scrubbed_command(command), Some(prover));
+                    aterm_verify::native_verifier::configure_runtime(
+                        &mut command,
+                        root,
+                        &environment,
+                    );
+                    command
+                        .current_dir(root)
+                        .args(["release-input", "--base", base]);
+                    crate::input_record::detach_launcher(&mut command);
+                    Ok(command)
+                };
+                let mut child = runtime()?;
                 let seal = (self.build_inputs)().map_err(unavailable)?;
                 let scanner = atpkg::prerequisite::configured(
                     &[atpkg::prerequisite::Prerequisite::Gitleaks],
@@ -8362,15 +9187,7 @@ impl Backend for Real {
                 let input_tools = format!("{seal}\ngitleaks {}", scanner.tree_root());
                 // The handoff filename is a capability for reading this already-bound seal.
                 // It differs between a dry run and a real run, without changing any input.
-                let mut identity_child = self.child(prover.bin.join("targo"), Some(prover));
-                if let Some(layout) = verify_layout(root).1 {
-                    identity_child.args(["--config", &layout]);
-                }
-                identity_child
-                    .args(["--unverified", "verify", "release-input", "--base", base])
-                    .env("PUBLICATION_ENGINE", &self.engine)
-                    .current_dir(root);
-                crate::input_record::detach_launcher(&mut identity_child);
+                let mut identity_child = runtime()?;
                 self.finalize_spawn_environment(&mut identity_child)
                     .map_err(unavailable)?;
                 identity_child.env_remove(crate::build_inputs::SEAL_ENV);
@@ -8415,9 +9232,7 @@ impl Backend for Real {
                 .map_err(unavailable)?;
                 let missing = crate::check_record::input_missing(&records, &tree, &input_seal)
                     .map_err(|why| match why {
-                        crate::check_record::InputError::Failed(why) => {
-                            Refusal::new(why, remedy.clone())
-                        }
+                        crate::check_record::InputError::Failed(why) => InputFinding::Failed(why),
                         crate::check_record::InputError::Unavailable(why) => unavailable(why),
                     })?;
                 if missing.is_empty() {
@@ -8526,13 +9341,10 @@ impl Backend for Real {
                         .find(|line| line.starts_with("release input:"))
                         .unwrap_or("release input passed")
                         .to_string())
+                } else if out.status.code() == Some(aterm_verify::exit::FAILED) {
+                    Err(InputFinding::Failed(text))
                 } else {
-                    let refusal = Refusal::new(text, remedy.clone());
-                    Err(if out.status.code() == Some(aterm_verify::exit::FAILED) {
-                        refusal
-                    } else {
-                        refusal.could_not_run()
-                    })
+                    Err(InputFinding::Unanswered(text))
                 }
             }
             Ok(out) => Err(unavailable(out.stderr_utf8())),
@@ -8750,14 +9562,20 @@ impl Backend for Real {
         )
     }
 
-    fn cut_journal(&mut self) -> Option<CutState> {
+    fn cut_journal_read(&mut self) -> Result<Option<CutState>, CutJournalUnread> {
         let header =
-            crate::publish::JournalHeader::read(&self.repo.join("dist/cut-state.toml")).ok()??;
-        Some(CutState {
+            crate::publish::JournalHeader::read_classified(&self.repo.join("dist/cut-state.toml"))
+                .map_err(|unread| match unread {
+                    crate::publish::JournalUnread::Read(e) => CutJournalUnread::Read(e.to_string()),
+                    crate::publish::JournalUnread::Invalid(e) => {
+                        CutJournalUnread::Invalid(e.to_string())
+                    }
+                })?;
+        Ok(header.map(|header| CutState {
             finished: header.finished(),
             version: header.version,
             build: header.build_number,
-        })
+        }))
     }
 
     fn is_dir(&mut self, path: &Path) -> bool {
@@ -8907,8 +9725,14 @@ impl Backend for Real {
     }
 
     fn preview_bump(&mut self, c: &Candidate, prover: &Prover) -> Result<String, Refusal> {
-        let origin = crate::publish::native_origin(&self.repo)
-            .map_err(|e| cut_refusal("private bump origin", &e.to_string()))?;
+        let origin = crate::publish::native_origin(&self.repo).map_err(|e| {
+            private_bump_unavailable(
+                "private bump origin",
+                &e.to_string(),
+                "restore the configured repository matching Cargo.toml, then retry the dry run"
+                    .into(),
+            )
+        })?;
         self.preview_bump_from_origin(c, prover, &origin)
     }
 
@@ -9035,17 +9859,21 @@ impl Backend for Real {
             .could_not_run());
         }
         let explicit = std::env::var_os("ATPKG_KEYS");
-        let helper =
-            crate::source_signing::prepare_helper(&self.repo, explicit.as_deref(), |args| {
+        let helper = crate::source_signing::prepare_helper(
+            &self.repo,
+            explicit.as_deref(),
+            &verify_environment(),
+            |args, plan| {
                 println!("validation tools: building this checkout's source-signing helper");
-                (self.checkout_build)(self, "source-signing helper", args)
-            })
-            .map_err(|why| {
-                Refusal::new(
-                    why,
-                    "restore the source-signing helper build and retry the release",
-                )
-            })?;
+                (self.checkout_build)(self, "source-signing helper", args, plan)
+            },
+        )
+        .map_err(|why| {
+            Refusal::new(
+                why,
+                "restore the source-signing helper build and retry the release",
+            )
+        })?;
         self.prepared_source_helper = Some(helper);
         Ok("all pinned prerequisites and the source-signing helper are ready".into())
     }
@@ -9078,10 +9906,12 @@ impl Backend for Real {
         // verify_pending proved every discarded hop is reproducible from its landed fix,
         // author/committer metadata and predecessor. A dirty or unrelated head never gets here;
         // the caller retains or explicitly removes the journal only after this reset succeeds.
+        // The reset restores, it starts no work: the release's own stop (its fleet line lost,
+        // which a refusal settles here) leaves it free to run; a person's signal refuses it.
         let mut cmd = local_git()?;
         cmd.current_dir(&self.repo)
             .args(["reset", "-q", "--keep", prefix.head()]);
-        let ran = self.logged(Step::Commit, &mut cmd);
+        let ran = self.logged_settling(Step::Commit, &mut cmd);
         if ran.code != 0 {
             return Err(Refusal::new(
                 "cannot rewind the locally generated candidate",
@@ -9156,6 +9986,7 @@ impl Backend for Real {
             crate::cut_timing::EXEC_PID_ENV,
             std::process::id().to_string(),
         );
+        aterm_verify::remote_host::release_before_exec().map_err(cannot)?;
         let error = command.exec();
         Err(cannot(error.to_string()))
     }
@@ -9168,18 +9999,25 @@ impl Backend for Real {
         let stderr = self.logs.join("verifier-build.log");
         let start = || -> Result<WarmingVerifier, String> {
             let mut command = self.child(prover.bin.join("targo"), Some(prover));
-            let layout = verify_layout(&self.repo).1;
+            let plan = verify_plan(&self.repo)
+                .map_err(|e| format!("select verifier build directory: {e}"))?;
             command
                 .args(Self::frozen_tool_args(
                     &self.repo,
                     &FROZEN_VERIFY,
                     "test",
-                    layout.as_deref(),
+                    plan.build_dir(),
                 ))
+                .arg("--target-dir")
+                .arg(plan.target())
                 .current_dir(&self.repo)
                 .stdin(Stdio::null())
                 .stdout(std::fs::File::create(&stdout).map_err(|e| e.to_string())?)
                 .stderr(std::fs::File::create(&stderr).map_err(|e| e.to_string())?);
+            plan.apply_to_command(&mut command)
+                .map_err(|e| format!("configure verifier build environment: {e}"))?;
+            plan.prepare()
+                .map_err(|e| format!("prepare verifier build directory: {e}"))?;
             let (child, forwarded) = self
                 .spawn_forwarded(&mut command)
                 .map_err(|e| e.to_string())?;
@@ -9347,7 +10185,7 @@ impl Backend for Real {
         crate::gates::own_cutter(&self.git(), &c.commit).is_ok()
     }
 
-    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
+    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Preflight {
         let origin = crate::publish::native_origin(&self.repo);
         self.commit_gates_from_origin(c, dry, origin)
     }
@@ -9417,6 +10255,21 @@ impl Backend for Real {
 
     fn withdraw(&mut self, key: &str) -> Result<String, String> {
         notice(&["notice", "done"], &format!("{key} withdraw"))
+    }
+
+    fn repair(&mut self, failure: &aterm_release::repair::Failure) -> Vec<String> {
+        let record = self.release.join(aterm_release::repair::RECORD_FILE);
+        aterm_release::repair::open(
+            &record,
+            &self.repo,
+            failure,
+            &mut aterm_release::repair::Ctl,
+        )
+        .lines(&record)
+    }
+
+    fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String> {
+        crate::buildplan::slice_memory_forecast()
     }
 
     fn origin_tail(&mut self) -> Option<u64> {
@@ -9544,51 +10397,120 @@ impl Backend for Real {
         self.prepare_source_signing()
     }
 
-    fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
+    fn source_publication(&mut self, c: &Candidate, build: u64) -> Result<SourceState, Refusal> {
         let _timing = crate::cut_timing::Timer::start(
             &self.step_log(Step::Publish),
             "source publication binding",
         );
         let slug = self.slug();
         let tag = format!("v{}", c.version);
-        let draft = crate::publish::journaled_draft(&self.repo.join("dist"), &c.version).map_err(
-            |why| {
+        let draft = crate::publish::journaled_draft(&self.repo.join("dist"), &c.version, build)
+            .map_err(|why| {
                 Refusal::new(
                     format!("the private draft journal of {tag} cannot be read: {why}"),
                     format!("run {RELEASE_COMMAND} again once dist/ is readable"),
                 )
                 .could_not_run()
-            },
-        )?;
-        let release = self
-            .github_read(&source_release_path(&slug, &tag, draft))
-            .map_err(|e| {
-                Refusal::new(
-                    format!("could not read {slug} {tag} from GitHub's API ({e})"),
-                    format!("run {RELEASE_COMMAND} again once the channel answers"),
-                )
-                .could_not_run()
             })?;
-        if let Some((why, fix)) = source_binding_problem(&release, &slug, &tag, draft) {
-            return Err(Refusal::new(
-                why,
-                format!("{fix}, then {RELEASE_COMMAND} (nothing was claimed)"),
-            ));
-        }
-        let missing = source_attestation_findings(&release);
-        if missing.is_empty() {
-            return Ok(());
-        }
-        Err(Refusal::new(
-            format!(
-                "the source publication of {tag} is incomplete: {}",
-                missing.join("; ")
-            ),
-            format!("finish pub sign-release aterm, then {RELEASE_COMMAND} (nothing was claimed)"),
-        ))
+        let unread = |e: String| {
+            Refusal::new(
+                format!("could not read {slug} {tag} from GitHub's API ({e})"),
+                format!("run {RELEASE_COMMAND} again once the channel answers"),
+            )
+            .could_not_run()
+        };
+        let path = source_release_path(&slug, &tag, draft);
+        let release = match draft {
+            // An id never comes back: a journaled draft GitHub does not answer was deleted, and
+            // only a person can say so for certain (a retry reads the same 404).
+            Some(id) => self
+                .github_read_optional(&path)
+                .map_err(unread)?
+                .ok_or_else(|| {
+                    Refusal::new(
+                        format!(
+                            "GitHub answers no release {id}, the private draft of {tag} \
+                         dist/draft-state.toml journals"
+                        ),
+                        format!(
+                            "once {slug}'s releases page shows no draft of {tag} this clone made, \
+                         remove dist/draft-state.toml and dist/draft-bytes.toml, then \
+                         {RELEASE_COMMAND} (its sign drafts afresh; nothing was claimed)"
+                        ),
+                    )
+                })?,
+            None => match self.github_read_optional(&path).map_err(unread)? {
+                Some(release) => release,
+                None => return Ok(SourceState::Pending(unjournaled_source(&tag))),
+            },
+        };
+        judge_source_release(&release, &slug, &c.version, &self.repo, draft)
     }
 
-    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Vec<String> {
+    fn attest_draft(
+        &mut self,
+        c: &Candidate,
+        build: u64,
+        prover: &Prover,
+    ) -> Result<String, Refusal> {
+        let tag = format!("v{}", c.version);
+        let id = crate::publish::journaled_draft(&self.repo.join("dist"), &c.version, build)
+            .map_err(|why| {
+                Refusal::new(
+                    format!("the private draft journal of {tag} cannot be read: {why}"),
+                    format!("run {RELEASE_COMMAND} again once dist/ is readable"),
+                )
+                .could_not_run()
+            })?
+            .ok_or_else(|| {
+                Refusal::new(
+                    format!(
+                        "cut --sign passed, and dist/draft-state.toml names no private draft of \
+                         {tag}: the source signing has no draft to attach R's attestation to, \
+                         and nothing ran"
+                    ),
+                    format!("read the sign's log, then {RELEASE_COMMAND}"),
+                )
+            })?;
+        self.engine_sync()?;
+        self.prepare_source_signing()?;
+        let state = crate::publish::draft_journal_path(&self.repo);
+        let shown = crate::publish::sign_release_command(&self.repo, &c.version, Some(&state));
+        let mut cmd = self.engine_child(&self.engine, Some(prover))?;
+        cmd.args(crate::publish::sign_release_args(
+            &self.repo,
+            &c.version,
+            Some(&state),
+        ));
+        if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Publish), true) {
+            let _ = writeln!(log, "$ {shown}");
+        }
+        let ran = self.logged(Step::Publish, &mut cmd);
+        if ran.code == 0 {
+            return Ok(format!(
+                "{shown} attached R's source attestation to private draft {id}"
+            ));
+        }
+        let refusal = Refusal::new(
+            format!(
+                "the source signing of {tag} onto private draft {id} exited {}: {}",
+                ran.code,
+                ran.detail.last().cloned().unwrap_or_default()
+            ),
+            format!(
+                "read step 7's log; {RELEASE_COMMAND} signs alone and runs it again (or finish \
+                 it by hand: {shown}); nothing was claimed"
+            ),
+        )
+        .detail(ran.detail);
+        Err(if ran.code == 130 {
+            refusal.could_not_run()
+        } else {
+            refusal
+        })
+    }
+
+    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Discarded {
         crate::publish::discard_signed(&self.repo.join("dist"), version, build, reason)
     }
     fn cut(
@@ -9796,7 +10718,7 @@ impl Real {
             ("after-cut site election", || self.site_tag(&slug)),
         );
         let (mut problems, pointer) = match release {
-            Ok((rel, pointer)) => (release_shape(&rel, version), pointer),
+            Ok((rel, pointer)) => (release_shape(&rel, &slug, version), pointer),
             Err(why) => {
                 return Err(Refusal::new(
                     why,
@@ -9826,7 +10748,7 @@ impl Real {
                 Ok(rel) => {
                     let v = site_tag.strip_prefix('v').unwrap_or(&site_tag);
                     problems.extend(
-                        release_shape(&rel, v).into_iter().map(|p| {
+                        release_shape(&rel, &slug, v).into_iter().map(|p| {
                             format!("{site_tag} (the release alab.systems would link): {p}")
                         }),
                     );
@@ -11162,7 +12084,7 @@ pub fn input_check(repo: &Path, base: &str) -> Result<(), String> {
             println!("{note}");
             Ok(())
         }
-        Err(refusal) => Err(refusal.why),
+        Err(found) => Err(found.why().to_owned()),
     }
 }
 
@@ -11393,7410 +12315,5 @@ mod commit_gate_measure;
 pub(crate) mod dry_tools_tests;
 
 #[cfg(test)]
-mod tests {
-    /// A held shared slice budget in the build child's process tree opens the production tree
-    /// gate. One held exclusive learner plus its queued or not-yet-present sibling selects the
-    /// bounded serial escape.
-    /// NEGATIVE CONTROLS: queued shared, foreign, undersized, lower-ranked and non-accounting
-    /// rows do not authorize either schedule, and the old Pending answer for a held learner
-    /// would strand that slice behind the all-token barrier.
-    #[test]
-    fn a_held_descendant_shared_slice_budget_opens_the_tree_gate() {
-        let record = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::Holder,
-            pid,
-            start_ms: 1,
-            seq: 1,
-            checkout: String::new(),
-            need: aterm_capacity::Need::new(what)
-                .rank(aterm_capacity::Rank::Release)
-                .mem(mem)
-                .margin(1),
-            timing: aterm_capacity::TimingEvidence::default(),
-            held: held.then_some(aterm_capacity::Held {
-                admitted_ms: 2,
-                cores: 0,
-                alone: false,
-            }),
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        let learning = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::Holder,
-            pid,
-            start_ms: 1,
-            seq: 1,
-            checkout: String::new(),
-            need: aterm_capacity::Need::new(what)
-                .rank(aterm_capacity::Rank::Release)
-                .mem(mem)
-                .margin(1)
-                .alone(),
-            timing: aterm_capacity::TimingEvidence::default(),
-            held: held.then_some(aterm_capacity::Held {
-                admitted_ms: 2,
-                cores: 0,
-                alone: true,
-            }),
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        let me = 10;
-        let child = crate::interrupt::Proc {
-            pid: 20,
-            parent: me,
-            pgid: 20,
-            name: "build".into(),
-        };
-        let foreign = crate::interrupt::Proc {
-            pid: 30,
-            parent: 1,
-            pgid: 30,
-            name: "other".into(),
-        };
-        for (held, bytes, expected) in [
-            (true, 40_u64 << 30, super::SliceMemory::Serial),
-            (false, 40_u64 << 30, super::SliceMemory::Pending),
-            (true, 35_u64 << 30, super::SliceMemory::StaleBudget),
-            (true, 1_u64 << 30, super::SliceMemory::Pending),
-        ] {
-            let packed = record(20, crate::slice_units::SERIAL_PARENT, held, bytes);
-            assert_eq!(
-                super::slices_hold_memory_in(
-                    u32::try_from(me).unwrap(),
-                    44_u64 << 30,
-                    &[packed],
-                    std::slice::from_ref(&child)
-                ),
-                expected
-            );
-        }
-        let shared = record(
-            20,
-            "release slice memory budget",
-            true,
-            crate::slice_units::MIN_SHARED,
-        );
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                std::slice::from_ref(&shared),
-                std::slice::from_ref(&child)
-            ),
-            super::SliceMemory::Held
-        );
-        let calibrated_minimum = 55 * (1_u64 << 30);
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                calibrated_minimum,
-                std::slice::from_ref(&shared),
-                std::slice::from_ref(&child),
-            ),
-            super::SliceMemory::StaleBudget,
-            "a held parent sized from an older book must release the barrier to build alone"
-        );
-        let calibrated = record(20, "release slice memory budget", true, calibrated_minimum);
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                calibrated_minimum,
-                std::slice::from_ref(&calibrated),
-                std::slice::from_ref(&child),
-            ),
-            super::SliceMemory::Held
-        );
-        for malformed in [
-            aterm_capacity::Record {
-                need: aterm_capacity::Need::new("release slice memory budget")
-                    .rank(aterm_capacity::Rank::Release)
-                    .mem(calibrated_minimum),
-                ..calibrated.clone()
-            },
-            aterm_capacity::Record {
-                held: calibrated.held.map(|held| aterm_capacity::Held {
-                    alone: true,
-                    ..held
-                }),
-                ..calibrated.clone()
-            },
-        ] {
-            assert_eq!(
-                super::slices_hold_memory_in(
-                    u32::try_from(me).unwrap(),
-                    calibrated_minimum,
-                    std::slice::from_ref(&malformed),
-                    std::slice::from_ref(&child),
-                ),
-                super::SliceMemory::Pending,
-                "a shared parent must carry the anti-ALONE margin and admission"
-            );
-        }
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                &[record(
-                    20,
-                    "release slice memory budget",
-                    false,
-                    crate::slice_units::MIN_SHARED,
-                )],
-                std::slice::from_ref(&child)
-            ),
-            super::SliceMemory::Pending,
-            "a queued shared parent has reserved no memory yet"
-        );
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                &[record(
-                    30,
-                    "release slice memory budget",
-                    true,
-                    crate::slice_units::MIN_SHARED,
-                )],
-                &[child.clone(), foreign]
-            ),
-            super::SliceMemory::Pending,
-            "another release's held budget cannot open this one's tree gate"
-        );
-        for mem in [calibrated_minimum - 1, 1] {
-            assert_eq!(
-                super::slices_hold_memory_in(
-                    u32::try_from(me).unwrap(),
-                    calibrated_minimum,
-                    &[record(20, "release slice memory budget", true, mem)],
-                    std::slice::from_ref(&child)
-                ),
-                if mem >= crate::slice_units::MIN_SHARED {
-                    super::SliceMemory::StaleBudget
-                } else {
-                    super::SliceMemory::Pending
-                },
-                "a shared-label claim below the production floor cannot open the tree gate"
-            );
-        }
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                &[aterm_capacity::Record {
-                    need: aterm_capacity::Need::new("release slice memory budget")
-                        .mem(crate::slice_units::MIN_SHARED),
-                    ..shared.clone()
-                }],
-                std::slice::from_ref(&child)
-            ),
-            super::SliceMemory::Pending,
-            "a lower-ranked lookalike cannot open the release tree gate"
-        );
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                &[aterm_capacity::Record {
-                    accounting: aterm_capacity::Accounting::Whole,
-                    ..shared.clone()
-                }],
-                std::slice::from_ref(&child)
-            ),
-            super::SliceMemory::Pending,
-            "a non-accounting lookalike cannot open the release tree gate"
-        );
-
-        let native = learning(
-            20,
-            "release slice aarch64-apple-darwin",
-            true,
-            crate::slice_units::DRIVER,
-        );
-        for malformed in [
-            record(
-                20,
-                "release slice aarch64-apple-darwin",
-                true,
-                crate::slice_units::DRIVER,
-            ),
-            aterm_capacity::Record {
-                held: native.held.map(|held| aterm_capacity::Held {
-                    alone: false,
-                    ..held
-                }),
-                ..native.clone()
-            },
-        ] {
-            assert_eq!(
-                super::slices_hold_memory_in(
-                    u32::try_from(me).unwrap(),
-                    crate::slice_units::MIN_SHARED,
-                    std::slice::from_ref(&malformed),
-                    std::slice::from_ref(&child),
-                ),
-                super::SliceMemory::Pending,
-                "a learning claim and its held state must both carry ALONE"
-            );
-        }
-        let held_and_missing = super::slices_hold_memory_in(
-            u32::try_from(me).unwrap(),
-            crate::slice_units::MIN_SHARED,
-            std::slice::from_ref(&native),
-            std::slice::from_ref(&child),
-        );
-        assert_eq!(
-            held_and_missing,
-            super::SliceMemory::Serial,
-            "an exact held learning claim cannot remain behind every compiler token when its sibling is absent"
-        );
-        let compat_waiting = learning(
-            20,
-            "release slice x86_64-apple-darwin",
-            false,
-            crate::slice_units::DRIVER,
-        );
-        let serial = super::slices_hold_memory_in(
-            u32::try_from(me).unwrap(),
-            crate::slice_units::MIN_SHARED,
-            &[native.clone(), compat_waiting],
-            std::slice::from_ref(&child),
-        );
-        assert_eq!(
-            serial,
-            super::SliceMemory::Serial,
-            "the held learner must receive its compiler tokens before its queued sibling can fit"
-        );
-
-        for escape in [held_and_missing, serial] {
-            let ended = std::cell::Cell::new(false);
-            let released = std::cell::Cell::new(false);
-            super::await_slice_memory(
-                &|| ended.get(),
-                || escape,
-                || released.set(true),
-                || {
-                    assert!(
-                        released.get(),
-                        "learning tokens return before its build wait"
-                    );
-                    ended.set(true);
-                },
-            );
-            assert!(ended.get(), "learning admission waits for build completion");
-        }
-
-        // Bind the production detector and wait ordering to QualifyFallbackAdmission. A
-        // Pending mutation never releases before the first pause; an early-return mutation
-        // leaves `ended` false; an early-tree mutation is disabled until both parents end.
-        let model = aterm_models_capacity::qualify_fallback_admission_model();
-        let mut state = model.init_state();
-        assert!(model.fire("NativeParentHolds", &mut state));
-        assert!(model.fire("CompatParentQueues", &mut state));
-        assert_eq!(
-            serial == super::SliceMemory::Serial,
-            model.action_enabled("SerialEscape", &state)
-        );
-        assert!(!model.action_enabled("TreeStarts", &state));
-        let ended = std::cell::Cell::new(false);
-        let released = std::cell::Cell::new(false);
-        let pauses = std::cell::Cell::new(0_u8);
-        super::await_slice_memory(
-            &|| ended.get(),
-            || serial,
-            || {
-                assert!(!released.replace(true));
-                assert!(model.fire("SerialEscape", &mut state));
-            },
-            || {
-                assert!(released.get(), "serial escape precedes its build wait");
-                pauses.set(pauses.get() + 1);
-                ended.set(true);
-            },
-        );
-        assert!(ended.get(), "admission returns only after build completion");
-        assert_eq!(pauses.get(), 1);
-        assert!(model.fire("NativeSliceEnds", &mut state));
-        assert!(model.fire("CompatParentHolds", &mut state));
-        assert!(!model.action_enabled("TreeStarts", &state));
-        assert!(model.fire("CompatSliceEnds", &mut state));
-        assert!(model.action_enabled("TreeStarts", &state));
-        assert!(model.fire("TreeStarts", &mut state));
-        assert_eq!(state["tree"], 1);
-        assert!(aterm_spec::interp::bmc(&model).is_ok());
-        assert!(
-            aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err(),
-            "KeepBarrier or TreeStartsEarly must break the fallback laws"
-        );
-        let compat = learning(
-            20,
-            "release slice x86_64-apple-darwin",
-            true,
-            crate::slice_units::DRIVER,
-        );
-        assert_eq!(
-            super::slices_hold_memory_in(
-                u32::try_from(me).unwrap(),
-                crate::slice_units::MIN_SHARED,
-                &[native.clone(), compat],
-                std::slice::from_ref(&child)
-            ),
-            super::SliceMemory::Pending,
-            "two held ALONE rows are not a valid state and cannot open the tree"
-        );
-        for (native_mem, compat_mem) in [
-            (crate::slice_units::DRIVER - 1, crate::slice_units::DRIVER),
-            (crate::slice_units::DRIVER, crate::slice_units::DRIVER - 1),
-        ] {
-            assert_eq!(
-                super::slices_hold_memory_in(
-                    u32::try_from(me).unwrap(),
-                    crate::slice_units::MIN_SHARED,
-                    &[
-                        learning(20, "release slice aarch64-apple-darwin", true, native_mem),
-                        learning(20, "release slice x86_64-apple-darwin", false, compat_mem),
-                    ],
-                    std::slice::from_ref(&child)
-                ),
-                super::SliceMemory::Pending,
-                "each exclusive learning claim must retain its driver envelope"
-            );
-        }
-    }
-
-    /// Only the verifier descendant's held, covering whole-stage Tippy reservation at or above
-    /// its safe floor opens the build-first compiler-token barrier. A queued valid row selects the
-    /// bounded serial escape. NEGATIVE CONTROLS: undersized, lower-ranked, marginless,
-    /// non-covering or ALONE exact rows refuse the tree after transferring its tokens to build;
-    /// foreign and merely similarly named rows authorize no path.
-    #[test]
-    fn only_an_exact_held_descendant_tippy_claim_opens_the_compiler_barrier() {
-        let shapes = super::tree_lint_claim_shapes().expect("release plan has Tippy");
-        let row = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::Holder,
-            pid,
-            start_ms: 1,
-            seq: 1,
-            checkout: String::new(),
-            need: aterm_capacity::Need::new(what)
-                .rank(aterm_capacity::Rank::Release)
-                .mem(mem)
-                .margin(1)
-                .covers(),
-            timing: aterm_capacity::TimingEvidence::default(),
-            held: held.then_some(aterm_capacity::Held {
-                admitted_ms: 2,
-                cores: 0,
-                alone: false,
-            }),
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        let me = 10_u32;
-        let verifier = crate::interrupt::Proc {
-            pid: 20,
-            parent: i32::try_from(me).unwrap(),
-            pgid: 20,
-            name: "aterm-verify".into(),
-        };
-        let foreign = crate::interrupt::Proc {
-            pid: 30,
-            parent: 1,
-            pgid: 30,
-            name: "aterm-verify".into(),
-        };
-        for shape in &shapes {
-            let valid = row(20, &shape.label, true, shape.bytes);
-            assert_eq!(
-                super::tree_lint_claim_in(
-                    me,
-                    std::slice::from_ref(&valid),
-                    std::slice::from_ref(&verifier),
-                    &shapes,
-                ),
-                Some(super::TreeLintClaim::Held)
-            );
-            assert_eq!(
-                super::tree_lint_claim_in(
-                    me,
-                    &[row(20, &shape.label, false, shape.bytes)],
-                    std::slice::from_ref(&verifier),
-                    &shapes,
-                ),
-                Some(super::TreeLintClaim::Waiting),
-                "a valid queued claim selects the bounded serial escape, not concurrent admission"
-            );
-            assert_eq!(
-                super::tree_lint_claim_in(
-                    me,
-                    &[row(20, &shape.label, true, shape.bytes - 1)],
-                    std::slice::from_ref(&verifier),
-                    &shapes,
-                ),
-                Some(super::TreeLintClaim::Invalid),
-                "an undersized {} claim must refuse the tree",
-                shape.label
-            );
-        }
-
-        let whole = &shapes[0];
-        for bytes in [0, whole.bytes - 1] {
-            assert_eq!(
-                super::tree_lint_claim_in(
-                    me,
-                    &[row(20, &whole.label, true, bytes)],
-                    std::slice::from_ref(&verifier),
-                    &shapes,
-                ),
-                Some(super::TreeLintClaim::Invalid),
-                "NEGATIVE CONTROL: a whole-stage Tippy claim below its measured floor is unsafe"
-            );
-        }
-        assert_eq!(
-            super::tree_lint_claim_in(
-                me,
-                &[row(20, &whole.label, true, whole.bytes + 1)],
-                std::slice::from_ref(&verifier),
-                &shapes,
-            ),
-            Some(super::TreeLintClaim::Held),
-            "a learned whole-stage claim may safely exceed its floor"
-        );
-
-        let valid = row(20, &whole.label, true, whole.bytes);
-        let similarly_named = row(20, "verify tippy lint (-p aterm)", true, whole.bytes);
-        assert!(
-            super::tree_lint_claim_in(
-                me,
-                std::slice::from_ref(&similarly_named),
-                std::slice::from_ref(&verifier),
-                &shapes,
-            )
-            .is_none(),
-            "a merely similar label is not this release's claim"
-        );
-        for invalid in [
-            aterm_capacity::Record {
-                need: aterm_capacity::Need::new(&whole.label)
-                    .mem(whole.bytes)
-                    .covers(),
-                ..valid.clone()
-            },
-            aterm_capacity::Record {
-                need: aterm_capacity::Need::new(&whole.label)
-                    .rank(aterm_capacity::Rank::Release)
-                    .mem(whole.bytes),
-                ..valid.clone()
-            },
-            aterm_capacity::Record {
-                accounting: aterm_capacity::Accounting::Whole,
-                ..valid.clone()
-            },
-            aterm_capacity::Record {
-                need: aterm_capacity::Need::new(&whole.label)
-                    .rank(aterm_capacity::Rank::Release)
-                    .mem(whole.bytes)
-                    .covers(),
-                ..valid.clone()
-            },
-            aterm_capacity::Record {
-                held: Some(aterm_capacity::Held {
-                    admitted_ms: 2,
-                    cores: 0,
-                    alone: true,
-                }),
-                ..valid.clone()
-            },
-        ] {
-            assert_eq!(
-                super::tree_lint_claim_in(
-                    me,
-                    std::slice::from_ref(&invalid),
-                    std::slice::from_ref(&verifier),
-                    &shapes,
-                ),
-                Some(super::TreeLintClaim::Invalid),
-                "invalid exact claim must refuse the tree: {invalid:?}"
-            );
-        }
-
-        let waiting = row(20, &whole.label, false, whole.bytes);
-        for records in [
-            vec![waiting.clone(), valid.clone()],
-            vec![valid.clone(), waiting.clone()],
-        ] {
-            assert_eq!(
-                super::tree_lint_claim_in(me, &records, std::slice::from_ref(&verifier), &shapes,),
-                Some(super::TreeLintClaim::Held),
-                "a held duplicate dominates a queued duplicate in either file order"
-            );
-        }
-        let malformed = aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::Whole,
-            ..valid.clone()
-        };
-        for (dominant, expected) in [
-            (valid.clone(), super::TreeLintClaim::Held),
-            (waiting, super::TreeLintClaim::Waiting),
-        ] {
-            for records in [
-                vec![malformed.clone(), dominant.clone()],
-                vec![dominant.clone(), malformed.clone()],
-            ] {
-                assert_eq!(
-                    super::tree_lint_claim_in(
-                        me,
-                        &records,
-                        std::slice::from_ref(&verifier),
-                        &shapes,
-                    ),
-                    Some(expected),
-                    "NEGATIVE CONTROL: a valid duplicate dominates a malformed duplicate in \
-                     either file order"
-                );
-            }
-        }
-        assert!(
-            super::tree_lint_claim_in(
-                me,
-                &[row(30, &whole.label, true, whole.bytes)],
-                &[verifier, foreign],
-                &shapes,
-            )
-            .is_none(),
-            "another release's verifier cannot release this pool"
-        );
-
-        let model = aterm_models_capacity::qualify_memory_model();
-        let mut state = model.init_state();
-        assert!(model.fire("ParentAdmit", &mut state));
-        assert!(model.action_enabled("WholeLintAdmit", &state));
-        assert!(model.fire("WholeLintAdmit", &mut state));
-        assert!(model.action_enabled("TreeStarts", &state));
-        assert!(aterm_spec::interp::bmc(&model).is_ok());
-        assert!(
-            aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 2)).is_err(),
-            "NEGATIVE CONTROL: the old delayed-admission ordering must break its scheduling law"
-        );
-    }
-
-    /// Capacity inspection is never a liveness dependency of the all-token barrier. An unread
-    /// detector and held-plus-waiting learning claims both release the tokens and wait for build
-    /// completion before returning; an unread tree detector returns immediately because the
-    /// slice parent is already protected. NEGATIVE CONTROLS: treating either slice escape as
-    /// Pending reaches the injected pause before release, and returning before build completion
-    /// violates the final assertion.
-    #[test]
-    fn unread_admission_detectors_take_the_bounded_escape_without_deadlock() {
-        use std::cell::Cell;
-
-        for escape in [
-            super::SliceMemory::Unavailable,
-            super::SliceMemory::Serial,
-            super::SliceMemory::StaleBudget,
-        ] {
-            let build_ended = Cell::new(false);
-            let released = Cell::new(false);
-            let pauses = Cell::new(0_u8);
-            super::await_slice_memory(
-                &|| build_ended.get(),
-                || escape,
-                || released.set(true),
-                || {
-                    assert!(released.get(), "tokens return before the serial build wait");
-                    pauses.set(pauses.get() + 1);
-                    build_ended.set(true);
-                },
-            );
-            assert!(released.get());
-            assert!(build_ended.get());
-            assert_eq!(pauses.get(), 1, "the serial escape waited for build end");
-        }
-
-        let tree_pauses = Cell::new(0_u8);
-        assert!(super::await_tree_memory(
-            &|| false,
-            || super::TreeLintObservation::Unavailable,
-            || panic!("an unread tree detector keeps the original branch shares"),
-            || tree_pauses.set(tree_pauses.get() + 1),
-        ));
-        assert_eq!(
-            tree_pauses.get(),
-            0,
-            "an unread tree detector cannot retain every compiler token"
-        );
-
-        for (claim, must_serialize, tree_may_run) in [
-            (super::TreeLintClaim::Held, false, true),
-            (super::TreeLintClaim::Waiting, true, true),
-            (super::TreeLintClaim::Invalid, true, false),
-        ] {
-            let serialized = Cell::new(false);
-            let admitted = super::await_tree_memory(
-                &|| false,
-                || super::TreeLintObservation::Claim(claim),
-                || serialized.set(true),
-                || panic!("an observed exact Tippy claim needs no further scan"),
-            );
-            assert_eq!(
-                serialized.get(),
-                must_serialize,
-                "a queued or malformed Tippy claim transfers every token to build"
-            );
-            assert_eq!(
-                admitted, tree_may_run,
-                "NEGATIVE CONTROL: a malformed envelope must stop the tree"
-            );
-        }
-    }
-
-    /// Bind both production admission seams to the real private FIFOs. NEGATIVE CONTROLS:
-    /// replacing the transfer with an ordinary barrier drop yields the initial 2/1 split;
-    /// replacing it with a no-op yields 0/0 while the reservation remains held.
-    #[test]
-    fn serial_admission_seams_transfer_the_exact_bounded_allocation_to_build() {
-        use std::cell::Cell;
-
-        fn drain(pool: &aterm_capacity::Jobserver) -> Vec<aterm_capacity::Token<'_>> {
-            let mut tokens = Vec::new();
-            while let Some(token) = pool.try_acquire().unwrap() {
-                tokens.push(token);
-            }
-            tokens
-        }
-
-        let assert_serial = |tree: bool| {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let shares = aterm_capacity::BranchShares::new(
-                &dir.path().join("qualify.jobs"),
-                4,
-                1,
-                [true, true],
-            )
-            .unwrap();
-            let barrier = std::sync::Mutex::new(Some(shares.reserve_initial().unwrap()));
-            if tree {
-                assert!(super::await_tree_memory_with_barrier(
-                    &barrier,
-                    &|| false,
-                    || super::TreeLintObservation::Claim(super::TreeLintClaim::Waiting),
-                    || panic!("an exact queued Tippy claim needs no further scan"),
-                ));
-            } else {
-                let ended = Cell::new(false);
-                super::await_slice_memory_with_barrier(
-                    &barrier,
-                    &|| ended.get(),
-                    || super::SliceMemory::Serial,
-                    || ended.set(true),
-                );
-                assert!(
-                    ended.get(),
-                    "slice serialization waits for build completion"
-                );
-            }
-            assert!(barrier.lock().unwrap().is_none());
-            let build = drain(shares.pool(false));
-            let tree = drain(shares.pool(true));
-            assert_eq!(
-                (build.len(), tree.len()),
-                (3, 0),
-                "serial escape transfers every non-export token to build"
-            );
-            drop((build, tree));
-
-            shares.finish(2);
-            let build = drain(shares.pool(false));
-            assert_eq!(build.len(), 4, "export completion stays on serial build");
-            assert!(drain(shares.pool(true)).is_empty());
-            drop(build);
-            shares.finish(0);
-            assert!(drain(shares.pool(false)).is_empty());
-            assert_eq!(
-                drain(shares.pool(true)).len(),
-                4,
-                "build completion transfers the same bounded allocation to tree"
-            );
-        };
-        assert_serial(false);
-        assert_serial(true);
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let shares = aterm_capacity::BranchShares::new(
-            &dir.path().join("concurrent.jobs"),
-            4,
-            1,
-            [true, true],
-        )
-        .unwrap();
-        let barrier = std::sync::Mutex::new(Some(shares.reserve_initial().unwrap()));
-        assert!(super::await_tree_memory_with_barrier(
-            &barrier,
-            &|| false,
-            || super::TreeLintObservation::Claim(super::TreeLintClaim::Held),
-            || panic!("an exact held Tippy claim needs no further scan"),
-        ));
-        drop(barrier.lock().unwrap().take());
-        assert_eq!(
-            (
-                drain(shares.pool(false)).len(),
-                drain(shares.pool(true)).len()
-            ),
-            (2, 1),
-            "held Tippy preserves build-first width and one tree compiler"
-        );
-    }
-
-    /// A resume may have only one branch. NEGATIVE CONTROL: the former all-compiler allocation
-    /// gives a build-only one-slot plan's sole token to tree.
-    #[test]
-    fn qualify_pool_allocates_only_to_branches_in_the_resume_plan() {
-        fn drain(pool: &aterm_capacity::Jobserver) -> Vec<aterm_capacity::Token<'_>> {
-            let mut tokens = Vec::new();
-            while let Some(token) = pool.try_acquire().unwrap() {
-                tokens.push(token);
-            }
-            tokens
-        }
-
-        type ResumeCase<'a> = (u32, &'a [Branch], u32, (usize, usize));
-        let cases: &[ResumeCase<'_>] = &[
-            (1, &[Branch::Build], 0, (1, 0)),
-            (4, &[Branch::Tree], 0, (0, 4)),
-            (4, &[Branch::Build, Branch::Export], 1, (3, 0)),
-            (4, &[Branch::Tree, Branch::Export], 1, (0, 3)),
-            (4, &[Branch::Export], 4, (0, 0)),
-        ];
-        for &(slots, branches, expected_export, expected_compilers) in cases {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
-            let machine =
-                aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, slots));
-            let pool = super::qualify_pool(&dir.path().join("resume.jobs"), branches, |need| {
-                aterm_capacity::admit_with(
-                    &ledger,
-                    &machine,
-                    need.cores(slots),
-                    aterm_capacity::Admit::Now,
-                    aterm_capacity::Pace::default(),
-                    &mut |_| {},
-                )
-            })
-            .unwrap();
-            assert_eq!(pool.export, expected_export);
-            let barrier = pool.jobs.reserve_initial().unwrap();
-            assert_eq!(
-                barrier.len(),
-                usize::try_from(slots - expected_export).unwrap()
-            );
-            drop(barrier);
-            let build = drain(pool.jobs.pool(false));
-            let tree = drain(pool.jobs.pool(true));
-            assert_eq!((build.len(), tree.len()), expected_compilers);
-            assert_eq!(
-                build.len() + tree.len() + usize::try_from(expected_export).unwrap(),
-                usize::try_from(slots).unwrap()
-            );
-        }
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let old = aterm_capacity::BranchShares::new(
-            &dir.path().join("old-all-compiler.jobs"),
-            1,
-            0,
-            [true, true],
-        )
-        .unwrap();
-        drop(old.reserve_initial().unwrap());
-        assert_eq!(
-            (drain(old.pool(false)).len(), drain(old.pool(true)).len()),
-            (0, 1),
-            "NEGATIVE CONTROL: an all-compiler allocation starves a build-only one-slot resume"
-        );
-    }
-
-    #[test]
-    fn a_published_supersession_refusal_names_the_fix_hop_remedy() {
-        let previous = super::Line::start("0.189.0", "0123456789abcdef0123456789abcdef01234567", 1);
-        let refusal = super::SupersedeCheck::Present(
-            "the line has a release object; cannot supersede".into(),
-        )
-        .refusal(Some(&previous));
-        assert_eq!(refusal.remedy, crate::release::fix_remedy(previous.head()));
-    }
-
-    #[test]
-    fn the_staging_classifier_allows_replacement_of_the_same_version() {
-        assert!(!super::staged_ahead_of_version("0.188.0", "0.189.0").unwrap());
-        assert!(!super::staged_ahead_of_version("0.189.0", "0.189.0").unwrap());
-        assert!(super::staged_ahead_of_version("0.190.0", "0.189.0").unwrap());
-        assert!(super::staged_ahead_of_version("not-a-version", "0.189.0").is_err());
-    }
-
-    #[test]
-    fn exact_supersession_reread_uses_the_complete_record() {
-        use super::*;
-
-        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
-        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
-        let requested = supersession_record(previous.clone(), replacement.clone());
-        assert!(matches!(
-            classify_supersession_reread(&requested, Ok(Some(requested.clone())), true),
-            SupersedeResult::Committed(_)
-        ));
-
-        let mut different_reason = requested.clone();
-        different_reason.reason.push_str(" mutated");
-        assert!(matches!(
-            classify_supersession_reread(&requested, Ok(Some(different_reason)), true),
-            SupersedeResult::Refused {
-                retry: false,
-                winner: Some(line),
-                ..
-            } if line == replacement
-        ));
-        let mut different_previous = requested.clone();
-        different_previous.previous.started += 1;
-        assert!(matches!(
-            classify_supersession_reread(&requested, Ok(Some(different_previous)), true),
-            SupersedeResult::Refused {
-                winner: Some(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            classify_supersession_reread(&requested, Ok(None), true),
-            SupersedeResult::Refused {
-                retry: true,
-                winner: None,
-                ..
-            }
-        ));
-        let earlier = supersession_record(Line::start("0.189.0", &"0".repeat(40), 0), previous);
-        assert!(matches!(
-            classify_supersession_reread(&requested, Ok(Some(earlier.clone())), true),
-            SupersedeResult::Refused {
-                retry: true,
-                winner: None,
-                ..
-            }
-        ));
-        assert!(matches!(
-            classify_claim_stop(&requested, "claim stopped".into(), Ok(Some(earlier))),
-            SupersedeResult::Refused { why, retry: false, winner: None }
-                if why == "claim stopped"
-        ));
-        assert!(matches!(
-            classify_supersession_reread(&requested, Err("unreadable".into()), true),
-            SupersedeResult::Unknown(why) if why == "unreadable"
-        ));
-    }
-
-    /// A claim stop alone restores nothing. NEGATIVE CONTROLS: an exact record commits, a
-    /// different record returns its winner, and an unreadable source remains unknown; only a
-    /// proved-empty reread preserves the claim's original refusal.
-    #[test]
-    fn claim_stop_is_decided_by_the_exact_source_record() {
-        use super::*;
-
-        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
-        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
-        let requested = supersession_record(previous, replacement.clone());
-        assert!(matches!(
-            classify_claim_stop(
-                &requested,
-                "claim stopped".into(),
-                Ok(Some(requested.clone()))
-            ),
-            SupersedeResult::Committed(_)
-        ));
-        let mut competing = requested.clone();
-        competing.replacement = Line::start("0.189.0", &"3".repeat(40), 3);
-        assert!(matches!(
-            classify_claim_stop(
-                &requested,
-                "claim stopped".into(),
-                Ok(Some(competing.clone()))
-            ),
-            SupersedeResult::Refused {
-                winner: Some(line),
-                ..
-            } if line == competing.replacement
-        ));
-        assert!(matches!(
-            classify_claim_stop(&requested, "claim stopped".into(), Ok(None)),
-            SupersedeResult::Refused {
-                why,
-                winner: None,
-                ..
-            } if why == "claim stopped"
-        ));
-        assert!(matches!(
-            classify_claim_stop(&requested, "claim stopped".into(), Err("unreadable".into())),
-            SupersedeResult::Unknown(why) if why == "unreadable"
-        ));
-    }
-
-    /// A public-surface refusal can arrive after an aged claim was adopted elsewhere. NEGATIVE
-    /// CONTROL: the durable competing record wins over the stale scan result; treating that scan
-    /// as authoritative would return its refusal with no winner.
-    #[test]
-    fn public_state_stop_is_decided_by_the_competing_record() {
-        use super::*;
-
-        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
-        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
-        let requested = supersession_record(previous.clone(), replacement);
-        let mut competing = requested.clone();
-        competing.replacement = Line::start("0.189.0", &"3".repeat(40), 3);
-        let result = settle_post_claim_public_state(
-            Err(SupersedeCheck::Present(
-                "the line has a release object; cannot supersede".into(),
-            )),
-            &previous,
-            |why| classify_claim_stop(&requested, why, Ok(Some(competing.clone()))),
-        )
-        .expect_err("the stale public-state stop is classified by the durable record");
-        assert!(matches!(
-            result,
-            SupersedeResult::Refused {
-                winner: Some(line),
-                retry: false,
-                ..
-            } if line == competing.replacement
-        ));
-    }
-
-    /// A competing record cannot move local state unless its replacement is itself a verified
-    /// release line. NEGATIVE CONTROL: the same structured winner with a nonexistent base is
-    /// classified as unknown instead of being handed to the transaction's adoption path.
-    #[test]
-    fn an_unverified_competing_supersession_is_not_a_winner() {
-        use super::*;
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = GitCli::new(&repo);
-        crate::ledger::git_ok(&git, &["init", "-q"]).unwrap();
-        let real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        let invalid = Line::start("0.189.0", &"f".repeat(40), 1);
-        let classified = real.verify_supersede_result(SupersedeResult::Refused {
-            why: "a competing writer won".into(),
-            retry: false,
-            winner: Some(invalid),
-        });
-        assert!(matches!(classified, SupersedeResult::Unknown(_)));
-    }
-
-    fn supersede_staging_fixture(
-        slug: &str,
-        reference: &str,
-        path: &str,
-    ) -> Result<Vec<u8>, String> {
-        assert_eq!(reference, "main");
-        assert_eq!(path, "Cargo.toml");
-        let version = match slug {
-            "fixture/retired-staging" => "0.188.0",
-            "fixture/retired-hop-staging" => "0.190.0",
-            "fixture/replacement-staging" => "0.188.0",
-            other => return Err(format!("unexpected staging repository {other}")),
-        };
-        Ok(format!("[workspace.package]\nversion = \"{version}\"\n").into_bytes())
-    }
-
-    /// Production preflight reads every retired-line staging declaration before any selection
-    /// write. NEGATIVE CONTROL: reading only either base, or `replacement.base`, sees only older
-    /// staged versions and cannot detect that staging advanced beyond the requested version.
-    #[test]
-    fn production_supersede_preflight_reads_the_retired_lines_staging_repo() {
-        use super::*;
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join("publish")).unwrap();
-        let git = GitCli::new(&repo);
-        let run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
-        run(&["init", "-q"]);
-        let commit = || {
-            run(&["add", "."]);
-            run(&[
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "fixture",
-            ]);
-            run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string()
-        };
-        std::fs::write(
-            repo.join("publish/config.sh"),
-            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/retired-staging.git\"\n",
-        )
-        .unwrap();
-        let retired = commit();
-        std::fs::write(
-            repo.join("publish/config.sh"),
-            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/retired-hop-staging.git\"\n",
-        )
-        .unwrap();
-        let retired_hop = commit();
-        std::fs::write(
-            repo.join("publish/config.sh"),
-            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/replacement-staging.git\"\n",
-        )
-        .unwrap();
-        let replacement = commit();
-        let mut previous = Line::start("0.189.0", &retired, 1);
-        previous.hops.push(Hop {
-            commit: retired_hop,
-            carries: "fixture-fix".into(),
-            why: "changes staging policy".into(),
-            paths: vec!["publish/config.sh".into()],
-        });
-        let proposed = Line::start("0.189.0", &replacement, 2);
-        let head_before = run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string();
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.staging_file = |_, _, _| Ok(b"[workspace.package]\nversion = \"0.189.0\"\n".to_vec());
-        real.supersede_staging_state(&previous, &proposed).unwrap();
-        // NEGATIVE CONTROL: the former >= comparison refuses this same staged version,
-        // leaving only the fix-hop route even when a later main series cannot be carried.
-        let staged_version = [0_u64, 189, 0];
-        let requested_version = proposed
-            .version
-            .split('.')
-            .map(|n| n.parse::<u64>().unwrap())
-            .collect::<Vec<_>>();
-        assert!(staged_version.as_slice() >= requested_version.as_slice());
-        real.staging_file = supersede_staging_fixture;
-        let refusal = Backend::preflight_supersede(&mut real, &proposed, Some(&previous))
-            .expect_err("a retired hop has a newer staged version");
-        assert!(refusal.why.contains("staging has advanced to v0.190.0"));
-        assert_eq!(
-            run(&["rev-parse", "HEAD"]).stdout_utf8().trim(),
-            head_before
-        );
-        assert!(!real.release.join(crate::release::SELECTION_FILE).exists());
-    }
-
-    fn supersede_release_fixture(slug: &str, tag: &str) -> Result<bool, String> {
-        assert_eq!(tag, "v0.189.0");
-        match slug {
-            "fixture/base-channel" | "fixture/replacement-channel" => Ok(false),
-            "fixture/hop-channel" => Ok(true),
-            other => Err(format!("unexpected release channel {other}")),
-        }
-    }
-
-    /// Every historical channel is checked. NEGATIVE CONTROL: checking only the base or current
-    /// checkout misses the release object addressed by the retired hop.
-    #[test]
-    fn supersede_checks_each_release_channel_declared_by_the_retired_line() {
-        use super::*;
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = GitCli::new(&repo);
-        let run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
-        run(&["init", "-q"]);
-        let manifest = |channel: &str| {
-            format!(
-                "[workspace]\nmembers = []\n\
-                 [workspace.package]\nversion = \"0.189.0\"\n\
-                 repository = \"https://github.com/fixture/source\"\n\
-                 [workspace.metadata.aterm]\nupdate_channel = \"{channel}\"\n"
-            )
-        };
-        let commit = || {
-            run(&["add", "Cargo.toml"]);
-            run(&[
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "fixture",
-            ]);
-            run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string()
-        };
-        std::fs::write(repo.join("Cargo.toml"), manifest("fixture/base-channel")).unwrap();
-        let base = commit();
-        std::fs::write(repo.join("Cargo.toml"), manifest("fixture/hop-channel")).unwrap();
-        let hop = commit();
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            manifest("fixture/replacement-channel"),
-        )
-        .unwrap();
-        let _replacement = commit();
-        let mut previous = Line::start("0.189.0", &base, 1);
-        previous.hops.push(Hop {
-            commit: hop,
-            carries: "fixture-fix".into(),
-            why: "changes release channel".into(),
-            paths: vec!["Cargo.toml".into()],
-        });
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.release_exists = supersede_release_fixture;
-        assert!(matches!(
-            real.supersede_release_state(&previous, "v0.189.0"),
-            Err(SupersedeCheck::Present(_))
-        ));
-    }
-
-    fn witnessed_fixture_wait(
-        real: &super::Real,
-        _candidate: &super::Candidate,
-        _prover: &super::Prover,
-        handoff: &super::TreeIndexHandoff,
-        _stop: &super::BranchStop,
-    ) -> Result<(), super::Refusal> {
-        assert!(
-            handoff.expected(),
-            "the production build path kept the tree promise"
-        );
-        if let Some(pool) = &real.pool {
-            let tree = pool.jobs.pool(true);
-            let mut held = Vec::new();
-            while let Some(token) = tree.try_acquire().unwrap() {
-                held.push(token);
-            }
-            assert_eq!(
-                held.len(),
-                4,
-                "tree must be able to produce the fixture index before build ends"
-            );
-            assert!(pool.jobs.pool(false).try_acquire().unwrap().is_none());
-        }
-        std::fs::write(real.repo.join("fixture-waited"), b"waited").unwrap();
-        Ok(())
-    }
-
-    fn witnessed_fixture_stage(
-        real: &super::Real,
-        _step: super::Step,
-        _candidate: &super::Candidate,
-        _reserved: &super::Reservation,
-        _prover: &super::Prover,
-        _log: &std::path::Path,
-        stop: Option<&super::BranchStop>,
-    ) -> Result<String, super::Refusal> {
-        assert!(real.repo.join("fixture-waited").is_file());
-        assert!(
-            stop.is_some(),
-            "the production build path attaches its stop"
-        );
-        std::fs::write(real.repo.join("fixture-staged"), b"staged").unwrap();
-        Ok("fixtures staged".into())
-    }
-
-    fn red_tree_verify(
-        _real: &super::Real,
-        _candidate: &super::Candidate,
-        _prover: &super::Prover,
-        _run: &crate::check_record::VerifyRun,
-        _artifact: Option<&super::Artifact>,
-        _stop: &super::BranchStop,
-    ) -> Result<super::Ran, super::Refusal> {
-        Err(super::Refusal::new("tree red", "fix it"))
-    }
-
-    /// The production orchestration, not only its helpers, waits before staging fixtures and
-    /// closes the tree handoff before returning a red. NEGATIVE CONTROLS: removing the wait call
-    /// makes the injected stage observe no marker; removing `with_tree_index_completion` leaves
-    /// the production handoff Pending.
-    #[test]
-    fn production_build_and_tree_wiring_owns_the_fixture_handoff() {
-        use super::*;
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let mut real = Real::new(&repo, Some(&repo.join("engine")), true, false).unwrap();
-        real.await_fixture_index_op = witnessed_fixture_wait;
-        real.stage_fixtures_run_op = witnessed_fixture_stage;
-        let candidate = Candidate {
-            commit: "11".repeat(20),
-            version: "0.0.0".into(),
-            why: "fixture".into(),
-            bump_from: None,
-            carry: Vec::new(),
-        };
-        let reservation = Reservation {
-            build: 1,
-            commit: "22".repeat(20),
-            line: "1 0.0.0".into(),
-        };
-        let prover = Prover {
-            bin: repo.join("prover/bin"),
-            commit: "33".repeat(20),
-            source: "fixture".into(),
-        };
-        let handoff = TreeIndexHandoff::default();
-        handoff.expect();
-        let built = real.build_branch(
-            &candidate,
-            &reservation,
-            &prover,
-            BuildWork {
-                bundle: false,
-                fixtures: true,
-            },
-            &handoff,
-            &BranchStop::default(),
-        );
-        assert!(built.artifact.is_none());
-        assert!(built.fixtures.is_some_and(|result| result.is_ok()));
-        assert!(repo.join("fixture-staged").is_file());
-
-        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
-        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4));
-        real.pool = Some(
-            qualify_pool(&dir.path().join("serial.jobs"), &Branch::ALL, |need| {
-                aterm_capacity::admit_with(
-                    &ledger,
-                    &machine,
-                    need,
-                    aterm_capacity::Admit::Wait,
-                    aterm_capacity::Pace::default(),
-                    &mut |_| {},
-                )
-            })
-            .unwrap(),
-        );
-        let pool = real.pool.as_ref().unwrap();
-        pool.jobs
-            .reserve_initial()
-            .unwrap()
-            .release_to_build()
-            .unwrap();
-        pool.jobs.finish(2);
-        real.build_run_op = |_, _, _, _, _, _| {
-            Ok(Artifact {
-                key: String::new(),
-                app: PathBuf::new(),
-                macho_sha256: String::new(),
-                build: 1,
-            })
-        };
-        let built = real.build_branch(
-            &candidate,
-            &reservation,
-            &prover,
-            BuildWork {
-                bundle: true,
-                fixtures: true,
-            },
-            &handoff,
-            &BranchStop::default(),
-        );
-        assert!(built.artifact.is_some_and(|result| result.is_ok()));
-        assert!(built.fixtures.is_some_and(|result| result.is_ok()));
-        real.pool = None;
-
-        real.verify_half_op = red_tree_verify;
-        let branches = RealBranches {
-            real: &real,
-            admission_barrier: std::sync::Mutex::new(None),
-            tree_index: TreeIndexHandoff::default(),
-        };
-        branches.tree_index.expect();
-        let stop = BranchStop::default();
-        let run = crate::check_record::VerifyRun {
-            half: crate::check_record::Half::Tree,
-            checks: vec!["test".into()],
-            passed_binaries: Vec::new(),
-            passed_lint_packages: Vec::new(),
-        };
-        assert!(
-            branches
-                .verify(&candidate, &prover, &run, None, &stop)
-                .is_err()
-        );
-        assert_eq!(
-            branches.tree_index.completion(),
-            TreeIndexCompletion::Stopped
-        );
-        assert!(!stop.fired(), "the graph has not classified the red yet");
-    }
-
-    /// Production obtains its artifact through the completion transition itself. NEGATIVE
-    /// CONTROLS: an absent build and a failed build do not release admission; deleting the
-    /// successful transition leaves `bundle_is_finished` false.
-    #[test]
-    fn a_successful_product_build_publishes_completion_before_returning_its_artifact() {
-        use super::*;
-
-        let completed = TreeIndexHandoff::default();
-        let artifact = build_artifact_with_handoff(true, &completed, || Ok::<_, &str>(7));
-        assert_eq!(artifact, Some(Ok(7)));
-        assert!(completed.bundle_is_finished());
-
-        let failed = TreeIndexHandoff::default();
-        assert_eq!(
-            build_artifact_with_handoff(true, &failed, || Err::<u8, _>("red")),
-            Some(Err("red"))
-        );
-        assert!(!failed.bundle_is_finished());
-
-        let absent = TreeIndexHandoff::default();
-        assert_eq!(
-            build_artifact_with_handoff(false, &absent, || Ok::<_, &str>(7)),
-            None
-        );
-        assert!(!absent.bundle_is_finished());
-    }
-
-    /// A scheduled tree gets the opportunity to publish its exact executable index before the
-    /// fixture path may compile. NEGATIVE CONTROLS: the former one-shot miss is `Compile`, not the
-    /// `Ready` answer this handoff reaches; and a tree red published before the graph fires the
-    /// build stop is already `Stopped`, never a fallback compile. A non-red completed tree with no
-    /// index still falls back.
-    #[test]
-    fn fixture_index_waits_for_the_tree_compile_before_fallback() {
-        use super::*;
-        use std::cell::Cell;
-
-        let handoff = TreeIndexHandoff::default();
-        handoff.expect();
-        let probes = Cell::new(0);
-        let pauses = Cell::new(0);
-        let answer = await_tree_index(
-            &handoff,
-            || {
-                let probe = probes.get() + 1;
-                probes.set(probe);
-                probe == 2
-            },
-            || false,
-            || pauses.set(pauses.get() + 1),
-        );
-        assert_eq!(answer, TreeIndexAnswer::Ready);
-        assert_eq!((probes.get(), pauses.get()), (2, 1));
-        let one_shot_miss = TreeIndexAnswer::Compile;
-        assert_ne!(
-            answer, one_shot_miss,
-            "the former one-shot lookup compiles instead of observing the tree's handoff"
-        );
-
-        let missing = TreeIndexHandoff::default();
-        missing.expect();
-        let pauses = Cell::new(0);
-        let answer = await_tree_index(
-            &missing,
-            || false,
-            || false,
-            || {
-                pauses.set(pauses.get() + 1);
-                missing.finish(TreeIndexCompletion::Compile);
-            },
-        );
-        assert_eq!(answer, TreeIndexAnswer::Compile);
-        assert_eq!(pauses.get(), 1);
-
-        let red = TreeIndexHandoff::default();
-        red.expect();
-        let graph_stop = BranchStop::default();
-        let refusal = with_tree_index_completion(&red, &graph_stop, || {
-            Err(Refusal::new("tree tests failed", "fix the tests"))
-        })
-        .unwrap_err();
-        assert_eq!(refusal.why, "tree tests failed");
-        assert!(
-            !graph_stop.fired(),
-            "the graph has not classified the note yet"
-        );
-        assert_eq!(
-            await_tree_index(&red, || false, || graph_stop.fired(), || unreachable!()),
-            TreeIndexAnswer::Stopped,
-            "the tree outcome closes the pre-stop race instead of authorizing fallback"
-        );
-
-        let stopped = TreeIndexHandoff::default();
-        stopped.expect();
-        assert_eq!(
-            await_tree_index(&stopped, || true, || true, || unreachable!()),
-            TreeIndexAnswer::Stopped,
-            "a sibling red starts no new fixture work even when an index exists"
-        );
-    }
-
-    /// NEGATIVE CONTROLS: ignoring the shape verdict starts a writer; returning
-    /// immediately on the site's refusal leaves the independent tap unrun.
-    #[test]
-    fn public_shape_precedes_writers_and_each_writer_joins_on_refusal() {
-        use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let log = dir.path().join("after-cut.log");
-        let calls = AtomicUsize::new(0);
-        let site = || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Err(Refusal::new("site refused", "retry"))
-        };
-        let tap = || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok("tap aligned".into())
-        };
-        let refused = distribute_after_shape(
-            &log,
-            Err(Refusal::new("bad public shape", "repair")),
-            site,
-            tap,
-        )
-        .unwrap_err();
-        assert_eq!(refused.why, "bad public shape");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let refused = distribute_after_shape(&log, Ok(()), site, tap).unwrap_err();
-        assert_eq!(refused.why, "site refused");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    /// Credential-free scheduling measurement. The engine child is a native
-    /// no-op at the existing tap seam; reads use agh-fake's loopback server and
-    /// real curl with an injected 40 ms service cost. This is not a real cut.
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "explicit loopback cut/after-cut gate scheduling measurement"]
-    fn independent_cut_gate_fixture_walls() {
-        use super::*;
-        use aterm_update_core::github_rest::{Direct, Origins, Spawn};
-        use std::time::Instant;
-        struct Service;
-        impl Spawn for Service {
-            fn run(
-                &self,
-                cmd: &mut Command,
-                stdin: Option<&[u8]>,
-            ) -> std::io::Result<std::process::Output> {
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                Direct.run(cmd, stdin)
-            }
-        }
-        let fake = agh_fake::FakeGithub::start();
-        let token = agh_fake::token("cut-gate-fixture");
-        fake.add_token(&token, "gate-fixture-reader");
-        fake.add_repo("gate-fixture/aterm", agh_fake::RepoSpec::public());
-        let ports = fake.ports();
-        let _route = crate::github::Fixture {
-            origins: Origins::loopback(ports.api, ports.uploads, ports.web, ports.cdn),
-            token: Some(token),
-            spawn: Some(std::sync::Arc::new(Service)),
-        }
-        .enter();
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        std::fs::create_dir_all(engine.join("bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/true", engine.join("bin/pub")).unwrap();
-        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let read = || {
-            crate::github::get("repos/gate-fixture/aterm/releases?per_page=30").unwrap();
-        };
-        let tap = || {
-            real.align_tap("v0.184.0").unwrap();
-        };
-        read();
-        tap();
-        for (take, parallel) in [false, true, true, false].into_iter().enumerate() {
-            let started = Instant::now();
-            if parallel {
-                let commit = || {
-                    crate::cut_timing::independent(
-                        ("bundle", read),
-                        ("handoff", || {
-                            crate::cut_timing::independent(("fixtures", read), ("policy", read));
-                        }),
-                    )
-                };
-                let authority = || {
-                    crate::cut_timing::independent(
-                        ("availability", || {
-                            crate::cut_timing::independent(("lock", read), ("target", read));
-                        }),
-                        ("floors", || {
-                            crate::cut_timing::independent(
-                                ("head and signature", || {
-                                    crate::cut_timing::independent(
-                                        ("head", read),
-                                        ("signature", read),
-                                    );
-                                }),
-                                ("roster and ledger", || {
-                                    crate::cut_timing::independent(
-                                        ("roster", read),
-                                        ("ledger", read),
-                                    );
-                                }),
-                            );
-                        }),
-                    )
-                };
-                crate::cut_timing::independent(("commit", commit), ("authority", authority));
-                crate::cut_timing::independent(("signed bytes", read), ("published floor", read));
-            } else {
-                for _ in 0..11 {
-                    read();
-                }
-            }
-            println!(
-                "gate-fixture step=cut take={take} parallel={parallel} wall_s={:.6}",
-                started.elapsed().as_secs_f64()
-            );
-            let started = Instant::now();
-            let distribution = || {
-                // Public shape precedes both distribution writes.
-                if parallel {
-                    crate::cut_timing::independent(
-                        ("release JSON", read),
-                        ("public readers", || {
-                            crate::cut_timing::independent(("pointer", read), ("election", read));
-                        }),
-                    );
-                } else {
-                    for _ in 0..3 {
-                        read();
-                    }
-                }
-                if parallel {
-                    crate::cut_timing::independent(("site", read), ("tap", tap));
-                } else {
-                    read();
-                    tap();
-                }
-            };
-            let reader = || {
-                read();
-            };
-            if parallel {
-                crate::cut_timing::independent(("distribution", distribution), ("reader", reader));
-            } else {
-                distribution();
-                reader();
-            }
-            println!(
-                "gate-fixture step=after-cut take={take} parallel={parallel} wall_s={:.6}",
-                started.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    #[test]
-    fn an_interrupted_cutter_checkout_is_reconstructed_at_the_same_path() {
-        use super::*;
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("input"), "committed input").unwrap();
-        let git = GitCli::new(&repo);
-        for args in [
-            vec!["init", "-q"],
-            vec!["add", "."],
-            vec![
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "fixture",
-            ],
-        ] {
-            crate::ledger::git_ok(&git, &args).unwrap();
-        }
-        let commit = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
-            .unwrap()
-            .stdout_utf8()
-            .trim()
-            .to_owned();
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.state = temp.path().join("state");
-        let cache = temp.path().join("cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        let compiler = real.cutter_workspace_at(&cache, &commit).unwrap();
-        let source = compiler.repo.clone();
-        drop(compiler);
-        std::fs::write(source.join(".git/index.lock"), "interrupted checkout").unwrap();
-        std::fs::write(source.join("input"), "partial checkout").unwrap();
-        std::fs::remove_file(cache.join("source-ready")).unwrap();
-        let compiler = real.cutter_workspace_at(&cache, &commit).unwrap();
-        assert_eq!(compiler.repo, source);
-        assert!(!source.join(".git/index.lock").exists());
-        assert_eq!(
-            std::fs::read_to_string(source.join("input")).unwrap(),
-            "committed input"
-        );
-        crate::release_tools::clean_at(&source, &commit).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn automatic_prefreeze_follows_between_cuts_and_yields_to_stages_and_windows() {
-        use super::*;
-        let row = |pid, need| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::default(),
-            pid,
-            start_ms: 1,
-            seq: 1,
-            checkout: String::new(),
-            need,
-            timing: Default::default(),
-            held: None,
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        let line = row(
-            1,
-            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
-        );
-        let marker = line.cover_marker();
-        let worker = row(2, prefreeze_need().rank(aterm_capacity::Rank::Release));
-        assert_eq!(
-            prefreeze_traffic(&[line.clone(), worker.clone()], &marker, Some(2)),
-            PrefreezeTraffic::Free
-        );
-        let mut stage = row(
-            1,
-            aterm_capacity::Need::new("stage")
-                .rank(aterm_capacity::Rank::Release)
-                .mem_gib(1),
-        );
-        stage.seq = 2;
-        assert_eq!(
-            prefreeze_traffic(&[line.clone(), worker.clone(), stage], &marker, Some(2)),
-            PrefreezeTraffic::Yield
-        );
-        let window = row(3, aterm_capacity::Need::new("window").quiet(f64::MAX));
-        assert_eq!(
-            prefreeze_traffic(&[line.clone(), worker.clone(), window], &marker, Some(2)),
-            PrefreezeTraffic::Yield
-        );
-        let next = row(
-            3,
-            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
-        );
-        assert_eq!(
-            prefreeze_traffic(&[line, worker.clone(), next.clone()], &marker, Some(2)),
-            PrefreezeTraffic::End
-        );
-        assert_eq!(
-            prefreeze_traffic(&[next], &marker, None),
-            PrefreezeTraffic::End,
-            "a new cut must cancel preparation after the old cut exited"
-        );
-        assert_eq!(
-            prefreeze_traffic(&[worker], &marker, Some(2)),
-            PrefreezeTraffic::Free,
-            "the old cut ending must not stop following main"
-        );
-        assert_eq!(
-            prefreeze_traffic(&[], &marker, None),
-            PrefreezeTraffic::Free
-        );
-        let now = std::time::Instant::now();
-        let next = now + PREFREEZE_REFRESH;
-        assert!(!prefreeze_due(now, next));
-        assert!(prefreeze_due(next, next));
-    }
-
-    /// The fake clock advances one observation interval per wait, and `spawn` is the boundary
-    /// that creates a release run directory. NEGATIVE CONTROL: the former deadline-only loop
-    /// ignored both `prepared` and the observed target, so it calls `spawn` after the first
-    /// unchanged observation; this test's `start.tick >= QUIET_TICKS` assertion fails against
-    /// that policy.
-    #[cfg(unix)]
-    #[test]
-    fn prefreeze_supervisor_starts_once_per_main_and_states_a_yield() {
-        use super::*;
-        use std::time::Instant;
-
-        const QUIET_TICKS: u32 = 4;
-        const BASE: &str = "1111111111111111111111111111111111111111";
-        const MOVED: &str = "2222222222222222222222222222222222222222";
-
-        #[derive(Clone)]
-        struct FakeWorker {
-            pid: u32,
-        }
-
-        struct FakeObservation {
-            target: String,
-        }
-
-        struct FakeSupervisor {
-            now: Instant,
-            waits: u32,
-            stop_at: u32,
-            line: aterm_capacity::Record,
-            window: aterm_capacity::Record,
-            yield_at: Option<u32>,
-            exit: Option<PrefreezeExit>,
-            observation_ready: bool,
-            observation_settles: u32,
-            starts: Vec<(u32, String)>,
-            run_dirs: u32,
-            settles: u32,
-            events: Vec<PrefreezeEvent>,
-        }
-
-        impl PrefreezeSupervisorRuntime for FakeSupervisor {
-            type Worker = FakeWorker;
-            type Observation = FakeObservation;
-
-            fn now(&mut self) -> Instant {
-                self.now
-            }
-
-            fn interrupted(&mut self) -> bool {
-                self.waits >= self.stop_at
-            }
-
-            fn rows(&mut self) -> Result<Vec<aterm_capacity::Record>, String> {
-                let mut rows = vec![self.line.clone()];
-                if self.yield_at == Some(self.waits) {
-                    rows.push(self.window.clone());
-                }
-                Ok(rows)
-            }
-
-            fn start_observation(&mut self) -> Result<Self::Observation, String> {
-                Ok(FakeObservation {
-                    target: if self.waits < QUIET_TICKS {
-                        BASE
-                    } else {
-                        MOVED
-                    }
-                    .to_owned(),
-                })
-            }
-
-            fn poll_observation(
-                &mut self,
-                observation: &mut Self::Observation,
-            ) -> Result<Option<String>, String> {
-                Ok(self.observation_ready.then(|| observation.target.clone()))
-            }
-
-            fn settle_observation(&mut self, _observation: &mut Self::Observation) {
-                self.observation_settles += 1;
-            }
-
-            fn prepared(&mut self, target: &str) -> bool {
-                target == BASE
-            }
-
-            fn spawn(&mut self, target: &str, _covered: bool) -> Result<Self::Worker, String> {
-                self.run_dirs += 1;
-                self.starts.push((self.waits, target.to_owned()));
-                Ok(FakeWorker { pid: 40 })
-            }
-
-            fn worker_pid(&self, worker: &Self::Worker) -> u32 {
-                worker.pid
-            }
-
-            fn poll(
-                &mut self,
-                _worker: &mut Self::Worker,
-            ) -> Result<Option<PrefreezeExit>, String> {
-                Ok(self.exit.clone())
-            }
-
-            fn settle(&mut self, _worker: &mut Self::Worker) {
-                self.settles += 1;
-            }
-
-            fn event(&mut self, event: PrefreezeEvent) {
-                self.events.push(event);
-            }
-
-            fn wait(&mut self) {
-                self.waits += 1;
-                self.now += PREFREEZE_REFRESH;
-            }
-        }
-
-        let row = |pid, need| aterm_capacity::Record {
-            accounting: aterm_capacity::Accounting::default(),
-            pid,
-            start_ms: 1,
-            seq: 1,
-            checkout: String::new(),
-            need,
-            timing: Default::default(),
-            held: None,
-            credit: Vec::new(),
-            wrote: None,
-            next_ms: None,
-        };
-        let line = row(
-            1,
-            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
-        );
-        let marker = line.cover_marker();
-        let window = row(3, aterm_capacity::Need::new("window").quiet(f64::MAX));
-        let fake = |yield_at, exit| FakeSupervisor {
-            now: Instant::now(),
-            waits: 0,
-            stop_at: QUIET_TICKS + 5,
-            line: line.clone(),
-            window: window.clone(),
-            yield_at,
-            exit,
-            observation_ready: true,
-            observation_settles: 0,
-            starts: Vec::new(),
-            run_dirs: 0,
-            settles: 0,
-            events: Vec::new(),
-        };
-
-        let success = PrefreezeExit {
-            success: true,
-            exit_code: Some(0),
-            signal: None,
-            status: "exit status: 0".into(),
-        };
-        let mut completed = fake(None, Some(success));
-        supervise_prefreeze_loop(&marker, &mut completed).unwrap();
-        assert_eq!(
-            completed.run_dirs, 1,
-            "one main move makes one run directory"
-        );
-        assert_eq!(completed.starts, [(QUIET_TICKS + 1, MOVED.to_owned())]);
-        assert!(
-            completed
-                .starts
-                .iter()
-                .all(|(tick, _)| *tick >= QUIET_TICKS),
-            "N unchanged quiet ticks make no run directories"
-        );
-        assert!(completed.events.iter().any(|event| matches!(
-            event,
-            PrefreezeEvent::Finished {
-                target,
-                success: true,
-                exit_code: Some(0),
-                signal: None,
-                status,
-            } if target == MOVED && status == "exit status: 0"
-        )));
-
-        let mut yielded = fake(Some(QUIET_TICKS + 2), None);
-        supervise_prefreeze_loop(&marker, &mut yielded).unwrap();
-        assert_eq!(yielded.run_dirs, 1, "the yielded head is not restarted");
-        assert_eq!(yielded.settles, 1);
-        assert!(yielded.events.iter().any(|event| matches!(
-            event,
-            PrefreezeEvent::YieldRequested { target, reason, .. }
-                if target == MOVED && reason == "Release stage or timing claim"
-        )));
-        assert!(yielded.events.iter().any(|event| matches!(
-            event,
-            PrefreezeEvent::Yielded { target, reason, .. }
-                if target == MOVED && reason == "Release stage or timing claim"
-        )));
-
-        let killed = PrefreezeExit {
-            success: false,
-            exit_code: None,
-            signal: Some(9),
-            status: "signal: 9 (SIGKILL)".into(),
-        };
-        let mut simultaneous = fake(Some(QUIET_TICKS + 2), Some(killed));
-        supervise_prefreeze_loop(&marker, &mut simultaneous).unwrap();
-        assert_eq!(simultaneous.settles, 0);
-        assert!(!simultaneous.events.iter().any(|event| matches!(
-            event,
-            PrefreezeEvent::YieldRequested { .. } | PrefreezeEvent::Yielded { .. }
-        )));
-        assert!(simultaneous.events.iter().any(|event| matches!(
-            event,
-            PrefreezeEvent::Finished {
-                target,
-                success: false,
-                exit_code: None,
-                signal: Some(9),
-                ..
-            } if target == MOVED
-        )));
-
-        let mut observing = fake(Some(1), None);
-        observing.observation_ready = false;
-        observing.stop_at = 2;
-        supervise_prefreeze_loop(&marker, &mut observing).unwrap();
-        assert_eq!(observing.run_dirs, 0);
-        assert_eq!(observing.observation_settles, 1);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
-        use super::*;
-
-        const PREPARED_SEAL: &str =
-            "3333333333333333333333333333333333333333333333333333333333333333";
-        const CHANGED_SEAL: &str =
-            "4444444444444444444444444444444444444444444444444444444444444444";
-        static OFFERED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-        fn arm_prefrozen_fixture(_: &Path, _: Option<&Path>, handed: Option<&Path>) {
-            *OFFERED.lock().unwrap() = handed.map(Path::to_path_buf);
-        }
-        fn prepared_identity() -> Result<String, String> {
-            if OFFERED.lock().unwrap().is_some() {
-                Ok(PREPARED_SEAL.into())
-            } else {
-                Ok(CHANGED_SEAL.into())
-            }
-        }
-        fn changed_identity() -> Result<String, String> {
-            Ok(CHANGED_SEAL.into())
-        }
-        *OFFERED.lock().unwrap() = None;
-
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("input"), "fixed release input\n").unwrap();
-        let git = GitCli::new(&repo);
-        for args in [
-            vec!["init", "-q"],
-            vec!["add", "."],
-            vec![
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "fixture",
-            ],
-        ] {
-            crate::ledger::git_ok(&git, &args).unwrap();
-        }
-        let built_from = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
-            .unwrap()
-            .stdout_utf8()
-            .trim()
-            .to_owned();
-        std::fs::write(repo.join("input"), "next fixed release input\n").unwrap();
-        for args in [
-            vec!["add", "."],
-            vec![
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "target",
-            ],
-        ] {
-            crate::ledger::git_ok(&git, &args).unwrap();
-        }
-        let commit = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
-            .unwrap()
-            .stdout_utf8()
-            .trim()
-            .to_owned();
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.release = temp.path().join("release");
-        real.state = temp.path().join("state");
-        real.logs = temp.path().join("logs");
-        real.build_inputs = prepared_identity;
-        real.arm_prefrozen_inputs = arm_prefrozen_fixture;
-        real.handed_inputs = || {
-            Some(PathBuf::from(
-                "/state/aterm-release/inputs-seal/current.toml",
-            ))
-        };
-        real.prefrozen_inputs = |state, expected| {
-            if expected != PREPARED_SEAL {
-                return None;
-            }
-            let path = state.join("inputs-seal/prepared.toml");
-            std::fs::create_dir_all(path.parent().unwrap()).ok()?;
-            std::fs::write(&path, "fixture seal").ok()?;
-            Some(path)
-        };
-        std::fs::create_dir_all(&real.logs).unwrap();
-
-        let source = temp.path().join("prepared-cutter");
-        aterm_tempfile::stand_in(
-            &source,
-            &format!(
-                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ] || exit 64\nprintf '%s\\n' '{}'\n",
-                crate::release_tools::CUTTER_VERSION
-            ),
-        )
-        .unwrap();
-        let source = std::fs::canonicalize(source).unwrap();
-        let cache = cutter_cache_dir(&real.release);
-        let inputs = crate::cutter_inputs::Inputs {
-            digest: "1".repeat(64),
-            sources: "2".repeat(64),
-            seal: PREPARED_SEAL.into(),
-        };
-        let mut prepared = crate::release_tools::stage_cutter(
-            &cache,
-            &commit,
-            &source,
-            &real.step_log(real.step),
-            Some(inputs.clone()),
-        )
-        .unwrap();
-        prepared.built_from.clone_from(&built_from);
-        crate::release_tools::publish_cutter(&cache, &prepared).unwrap();
-        real.seal_inputs().unwrap();
-        assert!(
-            OFFERED
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|path| path.ends_with("cutter-cache/state/inputs-seal/prepared.toml"))
-        );
-
-        // This path cannot build anything. Success therefore proves that the real cut promoted
-        // the exact cache record instead of entering cutter_workspace_at/frozen_cutter_here.
-        let unusable = Prover {
-            bin: temp.path().join("no-prover"),
-            commit: "f".repeat(40),
-            source: "negative-control prover".into(),
-        };
-        let (adopted, handed) = real.frozen_cutter_with_inputs(&commit, &unusable).unwrap();
-        assert_eq!(adopted.commit, commit);
-        assert_eq!(adopted.built_from, built_from);
-        assert_eq!(adopted.inputs, Some(inputs));
-        assert_ne!(adopted.tool.path, prepared.tool.path);
-        let handed = handed.expect("the prepared step-1 seal is handed to the real cutter");
-        assert_eq!(
-            handed,
-            PathBuf::from("/state/aterm-release/inputs-seal/current.toml")
-        );
-        let command = real.cutter_command_with_inputs(&adopted.tool.path, Some(handed.clone()));
-        assert!(command.get_envs().any(|(name, value)| {
-            name == std::ffi::OsStr::new(crate::build_inputs::SEAL_ENV)
-                && value == Some(handed.as_os_str())
-        }));
-        assert_eq!(
-            crate::release_tools::recorded_cutter(&real.release, &commit).unwrap(),
-            adopted
-        );
-        let log = std::fs::read_to_string(real.step_log(real.step)).unwrap();
-        assert!(
-            log.contains("\"event\":\"cutter-prefreeze-adopted\"")
-                && log.contains("\"step_1_inputs\":\"adopted-and-handed\"")
-                && log.contains("\"event\":\"prefreeze-step-1-inputs-adopted\""),
-            "the next cut must state exact preparation adoption: {log}"
-        );
-
-        std::fs::remove_file(crate::release_tools::cutter_record_path(&real.release)).unwrap();
-        real.build_inputs = changed_identity;
-        real.seal_inputs().unwrap();
-        assert!(
-            real.frozen_cutter_with_inputs(&commit, &unusable).is_err(),
-            "changed step-1 inputs must reject the exact cached cutter and enter a real freeze"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prefreeze_handoff_waits_ninety_seconds_with_progress_but_refuses_a_stall() {
-        use super::*;
-        use std::cell::Cell;
-        use std::time::{Duration, Instant};
-        for progressing in [true, false] {
-            let seconds = Cell::new(0_u64);
-            let began = Instant::now();
-            let mut logs = Vec::new();
-            let result = wait_prefreeze(
-                || {
-                    let elapsed = seconds.get();
-                    (!progressing || elapsed < 90).then(|| {
-                        (
-                            4321,
-                            "same birth".into(),
-                            Some(if progressing { elapsed / 30 } else { 0 }),
-                        )
-                    })
-                },
-                || began + Duration::from_secs(seconds.get()),
-                || seconds.set(seconds.get() + 1),
-                || false,
-                |message| logs.push(message.to_owned()),
-            );
-            if progressing {
-                result.unwrap();
-                assert_eq!(seconds.get(), 90);
-                assert!(logs[0].contains("pid 4321"));
-                assert!(logs[1].contains("yielded after 90.000 s"));
-            } else {
-                assert_eq!(seconds.get(), 60);
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("pid 4321 made no descendant CPU/I/O progress")
-                );
-                assert_eq!(logs.len(), 1);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prefreeze_compiler_stays_in_the_workers_cancellation_group() {
-        use super::*;
-        for prefreeze in [true, false] {
-            let mut cmd = command("/bin/cat");
-            cmd.stdin(Stdio::piped()).stdout(Stdio::null());
-            step_process_group(&mut cmd, prefreeze);
-            let mut child = cmd.spawn().unwrap();
-            let pid = i32::try_from(child.id()).unwrap();
-            // SAFETY: these calls only read process-group identities of this process
-            // and its owned, unreaped child.
-            let (group, parent) = unsafe { (libc::getpgid(pid), libc::getpgrp()) };
-            assert_eq!(group, if prefreeze { parent } else { pid });
-            drop(child.stdin.take());
-            assert!(child.wait().unwrap().success());
-        }
-    }
-
-    /// Real worker and supervisor, private traffic ledger: no cut or publication.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "explicit real prefreeze cancellation measurement"]
-    fn measure_prefreeze_yield() {
-        use super::*;
-        use std::time::{Duration, Instant};
-        let cwd = std::env::current_dir().unwrap();
-        let source = PathBuf::from(
-            crate::ledger::git_ok(&GitCli::new(&cwd), &["rev-parse", "--show-toplevel"])
-                .unwrap()
-                .stdout_utf8()
-                .trim(),
-        );
-        let original = GitCli::new(&source);
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        crate::ledger::git_ok(
-            &original,
-            &[
-                "clone",
-                "--quiet",
-                "--shared",
-                source.to_str().unwrap(),
-                repo.to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        let repo = repo.canonicalize().unwrap();
-        let git = GitCli::new(&repo);
-        let url = crate::ledger::git_ok(&original, &["remote", "get-url", "origin"])
-            .unwrap()
-            .stdout_utf8();
-        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url.trim()]).unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "submodule.vendor/astream.url",
-                source.join("vendor/astream").to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "update",
-                "--init",
-                "vendor/astream",
-            ],
-        )
-        .unwrap();
-        let ledger = aterm_capacity::Ledger::at(temp.path().join("traffic"));
-        let executable = aterm_tempfile::bin_exe("aterm-release");
-        std::thread::scope(|scope| {
-            let supervisor =
-                scope.spawn(|| supervise_prefreeze_in(&repo, "old-line", &ledger, &executable));
-            let mut last = Instant::now();
-            let mut probe = aterm_uds::deadline::ProcessProgressProbe::default();
-            let mut evidence = None;
-            let compiler = loop {
-                let sweep = aterm_sysprobe::processes().unwrap();
-                let mut descendants = std::collections::BTreeSet::from([std::process::id()]);
-                loop {
-                    let before = descendants.len();
-                    for process in &sweep.procs {
-                        if descendants.contains(&process.ppid) {
-                            descendants.insert(process.pid);
-                        }
-                    }
-                    if descendants.len() == before {
-                        break;
-                    }
-                }
-                if let Some(compiler) = sweep.procs.iter().find(|process| {
-                    descendants.contains(&process.pid)
-                        && process.name == "trustc"
-                        && aterm_sysprobe::kproc::argv(process.pid).is_some_and(|args| {
-                            args.iter().any(|arg| arg.starts_with(b"--emit="))
-                                && !args.iter().any(|arg| arg.starts_with(b"--print"))
-                        })
-                }) {
-                    let args = aterm_sysprobe::kproc::argv(compiler.pid).unwrap();
-                    let unit = args
-                        .windows(2)
-                        .find(|pair| pair[0] == b"--crate-name")
-                        .unwrap();
-                    println!(
-                        "prefreeze-active-compiler unit={}",
-                        String::from_utf8_lossy(&unit[1])
-                    );
-                    break Some(compiler.pid);
-                }
-                let progress = probe.read_descendants(std::process::id());
-                if progress.is_none() || progress != evidence {
-                    last = Instant::now();
-                }
-                evidence = progress;
-                if supervisor.is_finished() || last.elapsed() >= Duration::from_secs(60) {
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            };
-            let claimed = Instant::now();
-            let _line = aterm_capacity::admit_with(
-                &ledger,
-                &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4)),
-                aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
-                aterm_capacity::Admit::Wait,
-                aterm_capacity::Pace::default(),
-                &mut |_| {},
-            )
-            .unwrap();
-            supervisor.join().unwrap().unwrap();
-            let compiler =
-                compiler.expect("no compiler appeared before preparation stopped progressing");
-            println!(
-                "prefreeze-yield-measure compiler_pid={compiler} claim_to_holder_removed_s={:.6}",
-                claimed.elapsed().as_secs_f64()
-            );
-            assert!(
-                !repo
-                    .join(".git/aterm-release/.ubd/cutter-cache/prefreeze-running")
-                    .exists()
-            );
-            let remaining = aterm_sysprobe::kproc::record_read(compiler).unwrap();
-            println!("prefreeze-yield-compiler-terminal {remaining:?}");
-            assert!(
-                remaining.is_none_or(|record| record.zombie),
-                "a live compiler retained its build lock after yield"
-            );
-        });
-    }
-
-    /// Small real Cargo graph, no release, credential, service or product execution.
-    /// The instrument counts compiled units, rather than interpreting elapsed time as a gain.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "explicit local pre-freeze timeline measurement"]
-    fn measure_automatic_prefreeze_timeline() {
-        use super::*;
-
-        const MEASURED_SEAL: &str =
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(repo.join("crates/aterm-release/src")).unwrap();
-        std::fs::create_dir_all(repo.join("dep/src")).unwrap();
-        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
-        std::fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
-        std::fs::write(
-            repo.join(".cargo/config.toml"),
-            "[unstable]\nchecksum-freshness=true\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(repo.join("app/src")).unwrap();
-        std::fs::write(repo.join("app/src/main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(
-            repo.join("app/Cargo.toml"),
-            "[package]\nname='app'\nversion.workspace=true\nedition='2021'\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers=['dep','app','crates/aterm-release']\nresolver='2'\n[workspace.package]\nversion='1.0.0'\n[profile.gate]\ninherits='dev'\n").unwrap();
-        std::fs::write(repo.join("crates/aterm-release/Cargo.toml"), "[package]\nname='aterm-release'\nversion='0.0.0'\nedition='2021'\n[dependencies]\ncutter-dep={path='../../dep'}\n").unwrap();
-        std::fs::write(
-            repo.join("dep/Cargo.toml"),
-            "[package]\nname='cutter-dep'\nversion='0.0.0'\nedition='2021'\n",
-        )
-        .unwrap();
-        std::fs::write(
-            repo.join("dep/src/lib.rs"),
-            "pub fn marker() -> u32 { 1 }\n",
-        )
-        .unwrap();
-        let program =
-            "fn main() { let _ = cutter_dep::marker(); println!(\"aterm-release tool 1\"); }\n";
-        std::fs::write(repo.join("crates/aterm-release/src/main.rs"), program).unwrap();
-        std::fs::write(repo.join("Cargo.lock"), "version=4\n[[package]]\nname='app'\nversion='1.0.0'\n[[package]]\nname='aterm-release'\nversion='0.0.0'\ndependencies=['cutter-dep']\n[[package]]\nname='cutter-dep'\nversion='0.0.0'\n").unwrap();
-        let git = GitCli::new(&repo);
-        let git_run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
-        git_run(&["init", "-q"]);
-        let commit = || {
-            git_run(&["add", "."]);
-            git_run(&[
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qm",
-                "fixture",
-            ]);
-            git_run(&["rev-parse", "HEAD"])
-                .stdout_utf8()
-                .trim()
-                .to_owned()
-        };
-        let base = commit();
-        std::fs::write(
-            repo.join("crates/aterm-release/src/main.rs"),
-            format!("{program}// main moves during cut N\n"),
-        )
-        .unwrap();
-        std::fs::write(repo.join("notes"), "unrelated main movement\n").unwrap();
-        let next = commit();
-        let bin = crate::gates::trust_stage2_bin().unwrap();
-        let prover = Prover {
-            bin,
-            commit: "0".repeat(40),
-            source: "fixture pinned Trust".into(),
-        };
-        for (take, prepared) in [false, true, true, false].into_iter().enumerate() {
-            git_run(&["checkout", "--quiet", "--detach", &base]);
-            let state = temp.path().join(format!("take-{take}-{prepared}"));
-            let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-            real.scratch_logs = false;
-            real.release = state.join("release");
-            real.state = state.join("state");
-            real.logs = state.join("logs");
-            std::fs::create_dir_all(&real.logs).unwrap();
-            real.build_inputs = || Ok(MEASURED_SEAL.into());
-            real.arm_inputs = |_, _| {};
-            real.arm_prefrozen_inputs = |_, _, _| {};
-            real.handed_inputs = || Some(PathBuf::from("/measurement/inputs-seal.toml"));
-            real.prefrozen_inputs = |state, expected| {
-                if expected != MEASURED_SEAL {
-                    return None;
-                }
-                let path = state.join("inputs-seal/measurement.toml");
-                std::fs::create_dir_all(path.parent().unwrap()).ok()?;
-                std::fs::write(&path, "measurement seal").ok()?;
-                Some(path)
-            };
-            let n = real.frozen_cutter(&base, &prover).unwrap();
-            git_run(&["checkout", "--quiet", "--detach", &next]);
-            if prepared {
-                let compiler = real
-                    .cutter_workspace_at(&cutter_cache_dir(&real.release), &next)
-                    .unwrap();
-                compiler.frozen_cutter_here(&next, &prover).unwrap();
-                assert_eq!(
-                    crate::release_tools::recorded_cutter(&real.release, &base).unwrap(),
-                    n,
-                    "preparation must not overwrite the current cut's proof"
-                );
-            }
-            real.seal_inputs().unwrap();
-            let log = real.step_log(real.step);
-            std::fs::write(&log, "").unwrap();
-            let selection = std::time::Instant::now();
-            let next_cutter = real.frozen_cutter(&next, &prover).unwrap();
-            let selection_s = selection.elapsed().as_secs_f64();
-            let compiled = |log: &Path| -> u64 {
-                std::fs::read_to_string(log)
-                    .unwrap()
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("release-event: "))
-                    .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
-                    .filter(|event| event["event"].as_str() == Some("frozen-tool-compile"))
-                    .map(|event| event["compiled_units"].as_u64().unwrap())
-                    .sum()
-            };
-            let first = compiled(&log);
-            assert_eq!(first, if prepared { 0 } else { 1 });
-            let exact = std::fs::read_to_string(&log)
-                .unwrap()
-                .contains("\"event\":\"cutter-prefreeze-adopted\"");
-            assert_eq!(
-                exact, prepared,
-                "only the prepared take adopts the exact record"
-            );
-            let hop = |label: &str, expected: u64| {
-                let text = std::fs::read_to_string(&log).unwrap();
-                assert_eq!(compiled(&log), expected, "{label}");
-                println!(
-                    "prefreeze-timeline take={take} prepared={prepared} hop={label} compiled={expected}"
-                );
-                for line in text.lines().filter(|line| {
-                    line.contains("fingerprint") || line.starts_with("release-event: ")
-                }) {
-                    println!("{line}");
-                }
-            };
-            hop("unchanged", first);
-            let manifest = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap();
-            let lock = std::fs::read_to_string(repo.join("Cargo.lock")).unwrap();
-            std::fs::write(repo.join("Cargo.toml"), manifest.replace("1.0.0", "2.0.0")).unwrap();
-            std::fs::write(repo.join("Cargo.lock"), lock.replace("1.0.0", "2.0.0")).unwrap();
-            let bump = commit();
-            std::fs::write(&log, "").unwrap();
-            let bumped = real.frozen_cutter(&bump, &prover).unwrap();
-            assert_eq!(bumped.built_from, next_cutter.built_from);
-            assert_eq!(bumped.inputs, next_cutter.inputs);
-            hop("bump-only", 0);
-            if prepared {
-                assert_eq!(next_cutter.built_from, next);
-                std::fs::write(
-                    repo.join("crates/aterm-release/src/main.rs"),
-                    format!("{program}// another cutter delta\n"),
-                )
-                .unwrap();
-                let delta = commit();
-                std::fs::write(&log, "").unwrap();
-                let delta_cutter = real.frozen_cutter(&delta, &prover).unwrap();
-                assert_eq!(compiled(&log), 1, "unchanged dependency stays fresh");
-                assert_eq!(delta_cutter.built_from, delta);
-                assert_ne!(delta_cutter.inputs, next_cutter.inputs);
-                hop("real-cutter-change", 1);
-                std::fs::write(
-                    repo.join("dep/src/lib.rs"),
-                    "pub fn marker() -> u32 { 2 }\n",
-                )
-                .unwrap();
-                let manifest = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap();
-                let lock = std::fs::read_to_string(repo.join("Cargo.lock")).unwrap();
-                std::fs::write(repo.join("Cargo.toml"), manifest.replace("2.0.0", "3.0.0"))
-                    .unwrap();
-                std::fs::write(repo.join("Cargo.lock"), lock.replace("2.0.0", "3.0.0")).unwrap();
-                let delta = commit();
-                std::fs::write(&log, "").unwrap();
-                let cutter = real.frozen_cutter(&delta, &prover).unwrap();
-                assert_eq!(
-                    cutter.built_from, delta,
-                    "a bump carrying a real input cannot adopt another input's pre-freeze"
-                );
-                assert_ne!(cutter.inputs, bumped.inputs);
-                hop("real-dependency-change", 2);
-            }
-            println!(
-                "prefreeze-timeline take={take} prepared={prepared} commit={next} \
-                 cutter_selection_wall_s={selection_s:.6} next_freeze_compiled_units={first}"
-            );
-        }
-    }
-
-    /// Read-only native origin observations and local bump writes in a disposable
-    /// clone. Deliberately stops before the native ref write or any publication.
-    #[test]
-    #[ignore = "explicit local bump attribution; reads configured source origin"]
-    fn measure_local_bump_parts() {
-        let source = std::env::current_dir().unwrap();
-        let original = GitCli::new(&source);
-        let url = crate::ledger::git_ok(&original, &["remote", "get-url", "origin"])
-            .unwrap()
-            .stdout_utf8();
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        crate::ledger::git_ok(
-            &original,
-            &[
-                "clone",
-                "--quiet",
-                "--shared",
-                source.to_str().unwrap(),
-                repo.to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        let repo = repo.canonicalize().unwrap();
-        let git = GitCli::new(&repo);
-        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url.trim()]).unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "submodule.vendor/astream.url",
-                source.join("vendor/astream").to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "update",
-                "--init",
-                "vendor/astream",
-            ],
-        )
-        .unwrap();
-        let mut real = Real::new(&repo, Some(&source), true, false).unwrap();
-        let prover = real.prover(None).unwrap();
-        let from = real.version_at("HEAD").unwrap();
-        let to = aterm_types::release_version::ReleaseVersion::parse(&from)
-            .unwrap()
-            .successor()
-            .unwrap()
-            .to_string();
-        crate::cut_timing::measure("fixture-bump-origin", || {
-            crate::publish::native_origin(&repo).unwrap()
-        });
-        let editor = PathBuf::from(std::env::var_os("ATERM_RELEASE_BUMP_EDITOR").unwrap());
-        crate::cut_timing::measure("fixture-bump-editor", || {
-            let mut cmd = real.child(editor, None);
-            cmd.arg(&repo).args([&to, &from]);
-            assert_eq!(real.logged(Step::Commit, &mut cmd).code, 0);
-        });
-        crate::cut_timing::measure("fixture-bump-lockfiles", || {
-            let changed = bump_nested_locks(
-                &repo,
-                real.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]),
-                &from,
-                &to,
-            )
-            .unwrap();
-            real.validate_bumped_locks(&prover, &changed).unwrap();
-        });
-        crate::cut_timing::measure("fixture-bump-harness", || {
-            // A libtest image has no credential-helper dispatch. Use the real
-            // diagnostic CLI, so its native origin uses its own typed helper.
-            let cli = PathBuf::from(std::env::var_os("ATERM_RELEASE_DIAGNOSTIC").unwrap());
-            let mut cmd = real.child(cli, None);
-            cmd.arg("harness-bump");
-            assert_eq!(real.logged(Step::Commit, &mut cmd).code, 0);
-        });
-        crate::cut_timing::measure("fixture-bump-commit", || {
-            crate::ledger::git_ok(
-                &git,
-                &[
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "-qam",
-                    "Fixture bump (never pushed)",
-                ],
-            )
-            .unwrap();
-        });
-        // Keep this mutable so Real's destructor owns all its ordinary cleanup.
-        real.scratch_logs = true;
-    }
-
-    /// Replay exact historical compiler graphs in one persistent private checkout.
-    /// The seal is fixed fixture evidence; this measures compiler reuse, not an SDK walk.
-    #[test]
-    #[ignore = "explicit full cutter rebuild attribution"]
-    fn measure_real_cutter_rebuilds() {
-        let repo = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let state = PathBuf::from(std::env::var_os("ATERM_RELEASE_REBUILD_STATE").unwrap());
-        assert!(state.is_absolute());
-        let commits = std::env::var("ATERM_RELEASE_REBUILD_COMMITS").unwrap();
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.state = state.join("state");
-        real.release = state.join("release");
-        real.logs = state.join("logs");
-        real.build_inputs = || Ok("f".repeat(64));
-        real.arm_inputs = |_, _| {};
-        std::fs::create_dir_all(&real.logs).unwrap();
-        let prover = real.prover(None).unwrap();
-        for rev in commits.split(',') {
-            let commit = crate::ledger::git_ok(&real.git(), &["rev-parse", rev])
-                .unwrap()
-                .stdout_utf8();
-            let compiler = real
-                .cutter_workspace_at(&cutter_cache_dir(&real.release), commit.trim())
-                .unwrap();
-            let log = compiler.step_log(compiler.step);
-            std::fs::write(&log, "").unwrap();
-            let cutter = compiler.frozen_cutter_here(commit.trim(), &prover).unwrap();
-            std::fs::copy(&log, state.join(format!("{rev}.log"))).unwrap();
-            println!("cutter-rebuild rev={rev} built_from={}", cutter.built_from);
-            for line in std::fs::read_to_string(&log)
-                .unwrap()
-                .lines()
-                .filter(|line| line.contains("fingerprint") || line.starts_with("release-event: "))
-            {
-                println!("{line}");
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prefreeze_reserves_background_build_and_timing_exclusion() {
-        use super::*;
-        let need = prefreeze_need();
-        assert_eq!(need.rank, aterm_capacity::Rank::Background);
-        assert!(need.mem > 0 && need.cores > 0 && need.covers);
-        assert_eq!(need.quiet, Some(f64::MAX));
-        // The ordinary cut path carries Release rank; the preparation must remove it
-        // from every child, retain the admitted build cover and bound compiler jobs.
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        let mut cmd = real.child("targo", None);
-        assert!(
-            cmd.get_envs()
-                .any(|(key, val)| key == aterm_capacity::RELEASE_RUN_ENV && val.is_some())
-        );
-        configure_prefreeze_child(&mut cmd, "fixture-cover", 3);
-        let env: std::collections::BTreeMap<_, _> = cmd.get_envs().collect();
-        assert_eq!(
-            env[std::ffi::OsStr::new(aterm_capacity::RELEASE_RUN_ENV)],
-            None
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new(aterm_capacity::COVER_ENV)],
-            Some(std::ffi::OsStr::new("fixture-cover"))
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new("CARGO_BUILD_JOBS")],
-            Some(std::ffi::OsStr::new("3"))
-        );
-    }
-
-    /// Real offline resolution is the oracle. Omitting the rewrite must fail locked
-    /// metadata, and an incorrect rewritten version must fail it too.
-    #[cfg(unix)]
-    #[test]
-    fn version_only_lock_rewrite_matches_resolver_bytes() {
-        use super::*;
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let repo = scratch.path().canonicalize().unwrap();
-        for dir in ["leaf/src", "nested/src"] {
-            std::fs::create_dir_all(repo.join(dir)).unwrap();
-            std::fs::write(repo.join(dir).join("lib.rs"), "").unwrap();
-        }
-        let root = "[workspace]\nmembers = [\"leaf\"]\nexclude = [\"nested\"]\nresolver = \"2\"\n[workspace.package]\nversion = \"0.147.0\"\n";
-        std::fs::write(repo.join("Cargo.toml"), root).unwrap();
-        std::fs::write(
-            repo.join("leaf/Cargo.toml"),
-            "[package]\nname = \"bump-leaf\"\nversion.workspace = true\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join("nested/Cargo.toml"), "[workspace]\n[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[dependencies]\nbump-leaf = { path = \"../leaf\" }\n").unwrap();
-        let targo = crate::gates::trust_stage2_bin().unwrap().join("targo");
-        let run = |manifest: &Path, args: &[&str]| {
-            let mut cmd = command(&targo);
-            cmd.current_dir(&repo)
-                .args(args)
-                .arg("--manifest-path")
-                .arg(manifest);
-            cmd.output().unwrap()
-        };
-        let locks = ["Cargo.lock", "nested/Cargo.lock"];
-        let mut old = Vec::new();
-        for lock in locks {
-            let manifest = repo.join(lock).with_file_name("Cargo.toml");
-            assert!(
-                run(&manifest, &["update", "--workspace", "--offline"])
-                    .status
-                    .success()
-            );
-            old.push(std::fs::read_to_string(repo.join(lock)).unwrap());
-        }
-        std::fs::write(repo.join("Cargo.toml"), root.replace("0.147.0", "0.148.0")).unwrap();
-        let metadata = ["metadata", "--locked", "--offline", "--format-version", "1"];
-        for lock in locks {
-            assert!(
-                !run(&repo.join(lock).with_file_name("Cargo.toml"), &metadata)
-                    .status
-                    .success(),
-                "unmodified {lock} must be stale"
-            );
-        }
-        assert_eq!(
-            bump_nested_locks(
-                &repo,
-                Ok(locks.map(str::to_owned).to_vec()),
-                "0.147.0",
-                "0.148.0"
-            )
-            .unwrap(),
-            locks
-        );
-        for (lock, original) in locks.iter().zip(&old) {
-            let manifest = repo.join(lock).with_file_name("Cargo.toml");
-            let expected = lock_follows_bump(original, "0.147.0", "0.148.0").unwrap();
-            assert_eq!(std::fs::read_to_string(repo.join(lock)).unwrap(), expected);
-            assert!(run(&manifest, &metadata).status.success());
-            assert!(
-                run(&manifest, &["update", "--workspace", "--offline"])
-                    .status
-                    .success()
-            );
-            assert_eq!(std::fs::read_to_string(repo.join(lock)).unwrap(), expected);
-            std::fs::write(repo.join(lock), expected.replace("0.148.0", "0.149.0")).unwrap();
-            assert!(
-                !run(&manifest, &metadata).status.success(),
-                "wrong version must be refused"
-            );
-        }
-    }
-    /// NEGATIVE CONTROLS: waiting at start blocks on sleep; dropping without stopping and
-    /// reaping leaves the PID alive. No release executable, signer or credential is used.
-    #[cfg(unix)]
-    #[test]
-    fn early_packaging_child_is_owned_until_join_or_cancel() {
-        use super::*;
-        use crate::release::PendingSign as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        for cancel in [false, true] {
-            let mut cmd = command("/bin/sleep");
-            cmd.arg("60");
-            let mut pending = real.start_preparing_sign(cmd).unwrap();
-            let pid = pending.child.as_ref().unwrap().id();
-            assert!(
-                pending
-                    .child
-                    .as_mut()
-                    .unwrap()
-                    .try_wait()
-                    .unwrap()
-                    .is_none()
-            );
-            if cancel {
-                drop(pending);
-            } else {
-                pending.stop().fire();
-                let ran = Box::new(pending).finish();
-                assert_ne!(ran.code, 0);
-                assert!(
-                    ran.detail
-                        .iter()
-                        .any(|line| line.contains("step-child-finished"))
-                );
-            }
-            // SAFETY: signal zero only queries this test child's PID after it was reaped.
-            assert_ne!(
-                unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), 0) },
-                0
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn release_signal_disposition_probe() {
-        let Ok(expected) = std::env::var("ATERM_RELEASE_SIGNAL_PROBE") else {
-            return;
-        };
-        let expected = if expected == "ignored" {
-            libc::SIG_IGN
-        } else {
-            libc::SIG_DFL
-        };
-        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
-            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-            // SAFETY: a null new action reads into a live output slot.
-            assert_eq!(
-                unsafe { libc::sigaction(sig, std::ptr::null(), action.as_mut_ptr()) },
-                0
-            );
-            // SAFETY: the successful query initialized the action.
-            assert_eq!(
-                unsafe { action.assume_init() }.sa_sigaction,
-                expected,
-                "signal {sig}"
-            );
-        }
-        println!("\nRELEASE_SIGNAL_CHILD_CHECKED");
-    }
-
-    /// Detached release steps default the signals the cutter forwards even when its shell
-    /// ignored them. The ordinary child is the negative control: it observes inherited ignores.
-    #[cfg(unix)]
-    #[test]
-    fn detached_steps_default_the_background_shells_ignored_signals() {
-        use super::*;
-        use std::time::Duration;
-        const PARENT: &str = "ATERM_RELEASE_SIGNAL_PARENT";
-        const NAME: &str =
-            "release_steps::tests::detached_steps_default_the_background_shells_ignored_signals";
-        const PROBE: &str = "release_steps::tests::release_signal_disposition_probe";
-        if std::env::var_os(PARENT).is_none() {
-            let mut parent = command("/bin/sh");
-            parent
-                .args(["-c", "trap '' INT QUIT TERM; exec \"$0\" \"$@\""])
-                .arg(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-                .env(PARENT, "1");
-            let out = aterm_uds::deadline::ends_within(&mut parent, Duration::from_secs(60));
-            assert!(out.status.success(), "{out:?}");
-            assert!(
-                String::from_utf8_lossy(&out.stdout).contains("\nDETACHED_SIGNALS_CHECKED\n"),
-                "{out:?}"
-            );
-            return;
-        }
-        for reset in [false, true] {
-            let mut child = command(std::env::current_exe().unwrap());
-            child
-                .args(["--exact", PROBE, "--nocapture", "--test-threads=1"])
-                .env(
-                    "ATERM_RELEASE_SIGNAL_PROBE",
-                    if reset { "default" } else { "ignored" },
-                );
-            if reset {
-                detach(&mut child);
-            }
-            let out = aterm_uds::deadline::ends_within(&mut child, Duration::from_secs(60));
-            assert!(out.status.success(), "{out:?}");
-            assert!(
-                String::from_utf8_lossy(&out.stdout).contains("\nRELEASE_SIGNAL_CHILD_CHECKED\n"),
-                "reset={reset}: {out:?}"
-            );
-        }
-        println!("\nDETACHED_SIGNALS_CHECKED");
-    }
-
-    #[test]
-    fn reader_cargo_holds_its_implicit_job_through_success_and_failure() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let pool = aterm_capacity::Jobserver::new(&dir.path().join("reader.jobs"), 1).unwrap();
-        for fail in [false, true] {
-            let stop = super::BranchStop::default();
-            let mut cmd = super::command("targo");
-            let result = super::with_reader_cargo(Some(&pool), &stop, &mut cmd, |cmd| {
-                assert!(
-                    pool.try_acquire().unwrap().is_none(),
-                    "implicit job is charged"
-                );
-                for name in ["MAKEFLAGS", "CARGO_MAKEFLAGS"] {
-                    assert!(cmd.get_envs().any(|(key, value)| {
-                        key == name && value == Some(std::ffi::OsStr::new(&pool.flags()))
-                    }));
-                }
-                if fail {
-                    Err(std::io::Error::other("compile failed"))
-                } else {
-                    Ok(())
-                }
-            });
-            assert_eq!(result.is_err(), fail);
-            assert!(
-                pool.try_acquire().unwrap().is_some(),
-                "compile returned its job"
-            );
-        }
-        let stop = super::BranchStop::default();
-        stop.fire();
-        let token = pool.try_acquire().unwrap().unwrap();
-        let mut ran = false;
-        let result =
-            super::with_reader_cargo(Some(&pool), &stop, &mut super::command("targo"), |_| {
-                ran = true;
-                Ok(())
-            });
-        assert!(result.is_err());
-        assert!(!ran, "cancelled warm-up never starts Cargo");
-        drop(token);
-    }
-
-    #[test]
-    fn reader_prebuild_overlaps_cut_and_preserves_its_verdict() {
-        let (started, began) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let stopped = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let warm_stop = std::sync::Arc::clone(&stopped);
-        let timeout = std::time::Duration::from_secs(60);
-        let verdict = super::with_reader_prebuild(
-            None,
-            move |stop| {
-                *warm_stop.lock().unwrap() = Some(stop.clone());
-                started.send(()).unwrap();
-                released.recv_timeout(timeout).unwrap();
-            },
-            || {
-                began.recv_timeout(timeout).unwrap();
-                release.send(()).unwrap();
-                super::Ran {
-                    code: 37,
-                    detail: Vec::new(),
-                }
-            },
-        );
-        assert_eq!(verdict.code, 37);
-        assert!(stopped.lock().unwrap().as_ref().unwrap().fired());
-    }
-
-    #[test]
-    fn a_channel_transport_failure_never_blames_installed_prerequisites() {
-        let transport = "curl: (56) HTTP 504";
-        let error = format!("signed channel freshness transport: {transport}");
-        let refusal = prerequisite_refusal(error);
-        assert!(refusal.could_not_run);
-        assert!(refusal.why.contains(transport), "{}", refusal.why);
-        assert!(
-            refusal.remedy.contains("transport answers"),
-            "{}",
-            refusal.remedy
-        );
-        assert!(
-            !refusal.remedy.contains("pkg install"),
-            "negative control: a freshness failure cannot be repaired by replacing local bytes: {}",
-            refusal.remedy
-        );
-
-        let local = prerequisite_refusal("gitleaks is not installed".into());
-        assert!(local.remedy.contains("pkg install"), "{}", local.remedy);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_warming_verifier_is_bound_to_the_candidate_it_started_from() {
-        use super::*;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(root.path(), Some(root.path()), true, false).unwrap();
-        let mut command = command(aterm_uds::os_path!("true"));
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let child = command.spawn().unwrap();
-        let forwarded = Forwarded {
-            _running: interrupt::Running::enter(child.id()),
-            meter: None,
-            note: None,
-        };
-        let expected = "a".repeat(40);
-        real.warming = Some(WarmingVerifier {
-            commit: expected.clone(),
-            child,
-            _forwarded: forwarded,
-            stdout: root.path().join("no-build-output"),
-            stderr: root.path().join("no-build-errors"),
-        });
-        // This checkout is not the recorded candidate. Without the binding, the code instead
-        // consumes build output or resolves tools, neither of which is authorized here.
-        let error = real.finish_tools().unwrap_err();
-        assert!(error.contains(&format!("not {expected}")), "{error}");
-        assert!(real.warm_verifier.is_none());
-        assert!(real.warming.is_none());
-    }
-
-    #[test]
-    fn step_one_consumes_a_fleet_source_refresh_without_fetching_it_again() {
-        use super::*;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(root.path(), Some(root.path()), true, false).unwrap();
-        real.prefetched_origin = Some(crate::github_remote::FetchedOrigin {
-            main: "a".repeat(40),
-            tags: "fixture tags".into(),
-        });
-        // This directory has no source origin: trying a second refresh is a negative control.
-        assert_eq!(real.fetch().unwrap(), "a".repeat(40));
-        assert_eq!(real.origin_tags, "fixture tags");
-        assert!(real.prefetched_origin.is_none());
-    }
-
-    /// NEGATIVE CONTROL: omitting settlement, or ending only the direct child, leaves the
-    /// output pipe open. EOF proves each owned build and its inherited-pipe descendant ended.
-    #[cfg(unix)]
-    #[test]
-    fn an_early_refusal_settles_owned_warmups_and_their_groups() {
-        use super::*;
-        use std::os::fd::AsFd as _;
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let program = temp.path().join("warming-verifier");
-        aterm_tempfile::stand_in(
-            &program,
-            "#!/bin/sh\n/bin/sh -c 'printf \"ready\\n\"; while :; do /bin/sleep 60; done' &\nwait\n",
-        )
-        .unwrap();
-        for warming in [true, false] {
-            let mut command = command(&program);
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .process_group(0);
-            let mut child = command.spawn().unwrap();
-            let mut output = child.stdout.take().unwrap();
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            assert!(
-                !aterm_uds::ready::any_until(&[output.as_fd()], end)
-                    .unwrap()
-                    .is_empty()
-            );
-            let mut line = [0; 6];
-            output.read_exact(&mut line).unwrap();
-            assert_eq!(&line, b"ready\n");
-            let forwarded = Forwarded {
-                _running: interrupt::Running::enter(child.id()),
-                meter: None,
-                note: None,
-            };
-            if warming {
-                drop(WarmingVerifier {
-                    commit: "a".repeat(40),
-                    child,
-                    _forwarded: forwarded,
-                    stdout: temp.path().join("out"),
-                    stderr: temp.path().join("err"),
-                });
-            } else {
-                drop(forwarded);
-                aterm_uds::deadline::settle_child(&mut child);
-            }
-            assert!(
-                !aterm_uds::ready::any_until(&[output.as_fd()], end)
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(
-                output.read(&mut [0]).unwrap(),
-                0,
-                "no build descendant retains the pipe"
-            );
-        }
-    }
-
-    /// Local instrument for the launch boundary only. It never starts a release, reads a
-    /// roster, or publishes. Run A/B/B/A from a clean, fixed checkout with warm units.
-    #[test]
-    #[ignore = "explicit local freeze-time measurement"]
-    fn measure_cutter_freeze() {
-        use super::*;
-        let cwd = std::env::current_dir().unwrap();
-        let root =
-            crate::ledger::git_ok(&GitCli::new(&cwd), &["rev-parse", "--show-toplevel"]).unwrap();
-        let repo = PathBuf::from(root.stdout_utf8().trim());
-        let sample = std::env::var("ATERM_RELEASE_FREEZE_SAMPLE")
-            .expect("A (old two-tool freeze) or B (cutter-only)");
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(&repo, Some(&repo), false, false).unwrap();
-        real.release = std::env::var_os("ATERM_RELEASE_FREEZE_STATE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| temp.path().join("release"));
-        assert!(real.release.is_absolute(), "fixture state must be absolute");
-        if std::env::var_os("ATERM_RELEASE_FREEZE_STATE").is_some() {
-            real.state = real.release.join("fixture-state");
-        }
-        real.logs = std::env::var_os("ATERM_RELEASE_FREEZE_LOGS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| temp.path().join("logs"));
-        std::fs::create_dir_all(&real.logs).unwrap();
-        let commit = real.head();
-        let prover = real.prover(None).unwrap();
-        let start = std::time::Instant::now();
-        if sample == "A" {
-            crate::release_tools::clean_at(&repo, &commit).unwrap();
-            let phase = std::time::Instant::now();
-            let cutter = real
-                .build_frozen_tool(&prover, &FROZEN_CUTTER, "gate")
-                .unwrap()
-                .0;
-            println!(
-                "freeze-phase cutter_build_ms={}",
-                phase.elapsed().as_millis()
-            );
-            let phase = std::time::Instant::now();
-            let verifier = real
-                .build_frozen_tool(&prover, &FROZEN_VERIFY, "test")
-                .unwrap()
-                .0;
-            println!(
-                "freeze-phase verifier_build_ms={}",
-                phase.elapsed().as_millis()
-            );
-            let phase = std::time::Instant::now();
-            let tools =
-                crate::release_tools::stage(&real.release, &commit, &cutter, &verifier).unwrap();
-            crate::release_tools::clean_at(&repo, &commit).unwrap();
-            crate::release_tools::publish(&real.release, &tools).unwrap();
-            println!(
-                "freeze-phase copy_prove_publish_ms={}",
-                phase.elapsed().as_millis()
-            );
-        } else {
-            assert_eq!(sample, "B");
-            let cutter = real.frozen_cutter(&commit, &prover).unwrap();
-            println!("freeze-proof {}", aterm_json::to_string(&cutter).unwrap());
-        }
-        println!(
-            "freeze-sample mode={sample} elapsed_ms={}",
-            start.elapsed().as_millis()
-        );
-        let log = std::fs::read_to_string(real.step_log(real.step)).unwrap_or_default();
-        for line in log.lines().filter(|line| {
-            line.starts_with("release-event: ") || line.starts_with("cutter adoption unavailable:")
-        }) {
-            println!("{line}");
-        }
-    }
-
-    /// Full local launch instrument: real two-freeze/bump/seal work, with the existing
-    /// authority seam stopping at qualify. The caller owns a clean disposable branch;
-    /// restore its base between ABBA takes. No real release authority is contacted.
-    pub(super) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Duration) {
-        use super::*;
-        let repo = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let git = GitCli::new(&repo);
-        let branch = crate::ledger::git_ok(&git, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        assert!(branch.stdout_utf8().trim().starts_with("freeze-fixture-"));
-        let base = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
-            .unwrap()
-            .stdout_utf8()
-            .trim()
-            .to_owned();
-        crate::release_tools::clean_at(&repo, &base).unwrap();
-        let mode = std::env::var("ATERM_RELEASE_LAUNCH_SAMPLE").expect("before or after");
-        assert!(mode == "before" || mode == "after" || mode == "prepare");
-        let state = PathBuf::from(
-            std::env::var_os("ATERM_RELEASE_FREEZE_STATE").expect("private fixture state"),
-        );
-        assert!(state.is_absolute());
-        let editor =
-            PathBuf::from(std::env::var_os("ATERM_RELEASE_BUMP_EDITOR").expect("pub-bump-edit"));
-        assert!(editor.is_absolute());
-        let preparation_start = std::time::Instant::now();
-        let preparation_timing = crate::cut_timing::Timer::new("launch-fixture-preparation");
-        let mut real = Real::new(&repo, Some(&repo), false, false).unwrap();
-        real.state = state.join("seal");
-        real.logs = state.join(format!("logs-{mode}-{}", std::process::id()));
-        real.release = state.join(if mode == "prepare" { "after" } else { &mode });
-        std::fs::create_dir_all(&real.logs).unwrap();
-        if mode == "prepare" {
-            #[cfg(unix)]
-            prepare_cached_cutter(&mut real, &base).unwrap();
-            return;
-        }
-        let prover = real.prover(None).unwrap();
-        let freeze = |real: &Real, commit: &str| real.frozen_cutter(commit, &prover).unwrap();
-        if mode == "after" {
-            // A separate process runs the actual Background preparation, then exits.
-            // The measured cut retains its default QoS and inherits no resource cover.
-            // Libtest has no tether entry; this opt-in instrument owns and waits for
-            // its setsid child rather than detaching it.
-            let mut cmd = command(std::env::current_exe().unwrap());
-            cmd.args(std::env::args_os().skip(1))
-                .env("ATERM_RELEASE_LAUNCH_SAMPLE", "prepare");
-            #[cfg(unix)]
-            cmd.setsid(true).default_signals();
-            assert!(cmd.spawn().unwrap().wait().unwrap().success());
-        }
-        let preparation_s = preparation_start.elapsed().as_secs_f64();
-        drop(preparation_timing);
-        let start = std::time::Instant::now();
-        let _launch_timing = crate::cut_timing::Timer::new("launch-fixture-cut");
-        freeze(&real, &base);
-        let version = real.version_at("HEAD").unwrap();
-        let parts: Vec<u64> = version.split('.').map(|s| s.parse().unwrap()).collect();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[2], 0);
-        let next = format!("{}.{}.0", parts[0], parts[1] + 1);
-        let mut edit = real.child(&editor, None);
-        edit.arg(&repo).args([&next, &version]);
-        assert_eq!(real.logged(Step::Commit, &mut edit).code, 0);
-        let bump_start = std::time::Instant::now();
-        let lock_timing = crate::cut_timing::Timer::new("launch-fixture-lockfiles");
-        if mode == "before" {
-            let mut lock = real.child(prover.bin.join("targo"), Some(&prover));
-            lock.args(["update", "--workspace", "--offline", "-q"]);
-            assert_eq!(real.logged(Step::Commit, &mut lock).code, 0);
-            bump_nested_locks(
-                &repo,
-                real.git_paths(&["ls-files", "-z", "--", "*/Cargo.lock"]),
-                &version,
-                &next,
-            )
-            .unwrap();
-        } else {
-            let changed = bump_nested_locks(
-                &repo,
-                real.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]),
-                &version,
-                &next,
-            )
-            .unwrap();
-            real.validate_bumped_locks(&prover, &changed).unwrap();
-        }
-        let locks_s = bump_start.elapsed().as_secs_f64();
-        drop(lock_timing);
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-qam",
-                "Fixture runtime identity bump",
-            ],
-        )
-        .unwrap();
-        let bumped = real.head();
-        assert_ne!(bumped, base);
-        let cutter = freeze(&real, &bumped);
-        if mode == "after" {
-            assert!(
-                cutter.inputs.is_some(),
-                "the fixture needs complete graph evidence"
-            );
-            assert_ne!(
-                cutter.built_from, bumped,
-                "the bump must adopt, not stage a new proof"
-            );
-        }
-        // This is the real seal work formerly done by step 1. The authority seam below
-        // models controller checks; its wall time is explicitly not service latency.
-        real.seal_inputs().unwrap();
-        let controller = controller();
-        println!(
-            "release-event: {}",
-            aterm_json::json!({
-                "schema":1,"event":"launch-fixture-to-qualify","sample":mode,
-                "execution_s": start.elapsed().as_secs_f64(),
-                "preparation_s": preparation_s,"locks_s":locks_s,
-                "controller_s": controller.as_secs_f64(),"authority":"offline-test-seam",
-                "base":base,"commit":bumped,"built_from":cutter.built_from,"inputs":cutter.inputs,
-            })
-        );
-        let log = std::fs::read_to_string(real.step_log(real.step)).unwrap();
-        for line in log.lines().filter(|line| {
-            line.starts_with("release-event: ") || line.starts_with("cutter adoption unavailable:")
-        }) {
-            println!("{line}");
-        }
-    }
-
-    pub(super) fn bind_native_engine_fixture(repo: &Path, bare: &Path) {
-        let git = GitCli::new(repo);
-        crate::ledger::git_ok(
-            &git,
-            &["config", "remote.fixture.url", bare.to_str().unwrap()],
-        )
-        .unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "remote.origin.url",
-                "https://github.com/fixture/app.git",
-            ],
-        )
-        .unwrap();
-    }
-
-    pub(super) fn native_engine_fixture(
-        repo: &Path,
-        authority: &Path,
-    ) -> Result<crate::github_remote::Remote, String> {
-        let bare = crate::ledger::git_ok(
-            &GitCli::new(authority),
-            &["config", "--get", "remote.fixture.url"],
-        )
-        .map_err(|why| why.to_string())?
-        .stdout_utf8();
-        Ok(crate::github_remote::claim_fixture(
-            repo,
-            Path::new(bare.trim()),
-        ))
-    }
-
-    pub(super) fn fixture_engine_url(repo: &Path) -> Result<String, String> {
-        let configured = engine_origin_url(repo)?;
-        if !crate::publish::github_slug_from_remote_url(&configured)
-            .is_ok_and(|slug| slug == "fixture/app")
-        {
-            return Ok(configured);
-        }
-        crate::ledger::git_ok(
-            &GitCli::new(repo),
-            &["config", "--get", "remote.fixture.url"],
-        )
-        .map(|out| out.stdout_utf8().trim().to_string())
-        .or_else(|_| engine_origin_url(repo))
-    }
-
-    /// The native writer may canonicalize transport to SSH. Only the fixture repository
-    /// maps to the local bare; a different origin keeps its identity even with stale metadata.
-    #[test]
-    fn fixture_engine_origin_survives_transport_normalization_but_not_retargeting() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let repo = root.path().join("engine");
-        let bare = root.path().join("engine.git");
-        crate::ledger::testing::init(&repo, &[]);
-        std::fs::create_dir(&bare).unwrap();
-        bind_native_engine_fixture(&repo, &bare);
-        let git = GitCli::new(&repo);
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "url.git@github.com:fixture/app.git.insteadOf",
-                "https://github.com/fixture/app.git",
-            ],
-        )
-        .unwrap();
-        for url in [
-            "https://github.com/fixture/app.git",
-            "git@github.com:fixture/app.git",
-            "ssh://git@github.com/fixture/app.git",
-        ] {
-            crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url]).unwrap();
-            if url == "https://github.com/fixture/app.git" {
-                assert_eq!(
-                    engine_origin_url(&repo).unwrap(),
-                    "git@github.com:fixture/app.git"
-                );
-            }
-            assert_eq!(
-                fixture_engine_url(&repo).unwrap(),
-                bare.display().to_string()
-            );
-        }
-        let other = "git@github.com:another/app.git";
-        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", other]).unwrap();
-        let resolved = fixture_engine_url(&repo).unwrap();
-        assert_eq!(
-            crate::publish::github_slug_from_remote_url(&resolved).unwrap(),
-            "another/app"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn engine_audit_rows_use_the_native_expected_main_and_reject_retargeting() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let engine = root.path().join("engine");
-        let bare = root.path().join("engine.git");
-        crate::ledger::testing::init(
-            &engine,
-            &[
-                ("user.name", "fixture"),
-                ("user.email", "fixture@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ],
-        );
-        let git = GitCli::new(&engine);
-        std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
-        crate::ledger::git_ok(&git, &["add", "verification-log.jsonl"]).unwrap();
-        crate::ledger::git_ok(&git, &["commit", "-qm", "initial audit"]).unwrap();
-        crate::ledger::git_ok(
-            &GitCli::new(root.path()),
-            &[
-                "clone",
-                "-q",
-                "--bare",
-                engine.to_str().unwrap(),
-                bare.to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        bind_native_engine_fixture(&engine, &bare);
-        let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
-        real.engine_origin = native_engine_fixture;
-        std::fs::write(engine.join("verification-log.jsonl"), "{\"row\":1}\n").unwrap();
-        real.engine_fast_forward().unwrap();
-        let remote = GitCli::new(&bare);
-        assert_eq!(
-            crate::ledger::git_ok(&remote, &["show", "refs/heads/main:verification-log.jsonl"])
-                .unwrap()
-                .stdout_utf8(),
-            "{\"row\":1}\n"
-        );
-        assert_eq!(real.engine_git(&["status", "--porcelain"]).unwrap(), "");
-        let before = crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap();
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "remote.origin.url",
-                "https://github.com/foreign/app.git",
-            ],
-        )
-        .unwrap();
-        std::fs::write(
-            engine.join("verification-log.jsonl"),
-            "{\"row\":1}\n{\"row\":2}\n",
-        )
-        .unwrap();
-        assert!(real.engine_fast_forward().is_err());
-        assert_eq!(
-            crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
-            before
-        );
-        assert_eq!(
-            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
-            "{\"row\":1}\n{\"row\":2}\n"
-        );
-    }
-    #[cfg(unix)]
-    #[test]
-    fn a_valid_retargeted_engine_adapter_cannot_replace_the_captured_authority() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let engine = root.path().join("engine");
-        let bare = root.path().join("engine.git");
-        crate::ledger::testing::init(
-            &engine,
-            &[
-                ("user.name", "fixture"),
-                ("user.email", "fixture@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ],
-        );
-        let git = GitCli::new(&engine);
-        std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
-        crate::ledger::git_ok(&git, &["add", "verification-log.jsonl"]).unwrap();
-        crate::ledger::git_ok(&git, &["commit", "-qm", "initial audit"]).unwrap();
-        crate::ledger::git_ok(
-            &GitCli::new(root.path()),
-            &[
-                "clone",
-                "-q",
-                "--bare",
-                engine.to_str().unwrap(),
-                bare.to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        bind_native_engine_fixture(&engine, &bare);
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "remote.origin.url",
-                "https://github.com/earlier/engine.git",
-            ],
-        )
-        .unwrap();
-        let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
-        // This new native adapter is itself valid and permitted. The common
-        // production binding must still reject its different captured slug.
-        crate::ledger::git_ok(
-            &git,
-            &[
-                "config",
-                "remote.origin.url",
-                "https://github.com/fixture/app.git",
-            ],
-        )
-        .unwrap();
-        real.engine_origin = native_engine_fixture;
-        assert!(
-            native_engine_fixture(&engine, &engine)
-                .unwrap()
-                .repository()
-                .eq_full_name("fixture/app")
-        );
-        let remote = GitCli::new(&bare);
-        let before = crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap();
-        std::fs::write(engine.join("verification-log.jsonl"), "{\"row\":1}\n").unwrap();
-        let error = real.engine_fast_forward().unwrap_err();
-        assert!(format!("{error:?}").contains("captured authority"));
-        assert_eq!(
-            crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
-            before
-        );
-        assert_eq!(
-            git.git(&[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "refs/remotes/origin/main"
-            ])
-            .unwrap()
-            .status,
-            1,
-            "refused before the native main refresh records its snapshot"
-        );
-        assert_eq!(
-            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
-            "{\"row\":1}\n"
-        );
-    }
-
-    /// Only adopting branch children receive a pool. Build and tree have distinct FIFOs and
-    /// initial allocations; the command's finalized content context still ignores pool identity.
-    #[test]
-    fn the_qualify_pool_goes_only_to_the_branch_children_that_adopt_it() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = std::env::current_dir().unwrap();
-        let mut real = Real::new(&repo, None, true, false).unwrap();
-        let prover = Prover {
-            bin: PathBuf::from("/fixture/trust/bin"),
-            commit: "0".repeat(40),
-            source: "fixture".into(),
-        };
-        let context_outside_pool = real
-            .check_content_context(
-                Path::new("/fixture/verify"),
-                "frozen-tools",
-                "seal",
-                &prover,
-                crate::check_record::Half::Tree,
-            )
-            .unwrap();
-        let mut spawn_mirror = real.verifier_child(
-            Path::new("/fixture/verify"),
-            Some(&prover),
-            crate::check_record::Half::Tree,
-        );
-        real.hand_pool(&mut spawn_mirror, true).unwrap();
-        real.finalize_spawn_environment(&mut spawn_mirror).unwrap();
-        assert_eq!(
-            spawn_mirror
-                .get_envs()
-                .find(|(name, _)| *name == "GIT_TERMINAL_PROMPT")
-                .and_then(|(_, value)| value),
-            Some(std::ffi::OsStr::new("0"))
-        );
-        assert_eq!(
-            spawn_mirror
-                .get_envs()
-                .find(|(name, _)| *name == "GIT_ASKPASS")
-                .and_then(|(_, value)| value),
-            Some(std::ffi::OsStr::new(""))
-        );
-        assert_eq!(
-            context_outside_pool,
-            crate::check_content::context(
-                "frozen-tools",
-                "seal",
-                &spawn_mirror,
-                crate::check_content::ReleaseHalf::Tree,
-            ),
-            "the context uses the same environment finalizer as the verifier spawn"
-        );
-        // `<slots>:<fifo>`, each exactly as handed.
-        let pool_of = |cmd: &Command| {
-            let value = cmd
-                .get_envs()
-                .find(|(k, _)| *k == aterm_capacity::POOL_ENV)
-                .and_then(|(_, v)| v)?;
-            let value = value.to_str().expect("this test's pool value is UTF-8");
-            let (slots, fifo) = value.split_once(':').expect("<slots>:<fifo>");
-            Some((slots.to_owned(), std::ffi::OsString::from(fifo)))
-        };
-        let mut none = command("verify");
-        real.hand_pool(&mut none, true).unwrap();
-        assert_eq!(pool_of(&none), None, "no pool, nothing handed");
-        let verifier = Path::new("/frozen/verifier");
-
-        // Asked for by a spelling no child is handed: a `.` component, and a doubled separator
-        // too where `TMPDIR` holds one (as `$TMPDIR/.ubd/` does where `$TMPDIR` ends in a
-        // separator).
-        let path = dir.path().join(".").join("qualify.jobs");
-        // This fixture must not publish a Release into the account ledger and cancel an
-        // unrelated main-lane judgment. Its four-core machine and ledger are both private.
-        let ledger_path = dir.path().join("pool-ledger");
-        let ledger = aterm_capacity::Ledger::at(&ledger_path);
-        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4));
-        let pool = qualify_pool(&path, &Branch::ALL, |need| {
-            assert_eq!(need.rank, aterm_capacity::Rank::Release);
-            aterm_capacity::admit_with(
-                &ledger,
-                &machine,
-                need.cores(4),
-                aterm_capacity::Admit::Now,
-                aterm_capacity::Pace::default(),
-                &mut |_| {},
-            )
-        })
-        .unwrap();
-        assert_eq!(
-            pool._claim.path().parent().unwrap().canonicalize().unwrap(),
-            ledger_path.canonicalize().unwrap(),
-            "the synthetic Release belongs only to the fixture's ledger"
-        );
-        assert_eq!(ledger.list().unwrap().len(), 1);
-        assert_eq!(
-            pool._claim.record().need.rank,
-            aterm_capacity::Rank::Release
-        );
-        let (slots, export) = (pool.slots, pool.export);
-        assert_eq!(slots, 4);
-        assert_eq!(export, export_share(slots, true, true));
-        let barrier = pool.jobs.reserve_initial().unwrap();
-        assert_eq!(
-            barrier.len(),
-            usize::try_from(slots - export).unwrap(),
-            "every compiler token is withheld until both memory reservations stand"
-        );
-        assert!(
-            pool.jobs.pool(false).try_acquire().unwrap().is_none(),
-            "no build Cargo driver can start through the admission snapshot"
-        );
-        assert!(
-            pool.jobs.pool(true).try_acquire().unwrap().is_none(),
-            "no tree Cargo driver can start through the admission snapshot"
-        );
-        drop(barrier);
-        assert!(
-            pool.jobs.pool(false).try_acquire().unwrap().is_some(),
-            "releasing the barrier returns the build's compiler tokens"
-        );
-        assert!(
-            pool.jobs.pool(true).try_acquire().unwrap().is_some(),
-            "releasing the barrier returns the tree's compiler tokens"
-        );
-        let fifo = pool.jobs.pool(false).path().as_os_str().to_owned();
-        assert_eq!(
-            Path::new(&fifo),
-            path,
-            "the pool's FIFO is the one asked for"
-        );
-        real.pool = Some(pool);
-
-        let tree = real.verifier_child(verifier, None, crate::check_record::Half::Tree);
-        if cfg!(unix) {
-            assert_eq!(tree.get_program(), "/usr/bin/nice");
-            assert_eq!(
-                tree.get_args().collect::<Vec<_>>(),
-                [
-                    std::ffi::OsStr::new("-n"),
-                    std::ffi::OsStr::new("10"),
-                    verifier.as_os_str()
-                ]
-            );
-        }
-        // Negative control: bundle checks run after the pool's slices and keep foreground priority.
-        let bundle = real.verifier_child(verifier, None, crate::check_record::Half::Bundle);
-        assert_eq!(bundle.get_program(), verifier.as_os_str());
-        assert_eq!(bundle.get_args().count(), 0);
-
-        let mut actual_tree = real.verifier_child(
-            Path::new("/fixture/verify"),
-            Some(&prover),
-            crate::check_record::Half::Tree,
-        );
-        real.hand_pool(&mut actual_tree, true).unwrap();
-        real.finalize_spawn_environment(&mut actual_tree).unwrap();
-        assert_eq!(
-            context_outside_pool,
-            crate::check_content::context(
-                "frozen-tools",
-                "seal",
-                &actual_tree,
-                crate::check_content::ReleaseHalf::Tree,
-            ),
-            "the pre-pool content plan predicts the finalized pooled tree child"
-        );
-        if cfg!(unix) {
-            let mut omitted_wrapper = real.child("/fixture/verify", Some(&prover));
-            real.hand_pool(&mut omitted_wrapper, true).unwrap();
-            real.finalize_spawn_environment(&mut omitted_wrapper)
-                .unwrap();
-            assert_ne!(
-                context_outside_pool,
-                crate::check_content::context(
-                    "frozen-tools",
-                    "seal",
-                    &omitted_wrapper,
-                    crate::check_content::ReleaseHalf::Tree,
-                ),
-                "omitting nice's program and argv must invalidate tree content evidence"
-            );
-        }
-
-        let mut build = command("ship");
-        real.hand_pool(&mut build, false).unwrap();
-        let non_export = slots - export;
-        assert_eq!(
-            pool_of(&build),
-            Some(((non_export - 1).to_string(), fifo.clone())),
-            "build receives every non-export token except tree's one"
-        );
-        let mut verify = command("targo");
-        real.hand_pool(&mut verify, true).unwrap();
-        assert_eq!(
-            pool_of(&verify),
-            Some((
-                1_u32.to_string(),
-                real.pool
-                    .as_ref()
-                    .unwrap()
-                    .jobs
-                    .pool(true)
-                    .path()
-                    .as_os_str()
-                    .to_owned()
-            )),
-            "verify has its own FIFO and allocation"
-        );
-        assert_eq!(
-            context_outside_pool,
-            real.check_content_context(
-                Path::new("/fixture/verify"),
-                "frozen-tools",
-                "seal",
-                &prover,
-                crate::check_record::Half::Tree,
-            )
-            .unwrap(),
-            "facts before qualify and the verifier inside its pool have one check context"
-        );
-        let plain = real.child("generator", None);
-        assert_eq!(pool_of(&plain), None, "a plain child is handed no pool");
-
-        // NEGATIVE CONTROL: recovering the build share before returning the barrier's original
-        // token remints one byte too many. The finish guard must return all originals first.
-        let pool = real.pool.as_ref().unwrap();
-        let barrier = std::sync::Mutex::new(Some(pool.jobs.reserve_initial().unwrap()));
-        drop(FinishShare {
-            pool: Some(pool),
-            branch: 0,
-            admission_barrier: &barrier,
-        });
-        assert!(
-            barrier
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_none(),
-            "branch completion returns the admission tokens before recovering its share"
-        );
-        let drain = |tree| {
-            let branch = pool.jobs.pool(tree);
-            let mut held = Vec::new();
-            while let Some(token) = branch.try_acquire().unwrap() {
-                held.push(token);
-            }
-            held
-        };
-        let build_tokens = drain(false);
-        let tree_tokens = drain(true);
-        assert_eq!(
-            (build_tokens.len(), tree_tokens.len()),
-            (0, usize::try_from(slots - export).unwrap()),
-            "early build completion conserves the grant and moves its share to tree"
-        );
-        drop((build_tokens, tree_tokens));
-        drop(barrier);
-
-        // A real one-slot pool must admit tree before probing build's memory admission.
-        // The ended predicate is an observation, so this control does not wait on a clock.
-        real.pool = None;
-        real.pool = Some(
-            qualify_pool(&dir.path().join("single.jobs"), &Branch::ALL, |need| {
-                aterm_capacity::admit_with(
-                    &ledger,
-                    &machine,
-                    need.cores(1),
-                    aterm_capacity::Admit::Now,
-                    aterm_capacity::Pace::default(),
-                    &mut |_| {},
-                )
-            })
-            .unwrap(),
-        );
-        let asked = std::cell::Cell::new(0);
-        real.branches().build_admitted(&|| {
-            asked.set(asked.get() + 1);
-            true
-        });
-        assert_eq!(
-            asked.get(),
-            0,
-            "tree precedes the zero-token build's admission wait"
-        );
-    }
-
-    /// The export's reservation stays bounded even on a one-slot host.
-    #[test]
-    fn the_export_reservation_is_bounded_by_the_grant() {
-        assert_eq!(export_share(18, true, true), 4);
-        assert_eq!(export_share(3, true, true), 1);
-        assert_eq!(export_share(2, true, true), 1);
-        assert_eq!(export_share(1, true, true), 1);
-        assert_eq!(export_share(18, false, true), 0);
-        assert_eq!(export_share(18, true, false), 18);
-    }
-
-    #[test]
-    fn a_zero_token_build_cannot_reserve_memory_before_tree_returns_its_share() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let shares =
-            aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 1, 0, [true, true])
-                .unwrap();
-        let entered = std::cell::Cell::new(false);
-        let result = super::start_with_share(shares.pool(false), &|| true, || entered.set(true));
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
-        assert!(
-            !entered.get(),
-            "no memory admission while the build has zero tokens"
-        );
-        shares.finish(1);
-        super::start_with_share(shares.pool(false), &|| false, || {
-            entered.set(true);
-            assert!(
-                shares.pool(false).try_acquire().unwrap().is_some(),
-                "the child can charge its own implicit token"
-            );
-        })
-        .unwrap();
-        assert!(entered.get());
-    }
-
-    #[test]
-    fn a_direct_fixtures_runtime_manifest_survives_the_launcher_scrub() {
-        let mut cmd = aterm_uds::spawnfd::command("generator");
-        cmd.env("CARGO_MANIFEST_DIR", "/candidate/crates/aterm-gui");
-        super::scrub_fixture_command(&mut cmd);
-        assert_eq!(
-            cmd.get_envs()
-                .find(|(k, _)| *k == "CARGO_MANIFEST_DIR")
-                .and_then(|(_, v)| v),
-            Some(std::ffi::OsStr::new("/candidate/crates/aterm-gui"))
-        );
-        // The inherited launcher value is still stripped; only an explicit artifact
-        // manifest can be restored by the fixture path.
-        let mut inherited = aterm_uds::spawnfd::command("generator");
-        super::scrub_names(
-            &mut inherited,
-            [std::ffi::OsString::from("CARGO_MANIFEST_DIR")],
-        );
-        assert_eq!(
-            inherited
-                .get_envs()
-                .find(|(k, _)| *k == "CARGO_MANIFEST_DIR")
-                .and_then(|(_, v)| v),
-            None
-        );
-    }
-    use super::*;
-
-    /// Every exec resource offer owns a distinct descriptor slot before any slot becomes an
-    /// `OwnedFd`. NEGATIVE CONTROL: repeat the toolchain, line, or cohort-writer number in either
-    /// other variable, and validation must refuse while the original descriptor remains owned by
-    /// this test.
-    #[cfg(unix)]
-    #[test]
-    fn duplicate_exec_resource_descriptor_offers_are_refused_before_ownership() {
-        use std::os::fd::AsRawFd as _;
-
-        let held = std::fs::File::open("/dev/null").unwrap();
-        let repeated = std::ffi::OsString::from(held.as_raw_fd().to_string());
-        for (lease, line, writer) in [
-            (Some(repeated.as_os_str()), Some(repeated.as_os_str()), None),
-            (Some(repeated.as_os_str()), None, Some(repeated.as_os_str())),
-            (None, Some(repeated.as_os_str()), Some(repeated.as_os_str())),
-        ] {
-            let why = inherited_fd_offers(lease, line, writer).unwrap_err();
-            assert!(why.contains("duplicates"), "{why}");
-            assert!(
-                held.metadata().is_ok(),
-                "refusal took ownership of the offered descriptor"
-            );
-        }
-
-        let lease = std::fs::File::open("/dev/null").unwrap();
-        let line = std::fs::File::open("/dev/null").unwrap();
-        let writer = std::fs::File::open("/dev/null").unwrap();
-        let values = [
-            std::ffi::OsString::from(lease.as_raw_fd().to_string()),
-            std::ffi::OsString::from(line.as_raw_fd().to_string()),
-            std::ffi::OsString::from(writer.as_raw_fd().to_string()),
-        ];
-        assert_eq!(
-            inherited_fd_offers(
-                Some(values[0].as_os_str()),
-                Some(values[1].as_os_str()),
-                Some(values[2].as_os_str()),
-            )
-            .unwrap(),
-            [
-                Some(lease.as_raw_fd()),
-                Some(line.as_raw_fd()),
-                Some(writer.as_raw_fd()),
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn publication_engine_bootstrap_requires_a_working_launcher_and_recovers() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("source");
-        let engine = dir.path().join("engine");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(engine.join("bin")).unwrap();
-        let launcher = engine.join("bin/pub");
-        std::fs::write(&launcher, "#!/bin/sh\necho 'gone' >&2\nexit 127\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-        match engine_bootstrap_with(&repo, &engine, crate::managed_prerequisites::simulated) {
-            Err(Bootstrap::Failed(why)) => {
-                assert!(why.contains("(exit status: 127): gone;"), "{why}")
-            }
-            other => panic!("{other:?}"),
-        }
-        std::fs::rename(&launcher, engine.join("bin/unavailable-pub")).unwrap();
-        std::fs::write(
-            &launcher,
-            "#!/bin/sh\ncase \"$*\" in '--help') printf 'engine-help-ready\\n';; 'tap --help') printf '%s\\n' '--expect-version VERSION';; *) exit 3;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            engine_bootstrap_with(&repo, &engine, crate::managed_prerequisites::simulated).is_ok()
-        );
-        // An old tap may have successful help while lacking the cohort guard.
-        std::fs::write(
-            &launcher,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> probes\nprintf 'old-help\\n'\n",
-        )
-        .unwrap();
-        let missing =
-            engine_bootstrap_with(&repo, &engine, crate::managed_prerequisites::simulated);
-        assert!(matches!(missing, Err(Bootstrap::Failed(why)) if why.contains("--expect-version")));
-        assert_eq!(
-            std::fs::read_to_string(repo.join("probes")).unwrap(),
-            "--help\ntap --help\n"
-        );
-        // A healthy-looking engine cannot run when signed admission refuses.
-        // No script or PATH interpreter is probed as a replacement.
-        std::fs::write(&launcher, "#!/bin/sh\nprintf ran > child-ran\n").unwrap();
-        let refused = engine_bootstrap_with(&repo, &engine, |wants, _| {
-            assert_eq!(wants, crate::managed_prerequisites::PUBLICATION);
-            Err("cpython is unavailable on this target".into())
-        });
-        assert!(
-            matches!(refused, Err(Bootstrap::Prerequisites(why)) if why.contains("unavailable"))
-        );
-        assert!(!repo.join("child-ran").exists());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn an_old_tap_refuses_before_validation_tool_provisioning() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        std::fs::create_dir_all(engine.join("bin")).unwrap();
-        let script = engine.join("bin/pub");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-probe\nprintf 'legacy tap help\\n'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let refused = real.validation_tools().unwrap_err();
-        assert!(refused.why.contains("--expect-version"), "{refused:?}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("tap-probe")).unwrap(),
-            "tap --help\n"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn the_after_cut_tap_child_uses_the_validated_cohort_and_propagates_refusal() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        std::fs::create_dir_all(engine.join("bin")).unwrap();
-        let script = engine.join("bin/pub");
-        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
-        assert!(
-            real.tap_command("v0.159.0").is_err(),
-            "unheld interpreter cannot run"
-        );
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        for bad in ["0.159.0", "v0.159.1", "v00.159.0", "v0.159.0 extra"] {
-            assert!(real.tap_command(bad).is_err(), "{bad}");
-        }
-        let command = real.tap_command("v0.159.0").unwrap();
-        assert_eq!(command.get_program(), script.as_os_str());
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["tap", "--bump", "--expect-version", "0.159.0"].map(std::ffi::OsStr::new)
-        );
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-invocation\nexit 17\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let refused = real.align_tap("v0.159.0").unwrap_err();
-        assert!(refused.why.contains("exit 17"), "{refused:?}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("tap-invocation")).unwrap(),
-            "tap --bump --expect-version 0.159.0\n"
-        );
-        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-invocation\nprintf 'canonical verified alignment\\n'\n").unwrap();
-        assert!(real.align_tap("v0.159.0").unwrap().contains("v0.159.0"));
-        let log = std::fs::read_to_string(real.side_log(Step::AfterCut, "tap")).unwrap();
-        assert!(log.contains("canonical verified alignment"));
-    }
-
-    #[test]
-    fn publication_admission_is_retained_and_a_refusal_never_probes_scanners() {
-        static ACQUIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        real.prerequisite_acquire = |wants, _| {
-            assert_eq!(wants, crate::managed_prerequisites::PUBLICATION);
-            ACQUIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::managed_prerequisites::Tools::Simulated)
-        };
-        real.prepare_prerequisites().unwrap();
-        real.prepare_prerequisites().unwrap();
-        assert_eq!(ACQUIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
-        real.prerequisites = None;
-        real.prerequisite_acquire = |_, _| Err("selected package has a bad signature".into());
-        real.scanner_probe = |_| panic!("admission must refuse before scanner execution");
-        let prover = Prover {
-            bin: dir.path().to_path_buf(),
-            commit: "fixture".into(),
-            source: "fixture".into(),
-        };
-        let why = real.prepare_scanner_tools(&prover).err().unwrap();
-        assert!(why.why.contains("bad signature"));
-        assert!(why.could_not_run);
-        assert!(real.prerequisites.is_none());
-        assert!(real.scanner_tools.is_none());
-    }
-
-    /// A descriptor without FD_CLOEXEC, held open as one is between a `pipe` and its
-    /// `fcntl`: neither a detached step nor the snapshot's git may inherit it.
-    #[cfg(unix)]
-    #[test]
-    fn forwarded_steps_and_object_git_exclude_an_unflagged_descriptor() {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-        unsafe extern "C" {
-            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        }
-        let file = std::fs::File::open("/dev/null").unwrap();
-        // SAFETY: F_DUPFD creates a fresh descriptor without FD_CLOEXEC.
-        let fd = unsafe { fcntl(file.as_raw_fd(), 0, 200) };
-        assert!(fd >= 200);
-        let _held = unsafe { OwnedFd::from_raw_fd(fd) };
-        let probe = aterm_spec::host::held_probe(fd);
-        let control = aterm_uds::spawnfd::transparent("/bin/sh")
-            .args(["-c", &probe])
-            .status()
-            .unwrap();
-        assert_eq!(control.code(), Some(3));
-
-        let repo = std::env::current_dir().unwrap();
-        let real = Real::new(&repo, None, true, false).unwrap();
-        let out = real
-            .output_forwarded(command("/bin/sh").args(["-c", &probe]))
-            .unwrap();
-        assert!(out.status.success(), "detached step inherited fd {fd}");
-
-        let alias = format!("alias.fd-proof=!{probe}");
-        let out = crate::ledger::object_git(&repo)
-            .unwrap()
-            .args(["-c", &alias, "fd-proof"])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "object git inherited fd {fd}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// The appcast adapter hands every transport attempt to `Launched<StepChildren>`'s launch
-    /// boundary. NEGATIVE CONTROL: replacing that adapter with the client's direct spawn leaves
-    /// `started` at zero; starting a later retry after the launch reports an interrupt makes the
-    /// second half fail.
-    #[test]
-    fn appcast_retries_are_release_children_and_an_interrupt_starts_no_later_attempt() {
-        use super::*;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-        struct Launch {
-            interrupt_after_first: bool,
-            interrupted: AtomicBool,
-            started: Arc<AtomicU32>,
-        }
-
-        impl crate::site::Launch for Launch {
-            fn interrupted(&self) -> Option<i32> {
-                self.interrupted.load(Ordering::SeqCst).then_some(15)
-            }
-
-            fn spawn(
-                &self,
-                command: &mut aterm_uds::spawnfd::Command,
-            ) -> std::io::Result<(aterm_uds::spawnfd::Child, crate::site::Guard)> {
-                if self.interrupted().is_some() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "not started: the release was interrupted",
-                    ));
-                }
-                let child = command.spawn()?;
-                self.started.fetch_add(1, Ordering::SeqCst);
-                if self.interrupt_after_first {
-                    self.interrupted.store(true, Ordering::SeqCst);
-                }
-                Ok((child, Box::new(())))
-            }
-        }
-
-        let fetch = |_: &str,
-                     _: u64,
-                     spawn: &dyn aterm_update_core::github_rest::Spawn|
-         -> Result<Vec<u8>, String> {
-            for _ in 0..3 {
-                let mut command = aterm_uds::spawnfd::command("/bin/sh");
-                command.args(["-c", "printf appcast"]);
-                let output = spawn
-                    .run(&mut command, None)
-                    .map_err(|error| error.to_string())?;
-                if !output.status.success() {
-                    return Err(format!("fixture child exited {}", output.status));
-                }
-            }
-            Ok(b"appcast".to_vec())
-        };
-
-        let started = Arc::new(AtomicU32::new(0));
-        assert_eq!(
-            appcast_bytes_with(
-                "https://example.invalid/appcast",
-                1024,
-                Launch {
-                    interrupt_after_first: false,
-                    interrupted: AtomicBool::new(false),
-                    started: Arc::clone(&started),
-                },
-                fetch,
-            ),
-            Ok(b"appcast".to_vec())
-        );
-        assert_eq!(started.load(Ordering::SeqCst), 3);
-
-        let started = Arc::new(AtomicU32::new(0));
-        let refused = appcast_bytes_with(
-            "https://example.invalid/appcast",
-            1024,
-            Launch {
-                interrupt_after_first: true,
-                interrupted: AtomicBool::new(false),
-                started: Arc::clone(&started),
-            },
-            fetch,
-        )
-        .expect_err("the next retry is not started after the interrupt");
-        assert!(refused.contains("not started"), "{refused}");
-        assert_eq!(started.load(Ordering::SeqCst), 1);
-    }
-
-    /// The site sync's children keep the release's rules: each leads a session and group of
-    /// its own (where the interrupt is forwarded, with no terminal to stop on), git's prompt
-    /// is off, and a running-child note names it while it runs and is gone once it ends.
-    #[cfg(unix)]
-    #[test]
-    fn the_site_syncs_children_keep_the_releases_rules() {
-        use crate::site::Launch as _;
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-step-children-")
-            .tempdir()
-            .unwrap();
-        let children = StepChildren {
-            noted: Some((dir.path().to_path_buf(), Step::AfterCut)),
-        };
-        assert_eq!(children.interrupted(), None);
-        let mut sh = aterm_uds::spawnfd::command("/bin/sh");
-        sh.args([
-            "-c",
-            "echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ') ${GIT_TERMINAL_PROMPT-unset} [${GIT_ASKPASS-unset}]\"",
-        ]);
-        let out = crate::site::output(&children, &mut sh).unwrap();
-        let said = String::from_utf8_lossy(&out.stdout);
-        let fields: Vec<&str> = said.split_whitespace().collect();
-        assert_eq!(fields.len(), 4, "{said}");
-        assert_eq!(
-            fields[0], fields[1],
-            "the child leads its own group: {said}"
-        );
-        assert_eq!(fields[2], "0", "git's prompt is off: {said}");
-        assert_eq!(fields[3], "[]", "and so is its askpass: {said}");
-        assert!(
-            crate::release::child_notes(dir.path()).is_empty(),
-            "the note goes with the child"
-        );
-        let mut sleeper = aterm_uds::spawnfd::command("/bin/sh");
-        sleeper
-            .args(["-c", "read line"])
-            .stdin(aterm_uds::spawnfd::Stdio::piped());
-        let (mut child, guard) = children.spawn(&mut sleeper).unwrap();
-        let note =
-            std::fs::read_to_string(crate::release::child_note(dir.path(), child.id())).unwrap();
-        assert!(
-            note.starts_with(&format!("pid {}\n", child.id()))
-                && note.ends_with("step after-cut\n"),
-            "{note}"
-        );
-        drop(child.stdin.take());
-        child.wait().unwrap();
-        drop(guard);
-        assert!(crate::release::child_notes(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn a_pointer_that_could_not_be_read_is_could_not_run() {
-        let refused = pointer_verdict(Err("https://x/latest could not be read: timeout".into()))
-            .expect_err("a failed read refuses");
-        assert!(refused.could_not_run, "{refused:?}");
-        assert_eq!(
-            pointer_verdict(Ok(vec!["404".into()])).expect("shape problems pass through"),
-            ["404"]
-        );
-    }
-
-    fn pointer_release_list() -> aterm_json::Value {
-        aterm_json::json!([
-            {"tag_name": "v0.5.0", "draft": false, "prerelease": false,
-             "published_at": "2026-11-08T00:00:00Z"},
-            {"tag_name": "v0.6.0", "draft": false, "prerelease": false,
-             "published_at": "2026-11-09T00:00:00Z"},
-            {"tag_name": "v0.7.0", "draft": true, "prerelease": false,
-             "published_at": "2026-11-09T00:00:00Z"},
-            {"tag_name": "v0.8.0", "draft": false, "prerelease": true,
-             "published_at": "2026-11-09T00:00:00Z"},
-            {"tag_name": "v0.9.0", "draft": false, "prerelease": false,
-             "published_at": null}
-        ])
-    }
-
-    /// Negative controls: making any latest surface a one-shot read fails the two-stale-then-
-    /// current arm; returning the old shape refusal at the bound fails the retryable arm;
-    /// trusting the redirect instead of the list fails the successor arm (including when the
-    /// redirect still names this cut). Dropping the page or any asset fails the URL inventory.
-    #[test]
-    fn after_cut_latest_surfaces_wait_for_propagation_and_only_a_proven_successor_refuses() {
-        let assets = lean();
-        let pointers = latest_pointer_urls("owner/repo", "v0.6.0", &release(&assets, "lean"));
-        assert_eq!(pointers.len(), assets.len() + 1);
-        assert!(pointers.contains(&(
-            "https://github.com/owner/repo/releases/latest".into(),
-            "https://github.com/owner/repo/releases/tag/v0.6.0".into(),
-        )));
-        for (asset, _) in &assets {
-            assert!(pointers.contains(&(
-                format!("https://github.com/owner/repo/releases/latest/download/{asset}"),
-                format!("https://github.com/owner/repo/releases/download/v0.6.0/{asset}"),
-            )));
-        }
-        let mut counts = std::collections::BTreeMap::new();
-        let (mut slept, mut lists) = (0, 0);
-        let problems = settled_pointer_problems(
-            &pointers,
-            "v0.6.0",
-            &mut |ptr| {
-                let reads = counts.entry(ptr.to_string()).or_insert(0);
-                *reads += 1;
-                let want = &pointers.iter().find(|(url, _)| url == ptr).unwrap().1;
-                Ok((
-                    302,
-                    Some(if *reads <= 2 {
-                        want.replace("v0.6.0", "v0.5.0")
-                    } else {
-                        want.clone()
-                    }),
-                ))
-            },
-            &mut || {
-                lists += 1;
-                Ok(pointer_release_list())
-            },
-            &mut |pause| {
-                assert_eq!(pause, crate::publish::POINTER_PROBE_DELAY);
-                slept += 1;
-            },
-        )
-        .unwrap();
-        assert!(problems.is_empty());
-        assert_eq!((slept, lists), (2, 3));
-        assert_eq!(counts.len(), pointers.len());
-        assert!(counts.values().all(|count| *count == 3));
-        eprintln!(
-            "after-cut injected propagation: {} surfaces, 3 reads each, 2 waits (20 s scheduled), PASS",
-            pointers.len()
-        );
-
-        for stale in [(302, Some("https://x/v0.5.0".into())), (404, None)] {
-            let (mut reads, mut slept) = (0, 0);
-            let why = settled_pointer_problems(
-                &pointers[..1],
-                "v0.6.0",
-                &mut |_| {
-                    reads += 1;
-                    Ok(stale.clone())
-                },
-                &mut || Ok(pointer_release_list()),
-                &mut |_| slept += 1,
-            )
-            .unwrap_err();
-            assert!(why.contains("propagation did not finish"), "{why}");
-            assert!(!why.contains("another release holds"), "{why}");
-            assert!(pointer_verdict(Err(why)).unwrap_err().could_not_run);
-            assert_eq!(reads, crate::publish::POINTER_PROBE_ATTEMPTS);
-            assert_eq!(slept, crate::publish::POINTER_PROBE_ATTEMPTS - 1);
-        }
-
-        let mut lists = 0;
-        let problems = settled_pointer_problems(
-            &pointers[..1],
-            "v0.6.0",
-            &mut |_| Ok((302, Some("https://x/v0.5.0".into()))),
-            &mut || {
-                lists += 1;
-                let mut list = pointer_release_list();
-                list.as_array_mut().unwrap()[2]
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("draft".into(), aterm_json::Value::Bool(lists == 1));
-                Ok(list)
-            },
-            &mut |_| {},
-        )
-        .unwrap();
-        assert_eq!(lists, 2, "a successor published during the wait ends it");
-        assert!(problems[0].contains("another release holds GitHub's latest"));
-        assert!(problems[0].contains("v0.7.0"));
-        let problems = settled_pointer_problems(
-            &pointers[..1],
-            "v0.6.0",
-            &mut |_| {
-                panic!("the list proves a successor even if the redirect is cached or unreadable")
-            },
-            &mut || {
-                let mut list = pointer_release_list();
-                list.as_array_mut().unwrap()[2]
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("draft".into(), aterm_json::Value::Bool(false));
-                Ok(list)
-            },
-            &mut |_| panic!("a proven successor refuses immediately"),
-        )
-        .unwrap();
-        assert!(problems[0].contains("another release holds GitHub's latest"));
-    }
-
-    /// Negative control: retrying a failed read instead of a stale pointer trips the sleeper;
-    /// re-reading a settled surface trips its exact read count.
-    #[test]
-    fn after_cut_pointer_reads_fail_unknown_and_settled_surfaces_are_not_polled() {
-        let pointers = vec![
-            ("page".into(), "current-page".into()),
-            ("asset".into(), "current-asset".into()),
-        ];
-        for once in [Ok((503, None)), Err("timeout".into())] {
-            let mut reads = 0;
-            assert!(
-                settled_pointer_problems(
-                    &pointers,
-                    "v0.6.0",
-                    &mut |_| {
-                        reads += 1;
-                        once.clone()
-                    },
-                    &mut || Ok(pointer_release_list()),
-                    &mut |_| panic!("a failed read is final")
-                )
-                .is_err()
-            );
-            assert_eq!(reads, 1);
-        }
-        let (mut pages, mut assets) = (0, 0);
-        assert!(
-            settled_pointer_problems(
-                &pointers,
-                "v0.6.0",
-                &mut |ptr| {
-                    if ptr == "page" {
-                        pages += 1;
-                        Ok((302, Some("current-page".into())))
-                    } else {
-                        assets += 1;
-                        Ok((
-                            302,
-                            Some(
-                                if assets == 1 {
-                                    "old-asset"
-                                } else {
-                                    "current-asset"
-                                }
-                                .into(),
-                            ),
-                        ))
-                    }
-                },
-                &mut || Ok(pointer_release_list()),
-                &mut |_| {}
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert_eq!((pages, assets), (1, 2));
-        assert!(
-            settled_pointer_problems(
-                &pointers,
-                "v0.6.0",
-                &mut |_| panic!("list read failed"),
-                &mut || Err("API unavailable".into()),
-                &mut |_| panic!("failed list is final")
-            )
-            .is_err()
-        );
-    }
-
-    fn release(assets: &[(&str, u64)], body: &str) -> aterm_json::Value {
-        let assets: Vec<String> = assets
-            .iter()
-            .map(|(n, s)| format!("{{\"name\":\"{n}\",\"size\":{s}}}"))
-            .collect();
-        aterm_json::from_str(&format!(
-            "{{\"tag_name\":\"v0.6.0\",\"body\":{body:?},\"assets\":[{}]}}",
-            assets.join(",")
-        ))
-        .unwrap()
-    }
-
-    fn lean() -> Vec<(&'static str, u64)> {
-        vec![
-            ("aterm-0.6.0.dmg", 40_600_000),
-            ("aterm-0.6.0-mac.zip", 38_000_000),
-            ("aterm.dmg", 40_600_000),
-            ("aterm-mac.zip", 38_000_000),
-            ("aterm-0.6.0.dmg.sha256", 90),
-            ("aterm-0.6.0-mac.zip.sha256", 90),
-            ("aterm.dmg.sha256", 90),
-            ("aterm-mac.zip.sha256", 90),
-            ("aterm-appcast.toml", 900),
-            ("aterm-appcast.toml.sig", 100),
-            ("aterm-machines.toml", 900),
-            ("aterm-machines.toml.sig", 100),
-            ("SHA256SUMS", 680_000),
-            ("SHA256SUMS.sig", 64),
-        ]
-    }
-
-    #[test]
-    fn source_publication_requires_one_manifest_and_one_signature_before_binary_assets() {
-        let pair = [("SHA256SUMS", 100), ("SHA256SUMS.sig", 64)];
-        assert!(source_attestation_findings(&release(&pair, "")).is_empty());
-        for assets in [
-            vec![],
-            vec![pair[0]],
-            vec![pair[1]],
-            vec![pair[0], pair[0], pair[1]],
-        ] {
-            assert!(!source_attestation_findings(&release(&assets, "")).is_empty());
-        }
-    }
-
-    /// 0.193.0's step 7 read its private draft by tag and GitHub answered 404, as it does for
-    /// every draft: a journaled draft is read by its id, a cut with none by its tag.
-    #[test]
-    fn step_seven_reads_the_journaled_private_draft_by_id() {
-        assert_eq!(
-            source_release_path("o/aterm", "v0.6.0", Some(440_210_489)),
-            "repos/o/aterm/releases/440210489"
-        );
-        assert_eq!(
-            source_release_path("o/aterm", "v0.6.0", None),
-            "repos/o/aterm/releases/tags/v0.6.0"
-        );
-    }
-
-    #[test]
-    fn a_draft_github_unbound_or_another_release_is_refused_before_the_claim() {
-        let with = |id: u64, tag: &str| -> aterm_json::Value {
-            aterm_json::from_str(&format!(
-                "{{\"id\":{id},\"tag_name\":\"{tag}\",\"assets\":[]}}"
-            ))
-            .unwrap()
-        };
-        assert_eq!(
-            source_binding_problem(&with(7, "v0.6.0"), "o/a", "v0.6.0", Some(7)),
-            None
-        );
-        assert_eq!(
-            source_binding_problem(&with(7, "v0.6.0"), "o/a", "v0.6.0", None),
-            None
-        );
-        let (why, fix) = source_binding_problem(
-            &with(7, "untagged-88239b0cc2be8b1abf48"),
-            "o/a",
-            "v0.6.0",
-            Some(7),
-        )
-        .unwrap();
-        assert!(why.contains("untagged-88239b0cc2be8b1abf48"), "{why}");
-        assert!(
-            fix.contains("releases/7 -X PATCH -f tag_name=v0.6.0"),
-            "{fix}"
-        );
-        let (why, _) =
-            source_binding_problem(&with(8, "v0.6.0"), "o/a", "v0.6.0", Some(7)).unwrap();
-        assert!(why.contains("not the private draft 7"), "{why}");
-    }
-
-    #[test]
-    fn a_release_is_judged_by_the_lean_shape_github_serves() {
-        assert_eq!(
-            release_shape(&release(&lean(), "notes"), "0.6.0"),
-            Vec::<String>::new()
-        );
-        let mut seeded = lean();
-        seeded[0].1 = 1_070_000_000;
-        seeded.push(("aterm-0.6.0-x86_64.dmg", 9));
-        seeded.retain(|(n, _)| *n != "aterm-mac.zip.sha256" && *n != "SHA256SUMS.sig");
-        seeded[2].1 = 1;
-        let bad = release_shape(&release(&seeded, "the batteries-included image"), "0.6.0");
-        assert_eq!(bad.len(), 6, "{bad:#?}");
-        for asset in [
-            "aterm-mac.zip.sha256",
-            "aterm-0.6.0-x86_64.dmg",
-            "SHA256SUMS.sig",
-        ] {
-            assert!(bad.iter().any(|p| p.contains(asset)), "{asset}: {bad:#?}");
-        }
-        let mut linux = lean();
-        linux.push(("aterm-0.6.0-linux-x86_64", 40_000_000));
-        linux.push(("aterm-0.6.0-linux-riscv64", 40_000_000));
-        linux.push(("aterm-0.5.0-linux-aarch64", 40_000_000));
-        linux.push(("aterm-0.6.0-linux-aarch64.tar.gz", 1_000));
-        linux.retain(|(n, _)| *n != "aterm-machines.toml.sig");
-        let bad = release_shape(&release(&linux, ""), "0.6.0");
-        for asset in [
-            "aterm-0.6.0-linux-riscv64",
-            "aterm-0.5.0-linux-aarch64",
-            "aterm-0.6.0-linux-aarch64.tar.gz.sha256",
-            "aterm-machines.toml.sig",
-        ] {
-            assert!(bad.iter().any(|p| p.contains(asset)), "{asset}: {bad:#?}");
-        }
-    }
-
-    #[test]
-    fn the_appcast_the_pointer_serves_names_this_version_and_binds_its_url() {
-        let slug = "alabsystems/aterm";
-        let good = "version = \"0.6.0\"\ndmg = \"aterm-0.6.0.dmg\"\n\
-                    url = \"https://github.com/alabsystems/aterm/releases/download/v0.6.0/aterm-0.6.0.dmg\"\n";
-        assert!(appcast_problems(good, slug, "v0.6.0", "0.6.0").is_empty());
-        assert!(!appcast_problems(good, slug, "v0.7.0", "0.7.0").is_empty());
-        let unbound = good.replace("download/v0.6.0", "download/v0.5.0");
-        assert!(!appcast_problems(&unbound, slug, "v0.6.0", "0.6.0").is_empty());
-    }
-
-    #[test]
-    fn the_engines_dry_run_is_read_in_its_own_words() {
-        let text = "== exported 5807 of 7058 tracked files from abc\n\
-                    == guard ok: no forbidden content\n\
-                    == GUARD FAIL: private references (2)\n  a.rs:3\n  b.md:9\n\
-                    FAIL: guards failed — nothing was pushed\n";
-        let run = EngineRun::read(1, text);
-        assert_eq!(run.passed, ["no forbidden content"]);
-        assert_eq!(
-            run.failed,
-            [(
-                "private references (2)".to_string(),
-                vec!["a.rs:3".to_string(), "b.md:9".to_string()]
-            )]
-        );
-        assert_eq!(run.refusals, ["guards failed — nothing was pushed"]);
-        assert_eq!(EngineRun::read(0, "").tail, Vec::<String>::new());
-    }
-
-    #[test]
-    fn an_engine_refusal_is_sorted_by_its_cause() {
-        for line in [
-            "malformed manifest line (bare '!'): '!'",
-            "empty manifest",
-            "captured aterm commit has no publish/manifest.txt",
-            "publication policy contains a symlink, which could escape immutable inputs: x",
-            "CHECK_TIMEOUT_SECONDS_DEFAULT must be a positive integer",
-            "vendor/astream is not a gitlink in abc",
-            "transforms failed",
-            "the export does not pin the Trust toolchain the dev commit pins",
-            "detected version '1.2' is not a semver string",
-            "no staging remote configured",
-            "staging remote must identify alabsystems/aterm-staging, found 'x'",
-        ] {
-            assert_eq!(EngineCause::of(line), EngineCause::Tree, "{line}");
-        }
-        for (line, cause) in [
-            (
-                "gitleaks not installed — a fail-closed guard cannot be skipped",
-                EngineCause::NoGitleaks,
-            ),
-            (
-                "gitleaks crashed/timed out — aborting rather than fail open",
-                EngineCause::GitleaksBroke,
-            ),
-            (
-                "release notes: cannot read the public tags of alabsystems/aterm: git \
-                 ls-remote failed",
-                EngineCause::Network,
-            ),
-            (
-                "release notes: cannot fetch the previous public release v0.1.0",
-                EngineCause::Network,
-            ),
-            (
-                "cannot query aterm origin/main: fatal: unable to access",
-                EngineCause::Network,
-            ),
-            (
-                "astream public release main fetch failed: Host key verification failed.",
-                EngineCause::Network,
-            ),
-            // The engine's agh transport (2026-11-05), measured on this Mac on 2026-11-06 with
-            // the installed agh: a read through it is agh's to route, not the network's.
-            (
-                "cannot query publication engine origin/main: pub GitHub transport: Agh exited 2: \
-                 aterm help: unknown topic 'repo'",
-                EngineCause::Transport,
-            ),
-            (
-                "astream public release main fetch failed: pub GitHub transport: Agh exited 4: \
-                 agh: not_found exit=4",
-                EngineCause::Transport,
-            ),
-            (
-                "Agh lacks the required exact anonymous fetch capability; select the qualified \
-                 client with PUBLISH_AGH",
-                EngineCause::Transport,
-            ),
-            (
-                "publication engine HEAD a does not exactly match queried origin/main b",
-                EngineCause::Engine,
-            ),
-            (
-                "another publication operation for aterm is running; cannot stage",
-                EngineCause::Engine,
-            ),
-            (
-                "--commit abc is not an ancestor of origin/main def",
-                EngineCause::Source,
-            ),
-        ] {
-            assert_eq!(EngineCause::of(line), cause, "{line}");
-        }
-    }
-
-    #[test]
-    fn the_export_guards_pass_refuse_or_could_not_run() {
-        let (log, reports) = (Path::new("/c/dry-run.log"), Path::new("/c/reports"));
-        let outcome = |code: i32, text: &str, toolchain: Option<&Refusal>| {
-            export_outcome(&EngineRun::read(code, text), "r", toolchain, log, reports)
-        };
-        let refused = |code: i32, text: &str, toolchain: Option<&Refusal>| match outcome(
-            code, text, toolchain,
-        ) {
-            Outcome::Refuse(r) => r,
-            other => panic!("{text:?}: {other:?}"),
-        };
-        let not_run = |code: i32, text: &str, toolchain: Option<&Refusal>| match outcome(
-            code, text, toolchain,
-        ) {
-            Outcome::CouldNotRun(r) => r,
-            other => panic!("{text:?}: {other:?}"),
-        };
-        let no_toolchain = Refusal::new("no rustup", "install rustup");
-        let exported = "== exported 1 of 1 tracked files from r\n";
-        let ok =
-            format!("{exported}== guard ok: no forbidden content\n== guard ok: gitleaks clean\n");
-        assert!(matches!(outcome(0, &ok, None), Outcome::Pass(_)));
-        assert!(matches!(
-            outcome(0, &ok, Some(&no_toolchain)),
-            Outcome::Pass(_)
-        ));
-        let hit =
-            format!("{exported}== GUARD FAIL: forbidden content (1 hits; first 5):\n  x.rs:1\n");
-        for after in [
-            "FAIL: guards failed — nothing was pushed\n",
-            "FAIL: gitleaks not installed — a fail-closed guard cannot be skipped\n",
-            "FAIL: gitleaks crashed/timed out — aborting rather than fail open\n",
-        ] {
-            let r = refused(1, &format!("{hit}{after}"), None);
-            assert!(r.detail.iter().any(|l| l == "  x.rs:1"), "{r:?}");
-        }
-        for (text, line) in [
-            (
-                "FAIL: malformed manifest line (bare '!'): '!'\n".to_string(),
-                "malformed manifest line (bare '!'): '!'",
-            ),
-            (
-                format!(
-                    "{exported}FAIL: vendor/astream is not a gitlink in abc\nFAIL: transforms \
-                     failed\n"
-                ),
-                "vendor/astream is not a gitlink in abc",
-            ),
-        ] {
-            assert!(refused(1, &text, None).why.contains(line), "{text}");
-        }
-        for (text, line) in [
-            (
-                "FAIL: cannot query aterm origin/main: fatal: unable to access\n".to_string(),
-                "cannot query aterm origin/main",
-            ),
-            (
-                format!(
-                    "{exported}== guard ok: no forbidden content\nFAIL: gitleaks not installed \
-                     — a fail-closed guard cannot be skipped\n"
-                ),
-                "gitleaks not installed",
-            ),
-            (
-                format!(
-                    "{exported}== guard ok: no forbidden content\nFAIL: gitleaks crashed/timed \
-                     out — aborting rather than fail open\n"
-                ),
-                "gitleaks crashed",
-            ),
-            (
-                format!(
-                    "{exported}FAIL: release notes: cannot read the public tags of \
-                     alabsystems/aterm: git ls-remote failed\n"
-                ),
-                "release notes: cannot read the public tags",
-            ),
-        ] {
-            assert!(not_run(1, &text, None).why.contains(line), "{text}");
-        }
-        let metadata = format!(
-            "{exported}== guard ok: gitleaks clean\n== GUARD FAIL: targo metadata failed (see \
-             cargo-metadata.err)\nFAIL: guards failed — nothing was pushed\n"
-        );
-        refused(1, &metadata, None);
-        assert_eq!(
-            not_run(1, &metadata, Some(&no_toolchain)).why,
-            no_toolchain.why
-        );
-        for (code, text) in [
-            (0, exported),
-            (1, exported),
-            (-1, "cannot run /e/bin/pub: No such file or directory"),
-        ] {
-            not_run(code, text, None);
-        }
-    }
-
-    #[test]
-    fn a_gitleaks_finding_is_named_by_place_and_rule_never_by_its_secret() {
-        let report = r#"[{"File":"/x/export/a/b.rs","StartLine":7,"RuleID":"generic-api-key","Match":"key=hunter2","Secret":"hunter2"}]"#;
-        assert_eq!(
-            gitleaks_locations(report, Path::new("/x/export")),
-            ["a/b.rs:7 generic-api-key"]
-        );
-        assert!(gitleaks_locations("not json", Path::new("/x")).is_empty());
-        assert_eq!(
-            gitleaks_report("gitleaks findings (see /o/gitleaks-adjudicated.json)"),
-            Some("/o/gitleaks-adjudicated.json")
-        );
-        assert_eq!(gitleaks_report("private references (2)"), None);
-    }
-
-    #[test]
-    fn ship_check_export_drives_a_scratch_copy_of_the_engine_at_its_origins_main() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let git = |cwd: &Path, args: &[&str]| -> String {
-            let out = crate::ledger::testing::git()
-                .current_dir(cwd)
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let (engine, engine_origin) = (root.join("publication"), root.join("publication.git"));
-        let (repo, origin) = (root.join("aterm"), root.join("aterm.git"));
-        for bare in [&engine_origin, &origin] {
-            git(
-                &root,
-                &[
-                    "init",
-                    "-q",
-                    "--bare",
-                    "-b",
-                    "main",
-                    &bare.display().to_string(),
-                ],
-            );
-        }
-        for (dir, remote) in [(&engine, &engine_origin), (&repo, &origin)] {
-            std::fs::create_dir_all(dir).unwrap();
-            git(dir, &["init", "-q", "-b", "main"]);
-            git(
-                dir,
-                &["remote", "add", "origin", &remote.display().to_string()],
-            );
-        }
-        // The engine's GIT_* environment, as the gate hands it on from this process's own.
-        let reads = public_reads(
-            std::env::var_os("GIT_CONFIG_COUNT").as_deref(),
-            &[],
-            std::env::var_os("GIT_CONFIG_PARAMETERS").as_deref(),
-        )
-        .unwrap();
-        let seen = root.join("seen-env");
-        let scanner_report = root.join("scanner-report.json");
-        std::fs::write(&scanner_report, scanner_tools::test_output().stdout).unwrap();
-        let dump: String = reads
-            .iter()
-            .map(|(key, _)| {
-                format!(
-                    "printf '%s=%s\\n' {key} \"${key}\" >> '{}'\n",
-                    seen.display()
-                )
-            })
-            .collect();
-        let agh = agh_standin(&repo);
-        aterm_verify::standin(&agh, "exit 0");
-        let stub = |say: &str, code: i32| {
-            std::fs::create_dir_all(engine.join("bin")).unwrap();
-            let pubbin = engine.join("bin/pub");
-            std::fs::write(
-                &pubbin,
-                format!(
-                    "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\n\
-                     if [ \"$1\" = scanner-preflight ]; then cat '{scanner}'; exit 0; fi\n\
-                     [ -n \"$PUBLISH_SCANNER_TOOLS\" ] && cmp -s \"$PUBLISH_SCANNER_TOOLS\" '{scanner}' || exit 10\n\
-                     [ \"$PUBLISH_AGH\" = '{agh}' ] || exit 11\n\
-                     head=$(git -C \"$here\" rev-parse HEAD) || exit 12\n\
-                     remote=$(git --git-dir='{engine_origin}' rev-parse refs/heads/main) || exit 12\n\
-                     [ \"$head\" = \"$remote\" ] || {{ printf 'FAIL: publication engine HEAD %s does not exactly match queried origin/main %s\\n' \"$head\" \"$remote\"; exit 1; }}\n\
-                     echo '{{\"row\":1}}' \
-                     >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
-                     --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n",
-                    scanner = scanner_report.display(),
-                    agh = agh.display(),
-                    engine_origin = engine_origin.display(),
-                ),
-            )
-            .unwrap();
-            let mut perms = std::fs::metadata(&pubbin).unwrap().permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&pubbin, perms).unwrap();
-            std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
-            git(&engine, &["add", "-A"]);
-            git(&engine, &["commit", "-q", "-m", "stub"]);
-            git(
-                &engine,
-                &[
-                    "push",
-                    "-q",
-                    "--force",
-                    engine_origin.to_str().unwrap(),
-                    "main",
-                ],
-            );
-        };
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace.package]\nversion = \"0.2.0\"\n",
-        )
-        .unwrap();
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-q", "-m", "c"]);
-        git(&repo, &["push", "-q", "origin", "main"]);
-        git(&repo, &["fetch", "-q", "origin"]);
-        let opts = |commit: &str, engine: &Path| CheckOptions {
-            commit: Some(commit.to_string()),
-            engine: Some(engine.to_path_buf()),
-            export: true,
-            ..CheckOptions::default()
-        };
-        let export_built = |commit: &str, build: CheckoutBuild| {
-            bind_native_engine_fixture(&engine, &engine_origin);
-            let found = checked_with(&repo, &opts(commit, &engine), |real| {
-                real.engine_origin = native_engine_fixture;
-                real.prerequisite_acquire = crate::managed_prerequisites::simulated;
-                real.checkout_build = build;
-                // This test builds the checkout's agh, whatever PUBLISH_AGH its caller set.
-                real.engine_agh_explicit = None;
-            })
-            .expect("a release");
-            let gate = found.gates.last().expect("the export gate");
-            assert_eq!(gate.name, EXPORT_GATE);
-            (gate.outcome.clone(), found.exit_code())
-        };
-        let export = |commit: &str| export_built(commit, built_agh);
-        let exported = "== exported 1 of 1 tracked files from r\n";
-        stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
-        let (outcome, code) = export("HEAD");
-        assert!(matches!(outcome, Outcome::Pass(_)), "{outcome:?}");
-        assert_eq!(code, 0);
-        let want: String = reads
-            .iter()
-            .map(|(k, v)| format!("{k}={}\n", v.to_string_lossy()))
-            .collect();
-        assert_eq!(std::fs::read_to_string(&seen).unwrap(), want);
-        assert_eq!(
-            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
-            ""
-        );
-        assert_eq!(git(&engine, &["status", "--porcelain"]), "");
-        // The fixture's engine advances while this checkout prepares its GitHub client.
-        // The actual stage must still receive that origin's current main, not the copy
-        // fetched before preparation. No elapsed-time threshold or remote network is involved.
-        let (outcome, code) = export_built("HEAD", |real, what, args| {
-            let built = built_agh(real, what, args)?;
-            for args in [
-                vec![
-                    "commit",
-                    "-q",
-                    "--allow-empty",
-                    "-m",
-                    "advance during agh build",
-                ],
-                vec!["push", "-q", "fixture", "main"],
-            ] {
-                let out = crate::ledger::testing::git()
-                    .current_dir(&real.engine)
-                    .args([
-                        "-c",
-                        "user.name=t",
-                        "-c",
-                        "user.email=t@t",
-                        "-c",
-                        "commit.gpgsign=false",
-                    ])
-                    .args(&args)
-                    .output()
-                    .map_err(|why| why.to_string())?;
-                assert!(
-                    out.status.success(),
-                    "git {args:?}: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            Ok(built)
-        });
-        assert!(matches!(outcome, Outcome::Pass(_)), "{outcome:?}");
-        assert_eq!(code, 0);
-        stub("FAIL: malformed manifest line (bare !): !\n", 1);
-        git(&engine, &["reset", "-q", "--hard", "HEAD~1"]);
-        let (outcome, code) = export("HEAD");
-        assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
-        assert_eq!(code, 1);
-        stub(
-            "FAIL: cannot query aterm origin/main: fatal: unable to access\n",
-            1,
-        );
-        let (outcome, code) = export("HEAD");
-        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
-        assert_eq!(code, 3);
-        stub(&format!("{exported}== guard ok: no forbidden content\n"), 0);
-        // No agh the engine can read GitHub through: the gate stops before the dry run, and its
-        // refusal names what would.
-        let (outcome, code) = export_built("HEAD", broken_agh);
-        match &outcome {
-            Outcome::CouldNotRun(why) => assert!(
-                why.why.contains("only through agh")
-                    && why.why.contains("error[E0425]")
-                    && why.remedy.contains("PUBLISH_AGH"),
-                "{why:?}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(code, 3);
-        std::fs::write(repo.join("new.rs"), "\n").unwrap();
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-q", "-m", "unpushed"]);
-        let (outcome, code) = export("HEAD");
-        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
-        assert_eq!(code, 3);
-        git(
-            &repo,
-            &["push", "-q", "origin", "HEAD:refs/heads/export-feature"],
-        );
-        git(&repo, &["fetch", "-q", "origin"]);
-        let branch = checked_with(&repo, &opts("HEAD", &engine), |real| {
-            real.prerequisite_acquire = |_, _| panic!("a feature commit acquires no export tools");
-            real.checkout_build = |_, _, _| panic!("a feature commit builds no export tools");
-        })
-        .unwrap();
-        assert!(matches!(
-            branch.gates.last().map(|gate| &gate.outcome),
-            Some(Outcome::CouldNotRun(_))
-        ));
-        assert_eq!(
-            branch.exit_code(),
-            3,
-            "a feature branch push is not mainline"
-        );
-        let mut unread = Real::new(&repo, Some(&engine), true, false).unwrap();
-        unread.prerequisite_acquire = |_, _| panic!("unread ancestry acquires no export tools");
-        let (outcome, _) =
-            unread.export_gate(&Scratch::read_only(&repo).unwrap(), "no-such-commit");
-        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
-        let found = checked_with(&repo, &opts("HEAD~1", &root.join("none")), |real| {
-            real.prerequisite_acquire = crate::managed_prerequisites::simulated;
-            real.checkout_build = |_, _, _| panic!("a missing engine builds no export tools");
-        })
-        .unwrap();
-        assert!(matches!(
-            found.gates.last().map(|g| &g.outcome),
-            Some(Outcome::CouldNotRun(_))
-        ));
-        assert!(checked(&repo, &opts("no-such-commit", &engine)).is_err());
-    }
-
-    /// Where the stand-in agh of the checkout at `repo` is "built", outside the checkout.
-    fn agh_standin(repo: &Path) -> PathBuf {
-        repo.with_file_name("agh-build").join("agh")
-    }
-
-    /// A build of the checkout's agh that cargo answers with the stand-in's path.
-    fn built_agh(real: &Real, what: &str, args: &[std::ffi::OsString]) -> Result<Vec<u8>, String> {
-        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
-        assert!(
-            what == "agh" && pair("-p", "agh") && pair("--bin", "agh"),
-            "{what}: {args:?}"
-        );
-        let manifest = real.repo.join("crates/agh/Cargo.toml");
-        Ok(aterm_json::json!({
-            "reason": "compiler-artifact",
-            "manifest_path": manifest.to_str().unwrap(),
-            "target": {"name": "agh", "kind": ["bin"]},
-            "executable": agh_standin(&real.repo).to_str().unwrap(),
-        })
-        .to_string()
-        .into_bytes())
-    }
-
-    /// A build of the checkout's agh that does not compile.
-    fn broken_agh(_: &Real, what: &str, _: &[std::ffi::OsString]) -> Result<Vec<u8>, String> {
-        Err(format!(
-            "{what} build exited exit status: 101: error[E0425]"
-        ))
-    }
-
-    /// [`PUBLIC_READS`] numbered from `base`, the way [`public_reads`] hands them to the engine.
-    fn public_reads_at(base: usize) -> Vec<(String, std::ffi::OsString)> {
-        let pair = |key: String, value: &str| (key, value.into());
-        vec![
-            pair(
-                format!("GIT_CONFIG_KEY_{base}"),
-                "url.https://github.com/alabsystems/.insteadOf",
-            ),
-            pair(
-                format!("GIT_CONFIG_VALUE_{base}"),
-                "git@github.com:alabsystems/",
-            ),
-            pair(
-                format!("GIT_CONFIG_KEY_{}", base + 1),
-                "credential.https://github.com/alabsystems.helper",
-            ),
-            pair(format!("GIT_CONFIG_VALUE_{}", base + 1), ""),
-            pair(
-                format!("GIT_CONFIG_KEY_{}", base + 2),
-                "credential.https://github.com/alabsystems.helper",
-            ),
-            pair(
-                format!("GIT_CONFIG_VALUE_{}", base + 2),
-                "!f() { echo quit=1; }; f",
-            ),
-            pair(
-                format!("GIT_CONFIG_KEY_{}", base + 3),
-                "http.https://github.com/alabsystems/.extraHeader",
-            ),
-            pair(format!("GIT_CONFIG_VALUE_{}", base + 3), ""),
-            pair("GIT_CONFIG_COUNT".to_string(), &(base + 4).to_string()),
-            pair(
-                "GIT_CONFIG_PARAMETERS".to_string(),
-                concat!(
-                    "'url.https://github.com/alabsystems/.insteadOf=git@github.com:alabsystems/' ",
-                    "'credential.https://github.com/alabsystems.helper=' ",
-                    "'credential.https://github.com/alabsystems.helper=!f() { echo quit=1; }; f' ",
-                    "'http.https://github.com/alabsystems/.extraHeader='",
-                ),
-            ),
-            pair("GIT_TERMINAL_PROMPT".to_string(), "0"),
-        ]
-    }
-
-    /// The engine's dry run reads alabsystems as the public does, whatever this host's SSH keys: each `git@github.com:alabsystems/` URL over HTTPS, with no credential for `https://github.com/alabsystems` from a helper or an askpass program, numbered after the caller's own `GIT_CONFIG_*` entries, which still apply, while every other GitHub URL keeps its transport and its helper.
-    #[test]
-    fn the_engines_dry_run_reads_the_public_tier_anonymously_after_the_callers_git_config() {
-        let reads = |count: Option<&str>| public_reads(count.map(std::ffi::OsStr::new), &[], None);
-        assert_eq!(reads(None).unwrap(), public_reads_at(0));
-        assert_eq!(reads(Some("")).unwrap(), public_reads_at(0));
-        assert_eq!(reads(Some("3")).unwrap(), public_reads_at(3));
-        for bogus in ["two", "-1", " 1", "1 ", &usize::MAX.to_string()] {
-            let why = reads(Some(bogus)).unwrap_err();
-            assert!(
-                why.why.contains("GIT_CONFIG_COUNT") && why.why.contains(bogus),
-                "{why:?}"
-            );
-        }
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut real = Real::new(&root, Some(&root), true, false).unwrap();
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let (stage, handed) = real
-            .dry_run_command(
-                &root.join("engine"),
-                "c0ffee",
-                &root.join("clone"),
-                &reads(Some("1")).unwrap(),
-                &root.join("agh"),
-            )
-            .unwrap();
-        let (full, _) = real
-            .local_stage_command(
-                &root.join("engine"),
-                "c0ffee",
-                &root.join("clone"),
-                &reads(Some("1")).unwrap(),
-                &root.join("agh"),
-                Some(3),
-            )
-            .unwrap();
-        assert!(stage.get_args().any(|arg| arg == "--no-check"));
-        assert!(!full.get_args().any(|arg| arg == "--no-check"));
-        assert!(full.get_args().any(|arg| arg == "--dry-run"));
-        assert!(
-            full.get_envs().any(|(key, value)| key == "CARGO_BUILD_JOBS"
-                && value == Some(std::ffi::OsStr::new("3")))
-        );
-        // This test process was never judged at its start, so it is no commit's build: the dry
-        // run it builds is handed no cutter, not even one this process inherited.
-        for name in [RELEASE_CUTTER_ENV, RELEASE_CUTTER_SINCE_ENV] {
-            assert!(
-                stage
-                    .get_envs()
-                    .any(|(k, v)| k == std::ffi::OsStr::new(name) && v.is_none()),
-                "{name}: {handed}"
-            );
-        }
-        assert!(
-            handed.ends_with("c0ffee's publish/transforms.sh builds its own"),
-            "{handed}"
-        );
-        let mut sent: Vec<(String, std::ffi::OsString)> = stage
-            .get_envs()
-            .filter_map(|(key, value)| {
-                let key = key.to_str().filter(|k| k.starts_with("GIT_"))?;
-                let value = value.map_or_else(|| "<removed>".into(), |v| v.to_os_string());
-                Some((key.to_string(), value))
-            })
-            .collect();
-        sent.sort();
-        let mut want = public_reads_at(1);
-        want.sort();
-        assert_eq!(sent, want, "the engine's GIT_* environment");
-
-        // What git makes of it, under a caller's own entry 0, a helper for every GitHub URL and
-        // an askpass program that answers any prompt.
-        let config = root.join("gitconfig");
-        std::fs::write(
-            &config,
-            "[credential \"https://github.com\"]\n\thelper = \"!f() { echo username=fixture; \
-             echo password=fixture-pass; }; f\"\n",
-        )
-        .unwrap();
-        let askpass = root.join("askpass");
-        std::fs::write(&askpass, "#!/bin/sh\necho askpass-pass\n").unwrap();
-        let mut perms = std::fs::metadata(&askpass).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&askpass, perms).unwrap();
-        let git = |args: &[&str], input: Option<&str>| {
-            let mut git = crate::ledger::testing::git();
-            git.current_dir(&root)
-                .env("GIT_CONFIG_GLOBAL", &config)
-                .env("GIT_ASKPASS", &askpass)
-                .env_remove("SSH_ASKPASS")
-                .env(
-                    "GIT_CONFIG_KEY_0",
-                    "url.https://example.invalid/mirror/.insteadOf",
-                )
-                .env("GIT_CONFIG_VALUE_0", "fixture:")
-                .envs(sent.iter().map(|(key, value)| (key, value)))
-                .args(args)
-                .stdin(if input.is_some() {
-                    Stdio::piped()
-                } else {
-                    Stdio::null()
-                })
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = git.spawn().unwrap();
-            if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-                stdin.write_all(input.as_bytes()).unwrap();
-            }
-            let out = child.wait_with_output().unwrap();
-            let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-            (out.status.success(), text(&out.stdout), text(&out.stderr))
-        };
-        let url = |from: &str| git(&["ls-remote", "--get-url", from], None).1;
-        assert_eq!(
-            url("git@github.com:alabsystems/a3d.git").trim(),
-            "https://github.com/alabsystems/a3d.git"
-        );
-        assert_eq!(
-            url("git@github.com:alabsystems/publication.git").trim(),
-            "git@github.com:alabsystems/publication.git",
-            "a private address keeps this host's transport"
-        );
-        assert_eq!(
-            url("fixture:x").trim(),
-            "https://example.invalid/mirror/x",
-            "the caller's own entry still applies"
-        );
-        let fill = |url: &str| git(&["credential", "fill"], Some(&format!("url={url}\n\n")));
-        let (ok, out, err) = fill("https://github.com/alabsystems/publication.git");
-        assert!(ok && out.contains("password=fixture-pass"), "{out}{err}");
-        for public in [
-            "https://github.com/alabsystems/a3d.git",
-            "https://alabsystems@github.com/alabsystems/aterm.git",
-        ] {
-            let (ok, out, err) = fill(public);
-            assert!(
-                !ok && !out.contains("password=") && err.contains("told us to quit"),
-                "{public}: {out}{err}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_wasm32_gate_runs_rs_own_clause_under_a_stub_rustup() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let git = |cwd: &Path, args: &[&str]| -> String {
-            let out = crate::ledger::testing::git()
-                .current_dir(cwd)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(["-c", "commit.gpgsign=false"])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let repo = root.join("aterm");
-        std::fs::create_dir_all(repo.join("publish")).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(
-            repo.join("publish/config.sh"),
-            "CHECK_CMD_DEFAULT=\"rustup target add --toolchain 9.9.9 wasm32-unknown-unknown && \
-             RUSTC=$(rustup which --toolchain 9.9.9 rustc) rustup run 9.9.9 cargo check \
-             --locked --target wasm32-unknown-unknown -p aterm-wasm\"\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-q", "-m", "r"]);
-        let r = git(&repo, &["rev-parse", "HEAD"]);
-        let stub = root.join("rustup-bin");
-        std::fs::create_dir_all(&stub).unwrap();
-        std::fs::write(
-            stub.join("rustup"),
-            "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$1\" in\n\
-             target) exit 0 ;;\n\
-             which) echo \"$here/rustc\"; exit 0 ;;\n\
-             run) [ -f Cargo.toml ] || { echo \"error: no tree laid out in $(pwd)\" >&2; exit 101; }\n\
-             \x20 [ -f \"$here/broken\" ] && { echo 'error[E0425]: cannot find value `x`' >&2; exit 101; }\n\
-             \x20 echo 'Finished'; exit 0 ;;\nesac\n\
-             echo \"stub rustup: unexpected $*\" >&2; exit 2\n",
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(stub.join("rustup"))
-            .unwrap()
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(stub.join("rustup"), perms).unwrap();
-        let tools = Wasm32Tools {
-            rustup: stub.clone(),
-            path: std::env::join_paths([stub.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-                .unwrap(),
-        };
-        let scratch = Scratch {
-            dir: root.join("scratch"),
-            cache: root.join("cache"),
-        };
-        std::fs::create_dir_all(&scratch.dir).unwrap();
-        let export = root.join("export");
-        std::fs::create_dir_all(&export).unwrap();
-        std::fs::write(export.join("Cargo.toml"), "[workspace]\n").unwrap();
-        let mut real = Real::new(&repo, None, true, false).expect("a backend");
-
-        let absent = aterm_uds::host::tool("rustup")
-            .locate_in(&aterm_uds::host::Lookup {
-                named: None,
-                tooling: Some(root.join("tooling.noindex")),
-                path: None,
-            })
-            .unwrap_err();
-        let none = real.wasm32_gate(&scratch, &r, Some(&export), Err(&absent));
-        assert!(
-            matches!(&none, Outcome::CouldNotRun(refused)
-                if refused.why.starts_with("no rustup (looked in")
-                    && refused.remedy.contains("targo --unverified verify provision")),
-            "no rustup: {none:?}"
-        );
-        let passed = real.wasm32_gate(&scratch, &r, Some(&export), Ok(&tools));
-        assert!(matches!(passed, Outcome::Pass(_)), "{passed:?}");
-        std::fs::write(stub.join("broken"), "").unwrap();
-        let broken = real.wasm32_gate(&scratch, &r, Some(&export), Ok(&tools));
-        match &broken {
-            Outcome::Refuse(why) => assert!(
-                why.detail.iter().any(|l| l.starts_with("error[E0425]")),
-                "the compiler's errors ride along: {why:?}"
-            ),
-            other => panic!("a compile that fails refuses: {other:?}"),
-        }
-        std::fs::remove_file(stub.join("broken")).unwrap();
-        let archived = real.wasm32_gate(&scratch, &r, None, Ok(&tools));
-        assert!(matches!(archived, Outcome::Pass(_)), "{archived:?}");
-        assert!(scratch.dir.join("wasm-src/publish/config.sh").is_file());
-    }
-
-    const CRLF_PROBE_ENV: &str = "ATERM_RELEASE_CRLF_PROBE_DIR";
-    const CRLF_PROBE: &str =
-        "release_steps::tests::every_tree_the_release_writes_is_the_commits_bytes";
-
-    fn run_crlf_git(at: &Path, args: &[&str]) -> String {
-        let out = crate::ledger::testing::git()
-            .arg("-C")
-            .arg(at)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    fn write_crlf_fixture_file(path: &Path, body: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
-
-    fn setup_crlf_fixture_repos(root: &Path) -> (PathBuf, String) {
-        use crate::ledger::testing;
-        let ident = [
-            ("user.name", "t"),
-            ("user.email", "t@example.invalid"),
-            ("commit.gpgsign", "false"),
-        ];
-        let sub = root.join("sub");
-        testing::init(&sub, &ident);
-        write_crlf_fixture_file(&sub.join("s.sh"), "#!/bin/sh\n");
-        run_crlf_git(&sub, &["add", "-A"]);
-        run_crlf_git(&sub, &["commit", "-q", "-m", "s"]);
-        let (repo, origin) = (root.join("aterm"), root.join("aterm.git"));
-        testing::init(&repo, &ident);
-        write_crlf_fixture_file(&repo.join(".gitattributes"), "*.txt text\n");
-        write_crlf_fixture_file(&repo.join("bin/pub"), "#!/bin/sh\n");
-        write_crlf_fixture_file(&repo.join("notes.txt"), "one\n");
-        write_crlf_fixture_file(&repo.join("RELEASES.ledger"), "1783354739 0.25.0\n");
-        write_crlf_fixture_file(
-            &repo.join("CHANGELOG.md"),
-            "## [Unreleased]\n\n### Added\n- An entry.\n",
-        );
-        let sub_s = sub.display().to_string();
-        let add_sub = ["submodule", "add", "-q", &sub_s, "vendor/sub"];
-        run_crlf_git(
-            &repo,
-            &[&["-c", "protocol.file.allow=always"][..], &add_sub].concat(),
-        );
-        run_crlf_git(&repo, &["add", "-A"]);
-        run_crlf_git(&repo, &["commit", "-q", "-m", "r"]);
-        run_crlf_git(root, &["init", "-q", "--bare", "-b", "main", "aterm.git"]);
-        run_crlf_git(
-            &repo,
-            &["remote", "add", "origin", &origin.display().to_string()],
-        );
-        run_crlf_git(&repo, &["push", "-q", "origin", "main"]);
-        let head = run_crlf_git(&repo, &["rev-parse", "HEAD"]);
-        (repo, head)
-    }
-
-    fn probe_every_tree_the_release_writes_under_a_crlf_config_if_asked() -> bool {
-        use std::fs;
-        let Some(root) = std::env::var_os(CRLF_PROBE_ENV).map(PathBuf::from) else {
-            return false;
-        };
-        let (repo, r) = setup_crlf_fixture_repos(&root);
-        // The configuration the parent chose is what this probe's own git reads (it was started
-        // with `crate::ledger::testing::CHOSEN_GIT_ENV`), not the test binary's hermetic one.
-        let host = GitCli::new(&repo);
-        let read = |args: &[&str]| {
-            crate::ledger::GitRunner::git(&host, args)
-                .unwrap()
-                .stdout_utf8()
-                .trim()
-                .to_owned()
-        };
-        assert_eq!(read(&["config", "core.autocrlf"]), "true");
-        assert_eq!(
-            read(&["check-attr", "eol", "--", "notes.txt"]),
-            "notes.txt: eol: crlf"
-        );
-        let lf = |tree: &Path, notes: &str, with_sub: bool| {
-            let read = |rel: &str| fs::read_to_string(tree.join(rel)).unwrap();
-            assert_eq!(read("bin/pub"), "#!/bin/sh\n", "{}", tree.display());
-            assert_eq!(read("notes.txt"), notes, "{}", tree.display());
-            if with_sub {
-                assert_eq!(read("vendor/sub/s.sh"), "#!/bin/sh\n", "{}", tree.display());
-            }
-        };
-        bind_native_engine_fixture(&repo, &root.join("aterm.git"));
-        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
-        real.engine_origin = native_engine_fixture;
-        let scratch = Scratch {
-            dir: root.join("scratch"),
-            cache: root.join("cache"),
-        };
-        fs::create_dir_all(&scratch.dir).unwrap();
-        lf(&real.scratch_engine(&scratch).unwrap(), "one\n", false);
-        let clone = scratch.dir.join("dry-run/aterm");
-        real.dry_clone(&scratch.dir, &clone, &r).unwrap();
-        lf(&clone, "one\n", true);
-        let archive = root.join("archive");
-        fs::create_dir_all(&archive).unwrap();
-        assert!(real.archive_into(&r, &archive));
-        lf(&archive, "one\n", true);
-        // The engine segment above uses its explicit native fixture. The
-        // placement segment exercises the existing local-file route; keep its
-        // authority local rather than accidentally selecting network Git.
-        run_crlf_git(
-            &repo,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                root.join("aterm.git").to_str().unwrap(),
-            ],
-        );
-        let place = |commit: &str| {
-            let source = crate::gates::PublishedSource {
-                commit: commit.to_string(),
-                verified_at: "2026-10-21T00:00:00+00:00".to_string(),
-            };
-            let git = GitCli::new(&repo);
-            let origin = crate::gates::fixture_origin::FixtureOrigin(&git);
-            crate::gates::place_published(&git, &origin, &repo, &source).unwrap()
-        };
-        lf(&place(&r).tree, "one\n", true);
-        write_crlf_fixture_file(&repo.join("notes.txt"), "one\ntwo\n");
-        run_crlf_git(&repo, &["commit", "-q", "-am", "two"]);
-        run_crlf_git(
-            &repo,
-            &[
-                "push",
-                "-q",
-                root.join("aterm.git").to_str().unwrap(),
-                "main",
-            ],
-        );
-        let source = run_crlf_git(&repo, &["rev-parse", "HEAD"]);
-        let moved = place(&source);
-        assert!(moved.moved);
-        lf(&moved.tree, "one\ntwo\n", true);
-        let plan = crate::ledger::ClaimPlan {
-            version: "0.26.0",
-            now: 0,
-            allow_existing_section: false,
-            max_attempts: 1,
-            source: &source,
-        };
-        let rolls = |source: &str, main: &str| {
-            crate::changelog::claim_changelogs(source, main, "0.26.0", "2026-10-21")
-        };
-        let cut = GitCli::new(&moved.tree);
-        bind_native_engine_fixture(&moved.tree, &root.join("aterm.git"));
-        let native = native_engine_fixture(&moved.tree, &moved.tree).unwrap();
-        let reserved = crate::ledger::reserve(&cut, &native, &plan, &rolls).unwrap();
-        crate::ledger::claim(&cut, &native, &moved.tree, &plan, &reserved, &rolls).unwrap();
-        let rolled = fs::read_to_string(moved.tree.join("CHANGELOG.md")).unwrap();
-        assert!(
-            rolled.contains("## [0.26.0]") && !rolled.contains('\r'),
-            "{rolled:?}"
-        );
-        true
-    }
-
-    /// Every entry under `root` and its bytes, symlinks not followed: what a probe writes grows it.
-    fn tree_bytes(root: &Path) -> u64 {
-        let mut total = 0;
-        let mut dirs = vec![root.to_path_buf()];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let Ok(meta) = entry.metadata() else { continue };
-                total += 1 + meta.len();
-                if meta.is_dir() {
-                    dirs.push(entry.path());
-                }
-            }
-        }
-        total
-    }
-
-    #[test]
-    fn every_tree_the_release_writes_is_the_commits_bytes() {
-        if probe_every_tree_the_release_writes_under_a_crlf_config_if_asked() {
-            return;
-        }
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let config = root.join("gitconfig");
-        std::fs::write(
-            &config,
-            "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\teol = crlf\n[protocol \"file\"]\n\tallow = always\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("xdg/git")).unwrap();
-        std::fs::write(root.join("xdg/git/attributes"), "* text eol=crlf\n").unwrap();
-        let work = root.join("work");
-        std::fs::create_dir(&work).unwrap();
-        for leaf in ["home", "tmp", "state"] {
-            std::fs::create_dir(root.join(leaf)).unwrap();
-        }
-        let mut child = command(std::env::current_exe().unwrap());
-        aterm_uds::fixture_git::hermetic(&mut child)
-            .args(["--exact", "--nocapture", "--test-threads=1", CRLF_PROBE])
-            .env(CRLF_PROBE_ENV, &work)
-            .env("HOME", root.join("home"))
-            .env("TMPDIR", root.join("tmp"))
-            .env("TMP", root.join("tmp"))
-            .env("TEMP", root.join("tmp"))
-            .env("XDG_STATE_HOME", root.join("state"))
-            .env("GIT_CONFIG_GLOBAL", &config)
-            .env("XDG_CONFIG_HOME", root.join("xdg"))
-            .env(crate::ledger::testing::CHOSEN_GIT_ENV, "1")
-            .stdin(Stdio::null());
-        // The probe is a whole release's git work: the hang detector is a minute in which its
-        // fixture tree stops growing, not a minute for all of it.
-        let mut grown = || tree_bytes(&work);
-        let out = aterm_uds::deadline::output_while_progressing(
-            &mut child,
-            aterm_spec::wait::MUST_HAPPEN,
-            &mut grown,
-        );
-        let out = match out {
-            Ok(out) => out,
-            Err(error) => {
-                let kept = dir.keep();
-                panic!(
-                    "CRLF probe: {error} (its fixture tree stopped growing); retained fixture {}",
-                    kept.display()
-                );
-            }
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "the probe under a CRLF config: {}\n{stdout}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    fn a_refusal_outranks_a_gate_that_could_not_run() {
-        let gate = |outcome: Outcome| PrecheckGate { name: "g", outcome };
-        let pass = || gate(Outcome::Pass("ok".into()));
-        let refuse = || gate(Outcome::Refuse(Refusal::new("no", "fix")));
-        let not_run = || gate(Outcome::CouldNotRun(Refusal::new("no tool", "install")));
-        for (gates, code) in [
-            (vec![pass()], 0),
-            (vec![pass(), not_run()], 3),
-            (vec![not_run(), refuse(), pass()], 1),
-            (vec![refuse(), not_run()], 1),
-        ] {
-            let found = Precheck {
-                commit: "c".repeat(40),
-                version: "0.2.0".into(),
-                gates,
-            };
-            assert_eq!(found.exit_code(), code);
-        }
-    }
-
-    #[test]
-    fn the_engines_ledger_and_attestation_are_read_as_the_release_reads_them() {
-        let a = "a".repeat(40);
-        let b = "b".repeat(40);
-        let json = format!(
-            "{{\"mappings\":{{\"aterm\":{{\"{a}\":{{\"verified_at\":\"2026-10-01T00:00:00Z\",\
-             \"release_rev\":\"e1\"}},\"{b}\":{{\"verified_at\":\"2026-10-02T00:00:00Z\"}}}}}}}}"
-        );
-        let rows = engine_rows_in(&json, Some(&a));
-        assert_eq!(
-            rows,
-            EngineRows {
-                newest: Some(b.clone()),
-                has: true,
-                rev: Some("e1".into())
-            }
-        );
-        assert!(!engine_rows_in(&json, Some("c")).has);
-        assert_eq!(engine_rows_in("not json", None), EngineRows::default());
-        // A revoked row is no publication of its commit, nor the newest. NEGATIVE CONTROL: the
-        // same rows unrevoked (above) have `a` published and `b` newest.
-        let revoked = format!(
-            "{}, \"revoked\":{{\"aterm\":{{\"{b}\":{{}},\"{a}\":{{}}}}}}}}",
-            json.strip_suffix('}').unwrap()
-        );
-        assert_eq!(engine_rows_in(&revoked, Some(&a)), EngineRows::default());
-        let attestation = |gate: &str, mode: &str| {
-            format!(
-                "{{\"source\":{{\"commit\":\"{a}\"}},\"guards\":{{\"public_clone\":\"{gate}\"}},\
-                 \"release_mode\":\"{mode}\",\"engine\":{{\"commit\":\"{b}\"}},\
-                 \"staging\":{{\"candidate_rev\":\"{b}\",\"attested_rev\":\"{b}\"}},\
-                 \"export\":{{\"tree\":\"{a}\"}}}}"
-            )
-        };
-        assert!(attestation_promotes(&attestation("pass", "full"), &a));
-        assert!(attestation_promotes(
-            &attestation("skipped", "source-only"),
-            &a
-        ));
-        assert!(!attestation_promotes(&attestation("skipped", "full"), &a));
-        assert!(!attestation_promotes(&attestation("pass", "full"), &b));
-        assert_eq!(
-            attested_engine(&attestation("pass", "full")).as_deref(),
-            Some(b.as_str())
-        );
-        let engineless =
-            attestation("pass", "full").replace(&format!(",\"engine\":{{\"commit\":\"{b}\"}}"), "");
-        assert_eq!(attested_engine(&engineless), None);
-        assert!(!attestation_promotes(&engineless, &a));
-        let private = attestation("pass", "full").replace(
-            &format!("\"attested_rev\":\"{b}\""),
-            "\"attested_rev\":null",
-        );
-        assert!(attestation_qualifies(&private, &a));
-        assert!(!attestation_promotes(&private, &a));
-        for invalid in [
-            private.replace(
-                &format!("\"candidate_rev\":\"{b}\""),
-                "\"candidate_rev\":null",
-            ),
-            private.replace(&format!("\"tree\":\"{a}\""), "\"tree\":null"),
-            private.replace("\"public_clone\":\"pass\"", "\"public_clone\":\"skipped\""),
-        ] {
-            assert!(!attestation_qualifies(&invalid, &a), "{invalid}");
-            assert!(!attestation_promotes(&invalid, &a), "{invalid}");
-        }
-        let mismatch = attestation("pass", "full").replace(
-            &format!("\"attested_rev\":\"{b}\""),
-            &format!("\"attested_rev\":\"{a}\""),
-        );
-        assert!(!attestation_promotes(&mismatch, &a));
-    }
-
-    #[test]
-    fn the_qualified_candidate_requires_both_commit_and_tree() {
-        let (s, t) = ("5".repeat(40), "6".repeat(40));
-        let json =
-            format!("{{\"staging\":{{\"attested_rev\":\"{s}\"}},\"export\":{{\"tree\":\"{t}\"}}}}");
-        assert_eq!(attested_candidate(&json), Some((s.clone(), t.clone())));
-        assert_eq!(
-            attested_candidate("{\"staging\":{\"attested_rev\":\"r\"}}"),
-            None
-        );
-        assert_eq!(attested_candidate("not json"), None);
-    }
-
-    #[test]
-    fn retained_candidate_is_checked_locally_and_missing_evidence_is_not_a_pass() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let git = GitCli::new(dir.path());
-        let run = |args: &[&str]| {
-            let out = git.git(args).unwrap();
-            assert!(out.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            out.stdout_utf8().trim().to_string()
-        };
-        run(&["init", "-q", "-b", "main"]);
-        run(&[
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.invalid",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "qualified",
-        ]);
-        let revision = run(&["rev-parse", "HEAD"]);
-        let tree = run(&["rev-parse", "HEAD^{tree}"]);
-        let reference = format!("refs/publication/candidates/{revision}");
-        run(&["update-ref", &reference, &revision]);
-        let out = dir.path().join("publish/.out");
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("attestation.json"), format!(
-            "{{\"staging\":{{\"attested_rev\":\"{revision}\"}},\"export\":{{\"tree\":\"{tree}\"}}}}"
-        )).unwrap();
-        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        assert_eq!(real.candidate_missing().unwrap(), None);
-        run(&["update-ref", "-d", "refs/heads/main"]);
-        assert_eq!(real.candidate_missing().unwrap(), None);
-        run(&["update-ref", "-d", &reference]);
-        assert!(real.candidate_missing().unwrap().is_some());
-        std::fs::rename(dir.path().join(".git"), dir.path().join("missing-git")).unwrap();
-        assert!(real.candidate_missing().is_err());
-    }
-
-    #[test]
-    fn dry_run_machine_checks_refuse_an_incomplete_source_signing_ring() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        real.home = dir.path().join("empty-home");
-        let (_, refusals) = real.machine(&real.home.join("profile.toml"), false);
-        assert!(
-            refusals
-                .iter()
-                .any(|r| r.why.starts_with("source signing ring:"))
-        );
-    }
-
-    /// The build and cut steps run this very executable or nothing: a cutter that cannot name
-    /// its own executable builds no command for an `aterm-release` found on `PATH`, which would
-    /// be handed nothing of this one; one that can runs that path, handed itself. NEGATIVE
-    /// CONTROL: fall back to `aterm-release` on `PATH` (as before), and a command comes back.
-    #[test]
-    fn a_cutter_that_cannot_name_itself_starts_no_step() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(
-            dir.path(),
-            Some(Path::new("/other/publication")),
-            true,
-            false,
-        )
-        .expect("a backend");
-        let prover = Prover {
-            bin: PathBuf::from("/store/trust/9192/bin"),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
-        };
-        let args = ["cut".to_string()];
-        let gone = real.cut_command_of(Err(std::io::Error::other("gone")), &args, &prover);
-        assert_eq!(
-            gone.err().as_deref(),
-            Some("this cutter cannot name its own executable (gone)")
-        );
-        let exe = PathBuf::from("/t/gate/aterm-release");
-        let cmd = real
-            .cut_command_of(Ok(exe.clone()), &args, &prover)
-            .unwrap();
-        assert_eq!(cmd.get_program(), exe.as_os_str());
-        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["cut"]);
-        assert!(cmd.get_envs().any(|kv| kv
-            == (
-                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
-                Some(exe.as_os_str())
-            )));
-    }
-
-    #[test]
-    fn the_engine_the_release_judges_is_the_one_every_child_reads() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(
-            dir.path(),
-            Some(Path::new("/other/publication")),
-            true,
-            false,
-        )
-        .expect("a backend");
-        let prover = Prover {
-            bin: PathBuf::from("/store/trust/9192/bin"),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
-        };
-        let engine = (
-            std::ffi::OsStr::new("PUBLICATION_ENGINE"),
-            Some(std::ffi::OsStr::new("/other/publication")),
-        );
-        let cut = real
-            .cut_command(&["cut".into(), "--mac-only".into()], &prover)
-            .unwrap();
-        let envs: Vec<_> = cut.get_envs().collect();
-        assert!(envs.contains(&engine), "{envs:?}");
-        let exe = std::env::current_exe().unwrap();
-        // The cut step's cutter is this executable, handed itself, so its cut gate judges it
-        // from this process's moment; never judged at its start, this test process has none.
-        for handed in [
-            (RELEASE_CUTTER_ENV, Some(exe.as_os_str())),
-            (RELEASE_CUTTER_SINCE_ENV, None),
-        ] {
-            assert!(
-                envs.contains(&(std::ffi::OsStr::new(handed.0), handed.1)),
-                "{handed:?}: {envs:?}"
-            );
-        }
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("TRUST_STAGE2_BIN"),
-                Some(std::ffi::OsStr::new("/store/trust/9192/bin"))
-            )),
-            "{envs:?}"
-        );
-        let stage = real.child("/other/publication/bin/pub", Some(&prover));
-        assert!(stage.get_envs().any(|kv| kv == engine));
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let publish = real.publish_command(&prover).unwrap();
-        assert_eq!(
-            publish.get_program(),
-            std::ffi::OsStr::new("/other/publication/bin/pub")
-        );
-        assert!(
-            publish.get_args().any(|a| a == "--skip-site"),
-            "the site follows the cut, not the promote"
-        );
-        let args: Vec<_> = publish.get_args().collect();
-        assert!(args.windows(2).any(|pair| {
-            pair == [
-                "--release-remote",
-                "https://github.com/alabsystems/aterm.git",
-            ]
-        }));
-        let envs: Vec<_> = publish.get_envs().collect();
-        assert!(envs.contains(&engine), "{envs:?}");
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
-                Some(exe.as_os_str())
-            )),
-            "{envs:?}"
-        );
-        // Never judged at its start, this test process has no moment to hand on with itself.
-        assert!(
-            envs.contains(&(std::ffi::OsStr::new(RELEASE_CUTTER_SINCE_ENV), None)),
-            "{envs:?}"
-        );
-        let edit = real.scrubbed("/other/publication/bin/pub-bump-edit");
-        assert!(edit.get_envs().any(|kv| kv == engine));
-    }
-
-    #[cfg(unix)]
-    /// EVERY CHILD THE RELEASE STARTS IS NAMED ITS DISK CLAIM WHILE IT HOLDS ONE: a `verify` it
-    /// runs is covered by that claim alone (`aterm_capacity::covering_disk`), walking nothing. One
-    /// this process inherited is never passed on, and once the claim is let go no child is named
-    /// it. NEGATIVE CONTROL: before the claim, the same child carries no marker.
-    #[test]
-    fn every_child_is_named_the_releases_disk_claim_while_it_holds_one() {
-        let gib = 1u64 << 30;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
-        // `Real::new` keeps its record below this test binary's own root (`release_state`),
-        // which every test in this process shares; a record of its own keeps "a run that did
-        // not pass keeps nothing" below independent of them.
-        real.state = dir.path().join("state");
-        let marker = |cmd: &Command| {
-            cmd.get_envs()
-                .find(|(k, _)| *k == std::ffi::OsStr::new(aterm_capacity::DISK_COVER_ENV))
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
-        };
-        let mut inherited = command("/bin/true");
-        scrub_names(
-            &mut inherited,
-            [std::ffi::OsString::from(aterm_capacity::DISK_COVER_ENV)],
-        );
-        assert_eq!(
-            marker(&inherited),
-            Some(None),
-            "an inherited claim is removed"
-        );
-        assert_eq!(
-            marker(&real.child("/bin/true", None)),
-            None,
-            "no claim, no marker"
-        );
-
-        let mut reading = aterm_capacity::Reading::of_gib(48, 40, 14);
-        reading.volume = Some(aterm_capacity::Volume {
-            mount: dir.path().to_path_buf(),
-            total: 400 * gib,
-            free: 300 * gib,
-            floor: 10 * gib,
-            room: 2 * gib,
-        });
-        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
-        let whole = atpkg::admit_disk::admit_sized_on(
-            crate::release_disk::sized(dir.path(), 39 * gib, "release v0.6.0", Vec::new()),
-            &ledger,
-            &aterm_capacity::Fixed::new(reading),
-            atpkg::admit_disk::Admit::Wait,
-            aterm_capacity::Pace::default(),
-            &mut atpkg::admit_disk::Reclaim::of(
-                Box::new(|_, _| (0, Vec::new(), Vec::new())),
-                Box::new(|_, _, _| None),
-                Box::new(|_, _| Vec::new()),
-            ),
-            &mut |_| {},
-        )
-        .expect("room for the claim");
-        let name = std::ffi::OsString::from(whole.marker());
-        real.disk_claim = Some(whole);
-        assert_eq!(marker(&real.child("/bin/true", None)), Some(Some(name)));
-
-        real.let_disk_go(false);
-        assert!(real.disk_claim.is_none());
-        assert_eq!(marker(&real.child("/bin/true", None)), None, "let go");
-        assert!(
-            !crate::release_disk::record_in(&real.state).exists(),
-            "a run that did not pass keeps nothing"
-        );
-    }
-
-    #[test]
-    fn scanner_export_preflight_uses_the_actual_dry_run_environment() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let repo = root.join("candidate");
-        let export = root.join("export-candidate");
-        std::fs::create_dir(&repo).unwrap();
-        std::fs::create_dir(&export).unwrap();
-        let mut real = Real::new(&repo, Some(&root.join("engine")), true, false).unwrap();
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let (mut stage, _) = real
-            .dry_run_command(
-                &root.join("scratch-engine"),
-                "candidate",
-                &export,
-                &public_reads_at(0),
-                &root.join("agh"),
-            )
-            .unwrap();
-        let report = scanner_tools::prepare(
-            &stage,
-            real.engine_prefix_len(),
-            &real.logs.join("export-scanner-tools.json"),
-            &[&repo, &export],
-            |probe| {
-                assert_eq!(probe.get_program(), stage.get_program());
-                assert_eq!(
-                    probe.get_envs().collect::<Vec<_>>(),
-                    stage.get_envs().collect::<Vec<_>>()
-                );
-                assert_eq!(
-                    probe.get_args().collect::<Vec<_>>(),
-                    [std::ffi::OsStr::new("scanner-preflight")]
-                );
-                Ok(scanner_tools::test_output())
-            },
-        )
-        .unwrap();
-        report.apply(&mut stage);
-        assert!(
-            stage
-                .get_envs()
-                .any(|(name, value)| name == scanner_tools::ENV && value.is_some())
-        );
-        assert_eq!(std::fs::read_dir(repo).unwrap().count(), 0);
-        assert_eq!(std::fs::read_dir(export).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scanner_failures_stop_the_export_and_its_tools_reach_only_the_engine() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        crate::ledger::testing::init(
-            &repo,
-            &[
-                ("user.name", "Test"),
-                ("user.email", "test@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ],
-        );
-        let git = GitCli::new(&repo);
-        git.git(&["commit", "--allow-empty", "-qm", "candidate"])
-            .unwrap();
-        let candidate = Candidate {
-            commit: git
-                .git(&["rev-parse", "HEAD"])
-                .unwrap()
-                .stdout_utf8()
-                .trim()
-                .into(),
-            version: "1.0.0".into(),
-            why: "test".into(),
-            bump_from: None,
-            carry: Vec::new(),
-        };
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
-        let prover = Prover {
-            bin: bin.clone(),
-            commit: "test".into(),
-            source: "test".into(),
-        };
-        // An engine clone with no bin/pub, synced from its origin before the export runs.
-        let engine = dir.path().join("engine");
-        let origin = dir.path().join("engine-origin.git");
-        crate::ledger::testing::init(
-            &engine,
-            &[
-                ("user.name", "Test"),
-                ("user.email", "test@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ],
-        );
-        let engine_git = GitCli::new(&engine);
-        engine_git
-            .git(&["commit", "--allow-empty", "-qm", "engine"])
-            .unwrap();
-        GitCli::new(dir.path())
-            .git(&["clone", "-q", "--bare", "engine", "engine-origin.git"])
-            .unwrap();
-        engine_git
-            .git(&["remote", "add", "origin", &origin.display().to_string()])
-            .unwrap();
-        bind_native_engine_fixture(&engine, &origin);
-        // A real run's backend (a dry one makes no engine to stage from), its logs its own.
-        let backend = |engine: &Path, logs: &str| {
-            let mut real = Real::new(&repo, Some(engine), false, false).unwrap();
-            real.engine_origin = native_engine_fixture;
-            real.engine_url = fixture_engine_url;
-            real.logs = dir.path().join(logs);
-            std::fs::create_dir_all(&real.logs).unwrap();
-            real
-        };
-        let mut real = backend(&engine, "logs");
-        real.home = dir.path().join("empty-home");
-        real.prerequisite_acquire = crate::managed_prerequisites::simulated;
-        let mut missing = backend(&dir.path().join("missing-engine"), "logs-missing");
-        let unsynced =
-            Backend::stage(&mut missing, &candidate, &prover, StageTarget::Remote).unwrap_err();
-        assert!(
-            unsynced.why.starts_with("no publication engine at"),
-            "the engine is synced before the export: {unsynced:?}"
-        );
-        let scanner_failure =
-            Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
-        assert!(
-            scanner_failure
-                .why
-                .starts_with("publication scanner preflight:")
-        );
-        assert!(real.scanner_tools.is_none());
-        real.scanner_probe = |_| Ok(scanner_tools::test_output());
-        let ran = Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap();
-        assert_ne!(ran.code, 0, "the engine has no bin/pub: {ran:?}");
-        let report = real.logs.canonicalize().unwrap().join("scanner-tools.json");
-        for cmd in [
-            real.with_scanners(
-                real.stage_command(&candidate.commit, &prover, StageTarget::Remote)
-                    .unwrap()
-                    .0,
-            ),
-            real.publish_command(&prover).unwrap(),
-        ] {
-            assert!(cmd.get_envs().any(
-                |(name, value)| name == scanner_tools::ENV && value == Some(report.as_os_str())
-            ));
-        }
-        // Negative control: no other child of the run is handed them (the build's, verify's);
-        // each has the name removed, so none inherits one either.
-        assert!(
-            real.child(prover.bin.join("targo"), Some(&prover))
-                .get_envs()
-                .any(|(name, value)| name == scanner_tools::ENV && value.is_none())
-        );
-        // The stage outside the graph (step 7's, again) is that step's child, in its log; the
-        // graph's export is the export branch, in its own.
-        let logged = |path: PathBuf| std::fs::read_to_string(path).unwrap_or_default();
-        let branch_log = real.side_log(Step::Qualify, Branch::Export.name());
-        assert!(
-            logged(real.step_log(Step::Publish)).contains("\"stage\""),
-            "the stage again logs as step 7's child"
-        );
-        assert!(!branch_log.exists(), "and not as step 4's export");
-        let ran = Backend::branches(&mut real)
-            .export(
-                &candidate,
-                &prover,
-                StageTarget::Remote,
-                &BranchStop::default(),
-            )
-            .unwrap();
-        assert_ne!(ran.code, 0, "{ran:?}");
-        assert!(logged(branch_log).contains("\"stage\""));
-        // An engine that cannot be synced after the graph's export says nothing of R: COULD NOT
-        // RUN, so it stops no other branch. NEGATIVE CONTROL: the same refusal outside the graph
-        // stays a refusal.
-        std::fs::rename(&origin, dir.path().join("gone.git")).unwrap();
-        let unsynced = Backend::branches(&mut real)
-            .export(
-                &candidate,
-                &prover,
-                StageTarget::Remote,
-                &BranchStop::default(),
-            )
-            .unwrap_err();
-        assert!(
-            unsynced.why.starts_with("cannot fetch the engine's origin") && unsynced.could_not_run,
-            "{unsynced:?}"
-        );
-        let refused =
-            Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
-        assert!(
-            refused.why.starts_with("cannot fetch the engine's origin") && !refused.could_not_run,
-            "{refused:?}"
-        );
-        std::fs::rename(dir.path().join("gone.git"), &origin).unwrap();
-        let failures: [scanner_tools::Probe; 3] = [
-            |_| Err("engine missing or probe timed out".into()),
-            |_| {
-                let mut out = scanner_tools::test_output();
-                out.stdout = b"unsupported command help".to_vec();
-                Ok(out)
-            },
-            |_| {
-                use std::os::unix::process::ExitStatusExt as _;
-                let mut out = scanner_tools::test_output();
-                out.status = std::process::ExitStatus::from_raw(1 << 8);
-                out.stderr = b"zstd unavailable: restore the supported managed zstd tool".to_vec();
-                Ok(out)
-            },
-        ];
-        for (index, probe) in failures.into_iter().enumerate() {
-            real.scanner_probe = probe;
-            let refusal =
-                Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
-            assert!(refusal.why.starts_with("publication scanner preflight:"));
-            if index == 2 {
-                assert!(
-                    refusal
-                        .detail
-                        .iter()
-                        .any(|line| line.contains("zstd unavailable")
-                            && line.contains("supported managed zstd"))
-                );
-            }
-            assert!(real.scanner_tools.is_none());
-            assert!(
-                real.publish_command(&prover)
-                    .unwrap()
-                    .get_envs()
-                    .any(|(name, value)| name == scanner_tools::ENV && value.is_none())
-            );
-        }
-    }
-
-    /// The fixture generator compiles the clone's working tree, so a clone off the candidate's
-    /// tree is refused before it runs, in the build branch as in the after-cut step.
-    #[cfg(unix)]
-    #[test]
-    fn the_fixture_generator_refuses_a_clone_off_the_candidates_tree() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        crate::ledger::testing::init(
-            &repo,
-            &[
-                ("user.name", "Test"),
-                ("user.email", "test@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ],
-        );
-        let git = GitCli::new(&repo);
-        git.git(&["commit", "--allow-empty", "-qm", "candidate"])
-            .unwrap();
-        let candidate = Candidate {
-            commit: git
-                .git(&["rev-parse", "HEAD"])
-                .unwrap()
-                .stdout_utf8()
-                .trim()
-                .into(),
-            version: "1.0.0".into(),
-            why: "test".into(),
-            bump_from: None,
-            carry: Vec::new(),
-        };
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
-        let prover = Prover {
-            bin,
-            commit: "test".into(),
-            source: "test".into(),
-        };
-        let real = Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
-        let log = dir.path().join("fixtures.log");
-        let off_tree = |refusal: &Refusal| refusal.why.contains("tree and clean");
-        let clean = real.stage_fixtures_run(
-            Step::Qualify,
-            &candidate,
-            &Reservation::default(),
-            &prover,
-            &log,
-        );
-        assert!(!clean.as_ref().is_err_and(off_tree), "{clean:?}");
-        std::fs::write(repo.join("untracked"), "changed").unwrap();
-        let dirty = real
-            .stage_fixtures_run(
-                Step::Qualify,
-                &candidate,
-                &Reservation::default(),
-                &prover,
-                &log,
-            )
-            .unwrap_err();
-        assert!(off_tree(&dirty), "{dirty:?}");
-        assert!(
-            dirty.detail.iter().any(|line| line.contains("untracked")),
-            "{dirty:?}"
-        );
-    }
-
-    /// The stage step's `pub stage` is a child with the prover's bin, handed this cutter only as
-    /// the commit's own build: this test process, never judged at its start, hands none, and
-    /// removes any it inherited. NEGATIVE CONTROL: build the command without
-    /// [`hand_transforms_cutter`], and neither variable is removed.
-    #[test]
-    fn the_stage_step_is_handed_this_cutter_only_as_the_commits_own_build() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(
-            dir.path(),
-            Some(Path::new("/other/publication")),
-            true,
-            false,
-        )
-        .expect("a backend");
-        let prover = Prover {
-            bin: PathBuf::from("/store/trust/9192/bin"),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
-        };
-        let commit = "c".repeat(40);
-        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
-        let (stage, handed) = real
-            .stage_command(&commit, &prover, StageTarget::Remote)
-            .unwrap();
-        assert_eq!(
-            stage.get_program(),
-            std::ffi::OsStr::new("/other/publication/bin/pub")
-        );
-        let args: Vec<_> = stage.get_args().collect();
-        let repo = dir.path().as_os_str();
-        assert_eq!(
-            args,
-            ["stage", "aterm", "--commit", commit.as_str(), "--repo-path"]
-                .map(std::ffi::OsStr::new)
-                .into_iter()
-                .chain([repo])
-                .collect::<Vec<_>>()
-        );
-        let local = real
-            .stage_command(&commit, &prover, StageTarget::Local)
-            .unwrap()
-            .0;
-        let local_args: Vec<_> = local.get_args().collect();
-        let mut expected_local = args.clone();
-        expected_local.push(std::ffi::OsStr::new("--dry-run"));
-        assert_eq!(local_args, expected_local);
-        assert!(!local_args.contains(&std::ffi::OsStr::new("--no-check")));
-        let envs: Vec<_> = stage.get_envs().collect();
-        for kv in [
-            ("PUBLICATION_ENGINE", Some("/other/publication")),
-            ("TRUST_STAGE2_BIN", Some("/store/trust/9192/bin")),
-            (STAGE_APPEND_ONLY_ENV, Some("1")),
-            (RELEASE_CUTTER_ENV, None),
-            (RELEASE_CUTTER_SINCE_ENV, None),
-        ] {
-            let want = (std::ffi::OsStr::new(kv.0), kv.1.map(std::ffi::OsStr::new));
-            assert!(envs.contains(&want), "{kv:?}: {envs:?}");
-        }
-        // Both stage commands stage append-only: the engine's GitHub transport has no forced
-        // write, so the legacy orphan-snapshot replacement refuses at the staging push.
-        let local_envs: Vec<_> = local.get_envs().collect();
-        let append_only = (
-            std::ffi::OsStr::new(STAGE_APPEND_ONLY_ENV),
-            Some(std::ffi::OsStr::new("1")),
-        );
-        assert!(local_envs.contains(&append_only), "{local_envs:?}");
-        assert!(
-            handed.contains("no commit's build")
-                && handed.ends_with("ccccccccc's publish/transforms.sh builds its own"),
-            "{handed}"
-        );
-    }
-
-    /// Frozen tools share verify's main build directory, and only the test-profile verifier
-    /// widens to the workspace test graph. NEGATIVE CONTROL: applying those words to the gate
-    /// cutter would change its compiled feature set.
-    #[test]
-    fn frozen_tools_use_the_main_layout_and_only_verify_uses_the_test_graph() {
-        let repo = Path::new("/release");
-        let layout = "build.build-dir='/cache/build.noindex'";
-        let words = |args: Vec<std::ffi::OsString>| {
-            args.into_iter()
-                .map(|word| word.into_string().unwrap())
-                .collect::<Vec<_>>()
-        };
-        let cutter = words(Real::frozen_tool_args(
-            repo,
-            &FROZEN_CUTTER,
-            "gate",
-            Some(layout),
-        ));
-        let verify = words(Real::frozen_tool_args(
-            repo,
-            &FROZEN_VERIFY,
-            "test",
-            Some(layout),
-        ));
-        assert_eq!(&cutter[..4], ["--config", layout, "--unverified", "build"]);
-        assert!(
-            !cutter
-                .iter()
-                .any(|word| word == aterm_toolchain::build_cache::TEST_GRAPH_FLAG)
-        );
-        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
-        assert_eq!(
-            &verify[..7],
-            [
-                "--config",
-                layout,
-                "--unverified",
-                config,
-                workspace,
-                "build",
-                aterm_toolchain::build_cache::TEST_GRAPH_FLAG
-            ]
-        );
-        for (args, package, profile) in [
-            (&cutter, FROZEN_CUTTER.package, "gate"),
-            (&verify, FROZEN_VERIFY.package, "test"),
-        ] {
-            assert!(args.windows(2).any(|pair| pair == ["--profile", profile]));
-            assert!(args.windows(2).any(|pair| pair == ["-p", package]));
-            assert!(
-                args.windows(2)
-                    .any(|pair| pair == ["--manifest-path", "/release/Cargo.toml"])
-            );
-        }
-    }
-
-    /// A Cargo test binary's release keeps its state, its logs included, below that binary's own
-    /// root ([`release_state`]), never below the person's HOME, whose logs, step times, footprints
-    /// and kept seal the next real release reads (m3's logs held empty run folders this crate's
-    /// tests had made). NEGATIVE CONTROL: resolve the state from HOME alone, and this run's log
-    /// folder is made below the person's.
-    #[test]
-    fn a_test_binarys_release_keeps_its_state_below_its_own_root() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(dir.path(), Some(dir.path()), false, false).expect("a backend");
-        let root = aterm_uds::test_binary::scratch_root().expect("a test binary's root");
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME in tests"));
-        assert_eq!(real.state, root.join(RELEASE_STATE));
-        assert!(
-            real.logs.starts_with(&real.state) && real.logs.is_dir(),
-            "{}",
-            real.logs.display()
-        );
-        assert!(
-            real.logs
-                .starts_with(real.state.join(aterm_tempfile::QUIET).join("logs.noindex"))
-        );
-        assert!(
-            !real.logs.starts_with(home.join(RELEASE_STATE)),
-            "{}",
-            real.logs.display()
-        );
-    }
-
-    /// On macOS a dry run's logs go in its temp root's quiet folder, which fseventsd drops, even
-    /// where that root is heard; elsewhere nothing drops a file event by its path, so they go in
-    /// the root itself ([`aterm_tempfile::quiet_in`]).
-    #[test]
-    fn dry_run_logs_go_quiet_on_macos_even_when_the_callers_temp_root_is_heard() {
-        let root = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
-        assert!(!aterm_tempfile::is_quiet(root.path()));
-        let logs = dry_log_dir(root.path(), 42, 7);
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("operational-status.json"), b"{}").unwrap();
-        let macos = cfg!(target_os = "macos");
-        assert_eq!(aterm_tempfile::is_quiet(&logs), macos);
-        assert!(logs.ends_with("aterm-release-dry-42-7.noindex"));
-        assert_eq!(
-            root.path().join("aterm-release-dry-42-7.noindex").exists(),
-            !macos
-        );
-    }
-
-    /// A handed cutter carries the moment it was judged from, with this process as the one that
-    /// handed it, as the cutter it hands reads it, or none: an inherited one is removed.
-    /// NEGATIVE CONTROL: leave the variable alone when there is no moment, and an inherited one
-    /// reaches the handed cutter.
-    #[test]
-    fn a_handed_cutter_carries_the_moment_it_was_judged_from() {
-        let exe = Path::new("/t/gate/aterm-release");
-        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_793_520_000, 7);
-        let since = |cmd: &Command| {
-            cmd.get_envs()
-                .find(|(k, _)| *k == std::ffi::OsStr::new(RELEASE_CUTTER_SINCE_ENV))
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
-        };
-        let mut cmd = command("/other/publication/bin/pub");
-        hand_this_cutter(&mut cmd, exe, Some(at));
-        let value = crate::cutter::hand_value(at);
-        #[cfg(target_os = "macos")]
-        assert!(
-            value.as_deref().is_some_and(
-                |v| v.starts_with(&format!("1793520000000000007 {} ", std::process::id()))
-            ),
-            "the moment and this process's pid, in nanoseconds: {value:?}"
-        );
-        assert_eq!(
-            since(&cmd),
-            Some(value.map(Into::into)),
-            "handed by this process"
-        );
-        assert!(cmd.get_envs().any(|kv| kv
-            == (
-                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
-                Some(exe.as_os_str())
-            )));
-        let mut cmd = command("/other/publication/bin/pub");
-        hand_this_cutter(&mut cmd, exe, None);
-        assert_eq!(since(&cmd), Some(None), "none, and none inherited");
-    }
-
-    /// A step runs without the cutter or the build-inputs seal this process may have been
-    /// handed: a child has [`RELEASE_CUTTER_ENV`] and [`RELEASE_CUTTER_SINCE_ENV`] only from
-    /// [`hand_this_cutter`] and [`crate::build_inputs::SEAL_ENV`] only from
-    /// [`hand_inputs_seal`] (this process's kept seal, else none), never inherited, and keeps
-    /// what the scrub does not name. NEGATIVE CONTROL: scrub only what [`clears`] and
-    /// [`launcher_env`] name, and all three reach the child.
-    #[test]
-    fn a_step_inherits_no_handed_cutter() {
-        let seal = crate::build_inputs::SEAL_ENV;
-        let mut cmd = command("/usr/bin/true");
-        let inherited = [
-            RELEASE_CUTTER_ENV,
-            RELEASE_CUTTER_SINCE_ENV,
-            seal,
-            "HOME",
-            "RUSTFLAGS",
-        ];
-        scrub_names(&mut cmd, inherited.map(std::ffi::OsString::from));
-        let removed: Vec<_> = cmd
-            .get_envs()
-            .filter(|(_, v)| v.is_none())
-            .map(|(k, _)| k.to_os_string())
-            .collect();
-        assert_eq!(
-            removed,
-            [
-                RELEASE_CUTTER_ENV,
-                RELEASE_CUTTER_SINCE_ENV,
-                seal,
-                "RUSTFLAGS"
-            ]
-        );
-        hand_this_cutter(&mut cmd, Path::new("/t/gate/aterm-release"), None);
-        assert!(cmd.get_envs().any(|kv| kv
-            == (
-                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
-                Some(std::ffi::OsStr::new("/t/gate/aterm-release"))
-            )));
-        let handed = |cmd: &Command| {
-            cmd.get_envs()
-                .find(|(k, _)| *k == std::ffi::OsStr::new(seal))
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
-        };
-        hand_inputs_seal(&mut cmd, None);
-        assert_eq!(handed(&cmd), Some(None), "none kept, none handed");
-        let kept = PathBuf::from("/state/aterm-release/inputs-seal/k.toml");
-        hand_inputs_seal(&mut cmd, Some(kept.clone()));
-        assert_eq!(handed(&cmd), Some(Some(kept.into_os_string())));
-    }
-
-    /// A RELEASE'S OWN FROZEN CUTTER TAKES THE ENGINE SOURCE AND REPOSITORY THE RELEASE CAPTURED:
-    /// the exec hands both ([`hand_engine_capture`]) beside the release's copy as
-    /// `PUBLICATION_ENGINE`, the engine a cutter older than the handover syncs, never the source;
-    /// no other child inherits them ([`scrub_names`]); and the new image (this test binary run with
-    /// the exec's engine handover, `Real::new` reading its environment) takes the release's source
-    /// and holds to its repository ([`engine_authority`]), and hands both to the next image it
-    /// would exec. A source that names another repository since the capture is refused, as is a
-    /// handover from a release that admitted none, with that release's own reason, and either
-    /// refusal is handed on unchanged ([`ENGINE_REPOSITORY_NONE`], [`ENGINE_REPOSITORY_WHY_ENV`]),
-    /// so no later hop adopts what the copy names. NEGATIVE CONTROL: the exec of a release older
-    /// than the handover, which names only the copy, has the image take the copy as its source and
-    /// hold to the other repository the copy names.
-    #[test]
-    fn a_releases_frozen_cutter_takes_the_engine_source_and_repository_it_captured() {
-        const PROBE: &str = "ATERM_RELEASE_ENGINE_CAPTURE_PROBE";
-        const HANDOVER: [&str; 4] = [
-            "PUBLICATION_ENGINE",
-            ENGINE_SOURCE_ENV,
-            ENGINE_REPOSITORY_ENV,
-            ENGINE_REPOSITORY_WHY_ENV,
-        ];
-        let named = |cmd: &Command, name: &str| {
-            cmd.get_envs()
-                .find(|(k, _)| *k == std::ffi::OsStr::new(name))
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
-        };
-        if let Some(repo) = std::env::var_os(PROBE) {
-            let real = Real::new(Path::new(&repo), None, true, false).unwrap();
-            let next = real.cutter_command(Path::new("/usr/bin/true"));
-            let next = |name: &str| {
-                named(&next, name)
-                    .flatten()
-                    .map(|v| v.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            };
-            println!(
-                "PROBE source={} repository={} next_source={} next_repository={} next_why={}",
-                real.engine_source.display(),
-                real.engine_repository
-                    .as_ref()
-                    .map_or_else(|why| format!("refused: {why}"), ToString::to_string),
-                next(ENGINE_SOURCE_ENV),
-                next(ENGINE_REPOSITORY_ENV),
-                next(ENGINE_REPOSITORY_WHY_ENV),
-            );
-            // A dry run removes its scratch logs when it drops, and `exit` runs no destructor.
-            drop(real);
-            std::process::exit(0);
-        }
-        let slug = |s: &str| agh::Slug::parse(s).unwrap();
-        let handed = |s: &str| Some(std::ffi::OsString::from(s));
-        assert_eq!(
-            engine_authority(Ok(slug("foreign/app")), handed(""), handed("no origin")),
-            Ok(slug("foreign/app"))
-        );
-        assert_eq!(
-            engine_authority(
-                Ok(slug("fixture/app")),
-                handed(ENGINE_REPOSITORY_NONE),
-                handed("no origin")
-            ),
-            Err("no origin".to_owned()),
-            "a release that admitted none is refused for its own reason"
-        );
-        for refused in [
-            engine_authority(Ok(slug("foreign/app")), handed("fixture/app"), None),
-            engine_authority(Err("no origin".into()), handed("fixture/app"), None),
-            engine_authority(Ok(slug("fixture/app")), handed("not one repository"), None),
-            engine_authority(
-                Ok(slug("fixture/app")),
-                handed(ENGINE_REPOSITORY_NONE),
-                None,
-            ),
-            engine_authority(
-                Ok(slug("fixture/app")),
-                handed(ENGINE_REPOSITORY_NONE),
-                handed(""),
-            ),
-        ] {
-            assert!(refused.is_err(), "{refused:?}");
-        }
-        let mut inherited = command("/usr/bin/true");
-        let captured = &HANDOVER[1..];
-        scrub_names(
-            &mut inherited,
-            captured.iter().map(std::ffi::OsString::from),
-        );
-        for name in captured {
-            assert_eq!(
-                named(&inherited, name),
-                Some(None),
-                "{name} is not inherited"
-            );
-        }
-
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let checkout = |name: &str, url: &str| {
-            let at = root.join(name);
-            crate::ledger::testing::init(&at, &[]);
-            crate::ledger::git_ok(&GitCli::new(&at), &["remote", "add", "origin", url]).unwrap();
-            at
-        };
-        let source = checkout("publication", "https://github.com/fixture/app.git");
-        let copy = checkout("copy", "https://github.com/foreign/app.git");
-        let moved = checkout("moved", "https://github.com/other/app.git");
-        let repo = root.join("aterm");
-        std::fs::create_dir(&repo).unwrap();
-        let probe = |exec: &Command| {
-            let mut cmd = command(std::env::current_exe().unwrap());
-            cmd.args([
-                "--exact",
-                "release_steps::tests::a_releases_frozen_cutter_takes_the_engine_source_and_repository_it_captured",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PROBE, &repo)
-            .stdin(Stdio::null());
-            for name in HANDOVER {
-                cmd.env_remove(name);
-                if let Some(Some(value)) = named(exec, name) {
-                    cmd.env(name, value);
-                }
-            }
-            let out = cmd.output().unwrap();
-            assert!(out.status.success(), "{out:?}");
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            stdout
-                .lines()
-                .find_map(|line| line.split_once("PROBE ").map(|(_, probe)| probe.to_owned()))
-                .unwrap_or_else(|| panic!("no probe line: {stdout}"))
-        };
-        let (s, c, m) = (source.display(), copy.display(), moved.display());
-
-        let mut real = Real::new(&repo, Some(&source), true, false).unwrap();
-        assert_eq!(real.engine_repository, Ok(slug("fixture/app")));
-        // A real run's engine is its copy; this dry one has none made.
-        real.engine.clone_from(&copy);
-        let cutter = Path::new("/usr/bin/true");
-        let exec = real.cutter_command(cutter);
-        assert_eq!(
-            named(&exec, "PUBLICATION_ENGINE"),
-            Some(Some(copy.clone().into_os_string())),
-            "a cutter older than the handover is named the release's copy, never its source"
-        );
-        assert_eq!(
-            probe(&exec),
-            format!(
-                "source={s} repository=fixture/app next_source={s} next_repository=fixture/app \
-                 next_why="
-            )
-        );
-        assert_eq!(
-            probe(&real.scrubbed(cutter)),
-            format!(
-                "source={c} repository=foreign/app next_source={c} next_repository=foreign/app \
-                 next_why="
-            ),
-            "NEGATIVE CONTROL: the exec of a release older than the handover"
-        );
-        real.engine_source.clone_from(&moved);
-        let why = engine_authority(Ok(slug("other/app")), handed("fixture/app"), None).unwrap_err();
-        assert_eq!(
-            probe(&real.cutter_command(cutter)),
-            format!(
-                "source={m} repository=refused: {why} next_source={m} next_repository=none \
-                 next_why={why}"
-            ),
-            "a source naming another repository since the capture"
-        );
-        real.engine_repository = Err("no origin".into());
-        real.engine_source.clone_from(&copy);
-        assert_eq!(
-            probe(&real.cutter_command(cutter)),
-            format!(
-                "source={c} repository=refused: no origin next_source={c} next_repository=none \
-                 next_why=no origin"
-            ),
-            "a release that admitted none, refused for its own reason"
-        );
-    }
-
-    /// NEGATIVE CONTROL: leaking a launch envelope lets a nested cutter mistake the
-    /// parent's proof or retry budget for its own.
-    #[test]
-    fn only_exec_explicitly_hands_the_freezer_envelope() {
-        let names = [
-            crate::release_tools::RECORD_ENV,
-            crate::release_tools::FREEZER_ENV,
-            crate::release_tools::CONTRACT_ENV,
-            crate::release_tools::REFREEZE_ENV,
-        ];
-        let mut cmd = command("/usr/bin/true");
-        scrub_names(&mut cmd, names.map(std::ffi::OsString::from));
-        for name in names {
-            assert!(
-                cmd.get_envs()
-                    .any(|(key, value)| key == name && value.is_none())
-            );
-        }
-    }
-
-    /// NEGATIVE CONTROL for the scrub above: a child that runs this frozen image (step 7's
-    /// `cut --sign`, step 8's `cut`) gets back the record this process was proved by, and no
-    /// part of the freezer envelope. Without it the copy falls back to a dep-info judgment no
-    /// copy passes: 0.177.0 refused at step 7 on 2026-11-08 ("this aterm-release binary is no
-    /// commit's cutter: cannot read …/aterm-release.d") when only the scrub ran. A cutter that
-    /// was not proved hands no record.
-    #[test]
-    fn a_child_of_this_frozen_image_is_handed_its_proof_and_never_the_envelope() {
-        use crate::release_tools::{CONTRACT_ENV, FREEZER_ENV, RECORD_ENV, REFREEZE_ENV};
-        let names = [RECORD_ENV, FREEZER_ENV, CONTRACT_ENV, REFREEZE_ENV];
-        let exe = Path::new("/release/tools/0a/aterm-release");
-        let record = std::ffi::OsStr::new("/release/cutter.toml");
-
-        let mut proved = command("/usr/bin/true");
-        scrub_names(&mut proved, names.map(std::ffi::OsString::from));
-        hand_cutter_with_proof(&mut proved, exe, None, Some(record.to_owned()));
-        let envs: Vec<_> = proved.get_envs().collect();
-        assert!(
-            envs.contains(&(std::ffi::OsStr::new(RECORD_ENV), Some(record))),
-            "{envs:?}"
-        );
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
-                Some(exe.as_os_str())
-            )),
-            "{envs:?}"
-        );
-        for name in [FREEZER_ENV, CONTRACT_ENV, REFREEZE_ENV] {
-            assert!(
-                envs.contains(&(std::ffi::OsStr::new(name), None)),
-                "{name}: {envs:?}"
-            );
-        }
-
-        let mut built = command("/usr/bin/true");
-        scrub_names(&mut built, names.map(std::ffi::OsString::from));
-        hand_cutter_with_proof(&mut built, exe, None, None);
-        assert!(
-            built
-                .get_envs()
-                .any(|(key, value)| key == RECORD_ENV && value.is_none())
-        );
-    }
-
-    /// Step 1's seal arms keeping in the release state, then takes the seal, whose failure is
-    /// the step's; every child the backend starts (a step or the cut) is handed the kept seal,
-    /// and none while none is kept. CONTROL: off macOS step 1 arms and
-    /// takes nothing. The seal's reports go to the run's transcript, as the cutter's stderr
-    /// reaches no log. NEGATIVE CONTROL: drop the hand-off from [`Real::scrubbed`], the arm
-    /// from [`Real::seal_inputs`], or its transcript, and the children carry no seal, nothing
-    /// is armed, or the cutter's own seal calls go uncounted.
-    #[test]
-    fn step_one_keeps_the_inputs_seal_and_every_child_is_handed_it() {
-        thread_local! {
-            static ARMED: std::cell::RefCell<Vec<(PathBuf, Option<PathBuf>)>> =
-                const { std::cell::RefCell::new(Vec::new()) };
-            static TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        }
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).expect("a backend");
-        real.arm_inputs = |state, log| {
-            ARMED.with(|armed| {
-                armed
-                    .borrow_mut()
-                    .push((state.into(), log.map(Path::to_path_buf)));
-            });
-        };
-        real.build_inputs = || {
-            TAKEN.with(|n| n.set(n.get() + 1));
-            Ok("inputs".into())
-        };
-        let macos = cfg!(target_os = "macos");
-        assert_eq!(real.seal_inputs(), Ok(()));
-        assert_eq!(
-            (
-                ARMED.with(|armed| armed.borrow().clone()),
-                TAKEN.with(std::cell::Cell::get)
-            ),
-            if macos {
-                (
-                    vec![(real.state.clone(), Some(real.logs.join("transcript.log")))],
-                    1,
-                )
-            } else {
-                (Vec::new(), 0)
-            }
-        );
-        assert!(real.state.ends_with(RELEASE_STATE));
-        real.build_inputs = || Err("build input changed while it was hashed: /sdk".into());
-        assert_eq!(
-            real.seal_inputs().is_err(),
-            macos,
-            "a seal that cannot be taken refuses step 1"
-        );
-
-        let seal = |cmd: &Command| {
-            cmd.get_envs()
-                .find(|(k, _)| *k == std::ffi::OsStr::new(crate::build_inputs::SEAL_ENV))
-                .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
-        };
-        let prover = Prover {
-            bin: PathBuf::from("/store/trust/9192/bin"),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
-        };
-        let exe = || Ok(PathBuf::from("/t/gate/aterm-release"));
-        let children = |real: &Real| {
-            [
-                real.child("/usr/bin/true", None),
-                real.cut_command_of(exe(), &["cut".into()], &prover)
-                    .unwrap(),
-            ]
-            .map(|cmd| seal(&cmd))
-        };
-        real.handed_inputs = || None;
-        assert_eq!(children(&real), [None, None], "none kept, none handed");
-        real.handed_inputs = || Some(PathBuf::from("/state/aterm-release/inputs-seal/k.toml"));
-        let kept = Some(std::ffi::OsString::from(
-            "/state/aterm-release/inputs-seal/k.toml",
-        ));
-        assert_eq!(children(&real), [kept.clone(), kept]);
-    }
-
-    #[test]
-    fn a_stage_is_handed_this_cutter_for_its_transforms_only_as_the_commits_own_build() {
-        let (commit, other) = ("c".repeat(40), "d".repeat(40));
-        let exe = || Ok(PathBuf::from("/t/gate/aterm-release"));
-        assert_eq!(
-            transforms_cutter(Ok(commit.as_str()), exe(), &commit),
-            Ok(PathBuf::from("/t/gate/aterm-release"))
-        );
-        let dirty = crate::cutter::NotOwn {
-            why: "its checkout /w has uncommitted cutter sources (Cargo.lock)".into(),
-            fix: String::new(),
-        };
-        for (built, words) in [
-            (Ok(other.as_str()), "the build of ddddddddd, not ccccccccc"),
-            (
-                Err(&dirty),
-                "no commit's build: its checkout /w has uncommitted",
-            ),
-        ] {
-            let why = transforms_cutter(built, exe(), &commit).unwrap_err();
-            assert!(why.contains(words), "{words}: {why}");
-        }
-        let unnamed = transforms_cutter(
-            Ok(commit.as_str()),
-            Err(std::io::Error::other("gone")),
-            &commit,
-        );
-        assert!(
-            unnamed
-                .unwrap_err()
-                .contains("cannot name its own executable (gone)")
-        );
-    }
-
-    #[test]
-    fn a_verbose_step_logs_both_streams_in_the_order_written() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), None, true, true).expect("a backend");
-        let mut cmd = real.child("/bin/sh", None);
-        cmd.args(["-c", "echo one; echo two >&2; echo three; exit 7"]);
-        let ran = real.logged(Step::Sync, &mut cmd);
-        assert_eq!(ran.code, 7, "{ran:?}");
-        let log = std::fs::read_to_string(real.log_path(Step::Sync)).unwrap();
-        let at = |needle: &str| {
-            log.find(needle)
-                .unwrap_or_else(|| panic!("{needle}: {log}"))
-        };
-        assert!(
-            at("one\n") < at("two\n") && at("two\n") < at("three\n"),
-            "{log}"
-        );
-    }
-
-    /// The direct child exits only after its background descendant holds the shared output
-    /// writer. The zero drain grace makes the step cancel immediately, and its witness must say
-    /// the pump is gone before the return. NEGATIVE CONTROL: discarding the pump's join handle
-    /// after the timed receive leaves the witness set until the descendant is released.
-    #[cfg(unix)]
-    #[test]
-    fn a_logged_step_joins_its_pump_when_a_grandchild_holds_the_pipe() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let go = dir.path().join("finish-after-return");
-        let finished = dir.path().join("grandchild-finished");
-        let token = dir.path().join("pump-token");
-        std::fs::write(&token, b"pump-read-before-direct-exit\n").unwrap();
-        let pump_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let real = Real::new(dir.path(), None, true, false).expect("a backend");
-        let log = real.step_log(Step::Sync);
-        let mut cmd = real.child("/bin/sh", None);
-        cmd.arg("-c")
-            .arg(
-                "(token=$(/bin/cat \"$2\"); printf '%s\\n' \"$token\"; \
-                 while [ ! -e \"$0\" ]; do /bin/sleep 0.01; done; : > \"$1\") & \
-                 token=$(/bin/cat \"$2\"); \
-                 while ! /usr/bin/grep -Fq \"$token\" \"$3\"; do /bin/sleep 0.01; done; exit 0",
-            )
-            .arg(&go)
-            .arg(&finished)
-            .arg(&token)
-            .arg(&log);
-        let ran = real.logged_in_with_drain(
-            Logged {
-                step: Step::Sync,
-                log,
-                stream: true,
-                stop: None,
-                push: None,
-                arrivals: false,
-            },
-            &mut cmd,
-            std::time::Duration::ZERO,
-            Some(pump_active.clone()),
-        );
-
-        let active_after_return = pump_active.load(std::sync::atomic::Ordering::SeqCst);
-        std::fs::write(&go, b"go").unwrap();
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the grandchild to finish after the pump assertion",
-            || finished.exists().then_some(()),
-        );
-        assert_eq!(ran.code, 0, "{ran:?}");
-        assert!(!active_after_return, "the output pump survived the return");
-    }
-
-    /// NEGATIVE CONTROLS: treating build-script executions or arbitrary JSON as artifacts
-    /// overcounts compiled units; treating absent freshness as false claims an unobserved
-    /// compile. A fresh build-script executable is still a compiler unit.
-    #[test]
-    fn frozen_compile_counts_only_artifacts_with_observed_freshness() {
-        let output =
-            br#"{"reason":"compiler-artifact","fresh":true,"target":{"kind":["custom-build"]}}
-{"reason":"compiler-artifact","fresh":false}
-{"reason":"compiler-artifact"}
-{"reason":"build-script-executed","fresh":false}
-{"fresh":false}
-not json
-"#;
-        let line = frozen_build_event(
-            "aterm-release",
-            "gate",
-            Some("build.build-dir='fixture'"),
-            output,
-        );
-        let event: aterm_json::Value =
-            aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap();
-        assert_eq!(event["fresh_units"].as_u64(), Some(1));
-        assert_eq!(event["compiled_units"].as_u64(), Some(1));
-        assert_eq!(event["unknown_units"].as_u64(), Some(1));
-        assert_eq!(
-            event["build_layout"].as_str(),
-            Some("build.build-dir='fixture'")
-        );
-    }
-
-    /// Each step child leaves one `step-child-finished` record after its output: its exit, when
-    /// it ran, and the CPU sampled in its descendants (here a
-    /// grandchild that did all the work), with no `outcome`, so a child's exit is never a red.
-    #[cfg(unix)]
-    #[test]
-    fn a_step_child_books_the_cpu_of_what_it_reaped_and_is_no_red() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(dir.path(), None, true, false).expect("a backend");
-        let mut cmd = real.child("/bin/sh", None);
-        cmd.args([
-            "-c",
-            "/bin/sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' & wait; echo done; exit 3",
-        ]);
-        let ran = real.logged(Step::Qualify, &mut cmd);
-        assert_eq!(ran.code, 3, "{ran:?}");
-        let log = std::fs::read_to_string(real.step_log(Step::Qualify)).unwrap();
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"step-child-finished\""))
-            .unwrap_or_else(|| panic!("no record: {log}"));
-        assert!(
-            log.find("done\n").unwrap() < log.find(line).unwrap(),
-            "the record follows the output: {log}"
-        );
-        let event: aterm_json::Value =
-            aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap();
-        assert_eq!(event["step"].as_str(), Some("qualify"), "{event}");
-        assert_eq!(event["exit_code"].as_u64(), Some(3), "{event}");
-        assert!(event.get("outcome").is_none(), "{event}");
-        assert!(
-            event["started_at_unix_ms"].as_u64() <= event["ended_at_unix_ms"].as_u64(),
-            "{event}"
-        );
-        if !event["child_cpu"].is_null() {
-            assert_eq!(
-                event["child_cpu"]["scope"].as_str(),
-                Some("sampled-descendant-processes")
-            );
-            assert!(event["starved_s"].as_f64().is_some(), "{event}");
-        } else {
-            assert!(event["starved_s"].is_null(), "{event}");
-        }
-        assert!(
-            event["program"].as_str().unwrap().starts_with("sh -c"),
-            "{event}"
-        );
-    }
-
-    /// A step child whose output the step reads (the fixture generator, the export dry run)
-    /// is booked as a logged one is, and its output still comes back whole and apart.
-    #[test]
-    fn a_captured_step_child_is_booked_and_keeps_its_output() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let real = Real::new(dir.path(), None, true, false).expect("a backend");
-        let mut cmd = real.child("/bin/sh", None);
-        cmd.args([
-            "-c",
-            "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo out; echo err >&2; exit 4",
-        ]);
-        let (out, record) = real.output_accounted(Step::Qualify, &mut cmd).unwrap();
-        assert_eq!(out.status.code(), Some(4));
-        assert_eq!(
-            (out.stdout.as_slice(), out.stderr.as_slice()),
-            (&b"out\n"[..], &b"err\n"[..])
-        );
-        let event: aterm_json::Value =
-            aterm_json::from_str(record.strip_prefix("release-event: ").unwrap()).unwrap();
-        assert_eq!(event["step"].as_str(), Some("qualify"), "{event}");
-        assert_eq!(event["exit_code"].as_u64(), Some(4), "{event}");
-        assert!(event.get("outcome").is_none(), "{event}");
-        if !event["child_cpu"].is_null() {
-            assert_eq!(
-                event["child_cpu"]["scope"].as_str(),
-                Some("sampled-descendant-processes")
-            );
-            assert!(event["starved_s"].as_f64().is_some(), "{event}");
-        } else {
-            assert!(event["starved_s"].is_null(), "{event}");
-        }
-    }
-
-    /// The publish step's lines are stamped as they arrive, in a side log, even when they are
-    /// not echoed: the split of the engine's time comes from nowhere else.
-    #[cfg(unix)]
-    #[test]
-    fn the_publish_steps_lines_are_stamped_as_they_arrive() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let mut real = Real::new(dir.path(), None, true, false).expect("a backend");
-        real.scratch_logs = false;
-        let mut cmd = real.child("/bin/sh", None);
-        cmd.args([
-            "-c",
-            "echo '== first section'; echo body >&2; echo '== second'",
-        ]);
-        let ran = real.logged(Step::Publish, &mut cmd);
-        real.scratch_logs = true;
-        assert_eq!(ran.code, 0, "{ran:?}");
-        let log = std::fs::read_to_string(real.step_log(Step::Publish)).unwrap();
-        assert!(
-            log.contains("== first section\n") && log.contains("body\n"),
-            "{log}"
-        );
-        let arrivals = std::fs::read_to_string(real.side_log(Step::Publish, "arrivals")).unwrap();
-        let lines: Vec<aterm_json::Value> = arrivals
-            .lines()
-            .map(|l| aterm_json::from_str(l.strip_prefix("release-event: ").unwrap()).unwrap())
-            .collect();
-        assert_eq!(lines.len(), 3, "{arrivals}");
-        assert!(
-            lines
-                .iter()
-                .all(|e| e["event"].as_str() == Some("publish-line")
-                    && e["at_unix_ms"].as_u64().is_some())
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|e| e["line"].as_str() == Some("== second")),
-            "{arrivals}"
-        );
-    }
-
-    /// A signal the release was started ignoring (`nohup`) stays ignored, and every other
-    /// one is caught.
-    #[cfg(unix)]
-    #[test]
-    fn an_inherited_sig_ign_is_kept_and_the_others_are_caught() {
-        const PROBE: &str = "ATERM_RELEASE_SIGNAL_PROBE";
-        const SIG_DFL: usize = 0;
-        const SIG_IGN: usize = 1;
-        unsafe extern "C" {
-            fn signal(sig: i32, handler: usize) -> usize;
-        }
-        if let Some(mode) = std::env::var_os(PROBE) {
-            // SAFETY: SIG_DFL is a disposition, no handler of ours.
-            unsafe {
-                // SIGTERM, which the probe sends itself, at its default action whatever this
-                // test binary was started with: an ignored one stays ignored.
-                signal(interrupt::SIGTERM, SIG_DFL);
-                if mode == "control" {
-                    signal(interrupt::SIGHUP, SIG_DFL);
-                }
-            }
-            interrupt::install();
-            // SAFETY: as above; the disposition read is put straight back.
-            let hup = unsafe {
-                let now = signal(interrupt::SIGHUP, SIG_IGN);
-                signal(interrupt::SIGHUP, now);
-                now
-            };
-            let hup = match hup {
-                SIG_IGN => "ignored",
-                SIG_DFL => "default",
-                _ => "caught",
-            };
-            println!("PROBE hup={hup}");
-            interrupt::send(std::process::id().cast_signed(), interrupt::SIGTERM);
-            let term = aterm_spec::wait::until_within(
-                aterm_spec::wait::MUST_HAPPEN,
-                "the probe's own SIGTERM caught",
-                interrupt::caught,
-            );
-            println!("PROBE term={term}");
-            std::process::exit(0);
-        }
-        let probe = |nohup: bool, mode: &str| {
-            let exe = std::env::current_exe().unwrap();
-            let mut cmd = if nohup {
-                let mut cmd = command(aterm_uds::os_path!("nohup"));
-                cmd.arg(exe);
-                cmd
-            } else {
-                command(exe)
-            };
-            cmd.args([
-                "--exact",
-                "release_steps::tests::an_inherited_sig_ign_is_kept_and_the_others_are_caught",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PROBE, mode);
-            // Its stdin closed, within twice the hang detector: the probe's own detector says
-            // first what never came.
-            let out =
-                aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN * 2)
-                    .expect("hang detector: the probe never ended");
-            assert!(out.status.success(), "{out:?}");
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        let kept = probe(true, "nohup");
-        assert!(kept.contains("PROBE hup=ignored"), "{kept}");
-        assert!(kept.contains("PROBE term=15"), "{kept}");
-        let control = probe(false, "control");
-        assert!(control.contains("PROBE hup=caught"), "{control}");
-        assert!(control.contains("PROBE term=15"), "{control}");
-    }
-
-    #[test]
-    fn kept_audit_rows_go_back_in_time_order() {
-        let text = "{\"at\":\"1\"}\n{\"at\":\"3\"}\n";
-        let kept = vec!["{\"at\":\"2\"}".to_string(), "{\"at\":\"3\"}".to_string()];
-        assert_eq!(
-            audit_rows_merged(text, &kept),
-            "{\"at\":\"1\"}\n{\"at\":\"2\"}\n{\"at\":\"3\"}\n"
-        );
-        assert_eq!(local_stamp(0, 0), "19700101T000000");
-        assert_eq!(local_stamp(1_792_627_200, 7200), "20261022T020000");
-        assert_eq!(local_stamp(1_792_627_200, -27_000), "20261021T163000");
-        let (pdt, pst, fall_back) = (-7 * 3600, -8 * 3600, 1_793_523_600);
-        let zone = |t: i64| Some(if t < fall_back { pdt } else { pst });
-        assert_eq!(hms_local(1_793_518_200, zone), "00:30:00");
-        assert_eq!(hms_local(1_793_527_200, zone), "02:00:00");
-        assert_eq!(
-            hms_local(1_793_527_200, |_| Some(pdt)),
-            "03:00:00",
-            "NEGATIVE CONTROL: start-of-run offset shifts post-change step times by an hour"
-        );
-        assert!(clears("RUSTFLAGS") && clears("CARGO_TARGET_DIR") && !clears("PATH"));
-        for name in [
-            "CARGO",
-            "CARGO_PKG_NAME",
-            "TARGO_MANIFEST_DIR",
-            "TRUST_TARGO_FRONTEND",
-        ] {
-            assert!(launcher_env(name), "{name}");
-        }
-        assert!(!launcher_env("CARGO_HOME") && !launcher_env("HOME"));
-    }
-
-    #[cfg(unix)]
-    mod nested_lock_files {
-        use super::*;
-
-        const NESTED_LOCK_BEFORE: &str = "version = 4\n\n[[package]]\nname = \"aterm-local\"\nversion = \"0.147.0\"\n\n[[package]]\nname = \"registry\"\nversion = \"0.147.0\"\nsource = \"registry+https://example.invalid/index\"\n";
-        const NESTED_LOCK_AFTER: &str = "version = 4\n\n[[package]]\nname = \"aterm-local\"\nversion = \"0.148.0\"\n\n[[package]]\nname = \"registry\"\nversion = \"0.147.0\"\nsource = \"registry+https://example.invalid/index\"\n";
-
-        fn ordinary_nested_bump(repo: &Path) {
-            let parent = repo.join("ordinary");
-            std::fs::create_dir_all(&parent).unwrap();
-            std::fs::write(parent.join("Cargo.lock"), NESTED_LOCK_BEFORE).unwrap();
-            assert_eq!(
-                bump_nested_locks(
-                    repo,
-                    Ok(vec!["ordinary/Cargo.lock".into()]),
-                    "0.147.0",
-                    "0.148.0"
-                )
-                .unwrap(),
-                ["ordinary/Cargo.lock"]
-            );
-            assert_eq!(
-                std::fs::read_to_string(parent.join("Cargo.lock")).unwrap(),
-                NESTED_LOCK_AFTER,
-                "the local package moves and the registry version stays"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn nested_lock_bumps_refuse_aliases_without_touching_their_payloads() {
-            use std::os::unix::fs::MetadataExt as _;
-
-            let mut outcomes = Vec::new();
-            for kind in ["symlink", "hardlink"] {
-                let scratch = aterm_tempfile::tempdir().unwrap();
-                let home = scratch.path().canonicalize().unwrap();
-                let repo = home.join("repo");
-                ordinary_nested_bump(&repo);
-                std::fs::create_dir(repo.join("nested")).unwrap();
-                let payload = home.join("outside-repo.lock");
-                let alias = repo.join("nested/Cargo.lock");
-                std::fs::write(&payload, NESTED_LOCK_BEFORE).unwrap();
-                if kind == "symlink" {
-                    std::os::unix::fs::symlink(&payload, &alias).unwrap();
-                } else {
-                    std::fs::hard_link(&payload, &alias).unwrap();
-                }
-                let identity = |path: &Path| {
-                    let meta = std::fs::symlink_metadata(path).unwrap();
-                    (meta.dev(), meta.ino(), meta.nlink())
-                };
-                let before = identity(&alias);
-                let result = bump_nested_locks(
-                    &repo,
-                    Ok(vec!["nested/Cargo.lock".into()]),
-                    "0.147.0",
-                    "0.148.0",
-                );
-                outcomes.push((
-                    kind,
-                    result.is_err(),
-                    identity(&alias) == before,
-                    std::fs::read_to_string(&payload).unwrap() == NESTED_LOCK_BEFORE,
-                ));
-            }
-            assert!(
-                outcomes
-                    .iter()
-                    .all(|(_, refused, kept, untouched)| *refused && *kept && *untouched),
-                "each alias must be refused and retain its external payload: {outcomes:?}"
-            );
-        }
-
-        #[test]
-        fn nested_lock_refusals_preserve_every_target_before_publication() {
-            let mut outcomes = Vec::new();
-            for kind in ["invalid-utf8", "missing", "directory", "listing-refused"] {
-                let scratch = aterm_tempfile::tempdir().unwrap();
-                let repo = scratch.path().canonicalize().unwrap();
-                ordinary_nested_bump(&repo);
-                std::fs::create_dir(repo.join("good")).unwrap();
-                std::fs::write(repo.join("good/Cargo.lock"), NESTED_LOCK_BEFORE).unwrap();
-                std::fs::create_dir(repo.join("unknown")).unwrap();
-                match kind {
-                    "invalid-utf8" => {
-                        std::fs::write(repo.join("unknown/Cargo.lock"), [0xff]).unwrap()
-                    }
-                    "directory" => std::fs::create_dir(repo.join("unknown/Cargo.lock")).unwrap(),
-                    "missing" | "listing-refused" => {}
-                    _ => unreachable!(),
-                }
-                let listing = if kind == "listing-refused" {
-                    Err("inert git enumeration refusal".to_owned())
-                } else {
-                    Ok(vec!["good/Cargo.lock".into(), "unknown/Cargo.lock".into()])
-                };
-                let result = bump_nested_locks(&repo, listing, "0.147.0", "0.148.0");
-                outcomes.push((
-                    kind,
-                    result.is_err(),
-                    std::fs::read_to_string(repo.join("good/Cargo.lock")).unwrap()
-                        == NESTED_LOCK_BEFORE,
-                ));
-            }
-            assert!(
-                outcomes
-                    .iter()
-                    .all(|(_, refused, unchanged)| *refused && *unchanged),
-                "unknown evidence must stop the batch before any target changes: {outcomes:?}"
-            );
-        }
-    }
-
-    /// The bump moves a nested lock's path crates with the root's and leaves a
-    /// registry crate that happens to share the old version where it was.
-    #[test]
-    fn a_nested_lock_follows_the_bump_in_its_path_crates_only() {
-        use super::lock_follows_bump;
-        let lock = "version = 4\n\n[[package]]\nname = \"aterm-font\"\nversion = \"0.147.0\"\n\
-                    dependencies = [\n \"aterm-hash\",\n]\n\n[[package]]\nname = \"lookalike\"\n\
-                    version = \"0.147.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-                    checksum = \"00\"\n\n[[package]]\nname = \"astream-wire\"\nversion = \"0.2.0\"\n\n\
-                    [[package]]\nname = \"aterm-hash\"\nversion = \"0.147.0\"\n";
-        let moved = lock_follows_bump(lock, "0.147.0", "0.148.0").expect("two path crates move");
-        assert_eq!(
-            moved,
-            lock.replacen(
-                "name = \"aterm-font\"\nversion = \"0.147.0\"",
-                "name = \"aterm-font\"\nversion = \"0.148.0\"",
-                1
-            )
-            .replacen(
-                "name = \"aterm-hash\"\nversion = \"0.147.0\"",
-                "name = \"aterm-hash\"\nversion = \"0.148.0\"",
-                1
-            )
-        );
-        assert!(moved.contains("name = \"lookalike\"\nversion = \"0.147.0\""));
-        assert_eq!(lock_follows_bump(lock, "0.107.0", "0.148.0"), None);
-        let crlf = "[[package]]\r\nname = \"aterm-uds\"\r\nversion = \"0.147.0\"\r\n";
-        assert_eq!(
-            lock_follows_bump(crlf, "0.147.0", "0.148.0").as_deref(),
-            Some("[[package]]\r\nname = \"aterm-uds\"\r\nversion = \"0.148.0\"\r\n")
-        );
-        let ambiguous = "[[package]]\nname = \"leaf\"\nversion = \"0.147.0\"\n\n[[package]]\nname = \"user\"\nversion = \"0.0.0\"\ndependencies = [\n \"leaf 0.147.0\",\n \"leaf 0.147.0 (registry+https://example.invalid/index)\",\n]\n";
-        assert_eq!(
-            lock_follows_bump(ambiguous, "0.147.0", "0.148.0").unwrap(),
-            ambiguous
-                .replacen("version = \"0.147.0\"", "version = \"0.148.0\"", 1)
-                .replacen("\"leaf 0.147.0\"", "\"leaf 0.148.0\"", 1)
-        );
-    }
-}
+#[path = "release_steps_tests.rs"]
+mod tests;

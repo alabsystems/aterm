@@ -356,7 +356,7 @@ impl GlassInks {
     #[inline]
     pub const fn hero(&self, k: f32) -> u32 {
         match self.key.palette {
-            Some(palette) => palette.hero_on(k, self.key.ground),
+            Some(palette) => palette.hero_with_polarity(k, self.key.ground, self.dark),
             None => self.lit,
         }
     }
@@ -368,7 +368,7 @@ impl GlassInks {
     #[inline]
     pub const fn letter(&self, t: f32) -> u32 {
         match self.key.palette {
-            Some(palette) => palette.letter_on(t, self.key.ground),
+            Some(palette) => palette.letter_with_polarity(t, self.key.ground, self.dark),
             None => self.lit,
         }
     }
@@ -428,6 +428,56 @@ impl GlassInks {
     pub const fn warn(&self) -> u32 {
         self.warn
     }
+
+    /// How a cell of a footer element reads under the pointer or the keyboard's selection
+    /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.5), the one place the look is
+    /// decided: every element a click acts on is painted from it, and nothing else is. `rest` is
+    /// the ink the cell wears at rest.
+    ///
+    /// Words take [`Self::lit`], whatever their column and their ink at rest, and a warning's
+    /// keep [`Self::warn`]; both are underlined in the lit ink, so one line of one ink runs from
+    /// the element's first glyph to its last under the blanks between them too. A chart keeps
+    /// the inks it reads by and takes no line: under an eighth-block level a line reads as a
+    /// second level. The weight is never changed, so no width and no fit moves with the pointer.
+    #[must_use]
+    #[inline]
+    pub const fn hovered(&self, rest: u32, part: HoverPart) -> Hovered {
+        match part {
+            HoverPart::Text => Hovered {
+                fg: self.lit,
+                underline: Some(self.lit),
+            },
+            HoverPart::Warn => Hovered {
+                fg: self.warn,
+                underline: Some(self.lit),
+            },
+            HoverPart::Chart => Hovered {
+                fg: rest,
+                underline: None,
+            },
+        }
+    }
+}
+
+/// What a cell of a hovered footer element is ([`GlassInks::hovered`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoverPart {
+    /// A glyph of its words or its mark, or a blank between two of them.
+    Text,
+    /// A glyph of a warning (`╳`, `⧗`, `$` and their words).
+    Warn,
+    /// A cell of a chart.
+    Chart,
+}
+
+/// A hovered cell's paint ([`GlassInks::hovered`]): its ink, and the ink of the single underline
+/// it takes, `None` for no line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hovered {
+    /// The cell's ink (`0x00RRGGBB`).
+    pub fg: u32,
+    /// The underline's ink.
+    pub underline: Option<u32>,
 }
 
 /// `start` moved toward white (`light`) or black in [`TOWARD_STEPS`] steps until `meets` holds,
@@ -446,8 +496,9 @@ fn toward(start: u32, light: bool, meets: impl Fn(u32) -> bool) -> u32 {
 /// ([`clearest`]).
 fn warm(palette: CardPalette, t: f32, ground: u32, dark: bool) -> u32 {
     clearest(
-        palette.letter_on(t, ground),
-        (1..=WARN_STEPS).map(|k| palette.letter_on(t + f32::from(k) * WARN_STEP, ground)),
+        palette.letter_with_polarity(t, ground, dark),
+        (1..=WARN_STEPS)
+            .map(|k| palette.letter_with_polarity(t + f32::from(k) * WARN_STEP, ground, dark)),
         |c| status_gap(c, dark),
     )
 }

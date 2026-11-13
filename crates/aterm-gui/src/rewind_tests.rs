@@ -761,7 +761,7 @@ fn a_capture_reads_a_rewound_pane_as_not_live_and_presents_no_pet_over_it() {
     use std::time::{Duration, Instant};
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.windows.get_mut(&WID).expect("window").focused = true;
     app.recompute_sparkle();

@@ -113,7 +113,7 @@ fn claim_volumes(claims: &[Record], read: Option<&Volume>) -> Vec<Volume> {
             continue;
         }
         tried.push(mount);
-        if let Some(v) = Live.read(Some(mount)).volume.filter(|v| v.mount == mount) {
+        if let Some(v) = Live.volume(mount).filter(|v| v.mount == mount) {
             out.push(v);
         }
     }

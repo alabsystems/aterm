@@ -90,6 +90,29 @@ impl World {
         }
     }
 
+    /// What the store says of row `one`'s login as the roster binds it now.
+    fn word(&self) -> accounts::Auth {
+        let roster = self.seat().bound_roster(Cli::Agy).unwrap();
+        let row = roster.row("one").unwrap();
+        let (state, _) = self.seat().store(Cli::Agy).load(NOW + 2).unwrap();
+        state.account("one").current_auth(row)
+    }
+
+    /// The ledger's `auth signed-out` rows of row `one`.
+    fn signed_out_rows(&self) -> usize {
+        self.seat()
+            .store(Cli::Agy)
+            .tail(64)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.kind == accounts::Kind::Auth
+                    && event.account == "one"
+                    && event.why == "signed-out"
+            })
+            .count()
+    }
+
     fn prepare(&self) -> Result<Option<GooglePoolWorker>, String> {
         prepare_google_worker_with(&self.seat(), self.starter(), |row, profile| {
             Ok(agy_signin::published_fixture(
@@ -388,6 +411,17 @@ fn native_google_worker_renews_a_signed_out_row_once_in_new_home() {
         );
         assert_eq!(checks.get(), if scenario == 2 { 1 } else { 2 });
         assert_eq!(renewals.get(), 1);
+        // Only the renewed login a second check found signed out is on the row's record so.
+        assert_eq!(
+            world.word(),
+            if scenario == 1 {
+                accounts::Auth::SignedOut
+            } else {
+                accounts::Auth::Ok
+            },
+            "scenario {scenario}"
+        );
+        assert_eq!(world.signed_out_rows(), usize::from(scenario == 1));
         if scenario == 1 {
             assert!(
                 matches!(result, Err(super::super::worker::Refused::SignedOut(_))),
@@ -473,6 +507,42 @@ fn native_google_worker_failed_renewal_never_rechecks_or_launches() {
     );
     assert!(result.is_err());
     assert_eq!(checks.get(), 1);
+}
+
+/// A LAUNCH THAT ENDS REFUSED ON A MISSING GRANT LEAVES ITS ROW SIGNED OUT ON THE RECORD, ONCE:
+/// whatever the renewal it started came to (refused, held, deferred, a bot check), the grant the
+/// check found missing is still missing, so the row's word, its ledger and the journal say so,
+/// and a second launch writes nothing more.
+/// CONTROL: a launch refused for a reason that is no sign-out (its profile is held) leaves the
+/// store as it was; a launch whose renewal took is the test above.
+#[test]
+fn a_launch_refused_on_a_missing_grant_records_its_row_signed_out_once() {
+    let world = World::new(Some([1; 32]));
+    let before = world.seat().store(Cli::Agy).load(NOW).unwrap().0;
+    let held = recover_google_worker_with(
+        &world.seat(),
+        world.starter(),
+        |_, _| Err(agy_signin::PublishedRefusal::Refused("profile is held")),
+        |_, _| panic!("a refusal that is no sign-out reached authentication"),
+    );
+    assert!(held.is_err());
+    assert_eq!(
+        world.seat().store(Cli::Agy).load(NOW).unwrap().0,
+        before,
+        "CONTROL: no sign-out, nothing written"
+    );
+    assert_eq!(world.word(), accounts::Auth::Ok);
+    for launch in 0..2 {
+        let result = recover_google_worker_with(
+            &world.seat(),
+            world.starter(),
+            |_, _| Err(agy_signin::PublishedRefusal::SignedOut),
+            |_, _| Err("staged login refused".into()),
+        );
+        assert!(result.is_err());
+        assert_eq!(world.word(), accounts::Auth::SignedOut, "launch {launch}");
+        assert_eq!(world.signed_out_rows(), 1, "launch {launch}");
+    }
 }
 
 /// A launch on a row whose published grant is gone runs the real local check: it answers signed

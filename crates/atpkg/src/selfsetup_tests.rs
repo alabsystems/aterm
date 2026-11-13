@@ -1167,6 +1167,60 @@ fn an_uninstall_helper_is_selected_only_from_an_identified_aterm_bundle() {
 }
 
 #[test]
+fn a_store_install_sweeps_its_toolchain_and_keeps_the_helper_on_failure() {
+    for (identity, code, dry) in [
+        ("aterm", 0, false),
+        ("aterm", 1, false),
+        ("aterm", 126, false),
+        ("aterm", 0, true),
+        ("foreign", 0, false),
+    ] {
+        let account = Account::new("store-toolchain");
+        let program = account.places.store_dir.join("aterm");
+        let log = account.dir.join("toolchain-sweep");
+        exe(
+            &program,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '{identity} 0'; exit 0; }}\n\
+                 if [ \"$*\" = 'pkg uninstall --all' ]; then echo swept >'{}'; exit {code}; fi\n\
+                 exit 1\n",
+                log.display()
+            ),
+        );
+        aterm_spec::wait::first_exec(&program, &["--version"]);
+        let (_, out, err) = account.sweep(None, dry);
+        assert_eq!(log.exists(), identity == "aterm" && !dry, "{out}\n{err}");
+        assert_eq!(
+            program.exists(),
+            dry || code != 0 || identity != "aterm",
+            "{out}\n{err}"
+        );
+        if dry {
+            assert!(out.contains("pkg uninstall --all"), "{out}\n{err}");
+        }
+    }
+}
+
+#[test]
+fn an_uninstall_does_not_ask_a_path_directory_as_a_private_store() {
+    let mut account = Account::new("store-is-path");
+    account.places.bin_dir = account.places.store_dir.clone();
+    let log = account.dir.join("asked");
+    exe(
+        &account.places.store_dir.join("aterm"),
+        &format!(
+            "#!/bin/sh\necho asked >'{}'\necho 'aterm 0'\n",
+            log.display()
+        ),
+    );
+    assert!(uninstall_helper(&account.places).is_none());
+    assert!(
+        !log.exists(),
+        "a refused store never executes its candidate"
+    );
+}
+
+#[test]
 fn a_desktop_write_preserves_a_preexisting_staging_file_or_link() {
     let mut preserved = Vec::new();
     for linked in [false, true] {
@@ -1924,6 +1978,34 @@ fn a_dry_run_of_the_mugs_files_says_what_the_real_one_does() {
         "a lone lock: {out}"
     );
     assert!(!out.contains("left old Caffeine lock"), "{out}");
+}
+
+/// The setup login job's definition runs the aterm an uninstall removes: the sweep names it in a
+/// dry run and removes it in a real one, and leaves another label's. Before, it stayed, and
+/// launchd started a program that was gone at every login.
+#[test]
+fn an_uninstall_removes_the_setup_login_job() {
+    let a = Account::new("setup-job");
+    let agents = a.home().join("Library/LaunchAgents");
+    let job = agents.join(format!(
+        "{}.plist",
+        aterm_types::macos_setup::SETUP_RESUME_LABEL
+    ));
+    let other = agents.join("systems.alab.aterm-setup-other.plist");
+    for plist in [&job, &other] {
+        write(plist, "<plist/>");
+    }
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!("would remove setup login item: {}", job.display())),
+        "{out}"
+    );
+    assert!(job.is_file(), "a dry run keeps it");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(!job.exists(), "{out}");
+    assert!(other.is_file(), "another label's: {out}");
 }
 
 #[test]
@@ -2702,7 +2784,7 @@ fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
         let (ok, out, err) = a.sweep(None, false);
         assert_eq!(
             std::fs::read_to_string(&log).expect("the store's aterm was asked"),
-            "help acaffeine\nacaffeine startup off\nacaffeine quit\n",
+            "pkg uninstall --all\nhelp acaffeine\nacaffeine startup off\nacaffeine quit\n",
             "{out}{err}"
         );
         assert_eq!(ok, !fails, "{out}{err}");

@@ -81,3 +81,8 @@ workspace = true
 [[test]]
 name = "agh_suite"
 path = "tests/agh_suite.rs"
+
+[[test]]
+name = "helper_image"
+path = "tests/helper_image.rs"
+harness = false

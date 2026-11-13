@@ -9,18 +9,32 @@
 //! ## Application termination
 //!
 //! This fork installs its own `NSApplicationDelegate` to deliver application lifecycle events.
-//! Keep that delegate in place. To decide whether AppKit may terminate the application,
-//! register a callback with [`set_application_should_terminate_handler`]. It runs on the main
-//! thread; returning `false` cancels termination. Only the first registration takes effect.
+//! Keep that delegate in place. To decide what AppKit hears when it asks whether the application
+//! may terminate, register a callback with [`set_application_should_terminate_handler`]. It runs
+//! on the main thread, is told whether a reply could come from AppKit's wait ([`ReplyWait`]), and
+//! answers a [`TerminateAnswer`]. Only the first registration takes effect.
+//!
+//! A quit the application takes up ([`TerminateAnswer::Later`]) is answered once: YES when the
+//! event loop next exits, after its `LoopExiting` (in which the application does its shutdown,
+//! since inside AppKit's `terminate:` `run_app` never returns: [`exit_ends_in_appkit`]), or NO
+//! from [`refuse_deferred_termination`]. A logout, restart or shutdown goes on after the YES and
+//! is abandoned after the NO. A `Later` to an ask [`ReplyWait::Unanswerable`] describes (AppKit
+//! asking from inside the application's own handler) is refused instead, since no reply to it
+//! could come.
 //!
 //! ```no_run
-//! use aterm_window::platform::macos::set_application_should_terminate_handler;
+//! use aterm_window::platform::macos::{
+//!     set_application_should_terminate_handler, ReplyWait, TerminateAnswer,
+//! };
 //!
-//! fn allow_termination() -> bool {
-//!     true
+//! fn take_up_the_quit(wait: ReplyWait) -> TerminateAnswer {
+//!     match wait {
+//!         ReplyWait::Answerable => TerminateAnswer::Later,
+//!         ReplyWait::Unanswerable => TerminateAnswer::Cancel,
+//!     }
 //! }
 //!
-//! set_application_should_terminate_handler(allow_termination);
+//! set_application_should_terminate_handler(take_up_the_quit);
 //! ```
 
 use crate::event::InputOrigin;
@@ -28,6 +42,8 @@ use crate::event_loop::EventLoopBuilder;
 use crate::keyboard::ModifiersState;
 use crate::monitor::MonitorHandle;
 use crate::window::Window;
+
+pub use crate::platform_impl::{ReplyWait, TerminateAnswer};
 
 /// Complete AppKit launch before entering the application's event loop.
 ///
@@ -44,10 +60,29 @@ impl<T: 'static> EventLoopExtMacOS for crate::event_loop::EventLoop<T> {
     }
 }
 
-/// Register a handler consulted on the main thread before AppKit terminates the application.
+/// Register the handler that answers AppKit's `applicationShouldTerminate:` on the main thread.
 #[inline]
-pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
+pub fn set_application_should_terminate_handler(handler: fn(ReplyWait) -> TerminateAnswer) {
     crate::platform_impl::set_quit_confirm_hook(handler);
+}
+
+/// Refuse the quit AppKit waits on (a [`TerminateAnswer::Later`]): it hears NO, once, and a
+/// logout, restart or shutdown it stood for is abandoned. False, with nothing sent, when AppKit
+/// waits on no reply, as on any thread but the main one, and while the event loop's exit is
+/// delivered inside AppKit ([`exit_ends_in_appkit`]): that exit ends the process, so AppKit hears
+/// YES after it whatever is cancelled in it.
+#[inline]
+pub fn refuse_deferred_termination() -> bool {
+    crate::platform_impl::refuse_deferred_termination()
+}
+
+/// Whether the event loop's exit being delivered now (`ApplicationHandler::exiting`) happens
+/// inside AppKit's `terminate:`, which ends the process when it returns: after a deferred quit's
+/// exit, AppKit hears YES, and after `applicationWillTerminate:` it exits by itself. `run_app`
+/// never returns then, so what the application does after it must be done in `exiting`.
+#[inline]
+pub fn exit_ends_in_appkit() -> bool {
+    crate::platform_impl::exit_ends_in_appkit()
 }
 
 /// The original native key, modifier or mouse event before Option handling or input-method

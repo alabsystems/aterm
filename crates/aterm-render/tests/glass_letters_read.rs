@@ -3,8 +3,8 @@
 //
 // The theme fg's letters over Prism Glass's light glass as the trail census reads them
 // (`docs/design/PRISM-GLASS.md` §15.8 amendment 49): every printable ASCII glyph of the window's
-// face at the window's size (`Renderer::from_system`'s: SF Mono on macOS, the bundled JetBrains
-// Mono elsewhere, at 24 px, a 12 pt font at scale 2, its cells 28 px tall for SF Mono), set in each
+// face at the window's size (`Renderer::from_system`'s: SF Mono on macOS, the bundled primary
+// elsewhere, Iosevka Term NL on Windows and JetBrains Mono on Linux, at 24 px, a 12 pt font at scale 2, its cells 28 px tall for SF Mono), set in each
 // shipped glass page's theme fg with each of its glass129 entries as the ground and with the page
 // as its clean twin, judged as `aterm-lab trail-census` judges a frame's glyph minimum: each solid
 // ink pixel of the twin (its contrast at least `SOLID_SHARE` of its glyph's extreme's against the
@@ -90,7 +90,7 @@ pub const fn text_row(k: usize) -> usize {
 
 impl Sheet {
     /// `fg` set on page `bg` over each of `grounds`, at `px` in the window's face
-    /// ([`Renderer::from_system`]: SF Mono on macOS, the bundled JetBrains Mono elsewhere).
+    /// ([`Renderer::from_system`]: SF Mono on macOS, the bundled primary elsewhere).
     pub fn new(px: f32, fg: u32, bg: u32, grounds: &[u32]) -> Self {
         let mut rend = Renderer::from_system(px, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature");
@@ -394,8 +394,9 @@ fn a_glass_solved_to_the_bare_fg_holds_a_letter_under_its_bar() {
 }
 
 /// The window's face, by the identity [`Renderer::from_system`] resolves
-/// ([`aterm_render::default_primary_identity`]: SF Mono's file on macOS, the bundled JetBrains
-/// Mono elsewhere) and its bytes.
+/// ([`aterm_render::default_primary_identity`]: SF Mono's file on macOS, elsewhere the bundled
+/// primary, [`aterm_render::bundled::PRIMARY_ID`]: Iosevka Term NL on Windows, JetBrains
+/// Mono on Linux) and its bytes.
 fn window_face() -> (FaceRef, Vec<u8>) {
     let face = aterm_render::default_primary_identity().expect("the window's face resolves");
     let bytes = aterm_render::read_resolved_font(&face.path)
@@ -406,7 +407,7 @@ fn window_face() -> (FaceRef, Vec<u8>) {
 
 /// The window's face at `px`, built as [`Renderer::from_system`] builds it: by its identity, so
 /// its bold comes from the face's own bold sibling where it has one (the bundled
-/// JetBrainsMono-Bold), not from a synthesized emboldening.
+/// JetBrainsMono-Bold; Iosevka Term NL's Bold), not from a synthesized emboldening.
 fn window_renderer(face: &FaceRef, bytes: &[u8], px: f32) -> Renderer {
     Renderer::from_resolved_font_file(face.clone(), bytes, px, Theme::default())
         .expect("the window's face")
@@ -456,13 +457,17 @@ fn swept(face: &FaceRef, bytes: &[u8], px: f32, line_height: f32) -> Vec<(f32, f
 /// [`window_renderer`]) at every whole px from 10 to 48 and at line heights 1.0, 1.1 and 1.2, on
 /// every shipped glass page. Where its thin share in the page's fg on its page is at most
 /// [`colour::THIN_INK_SHARE`], the page's glass draws, and the census's glyph minimum over its
-/// [`SWEPT_ENTRIES`] least-seen entries keeps [`GLASS_BAR`]; a 12 pt window at scale 1 (12 px)
+/// [`SWEPT_ENTRIES`] least-seen entries keeps [`GLASS_BAR`]. A 12 pt window at scale 1 (12 px)
 /// and the Settings card at scale 1 (14 px) are refused, and a 12 pt window at scale 2 (24 px)
-/// admitted on every page. The face built by its identity is the one `Renderer::from_system`
-/// draws (their glyph ink, regular and bold, is one). Negative control: a size the rule refuses
-/// holds a glyph under [`GLASS_BAR`] on a page, though its cells are at least 24 px tall, which a
-/// rule keyed on the cells' height admitted (amendment 50's; SF Mono at 26 px, whose `_` lays no
-/// row near the full ink). Each size's shares and minima print with `--nocapture`.
+/// admitted on every page, on Windows' Iosevka Term NL, hinted, as well (on page 0 a thin share
+/// of 0.0224 at 14 px and 0.0000 at 24 px); at its default 17 px it lays 0.0039 there, so page
+/// 0's glass draws, and keeps the bar at 5.37. The face built by its identity is the one
+/// `Renderer::from_system` draws (their glyph ink, regular and bold, is one). Negative control:
+/// a size the rule refuses holds a glyph under [`GLASS_BAR`] on a page (Iosevka Term NL's 10 px,
+/// its `` ` `` at 2.35), and off Windows one does though its cells are at least 24 px tall, which
+/// a rule keyed on the cells' height admitted (amendment 50's; SF Mono at 26 px, whose `_` lays
+/// no row near the full ink; every size at which Iosevka Term NL holds a glyph under the bar lays
+/// cells under 24 px). Each size's shares and minima print with `--nocapture`.
 #[test]
 fn the_glass_draws_where_the_windows_face_lays_its_letters_full() {
     let (face, bytes) = window_face();
@@ -496,9 +501,11 @@ fn the_glass_draws_where_the_windows_face_lays_its_letters_full() {
                         "{px} px x{line_height}: page {k} admitted at {thin:.4} holds '{glyph}' \
                          at {min:.4}"
                     );
-                } else if min < GLASS_BAR && cells >= 24 {
-                    refused_under.push((px, line_height, k, thin, min, glyph));
+                } else if min < GLASS_BAR {
+                    refused_under.push((px, line_height, cells, k, thin, min, glyph));
                 }
+                // The window's and the Settings card's sizes, measured on SF Mono, JetBrains
+                // Mono and Iosevka Term NL.
                 if line_height == 1.0 {
                     match px {
                         12 | 14 => assert!(!admitted, "{px} px: page {k} at {thin:.4}"),
@@ -509,9 +516,14 @@ fn the_glass_draws_where_the_windows_face_lays_its_letters_full() {
             }
         }
     }
-    println!("refused, under the bar, on cells of 24 px or more: {refused_under:?}");
+    println!("refused, under the bar: {refused_under:?}");
     assert!(
         !refused_under.is_empty(),
+        "negative control: no size the rule refuses loses a letter"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        refused_under.iter().any(|r| r.2 >= 24),
         "negative control: no size the rule refuses on cells of 24 px or more loses a letter"
     );
 }

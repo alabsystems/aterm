@@ -185,13 +185,25 @@ fn copy_tree_kind(src: &Path, dst: &Path, kind: std::fs::FileType) -> io::Result
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let (mut source, src_meta) = aterm_uds::regular_file::open(src)?;
         let perms = src_meta.permissions();
-        let mut sink = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(perms.mode())
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(dst)?;
-        std::io::copy(&mut source, &mut sink)?;
+        // A clone (APFS) shares the source's blocks: it writes no byte and takes no free space,
+        // so the copy never waits on the disk's write throughput or room (a debug build's
+        // executable is 600 MB, an 8 KiB read/write loop through `std::io::copy`). A file
+        // system that cannot clone gets the byte copy.
+        let sink = if aterm_uds::regular_file::clone_held(&source, dst)? {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(dst)?
+        } else {
+            let mut sink = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(perms.mode())
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(dst)?;
+            std::io::copy(&mut source, &mut sink)?;
+            sink
+        };
         if sink
             .metadata()
             .is_ok_and(|m| m.permissions().mode() & 0o7777 == perms.mode() & 0o7777)

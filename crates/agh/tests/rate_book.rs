@@ -152,6 +152,160 @@ mod files {
         )
     }
 
+    fn authenticated(
+        transport: &Arc<ScriptedTransport>,
+        book: RateBook,
+        root: &std::path::Path,
+        reserve: u64,
+    ) -> Github {
+        GithubBuilder::new(common::router(&common::canonical_config(root), root))
+            .transport(transport.clone())
+            .endpoints(Endpoints::loopback(47_201, 47_202, 47_203, 47_204))
+            .env(Arc::new(common::env()))
+            .fx(Arc::new(Fx::simulated(NOW)))
+            .caller("quota-test")
+            .rate_book(book)
+            .core_reserve(reserve)
+            .retry(RetryPolicy::NONE)
+            .build()
+    }
+
+    #[test]
+    fn separate_clients_revalidate_one_cached_representation_and_never_hide_a_change() {
+        let root = common::scratch("rate-conditional");
+        let fake = agh_fake::FakeGithub::start();
+        common::canonical_tokens(root.path(), &fake, true, false);
+        let book = RateBook::at(Dirs::under(root.path()).rate());
+        let transport = Arc::new(ScriptedTransport::new());
+        let call = repo_get();
+        transport.answer(
+            200,
+            &[("etag", "\"one\""), ("content-type", "application/json")],
+            b"{\"id\":1}",
+        );
+        let first = authenticated(&transport, book.clone(), root.path(), 1000)
+            .call(&call)
+            .unwrap();
+        for _ in 0..9 {
+            transport.answer(304, &[], b"");
+            let answer = authenticated(&transport, book.clone(), root.path(), 1000)
+                .call(&call)
+                .unwrap();
+            assert_eq!(answer.body, first.body);
+        }
+        for request in transport.requests().iter().skip(1) {
+            assert_eq!(
+                request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("if-none-match"))
+                    .map(|(_, v)| v.as_str()),
+                Some("\"one\"")
+            );
+        }
+        let rows = book.calls_in_hour(NOW / 3600).unwrap();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["status"].as_u64() == Some(200))
+                .count(),
+            1,
+            "ten unchanged reads cost one counted request instead of ten"
+        );
+        transport.answer(200, &[("etag", "\"two\"")], b"{\"id\":2}");
+        let changed = authenticated(&transport, book.clone(), root.path(), 1000)
+            .call(&call)
+            .unwrap();
+        assert_ne!(changed.body, first.body);
+        transport.answer(403, &[], b"{}");
+        assert!(
+            authenticated(&transport, book.clone(), root.path(), 1000)
+                .call(&call)
+                .is_err(),
+            "an error never serves the old body"
+        );
+        assert!(
+            book.calls_in_hour(NOW / 3600)
+                .unwrap()
+                .iter()
+                .all(|row| row.get("body").is_none())
+        );
+    }
+
+    #[test]
+    fn background_stops_at_the_reserve_and_cutter_reads_still_send() {
+        let root = common::scratch("rate-reserve");
+        let fake = agh_fake::FakeGithub::start();
+        common::canonical_tokens(root.path(), &fake, true, false);
+        let book = RateBook::at(Dirs::under(root.path()).rate());
+        let transport = Arc::new(ScriptedTransport::new());
+        transport.answer(
+            200,
+            &[
+                ("x-ratelimit-limit", "5000"),
+                ("x-ratelimit-remaining", "1000"),
+                ("x-ratelimit-reset", "1760003600"),
+            ],
+            b"{}",
+        );
+        let background = authenticated(&transport, book.clone(), root.path(), 1000);
+        background.call(&repo_get()).unwrap();
+        assert_eq!(
+            background.call(&repo_get()).unwrap_err().sub,
+            Sub::PreRefused
+        );
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "background sends no request in the reserve"
+        );
+        transport.answer(200, &[], b"{}");
+        authenticated(&transport, book, root.path(), 0)
+            .call(&repo_get())
+            .unwrap();
+        assert_eq!(transport.requests().len(), 2, "the cutter can still read");
+    }
+
+    #[test]
+    fn a_concurrent_background_burst_leaves_the_reserve_instead_of_spending_old_snapshots() {
+        for (reserve, expected) in [(1000, 1), (0, 32)] {
+            let root = common::scratch("rate-burst");
+            let fake = agh_fake::FakeGithub::start();
+            common::canonical_tokens(root.path(), &fake, true, false);
+            let book = RateBook::at(Dirs::under(root.path()).rate());
+            let transport = Arc::new(ScriptedTransport::new());
+            for _ in 0..32 {
+                transport.answer(
+                    200,
+                    &[
+                        ("x-ratelimit-limit", "5000"),
+                        ("x-ratelimit-remaining", "1000"),
+                        ("x-ratelimit-reset", "1760003600"),
+                    ],
+                    b"{}",
+                );
+            }
+            let gh = authenticated(&transport, book, root.path(), reserve);
+            let barrier = std::sync::Barrier::new(32);
+            std::thread::scope(|scope| {
+                for _ in 0..32 {
+                    let (gh, barrier) = (&gh, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        if let Err(error) = gh.call(&repo_get()) {
+                            assert_eq!(error.sub, Sub::PreRefused);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                transport.requests().len(),
+                expected,
+                "reserve={reserve}: one background send observes the boundary; foreground control sends every call"
+            );
+        }
+    }
+
     #[test]
     fn attribution_keeps_each_retry_and_omits_untrusted_failure_details() {
         use agh::wire::scripted::Scripted;
@@ -235,6 +389,11 @@ mod files {
                 .is_none()
         );
         book.record("anonymous", &snapshot("core", 1, NOW + 60));
+        assert!(
+            book.refuse_before_send("anonymous", "core", NOW).is_some(),
+            "a reordered response cannot restore spent quota"
+        );
+        book.record("anonymous", &snapshot("core", 1, NOW + 120));
         assert!(book.refuse_before_send("anonymous", "core", NOW).is_none());
     }
 

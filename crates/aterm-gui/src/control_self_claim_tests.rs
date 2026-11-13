@@ -36,6 +36,46 @@ fn gone() -> Proven {
     }
 }
 
+#[test]
+fn continuation_observations_require_the_claim_and_reject_older_sequences() {
+    use super::control_session::cmd_meta_harness_activity;
+    let h = crate::session_store::test_handle_on(7546, -1);
+    let ctx = h.ctx.as_ref();
+    let no_proof = |_: &str| None;
+    let line = "set harness_activity reason=person wait_ms=120000 seq=2";
+    assert_eq!(
+        cmd_meta_harness_activity(ctx, Some(1), &no_proof, line)
+            .unwrap()
+            .0,
+        "ERR denied\n"
+    );
+    let me = format!("codex-alab@{}", stand_in());
+    claim_supervisor_as(
+        ctx,
+        &me,
+        Some(1),
+        None,
+        Some(running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    assert_eq!(
+        cmd_meta_harness_activity(ctx, Some(1), &no_proof, line).unwrap(),
+        ("OK\n".into(), true)
+    );
+    let earlier = "set harness_activity reason=working wait_ms=- seq=1";
+    assert_eq!(
+        cmd_meta_harness_activity(ctx, Some(1), &no_proof, earlier).unwrap(),
+        ("OK\n".into(), false)
+    );
+    let meta = ctx.meta.lock().unwrap();
+    assert_eq!(
+        meta.continuation_activity.as_ref().unwrap().1.reason,
+        "person"
+    );
+}
+
 /// The supervisor fields of a session's meta now: `(holder, proven)`.
 fn shown(ctx: &crate::SessionCtx) -> (Option<String>, bool) {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);

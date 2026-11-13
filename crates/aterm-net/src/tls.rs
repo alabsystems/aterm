@@ -412,9 +412,14 @@ where
 /// Stream on which an [`answer`] is written, exposing I/O, timeouts, and peer address.
 pub struct Answering<'a, C> {
     stream: &'a mut StreamOwned<C, TcpStream>,
+    authorize: &'a (dyn Fn() -> io::Result<()> + Sync),
 }
 
-impl<C> Answering<'_, C> {
+impl<'a, C> Answering<'a, C> {
+    /// Recheck this connection's admission at a persistence boundary after reading its request.
+    pub fn authorization(&self) -> &'a (dyn Fn() -> io::Result<()> + Sync) {
+        self.authorize
+    }
     /// Bound each read of the request ([`TcpStream::set_read_timeout`]).
     /// # Errors
     /// The socket's own.
@@ -452,6 +457,7 @@ where
     S: rustls::SideData,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (self.authorize)()?;
         self.stream.read(buf)
     }
 }
@@ -462,20 +468,23 @@ where
     S: rustls::SideData,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (self.authorize)()?;
         self.stream.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        (self.authorize)()?;
         self.stream.flush()
     }
 }
 
 /// Answer `transport` HERE, in [`relay_answers`]' order.
 /// # Errors
-/// `write`'s own, or the flush's.
+/// `write`'s own, an authorization refusal, or the flush's.
 pub fn answer<C, S, G, T>(
     mut transport: TlsTransport<C>,
     guard: G,
+    authorize: &(dyn Fn() -> io::Result<()> + Sync),
     write: impl FnOnce(&mut Answering<'_, C>) -> io::Result<T>,
 ) -> io::Result<T>
 where
@@ -484,8 +493,12 @@ where
 {
     let answered = write(&mut Answering {
         stream: transport.stream(),
+        authorize,
     })
-    .and_then(|t| transport.stream().flush().map(|()| t));
+    .and_then(|t| {
+        authorize()?;
+        transport.stream().flush().map(|()| t)
+    });
     drop(guard);
     end_without_waiting(transport, answered.is_ok());
     answered
@@ -571,19 +584,29 @@ where
 /// Relay between an authenticated TLS stream and a local `CtlStream` whose end ANSWERS.
 /// # Errors
 /// On setup failure (a socket clone, a thread that cannot start), an unexpected mid-stream I/O
-/// error, or an unfinished required answer drain past its minute hang detector.
+/// error, an authorization refusal, or an unfinished required answer drain past its minute hang
+/// detector.
 /// A normal peer close — EOF, `close_notify`, a reset — is not an error.
 pub fn relay_answers<C, S, G>(
     transport: TlsTransport<C>,
     local: CtlStream,
     guard: G,
+    authorize: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
 ) -> io::Result<()>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
     S: rustls::SideData + 'static,
     G: Send + 'static,
 {
-    relay_answers_with::<C, S, G>(transport, local, guard, |_| {}, Instant::now, || {})
+    relay_answers_with::<C, S, G>(
+        transport,
+        local,
+        guard,
+        |_| {},
+        Instant::now,
+        || {},
+        authorize,
+    )
 }
 
 fn relay_answers_with<C, S, G>(
@@ -593,6 +616,7 @@ fn relay_answers_with<C, S, G>(
     mut writing: impl FnMut(&[u8]) + Send + 'static,
     drain_started: impl FnOnce() -> Instant + Send + 'static,
     mut draining: impl FnMut() + Send + 'static,
+    authorize: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
 ) -> io::Result<()>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
@@ -622,6 +646,7 @@ where
     });
 
     let wr = {
+        let authorize = Arc::clone(&authorize);
         let shared = Arc::clone(&shared);
         let mut tcp_wr = tcp_wr;
         let writer = std::thread::Builder::new().name("aterm-tls-out".to_owned());
@@ -645,7 +670,9 @@ where
                 g.inflight = true;
                 drop(g);
                 writing(&out);
-                let sent = tcp_wr.write_all(&out).and_then(|()| tcp_wr.flush());
+                let sent = authorize()
+                    .and_then(|()| tcp_wr.write_all(&out))
+                    .and_then(|()| tcp_wr.flush());
                 let mut g = shared.lock();
                 g.inflight = false;
                 if let Err(e) = sent {
@@ -804,8 +831,8 @@ where
     }
     if !fatal_down
         && !plain.is_empty()
-        && let Err(e) = local_down
-            .write_all(&plain)
+        && let Err(e) = authorize()
+            .and_then(|()| local_down.write_all(&plain))
             .and_then(|()| local_down.flush())
     {
         let mut g = shared.lock();
@@ -877,8 +904,8 @@ where
             }
         }
         if !plain.is_empty()
-            && let Err(e) = local_down
-                .write_all(&plain)
+            && let Err(e) = authorize()
+                .and_then(|()| local_down.write_all(&plain))
                 .and_then(|()| local_down.flush())
         {
             let mut g = shared.lock();

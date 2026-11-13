@@ -272,10 +272,11 @@ fn every_host_answer_reads_back_as_written() {
         pid: 27098,
         pgid: u32::MAX,
         birth,
-        exe: "aterm_gui-e0964a".to_string(),
+        episode: 1,
         task: task.map(str::to_string),
         quiet_ms: u64::MAX,
         wait: wait.map(str::to_string),
+        held_by: None,
     };
     for (task, wait, birth) in [
         (None, None, None),
@@ -285,6 +286,7 @@ fn every_host_answer_reads_back_as_written() {
             worst: call(task, wait, birth),
         });
         same(Some(crate::supervise::FactsReading {
+            waiting: 0,
             as_of_ms: i64::MIN,
             no_progress: vec![call(task, wait, birth), call(None, None, Some(1))],
             held: None,
@@ -293,6 +295,7 @@ fn every_host_answer_reads_back_as_written() {
     }
     same(None::<crate::supervise::FactsReading>);
     same(Some(crate::supervise::FactsReading {
+        waiting: 0,
         as_of_ms: 1_760_000_000_000,
         no_progress: Vec::new(),
         held: None,
@@ -314,6 +317,7 @@ fn every_host_answer_reads_back_as_written() {
         ],
     ] {
         same(Some(crate::supervise::FactsReading {
+            waiting: 0,
             as_of_ms: 1_760_000_000_000,
             no_progress: vec![call(None, None, Some(1))],
             held: Some(crate::supervise::HeldReading {
@@ -325,6 +329,7 @@ fn every_host_answer_reads_back_as_written() {
     }
     for oldest_ms in [None, Some(u64::MAX)] {
         same(Some(crate::supervise::FactsReading {
+            waiting: 0,
             as_of_ms: 1_760_000_000_000,
             no_progress: Vec::new(),
             held: None,
@@ -340,6 +345,7 @@ fn every_host_answer_reads_back_as_written() {
         <Option<crate::supervise::FactsReading> as HostReply>::take(before_held, Instant::now())
             .ok(),
         Some(Some(crate::supervise::FactsReading {
+            waiting: 0,
             as_of_ms: 5,
             no_progress: Vec::new(),
             held: None,
@@ -355,6 +361,7 @@ fn every_host_answer_reads_back_as_written() {
         )
         .ok(),
         Some(Some(crate::supervise::FactsReading {
+            waiting: 0,
             as_of_ms: 5,
             no_progress: Vec::new(),
             held: Some(crate::supervise::HeldReading {
@@ -378,13 +385,15 @@ fn every_host_answer_reads_back_as_written() {
                 pid: 1,
                 pgid: 2,
                 birth: None,
-                exe: "x".to_string(),
+                episode: 0,
                 task: None,
                 quiet_ms: 3,
                 wait: None,
+                held_by: None,
             }
         }),
-        "a tape from before the leader's birth was read reads back without one"
+        "a tape from before the leader's birth and the engine's episode were read reads back \
+         without them, its program name ignored"
     );
     same(Ok::<(), ProbeNo>(()));
     for no in ProbeNo::ALL {

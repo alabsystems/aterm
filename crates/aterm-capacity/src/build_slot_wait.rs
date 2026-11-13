@@ -24,7 +24,9 @@ pub fn read(facts: &[ProcFacts], now_us: u64) -> Vec<Wait> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let Some(home) = aterm_uds::account::home() else {
+        let Some(home) =
+            aterm_uds::account::home().and_then(|home| std::fs::canonicalize(home).ok())
+        else {
             return Vec::new();
         };
         let pool = home.join(slots::SLOT_DIR);
@@ -75,7 +77,7 @@ pub fn read(facts: &[ProcFacts], now_us: u64) -> Vec<Wait> {
         if holders.is_empty() {
             return Vec::new();
         }
-        let blockers: Vec<Holder> = slots::observe(&pool, 0, now_us)
+        let blockers: Vec<Holder> = slots::observe(&pool, Some(&pool.join("adopted")), 0, now_us)
             .ok()
             .into_iter()
             .flat_map(|o| o.slots)

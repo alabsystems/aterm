@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::companion::{
-    CompanionFrame, CompanionOwner, ContrastFallback, GlowOwnership, PetFacts, PetGlass,
+    CompanionFrame, CompanionOwner, ContrastFallback, PetFacts, PetGlass, PetOwnership,
 };
-use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{OldPath, PetAction, PetFrame};
 use aterm_effects::pet_glyphs_gen::PetGlyphId;
@@ -196,16 +195,8 @@ impl Host {
                 .offer_glass(std::iter::once(focused).chain(other).chain(third));
         }
         let tick = self.owner.prepare(
-            PetFacts::new(
-                &facts,
-                &host,
-                GlowOwnership {
-                    enabled: true,
-                    style: GlowStyle::RainbowKitty,
-                    style_raw_names_pet: true,
-                },
-            )
-            .with_pane(self.pane.map(|origin| (self.session, origin))),
+            PetFacts::new(&facts, &host, PetOwnership { on: true })
+                .with_pane(self.pane.map(|origin| (self.session, origin))),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick);

@@ -65,16 +65,14 @@ pub enum GitOp {
         /// The clone.
         dir: PathBuf,
     },
-    /// `git -C <dir> -c core.logAllRefUpdates=always fetch --quiet --no-tags
-    /// --no-write-fetch-head --recurse-submodules=no
-    /// <url> +refs/heads/main:<into>`: atpkg-publish's `fetch_main`, which reads the main of
-    /// record into a person's source checkout and writes no other ref there, so neither its
-    /// remote-tracking refs nor its tags move. A per-command `core.logAllRefUpdates=always`
-    /// retains previous snapshots in a reflog, without changing repository configuration.
+    /// Fetch main into private scratch, import its verified objects, then update only `into`
+    /// with a reflog: atpkg-publish's `fetch_main`. A caller's metadata-only refs are not
+    /// advertised as complete haves. No other ref, FETCH_HEAD or repository configuration
+    /// changes, so neither the caller's remote-tracking refs nor its tags move.
     /// Its config screen is `Fetch`'s. The runner
     /// refuses it (Usage, before anything runs) unless `into` is a ref name git accepts under
     /// `refs/` that is not under `refs/heads/`, `refs/tags/` or `refs/remotes/`, so the forced
-    /// fetch never moves a branch, a tag or a remote-tracking ref of the checkout.
+    /// cache update never moves a branch, a tag or a remote-tracking ref of the checkout.
     FetchMain {
         /// The checkout.
         dir: PathBuf,
@@ -441,14 +439,50 @@ pub struct GitOut {
     pub grant: Option<String>,
 }
 
+/// The credential callback grammar implemented by this executable's front door.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperHost {
+    /// The standalone agh front door.
+    Direct,
+    /// A frontend with an `agh` subcommand.
+    Subcommand,
+    /// The verifier's restricted remote credential entry.
+    Verifier,
+}
+
+static HELPER_HOST: std::sync::OnceLock<HelperHost> = std::sync::OnceLock::new();
+
+impl HelperHost {
+    /// Record the frontend's intrinsic dispatch before constructing Git clients.
+    /// Repeating the same binding is harmless; another binding is refused.
+    /// # Errors
+    /// This process already recorded a different credential callback grammar.
+    pub fn record(self) -> Result<()> {
+        if *HELPER_HOST.get_or_init(|| self) != self {
+            return Err(unnamed(
+                "credential host dispatch was already bound differently",
+            ));
+        }
+        Ok(())
+    }
+
+    fn arguments(self) -> Vec<String> {
+        match self {
+            Self::Direct => Vec::new(),
+            Self::Subcommand => vec!["agh".into()],
+            Self::Verifier => vec!["--remote-agh".into(), "credential".into()],
+        }
+    }
+}
+
 /// The command git runs as its credential helper: this executable, and the words before
 /// `auth git-credential`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelperCommand {
-    /// The executable, absolute and canonical.
+    /// The retained executable, independent of the replaceable launch pathname.
     pub exe: PathBuf,
     /// The words before `auth git-credential`: `["agh"]` for `aterm`, `aterm-release`
-    /// and `atpkg-publish`, none for an executable whose file stem is `agh`.
+    /// and `atpkg-publish`, `["--remote-agh", "credential"]` for `aterm-verify`, none for `agh`.
     pub args: Vec<String>,
 }
 
@@ -458,42 +492,36 @@ fn unnamed(what: &str) -> Error {
 }
 
 impl HelperCommand {
-    /// `std::env::current_exe()`, canonicalized, with `args` by its file stem: `["agh"]` for
-    /// `aterm`, `aterm-release` and `atpkg-publish`, none for `agh`.
+    /// Retained code recorded by the frontend's early tether entry, with the intrinsic
+    /// callback grammar recorded by [`HelperHost::record`]. No launch pathname or
+    /// retained filename selects either the image or its dispatch.
     ///
     /// # Errors
     ///
-    /// could_not_run, why `the helper's executable cannot be named: {e}`, or, for any other
-    /// file stem, `… {stem} is not agh, aterm, aterm-release or atpkg-publish`.
+    /// could_not_run when host dispatch or prepared image custody is unavailable.
     pub fn current() -> Result<HelperCommand> {
-        let exe = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .map_err(|e| unnamed(&e.to_string()))?;
-        Self::for_executable(exe)
-    }
-
-    fn for_executable(exe: PathBuf) -> Result<HelperCommand> {
-        let stem = exe
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let args = match stem.as_str() {
-            "agh" => Vec::new(),
-            "aterm" | "aterm-release" | "atpkg-publish" => vec!["agh".to_string()],
-            _ => {
-                return Err(unnamed(&format!(
-                    "{stem} is not agh, aterm, aterm-release or atpkg-publish"
-                )));
-            }
-        };
-        Ok(HelperCommand { exe, args })
+        let host = HELPER_HOST
+            .get()
+            .ok_or_else(|| unnamed("this frontend recorded no credential host dispatch"))?;
+        let exe = aterm_uds::tether::prepared_executable()
+            .map_err(|why| unnamed(&why))?
+            .ok_or_else(|| {
+                unnamed(
+                    "recorded image custody is unavailable; restart this frontend before using Git",
+                )
+            })?;
+        Ok(HelperCommand {
+            exe: exe.to_path_buf(),
+            args: host.arguments(),
+        })
     }
 
     /// The `credential.helper` value: `!` and the shell-quoted words, then
     /// `auth git-credential`. Each word is wrapped in `"…"`, with `"`, `\`, `$` and a backtick
     /// escaped by `\`.
-    #[must_use]
-    pub fn config_value(&self) -> String {
+    /// # Errors
+    /// The executable pathname cannot be represented exactly in Git's text configuration.
+    pub fn config_value(&self) -> Result<String> {
         let quote = |word: &str| {
             let mut quoted = String::with_capacity(word.len() + 2);
             quoted.push('"');
@@ -506,11 +534,14 @@ impl HelperCommand {
             quoted.push('"');
             quoted
         };
-        let exe = self.exe.to_string_lossy();
-        let words: Vec<String> = std::iter::once(quote(&exe))
+        let exe = self
+            .exe
+            .to_str()
+            .ok_or_else(|| unnamed("retained image pathname is not UTF-8"))?;
+        let words: Vec<String> = std::iter::once(quote(exe))
             .chain(self.args.iter().map(|word| quote(word)))
             .collect();
-        format!("!{} auth git-credential", words.join(" "))
+        Ok(format!("!{} auth git-credential", words.join(" ")))
     }
 }
 
@@ -565,6 +596,7 @@ mod unix {
     use crate::git::GRANT_MAX;
     use crate::git::credential;
     use crate::git::grant::{self, Grant};
+    use crate::git::source_config::{ReadError, Refusal, SourceConfig};
     use crate::identity::{EnvSource, Source};
     use crate::policy::{Decision, Named, RefusalCode, RouteRequest, RouteTarget, Tier};
     use crate::redact::Redactor;
@@ -653,12 +685,27 @@ mod unix {
         Refused { class: ConfigClass },
     }
 
+    /// A source config file's admission, as the run's fact tapes it: read, absent, or refused
+    /// with why and the act that lifts it.
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     enum ConfigSourceVerdict {
         Ready,
         Missing,
-        Refused(String),
+        Refused { why: String, next: String },
+    }
+
+    impl ConfigSourceVerdict {
+        fn refused(refusal: Refusal) -> Self {
+            Self::Refused {
+                why: refusal.why,
+                next: refusal.next,
+            }
+        }
+
+        fn taped(&self) -> String {
+            aterm_json::to_string(self).unwrap_or_default()
+        }
     }
 
     fn config_names_request(slug: &Slug, read_only: bool, scope: &str) -> Vec<u8> {
@@ -942,38 +989,7 @@ mod unix {
     }
 
     #[cfg(test)]
-    mod certificate_tests {
-        use super::*;
-
-        #[test]
-        fn certificate_default_keeps_only_one_absolute_path() {
-            let output = |code, bytes: &[u8]| ChildOut {
-                code: Some(code),
-                stdout: bytes.to_vec(),
-                stderr: Vec::new(),
-            };
-            assert_eq!(certificate_default(&output(1, b"")).unwrap(), None);
-            assert_eq!(
-                certificate_default(&output(0, b"/moved store/share/cacert.pem\0")).unwrap(),
-                Some(PathBuf::from("/moved store/share/cacert.pem")),
-            );
-            for (code, raw) in [
-                (128, b"".as_slice()),
-                (0, b""),
-                (0, b"relative.pem\0"),
-                (0, b"/first\0/second\0"),
-                (0, b"/line\nbreak\0"),
-                (1, b"/unexpected\0"),
-                (0, b"/unterminated"),
-            ] {
-                assert!(
-                    certificate_default(&output(code, raw)).is_err(),
-                    "{code}: {raw:?}"
-                );
-            }
-            assert!(certificate_default(&output(0, &vec![b'x'; 8193])).is_err());
-        }
-    }
+    mod certificate_tests;
 
     impl Children<'_> {
         /// Keep the selected Git's certificate default while still suppressing every
@@ -2060,7 +2076,7 @@ mod unix {
         // agh.toml the child's `XDG_CONFIG_HOME` holds) and could answer a token for a run
         // whose route, and `GitOut.as_`, said nobody.
         let helper = match profile {
-            Some(_) => Some(gh.git_helper()?.config_value()),
+            Some(_) => Some(gh.git_helper()?.config_value()?),
             None => None,
         };
         let (scratch, root) = scratch()?;
@@ -2097,7 +2113,7 @@ mod unix {
                     GitOp::FetchRef { .. }
                         | GitOp::FetchBatch { .. }
                         | GitOp::CommitRead { .. }
-                        | GitOp::FetchMain { blobless: true, .. }
+                        | GitOp::FetchMain { .. }
                 ))
             .then(|| root.join("scratch.git")),
             budget: run.budget,
@@ -2146,20 +2162,16 @@ mod unix {
             children
                 .gh
                 .fx()
-                .fact("git-source-config-v2", &slug.to_string(), &mut || {
-                    match super::super::source_config::SourceConfig::read(&dir, SCREEN_MAX) {
+                .fact("git-source-config-v3", &slug.to_string(), &mut || {
+                    match SourceConfig::read(&dir, SCREEN_MAX) {
                         Ok(snapshot) => {
                             source = Some(snapshot);
-                            aterm_json::to_string(&ConfigSourceVerdict::Ready).unwrap_or_default()
+                            ConfigSourceVerdict::Ready
                         }
-                        Err(super::super::source_config::ReadError::Missing) => {
-                            aterm_json::to_string(&ConfigSourceVerdict::Missing).unwrap_or_default()
-                        }
-                        Err(super::super::source_config::ReadError::Refused(error)) => {
-                            aterm_json::to_string(&ConfigSourceVerdict::Refused(error))
-                                .unwrap_or_default()
-                        }
+                        Err(ReadError::Missing) => ConfigSourceVerdict::Missing,
+                        Err(ReadError::Refused(refusal)) => ConfigSourceVerdict::refused(refusal),
                     }
+                    .taped()
                 })?;
         let admitted: ConfigSourceVerdict = aterm_json::from_str(&admitted)
             .map_err(|_| Error::local("invalid source-config admission"))?;
@@ -2170,8 +2182,10 @@ mod unix {
                     "source has no repository common configuration",
                 ));
             }
-            ConfigSourceVerdict::Refused(error) => {
-                return Err(Error::refused(error).with_repo(slug.to_string()));
+            ConfigSourceVerdict::Refused { why, next } => {
+                return Err(Error::refused(why)
+                    .with_next(next)
+                    .with_repo(slug.to_string()));
             }
         }
         // In replay the filesystem closure is not called and the child door
@@ -2217,23 +2231,39 @@ mod unix {
                 children
                     .gh
                     .fx()
-                    .fact("git-worktree-config-v2", &slug.to_string(), &mut || {
+                    .fact("git-worktree-config-v3", &slug.to_string(), &mut || {
+                        // The source fact above took the snapshot whenever this one reads the
+                        // filesystem: both answer under the same tape mode.
                         let Some(source) = &source else {
-                            return "source config snapshot is unavailable".into();
+                            return ConfigSourceVerdict::Refused {
+                                why: "source config snapshot is unavailable".into(),
+                                next: "run the command again: each run reads the source anew"
+                                    .into(),
+                            }
+                            .taped();
                         };
                         match source.worktree() {
                             Ok(Some(bytes)) => {
                                 worktree = Some(bytes);
-                                "present".into()
+                                ConfigSourceVerdict::Ready
                             }
-                            Ok(None) => "absent".into(),
-                            Err(error) => error,
+                            Ok(None) => ConfigSourceVerdict::Missing,
+                            Err(refusal) => ConfigSourceVerdict::refused(refusal),
                         }
+                        .taped()
                     })?;
-            match admitted.as_str() {
-                "present" => names(worktree.as_deref().unwrap_or_default(), "worktree")?,
-                "absent" => {}
-                _ => return Err(Error::refused(admitted).with_repo(slug.to_string())),
+            let admitted: ConfigSourceVerdict = aterm_json::from_str(&admitted)
+                .map_err(|_| Error::local("invalid worktree-config admission"))?;
+            match admitted {
+                ConfigSourceVerdict::Ready => {
+                    names(worktree.as_deref().unwrap_or_default(), "worktree")?;
+                }
+                ConfigSourceVerdict::Missing => {}
+                ConfigSourceVerdict::Refused { why, next } => {
+                    return Err(Error::refused(why)
+                        .with_next(next)
+                        .with_repo(slug.to_string()));
+                }
             }
         }
         Ok(dir)
@@ -2335,6 +2365,335 @@ mod unix {
         .map_err(|e| Error::local(format!("private object view: {e}")))
     }
 
+    /// Ordinary refs in a non-shallow repository can still name metadata-only
+    /// history produced by `fetch_tree_scope`. Only a complete, quiet graph walk
+    /// permits Git to advertise all borrowed refs as complete haves. A successful
+    /// nonempty or truncated answer uses the cold profile before any request;
+    /// a failed observation refuses instead of retrying a failed transfer.
+    fn lend_complete_objects(
+        children: &Children<'_>,
+        run: &GitRun,
+        scratch: Option<&Path>,
+        common: &str,
+        shallow: bool,
+    ) -> Result<()> {
+        if shallow {
+            return Ok(());
+        }
+        let key = [
+            crate::fx::canon::git_request(run),
+            b"\nstep have-closure".to_vec(),
+        ]
+        .concat();
+        let mut original_graph = children.clone();
+        original_graph
+            .env
+            .push((os("GIT_GRAFT_FILE"), os("/dev/null")));
+        let checked = original_graph
+            .git(
+                &[
+                    os("--git-dir"),
+                    os(common),
+                    os("-c"),
+                    os("core.commitGraph=false"),
+                    os("rev-list"),
+                    os("--objects"),
+                    os("--all"),
+                    os("--quiet"),
+                    os("--missing=print"),
+                ],
+                None,
+                &key,
+            )
+            .map_err(unsent)?;
+        if checked.code != Some(0) {
+            return Err(
+                failed(&run.op, &checked, children.gh.redactor(), &run.slug, false)
+                    .with_next("fetch step: have-closure"),
+            );
+        }
+        if checked.stdout.is_empty() && !checked.stdout_may_be_truncated() {
+            lend_objects(scratch, common, false)?;
+        }
+        Ok(())
+    }
+
+    fn intake_file_stamp(metadata: &std::fs::Metadata) -> impl Eq {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mode(),
+            metadata.uid(),
+            metadata.nlink(),
+        )
+    }
+
+    fn hold_intake_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata)> {
+        let named = std::fs::symlink_metadata(path)
+            .map_err(|error| Error::local(format!("object intake file identity: {error}")))?;
+        if !named.is_file() {
+            return Err(Error::refused("object intake file must be physical"));
+        }
+        let (file, held) = aterm_uds::regular_file::open(path)
+            .map_err(|error| Error::local(format!("hold object intake file: {error}")))?;
+        if intake_file_stamp(&named) != intake_file_stamp(&held) {
+            return Err(Error::refused("object intake file changed while opening"));
+        }
+        Ok((file, held))
+    }
+
+    fn check_intake_file(
+        path: &Path,
+        file: &std::fs::File,
+        before: &std::fs::Metadata,
+    ) -> Result<()> {
+        let after = file
+            .metadata()
+            .map_err(|error| Error::local(format!("object intake comparison bookend: {error}")))?;
+        let named = std::fs::symlink_metadata(path)
+            .map_err(|error| Error::local(format!("named object intake comparison: {error}")))?;
+        if !named.is_file()
+            || intake_file_stamp(before) != intake_file_stamp(&after)
+            || intake_file_stamp(before) != intake_file_stamp(&named)
+        {
+            return Err(Error::refused(
+                "object intake file changed during comparison",
+            ));
+        }
+        Ok(())
+    }
+
+    fn hold_object_intake_directories(
+        object_directory: &Path,
+        pack_directory: &Path,
+    ) -> Result<Vec<(PathBuf, std::fs::File)>> {
+        let mut pinned = Vec::new();
+        for path in [object_directory, pack_directory] {
+            let before = std::fs::symlink_metadata(path)
+                .map_err(|error| Error::local(format!("object intake directory: {error}")))?;
+            if !before.is_dir() {
+                return Err(Error::refused("object intake directory must be physical"));
+            }
+            let file = std::fs::File::open(path)
+                .map_err(|error| Error::local(format!("hold object intake directory: {error}")))?;
+            let held = file
+                .metadata()
+                .map_err(|error| Error::local(format!("object intake identity: {error}")))?;
+            if (before.dev(), before.ino()) != (held.dev(), held.ino()) {
+                return Err(Error::refused(
+                    "object intake directory changed while opening",
+                ));
+            }
+            pinned.push((path.to_path_buf(), file));
+        }
+        Ok(pinned)
+    }
+
+    fn check_object_intake_directories(pinned: &[(PathBuf, std::fs::File)]) -> Result<()> {
+        for (path, file) in pinned {
+            let held = file
+                .metadata()
+                .map_err(|error| Error::local(format!("held object intake directory: {error}")))?;
+            let named = std::fs::symlink_metadata(path)
+                .map_err(|error| Error::local(format!("named object intake directory: {error}")))?;
+            if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Err(Error::refused("object intake directory identity changed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// An existing filename is not evidence that its valid pack/index bytes are
+    /// the generated pair. Compare through held regular-file descriptions with
+    /// bounded buffers and require unchanged named identities and file stamps.
+    fn existing_pack_file_matches(expected: &Path, destination: &Path) -> Result<()> {
+        let (mut source, source_before) = hold_intake_file(expected)?;
+        let (mut installed, installed_before) = hold_intake_file(destination)?;
+        if source_before.len() != installed_before.len() {
+            return Err(Error::refused(
+                "existing object intake file differs from generated bytes",
+            ));
+        }
+        let mut remaining = source_before.len();
+        let (mut left, mut right) = ([0; 16 * 1024], [0; 16 * 1024]);
+        while remaining != 0 {
+            let length = remaining.min(left.len() as u64) as usize;
+            source
+                .read_exact(&mut left[..length])
+                .and_then(|()| installed.read_exact(&mut right[..length]))
+                .map_err(|error| Error::local(format!("compare object intake file: {error}")))?;
+            if left[..length] != right[..length] {
+                return Err(Error::refused(
+                    "existing object intake file differs from generated bytes",
+                ));
+            }
+            remaining -= length as u64;
+        }
+        for (path, file, before) in [
+            (expected, &mut source, &source_before),
+            (destination, &mut installed, &installed_before),
+        ] {
+            let mut end = [0];
+            if file
+                .read(&mut end)
+                .map_err(|error| Error::local(format!("object intake end: {error}")))?
+                != 0
+            {
+                return Err(Error::refused(
+                    "object intake file changed during comparison",
+                ));
+            }
+            check_intake_file(path, file, before)?;
+        }
+        Ok(())
+    }
+
+    /// Import from the fresh fetch repository without negotiating against the
+    /// destination's possibly partial refs or reading its fetch configuration.
+    /// `--local` leaves complete borrowed objects in their original owner and
+    /// packs only the private repository's objects. No ref is published here.
+    fn import_fetched_objects(
+        children: &Children<'_>,
+        run: &GitRun,
+        common: &str,
+        roots: &[&str],
+    ) -> Result<ChildOut> {
+        let canonical = crate::fx::canon::git_request(run);
+        let scratch = children.scratch_git.as_deref();
+        let object_directory = Path::new(common).join("objects");
+        let pack_directory = object_directory.join("pack");
+        let pinned = if scratch.is_some() {
+            hold_object_intake_directories(&object_directory, &pack_directory)?
+        } else {
+            Vec::new()
+        };
+        let check_current = || check_object_intake_directories(&pinned);
+        check_current()?;
+        let quarantine = if scratch.is_some() {
+            Some(
+                aterm_tempfile::Builder::new()
+                    .prefix(".agh-object-intake-")
+                    .suffix(".noindex")
+                    .tempdir_in(&pack_directory)
+                    .map_err(|error| Error::local(format!("object intake quarantine: {error}")))?,
+            )
+        } else {
+            None
+        };
+        let prefix = quarantine
+            .as_ref()
+            .map_or(pack_directory.as_path(), aterm_tempfile::TempDir::path)
+            .join("pack");
+        let step = |name: &str, args: Vec<OsString>, input: Option<&[u8]>| -> Result<ChildOut> {
+            let key = [
+                canonical.as_slice(),
+                b"\nstep object-intake-",
+                name.as_bytes(),
+            ]
+            .concat();
+            let out = match input {
+                Some(input) => children.git_input(&args, scratch, &key, input),
+                None => children.git(&args, scratch, &key),
+            }
+            .map_err(unsent)?;
+            if out.code != Some(0) {
+                return Err(
+                    failed(&run.op, &out, children.gh.redactor(), &run.slug, false)
+                        .with_next(format!("object intake step: {name}")),
+                );
+            }
+            Ok(out)
+        };
+        let result = (|| {
+            check_current()?;
+            let input = format!("{}\n", roots.join("\n"));
+            let packed = step(
+                "pack",
+                vec![
+                    os("-c"),
+                    os("protocol.allow=never"),
+                    os("pack-objects"),
+                    os("--quiet"),
+                    os("--threads=1"),
+                    os("--local"),
+                    os("--revs"),
+                    os("--non-empty"),
+                    prefix.as_os_str().to_owned(),
+                ],
+                Some(input.as_bytes()),
+            )?;
+            check_current()?;
+            // A fully borrowed root needs no new pack. Git's explicit
+            // --non-empty option suppresses both pack creation and its hash.
+            if packed.stdout.is_empty() && !packed.stdout_may_be_truncated() {
+                check_current()?;
+                return Ok(packed);
+            }
+            let hash = std::str::from_utf8(&packed.stdout)
+                .ok()
+                .and_then(|value| value.strip_suffix('\n'))
+                .filter(|value| !packed.stdout_may_be_truncated() && crate::path::is_sha(value))
+                .ok_or_else(|| Error::protocol("invalid object intake pack identity"))?;
+            let verify = |path: &Path| {
+                step(
+                    "verify",
+                    vec![
+                        os("-c"),
+                        os("protocol.allow=never"),
+                        os("index-pack"),
+                        os("--verify"),
+                        path.as_os_str().to_owned(),
+                    ],
+                    None,
+                )
+            };
+            verify(&prefix.with_file_name(format!("pack-{hash}.pack")))?;
+            check_current()?;
+            if let Some(quarantine) = &quarantine {
+                for extension in ["pack", "idx"] {
+                    let name = format!("pack-{hash}.{extension}");
+                    let destination = pack_directory.join(&name);
+                    match std::fs::hard_link(quarantine.path().join(name), &destination) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            existing_pack_file_matches(
+                                &quarantine.path().join(format!("pack-{hash}.{extension}")),
+                                &destination,
+                            )?;
+                        }
+                        Err(error) => {
+                            return Err(Error::local(format!(
+                                "install verified object intake: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+            // Existing identical pack names are accepted only after the actual
+            // installed pack/index pair independently passes Git verification.
+            let verified = verify(&pack_directory.join(format!("pack-{hash}.pack")))?;
+            check_current()?;
+            Ok(verified)
+        })();
+        result.map_err(|error| {
+            if let Some(quarantine) = quarantine {
+                let next = format!(
+                    "{}; failed object intake quarantine retained at {}",
+                    error.next,
+                    quarantine.keep().display()
+                );
+                error.with_next(next)
+            } else {
+                error
+            }
+        })
+    }
+
     /// Fetch into private scratch first, then import objects with no destination
     /// ref. Only the final no-deref update can change the caller's cache ref.
     fn fetch_exact(
@@ -2356,13 +2715,10 @@ mod unix {
             }
             .map_err(unsent)?;
             if out.code != Some(0) {
-                return Err(failed(
-                    &run.op,
-                    &out,
-                    children.gh.redactor(),
-                    &run.slug,
-                    false,
-                ));
+                return Err(
+                    failed(&run.op, &out, children.gh.redactor(), &run.slug, false)
+                        .with_next(format!("exact fetch step: {name}")),
+                );
             }
             Ok(out)
         };
@@ -2392,7 +2748,7 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None)?;
-        lend_objects(scratch, common, shallow)?;
+        lend_complete_objects(children, run, scratch, common, shallow)?;
         step(
             "fetch",
             vec![
@@ -2416,26 +2772,7 @@ mod unix {
             .and_then(|text| text.strip_suffix('\n'))
             .filter(|text| crate::path::is_sha(text))
             .ok_or_else(|| Error::local("git returned an invalid fetched object id"))?;
-        // Only this generated private directory gets file transport. No user URL
-        // or repository remote participates in the local object transfer.
-        let source = scratch.map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf);
-        step(
-            "objects",
-            vec![
-                os("-C"),
-                dir.as_os_str().to_os_string(),
-                os("-c"),
-                os("protocol.file.allow=always"),
-                os("fetch"),
-                os("--quiet"),
-                os("--no-tags"),
-                os("--no-write-fetch-head"),
-                os("--recurse-submodules=no"),
-                source.into_os_string(),
-                os("refs/agh/source"),
-            ],
-            None,
-        )?;
+        import_fetched_objects(children, run, common, &[oid])?;
         check_parents()?;
         step(
             "update",
@@ -2502,22 +2839,69 @@ mod unix {
         Ok(blobs)
     }
 
+    /// The repository a checkout closure reads its blobs' presence through: `git_dir`, an empty
+    /// repository beside the scratch whose object store is the scratch's (`objects`, with the
+    /// cache the scratch borrows through its alternates). The scratch is a promisor of the source
+    /// (its filtered fetch made it one), and a promisor read of an absent object asks the source
+    /// for it, which `GIT_NO_LAZY_FETCH` forbids: git 2.56.0 then answers `missing`, but Ubuntu
+    /// 24.04's 2.43.0 stops the whole batch (128, "could not fetch … from promisor remote"),
+    /// both measured. The view names no promisor, so a git answers `missing` and cannot fetch.
+    struct PresenceView {
+        git_dir: PathBuf,
+        objects: PathBuf,
+    }
+
+    impl PresenceView {
+        /// The view beside `scratch`. A replay has no scratch and spawns nothing: its tape
+        /// answers each step by name, so the paths go unused there.
+        fn beside(scratch: Option<&Path>) -> Self {
+            let scratch = scratch.unwrap_or(Path::new("scratch.git"));
+            Self {
+                git_dir: scratch.with_file_name("presence.git"),
+                objects: scratch.join("objects"),
+            }
+        }
+
+        /// The `git init` that makes the view, empty (`--template=`).
+        fn init(&self) -> Vec<OsString> {
+            vec![
+                os("init"),
+                os("--quiet"),
+                os("--bare"),
+                os("--template="),
+                self.git_dir.as_os_str().to_owned(),
+            ]
+        }
+    }
+
+    /// Which of `batch`'s blobs `view` lacks. `commit`, the scratch's metadata commit, is read
+    /// first and must be seen: a view that saw no objects would answer every blob `missing` and
+    /// refetch them all without a word.
     fn checkout_missing_blobs(
         children: &Children<'_>,
-        scratch: Option<&Path>,
+        view: &PresenceView,
+        commit: &str,
         key: &[u8],
         batch: &[String],
         input: &[u8],
     ) -> Result<String> {
         let key = [key, b"\ninspect cached blob types"].concat();
-        let result = children.git_input(
+        let input = [format!("{commit}\n").as_bytes(), input].concat();
+        let mut viewed = children.clone();
+        viewed
+            .env
+            .push((os("GIT_DIR"), view.git_dir.clone().into()));
+        viewed
+            .env
+            .push((os("GIT_OBJECT_DIRECTORY"), view.objects.clone().into()));
+        let result = viewed.git_input(
             &[
                 os("cat-file"),
                 os("--batch-check=%(objectname) %(objecttype)"),
             ],
-            scratch,
+            None,
             &key,
-            input,
+            &input,
         )?;
         if result.code != Some(0) || result.stdout_may_be_truncated() {
             return Err(Error::protocol(
@@ -2527,6 +2911,11 @@ mod unix {
         let text = std::str::from_utf8(&result.stdout)
             .map_err(|_| Error::protocol("invalid checkout cache object response"))?;
         let mut rows = text.lines();
+        if rows.next().and_then(|row| row.split_once(' ')) != Some((commit, "commit")) {
+            return Err(Error::protocol(
+                "the checkout presence view does not see the scratch's metadata commit",
+            ));
+        }
         let mut missing = String::new();
         for oid in batch {
             match rows.next().and_then(|row| row.split_once(' ')) {
@@ -2625,14 +3014,14 @@ mod unix {
         }
         let object_directory = Path::new(common).join("objects");
         let pack_directory = object_directory.join("pack");
+        let pinned = if checkout.is_some() {
+            hold_object_intake_directories(&object_directory, &pack_directory)?
+        } else {
+            Vec::new()
+        };
+        let check_current = || check_object_intake_directories(&pinned);
+        check_current()?;
         let quarantine = if checkout.is_some() {
-            for directory in [&object_directory, &pack_directory] {
-                let metadata = std::fs::symlink_metadata(directory)
-                    .map_err(|error| Error::local(format!("checkout pack directory: {error}")))?;
-                if !metadata.is_dir() {
-                    return Err(Error::refused("checkout pack directory must be physical"));
-                }
-            }
             Some(
                 aterm_tempfile::Builder::new()
                     .prefix(".agh-checkout-")
@@ -2695,6 +3084,7 @@ mod unix {
             ],
             scratch,
         )?;
+        check_current()?;
         let mut verified_packs = vec![hash.to_owned()];
         if let Some((_, cache)) = checkout {
             if let Some(cache) = cache {
@@ -2708,6 +3098,15 @@ mod unix {
                 }
                 lend_objects(scratch, common, false)?;
             }
+            // Without a lent cache every blob is missing: the metadata fetch took none.
+            let presence = match cache {
+                Some(_) => {
+                    let view = PresenceView::beside(scratch);
+                    step("presence-view", view.init(), None)?;
+                    Some(view)
+                }
+                None => None,
+            };
             let blobs = checkout_blob_ids(oid, |tree, recursive| {
                 let mut args = vec![
                     os("ls-tree"),
@@ -2734,16 +3133,27 @@ mod unix {
                     format!("\nstep checkout-pack {index}").as_bytes(),
                 ]
                 .concat();
-                let missing = if cache.is_some() {
-                    checkout_missing_blobs(&children, scratch, &fetch_key, batch, input.as_bytes())?
-                } else {
-                    input.clone()
+                let missing = match &presence {
+                    Some(view) => checkout_missing_blobs(
+                        &children,
+                        view,
+                        oid,
+                        &fetch_key,
+                        batch,
+                        input.as_bytes(),
+                    )?,
+                    None => input.clone(),
                 };
                 if !missing.is_empty() {
+                    // The scratch has complete metadata, not complete blob history.
+                    // Explicit missing-object wants must not negotiate its filtered
+                    // commits as complete haves (Git's partial-clone fetch contract).
                     let fetched = children
                         .remote_read(
                             run,
                             &[
+                                os("-c"),
+                                os("fetch.negotiationAlgorithm=noop"),
                                 os("fetch"),
                                 os("--quiet"),
                                 os("--no-tags"),
@@ -2802,21 +3212,56 @@ mod unix {
                     ],
                     scratch,
                 )?;
+                check_current()?;
                 verified_packs.push(hash.to_owned());
             }
         }
         cache_parents(Path::new(common), into)?;
+        check_current()?;
+        let mut installed = Vec::new();
         if let Some(quarantine) = &quarantine {
             for hash in &verified_packs {
+                check_current()?;
                 for extension in ["pack", "idx"] {
                     let name = format!("pack-{hash}.{extension}");
-                    std::fs::hard_link(quarantine.path().join(&name), pack_directory.join(&name))
-                        .map_err(|error| {
-                        Error::local(format!("install verified checkout pack: {error}"))
-                    })?;
+                    let generated = quarantine.path().join(&name);
+                    let destination = pack_directory.join(&name);
+                    match std::fs::hard_link(&generated, &destination) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            existing_pack_file_matches(&generated, &destination)?;
+                        }
+                        Err(error) => {
+                            return Err(Error::local(format!(
+                                "install verified checkout pack: {error}"
+                            )));
+                        }
+                    }
+                    let (file, before) = hold_intake_file(&destination)?;
+                    installed.push((destination, file, before));
+                }
+                // A name collision never substitutes for verification of the
+                // actual installed pair, including a concurrent identical copy.
+                step(
+                    "checkout-installed-verify",
+                    vec![
+                        os("-c"),
+                        os("protocol.allow=never"),
+                        os("index-pack"),
+                        os("--verify"),
+                        pack_directory
+                            .join(format!("pack-{hash}.pack"))
+                            .into_os_string(),
+                    ],
+                    scratch,
+                )?;
+                check_current()?;
+                for (path, file, before) in &installed {
+                    check_intake_file(path, file, before)?;
                 }
             }
         }
+        check_current()?;
         step(
             "update",
             vec![
@@ -2967,7 +3412,7 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None, None)?;
-        lend_objects(scratch, common, shallow)?;
+        lend_complete_objects(children, run, scratch, common, shallow)?;
         let mut fetch_input = String::new();
         for (index, (source, _)) in sources.iter().enumerate() {
             let _ = writeln!(fetch_input, "+{source}:refs/agh/batch/{index}");
@@ -3022,29 +3467,8 @@ mod unix {
             ));
         }
         check_parents()?;
-        let mut objects_input = String::new();
-        for index in 0..sources.len() {
-            let _ = writeln!(objects_input, "refs/agh/batch/{index}");
-        }
-        let source = scratch.map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf);
-        let imported = step(
-            "objects",
-            vec![
-                os("-C"),
-                dir.as_os_str().to_os_string(),
-                os("-c"),
-                os("protocol.file.allow=always"),
-                os("fetch"),
-                os("--quiet"),
-                os("--no-tags"),
-                os("--no-write-fetch-head"),
-                os("--recurse-submodules=no"),
-                os("--stdin"),
-                source.into_os_string(),
-            ],
-            None,
-            Some(objects_input.as_bytes()),
-        )?;
+        let roots: Vec<_> = sources.iter().map(|(_, oid)| *oid).collect();
+        let imported = import_fetched_objects(children, run, common, &roots)?;
         if batch.rows().is_empty() {
             return Ok(imported);
         }
@@ -3356,11 +3780,7 @@ mod unix {
             ],
             None,
         )?;
-        if shallow.stdout != b"false\n" {
-            return Err(Error::refused(
-                "native push requires a complete, non-shallow source repository",
-            ));
-        }
+        crate::git::require_complete_source(&shallow.stdout)?;
         // A newly created tag has no BEFORE of its own. Observe main too, so
         // a tag of an already published commit need not import its history.
         // This is remote authority, never origin/main or a source accelerator.
@@ -4171,29 +4591,17 @@ mod unix {
                 into,
                 blobless,
             } => {
-                if *blobless {
-                    let out = fetch_tree_scope(children, run, remote, dir, into, None)?;
-                    return Ok(GitOut {
-                        stdout: kept(&out.stdout, redactor),
-                        stderr: kept(&out.stderr, redactor),
-                        as_: profile,
-                        grant,
-                    });
-                }
-                let dir = screened(children, run, dir)?;
-                let mut args = vec![
-                    os("-C"),
-                    dir.into_os_string(),
-                    os("-c"),
-                    os("core.logAllRefUpdates=always"),
-                    os("fetch"),
-                    os("--quiet"),
-                    os("--no-tags"),
-                    os("--no-write-fetch-head"),
-                    os("--recurse-submodules=no"),
-                ];
-                args.extend([url, os(format!("+refs/heads/main:{into}"))]);
-                (args, None)
+                let out = if *blobless {
+                    fetch_tree_scope(children, run, remote, dir, into, None)?
+                } else {
+                    fetch_exact(children, run, remote, dir, "refs/heads/main", into)?
+                };
+                return Ok(GitOut {
+                    stdout: kept(&out.stdout, redactor),
+                    stderr: kept(&out.stderr, redactor),
+                    as_: profile,
+                    grant,
+                });
             }
             GitOp::FetchRef {
                 dir,
@@ -4408,689 +4816,12 @@ mod unix {
     }
 
     #[cfg(test)]
-    mod config_replay_tests {
-        use super::*;
-
-        #[test]
-        fn read_only_config_projection_cannot_replay_as_write_admission() {
-            use crate::fx::tape::{TapeHeader, TapeMode};
-
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-config-replay-")
-                .tempdir()
-                .unwrap();
-            let tape = root.path().join("config.tape");
-            let slug = Slug::new("fixture-dev", "app").unwrap();
-            let input = b"[remote \"origin\"]\npushurl = https://elsewhere.invalid/app\n";
-            let query = ConfigQuery::Names { read_only: true };
-            let mut spec = ChildSpec::new(&find_git(&crate::identity::ProcessEnv).unwrap())
-                .cwd(root.path())
-                .config_input(input, query);
-            for arg in query.args() {
-                spec = spec.arg(*arg);
-            }
-            let mut header = TapeHeader::for_run(
-                &["config-screen".into()],
-                &crate::wire::Endpoints::github_com(),
-            );
-            header.mode = TapeMode::Credentialed;
-            let recording = crate::fx::Fx::record_for_tests(&tape, &header).unwrap();
-            let answer = recording
-                .git(&spec, &config_names_request(&slug, true, "local"))
-                .unwrap();
-            assert_eq!(answer.code, Some(0));
-            screen_projected(&answer.stdout, &slug).unwrap();
-            recording.finish(0).unwrap();
-            let (replay, _) = crate::fx::Fx::replay_for_tests(&tape).unwrap();
-            let write = spec.config_input(input, ConfigQuery::Names { read_only: false });
-            replay
-                .git(&write, &config_names_request(&slug, false, "local"))
-                .expect_err("read-only pushurl permission must not become write permission");
-            assert!(
-                replay.finish(0).is_err(),
-                "the semantic divergence must stay latched"
-            );
-        }
-
-        #[test]
-        fn config_verdict_rejects_unknown_protocol_fields() {
-            let slug = Slug::new("fixture-dev", "app").unwrap();
-            assert!(screen_projected(br#"{"Allowed":{"keys":1,"extra":true}}"#, &slug).is_err());
-        }
-    }
+    mod config_replay_tests;
 
     #[cfg(test)]
-    mod transport_retry_tests {
-        use super::*;
-
-        #[test]
-        fn private_header_trace_recovers_numeric_retry_after_then_is_removed() {
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-git-trace-")
-                .tempdir()
-                .unwrap();
-            let trace = root.path().join("curl.trace");
-            std::fs::write(
-                &trace,
-                b"00:00:00 <= Recv header: HTTP/2 429\r\n\
-                  00:00:00 <= Recv header: Retry-After: 7\r\n",
-            )
-            .unwrap();
-            assert_eq!(
-                git_trace_observation(&trace, None),
-                GitObservation::from_trace(
-                    "00:00:00 <= Recv header: HTTP/2 429\r\n\
-                     00:00:00 <= Recv header: Retry-After: 7\r\n"
-                )
-            );
-            assert!(!trace.exists());
-        }
-
-        #[test]
-        fn private_header_trace_uses_the_run_clock_for_http_date_retry_after() {
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-git-trace-date-")
-                .tempdir()
-                .unwrap();
-            let trace = root.path().join("curl.trace");
-            let text = "00:00:00 <= Recv header: HTTP/2 429\r\n\
-                        00:00:00 <= Recv header: Retry-After: Sun, 08 Nov 2026 12:00:00 GMT\r\n";
-            std::fs::write(&trace, text).unwrap();
-            let now = 1_762_600_000;
-
-            assert_eq!(
-                git_trace_observation(&trace, Some(now)),
-                GitObservation::from_trace_at(text, Some(now))
-            );
-            assert!(!trace.exists());
-        }
-
-        /// NEGATIVE CONTROL: publishing directly into `destination`, or clearing it after a
-        /// failed attempt, removes `caller's-file` and fails this assertion.
-        #[test]
-        fn clone_stage_refuses_to_replace_a_concurrent_destination_file() {
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-clone-stage-")
-                .tempdir()
-                .unwrap();
-            let destination = root.path().join("destination");
-            let stage = CloneStage::for_op(&GitOp::Clone {
-                dest: destination.clone(),
-                depth: None,
-            })
-            .unwrap()
-            .unwrap();
-            let stage_path = stage.path().to_path_buf();
-            std::fs::write(stage.path().join("downloaded"), b"network bytes").unwrap();
-
-            std::fs::create_dir(&destination).unwrap();
-            std::fs::write(destination.join("caller's-file"), b"keep").unwrap();
-            let error = stage
-                .publish()
-                .expect_err("a nonempty destination wins the publish race");
-
-            assert!(error.why.contains("without replacing caller files"));
-            assert_eq!(
-                std::fs::read(destination.join("caller's-file")).unwrap(),
-                b"keep"
-            );
-            assert!(!destination.join("downloaded").exists());
-            assert!(!stage_path.exists(), "only the task-owned stage is cleaned");
-        }
-
-        #[test]
-        fn clone_stage_publishes_over_the_still_empty_admitted_destination() {
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-clone-publish-")
-                .tempdir()
-                .unwrap();
-            let destination = root.path().join("destination");
-            std::fs::create_dir(&destination).unwrap();
-            let stage = CloneStage::for_op(&GitOp::Clone {
-                dest: destination.clone(),
-                depth: None,
-            })
-            .unwrap()
-            .unwrap();
-            std::fs::write(stage.path().join("downloaded"), b"complete").unwrap();
-
-            stage.publish().unwrap();
-
-            assert_eq!(
-                std::fs::read(destination.join("downloaded")).unwrap(),
-                b"complete"
-            );
-        }
-
-        /// NEGATIVE CONTROL: passing the caller destination to the retry cleanup removes its
-        /// file and fails this test.
-        #[test]
-        fn retry_cleanup_removes_only_the_private_clone_stage() {
-            let root = aterm_tempfile::Builder::new()
-                .prefix("agh-clone-retry-cleanup-")
-                .tempdir()
-                .unwrap();
-            let destination = root.path().join("destination");
-            let stage = CloneStage::for_op(&GitOp::Mirror {
-                dest: destination.clone(),
-            })
-            .unwrap()
-            .unwrap();
-            std::fs::write(stage.path().join("partial"), b"partial").unwrap();
-            std::fs::create_dir(&destination).unwrap();
-            std::fs::write(destination.join("caller's-file"), b"keep").unwrap();
-
-            clear_clone_stage(Some(stage.path())).unwrap();
-
-            assert!(std::fs::read_dir(stage.path()).unwrap().next().is_none());
-            assert_eq!(
-                std::fs::read(destination.join("caller's-file")).unwrap(),
-                b"keep"
-            );
-        }
-    }
+    mod transport_retry_tests;
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    /// A stall report names the credential-free operation and its exact internal phase, without
-    /// copying ref rows or raw argv into the diagnostic.
-    #[test]
-    fn progress_wait_name_is_the_canonical_operation_and_step() {
-        assert_eq!(
-            super::unix::waiting_on(
-                b"git fetch-batch fixture/app\nsource 0123\ninto refs/agh/x\nstep fetch"
-            ),
-            "git fetch-batch fixture/app, step fetch"
-        );
-        assert_eq!(
-            super::unix::waiting_on(b"git ls-remote fixture/app\nref refs/heads/main"),
-            "git ls-remote fixture/app"
-        );
-        assert_eq!(
-            super::unix::waiting_on(b"not canonical"),
-            "native git operation"
-        );
-    }
-
-    #[test]
-    fn cutter_helper_uses_only_its_explicit_agh_dispatch() {
-        let helper = super::HelperCommand::for_executable("/owned/aterm-release".into()).unwrap();
-        assert_eq!(helper.args, ["agh"]);
-        assert_eq!(helper.exe, std::path::Path::new("/owned/aterm-release"));
-        assert!(super::HelperCommand::for_executable("/owned/unrelated-cutter".into()).is_err());
-    }
-
-    #[test]
-    fn main_is_fetched_into_no_branch_tag_or_remote_tracking_ref() {
-        assert!(super::into_ok("refs/atpkg-publish/main-of-record"));
-        for bad in [
-            "refs/heads/main",
-            "refs/tags/v1",
-            "refs/remotes/origin/main",
-            "refs/",
-            "main",
-            "refs/x/../y",
-            "refs/x/a:b",
-            "refs/x/.y",
-        ] {
-            assert!(!super::into_ok(bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn the_config_screen_names_every_rewriting_key_and_no_other() {
-        use super::unix::rewrites;
-        for key in [
-            "url.https://x/.insteadof",
-            "url.a.pushinsteadof",
-            "http.proxy",
-            "http.https://x/.sslcainfo",
-            "remote.origin.proxy",
-            "remote.origin.pushurl",
-            "remote.origin.uploadpack",
-            "remote.origin.receivepack",
-            "remote.file:///x.url",
-            "remote.http://127.0.0.1:1/a/b.git.fetch",
-            "core.sshcommand",
-            "core.gitProxy",
-            "core.fsmonitor",
-            "core.hookspath",
-            "core.alternateRefsCommand",
-            "credential.helper",
-            "credential.https://github.com.username",
-            "include.path",
-            "includeif.gitdir:/x.path",
-            "protocol.ext.allow",
-            "extensions.partialClone",
-            "fetch.bundleURI",
-            "bundle.version",
-            "bundle.one.uri",
-            "remote.origin.promisor",
-            "remote.origin.partialCloneFilter",
-            "hook.x.command",
-            "hook.x.event",
-        ] {
-            assert!(rewrites(key), "{key}");
-        }
-        for key in [
-            "remote.origin.url",
-            "remote.origin.fetch",
-            "core.bare",
-            "core.repositoryformatversion",
-            "submodule.recurse",
-            "submodule.sub.url",
-            "branch.main.remote",
-            "user.name",
-            "url.insteadof",
-            "fetch.prune",
-            "extensions.objectformat",
-            "extensions.worktreeconfig",
-        ] {
-            assert!(!rewrites(key), "{key}");
-        }
-    }
-
-    #[test]
-    fn http_transport_tuning_passes_the_config_screen() {
-        // Independent of the implementation's allowlist: restoring the blanket HTTP refusal
-        // fails every row. Mutating an allowed spelling must remain fail-closed.
-        for var in [
-            "postBuffer",
-            "lowSpeedLimit",
-            "lowSpeedTime",
-            "maxRequests",
-            "minSessions",
-            "keepAliveIdle",
-            "keepAliveInterval",
-            "keepAliveCount",
-        ] {
-            for prefix in ["http.", "HTTP.https://github.com/owner/repo.git."] {
-                let key = format!("{prefix}{var}");
-                for read_only in [false, true] {
-                    let project = |key: &str| {
-                        super::unix::project_config_names(
-                            format!("core.bare\0{key}\0").as_bytes(),
-                            read_only,
-                        )
-                    };
-                    let allowed: aterm_json::Value =
-                        aterm_json::from_slice(&project(&key)).unwrap();
-                    assert_eq!(
-                        allowed,
-                        aterm_json::json!({"Allowed": {"keys": 2}}),
-                        "{key}"
-                    );
-                    let unknown = format!("{key}Future");
-                    let refused: aterm_json::Value =
-                        aterm_json::from_slice(&project(&unknown)).unwrap();
-                    assert_eq!(
-                        refused,
-                        aterm_json::json!({"Refused": {"class": "Http"}}),
-                        "{unknown}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn http_security_protocol_and_unknown_options_stay_refused() {
-        // Git 2.54 http_options minus the eight audited tuning variables; both scopes and
-        // both read/write screens must refuse. Values never enter the screen's verdict.
-        for var in [
-            "proxy",
-            "proxyAuthMethod",
-            "proxySSLCert",
-            "proxySSLKey",
-            "proxySSLCertPasswordProtected",
-            "proxySSLCAInfo",
-            "emptyAuth",
-            "proactiveAuth",
-            "delegation",
-            "extraHeader",
-            "cookieFile",
-            "saveCookies",
-            "version",
-            "curloptResolve",
-            "sslVersion",
-            "sslCipherList",
-            "sslVerify",
-            "sslCert",
-            "sslKey",
-            "sslCertPasswordProtected",
-            "sslCAInfo",
-            "sslCAPath",
-            "sslBackend",
-            "sslCertType",
-            "sslKeyType",
-            "schannelCheckRevoke",
-            "schannelUseSSLCAInfo",
-            "pinnedPubkey",
-            "sslTry",
-            "retryAfter",
-            "maxRetries",
-            "maxRetryTime",
-            "noEPSV",
-            "userAgent",
-            "followRedirects",
-            "futureOption",
-            "",
-            "postBuffer.extraHeader",
-        ] {
-            for prefix in ["http.", "HtTp.https://github.com/owner/repo.git."] {
-                let key = format!("{prefix}{var}\0");
-                for read_only in [false, true] {
-                    let verdict: aterm_json::Value = aterm_json::from_slice(
-                        &super::unix::project_config_names(key.as_bytes(), read_only),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        verdict,
-                        aterm_json::json!({"Refused": {"class": "Http"}}),
-                        "{key}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn inventory_movement_is_only_a_conflict_when_an_expected_ref_changed() {
-        use crate::error::{Kind, SideEffect};
-        let owner = "a".repeat(40);
-        let updates = vec![crate::github::refs::RefUpdate {
-            reference: crate::git::RELEASE_LEASE_REF.into(),
-            before: owner.clone(),
-            after: "0".repeat(40),
-        }];
-        let moved_main = format!(
-            "{owner}\t{}\n{}\trefs/heads/main\n",
-            crate::git::RELEASE_LEASE_REF,
-            "b".repeat(40)
-        );
-        let error = super::unix::inventory_change(&updates, moved_main.as_bytes());
-        assert_eq!(
-            (error.kind, error.side_effect),
-            (Kind::CouldNotRun, SideEffect::None)
-        );
-        let moved_lease = moved_main.replacen(&owner, &"c".repeat(40), 1);
-        let error = super::unix::inventory_change(&updates, moved_lease.as_bytes());
-        assert_eq!(
-            (error.kind, error.side_effect),
-            (Kind::Conflict, SideEffect::None)
-        );
-        assert!(error.why.contains(&"c".repeat(40)));
-    }
-
-    #[test]
-    fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
-        use crate::error::{Kind, SideEffect};
-        use crate::fx::child::ChildOut;
-        use crate::github::refs::{AtomicRefBatch, RefUpdate};
-        let before = "b".repeat(40);
-        let actual = "c".repeat(40);
-        let redactor = crate::redact::Redactor::new();
-        let slug = crate::slug::Slug::new("fixture-dev", "app").unwrap();
-        let classify = |op: &super::GitOp, stdout: &str| {
-            super::unix::failed(
-                op,
-                &ChildOut {
-                    code: Some(1),
-                    stdout: stdout.as_bytes().to_vec(),
-                    stderr: Vec::new(),
-                },
-                &redactor,
-                &slug,
-                true,
-            )
-        };
-        let batch = AtomicRefBatch::new(vec![
-            RefUpdate {
-                reference: "refs/heads/main".into(),
-                before: before.clone(),
-                after: "a".repeat(40),
-            },
-            RefUpdate {
-                reference: "refs/tags/other".into(),
-                before: "d".repeat(40),
-                after: "a".repeat(40),
-            },
-        ])
-        .unwrap();
-        let control = crate::git::ControlRefTransaction::new(
-            &before,
-            vec![crate::git::ControlRefChange {
-                reference: crate::git::RELEASE_LEASE_REF.into(),
-                before: Some(before.clone()),
-                after: None,
-            }],
-        )
-        .unwrap();
-        for (op, reference) in [
-            (
-                super::GitOp::PushRefs {
-                    dir: "/unused".into(),
-                    batch,
-                    dry_run: false,
-                },
-                "refs/heads/main",
-            ),
-            (
-                super::GitOp::PushDelete {
-                    reference: "refs/tags/v1".into(),
-                    expect: before.clone(),
-                },
-                "refs/tags/v1",
-            ),
-            (
-                super::GitOp::PushControl {
-                    dir: "/unused".into(),
-                    transaction: control,
-                    dry_run: false,
-                },
-                crate::git::RELEASE_LEASE_REF,
-            ),
-        ] {
-            let line = format!(
-                "!\tcommit:{reference}\t[remote rejected] (cannot lock ref '{reference}': is at {actual} but expected {before})"
-            );
-            let error = classify(&op, &line);
-            assert_eq!(
-                (error.kind, error.side_effect, error.exit()),
-                (Kind::Conflict, SideEffect::None, 9)
-            );
-            for bad in [
-                line.replace(&format!("'{reference}'"), "'refs/heads/other'"),
-                line.replace(
-                    &format!("expected {before}"),
-                    &format!("expected {}", "d".repeat(40)),
-                ),
-                line.replace(&format!("at {actual}"), "at malformed"),
-                line.replace(&format!("at {actual}"), &format!("at {before}")),
-                format!("{line} extra"),
-            ] {
-                assert_ne!(classify(&op, &bad).kind, Kind::Conflict, "{bad}");
-            }
-            for (other, expected) in [
-                ("protected branch hook declined", Kind::Refused),
-                ("failed", Kind::CouldNotRun),
-            ] {
-                let other = format!("!\tcommit:refs/heads/other\t[remote rejected] ({other})");
-                for rows in [format!("{line}\n{other}"), format!("{other}\n{line}")] {
-                    assert_eq!(classify(&op, &rows).kind, expected, "{rows}");
-                }
-            }
-        }
-    }
-
-    /// Step 9 on a leased delete's own push: an exit no phrase names, or a signal, may follow a
-    /// delete GitHub applied, so it is could_not_run with the side effect unknown; the same
-    /// exit of a read, or of the push's scratch `init` (`sent` false), wrote nothing. A
-    /// porcelain `[remote rejected]` line is Refused, nothing written.
-    #[test]
-    fn a_push_s_unnamed_exit_may_have_been_sent() {
-        use crate::error::{Kind, SideEffect};
-        use crate::fx::child::ChildOut;
-        let redactor = crate::redact::Redactor::new();
-        let slug = crate::slug::Slug::new("fixture-dev", "app").expect("a slug");
-        let push = super::GitOp::PushDelete {
-            reference: "refs/tags/v1".to_string(),
-            expect: "0123456789abcdef0123456789abcdef01234567".to_string(),
-        };
-        let read = super::GitOp::LsRemote {
-            reference: None,
-            anonymous: false,
-        };
-        let hung = ChildOut {
-            code: Some(128),
-            stdout: Vec::new(),
-            stderr:
-                b"fatal: HTTP 503 from receive-pack\nfatal: the remote end hung up unexpectedly\n"
-                    .to_vec(),
-        };
-        assert!(
-            super::unix::failed(&push, &hung, &redactor, &slug, true)
-                .why
-                .contains("HTTP 503")
-        );
-        let signalled = ChildOut {
-            code: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
-        for out in [&hung, &signalled] {
-            let error = super::unix::failed(&push, out, &redactor, &slug, true);
-            assert_eq!(
-                (error.kind, error.side_effect),
-                (Kind::CouldNotRun, SideEffect::Unknown),
-                "{}",
-                error.why
-            );
-            for (op, sent) in [(&read, true), (&push, false)] {
-                let error = super::unix::failed(op, out, &redactor, &slug, sent);
-                assert_eq!(
-                    (error.kind, error.side_effect),
-                    (Kind::CouldNotRun, SideEffect::None),
-                    "{op:?}, sent {sent}: {}",
-                    error.why
-                );
-            }
-        }
-        let ruled = ChildOut {
-            code: Some(1),
-            stdout: b"To http://127.0.0.1:1/fixture-dev/app.git\n!\t:refs/tags/v1\t[remote rejected] (protected)\nDone\n"
-                .to_vec(),
-            stderr: b"error: failed to push some refs to 'http://127.0.0.1:1/fixture-dev/app.git'\n"
-                .to_vec(),
-        };
-        let error = super::unix::failed(&push, &ruled, &redactor, &slug, true);
-        assert_eq!(
-            (error.kind, error.side_effect, error.exit()),
-            (Kind::Refused, SideEffect::None, 1),
-            "{}",
-            error.why
-        );
-        assert!(error.why.contains("refs/tags/v1"), "{}", error.why);
-        for (reason, transient) in [
-            ("failed", true),
-            (
-                "cannot lock ref 'refs/tags/v1': unable to create lock file",
-                true,
-            ),
-            ("failed to lock refs", true),
-            ("failed to update ref", true),
-            ("failed to update refs", true),
-            ("transaction failed to start", true),
-            ("atomic transaction failed", true),
-            ("unable to migrate objects to permanent storage", true),
-            ("protected branch hook declined", false),
-            ("pre-receive hook declined", false),
-            ("hook declined", false),
-            ("protected", false),
-            ("permission denied", false),
-            ("repository rule violations found", false),
-            ("unrecognized failure", false),
-            ("atomic push failure", false),
-        ] {
-            let mut out = ruled.clone();
-            out.stdout = format!("!\t:refs/tags/v1\t[remote rejected] ({reason})\n").into_bytes();
-            let error = super::unix::failed(&push, &out, &redactor, &slug, true);
-            assert_eq!(
-                (error.kind, error.side_effect),
-                if transient {
-                    (Kind::CouldNotRun, SideEffect::Unknown)
-                } else {
-                    (Kind::Refused, SideEffect::None)
-                },
-                "{reason}"
-            );
-            assert!(error.why.contains(reason));
-        }
-        for (other, expected) in [
-            ("atomic push failure", Kind::CouldNotRun),
-            ("protected branch hook declined", Kind::Refused),
-        ] {
-            let mut out = ruled.clone();
-            out.stdout =
-                format!("!\t:a\t[remote rejected] ({other})\n!\t:b\t[remote rejected] (failed)\n")
-                    .into_bytes();
-            assert_eq!(
-                super::unix::failed(&push, &out, &redactor, &slug, true).kind,
-                expected
-            );
-            // Reordering rows must preserve a concrete policy refusal.
-            out.stdout =
-                format!("!\t:b\t[remote rejected] (failed)\n!\t:a\t[remote rejected] ({other})\n")
-                    .into_bytes();
-            assert_eq!(
-                super::unix::failed(&push, &out, &redactor, &slug, true).kind,
-                expected
-            );
-        }
-        let stale = ChildOut {
-            code: Some(1),
-            stdout: b"!\t(delete):refs/tags/v1\t[rejected] (stale info)\n".to_vec(),
-            stderr: Vec::new(),
-        };
-        let error = super::unix::failed(&push, &stale, &redactor, &slug, true);
-        assert_eq!(
-            (error.kind, error.side_effect),
-            (Kind::Conflict, SideEffect::None)
-        );
-    }
-
-    /// A learned token that straddles the 64 KiB cut is redacted whole before the cut, so no
-    /// tail of it is kept.
-    #[test]
-    fn a_token_across_the_cut_leaves_no_tail() {
-        let redactor = crate::redact::Redactor::new();
-        let token: String = ["kept", "-learned-", "value", "-TAILQZX"].concat();
-        redactor.learn(token.as_bytes());
-        let pad = "y".repeat(64 * 1024 - 4);
-        let bytes = format!("{token}{pad}");
-        let kept = super::unix::kept(bytes.as_bytes(), &redactor);
-        assert!(!kept.contains("QZX"), "a tail of the token was kept");
-        assert!(kept.len() <= 64 * 1024, "{}", kept.len());
-        let tail = format!("{}\u{e9}", "z".repeat(64 * 1024));
-        let kept = super::unix::kept(tail.as_bytes(), &redactor);
-        assert!(kept.ends_with('\u{e9}'), "the cut kept the last char whole");
-    }
-
-    /// NEGATIVE CONTROL: transient git scratch directories must carry `.noindex` so Spotlight
-    /// never indexes cloned worktrees or credential-helper homes under `$TMPDIR`.
-    #[test]
-    fn git_run_scratch_directory_carries_noindex_suffix() {
-        let (dir, root) = super::unix::scratch().expect("create git scratch");
-        let name = dir
-            .path()
-            .file_name()
-            .and_then(|os| os.to_str())
-            .expect("scratch dir name is UTF-8");
-        assert!(name.starts_with("agh-git-"), "{name}");
-        assert!(name.ends_with(".noindex"), "{name}");
-        assert!(root.ends_with(name), "{}", root.display());
-        assert!(root.join("home").is_dir());
-        assert!(root.join("work").is_dir());
-    }
-}
+#[path = "run_tests.rs"]
+mod tests;

@@ -1,0 +1,663 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use crate::grid::{Cell, CellExtra, CellFlags, PackedColor};
+
+const DEFAULT_FG: Rgb = Rgb {
+    r: 255,
+    g: 255,
+    b: 255,
+};
+const DEFAULT_BG: Rgb = Rgb { r: 0, g: 0, b: 0 };
+
+fn palette() -> ColorPalette {
+    ColorPalette::new()
+}
+
+#[test]
+fn dim_transfer_tables_are_byte_exact() {
+    for c in 0..=255u8 {
+        assert_eq!(
+            srgb_to_linear(c).to_bits(),
+            srgb_to_linear_direct(c).to_bits()
+        );
+    }
+
+    for i in 0..=131_072u32 {
+        let l = i as f32 / 131_072.0;
+        assert_eq!(linear_to_srgb(l), linear_to_srgb_direct(l), "l={l:?}");
+    }
+    for &threshold in &transfer_tables().thresholds {
+        let bits = threshold.to_bits();
+        for candidate in [bits.saturating_sub(1), bits, bits.saturating_add(1)] {
+            let l = f32::from_bits(candidate);
+            assert_eq!(linear_to_srgb(l), linear_to_srgb_direct(l), "l={l:?}");
+        }
+    }
+}
+
+fn resolve(
+    fg: Option<Result<u8, [u8; 3]>>,
+    flags: CellFlags,
+    default_bg: Rgb,
+    reverse_video: bool,
+) -> (Rgb, Rgb) {
+    let mut cell = Cell::default();
+    let mut extra = CellExtra::default();
+    match fg {
+        None => {}
+        Some(Ok(index)) => cell.set_fg(PackedColor::indexed(index)),
+        Some(Err([r, g, b])) => {
+            cell.set_fg(PackedColor::rgb(r, g, b));
+            extra.set_fg_rgb(Some([r, g, b]));
+        }
+    }
+    cell.set_flags(flags);
+    resolve_colors(
+        &cell,
+        Some(&extra),
+        &palette(),
+        DEFAULT_FG,
+        default_bg,
+        reverse_video,
+    )
+}
+
+#[test]
+fn style_attributes_resolve_in_order() {
+    let pal = palette();
+    let light_bg = Rgb::new(240, 240, 240);
+    let rgb = Rgb::new(200, 100, 50);
+    let dim = |c: Rgb, bg: Rgb| dim_toward_bg(c, bg, DIM_FACTOR);
+    let all = CellFlags::BOLD
+        .union(CellFlags::DIM)
+        .union(CellFlags::INVERSE)
+        .union(CellFlags::HIDDEN);
+    #[rustfmt::skip]
+    let cases: [(&str, Option<Result<u8, [u8; 3]>>, CellFlags, Rgb, bool, (Rgb, Rgb)); 14] = [
+        ("plain", None, CellFlags::empty(), DEFAULT_BG, false, (DEFAULT_FG, DEFAULT_BG)),
+        ("custom bg", None, CellFlags::empty(), light_bg, false, (DEFAULT_FG, light_bg)),
+        ("dim ansi", Some(Ok(1)), CellFlags::DIM, DEFAULT_BG, false, (dim(pal.get(1), DEFAULT_BG), DEFAULT_BG)),
+        ("dim rgb", Some(Err([200, 100, 50])), CellFlags::DIM, DEFAULT_BG, false, (dim(rgb, DEFAULT_BG), DEFAULT_BG)),
+        ("dim on light", Some(Err([40, 40, 40])), CellFlags::DIM, light_bg, false, (dim(Rgb::new(40, 40, 40), light_bg), light_bg)),
+        ("bold promotes", Some(Ok(3)), CellFlags::BOLD, DEFAULT_BG, false, (pal.get(11), DEFAULT_BG)),
+        ("bold bright", Some(Ok(10)), CellFlags::BOLD, DEFAULT_BG, false, (pal.get(10), DEFAULT_BG)),
+        ("bold rgb", Some(Err([200, 100, 50])), CellFlags::BOLD, DEFAULT_BG, false, (rgb, DEFAULT_BG)),
+        ("bold+dim", Some(Ok(1)), CellFlags::BOLD.union(CellFlags::DIM), DEFAULT_BG, false, (dim(pal.get(1), DEFAULT_BG), DEFAULT_BG)),
+        ("inverse", None, CellFlags::INVERSE, DEFAULT_BG, false, (DEFAULT_BG, DEFAULT_FG)),
+        ("decscnm", None, CellFlags::empty(), DEFAULT_BG, true, (DEFAULT_BG, DEFAULT_FG)),
+        ("decscnm+inverse", None, CellFlags::INVERSE, DEFAULT_BG, true, (DEFAULT_FG, DEFAULT_BG)),
+        ("hidden", None, CellFlags::HIDDEN, DEFAULT_BG, false, (DEFAULT_BG, DEFAULT_BG)),
+        ("hidden+inverse", None, CellFlags::HIDDEN.union(CellFlags::INVERSE), DEFAULT_BG, false, (DEFAULT_FG, DEFAULT_FG)),
+    ];
+    for (name, fg, flags, bg, reverse, want) in cases {
+        assert_eq!(resolve(fg, flags, bg, reverse), want, "{name}");
+    }
+    let dimmed = dim(pal.get(2), DEFAULT_BG);
+    assert_eq!(
+        resolve(Some(Ok(2)), all, DEFAULT_BG, false),
+        (dimmed, dimmed),
+        "every flag at once"
+    );
+    let (on_light, _) = resolve(Some(Err([40, 40, 40])), CellFlags::DIM, light_bg, false);
+    assert!(
+        on_light.r > 40,
+        "dim dark-on-light text moves TOWARD the light bg, not toward black: {on_light:?}"
+    );
+}
+
+#[test]
+fn test_bold_is_bright_off_keeps_base_color() {
+    let mut cell = Cell::default();
+    cell.set_fg(PackedColor::indexed(3));
+    cell.set_flags(CellFlags::BOLD);
+    let pal = palette();
+    let opts_off = StyleResolveOpts {
+        bold_is_bright: false,
+        ..StyleResolveOpts::default()
+    };
+    let (fg, _) = resolve_colors_raw_opts(
+        &cell, None, None, &pal, DEFAULT_FG, DEFAULT_BG, false, opts_off,
+    );
+    assert_eq!(fg, pal.get(3), "no promotion when the policy is off");
+}
+
+fn contrast(a: Rgb, b: Rgb) -> f32 {
+    let l = |c: Rgb| {
+        0.2126 * srgb_to_linear(c.r) + 0.7152 * srgb_to_linear(c.g) + 0.0722 * srgb_to_linear(c.b)
+    };
+    let (la, lb) = (l(a), l(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[test]
+fn floor_contrast_reaches_the_ratio_or_the_best_pole() {
+    let vals = [0u8, 51, 102, 153, 204, 255];
+    let mut lattice = Vec::new();
+    for r in vals {
+        for g in vals {
+            for b in vals {
+                lattice.push(Rgb::new(r, g, b));
+            }
+        }
+    }
+    let inks = [
+        [Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18)],
+        [Rgb::new(0x2B, 0x2D, 0x33), Rgb::new(0xF6, 0xF7, 0xF9)],
+        [Rgb::new(0x80, 0x80, 0x80), Rgb::new(0x90, 0x90, 0x90)],
+    ];
+    let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(255, 255, 255));
+    for &bg in &lattice {
+        let best = contrast(black, bg).max(contrast(white, bg));
+        for &fg in &lattice {
+            for min in [3.0f32, 4.5, 7.0] {
+                let floors = std::iter::once(floor_contrast(fg, bg, min))
+                    .chain(inks.map(|inks| floor_contrast_on_colour(fg, bg, min, inks)));
+                for out in floors {
+                    if contrast(fg, bg) >= min {
+                        assert_eq!(out, fg, "{fg:?} on {bg:?} at {min}: kept");
+                    } else {
+                        let got = contrast(out, bg);
+                        assert!(
+                            got >= min.min(best) - 1e-4,
+                            "{fg:?} on {bg:?} at {min}: {out:?} is {got:.3}:1, best {best:.3}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_flip_on_a_coloured_cell_takes_the_theme_ink() {
+    let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
+    let dark = [ink, page];
+    let (yellow, green) = (Rgb::new(0xCD, 0xCD, 0), Rgb::new(0, 0xCD, 0));
+    assert_eq!(floor_contrast(ink, yellow, 4.5), Rgb::new(0x53, 0x53, 0x53));
+    assert_eq!(floor_contrast(ink, green, 4.5), Rgb::new(0x3E, 0x3E, 0x3E));
+    for cell in [
+        yellow,
+        green,
+        Rgb::new(0xE5, 0xC0, 0x7B),
+        Rgb::new(0x98, 0xC3, 0x79),
+        Rgb::new(0x56, 0xB6, 0xC2),
+    ] {
+        let out = floor_contrast_on_colour(ink, cell, 4.5, dark);
+        assert_eq!(out, page, "on {cell:?}");
+        assert!(contrast(out, cell) >= 7.0, "on {cell:?}");
+    }
+    let (light_ink, light_page) = (Rgb::new(0x2B, 0x2D, 0x33), Rgb::new(0xF6, 0xF7, 0xF9));
+    let blue = Rgb::new(0x0B, 0x5C, 0xC4);
+    assert_eq!(
+        floor_contrast_on_colour(light_ink, blue, 4.5, [light_ink, light_page]),
+        light_page
+    );
+    let on = StyleResolveOpts {
+        indexed_minimum_contrast: 4.5,
+        ..StyleResolveOpts::default()
+    };
+    let pal = ColorPalette::new();
+    for (fg, bg, flags) in [
+        (
+            PackedColor::DEFAULT_FG,
+            PackedColor::indexed(3),
+            CellFlags::empty(),
+        ),
+        (
+            PackedColor::indexed(3),
+            PackedColor::DEFAULT_BG,
+            CellFlags::INVERSE,
+        ),
+    ] {
+        let cell = Cell::with_style('x', fg, bg, flags);
+        let got = resolve_colors_raw_opts(&cell, None, None, &pal, ink, page, false, on);
+        assert_eq!(got, (page, pal.get(3)), "{fg:?} on {bg:?} {flags:?}");
+    }
+    let greys = [Rgb::new(0x80, 0x80, 0x80), Rgb::new(0x90, 0x90, 0x90)];
+    assert_eq!(
+        floor_contrast_on_colour(ink, yellow, 4.5, greys),
+        Rgb::new(0, 0, 0)
+    );
+    for (fg, cell) in [
+        (Rgb::new(0x8A, 0x61, 0x00), Rgb::new(0xBC, 0xC9, 0xE0)),
+        (Rgb::new(0x29, 0x73, 0xD0), page),
+        (ink, Rgb::new(0x29, 0x73, 0xD0)),
+    ] {
+        assert_eq!(
+            floor_contrast_on_colour(fg, cell, 4.5, dark),
+            floor_contrast(fg, cell, 4.5),
+            "{fg:?} on {cell:?}"
+        );
+    }
+}
+
+#[test]
+fn a_halfway_nudge_on_a_coloured_cell_takes_the_theme_ink() {
+    let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
+    let dark = [ink, page];
+    let mut cells = vec![
+        (Rgb::new(0xE5, 0xE5, 0xE5), 0x53),
+        (Rgb::new(0xFF, 0xFF, 0xFF), 0x68),
+        (Rgb::new(0x50, 0xFA, 0x7B), 0x53),
+        (Rgb::new(0xF1, 0xFA, 0x8C), 0x68),
+        (Rgb::new(0x8B, 0xE9, 0xFD), 0x53),
+    ];
+    for slot in [7, 10, 11, 14, 15] {
+        let cell = ColorPalette::default_color(slot);
+        let grey = floor_contrast(ink, cell, 4.5).r;
+        cells.push((cell, grey));
+    }
+    for (cell, mud) in cells {
+        let nudged = floor_contrast(ink, cell, 4.5);
+        assert_eq!(nudged, Rgb::new(mud, mud, mud), "control on {cell:?}");
+        assert!(nudged.r <= 0x68, "halfway or further on {cell:?}");
+        let out = floor_contrast_on_colour(ink, cell, 4.5, dark);
+        assert_eq!(out, page, "on {cell:?}");
+        assert!(contrast(out, cell) >= 10.0, "on {cell:?}");
+        assert!(contrast(out, cell) > contrast(nudged, cell), "on {cell:?}");
+    }
+    let on = StyleResolveOpts {
+        indexed_minimum_contrast: 4.5,
+        ..StyleResolveOpts::default()
+    };
+    let pal = ColorPalette::new();
+    for slot in [7, 10] {
+        let cell = Cell::with_style(
+            'x',
+            PackedColor::DEFAULT_FG,
+            PackedColor::indexed(slot),
+            CellFlags::empty(),
+        );
+        let got = resolve_colors_raw_opts(&cell, None, None, &pal, ink, page, false, on);
+        assert_eq!(got, (page, pal.get(slot)), "on slot {slot}");
+    }
+    let white = Rgb::new(0xE5, 0xE5, 0xE5);
+    for (fg, cell, hue) in [
+        (Rgb::new(0xE0, 0x6C, 0x75), Rgb::new(0xF1, 0xFA, 0x8C), 0),
+        (Rgb::new(0x98, 0xC3, 0x79), white, 1),
+        (Rgb::new(0x50, 0xFA, 0x7B), white, 1),
+    ] {
+        let darker = floor_contrast(fg, cell, 4.5);
+        let channels = [darker.r, darker.g, darker.b];
+        assert_eq!(
+            channels
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &v)| v)
+                .map(|(i, _)| i),
+            Some(hue),
+            "{fg:?} on {cell:?} keeps its hue: {darker:?}"
+        );
+        assert_eq!(floor_contrast_on_colour(fg, cell, 4.5, dark), darker);
+    }
+}
+
+#[test]
+fn aterm_own_colours_are_held_to_body_text_on_the_page() {
+    let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
+    let on = StyleResolveOpts {
+        indexed_minimum_contrast: 4.5,
+        ..StyleResolveOpts::default()
+    };
+    let run = |pal: &ColorPalette, fg: PackedColor, bg: PackedColor, flags: CellFlags| {
+        let cell = Cell::with_style('x', fg, bg, flags);
+        resolve_colors_raw_opts(&cell, None, None, pal, ink, page, false, on)
+    };
+    let own = ColorPalette::new();
+    let db = PackedColor::DEFAULT_BG;
+    for slot in 1..=6u8 {
+        let (fg, _) = run(&own, PackedColor::indexed(slot), db, CellFlags::empty());
+        assert!(contrast(fg, page) >= 4.5, "slot {slot}: {fg:?}");
+    }
+    let windows_blue = Rgb::new(0x29, 0x73, 0xD0);
+    assert!(
+        contrast(
+            floor_contrast(windows_blue, page, THEME_BACKGROUND_FLOOR),
+            page
+        ) < 4.0
+    );
+    let mut themed = ColorPalette::new();
+    themed.set(4, windows_blue);
+    let (fg, _) = run(&themed, PackedColor::indexed(4), db, CellFlags::empty());
+    if cfg!(windows) {
+        assert_eq!(fg, Rgb::new(0x3E, 0x81, 0xD5), "aterm's own blue, lifted");
+        let (faint, _) = run(&themed, PackedColor::indexed(4), db, CellFlags::DIM);
+        assert!(contrast(faint, page) >= 2.98, "faint blue: {faint:?}");
+        let (dir, ground) = run(
+            &themed,
+            PackedColor::DEFAULT_FG,
+            PackedColor::indexed(4),
+            CellFlags::BOLD,
+        );
+        assert_eq!(ground, windows_blue);
+        assert!(contrast(dir, ground) >= 4.5 && dir.r >= 0xF0, "{dir:?}");
+    } else {
+        assert_eq!(fg, windows_blue, "a theme's 3.9:1 slot keeps its tone");
+    }
+    let theirs = Rgb::new(0x29, 0x73, 0xD1);
+    themed.set(4, theirs);
+    let (fg, _) = run(&themed, PackedColor::indexed(4), db, CellFlags::empty());
+    assert_eq!(fg, theirs, "a theme's 3.9:1 slot keeps its tone");
+}
+
+#[test]
+fn theme_pairs_are_floored_and_a_programs_own_colours_are_not() {
+    let page = Rgb::new(0x11, 0x13, 0x18);
+    let ink = Rgb::new(0xD0, 0xD0, 0xD0);
+    let mut pal = ColorPalette::new();
+    pal.set(0, Rgb::new(0, 0, 0));
+    pal.set(4, Rgb::new(0x3B, 0x8E, 0xEA));
+    let blue = pal.get(4);
+    let on = StyleResolveOpts {
+        indexed_minimum_contrast: 4.5,
+        ..StyleResolveOpts::default()
+    };
+    let off = StyleResolveOpts::default();
+    let d = PackedColor::DEFAULT_FG;
+    let db = PackedColor::DEFAULT_BG;
+    let ix = PackedColor::indexed;
+    let run_screen =
+        |ch: char, fg: PackedColor, bg: PackedColor, flags: CellFlags, opts, decscnm| {
+            let cell = Cell::with_style(ch, fg, bg, flags);
+            let fg_rgb = (fg.0 >> 24 == 1).then(|| {
+                let (r, g, b) = fg.rgb_components();
+                [r, g, b]
+            });
+            resolve_colors_raw_opts(&cell, fg_rgb, None, &pal, ink, page, decscnm, opts)
+        };
+    let run = |ch: char, fg: PackedColor, bg: PackedColor, flags: CellFlags, opts| {
+        run_screen(ch, fg, bg, flags, opts, false)
+    };
+
+    let (fg, bg) = run('t', d, ix(4), CellFlags::BOLD, off);
+    assert_eq!((fg, bg), (ink, blue), "off: the old 2.18:1");
+    assert!(contrast(fg, bg) < 2.5);
+    let (fg, bg) = run('t', d, ix(4), CellFlags::BOLD, on);
+    assert_eq!(bg, blue, "only the foreground moves");
+    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+
+    let (fg, _) = run('x', ix(0), db, CellFlags::empty(), on);
+    let c = contrast(fg, page);
+    assert!((THEME_BACKGROUND_FLOOR..4.5).contains(&c), "{fg:?}: {c:.2}");
+
+    let (fg, bg) = run('x', ix(4), db, CellFlags::INVERSE, on);
+    assert_eq!(bg, blue);
+    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+
+    let (fg, bg) = run('x', d, ix(4), CellFlags::INVERSE, on);
+    assert_eq!(bg, ink);
+    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+
+    let page_cap = if blue == ColorPalette::default_color(4) {
+        DEFAULT_PALETTE_TEXT_FLOOR
+    } else {
+        THEME_BACKGROUND_FLOOR
+    };
+    let (fg, bg) = run_screen('x', d, ix(4), CellFlags::empty(), on, true);
+    assert_eq!(bg, ink);
+    let c = contrast(fg, bg);
+    assert!((page_cap..page_cap + 1.5).contains(&c), "{fg:?}: {c:.2}");
+    let (fg, bg) = run_screen('x', ix(0), db, CellFlags::INVERSE, on, true);
+    assert_eq!(bg, page);
+    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+
+    let (floored, _) = run('t', d, ix(4), CellFlags::empty(), on);
+    let (faint, _) = run('t', d, ix(4), CellFlags::DIM, on);
+    assert_eq!(faint, dim_toward_bg(floored, blue, DIM_FACTOR));
+
+    let (fg, bg) = resolve_colors_raw_opts(
+        &Cell::with_style('t', d, ix(4), CellFlags::empty()),
+        None,
+        None,
+        &pal,
+        blue,
+        page,
+        false,
+        on,
+    );
+    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+
+    let exact = [
+        (
+            't',
+            PackedColor::rgb(0xD0, 0xD0, 0xD0),
+            ix(4),
+            CellFlags::empty(),
+            ink,
+        ),
+        ('t', ix(17), ix(4), CellFlags::empty(), pal.get(17)),
+        ('\u{2580}', d, ix(4), CellFlags::empty(), ink),
+        ('\u{E0B0}', d, ix(4), CellFlags::empty(), ink),
+        ('t', ix(4), ix(4), CellFlags::HIDDEN, blue),
+        ('t', ix(4), ix(4), CellFlags::empty(), blue),
+    ];
+    for (ch, fg, bg, flags, want) in exact {
+        assert_eq!(
+            run(ch, fg, bg, flags, on).0,
+            want,
+            "{ch:?} {fg:?} {flags:?}"
+        );
+    }
+    let dim_default = Rgb::new(0x20, 0x22, 0x28);
+    let cell = Cell::with_style('t', d, db, CellFlags::empty());
+    let (fg, _) = resolve_colors_raw_opts(&cell, None, None, &pal, dim_default, page, false, on);
+    assert_eq!(fg, dim_default, "the theme's own body text is its business");
+}
+
+fn builtin_palette(name: &str) -> (ColorPalette, Rgb, Rgb) {
+    let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
+    let mut pal = ColorPalette::new();
+    for (slot, colour) in (0u8..).zip(scheme.ansi) {
+        pal.set(slot, colour);
+    }
+    (pal, scheme.foreground, scheme.background)
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table of drawn pairs, each with its before and after"
+)]
+fn a_light_themes_dark_white_reads_light_on_a_colour() {
+    let (pal, ink, page) = builtin_palette("Default Light");
+    let (slate, grey) = (pal.get(15), pal.get(7));
+    assert_eq!(slate, Rgb::new(0x47, 0x4D, 0x57));
+    assert_eq!(grey, Rgb::new(0x6B, 0x72, 0x80));
+    let opts = |ratio: f32| StyleResolveOpts {
+        indexed_minimum_contrast: ratio,
+        ..StyleResolveOpts::default()
+    };
+    let teal = [0x00, 0x5F, 0x87];
+    let run = |light_whites: bool,
+               ch: char,
+               fg: PackedColor,
+               bg: PackedColor,
+               flags: CellFlags,
+               ratio: f32,
+               decscnm: bool| {
+        let cell = Cell::with_style(ch, fg, bg, flags);
+        let bg_rgb = (bg.0 >> 24 == 1).then_some(teal);
+        if light_whites {
+            resolve_colors_raw_opts(&cell, None, bg_rgb, &pal, ink, page, decscnm, opts(ratio))
+        } else {
+            resolve_both_with::<false>(cell, None, bg_rgb, &pal, ink, page, decscnm, opts(ratio))
+        }
+    };
+    let ix = PackedColor::indexed;
+    let [r, g, b] = teal;
+    let rgb = PackedColor::rgb(r, g, b);
+    let (none, bold) = (CellFlags::empty(), CellFlags::BOLD);
+    let cases = [
+        ("97;41", ix(15), ix(1), none, slate, 1.49, page, 5.35, page),
+        ("97;42", ix(15), ix(2), none, slate, 1.68, page, 4.74, page),
+        ("97;44", ix(15), ix(4), none, slate, 1.35, page, 5.86, page),
+        ("37;41", ix(7), ix(1), none, grey, 1.19, page, 5.35, page),
+        ("1;37;41", ix(7), ix(1), bold, slate, 1.49, page, 5.35, page),
+        (
+            "97;40",
+            ix(15),
+            ix(0),
+            none,
+            slate,
+            1.62,
+            page,
+            12.84,
+            Rgb::new(0x91, 0x94, 0x9A),
+        ),
+        (
+            "37;40",
+            ix(7),
+            ix(0),
+            none,
+            grey,
+            2.85,
+            page,
+            12.84,
+            Rgb::new(0x97, 0x9C, 0xA6),
+        ),
+        (
+            "97 on 24-bit",
+            ix(15),
+            rgb,
+            none,
+            slate,
+            1.21,
+            page,
+            6.56,
+            slate,
+        ),
+        (
+            "97 on 256:24",
+            ix(15),
+            ix(24),
+            none,
+            slate,
+            1.21,
+            page,
+            6.56,
+            slate,
+        ),
+        ("30;42", ix(0), ix(2), none, ink, 2.71, page, 4.74, page),
+    ];
+    for (label, fg, bg, flags, off_fg, off_c, on_fg, on_c, control) in cases {
+        let (got, ground) = run(true, 'x', fg, bg, flags, 1.0, false);
+        assert_eq!(got, off_fg, "{label}, the floor off");
+        let c = contrast(got, ground);
+        assert!((c - off_c).abs() < 0.01, "{label}, the floor off: {c:.2}");
+        let (got, ground) = run(true, 'x', fg, bg, flags, 4.5, false);
+        assert_eq!(got, on_fg, "{label}, floored");
+        let c = contrast(got, ground);
+        assert!((c - on_c).abs() < 0.01, "{label}, floored: {c:.2}");
+        let (without, _) = run(false, 'x', fg, bg, flags, 4.5, false);
+        assert_eq!(without, control, "{label}: CONTROL, the floor alone");
+    }
+    assert!(contrast(Rgb::new(0x91, 0x94, 0x9A), ink) < 4.6);
+
+    let d = PackedColor::DEFAULT_FG;
+    let db = PackedColor::DEFAULT_BG;
+    assert_eq!(
+        run(true, 'x', d, ix(7), CellFlags::INVERSE, 4.5, false),
+        (page, ink)
+    );
+    assert_eq!(run(true, 'x', d, ix(7), none, 4.5, true), (page, ink));
+    assert_eq!(run(true, 'x', ix(7), ix(15), none, 4.5, false).0, page);
+    assert_eq!(run(true, 'x', ix(15), ix(15), none, 4.5, false).0, slate);
+    for (ch, fg, bg, flags, want) in [
+        ('x', ix(15), db, none, (slate, page)),
+        ('x', ix(15), db, CellFlags::INVERSE, (page, slate)),
+        ('\u{2580}', ix(15), ix(4), none, (slate, pal.get(4))),
+        ('\u{E0B0}', ix(15), ix(4), none, (slate, pal.get(4))),
+        ('\u{2500}', ix(7), ix(4), none, (grey, pal.get(4))),
+        (
+            'x',
+            ix(15),
+            ix(1),
+            CellFlags::HIDDEN,
+            (pal.get(1), pal.get(1)),
+        ),
+    ] {
+        assert_eq!(run(true, ch, fg, bg, flags, 4.5, false), want, "{ch:?}");
+    }
+}
+
+#[test]
+fn only_a_light_themes_dark_white_on_a_colour_moves() {
+    let flag_sets = [
+        CellFlags::empty(),
+        CellFlags::BOLD,
+        CellFlags::INVERSE,
+        CellFlags::BOLD.union(CellFlags::INVERSE),
+        CellFlags::DIM,
+        CellFlags::HIDDEN,
+    ];
+    let colours: Vec<PackedColor> = std::iter::once(PackedColor::DEFAULT_FG)
+        .chain((0..16).map(PackedColor::indexed))
+        .collect();
+    let grounds: Vec<PackedColor> = std::iter::once(PackedColor::DEFAULT_BG)
+        .chain((0..16).map(PackedColor::indexed))
+        .chain(std::iter::once(PackedColor::rgb(0x00, 0x5F, 0x87)))
+        .collect();
+    let mut moved = std::collections::BTreeMap::new();
+    for name in aterm_types::scheme::builtin_names() {
+        let (pal, ink, page) = builtin_palette(name);
+        let light = wcag_luminance(page) > wcag_luminance(ink);
+        for &fg in &colours {
+            for &bg in &grounds {
+                let bg_rgb = (bg.0 >> 24 == 1).then_some([0x00, 0x5F, 0x87]);
+                for flags in flag_sets {
+                    for decscnm in [false, true] {
+                        for ratio in [1.0f32, 4.5] {
+                            let cell = Cell::with_style('x', fg, bg, flags);
+                            let opts = StyleResolveOpts {
+                                indexed_minimum_contrast: ratio,
+                                ..StyleResolveOpts::default()
+                            };
+                            let args = (cell, None, bg_rgb, &pal, ink, page, decscnm, opts);
+                            let new = resolve_colors_raw_opts(
+                                &args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                            );
+                            let old = resolve_both_with::<false>(
+                                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                            );
+                            if new == old {
+                                continue;
+                            }
+                            let what = format!("{name}: {fg:?} on {bg:?} {flags:?} {decscnm}");
+                            assert!(light && name != "Solarized Light", "{what}");
+                            assert!(ratio > 1.0, "{what}: the floor off");
+                            assert_eq!(new.1, old.1, "{what}: the ground stays");
+                            let on_page = bg == PackedColor::DEFAULT_BG
+                                && !flags.contains(CellFlags::INVERSE)
+                                && !decscnm;
+                            assert!(!on_page, "{what}: the page keeps its white");
+                            if !flags.contains(CellFlags::DIM) {
+                                let (c_new, c_old) =
+                                    (contrast(new.0, new.1), contrast(old.0, old.1));
+                                assert!(
+                                    c_new >= c_old.min(4.5) - 1e-3,
+                                    "{what}: {c_new:.2} < {c_old:.2}"
+                                );
+                            }
+                            *moved.entry(name).or_insert(0u32) += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for name in [
+        "Aterm Day",
+        "Linen",
+        "Default Light",
+        "Gruvbox Light",
+        "GitHub Light",
+        "Catppuccin Latte",
+    ] {
+        assert!(
+            moved.get(name).copied().unwrap_or(0) > 0,
+            "{name}: {moved:?}"
+        );
+    }
+}

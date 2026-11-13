@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use aterm_net::fleet::{DriveGrant, NodeKey};
+use aterm_types::control_verbs::Requester;
+use aterm_types::fleet_access::FleetAccess;
 use aterm_uds::CtlStream;
 
 use super::super::{
@@ -86,6 +88,8 @@ impl Holds {
 /// answers each as a window's drive gate would.
 struct TestWindow {
     served: Arc<Mutex<Vec<String>>>,
+    /// Each drive's requester, as the window read it in the drive's relay header.
+    requesters: Arc<Mutex<Vec<Requester>>>,
     stop: Arc<AtomicBool>,
     serving: Option<std::thread::JoinHandle<()>>,
 }
@@ -93,24 +97,34 @@ struct TestWindow {
 impl TestWindow {
     fn open(relay_dir: &Path, pid: u32, holds: Holds, every_drive: bool) -> Self {
         let served = Arc::new(Mutex::new(Vec::new()));
+        let requesters = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let serving = {
             let dir = relay_dir.to_path_buf();
             let stop = Arc::clone(&stop);
             let served = Arc::clone(&served);
+            let requesters = Arc::clone(&requesters);
             let hosting = holds.clone();
             std::thread::spawn(move || {
                 let hosts = move |sid: &SessionId| every_drive || hosting.holds(sid.as_str());
                 let _ =
                     serve_window_relay_at(&dir, pid, Some(&stop), hosts, move |header, stream| {
                         let served = Arc::clone(&served);
+                        let requesters = Arc::clone(&requesters);
                         let holds = holds.clone();
                         std::thread::spawn(move || match header {
-                            RelayHeader::Drive { .. } => serve_drive(pid, stream, &holds, &served),
+                            RelayHeader::Drive { requester, .. } => {
+                                requesters
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(requester);
+                                serve_drive(pid, stream, &holds, &served);
+                            }
                             RelayHeader::Survey { .. } => {
                                 serve_survey(pid, stream, &holds, &served)
                             }
-                            RelayHeader::Ask { .. } | RelayHeader::Needs => {}
+                            RelayHeader::Ask { .. } | RelayHeader::Applies | RelayHeader::Needs => {
+                            }
                         });
                         true
                     });
@@ -122,6 +136,7 @@ impl TestWindow {
         });
         Self {
             served,
+            requesters,
             stop,
             serving: Some(serving),
         }
@@ -129,6 +144,13 @@ impl TestWindow {
 
     fn served(&self) -> Vec<String> {
         self.served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn requesters(&self) -> Vec<Requester> {
+        self.requesters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -309,10 +331,24 @@ fn two_pids(stand_in: &StandIn) -> (u32, u32) {
     (mine.min(other), mine.max(other))
 }
 
-/// Hand `line` to this Mac's node drive as a driver's connection does, over `relay_dir`'s windows
-/// with `app` the installed app's, and read the whole answer.
+/// Hand `line` to this Mac's node drive as a driver's connection does, behind a requester line
+/// that names nobody, over `relay_dir`'s windows with `app` the installed app's, and read the
+/// whole answer.
 fn drive(relay_dir: &Path, app: Option<u32>, line: &str) -> String {
+    // These drives are about which window serves a line: this scratch Mac admits every act.
+    drive_sending(
+        relay_dir,
+        app,
+        FleetAccess::Full,
+        &format!("{}{line}\n", Requester::default().line()),
+    )
+}
+
+/// [`drive`] sending `sent` whole, on a Mac at fleet access `access`.
+fn drive_sending(relay_dir: &Path, app: Option<u32>, access: FleetAccess, sent: &str) -> String {
     let state = aterm_tempfile::tempdir().expect("state dir");
+    aterm_agent::fleet_access::set(state.path(), access, aterm_agent::fleet_access::By::Cli)
+        .expect("store the access");
     let windows = WindowRelays::new(relay_dir.to_path_buf(), Arc::new(Apps { app }));
     let node = "ab".repeat(16);
     let table = Arc::new(NodeOpenTable::default());
@@ -342,8 +378,7 @@ fn drive(relay_dir: &Path, app: Option<u32>, line: &str) -> String {
     )
     .expect("the drive starts");
     // A driver keeps its side open while it waits, as a wait's window reads a close as a hang-up.
-    far.write_all(format!("{line}\n").as_bytes())
-        .expect("the line");
+    far.write_all(sent.as_bytes()).expect("the lines");
     let mut answer = read_line_raw(&mut far, 4096)
         .expect("an answer")
         .expect("a status line");
@@ -396,6 +431,56 @@ fn a_drive_naming_a_session_reaches_the_window_that_hosts_it() {
     );
     assert_eq!(new.served(), ["@s-0d status"]);
     assert!(old.served().is_empty());
+}
+
+/// A NODE DRIVE HANDS ITS WINDOW THE REQUESTER ITS DRIVER SENT, in the relay header, never as a
+/// line ahead of the request (which a window of the build before requesters would serve as one,
+/// and answer every request after it one reply late): the session, program, model and account
+/// reach it whole, and the first line the window serves is the request.
+/// NEGATIVE CONTROLS: a drive whose first line is a request, and one whose requester names a
+/// session aterm never minted, are refused `ERR drive:` before the fleet access lock judges the
+/// spawn behind them, and reach no window; a well-formed requester's spawn reaches the lock,
+/// which refuses it on this Read Only Mac.
+#[test]
+fn a_node_drive_hands_its_window_the_requester_and_refuses_a_drive_without_one() {
+    let stand_in = StandIn::start();
+    let (older, _) = two_pids(&stand_in);
+    let relay = crate::test_scratch::short_dir("dr1-req");
+    let window = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
+    let asked = Requester::of(
+        Some("s-0123456789abcdef0123"),
+        Some("claude"),
+        Some("Opus 5.5"),
+        Some("team acct"),
+    );
+    let answer = drive_sending(
+        relay.path(),
+        Some(older),
+        FleetAccess::Full,
+        &format!("{}@s-0d status\n", asked.line()),
+    );
+    assert_eq!(answer, format!("OK 1\nwindow={older} status s-0d\n"));
+    assert_eq!(window.requesters(), [asked]);
+    assert_eq!(window.served(), ["@s-0d status"]);
+    for sent in [
+        "spawn cwd=/tmp\n".to_owned(),
+        "requester sid=worker program=- model=- account=-\nspawn cwd=/tmp\n".to_owned(),
+    ] {
+        let answer = drive_sending(relay.path(), Some(older), FleetAccess::ReadOnly, &sent);
+        assert!(answer.starts_with("ERR drive: "), "{sent:?}: {answer}");
+    }
+    let answer = drive_sending(
+        relay.path(),
+        Some(older),
+        FleetAccess::ReadOnly,
+        &format!("{}spawn cwd=/tmp\n", Requester::default().line()),
+    );
+    assert!(
+        answer.starts_with(aterm_types::control_verbs::DRIVE_LOCKED),
+        "CONTROL: {answer}"
+    );
+    assert_eq!(window.served(), ["@s-0d status"]);
+    assert_eq!(window.requesters().len(), 1);
 }
 
 /// A DRIVE NAMING NO SESSION REACHES THE INSTALLED APP'S WINDOW: `spawn` goes to the window that

@@ -41,6 +41,7 @@ fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }],
     }
 }

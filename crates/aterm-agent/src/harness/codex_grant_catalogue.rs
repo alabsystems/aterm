@@ -435,7 +435,7 @@ fn allowed_phase(old: CataloguePhase, next: CataloguePhase) -> bool {
                     | CataloguePhase::Quarantined
                     | CataloguePhase::Rejected
                     | CataloguePhase::NotDispatched
-            )
+            ) | (CataloguePhase::Received, CataloguePhase::Retired)
         )
 }
 
@@ -509,6 +509,14 @@ impl LineageFacts {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Retirement {
+    binding: GrantBinding,
+    owner: codex_enrollment::OwnerWitness,
+    settled_at: i64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
     schema: u32,
     scope: CatalogueScope,
@@ -518,6 +526,8 @@ struct Entry {
     reference: Option<GrantReference>,
     facts: Option<LineageFacts>,
     response_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement: Option<Retirement>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -527,10 +537,20 @@ struct SignedEntry {
 }
 impl Entry {
     fn valid(&self) -> bool {
-        ((self.schema == 1 && !(self.phase == CataloguePhase::Quarantined && self.facts.is_some()))
+        ((self.schema == 1
+            && self.phase != CataloguePhase::Retired
+            && !(self.phase == CataloguePhase::Quarantined && self.facts.is_some()))
             || (self.schema == 2
                 && self.phase == CataloguePhase::Quarantined
-                && self.facts.is_some()))
+                && self.facts.is_some())
+            || (self.schema == 3 && self.phase == CataloguePhase::Retired))
+            && ((self.phase == CataloguePhase::Retired) == self.retirement.is_some())
+            && self.retirement.as_ref().is_none_or(|retired| {
+                retired.binding.request == *self.scope.request()
+                    && self.reference.as_ref() == Some(&retired.binding.reference)
+                    && retired.binding.generation > 0
+                    && retired.owner.valid()
+            })
             && self.scope.valid()
             && self.sequence > 0
             && self.predecessor.as_ref().is_none_or(|old| {
@@ -555,7 +575,7 @@ impl Entry {
                         && self.facts.is_none()
                         && self.response_digest.is_none()
                 }
-                CataloguePhase::Received => {
+                CataloguePhase::Received | CataloguePhase::Retired => {
                     self.reference.is_some()
                         && self.facts.is_some()
                         && self.response_digest.is_some()
@@ -854,6 +874,7 @@ pub(super) fn prepare_held(
                 reference: None,
                 facts: None,
                 response_digest: None,
+                retirement: None,
             })?;
         }
         claimed.durable_current()?;
@@ -933,6 +954,7 @@ fn reconcile_preparation_held(
             reference: None,
             facts: None,
             response_digest: None,
+            retirement: None,
         })?;
     }
     claimed.durable_current()?;
@@ -998,6 +1020,7 @@ fn advance(
                 reference,
                 facts,
                 response_digest,
+                retirement: None,
             })?;
         }
         claimed.durable_current()?;
@@ -1035,6 +1058,60 @@ pub(super) fn attempted(env: &Env, scope: &CatalogueScope) -> Result<(), String>
     }
     advance(env, scope, CataloguePhase::Attempted, None, None, None)
 }
+/// Consume only the non-serializable result of the same account writer's
+/// completed contextual sign-out. The immutable global membership stays intact.
+pub(in crate::harness) fn retire_settled_refusal(
+    env: &Env,
+    proof: &codex_enrollment::SettledRefusal,
+    anchor: &mut CatalogueAnchorWriter<'_>,
+) -> Result<(), String> {
+    let scope =
+        existing_scope(env, &proof.binding().request.id)?.ok_or("retirement catalogue absent")?;
+    let mut claimed = ClaimedEntry::open(env, &scope, false)?;
+    let expected = anchor.read()?.ok_or("retirement anchor absent")?;
+    let old = claimed.entry.as_ref().ok_or("retirement entry absent")?;
+    let retirement = Retirement {
+        binding: proof.binding().clone(),
+        owner: proof.witness().clone(),
+        settled_at: proof.at(),
+    };
+    let actual = claimed.witness()?;
+    if old.phase == CataloguePhase::Retired && old.retirement.as_ref() == Some(&retirement) {
+        if actual != expected && old.predecessor.as_ref() != Some(&expected) {
+            return Err("retirement anchor changed".into());
+        }
+    } else {
+        if actual != expected
+            || old.phase != CataloguePhase::Received
+            || old.reference.as_ref() != Some(&proof.binding().reference)
+        {
+            return Err("retirement grant changed".into());
+        }
+        let mut next = old.clone();
+        next.schema = 3;
+        next.sequence = expected
+            .sequence
+            .checked_add(1)
+            .ok_or("catalogue sequence exhausted")?;
+        next.predecessor = Some(expected.clone());
+        next.phase = CataloguePhase::Retired;
+        next.retirement = Some(retirement);
+        claimed.save(next)?;
+    }
+    claimed.durable_current()?;
+    #[cfg(test)]
+    cut_preparation(3)?;
+    let next = claimed.witness()?;
+    if next != expected {
+        anchor.compare_exchange(&CatalogueTransition {
+            scope,
+            expected: Some(expected),
+            next,
+        })?;
+    }
+    Ok(())
+}
+
 /// Called before exchange exclusion may retire. Failure keeps the original
 /// PreparedGrant/response/Scope carrier, never a string-only completed result.
 pub(super) fn received(
@@ -1155,7 +1232,11 @@ struct InventorySnapshot {
     members: Vec<InventoryMember>,
 }
 impl InventorySnapshot {
-    fn read(env: &Env, own: Option<&CatalogueScope>) -> Result<Self, String> {
+    fn read(
+        env: &Env,
+        own: Option<&CatalogueScope>,
+        settling: Option<&GrantBinding>,
+    ) -> Result<Self, String> {
         let authority = AuthorityObservation::read(env)?;
         let scopes: Vec<_> = authority.manifest.members.values().cloned().collect();
         let unattempted = authority.manifest.unattempted.clone();
@@ -1223,10 +1304,17 @@ impl InventorySnapshot {
             }
             let claimed = EntryObservation::read(&source_env, &scope)?;
             let observed = claimed.witness()?;
-            if state.witness.as_ref() != Some(&observed) {
+            let entry = claimed.entry.as_ref().ok_or("catalogue entry absent")?;
+            if state.witness.as_ref() != Some(&observed)
+                && !(entry.phase == CataloguePhase::Retired
+                    && entry.predecessor.as_ref() == state.witness.as_ref()
+                    && entry
+                        .retirement
+                        .as_ref()
+                        .is_some_and(|retired| Some(&retired.binding) == settling))
+            {
                 return Err("catalogue entry requires canonical reconciliation".into());
             }
-            let entry = claimed.entry.as_ref().ok_or("catalogue entry absent")?;
             match entry.phase {
                 CataloguePhase::Prepared | CataloguePhase::NotDispatched => {
                     if entry.phase == CataloguePhase::Prepared
@@ -1246,7 +1334,7 @@ impl InventorySnapshot {
                     // was unaffected; there is no provider lineage identifier.
                     return Err("catalogue has unresolved provider effects".into());
                 }
-                CataloguePhase::Received => {}
+                CataloguePhase::Received | CataloguePhase::Retired => {}
             }
             let reference = entry
                 .reference
@@ -1286,12 +1374,24 @@ impl InventorySnapshot {
                         .as_ref()
                         .ok_or("catalogue publication proof absent")?;
                     issuer.verify_publication(proof)?;
-                    if proof.binding() != binding
-                        || proof.binding_fingerprint()
-                            != super::super::codex_native_row::binding_digest(
-                                &logins,
-                                &binding.request.label,
-                            )?
+                    if proof.binding() != binding {
+                        return Err("catalogue publication binding changed".into());
+                    }
+                    if let Some(retired) = &entry.retirement {
+                        if retired.binding != *binding
+                            || state.owner_witness.as_ref() != Some(&retired.owner)
+                        {
+                            return Err("catalogue retirement owner changed".into());
+                        }
+                        // The MACed terminal entry follows this exact owner's
+                        // durable contextual sign-out. A new row's fingerprint
+                        // cannot revoke that historical proof; token history is
+                        // still read and authenticated below.
+                    } else if proof.binding_fingerprint()
+                        != super::super::codex_native_row::binding_digest(
+                            &logins,
+                            &binding.request.label,
+                        )?
                     {
                         return Err("catalogue current publication binding changed".into());
                     }
@@ -1307,6 +1407,12 @@ impl InventorySnapshot {
                     if history.uncertainty == refresh::LineageUncertainty::Global {
                         return Err("catalogue refresh outcome uncertain".into());
                     }
+                    if entry.retirement.is_some()
+                        && (history.uncertainty != refresh::LineageUncertainty::None
+                            || history.pending)
+                    {
+                        return Err("catalogue retired token history is uncertain".into());
+                    }
                     uncertainty = history.uncertainty;
                     tokens.extend(history.tokens);
                     pending |= history.pending;
@@ -1315,6 +1421,9 @@ impl InventorySnapshot {
                     return Err("catalogue publication lacks row authority".into());
                 }
             } else {
+                if entry.retirement.is_some() {
+                    return Err("catalogue retirement publication absent".into());
+                }
                 issuer.current()?;
             }
             claimed.store.unchanged().map_err(str::to_owned)?;
@@ -1340,7 +1449,7 @@ impl Inventory {
     /// Complete Code/publication view. A bound managed Attempted observation
     /// is not complete and cannot be reused as a weak Code admission mode.
     fn read(env: &Env, own: Option<&CatalogueScope>) -> Result<Self, String> {
-        let snapshot = InventorySnapshot::read(env, own)?;
+        let snapshot = InventorySnapshot::read(env, own, None)?;
         if snapshot
             .members
             .iter()
@@ -1354,7 +1463,7 @@ impl Inventory {
     }
     fn refuses_alias(&self, candidate: &LineageFacts) -> bool {
         self.members.iter().any(|member| {
-            candidate.overlaps_principal(&member.facts)
+            (member.phase != CataloguePhase::Retired && candidate.overlaps_principal(&member.facts))
                 || candidate.same_token(&member.facts)
                 || member.tokens.contains(&candidate.token)
         })
@@ -1505,7 +1614,8 @@ struct OwnedRefreshInventory {
 impl OwnedRefreshInventory {
     fn read(env: &Env, source: &refresh::OwnedRefreshInventorySource<'_>) -> Result<Self, String> {
         source.current()?;
-        let snapshot = InventorySnapshot::read(env, None)?;
+        let snapshot =
+            InventorySnapshot::read(env, None, source.settling().then(|| source.binding()))?;
         let own = snapshot
             .members
             .iter()
@@ -1516,7 +1626,8 @@ impl OwnedRefreshInventory {
             .ok_or("owned refresh membership unavailable")?;
         let current = &snapshot.members[own];
         let token = codex_app_login::owned_refresh_token_digest(source.document())?;
-        if current.phase != CataloguePhase::Received
+        let retired_settlement = source.settling() && current.phase == CataloguePhase::Retired;
+        if (current.phase != CataloguePhase::Received && !retired_settlement)
             || current.facts.principal != *source.identity()
             || !current.tokens.contains(&token)
         {
@@ -1532,7 +1643,8 @@ impl OwnedRefreshInventory {
         let own = &self.members[self.own];
         self.members.iter().enumerate().any(|(index, other)| {
             index != self.own
-                && (own.facts.overlaps_principal(&other.facts)
+                && ((other.phase != CataloguePhase::Retired
+                    && own.facts.overlaps_principal(&other.facts))
                     || !own.tokens.is_disjoint(&other.tokens))
         })
     }
@@ -1572,8 +1684,56 @@ pub(super) fn require_participant(
     claimed.store.unchanged().map_err(str::to_owned)
 }
 
+/// Interrupt the next fixture retirement after its durable entry, before anchor CAS.
+#[cfg(all(test, unix))]
+pub(super) fn cut_retirement_once() {
+    PREPARATION_CUT.with(|cut| cut.set(3));
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn phase_for_test(env: &Env, request: &codex_enrollment::Request) -> CataloguePhase {
+    let scope = existing_scope(env, &request.id).unwrap().unwrap();
+    EntryObservation::read(env, &scope)
+        .unwrap()
+        .entry
+        .as_ref()
+        .unwrap()
+        .phase
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn refuses_same_principal_for_test(
+    env: &Env,
+    request: &codex_enrollment::Request,
+) -> bool {
+    let scope = existing_scope(env, &request.id).unwrap().unwrap();
+    let claimed = EntryObservation::read(env, &scope).unwrap();
+    let mut candidate = claimed
+        .entry
+        .as_ref()
+        .unwrap()
+        .facts
+        .as_ref()
+        .unwrap()
+        .clone();
+    candidate.token = "f".repeat(64);
+    Inventory::read(env, None)
+        .unwrap()
+        .refuses_alias(&candidate)
+}
+
 /// Read-only test observation; creates no credential or publication capability.
 #[cfg(all(test, unix))]
 pub(super) fn inventory_current_for_test(env: &Env) -> Result<(), String> {
     Inventory::read(env, None).map(|_| ())
+}
+
+/// Read-only test observation: whether a code exchange here waits on a refresh's reconciliation,
+/// as [`attempted`] refuses one; creates no credential or publication capability.
+#[cfg(all(test, unix))]
+pub(super) fn exchange_waits_for_test(env: &Env) -> Result<bool, String> {
+    Ok(Inventory::read(env, None)?
+        .members
+        .iter()
+        .any(|member| member.pending))
 }

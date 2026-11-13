@@ -264,13 +264,14 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         exit: None,
         ended_by: None,
         leader_exited_ms: None,
+        leader_born_ms: None,
         ran: Some("targo".to_owned()),
         peak_bytes: Some(1 << 30),
         cpu_ns: Some(42_000_000_000),
         stuck: false,
     };
     let row =
-        agent_call_row(&ended, 21_000, 1_793_000_001_000, "m14", facts(), None).expect("a row");
+        agent_call_row(&ended, (21_000, 1_793_000_001_000), "m14", facts(), None).expect("a row");
     assert_eq!(row.at_ms, 1_793_000_000_000);
     assert_eq!(row.wall_ms, Fig::Known(10_000));
     assert_eq!(row.cpu_ms, Fig::Known(42_000));
@@ -278,8 +279,7 @@ fn an_agent_call_row_is_sampled_from_its_job() {
     assert_eq!(row.sid, None, "this reading supplied no public id");
     let named = agent_call_row(
         &ended,
-        21_000,
-        1_793_000_001_000,
+        (21_000, 1_793_000_001_000),
         "m14",
         facts(),
         Some("s-row-owned".to_owned()),
@@ -293,7 +293,7 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         ..ended
     };
     assert!(
-        agent_call_row(&shell, 21_000, 0, "m14", facts(), None).is_none(),
+        agent_call_row(&shell, (21_000, 0), "m14", facts(), None).is_none(),
         "a block's job is its command's row"
     );
 }
@@ -391,6 +391,7 @@ fn call(ended_by: Option<aterm_vitals::jobs::ExitOf>, stuck: bool) -> aterm_vita
         exit: None,
         ended_by,
         leader_exited_ms: ended_by.map(|_| 14_000),
+        leader_born_ms: Some(9_400),
         ran: Some("sleep".to_owned()),
         peak_bytes: None,
         cpu_ns: None,
@@ -403,7 +404,7 @@ fn an_agent_call_row_says_how_its_leader_ended() {
     use aterm_vitals::jobs::ExitOf;
     let at = |ended_by, stuck| {
         let r =
-            agent_call_row(&call(ended_by, stuck), 21_000, 0, "m14", facts(), None).expect("row");
+            agent_call_row(&call(ended_by, stuck), (21_000, 0), "m14", facts(), None).expect("row");
         (r.outcome, r.stop, r.code, r.sig)
     };
     assert_eq!(
@@ -433,7 +434,7 @@ fn an_agent_call_row_says_how_its_leader_ended() {
 
 #[test]
 fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
-    let ran = agent_call_row(&call(None, false), 21_000, 0, "m14", facts(), None).expect("row");
+    let ran = agent_call_row(&call(None, false), (21_000, 0), "m14", facts(), None).expect("row");
     assert_eq!(ran.label, "sleep", "not the wrapper `zsh`");
     assert_eq!(
         ran.key,
@@ -444,7 +445,7 @@ fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
         ran: None,
         ..call(None, false)
     };
-    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&builtins, (21_000, 0), "m14", facts(), None).expect("row");
     assert_eq!(
         (row.label.as_str(), row.key),
         ("-", None),
@@ -454,47 +455,95 @@ fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
 
 /// A WATCHED CALL'S ROW ENDS AT ITS LEADER'S OWN MOMENT (TM-1 §5): the pass that found the
 /// leader gone came a minute after its exit, as a windowless instance's next reading may, and the
-/// row's `wall_ms` and `at_ms` are still the exit's; an exit stamped past the pass's start (the
-/// read that took it came after) is that far past the pass's wall time. NEGATIVE CONTROL: a call
-/// no watch read ends at the pass.
+/// row's `at_ms` is still the exit's wall time. NEGATIVE CONTROL: a call no watch read ends at the
+/// pass.
+///
+/// EVERY MOMENT IS PUT ON THE WALL CLOCK THROUGH CLOCKS READ TOGETHER: the pass's own clock
+/// (74 000, `ended_ms`) was read before its sweep and the rest of its reading, and the jobs pass
+/// read its clock and the wall clock together 250 ms later. A moment is as far before the wall
+/// clock as before the pass's clock then, so no row is late by that span, and an exit stamped
+/// mid-reading (74 003, after the pass's clock but before the pair) is written before the row's
+/// making, never past it.
 #[test]
 fn a_watched_calls_row_ends_at_its_leaders_moment_not_the_pass_that_found_it_gone() {
     use aterm_vitals::jobs::{Ended, ExitOf};
+    // The pass's clock and the wall clock, read together 250 ms after the pass's own clock.
+    let (pass_now, wall_now) = (74_250, 1_793_000_074_250);
     let late = Ended {
         ended_ms: 74_000,
         ..call(Some(ExitOf::Code(0)), false)
     };
-    let row = agent_call_row(&late, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&late, (pass_now, wall_now), "m14", facts(), None).expect("row");
     assert_eq!(
-        row.wall_ms,
-        Fig::Known(4_000),
-        "opened 10 000, exited 14 000"
+        row.at_ms, 1_793_000_014_000,
+        "the exit's wall time, 60 250 ms before the pair"
     );
-    assert_eq!(row.at_ms, 1_793_000_014_000, "the exit's wall time");
     let past = Ended {
         leader_exited_ms: Some(74_003),
         ..late.clone()
     };
-    let row = agent_call_row(&past, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&past, (pass_now, wall_now), "m14", facts(), None).expect("row");
     assert_eq!(
-        (row.wall_ms, row.at_ms),
-        (Fig::Known(64_003), 1_793_000_074_003)
+        row.at_ms, 1_793_000_074_003,
+        "stamped mid-reading: 247 ms before the row's making"
     );
     let unwatched = Ended {
         leader_exited_ms: None,
+        ended_ms: 74_000,
         ..call(None, false)
     };
-    let unwatched = Ended {
-        ended_ms: 74_000,
-        ..unwatched
-    };
-    let row =
-        agent_call_row(&unwatched, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&unwatched, (pass_now, wall_now), "m14", facts(), None).expect("row");
     assert_eq!(
         (row.wall_ms, row.at_ms),
         (Fig::Known(64_000), 1_793_000_074_000),
-        "no moment: the pass that found it gone"
+        "no moment: the pass that found it gone, at its own clock's wall time"
     );
+    // Whatever its moment, no row is written past the wall clock it is made at.
+    for exited in [0, 14_000, 74_000, 74_003, 74_250, 74_251, u64::MAX] {
+        let e = Ended {
+            leader_exited_ms: Some(exited),
+            ..late.clone()
+        };
+        let row = agent_call_row(&e, (pass_now, wall_now), "m14", facts(), None).expect("row");
+        assert!(row.at_ms <= wall_now, "exited {exited}: {}", row.at_ms);
+    }
+}
+
+/// A CALL'S WALL TIME IS ITS LEADER'S LIFE OR PASS TO PASS, NEVER ONE OF EACH (TM-1 §5): with its
+/// leader's start (its age at a pass, 9 400) and its exit (the watch's moment, 14 000) both read,
+/// `wall_ms` runs between them, never from the first pass that tracked it (10 000, 600 ms after
+/// the start). With either missing it runs pass to pass, from that first pass to the one that
+/// found it gone (20 000), whose two lags are alike, never from one exact end to one pass's.
+#[test]
+fn a_calls_wall_time_is_its_leaders_life_or_pass_to_pass_never_one_of_each() {
+    use aterm_vitals::jobs::{Ended, ExitOf};
+    let wall = |e: &Ended| {
+        agent_call_row(e, (21_000, 0), "m14", facts(), None)
+            .expect("row")
+            .wall_ms
+    };
+    let both = call(Some(ExitOf::Code(0)), false);
+    assert_eq!(
+        (both.leader_born_ms, both.leader_exited_ms),
+        (Some(9_400), Some(14_000))
+    );
+    assert_eq!(wall(&both), Fig::Known(4_600), "the leader's life");
+    let unborn = Ended {
+        leader_born_ms: None,
+        ..both.clone()
+    };
+    assert_eq!(wall(&unborn), Fig::Known(10_000), "no start: pass to pass");
+    let unwatched = call(None, false);
+    assert_eq!(
+        (unwatched.leader_born_ms, unwatched.leader_exited_ms),
+        (Some(9_400), None)
+    );
+    assert_eq!(wall(&unwatched), Fig::Known(10_000), "no end: pass to pass");
+    let neither = Ended {
+        leader_born_ms: None,
+        ..unwatched
+    };
+    assert_eq!(wall(&neither), Fig::Known(10_000), "pass to pass");
 }
 
 /// A CALL THE JOIN NAMED IS KEYED BY ITS COMMAND (TM-1 §5), never by its program, and only once a
@@ -509,7 +558,7 @@ fn a_hinted_calls_key_is_its_command_and_only_once_a_program_ran() {
         ran: Some("targo".to_owned()),
         ..call(None, false)
     };
-    let row = agent_call_row(&hinted, 21_000, 0, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&hinted, (21_000, 0), "m14", facts(), None).expect("row");
     assert_eq!(
         row.key,
         Some(Digest::key(
@@ -525,7 +574,7 @@ fn a_hinted_calls_key_is_its_command_and_only_once_a_program_ran() {
         ran: None,
         ..hinted
     };
-    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts(), None).expect("row");
+    let row = agent_call_row(&builtins, (21_000, 0), "m14", facts(), None).expect("row");
     assert_eq!(
         (row.label.as_str(), row.key),
         ("-", None),

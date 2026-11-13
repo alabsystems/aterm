@@ -52,8 +52,6 @@ pub enum MetWord {
     BrowserControl,
     /// The authenticated issuer could not admit work; no bad login was proved.
     ServiceUnavailable,
-    /// The issuer admitted work but did not return a validated callback.
-    ChallengeFailed,
     /// Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
     BotCheck,
@@ -71,7 +69,6 @@ impl MetWord {
             MetWord::BrowserStart => "browser-start",
             MetWord::BrowserControl => "browser-control",
             MetWord::ServiceUnavailable => "service-unavailable",
-            MetWord::ChallengeFailed => "challenge-failed",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
             MetWord::Stall => "stall",
@@ -142,7 +139,6 @@ impl Met {
             MetWord::BrowserStart,
             MetWord::BrowserControl,
             MetWord::ServiceUnavailable,
-            MetWord::ChallengeFailed,
             MetWord::BotCheck,
             MetWord::BlockPage,
             MetWord::Stall,
@@ -176,10 +172,7 @@ impl Met {
             .map_or_else(String::new, |host| format!(" on {host}"));
         match self.word {
             MetWord::BrowserStart => "its headless browser could not start".to_owned(),
-            MetWord::ServiceUnavailable => "its fleet challenge service is unavailable".to_owned(),
-            MetWord::ChallengeFailed => {
-                "its fleet challenge service did not return a validated callback".to_owned()
-            }
+            MetWord::ServiceUnavailable => "its account service is unavailable".to_owned(),
             MetWord::BrowserControl => {
                 "it could not communicate with its headless browser".to_owned()
             }
@@ -221,6 +214,33 @@ fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
     if phase == OutcomePhase::Deferred && !met.is_service_unavailable() {
         return;
     }
+    write_outcome_record(path, &met.line(), phase);
+}
+
+/// A failing opener's end for the renewal that waits on it ([`main_entry`]): what it met, kept
+/// terminal, or a failure with an empty `met=` where it recorded nothing it met. The waiting
+/// `claude auth login` sits at its paste prompt once its opener exits, so without this record a
+/// failure that met no page held the renewal, and `signin.lock`, for its whole budget
+/// (ATERM-KI-1105-14). Nothing is published after a callback was handed to the CLI
+/// (`headless_oauth::callback_offered`): the CLI may hold the code, and only its own exit says.
+fn publish_failed_exit(path: &Path, callback_offered: bool) {
+    let recorded = read_outcome_record(path);
+    if callback_offered
+        || matches!(
+            recorded,
+            Some((OutcomePhase::Failed | OutcomePhase::Deferred, _))
+        )
+    {
+        return;
+    }
+    match recorded.and_then(|(_, met)| met) {
+        Some(met) => write_outcome_phase(path, &met, OutcomePhase::Failed),
+        None => write_outcome_record(path, "", OutcomePhase::Failed),
+    }
+}
+
+/// Writes one outcome record; `met` is a [`Met::line`], empty only on a failure that met nothing.
+fn write_outcome_record(path: &Path, met: &str, phase: OutcomePhase) {
     if !path.is_absolute() {
         return;
     }
@@ -230,13 +250,12 @@ fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
     let _ = aterm_uds::atomic_file::write_checked(
         path,
         format!(
-            "opener-outcome=1\nphase={}\nmet={}\n",
+            "opener-outcome=1\nphase={}\nmet={met}\n",
             match phase {
                 OutcomePhase::Continuing => "continuing",
                 OutcomePhase::Failed => "failed",
                 OutcomePhase::Deferred => "deferred",
             },
-            met.line()
         )
         .as_bytes(),
         0o600,
@@ -309,17 +328,19 @@ pub(super) fn take_oauth_code(path: PathBuf) -> Result<Option<String>, &'static 
     Ok(Some(code))
 }
 
-/// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes).
+/// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes); `None`
+/// also for a failure that recorded nothing it met.
 #[must_use]
 pub fn read_outcome(path: &Path) -> Option<Met> {
-    read_outcome_record(path).map(|(_, met)| met)
+    read_outcome_record(path).and_then(|(_, met)| met)
 }
 
 /// The explicit per-attempt reason for stopping an incomplete provider capture.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalOutcome {
-    Failed(Met),
+    /// The opener failed, with what it met where it recorded that.
+    Failed(Option<Met>),
     Deferred(Met),
 }
 
@@ -328,12 +349,13 @@ pub(super) enum TerminalOutcome {
 pub(super) fn read_terminal_outcome(path: &Path) -> Option<TerminalOutcome> {
     match read_outcome_record(path)? {
         (OutcomePhase::Failed, met) => Some(TerminalOutcome::Failed(met)),
-        (OutcomePhase::Deferred, met) => Some(TerminalOutcome::Deferred(met)),
+        (OutcomePhase::Deferred, met) => met.map(TerminalOutcome::Deferred),
         (OutcomePhase::Continuing, _) => None,
     }
 }
 
-fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Met)> {
+/// One record's phase and what it met; only a failure may have met nothing (an empty `met=`).
+fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -363,11 +385,18 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Met)> {
         _ => return None,
     };
     let line = lines.next()?.strip_prefix("met=")?;
-    let met = Met::parse(line)?;
-    if (phase == OutcomePhase::Deferred) != met.is_service_unavailable() {
+    let met = if line.is_empty() && phase == OutcomePhase::Failed {
+        None
+    } else {
+        Some(Met::parse(line)?)
+    };
+    if (phase == OutcomePhase::Deferred) != met.as_ref().is_some_and(Met::is_service_unavailable) {
         return None;
     }
-    if met.line() != line || !lines.next()?.is_empty() || lines.next().is_some() {
+    if met.as_ref().map_or(String::new(), Met::line) != line
+        || !lines.next()?.is_empty()
+        || lines.next().is_some()
+    {
         return None;
     }
     Some((phase, met))
@@ -383,7 +412,7 @@ fn profile_fallback_outcome(
         if let Some(path) = path {
             write_outcome_phase(path, met, OutcomePhase::Deferred);
         }
-        return (1, Some("the fleet challenge service is unavailable".into()));
+        return (1, Some("the account service is unavailable".into()));
     }
     if let (Some(path), Some(met)) = (path, met) {
         write_outcome_phase(path, met, OutcomePhase::Continuing);
@@ -4149,6 +4178,7 @@ fn follow_until_page_or_callback_until(
     for _ in 0..8 {
         deadline.left()?;
         if flow.is_callback(&current_url) {
+            super::headless_oauth::note_callback_offered();
             if flow.hosted() {
                 let credential = hosted_credential(&current_url)?;
                 let outcome = std::env::var_os(OUTCOME_ENV)
@@ -4770,10 +4800,27 @@ fn with_approved_mailbox<T>(
     run(&inputs.mailbox(), target, None)
 }
 
-/// Entry point for the `aterm-open-url` argv0 alias.
+/// Entry point for the `aterm-open-url` argv0 alias. Under a renewal that named an outcome file
+/// ([`OUTCOME_ENV`]), every failing exit leaves a terminal record there ([`publish_failed_exit`]).
 #[must_use = "return or inspect the command exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let _ = super::headless_oauth::take_met();
+    let _ = super::headless_oauth::take_callback_offered();
+    // What the headless sign-in met, for the renewal that named an outcome file.
+    let outcome_path = std::env::var_os(OUTCOME_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let code = open_reporting_to(args, outcome_path.as_deref());
+    if code != 0
+        && let Some(path) = &outcome_path
+    {
+        publish_failed_exit(path, super::headless_oauth::take_callback_offered());
+    }
+    ExitCode::from(code)
+}
+
+/// The opener's run and its exit code, noting what a headless sign-in met at `outcome_path`.
+fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
     let args: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -4781,12 +4828,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let profile = std::env::var(PROFILE_ENV).ok();
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    // What the headless sign-in met, for the renewal that named an outcome file.
-    let outcome_path = std::env::var_os(OUTCOME_ENV).filter(|p| !p.is_empty());
     let note_outcome = |phase| {
         let met = super::headless_oauth::take_met();
-        if let (Some(path), Some(met)) = (&outcome_path, &met) {
-            write_outcome_phase(Path::new(path), met, phase);
+        if let (Some(path), Some(met)) = (outcome_path, &met) {
+            write_outcome_phase(path, met, phase);
         }
     };
     let mut continuing_met = None;
@@ -4810,11 +4855,11 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             _ => Err("approved mailbox flow requires one authorization URL".into()),
         };
         return match result {
-            Ok(()) => ExitCode::from(0),
+            Ok(()) => 0,
             Err(why) => {
                 note_outcome(OutcomePhase::Failed);
                 eprintln!("{OPENER}: approved mailbox was not authorized: {why}");
-                ExitCode::from(1)
+                1
             }
         };
     }
@@ -4846,23 +4891,23 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                 resolved_email.as_deref(),
                 AUTHORIZE_TIMEOUT,
             ) {
-                Ok(()) => return ExitCode::from(0),
+                Ok(()) => return 0,
                 Err(why) => {
                     if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
                         note_outcome(OutcomePhase::Failed);
                         eprintln!("{OPENER}: not authorized: {why}");
-                        return ExitCode::from(1);
+                        return 1;
                     }
                     continuing_met = super::headless_oauth::take_met();
                     if let Some(met) = continuing_met
                         .as_ref()
                         .filter(|met| met.is_service_unavailable())
                     {
-                        if let Some(path) = &outcome_path {
-                            write_outcome_phase(Path::new(path), met, OutcomePhase::Deferred);
+                        if let Some(path) = outcome_path {
+                            write_outcome_phase(path, met, OutcomePhase::Deferred);
                         }
                         eprintln!("{OPENER}: not authorized: {why}");
-                        return ExitCode::from(1);
+                        return 1;
                     }
                 }
             }
@@ -4882,11 +4927,11 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                     resolved_email.as_deref(),
                     AUTHORIZE_TIMEOUT,
                 ) {
-                    Ok(()) => return ExitCode::from(0),
+                    Ok(()) => return 0,
                     Err(why) => {
                         note_outcome(OutcomePhase::Failed);
                         eprintln!("{OPENER}: not authorized: {why}");
-                        return ExitCode::from(1);
+                        return 1;
                     }
                 }
             }
@@ -4905,15 +4950,13 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         Some(text)
     };
     let mut run = |mut cmd: aterm_uds::spawnfd::Command| cmd.status().is_ok_and(|s| s.success());
-    let (code, said) = profile_fallback_outcome(
-        outcome_path.as_deref().map(Path::new),
-        continuing_met.as_ref(),
-        || open_with(&args, profile.as_deref(), &local_state, &mut run),
-    );
+    let (code, said) = profile_fallback_outcome(outcome_path, continuing_met.as_ref(), || {
+        open_with(&args, profile.as_deref(), &local_state, &mut run)
+    });
     if let Some(said) = said {
         eprintln!("{said}");
     }
-    ExitCode::from(code)
+    code
 }
 
 #[cfg(all(test, unix))]

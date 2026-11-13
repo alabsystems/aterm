@@ -14,7 +14,12 @@ use std::{
     time::Instant,
 };
 
-pub(super) const CAPACITY: usize = 64;
+/// Hints one endpoint keeps: one for each member a roster can hold and one more, as its witness
+/// logs keep (`WITNESS_ENTRIES`). A cache smaller than the roster lets a peer's hint go before a
+/// turn through the other peers comes back to it, so each round with that peer starts with none,
+/// as its first did: its initiator asks for witnesses (`replica::WITNESS_GAP_MS`), which opens every
+/// common table on both sides.
+pub(super) const CAPACITY: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
 
 #[derive(Default)]
 struct Pool {

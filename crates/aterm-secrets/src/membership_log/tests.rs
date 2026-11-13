@@ -1189,17 +1189,123 @@ fn concurrent_chosen_numbers_do_not_pick_a_holder_by_arrival_order() {
     let lab = found(&[(A, "m117"), (B, "m87")]);
     let mut one = lab.clone();
     let mut two = lab.clone();
-    one.keep(sign(&one, A, Body::Name { name: "m3".into() }));
-    two.keep(sign(&two, B, Body::Name { name: "m3".into() }));
+    let a = sign(&one, A, Body::Name { name: "m3".into() });
+    let b = sign(&two, B, Body::Name { name: "m3".into() });
+    let (winner, loser) = if a.id() < b.id() { (A, B) } else { (B, A) };
+    one.keep(a);
+    two.keep(b);
     assert_eq!(one.membership().label_after_choice(&A.id()), Some("m3"));
     assert_eq!(two.membership().label_after_choice(&B.id()), Some("m3"));
     heal(&mut one, &mut two);
     for log in [&one, &two] {
-        assert_eq!(log.membership().label(&A.id()), Some("m117"));
-        assert_eq!(log.membership().label(&B.id()), Some("m87"));
-        assert_eq!(log.membership().chosen_label(&A.id()), None);
-        assert_eq!(log.membership().label_after_choice(&A.id()), Some("m117"));
-        assert_eq!(log.membership().label_after_choice(&B.id()), Some("m87"));
+        let membership = log.membership();
+        assert_eq!(membership.label(&winner.id()), Some("m3"));
+        assert_eq!(membership.chosen_label(&winner.id()), Some("m3"));
+        assert_eq!(membership.label_after_choice(&winner.id()), Some("m3"));
+        assert_eq!(membership.chosen_label(&loser.id()), None);
+        assert_eq!(
+            membership.label(&loser.id()),
+            Some(loser.suffixed("m3").as_str())
+        );
+        assert_eq!(
+            membership.label_after_choice(&loser.id()),
+            Some(loser.suffixed("m3").as_str())
+        );
+    }
+}
+
+#[test]
+fn repeating_a_number_preserves_its_claim_but_leaving_and_returning_does_not() {
+    let base = found(&[(A, "m117"), (B, "m87")]);
+    let mut one = base.clone();
+    let mut two = base.clone();
+    let a = one.keep(sign(&base, A, Body::Name { name: "m3".into() }));
+    let b = two.keep(sign(&base, B, Body::Name { name: "m3".into() }));
+    let (winner, loser) = if a.id() < b.id() { (A, B) } else { (B, A) };
+    heal(&mut one, &mut two);
+    one.keep(sign(&one, winner, Body::Name { name: "m3".into() }));
+    one.keep(sign(
+        &one,
+        winner,
+        Body::Name {
+            name: "heron".into(),
+        },
+    ));
+    heal(&mut one, &mut two);
+    for replica in [&one, &two] {
+        assert_eq!(replica.membership().label(&winner.id()), Some("m3"));
+        assert_eq!(
+            replica.membership().label(&loser.id()),
+            Some(loser.suffixed("m3").as_str())
+        );
+    }
+    // Once the winner releases m3, the other choice holds it. Returning cannot revive the
+    // original tenure or displace the now-earlier claim.
+    one.keep(sign(&one, winner, Body::Name { name: "m4".into() }));
+    one.keep(sign(&one, winner, Body::Name { name: "m3".into() }));
+    heal(&mut one, &mut two);
+    for replica in [&one, &two] {
+        assert_eq!(replica.membership().label(&loser.id()), Some("m3"));
+        assert_eq!(replica.membership().chosen_label(&winner.id()), None);
+    }
+}
+
+#[test]
+fn a_causally_later_number_claim_cannot_win_with_a_lower_digest_or_clock() {
+    let base = found(&[(A, "m117"), (B, "m87"), (C, "m88")]);
+    let mut earlier = base.clone();
+    let a = earlier.keep(
+        earlier
+            .draft(&A.id(), 1000, Body::Name { name: "m3".into() })
+            .sign(&A.seed(), A.incarnation())
+            .unwrap(),
+    );
+    let c = (1000..1256)
+        .map(|clock| {
+            base.draft(&C.id(), clock, Body::Name { name: "m3".into() })
+                .sign(&C.seed(), C.incarnation())
+                .unwrap()
+        })
+        .find(|c| c.id() < a.id())
+        .expect("the fixed fixture has a concurrent claim below the earlier claim's digest");
+    // Force B < C < A by digest while A precedes B causally. A comparator using causality
+    // before digest cycles (A < B < C < A); a global digest minimum wrongly picks B.
+    // B's clock also precedes both minimal claims, so signed time cannot decide either.
+    let b = (0..256)
+        .map(|clock| {
+            earlier
+                .draft(&B.id(), clock, Body::Name { name: "m3".into() })
+                .sign(&B.seed(), B.incarnation())
+                .unwrap()
+        })
+        .find(|b| b.id() < a.id() && b.id() < c.id())
+        .expect("the fixed fixture has a causally later claim with the smallest digest");
+    let winner = C;
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut replica = base.clone();
+        let claims = [&a, &b, &c];
+        for i in order {
+            replica.insert(claims[i].clone()).unwrap();
+        }
+        let membership = replica.membership();
+        assert_eq!(membership.label(&winner.id()), Some("m3"));
+        assert_eq!(membership.chosen_label(&winner.id()), Some("m3"));
+        assert_ne!(membership.label(&B.id()), Some("m3"));
+        assert_eq!(
+            membership
+                .members()
+                .values()
+                .filter(|member| member.label == "m3")
+                .count(),
+            1
+        );
     }
 }
 

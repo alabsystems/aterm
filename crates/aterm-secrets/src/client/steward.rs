@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ALab steward (owner rulings 2026-10-27): from the converge pass, the Mac that holds the
+//! The ALab steward: from the converge pass, the Mac that holds the
 //! ALab vault's admin key finishes a revoke cascade left half done (`sync.steward.revoke`) and
 //! runs the swarm lease's step (`sync.steward.lease`). Only the ALab vault ([`alab_vault`]) and
 //! only an admin: a personal vault is never stewarded, and a member's pass reads that it is no

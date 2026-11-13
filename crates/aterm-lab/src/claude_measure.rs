@@ -1065,8 +1065,8 @@ fn session(n: u8, build: &str, expect: Expect) -> Result<(Run, Vec<Check>), Fail
 }
 
 /// STEPS 2 AND 8: the aterm the lab runs ([`crate::paths::Paths::need_aterm`]) is the one the
-/// build made, by its path or, for a copy of it (`target/debug/aterm` beside a build directory
-/// elsewhere), by its bytes ([`same_bytes`]), so the session runs the checkout's code.
+/// build made, by its path or, for a copy beside a separate compiler build directory,
+/// by its bytes ([`same_bytes`]), so the session runs the checkout's code.
 /// # Errors
 /// NOT RUN: the lab runs another (`LAB_ATERM` names it) or none.
 fn same_aterm(built: &Path) -> Result<(), Fail> {

@@ -353,14 +353,18 @@ fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
                     progress.observed_at,
                 ),
             );
-            let menu = crate::fact_menu::rows(
-                crate::claude_lights::Fact::Account,
-                &crate::fact_menu::FactMenuFacts {
-                    account_progress: Some(progress),
-                    ..Default::default()
-                },
+            // The declined judgment's phase is in the details the card copies, not a row.
+            assert_eq!(progress.stay, None);
+            let report = crate::fact_menu::details_report(&crate::fact_menu::FactMenuFacts {
+                account_progress: Some(progress),
+                ..Default::default()
+            });
+            assert!(
+                report
+                    .lines()
+                    .any(|line| line == format!("Recovery: {expected}")),
+                "{report}"
             );
-            assert!(menu.iter().any(|row| matches!(row, crate::autopilot_menu::MenuRow::Note { text, .. } if text.contains(&expected))));
         }
         let advice = idle.account(usage_wall());
         assert_eq!(selected(&advice, &target), 0);

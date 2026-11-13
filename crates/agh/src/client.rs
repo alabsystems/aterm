@@ -491,9 +491,10 @@ struct Inner {
     redactor: Redactor,
     backstop: Option<Duration>,
     no_anonymous_api: bool,
+    core_reserve: u64,
     /// Each profile's load, once per process.
     credentials: Mutex<BTreeMap<String, std::result::Result<Arc<Credential>, LoadError>>>,
-    /// Each repository's numeric id, by [`Slug`]: the only memo (design §14).
+    /// Each repository's numeric id, by [`Slug`].
     ids: Mutex<BTreeMap<Slug, u64>>,
     meter: Mutex<Meter>,
     /// The inline profiles whose login a `GET /user` bound (design §6.1), or is binding now.
@@ -532,6 +533,7 @@ pub struct GithubBuilder {
     redactor: Redactor,
     backstop: Option<Duration>,
     no_anonymous_api: bool,
+    core_reserve: u64,
     dirs: Option<Dirs>,
     notifier: Arc<dyn Notifier>,
     git_helper: Option<HelperCommand>,
@@ -555,6 +557,7 @@ impl GithubBuilder {
             redactor: Redactor::new(),
             backstop: None,
             no_anonymous_api: false,
+            core_reserve: 1000,
             dirs: None,
             notifier: Arc::new(NoNotifier),
             git_helper: None,
@@ -596,6 +599,14 @@ impl GithubBuilder {
     #[must_use]
     pub fn rate_book(mut self, book: RateBook) -> GithubBuilder {
         self.rate_book = book;
+        self
+    }
+
+    /// Core requests background reads leave for the release cutter. Set to zero
+    /// only in the foreground publication/cutter client; no environment override.
+    #[must_use]
+    pub const fn core_reserve(mut self, reserve: u64) -> GithubBuilder {
+        self.core_reserve = reserve;
         self
     }
 
@@ -690,6 +701,7 @@ impl GithubBuilder {
                 redactor: self.redactor,
                 backstop: self.backstop,
                 no_anonymous_api: self.no_anonymous_api,
+                core_reserve: self.core_reserve,
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -725,8 +737,63 @@ impl Github {
             });
         }
         let decided = self.route(&call.route)?;
-        self.run(call, &decided, Reading::Whole)
-            .and_then(Got::into_answered)
+        // Explicit conditionals (wait/page consistency), raw status callers,
+        // anonymous reads and tapes keep their own response contract.
+        let cached_call = !self.taped()
+            && self.inner.rate_book.enabled()
+            && decided.identity != IdentityRef::Anonymous
+            && call.origin == OriginRole::Api
+            && call.method == Method::Get
+            && call.if_none_match.is_none()
+            && !call.answer_any;
+        if !cached_call {
+            return self
+                .run(call, &decided, Reading::Whole)
+                .and_then(Got::into_answered);
+        }
+        let material = format!(
+            "{}\n{}\n{}\n{}",
+            book_key_str(&decided.identity),
+            self.inner.endpoints.api().base(),
+            call.path_and_query_cow(),
+            call.accept.header_value()
+        );
+        let key =
+            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(material.as_bytes()));
+        let cached = self.inner.rate_book.cached(&key, call.limit);
+        let conditional = call
+            .clone()
+            .if_none_match(cached.as_ref().map(|c| c.etag.clone()));
+        let mut answer = self
+            .run(&conditional, &decided, Reading::Whole)
+            .and_then(Got::into_answered)?;
+        if answer.status == 304 && (answer.moved.is_some() || answer.as_ != decided.identity) {
+            // Validators are scoped to a resource and identity. A redirected
+            // resource cannot validate the previous resource's cached bytes.
+            let spent = answer.requests;
+            answer = self
+                .run(call, &decided, Reading::Whole)
+                .and_then(Got::into_answered)?;
+            answer.requests = answer.requests.saturating_add(spent);
+        }
+        if answer.status == 304 {
+            let cached = cached.ok_or_else(|| {
+                Error::protocol("GitHub answered 304 without a cached representation")
+            })?;
+            answer.status = 200;
+            answer.body = cached.body;
+            for (name, value) in cached.headers {
+                if answer.header(&name).is_none() {
+                    answer.headers.push((name, value));
+                }
+            }
+            if answer.etag.is_none() {
+                answer.etag = Some(cached.etag);
+            }
+        } else if answer.moved.is_none() {
+            self.inner.rate_book.cache(&key, &answer);
+        }
+        Ok(answer)
     }
 
     /// Execute a call and stream its 2xx body.
@@ -971,6 +1038,7 @@ impl Github {
                 redactor: inner.redactor.clone(),
                 backstop: inner.backstop,
                 no_anonymous_api: inner.no_anonymous_api,
+                core_reserve: inner.core_reserve,
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -1452,7 +1520,8 @@ impl Github {
     }
 
     /// The helper command the runner mounts: the builder's `git_helper_for_tests`, else
-    /// `HelperCommand::current()`.
+    /// `HelperCommand::current()`. A frontend must record its intrinsic
+    /// [`crate::git::HelperHost`] and call the early tether entry before using native Git.
     ///
     /// # Errors
     ///
@@ -2415,7 +2484,7 @@ impl Github {
         let rate = RateSnapshot::from_headers(&response.headers);
         if let Some(snapshot) = &rate {
             self.inner.meter.lock_or_recover().rate = Some(snapshot.clone());
-            if booked {
+            if booked && response.status != 401 {
                 self.inner.rate_book.record(key, snapshot);
             }
         }
@@ -2628,12 +2697,18 @@ impl Github {
                 "pid": std::process::id(),
                 "parent_pid": i32::try_from(std::process::id()).ok()
                     .and_then(aterm_uds::process::read_process_parent),
-                "program": program,
+                "program": program.as_deref().map(|p| self.redactor().apply(p)),
                 "caller": self.redactor().apply(&self.inner.caller),
+                "chain": crate::rate::parent_chain(self.redactor()),
                 "as": identity.label(),
+                "login": match identity {
+                    IdentityRef::Profile { name, .. } => self.inner.router.profile(name).and_then(|p| p.login.as_deref()).map(|login| self.redactor().apply(login)),
+                    IdentityRef::Anonymous => None,
+                },
                 "fingerprint": book_key_str(identity),
                 "method": call.method.as_str(),
                 "path": self.redactor().apply(path_only(&call.path)),
+                "endpoint": aterm_ctl::github_usage::endpoint_class(&call.path),
                 "status": response.map(|response| response.status),
                 "wire_error": exchanged.as_ref().err().map(|error| error.kind.slug()),
                 "wire_phase": exchanged.as_ref().err().map(|error| match error.phase {
@@ -2698,6 +2773,31 @@ impl Github {
         let mut slept = Duration::ZERO;
         loop {
             let mut anonymous_subread = false;
+            let background = booked
+                && !free
+                && call.rate_book
+                && call.method.is_read()
+                && resource_for(&call.path) == "core"
+                && prepared.as_ != IdentityRef::Anonymous
+                && self.inner.core_reserve != 0;
+            let background_guard = if background {
+                Some(
+                    self.inner
+                        .rate_book
+                        .background_guard(book_key_str(&prepared.as_))?,
+                )
+            } else {
+                None
+            };
+            if background
+                && let Some(error) = self.inner.rate_book.refuse_background(
+                    book_key_str(&prepared.as_),
+                    self.inner.fx.wall_secs()?,
+                    self.inner.core_reserve,
+                )
+            {
+                return Err(self.finish_error(error, call, &prepared.as_, None));
+            }
             let began = resume
                 .as_mut()
                 .map_or(0, |resume| resume.begin(&mut prepared));
@@ -2705,6 +2805,20 @@ impl Github {
             *sent = requests;
             let exchanged = self.send(&prepared)?;
             self.record_exchange(call, &prepared.as_, &exchanged);
+            let rate = exchanged
+                .as_ref()
+                .ok()
+                .and_then(|response| RateSnapshot::from_headers(&response.headers));
+            if let (Some(snapshot), Ok(response)) = (&rate, &exchanged) {
+                self.inner.meter.lock_or_recover().rate = Some(snapshot.clone());
+                if booked && response.status != 401 {
+                    self.inner.rate_book.record(key, snapshot);
+                }
+            }
+            // The next admission must see these headers, but classification can
+            // itself probe GitHub. Never hold the admission lock through a probe
+            // or a response body's potentially long transfer.
+            drop(background_guard);
             let failure = match exchanged {
                 Err(wire) => self.finish_error(
                     classify::wire(&wire, call.method, call.idempotency),
@@ -2713,13 +2827,6 @@ impl Github {
                     None,
                 ),
                 Ok(mut response) => {
-                    let rate = RateSnapshot::from_headers(&response.headers);
-                    if let Some(snapshot) = &rate {
-                        self.inner.meter.lock_or_recover().rate = Some(snapshot.clone());
-                        if booked {
-                            self.inner.rate_book.record(key, snapshot);
-                        }
-                    }
                     let retry_answer = if call.answer_any {
                         crate::retry::transient_cause(
                             &self

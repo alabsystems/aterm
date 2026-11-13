@@ -39,13 +39,54 @@ impl Declaration {
     #[cfg(unix)]
     fn same_coordinator(&self, other: &Self) -> bool {
         self.cache == other.cache
-            && self.cache_identity == other.cache_identity
-            && self.lock_identity == other.lock_identity
+            && self.cache_identity.same_record(&other.cache_identity)
+            && self.lock_identity.same_record(&other.lock_identity)
+    }
+
+    #[cfg(unix)]
+    fn names_coordinator(&self, now: &Self) -> bool {
+        self.cache == now.cache
+            && self.cache_identity.names(&now.cache_identity)
+            && self.lock_identity.names(&now.lock_identity)
     }
 
     #[cfg(unix)]
     fn same_family(&self, other: &Self) -> bool {
-        self.preserve_if_present.is_some() && self.preserve_if_present == other.preserve_if_present
+        match (&self.preserve_if_present, &other.preserve_if_present) {
+            (Some(a), Some(b)) => a.same_record(b),
+            _ => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn names_family(&self, now: &Self) -> bool {
+        match (&self.preserve_if_present, &now.preserve_if_present) {
+            (Some(a), Some(b)) => a.names(b),
+            _ => false,
+        }
+    }
+
+    pub(super) fn same_record(&self, other: &Self) -> bool {
+        self.cache == other.cache
+            && self.cache_identity.same_record(&other.cache_identity)
+            && self.lock_identity.same_record(&other.lock_identity)
+            && self.minimum_bytes == other.minimum_bytes
+            && match (&self.preserve_if_present, &other.preserve_if_present) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same_record(b),
+                _ => false,
+            }
+    }
+
+    #[cfg(unix)]
+    fn names(&self, now: &Self) -> bool {
+        self.names_coordinator(now)
+            && self.minimum_bytes == now.minimum_bytes
+            && match (&self.preserve_if_present, &now.preserve_if_present) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.names(b),
+                _ => false,
+            }
     }
 }
 
@@ -60,12 +101,21 @@ impl PreserveIfPresent {
         self.path.is_absolute() && self.path.file_name().is_some()
     }
 
+    fn same_record(&self, other: &Self) -> bool {
+        self.path == other.path && self.parent_identity.same_record(&other.parent_identity)
+    }
+
+    #[cfg(unix)]
+    fn names(&self, now: &Self) -> bool {
+        self.path == now.path && self.parent_identity.names(&now.parent_identity)
+    }
+
     #[cfg(unix)]
     fn capture(path: &Path) -> Option<Self> {
         let parent = path.parent()?;
         let guard = Self {
             path: path.to_path_buf(),
-            parent_identity: super::boot_local(parent)?,
+            parent_identity: super::identity(parent)?,
         };
         (guard.valid() && guard.absent()).then_some(guard)
     }
@@ -77,7 +127,7 @@ impl PreserveIfPresent {
         };
         let current = || {
             parent.canonicalize().ok().as_deref() == Some(parent)
-                && super::boot_local(parent).as_ref() == Some(&self.parent_identity)
+                && super::identity(parent).is_some_and(|now| self.parent_identity.names(&now))
         };
         self.valid()
             && current()
@@ -185,11 +235,17 @@ impl Policy {
 
     #[cfg(unix)]
     pub(super) fn same_creation(&self, requested: &Self) -> bool {
-        let mut requested = requested.clone();
-        if let Some(active) = &mut requested.active {
-            active.fresh = self.active.as_ref().is_some_and(|active| active.fresh);
-        }
-        *self == requested
+        self.declaration.same_record(&requested.declaration)
+            && self.learned_budget == requested.learned_budget
+            && self.last_settled == requested.last_settled
+            && self.superseded == requested.superseded
+            && match (&self.active, &requested.active) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.token == b.token && a.producer == b.producer && a.workspace == b.workspace
+                }
+                _ => false,
+            }
     }
 
     #[cfg(unix)]
@@ -215,7 +271,7 @@ impl Policy {
 pub(super) fn same_declaration(a: Option<&Policy>, b: Option<&Policy>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(a), Some(b)) => a.declaration == b.declaration,
+        (Some(a), Some(b)) => a.declaration.same_record(&b.declaration),
         _ => false,
     }
 }
@@ -387,10 +443,13 @@ impl Kernel for Live {
 fn file_identity(file: &std::fs::File) -> Option<Identity> {
     use std::os::unix::fs::MetadataExt as _;
     let info = file.metadata().ok()?;
-    // SAFETY: geteuid has no preconditions and does not mutate process state.
-    let uid = unsafe { libc::geteuid() };
-    (info.is_file() && info.uid() == uid && info.mode() & 0o022 == 0 && info.nlink() == 1)
-        .then_some(Identity::unrecorded(info.dev(), info.ino()))
+    let held = Identity::held(file)?;
+    (info.is_file()
+        && info.uid() == super::euid()
+        && info.mode() & 0o022 == 0
+        && info.nlink() == 1
+        && (info.dev(), info.ino()) == (held.device, held.inode))
+        .then_some(held)
 }
 
 #[cfg(unix)]
@@ -398,7 +457,7 @@ fn coordinator(home: &Path, cache: &Path) -> Option<(Declaration, std::fs::File)
     if !super::scope(home, cache) || cache.canonicalize().ok().as_deref() != Some(cache) {
         return None;
     }
-    let cache_identity = super::boot_local(cache)?;
+    let cache_identity = super::identity(cache)?;
     let path = cache.join(COORDINATOR);
     let file = crate::metadata_io::open_regular(&path).ok()?;
     let lock_identity = file_identity(&file)?;
@@ -420,21 +479,16 @@ fn coordinator(home: &Path, cache: &Path) -> Option<(Declaration, std::fs::File)
 
 #[cfg(unix)]
 fn matches_coordinator(home: &Path, declaration: &Declaration) -> bool {
-    coordinator(home, &declaration.cache).is_some_and(|(mut current, _)| {
-        current.minimum_bytes = declaration.minimum_bytes;
-        current.preserve_if_present = declaration.preserve_if_present.clone();
-        current == *declaration
-    })
+    coordinator(home, &declaration.cache)
+        .is_some_and(|(current, _)| declaration.names_coordinator(&current))
 }
 
 #[cfg(unix)]
 fn held_coordinator(home: &Path, declaration: &Declaration) -> bool {
-    let Some((mut current, file)) = coordinator(home, &declaration.cache) else {
+    let Some((current, file)) = coordinator(home, &declaration.cache) else {
         return false;
     };
-    current.minimum_bytes = declaration.minimum_bytes;
-    current.preserve_if_present = declaration.preserve_if_present.clone();
-    current == *declaration
+    declaration.names_coordinator(&current)
         && matches!(
             crate::lock::Flock::try_lock(file),
             Err(std::fs::TryLockError::WouldBlock)
@@ -564,15 +618,14 @@ pub(super) fn coordinate(home: &Path, receipt: &Receipt) -> Result<Option<Coordi
     if !policy.retirement_allowed() {
         return Err(());
     }
-    let (mut declaration, file) = coordinator(home, &policy.declaration.cache).ok_or(())?;
-    declaration.minimum_bytes = policy.declaration.minimum_bytes;
-    declaration.preserve_if_present = policy.declaration.preserve_if_present.clone();
-    if declaration != policy.declaration
-        || receipt.root.parent() != Some(declaration.cache.as_path())
+    let (current, file) = coordinator(home, &policy.declaration.cache).ok_or(())?;
+    if !policy.declaration.names_coordinator(&current)
+        || receipt.root.parent() != Some(policy.declaration.cache.as_path())
     {
         return Err(());
     }
     let held = crate::lock::Flock::try_lock(file).map_err(|_| ())?;
+    let declaration = policy.declaration.clone();
     if !matches_coordinator(home, &declaration) || !policy.retirement_allowed() {
         return Err(());
     }
@@ -595,7 +648,7 @@ impl Coordination {
 
     pub(super) fn current(&self, home: &Path, receipt: &Receipt) -> bool {
         receipt.package.as_ref().is_some_and(|policy| {
-            policy.declaration == self.declaration
+            policy.declaration.same_record(&self.declaration)
                 && policy.active.is_none()
                 && policy.retirement_allowed()
         }) && !receipt.owners_unknown
@@ -666,7 +719,7 @@ fn recover_active(
     let Some(policy) = &receipt.package else {
         return false;
     };
-    if policy.declaration != *declaration {
+    if !policy.declaration.names(declaration) {
         return false;
     }
     if !policy.retirement_allowed() {
@@ -798,7 +851,7 @@ fn admit_on(
     if existing
         .as_ref()
         .and_then(|receipt| receipt.package.as_ref())
-        .is_some_and(|policy| !policy.declaration.same_family(&declaration))
+        .is_some_and(|policy| !policy.declaration.names_family(&declaration))
     {
         return Err("package target belongs to another preservation declaration".into());
     }
@@ -847,7 +900,7 @@ fn admit_on(
             && receipt
                 .package
                 .as_ref()
-                .is_some_and(|policy| policy.declaration.same_family(&declaration))
+                .is_some_and(|policy| policy.declaration.names_family(&declaration))
     }) {
         return Err("an unfinished retirement keeps the package generation".into());
     }
@@ -858,13 +911,13 @@ fn admit_on(
             .package
             .as_ref()
             .ok_or("package policy disappeared")?;
-        if !before.declaration.same_coordinator(&declaration) {
+        if !before.declaration.names_coordinator(&declaration) {
             return Err("package policy coordinator changed".into());
         }
         if before.last_settled.as_deref() == Some(args.attempt) {
             return Err("package attempt already settled".into());
         }
-        if !before.declaration.same_family(&declaration) {
+        if !before.declaration.names_family(&declaration) {
             if before
                 .active
                 .as_ref()
@@ -876,7 +929,7 @@ fn admit_on(
             }
             continue;
         }
-        if before.declaration != declaration
+        if !before.declaration.names(&declaration)
             || receipt.owners_unknown
             || receipt.owners.is_empty()
             || receipt.root.parent() != Some(args.cache)
@@ -1007,7 +1060,7 @@ fn admit_on(
     let Some(current) = &receipt.package else {
         return Ok(legacy(args.target, created));
     };
-    if current.declaration != declaration
+    if !current.declaration.names(&declaration)
         || current.active.as_ref().is_some_and(|attempt| {
             attempt.token != args.attempt
                 || attempt.workspace != workspace
@@ -1022,6 +1075,7 @@ fn admit_on(
         return Err("package cache changed during owner publication".into());
     }
     let mut policy = policy;
+    policy.declaration = current.declaration.clone();
     if let Some(active) = policy.active.as_mut() {
         active.fresh = created;
     }

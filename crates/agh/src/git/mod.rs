@@ -23,7 +23,54 @@ pub use control::{
     ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
 };
 pub use fetch::{FETCH_ROWS_MAX, FetchBatch, FetchRow};
-pub use run::{GitOp, GitOut, GitRun, HelperCommand};
+pub use run::{GitOp, GitOut, GitRun, HelperCommand, HelperHost};
+
+/// Admit Git's complete `rev-parse --is-shallow-repository` answer for a native push.
+/// Callers may use the same admission before expensive checks; the push rechecks it.
+/// # Errors
+/// A shallow source or any answer other than the exact non-shallow record is refused.
+pub fn require_complete_source(stdout: &[u8]) -> crate::Result<()> {
+    if stdout == b"false\n" {
+        Ok(())
+    } else {
+        Err(crate::Error::refused(
+            "native push requires a complete, non-shallow source repository",
+        ))
+    }
+}
+
+/// Parse a complete native advertisement, optionally selecting one exact full ref.
+/// Prefix neighbours never establish presence, and duplicate names never establish a value.
+/// # Errors
+/// Malformed lines, refs, object IDs or duplicate ref names.
+pub fn advertised_refs(
+    stdout: &str,
+    reference: Option<&str>,
+) -> crate::Result<std::collections::BTreeMap<String, String>> {
+    let mut refs = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let (oid, name) = line
+            .split_once('\t')
+            .ok_or_else(|| crate::Error::protocol("Git ref advertisement is malformed"))?;
+        let full = name.strip_suffix("^{}").unwrap_or(name);
+        if !aterm_types::land_trailer::object_id(oid)
+            || !(full == "HEAD" || (full.starts_with("refs/") && crate::path::ref_name_ok(full)))
+        {
+            return Err(crate::Error::protocol(
+                "Git ref advertisement has an invalid ref or object ID",
+            ));
+        }
+        if refs.insert(name.to_owned(), oid.to_owned()).is_some() {
+            return Err(crate::Error::protocol(
+                "Git ref advertisement has a duplicate ref",
+            ));
+        }
+    }
+    if let Some(reference) = reference {
+        refs.retain(|name, _| name == reference);
+    }
+    Ok(refs)
+}
 
 /// One validation phase of an incremental native atomic ref admission.
 #[cfg(unix)]

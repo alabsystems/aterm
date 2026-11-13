@@ -658,7 +658,7 @@ fn each_guard_in_hand_holds_the_due_line_once() {
             } else if !s.turn_end.left_to_person() {
                 let mut reading =
                     s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
-                // Left under Land: Cruise leaves no exchange to a person (owner ruling 2026-10-26).
+                // Left under Land: Cruise leaves no exchange to a person.
                 reading.left_record = true;
                 reading.autopilot = Autopilot::Land;
                 s.turn_end.observe(&reading, s.fx.mono());

@@ -369,3 +369,151 @@ fn a_hold_ends_with_its_intent_and_a_new_arming_names_its_own() {
         app.auto_apply_hold_words.kept()
     );
 }
+
+/// A refused boot trial holds the lane in the updater's own words. Both readers of them, the
+/// lane's hold line past the ladder and an apply deferred at the gate, carry the refusal and
+/// the bound the updater named, never the generic sentence; the hold is said once, not once
+/// per poll.
+#[test]
+fn a_pending_boot_health_is_named_once_in_the_updaters_own_words() {
+    use crate::native_update_auto_intent::{ApplyPhase, LANDS_WITHIN};
+
+    let mut app = App::headless_for_test();
+    app.native_updater_service =
+        crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
+    let now = std::time::Instant::now();
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 12,
+        dmg_sha256: [0xab; 32],
+        retry_at: now,
+        attempts: 0,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+        build: 12,
+        armed_at: now - LANDS_WITHIN,
+        announced: ApplyPhase::Land,
+        restored_hold_said: false,
+    });
+    assert_eq!(
+        app.automatic_apply_phase(now),
+        ApplyPhase::Land,
+        "PRECONDITION: past the ladder, where a hold is named"
+    );
+    let why = "a window reached its health checkpoint, but the trial's recovery proof failed: \
+               rollback refused; the running build retries it and settles the trial without \
+               the proof after 3 refusals spanning 30 min of awake time in this process";
+    assert!(
+        !why.contains(App::BOOT_HEALTH_PENDING) && !App::BOOT_HEALTH_PENDING.contains(why),
+        "PRECONDITION: the updater's words are not the generic sentence"
+    );
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::Pending {
+                why: why.to_string(),
+                retry_after: None,
+            },
+            now,
+        ),
+        BootHealthFinishDisposition::RetryArmed
+    );
+
+    let named = |app: &App| -> Vec<String> {
+        app.auto_apply_hold_words
+            .kept()
+            .iter()
+            .filter(|line| line.contains("(boot-health) since "))
+            .cloned()
+            .collect()
+    };
+    assert!(named(&app).is_empty(), "PRECONDITION: nothing said yet");
+    app.try_pending_native_auto_apply(false);
+    assert_eq!(app.auto_apply_hold_token(12), Some("boot-health"));
+    let lines = named(&app);
+    assert_eq!(lines.len(), 1, "the hold is named as it begins: {lines:?}");
+    assert!(
+        lines[0].contains(why) && !lines[0].contains(App::BOOT_HEALTH_PENDING),
+        "in the updater's words, its refusal and its bound: {}",
+        lines[0]
+    );
+
+    // A second due poll under the same hold says nothing.
+    app.auto_apply_intent
+        .as_mut()
+        .expect("a pending trial keeps the intent")
+        .retry_at = now;
+    app.try_pending_native_auto_apply(false);
+    assert_eq!(app.auto_apply_hold_token(12), Some("boot-health"));
+    assert_eq!(
+        named(&app).len(),
+        1,
+        "named once, never per poll: {:?}",
+        app.auto_apply_hold_words.kept()
+    );
+    assert_eq!(
+        lines_of(&app, "boot-health"),
+        (1, 0),
+        "and the hold is not over"
+    );
+
+    // An apply deferred at the gate gives the same words.
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Automatic),
+        UpdateOutcome::Deferred {
+            reason: why.to_string(),
+            hold: LaneHold::BootHealth,
+        }
+    );
+
+    // With nothing said by the updater yet, both fall back to the generic sentence.
+    app.boot_health_hold_reason = None;
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Automatic),
+        UpdateOutcome::Deferred {
+            reason: App::BOOT_HEALTH_PENDING.to_string(),
+            hold: LaneHold::BootHealth,
+        }
+    );
+}
+
+/// A handed session whose master hung up and whose reader never retired it is booked exited once
+/// it has stood so for `PANE_EXITED_BACKSTOP` of attempts: it leaves the live sessions the
+/// handoff hands over, so `pane-exited` ends, and its pane travels as a held one.
+#[test]
+fn a_hung_up_session_its_reader_never_retires_is_booked_exited_at_its_backstop() {
+    use crate::app_update_handoff::PANE_EXITED_BACKSTOP;
+    let mut app = app_nobody_at_the_mac();
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: `slave` is this test's own descriptor, closed once: the command "exits".
+    unsafe { libc::close(slave) };
+    let id = app.next_session_id;
+    let mut session = crate::stub_session(id);
+    session.master = master;
+    app.push_stub_tab(WindowId(0), session);
+    assert!(
+        crate::app_update_handoff::handoff_dead_masters(&app.handoff_live_sessions()).contains(&id),
+        "PRECONDITION: its master reads hung up"
+    );
+    let now = std::time::Instant::now();
+    app.tick_lane_hold_clocks(now);
+    assert!(
+        app.handoff_live_sessions()
+            .iter()
+            .any(|(live, _, _)| *live == id),
+        "inside its backstop the reader is the one to retire it"
+    );
+    let since = now.checked_sub(PANE_EXITED_BACKSTOP).unwrap();
+    app.lane_hold_clocks.hung_up.insert(id, since);
+    app.tick_lane_hold_clocks(std::time::Instant::now());
+    assert!(
+        !app.handoff_live_sessions()
+            .iter()
+            .any(|(live, _, _)| *live == id),
+        "past it, the session is booked exited and is no longer handed over as live"
+    );
+    assert!(app.handoff_exited_session_ids().contains(&id));
+    assert!(app.lane_hold_clocks.hung_up.is_empty());
+}

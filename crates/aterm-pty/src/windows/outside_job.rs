@@ -5,6 +5,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use aterm_types::MutexExt;
 
@@ -26,6 +28,87 @@ thread_local! {
 #[cfg(test)]
 pub(super) const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x1000;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`images`] has walked the machine's processes on this thread.
+    pub(super) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where a session's shell runs the programs its commands start, as far as its listings and
+/// its own image have shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProgramsRun {
+    /// Nothing has shown it yet: no listing has held a program.
+    Unknown,
+    /// In the tab's job: a listing of the job held one.
+    InJob,
+    /// Outside it: the shell is a packaged app ([`packaged`]), or a walk below the shell found a
+    /// program the job does not hold.
+    OutsideJob,
+}
+
+/// What a session has learned of where its shell's programs run ([`ProgramsRun`]): it moves from
+/// `Unknown` once and then stays, so a tab is asked the costly question (a walk of the
+/// machine's processes) only until it has answered.
+pub(super) struct Learned(AtomicU8);
+
+impl Learned {
+    const UNKNOWN: u8 = 0;
+    const IN_JOB: u8 = 1;
+    const OUTSIDE_JOB: u8 = 2;
+
+    /// What is known as the session starts, from its shell's image path (`None`: unread).
+    pub(super) fn of_shell(image: Option<&Path>) -> Self {
+        Self(AtomicU8::new(if image.is_some_and(packaged) {
+            Self::OUTSIDE_JOB
+        } else {
+            Self::UNKNOWN
+        }))
+    }
+
+    pub(super) fn get(&self) -> ProgramsRun {
+        match self.0.load(Ordering::Relaxed) {
+            Self::IN_JOB => ProgramsRun::InJob,
+            Self::OUTSIDE_JOB => ProgramsRun::OutsideJob,
+            _ => ProgramsRun::Unknown,
+        }
+    }
+
+    /// A listing found a program `at`; kept only where nothing was known.
+    pub(super) fn found(&self, at: ProgramsRun) {
+        let at = match at {
+            ProgramsRun::Unknown => return,
+            ProgramsRun::InJob => Self::IN_JOB,
+            ProgramsRun::OutsideJob => Self::OUTSIDE_JOB,
+        };
+        let _ = self
+            .0
+            .compare_exchange(Self::UNKNOWN, at, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// Whether a listing whose job holds no program walks below the shell for those outside it: a
+/// shell known to run its programs outside its job always, one known to run them in it never
+/// (its empty job is a shell at rest), and one not yet known only when the listing is one that
+/// may `discover` (a block's start or end, not the pace between).
+pub(super) const fn walks(known: ProgramsRun, discover: bool) -> bool {
+    match known {
+        ProgramsRun::OutsideJob => true,
+        ProgramsRun::InJob => false,
+        ProgramsRun::Unknown => discover,
+    }
+}
+
+/// Whether `image` is a packaged app's: under a `WindowsApps` folder, where Windows keeps a
+/// Store install (`C:\Program Files\WindowsApps\Microsoft.PowerShell_<version>\pwsh.exe`) and
+/// its execution alias (`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`). Windows starts such
+/// a shell's programs outside the tab's job.
+pub(super) fn packaged(image: &Path) -> bool {
+    image
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
 /// [`end`] the first time it is asked of session `s`, nothing after.
 pub(super) fn end_once(s: &WinSession) {
     let mut ended = s.outside_job_ended.lock_or_recover();
@@ -45,7 +128,13 @@ fn end(s: &WinSession) {
         return;
     };
     let tree = console_guard::process_tree();
-    let taken = select(s.pid, root_born, &tree, open, |h: &Handle| {
+    let to_end = |pid| {
+        open(
+            pid,
+            ffi::PROCESS_QUERY_LIMITED_INFORMATION | ffi::PROCESS_TERMINATE,
+        )
+    };
+    let taken = select(s.pid, root_born, &tree, to_end, |h: &Handle| {
         held_by(h.raw(), s.job)
     });
     for (_, process) in &taken {
@@ -53,6 +142,32 @@ fn end(s: &WinSession) {
         // process the walk vouched for.
         unsafe { ffi::TerminateProcess(process.raw(), ENDED) };
     }
+}
+
+/// The programs below session `s`'s first process that its job does not hold, each with its
+/// image's path: what [`end`] would end, read and left running. A packaged shell's programs (a
+/// Store pwsh's) are these, so a listing of the job alone names none of what such a tab runs.
+/// Each process is opened to read its start, its parent and its image path, and nothing else of
+/// it is read.
+pub(super) fn images(s: &WinSession) -> Vec<(u32, PathBuf)> {
+    if s.job == 0 {
+        return Vec::new();
+    }
+    let Some(root_born) = console_guard::started(s.process) else {
+        return Vec::new();
+    };
+    #[cfg(test)]
+    WALKS.with(|walks| walks.set(walks.get() + 1));
+    let tree = console_guard::process_tree();
+    let read = |pid| open(pid, ffi::PROCESS_QUERY_LIMITED_INFORMATION);
+    select(s.pid, root_born, &tree, read, |h: &Handle| {
+        held_by(h.raw(), s.job)
+    })
+    .into_iter()
+    .filter_map(|(pid, process)| {
+        console_guard::image_of_handle(process.raw()).map(|image| (pid, image))
+    })
+    .collect()
 }
 
 /// A process the walk opened: the handle (which pins its pid while held), its
@@ -97,11 +212,10 @@ fn select<H>(
         .collect()
 }
 
-/// Open process `pid` to end it, with its start and its parent; `None` when it
-/// cannot be opened so (gone, elevated, another user's) or either cannot be
-/// read.
-fn open(pid: u32) -> Option<Opened<Handle>> {
-    let access = ffi::PROCESS_QUERY_LIMITED_INFORMATION | ffi::PROCESS_TERMINATE;
+/// Open process `pid` with `access` (which holds `PROCESS_QUERY_LIMITED_INFORMATION`), with its
+/// start and its parent; `None` when it cannot be opened so (gone, elevated, another user's) or
+/// either cannot be read.
+fn open(pid: u32, access: u32) -> Option<Opened<Handle>> {
     // SAFETY: plain OpenProcess; the handle is owned by the guard.
     let handle = Handle::new(unsafe { ffi::OpenProcess(access, 0, pid) });
     if handle.raw() == 0 {

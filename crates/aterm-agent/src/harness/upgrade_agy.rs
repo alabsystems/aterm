@@ -490,8 +490,8 @@ pub(super) fn bound_worker_flags(
 pub const WORKER_FLOOR: [&str; 2] = ["--mode", "auto"];
 
 /// The flags of `argv` a worker of this agy starts with: what moves its config
-/// ([`config_flags`]) and what it may do unasked, its parent's (owner ruling 2026-11-02) held to
-/// [`WORKER_FLOOR`] (owner, 2026-11-04: workers are fully automated by default). A starter that
+/// ([`config_flags`]) and what it may do unasked, its parent's, held to
+/// [`WORKER_FLOOR`] (workers are fully automated by default). A starter that
 /// skips permissions (`--dangerously-skip-permissions`, unless Go reads its value as false) or
 /// runs in auto mode lends its posture as it is; any other mode, or none, lends the floor in
 /// place of its `--mode` (Go reads the last of several), and its `--sandbox` stays.

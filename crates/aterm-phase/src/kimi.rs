@@ -16,7 +16,9 @@
 //! one spinner row right over the composer's top border (a moon phase, `🌓` alone, with
 //! ` · Tip: …` or a retry's `Retrying (N/10) · …`, or a braille spinner and `Working…`), with a
 //! retry's detail or a queued message's block between it and the border; the turn's end takes it
-//! away and leaves a blank row there ([`phase`]). An approval, a question, a plan, the trust
+//! away and leaves a blank row there ([`phase`]). 2.5's agent swarm moves that spinner into its
+//! own panel's status row (read from 2.5.2's and 2.5.3's code, unmeasured), so a blank row there
+//! is idle only with no spinner over it. An approval, a question, a plan, the trust
 //! prompt and the session picker are drawn in the composer's place and wait on the person. The
 //! first four are boxes a tool or a launch raised: each is read whole by [`prompt`] for the
 //! supervisor's policy. The session picker is the person's own and decides nothing. Other widths
@@ -30,7 +32,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 21, "0.21");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 22, "0.22");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -113,14 +115,20 @@ pub fn context_row(row: &str) -> Option<u8> {
 }
 
 /// The share of context a footer row says is used ([`context_row`]), where the exit hint a first
-/// Ctrl-C arms for 1.5 s may stand at the footer row's left before it (`Press Ctrl+C again to
-/// exit`, measured on 2.4.0's exit-confirm frame).
+/// Ctrl-C or Ctrl-D arms for 1.5 s may stand at the footer row's left before it (`Press Ctrl+C
+/// again to exit`, measured on 2.4.0's exit-confirm frame; `Press Ctrl+D again to exit`, which
+/// 2.4.0's exit by Ctrl-D drew, and which 2.5.2's and 2.5.3's binaries arm the same way). The
+/// `Shutting down…` an exit draws in the same place is no hint: the program is ending, and its
+/// composer decides nothing.
 fn footer_used(row: &str) -> Option<u8> {
     let text = crate::text::trim(row);
-    context_row(
-        text.strip_prefix(crate::anchor!("kimi.footer.exit_confirm"))
-            .map_or(text, crate::text::trim_start),
-    )
+    let past = [
+        crate::anchor!("kimi.footer.exit_confirm"),
+        crate::anchor!("kimi.footer.exit_confirm.ctrl_d"),
+    ]
+    .into_iter()
+    .find_map(|hint| text.strip_prefix(hint));
+    context_row(past.map_or(text, crate::text::trim_start))
 }
 
 /// A decimal token count, optionally in compact thousands or millions.
@@ -354,12 +362,18 @@ fn spinner_row(row: &str) -> bool {
 /// Kimi Code's phase on `rows` and whether the screen decides it.
 ///
 /// Only its composer decides it ([`composer_rows`]), by the run of drawn rows standing right over
-/// the composer's top border: none (a blank row there, as every measured turn's end leaves) is
-/// idle; a run opened by the spinner row ([`spinner_row`]) is busy, whatever stands between the
-/// spinner and the border (a retry's detail, a queued message's block); a run ending in the
-/// notice a resume draws (`Resumed session (<id>).`, measured on 2.4.0's `resumed-picked` frame)
-/// is idle. Any other run decides nothing. A screen with no composer is a prompt where a box
-/// stands in its place ([`card`]), and decides nothing otherwise (the session picker, an exit).
+/// the composer's top border, up to the blank row over it, which must be on the screen: a run
+/// whose start is not seen (the composer at the screen's top, or drawn rows all the way up)
+/// decides nothing. No run (a blank row right over the border, as every measured turn's end
+/// leaves) is idle, unless a spinner row ([`spinner_row`]) stands anywhere over that blank row:
+/// 2.5's agent swarm draws the turn's spinner in its own panel's status row and none over the
+/// composer while it waits or runs a tool (`shouldPlaceActivitySpinnerInAgentSwarm`, read from
+/// 2.5.2's and 2.5.3's code, unmeasured), so a spinner over the transcript decides nothing. A run
+/// opened by the spinner row is busy, whatever stands between the spinner and the border (a
+/// retry's detail, a queued message's block); a run ending in the notice a resume draws
+/// (`Resumed session (<id>).`, measured on 2.4.0's `resumed-picked` frame) is idle. Any other run
+/// decides nothing. A screen with no composer is a prompt where a box stands in its place
+/// ([`card`]), and decides nothing otherwise (the session picker, an exit).
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some((top, _, _)) = composer_rows(rows) else {
@@ -369,11 +383,11 @@ pub fn phase(rows: &[String]) -> (Phase, bool) {
             (Phase::Idle, false)
         };
     };
-    let run = rows[..top]
-        .iter()
-        .rposition(|r| crate::text::blank(r))
-        .map_or(0, |gap| gap + 1);
-    match &rows[run..top] {
+    let Some(gap) = rows[..top].iter().rposition(|r| crate::text::blank(r)) else {
+        return (Phase::Idle, false);
+    };
+    match &rows[gap + 1..top] {
+        [] if rows[..gap].iter().any(|r| spinner_row(r)) => (Phase::Idle, false),
         [] => (Phase::Idle, true),
         [first, ..] if spinner_row(first) => (Phase::Busy, true),
         [.., last] if crate::text::trim(last).starts_with(crate::anchor!("kimi.resumed")) => {

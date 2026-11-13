@@ -45,6 +45,30 @@ pub const fn handshake_clamp_info_len(len: u64, max_len: u64) -> u64 {
     }
 }
 
+/// `roam_amp_budget_clamp` as `roam_island.rs` defines it in Clean:
+/// `if tx_cand < budget_cap then tx_cand else budget_cap`.
+#[cfg(feature = "handshake")]
+#[must_use]
+pub const fn roam_amp_budget_clamp(tx_cand: u64, budget_cap: u64) -> u64 {
+    if tx_cand < budget_cap {
+        tx_cand
+    } else {
+        budget_cap
+    }
+}
+
+/// `roam_epoch_advance` as `roam_island.rs` defines it in Clean:
+/// `if prev < cand then cand else prev`.
+#[cfg(feature = "handshake")]
+#[must_use]
+pub const fn roam_epoch_advance(prev: u64, cand: u64) -> u64 {
+    if prev < cand {
+        cand
+    } else {
+        prev
+    }
+}
+
 /// `identity_clamp_ctx_len` as `identity_island.rs` defines it in Clean:
 /// `if max_len < len then max_len else len`.
 #[cfg(feature = "identity")]
@@ -117,6 +141,17 @@ mod tests {
                 answers(|[a, b]| super::handshake_clamp_info_len(a, b)),
                 want
             );
+            assert_eq!(
+                answers(|[a, b]| crate::roam::roam_amp_budget_clamp(a, b)),
+                want
+            );
+            assert_eq!(answers(|[a, b]| super::roam_amp_budget_clamp(a, b)), want);
+            let want_mono = "012112222";
+            assert_eq!(
+                answers(|[a, b]| crate::roam::roam_epoch_advance(a, b)),
+                want_mono
+            );
+            assert_eq!(answers(|[a, b]| super::roam_epoch_advance(a, b)), want_mono);
         }
         #[cfg(feature = "identity")]
         {

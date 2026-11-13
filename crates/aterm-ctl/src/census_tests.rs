@@ -25,6 +25,8 @@ struct Fake {
     rows: Vec<Row>,
     launchd: Option<i32>,
     unreadable: bool,
+    /// A parent's own child list does not read either.
+    children_unread: bool,
     argv_asked: RefCell<BTreeSet<u32>>,
     stdin_asked: RefCell<BTreeSet<u32>>,
 }
@@ -46,6 +48,15 @@ impl Fake {
 impl Kernel for Fake {
     fn listed(&self) -> Option<Vec<Listed>> {
         (!self.unreadable).then(|| self.rows.iter().map(|r| r.listed).collect())
+    }
+    fn children(&self, parent: u32) -> Option<Vec<u32>> {
+        (!self.children_unread).then(|| {
+            self.rows
+                .iter()
+                .filter(|r| r.listed.ppid == Some(parent))
+                .map(|r| r.listed.pid)
+                .collect()
+        })
     }
     fn exe(&self, pid: u32) -> Option<Image> {
         let row = self.row(pid)?;
@@ -306,9 +317,8 @@ fn an_instance_s_children_are_its_aterm_programs() {
         proc(4006, 1, 10, ATERM, &serve),
         proc(4007, 0, 10, ATERM, &serve),
     ]);
-    let listed = k.listed().expect("the table");
     assert_eq!(
-        children_in(&k, &listed, 4000),
+        children_of(&k, 4000).expect("its children"),
         [
             Child {
                 pid: 4001,
@@ -325,11 +335,34 @@ fn an_instance_s_children_are_its_aterm_programs() {
         BTreeSet::from([4001]),
         "only an unheld aterm child's arguments are read"
     );
-    assert!(
-        children_in(&k, &listed, 1).is_empty(),
-        "no child of launchd"
+    assert_eq!(children_of(&k, 1), Some(Vec::new()), "no child of launchd");
+    assert_eq!(children_of(&k, 0), Some(Vec::new()), "no child of pid 0");
+}
+
+/// An instance's children are read for it alone, never out of the whole process table: the
+/// kernel can hold a `KERN_PROC_ALL` read past its bound while another process is mid-exec, and
+/// a busy machine's doctor then read every instance as bridgeless (`aterm fabric --json` named
+/// `bridge_pids: []` beside a live bridge). With the table unreadable, the bridge child is still
+/// found; with its own list unreadable, the answer is none read, never an empty list.
+/// NEGATIVE CONTROL: take the children out of `listed()` again, and the table's miss reads as
+/// `None` here.
+#[test]
+fn an_instance_s_children_do_not_wait_on_the_whole_table() {
+    let serve = ["aterm", "link", "serve", "--fleet", "f"];
+    let mut k = Fake::with(vec![
+        proc(4000, 50, 60, ATERM, &[ATERM, "--headless"]),
+        proc(4001, 4000, 1, ATERM, &serve),
+    ]);
+    k.unreadable = true;
+    assert_eq!(
+        children_of(&k, 4000),
+        Some(vec![Child {
+            pid: 4001,
+            words: Some(serve.map(String::from).to_vec()),
+        }])
     );
-    assert!(children_in(&k, &listed, 0).is_empty(), "no child of pid 0");
+    k.children_unread = true;
+    assert_eq!(children_of(&k, 4000), None);
 }
 
 /// An aterm's words are read only once its one thread has run (`thread_ran`, the guard of
@@ -382,8 +415,7 @@ fn a_process_that_execs_another_program_as_its_words_are_read_is_no_aterm() {
         ])
     };
     let k = table();
-    let listed = k.listed().expect("the table");
-    let children = children_in(&k, &listed, 4000);
+    let children = children_of(&k, 4000).expect("its children");
     assert!(children.is_empty(), "{children:?}");
     let c = census(&table(), &[]);
     assert_eq!(c.instances, 1, "{c:?}");

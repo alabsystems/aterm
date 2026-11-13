@@ -76,9 +76,9 @@ pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 /// own (`setsid`), so a launchd job's restart, which ends its process group, or a terminal's
 /// hangup does not end a pass midway. The [`SUBSCRIBER`]'s runner starts out of its starter's
 /// background band ([`aterm_uds::spawnfd::Command::leave_background_band`]): the vault
-/// subscriber is a `Background` launchd job, where every thread runs at priority 4 whatever
-/// class it asks for, and the pass writes the fleet book under its lock, whose taker is lifted
-/// to the default class while it holds it, a lift that band defeats. That runner holds its own
+/// subscriber starts ordinary children in that band, where every thread runs at priority 4
+/// whatever class it asks for. The pass writes the fleet book under its lock, whose taker is
+/// lifted to the default class while it holds it, a lift that band defeats. The runner holds its own
 /// threads at the background class instead, its children started in the band (`aterm init
 /// --converge`), so only the lock's holder is lifted. A window's or the first launch's runner
 /// starts with its starter's process type, in no band, and holds its threads at utility.
@@ -231,6 +231,13 @@ pub struct Due {
     routes: Option<Routes>,
     /// A start came due while the last runner ran, or the last one found the lock held.
     pending: Option<RepositoryRequest>,
+    /// A canonical identity transition is not paced or fulfilled by repository receipts.
+    identity_pending: bool,
+    /// Whether the one selected child carries identity debt. Its terminal result cannot be
+    /// mistaken for the stronger repository retry it may have run beside.
+    identity_running: bool,
+    /// Independent logical pacing, serviced by the same existing maintenance clock/worker.
+    identity_retry: RunnerRetry,
     /// The last chosen run, retained until its terminal result and used by the starter.
     repository_request: RepositoryRequest,
     /// Failed work waits for RunnerRetry, unless new work starts a stronger combined run.
@@ -254,6 +261,31 @@ impl Due {
         self.activation
     }
 
+    /// When time alone next makes [`Due::poll`] start a runner, on the same clock: the kept
+    /// retry, identity's own retry, or the recheck after the last refresh boundary. Every other
+    /// start waits on an event its owner hears (a request, a move of routes, a runner's end).
+    /// `None` before the first start, which [`Due::at_start`] makes.
+    #[must_use]
+    pub(crate) fn next_at(&self) -> Option<u64> {
+        let recheck = self.started.map(|(at, wait)| at.saturating_add(wait));
+        [self.retry.at, self.identity_retry.at, recheck]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Whether [`Due::poll`] at `now_ms` would want a start, a runner still running aside: work
+    /// requested or owed, or a retry due. An owner whose starts something else holds (the LAN)
+    /// reads this to know a held start is waiting.
+    #[must_use]
+    pub(crate) fn owes_start(&self, now_ms: u64) -> bool {
+        self.activation
+            || self.pending.is_some()
+            || self.identity_pending
+            || self.retry.due(now_ms)
+            || self.identity_retry.due(now_ms)
+    }
+
     /// Supply the same receipt facts used to bind this round's input transition.
     pub fn observe(&mut self, observed: RefreshObservation) {
         self.observed = observed;
@@ -267,6 +299,14 @@ impl Due {
     /// Service the same job while another subscriber lane is waiting on HTTP.
     pub(crate) fn poll(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
         self.start(None, now_ms, routes, last)
+    }
+
+    /// Canonical identity changed. Schedule local convergence without granting naming or
+    /// repository authority, forcing remote freshness, or replacing a stronger pending request.
+    pub fn identity_changed(&mut self) {
+        self.identity_pending = true;
+        // A newer canonical intent does not inherit the prior intent's failure backoff.
+        self.identity_retry = RunnerRetry::default();
     }
 
     /// Keep custody and capture event boundaries while the LAN prevents a start.
@@ -363,6 +403,19 @@ impl Due {
     /// completion ends its failure streak; a held lock stays owed without consuming backoff.
     /// A Repair that ran beside deferred Refresh debt cannot retire or reschedule that debt.
     pub fn reaped(&mut self, last: Last, now_ms: u64) {
+        if self.identity_running
+            && matches!(
+                last,
+                Last::Ended | Last::Failed | Last::Unfinished | Last::Held
+            )
+        {
+            self.identity_running = false;
+            // A late result retires only the identity that child carried. Newer input stays
+            // immediately pending; otherwise its own failure/hold retains a local retry.
+            if last == Last::Ended || !self.identity_pending {
+                self.identity_retry.reaped(last, now_ms);
+            }
+        }
         if self.repository_work() == RepositoryWork::Repair
             && self
                 .retry_request
@@ -457,11 +510,23 @@ impl Due {
         {
             self.retry.at = Some(now_ms.saturating_add(remaining));
         }
+        if last == Last::Running {
+            return false;
+        }
+        // A future repository retry cannot defer local identity debt, nor can its clock
+        // spend identity's independent failure backoff. No second child or timer is started.
+        if self.identity_pending || self.identity_retry.due(now_ms) {
+            self.pending = merge_requests(self.pending, Some(RepositoryRequest::Repair));
+        }
         if self.pending.is_none() && !self.retry.due(now_ms) {
             return false;
         }
-        if last == Last::Running {
-            return false;
+        // Any admitted full pass can carry still-owed identity alongside its other work.
+        // Keep that subject's custody through the actual child outcome (including start None).
+        self.identity_running = self.identity_pending || self.identity_retry.at.is_some();
+        if self.identity_running {
+            self.identity_pending = false;
+            self.identity_retry.started();
         }
         let pending = self.pending.take();
         // A checkout wake can be repaired now without repeating a failed remote refresh.
@@ -539,666 +604,5 @@ fn merge_requests(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::materialize::Report;
-    use std::net::Ipv4Addr;
-
-    const HOME: Routes = [Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))), None, None];
-    const AWAY: Routes = [Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))), None, None];
-    const MINUTE: u64 = 60 * 1000;
-
-    fn applied() -> SyncOutcome {
-        SyncOutcome::Applied {
-            seq: 3,
-            report: Report::default(),
-        }
-    }
-
-    fn unchanged() -> SyncOutcome {
-        SyncOutcome::Unchanged { seq: 3 }
-    }
-
-    /// One start as the subscriber starts, one more for each version it applies, none for a pass
-    /// that changed nothing on the same routes inside the recheck, one when the routes move and
-    /// one once the recheck passes (or the clock goes back).
-    /// NEGATIVE CONTROL: an `after_pass` that reads an applied version as a plain round starts
-    /// nothing for it.
-    #[test]
-    fn the_subscriber_starts_a_runner_at_start_per_applied_version_and_when_due() {
-        let mut due = Due::default();
-        let starts = std::cell::Cell::new(0);
-        let at = |started: bool| starts.set(starts.get() + usize::from(started));
-        at(due.at_start(0, HOME, Last::None));
-        assert_eq!(starts.get(), 1, "one at start");
-        at(due.after_pass(&applied(), MINUTE, HOME, Last::Ended));
-        assert_eq!(starts.get(), 2, "+1 for an applied version");
-        at(due.after_pass(&applied(), 2 * MINUTE, HOME, Last::Ended));
-        assert_eq!(starts.get(), 3, "+1 for each");
-        for minute in 3..30 {
-            at(due.after_pass(&unchanged(), minute * MINUTE, HOME, Last::Ended));
-        }
-        assert_eq!(starts.get(), 3, "0 for passes that changed nothing");
-        at(due.after_pass(&unchanged(), 30 * MINUTE, AWAY, Last::Ended));
-        assert_eq!(starts.get(), 4, "+1 when the routes move");
-        at(due.after_pass(&unchanged(), 31 * MINUTE, AWAY, Last::Ended));
-        assert_eq!(starts.get(), 4, "not again on the routes it started on");
-        at(due.after_pass(&unchanged(), 60 * MINUTE, AWAY, Last::Ended));
-        assert_eq!(starts.get(), 5, "+1 once the recheck passed");
-        at(due.after_pass(&unchanged(), MINUTE, AWAY, Last::Ended));
-        assert_eq!(starts.get(), 6, "+1 for a clock that went back");
-    }
-
-    /// A start that comes due while the last runner runs waits for it to end rather than start a
-    /// second that would find the lock held; one that found the lock held keeps its request
-    /// until the existing five-second retry boundary.
-    #[test]
-    fn a_start_due_while_a_runner_runs_or_after_a_held_lock_is_owed_to_the_next_round() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        assert!(
-            !due.after_pass(&applied(), MINUTE, HOME, Last::Running),
-            "never two at once"
-        );
-        assert!(
-            !due.after_pass(&unchanged(), 2 * MINUTE, HOME, Last::Running),
-            "still running"
-        );
-        assert!(
-            due.after_pass(&unchanged(), 3 * MINUTE, HOME, Last::Ended),
-            "the owed start, once it ended"
-        );
-        assert!(!due.after_pass(&unchanged(), 4 * MINUTE, HOME, Last::Ended));
-        assert!(
-            !due.after_pass(&unchanged(), 5 * MINUTE, HOME, Last::Held),
-            "another pass held the lock: retain the request without a per-look loop"
-        );
-        assert!(!due.after_pass(
-            &unchanged(),
-            5 * MINUTE + FIRST_RETRY_MS - 1,
-            HOME,
-            Last::None
-        ));
-        assert!(due.after_pass(&unchanged(), 5 * MINUTE + FIRST_RETRY_MS, HOME, Last::None));
-        assert!(!due.after_pass(&unchanged(), 6 * MINUTE, HOME, Last::Ended));
-    }
-
-    /// The first healthy pass after failed ones starts a runner, on the routes and inside the
-    /// recheck of the last start, and the one after it does not.
-    /// NEGATIVE CONTROL: an `after_pass` that forgets the failed passes starts nothing.
-    #[test]
-    fn a_healthy_pass_after_failed_ones_is_due_once() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        due.failed();
-        due.failed();
-        assert!(
-            due.after_pass(&unchanged(), MINUTE, HOME, Last::Ended),
-            "back after errors"
-        );
-        assert!(!due.after_pass(&unchanged(), 2 * MINUTE, HOME, Last::Ended));
-        due.failed();
-        assert!(
-            !due.after_pass(&unchanged(), 3 * MINUTE, HOME, Last::Running),
-            "never two at once"
-        );
-        assert!(
-            due.after_pass(&unchanged(), 4 * MINUTE, HOME, Last::Ended),
-            "owed once the runner ended"
-        );
-    }
-
-    #[test]
-    fn an_unfinished_runner_retries_unchanged_inputs_and_success_ends_the_retry() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        // The subscriber reaps before its source round, even if that round is unhealthy.
-        due.reaped(Last::Unfinished, 1_000);
-        for at in [1_000, 1_001, 5_999] {
-            assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
-        }
-        assert!(
-            due.after_pass(&unchanged(), 6_000, HOME, Last::None),
-            "unfinished work gets another pass without a new route, token or inventory"
-        );
-        assert!(
-            !due.after_pass(&unchanged(), 6_001, HOME, Last::Running),
-            "the retry remains the only runner"
-        );
-        due.reaped(Last::Ended, 6_002);
-        for at in [6_003, 11_000, RECHECK_MS] {
-            assert!(
-                !due.after_pass(&unchanged(), at, HOME, Last::None),
-                "success leaves only the ordinary recheck due"
-            );
-        }
-        assert!(due.after_pass(&unchanged(), 6_000 + RECHECK_MS, HOME, Last::None));
-        // Success reset the failure streak: another failure begins at five seconds again.
-        let failed_at = 6_001 + RECHECK_MS;
-        due.reaped(Last::Failed, failed_at);
-        assert!(!due.after_pass(&unchanged(), failed_at + 4_999, HOME, Last::None));
-        assert!(due.after_pass(&unchanged(), failed_at + 5_000, HOME, Last::None));
-    }
-
-    #[test]
-    fn consecutive_runner_failures_back_off_without_a_hot_loop_and_stay_bounded() {
-        let mut due = Due::default();
-        let mut at = 0;
-        assert!(due.at_start(at, HOME, Last::None));
-        for seconds in [5, 10, 20, 40, 80, 160, 300, 300] {
-            at += 1;
-            due.reaped(Last::Failed, at);
-            let ready = at + seconds * 1000;
-            assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
-            assert!(!due.after_pass(&unchanged(), ready - 1, HOME, Last::None));
-            assert!(due.after_pass(&unchanged(), ready, HOME, Last::None));
-            at = ready;
-        }
-    }
-
-    #[test]
-    fn held_and_running_runners_preserve_failed_retry_and_coalesced_work() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        due.reaped(Last::Failed, 1);
-        assert!(due.after_pass(&unchanged(), 5_001, HOME, Last::None));
-        due.reaped(Last::Held, 5_002);
-        assert!(
-            !due.after_pass(&unchanged(), 5_002, HOME, Last::None),
-            "a held lock keeps its existing bounded retry"
-        );
-        assert!(!due.after_pass(&unchanged(), 10_001, HOME, Last::None));
-        assert!(due.after_pass(&unchanged(), 10_002, HOME, Last::None));
-        due.reaped(Last::Failed, 10_003);
-        assert!(!due.after_pass(&unchanged(), 20_002, HOME, Last::None));
-        assert!(
-            due.after_pass(&unchanged(), 20_003, HOME, Last::None),
-            "a lock hold did not erase the failure streak"
-        );
-        assert!(!due.after_pass(&applied(), 20_004, HOME, Last::Running));
-        assert!(!due.after_pass(&unchanged(), 20_005, HOME, Last::Running));
-        assert!(due.after_pass(&unchanged(), 20_006, HOME, Last::Ended));
-        assert!(!due.after_pass(&unchanged(), 20_007, HOME, Last::Ended));
-    }
-
-    #[test]
-    fn local_repairs_and_unrelated_versions_do_not_postpone_the_remote_recheck() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-        assert!(due.after_pass(&applied(), 1, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        due.failed();
-        assert!(due.after_pass(&unchanged(), 2, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(due.after_local_progress(
-            RepositoryWork::Repair,
-            RECHECK_MS - 1,
-            HOME,
-            Last::Ended
-        ));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(due.poll(RECHECK_MS, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-    }
-
-    #[test]
-    fn pending_and_held_work_keeps_the_strongest_refresh_request() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(!due.after_local_progress(RepositoryWork::Refresh, 2, HOME, Last::Running));
-        assert!(!due.after_local_progress(RepositoryWork::Repair, 3, HOME, Last::Running));
-        assert!(due.poll(4, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-        assert!(!due.poll(5, HOME, Last::Ended));
-        due.reaped(Last::Held, 6);
-        assert!(due.after_local_progress(RepositoryWork::Repair, 7, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(!due.poll(5_005, HOME, Last::Ended));
-        assert!(due.poll(5_006, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-    }
-
-    #[test]
-    fn checkout_repairs_preserve_a_failed_refresh_deadline_and_backoff() {
-        for refresh_end in [Last::Failed, Last::Unfinished] {
-            for repair_end in [Last::Ended, Last::Failed, Last::Unfinished] {
-                let mut due = Due::default();
-                assert!(due.at_start(0, HOME, Last::None));
-                due.reaped(refresh_end, 1_000);
-                assert!(due.after_local_progress(RepositoryWork::Repair, 1_001, HOME, Last::None));
-                assert_eq!(due.repository_work(), RepositoryWork::Repair);
-                due.reaped(repair_end, 1_002);
-                assert!(!due.poll(5_999, HOME, Last::None));
-                assert!(due.poll(6_000, HOME, Last::None));
-                assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-                due.reaped(Last::Failed, 6_001);
-                assert!(!due.poll(16_000, HOME, Last::None));
-                assert!(due.poll(16_001, HOME, Last::None));
-                assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-            }
-        }
-    }
-
-    #[test]
-    fn a_new_source_refresh_starts_before_retained_refresh_retry_is_due() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        due.reaped(Last::Failed, 1_000);
-        assert!(due.after_local_progress(RepositoryWork::Repair, 1_001, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(!due.after_local_progress(RepositoryWork::Refresh, 1_002, HOME, Last::Running));
-        assert!(!due.after_local_progress(RepositoryWork::Repair, 1_003, HOME, Last::Running));
-        assert!(due.poll(1_004, HOME, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-        assert!(!due.poll(6_000, HOME, Last::Ended));
-    }
-
-    #[test]
-    fn a_failed_repair_retries_locally_until_routes_request_a_refresh() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Ended));
-        due.reaped(Last::Unfinished, 2);
-        assert!(!due.poll(1 + FIRST_RETRY_MS, HOME, Last::None));
-        assert!(due.poll(2 + FIRST_RETRY_MS, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        assert!(!due.poll(3 + FIRST_RETRY_MS, AWAY, Last::Running));
-        assert!(due.poll(4 + FIRST_RETRY_MS, AWAY, Last::Ended));
-        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
-    }
-
-    #[test]
-    fn producers_share_the_remote_wave_and_keep_their_generic_passes() {
-        let scope = RefreshScope::new([1; 32]);
-        let before = RefreshObservation {
-            version: RefreshVersion {
-                input: 1,
-                attempt: 1,
-                fulfilled: 1,
-            },
-            scope: Some(RefreshScope::new([0; 32])),
-            recheck_ms: Some(RECHECK_MS),
-            ..RefreshObservation::default()
-        };
-        let request = RepositoryRequest::Refresh(RefreshRequest::inputs(scope, before.version));
-        let mut node = Due::default();
-        let mut subscriber = Due::default();
-        for due in [&mut node, &mut subscriber] {
-            due.observe(before);
-            assert!(
-                due.at_start(0, HOME, Last::None),
-                "startup without a current scope cannot inherit the old source's receipt"
-            );
-            assert!(
-                due.after_request(
-                    RepositoryRequest::Refresh(RefreshRequest::ensure(
-                        before.scope,
-                        before.version
-                    )),
-                    1,
-                    HOME,
-                    Last::Ended,
-                ),
-                "a known matching ensure still owes its own generic pass"
-            );
-            assert_eq!(due.repository_work(), RepositoryWork::Repair);
-            assert!(due.after_request(request, 2, HOME, Last::Ended));
-            assert_eq!(due.repository_request(), request);
-        }
-        subscriber.reaped(Last::Held, 3);
-        let finished = RefreshObservation {
-            version: RefreshVersion {
-                input: 2,
-                attempt: 2,
-                fulfilled: 2,
-            },
-            scope: Some(scope),
-            recheck_ms: Some(RECHECK_MS - 100),
-            ..before
-        };
-        subscriber.observe(finished);
-        assert!(
-            !subscriber.poll(100, HOME, Last::None),
-            "the held follower keeps its bounded retry after sharing the remote wave"
-        );
-        assert!(
-            !subscriber.poll(FIRST_RETRY_MS + 2, HOME, Last::None),
-            "repository acknowledgment cannot accelerate the generic retry"
-        );
-        assert!(subscriber.poll(FIRST_RETRY_MS + 3, HOME, Last::None));
-        assert_eq!(subscriber.repository_work(), RepositoryWork::Repair);
-        assert!(!subscriber.poll(FIRST_RETRY_MS + 4, HOME, Last::Ended));
-        subscriber.observe(RefreshObservation {
-            recheck_ms: Some(0),
-            ..finished
-        });
-        assert!(
-            subscriber.poll(RECHECK_MS, HOME, Last::None),
-            "a delayed acknowledgment preserves the shared deadline"
-        );
-
-        let mut startup = Due::default();
-        startup.observe(finished);
-        startup.request(RepositoryRequest::Refresh(RefreshRequest::ensure(
-            finished.scope,
-            finished.version,
-        )));
-        assert!(startup.at_start(0, HOME, Last::None));
-        assert_eq!(startup.repository_work(), RepositoryWork::Repair);
-        assert!(!startup.poll(1, HOME, Last::Ended));
-        assert!(!startup.poll(2, HOME, Last::None));
-
-        let mut unknown = Due::default();
-        unknown.observe(RefreshObservation {
-            recheck_ms: Some(0),
-            ..finished
-        });
-        assert!(unknown.at_start(10, HOME, Last::None));
-        for (at, last) in [
-            (11, Last::Ended),
-            (12, Last::None),
-            (RECHECK_MS + 9, Last::None),
-        ] {
-            assert!(
-                !unknown.poll(at, HOME, last),
-                "an expired old receipt and successful NotApplicable cannot create a per-look loop"
-            );
-        }
-        assert!(unknown.poll(RECHECK_MS + 10, HOME, Last::None));
-        assert!(
-            unknown.after_request(
-                RepositoryRequest::Refresh(RefreshRequest::inputs(scope, finished.version)),
-                RECHECK_MS + 11,
-                HOME,
-                Last::Ended,
-            ),
-            "a real source transition interrupts ordinary unknown-source pacing"
-        );
-    }
-
-    #[test]
-    fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request() {
-        let refresh = RefreshRequest::inputs(RefreshScope::new([1; 32]), RefreshVersion::default());
-        let request = RepositoryRequest::Refresh(refresh);
-        let mut due = Due::default();
-        let failed = RefreshObservation {
-            pending: Some(refresh),
-            retry_ms: Some(5_000),
-            ..RefreshObservation::default()
-        };
-        due.observe(failed);
-        assert!(!due.after_request(request, 0, HOME, Last::None));
-        due.observe(RefreshObservation {
-            retry_ms: Some(4_999),
-            ..failed
-        });
-        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::None));
-        assert_eq!(due.repository_work(), RepositoryWork::Repair);
-        due.observe(RefreshObservation {
-            retry_ms: Some(4_998),
-            ..failed
-        });
-        assert!(
-            !due.poll(2, HOME, Last::Held),
-            "a held repair is subsumed without spinning or moving the refresh deadline"
-        );
-        due.observe(RefreshObservation {
-            retry_ms: Some(0),
-            ..failed
-        });
-        assert!(due.poll(5_000, HOME, Last::None));
-        assert_eq!(due.repository_request(), request);
-
-        let fulfilled = RefreshObservation {
-            scope: refresh.scope,
-            version: RefreshVersion {
-                input: 1,
-                attempt: 1,
-                fulfilled: 1,
-            },
-            recheck_ms: Some(RECHECK_MS),
-            ..RefreshObservation::default()
-        };
-        // This owner's full job can fail after its Native repository row succeeds.
-        // The repository receipt does not acknowledge the remaining generic rows.
-        for outcome in [Last::Failed, Last::Unfinished] {
-            let mut owned = Due::default();
-            assert!(owned.after_request(request, 0, HOME, Last::None));
-            owned.observe(fulfilled);
-            assert!(!owned.poll(1, HOME, outcome));
-            assert!(!owned.poll(FIRST_RETRY_MS, HOME, Last::None));
-            assert!(owned.poll(FIRST_RETRY_MS + 1, HOME, Last::None));
-            assert_eq!(owned.repository_work(), RepositoryWork::Repair);
-            assert!(!owned.poll(FIRST_RETRY_MS + 2, HOME, Last::Ended));
-
-            // The successful owned generic job clears its captured debt. A later
-            // held-only trigger still owes its own generic pass, at the held deadline.
-            let forced = RepositoryRequest::Refresh(RefreshRequest::after(
-                fulfilled.scope,
-                fulfilled.version,
-            ));
-            assert!(owned.after_request(forced, FIRST_RETRY_MS + 1_000, HOME, Last::None));
-            owned.observe(RefreshObservation {
-                version: RefreshVersion {
-                    attempt: 2,
-                    fulfilled: 2,
-                    ..fulfilled.version
-                },
-                ..fulfilled
-            });
-            assert!(!owned.poll(FIRST_RETRY_MS + 1_001, HOME, Last::Held));
-            assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_000, HOME, Last::None));
-            assert!(owned.poll(2 * FIRST_RETRY_MS + 1_001, HOME, Last::None));
-            assert_eq!(owned.repository_work(), RepositoryWork::Repair);
-            assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_002, HOME, Last::Ended));
-        }
-
-        // Repair can run beside another owner's deferred Refresh without spending
-        // that Refresh's failure streak. Its own non-repository failure still survives.
-        for outcome in [Last::Held, Last::Ended, Last::Failed, Last::Unfinished] {
-            let mut local = Due::default();
-            local.observe(failed);
-            assert!(!local.after_request(request, 0, HOME, Last::None));
-            local.observe(RefreshObservation {
-                retry_ms: Some(FIRST_RETRY_MS - 1),
-                ..failed
-            });
-            assert!(local.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::None));
-            local.observe(fulfilled);
-            assert!(!local.poll(2, HOME, outcome));
-            assert!(!local.poll(FIRST_RETRY_MS - 1, HOME, Last::None));
-            assert!(local.poll(FIRST_RETRY_MS, HOME, Last::None));
-            assert_eq!(local.repository_work(), RepositoryWork::Repair);
-            assert!(!local.poll(FIRST_RETRY_MS + 1, HOME, Last::Ended));
-        }
-
-        let mut during = Due::default();
-        assert!(during.after_request(request, 0, HOME, Last::None));
-        assert!(!during.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Running));
-        during.observe(fulfilled);
-        assert!(!during.after_request(
-            RepositoryRequest::Refresh(RefreshRequest::ensure(fulfilled.scope, fulfilled.version)),
-            2,
-            HOME,
-            Last::Running,
-        ));
-        assert!(during.poll(3, HOME, Last::Ended));
-        assert_eq!(during.repository_work(), RepositoryWork::Repair);
-        assert!(!during.poll(4, HOME, Last::Ended));
-        assert!(!during.poll(5, HOME, Last::None));
-
-        // A completed new source consumes the old source's retained retry before
-        // its Refresh becomes Repair, so the obsolete source cannot revive later.
-        let mut superseded = Due::default();
-        superseded.observe(failed);
-        assert!(!superseded.after_request(request, 0, HOME, Last::None));
-        let winner = RefreshObservation {
-            scope: Some(RefreshScope::new([2; 32])),
-            version: RefreshVersion {
-                input: 2,
-                attempt: 2,
-                fulfilled: 2,
-            },
-            recheck_ms: Some(RECHECK_MS),
-            ..RefreshObservation::default()
-        };
-        superseded.observe(winner);
-        assert!(superseded.after_request(
-            RepositoryRequest::Refresh(RefreshRequest::inputs(
-                winner.scope.unwrap(),
-                fulfilled.version,
-            )),
-            1,
-            HOME,
-            Last::None,
-        ));
-        assert_eq!(superseded.repository_work(), RepositoryWork::Repair);
-        assert!(!superseded.poll(2, HOME, Last::Ended));
-        assert!(!superseded.poll(FIRST_RETRY_MS, HOME, Last::None));
-    }
-
-    #[test]
-    fn a_route_event_captures_one_boundary_while_the_lan_is_held() {
-        let mut due = Due::default();
-        assert!(due.at_start(0, HOME, Last::None));
-        let observed = RefreshObservation {
-            version: RefreshVersion {
-                attempt: 2,
-                ..RefreshVersion::default()
-            },
-            ..RefreshObservation::default()
-        };
-        due.observe(observed);
-        due.hold(1, AWAY, Last::Running);
-        due.observe(RefreshObservation {
-            version: RefreshVersion {
-                attempt: 3,
-                ..observed.version
-            },
-            ..observed
-        });
-        due.hold(2, AWAY, Last::Running);
-        assert!(due.poll(3, AWAY, Last::Ended));
-        let RepositoryRequest::Refresh(request) = due.repository_request() else {
-            panic!("a route move requests refresh");
-        };
-        assert_eq!(
-            request.after_attempt,
-            Some(2),
-            "waiting must not move the event's boundary"
-        );
-    }
-
-    /// The runner keeps its starting app's privacy responsibility and leaves only the
-    /// subscriber's background band. A started child below proves its own session.
-    #[test]
-    fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming() {
-        let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        for trigger in [SUBSCRIBER, WINDOW, SETUP] {
-            for work in [RepositoryWork::Repair, RepositoryWork::Refresh] {
-                let command = runner(exe, trigger, work);
-                assert_eq!(command.get_program(), exe);
-                let args: Vec<_> = command.get_args().collect();
-                assert_eq!(
-                    args,
-                    [
-                        "init",
-                        "--converge",
-                        "--trigger",
-                        trigger,
-                        "--repository-work",
-                        work.word()
-                    ]
-                );
-                assert!(
-                    !command.get_disclaim_responsibility(),
-                    "the runner's privacy-gated acts stay the starting app's"
-                );
-                assert_eq!(
-                    command.leaves_background_band(),
-                    trigger == SUBSCRIBER,
-                    "only the subscriber's runner leaves its starter's background band ({trigger})"
-                );
-            }
-            let request = RepositoryRequest::Refresh(RefreshRequest::after(
-                Some(RefreshScope::new([7; 32])),
-                RefreshVersion {
-                    input: 2,
-                    attempt: 4,
-                    fulfilled: 3,
-                },
-            ));
-            let command = runner_requested(exe, trigger, request);
-            let args: Vec<_> = command.get_args().collect();
-            assert_eq!(args[4], "--repository-request");
-            assert_eq!(
-                aterm_json::from_str::<RepositoryRequest>(args[5].to_str().unwrap()).unwrap(),
-                request,
-                "the original request boundary survives runner IPC"
-            );
-            assert!(!command.get_disclaim_responsibility());
-            assert_eq!(command.leaves_background_band(), trigger == SUBSCRIBER);
-        }
-    }
-
-    /// A runner that does not end by itself leaves the start, and the reading of how it stands,
-    /// returning at once: the subscriber's long-poll never waits on a pass. The child leads a
-    /// process group of its own (the session `setsid` made), and one that ends with [`HELD`]
-    /// reads as held.
-    #[cfg(unix)]
-    #[test]
-    fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
-        let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
-        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
-        let script = |name: &str, body: String| {
-            let path = scratch.path().join(name);
-            std::fs::write(&path, format!("#!{}\n{body}\n", sh.display())).expect("script");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .expect("executable");
-            path
-        };
-        let endless = script("endless", format!("exec {} 600", sleep.display()));
-        let mut runner =
-            Some(start(&endless, "subscriber", RepositoryWork::Refresh).expect("start a runner"));
-        assert_eq!(Last::of(&mut runner), Last::Running);
-        let child = runner.as_mut().unwrap();
-        let pid = i32::try_from(child.id()).expect("a pid");
-        let lineage = aterm_uds::process::read_lineage(pid).expect("its lineage");
-        assert_eq!(
-            lineage.pgid,
-            child.id(),
-            "it leads a group (and the session setsid made) of its own"
-        );
-        child.kill().expect("kill the stand-in");
-        child.wait().expect("reap it");
-        assert_eq!(Last::of(&mut runner), Last::Failed);
-        assert!(runner.is_none());
-        assert_eq!(
-            Last::of(&mut runner),
-            Last::None,
-            "a signal is consumed once"
-        );
-        for (code, expected) in [
-            (0, Last::Ended),
-            (1, Last::Failed),
-            (HELD, Last::Held),
-            (UNFINISHED, Last::Unfinished),
-        ] {
-            let exe = script(&format!("exit-{code}"), format!("exit {code}"));
-            let mut runner =
-                Some(start(&exe, "subscriber", RepositoryWork::Refresh).expect("start a runner"));
-            runner.as_mut().unwrap().wait().expect("reap it");
-            assert_eq!(Last::of(&mut runner), expected);
-            assert_eq!(
-                Last::of(&mut runner),
-                Last::None,
-                "exit {code} is consumed once"
-            );
-        }
-    }
-}
+#[path = "converge_tests.rs"]
+mod tests;

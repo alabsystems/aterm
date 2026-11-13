@@ -11,7 +11,6 @@ use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 
 use super::{OldPath, PetInputKind, ROW_FIT, art_cols};
 use crate::cursor_fx::TrailColor;
-use crate::cursor_glow::GlowStyle;
 use crate::pipeline::EffectsPipeline;
 
 const ROWS: u16 = 14;
@@ -24,8 +23,8 @@ const FROM: u64 = 600;
 /// The cells (px) the scenes replay on: Linux's bundled JetBrains Mono (13 x 29), the trail
 /// gallery's 14 x 26, and Iosevka Term (11 x 28), the face every platform bundles.
 const CELLS: [(usize, usize); 3] = [(13, 29), (14, 26), (11, 28)];
-/// The companions judged: the cat, and the dog.
-const STYLES: [&str; 2] = ["rainbow kitty pet", "rainbow dog"];
+/// The pets judged (`cursor_pet`): the cat, and the dog, each beside the rainbow.
+const STYLES: [&str; 2] = ["cat", "dog"];
 /// The prompt's row (0-based): the page's rows above and under it are lettered.
 const PROMPT_ROW: usize = 4;
 
@@ -95,7 +94,7 @@ fn replay(
     fx.set_focused(true);
     fx.set_cursor_glow(
         true,
-        style,
+        "rainbow",
         TrailColor::Automatic,
         None,
         260,
@@ -105,7 +104,8 @@ fn replay(
         true,
         0x0050_FA7B,
     );
-    fx.set_cursor_pet(GlowStyle::style_names_any_pet(style), 0x5EED);
+    fx.set_cursor_pet(true, 0x5EED);
+    fx.set_cursor_pet_species(crate::cursor_pet::species(style).expect("a pet"));
     fx.set_sparkle_enabled(true);
     for &law in old {
         fx.set_pet_old_path(law, true);
@@ -883,9 +883,9 @@ type WallRun = (
 /// frames, and from the first Left arrow at a seat followed the caret onto them in 213 and 215
 /// (Linux arm64, 2026-11-08).
 ///
-/// Negative control (the law reverted, the cat, every face, both ways of typing, every room that
-/// leaves no seat): it stands at the wall over the line's last letters to the Enter, its box on
-/// them in 126 frames or more, two thirds of the fewest measured (188 to 197 of the 375 held; 188
+/// Negative control (the law reverted, with [`OldPath::CaretCellIsNoSeat`], the cat, every face,
+/// both ways of typing, every room that leaves no seat): it stands at the wall over the line's last
+/// letters to the Enter, its box on them in 126 frames or more, two thirds of the fewest measured (188 to 197 of the 375 held; 188
 /// to 191 past the gap, each at full alpha). Where
 /// the line wraps, as the gallery types it, its crossing back after the wrap lays its box on the
 /// wrapped line's letters in 21 frames or more, two thirds of those measured (31 on every face);
@@ -896,7 +896,12 @@ type WallRun = (
 /// leaves it on the letters from the first Backspace to the Enter in 18 frames or more (measured
 /// 26 to 240: 156 with three, 45 to 156 with six, 26 to 35 with twelve, 44 to 240 with six while
 /// it fades; at the other rooms the reverted body is clear of the letters within 8 frames of the
-/// erase, and no control is taken there).
+/// erase, and no control is taken there). The caret's cell is no seat either
+/// ([`PetBrain::wall_meets_the_caret`]): with the hide reverted alone, that law takes a body whose
+/// box at the wall lies on the caret's cell off to a seat off the line once the hand's rhythm closes,
+/// and the box met the letters only through that wait (54 frames on 13 x 29 at three blank cells,
+/// typed at the window, macOS, 2026-11-10), so this control reverts both: it is what the wall did
+/// before either law.
 ///
 /// Negative control of the cut ([`OldPath::LettersCutTheFade`] reverted, the cat, every face, both
 /// ways of typing, the rest at every room that leaves no seat): the body lies on the letters for
@@ -969,7 +974,13 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
         }
     }
     let seen = aterm_spec::check::each(&runs, |&((cell, path), scene, style, ctl, control)| {
-        let old: Vec<OldPath> = control.into_iter().collect();
+        // The hide's control reverts the caret's cell's law with it (the doc above).
+        let old: Vec<OldPath> = match control {
+            Some(OldPath::NoSeatHidesTheBody) => {
+                vec![OldPath::NoSeatHidesTheBody, OldPath::CaretCellIsNoSeat]
+            }
+            _ => control.into_iter().collect(),
+        };
         let run = last_row_after(cell, path, scene, style, &old, ctl);
         (wall_seen(&run, scene.0 < 0, cell.0), run.last_key)
     });

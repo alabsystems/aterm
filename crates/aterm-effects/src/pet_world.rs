@@ -121,7 +121,7 @@ impl PetRect {
 pub struct PetReserve<'a> {
     /// Surfaces the pet never stands on for good (chrome, footer rules/chips, active blocks).
     pub protected: &'a [PetRect],
-    /// Transient host overlays (Autopilot menu, find bar) omitted from the ground plane.
+    /// Transient host overlays (a fact menu's card, find bar) omitted from the ground plane.
     pub overlays: &'a [PetRect],
     /// Predicted echo and IME preedit rectangles treated as ink.
     pub ink: &'a [PetRect],
@@ -668,6 +668,45 @@ impl PetWorld {
             return None;
         }
         Some((self.rule_rows >> r) & 1 == 1)
+    }
+
+    /// What the seat rule reads of the pane's cell (`crate::pet_seat::Page::lettered`): `true`
+    /// where a body must not be drawn over it (a glyph or a coloured ground, the host's chrome
+    /// or an overlay, an image, a selection), `false` where it is clear, `None` where this map
+    /// did not read it. The live caret's ring protects nothing here: a ring cell is what it
+    /// would be with no caret at all (the rule keeps a seat off the caret's own cell itself),
+    /// so a blank cell beside the caret is a seat's.
+    #[inline]
+    #[must_use]
+    pub const fn seat_cell(&self, row: usize, col: usize) -> Option<bool> {
+        if self.stamp.is_none() {
+            return None;
+        }
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        let Some(c) = col.checked_sub(self.coverage.col) else {
+            return None;
+        };
+        if r >= self.coverage.rows || c >= self.coverage.cols {
+            return None;
+        }
+        match self.cells.as_slice()[r * MAX_WORLD_COLS + c] {
+            PetCell::Unknown => None,
+            PetCell::Clear => Some(false),
+            PetCell::Ink => Some(true),
+            PetCell::Protected => {
+                let mut i = 0;
+                while i < self.caret_cells_len as usize {
+                    let ring = self.caret_cells[i];
+                    if ring.row == r && ring.col == c {
+                        return Some(!ring.blank);
+                    }
+                    i += 1;
+                }
+                Some(true)
+            }
+        }
     }
 
     /// The application's last explicit state.

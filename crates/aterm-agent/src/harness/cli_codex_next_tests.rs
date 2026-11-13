@@ -7,6 +7,9 @@
 //! `accounts login|renew` and `accounts use` judge the program a launch runs; `accounts use` of
 //! every CLI but Claude Code says what a launch does under the pin, or once it ends.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+
 use super::*;
 use crate::harness::alab_roster::test_machine;
 use std::time::Duration;
@@ -2394,7 +2397,9 @@ fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
         );
         assert_eq!(doc["next"]["to"], Value::Null, "{at}: {doc}");
 
-        let managed = host.layout.agents_dir().join(cli.id());
+        let managed = host
+            .layout
+            .agent_shim(&atpkg::store::ToolName::new(cli.id()).expect("a tool"));
         std::fs::write(&managed, "#!/bin/sh\n").expect("atpkg's managed copy");
         assert_eq!(
             crate::harness::worker::pooled_launch_program_in(cli, Some(&host.layout)),
@@ -2752,32 +2757,35 @@ impl crate::harness::codex_rotation::UsageReader for LawReader {
         now: i64,
         _: Duration,
         use_token: crate::harness::provider_read::Use,
-    ) -> Option<crate::harness::codex_app_login::IdentifiedUsage> {
-        use_token
-            .begin_home(
-                crate::harness::provider_read::Read::CodexEndpoint,
-                path,
+    ) -> crate::harness::codex_app_login::IdentifiedRead {
+        (|| -> Option<crate::harness::codex_app_login::IdentifiedUsage> {
+            use_token
+                .begin_home(
+                    crate::harness::provider_read::Read::CodexEndpoint,
+                    path,
+                    now,
+                )
+                .ok()?;
+            let (account, spent) = self.answers.get(path)?;
+            let usage = crate::harness::codex_app_login::usage_from_backend(
+                &aterm_json::json!({
+                    "plan_type": "pro",
+                    "rate_limit": {
+                        "allowed": !spent,
+                        "primary_window": {"used_percent": 0, "limit_window_seconds": 18000,
+                            "reset_at": now + 3600},
+                        "secondary_window": {"used_percent": if *spent { 100 } else { 0 },
+                            "limit_window_seconds": 604_800, "reset_at": now + 86_400}
+                    }
+                }),
                 now,
-            )
-            .ok()?;
-        let (account, spent) = self.answers.get(path)?;
-        let usage = crate::harness::codex_app_login::usage_from_backend(
-            &aterm_json::json!({
-                "plan_type": "pro",
-                "rate_limit": {
-                    "allowed": !spent,
-                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000,
-                        "reset_at": now + 3600},
-                    "secondary_window": {"used_percent": if *spent { 100 } else { 0 },
-                        "limit_window_seconds": 604_800, "reset_at": now + 86_400}
-                }
-            }),
-            now,
-        )?;
-        Some(crate::harness::codex_app_login::IdentifiedUsage {
-            identity: crate::harness::codex_renewal::Identity::from_native(account, "user"),
-            usage,
-        })
+            )?;
+            Some(crate::harness::codex_app_login::IdentifiedUsage {
+                identity: crate::harness::codex_renewal::Identity::from_native(account, "user"),
+                usage,
+            })
+        })()
+        .into()
     }
 }
 
@@ -3170,7 +3178,11 @@ impl Pool {
         let agents = self.tmp.path().join("pkg/agents");
         std::fs::create_dir_all(&agents).expect("atpkg's agents");
         put(
-            &agents.join("codex"),
+            &agents.join(
+                atpkg::store::ToolName::new("codex")
+                    .expect("a tool")
+                    .shim_file(),
+            ),
             crate::harness::codex_alab::twin_text(&host.program).as_bytes(),
             "atpkg's launcher",
         );
@@ -4115,6 +4127,7 @@ impl Pool {
 
     /// What [`sign_in_plan`] decides for `label`, as `host` answers: whether it would run, and
     /// what it said. It starts no sign-in.
+    #[cfg(unix)]
     fn plan(&self, label: &str, host: &dyn AccountsHost) -> (bool, String) {
         let path = self.env.accounts_roster_for(self.cli).expect("a roster");
         let store = self.env.accounts_store_for(self.cli).expect("a store");
@@ -4239,6 +4252,7 @@ fn use_offers_no_sign_in_of_a_row_the_build_never_runs() {
 /// A ROW ANOTHER MAC'S WARM SET HOLDS IS THAT MAC'S TO SIGN IN, WHATEVER ASKS: `accounts use` names
 /// the holder and no sign-in, and [`sign_in_plan`], which every verb goes through, starts nothing
 /// and names it too. CONTROL: with no hold, the same row's plan runs and `use` names its sign-in.
+#[cfg(unix)]
 #[test]
 fn a_row_held_for_another_mac_is_signed_in_by_that_mac() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -4392,6 +4406,7 @@ fn use_of_a_row_with_a_sign_in_task_names_the_reports_step() {
 /// WITH THE PROGRAM A SIGN-IN RUNS NOT HERE, THE INSTALL COMES FIRST: [`sign_in_plan`] starts
 /// nothing and names it, and `accounts use` of a row with no login leads with it, then the row's
 /// sign-in. CONTROL: with the program here, the plan runs and `use` names no install.
+#[cfg(unix)]
 #[test]
 fn with_no_program_a_sign_in_and_use_lead_with_the_install() {
     for cli in [Cli::Grok, Cli::Kimi] {
@@ -4739,8 +4754,8 @@ fn a_refused_pair_of_rows_says_which_to_remove() {
         )
     };
     let own = row("main", "");
-    let dir = row("lab", "dir = \"/logins/lab\"\n");
-    let dir2 = row("two", "dir = \"/logins/two\"\n");
+    let dir = row("lab", at!("dir = \"", "/logins/lab", "\"\n"));
+    let dir2 = row("two", at!("dir = \"", "/logins/two", "\"\n"));
     for (rows, drop, keep) in [
         (format!("{own}{dir}"), "lab", "main"),
         (format!("{dir}{own}"), "lab", "main"),
@@ -5068,6 +5083,7 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
 /// session here on it, ever, it waits for its sign-in, a person's; once a session here ran on it,
 /// aterm signs it in by itself for a week, and it waits again after. CONTROL: with a session on
 /// it, it says it.
+#[cfg(unix)]
 #[test]
 fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
     let tmp = tmp_dir("claude-route");
@@ -5185,6 +5201,7 @@ fn a_login_with_no_terminal_says_the_missing_program_first() {
 /// `accounts use` READS A CLAUDE CODE ROW'S LOGIN AS THE REPORT DOES: the default row of a home whose
 /// profile names no account is `not-enrolled` in the report, and a pin on it is refused. CONTROL:
 /// once the profile names one, the pin is recorded.
+#[cfg(unix)]
 #[test]
 fn use_refuses_the_claude_row_the_report_calls_not_signed_in() {
     let tmp = tmp_dir("claude-use");
@@ -5386,6 +5403,47 @@ fn default_login_names(pool: &Pool, address: &str) {
     law_auth(&home.join(".codex/auth.json"), "moved", Some(address));
 }
 
+/// A MANAGED ROW WHOSE LOGIN NAMES ANOTHER ACCOUNT IS SAID AS SUCH IN TEXT AND JSON: every row is
+/// judged, not only the one on this machine's own login, and its renewal is the step. CONTROL: the
+/// same file naming the row's expected address removes the identity refusal.
+#[test]
+fn the_report_says_a_managed_row_whose_login_names_another_account() {
+    let pool = Pool::new("report-managed-mismatch");
+    pool.change_row("work", |row| {
+        row.email = Some("work@example.com".to_owned());
+    });
+    let work = PathBuf::from(
+        pool.roster()
+            .row("work")
+            .and_then(|row| row.dir.as_deref())
+            .expect("work's login directory"),
+    )
+    .join("auth.json");
+    law_auth(&work, "work", Some("far@example.com"));
+
+    let (text, json) = pool.report(Some(&pool.new));
+    let words = &not_next_json(&json)["work"];
+    assert!(
+        words.contains("Codex login does not match the expected account")
+            && words.contains("accounts renew work --cli codex"),
+        "{text}{json}"
+    );
+    assert!(text.contains(&format!("not next: work: {words}")), "{text}");
+
+    law_auth(&work, "work", Some("work@example.com"));
+    let (text, json) = pool.report(Some(&pool.new));
+    assert!(
+        !text.contains("work: Codex login does not match the expected account"),
+        "CONTROL: {text}"
+    );
+    assert!(
+        !not_next_json(&json)
+            .get("work")
+            .is_some_and(|why| why.contains("does not match the expected account")),
+        "CONTROL: {json}"
+    );
+}
+
 /// A ROW THE DEFAULT LOGIN MOVED OFF IS SAID IN THE REPORT: it is not next, with what that login
 /// names and the sync that answers for it, in words and JSON, and a lone row is judged so too.
 /// CONTROL: a login on the row's own address says nothing of it.
@@ -5400,7 +5458,7 @@ fn the_report_says_a_row_the_default_login_moved_off() {
 
     default_login_names(&pool, "far@example.com");
     let (text, json_moved) = pool.report_on(&host);
-    let words = "the default login names far@example.com: `aterm harness accounts login main \
+    let words = "the default login names far@example.com: `aterm harness accounts renew main \
                  --cli codex` signs this row in again";
     assert_eq!(
         not_next(&text).get("main").map(String::as_str),

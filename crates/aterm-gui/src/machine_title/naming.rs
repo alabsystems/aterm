@@ -18,6 +18,8 @@ pub(crate) struct NamingStatus {
     publication: Result<publish::Publication, String>,
     expected: Option<GeneratedNames>,
     authorization: Option<Result<bool, String>>,
+    system_pending: bool,
+    system_error: Option<String>,
 }
 
 impl NamingStatus {
@@ -27,25 +29,7 @@ impl NamingStatus {
         name: &MachineName,
         system: &dyn publish::SystemNames,
     ) -> Self {
-        let names = system.read();
-        let fleet = aterm_net::fleet_member::read_primary_name(state);
-        let publication = (|| {
-            let config =
-                aterm_uds::atomic_file::ConfigFile::open(config).map_err(|e| e.to_string())?;
-            let text = config.text().map_err(|e| e.to_string())?;
-            let fleet = fleet.as_ref().map_err(Clone::clone)?;
-            publish::publication_of(text, fleet.as_deref(), name, Some(&names))
-        })();
-        let mut status = Self {
-            fleet,
-            available_fleets: None,
-            names,
-            publication,
-            expected: name
-                .num
-                .map(|number| GeneratedNames::new(number, &name.nick)),
-            authorization: None,
-        };
+        let mut status = Self::read_with_names(state, config, name, Some(system.read()));
         if matches!(&status.publication, Ok(publish::Publication::Owed(owed))
             if owed.iter().any(|owed| matches!(owed, publish::Owed::SystemNames(values)
                 if status.actionable_system(values))))
@@ -53,6 +37,54 @@ impl NamingStatus {
             status.authorization = Some(system.authorization(state, config));
         }
         status
+    }
+
+    /// Local publication facts suffice to edit; OS observations arrive independently.
+    pub(crate) fn read_local(state: &Path, config: &Path, name: &MachineName) -> Self {
+        Self::read_with_names(state, config, name, None)
+    }
+
+    fn read_with_names(
+        state: &Path,
+        config: &Path,
+        name: &MachineName,
+        names: Option<[Option<String>; 3]>,
+    ) -> Self {
+        let fleet = aterm_net::fleet_member::read_primary_name(state);
+        let publication = (|| {
+            let config =
+                aterm_uds::atomic_file::ConfigFile::open(config).map_err(|e| e.to_string())?;
+            let text = config.text().map_err(|e| e.to_string())?;
+            let fleet = fleet.as_ref().map_err(Clone::clone)?;
+            publish::publication_of(text, fleet.as_deref(), name, names.as_ref())
+        })();
+        Self {
+            fleet,
+            available_fleets: None,
+            system_pending: names.is_none(),
+            names: names.unwrap_or([None, None, None]),
+            publication,
+            expected: name
+                .num
+                .map(|number| GeneratedNames::new(number, &name.nick)),
+            authorization: None,
+            system_error: None,
+        }
+    }
+
+    /// Keep independent fleet discovery and the edit's expected name when OS facts arrive.
+    pub(crate) fn diagnosed(&mut self, status: Result<Self, String>) {
+        self.system_pending = false;
+        match status {
+            Ok(status) => {
+                self.names = status.names;
+                self.fleet = status.fleet;
+                self.publication = status.publication;
+                self.authorization = status.authorization;
+                self.system_error = None;
+            }
+            Err(why) => self.system_error = Some(why),
+        }
     }
 
     fn actionable_system(&self, values: &[(&'static str, Option<String>)]) -> bool {
@@ -97,7 +129,13 @@ impl NamingStatus {
 
     /// Only an explicit panel press can request permission. An alias alone is not repair work.
     pub(crate) fn authorize(&self) -> bool {
-        self.retry() && matches!(&self.authorization, Some(Ok(false) | Err(_)))
+        self.retry() && matches!(&self.authorization, Some(Ok(false)))
+    }
+
+    /// An unread permission can still work. Keep an explicit authorization option,
+    /// while the primary action tries the existing noninteractive operation first.
+    pub(crate) fn authorization_unknown(&self) -> bool {
+        self.retry() && matches!(&self.authorization, Some(Err(_)))
     }
 
     pub(crate) fn text(&self, number: &str) -> String {
@@ -111,9 +149,9 @@ impl NamingStatus {
             Err(_) => "unread",
         };
         let mac = [
-            ("Computer", OsSlot::MacComputerName),
-            ("Host", OsSlot::MacHostName),
-            ("Bonjour", OsSlot::MacLocalHostName),
+            ("Computer name", OsSlot::MacComputerName),
+            ("Host name", OsSlot::MacHostName),
+            ("Network name", OsSlot::MacLocalHostName),
         ]
         .into_iter()
         .map(|(label, slot)| {
@@ -134,13 +172,17 @@ impl NamingStatus {
             let show = |value: Option<&str>| {
                 value.map_or_else(|| "unread".to_owned(), |value| format!("{value}{suffix}"))
             };
+            let observed = if self.system_pending {
+                "reading current name\u{2026}".to_owned()
+            } else {
+                format!("actual {}", show(actual))
+            };
             format!(
-                "{label}: expected {} · actual {}{}",
+                "{label}: expected {} · {observed}{}",
                 wanted.map_or_else(
                     || "not assigned".to_owned(),
                     |wanted| format!("{wanted}{suffix}")
                 ),
-                show(actual),
                 if collision { " (collision alias)" } else { "" },
             )
         })
@@ -161,11 +203,23 @@ impl NamingStatus {
             }
             _ => "",
         };
-        let authorization = if self.authorize() {
-            "\nAuthorize & Sync updates naming permission, then reads this Mac's name again."
+        let system = if self.system_error.is_some() {
+            "\nmacOS names could not be read."
         } else {
             ""
         };
+        let membership = match &self.available_fleets {
+            Some((aterm_agent::machine_name::InFleet::Paused(why), _)) => {
+                Some(("Fleet: ALab (paused)", why))
+            }
+            Some((aterm_agent::machine_name::InFleet::Unread(why), _)) => {
+                Some(("Fleet membership could not be read.", why))
+            }
+            _ => None,
+        }
+        .map_or_else(String::new, |(label, why)| {
+            format!("\n{label}\n{}", aterm_codec::tty::one_line(why, 240),)
+        });
         let available = match &self.available_fleets {
             Some((aterm_agent::machine_name::InFleet::In, _)) => "\nFleet: ALab (joined)",
             Some((aterm_agent::machine_name::InFleet::Joining, _)) => "\nFleet: ALab (joining)",
@@ -175,8 +229,19 @@ impl NamingStatus {
             Some((_, None)) => "\nAvailable fleets: discovering\u{2026}",
             None => "",
         };
+        let identity = match expected {
+            Some(expected) if expected.number().to_string() != number => {
+                format!("expected {} · saved {number}", expected.number())
+            }
+            _ => number.to_owned(),
+        };
+        let permission = if self.authorization_unknown() {
+            "\nNaming permission could not be read. Retry Sync tries existing permission; Authorize Naming requests administrator approval."
+        } else {
+            ""
+        };
         format!(
-            "ID: {number}{settings}   Fleet machine ID: {fleet}\n{mac}{note}{authorization}{available}"
+            "ID: {identity}{settings}   Fleet machine ID: {fleet}\n{mac}{note}{system}{membership}{available}{permission}"
         )
     }
 }

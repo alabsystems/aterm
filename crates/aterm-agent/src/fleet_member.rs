@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLI front-end for `aterm fleet init|join|peers|allow|publish|sync|census|name|leave` over
+//! CLI front-end for `aterm fleet init|join|peers|allow|access|publish|sync|census|name|leave` over
 //! [`aterm_net::fleet_member`], and the whole `aterm fleet --help` ([`USAGE`]), which also names
 //! the view ([`crate::fleet_view`]) and the lab verbs ([`crate::members_cli::parse_lab`]).
 
@@ -31,15 +31,14 @@ aterms of one LAN that hold one secret, each reading the others at the level
 they allow
 
 THE LAB:
-  aterm fleet [--json]   the status line (members, up, the members that need an
-                         update, tables in step and the slowest's lag, the
-                         membership log's fill), then one row per seat: its
-                         label, log name, node id, up or silent for how long,
-                         build or `needs update`, and whether its tables are
-                         in step. Read from this Mac's own copy (the node
-                         service's presence view, the membership log, the
-                         book's signed entries); it dials no Mac and starts
-                         nothing
+  aterm fleet [--json]   read authenticated fleet facts (three seconds per peer)
+                         and match their complete node keys to signed seats.
+                         Show current build, free disk, sessions and account
+                         usage where served; unanswered and unknown seats
+                         stay distinct. JSON includes observation times and
+                         build provenance; an unread seat's book build is
+                         historical. Membership still comes from this Mac's
+                         signed log and book
   aterm fleet remove <node|label|name|code> [--stolen]
                          take that Mac out of the lab as this Mac, printing the
                          log name and node id it acted on (as `aterm members
@@ -60,8 +59,10 @@ THE LAB:
 
 DEFAULT ALAB:
   Normal ALab setup joins its signed default fleet automatically once the
-  fleet code is available from the vault. Members may read and drive each
-  other by default; explicit access restrictions, a different manually
+  fleet code is available from the vault. Members may read each other and
+  are trusted to drive each other by default; each Mac's fleet access, Read
+  Only until its person raises it (`aterm fleet access`), decides what a
+  drive may do there. Explicit access restrictions, a different manually
   joined fleet, and a previous `leave` remain in force.
   Use `aterm fleet peers` or `aterm ctl survey --fleet` to inspect it.
   After joining, use its temporary node-<node-id> name, or assign a primary
@@ -97,6 +98,22 @@ USAGE:
                          (drive, granted here alone) drive its sessions from
                          every member or the nodes named, and every member
                          reads at content; facts|content takes it back
+  aterm fleet access [read|write|full] [--json]
+                         this machine's fleet access: what a member its
+                         grants trust may do here now. read (Read Only, the
+                         default): members read it, and none starts a job,
+                         sends a message or types into a session here. write
+                         (Read and Write, No New Tabs): members also message,
+                         type into, take over and close the sessions already
+                         here. full (Full Access): members also start jobs
+                         and tabs. With no level it prints the one in force;
+                         a level named is stated again even where it is that
+                         one. Only this machine changes it (this command, or
+                         the lock in its menu bar); a worker another Mac
+                         started here may lower it and never raise it. It is
+                         chosen for one fleet: leave, and an init, a join or
+                         a sync that writes another fleet's key, put it back
+                         to Read Only
   aterm fleet publish    an ALab vault admin on the Mac that minted the fleet's
                          code publishes it to every current and future ALab
                          member
@@ -118,7 +135,8 @@ USAGE:
                          accounts, shortfall, converge checks and LAN stragglers
   aterm fleet leave      remove this machine's secret, join code, books and
                          [fleet] listen/allow/drive_from (its node key stays),
-                         naming first each tab it holds on another Mac
+                         naming first each tab it holds on another Mac, and
+                         put its fleet access back to Read Only
 
 For a separate, manually configured fleet, use `init` on one machine and
 `join` on each other. Normal ALab setup needs neither command. --allow is
@@ -270,22 +288,25 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return aterm_uds::stdout::answer_exit(&format!("aterm fleet {verb}"), USAGE, 0);
     }
-    let ran = Places::here().and_then(|places| match verb {
-        "init" => init(&places, &args),
-        "join" => parse_join(&args).and_then(|opts| {
-            let (code, from) = read_code(opts.code_file.as_deref())?;
-            let out = join(&places, &opts, &code).map(|report| report + from.left_behind());
-            scrub_string(code);
-            out
-        }),
-        "peers" => peers(&places, &args),
-        "allow" => allow(&places, &args),
-        "publish" => publish(&places, &args),
-        "sync" => sync(&places, &args),
-        "census" => census(&places, &args),
-        "name" => name_machine(&places, &args),
-        "leave" => leave(&places, &args),
-        _ => Err(Failure::Usage(format!("no such command `{verb}`"))),
+    let ran = Places::here().and_then(|places| {
+        announcing(&places, || match verb {
+            "init" => init(&places, &args),
+            "join" => parse_join(&args).and_then(|opts| {
+                let (code, from) = read_code(opts.code_file.as_deref())?;
+                let out = join(&places, &opts, &code).map(|report| report + from.left_behind());
+                scrub_string(code);
+                out
+            }),
+            "peers" => peers(&places, &args),
+            "allow" => allow(&places, &args),
+            "access" => access(&places, &args),
+            "publish" => publish(&places, &args),
+            "sync" => sync(&places, &args),
+            "census" => census(&places, &args),
+            "name" => name_machine(&places, &args),
+            "leave" => leave(&places, &args),
+            _ => Err(Failure::Usage(format!("no such command `{verb}`"))),
+        })
     });
     match ran {
         Ok(report) => {
@@ -301,6 +322,21 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `run`, a verb or a sync at `places`, telling every running window on this machine once it
+/// changed what a raise of fleet access is asked over ([`crate::fleet_access::Basis`]): a level
+/// stated (`access`), one a leave or another fleet's key removed, and the fleet left, joined or
+/// changed. A window's lock then reads the level again and drops a raise it had pending. It is
+/// told whether or not `run` ran to its end. A unit test runs the verbs themselves and posts
+/// nothing.
+fn announcing<R>(places: &Places, run: impl FnOnce() -> R) -> R {
+    let before = crate::fleet_access::basis(&places.state);
+    let ran = run();
+    if crate::fleet_access::basis(&places.state) != before {
+        crate::fleet_access::announce();
+    }
+    ran
 }
 
 fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
@@ -1317,9 +1353,12 @@ struct Minted {
     ungranted: Option<String>,
     /// Whether it wrote the fleet seed: minted, or a rotate's signed again.
     seeded: bool,
+    /// The line for the stored fleet access the new key removed ([`relocked_line`]).
+    relocked: Option<String>,
 }
 
 fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
+    let under = vault_take_now(places)?;
     // The node first: its claim of the book's lock waits out another writer, and nothing of the
     // fleet is written yet.
     let keyed = matches!(member::read_node_identity(&places.state), Ok(Some(_)));
@@ -1328,7 +1367,7 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
     let code_path = places.state.join(CODE_FILE);
     at_step("key");
     let begun = member::write_held(&places.state, Began::Here, |book| {
-        init_first(places, book, &opts, (&me, keyed))
+        init_first(places, book, &opts, (&me, keyed), under.as_ref())
     })
     .map_err(failed)??;
     let Minted {
@@ -1338,6 +1377,7 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
         listen,
         ungranted,
         seeded,
+        relocked,
     } = match begun {
         Begun::Again(report) => return Ok(report),
         Begun::Minted(minted) => *minted,
@@ -1397,7 +1437,7 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
     out.push_str(&format!(
         "  key        {} (0600)\n  join code  {} (0600) — the fleet's secret: never printed, \
          as aterm exports screens\n  node key   {} (0600) — this machine's own: it proves \
-         which node it is\n{}{config_line}{}",
+         which node it is\n{}{config_line}{}{}",
         places.state.join(KEY_FILE).display(),
         code_path.display(),
         places.state.join(NODE_KEY_FILE).display(),
@@ -1412,6 +1452,7 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
                 places.state.join(member::fleet_seed::FILE).display()
             ),
         },
+        relocked.as_deref().unwrap_or_default(),
         unserved.as_deref().unwrap_or_default(),
     ));
     if !old_secret.is_empty() {
@@ -1483,6 +1524,7 @@ fn init_first(
     book: &HeldBook<'_>,
     opts: &Opts,
     (me, keyed): (&NodeIdentity, bool),
+    under: Option<&crate::fleet_vault::Vault>,
 ) -> Result<Begun, Failure> {
     let node = me.node();
     let config = ConfigFile::open(&places.config).map_err(failed)?;
@@ -1599,6 +1641,8 @@ fn init_first(
     book.write_code(&code)
         .map_err(|e| failed(format!("{CODE_FILE}: {e}")))?;
     at_step("code");
+    // A minted secret is a fleet nobody held: the level stored here goes with the old one.
+    let relocked = relocked_line(places);
     book.write_key(&secret).map_err(|e| {
         failed(format!(
             "{KEY_FILE}: {e}\n  {}",
@@ -1611,9 +1655,9 @@ fn init_first(
             }
         ))
     })?;
-    // The fleet state is taken under the vault configured now, in the take of its key: the grants
+    // The fleet state is taken under the vault captured as init began, in the take of its key: the grants
     // of the fleet held before are out of aterm.toml already (`ungranted`), or there were none.
-    crate::fleet_vault::take(book, vault_now(places).as_ref()).map_err(|e| {
+    crate::fleet_vault::take(book, under).map_err(|e| {
         failed(format!(
             "{}: {e}",
             places.state.join(member::VAULT_FILE).display()
@@ -1626,7 +1670,23 @@ fn init_first(
         listen,
         ungranted,
         seeded: seed.is_some(),
+        relocked,
     })))
+}
+
+/// The report line of the fleet access another fleet's key removes
+/// (`HeldBook::write_key`), read under the book's lock before that key is written: `None` where
+/// this Mac stored no level, so nothing changes.
+fn relocked_line(places: &Places) -> Option<String> {
+    in_state(places, crate::fleet_access::FILE)
+        .unwrap_or(false)
+        .then(|| {
+            format!(
+                "  removed    {} (fleet access was chosen for the fleet this Mac held before: \
+                 it is Read Only to this one until its person raises it)\n",
+                places.state.join(crate::fleet_access::FILE).display()
+            )
+        })
 }
 
 /// Why an init that mints takes the drive grants out: a new fleet, or a new secret.
@@ -1916,84 +1976,8 @@ fn prove_discovery_address_within(
 }
 
 #[cfg(test)]
-mod discovery_proof_tests {
-    use super::*;
-
-    #[test]
-    fn only_a_handshake_proving_a_current_members_mesh_id_populates_discovery() {
-        const HANG: Duration = Duration::from_secs(60);
-        let identity = |seed: u8| {
-            let provisional =
-                NodeIdentity::from_seed("00000000000000000000000000000000", &[seed; 32]).unwrap();
-            NodeIdentity::from_seed(&member::node_principal(provisional.key()), &[seed; 32])
-                .unwrap()
-        };
-        let server = identity(11);
-        let client = identity(12);
-        let secret = FleetSecret::new(&[7; 32]).unwrap();
-        for (standing, wrong_id, expected) in [
-            (Some(member::Standing::Member), false, true),
-            (Some(member::Standing::Out("removed".into())), false, false),
-            (None, false, false),
-            (Some(member::Standing::Member), true, false),
-        ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            aterm_uds::keep_out_of_children(&listener).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let secret_server = secret.clone();
-            let node = server.clone();
-            let (done, waited) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                let (tcp, _) = aterm_uds::accept(
-                    &listener,
-                    aterm_uds::AcceptWait::Forever,
-                    aterm_uds::AcceptedMode::Blocking,
-                )
-                .unwrap();
-                aterm_net::fleet::server_handshake_as(
-                    tcp,
-                    &secret_server,
-                    Some(&node),
-                    FleetScope::Facts,
-                    &[FleetOp::Survey],
-                    HANG,
-                )
-                .unwrap();
-                done.send(()).unwrap();
-            });
-            let members: member::MemberKeys = standing
-                .into_iter()
-                .map(|standing| (server.key(), standing))
-                .collect();
-            let hint = aterm_secrets::discover::Advert {
-                instance: "opaque".into(),
-                host: "127.0.0.1".into(),
-                port: addr.port(),
-                txt: vec![
-                    ("v".into(), "2".into()),
-                    (
-                        "id".into(),
-                        if wrong_id {
-                            client.node()
-                        } else {
-                            server.node()
-                        }
-                        .into(),
-                    ),
-                    ("port".into(), addr.port().to_string()),
-                ],
-            };
-            let answer =
-                prove_discovery_address_within(&hint, &secret, Some(&client), &members, HANG);
-            assert_eq!(answer.is_some(), expected);
-            if expected {
-                assert_eq!(answer, Some((server.node().into(), addr)));
-            }
-            waited.recv_timeout(HANG).unwrap();
-            worker.join().unwrap();
-        }
-    }
-}
+#[path = "fleet_member_discovery_proof_tests.rs"]
+mod discovery_proof_tests;
 
 /// The automatic join's listen place, bound until the service takes it over: `preferred` (else the
 /// default port, or any on the loopback) at `host` where it is a loopback address, else at every
@@ -2053,10 +2037,10 @@ fn join_with_denial_deadline(
     // The vault this join takes the fleet under: a sync's, the one it read the vault's code
     // under; a person's, the one configured as the join begins. A move while it dials leaves the
     // fleet the vault left's, beside which no grant admits (`crate::fleet_vault::take`).
-    let under = opts
-        .synced
-        .as_ref()
-        .map_or_else(|| vault_now(places), |synced| synced.under.clone());
+    let under = match opts.synced.as_ref() {
+        Some(synced) => synced.under.clone(),
+        None => vault_take_now(places)?,
+    };
     // A join dials, and takes the book of, only members the deny list does not name: with none
     // read, none can be told apart, so the join waits for one.
     let (denied, log) = denied_and_log_by(places, Some(deadline)).map_err(failed)?;
@@ -2288,6 +2272,7 @@ fn join_with_denial_deadline(
         holds,
         off,
         seeded,
+        relocked,
     } = member::write_held(&places.state, began, |book| {
         let held = book.held().clone();
         let same_fleet = held.secret() == Some(&secret);
@@ -2375,6 +2360,9 @@ fn join_with_denial_deadline(
                     )
                 })?;
         }
+        // Another fleet's key removes the level this Mac's person chose for the fleet held: its
+        // members were never the ones that level was opened to.
+        let relocked = (!same_fleet).then(|| relocked_line(places)).flatten();
         at_step("key");
         book.write_key(&code.secret).map_err(|e| {
             if let Some(seed) = &old_seed
@@ -2475,6 +2463,7 @@ fn join_with_denial_deadline(
             holds,
             off,
             seeded,
+            relocked,
         })
     })
     .map_err(|why| unfinished(&out, &issuer_at, why, not_keyed, finish))??;
@@ -2498,6 +2487,7 @@ fn join_with_denial_deadline(
                 (Some(Replaced::Renewed), _) => Some(Ungrant::NewSecret),
                 _ if !same_fleet => Some(Ungrant::OtherFleet),
                 (_, crate::fleet_vault::Tenure::Elsewhere { .. }) => Some(Ungrant::OtherVault),
+                (_, crate::fleet_vault::Tenure::Unknown) => Some(Ungrant::UnknownCustody),
                 (_, crate::fleet_vault::Tenure::Unread(_)) => Some(Ungrant::VaultUnread),
                 _ if !named => Some(Ungrant::Unbacked),
                 _ => None,
@@ -2654,6 +2644,7 @@ fn join_with_denial_deadline(
     let unserved = serves_new_key(places, &secret);
     out.push_str(unserved.as_deref().unwrap_or_default());
     out.push_str(off.as_deref().unwrap_or_default());
+    out.push_str(relocked.as_deref().unwrap_or_default());
     out.push_str(seeded.as_deref().unwrap_or_default());
     if allow == FleetScope::Facts.word() {
         out.push_str(
@@ -2717,6 +2708,8 @@ struct Keyed {
     off: Option<String>,
     /// The line for the fleet seed it adopted, or refused ([`adopt_join_seed`]).
     seeded: Option<String>,
+    /// The line for the stored fleet access another fleet's key removed ([`relocked_line`]).
+    relocked: Option<String>,
 }
 
 /// A join's adoption of the fleet seed `joined` carries (`docs/DESIGN-machine-names-2026-11-04.md`
@@ -4264,6 +4257,8 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
     #[cfg(unix)]
     let began_ms = aterm_netplace::unix_ms_now();
     // The fleet the read is made under, read before the book it reads.
+    let traffic =
+        crate::fleet_vault::Traffic::capture(&places.state, vault_paths_for(places).as_ref());
     let held = aterm_net::fleet::read_key_file(&places.state);
     if let Err(e) = &held
         && !matches!(e, aterm_net::fleet::KeyFileError::Missing)
@@ -4304,7 +4299,26 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
         check,
     };
     let (rows, unchecked, note, (listener, missed)) = match held {
+        Ok(_)
+            if !crate::fleet_vault::traffic_in_effect(
+                &places.state,
+                vault_paths_for(places).as_ref(),
+            ) =>
+        {
+            (
+                peers.into_iter().map(|peer| row(peer, None)).collect(),
+                tenure(places).void(),
+                None,
+                (None, None),
+            )
+        }
         Ok(secret) => {
+            let traffic = traffic
+                .as_ref()
+                .ok_or_else(|| failed(FLEET_IDENTITY_CHANGED))?;
+            if !traffic.current() {
+                return Err(failed(FLEET_IDENTITY_CHANGED));
+            }
             let own = own_node(places);
             let me = own_identity(places);
             let ((reads, book), listener) = std::thread::scope(|scope| {
@@ -4327,6 +4341,9 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
                 };
                 (read, listener)
             });
+            if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+                return Err(failed(FLEET_IDENTITY_CHANGED));
+            }
             #[cfg(unix)]
             aterm_netplace::heard::note_observations(
                 &aterm_netplace::record::dir(&places.state),
@@ -4337,7 +4354,7 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
                     probe_route,
                 ),
             );
-            let dropped = keep_book(places, &secret, (&reads, &book), own.as_deref());
+            let dropped = keep_book(places, &secret, (&reads, &book), own.as_deref(), traffic);
             let issuer_read = reads.iter().find(|read| read.peer.via == Via::Issuer);
             let missed = Missed::of_read(&book, issuer_read.map(|read| &read.read));
             // The read's own write lowered the level or took grants out: the header says the
@@ -4976,12 +4993,21 @@ fn tenure_under(
     crate::fleet_vault::tenure_under(&places.state, vault_paths_for(places).as_ref(), under)
 }
 
-/// The vault `places` configures now ([`crate::fleet_vault::Vault::configured`]): none with none,
-/// one this process does not read, or one that pins no signer.
+/// The vault `places` configures now ([`crate::fleet_vault::Vault::configured`]), for advisory
+/// reads: none where absent, unreadable, unpinned, or outside this process's account state.
 fn vault_now(places: &Places) -> Option<crate::fleet_vault::Vault> {
     vault_paths_for(places)
         .as_ref()
-        .and_then(crate::fleet_vault::Vault::configured)
+        .and_then(|paths| crate::fleet_vault::Vault::configured(paths).ok().flatten())
+}
+
+fn vault_take_now(places: &Places) -> Result<Option<crate::fleet_vault::Vault>, Failure> {
+    vault_paths_for(places)
+        .as_ref()
+        .map(crate::fleet_vault::Vault::configured)
+        .transpose()
+        .map(Option::flatten)
+        .map_err(|error| failed(DenialReadError::VaultConfiguration(error.to_string())))
 }
 
 /// Why a fleet verb that admits, joins or drives refuses while this Mac cannot read its deny
@@ -4993,6 +5019,7 @@ const DENY_LIST_UNREAD: &str = "this Mac cannot read its deny list and membershi
 /// that can observe a different vault state. An unavailable snapshot is not an empty deny list.
 #[derive(Debug)]
 enum DenialReadError {
+    VaultConfiguration(String),
     DenyListUnavailable(aterm_secrets::client::SwarmDenialUnavailable),
     DenyList(aterm_secrets::Error),
     MembershipLog(aterm_secrets::Error),
@@ -5002,6 +5029,11 @@ impl std::fmt::Display for DenialReadError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(out, "{DENY_LIST_UNREAD}; ")?;
         match self {
+            Self::VaultConfiguration(error) => write!(
+                out,
+                "local vault configuration: {}",
+                aterm_codec::tty::one_line(error, 1024)
+            ),
             Self::DenyListUnavailable(reason) => {
                 write!(out, "the local deny-list snapshot is unavailable: {reason}")
             }
@@ -5021,12 +5053,15 @@ impl std::fmt::Display for DenialReadError {
 
 type DeniedAndLog = (Vec<String>, Option<std::sync::Arc<member::MemberKeys>>);
 
-const FLEET_IDENTITY_CHANGED: &str = "this Mac left or changed fleets, or its local identity \
-                                     became unreadable, while its vault was being read";
+const FLEET_IDENTITY_CHANGED: &str = "this Mac left or changed fleets or vaults, or its local \
+                                     identity became unreadable, while its vault was being read";
 
 /// A local vault wait cannot carry credentials past a leave, rotation or identity change.
 /// This check holds no book or vault lock across the subsequent network operation.
 fn local_fleet_matches(places: &Places, secret: &FleetSecret, me: Option<&NodeIdentity>) -> bool {
+    if !crate::fleet_vault::traffic_in_effect(&places.state, vault_paths_for(places).as_ref()) {
+        return false;
+    }
     let began = Held::Key(secret.clone());
     member::write_held(&places.state, Began::Under(&began), |_| {
         me.is_none_or(|expected| {
@@ -5426,12 +5461,22 @@ fn keep_book(
     secret: &FleetSecret,
     (reads, read): (&[member::PeerRead], &BookRead),
     own: Option<&str>,
+    traffic: &crate::fleet_vault::Traffic,
 ) -> Option<String> {
+    if !traffic.current() || !local_fleet_matches(places, secret, None) {
+        return None;
+    }
     // With no deny list read, a fetched book cannot be told from a denied issuer's: keep nothing,
     // as a read that got no book, until one is.
     let (denied, log) = denied_and_log(places).ok()?;
     let checked_peers: Vec<Peer> = reads.iter().map(|r| r.peer.clone()).collect();
-    member::prune_pushed_facts(&places.state, &checked_peers, &denied, log.as_deref());
+    member::prune_pushed_facts(
+        &places.state,
+        &checked_peers,
+        &denied,
+        log.as_deref(),
+        &|| traffic.current(),
+    );
     let issuer_denied = |issuer_node: &str| {
         aterm_net::fleet::is_denied_node(issuer_node, &denied)
             || reads.iter().any(|r| {
@@ -5442,7 +5487,13 @@ fn keep_book(
     let copy = match read {
         BookRead::Fetched(book) if issuer_denied(&book.node) => Some(None),
         BookRead::Fetched(book) => {
-            member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
+            member::prune_pushed_facts(
+                &places.state,
+                &book.peers,
+                &denied,
+                log.as_deref(),
+                &|| traffic.current(),
+            );
             let mut copies = member::copies_of(book, own);
             copies.retain(|copy| !peer_is_denied_or_held_out(copy, &denied, log.as_deref()));
             Some(Some((book.node.as_str(), copies)))
@@ -5465,11 +5516,13 @@ fn keep_book(
         &places.state,
         Began::Under(&Held::Key(secret.clone())),
         |book| {
+            if !traffic.current() {
+                return None;
+            }
             // A record of when each member last answered: one this machine cannot write costs
             // `peers` its "since" line, never the read.
             let _ = book.note_answered(&answers);
-            // A record of the vault the fleet state is of, adopted where an older build left
-            // none (`crate::fleet_vault::keep`).
+            // Widen the matching recorded vault's signer line without adopting unknown custody.
             crate::fleet_vault::keep_in(book, &places.state, vault_now(places));
             book.keep_issuer_book(
                 copy.as_ref()?
@@ -6505,7 +6558,10 @@ pub fn try_sync_from_cache() -> Result<FleetSync, FleetSyncError> {
         at_capacity: false,
     })?;
     let opts = Opts::default();
-    sync_with(&places, false, || vault_code(Fetch::Cache), &opts).map_err(|err| FleetSyncError {
+    announcing(&places, || {
+        sync_with(&places, false, || vault_code(Fetch::Cache), &opts)
+    })
+    .map_err(|err| FleetSyncError {
         why: err.into_text(),
         at_capacity: opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed),
     })
@@ -6674,6 +6730,7 @@ fn sync_plan(places: &Places, code: &JoinCode, current: &FleetSecret) -> Result<
     // takes it, the grants made beside the record out (`crate::fleet_vault`).
     let elsewhere = match tenure(places) {
         crate::fleet_vault::Tenure::Here => None,
+        crate::fleet_vault::Tenure::Unknown => Some("this Mac's fleet has no recorded take"),
         crate::fleet_vault::Tenure::Elsewhere { .. } => Some(
             "this Mac's fleet was taken under another vault than the one whose default fleet this \
              is",
@@ -6851,7 +6908,7 @@ fn sync_with(
     // The vault configured as the sync reads the code: what the sync writes is that vault's,
     // whichever is configured by the time it writes, so a move while it dials leaves the fleet the
     // vault left's (`crate::fleet_vault::take`).
-    let under = vault_now(places);
+    let under = vault_take_now(places)?;
     let code = match vault()? {
         VaultCode::NoVault => return Ok(FleetSync::NoVault),
         VaultCode::NotAlab => return Ok(FleetSync::NotAlab),
@@ -6943,7 +7000,7 @@ fn converge_under_elapsed(
 /// under that vault.
 #[cfg(test)]
 fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Failure> {
-    converge_under(places, code, vault_now(places).as_ref(), at)
+    converge_under(places, code, vault_take_now(places)?.as_ref(), at)
 }
 
 /// A sync that found this Mac in the vault's fleet `current`, its join made: the record that it is
@@ -6954,8 +7011,7 @@ fn in_fleet(
     under: Option<&crate::fleet_vault::Vault>,
 ) -> Result<FleetSync, Failure> {
     record_synced(places, (code, current))?;
-    // The vault whose default fleet this is, which the sync read the code under: a record an
-    // older build left none of adopts it, whichever vault is configured by now.
+    // Widen custody already established by the explicit take selected by sync_plan.
     crate::fleet_vault::keep_as(&places.state, under.cloned());
     Ok(grant_owed(places, current)?.map_or(FleetSync::Current, FleetSync::Granted))
 }
@@ -6984,6 +7040,7 @@ fn retake(
             let ungrant = match tenure_under(places, under) {
                 crate::fleet_vault::Tenure::Here => return Ok(None),
                 crate::fleet_vault::Tenure::Elsewhere { .. } => Ungrant::OtherVault,
+                crate::fleet_vault::Tenure::Unknown => Ungrant::UnknownCustody,
                 crate::fleet_vault::Tenure::Unread(_) => Ungrant::VaultUnread,
             };
             let config = ConfigFile::open(&places.config).map_err(failed)?;
@@ -7050,8 +7107,8 @@ fn retake(
 /// Take the vault's rotated secret of the fleet `from` this Mac holds, in place, while it holds it
 /// still: the book's entries of that fleet marked as the new one's, the code (where this Mac
 /// `minted` that fleet) and the key written, and the sync's record moved, in one take under the
-/// book's lock. `[fleet]`, its grants and the node key stay: the fleet is the same Macs, each of
-/// which takes the secret so on its own next pass. A grant of the Mac whose removal rotated the
+/// book's lock. `[fleet]`, its grants, this Mac's fleet access and the node key stay: the fleet is
+/// the same Macs, each of which takes the secret so on its own next pass. A grant of the Mac whose removal rotated the
 /// secret stays too, and admits nothing: every listener refuses a node the membership log removed
 /// or the roster denies at its handshake (`aterm_secrets::client::swarm_denied_nodes`), and an
 /// "Allow again" of a plain removal finds its grants as it left them. A person's `init --rotate`,
@@ -7115,7 +7172,8 @@ fn rekey(
                     })?;
                 }
             }
-            book.write_key(&code.secret)
+            // The same Macs under a new secret: fleet access stays, as the grants do.
+            book.write_rotated_key(&code.secret)
                 .map_err(|e| failed(format!("{}: {e}", places.state.join(KEY_FILE).display())))?;
             at_step("rekeyed");
             // Marked again as the fleet held now, as a join marks an unmarked entry it moves
@@ -7131,9 +7189,8 @@ fn rekey(
             })
             .map_err(failed)?;
             write_synced(places, (code, current)).map_err(failed)?;
-            // The vault whose code rotated the secret, which the sync read it under, is the one
-            // the fleet state is of (a sync rekeys only that: [`sync_plan`]): a record an older
-            // build left none of adopts it, whichever vault is configured by now.
+            // Rekey only a fleet whose custody was established by an explicit take.
+            // Widen that matching vault's acknowledged signer line.
             crate::fleet_vault::keep_in(book, &places.state, under.cloned());
             Ok(Some(kept))
         },
@@ -8247,137 +8304,8 @@ fn resolve_registry_label(
 }
 
 #[cfg(test)]
-mod registry_label_tests {
-    use super::*;
-    use aterm_db::typed::cell::{Candidate, CellValue, Field, Projection, Row};
-    use aterm_json::json;
-
-    fn field(value: &str) -> Field {
-        Field::Value(Candidate {
-            operation: [1; 32],
-            value: CellValue::owner(2, json!(value)),
-        })
-    }
-
-    fn registry() -> Projection {
-        let mut rows = Projection::default();
-        rows.rows.insert(
-            "mc-0000000000000007".into(),
-            Row {
-                fields: [
-                    ("label".into(), field("m7")),
-                    ("node".into(), field("0123456789abcdef")),
-                ]
-                .into(),
-                ..Row::default()
-            },
-        );
-        rows
-    }
-
-    fn seat() -> LabelSeat {
-        LabelSeat {
-            actor: [7; 48],
-            node: "0123456789abcdef".into(),
-            name: "log-name-seven".into(),
-            mac: Some("mc-0000000000000007".into()),
-            transport: "00112233445566778899aabbccddeeff".into(),
-        }
-    }
-
-    #[test]
-    fn label_follows_registry_and_uses_book_bound_old_transport() {
-        let mut registry = registry();
-        assert_eq!(
-            resolve_registry_label("m7", &registry, &[seat()]).unwrap(),
-            "00112233445566778899aabbccddeeff"
-        );
-        let mut seat = seat();
-        registry
-            .rows
-            .values_mut()
-            .next()
-            .unwrap()
-            .fields
-            .insert("label".into(), field("m22"));
-        seat.transport = "n-0123456789abcdef".into();
-        assert_eq!(
-            resolve_registry_label("m22", &registry, &[seat]).unwrap(),
-            "n-0123456789abcdef"
-        );
-        assert!(resolve_registry_label("m7", &registry, &[]).is_err());
-    }
-
-    #[test]
-    fn dispute_prints_both_registry_node_and_signed_seat_name() {
-        let registry = registry();
-        let mut seat = seat();
-        seat.mac = Some("mc-0000000000000008".into());
-        let why = resolve_registry_label("m7", &registry, &[seat]).unwrap_err();
-        for evidence in [
-            "0123456789abcdef",
-            "log-name-seven",
-            "mc-0000000000000007",
-            "mc-0000000000000008",
-        ] {
-            assert!(why.contains(evidence), "missing evidence {evidence}: {why}");
-        }
-    }
-
-    #[test]
-    fn conflicted_label_and_duplicate_adoption_refuse() {
-        let mut registry = registry();
-        assert!(resolve_registry_label("m7", &registry, &[seat(), seat()]).is_err());
-        let mut collision = seat();
-        collision.actor = [8; 48];
-        collision.mac = Some("mc-0000000000000008".into());
-        assert!(resolve_registry_label("m7", &registry, &[seat(), collision]).is_err());
-        registry.rows.values_mut().next().unwrap().fields.insert(
-            "label".into(),
-            Field::Conflict {
-                candidates: ["m7", "m8"]
-                    .into_iter()
-                    .map(|value| Candidate {
-                        operation: [1; 32],
-                        value: CellValue::owner(2, json!(value)),
-                    })
-                    .collect(),
-                provisional: Some(json!("m7")),
-            },
-        );
-        assert!(resolve_registry_label("m7", &registry, &[seat()]).is_err());
-    }
-
-    #[test]
-    fn raw_node_diagnostics_never_print_untyped_values() {
-        let mut registry = registry();
-        let row = registry.rows.values_mut().next().unwrap();
-        row.fields
-            .insert("node".into(), field("untyped-private-fixture"));
-        row.raw.insert("node".into());
-        let why = resolve_registry_label("m7", &registry, &[seat()]).unwrap_err();
-        assert!(!why.contains("untyped-private-fixture"));
-        assert!(why.contains("log-name-seven"));
-    }
-
-    #[test]
-    fn typed_label_words_are_canonical_before_lookup() {
-        let label = registry_label("M7-3FA2").expect("a typed clash label");
-        let mut registry = registry();
-        registry
-            .rows
-            .values_mut()
-            .next()
-            .unwrap()
-            .fields
-            .insert("label".into(), field(&label));
-        assert_eq!(
-            resolve_registry_label(&label, &registry, &[seat()]).unwrap(),
-            "00112233445566778899aabbccddeeff"
-        );
-        assert!(registry_label("m7.local").is_none());
-    }
-}
+#[path = "fleet_member_registry_label_tests.rs"]
+mod registry_label_tests;
 
 /// [`host_word`] with the swarm roster's `identities` given.
 /// # Errors
@@ -8648,6 +8576,21 @@ fn leave_within_node(
                 .remove(name)
                 .map_err(|e| failed(format!("{}: {e}", places.state.join(name).display())))?;
         }
+        // A level was chosen for the fleet this Mac is leaving: the next one it joins finds it
+        // Read Only. One that cannot be removed stops no leave, and is said.
+        let access = places.state.join(crate::fleet_access::FILE);
+        match crate::fleet_access::reset(&places.state) {
+            Ok(true) => out.push_str(&format!(
+                "  removed    {} (fleet access is Read Only again)\n",
+                access.display()
+            )),
+            Ok(false) => {}
+            Err(e) => out.push_str(&format!(
+                "  kept       {} could not be removed ({e}): `aterm fleet access read` puts \
+                 this Mac's fleet access back to Read Only\n",
+                access.display()
+            )),
+        }
         at_step("removed");
         let config = ConfigFile::open(&places.config).map_err(failed)?;
         at_step("config");
@@ -8867,25 +8810,70 @@ pub fn survey_fleet(
     survey_fleet_in(&places, &ask)
 }
 
-/// The fleet client of `aterm ctl --host` (`aterm_ctl::LocalVerbs::fleet_drive`): a drive of
-/// the peer `host` names.
+/// Fleet status reads metadata explicitly, even where a peer grants content access.
+pub(crate) fn survey_all_facts(
+    within: Duration,
+) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
+    let places = Places::here().map_err(failure_words)?;
+    survey_all_facts_in(&places, seamed_within(SURVEY_WITHIN_SEAM, within))
+}
+
+fn survey_all_facts_in(
+    places: &Places,
+    within: Duration,
+) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
+    survey_fleet_read_in(
+        places,
+        &aterm_ctl::FleetAsk { host: None, within },
+        "survey facts",
+    )
+}
+
+/// The fleet client of `aterm ctl --host` (`aterm_ctl::LocalVerbs::fleet_drive`), run in a
+/// person's or an agent's shell: [`drive_fleet`] for the requester that shell is
+/// ([`aterm_ctl::requester_here`], read once per process).
 /// # Errors
-/// This machine is in no fleet or holds no node key, the book cannot be read, `host` names no
-/// node the book records (or more than one), or the drive is refused.
-pub fn drive_fleet(
+/// As [`drive_fleet`].
+pub fn drive_fleet_from_shell(
     host: &str,
     within: Duration,
 ) -> Result<aterm_ctl::DriveLink, aterm_ctl::DriveRefused> {
-    let places = Places::here().map_err(failure_words)?;
-    drive_fleet_in(&places, host, within)
+    static HERE: std::sync::OnceLock<aterm_types::control_verbs::Requester> =
+        std::sync::OnceLock::new();
+    drive_fleet(host, HERE.get_or_init(aterm_ctl::requester_here), within)
 }
 
+/// A drive of the peer `host` names, for `requester`, whom the drive's first line names
+/// (ATERM-KI-1109-3). A process aterm runs of its own (a window, the node job, a harness's
+/// service) passes [`aterm_types::control_verbs::Requester::default`]: it names no requester, and
+/// never reads one from its own environment.
+/// # Errors
+/// This machine is in no fleet or holds no node key, the book cannot be read, `host` names no
+/// node the book records (or more than one), the drive is refused, or its first line could not
+/// be sent.
+pub fn drive_fleet(
+    host: &str,
+    requester: &aterm_types::control_verbs::Requester,
+    within: Duration,
+) -> Result<aterm_ctl::DriveLink, aterm_ctl::DriveRefused> {
+    let places = Places::here().map_err(failure_words)?;
+    drive_fleet_proven_in(&places, host, requester, within).map(|(link, _)| link)
+}
+
+/// [`drive_fleet`] for no named requester, at `places`.
+#[cfg(test)]
 fn drive_fleet_in(
     places: &Places,
     host: &str,
     within: Duration,
 ) -> Result<aterm_ctl::DriveLink, aterm_ctl::DriveRefused> {
-    drive_fleet_proven_in(places, host, within).map(|(link, _)| link)
+    drive_fleet_proven_in(
+        places,
+        host,
+        &aterm_types::control_verbs::Requester::default(),
+        within,
+    )
+    .map(|(link, _)| link)
 }
 
 /// Dial native Drive while retaining the peer identity authenticated by its handshake.
@@ -8893,17 +8881,31 @@ fn drive_fleet_in(
 /// The same membership, resolution and Drive admission failures as [`drive_fleet`].
 pub fn drive_fleet_proven(
     host: &str,
+    requester: &aterm_types::control_verbs::Requester,
     within: Duration,
 ) -> Result<(aterm_ctl::DriveLink, aterm_net::fleet::NodeProof), aterm_ctl::DriveRefused> {
     let places = Places::here().map_err(failure_words)?;
-    drive_fleet_proven_in(&places, host, within)
+    drive_fleet_proven_in(&places, host, requester, within)
 }
 
 fn drive_fleet_proven_in(
     places: &Places,
     host: &str,
+    requester: &aterm_types::control_verbs::Requester,
     within: Duration,
 ) -> Result<(aterm_ctl::DriveLink, aterm_net::fleet::NodeProof), aterm_ctl::DriveRefused> {
+    let vault = vault_paths_for(places);
+    // Preserve a local configuration read failure before the custody gate's generic refusal.
+    if let Some(paths) = &vault {
+        aterm_secrets::client::config_now(paths).map_err(|error| aterm_ctl::DriveRefused {
+            again: true,
+            ..aterm_ctl::DriveRefused::once(
+                DenialReadError::VaultConfiguration(error.to_string()).to_string(),
+            )
+        })?;
+    }
+    let traffic = crate::fleet_vault::Traffic::capture(&places.state, vault.as_ref())
+        .ok_or_else(|| aterm_ctl::DriveRefused::once(FLEET_IDENTITY_CHANGED.to_owned()))?;
     let secret =
         aterm_net::fleet::read_key_file(&places.state).map_err(|e| aterm_ctl::DriveRefused {
             left: matches!(e, aterm_net::fleet::KeyFileError::Missing)
@@ -9057,7 +9059,7 @@ fn drive_fleet_proven_in(
                 ..aterm_ctl::DriveRefused::once(error.to_string())
             }
         })?;
-        if !local_fleet_matches(places, &secret, Some(&me)) {
+        if !traffic.current() || !local_fleet_matches(places, &secret, Some(&me)) {
             return Err(aterm_ctl::DriveRefused::once(
                 FLEET_IDENTITY_CHANGED.to_owned(),
             ));
@@ -9098,6 +9100,11 @@ fn drive_fleet_proven_in(
                 },
             }
         })?;
+    if !traffic.current() {
+        return Err(aterm_ctl::DriveRefused::once(
+            FLEET_IDENTITY_CHANGED.to_owned(),
+        ));
+    }
     let proof = aterm_net::fleet::NodeProof {
         node: driven.node.clone(),
         key: driven.key,
@@ -9105,11 +9112,60 @@ fn drive_fleet_proven_in(
     Ok((
         aterm_ctl::DriveLink {
             node: Some(proof.node.to_string()),
-            stream: Box::new(driven),
+            stream: Box::new(Introduced::new(driven, requester)),
             label,
         },
         proof,
     ))
+}
+
+/// A drive's stream that sends its first line, naming the requester, in the same write as the
+/// first request (or before the first read). One write keeps a refusing Mac's answer readable:
+/// a Mac that refuses the drive answers and closes at once, and a second write landing on the
+/// closed connection draws a reset that can discard the answer before it is read.
+struct Introduced<S> {
+    inner: S,
+    first: Option<Vec<u8>>,
+}
+
+impl<S: std::io::Write> Introduced<S> {
+    fn new(inner: S, requester: &aterm_types::control_verbs::Requester) -> Self {
+        Self {
+            inner,
+            first: Some(requester.line().into_bytes()),
+        }
+    }
+
+    fn introduce(&mut self, then: &[u8]) -> std::io::Result<()> {
+        if let Some(mut first) = self.first.take() {
+            first.extend_from_slice(then);
+            self.inner.write_all(&first)?;
+            self.inner.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl<S: std::io::Write> std::io::Write for Introduced<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.first.is_some() {
+            self.introduce(buf)?;
+            return Ok(buf.len());
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.introduce(&[])?;
+        self.inner.flush()
+    }
+}
+
+impl<S: std::io::Read + std::io::Write> std::io::Read for Introduced<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.introduce(&[])?;
+        self.inner.read(buf)
+    }
 }
 
 /// Why a member's read of its issuer's book brought none ([`copy_again`], [`check_peers`]).
@@ -9203,6 +9259,14 @@ fn copy_again(
     me: Option<&NodeIdentity>,
     deadline: (Instant, Duration),
 ) -> Result<bool, Missed> {
+    let changed = || Missed {
+        why: FLEET_IDENTITY_CHANGED.to_owned(),
+        silent: false,
+        unserved: false,
+    };
+    let traffic =
+        crate::fleet_vault::Traffic::capture(&places.state, vault_paths_for(places).as_ref())
+            .ok_or_else(changed)?;
     let own = own_node(places);
     let Some(issuer) = member::read_peers(&places.state).ok().and_then(|book| {
         book.into_iter()
@@ -9215,7 +9279,7 @@ fn copy_again(
         silent: false,
         unserved: false,
     })?;
-    if !local_fleet_matches(places, secret, me) {
+    if !traffic.current() || !local_fleet_matches(places, secret, me) {
         return Err(Missed {
             why: FLEET_IDENTITY_CHANGED.to_owned(),
             silent: false,
@@ -9223,20 +9287,25 @@ fn copy_again(
         });
     }
     if peer_is_denied_or_held_out(&issuer, &denied, log.as_deref()) {
-        let _ = member::keep_issuer_book(&places.state, secret, None);
+        let _ = keep_copy_current(places, secret, &traffic, None);
         return Ok(false);
     }
     let book = member::fetch_book(&target_of(&issuer), (secret, me), deadline)
         .map_err(|why| Missed::of(&why))?;
-    member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
+    if !traffic.current() {
+        return Err(changed());
+    }
+    member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref(), &|| {
+        traffic.current()
+    });
     if aterm_net::fleet::is_denied_node(&book.node, &denied) {
-        let _ = member::keep_issuer_book(&places.state, secret, None);
+        let _ = keep_copy_current(places, secret, &traffic, None);
         return Ok(false);
     }
     let mut copies = member::copies_of(&book, own.as_deref());
     copies.retain(|copy| !peer_is_denied_or_held_out(copy, &denied, log.as_deref()));
     let kept = book.proven
-        && member::keep_issuer_book(&places.state, secret, Some((&book.node, &copies)))
+        && keep_copy_current(places, secret, &traffic, Some((&book.node, &copies)))
             .unwrap_or(false);
     // The seed the issuer's reply relays, as `peers` adopts it (machine names §3.3).
     if kept && let (Some(seed), Some(me)) = (book.seed, me) {
@@ -9244,11 +9313,38 @@ fn copy_again(
             &places.state,
             Began::Under(&Held::Key(secret.clone())),
             |held| {
+                if !traffic.current() {
+                    return Ok(None);
+                }
                 held.adopt_relayed_seed(me, secret.mark(), [seed], aterm_netplace::unix_ms_now())
             },
         );
     }
     Ok(kept)
+}
+
+fn keep_copy_current(
+    places: &Places,
+    secret: &FleetSecret,
+    traffic: &crate::fleet_vault::Traffic,
+    copy: Option<(&str, &[Peer])>,
+) -> Result<bool, String> {
+    match member::write_held(
+        &places.state,
+        Began::Under(&Held::Key(secret.clone())),
+        |book| {
+            if !traffic.current() {
+                return Ok(false);
+            }
+            book.keep_issuer_book(copy)
+                .map(|()| true)
+                .map_err(|why| why.to_string())
+        },
+    ) {
+        Ok(result) => result,
+        Err(member::Unwritten::Moved) => Ok(false),
+        Err(why) => Err(why.to_string()),
+    }
 }
 
 fn drive_again(why: &Unreached) -> bool {
@@ -9303,10 +9399,24 @@ fn survey_fleet_in(
     places: &Places,
     ask: &aterm_ctl::FleetAsk<'_>,
 ) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
+    survey_fleet_read_in(places, ask, "survey")
+}
+
+fn survey_fleet_read_in(
+    places: &Places,
+    ask: &aterm_ctl::FleetAsk<'_>,
+    query: &str,
+) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
+    let traffic =
+        crate::fleet_vault::Traffic::capture(&places.state, vault_paths_for(places).as_ref())
+            .ok_or_else(|| FLEET_IDENTITY_CHANGED.to_owned())?;
     let secret = aterm_net::fleet::read_key_file(&places.state).map_err(|e| no_key(places, &e))?;
     let known = known_peers(places).map_err(failure_words)?;
     let mut book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
     let me = own_identity(places);
+    if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+        return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
+    }
     if let Some(what) = ask.host {
         let itself = |own: &str| {
             format!(
@@ -9409,7 +9519,13 @@ fn survey_fleet_in(
             }
         };
         raise_open_files();
+        if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+            return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
+        }
         let read = member::survey_one_by(&target_of(&peer), keys, (&secret, me.as_ref()), deadline);
+        if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+            return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
+        }
         // One dial alone: no other member's answer can say a no-route is its own.
         let mut row = peer_survey(
             &peer,
@@ -9464,15 +9580,27 @@ fn survey_fleet_in(
     });
     raise_open_files();
     let own = own_node(places);
+    if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+        return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
+    }
     let (reads, book_read) = member::read_whole(
         &book,
         &known.keys,
         own.as_deref(),
         (&secret, me.as_ref()),
         ask.within,
-        "survey",
+        query,
     );
-    let dropped = keep_book(places, &secret, (&reads, &book_read), own.as_deref());
+    if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
+        return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
+    }
+    let dropped = keep_book(
+        places,
+        &secret,
+        (&reads, &book_read),
+        own.as_deref(),
+        &traffic,
+    );
     // A place this machine's own node answered at is this machine, which its own survey reads.
     let (entries, answers): (Vec<Peer>, Vec<_>) = reads
         .into_iter()
@@ -9514,6 +9642,7 @@ fn survey_fleet_in(
             .skipped
             .into_iter()
             .map(|(entry, why)| aterm_ctl::PeerSurvey {
+                authenticated: None,
                 label: format!("[[fleet.peers]] {}", aterm_codec::tty::one_line(&entry, 40)),
                 answer: Err(format!("it is no host, so it was not asked: {why}")),
                 fault: aterm_ctl::PeerFault::NotDialled,
@@ -9641,6 +9770,16 @@ fn peer_survey(
 ) -> aterm_ctl::PeerSurvey {
     let name = shown_name(peer);
     aterm_ctl::PeerSurvey {
+        authenticated: read
+            .as_ref()
+            .ok()
+            .filter(|read| read.proven)
+            .and_then(|read| {
+                Some(aterm_ctl::AuthenticatedPeer {
+                    node: read.node.clone()?,
+                    key: *read.key?.bytes(),
+                })
+            }),
         label: match &read {
             Ok(surveyed) if surveyed.addr.ip().to_string() != peer.host => {
                 format!("{name} at {}", surveyed.addr.ip())
@@ -10075,6 +10214,8 @@ impl Edited {
 /// Why a write of `[fleet]` ([`write_fleet`]) takes the drive grants out at any level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ungrant {
+    /// No recorded take establishes which custody the old grants belong to.
+    UnknownCustody,
     /// They were granted in another fleet than the one written: named nodes of it, or every
     /// member of it (`"*"`).
     OtherFleet,
@@ -10109,6 +10250,10 @@ impl Ungrant {
         };
         let before = "the fleet this machine held before";
         match self {
+            Self::UnknownCustody => {
+                "no recorded fleet take establishes which vault these grants were made under"
+                    .to_owned()
+            }
             Self::OtherFleet => match (all, named) {
                 (true, 0) => format!("{they} admitted every member of {before}"),
                 (true, _) => {
@@ -10202,6 +10347,113 @@ fn write_fleet(
             )
         });
     Ok((out, gone))
+}
+
+/// `aterm fleet access [read|write|full] [--json]`: print or state this machine's fleet access
+/// ([`crate::fleet_access`]). A running window is told of a level stated ([`announcing`]).
+fn access(places: &Places, args: &[String]) -> Result<String, Failure> {
+    let session = std::env::var("ATERM_SESSION_ID").ok();
+    access_from(places, args, session.as_deref()).map(|(report, _)| report)
+}
+
+/// [`access`] asked from `session` (`$ATERM_SESSION_ID`), with whether the level in force
+/// changed; it posts nothing. A level named is written even where it is the one in force: it is
+/// this machine's statement now, and a raise the menu-bar lock had pending is not written over
+/// it. A raise is refused inside a worker another fleet Mac started here
+/// ([`crate::fleet_access::fleet_started`]): a Mac's fleet access is its person's decision.
+/// Lowering is always allowed.
+fn access_from(
+    places: &Places,
+    args: &[String],
+    session: Option<&str>,
+) -> Result<(String, bool), Failure> {
+    use crate::fleet_access::{By, read, set};
+    use aterm_types::fleet_access::FleetAccess;
+    let mut json = false;
+    let mut asked = None;
+    for arg in args {
+        match (arg.as_str(), FleetAccess::from_word(arg)) {
+            ("--json", _) => json = true,
+            (_, Some(level)) if asked.is_none() => asked = Some(level),
+            _ => {
+                return Err(Failure::Usage(format!(
+                    "unexpected `{}` (aterm fleet access [read|write|full] [--json])",
+                    aterm_codec::tty::one_line(arg, 40)
+                )));
+            }
+        }
+    }
+    let now = read(&places.state);
+    let Some(level) = asked else {
+        let unread = now.unread.as_ref().map(ToString::to_string);
+        let report = if json {
+            aterm_json::json!({
+                "access": now.level.word(),
+                "label": now.level.label(),
+                "at": now.at,
+                "by": now.by.map(By::word),
+                "unread": unread,
+            })
+            .to_string()
+        } else if let Some(why) = unread {
+            format!(
+                "{} (the stored level is not usable: {why}; enforced as {})",
+                now.level.word(),
+                now.level.label()
+            )
+        } else {
+            let set = match (now.at, now.by) {
+                (Some(at), Some(by)) => format!(
+                    "set {} by {}",
+                    aterm_types::rfc3339::format_rfc3339(at),
+                    by.said()
+                ),
+                _ => "the default: no level is stored".to_owned(),
+            };
+            format!("{} — {} ({set})", now.level.word(), now.level.label())
+        };
+        return Ok((report, false));
+    };
+    if level > now.level
+        && let Some(sid) =
+            session.filter(|sid| crate::fleet_access::fleet_started(&places.state, sid))
+    {
+        return Err(failed(format!(
+            "this session ({}) is a worker another Mac of the fleet started here, and a Mac's \
+             fleet access is raised by its person: the lock in its menu bar, or `aterm fleet \
+             access {}` in a session of their own (it stays {}; lowering it is always allowed)",
+            aterm_codec::tty::one_line(sid, 40),
+            level.word(),
+            now.level.label()
+        )));
+    }
+    // The level in force already, and stored as it is read: stated again, and nothing changes.
+    let stored = now.level == level && now.unread.is_none();
+    let change = set(&places.state, level, By::Cli).map_err(|e| {
+        failed(format!(
+            "fleet access stays {}: {e}",
+            read(&places.state).level.label()
+        ))
+    })?;
+    let report = if json {
+        aterm_json::json!({
+            "access": change.to.word(),
+            "label": change.to.label(),
+            "from": change.from.word(),
+            "changed": !stored,
+        })
+        .to_string()
+    } else if stored {
+        format!("fleet access: {} (unchanged)", change.to.word())
+    } else {
+        format!(
+            "fleet access: {} → {} ({})",
+            change.from.word(),
+            change.to.word(),
+            change.to.label()
+        )
+    };
+    Ok((report, !stored))
 }
 
 fn census(places: &Places, args: &[String]) -> Result<String, Failure> {

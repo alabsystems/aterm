@@ -36,7 +36,7 @@ use super::app::{override_send_event, set_send_event_panic_info};
 use super::app_state::{ApplicationDelegate, HandlePendingUserEvents};
 use super::event::dummy_event;
 use super::monitor::{self, MonitorHandle};
-use super::observer::setup_control_flow_observers;
+use super::observer::{setup_control_flow_observers, RunLoop};
 use super::wake_queue;
 use super::window::WinitWindow;
 use crate::error::EventLoopError;
@@ -540,7 +540,18 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
                 Some(panic_info) => panic_info.set_panic(e),
                 None => aterm_objc::abort_on_unwind("stop_app_on_panic (event loop gone)"),
             }
-            let _ = mtm;
+            // LOCAL PATCH (aterm): inside AppKit's wait on a deferred quit's reply `-stop:` ends
+            // nothing (`terminate.rs`), so a panic there, in the loop's exit inside AppKit too,
+            // refuses that quit (NO, which ends the wait) and stops the loop `terminate:` then
+            // returns to as well, where `-run` returns and the panic resumes. The process goes
+            // without its shutdown, so macOS is not told the quit went: a logout under it is
+            // abandoned.
+            if super::terminate::refuse_unwinding() {
+                RunLoop::main(mtm).queue_closure(|| {
+                    // SAFETY: `app()` is the live shared `NSApplication`.
+                    unsafe { stop_app_immediately(app()) }
+                });
+            }
             // SAFETY: `app()` is the live shared `NSApplication`.
             unsafe { stop_app_immediately(app()) };
             None

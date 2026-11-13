@@ -12,6 +12,10 @@ pub const FLAG: &str = "--lab-window-guard";
 pub const MEMORY_FLAG: &str = "--lab-window-memory-guard";
 /// Fixed leaf beneath the actual account capacity directory, never an argv path.
 pub const LOCK_NAME: &str = "lab-window.lock";
+/// Private local-owner request for an actual retained guard description.
+pub const CUSTODY_VERB: &str = "lab-window-custody-v1";
+/// One descriptor accompanies this prefix, the request's fresh challenge, and a newline.
+pub const CUSTODY_PREFIX: &[u8] = b"aterm-lab-window-custody/1 ";
 
 /// An original memory description's lookup reference. These parsed values confer
 /// no reservation: the actual descriptor and original account record must agree.

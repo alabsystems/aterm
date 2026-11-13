@@ -11,9 +11,10 @@ use aterm_session::sink::SinkWriter;
 
 use super::super::AosWindow;
 use super::{
-    ECHO_PROOF_BOUND, Echo, EchoView, HOLD_CAP, KeyRoute, Press, PressRow, admit_key, echo_verdict,
-    next_site, typed_echo_cells, unseen_verdict,
+    ECHO_PROOF_BOUND, Echo, EchoRun, EchoView, HOLD_CAP, KeyRoute, Press, PressRow, admit_key,
+    echo_verdict, next_site, note_written, typed_echo_cells, unseen_verdict,
 };
+use crate::app_input::paste_order::WrittenEpoch;
 
 /// A terminal at a prompt with no shell integration, a recording attached, and the window's hold.
 struct Fixture {
@@ -57,7 +58,7 @@ impl Fixture {
             alt: self.t.is_alternate_screen(),
             display_offset: self.t.grid().display_offset(),
             print_seq: self.t.print_seq(),
-            epoch: self.sink.input_epoch(),
+            epoch: Some(self.sink.input_epoch()),
             at,
             row: PressRow::read(&self.t, next_site(&self.aos)),
         }
@@ -68,8 +69,21 @@ impl Fixture {
         self.admit_as(ch, press, false)
     }
 
-    /// Types `ch` as a raw key whose press saw `press`, under the person's grant when `covered`.
+    /// Types `ch` as a raw key whose press saw `press`, under the person's grant when `covered`,
+    /// its write landing as an inline one does, before the next press: the fixture writes nothing,
+    /// so it notes the epoch the press saw.
     fn admit_as(&mut self, ch: char, press: &Press, covered: bool) -> KeyRoute {
+        let route = self.admit_unwritten(ch, press, covered);
+        if route == KeyRoute::Hold {
+            let written = WrittenEpoch::default();
+            written.note(&self.sink);
+            note_written(&mut self.aos, written);
+        }
+        route
+    }
+
+    /// [`Self::admit_as`] with no write noted for the key.
+    fn admit_unwritten(&mut self, ch: char, press: &Press, covered: bool) -> KeyRoute {
         admit_key(
             &mut self.aos,
             &mut self.host,
@@ -368,6 +382,99 @@ fn a_run_continues_only_on_a_glyph_that_is_neither_a_blank_nor_a_mask() {
         let _ = f.type_raw("c", f.t0);
         f.t.process(b"cc");
         assert_eq!(f.verdict(f.t0), want, "'cc' continuing 'ab', {what}");
+    }
+}
+
+/// A key continues the key before it, or a hold the last proven run, only where that key's write
+/// was noted by the press and the press saw the epoch it ended at: the ordered writer writes a
+/// queued key after its press returned, so a write not landed by the next press, or input still
+/// queued at it, continues nothing, and a note that comes only after the press changes nothing.
+#[test]
+fn a_key_continues_a_run_only_once_the_key_before_it_was_written() {
+    for (what, noted_before, noted_after, queued, want) in [
+        (
+            "negative control: written before the next press",
+            true,
+            false,
+            false,
+            Echo::Release(2),
+        ),
+        ("never written", false, false, false, Echo::Pending),
+        (
+            "written only after the next press",
+            false,
+            true,
+            false,
+            Echo::Pending,
+        ),
+        (
+            "other input still queued at the next press",
+            true,
+            false,
+            true,
+            Echo::Pending,
+        ),
+    ] {
+        let mut f = Fixture::new(4);
+        f.t.process(b"ab");
+        let press = f.press_of(f.t0);
+        assert_eq!(f.admit_unwritten('c', &press, false), KeyRoute::Hold);
+        f.continue_run("ab");
+        let written = WrittenEpoch::default();
+        note_written(&mut f.aos, written.clone());
+        if noted_before {
+            written.note(&f.sink);
+        }
+        let mut press = f.press_of(f.t0);
+        if queued {
+            press.epoch = None;
+        }
+        assert_eq!(f.admit('c', &press), KeyRoute::Hold, "{what}");
+        if noted_after {
+            written.note(&f.sink);
+        }
+        f.t.process(b"cc");
+        assert_eq!(
+            f.verdict(f.t0),
+            want,
+            "'cc' continuing 'ab', the first {what}"
+        );
+    }
+
+    // The same where a hold opens at the end of the last proven run, 'ab'.
+    for (what, noted, queued, want) in [
+        (
+            "negative control: its last key written",
+            true,
+            false,
+            Echo::Release(1),
+        ),
+        ("its last key not written", false, false, Echo::Pending),
+        ("other input still queued", true, true, Echo::Pending),
+    ] {
+        let mut f = Fixture::new(4);
+        f.t.process(b"ab");
+        let written = WrittenEpoch::default();
+        if noted {
+            written.note(&f.sink);
+        }
+        let c = f.t.cursor();
+        f.aos.echo_run = Some(EchoRun {
+            session: SESSION,
+            row: c.row,
+            end: c.col,
+            coord_gen: f.t.content_scroll_state().coordinate_generation(),
+            alt: false,
+            epoch: Some(written),
+            tail: vec!['a', 'b'],
+        });
+        let mut press = f.press_of(f.t0);
+        if queued {
+            press.epoch = None;
+        }
+        assert_eq!(f.admit('c', &press), KeyRoute::Hold, "{what}");
+        f.t.process(b"c");
+        assert_eq!(f.verdict(f.t0), want, "'c' at the run's end, {what}");
     }
 }
 

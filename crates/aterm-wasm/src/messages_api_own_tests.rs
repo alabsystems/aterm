@@ -54,7 +54,7 @@ fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32,
 }
 
 fn wake_the_pet(t: &mut Host) -> bool {
-    t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+    t.set_cursor_glow(true, "rainbow", None, None, 260, 24, 0.7, 0.6, true);
     t.set_cursor_pet(true, 7);
     draw(t);
     for frame in 0..240u32 {

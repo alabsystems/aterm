@@ -6,11 +6,18 @@
 //! `<state>/.ubd/netplace-keeper.lock` on macOS, `<state>/netplace/keeper.lock` elsewhere. A
 //! process that did not get it waits for it in the kernel
 //! ([`aterm_uds::private_file::PrivateLock::wait_for`]): it spends nothing while another keeps
-//! the place and takes over the moment that keeper ends (ATERM-KI-1105-20). The keeper reads the facts, steps the place ([`crate::place::step`]) and
-//! writes the record only when it changed, waking on a route change, a path change, or its own
-//! semantic deadline or its bounded fact timer: [`MOVED_EVERY`] while a move settles, [`CHECKING_EVERY`] while the place is checking
-//! or back home with no member heard, [`STEADY_EVERY`] otherwise. Its thread runs at background
-//! QoS and never on a window's main or render thread.
+//! the place and takes over the moment that keeper ends (ATERM-KI-1105-20). The keeper reads
+//! the facts, steps the place ([`crate::place::step`]) and writes the record only when it
+//! changed. It waits on everything that can change its answer, and on no clock that looks for a
+//! change: a route change (the route socket), a path change (the path monitor's bell), a write
+//! to the place's files it reads (the evidence and the book, never the record it writes itself:
+//! [`crate::watch`], armed before the first read),
+//! its stop, and the semantic deadline the place itself carries (an internet answer going
+//! stale, a dwell, a confirmation due). Only a fact no event announces keeps a bounded look
+//! ([`next_look`]): the gateway's ARP entry, [`MOVED_EVERY`] while a move settles and
+//! [`UNWATCHED_EVERY`] while the network keeps only a weak id; and where the files could not be
+//! watched, or the record could not be written, [`UNWATCHED_EVERY`] too. Its thread runs at
+//! background QoS and never on a window's main or render thread.
 //!
 //! Every reporter calls [`read`]: the record, the evidence and the facts now, stepped with the
 //! same pure function, writing nothing. A reader whose keeper is gone, or whose record lags a
@@ -32,26 +39,32 @@ use crate::record::{self, Written};
 /// The keeper's lock file name.
 pub const LOCK: &str = "keeper.lock";
 
-/// The keeper's look while a move settles (the gateway's hardware address unread).
+/// The keeper's look while a move settles (the gateway's hardware address unread: no event
+/// announces an ARP entry, and [`crate::place::SETTLE_MS`] bounds the settle).
 pub const MOVED_EVERY: Duration = Duration::from_secs(2);
 
-/// The keeper's look while checking, or back on the ALab LAN with no member heard yet.
-pub const CHECKING_EVERY: Duration = Duration::from_secs(10);
+/// The keeper's bounded slow look at a fact nothing watches: the gateway's ARP entry while the
+/// network keeps only a weak id, and every file where the place's folder could not be watched
+/// (or the record could not be written, for the retry).
+pub const UNWATCHED_EVERY: Duration = Duration::from_secs(60);
 
-/// The keeper's look otherwise.
-pub const STEADY_EVERY: Duration = Duration::from_secs(60);
+/// The longest single wait: a keeper with no deadline and nothing unwatched sleeps this long,
+/// as good as forever, without overflowing an `Instant`.
+pub const REST: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// How long a reporter's cached observation or [`crate::routes::paced_now`] result stands.
 pub const CACHE_FOR: Duration = Duration::from_secs(2);
 
-/// How long the keeper waits before its next look after `place`.
+/// The keeper's bounded look after `place`, for a fact no event announces: `None` where every
+/// input is heard (`watched`: the place's files are watched) and only a semantic deadline, or a
+/// change, wakes it.
 #[must_use]
-pub fn next_look(place: &Place) -> Duration {
+pub fn next_look(place: &Place, watched: bool) -> Option<Duration> {
     match place.at {
-        Where::Checking(Checking::Moved) => MOVED_EVERY,
-        Where::Checking(_) => CHECKING_EVERY,
-        Where::AlabLan if place.heard == 0 => CHECKING_EVERY,
-        _ => STEADY_EVERY,
+        Where::Checking(Checking::Moved) => Some(MOVED_EVERY),
+        Where::Checking(Checking::Unidentified) => Some(UNWATCHED_EVERY),
+        _ if !watched => Some(UNWATCHED_EVERY),
+        _ => None,
     }
 }
 
@@ -59,15 +72,20 @@ struct Kept {
     written: Written,
     place: Place,
     next_change_ms: Option<u64>,
+    /// The record could not be written: the keeper tries again on [`UNWATCHED_EVERY`].
+    unwritten: bool,
 }
 
-/// Bounds semantic time by the cadence for facts that have no complete invalidation source.
-/// `now` is sampled after publication and logging, immediately before waiting.
-fn next_wait(place: &Place, next_change_ms: Option<u64>, now: u64) -> Duration {
-    let cap = next_look(place);
-    next_change_ms.map_or(cap, |at| {
-        Duration::from_millis(at.saturating_sub(now)).min(cap)
-    })
+/// How long the keeper waits: until the semantic deadline `next_change_ms` or the bounded `look`,
+/// whichever comes first, else [`REST`]. `now` is sampled after publication and logging,
+/// immediately before waiting.
+fn next_wait(look: Option<Duration>, next_change_ms: Option<u64>, now: u64) -> Duration {
+    let due = next_change_ms.map(|at| Duration::from_millis(at.saturating_sub(now)));
+    match (look, due) {
+        (Some(look), Some(due)) => look.min(due),
+        (Some(wait), None) | (None, Some(wait)) => wait.min(REST),
+        (None, None) => REST,
+    }
 }
 
 /// One keeper step in `dir` at `now`: `held` (the record as the keeper last wrote it) brought up
@@ -116,6 +134,7 @@ fn keep_once(dir: &Path, held: Written, facts: &Facts, now: u64, started_ms: u64
             written: held,
             place,
             next_change_ms,
+            unwritten: false,
         };
     }
     let written = Written {
@@ -130,22 +149,41 @@ fn keep_once(dir: &Path, held: Written, facts: &Facts, now: u64, started_ms: u64
             written,
             place,
             next_change_ms,
+            unwritten: false,
         },
         Err(e) => {
             aterm_log::warn!("network place: the record could not be written: {e}");
-            // The prospective record is not durable. Retry on the positive fact cadence;
-            // its speculative deadline must neither promote it nor cause a zero-wait loop.
+            // The prospective record is not durable. Retry on the bounded slow look; its
+            // speculative deadline must neither promote it nor cause a zero-wait loop.
             Kept {
                 written: held,
                 place,
                 next_change_ms: None,
+                unwritten: true,
             }
         }
     }
 }
 
-/// The keeper's loop while it holds the lock, until `stop`.
+/// Watches the place's files in `dir` that the keeper reads ([`crate::watch::Reads::Keeper`]) for
+/// `sense`'s waits: each write nudges the wait
+/// ([`StopWake::nudge`], latched). `None` where no watch arms: the keeper looks on
+/// [`UNWATCHED_EVERY`] instead.
+fn watch(dir: &Path, sense: &dyn Sense) -> Option<crate::watch::Watch> {
+    let wake = sense.stop_wake().ok()?;
+    crate::watch::place_files(dir, crate::watch::Reads::Keeper, move |_| wake.nudge())
+}
+
+/// The keeper's loop while it holds the lock, until `stop`. The watch of the place's files is
+/// armed before the first read: a write the keeper's first read missed is told by the watch's
+/// first look, and one made during any later read is latched for the wait after it.
 fn keep(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
+    let watched = watch(dir, sense);
+    #[cfg(unix)]
+    let walled = sense
+        .stop_wake()
+        .ok()
+        .and_then(|wake| crate::watch::wall(sense.wall(), move || wake.nudge()));
     let started_ms = crate::unix_ms_now();
     let mut held = record::read(dir).unwrap_or_default();
     let mut said: Option<(Where, Alab)> = None;
@@ -158,6 +196,7 @@ fn keep(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
             written,
             place,
             next_change_ms,
+            unwritten,
         } = keep_once(dir, held, &facts, now, started_ms);
         held = written;
         let now_said = (place.at, place.alab);
@@ -171,11 +210,16 @@ fn keep(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
         if let Some((since, kind)) = returned(&mut away, &place) {
             aterm_log::info!("{}", crate::words::back_line(since, kind, now));
         }
-        sense.wait(
-            next_wait(&place, next_change_ms, crate::unix_ms_now()),
-            stop,
-        );
+        let look = if unwritten {
+            Some(UNWATCHED_EVERY)
+        } else {
+            next_look(&place, watched.is_some())
+        };
+        sense.wait(next_wait(look, next_change_ms, crate::unix_ms_now()), stop);
     }
+    #[cfg(unix)]
+    drop(walled);
+    drop(watched);
 }
 
 /// Follows the ALab axis across the keeper's looks (`away`: since when and on what kind of
@@ -200,7 +244,7 @@ fn returned(
 }
 
 /// Sets this thread's QoS class to background (macOS).
-fn background() {
+pub(crate) fn background() {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: pthread_set_qos_class_self_np takes a class value and a relative priority and
@@ -408,12 +452,15 @@ fn candidate_loop(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
     }
 }
 
-/// THE READER: recomputes the place from historical memory, current `facts` and evidence at
-/// `now`, writing nothing. Only the caller's facts supply a current path reading. A recorded
-/// writer PID says nothing about whether its keeper thread or monitor still owns resources.
-/// This computation is always attributed to the reader, even when it continues a saved stay.
-#[must_use]
-pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
+/// What every reader steps: the record as written (its history), the evidence and the member
+/// book in the place's folder under `state`.
+fn reader_inputs(
+    state: &Path,
+) -> (
+    crate::place::Record,
+    crate::place::Evidence,
+    Option<crate::place::Book>,
+) {
     let dir = record::dir(state);
     let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
     let written = judged
@@ -430,7 +477,40 @@ pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
             crate::heard::read_book(&dir),
         ),
     };
-    step_owned(written.record, &facts, &evidence, book.as_ref(), now, None).1
+    (written.record, evidence, book)
+}
+
+/// THE READER: recomputes the place from historical memory, current `facts` and evidence at
+/// `now`, writing nothing. Only the caller's facts supply a current path reading. A recorded
+/// writer PID says nothing about whether its keeper thread or monitor still owns resources.
+/// This computation is always attributed to the reader, even when it continues a saved stay.
+#[must_use]
+pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
+    let (record, evidence, book) = reader_inputs(state);
+    step_owned(record, &facts, &evidence, book.as_ref(), now, None).1
+}
+
+/// [`read_with`] and the first later time at which the same inputs would read otherwise (an
+/// internet answer going stale, a dwell, a confirmation due: what the keeper waits for too),
+/// `None` with none representable: a reader that caches the place reads again then, as no file
+/// need change when only the time does. A deadline at `now` itself (the record the reader holds
+/// needs normalizing) is stepped through as the keeper does, never answered as a zero wait.
+#[must_use]
+pub fn read_projected_with(state: &Path, facts: Facts, now: u64) -> (Place, Option<u64>) {
+    let (record, evidence, book) = reader_inputs(state);
+    let mut projection =
+        step_with_deadline_owned(record, &facts, &evidence, book.as_ref(), now, None);
+    while projection.next_change_ms == Some(now) {
+        projection = step_with_deadline_owned(
+            projection.record,
+            &facts,
+            &evidence,
+            book.as_ref(),
+            now,
+            None,
+        );
+    }
+    (projection.place, projection.next_change_ms)
 }
 
 /// [`read_with`] over current reader facts (or their script), at this clock. A reader running
@@ -438,6 +518,12 @@ pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
 #[must_use]
 pub fn read(state: &Path) -> Place {
     read_with(state, crate::facts::reader_facts(), crate::unix_ms_now())
+}
+
+/// [`read_projected_with`] over current reader facts (or their script), at this clock.
+#[must_use]
+pub fn read_projected(state: &Path) -> (Place, Option<u64>) {
+    read_projected_with(state, crate::facts::reader_facts(), crate::unix_ms_now())
 }
 
 #[cfg(test)]

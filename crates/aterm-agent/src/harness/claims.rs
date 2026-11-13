@@ -812,11 +812,7 @@ pub(crate) type PoolHome = (String, LeaseKey, String);
 /// Each `cli` account `ai-pool.toml` under `home` names with a home Mac ([`PoolHome`]);
 /// none where the file cannot be read.
 fn pool_homes(home: &std::path::Path, cli: Cli) -> Vec<PoolHome> {
-    let path = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
-    let Some(text) = super::ai_pool::read_bounded_text(&path, 4 * 1024 * 1024) else {
-        return Vec::new();
-    };
-    let Ok(pool) = super::ai_pool::Pool::from_toml(&text, &path.display().to_string()) else {
+    let Some(pool) = super::ai_pool::read_under(home) else {
         return Vec::new();
     };
     pool.accounts_for_cli(cli)

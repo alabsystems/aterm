@@ -8,7 +8,7 @@ use super::*;
 #[test]
 fn neighbor_probe_still_gates_star_pixels_after_discarding_duplicate_row_storage() {
     let now = Instant::now();
-    let cfg = cfg_for_style_name("rainbow kitty", true);
+    let cfg = tall_rainbow_cfg();
     let geom = retina_geom();
     let mut glow = CursorGlow::default();
     let mut quads = Vec::new();
@@ -29,7 +29,7 @@ fn neighbor_probe_still_gates_star_pixels_after_discarding_duplicate_row_storage
 #[test]
 fn far_witness_row_fills_its_engine_slot_once_without_a_second_copy() {
     let now = Instant::now();
-    let cfg = cfg_for_style_name("rainbow kitty", true);
+    let cfg = tall_rainbow_cfg();
     let mut glow = CursorGlow::default();
     glow.tick(Some((3, 0)), now, &cfg, retina_geom(), &mut Vec::new());
     assert!(glow.v2.engaged());
@@ -73,7 +73,7 @@ fn far_witness_row_fills_its_engine_slot_once_without_a_second_copy() {
 #[test]
 fn full_ribbon_row_budget_keeps_pending_source_and_caret_samples() {
     let now = Instant::now();
-    let glow_cfg = cfg_for_style_name("rainbow kitty", true);
+    let glow_cfg = tall_rainbow_cfg();
     let cfg = rk::Config::from_glow(&glow_cfg, false);
     let geom = Geom {
         rows: 24,

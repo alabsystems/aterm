@@ -39,6 +39,8 @@ struct DoorHost {
     reread: Mutex<Option<OccupancyReading>>,
     /// The hung calls the host's facts reading names (`IdleHost::facts`); `None`, no reading.
     facts: Mutex<Option<Vec<crate::supervise::BackgroundCall>>>,
+    /// How many other live calls of the agent's the facts reading names (`FactsReading::waiting`).
+    waiting: Mutex<u32>,
     /// The held programs the host's facts reading names (`FactsReading::held`); `None`, the part
     /// unread. With either set the host answers a reading.
     held: Mutex<Option<Vec<crate::supervise::HeldCall>>>,
@@ -187,6 +189,7 @@ impl IdleHost for DoorHost {
         }
         let as_of_ms = *self.facts_at.lock().expect("facts_at");
         Some(crate::supervise::FactsReading {
+            waiting: *self.waiting.lock().expect("waiting"),
             as_of_ms,
             no_progress: calls.unwrap_or_default(),
             held: held.map(|programs| crate::supervise::HeldReading { as_of_ms, programs }),
@@ -343,6 +346,34 @@ impl Ctl for Logged<'_> {
 
     fn agent_act(&mut self, sid: &str) -> Act {
         self.m.agent_act(sid)
+    }
+
+    fn builtin_authority(&mut self, sid: &str) -> BuiltinAuthority {
+        self.m.builtin_authority(sid)
+    }
+
+    /// A typed write on a window's host (`Mock::hosted`): logged as every call is, the refused
+    /// one too.
+    fn call_for_duty(
+        &mut self,
+        duty: Scope,
+        revision: u64,
+        args: &[&str],
+    ) -> Option<Result<CtlReply, String>> {
+        let authority = self.m.hosted?;
+        if authority.revision() != Some(revision) || !authority.keeps(duty) {
+            let words: Vec<&str> = args
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with('@'))
+                .collect();
+            self.seen.push((words.join(" "), DoorRows::default()));
+            return Some(Ok(Mock::duty_denied()));
+        }
+        self.m.serving_duty = true;
+        let reply = self.call(args);
+        self.m.serving_duty = false;
+        Some(reply)
     }
 }
 

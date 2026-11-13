@@ -23,6 +23,6 @@
 ──────────────────────────────────────────────────
 ❯
 ──────────────────────────────────────────────────
-  week 63% used · resets Sat 10:00
+  week 37% left · resets Sat 10:00
   ⏵⏵ auto mode on (shift+tab to cycle)
                          Now using usage credits

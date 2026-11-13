@@ -543,7 +543,7 @@ mod live {
     }
 
     fn look(dir: &Path, mono_ms: u64) -> Observation {
-        observe(dir, mono_ms, now_us()).expect("the slots read")
+        observe(dir, Some(&dir.join("adopted")), mono_ms, now_us()).expect("the slots read")
     }
 
     fn birth(pid: u32) -> Option<u64> {
@@ -584,6 +584,19 @@ mod live {
             ticket_wait(&ticket, &facts, now_us()).map(|h| h.pid),
             Some(holding.pid())
         );
+        let original = std::fs::read(&ticket).unwrap();
+        let mut ticket_record: aterm_json::Value = aterm_json::from_slice(&original).unwrap();
+        ticket_record.as_object_mut().unwrap().insert(
+            "supervisor_pid".into(),
+            aterm_json::Value::from(std::process::id()),
+        );
+        std::fs::write(&ticket, aterm_json::to_vec(&ticket_record).unwrap()).unwrap();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()).map(|h| h.pid),
+            Some(holding.pid()),
+            "a ticket keeps its own descriptor-bound writer, not a slot's handoff identity"
+        );
+        std::fs::write(&ticket, original).unwrap();
         let saved = facts[0].fds.take();
         assert_eq!(
             ticket_wait(&ticket, &facts, now_us()),
@@ -1032,6 +1045,43 @@ mod live {
     }
 
     #[test]
+    fn a_worker_handoff_keeps_the_publishers_native_descriptor_identity() {
+        let dir = Arc::new(aterm_tempfile::tempdir().expect("scratch dir"));
+        let slot = dir.path().join("slot-0");
+        let mut publisher = Holding::start(&dir, &slot, false);
+        let mut record: aterm_json::Value =
+            aterm_json::from_str(&python_record(std::process::id(), dir.path(), now_us())).unwrap();
+        record.as_object_mut().unwrap().insert(
+            "supervisor_pid".into(),
+            aterm_json::Value::from(publisher.pid()),
+        );
+        std::fs::write(&slot, aterm_json::to_vec(&record).unwrap()).unwrap();
+        let mut book = SlotBook::default();
+        let _ = book.judge(look(dir.path(), 0), &BUSY, &mut never);
+        let read = book.judge(look(dir.path(), 1_000), &BUSY, &mut never);
+        let SlotsRead::Read { counts, holders } = read else {
+            panic!("{read:?}")
+        };
+        assert_eq!(counts.held, 1);
+        assert_eq!(
+            holders,
+            vec![Holder {
+                pid: publisher.pid(),
+                birth_us: birth(publisher.pid()).unwrap(),
+            }]
+        );
+        record.as_object_mut().unwrap().insert(
+            "supervisor_pid".into(),
+            aterm_json::Value::from("unread identity"),
+        );
+        assert_eq!(
+            Record::parse(&aterm_json::to_vec(&record).unwrap()),
+            RecordRead::Bad
+        );
+        publisher.end();
+    }
+
+    #[test]
     fn a_reused_pid_reads_free() {
         let me = std::process::id();
         let born = birth(me).expect("this process's birth");
@@ -1227,7 +1277,7 @@ mod live {
                 .expect("open as build-slot does")
         };
         let mut acquired = None;
-        observe_in(dir.path(), 0, now_us(), &mut |path| {
+        observe_in(dir.path(), Some(&dir.path().join("adopted")), 0, now_us(), &mut |path| {
             let acquirer = open(path);
             #[expect(
                 clippy::disallowed_methods,
@@ -1241,24 +1291,30 @@ mod live {
         .expect("the slots read");
         assert_eq!(acquired, Some(true), "the reader holds no lock");
         let mut blocked = None;
-        observe_in(dir.path(), 1_000, now_us(), &mut |path| {
-            let status = open(path);
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the test plays build-slot's `status`, which locks a free slot to see \
+        observe_in(
+            dir.path(),
+            Some(&dir.path().join("adopted")),
+            1_000,
+            now_us(),
+            &mut |path| {
+                let status = open(path);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the test plays build-slot's `status`, which locks a free slot to see \
                           it is free; it lets go by LOCK_UN below"
-            )]
-            let probed = status.try_lock();
-            probed.expect("the free slot");
-            let acquirer = open(path);
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the test plays build-slot's acquirer; it holds nothing to let go"
-            )]
-            let got = acquirer.try_lock();
-            blocked = Some(matches!(got, Err(std::fs::TryLockError::WouldBlock)));
-            status.unlock().expect("LOCK_UN");
-        })
+                )]
+                let probed = status.try_lock();
+                probed.expect("the free slot");
+                let acquirer = open(path);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the test plays build-slot's acquirer; it holds nothing to let go"
+                )]
+                let got = acquirer.try_lock();
+                blocked = Some(matches!(got, Err(std::fs::TryLockError::WouldBlock)));
+                status.unlock().expect("LOCK_UN");
+            },
+        )
         .expect("the slots read");
         assert_eq!(blocked, Some(true), "the control can fail");
         assert!(std::fs::symlink_metadata(dir.path().join("slot-1")).is_err());
@@ -1299,7 +1355,7 @@ mod live {
     fn a_reader_hands_back_its_reading_until_the_period_passes() {
         let dir = aterm_tempfile::tempdir().expect("scratch dir");
         let slots = dir.path().join("build-slot");
-        let mut reader = SlotReader::new(slots.clone());
+        let mut reader = SlotReader::new(slots.clone(), Some(slots.join("adopted")));
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         assert_eq!(reader.read_at(), None);
@@ -1349,7 +1405,7 @@ mod live {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         for (period, anew) in [(PERIOD, false), (REREAD, true)] {
-            let mut reader = SlotReader::new(slots.clone());
+            let mut reader = SlotReader::new(slots.clone(), Some(slots.join("adopted")));
             let first = reader.read_within(at(0), now_us(), &CALM, period);
             assert_eq!(counts_of(&first).n, 1, "{first:?}");
             std::fs::write(slots.join("slot-1"), b"").expect("a second slot");

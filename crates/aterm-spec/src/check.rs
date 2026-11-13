@@ -275,7 +275,7 @@ pub fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
 
 /// `work` over every item on every core, results in item order.
 pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let cores = aterm_cores::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     each_on(cores, items, work)
 }
 
@@ -350,29 +350,8 @@ pub(crate) fn each_after<T: Sync, R: Send>(
 }
 
 #[cfg(test)]
-mod worker_executor_tests {
-    use super::*;
-
-    #[test]
-    fn declined_auxiliaries_keep_every_item_and_nested_admission() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        let executor: Arc<WorkerExecutor> = Arc::new(move |worker, _, run| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            if worker == 0 {
-                run();
-            }
-        });
-        let answers = with_worker_executor(executor, || {
-            each_on(3, &[1, 2, 3], |value| {
-                each_on(2, &[*value, value + 1], |v| *v).iter().sum::<i32>()
-            })
-        });
-        assert_eq!(answers, [3, 5, 7]);
-        assert_eq!(calls.load(Ordering::SeqCst), 9);
-        assert!(WORKER_EXECUTOR.with_borrow(Option::is_none));
-    }
-}
+#[path = "check_worker_executor_tests.rs"]
+mod worker_executor_tests;
 
 /// aterm-spec-models, beside the running package under `crates/`: spec-check runs through
 /// `targo run -p aterm-models` (verify's spec row and every bundle's README), which names that

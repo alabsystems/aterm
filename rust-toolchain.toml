@@ -4,7 +4,9 @@
 #
 # Stock Rust remains only where Trust lacks a capability: cross targets with no
 # Trust std (the x86_64-apple-darwin compat slice, `verify cells`, the wasm32
-# lanes, the Windows cfg build, the cross cells of `aterm-libc-oracle regen`).
+# lanes, the Windows cfg build, the cross cells of `aterm-libc-oracle regen`),
+# and a native Windows build, for which no Trust toolchain is published yet: it
+# selects the stock pin with RUSTUP_TOOLCHAIN and leaves this file as it is.
 # Each is labelled `STOCK EXCEPTION` where it runs:
 # `git grep -n 'STOCK EXCEPTION'`. The public snapshot keeps this pin.
 [toolchain]

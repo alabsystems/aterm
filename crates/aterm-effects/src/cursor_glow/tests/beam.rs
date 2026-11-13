@@ -9,7 +9,6 @@ use super::*;
 fn beam_parses_to_its_own_style() {
     assert_eq!(GlowStyle::parse("beam"), GlowStyle::Beam);
     assert_eq!(GlowStyle::parse(" BEAM "), GlowStyle::Beam);
-    assert_eq!(GlowStyle::parse("lightbeam"), GlowStyle::Beam);
     assert_eq!(GlowStyle::parse("comet"), GlowStyle::Comet);
     assert_eq!(GlowStyle::parse("lumen"), GlowStyle::Lumen);
     assert_eq!(GlowStyle::parse("laser"), GlowStyle::Laser);

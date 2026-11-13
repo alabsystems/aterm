@@ -17,7 +17,9 @@
 //! its own place: the parent's handle names the child itself, its pid, its signals and its exit
 //! status. A Linux spawn whose child leads its own process group (below) runs so too, its signal
 //! set as well, through the running image itself (`/proc/self/exe`), which no file put at the
-//! executable's path since replaces (`route`). The watcher is a grandchild of the tether,
+//! executable's path since replaces (`route`; not for a process started through its dynamic
+//! loader, whose `/proc/self/exe` is the loader). On both, a routed spawn's tether reports the
+//! program's exec error back to the spawn (`STATUS_VAR`). The watcher is a grandchild of the tether,
 //! adopted by launchd (on Linux by init, or the nearest subreaper), watching the parent's end and
 //! the child's exit: on Darwin by a kqueue watch on the parent's exit and exec (`NOTE_EXIT`,
 //! `NOTE_EXEC`) and on the child's exit; on Linux by pidfds (Linux 5.3), one of the thread that
@@ -25,13 +27,15 @@
 //! (`THREAD_VAR`; `PIDFD_THREAD`, Linux 6.9; an older kernel watches the parent's own, readable
 //! at its exit alone), and one of the child. A Linux kernel with no pidfd, or a seccomp filter
 //! that refuses one, arms the watcher with nothing to watch, and the child is tied by its signal
-//! alone. A Linux `/proc` mounted with `hidepid` lists no group whole, so a watcher there could
-//! never tell its group had emptied: a spawn there routes nothing (`route`), nor does one of a
-//! process whose pid is 1, whose orphans it adopts itself. The watcher leads a session of its
-//! own, made before it arms, so a listing of the child's group (a stage sweep's), a kill of that
-//! group and a hangup of the child's terminal never count or reach it (a group leader's group
-//! holds the watcher's anchor, a zombie, as below, which Darwin's listing shows and Linux's passes
-//! by); it still ends with the child by its exit watch. When the parent exits, or execs in its own
+//! alone. The tether and its watcher read themselves and the parent by their pids in `/proc`, so
+//! where `/proc` is another pid namespace's a spawn routes nothing (`route`); before Linux 6.9 a
+//! watcher judges its group empty by listings of `/proc`, so nor does one where `/proc` lists no
+//! group whole (`hidepid`, no `ns_last_pid`), nor one of a process whose pid is 1, whose orphans
+//! it adopts itself. The watcher leads a session of its own, made before it arms, so a listing of the
+//! child's group (a stage sweep's), a kill of that group and a hangup of the child's terminal never
+//! count or reach it (a group leader's group holds the watcher's anchor where it has one, a zombie,
+//! as below, which Darwin's listing shows and Linux's passes by); it still ends with the child by
+//! its exit watch. When the parent exits, or execs in its own
 //! place (an update's cold lane) as Linux's spawners end at, the watcher ends the child through
 //! [`end_proven`] ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
 //! [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid still reads the
@@ -45,7 +49,9 @@
 //! (a spawn's `process_group(0)` or session) is a pipeline's root, whose descendants in that group
 //! would run on, adopted, once it alone ended. Its watcher holds the group by an anchor, a child
 //! of its own forked before it leaves the group, which exits at once and is never reaped, so the
-//! group id names the child's group and no other while the watcher lives (`group`). When the
+//! group id names the child's group and no other while the watcher lives (`group`); from Linux 6.9
+//! a Linux watcher holds it by the child's pidfd instead, by which the kernel signals and counts
+//! the group itself, never another group that reuses its number (`group::GroupPidfd`). When the
 //! parent exits or execs, the watcher ends the whole group, `SIGTERM` then `SIGKILL` rounds
 //! (`group::end_group`), then the child alone, as above, should it have left the group. When the
 //! child exits first, the watcher of a group leader stays while the group holds a live member,
@@ -53,9 +59,10 @@
 //! the watcher of any other child exits with it. Linux leaves a watcher for a group leader alone:
 //! any other tethered child there is tied by its signal alone. The tether execs the child only
 //! once the watcher is armed and the parent is still its own parent. An exec of the parent before
-//! the watcher armed ends nothing on Darwin; on Linux a forking thread gone by then leaves the
-//! watcher unarmed and the tether starts nothing, and a child with no watcher is tied from the
-//! moment it set its signal. A kill by the parent's name passes the watcher by.
+//! the watcher armed ends nothing on Darwin; on Linux from 6.9 a forking thread gone by then leaves
+//! the watcher unarmed and the tether starts nothing (before 6.9 the watcher arms on the parent's
+//! own pidfd and sees that exec only at the new image's exit), and a child with no watcher is tied
+//! from the moment it set its signal. A kill by the parent's name passes the watcher by.
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -302,12 +309,32 @@ impl<C: EndControl> EndControl for Versionless<'_, C> {
 /// The executable this process's tethered spawns run through ([`entry`], [`through`]).
 static THROUGH: OnceLock<Option<Through>> = OnceLock::new();
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "tether_image.rs"]
+mod image;
+
+#[cfg(target_os = "macos")]
+#[path = "tether_selected.rs"]
+mod selected;
+#[cfg(target_os = "macos")]
+pub use selected::SelectedExecutable;
+
 /// An executable recorded to run through, with its file as it was recorded.
 struct Through {
     /// Its path.
     exe: PathBuf,
     /// Its file's device and inode then; `None` when they did not read.
     file: Option<(u64, u64)>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    held: Option<std::fs::File>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    source: Option<image::Source>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    retained: OnceLock<image::Retained>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    ready: OnceLock<()>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    creating: std::sync::Mutex<()>,
     /// Whether it is this process's own image, as [`entry`] records it; a test's [`through`]
     /// names another.
     #[cfg(target_os = "linux")]
@@ -315,13 +342,82 @@ struct Through {
 }
 
 impl Through {
+    /// Record `exe` only when its opened regular file matches this process's loaded image.
+    #[cfg(unix)]
+    fn own(exe: PathBuf) -> Self {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let opened = (|| {
+            let image = crate::process::LoadedImage::read(i32::try_from(std::process::id()).ok()?)?;
+            // Bind the opened description to the kernel. Linux opens its own proc image;
+            // Darwin accepts a launch link only when its target is the loaded file.
+            // Nonblocking opens refuse a FIFO without waiting for a writer.
+            #[cfg(target_os = "linux")]
+            let source = Path::new("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let source = exe.as_path();
+            let held = crate::kept_out(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+                    .open(source)
+            })
+            .ok()?;
+            let meta = held.metadata().ok()?;
+            image
+                .matches_metadata(&meta)
+                .then_some((held, (meta.dev(), meta.ino())))
+        })();
+        let file = opened.as_ref().map(|(_, identity)| *identity);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let source = opened
+            .as_ref()
+            .and_then(|(held, _)| image::Source::read(held).ok());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let retained = {
+            let retained = OnceLock::new();
+            if let (Some(source), Some((held, _)), Some(name)) = (&source, &opened, exe.file_name())
+                && source.bundled()
+                && let Ok(copy) = source.retain(held, name)
+            {
+                let _ = retained.set(copy);
+            }
+            retained
+        };
+        Self {
+            exe,
+            file,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            held: opened.map(|(held, _)| held),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            source,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            retained,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            ready: OnceLock::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            creating: std::sync::Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            own: true,
+        }
+    }
+
     /// `exe`, another process's image, with the file at its path now.
-    #[cfg(any(unix, test, debug_assertions))]
+    #[cfg(any(test, debug_assertions))]
     fn of(exe: PathBuf) -> Self {
         let file = file_at(&exe);
         Self {
             exe,
             file,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            held: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            source: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            retained: OnceLock::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            ready: OnceLock::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            creating: std::sync::Mutex::new(()),
             #[cfg(target_os = "linux")]
             own: false,
         }
@@ -331,7 +427,75 @@ impl Through {
     fn unchanged(&self) -> Option<&Path> {
         (self.file.is_some() && file_at(&self.exe) == self.file).then_some(self.exe.as_path())
     }
+
+    fn available(&self) -> Option<&Path> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(retained) = self.retained.get() {
+            return retained.path();
+        }
+        // An owned image must be retained before a helper is prepared. Returning
+        // the original name would reintroduce replacement between lookup and spawn.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let original_usable = self.held.is_none();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let original_usable = true;
+        if original_usable && let Some(path) = self.unchanged() {
+            return Some(path);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let _guard = self.creating.lock().ok()?;
+            if let Some(retained) = self.retained.get() {
+                return retained.path();
+            }
+            let held = self.held.as_ref()?;
+            let retained = self
+                .source
+                .as_ref()?
+                .retain(held, self.exe.file_name()?)
+                .ok()?;
+            self.retained.set(retained).ok()?;
+            self.retained.get()?.path()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn prepared(&self) -> Result<Option<&Path>, String> {
+        let Some(path) = self.available() else {
+            return Ok(None);
+        };
+        // Explicit test hosts supply their own protocol. Owned frontends retain a
+        // code-matched copy; its loader and native assessment precede a bounded probe.
+        if self.held.is_none() || self.ready.get().is_some() {
+            return Ok(Some(path));
+        }
+        let _guard = self
+            .creating
+            .lock()
+            .map_err(|_| "tether helper preparation lock poisoned".to_string())?;
+        if self.ready.get().is_none() {
+            let mut command = crate::spawnfd::command(path);
+            command.arg(READY_VERB).process_group(0);
+            let output =
+                crate::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
+                    .map_err(|error| format!("tether helper did not prepare: {error}"))?;
+            if !output.status.success() || output.stdout != READY_LINE.as_bytes() {
+                return Err("tether helper returned no execution receipt".into());
+            }
+            let _ = self.ready.set(());
+        }
+        Ok(Some(path))
+    }
 }
+
+#[cfg(unix)]
+const READY_VERB: &str = "__tether_ready";
+#[cfg(unix)]
+const READY_LINE: &str = "aterm tether helper executed\n";
 
 /// The device and inode of the file at `path`.
 fn file_at(path: &Path) -> Option<(u64, u64)> {
@@ -350,7 +514,11 @@ fn file_at(path: &Path) -> Option<(u64, u64)> {
 /// Called in an executable's `main` before anything that starts a thread. Asked for [`VERB`], it
 /// serves it and answers the exit code. Otherwise it records this executable as the one this
 /// process's tethered spawns run through (on Linux, a group leader's: `route`), and answers
-/// `None`.
+/// `None`. The launch path must open the kernel's loaded image; an unavailable or mismatched
+/// file is recorded without an executable path to run through. On Linux it records none when
+/// `/proc/self/exe` is not the file this code runs from ([`runs_its_own_image`]): under its
+/// dynamic loader (`ld.so <program>`) the kernel's loaded image is the loader, which would read
+/// [`VERB`] as a program to load.
 #[must_use = "return a handled tether command's exit status to the caller"]
 pub fn entry() -> Option<ExitCode> {
     #[cfg(unix)]
@@ -359,31 +527,159 @@ pub fn entry() -> Option<ExitCode> {
         if args.next().is_some_and(|first| first == VERB) {
             return Some(serve(&args.collect::<Vec<_>>()));
         }
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|arg| arg == READY_VERB)
+        {
+            if std::env::args_os().len() != 2 {
+                return Some(ExitCode::FAILURE);
+            }
+            print!("{READY_LINE}");
+            return Some(ExitCode::SUCCESS);
+        }
         let _ = THROUGH.get_or_init(|| {
-            std::env::current_exe().ok().map(|exe| Through {
-                #[cfg(target_os = "linux")]
-                own: true,
-                ..Through::of(exe)
-            })
+            #[cfg(target_os = "linux")]
+            if !runs_its_own_image() {
+                return None;
+            }
+            std::env::current_exe().ok().map(Through::own)
         });
     }
     None
 }
 
-/// The executable a tethered spawn runs through: this process's own once its `main` called
-/// [`entry`], while the file at its path is still the one recorded then. `None` in a process
-/// whose `main` never did (a test binary's), and once an update or a rebuild put another file at
-/// that path, which may be a build from before [`VERB`] that reads the tether's words as a
-/// window's command line: tethered spawns then start the child untethered on Darwin.
+/// Whether `/proc/self/exe`, the image an exec of it runs, is the image this code runs from: the
+/// file mapped where the kernel put the program headers of the image it exec'd (`AT_PHDR` as the
+/// kernel saved it at the exec, `/proc/self/auxv`, which no loader rewrites) is the file mapped
+/// where this function runs. Both are read off `/proc/self/maps`, which names every mapping's file
+/// alike on any file system, where a `stat` of `/proc/self/exe` need not (btrfs gives each
+/// subvolume a device of its own, and an overlay before Linux 6.8 maps its lower file). Not so
+/// under an explicit loader (`ld.so <program>`): the kernel exec'd the loader, which mapped the
+/// program itself. `false` when either does not read.
+#[cfg(target_os = "linux")]
+fn runs_its_own_image() -> bool {
+    /// `AT_PHDR`: the program headers of the image the kernel exec'd.
+    const AT_PHDR: usize = 3;
+    let Some(headers) = kernel_aux(AT_PHDR) else {
+        return false;
+    };
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return false;
+    };
+    let file_at = |address| maps.lines().find_map(|line| maps_file_at(line, address));
+    let here = (runs_its_own_image as *const ()).addr();
+    matches!(
+        (file_at(headers), file_at(here)),
+        (Some(exec), Some(code)) if exec == code && exec.1 != 0
+    )
+}
+
+/// The value of entry `kind` of the auxiliary vector the kernel gave this process at its exec, as
+/// it saved it (`/proc/self/auxv`: pairs of native words).
+#[cfg(target_os = "linux")]
+fn kernel_aux(kind: usize) -> Option<usize> {
+    const WORD: usize = size_of::<usize>();
+    let auxv = std::fs::read("/proc/self/auxv").ok()?;
+    let (words, _) = auxv.as_chunks::<WORD>();
+    let (pairs, _) = words.as_chunks::<2>();
+    pairs.iter().find_map(|[key, value]| {
+        (usize::from_ne_bytes(*key) == kind).then(|| usize::from_ne_bytes(*value))
+    })
+}
+
+/// The file one `/proc/<pid>/maps` `line` maps, its device as the line names it and its inode
+/// (`0` for no file), when the line's range holds `address`.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn maps_file_at(line: &str, address: usize) -> Option<(&str, u64)> {
+    let mut fields = line.split_ascii_whitespace();
+    let (low, high) = fields.next()?.split_once('-')?;
+    let range = usize::from_str_radix(low, 16).ok()?..usize::from_str_radix(high, 16).ok()?;
+    if !range.contains(&address) {
+        return None;
+    }
+    let device = fields.nth(2)?;
+    Some((device, fields.next()?.parse().ok()?))
+}
+
+/// Tie this running process to its immediate parent, including its own group when it leads one.
+/// This arms the same parent-death watch as [`entry`] without requiring a preceding exec.
+/// Use [`hold_parent_of`] when the original parent was captured before spawning, so an
+/// adopter cannot replace it before this entry runs.
+/// The same platform conditions apply; on Linux the signal follows the thread that forked
+/// this process, so that thread must live while it owns this process.
+/// # Errors
+/// The parent has already exited, or the platform cannot arm its watch.
+/// # Safety
+/// Call before starting any other thread: the watcher's fork must inherit no locks held by
+/// another thread.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub unsafe fn hold_parent() -> Result<(), String> {
+    // SAFETY: getppid takes nothing and cannot fail. hold validates it again after arming.
+    let parent = unsafe { libc::getppid() };
+    // SAFETY: this function carries the same single-threaded entry obligation.
+    unsafe { hold_parent_of(parent) }
+}
+
+/// Tie this running process to the immediate parent captured by its caller before spawn.
+/// An adopter cannot replace that parent if the caller died before this entry ran.
+/// The relationship is checked before and after arming the native watch.
+/// # Errors
+/// `parent` is at most 1, is not this process's parent, has exited, or its watch cannot be armed.
+/// # Safety
+/// Call before starting any other thread: the watcher's fork must inherit no locks held by
+/// another thread.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub unsafe fn hold_parent_of(parent: i32) -> Result<(), String> {
+    if parent <= 1 || !parent_is(parent) {
+        return Err(not_parent(parent));
+    }
+    hold(parent)
+}
+
+/// The executable a tethered spawn runs through, once its `main` called [`entry`]. A macOS
+/// bundle-bound image uses a shared complete clone retained at startup, including before an
+/// update can replace the original name between lookup and spawn. A standalone image clones
+/// its held file before returning a helper path, even while the original is unchanged.
+/// A private image's CodeDirectory matches
+/// the kernel's loaded cdhash. Its distinct inode is helper code custody,
+/// not the running process's original file identity. The copy stays for this boot, including
+/// after parent death while macOS may still assess a child. Linux retains a byte-matched ELF
+/// from its kernel-bound description; its loaded inode is never a reusable parent proc path.
+/// `None` without a recorded image or
+/// when its retained copy cannot be provided; a Darwin spawn then starts untethered.
 #[must_use]
 pub fn executable() -> Option<&'static Path> {
-    THROUGH.get()?.as_ref()?.unchanged()
+    THROUGH.get()?.as_ref()?.available()
+}
+
+/// Prepare the helper before constructing a probe with its own execution budget.
+/// macOS and Linux retained copies must execute their early entry once in this process's
+/// preparation, proving their loader context before a separate queried-program budget.
+/// The one-minute preparation hang detector preserves an unproved copy on failure.
+/// Other platforms use [`executable`] without an extra execution.
+///
+/// # Errors
+/// Helper preparation's lock, spawn or I/O fails, it hangs, or the child returns no
+/// successful execution receipt.
+pub fn prepared_executable() -> Result<Option<&'static Path>, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        THROUGH
+            .get()
+            .and_then(Option::as_ref)
+            .map(Through::prepared)
+            .unwrap_or(Ok(None))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(executable())
+    }
 }
 
 /// Whether this process's tethered spawns have lost their tie: its `main` served the tether
 /// ([`entry`]), or a test named an executable ([`through`]), but no unchanged executable is
-/// recorded now (an update or a rebuild put another file at its path, or none read when it was
-/// recorded), so on Darwin a tethered spawn starts its child untethered. `false` where nothing
+/// available now (neither its original file nor a code-matched retained image can be provided),
+/// so on Darwin a tethered spawn starts its child untethered. `false` where nothing
 /// was recorded (a test binary's own spawns), and off Darwin, whose tie needs no executable: the
 /// parent-death signal, and a Linux group leader's tether run through the running image itself
 /// (`route`).
@@ -394,7 +690,29 @@ pub fn lost() -> bool {
 
 /// [`lost`] for what was `recorded`, on Darwin.
 fn lost_of(recorded: Option<&Option<Through>>) -> bool {
-    recorded.is_some_and(|recorded| recorded.as_ref().and_then(Through::unchanged).is_none())
+    recorded.is_some_and(|recorded| recorded.as_ref().and_then(Through::available).is_none())
+}
+
+/// TEST SEAM: choose the private retained-image cache of a Cargo-named native fixture.
+/// # Errors
+/// This is not a test binary, the path is relative, or a cache was already selected.
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    any(test, debug_assertions)
+))]
+pub fn image_cache_for_tests(root: PathBuf) -> std::io::Result<()> {
+    image::test_root(root)
+}
+
+/// TEST SEAM: run retained-image cleanup before a fixture's first execution receipt.
+/// # Errors
+/// No test cache was selected, the boot identity is unavailable, or cleanup failed.
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    any(test, debug_assertions)
+))]
+pub fn image_cleanup_for_tests() -> std::io::Result<()> {
+    image::test_sweep()
 }
 
 /// TEST SEAM: this process's tethered spawns run through `exe`, an executable whose `main` calls
@@ -409,11 +727,16 @@ pub fn through(exe: PathBuf) {
 /// [`executable`]; on Linux, once this process's `main` served [`entry`], its running image itself
 /// (`/proc/self/exe`), which an update's or a rebuild's file at the executable's path does not
 /// replace, so such a tie is never lost there. `None` when this process records no executable to
-/// run through, on Linux where `/proc` hides processes (`hidepid`), and in a process whose pid is
-/// 1 (a container's first process, or a PID namespace's), a parent no tether takes
-/// ([`parent_pid`]), since its orphans are adopted by it: the child is then tied by Linux's signal
-/// alone, and starts untethered on Darwin. The spawn judges the program's search first
-/// (`spawnfd::program_search::findable`), since the tether runs it only after the spawn returned.
+/// run through (its `main` never called [`entry`], or ran under an explicit loader), in a process
+/// whose pid is 1 (a container's first process, or a PID namespace's), a parent no tether takes
+/// ([`parent_pid`]), since its orphans are adopted by it, and on Linux where `/proc` is another
+/// pid namespace's (`unshare --pid` with no `--mount-proc`), whose numbers the tether's reads of
+/// itself and of the parent would take for strangers', or where the watcher could never tell its
+/// group had emptied: a kernel that signals no group by pidfd (before 6.9,
+/// [`signals_groups_by_pidfd`]) whose listing of a group cannot be whole
+/// (`process::group_listing_can_be_whole`: a `/proc` that hides processes, no `ns_last_pid`). The child is then tied by Linux's signal alone, and starts
+/// untethered on Darwin. The tether reports its exec's error back on the spawn's exec status
+/// ([`STATUS_VAR`]), since it runs the program only after the spawn started it.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(crate) fn route(
     program: &std::ffi::OsStr,
@@ -429,10 +752,13 @@ pub(crate) fn route(
     } else {
         executable()?.to_path_buf()
     };
-    // A `/proc` that hides processes lists no group whole, so the watcher could never tell the
-    // group had emptied (`group::linger`).
+    // The tether and its watcher read themselves, the parent and its forking thread by their
+    // pids in `/proc`, which must be this pid namespace's on every kernel; a watcher with no
+    // pidfd scope for its group judges it empty by whole listings alone (`group::linger`).
     #[cfg(target_os = "linux")]
-    if !crate::process::group_listing_can_be_whole() {
+    if !crate::process::proc_is_this_namespaces()
+        || (!signals_groups_by_pidfd() && !crate::process::group_listing_can_be_whole())
+    {
         return None;
     }
     #[cfg(target_vendor = "apple")]
@@ -457,6 +783,10 @@ fn serve(rest: &[OsString]) -> ExitCode {
         eprintln!("aterm: {VERB}: {parent:?} is not a parent pid");
         return ExitCode::from(UNTETHERED);
     };
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    let status = exec_status();
+    #[cfg(target_vendor = "apple")]
+    let own_path = std::env::var_os(OWN_PATH_VAR).is_some();
     if let Err(why) = hold(parent) {
         eprintln!(
             "aterm: {} was not started: {why}",
@@ -464,16 +794,31 @@ fn serve(rest: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(UNTETHERED);
     }
-    // The spawn judged the search by the `PATH` it gave this tether
-    // (`spawnfd::program_search::findable`), so the exec searches it as a `PATH` a spawn sets: on
-    // Darwin not as this process's own, whose search ends at an entry too long to join to the name.
-    // This tether holds the descriptors its spawn handed it and no others (every one it inherits
-    // for a transparent spawn, stdio alone otherwise), so the exec hands them on as they are.
+    // The exec searches the `PATH` the spawn gave this tether as its spawn would have searched
+    // it: as a `PATH` a spawn sets, which on Darwin passes over an entry too long to join to the
+    // name, unless the spawn left the child this process's own (Darwin's [`OWN_PATH_VAR`]), whose
+    // search ends there. This tether holds the descriptors its spawn handed it and no others
+    // (every one it inherits for a transparent spawn, stdio alone otherwise, and its exec status,
+    // close-on-exec), so the exec hands them on as they are.
     let mut command = crate::spawnfd::transparent(program).into_command();
-    // The forking thread's id is the watcher's to read ([`THREAD_VAR`]), never the program's.
+    // The forking thread's id, the exec status and the search's rule are the tether's to read
+    // ([`THREAD_VAR`], [`STATUS_VAR`], [`OWN_PATH_VAR`]), never the program's, as the test's
+    // listing seam is.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    command.env_remove(STATUS_VAR);
     #[cfg(target_os = "linux")]
     command.env_remove(THREAD_VAR);
-    if let Some(path) = std::env::var_os("PATH") {
+    #[cfg(target_vendor = "apple")]
+    command.env_remove(OWN_PATH_VAR);
+    #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+    command.env_remove(BY_LISTING_VAR);
+    #[cfg(all(target_vendor = "apple", any(test, debug_assertions)))]
+    command.env_remove(NO_LISTING_VAR);
+    #[cfg(target_vendor = "apple")]
+    let set_path = !own_path;
+    #[cfg(not(target_vendor = "apple"))]
+    let set_path = true;
+    if set_path && let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
     command.arg0(argv0).args(args);
@@ -484,8 +829,57 @@ fn serve(rest: &[OsString]) -> ExitCode {
         Ok(never) => match never {},
         Err(error) => error,
     };
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    if let Some(status) = status
+        && let Some(errno) = error.raw_os_error()
+    {
+        // The spawn returns this error and reaps this tether, which says nothing more.
+        let _ = std::io::Write::write_all(&mut std::fs::File::from(status), &errno.to_ne_bytes());
+        return ExitCode::from(NOT_RUN);
+    }
     eprintln!("aterm: {}: {error}", Path::new(program).display());
     ExitCode::from(NOT_RUN)
+}
+
+/// The variable a tethered spawn that runs through its tether ([`route`]) names its exec
+/// status by: the number of a pipe's write end the tether holds, close-on-exec once the tether
+/// took it ([`exec_status`]), so the program's exec closes it; an exec that fails writes its
+/// `errno` there (four bytes, native order) first. The spawn reads it to its end and fails with
+/// that error, as a spawn of the program itself would fail with its own exec's, before it returns
+/// ([`spawnfd::Command`](crate::spawnfd::Command)'s spawn).
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub(crate) const STATUS_VAR: &str = "ATERM_TETHER_STATUS";
+
+/// The variable a Darwin routed spawn sets (to `1`) when its child's `PATH` is this process's own,
+/// which the spawn did not set, clear or remove: Darwin's search of that `PATH` ends at an entry
+/// too long to join to the name (`posix_spawnp`'s rule) where one a spawn set passes over it, so
+/// the tether's exec searches it so too ([`serve`]).
+#[cfg(target_vendor = "apple")]
+pub(crate) const OWN_PATH_VAR: &str = "ATERM_TETHER_OWN_PATH";
+
+/// The exec status [`STATUS_VAR`] names, made close-on-exec: `None` when it names none, a number
+/// below 3 (the spawn places it above stdio), or a descriptor this process does not hold as a
+/// pipe.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn exec_status() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    let fd: i32 = std::env::var(STATUS_VAR).ok()?.parse().ok()?;
+    if fd < 3 {
+        return None;
+    }
+    // SAFETY: `fstat` writes one live, zeroed stat; `fcntl` takes integers.
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0
+            || stat.st_mode & libc::S_IFMT != libc::S_IFIFO
+            || libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0
+        {
+            return None;
+        }
+        // A pipe this process holds at that number, which nothing else of it owns: its spawn
+        // handed it over for this alone.
+        Some(std::os::fd::OwnedFd::from_raw_fd(fd))
+    }
 }
 
 /// Parse an unsigned decimal parent pid greater than one.
@@ -842,7 +1236,8 @@ unsafe fn child_exit_notice(kq: i32, child: i32, patience: Duration) -> ChildExi
 }
 
 /// The watcher: a session of its own (`setsid`; one it cannot lead exits, unarmed, and the tether
-/// starts nothing), stdio on `/dev/null`, a kqueue watch on `parent`'s exit and exec and on the
+/// starts nothing), stdio on `/dev/null` and every other descriptor the tether held closed but
+/// `arming` ([`hold_nothing_but`]: a transparent spawn's, and the spawn's exec status), a kqueue watch on `parent`'s exit and exec and on the
 /// `watched` child's exit, the arming byte, then a wait. The child's exit ends it; the parent's
 /// exit or exec ends the child first, as [`end_once_run`] ends one, with the live reads and
 /// `kill(2)` ([`EndControlLive`]), the child's [`Proof`] read by [`read_lineage`] and
@@ -868,6 +1263,8 @@ unsafe fn watch(
     armed: i32,
 ) -> ! {
     const BLANK: libc::kevent = watch_of(0, 0);
+    // Closed with every other descriptor but `arming` ([`hold_nothing_but`]).
+    let _ = armed;
     let child = watched.pid;
     // SAFETY (whole body): the function's contract.
     unsafe {
@@ -889,13 +1286,12 @@ unsafe fn watch(
         if libc::setsid() < 0 {
             libc::_exit(1);
         }
-        libc::close(armed);
         for fd in 0..3 {
             libc::dup2(null, fd);
         }
-        if null > 2 {
-            libc::close(null);
-        }
+        // `null` and `armed` among them, and the spawn's exec status, whose end must come at the
+        // tether's exec.
+        hold_nothing_but(arming);
         let kq = libc::kqueue();
         if kq < 0 {
             libc::_exit(1);
@@ -1082,20 +1478,27 @@ fn child_exit_notice(exit: &std::os::fd::OwnedFd, patience: Duration) -> ChildEx
     }
 }
 
-/// The Linux watcher: Darwin's, pidfds in place of its kqueue. It holds a group leader's group by
-/// its anchor ([`anchored`]), leads a session of its own, takes [`NAME`] as its kernel name
-/// ([`KERNEL_NAME`]; Linux's `pkill` matches that name), puts stdio on `/dev/null`, opens a
-/// descriptor of the parent's end ([`parent_end`]) and a pidfd of the `watched` child, writes the
-/// arming byte, then waits. The parent's exit or exec ends a leader's group once the child reads
-/// started or exited ([`end_group_once_ready`]), then the child alone by its proof
-/// ([`end_once_run`]), with the live reads and `kill(2)`; the child's exit first leaves a
-/// leader's group watched while it holds a live member, and ends it should the parent end first
-/// (`group::linger`). A kernel with no pidfd (`ENOSYS`), or a seccomp filter that refuses one
-/// (`EPERM`), arms it with nothing to watch: it writes the byte and exits, and the child is tied
-/// by its parent-death signal alone. A forking thread gone by then, a parent already reaped, or a
-/// child whose pidfd does not open otherwise, leaves it unarmed. A parent that exited unreaped,
-/// watched by its own pidfd, arms it with its end already readable, so it ends the tether's group
-/// at once. Either way the tether starts nothing, as its parent check fails.
+/// The Linux watcher: Darwin's, pidfds in place of its kqueue. It puts stdio on `/dev/null` and
+/// closes every other descriptor the tether held but `arming` ([`hold_nothing_but`]: a
+/// transparent spawn's, and the spawn's exec status, whose end must come at the tether's exec),
+/// takes [`NAME`] as its kernel name ([`KERNEL_NAME`]; Linux's `pkill` matches that name), and
+/// opens a pidfd of the `watched` child while it still shares the child's group, so the number
+/// names the child or opens nothing: a group's number is not reused while a member, here the
+/// watcher, holds it, and the child waits on this arming. It holds a group leader's group by that
+/// pidfd where the kernel signals a group by one (Linux 6.9, `group::GroupPidfd`), else by its
+/// anchor ([`anchored`], `group::GroupLive`); then it leads a session of its own, opens a
+/// descriptor of the parent's end ([`parent_end`]), writes the arming byte, and waits. The
+/// parent's exit or exec ends a leader's group once the child reads started or exited
+/// ([`end_group_once_ready`]), then the child alone by its proof ([`end_once_run`]), with the live
+/// reads and `kill(2)`; the child's exit first leaves a leader's group watched while it holds a
+/// live member, and ends it should the parent end first (`group::linger`). A kernel with no pidfd
+/// (`ENOSYS`), or a seccomp filter that refuses one (`EPERM`), arms it with nothing to watch: it
+/// writes the byte and exits, and the child is tied by its parent-death signal alone. A child
+/// whose pidfd does not open otherwise, a parent already reaped, or from Linux 6.9 a forking
+/// thread gone by then, leaves it unarmed; before 6.9 it watches the parent's own pidfd, so an
+/// exec of the parent before it armed is seen only at the new image's exit. A parent that exited
+/// unreaped arms it with its end already readable, so it ends the tether's group at once. Either
+/// way the tether starts nothing, as its parent check fails.
 ///
 /// # Safety
 /// Only in a forked child of the tether, with `null`, `arming` and `armed` open, forked while the
@@ -1115,15 +1518,33 @@ unsafe fn watch(
     unsafe extern "C" {
         fn prctl(option: i32, ...) -> i32;
     }
+    let _ = armed;
     let child = watched.pid;
     // SAFETY (whole body): the function's contract; every pointer is to a live local or static.
     unsafe {
+        for fd in 0..3 {
+            libc::dup2(null, fd);
+        }
+        hold_nothing_but(arming);
+        prctl(PR_SET_NAME, KERNEL_NAME.as_ptr());
+        let exit = match pidfd_open(child, 0) {
+            Ok(exit) => exit,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
+                let armed = libc::write(arming, [1_u8].as_ptr().cast(), 1) == 1;
+                leave(None, i32::from(!armed));
+            }
+            Err(_) => leave(None, 1),
+        };
         // As on Darwin: the group held first, while the watcher is still in it, then out of the
         // child's group and session before it arms.
-        let anchor = if leads {
+        let by_pidfd =
+            leads && !listing_forced() && group::signal_by_pidfd(exit.as_raw_fd(), 0).is_ok();
+        // Whether a listing can show the group left with zombies alone (`group::GroupPidfd`).
+        let whole = by_pidfd && crate::process::group_listing_can_be_whole();
+        let anchor = if leads && !by_pidfd {
             match anchored() {
                 Some(anchor) => Some(anchor),
-                None => libc::_exit(1),
+                None => leave(None, 1),
             }
         } else {
             None
@@ -1131,32 +1552,36 @@ unsafe fn watch(
         if libc::setsid() < 0 {
             leave(anchor.as_ref(), 1);
         }
-        prctl(PR_SET_NAME, KERNEL_NAME.as_ptr());
-        libc::close(armed);
-        for fd in 0..3 {
-            libc::dup2(null, fd);
-        }
-        if null > 2 {
-            libc::close(null);
-        }
-        let (gone, exit) = match (parent_end(parent), pidfd_open(child, 0)) {
-            (Ok(gone), Ok(exit)) => (gone, exit),
-            (Err(e), _) | (_, Err(e))
-                if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) =>
-            {
+        let gone = match parent_end(parent) {
+            Ok(gone) => gone,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
                 let armed = libc::write(arming, [1_u8].as_ptr().cast(), 1) == 1;
                 leave(anchor.as_ref(), i32::from(!armed));
             }
-            _ => leave(anchor.as_ref(), 1),
+            Err(_) => leave(anchor.as_ref(), 1),
         };
         if libc::write(arming, [1_u8].as_ptr().cast(), 1) != 1 {
             leave(anchor.as_ref(), 1);
         }
         libc::close(arming);
-        let live = |anchor| group::GroupLive {
-            parent: gone.as_raw_fd(),
-            pgid: child,
-            anchor,
+        // The leader's group, as this watcher holds it; `None` for any other child.
+        let held = || {
+            if by_pidfd {
+                Some(group::Holding::Pidfd(group::GroupPidfd {
+                    parent: gone.as_raw_fd(),
+                    leader: exit.as_raw_fd(),
+                    pgid: child,
+                    whole,
+                }))
+            } else {
+                anchor.as_ref().map(|anchor| {
+                    group::Holding::Anchor(group::GroupLive {
+                        parent: gone.as_raw_fd(),
+                        pgid: child,
+                        anchor,
+                    })
+                })
+            }
         };
         loop {
             let mut fds = [gone.as_raw_fd(), exit.as_raw_fd()].map(|fd| libc::pollfd {
@@ -1179,14 +1604,14 @@ unsafe fn watch(
                     })
                 };
                 let mut control = crate::process::EndControlLive;
-                if let Some(anchor) = &anchor {
+                if let Some(mut group) = held() {
                     let _ended = end_group_once_ready(
                         watched,
                         fds[1].revents != 0,
                         &mut control,
                         proof,
                         |patience| child_exit_notice(&exit, patience),
-                        &mut live(anchor),
+                        &mut group,
                     );
                 }
                 let _ended = end_once_run(
@@ -1199,18 +1624,165 @@ unsafe fn watch(
                 leave(anchor.as_ref(), 0);
             }
             if fds[1].revents != 0 {
-                if let Some(anchor) = &anchor
-                    && group::linger(child, &mut live(anchor))
+                if let Some(mut group) = held()
+                    && group::linger(child, &mut group)
                 {
                     let _ended = group::end_group_guarded(
                         child,
                         crate::process::END_GRACE,
-                        &mut live(anchor),
+                        &mut group,
                         || group::Readiness::Exited,
                     );
                 }
                 leave(anchor.as_ref(), 0);
             }
+        }
+    }
+}
+
+/// TEST SEAM: the variable that has a Linux tether's watcher hold its group by its anchor and
+/// listings even where the kernel signals a group by pidfd, so a test on such a kernel runs the
+/// older kernels' mode too. The tether takes it out of the program's environment.
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+pub const BY_LISTING_VAR: &str = "ATERM_TETHER_BY_LISTING";
+
+/// Whether [`BY_LISTING_VAR`] asks for the anchor and listings; never in a release build.
+#[cfg(target_os = "linux")]
+fn listing_forced() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        std::env::var_os(BY_LISTING_VAR).is_some()
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Whether this kernel signals a process group by a pidfd (`PIDFD_SIGNAL_PROCESS_GROUP`, Linux
+/// 6.9), so a watcher holds its group by its child's pidfd with no listing: the scope known when
+/// signal `0` by this process's own pidfd answers, `0` for a group leader and `ESRCH` for any
+/// other process (no process's group is this one's pid), where an older kernel answers `EINVAL`.
+/// Read once.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn signals_groups_by_pidfd() -> bool {
+    use std::os::fd::AsRawFd as _;
+    static KNOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KNOWN.get_or_init(|| {
+        let own = i32::try_from(std::process::id())
+            .ok()
+            .map(|pid| pidfd_open(pid, 0));
+        let Some(Ok(own)) = own else {
+            return false;
+        };
+        match group::signal_by_pidfd(own.as_raw_fd(), 0) {
+            Ok(()) => true,
+            Err(e) => e.raw_os_error() == Some(libc::ESRCH),
+        }
+    })
+}
+
+/// Closes every descriptor from 3 up but `keep`: each one `proc_pidinfo(PROC_PIDLISTFDS)` lists,
+/// else, when the listing fails, every number below the bound on them
+/// ([`crate::spawnfd::descriptor_bound`], `kern.maxfilesperproc`), so the
+/// watcher never holds what it inherited (its spawn's exec status above all) for want of a list.
+/// For a forked child with one thread, which nothing else opens descriptors in.
+#[cfg(target_vendor = "apple")]
+fn hold_nothing_but(keep: i32) {
+    if let Some(listed) = listed_descriptors() {
+        for fd in listed {
+            if fd >= 3 && fd != keep {
+                // SAFETY: a number this process listed, which nothing else of this one-thread
+                // process owns.
+                unsafe { libc::close(fd) };
+            }
+        }
+        return;
+    }
+    let size = crate::spawnfd::descriptor_bound();
+    for fd in (3..size).filter(|&fd| fd != keep) {
+        // SAFETY: a number of this one-thread process's table; one not open is a harmless `EBADF`.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Every descriptor number this process holds, as `proc_pidinfo(PROC_PIDLISTFDS)` lists them:
+/// `None` when either call fails. Its seam forces the failure in a test and debug build
+/// ([`NO_LISTING_VAR`]).
+#[cfg(target_vendor = "apple")]
+fn listed_descriptors() -> Option<Vec<i32>> {
+    const ENTRY: usize = std::mem::size_of::<libc::proc_fdinfo>();
+    #[cfg(any(test, debug_assertions))]
+    if std::env::var_os(NO_LISTING_VAR).is_some() {
+        return None;
+    }
+    // SAFETY: `getpid` takes nothing and cannot fail.
+    let me = unsafe { libc::getpid() };
+    // SAFETY: a null buffer of no size asks for the size the listing needs, and touches no memory.
+    let need = unsafe { libc::proc_pidinfo(me, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let need = usize::try_from(need).ok().filter(|&need| need > 0)?;
+    // Room for what the call said and more: nothing opens a descriptor here meanwhile.
+    let mut listed = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        need / ENTRY + 8
+    ];
+    let room = i32::try_from(listed.len() * ENTRY).unwrap_or(i32::MAX);
+    // SAFETY: `listed` is a live buffer of `room` bytes the call fills with whole entries.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            me,
+            libc::PROC_PIDLISTFDS,
+            0,
+            listed.as_mut_ptr().cast(),
+            room,
+        )
+    };
+    let got = usize::try_from(got).ok().filter(|&got| got > 0)?;
+    Some(
+        listed[..(got / ENTRY).min(listed.len())]
+            .iter()
+            .map(|entry| entry.proc_fd)
+            .collect(),
+    )
+}
+
+/// TEST SEAM: the variable that has a test or debug build's Darwin watcher find its descriptor
+/// listing failed ([`listed_descriptors`]), so it closes every number below the bound instead. The tether
+/// takes it out of the program's environment.
+#[cfg(all(target_vendor = "apple", any(test, debug_assertions)))]
+pub const NO_LISTING_VAR: &str = "ATERM_TETHER_NO_FD_LISTING";
+
+/// Closes every descriptor from 3 up but `keep`: `close_range(2)` (Linux 5.9) over the two spans
+/// either side of it, else each number `/proc/self/fd` lists. For a forked child with one thread,
+/// which nothing else opens descriptors in.
+#[cfg(target_os = "linux")]
+fn hold_nothing_but(keep: i32) {
+    // The asm-generic, x86 and Arm number (MIPS offsets its tables; there a call that answers
+    // `ENOSYS` falls back to the listing below).
+    const SYS_CLOSE_RANGE: libc::c_long = 436;
+    let close_range = |low: i32, high: u32| {
+        // SAFETY: three integers; the kernel touches no memory of ours.
+        unsafe { libc::syscall(SYS_CLOSE_RANGE, low.unsigned_abs(), high, 0_u32) == 0 }
+    };
+    let below = keep <= 3 || close_range(3, keep.unsigned_abs() - 1);
+    if below && close_range(keep.saturating_add(1), u32::MAX) {
+        return;
+    }
+    let Ok(listed) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let fds: Vec<i32> = listed
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in fds {
+        if fd >= 3 && fd != keep {
+            // SAFETY: a number this process listed; one closed meanwhile (the listing's own) is a
+            // harmless `EBADF`.
+            unsafe { libc::close(fd) };
         }
     }
 }
@@ -1333,474 +1905,13 @@ pub(super) struct Anchor {
 mod group;
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::{Through, lost_of, parent_pid};
-    use std::ffi::OsStr;
-
-    #[test]
-    #[cfg(unix)]
-    fn an_anchor_requires_a_terminal_sigchld_for_the_actual_child() {
-        for code in [libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED] {
-            assert!(super::terminal_anchor_wait(42, libc::SIGCHLD, 42, code));
-        }
-        for code in [libc::CLD_STOPPED, libc::CLD_TRAPPED, libc::CLD_CONTINUED] {
-            assert!(!super::terminal_anchor_wait(42, libc::SIGCHLD, 42, code));
-        }
-        assert!(!super::terminal_anchor_wait(
-            42,
-            libc::SIGCHLD,
-            43,
-            libc::CLD_EXITED
-        ));
-        assert!(!super::terminal_anchor_wait(42, 0, 42, libc::CLD_EXITED));
-    }
-
-    #[test]
-    fn parent_pid_accepts_only_unsigned_pids_above_init() {
-        assert_eq!(parent_pid(OsStr::new("42")), Some(42));
-        assert_eq!(parent_pid(OsStr::new("1")), None);
-        assert_eq!(parent_pid(OsStr::new("0")), None);
-        assert_eq!(parent_pid(OsStr::new("+42")), None);
-        assert_eq!(parent_pid(OsStr::new("-42")), None);
-    }
-
-    #[test]
-    fn a_file_put_in_place_of_the_recorded_executable_is_not_run_through() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
-        let exe = dir.path().join("aterm");
-        std::fs::write(&exe, b"the build this process started from").expect("write");
-        let through = Through::of(exe.clone());
-        assert_eq!(
-            through.unchanged(),
-            Some(exe.as_path()),
-            "the recorded file"
-        );
-        let next = dir.path().join("aterm.next");
-        std::fs::write(&next, b"another build").expect("write");
-        std::fs::rename(&next, &exe).expect("rename over");
-        assert_eq!(through.unchanged(), None, "another file at its path");
-        std::fs::remove_file(&exe).expect("remove");
-        assert_eq!(through.unchanged(), None, "no file at its path");
-        assert_eq!(
-            Through::of(exe.clone()).unchanged(),
-            None,
-            "nothing recorded"
-        );
-    }
-
-    /// The tie is lost once the file recorded to run through was replaced, or none read when it
-    /// was recorded, and never where nothing was recorded: a test binary's own spawns, which were
-    /// never tied there.
-    #[test]
-    fn a_tie_is_lost_only_once_its_recorded_executable_was_replaced() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
-        let exe = dir.path().join("aterm");
-        std::fs::write(&exe, b"the build this process started from").expect("write");
-        assert!(!lost_of(None), "nothing recorded");
-        let recorded = Some(Through::of(exe.clone()));
-        assert!(!lost_of(Some(&recorded)), "the recorded file");
-        let next = dir.path().join("aterm.next");
-        std::fs::write(&next, b"an update's build").expect("write");
-        std::fs::rename(&next, &exe).expect("rename over");
-        assert!(lost_of(Some(&recorded)), "another file at its path");
-        assert!(lost_of(Some(&None)), "nothing read when it was recorded");
-    }
-}
+#[path = "tether_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod watcher_tests {
-    use super::{Proof, Watched, end_once_run, end_watched};
-    use crate::process::{Birth, EndControl, EndRefusal, Ended, Identity, Lineage};
-    use std::collections::VecDeque;
-    use std::time::Duration;
-
-    const SIGTERM: i32 = 15;
-    const SIGKILL: i32 = 9;
-    const PID: i32 = 4242;
-    const BIRTH: Birth = Birth(1_792_000_000_000_042);
-    const UNIQUE: u64 = 51_832_760;
-
-    /// The child as the tether read itself before it forked its watcher: on Apple its pid
-    /// version is the tether's own, which the exec of the child moves.
-    fn armed() -> Watched {
-        Watched::of(&Lineage {
-            identity: Identity {
-                pid: PID,
-                birth: BIRTH,
-                idversion: Some(7),
-            },
-            uniqueid: UNIQUE,
-            parent: 1,
-            pgid: 4200,
-            launcher_version: Some(3),
-            tty: None,
-        })
-    }
-
-    /// A read of the pid: its birth, and its pid version where the kernel keeps one.
-    const fn read(birth: Birth, idversion: Option<i32>) -> Option<Identity> {
-        Some(Identity {
-            pid: PID,
-            birth,
-            idversion,
-        })
-    }
-
-    /// An `EndControl` whose identity reads follow a script (`None` past it) and that logs each
-    /// signal; its naps take no time.
-    struct Script {
-        reads: VecDeque<Option<Identity>>,
-        signals: Vec<(i32, i32)>,
-    }
-
-    impl EndControl for Script {
-        fn identity(&mut self, _pid: i32) -> Option<Identity> {
-            self.reads.pop_front().flatten()
-        }
-        fn signal(&mut self, token: &Identity, sig: i32) -> std::io::Result<()> {
-            self.signals.push((token.pid, sig));
-            Ok(())
-        }
-        fn nap(&mut self, _pause: Duration) {}
-    }
-
-    /// One case: its name, the identity reads, the proof reads (`None` past the script), the
-    /// answer and the signals sent.
-    type Case = (
-        &'static str,
-        Vec<Option<Identity>>,
-        Vec<Option<Proof>>,
-        Result<Ended, EndRefusal>,
-        Vec<i32>,
-    );
-
-    const fn ended(killed: bool, gone: bool) -> Result<Ended, EndRefusal> {
-        Ok(Ended {
-            termed: true,
-            killed,
-            gone,
-        })
-    }
-
-    #[test]
-    fn the_watcher_ends_by_proof() {
-        let watched = armed();
-        assert_eq!(
-            watched.token(),
-            Identity {
-                pid: PID,
-                birth: BIRTH,
-                idversion: None
-            },
-            "the token is the pid and birth with no pid version"
-        );
-        let same = read(BIRTH, None);
-        let exec_d = read(BIRTH, Some(8));
-        let reborn = read(Birth(BIRTH.0 + 1), None);
-        let proven = Some(Proof {
-            uniqueid: UNIQUE,
-            ran: true,
-        });
-        let moved = Some(Proof {
-            uniqueid: UNIQUE + 1,
-            ran: true,
-        });
-        let held = Some(Proof {
-            uniqueid: UNIQUE,
-            ran: false,
-        });
-        let cases: [Case; 8] = [
-            (
-                "gone after the SIGTERM",
-                vec![same, same, None],
-                vec![proven],
-                ended(false, true),
-                vec![SIGTERM],
-            ),
-            (
-                "still there past the grace",
-                vec![same, same, same, same, same, None],
-                vec![proven, proven],
-                ended(true, true),
-                vec![SIGTERM, SIGKILL],
-            ),
-            (
-                "exec'd in place since the arming, its pid version moved",
-                vec![exec_d, exec_d, None],
-                vec![proven],
-                ended(false, true),
-                vec![SIGTERM],
-            ),
-            (
-                "its unique id moved before the SIGTERM (the control)",
-                vec![same, same],
-                vec![moved],
-                Err(EndRefusal::NotProven),
-                vec![],
-            ),
-            (
-                "its pid reused, another birth",
-                vec![reborn, reborn],
-                vec![proven],
-                Err(EndRefusal::Stale),
-                vec![],
-            ),
-            (
-                "held at macOS's program check, its thread not yet run",
-                vec![same, same],
-                vec![held],
-                Err(EndRefusal::NotProven),
-                vec![],
-            ),
-            (
-                "its proof does not read",
-                vec![same, same],
-                vec![None],
-                Err(EndRefusal::NotProven),
-                vec![],
-            ),
-            (
-                "its unique id moved before the SIGKILL",
-                vec![same, same, same, same],
-                vec![proven, moved],
-                ended(false, false),
-                vec![SIGTERM],
-            ),
-        ];
-        for (name, reads, proofs, want, signals) in cases {
-            let mut control = Script {
-                reads: reads.into(),
-                signals: Vec::new(),
-            };
-            let mut proofs = proofs.into_iter();
-            let out = end_watched(watched, Duration::ZERO, &mut control, |pid| {
-                assert_eq!(pid, PID, "{name}: the proof read is the child's");
-                proofs.next().flatten()
-            });
-            let sent: Vec<i32> = control.signals.iter().map(|&(_, sig)| sig).collect();
-            if signals.is_empty() {
-                assert!(sent.is_empty(), "{name}: no signal, sent {sent:?}");
-            }
-            assert_eq!(out, want, "{name}: sent {sent:?}");
-            assert_eq!(sent, signals, "{name}");
-            assert!(
-                control.signals.iter().all(|&(pid, _)| pid == PID),
-                "{name}: every signal went to the child's pid alone: {:?}",
-                control.signals
-            );
-        }
-    }
-
-    /// Once its parent is gone, a child held before its first instruction gets no signal and is
-    /// waited on until its thread has run, then ended by proof; one that exits while held gets
-    /// none at all, and one whose pid reads another birth is not waited on.
-    #[test]
-    fn a_held_child_is_ended_once_its_thread_has_run() {
-        let same = read(BIRTH, None);
-        let reborn = read(Birth(BIRTH.0 + 1), None);
-        let proven = Some(Proof {
-            uniqueid: UNIQUE,
-            ran: true,
-        });
-        let held = Some(Proof {
-            uniqueid: UNIQUE,
-            ran: false,
-        });
-        /// One run of `end_once_run` against a scripted child.
-        struct Case {
-            name: &'static str,
-            /// What each identity read of the child returns, in turn.
-            reads: Vec<Option<Identity>>,
-            /// What each proof read of the child returns, in turn.
-            proofs: Vec<Option<Proof>>,
-            /// The wait at which the child is seen to have exited.
-            exits_at_wait: usize,
-            /// What `end_once_run` returns.
-            want: Option<Result<Ended, EndRefusal>>,
-            /// The signals the child is sent.
-            signals: Vec<i32>,
-        }
-        let cases = [
-            Case {
-                name: "held for two reads, then run",
-                reads: vec![same, same, same, same, same, None],
-                proofs: vec![held, held, proven, proven],
-                exits_at_wait: usize::MAX,
-                want: Some(ended(false, true)),
-                signals: vec![SIGTERM],
-            },
-            Case {
-                name: "held, then exited",
-                reads: vec![same],
-                proofs: vec![held],
-                exits_at_wait: 1,
-                want: None,
-                signals: vec![],
-            },
-            Case {
-                name: "its pid reused, another birth",
-                reads: vec![reborn, reborn],
-                proofs: vec![],
-                exits_at_wait: usize::MAX,
-                want: Some(Err(EndRefusal::Stale)),
-                signals: vec![],
-            },
-        ];
-        for Case {
-            name,
-            reads,
-            proofs,
-            exits_at_wait,
-            want,
-            signals,
-        } in cases
-        {
-            let mut control = Script {
-                reads: reads.into(),
-                signals: Vec::new(),
-            };
-            let mut proofs = proofs.into_iter();
-            let mut waits = 0;
-            let out = end_once_run(
-                armed(),
-                Duration::ZERO,
-                &mut control,
-                |pid| {
-                    assert_eq!(pid, PID, "{name}: the proof read is the child's");
-                    proofs.next().flatten()
-                },
-                || {
-                    waits += 1;
-                    waits >= exits_at_wait
-                },
-            );
-            let sent: Vec<i32> = control.signals.iter().map(|&(_, sig)| sig).collect();
-            assert_eq!(out, want, "{name}: sent {sent:?} after {waits} waits");
-            assert_eq!(sent, signals, "{name}");
-        }
-    }
-}
+#[path = "tether_watcher_tests.rs"]
+mod watcher_tests;
 
 #[cfg(test)]
-mod spawner_tests {
-    use super::{SPAWNER, Spawners, spawned, start_thread};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::thread::{self, ThreadId};
-    use std::time::Duration;
-
-    /// The hang detector for a wait on what must happen.
-    const HANG: Duration = Duration::from_secs(60);
-
-    /// The thread a job ran on, and its name.
-    fn here() -> std::io::Result<(ThreadId, Option<String>)> {
-        let this = thread::current();
-        Ok((this.id(), this.name().map(str::to_owned)))
-    }
-
-    /// A spawn runs on a spawner, never on its caller. Calls made one after another, each from a
-    /// thread that ended before the next began, run on one spawner, which still runs a job after
-    /// every caller ended and after a job that panicked.
-    #[test]
-    fn a_spawner_outlives_its_callers_and_serves_the_next_call() {
-        static ONE_AFTER_ANOTHER: Spawners = Spawners::new(start_thread);
-        let ran: Vec<_> = (0..4)
-            .map(|_| {
-                thread::spawn(|| {
-                    let ran = ONE_AFTER_ANOTHER.run(here).expect("a spawner runs the job");
-                    assert_ne!(
-                        ran.0,
-                        thread::current().id(),
-                        "the job ran on a spawner, not on its caller"
-                    );
-                    ran
-                })
-                .join()
-                .expect("a caller")
-            })
-            .collect();
-        let panicked = ONE_AFTER_ANOTHER.run::<()>(|| panic!("a job that panics"));
-        assert!(panicked.is_err(), "a job that panicked answers an error");
-        let later = ONE_AFTER_ANOTHER
-            .run(here)
-            .expect("a spawner runs a job after its callers ended");
-        assert_eq!(later.1.as_deref(), Some(SPAWNER), "a spawner's name");
-        assert!(
-            ran.iter().all(|job| job.0 == later.0),
-            "one spawner for calls one after another, still running after every caller ended: \
-             {ran:?}, then {later:?}"
-        );
-        let process = spawned(here).expect("this process's spawners run a job");
-        assert_eq!(
-            process.1.as_deref(),
-            Some(SPAWNER),
-            "this process's spawner's name"
-        );
-    }
-
-    /// A call waits for no other call's fork: while one job holds the spawner an earlier call
-    /// left free, another call runs on a spawner of its own and answers.
-    #[test]
-    fn a_spawn_waits_for_no_other_spawns_fork() {
-        static BUSY: Spawners = Spawners::new(start_thread);
-        let earlier = BUSY.run(here).expect("an earlier job ran");
-        let (began, beginning) = mpsc::channel();
-        let (release, held) = mpsc::channel::<()>();
-        let first = thread::spawn(move || {
-            BUSY.run(move || {
-                let _ = began.send(());
-                let _ = held.recv();
-                here()
-            })
-        });
-        beginning.recv_timeout(HANG).expect("the first job began");
-        let (said, answer) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = said.send(BUSY.run(here));
-        });
-        let second = answer
-            .recv_timeout(HANG)
-            .expect("a spawn waits for no other spawn's fork")
-            .expect("the second job ran");
-        drop(release);
-        let first = first
-            .join()
-            .expect("the first caller")
-            .expect("the first job ran");
-        assert_eq!(first.0, earlier.0, "the first took the spawner left free");
-        assert_ne!(first.0, second.0, "the second ran on a spawner of its own");
-        assert_eq!(second.1.as_deref(), Some(SPAWNER), "a spawner's name");
-    }
-
-    /// When a spawner's thread cannot start, the call answers that error, runs nothing and lists
-    /// no spawner, and the next call starts one.
-    #[test]
-    fn a_spawner_that_cannot_start_runs_nothing_and_the_next_call_starts_one() {
-        static REFUSED: AtomicBool = AtomicBool::new(false);
-        fn refuse_once(
-            builder: thread::Builder,
-            body: Box<dyn FnOnce() + Send>,
-        ) -> std::io::Result<()> {
-            if REFUSED.swap(true, Ordering::SeqCst) {
-                start_thread(builder, body)
-            } else {
-                Err(std::io::Error::other("no thread"))
-            }
-        }
-        static REFUSING: Spawners = Spawners::new(refuse_once);
-        let ran = Arc::new(AtomicBool::new(false));
-        let job_ran = Arc::clone(&ran);
-        let refused = REFUSING
-            .run(move || {
-                job_ran.store(true, Ordering::SeqCst);
-                here()
-            })
-            .expect_err("a spawn whose spawner cannot start answers an error");
-        assert_eq!(refused.to_string(), "no thread", "the start's own error");
-        assert!(!ran.load(Ordering::SeqCst), "its job did not run");
-        assert!(REFUSING.take_free().is_none(), "no spawner is listed free");
-        let next = REFUSING.run(here).expect("the next call starts a spawner");
-        assert_eq!(next.1.as_deref(), Some(SPAWNER), "a spawner's name");
-    }
-}
+#[path = "tether_spawner_tests.rs"]
+mod spawner_tests;

@@ -101,7 +101,7 @@ impl App {
         }
         host.watched.insert(key, (document, path.clone()));
         if let Some(watch) = &host.watch {
-            watch.watch(key, path);
+            watch.watch_looked(key, path);
             return;
         }
         // The headless app has no event loop to wake, so it starts no watch.
@@ -117,7 +117,7 @@ impl App {
         match aterm_uds::file_watch::FileWatch::platform("aterm-document-watch", Box::new(notify)) {
             Ok(watch) => {
                 for (key, (_, path)) in &host.watched {
-                    watch.watch(*key, path.clone());
+                    watch.watch_looked(*key, path.clone());
                 }
                 host.watch = Some(watch);
             }

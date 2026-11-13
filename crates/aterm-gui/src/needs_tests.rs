@@ -912,6 +912,7 @@ fn every_reader_says_the_published_verdict() {
         let here = crate::survey::Here {
             host: None,
             instances: 1,
+            access: aterm_types::fleet_access::FleetAccess::ReadOnly,
             drive: false,
             facts: None,
         };

@@ -86,9 +86,12 @@ fn optional_progress_batches_keep_individual_stamps_and_skip_busy_external_sink(
     let holder = EventLog::open(&external)
         .unwrap()
         .sinks
-        .into_inner()
+        .lock()
         .unwrap()
         .external
+        .as_ref()
+        .unwrap()
+        .try_clone()
         .unwrap();
     aterm_uds::file_lock::lock_exclusive_until(&holder, Instant::now(), "busy").unwrap();
     emit_progress_batch(Some(&events), &raw);
@@ -124,9 +127,12 @@ fn independent_handles_and_hardlink_aliases_lock_the_actual_append_file() {
     let holder = EventLog::open(&path)
         .unwrap()
         .sinks
-        .into_inner()
+        .lock()
         .unwrap()
         .external
+        .as_ref()
+        .unwrap()
+        .try_clone()
         .unwrap();
     aterm_uds::file_lock::lock_exclusive_until(&holder, Instant::now(), "busy").unwrap();
     let holder = Arc::new(Mutex::new(Some(holder)));

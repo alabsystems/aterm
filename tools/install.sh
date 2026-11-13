@@ -3507,8 +3507,8 @@ linux_store_preflight() { # <store>
 # The installer replaces, and the uninstaller deletes, only what is aterm's.
 # These are the uninstaller's own tests, shared so the install path asks the
 # same questions of $DEST/aterm.app and $BIN_DIR/aterm and prints the same
-# SKIPPED line (docs/AUDIT-distribution-channel-2026-08-31.md). Defined above
-# the library guard so crates/aterm-update/tests/install_sh pins them.
+# SKIPPED line. Defined above the library guard so
+# crates/aterm-update/tests/install_sh pins them.
 
 # The one SKIPPED line both directions print for an entry that is not ours.
 ownership_skip() { # <path> <reason>
@@ -4924,7 +4924,7 @@ may_replace() { # <path>
 	return 1
 }
 
-# The plan's line for the one `aterm` on PATH, per bin_aterm_verdict — the same
+# The plan's lines for the CLI and its shell support, per bin_aterm_verdict — the same
 # question the install path asks (claim_bin_aterm), so --dry-run promises only what a
 # real run would do: link it, replace a pre-store file first, or leave a foreign one.
 bin_aterm_plan() { # <path> <store-dir>
@@ -4935,6 +4935,17 @@ bin_aterm_plan() { # <path> <store-dir>
 	pre-store) echo "install.sh: cli: would REPLACE $1 — a regular file from a pre-store install that answers as aterm — with the ONE symlink (bundle-backed, or a source build into $2), plus man pages/completions where writable" ;;
 	*) echo "install.sh: cli: $1 would be SKIPPED — ${verdict#foreign } (left exactly as it is; the command would be installed but not on PATH)" ;;
 	esac
+	local data="${XDG_DATA_HOME:-$HOME/.local/share}" cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+	echo "  man:      after a successful CLI install, its shell-setup installs pages where writable -> ${ATERM_MAN_DIR:-$HOME/.local/share/man}"
+	case "$verdict" in
+	absent | ours | pre-store)
+		echo "  complete: bash -> $data/bash-completion/completions; zsh -> $data/zsh/site-functions; fish -> $cfg/fish/completions (after a successful CLI install, where writable)"
+		;;
+	*) echo "  complete: skipped — $1 would not be this installer's" ;;
+	esac
+	if [[ "$(uname -s)" == Linux ]]; then
+		echo "  desktop:  after a successful CLI install, shell-setup writes $data/applications/aterm.desktop and icons below $data/icons/hicolor where writable"
+	fi
 }
 
 # The first installed bundle whose toolset can back the `aterm` symlink,

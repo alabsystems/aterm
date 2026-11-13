@@ -222,6 +222,8 @@ aterm-net = { workspace = true }
 aterm-mesh = { workspace = true }
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 # The signed fleet fixture reads a document and signature through the real release-asset
 # reader against loopback GitHub origins.
 agh-fake = { workspace = true }

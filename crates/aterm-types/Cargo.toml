@@ -23,6 +23,8 @@ dev-seams = []
 # a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
+# The same dependency-free product-version policy used by build stamps.
+aterm-stamp = { workspace = true }
 # Pure resource-accounting DTO/codec only; native channels and clients stay in
 # their owning host/client crates.
 trust-resource-controller = { workspace = true, default-features = false }
@@ -63,6 +65,8 @@ aterm-uds = { workspace = true }
 aterm-spec = { workspace = true }
 # The machine-number models `machine_name::model_tests` holds `settle`, `choose` and `check` to.
 aterm-models-swarm = { workspace = true }
+# The `CltEpisode` model `clt_mark::model_tests` holds the record of setup's password ask to.
+aterm-models-setup = { workspace = true }
 
 [lints]
 workspace = true

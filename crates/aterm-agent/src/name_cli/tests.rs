@@ -65,20 +65,68 @@ fn name_takes_json_or_help_and_refuses_every_other_word() {
     assert_eq!(parse(&args(&["--json"])), Ok(Mode::Show { json: true }));
     assert_eq!(parse(&args(&["--json", "-h"])), Ok(Mode::Help));
     assert_eq!(parse(&args(&["--help", "set"])), Ok(Mode::Help));
+    assert_eq!(parse(&args(&["sync"])), Ok(Mode::Sync { json: false }));
+    assert_eq!(
+        parse(&args(&["sync", "--json"])),
+        Ok(Mode::Sync { json: true })
+    );
+    assert_eq!(parse(&args(&["sync", "--help"])), Ok(Mode::Help));
     for refused in [
         &["--json", "--json"][..],
         &["set", "-1"],
         &["--jsonx"],
         &["json"],
+        &["sync", "85"],
+        &["sync", "--nick", "dog"],
+        &["sync", "--dry-run"],
+        &["sync", "--json", "--json"],
     ] {
         assert!(parse(&args(refused)).is_err(), "{refused:?}");
-        assert_eq!(main_entry(args(refused)), ExitCode::from(2), "{refused:?}");
+        assert_eq!(
+            main_entry(args(refused), || panic!("no sync for invalid arguments")),
+            ExitCode::from(2),
+            "{refused:?}"
+        );
     }
     assert!(
         parse(&[OsString::from_vec(vec![0xff])]).is_err(),
         "not UTF-8"
     );
-    assert_eq!(main_entry(args(&["--help"])), ExitCode::from(0));
+    assert_eq!(
+        main_entry(args(&["--help"]), || panic!("help changes no names")),
+        ExitCode::from(0)
+    );
+    let calls = Cell::new(0);
+    assert_eq!(
+        main_entry(args(&["sync", "--json"]), || {
+            calls.set(calls.get() + 1);
+            Ok(Some("macOS names match m85 Dog / m85-dog".into()))
+        }),
+        ExitCode::from(0)
+    );
+    assert_eq!(
+        calls.get(),
+        1,
+        "sync dispatches the saved-intent adapter once"
+    );
+    for result in [
+        Ok(None),
+        Err("existing authorization refused".into()),
+        Err("macOS retains a numeric collision alias".into()),
+    ] {
+        let (text, code) = super::sync_report(result, true);
+        assert_eq!(code, 1);
+        let report: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+        assert_eq!(report["status"].as_str(), Some("pending"));
+        assert!(
+            report["message"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty())
+        );
+    }
+    for result in [Ok(None), Err("existing authorization refused".into())] {
+        assert_eq!(main_entry(args(&["sync"]), || result), ExitCode::from(1));
+    }
 }
 
 #[test]
@@ -129,7 +177,11 @@ fn set_takes_a_number_and_optional_exact_nickname_with_preview_flags() {
         &["set", "m86", "--take"],
     ] {
         assert!(parse(&args(refused)).is_err(), "{refused:?}");
-        assert_eq!(main_entry(args(refused)), ExitCode::from(2), "{refused:?}");
+        assert_eq!(
+            main_entry(args(refused), || panic!("set parsing calls no sync")),
+            ExitCode::from(2),
+            "{refused:?}"
+        );
     }
 }
 
@@ -254,6 +306,7 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
     let me = node_identity(root.path()).expect("a node");
     let key = format!("{}\n", "ab".repeat(32));
     write_private(root.path(), KEY_FILE, key.as_bytes()).expect("writes a fleet key");
+    crate::fleet_vault::take_fixture(root.path(), Some(&vault(root.path()))).unwrap();
 
     let (json, _) = report(
         root.path(),
@@ -441,7 +494,11 @@ fn nick_takes_one_word_or_random_with_dry_run_and_json() {
         &["--json", "nick", "Heron"],
     ] {
         assert!(parse(&args(refused)).is_err(), "{refused:?}");
-        assert_eq!(main_entry(args(refused)), ExitCode::from(2), "{refused:?}");
+        assert_eq!(
+            main_entry(args(refused), || panic!("nick parsing calls no sync")),
+            ExitCode::from(2),
+            "{refused:?}"
+        );
     }
 }
 

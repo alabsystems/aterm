@@ -529,3 +529,77 @@ fn a_private_document_tab_is_neither_restored_nor_reopened() {
         );
     }
 }
+
+/// A DESK OF ONLY A PRIVATE DOCUMENT HOLDS NO UPDATE. No capture describes it, so a kept image's
+/// handoff had nothing to carry and the update waited until the tab closed, though a handoff from
+/// any other desk drops the same tab. A Recovery tab now stands in, and neither its path nor its
+/// text crosses. CONTROL: a quit keeps nothing, an ordinary document is carried as itself, and a
+/// tab beside it leaves the private one out as A17 does.
+#[test]
+fn a_handoff_with_nothing_else_stands_a_recovery_tab_in_for_a_private_document() {
+    use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView};
+    let wid = WindowId(0);
+    let lone = |private: bool| {
+        let f = fixture(private);
+        let mut app = App::headless_for_test();
+        let shell = app.focused_session_id(wid).unwrap();
+        let _ = opened(&mut app, &f);
+        assert!(app.close_session_tab_for_test(shell));
+        app.sync_window(wid);
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            1,
+            "PRECONDITION: it stands alone"
+        );
+        (app, f)
+    };
+
+    let (app, _f) = lone(true);
+    let layout = app.capture_handoff_layout();
+    assert_eq!(layout.windows.len(), 1);
+    let row = &layout.windows[0];
+    assert_eq!(row.active_item, Some(0));
+    assert!(!row.workers_in_front);
+    assert!(row.holds_no_terminal(), "a shell the person never had");
+    assert_eq!(row.restored_tabs.len(), 1);
+    let RestoredSplitTree::Leaf {
+        view: RestoredView::Placeholder(stand_in),
+    } = &row.restored_tabs[0].root
+    else {
+        panic!("{:?}", row.restored_tabs[0].root);
+    };
+    assert!(stand_in.reason.contains("private document"), "{stand_in:?}");
+    let wire = layout.to_toml().expect("it serializes");
+    assert!(
+        !wire.contains("private.noindex") && !wire.contains("address.txt"),
+        "no path crosses: {wire}"
+    );
+    assert_eq!(RestoreManifest::from_toml(&wire).as_ref(), Some(&layout));
+    assert!(!layout.is_empty(), "a sessionless target places it");
+    assert!(
+        app.capture_restore_manifest().is_empty(),
+        "CONTROL: a quit keeps nothing of it"
+    );
+
+    let (app, _f) = lone(false);
+    let RestoredSplitTree::Leaf {
+        view: RestoredView::Native(_),
+    } = &app.capture_handoff_layout().windows[0].restored_tabs[0].root
+    else {
+        panic!("CONTROL: an ordinary document is carried as itself");
+    };
+
+    let f = fixture(true);
+    let mut app = App::headless_for_test();
+    let _ = opened(&mut app, &f);
+    let layout = app.capture_handoff_layout();
+    assert!(
+        layout.windows[0].restored_tabs.iter().all(|tab| !matches!(
+            tab.root,
+            RestoredSplitTree::Leaf {
+                view: RestoredView::Placeholder(_)
+            }
+        )),
+        "CONTROL: a shell beside it needs no stand-in"
+    );
+}

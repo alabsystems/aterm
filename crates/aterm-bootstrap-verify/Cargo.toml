@@ -45,6 +45,8 @@ aterm-uds = { workspace = true }
 aterm-tempfile = { workspace = true }
 aterm-types = { workspace = true }
 aterm-json = { workspace = true }
+# aterm-cores: support.rs sizes its pools to the test's grant (`available_parallelism`).
+aterm-cores = { workspace = true }
 
 [lints]
 workspace = true

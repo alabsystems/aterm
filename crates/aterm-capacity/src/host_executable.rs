@@ -115,7 +115,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 fn unhex(text: &str) -> io::Result<Vec<u8>> {
-    if text.len() > 32768 || text.len() % 2 != 0 {
+    if text.len() > 32768 || !text.len().is_multiple_of(2) {
         return Err(refused("invalid bounded path hex"));
     }
     fn nibble(b: u8) -> io::Result<u8> {

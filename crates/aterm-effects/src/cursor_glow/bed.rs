@@ -1246,6 +1246,9 @@ pub(crate) struct BedScratch {
     /// A test's negative control: the page-matched rail's lights are laid at
     /// the least opacity whatever their colour's hue ([`PageMatched::hue_free`]).
     pub(crate) rail_hue_free: bool,
+    /// A test's negative control: a rail with no lane past a foot is laid as
+    /// a thread on its row's last pixel ([`RowFeet::threaded`]).
+    pub(crate) rail_threaded: bool,
     /// The last body ink solved under a lit page's letters
     /// ([`page_lit_body_ink`]): `(page, stop at full value, turn's bits, ink)`.
     /// The search is a few thousand OKLab steps, and a run's stops differ
@@ -1374,7 +1377,7 @@ const ROW_RAIL_SWELL_SHARE: f32 = 0.5;
 /// The depth of a rail laid in its own row's foot band
 /// ([`BedShape::row_rail`]), px.
 #[inline]
-const fn row_rail_depth(chf: f32) -> f32 {
+pub(crate) const fn row_rail_depth(chf: f32) -> f32 {
     (ROW_RAIL_CH * chf).floor().max(1.0)
 }
 /// How far an in-row rail keeps off a foot's cell past its own pitch, px
@@ -1397,20 +1400,27 @@ pub(crate) struct FootInk {
     /// its glyph.
     pub(crate) end: i32,
     /// The pixel row the ink under the cell and either side of it starts on; the row's bottom
-    /// where there is no row under it or the face does not place what it holds.
+    /// where the face does not place what it holds, and a row past the next where there is none.
     pub(crate) below: i32,
-    /// The most luminance a light in the ring round its ink may read, by the bar its own letter
-    /// keeps ([`foot_ring_light`](crate::cursor_glow::foot_ring_light)).
+    /// The columns the cell's ink lies in within the judge's ring of its row's foot band,
+    /// `[x0, x1)`, window px: empty where none of it does, the whole cell where the face does not
+    /// place its glyph ([`foot_ring`](crate::cursor_glow::foot_ring)).
+    pub(crate) ink: (i32, i32),
+    /// The most luminance a light in the ring round that ink may read, by the bar its own letter
+    /// keeps ([`foot_ring`](crate::cursor_glow::foot_ring)).
     pub(crate) light: f32,
 }
 
-/// Where a rail past a foot runs ([`part_round_feet`]): its first pixel row and depth, and in
-/// the ring of the foot's ink, the most luminance its letter leaves it.
+/// Where a rail past a foot runs ([`part_round_feet`]): its first pixel row and depth, whether
+/// that is the row's own foot band (no lane under the ink), and there, near the foot's ink, the
+/// most luminance its letter leaves it and the share of the way from that light to its own the
+/// rail keeps.
 #[derive(Clone, Copy)]
 struct FootLane {
     top: f32,
     depth: f32,
-    ring_light: Option<f32>,
+    in_band: bool,
+    ring: Option<(f32, f32)>,
 }
 
 /// The foot cells of one row a rail lies in the foot band of ([`part_round_feet`]).
@@ -1422,6 +1432,8 @@ pub(crate) struct RowFeet<'a> {
     pub(crate) y0: i32,
     /// The row's bottom, window px: the foot band's end.
     pub(crate) end: f32,
+    /// The effects' bottom, window px: no lane runs past it.
+    pub(crate) floor: f32,
     /// The foot band's depth, px.
     pub(crate) band: f32,
     /// The page and the shape whose saturation and dimming a stop keeps under a letter
@@ -1429,20 +1441,26 @@ pub(crate) struct RowFeet<'a> {
     /// laid matched to its page ([`BedScratch::rail_page`]), which adds its light to the page's:
     /// no ink stays at a letter's bar through that, so it lays no thread.
     pub(crate) letter_light: Option<(u32, BedShape)>,
+    /// A test's negative control: with no room past a foot, the lane is a thread on the row's
+    /// last pixel, as before the forward round's W9.
+    pub(crate) threaded: bool,
 }
 
 impl RowFeet<'_> {
     /// The lane a rail takes at `x`, past every foot cell of the row within `reach`.
     ///
     /// Under the ink and the judge's ring round it, and over the ink below and its ring, it keeps
-    /// its whole light and a pixel less than the band's depth; with no such room, on the row's last
-    /// pixel row, in the ring, so in the light its letter leaves. That row may hold the ink's own
-    /// foot: a descender reaching the cell's bottom is drawn over the thread, so the thread runs
-    /// behind it, and what the foot's ring reads is that same light. No glyph named, or a rail
+    /// its whole light and a pixel less than the band's depth. With no such room (on a grid's last
+    /// row, over the effects' floor) it keeps to the row's own foot band, over the ring of any ink
+    /// below, and only within `clear` px of a foot's ink in the band's ring ([`FootInk::ink`]),
+    /// easing out over `ease`, does it take the light that foot's letter leaves it: the ink is
+    /// drawn over it, and what that ink's ring reads is that light. No glyph named, or a rail
     /// matched to its page, has no lane.
     #[inline]
-    const fn lane(&self, x: f32, reach: f32) -> Option<FootLane> {
-        let (mut end, mut below, mut light) = (i32::MIN, i32::MAX, f32::INFINITY);
+    const fn lane(&self, x: f32, reach: f32, (clear, ease): (f32, f32)) -> Option<FootLane> {
+        let (mut end, mut below) = (i32::MIN, i32::MAX);
+        let (mut light, mut keep) = (f32::INFINITY, 1.0f32);
+        let inv_ease = 1.0 / ease.max(1.0);
         let mut i = 0;
         while i < self.ink.len() {
             let foot = self.ink[i];
@@ -1454,8 +1472,23 @@ impl RowFeet<'_> {
                 if foot.below < below {
                     below = foot.below;
                 }
-                if foot.light < light {
-                    light = foot.light;
+                let (x0, x1) = foot.ink;
+                if x0 < x1 {
+                    let d = (x0 as f32 - x).max(x - x1 as f32) - clear;
+                    let k = if d <= 0.0 {
+                        0.0
+                    } else {
+                        let k = (d * inv_ease).min(1.0);
+                        k * k * (3.0 - 2.0 * k)
+                    };
+                    if k < 1.0 {
+                        if k < keep {
+                            keep = k;
+                        }
+                        if foot.light < light {
+                            light = foot.light;
+                        }
+                    }
                 }
             }
         }
@@ -1464,7 +1497,7 @@ impl RowFeet<'_> {
         }
         let ring = crate::cursor_glow::LETTER_GUARD_RING as f32;
         let top = end as f32 + ring;
-        let room = below as f32 - ring - top;
+        let room = (below as f32 - ring).min(self.floor) - top;
         if room >= 1.0 {
             let most = if self.band > 2.0 {
                 self.band - 1.0
@@ -1474,17 +1507,33 @@ impl RowFeet<'_> {
             return Some(FootLane {
                 top,
                 depth: if room < most { room } else { most },
-                ring_light: None,
+                in_band: false,
+                ring: None,
             });
         }
-        if self.letter_light.is_some() {
-            return Some(FootLane {
-                top: self.end - 1.0,
-                depth: 1.0,
-                ring_light: Some(light),
-            });
+        if self.letter_light.is_none() {
+            return None;
         }
-        None
+        let band_top = if self.threaded {
+            self.end - 1.0
+        } else {
+            self.end - self.band
+        };
+        let over = below as f32 - ring;
+        let depth = (if over < self.end { over } else { self.end }) - band_top;
+        if depth < 1.0 {
+            return None;
+        }
+        Some(FootLane {
+            top: band_top,
+            depth,
+            in_band: true,
+            ring: if keep < 1.0 {
+                Some((light, keep))
+            } else {
+                None
+            },
+        })
     }
 }
 
@@ -1556,13 +1605,19 @@ pub(crate) fn carve_cell(feet: &mut Vec<(i32, i32, i32, i32)>, geom: Geom, (row,
 /// round each descender's cell, Beam's rail was dashes wherever it lay in its row, Phaser's and
 /// Comet's with it (the after-land lows' A5, `beam-dark-context.mid`, x244-268). Under the ink's
 /// ring it is whole, the ribbons' dip ([`crate::rainbow_kitty::ribbon::ROW_RAIL_DIP_GAP_PX`]), read
-/// by the frame's rasters, so a tall letter below does not stop it. With no room there (a grid's
-/// last row) it is a thread on the row's last pixel in the light its letter leaves: whole there, it
-/// took `q` from 12 to 3.03 on the reference dark and 4.33 to 1.27 on Solarized Dark. It runs on
-/// behind a foot whose ink reaches that pixel: kept to the pixel a glyph left free, the real face at
-/// 22 px left `q` a thread and cut the rail at `g` and `y`, and at 14 px at every descender. Only
-/// where the rail is matched to its page, or a swell has no fixed row to leave (`row` `None`), does
-/// the light go down to its share.
+/// by the frame's rasters, so a tall letter below does not stop it.
+///
+/// A RAIL WITH NO LANE KEEPS ITS BAND, DIMMED ONLY AT THE INK. With no room under the ink (a
+/// grid's last row) the rail stays in its band, and only within `clear` px of the foot's ink in
+/// the band's ring (from the frame's rasters) does it take the light that letter leaves: whole
+/// there, it took `q` from 12 to 3.03 on the reference dark and 4.33 to 1.27 on Solarized Dark.
+/// Laid as a thread on the row's last pixel in that light round the foot's whole cell, it read at
+/// 1x as a gap of two cells at each descender in the window (the forward round's W9: under `g`,
+/// a 26 px gap; between `y` and `g`, a dash): the band at the reference dark's `#0774a6`, the
+/// thread a pixel of `#073d57`. Where the letter leaves no light over the page (Solarized Dark's,
+/// a deep cell's) the rail parts round its ink instead, its light down to its share. Only where the
+/// rail is matched to its page, or a swell has no fixed row to leave (`row` `None`), does the light
+/// go down to its share everywhere.
 pub(crate) fn part_round_feet(
     verts: &mut Vec<RibbonVertex>,
     out: &mut Vec<RibbonVertex>,
@@ -1579,24 +1634,33 @@ pub(crate) fn part_round_feet(
             return v;
         }
         let lane = row.as_ref().and_then(|row| {
-            row.lane(v.x, clear + ease)
+            row.lane(v.x, clear + ease, (clear, ease))
                 .map(|lane| (lane, row.letter_light))
         });
         match lane {
             Some((lane, letter_light)) => {
-                // The ink ends over the rail's own top: nothing to leave. A thread is in the
-                // ring wherever it lies, a one-pixel band on that row included.
-                if lane.ring_light.is_some() || lane.top > v.spine - v.up {
+                // The ink ends over the rail's own top: nothing to leave. In its band the rail
+                // keeps over the ink below's ring, a one-pixel band on the row included.
+                if lane.in_band || lane.top > v.spine - v.up {
                     v.spine = lane.top + (v.spine - lane.top) * share;
                     v.up *= share;
                     v.dn = lane.depth + (v.dn - lane.depth) * share;
                     v.core_up *= share;
                     v.core_dn = lane.depth + (v.core_dn - lane.depth) * share;
-                    if let (Some(light), Some((page, shape))) = (lane.ring_light, letter_light) {
-                        let sat = shape.under_sat_for(v.color);
-                        let budget = dim_budget(light, page, shape.dim);
-                        let letter = dark_bed_ink(v.color, page, budget, sat);
-                        v.color = crate::effect_util::lerp_rgb(letter, v.color, share);
+                    if let (Some((light, keep)), Some((page, shape))) = (lane.ring, letter_light) {
+                        if light <= crate::color_math::relative_luminance(page) {
+                            // A letter that leaves the page no light leaves the rail none: laid
+                            // there at the page's luminance in its own hue, the judges' medians
+                            // of each channel round the stroke read the rail's blue and the
+                            // page's green, brighter than either, and Solarized Dark's
+                            // underlined `o` read 4.12 of its own 4.28 under Phaser's band.
+                            v.cov *= keep;
+                        } else {
+                            let sat = shape.under_sat_for(v.color);
+                            let budget = dim_budget(light, page, shape.dim);
+                            let letter = dark_bed_ink(v.color, page, budget, sat);
+                            v.color = crate::effect_util::lerp_rgb(letter, v.color, keep);
+                        }
                     }
                 }
             }
@@ -1733,6 +1797,7 @@ impl BedScratch {
         row_rail_swell_lifts: false,
         rail_page: None,
         rail_hue_free: false,
+        rail_threaded: false,
         lit_body: None,
         bar: None,
         shade_runs: Vec::new(),
@@ -2067,6 +2132,7 @@ pub(crate) fn lay_dark_bed(
         row_rail_swell_lifts,
         rail_page,
         rail_hue_free,
+        rail_threaded,
         lit_body: _,
         bar,
         shade_runs,
@@ -2077,7 +2143,7 @@ pub(crate) fn lay_dark_bed(
     let (foam_even, foam_head_cut, foam_bodiless) = (*foam_even, *foam_head_cut, *foam_bodiless);
     let (caret, rail_drop) = (*caret, *rail_drop);
     let (row_rail_off, row_rail_swell_lifts) = (*row_rail_off, *row_rail_swell_lifts);
-    let (rail_page, rail_hue_free) = (*rail_page, *rail_hue_free);
+    let (rail_page, rail_hue_free, rail_threaded) = (*rail_page, *rail_hue_free, *rail_threaded);
     #[inline]
     const fn bed_cell_of(
         x: f32,
@@ -2592,11 +2658,13 @@ pub(crate) fn lay_dark_bed(
                         ink: foot_ink,
                         y0: row_y0,
                         end: oyf + (row + 1) as f32 * chf,
+                        floor: oyf + geom.rows as f32 * chf,
                         band: row_rail,
                         letter_light: match rail_page {
                             Some(_) => None,
                             None => Some((page, shape)),
                         },
+                        threaded: rail_threaded,
                     };
                     part_round_feet(
                         verts,
@@ -3561,6 +3629,10 @@ impl CursorGlow {
         #[cfg(test)]
         {
             scratch.rail_hue_free = self.rail_hue_free;
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            scratch.rail_threaded = self.rail_threaded;
         }
         scratch.rail_page = if matched && self.night_grounded(cfg) {
             Some(cfg.theme_bg & 0x00FF_FFFF)

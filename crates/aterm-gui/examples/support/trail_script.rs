@@ -769,10 +769,10 @@ struct Config {
 }
 
 impl Config {
-    /// The owner's look: the rainbow kitty, its sounds on, motion full.
+    /// The shipped look: the rainbow, its sounds on, motion full.
     fn new() -> Self {
         Self {
-            style: "rainbow kitty".into(),
+            style: "rainbow".into(),
             pet: None,
             words: None,
             profanity: None,

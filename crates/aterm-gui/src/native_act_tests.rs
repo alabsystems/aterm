@@ -106,6 +106,7 @@ struct Facts {
     prepare_journal_panic: AtomicBool,
     prepare_journal_gate: Option<PublicationGate>,
     grant_journal_allowed: AtomicBool,
+    grant_journal_panic: AtomicBool,
     grant_journal_gate: Option<PublicationGate>,
     grant_journal_calls: AtomicU32,
     sealed_history: Mutex<Vec<(Prepare, Binding)>>,
@@ -141,7 +142,6 @@ struct Facts {
     physical_target: Option<Vec<u8>>,
     account_allowed: AtomicBool,
     reservation: Option<(Arc<Barrier>, Arc<Barrier>)>,
-    completion: Option<(Arc<Barrier>, Arc<Barrier>)>,
     completion_seen: AtomicBool,
     outcome_gate: Option<PublicationGate>,
     prepare_gate: Option<PublicationGate>,
@@ -298,6 +298,7 @@ impl Facts {
             prepare_journal_panic: AtomicBool::new(false),
             prepare_journal_gate: None,
             grant_journal_allowed: AtomicBool::new(true),
+            grant_journal_panic: AtomicBool::new(false),
             grant_journal_gate: None,
             grant_journal_calls: AtomicU32::new(0),
             sealed_history: Mutex::new(Vec::new()),
@@ -332,7 +333,6 @@ impl Facts {
             physical_target: None,
             account_allowed: AtomicBool::new(true),
             reservation: None,
-            completion: None,
             completion_seen: AtomicBool::new(false),
             outcome_gate: None,
             prepare_gate: None,
@@ -512,6 +512,13 @@ impl Kernel for Facts {
             JournalState::Sealed { .. } => Some(ChildState::Sealed { may_execute: true }),
         }
     }
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_literal_unwrap,
+            reason = "off Unix no journal is on disk, so `from_disk` is always `None`"
+        )
+    )]
     fn record_account_claim(
         &self,
         relation: &aterm_agent::harness::native_account_wire::Relation,
@@ -708,10 +715,15 @@ impl Kernel for Facts {
                 "grant journal worker was not released"
             );
         }
-        self.grant_journal_allowed.load(Ordering::SeqCst)
+        let recorded = self.grant_journal_allowed.load(Ordering::SeqCst)
             && self
                 .journal_event(prepare, binding, JournalEvent::MayExecute)
-                .is_some()
+                .is_some();
+        assert!(
+            !self.grant_journal_panic.load(Ordering::SeqCst),
+            "injected panic after a committed grant"
+        );
+        recorded
     }
     fn record_sealed(&self, prepare: &Prepare, binding: &Binding) -> bool {
         if !self.seal_journal_allowed.load(Ordering::SeqCst) {
@@ -1017,13 +1029,6 @@ impl Kernel for Facts {
                 .wait_timeout_while(permit, PATIENCE, |permit| !*permit)
                 .unwrap();
             assert!(*permit, "outcome publication gate hang detector");
-            return;
-        }
-        if let Some((sealed, proceed)) = &self.completion
-            && !self.completion_seen.swap(true, Ordering::SeqCst)
-        {
-            sealed.wait();
-            proceed.wait();
         }
     }
 }
@@ -1041,7 +1046,7 @@ fn restart_command(inode: u64) -> RestartCommand {
         settles: None,
         account_intent: None,
         image: image(inode),
-        program: format!("/image-{inode}"),
+        program: crate::test_host::abs(&format!("/image-{inode}")),
         argv: vec!["--resume".into(), "captured-conversation".into()],
         env: Vec::new(),
         unset: None,
@@ -1086,7 +1091,7 @@ fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
             .supervisor_authority(crate::metrics::now_us())
             .revision(),
         expected_human_seq: None,
-        deadline_us: aterm_agent::harness::native_act::monotonic_us().unwrap() + 60_000_000,
+        deadline_us: facts.clock.load(Ordering::SeqCst) + 60_000_000,
         duty: Scope::Upgrade,
         plan: NativePlan::OwnImage {
             child: facts.process(500).unwrap(),
@@ -1187,7 +1192,7 @@ fn native_actual_admission_rejects_wrong_duty_revision_actor_connection_and_plan
         process: facts.process(4242).unwrap(),
         shell: process(400, 1, 400, 400, 4),
         launcher: image(20),
-        socket: "/fake-native.sock".into(),
+        socket: crate::test_host::abs("/fake-native.sock"),
         forward: Box::new(restart_command(9)),
         rollback: Some(Box::new(restart_command(2))),
     };
@@ -1630,7 +1635,7 @@ fn private_constructor_executes_only_its_signal_and_retained_continuation() {
         process: old,
         shell,
         launcher: image(20),
-        socket: "/fake-native.sock".into(),
+        socket: crate::test_host::abs("/fake-native.sock"),
         forward: Box::new(restart_command(9)),
         rollback: Some(Box::new(restart_command(2))),
     };
@@ -1683,7 +1688,7 @@ fn private_constructor_executes_only_its_signal_and_retained_continuation() {
             let expected = restart_command(9)
                 .launcher_line(
                     &image(20),
-                    "/fake-native.sock",
+                    &crate::test_host::abs("/fake-native.sock"),
                     ctx.self_id.as_str(),
                     &binding,
                     ImagePhase::Forward,
@@ -1864,7 +1869,7 @@ fn native_input_seals_producer_but_pending_work_keeps_exact_custody() {
             custody,
             ctx.human_input.seq(),
             snapshot,
-            aterm_agent::harness::native_act::monotonic_us().unwrap() + MAX_PREPARE_US,
+            facts.clock.load(Ordering::SeqCst) + MAX_PREPARE_US,
             Arc::new(AtomicBool::new(false)),
             Some(Conversation::Facts(Arc::new(AtomicBool::new(true)))),
             Clock::Facts(Arc::clone(&facts.clock)),
@@ -2039,10 +2044,12 @@ fn completion_is_sealed_before_unlock_and_duplicate_abort_replays_once() {
     let h = crate::session_store::test_handle_on(7918, -1);
     let ctx = Arc::clone(&h.ctx);
     install(&ctx, 71, &[Scope::Upgrade]);
-    let sealed = Arc::new(Barrier::new(2));
-    let proceed = Arc::new(Barrier::new(2));
+    // The first seal parks at the outcome gate, a hang detector: a seal that never comes, or
+    // one the prepare makes on this thread, fails in a minute instead of parking the test.
+    let (arrived, at_seal) = mpsc::sync_channel(1);
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let facts = Arc::new(Facts {
-        completion: Some((Arc::clone(&sealed), Arc::clone(&proceed))),
+        outcome_gate: Some((arrived, Arc::clone(&gate))),
         ..Facts::new()
     });
     let binding = admitted_binding(&run(
@@ -2062,7 +2069,11 @@ fn completion_is_sealed_before_unlock_and_duplicate_abort_replays_once() {
             caller(),
         )
     });
-    sealed.wait();
+    if at_seal.recv_timeout(PATIENCE).is_err() {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        panic!("the abort seals its completion before it unlocks");
+    }
     let operation = lookup(&ctx, &binding).unwrap();
     assert_eq!(
         operation.lock().unwrap().phase,
@@ -2084,7 +2095,8 @@ fn completion_is_sealed_before_unlock_and_duplicate_abort_replays_once() {
     // A minute detects a parked observation, not a response-time budget. Always release the
     // paused owner before checking the result so a failed control leaves no test actor parked.
     let duplicate = rx.recv_timeout(PATIENCE);
-    proceed.wait();
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
     assert_eq!(worker.join().unwrap(), ROLLBACK_SAFE);
     observer.join().unwrap();
     assert_eq!(

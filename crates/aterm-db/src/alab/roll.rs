@@ -36,12 +36,14 @@
 //! 5. **Release** this Mac's storage of the old generation where the covers carry everything
 //!    it holds there (`catalog::release`).
 //!
-//! Every write is a whole register the old generation stated, written by request id derived
-//! from its content, so a re-run writes nothing and a retry returns its first receipt. A record
+//! Every restated register change has a request id derived from its content and the target's
+//! observed eligible business history. An unchanged re-run writes nothing; an exact retry
+//! returns its first receipt. A record
 //! that reached a Mac late (a Mac on the other side of a split edited the old generation before
-//! it heard the seal) is carried by the roll run again on that Mac: it writes only registers
-//! holding a candidate no roll carried yet (`late`), merged with what the new generation holds
-//! now, less the candidates this Mac's old history shows were superseded. An owner's edit made
+//! it heard the seal) is carried by the roll run again on that Mac. New candidates (`late`)
+//! merge with what the new generation holds; candidates the old history shows superseded are
+//! removed even when the surviving candidate was already carried. Previously carried values
+//! that the new generation replaced never return. An owner's edit made
 //! in the new generation meanwhile stays, beside the late value, as a conflict for the owner,
 //! since neither saw the other. Until that Mac's roll runs, its storage of the old generation
 //! stays.
@@ -68,6 +70,7 @@ use crate::{
     },
 };
 use astream_wire::sync::{Actor, Digest};
+use aterm_digest::Sha256;
 use aterm_json::{Value, json};
 use aterm_secrets::commons::bootstrap::Bootstrap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,24 +79,46 @@ use std::collections::{BTreeMap, BTreeSet};
 /// takes the compiled ones) and the old generation's own cover rows.
 const NOT_RESTATED: [&str; 2] = [typed::SCHEMA, ROLL.name];
 
-/// Every operation a carried value in `ops` names: what some roll already carried into the
-/// table, whether or not a later edit has replaced it since.
-pub(crate) fn carried_origins<'a>(ops: impl IntoIterator<Item = &'a Command>) -> BTreeSet<Digest> {
-    ops.into_iter()
-        .filter_map(Command::changes)
-        .flatten()
-        .filter_map(|change| change.value.as_ref().and_then(cell::carried_refs))
-        .flat_map(|items| items.into_iter().map(|(operation, _)| operation))
-        .collect()
+/// The origins carried at each collection and key, including ones a later edit replaced.
+pub(crate) type Carried = BTreeMap<(String, String), BTreeSet<Digest>>;
+
+/// Every carried origin at its register. One operation can write several registers, so carrying
+/// one cell does not mark the operation's other cells carried after an interrupted roll.
+pub(crate) fn carried_origins<'a>(ops: impl IntoIterator<Item = &'a Command>) -> Carried {
+    let mut carried = Carried::new();
+    for change in ops.into_iter().filter_map(Command::changes).flatten() {
+        if let Some(items) = change.value.as_ref().and_then(cell::carried_refs) {
+            carried
+                .entry((change.collection.clone(), change.key.clone()))
+                .or_default()
+                .extend(items.into_iter().map(|(operation, _)| operation));
+        }
+    }
+    carried
+}
+
+/// Bind a batch's request identities to what its plan observed. Reapplying identical contents
+/// after a later write is a new reconciliation, not a retry of an earlier receipt.
+fn request_role(role: &str, log: &Log) -> String {
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/roll/request-basis\0");
+    for (operation, _) in log.eligible_iter() {
+        sha.update(operation.header.id);
+    }
+    format!(
+        "{role}:roll:{}",
+        aterm_codec::hex::encode_lower(&sha.finalize())
+    )
 }
 
 /// The registers to write into the new generation (`target`, whose rolls already carried
 /// `carried`) from the old one's `source` cells, `held` being every operation this Mac holds of
-/// the old one. A register is written only where it holds a candidate no roll carried yet; it
-/// then holds that candidate and every other the old generation holds, and whatever the new one
-/// holds that the old history here does not show superseded. One change each. A collection
-/// `table` names as owned or log rows is no register: its rows go as archived records. A
-/// `Secret` column's candidates go through `reseal` (the old generation's sealer, then the
+/// the old one. A register carries candidates not carried before, retains ones the new
+/// generation still holds, and drops ones this Mac's old history shows superseded. A previously
+/// carried candidate absent from the new generation stays absent: a later edit replaced it.
+/// An unchanged result writes nothing; an empty result clears the register. One change each.
+/// A collection `table` names as owned or log rows is no register: its rows go as archived
+/// records. A `Secret` column's candidates go through `reseal` (the old generation's sealer, then the
 /// new one's); a candidate the new generation already holds keeps the token it has there only
 /// where that token opens there: a token an older build's roll copied as it was is sealed for
 /// the old generation, so it is resealed, though its origin counts as carried.
@@ -106,7 +131,7 @@ pub(crate) fn restate(
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
-    carried: &BTreeSet<Digest>,
+    carried: &Carried,
     reseal: (&dyn Sealer, &dyn Sealer),
 ) -> Result<Vec<Vec<Change>>> {
     let mut rows = Vec::new();
@@ -138,14 +163,13 @@ pub(crate) fn restate(
                 .as_ref()
                 .is_none_or(|parsed| opens_in(value, collection, parsed.pk, parsed.col, reseal.1))
         };
-        let old_refs = cell::origins_refs(cell);
-        if old_refs.iter().all(|(origin, _)| {
-            carried.contains(origin) && now.get(origin).copied().is_none_or(opens)
-        }) {
-            continue;
-        }
-        let mut old: BTreeMap<Digest, Value> = old_refs
+        let carried_here = carried.get(coord);
+        let mut old: BTreeMap<Digest, Value> = cell::origins_refs(cell)
             .into_iter()
+            .filter(|(origin, _)| {
+                carried_here.is_none_or(|origins| !origins.contains(origin))
+                    || now.contains_key(origin)
+            })
             .map(|(origin, value)| (origin, value.clone()))
             .collect();
         if let Some(parsed) = &secret {
@@ -170,16 +194,20 @@ pub(crate) fn restate(
         {
             continue;
         }
-        let value = cell::carry(&merged).ok_or_else(|| {
-            Error::new(&format!(
-                "{collection}: a register holds more candidates than a roll carries; resolve it \
-                 first"
-            ))
-        })?;
+        let value = if merged.is_empty() {
+            None
+        } else {
+            Some(cell::carry(&merged).ok_or_else(|| {
+                Error::new(&format!(
+                    "{collection}: a register holds more candidates than a roll carries; resolve it \
+                     first"
+                ))
+            })?)
+        };
         rows.push(vec![Change {
             collection: collection.clone(),
             key: key.clone(),
-            value: Some(value),
+            value,
         }]);
     }
     Ok(rows)
@@ -897,9 +925,10 @@ impl Registry {
         let mut records = pack(body)?;
         records.extend(pack(cover_rows)?);
         let mut log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
+        let request_role = request_role(to.table.role, &log);
         let mut appended = BTreeMap::new();
         for changes in records {
-            let request = typed::request_id(APPLICATION, to.table.role, &changes)?;
+            let request = typed::request_id(APPLICATION, &request_role, &changes)?;
             let command = Command::Write { request, changes };
             if att::retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                 continue;

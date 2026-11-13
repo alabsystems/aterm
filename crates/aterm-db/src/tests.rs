@@ -46,7 +46,7 @@ fn write(request: u8, key: &str, value: aterm_json::Value) -> Command {
 pub(super) fn wires(dir: &Path) -> Vec<Vec<u8>> {
     let db = Database::open(dir).unwrap();
     db.history
-        .index
+        .index()
         .inventory()
         .map(|id| db.history.wire(id).unwrap().to_vec())
         .collect()
@@ -105,7 +105,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
     };
     let mut db = Database::open(&path).unwrap();
     assert_eq!(db.commit(command).unwrap(), original);
-    assert_eq!(db.history.index.inventory().count(), 1);
+    assert_eq!(db.history.index().inventory().count(), 1);
     assert!(db.commit(write(1, "different", json!(false))).is_err());
     let bytes = std::fs::read(path.join("operations.astream")).unwrap();
     assert!(
@@ -134,7 +134,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
     };
     assert!(crate::cli::run(&put("null")).is_err());
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(db.history.index.inventory().count(), 1);
+    assert_eq!(db.history.index().inventory().count(), 1);
     assert_eq!(db.view().cells, baseline);
     assert!(
         db.commit(Command::Write {
@@ -154,11 +154,11 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
         })
         .is_err()
     );
-    assert_eq!(db.history.index.inventory().count(), 1);
+    assert_eq!(db.history.index().inventory().count(), 1);
     assert_eq!(db.view().cells, baseline);
     drop(db);
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.history.index.inventory().count(), 1);
+    assert_eq!(db.history.index().inventory().count(), 1);
     assert_eq!(db.view().cells, baseline);
     drop(db);
 
@@ -168,7 +168,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
     let receipt = crate::cli::run(&nested).unwrap();
     assert_eq!(crate::cli::run(&nested).unwrap(), receipt);
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(db.history.index.inventory().count(), 2);
+    assert_eq!(db.history.index().inventory().count(), 2);
     assert_eq!(
         db.view().cells[&("example".into(), "left".into())].candidates[0].value,
         json!({"nested":null})
@@ -184,7 +184,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
     .unwrap();
     drop(db);
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.history.index.inventory().count(), 3);
+    assert_eq!(db.history.index().inventory().count(), 3);
     assert!(db.view().cells[&("example".into(), "left".into())].stopped);
     assert!(
         db.view().cells[&("example".into(), "left".into())]
@@ -338,7 +338,7 @@ fn invalid_signatures_foreign_databases_and_torn_wire_are_not_acknowledged() {
     for len in 0..wire.len() {
         assert!(db.ingest(&wire[..len]).is_err());
     }
-    assert_eq!(db.history.index.inventory().count(), 0);
+    assert_eq!(db.history.index().inventory().count(), 0);
     drop(db);
     let other = tmp();
     local::init(other.path(), "other").unwrap();
@@ -928,11 +928,11 @@ fn revert_is_an_atomic_audited_edit_and_refuses_intervening_changes_or_resource_
         .unwrap();
     let last_head = db
         .history
-        .index
+        .index()
         .project()
         .ordered
         .into_iter()
-        .filter_map(|id| db.history.index.get(&id))
+        .filter_map(|id| db.history.index().get(&id))
         .filter(|h| h.actor == actor)
         .max_by_key(|h| h.sequence)
         .unwrap()
@@ -1135,4 +1135,147 @@ fn local_credentials_and_journal_refuse_control_capabilities_and_hidden_records(
         log.retain_before(astream_wire::Offset(1)).unwrap();
     }
     assert!(Database::open(&dir).is_err());
+}
+
+fn writer_usage_record(actor: u8, sequence: u64, control: bool, valid: bool) -> crypto::Opened {
+    let mut id = [actor; 32];
+    id[..8].copy_from_slice(&sequence.to_le_bytes());
+    crypto::Opened {
+        control,
+        authored_at_unix_ms: 0,
+        header: astream_wire::sync::Header {
+            id,
+            actor: [actor; 48],
+            sequence: 1,
+            previous: None,
+            parents: Vec::new(),
+        },
+        plaintext: if valid {
+            write(1, "usage", json!(sequence)).encode().unwrap()
+        } else {
+            vec![0xff]
+        },
+        wire: vec![actor; 31 + usize::try_from(sequence % 17).unwrap()],
+    }
+}
+
+#[test]
+fn writer_usage_counts_retained_evidence_once_and_survives_clone() {
+    // History receives already-opened records; authentication is outside this seam.
+    let opened = writer_usage_record;
+    let mut history = database::History::new([0; 32]);
+    let mut expected = BTreeMap::<_, (usize, usize)>::new();
+    for sequence in 0..96 {
+        let record = opened(
+            1 + u8::try_from(sequence % 3).unwrap(),
+            sequence,
+            sequence % 4 == 0,
+            sequence % 5 != 0,
+        );
+        let actor = record.header.actor;
+        let bytes = record.wire.len();
+        assert!(history.insert(record.clone()).unwrap());
+        assert!(!history.insert(record).unwrap());
+        let usage = expected.entry(actor).or_default();
+        usage.0 += 1;
+        usage.1 += bytes;
+        for (actor, usage) in &expected {
+            assert_eq!(history.writer_usage(actor), *usage);
+        }
+    }
+    assert!(history.refusals().count() > 0);
+    assert_eq!(history.writer_usage(&[99; 48]), (0, 0));
+    let mut malformed = opened(4, 100, false, true);
+    malformed.header.sequence = 0;
+    assert!(history.insert(malformed).is_err());
+    assert_eq!(history.writer_usage(&[4; 48]), (0, 0));
+    let mut cloned = history.clone();
+    let extra = opened(1, 100, false, true);
+    let extra_bytes = extra.wire.len();
+    assert!(cloned.insert(extra).unwrap());
+    let original = expected[&[1; 48]];
+    assert_eq!(history.writer_usage(&[1; 48]), original);
+    assert_eq!(
+        cloned.writer_usage(&[1; 48]),
+        (original.0 + 1, original.1 + extra_bytes)
+    );
+
+    let mut capped = database::History::new([0; 32]);
+    for sequence in 0..database::MAX_WRITER_OPERATIONS as u64 {
+        assert!(
+            capped
+                .insert(opened(8, sequence, false, sequence % 2 == 0))
+                .unwrap()
+        );
+    }
+    assert!(capped.insert(opened(8, 9000, false, true)).is_err());
+    assert_eq!(
+        capped.writer_usage(&[8; 48]).0,
+        database::MAX_WRITER_OPERATIONS
+    );
+    assert!(capped.insert(opened(9, 9000, false, true)).unwrap());
+    #[cfg(unix)]
+    {
+        // Historical control evidence can replay beyond a writer's ordinary quota.
+        let historical = opened(8, 9001, true, false);
+        assert!(capped.replay(historical.clone()).unwrap());
+        assert!(!capped.replay(historical).unwrap());
+        assert_eq!(
+            capped.writer_usage(&[8; 48]).0,
+            database::MAX_WRITER_OPERATIONS + 1
+        );
+        assert!(capped.insert(opened(8, 9002, false, true)).is_err());
+    }
+}
+
+#[test]
+#[ignore = "process CPU measurement of opened-history retention; no latency budget"]
+fn writer_usage_ingest_measurement() {
+    let cpu = || {
+        let pid = std::process::id();
+        aterm_sysprobe::processes()
+            .unwrap()
+            .procs
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .unwrap()
+            .cpu_ns
+            .unwrap()
+    };
+    const RECORDS: u64 = 8192;
+    let records: Vec<_> = (0..RECORDS)
+        .map(|sequence| {
+            writer_usage_record(
+                1 + u8::try_from(sequence % 4).unwrap(),
+                sequence,
+                false,
+                sequence % 2 == 0,
+            )
+        })
+        .collect();
+    for round in 0..5 {
+        let mut history = database::History::new([0; 32]);
+        let before = cpu();
+        let start = cpu();
+        for record in &records {
+            assert!(
+                history
+                    .insert(std::hint::black_box(record.clone()))
+                    .unwrap()
+            );
+        }
+        let elapsed = cpu()
+            .saturating_sub(start)
+            .saturating_sub(start.saturating_sub(before));
+        for actor in 1..=4 {
+            assert_eq!(
+                history.writer_usage(&[actor; 48]).0,
+                usize::try_from(RECORDS / 4).unwrap()
+            );
+        }
+        println!(
+            "{}",
+            json!({"measurement":"opened_history_ingest", "records":RECORDS, "writers":4, "warmup":round == 0, "process_cpu_ns":elapsed})
+        );
+    }
 }

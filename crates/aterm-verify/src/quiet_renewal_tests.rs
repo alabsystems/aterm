@@ -41,9 +41,9 @@ fn busy_claim(ledger: &Ledger, need: Need, mode: Admit) -> Result<Claim, Error> 
 }
 
 /// A TIMED STAGE ON A MACHINE THAT STAYED BUSY THROUGH ITS PATIENCE RUNS, AND ITS TIME LINE SAYS
-/// IT RAN WITHOUT A QUALIFIED QUIET ADMISSION (owner ruling 2026-11-05: a busy machine never
-/// blocks a release). NEGATIVE CONTROL: a strict need on the same machine is refused, and the
-/// stage starts nothing.
+/// IT RAN WITHOUT A QUALIFIED QUIET ADMISSION (a busy machine never blocks a release: the row is
+/// named, not counted red). NEGATIVE CONTROL: a strict need on the same machine is refused, and
+/// the stage starts nothing.
 #[test]
 fn a_loaded_stage_admission_runs_the_stage_and_says_so() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -307,4 +307,91 @@ fn concurrent_stages_replace_once_and_preserve_the_old_worker_share() {
             .then_some(())
         },
     );
+}
+
+/// A timed stage that panics passes its turn on the unwind (`sched::run_stages` re-raises a
+/// stage's panic): the last one's turn lets the run's quiet claim go, on both the qualified path
+/// and AppKit's `--admit now` window path, so the per-user ledger no longer holds it. NEGATIVE
+/// CONTROL: while the stage ran, the ledger held its claim.
+#[test]
+fn a_panicking_timed_stage_lets_the_runs_quiet_claim_go() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let quiet = Mutex::new(Quiet {
+        claim: None,
+        left: 1,
+        admit: unused_admit,
+    });
+    let held = std::cell::Cell::new(false);
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        quietly_with(
+            &context(dir.path()),
+            &quiet,
+            "panics",
+            || {
+                held.set(crate::current_quiet_claim().is_some());
+                panic!("a stage's panic")
+            },
+            Claim::timing_protection,
+            |_, need, mode| claim(&ledger, need, mode),
+        )
+    }));
+    assert!(panicked.is_err());
+    assert!(held.get(), "the stage ran under the claim");
+    let q = quiet.lock().unwrap();
+    assert_eq!(q.left, 0, "the panicking stage passed its turn");
+    assert!(q.claim.is_none(), "and the run's claim went with the last");
+    drop(q);
+    assert!(crate::current_quiet_claim().is_none());
+    assert!(
+        ledger.list().unwrap().is_empty(),
+        "the claim left the ledger"
+    );
+
+    let machine = Fixed::new(Reading::of_gib(48, 40, 14));
+    let ctx = Ctx::new(
+        dir.path().to_owned(),
+        Scope::crate_only("aterm-gui"),
+        EnvSnapshot::default(),
+        dir.path().join("scratch"),
+    )
+    .with_quiet(Some(Admit::Now))
+    .with_measure_artifact(Some(crate::MeasureArtifact {
+        app: dir.path().join("fixture.app"),
+        version: None,
+        commit: None,
+    }));
+    let window = Ledger::at(dir.path().join("window-ledger"));
+    let listed = || window.list().unwrap().len();
+    let appkit = Mutex::new(Quiet {
+        claim: None,
+        left: 1,
+        admit: unused_admit,
+    });
+    let excluded = std::cell::Cell::new(false);
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        crate::run_timed_with(
+            &ctx,
+            &appkit,
+            crate::plan::StageId::RedrawConformance,
+            "AppKit redraw",
+            |need| aterm_capacity::admit::try_admit_with(&window, &machine, need),
+            || -> Result<(), String> {
+                excluded.set(listed() == 1);
+                panic!("an AppKit stage's panic")
+            },
+        )
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        excluded.get(),
+        "CONTROL: the stage held the per-user window claim"
+    );
+    let q = appkit.lock().unwrap();
+    assert_eq!(q.left, 0);
+    assert!(q.claim.is_none());
+    drop(q);
+    assert_eq!(listed(), 0, "the window claim went with the panic");
 }

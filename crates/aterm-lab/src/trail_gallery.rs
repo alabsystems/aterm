@@ -22,7 +22,8 @@ use crate::{Fail, Res};
 /// The verb's own help (`trail-gallery --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]...
-         [--extra 'key = value']... [--columns N] [--lines N] [--font-px N] [--no-clean] [--keep] <out_dir> [style ...]
+         [--caret NAME[,NAME]|both|all] [--extra 'key = value']... [--columns N] [--lines N] [--font-px N]
+         [--no-clean] [--keep] <out_dir> [style ...]
 
 Photograph cursor trail styles: one fresh private headless aterm per style, theme and scenario (a scratch HOME and XDG
 dirs, a private control socket, a lifeline; ended by its process group, never by name), a frame after every key
@@ -30,23 +31,26 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
 
   <out_dir>     where the frames go, OUTSIDE the repository (refused inside this checkout or any of its worktrees);
                 made if missing; same-named files are replaced
-  style ...     trail styles, e.g. phaser \"rainbow kitty pet\" off; none: every style the Settings picker offers, read
-                from a probe instance's `controls prefs` (an alias such as \"nyan rainbow\" or \"classic mono\"
-                is not on it; name it to capture it)
+  style ...     trail styles, e.g. rainbow phaser off; none: every style the Settings picker offers, read from a
+                probe instance's `controls prefs` (\"classic mono\" is not on it; name it to capture it). The pet
+                is its own setting, the cat unless told: --extra 'cursor_pet = \"dog\"', \"flying cat\" or \"off\"
   --aterm PATH  the aterm to run (default: the lab's pick, `targo --unverified lab paths`); a release build keeps the
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
   --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
-                split, move-up, last-row, coloured, flood, rail-g, focus-roundtrip, focus-wrap, settings, or all;
-                repeatable
+                split, move-up, last-row, coloured, flood, rail-g, focus-roundtrip, focus-wrap, bottom-prompt,
+                composer, jump, enter-long, wall, coloured-prompt, verdict, long-build, settings, or all; repeatable
+  --caret       the caret each instance's program sets: block, bar, underline, both (block and bar) or all; each
+                adds -<caret> to the instance's name. None: the instance's own caret, and no suffix
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px;
-                focus-wrap always uses 32x14; its font-px override applies)
+                focus-wrap always uses 32x14; its font-px override applies; wall 71x14, and
+                --columns 69 to 73 moves its wall)
   --no-clean    skip each frame's `image clean` twin
   --keep        retain every instance's scratch world, including a roster probe's
 
-Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): <name>.<frame>.png and its
+Per instance <name> = <style-slug>-<theme>[-<scenario>][-<caret>] (typing has no suffix): <name>.<frame>.png and its
 .clean.png, .cursor.txt and .text.txt; <name>.frames.tsv (frame, ms since the instance came up, @event rows);
 <name>.dims.txt, .status.txt, .status-end.txt (`trail status`), .admissions.txt (`trail 40`), .gui.log; and
 gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. A settings frame keeps its
@@ -81,6 +85,22 @@ the paper glass's word yield runs past `MAX_QUADS` and takes whole words.
 The `rail-g` scenario stops the caret just past the `g` of `lazy dog`, the burst's pace, so a trail's
 foot rail runs across that descender: on a row under letters with blank rows below it (`under-g`,
 `under-g120`, `under-g470`), then, Ctrl+L, on the grid's last row (`last-g`, `last-g120`, `last-g470`).
+
+The two rows a person types on, each typed on from 2 s after the page is up, once a pet has come to the caret.
+`bottom-prompt` is a shell prompt on the last row of a full page, a command's output on the row over it: 48 keys
+(`mid`, `key30`, `t0`), then held (`t120`, `t470`, `l1650`, `l3900`, `l6000`). `composer` is Claude Code's input box
+under its transcript (a grey rule, the `❯` prompt, a rule, two grey rows), the program repainting the row at each key: the
+same keys and frames.
+
+Six more scenes on the shell's full page (`jump` on a blank one). `jump` types the line, then Home and End, each a
+move of the whole line along its row (`t0`, `home`, `h60` to `h470`, `end`, `e60` to `e470`). `enter-long` enters a
+40-cell command and its answer scrolls the page (`typed`, `enter`, `e60` to `e1650`). `wall` types the burst's 69-cell
+line on 71 columns, two cells short of the wall (`key63` to `key67` at its last keys, `t0`, then held).
+`coloured-prompt` types a command as fish paints it, each word in its syntax ink and the suggestion's rest grey past
+the caret (`mid`, `t0`, `t120`, `t470`). `verdict` runs `true`, `false`, `sleep 3`, `sleep 3; false` and a `sleep 9`
+that Ctrl-C ends, each between shell-integration marks, with frames after each ends (`<command>-d60` to `-d1500`).
+`long-build` enters a build of forty lines 100 ms apart that ends green (`typed`, `b1000` to `b4000`, `d60` to
+`d1500`).
 
 exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, a redraw return was
 inconclusive, or an instance outlived the run;
@@ -171,12 +191,39 @@ pub enum Scenario {
     /// letters ([`RAIL_G_UNDER_ROW`]; `under-g`, `under-g120`, `under-g470`), then on the grid's
     /// last row (`last-g`, `last-g120`, `last-g470`), where the descender reaches the row's foot.
     RailG,
+    /// A shell prompt on the grid's last row under a full page of a session ([`shell_page`]), a
+    /// command's output on the row over it: where a person types in a shell. [`RESIDENT_TEXT`]
+    /// typed along it from [`RESIDENT_SETTLE_MS`] and held.
+    BottomPrompt,
+    /// Claude Code's composer under its transcript ([`composer_page`]): a grey rule, the `❯`
+    /// prompt, a rule and two grey rows, the program repainting the prompt's row at each key: where a
+    /// person types to an agent. [`RESIDENT_TEXT`] typed into it and held.
+    Composer,
+    /// [`RESIDENT_TEXT`] typed on a blank page's prompt, then Home and End: two moves of the
+    /// whole line along its row, the long flight no other scene has.
+    Jump,
+    /// [`ENTER_LONG_TEXT`], a 40-cell command, entered on [`Scenario::BottomPrompt`]'s page,
+    /// its answer scrolling the page.
+    EnterLong,
+    /// The burst's 69-cell line on [`Scenario::BottomPrompt`]'s page, [`WALL_COLUMNS`] wide:
+    /// two blank cells past the line (`--columns 69` to `73` moves the wall).
+    Wall,
+    /// [`COLOURED_PROMPT_TEXT`] typed on [`Scenario::BottomPrompt`]'s page as fish paints it:
+    /// the line repainted at each key, each word in its syntax ink, the rest of the
+    /// suggestion grey past the caret.
+    ColouredPrompt,
+    /// [`VERDICT_COMMANDS`] and a `sleep 9` that Ctrl-C ends, on [`Scenario::BottomPrompt`]'s
+    /// page, each between shell-integration marks: what a pet makes of each end.
+    Verdict,
+    /// [`BUILD_COMMAND`] entered on [`Scenario::BottomPrompt`]'s page: [`BUILD_LINES`] lines
+    /// [`BUILD_LINE_MS`] apart, then a green end.
+    LongBuild,
     Settings,
 }
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 19] = [
+    pub const ALL: [Scenario; 27] = [
         Scenario::Typing,
         Scenario::Burst,
         Scenario::Context,
@@ -195,6 +242,14 @@ impl Scenario {
         Scenario::Coloured,
         Scenario::Flood,
         Scenario::RailG,
+        Scenario::BottomPrompt,
+        Scenario::Composer,
+        Scenario::Jump,
+        Scenario::EnterLong,
+        Scenario::Wall,
+        Scenario::ColouredPrompt,
+        Scenario::Verdict,
+        Scenario::LongBuild,
         Scenario::Settings,
     ];
 
@@ -219,6 +274,14 @@ impl Scenario {
             Scenario::Coloured => "coloured",
             Scenario::Flood => "flood",
             Scenario::RailG => "rail-g",
+            Scenario::BottomPrompt => "bottom-prompt",
+            Scenario::Composer => "composer",
+            Scenario::Jump => "jump",
+            Scenario::EnterLong => "enter-long",
+            Scenario::Wall => "wall",
+            Scenario::ColouredPrompt => "coloured-prompt",
+            Scenario::Verdict => "verdict",
+            Scenario::LongBuild => "long-build",
             Scenario::Settings => "settings",
         }
     }
@@ -238,6 +301,7 @@ impl Scenario {
         match self {
             Scenario::Settings => (110, 40, 16),
             Scenario::FocusWrap => (32, 14, 22),
+            Scenario::Wall => (WALL_COLUMNS, 14, 22),
             _ => (72, 14, 22),
         }
     }
@@ -256,6 +320,47 @@ impl Scenario {
     }
 }
 
+/// A caret shape an instance's program sets before it paints (`--caret`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caret {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl Caret {
+    pub const ALL: [Caret; 3] = [Caret::Block, Caret::Bar, Caret::Underline];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Caret::Block => "block",
+            Caret::Bar => "bar",
+            Caret::Underline => "underline",
+        }
+    }
+
+    /// The DECSCUSR parameter that sets it, steady (a blink would differ from frame to frame).
+    const fn decscusr(self) -> u8 {
+        match self {
+            Caret::Block => 2,
+            Caret::Bar => 6,
+            Caret::Underline => 4,
+        }
+    }
+
+    fn named(name: &str) -> Option<Vec<Caret>> {
+        match name {
+            "both" => Some(vec![Caret::Block, Caret::Bar]),
+            "all" => Some(Caret::ALL.to_vec()),
+            _ => Caret::ALL
+                .into_iter()
+                .find(|c| c.name() == name)
+                .map(|c| vec![c]),
+        }
+    }
+}
+
 /// What `trail-gallery` was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
@@ -263,6 +368,8 @@ pub struct Args {
     pub styles: Vec<String>,
     pub themes: Vec<Theme>,
     pub scenarios: Vec<Scenario>,
+    /// The carets `--caret` names; none: each instance keeps its own.
+    pub carets: Vec<Caret>,
     pub extras: Vec<String>,
     pub columns: Option<u32>,
     pub lines: Option<u32>,
@@ -368,6 +475,21 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     if scenarios.is_empty() {
         scenarios.push(Scenario::Typing);
     }
+    let mut carets: Vec<Caret> = Vec::new();
+    for spec in take_values(&mut a, "--caret")? {
+        for name in spec.split(',').filter(|n| !n.is_empty()) {
+            let named = Caret::named(name).ok_or_else(|| {
+                usage(format!(
+                    "--caret takes block, bar, underline, both or all, not '{name}'"
+                ))
+            })?;
+            for c in named {
+                if !carets.contains(&c) {
+                    carets.push(c);
+                }
+            }
+        }
+    }
     let extras = take_values(&mut a, "--extra")?;
     for e in &extras {
         check_extra(e)?;
@@ -398,6 +520,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         styles: styles.to_vec(),
         themes,
         scenarios,
+        carets,
         extras,
         columns,
         lines,
@@ -413,6 +536,12 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
 pub fn config_lines(style: &str, theme: Theme, extras: &[String]) -> Vec<String> {
     let mut lines = vec![
         format!("cursor_trail_style = \"{style}\""),
+        // Named, so the scratch file is no upgraded one: an aterm.toml that names a style
+        // and no pet is migrated to the pet that style had (none beside Fire or Off).
+        format!(
+            "cursor_pet = \"{}\"",
+            aterm_effects::cursor_pet::DEFAULT_PET
+        ),
         "motion = \"full\"".to_string(),
         "trail_sounds = false".to_string(),
     ];
@@ -745,6 +874,17 @@ pub const SPLIT_BURST_FRAMES: [&str; 5] = ["bfly", "b0", "b120", "b470", "b1650"
 /// The ms after the last key of `split`'s `b120`, `b470` and `b1650`.
 pub const SPLIT_BURST_AFTER_MS: [u64; 3] = [120, 470, 1650];
 
+/// The resident scenes' pages and lines, which `trail-film`'s replay lays too.
+pub use crate::trail_scenes::{
+    BUILD_COMMAND, BUILD_FINISHED, BUILD_LINE_MS, BUILD_LINES, COLOURED_PROMPT_TEXT,
+    COMPOSER_PROMPT, ENTER_LONG_TEXT, MARK_INPUT, MARK_PROMPT, MARK_RUNS, RESIDENT_SETTLE_MS,
+    RESIDENT_TEXT, SHELL_PROMPT, VERDICT_COMMANDS, VERDICT_INTERRUPT_MS, VERDICT_INTERRUPTED,
+    build_line, composer_page, composer_row, composer_row_of, exit_mark, fish_row, shell_page,
+};
+
+/// `wall`'s columns: the burst's line and its prompt are 69 cells, so two blank cells past it.
+pub const WALL_COLUMNS: u32 = 71;
+
 const PAINT_STEAM: &str = r"printf '\033[2J\033[3H'
 printf 'Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n'
 printf 'Above2: The lazy dog jogged by, every glyph legible.\r\n'
@@ -753,9 +893,13 @@ printf 'Below: pqgyj Wide test {braces} [ok]\r\n'
 printf '\033[5H'
 ";
 
-/// The PTY's script: a locale for wide input, a known prompt, then the scenario's paint, then an interactive shell.
+/// The PTY's script: a locale for wide input, a known prompt, `caret` set when one is named (DECSCUSR), then the
+/// scenario's paint, then an interactive shell.
 #[must_use]
-pub fn paint(scenario: Scenario, theme: Theme) -> String {
+pub fn paint(scenario: Scenario, theme: Theme, caret: Option<Caret>) -> String {
+    let caret = caret.map_or_else(String::new, |c| {
+        format!("printf '\\033[{} q'\n", c.decscusr())
+    });
     let body = match scenario {
         Scenario::Context => PAINT_CONTEXT.replace("@SEL@", theme.selection()),
         Scenario::Steam => PAINT_STEAM.to_string(),
@@ -763,7 +907,7 @@ pub fn paint(scenario: Scenario, theme: Theme) -> String {
         Scenario::MoveUp => PAINT_MOVE_UP.replace("@UP@", &MOVE_UP_ROWS.to_string()),
         _ => "printf '\\033[2J\\033[5H'\n".to_string(),
     };
-    format!("{PAINT_HEAD}{body}exec /bin/sh -i\n")
+    format!("{PAINT_HEAD}{caret}{body}exec /bin/sh -i\n")
 }
 
 /// One `key` name per character of a word (a space is `space`).
@@ -927,17 +1071,39 @@ pub fn burst_keys() -> Vec<String> {
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
+    let (caret, args): (Vec<&str>, Vec<&str>) = args
+        .iter()
+        .map(String::as_str)
+        .partition(|a| a.starts_with("caret="));
+    let caret = match caret.as_slice() {
+        [] => None,
+        [one] => Some(
+            Caret::ALL
+                .into_iter()
+                .find(|c| one.strip_prefix("caret=") == Some(c.name()))
+                .ok_or_else(|| {
+                    Fail::usage("the redraw fixture's caret is block, bar or underline")
+                })?,
+        ),
+        _ => return Err(Fail::usage("the redraw fixture takes one caret")),
+    };
     let fold = args == ["fold"];
-    let focus = args == ["focus"];
-    let typing = args == ["typing"];
-    let last_row = args == ["last-row"];
-    let coloured = args == ["coloured"];
     let flood = args == ["flood"];
-    let rail_g = args == ["rail-g"];
-    if !args.is_empty() && !fold && !focus && !typing && !last_row && !coloured && !flood && !rail_g
-    {
+    let line = match args.as_slice() {
+        ["typing"] => Some(LineMode::Typing),
+        ["focus"] => Some(LineMode::Focus),
+        ["last-row"] => Some(LineMode::LastRow),
+        ["coloured"] => Some(LineMode::Coloured),
+        ["rail-g"] => Some(LineMode::RailG),
+        ["bottom-prompt"] => Some(LineMode::BottomPrompt),
+        ["composer"] => Some(LineMode::Composer),
+        ["coloured-prompt"] => Some(LineMode::ColouredPrompt),
+        _ => None,
+    };
+    if !args.is_empty() && !fold && !flood && line.is_none() {
         return Err(Fail::usage(
-            "the redraw fixture takes only an optional fold, focus, typing, last-row, coloured, flood or rail-g mode",
+            "the redraw fixture takes only an optional fold, focus, typing, last-row, coloured, flood, rail-g, \
+             bottom-prompt, composer or coloured-prompt mode, and a caret=NAME",
         ));
     }
     let _raw = crate::sys::RawMode::enter(0)
@@ -945,20 +1111,22 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
-    if typing || focus || last_row || coloured || flood || rail_g {
+    if let Some(caret) = caret {
+        write!(output, "\x1b[{} q", caret.decscusr()).map_err(io_error)?;
+    }
+    if flood || line.is_some() {
         let size = || crate::sys::winsize(0).map(|size| (size.ws_row, size.ws_col));
-        if flood {
-            flood_fixture(&mut input, &mut output, size)
-        } else if typing {
-            typing_fixture(&mut input, &mut output, size)
-        } else if focus {
-            line_fixture(&mut input, &mut output, LineMode::Focus, size)
-        } else if coloured {
-            line_fixture(&mut input, &mut output, LineMode::Coloured, size)
-        } else if rail_g {
-            line_fixture(&mut input, &mut output, LineMode::RailG, size)
-        } else {
-            line_fixture(&mut input, &mut output, LineMode::LastRow, size)
+        match line {
+            Some(mode) => {
+                // Whether a key is waiting within `ms`: a running command's Ctrl-C.
+                let mut key_within = |ms: u64| {
+                    let mut fds = [crate::sys::pollfd(0)];
+                    let ms = i32::try_from(ms).unwrap_or(i32::MAX);
+                    crate::sys::poll(&mut fds, ms).map(|ready| ready > 0)
+                };
+                line_fixture_waiting(&mut input, &mut output, mode, size, &mut key_within)
+            }
+            None => flood_fixture(&mut input, &mut output, size),
         }
         .map_err(io_error)?;
         return Ok(0);
@@ -1023,17 +1191,7 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// An ASCII line editor holding at most 80 bytes, never a command interpreter.
-/// The same byte stream can be exercised in memory without a PTY or child process.
-fn typing_fixture(
-    input: &mut impl std::io::Read,
-    output: &mut impl std::io::Write,
-    size: impl FnMut() -> Option<(u16, u16)>,
-) -> std::io::Result<()> {
-    line_fixture(input, output, LineMode::Typing, size)
-}
-
-/// What a [`line_fixture`] keeps round its line.
+/// What a [`line_fixture_waiting`] keeps round its line.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineMode {
     /// The fifth row of a blank page.
@@ -1049,13 +1207,44 @@ enum LineMode {
     /// [`Self::LastRow`]'s page down to [`RAIL_G_UNDER_ROW`], and on Ctrl+L the line cleared and
     /// its whole page, on the grid's last row.
     RailG,
+    /// The grid's last row under [`shell_page`], the prompt between shell-integration marks; a
+    /// Return runs the line as one of the scenes' commands ([`TypingLine::submit`]).
+    BottomPrompt,
+    /// The prompt's row of [`composer_page`], repainted whole at each key; a Return empties it.
+    Composer,
+    /// [`Self::BottomPrompt`] as fish paints its line: repainted at each key, the typed part
+    /// inked ([`crate::trail_scenes::fish_inked`]) and the rest of [`COLOURED_PROMPT_TEXT`] grey past the caret.
+    ColouredPrompt,
 }
 
-fn line_fixture(
+impl LineMode {
+    /// Whether the line is a shell's on [`shell_page`]'s last row.
+    fn shell(self) -> bool {
+        matches!(self, LineMode::BottomPrompt | LineMode::ColouredPrompt)
+    }
+}
+
+/// How a [`TypingLine`] paints itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dress {
+    /// The prompt and the letters, each written as it is typed.
+    Plain,
+    /// [`LineMode::Composer`]'s repaint.
+    Composer,
+    /// [`LineMode::ColouredPrompt`]'s repaint.
+    Fish,
+}
+
+/// An ASCII line editor holding at most 80 bytes, never a command interpreter.
+/// The same byte stream can be exercised in memory without a PTY or child process.
+/// `key_within(ms)` says whether a key is waiting within `ms`: what a running command of
+/// [`TypingLine::submit`] waits on.
+fn line_fixture_waiting(
     input: &mut impl std::io::Read,
     output: &mut impl std::io::Write,
     mode: LineMode,
     mut size: impl FnMut() -> Option<(u16, u16)>,
+    key_within: &mut dyn FnMut(u64) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
     let focus = mode == LineMode::Focus;
     let (rows, cols) = typing_size(size())?;
@@ -1065,14 +1254,28 @@ fn line_fixture(
         cols,
         row: 4.min(usize::from(rows) - 1),
         visible: true,
-        prompt: if focus { "> " } else { "$ " },
+        prompt: match mode {
+            LineMode::Focus => "> ",
+            LineMode::Composer => COMPOSER_PROMPT,
+            _ => SHELL_PROMPT,
+        },
         inks: (mode == LineMode::Coloured).then_some(&COLOURED_INKS),
         last_row: false,
+        dress: match mode {
+            LineMode::Composer => Dress::Composer,
+            LineMode::ColouredPrompt => Dress::Fish,
+            _ => Dress::Plain,
+        },
+        home: false,
     };
     if focus {
         output.write_all(b"\x1b[?1049h\x1b[?1004h")?;
     }
-    if matches!(mode, LineMode::LastRow | LineMode::RailG) {
+    if matches!(
+        mode,
+        LineMode::LastRow | LineMode::RailG | LineMode::Composer
+    ) || mode.shell()
+    {
         line.fresh_view(output, mode)?;
     } else {
         output.write_all(b"\x1b[2J")?;
@@ -1095,20 +1298,35 @@ fn line_fixture(
             line.cols = cols;
             line.fresh_view(output, mode)?;
         }
-        if focus && key[0] == 27 {
-            let mut report = [0u8; 2];
-            input.read_exact(&mut report)?;
-            let label = match report {
-                [b'[', b'I'] => "in",
-                [b'[', b'O'] => "out",
-                _ => continue,
-            };
-            line.focus_report(output, label)?;
-            output.flush()?;
-            continue;
+        if key[0] == 27 {
+            // A focus report, or Home or End: an introducer (CSI's or SS3's) and a final byte.
+            // An escape before any other byte is passed over, and that byte is a key.
+            input.read_exact(&mut key)?;
+            if matches!(key[0], b'[' | b'O') {
+                let mut last = [0u8; 1];
+                input.read_exact(&mut last)?;
+                match (key[0], last[0]) {
+                    (b'[', b'I') if focus => line.focus_report(output, "in")?,
+                    (b'[', b'O') if focus => line.focus_report(output, "out")?,
+                    (_, b'H') if !focus => line.jump(output, true)?,
+                    (_, b'F') if !focus => line.jump(output, false)?,
+                    _ => continue,
+                }
+                output.flush()?;
+                continue;
+            }
+        }
+        if line.home && matches!(key[0], 8 | 127 | 0x20..=0x7e) {
+            // The line edits at its end only: a key typed from Home goes back there first.
+            line.jump(output, false)?;
         }
         match key[0] {
             3 | 4 => break,
+            b'\r' | b'\n' if mode == LineMode::Composer => {
+                line.text.clear();
+                line.repaint(output, false)?;
+            }
+            b'\r' | b'\n' if mode.shell() => line.submit(input, output, key_within)?,
             b'\r' | b'\n' => {
                 let row = (line.cursor_row() + 1).min(usize::from(line.rows) - 1);
                 output.write_all(b"\r\n")?;
@@ -1141,7 +1359,11 @@ fn line_fixture(
             }
             0x20..=0x7e if line.text.len() < 80 => {
                 line.text.push(key[0]);
-                line.write_letter(output, line.text.len() - 1)?;
+                if line.dress == Dress::Plain {
+                    line.write_letter(output, line.text.len() - 1)?;
+                } else {
+                    line.repaint(output, false)?;
+                }
                 line.note_wrap();
             }
             _ => {}
@@ -1167,6 +1389,9 @@ struct TypingLine {
     inks: Option<&'static [&'static str; 6]>,
     /// [`LineMode::RailG`]: past its Ctrl+L, on the grid's last row.
     last_row: bool,
+    dress: Dress,
+    /// Whether a Home left the caret at the line's start.
+    home: bool,
 }
 
 impl TypingLine {
@@ -1189,7 +1414,7 @@ impl TypingLine {
     /// Physical caret position, including the last cell while DEC wrap is pending.
     fn cursor(&self) -> (usize, usize) {
         let cols = usize::from(self.cols);
-        let end = self.text.len() + self.prompt.len();
+        let end = self.text.len() + self.prompt.chars().count();
         let row = if self.visible {
             self.row + (end - 1) / cols
         } else {
@@ -1231,6 +1456,16 @@ impl TypingLine {
             LineMode::LastRow => self.rows,
             LineMode::RailG if self.last_row => self.rows,
             LineMode::RailG => (RAIL_G_UNDER_ROW + 1).min(self.rows),
+            LineMode::Composer => {
+                output.write_all(composer_page(self.rows, self.cols).as_bytes())?;
+                self.row = usize::from(composer_row_of(self.rows)) - 1;
+                self.visible = true;
+                return self.repaint(output, false);
+            }
+            mode if mode.shell() => {
+                output.write_all(shell_page(self.rows, self.cols).as_bytes())?;
+                return self.prompt_again(output);
+            }
             _ => return self.repaint(output, true),
         };
         last_row_page(output, rows, self.cols)?;
@@ -1239,7 +1474,120 @@ impl TypingLine {
         self.repaint(output, false)
     }
 
+    /// A shell's prompt on the grid's last row, between its marks, the line after it.
+    fn prompt_again(&mut self, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        self.row = usize::from(self.rows) - 1;
+        self.visible = true;
+        self.home = false;
+        output.write_all(MARK_PROMPT.as_bytes())?;
+        self.repaint(output, false)?;
+        output.write_all(MARK_INPUT.as_bytes())
+    }
+
+    /// Home (`home`) or End: the caret to the line's first cell or past its last.
+    fn jump(&mut self, output: &mut impl std::io::Write, home: bool) -> std::io::Result<()> {
+        self.home = home && !self.text.is_empty();
+        let (row, col) = if home {
+            (self.row, self.prompt.chars().count())
+        } else {
+            self.cursor()
+        };
+        write!(output, "\x1b[{};{}H", row + 1, col + 1)
+    }
+
+    /// Wait `ms` for a running command; whether a Ctrl-C ended the wait. Any other key is
+    /// read and dropped, as a command that reads nothing leaves it.
+    fn runs(
+        ms: u64,
+        input: &mut impl std::io::Read,
+        key_within: &mut dyn FnMut(u64) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let until = Instant::now() + Duration::from_millis(ms);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let left = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+            if left == 0 || !key_within(left)? {
+                return Ok(false);
+            }
+            let mut key = [0u8; 1];
+            input.read_exact(&mut key)?;
+            if key[0] == 3 {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// A Return on a shell's line: the line run as one of the scenes' commands between the
+    /// marks that it runs and that it ended, then the next prompt. `echo` answers its words,
+    /// [`VERDICT_COMMANDS`] and [`VERDICT_INTERRUPTED`] wait and exit as they say (130 when a
+    /// Ctrl-C ends one), [`BUILD_COMMAND`] writes its lines, and any other line is not found
+    /// (127). No line reaches a shell.
+    fn submit(
+        &mut self,
+        input: &mut impl std::io::Read,
+        output: &mut impl std::io::Write,
+        key_within: &mut dyn FnMut(u64) -> std::io::Result<bool>,
+    ) -> std::io::Result<()> {
+        let command = String::from_utf8_lossy(&self.text).into_owned();
+        write!(output, "\r\n{MARK_RUNS}")?;
+        output.flush()?;
+        let mut interrupted = false;
+        let code = if command.is_empty() {
+            0
+        } else if let Some(words) = command.strip_prefix("echo ") {
+            write!(output, "{words}\r\n")?;
+            0
+        } else if command == BUILD_COMMAND {
+            for n in 0..BUILD_LINES {
+                interrupted = Self::runs(BUILD_LINE_MS, input, key_within)?;
+                if interrupted {
+                    break;
+                }
+                output.write_all(build_line(n).as_bytes())?;
+                output.flush()?;
+            }
+            if !interrupted {
+                interrupted = Self::runs(BUILD_LINE_MS, input, key_within)?;
+            }
+            if !interrupted {
+                output.write_all(BUILD_FINISHED.as_bytes())?;
+            }
+            0
+        } else if let Some(&(_, _, ms, code)) =
+            VERDICT_COMMANDS.iter().find(|c| c.1 == command.as_str())
+        {
+            interrupted = Self::runs(ms, input, key_within)?;
+            code
+        } else if command == VERDICT_INTERRUPTED {
+            interrupted = Self::runs(9_000, input, key_within)?;
+            0
+        } else {
+            127
+        };
+        let code = if interrupted {
+            output.write_all(b"^C\r\n")?;
+            130
+        } else {
+            code
+        };
+        output.write_all(exit_mark(code).as_bytes())?;
+        self.text.clear();
+        self.prompt_again(output)
+    }
+
     fn repaint(&mut self, output: &mut impl std::io::Write, clear: bool) -> std::io::Result<()> {
+        let typed = String::from_utf8_lossy(&self.text).into_owned();
+        match self.dress {
+            Dress::Plain => {}
+            Dress::Composer => {
+                let row = u16::try_from(self.row + 1).unwrap_or(u16::MAX);
+                return output.write_all(composer_row(row, &typed).as_bytes());
+            }
+            Dress::Fish => {
+                let row = u16::try_from(self.row + 1).unwrap_or(u16::MAX);
+                return output.write_all(fish_row(row, &typed).as_bytes());
+            }
+        }
         // An offscreen prompt means this line fills the viewport. Rebuild its visible tail;
         // a resize also starts a fresh view instead of guessing how the old rows reflowed.
         if clear || !self.visible {
@@ -2063,6 +2411,22 @@ impl Shot<'_> {
         Ok(())
     }
 
+    /// The wait a scene on a resident page starts with ([`RESIDENT_SETTLE_MS`]), a frame every
+    /// 60 ms, so its first key finds the pet at the caret.
+    fn pet_settles(&mut self) -> Result<(), Stopped> {
+        self.mark("page");
+        self.tick_until(RESIDENT_SETTLE_MS, Duration::from_millis(60))
+    }
+
+    /// A frame at each of `at` ms after the mark, kept as `<prefix><ms>`.
+    fn after(&mut self, prefix: &str, at: &[u64]) -> Result<(), Stopped> {
+        for &ms in at {
+            self.tick_until(ms, Duration::from_millis(40))?;
+            self.snap(&format!("{prefix}{ms}"));
+        }
+        Ok(())
+    }
+
     /// Split the window ([`SPLIT_PANES`]) and give the caret's pane the focus
     /// back, keeping each reply and the layout (`<name>.panes.txt`); half a
     /// second of frames lets the new pane's shell come up.
@@ -2299,6 +2663,83 @@ impl Shot<'_> {
                 self.snap("r0");
                 self.held("r")?;
             }
+            Scenario::BottomPrompt | Scenario::Composer => {
+                self.pet_settles()?;
+                let keep = [(12, "mid".to_string()), (30, "key30".to_string())];
+                self.paced(TYPING_KEY_MS, &keep, &keys_of(RESIDENT_TEXT))?;
+                self.snap("t0");
+                self.held("")?;
+            }
+            Scenario::Jump => {
+                self.pet_settles()?;
+                self.paced(BURST_KEY_MS, &[], &keys_of(RESIDENT_TEXT))?;
+                self.snap("t0");
+                self.tick_until(600, Duration::from_millis(60))?;
+                for (key, prefix) in [("home", "h"), ("end", "e")] {
+                    self.press(key);
+                    self.mark(key);
+                    sleep(30)?;
+                    self.snap(key);
+                    self.after(prefix, &[60, 120, 250, 470])?;
+                    self.tick_until(1_500, Duration::from_millis(60))?;
+                }
+            }
+            Scenario::EnterLong => {
+                self.pet_settles()?;
+                self.paced(BURST_KEY_MS, &[], &keys_of(ENTER_LONG_TEXT))?;
+                self.snap("typed");
+                self.tick_until(200, Duration::from_millis(40))?;
+                self.press("enter");
+                self.mark("enter");
+                sleep(30)?;
+                self.snap("enter");
+                self.after("e", &[60, 120, 250, 470, 1_650])?;
+            }
+            Scenario::Wall => {
+                self.pet_settles()?;
+                let keys = burst_keys();
+                let keep: Vec<(u64, String)> = (keys.len() as u64 - 5..keys.len() as u64)
+                    .map(|k| (k, format!("key{}", k + 1)))
+                    .collect();
+                self.paced(BURST_KEY_MS, &keep, &keys)?;
+                self.snap("t0");
+                self.held("")?;
+            }
+            Scenario::ColouredPrompt => {
+                self.pet_settles()?;
+                self.burst(Some(12), &keys_of(COLOURED_PROMPT_TEXT))?;
+                self.snap("t0");
+                self.fade()?;
+            }
+            Scenario::Verdict => {
+                self.pet_settles()?;
+                for (label, command, runs, _) in VERDICT_COMMANDS {
+                    self.burst(None, &keys_of(command))?;
+                    self.press("enter");
+                    self.mark(label);
+                    self.tick_until(runs, Duration::from_millis(60))?;
+                    self.mark(&format!("{label}-done"));
+                    self.after(&format!("{label}-d"), &[60, 250, 600, 1_500])?;
+                }
+                self.burst(None, &keys_of(VERDICT_INTERRUPTED))?;
+                self.press("enter");
+                self.mark("interrupted");
+                self.tick_until(VERDICT_INTERRUPT_MS, Duration::from_millis(60))?;
+                self.press("ctrl+c");
+                self.mark("interrupted-done");
+                self.after("interrupted-d", &[60, 250, 600, 1_500])?;
+            }
+            Scenario::LongBuild => {
+                self.pet_settles()?;
+                self.burst(None, &keys_of(BUILD_COMMAND))?;
+                self.snap("typed");
+                self.press("enter");
+                self.mark("enter");
+                self.after("b", &[1_000, 2_000, 3_000, 4_000])?;
+                self.tick_until((BUILD_LINES + 1) * BUILD_LINE_MS, Duration::from_millis(60))?;
+                self.mark("done");
+                self.after("d", &[60, 250, 600, 1_500])?;
+            }
             Scenario::Steam => {
                 self.burst(None, &word)?;
                 self.snap("t0");
@@ -2502,10 +2943,18 @@ fn gallery_program(
     dir: &Path,
     scenario: Scenario,
     theme: Theme,
+    caret: Option<Caret>,
     lab: &Path,
 ) -> Result<Vec<String>, String> {
     let mode = match scenario {
-        Scenario::Typing => Some("typing"),
+        Scenario::Typing | Scenario::Jump => Some("typing"),
+        Scenario::BottomPrompt
+        | Scenario::EnterLong
+        | Scenario::Wall
+        | Scenario::Verdict
+        | Scenario::LongBuild => Some("bottom-prompt"),
+        Scenario::Composer => Some("composer"),
+        Scenario::ColouredPrompt => Some("coloured-prompt"),
         Scenario::Settings | Scenario::RedrawStall => Some(""),
         Scenario::FoldRest => Some("fold"),
         Scenario::FocusRoundtrip | Scenario::FocusWrap => Some("focus"),
@@ -2523,10 +2972,13 @@ fn gallery_program(
         if !mode.is_empty() {
             args.push(mode.to_string());
         }
+        if let Some(caret) = caret {
+            args.push(format!("caret={}", caret.name()));
+        }
         return Ok(args);
     }
     let script = dir.join("paint.sh");
-    crate::util::write_fresh(&script, paint(scenario, theme))
+    crate::util::write_fresh(&script, paint(scenario, theme, caret))
         .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
     Ok(vec![
         "/bin/sh".to_string(),
@@ -2555,8 +3007,7 @@ impl Gallery {
     fn launch(
         &mut self,
         name: &str,
-        scenario: Scenario,
-        theme: Theme,
+        (scenario, theme, caret): (Scenario, Theme, Option<Caret>),
         (columns, lines, font_px): (u32, u32, u32),
         config: &[String],
     ) -> Result<Live, String> {
@@ -2578,7 +3029,13 @@ impl Gallery {
             font_px.to_string(),
         ];
         args.push("-e".to_string());
-        args.extend(gallery_program(&world.dir, scenario, theme, &paths().exe)?);
+        args.extend(gallery_program(
+            &world.dir,
+            scenario,
+            theme,
+            caret,
+            &paths().exe,
+        )?);
         let inst = Instance::start(
             &world,
             Launch {
@@ -2620,8 +3077,7 @@ impl Gallery {
         let mut live = self
             .launch(
                 "roster-probe",
-                Scenario::Typing,
-                Theme::Dark,
+                (Scenario::Typing, Theme::Dark, None),
                 Scenario::Settings.grid(),
                 &[],
             )
@@ -2660,9 +3116,15 @@ impl Gallery {
         crate::instance::after_stop(found, cleanup)
     }
 
-    /// One style, theme and scenario on a fresh instance.
-    fn one(&mut self, style: &str, theme: Theme, scenario: Scenario, a: &Args) -> Result<(), Fail> {
+    /// One style, theme, scenario and caret on a fresh instance.
+    fn one(
+        &mut self,
+        style: &str,
+        (theme, scenario, caret): (Theme, Scenario, Option<Caret>),
+        a: &Args,
+    ) -> Result<(), Fail> {
         let name = instance_name(style, theme, scenario);
+        let name = caret.map_or(name.clone(), |c| format!("{name}-{}", c.name()));
         remove_named(&self.out, &name);
         self.instances += 1;
         let before = (self.fails, self.inconclusive);
@@ -2672,7 +3134,7 @@ impl Gallery {
             scenario,
             Scenario::RedrawStall | Scenario::FocusRoundtrip | Scenario::FocusWrap
         ) && expects_rainbow(&config).map_err(usage)?;
-        match self.launch(&name, scenario, theme, grid, &config) {
+        match self.launch(&name, (scenario, theme, caret), grid, &config) {
             Err(e) => {
                 eprintln!("trail-gallery: [{name}] {e}");
                 self.fails += 1;
@@ -2842,10 +3304,17 @@ pub fn cmd_trail_gallery(args: &[String]) -> Res {
     } else {
         a.styles.clone()
     };
+    let carets: Vec<Option<Caret>> = if a.carets.is_empty() {
+        vec![None]
+    } else {
+        a.carets.iter().copied().map(Some).collect()
+    };
     for &scenario in &a.scenarios {
         for style in &styles {
             for &theme in &a.themes {
-                g.one(style, theme, scenario, &a)?;
+                for &caret in &carets {
+                    g.one(style, (theme, scenario, caret), &a)?;
+                }
             }
         }
     }

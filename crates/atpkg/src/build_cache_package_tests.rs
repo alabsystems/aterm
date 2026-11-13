@@ -2055,3 +2055,83 @@ fn compact_counts_a_kept_generation_as_neither_retired_nor_removed() {
     );
     assert!(!world.target.exists());
 }
+
+/// A PACKAGE DECLARATION RECORDED IN AN EARLIER BOOT BINDS BY ITS VOLUME'S UUID, AND ANOTHER
+/// VOLUME'S STAYS REFUSED: `cache_identity`, `lock_identity` and
+/// `preserve_if_present.parent_identity` record the volume's UUID beside the device number; when a
+/// restart renumbers the volume (the same UUIDs and inodes, another device number), a subsequent
+/// attempt on the warm generation is admitted and settles, and `compact` coordinates and retires
+/// it. NEGATIVE CONTROL: when any of the three declaration identities carries another volume's
+/// UUID (though its device number and inode match this boot's), admission and coordination refuse
+/// and the generation stays.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_package_declaration_from_an_earlier_boot_binds_by_volume_uuid_and_another_volumes_stays() {
+    let rewrite = |world: &World, mutate: &dyn Fn(&mut Receipt)| {
+        let mut receipt = world.receipt();
+        mutate(&mut receipt);
+        super::super::write(&world.path(), &receipt).unwrap();
+        let held = super::super::creation::pin(&world.target).unwrap();
+        let mut marker = super::super::retention::receipt_at(&held).unwrap();
+        mutate(&mut marker);
+        super::super::retention::write_marker(&held, &marker).unwrap();
+    };
+    let mut world = World::new();
+    world.admit(FIRST, 1).unwrap();
+    world.output(32 << 10);
+    world.settle(FIRST, false).unwrap();
+    let initial = world.receipt();
+    let decl = &initial.package.as_ref().unwrap().declaration;
+    assert!(decl.cache_identity.volume.is_some());
+    assert!(decl.lock_identity.volume.is_some());
+    assert!(
+        decl.preserve_if_present
+            .as_ref()
+            .unwrap()
+            .parent_identity
+            .volume
+            .is_some()
+    );
+    rewrite(&world, &|receipt| {
+        receipt.identity.device = receipt.identity.device.wrapping_add(1);
+        let decl = &mut receipt.package.as_mut().unwrap().declaration;
+        decl.cache_identity.device = decl.cache_identity.device.wrapping_add(1);
+        decl.lock_identity.device = decl.lock_identity.device.wrapping_add(1);
+        let guard = decl.preserve_if_present.as_mut().unwrap();
+        guard.parent_identity.device = guard.parent_identity.device.wrapping_add(1);
+    });
+    let re_admitted = world.admit(SECOND, 1).unwrap();
+    assert_eq!(re_admitted["budgeted"].as_bool(), Some(true));
+    assert_eq!(re_admitted["created"].as_bool(), Some(false));
+    world.settle(SECOND, false).unwrap();
+    world.held.take();
+    assert!(coordinate(&world.home, &world.receipt()).is_ok());
+    let compacted = compact(&world.home, &world.cache, &Fence::default()).unwrap();
+    assert_eq!(compacted["status"].as_str(), Some("retired"));
+    assert_eq!(compacted["removed"].as_u64(), Some(1));
+    assert!(!world.target.exists());
+
+    for which in ["cache", "lock", "preserve"] {
+        let mut world = World::new();
+        world.admit(FIRST, 1).unwrap();
+        world.output(32 << 10);
+        world.settle(FIRST, false).unwrap();
+        rewrite(&world, &|receipt| {
+            let decl = &mut receipt.package.as_mut().unwrap().declaration;
+            let id = match which {
+                "cache" => &mut decl.cache_identity,
+                "lock" => &mut decl.lock_identity,
+                "preserve" => &mut decl.preserve_if_present.as_mut().unwrap().parent_identity,
+                _ => unreachable!(),
+            };
+            id.volume.as_mut().unwrap()[0] ^= 0xff;
+        });
+        assert!(world.admit(SECOND, 1).is_err(), "{which}");
+        world.held.take();
+        assert!(
+            coordinate(&world.home, &world.receipt()).is_err(),
+            "{which}"
+        );
+        assert!(world.target.join("debug/deps/unit").is_file(), "{which}");
+    }
+}

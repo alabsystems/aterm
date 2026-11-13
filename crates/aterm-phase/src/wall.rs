@@ -114,6 +114,8 @@ pub enum Placement {
     Gutter,
     /// The vendor's error row: an `isApiErrorMessage` row Claude Code 2.1.281 draws with its `⏺` bullet in column 0, as the last thing said (`⏺ Login expired · Please run /login`; `crate::phase`'s `error_row_notice`).
     ErrorRow,
+    /// A sign-in screen or menu the program draws instead of its composer ([`Wall::sign_in`]): the one wall whose remedy stands on the screen itself, a sign-in the program already runs.
+    SignIn,
 }
 
 /// One wall, read from a screen.
@@ -132,14 +134,14 @@ pub struct Wall {
 }
 
 impl Wall {
-    /// A sign-in menu drawn INSTEAD of the composer, `rows[row]` its message ([`WallKind::Auth`]): agy's and Muse Code's, whose options open a browser and are never read.
+    /// A sign-in menu or screen drawn INSTEAD of the composer, `rows[row]` its message ([`WallKind::Auth`], [`Placement::SignIn`]): agy's and Muse Code's, whose options open a browser and are never read, and Grok Build's device sign-in, whose approval waits in a browser.
     pub(crate) fn sign_in(rows: &[String], row: usize) -> Self {
         Self {
             kind: WallKind::Auth,
             message: crate::text::trim(&rows[row]).to_string(),
             reset: None,
             row,
-            placement: Placement::Banner,
+            placement: Placement::SignIn,
             under_call: false,
         }
     }

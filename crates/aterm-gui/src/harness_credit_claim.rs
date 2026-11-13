@@ -683,6 +683,7 @@ impl crate::App {
             split: None,
             raise: false,
             admission: crate::tab_spawn::SpawnAdmission::Plain,
+            fleet: false,
         };
         let plan = match self.resolve_spawn(crate::control::SpawnAim::Front, Some(order)) {
             Ok(plan) => plan,

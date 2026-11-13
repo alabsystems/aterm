@@ -17,10 +17,10 @@
 //! the master-signed machine [`roster`]; and the Developer ID requirement with its bounded
 //! `/usr/bin/codesign` check ([`codesign`]).
 //!
-//! `aterm-update` layers the macOS `.app` pieces (DMG mount, spctl, the `RENAME_SWAP` bundle
-//! exchange and re-exec, the staging layout) on top. Roster verification is astream's strict
-//! Ed25519 check (`astream_aead::signature::verify`), shared with the owner-side minting tool so
-//! producer and client cannot drift on a valid chain.
+//! `app_swap` supplies macOS atomic directory placement. `aterm-update` layers the remaining
+//! `.app` pieces (DMG mount, spctl, re-exec and staging layout) on top. Roster verification is
+//! astream's strict Ed25519 check (`astream_aead::signature::verify`), shared with the owner-side
+//! minting tool so producer and client cannot drift on a valid chain.
 
 // Under the Trust verifier, register the `trust` tool namespace so the crate's
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-outs resolve; inert under plain rustc.
@@ -30,6 +30,8 @@
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
 
+#[cfg(target_os = "macos")]
+pub mod app_swap;
 pub mod cdn;
 pub mod codesign;
 pub mod git_https;

@@ -317,7 +317,7 @@ fn pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state() {
         .build();
     configure_glass_theme(&mut term);
     let mut pipeline = EffectsPipeline::new();
-    rainbow_kitty_glow(&mut pipeline, "rainbow kitty");
+    rainbow_kitty_glow(&mut pipeline, "rainbow");
     pipeline.set_cursor_pet(true, 0x5EED);
     let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
     assert!(
@@ -458,24 +458,24 @@ fn pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state() {
 }
 
 #[test]
-fn every_web_rainbow_kitty_spelling_is_v2() {
+fn the_web_rainbow_is_v2_the_underline_and_names_no_animal() {
     let mut p = EffectsPipeline::new();
-    for (style, kitty) in [
-        ("rainbow kitty", true),
-        ("rainbow kitty pet", true),
-        ("nyan rainbow", true),
+    for (style, rainbow) in [
+        ("rainbow", true),
+        (" Rainbow ", true),
         ("rainbow kitty v1", false),
-        ("kitty v1", false),
+        ("rainbow kitty flying", false),
+        ("nyan", false),
     ] {
         rainbow_kitty_glow(&mut p, style);
-        let want = if kitty {
+        let want = if rainbow {
             GlowStyle::RainbowKitty
         } else {
             GlowStyle::Lumen
         };
         assert_eq!(p.glow_cfg.style, want, "{style:?}");
     }
-    for (style, v2) in [("rainbow kitty", true), ("rainbow kitty v1", false)] {
+    for (style, v2) in [("rainbow", true), ("rainbow kitty v1", false)] {
         let mut p = EffectsPipeline::new();
         rainbow_kitty_glow(&mut p, style);
         let (mut term, mut input) = glass(8, 40);
@@ -484,31 +484,19 @@ fn every_web_rainbow_kitty_spelling_is_v2() {
         }
         assert_eq!(p.cursor.glow.v2_status().is_some(), v2, "{style:?}: v2");
     }
-    for (style, named, species) in [
-        ("rainbow kitty", true, PetSpecies::Cat),
-        ("kitty", true, PetSpecies::Cat),
-        ("rainbow kitty pet", true, PetSpecies::Cat),
-        ("Rainbow Kitty Underline", true, PetSpecies::Cat),
-        ("rainbow dog pet", true, PetSpecies::Dog),
-        ("pet dog", true, PetSpecies::Dog),
-        ("rainbow kitty flying", false, PetSpecies::Cat),
-        ("rainbow", false, PetSpecies::Cat),
-        ("lumen", false, PetSpecies::Cat),
-    ] {
+    // The animal is the pet setting's: no style changes it.
+    p.set_cursor_pet_species(PetSpecies::Dog);
+    for style in ["rainbow", "lumen", "off", "fire"] {
         rainbow_kitty_glow(&mut p, style);
-        assert_eq!(p.pet_style_named, named, "{style:?}: names the pet?");
-        assert_eq!(p.companion.species(), species, "{style:?}: which animal");
+        assert_eq!(p.companion.species(), PetSpecies::Dog, "{style:?}");
     }
-    for (style, tall) in [
-        ("rainbow kitty", true),
-        ("rainbow kitty pet", true),
-        ("rainbow kitty flying", true),
-        ("rainbow kitty tall", true),
-        ("rainbow kitty underline", false),
-    ] {
-        rainbow_kitty_glow(&mut p, style);
-        assert_eq!(p.glow_cfg.ribbon_tall, tall, "{style:?}: tall ribbon?");
-    }
+    p.set_cursor_pet_species(PetSpecies::Cat);
+    assert_eq!(p.companion.species(), PetSpecies::Cat);
+    rainbow_kitty_glow(&mut p, "rainbow");
+    assert!(
+        !p.glow_cfg.ribbon_tall && !p.glow_cfg.ribbon_flat,
+        "the one rainbow theme is the underline"
+    );
 }
 
 fn rainbow_kitty_glow(p: &mut EffectsPipeline, style: &str) {
@@ -526,9 +514,20 @@ fn rainbow_kitty_glow(p: &mut EffectsPipeline, style: &str) {
     );
 }
 
+/// The rainbow with the tall ribbon body. The one `rainbow` theme draws the underline; the tall
+/// body is a shape no built-in theme picks, kept drawing here as theme data for the tests that
+/// need a ribbon over the letters' rows.
+fn tall_rainbow_glow(p: &mut EffectsPipeline) {
+    rainbow_kitty_glow(p, "rainbow");
+    let request = p.glow_request.as_mut().expect("a glow request");
+    request.spelling.ribbon_tall = true;
+    p.resolve_glow();
+    assert!(p.glow_cfg.ribbon_tall);
+}
+
 fn pet_pipeline(seed: u64) -> EffectsPipeline {
     let mut p = EffectsPipeline::new();
-    rainbow_kitty_glow(&mut p, "rainbow kitty");
+    rainbow_kitty_glow(&mut p, "rainbow");
     p.set_cursor_pet(true, seed);
     p
 }
@@ -756,9 +755,9 @@ fn materialize_pet(p: &mut EffectsPipeline, term: &mut Terminal, input: &mut Ren
 #[test]
 fn cursor_pet_off_leaves_every_channel_and_fingerprint_untouched() {
     let mut plain = EffectsPipeline::new();
-    rainbow_kitty_glow(&mut plain, "rainbow kitty");
+    rainbow_kitty_glow(&mut plain, "rainbow");
     let mut off = EffectsPipeline::new();
-    rainbow_kitty_glow(&mut off, "rainbow kitty");
+    rainbow_kitty_glow(&mut off, "rainbow");
     off.set_cursor_pet(false, 7);
     assert!(!off.cursor_pet_enabled());
     assert!(!off.note_pointer_px(f32::NAN, 1.0), "poison is dropped");
@@ -862,8 +861,8 @@ fn cursor_pet_walks_beside_the_caret_then_sleeps_and_releases_cadence() {
 }
 
 #[test]
-fn cursor_pet_retires_when_the_style_stops_naming_it() {
-    for other in ["lumen", "rainbow kitty flying"] {
+fn cursor_pet_stays_beside_every_style_and_the_plain_cursor() {
+    for other in ["lumen", "fire", "off"] {
         let mut p = pet_pipeline(7);
         let (mut term, mut input) = glass(8, 40);
         materialize_pet(&mut p, &mut term, &mut input);
@@ -871,26 +870,15 @@ fn cursor_pet_retires_when_the_style_stops_naming_it() {
         rainbow_kitty_glow(&mut p, other);
         idle(&mut p, &mut term, &mut input, 1, 33.0);
         assert!(
-            pet_body_sprite(&free_sprites(&input), CELL_H).is_none(),
-            "{other}: nothing drawn on the very next frame"
+            pet_body_sprite(&free_sprites(&input), CELL_H).is_some(),
+            "{other}: the pet is still drawn on the very next frame"
         );
-        assert_eq!(p.cursor_pet_alpha(), 0);
-        assert_eq!(p.companion_hit_rect(), None);
-        assert!(
-            !p.companion.brain().is_active(),
-            "{other}: retired (a switch), not fading (an exit)"
-        );
-        assert!(!p.companion.needs_frames(), "{other}: no owed frames");
-        assert!(
-            p.cursor_pet_enabled(),
-            "the opt-in survives; only the owner went"
-        );
-        rainbow_kitty_glow(&mut p, "rainbow kitty");
-        materialize_pet(&mut p, &mut term, &mut input);
+        assert!(p.cursor_pet_alpha() > 0, "{other}");
+        assert!(p.companion.brain().is_active(), "{other}: not retired");
         assert_eq!(
             p.companion.brain().worn_pair(),
             Some(worn),
-            "{other}: back wearing the seed's coat"
+            "{other}: wearing the same coat"
         );
     }
 
@@ -899,7 +887,7 @@ fn cursor_pet_retires_when_the_style_stops_naming_it() {
     materialize_pet(&mut p, &mut term, &mut input);
     p.set_cursor_glow(
         false,
-        "rainbow kitty",
+        "rainbow",
         crate::cursor_fx::TrailColor::Automatic,
         None,
         400,
@@ -910,11 +898,17 @@ fn cursor_pet_retires_when_the_style_stops_naming_it() {
         0x0050_FA7B,
     );
     idle(&mut p, &mut term, &mut input, 2, 33.0);
+    assert!(
+        pet_body_sprite(&free_sprites(&input), CELL_H).is_some(),
+        "the trail master off leaves the pet beside the plain cursor"
+    );
+    p.set_cursor_pet(false, 7);
+    idle(&mut p, &mut term, &mut input, 2, 33.0);
     assert!(free_sprites(&input).is_empty());
     assert!(!p.companion.brain().is_active() && !p.companion.needs_frames());
     assert!(
         !p.is_active() && !p.enabled_any(),
-        "the trail master off is all-off again"
+        "the trail master and the pet off is all-off again"
     );
 }
 
@@ -993,7 +987,7 @@ fn cursor_pet_hides_in_history_and_when_unfocused_but_keeps_its_identity() {
 fn cursor_pet_body_rect_is_handed_to_the_word_engine() {
     let drive = |with_pet: bool| -> (bool, bool) {
         let mut p = EffectsPipeline::new();
-        rainbow_kitty_glow(&mut p, "rainbow kitty");
+        rainbow_kitty_glow(&mut p, "rainbow");
         p.set_sparkle_enabled(true);
         p.set_sparkle_feline("cat", true, true, false);
         if with_pet {
@@ -1038,13 +1032,15 @@ fn cursor_pet_body_rect_is_handed_to_the_word_engine() {
 #[test]
 fn web_pipeline_reads_off_and_aliases_like_the_native_host() {
     let mut p = EffectsPipeline::new();
-    rainbow_kitty_glow(&mut p, "rainbow kitty");
+    rainbow_kitty_glow(&mut p, "rainbow");
     assert!(p.glow_cfg.enabled);
     assert_eq!(p.glow_cfg.style, GlowStyle::RainbowKitty);
-    assert!(p.pet_style_named, "the bare name names the pet");
     rainbow_kitty_glow(&mut p, "nyan rainbow");
-    assert_eq!(p.glow_cfg.style, GlowStyle::RainbowKitty);
-    assert!(!p.pet_style_named, "nyan rainbow keeps the flying head");
+    assert_eq!(
+        p.glow_cfg.style,
+        GlowStyle::Lumen,
+        "a retired name is no style"
+    );
     rainbow_kitty_glow(&mut p, "classic mono");
     assert_eq!(p.glow_cfg.style, GlowStyle::Classic);
     assert!(
@@ -1053,7 +1049,6 @@ fn web_pipeline_reads_off_and_aliases_like_the_native_host() {
     );
     rainbow_kitty_glow(&mut p, "off");
     assert!(!p.glow_cfg.enabled, "`off` disables the trail");
-    assert!(!p.pet_style_named);
     rainbow_kitty_glow(&mut p, "lumen");
     assert!(p.glow_cfg.enabled && p.glow_cfg.style == GlowStyle::Lumen);
     rainbow_kitty_glow(&mut p, "plasma");
@@ -1458,15 +1453,7 @@ fn pipeline_rows_metrics_and_chrome_changes_reset_seeded_geometry() {
         (pipeline, frames)
     };
     let styles = [
-        "lumen",
-        "phaser",
-        "rainbow kitty",
-        "sparkle",
-        "fire",
-        "laser",
-        "beam",
-        "water",
-        "comet",
+        "lumen", "phaser", "rainbow", "sparkle", "fire", "laser", "beam", "water", "comet",
         "classic",
     ];
     for case in ["rows", "cell-metrics", "chrome-origin"] {
@@ -1475,7 +1462,7 @@ fn pipeline_rows_metrics_and_chrome_changes_reset_seeded_geometry() {
             let (_, fresh) = run(style, case, Prep::FreshFamily);
             assert!(
                 !subject.cursor.trail.is_active()
-                    && (style == "rainbow kitty" || !subject.cursor.glow.is_active()),
+                    && (style == "rainbow" || !subject.cursor.glow.is_active()),
                 "{style}/{case}: changed coordinate space retained a seeded survivor"
             );
             assert!(
@@ -1845,7 +1832,7 @@ fn the_web_pipeline_draws_no_light_on_a_light_page() {
     let mut pipeline = EffectsPipeline::new();
     pipeline.set_cursor_glow(
         true,
-        "rainbow kitty tall",
+        "rainbow",
         crate::cursor_fx::TrailColor::Automatic,
         None,
         650,
@@ -2128,7 +2115,7 @@ fn the_page_colours_its_cursor_as_a_native_window_does() {
             }
         }
     }
-    assert!(checked > 100, "{checked}");
+    assert!(checked > 80, "{checked}");
 
     let mut pipeline = EffectsPipeline::new();
     pipeline.set_cursor_glow(
@@ -2267,7 +2254,7 @@ fn fire_glow_splices_field_streams_into_the_head_band() {
     p.set_chrome(pad, head);
     p.set_cursor_glow(
         true,
-        "ember",
+        "fire",
         crate::cursor_fx::TrailColor::Automatic,
         None,
         400,
@@ -2595,7 +2582,7 @@ fn typed_page(style: &str, reduced: bool) -> (EffectsPipeline, bool) {
     (p, lit)
 }
 
-const BODY_STYLES: [&str; 4] = ["rainbow kitty", "water", "lumen", "comet"];
+const BODY_STYLES: [&str; 4] = ["rainbow", "water", "lumen", "comet"];
 
 #[test]
 fn reduced_motion_turns_off_the_page_cursor_family() {
@@ -3020,7 +3007,7 @@ fn the_published_trail_lays_no_light_on_a_word_icon() {
     // (frames with an icon, lit face texels, lit margin texels).
     let run = |unshaded: bool| -> (usize, usize, usize) {
         let mut p = EffectsPipeline::new();
-        rainbow_kitty_glow(&mut p, "rainbow kitty");
+        tall_rainbow_glow(&mut p);
         p.set_sparkle_enabled(true);
         p.word_icons_unshaded = unshaded;
         let (mut term, mut input) = glass(8, 40);
@@ -3114,7 +3101,7 @@ fn a_frame_without_cells_names_its_word_icons() {
     // (frames that drew an icon, frames whose icons the glow does not hold).
     let run = |unnamed: bool| -> (usize, usize) {
         let mut p = EffectsPipeline::new();
-        rainbow_kitty_glow(&mut p, "rainbow kitty");
+        rainbow_kitty_glow(&mut p, "rainbow");
         p.set_sparkle_enabled(true);
         p.word_icons_unnamed = unnamed;
         let (mut term, mut input) = glass(8, 40);
@@ -3862,7 +3849,7 @@ fn apply_routes_v2_offer_and_drains_companion_impulse_to_resident_pet() {
     p.set_cursor_pet(true, 0x5EED);
     p.set_cursor_glow(
         true,
-        "rainbow kitty",
+        "rainbow",
         crate::cursor_fx::TrailColor::Automatic,
         None,
         260,

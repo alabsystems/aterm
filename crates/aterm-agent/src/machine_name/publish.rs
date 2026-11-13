@@ -473,7 +473,7 @@ pub fn synchronize_system_names(
     }
     if all_accepted(&observed, expected) {
         return Err(Pending::SystemNames(
-            "Bonjour retains a numeric collision alias; its actual name is shown in the name menu"
+            "macOS retains a numeric collision alias; its actual name is shown in the name menu"
                 .into(),
         ));
     }
@@ -487,7 +487,7 @@ pub fn synchronize_system_names(
     if !all_read(&observed, expected) {
         if all_accepted(&observed, expected) {
             return Err(Pending::SystemNames(
-                "Bonjour retains a numeric collision alias; its actual name is shown in the name menu".into(),
+                "macOS retains a numeric collision alias; its actual name is shown in the name menu".into(),
             ));
         }
         return Err(judged(

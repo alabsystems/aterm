@@ -36,17 +36,17 @@ fn the_choice_says_when_its_figures_are_old_or_near_a_wall() {
         why("codex", &[], &chosen)
     };
     assert!(
-        said("unseen", Some(1)).contains("7d 1% (unseen),"),
+        said("unseen", Some(1)).contains("7d 99% left (unseen),"),
         "{}",
         said("unseen", Some(1))
     );
     assert!(
-        said("low", Some(98)).contains("7d 98% (low),"),
+        said("low", Some(98)).contains("7d 2% left (low),"),
         "{}",
         said("low", Some(98))
     );
     assert!(
-        said("usable", Some(1)).contains("7d 1%,"),
+        said("usable", Some(1)).contains("7d 99% left,"),
         "{}",
         said("usable", Some(1))
     );
@@ -65,6 +65,8 @@ fn member(host: &str, rows: Vec<Row>) -> Member {
         host: Some(format!("{host}.local")),
         addr: Some("192.168.1.9".to_owned()),
         drive: true,
+        // The fixture's members take a spawn: the level that needs is said, never defaulted.
+        access: aterm_types::fleet_access::FleetAccess::Full,
         at_ms: Some(AT),
         accounts: Some(rows),
         unread: Vec::new(),
@@ -276,6 +278,7 @@ fn a_member_is_weighed_by_the_row_its_launch_would_start_on() {
 
     // On the wire: `launch=1`, `launch=0`, and nothing or `-` from an aterm older than the field.
     let peer = |launch: &str| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m6.local".to_owned(),
         answer: Ok(vec![
@@ -448,6 +451,73 @@ fn a_signed_out_row_is_named_as_signed_out_with_what_mends_it() {
     assert!(!words.contains("signed out"), "{words}");
 }
 
+/// A Mac whose fleet access is below Full Access takes no spawn, whatever its grants say, and
+/// is counted as locked, which the refusal tells from a Mac with no grant. A header with no `access=` is an aterm older than
+/// the lock, which enforces none: it reads as full. CONTROL: the same member at Full Access is
+/// chosen.
+#[test]
+fn a_locked_mac_takes_no_spawn_and_an_older_aterm_reads_as_full() {
+    use aterm_types::fleet_access::FleetAccess;
+    let best = vec![row("claude", "best", Some(0), Some(0))];
+    for level in [FleetAccess::ReadOnly, FleetAccess::ReadWrite] {
+        let locked = Member {
+            access: level,
+            ..member("m1", best.clone())
+        };
+        let counts = pick("claude", &[], std::slice::from_ref(&locked)).expect_err("locked");
+        assert_eq!(
+            *counts,
+            Counts {
+                answered: 1,
+                locked: 1,
+                drivable: 0,
+                ..Counts::default()
+            },
+            "{level:?}"
+        );
+        let ungranted = Counts {
+            answered: 1,
+            ungranted: 1,
+            ..Counts::default()
+        };
+        assert_ne!(
+            none_able("claude", &[], &counts, None),
+            none_able("claude", &[], &ungranted, None),
+            "{level:?}: its grant stands, and the refusal tells a lock from a missing grant"
+        );
+        let open = Member {
+            access: FleetAccess::Full,
+            ..locked
+        };
+        assert_eq!(chosen("claude", &[open]), "m1.local", "control");
+    }
+    let header = |access: &str| {
+        let line = format!(
+            "instance pid=9 host=m8.local version=0.146.0 sessions=0 at_ms=1{access} drive=1"
+        );
+        let peers = [PeerSurvey {
+            authenticated: None,
+            reason: None,
+            label: "m8.local".to_owned(),
+            answer: Ok(vec![line]),
+            fault: survey::PeerFault::Other,
+            unproven: false,
+            node: Some("ab".repeat(16)),
+            addr: Some("192.168.1.8".to_owned()),
+        }];
+        members_of(&peers)
+            .first()
+            .map(|member| (member.access, member.drive))
+    };
+    assert_eq!(header(""), Some((FleetAccess::Full, true)), "older aterm");
+    assert_eq!(
+        header(" access=write"),
+        Some((FleetAccess::ReadWrite, true))
+    );
+    assert_eq!(header(" access=read"), Some((FleetAccess::ReadOnly, true)));
+    assert_eq!(header(" access=full"), Some((FleetAccess::Full, true)));
+}
+
 #[test]
 fn a_mac_that_does_not_let_this_one_drive_it_is_never_chosen() {
     let best = vec![row("claude", "best", Some(0), Some(0))];
@@ -571,6 +641,7 @@ fn a_refusal_counts_how_far_the_members_got() {
 #[test]
 fn a_survey_reply_reads_as_a_member() {
     let peer = |answer: Result<Vec<String>, String>| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m7.local at 192.168.1.7".to_owned(),
         answer,
@@ -636,7 +707,7 @@ fn a_survey_reply_reads_as_a_member() {
     let chosen = pick("claude", &[], &members).expect("m7 qualifies");
     assert_eq!(
         why("claude", &[], &chosen),
-        "claude account main 7d 12% 5h 3%, 1 busy session; the best of 1 that can take it"
+        "claude account main 7d 88% left 5h 97% left, 1 busy session; the best of 1 that can take it"
     );
     let plus = vec![
         "instance pid=9 host=m7.local version=0.146.0 sessions=0 level=facts \
@@ -852,6 +923,7 @@ fn a_usable_row_that_names_no_read_takes_no_worker() {
 
     // A read's `-` and an older aterm's nothing read alike, and either is refused for `usable`.
     let peer = |row: &str| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m21.local at 192.168.1.21".to_owned(),
         answer: Ok(vec![
@@ -1204,7 +1276,7 @@ fn a_package_that_needs_trust_and_150g_is_never_placed_on_a_mac_without_them() {
     assert_eq!(chosen.able, 1);
     assert_eq!(
         why("claude", &needs, &chosen),
-        "claude account worst 7d 90% 5h 90%, 0 busy sessions; trust 2 behind, 150 GiB free; \
+        "claude account worst 7d 10% left 5h 10% left, 0 busy sessions; trust 2 behind, 150 GiB free; \
          the best of 1 that can take it"
     );
     assert_eq!(
@@ -1307,6 +1379,7 @@ fn a_refusal_with_needs_counts_those_that_meet_them_apart() {
 #[test]
 fn a_survey_reply_carries_the_members_home_and_checkouts() {
     let peer = |lines: &[&str]| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m7.local at 192.168.1.7".to_owned(),
         answer: Ok(lines.iter().map(|l| (*l).to_owned()).collect()),

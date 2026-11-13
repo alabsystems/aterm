@@ -757,7 +757,9 @@ pub(super) fn repair(
                     "required dependency download failed; existing worktrees left untouched",
                 )?;
                 current()?;
-                repos::verify_existing(
+                // The clone just ran to its end, without a checkout: it has no index until
+                // `checkout_pin` writes one, which `repos::finished` would read as cut off.
+                repos::verify_origin(
                     sys,
                     user,
                     &dependency.owner,

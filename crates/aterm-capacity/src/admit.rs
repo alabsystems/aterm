@@ -150,7 +150,7 @@ pub fn gib(bytes: u64) -> String {
 
 /// `tenths` tenths of a GiB, as [`gib`] writes them.
 fn tenths_of_gib(tenths: u128) -> String {
-    if tenths % 10 == 0 {
+    if tenths.is_multiple_of(10) {
         format!("{} GiB", tenths / 10)
     } else {
         format!("{}.{} GiB", tenths / 10, tenths % 10)
@@ -1384,7 +1384,7 @@ pub fn covering_disk(
     }) else {
         return Ok(None);
     };
-    let mount = machine.read(Some(on)).volume.map(|v| v.mount);
+    let mount = machine.volume(on).map(|v| v.mount);
     Ok((mount.is_some() && by.need.path == mount).then_some(by))
 }
 
@@ -2006,8 +2006,16 @@ pub(crate) fn decide(
     Ok(Grant { cores, alone })
 }
 
-/// Bound every new grant by physical room. Earlier waiters in rank/arrival order reserve
-/// their requested room without changing any running grant.
+/// Bound every new grant by physical room. Earlier waiters in rank/arrival order that need
+/// cores alone reserve their requested room without changing any running grant.
+///
+/// CORES-NO-CYCLE. A waiter that needs memory, disk or the quiet machine as well reserves no
+/// cores: it may wait for memory a holder keeps, and that holder's own later cores claim (a test
+/// run's subprocesses, [`crate::Need::cores`] after its memory) would then wait on it, a cycle no
+/// claim's end breaks. On this Mac, 2026-11-10, a verify holding 3.2 GiB waited an hour for
+/// cores two `targo test` waiters reserved while they queued for memory behind a 106 GiB compile
+/// that waited for that verify's 3.2 GiB. Such a waiter still counts as a party to the fair share
+/// ([`grant_iter`]), and its memory waits keep their first in, first out order.
 fn ranked_grant(
     need: &Need,
     mine: (u64, u32, u64),
@@ -2022,7 +2030,9 @@ fn ranked_grant(
     let reserved = others
         .iter()
         .filter(|o| {
-            o.record.held.is_none() && (o.record.need.rank, o.record.order()) < (need.rank, mine)
+            o.record.held.is_none()
+                && reserves_cores(&o.record.need)
+                && (o.record.need.rank, o.record.order()) < (need.rank, mine)
         })
         .map(|o| o.record.need.cores)
         .fold(0u32, u32::saturating_add);
@@ -2040,6 +2050,16 @@ fn ranked_grant(
     )
     .min(room)
 }
+
+/// Whether a waiter with `need` reserves its cores ahead of later claims (CORES-NO-CYCLE,
+/// [`ranked_grant`]): only one that waits for nothing but cores.
+const fn reserves_cores(need: &Need) -> bool {
+    need.mem == 0 && need.margin == 0 && need.disk == 0 && need.quiet.is_none()
+}
+
+#[cfg(test)]
+#[path = "admit_cores_cycle_tests.rs"]
+mod cores_cycle_tests;
 
 /// The fair share before `ranked_grant` applies reservations and the physical core bound.
 /// - The room is the cores less what every held claim was granted. Past about half
@@ -2178,19 +2198,52 @@ impl Claim {
         clippy::result_large_err,
         reason = "returning original Claim preserves its exact writer and pending custody on refusal"
     )]
-    pub fn into_retained_guard(mut self) -> Result<crate::RetainedClaim, (Self, io::Error)> {
+    pub fn into_retained_guard(self) -> Result<crate::RetainedClaim, (Self, io::Error)> {
+        self.retain_original(crate::ledger::DETACHED_MEMORY)
+    }
+
+    /// Retain an original ordinary memory-and-CPU reservation through inherited close-only
+    /// guards. Exact admitted cores and the full memory peak remain reserved until final
+    /// close. This grants no SDK, execution, covering, cohort or timing authority.
+    ///
+    /// # Errors
+    /// Unsupported claim kinds and partial transfers return the exact original owner.
+    /// A partial intent remains poisoned and can retry only its original protocol.
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed transfer returns original custody"
+    )]
+    pub fn into_retained_reservation(self) -> Result<crate::RetainedClaim, (Self, io::Error)> {
+        self.retain_original(crate::ledger::DETACHED_RESERVATION)
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed transfer returns original custody"
+    )]
+    fn retain_original(
+        mut self,
+        marker: &'static [u8],
+    ) -> Result<crate::RetainedClaim, (Self, io::Error)> {
+        let supported = if marker == crate::ledger::DETACHED_MEMORY {
+            crate::ledger::memory_only(&self.record.need)
+        } else {
+            crate::ledger::retained_reservation(&self.record.need)
+        };
         if self.laid.is_cohort()
             || !self.entry_custody
             || self.record.accounting != crate::Accounting::Holder
             || self.record.held.is_none()
             || self.record.need.critical
-            || !crate::ledger::memory_only(&self.record.need)
+            || !supported
         {
             return Err((
                 self,
                 io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "only an original admitted non-critical non-covering ordinary memory-only claim can detach",
+                    "only an original admitted non-critical non-covering ordinary reservation can detach",
                 ),
             ));
         }
@@ -2208,7 +2261,7 @@ impl Claim {
                     ));
                 }
             }
-            self.laid.detach_memory()
+            self.laid.detach_reservation(marker)
         })();
         if let Err(error) = prepared {
             return Err((self, error));
@@ -2350,8 +2403,8 @@ impl Claim {
     /// [`Self::measurement_entry`] for work that runs on a busy machine and states it
     /// ([`crate::AtBound::RunLoaded`]): a loaded admission enters on one fresh window, and a quiet
     /// one whose entry stays busy through its entry's patience enters then; each says why in
-    /// [`crate::StatedEntry::unqualified`] (owner ruling 2026-11-05: a busy machine never blocks a
-    /// release).
+    /// [`crate::StatedEntry::unqualified`] (a busy machine never blocks a release: the row is
+    /// named, not counted red).
     /// # Errors
     /// What [`Self::measurement_entry`] refuses, but a busy machine: no window at its entry's
     /// patience ([`crate::TimingIssue::Blind`]) included.
@@ -3110,8 +3163,9 @@ impl Waiter {
         }
         let at = need.path.clone().or_else(|| std::env::current_dir().ok());
         need.path = (need.disk > 0)
-            .then(|| machine.read(at.as_deref()).volume.map(|v| v.mount))
-            .flatten();
+            .then(|| at.as_deref().and_then(|at| machine.volume(at)))
+            .flatten()
+            .map(|v| v.mount);
         let mark = aterm_toolchain::waits::Mark::begin(&format!("capacity: {} waits", need.what));
         let stalled_after = need
             .stuck_ends
@@ -3384,6 +3438,35 @@ impl Waiter {
         } else {
             counted(records, self.record.pid, procs.as_ref(), reading.available)
         };
+        // A cold release slice holds memory ALONE while it learns its unit peaks. `Now` may
+        // oversubscribe ordinary work, but letting unrelated work through this exclusion both
+        // breaks the memory bound and can deadlock when that work next asks for the release's
+        // held core pool. Ancestor filtering above deliberately removes a release holder from
+        // dependent work inside its own tree, preserving that work's anti-ABBA escape.
+        let protected_release_alone = records
+            .iter()
+            .find(|record| {
+                record.held.is_some_and(|held| held.alone)
+                    && record.need.mem > 0
+                    && record.need.rank == crate::Rank::Release
+                    && (record.accounting == crate::Accounting::CohortOwned
+                        || record.pid != self.record.pid)
+            })
+            .map(|record| (record.pid, record.need.what.clone()));
+        // `Now` may override an ordinary resource shortage, but not the memory turn of visible
+        // Release or leading work. Compute this after `counted`: work inside a held parent must
+        // retain its anti-ABBA escape from an unsafe waiter, while an independent forced stage
+        // cannot consume the room a release slice or its leading unit already queued for.
+        let protected_memory_turn = need.mem > 0
+            && records.iter().any(|record| {
+                record.held.is_none()
+                    && record.need.mem > 0
+                    && (record.need.rank == crate::Rank::Release || record.need.leads)
+                    && (record.accounting == crate::Accounting::CohortOwned
+                        || record.pid != self.record.pid)
+                    && (!record.need.leads, record.need.rank, record.order())
+                        < (!need.leads, need.rank, mine)
+            });
         let mut claimants = HashSet::with_capacity(records.len() + 1);
         claimants.extend(records.iter().map(|r| r.pid));
         claimants.insert(self.record.pid);
@@ -3554,6 +3637,8 @@ impl Waiter {
         Ok(Found {
             cores,
             decided,
+            protected_release_alone,
+            protected_memory_turn,
             cpu: cpu.ok(),
             load1: reading.load1,
             loaded: loaded.is_some(),
@@ -3673,37 +3758,84 @@ impl Waiter {
 
     /// One look under `--admit now`: admit it room or not, with what it would have waited for;
     /// on a cohort-aware ledger it only polls, so it meets the same checks as any other look.
-    /// Either way it decides only in its turn: while another admission holds the ledger's lock
-    /// it admits nothing and hands the waiter back ([`Forced::Turn`]) to look again, which
+    /// Either way it decides only in its turn and never past the physical core bound, a
+    /// Release's core reservation or a Release claim a background need yields to: while
+    /// another admission holds the ledger's lock, or a look is short of any of those (whatever
+    /// else it is short of), it admits nothing and hands the waiter back ([`Forced::Turn`]) to
+    /// look again, which
     /// [`admit_with`]'s `now` does every [`Pace::turn_gap`] and the Trust lane's launch gate at
     /// its next pass.
     ///
     /// # Errors
-    /// The ledger could not be read or marked admitted; on a cohort-aware ledger, also a look
-    /// short of anything but the ledger's lock.
-    pub fn force(mut self, machine: &dyn Machine) -> io::Result<Forced> {
-        if self.ledger.cohort_aware()? {
+    /// [`Error::Ledger`]: the ledger could not be read or marked admitted, or its claim file was
+    /// removed; on a cohort-aware ledger, also [`Error::Refused`], a look short of anything else
+    /// (room), and [`Error::Timing`], a grant whose timing could not be qualified.
+    pub fn force(mut self, machine: &dyn Machine) -> Result<Forced, Error> {
+        if self.ledger.cohort_aware().map_err(Error::Ledger)? {
             return match self.poll_mode(machine, true, &|| false) {
                 Polled::Admitted(claim) => Ok(Forced::Admitted(claim, None)),
+                // The ledger's lock or a core, a Release's core reservation among them, is never
+                // overridden, on either kind of ledger: a look short of one looks again in its
+                // turn, whatever else it is short of, as the holder branch below does. A Release
+                // claim a Background need yields to, which that branch never overrides either,
+                // meets no look here: a cohort-aware ledger admits no Background need
+                // (`enter_accounted`).
                 Polled::Waiting(waiter, short)
-                    if matches!(short.shorts[..], [Short::Turn { .. }]) =>
+                    if short
+                        .shorts
+                        .iter()
+                        .any(|short| matches!(short, Short::Turn { .. } | Short::Cores)) =>
                 {
                     Ok(Forced::Turn(waiter, short))
                 }
-                Polled::Waiting(_, short) => Err(io::Error::other(short.to_string())),
-                Polled::Gone(error) => Err(error),
-                Polled::Unqualified(why) => Err(io::Error::other(why)),
+                Polled::Waiting(_, short) => Err(Error::short_at_once(short)),
+                Polled::Gone(error) => Err(Error::Ledger(error)),
+                Polled::Unqualified(why) => Err(Error::Timing(why)),
             };
         }
-        let turn = match self.ledger.try_turn()? {
+        let turn = match self.ledger.try_turn().map_err(Error::Ledger)? {
             Ok(turn) => turn,
             Err(holder) => {
                 return Ok(Forced::Turn(self, Shortfall::only(Short::Turn { holder })));
             }
         };
-        let found = self.look(machine, None)?;
-        // An override may bypass resource-only memory/disk admission, never a Release's
-        // core reservation or the physical core bound.
+        let found = self.look(machine, None).map_err(Error::Ledger)?;
+        if found
+            .protected_release_alone
+            .as_ref()
+            .is_some_and(|(protected_pid, protected_what)| {
+                found.decided.as_ref().is_err_and(|short| {
+                    short.shorts.iter().any(|item| {
+                        matches!(item, Short::Alone { pid, what }
+                            if pid == protected_pid && what == protected_what)
+                    })
+                })
+            })
+        {
+            return Ok(Forced::Turn(
+                self,
+                found
+                    .decided
+                    .expect_err("the protected Release ALONE claim was short"),
+            ));
+        }
+        // An override may bypass an ordinary resource-only memory/disk admission, never a
+        // visible Release/lead memory turn, a Release's core reservation or the physical core
+        // bound. `look` derives the memory authority after ancestor filtering, so this preserves
+        // the bounded escape for work a held parent must let finish.
+        if found.protected_memory_turn
+            && found.decided.as_ref().is_err_and(|short| {
+                short
+                    .shorts
+                    .iter()
+                    .any(|item| matches!(item, Short::Memory { .. }))
+            })
+        {
+            return Ok(Forced::Turn(
+                self,
+                found.decided.expect_err("the protected turn was short"),
+            ));
+        }
         if self.record.need.cores > 0 && found.cores == 0 {
             return Ok(Forced::Turn(self, Shortfall::only(Short::Cores)));
         }
@@ -3732,9 +3864,9 @@ impl Waiter {
         drop(turn);
         match polled {
             Polled::Admitted(claim) => Ok(Forced::Admitted(claim, would)),
-            Polled::Waiting(_, short) => Err(io::Error::other(short.to_string())),
-            Polled::Gone(e) => Err(e),
-            Polled::Unqualified(why) => Err(io::Error::other(why)),
+            Polled::Waiting(_, short) => Err(Error::short_at_once(short)),
+            Polled::Gone(e) => Err(Error::Ledger(e)),
+            Polled::Unqualified(why) => Err(Error::Timing(why)),
         }
     }
 
@@ -3840,6 +3972,12 @@ pub(crate) fn stuck(holders: &[Holder]) -> Option<aterm_toolchain::waits::Stuck>
 struct Found {
     cores: u32,
     decided: Result<(Grant, Option<QuietStart>), Shortfall>,
+    /// A visible, unrelated Release holder owns memory ALONE. Forced admission preserves its
+    /// exclusion when the ordinary decision names that holder.
+    protected_release_alone: Option<(u32, String)>,
+    /// A visible queued Release or leading memory need is ahead of this waiter. Forced
+    /// admission preserves its turn when the ordinary decision is short of memory.
+    protected_memory_turn: bool,
     cpu: Option<crate::CpuWindow>,
     load1: Option<f64>,
     /// A measured need that runs loaded met its bound on a busy machine ([`crate::AtBound`]).
@@ -3883,8 +4021,11 @@ impl Found {
 pub enum Forced {
     /// Admitted, room or not, with what it would have waited for: `None` where it had room.
     Admitted(Claim, Option<Shortfall>),
-    /// Another admission held the ledger's lock while it decided, so it decided nothing: the
-    /// waiter, still in the queue, and the short that names that lock's holder.
+    /// It decided nothing, as no override may: another admission held the ledger's lock while
+    /// it decided, or its look was short of a core, a Release's core reservation, a Release
+    /// claim a background need yields to or a visible Release/lead memory turn
+    /// ([`Waiter::force`]). The waiter, still in the queue, and what it was short of (the
+    /// lock's holder, for the lock).
     Turn(Waiter, Shortfall),
 }
 
@@ -3914,6 +4055,12 @@ pub enum Error {
     },
     /// The ledger could not be used.
     Ledger(io::Error),
+    /// A look that could not wait was short, so it admitted nothing: of room under `--admit now`
+    /// on a cohort-aware ledger, which admits only what fits ([`Waiter::force`]; one short of
+    /// the ledger's lock or a core looks again, [`Forced::Turn`]), or of
+    /// anything but the ledger's own failure, its lock included, at a
+    /// caller's one look ([`Self::short_at_once`]). The claim has left the queue.
+    Refused(Shortfall),
     /// An interrupt, the caller ([`admit_until`]), or a conservative Background stop before a
     /// [`crate::Admit::Preemptible`] grant ended the wait. The latter means a Release arrived or
     /// ledger failure made its absence unknowable. The claim has left the queue.
@@ -3990,6 +4137,7 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::Ledger(e) => write!(f, "the capacity ledger could not be used: {e}"),
+            Error::Refused(short) => write!(f, "short at a look that could not wait: {short}"),
             Error::Stopped { signal, short } => {
                 match signal {
                     Some(sig) => write!(
@@ -4015,6 +4163,19 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// What a look that could not wait comes to where it found `short`
+    /// ([`Polled::Waiting`]): the ledger's failure, where that is all it was short of, else
+    /// [`Self::Refused`].
+    #[must_use]
+    pub fn short_at_once(short: Shortfall) -> Self {
+        match &short.shorts[..] {
+            [Short::Ledger(why)] => Self::Ledger(io::Error::other(why.clone())),
+            _ => Self::Refused(short),
+        }
+    }
+}
 
 /// Admit `need` in this user's ledger on the live machine, saying on stderr what it waits for ([`admit_with`]).
 ///
@@ -4064,15 +4225,49 @@ pub fn try_admit_with(
     machine: &dyn Machine,
     need: Need,
 ) -> Result<Option<Claim>, Error> {
-    if never(&need, &machine.read(need.path.as_deref())).is_some() {
-        return Ok(None);
+    try_admit_observed_with(ledger, machine, need).map(|attempt| match attempt {
+        AdmissionAttempt::Admitted(claim) => Some(claim),
+        AdmissionAttempt::Waiting(_) | AdmissionAttempt::Unreachable(_) => None,
+    })
+}
+
+/// The result of one nonblocking admission look, retaining its diagnostic reason.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the original claim retains its custody without an allocation added by diagnostic observation"
+)]
+pub enum AdmissionAttempt {
+    /// Hold this claim while the work runs.
+    Admitted(Claim),
+    /// The unchanged admission rule found this shortfall. No queue position remains.
+    Waiting(Shortfall),
+    /// The need cannot fit this reading. No waiter was entered.
+    Unreachable(String),
+}
+
+/// [`try_admit_with`], retaining the reason an attempt could not start. This performs the
+/// same single look and drops a waiting claim before returning its observation.
+///
+/// # Errors
+/// The ledger cannot be read or written, or requested timing is unavailable.
+pub fn try_admit_observed_with(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+) -> Result<AdmissionAttempt, Error> {
+    if let Some(why) = never(&need, &machine.read(need.path.as_deref())) {
+        return Ok(AdmissionAttempt::Unreachable(why));
     }
     match Waiter::enter(ledger, machine, need)
         .map_err(Error::Ledger)?
         .poll(machine)
     {
-        Polled::Admitted(claim) => Ok(Some(claim)),
-        Polled::Waiting(_, _) => Ok(None),
+        Polled::Admitted(claim) => Ok(AdmissionAttempt::Admitted(claim)),
+        Polled::Waiting(waiter, shortfall) => {
+            drop(waiter);
+            Ok(AdmissionAttempt::Waiting(shortfall))
+        }
         Polled::Gone(error) => Err(Error::Ledger(error)),
         Polled::Unqualified(issue) => Err(Error::Timing(issue)),
     }
@@ -4346,7 +4541,7 @@ fn admit_deciding(
         let mut said: Option<Instant> = None;
         let mut last: Option<Shortfall> = None;
         let (claim, would) = loop {
-            match waiter.force(machine).map_err(Error::Ledger)? {
+            match waiter.force(machine)? {
                 Forced::Admitted(claim, would) => {
                     if let Some((watch, _)) = &turn {
                         let signal = watch.take();
@@ -4601,101 +4796,12 @@ fn admit_deciding(
 }
 
 #[cfg(test)]
-mod waiting_completion_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use super::*;
-
-    /// A caller stop observed by an interruptible holder scan wins over the refusal that scan
-    /// was preparing. Negative control: without the check after `holders`, this is `Unmet`.
-    #[test]
-    fn a_stop_during_unmet_holder_discovery_is_reported_as_stopped() {
-        struct StopsInHolders<'a>(&'a AtomicBool);
-
-        impl Relief for StopsInHolders<'_> {
-            fn relieve(
-                &mut self,
-                _short: &Shortfall,
-                _say: &mut dyn FnMut(&str),
-                _stopped: &dyn Fn() -> bool,
-            ) {
-            }
-
-            fn holders(
-                &mut self,
-                _short: &Shortfall,
-                _stopped: &dyn Fn() -> bool,
-            ) -> Option<String> {
-                self.0.store(true, Ordering::SeqCst);
-                Some("holder scan stopped".to_owned())
-            }
-        }
-
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let ledger = Ledger::at(scratch.path().join("ledger"));
-        let mut reading = Reading::of_gib(48, 40, 14);
-        reading.volume = Some(Volume {
-            mount: PathBuf::from("/vol"),
-            total: 40 * GIB,
-            free: 20 * GIB,
-            floor: 4 * GIB,
-            room: 2 * GIB,
-        });
-        let machine = crate::Fixed::new(reading);
-        let stopped = AtomicBool::new(false);
-        let mut relief = StopsInHolders(&stopped);
-        let got = admit_waiting(
-            &ledger,
-            &machine,
-            Need::new("verify").disk(27 * GIB, "/vol"),
-            Admit::Wait,
-            Pace::default(),
-            &mut relief,
-            &mut |_| {},
-            &|| stopped.load(Ordering::SeqCst),
-        );
-
-        let Err(Error::Stopped {
-            signal: None,
-            short: Some(short),
-        }) = &got
-        else {
-            panic!("the stop during holder discovery wins, got {got:?}");
-        };
-        assert!(short.shorts.iter().any(Short::unservable), "{short}");
-        assert!(ledger.list().unwrap().is_empty(), "the stopped claim left");
-    }
-}
+#[path = "admit_waiting_completion_tests.rs"]
+mod waiting_completion_tests;
 
 #[cfg(test)]
-mod timing_completion_tests {
-    use super::*;
-
-    #[test]
-    fn protection_expiring_during_work_cannot_qualify_its_result() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let ledger = Ledger::at(scratch.path().join("ledger"));
-        let machine = crate::tests::TimingMachine::new(&[(0, 0), (1, 99), (2, 198), (3, 297)]);
-        let mut claim = crate::tests::timed_in(&ledger, &machine);
-        claim
-            .measurement_entry_on(&machine, Pace::default(), &mut |_| false)
-            .unwrap();
-        claim.record.need.quiet_policy = crate::QuietPolicy::Unknown;
-        assert_eq!(
-            claim.timing_admission(),
-            Err(crate::TimingIssue::UnknownAdmission)
-        );
-        claim.record.need.quiet_policy = crate::QuietPolicy::Timing;
-        {
-            // Inject completion after the EXISTING hold, without waiting or changing its duration.
-            let admitted =
-                now_ms().saturating_sub(millis(claim.record.need.patience.unwrap().hold));
-            claim.record.held.as_mut().unwrap().admitted_ms = admitted;
-            claim.record.timing.admitted_ms = Some(admitted);
-        }
-        assert_eq!(claim.timing_admission(), Err(crate::TimingIssue::Expired));
-    }
-}
+#[path = "admit_timing_completion_tests.rs"]
+mod timing_completion_tests;
 
 #[cfg(all(test, unix))]
 #[path = "cohort_budget_tests.rs"]

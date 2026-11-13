@@ -19,7 +19,7 @@ use aterm_spec::interp::{self, State};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
 use super::aos_repair_tests::{
-    WID, detached_for, exported_log, glyph, leave_prompt, momentum_app, press, status, type_keys,
+    WID, detached_for, exported_log, glyph, leave_prompt, momentum_app, status, type_keys,
 };
 use crate::App;
 use crate::aos_host::Worked;
@@ -75,6 +75,30 @@ fn pressed(key: Key, mods: Modifiers) -> InputEvent {
 /// Shift-Enter: on the alternate screen, a new line typed into a composer, which carries no text.
 fn shift_enter() -> InputEvent {
     pressed(Key::Named(NamedKey::Enter), Modifiers::SHIFT)
+}
+
+/// The front session's sink.
+fn front_sink(app: &App) -> std::sync::Arc<aterm_session::sink::SinkWriter> {
+    let session = app.front_terminal(WID).expect("front terminal").session;
+    app.pool.get(session).expect("session").ctx.sink.clone()
+}
+
+/// Dispatches `ev` at `at` as the person's, then waits until the session's ordered writer has
+/// written whatever the press handed it (a hang detector): a person's next key comes long after
+/// the last one's write, whichever route it took.
+fn press(app: &mut App, ev: InputEvent, at: Instant) {
+    super::aos_repair_tests::press(app, ev, at);
+    crate::app_input::paste_order::await_drain_for_test(&front_sink(app));
+}
+
+/// Runs `body` once per route a typed key can take on this host
+/// ([`crate::app_input::paste_order::routes_for_test`]), naming it: written inline by the UI
+/// thread, or queued to the session's ordered writer, as every key is on Windows.
+fn on_every_route(mut body: impl FnMut(&str)) {
+    for &queued in crate::app_input::paste_order::routes_for_test() {
+        let _route = queued.then(crate::app_input::paste_order::force_conpty_route_for_test);
+        body(if queued { "queued" } else { "inline" });
+    }
 }
 
 /// The person types `c` at `at`.
@@ -472,54 +496,67 @@ fn identical_echoes_never_open_a_run() {
     );
 }
 
+/// On every route a key takes, inline or queued to the session's ordered writer.
 #[test]
 fn a_run_continues_only_where_the_last_echo_ended() {
     let t0 = Instant::now();
-    let mut app = raw_app(t0);
-    let echo = same;
-    let at = type_echoed(&mut app, "ab", echo, t0 + ms(100), ms(30), ms(5));
-    assert_eq!(key_times(&app, t0).len(), 2, "'ab' released");
-    let at = type_echoed(&mut app, "c", echo, at + ms(30), ms(30), ms(5));
-    assert_eq!(
-        key_times(&app, t0).len(),
-        3,
-        "'c' at the run's end released alone"
-    );
+    on_every_route(|route| {
+        let mut app = raw_app(t0);
+        let echo = same;
+        let at = type_echoed(&mut app, "ab", echo, t0 + ms(100), ms(30), ms(5));
+        assert_eq!(key_times(&app, t0).len(), 2, "{route}: 'ab' released");
+        let at = type_echoed(&mut app, "c", echo, at + ms(30), ms(30), ms(5));
+        assert_eq!(
+            key_times(&app, t0).len(),
+            3,
+            "{route}: 'c' at the run's end released alone"
+        );
 
-    feed(&app, b"\r\n");
-    let at = type_echoed(&mut app, "d", echo, at + ms(30), ms(30), ms(5));
-    assert_eq!(
-        key_times(&app, t0).len(),
-        3,
-        "'d' on a new row opens a new run: it waits"
-    );
-    let at = type_echoed(&mut app, "e", echo, at + ms(30), ms(30), ms(5));
-    assert_eq!(key_times(&app, t0).len(), 5, "'de' released");
+        feed(&app, b"\r\n");
+        let at = type_echoed(&mut app, "d", echo, at + ms(30), ms(30), ms(5));
+        assert_eq!(
+            key_times(&app, t0).len(),
+            3,
+            "{route}: 'd' on a new row opens a new run: it waits"
+        );
+        let _ = type_echoed(&mut app, "e", echo, at + ms(30), ms(30), ms(5));
+        assert_eq!(key_times(&app, t0).len(), 5, "{route}: 'de' released");
 
-    let sink = app.pool.get(0).expect("session").ctx.sink.clone();
-    let before = sink.input_epoch();
-    let _ = sink.write_reply(b"\x1b[I");
-    assert_ne!(
-        sink.input_epoch(),
-        before,
-        "fixture: a reply is input to the session"
-    );
-    let at = type_echoed(&mut app, "f", echo, at + ms(60), ms(30), ms(5));
-    assert_eq!(
-        key_times(&app, t0).len(),
-        5,
-        "input between the runs: 'f' at the run's end continues nothing"
-    );
-    app.redraw_window_at(WID, at + ECHO_PROOF_BOUND);
-    assert!(!status(&app).attached);
+        // Input between the run and the next key: a reply, or a paste the program does not echo.
+        for (what, pasted) in [("a reply", false), ("a paste", true)] {
+            let mut app = raw_app(t0);
+            let at = type_echoed(&mut app, "ab", echo, t0 + ms(100), ms(30), ms(5));
+            let sink = front_sink(&app);
+            let before = sink.input_epoch();
+            if pasted {
+                press(&mut app, paste("x"), at + ms(10));
+            } else {
+                let _ = sink.write_reply(b"\x1b[I");
+            }
+            assert_ne!(
+                sink.input_epoch(),
+                before,
+                "{route}: fixture: {what} is input to the session"
+            );
+            assert!(status(&app).attached, "{route}: {what} with nothing held");
+            let at = type_echoed(&mut app, "c", echo, at + ms(30), ms(30), ms(5));
+            assert_eq!(
+                key_times(&app, t0).len(),
+                2,
+                "{route}: {what} between: 'c' at the run's end continues nothing"
+            );
+            app.redraw_window_at(WID, at + ECHO_PROOF_BOUND);
+            assert!(!status(&app).attached, "{route}: {what}: refuted");
+        }
 
-    let mut app = raw_app(t0);
-    let at = type_echoed(&mut app, "ab", echo, t0 + ms(100), ms(30), ms(5));
-    let _ = type_echoed(&mut app, "c", |_| "*".into(), at + ms(30), ms(30), ms(5));
-    assert!(
-        !status(&app).attached,
-        "a '*' where 'c' should show refutes at once"
-    );
+        let mut app = raw_app(t0);
+        let at = type_echoed(&mut app, "ab", echo, t0 + ms(100), ms(30), ms(5));
+        let _ = type_echoed(&mut app, "c", |_| "*".into(), at + ms(30), ms(30), ms(5));
+        assert!(
+            !status(&app).attached,
+            "{route}: a '*' where 'c' should show refutes at once"
+        );
+    });
 }
 
 #[test]
@@ -527,60 +564,65 @@ fn a_space_no_typed_glyph_follows_stops_the_recording_at_its_bound() {
     // A blank never corroborates a run, so an echoed space waits for a typed glyph after it. A
     // key that sends no text never reaches the hold, so after Tab (completion printed past the
     // space), Enter or an arrow the space stays unproven. Each arm differs from the control in
-    // the key typed after the space.
+    // the key typed after the space, on every route a key takes.
     let t0 = Instant::now();
     let named = |k| Some(pressed(Key::Named(k), Modifiers::empty()));
-    for (arm, next, shown) in [
+    let arms = [
         ("control: 'c'", None, &b"c"[..]),
         ("Tab, completion printed", named(NamedKey::Tab), b"cd/"),
         ("Enter", named(NamedKey::Enter), b"\r\n"),
         ("an arrow", named(NamedKey::ArrowLeft), b"\x1b[D"),
-    ] {
-        let mut app = raw_app(t0);
-        let at = type_echoed(&mut app, "ab", same, t0 + ms(100), ms(30), ms(5));
-        assert_eq!(key_times(&app, t0).len(), 2, "{arm}: 'ab' released");
-        let space = at + ms(30);
-        press(
-            &mut app,
-            pressed(Key::Named(NamedKey::Space), Modifiers::empty()),
-            space,
-        );
-        feed(&app, b" ");
-        app.redraw_window_at(WID, space + ms(5));
-        assert_eq!(
-            held_keys(&app.windows[&WID].aos),
-            1,
-            "{arm}: the echoed space waits"
-        );
-        let then = space + ms(30);
-        match next {
-            Some(ev) => press(&mut app, ev, then),
-            None => key(&mut app, 'c', then),
-        }
-        feed(&app, shown);
-        app.redraw_window_at(WID, then + ms(5));
-        if arm.starts_with("control") {
+    ];
+    on_every_route(|route| {
+        for (arm, next, shown) in arms.clone() {
+            let control = next.is_none();
+            let arm = format!("{route}, {arm}");
+            let mut app = raw_app(t0);
+            let at = type_echoed(&mut app, "ab", same, t0 + ms(100), ms(30), ms(5));
+            assert_eq!(key_times(&app, t0).len(), 2, "{arm}: 'ab' released");
+            let space = at + ms(30);
+            press(
+                &mut app,
+                pressed(Key::Named(NamedKey::Space), Modifiers::empty()),
+                space,
+            );
+            feed(&app, b" ");
+            app.redraw_window_at(WID, space + ms(5));
+            assert_eq!(
+                held_keys(&app.windows[&WID].aos),
+                1,
+                "{arm}: the echoed space waits"
+            );
+            let then = space + ms(30);
+            match next {
+                Some(ev) => press(&mut app, ev, then),
+                None => key(&mut app, 'c', then),
+            }
+            feed(&app, shown);
+            app.redraw_window_at(WID, then + ms(5));
+            if control {
+                assert_eq!(
+                    key_times(&app, t0).len(),
+                    4,
+                    "{arm}: the glyph proves the space before it"
+                );
+                assert!(status(&app).attached, "{arm}");
+                continue;
+            }
+            assert!(status(&app).attached, "{arm}: still waiting");
             assert_eq!(
                 key_times(&app, t0).len(),
-                4,
-                "{arm}: the glyph proves the space before it"
+                2,
+                "{arm}: the space is not logged"
             );
-            assert!(status(&app).attached, "{arm}");
-            continue;
+            app.redraw_window_at(WID, space + ECHO_PROOF_BOUND);
+            assert!(
+                !status(&app).attached,
+                "{arm}: refuted at the space's bound"
+            );
+            assert!(detached_for(&app, "raw_key"), "{arm}");
         }
-        assert!(status(&app).attached, "{arm}: still waiting");
-        assert_eq!(
-            key_times(&app, t0).len(),
-            2,
-            "{arm}: the space is not logged"
-        );
-        app.redraw_window_at(WID, space + ECHO_PROOF_BOUND);
-        assert!(
-            !status(&app).attached,
-            "{arm}: refuted at the space's bound"
-        );
-        assert!(detached_for(&app, "raw_key"), "{arm}");
-    }
+    });
 }
 
 #[test]
@@ -791,28 +833,31 @@ fn an_attach_or_detach_while_a_key_waits_starts_the_next_glow_from_rest() {
     }
 
     // A run proven under one recording corroborates nothing in the next: `c` typed at its end
-    // with no input since waits for a distinct second key once the recording restarted.
-    for (what, restart) in [
-        ("re-attached", Some(false)),
-        ("detached, then attached", Some(true)),
-        ("negative control: the same recording", None),
-    ] {
-        let mut app = raw_app(t0);
-        let at = type_echoed(&mut app, "ab", same, t0 + ms(60), ms(30), ms(5));
-        if let Some(detach_first) = restart {
-            if detach_first {
-                let _ = app.aos_detach_now(at + ms(5)).expect("detaches");
+    // with no input since waits for a distinct second key once the recording restarted, on every
+    // route a key takes.
+    on_every_route(|route| {
+        for (what, restart) in [
+            ("re-attached", Some(false)),
+            ("detached, then attached", Some(true)),
+            ("negative control: the same recording", None),
+        ] {
+            let mut app = raw_app(t0);
+            let at = type_echoed(&mut app, "ab", same, t0 + ms(60), ms(30), ms(5));
+            if let Some(detach_first) = restart {
+                if detach_first {
+                    let _ = app.aos_detach_now(at + ms(5)).expect("detaches");
+                }
+                app.aos_attach_at(MomentumCode::Shipped, at + ms(10))
+                    .expect("attaches");
             }
-            app.aos_attach_at(MomentumCode::Shipped, at + ms(10))
-                .expect("attaches");
+            let _ = type_echoed(&mut app, "c", same, at + ms(30), ms(30), ms(5));
+            assert_eq!(
+                held_keys(&app.windows[&WID].aos),
+                usize::from(restart.is_some()),
+                "{route}: {what}"
+            );
         }
-        let _ = type_echoed(&mut app, "c", same, at + ms(30), ms(30), ms(5));
-        assert_eq!(
-            held_keys(&app.windows[&WID].aos),
-            usize::from(restart.is_some()),
-            "{what}"
-        );
-    }
+    });
 }
 
 /// The claim-2 binding (`OnlyEchoedKeysLogged`) and the person's grant (D12's

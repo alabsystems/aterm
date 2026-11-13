@@ -4,8 +4,13 @@
 //! The vault token facts the window shows (`docs/DESIGN-claude-setup-token-2026-11-05.md`
 //! §5.9, §5.10, slice S12): one value-free read of this Mac's Claude Code accounts
 //! ([`aterm_agent::harness::accounts_token_view::view_here`]) on the footer's resolver thread, at
-//! most once per [`READ_EVERY_S`], posted as [`Tokens`] for the Accounts card, the Lab page, the
+//! most once per [`READ_EVERY_S`], posted as [`Tokens`] for the Account card, the Lab page, the
 //! harness page's state line and `ctl status`, which map it without reading a file.
+//!
+//! A fact keeps what the view typed (its state, its dates, the Mac that made it, the login half)
+//! beside the words, so a surface chooses its own words and never parses another's; and a read
+//! says whether this Mac has a vault at all ([`TokensRead`]), so "no vault here" is not the same
+//! answer as "no token for this account".
 //!
 //! The read records each new offer pair (`note_offers`), so the quiet offer is journaled once per
 //! change of the pair whichever surface shows it first. Its one step ([`App::open_token_step`])
@@ -14,6 +19,9 @@
 //! none, and every surface then says nothing of them.
 
 use std::sync::Arc;
+
+use aterm_agent::harness::account_card::LoginHalf;
+use aterm_agent::harness::token_state::TokenState;
 
 /// The least time between two reads of the token view.
 pub(crate) const READ_EVERY_S: i64 = 60;
@@ -58,17 +66,111 @@ pub(crate) struct TokenFact {
     pub(crate) phrase: Option<String>,
     /// The offer, where one stands.
     pub(crate) offer: Option<TokenOffer>,
+    /// The token's state as the view typed it (§5.1), which [`Self::state`] and [`Self::words`]
+    /// say.
+    pub(crate) kind: TokenState,
+    /// When the token was made (unix seconds), where the vault's meta or this Mac's row says.
+    pub(crate) made_at: Option<u64>,
+    /// When it ends.
+    pub(crate) ends_at: Option<u64>,
+    /// The Mac that made it, as its meta names it.
+    pub(crate) made_on: Option<String>,
+    /// When the Mac that made it verified it, where this Mac's row holds that.
+    pub(crate) verified_at: Option<u64>,
+    /// A token made here is not in the vault yet: its write waits, or no server took it.
+    pub(crate) not_yet: bool,
+    /// The account's stored login on this Mac, the offer pair's other half.
+    pub(crate) login: LoginHalf,
+    /// A session on this Mac is logged into the account.
+    pub(crate) logged_in: bool,
+    /// The vault column as a person reads it (`in vault`, `not yet in vault (waiting: …)`).
+    pub(crate) vault_words: Option<String>,
+    /// The other Macs whose sessions ran on the token at the last fleet read.
+    pub(crate) peers: Vec<String>,
+    /// When that fleet read was.
+    pub(crate) peers_read_at: Option<u64>,
 }
 
-/// The window's token facts: the accounts the last read covered.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Tokens(pub(crate) Vec<TokenFact>);
+#[cfg(test)]
+impl TokenFact {
+    /// A test's fact of the account `email` (row `label`) whose token stands at `kind`: its word
+    /// and words the state's own, no dates, no offer, a login with no end known.
+    pub(crate) fn for_test(label: Option<&str>, email: &str, kind: TokenState) -> Self {
+        let account = "ac-fedcba9876543210";
+        Self {
+            key: account.into(),
+            label: label.map(str::to_owned),
+            email: email.into(),
+            state: kind.word().to_owned(),
+            words: kind.words(),
+            phrase: None,
+            offer: None,
+            kind,
+            made_at: None,
+            ends_at: None,
+            made_on: None,
+            verified_at: None,
+            not_yet: false,
+            login: LoginHalf::Ok,
+            logged_in: false,
+            vault_words: None,
+            peers: Vec::new(),
+            peers_read_at: None,
+        }
+    }
+}
+
+/// What a read of the token view could say at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokensRead {
+    /// This Mac has no vault to hold a token (none configured under its home, no home, or a
+    /// platform with no vault tokens): the read covers no account, and that is not "no token".
+    NoVault,
+    /// The vault's view was read: [`Tokens::facts`] are the accounts it covers.
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(
+            dead_code,
+            reason = "only a Unix read has a vault to cover: elsewhere every read is NoVault"
+        )
+    )]
+    Read,
+}
+
+/// The window's token facts: whether the last read had a vault to read, and the accounts it
+/// covered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Tokens {
+    /// Whether there was a vault to read.
+    pub(crate) read: TokensRead,
+    /// The accounts the read covered; none with no vault.
+    pub(crate) facts: Vec<TokenFact>,
+}
 
 impl Tokens {
+    /// A read of a vault's view that covered `facts`.
+    #[cfg(any(unix, test))]
+    #[must_use]
+    pub(crate) const fn read(facts: Vec<TokenFact>) -> Self {
+        Self {
+            read: TokensRead::Read,
+            facts,
+        }
+    }
+
+    /// A read on a Mac with no vault.
+    #[must_use]
+    pub(crate) const fn no_vault() -> Self {
+        Self {
+            read: TokensRead::NoVault,
+            facts: Vec::new(),
+        }
+    }
+
     /// The account whose row is `label`, else whose email is `email`.
     #[must_use]
     pub(crate) fn of(&self, label: Option<&str>, email: Option<&str>) -> Option<&TokenFact> {
-        let facts = &self.0;
+        let facts = &self.facts;
         label
             .and_then(|label| facts.iter().find(|f| f.label.as_deref() == Some(label)))
             .or_else(|| email.and_then(|email| facts.iter().find(|f| f.email == email)))
@@ -87,7 +189,7 @@ impl Tokens {
     /// The account keyed `key`.
     #[must_use]
     pub(crate) fn of_key(&self, key: &str) -> Option<&TokenFact> {
-        self.0.iter().find(|f| f.key == key)
+        self.facts.iter().find(|f| f.key == key)
     }
 }
 
@@ -167,7 +269,7 @@ pub(crate) fn show(tokens: Option<Tokens>) {
 
 /// Read the token view again where [`READ_EVERY_S`] has passed since the last read at wall
 /// second `now` (the footer's resolver thread asks on each Claude Code resolve); a move posts
-/// the new facts and wakes the open Accounts card. A no-op in a unit test, which posts its own.
+/// the new facts and wakes the open Account card. A no-op in a unit test, which posts its own.
 pub(crate) fn refresh(now: i64) {
     #[cfg(test)]
     let _ = now;
@@ -186,7 +288,11 @@ pub(crate) fn refresh(now: i64) {
         if !due {
             return;
         }
-        let read = Arc::new(read(now));
+        // With no harness state there is nothing to read from: the facts stay as they were
+        // (not read yet, before a first read), never "no vault".
+        let Some(read) = read(now).map(Arc::new) else {
+            return;
+        };
         let moved = {
             let mut shown = SHOWN
                 .lock()
@@ -209,13 +315,11 @@ fn due(last: Option<i64>, now: i64) -> bool {
 
 /// One read of this Mac's token view at `now`, with each new offer pair recorded.
 #[cfg(all(unix, not(test)))]
-fn read(now: i64) -> Tokens {
-    let Some(harness) = crate::harness_host::harness_state() else {
-        return Tokens::default();
-    };
+fn read(now: i64) -> Option<Tokens> {
+    let harness = crate::harness_host::harness_state()?;
     let config = crate::app_config::config_path();
     let home = aterm_types::dirs::home_dir();
-    facts_of_view(
+    Some(facts_of_view(
         &harness,
         aterm_agent::harness::accounts_token_view::view_here(
             &harness,
@@ -224,16 +328,17 @@ fn read(now: i64) -> Tokens {
             now,
         ),
         now,
-    )
+    ))
 }
 
+/// A platform with no vault tokens has no vault to read.
 #[cfg(all(not(unix), not(test)))]
-fn read(_now: i64) -> Tokens {
-    Tokens::default()
+fn read(_now: i64) -> Option<Tokens> {
+    Some(Tokens::no_vault())
 }
 
-/// The window's facts of a token view (`None`: no home, so no vault, is known), each new offer
-/// pair recorded in the store under `harness`.
+/// The window's facts of a token view (`None`: no home or no vault configured under it, so
+/// [`TokensRead::NoVault`]), each new offer pair recorded in the store under `harness`.
 #[cfg(unix)]
 pub(crate) fn facts_of_view(
     harness: &std::path::Path,
@@ -242,7 +347,7 @@ pub(crate) fn facts_of_view(
 ) -> Tokens {
     use aterm_agent::harness::accounts_step::Step;
     let Some(mut accounts) = view else {
-        return Tokens::default();
+        return Tokens::no_vault();
     };
     let store = aterm_agent::harness::accounts::Store::at(harness);
     if let Err(why) = aterm_agent::harness::accounts_token_view::note_offers(
@@ -252,7 +357,7 @@ pub(crate) fn facts_of_view(
     ) {
         aterm_log::warn!("accounts: the token offers could not be recorded: {why}");
     }
-    Tokens(
+    Tokens::read(
         accounts
             .iter()
             .map(|account| {
@@ -260,7 +365,19 @@ pub(crate) fn facts_of_view(
                 if account.not_yet() {
                     words.push_str("; not yet in vault");
                 }
+                let used = account.row.as_ref().map(|row| &row.used_on);
                 TokenFact {
+                    kind: account.state.clone(),
+                    made_at: account.minted_at(),
+                    ends_at: account.expires_at(),
+                    made_on: account.minted_on(),
+                    verified_at: account.row.as_ref().and_then(|row| row.verified),
+                    not_yet: account.not_yet(),
+                    login: account.login,
+                    logged_in: account.logged_in,
+                    vault_words: account.vault_words(),
+                    peers: used.map(|used| used.peers.clone()).unwrap_or_default(),
+                    peers_read_at: used.and_then(|used| used.peers_read_at),
                     key: account.key.clone(),
                     label: account.label.clone(),
                     email: account.email.clone(),

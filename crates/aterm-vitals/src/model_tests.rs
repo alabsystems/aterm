@@ -4416,3 +4416,81 @@ fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
         label: "extreme (SIGSEGV)".into(),
     });
 }
+
+#[test]
+fn cgroup_limits_bound_cpu_and_memory_row_capacities() {
+    const GIB: u64 = 1 << 30;
+    let reading =
+        |at_s: u64, busy: u64, cpu_millicores: Option<u32>, mem_bytes: Option<u64>| Sample {
+            at_ns: at_s * 1_000_000_000,
+            at_unix_ms: T0 + (at_s as i64) * 1_000,
+            mono_ms: at_s * 1_000,
+            cadence_ms: 1_000,
+            cores: Some(vec![
+                Ticks {
+                    busy,
+                    total: at_s * 100,
+                };
+                8
+            ]),
+            mem: Some(MemSample {
+                total: 32 * GIB,
+                app: 4 * GIB,
+                free: 28 * GIB,
+                available: 28 * GIB,
+                ..MemSample::default()
+            }),
+            cpu_millicores,
+            mem_bytes,
+            ..Sample::default()
+        };
+
+    // Tighter cgroup limits (2.5 cores on an 8-core host, 8 GiB on a 32 GiB host) bind both rows.
+    let mut v = Vitals::new();
+    let _ = v.absorb(&reading(1, 0, Some(2_500), Some(8 * GIB)));
+    let s = v.absorb(&reading(2, 25, Some(2_500), Some(8 * GIB)));
+    let cpu = &s.resources[Cpu.index()];
+    let mem = &s.resources[Memory.index()];
+    assert_eq!(cpu.capacity, Some(2.5));
+    assert!(close(cpu.now, 2.0), "{cpu:?}");
+    assert!(close(cpu.heat_now.map(f64::from), 2.0 / 2.5), "{cpu:?}");
+    assert_eq!(mem.capacity, Some((8 * GIB) as f64));
+    assert!(close(mem.heat_now.map(f64::from), 0.5), "{mem:?}");
+
+    // Larger cgroup limits than the host (16 cores on 8, 64 GiB on 32 GiB) never lift capacity
+    // past the host.
+    let mut v_wide = Vitals::new();
+    let _ = v_wide.absorb(&reading(1, 0, Some(16_000), Some(64 * GIB)));
+    let s_wide = v_wide.absorb(&reading(2, 25, Some(16_000), Some(64 * GIB)));
+    assert_eq!(s_wide.resources[Cpu.index()].capacity, Some(8.0));
+    assert_eq!(
+        s_wide.resources[Memory.index()].capacity,
+        Some((32 * GIB) as f64)
+    );
+
+    // CONTROL: without cgroup limits, the host's 8 cores and 32 GiB are the capacities.
+    let mut v_host = Vitals::new();
+    let _ = v_host.absorb(&reading(1, 0, None, None));
+    let s_host = v_host.absorb(&reading(2, 25, None, None));
+    assert_eq!(
+        s_host.resources[Cpu.index()].capacity,
+        Some(8.0),
+        "CONTROL: host cores without cgroup quota"
+    );
+    assert!(
+        close(s_host.resources[Cpu.index()].heat_now.map(f64::from), 0.25),
+        "CONTROL"
+    );
+    assert_eq!(
+        s_host.resources[Memory.index()].capacity,
+        Some((32 * GIB) as f64),
+        "CONTROL: host physical memory without cgroup limit"
+    );
+    assert!(
+        close(
+            s_host.resources[Memory.index()].heat_now.map(f64::from),
+            0.125
+        ),
+        "CONTROL"
+    );
+}

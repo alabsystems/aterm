@@ -38,9 +38,10 @@ const FLYING_SQUINT_TAIL_DUR: std::time::Duration = std::time::Duration::from_na
 /// Which body owns this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
-    /// The resident pet ([`crate::kitty_pet`]): the default, and what `rainbow kitty` / `kitty` / `rainbow kitty pet` mean.
+    /// The resident pet ([`crate::kitty_pet`]): what `cursor_pet` draws, beside any style.
     Pet,
-    /// The flying head ([`crate::kitty_cursor`]): `rainbow kitty flying` and the bare `nyan` / `rainbow` aliases.
+    /// The flying head ([`crate::kitty_cursor`]): no setting chooses it; the collection hello
+    /// and the pet's song are what still fly it.
     Flying {
         /// The caret cell the head escorts this frame (`CompanionDuty::FlyingHead { cell }`),
         /// so seat and snap-to resolve against one cell.
@@ -926,6 +927,38 @@ impl PetShade {
     }
 }
 
+/// A foot cell's ink as the host's face lays it (`CursorGlow::foot_ink`), window px: what a
+/// rail in its row's foot band parts round ([`KeepOut::foot_gap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FootSpan {
+    /// The cell across.
+    pub x0: i32,
+    pub x1: i32,
+    /// Its row's top.
+    pub y0: i32,
+    /// The pixel row the cell's ink ends before; its row's bottom where the face does not
+    /// place its glyph.
+    pub end: i32,
+    /// The pixel row the ink under the cell and either side of it starts on.
+    pub below: i32,
+    /// The columns the cell's ink lies in within the judge's ring of its row's foot band,
+    /// `[x0, x1)`: empty where none of it does, the whole cell where the face does not place
+    /// its glyph.
+    pub ink: (i32, i32),
+}
+
+/// Where a rail in its row's foot band stands beside the row's feet ([`KeepOut::foot_gap`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FootGap {
+    /// The share of its place in the band the rail keeps: none within the clearance of a
+    /// foot's ink, easing to whole.
+    pub keep: f32,
+    /// The pixel row the feet's ink near it ends before.
+    pub end: i32,
+    /// The pixel row the ink under them starts on.
+    pub below: i32,
+}
+
 /// What the sky and the ribbon's top keep off: the frame's word icons (a
 /// `dog`'s or a `fox`'s face drawn over its word) and every lettered or
 /// filled cell (a powerline segment, a selection) of a row the caret is not
@@ -955,6 +988,8 @@ pub struct KeepOut {
     /// Those rows' boxes: a row among them has its feet known
     /// ([`Self::knows_feet`]).
     soles: Vec<(i32, i32, i32, i32)>,
+    /// Each foot cell's ink, where the host's face names it ([`Self::foot_gap`]).
+    foot_spans: Vec<FootSpan>,
     /// The lettered cells' runs alone (a glyph, on any ground), when the
     /// host named them ([`Self::letters_meet`]); a run of glyphs that keep
     /// under the x-height begins where their ink may, a third of the cell
@@ -980,6 +1015,7 @@ impl Clone for KeepOut {
             filled: self.filled.clone(),
             feet: self.feet.clone(),
             soles: self.soles.clone(),
+            foot_spans: self.foot_spans.clone(),
             letters: self.letters.clone(),
         }
     }
@@ -993,6 +1029,7 @@ impl Clone for KeepOut {
         self.filled.clone_from(&source.filled);
         self.feet.clone_from(&source.feet);
         self.soles.clone_from(&source.soles);
+        self.foot_spans.clone_from(&source.foot_spans);
         self.letters.clone_from(&source.letters);
     }
 }
@@ -1020,6 +1057,7 @@ impl KeepOut {
         filled: Vec::new(),
         feet: Vec::new(),
         soles: Vec::new(),
+        foot_spans: Vec::new(),
         letters: None,
     };
     /// This frame's boxes, window pixels, all of them lettered or filled
@@ -1083,6 +1121,91 @@ impl KeepOut {
                 self.soles.push(b);
             }
         }
+    }
+
+    /// This frame's foot cells' ink ([`FootSpan`]), every foot cell of a row or none of them.
+    #[inline]
+    pub fn set_foot_spans(&mut self, spans: impl IntoIterator<Item = FootSpan>) {
+        self.foot_spans.clear();
+        self.foot_spans.extend(spans);
+    }
+
+    /// Whether the host's face named the ink of the feet of the row whose top is `y0`
+    /// ([`Self::foot_gap`]); where it did not, a rail parts round each foot's whole cell
+    /// ([`Self::foot_share`]).
+    #[inline]
+    #[must_use]
+    pub const fn inks_row(&self, y0: i32) -> bool {
+        let spans = self.foot_spans.as_slice();
+        let mut i = 0;
+        while i < spans.len() {
+            if spans[i].y0 == y0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether a foot's ink of the row whose top is `y0` lies within `reach` px of `x0..x1`.
+    #[inline]
+    #[must_use]
+    pub const fn ink_near(&self, (x0, x1): (f32, f32), y0: i32, reach: f32) -> bool {
+        let spans = self.foot_spans.as_slice();
+        let mut i = 0;
+        while i < spans.len() {
+            let s = spans[i];
+            i += 1;
+            if s.y0 == y0
+                && s.ink.0 < s.ink.1
+                && s.ink.0 as f32 - reach <= x1
+                && x0 <= s.ink.1 as f32 + reach
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Where a rail in the foot band of the row whose top is `y0` stands at `x`: whole
+    /// (`keep` 1) but within `clear` px of the columns a foot's ink lies in by the band's
+    /// ring, where it keeps none, easing in over the next `ease` px; and how far down the ink
+    /// of the feet that near reaches, and where the ink under them starts. A typeset
+    /// underline's skip: the rail parts round the ink of a descender, not round its cell.
+    #[inline]
+    #[must_use]
+    pub const fn foot_gap(&self, x: f32, y0: i32, (clear, ease): (f32, f32)) -> FootGap {
+        let spans = self.foot_spans.as_slice();
+        let ease = ease.max(1.0);
+        let (mut keep, mut end, mut below) = (1.0f32, i32::MIN, i32::MAX);
+        let mut i = 0;
+        while i < spans.len() {
+            let s = spans[i];
+            i += 1;
+            if s.y0 != y0 || s.ink.0 >= s.ink.1 {
+                continue;
+            }
+            let d = (s.ink.0 as f32 - x).max(x - s.ink.1 as f32) - clear;
+            if d >= ease {
+                continue;
+            }
+            let k = if d <= 0.0 {
+                0.0
+            } else {
+                let k = d * (1.0 / ease);
+                k * k * (3.0 - 2.0 * k)
+            };
+            if k < keep {
+                keep = k;
+            }
+            if s.end > end {
+                end = s.end;
+            }
+            if s.below < below {
+                below = s.below;
+            }
+        }
+        FootGap { keep, end, below }
     }
 
     /// Whether the glyphs of the row spanning `y0..y1` were named, so its

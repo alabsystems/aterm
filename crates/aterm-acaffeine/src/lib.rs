@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-acaffeine` — the menu-bar keep-awake mug, `aterm acaffeine`.
+//! `aterm-acaffeine` — the menu-bar keep-awake mug, `aterm acaffeine`. On Windows, where there is
+//! no mug, the verb runs a holder process that keeps the PC from its idle sleep.
 
 #![warn(missing_docs)]
 #![cfg_attr(trust_verify, feature(register_tool))]
@@ -22,6 +23,8 @@ pub mod notify;
 pub mod paths;
 pub mod state;
 pub mod trouble;
+#[cfg(windows)]
+mod win;
 
 /// Creates an isolated `.noindex` temporary directory for `aterm-acaffeine` tests so test churn
 /// stays out of Spotlight and `fseventsd`.

@@ -43,6 +43,7 @@ fn scrolling(console: u32) -> NativeHost {
     let mut host = NativeHost::over(
         Box::new(sys),
         Box::new(aterm_machines::init::prepare_workstation_selected),
+        complete_explicit_workstation_plan_for_test,
     );
     host.select(selected(&[Setting::NaturalScrolling]).selection);
     host
@@ -55,6 +56,7 @@ fn keyboard(attached: bool) -> NativeHost {
             &[],
         )),
         Box::new(aterm_machines::init::prepare_workstation_selected),
+        complete_explicit_workstation_plan_for_test,
     );
     host.select(selected(&[Setting::CapsLock]).selection);
     host
@@ -255,6 +257,8 @@ fn a_console_recovery_cannot_lift_a_stage_parked_by_its_ledger() {
         let root = dir.path();
         let plan = selected(&[Setting::NaturalScrolling]);
         let revision = authorize_at(root, &plan).unwrap().unwrap();
+        // Parked now, so its pause is still ahead when the pass below runs.
+        let now = ledger::now_secs();
         ledger::update(root, revision, |ledger| {
             let stamp = ledger::Stamp {
                 at: 10,
@@ -266,9 +270,9 @@ fn a_console_recovery_cannot_lift_a_stage_parked_by_its_ledger() {
                     ledger::Admit::Run
                 );
                 if second && hung {
-                    assert!(ledger.mark_hung(Stage::Workstation, stamp.at));
+                    assert!(ledger.mark_hung(Stage::Workstation, stamp.at, now));
                 }
-                ledger.recover(0, None);
+                ledger.recover(0, None, None, now);
             }
         })
         .unwrap();
@@ -357,9 +361,9 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
                     ledger::Admit::Run
                 );
                 if second && hung {
-                    assert!(ledger.mark_hung(Stage::Workstation, stamp.at));
+                    assert!(ledger.mark_hung(Stage::Workstation, stamp.at, stamp.at));
                 }
-                ledger.recover(0, None);
+                ledger.recover(0, None, None, stamp.at);
             }
         })
         .unwrap();
@@ -393,4 +397,59 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
         no_hardware.calls().is_empty(),
         "completed Caps has no pending hardware observation"
     );
+}
+
+/// A Workstation stage that reads its row back as wanted ends carrying that reading, dated from
+/// before its read (System State design §3.5), so an unattended pass ends with an admitted
+/// reading of the row rather than none. NEGATIVE CONTROL: the same stage parked for another
+/// console reads nothing back, and its end carries nothing.
+#[test]
+fn a_stage_that_reads_its_row_back_as_wanted_ends_with_that_reading() {
+    use aterm_types::macos_setup::{Observation, Standing};
+    use std::sync::Mutex;
+    static ENDS: Mutex<Vec<Vec<Observation>>> = Mutex::new(Vec::new());
+    fn stage(event: StageEvent<'_>) {
+        if event.running {
+            assert!(event.readback.is_empty(), "a start reads nothing back");
+        } else {
+            ENDS.lock()
+                .unwrap()
+                .push(event.readback.observations().to_vec());
+        }
+    }
+    let hooks = SetupHooks {
+        stage,
+        ..SetupHooks::NONE
+    };
+    let scroll = Subject::Setting(Setting::NaturalScrolling);
+    for console in [502, 501] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let revision = authorize_at(root, &selected(&[Setting::NaturalScrolling]))
+            .unwrap()
+            .unwrap();
+        let native = scrolling(console);
+        let read_at = aterm_machines::port::System::now(native.sys.as_ref());
+        let mut host = Fake::default().with_workstation(native);
+        ENDS.lock().unwrap().clear();
+        let (_, next) = execute_initial_for_revision(&mut host, root, revision, &mut None, hooks)
+            .unwrap()
+            .unwrap();
+        let ends = std::mem::take(&mut *ENDS.lock().unwrap());
+        let read: Vec<&Observation> = ends.iter().flatten().collect();
+        if console == 502 {
+            assert_ne!(next, SetupNext::Done);
+            assert!(
+                read.is_empty(),
+                "a parked stage read nothing back: {read:?}"
+            );
+            continue;
+        }
+        assert_eq!(next, SetupNext::Done);
+        assert_eq!(read.len(), 1, "{ends:?}");
+        assert_eq!(
+            (read[0].subject, read[0].standing, read[0].read_at()),
+            (scroll, Standing::InPlace, Some(read_at))
+        );
+    }
 }

@@ -135,7 +135,7 @@ fn a_tabs_menu_carries_its_sections_headers_and_their_rows() {
     let two = CHROME.replace(
         "statusmenu --- at=2",
         "statusmenu \"◇ cruise-n — grant it · 2s\" enabled=yes checked=no at=11\n\
-         statusmenu \"and 3 more — Overview…\" enabled=yes checked=no at=12\nstatusmenu --- at=2",
+         statusmenu \"and 3 more in Overview\" enabled=no at=12\nstatusmenu --- at=2",
     );
     let rows = menu_rows(&two);
     assert_eq!(
@@ -747,7 +747,7 @@ fn a_workers_row_is_read_under_its_managers_submenu() {
 fn the_title_is_split_off_the_chip_line() {
     let line = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" \
                 description=- title=\"autopilot: cruise — keeps going for ever, finding more to \
-                do · click: land · right-click: more\"";
+                do · click: land\"";
     let (chip_line, title) = split_title(line);
     assert_eq!(
         chip_line,
@@ -755,9 +755,7 @@ fn the_title_is_split_off_the_chip_line() {
     );
     assert_eq!(
         title.as_deref(),
-        Some(
-            "autopilot: cruise — keeps going for ever, finding more to do · click: land · right-click: more"
-        )
+        Some("autopilot: cruise — keeps going for ever, finding more to do · click: land")
     );
     assert_eq!(
         split_title("face=cruise drawn=- why=not-drawn spoken=- description=- title=-")
@@ -841,7 +839,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     use aterm_agent::supervise::mode_words::mode_words;
     let title = |mode: &str, m: Autopilot| {
         format!(
-            "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
+            "autopilot: {mode} \u{2014} {} \u{b7} click: x",
             mode_words(m).chip
         )
     };
@@ -1606,7 +1604,7 @@ fn a_drawn_chip_that_loses_its_title_mid_run_fails() {
     use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let cruise = format!(
-        "autopilot: cruise \u{2014} {} \u{b7} click: land \u{b7} right-click: more",
+        "autopilot: cruise \u{2014} {} \u{b7} click: land",
         mode_words(Autopilot::Cruise).chip
     );
     let opening = Some(drawn_title("claude", "cruise", "\"∞\"", &qt(&cruise)));
@@ -1662,7 +1660,7 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
     use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let land = format!(
-        "autopilot: land \u{2014} {} \u{b7} click: off \u{b7} right-click: more",
+        "autopilot: land \u{2014} {} \u{b7} click: off",
         mode_words(Autopilot::Land).chip
     );
     let landed: &str = &format!(

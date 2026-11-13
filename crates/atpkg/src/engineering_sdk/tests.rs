@@ -6,16 +6,25 @@
 use super::*;
 use std::ffi::OsStr;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
+// Valid inputs request private modes regardless of the inherited umask. Negative controls
+// change only the boundary they exercise, rather than failing first on unrelated permissions.
+fn private_directory(path: &std::path::Path) {
+    std::fs::DirBuilder::new().mode(0o755).create(path).unwrap();
+}
+fn private_input(path: &std::path::Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
 fn fixture() -> (aterm_tempfile::TempDir, fs::Pin) {
     let temp = aterm_tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("tree")).unwrap();
-    std::fs::create_dir(temp.path().join("tree/bin")).unwrap();
-    std::fs::write(temp.path().join("tree/bin/tool"), b"actual original bytes").unwrap();
+    private_directory(&temp.path().join("tree"));
+    private_directory(&temp.path().join("tree/bin"));
+    private_input(&temp.path().join("tree/bin/tool"), b"actual original bytes");
     let pin = fs::Pin::open(&std::fs::canonicalize(temp.path().join("tree")).unwrap()).unwrap();
     (temp, pin)
 }
@@ -25,7 +34,7 @@ fn exact_original_inventory_refuses_file_replacement_and_restoration() {
     let original = fs::Snapshot::capture(pin.held(), deadline()).unwrap();
     let path = temp.path().join("tree/bin/tool");
     std::fs::rename(&path, path.with_extension("held")).unwrap();
-    std::fs::write(&path, b"substituted bytes").unwrap();
+    private_input(&path, b"substituted bytes");
     assert!(original.recheck(pin.held(), deadline()).is_err());
     std::fs::remove_file(&path).unwrap();
     std::fs::rename(path.with_extension("held"), &path).unwrap();
@@ -40,8 +49,8 @@ fn actual_parent_namespace_aba_stays_refused_with_original_file_unchanged() {
     let before = fs::Stamp::of(&file.metadata().unwrap());
     let bin = temp.path().join("tree/bin");
     std::fs::rename(&bin, bin.with_extension("original")).unwrap();
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::write(bin.join("tool"), b"other input").unwrap();
+    private_directory(&bin);
+    private_input(&bin.join("tool"), b"other input");
     std::fs::remove_file(bin.join("tool")).unwrap();
     std::fs::remove_dir(&bin).unwrap();
     std::fs::rename(bin.with_extension("original"), &bin).unwrap();
@@ -107,7 +116,7 @@ fn fresh_prefix_binding_refuses_replaced_directory_before_child_mutation() {
     };
     let lock = crate::lock::StoreLock::create_in_original(&layout, &original).unwrap();
     std::fs::rename(&layout.prefix, temp.path().join("saved-original")).unwrap();
-    std::fs::create_dir(&layout.prefix).unwrap();
+    private_directory(&layout.prefix);
     // Even copying a writer-lock name cannot make a different directory the created prefix.
     std::fs::hard_link(
         temp.path().join("saved-original/store.lock"),
@@ -122,8 +131,8 @@ fn fresh_prefix_binding_refuses_replaced_directory_before_child_mutation() {
 fn an_existing_destination_is_never_entered_or_truncated() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let parent = fs::Pin::open(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
-    std::fs::create_dir(temp.path().join("existing")).unwrap();
-    std::fs::write(temp.path().join("existing/sentinel"), b"unchanged").unwrap();
+    private_directory(&temp.path().join("existing"));
+    private_input(&temp.path().join("existing/sentinel"), b"unchanged");
     assert!(fs::mkdir(parent.held(), "existing").is_err());
     assert_eq!(
         std::fs::read(temp.path().join("existing/sentinel")).unwrap(),
@@ -175,7 +184,7 @@ fn fresh_names_below_original_store_or_image_are_refused_without_mutation() {
 fn prefix_alias_is_refused_before_it_can_hide_input_overlap() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let real = std::fs::canonicalize(temp.path()).unwrap();
-    std::fs::create_dir(real.join("base")).unwrap();
+    private_directory(&real.join("base"));
     std::os::unix::fs::symlink("base", real.join("alias")).unwrap();
     assert!(fs::Pin::open(&real.join("alias")).is_err());
     assert!(!real.join("base/store.lock").exists());
@@ -183,7 +192,11 @@ fn prefix_alias_is_refused_before_it_can_hide_input_overlap() {
 #[test]
 fn runtime_profile_explicitly_omits_only_source_namespaces_and_rejects_runtime_alias_into_them() {
     let (temp, pin) = fixture();
-    std::fs::create_dir_all(temp.path().join("tree/lib/rustlib/src")).unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(temp.path().join("tree/lib/rustlib/src"))
+        .unwrap();
     std::fs::write(
         temp.path().join("tree/lib/rustlib/src/uncaptured"),
         b"not runtime or source custody",

@@ -988,6 +988,221 @@ mod macos {
         );
     }
 
+    /// A captured view as text, one character a point: what a person reading the drive's output
+    /// sees of the drawing.
+    fn show_bitmap(w: usize, h: usize, px: &[u8], points: (f64, f64)) -> Vec<String> {
+        let spp = px.len().checked_div(w * h).unwrap_or(4).max(1);
+        // Whole pixels a point: 1 or 2 on the displays this runs on.
+        let step = ((w as f64 / points.0.max(1.0)).round() as usize).max(1);
+        (0..h)
+            .step_by(step)
+            .map(|y| {
+                (0..w)
+                    .step_by(step)
+                    .map(|x| {
+                        let i = (y * w + x) * spp;
+                        let a = if spp >= 4 {
+                            px.get(i + 3).copied().unwrap_or(0)
+                        } else {
+                            255
+                        };
+                        match a {
+                            0..=31 => ' ',
+                            32..=127 => '.',
+                            128..=199 => 'o',
+                            _ => '#',
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Stage 14: a real `NSStatusItem` on a Mac in a fleet at each fleet access level in turn
+    /// (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §6, §7), read back off AppKit: the
+    /// button's title the caret, its image that level's template lock, its hover and its
+    /// accessibility label the ones the glance makes, the item with no `-menu` of its own and
+    /// `statusClicked:` as the button's action; the button as AppKit draws it, inked wider than
+    /// the caret alone and no two levels alike; and, first in the menu the click handler pops
+    /// up, the Fleet Access submenu with the level in force checked. A fresh click's level
+    /// joins the title while the checkmark stays on the level in force, and out of a fleet the
+    /// same item shows no image. The levels are the glance's: nothing is clicked and no level
+    /// is stored. The item leaves the bar when the stage ends.
+    fn lock_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
+        use aterm_types::fleet_access::FleetAccess;
+        const CARET: &str = "\u{276f}";
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
+        let slot = crate::fleet_glance::FleetSlot {
+            book: crate::fleet_glance::BookFacts {
+                in_fleet: true,
+                ..crate::fleet_glance::BookFacts::default()
+            },
+            ..crate::fleet_glance::FleetSlot::default()
+        };
+        let at = |level: FleetAccess| {
+            let mut glance = crate::status_item::Glance::build(&[], &[], Some(&slot), now_ms, None);
+            glance.access = level;
+            glance.access_shown = level;
+            glance
+        };
+        let alone = crate::status_item::Glance::build(&[], &[], None, now_ms, None);
+        let Some(item) = crate::status_item::install(proxy, &alone) else {
+            cx.check(false, "the status bar gave the drive no item".to_owned());
+            return;
+        };
+        let button = crate::status_item::button_on_the_bar(&item);
+        let drawn = |what: &str| {
+            // SAFETY: the item's live bar button, on the main thread.
+            let shot = button.as_ref().and_then(|b| unsafe { capture(b.id()) });
+            if let (Some((w, h, px)), Some(b)) = (&shot, &button) {
+                // SAFETY: `-bounds` is a read-only accessor on the live button.
+                let size = unsafe { s_rect(b.id(), sel!(bounds)) }.size;
+                println!("  --  the button as AppKit draws it, {what} ({w}x{h} px):");
+                for line in show_bitmap(*w, *h, px, (size.width, size.height)) {
+                    println!("      |{line}");
+                }
+            }
+            shot.map(|(w, h, px)| {
+                let inked = ink_columns(w, h, &px).iter().filter(|c| **c > 0).count();
+                (inked, px)
+            })
+        };
+        let face = crate::status_item::face_on_the_bar(&item);
+        println!("  --  out of a fleet: {face:?}");
+        cx.check(
+            face.as_ref()
+                .is_some_and(|f| f.title == CARET && f.image.is_none() && f.no_menu && f.clicks),
+            "out of a fleet the button is the caret alone, the item has no -menu of its own and \
+             the button's action is statusClicked:"
+                .to_owned(),
+        );
+        let bare = drawn("out of a fleet");
+        cx.check(
+            bare.as_ref().is_some_and(|(inked, _)| *inked > 0),
+            format!(
+                "AppKit draws the caret on the bar button ({:?} inked columns)",
+                bare.as_ref().map(|(inked, _)| *inked)
+            ),
+        );
+        let mut locks: Vec<Vec<u8>> = Vec::new();
+        for level in FleetAccess::ALL {
+            let glance = at(level);
+            let (tip, label) = (glance.tooltip(), glance.accessibility_label());
+            crate::status_item::update(&item, glance);
+            let face = crate::status_item::face_on_the_bar(&item);
+            println!("  --  {}: {face:?}", level.word());
+            let image = crate::status_lock_icon::description(level);
+            cx.check(
+                face.as_ref().is_some_and(|f| {
+                    f.title == CARET
+                        && f.image.as_deref() == Some(image)
+                        && f.template
+                        && f.no_menu
+                        && f.clicks
+                }),
+                format!(
+                    "at {} the button is the caret beside the template image {image:?}",
+                    level.word()
+                ),
+            );
+            cx.check(
+                face.as_ref().is_some_and(|f| {
+                    f.tip.as_deref() == Some(tip.as_str())
+                        && f.label.as_deref() == Some(label.as_str())
+                }),
+                format!(
+                    "at {} the button's -toolTip is {tip:?} and its -accessibilityLabel {label:?}",
+                    level.word()
+                ),
+            );
+            let shot = drawn(level.word());
+            let wider = match (&shot, &bare) {
+                (Some((with, _)), Some((without, _))) => with > without,
+                _ => false,
+            };
+            cx.check(
+                wider,
+                format!(
+                    "at {} AppKit draws the lock beside the caret ({:?} inked columns, {:?} \
+                     without it)",
+                    level.word(),
+                    shot.as_ref().map(|(inked, _)| *inked),
+                    bare.as_ref().map(|(inked, _)| *inked)
+                ),
+            );
+            locks.extend(shot.map(|(_, px)| px));
+            let items = crate::status_item::items_on_the_bar(&item);
+            let first = items.first();
+            let levels: Vec<(&str, bool, bool)> = first
+                .map(|i| {
+                    i.under
+                        .iter()
+                        .map(|l| (l.title.as_str(), l.checked, l.tip.is_some()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let want: Vec<(&str, bool, bool)> = FleetAccess::ALL
+                .iter()
+                .map(|l| (l.label(), *l == level, true))
+                .collect();
+            cx.check(
+                first.is_some_and(|i| i.title.ends_with(level.label())) && levels == want,
+                format!(
+                    "at {} the menu's first item is Fleet Access, named for the level, holding \
+                     the three levels with a hover each and that one checked (got {:?}: \
+                     {levels:?})",
+                    level.word(),
+                    first.map(|i| i.title.as_str())
+                ),
+            );
+        }
+        cx.check(
+            locks.len() == 3
+                && locks[0] != locks[1]
+                && locks[1] != locks[2]
+                && locks[0] != locks[2],
+            format!(
+                "no two levels are drawn alike on the bar ({} of 3 drawn)",
+                locks.len()
+            ),
+        );
+        // A click's raise that has not taken effect: the lock and the title are the level it
+        // shows, the checkmark the level in force.
+        let mut raising = at(FleetAccess::ReadOnly);
+        raising.access_shown = FleetAccess::ReadWrite;
+        raising.access_flash = Some(FleetAccess::ReadWrite);
+        crate::status_item::update(&item, raising);
+        let face = crate::status_item::face_on_the_bar(&item);
+        println!("  --  a raise not yet in effect: {face:?}");
+        let named = format!("{CARET} {}", FleetAccess::ReadWrite.short());
+        let image = crate::status_lock_icon::description(FleetAccess::ReadWrite);
+        let checked: Vec<bool> = crate::status_item::items_on_the_bar(&item)
+            .first()
+            .map(|i| i.under.iter().map(|l| l.checked).collect())
+            .unwrap_or_default();
+        cx.check(
+            face.as_ref()
+                .is_some_and(|f| f.title == named && f.image.as_deref() == Some(image))
+                && checked == [true, false, false],
+            format!(
+                "a fresh click's raise shows {named:?} beside {image:?} while Read Only stays \
+                 checked (checked: {checked:?})"
+            ),
+        );
+        let _ = drawn("a raise not yet in effect");
+        crate::status_item::update(&item, alone);
+        let face = crate::status_item::face_on_the_bar(&item);
+        cx.check(
+            face.as_ref()
+                .is_some_and(|f| f.title == CARET && f.image.is_none()),
+            format!("out of a fleet again the lock leaves the button ({face:?})"),
+        );
+        drop(button);
+        drop(item);
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one linear drive of one window: every stage depends on the \
@@ -2271,13 +2486,29 @@ mod macos {
         let row = |name: &str,
                    d: &mut Driver,
                    el: &mut EventLoop<Wake>,
-                   matrix: &mut Vec<(String, Option<u64>)>| {
+                   matrix: &mut Vec<(String, Option<u64>)>,
+                   unhovered: bool| {
             let t = Instant::now();
             while t.elapsed() < Duration::from_millis(90) {
                 let _ = el.pump_app_events(Some(Duration::from_millis(4)), d);
             }
             // SAFETY: `ns_window` is live and the strip is re-found through AppKit every row, so a rebuild that replaced it is followed.
             let s = unsafe { strip_of(ns_window) };
+            if unhovered {
+                // These metadata comparisons are unhovered states. Settling may deliver a
+                // tracking-area enter from the real pointer, and a reused chip keeps it.
+                // Establish the same state after settling and before the synchronous capture.
+                // SAFETY: the strip's chips are live views; the exit events are +0 autoreleased.
+                unsafe {
+                    for chip in chips(s) {
+                        s_v_id(
+                            chip,
+                            sel!(mouseExited:),
+                            mouse_event(MOUSE_MOVED, CGPoint { x: 0.0, y: 0.0 }, 0, win_no, 0),
+                        );
+                    }
+                }
+            }
             // SAFETY: `s` is a live view or nil, which `capture` rejects.
             match unsafe { capture(s) } {
                 Some((w, hgt, px)) => {
@@ -2293,7 +2524,7 @@ mod macos {
         };
         for n in [1usize, 2, 3, 5, 8] {
             apply(&handle, &model(n));
-            row(&format!("tabs={n}"), &mut d, &mut el, &mut matrix);
+            row(&format!("tabs={n}"), &mut d, &mut el, &mut matrix, false);
         }
         let mut m = model(4);
         let tile = |fill, glyph| crate::tab_bar::AppTile { fill, glyph };
@@ -2302,18 +2533,24 @@ mod macos {
             solo: tile(fill, glyph),
             quiet: tile(fill, glyph),
         };
-        row("tile unpublished", &mut d, &mut el, &mut matrix);
+        row("tile unpublished", &mut d, &mut el, &mut matrix, false);
         toolbar::set_app_tiles(&handle, inks([40, 90, 160], [240, 240, 250]));
-        row("tile published", &mut d, &mut el, &mut matrix);
+        row("tile published", &mut d, &mut el, &mut matrix, false);
         for kind in TabIconKind::ALL {
             m.metadata[0].icon = Some(kind);
             apply(&handle, &m);
-            row(&format!("icon={kind:?}"), &mut d, &mut el, &mut matrix);
+            row(
+                &format!("icon={kind:?}"),
+                &mut d,
+                &mut el,
+                &mut matrix,
+                false,
+            );
         }
         m.metadata[0].icon = Some(TabIconKind::Settings);
         apply(&handle, &m);
         toolbar::set_app_tiles(&handle, inks([150, 60, 40], [250, 240, 230]));
-        row("tile recoloured", &mut d, &mut el, &mut matrix);
+        row("tile recoloured", &mut d, &mut el, &mut matrix, false);
         for (name, f) in [
             ("dirty", 0usize),
             ("busy", 1),
@@ -2330,7 +2567,7 @@ mod macos {
                 t.conn = None;
             }
             apply(&handle, &mm);
-            row(name, &mut d, &mut el, &mut matrix);
+            row(name, &mut d, &mut el, &mut matrix, true);
         }
         for role in [
             TabConnRole::Outbound,
@@ -2342,12 +2579,18 @@ mod macos {
                 t.conn = Some(role);
             }
             apply(&handle, &mm);
-            row(&format!("conn={role:?}"), &mut d, &mut el, &mut matrix);
+            row(
+                &format!("conn={role:?}"),
+                &mut d,
+                &mut el,
+                &mut matrix,
+                false,
+            );
         }
         apply(&handle, &model(3));
         for (name, dark) in [("dark=true", true), ("dark=false", false)] {
             toolbar::set_strip_dark(&handle, dark);
-            row(name, &mut d, &mut el, &mut matrix);
+            row(name, &mut d, &mut el, &mut matrix, false);
         }
         for (name, c) in [
             ("accent=None", None),
@@ -2355,7 +2598,7 @@ mod macos {
             ("accent=(20,180,90)", Some([20u8, 180, 90])),
         ] {
             toolbar::set_active_tab_color(&handle, c);
-            row(name, &mut d, &mut el, &mut matrix);
+            row(name, &mut d, &mut el, &mut matrix, false);
         }
         toolbar::set_active_tab_color(&handle, None);
         // SAFETY: `ns_window` is live.
@@ -2383,7 +2626,7 @@ mod macos {
                     );
                     s_v_id(chip, s, mouse_event(MOUSE_MOVED, wp, 0, win_no, 0));
                 }
-                row(name, &mut d, &mut el, &mut matrix);
+                row(name, &mut d, &mut el, &mut matrix, false);
             }
         } else {
             cx.check(false, "a chip is live for the hover rows".to_owned());
@@ -2410,7 +2653,7 @@ mod macos {
                     mouse_event(MOUSE_MOVED, wp, 0, win_no, 0),
                 )
             };
-            row("plus hover", &mut d, &mut el, &mut matrix);
+            row("plus hover", &mut d, &mut el, &mut matrix, false);
             // SAFETY: as above.
             unsafe {
                 s_v_id(
@@ -2419,7 +2662,7 @@ mod macos {
                     mouse_event(LEFT_DOWN, wp, 0, win_no, 1),
                 )
             };
-            row("plus pressed", &mut d, &mut el, &mut matrix);
+            row("plus pressed", &mut d, &mut el, &mut matrix, false);
             d.clear_wakes();
             // SAFETY: as above.
             unsafe { s_v_id(p, sel!(mouseUp:), mouse_event(LEFT_UP, wp, 0, win_no, 1)) };
@@ -2437,7 +2680,7 @@ mod macos {
                     mouse_event(MOUSE_MOVED, wp, 0, win_no, 0),
                 )
             };
-            row("plus idle", &mut d, &mut el, &mut matrix);
+            row("plus idle", &mut d, &mut el, &mut matrix, false);
         } else {
             cx.check(
                 false,
@@ -2574,6 +2817,12 @@ mod macos {
         stopped_first_on_the_bar(&mut cx, &proxy);
         receipt_on_the_bar(&mut cx, &proxy);
 
+        println!(
+            "\n-- stage 14: the menu bar's fleet access lock, off the real status item's button \
+             and NSMenu"
+        );
+        lock_on_the_bar(&mut cx, &proxy);
+
         drop(handle);
         drop(d.window.take());
         println!("\n=== VERDICT ===");
@@ -2603,22 +2852,5 @@ mod macos {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn required_window_start_pumps_after_scheduling_delay() {
-        for (age, expected) in [(21, true), (61, false)] {
-            let started = std::time::Instant::now() - std::time::Duration::from_secs(age);
-            let mut created = false;
-            pump_window_start(started, || {
-                created = true;
-                false
-            });
-            assert_eq!(
-                created, expected,
-                "only a live startup pumps the required creation"
-            );
-        }
-    }
-}
+#[path = "toolbar_drive_tests.rs"]
+mod tests;

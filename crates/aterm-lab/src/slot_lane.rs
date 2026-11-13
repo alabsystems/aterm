@@ -458,7 +458,12 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
         span.as_secs(),
         aterm_sysprobe::slots::PERIOD.as_secs()
     );
-    let mut reader = SlotReader::new(dir.to_path_buf());
+    let mut reader = SlotReader::new(
+        dir.to_path_buf(),
+        aterm_uds::account::home()
+            .and_then(|home| std::fs::canonicalize(home).ok())
+            .map(|home| aterm_sysprobe::slots::default_dir(&home).join("adopted")),
+    );
     let start = Instant::now();
     let mut next_summary = start + Duration::from_secs(3600);
     let (mut reads, mut fails) = (0u64, 0u64);
@@ -466,10 +471,19 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
     let mut last = SlotsRead::Unread(Unread::NotSampled);
     while start.elapsed() < span {
         let before = slot_files(dir);
+        let SlotHolders {
+            held: before_held,
+            unread: before_unread,
+        } = slot_holders(&before)?;
         let load = aterm_sysprobe::load_average();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the machine's cores the load is read against, not a pool's size"
+        )]
+        let ncpu = std::thread::available_parallelism().ok().map(usize::from);
         let machine = Machine {
             load5: load.map(|l| l[1]),
-            ncpu: std::thread::available_parallelism().ok().map(usize::from),
+            ncpu,
         };
         let read = reader.read(Instant::now(), now_us(), &machine, true);
         let after = slot_files(dir);
@@ -479,15 +493,49 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             fails += 1;
             println!("  FAIL read {reads}: {why}");
         };
-        let proven: Vec<u32> = match &read {
-            SlotsRead::Read { holders, .. } => holders.iter().map(|h| h.pid).collect(),
+        let proven = match &read {
+            SlotsRead::Read { holders, .. } => holders.clone(),
             SlotsRead::Unread(_) => Vec::new(),
         };
-        for pid in &proven {
-            let seen = |list: &[(PathBuf, u32)]| list.iter().any(|(_, p)| p == pid);
-            if !seen(&held) && !seen(&unread) && aterm_uds::process::pid_alive(*pid) {
+        for holder in &proven {
+            let pid = holder.pid;
+            let live = match aterm_sysprobe::kproc::record_read(pid) {
+                Ok(Some(process)) => {
+                    !process.zombie
+                        && process
+                            .start_s
+                            .saturating_mul(1_000_000)
+                            .saturating_add(u64::from(process.start_us))
+                            == holder.birth_us
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    println!(
+                        "slot-capture: COULD NOT RUN: current process identity for pid {pid} is unreadable"
+                    );
+                    return Ok(3);
+                }
+            };
+            let seen = |list: &[(PathBuf, u32)]| list.iter().any(|(_, p)| *p == pid);
+            if !seen(&held) && !seen(&before_held) && live {
+                match reader.adoption_holds(*holder) {
+                    Some(true) => continue,
+                    None => {
+                        println!(
+                            "slot-capture: COULD NOT RUN: current adoption custody for pid {pid} is unreadable"
+                        );
+                        return Ok(3);
+                    }
+                    Some(false) if seen(&unread) || seen(&before_unread) => {
+                        println!(
+                            "slot-capture: COULD NOT RUN: current descriptors for pid {pid} are unreadable"
+                        );
+                        return Ok(3);
+                    }
+                    Some(false) => {}
+                }
                 fail(format!(
-                    "the reader proves pid {pid} a holder; the holder scan shows it holding no slot"
+                    "the reader proves pid {pid} a holder; neither descriptors nor a fresh process-bound adoption prove it"
                 ));
             }
         }
@@ -496,24 +544,20 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             let own = f.pid.is_some_and(|pid| {
                 before.iter().any(|b| b.path == f.path && b.pid == f.pid)
                     && held.iter().any(|(path, p)| *p == pid && path == &f.path)
+                    && before_held
+                        .iter()
+                        .any(|(path, p)| *p == pid && path == &f.path)
             });
             if own && let Some(pid) = f.pid {
-                if seen_once.contains(&(f.path.clone(), pid)) && !proven.contains(&pid) {
+                if seen_once.contains(&(f.path.clone(), pid))
+                    && !proven.iter().any(|h| h.pid == pid)
+                {
                     fail(format!(
                         "the holder scan shows {} held by its record's pid {pid} on two reads; the reader does not prove it",
                         f.path.display()
                     ));
                 }
                 seen_now.push((f.path.clone(), pid));
-            }
-            if !before.iter().any(|b| b.path == f.path)
-                && f.stamp.0 == 0
-                && !held.iter().chain(&unread).any(|(path, _)| path == &f.path)
-            {
-                fail(format!(
-                    "{} appeared, empty and unheld, across the reader's read",
-                    f.path.display()
-                ));
             }
         }
         seen_once = seen_now;
@@ -854,62 +898,5 @@ fn ctl(inst: &Instance, world: &World, args: &[&str]) -> Result<Reply, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{duration_of, slot_files, slot_holders};
-    use std::time::Duration;
-
-    /// The watch's holder scan ([`slot_holders`]) names each slot file a process holds open
-    /// with that process. NEGATIVE CONTROLS: a slot file nobody holds names no holder, and one
-    /// removed after the listing is held by nobody rather than failing the watch.
-    #[test]
-    fn the_watch_names_each_held_slot_file_with_its_holder() {
-        let dir = crate::TestScratch::new("slots");
-        for n in 0..3 {
-            std::fs::write(dir.join(format!("slot-{n}")), b"").unwrap();
-        }
-        let mut holder = aterm_uds::spawnfd::command("/bin/sleep")
-            .arg("600")
-            .stdin(std::fs::File::open(dir.join("slot-0")).unwrap())
-            .spawn()
-            .expect("spawn a holder");
-        let files = slot_files(&dir);
-        std::fs::remove_file(dir.join("slot-2")).unwrap();
-        let scan = slot_holders(&files);
-        let _ = holder.kill();
-        let _ = holder.wait();
-        assert_eq!(files.len(), 3, "the listing");
-        let scan = scan.expect("the scan");
-        assert_eq!(scan.held, [(dir.join("slot-0"), holder.id())]);
-    }
-
-    #[test]
-    fn watch_duration_requires_a_positive_bounded_number_and_an_ascii_unit() {
-        for (text, seconds) in [("1s", 1), ("30s", 30), ("20m", 1200), ("24h", 86400)] {
-            assert_eq!(
-                duration_of(text),
-                Some(Duration::from_secs(seconds)),
-                "{text}"
-            );
-        }
-        for text in [
-            "",
-            "s",
-            "0s",
-            "1",
-            "-1s",
-            "1é",
-            "é",
-            "1😀",
-            "1秒",
-            "18446744073709551616s",
-            "18446744073709551615m",
-            "18446744073709551615h",
-        ] {
-            assert_eq!(duration_of(text), None, "{text}");
-        }
-        assert_eq!(
-            duration_of("18446744073709551615s"),
-            Some(Duration::from_secs(u64::MAX))
-        );
-    }
-}
+#[path = "slot_lane_tests.rs"]
+mod tests;

@@ -219,8 +219,8 @@ fn ten_escaped_failure_samples_fit_the_event_reader_and_count_exact_omissions() 
     }
 }
 
-/// The event of `run`, at a width of 3 charged 4 cores, with the fields every event has, and the history sample
-/// it keeps, if it keeps one, with the figures the event has.
+/// The event of `run`, at a width of 3 charged 7 cores, with the fields every event has, and the history sample
+/// it keeps, if it keeps one, with the figures the event has and the grant each thread had (two).
 fn event_and_sample(
     binary: &Binary,
     run: &Run,
@@ -232,7 +232,7 @@ fn event_and_sample(
         Duration::from_millis(8500),
     );
     ran.planned.width = 3;
-    ran.planned.charge = 4;
+    ran.planned.charge = 7;
     let evidence = crate::test_content::Evidence {
         exe_sha256: Some("ab".repeat(32)),
         content_key: Some("cd".repeat(32)),
@@ -248,7 +248,7 @@ fn event_and_sample(
     assert_eq!(event["waiting_s"].as_f64(), Some(1.25));
     assert_eq!(event["execution_s"].as_f64(), Some(8.5));
     assert_eq!(event["width"].as_u64(), Some(3));
-    assert_eq!(event["charge"].as_u64(), Some(4));
+    assert_eq!(event["charge"].as_u64(), Some(7));
     assert_eq!(event["exe_sha256"].as_str(), Some("ab".repeat(32).as_str()));
     assert_eq!(
         event["content_key"].as_str(),
@@ -258,6 +258,7 @@ fn event_and_sample(
     assert_eq!(event["carried"].as_bool(), Some(false));
     if let Some(sample) = &sample {
         assert_eq!(sample.width, 3);
+        assert_eq!(sample.cores, Some(2), "seven cores over three threads");
         assert_eq!(event["tests"].as_u64(), sample.tests);
         assert_eq!(
             sample.wall_ms,

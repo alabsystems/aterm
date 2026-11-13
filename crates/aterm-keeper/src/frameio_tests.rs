@@ -21,7 +21,7 @@ fn a_register_carries_its_descriptor_and_a_bye_none() {
         tag: b"t".to_vec(),
     };
     write_frame(&a, &frame, Some(file.as_fd())).expect("write");
-    write_frame(&a, &Frame::Bye, None).expect("write");
+    write_frame(&a, &Frame::Bye { keep: Vec::new() }, None).expect("write");
     let got = read_frame(&b).expect("read").expect("a frame");
     assert_eq!(got.frame, frame);
     let fd = got.fd.expect("the descriptor rode it");
@@ -32,7 +32,7 @@ fn a_register_carries_its_descriptor_and_a_bye_none() {
         "the same device"
     );
     let bye = read_frame(&b).expect("read").expect("a frame");
-    assert_eq!(bye.frame, Frame::Bye);
+    assert_eq!(bye.frame, Frame::Bye { keep: Vec::new() });
     assert!(bye.fd.is_none());
     drop(a);
     assert!(read_frame(&b).expect("eof").is_none(), "clean EOF");
@@ -42,10 +42,10 @@ fn a_register_carries_its_descriptor_and_a_bye_none() {
 fn a_descriptor_on_the_wrong_kind_is_refused() {
     let (a, b) = CtlStream::pair().expect("pair");
     assert!(
-        write_frame(&a, &Frame::Bye, Some(a.as_fd())).is_err(),
+        write_frame(&a, &Frame::Bye { keep: Vec::new() }, Some(a.as_fd())).is_err(),
         "the writer refuses"
     );
-    let bytes = Frame::Bye.encode().expect("encode");
+    let bytes = Frame::Bye { keep: Vec::new() }.encode().expect("encode");
     fdpass::send_with_fds(&a, &bytes, &[a.as_fd()]).expect("send");
     let err = read_frame(&b).expect_err("refused");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -54,7 +54,7 @@ fn a_descriptor_on_the_wrong_kind_is_refused() {
 #[test]
 fn truncated_header_returns_unexpected_eof() {
     let (a, b) = CtlStream::pair().expect("pair");
-    let bytes = Frame::Bye.encode().expect("encode");
+    let bytes = Frame::Bye { keep: Vec::new() }.encode().expect("encode");
     fdpass::send_with_fds(&a, &bytes[..3], &[]).expect("partial header");
     drop(a);
     let err = read_frame(&b).expect_err("truncated header must fail");

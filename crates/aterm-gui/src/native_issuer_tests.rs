@@ -375,73 +375,93 @@ fn direct_continuation_capture_cannot_bypass_operation_wide_grant_history() {
 
 #[test]
 fn uncertain_grant_closes_only_as_unknown_after_positive_quiescence() {
-    let (handle, facts, binding, actor, launcher) = ready(8103);
-    let ctx = &handle.ctx;
-    facts.grant_journal_allowed.store(false, Ordering::SeqCst);
-    assert_eq!(
-        run(
-            ctx,
-            &facts,
-            Request::Execute(binding.clone(), ImagePhase::Forward),
-            launcher.clone()
-        ),
-        UNKNOWN
-    );
-    let operation = lookup(ctx, &binding).unwrap();
-    // Even a dead launcher birth is insufficient while its process group lives.
-    facts.processes.lock().unwrap().remove(&600);
-    facts
-        .processes
-        .lock()
-        .unwrap()
-        .insert(601, process(601, 400, 600, 400, 20));
-    assert_eq!(
-        run(
-            ctx,
-            &facts,
-            Request::Reconcile(binding.clone()),
-            actor.clone()
-        ),
-        UNKNOWN
-    );
-    assert_eq!(operation.lock().unwrap().phase, Phase::Started);
-    facts.processes.lock().unwrap().remove(&601);
-    facts.foreground.store(400, Ordering::SeqCst);
-    assert_eq!(
-        run(
-            ctx,
-            &facts,
-            Request::Reconcile(binding.clone()),
-            actor.clone()
-        ),
-        UNKNOWN
-    );
-    assert_eq!(
-        operation.lock().unwrap().phase,
-        Phase::Completed(Decision::Unknown)
-    );
-    assert!(facts.receipt_history.lock().unwrap().is_empty());
-    assert_eq!(facts.sealed_history.lock().unwrap().len(), 1);
-    assert_eq!(
-        run(
-            ctx,
-            &facts,
-            Request::Execute(binding.clone(), ImagePhase::Forward),
-            launcher
-        ),
-        DENIED
-    );
-    let deadline = operation.lock().unwrap().request.deadline_us;
-    let retired = ctx
-        .fenced_writes
-        .native
-        .lock()
-        .unwrap()
-        .reclaim(deadline + 1);
-    assert_eq!(retired.len(), 1);
-    drop(retired);
-    assert_eq!(run(ctx, &facts, Request::Query(binding), actor), DENIED);
-    assert!(facts.receipt_history.lock().unwrap().is_empty());
+    for committed_panic in [false, true] {
+        let (handle, facts, binding, actor, launcher) = ready(8150 + u64::from(committed_panic));
+        let ctx = &handle.ctx;
+        facts
+            .grant_journal_allowed
+            .store(committed_panic, Ordering::SeqCst);
+        facts
+            .grant_journal_panic
+            .store(committed_panic, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                ctx,
+                &facts,
+                Request::Execute(binding.clone(), ImagePhase::Forward),
+                launcher.clone(),
+            )
+        }));
+        if committed_panic {
+            assert!(result.is_err());
+            assert_eq!(
+                facts.journal.lock().unwrap()[&binding.id].state,
+                JournalState::MayExecute
+            );
+        } else {
+            assert_eq!(result.unwrap(), UNKNOWN);
+        }
+        let operation = lookup(ctx, &binding).unwrap();
+        {
+            let op = operation.lock().unwrap();
+            assert_eq!(op.grant_record, GrantRecord::Uncertain(1));
+            assert!(!op.children[0].as_ref().unwrap().execute_sent);
+        }
+        // Even a dead launcher birth is insufficient while its process group lives.
+        facts.processes.lock().unwrap().remove(&600);
+        facts
+            .processes
+            .lock()
+            .unwrap()
+            .insert(601, process(601, 400, 600, 400, 20));
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Reconcile(binding.clone()),
+                actor.clone()
+            ),
+            UNKNOWN
+        );
+        assert_eq!(operation.lock().unwrap().phase, Phase::Started);
+        facts.processes.lock().unwrap().remove(&601);
+        facts.foreground.store(400, Ordering::SeqCst);
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Reconcile(binding.clone()),
+                actor.clone()
+            ),
+            UNKNOWN
+        );
+        assert_eq!(
+            operation.lock().unwrap().phase,
+            Phase::Completed(Decision::Unknown)
+        );
+        assert!(facts.receipt_history.lock().unwrap().is_empty());
+        assert_eq!(facts.sealed_history.lock().unwrap().len(), 1);
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Execute(binding.clone(), ImagePhase::Forward),
+                launcher
+            ),
+            DENIED
+        );
+        let deadline = operation.lock().unwrap().request.deadline_us;
+        let retired = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .reclaim(deadline + 1);
+        assert_eq!(retired.len(), 1);
+        drop(retired);
+        assert_eq!(run(ctx, &facts, Request::Query(binding), actor), DENIED);
+        assert!(facts.receipt_history.lock().unwrap().is_empty());
+    }
 }
 
 fn grant_number(record: GrantRecord) -> i64 {

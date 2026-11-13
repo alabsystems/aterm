@@ -61,7 +61,7 @@ fn real_changelog(root: &Path) -> (Candidate, crate::ledger::testing::Git) {
 }
 
 fn changelog_refusal(git: &dyn crate::ledger::GitRunner, c: &Candidate) -> Refusal {
-    let failed = crate::gates::changelog_gate_at(git, &c.commit, &c.version).unwrap_err();
+    let failed = crate::gates::changelog_gate_at(git, &c.commit, &c.version, "").unwrap_err();
     Refusal::new(failed.to_string(), "write actual release notes")
         .detail(["retain this complete detail in the aggregate".into()])
 }

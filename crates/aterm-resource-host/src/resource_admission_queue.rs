@@ -74,7 +74,7 @@ impl Owner {
             queued_at,
             resolver: None,
             bootstrap_graph: None,
-            submission,
+            submission: submission.into(),
             events,
             recipe: None,
             sdk: None,
@@ -86,18 +86,36 @@ impl Owner {
             admitted: None,
             scope_reference: None,
             cancelled: false,
+            preflight: None,
+            probe_scope: None,
         });
         Ok(())
     }
     pub(super) fn tick_queue(&mut self) {
-        let Some(mut pending) = self.pending.pop_front() else {
+        let Some(pending) = self.pending.pop_front() else {
             return;
         };
+        if let Some(pending) = self.tick_pending(pending) {
+            self.pending.push_front(pending);
+        }
+    }
+
+    pub(super) fn tick_pending(&mut self, mut pending: Pending) -> Option<Pending> {
         pending.cancelled |= pending.events.cancelled();
         let expired = pending
             .original_deadline()
             .is_ok_and(|deadline| deadline.is_some_and(|deadline| Instant::now() >= deadline));
         if pending.cancelled || expired {
+            if let Some(mut scope) = pending.probe_scope.take() {
+                scope.cancel();
+                if !scope.poll(self) {
+                    pending.probe_scope = Some(scope);
+                    return Some(pending);
+                }
+            }
+            if let Some(call) = pending.probe.as_ref().and_then(recipe::Probe::take_call) {
+                let _ = call.reply.try_send(Err(io::ErrorKind::Interrupted.into()));
+            }
             // Preparation may still hold and inspect original images. Its
             // paid CPU and memory remain occupied until the worker joins.
             if pending
@@ -105,8 +123,7 @@ impl Owner {
                 .as_ref()
                 .is_some_and(|probe| !probe.finished())
             {
-                self.pending.push_front(pending);
-                return;
+                return Some(pending);
             }
             if let Some(mut probe) = pending.probe.take() {
                 let _ = probe.poll();
@@ -120,7 +137,7 @@ impl Owner {
                         "cancelled before native launch"
                     },
                 );
-                return;
+                return None;
             }
             let retained = self.retain_unlaunched(&mut pending);
             drop(pending.claim.take());
@@ -130,10 +147,10 @@ impl Owner {
             {
                 self.journal.fault(&mut self.faulted, "queue-settle", error);
             }
-            return;
+            return None;
         }
         match self.advance(&mut pending) {
-            Ok(Advance::Wait) => self.pending.push_front(pending),
+            Ok(Advance::Wait) => return Some(pending),
             Ok(Advance::Launch(custody)) => self.launch(pending, *custody),
             Ok(Advance::Retain(error)) => {
                 // No ARM has occurred, but CPU publication may be uncertain.
@@ -153,6 +170,7 @@ impl Owner {
             Err(error) => {
                 let reason = if workload::purpose(&pending.submission.request)
                     || bootstrap_graph::purpose(&pending.submission.request)
+                    || pending.preflight.is_some()
                 {
                     let detail: String = error
                         .to_string()
@@ -162,6 +180,8 @@ impl Owner {
                         .collect();
                     let kind = if bootstrap_graph::purpose(&pending.submission.request) {
                         "Bootstrap graph"
+                    } else if pending.preflight.is_some() {
+                        "preflight"
                     } else {
                         "workload"
                     };
@@ -171,7 +191,7 @@ impl Owner {
                 };
                 if pending.events.requires_accounting() {
                     self.defer_accounted_refusal(pending, &reason);
-                    return;
+                    return None;
                 }
                 // No CPU grant or ARM occurred on this branch. An exact
                 // prepared intent can remain private and unused after refusal.
@@ -187,6 +207,7 @@ impl Owner {
                 }
             }
         }
+        None
     }
     fn advance(&mut self, pending: &mut Pending) -> io::Result<Advance> {
         self.advance_inspected(pending, Instant::now() + Duration::from_millis(250))
@@ -199,6 +220,7 @@ impl Owner {
         let metadata = recipe::metadata_request(&pending.submission.request);
         let workload = workload::closed_request(&pending.submission.request);
         let graph = bootstrap_graph::closed_request(&pending.submission.request);
+        let preflight = pending.preflight.is_some();
         let root_deadline = pending.original_deadline()?;
         if root_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(io::Error::new(
@@ -206,7 +228,7 @@ impl Owner {
                 "original workload admission deadline expired",
             ));
         }
-        if metadata || workload || graph {
+        if metadata || workload || graph || preflight {
             if let Some(claim) = &pending.claim {
                 pending.scope_reference = Some(claim.cohort_closure_ref()?);
             }
@@ -222,7 +244,7 @@ impl Owner {
             };
             match inspection {
                 Err(error)
-                    if (workload || graph)
+                    if (workload || graph || preflight)
                         && error.kind() == io::ErrorKind::TimedOut
                         && root_deadline.is_some_and(|deadline| Instant::now() < deadline) =>
                 {
@@ -377,6 +399,17 @@ impl Owner {
                     self.pool.slots().get(),
                     layout,
                 )?);
+            }
+            if pending.probe_scope.is_none()
+                && let Some(call) = pending.probe.as_ref().and_then(recipe::Probe::take_call)
+            {
+                pending.probe_scope = Some(preflight::Scope::new(self, pending, call)?);
+            }
+            if let Some(mut scope) = pending.probe_scope.take()
+                && !scope.poll(self)
+            {
+                pending.probe_scope = Some(scope);
+                return Ok(false);
             }
             match pending
                 .probe

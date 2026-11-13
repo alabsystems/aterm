@@ -58,7 +58,7 @@ pub(super) fn migration_target_tap(
     }
 }
 
-fn tap_path(prefix: &Prefix, user: &str, repo: &str) -> Result<PathBuf, String> {
+pub(super) fn tap_path(prefix: &Prefix, user: &str, repo: &str) -> Result<PathBuf, String> {
     if !super::valid_component(user) || !super::valid_component(repo) {
         return Err("abrew: invalid tap path component".to_owned());
     }
@@ -333,7 +333,7 @@ pub fn add(
             let path_s = path.to_string_lossy();
             let mut args = git_protocol_args(local);
             args.extend(["-C", &path_s, "fetch", "--unshallow"]);
-            let fetched = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+            let fetched = fetch::capture(fetch::git_remote(&args))
                 .map_err(|e| format!("abrew: git fetch failed for tap {shown}: {e}"))?;
             if !fetched.status.success() {
                 return Err(format!("abrew: git fetch failed for tap {shown}"));
@@ -372,7 +372,7 @@ pub fn add(
         let staged_s = staged.to_string_lossy();
         let mut git_args: Vec<&str> = git_protocol_args(is_local_remote(&remote));
         git_args.extend(["clone", "--depth=1", "--", &remote, &staged_s]);
-        let code = fetch::run_inherit(aterm_uds::os_path!("git"), &git_args);
+        let code = fetch::inherit(fetch::git_remote(&git_args));
         if code != 0 {
             return Err(format!(
                 "abrew: git clone failed for tap {user}/{repo} ({code})"
@@ -417,7 +417,7 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     let path_s = path.to_string_lossy();
     let mut git_args: Vec<&str> = git_protocol_args(local);
     git_args.extend(["-C", &path_s, "pull", "--ff-only"]);
-    let code = fetch::run_inherit(aterm_uds::os_path!("git"), &git_args);
+    let code = fetch::inherit(fetch::git_remote(&git_args));
     if code != 0 {
         return Err(format!(
             "abrew: git pull failed for tap {user}/{repo} ({code})"
@@ -510,7 +510,7 @@ fn fix_remote_configuration(tap: &Tap, requested_remote: Option<&str>) -> Result
     {
         let mut args = git_protocol_args(local);
         args.extend(["-C", &path_s, "ls-remote", "--heads", "origin", branch]);
-        let listed = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+        let listed = fetch::capture(fetch::git_remote(&args))
             .map_err(|e| format!("abrew: git ls-remote failed for tap {}: {e}", tap.name()))?;
         if listed.status.success() && !listed.stdout.is_empty() {
             return Ok(());
@@ -524,7 +524,7 @@ fn fix_remote_configuration(tap: &Tap, requested_remote: Option<&str>) -> Result
         "origin",
         "+refs/heads/*:refs/remotes/origin/*",
     ]);
-    let fetched = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+    let fetched = fetch::capture(fetch::git_remote(&args))
         .map_err(|e| format!("abrew: git fetch failed for tap {}: {e}", tap.name()))?;
     if !fetched.status.success() {
         return Err(format!("abrew: git fetch failed for tap {}", tap.name()));
@@ -1267,8 +1267,34 @@ fn parse_service_block(text: &str, name: &str) -> Option<super::formula::Service
 }
 
 fn version_from_url(url: &str) -> String {
-    let base = url.rsplit('/').next().unwrap_or_default();
-    let digits: String = base
+    // The file name's first token (split on `-`/`_`) that is
+    // exactly `v?<digits>(.<digits>)*`, archive suffixes
+    // stripped — so `gate403-1.0.tar.gz` is 1.0, not the 403
+    // embedded in the name. Falls back to the first digit
+    // run when no token is version-shaped.
+    let base = url.split(['?', '#']).next().unwrap_or_default();
+    let mut name = base.rsplit('/').next().unwrap_or_default().to_string();
+    const EXTS: &[&str] = &[
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".whl", ".zip", ".crate",
+        ".tar", ".gz", ".bz2", ".xz", ".7z", ".gem", ".jar",
+    ];
+    loop {
+        let lower = name.to_lowercase();
+        let Some(ext) = EXTS.iter().find(|e| lower.ends_with(**e)) else {
+            break;
+        };
+        name.truncate(name.len() - ext.len());
+    }
+    for tok in name.split(['-', '_']) {
+        let t = tok.strip_prefix('v').unwrap_or(tok);
+        if !t.is_empty()
+            && t.split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return t.to_string();
+        }
+    }
+    let digits: String = name
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -1456,6 +1482,124 @@ fn livecheck_block_open(line: &str) -> bool {
     })
 }
 
+/// The formula file's `resource` stanzas as data, in file
+/// order: (name, url, explicit version). Resources nested in
+/// a block for another OS (`on_linux` off Linux, `on_macos`
+/// on it) or in the HEAD spec are not collected, matching
+/// what a stable load on this machine would see. None when
+/// a block's shape is outside the line scanner's subset (no
+/// plain `url`, interpolation, unterminated block).
+///
+/// (name, url, explicit version, livecheck block)
+pub type ResourceStanza = (
+    String,
+    String,
+    Option<String>,
+    Option<super::formula::LivecheckSpec>,
+);
+
+#[must_use]
+pub fn parse_resource_stanzas(text: &str) -> Option<Vec<ResourceStanza>> {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let mut out: Vec<ResourceStanza> = Vec::new();
+    let mut on_stack: Vec<(usize, bool)> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        let indent = indent_of(line);
+        if trimmed == "end"
+            && let Some(&(top, _)) = on_stack.last()
+            && indent == top
+        {
+            on_stack.pop();
+            continue;
+        }
+        if trimmed.starts_with("on_") && trimmed.ends_with(" do") {
+            let other_os = if cfg!(target_os = "linux") {
+                trimmed.starts_with("on_macos")
+            } else {
+                trimmed.starts_with("on_linux")
+            };
+            on_stack.push((indent, other_os));
+            continue;
+        }
+        // Resources of the HEAD spec are not the stable
+        // formula's; `brew livecheck` checks stable ones.
+        if trimmed == "head do" {
+            on_stack.push((indent, true));
+            continue;
+        }
+        let Some(after) = trimmed.strip_prefix("resource \"") else {
+            continue;
+        };
+        let name_end = after.find('"')?;
+        let name = after[..name_end].to_string();
+        if name.contains("#{") || !after[name_end..].contains(" do") {
+            return None;
+        }
+        let collect = !on_stack.iter().any(|&(_, other)| other);
+        let mut url: Option<String> = None;
+        let mut version: Option<String> = None;
+        let mut livecheck: Option<super::formula::LivecheckSpec> = None;
+        let mut lc_seen = false;
+        let mut closed = false;
+        while let Some(inner) = lines.next() {
+            let it = inner.trim();
+            let inner_indent = indent_of(inner);
+            if it == "end" && inner_indent == indent {
+                closed = true;
+                break;
+            }
+            // A resource may carry its own livecheck block;
+            // extract it and parse with the package parser
+            // (reindented so its opener matches). Its `url`
+            // lines are not the resource's.
+            if it == "livecheck do" && inner_indent > indent {
+                if lc_seen {
+                    return None;
+                }
+                lc_seen = true;
+                let mut block = String::from("  livecheck do\n");
+                let mut block_closed = false;
+                for lcl in lines.by_ref() {
+                    if lcl.trim() == "end" && indent_of(lcl) == inner_indent {
+                        block_closed = true;
+                        break;
+                    }
+                    block.push_str(lcl);
+                    block.push('\n');
+                }
+                if !block_closed {
+                    return None;
+                }
+                block.push_str("  end\n");
+                livecheck = Some(parse_livecheck_block(&block)?);
+                continue;
+            }
+            if url.is_none()
+                && let Some(u) = cask_quoted(it, "url")
+            {
+                if u.contains("#{") {
+                    return None;
+                }
+                url = Some(u);
+            } else if version.is_none()
+                && let Some(v) = cask_quoted(it, "version")
+            {
+                version = Some(v);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        if collect {
+            let url = url?;
+            out.push((name, url, version, livecheck));
+        }
+    }
+    Some(out)
+}
+
 /// Whether the tap file text carries a package-level
 /// `livecheck` block at all (brew's `livecheck_defined?`, as
 /// far as data can tell) — distinguishes "no block" from
@@ -1494,16 +1638,69 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
     }
     let mut spec = LivecheckSpec::default();
     let mut depth = 1usize;
-    for t in body {
+    let mut idx = 0usize;
+    // A `:json`/`:xml`/`:yaml` block's body lines, while
+    // inside it: (strategy symbol, params, lines).
+    let mut json_capture: Option<(String, String, Vec<String>)> = None;
+    while idx < body.len() {
+        let t = body[idx];
+        idx += 1;
         if t == "end" {
             depth -= 1;
+            if let Some((sym, params, lines)) = &mut json_capture {
+                if depth == 1 {
+                    match sym.as_str() {
+                        "xml" => spec.xml_block = parse_xml_shape(params, lines),
+                        "yaml" => spec.yaml_block = parse_yaml_shape(params, lines),
+                        _ => spec.json_block = parse_json_shape(params, lines),
+                    }
+                    json_capture = None;
+                } else {
+                    lines.push(t.to_string());
+                }
+            }
             continue;
+        }
+        if let Some((_, _, lines)) = &mut json_capture
+            && depth >= 2
+        {
+            lines.push(t.to_string());
         }
         let opens = line_opens_block(t);
         // Interpolation in a statement we read is not data; a
         // strategy block's unread Ruby body may contain it.
+        // The narrow exception is a `url` whose interpolations
+        // are only `#{LATEST_VERSION}` (rewritten below to the
+        // `<FORMULA_LATEST_VERSION>` form the oracle reports)
+        // and `#{version}` with a component accessor (kept
+        // verbatim; substituted at check time).
         if depth == 1 && t.contains("#{") {
-            return None;
+            let allowed = |line: &str| {
+                let mut rest = line;
+                while let Some(i) = rest.find("#{") {
+                    let Some(j) = rest[i + 2..].find('}') else {
+                        return false;
+                    };
+                    let token = &rest[i + 2..i + 2 + j];
+                    if !matches!(
+                        token,
+                        "LATEST_VERSION"
+                            | "version"
+                            | "version.major"
+                            | "version.minor"
+                            | "version.patch"
+                            | "version.major_minor"
+                            | "version.major_minor_patch"
+                    ) {
+                        return false;
+                    }
+                    rest = &rest[i + 2 + j + 1..];
+                }
+                true
+            };
+            if !(t.starts_with("url ") || t.starts_with("url(")) || !allowed(t) {
+                return None;
+            }
         }
         if depth == 1 && !t.is_empty() && !t.starts_with('#') {
             if let Some(rest) = t.strip_prefix("url ") {
@@ -1516,10 +1713,70 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                     (LivecheckUrl::Symbol(sym), tail)
                 } else {
                     let (s, tail) = quoted_token(rest)?;
-                    (LivecheckUrl::Literal(s), tail)
+                    (
+                        LivecheckUrl::Literal(
+                            s.replace("#{LATEST_VERSION}", "<FORMULA_LATEST_VERSION>"),
+                        ),
+                        tail,
+                    )
                 };
                 spec.url = Some(url);
-                spec.url_options = !tail.trim().trim_end_matches(')').trim().is_empty();
+                // Url options may continue on following lines
+                // while the text ends with a comma.
+                let mut opts = tail.trim().trim_end_matches(')').trim().to_string();
+                while opts.ends_with(',') {
+                    let next = body.get(idx)?;
+                    idx += 1;
+                    opts.push(' ');
+                    opts.push_str(next.trim().trim_end_matches(')').trim());
+                }
+                let opts = opts.strip_prefix(',').unwrap_or(&opts).trim();
+                if !opts.is_empty() {
+                    // Split at commas outside quotes.
+                    let mut parts: Vec<String> = Vec::new();
+                    let mut cur = String::new();
+                    let mut quote: Option<char> = None;
+                    for c in opts.chars() {
+                        match quote {
+                            Some(q) if c == q => quote = None,
+                            Some(_) => {}
+                            None if c == '"' || c == '\'' => quote = Some(c),
+                            None if c == ',' => {
+                                parts.push(std::mem::take(&mut cur));
+                                continue;
+                            }
+                            None => {}
+                        }
+                        cur.push(c);
+                    }
+                    parts.push(cur);
+                    for part in parts {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        let Some((key, value)) = part.split_once(':') else {
+                            spec.url_options = true;
+                            continue;
+                        };
+                        if key.trim() != "user_agent" {
+                            spec.url_options = true;
+                            continue;
+                        }
+                        let value = value.trim();
+                        if let Some(sym) = value.strip_prefix(':') {
+                            if sym == "browser" {
+                                spec.user_agent = Some(":browser".to_string());
+                            } else {
+                                spec.url_options = true;
+                            }
+                        } else if let Some((lit, _)) = quoted_token(value) {
+                            spec.user_agent = Some(lit);
+                        } else {
+                            spec.url_options = true;
+                        }
+                    }
+                }
             } else if let Some(rest) = t.strip_prefix("regex(") {
                 let (pattern, flags, tail) = regex_literal(rest)?;
                 if tail.trim() != ")" {
@@ -1535,6 +1792,9 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                     || (tail.starts_with("do |") && tail.ends_with('|')))
                 {
                     return None;
+                }
+                if (sym == "json" || sym == "xml" || sym == "yaml") && opens {
+                    json_capture = Some((sym.clone(), tail.to_string(), Vec::new()));
                 }
                 spec.strategy = Some(sym);
                 spec.strategy_block = opens;
@@ -1586,6 +1846,448 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
         }
     }
     Some(spec)
+}
+
+/// A strategy block's parameters: the root variable
+/// name and whether a `regex` parameter is declared.
+fn block_params(params: &str) -> Option<(String, bool)> {
+    let inner = params.trim().strip_prefix("do")?.trim();
+    let plist: Vec<&str> = if inner.is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .strip_prefix('|')?
+            .strip_suffix('|')?
+            .split(',')
+            .map(str::trim)
+            .collect()
+    };
+    let root = *plist.first()?;
+    if root.is_empty() || !root.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((root.to_string(), plist.get(1) == Some(&"regex")))
+}
+
+/// Join a block's non-comment lines, collapsing
+/// whitespace outside string literals.
+fn join_block_lines(lines: &[String]) -> String {
+    let mut joined = String::new();
+    for line in lines {
+        let l = line.trim();
+        if l.starts_with('#') {
+            continue;
+        }
+        let mut quoted = false;
+        let mut prev_space = joined.ends_with(' ') || joined.is_empty();
+        for c in l.chars() {
+            if c == '"' {
+                quoted = !quoted;
+            }
+            if !quoted && c.is_whitespace() {
+                if !prev_space {
+                    joined.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                joined.push(c);
+                prev_space = false;
+            }
+        }
+        if !joined.ends_with(' ') {
+            joined.push(' ');
+        }
+    }
+    joined
+}
+
+/// Reduce an `:xml` strategy block body to a data shape:
+/// `xml.get_elements("//a/b").map(&:text)` and the
+/// regex-capture map forms.
+fn parse_xml_shape(params: &str, lines: &[String]) -> Option<super::formula::XmlBlock> {
+    use super::formula::{XmlBlock, XmlShape};
+    let (root, has_regex) = block_params(params)?;
+    let joined = join_block_lines(lines);
+    let body = joined.trim();
+    let rest = body.strip_prefix(&root)?.strip_prefix(".get_elements(")?;
+    let (path_str, tail) = quoted_token(rest)?;
+    let tail = tail.strip_prefix(')')?;
+    let segs: Vec<String> = path_str
+        .strip_prefix("//")?
+        .split('/')
+        .map(str::to_string)
+        .collect();
+    if segs.is_empty() || segs.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    let shape = if tail == ".map(&:text)" {
+        XmlShape::Texts(segs)
+    } else {
+        let rest = strip_map_open(tail)?;
+        let (var, inner) = xml_map_parts(rest)?;
+        let after = inner.strip_prefix(&var)?.trim();
+        let ok = after == ".text[regex, 1]" || after == ".text&.[](regex, 1)";
+        if !ok || !has_regex {
+            return None;
+        }
+        XmlShape::TextsRegex(segs)
+    };
+    Some(XmlBlock { has_regex, shape })
+}
+
+/// Split an xml map body into its block variable and
+/// inner expression text (brace or `do` form).
+fn xml_map_parts(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let inner = if let Some(r) = s.strip_prefix('{') {
+        r.strip_suffix('}')?
+    } else {
+        s.strip_prefix("do ")?.strip_suffix(" end")?
+    };
+    let inner = inner.trim().strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let var = inner[..var_end].trim().to_string();
+    if var.is_empty() || !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((var, inner[var_end + 1..].trim().to_string()))
+}
+
+/// Reduce a `:json` strategy block body to a data shape,
+/// or `None` for anything beyond the enumerable forms.
+/// `params` is the block tail (`do`, `do |json|`,
+/// `do |json, regex|`).
+fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::JsonBlock> {
+    use super::formula::{JsonBlock, JsonKey, JsonShape};
+    let (root, has_regex) = block_params(params)?;
+    let joined = join_block_lines(lines);
+    let body = joined.trim();
+    let mut s = body;
+    // The two-statement match form:
+    // `m = <path>&.match(regex) m[1]`.
+    let mut match_form = false;
+    if let Some((var, rest)) = s.split_once(" = ")
+        && !var.contains(' ')
+        && let Some(r) = rest.strip_suffix(&format!(" {var}[1]"))
+        && let Some(p) = r.strip_suffix("&.match(regex)")
+    {
+        s = p;
+        match_form = true;
+    }
+    let mut cur = s.strip_prefix(root.as_str())?;
+    if let Some(rest) = cur.strip_prefix(".first") {
+        let (key, tail) = json_bracket_key(rest)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        return Some(JsonBlock {
+            has_regex,
+            shape: JsonShape::FirstKey(key),
+        });
+    }
+    let mut path: Vec<JsonKey> = Vec::new();
+    loop {
+        if let Some(rest) = cur.strip_prefix(".dig(") {
+            let close = rest.find(')')?;
+            for arg in rest[..close].split(',') {
+                let arg = arg.trim();
+                if let Some(k) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+                    if k.contains(['"', '\\']) {
+                        return None;
+                    }
+                    path.push(JsonKey::Key(k.to_string()));
+                } else if let Ok(i) = arg.parse::<usize>() {
+                    path.push(JsonKey::Idx(i));
+                } else {
+                    return None;
+                }
+            }
+            cur = &rest[close + 1..];
+        } else if cur.starts_with('[') {
+            let (key, tail) = json_bracket_key(cur)?;
+            path.push(JsonKey::Key(key));
+            cur = tail;
+        } else {
+            break;
+        }
+    }
+    if match_form {
+        if !cur.is_empty() || !has_regex {
+            return None;
+        }
+        return Some(JsonBlock {
+            has_regex,
+            shape: JsonShape::DigRegex(path),
+        });
+    }
+    let shape = if cur.is_empty() {
+        JsonShape::Dig(path)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.delete(")
+        .or_else(|| cur.strip_prefix(".delete("))
+    {
+        let (chars, tail) = quoted_token(rest)?;
+        if tail.trim() != ")" || chars.contains(['\\', '^']) {
+            return None;
+        }
+        JsonShape::DigDelete(path, chars)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.[](regex, 1)")
+        .or_else(|| cur.strip_prefix(".[](regex, 1)"))
+    {
+        if !rest.is_empty() || !has_regex {
+            return None;
+        }
+        JsonShape::DigRegex(path)
+    } else {
+        let rest = strip_map_open(cur)?;
+        let (var, inner) = json_map_parts(rest)?;
+        if let Some((item_key, is_regex)) = json_map_item(&var, &inner) {
+            if is_regex && !has_regex {
+                return None;
+            }
+            if is_regex {
+                JsonShape::MapRegex(path, item_key)
+            } else {
+                JsonShape::MapKey(path, item_key)
+            }
+        } else {
+            let guard = json_map_guarded(&var, &inner)?;
+            if guard.regex && !has_regex {
+                return None;
+            }
+            JsonShape::MapGuarded(path, Box::new(guard))
+        }
+    };
+    Some(JsonBlock { has_regex, shape })
+}
+
+/// Reduce a `:yaml` strategy block body to a data shape:
+/// a `yaml.dig("a", "b")` / index-path walk, optionally
+/// with the regex's first capture applied.
+fn parse_yaml_shape(params: &str, lines: &[String]) -> Option<super::formula::YamlBlock> {
+    use super::formula::{JsonKey, YamlBlock, YamlShape};
+    let (root, has_regex) = block_params(params)?;
+    let joined = join_block_lines(lines);
+    let body = joined.trim();
+    let mut cur = body.strip_prefix(root.as_str())?;
+    let mut path: Vec<JsonKey> = Vec::new();
+    loop {
+        if let Some(rest) = cur.strip_prefix(".dig(") {
+            let close = rest.find(')')?;
+            for arg in rest[..close].split(',') {
+                let arg = arg.trim();
+                if let Some(k) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+                    if k.contains(['"', '\\']) {
+                        return None;
+                    }
+                    path.push(JsonKey::Key(k.to_string()));
+                } else if let Ok(i) = arg.parse::<usize>() {
+                    path.push(JsonKey::Idx(i));
+                } else {
+                    return None;
+                }
+            }
+            cur = &rest[close + 1..];
+        } else if cur.starts_with('[') {
+            let (key, tail) = json_bracket_key(cur)?;
+            path.push(JsonKey::Key(key));
+            cur = tail;
+        } else {
+            break;
+        }
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let shape = if cur.is_empty() {
+        YamlShape::Dig(path)
+    } else {
+        let rest = cur
+            .strip_prefix("&.[](regex, 1)")
+            .or_else(|| cur.strip_prefix(".[](regex, 1)"))?;
+        if !rest.is_empty() || !has_regex {
+            return None;
+        }
+        YamlShape::DigRegex(path)
+    };
+    Some(YamlBlock { has_regex, shape })
+}
+
+/// `["key"]` at the start of `s`: the key and the rest.
+fn json_bracket_key(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix("[\"")?;
+    let close = rest.find('"')?;
+    let key = &rest[..close];
+    if key.contains('\\') {
+        return None;
+    }
+    let tail = rest[close + 1..].strip_prefix(']')?;
+    Some((key.to_string(), tail))
+}
+
+/// Strip a `.map`/`&.map`/`.filter_map` opener, braced or
+/// `do`-formed, returning what follows.
+fn strip_map_open(s: &str) -> Option<&str> {
+    for pre in ["&.map", "&.filter_map", ".map", ".filter_map"] {
+        if let Some(rest) = s.strip_prefix(pre) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Split a map body into its block variable and inner
+/// expression text.
+fn json_map_parts(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let inner = if let Some(r) = s.strip_prefix('{') {
+        r.strip_suffix('}')?
+    } else {
+        s.strip_prefix("do ")?.strip_suffix(" end")?
+    };
+    let inner = inner.trim().strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let var = inner[..var_end].trim().to_string();
+    if var.is_empty() || !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((var, inner[var_end + 1..].trim().to_string()))
+}
+
+/// The item access of a map body: its key (`None` = the
+/// item itself) and whether a regex capture applies.
+fn json_map_item(var: &str, inner: &str) -> Option<(Option<String>, bool)> {
+    // `m = item["k"]&.match(regex) next if m.blank? m[1]`
+    if let Some((mvar, rest)) = inner.split_once(" = ")
+        && !mvar.contains(' ')
+        && let Some(key) = rest_key(rest, var)
+        && rest == format!("{var}[\"{key}\"]&.match(regex) next if {mvar}.blank? {mvar}[1]")
+    {
+        return Some((Some(key), true));
+    }
+    let after = inner.strip_prefix(var)?;
+    if after.is_empty() {
+        return Some((None, false));
+    }
+    if let Some(r) = after.strip_prefix("[regex, 1]") {
+        return r.is_empty().then_some((None, true));
+    }
+    let (key, tail) = json_bracket_key(after)?;
+    match tail {
+        "" => Some((Some(key), false)),
+        "&.[](regex, 1)" => Some((Some(key), true)),
+        _ => None,
+    }
+}
+
+/// A guarded map body: zero or more `next if/unless`
+/// guards (or one postfix guard) around a simple item
+/// projection.
+fn json_map_guarded(var: &str, inner: &str) -> Option<super::formula::MapGuard> {
+    use super::formula::MapGuard;
+    // Postfix form: `<projection> unless <cond>` /
+    // `<projection> if <cond>`.
+    for (sep, unless) in [(" unless ", false), (" if ", true)] {
+        if let Some((left, right)) = inner.rsplit_once(sep)
+            && let Some((item_key, is_regex)) = json_map_item(var, left.trim())
+            && let Some((cond, rest)) = parse_json_cond(var, right.trim())
+            && rest.trim().is_empty()
+        {
+            return Some(MapGuard {
+                item_key,
+                regex: is_regex,
+                guards: vec![super::formula::JsonGuard { unless, cond }],
+            });
+        }
+    }
+    // Prefix guards, then the projection.
+    let mut s = inner.trim();
+    let mut guards = Vec::new();
+    loop {
+        let (unless, rest) = if let Some(r) = s.strip_prefix("next if ") {
+            (false, r)
+        } else if let Some(r) = s.strip_prefix("next unless ") {
+            (true, r)
+        } else {
+            break;
+        };
+        let (cond, rest) = parse_json_cond(var, rest)?;
+        guards.push(super::formula::JsonGuard { unless, cond });
+        s = rest.trim();
+    }
+    if guards.is_empty() {
+        return None;
+    }
+    let (item_key, is_regex) = json_map_item(var, s)?;
+    Some(MapGuard {
+        item_key,
+        regex: is_regex,
+        guards,
+    })
+}
+
+/// One guard condition at the start of `s`, plus the
+/// remainder: field comparisons, truthiness (with `||`
+/// chains), and the version/downcase forms.
+fn parse_json_cond<'a>(var: &str, s: &'a str) -> Option<(super::formula::JsonCond, &'a str)> {
+    use super::formula::JsonCond;
+    let (first, mut rest) = parse_json_cond_atom(var, s)?;
+    let mut parts = vec![first];
+    while let Some(r) = rest.trim_start().strip_prefix("|| ") {
+        let (atom, r2) = parse_json_cond_atom(var, r.trim_start())?;
+        parts.push(atom);
+        rest = r2;
+    }
+    if parts.len() == 1 {
+        return Some((parts.pop()?, rest));
+    }
+    // Only bare field accesses chain with `||` in the
+    // reduced grammar.
+    if !parts.iter().all(|p| matches!(p, JsonCond::Truthy(_))) {
+        return None;
+    }
+    Some((JsonCond::Or(parts), rest))
+}
+
+fn parse_json_cond_atom<'a>(var: &str, s: &'a str) -> Option<(super::formula::JsonCond, &'a str)> {
+    use super::formula::{JsonCond, JsonLit};
+    let after = s.strip_prefix(var)?;
+    let (field, tail) = json_bracket_key(after)?;
+    if let Some(rest) = tail.strip_prefix("&.start_with?(version.major_minor)") {
+        return Some((JsonCond::StartsWithMajorMinor(field), rest));
+    }
+    if let Some(rest) = tail.strip_prefix("&.downcase&.include?(") {
+        let (lit, rest) = quoted_token(rest)?;
+        let rest = rest.strip_prefix(')')?;
+        return Some((JsonCond::DowncaseIncludes(field, lit), rest));
+    }
+    for (op, is_ne) in [(" == ", false), (" != ", true)] {
+        if let Some(rest) = tail.strip_prefix(op) {
+            let (lit, rest) = if let Some(r) = rest.strip_prefix("true") {
+                (JsonLit::Bool(true), r)
+            } else if let Some(r) = rest.strip_prefix("false") {
+                (JsonLit::Bool(false), r)
+            } else {
+                let (lit, r) = quoted_token(rest)?;
+                (JsonLit::Str(lit), r)
+            };
+            let cond = if is_ne {
+                JsonCond::Ne(field, lit)
+            } else {
+                JsonCond::Eq(field, lit)
+            };
+            return Some((cond, rest));
+        }
+    }
+    Some((JsonCond::Truthy(field), tail))
+}
+
+/// The `["k"]` key right after `var` in `rest`.
+fn rest_key(rest: &str, var: &str) -> Option<String> {
+    let after = rest.strip_prefix(var)?;
+    let (key, _) = json_bracket_key(after)?;
+    Some(key)
 }
 
 /// Parse a cask `.rb` as data without evaluating Ruby, the
@@ -2086,616 +2788,5 @@ fn alias_file(tap: &Tap, name: &str) -> Option<(PathBuf, String)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn git_ok(args: &[&str]) {
-        let out = fetch::run_capture(aterm_uds::os_path!("git"), args).unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?}: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// r376: livecheck blocks parse as data across the shapes
-    /// the core tap actually uses (samples verbatim from
-    /// homebrew-core); interpolation and unknown statements
-    /// refuse the whole block (fail-closed).
-    #[test]
-    fn livecheck_block_parses_as_data() {
-        use super::super::formula::LivecheckUrl;
-        let spec = parse_livecheck_block(
-            "class Jq < Formula\n  livecheck do\n    url :stable\n    regex(/^(?:jq[._-])?v?(\\d+(?:\\.\\d+)+)$/i)\n  end\nend\n",
-        )
-        .unwrap();
-        assert_eq!(spec.url, Some(LivecheckUrl::Symbol("stable".into())));
-        assert_eq!(
-            spec.regex.as_deref(),
-            Some(r"^(?:jq[._-])?v?(\d+(?:\.\d+)+)$")
-        );
-        assert_eq!(spec.regex_flags, "i");
-        assert!(!spec.url_options && !spec.strategy_block);
-
-        let spec = parse_livecheck_block(
-            "  livecheck do\n    url \"https://files.radicle.xyz/releases/latest/radicle.json\"\n    strategy :json do |json|\n      json[\"version\"]\n    end\n  end\n",
-        )
-        .unwrap();
-        assert_eq!(
-            spec.url,
-            Some(LivecheckUrl::Literal(
-                "https://files.radicle.xyz/releases/latest/radicle.json".into()
-            ))
-        );
-        assert_eq!(spec.strategy.as_deref(), Some("json"));
-        assert!(spec.strategy_block);
-
-        let spec = parse_livecheck_block(
-            "  livecheck do\n    regex(%r{<version>v?(\\d+(?:\\.\\d+)+)</version>}i)\n    throttle days: 1\n  end\n",
-        )
-        .unwrap();
-        assert_eq!(
-            spec.regex.as_deref(),
-            Some(r"<version>v?(\d+(?:\.\d+)+)</version>")
-        );
-        assert_eq!(spec.throttle_days, Some(1));
-
-        let spec = parse_livecheck_block(
-            "  livecheck do\n    skip \"Not actively developed or maintained\"\n  end\n",
-        )
-        .unwrap();
-        assert_eq!(
-            spec.skip.as_deref(),
-            Some("Not actively developed or maintained")
-        );
-
-        // Nested resource block is not the package block, and a
-        // block after it still resolves as the package one.
-        let none = parse_livecheck_block(
-            "  resource \"man\" do\n    livecheck do\n      formula :parent\n    end\n  end\n",
-        );
-        assert!(none.is_none());
-        let spec = parse_livecheck_block(
-            "  livecheck do\n    formula \"git\"\n  end\n  resource \"man\" do\n    livecheck do\n      formula :parent\n    end\n  end\n",
-        )
-        .unwrap();
-        assert_eq!(spec.formula_ref.as_deref(), Some("git"));
-
-        // Interpolation and unknown statements refuse.
-        assert!(
-            parse_livecheck_block(
-                "  livecheck do\n    url \"https://example.com/#{version}/\"\n  end\n"
-            )
-            .is_none()
-        );
-        assert!(
-            parse_livecheck_block("  livecheck do\n    url :stable\n    whatever 1\n  end\n")
-                .is_none()
-        );
-        assert!(parse_livecheck_block("class X < Formula\nend\n").is_none());
-    }
-
-    #[test]
-    fn tap_add_refusals_match_brew() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let prefix = Prefix::at(&tmp.path().join("prefix"));
-        prefix.ensure().unwrap();
-        let err = |name: &str, url: Option<&str>, custom: bool, force: bool| {
-            add(&prefix, name, url, custom, force).unwrap_err()
-        };
-        assert!(err("homebrew/services", None, false, false).contains("was deprecated"));
-        assert!(err("homebrew/bundle", None, false, false).contains("was deprecated"));
-        assert_eq!(
-            err("caskroom/fonts", None, false, false),
-            "Error: caskroom/fonts was moved. Tap homebrew/cask-fonts instead."
-        );
-        assert_eq!(
-            err("someone/tap", None, true, false),
-            "Error: Tap someone/tap with option `--custom-remote` but without a remote URL."
-        );
-        assert!(err("homebrew/core", None, false, false).contains("--force"));
-        assert!(err("homebrew/cask", None, false, false).contains("--force"));
-        assert!(err("linuxbrew/core", None, false, false).contains("--force"));
-    }
-
-    #[test]
-    fn tap_add_mismatch_and_custom_remote() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let origin = tmp.path().join("origin");
-        std::fs::create_dir(&origin).unwrap();
-        let origin_s = origin.to_string_lossy().into_owned();
-        git_ok(&["-C", &origin_s, "init", "-q", "-b", "main"]);
-        std::fs::write(origin.join("f.rb"), b"# tap").unwrap();
-        git_ok(&["-C", &origin_s, "add", "f.rb"]);
-        git_ok(&[
-            "-C",
-            &origin_s,
-            "-c",
-            "user.email=t@example.invalid",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            "one",
-        ]);
-        let prefix = Prefix::at(&tmp.path().join("prefix"));
-        prefix.ensure().unwrap();
-        let (tap, newly) = add(&prefix, "someone/tap", Some(&origin_s), false, false).unwrap();
-        assert!(newly);
-        // Re-tap with a different URL refuses with brew's mismatch text.
-        let error = add(&prefix, "someone/tap", Some("/elsewhere"), false, false).unwrap_err();
-        assert_eq!(
-            error,
-            format!("Error: Tap someone/tap remote mismatch.\n{origin_s} != /elsewhere")
-        );
-        // --custom-remote repoints the tap at the new remote.
-        let mirror = tmp.path().join("mirror");
-        let mirror_s = mirror.to_string_lossy().into_owned();
-        git_ok(&["clone", "-q", &origin_s, &mirror_s]);
-        add(&prefix, "someone/tap", Some(&mirror_s), true, false).unwrap();
-        let remote = git_out(&tap.path, &["remote", "get-url", "origin"]).unwrap();
-        assert_eq!(remote, mirror_s);
-    }
-
-    #[test]
-    fn repair_follows_an_upstream_default_branch_rename() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let origin = tmp.path().join("origin");
-        std::fs::create_dir(&origin).unwrap();
-        let origin_s = origin.to_string_lossy().into_owned();
-        git_ok(&["-C", &origin_s, "init", "-q", "-b", "trunk"]);
-        std::fs::write(origin.join("f.rb"), b"# tap").unwrap();
-        git_ok(&["-C", &origin_s, "add", "f.rb"]);
-        git_ok(&[
-            "-C",
-            &origin_s,
-            "-c",
-            "user.email=t@example.invalid",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            "one",
-        ]);
-        let prefix = Prefix::at(&tmp.path().join("prefix"));
-        prefix.ensure().unwrap();
-        let tap_dir = prefix.taps_dir().join("someone/homebrew-tap");
-        std::fs::create_dir_all(tap_dir.parent().unwrap()).unwrap();
-        let tap_s = tap_dir.to_string_lossy().into_owned();
-        git_ok(&["clone", "-q", &origin_s, &tap_s]);
-        // Stale state: local branch and origin/HEAD still say master.
-        git_ok(&["-C", &tap_s, "branch", "-m", "trunk", "master"]);
-        git_ok(&[
-            "-C",
-            &tap_s,
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/master",
-        ]);
-        repair(&prefix).unwrap();
-        let branches = git_out(&tap_dir, &["branch", "--format=%(refname:short)"]).unwrap();
-        assert_eq!(branches, "trunk");
-        assert_eq!(origin_branch_name(&tap_dir).as_deref(), Some("trunk"));
-        // A second repair is a quiet no-op.
-        repair(&prefix).unwrap();
-        // No taps at all is fine too.
-        let empty = Prefix::at(&tmp.path().join("empty"));
-        empty.ensure().unwrap();
-        repair(&empty).unwrap();
-    }
-
-    #[test]
-    fn untap_refuses_while_tap_packages_are_installed() {
-        fn payload(p: &Prefix, kind: Kind, version: &str, full: Option<&str>) -> PathBuf {
-            let dir = match kind {
-                Kind::Formula => p.keg("tool", version),
-                Kind::Cask => p.cask_dir("tool", version),
-            };
-            std::fs::create_dir_all(&dir).unwrap();
-            let mut fields = vec![
-                ("installed_by", "abrew"),
-                (
-                    match kind {
-                        Kind::Formula => "name",
-                        Kind::Cask => "token",
-                    },
-                    "tool",
-                ),
-                ("version", version),
-            ];
-            if let Some(full) = full {
-                fields.push(("full_name", full));
-            }
-            p.write_receipt(&dir, &fields).unwrap();
-            dir
-        }
-        fn tapped(p: &Prefix) -> PathBuf {
-            let tap = p.taps_dir().join("someone/homebrew-tap");
-            std::fs::create_dir_all(&tap).unwrap();
-            std::fs::write(tap.join("KEEP"), b"tap recipes").unwrap();
-            tap
-        }
-        fn refused(p: &Prefix, tap: &std::path::Path) -> String {
-            let error = remove(p, "someone/tap").unwrap_err();
-            assert_eq!(std::fs::read(tap.join("KEEP")).unwrap(), b"tap recipes");
-            error
-        }
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        for kind in [Kind::Formula, Kind::Cask] {
-            let p = Prefix::at(&tmp.path().join(kind.word()));
-            p.ensure().unwrap();
-            let official = match kind {
-                Kind::Formula => "homebrew/core/tool",
-                Kind::Cask => "homebrew/cask/tool",
-            };
-            let old = payload(&p, kind, "1.0", Some("someone/tap/tool"));
-            let current = payload(&p, kind, "2.0", Some(official));
-            let tap = tapped(&p);
-            let error = refused(&p, &tap);
-            assert!(error.contains("Refusing to untap someone/tap"), "{error}");
-            assert!(error.contains("someone/tap/tool"), "{error}");
-            assert!(old.is_dir() && current.is_dir());
-            payload(&p, kind, "1.0", Some("someone/homebrew-tap/tool"));
-            assert!(refused(&p, &tap).contains("someone/tap/tool"));
-            std::fs::remove_dir_all(&old).unwrap();
-            let receipt = current.join("INSTALL_RECEIPT.json");
-            let official_bytes = std::fs::read(&receipt).unwrap();
-            remove(&p, "someone/tap").unwrap();
-            assert!(
-                !tap.exists(),
-                "an unrelated installed version is no use of this tap"
-            );
-            assert_eq!(std::fs::read(&receipt).unwrap(), official_bytes);
-
-            let tap = tapped(&p);
-            let key = match kind {
-                Kind::Formula => "name",
-                Kind::Cask => "token",
-            };
-            for full in [
-                "null",
-                "42",
-                "\"\"",
-                "\"other\"",
-                "\"someone/tap/other\"",
-                "\"someone/tool\"",
-                "\"../tap/tool\"",
-            ] {
-                let bytes = format!(
-                    "{{\"installed_by\":\"abrew\",\"{key}\":\"tool\",\"version\":\"2.0\",\"full_name\":{full}}}"
-                );
-                std::fs::write(&receipt, bytes.as_bytes()).unwrap();
-                let _ = refused(&p, &tap);
-                assert_eq!(std::fs::read(&receipt).unwrap(), bytes.as_bytes());
-            }
-            for bytes in [b"{".as_slice(), b"[]".as_slice()] {
-                std::fs::write(&receipt, bytes).unwrap();
-                let _ = refused(&p, &tap);
-                assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
-            }
-            std::fs::remove_file(&receipt).unwrap();
-            let _ = refused(&p, &tap);
-            std::fs::create_dir(&receipt).unwrap();
-            let _ = refused(&p, &tap);
-            assert!(receipt.is_dir());
-            std::fs::remove_dir(&receipt).unwrap();
-            let oversized = vec![b' '; 64 * 1024 + 1];
-            std::fs::write(&receipt, &oversized).unwrap();
-            let _ = refused(&p, &tap);
-            assert_eq!(
-                std::fs::metadata(&receipt).unwrap().len(),
-                oversized.len() as u64
-            );
-            std::fs::remove_file(&receipt).unwrap();
-
-            #[cfg(unix)]
-            {
-                let external = tmp.path().join(format!("{}-receipt", kind.word()));
-                std::fs::write(&external, &official_bytes).unwrap();
-                std::os::unix::fs::symlink(&external, &receipt).unwrap();
-                let _ = refused(&p, &tap);
-                assert_eq!(std::fs::read_link(&receipt).unwrap(), external);
-                assert_eq!(std::fs::read(&external).unwrap(), official_bytes);
-                std::fs::remove_file(&receipt).unwrap();
-                payload(&p, kind, "2.0", Some(official));
-                for version_only in [false, true] {
-                    let row = if version_only {
-                        current.clone()
-                    } else {
-                        current.parent().unwrap().to_path_buf()
-                    };
-                    let held = tmp
-                        .path()
-                        .join(format!("{}-held-{version_only}", kind.word()));
-                    std::fs::rename(&row, &held).unwrap();
-                    std::os::unix::fs::symlink(&held, &row).unwrap();
-                    let _ = refused(&p, &tap);
-                    assert_eq!(std::fs::read_link(&row).unwrap(), held);
-                    std::fs::remove_file(&row).unwrap();
-                    std::fs::rename(&held, &row).unwrap();
-                }
-            }
-            for full in [None, Some("tool")] {
-                payload(&p, kind, "2.0", full);
-                let tap = tapped(&p);
-                remove(&p, "someone/tap").unwrap();
-                assert!(!tap.exists());
-                assert!(current.is_dir());
-            }
-        }
-    }
-
-    #[test]
-    fn local_remotes_are_the_only_file_transport() {
-        for local in ["/tmp/tap", "./tap", "../tap", "~/tap", "file:///tmp/tap"] {
-            assert!(is_local_remote(local), "{local}");
-            assert!(
-                git_protocol_args(true).contains(&"protocol.file.allow=always"),
-                "{local}"
-            );
-        }
-        for remote in [
-            "https://github.com/me/homebrew-tools.git",
-            "git@github.com:me/homebrew-tools.git",
-            "ssh://git@example.com/x.git",
-            "ext::sh -c true",
-            "fd::0",
-        ] {
-            assert!(!is_local_remote(remote), "{remote}");
-        }
-        assert!(
-            !git_protocol_args(false).contains(&"protocol.file.allow=always"),
-            "non-local remotes never allow the file transport"
-        );
-    }
-
-    #[test]
-    fn rb_parse_as_data() {
-        let rb = "class Foo < Formula\n  desc \"A foo\"\n  homepage \"https://foo.example\"\n  url \"https://foo.example/foo-2.1.tar.gz\"\n  sha256 \"aaaa\"\n  depends_on \"openssl@3\"\nend\n";
-        let f = parse_rb_as_data(rb, "me/tap/foo");
-        assert_eq!(f.name, "foo");
-        assert_eq!(f.version, "2.1");
-        assert_eq!(f.stable_sha256, "aaaa");
-        assert_eq!(f.dependencies, ["openssl@3"]);
-    }
-
-    #[test]
-    fn rb_parse_service_block_as_data() {
-        let rb = "class Foo < Formula\n  url \"https://foo.example/foo-2.1.tar.gz\"\n  service do\n    run [opt_bin/\"foo\", \"--serve\", \"-c\", etc/\"foo.conf\"]\n    require_root true\n    environment_variables FOO: \"bar\"\n    log_path var/\"log/foo.log\"\n    error_log_path var/\"log/foo.err\"\n    interval 3600\n    name macos: \"com.example.foo\"\n  end\nend\n";
-        let f = parse_rb_as_data(rb, "me/tap/foo");
-        let svc = f.service.expect("service block parsed");
-        assert_eq!(
-            svc.run,
-            [
-                "$HOMEBREW_PREFIX/opt/foo/bin/foo",
-                "--serve",
-                "-c",
-                "$HOMEBREW_PREFIX/etc/foo.conf",
-            ]
-        );
-        assert!(svc.require_root);
-        assert_eq!(
-            svc.environment_variables,
-            [("FOO".to_string(), "bar".to_string())]
-        );
-        assert_eq!(
-            svc.log_path.as_deref(),
-            Some("$HOMEBREW_PREFIX/var/log/foo.log")
-        );
-        assert_eq!(
-            svc.error_log_path.as_deref(),
-            Some("$HOMEBREW_PREFIX/var/log/foo.err")
-        );
-        assert_eq!(svc.interval, Some(3600));
-        assert_eq!(svc.name.as_deref(), Some("com.example.foo"));
-        // An interpolated run is beyond data-only parsing.
-        let rb = "class Foo < Formula\n  service do\n    run [opt_bin/\"foo\", \"--opt=#{etc}/x\"]\n  end\nend\n";
-        assert!(parse_rb_as_data(rb, "me/tap/foo").service.is_none());
-    }
-
-    #[test]
-    fn tap_name_parse() {
-        assert_eq!(
-            parse_tap_name("me/homebrew-tools"),
-            Some(("me".into(), "tools".into()))
-        );
-        assert_eq!(parse_tap_name("bogus"), None);
-        for invalid in [
-            "../x",
-            "./x",
-            "/x",
-            "me/..",
-            "me/.",
-            "me/homebrew-",
-            "me/homebrew-..",
-            "me/x/y",
-            "me\\x/repo",
-            "me/repo\\x",
-            "me/repo\0",
-        ] {
-            assert_eq!(parse_tap_name(invalid), None, "{invalid:?}");
-        }
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
-        let p = Prefix::at(&tmp.path().join("prefix"));
-        p.ensure().unwrap();
-        let outside = p.root.join("Library/homebrew-x");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("marker"), b"keep").unwrap();
-        assert!(remove(&p, "../x").is_err());
-        assert!(lookup(&p, "../x/marker").is_none());
-        assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
-        let missing = p.taps_dir().join("missing-user");
-        assert!(remove(&p, "missing-user/x").is_err());
-        assert!(!missing.exists(), "untap never creates a parent");
-        let (ordinary, update) = mutation_path(&p, "me", "tools", true).unwrap();
-        assert!(!update);
-        std::fs::create_dir(&ordinary).unwrap();
-        std::fs::create_dir(ordinary.join(".git")).unwrap();
-        assert!(mutation_path(&p, "me", "tools", true).unwrap().1);
-        std::fs::write(ordinary.join("payload"), b"ordinary").unwrap();
-        remove(&p, "me/homebrew-tools").unwrap();
-        assert!(!ordinary.exists());
-        let regular = p.taps_dir().join("me/homebrew-regular");
-        std::fs::write(&regular, b"keep regular").unwrap();
-        assert!(remove(&p, "me/regular").is_err());
-        assert!(mutation_path(&p, "me", "regular", true).is_err());
-        assert_eq!(std::fs::read(&regular).unwrap(), b"keep regular");
-        #[cfg(unix)]
-        for (label, suffix) in [
-            ("root", "Library/Taps/me/homebrew-x"),
-            ("Library", "Taps/me/homebrew-x"),
-            ("Taps", "me/homebrew-x"),
-            ("user", "homebrew-x"),
-            ("leaf", ""),
-        ] {
-            let p = Prefix::at(&tmp.path().join(label));
-            p.ensure().unwrap();
-            let external = tmp.path().join(format!("external-{label}"));
-            let victim = external.join(suffix);
-            std::fs::create_dir_all(&victim).unwrap();
-            std::fs::write(victim.join("marker"), b"keep").unwrap();
-            let alias = match label {
-                "root" => p.root.clone(),
-                "Library" => p.root.join("Library"),
-                "Taps" => p.taps_dir(),
-                "user" => p.taps_dir().join("me"),
-                _ => p.taps_dir().join("me/homebrew-x"),
-            };
-            if let Some(parent) = alias.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            if alias.is_dir() {
-                std::fs::remove_dir_all(&alias).unwrap();
-            }
-            std::os::unix::fs::symlink(&external, &alias).unwrap();
-            assert!(remove(&p, "me/x").is_err(), "{label}");
-            assert!(mutation_path(&p, "me", "x", true).is_err(), "{label}");
-            assert_eq!(std::fs::read(victim.join("marker")).unwrap(), b"keep");
-            assert_eq!(std::fs::read_link(&alias).unwrap(), external);
-        }
-        #[cfg(unix)]
-        {
-            let (path, _) = mutation_path(&p, "me", "worktree", true).unwrap();
-            std::fs::create_dir(&path).unwrap();
-            let external = tmp.path().join("external-git");
-            std::fs::create_dir(&external).unwrap();
-            std::fs::write(external.join("marker"), b"keep").unwrap();
-            std::os::unix::fs::symlink(&external, path.join(".git")).unwrap();
-            assert!(mutation_path(&p, "me", "worktree", true).is_err());
-            assert_eq!(std::fs::read(external.join("marker")).unwrap(), b"keep");
-        }
-        assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn migration_target_reads_local_tap_migrations() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let p = Prefix::at(tmp.path());
-        p.ensure().unwrap();
-        assert_eq!(migration_target_tap(&p, "example/tap", "aztfy"), None);
-        let dir = p.taps_dir().join("example/homebrew-tap");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("tap_migrations.json"),
-            br#"{"aztfy": "homebrew/core", "old": "other/tap/renamed"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            migration_target_tap(&p, "example/tap", "aztfy").as_deref(),
-            Some("homebrew/core")
-        );
-        assert_eq!(
-            migration_target_tap(&p, "example/homebrew-tap", "old").as_deref(),
-            Some("other/tap")
-        );
-        assert_eq!(migration_target_tap(&p, "example/tap", "missing"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tap_link_hook_links_manpages_and_setting_gated_completions() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let p = Prefix::at(tmp.path());
-        p.ensure().unwrap();
-        let root = p.taps_dir().join("someone/homebrew-tools");
-        for dir in ["manpages", "completions/zsh", ".git"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-        }
-        std::fs::write(root.join("manpages/tool.1"), b"man").unwrap();
-        std::fs::write(root.join("completions/zsh/_tool"), b"#compdef tool").unwrap();
-        let tap = Tap {
-            user: "someone".to_string(),
-            repo: "tools".to_string(),
-            path: root.clone(),
-        };
-        // Unlinked setting: manpages link, completions do not.
-        link_completions_and_manpages(&p, &tap);
-        assert!(p.root.join("share/man/man1/tool.1").exists());
-        assert!(!p.root.join("share/zsh/site-functions/_tool").exists());
-        assert!(completions_message_shown(&p));
-        // Linked setting: completions follow.
-        set_completions_linked(&p, true).unwrap();
-        link_completions_and_manpages(&p, &tap);
-        assert!(p.root.join("share/zsh/site-functions/_tool").exists());
-        // Untap removes both link sets.
-        remove(&p, "someone/tools").unwrap();
-        assert!(!p.root.join("share/man/man1/tool.1").exists());
-        assert!(!p.root.join("share/zsh/site-functions/_tool").exists());
-        assert!(!root.exists());
-    }
-
-    #[test]
-    fn git_redirect_parsing_and_refusal_match_brew() {
-        let stderr = "warning: redirecting to https://github.com/New/tools.git/\nFrom https://github.com/old/tools\n";
-        assert_eq!(
-            redirected_remotes(stderr).collect::<Vec<_>>(),
-            vec!["https://github.com/New/tools.git/"]
-        );
-        // Non-ASCII prefix whose Unicode `.to_lowercase()` expands UTF-8 byte length (`İ` -> `i\u{307}`)
-        // must not shift or panic the byte slice into `line`.
-        assert_eq!(
-            unsafe_redirect(
-                "https://github.com/old/tools",
-                "İhtar: Redirecting to https://github.com/New/tools.git/\n",
-            )
-            .as_deref(),
-            Some("https://github.com/New/tools.git/")
-        );
-        // Multi-hop redirect where the first hop canonicalizes `.git/` (`same_remote`) and the
-        // second hop crosses to a new repository must still be refused with the new target.
-        let multi_hop = "warning: redirecting to https://github.com/old/tools.git/\n\
-                         warning: redirecting to https://github.com/New/tools.git/\n";
-        assert_eq!(
-            unsafe_redirect("https://github.com/old/tools", multi_hop).as_deref(),
-            Some("https://github.com/New/tools.git/")
-        );
-        assert_eq!(
-            unsafe_redirect(
-                "https://github.com/old/tools",
-                "warning: redirecting to https://github.com/old/tools.git/\n",
-            ),
-            None
-        );
-        assert_eq!(redirected_remotes("From https://x\n").next(), None);
-        assert!(same_remote(
-            "git@github.com:Old/Tools.git",
-            "https://github.com/old/tools/"
-        ));
-        assert!(same_remote(
-            "https://github.com/old/tools",
-            "https://github.com/old/tools.git"
-        ));
-        assert!(!same_remote(
-            "https://github.com/old/tools",
-            "https://github.com/new/tools"
-        ));
-        assert!(!same_remote("", "https://github.com/new/tools"));
-        assert!(!same_remote("   ", "   "));
-        assert_eq!(
-            redirect_refusal("old/tools", "https://github.com/new/tools"),
-            "Error: Refusing automatic redirect from old/tools to https://github.com/new/tools.\n\
-             Untap old/tools, then tap the new location directly to review its source and trust."
-        );
-    }
-}
+#[path = "tap_tests.rs"]
+mod tests;

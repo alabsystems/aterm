@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! App-owned account work is drained before process replacement or logical exit.
+//! App-owned account work is drained before process replacement or logical exit, and past
+//! [`ACCOUNT_WORK_RETIRES_WITHIN`] they go on without it.
+
+use std::time::{Duration, Instant};
 
 use aterm_agent::harness::account_work::{Drained, Pause};
 use aterm_window::event_loop::ActiveEventLoop;
-use std::time::{Duration, Instant};
 
+use crate::native_app::UpdateOutcome;
+use crate::native_updater_service::ApplyMode;
 use crate::{App, CloseOutcome, Wake, WindowId};
+
+/// How long what waits on a closed account epoch waits for its operations to retire and for its
+/// enrollment metadata to seal. A cancelled operation stops within seconds (its child group killed, a
+/// network call's own budget), so one still out after this is stuck on what may never answer (a read
+/// or a write on a stopped volume, a child nothing can reap) or on storage that keeps failing a finished
+/// sign-in's write. An update or a quit goes on without its proof: an update waiting on that for good
+/// is the worse mistake. This process's end takes what is in memory along, a response not yet stored
+/// included, and leaves an enrollment's record uncertain. Account work stays closed until it retires,
+/// or, where its worker panicked and took the pause with it, until aterm restarts.
+const ACCOUNT_WORK_RETIRES_WITHIN: Duration = Duration::from_secs(5 * 60);
 
 const WORKER_RETRY: Duration = Duration::from_secs(1);
 
@@ -47,7 +61,7 @@ fn drain_account_sources_inner(
     }
     const FIRST_CUSTODY_RETRY: Duration = Duration::from_millis(100);
     const MAX_CUSTODY_RETRY: Duration = Duration::from_secs(1);
-    const CONSTRUCTOR_SWEEP: Duration = Duration::from_millis(10);
+    let began = Instant::now();
     let mut next_custody = Instant::now();
     let mut custody_retry = FIRST_CUSTODY_RETRY;
     loop {
@@ -88,10 +102,21 @@ fn drain_account_sources_inner(
         // This clock only paces owned storage retries, never proves retirement.
         let wait = next_custody.saturating_duration_since(Instant::now());
         std::thread::park_timeout(if sources.is_some() {
-            wait.min(CONSTRUCTOR_SWEEP)
+            wait.min(source_sweep_waits(began.elapsed()))
         } else {
             wait
         });
+    }
+}
+
+/// How long a drain that has swept for `so_far` waits for its next sweep. Past
+/// [`ACCOUNT_WORK_RETIRES_WITHIN`] nothing waits on it, and a process that lives on keeps it for as long
+/// as the stuck work lasts, so it stops waking a hundred times a second.
+fn source_sweep_waits(so_far: Duration) -> Duration {
+    if so_far < ACCOUNT_WORK_RETIRES_WITHIN {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_secs(1)
     }
 }
 
@@ -102,6 +127,15 @@ pub(crate) fn drain_custody_for_test(
     checkpoint: Option<CustodySweepCheckpoint>,
 ) -> Drained {
     drain_account_sources_inner(pause, None, lifetime, checkpoint)
+}
+
+/// An automatic attempt whose handoff waits on account work, so it has no answer yet.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AutoApplyAttempt {
+    pub(crate) intent: crate::AutoApplyIntent,
+    pub(crate) phase: crate::native_update_auto_intent::ApplyPhase,
+    pub(crate) announce: bool,
+    pub(crate) activation: bool,
 }
 
 #[derive(Debug)]
@@ -175,6 +209,14 @@ pub(crate) struct Drain {
     drained: Option<Drained>,
     pause: Option<Pause>,
     failed: bool,
+    /// When the current drain began.
+    since: Option<Instant>,
+    /// Its operations outlived [`ACCOUNT_WORK_RETIRES_WITHIN`] or its worker panicked: nothing waits
+    /// on them any more, and the epoch stays closed until they retire, or, after a panic, until aterm
+    /// restarts.
+    outlived: bool,
+    /// The automatic attempt the pending handoff will answer.
+    parked_auto_apply: Option<AutoApplyAttempt>,
     worker_retry_at: Option<Instant>,
     retirement_pending: bool,
     #[cfg(unix)]
@@ -203,6 +245,60 @@ impl Drain {
     }
 }
 
+/// What held a handoff at its safety re-read. Unsaved work holds a renewal as it does at a direct look,
+/// uncounted, and refuses an update.
+fn account_safety_refusal(renewal: bool, reasons: &[String]) -> crate::UpdateHandoffStartError {
+    #[cfg(target_os = "macos")]
+    if renewal {
+        return crate::UpdateHandoffStartError::activity(
+            crate::native_update_lane_hold::LaneHold::BoundaryItem,
+            reasons.join("; "),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = renewal;
+    crate::UpdateHandoffStartError::refused(reasons.join("; "))
+}
+
+/// Says [`Wake::AccountsOutlived`] for the drain `serial` once its worker has outlived
+/// [`ACCOUNT_WORK_RETIRES_WITHIN`], whether it is waiting on an operation or sealing metadata. Dropping
+/// what this returns, as the worker's end does, ends the wait with nothing said. No worker starts
+/// without one: that drain stays on the event loop, which watches the same bound.
+fn spawn_account_work_bound(
+    proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
+    serial: u64,
+) -> std::io::Result<std::sync::mpsc::Sender<()>> {
+    let (worker_lives, worker_ended) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("aterm-account-drain-bound".into())
+        .spawn(move || {
+            if outlives_account_work_bound(&worker_ended, ACCOUNT_WORK_RETIRES_WITHIN) {
+                let _ = proxy.send_event(Wake::AccountsOutlived { serial });
+            }
+        })?;
+    Ok(worker_lives)
+}
+
+/// What a worker's settlement comes to: [`Wake::AccountsOutlived`] where it panicked, since its pause
+/// died with it, so no settlement will come and nothing else would take what waits.
+fn worker_answer(serial: u64, settle: impl FnOnce() -> Settlement) -> Wake {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(settle)) {
+        Ok(drained) => Wake::AccountsDrained { serial, drained },
+        Err(_) => Wake::AccountsOutlived { serial },
+    }
+}
+
+/// Whether the worker that holds the other end is still going after `within`.
+fn outlives_account_work_bound(
+    worker_ended: &std::sync::mpsc::Receiver<()>,
+    within: Duration,
+) -> bool {
+    matches!(
+        worker_ended.recv_timeout(within),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
 impl App {
     /// A failed initial surface has no window for a native close prompt; it still owes account settlement.
     pub(crate) fn initial_surface_exit_ready(&mut self) -> bool {
@@ -211,7 +307,9 @@ impl App {
 
     /// Close admission immediately; only the worker waits for already admitted resources.
     pub(crate) fn accounts_drained_before(&mut self, continuation: Continuation) -> bool {
-        if self.account_drain.drained.is_some() && !self.account_drain.retirement_pending {
+        if (self.account_drain.drained.is_some() && !self.account_drain.retirement_pending)
+            || self.account_drain.outlived
+        {
             return true;
         }
         if self.account_drain.pending.is_some() {
@@ -283,6 +381,7 @@ impl App {
         self.wake_parked_launchers();
         self.account_drain.pending = Some(continuation);
         self.account_drain.pause = Some(pause);
+        self.account_drain.since = Some(Instant::now());
         self.dispatch_account_drain(serial);
 
         false
@@ -318,14 +417,18 @@ impl App {
         // cannot destroy the App's only proof-producing handle.
         let (send, receive) = std::sync::mpsc::sync_channel::<DrainInput>(1);
         let lifetime = self.account_work.clone();
-        match std::thread::Builder::new()
-            .name("aterm-account-drain".into())
-            .spawn(move || {
-                if let Ok(input) = receive.recv() {
-                    let drained = settle_accounts(input, &lifetime);
-                    let _ = proxy.send_event(Wake::AccountsDrained { serial, drained });
-                }
-            }) {
+        let worker = spawn_account_work_bound(proxy.clone(), serial).and_then(|bound| {
+            std::thread::Builder::new()
+                .name("aterm-account-drain".into())
+                .spawn(move || {
+                    let _bound = bound;
+                    if let Ok(input) = receive.recv() {
+                        let answer = worker_answer(serial, || settle_accounts(input, &lifetime));
+                        let _ = proxy.send_event(answer);
+                    }
+                })
+        });
+        match worker {
             Ok(_) => {
                 self.account_drain.failed = false;
                 self.account_drain.worker_retry_at = None;
@@ -422,8 +525,50 @@ impl App {
                 );
             }
         } else {
-            self.retry_account_drain_worker(Instant::now());
+            // In this order, since a worker that can start at last still has to retire what is stuck.
+            let now = Instant::now();
+            if self.account_drain_overdue(now) {
+                self.go_on_past_account_work(el, self.account_drain.serial);
+            }
+            self.retry_account_drain_worker(now);
         }
+    }
+
+    /// Whether a drain only this loop watches ([`Self::poll_account_drain`]) has outlived its bound.
+    fn account_drain_overdue(&self, now: Instant) -> bool {
+        self.account_drain.pause.is_some()
+            && self.account_drain.since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= ACCOUNT_WORK_RETIRES_WITHIN
+            })
+    }
+
+    /// Account work has outlived its bound ([`ACCOUNT_WORK_RETIRES_WITHIN`]): what waits on it goes
+    /// on, once, and anything that comes later waits no longer.
+    pub(crate) fn go_on_past_account_work(&mut self, el: &ActiveEventLoop, serial: u64) {
+        let Some(continuation) = self.take_outlived_continuation(serial) else {
+            return;
+        };
+        aterm_log::warn!(
+            "account work did not stop within {} s of being cancelled, or its worker panicked: \
+             what waited on it goes on, and account work stays off until it stops, or until aterm \
+             restarts if its worker panicked",
+            ACCOUNT_WORK_RETIRES_WITHIN.as_secs()
+        );
+        self.continue_after_accounts(el, continuation);
+    }
+
+    /// What waited on the drain `serial`, now it has outlived its bound. The drain keeps its pause,
+    /// and its retirement still reopens admissions ([`Self::accept_account_drain`]), unless its worker
+    /// panicked, which took the pause with it: account work then stays off until aterm restarts.
+    fn take_outlived_continuation(&mut self, serial: u64) -> Option<Continuation> {
+        let drain = &mut self.account_drain;
+        if drain.serial != serial || drain.drained.is_some() || drain.outlived {
+            return None;
+        }
+        let continuation = drain.pending.take()?;
+        drain.pending = Some(Continuation::ResumeAfterDrain);
+        drain.outlived = true;
+        Some(continuation)
     }
 
     fn take_retired_account_pause(&mut self) -> Option<Drained> {
@@ -442,18 +587,88 @@ impl App {
     }
 
     fn retire_account_drain_handoff(&mut self, pending: Continuation, reason: &str) {
-        if let Continuation::Handoff {
-            attempt: Some(attempt),
+        let Continuation::Handoff {
+            attempt,
+            same_image,
             ..
         } = pending
+        else {
+            return;
+        };
+        if same_image.is_some_and(crate::app_update_handoff::SameImageHandoff::renews_launch_record)
+        {
+            self.renewal_did_not_start(reason);
+        }
+        if let Some(attempt) = attempt
             && self.native_updater_service.abort_apply(&attempt, reason)
         {
             self.publish_native_update_state();
         }
+        if let Some(parked) = self.account_drain.parked_auto_apply.take() {
+            // What held the attempt was the account work its handoff waited behind.
+            self.settle_auto_apply_attempt(
+                parked,
+                UpdateOutcome::Deferred {
+                    reason: reason.to_string(),
+                    hold: crate::native_update_lane_hold::LaneHold::BoundaryItem,
+                },
+            );
+        }
     }
 
     pub(crate) fn account_drain_pending(&self) -> bool {
-        self.account_drain.pending.is_some()
+        self.account_drain.pending.is_some() && !self.account_drain.outlived
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn account_drain_pending_for_test(&self) -> Option<&Continuation> {
+        self.account_drain.pending.as_ref()
+    }
+
+    /// Whether a handoff is waiting on account work, so an attempt that started it has no answer yet.
+    pub(crate) fn account_drain_holds_a_handoff(&self) -> bool {
+        matches!(
+            self.account_drain.pending,
+            Some(Continuation::Handoff { .. })
+        )
+    }
+
+    /// Whether the handoff the drain holds is a launch-record renewal's.
+    #[cfg(unix)]
+    pub(crate) fn account_drain_holds_a_renewal(&self) -> bool {
+        matches!(
+            self.account_drain.pending,
+            Some(Continuation::Handoff { same_image: Some(same_image), .. })
+                if same_image.renews_launch_record()
+        )
+    }
+
+    /// A person's press takes the place of a launch-record renewal's handoff waiting on account work.
+    /// The renewal installs nothing and an automatic lane follows it, but a press has no lane to follow
+    /// it: told to wait, it was dropped with auto-apply off. The press now waits on the drain as any
+    /// update's handoff does, and the person hears what came of it.
+    #[cfg(unix)]
+    pub(crate) fn press_takes_the_renewal_s_place(&mut self, press: Continuation) {
+        if let Some(renewal) = self.account_drain.pending.replace(press) {
+            self.retire_account_drain_handoff(renewal, "a person's Install took its place");
+        }
+    }
+
+    /// The caller hears this handoff failed, so it must not start later: the drain goes on proving
+    /// retirement, and its end reopens account work. Only the call that just stored it can reach this,
+    /// since a drain already pending refuses a later one first.
+    pub(crate) fn disarm_failed_account_handoff(&mut self) {
+        if matches!(
+            self.account_drain.pending,
+            Some(Continuation::Handoff { .. })
+        ) {
+            self.account_drain.pending = Some(Continuation::ResumeAfterDrain);
+        }
+    }
+
+    /// Keep `attempt` until the handoff waiting on account work answers it.
+    pub(crate) fn park_auto_apply_for_accounts(&mut self, attempt: AutoApplyAttempt) {
+        self.account_drain.parked_auto_apply = Some(attempt);
     }
 
     pub(crate) fn account_drain_unavailable(&self) -> bool {
@@ -525,6 +740,7 @@ impl App {
         let continuation = self.account_drain.pending.take()?;
         self.account_drain.drained = Some(drained);
         self.account_drain.failed = false;
+        self.account_drain.outlived = false;
         self.account_drain.worker_retry_at = None;
         self.account_drain.retirement_pending = false;
         if matches!(continuation, Continuation::ResumeAfterDrain) {
@@ -543,6 +759,10 @@ impl App {
         let Some(continuation) = self.accept_account_settlement(serial, settlement) else {
             return;
         };
+        self.continue_after_accounts(el, continuation);
+    }
+
+    fn continue_after_accounts(&mut self, el: &ActiveEventLoop, continuation: Continuation) {
         match continuation {
             Continuation::ResumeAfterDrain => self.resume_drained_accounts(),
             Continuation::StartupFailure => el.exit(),
@@ -580,8 +800,9 @@ impl App {
     }
 
     /// Nothing has been captured while account work drains. Re-read safety now; activity
-    /// before this point cannot invalidate a snapshot that has not been taken.
-    fn finish_account_handoff(&mut self, handoff: Continuation) {
+    /// before this point cannot invalidate a snapshot that has not been taken. What the handoff comes
+    /// to reads as [`Self::apply_native_update`] would have answered it.
+    pub(crate) fn finish_account_handoff(&mut self, handoff: Continuation) {
         let Continuation::Handoff {
             mode,
             attempt,
@@ -593,44 +814,173 @@ impl App {
             unreachable!("only a handoff continuation reaches its completion");
         };
         #[cfg(unix)]
-        if self.next_update_handoff_id != next_attempt {
+        let superseded = self.next_update_handoff_id != next_attempt;
+        #[cfg(not(unix))]
+        let superseded = false;
+        let renewal = same_image
+            .is_some_and(crate::app_update_handoff::SameImageHandoff::renews_launch_record);
+        if let Some(reason) = self.handoff_gives_way(mode, attempt.as_ref(), renewal, superseded) {
             self.retire_account_drain_handoff(
                 Continuation::Handoff {
                     mode,
                     attempt,
                     same_image,
+                    #[cfg(unix)]
                     next_attempt,
                 },
-                "the handoff changed while account work drained",
+                reason,
             );
-            self.resume_drained_accounts();
-            return;
-        }
-        if attempt
-            .as_ref()
-            .is_some_and(|attempt| !self.native_updater_service.apply_ticket_is_current(attempt))
-        {
             self.resume_drained_accounts();
             return;
         }
         let retained_attempt = attempt.clone();
         let result = self
             .revalidate_native_update_safety()
-            .map_err(|reasons| crate::UpdateHandoffStartError::refused(reasons.join("; ")))
+            .map_err(|reasons| account_safety_refusal(renewal, &reasons))
             .and_then(|safety| self.apply_staged_update_now(safety, mode, attempt, same_image));
-        if let Err(error) = result {
-            self.resume_drained_accounts();
-            if let Some(attempt) = retained_attempt {
-                let outcome = self.account_update_start_outcome(&attempt, mode, error);
-                self.surface_update_apply_outcome_for_target(
-                    "account settlement",
-                    outcome,
-                    false,
-                    attempt.target_build(),
-                );
-            } else {
-                aterm_log::info!("update waits after account work drained: {error}");
+        let outcome = match result {
+            Ok(()) => UpdateOutcome::Accepted,
+            Err(error) => {
+                self.resume_drained_accounts();
+                #[cfg(target_os = "macos")]
+                if renewal {
+                    self.renewal_refused_after_accounts(&error);
+                }
+                match &retained_attempt {
+                    Some(attempt) => self.account_update_start_outcome(attempt, mode, error),
+                    None => UpdateOutcome::Failed {
+                        message: error.into_message(),
+                    },
+                }
             }
+        };
+        let target = retained_attempt
+            .as_ref()
+            .map(crate::native_updater_service::ApplyAttemptTicket::target_build);
+        self.answer_handoff_after_accounts(mode, target, renewal, outcome);
+    }
+
+    /// Why a handoff that waited on account work may no longer start: another took the next attempt
+    /// or the stage's ticket, or `[update] auto_apply` went off under an automatic attempt, which the
+    /// lane's next look reads again. A person's press is not held by that setting, and a launch-record
+    /// renewal installs nothing.
+    pub(crate) fn handoff_gives_way(
+        &self,
+        mode: ApplyMode,
+        attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+        renewal: bool,
+        superseded: bool,
+    ) -> Option<&'static str> {
+        if superseded {
+            Some("the handoff changed while account work drained")
+        } else if attempt
+            .is_some_and(|attempt| !self.native_updater_service.apply_ticket_is_current(attempt))
+        {
+            Some("another update attempt took over while account work drained")
+        } else if mode.is_automatic()
+            && !renewal
+            && !crate::app_config::update_auto_apply(&self.config)
+        {
+            Some("automatic updates were turned off while account work drained")
+        } else {
+            None
+        }
+    }
+
+    /// Answer the apply that waited on account work, as a caller of
+    /// [`Self::apply_native_update`] answers one that did not wait. An automatic attempt settles
+    /// with what came of it, which says so itself. A person's press hears what came of it, and the
+    /// automatic lane is armed again, as for a control request that did not land; an automatic attempt
+    /// that joined that press looks again. A renewal that did not start goes back to its own ladder.
+    /// A press that stopped here ends as one held for a read does, its row no longer saying it is
+    /// installing and its switch record ended; unlike that one's, the record here is routine where the
+    /// press was deferred and the lane will try again. Deferred with a ready row up it gets its own
+    /// word unless the lane will try again: the row says nothing new, and a Settings tab opening this
+    /// long after the press would take focus.
+    pub(crate) fn answer_handoff_after_accounts(
+        &mut self,
+        mode: ApplyMode,
+        target: Option<u64>,
+        renewal: bool,
+        outcome: UpdateOutcome,
+    ) {
+        let started = outcome == UpdateOutcome::Accepted;
+        if renewal && !started {
+            self.renewal_did_not_start(&format!("{outcome:?}"));
+        }
+        if let Some(parked) = self.account_drain.parked_auto_apply.take() {
+            let answer = if started || mode.is_automatic() {
+                outcome.clone()
+            } else {
+                UpdateOutcome::Deferred {
+                    reason: "the install it joined did not start".to_string(),
+                    hold: crate::native_update_lane_hold::LaneHold::HandoffInFlight,
+                }
+            };
+            self.settle_auto_apply_attempt(parked, answer);
+            if mode.is_automatic() {
+                return;
+            }
+        }
+        if started {
+            return;
+        }
+        let Some(target) = target else {
+            aterm_log::info!("update waits after account work drained: {outcome:?}");
+            return;
+        };
+        #[cfg(unix)]
+        let stopped = if mode.is_automatic() {
+            None
+        } else {
+            outcome.why_it_stopped()
+        };
+        #[cfg(unix)]
+        if stopped.is_some() {
+            self.retire_update_installing();
+        }
+        let deferred = matches!(outcome, UpdateOutcome::Deferred { .. });
+        self.surface_update_apply_outcome_for_target("account settlement", outcome, false, target);
+        if mode.is_automatic() {
+            return;
+        }
+        let staged = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|staged| (staged.build, staged.dmg_sha256.clone()));
+        if let Some((build, digest)) = staged {
+            self.arm_native_auto_apply(build, &digest);
+        }
+        let retries = self.automatic_apply_retry_scheduled(target);
+        #[cfg(unix)]
+        if let Some(why) = stopped {
+            self.record_update_switch_stopped(deferred && retries, &why);
+        }
+        if deferred && !retries && self.staged_update_row().is_some() {
+            let message = self.stopped_lane_outcome(crate::app_update_screen::UPDATE_DIDNT_INSTALL);
+            self.note_update_outcome(message);
+        }
+    }
+
+    fn renewal_did_not_start(&mut self, detail: &str) {
+        #[cfg(target_os = "macos")]
+        self.renewal_did_not_start_after_accounts(detail);
+        #[cfg(not(target_os = "macos"))]
+        let _ = detail;
+    }
+
+    /// A person's press joined the handoff waiting on account work: it now carries that press, so
+    /// what stops only an automatic attempt no longer stops it, and the person hears what came of it.
+    pub(crate) fn press_joins_handoff_waiting_on_accounts(&mut self) {
+        if let Some(Continuation::Handoff {
+            mode,
+            attempt: Some(_),
+            ..
+        }) = &mut self.account_drain.pending
+        {
+            *mode = ApplyMode::Immediate;
         }
     }
 
@@ -677,607 +1027,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn paused_app_retires_the_actual_unclaimed_constructor_and_releases_its_gate() {
-        let (root, sources, lifetime) = crate::task_launch::pending_codex_constructor_for_drain();
-        let gate = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(root.path().join("home/.aterm/codex-source-custody/gate"))
-            .unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "observe the actual pending constructor's kernel exclusion"
-        )]
-        let before = gate.try_lock();
-        assert!(matches!(before, Err(std::fs::TryLockError::WouldBlock)));
-        let pause = lifetime
-            .pause()
-            .unwrap()
-            .try_wait()
-            .expect_err("the real constructor still owns its App scope");
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        let worker_sources = sources.clone();
-        let worker_lifetime = lifetime.clone();
-        let worker = std::thread::spawn(move || {
-            send.send(drain_account_sources(
-                pause,
-                Some(&worker_sources),
-                &worker_lifetime,
-            ))
-            .unwrap();
-        });
-        let drained = receive
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("cancelled unclaimed constructor must retire");
-        worker.join().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "verify revocation released the actual constructor gate"
-        )]
-        gate.try_lock().unwrap();
-        assert_eq!(sources.revoke_cancelled_unclaimed().unwrap(), 0);
-        drained.resume().unwrap();
-        assert!(lifetime.enter().is_some());
-    }
-
-    #[test]
-    fn source_cleanup_does_not_retire_other_owned_account_work() {
-        for registered in [false, true] {
-            let lifetime = aterm_agent::harness::account_work::Lifetime::default();
-            let work = lifetime.enter().unwrap();
-            let pause = lifetime.pause().unwrap();
-            assert!(work.cancelled());
-            let (send, receive) = std::sync::mpsc::sync_channel(1);
-            let worker_lifetime = lifetime.clone();
-            let worker = std::thread::spawn(move || {
-                let sources =
-                    registered.then(aterm_agent::harness::codex_source_registry::Registry::default);
-                let drained = drain_account_sources(pause, sources.as_ref(), &worker_lifetime);
-                send.send(drained).unwrap();
-            });
-            assert!(matches!(
-                receive.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
-            assert!(lifetime.enter().is_none());
-            drop(work);
-            let drained = receive
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .expect("actual owned work retired");
-            worker.join().unwrap();
-            drained.resume().unwrap();
-            assert!(lifetime.enter().is_some());
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn activity_during_account_retirement_reaches_the_fresh_handoff_preflight() {
-        if !crate::test_alone::alone() {
-            return;
-        }
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
-        let mut app = App::headless_for_test();
-        let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
-        attempt.make_current_apply_for_test(&mut app.native_updater_service);
-        let work = app.account_work.enter().unwrap();
-        assert!(!app.accounts_drained_before(Continuation::Handoff {
-            mode: ApplyMode::AutomaticPastGrace,
-            attempt: Some(attempt),
-            same_image: None,
-            next_attempt: app.next_update_handoff_id,
-        }));
-        app.note_update_handoff_activity();
-        // A real blocker appearing while the accounts retire must be read now, rather
-        // than discarding the request merely because the earlier activity counter moved. A
-        // Command Line Tools install's tab is that blocker, named as its own hold
-        // (`LaneHold::DeveloperTools`).
-        app.land_install_session_for_test(0);
-        drop(work);
-        let drained = app.take_retired_account_pause().unwrap();
-        let handoff = app
-            .accept_account_drain(app.account_drain.serial, drained)
-            .unwrap();
-        app.finish_account_handoff(handoff);
-        assert_eq!(
-            app.native_updater_service.snapshot().error.as_deref(),
-            Some("a Command Line Tools install's tab is still running")
-        );
-        assert!(
-            app.auto_apply_intent.is_some(),
-            "the automatic request remains owed"
-        );
-        assert!(
-            app.account_work.enter().is_some(),
-            "the deferred handoff reopened account work"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_handoff_or_artifact_that_superseded_the_drain_is_never_resumed() {
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
-        for new_artifact in [false, true] {
-            let mut app = App::headless_for_test();
-            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
-            attempt.make_current_apply_for_test(&mut app.native_updater_service);
-            let work = app.account_work.enter().unwrap();
-            assert!(!app.accounts_drained_before(Continuation::Handoff {
-                mode: ApplyMode::AutomaticPastGrace,
-                attempt: Some(attempt.clone()),
-                same_image: None,
-                next_attempt: app.next_update_handoff_id,
-            }));
-            let newer = ApplyAttemptTicket::for_test(43, "newer-build", &"cd".repeat(32));
-            if new_artifact {
-                newer.make_current_apply_for_test(&mut app.native_updater_service);
-            } else {
-                app.next_update_handoff_id += 1;
-            }
-            drop(work);
-            let drained = app.take_retired_account_pause().unwrap();
-            let handoff = app
-                .accept_account_drain(app.account_drain.serial, drained)
-                .unwrap();
-            app.finish_account_handoff(handoff);
-            assert!(app.auto_apply_intent.is_none());
-            assert!(app.account_work.enter().is_some());
-            if new_artifact {
-                assert!(app.native_updater_service.apply_ticket_is_current(&newer));
-            } else {
-                assert!(!app.native_updater_service.apply_ticket_is_current(&attempt));
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_late_account_deferral_retries_only_the_automatic_request_and_keeps_its_artifact() {
-        use crate::native_app::UpdateOutcome;
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode, UpdaterPhase};
-
-        for mode in [ApplyMode::AutomaticPastGrace, ApplyMode::Immediate] {
-            let mut app = App::headless_for_test();
-            let digest = "ab".repeat(32);
-            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &digest);
-            attempt.make_current_apply_for_test(&mut app.native_updater_service);
-            let outcome = app.account_update_start_outcome(
-                &attempt,
-                mode,
-                crate::UpdateHandoffStartError::activity(
-                    crate::native_update_lane_hold::LaneHold::TabStarting,
-                    "a tab is still starting",
-                ),
-            );
-            assert_eq!(
-                outcome,
-                UpdateOutcome::Deferred {
-                    reason: "a tab is still starting".into(),
-                    hold: crate::native_update_lane_hold::LaneHold::TabStarting,
-                }
-            );
-            let snapshot = app.native_updater_service.snapshot();
-            assert_eq!(snapshot.phase, UpdaterPhase::Staged);
-            assert_eq!(snapshot.error.as_deref(), Some("a tab is still starting"));
-            assert_eq!(snapshot.staged.as_ref().unwrap().dmg_sha256, digest);
-            if mode.is_automatic() {
-                let retry = app
-                    .auto_apply_intent
-                    .expect("the accepted automatic request remains owed");
-                assert_eq!(retry.build, 42);
-                assert_eq!(retry.dmg_sha256, [0xab; 32]);
-            } else {
-                assert!(app.auto_apply_intent.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn a_late_account_refusal_or_failure_keeps_its_verdict() {
-        use crate::native_app::UpdateOutcome;
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
-
-        for (error, expected) in [
-            (
-                crate::UpdateHandoffStartError::refused("draft changed"),
-                UpdateOutcome::Blocked {
-                    reasons: vec!["draft changed".into()],
-                },
-            ),
-            (
-                crate::UpdateHandoffStartError::failed("launch failed"),
-                UpdateOutcome::Failed {
-                    message: "launch failed".into(),
-                },
-            ),
-        ] {
-            let mut app = App::headless_for_test();
-            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
-            attempt.make_current_apply_for_test(&mut app.native_updater_service);
-            assert_eq!(
-                app.account_update_start_outcome(&attempt, ApplyMode::Immediate, error),
-                expected
-            );
-            assert!(app.auto_apply_intent.is_none());
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_late_preflight_block_keeps_a_bounded_retry_for_the_same_artifact() {
-        use crate::native_app::UpdateOutcome;
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
-        let mut app = App::headless_for_test();
-        let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
-        attempt.make_current_apply_for_test(&mut app.native_updater_service);
-        assert_eq!(
-            app.account_update_start_outcome(
-                &attempt,
-                ApplyMode::AutomaticPastGrace,
-                crate::UpdateHandoffStartError::refused("draft changed"),
-            ),
-            UpdateOutcome::Blocked {
-                reasons: vec!["draft changed".into()]
-            },
-        );
-        let retry = app.auto_apply_intent.unwrap();
-        assert_eq!(retry.build, 42);
-        assert_eq!(retry.dmg_sha256, [0xab; 32]);
-        app.auto_overlap_retry.as_mut().unwrap().cycles = u8::MAX;
-        let cooldown = app.arm_account_preflight_retry(&attempt).unwrap();
-        assert!(cooldown > std::time::Duration::ZERO);
-        assert!(cooldown <= std::time::Duration::from_secs(60));
-        app.auto_apply_intent = None;
-        attempt.make_current_apply_for_test(&mut app.native_updater_service);
-        let _ = app.account_update_start_outcome(
-            &attempt,
-            ApplyMode::AutomaticPastGrace,
-            crate::UpdateHandoffStartError::failed("launch failed"),
-        );
-        assert!(
-            app.auto_apply_intent.is_none(),
-            "a real failure is not a cheap preflight retry"
-        );
-    }
-
-    #[test]
-    fn unavailable_retirement_metadata_does_not_turn_real_resource_retirement_into_a_quit_stall() {
-        let mut app = App::headless_for_test();
-        let work = app.account_work.enter().unwrap();
-        assert!(!app.accounts_drained_before(Continuation::Quit));
-        drop(work);
-        let drained = app.take_retired_account_pause().unwrap();
-        let serial = app.account_drain.serial;
-        assert!(matches!(
-            app.accept_account_settlement(
-                serial,
-                Settlement {
-                    drained,
-                    sealed: false
-                }
-            ),
-            Some(Continuation::Quit)
-        ));
-        assert!(app.account_drain.drained.is_some());
-        assert!(!app.account_drain.failed);
-        assert!(!app.account_drain.retirement_pending);
-        assert!(app.account_drain.worker_retry_at.is_none());
-        assert!(app.account_work.enter().is_none());
-        app.resume_drained_accounts();
-        assert!(app.account_work.enter().is_some());
-    }
-
-    #[test]
-    fn an_empty_quit_closes_admission_without_a_worker_or_completion_channel() {
-        let mut app = App::headless_for_test();
-        assert!(app.proxy.is_none());
-        assert!(app.account_work.enter().is_some());
-        assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Ready);
-        assert!(app.account_work.enter().is_none());
-        assert!(app.account_drain.drained.is_some());
-        assert!(!app.account_drain.failed);
-    }
-
-    #[test]
-    fn a_busy_last_window_stays_logically_present_without_settlement_delivery() {
-        let mut app = App::headless_for_test();
-        let work = app.account_work.enter().unwrap();
-        let sessions = app
-            .pool
-            .iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            app.close_window_logical(WindowId(0)),
-            CloseOutcome::Stay
-        ));
-        assert!(work.cancelled());
-        assert!(app.windows.contains_key(&WindowId(0)));
-        assert_eq!(
-            app.pool
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            sessions
-        );
-        assert!(app.account_drain.drained.is_none());
-        drop(work);
-        // The retained Pause can prove actual settlement on the next request, without a worker.
-        assert!(app.account_work.enter().is_none());
-        assert!(app.account_drain.pause.is_some());
-        // Exercise the event loop's nonblocking retirement path, with no second quit request.
-        let drained = app.take_retired_account_pause().unwrap();
-        let serial = app.account_drain.serial;
-        assert!(matches!(
-            app.accept_account_drain(serial, drained),
-            Some(Continuation::Window(WindowId(0), _))
-        ));
-        app.resume_drained_accounts();
-        assert!(app.account_work.enter().is_some());
-        assert!(!app.account_drain.failed);
-    }
-
-    #[test]
-    fn initial_surface_failure_waits_for_actual_account_retirement() {
-        for busy in [false, true] {
-            let mut app = App::headless_for_test();
-            let work = busy.then(|| app.account_work.enter().unwrap());
-            assert_eq!(app.initial_surface_exit_ready(), !busy);
-            assert!(app.account_work.enter().is_none());
-            if let Some(work) = work {
-                assert!(work.cancelled());
-                assert!(app.take_retired_account_pause().is_none());
-                drop(work);
-                let drained = app.take_retired_account_pause().unwrap();
-                let serial = app.account_drain.serial;
-                assert!(matches!(
-                    app.accept_account_drain(serial, drained),
-                    Some(Continuation::StartupFailure)
-                ));
-                assert!(app.initial_surface_exit_ready());
-            }
-            assert!(app.account_work.enter().is_none());
-        }
-    }
-
-    #[test]
-    fn a_refused_last_window_close_does_not_enter_the_account_gate() {
-        use crate::native_app::{ActionInvocation, AppEvent, TextInputEvent};
-        let mut app = App::headless_for_test();
-        let window = WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
-        let (_, settings) = app.active_native_view(window).unwrap();
-        for event in [
-            AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new(format!(
-                    "settings/set/{}",
-                    crate::prefs::EDIT_FONT_FAMILY
-                )),
-                value: None,
-            }),
-            AppEvent::TextInput(TextInputEvent::SelectAll),
-            AppEvent::TextInput(TextInputEvent::Commit("Inert Draft Mono".into())),
-        ] {
-            app.dispatch_native_view_event(window, settings, event)
-                .unwrap();
-        }
-        let work = app.account_work.enter().unwrap();
-        assert!(matches!(
-            app.close_window_through_barriers(window),
-            CloseOutcome::Stay
-        ));
-        assert!(!work.cancelled());
-        assert!(app.account_work.enter().is_some());
-        assert!(app.account_drain.drained.is_none());
-        assert!(app.windows.contains_key(&window));
-    }
-
-    #[test]
-    fn a_refused_busy_close_disarms_its_exit_even_if_the_draft_is_resolved_before_retirement() {
-        use crate::native_app::{ActionInvocation, AppEvent, TextInputEvent};
-        for (window_close, rearm) in [(false, false), (false, true), (true, false), (true, true)] {
-            let mut app = App::headless_for_test();
-            let work = app.account_work.enter().unwrap();
-            if window_close {
-                assert!(matches!(
-                    app.close_window_through_barriers(WindowId(0)),
-                    CloseOutcome::Stay
-                ));
-                assert!(matches!(
-                    app.account_drain.pending,
-                    Some(Continuation::Window(..))
-                ));
-            } else {
-                assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Saving);
-                assert!(matches!(
-                    app.account_drain.pending,
-                    Some(Continuation::Quit)
-                ));
-            }
-            let window = WindowId(0);
-            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
-            let (_, settings) = app.active_native_view(window).unwrap();
-            for event in [
-                AppEvent::Action(ActionInvocation {
-                    id: crate::native_ui::ActionId::new(format!(
-                        "settings/set/{}",
-                        crate::prefs::EDIT_FONT_FAMILY
-                    )),
-                    value: None,
-                }),
-                AppEvent::TextInput(TextInputEvent::SelectAll),
-                AppEvent::TextInput(TextInputEvent::Commit("Inert Draft Mono".into())),
-            ] {
-                app.dispatch_native_view_event(window, settings, event)
-                    .unwrap();
-            }
-            if window_close {
-                assert!(matches!(
-                    app.close_window_through_barriers(window),
-                    CloseOutcome::Stay
-                ));
-            } else {
-                assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Refused);
-            }
-            assert!(matches!(
-                app.account_drain.pending,
-                Some(Continuation::ResumeAfterDrain)
-            ));
-            // Resolving the draft does not revive the refused request.
-            for _ in 0..2 {
-                app.dispatch_native_view_event(
-                    window,
-                    settings,
-                    AppEvent::Action(ActionInvocation {
-                        id: crate::native_ui::ActionId::new("settings/drafts/discard-all"),
-                        value: None,
-                    }),
-                )
-                .unwrap();
-            }
-            assert!(app.prepare_quit_native_shutdown().unwrap());
-            assert!(app.account_work.enter().is_none());
-            if rearm {
-                if window_close {
-                    assert!(matches!(
-                        app.close_window_through_barriers(window),
-                        CloseOutcome::Stay
-                    ));
-                } else {
-                    assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Saving);
-                }
-            }
-            drop(work);
-            let drained = app.take_retired_account_pause().unwrap();
-            let serial = app.account_drain.serial;
-            let continuation = app.accept_account_drain(serial, drained);
-            if rearm {
-                if window_close {
-                    assert!(matches!(
-                        continuation,
-                        Some(Continuation::Window(WindowId(0), _))
-                    ));
-                } else {
-                    assert!(matches!(continuation, Some(Continuation::Quit)));
-                }
-                assert!(app.account_work.enter().is_none());
-                assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Ready);
-            } else {
-                assert!(
-                    continuation.is_none(),
-                    "the cancelled completion cannot execute Quit"
-                );
-                assert!(app.account_work.enter().is_some());
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_busy_update_cannot_start_any_successor_without_settlement_delivery() {
-        let mut app = App::headless_for_test();
-        let work = app.account_work.enter().unwrap();
-        let attempt = app.next_update_handoff_id;
-        let result = app.apply_staged_update_now(
-            crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0, 0),
-            crate::native_updater_service::ApplyMode::Immediate,
-            None,
-            None,
-        );
-        assert!(result.is_err());
-        assert!(work.cancelled());
-        assert_eq!(app.next_update_handoff_id, attempt);
-        assert!(app.pending_update_handoff.is_none());
-        assert!(app.account_drain.drained.is_none());
-        assert!(app.account_work.enter().is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_quit_wait_does_not_accept_an_unqueued_update_request() {
-        let mut app = App::headless_for_test();
-        let _work = app.account_work.enter().unwrap();
-        assert!(!app.accounts_drained_before(Continuation::Quit));
-        assert!(
-            app.apply_staged_update_now(
-                crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0, 0),
-                crate::native_updater_service::ApplyMode::Immediate,
-                None,
-                None,
-            )
-            .is_err()
-        );
-        assert!(matches!(
-            app.account_drain.pending,
-            Some(Continuation::Quit)
-        ));
-        assert!(app.pending_update_handoff.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_the_matching_returned_handoff_can_release_its_drained_epoch() {
-        let mut app = App::headless_for_test();
-        assert!(app.accounts_drained_before(Continuation::Quit));
-        app.bind_account_handoff(7);
-        app.returned_account_handoff(6, false);
-        assert!(app.account_work.enter().is_none());
-        app.returned_account_handoff(7, false);
-        assert!(app.account_work.enter().is_some());
-        assert!(app.accounts_drained_before(Continuation::Quit));
-        app.bind_account_handoff(8);
-        app.returned_account_handoff(7, false);
-        assert!(app.account_work.enter().is_none());
-        // A matching completion hands its closed scope directly to deferred Quit.
-        app.returned_account_handoff(8, true);
-        assert!(app.account_work.enter().is_none());
-        app.resume_drained_accounts();
-        assert!(app.account_work.enter().is_some());
-    }
-
-    #[test]
-    fn incoming_successor_clones_stay_closed_until_its_commit_releases_them() {
-        let mut app = App::headless_for_test();
-        app.account_drain = Drain::for_launch(&app.account_work, true);
-        let host = app.account_work.clone();
-        let menu = app.account_work.clone();
-        assert!(host.enter().is_none());
-        assert!(menu.enter().is_none());
-        assert!(app.account_drain.drained.is_some());
-        app.resume_drained_accounts();
-        assert!(host.enter().is_some());
-        assert!(menu.enter().is_some());
-    }
-    #[test]
-    fn unavailable_drain_worker_retries_without_losing_custody_or_reopening_admission() {
-        let mut app = App::headless_for_test();
-        assert!(app.proxy.is_none());
-        let work = app.account_work.enter().unwrap();
-        assert!(!app.accounts_drained_before(Continuation::ResumeAfterDrain));
-        let serial = app.account_drain.serial;
-        let due = app
-            .account_drain
-            .worker_retry_at
-            .expect("unavailable dispatch is retried");
-        assert!(work.cancelled());
-        assert!(!app.retry_account_drain_worker(due - Duration::from_nanos(1)));
-        assert_eq!(app.account_drain.worker_retry_at, Some(due));
-        assert!(app.retry_account_drain_worker(due));
-        assert_eq!(app.account_drain.serial, serial);
-        assert!(app.account_drain.pause.is_some());
-        assert!(app.account_drain.worker_retry_at.is_some());
-        assert!(app.account_work.enter().is_none());
-
-        drop(work);
-        let drained = app.take_retired_account_pause().unwrap();
-        assert!(app.accept_account_drain(serial, drained).is_none());
-        assert!(app.account_drain.worker_retry_at.is_none());
-        assert!(!app.retry_account_drain_worker(due + WORKER_RETRY));
-        assert!(app.account_work.enter().is_some());
-    }
-}
+#[path = "app_account_work_tests.rs"]
+mod tests;

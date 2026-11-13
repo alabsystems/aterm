@@ -519,8 +519,8 @@ fn scale_two_lays_twice_the_frame() {
 #[test]
 fn style_parses() {
     assert_eq!(
-        one("style rainbow   kitty"),
-        Stmt::Setup(Setup::Style("rainbow kitty".into()))
+        one("style classic   mono"),
+        Stmt::Setup(Setup::Style("classic mono".into()))
     );
 }
 

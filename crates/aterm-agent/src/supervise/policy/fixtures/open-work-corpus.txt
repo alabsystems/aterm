@@ -8,8 +8,12 @@
 # open or hold one of the reader's words; paths outside the repository read
 # <scratch>, <worktrees>, <build-cache> and <checkout>.
 #
-# Labels follow the owner's rule for a finished job (2026-10-19: the token
-# NEVER ends a job while ANY follow-up is left). An excerpt is OPEN when it
+# One report says floors are not a gate "under the owner's 2026-10-16 ruling".
+# It is kept as written; the owner never made that ruling (docs/OWNER_RULINGS.md,
+# 2026-11-09: "that is not my ruling").
+#
+# Labels follow the project's rule for a finished job: the token never ends a
+# job while any follow-up is left. An excerpt is OPEN when it
 # leaves something undone (a check not run, a gap still open, something
 # unmeasured, unexplained or left to follow up), WHATEVER BLOCKS IT: one that
 # names its blocker (a person's credential or decision, what this host

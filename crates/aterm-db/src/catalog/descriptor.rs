@@ -193,6 +193,20 @@ pub(crate) fn application_scope(trust: Trust, application: &str, role: &str) -> 
     Scope::new(trust, table, 1)
 }
 
+/// The catalog's scope under `trust`. A thread keeps the last one it derived beside the trust it
+/// derived it under, and answers that trust again from it: a store's ingest, its commits and its
+/// catalog evidence check ask it of each record they judge (`table::store::operation_policy`),
+/// where its derivation hashes. A store's open asks it once.
 pub(super) fn catalog_scope(trust: Trust) -> Scope {
-    application_scope(trust, "aterm.catalog", "tables").expect("nonzero catalog scope")
+    thread_local! {
+        static LAST: std::cell::Cell<Option<(Trust, Scope)>> = const { std::cell::Cell::new(None) };
+    }
+    if let Some((held, scope)) = LAST.get()
+        && held == trust
+    {
+        return scope;
+    }
+    let scope = application_scope(trust, "aterm.catalog", "tables").expect("nonzero catalog scope");
+    LAST.set(Some((trust, scope)));
+    scope
 }

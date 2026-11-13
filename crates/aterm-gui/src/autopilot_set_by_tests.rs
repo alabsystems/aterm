@@ -229,7 +229,7 @@ fn a_wire_write_says_the_timer_it_dropped() {
         [
             format!(
                 "the {} landing time is cancelled",
-                crate::autopilot_menu::when(until)
+                crate::autopilot_timers::when(until)
             ),
             "set over aterm ctl".to_string(),
         ]
@@ -238,32 +238,18 @@ fn a_wire_write_says_the_timer_it_dropped() {
     host.shutdown_and_join();
 }
 
-/// THE SURFACES, A TABLE (§11.7.5): the chip, the Autopilot menu (a mode
-/// and its cancel), a SESSIONS row (a mode and its Timer), the `Every
+/// THE SURFACES, A TABLE (§11.7.5): the chip, a SESSIONS row (a mode, its
+/// Timer and its Cancel), the `Every
 /// session` row and the timer's fire each store their own setter — `meta`'s
 /// word for it — and end the record with their own words. The composer
 /// border's switch writes `aterm.toml`, never the pair, so it moves nothing.
 #[test]
 fn every_surface_names_itself() {
-    use crate::autopilot_menu::{MenuAct, MenuRow};
     use crate::harness_screen::EveryPress;
     let (mut app, host) = hosted();
     let mono = Instant::now();
     let wall = FRI_19Z * 1000;
     set_fake_clocks(Some((mono, wall)));
-    let wid = WindowId(0);
-    let choose = move |app: &mut App, act: MenuAct| {
-        app.open_autopilot_menu(wid, 0, (20, 2), false);
-        let row = app
-            .autopilot_menu
-            .as_ref()
-            .expect("open")
-            .rows
-            .iter()
-            .position(|r| matches!(r, MenuRow::Item { act: a, .. } if *a == act))
-            .unwrap_or_else(|| panic!("no {act:?} row"));
-        app.choose_autopilot_menu_row(row);
-    };
     type Step = Box<dyn Fn(&mut App)>;
     let steps: Vec<(&str, Step, &str, String)> = vec![
         (
@@ -275,10 +261,12 @@ fn every_surface_names_itself() {
             "set from the chip".into(),
         ),
         (
-            "the menu's mode",
-            Box::new(move |app: &mut App| choose(app, MenuAct::Mode(Autopilot::Cruise))),
-            "human:menu",
-            "set from the Autopilot menu".into(),
+            "the Every session row",
+            Box::new(|app: &mut App| {
+                app.press_autopilot_every(EveryPress::Mode(Autopilot::Cruise));
+            }),
+            "human:every",
+            "set from Settings \u{25b8} Harness, every session".into(),
         ),
         (
             "a SESSIONS row's mode",
@@ -287,14 +275,6 @@ fn every_surface_names_itself() {
             }),
             "human:settings",
             "set from Settings \u{25b8} Harness".into(),
-        ),
-        (
-            "the Every session row",
-            Box::new(|app: &mut App| {
-                app.press_autopilot_every(EveryPress::Mode(Autopilot::Cruise));
-            }),
-            "human:every",
-            "set from Settings \u{25b8} Harness, every session".into(),
         ),
         (
             "a SESSIONS row's Timer",
@@ -308,10 +288,15 @@ fn every_surface_names_itself() {
             "set from Settings \u{25b8} Harness".into(),
         ),
         (
-            "the menu's cancel",
-            Box::new(move |app: &mut App| choose(app, MenuAct::Timer(TimerChoice::Cancel))),
-            "human:menu",
-            "set from the Autopilot menu".into(),
+            "a SESSIONS row's Cancel",
+            Box::new(|app: &mut App| {
+                app.execute_harness_timer(crate::native_app::HarnessTimerRequest {
+                    session: 0,
+                    choice: TimerChoice::Cancel,
+                });
+            }),
+            "human:settings",
+            "set from Settings \u{25b8} Harness".into(),
         ),
     ];
     let revision = |app: &App| {
@@ -349,7 +334,11 @@ fn every_surface_names_itself() {
         assert_eq!(last_line(&app, 0).as_ref(), Some(line), "{name}");
     }
 
-    choose(&mut app, MenuAct::Timer(TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(
+        0,
+        TimerChoice::In(60),
+        crate::autopilot::Surface::Settings
+    ));
     let until = app.autopilot_timers.glass(0).expect("armed");
     let land_at = app.autopilot_timers.entry(0).unwrap().land_at_ms;
     set_fake_clocks(Some((mono + Duration::from_secs(3_600), land_at)));
@@ -630,28 +619,20 @@ fn a_sessions_row_says_who_set_its_word_and_when() {
 }
 
 /// A LATER WAKE NEVER REPLACES THE FIRE'S RECORD (§11.7.7):
-/// a timer armed from the menu fires — its record says what the
+/// a timer armed from Settings ▸ Harness fires — its record says what the
 /// fire found and `set at the 13:00 timer` — and the session's next wake
 /// for another field (`meta set title x` over the wire) records nothing,
 /// since the fire noted its revision as recorded.
 #[test]
 fn a_later_wake_never_replaces_the_fires_record() {
-    use crate::autopilot_menu::{MenuAct, MenuRow};
     let (mut app, host) = hosted();
     let mono = Instant::now();
     set_fake_clocks(Some((mono, FRI_19Z * 1000)));
-    app.open_autopilot_menu(WindowId(0), 0, (20, 2), false);
-    let row = app
-        .autopilot_menu
-        .as_ref()
-        .expect("open")
-        .rows
-        .iter()
-        .position(|r| {
-            matches!(r, MenuRow::Item { act, .. } if *act == MenuAct::Timer(TimerChoice::In(60)))
-        })
-        .expect("the 1 hour row");
-    app.choose_autopilot_menu_row(row);
+    assert!(app.choose_autopilot_timer(
+        0,
+        TimerChoice::In(60),
+        crate::autopilot::Surface::Settings
+    ));
     let until = app.autopilot_timers.glass(0).expect("armed");
     let land_at = app.autopilot_timers.entry(0).unwrap().land_at_ms;
     set_fake_clocks(Some((mono + Duration::from_secs(3_600), land_at)));
@@ -672,4 +653,45 @@ fn a_later_wake_never_replaces_the_fires_record() {
     );
     set_fake_clocks(None);
     host.shutdown_and_join();
+}
+
+/// A FLEET DRIVE'S SETTER IS NAMED BY ITS MAC (§11.7.3, item 4): a SESSIONS
+/// row says `over the fleet from m9`, the name this Mac's fleet read gives the node the
+/// drive's actor token heads, then the driving session where the drive named one, never the raw
+/// `<node head>:<sid>` token.
+/// NEGATIVE CONTROL: a node no fleet read names is said as `node <head>`.
+#[test]
+fn a_fleet_setter_is_named_by_its_mac() {
+    let node = "87be5228aaaaaaaaaaaaaaaaaaaaaaaa";
+    let sid = "s-0123456789abcdef0123";
+    let words = |actor: Actor, name: Option<&str>| {
+        SetByWords::of(
+            Some(AutopilotSetBy {
+                actor,
+                surface: None,
+                since_ms: FRI_19Z * 1000,
+            }),
+            true,
+            |_| None,
+            |head| {
+                assert_eq!(head, "87be5228");
+                name.map(str::to_owned)
+            },
+        )
+        .expect("a setter")
+        .by
+    };
+    assert_eq!(
+        words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
+        "over the fleet from m9 (session s-0123)"
+    );
+    assert_eq!(
+        words(Actor::fleet_drive(node, None), Some("m9")),
+        "over the fleet from m9"
+    );
+    assert_eq!(
+        words(Actor::fleet_drive(node, Some(sid)), None),
+        "over the fleet from node 87be5228 (session s-0123)",
+        "CONTROL"
+    );
 }

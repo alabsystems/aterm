@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_uds::secret::{Secret, scrub};
 
@@ -296,6 +296,7 @@ impl Client {
             idle: None,
             backstop: Backstop::Client,
             connect_within: None,
+            until: None,
             error: None,
         }
     }
@@ -314,6 +315,7 @@ pub struct RequestBuilder<'a> {
     idle: Option<Duration>,
     backstop: Backstop,
     connect_within: Option<Duration>,
+    until: Option<Instant>,
     /// First construction error, surfaced at `send` so the builder stays chainable.
     error: Option<Error>,
 }
@@ -344,6 +346,12 @@ impl std::fmt::Debug for RequestBuilder<'_> {
 }
 
 impl RequestBuilder<'_> {
+    /// Preserve the absolute boundary of an enclosing operation through request construction.
+    #[must_use]
+    pub const fn until(mut self, until: Instant) -> Self {
+        self.until = Some(until);
+        self
+    }
     /// Add a header.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -501,6 +509,7 @@ impl RequestBuilder<'_> {
             idle,
             backstop,
             connect_within,
+            until,
             error,
         } = self;
         if let Some(error) = error {
@@ -523,6 +532,9 @@ impl RequestBuilder<'_> {
             Backstop::Within(total) => Deadline::after(total),
             Backstop::None => Deadline::unbounded(),
         };
+        if let Some(until) = until {
+            deadline = deadline.until(until);
+        }
         if let Some(idle) = idle {
             deadline = deadline.with_idle(idle);
         }
@@ -531,6 +543,13 @@ impl RequestBuilder<'_> {
         // The connect budget starts once the proxy is chosen: reading its variables is no
         // part of the DNS, connect, CONNECT and handshake that `connect_within` bounds.
         let connect = connect_within.map_or(deadline, |within| deadline.connect_phase(within));
+
+        if !guard.is_authorized() {
+            return Err(not_sent(crate::stream::revoked_error().into()));
+        }
+        connect
+            .remaining_or_timeout()
+            .map_err(|error| not_sent(error.into()))?;
 
         let mut stream = client
             .open(&target, via.as_ref(), &guard, connect)

@@ -450,12 +450,35 @@ impl Jobserver {
         notify: &dyn Fn(Duration),
     ) -> io::Result<Token<'_>> {
         let started = std::time::Instant::now();
+        let asked_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok());
         let stated = std::cell::Cell::new(false);
-        self.acquire_waking(stopped, WAKE_EVERY, &|| {
+        let waited = std::cell::Cell::new(false);
+        let result = self.acquire_waking(stopped, WAKE_EVERY, &|| {
+            waited.set(true);
             if started.elapsed() >= after && !stated.replace(true) {
                 notify(started.elapsed());
             }
-        })
+        });
+        if waited.get() {
+            let ended_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok());
+            eprintln!(
+                "capacity-event: {}",
+                aterm_json::json!({
+                    "schema":1,"event":"jobserver-wait","process_id":std::process::id(),
+                    "fifo":self.path,"slots":self.slots,"resource":"core",
+                    "started_at_unix_ms":asked_ms,"ended_at_unix_ms":ended_ms,
+                    "waiting_s":started.elapsed().as_secs_f64(),"acquired":result.is_ok(),
+                    "bounds":"acquire call; the FIFO was observed empty",
+                })
+            );
+        }
+        result
     }
 
     /// Re-mint an allocation whose former branch has drained. Only the share accountant calls

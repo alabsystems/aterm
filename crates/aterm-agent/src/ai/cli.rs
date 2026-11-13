@@ -14,7 +14,7 @@ use aterm_json::{Map, Number, Value};
 use super::change::{self, Base};
 use super::config::{self, FleetSource, FleetState, Settings};
 use super::connector::{self, Connector};
-use super::facts::{self, Facts, Job, LiveRunner, Machine, Runner};
+use super::facts::{self, Facts, Job, LiveRunner, Machine, RunFailed, Runner};
 use super::fleet::{self, Fetched, Fetcher, Held, LiveFetcher};
 use super::login::{self, Done};
 use super::permission::{self, Asker, Choice, Level};
@@ -119,13 +119,7 @@ impl Env {
                 .as_ref()
                 .map(|s| s.join("harness").join(crate::harness::cli::HARNESS)),
         };
-        let asker = permission::asker(&permission::LiveProcs, &|| {
-            let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .filter(|d| d.is_absolute())
-                .or_else(|| home.as_ref().map(|h| h.join(".claude")))?;
-            permission::claude_default_mode(&dir)
-        });
+        let asker = permission::asker(&permission::LiveProcs);
         Env {
             now: crate::supervise::limit::unix_now(),
             home,
@@ -836,12 +830,59 @@ fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     }
 }
 
+/// How long the doctor gives a pool's sync: past a sync's own bounded reads and its locks' waits.
+const SYNC_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// Runs each sync a pool's default login names as the step that moves its row off it
+/// ([`crate::harness::accounts_pool::DefaultMovedEnd`]). A window's upkeep runs the same sync; on
+/// a headless Mac the doctor is the upkeep that is present. Whether any ran.
+fn take_moved_syncs(env: &Env, runner: &dyn Runner, seen: &Look, out: &mut dyn Write) -> bool {
+    let Some(exe) = env.exe.as_deref() else {
+        return false;
+    };
+    let mut took = false;
+    for f in &seen.facts {
+        let Some((_, Step::Sync(cli))) = f.login_pool().and_then(|p| p.default_moved.as_ref())
+        else {
+            continue;
+        };
+        let args: Vec<String> = ["harness", "accounts", "sync", "--cli", cli.id()]
+            .map(str::to_owned)
+            .to_vec();
+        let ran = runner.run(&Job {
+            program: exe,
+            args: &args,
+            env: &env.vars,
+            stdin: None,
+            cwd: None,
+            budget: SYNC_BUDGET,
+        });
+        let step = Step::Sync(*cli);
+        let _ = writeln!(out, "\n── {} ──", f.connector.product);
+        match ran {
+            Ok(ran) => {
+                let _ = out.write_all(ran.stdout.as_bytes());
+                let _ = out.write_all(ran.stderr.as_bytes());
+            }
+            Err(RunFailed::Timeout) => {
+                let _ = writeln!(out, "`{step}` ran past its budget and was ended");
+            }
+            Err(RunFailed::NotRun(why)) => {
+                let _ = writeln!(out, "`{step}` did not run: {why}");
+            }
+        }
+        took = true;
+    }
+    took
+}
+
 /// `aterm ai doctor` here: the look, then each fix it may make ([`may_fix`]): aterm's own
 /// (installs, and sign-ins through accounts v2's or a pool's ladder) at any run but
 /// `--read-only`'s or `--json`'s, under an agent and with no terminal too; a person's only where
 /// one is at this terminal, else said and not started; and for a CLI nobody asked for
-/// ([`state::asked`]) a person's sign-in is said, never started, even with a person here. The look again after, which names what
-/// this run tried and did not finish rather than offering the same run again.
+/// ([`state::asked`]) a person's sign-in is said, never started, even with a person here. A sync a
+/// moved default login names runs first ([`take_moved_syncs`]). The look again after, which names
+/// what this run tried and did not finish rather than offering the same run again.
 fn doctor_here(
     env: &Env,
     runner: &dyn Runner,
@@ -850,7 +891,10 @@ fn doctor_here(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let first = look(env);
+    let mut first = look(env);
+    if !json && !read_only && take_moved_syncs(env, runner, &first, out) {
+        first = look(env);
+    }
     let needs: Vec<usize> = first
         .rows
         .iter()

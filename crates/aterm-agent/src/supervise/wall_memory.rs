@@ -5,7 +5,8 @@
 
 use super::super::policy::outlook::ExceptionKind;
 use super::super::policy::turn_end::{
-    Conversation, HostTurn, ended_under, met_under_another, reads_conversation, screen_alone,
+    Conversation, HostTurn, RULE_MODEL_FALLBACK, ended_under, met_under_another,
+    reads_conversation, screen_alone,
 };
 use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, WALL_LEFT_NO_TASK};
 use super::turn_end_loop::resume_jitter;
@@ -153,7 +154,7 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
     ) {
         match reading.wall.clone() {
-            Some(w) if is_kept(&w) => {
+            Some(w) if is_kept(&w) && !self.turn_end.left_bucket(w.kind, &w.message) => {
                 self.remember_wall(&w, reader.program(), seq);
             }
             Some(_) => self.forget_wall(seq),
@@ -188,6 +189,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Update wall memory after observing an idle or busy turn-end point.
     pub(super) fn observe_point(&mut self, reading: &TurnEndReading, now: Instant, seq: u64) {
+        let unasked = self.turn_end.fallback_unasked();
         let land = self.turn_end.land_episode().0;
         self.turn_end.observe(reading, now);
         self.book_go_ahead_hour(seq);
@@ -203,6 +205,7 @@ impl<C: Ctl> Session<'_, C> {
             self.wall_login = None;
         }
         self.land_over(land, seq);
+        self.fallback_asked(unasked, seq);
         if self.turn_end.limit_ended() {
             let why = if self.turn_end.limit_ended_elsewhere() {
                 approvals::LIMIT_ENDED_ELSEWHERE
@@ -232,13 +235,28 @@ impl<C: Ctl> Session<'_, C> {
     /// recording build had no break door with guards (`host.at_background_on`) records it as
     /// that build did, as any host turn. Either way it is the harness's own submission, as
     /// Cruise's carry counts them (`CarryWatch::host_typed`).
-    pub(super) fn host_turn(&mut self, kind: HostTurn) {
+    pub(super) fn host_turn(&mut self, kind: HostTurn, seq: u64) {
         self.cruise_carry.host_typed();
         if kind == HostTurn::Fact && !self.fx.replay_lacks_host_door("host.at_background_on") {
             self.turn_end.fact_typed();
             return;
         }
+        let unasked = self.turn_end.fallback_unasked();
         self.turn_end.host_typed(self.fx.mono(), kind);
+        self.fallback_asked(unasked, seq);
+    }
+
+    /// Record an unasked fallback turn against wall memory.
+    pub(super) fn fallback_asked(&mut self, unasked: bool, seq: u64) {
+        if unasked && !self.turn_end.fallback_unasked() {
+            self.ledger_row(
+                RULE_MODEL_FALLBACK,
+                Outcome::Waiting,
+                "",
+                approvals::FALLBACK_ASKED,
+                seq,
+            );
+        }
     }
 
     fn limit_ended_row(&mut self, shown: bool, why: &str, seq: u64) {
@@ -631,14 +649,6 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    fn no_progress_call(&self) -> Option<super::super::background::BackgroundCall> {
-        let host = self.stall_host.as_ref()?;
-        match host.background_jobs() {
-            super::super::background::BackgroundEvidence::NoProgress { worst } => Some(worst),
-            super::super::background::BackgroundEvidence::Unknown => None,
-        }
-    }
-
     /// Evaluate and fire the unrecognized-dialog canary.
     pub(super) fn dialog_note(&mut self, screen: &Screen, review: &mut dyn Review) {
         if !review.unattended() {
@@ -713,43 +723,34 @@ impl<C: Ctl> Session<'_, C> {
         let Some((next, times)) = self.stuck_rung.next() else {
             return;
         };
-        let paced = self.stuck_asked.is_some_and(|t| self.fx.since(t) < after);
-        // A rung said with no call named (`STUCK`, or a `STALLED` in today's words) does not
-        // hold back a call the reading names since: it is told at once (the hung-call design's
-        // R1), not one pace after that rung's read. Every other rung keeps the pace.
-        let unnamed = self.stuck_rung == StuckRung::Said
-            || (self.stuck_rung == StuckRung::Told
-                && self.stuck_told.is_some_and(|(_, pgid)| pgid.is_none()));
-        if paced && !unnamed {
+        if self.stuck_asked.is_some_and(|t| self.fx.since(t) < after) {
             return;
         }
         let dialog = kind == ExceptionKind::Dialog;
+        // Background work the jobs reading names is judged there, call by call: one that
+        // progresses or waits on what it declared is not stalled, and one at no progress is the
+        // facts door's to tell the agent, once, when nothing else will wake it. The canary keeps
+        // only what no reading names.
+        if !dialog
+            && self.fx.since(at) >= self.setup.background_settle
+            && self
+                .stall_host
+                .as_ref()
+                .is_some_and(|host| host.background_jobs().names_a_call())
+        {
+            self.stuck_over(
+                screen.seq,
+                "the jobs reading names its background calls",
+                review,
+            );
+            return;
+        }
         let on = self
             .stuck_dialog
             .as_ref()
             .map_or(StuckOn::Unread, |((_, on), _)| *on);
         let named = on.named().filter(|_| dialog);
-        let call = if dialog || self.fx.since(at) < self.setup.background_settle {
-            None
-        } else {
-            self.no_progress_call()
-        };
-        if paced && call.is_none() {
-            return;
-        }
-        let (next, due) = match &call {
-            Some(_) if next <= StuckRung::Told => (StuckRung::Told, true),
-            Some(c) if self.stuck_told.is_some_and(|(_, g)| g != Some(c.pgid)) => {
-                (StuckRung::Told, true)
-            }
-            Some(_) => (
-                next,
-                self.stuck_told
-                    .is_some_and(|(told, _)| self.fx.since(told) >= after),
-            ),
-            None => (next, self.fx.since(at) >= after * times),
-        };
-        if !due {
+        if self.fx.since(at) < after * times {
             return;
         }
         let status = match witness {
@@ -780,28 +781,6 @@ impl<C: Ctl> Session<'_, C> {
         };
         let minutes = self.fx.since(at).as_secs() / 60;
         self.stuck_rung = next;
-        match (next, &call) {
-            (StuckRung::Told, Some(call)) => {
-                self.stuck_told = Some((self.fx.mono(), Some(call.pgid)));
-                review.note(&format!(
-                    "STALLED seq={} {}; told to the window as a record",
-                    screen.seq,
-                    call.fact(),
-                ));
-                if let Some(host) = &self.stall_host {
-                    host.stall_unread(Some(StallSeen::NoProgress {
-                        minutes: call.quiet_min(),
-                        pid: call.pid,
-                    }));
-                }
-                return;
-            }
-            (StuckRung::Raised, Some(call)) => {
-                self.raise_stuck(screen.seq, &Exception::no_progress(call), kind, review);
-                return;
-            }
-            _ => {}
-        }
         match next {
             StuckRung::Quiet => {}
             StuckRung::Said if named.is_some() => {
@@ -855,7 +834,6 @@ impl<C: Ctl> Session<'_, C> {
             StuckRung::Told if named.is_some() => {
                 // A record of a screen this build does not recognise would be false here: the
                 // journal keeps it, and the third rung names the screen.
-                self.stuck_told = Some((self.fx.mono(), None));
                 let whose = match on {
                     StuckOn::Login => "",
                     StuckOn::Panel | StuckOn::Unread => ", which the harness did not open",
@@ -867,7 +845,6 @@ impl<C: Ctl> Session<'_, C> {
                 ));
             }
             StuckRung::Told => {
-                self.stuck_told = Some((self.fx.mono(), None));
                 let what = match witness {
                     _ if dialog => UNREAD_DIALOG,
                     Witness::Title => "a wait this build does not classify",
@@ -930,7 +907,6 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn stuck_over(&mut self, seq: u64, cause: &str, review: &mut dyn Review) {
         self.stuck_dialog = None;
         self.stuck_still = None;
-        self.stuck_told = None;
         let rung = std::mem::replace(&mut self.stuck_rung, StuckRung::Quiet);
         let raised = self.stuck_raised.take();
         if rung >= StuckRung::Told

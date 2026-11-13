@@ -490,8 +490,8 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// The program of `cli`'s sign-in on this machine: the binary atpkg's managed copy runs (never
-/// its shim, which adds launch postures), else `~/.local/bin/<id>`, else the bare word, which
-/// a sign-in finds on the parent's `PATH` ([`child_program`]).
+/// its shim, which adds launch postures), else `~/.local/bin/<id>` (`<id>.exe` on Windows), else
+/// the bare word, which a sign-in finds on the parent's `PATH` ([`child_program`]).
 #[must_use]
 pub fn program_of(cli: Cli, home: &Path) -> PathBuf {
     if cli == Cli::Claude {
@@ -507,7 +507,9 @@ pub fn program_of(cli: Cli, home: &Path) -> PathBuf {
     {
         return exe;
     }
-    let local = home.join(".local/bin").join(id);
+    let local = home
+        .join(".local/bin")
+        .join(format!("{id}{}", std::env::consts::EXE_SUFFIX));
     if local.is_file() {
         return local;
     }
@@ -556,9 +558,8 @@ pub enum Approval {
     Refused(String),
     /// It waited on Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::bot_check`]): why, naming Cloudflare and the page's host and
-    /// path, never its text. Software never tries to pass one. A Claude flow may use the fleet
-    /// issuer's interactive challenge service; if that is unavailable or does not finish, the
-    /// sign-in ends as an error on record without asking the AI.
+    /// path, never its text. Software never tries to pass one, and no other Mac is asked to: the
+    /// sign-in ends as a stop on the account's record without asking the AI.
     BotCheck(String),
 }
 

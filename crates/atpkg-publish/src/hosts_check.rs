@@ -270,7 +270,7 @@ pub fn check(
         )
     });
 
-    // Drafts (design §6.4; the fail-closed gate stays, owner ruling 2026-10-26 (b)).
+    // Drafts (design §6.4; the fail-closed gate stays).
     let mut unproven: Vec<String> = Vec::new();
     for name in &present {
         if !client.drafts_vouched(name) {

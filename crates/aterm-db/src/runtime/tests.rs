@@ -574,6 +574,32 @@ fn the_owner_loop_waits_out_a_persistent_refusal_at_a_doubling_interval() {
     }
 }
 
+/// A WAITING OWNER PUBLISHES AGAIN BETWEEN THE SLICES OF A LONG WAIT, so its observation stays
+/// current while it lives: a wait of four slices publishes three times, one of a slice or less
+/// never, and a set stop ends the wait with nothing more published. The counts are exact
+/// whatever the load, since each slice is slept in full. Negative control: a wait slept in one
+/// piece publishes nothing, and a refused window's observation ages past what its relay serves.
+#[test]
+fn a_long_wait_publishes_again_between_its_slices() {
+    let every = Duration::from_millis(5);
+    let count = |stop: &Stop, wait: Duration| {
+        let mut published = 0;
+        sleep_sliced(stop, wait, every, || published += 1);
+        published
+    };
+    let stop = Stop::default();
+    assert_eq!(count(&stop, every * 4), 3);
+    assert_eq!(count(&stop, every * 3 + every / 2), 3);
+    assert_eq!(count(&stop, every), 0);
+    assert_eq!(count(&stop, Duration::ZERO), 0);
+    stop.set();
+    assert_eq!(count(&stop, every * 4), 0);
+    // The owner's longest wait is past the window a reader holds a publication to, and its
+    // slices are well inside it.
+    assert!(REFUSED_MAX > Duration::from_millis(aterm_types::network_state::REACHABLE_MS));
+    assert!(REPUBLISH * 2 <= Duration::from_millis(aterm_types::network_state::REACHABLE_MS));
+}
+
 /// A refusal carries the step that refused and the error that step gave, from either error type a
 /// step fails with, and so does the refusal of a configuration that could not be read; local
 /// contention is still a retry. NEGATIVE CONTROL: the adapter that kept only the step gave two
@@ -876,6 +902,43 @@ fn missing_configuration_is_default_on_but_never_bootstraps_a_vault() {
     }
     fsx::write_atomic(&config, b"[commons]\n", 0o600).unwrap();
     assert!(enabled(&config).unwrap());
+}
+
+/// A process keeps its runtime in a static, which nothing drops: it stops the runtime through a
+/// shared reference as it ends, and the owner thread's observer then closes the network history.
+#[test]
+fn a_shared_runtime_shuts_down_and_closes_its_network_history() {
+    static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    let config = home.path().join("aterm.toml");
+    let (send, receive) = std::sync::mpsc::channel();
+    let started = Runtime::start(paths, config.clone(), move |status| {
+        let _ = send.send(status);
+    })
+    .unwrap();
+    assert!(RUNTIME.set(started).is_ok());
+    let runtime = RUNTIME.get().unwrap();
+    assert_eq!(
+        receive.recv_timeout(Duration::from_secs(60)).unwrap(),
+        Status::Dormant
+    );
+    // The wait is a hang detector: the owner thread ends as soon as it reads the request.
+    assert!(runtime.shutdown(Duration::from_secs(60)));
+    assert_eq!(
+        runtime.network_observation().snapshot().detail,
+        "Network observation stopped"
+    );
+    // Its observer observed, so it wrote; its drop closed what it wrote.
+    let history = crate::network_state::directory(&config).join("projection.json");
+    assert!(history.is_file());
+    assert!(
+        crate::network_state::read_closed_history(&config)
+            .unwrap()
+            .is_some()
+    );
+    // Asked again, there is nothing left to stop.
+    assert!(runtime.shutdown(Duration::ZERO));
 }
 
 #[test]

@@ -743,6 +743,7 @@ impl Clock {
 
 fn turn_end(worked: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase: Phase::Idle,
         authoritative: true,
         survey: false,
@@ -2499,7 +2500,7 @@ impl<T> Slot<T> {
 fn pooled<T: Send>(n: usize, job: impl Fn(usize) -> Option<T> + Sync) -> Vec<Slot<T>> {
     let next = AtomicUsize::new(0);
     let first_panic = AtomicUsize::new(usize::MAX);
-    let workers = thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(1, NonZero::get)
         .min(n)
         .max(1);

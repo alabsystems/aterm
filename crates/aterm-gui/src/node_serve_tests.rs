@@ -5,8 +5,8 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aterm_agent::fleet_log::LocalLog;
@@ -24,13 +24,25 @@ use aterm_uds::stop::Stop;
 
 use super::{
     NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
-    WindowLauncher, WindowRelays, a_window_relay_answers, apply_at_node_boot,
+    WindowLauncher, WindowRelays, a_window_that_applies_answers, apply_at_node_boot,
     arm_claims_off_on_quit, claims_off_on_quit, claims_upkeep, has_live_window_relay,
-    keeps_port_after, mind_node_checker, own_node_job, query_window_survey_facts, read_line_raw,
-    relay_ask, relay_socket_path, restart_for, run_node_serve_with, serve_window_relay_at,
-    wanted_for_node, why_the_run_ends,
+    keeps_port_after, mind_node_checker, others_beside, own_node_job, query_window_survey_facts,
+    read_line_raw, relay_ask, relay_socket_path, restart_for, run_node_serve_with,
+    serve_window_relay_at, spawn_node_updates, wanted_for_node, why_the_run_ends,
 };
 use aterm_session::SessionId;
+use aterm_types::MutexExt as _;
+use aterm_types::control_verbs::Requester;
+use aterm_types::fleet_access::FleetAccess;
+
+/// A DRIVE relay header's requester word naming nobody, as [`RelayHeader::Drive`] encodes it.
+const REQUESTER_NOBODY: &str = " requester=requester%20sid=-%20program=-%20model=-%20account=-";
+
+/// `lines` as a drive sends them: its requester line first, naming nobody
+/// ([`aterm_types::control_verbs::Requester::line`]).
+fn drive_bytes(lines: &str) -> String {
+    format!("{}{lines}", Requester::default().line())
+}
 
 /// A test window that stands for this Mac's only one: it hosts every session a drive names.
 fn hosts_every(_: &SessionId) -> bool {
@@ -89,6 +101,8 @@ mod needs;
 mod ports;
 #[path = "node_serve_tests/presence.rs"]
 mod presence;
+#[path = "node_serve_tests/survey_read.rs"]
+mod survey_read;
 #[path = "node_serve_tests/two_windows.rs"]
 mod two_windows;
 #[path = "node_serve_tests/vault_pass.rs"]
@@ -155,8 +169,11 @@ impl WindowLauncher for MockWindowLauncher {
                                     }
                                 }
                             }
-                            RelayHeader::Ask { .. } | RelayHeader::Needs => {}
+                            RelayHeader::Ask { .. } | RelayHeader::Applies | RelayHeader::Needs => {
+                            }
                             RelayHeader::Drive { driver, .. } => {
+                                // The requester came in the header; the stream starts at the
+                                // drive's first request.
                                 let Ok(Some(head)) = read_line_raw(&mut stream, 4096) else {
                                     return;
                                 };
@@ -220,6 +237,7 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         key: Some(aterm_net::fleet::NodeKey::from_bytes([0xcd; 32])),
         peer: None,
         sids: Vec::new(),
+        requester: Requester::default(),
     };
     assert_eq!(
         RelayHeader::parse(&drive.encode()).expect("parse drive"),
@@ -230,6 +248,7 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         key: None,
         peer: None,
         sids: Vec::new(),
+        requester: Requester::default(),
     };
     assert_eq!(
         RelayHeader::parse(&drive_no_key.encode()).expect("parse drive without key"),
@@ -244,11 +263,12 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
             SessionId::new("s-4c56f539e92639ba37ae"),
             SessionId::new("s-b"),
         ],
+        requester: Requester::default(),
     };
     assert!(
-        naming
-            .encode()
-            .ends_with(" sids=s-4c56f539e92639ba37ae,s-b\n"),
+        naming.encode().ends_with(&format!(
+            " sids=s-4c56f539e92639ba37ae,s-b{REQUESTER_NOBODY}\n"
+        )),
         "{}",
         naming.encode()
     );
@@ -256,36 +276,84 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         RelayHeader::parse(&naming.encode()).expect("parse drive naming sessions"),
         naming
     );
+    // A drive carries its requester whole, an account's spaces and all, in one header word.
+    let asked = RelayHeader::Drive {
+        driver: crate::fabric::Driver {
+            node: "ab".repeat(16),
+            host: "m12".to_owned(),
+        },
+        key: None,
+        peer: None,
+        sids: Vec::new(),
+        requester: Requester::of(
+            Some("s-0123456789abcdef0123"),
+            Some("claude"),
+            Some("Opus 5.5"),
+            Some("team acct %"),
+        ),
+    };
+    assert_eq!(asked.encode().split_ascii_whitespace().count(), 5);
+    assert_eq!(
+        RelayHeader::parse(&asked.encode()).expect("parse drive naming its requester"),
+        asked
+    );
     let ask = RelayHeader::Ask { peer };
     assert_eq!(RelayHeader::parse(&ask.encode()).expect("parse ask"), ask);
+    assert_eq!(
+        RelayHeader::parse(&RelayHeader::Applies.encode()).expect("parse applies"),
+        RelayHeader::Applies
+    );
 
     // Negative controls: malformed, missing, duplicate, control-injected, or unknown relay headers
-    // are rejected.
+    // are rejected. Each DRIVE line names a well-formed requester, so its own fault refuses it;
+    // a DRIVE with none, a malformed one or two is refused too, as a window of the build before
+    // requesters refuses a header that names one (`unknown DRIVE key`).
+    let nobody = |line: &str| line.replace('\n', &format!("{REQUESTER_NOBODY}\n"));
     for bad in [
-        "",
-        "PING\n",
-        "SURVEY content=2 drive=0 peer=-\n",
-        "SURVEY content=1 peer=-\n",
-        "SURVEY content=0 content=1 drive=0 peer=-\n",
-        "SURVEY content=0 drive=0 drive=1 peer=-\n",
-        "SURVEY content=0 drive=0 peer=- peer=-\n",
-        "DRIVE node= host=x peer=-\n",
-        "DRIVE node=abcd peer=-\n",
-        "DRIVE node=abcd node=efgh host=x peer=-\n",
-        "DRIVE node=ab%0acd host=x peer=-\n",
-        "DRIVE node=abcd host=x%00y peer=-\n",
-        "DRIVE node=abcd host=x peer=- sids=\n",
-        "DRIVE node=abcd host=x peer=- sids=-\n",
-        "DRIVE node=abcd host=x peer=- sids=s-a,,s-b\n",
-        "DRIVE node=abcd host=x peer=- sids=s-a,x-b\n",
-        "DRIVE node=abcd host=x peer=- sids=s-\n",
-        "DRIVE node=abcd host=x peer=- sids=s-a sids=s-b\n",
-        "ASK peer=-\n",
-        "ASK\n",
-        "ASK peer=127.0.0.1:1 more=1\n",
+        "DRIVE node=abcd host=x peer=-\n".to_owned(),
+        "DRIVE node=abcd host=x peer=- requester=requester%20sid=worker%20program=-%20model=-%20\
+         account=-\n"
+            .to_owned(),
+        "DRIVE node=abcd host=x peer=- requester=spawn%20cwd=/tmp\n".to_owned(),
+        nobody(&format!(
+            "DRIVE node=abcd host=x peer=-{REQUESTER_NOBODY}\n"
+        )),
     ] {
         assert!(
-            RelayHeader::parse(bad).is_err(),
+            RelayHeader::parse(&bad).is_err(),
+            "a drive's header names one well-formed requester: {bad:?}"
+        );
+    }
+    assert!(
+        RelayHeader::parse(&nobody("DRIVE node=abcd host=x peer=-\n")).is_ok(),
+        "CONTROL: the same header with its requester parses"
+    );
+    for bad in [
+        "".to_owned(),
+        "PING\n".to_owned(),
+        "APPLIES now\n".to_owned(),
+        "SURVEY content=2 drive=0 peer=-\n".to_owned(),
+        "SURVEY content=1 peer=-\n".to_owned(),
+        "SURVEY content=0 content=1 drive=0 peer=-\n".to_owned(),
+        "SURVEY content=0 drive=0 drive=1 peer=-\n".to_owned(),
+        "SURVEY content=0 drive=0 peer=- peer=-\n".to_owned(),
+        nobody("DRIVE node= host=x peer=-\n"),
+        nobody("DRIVE node=abcd peer=-\n"),
+        nobody("DRIVE node=abcd node=efgh host=x peer=-\n"),
+        nobody("DRIVE node=ab%0acd host=x peer=-\n"),
+        nobody("DRIVE node=abcd host=x%00y peer=-\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=-\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-a,,s-b\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-a,x-b\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-a sids=s-b\n"),
+        "ASK peer=-\n".to_owned(),
+        "ASK\n".to_owned(),
+        "ASK peer=127.0.0.1:1 more=1\n".to_owned(),
+    ] {
+        assert!(
+            RelayHeader::parse(&bad).is_err(),
             "malformed relay header must be rejected: {bad:?}"
         );
     }
@@ -308,6 +376,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         .map(|idx| SurveyAccountFact {
             pool: ["claude", "codex", "grok", "kimi"][idx % 4].to_owned(),
             id: format!("seat-{idx:02}"),
+            email: None,
             condition: "usable".to_owned(),
             enrolled: true,
             usage_5h_pct: Some((idx % 50) as u32),
@@ -321,7 +390,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         })
         .collect();
     let expected = SwarmSurveyFacts {
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         node: Some("11111111111111111111111111111111".to_owned()),
         label: Some("m22".to_owned()),
         roster_unread: false,
@@ -344,7 +413,13 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         repos: None,
     };
     let mut reply_lines: Vec<String> = Vec::new();
-    let base_wire = expected.to_survey_reply(pid, Some("m22.local"), 1_793_160_000_000, 1, false);
+    let base_wire = expected.to_survey_reply(
+        pid,
+        Some("m22.local"),
+        1_793_160_000_000,
+        1,
+        (FleetAccess::ReadOnly, false),
+    );
     for (idx, line) in base_wire.lines().skip(1).enumerate() {
         reply_lines.push(line.to_owned());
         if idx == 0 {
@@ -498,6 +573,69 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     assert_eq!(parsed_facts.label.as_deref(), Some("m7"));
     drop(dialed);
 
+    // 1b. Fleet access. Nothing stored a level in this state folder, so the node job enforces
+    //     Read Only: a granted driver's spawn, well formed or not, and its turn are refused by
+    //     the level and launch no window, on a Mac whose person is logged in (so only the lock
+    //     stands between the spawn and a window). The reads and the machine's own services
+    //     still answer in their own words.
+    let drive_line = |line: &str| {
+        let tcp = TcpStream::connect(addr).expect("connect drive");
+        let mut drive =
+            client_handshake_as(tcp, &secret, Some(&driver_id), FleetOp::Drive, DIAL_WITHIN)
+                .expect("drive handshake");
+        drive
+            .transport
+            .stream()
+            .write_all(drive_bytes(line).as_bytes())
+            .unwrap();
+        drive.transport.stream().flush().unwrap();
+        read_line_raw(drive.transport.stream(), 4096)
+            .expect("read the drive's answer")
+            .expect("an answer")
+    };
+    launcher.logged_in.store(true, Ordering::Release);
+    for (line, needs) in [
+        ("spawn agent=claude len=11\n", FleetAccess::Full),
+        ("spawn\n", FleetAccess::Full),
+        ("spawn cwd=/nowhere\n", FleetAccess::Full),
+        ("spawn \"open\n", FleetAccess::Full),
+        ("@s-1 turn hello\n", FleetAccess::ReadWrite),
+        ("@s-1 post kind=note -- hi\n", FleetAccess::ReadWrite),
+    ] {
+        let reply = drive_line(line);
+        assert_eq!(
+            FleetAccess::refused_at(&reply),
+            Some((FleetAccess::ReadOnly, needs)),
+            "{line:?} at Read Only: {reply}"
+        );
+        assert_eq!(
+            launcher.launches.load(Ordering::Acquire),
+            0,
+            "{line:?} launched a window on a Read Only Mac"
+        );
+    }
+    for line in [
+        "board\n",
+        "vault status\n",
+        "service-repair status\n",
+        "@s-1 status\n",
+    ] {
+        let reply = drive_line(line);
+        assert!(
+            !reply.starts_with(aterm_types::control_verbs::DRIVE_LOCKED),
+            "{line:?} is no act the lock refuses: {reply}"
+        );
+    }
+    assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    launcher.logged_in.store(false, Ordering::Release);
+    // The rest drives: this scratch Mac's person raises it, as `aterm fleet access full` does.
+    aterm_agent::fleet_access::set(
+        &state_dir,
+        FleetAccess::Full,
+        aterm_agent::fleet_access::By::Cli,
+    )
+    .expect("store Full Access");
+
     // 2. Windowless Drive with non-spawn verb refuses without launching a window.
     let tcp = TcpStream::connect(addr).expect("connect drive non-spawn");
     let mut drive_non_spawn =
@@ -506,7 +644,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     drive_non_spawn
         .transport
         .stream()
-        .write_all(b"@s-1 turn hello\n")
+        .write_all(drive_bytes("@s-1 turn hello\n").as_bytes())
         .unwrap();
     drive_non_spawn.transport.stream().flush().unwrap();
     let non_spawn_reply = read_line_raw(drive_non_spawn.transport.stream(), 4096)
@@ -531,7 +669,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         renewal
             .transport
             .stream()
-            .write_all(request.as_bytes())
+            .write_all(drive_bytes(request).as_bytes())
             .unwrap();
         renewal.transport.stream().flush().unwrap();
         let reply = read_line_raw(renewal.transport.stream(), 4096)
@@ -556,7 +694,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     drive_logged_out
         .transport
         .stream()
-        .write_all(b"spawn agent=claude len=11\n")
+        .write_all(drive_bytes("spawn agent=claude len=11\n").as_bytes())
         .unwrap();
     drive_logged_out.transport.stream().flush().unwrap();
     let logged_out_reply = read_line_raw(drive_logged_out.transport.stream(), 4096)
@@ -581,7 +719,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     drive_spawn
         .transport
         .stream()
-        .write_all(b"spawn agent=claude len=11\n")
+        .write_all(drive_bytes("spawn agent=claude len=11\n").as_bytes())
         .unwrap();
     drive_spawn.transport.stream().flush().unwrap();
     let go_line = read_line_raw(drive_spawn.transport.stream(), 4096)
@@ -644,8 +782,9 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
 /// A windowless node job over `state` on an ephemeral loopback port, admitting by `members`.
 /// The node job serves the drive grants of its fleet state only while that state was taken under
 /// the vault configured (`aterm_agent::fleet_vault`, ATERM-KI-1105-10): beside a record of another
-/// vault its listener serves no grant, `"*"` included, so no member drives this Mac by one; under
-/// the vault recorded, and in a job that reads no vault, it serves them as before.
+/// vault its listener serves no grant, `"*"` included, and its handshake policy refuses all
+/// traffic even with a denial list cached before the move. Under the vault recorded, and in a
+/// job that reads no vault, it serves them as before.
 ///
 /// NEGATIVE CONTROL (2026-11-05): `node_serving` serving `node_serving_now`'s grants unfiltered
 /// (`super::in_effect` dropped) fails "a fleet state taken under another vault serves no grant".
@@ -671,7 +810,15 @@ fn the_node_job_serves_no_grant_beside_a_fleet_taken_under_another_vault() {
         .unwrap();
     };
     configure("alab", 1);
-    aterm_agent::fleet_vault::keep(&state, Some(&vault));
+    let denied_cache = Mutex::new(super::DeniedCache::new());
+    aterm_net::fleet_member::write_held(&state, aterm_net::fleet_member::Began::Here, |book| {
+        book.keep_vault(Some(&format!(
+            "# take 01010101010101010101010101010101\nname 616c6162\nkey {}\n",
+            aterm_codec::hex::encode_lower(&[1; 32])
+        )))
+    })
+    .unwrap()
+    .unwrap();
     assert!(
         aterm_net::fleet_member::read_vault(&state)
             .unwrap()
@@ -694,19 +841,37 @@ fn the_node_job_serves_no_grant_beside_a_fleet_taken_under_another_vault() {
         1,
         "PRECONDITION: the default grant, under the vault it was taken under"
     );
+    assert!(super::denied_nodes_for(&state, Some(&vault), &denied_cache).is_some());
     configure("other", 9);
+    let denied = super::denied_nodes_for(&state, Some(&vault), &denied_cache);
+    assert!(
+        denied.is_none(),
+        "the old fleet secret admits no traffic under another vault"
+    );
+    assert!(
+        crate::fleet_listen::denied_under(denied.as_deref(), None).unread,
+        "the handshake refuses even though a usable deny list was cached before the move"
+    );
     assert_eq!(
         serving().grants,
         Vec::new(),
         "a fleet state taken under another vault serves no grant"
     );
-    let unread = super::node_serving((Some(config), state, None), running.clone(), running);
+    let unread = super::node_serving(
+        (Some(config), state.clone(), None),
+        running.clone(),
+        running,
+    );
     assert_eq!(
         unread().grants.len(),
         1,
         "a job that reads no vault serves its grants as before"
     );
     configure("alab", 1);
+    assert!(
+        super::denied_nodes_for(&state, Some(&vault), &denied_cache).is_some(),
+        "returning to the recorded vault restores traffic"
+    );
     assert_eq!(
         serving().grants.len(),
         1,
@@ -1029,17 +1194,151 @@ fn a_removed_node_is_refused_with_the_old_fleet_secret() {
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
 }
 
-/// A node job that has never read its deny list (its vault's `source.toml` other users may read,
-/// which the read refuses) refuses a Mac that proved the fleet secret, answering busy (`NO
-/// capacity`, which every dialer dials again after), and records nothing of it; once a read succeeds (no vault configured: a list that names
-/// no one) the same Mac joins, and a read that fails again after it keeps that list, so another
-/// Mac joins too.
-///
-/// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` answering an empty list while
-/// none was read (the shape before), the first join is admitted (`a node job with no deny list
-/// read must refuse a proven peer, got Ok(..)`).
+/// Even a cached deny list cannot restore unknown or corrupt custody.
 #[test]
-fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has() {
+fn unknown_custody_cannot_use_a_cached_deny_list() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    seed_fleet_node(&state);
+    let vault = aterm_secrets::client::Paths::for_home(root.path());
+    let cache = Mutex::new(super::DeniedCache::new());
+    super::update_denied_nodes_cache(
+        &mut cache.lock().unwrap(),
+        Ok(aterm_secrets::client::SwarmDenialSnapshot::Available(
+            Vec::new(),
+        )),
+    );
+    assert!(super::denied_nodes_for(&state, Some(&vault), &cache).is_none());
+    write_held(&state, Began::Here, |book| {
+        book.keep_vault(Some("corrupt custody"))
+    })
+    .unwrap()
+    .unwrap();
+    assert!(super::denied_nodes_for(&state, Some(&vault), &cache).is_none());
+    assert!(crate::fleet_listen::denied_under(None, None).refuses(None));
+}
+
+#[test]
+fn custody_move_rejects_an_old_secrets_open_facts_push() {
+    for (moved, retaken, logged) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let relays = crate::test_scratch::short_dir("custody-facts");
+        let state = root.path().join("state");
+        let (secret, host) = seed_fleet_node(&state);
+        let vault = aterm_secrets::client::Paths::for_home(root.path());
+        aterm_secrets::fsx::ensure_private_dir(&vault.dir).unwrap();
+        let configure = |name: &str, byte: u8| {
+            aterm_secrets::fsx::write_atomic(&vault.dir.join("source.toml"), format!(
+                "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = \"{}\"\nhost = \"m22\"\n",
+                aterm_secrets::b64::encode_padded(&[byte; 32]),
+            ).as_bytes(), 0o600).unwrap();
+        };
+        configure("alab", 1);
+        write_held(&state, Began::Here, |book| {
+            book.keep_vault(Some(&format!(
+                "# take 01010101010101010101010101010101\nname 616c6162\nkey {}\n",
+                aterm_codec::hex::encode_lower(&[1; 32]),
+            )))
+        })
+        .unwrap()
+        .unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let members = logged.then(|| {
+            let omitted = seed_id(&root.path().join("omitted"));
+            lab_log(
+                &root.path().join("records"),
+                &[(1, &host), (2, &omitted)],
+                2,
+            )
+        });
+        let (stop, server) = serve_node_reading(
+            listener,
+            root.path(),
+            relays.path(),
+            &state,
+            (members, Some(vault.clone())),
+        );
+        let peer = seed_id(&root.path().join("peer"));
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut open =
+            client_handshake_as(tcp, &secret, Some(&peer), FleetOp::Facts, DIAL_WITHIN).unwrap();
+        if moved {
+            configure("other", 9);
+        }
+        if retaken {
+            let taken = aterm_net::fleet_member::read_vault(&state)
+                .unwrap()
+                .unwrap()
+                .replace(
+                    "01010101010101010101010101010101",
+                    "02020202020202020202020202020202",
+                );
+            write_held(&state, Began::Here, |book| book.keep_vault(Some(&taken)))
+                .unwrap()
+                .unwrap();
+        }
+        let payload = SwarmSurveyFacts {
+            operation_lines: Vec::new(),
+            node: Some(peer.node().to_owned()),
+            label: None,
+            roster_unread: false,
+            version: "0.149.0".into(),
+            window: false,
+            window_last: None,
+            sessions: 0,
+            ssh_host_key: None,
+            accounts: Vec::new(),
+            accounts_unread: Vec::new(),
+            session_accounts: std::collections::BTreeMap::new(),
+            moves: None,
+            server_heard: Vec::new(),
+            home: None,
+            home_free_mb: None,
+            repos: None,
+        }
+        .to_survey_reply(
+            1,
+            Some("old-member"),
+            1,
+            0,
+            (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+        );
+        let stream = open.transport.stream();
+        stream
+            .get_ref()
+            .set_read_timeout(Some(DIAL_WITHIN))
+            .unwrap();
+        stream
+            .get_ref()
+            .set_write_timeout(Some(DIAL_WITHIN))
+            .unwrap();
+        let _ = stream
+            .write_all(payload.as_bytes())
+            .and_then(|()| stream.flush());
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        stop.set();
+        assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+        let facts = aterm_net::fleet_member::read_pushed_facts(&state);
+        assert_eq!(
+            facts.iter().any(|(node, _)| node == peer.node()),
+            !(moved || retaken)
+        );
+        assert_eq!(answer.starts_with(b"OK\n"), !(moved || retaken));
+    }
+}
+
+/// Unread local custody withdraws admission even when the deny cache retains a verified list.
+/// Removing the invalid configuration restores this explicitly standalone fleet's custody.
+#[test]
+fn a_node_job_with_unread_custody_refuses_even_with_a_retained_deny_list() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let relay_scratch = crate::test_scratch::short_dir("node-serve-unread");
@@ -1047,6 +1346,7 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
     let (secret, _host_id) = seed_fleet_node(&state);
     let vault = aterm_secrets::client::Paths::for_home(&root.path().join("home"));
     aterm_secrets::fsx::ensure_private_dir(&vault.dir).expect("vault dir");
+    aterm_agent::fleet_vault::take_fixture(&state, Some(&vault)).unwrap();
     let source = vault.dir.join("source.toml");
     let unreadable = || {
         std::fs::write(&source, b"name = \"team\"\n").expect("source");
@@ -1067,18 +1367,15 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
         (None, Some(vault.clone())),
     );
     let dial_join = |id: &NodeIdentity| {
-        let tcp = TcpStream::connect(addr).expect("connect");
+        let tcp = TcpStream::connect(addr).map_err(aterm_net::fleet::FleetError::Io)?;
         client_handshake_as(tcp, &secret, Some(id), FleetOp::Join, DIAL_WITHIN).map(|_| ())
     };
 
     let early = seed_id(&root.path().join("early-state"));
-    match dial_join(&early) {
-        Err(error) => assert!(
-            matches!(error, aterm_net::fleet::FleetError::AddressBusy),
-            "expected a busy answer to dial again, got {error:?}"
-        ),
-        Ok(()) => panic!("a node job with no deny list read must refuse a proven peer, got Ok(..)"),
-    }
+    assert!(
+        dial_join(&early).is_err(),
+        "unread custody must not start an admitting generation"
+    );
     assert!(
         !read_peers(&state)
             .expect("book")
@@ -1088,7 +1385,7 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
     );
 
     std::fs::remove_file(&source).expect("unconfigure the vault");
-    let (early_at, later_at) = (MemberPlace::bind(), MemberPlace::bind());
+    let early_at = MemberPlace::bind();
     let joined = join_as(addr, &secret, &early, &early_at);
     assert!(
         joined.is_ok(),
@@ -1097,10 +1394,17 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
 
     unreadable();
     let later = seed_id(&root.path().join("later-state"));
-    let kept = join_as(addr, &secret, &later, &later_at);
+    let refused = dial_join(&later);
     assert!(
-        kept.is_ok(),
-        "a failed read after a good one keeps that list: {kept:?}"
+        refused.is_err(),
+        "a retained deny list cannot override unread custody: {refused:?}"
+    );
+    assert!(
+        !read_peers(&state)
+            .unwrap()
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(later.node())),
+        "the refused Mac must stay out of the book"
     );
 
     stop.set();
@@ -1598,6 +1902,13 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
     let driver_dir = root.path().join("driver-state");
     let driver_id = seed_id(&driver_dir);
     let driver_at = seed_joined_driver(&state_dir, &driver_id);
+    // The grant admits the driver; this scratch Mac's fleet access admits its spawn.
+    aterm_agent::fleet_access::set(
+        &state_dir,
+        FleetAccess::Full,
+        aterm_agent::fleet_access::By::Cli,
+    )
+    .expect("store Full Access");
 
     // `sync.identity` writes `[ai]\nmachine = "m7"\n[fleet]\nmachine = "m7"\n` without explicit
     // `listen`, `allow`, or `drive_from`. A member node job must still serve `FleetOp::Drive`
@@ -1641,7 +1952,7 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
     drive_dial
         .transport
         .stream()
-        .write_all(b"spawn agent=claude len=11\n")
+        .write_all(drive_bytes("spawn agent=claude len=11\n").as_bytes())
         .unwrap();
     drive_dial.transport.stream().flush().unwrap();
     let go_line = read_line_raw(drive_dial.transport.stream(), 4096)
@@ -1911,6 +2222,13 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
         updates: None,
         mesh: NodeMesh::off(),
     };
+    // The turn and the spawn reach the busy window: this scratch Mac is at Full Access.
+    aterm_agent::fleet_access::set(
+        &state_dir,
+        FleetAccess::Full,
+        aterm_agent::fleet_access::By::Cli,
+    )
+    .expect("store Full Access");
     let server = std::thread::spawn(move || run_node_serve_with(cfg));
     driver_at.dialed();
     for (op, line) in [
@@ -1921,7 +2239,12 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
         let tcp = TcpStream::connect(addr).expect("connect");
         let mut dialed = client_handshake_as(tcp, &secret, Some(&driver_id), op, DIAL_WITHIN)
             .expect("handshake");
-        let _ = dialed.transport.stream().write_all(line.as_bytes());
+        let sent = if op == FleetOp::Drive {
+            drive_bytes(line)
+        } else {
+            line.to_owned()
+        };
+        let _ = dialed.transport.stream().write_all(sent.as_bytes());
         let _ = dialed.transport.stream().flush();
         let reply = read_line_raw(dialed.transport.stream(), 4096)
             .expect("read")
@@ -1945,7 +2268,7 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
     renewal
         .transport
         .stream()
-        .write_all(b"accounts-renew poll=0123456789abcdef0123456789abcdef\n")
+        .write_all(drive_bytes("accounts-renew poll=0123456789abcdef0123456789abcdef\n").as_bytes())
         .unwrap();
     renewal.transport.stream().flush().unwrap();
     let reply = read_line_raw(renewal.transport.stream(), 4096)
@@ -2103,9 +2426,15 @@ fn the_node_job_gives_up_the_account_claims_as_it_stops_only_while_no_window_run
 }
 
 /// Where the stand-in of [`a_sigterm_gives_up_the_node_jobs_claims_then_ends_the_job_by_it`]
-/// finds its relay directory, and where its `off` writes its marker.
+/// finds its relay directory, where its `off` writes its marker, where its host's quit step
+/// writes its own, and its fleet state directory.
 const OFF_RELAY: &str = "ATERM_TEST_NODE_CLAIMS_OFF_RELAY";
 const OFF_MARKER: &str = "ATERM_TEST_NODE_CLAIMS_OFF_MARKER";
+const HOST_STEP_MARKER: &str = "ATERM_TEST_NODE_HOST_STEP_MARKER";
+const QUIT_STATE: &str = "ATERM_TEST_NODE_QUIT_STATE";
+
+/// When the stand-in's book first heard its one member, and the times it hears it again at.
+const HEARD_MS: u64 = 1_793_160_000_000;
 
 /// A real quit signal closes both weak-tier logs. The unarmed child is the negative control:
 /// reopening at an unknown boot must move its generation after an unclean stop.
@@ -2159,7 +2488,7 @@ fn a_sigterm_closes_and_flushes_both_mesh_logs() {
             }
         }
         if std::env::var_os(ARMED).is_some() {
-            arm_claims_off_on_quit(state.join("relay"), || {});
+            arm_claims_off_on_quit(state.join("relay"), state.clone(), || {});
         }
         let pid = libc::pid_t::try_from(std::process::id()).expect("pid");
         // SAFETY: signal this test's stand-in process itself.
@@ -2238,20 +2567,79 @@ fn off_marks() {
     }
 }
 
+/// The stand-in host's quit step (`crate::host_quit::install`): a marker that it ran.
+fn host_step_marks() {
+    if let Some(marker) = std::env::var_os(HOST_STEP_MARKER) {
+        std::fs::write(marker, b"step").expect("the host step's marker");
+    }
+}
+
+/// The stand-in's fleet state: a book of one member in `state`, heard again twice as a
+/// process that stays hears it. The first time it notes is written at once and the second,
+/// inside the pace, is held in the process (`aterm_net::fleet_member::SEEN_FLUSH_EVERY`): a
+/// test binary starts no thread to write it later.
+fn hold_a_noted_time(state: &Path) {
+    let heard = |at: u64| {
+        write_held(state, Began::Here, |book| {
+            book.update_paced(|peers| {
+                peers[0].seen_ms = Some(at);
+                Ok(())
+            })
+            .expect("the member is heard");
+        })
+        .expect("the book's lock");
+    };
+    write_held(state, Began::Here, |book| {
+        book.update(|peers| {
+            aterm_net::fleet_member::record(
+                peers,
+                Peer {
+                    node: Some("a1".repeat(16)),
+                    key: None,
+                    key_from: None,
+                    host: "a.local".to_owned(),
+                    addr: Some(Ipv4Addr::LOCALHOST.into()),
+                    port: 7100,
+                    version: Some("0.146.0".to_owned()),
+                    seen_ms: Some(HEARD_MS),
+                    via: Via::Joined,
+                    fleet: None,
+                    signed: None,
+                },
+            )
+        })
+        .expect("the member is recorded");
+    })
+    .expect("the book's lock");
+    heard(HEARD_MS + 1_000);
+    heard(HEARD_MS + 2_000);
+}
+
 /// A SIGTERM TO THE NODE JOB GIVES UP ITS CLAIMS, THEN ENDS THE JOB BY IT
 /// (docs/DESIGN-fluid-swarm-2026-10-28.md F19): armed as `run_node_serve` arms it, launchd's
 /// SIGTERM runs the job's `off` where no window's relay is live and not where one is, and either
 /// way the job then dies of that SIGTERM. A stand-in process of this test is the job, its `off` a
 /// marker.
 ///
+/// THE SAME SIGTERM RUNS THE HOST'S QUIT STEP AND WRITES THE FLEET TIMES THE JOB HOLDS, whether
+/// or not a window runs: launchd's SIGTERM is the job's usual end, and its serve loop never
+/// returns for it. The stand-in installs a step that leaves a marker (production's stops the
+/// Commons runtime, which closes the network history) and holds one noted time unwritten.
+///
 /// NEGATIVE CONTROL: drop the stand-in's `arm_claims_off_on_quit` call (the job unarmed, as
-/// before), and it dies of its SIGTERM with no marker where no window runs.
+/// before), and it dies of its SIGTERM with no marker where no window runs. Drop
+/// `crate::host_quit::run()` from the armed quit and the step's marker is missing; drop
+/// `write_seen_at_quit` from it and the seen file holds only the time written before.
 #[test]
 fn a_sigterm_gives_up_the_node_jobs_claims_then_ends_the_job_by_it() {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     if let Some(relay) = std::env::var_os(OFF_RELAY) {
+        let state = std::path::PathBuf::from(std::env::var_os(QUIT_STATE).expect("its state"));
+        crate::host_quit::install(host_step_marks);
+        hold_a_noted_time(&state);
         // The stand-in starts with SIGTERM at its default (`StandIn`), which the arming needs.
-        arm_claims_off_on_quit(std::path::PathBuf::from(relay), off_marks);
+        arm_claims_off_on_quit(std::path::PathBuf::from(relay), state, off_marks);
         let pid = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
         // SAFETY: a signal to this stand-in process itself.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
@@ -2269,11 +2657,18 @@ fn a_sigterm_gives_up_the_node_jobs_claims_then_ends_the_job_by_it() {
                 .expect("a live window's relay");
         }
         let marker = scratch.path().join("off");
+        let step = scratch.path().join("step");
+        let fleet = scratch.path().join("fleet");
+        std::fs::create_dir(&fleet).expect("fleet state dir");
+        std::fs::set_permissions(&fleet, std::fs::Permissions::from_mode(0o700))
+            .expect("a private state dir");
         let mut stand_in = crate::test_alone::StandIn::this_test();
         stand_in
             .command()
             .env(OFF_RELAY, &relay)
-            .env(OFF_MARKER, &marker);
+            .env(OFF_MARKER, &marker)
+            .env(HOST_STEP_MARKER, &step)
+            .env(QUIT_STATE, &fleet);
         let ran = stand_in.spawn().selected();
         let status = ran.status.expect("the stand-in exited");
         assert_eq!(
@@ -2291,6 +2686,19 @@ fn a_sigterm_gives_up_the_node_jobs_claims_then_ends_the_job_by_it() {
             } else {
                 "no window ran, and the job died with its claims standing"
             },
+            ran.stderr
+        );
+        assert!(
+            step.exists(),
+            "window = {window}: the job died of its SIGTERM with its host's quit step not run\n{}",
+            ran.stderr
+        );
+        let seen = std::fs::read_to_string(fleet.join(aterm_net::fleet_member::SEEN_FILE))
+            .expect("the seen file");
+        assert!(
+            seen.contains(&format!("ms={}\n", HEARD_MS + 2_000)),
+            "window = {window}: the job died of its SIGTERM holding a noted time unwritten: \
+             {seen}\n{}",
             ran.stderr
         );
     }
@@ -2693,6 +3101,18 @@ struct ScriptedUpdater {
     stop: Arc<Stop>,
     started: Instant,
     advanced: std::sync::Mutex<Duration>,
+    /// What the next minding of the checker says ends the run.
+    stuck: std::sync::Mutex<Option<String>>,
+    /// The next look at a waiting build panics.
+    look_panics: AtomicBool,
+    /// The next confirm of the boot trial panics.
+    confirm_panics: AtomicBool,
+    /// How many of the next looks cannot start.
+    look_spawn_failures: AtomicUsize,
+    /// An installed activation a window here failed to switch to, and the newer stage waiting.
+    failed: std::sync::Mutex<Option<(u64, u64)>>,
+    /// The installs over a failed activation run.
+    failed_installs: AtomicUsize,
 }
 
 impl ScriptedUpdater {
@@ -2716,6 +3136,12 @@ impl ScriptedUpdater {
             stop: Arc::new(Stop::new()),
             started: Instant::now(),
             advanced: std::sync::Mutex::new(Duration::ZERO),
+            stuck: std::sync::Mutex::new(None),
+            look_panics: AtomicBool::new(false),
+            confirm_panics: AtomicBool::new(false),
+            look_spawn_failures: AtomicUsize::new(0),
+            failed: std::sync::Mutex::new(None),
+            failed_installs: AtomicUsize::new(0),
         }
     }
 
@@ -2738,6 +3164,19 @@ impl ScriptedUpdater {
 }
 
 impl NodeUpdater for ScriptedUpdater {
+    fn spawn_look(&self, look: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        if self
+            .look_spawn_failures
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        std::thread::spawn(look);
+        Ok(())
+    }
     fn start_checker(&self, noticed: Box<dyn Fn() + Send>) {
         if let Some(build) = self.stages {
             *lock(&self.newer) = Some(build);
@@ -2748,6 +3187,10 @@ impl NodeUpdater for ScriptedUpdater {
 
     fn newer_build(&self) -> Option<u64> {
         self.looks.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            !self.look_panics.swap(false, Ordering::AcqRel),
+            "the scripted look panics"
+        );
         *lock(&self.newer)
     }
 
@@ -2767,6 +3210,10 @@ impl NodeUpdater for ScriptedUpdater {
 
     fn confirm_trial(&self) -> bool {
         self.confirms.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            !self.confirm_panics.swap(false, Ordering::AcqRel),
+            "the scripted confirm panics"
+        );
         let lands = self.confirms_land.load(Ordering::Acquire);
         if lands {
             self.trial_pending.store(false, Ordering::Release);
@@ -2787,8 +3234,22 @@ impl NodeUpdater for ScriptedUpdater {
         self.checks_moved.load(Ordering::Acquire)
     }
 
-    fn mind_checker(&self) {
+    fn failed_activation(&self) -> Option<(u64, u64)> {
+        *lock(&self.failed)
+    }
+
+    fn install_over_failed_activation(&self, waiting: (u64, u64)) -> Option<String> {
+        self.failed_installs.fetch_add(1, Ordering::AcqRel);
+        let mut failed = lock(&self.failed);
+        assert_eq!(*failed, Some(waiting), "installs over what the look found");
+        failed.take().map(|(activation, newer)| {
+            format!("scripted: build {newer} installed over {activation}")
+        })
+    }
+
+    fn mind_checker(&self) -> Option<String> {
         self.minds.fetch_add(1, Ordering::AcqRel);
+        lock(&self.stuck).take()
     }
 
     fn restart(&self, why: &str) {
@@ -2831,7 +3292,7 @@ impl WindowRelay {
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the window's relay answers",
-            || a_window_relay_answers(relay_dir).then_some(()),
+            || a_window_that_applies_answers(relay_dir).then_some(()),
         );
         Self {
             stop,
@@ -2847,6 +3308,116 @@ impl Drop for WindowRelay {
             let _ = serving.join();
         }
     }
+}
+
+/// A relay of this test process whose process says it never applies, as `aterm --headless` and a
+/// dev bundle do, and which still takes the fleet's hand-overs.
+fn relay_that_never_applies(relay_dir: &Path) -> WindowRelay {
+    relay_answering(relay_dir, || false)
+}
+
+/// A relay of this test process that answers [`RelayHeader::Applies`] with what `applies` says at
+/// each ask, and which still takes the fleet's hand-overs.
+fn relay_answering(
+    relay_dir: &Path,
+    applies: impl Fn() -> bool + Send + Sync + 'static,
+) -> WindowRelay {
+    relay_answering_as(relay_dir, std::process::id(), applies)
+}
+
+/// [`relay_answering`] under the relay name of live process `pid`.
+fn relay_answering_as(
+    relay_dir: &Path,
+    pid: u32,
+    applies: impl Fn() -> bool + Send + Sync + 'static,
+) -> WindowRelay {
+    let stop = Arc::new(AtomicBool::new(false));
+    let serving = {
+        let dir = relay_dir.to_path_buf();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _ = serve_window_relay_at(
+                &dir,
+                pid,
+                Some(&stop),
+                |_: &SessionId| true,
+                move |header, stream| match header {
+                    RelayHeader::Applies => super::answer_applies(stream, applies()),
+                    _ => true,
+                },
+            );
+        })
+    };
+    // Its own socket taking a connect, as another relay may already serve this folder.
+    let own = relay_socket_path(relay_dir, pid);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the relay's socket", || {
+        super::relay_answers(&own).then_some(())
+    });
+    WindowRelay {
+        stop,
+        serving: Some(serving),
+    }
+}
+
+/// A PROCESS THAT NEVER APPLIES HOLDS NO UPDATE: `aterm --headless` or a dev bundle serves a relay
+/// so the fleet reaches it, and the job used to read that as a window that applies its own, which
+/// held a staged build for as long as that process stayed. CONTROL: it is still a live relay to the
+/// fleet, and a relay that says it applies holds the same build.
+#[test]
+fn a_relay_that_never_applies_holds_no_update() {
+    let relay = crate::test_scratch::short_dir("node-update-never");
+    let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
+    let boot = NodeBoot::nothing_at(updater.started);
+    updater.stage(2);
+
+    let window = relay_that_never_applies(relay.path());
+    assert!(
+        has_live_window_relay(relay.path()),
+        "CONTROL: the fleet still reaches it"
+    );
+    assert!(!a_window_that_applies_answers(relay.path()));
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "it applies nothing, so the job does"
+    );
+    drop(window);
+
+    let window = WindowRelay::open(relay.path());
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "CONTROL: a window that applies holds it"
+    );
+    drop(window);
+}
+
+/// What a relay answers decides nothing but `no`: an older build refuses the command it does not
+/// know, and one that answers nothing cannot be told from a window, so each is held for as before.
+#[test]
+fn only_a_relays_no_says_it_never_applies() {
+    assert!(!super::relay_reply_applies(Some("no\n")));
+    for reply in [
+        Some("yes\n"),
+        Some("OK\n"),
+        Some("ERR unknown relay command\n"),
+        None,
+    ] {
+        assert!(super::relay_reply_applies(reply), "{reply:?}");
+    }
+}
+
+/// Which process says it applies: a window on a copy the updater may replace. Off macOS nothing
+/// asks, and no read of the copy says otherwise.
+#[test]
+fn only_a_window_on_an_installable_copy_applies_updates() {
+    use super::window_applies_updates as applies;
+    assert!(applies(false, Some(true)), "an installed window");
+    assert!(!applies(true, Some(true)), "aterm --headless");
+    assert!(!applies(false, Some(false)), "a dev bundle or a bare build");
+    assert!(!applies(true, Some(false)));
+    assert!(applies(false, None), "off macOS");
 }
 
 /// Leave a relay file named for this live process that nothing listens on: its window crashed.
@@ -2959,7 +3530,7 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
                 (found == pid && libc::WIFSTOPPED(status)).then_some(())
             },
         );
-        let answers = a_window_relay_answers(relay.path());
+        let answers = a_window_that_applies_answers(relay.path());
         drop(child);
         answers
     };
@@ -2981,6 +3552,7 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
 fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
     let relay = crate::test_scratch::short_dir("node-update-restart");
     let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
     let boot = NodeBoot::nothing_at(updater.started);
     assert_eq!(
         restart_for(&updater, boot, relay.path()),
@@ -3007,7 +3579,7 @@ fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
         "CONTROL: by its live pid alone, a relay file whose listener is gone reads as a window"
     );
     assert!(
-        !a_window_relay_answers(relay.path()),
+        !a_window_that_applies_answers(relay.path()),
         "a relay file nothing listens on answered"
     );
     assert_eq!(
@@ -3076,14 +3648,39 @@ fn a_relay_file_answers_while_a_copy_of_its_listener_lives() {
         .expect("a relay listener");
     let copy = aterm_uds::kept_out(|| listener.try_clone()).expect("a copy of its descriptor");
     drop(listener);
-    assert!(
-        a_window_relay_answers(relay.path()),
-        "CONTROL: a listener closed here answers through a copy of its descriptor"
+    let receive = std::thread::spawn(move || {
+        let request = (|| {
+            let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            let (mut stream, _) = aterm_uds::accept(
+                &copy,
+                aterm_uds::AcceptWait::Until(until),
+                aterm_uds::AcceptedMode::Blocking,
+            )?;
+            stream.set_read_timeout(Some(until.saturating_duration_since(Instant::now())))?;
+            // No reply: EOF exercises the same conservative decision as a silent old relay,
+            // without spending its timeout in this descriptor-lifetime control.
+            read_line_raw(&mut stream, super::RELAY_HEADER_MAX)
+        })();
+        // The join result retains the listener until the actual product probe has returned.
+        (copy, request)
+    });
+    let answers = a_window_that_applies_answers(relay.path());
+    let (copy, request) = crate::test_socket::join_after_hang_up(
+        receive,
+        "the copied listener finishes the probe's request",
     );
     drop(copy);
+    assert_eq!(
+        request.expect("the copied listener reads the real probe"),
+        Some(RelayHeader::Applies.encode())
+    );
+    assert!(
+        answers,
+        "CONTROL: a listener closed here answers through a copy of its descriptor"
+    );
     let held = stale_relay_file(relay.path());
     assert!(
-        !a_window_relay_answers(relay.path()),
+        !a_window_that_applies_answers(relay.path()),
         "a stale relay file answers nothing while its descriptor lives"
     );
     drop(held);
@@ -3190,6 +3787,492 @@ fn serve_updating(
     std::thread::spawn(move || run_node_serve_with(cfg))
 }
 
+/// A WINDOW IN ITS TEARDOWN APPLIES NOTHING: its update lane ended with its event loop and its relay
+/// answers on, so a teardown stuck on a blocked write left the node job waiting on a window that would
+/// never apply.
+#[test]
+fn a_window_whose_event_loop_ended_stops_saying_it_applies() {
+    let window = super::WindowApplies::new();
+    let now = Instant::now();
+    assert!(window.answer(true, now));
+    assert!(!window.answer(false, now));
+    window.stop();
+    assert!(!window.answer(true, now));
+    window.note_lane(super::WindowUpdateLane::PersonHolds, Some(2));
+    assert!(
+        !window.answer(true, now),
+        "an ended loop's last word cannot bring it back"
+    );
+}
+
+/// A WINDOW THAT HOLDS A STAGED BUILD PAST THE BOUND LETS THE NODE JOB INSTALL IT: the relay's
+/// answer was read once for the process, so a window whose automatic lane stood down for six hours
+/// after a failed switch, or whose intent stayed blocked, still said it applied, and the job left
+/// the build staged as long as the window ran. The answer is now live. A lane that leaves the build
+/// says `no` at once, and one that may still land it holds the job for
+/// [`super::WINDOW_HOLDS_AN_UPDATE_WITHIN`] of unbroken asks. CONTROL: a person's setting holds
+/// the job however long, and the job's own reading of `auto_apply = false` installs nothing.
+#[test]
+fn a_window_that_holds_an_update_past_the_bound_lets_the_node_job_install_it() {
+    use super::{WINDOW_HOLDS_AN_UPDATE_WITHIN as BOUND, WindowApplies, WindowUpdateLane};
+    let relay = crate::test_scratch::short_dir("node-update-live-answer");
+    let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
+    let boot = NodeBoot::nothing_at(updater.started);
+    updater.stage(2);
+
+    // The window's answer, on a clock the test moves: each ask reads `base + offset`.
+    let window = Arc::new(WindowApplies::new());
+    let offset = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let base = Instant::now();
+    let _relay = {
+        let (window, offset) = (Arc::clone(&window), Arc::clone(&offset));
+        relay_answering(relay.path(), move || {
+            window.answer(true, base + *offset.lock_or_recover())
+        })
+    };
+    let ask_at = |at: Duration| {
+        *offset.lock_or_recover() = at;
+        restart_for(&updater, boot, relay.path())
+    };
+    let minute = Duration::from_secs(60);
+
+    window.note_lane(WindowUpdateLane::Lands, Some(2));
+    assert_eq!(
+        ask_at(Duration::ZERO),
+        None,
+        "CONTROL: a window that may land it holds it"
+    );
+    assert_eq!(ask_at(BOUND / 2), None);
+    assert_eq!(ask_at(BOUND - minute), None, "…for the whole bound");
+    assert_eq!(
+        ask_at(BOUND),
+        Some(2),
+        "THE STALL: a window that has held the job for the bound without landing the build \
+         lets the job install it"
+    );
+    assert_eq!(ask_at(BOUND + minute), Some(2), "and keeps letting it");
+
+    window.note_lane(WindowUpdateLane::Lands, Some(3));
+    assert_eq!(
+        ask_at(BOUND + 2 * minute),
+        None,
+        "another staged build starts its own bound"
+    );
+
+    window.note_lane(WindowUpdateLane::Leaves, Some(3));
+    assert_eq!(
+        ask_at(BOUND + 3 * minute),
+        Some(2),
+        "THE STALL: a window whose lane stood down for its build says so at once"
+    );
+
+    window.note_lane(WindowUpdateLane::PersonHolds, Some(3));
+    for hours in [1, 6, 48] {
+        assert_eq!(
+            ask_at(BOUND + Duration::from_secs(hours * 3600)),
+            None,
+            "CONTROL: a person's setting holds the update with no bound ({hours} h)"
+        );
+    }
+
+    window.note_lane(WindowUpdateLane::Activates, Some(3));
+    assert_eq!(
+        ask_at(BOUND + Duration::from_secs(48 * 3600 + 60)),
+        None,
+        "CONTROL: bytes already installed in the window's place wait for its switch, whose boot \
+         trial a start of the job's own would not count"
+    );
+
+    window.note_lane(WindowUpdateLane::Leaves, Some(3));
+    updater.auto_apply.store(false, Ordering::Release);
+    assert_eq!(
+        ask_at(BOUND + Duration::from_secs(49 * 3600)),
+        None,
+        "CONTROL: the job reads `auto_apply = false` itself, whatever a window says"
+    );
+}
+
+/// How long a window holds the node job: the clock runs from the job's first ask while the lane
+/// may land the build, and a person's hold, a lane that leaves it, another staged build or a
+/// silence past [`super::ASKS_UNBROKEN_WITHIN`] each end the run. Neither the job's look interval
+/// nor its hour's pause after a failed boot restarts it.
+#[test]
+fn a_windows_hold_on_the_node_job_runs_out_once_and_restarts_only_on_news() {
+    use super::{
+        ASKS_UNBROKEN_WITHIN, HoldAnswer, RETRY_LEFT_AFTER, WINDOW_HOLDS_AN_UPDATE_WITHIN as BOUND,
+        WindowHold,
+        WindowUpdateLane::{Activates, Lands, Leaves, PersonHolds},
+    };
+    let t0 = Instant::now();
+    let minute = Duration::from_secs(60);
+    let held = |holds| HoldAnswer {
+        holds,
+        ran_out: None,
+    };
+    let mut hold = WindowHold::default();
+    assert_eq!(hold.ask(Lands, 7, t0), held(true));
+    assert_eq!(hold.ask(Lands, 7, t0 + BOUND - minute), held(true));
+    assert_eq!(
+        hold.ask(Lands, 7, t0 + BOUND),
+        HoldAnswer {
+            holds: false,
+            ran_out: Some(BOUND),
+        },
+        "the run ends at the bound, and says so once"
+    );
+    assert_eq!(hold.ask(Lands, 7, t0 + BOUND + minute), held(false));
+
+    let mut paused = WindowHold::default();
+    assert_eq!(paused.ask(Lands, 7, t0), held(true));
+    let after_pause = t0 + RETRY_LEFT_AFTER + minute;
+    assert!(after_pause - t0 < ASKS_UNBROKEN_WITHIN);
+    assert!(
+        !paused.ask(Lands, 7, after_pause).holds,
+        "the job's hour-long pause after a failed boot does not restart the window's bound"
+    );
+
+    let mut silent = WindowHold::default();
+    assert_eq!(silent.ask(Lands, 7, t0), held(true));
+    let much_later = t0 + ASKS_UNBROKEN_WITHIN + minute;
+    assert_eq!(
+        silent.ask(Lands, 7, much_later),
+        held(true),
+        "a silence longer than any pause of a deferring job starts a new run"
+    );
+    assert!(!silent.ask(Lands, 7, much_later + BOUND).holds);
+
+    let mut moved = WindowHold::default();
+    assert_eq!(moved.ask(Lands, 7, t0), held(true));
+    assert!(!moved.ask(Lands, 7, t0 + BOUND).holds);
+    assert_eq!(
+        moved.ask(Lands, 8, t0 + BOUND + minute),
+        held(true),
+        "another staged build starts a new run"
+    );
+
+    for (lane, answer) in [(PersonHolds, true), (Activates, true), (Leaves, false)] {
+        let mut ended = WindowHold::default();
+        assert_eq!(ended.ask(Lands, 7, t0), held(true));
+        assert_eq!(ended.ask(lane, 7, t0 + BOUND * 3), held(answer), "{lane:?}");
+        assert_eq!(
+            ended.ask(Lands, 7, t0 + BOUND * 3 + minute),
+            held(true),
+            "{lane:?} ended the run, so a lane that may land it again has its whole bound"
+        );
+    }
+}
+
+/// Which window lanes hold the node job. A person's setting holds it with no bound, as does a build
+/// already installed in the window's place, whose boot trial waits on this window's switch. An
+/// automatic lane that may land the download holds it within the bound. Every posture that will
+/// not land the download by itself holds it not at all.
+#[test]
+fn a_windows_posture_decides_whether_it_holds_the_node_job() {
+    use super::WindowUpdateLane::{self as Lane, Activates, Lands, Leaves, PersonHolds};
+    use crate::app_update_handoff::HandoffUnavailable;
+    use crate::update_words::{ApplyPosture as P, AutoApplyVeto};
+    assert_eq!(
+        Lane::of(false, false, None),
+        Lands,
+        "nothing staged in the window's view"
+    );
+    assert_eq!(Lane::of(true, false, None), PersonHolds);
+    let disabled = |veto| P::HandoffDisabled {
+        why: HandoffUnavailable::UnownedControlSocket,
+        veto,
+        image_kept: false,
+    };
+    for (posture, lane) in [
+        (P::Automatic, Lands),
+        (P::ManualByConfig, PersonHolds),
+        (
+            P::VetoedByEnv {
+                var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+            },
+            PersonHolds,
+        ),
+        (disabled(Some(AutoApplyVeto::Config)), PersonHolds),
+        (disabled(None), Leaves),
+        (P::ManualOnlyLatched { lapses: true }, Leaves),
+        (P::ManualOnlyLatched { lapses: false }, Leaves),
+        (P::TrialSpent, Leaves),
+        (P::AtNextLaunch, Leaves),
+    ] {
+        assert_eq!(Lane::of(false, false, Some(posture)), lane, "{posture:?}");
+        assert_eq!(
+            Lane::of(false, true, Some(posture)),
+            Activates,
+            "bytes already installed in the window's place leave the job nothing to install, and \
+             a start of its own on them would not count against the window's trial: {posture:?}"
+        );
+        for activation in [false, true] {
+            assert_eq!(
+                Lane::of(true, activation, Some(posture)),
+                PersonHolds,
+                "a person's setting outranks every posture: {posture:?}"
+            );
+        }
+    }
+}
+
+/// SEVERAL WINDOWS HOLD THE JOB NO LONGER THAN ONE: each window's hold runs from the asks it
+/// hears, and the job stopped at the first relay that said it applied, so a second window heard
+/// its first ask only once the first had run out, and two windows held a build for two bounds.
+/// Every relay hears every ask.
+#[test]
+fn every_window_relay_hears_the_node_jobs_ask() {
+    let relay = crate::test_scratch::short_dir("node-update-every-relay");
+    let asked = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    // Two live processes' relay names: this test's and its runner's.
+    let pids = [std::process::id(), std::os::unix::process::parent_id()];
+    let _relays: Vec<WindowRelay> = pids
+        .iter()
+        .zip(&asked)
+        .map(|(&pid, asked)| {
+            let asked = Arc::clone(asked);
+            relay_answering_as(relay.path(), pid, move || {
+                asked.fetch_add(1, Ordering::AcqRel);
+                true
+            })
+        })
+        .collect();
+    assert!(a_window_that_applies_answers(relay.path()));
+    assert_eq!(
+        asked.each_ref().map(|asked| asked.load(Ordering::Acquire)),
+        [1, 1],
+        "THE STALL: every window hears the ask, so every window's hold runs from it"
+    );
+}
+
+/// A WATCH THREAD THAT PANICS CANNOT KEEP A RUN FROM ENDING: the serve loop reads only its
+/// listener's stop, and only that thread turned `stop` into it, so after a panic a newer build's
+/// restart was never read and the job served the old build until the next logout. The generation
+/// ends with the thread, and the run with the next `stop`.
+#[test]
+fn a_watch_thread_that_panics_cannot_keep_a_run_from_ending() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let relay = crate::test_scratch::short_dir("node-update-watch-panics");
+    let state = root.path().join("state");
+    let _ = seed_fleet_node(&state);
+    let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = prebound.local_addr().expect("its address");
+    let config = format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    updater.confirm_panics.store(true, Ordering::Release);
+    let server = serve_updating(
+        root.path(),
+        &state,
+        relay.path(),
+        &updater,
+        (&config, Some(prebound)),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the watch thread reaches its panic",
+        || (!updater.confirm_panics.load(Ordering::Acquire)).then_some(()),
+    );
+    updater.trial_pending.store(false, Ordering::Release);
+    updater.stage(2);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the run ends for the waiting build",
+        || server.is_finished().then_some(()),
+    );
+    assert_eq!(server.join().expect("the job's thread"), ExitCode::SUCCESS);
+    assert_eq!(updater.restarts().len(), 1, "{:?}", updater.restarts());
+}
+
+/// A LOOK THAT PANICS COSTS THAT LOOK: the thread that looks is the only one that restarts this run
+/// for a newer build or a stuck check, so losing it ended both for as long as the job stayed up.
+#[test]
+fn a_look_that_panics_looks_again() {
+    let relay = crate::test_scratch::short_dir("node-update-look-panics");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    updater.look_panics.store(true, Ordering::Release);
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    spawn_node_updates(
+        &updates,
+        relay.path().to_path_buf(),
+        Arc::clone(&updater.stop),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job looks past its panic",
+        || (updater.looks.load(Ordering::Acquire) >= 2).then_some(()),
+    );
+    updater.trial_pending.store(false, Ordering::Release);
+    updater.stage(2);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the run ends for the waiting build",
+        || (!updater.restarts().is_empty()).then_some(()),
+    );
+}
+
+/// A LOOK THAT NEVER ANSWERS COSTS ITS BOUND: a read of `aterm.toml` through a symlink onto a volume
+/// that stopped answering, or behind a dialog nobody answers, held the thread that restarts the run
+/// with no bound. The look answers its fallback, and while the read stays out the next asks answer at
+/// once and start no second one. CONTROL: a read that answers gives its own answer.
+#[test]
+fn a_look_that_never_answers_costs_its_bound() {
+    static LOOKS: aterm_uds::deadline::Gate =
+        aterm_uds::deadline::Gate::new("aterm-node-test-look");
+    assert!(
+        !super::look_within(
+            &LOOKS,
+            aterm_spec::wait::MUST_HAPPEN,
+            "a read",
+            true,
+            || false
+        ),
+        "CONTROL: a read that answers"
+    );
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    assert!(
+        super::look_within(
+            &LOOKS,
+            Duration::from_millis(50),
+            "a read",
+            true,
+            move || {
+                let _ = released.recv();
+                false
+            }
+        ),
+        "the read stays out: the fallback"
+    );
+    assert!(
+        super::look_within(
+            &LOOKS,
+            aterm_spec::wait::MUST_HAPPEN,
+            "a read",
+            true,
+            || false
+        ),
+        "while it stays out, the next ask is refused at once"
+    );
+    assert_eq!(LOOKS.running(), 1, "no second read started");
+    drop(release);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the stuck read returns",
+        || (LOOKS.running() == 0).then_some(()),
+    );
+    assert!(
+        !super::look_within(
+            &LOOKS,
+            aterm_spec::wait::MUST_HAPPEN,
+            "a read",
+            true,
+            || false
+        ),
+        "once it returns, a look answers again"
+    );
+}
+
+/// A LOOK THAT COULD NOT START STARTS WHILE A GENERATION SERVES: it was asked for again only between
+/// generations, and a generation can last as long as the job, so a build waiting here was held for
+/// that long. It ended no run in the meantime, since a run ended there counted a launch against a
+/// boot trial each time. Two fail: the run's own and the one its loop asks for before it serves.
+#[test]
+fn a_look_that_could_not_start_starts_while_a_generation_serves() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let relay = crate::test_scratch::short_dir("node-update-owed-look");
+    let state = root.path().join("state");
+    let _ = seed_fleet_node(&state);
+    let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = prebound.local_addr().expect("its address");
+    let config = format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    updater.look_spawn_failures.store(2, Ordering::Release);
+    let server = serve_updating(
+        root.path(),
+        &state,
+        relay.path(),
+        &updater,
+        (&config, Some(prebound)),
+    );
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the look starts", || {
+        (updater.looks.load(Ordering::Acquire) >= 1).then_some(())
+    });
+    assert!(updater.restarts().is_empty(), "no run ended for it");
+    updater.trial_pending.store(false, Ordering::Release);
+    updater.stage(2);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the run ends for the waiting build",
+        || server.is_finished().then_some(()),
+    );
+    assert_eq!(server.join().expect("the job's thread"), ExitCode::SUCCESS);
+    assert_eq!(updater.restarts().len(), 1, "{:?}", updater.restarts());
+}
+
+/// A LOOK WITH NO NOTICES LOOKS ON THE CLOCK: the look started again after one that could not start
+/// has no checker behind it, so its channel's sender is gone from the first turn. It still finds a
+/// build another process staged, and ends the run for it.
+#[test]
+fn a_look_with_no_notices_looks_on_the_clock() {
+    let relay = crate::test_scratch::short_dir("node-update-clock");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    updater.trial_pending.store(false, Ordering::Release);
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    assert!(super::spawn_node_look(
+        &updates,
+        relay.path().to_path_buf(),
+        Arc::clone(&updater.stop),
+        std::sync::mpsc::sync_channel::<()>(1).1,
+    ));
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the look goes round", || {
+        (updater.looks.load(Ordering::Acquire) >= 2).then_some(())
+    });
+    *lock(&updater.newer) = Some(2);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the look ends the run",
+        || (!updater.restarts().is_empty()).then_some(()),
+    );
+}
+
+/// A SETTING THAT DOES NOT ANSWER HOLDS THIS LOOK: answering on let a stuck read install over a
+/// person's `auto_apply = false`. CONTROL: a read that answers on is read.
+#[test]
+fn a_setting_that_does_not_answer_holds_this_look() {
+    static READS: aterm_uds::deadline::Gate =
+        aterm_uds::deadline::Gate::new("aterm-node-test-setting");
+    assert!(
+        super::auto_apply_look(&READS, aterm_spec::wait::MUST_HAPPEN, || true),
+        "CONTROL: a read that answers"
+    );
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    assert!(
+        !super::auto_apply_look(&READS, Duration::from_millis(50), move || {
+            let _ = released.recv();
+            true
+        }),
+        "the read stays out: this look holds"
+    );
+    assert!(
+        !super::auto_apply_look(&READS, aterm_spec::wait::MUST_HAPPEN, || true),
+        "while it stays out, the next ask holds too, at once"
+    );
+    drop(release);
+}
+
+/// A RESTART'S END COMES BY ITSELF: nothing the job is stuck in can hold the thread that ends it.
+#[test]
+fn a_restart_ends_the_process_by_its_deadline_on_its_own_thread() {
+    static ENDED: AtomicBool = AtomicBool::new(false);
+    super::end_run_within(Duration::from_millis(20), || {
+        ENDED.store(true, Ordering::Release);
+    });
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the end runs", || {
+        ENDED.load(Ordering::Acquire).then_some(())
+    });
+}
+
 /// A NODE JOB WITH A WINDOW STAGES AND LEAVES THE APPLY TO IT (§4.13): its checker starts and
 /// stages build 2, and while the window's relay answers no look ends the run; once the window
 /// quits, the next look ends it, for launchd to start the job again.
@@ -3199,6 +4282,7 @@ fn a_node_job_with_a_window_stages_and_ends_its_run_only_once_the_window_quits()
     let relay = crate::test_scratch::short_dir("node-update-window");
     let window = WindowRelay::open(relay.path());
     let updater = Arc::new(ScriptedUpdater::new(Some(2)));
+    updater.trial_pending.store(false, Ordering::Release);
     let server = serve_updating(
         root.path(),
         &root.path().join("state"),
@@ -3235,9 +4319,9 @@ fn a_node_job_with_a_window_stages_and_ends_its_run_only_once_the_window_quits()
 /// A START THAT FINDS THE JOB'S LOCK HELD BOOTS AND STARTS NOTHING (§4.13): no boot apply,
 /// which would swap a stage in or count a start against the boot trial of a build the instance
 /// holding the lock does not run, no startup of the job's services and no run; it ends as a
-/// second instance ends. A lock that cannot be opened orders no start, so that start still
-/// boots, which counts a new build that fails there against its trial, and then fails with no
-/// service started. CONTROL: once the lock is free, the start takes it, runs its boot while it
+/// second instance ends. A lock that cannot be opened orders no start either: that start fails with
+/// no boot and no service, since a file with the wrong mode says nothing of a build and reverts none.
+/// CONTROL: once the lock is free, the start takes it, runs its boot while it
 /// holds it, then its startup, then the run, which lets it go as it returns.
 #[test]
 fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
@@ -3274,8 +4358,8 @@ fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
     );
     assert_eq!(
         std::mem::take(&mut *lock(&calls)),
-        ["boot"],
-        "a start whose lock cannot be opened still boots, and starts nothing"
+        Vec::<&str>::new(),
+        "and no boot swaps or counts anything for a file that says nothing of a build"
     );
     let start = || {
         own_node_job(
@@ -3349,6 +4433,7 @@ fn an_older_installed_build_ends_the_run_only_once_this_jobs_image_was_replaced(
 fn an_older_build_or_a_changed_checks_setting_ends_the_node_run_window_or_not() {
     let relay = crate::test_scratch::short_dir("node-update-ends");
     let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
     let boot = NodeBoot::nothing_at(updater.started);
     let window = WindowRelay::open(relay.path());
     updater.stage(3);
@@ -3371,6 +4456,156 @@ fn an_older_build_or_a_changed_checks_setting_ends_the_node_run_window_or_not() 
     let why = why_the_run_ends(&updater, boot, relay.path())
         .expect("CONTROL: with the window gone the newer build ends the run");
     assert!(why.contains("build 3 waits here"), "{why}");
+}
+
+/// AN ACTIVATION THE WINDOW HERE FAILED TO SWITCH TO GIVES WAY TO A NEWER STAGE THROUGH THE NODE
+/// JOB, WINDOW OR NOT: a window that cannot reach the build it pinned its switch to applies
+/// nothing newer, so the job installs the newer stage and ends its run, during a trial too; with no
+/// window the install's words end the run, not those of the newer build it took. CONTROLS:
+/// `[update] auto_apply` off installs nothing, window or not, and with no failed activation the
+/// newer build waits for the window as before, or ends the run by itself with no window.
+#[test]
+fn a_failed_activation_gives_way_to_a_newer_stage_through_the_node_job_window_or_not() {
+    let relay = crate::test_scratch::short_dir("node-update-failed-activation");
+    let updater = ScriptedUpdater::new(None);
+    let boot = NodeBoot::nothing_at(updater.started);
+    let window = WindowRelay::open(relay.path());
+    updater.stage(12);
+    assert!(updater.trial_pending.load(Ordering::Acquire));
+    assert_eq!(
+        why_the_run_ends(&updater, boot, relay.path()),
+        None,
+        "CONTROL: with no failed activation the newer build waits while a window runs"
+    );
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    *lock(&updater.failed) = Some((11, 12));
+    updater.auto_apply.store(false, Ordering::Release);
+    assert_eq!(
+        why_the_run_ends(&updater, boot, relay.path()),
+        None,
+        "CONTROL: with auto_apply off, Install owns the decision"
+    );
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    updater.auto_apply.store(true, Ordering::Release);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("the job installs over a failed activation while a window runs, mid-trial");
+    assert!(why.contains("build 12 installed over 11"), "{why}");
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 1);
+    drop(window);
+
+    // No window: the newer build would end the run by itself once no trial holds it, and the
+    // install over the failed activation goes first, so the run ends on what the install path
+    // now holds, not on the stage it took.
+    let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
+    let boot = NodeBoot::nothing_at(updater.started);
+    updater.stage(12);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("CONTROL: with no window and no failed activation the newer build ends the run");
+    assert!(why.contains("build 12 waits here"), "{why}");
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    *lock(&updater.failed) = Some((11, 12));
+    updater.auto_apply.store(false, Ordering::Release);
+    assert_eq!(
+        why_the_run_ends(&updater, boot, relay.path()),
+        None,
+        "CONTROL: with auto_apply off and no window, Install owns the decision"
+    );
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    updater.auto_apply.store(true, Ordering::Release);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("the job installs over a failed activation with no window");
+    assert!(
+        why.contains("build 12 installed over 11") && !why.contains("waits here"),
+        "{why}"
+    );
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 1);
+}
+
+/// What the node job says of each outcome of an install over a failed activation: a changed
+/// install path ends the run and names the builds; a hold ends nothing and is said once per
+/// reason; only a refusal by the verified bundles is kept for its pair, so the run does not
+/// verify the same bundles each look, while a hold (for now, or settled by small files read
+/// before any verification) is asked again; nothing failed ends nothing and forgets both.
+#[test]
+fn a_node_run_ends_only_where_the_install_over_a_failed_activation_moved_the_install_path() {
+    use aterm_update::FailedActivationInstall::{
+        Held, Installed, NoneFailed, Refused, RetiredOnly,
+    };
+    use aterm_update::SupersedeRefusal::{ForNow, Settled};
+    let retired = aterm_update::SupersededActivation {
+        activation_build: 11,
+        restored_build: 10,
+        newer_build: 12,
+        trial_launches: 0,
+        trial_disarm_deferred: None,
+    };
+    let waiting = (11, 12);
+    let holds = std::sync::Mutex::new(super::FailedActivationHolds::default());
+    let for_now = ForNow("a window's launch runs".to_owned());
+    let words = |outcome| super::failed_activation_words(waiting, outcome, &holds);
+    assert_eq!(words(Held(for_now.clone())), None);
+    assert_eq!(
+        *lock(&holds),
+        super::FailedActivationHolds {
+            said: Some("a window's launch runs".to_owned()),
+            settled: None,
+        },
+        "a hold for now is asked again"
+    );
+    assert_eq!(
+        words(Held(Settled("this process runs neither build".to_owned()))),
+        None
+    );
+    assert_eq!(
+        *lock(&holds),
+        super::FailedActivationHolds {
+            said: Some("this process runs neither build".to_owned()),
+            settled: None,
+        },
+        "a hold settled by small files is asked again: a re-booked failure may pass it"
+    );
+    assert_eq!(
+        words(Refused("the retained predecessor is build 9".to_owned())),
+        None
+    );
+    assert_eq!(
+        *lock(&holds),
+        super::FailedActivationHolds {
+            said: Some("the retained predecessor is build 9".to_owned()),
+            settled: Some(waiting),
+        },
+        "a refusal by the verified bundles is kept for its pair"
+    );
+    assert_eq!(words(Held(for_now.clone())), None);
+    assert_eq!(
+        lock(&holds).settled,
+        None,
+        "a later hold for the pair replaces the kept refusal"
+    );
+    assert_eq!(words(NoneFailed), None);
+    assert_eq!(
+        *lock(&holds),
+        super::FailedActivationHolds::default(),
+        "nothing failed forgets the holds"
+    );
+    assert_eq!(words(Held(for_now)), None);
+    let why = words(Installed {
+        retired: retired.clone(),
+        installed_build: 12,
+    })
+    .expect("an install ends the run");
+    assert!(
+        why.contains("installed build 12 over build 10") && why.contains("retired it"),
+        "{why}"
+    );
+    assert_eq!(*lock(&holds), super::FailedActivationHolds::default());
+    let why = words(RetiredOnly {
+        retired,
+        why: "the probe did not start".to_owned(),
+    })
+    .expect("a retire alone moved the install path, so it ends the run");
+    assert!(why.contains("build 10 put back"), "{why}");
 }
 
 /// THE NODE JOB'S LOOK MINDS ITS CHECKER AND ENDS ITS RUN FOR A CHANGED CHECKS SETTING (§4.13):
@@ -3439,7 +4674,6 @@ fn the_node_job_replaces_a_stalled_checker_once_and_a_fresh_one_never() {
             lock(&respawned).push(generation);
             Some(generation + 1)
         })
-        .map(|(stall, replacement)| (stall.generation, replacement))
     };
     let fresh = beat(CheckerPhase::Waiting, 1_000);
     assert_eq!(look(fresh, 1_060), None);
@@ -3448,20 +4682,218 @@ fn the_node_job_replaces_a_stalled_checker_once_and_a_fresh_one_never() {
         None,
         "CONTROL: a fresh heartbeat is never replaced"
     );
+    assert!(lock(&respawned).is_empty(), "CONTROL: nothing replaced");
     let stuck = beat(CheckerPhase::LockWait, 1_000);
     let days = 1_000 + 4 * 86_400;
     assert_eq!(look(stuck, days), None, "the first look only suspects");
+    assert!(lock(&respawned).is_empty(), "the first look only suspects");
     assert_eq!(
         look(stuck, days + confirm),
-        Some((1, Some(2))),
-        "a later look replaces the stalled checker"
+        None,
+        "a replacement that can check ends no run"
     );
+    assert_eq!(*lock(&respawned), [1], "a later look replaces the stall");
     assert_eq!(
         look(stuck, days + 2 * confirm),
         None,
         "the same stall is acted on once"
     );
     assert_eq!(*lock(&respawned), [1]);
+}
+
+/// A CHECK NO REPLACEMENT CAN TAKE OVER ENDS THE NODE RUN (§4.13): one stuck inside its check holds
+/// the check lane, which a replacement in this process could not take until it lets go, and a
+/// replacement may not start (its budget is spent, or the process is out of threads). Either would
+/// mean no check here for as long as the job stayed up, with no window to see it. launchd's next
+/// start checks afresh. CONTROL: a first look only suspects.
+#[test]
+fn a_check_no_replacement_can_take_over_ends_the_node_run() {
+    use aterm_update::checker_watch::{CheckerBeat, CheckerPhase, LaneHolder, STALL_CONFIRM};
+    let beat = |lane| CheckerBeat {
+        generation: 1,
+        phase: CheckerPhase::Checking,
+        at_secs: 1_000,
+        max_interval_secs: 1_100,
+        respawns: 0,
+        workers: 1,
+        worker_epoch: 0,
+        deferrals: 0,
+        settings_misses: 0,
+        lane,
+        checks: 0,
+    };
+    let days = 1_000 + 4 * 86_400;
+    let holding = beat(Some(LaneHolder {
+        generation: 1,
+        phase: CheckerPhase::Checking,
+        at_secs: 1_000,
+    }));
+    let mut watch = crate::update_checker_watch::CheckerWatchState::default();
+    let starts_none = |_| panic!("a replacement started behind a check holding the lane");
+    assert_eq!(
+        mind_node_checker(&mut watch, Some(holding), days, starts_none),
+        None,
+        "CONTROL: the first look only suspects"
+    );
+    let why = mind_node_checker(
+        &mut watch,
+        Some(holding),
+        days + STALL_CONFIRM.as_secs(),
+        starts_none,
+    )
+    .expect("a check holding the lane ends the run");
+    assert!(why.contains("update check"), "{why}");
+    let free = beat(None);
+    let mut watch = crate::update_checker_watch::CheckerWatchState::default();
+    assert_eq!(
+        mind_node_checker(&mut watch, Some(free), days, |_| Some(2)),
+        None,
+        "CONTROL: the first look only suspects"
+    );
+    let why = mind_node_checker(
+        &mut watch,
+        Some(free),
+        days + STALL_CONFIRM.as_secs(),
+        |_| None,
+    )
+    .expect("a replacement that did not start ends the run");
+    assert!(why.contains("no replacement"), "{why}");
+}
+
+/// THE LOOK ENDS THE RUN ONCE ITS MINDING SAYS NO REPLACEMENT CAN CHECK (§4.13), though nothing
+/// else ends it. CONTROL: looks whose minding says nothing end no run.
+#[test]
+fn a_stuck_check_ends_the_node_run() {
+    let relay = crate::test_scratch::short_dir("node-update-stuck");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    spawn_node_updates(
+        &updates,
+        relay.path().to_path_buf(),
+        Arc::clone(&updater.stop),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job minds its checker three times",
+        || (updater.minds.load(Ordering::Acquire) >= 3).then_some(()),
+    );
+    assert_eq!(updater.restarts(), Vec::<String>::new(), "CONTROL");
+    updater.trial_pending.store(false, Ordering::Release);
+    *lock(&updater.stuck) = Some("the update check has not moved".to_owned());
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the run ends for the stuck check",
+        || (!updater.restarts().is_empty()).then_some(()),
+    );
+    let restarts = updater.restarts();
+    assert_eq!(restarts.len(), 1, "{restarts:?}");
+    assert!(restarts[0].contains("update check"), "{restarts:?}");
+}
+
+/// The same, through the look: a stuck check said while a trial is active leaves the run up, and the look
+/// that finds the trial settled ends it, though the watchdog said it only once.
+#[test]
+fn a_stuck_check_said_during_a_trial_ends_the_node_run_once_it_settles() {
+    let relay = crate::test_scratch::short_dir("node-update-stuck-trial");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    *lock(&updater.stuck) = Some("the update check has not moved".to_owned());
+    spawn_node_updates(
+        &updates,
+        relay.path().to_path_buf(),
+        Arc::clone(&updater.stop),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job minds its checker three times",
+        || (updater.minds.load(Ordering::Acquire) >= 3).then_some(()),
+    );
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+    updater.trial_pending.store(false, Ordering::Release);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the run ends once the trial settles",
+        || (!updater.restarts().is_empty()).then_some(()),
+    );
+    assert!(updater.restarts()[0].contains("update check"));
+}
+
+/// WHAT A RUN WOULD END FOR WAITS FOR A TRIAL TO SETTLE: a start counts against a build whose listener has
+/// not missed, three revert it, and an armed trial applies nothing newer. A stage or a changed setting
+/// that landed during a held trial spent those starts on nothing the build did. The newer build gives way
+/// an hour on, since a trial the updater keeps refusing to settle must not hold it for good. CONTROL: a
+/// build put back in this copy's place goes at once, trial or not.
+#[test]
+fn what_a_run_would_end_for_waits_for_a_trial_to_settle() {
+    let relay = crate::test_scratch::short_dir("node-update-trial-wait");
+    let updater = ScriptedUpdater::new(None);
+    let boot = NodeBoot::nothing_at(updater.started);
+    assert!(updater.trial_pending.load(Ordering::Acquire));
+    updater.stage(2);
+    updater.checks_moved.store(true, Ordering::Release);
+    assert_eq!(why_the_run_ends(&updater, boot, relay.path()), None);
+    updater.checks_moved.store(false, Ordering::Release);
+    updater.advance(RETRY_LEFT_AFTER - Duration::from_secs(1));
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "within the hour"
+    );
+    updater.advance(Duration::from_secs(1));
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "an hour on, the trial gives way to the waiting build"
+    );
+    let boot = NodeBoot::nothing_at(updater.now());
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "a new run's hour"
+    );
+    *lock(&updater.older) = Some(1);
+    assert!(
+        why_the_run_ends(&updater, boot, relay.path()).is_some_and(|why| why.contains("older")),
+        "CONTROL"
+    );
+    *lock(&updater.older) = None;
+    updater.trial_pending.store(false, Ordering::Release);
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "settled, it goes at once"
+    );
+    updater.checks_moved.store(true, Ordering::Release);
+    assert!(
+        why_the_run_ends(&updater, boot, relay.path())
+            .is_some_and(|why| why.contains("[update] enabled"))
+    );
+}
+
+/// A CHECK NO REPLACEMENT CAN TAKE OVER WAITS FOR A TRIAL TO SETTLE: a run ended for it counts the next
+/// start against a build whose listener has not missed, and three such starts on a Mac short of threads
+/// reverted a good build. The watchdog says it once for a generation, so it is kept for the look after
+/// the trial settles, and said once.
+#[test]
+fn a_check_no_replacement_can_take_over_waits_for_a_trial_to_settle() {
+    let updater = ScriptedUpdater::new(None);
+    let mut owes = None;
+    *lock(&updater.stuck) = Some("the update check has not moved".to_owned());
+    for look in 0..2 {
+        assert_eq!(
+            super::the_checker_ends_the_run(&updater, &mut owes),
+            None,
+            "{look}"
+        );
+    }
+    updater.trial_pending.store(false, Ordering::Release);
+    assert_eq!(
+        super::the_checker_ends_the_run(&updater, &mut owes).as_deref(),
+        Some("the update check has not moved")
+    );
+    assert_eq!(super::the_checker_ends_the_run(&updater, &mut owes), None);
 }
 
 /// The node confirms an admitted listener only after its authenticated Census response, or a
@@ -3517,8 +4949,13 @@ fn the_node_job_confirms_its_boot_trial_once_it_serves_or_holds_the_lan() {
     }
 }
 
+/// WHAT KEEPS AN ADMITTED NODE FROM SERVING SAYS NOTHING OF ITS BUILD: a key that does not read, a
+/// port another program holds, a port lock held elsewhere. Each look holds, ending no run, so nothing
+/// counts against a trial a revert could not cure, and past its bound the trial settles, since a
+/// trial nothing confirms refuses every later update. CONTROL: no evidence confirms it before then,
+/// and with no trial active nothing is asked.
 #[test]
-fn an_admitted_node_with_invalid_key_or_failed_bind_cannot_confirm_its_trial() {
+fn what_keeps_an_admitted_node_from_serving_says_nothing_of_its_build() {
     for (failure, active) in [
         ("key", true),
         ("bind", true),
@@ -3545,27 +4982,63 @@ fn an_admitted_node_with_invalid_key_or_failed_bind_cannot_confirm_its_trial() {
         updater.trial_pending.store(active, Ordering::Release);
         let config = format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n");
         let server = serve_updating(root.path(), &state, relay.path(), &updater, (&config, None));
-        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        while updater.confirms.load(Ordering::Acquire) == 0
-            && updater.restarts().is_empty()
-            && (active || updater.trial_reads.load(Ordering::Acquire) == 0)
-            && Instant::now() < until
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        updater.stop.set();
-        assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the job looks at its trial three times",
+            || (updater.trial_reads.load(Ordering::Acquire) >= 3).then_some(()),
+        );
         assert_eq!(
             updater.confirms.load(Ordering::Acquire),
             0,
             "{failure}: an admitted node that cannot serve supplied no health evidence"
         );
-        assert_eq!(
-            updater.restarts().len(),
-            usize::from(active),
-            "{failure}: only the active trial requests its next recovery boot"
-        );
+        assert_eq!(updater.restarts(), Vec::<String>::new(), "{failure}");
+        if active {
+            updater.advance(super::TRIAL_SETTLES_WITHIN);
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the trial settles past its bound",
+                || (updater.confirms.load(Ordering::Acquire) > 0).then_some(()),
+            );
+        }
+        updater.stop.set();
+        assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(updater.restarts(), Vec::<String>::new(), "{failure}");
     }
+}
+
+/// A PROCESS THAT NEVER APPLIES AND BINDS THE FLEET PORT COSTS NO UPDATE: `aterm --headless` or a dev
+/// bundle takes the port while no job holds the lock, and lets it go within its tick once one does. A
+/// new build's first bind then fails. That used to fail its trial at once, launchd's next start met
+/// the same, and the third reverted a good build. The job binds again, and its listener proves it.
+#[test]
+fn a_bind_refused_by_a_process_that_lets_the_port_go_holds_the_trial_until_it_proves() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let relay = crate::test_scratch::short_dir("node-bind-handed-over");
+    let state = root.path().join("state");
+    seed_fleet_node(&state);
+    let holder = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = holder.local_addr().unwrap();
+    let _process = relay_that_never_applies(relay.path());
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let config = format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n");
+    let server = serve_updating(root.path(), &state, relay.path(), &updater, (&config, None));
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job meets the held port three times",
+        || (updater.trial_reads.load(Ordering::Acquire) >= 3).then_some(()),
+    );
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+    drop(holder);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job binds, and its listener proves the build",
+        || (updater.confirms.load(Ordering::Acquire) > 0).then_some(()),
+    );
+    updater.stop.set();
+    assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+    assert_eq!(updater.restarts(), Vec::<String>::new());
 }
 
 #[test]
@@ -3600,6 +5073,433 @@ fn an_owned_port_is_delegated_only_while_a_window_relay_answers() {
     assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
     assert_eq!(updater.confirms.load(Ordering::Acquire), 1);
     assert!(updater.restarts().is_empty());
+}
+
+/// A TRIAL'S CLOCKS MEASURE AN UNBROKEN RUN OF LOOKS: an answer between two misses makes the second a
+/// first, a miss between two looks that could not ask makes the second a first, and a window's custody
+/// starts both again. CONTROLS: a look that could not ask does not clear misses, so misses that last
+/// still end the run, and looks with nothing between them still settle.
+#[test]
+fn a_trial_s_clocks_measure_an_unbroken_run_of_looks() {
+    let bound = super::TRIAL_SETTLES_WITHIN;
+    let fresh = || {
+        let updater = Arc::new(ScriptedUpdater::new(None));
+        let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+        let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+        (updater, updates)
+    };
+
+    let (updater, updates) = fresh();
+    updater.confirms_land.store(false, Ordering::Release);
+    updates.trial_proof_missed(&updater.stop, "a loaded Mac");
+    updater.advance(bound);
+    updates.trial_answered(&updater.stop);
+    updates.trial_proof_missed(&updater.stop, "a loaded Mac again");
+    assert_eq!(
+        updater.restarts(),
+        Vec::<String>::new(),
+        "an answer between"
+    );
+
+    let (updater, updates) = fresh();
+    updates.trial_unprovable(&updater.stop, "a vault read at boot");
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    updater.advance(bound);
+    updates.trial_unprovable(&updater.stop, "a writer for a moment");
+    assert_eq!(
+        updater.confirms.load(Ordering::Acquire),
+        0,
+        "a build missing at every look it could ask is not confirmed by one it could not"
+    );
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    assert_eq!(updater.restarts().len(), 1, "CONTROL: its misses lasted");
+
+    let (updater, updates) = fresh();
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    updater.trial_pending.store(false, Ordering::Release);
+    assert!(!updates.active_trial());
+    updater.trial_pending.store(true, Ordering::Release);
+    updater.advance(bound);
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    assert_eq!(updater.restarts(), Vec::<String>::new(), "custody between");
+
+    let (updater, updates) = fresh();
+    updates.trial_unprovable(&updater.stop, "a key that does not read");
+    updater.advance(bound);
+    updates.trial_unprovable(&updater.stop, "a key that does not read");
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1, "CONTROL");
+}
+
+/// A TRIAL THE UPDATER WILL NOT SETTLE ASKS AGAIN, AND ENDS NO RUN: a held lock or a failed recovery
+/// proof at its bound is no more the build's than what kept it from asking.
+#[test]
+fn a_trial_the_updater_will_not_settle_asks_again_and_ends_no_run() {
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    updater.confirms_land.store(false, Ordering::Release);
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    updates.trial_unprovable(&updater.stop, "a key that does not read");
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    for asks in 1..=3 {
+        updates.trial_unprovable(&updater.stop, "a key that does not read");
+        assert_eq!(updater.confirms.load(Ordering::Acquire), asks);
+    }
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+}
+
+/// A LOOK THAT COULD NOT READ ITS INPUTS KEEPS THE LISTENER: a vault read that fails, or an `allow` this
+/// build does not know, says nothing of a listener that is serving, so it goes on serving whether the
+/// fault meets the read before the self-dial or the one after it, and past the bound the trial settles.
+/// Text that is not TOML takes another way, since the job's watch reads its swarm switch as off first.
+/// It asks no self-dial, since it cannot say what the dial should find. CONTROL: a stop still ends it.
+#[test]
+fn a_look_that_could_not_read_its_inputs_keeps_the_listener() {
+    const READS: &str = "[fleet]\nlisten = \"127.0.0.1:1\"\nallow = \"facts\"\n";
+    const UNREAD: &str = "[fleet]\nlisten = \"127.0.0.1:1\"\nallow = \"nonsense\"\n";
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let (secret, node) = seed_fleet_node(&state);
+    let config = root.path().join("aterm.toml");
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let cfg = idle_job_config(&updater, &state, &config, root.path());
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    let proved = Some((node.node().to_owned(), node.key()));
+    let listen = "127.0.0.1:1";
+    let at = (listen.parse().unwrap(), &secret, &proved, listen);
+    let look = || {
+        updates.settle_service_with(&super::health::Inputs::of(&cfg), at, &cfg.stop, |_| {
+            panic!("a look that could not read asks no self-dial")
+        })
+    };
+    crate::test_scratch::write_config(&config, UNREAD);
+    assert!(look(), "it goes on serving");
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    crate::test_scratch::write_config(&config, READS);
+    assert!(
+        updates.settle_service_with(&super::health::Inputs::of(&cfg), at, &cfg.stop, |_| {
+            crate::test_scratch::write_config(&config, UNREAD);
+            Err("a dial the fault cut short".to_owned())
+        }),
+        "so does a fault that meets the read after the dial"
+    );
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    assert!(look(), "past the bound too");
+    assert_eq!(
+        updater.confirms.load(Ordering::Acquire),
+        1,
+        "it settles, so neither look was a miss"
+    );
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+    updater.stop.set();
+    assert!(!look(), "CONTROL: a stop ends it");
+}
+
+/// A LISTENER THAT REFUSES ITS OWN DIAL FAILS NO TRIAL: one named on a Tailscale or public address
+/// refuses a connection from that address as it does any peer's, so no self-dial can answer, a revert
+/// cures nothing, and the next release would meet the same. CONTROL: a miss on a fleet source is the
+/// listener's own.
+#[test]
+fn a_listener_that_refuses_its_own_dial_fails_no_trial() {
+    for (listen, its_own) in [
+        ("100.100.1.2:7100", false),
+        ("[2606:4700::1]:7100", false),
+        ("192.168.1.2:7100", true),
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let (secret, node) = seed_fleet_node(&state);
+        let config = root.path().join("aterm.toml");
+        crate::test_scratch::write_config(
+            &config,
+            format!("[fleet]\nlisten = \"{listen}\"\nallow = \"facts\"\n"),
+        );
+        let updater = Arc::new(ScriptedUpdater::new(None));
+        let cfg = idle_job_config(&updater, &state, &config, root.path());
+        let updates = NodeUpdates::new(
+            Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+            NodeBoot::nothing_at(updater.started),
+        );
+        let proved = Some((node.node().to_owned(), node.key()));
+        let look = || {
+            updates.settle_service_with(
+                &super::health::Inputs::of(&cfg),
+                (listen.parse().unwrap(), &secret, &proved, listen),
+                &cfg.stop,
+                |_| Err("the listener refused the dial".to_owned()),
+            )
+        };
+        assert!(look(), "{listen}");
+        updater.advance(super::TRIAL_SETTLES_WITHIN);
+        assert_eq!(look(), !its_own, "{listen}");
+        assert_eq!(
+            updater.confirms.load(Ordering::Acquire),
+            usize::from(!its_own),
+            "{listen}"
+        );
+        assert_eq!(updater.restarts().len(), usize::from(its_own), "{listen}");
+    }
+}
+
+/// A BROKER THAT FAILS BETWEEN MISSES CONFIRMS NOTHING: one failed hello read as a definite hold, so a
+/// build that missed for minutes was confirmed by it, and its clock cleared. It holds that look alone.
+/// CONTROL: misses that last still end the run.
+#[test]
+fn a_broker_that_fails_between_misses_confirms_nothing() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let (secret, node) = seed_fleet_node(&state);
+    let config = root.path().join("aterm.toml");
+    let listen = "127.0.0.1:1";
+    crate::test_scratch::write_config(
+        &config,
+        format!("[fleet]\nlisten = \"{listen}\"\nallow = \"facts\"\n"),
+    );
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let cfg = idle_job_config(&updater, &state, &config, root.path());
+    let mut no_broker = idle_job_config(&updater, &state, &config, root.path());
+    no_broker.lan_unavailable = || Some("no root LAN broker answers".to_owned());
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    let proved = Some((node.node().to_owned(), node.key()));
+    let at = (listen.parse().unwrap(), &secret, &proved, listen);
+    let miss = || {
+        updates.settle_service_with(&super::health::Inputs::of(&cfg), at, &cfg.stop, |_| {
+            Err("no reply".to_owned())
+        })
+    };
+    assert!(miss());
+    updater.advance(super::TRIAL_SETTLES_WITHIN - Duration::from_secs(1));
+    assert!(updates.settle_service_with(
+        &super::health::Inputs::of(&no_broker),
+        at,
+        &cfg.stop,
+        |_| panic!("a look with no broker asks no self-dial"),
+    ));
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    updater.advance(Duration::from_secs(2));
+    assert!(!miss());
+    assert_eq!(updater.restarts().len(), 1);
+}
+
+/// A JOB THAT ONLY WAITS TO SERVE HOLDS ITS TRIAL UNTIL THE BOUND: an admitted node whose listener is
+/// between generations is not missing anything of the build's, and a trial nothing settles refuses
+/// every later update. It asks no window, since it holds the port's turn.
+#[test]
+fn a_job_that_only_waits_to_serve_settles_its_trial_past_the_bound() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    seed_fleet_node(&state);
+    let config = root.path().join("aterm.toml");
+    crate::test_scratch::write_config(
+        &config,
+        "[fleet]\nlisten = \"127.0.0.1:1\"\nallow = \"facts\"\n",
+    );
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let mut cfg = idle_job_config(&updater, &state, &config, root.path());
+    cfg.updates = Some(NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    ));
+    let look = || {
+        super::checkpoint_idle_with(&cfg, super::IdleCheckpoint::Waiting, || {
+            panic!("a job that only waits asks no window")
+        });
+    };
+    look();
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    look();
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1);
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+}
+
+fn idle_job_config(
+    updater: &Arc<ScriptedUpdater>,
+    state: &Path,
+    config: &Path,
+    root: &Path,
+) -> NodeServeConfig {
+    NodeServeConfig {
+        state_dir: state.to_path_buf(),
+        relay_dir: root.join("relay"),
+        home_dir: None,
+        config_path: Some(config.to_path_buf()),
+        vault_paths: None,
+        members: None,
+        alab_browse: None,
+        prebound_listener: None,
+        on_generation: None,
+        tick_every: Duration::from_millis(20),
+        wake_timeout: Duration::from_secs(1),
+        stop: Arc::clone(&updater.stop),
+        launcher: idle_launcher(),
+        lan_unavailable: || None,
+        updates: None,
+        mesh: NodeMesh::off(),
+    }
+}
+
+/// A SELF-DIAL THAT REACHED A LOOPBACK HOLDER FAILS NO TRIAL: macOS lets a wildcard listener coexist
+/// with `127.0.0.1` on its port (an `ssh -L`, a local server), and the dial goes to that socket, so
+/// misses said nothing of a listener serving every other address. CONTROL: with no holder a miss is
+/// this listener's, and one on a named address is too.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_self_dial_that_reached_a_loopback_holder_fails_no_trial() {
+    use super::health::loopback_held_elsewhere;
+    let wildcard = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let addr = wildcard.local_addr().unwrap();
+    assert!(
+        !loopback_held_elsewhere(addr),
+        "CONTROL: its own socket holds nothing there"
+    );
+    let holder = TcpListener::bind((Ipv4Addr::LOCALHOST, addr.port()))
+        .expect("PRECONDITION: macOS lets the two coexist");
+    assert!(loopback_held_elsewhere(addr));
+    assert!(
+        !loopback_held_elsewhere(holder.local_addr().unwrap()),
+        "CONTROL: a named address is what the dial reaches"
+    );
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let (secret, node) = seed_fleet_node(&state);
+    let config = root.path().join("aterm.toml");
+    let listen = addr.to_string();
+    crate::test_scratch::write_config(
+        &config,
+        format!("[fleet]\nlisten = \"{listen}\"\nallow = \"facts\"\n"),
+    );
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let cfg = NodeServeConfig {
+        state_dir: state.clone(),
+        relay_dir: root.path().join("relay"),
+        home_dir: None,
+        config_path: Some(config.clone()),
+        vault_paths: None,
+        members: None,
+        alab_browse: None,
+        prebound_listener: None,
+        on_generation: None,
+        tick_every: Duration::from_millis(20),
+        wake_timeout: Duration::from_secs(1),
+        stop: Arc::clone(&updater.stop),
+        launcher: idle_launcher(),
+        lan_unavailable: || None,
+        updates: None,
+        mesh: NodeMesh::off(),
+    };
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    let proved = Some((node.node().to_owned(), node.key()));
+    let look = || {
+        updates.settle_service_with(
+            &super::health::Inputs::of(&cfg),
+            (addr, &secret, &proved, listen.as_str()),
+            &cfg.stop,
+            |_| Err("the dial reached another node".to_owned()),
+        )
+    };
+    assert!(look());
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    assert!(look());
+    assert_eq!(updater.restarts(), Vec::<String>::new());
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1, "it settles");
+    drop(holder);
+    updater.trial_pending.store(true, Ordering::Release);
+    assert!(look());
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    assert!(!look(), "CONTROL: nobody else there, so misses are its own");
+    assert_eq!(updater.restarts().len(), 1);
+}
+
+/// EACH KIND OF LOOK KEEPS ITS OWN CLOCK: a job that could not ask for minutes has not been missed for
+/// minutes, so a first miss then ends no run, and misses that last still do. CONTROL: with no trial
+/// active nothing is asked.
+#[test]
+fn a_miss_after_a_long_unprovable_wait_is_a_first_miss() {
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    let bound = super::TRIAL_SETTLES_WITHIN;
+    updates.trial_unprovable(&updater.stop, "a key that does not read");
+    updater.advance(bound - Duration::from_secs(1));
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    updater.advance(Duration::from_secs(2));
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    assert_eq!(
+        updater.restarts(),
+        Vec::<String>::new(),
+        "seconds of misses"
+    );
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+    updater.advance(bound);
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    assert_eq!(
+        updater.restarts().len(),
+        1,
+        "misses that last are the build's"
+    );
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+
+    let idle = Arc::new(ScriptedUpdater::new(None));
+    idle.trial_pending.store(false, Ordering::Release);
+    let dyn_idle: Arc<dyn NodeUpdater> = idle.clone();
+    let updates = NodeUpdates::new(dyn_idle, NodeBoot::nothing_at(idle.started));
+    updates.trial_proof_missed(&idle.stop, "no reply");
+    idle.advance(bound);
+    updates.trial_proof_missed(&idle.stop, "no reply");
+    updates.trial_unprovable(&idle.stop, "a key that does not read");
+    idle.advance(bound);
+    updates.trial_unprovable(&idle.stop, "a key that does not read");
+    assert_eq!(idle.restarts(), Vec::<String>::new(), "CONTROL");
+    assert_eq!(idle.confirms.load(Ordering::Acquire), 0, "CONTROL");
+}
+
+/// A PORT LOCK HELD BY A PROCESS THAT NEVER APPLIES FAILS NO TRIAL: who answers and who applies are
+/// two questions. A process can answer its relay while it says it never applies, and the job's health
+/// check asks only the first of `node-port.lock` held elsewhere, since reverting a good build for that
+/// would undo an update.
+#[test]
+fn a_port_held_by_a_process_that_never_applies_fails_no_trial() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let relay = crate::test_scratch::short_dir("node-never-applies-health");
+    let state = root.path().join("state");
+    seed_fleet_node(&state);
+    let _custody = aterm_agent::node_service::NodeJobLock::try_acquire_port(&state)
+        .unwrap()
+        .unwrap();
+    let _process = relay_that_never_applies(relay.path());
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let server = serve_updating(
+        root.path(),
+        &state,
+        relay.path(),
+        &updater,
+        (
+            "[fleet]\nlisten = \"127.0.0.1:0\"\nallow = \"facts\"\n",
+            None,
+        ),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job settles the trial its port's holder answers for",
+        || {
+            (updater.confirms.load(Ordering::Acquire) > 0 || !updater.restarts().is_empty())
+                .then_some(())
+        },
+    );
+    updater.stop.set();
+    assert_eq!(server.join().unwrap(), ExitCode::SUCCESS);
+    assert!(updater.restarts().is_empty(), "{:?}", updater.restarts());
+    assert_eq!(updater.confirms.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -3748,7 +5648,7 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
             }
             "broker" => {
                 cfg.lan_unavailable = || Some("controlled unavailable broker".into());
-                Some(true)
+                Some(false)
             }
             "invalid-config" => {
                 crate::test_scratch::write_config(&config, "invalid TOML [");
@@ -3771,7 +5671,15 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
                 usize::from(held),
                 "{cut}"
             );
-            assert_eq!(updater.restarts().len(), usize::from(!held), "{cut}");
+            assert_eq!(updater.restarts(), Vec::<String>::new(), "{cut}");
+            if !held {
+                // What a mistake, a mode or a broker has put out of reach reverts no build: past
+                // the bound the trial settles, and this Mac's next update can land.
+                updater.advance(super::TRIAL_SETTLES_WITHIN);
+                super::checkpoint_idle(&cfg, super::IdleCheckpoint::Waiting);
+                assert_eq!(updater.confirms.load(Ordering::Acquire), 1, "{cut}");
+                assert_eq!(updater.restarts(), Vec::<String>::new(), "{cut}");
+            }
             continue;
         }
         let updates = NodeUpdates::new(
@@ -3798,13 +5706,30 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
                 Err("controlled probe failure after its input capture".to_owned())
             },
         );
-        assert!(!result);
+        assert_eq!(
+            result,
+            cut == "unchanged",
+            "{cut}: one miss ends no generation"
+        );
         assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
         assert_eq!(
-            updater.restarts().len(),
-            usize::from(cut == "unchanged"),
-            "{cut}"
+            updater.restarts(),
+            Vec::<String>::new(),
+            "{cut}: one miss ends no run"
         );
+        if cut == "unchanged" {
+            // Misses that last are the build's: the next start counts against its trial.
+            updater.advance(super::TRIAL_SETTLES_WITHIN);
+            let result = updates.settle_service_with(
+                &super::health::Inputs::of(&cfg),
+                (listen.parse().unwrap(), &secret, &proved, listen),
+                &cfg.stop,
+                |_| Err("the listener still does not answer".to_owned()),
+            );
+            assert!(!result);
+            assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
+            assert_eq!(updater.restarts().len(), 1);
+        }
     }
 }
 
@@ -3875,7 +5800,17 @@ impl NodeUpdater for FixtureStage {
         false
     }
 
-    fn mind_checker(&self) {}
+    fn failed_activation(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn install_over_failed_activation(&self, _: (u64, u64)) -> Option<String> {
+        None
+    }
+
+    fn mind_checker(&self) -> Option<String> {
+        None
+    }
 
     fn restart(&self, _why: &str) {
         self.restarted.store(true, Ordering::Release);
@@ -4091,4 +6026,27 @@ fn a_windowless_members_checkouts_are_read_again_with_no_survey() {
         "a read within the reader's own refresh period"
     );
     assert!(said.repos.is_empty(), "the home holds no clone");
+}
+
+/// The windows beside this one count only from a relay folder it can list that holds this
+/// window's own relay. NEGATIVE CONTROLS: a folder that cannot be listed, and one without this
+/// window's relay (removed or replaced under it), cannot say, even with no other window in it.
+#[test]
+fn other_windows_count_only_from_a_folder_holding_this_ones_relay() {
+    let relay = crate::test_scratch::short_dir("relay-others");
+    let me = std::process::id();
+    // Pid 1 lives as long as the machine: another live window's relay.
+    let other = 1;
+    assert_eq!(
+        others_beside(me, &relay.path().join("gone")),
+        None,
+        "unlisted"
+    );
+    assert_eq!(others_beside(me, relay.path()), None, "empty");
+    std::fs::write(super::relay_socket_path(relay.path(), other), b"").unwrap();
+    assert_eq!(others_beside(me, relay.path()), None, "without mine");
+    std::fs::write(super::relay_socket_path(relay.path(), me), b"").unwrap();
+    assert_eq!(others_beside(me, relay.path()), Some(1));
+    std::fs::remove_file(super::relay_socket_path(relay.path(), other)).unwrap();
+    assert_eq!(others_beside(me, relay.path()), Some(0), "alone");
 }

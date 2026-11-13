@@ -589,21 +589,8 @@ impl OscEventQueue {
 
 /// Deterministic cost meter for [`OscEventQueue::shift_marks`]: the queued events it walked.
 #[cfg(test)]
-pub(super) mod shift_meter {
-    thread_local! {
-        static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    /// `n` events walked.
-    pub(super) fn charge(n: usize) {
-        WALKED.with(|c| c.set(c.get() + n));
-    }
-
-    /// Read and reset, so each measured stretch starts from zero.
-    pub(in crate::terminal) fn take() -> usize {
-        WALKED.with(|c| c.replace(0))
-    }
-}
+#[path = "transient_state_shift_meter_tests.rs"]
+pub(super) mod shift_meter;
 
 /// One Kitty image's animation (see `TransientState::kitty_frames`): its frames, root first, and how they play, as kitty plays them.
 #[derive(Debug, Clone)]

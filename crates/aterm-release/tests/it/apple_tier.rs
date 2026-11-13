@@ -881,6 +881,7 @@ fn journal_with(done: &[&str]) -> Journal {
         release_id: None,
         release_intent: false,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: done.iter().map(|s| (*s).to_string()).collect(),
     }
 }

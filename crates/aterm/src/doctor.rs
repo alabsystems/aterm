@@ -1072,6 +1072,7 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
         class: None,
         explain: None,
         stood_aside: None,
+        waits_on: None,
         essential: false,
         elapsed_ms: Some(0),
     }
@@ -1330,6 +1331,7 @@ fn ai_accounts_observation(probe: aterm_converge::Probe) -> aterm_types::macos_s
         wanted: "Provisioned".to_owned(),
         note,
         detail: None,
+        read: aterm_types::macos_setup::Read::Unstamped,
     }
 }
 

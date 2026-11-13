@@ -358,8 +358,8 @@ fn harness_pins() -> Delta {
     delta(&pins)
 }
 
-/// A HARNESS PINS LIKE ANY ROW, INTO THE CLIENT'S DEFAULT SET (owner ruling 2026-10-27,
-/// `docs/DESIGN-harness-repos-2026-10-24.md` §11 D45): `plan` admits `--pin` of each of the five,
+/// A HARNESS PINS LIKE ANY ROW, INTO THE CLIENT'S DEFAULT SET
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D45): `plan` admits `--pin` of each of the five,
 /// its block names its own repo with no group and the prebuilt-only policy, and the index it
 /// makes installs it unasked; a head's harness pin, one the table lacks included, is carried
 /// like any other.

@@ -937,7 +937,6 @@ const fn native_settings_route_for_aux(
         | AuxTarget::About
         | AuxTarget::Menu
         | AuxTarget::TabMenu
-        | AuxTarget::AutopilotMenu
         | AuxTarget::FactMenu
         | AuxTarget::Overview => None,
     }
@@ -1010,7 +1009,7 @@ pub(crate) mod paste_order {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
     use std::time::Duration;
 
     use super::{
@@ -1018,7 +1017,7 @@ pub(crate) mod paste_order {
         tracked_egress_metered, tracked_egress_ticketed,
     };
     use aterm_core::terminal::ModeMirror;
-    use aterm_session::sink::BulkMeter;
+    use aterm_session::sink::{BulkMeter, InputEpoch};
     use aterm_window::event_loop::EventLoopProxy;
 
     const MAX_BYTES: u32 = 32 * 1024 * 1024;
@@ -1207,6 +1206,8 @@ pub(crate) mod paste_order {
         control_vim: Option<crate::control::ControlVim>,
         /// Who waits for this write's own receipt ([`Written`]).
         written: Option<SyncSender<crate::input::EgressReceipt>>,
+        /// Where the writer notes the sink's input epoch once it wrote this job ([`WrittenEpoch`]).
+        epoch: Option<WrittenEpoch>,
         /// Last field: payloads above are dropped before capacity is returned.
         _reservation: Reservation,
     }
@@ -1229,6 +1230,25 @@ pub(crate) mod paste_order {
         pub(crate) fn for_test() -> (SyncSender<crate::input::EgressReceipt>, Written) {
             let (tx, rx) = sync_channel(1);
             (tx, Written(rx))
+        }
+    }
+
+    /// The sink's input epoch ([`SinkWriter::input_epoch`]) once one write returned, as the route
+    /// that ran it notes it: the UI thread as its inline write returns, the ordered writer as its
+    /// write of the queued job returns. Empty until then, and for good where the job was refused
+    /// or never ran, so a reader that finds it empty knows the write has not landed.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct WrittenEpoch(Arc<OnceLock<InputEpoch>>);
+
+    impl WrittenEpoch {
+        /// Notes `sink`'s input epoch now, just after the write returned; a later note is ignored.
+        pub(crate) fn note(&self, sink: &SinkWriter) {
+            let _ = self.0.set(sink.input_epoch());
+        }
+
+        /// The noted epoch, or `None` while the write has not returned.
+        pub(crate) fn get(&self) -> Option<InputEpoch> {
+            self.0.get().copied()
         }
     }
 
@@ -1362,6 +1382,9 @@ pub(crate) mod paste_order {
                 ),
             }
         };
+        if admitted && let Some(epoch) = &job.epoch {
+            epoch.note(&job.sink);
+        }
         // PrefixDrained waited only this job's admitted bytes; later terminal replies or
         // operator input cannot prolong its pending completion and authority lease.
         if let Some(observer) = &job.control_vim {
@@ -1388,373 +1411,7 @@ pub(crate) mod paste_order {
     }
 
     #[cfg(all(test, unix))]
-    mod completion_tests {
-        use super::*;
-        use crate::control_input_ack::{InputMark, testing};
-
-        #[test]
-        fn scoped_writer_drops_stale_queues_and_finishes_the_started_command_before_ack() {
-            use crate::session_timeline::{SupervisorInputDelivery, scoped_input_tests};
-            use aterm_agent::harness::contract::Scope;
-            use std::io::Read;
-            let (handle, mut reader) = testing::owned_handle(74);
-            {
-                let mut timeline = handle.ctx.timeline.lock().unwrap();
-                let at = timeline.slog().now();
-                timeline.slog_mut().open_session(None, None, at);
-            }
-            scoped_input_tests::install(&handle.ctx, 71, &[Scope::Upgrade]);
-            let delivery = SupervisorInputDelivery::new(
-                &handle.ctx,
-                scoped_input_tests::ticket(&handle.ctx, true, Scope::Approvals),
-            );
-            let stale_delivery = SupervisorInputDelivery::new(
-                &handle.ctx,
-                scoped_input_tests::ticket(&handle.ctx, true, Scope::Approvals),
-            );
-            let mark = InputMark::at_epoch(
-                &handle.ctx,
-                74,
-                aterm_slog::Actor::Harness,
-                crate::session_log::InputVerb::Key,
-                None,
-                false,
-            )
-            .supervised(delivery.batch());
-            let stale_mark = InputMark::at_epoch(
-                &handle.ctx,
-                74,
-                aterm_slog::Actor::Harness,
-                crate::session_log::InputVerb::Key,
-                None,
-                false,
-            )
-            .supervised(stale_delivery.batch());
-            let budget = Arc::new(Budget::new(LIMITS));
-            let job = |byte, completion| {
-                let event = InputEvent::KeySequence(vec![byte]);
-                let bytes = retained_bytes(&event).unwrap();
-                assert!(budget.claim(bytes, false));
-                handle.ctx.sink.claim_ordered_egress();
-                Job {
-                    term: handle.term.clone(),
-                    modes: handle.ctx.modes.clone(),
-                    sink: handle.ctx.sink.clone(),
-                    echo: Some(handle.ctx.output_echo.clone()),
-                    control_vim: None,
-                    ev: event,
-                    ticket: None,
-                    key_ns: crate::metrics::KeyWriteStamp::default(),
-                    hot_key: None,
-                    meter: None,
-                    completion: Some(completion),
-                    written: None,
-                    _reservation: Reservation {
-                        budget: budget.clone(),
-                        sink: handle.ctx.sink.clone(),
-                        bytes,
-                        meter: None,
-                    },
-                }
-            };
-            let queued = job(b'X', stale_mark.completion());
-            run_one(job(b'A', mark.completion()));
-            assert_eq!(testing::byte(&mut reader), b'A');
-            let old_revision = handle
-                .ctx
-                .meta
-                .lock()
-                .unwrap()
-                .supervisor_authority(crate::metrics::now_us())
-                .revision();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let barrier = Arc::new(std::sync::Barrier::new(2));
-            let transition = {
-                let ctx = handle.ctx.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let claim = scoped_input_tests::install(&ctx, 71, &[Scope::Approvals]);
-                    tx.send(claim.revision).unwrap();
-                })
-            };
-            barrier.wait();
-            let since = std::time::Instant::now();
-            while handle
-                .ctx
-                .meta
-                .lock()
-                .unwrap()
-                .supervisor_authority(crate::metrics::now_us())
-                .revision()
-                == old_revision
-            {
-                assert!(
-                    since.elapsed() < Duration::from_secs(60),
-                    "hang: scope renewal never became visible"
-                );
-                aterm_uds::deadline::poll_yield();
-            }
-            assert!(
-                rx.try_recv().is_err(),
-                "first actual write owns the whole logical command"
-            );
-            run_one(queued);
-            let mut byte = [0];
-            assert_eq!(
-                reader.read(&mut byte).unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock,
-                "stale queue emitted no byte"
-            );
-            run_one(job(b'B', mark.completion()));
-            assert_eq!(
-                testing::byte(&mut reader),
-                b'B',
-                "the admitted command's suffix is never truncated"
-            );
-            assert_eq!(
-                testing::input_count(&handle),
-                1,
-                "one logical request, no stale acceptance"
-            );
-            assert!(rx.try_recv().is_err());
-            drop(mark);
-            drop(delivery);
-            assert!(
-                rx.recv_timeout(Duration::from_secs(60))
-                    .expect("hang: batch never drained")
-                    > old_revision
-            );
-            transition.join().unwrap();
-            // Negative control: removing the carried custody from this otherwise identical
-            // job really emits the stale byte. The model law must reject that projection.
-            run_one(job(b'X', stale_mark.supervised(None).completion()));
-            assert_eq!(testing::byte(&mut reader), b'X');
-            let model = aterm_models_harness::scoped_input_drain_model();
-            let mutant = aterm_spec::interp::with_buggy(&model, 1);
-            let mut state = mutant.init_state();
-            for action in ["Queue", "TransitionQueued", "Stale"] {
-                assert!(mutant.fire(action, &mut state));
-            }
-            assert_eq!(state["stale_byte"], 1);
-            assert!(!model.check_invariant("StaleQueueWritesNothing", &state));
-            assert_eq!(budget.used.load(Ordering::Acquire), 0);
-            assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
-        }
-
-        #[test]
-        fn only_completed_nonempty_jobs_mark_the_exact_admitted_log() {
-            let (handle, mut reader) = testing::owned_handle(73);
-            {
-                let mut timeline = handle.ctx.timeline.lock().unwrap();
-                let at = timeline.slog().now();
-                timeline.slog_mut().open_session(None, None, at);
-            }
-            let caller = |word: &str| {
-                Some(crate::typed_by::Caller::new(crate::typed_by::Who::Word(
-                    word.to_owned(),
-                )))
-            };
-            let credited = || handle.ctx.typed.last().map(|t| t.by.words());
-            let mark = InputMark::at_epoch(
-                &handle.ctx,
-                73,
-                aterm_slog::Actor::Bridge,
-                crate::session_log::InputVerb::Feed,
-                None,
-                false,
-            )
-            .typed_by(&handle.ctx, caller("first"));
-            let budget = Arc::new(Budget::new(LIMITS));
-            let job = |event: InputEvent, completion| {
-                let bytes = retained_bytes(&event).expect("tiny job");
-                assert!(budget.claim(bytes, false));
-                handle.ctx.sink.claim_ordered_egress();
-                Job {
-                    term: handle.term.clone(),
-                    modes: handle.ctx.modes.clone(),
-                    sink: handle.ctx.sink.clone(),
-                    echo: Some(handle.ctx.output_echo.clone()),
-                    control_vim: None,
-                    ev: event,
-                    ticket: None,
-                    key_ns: crate::metrics::KeyWriteStamp::default(),
-                    hot_key: None,
-                    meter: None,
-                    completion: Some(completion),
-                    written: None,
-                    _reservation: Reservation {
-                        budget: budget.clone(),
-                        sink: handle.ctx.sink.clone(),
-                        bytes,
-                        meter: None,
-                    },
-                }
-            };
-            let (tx, rx) = sync_channel(1);
-            assert!(
-                tx.try_send(job(InputEvent::KeySequence(vec![b'Q']), mark.completion()))
-                    .is_ok()
-            );
-            assert_eq!(
-                testing::input_count(&handle),
-                0,
-                "admission is not acceptance"
-            );
-            assert_eq!(credited(), None, "queue admission gives no credit");
-            run_one(rx.try_recv().expect("owned admitted job"));
-            assert_eq!(credited().as_deref(), Some("first"));
-            assert_eq!(testing::byte(&mut reader), b'Q');
-            assert_eq!(
-                testing::input_count(&handle),
-                1,
-                "ordinary actual completion marks"
-            );
-            assert_eq!(budget.used.load(Ordering::Acquire), 0);
-            let cancelled = InputMark::at_epoch(
-                &handle.ctx,
-                73,
-                aterm_slog::Actor::Harness,
-                crate::session_log::InputVerb::Key,
-                None,
-                false,
-            )
-            .typed_by(&handle.ctx, caller("cancelled"));
-            drop(job(
-                InputEvent::KeySequence(vec![b'X']),
-                cancelled.completion(),
-            ));
-            assert_eq!(budget.used.load(Ordering::Acquire), 0);
-            assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
-            assert_eq!(
-                credited().as_deref(),
-                Some("first"),
-                "unrun job kept no credit"
-            );
-            let refused = InputMark::at_epoch(
-                &handle.ctx,
-                73,
-                aterm_slog::Actor::Ctl,
-                crate::session_log::InputVerb::Key,
-                None,
-                false,
-            )
-            .typed_by(&handle.ctx, caller("next"));
-            for receipt in [
-                crate::input::EgressReceipt::deferred_full(),
-                crate::input::EgressReceipt::queue_full(),
-                crate::input::EgressReceipt::unwritten(crate::input::Egress::Reported(
-                    crate::input::Delivery::Full,
-                )),
-            ] {
-                refused.completion().finish(receipt);
-            }
-            run_one(job(
-                InputEvent::KeySequence(Vec::new()),
-                refused.completion(),
-            ));
-            assert_eq!(
-                testing::input_count(&handle),
-                1,
-                "empty, deferred, refused and cancelled input is unmarked"
-            );
-            assert_eq!(
-                credited().as_deref(),
-                Some("first"),
-                "empty/deferred/refused kept no credit"
-            );
-            run_one(job(
-                InputEvent::KeySequence(vec![b'R']),
-                refused.completion(),
-            ));
-            assert_eq!(testing::byte(&mut reader), b'R');
-            assert_eq!(budget.used.load(Ordering::Acquire), 0);
-            assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
-            assert_eq!(
-                testing::input_count(&handle),
-                2,
-                "CTL_INPUT_MARK_REQUIRES_COMPLETED_NONEMPTY_RECEIPT"
-            );
-            assert_eq!(credited().as_deref(), Some("next"));
-            assert!(testing::paste(&handle, &mark, "Z"));
-            assert_eq!(testing::byte(&mut reader), b'Z');
-            assert_eq!(
-                credited().as_deref(),
-                Some("next"),
-                "one mark credits only its first acceptance"
-            );
-            assert_eq!(testing::input_count(&handle), 2);
-            let stale = InputMark::at_epoch(
-                &handle.ctx,
-                73,
-                aterm_slog::Actor::Harness,
-                crate::session_log::InputVerb::Send,
-                None,
-                false,
-            )
-            .typed_by(&handle.ctx, caller("stale"));
-            {
-                let mut timeline = handle.ctx.timeline.lock().unwrap();
-                let old = timeline.slog().log().ep();
-                let at = timeline.slog().now();
-                timeline.slog_mut().adopt(
-                    crate::session_log::LogAdopt {
-                        ids: Some(crate::session_log::LogCarry {
-                            ep: old,
-                            ids: aterm_slog::IdCounters::default(),
-                        }),
-                        seq: 0,
-                        lines: None,
-                        keeper_ep: None,
-                        mirror: None,
-                    },
-                    false,
-                    None,
-                    at,
-                );
-                timeline.slog_mut().open_session(None, None, at);
-                assert_ne!(timeline.slog().log().ep(), old, "ordinary epoch transition");
-            }
-            run_one(job(InputEvent::KeySequence(vec![b'E']), stale.completion()));
-            assert_eq!(
-                testing::byte(&mut reader),
-                b'E',
-                "acceptance itself is unchanged"
-            );
-            assert_eq!(
-                testing::input_count(&handle),
-                0,
-                "an old request cannot mark a new log epoch"
-            );
-            assert_eq!(
-                credited().as_deref(),
-                Some("next"),
-                "old epoch cannot credit a newer one"
-            );
-            let current = InputMark::at_epoch(
-                &handle.ctx,
-                73,
-                aterm_slog::Actor::Harness,
-                crate::session_log::InputVerb::Send,
-                None,
-                false,
-            )
-            .typed_by(&handle.ctx, caller("current"));
-            run_one(job(
-                InputEvent::KeySequence(vec![b'N']),
-                current.completion(),
-            ));
-            assert_eq!(testing::byte(&mut reader), b'N');
-            assert_eq!(credited().as_deref(), Some("current"));
-            assert_eq!(
-                testing::input_count(&handle),
-                1,
-                "a current-epoch receipt remains observable"
-            );
-            assert_eq!(budget.used.load(Ordering::Acquire), 0);
-            assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
-        }
-    }
+    mod completion_tests;
 
     /// The FIFO sender for `master`, spawning the writer thread on first use.
     fn writer_for(
@@ -1894,10 +1551,12 @@ pub(crate) mod paste_order {
             completion,
             None,
             None,
+            None,
         )
     }
 
-    /// The one submission body behind `enqueue_metered` and the report route.
+    /// The one submission body behind `enqueue_metered`, the queued key route and the report
+    /// route.
     #[allow(
         clippy::too_many_arguments,
         reason = "enqueue_metered's handles, with the tracker optional for an encoded report"
@@ -1914,6 +1573,7 @@ pub(crate) mod paste_order {
         completion: Option<crate::control_input_ack::InputCompletion>,
         written: Option<SyncSender<crate::input::EgressReceipt>>,
         control_vim: Option<crate::control::ControlVim>,
+        epoch: Option<WrittenEpoch>,
     ) -> Result<(), Rejected> {
         let bytes = retained_bytes(&ev).ok_or(Rejected::TooLarge)?;
         let paste = matches!(ev, InputEvent::Paste(..)) || echo.is_none();
@@ -1952,6 +1612,7 @@ pub(crate) mod paste_order {
             completion,
             control_vim,
             written,
+            epoch,
             _reservation: Reservation {
                 budget,
                 sink: Arc::clone(sink),
@@ -1998,9 +1659,11 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> (crate::input::EgressReceipt, bool) {
-        ordered_or_inline_observed(term, modes, sink, echo, ev, ticket, hot_key, None)
+        ordered_or_inline_observed(term, modes, sink, echo, ev, ticket, hot_key, None, None)
     }
 
+    /// [`ordered_or_inline`] with the control lane's completion, and `epoch` for the route that
+    /// writes `ev` to note once its write returned ([`WrittenEpoch`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the receipt follows the existing input capability handles"
@@ -2014,11 +1677,12 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        epoch: Option<&WrittenEpoch>,
     ) -> (crate::input::EgressReceipt, bool) {
         let queue =
             ui_writes_can_block() || is_ordering(sink) || matches!(ev, InputEvent::Paste(..));
         queued_or_inline_observed(
-            queue, term, modes, sink, echo, ev, ticket, hot_key, completion,
+            queue, term, modes, sink, echo, ev, ticket, hot_key, completion, epoch,
         )
     }
 
@@ -2057,7 +1721,7 @@ pub(crate) mod paste_order {
                 .as_ref()
                 .and_then(|observer| observer.capture(term));
             let inline = queued_or_inline_observed(
-                false, term, modes, sink, echo, ev, None, None, completion,
+                false, term, modes, sink, echo, ev, None, None, completion, None,
             );
             if let Some(observer) = control_vim {
                 observer.accepted(vim, ev, inline.0);
@@ -2077,6 +1741,7 @@ pub(crate) mod paste_order {
             completion,
             Some(written),
             control_vim,
+            None,
         ) {
             Ok(()) => (
                 crate::input::EgressReceipt::deferred_full(),
@@ -2102,9 +1767,13 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> (crate::input::EgressReceipt, bool) {
-        queued_or_inline_observed(queue, term, modes, sink, echo, ev, ticket, hot_key, None)
+        queued_or_inline_observed(
+            queue, term, modes, sink, echo, ev, ticket, hot_key, None, None,
+        )
     }
 
+    /// The routing decision carried out: a queued `ev` leaves `epoch` to the ordered writer, an
+    /// inline one notes it as its write returns.
     #[allow(
         clippy::too_many_arguments,
         reason = "the receipt follows the existing input capability handles"
@@ -2119,22 +1788,26 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        epoch: Option<&WrittenEpoch>,
     ) -> (crate::input::EgressReceipt, bool) {
         if queue
             || completion
                 .as_ref()
                 .is_some_and(|completion| completion.is_supervised())
         {
-            match enqueue_metered_observed(
+            match submit(
                 term,
                 modes,
                 sink,
-                echo,
+                Some(echo),
                 ev.clone(),
                 ticket,
                 hot_key,
                 None,
                 completion,
+                None,
+                None,
+                epoch.cloned(),
             ) {
                 Ok(()) => (crate::input::EgressReceipt::deferred_full(), false),
                 Err(_) => (crate::input::EgressReceipt::queue_full(), false),
@@ -2149,6 +1822,9 @@ pub(crate) mod paste_order {
                 crate::input::EgressMode::Interactive,
                 None,
             );
+            if let Some(epoch) = epoch {
+                epoch.note(sink);
+            }
             if let Some(completion) = completion {
                 completion.finish(receipt);
             }
@@ -2244,7 +1920,7 @@ pub(crate) mod paste_order {
         };
         let frame = InputEvent::KeySequence(bytes);
         match submit(
-            term, modes, sink, None, frame, None, None, None, None, tx, None,
+            term, modes, sink, None, frame, None, None, None, None, tx, None, None,
         ) {
             Ok(()) => (crate::input::EgressReceipt::deferred_full(), rx),
             Err(_) => (crate::input::EgressReceipt::queue_full(), None),
@@ -2951,41 +2627,8 @@ impl ErasePriceMemory {
 }
 
 #[cfg(test)]
-mod erase_price_memory_tests {
-    use super::{ErasePriceMemory, grapheme_advances};
-
-    #[test]
-    fn large_commits_keep_only_the_bounded_erase_tail_without_retaining_their_allocation() {
-        let long = "x日e\u{301}👩🏽‍💻·".repeat(4096);
-        for double_width in [false, true] {
-            let mut memory = ErasePriceMemory::default();
-            let mut reference = Vec::new();
-            memory.push(1);
-            memory.push_zeros(ErasePriceMemory::CAP);
-            reference.resize(ErasePriceMemory::CAP, 0);
-            for text in ["ab", "\u{301}", "\u{301}日本", long.as_str(), "⚠️z"] {
-                if aterm_grapheme::str_width(text) > 0 {
-                    reference.extend(grapheme_advances(text, double_width));
-                }
-                if text == long {
-                    assert!(reference.capacity() > 2 * ErasePriceMemory::CAP);
-                }
-                let excess = reference.len().saturating_sub(ErasePriceMemory::CAP);
-                reference.drain(..excess);
-                memory.price_graphemes(text, double_width);
-                assert_eq!(memory.widths(), reference, "{double_width}");
-                assert!(memory.0.capacity() < 4 * ErasePriceMemory::CAP);
-                assert_eq!(memory.pop(), reference.pop());
-            }
-            memory.clear();
-            assert!(memory.widths().is_empty());
-            assert!(memory.0.capacity() < 4 * ErasePriceMemory::CAP);
-            memory.price_graphemes("é", double_width);
-            assert_eq!(memory.pop(), Some(if double_width { 2 } else { 1 }));
-            assert_eq!(memory.pop(), None);
-        }
-    }
-}
+#[path = "app_input_erase_price_memory_tests.rs"]
+mod erase_price_memory_tests;
 
 fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
     let width = if ambiguous_width_double {
@@ -4448,7 +4091,7 @@ impl App {
             let _ = apply_press_custody(&mut terminal, press_kind);
         }
         let (receipt, _) = paste_order::ordered_or_inline_observed(
-            &term, &modes, &sink, &echo, &ev, None, None, completion,
+            &term, &modes, &sink, &echo, &ev, None, None, completion, None,
         );
         if receipt.input_queue_full() {
             self.refuse_input(target_session, InputRefusal::Busy);
@@ -5111,7 +4754,8 @@ impl App {
                                 alt,
                                 display_offset,
                                 print_seq,
-                                epoch: sink.input_epoch(),
+                                epoch: (!paste_order::is_ordering(&sink))
+                                    .then(|| sink.input_epoch()),
                                 at: input_now,
                                 row,
                             };
@@ -5448,6 +5092,7 @@ impl App {
                     },
                     dispatched_at: dispatched,
                 });
+                let written = held_press.then(paste_order::WrittenEpoch::default);
                 let (receipt, wrote_inline) = paste_order::ordered_or_inline_observed(
                     &term,
                     &modes,
@@ -5458,9 +5103,12 @@ impl App {
                     (!inert_modifier && !is_release && !tty_swallows)
                         .then_some((session, self.proxy.as_ref())),
                     completion,
+                    written.as_ref(),
                 );
-                if held_press && let Some(ws) = self.windows.get_mut(&wid) {
-                    crate::aos_host::echo::note_written(&mut ws.aos, sink.input_epoch());
+                if let Some(written) = written
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    crate::aos_host::echo::note_written(&mut ws.aos, written);
                 }
                 let outcome = receipt_outcome(receipt);
                 if outcome == InputOutcome::Ok
@@ -7604,6 +7252,12 @@ impl App {
                     .as_ref()
                     .is_some_and(|key| app.field_composing(key.as_str()))
             }
+            Some(crate::native_app::AppViewState::Tables(state)) => state
+                .common
+                .last_focus
+                .as_ref()
+                .and_then(|key| crate::native_tables::TablesApp::field_input(state, key.as_str()))
+                .is_some_and(|input| input.preedit().is_some()),
             Some(
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Recovery(_)
@@ -7690,6 +7344,12 @@ impl App {
                 };
                 let key = state.common.last_focus.as_ref()?;
                 let text = app.text_input(key.as_str())?.selected_text();
+                (!text.is_empty()).then(|| read(&[text]))
+            }
+            Some(crate::native_app::AppViewState::Tables(state)) => {
+                let key = state.common.last_focus.as_ref()?;
+                let text = crate::native_tables::TablesApp::field_input(state, key.as_str())?
+                    .selected_text();
                 (!text.is_empty()).then(|| read(&[text]))
             }
             Some(
@@ -10511,7 +10171,6 @@ impl App {
                 }
             }
             AuxTarget::Overview => self.open_overview(),
-            AuxTarget::AutopilotMenu => self.open_front_autopilot_menu(),
             AuxTarget::FactMenu => {
                 use crate::claude_lights::Fact;
                 let names: Vec<&str> = Fact::EVERY.into_iter().map(Fact::key).collect();
@@ -10554,10 +10213,6 @@ impl App {
                 }
                 Ok(())
             }
-            AuxTarget::AutopilotMenu => {
-                self.close_autopilot_menu();
-                Ok(())
-            }
             AuxTarget::FactMenu => {
                 self.close_fact_menu();
                 Ok(())
@@ -10577,276 +10232,25 @@ impl App {
 }
 
 #[cfg(all(test, unix))]
-mod forwarded_release_handoff_activity_tests {
-    use crate::{App, WindowId};
-    use aterm_window::keyboard::{KeyCode, PhysicalKey};
-
-    fn arm_pending_overlap(app: &mut App) -> std::sync::mpsc::Receiver<()> {
-        let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
-        app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
-            park_at: std::time::Instant::now(),
-            proof_ready_at: None,
-            attempt_id: 1,
-            nonce: None,
-            live: Vec::new(),
-            adoption: Vec::new(),
-            child_pid: None,
-            mode: crate::native_updater_service::ApplyMode::Immediate,
-            apply_attempt: None,
-            same_image: None,
-            target_build: 0,
-            target_commit: String::new(),
-            layout: crate::restore::RestoreManifest::new(Vec::new()),
-            carry_lone_lists: false,
-            layout_digest: [0; 32],
-            screen_digest: [0; 32],
-            activity_epoch: app.update_handoff_activity_epoch,
-            hold_serials: 0,
-            carried_claims: Vec::new(),
-            cancel,
-            arbiter: crate::HandoffAttemptArbiter::new(),
-            teardown: crate::DeferredHandoffTeardown::None,
-            commit_drain_started: None,
-            commit_flush: None,
-            held_commit: None,
-            revoked_by_activity: false,
-        });
-        cancelled
-    }
-
-    #[test]
-    fn forwarded_release_is_tolerated_while_overlap_pending() {
-        use aterm_types::keyboard::{Key as TKey, Modifiers};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let physical = PhysicalKey::Code(KeyCode::KeyA);
-        app.note_forwarded_press_key(
-            wid,
-            physical,
-            false,
-            TKey::Character('a'),
-            Modifiers::empty(),
-            None,
-            None,
-        );
-        let cancelled = arm_pending_overlap(&mut app);
-        let epoch = app.update_handoff_activity_epoch;
-        app.release_physical_press(wid, physical);
-        assert!(
-            !app.physical_press_owners.contains_key(&physical),
-            "the forwarded episode is closed by its release"
-        );
-        assert_eq!(
-            app.update_handoff_activity_epoch, epoch,
-            "a key release must not bump the activity epoch while an overlap is pending"
-        );
-        assert!(
-            cancelled.try_recv().is_err(),
-            "a key release must not poke the pending overlap's cancel channel"
-        );
-    }
-}
+#[path = "app_input_forwarded_release_handoff_activity_tests.rs"]
+mod forwarded_release_handoff_activity_tests;
 
 #[cfg(test)]
-mod native_aux_alias_tests {
-    use super::native_settings_route_for_aux;
-    use crate::app_introspect::AuxTarget;
-    use crate::native_app::AppViewState;
-    use crate::native_settings::SettingsRoute;
-    use crate::{App, WindowId};
-
-    #[test]
-    fn update_spellings_navigate_native_settings_routes() {
-        for (spelling, route) in [
-            ("update", SettingsRoute::SoftwareUpdate),
-            ("software-update", SettingsRoute::SoftwareUpdate),
-        ] {
-            let target = AuxTarget::parse(spelling).expect("compatibility spelling");
-            assert_eq!(native_settings_route_for_aux(target), Some(route));
-
-            let mut app = App::headless_for_test();
-            assert!(app.open_settings_tab(route));
-            let (_, view) = app
-                .active_native_view(WindowId(0))
-                .expect("native Settings view");
-            assert!(matches!(
-                app.native_runtime.view_state(view),
-                Some(AppViewState::Settings(state)) if state.route == route
-            ));
-            assert!(app.windows[&WindowId(0)].overlay.is_none());
-            assert!(app.close_settings_tabs());
-            assert!(app.active_native_view(WindowId(0)).is_none());
-        }
-    }
-}
+#[path = "app_input_native_aux_alias_tests.rs"]
+mod native_aux_alias_tests;
 
 #[cfg(test)]
-mod native_preferences_menu_tests {
-    use crate::native_app::AppKind;
-    use crate::{App, WindowId};
-
-    #[test]
-    fn open_aterm_toml_menu_command_is_the_native_manual_editor() {
-        const ROOT: &str = "ATERM_NATIVE_PREFERENCES_MENU_ROOT";
-        if !crate::test_alone::in_child() {
-            let root = aterm_tempfile::TempDir::new().unwrap();
-            crate::test_alone::run_alone_with(&[
-                (ROOT, root.path().as_os_str()),
-                ("XDG_CONFIG_HOME", root.path().as_os_str()),
-            ]);
-            return;
-        }
-
-        let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
-        let mut app = App::headless_for_test();
-        app.open_config_editor_in_front()
-            .expect("the menu command opens aterm.toml");
-        assert!(
-            root.join("aterm/aterm.toml").is_file(),
-            "Manual must resolve only the isolated config file"
-        );
-        let (instance, _) = app
-            .active_native_view(WindowId(0))
-            .expect("native Manual editor");
-        assert_eq!(
-            app.native_runtime.app(instance).map(|app| app.kind()),
-            Some(AppKind::Editor)
-        );
-        assert!(app.windows[&WindowId(0)].front_terminal().is_none());
-        assert!(app.windows[&WindowId(0)].overlay.is_none());
-    }
-}
+#[path = "app_input_native_preferences_menu_tests.rs"]
+mod native_preferences_menu_tests;
 
 #[cfg(test)]
-mod serious_mode_command_tests {
-    use crate::App;
-
-    #[test]
-    fn unavailable_config_lane_leaves_runtime_and_service_unchanged_and_reports_failure() {
-        let mut app = App::headless_for_test();
-        let before = app.native_config_service.snapshot();
-        let rows_before = app.messages.live_rows().count();
-        assert!(!app.serious_mode_enabled());
-        assert_eq!(app.config.serious_mode, None);
-        assert!(
-            app.proxy.is_none(),
-            "negative control needs no event-loop host"
-        );
-
-        app.user_toggle_serious_mode();
-
-        assert!(
-            !app.serious_mode_enabled(),
-            "the live suppression policy must not move before durability"
-        );
-        assert_eq!(app.config.serious_mode, None);
-        let after = app.native_config_service.snapshot();
-        assert_eq!(after.revision, before.revision);
-        assert_eq!(after.text, before.text);
-        assert!(
-            app.native_config_pending.is_empty(),
-            "a failed preflight must not leave a command that can apply later"
-        );
-        assert!(
-            app.messages.live_rows().count() > rows_before,
-            "Finder-launched users need visible failure feedback"
-        );
-    }
-}
+#[path = "app_input_serious_mode_command_tests.rs"]
+mod serious_mode_command_tests;
 
 /// `[keybindings]` actions for commands that are otherwise menu items.
 #[cfg(test)]
-mod menu_only_action_dispatch_tests {
-    use crate::keybinding::Action;
-    use crate::{App, WindowId, term_lock};
-
-    fn app_with_three_matches() -> (App, WindowId) {
-        let app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app.pool.get(0).expect("session 0").term.clone();
-        term_lock(&term).process(b"hit one\r\nhit two\r\nhit three");
-        (app, wid)
-    }
-
-    fn current(app: &App, wid: WindowId) -> usize {
-        app.windows[&wid]
-            .search
-            .as_ref()
-            .expect("open find bar")
-            .current
-    }
-
-    #[test]
-    fn find_again_actions_step_an_open_bar_and_resume_a_closed_one() {
-        let (mut app, wid) = app_with_three_matches();
-        app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".into();
-        app.search_recompute();
-        let first = current(&app, wid);
-
-        app.dispatch_action(wid, Action::FindNext);
-        let second = current(&app, wid);
-        assert_ne!(second, first, "find_next stepped the open bar");
-        app.dispatch_action(wid, Action::FindPrev);
-        assert_eq!(current(&app, wid), first, "find_prev stepped back");
-
-        app.search_accept();
-        assert!(
-            app.windows[&wid].search.is_none(),
-            "Enter closed the bar and remembered the query"
-        );
-        app.dispatch_action(wid, Action::FindNext);
-        assert_eq!(
-            app.windows[&wid]
-                .search
-                .as_ref()
-                .expect("find_next reopened the accepted query")
-                .query,
-            "hit",
-        );
-    }
-
-    #[test]
-    fn select_all_action_selects_the_screen_and_defers_to_an_open_find() {
-        let (mut app, wid) = app_with_three_matches();
-        let term = app.pool.get(0).expect("session 0").term.clone();
-        assert!(
-            term_lock(&term).selection_to_string().is_none(),
-            "negative control: nothing selected yet"
-        );
-        app.dispatch_action(wid, Action::SelectAll);
-        let all = term_lock(&term)
-            .selection_to_string()
-            .expect("select_all selected the screen");
-        assert!(all.contains("hit three"), "{all:?}");
-
-        app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit one".into();
-        app.search_recompute();
-        let marked = term_lock(&term)
-            .selection_to_string()
-            .expect("the find marked its match");
-        app.dispatch_action(wid, Action::SelectAll);
-        assert_eq!(
-            term_lock(&term).selection_to_string(),
-            Some(marked),
-            "select_all must not eat the find bar's match highlight",
-        );
-    }
-}
+#[path = "app_input_menu_only_action_dispatch_tests.rs"]
+mod menu_only_action_dispatch_tests;
 
 #[cfg(test)]
 #[path = "app_input_native_keyboard_boundary_tests.rs"]
@@ -10857,145 +10261,12 @@ mod native_keyboard_boundary_tests;
 mod native_clipboard_owner_tests;
 
 #[cfg(test)]
-mod local_repeat_behavior_tests {
-    use crate::{App, LocalRepeatAction, SearchRepeatAction, WindowId, term_lock};
-    use aterm_window::keyboard::{KeyCode, PhysicalKey};
-
-    #[test]
-    fn search_repeat_stays_on_press_window_after_focus_changes() {
-        let mut app = App::headless_for_test();
-        let press_window = WindowId(0);
-        let terminal = app
-            .front_terminal(press_window)
-            .expect("press terminal")
-            .term
-            .clone();
-        term_lock(&terminal).process(b"focus_routing_needle");
-        app.search_enter();
-
-        let session = app
-            .front_terminal(press_window)
-            .expect("press terminal")
-            .session;
-        let physical = PhysicalKey::Code(KeyCode::KeyQ);
-        app.note_local_repeat_press(
-            press_window,
-            physical,
-            LocalRepeatAction::Search {
-                session,
-                action: SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert(
-                    "focus_routing_needle".to_string(),
-                )),
-            },
-        );
-
-        let next_session = app.next_session_id;
-        let arrival_window = app.insert_logical_window(crate::stub_session(next_session), 24, 80);
-        assert_eq!(app.frontmost_window, Some(arrival_window));
-
-        app.route_physical_repeat(arrival_window, physical);
-
-        let search = app.windows[&press_window]
-            .search
-            .as_ref()
-            .expect("press-window search remains open");
-        assert_eq!(search.query, "focus_routing_needle");
-        assert!(
-            !search.matches.is_empty(),
-            "repeat edit must recompute and navigate its press-time window"
-        );
-        assert!(app.windows[&arrival_window].search.is_none());
-        assert!(app.take_local_repeat_release(arrival_window, physical));
-    }
-
-    #[test]
-    fn palette_repeat_stops_when_its_press_time_overlay_closes() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.palette_enter();
-        let physical = PhysicalKey::Code(KeyCode::KeyN);
-        app.note_local_repeat_press(
-            wid,
-            physical,
-            LocalRepeatAction::Palette(crate::app_palette::PaletteKey::Edit(
-                crate::app_search::SearchEdit::Insert("n".to_string()),
-            )),
-        );
-        app.route_physical_repeat(wid, physical);
-        let before_close = app.windows[&wid]
-            .palette()
-            .expect("palette")
-            .controls_lines();
-        assert!(before_close[0].contains("query=\"n\""), "{before_close:?}");
-
-        app.palette_exit();
-        app.route_physical_repeat(wid, physical);
-        assert!(app.windows[&wid].palette().is_none());
-        assert!(app.take_local_repeat_release(wid, physical));
-    }
-}
+#[path = "app_input_local_repeat_behavior_tests.rs"]
+mod local_repeat_behavior_tests;
 
 #[cfg(test)]
-mod ledger_key_tests {
-    //! Keyboard, IME, mouse-modifier, and action dispatch methods on `App`.
-
-    use crate::keybinding::Action;
-    use crate::{App, WindowId};
-    use aterm_window::event::{ElementState, KeyEvent};
-    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
-
-    fn shift_l() -> KeyEvent {
-        KeyEvent::synthetic_for_test(
-            PhysicalKey::Code(KeyCode::KeyL),
-            Key::Character(SmolStr::new("L")),
-            None,
-            KeyLocation::Standard,
-            ElementState::Pressed,
-            false,
-        )
-    }
-
-    #[test]
-    fn cmd_shift_l_composes_the_focused_sessions_ledger_command() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let sid = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session(sid));
-        app.frontmost_window = Some(wid);
-        let stable = app
-            .pool
-            .get(sid)
-            .expect("stub pooled")
-            .ctx
-            .self_id
-            .as_str()
-            .to_string();
-        assert!(app.last_ledger_plan.is_none());
-
-        let fired = app.on_key_super_shift_chord(
-            wid,
-            ModifiersState::SUPER | ModifiersState::SHIFT,
-            &shift_l(),
-        );
-        assert!(fired, "⇧⌘L is consumed, never typed into the PTY");
-        let plan = app.last_ledger_plan.clone().expect("a plan was composed");
-        assert_eq!(plan.sid, stable);
-        assert_eq!(plan.argv[..2], ["drive", "ledger"]);
-        assert_eq!(plan.argv[2], format!("@{stable}"));
-        assert_eq!(plan.argv[3..6], ["--format", "html", "--out"]);
-        assert_eq!(plan.argv[6], plan.out.to_string_lossy());
-
-        app.last_ledger_plan = None;
-        assert!(!app.on_key_super_shift_chord(wid, ModifiersState::SUPER, &shift_l()));
-        assert!(app.last_ledger_plan.is_none());
-
-        app.dispatch_action(wid, Action::OpenLedger);
-        assert_eq!(
-            app.last_ledger_plan.as_ref().map(|p| p.sid.as_str()),
-            Some(stable.as_str())
-        );
-    }
-}
+#[path = "app_input_ledger_key_tests.rs"]
+mod ledger_key_tests;
 
 #[cfg(test)]
 #[path = "app_input_terminal_emacs_search_input_tests.rs"]
@@ -11004,309 +10275,12 @@ mod terminal_emacs_search_input_tests;
 /// The seam classifies a keypad press as its main-block twin, and a person's key sequence that
 /// types only text as that text.
 #[cfg(test)]
-mod keypad_press_class_tests {
-    use super::{
-        OutputEchoInput, PetInputKind, PredictKey, classify_press, classify_sent, is_plain_enter,
-    };
-    use crate::input::InputEvent;
-    use crate::predict::EditKey;
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
-
-    fn press(key: NamedKey, mods: Modifiers) -> InputEvent {
-        InputEvent::Key {
-            key: Key::Named(key),
-            mods,
-            base_layout: None,
-            layout_text: None,
-            event_type: KeyEventType::Press,
-        }
-    }
-
-    #[test]
-    fn keypad_enter_is_a_plain_enter_and_a_turn_boundary() {
-        let kp_enter = press(NamedKey::NumpadEnter, Modifiers::empty());
-        assert!(is_plain_enter(&kp_enter));
-        assert_eq!(
-            OutputEchoInput::of(&kp_enter),
-            OutputEchoInput::TurnBoundary
-        );
-        let class = classify_press(&kp_enter);
-        assert!(class.enter_like && class.keyed_enter);
-        assert!(matches!(class.console_input, Some(PetInputKind::Submit)));
-        assert_eq!(class.typed_forward, Some(true));
-        let shifted = press(NamedKey::NumpadEnter, Modifiers::SHIFT);
-        assert!(!is_plain_enter(&shifted));
-        assert!(classify_press(&shifted).enter_like);
-    }
-
-    #[test]
-    fn a_key_sequence_that_types_only_text_is_classified_as_that_text() {
-        let seq = |bytes: &[u8]| InputEvent::KeySequence(bytes.to_vec());
-        for text in ["#", "ab", "日", "e\u{301}"] {
-            let ev = seq(text.as_bytes());
-            let sent = classify_sent(&ev, true);
-            let typed_ev = InputEvent::Text(text.to_owned());
-            let typed = classify_press(&typed_ev);
-            assert_eq!(sent.typed_forward, Some(true), "{text:?}");
-            assert_eq!(sent.ime, Some(text), "{text:?}");
-            assert_eq!(
-                (
-                    sent.predict_candidate,
-                    sent.brk,
-                    sent.keyed_enter,
-                    sent.line_terminator,
-                    sent.typed
-                ),
-                (
-                    typed.predict_candidate,
-                    typed.brk,
-                    typed.keyed_enter,
-                    typed.line_terminator,
-                    typed.typed
-                ),
-                "{text:?}: exactly the Text of that string"
-            );
-            assert!(matches!(sent.console_input, Some(PetInputKind::Text)));
-            let bytes = classify_sent(&ev, false);
-            assert_eq!(
-                (bytes.typed_forward, bytes.ime, bytes.brk),
-                (None, None, true),
-                "{text:?}: a controller's `send` stays bytes"
-            );
-        }
-        for bytes in [
-            &b"\x1b#"[..],
-            b"#\r",
-            b"\t",
-            b"",
-            b"\xff#",
-            "\u{301}".as_bytes(),
-            b"\x7f",
-            b"\x03",
-        ] {
-            let ev = seq(bytes);
-            let class = classify_sent(&ev, true);
-            assert_eq!(
-                (class.typed_forward, class.ime, class.brk),
-                (None, None, true),
-                "{bytes:?}: not text alone"
-            );
-        }
-    }
-
-    #[test]
-    fn keypad_digit_is_a_typed_glyph() {
-        let five_ev = press(NamedKey::Numpad5, Modifiers::empty());
-        let class = classify_press(&five_ev);
-        assert_eq!(class.typed, Some('5'));
-        assert_eq!(class.predict_candidate, Some(PredictKey::Glyph('5')));
-        assert_eq!(class.typed_forward, Some(true));
-        assert!(matches!(class.console_input, Some(PetInputKind::Text)));
-        assert!(!class.brk);
-        let decimal_ev = press(NamedKey::NumpadDecimal, Modifiers::empty());
-        let decimal = classify_press(&decimal_ev);
-        assert_eq!(decimal.typed, Some('.'));
-        let shifted_ev = press(NamedKey::Numpad5, Modifiers::SHIFT);
-        let shifted = classify_press(&shifted_ev);
-        assert_eq!(shifted.typed, Some('5'));
-        assert_eq!(shifted.predict_candidate, Some(PredictKey::Glyph('5')));
-        let equal_ev = press(NamedKey::NumpadEqual, Modifiers::SHIFT);
-        assert_eq!(classify_press(&equal_ev).typed, Some('='));
-    }
-
-    #[test]
-    fn only_bare_arrows_and_backspace_are_edit_keys() {
-        let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
-        for locks in [
-            Modifiers::CAPS_LOCK,
-            Modifiers::NUM_LOCK,
-            Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
-        ] {
-            assert_eq!(
-                candidate(NamedKey::ArrowRight, locks),
-                Some(PredictKey::Edit(EditKey::Right)),
-                "{locks:?}"
-            );
-            assert_eq!(
-                candidate(NamedKey::ArrowLeft, locks | Modifiers::ALT),
-                None,
-                "{locks:?} with Alt is a word motion"
-            );
-        }
-        for mods in [Modifiers::HYPER, Modifiers::META] {
-            assert_eq!(candidate(NamedKey::ArrowLeft, mods), None, "{mods:?}");
-        }
-        assert_eq!(
-            candidate(NamedKey::ArrowLeft, Modifiers::empty()),
-            Some(PredictKey::Edit(EditKey::Left))
-        );
-        assert_eq!(
-            candidate(NamedKey::ArrowRight, Modifiers::empty()),
-            Some(PredictKey::Edit(EditKey::Right))
-        );
-        assert_eq!(
-            candidate(NamedKey::Backspace, Modifiers::empty()),
-            Some(PredictKey::Edit(EditKey::Backspace))
-        );
-        for mods in [
-            Modifiers::SHIFT,
-            Modifiers::CTRL,
-            Modifiers::ALT,
-            Modifiers::SUPER,
-        ] {
-            assert_eq!(candidate(NamedKey::ArrowLeft, mods), None, "{mods:?}");
-        }
-        for locks in [Modifiers::empty(), Modifiers::NUM_LOCK] {
-            assert_eq!(
-                candidate(NamedKey::NumpadArrowLeft, locks),
-                Some(PredictKey::Edit(EditKey::Left)),
-                "the keypad's ←, {locks:?}"
-            );
-            assert_eq!(
-                candidate(NamedKey::NumpadArrowRight, locks),
-                Some(PredictKey::Edit(EditKey::Right)),
-                "the keypad's →, {locks:?}"
-            );
-        }
-        assert_eq!(
-            candidate(NamedKey::NumpadArrowLeft, Modifiers::SHIFT),
-            None,
-            "a chord on the keypad is a chord"
-        );
-        assert_eq!(candidate(NamedKey::ArrowUp, Modifiers::empty()), None);
-    }
-
-    #[test]
-    fn home_end_delete_and_ctrl_a_e_are_learned_edit_keys() {
-        let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
-        for (key, edit) in [
-            (NamedKey::Home, EditKey::Home),
-            (NamedKey::End, EditKey::End),
-            (NamedKey::Delete, EditKey::Delete),
-        ] {
-            for locks in [
-                Modifiers::empty(),
-                Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
-            ] {
-                assert_eq!(
-                    candidate(key, locks),
-                    Some(PredictKey::Edit(edit)),
-                    "{key:?} {locks:?}"
-                );
-            }
-            for mods in [
-                Modifiers::SHIFT,
-                Modifiers::ALT,
-                Modifiers::SUPER,
-                Modifiers::CTRL,
-            ] {
-                assert_eq!(candidate(key, mods), None, "{key:?} {mods:?}");
-            }
-        }
-        for key in [
-            NamedKey::NumpadHome,
-            NamedKey::NumpadEnd,
-            NamedKey::NumpadDelete,
-        ] {
-            assert_eq!(candidate(key, Modifiers::empty()), None, "{key:?}");
-        }
-        let chord = |c: char, mods| {
-            classify_press(&InputEvent::Key {
-                key: Key::Character(c),
-                mods,
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            })
-            .predict_candidate
-        };
-        for (c, edit) in [('a', EditKey::CtrlA), ('e', EditKey::CtrlE)] {
-            assert_eq!(
-                chord(c, Modifiers::CTRL),
-                Some(PredictKey::Edit(edit)),
-                "Ctrl-{c}"
-            );
-            assert_eq!(
-                chord(c, Modifiers::CTRL | Modifiers::NUM_LOCK),
-                Some(PredictKey::Edit(edit)),
-                "Ctrl-{c} with a lock"
-            );
-            for mods in [
-                Modifiers::CTRL | Modifiers::SHIFT,
-                Modifiers::CTRL | Modifiers::ALT,
-                Modifiers::CTRL | Modifiers::SUPER,
-            ] {
-                assert_eq!(chord(c, mods), None, "{c} {mods:?}");
-            }
-            assert_eq!(chord(c, Modifiers::empty()), Some(PredictKey::Glyph(c)));
-        }
-        assert_eq!(chord('b', Modifiers::CTRL), None, "Ctrl-B is not modelled");
-    }
-
-    #[test]
-    fn keypad_navigation_and_delete_classify_as_their_twins() {
-        let left_ev = press(NamedKey::NumpadArrowLeft, Modifiers::empty());
-        let left = classify_press(&left_ev);
-        assert!(left.navigation_key && left.brk);
-        assert!(matches!(left.console_input, Some(PetInputKind::Navigate)));
-        let end_ev = press(NamedKey::NumpadEnd, Modifiers::empty());
-        assert!(classify_press(&end_ev).navigation_key);
-        let del_ev = press(NamedKey::NumpadDelete, Modifiers::empty());
-        let del = classify_press(&del_ev);
-        assert!(del.kill_key && !del.kill_moves && del.kill_word);
-        assert!(matches!(del.console_input, Some(PetInputKind::Delete)));
-    }
-
-    #[test]
-    fn keypad_begin_and_the_main_block_are_untouched() {
-        let begin_ev = press(NamedKey::NumpadBegin, Modifiers::empty());
-        let begin = classify_press(&begin_ev);
-        assert_eq!(begin.typed, None);
-        assert!(!begin.navigation_key && !begin.enter_like && !begin.kill_key);
-        assert!(begin.console_input.is_none());
-        let five = InputEvent::Key {
-            key: Key::Character('5'),
-            mods: Modifiers::empty(),
-            base_layout: None,
-            layout_text: None,
-            event_type: KeyEventType::Press,
-        };
-        assert_eq!(classify_press(&five).typed, Some('5'));
-        assert!(is_plain_enter(&press(NamedKey::Enter, Modifiers::empty())));
-    }
-}
+#[path = "app_input_keypad_press_class_tests.rs"]
+mod keypad_press_class_tests;
 
 #[cfg(test)]
-mod mouse_cell_clobber_tests {
-    use crate::App;
-    use crate::WindowId;
-    use crate::input::{InputEvent, PixelOffset, Source};
-    use aterm_core::selection::SelectionSide;
-
-    #[test]
-    fn mouse_move_does_not_clobber_pane_local_cell() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.windows.get_mut(&wid).unwrap().last_mouse_cell = (5, 7);
-        let _ = app.input(
-            wid,
-            InputEvent::MouseMove {
-                buttons: 3,
-                row: 30,
-                col: 30,
-                mods: 0,
-                side: SelectionSide::Left,
-                px_off: PixelOffset::CELL_ORIGIN,
-            },
-            Source::Human,
-        );
-        assert_eq!(
-            app.windows.get(&wid).unwrap().last_mouse_cell,
-            (5, 7),
-            "the seam must not overwrite the pane-local last_mouse_cell"
-        );
-    }
-}
+#[path = "app_input_mouse_cell_clobber_tests.rs"]
+mod mouse_cell_clobber_tests;
 
 #[cfg(test)]
 #[path = "app_input_kitty_orphan_release_tests.rs"]
@@ -11358,83 +10332,8 @@ mod pane_focus_key_tests;
 mod paste_cursor_gesture_tests;
 
 #[cfg(test)]
-mod predictive_echo_input_gate_tests {
-    use std::time::{Duration, Instant};
-
-    use crate::input::{InputEvent, Source};
-    use crate::{App, WindowId, term_lock};
-    use aterm_predict::PredictMode;
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-    fn printable(ch: char) -> InputEvent {
-        InputEvent::Key {
-            key: Key::Character(ch),
-            mods: Modifiers::empty(),
-            base_layout: None,
-            layout_text: None,
-            event_type: KeyEventType::Press,
-        }
-    }
-
-    #[test]
-    fn codex_report_event_types_never_arms_the_expiry_erase() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-
-        let model = aterm_models_core::predictive_echo_visibility_model();
-        let mut model_state = model.init_state();
-
-        app.config.predictive_echo = Some("adaptive".to_string());
-        let now = Instant::now();
-        let first_confirmed = now + Duration::from_millis(60);
-        let second_confirmed = first_confirmed + Duration::from_millis(60);
-        {
-            let predictor = &mut app.windows.get_mut(&wid).expect("window").predictor;
-            predictor.set_mode(PredictMode::Adaptive);
-            assert!(predictor.predict_char('a', (0, 0), 0, 80, now));
-            predictor.reconcile(Some((0, 1)), 0, false, first_confirmed, |row, col| {
-                ((row, col) == (0, 0)).then_some('a')
-            });
-            assert!(predictor.predict_char('b', (0, 1), 0, 80, first_confirmed));
-            predictor.reconcile(Some((0, 2)), 0, false, second_confirmed, |row, col| {
-                ((row, col) == (0, 1)).then_some('b')
-            });
-            assert!(predictor.predict_char('c', (0, 2), 0, 80, second_confirmed));
-            assert!(predictor.is_displaying(second_confirmed));
-        }
-        assert!(model.fire("ConfirmSlow", &mut model_state));
-        assert!(model.fire("Key", &mut model_state));
-        assert_eq!(model_state["pending"], 1);
-        assert_eq!(model_state["visible"], 1);
-
-        assert!(
-            app.windows[&wid].predictor.next_deadline().is_some(),
-            "control: the pre-Codex visible guess armed the 250 ms self-heal"
-        );
-
-        term_lock(&term).process(b"\x1b[>7u");
-        assert!(model.fire("EnterComposer", &mut model_state));
-        crate::app_input::pin_input_clock(Some(second_confirmed));
-        let _ = app.input(wid, printable('c'), Source::Human);
-        assert!(model.fire("Key", &mut model_state));
-        let predictor = &app.windows[&wid].predictor;
-        assert!(
-            predictor.idle(),
-            "the app-owned composer flushes prior guesses"
-        );
-        assert_eq!(model_state["pending"], 0);
-        assert_eq!(model_state["visible"], 0);
-        assert!(
-            predictor.next_deadline().is_none(),
-            "Codex input must not arm a delayed erase"
-        );
-    }
-}
+#[path = "app_input_predictive_echo_input_gate_tests.rs"]
+mod predictive_echo_input_gate_tests;
 
 /// Typed-word summon plumbing (the detector's laws are proven in `aterm_effects::kitty_summon`).
 #[cfg(test)]
@@ -11491,158 +10390,8 @@ mod key_layer_tests;
 /// The `tone` control verb's App half ([`App::tone_status`]): the readout that makes an
 /// audible-only feature diagnosable.
 #[cfg(test)]
-mod tone_status_tests {
-    use crate::input::{InputEvent, Source};
-    use crate::trail_audio::TrailAudio;
-    use crate::{App, WindowId};
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-    fn key(character: char) -> InputEvent {
-        InputEvent::Key {
-            key: Key::Character(character),
-            mods: Modifiers::empty(),
-            base_layout: None,
-            layout_text: None,
-            event_type: KeyEventType::Press,
-        }
-    }
-
-    fn type_line(app: &mut App, wid: WindowId, line: &str) {
-        for ch in line.chars() {
-            let _ = app.input(wid, key(ch), Source::Human);
-        }
-    }
-
-    #[test]
-    fn a_muted_build_reports_the_gate_that_stopped_the_classifier() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(!app.trail_audio.is_live(), "the headless host is sealed");
-        type_line(&mut app, wid, "why is this broken again ugh");
-
-        let line = app.tone_status().expect("the fixture window is focused");
-        assert!(line.contains("audio=inert"), "{line}");
-        assert!(line.contains("active=false"), "{line}");
-        assert!(line.contains("inferences=0"), "{line}");
-        assert!(line.contains("tone=technical"), "{line}");
-        assert!(
-            line.contains("window_chars=28"),
-            "the window tracks the typed text even while inference is off: {line}",
-        );
-    }
-
-    #[test]
-    fn a_live_build_reports_the_classified_mood_and_that_the_model_ran() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.trail_audio = TrailAudio::capturing_for_test();
-        app.config.trail_sound_volume = Some(0.65);
-        type_line(&mut app, wid, "why is this broken again ugh");
-
-        let line = app.tone_status().expect("the fixture window is focused");
-        assert!(line.contains("tone=frustrated"), "{line}");
-        assert!(line.contains("effective=frustrated"), "{line}");
-        assert!(line.contains("audio=live"), "{line}");
-        assert!(line.contains("active=true"), "{line}");
-        assert!(line.contains("knob=on sounds=on volume=0.65"), "{line}");
-        assert!(!line.contains("inferences=0"), "the model ran: {line}");
-    }
-
-    #[test]
-    fn a_disabled_knob_separates_the_verdict_from_what_the_synth_hears() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.trail_audio = TrailAudio::capturing_for_test();
-        type_line(&mut app, wid, "why is this broken again ugh");
-        app.config.tone_melody = Some(false);
-
-        let line = app.tone_status().expect("the fixture window is focused");
-        assert!(line.contains("tone=frustrated"), "{line}");
-        assert!(line.contains("effective=technical"), "{line}");
-        assert!(line.contains("knob=off"), "{line}");
-        assert!(line.contains("active=false"), "{line}");
-    }
-
-    #[test]
-    fn a_windowless_app_refuses_rather_than_inventing_a_row() {
-        let mut app = App::headless_for_test();
-        app.frontmost_window = None;
-        assert!(app.tone_status().is_err());
-    }
-
-    #[test]
-    fn the_status_line_never_carries_the_typed_text() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.trail_audio = TrailAudio::capturing_for_test();
-        let secret = "hunter2correcthorse";
-        type_line(&mut app, wid, secret);
-
-        let line = app.tone_status().expect("the fixture window is focused");
-        assert!(
-            !line.contains("hunter") && !line.contains("horse"),
-            "the window text must never reach the wire: {line}",
-        );
-        let chars: Vec<char> = secret.chars().collect();
-        for window in chars.windows(4) {
-            let needle: String = window.iter().collect();
-            assert!(
-                !line.contains(&needle),
-                "no partial leak either ({needle}): {line}",
-            );
-        }
-        assert!(
-            line.contains(&format!("window_chars={}", secret.len())),
-            "only the count is reported: {line}",
-        );
-    }
-
-    fn seam_row_after_one_frame(app: &mut App) -> String {
-        let wid = WindowId(0);
-        let fx = crate::app_render::CursorFxInputs::sample_for_test(std::time::Instant::now());
-        app.cursor_frame(wid, fx).expect("one cursor frame");
-        app.tone_status().expect("the fixture window is focused")
-    }
-
-    fn audible_app(style: &str) -> App {
-        let mut app = App::headless_for_test();
-        app.trail_audio = TrailAudio::capturing_for_test();
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some(style.into());
-        app.config.trail_sounds = Some(true);
-        app
-    }
-
-    #[test]
-    fn a_dimmed_aurora_reads_trail_off_never_engine_silent() {
-        let mut app = audible_app("rainbow kitty");
-        app.config.cursor_trail_intensity = Some(0.0);
-        let line = seam_row_after_one_frame(&mut app);
-        assert!(line.contains("seam=closed:trail-off"), "{line}");
-        assert!(line.contains("trail=off"), "{line}");
-        assert!(line.contains("engine_sound=closed"), "{line}");
-        assert!(!line.contains("engine-silent"), "{line}");
-    }
-
-    #[test]
-    fn a_reduce_motion_trail_is_dark_but_on_and_heard() {
-        let mut app = audible_app("rainbow kitty");
-        app.system_reduce_motion = true;
-        let line = seam_row_after_one_frame(&mut app);
-        assert!(line.contains("seam=open"), "{line}");
-        assert!(line.contains("trail=on"), "{line}");
-        assert!(line.contains("engine_sound=open"), "{line}");
-    }
-
-    #[test]
-    fn a_classic_window_is_heard_and_the_verb_says_so() {
-        let mut app = audible_app("classic");
-        let line = seam_row_after_one_frame(&mut app);
-        assert!(line.contains("seam=open"), "{line}");
-        assert!(line.contains("engine_sound=open"), "{line}");
-        assert!(line.contains("trail=on"), "{line}");
-    }
-}
+#[path = "app_input_tone_status_tests.rs"]
+mod tone_status_tests;
 
 /// The inline rename field through the shipping `on_key` with real winit events.
 #[cfg(test)]
@@ -11656,437 +10405,22 @@ mod controller_clipboard_tests;
 
 /// The person at the keyboard (`human_ms=`, `EVENT <local> human`).
 #[cfg(all(test, unix))]
-mod person_presence_tests {
-    use std::sync::Arc;
-
-    use super::pet_console_input_tests::observing_app as app;
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
-
-    use crate::input::{InputEvent, InputOutcome, PasteFraming, Source};
-    use crate::{App, SessionCtx, WindowId};
-
-    const CTL: Source = Source::Controller;
-
-    fn ctx(app: &App) -> Arc<SessionCtx> {
-        let session = app.front_terminal(WindowId(0)).unwrap().session;
-        app.pool.get(session).unwrap().ctx.clone()
-    }
-
-    fn human_events(ctx: &SessionCtx) -> usize {
-        ctx.timeline
-            .lock()
-            .unwrap()
-            .since(None)
-            .filter(|e| e.kind == "human")
-            .count()
-    }
-
-    fn typing() -> Vec<InputEvent> {
-        vec![
-            InputEvent::Key {
-                key: Key::Character('x'),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            },
-            InputEvent::Key {
-                key: Key::Named(NamedKey::Escape),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            },
-            InputEvent::Text("typed".into()),
-            InputEvent::KeySequence(b"\x1b[D".to_vec()),
-            InputEvent::Paste("pasted".into(), PasteFraming::AtDrain),
-        ]
-    }
-
-    fn click(pressed: bool) -> InputEvent {
-        InputEvent::MouseButton {
-            button: aterm_types::mouse::MouseButton::Left,
-            pressed,
-            row: 1,
-            col: 1,
-            mods: 0,
-            click_count: 1,
-            side: aterm_core::selection::SelectionSide::Left,
-            block: false,
-            suppress_copy_on_select: false,
-            px_off: crate::input::PixelOffset::CELL_ORIGIN,
-        }
-    }
-
-    fn pointer_move(buttons: u8) -> InputEvent {
-        InputEvent::MouseMove {
-            buttons,
-            row: 2,
-            col: 3,
-            mods: 0,
-            side: aterm_core::selection::SelectionSide::Left,
-            px_off: crate::input::PixelOffset::CELL_ORIGIN,
-        }
-    }
-
-    fn pointing() -> Vec<InputEvent> {
-        vec![
-            click(true),
-            pointer_move(0),
-            InputEvent::Wheel {
-                dir: aterm_types::mouse::WheelDir::Up,
-                lines: 3,
-                detent: true,
-                row: 1,
-                col: 1,
-                mods: 0,
-                px_off: crate::input::PixelOffset::CELL_ORIGIN,
-            },
-            InputEvent::ScrollView(crate::input::ScrollIntent::Up),
-        ]
-    }
-
-    #[test]
-    fn a_window_keystroke_stamps_human_ms_and_a_control_write_never_does() {
-        for event in typing().into_iter().chain(pointing()) {
-            let (mut app, _reader) = app();
-            let ctx = ctx(&app);
-            assert_eq!(app.input(WindowId(0), event.clone(), CTL), InputOutcome::Ok);
-            assert_eq!(ctx.human_input.ms_since(crate::metrics::now_us()), None);
-            assert_eq!(
-                ctx.human_input.wire(crate::metrics::now_us()),
-                "-",
-                "{event:?}"
-            );
-            assert_eq!(human_events(&ctx), 0, "{event:?}");
-            assert_eq!(
-                app.input(WindowId(0), event.clone(), Source::Human),
-                InputOutcome::Ok
-            );
-            let since = ctx.human_input.ms_since(crate::metrics::now_us());
-            assert!(since.is_some_and(|ms| ms < 60_000), "{event:?}: {since:?}");
-            assert!(
-                ctx.human_input.wire(crate::metrics::now_us()) != "-",
-                "{event:?}"
-            );
-            assert_eq!(human_events(&ctx), 1, "{event:?}");
-        }
-    }
-
-    /// THE PERSON'S TYPING IS STAMPED APART (`human_typed_ms=`, 2026-10-30 review 8): a key, text,
-    /// a key sequence or a paste that reaches the program stamps it, while a click, a drag, a
-    /// wheel or a scroll of the view stamps `human_ms` alone, so the harness's hour after the
-    /// person's key never starts at a gesture that says nothing.
-    #[test]
-    fn typing_alone_stamps_human_typed_ms() {
-        for (event, types) in typing()
-            .into_iter()
-            .map(|e| (e, true))
-            .chain(pointing().into_iter().map(|e| (e, false)))
-        {
-            let (mut app, _reader) = app();
-            let ctx = ctx(&app);
-            assert_eq!(
-                app.input(WindowId(0), event.clone(), Source::Human),
-                InputOutcome::Ok
-            );
-            let now = crate::metrics::now_us();
-            assert!(ctx.human_input.ms_since(now).is_some(), "{event:?}");
-            assert_eq!(
-                ctx.human_input.typed_ms_since(now).is_some(),
-                types,
-                "{event:?}"
-            );
-            assert_eq!(ctx.human_input.typed_wire(now) != "-", types, "{event:?}");
-        }
-    }
-
-    #[test]
-    fn a_burst_is_one_human_event_and_what_is_not_a_hand_stamps_nothing() {
-        let (mut app, _reader) = app();
-        let ctx = ctx(&app);
-        for event in [
-            InputEvent::Key {
-                key: Key::Character('x'),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Release,
-            },
-            pointer_move(3),
-            InputEvent::Focus(true),
-        ] {
-            let _ = app.input(WindowId(0), event, Source::Human);
-        }
-        assert_eq!(ctx.human_input.ms_since(crate::metrics::now_us()), None);
-        for event in typing().into_iter().chain(pointing()).chain([click(false)]) {
-            let _ = app.input(WindowId(0), event, Source::Human);
-        }
-        assert_eq!(human_events(&ctx), 1);
-    }
-}
+#[path = "app_input_person_presence_tests.rs"]
+mod person_presence_tests;
 
 #[cfg(test)]
 #[path = "app_input/native_ime_owner_tests.rs"]
 mod native_ime_owner_tests;
 
 #[cfg(test)]
-mod native_ime_selection_tests {
-    use super::*;
-    use crate::native_app::{ActionInvocation, AppEvent, AppViewState, TextInputEvent};
-    use crate::native_text_input::TextSelection;
-
-    #[test]
-    fn native_ime_preedit_preserves_platform_byte_selection_through_the_input_route() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
-        app.dispatch_native_event(
-            wid,
-            AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new("settings/search"),
-                value: None,
-            }),
-        )
-        .unwrap();
-        app.on_ime_commit(wid, "aβz".to_string());
-        let (_, view) = app.active_native_view(wid).unwrap();
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
-            panic!("Settings view");
-        };
-        state.search_input.set_selection(1, 3);
-        let original = state.search_input.clone();
-
-        for (text, cursor, expected) in [
-            ("e\u{301}日本", Some((3, 3)), 4..4),
-            ("e\u{301}日本", Some((3, 6)), 4..7),
-            ("e\u{301}日本", Some((1, 3)), 1..4),
-            ("e\u{301}日本", Some((2, 3)), 10..10),
-            ("e\u{301}日本", Some((6, 3)), 10..10),
-            ("e\u{301}日本", Some((0, 99)), 10..10),
-            ("e\u{301}日本", None, 10..10),
-            ("👩‍💻日", Some((11, 11)), 12..12),
-            ("👩‍💻日", Some((4, 7)), 1..1),
-            ("👩‍💻日", Some((5, 7)), 15..15),
-        ] {
-            app.on_ime_preedit(wid, text.to_string(), cursor);
-            let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
-                panic!("Settings view");
-            };
-            let projection = state.search_input.projection();
-            assert_eq!(state.search_input.value(), "aβz", "preedit is transient");
-            assert_eq!(projection.text, format!("a{text}z"));
-            assert_eq!(projection.preedit, Some(1..1 + text.len()));
-            assert_eq!(
-                projection.selection,
-                TextSelection {
-                    anchor: expected.start,
-                    head: expected.end
-                },
-                "platform selection {cursor:?} in {text:?}"
-            );
-        }
-
-        let mut lost_range = original;
-        lost_range.set_preedit("e\u{301}日本".to_string(), None);
-        app.on_ime_preedit(wid, "e\u{301}日本".to_string(), Some((3, 3)));
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
-            panic!("Settings view");
-        };
-        assert_ne!(
-            state.search_input.projection().selection,
-            lost_range.projection().selection
-        );
-
-        app.on_ime_preedit(wid, String::new(), None);
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
-            panic!("Settings view");
-        };
-        assert!(state.search_input.preedit().is_none());
-        assert_eq!(state.search_input.value(), "aβz");
-        assert_eq!(state.search_input.selection().range(), 1..3);
-        assert!(app.windows[&wid].preedit.is_empty());
-
-        app.on_ime_preedit(wid, "候補".to_string(), Some((0, 3)));
-        app.on_ime_commit(wid, "語".to_string());
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
-            panic!("Settings view");
-        };
-        assert_eq!(state.search_input.value(), "a語z");
-        assert_eq!(state.search_input.selection(), &TextSelection::caret(4));
-        assert!(state.search_input.preedit().is_none());
-        app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::Undo))
-            .unwrap();
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
-            panic!("Settings view");
-        };
-        assert_eq!(
-            state.search_input.value(),
-            "aβz",
-            "one commit is one undo frame"
-        );
-        assert_eq!(state.search_input.selection().range(), 1..3);
-
-        use crate::native_app::{NativeApp, SemanticInput};
-        use aterm_window::keyboard::{KeyCode, KeyLocation, PhysicalKey, SmolStr};
-        let press = |app: &mut App| {
-            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-            for state in [ElementState::Pressed, ElementState::Released] {
-                app.on_key(
-                    wid,
-                    KeyEvent::synthetic_for_test(
-                        PhysicalKey::Code(KeyCode::KeyN),
-                        Key::Character(SmolStr::new("n")),
-                        Some(SmolStr::new("n")),
-                        KeyLocation::Standard,
-                        state,
-                        false,
-                    ),
-                );
-            }
-        };
-        assert!(app.open_system_state_tab());
-        // The worker's read names the plan in force; a page opened by hand
-        // submits nothing before it.
-        app.publish_system_state(crate::system_state::SetupStatus {
-            plan: Some(aterm_types::macos_setup::Plan::default()),
-            ..crate::system_state::SetupStatus::default()
-        });
-        let (instance, _) = app.active_native_view(wid).unwrap();
-        for field in ["system-state/url", "system-state/password"] {
-            app.dispatch_native_event(
-                wid,
-                AppEvent::Action(ActionInvocation {
-                    id: crate::native_ui::ActionId::new(field),
-                    value: Some(SemanticInput::Text(String::new())),
-                }),
-            )
-            .unwrap();
-            let projection = |app: &App| {
-                let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
-                    panic!("System State app");
-                };
-                model.field_projection(field).unwrap()
-            };
-            app.on_ime_preedit(wid, "候補".into(), Some((0, 3)));
-            press(&mut app);
-            assert_eq!(
-                projection(&app).text,
-                if field.ends_with("password") {
-                    ""
-                } else {
-                    "候補"
-                },
-                "composing physical keys do not insert into {field}"
-            );
-            if field.ends_with("password") {
-                assert!(projection(&app).preedit.is_none());
-            }
-            app.on_ime_commit(wid, "語".into());
-            press(&mut app);
-            app.on_ime_preedit(wid, "候補".into(), Some((0, 3)));
-            app.on_ime_preedit(wid, String::new(), None);
-            press(&mut app);
-            assert_eq!(
-                projection(&app).text,
-                if field.ends_with("password") {
-                    "•••"
-                } else {
-                    "語nn"
-                },
-                "committed and non-composing input reaches {field} exactly once"
-            );
-        }
-        thread_local! {
-            static JOINED: std::cell::RefCell<Vec<(aterm_types::macos_setup::Plan, Option<aterm_secrets::SecretBytes>)>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
-            apply: |plan, _, password, receipt| {
-                JOINED.with(|joined| joined.borrow_mut().push((plan, password)));
-                receipt.accept();
-                true
-            },
-            ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
-        });
-        app.dispatch_native_event(
-            wid,
-            AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new("system-state/vault/join"),
-                value: None,
-            }),
-        )
-        .unwrap();
-        let mut joined = JOINED.with(|joined| std::mem::take(&mut *joined.borrow_mut()));
-        assert_eq!(joined.len(), 1, "Join delivers one edited plan");
-        let (plan, password) = joined.pop().unwrap();
-        assert_eq!(plan.vault_url, "語nn");
-        assert_eq!(password.unwrap().as_str(), Some("語nn"));
-    }
-}
+#[path = "app_input_native_ime_selection_tests.rs"]
+mod native_ime_selection_tests;
 
 /// The refused-input row's fold: a burst of one cause is one row, and a new cause replaces that
 /// row's line under the same key.
 #[cfg(test)]
-mod refusal_row_tests {
-    use super::{InputRefusal, paste_order};
-
-    #[test]
-    fn only_a_full_queue_refuses_a_paste_busy() {
-        use crate::input::InputOutcome;
-        assert_eq!(
-            super::rejected_outcome(paste_order::Rejected::Full),
-            InputOutcome::QueueFull
-        );
-        assert_eq!(
-            super::rejected_outcome(paste_order::Rejected::TooLarge),
-            InputOutcome::WriteFailed
-        );
-        assert_eq!(
-            super::rejected_outcome(paste_order::Rejected::Unavailable),
-            InputOutcome::WriteFailed
-        );
-    }
-
-    #[test]
-    fn each_refusal_maps_to_its_cause_and_a_burst_is_one_row() {
-        assert_eq!(
-            InputRefusal::of_rejected(paste_order::Rejected::TooLarge),
-            InputRefusal::PasteTooLarge
-        );
-        assert_eq!(
-            InputRefusal::of_rejected(paste_order::Rejected::Full),
-            InputRefusal::Busy
-        );
-        assert_eq!(
-            InputRefusal::of_rejected(paste_order::Rejected::Unavailable),
-            InputRefusal::Unavailable
-        );
-        let mut app = crate::App::headless_for_test();
-        app.clear_messages_for_test();
-        let key = "session.input-full.7";
-        let row = |app: &crate::App| {
-            app.messages
-                .live_by_key(key)
-                .map(|live| (live.id, live.msg.title.clone(), live.msg.detail.clone()))
-        };
-        app.refuse_input(7, InputRefusal::Unavailable);
-        let (first, _, first_detail) = row(&app).expect("the row");
-        for _ in 0..5 {
-            app.refuse_input(7, InputRefusal::Unavailable);
-        }
-        assert_eq!(row(&app).map(|r| r.0), Some(first), "a burst is one row");
-        app.refuse_input(7, InputRefusal::Busy);
-        let (_, _, detail) = row(&app).expect("still one row");
-        assert_ne!(detail, first_detail, "a new cause replaces the line");
-        assert_eq!(
-            app.messages
-                .live_rows()
-                .filter(|live| live.msg.key.as_deref() == Some(key))
-                .count(),
-            1
-        );
-    }
-}
+#[path = "app_input_refusal_row_tests.rs"]
+mod refusal_row_tests;
 
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(

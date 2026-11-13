@@ -185,36 +185,8 @@ fn wait_after_nonterminal_with(pid: u32, ready: impl FnOnce()) -> io::Result<boo
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
-mod tests {
-    use super::*;
-    use crate::spawnfd::{Stdio, command};
-
-    /// The blocking nonterminal path waits on actual kernel exit, preserves the
-    /// owning wait, and needs neither a polling loop nor another process owner.
-    #[test]
-    fn a_stopped_notification_waits_for_real_exit_without_reaping() {
-        let mut child = command("/bin/cat")
-            .start_suspended(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut resumed = false;
-        let seen = wait_after_nonterminal_with(pid, || {
-            child.resume().unwrap();
-            child.stdin.take();
-            resumed = true;
-        });
-        if !resumed {
-            let _ = child.kill();
-        }
-        let status = child.wait().unwrap();
-        assert!(seen.unwrap());
-        assert!(resumed);
-        assert!(status.success(), "the original owner still reaps its child");
-    }
-}
+#[path = "spawnfd_rusage_tests.rs"]
+mod tests;
 
 #[cfg(all(not(target_vendor = "apple"), target_os = "linux"))]
 fn wait_after_nonterminal(_pid: u32) -> io::Result<bool> {

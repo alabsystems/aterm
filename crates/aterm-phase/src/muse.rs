@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 20, "0.20");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 21, "0.21");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -1173,6 +1173,26 @@ fn is_auth_wall(message: &str) -> bool {
     auth.contains(&message) || lost.iter().any(|l| message.starts_with(l))
 }
 
+/// Whether `text` (Muse Code's own words: an RPC error's message, a line of its standard
+/// error) says its Meta login is gone or no longer accepted, wherever in the line the words
+/// stand and in whatever case: the sign-in subset of [`is_auth_wall`]'s messages. A payment or
+/// onboarding wall is no sign-out, and a Keychain read macOS refused says nothing of the login.
+#[must_use]
+pub fn says_signed_out(text: &str) -> bool {
+    let said = [
+        crate::anchor!("muse.wall.no_login"),
+        crate::anchor!("muse.wall.saved_login"),
+        crate::anchor!("muse.wall.still_unauthorized"),
+        crate::anchor!("muse.wall.not_logged_in_cli"),
+        crate::anchor!("muse.wall.not_logged_in_key"),
+        crate::anchor!("muse.wall.invalid"),
+        crate::anchor!("muse.wall.missing"),
+    ];
+    let text = text.to_ascii_lowercase();
+    said.iter()
+        .any(|words| text.contains(&words.to_ascii_lowercase()))
+}
+
 fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
     if is_auth_wall(message) {
         return Some((WallKind::Auth, None));
@@ -2320,8 +2340,9 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
 }
 
 /// Weekly subscription quota percentage and reset text read from a Muse Code `/usage` card:
-/// `text` says the share used (`weekly 22% used`), as the glass says every week
-/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: no `% left`).
+/// `text` says the share left (`weekly 78% left` of a card's `22% used`), as the glass says
+/// every week (`docs/DESIGN-account-discovery-2026-11-09.md` decision 8; aterm-agent's
+/// `harness::left`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsageCardWeekly {
     pub text: String,
@@ -2346,7 +2367,7 @@ pub fn usage_card_weekly(rows: &[String]) -> Option<UsageCardWeekly> {
         .map(|(_, words)| crate::text::trim(words).to_owned())
         .filter(|words| !words.is_empty());
     Some(UsageCardWeekly {
-        text: format!("weekly {}% used", used.min(100)),
+        text: format!("weekly {}% left", 100 - used.min(100)),
         reset,
     })
 }

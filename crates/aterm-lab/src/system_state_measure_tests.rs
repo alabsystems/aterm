@@ -292,6 +292,42 @@ fn words_marks_and_cards_are_read_above_a_lists_fade() {
 }
 
 #[test]
+fn painted_word_bands_distinguish_padding_from_even_a_small_cut_through_words() {
+    let judge = |top: f64, band: &str| {
+        let line = node("t", "text", (8.0, 12.0, 40.0, 36.0), "surface=-").replace(
+            "clip=0.0,0.0,200.0,100.0",
+            &format!("clip=8.0,{top},40.0,{}", 48.0 - top),
+        );
+        let text = text_fit("t", "Words", false)
+            .replace("painted=", &format!("word-band={band} painted="));
+        clip_check(&parse_layout(&format!("{}{line}{text}", head(1.0))).unwrap())
+    };
+    assert!(
+        judge(20.0, "23.0,39.0").pass(),
+        "only the line box's padding was cut"
+    );
+    assert!(
+        !judge(20.0, "18.0,39.0").pass(),
+        "the edge cuts the word band"
+    );
+    assert!(
+        !judge(14.0, "13.0,39.0").pass(),
+        "even a small cut through words fails"
+    );
+    assert!(
+        !judge(20.0, "-").pass(),
+        "missing evidence keeps the line-box check"
+    );
+    assert!(
+        !judge(20.0, "NaN,39.0").pass(),
+        "invalid evidence keeps the line-box check"
+    );
+    let hidden = judge(20.0, "13.0,19.0");
+    assert!(hidden.pass());
+    assert_eq!(hidden.skipped, vec![("hidden", 1)]);
+}
+
+#[test]
 fn clipped_or_ellipsised_words_fail_and_scrolled_away_words_do_not() {
     let fit = |overflow: bool, clipped: bool, visible: bool| {
         let line = node("t", "text", (8.0, 8.0, 40.0, 20.0), "surface=-")

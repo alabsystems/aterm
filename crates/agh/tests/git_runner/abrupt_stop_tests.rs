@@ -326,6 +326,43 @@ fn real_git_pack_completes_through_the_unchanged_cli_collector() {
     assert_eq!(host_git(&repo, &["rev-parse", "refs/agh/test"]), oid);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fresh_home_retains_its_helper_and_unavailable_custody_starts_no_git() {
+    for blocked in [false, true] {
+        let root = World::new("git-helper-admission");
+        assert!(!root.path().join("Library").exists());
+        if blocked {
+            std::fs::write(root.path().join("Library"), b"not a directory").unwrap();
+        }
+        let (oid, pack) = source_pack(root.path());
+        let server = PackServer::new(oid.clone(), pack);
+        server.release(true);
+        let (mut cli, marker, repo) = cli(root.path(), &server.url);
+        let status = wait_status(&mut cli.0);
+        assert_eq!(
+            status.success(),
+            !blocked,
+            "{status:?}: {}",
+            std::fs::read_to_string(root.path().join("cli.stderr")).unwrap()
+        );
+        assert_eq!(
+            marker.exists(),
+            !blocked,
+            "only admitted custody starts Git"
+        );
+        assert_eq!(server.state.posted.load(Ordering::Acquire), !blocked);
+        if blocked {
+            assert_eq!(
+                std::fs::read(root.path().join("Library")).unwrap(),
+                b"not a directory"
+            );
+        } else {
+            assert_eq!(host_git(&repo, &["rev-parse", "refs/agh/test"]), oid);
+        }
+    }
+}
+
 #[test]
 fn abrupt_cli_death_retires_real_git_and_index_pack_without_signalling_a_bystander() {
     let root = World::new("abrupt-real-git-pack");

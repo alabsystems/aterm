@@ -40,8 +40,8 @@ pub enum Outcome {
     Unanswered(String),
     /// The row measured, and its takes are no evidence either way on this machine's load (an
     /// interval too wide, a starved driver). It is stated beside the rows that passed, never a
-    /// finding and never a refusal (owner ruling 2026-11-05: a busy machine never blocks a
-    /// release). A row that could not measure at all is `CouldNotRun`.
+    /// finding and never a refusal (a busy machine never blocks a release: the row is named, not
+    /// counted red). A row that could not measure at all is `CouldNotRun`.
     #[allow(
         dead_code,
         reason = "only paint and rewind judge takes a machine's load can leave undecided; spin and aos mount the same runner"
@@ -62,7 +62,7 @@ struct Counts {
 impl Counts {
     /// 1 for a finding; 3 where a row could not run or went unanswered, or the matrix is empty;
     /// else 0, undecided rows included, a wholly undecided matrix too: a busy machine is stated,
-    /// never a refusal (owner ruling 2026-11-05).
+    /// never a refusal.
     fn exit_code(&self) -> u8 {
         if self.failed != 0 {
             1

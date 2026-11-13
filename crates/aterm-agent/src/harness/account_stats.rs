@@ -672,6 +672,31 @@ pub fn held_windows(
     )
 }
 
+/// The per-model weeks the accounts state holds a figure of for `account`, as `accounts stats`
+/// merges them ([`view`]) with no profile read: a session's screen word on the model's week, a
+/// figure held for its bucket, a wall that named no reset. Each is named by its bucket
+/// ([`Win::name`] is `Fable` for Fable's; a name the cached `/usage` body alone gives is not
+/// read here). A model with no figure is left out.
+#[must_use]
+pub fn held_model_weeks(
+    account: &Account,
+    key: Option<profile::AccountKey>,
+    machine: Option<&str>,
+    now: i64,
+) -> Vec<Win> {
+    let none = Err(NoProfile::NoHome);
+    let mut held = windows_of(
+        Some(account).filter(|a| !a.of_another(key)),
+        &none,
+        machine,
+        Tap::On,
+        now,
+    );
+    held.windows
+        .retain(|w| w.kind == "model_weekly" && w.fig.is_some());
+    held.windows
+}
+
 /// THE TWO WINDOWS aterm HOLDS OF `account` ON A HOME WHOSE PROFILE READ IS `profile`: the
 /// accounts state's figures (every tapped session's on its login, its newest sample, a standing
 /// wall, Claude Code's warning) and the home's cached `/usage` body, merged as `accounts stats`
@@ -680,6 +705,20 @@ pub fn held_windows(
 /// ([`Account::of_another`]).
 #[must_use]
 pub fn home_windows(
+    account: Option<&Account>,
+    profile: &Result<Profile, NoProfile>,
+    machine: Option<&str>,
+    tap: Tap,
+    now: i64,
+) -> View {
+    let mut held = windows_of(account, profile, machine, tap, now);
+    held.windows.retain(|w| w.kind != "model_weekly");
+    held
+}
+
+/// Every window [`view`] gives of `account` on a home whose profile read is `profile`, the
+/// per-model weeks among them.
+fn windows_of(
     account: Option<&Account>,
     profile: &Result<Profile, NoProfile>,
     machine: Option<&str>,
@@ -703,9 +742,7 @@ pub fn home_windows(
         login: None,
         sessions: Err("not-counted"),
     };
-    let mut held = view(&look);
-    held.windows.retain(|w| w.kind != "model_weekly");
-    held
+    view(&look)
 }
 
 /// How a figure's source was read, for its resolution ([`spend::ReadingKind`]).
@@ -821,13 +858,16 @@ pub(super) fn clock_local(t: i64, now: i64, tz_at: &dyn Fn(i64) -> i64) -> Strin
     }
 }
 
-/// A percent in tenths as the text says it. The whole percent is [`super::decimal::whole_used`]'s,
-/// so no reading under 100 is said as `100%`.
-pub fn percent(x10: u32, tenths: bool) -> String {
+/// What is left of a window at `x10` tenths used, as the text says it ([`super::left`]): `37%
+/// left`, to the tenth (`37.5% left`) where the reading carries one. The whole percent is
+/// [`super::left::exact`]'s, so `0% left` is said only of a reading of 100.
+#[must_use]
+pub fn left(x10: u32, tenths: bool) -> String {
     if tenths {
-        format!("{}.{}%", x10 / 10, x10 % 10)
+        let left = 1000 - x10.min(1000);
+        format!("{}.{}% {}", left / 10, left % 10, super::left::WORD)
     } else {
-        format!("{}%", super::decimal::whole_used(x10))
+        super::left::words(x10)
     }
 }
 
@@ -955,11 +995,11 @@ pub(super) fn since_span(s: i64) -> String {
     }
 }
 
-/// A window's `since` as its row says it: `+18 since 24h`, `new window since 13:00` or `reset
+/// A window's `since` as its row says it: `18 used since 24h`, `new window since 13:00` or `reset
 /// used since 13:00`.
 fn since_text(since: &Since, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
     match since.moved {
-        Moved::Rose(points) => format!("+{points} since {}", since_span(since.span_s)),
+        Moved::Rose(points) => format!("{points} used since {}", since_span(since.span_s)),
         Moved::NewWindow(at) => format!("new window since {}", clock_local(at, now, tz_at)),
         Moved::ResetUsed(at) => format!("reset used since {}", clock_local(at, now, tz_at)),
     }
@@ -978,17 +1018,15 @@ fn window_row(
     let mut row = match win.current(now) {
         Some(f) if win.void_at.is_some() => format!(
             "{}, no reset given{DOT}as of {} ({}, {})",
-            percent(f.pct_x10, view.tenths),
+            left(f.pct_x10, view.tenths),
             span(now.saturating_sub(f.at)),
             source_word(&f.source),
             machine_word(&f.by, look)
         ),
         Some(f) => {
-            let left = 1000u32.saturating_sub(f.pct_x10);
             let mut row = format!(
-                "{} used{DOT}{} left{DOT}resets {} (in {})",
-                percent(f.pct_x10, view.tenths),
-                percent(left, view.tenths),
+                "{}{DOT}resets {} (in {})",
+                left(f.pct_x10, view.tenths),
                 clock_local(f.reset, now, tz_at),
                 span(f.reset.saturating_sub(now)),
             );

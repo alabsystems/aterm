@@ -843,6 +843,7 @@ fn take_stage_lock(staging: &Staging, wait: std::time::Duration) -> Result<Stage
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            crate::resume_stopped_lock_holder(&staging.stage_lock, crate::is_an_aterm);
             let fresh = crate::holder_fresh(wait);
             if crate::checker_holder_progressing(&staging.stage_lock, fresh) {
                 StaleStageStamps::forget(&staging.stage_lock);
@@ -1615,10 +1616,7 @@ fn observe_floor_and_withdraw_at(
     if let Some(staged) = Ready::read_published_bundle(staging)
         && let Some(why) = withdrawal(&staged)
     {
-        match aterm_update_core::FileLock::acquire_within(
-            &staging.apply_lock,
-            crate::install::BACKGROUND_LOCK_WAIT,
-        ) {
+        match crate::take_apply_lock(&staging.apply_lock, crate::install::BACKGROUND_LOCK_WAIT) {
             Ok(_apply_lock) => {
                 if Ready::read_published_bundle(staging)
                     .is_some_and(|still| still.build_number == staged.build_number)
@@ -1753,9 +1751,7 @@ fn check_and_stage_in(
     }
     install::sweep_left_incoming_unless_staging(&staging);
     crate::status::clear_check_note();
-    if !crate::is_uncommitted_handoff_candidate() {
-        crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);
-    }
+    install::expire_apply_streak_moved_past(&staging, current_build);
     let floor = floor_snapshot(&staging)?;
 
     let authoritative = match acquire(&staging, current_build, source, (head, latest))? {

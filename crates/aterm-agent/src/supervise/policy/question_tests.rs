@@ -19,7 +19,7 @@ fn recommended_answer(p: &aterm_phase::PromptV2, rows: &[String]) -> Decision {
     answer_question(
         p,
         rows,
-        QuestionPriority::Recommended,
+        QuestionPriority::Word(PriorityWord::Recommended),
         None,
         (false, false),
         Pane::of(rows),
@@ -207,7 +207,7 @@ fn the_security_model_switch_stays_on_the_current_model() {
     assert!(subject.ends_with("→ Stay on Opus 5.5"), "{subject}");
     assert_eq!(
         unproven,
-        "a security alert's model switch: stayed on the current model (owner ruling, 2026-10-16)"
+        "a security alert's model switch: stayed on the current model"
     );
 }
 
@@ -907,7 +907,7 @@ fn muses_question_is_answered_by_the_cursor_and_enter() {
     let long = answer_question(
         &p,
         &rows,
-        QuestionPriority::LongTerm,
+        QuestionPriority::Word(PriorityWord::LongTerm),
         None,
         (false, false),
         Pane::of(&rows),
@@ -916,7 +916,7 @@ fn muses_question_is_answered_by_the_cursor_and_enter() {
         matches!(
             &long,
             Decision::Approve {
-                choice: Choice::Note { text: QuestionPriority::LongTerm },
+                choice: Choice::Note { text: QuestionPriority::Word(PriorityWord::LongTerm) },
                 guard,
                 ..
             } if *guard == row_guard(question_row)

@@ -642,7 +642,7 @@ fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<u
         }
     }
     let evidence = xref::window_is_armed() == Some(true);
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2).min(POOL));
+    let threads = aterm_cores::available_parallelism().map_or(1, |n| n.get().div_ceil(2).min(POOL));
     let (next, stop, judging) = (
         AtomicUsize::new(0),
         AtomicBool::new(false),

@@ -235,8 +235,11 @@ fn drive(
     probe: &Probe,
     now: u64,
 ) -> Result<(), Fail> {
-    check(one.cli(None, &["fleet", "allow", "drive", "--all"]))?;
-    check(two.cli(None, &["fleet", "allow", "drive", "--all"]))?;
+    // A grant says who may drive; each lab Mac's fleet access says how far, and starts Read Only.
+    for mac in [one, two] {
+        check(mac.cli(None, &["fleet", "allow", "drive", "--all"]))?;
+        check(mac.cli(None, &["fleet", "access", "full"]))?;
+    }
     let number = Number::parse("m3").map_err(fail)?;
     let to = aterm_agent::machine_name::NameTo {
         num: number,

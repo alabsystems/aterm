@@ -170,6 +170,10 @@ impl Kernel for LiveKernel {
     fn restart_background(&self, _: u32) -> Vec<String> {
         crate::harness::upgrade_drive::tests::unstated("background")
     }
+
+    fn restart_held(&self, _: u32) -> Option<Vec<crate::harness::upgrade::Held>> {
+        crate::harness::upgrade_drive::tests::unstated("held")
+    }
 }
 
 impl AgyKernel for LiveKernel {

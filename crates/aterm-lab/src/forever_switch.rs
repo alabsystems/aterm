@@ -10,7 +10,7 @@
 //!   the text unshown, which is said beside it as its own number. Main typed it at +124.3 s: the
 //!   first short turn's 2-minute back-off was waited out before the instruction.
 //! * `--mode switch` ([`Chain::SWITCH`]) switches a running Cruise tab's word with `meta set
-//!   autopilot land`, as a chip click, the Autopilot menu or Settings' row does ([`word_step`]):
+//!   autopilot land`, as a chip click or Settings' row does ([`word_step`]):
 //!   - `switch-agent`: at rest in its first short turn's back-off, switched [`SWITCH_AFTER_MS`]
 //!     in: land@v1 within [`LAND_WITHIN_MS`] of the switch and before the back-off's due
 //!     ([`judge_at_rest`]);

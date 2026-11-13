@@ -167,7 +167,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
                         Some(
                             format!(
                                 "the {} landing time is cancelled",
-                                crate::autopilot_menu::when(at)
+                                crate::autopilot_timers::when(at)
                             )
                             .as_str()
                         ),
@@ -753,6 +753,17 @@ fn every_reporter_message() -> Vec<Message> {
             all.extend(one.into_messages());
         }
     }
+    let migration = crate::prefs::CursorMigration {
+        text: String::new(),
+        renamed: vec![crate::prefs::RetiredCursorName {
+            key: crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+            old: "rainbow dog pet".into(),
+            style: "rainbow",
+        }],
+        pet: Some("dog"),
+    };
+    all.push(cursor_names_renamed(&migration));
+    all.push(cursor_names_unwritten(&migration, "read-only file"));
     all.push(crash_message(&crate::logging::CrashEvidence {
         path: std::path::PathBuf::from("/Users/_an/Library/Logs/aterm/crash-1-1.log.seen"),
         head: vec!["aterm-gui 0.1.0 crashed at unix 1.000".into()],
@@ -2936,7 +2947,7 @@ fn asks_a_sign_in(msg: &aterm_messages::Message) -> bool {
         .any(|ask| step.contains(ask))
 }
 
-/// NO CLAUDE ACCOUNTS FACT ASKS A PERSON TO SIGN IN (owner, 2026-10-24: sign-in is autonomous):
+/// NO CLAUDE ACCOUNTS FACT ASKS A PERSON TO SIGN IN (sign-in is autonomous):
 /// the signed-out, due, none-soon, wrong-account and no-sign-in entries each say what aterm did
 /// and why it is not enough, their step the read of each route tried, their rows in Details;
 /// another CLI's due and wrong-account entries, whose rows the upkeep signs in again in the

@@ -12,7 +12,9 @@ macro_rules! harness_mark {
 pub(crate) use harness_mark;
 
 mod account_backfill;
+pub mod account_card;
 pub mod account_catalog;
+pub mod account_history;
 pub mod account_progress;
 pub mod account_series;
 pub mod account_stats;
@@ -36,6 +38,7 @@ pub mod accounts_tokens;
 pub mod acts;
 pub mod agent_image;
 pub mod agents;
+pub mod agy_gate;
 pub mod agy_quota;
 pub mod agy_quota_store;
 #[cfg(unix)]
@@ -52,9 +55,6 @@ mod auth_deadline;
 #[cfg(test)]
 mod auth_deadline_tests;
 pub mod browser_window;
-pub mod challenge_relay;
-#[cfg(unix)]
-mod challenge_window;
 pub mod claims;
 #[cfg(unix)]
 pub mod claude_homes;
@@ -112,6 +112,7 @@ pub mod kimi_wire;
 pub mod land_receipt;
 pub mod lanes;
 pub mod laps;
+pub mod left;
 pub mod leftover;
 pub mod lights;
 pub mod login_drive;
@@ -146,6 +147,7 @@ mod native_record;
 mod native_restart;
 pub mod netwatch;
 pub mod observe;
+pub mod observed_account;
 pub mod open_url;
 pub mod outlook;
 pub mod permission_click;
@@ -160,8 +162,6 @@ pub mod repo_work;
 pub mod restart_stamp;
 pub mod result;
 pub mod resume;
-#[cfg(target_os = "macos")]
-mod safari_window;
 pub mod self_claimed;
 pub mod session_usage;
 /// The setup-token capture: Claude Code's `setup-token` on a private terminal, its token taken
@@ -181,6 +181,7 @@ pub mod timings;
 /// The one judgment of whether a Claude Code launch starts on its vault token
 /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3).
 pub mod token_route;
+pub mod token_state;
 pub use timings::Timings;
 pub(crate) mod transcript;
 pub use transcript::{claude_reads, codex_reads};
@@ -555,84 +556,9 @@ pub mod host_path {
 
 /// The `/bin/sh` stand-ins the harness tests run under a budget.
 #[cfg(all(test, unix))]
-pub(crate) mod stand_in {
-    /// Writes the owner-only `/bin/sh` stand-in `path` running `body`, then runs it once with
-    /// no arguments until it writes `ran` ([`aterm_uds::deadline::prints`]); `body` runs only
-    /// when it is given arguments. macOS's program check assesses a new file at its first exec,
-    /// and a loaded host holds that exec for seconds, which a bounded run of the stand-in (agy's
-    /// usage fetch, a version probe) would count against its budget: the bounded run must meet
-    /// a stand-in that has already run, and the stand-in's directory may go once this returns.
-    pub(crate) fn proven(path: &std::path::Path, body: &str) {
-        use aterm_uds::spawnfd::Stdio;
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(
-            path,
-            format!("#!/bin/sh\nif [ $# -eq 0 ]; then echo ran; exit 0; fi\n{body}\n"),
-        )
-        .expect("write the stand-in");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        let mut child = aterm_uds::spawnfd::command(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the stand-in");
-        aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::ECHO_HANG);
-        aterm_uds::deadline::kill_within(&mut child, aterm_uds::deadline::ECHO_HANG);
-    }
-}
+#[path = "mod_stand_in_tests.rs"]
+pub(crate) mod stand_in;
 
 #[cfg(test)]
-mod tests {
-    use super::{one_line, truncate_bytes};
-
-    #[test]
-    fn one_line_folds_what_a_hand_rolled_control_sweep_misses() {
-        assert_eq!(one_line("  a \n b  ", 99), "a b");
-        assert_eq!(one_line("with\ta tab", 99), "with a tab");
-        assert_eq!(one_line("a\u{2028}b", 99), "a b");
-        assert_eq!(one_line("a\u{2029}b", 99), "a b");
-        assert_eq!(one_line("abcdef", 3), "abc");
-        assert_eq!(one_line("é😀", 2), "é");
-        assert_eq!(one_line("", 0), "");
-        for (text, max) in [
-            ("work", 80),
-            ("a@b.example", 80),
-            ("five hours left", 80),
-            ("(x) ~y_z-1:2", 80),
-            (" lead", 80),
-            ("trail ", 80),
-            ("two  spaces", 80),
-            ("tab\there", 80),
-            ("nb\u{a0}sp", 80),
-            ("\u{3000}ideo", 80),
-            ("cut here", 3),
-            ("", 80),
-        ] {
-            let folded = crate::supervise::limit::one_line(truncate_bytes(text, max))
-                .trim()
-                .to_string();
-            assert_eq!(one_line(text, max), folded, "{text:?} at {max}");
-        }
-    }
-
-    #[test]
-    fn truncate_bytes_never_splits_a_character_and_never_grows_a_string() {
-        assert_eq!(truncate_bytes("abc", 8), "abc");
-        assert_eq!(truncate_bytes("abc", 3), "abc");
-        assert_eq!(truncate_bytes("abc", 2), "ab");
-        assert_eq!(truncate_bytes("abc", 0), "");
-        assert_eq!(truncate_bytes("é", 1), "", "a two-byte character, cut at 1");
-        assert_eq!(truncate_bytes("aé", 2), "a");
-        for max in 0..4 {
-            assert_eq!(truncate_bytes("😀", max), "", "max {max}");
-        }
-        assert_eq!(truncate_bytes("😀", 4), "😀");
-        let mixed = "a😀é b\u{2028}ω";
-        for max in 0..=mixed.len() + 2 {
-            let cut = truncate_bytes(mixed, max);
-            assert!(cut.len() <= max.min(mixed.len()), "max {max}");
-            assert!(mixed.starts_with(cut), "max {max}");
-        }
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

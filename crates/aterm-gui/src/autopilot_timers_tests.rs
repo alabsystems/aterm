@@ -575,7 +575,7 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
         0,
         Some(Autopilot::Cruise),
         Some(land_at),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     assert_eq!(
         app.autopilot_timer_deadline(),
@@ -627,7 +627,7 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
         0,
         Some(Autopilot::Cruise),
         Some(land_at),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     let (reply, changed) = crate::control::cmd_meta(
@@ -654,7 +654,7 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
         0,
         Some(Autopilot::Cruise),
         Some(land_at),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let due = mono + Duration::from_secs(120);
     set_fake_clocks(Some((due, land_at - 30_000)));
@@ -709,7 +709,7 @@ fn closing_the_session_drops_its_timer() {
         terminal,
         Some(Autopilot::Cruise),
         Some(wall + 3_600_000),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     assert!(app.autopilot_timer_deadline().is_some(), "armed");
     assert!(app.close_session_by_id(terminal).is_ok());
@@ -764,7 +764,7 @@ fn the_fire_says_what_it_found() {
             0,
             Some(Autopilot::Cruise),
             Some(land_at),
-            crate::autopilot::Surface::Menu
+            crate::autopilot::Surface::Settings
         ));
         if let Some(policy) = after {
             app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
@@ -857,7 +857,7 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
             session,
             Some(Autopilot::Cruise),
             Some(land_at),
-            crate::autopilot::Surface::Menu
+            crate::autopilot::Surface::Settings
         ));
         set_fake_clocks(Some((mono + Duration::from_secs(120), land_at)));
         app.expire_autopilot_timers();
@@ -915,28 +915,40 @@ fn a_hand_change_names_the_timer_it_dropped() {
         0,
         Some(Autopilot::Cruise),
         Some(land_at),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
-    let when = crate::autopilot_menu::when(
+    let when = crate::autopilot_timers::when(
         glass_of(land_at, wall, &local_offset_at).expect("the zone reads"),
     );
     assert_eq!(
         last_record(&app).0,
         format!("Autopilot cruises until {when}")
     );
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Menu));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     let (title, detail) = last_record(&app);
     assert_eq!(title, "Autopilot set to land");
     assert_eq!(
         detail[detail.len().saturating_sub(2)..],
         [
             format!("the {when} landing time is cancelled"),
-            "set from the Autopilot menu".to_string()
+            "set from Settings \u{25b8} Harness".to_string()
         ],
         "{detail:?}"
     );
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Cruise), crate::autopilot::Surface::Menu));
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Menu));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Settings
+    ));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     let (_, detail) = last_record(&app);
     assert!(
         !detail.iter().any(|l| l.contains("cancelled")),
@@ -951,7 +963,11 @@ fn the_windows_timer_choices_arm_and_cancel() {
     let (mut app, host) = hosted();
     let wall = FRI_19Z * 1000;
     set_fake_clocks(Some((Instant::now(), wall)));
-    assert!(app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu));
+    assert!(app.choose_autopilot_timer(
+        0,
+        TimerChoice::In(60),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(
         stored(&app),
         (Some("cruise".into()), Some(wall + 3_600_000))
@@ -961,28 +977,32 @@ fn the_windows_timer_choices_arm_and_cancel() {
         None,
         "no land_at"
     );
-    assert!(!app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Menu));
+    assert!(!app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Settings));
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nland_at = \"18:00\"\n"),
     );
     assert!(app.resolve_timer_choice(TimerChoice::At).is_some());
-    assert!(app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Menu));
+    assert!(app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Settings));
     let at = stored(&app).1.expect("armed at 18:00");
     assert!(at > wall && at - wall <= 25 * 3_600 * 1000);
-    assert!(app.choose_autopilot_timer(0, TimerChoice::Cancel, crate::autopilot::Surface::Menu));
+    assert!(app.choose_autopilot_timer(
+        0,
+        TimerChoice::Cancel,
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(stored(&app), (Some("cruise".into()), None));
     assert!(app.autopilot_timers.is_empty());
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     assert!(
-        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu),
+        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Settings),
         "master switch"
     );
     assert_eq!(stored(&app), (Some("cruise".into()), None));
     app.harness = None;
     assert!(
-        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu),
+        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Settings),
         "no host"
     );
     set_fake_clocks(None);
@@ -1012,7 +1032,7 @@ fn a_timer_for_a_switched_off_agent_is_refused() {
         );
         set_fake_clocks(Some((Instant::now(), wall)));
         let moved =
-            app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu);
+            app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Settings);
         let pair = stored(&app);
         set_fake_clocks(None);
         host.shutdown_and_join();
@@ -1040,7 +1060,7 @@ fn a_moved_wall_derives_the_due_again() {
         0,
         Some(Autopilot::Cruise),
         Some(wall + 600_000),
-        crate::autopilot::Surface::Menu
+        crate::autopilot::Surface::Settings
     ));
     let woke = mono + Duration::from_secs(1);
     set_fake_clocks(Some((woke, wall + 3_600_000)));

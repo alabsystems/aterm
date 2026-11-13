@@ -19,12 +19,14 @@ use crate::rainbow_kitty::companion::{PetOffer, StarCatch};
 mod console_life;
 #[cfg(test)]
 mod full_screen_tests;
+mod seat;
 #[cfg(any(test, debug_assertions))]
 mod state_words;
 #[cfg(test)]
 mod steam_tests;
 use console_life::ConsoleLife;
 pub use console_life::{PetAttention, PetInputKind};
+pub use seat::{SeatArt, SeatShadow};
 
 const STATION_LEAD: f32 = 1.0;
 const CHASE_GAIN: f32 = 4.0;
@@ -96,6 +98,43 @@ const CHASE_GAIN_FAST: f32 = 6.0;
 /// at the writing's pace ([`PetBrain::wrap_ahead_aim`]): up a row to the caret's and down
 /// again at the wrap is two flights in that time where none is needed.
 const WRAP_WAIT: f32 = 1.5;
+/// The most rows a page moves up in one frame that [`PetBrain::sense_ink`] reads as one rise
+/// ([`PetBrain::ride_the_page`]).
+const PAGE_RISE_ROWS: usize = 3;
+
+/// The rows a page's ink map moved up by from `old` to `new` ([`PetBrain::sense_ink`]): the
+/// fewest, up to [`PAGE_RISE_ROWS`], that every lettered row of `old` below the top went up by
+/// to the span it held, where `new` did not keep them all in place. A blank row may come up
+/// written: an answer printed on the caret's empty line scrolls up with the rows over it, and
+/// the rows that came on at the foot are the page's own. 0 for none, a map of another height,
+/// or one with no lettered row to move.
+#[inline]
+fn page_rise(old: &[(u16, u16)], new: &[(u16, u16)]) -> u16 {
+    let n = old.len();
+    if n != new.len() {
+        return 0;
+    }
+    let lettered = |&(first, end): &(u16, u16)| end > first;
+    let held = |k: usize| {
+        let mut any = false;
+        for (i, span) in old.iter().enumerate().skip(k) {
+            if lettered(span) {
+                if new[i - k] != *span {
+                    return false;
+                }
+                any = true;
+            }
+        }
+        any
+    };
+    if held(0) {
+        return 0;
+    }
+    (1..=PAGE_RISE_ROWS.min(n.saturating_sub(1)))
+        .find(|&k| held(k))
+        .map_or(0, |k| k as u16)
+}
+
 /// How much further ahead (cells) the station stands for writing that steps two cells a key
 /// ([`PetBrain::wide_step`]).
 const WIDE_STEP_LEAD: f32 = 2.0;
@@ -373,6 +412,20 @@ const _: () = assert!(
 #[inline]
 const fn span_eq(dcol: f32, drow: f32) -> f32 {
     crate::color_math::hypot_f32(dcol, ROW_AS_COLS * drow)
+}
+
+/// THE CARET'S CELL IS NO SEAT: whether a body drawn across the columns `(left, right)` on the
+/// caret's row lies on the caret's cell `cc`. A box is its art and a transparent border, which
+/// the caret's cell may meet: the box's first cell (by the margin, where a fitted body is drawn
+/// at its whole box's right edge facing into the line, the fitted cat's fur began 17 of the
+/// box's 40 px in on the trail gallery's 14 x 26 px cells, clear of a caret 0.81 of a cell under
+/// the box) and [`INK_PAD`] at its end. Read past them, the 72-column `last-row` wall seat,
+/// whose caret reads 4.5 and more, would be no seat; read short of them, at 71 columns the bar
+/// caret's cell under the cat's fur read 3.71 ([`PetBrain::wall_meets_the_caret`]).
+#[inline]
+pub const fn lies_on_the_caret((left, right): (f32, f32), cc: u16) -> bool {
+    let c = cc as f32;
+    c > left && c < right - INK_PAD
 }
 
 /// The chosen show's and play's pace, a share of the pane a second ([`quiet_speed_max`]): a
@@ -1838,8 +1891,11 @@ pub enum OldPath {
     /// A body the margin holds at the wall on a line that leaves it no seat there, and none
     /// off the line or at rest, fades out where it stands and comes back at the first stand
     /// clear of the letters, or once the caret leaves the line's row ([`PetBrain::wall_seat`],
-    /// [`PetBrain::unseated_sense`]); reverted, it stands at the wall over the line's last
-    /// letters, a cat tucked behind the block caret, then crumbs between those letters.
+    /// [`PetBrain::unseated_sense`]); reverted with [`Self::CaretCellIsNoSeat`], it stands at the
+    /// wall over the line's last letters, a cat tucked behind the block caret, then crumbs between
+    /// those letters. Reverted alone, where the box at the wall lies on the caret's cell, that law
+    /// sends the body to a seat off the line once the hand's rhythm closes, and its box lies on the
+    /// letters through that wait.
     NoSeatHidesTheBody = 1 << 38,
     /// Where no key reached the console, a caret's own step forward onto a blank cell is the
     /// writing's ([`PetBrain::caret_typed_on`], read by [`PetBrain::writing_on`]); reverted, only
@@ -1998,11 +2054,46 @@ pub enum OldPath {
     /// reverted, it lay over them for the whole fade ([`FADE_OUT`]), 28 frames at 60 Hz on a full
     /// page's last row (ATERM-KI-1107-4).
     LettersCutTheFade = 1 << 64,
+    /// The caret's cell is no seat ([`lies_on_the_caret`]): the wall on the caret's row is no
+    /// stand where the body drawn there lies on it ([`PetBrain::wall_meets_the_caret`]), and a
+    /// body a program's writing holds where it stands is let go to its station once the caret
+    /// comes into it ([`PetBrain::held_on_the_caret`]). Where the box the wall draws meets the
+    /// line's letters while the hand writes, the wall's hide ([`Self::NoSeatHidesTheBody`])
+    /// takes the body off the glass first, and on a page with no seat anywhere it keeps it off
+    /// ([`Self::NoSeatAnywhereHides`]). Reverted with the hide, the wall holds and the
+    /// writing's last cells run under the body: at 71 columns the fitted cat at the wall of a
+    /// full page's last row sat in the bar caret's cell, which read 3.71 against the page; and
+    /// reverted alone, the watch holds, so a page written to its last cell left the cat at the
+    /// wall behind a block caret, all of it hidden but a sliver (the "crumb").
+    CaretCellIsNoSeat = 1 << 65,
+    /// A body on its feet rides the page up where the page scrolls letters under it
+    /// ([`PetBrain::ride_the_page`]); reverted, it stays on its row of the glass, on the letters
+    /// the scroll brought there.
+    SeatRidesThePage = 1 << 66,
+    /// On a page with no seat off the line anywhere ([`PetBrain::seat_off_the_line`]), a wall
+    /// that lies on the caret's cell ([`PetBrain::wall_meets_the_caret`]) and holds the body no
+    /// seat of its own ([`PetBrain::wall_unseated`]: the box it draws at rest there meets the
+    /// line's letters) keeps the margin at the wall, so the wall's hide
+    /// ([`Self::NoSeatHidesTheBody`]) takes the body off the glass until the line ends. Reverted,
+    /// the wall side turned and the body stood at the station on the caret's line side, over the
+    /// line's letters too: the trail gallery's `flood` at 72 columns, typed through the console,
+    /// laid it on "gypsy" in every frame from 470 ms after the last key to the end, where the hide
+    /// has it off the glass once the stream's watch lapses (800 ms after the last key).
+    NoSeatAnywhereHides = 1 << 67,
+    /// While the hand writes, the margin's hold on the wall side lapses where the wall meets the
+    /// caret ([`PetBrain::wall_meets_the_caret`]) only once the caret stands in the row's last
+    /// cell, where it stays until the next key wraps it: short of it the next keys take the caret
+    /// on through the wall's cells. Reverted, the wall side turned in the cell before the last
+    /// too: the trail gallery's `flood` at 70 columns, typed through the console, has the caret a
+    /// frame there at each row's end, and the turn at the last row's end sent the body along that
+    /// row's letters to the station as the caret folded home to the top row, its box on 3 and 4
+    /// lettered cells where the wall kept it on 2, to 470 ms after the last key.
+    TurnAtTheLastCell = 1 << 68,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 65] = [
+    pub const EVERY: [Self; 69] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -2068,6 +2159,10 @@ impl OldPath {
         Self::FitWaitsForTheFeet,
         Self::GapIsTheLines,
         Self::LettersCutTheFade,
+        Self::CaretCellIsNoSeat,
+        Self::SeatRidesThePage,
+        Self::NoSeatAnywhereHides,
+        Self::TurnAtTheLastCell,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
@@ -2208,10 +2303,10 @@ enum Tier {
 /// Which animal the pet is drawn as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum PetSpecies {
-    /// The original companion (`cursor_trail_style = "rainbow kitty pet"`).
+    /// The cat (`cursor_pet = "cat"`, the default).
     #[default]
     Cat,
-    /// The dog (`cursor_trail_style = "rainbow dog pet"`).
+    /// The dog (`cursor_pet = "dog"`).
     Dog,
 }
 
@@ -2431,6 +2526,9 @@ pub struct PetBrain {
     ink_base: u16,
     ink_spans: Vec<(u16, u16)>,
     ink_scrolled: bool,
+    /// The rows the ink map last moved up together ([`PetBrain::sense_ink`]), 0 for none: read
+    /// once by [`PetBrain::ride_the_page`].
+    ink_rose: u16,
     ink_live: Option<u16>,
 
     content: f32,
@@ -2741,6 +2839,8 @@ pub struct PetBrain {
     /// before the aim) keeps it.
     station_seen: Option<SeenStation>,
     evicting: bool,
+    /// What the one seat rule carries from one asking to the next ([`Self::seat_shadow`]).
+    seat: seat::SeatWire,
 }
 
 impl Default for PetBrain {
@@ -2828,6 +2928,7 @@ impl PetBrain {
             ink_base: 0,
             ink_spans: Vec::new(),
             ink_scrolled: false,
+            ink_rose: 0,
             ink_live: None,
             content: 0.0,
             pending_bell: None,
@@ -3051,6 +3152,7 @@ impl PetBrain {
             home: 0.0,
             station_seen: None,
             evicting: false,
+            seat: seat::SeatWire::new(),
         }
     }
 }
@@ -3888,7 +3990,8 @@ impl PetBrain {
         let limit = (f32::from(cols) - width).max(0.0);
         if let Some(WrapAhead::Rest(col, row)) = self.wrap_ahead
             && (row - f32::from(cr)).abs() >= 0.5
-            && self.margin_seat_at((col, row), (cr, cc), rows, width)
+            && (self.margin_seat_at((col, row), (cr, cc), rows, width)
+                || self.seat_off_the_line_at((col, row), (cr, cc), (rows, cols), width))
         {
             return Some((col, row));
         }
@@ -3907,6 +4010,43 @@ impl PetBrain {
                 self.slide_to_row(row);
             }
             return Some((limit, row));
+        }
+        if self.wall_meets_the_caret((cr, cc), (rows, cols), limit, width) && !self.on_the_beat() {
+            let seat = match self.margin_rest_seat((cr, cc), (rows, limit), width) {
+                Some(seat) => Some(seat),
+                None => self.seat_off_the_line((cr, cc), (rows, cols), limit, width),
+            };
+            match seat {
+                // The hand's rhythm closed at the wall: it stopped there.
+                Some(seat) if !self.typing_on() => {
+                    self.wrap_ahead = Some(WrapAhead::Rest(seat.0, seat.1));
+                    return Some(seat);
+                }
+                // A pause in a run whose next key may wrap the caret off the wall, the wrap's
+                // crossing taking the body with it: the wall holds until the rhythm closes, and
+                // where its box meets the line's letters the wall's hide takes the body off the
+                // glass meanwhile ([`Self::wall_seat`]).
+                Some(_) => {}
+                // A page with no seat off the line whose wall holds the body no seat either: the
+                // box it draws at rest there meets the line's letters. The margin holds it at the
+                // wall, where the wall's hide takes it off the glass ([`Self::wall_seat`]) until
+                // the line ends: the station on the caret's line side lies on those letters too
+                // ([`OldPath::NoSeatAnywhereHides`]).
+                None if !self.old_path(OldPath::NoSeatAnywhereHides)
+                    && !self.old_path(OldPath::NoSeatHidesTheBody)
+                    && self.wall_unseated(
+                        (cr, cc),
+                        ((self.last_cell_w, self.last_cell_h), (cols, rows)),
+                        width,
+                    ) == Some(true) => {}
+                // A page with no seat off the line: the margin is not taken, the wall side
+                // turns ([`Self::update_wall`]), and the stand is the station on the caret's
+                // line side, off its cell.
+                None => {
+                    self.wrap_ahead = None;
+                    return None;
+                }
+            }
         }
         if self.hand_stopped()
             && let Some(seat) = self.margin_rest_seat((cr, cc), (rows, limit), width)
@@ -3935,9 +4075,18 @@ impl PetBrain {
     /// another line's letters on a row blank only by the wall. Short of them it keeps to the line
     /// and slides once it has passed them.
     ///
+    /// The alternate screen keeps this seat ([`Self::note_full_screen`]). The row under the line
+    /// is the wrap's own row, where the writing brings the caret next, and it is blank across the
+    /// body's whole way. A full-screen program's rows under its line
+    /// ([`OldPath::FullScreenKeepsItsRow`]) are a different matter: that law governs where a seat
+    /// is sought by the caret, not where a wrap is met. Held to the line on the alternate screen
+    /// (the trail gallery's `focus-wrap`, which runs there), the cat on dark lay on the writing
+    /// in 41 frames.
+    ///
     /// `None` where neither row is blank so, where a rule lies on it, or where the letter reader
-    /// certifies nothing: the wall on the line holds, and [`Self::margin_rest_seat`] looks further
-    /// once the hand has stopped; and for a body that is not on the line, such as one the head law
+    /// certifies nothing: the wall on the line holds until the caret comes into the body there
+    /// ([`Self::wall_meets_the_caret`]), and [`Self::margin_rest_seat`] looks further once the
+    /// hand has stopped; and for a body that is not on the line, such as one the head law
     /// seated on a composer's footer, which the wrap comes to where it is. Reverted by
     /// [`OldPath::MarginKeepsTheLine`].
     #[inline]
@@ -4030,8 +4179,9 @@ impl PetBrain {
 
     /// THE HEAD LAW AT THE MARGIN. Where no row beside the line is free for the body
     /// ([`Self::margin_seat_off_the_line`]), writing that runs into the margin runs its last
-    /// letters over the cat at the wall ([`Self::wrap_ahead_aim`]): while the hand writes, the
-    /// wrap is coming and the crossing it starts is the line end's one flight. Once the hand has
+    /// letters over the cat at the wall ([`Self::wrap_ahead_aim`]) until the caret comes into it
+    /// ([`Self::wall_meets_the_caret`]): while the hand writes, the wrap is coming and the
+    /// crossing it starts is the line end's one flight. Once the hand has
     /// stopped ([`Self::hand_stopped`], the cat sits), a wall seat whose feet or head lie
     /// among letters ([`Self::head_seat_at`]) is a resting cat on the words: the cat takes the
     /// nearest seat by the caret that keeps the head law ([`Self::head_seat_along`]), on a row
@@ -4134,6 +4284,213 @@ impl PetBrain {
         !self.console_rule_at(row)
             && !self.console_rule_at(row - 1.0)
             && self.head_seat_at((col, row), caret, rows, width)
+    }
+
+    /// THE CARET'S CELL IS NO SEAT AT THE WALL. Writing that runs into the margin brings the
+    /// caret up to the body at the wall on its row ([`WrapAhead::Approach`]), and where the box
+    /// the body is drawn in there, as the head law draws it ([`Self::head_target`], a fitted one
+    /// at its whole box's right edge, [`Self::fitted_to_the_wall`]), reaches back over the caret's
+    /// cell past the box's first cell, the body lies in that cell: on a full page's last row at 71
+    /// columns the fitted cat's fur lay in the bar caret's cell, which read 3.71 against the page
+    /// where main's 5.10 (the trail gallery's `last-row`), and at 72 with the caret in the last
+    /// column a block caret hid all but a sliver of it (`flood`, the "crumb"). The box's first
+    /// cell over the caret's is its art's transparent border: at 72 columns, the caret two cells
+    /// from the wall, the box began 0.81 of a cell into the caret's cell and the fitted cat's fur
+    /// 17 of the box's 40 px in, clear of it. Where it lies so, and the hand's next key is not
+    /// due on its beat ([`Self::on_the_beat`]), the margin sends the body to the nearest seat
+    /// off the line ([`Self::margin_rest_seat`] in reach, else [`Self::seat_off_the_line`]
+    /// anywhere on the screen) once the hand's rhythm closes ([`Self::typing_on`]: a pause the
+    /// next key may still end with a wrap keeps the wall, the wrap's crossing its one flight),
+    /// held until the wrap ([`WrapAhead::Rest`]); with none, the wall side turns while the hand
+    /// still writes, once the caret is in the row's last cell ([`OldPath::TurnAtTheLastCell`];
+    /// [`Self::update_wall`]: held to the margin, the station clamped to the wall,
+    /// on the caret, and the fitted cat stood there as a sliver behind the block caret, the
+    /// trail gallery's `flood` from its last key through `t470`), and the stand is the station
+    /// on the caret's line side; but where the box the wall draws at rest meets the line's
+    /// letters ([`Self::wall_unseated`]), that station lies on them too, and the margin holds the
+    /// wall for its hide ([`OldPath::NoSeatAnywhereHides`]). Where the box the wall draws at rest
+    /// meets the line's letters while the rhythm is open, the wall's hide ([`Self::wall_seat`],
+    /// [`OldPath::NoSeatHidesTheBody`]) has the body off the glass before the rhythm closes, and
+    /// holds it there to the line's end; this seat is then not taken (see [`Self::wall_seat`]).
+    /// `false` where the page is not read there (the letter reader blinded too), or reverted by
+    /// [`OldPath::CaretCellIsNoSeat`].
+    #[inline]
+    const fn wall_meets_the_caret(
+        &self,
+        (cr, cc): (u16, u16),
+        (rows, cols): (u16, u16),
+        limit: f32,
+        width: f32,
+    ) -> bool {
+        if self.old_path(OldPath::CaretCellIsNoSeat) || !width.is_finite() || width <= 0.0 {
+            return false;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if self.letters_unseen {
+            return false;
+        }
+        let row = cr as f32;
+        let Some(HeadRead { law: (_, fit), .. }) =
+            self.head_target(row, (rows, cols), (limit, limit + width))
+        else {
+            return false;
+        };
+        lies_on_the_caret(self.drawn_cols(limit, fit, cols, width), cc)
+    }
+
+    /// Whether the hand's next key is due on its run's beat: the rhythm open ([`Self::typing_on`])
+    /// and the last key under [`KEY_BEAT_LATE`] beats ago. A wall the caret comes into then
+    /// ([`Self::wall_meets_the_caret`]) is met for a beat or two before the next key wraps the
+    /// caret off it, the wrap's crossing taking the body down with it, so nothing of the wall
+    /// is read until the beat lapses. Sent off the line at once, a held key typed through a full
+    /// page's last row cost its wraps two flights more, up to a seat over the line and back down
+    /// after the wrap (`aterm-effects`' `a_held_key_runs_and_each_wrap_typed_through_is_one_flight`,
+    /// five flights for three wraps); and a hand that paused between words at the wall cost the
+    /// same, so a seat off the line is taken only once the rhythm closes.
+    #[inline]
+    const fn on_the_beat(&self) -> bool {
+        self.typing_on() && self.key_beat > 0.0 && self.run_t <= self.key_beat * KEY_BEAT_LATE
+    }
+
+    /// Whether a body a program's writing holds where it stands ([`Self::stream`], the watch's
+    /// hold) lies on the caret's cell as it is drawn now ([`lies_on_the_caret`]): the writing
+    /// came up to it. The hold lets it go to its station, as the margin's wall does
+    /// ([`Self::wall_meets_the_caret`]): held, a page written to its last cell left the cat at the
+    /// wall with the caret in its box, a block caret over all of it but a sliver between the
+    /// last letter and the caret (the trail gallery's `flood`, keys 1008 at 72 columns and 981 at
+    /// 70, the "crumb"), until the watch lapsed 0.8 s on. Reverted by
+    /// [`OldPath::CaretCellIsNoSeat`].
+    #[inline]
+    const fn held_on_the_caret(&self, (cr, cc): (u16, u16), cols: u16, width: f32) -> bool {
+        !self.old_path(OldPath::CaretCellIsNoSeat)
+            && (self.row - cr as f32).abs() < 0.5
+            && width.is_finite()
+            && width > 0.0
+            && lies_on_the_caret(self.drawn_cols(self.col, self.fit, cols, width), cc)
+    }
+
+    /// The columns a body standing at `col` is drawn across at `fit` ([`head_law`]): its box
+    /// scaled about its middle, a fitted one moved toward its whole box's right edge by the
+    /// margin ([`Self::fitted_to_the_wall`]).
+    #[inline]
+    const fn drawn_cols(&self, col: f32, fit: f32, cols: u16, width: f32) -> (f32, f32) {
+        let fit = fit.clamp(0.0, 1.0);
+        let left =
+            col + self.fitted_to_the_wall_at(col, fit, cols, width) + width * (1.0 - fit) * 0.5;
+        (left, left + width * fit)
+    }
+
+    /// The nearest seat off the caret's row anywhere on the screen for a body sent off the wall
+    /// ([`Self::wall_meets_the_caret`]): rows nearest first, each from the wall inward, a row's
+    /// distance its rows at [`ROW_AS_COLS`] ([`span_eq`]), never across a rule. A seat is one
+    /// the head law draws clear of every row's letters ([`Self::seat_off_the_line_at`]): whole, or
+    /// drawn down its row, or fitted to it. `None` on a page with no such seat (the trail
+    /// gallery's `flood`, a letter in every cell but the spaces between words).
+    #[inline]
+    const fn seat_off_the_line(
+        &self,
+        (cr, cc): (u16, u16),
+        (rows, cols): (u16, u16),
+        limit: f32,
+        width: f32,
+    ) -> Option<(f32, f32)> {
+        if !width.is_finite() || width <= 0.0 || !limit.is_finite() {
+            return None;
+        }
+        let row = cr as f32;
+        let mut best: Option<(f32, f32, f32)> = None;
+        let mut k = 1u16;
+        while k < rows {
+            let min_span = k as f32 * ROW_AS_COLS;
+            if matches!(best, Some((d, ..)) if min_span >= d) {
+                break;
+            }
+            let mut side = 0u8;
+            while side < 2 {
+                let dr = if side == 0 { -(k as f32) } else { k as f32 };
+                side += 1;
+                let r = row + dr;
+                if r < 0.0 || r >= rows as f32 {
+                    continue;
+                }
+                // No rule between the caret's row and the seat's, nor on the seat's own.
+                let (lo, hi) = if dr < 0.0 {
+                    (r, row - 1.0)
+                } else {
+                    (row + 1.0, r)
+                };
+                let mut ruled = false;
+                let mut i = lo;
+                while i <= hi + 0.5 {
+                    ruled |= self.console_rule_at(i);
+                    i += 1.0;
+                }
+                if ruled {
+                    continue;
+                }
+                let mut x = limit;
+                while x >= 0.0 {
+                    let d = span_eq(limit - x, dr);
+                    if matches!(best, Some((bd, ..)) if d >= bd) {
+                        break;
+                    }
+                    if self.seat_off_the_line_at((x, r), (cr, cc), (rows, cols), width) {
+                        best = Some((d, x, r));
+                        break;
+                    }
+                    x -= 1.0;
+                }
+            }
+            k += 1;
+        }
+        match best {
+            Some((_, x, r)) => Some((x, r)),
+            None => None,
+        }
+    }
+
+    /// Whether a body at `(col, row)`, off the caret's row, is seated clear of every row's letters
+    /// as the head law draws it there ([`Self::head_target`]): no ink under its feet (as the letter
+    /// reader saw them, and none the ink spans hold), no rule across its feet or its head, a rest
+    /// the console admits, and its footprint off the caret's cell on a row beside the caret's;
+    /// drawn whole, its head off the row above's letters too ([`Self::head_seat_at`]). Drawn down
+    /// its row or fitted to it, the law keeps its box off the rows beside its own ([`head_law`]).
+    #[inline]
+    const fn seat_off_the_line_at(
+        &self,
+        (col, row): (f32, f32),
+        (cr, cc): (u16, u16),
+        (rows, cols): (u16, u16),
+        width: f32,
+    ) -> bool {
+        let caret_row = cr as f32;
+        let caret_col = cc as f32;
+        if (row - caret_row).abs() < 0.5
+            || row < 0.0
+            || row >= rows as f32
+            || self.console_rule_at(row)
+            || self.console_rule_at(row - 1.0)
+        {
+            return false;
+        }
+        if (row - caret_row).abs() < 1.5
+            && col + INK_PAD < caret_col + 1.0
+            && col + width - INK_PAD > caret_col
+        {
+            return false;
+        }
+        if !matches!(self.observed_ink_overlaps(col, row, width), Some(false))
+            || self.ink_overlaps(col, row, width)
+            || !self.console_admits_rest((col, row), rows, width)
+        {
+            return false;
+        }
+        match self.head_target(row, (rows, cols), (col, col + width)) {
+            Some(HeadRead {
+                law: (sink, fit), ..
+            }) => (sink > 0.0 || fit < 1.0) || self.head_seat_at((col, row), (cr, cc), rows, width),
+            None => false,
+        }
     }
 
     /// Whether a body standing at `(col, row)` keeps the head law there
@@ -4372,6 +4729,7 @@ impl PetBrain {
         }
         if self.ink_base == base_row && self.ink_spans.as_slice() == spans {
             self.ink_scrolled = false;
+            self.ink_rose = 0;
             self.ink_live = live_row;
             return;
         }
@@ -4380,6 +4738,11 @@ impl PetBrain {
             && self.ink_spans.len() == spans.len()
             && self.ink_spans[1..] == spans[..spans.len() - 1]
             && has_nonempty_span(self.ink_spans.as_slice());
+        self.ink_rose = if self.ink_base == base_row {
+            page_rise(self.ink_spans.as_slice(), spans)
+        } else {
+            0
+        };
         self.ink_base = base_row;
         self.ink_spans.clear();
         self.ink_spans.extend_from_slice(spans);
@@ -4527,6 +4890,7 @@ impl PetBrain {
         self.ink_spans.clear();
         self.ink_live = None;
         self.ink_scrolled = false;
+        self.seat.note_new_page();
         self.last_pointer = None;
         self.pending_pointer_pounce = None;
         if !self.old_path(OldPath::NewScreenEasesTheHead) {
@@ -4563,8 +4927,52 @@ impl PetBrain {
         self.ink_spans.clear();
         self.ink_live = None;
         self.ink_scrolled = false;
+        self.ink_rose = 0;
+        self.seat.note_new_page();
         self.last_pointer = None;
         self.pending_pointer_pounce = None;
+    }
+
+    /// THE SEAT RIDES THE PAGE. A page that scrolls moves its rows up together
+    /// ([`Self::sense_ink`]), and a body on its feet among them stood on blank ground: where
+    /// the rows that came up under it hold letters and the ground it sat on, the same rows up, is
+    /// still clear of them, it rides up with the page in the frame the page moves, as a host's
+    /// regrid carries it ([`Self::carry_with_regrid`]), and sits on what it sat on. Seated off a
+    /// full page's last row (the trail gallery's `last-row` at 70 and 71 columns, the seat over
+    /// the row of letters over the line, which the body takes there with the wall's hide
+    /// reverted, [`OldPath::NoSeatHidesTheBody`]), the line's Enter and its answer scrolled the
+    /// page two rows, and the body stayed on its row of the glass, now the line it had left: on
+    /// its letters 400 ms, then walking along them 370 ms more. With every law it takes that
+    /// seat where the line's last keys are spaces ([`Self::wall_meets_the_caret`]); an Enter
+    /// answered by the prompt alone scrolled the page one row, and the body lay on the full
+    /// row's letters the scroll brought under it in all 22 frames from 40 ms past the Enter to
+    /// its setting off. Inert in flight, beside a console's own rows (it carries a body itself),
+    /// where the scroll left the body's ground clear, or where the ride would take it off the
+    /// glass. Reverted by [`OldPath::SeatRidesThePage`].
+    #[inline]
+    fn ride_the_page(&mut self, rows: u16, width: f32) {
+        let rose = core::mem::take(&mut self.ink_rose);
+        if rose == 0
+            || self.old_path(OldPath::SeatRidesThePage)
+            || self.flight.is_some()
+            || self.console.resident
+            || !width.is_finite()
+            || width <= 0.0
+        {
+            return;
+        }
+        let dy = -f32::from(rose);
+        if self.ink_overlaps(self.col, self.row, width)
+            && !self.ink_overlaps(self.col, self.row + dy, width)
+            && self.carry_with_regrid(dy, rows)
+            && let Some((at, ..)) = &mut self.sink_seat
+        {
+            // Still on its seat to the head law, whose read of the rows round it the page
+            // changed: judged as a body moved to another row, the fitted cat was drawn whole
+            // for the frames the letter reader took to see the rows that came up, its head
+            // in the row of letters over its seat.
+            at.1 += dy;
+        }
     }
 
     /// A BODY ON ITS STATION STAYS ON IT WHEN ONLY THE ART'S WIDTH MOVED IT. The art's width in
@@ -6879,6 +7287,12 @@ impl PetBrain {
         if carried {
             self.name_the_spans_carry();
         }
+        // The one seat rule is asked beside the frame and draws nothing ([`Self::seat_shadow`]):
+        // only where debug assertions are on, so no shipped frame pays for an answer nobody
+        // sees. What draws from the rule takes this gate out.
+        if cfg!(any(test, debug_assertions)) {
+            self.ask_the_seat_rule(sense);
+        }
         // The deadline a host that draws on demand arms on this frame's reading: the next late
         // frame lives the step it names, not where that frame's reading of the page moves it.
         self.span_due = if self.asked_frames {
@@ -7148,6 +7562,9 @@ impl PetBrain {
         } else {
             false
         };
+        if !regrid_carried {
+            self.ride_the_page(sense.rows, width);
+        }
         if !regrid_carried
             && !sense.output_burst
             && self.exec_since.is_none()
@@ -7894,9 +8311,28 @@ impl PetBrain {
             }
         }
 
+        // The margin keeps the wall side while the hand writes into it, but not where the wall
+        // the body stands at on the caret's row meets the caret ([`Self::wall_meets_the_caret`])
+        // in the row's last cell, where the caret stays until the next key wraps it: with no seat
+        // off the line ([`Self::wrap_ahead_aim`]), the stand is the station on the caret's line
+        // side. Short of that cell the next keys take the caret on through the wall's cells
+        // ([`OldPath::TurnAtTheLastCell`]). A body on another row keeps it: on top of a
+        // composer's upper rule, escorting a draft into the margin under it, the turn sent it on
+        // a flight to the caret's other side before the wrap.
         if self.flight.is_none()
             && self.wrap_ahead.is_none()
-            && !(self.writing_on() && self.at_the_margin((cr, cc), sense.cols, width, 0.0))
+            && !(self.writing_on()
+                && self.at_the_margin((cr, cc), sense.cols, width, 0.0)
+                && !((self.row - f32::from(cr)).abs() < 0.5
+                    && !self.on_the_beat()
+                    && (cc.saturating_add(1) >= sense.cols
+                        || self.old_path(OldPath::TurnAtTheLastCell))
+                    && self.wall_meets_the_caret(
+                        (cr, cc),
+                        (sense.rows, sense.cols),
+                        (f32::from(sense.cols) - width).max(0.0),
+                        width,
+                    )))
             && !(self.run_dir < 0 && self.rhythm_open())
             && self.update_wall(cc, sense.cols, width)
         {
@@ -8099,7 +8535,9 @@ impl PetBrain {
                 hugging = true;
                 self.quiet_leap = true;
                 (col, live)
-            } else if (live - self.row).abs() >= WATCH_HUG_ROWS {
+            } else if (live - self.row).abs() >= WATCH_HUG_ROWS
+                || self.held_on_the_caret((cr, cc), sense.cols, width)
+            {
                 (target, target_row)
             } else {
                 (self.col, self.row)
@@ -8145,7 +8583,11 @@ impl PetBrain {
         };
 
         let watch_far = (target_row - self.row).abs() > WATCH_HUG_ROWS;
-        let (target, target_row) = if self.stream && self.flight.is_none() && !hugging && !watch_far
+        let (target, target_row) = if self.stream
+            && self.flight.is_none()
+            && !hugging
+            && !watch_far
+            && !self.held_on_the_caret((cr, cc), sense.cols, width)
         {
             (self.col, self.row)
         } else {
@@ -8799,8 +9241,11 @@ impl PetBrain {
         };
         let written_under = off_writing.is_some();
         let (target, target_row) = off_writing.unwrap_or((target, target_row));
+        // A cat the caret came into is not held there ([`Self::held_on_the_caret`]).
+        let watch_holds =
+            self.stream && !hugging && !self.held_on_the_caret((cr, cc), sense.cols, width);
         match self.action {
-            PetAction::Sit | PetAction::Stand | PetAction::Perk if self.stream && !hugging => {
+            PetAction::Sit | PetAction::Stand | PetAction::Perk if watch_holds => {
                 // The stream watch sits the cat down: the notice keeps its
                 // beat, a stand sits at once, and the sit holds until the
                 // events lapse. Ranked above the tennis watch and idle
@@ -13556,6 +14001,14 @@ impl PetBrain {
     /// `slack` is how far short of the margin the caret may stand ([`Self::at_the_margin`]): none
     /// to begin a hide, [`WALL_RETURN_MARGIN`] while one holds, the slack a taken margin keeps.
     ///
+    /// The seat the caret's cell's law finds anywhere on the screen ([`Self::seat_off_the_line`],
+    /// [`OldPath::CaretCellIsNoSeat`]) is not read here. A body that law takes there flies to it
+    /// from the wall once the hand's rhythm closes, which a hand still writing does not allow; one
+    /// the hide has already taken off the glass would come back there rows from where it left,
+    /// as the rhythm closes ([`RHYTHM_WINDOW`] past the hand's last key): a dip and a return with
+    /// no motion between, which reads as a blink. So the hide holds it out to the line's end, as
+    /// it does where no seat lies anywhere.
+    ///
     /// `None` where the margin does not hold the body at the wall on the caret's row (in flight,
     /// off that row, the margin untaken or holding it elsewhere), where the letter reader
     /// certifies nothing of the caret's row there or of the row over the body's head, where the
@@ -13596,10 +14049,35 @@ impl PetBrain {
         if let Some(seat) = self.margin_rest_seat((cr, cc), (rows, limit), width) {
             return Some(WallSeat::Seat(seat, WrapAhead::Rest(seat.0, seat.1)));
         }
-        let wall = (limit, row);
-        let head = head_seat_from(limit, width, !self.old_path(OldPath::SeatClearsTheStretch));
         let grid = (sense.cols, sense.rows);
-        let inked = self.rest_box_inked(wall, ((sense.cell_w, sense.cell_h), grid), width)?;
+        Some(
+            if self.wall_unseated((cr, cc), ((sense.cell_w, sense.cell_h), grid), width)? {
+                WallSeat::NoSeat
+            } else {
+                WallSeat::Seat((limit, row), WrapAhead::Approach)
+            },
+        )
+    }
+
+    /// Whether the wall on the caret's row holds a body no seat of its own ([`Self::wall_seat`]):
+    /// the box it draws at rest there ([`Self::rest_box_inked`], on the `cells` px cells of the
+    /// grid they give) meets a lettered cell of the caret's row, and the head law seats it
+    /// nowhere there either ([`Self::head_seat_at`]). Seats beside the line or within reach are
+    /// not read here. `None` where the letter reader certifies nothing of the caret's row there or
+    /// of the row over the body's head.
+    #[inline]
+    fn wall_unseated(
+        &self,
+        (cr, cc): (u16, u16),
+        cells: ((u16, u16), (u16, u16)),
+        width: f32,
+    ) -> Option<bool> {
+        let (_, (cols, rows)) = cells;
+        let row = f32::from(cr);
+        let limit = (f32::from(cols) - width).max(0.0);
+        let wall = (limit, row);
+        let inked = self.rest_box_inked(wall, cells, width)?;
+        let head = head_seat_from(limit, width, !self.old_path(OldPath::SeatClearsTheStretch));
         if row >= 0.5
             && self
                 .observed_last_letter(row - 1.0, head, limit + width - INK_PAD)
@@ -13607,13 +14085,7 @@ impl PetBrain {
         {
             return None;
         }
-        Some(
-            if inked && !self.head_seat_at(wall, (cr, cc), rows, width) {
-                WallSeat::NoSeat
-            } else {
-                WallSeat::Seat(wall, WrapAhead::Approach)
-            },
-        )
+        Some(inked && !self.head_seat_at(wall, (cr, cc), rows, width))
     }
 
     /// Whether the box a body standing at `(col, row)` draws at rest there
@@ -15562,7 +16034,10 @@ impl PetBrain {
         gap.abs() * (cell_w as f32) >= 1.0
     }
 
-    /// The coarse offer.
+    /// The coarse offer. The seat rule's clocks ([`Self::seat_due`]) are not in it while the
+    /// rule draws nothing: a host woken for them would draw a frame nobody sees changed, in
+    /// states this offer promises no poll (a retired body, a selection over the whole view).
+    /// What draws from the rule adds them here, under the gates that say the pet is drawn.
     #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {

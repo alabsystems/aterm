@@ -1015,7 +1015,8 @@ fn parse_post(rest: &str, answering: bool) -> Result<Post<'_>, String> {
 
 /// Whether this local post addresses a retained direct message instead of the bus.
 pub fn is_reply(rest: &str) -> bool {
-    super::post_options(rest.split_whitespace()).any(|word| word.starts_with("re=f"))
+    aterm_types::control_verbs::post_options(rest.split_whitespace())
+        .any(|word| word.starts_with("re=f"))
 }
 
 /// Deliver from the proved remote node, or retain the local recipient's answer for that node.

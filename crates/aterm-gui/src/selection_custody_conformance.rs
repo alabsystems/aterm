@@ -3,8 +3,6 @@
 
 //! Tier-1 trace conformance for `SelectionCustody` against [`aterm_spec::verify::validate_transition_tiered`].
 
-#![cfg(test)]
-
 use std::collections::BTreeMap;
 
 use aterm_core::selection::{SelectionSide, SelectionType};

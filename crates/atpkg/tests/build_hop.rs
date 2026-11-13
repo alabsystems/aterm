@@ -61,6 +61,82 @@ exit "${HOP_EXIT:-0}"
 /// ([`atpkg::platform::Starting`]).
 const FRONT_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
 
+#[test]
+fn reader_readiness_isolated_child() {
+    let Some(expected) = std::env::var_os("ATPKG_READER_EXPECT") else {
+        return;
+    };
+    let result = atpkg::build_admit::reader::Readiness::normal(&mut || false)
+        .and_then(|witness| witness.check());
+    assert_eq!(result.is_ok(), expected == "supported", "{result:?}");
+    println!("reader-readiness-child-complete");
+}
+
+#[test]
+fn whole_normal_reader_preflight_binds_both_real_managed_routes() {
+    let s = Scratch::new();
+    let helper = aterm_tempfile::bin_exe("atpkg");
+    let bin = atpkg::store::default_prefix(&s.home()).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let write = |name: &str, helper: &Path, environment: &atpkg::shim_env::ShimEnv| {
+        let shim = bin.join(name);
+        let rendered =
+            atpkg::platform::build_hop_fixture(&shim, &s.root().join(name), environment, helper)
+                .unwrap();
+        atpkg::lay::write_in_process(&rendered).unwrap();
+    };
+    let run = |supported: bool| {
+        let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "build_hop::reader_readiness_isolated_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("HOME", s.home())
+            .env("ATERM_STATE_HOME", s.state())
+            .env(
+                "PATH",
+                std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                    .unwrap(),
+            )
+            .env(
+                "ATPKG_READER_EXPECT",
+                if supported { "supported" } else { "refused" },
+            );
+        let output = aterm_uds::deadline::output_within(&mut child, MUST_HAPPEN).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("reader-readiness-child-complete")
+        );
+    };
+    write("targo", &helper, &atpkg::shim_env::ShimEnv::NONE);
+    run(true); // Genuine absence of the optional reader is not schema evidence.
+    write("targo-tippy", &helper, &atpkg::shim_env::ShimEnv::NONE);
+    run(true);
+    let foreign = atpkg::shim_env::ShimEnv::admit(&[format!(
+        "{}={}",
+        atpkg::build_admit::LEDGER_ENV,
+        s.root().join("uncreated-ledger").display()
+    )])
+    .unwrap();
+    write("targo-tippy", &helper, &foreign);
+    run(false);
+    assert!(!s.root().join("uncreated-ledger").exists());
+    let source_cat = s.root().join("source-cat");
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &source_cat);
+    write("targo-tippy", &source_cat, &atpkg::shim_env::ShimEnv::NONE);
+    run(false); // A present native image without the known entry cannot borrow Targo's witness.
+    std::fs::write(bin.join("targo-tippy"), "#!/bin/sh\nexec /bin/false\n").unwrap();
+    run(false);
+}
+
 /// The front `cmd` starts. A front, and the admission wait it holds, keep an ignored signal
 /// ignored: it starts with the ones it is sent at their defaults ([`FRONT_SIGNALS`]), set here, not
 /// this test binary's, and a shell's `trap ''` then ignores the ones named.
@@ -1299,4 +1375,40 @@ fn the_front_says_it_honours_locks() {
             build: Some(16500)
         }
     );
+}
+
+#[test]
+fn actual_reader_query_reports_its_exact_private_namespace_without_a_claim() {
+    let scratch = Scratch::new();
+    let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
+    command
+        .args(["__build_admit", "--capabilities"])
+        .env(
+            atpkg::build_admit::reader::QUERY_ENV,
+            atpkg::build_admit::reader::QUERY,
+        )
+        .env(atpkg::build_admit::LEDGER_ENV, scratch.ledger())
+        .env("HOME", scratch.home())
+        .env("ATERM_STATE_HOME", scratch.state());
+    let output = aterm_uds::deadline::output_within(&mut command, MUST_HAPPEN).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: aterm_json::Value = aterm_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 5);
+    assert_eq!(value["schema"].as_u64(), Some(1));
+    assert_eq!(
+        value["protocol"].as_str(),
+        std::str::from_utf8(aterm_capacity::RetainedClaim::reservation_protocol_marker()).ok()
+    );
+    assert_eq!(value["ledger"].as_str(), scratch.ledger().to_str());
+    assert!(
+        value["machine"]
+            .as_str()
+            .is_some_and(|word| !word.is_empty())
+    );
+    assert!(value["boot"].as_str().is_some_and(|word| !word.is_empty()));
+    assert_eq!(std::fs::read_dir(scratch.ledger()).unwrap().count(), 0);
 }

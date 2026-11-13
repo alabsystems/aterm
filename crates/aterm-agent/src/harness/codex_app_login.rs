@@ -53,7 +53,7 @@ pub use grant_completion::{FreshCodeGrant, StagedWitness};
 pub(in crate::harness) use refresh_transport::with_refresh_fixture_endpoint;
 pub(in crate::harness) use refresh_transport::{
     ReceivedRefresh, RefreshExchange, exchange_owned_refresh, merge_owned_refresh,
-    owned_refresh_token_digest,
+    owned_refresh_refusal_settled_at, owned_refresh_refused, owned_refresh_token_digest,
 };
 
 /// Per-account credential file inside a Codex login directory (`CODEX_AUTH_PATH`).
@@ -536,7 +536,7 @@ const MIN_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 
 /// Hang detector for a valid rotation another writer may still be publishing after a
 /// single-use refresh was refused. Its absence at expiry is not a sign-out proof.
-const ROTATION_HANG: Duration = Duration::from_secs(60);
+pub(in crate::harness) const ROTATION_HANG: Duration = Duration::from_secs(60);
 
 /// `auth.json`'s name in `home` with `suffix` after it, in the same directory.
 fn beside_auth(home: &Path, suffix: &str) -> PathBuf {
@@ -709,6 +709,9 @@ enum RefreshJournal {
     },
     Rejected {
         token: String,
+        /// When the issuer refused it (Unix seconds). Absent in a journal written before the
+        /// refusal was dated, which is read as long settled ([`refusal_settled`]).
+        at: Option<i64>,
     },
     Response {
         base: String,
@@ -1030,11 +1033,22 @@ impl RefreshJournal {
                 "candidate": candidate.0,
                 "digest": digest,
             }),
-            Self::Attempted { token } | Self::Rejected { token } => json!({
+            Self::Attempted { token } => json!({
                 "aterm_codex_refresh": 2,
-                "state": if matches!(self, Self::Rejected { .. }) { "rejected" } else { "attempted" },
+                "state": "attempted",
                 "refresh_token_digest": token,
             }),
+            Self::Rejected { token, at } => {
+                let mut doc = json!({
+                    "aterm_codex_refresh": 2,
+                    "state": "rejected",
+                    "refresh_token_digest": token,
+                });
+                if let (Some(at), Some(doc)) = (at, doc.as_object_mut()) {
+                    doc.insert("rejected_at".into(), json!(at));
+                }
+                doc
+            }
             Self::Response {
                 base,
                 token,
@@ -1102,7 +1116,10 @@ impl RefreshJournal {
             2 => {
                 return match value.get("state")?.as_str()? {
                     "attempted" => Some(Self::Attempted { token: token? }),
-                    "rejected" => Some(Self::Rejected { token: token? }),
+                    "rejected" => Some(Self::Rejected {
+                        token: token?,
+                        at: value.get("rejected_at").and_then(Value::as_i64),
+                    }),
                     _ => None,
                 };
             }
@@ -1238,7 +1255,7 @@ fn recover_journal_held(home: &Path) -> Result<(), Refreshed> {
         RefreshJournal::Attempted { token } if current_token.as_ref() == Some(&token) => {
             return Err(Refreshed::Failed);
         }
-        RefreshJournal::Rejected { token } if current_token.as_ref() == Some(&token) => {
+        RefreshJournal::Rejected { token, .. } if current_token.as_ref() == Some(&token) => {
             return Err(Refreshed::Rejected);
         }
         RefreshJournal::Response {
@@ -1643,7 +1660,7 @@ impl Refreshed {
 /// reads one (`login/src/auth/manager.rs`, `classify_refresh_token_failure`): its `error` (or
 /// `error.code`, or `code`) names the refresh token expired, reused or invalidated, or the
 /// answer is a `401`, or an `invalid_grant` `400`.
-fn refresh_refused(status: u16, body: &[u8]) -> bool {
+fn refresh_refusal_code(body: &[u8]) -> Option<String> {
     let parsed: Option<Value> = aterm_json::from_slice(body).ok();
     let text = |value: Option<&Value>| {
         value
@@ -1652,17 +1669,23 @@ fn refresh_refused(status: u16, body: &[u8]) -> bool {
             .filter(|s| !s.is_empty())
             .map(str::to_ascii_lowercase)
     };
-    let code = parsed.as_ref().and_then(|json| {
+    parsed.as_ref().and_then(|json| {
         text(json.get("error"))
             .or_else(|| text(json.get("error").and_then(|error| error.get("code"))))
             .or_else(|| text(json.get("code")))
-    });
-    status == 401
-        || matches!(
-            code.as_deref(),
-            Some("refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated")
-        )
-        || (status == 400 && code.as_deref() == Some("invalid_grant"))
+    })
+}
+
+fn explicit_refresh_refusal(status: u16, body: &[u8]) -> bool {
+    let code = refresh_refusal_code(body);
+    matches!(
+        code.as_deref(),
+        Some("refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated")
+    ) || (matches!(status, 400 | 401) && code.as_deref() == Some("invalid_grant"))
+}
+
+fn refresh_refused(status: u16, body: &[u8]) -> bool {
+    status == 401 || explicit_refresh_refusal(status, body)
 }
 
 /// Observe the credential again before the request and publication. A token
@@ -1833,7 +1856,11 @@ fn refresh_admitted(
     };
     if resp.status() != 200 {
         return if refresh_refused(resp.status(), resp.body()) {
-            let _ = (RefreshJournal::Rejected { token }).write(home);
+            let _ = (RefreshJournal::Rejected {
+                token,
+                at: Some(now),
+            })
+            .write(home);
             Refreshed::Rejected
         } else {
             Refreshed::Failed
@@ -2401,8 +2428,38 @@ pub struct IdentifiedUsage {
     pub usage: Usage,
 }
 
+/// What one identified read of a login said ([`read_identified_login_with_config`]): a login
+/// the provider read signed out is a fact of its account, kept apart from a read that said
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifiedRead {
+    /// Its usage, under the identity the request carried.
+    Usage(IdentifiedUsage),
+    /// The provider refused the login for good ([`Reading::SignedOut`]).
+    SignedOut,
+    /// Nothing was learned: no answer, no known identity, or a refusal not yet settled.
+    Unread,
+}
+
+impl IdentifiedRead {
+    /// The usage, where the read served one.
+    #[must_use]
+    pub fn usage(self) -> Option<IdentifiedUsage> {
+        match self {
+            Self::Usage(usage) => Some(usage),
+            Self::SignedOut | Self::Unread => None,
+        }
+    }
+}
+
+impl From<Option<IdentifiedUsage>> for IdentifiedRead {
+    fn from(usage: Option<IdentifiedUsage>) -> Self {
+        usage.map_or(Self::Unread, Self::Usage)
+    }
+}
+
 /// Read usage as [`read_login_with`] does, retaining the exact request identity.
-/// A successful response without known account and user claims yields `None`.
+/// A successful response without known account and user claims is [`IdentifiedRead::Unread`].
 #[must_use]
 fn read_identified_login_with(
     home: &Path,
@@ -2411,7 +2468,7 @@ fn read_identified_login_with(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
-) -> Option<IdentifiedUsage> {
+) -> IdentifiedRead {
     let snapshot = read_login_snapshot(
         home,
         usage_url,
@@ -2420,10 +2477,14 @@ fn read_identified_login_with(
         now,
         expected_email,
     );
-    Some(IdentifiedUsage {
-        identity: snapshot.identity?,
-        usage: snapshot.reading.usage()?,
-    })
+    if snapshot.reading == Reading::SignedOut {
+        return IdentifiedRead::SignedOut;
+    }
+    snapshot
+        .identity
+        .zip(snapshot.reading.usage())
+        .map(|(identity, usage)| IdentifiedUsage { identity, usage })
+        .into()
 }
 
 #[cfg_attr(
@@ -2593,10 +2654,29 @@ fn usage_reading(status: u16, body: &[u8], now: i64) -> Reading {
         .into()
 }
 
+/// Whether the issuer's refusal of this login's refresh token is settled: its journal holds
+/// that refusal of this very token ([`RefreshJournal::Rejected`]) and [`ROTATION_HANG`] has
+/// passed since, so no other writer's rotation of the token can still be on its way to the
+/// file. A refusal just made is not: a single-use token another program spent reads refused
+/// here while that program publishes its successor.
+fn refusal_settled(home: &Path, stored: &StoredAuth, now: i64) -> bool {
+    let Some(held) = stored.refresh_token.as_deref().map(refresh_token_digest) else {
+        return false;
+    };
+    let hang = i64::try_from(ROTATION_HANG.as_secs()).unwrap_or(i64::MAX);
+    matches!(
+        RefreshJournal::read(home),
+        Ok(Some(RefreshJournal::Rejected { token, at }))
+            if token == held && at.is_none_or(|at| now.saturating_sub(at) >= hang)
+    )
+}
+
 /// Recheck a refused login without replaying its refresh. A published rotation is read
-/// as the new login. An unresolved single-use refresh remains Unread even after another
-/// access refusal: a missing response is not account sign-out. With no refresh token,
-/// two actual access refusals identify the nonrefreshable credential as signed out.
+/// as the new login. A single-use refresh refused within [`ROTATION_HANG`] remains Unread
+/// even after another access refusal: a missing response is not account sign-out. With no
+/// refresh token, or with one whose refusal is settled ([`refusal_settled`]) and no rotation on
+/// disk, two actual access refusals identify the credential as signed out: a revoked login
+/// reads so from its second look on, instead of working with a stale quota for ever.
 /// The original deadline bounds every observation and request.
 fn confirmed_signed_out(
     home: &Path,
@@ -2610,7 +2690,8 @@ fn confirmed_signed_out(
     if Instant::now() >= deadline {
         return LoginSnapshot::unread();
     }
-    let end = if stored.refresh_token.is_none() {
+    let settled = refusal_settled(home, stored, now);
+    let end = if stored.refresh_token.is_none() || settled {
         started
     } else {
         let Some(end) = started
@@ -2651,7 +2732,7 @@ fn confirmed_signed_out(
         return LoginSnapshot::unread();
     }
     if status == 401 && rotated.is_none() {
-        if stored.refresh_token.is_some() {
+        if stored.refresh_token.is_some() && !settled {
             return LoginSnapshot::unread();
         }
         return LoginSnapshot::read(Reading::SignedOut, login, usage_url, fallback_token_url);
@@ -2784,10 +2865,13 @@ pub fn read_identified_login_with_config(
     now: i64,
     expected_email: Option<&str>,
     use_token: super::provider_read::Use,
-) -> Option<IdentifiedUsage> {
-    use_token
+) -> IdentifiedRead {
+    if use_token
         .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
-        .ok()?;
+        .is_err()
+    {
+        return IdentifiedRead::Unread;
+    }
     let usage_url = resolve_usage_url(config_home, user_home);
     let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
     read_identified_login_with(home, &usage_url, &token_url, wait, now, expected_email)

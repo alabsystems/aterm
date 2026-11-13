@@ -315,7 +315,10 @@ fn recovery_receives_authenticated_history_without_resuming_or_replacing_the_ori
     let second = original
         .commit_catalog(&session, b"original-custody-still-continues")
         .unwrap();
-    assert_eq!(original.index.get(&second.id).unwrap().sequence, 2);
+    assert_eq!(
+        original.index().unwrap().get(&second.id).unwrap().sequence,
+        2
+    );
 }
 
 pub(crate) fn recovery_transition(

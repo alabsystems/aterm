@@ -2750,18 +2750,35 @@ impl RanFeed {
 #[cfg(any(windows, test))]
 pub(crate) const JOB_PACE: Duration = Duration::from_millis(100);
 
-/// Lists the job of a Windows session whose shell is the given pid: each process with its
-/// image's path ([`JobSeam::images`], or a test's script).
+/// Which of a gather's listings one is ([`RanJob::batch`]). A shell's programs are in its job or,
+/// for a shell that lets them go, below it, and only a walk of the machine's processes tells
+/// which of a shell whose job holds none.
 #[cfg(any(windows, test))]
-pub(crate) type ListJob = Box<dyn FnMut(i32) -> Vec<(u32, PathBuf)> + Send>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JobListing {
+    /// At a block's start or end, at the batch after either, and a gather's first: the listing
+    /// that may take that walk to find out.
+    Mark,
+    /// At [`JOB_PACE`] while output is read: it never takes the walk to find out, so a shell
+    /// at rest (typing echo, a prompt redrawn, a cmdlet's output) costs one job query.
+    Pace,
+}
+
+/// Lists the job of a Windows session whose shell is the given pid: each process with its
+/// image's path (`JobSeam::images` and `JobSeam::images_at_pace`, or a test's script).
+#[cfg(any(windows, test))]
+pub(crate) type ListJob = Box<dyn FnMut(i32, JobListing) -> Vec<(u32, PathBuf)> + Send>;
 
 /// How a Windows gather lists its session's job (`SessionFactory::job_seam`; the test App's
 /// inert arm lists none, and its gather has no [`RanJob`]).
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JobSeam {
-    /// The job's processes with their image paths (`aterm_pty::job_images`).
+    /// The session's programs with their image paths (`aterm_pty::job_images`).
     pub(crate) images: fn(i32) -> Vec<(u32, PathBuf)>,
+    /// The same at the pace (`aterm_pty::job_images_at_pace`): no walk of the machine's
+    /// processes for a shell not known to run its programs outside its job.
+    pub(crate) images_at_pace: fn(i32) -> Vec<(u32, PathBuf)>,
     /// The console host aterm started for the session (`aterm_pty::console_host_pid`).
     pub(crate) host: fn(i32) -> Option<u32>,
 }
@@ -2770,11 +2787,14 @@ pub(crate) struct JobSeam {
 #[cfg(windows)]
 pub(crate) const JOB_SHIPPING: JobSeam = JobSeam {
     images: aterm_pty::job_images,
+    images_at_pace: aterm_pty::job_images_at_pace,
     host: aterm_pty::console_host_pid,
 };
 
 /// What one Windows PTY gather hears for its session's [`Ran`]: the processes the session's job
-/// holds (the ConPTY shell runs in a job of its own, which every program it starts joins), each
+/// holds (the ConPTY shell runs in a job of its own, which every program it starts joins) or,
+/// for a shell whose programs Windows starts outside its jobs (a Store pwsh), those below the
+/// shell (`aterm_pty::job_images`), each
 /// heard once by its image's names ([`ExecNames::of_windows_image`]) through [`Ran::hear_at`],
 /// and heard again when its pid maps another image. ConPTY shows no foreground group and no
 /// unread count, so each is placed by its stamp ([`During::Window`]): it confirms a bare word
@@ -2823,7 +2843,15 @@ impl RanJob {
     /// with `seam`.
     #[cfg(windows)]
     pub(crate) fn new(ran: Arc<Ran>, shell: i32, seam: JobSeam) -> Self {
-        Self::listing(ran, shell, (seam.host)(shell), Box::new(seam.images))
+        Self::listing(
+            ran,
+            shell,
+            (seam.host)(shell),
+            Box::new(move |shell, listing| match listing {
+                JobListing::Mark => (seam.images)(shell),
+                JobListing::Pace => (seam.images_at_pace)(shell),
+            }),
+        )
     }
 
     /// The feed of `ran` from the gather of `shell`'s session, whose console host is `host`,
@@ -2850,26 +2878,37 @@ impl RanJob {
     /// program the command left running (one started in the background) is listed at the
     /// block's D, inside its window: left to the pace, the next listing could come only with
     /// the next command's output and stamp it inside that block's window, where it would
-    /// confirm that block's word.
+    /// confirm that block's word. Those listings, and a gather's first, are the ones that may
+    /// walk below a shell whose job holds no program ([`JobListing::Mark`]); one the pace alone
+    /// brought is a [`JobListing::Pace`].
     pub(crate) fn batch(&mut self, batch: &[u8], now: Instant, wall_ms: u64) {
         self.marks.ends(batch, &mut self.ends);
         let mark = !self.ends.is_empty();
-        let due = self
-            .listed
-            .is_none_or(|at| now.saturating_duration_since(at) >= JOB_PACE);
-        if due || mark {
+        let listing = match self.listed {
+            _ if mark => Some(JobListing::Mark),
+            None => Some(JobListing::Mark),
+            Some(at) if now.saturating_duration_since(at) >= JOB_PACE => Some(JobListing::Pace),
+            Some(_) => None,
+        };
+        if let Some(listing) = listing {
             self.listed = (!mark).then_some(now);
-            self.list_at(wall_ms);
+            self.list(wall_ms, listing);
         }
+    }
+
+    /// [`Self::list`] as a block's start or end lists it.
+    #[cfg(test)]
+    pub(crate) fn list_at(&mut self, now: u64) {
+        self.list(now, JobListing::Mark);
     }
 
     /// List the job now, at wall ms `now`: hear each process the last listing did not hold
     /// with the image it maps now, but the shell's and the console host's; at most
     /// [`RAN_MAX`] are read.
-    pub(crate) fn list_at(&mut self, now: u64) {
+    fn list(&mut self, now: u64, listing: JobListing) {
         let shell = u32::try_from(self.shell).ok();
         let mut seen = Vec::new();
-        for (pid, image) in (self.list)(self.shell) {
+        for (pid, image) in (self.list)(self.shell, listing) {
             if seen.len() >= RAN_MAX {
                 break;
             }

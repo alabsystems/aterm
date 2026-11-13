@@ -3,7 +3,8 @@
 
 //! Claude Code settings chain reader ([`sources`], [`sources_under`], [`MANAGED_DIR`],
 //! [`WorkerEnv::claude_dir`], [`managed_preferences`], [`parse`]) for Bash `env`
-//! ([`WorkerEnv::git_settings_env`]) and owner ask rules/hooks ([`owner_asks`]).
+//! ([`WorkerEnv::git_settings_env`]), owner ask rules/hooks ([`owner_asks`]) and the default
+//! permission mode a line with no permission flag lands in ([`permission_default`]).
 
 use std::path::{Path, PathBuf};
 
@@ -414,6 +415,180 @@ fn pin_in(value: &Value) -> super::login::LoginPin {
             found
         }
         _ => LoginPin::Picker,
+    }
+}
+
+/// What the agent's settings make the permission mode of a line that names none
+/// ([`permission_default`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// `permissions.defaultMode` names `mode` in the document `source`, the one that wins in
+    /// Claude Code's precedence.
+    Mode {
+        /// The mode it names.
+        mode: crate::harness::lights::Mode,
+        /// The settings document that names it, for a person to open.
+        source: String,
+    },
+    /// Every document was read and none names a mode: Claude Code picks its own.
+    Unset,
+    /// A document that could win cannot be read, or names a mode this build does not know: why.
+    Unread(String),
+}
+
+/// The default permission mode of an agent's settings, and whether they turn bypass off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDefault {
+    /// The mode a line with no permission flag lands in.
+    pub mode: Resolved,
+    /// The document whose `permissions.disableBypassPermissionsMode` is `disable`, where one
+    /// is: Claude Code then starts in no bypass whatever the line asks.
+    pub bypass_disabled: Option<String>,
+}
+
+/// THE DEFAULT PERMISSION MODE OF THE AGENT'S SETTINGS ([`permission_default`]), its documents
+/// read in Claude Code's precedence, highest first: the server-managed copy
+/// ([`REMOTE_SETTINGS`]), the managed preference domains ([`managed_preferences`], which this
+/// reader cannot parse), the managed folder's drop-ins from the last name to the first and then
+/// its file (a drop-in is merged over the file, a later one over an earlier), and the rest of
+/// [`sources_under`]'s chain as it orders it: the command line's `--settings`, the project's
+/// local settings, the project's, the user's. A `--permission-mode` or bypass flag on the line is
+/// not read: this is the mode of a line that has none (`harness::upgrade::permission_click_argv`).
+#[must_use]
+pub fn permission_default_under(
+    worker: &WorkerEnv,
+    launch: &Path,
+    managed: Option<&Path>,
+    prefs: &Path,
+    fence: Option<&Path>,
+) -> PermissionDefault {
+    let mut all = Vec::new();
+    all.push(match worker.claude_dir(launch) {
+        Ok(dir) if dir.is_absolute() => {
+            let path = dir.join(REMOTE_SETTINGS);
+            Source {
+                name: path.display().to_string(),
+                text: read_settings_in(fence, &path),
+            }
+        }
+        Ok(_) | Err(_) => Source {
+            name: format!("the user's {REMOTE_SETTINGS}"),
+            text: Err("cannot be found".to_string()),
+        },
+    });
+    all.extend(managed_preferences(worker, prefs));
+    if let Some(managed) = managed {
+        all.extend(managed_sources(managed, fence).into_iter().rev());
+    }
+    all.extend(sources_under(worker, launch, None, fence));
+    permission_default(&all)
+}
+
+/// THE MODE `sources` GIVE A LINE WITH NO PERMISSION FLAG, `sources` in precedence order, the
+/// highest first: the first document whose `permissions.defaultMode` names a mode wins
+/// ([`Resolved::Mode`]); none naming one is [`Resolved::Unset`]. On the safe side it is
+/// [`Resolved::Unread`], saying why, where a document at or above the winner is there and cannot
+/// be read or parsed, names a policy helper whose output this reader does not run
+/// ([`POLICY_HELPER_KEYS`]), names a mode this build does not know, or holds a `defaultMode`
+/// anywhere but under its own `permissions` (the server-managed copy's shape is Claude Code's
+/// own). A missing document says nothing. `bypass_disabled` is the first readable document, at
+/// any precedence, whose `permissions.disableBypassPermissionsMode` is `disable`.
+#[must_use]
+pub fn permission_default(sources: &[Source]) -> PermissionDefault {
+    let unread = |source: &Source, why: &str| format!("its settings ({}) {why}", source.name);
+    let (mut mode, mut bypass_disabled) = (None, None);
+    for source in sources {
+        let value = match &source.text {
+            Ok(None) => continue,
+            Ok(Some(text)) => parse(text),
+            Err(why) => Err(why.clone()),
+        };
+        let value = match value {
+            Ok(value) => value,
+            Err(why) => {
+                mode.get_or_insert_with(|| Resolved::Unread(unread(source, &why)));
+                continue;
+            }
+        };
+        let permissions = value.get("permissions");
+        if bypass_disabled.is_none()
+            && permissions
+                .and_then(|p| p.get("disableBypassPermissionsMode"))
+                .and_then(Value::as_str)
+                == Some("disable")
+        {
+            bypass_disabled = Some(source.name.clone());
+        }
+        if mode.is_some() {
+            continue;
+        }
+        if let Value::Object(map) = &value
+            && POLICY_HELPER_KEYS
+                .iter()
+                .any(|key| map.get(*key).is_some_and(|v| !v.is_null()))
+        {
+            mode = Some(Resolved::Unread(unread(
+                source,
+                "name a policy helper, whose output is not read",
+            )));
+            continue;
+        }
+        match permissions.and_then(|p| p.get("defaultMode")) {
+            None | Some(Value::Null) if names_default_mode(&value, true) => {
+                mode = Some(Resolved::Unread(unread(
+                    source,
+                    "hold a `defaultMode` outside their `permissions`",
+                )));
+            }
+            None | Some(Value::Null) => {}
+            Some(Value::String(word)) => {
+                mode = Some(
+                    match crate::harness::lights::Mode::of_setting(word.trim()) {
+                        Some(mode) => Resolved::Mode {
+                            mode,
+                            source: source.name.clone(),
+                        },
+                        None => Resolved::Unread(unread(
+                            source,
+                            &format!("name a `defaultMode` this build does not know ({word})"),
+                        )),
+                    },
+                );
+            }
+            Some(_) => {
+                mode = Some(Resolved::Unread(unread(
+                    source,
+                    "hold a `permissions.defaultMode` that is no string",
+                )));
+            }
+        }
+    }
+    PermissionDefault {
+        mode: mode.unwrap_or(Resolved::Unset),
+        bypass_disabled,
+    }
+}
+
+/// Whether `value` holds a non-null `defaultMode` key anywhere but the top document's own
+/// `permissions` (`top`), whose key [`permission_default`] reads itself.
+fn names_default_mode(value: &Value, top: bool) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, nested)| {
+            if key == "defaultMode" {
+                return !nested.is_null();
+            }
+            if top && key == "permissions" {
+                return match nested {
+                    Value::Object(own) => own
+                        .iter()
+                        .any(|(k, v)| k != "defaultMode" && names_default_mode(v, false)),
+                    other => names_default_mode(other, false),
+                };
+            }
+            names_default_mode(nested, false)
+        }),
+        Value::Array(items) => items.iter().any(|item| names_default_mode(item, false)),
+        _ => false,
     }
 }
 

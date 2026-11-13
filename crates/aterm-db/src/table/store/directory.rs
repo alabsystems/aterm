@@ -19,6 +19,19 @@ fn name(claim_name: &str) -> String {
     format!("{claim_name}.volume")
 }
 
+/// Retire the supplemental witness before its claim, so a completed retirement
+/// never leaves a detached witness that can be mistaken for lost custody.
+pub(crate) fn remove_claim_files(dir: &Path, claim_name: &str) -> Result<()> {
+    for file in [name(claim_name), claim_name.to_owned()] {
+        match std::fs::remove_file(dir.join(file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn anchor(claim: &[u8]) -> [u8; 32] {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(DOMAIN);

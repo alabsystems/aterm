@@ -6,7 +6,16 @@
 //! move (an Autopilot or an agent switched off, the agent's own background work) and waits only
 //! for what a restart would lose (a held tab, a box, a draft), a wall, or a running turn.
 //! It leaves out the quiet flow, which `HarnessUpgradeQuiet` binds (§4.5), the owner's tell, Codex
-//! and the move clock.
+//! and the move clock. `NoAutomaticMoveEndsRunningWork` is the ask flow's law (`RestartAtIdle`
+//! needs the agent's READY): the quiet flow's bounded move over the agent's own background work
+//! (its waits, or work past the deadline it was told) is `HarnessUpgradeQuiet`'s `MoveOverOwn`.
+//!
+//! A finished move (`phase == 3`) leaves a look open on its own clock (`age`: inside its window,
+//! past it, past the bound a warned look's line holds the conversation for), while its agent
+//! rests idle or at a break of its own background work (`rests`). A newer build landing behind it
+//! (`next == 1`) is taken at whatever point comes next once that clock has passed, a break
+//! included: the look never waits for an idle point to be closed, and only the line it owes is an
+//! idle point's, typed there however late that point comes.
 
 use aterm_spec::derive::*;
 
@@ -35,6 +44,15 @@ pub fn harness_upgrade_progress_model() -> Model {
             var now = 0;
             var lost = 0;
             var asnow = 0;
+            var age = 0;
+            var owes = 0;
+            var closed = 0;
+            var next = 0;
+            var idle_only = 0;
+            var hid = 0;
+            var off_idle = 0;
+            var rests = 0;
+            var any_point = 0;
 
             action TurnRuns when (phase <= 2 && posture > 0) {
                 posture = 0;
@@ -183,6 +201,50 @@ pub fn harness_upgrade_progress_model() -> Model {
                 clock = 0;
             }
 
+            action LookClockPasses when (phase == 3 && closed == 0 && age <= 1) {
+                age = if age == 0 { 1 } else { 2 };
+            }
+            action ResumedBuildWarns when (phase == 3 && closed == 0 && age == 0 && owes == 0) {
+                owes = 1;
+            }
+            action NewerBuildLands when (phase == 3 && next == 0) {
+                next = 1;
+            }
+            action RestsAtABreak when (phase == 3 && rests == 0) {
+                rests = 1;
+            }
+            action RestsIdle when (phase == 3 && rests == 1) {
+                rests = 0;
+            }
+            action LineTypedAtIdle when (
+                phase == 3 && closed == 0 && owes == 1 && (rests == 0 || any_point == 1)
+            ) {
+                closed = 1;
+                off_idle = if rests == 1 { 1 } else { off_idle };
+            }
+            action LookClosesAtAPoint when (
+                phase == 3 && closed == 0 && idle_only == 0 &&
+                (age == 2 || (age == 1 && owes == 0))
+            ) {
+                closed = 1;
+            }
+            action NextTargetTaken when (
+                phase == 3 && next == 1 &&
+                (closed == 1 || age == 2 || (age == 1 && owes == 0))
+            ) {
+                next = if closed == 1 || idle_only == 0 { 2 } else { next };
+                closed = if idle_only == 0 { 1 } else { closed };
+                hid = if closed == 0 && idle_only == 1 { 1 } else { hid };
+            }
+
+            action OnlyIdleClosesALook when (Buggy == 1 && slipped == 0 && idle_only == 0) {
+                idle_only = 1;
+                slipped = 1;
+            }
+            action LineTypedAtBreak when (Buggy == 1 && slipped == 0 && any_point == 0) {
+                any_point = 1;
+                slipped = 1;
+            }
             action NoLookWithoutAPoint when (
                 Buggy == 1 && slipped == 0 && blind == 0 &&
                 (posture == 0 || posture == 3 || posture == 4)
@@ -252,6 +314,8 @@ pub fn harness_upgrade_progress_model() -> Model {
             invariant NoStaleLook: cause == seen;
             invariant NoAutomaticMoveEndsRunningWork: at_work == 0;
             invariant NoPressLosesInput: lost == 0;
+            invariant NoLookPastItsClockHidesATarget: hid == 0;
+            invariant NoRestoreLineOffAnIdlePoint: off_idle == 0;
         }
     }
 }
@@ -329,6 +393,22 @@ pub fn harness_upgrade_progress_liveness() -> Liveness {
         weak: vec!["Watch"],
         strong: vec![],
         mutants: vec!["NoLookWithoutAPoint", "RecordedWordStands"],
+    }
+}
+
+/// A newer build that lands behind a finished move's look is taken: the look's clock passes and
+/// the next point takes the build, whoever has yet to close the look.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(harness_upgrade_progress_model)]
+pub fn harness_upgrade_look_liveness() -> Liveness {
+    let is = |v: &'static str, n: i64| eq(var(v), int(n));
+    Liveness {
+        name: "ANewerBuildBehindALookIsTaken",
+        goal: or_(le(var("phase"), int(2)), or_(is("next", 0), is("next", 2))),
+        weak: vec!["LookClockPasses", "NextTargetTaken"],
+        strong: vec![],
+        mutants: vec!["OnlyIdleClosesALook"],
     }
 }
 

@@ -49,7 +49,9 @@ struct Held {
 const SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 #[cfg(unix)]
-extern "C" fn on_signal(sig: libc::c_int) {
+extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // SAFETY: installed with SA_SIGINFO, so the kernel supplies a live packet.
+    unsafe { aterm_uds::signal_origin::capture(sig, info) };
     let _ = CAUGHT.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
 }
 
@@ -77,6 +79,10 @@ impl Watch {
     /// handler was installed over this module's meanwhile, which stays.
     #[must_use]
     pub fn enter() -> Watch {
+        #[cfg(unix)]
+        if let Err(why) = aterm_uds::signal_origin::start() {
+            eprintln!("signal provenance unavailable: {why}");
+        }
         let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
         if held.depth == 0 {
             CAUGHT.store(0, Ordering::SeqCst);
@@ -90,14 +96,13 @@ impl Watch {
                 {
                     continue;
                 }
-                // SAFETY: as above for the zeroed value; `on_signal` is an `extern "C" fn(c_int)`
-                // that lives for the whole program and touches one atomic, which is
-                // async-signal-safe; `sa_mask` is emptied by `sigemptyset` before the call reads it.
+                // SAFETY: as above for the zeroed value; the SA_SIGINFO handler lives for
+                // the whole program and uses only atomics and a nonblocking pipe write.
+                // `sa_mask` is emptied before the kernel reads it.
                 let installed = unsafe {
                     let mut new: libc::sigaction = std::mem::zeroed();
-                    new.sa_sigaction =
-                        on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-                    new.sa_flags = libc::SA_RESTART;
+                    new.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+                    new.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
                     libc::sigemptyset(&raw mut new.sa_mask);
                     libc::sigaction(sig, &raw const new, std::ptr::null_mut()) == 0
                 };
@@ -115,7 +120,11 @@ impl Watch {
     pub fn caught(&self) -> Option<i32> {
         match CAUGHT.load(Ordering::SeqCst) {
             0 => None,
-            sig => Some(sig),
+            sig => {
+                #[cfg(unix)]
+                let _ = aterm_uds::signal_origin::records();
+                Some(sig)
+            }
         }
     }
 
@@ -125,7 +134,11 @@ impl Watch {
     pub fn take(&self) -> Option<i32> {
         match CAUGHT.swap(0, Ordering::SeqCst) {
             0 => None,
-            sig => Some(sig),
+            sig => {
+                #[cfg(unix)]
+                let _ = aterm_uds::signal_origin::records();
+                Some(sig)
+            }
         }
     }
 
@@ -164,7 +177,7 @@ impl Drop for Watch {
             // the watch began.
             unsafe {
                 let mut now: libc::sigaction = std::mem::zeroed();
-                let ours = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                let ours = on_signal as *const () as libc::sighandler_t;
                 if libc::sigaction(sig, std::ptr::null(), &raw mut now) == 0
                     && now.sa_sigaction == ours
                 {
@@ -174,6 +187,8 @@ impl Drop for Watch {
         }
         let sig = CAUGHT.swap(0, Ordering::SeqCst);
         if sig != 0 {
+            #[cfg(unix)]
+            let _ = aterm_uds::signal_origin::records();
             resend(sig);
         }
     }

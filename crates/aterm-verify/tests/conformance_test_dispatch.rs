@@ -181,9 +181,9 @@ fn the_model_refuses_a_double_release_and_a_start_past_the_share() {
     over.insert("held", running["held"] + constant(&m, "C2"));
     over.insert("bytes", running["bytes"] + constant(&m, "P2"));
     assert_eq!(
-        d.next(0.0),
-        None,
-        "the second does not fit beside the first"
+        d.clone().next(0.0).map(|b| b.index),
+        Some(3),
+        "the second does not fit; the fourth uses the spare core"
     );
     assert_eq!(interp::admits(&m, &running, &over), None);
     assert_eq!(

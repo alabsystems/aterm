@@ -277,6 +277,7 @@ fn open_admitted(
     };
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
     let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    look_afresh();
     #[cfg(test)]
     count_read(path);
     #[cfg(test)]
@@ -515,6 +516,65 @@ pub fn write_atomic_with(
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
+/// [`write_atomic`], unless `path` already holds exactly `bytes`: a regular file of this user's
+/// with one link, permissions exactly `mode`, no access list that widens it, that length and
+/// those bytes, which is then left as it is (`false`): no temporary file, no rename, and the
+/// same inode and times, so a reader that keeps what it read by the file's [`FileStamp`] keeps
+/// it. Anything else there (nothing, other bytes, another mode, a symlink, a file that cannot be
+/// read) is replaced as [`write_atomic`] replaces it (`true`). For text a caller derives again
+/// from state that often has not changed.
+///
+/// A file left as it is has the durability its last writer gave it, and nothing is flushed
+/// again: where that writer's flush of the directory failed, it was told so, and a caller that
+/// then writes the same bytes with this function does not repeat that flush.
+///
+/// # Errors
+/// As [`write_atomic`], where it writes.
+pub fn write_atomic_if_changed(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
+    if holds_exactly(path, bytes, mode) {
+        return Ok(false);
+    }
+    write_atomic(path, bytes, mode)?;
+    Ok(true)
+}
+
+/// Whether the file at `path` is one [`write_atomic`] of `bytes` under `mode` would leave no
+/// different ([`write_atomic_if_changed`]). Any doubt (it cannot be opened, examined or read
+/// through) is `false`. The opened file is examined and read, so a file renamed over the path
+/// meanwhile is not the one judged, and the bytes read are wiped.
+fn holds_exactly(path: &Path, bytes: &[u8], mode: u32) -> bool {
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.file_type().is_file()
+        || meta.uid() != euid()
+        || meta.nlink() != 1
+        || meta.mode() & 0o7777 != mode & 0o7777
+        || u64::try_from(bytes.len()).ok() != Some(meta.len())
+        || check_access_list(&file, false).is_err()
+    {
+        return false;
+    }
+    let mut held = zeroize::Zeroizing::new([0u8; 64 * 1024]);
+    let mut rest = bytes;
+    loop {
+        match file.read(&mut held[..]) {
+            Ok(0) => return rest.is_empty(),
+            Ok(n) if n <= rest.len() && held[..n] == rest[..n] => rest = &rest[n..],
+            Ok(_) => return false,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Opens or creates a `0600` regular lock file at `path` (`O_NOFOLLOW | O_NONBLOCK`), verifying
 /// ownership and a single hard link, narrowing its permissions to `0600`, and keeping its
 /// descriptor out of child processes.
@@ -670,20 +730,26 @@ pub(crate) fn seen_if_present_in(
     path: &Path,
 ) -> crate::Result<Option<Seen>> {
     match lstat_in(glance, path) {
-        Ok(Some(meta)) => Ok(Some(Seen {
-            kind: kind_of(&meta),
-            stamp: FileStamp::of(&meta),
-            uid: meta.uid(),
-            mode: meta.mode(),
-            nlink: meta.nlink(),
-        })),
+        Ok(Some(meta)) => Ok(Some(seen_of(&meta))),
         Ok(None) => Ok(None),
         Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
     }
 }
 
+/// What the `lstat` `meta` shows ([`Seen`]).
+fn seen_of(meta: &std::fs::Metadata) -> Seen {
+    Seen {
+        kind: kind_of(meta),
+        stamp: FileStamp::of(meta),
+        uid: meta.uid(),
+        mode: meta.mode(),
+        nlink: meta.nlink(),
+    }
+}
+
 /// The `lstat` of `path`, `None` where nothing is there: `glance`'s where the caller looks
-/// through one ([`Glance::symlink_metadata`]), a fresh one where it does not.
+/// through one ([`Glance::symlink_metadata`]), a fresh one where it does not, which moves this
+/// thread's count of fresh looks ([`fresh_looks`]).
 ///
 /// # Errors
 /// The `lstat`'s, other than a missing path.
@@ -694,6 +760,16 @@ pub(crate) fn lstat_in(
     if let Some(glance) = glance {
         return glance.symlink_metadata(path);
     }
+    look_afresh();
+    lstat_now(path)
+}
+
+/// The `lstat` of `path` taken now, `None` where nothing is there: [`lstat_in`]'s own, or a
+/// glance's first ([`Glance::symlink_metadata`]).
+///
+/// # Errors
+/// The `lstat`'s, other than a missing path.
+fn lstat_now(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
     #[cfg(test)]
     count_look(path);
     match std::fs::symlink_metadata(path) {
@@ -701,6 +777,40 @@ pub(crate) fn lstat_in(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+std::thread_local! {
+    /// How many times this thread looked at the disk afresh ([`fresh_looks`]).
+    static FRESH_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread looked at the disk afresh, since it began. These looks move it: each
+/// `lstat` no glance keeps ([`lstat_in`] on its own call, [`kind`], [`kind_and_id`], [`file_id`],
+/// [`kind_and_stamp_if_present`], a glance's `lstat` that failed, which it does not keep, and the
+/// `lstat` a glance confirms its first look at a file by, which it does not keep either
+/// ([`Glance::first_stands`])), each open of a file through `open_admitted` (the one [`read_private`], [`read_public`],
+/// [`read_owned`] and the digests [`digest_while_seen`] reads go through), the state lock's own
+/// open (`client::StateLock::open_present`), each listing of the control journal
+/// (`client::vault_memo::desk_files`), a memo's miss under a look
+/// (`client::vault_memo::Memo::read_under`), and each other mark of a reader that reads past these
+/// ([`look_afresh`]). A glance's first `lstat` of a path, which the glance keeps and gives for the
+/// rest of its life ([`Glance::symlink_metadata`]), does not move it. Nor do some other looks a
+/// derivation through a vault look takes, but each follows, within the same derivation, one that
+/// moved it: `records_storage`'s `Context` (its `lstat` and `canonicalize` of the records' folder,
+/// its `openat`s and the reads of its layout files) after `data_path`'s read of the pin or its
+/// [`kind`], the state lock's `lstat` of the vault's folder as it narrows a lock this user owns
+/// (`client::StateLock::narrow_owned_then`) after its open, and an opened file's `fstat` or ACL
+/// read after its open. So a value a look at the vault derives while this stands still was derived
+/// from its glance's `lstat`s alone and from caches whose entries those `lstat`s name
+/// (`client::Moment`), and the look may keep it; one derived while it moved read something afresh,
+/// and is derived again at the look's next ask, as each ask derived it before.
+pub(crate) fn fresh_looks() -> u64 {
+    FRESH_LOOKS.with(std::cell::Cell::get)
+}
+
+/// Count one fresh look at the disk on this thread ([`fresh_looks`]).
+pub(crate) fn look_afresh() {
+    FRESH_LOOKS.with(|looks| looks.set(looks.get().wrapping_add(1)));
 }
 
 /// The `lstat`s one check of a vault takes, or the checks one look at it serves, each path's once.
@@ -720,7 +830,15 @@ pub(crate) fn lstat_in(
 /// none outlives its check or its look, and a look that confirms a file stood still across a read
 /// is never taken from one. A digest kept of what a glance saw is kept only where the file had
 /// settled when the glance began ([`digest_while_seen`]): a glance's `lstat` can be older than the
-/// ask it answers.
+/// ask it answers. A glance's first `lstat` of a path is the one look at the disk that does not
+/// move this thread's count of fresh looks ([`fresh_looks`]): it stands for the rest of the
+/// glance's life, so what a look at the vault derives from such `lstat`s alone may be kept for
+/// that look (`client::Moment`). One that fails is not kept, and moves it. A glance's first look at
+/// a file stands for it as of a later moment, past a read its caller made since, only where one
+/// `lstat` taken then, afresh, shows the same, and the first showed the file settled when the
+/// glance began ([`Self::first_stands`]); the glance keeps that `lstat` no more than a failed one,
+/// and whether its first look showed a settled file it says without looking again
+/// ([`Self::first_settled`]).
 pub(crate) struct Glance {
     /// When this look began, before any `lstat` it took ([`asked_now`]).
     began: std::time::SystemTime,
@@ -730,8 +848,14 @@ pub(crate) struct Glance {
 impl Glance {
     /// A look that has taken nothing yet, begun now.
     pub(crate) fn new() -> Self {
+        Self::begun_at(asked_now())
+    }
+
+    /// A look that has taken nothing yet, begun at `began`: [`Self::new`]'s, or a test's own
+    /// time, whose digests judge a file settled as of then ([`digest_while_seen`]).
+    pub(crate) fn begun_at(began: std::time::SystemTime) -> Self {
         Self {
-            began: asked_now(),
+            began,
             seen: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -742,20 +866,70 @@ impl Glance {
     /// # Errors
     /// The `lstat`'s, other than a missing path.
     pub(crate) fn symlink_metadata(&self, path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+        if let Some(meta) = self.first(path) {
+            return Ok(meta);
+        }
+        // The one look at the disk that is no fresh look ([`fresh_looks`]): what it finds is
+        // this glance's for the rest of its life. One that fails is not kept, and is.
+        let meta = lstat_now(path).inspect_err(|_| look_afresh())?;
+        self.seen
+            .borrow_mut()
+            .push((path.to_path_buf(), meta.clone()));
+        Ok(meta)
+    }
+
+    /// The `lstat` of `path` this look took first, `Some(None)` where nothing was there; `None`
+    /// where it took none. It looks at nothing.
+    fn first(&self, path: &Path) -> Option<Option<std::fs::Metadata>> {
         let bytes = path.as_os_str().as_encoded_bytes();
         // The paths one check names share their folder: they differ at their ends.
         let same = |at: &std::path::PathBuf| {
             let at = at.as_os_str().as_encoded_bytes();
             at.len() == bytes.len() && at.iter().rev().eq(bytes.iter().rev())
         };
-        if let Some((_, meta)) = self.seen.borrow().iter().find(|(at, _)| same(at)) {
-            return Ok(meta.clone());
-        }
-        let meta = lstat_in(None, path)?;
         self.seen
-            .borrow_mut()
-            .push((path.to_path_buf(), meta.clone()));
-        Ok(meta)
+            .borrow()
+            .iter()
+            .find(|(at, _)| same(at))
+            .map(|(_, meta)| meta.clone())
+    }
+
+    /// What this look's first `lstat` of `path` showed, where it showed a regular file that had
+    /// settled ([`settled`]) when the look began; `None` where it took none of `path`, or its
+    /// first showed nothing, something other than a regular file, or a file that changed within
+    /// [`SETTLED_NS`] of when the look began. It looks at nothing.
+    fn first_seen_settled(&self, path: &Path) -> Option<Seen> {
+        self.first(path)
+            .flatten()
+            .map(|meta| seen_of(&meta))
+            .filter(|first| first.kind == Kind::File && settled(first, self.began))
+    }
+
+    /// Whether the `lstat` of `path` this look took first showed a regular file that had settled
+    /// ([`settled`]) when the look began, as [`Self::first_stands`] asks before it looks again:
+    /// `false` where the look took none of `path`, or its first showed nothing or something else.
+    /// It looks at nothing, so it moves no count of fresh looks ([`fresh_looks`]): for a caller
+    /// that would hand the look on only where its first look at a file can be confirmed later.
+    pub(crate) fn first_settled(&self, path: &Path) -> bool {
+        self.first_seen_settled(path).is_some()
+    }
+
+    /// Whether the `lstat` of `path` this look took first still stands: it showed a regular file
+    /// that had settled ([`settled`]) when the look began, and an `lstat` taken now shows the same
+    /// ([`Seen`]: its kind, device, inode, length, both change times, owner, mode and link count).
+    /// `false` where the look took none of `path`, or its first showed nothing or something else,
+    /// or one taken now shows another file, a change or nothing, or fails. The `lstat` taken now
+    /// is a fresh look ([`fresh_looks`]), and the look does not keep it: its first stands as it
+    /// was. For a caller that judged a file through a look begun before a read of its own, and
+    /// must judge it as of after that read: a change made after the look's first `lstat` moves
+    /// what one taken now shows, as the settled rule has it for a digest kept of what a glance
+    /// saw ([`digest_while_seen`]).
+    pub(crate) fn first_stands(&self, path: &Path) -> bool {
+        let Some(first) = self.first_seen_settled(path) else {
+            return false;
+        };
+        look_afresh();
+        matches!(lstat_now(path), Ok(Some(now)) if seen_of(&now) == first)
     }
 }
 
@@ -847,35 +1021,41 @@ fn digest_while_seen(
     reader: Reader,
     glance: Option<&Glance>,
 ) -> crate::Result<Option<[u8; 32]>> {
+    static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
     let now = asked_now();
-    #[cfg(not(test))]
-    {
-        static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
-        digest_while_seen_in(&DIGESTS, glance, now, path, reader, |path| {
-            reader.digest(path)
-        })
+    #[cfg(any(test, debug_assertions))]
+    if cfg!(test) || !ASKED_LATER.get().is_zero() {
+        return THREAD_DIGESTS.with(|kept| {
+            digest_while_seen_in(kept, glance, now, path, reader, |path| reader.digest(path))
+        });
     }
-    #[cfg(test)]
-    THREAD_DIGESTS.with(|kept| {
-        digest_while_seen_in(kept, glance, now, path, reader, |path| reader.digest(path))
+    digest_while_seen_in(&DIGESTS, glance, now, path, reader, |path| {
+        reader.digest(path)
     })
 }
 
 /// The time a kept digest's settled rule judges an ask, or the start of a glance, by: the clock,
-/// and in a test as much later as this thread's [`as_if_later`] puts it.
+/// and in a test (this crate's own, or another crate's in a build with debug assertions) as much
+/// later as this thread's [`as_if_later`] puts it.
 fn asked_now() -> std::time::SystemTime {
     let now = std::time::SystemTime::now();
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     let now = now + ASKED_LATER.get();
     now
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 std::thread_local! {
     /// A test thread's own [`digest_while_seen`] digests, so one test's asks never let go of
-    /// another's.
+    /// another's: every ask in this crate's own tests, and, in a build with debug assertions
+    /// (another crate's tests'), each ask within an [`as_if_later`] that puts it later than the
+    /// clock.
     static THREAD_DIGESTS: KeptDigests =
         const { std::sync::Mutex::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
     /// How much later than the clock this thread's asks of [`digest_while_seen`], and the glances
     /// it begins, are ([`as_if_later`]).
     static ASKED_LATER: std::cell::Cell<std::time::Duration> =
@@ -884,8 +1064,10 @@ std::thread_local! {
 
 /// Run `f` with each digest this thread asks ([`digest_while_seen`]), and each glance it begins
 /// ([`Glance::new`]), asked `by` later than the clock: a test's files have stood settled
-/// ([`SETTLED_NS`]) without its waiting.
-#[cfg(test)]
+/// ([`SETTLED_NS`]) without its waiting. Where `by` is not zero, the digests kept within it are
+/// this thread's own ([`THREAD_DIGESTS`]), which no other thread's asks let go of. Another
+/// crate's tests ask it as `client::test_as_if_later`.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn as_if_later<T>(by: std::time::Duration, f: impl FnOnce() -> T) -> T {
     let was = ASKED_LATER.replace(by);
     let out = f();
@@ -919,6 +1101,67 @@ pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
         .ok()
         .and_then(|since| i128::try_from(since.as_nanos()).ok())
         .is_some_and(|now| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns) <= now - SETTLED_NS)
+}
+
+/// What one `lstat` each showed of a journal's folder and of the files a read of it reads
+/// ([`aterm_journal::committed_files`]): the anchor, the checkpoint and the astream file. A reader
+/// that keeps what a read of the journal found keeps it while a later one shows the same, where it
+/// stands for that read ([`Self::stands_for`]): an append, a checkpoint renamed over, a new link
+/// and a mode, owner or access-list change each move what one shows, which nothing moves back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalSeen([Seen; 4]);
+
+impl JournalSeen {
+    /// The journal `name` in `dir` as `lstat` shows it now; `None` where the folder or a file is
+    /// missing or cannot be examined, or is not what a read admits (the folder a directory, each
+    /// file a regular file).
+    #[must_use]
+    pub fn of(dir: &Path, name: &str) -> Option<Self> {
+        let files = aterm_journal::committed_files(dir, name);
+        let seen = |path: &Path, kind| {
+            seen_if_present(path)
+                .ok()
+                .flatten()
+                .filter(|seen| seen.kind == kind)
+        };
+        Some(Self([
+            seen(dir, Kind::Dir)?,
+            seen(&files.anchor, Kind::File)?,
+            seen(&files.checkpoint, Kind::File)?,
+            seen(&files.astream, Kind::File)?,
+        ]))
+    }
+
+    /// Whether this, taken before a read that opened `opened`, may stand for what that read found:
+    /// it shows the very files the read opened, and none of what it shows changed within
+    /// [`settled`]'s window of `now`. A copy of the journal swapped in for the read, through a
+    /// parent renamed aside and back, moves none of the times a witness holds, but each of its
+    /// files is another inode, or one moved out of this folder, which moves the folder's times.
+    /// The folder's own verdict is the read's: a folder swapped in for that verdict alone, and out
+    /// again before the files are opened, is taken as a fresh read made then takes it.
+    #[must_use]
+    pub fn stands_for(&self, opened: &aterm_journal::Opened, now: std::time::SystemTime) -> bool {
+        let [_, anchor, checkpoint, astream] = &self.0;
+        let id = |seen: &Seen| (seen.stamp.dev, seen.stamp.ino);
+        (id(anchor), id(checkpoint), id(astream))
+            == (opened.anchor, opened.checkpoint, opened.astream)
+            && self.0.iter().all(|seen| settled(seen, now))
+    }
+
+    /// The earliest and the latest change (each path's later of its content and inode change
+    /// times, in nanoseconds) this shows, for a law that asks within or past [`settled`]'s window.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_changed_ns(&self) -> (i128, i128) {
+        let changed = self
+            .0
+            .map(|seen| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns));
+        (
+            changed.into_iter().min().unwrap_or_default(),
+            changed.into_iter().max().unwrap_or_default(),
+        )
+    }
 }
 
 /// [`digest_while_seen`] with its digests in `kept`, asked at `now`, reading with `read` what
@@ -968,6 +1211,7 @@ fn digest_while_seen_in(
 /// # Errors
 /// As [`stamp_if_present`].
 pub(crate) fn kind_and_stamp_if_present(path: &Path) -> crate::Result<Option<(Kind, FileStamp)>> {
+    look_afresh();
     match std::fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some((kind_of(&meta), FileStamp::of(&meta)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1249,6 +1493,7 @@ pub fn kind(path: &Path) -> crate::Result<Kind> {
 
 /// What is at `path` (`lstat`), together with its `(device, inode)` when present.
 pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, u64)>)> {
+    look_afresh();
     match std::fs::symlink_metadata(path) {
         Ok(meta) => Ok((kind_of(&meta), Some((meta.dev(), meta.ino())))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Kind::Missing, None)),
@@ -1271,6 +1516,7 @@ fn kind_of(meta: &std::fs::Metadata) -> Kind {
 
 /// Returns `(device, inode)` of `path` via `lstat`, or `None` if missing.
 pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    look_afresh();
     std::fs::symlink_metadata(path)
         .ok()
         .map(|meta| (meta.dev(), meta.ino()))
@@ -1549,692 +1795,5 @@ pub(crate) fn as_another_user<T>(f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn scratch() -> aterm_tempfile::TempDir {
-        aterm_tempfile::tempdir().expect("tempdir")
-    }
-
-    /// A glance gives each path the `lstat` it took of it first ([`Glance`]): a file rewritten,
-    /// removed or made since stands as the glance saw it, while a new glance sees each as it is;
-    /// each path has its own, and an error is not kept, so the next ask looks again.
-    /// NEGATIVE CONTROLS (2026-11-08): a glance that looks afresh at each ask sees the rewrite
-    /// (`a rewrite stands as first seen`); one that tells paths apart by their length alone gives
-    /// the second file the first one's `lstat` (`each path its own`); one that keeps a failed look
-    /// as an absence answers the file made at that path since with none (`an error is looked at
-    /// again`).
-    #[test]
-    fn a_glance_gives_each_path_the_lstat_it_took_first() {
-        let root = scratch();
-        let (a, b, made) = (
-            root.path().join("a"),
-            root.path().join("b"),
-            root.path().join("c"),
-        );
-        write_atomic(&a, b"one", 0o600).unwrap();
-        write_atomic(&b, b"second", 0o600).unwrap();
-        let len = |meta: Option<std::fs::Metadata>| meta.map(|meta| meta.len());
-        let glance = Glance::new();
-        assert_eq!(len(glance.symlink_metadata(&a).unwrap()), Some(3));
-        assert_eq!(
-            len(glance.symlink_metadata(&b).unwrap()),
-            Some(6),
-            "each path its own"
-        );
-        assert_eq!(len(glance.symlink_metadata(&made).unwrap()), None);
-
-        write_atomic(&a, b"rewritten", 0o600).unwrap();
-        std::fs::remove_file(&b).unwrap();
-        write_atomic(&made, b"made", 0o600).unwrap();
-        assert_eq!(
-            len(glance.symlink_metadata(&a).unwrap()),
-            Some(3),
-            "a rewrite stands as first seen"
-        );
-        assert_eq!(
-            len(glance.symlink_metadata(&b).unwrap()),
-            Some(6),
-            "a removal stands as first seen"
-        );
-        assert_eq!(
-            len(glance.symlink_metadata(&made).unwrap()),
-            None,
-            "a file made since stands absent"
-        );
-        let now = Glance::new();
-        assert_eq!(len(now.symlink_metadata(&a).unwrap()), Some(9));
-        assert_eq!(len(now.symlink_metadata(&b).unwrap()), None);
-        assert_eq!(len(now.symlink_metadata(&made).unwrap()), Some(4));
-
-        let child = a.join("child");
-        assert!(
-            glance.symlink_metadata(&child).is_err(),
-            "a file has no child"
-        );
-        std::fs::remove_file(&a).unwrap();
-        std::fs::create_dir(&a).unwrap();
-        write_atomic(&child, b"child", 0o600).unwrap();
-        assert_eq!(
-            len(glance.symlink_metadata(&child).unwrap()),
-            Some(5),
-            "an error is looked at again"
-        );
-    }
-
-    #[test]
-    fn a_stamp_distinguishes_missing_paths_from_failed_observations() {
-        let root = scratch();
-        let path = root.path().join("file");
-        assert_eq!(stamp_if_present(&path).unwrap(), None);
-        write_atomic(&path, b"present", 0o600).unwrap();
-        assert!(stamp_if_present(&path).unwrap().is_some());
-        assert!(stamp_if_present(&path.join("cannot-be-a-child")).is_err());
-    }
-
-    /// A digest of what a glance saw is kept only where its file had settled ([`SETTLED_NS`]) when
-    /// the glance began, not merely by the ask: a glance's `lstat` can be older than the ask, and a
-    /// change between them in one tick of a coarse clock would leave its witness standing. A file
-    /// a glance began to look at a second after its last change is read again at each ask through
-    /// it, though the asks come two hours after the change; one a glance begun an hour after the
-    /// change saw is read once. Each time is taken from the file's own stamp, so neither depends
-    /// on how soon after the write the law runs.
-    /// NEGATIVE CONTROL (2026-11-10): judged settled as of the ask, the file a glance began to
-    /// look at a second after its change is read once (`a digest of what a glance saw before its
-    /// file settled`).
-    #[test]
-    fn a_glance_fed_digest_is_kept_only_where_its_file_had_settled_when_the_glance_began() {
-        const PRIVATE: Reader = Reader {
-            admit: Admit::Private,
-            max: 64,
-        };
-        let root = scratch();
-        let path = root.path().join("custody");
-        write_atomic(&path, b"custody", 0o600).unwrap();
-        let seen = seen_if_present(&path).unwrap().unwrap();
-        let changed = std::time::UNIX_EPOCH
-            + std::time::Duration::from_nanos(
-                u64::try_from(seen.stamp.mtime_ns.max(seen.stamp.ctime_ns)).unwrap(),
-            );
-        let after_it = |secs| changed + std::time::Duration::from_secs(secs);
-        let begun_after_it = |secs| Glance {
-            began: after_it(secs),
-            seen: std::cell::RefCell::new(Vec::new()),
-        };
-        let reads_through = |glance: &Glance| {
-            let kept = std::sync::Mutex::new(std::collections::VecDeque::new());
-            let reads = std::cell::Cell::new(0);
-            for _ in 0..2 {
-                digest_while_seen_in(
-                    &kept,
-                    Some(glance),
-                    after_it(7200),
-                    &path,
-                    PRIVATE,
-                    |path| {
-                        reads.set(reads.get() + 1);
-                        PRIVATE.digest(path)
-                    },
-                )
-                .unwrap()
-                .unwrap();
-            }
-            reads.get()
-        };
-        assert_eq!(
-            reads_through(&begun_after_it(1)),
-            2,
-            "a digest of what a glance saw before its file settled"
-        );
-        assert_eq!(
-            reads_through(&begun_after_it(3600)),
-            1,
-            "CONTROL: a digest of what a glance begun after its file settled saw"
-        );
-    }
-
-    /// A digest is kept while its file stands ([`digest_while_seen`]): a settled file is read once
-    /// however often its digest is asked, and each change a reader would see is read again (its
-    /// bytes rewritten in place at the same length, the file opened to others, another file renamed
-    /// over it at the same length, the file removed), as is a file swapped in for the read that
-    /// gave the digest, at its path or through its parent directory, and a file changed within
-    /// [`SETTLED_NS`] of the ask. A digest one reader kept never answers a reader that refuses the
-    /// file.
-    /// NEGATIVE CONTROLS (2026-11-08): a digest kept by its path alone, and one kept by the file's
-    /// device, inode and length, each answer the rewrite in place with the digest they kept; one
-    /// kept without the opened file's stamp answers the parent's swap with the swapped-in file's;
-    /// one kept for any reader answers the stricter reader; one kept without the settled rule
-    /// reads a file changed a second before the ask once. A digest kept without its mode answers
-    /// no change here wrongly, since APFS moves a file's change time at each `chmod`, which
-    /// [`Seen`] holds for a coarser clock.
-    #[test]
-    fn a_digest_is_kept_while_its_file_stands_and_read_again_after_each_change() {
-        use std::os::unix::fs::PermissionsExt as _;
-        /// A change to a file whose digest is kept, and what makes it.
-        struct Change {
-            what: &'static str,
-            make: fn(&Path),
-        }
-        const PRIVATE: Reader = Reader {
-            admit: Admit::Private,
-            max: 64,
-        };
-        fn read(path: &Path) -> crate::Result<Option<(FileStamp, [u8; 32])>> {
-            PRIVATE.digest(path)
-        }
-        /// What a fresh read by `reader` answers: its digest, `None` where there is no file, or
-        /// `None` for its refusal.
-        fn fresh(reader: Reader, path: &Path) -> Option<Option<[u8; 32]>> {
-            reader
-                .digest(path)
-                .ok()
-                .map(|read| read.map(|(_, digest)| digest))
-        }
-        fn store() -> KeptDigests {
-            std::sync::Mutex::new(std::collections::VecDeque::new())
-        }
-        /// When the file at `path` last changed, `secs` seconds on.
-        fn after_its_change(path: &Path, secs: u64) -> std::time::SystemTime {
-            let seen = seen_if_present(path).unwrap().unwrap();
-            let changed = seen.stamp.mtime_ns.max(seen.stamp.ctime_ns);
-            std::time::UNIX_EPOCH
-                + std::time::Duration::from_nanos(u64::try_from(changed).unwrap())
-                + std::time::Duration::from_secs(secs)
-        }
-        let sha = aterm_digest::Sha256::digest;
-        // The file stood an hour unchanged at each ask but the settled rule's.
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        let changes = [
-            Change {
-                what: "its bytes rewritten in place at the same length",
-                make: |path| {
-                    let file = File::options().write(true).open(path).unwrap();
-                    file.write_all_at(b"CUSTODY", 0).unwrap();
-                    // Its mtime moved away too, so the case holds where a coarse clock gives the
-                    // rewrite the time the file had, which the settled rule answers at a real ask.
-                    file.set_modified(std::time::UNIX_EPOCH).unwrap();
-                },
-            },
-            Change {
-                what: "the file opened to others",
-                make: |path| {
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-                },
-            },
-            Change {
-                what: "another file renamed over it at the same length",
-                make: |path| {
-                    let beside = path.with_extension("new");
-                    write_atomic(&beside, b"CUSTODY", 0o600).unwrap();
-                    std::fs::rename(&beside, path).unwrap();
-                },
-            },
-            Change {
-                what: "the file removed",
-                make: |path| std::fs::remove_file(path).unwrap(),
-            },
-        ];
-        for Change { what, make } in changes {
-            let root = scratch();
-            let path = root.path().join("custody");
-            write_atomic(&path, b"custody", 0o600).unwrap();
-            let kept = store();
-            let first = digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap();
-            assert_eq!(first, Some(sha(b"custody")), "{what}");
-            let reads = reads_of(&path);
-            assert_eq!(
-                digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap(),
-                first
-            );
-            assert_eq!(reads_of(&path), reads, "{what}: read again while it stood");
-            make(&path);
-            let again = digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).ok();
-            assert_eq!(again, fresh(PRIVATE, &path), "{what}");
-            assert_ne!(again, Some(first), "{what}: answered with the kept digest");
-        }
-
-        // Another file swapped in for the read, at the path or through its parent directory,
-        // gives that read its digest, which is not kept: the next ask reads the file put back.
-        let root = scratch();
-        let dir = root.path().join("vault");
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("custody");
-        write_atomic(&path, b"custody", 0o600).unwrap();
-        /// A swap of another file in for the read: it puts the other file there, reads it and
-        /// puts the file back.
-        type Swap = fn(&Path) -> crate::Result<Option<(FileStamp, [u8; 32])>>;
-        let swaps: [(&str, Swap); 2] = [
-            ("its path", |path| {
-                let aside = path.with_extension("aside");
-                std::fs::rename(path, &aside).unwrap();
-                write_atomic(path, b"CUSTODY", 0o600).unwrap();
-                let swapped_in = read(path);
-                std::fs::rename(&aside, path).unwrap();
-                swapped_in
-            }),
-            ("its parent directory", |path| {
-                let dir = path.parent().unwrap();
-                let aside = dir.with_extension("aside");
-                std::fs::rename(dir, &aside).unwrap();
-                std::fs::create_dir(dir).unwrap();
-                write_atomic(path, b"CUSTODY", 0o600).unwrap();
-                let swapped_in = read(path);
-                std::fs::remove_file(path).unwrap();
-                std::fs::remove_dir(dir).unwrap();
-                std::fs::rename(&aside, dir).unwrap();
-                swapped_in
-            }),
-        ];
-        for (through, swap) in swaps {
-            let kept = store();
-            let seen = seen_if_present(&path).unwrap();
-            let swapped = digest_while_seen_in(&kept, None, later, &path, PRIVATE, swap);
-            assert_eq!(swapped.unwrap(), Some(sha(b"CUSTODY")), "through {through}");
-            if through == "its parent directory" {
-                assert_eq!(
-                    seen_if_present(&path).unwrap(),
-                    seen,
-                    "the parent's swap left the file's witness as it was"
-                );
-            }
-            assert_eq!(
-                digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap(),
-                Some(sha(b"custody")),
-                "the file put back through {through}"
-            );
-        }
-
-        // A digest one reader kept answers no reader that refuses the file.
-        let stricter = [
-            (
-                "a reader refusing its mode",
-                Reader {
-                    admit: Admit::Any,
-                    max: 64,
-                },
-                PRIVATE,
-                0o640,
-            ),
-            (
-                "a reader with a smaller cap",
-                PRIVATE,
-                Reader {
-                    admit: Admit::Private,
-                    max: 4,
-                },
-                0o600,
-            ),
-        ];
-        for (what, laxer, stricter, mode) in stricter {
-            let root = scratch();
-            let path = root.path().join("custody");
-            write_atomic(&path, b"custody", mode).unwrap();
-            let kept = store();
-            let admitted =
-                digest_while_seen_in(&kept, None, later, &path, laxer, |path| laxer.digest(path));
-            assert_eq!(admitted.unwrap(), Some(sha(b"custody")), "{what}");
-            let refused = digest_while_seen_in(&kept, None, later, &path, stricter, |path| {
-                stricter.digest(path)
-            });
-            assert!(refused.is_err(), "{what}: {refused:?}");
-        }
-
-        // A file that changed a second before the ask is read at each ask, and one that changed
-        // three seconds before it once.
-        let root = scratch();
-        let path = root.path().join("custody");
-        write_atomic(&path, b"changed", 0o600).unwrap();
-        for (secs, read_at) in [(1, 2), (3, 1)] {
-            let kept = store();
-            let at = after_its_change(&path, secs);
-            let reads = reads_of(&path);
-            for _ in 0..2 {
-                let changed = digest_while_seen_in(&kept, None, at, &path, PRIVATE, read).unwrap();
-                assert_eq!(changed, Some(sha(b"changed")));
-            }
-            assert_eq!(
-                reads_of(&path) - reads,
-                read_at,
-                "a file changed {secs} s before the ask"
-            );
-        }
-    }
-
-    /// F23 (rule 5): an append refuses a file renamed over the one its writer last left, though
-    /// it has the same length: `append_at` checks the file's device and inode with its length.
-    /// NEGATIVE CONTROL: the length-only check of main before F23 appends onto it, and the test
-    /// fails "the append went onto a file renamed over with the same length".
-    #[test]
-    fn an_append_refuses_a_file_renamed_over_with_the_same_length() {
-        let root = scratch();
-        let path = root.path().join("team.records");
-        let left = write_atomic_stamped(&path, b"ours", 0o600)
-            .expect("write")
-            .expect("its stamp");
-        assert_eq!(stamp(&path), Some(left));
-        let beside = root.path().join("team.records.new");
-        write_atomic(&beside, b"some", 0o600).expect("write");
-        std::fs::rename(&beside, &path).expect("renamed over");
-        assert_eq!(stamp(&path).map(|now| now.len), Some(left.len));
-        assert!(
-            append_at(&path, &left, b"tail").is_err(),
-            "the append went onto a file renamed over with the same length"
-        );
-        assert_eq!(std::fs::read(&path).expect("read"), b"some");
-
-        // The file it stamped takes the append, which returns the stamp it leaves.
-        let now = stamp(&path).expect("stamped");
-        let after = append_at(&path, &now, b"tail").expect("appended");
-        assert_eq!(std::fs::read(&path).expect("read"), b"sometail");
-        assert_eq!(stamp(&path), Some(after));
-        assert_eq!(after.len, 8);
-        assert_eq!(
-            read_owned_stamped(&path, 64).expect("read"),
-            Some((after, b"sometail".to_vec()))
-        );
-    }
-
-    #[test]
-    fn a_private_dir_is_made_and_narrowed_to_0700() {
-        let root = scratch();
-        let dir = root.path().join("a").join("secrets");
-        ensure_private_dir(&dir).expect("made");
-        assert_eq!(
-            std::fs::metadata(&dir).expect("meta").mode() & 0o7777,
-            0o700
-        );
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("widen");
-        ensure_private_dir(&dir).expect("narrowed");
-        assert_eq!(
-            std::fs::metadata(&dir).expect("meta").mode() & 0o7777,
-            0o700
-        );
-    }
-
-    #[test]
-    fn a_symlinked_dir_is_refused() {
-        let root = scratch();
-        let real = root.path().join("real");
-        std::fs::create_dir(&real).expect("dir");
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).expect("link");
-        let error = ensure_private_dir(&link).expect_err("refused");
-        assert!(error.0.contains("symlink"), "{error}");
-    }
-
-    #[test]
-    fn private_reads_refuse_group_or_other_bits_and_symlinks() {
-        let root = scratch();
-        let path = root.path().join("token");
-        write_atomic(&path, b"value", 0o600).expect("write");
-        assert_eq!(
-            std::fs::metadata(&path).expect("meta").mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            read_private(&path, 64)
-                .expect("read")
-                .expect("present")
-                .as_slice(),
-            b"value"
-        );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
-        let error = read_private(&path, 64).expect_err("refused");
-        assert!(!error.0.contains("value"), "{error}");
-        assert!(
-            read_owned(&path, 64)
-                .expect("owned admits group read")
-                .is_some()
-        );
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&path, &link).expect("link");
-        assert!(read_public(&link, 64).is_err());
-        assert!(
-            read_private(&root.path().join("missing"), 64)
-                .expect("ok")
-                .is_none()
-        );
-
-        let lock_path = root.path().join("state.lock");
-        std::fs::write(&lock_path, b"").expect("seed lock");
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644))
-            .expect("widen lock");
-        let _lock = open_lock(&lock_path).expect("open_lock");
-        assert_eq!(
-            std::fs::symlink_metadata(&lock_path).expect("meta").mode() & 0o7777,
-            0o600
-        );
-        let lock_hard = root.path().join("state.lock.hard");
-        std::fs::hard_link(&lock_path, &lock_hard).expect("hard link lock");
-        assert!(open_lock(&lock_path).is_err());
-        std::fs::remove_file(&lock_hard).expect("rm hard link lock");
-
-        let append_file = root.path().join("append.bin");
-        write_atomic(&append_file, b"head", 0o600).expect("write append");
-        let stamped = |path: &Path| stamp(path).expect("stamped");
-        append_at(&append_file, &stamped(&append_file), b"-tail").expect("append private");
-        assert_eq!(std::fs::read(&append_file).expect("read"), b"head-tail");
-        std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o644))
-            .expect("widen append");
-        assert!(append_at(&append_file, &stamped(&append_file), b"!").is_err());
-        std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o600))
-            .expect("restore append");
-        let append_hard = root.path().join("append.hard");
-        std::fs::hard_link(&append_file, &append_hard).expect("hard link append");
-        assert!(append_at(&append_file, &stamped(&append_file), b"!").is_err());
-        std::fs::remove_file(&append_hard).expect("rm hard link append");
-        let real_dir = root.path().join("real-dir");
-        std::fs::create_dir(&real_dir).expect("real dir");
-        write_atomic(&real_dir.join("in.bin"), b"abcd", 0o600).expect("seed in");
-        let link_dir = root.path().join("link-dir");
-        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink dir");
-        let real = stamped(&real_dir.join("in.bin"));
-        assert!(append_at(&link_dir.join("in.bin"), &real, b"ef").is_err());
-    }
-
-    /// A read fills one buffer sized from the file's length, a byte over so it sees the end
-    /// without growing: a buffer that grew freed each block it outgrew, unwiped.
-    #[test]
-    fn a_read_fills_one_buffer_sized_from_the_files_length() {
-        let root = scratch();
-        let path = root.path().join("value");
-        write_atomic(&path, &[7u8; 1000], 0o600).expect("write");
-        let bytes = read_owned(&path, 4096).expect("read").expect("there");
-        assert_eq!((bytes.len(), bytes.capacity()), (1000, 1001));
-    }
-
-    #[test]
-    fn reads_are_bounded_and_a_fifo_never_blocks() {
-        let root = scratch();
-        let path = root.path().join("big");
-        write_atomic(&path, &[7u8; 65], 0o600).expect("write");
-        assert!(read_private(&path, 64).is_err());
-        assert!(read_private(&path, 65).expect("ok").is_some());
-        let fifo = root.path().join("fifo");
-        let made = aterm_uds::spawnfd::command("/usr/bin/mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo");
-        assert!(made.success());
-        assert!(
-            read_public(&fifo, 64).is_err(),
-            "a FIFO is not a regular file"
-        );
-    }
-
-    #[test]
-    fn rename_noreplace_refuses_an_existing_target() {
-        let root = scratch();
-        let a = root.path().join("a");
-        let b = root.path().join("b");
-        write_atomic(&a, b"a", 0o600).expect("a");
-        write_atomic(&b, b"b", 0o600).expect("b");
-        assert!(rename_noreplace(&a, &b).is_err());
-        assert_eq!(std::fs::read(&b).expect("b"), b"b");
-        std::fs::remove_file(&b).expect("rm");
-        rename_noreplace(&a, &b).expect("moved");
-        assert_eq!(kind(&a).expect("kind"), Kind::Missing);
-        assert_eq!(std::fs::read(&b).expect("b"), b"a");
-    }
-
-    #[test]
-    fn a_rename_whose_unlink_fails_undoes_its_link() {
-        let root = scratch();
-        let locked = root.path().join("locked");
-        std::fs::create_dir(&locked).expect("dir");
-        let from = locked.join("f");
-        write_atomic(&from, b"kept", 0o600).expect("write");
-        let to = root.path().join("to");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
-        let result = rename_noreplace(&from, &to);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock");
-        if euid() == 0 {
-            result.expect("root renames");
-            assert_eq!(kind(&from).expect("kind"), Kind::Missing);
-            return;
-        }
-        let error = result.expect_err("the unlink is refused");
-        assert!(error.0.contains("locked/f"), "{error}");
-        assert_eq!(
-            kind(&to).expect("kind"),
-            Kind::Missing,
-            "the link is undone"
-        );
-        assert_eq!(std::fs::read(&from).expect("from"), b"kept");
-        assert_eq!(
-            std::fs::symlink_metadata(&from).expect("meta").nlink(),
-            1,
-            "one name again"
-        );
-    }
-
-    #[test]
-    fn file_ids_tell_one_file_from_two() {
-        let root = scratch();
-        let a = root.path().join("a");
-        write_atomic(&a, b"x", 0o600).expect("a");
-        let link = root.path().join("hard");
-        std::fs::hard_link(&a, &link).expect("link");
-        let other = root.path().join("other");
-        write_atomic(&other, b"x", 0o600).expect("other");
-        assert!(file_id(&a).is_some());
-        assert_eq!(file_id(&a), file_id(&link));
-        assert_ne!(file_id(&a), file_id(&other));
-        assert_eq!(file_id(&root.path().join("missing")), None);
-        let soft = root.path().join("soft");
-        std::os::unix::fs::symlink(&a, &soft).expect("symlink");
-        assert_ne!(file_id(&soft), file_id(&a));
-    }
-
-    #[test]
-    fn wipe_removes_files_and_only_the_link_of_a_link() {
-        let root = scratch();
-        let file = root.path().join("f");
-        write_atomic(&file, b"secret", 0o600).expect("write");
-        let link = root.path().join("l");
-        std::os::unix::fs::symlink(&file, &link).expect("link");
-        wipe_and_remove(&link).expect("link removed");
-        assert_eq!(std::fs::read(&file).expect("intact"), b"secret");
-        wipe_and_remove(&file).expect("wiped");
-        assert_eq!(kind(&file).expect("kind"), Kind::Missing);
-        wipe_and_remove(&file).expect("missing is fine");
-    }
-
-    #[test]
-    fn wipe_zeroes_the_bytes_under_every_name() {
-        let root = scratch();
-        let file = root.path().join("f");
-        write_atomic(&file, b"secret", 0o600).expect("write");
-        let kept = root.path().join("kept");
-        std::fs::hard_link(&file, &kept).expect("link");
-        let mut open = File::open(&file).expect("open");
-        wipe_and_remove(&file).expect("wiped");
-        assert_eq!(kind(&file).expect("kind"), Kind::Missing);
-        assert_eq!(std::fs::read(&kept).expect("the other name"), [0u8; 6]);
-        let mut left = Vec::new();
-        open.read_to_end(&mut left).expect("read");
-        assert_eq!(
-            left, [0u8; 6],
-            "a descriptor open before the wipe reads zeros"
-        );
-    }
-
-    #[test]
-    fn a_judged_wipe_never_touches_a_file_renamed_over_the_one_it_judged() {
-        let root = scratch();
-        let file = root.path().join("config");
-        write_atomic(&file, b"the vault's", 0o600).expect("write");
-        assert!(!wipe_if(&file, 64, |bytes| bytes == b"other").expect("judged"));
-        assert!(
-            !wipe_if(&file, 4, |_| true).expect("judged"),
-            "past the bound"
-        );
-        assert_eq!(std::fs::read(&file).expect("kept"), b"the vault's");
-
-        let tools = root.path().join("config.lock");
-        write_atomic(&tools, b"the tool's", 0o600).expect("write");
-        let removed = wipe_if(&file, 64, |bytes| {
-            std::fs::rename(&tools, &file).expect("renamed over");
-            bytes == b"the vault's"
-        })
-        .expect("judged");
-        assert!(!removed);
-        assert_eq!(
-            std::fs::read(&file).expect("the tool's file"),
-            b"the tool's"
-        );
-
-        let kept = root.path().join("kept");
-        std::fs::hard_link(&file, &kept).expect("link");
-        assert!(wipe_if(&file, 64, |bytes| bytes == b"the tool's").expect("wiped"));
-        assert_eq!(kind(&file).expect("kind"), Kind::Missing);
-        assert_eq!(std::fs::read(&kept).expect("the other name"), [0u8; 10]);
-    }
-
-    /// The names in `dir`, sorted.
-    fn names_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .expect("dir")
-            .map(|entry| {
-                entry
-                    .expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn write_new_fills_only_an_empty_name() {
-        let root = scratch();
-        let path = root.path().join("gap");
-        assert!(write_new(&path, b"filled", 0o600).expect("written"));
-        assert_eq!(std::fs::read(&path).expect("read"), b"filled");
-        assert_eq!(
-            std::fs::symlink_metadata(&path).expect("meta").mode() & 0o7777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::symlink_metadata(&path).expect("meta").nlink(),
-            1,
-            "the temp's name is gone"
-        );
-
-        assert!(!write_new(&path, b"again", 0o600).expect("taken"));
-        assert_eq!(std::fs::read(&path).expect("read"), b"filled");
-        let dangling = root.path().join("dangling");
-        let nowhere = root.path().join("nowhere");
-        std::os::unix::fs::symlink(&nowhere, &dangling).expect("link");
-        assert!(!write_new(&dangling, b"v", 0o600).expect("taken"));
-        assert_eq!(kind(&dangling).expect("kind"), Kind::Symlink);
-        assert_eq!(kind(&nowhere).expect("kind"), Kind::Missing);
-        assert_eq!(names_in(root.path()), ["dangling", "gap"], "no temp left");
-
-        let missing = root.path().join("no-dir").join("x");
-        let error = write_new(&missing, b"v", 0o600).expect_err("no parent");
-        assert!(error.0.contains("no-dir"), "{error}");
-    }
-}
+#[path = "fsx_tests.rs"]
+mod tests;

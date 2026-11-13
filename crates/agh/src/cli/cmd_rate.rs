@@ -32,6 +32,9 @@ fn row(label: &str, source: &str, snapshot: &RateSnapshot) -> Value {
 ///
 /// The first identity's error.
 pub(crate) fn rate(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if inv.has("--summary") && inv.flag("--calls-hour").is_none() {
+        return Err(inv.usage("--summary requires --calls-hour"));
+    }
     if let Some(hour) = inv.flag("--calls-hour") {
         let hour = crate::path::digits::<u64>(hour)
             .ok_or_else(|| inv.usage("--calls-hour requires Unix seconds / 3600"))?;
@@ -45,6 +48,9 @@ pub(crate) fn rate(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         }
         if inv.global.anonymous {
             items.retain(|row| row.get("as").and_then(Value::as_str) == Some("anonymous"));
+        }
+        if inv.has("--summary") {
+            items = aterm_ctl::github_usage::summarize(&items, hour);
         }
         return Ok(Outcome {
             answer: Answer::Items {

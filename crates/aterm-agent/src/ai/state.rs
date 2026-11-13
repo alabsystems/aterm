@@ -639,7 +639,7 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
     let pool_signs_nothing = f.login_pool().is_some_and(|pool| {
         !super::login::default_home_sign_in(pool)
             && pool.launch_refused.is_some()
-            && pool.default_moved.is_none()
+            && !pool.moved_refuses_launch()
             && Cli::parse(c.id).is_some_and(|cli| super::login::pool_target(cli, pool).is_err())
     });
     let give_fix = |row: &mut Row| {
@@ -709,6 +709,27 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
                  launch to `{label}`)"
             ),
         );
+        return row;
+    }
+    // Where this machine's own login names another account, and the row's own sign-in ends that,
+    // the CLI is signed out as aterm runs it: the pool's sign-in is the fix, aterm's own where it
+    // renews the row ([`sign_in_actor`]), and no person's mend. It warns rather than fails, as a
+    // doctor's run ends it.
+    if let (Some(p), Some(why)) = (f.login_pool(), launch_refused)
+        && matches!(
+            &p.launch_end,
+            Some(super::facts::LaunchEnd::DefaultMoved(
+                Step::Renew(..) | Step::Login(..)
+            ))
+        )
+    {
+        signed_out(
+            &mut row,
+            format!("a launch aterm makes of it now is refused: {why}"),
+        );
+        if row.mark == Mark::Fail {
+            row.mark = Mark::Warn;
+        }
         return row;
     }
     // On a Codex build that keeps no row's login its own, the row on this machine's own login is
@@ -872,8 +893,14 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
         let id = c.id;
         let mend = match (&p.launch_end, &p.launch_step) {
             (Some(LaunchEnd::Pool) | None, _) => None,
-            // aterm's upkeep runs that sync, and so may anyone: it asks no person for anything.
-            (Some(LaunchEnd::DefaultMoved(Step::Sync(_))), _) => None,
+            // aterm's upkeep runs that sync, another Mac signs a row it keeps in, and `aterm ai
+            // login` makes the row's own sign-in: none is a mend of a person's.
+            (
+                Some(LaunchEnd::DefaultMoved(
+                    Step::Sync(_) | Step::Report(_) | Step::Renew(..) | Step::Login(..),
+                )),
+                _,
+            ) => None,
             (Some(LaunchEnd::DefaultMoved(step)), _) => Some(format!(
                 "this machine's own login names another account, so a launch of {id} is refused: \
                  `{step}`"

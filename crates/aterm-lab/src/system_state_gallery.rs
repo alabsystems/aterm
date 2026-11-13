@@ -25,7 +25,8 @@ use crate::{Fail, Res};
 /// The verb's own help (`system-state-gallery --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab system-state-gallery [--aterm PATH] [--fixtures NAME[,NAME]]... [--quick]
-         [--looks LOOK[,LOOK]]... [--sizes SIZE[,SIZE]]... [--at MS[,MS]]... [--reduce-motion] [--keep] <out_dir>
+         [--looks LOOK[,LOOK]]... [--sizes SIZE[,SIZE]]... [--press UI_KEY]... [--scroll top|bottom]
+         [--at MS[,MS]]... [--reduce-motion] [--keep] <out_dir>
        targo --unverified lab system-state-gallery --measure <out_dir>
 
 Photograph System State's fixtures and judge each frame (init-on-by-default design §4.9): one fresh private headless
@@ -46,6 +47,10 @@ lifeline; ended by its process group, never by name), showing the page under ATE
                  window's grid at 1x); all (the default); repeatable
   --at MS        motion times: one frame per time, the instance's painters pinned there by ATERM_DEV_MOTION_AT_MS
                  (refused, exit 3, by a build without that seam); none: one settled frame
+  --press UI_KEY press a button through act app/v1 after opening each instance's page, before taking its frames;
+                 repeatable, in order (including repeats); a refused action makes that instance's frames fail
+  --scroll       top or bottom: position the list through native scroll after each frame's resize has settled;
+                 a refused scroll fails the frame; omitted: preserve the page's scroll position
   --reduce-motion  every instance with Reduce Motion on (ATERM_DEV_ACCESSIBILITY)
   --aterm PATH   the aterm to run (default: the lab's pick, `targo --unverified lab paths`); a debug or dev-seams build
   --keep         retain every instance's scratch world
@@ -96,28 +101,15 @@ const SETTLE_GAP: Duration = Duration::from_millis(250);
 
 /// The fixtures the seam accepts: the `FIXTURES` list of `source`, in its order.
 /// # Errors
-/// The list is missing, or holds a different count of names than its type declares.
+/// The slice declaration is missing or its list is unterminated.
 pub fn parse_fixtures(source: &str) -> Result<Vec<&str>, String> {
-    const HEAD: &str = "const FIXTURES: [&str; ";
+    const HEAD: &str = "const FIXTURES: &[&str] = &[";
     let at = source
         .find(HEAD)
-        .ok_or("crates/aterm-gui/src/system_state.rs declares no `const FIXTURES: [&str; N]`")?;
+        .ok_or("crates/aterm-gui/src/system_state.rs declares no `const FIXTURES: &[&str] = &[`")?;
     let rest = &source[at + HEAD.len()..];
-    let (count, rest) = rest
-        .split_once("] = [")
-        .ok_or("FIXTURES is not a `[&str; N] = [...]` array")?;
-    let count: usize = count
-        .trim()
-        .parse()
-        .map_err(|_| format!("FIXTURES declares no count: {count:?}"))?;
     let body = rest.split_once("];").ok_or("FIXTURES never closes")?.0;
     let names: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
-    if names.len() != count {
-        return Err(format!(
-            "FIXTURES declares {count} names and lists {}",
-            names.len()
-        ));
-    }
     Ok(names)
 }
 
@@ -229,6 +221,22 @@ impl Size {
     }
 }
 
+/// An explicit native list position for each capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollPosition {
+    Top,
+    Bottom,
+}
+
+impl ScrollPosition {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
 /// What `system-state-gallery` was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
@@ -238,6 +246,9 @@ pub struct Args {
     pub quick: bool,
     pub looks: Vec<Look>,
     pub sizes: Vec<Size>,
+    /// Button keys to press, in order, before the instance's first frame.
+    pub press: Vec<String>,
+    pub scroll: Option<ScrollPosition>,
     /// Motion times in ms; empty: one settled frame.
     pub at: Vec<u64>,
     pub reduce_motion: bool,
@@ -270,6 +281,14 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let fixtures = words(&take_values(&mut a, "--fixtures")?);
     let looks = words(&take_values(&mut a, "--looks")?);
     let sizes = words(&take_values(&mut a, "--sizes")?);
+    let press = take_values(&mut a, "--press")?;
+    let scroll = take_value(&mut a, "--scroll")?
+        .map(|word| match word.as_str() {
+            "top" => Ok(ScrollPosition::Top),
+            "bottom" => Ok(ScrollPosition::Bottom),
+            _ => Err(usage(format!("--scroll takes top or bottom, not '{word}'"))),
+        })
+        .transpose()?;
     let at = words(&take_values(&mut a, "--at")?);
     let quick = take_flag(&mut a, "--quick");
     let reduce_motion = take_flag(&mut a, "--reduce-motion");
@@ -326,6 +345,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         quick,
         looks: parsed_looks,
         sizes: parsed_sizes,
+        press,
+        scroll,
         at,
         reduce_motion,
         aterm,
@@ -569,6 +590,8 @@ struct Gallery {
     aterm: PathBuf,
     keep: bool,
     reduce_motion: bool,
+    press: Vec<String>,
+    scroll: Option<ScrollPosition>,
     pids: Option<std::fs::File>,
     launched: Vec<(i32, String, String)>,
     /// Frames taken, by name, in order.
@@ -666,7 +689,31 @@ impl Gallery {
                 return Ok(());
             }
         };
-        let shown = show(&mut live.inst, look, scale);
+        let shown = show(&mut live.inst, look, scale).and_then(|view| {
+            for key in &self.press {
+                let controls = live.inst.ctl(&[
+                    "inspect",
+                    "app/v1",
+                    "view",
+                    &view.id.to_string(),
+                    "controls",
+                ]);
+                if controls.code != 0 {
+                    return Err(Miss::Failed(format!(
+                        "inspect before pressing {key}: {}",
+                        controls.first()
+                    )));
+                }
+                let action = button_action(&controls.stdout, key).map_err(Miss::Failed)?;
+                let r =
+                    live.inst
+                        .ctl(&["act", "app/v1", "view", &view.id.to_string(), key, &action]);
+                if r.code != 0 {
+                    return Err(Miss::Failed(format!("press {key}: {}", r.first())));
+                }
+            }
+            Ok(view)
+        });
         for (&size, name) in sizes.iter().zip(&names) {
             let taken = match &shown {
                 Err(miss) => Err(miss.clone()),
@@ -732,7 +779,24 @@ impl Gallery {
         if r.code != 0 {
             return Err(Miss::Failed(format!("{resize}: {}", r.first())));
         }
-        let (png, meta, layout) = settled_frame(inst, view.id)?;
+        let mut frame = settled_frame(inst, view.id)?;
+        if let Some(position) = self.scroll {
+            let r = inst.ctl(&["scroll", position.word()]);
+            if r.code != 0 {
+                return Err(Miss::Failed(format!(
+                    "scroll {}: {}",
+                    position.word(),
+                    r.first()
+                )));
+            }
+            println!(
+                "system-state-gallery: [{name}] scroll {}: {}",
+                position.word(),
+                r.first()
+            );
+            frame = settled_frame(inst, view.id)?;
+        }
+        let (png, meta, layout) = frame;
         let write = |suffix: &str, bytes: &[u8]| {
             let path = self.out.join(format!("{name}.{suffix}"));
             crate::util::write_fresh(&path, bytes)
@@ -758,6 +822,35 @@ impl Gallery {
             }
         }
         alive
+    }
+}
+
+/// Read the live button's action rather than assuming its identity is also its action.
+fn button_action(controls: &str, key: &str) -> Result<String, String> {
+    let mut actions = controls
+        .lines()
+        .filter(|line| line.starts_with("ui "))
+        .filter_map(|line| {
+            let fields = measure::fields(line);
+            let get = |name| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            (get("key") == Some(key) && get("role") == Some("Button"))
+                .then(|| {
+                    get("action")
+                        .filter(|action| *action != "-")
+                        .map(str::to_owned)
+                })
+                .flatten()
+        });
+    match (actions.next(), actions.next()) {
+        (Some(action), None) => Ok(action),
+        _ => Err(format!(
+            "press {key}: expected one actionable button in the live controls"
+        )),
     }
 }
 
@@ -973,7 +1066,7 @@ fn motion_note(at: &[u64], seam: bool) -> String {
 /// Judge the frames `names` in `out` on every core, in `names`' order: each frame's verdict and
 /// pixels, or why it could not be judged.
 fn judge_all(out: &Path, names: &[String]) -> Vec<Result<(Judged, Image), String>> {
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(1, std::num::NonZero::get)
         .clamp(1, names.len().max(1));
     let chunk = names.len().div_ceil(workers).max(1);
@@ -1209,6 +1302,8 @@ pub fn cmd_system_state_gallery(args: &[String]) -> Res {
         aterm: aterm.clone(),
         keep: a.keep,
         reduce_motion: a.reduce_motion,
+        press: a.press.clone(),
+        scroll: a.scroll,
         pids,
         launched: Vec::new(),
         taken: Vec::new(),

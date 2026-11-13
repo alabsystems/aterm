@@ -3,7 +3,7 @@
 
 //! The readings series: each account label's history of usage figures on one machine, the
 //! history file `docs/DESIGN-account-stats-2026-10-15.md` §5 designs. The accounts outlook's
-//! pace reads its newest week (`docs/DESIGN-accounts-outlook-2026-10-25.md` §4).
+//! pace reads its newest week (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`).
 //!
 //! The series lives beside the accounts store, never in it: `<harness_state>/accounts/stats/`
 //! holds one `u-<label>@<machine>.jsonl` per label and machine, a directory of mode 0700 and
@@ -2557,7 +2557,14 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
         use std::os::unix::fs::MetadataExt as _;
         meta.ino()
     };
-    #[cfg(not(unix))]
+    // Windows numbers a file on its volume only through an open handle; a compaction's rename
+    // over the file changes that number as it changes a Unix inode.
+    #[cfg(windows)]
+    let ino = {
+        let (file, open) = super::footer::open_regular_with_meta(path)?;
+        super::session_usage::open_identity(&file, &open)?.1
+    };
+    #[cfg(not(any(unix, windows)))]
     let ino = 0;
     let mtime_ns = meta
         .modified()

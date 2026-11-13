@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::{
-    alab::registry::{ADDRESS, COLLECTIONS, MACHINE_FACTS, PROVIDER, REGISTRY},
+    alab::registry::{ADDRESS, COLLECTIONS, MACHINE_FACTS, MODEL, PROVIDER, REGISTRY},
     catalog::release::Kept,
     table::tests::{Lab, repair_commons, repair_commons_among_first, repair_commons_first},
     typed::{
@@ -33,6 +33,10 @@ fn key() -> (String, String) {
     ("provider".to_owned(), "anthropic.site".to_owned())
 }
 
+fn carried_at(coord: &(String, String), origins: impl IntoIterator<Item = Digest>) -> Carried {
+    Carried::from([(coord.clone(), origins.into_iter().collect())])
+}
+
 /// A `Secret` register crosses a roll resealed: the new generation's token opens there to the
 /// same value under the new table's name, it is not the old token, and the old sealer cannot
 /// open it; a re-run once it is carried writes nothing, and an empty candidate stays empty.
@@ -53,7 +57,7 @@ fn a_secret_register_is_resealed_across_a_roll() {
         &source,
         &held,
         &Cells::new(),
-        &BTreeSet::new(),
+        &Carried::new(),
         RESEAL,
     )
     .unwrap();
@@ -95,7 +99,7 @@ fn a_secret_register_is_resealed_across_a_roll() {
         &cleared,
         &BTreeSet::from([op(2)]),
         &Cells::new(),
-        &BTreeSet::new(),
+        &Carried::new(),
         RESEAL,
     )
     .unwrap();
@@ -105,8 +109,8 @@ fn a_secret_register_is_resealed_across_a_roll() {
 /// A `Secret` register an older build's roll copied as it was (its token sealed for the old
 /// generation, its origin carried) is resealed, not skipped, and a register a revert left a bare
 /// `null` candidate in rolls rather than refusing the whole roll.
-/// NEGATIVE CONTROL: with `restate` skipping every register whose origins are all carried (the
-/// `opens` check dropped), the copied token stays and never opens under the new table: ``
+/// NEGATIVE CONTROL: with `restate` reusing the target token without checking that it opens,
+/// the copied token stays and never opens under the new table: ``
 /// assertion failed: !rows.is_empty() ``.
 #[test]
 fn a_copied_or_reverted_secret_register_rolls() {
@@ -124,7 +128,7 @@ fn a_copied_or_reverted_secret_register_rolls() {
         &source,
         &held,
         &copied,
-        &BTreeSet::from([op(1)]),
+        &carried_at(&key, [op(1)]),
         RESEAL,
     )
     .unwrap();
@@ -148,7 +152,7 @@ fn a_copied_or_reverted_secret_register_rolls() {
         &reverted,
         &BTreeSet::from([op(3)]),
         &Cells::new(),
-        &BTreeSet::new(),
+        &Carried::new(),
         RESEAL,
     )
     .unwrap();
@@ -183,7 +187,7 @@ fn written(rows: &[Vec<Change>]) -> Vec<(Digest, Value)> {
 /// generation's candidates dropped, the owner's edit `e` is lost.
 #[test]
 fn the_restatement_merges_what_each_side_saw() {
-    let none = BTreeSet::new();
+    let none = Carried::new();
     // A first roll: an open conflict stays open.
     let source = Cells::from([(key(), register(&[(op(1), plain("a")), (op(2), plain("b"))]))]);
     let held = BTreeSet::from([op(1), op(2)]);
@@ -233,7 +237,7 @@ fn the_restatement_merges_what_each_side_saw() {
         key(),
         register(&[(op(9), first[0][0].value.clone().unwrap())]),
     )]);
-    let carried = BTreeSet::from([op(1)]);
+    let carried = carried_at(&key(), [op(1)]);
     let late = Cells::from([(key(), register(&[(op(3), plain("c"))]))]);
     let superseded = restate(
         &REGISTRY,
@@ -274,6 +278,121 @@ fn the_restatement_merges_what_each_side_saw() {
     .unwrap();
     assert_eq!(
         written(&beside),
+        vec![(op(3), plain("c")), (op(8), plain("e"))]
+    );
+}
+
+#[test]
+fn carrying_one_cell_never_marks_another_cell_of_the_same_operation_carried() {
+    for other in [
+        (PROVIDER.name.to_owned(), "openai.site".to_owned()),
+        (MODEL.name.to_owned(), key().1),
+    ] {
+        let source = Cells::from([
+            (
+                key(),
+                register(&[(op(1), plain("https://one.example.test"))]),
+            ),
+            (
+                other.clone(),
+                register(&[(op(1), plain("https://two.example.test"))]),
+            ),
+        ]);
+        let held = BTreeSet::from([op(1)]);
+        let rows = restate(
+            &REGISTRY,
+            &source,
+            &held,
+            &Cells::new(),
+            &Carried::new(),
+            RESEAL,
+        )
+        .unwrap();
+        let first = rows
+            .iter()
+            .flatten()
+            .find(|change| (change.collection.clone(), change.key.clone()) == key())
+            .unwrap()
+            .clone();
+        let carried = carried_origins([&Command::Write {
+            request: [0; 16],
+            changes: vec![first.clone()],
+        }]);
+        let target = Cells::from([(key(), register(&[(op(9), first.value.unwrap())]))]);
+        let resumed = restate(&REGISTRY, &source, &held, &target, &carried, RESEAL).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(
+            written_at(&resumed, &other),
+            vec![(op(1), plain("https://two.example.test"))]
+        );
+    }
+}
+
+#[test]
+fn an_already_carried_value_still_cleans_up_a_superseded_late_candidate() {
+    let source = Cells::from([(key(), register(&[(op(2), plain("b"))]))]);
+    let held = BTreeSet::from([op(1), op(2)]);
+    let carried = carried_at(&key(), held.iter().copied());
+    let target = Cells::from([(
+        key(),
+        register(&[(
+            op(9),
+            cell::carry(&BTreeMap::from([(op(1), plain("a")), (op(2), plain("b"))])).unwrap(),
+        )]),
+    )]);
+    let rows = restate(&REGISTRY, &source, &held, &target, &carried, RESEAL).unwrap();
+    assert_eq!(written(&rows), vec![(op(2), plain("b"))]);
+
+    // The new generation's edit already replaced b; removing the stale a must not revive b.
+    let edited = Cells::from([(
+        key(),
+        register(&[(
+            op(9),
+            cell::carry(&BTreeMap::from([(op(1), plain("a")), (op(8), plain("e"))])).unwrap(),
+        )]),
+    )]);
+    let rows = restate(&REGISTRY, &source, &held, &edited, &carried, RESEAL).unwrap();
+    assert_eq!(written(&rows), vec![(op(8), plain("e"))]);
+
+    // Nothing in the new generation survives this cleanup. Do not turn its prior removal
+    // of b into a resurrection, or encode an empty carried list as a malformed value.
+    let stale = Cells::from([(
+        key(),
+        register(&[(
+            op(9),
+            cell::carry(&BTreeMap::from([(op(1), plain("a"))])).unwrap(),
+        )]),
+    )]);
+    let rows = restate(&REGISTRY, &source, &held, &stale, &carried, RESEAL).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 1);
+    assert_eq!(
+        (rows[0][0].collection.clone(), rows[0][0].key.clone()),
+        key()
+    );
+    assert_eq!(rows[0][0].value, None);
+    assert!(
+        restate(&REGISTRY, &source, &held, &Cells::new(), &carried, RESEAL)
+            .unwrap()
+            .is_empty()
+    );
+    let cleared = Cells::from([(key(), register(&[(op(10), Value::Null)]))]);
+    assert!(
+        restate(&REGISTRY, &source, &held, &cleared, &carried, RESEAL)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_new_late_candidate_does_not_revive_an_already_carried_sibling() {
+    let source = Cells::from([(key(), register(&[(op(2), plain("b")), (op(3), plain("c"))]))]);
+    let carried = carried_at(&key(), [op(2)]);
+    let held = BTreeSet::from([op(2), op(3)]);
+    let target = Cells::from([(key(), register(&[(op(8), plain("e"))]))]);
+    let rows = restate(&REGISTRY, &source, &held, &target, &carried, RESEAL).unwrap();
+    assert_eq!(
+        written(&rows),
         vec![(op(3), plain("c")), (op(8), plain("e"))]
     );
 }
@@ -328,6 +447,104 @@ fn provider(pk: &str, col: &str, x: Value) -> Change {
         &CellValue::owner(1, x),
     )
     .unwrap()
+}
+
+#[test]
+fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let compiled = &att::REGISTRY;
+    let scope = compiled.descriptor(bootstrap.trust()).unwrap().scope;
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let mut store = Store::open(&session, &directory.path(scope).unwrap(), scope).unwrap();
+    let changes = vec![Change {
+        collection: key().0,
+        key: key().1,
+        value: Some(
+            cell::carry(&BTreeMap::from([(
+                op(1),
+                plain("https://one.example.test"),
+            )]))
+            .unwrap(),
+        ),
+    }];
+    let log = Log::read_with(&session, &store, scope, decode).unwrap();
+    let first = Command::Write {
+        request: typed::request_id(
+            APPLICATION,
+            &request_role(compiled.table.role, &log),
+            &changes,
+        )
+        .unwrap(),
+        changes: changes.clone(),
+    };
+    let receipt = application::append(&session, &mut store, &first.encode().unwrap()).unwrap();
+    let mut late = changes.clone();
+    late[0].value = Some(
+        cell::carry(&BTreeMap::from([
+            (op(1), plain("https://one.example.test")),
+            (op(2), plain("https://two.example.test")),
+        ]))
+        .unwrap(),
+    );
+    let late = Command::Write {
+        request: [240; 16],
+        changes: late,
+    };
+    application::append(&session, &mut store, &late.encode().unwrap()).unwrap();
+    let log = Log::read_with(&session, &store, scope, decode).unwrap();
+    assert_eq!(
+        log.retry(session.actor(), &first).unwrap(),
+        Some(receipt.id)
+    );
+    let view = View::read(compiled.table, &session, &log);
+    let source = Cells::from([(
+        key(),
+        register(&[(op(1), plain("https://one.example.test"))]),
+    )]);
+    let carried = carried_origins(log.eligible_iter().map(|(_, command)| command));
+    let rows = restate(
+        &REGISTRY,
+        &source,
+        &BTreeSet::from([op(1), op(2)]),
+        &view.cells,
+        &carried,
+        RESEAL,
+    )
+    .unwrap();
+    let mut records = pack(rows).unwrap();
+    assert_eq!(records.len(), 1);
+    let again = records.pop().unwrap();
+    assert_eq!(again, changes);
+    let cleanup = Command::Write {
+        request: typed::request_id(
+            APPLICATION,
+            &request_role(compiled.table.role, &log),
+            &again,
+        )
+        .unwrap(),
+        changes: again,
+    };
+    if att::retry_or_appended(&log, session.actor(), &cleanup, &BTreeMap::new())
+        .unwrap()
+        .is_none()
+    {
+        application::append(&session, &mut store, &cleanup.encode().unwrap()).unwrap();
+    }
+    let log = Log::read_with(&session, &store, scope, decode).unwrap();
+    let cleaned = log
+        .retry(session.actor(), &cleanup)
+        .unwrap()
+        .expect("the cleanup has its own retry receipt");
+    assert_ne!(cleaned, receipt.id);
+    let providers = View::read(compiled.table, &session, &log).project(&PROVIDER);
+    assert!(!providers.rows["anthropic"].fields["site"].conflicted());
+    assert_eq!(
+        providers.rows["anthropic"].get("site"),
+        Some(&json!("https://one.example.test"))
+    );
 }
 
 /// An address row born for a synthetic address.

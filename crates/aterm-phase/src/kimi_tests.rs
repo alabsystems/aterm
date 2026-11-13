@@ -498,10 +498,13 @@ fn every_kimi_frame_reads_the_phase_its_own_rows_decide() {
     assert!(Program::Kimi.supervisable());
 }
 
-/// THE EXIT HINT A FIRST CTRL-C ARMS STANDS AT THE FOOTER'S LEFT AND HIDES NO COMPOSER: the
-/// `context: N%` footer still reads past it, so the idle composer, its draft and its context are
-/// read. CONTROL: the hint with no context after it is no footer, and the composer it would
-/// stand under reads nothing.
+/// THE EXIT HINT A FIRST CTRL-C OR CTRL-D ARMS STANDS AT THE FOOTER'S LEFT AND HIDES NO
+/// COMPOSER: the `context: N%` footer still reads past it, so the idle composer, its draft and its
+/// context are read (the Ctrl-D hint HAND-BUILT from the measured Ctrl-C frame: 2.4.0's exit by
+/// Ctrl-D drew it, 2.5.2's and 2.5.3's binaries arm it the same way). CONTROLS: the hint with no
+/// context after it is no footer, and the composer it would stand under reads nothing; and the
+/// `Shutting down…` an exit draws in the hint's place is no hint, so the ending program's
+/// composer decides nothing.
 #[test]
 fn the_exit_hint_at_the_footers_left_hides_no_composer() {
     let rows = frame("2.4.0-exit-confirm");
@@ -512,6 +515,18 @@ fn the_exit_hint_at_the_footers_left_hides_no_composer() {
     assert_eq!(composer(&rows).map(|(_, l)| l), Some(vec![String::new()]));
     assert_eq!(context_left(&rows), Some(74), "context: 26% used");
     assert!(is_kimi_screen(&rows), "by sight");
+    let respelled = |to: &str| -> Vec<String> {
+        rows.iter()
+            .map(|r| r.replace("Press Ctrl+C again to exit", to))
+            .collect()
+    };
+    let ctrl_d = respelled("Press Ctrl+D again to exit");
+    assert_eq!(composer(&ctrl_d).map(|(_, l)| l), Some(vec![String::new()]));
+    assert_eq!(context_left(&ctrl_d), Some(74), "Ctrl-D: context: 26% used");
+    assert_eq!(phase(&ctrl_d), (Phase::Idle, true), "Ctrl-D");
+    let ending = respelled("Shutting down\u{2026} (running shutdown hooks)");
+    assert_eq!(composer_rows(&ending), None, "CONTROL: an exit's footer");
+    assert_eq!(phase(&ending), (Phase::Idle, false), "CONTROL: an exit");
     let bare: Vec<String> = rows
         .iter()
         .map(|r| match r.find("context: ") {
@@ -524,10 +539,12 @@ fn the_exit_hint_at_the_footers_left_hides_no_composer() {
 }
 
 /// THE SPINNER COUNTS ONLY WHERE IT OPENS THE RUN OVER THE COMPOSER: a reply row that opens with a
-/// moon phase, standing in an ended turn's transcript over its blank row, is no running turn;
-/// and a running turn whose spinner the build no longer draws (its moon phase respelled) decides
-/// nothing, never an idle. NEGATIVE CONTROL for the mutants that read a moon phase off any row
-/// of the screen and that take a run with no spinner for an ended turn.
+/// moon phase, standing in an ended turn's transcript over its blank row, is no running turn
+/// (nor an ended one: a spinner over the transcript is where 2.5's agent swarm draws its turn's,
+/// so the blank row decides nothing); and a running turn whose spinner the build no longer draws
+/// (its moon phase respelled) decides nothing, never an idle. NEGATIVE CONTROL for the mutants
+/// that read a moon phase off any row of the screen and that take a run with no spinner for an
+/// ended turn.
 #[test]
 fn the_spinner_counts_only_where_it_opens_the_run_over_the_composer() {
     let mut ended = frame("2.4.0-end-of-turn");
@@ -546,7 +563,7 @@ fn the_spinner_counts_only_where_it_opens_the_run_over_the_composer() {
         composer_rows(&ended).is_some(),
         "PRECONDITION: the composer"
     );
-    assert_eq!(phase(&ended), (Phase::Idle, true));
+    assert_eq!(phase(&ended), (Phase::Idle, false));
     // A run with no spinner opening it decides nothing.
     let held = frame("2.4.0-busy-held");
     assert_eq!(phase(&held), (Phase::Busy, true), "PRECONDITION");
@@ -1594,4 +1611,99 @@ fn a_fullscreen_panel_reads_its_command_and_file_only_off_a_body_drawn_whole() {
         question.footer.as_deref(),
         Some("↑↓ select  1-5 / ↵ toggle  ←/→/tab switch  esc cancel")
     );
+}
+
+/// EACH CLAUSE OF THE SPINNER AND THE RESUME NOTICE IS ITS OWN: a moon phase with a word glued to
+/// it, a braille glyph before another word than `Working…` (2.5's compaction draws `Compacting…`
+/// there, read from 2.5.3's code), and a row that quotes the resume notice after words of its own
+/// each decide nothing (respelled from the measured 2.4.0 frames). CONTROLS: the measured frames
+/// themselves decide busy, busy and idle. NEGATIVE CONTROLS for the mutants that take any moon
+/// phase, any braille glyph, or a notice anywhere on the run's last row.
+#[test]
+fn each_clause_of_the_spinner_and_the_resume_notice_is_its_own() {
+    for (name, from, to, want) in [
+        ("2.4.0-busy-held", "🌓", "🌓·", Phase::Busy),
+        (
+            "2.4.0-busy-streaming",
+            "Working\u{2026}",
+            "Compacting\u{2026}",
+            Phase::Busy,
+        ),
+        (
+            "2.4.0-resumed-picked",
+            "Resumed session (",
+            "Quoted: Resumed session (",
+            Phase::Idle,
+        ),
+    ] {
+        let measured = frame(name);
+        assert_eq!(phase(&measured), (want, true), "CONTROL: {name}");
+        let respelled: Vec<String> = measured.iter().map(|r| r.replace(from, to)).collect();
+        assert_ne!(respelled, measured, "PRECONDITION: {name} respelled");
+        assert_eq!(phase(&respelled), (Phase::Idle, false), "{name}: {to}");
+    }
+}
+
+/// A RUN WHOSE START IS NOT ON THE SCREEN DECIDES NOTHING: the measured busy frame cut at its
+/// composer's top border (a pane as tall as the composer and its footer) shows no blank row over
+/// the border, so it reads nothing, never the idle an empty run would; nor does the frame cut at
+/// its spinner row, whose run may start above the screen. CONTROL: the same frame cut at the blank
+/// row over its spinner is busy. NEGATIVE CONTROL for the mutant that takes an empty slice over
+/// the border for the blank row a turn's end leaves.
+#[test]
+fn a_run_whose_start_is_not_on_the_screen_decides_nothing() {
+    let held = frame("2.4.0-busy-held");
+    assert_eq!(phase(&held), (Phase::Busy, true), "PRECONDITION");
+    let (top, _, _) = composer_rows(&held).expect("the composer");
+    assert_eq!(
+        phase(&held[top..]),
+        (Phase::Idle, false),
+        "cut at the border"
+    );
+    assert_eq!(
+        phase(&held[top - 1..]),
+        (Phase::Idle, false),
+        "cut at the spinner"
+    );
+    assert_eq!(
+        phase(&held[top - 2..]),
+        (Phase::Busy, true),
+        "CONTROL: the blank row seen"
+    );
+}
+
+/// A SPINNER OVER THE TRANSCRIPT KEEPS THE BLANK ROW OVER THE COMPOSER FROM READING IDLE: 2.5's
+/// agent swarm draws its turn's moon spinner in its own panel's status row, not over the composer,
+/// while it waits or runs a tool (`shouldPlaceActivitySpinnerInAgentSwarm`, `renderActivityPrefix`
+/// and `renderStatusLabel` read from 2.5.3's code; the rows HAND-BUILT, the panel unmeasured), so
+/// an ended turn's frame with that panel spinning over its blank row decides nothing. CONTROL: the
+/// same panel done (` ✓ Completed.`, its status row once the call ends) leaves the frame idle.
+/// NEGATIVE CONTROL for the mutant that reads the blank row idle whatever spins above it.
+#[test]
+fn a_spinner_over_the_transcript_keeps_the_blank_row_from_reading_idle() {
+    let ended = frame("2.4.0-end-of-turn");
+    assert_eq!(phase(&ended), (Phase::Idle, true), "PRECONDITION");
+    let reply = ended
+        .iter()
+        .position(|r| r.contains("● lab held reply"))
+        .expect("the reply");
+    let with_panel = |status: &str| -> Vec<String> {
+        let mut rows = ended.clone();
+        rows.splice(
+            reply + 1..reply + 1,
+            [
+                String::new(),
+                "   \u{2500}\u{2500} Agent Swarm \u{2014} lab subagents \u{2014} lab-model \u{2500}\u{2500}"
+                    .to_string(),
+                format!("   {status}"),
+                "   lab-1 \u{2500}\u{2500} lab-2 \u{2500}\u{2500} lab-3".to_string(),
+            ],
+        );
+        rows
+    };
+    let spinning = with_panel("🌓 Working\u{2026}  \u{2588}\u{2588}\u{2591}\u{2591}");
+    assert_eq!(phase(&spinning), (Phase::Idle, false));
+    assert!(!read(Some("kimi"), &spinning, None).phase_authoritative);
+    let done = with_panel("\u{2713} Completed.  \u{2588}\u{2588}\u{2588}\u{2588}");
+    assert_eq!(phase(&done), (Phase::Idle, true), "CONTROL: the swarm done");
 }

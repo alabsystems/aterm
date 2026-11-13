@@ -39,14 +39,21 @@ pub(crate) struct Chain {
 }
 
 pub(crate) fn chain() -> Chain {
+    chain_founded_at(1_000)
+}
+
+/// [`chain`] founded at `founded`: another moment makes another genesis, so every record and
+/// byte of it is another's, for a test whose records file must be no other test's (the
+/// process's records cache knows an entry by the stamp of each file that holds its bytes).
+pub(crate) fn chain_founded_at(founded: u64) -> Chain {
     let (w1, inc1, m1, e1) = entrant(1, NETWORK);
     let (w2, inc2, m2, e2) = entrant(2, NETWORK);
-    let genesis = Record::found(&[9; 32], vec![e1], 1_000).expect("genesis");
+    let genesis = Record::found(&[9; 32], vec![e1], founded).expect("genesis");
     let mut author = Log::new(genesis.clone()).expect("log");
     let first_by_m1 = author
         .draft(
             &m1,
-            1_001,
+            founded + 1,
             Body::Name {
                 name: "m1-renamed".to_owned(),
             },
@@ -57,7 +64,7 @@ pub(crate) fn chain() -> Chain {
     let admit = author
         .draft(
             &m1,
-            1_002,
+            founded + 2,
             Body::Admit {
                 entrant: e2,
                 evidence: Evidence::Phrase,
@@ -69,7 +76,7 @@ pub(crate) fn chain() -> Chain {
     let by_m2 = author
         .draft(
             &m2,
-            1_003,
+            founded + 3,
             Body::Name {
                 name: "m2-renamed".to_owned(),
             },
@@ -217,4 +224,59 @@ fn written_reaches_this_threads_override_and_not_once_the_call_is_removed() {
         store: &store,
     });
     assert_eq!(calls.get(), 1);
+}
+
+/// A member's own records file with its last record cut short at any byte reads as the records
+/// before the cut, each verified: what an append that died, or is read mid-write, leaves. A
+/// whole stream reads whole, and nothing else is read past: a whole last frame that fails its
+/// signature, bytes no frame begins with after the records, a frame of a kind this build does
+/// not know.
+///
+/// NEGATIVE CONTROLS (2026-11-11): with `decode_records_before_cut` refusing a cut as
+/// [`decode_records`] does, the first cut is refused (`the records before the cut`); with it
+/// reading past whatever its framing refuses, the bytes no frame begins with read as two records
+/// (`no frame begins so`).
+#[test]
+fn a_last_record_cut_short_reads_as_the_records_before_it() {
+    let c = chain_founded_at(7_101);
+    let whole = encode_records([&c.genesis, &c.first_by_m1, &c.admit]);
+    let two = whole.len() - c.admit.bytes().len();
+    let ids = |records: Vec<Record>| records.iter().map(|r| *r.id()).collect::<Vec<_>>();
+    assert_eq!(
+        ids(decode_records_before_cut(&whole).unwrap()),
+        [*c.genesis.id(), *c.first_by_m1.id(), *c.admit.id()]
+    );
+    assert!(decode_records_before_cut(&[]).unwrap().is_empty());
+    // Every cut of the last record: one decode of the two before it, then the framing alone.
+    let before =
+        ids(decode_records_before_cut(&whole[..=two]).expect("the records before the cut"));
+    assert_eq!(before, [*c.genesis.id(), *c.first_by_m1.id()]);
+    for cut in two + 1..whole.len() {
+        assert!(Record::is_cut_frame(&whole[two..cut]), "cut at {cut}");
+        assert!(decode_records(&whole[..cut]).is_err(), "strict at {cut}");
+    }
+    assert!(!Record::is_cut_frame(&whole[two..]), "a whole frame");
+    assert!(!Record::is_cut_frame(&[]), "no bytes");
+    let cut_body = &whole[..whole.len() - 1];
+    assert_eq!(ids(decode_records_before_cut(cut_body).unwrap()), before);
+
+    let mut forged = whole.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    assert!(
+        decode_records_before_cut(&forged).is_err(),
+        "a whole frame that fails its signature"
+    );
+    let junk = [&whole[..two], b"not a record".as_slice()].concat();
+    assert!(
+        decode_records_before_cut(&junk).is_err(),
+        "no frame begins so"
+    );
+    let zeros = [&whole[..two], [0; 64].as_slice()].concat();
+    assert!(decode_records_before_cut(&zeros).is_err(), "a zeroed tail");
+    let mut unknown = whole[..two + 200.min(c.admit.bytes().len() - 1)].to_vec();
+    unknown[two + crate::membership_log::KIND_AT] = 0xff;
+    assert!(
+        decode_records_before_cut(&unknown).is_err(),
+        "a cut frame of a kind this build does not know"
+    );
 }

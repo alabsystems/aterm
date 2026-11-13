@@ -16,6 +16,7 @@ fn here() -> Here {
     Here {
         host: Some("m7.local".to_owned()),
         instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: false,
         facts: None,
     }
@@ -788,6 +789,9 @@ fn each_level_emits_exactly_its_fields() {
         "held_from",
         "typed_by",
         "typed_ms",
+        "request",
+        "request_from",
+        "request_why",
         "bells",
         "bells_sounded",
         "last_bell",
@@ -1102,6 +1106,7 @@ fn the_header_names_this_machine_and_its_instances() {
     let two = Here {
         host: Some("Andrews-MacBook-Pro.local".to_owned()),
         instances: 2,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: false,
         facts: None,
     };
@@ -1112,6 +1117,7 @@ fn the_header_names_this_machine_and_its_instances() {
     let none = Here {
         host: None,
         instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: false,
         facts: None,
     };
@@ -1121,6 +1127,34 @@ fn the_header_names_this_machine_and_its_instances() {
         (head["host"].as_str(), head["instances"].as_str()),
         ("-", "1")
     );
+}
+
+/// The header says this Mac's fleet access to every reader, at facts as at content, and before
+/// the `drive=1` a reader its grants let drive is told.
+#[test]
+fn the_header_names_this_machines_fleet_access() {
+    use aterm_types::fleet_access::FleetAccess;
+    let store = crate::session_store::new_store();
+    for access in FleetAccess::ALL {
+        for (level, drive) in [(SurveyLevel::Facts, false), (SurveyLevel::Content, true)] {
+            let here = Here {
+                host: None,
+                instances: 1,
+                access,
+                drive,
+                facts: None,
+            };
+            let out = survey_rows(&store, level, usize::MAX, &here);
+            let head = out.lines().nth(1).unwrap();
+            assert_eq!(fields(head)["access"], access.word(), "{head}");
+            let tail = format!(
+                " access={}{}",
+                access.word(),
+                if drive { " drive=1" } else { "" }
+            );
+            assert!(head.ends_with(&tail), "{head}");
+        }
+    }
 }
 
 #[test]
@@ -1593,14 +1627,17 @@ fn a_row_names_the_agents_active_goal() {
 }
 
 /// An instance's facts list each account row of its pools after its sessions, the header counting
-/// them and naming each pool it could not read, with no email on the wire; each agent's row names
-/// the account it runs on.
+/// them and naming each pool it could not read, each row by its label and its address; each
+/// agent's row names the account it runs on, by its address where its footer knows one.
+/// NEGATIVE CONTROL: with `session_row` reading the footer's `account` alone, the Claude Code
+/// session reads `work-2`, its row's label, where its login file names `unicorn@example.com`.
 #[test]
 fn an_instance_lists_its_account_rows_and_each_session_its_account() {
     use aterm_agent::survey_facts::{SurveyAccountFact, SwarmSurveyFacts};
     let row = |pool: &str, id: &str, condition: &str| SurveyAccountFact {
         pool: pool.to_owned(),
         id: id.to_owned(),
+        email: None,
         condition: condition.to_owned(),
         enrolled: condition != "not-enrolled",
         usage_5h_pct: None,
@@ -1619,6 +1656,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         let mut tl = claude.ctx.timeline.lock().unwrap();
         let mut facts = tl.claude_footer().cloned().expect("the footer facts");
         facts.account = Some("work-2".into());
+        facts.account_email = Some("unicorn@example.com".into());
         assert!(tl.set_claude_footer(4242, None, Some(facts)));
     }
     let codex = crate::session_store::test_handle(6);
@@ -1628,7 +1666,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
     }
     let facts = SwarmSurveyFacts {
         node: None,
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         label: None,
         roster_unread: false,
         version: "0.146.0".to_owned(),
@@ -1649,7 +1687,10 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
                 walled_until: Some(1_793_140_000),
                 ..row("claude", "work-2", "limited")
             },
-            row("claude", "abcdef@example.com", "unseen"),
+            SurveyAccountFact {
+                email: Some("abcdef@example.com".to_owned()),
+                ..row("claude", "work-3", "unseen")
+            },
             row("codex", "codex-1", "not-enrolled"),
         ],
         accounts_unread: vec!["grok".to_owned()],
@@ -1681,7 +1722,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
             [
                 ("claude", "main"),
                 ("claude", "work-2"),
-                ("claude", "ab\u{2026}@\u{2026}"),
+                ("claude", "work-3"),
                 ("codex", "codex-1"),
             ]
         );
@@ -1703,12 +1744,17 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
             [&rows[3]["enrolled"], &rows[3]["condition"]],
             ["0", "not-enrolled"]
         );
-        assert!(
-            !out.contains("example") && !out.contains("abcdef"),
-            "no email on the wire: {out}"
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["email"].as_str())
+                .collect::<Vec<_>>(),
+            ["-", "-", "abcdef@example.com", "-"]
         );
         let sessions: Vec<_> = lines[2..4].iter().map(|line| fields(line)).collect();
-        assert_eq!(sessions[0]["account"], "work-2", "the footer's: {out}");
+        assert_eq!(
+            sessions[0]["account"], "unicorn@example.com",
+            "the footer's address: {out}"
+        );
         assert_eq!(sessions[1]["account"], "codex-1", "its pool's record");
     }
 
@@ -1820,7 +1866,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
 
     let facts = SwarmSurveyFacts {
         node: Some("0123456789abcdef0123456789abcdef".to_owned()),
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         label: Some("m22".to_owned()),
         roster_unread: false,
         version: "0.146.0".to_owned(),
@@ -1831,6 +1877,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
         accounts: vec![SurveyAccountFact {
             pool: "claude".to_owned(),
             id: "c01".to_owned(),
+            email: None,
             condition: "usable".to_owned(),
             enrolled: true,
             usage_5h_pct: Some(25),
@@ -1857,6 +1904,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
     let non_drive = Here {
         host: Some("m22.local".to_owned()),
         instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: false,
         facts: Some(facts.clone()),
     };
@@ -1881,9 +1929,8 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
     assert!(!again.lines().nth(1).unwrap().contains(" drive=1"));
 }
 
-/// WHERE A MAC KEEPS ITS WORK IS CONTENT: a content reply carries its home, free space and
-/// checkouts, which round-trip; the same facts at the facts level carry none of them (a reader
-/// granted facts alone reads an aterm that says nothing of its home), and the account rows stay.
+/// Home paths and checkout names need content access. Numeric free space remains available
+/// at facts level without revealing either location.
 #[test]
 fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
     use aterm_agent::harness::repo_work::home::{HomeRepo, HomeRepos};
@@ -1892,7 +1939,7 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
     let store = crate::session_store::new_store();
     let facts = SwarmSurveyFacts {
         version: "0.147.0".to_owned(),
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         home: Some("/Users//a".to_owned()),
         home_free_mb: Some(812_345),
         repos: Some(HomeRepos {
@@ -1925,6 +1972,7 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
     let here = Here {
         host: Some("m22.local".to_owned()),
         instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
         drive: true,
         facts: Some(facts.clone()),
     };
@@ -1945,7 +1993,7 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
     let parsed = SwarmSurveyFacts::from_survey_reply(&at_facts).expect("a facts reply");
     assert_eq!(
         (parsed.home, parsed.home_free_mb, parsed.repos),
-        (None, None, None)
+        (None, Some(812_345), None)
     );
 }
 
@@ -2095,7 +2143,7 @@ fn a_record_shows_only_while_its_group_is_in_front() {
 #[test]
 fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
     let facts = |roster_unread: bool| aterm_agent::survey_facts::SwarmSurveyFacts {
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         node: Some("n-1".to_owned()),
         label: (!roster_unread).then(|| "m5".to_owned()),
         roster_unread,
@@ -2283,4 +2331,137 @@ fn a_step_of_words_and_a_post_that_tie_is_the_screens() {
     );
     assert_eq!(step_of(words(), None).as_deref(), Some("Running"));
     assert_eq!(step_of(None, None), None);
+}
+
+#[test]
+fn a_request_tab_row_names_its_request_from_and_why() {
+    let _here = RequestsHere::new();
+    let store = crate::session_store::new_store();
+    let tab = crate::session_store::test_handle(41);
+    let person = crate::session_store::test_handle(42);
+    let id = crate::requests_host::opened_for_test(
+        true,
+        "87be5228c0ffee0087be5228c0ffee00",
+        "m114",
+        "fleet:87be5228:s-0123456789abcdef0123",
+        crate::requests_host::Made::Shell,
+        tab.sid.as_str(),
+    );
+    let (sid, person_sid) = (tab.sid.as_str().to_owned(), person.sid.as_str().to_owned());
+    store.write().unwrap().register(tab);
+    store.write().unwrap().register(person);
+    let row_of = |level, sid: &str| {
+        survey_rows(&store, level, usize::MAX, &here())
+            .lines()
+            .find(|line| line.contains(&format!(" sid={sid} ")))
+            .map(fields)
+            .unwrap_or_else(|| panic!("a row for {sid}"))
+    };
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        let row = row_of(level, &sid);
+        assert_eq!(row["request"], id, "{level:?}");
+        assert_eq!(row["request_from"], "m114");
+        assert_eq!(
+            row["request_why"], "a test's request",
+            "a given why is host tier"
+        );
+        // NEGATIVE: a person's tab names no request.
+        let mine = row_of(level, &person_sid);
+        assert_eq!(
+            (
+                mine["request"].as_str(),
+                mine["request_from"].as_str(),
+                mine["request_why"].as_str()
+            ),
+            ("-", "-", "-")
+        );
+    }
+}
+
+/// This test thread's requests in a folder of its own until dropped.
+struct RequestsHere {
+    _dir: aterm_tempfile::TempDir,
+}
+
+impl RequestsHere {
+    fn new() -> Self {
+        let dir = aterm_tempfile::tempdir().expect("a folder");
+        crate::requests_host::set_dir_for_test(Some(dir.path().to_path_buf()));
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for RequestsHere {
+    fn drop(&mut self) {
+        assert!(
+            crate::requests_host::flush_within(std::time::Duration::from_secs(60)),
+            "the writer flushed"
+        );
+        crate::requests_host::forget_for_test();
+        crate::requests_host::set_dir_for_test(None);
+    }
+}
+
+#[test]
+fn a_fallback_why_reads_one_to_a_drive_as_at_facts() {
+    let _here = RequestsHere::new();
+    let store = crate::session_store::new_store();
+    let (worker, shell) = (
+        crate::session_store::test_handle(43),
+        crate::session_store::test_handle(44),
+    );
+    let asker = (
+        true,
+        "87be5228c0ffee0087be5228c0ffee00",
+        "m114",
+        "fleet:87be5228:s-0123456789abcdef0123",
+    );
+    let briefed = crate::requests_host::opened_why_for_test(
+        asker,
+        crate::requests_host::Made::Agent("claude"),
+        worker.sid.as_str(),
+        Err("fix the parser's private bug"),
+    );
+    let given = crate::requests_host::opened_for_test(
+        asker.0,
+        asker.1,
+        asker.2,
+        asker.3,
+        crate::requests_host::Made::Shell,
+        shell.sid.as_str(),
+    );
+    let (worker_sid, shell_sid) = (
+        worker.sid.as_str().to_owned(),
+        shell.sid.as_str().to_owned(),
+    );
+    store.write().unwrap().register(worker);
+    store.write().unwrap().register(shell);
+    let row_of = |level, sid: &str| {
+        survey_rows(&store, level, usize::MAX, &here())
+            .lines()
+            .find(|line| line.contains(&format!(" sid={sid} ")))
+            .map(fields)
+            .unwrap_or_else(|| panic!("a row for {sid}"))
+    };
+    // This Mac's own connection reads the fallback at content, `1` at facts.
+    let row = row_of(SurveyLevel::Content, &worker_sid);
+    assert_eq!(row["request"], briefed);
+    assert_eq!(row["request_why"], "fix the parser's private bug");
+    assert_eq!(row_of(SurveyLevel::Facts, &worker_sid)["request_why"], "1");
+    // Another Mac's drive reads no content tier: the fallback is `1` at content too.
+    let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "c0ffee00c0ffee00c0ffee00c0ffee00".to_owned(),
+        host: "m72".to_owned(),
+    });
+    let row = row_of(SurveyLevel::Content, &worker_sid);
+    assert_eq!(
+        (row["request"].as_str(), row["request_why"].as_str()),
+        (briefed.as_str(), "1")
+    );
+    // NEGATIVE: a requester's own why is the host tier, which a drive reads.
+    let row = row_of(SurveyLevel::Content, &shell_sid);
+    assert_eq!(
+        (row["request"].as_str(), row["request_why"].as_str()),
+        (given.as_str(), "a test's request")
+    );
 }

@@ -98,6 +98,8 @@ enum Sock {
     #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
+    #[cfg(feature = "handshake")]
+    Roam(astream_aead::RoamCloser),
     /// An adopted stream ([`Broker::serve_stream`]), and the key its owner proved. Unlike a
     /// socket, it is ended as soon as that key is revoked ([`end_revoked_streams`]).
     #[cfg(feature = "stream")]
@@ -109,13 +111,21 @@ enum Sock {
 
 impl Sock {
     fn shutdown_both(&self) {
-        let _ = match self {
+        match self {
             #[cfg(unix)]
-            Sock::Unix(s) => s.shutdown(Shutdown::Both),
-            Sock::Tcp(s) => s.shutdown(Shutdown::Both),
+            Sock::Unix(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            Sock::Tcp(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            #[cfg(feature = "handshake")]
+            Sock::Roam(c) => c.shutdown_both(),
             #[cfg(feature = "stream")]
-            Sock::Stream { link, .. } => link.shutdown(Shutdown::Both),
-        };
+            Sock::Stream { link, .. } => {
+                let _ = link.shutdown(Shutdown::Both);
+            }
+        }
     }
 }
 
@@ -1384,6 +1394,8 @@ enum Conn {
     Tcp(TcpStream),
     #[cfg(feature = "aead")]
     Sealed(astream_aead::SealedStream<TcpStream>),
+    #[cfg(feature = "handshake")]
+    Roam(astream_aead::RoamStream),
     /// A stream its owner authenticated ([`Broker::serve_stream`]), with the key it proved.
     #[cfg(feature = "stream")]
     Stream(crate::stream_link::LinkEnd, [u8; 32]),
@@ -1397,6 +1409,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_read_timeout(d),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_read_timeout(d),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.set_read_timeout(d),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.set_read_timeout(d),
         }
@@ -1409,6 +1423,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_write_timeout(d),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_write_timeout(d),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.set_write_timeout(d),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.set_write_timeout(d),
         }
@@ -1424,6 +1440,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_nonblocking(on),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_nonblocking(on),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.set_nonblocking(on),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.set_nonblocking(on),
         }
@@ -1454,6 +1472,11 @@ impl Conn {
                 kept_from_children(clone.get_ref())?;
                 Conn::Sealed(clone)
             }
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => {
+                let clone = astream_aead::TryCloneable::try_clone(s)?;
+                Conn::Roam(clone)
+            }
             #[cfg(feature = "stream")]
             Conn::Stream(s, peer) => Conn::Stream(s.clone(), *peer),
         })
@@ -1480,6 +1503,8 @@ impl Conn {
                 kept_from_children(&clone)?;
                 Sock::Tcp(clone)
             }
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => Sock::Roam(s.closer()),
             #[cfg(feature = "stream")]
             Conn::Stream(s, peer) => Sock::Stream {
                 link: s.clone(),
@@ -1490,15 +1515,25 @@ impl Conn {
 
     /// Shut only the write direction: the peer reads EOF, and may still write.
     fn shutdown_write(&self) {
-        let _ = match self {
+        match self {
             #[cfg(unix)]
-            Conn::Unix(s) => s.shutdown(Shutdown::Write),
-            Conn::Tcp(s) => s.shutdown(Shutdown::Write),
+            Conn::Unix(s) => {
+                let _ = s.shutdown(Shutdown::Write);
+            }
+            Conn::Tcp(s) => {
+                let _ = s.shutdown(Shutdown::Write);
+            }
             #[cfg(feature = "aead")]
-            Conn::Sealed(s) => s.get_ref().shutdown(Shutdown::Write),
+            Conn::Sealed(s) => {
+                let _ = s.get_ref().shutdown(Shutdown::Write);
+            }
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.shutdown_write(),
             #[cfg(feature = "stream")]
-            Conn::Stream(s, _) => s.shutdown(Shutdown::Write),
-        };
+            Conn::Stream(s, _) => {
+                let _ = s.shutdown(Shutdown::Write);
+            }
+        }
     }
 }
 
@@ -1510,6 +1545,8 @@ impl Read for Conn {
             Conn::Tcp(s) => s.read(buf),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.read(buf),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.read(buf),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.read(buf),
         }
@@ -1524,6 +1561,8 @@ impl Write for Conn {
             Conn::Tcp(s) => s.write(buf),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.write(buf),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.write(buf),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.write(buf),
         }
@@ -1536,6 +1575,8 @@ impl Write for Conn {
             Conn::Tcp(s) => s.flush(),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.flush(),
+            #[cfg(feature = "handshake")]
+            Conn::Roam(s) => s.flush(),
             #[cfg(feature = "stream")]
             Conn::Stream(s, _) => s.flush(),
         }
@@ -6708,6 +6749,79 @@ impl Broker {
         psk: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<BrokerHandle> {
         self.serve_tcp_with(addr, TcpWrap::Handshake(psk))
+    }
+
+    /// Serve this broker over **zero-gap AEAD-over-UDP connection migration** (`AROM` v1;
+    /// `docs/ROADMAP.md` §1) authenticated by `psk` with per-session ephemeral X25519
+    /// forward secrecy, stateless HMAC `PKT_RETRY` source-address cookies, immutable 8-byte
+    /// Connection IDs, and RFC 9000 §8.2 `PATH_CHALLENGE` / `PATH_RESPONSE` + 3x
+    /// anti-amplification path validation.
+    ///
+    /// Clients connect with [`crate::client::Client::connect_udp_roaming`] and can migrate
+    /// across new local [`std::net::UdpSocket`]s without dropping live subscriptions,
+    /// pipelined publishes, attached capabilities, or falsely firing Last Wills.
+    #[cfg(feature = "handshake")]
+    pub fn serve_udp_roaming(
+        &self,
+        addr: impl std::net::ToSocketAddrs,
+        psk: [u8; astream_aead::KEY_LEN],
+    ) -> io::Result<BrokerHandle> {
+        let sock = std::net::UdpSocket::bind(addr)?;
+        kept_from_children(&sock)?;
+        let dial = connectable_addr(sock.local_addr()?);
+        let listener = astream_aead::RoamListener::from_socket(sock, psk)?;
+        let shared = self.shared.clone();
+        let listener_running = Arc::new(AtomicBool::new(true));
+        let acc_running = Arc::clone(&listener_running);
+        let acceptor = thread::Builder::new().spawn(move || {
+            let mut listener = listener;
+            loop {
+                if !shared.running.load(Ordering::Relaxed) || !acc_running.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept_timeout(ACCEPT_POLL) {
+                    Ok(Some(roam_stream)) => {
+                        if !shared.running.load(Ordering::Relaxed)
+                            || !acc_running.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        shared.accepted.fetch_add(1, Ordering::Relaxed);
+                        let sh = shared.clone();
+                        let _ = thread::Builder::new().spawn(move || {
+                            let _ = handle_conn_with_peer(
+                                &sh,
+                                Conn::Roam(roam_stream),
+                                Wire::Tcp,
+                                "roam",
+                                PeerAuth::none(),
+                            );
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+            listener.shutdown();
+        })?;
+        let listener_id = self.shared.listener_seq.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(listener_id, format!("roam:{dial}"));
+        self.shared.active_listeners.fetch_add(1, Ordering::AcqRel);
+        Ok(BrokerHandle {
+            shared: self.shared.clone(),
+            listener_id,
+            listener_running,
+            acceptor: Some(acceptor),
+            wake: AcceptWake::Polls,
+            endpoint: Endpoint::Tcp {
+                dial,
+                shown: dial.to_string(),
+            },
+        })
     }
 
     /// Like [`serve_tcp_handshake`](Self::serve_tcp_handshake) but with **static
@@ -15812,3 +15926,7 @@ mod tests {
 #[cfg(all(test, feature = "retention"))]
 #[path = "retention_tick_tests.rs"]
 mod retention_tick_tests;
+
+#[cfg(all(test, unix, feature = "retention"))]
+#[path = "held_tail_wire_tests.rs"]
+mod held_tail_wire_tests;

@@ -16,15 +16,19 @@ claude/user-tool-result/command	ok	{"message":{"content":null},"timestamp":"2026
 claude/user-tool-result/conversation	ok	{"message":{"content":[{"type":"tool_result"},{"text":"follow-up","type":"text"}]},"parentUuid":"u-2","timestamp":"2026-10-15T20:36:40Z","type":"user","uuid":"u-3"}
 claude/turn-duration/usage	ok	{"durationMs":5123,"isSidechain":false,"subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/metadata	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
-claude/turn-duration/command	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
+claude/turn-duration/command	ok	{"isSidechain":false,"subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/conversation	ok	{"durationMs":5123,"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
 claude/limit/usage	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/metadata	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
-claude/limit/command	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
+claude/limit/command	ok	{"content":"You've hit your limit","subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/conversation	ok	{"content":"You've hit your limit","error":"rate_limit","isApiErrorMessage":true,"quotaLimits":{"isUsingOverage":false,"overageStatus":"rejected","rateLimitType":"five_hour","resetsAt":1790870400,"status":"rejected"},"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
+claude/mid-turn-command/usage	ok	{"isSidechain":false,"subtype":"local_command","timestamp":"2026-11-11T03:55:49.135Z","type":"system"}
+claude/mid-turn-command/metadata	ok	{"isSidechain":false,"timestamp":"2026-11-11T03:55:49.135Z","type":"system","version":"2.1.322"}
+claude/mid-turn-command/command	ok	{"content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>","isSidechain":false,"subtype":"local_command","timestamp":"2026-11-11T03:55:49.135Z","type":"system","version":"2.1.322"}
+claude/mid-turn-command/conversation	ok	{"content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>","isMeta":false,"isSidechain":false,"level":"info","parentUuid":"u-6","sessionId":"s-1","subtype":"local_command","timestamp":"2026-11-11T03:55:49.135Z","type":"system","uuid":"u-7","version":"2.1.322"}
 claude/compact-boundary/usage	ok	{"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/compact-boundary/metadata	ok	{"timestamp":"2026-10-15T20:40:00Z","type":"system"}
-claude/compact-boundary/command	ok	{"timestamp":"2026-10-15T20:40:00Z","type":"system"}
+claude/compact-boundary/command	ok	{"content":"Conversation compacted","subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/compact-boundary/conversation	ok	{"content":"Conversation compacted","isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
 claude/bookkeeping/usage	ok	{"type":"cost-state"}
 claude/bookkeeping/metadata	ok	{"type":"cost-state"}

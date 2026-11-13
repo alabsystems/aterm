@@ -297,6 +297,12 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
         ));
     }
     let program = spec.program.display();
+    #[cfg(target_os = "macos")]
+    if aterm_uds::tether::lost() {
+        return Err(Error::local(
+            "the recorded Git lifecycle helper is unavailable; no child was started",
+        ));
+    }
     let until = if spec.progress.is_none() {
         Some(Instant::now().checked_add(spec.budget).ok_or_else(|| {
             Error::local(format!(
@@ -312,9 +318,12 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
     let mut cmd = spawnfd::command(&spec.program);
     // A killed frontend cannot run its collector. Git ends none of its children
     // on a SIGTERM, so the tie ends the group this child leads (`process_group(0)`
-    // in the collector): on Darwin its watcher signals the whole group, which its
-    // anchor holds as this child's (`aterm_uds::tether`), and stays for the group
-    // should git exit first. A descendant that left the group is not reached.
+    // in the collector): its watcher signals the whole group, which its anchor
+    // holds as this child's (`aterm_uds::tether`), and stays for the group should
+    // git exit first. A descendant that left the group is not reached. Where a
+    // Linux tether cannot route (a `hidepid` `/proc`, or this process as pid 1),
+    // or its watcher gets no pidfd (a kernel before 5.3, or a seccomp filter that
+    // refuses `pidfd_open`), the parent-death signal reaches git alone.
     cmd.tether();
     cmd.args(&spec.args);
     cmd.env_clear();

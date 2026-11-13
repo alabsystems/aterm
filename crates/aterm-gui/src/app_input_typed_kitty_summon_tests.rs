@@ -42,6 +42,7 @@ fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
         crate::app_render::forward_kitty_cursor_motion(
             enabled,
             false,
+            true,
             crate::cursor_glow::GlowStyle::RainbowKitty,
             Some(aterm_effects::cursor_glow::CursorCatMotionPulse {
                 at: base + Duration::from_millis(i * 40),
@@ -65,7 +66,7 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
 
     let mut off_app = App::headless_for_test();
     off_app.config.cursor_trail = Some(false);
-    off_app.config.cursor_trail_style = Some("rainbow kitty".into());
+    off_app.config.cursor_trail_style = Some("rainbow".into());
     off_app.kitty_cursor_enabled_cache = None;
     off_app.recompute_sparkle();
     assert!(
@@ -109,13 +110,14 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
 
     let mut on_app = App::headless_for_test();
     on_app.config.cursor_trail = Some(true);
-    on_app.config.cursor_trail_style = Some("rainbow kitty".into());
+    on_app.config.cursor_trail_style = Some("rainbow".into());
+    on_app.config.cursor_pet = Some("flying cat".into());
     on_app.kitty_cursor_enabled_cache = None;
     on_app.recompute_sparkle();
     drive_cursor_cat_momentum(&mut on_app, wid, true);
     assert!(
         on_app.windows[&wid].fx.companions().cursor_cat.is_active(),
-        "enabled Nyan owner forwards the decisive momentum key"
+        "the flier's enabled rainbow forwards the decisive momentum key"
     );
     assert!(crate::app_render::cursor_cat_presentation_enabled(
         true,
@@ -661,7 +663,7 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
         ),
         ("Tab", named(NamedKey::Tab), DeliveredClass::Gesture, false),
     ];
-    for style in ["rainbow kitty", "comet"] {
+    for style in ["rainbow", "comet"] {
         for (label, ev, class, alt_screen) in cases.clone() {
             for queued in [false, true] {
                 let (mut app, sink, pipe) = app_with_private_pty();
@@ -753,7 +755,7 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
     let (mut app, sink, pipe) = app_with_private_pty();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let glow_cfg = app.glow_config();
     let geom = Geom {
         cw: 8,
@@ -831,7 +833,7 @@ fn a_queued_key_release_publishes_no_receipt() {
     let (mut app, sink, pipe) = app_with_private_pty();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let session = app.front_terminal(wid).unwrap().session;
     let term = app.pool.get(session).unwrap().term.clone();
     crate::term_lock(&term).process(b"\x1b[>10u");
@@ -888,7 +890,7 @@ fn a_queued_ticket_carries_its_dispatch_instant() {
     let (mut app, sink, pipe) = app_with_private_pty();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let session = app.front_terminal(wid).unwrap().session;
     let pin = super::paste_order::pin_ordering_for_test(&sink);
     assert!(super::paste_order::is_ordering(&sink));
@@ -956,7 +958,7 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
     let wid = WindowId(0);
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     app.config.trail_sounds = Some(false);
     app.windows.get_mut(&wid).unwrap().focused = true;
     app.frontmost_window = Some(wid);
@@ -1049,7 +1051,7 @@ fn pty_app(
     let mut app = App::headless_for_test_with_sink(sink.clone());
     app.recompute_sparkle();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     (app, sink, master, slave)
 }
 
@@ -1154,7 +1156,7 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
         );
         let mut app = App::headless_for_test_with_sink(sink.clone());
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
         let wid = WindowId(0);
         app.cursor_frame(
@@ -1602,7 +1604,7 @@ fn key_only_input_builds_no_cat_momentum() {
     let mut app = App::headless_for_test();
     app.recompute_sparkle();
     let wid = WindowId(0);
-    app.config.cursor_trail_style = Some("nyan".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let now = std::time::Instant::now();
     for _ in 0..40 {
         app.input(wid, key('j'), Source::Human);

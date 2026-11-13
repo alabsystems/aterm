@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// The item's id, as `aterm init --only` and every remedy that names it spell it.
 pub const ID: &str = "base.clt";
 
+/// The id of the read-only row of what setup's one elevation still owes beside the tools
+/// ([`RootSteps`]): `--only base.clt` selects it too.
+pub const ROOT_STEPS_ID: &str = "base.clt.root-steps";
+
 /// What the C toolchain probe found, in the item's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
@@ -81,13 +85,16 @@ pub enum Unfinished {
     /// This account is not one of the Mac's administrators, whom alone macOS lets install the
     /// tools: nothing was asked.
     NotAdmin,
+    /// The root half ran and the tools are there, but a root step beside them (developer mode,
+    /// the Mac's name rule, the LAN broker) still reads owed ([`RootSteps`]).
+    StepsOwed,
     /// Anything else.
     Other,
 }
 
 impl Unfinished {
     /// Every class, in code order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Password,
         Self::Catalog,
         Self::NoneOffered,
@@ -102,6 +109,7 @@ impl Unfinished {
         Self::NotOwnLogin,
         Self::LowData,
         Self::NotAdmin,
+        Self::StepsOwed,
         Self::Other,
     ];
 
@@ -121,9 +129,12 @@ impl Unfinished {
             Self::Other => Some(87),
             Self::WindowClosed => Some(88),
             Self::Unread => Some(89),
-            Self::Password | Self::Refuses | Self::NotOwnLogin | Self::LowData | Self::NotAdmin => {
-                None
-            }
+            Self::Password
+            | Self::Refuses
+            | Self::NotOwnLogin
+            | Self::LowData
+            | Self::NotAdmin
+            | Self::StepsOwed => None,
         }
     }
 
@@ -132,9 +143,14 @@ impl Unfinished {
     /// their own codes ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA`],
     /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN`],
     /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`],
-    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]), so the window spends
-    /// no automatic opening on the first, offers no Install… for the second, and keeps the last
-    /// two's opening spent, each a person's press; every other class is 1.
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]), so the window gives
+    /// the first's attempt back (it asked nothing, and the mode's end wakes it), offers no
+    /// Install… for the second, records the third as a person's decline
+    /// ([`aterm_types::clt_mark::End::Declined`]) and says where the fourth ended; every other
+    /// class is 1. The window records the fourth and every 1 as unfinished, asked again by
+    /// itself on the record's schedule: Apple's window gives no word of which button closed it
+    /// (Not Now, Cancel, Done after its own failure, or a quit at logout), so its close is never
+    /// read as a decline.
     #[must_use]
     pub const fn tab_exit(self) -> u8 {
         match self {
@@ -185,6 +201,9 @@ impl Unfinished {
             Self::NotOwnLogin => "it runs only in your own Mac login",
             Self::LowData => "Low Data Mode is on, so the download waits",
             Self::NotAdmin => "only an administrator of this Mac can install them",
+            Self::StepsOwed => {
+                "developer mode, the Mac's name rule or the local network helper is still not set up"
+            }
             Self::Other => "something unexpected went wrong",
         }
     }
@@ -241,11 +260,17 @@ pub const INTRO_SETUP: &str = "aterm init: finishing the administrator's part of
 /// The password prompt (`sudo -p`), in the tab and outside it.
 pub const TAB_PROMPT: &str = aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT;
 
-/// The tab's last line once the tools are installed and the rest of the elevation ran; the
-/// window then closes the tab unless it is its window's last (`aterm-gui`'s
-/// `App::developer_tools_install_ended`).
-pub const TAB_INSTALLED: &str =
-    "Successfully completed: Apple's Command Line Tools are in place. This tab closes by itself.";
+/// The root half's flag (`machines here apply --plain`) that leaves developer mode as it reads:
+/// its baseline then carries no `[developer] debugger` ([`CommandLineTools::leaves_developer_mode`]).
+/// It only narrows what the root half does.
+pub const LEAVE_DEVELOPER_MODE: &str = "--leave-developer-mode";
+
+/// The tab's last line once the tools read in place and no root step beside them reads owed, each
+/// read back after the root half ran; the window then closes the tab unless it is its window's
+/// last (`aterm-gui`'s `App::developer_tools_install_ended`).
+pub const TAB_INSTALLED: &str = "Successfully completed: Apple's Command Line Tools and the \
+                                 administrator's part of setup are in place. This tab closes by \
+                                 itself.";
 
 /// Clear the admitted tab's screen and scrollback after its go line was received.
 pub(crate) const TAB_CLEAR: &str = "\x1b[H\x1b[2J\x1b[3J";
@@ -396,6 +421,11 @@ pub struct CommandLineTools {
     /// Whether this run's root half ran: what it left owed then goes to the journal, and the
     /// row's read-back says the tools alone.
     asked: std::sync::atomic::AtomicBool,
+    /// The window that opened the Mac Setup tab read developer mode off as the person's own
+    /// choice ([`Self::leaving_developer_mode`]).
+    developer_mode_theirs: bool,
+    /// The root work the last probe admitted ([`Self::read`]), which an apply re-reads within
+    /// ([`Self::plan_after`]).
     root_plan: Mutex<RootPlan>,
 }
 
@@ -441,7 +471,49 @@ impl CommandLineTools {
             name: Box::new(|| None),
             owed: Box::new(|_| Vec::new()),
             asked: std::sync::atomic::AtomicBool::new(false),
+            developer_mode_theirs: false,
             root_plan: Mutex::new(RootPlan::WithTools),
+        }
+    }
+
+    /// This item as the Mac Setup tab's program of a window that read developer mode off as the
+    /// person's own choice (`theirs`: they turned it off in aterm's Settings ▸ Security, or
+    /// something they ran turned it off after aterm saw it on;
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE`]): it is never
+    /// owed, and the root half leaves it ([`Self::leaves_developer_mode`]).
+    #[must_use]
+    pub fn leaving_developer_mode(self, theirs: bool) -> Self {
+        Self {
+            developer_mode_theirs: theirs,
+            ..self
+        }
+    }
+
+    /// Whether this run leaves developer mode as it reads, owing nothing for it and telling the
+    /// root half to leave it (`--leave-developer-mode`): a run nobody typed (the Mac Setup tab, or
+    /// a run aterm decided) where the account's record says setup's elevation finished once
+    /// ([`aterm_types::clt_mark::Record::finished`]: developer mode reading off since was turned
+    /// off by someone after setup turned it on), or where the tab's window read it off as the
+    /// person's choice ([`Self::leaving_developer_mode`]). A person's own typed `aterm init` sets
+    /// it up whatever it reads: their run is their yes.
+    fn leaves_developer_mode(&self, sys: &dyn System) -> bool {
+        let typed = self.tab.is_none() && self.unbidden.as_ref().is_none_or(|u| u.explicit);
+        !typed
+            && (self.developer_mode_theirs
+                || self
+                    .unbidden
+                    .as_ref()
+                    .is_some_and(|unbidden| unbidden.finished(sys)))
+    }
+
+    /// [`Self::command_for`] `plan`, telling the root half to leave developer mode where this
+    /// run does ([`Self::leaves_developer_mode`]).
+    fn root_command(&self, sys: &dyn System, plan: RootPlan) -> Cmd {
+        let command = self.command_for(plan);
+        if self.leaves_developer_mode(sys) {
+            command.arg(LEAVE_DEVELOPER_MODE)
+        } else {
+            command
         }
     }
 
@@ -471,8 +543,10 @@ impl CommandLineTools {
 
     /// This item in a run aterm decided ([`crate::init::Decider::Aterm`]: the follow-up of a
     /// person's own package install or update), held as `unbidden` says: it asks for the Mac
-    /// password automatically once per account episode, sharing System State's Mac Setup tab's ask
-    /// ([`aterm_types::clt_mark`]), and never while the person's choices hold that tab, as read
+    /// password automatically only where the account's record lets an ask go now (no other asker
+    /// runs, no person declined the last ask, and its next try is due), sharing System State's
+    /// Mac Setup tab's record ([`aterm_types::clt_mark`]), and never while the person's choices
+    /// hold that tab, as read
     /// when its probe runs and again right before it claims the ask; where it asks nothing it is
     /// deferred, naming the person's step ([`PERSONS_STEP`]), and an ask a Stop or another asker
     /// took between its probe and its apply fails in those words.
@@ -513,7 +587,9 @@ impl CommandLineTools {
     /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
     /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
     /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
-    /// one password does every root step setup has. [`RootPlan::StepsOnly`] omits CLT
+    /// root transaction also disables Spotlight data-volume indexing in
+    /// `controller::commands`, so one password does every root step setup has.
+    /// [`RootPlan::StepsOnly`] omits CLT
     /// installation and selection while retaining these independent steps.
     /// [`RootPlan::NameRuleOnly`] contains only the naming permission and no OS targets.
     #[must_use]
@@ -567,10 +643,15 @@ impl CommandLineTools {
         self.unbidden.as_ref().is_some_and(|record| record.explicit)
     }
 
-    /// Only the person's setup request may renew an old or unread naming permission.
-    /// Automatic runs retain the original metadata inventory and durable episode policy.
+    /// What the elevation still owes this Mac beside the tools ([`Self::with_owed`]), less
+    /// developer mode where this run leaves it ([`Self::leaves_developer_mode`]). Only the
+    /// person's setup request may renew an old or unread naming permission; automatic runs
+    /// retain the original metadata inventory and durable episode policy.
     fn owed_now(&self, sys: &dyn System) -> Vec<crate::root_steps::Owed> {
         let mut owed = (self.owed)(sys);
+        if self.leaves_developer_mode(sys) {
+            owed.retain(|step| *step != crate::root_steps::Owed::Debugger);
+        }
         if self.is_explicit()
             && sys.macos()
             && sys
@@ -703,49 +784,63 @@ impl CommandLineTools {
 }
 
 /// What holds back the ask of a run aterm decided ([`CommandLineTools::unbidden`]): this
-/// account's record of aterm's own ask, which System State's Mac Setup tab reads and
-/// writes too ([`aterm_types::clt_mark`]), the build that asks, and the person's choices in
+/// account's record of setup's administrator ask, which System State's Mac Setup tab reads and
+/// writes too ([`aterm_types::clt_mark`]), the process that asks, and the person's choices in
 /// System State that hold that tab ([`held_by`]), read from the setup records as the item's probe
 /// runs and again right before its apply claims the ask, so a Stop pressed after `aterm init`
 /// began, while the base layer or the vault's join ran, still holds it (principle 4).
 pub struct Unbidden {
     /// The record ([`aterm_types::clt_mark::path`]); `None` where it has no place, which holds
-    /// the ask as a record naming this build does.
+    /// the automatic ask.
     mark: Option<PathBuf>,
-    /// The build that asks ([`aterm_stamp::build_id`]).
-    build: String,
+    /// This process, which asks ([`aterm_types::clt_mark::Asker::this_process`]); `None` where
+    /// its birth cannot be read, which holds the automatic ask (the record could not tell a later
+    /// asker whether it still runs).
+    asker: Option<aterm_types::clt_mark::Asker>,
     /// An explicit person retry records its attempt but never borrows an automatic hold.
     explicit: bool,
     /// The person's choices now, as the setup records say ([`crate::init::Records::holds`]).
     holds: Arc<dyn Fn() -> crate::init::Holds + Send + Sync>,
+    /// This run's claim of the episode ([`Self::claim`]), which only its end replaces.
+    claim: Mutex<Option<aterm_types::clt_mark::Claim>>,
 }
 
 impl Unbidden {
-    /// The record at `mark` and `build`, held as `holds` reads the person's choices each time
-    /// it is called.
+    /// The record at `mark` and the process `asker` that asks, held as `holds` reads the
+    /// person's choices each time it is called.
     #[must_use]
     pub fn new(
         mark: Option<PathBuf>,
-        build: String,
+        asker: Option<aterm_types::clt_mark::Asker>,
         holds: impl Fn() -> crate::init::Holds + Send + Sync + 'static,
     ) -> Self {
         Self {
             mark,
-            build,
+            asker,
             explicit: false,
             holds: Arc::new(holds),
+            claim: Mutex::new(None),
         }
     }
 
-    /// This account's record and this build, held as `records` say each time they are read
-    /// ([`held_by`]).
+    /// This account's record and this process of this build, held as `records` say each time
+    /// they are read ([`held_by`]).
     #[must_use]
     pub fn here(records: &'static dyn crate::init::Records) -> Self {
         Self::new(
             aterm_types::clt_mark::path(),
-            aterm_stamp::build_id(),
+            aterm_types::clt_mark::Asker::this_process(&aterm_stamp::build_id()),
             move || records.holds(),
         )
+    }
+
+    /// Whether the record says setup's elevation finished on this account once
+    /// ([`aterm_types::clt_mark::Record::finished`]), as it reads through `sys`; `false` where it
+    /// has no place or cannot be read.
+    fn finished(&self, sys: &dyn System) -> bool {
+        self.mark.as_deref().is_some_and(|mark| {
+            aterm_types::clt_mark::record(sys.clt_mark(), mark, sys.now()).finished
+        })
     }
 
     /// Why the person's choices hold the ask now, naming their step, as the setup records read
@@ -760,10 +855,11 @@ impl Unbidden {
     }
 
     /// Why a run aterm decided asks no password by itself now, naming the person's step, or
-    /// `None` when it may ask: the person's choices hold it ([`Self::held`]), an earlier attempt consumed
-    /// the episode (its tab, or an earlier run aterm decided: [`ASK_ALREADY_SPENT`]), or the
-    /// record has no place or cannot say whether it did ([`UNREAD_RECORD`]), as the record reads
-    /// through `sys` ([`aterm_types::clt_mark::reading`]).
+    /// `None` when it may ask: the person's choices hold it ([`Self::held`]), the record says no
+    /// automatic ask goes now (another asker asks, the last attempt's next try is not due yet,
+    /// a finished one's pause has not passed, or a person declined), or the record has no place
+    /// or cannot say ([`UNREAD_RECORD`]), as the record reads through `sys` at `sys`'s clock
+    /// ([`aterm_types::clt_mark::reading`]).
     fn withheld(&self, sys: &dyn System) -> Option<String> {
         if self.explicit {
             return None;
@@ -777,11 +873,25 @@ impl Unbidden {
                  password by itself: {PERSONS_STEP}"
             ));
         };
-        match aterm_types::clt_mark::reading(sys.clt_mark(), mark) {
-            aterm_types::clt_mark::Asked::Available => None,
-            aterm_types::clt_mark::Asked::Spent => {
-                Some(format!("{ASK_ALREADY_SPENT}: {PERSONS_STEP}"))
+        if self.asker.is_none() {
+            return Some(format!("{NOT_NOTED}: {PERSONS_STEP}"));
+        }
+        let now = sys.now();
+        match aterm_types::clt_mark::reading(sys.clt_mark(), mark, now) {
+            asked if asked.may_ask(now) => None,
+            aterm_types::clt_mark::Asked::Asking => {
+                Some(format!("{ASKING_ELSEWHERE}: {PERSONS_STEP}"))
             }
+            aterm_types::clt_mark::Asked::Declined { due, .. } => Some(format!(
+                "{ASK_DECLINED}; it asks again by itself in about {} days: {PERSONS_STEP}",
+                due.saturating_sub(now).div_ceil(86_400)
+            )),
+            aterm_types::clt_mark::Asked::Unfinished { due, .. }
+            | aterm_types::clt_mark::Asked::Done { due } => Some(format!(
+                "{ASKS_AGAIN} in about {} min: {PERSONS_STEP}",
+                due.saturating_sub(now).div_ceil(60)
+            )),
+            aterm_types::clt_mark::Asked::Available => None,
             aterm_types::clt_mark::Asked::Unread(error) => Some(format!(
                 "{UNREAD_RECORD}, {} ({error}), so it asks for no Mac password by itself: \
                  {PERSONS_STEP}",
@@ -790,35 +900,85 @@ impl Unbidden {
         }
     }
 
-    /// Claim this build's ask in the record, right before `sudo` asks
-    /// ([`aterm_types::clt_mark::claim`]): `true` when this run added its line, `false` when
-    /// another asker of this build (System State's tab) named it first.
+    /// Claim the episode right before `sudo` asks: an automatic run's claim
+    /// ([`aterm_types::clt_mark::claim`]) only where the record lets one go now, a person's
+    /// ([`aterm_types::clt_mark::explicit`]) whatever it says. `true` when this run holds it.
     ///
     /// # Errors
-    /// No place for the record, and the claim's own.
+    /// No place for the record, no readable birth of this process, and the claim's own.
     fn claim(&self, sys: &dyn System) -> std::io::Result<bool> {
         let mark = self
             .mark
             .as_deref()
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        if self.explicit {
-            aterm_types::clt_mark::explicit(sys.clt_mark(), mark, &self.build)
+        let asker = self
+            .asker
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let claim = if self.explicit {
+            Some(aterm_types::clt_mark::explicit(
+                sys.clt_mark(),
+                mark,
+                asker,
+                sys.now(),
+            )?)
         } else {
-            aterm_types::clt_mark::claim(sys.clt_mark(), mark, &self.build)
-        }
+            aterm_types::clt_mark::claim(sys.clt_mark(), mark, asker, sys.now())?
+        };
+        let held = claim.is_some();
+        *self.claim.lock().unwrap_or_else(PoisonError::into_inner) = claim;
+        Ok(held)
     }
 
-    /// Release this run's exact claim after the port proves sudo never started. An unreadable
-    /// record retains the hold and reports the release failure in the journal.
-    fn forget(&self, sys: &dyn System) {
-        if let Some(mark) = &self.mark
-            && let Err(error) = aterm_types::clt_mark::forget(sys.clt_mark(), mark, &self.build)
+    /// Record how this run's claimed attempt ended ([`aterm_types::clt_mark::end`]); nothing
+    /// where it claimed none. A record that cannot be written keeps its `asking` line, which
+    /// reads as cut off once this run ends: asked again by itself, as an interruption is.
+    fn end(&self, sys: &dyn System, how: aterm_types::clt_mark::End) {
+        let claim = self
+            .claim
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let (Some(mark), Some(claim)) = (&self.mark, claim)
+            && let Err(error) =
+                aterm_types::clt_mark::end(sys.clt_mark(), mark, &claim, how, sys.now())
         {
             aterm_log::warn!(
-                "aterm init: the record of aterm's Command Line Tools ask was not taken back: {error}"
+                "aterm init: how aterm's ask for the Mac password ended was not recorded: {error}"
             );
         }
     }
+}
+
+/// How the attempt that ran the root half (`ran`, which `ended` reads) ends in the record, read
+/// as the `CltEpisode` model's terminal exit ([`aterm_types::clt_mark::term_end`]): only a port
+/// result that proves `sudo` never started gives the attempt back; done only where the read-back
+/// after it (`settled`) finds the tools in place and no root step owed; a stop is the person's
+/// decline only when the run caught a key at this terminal (`caught`, `SIGINT` or `SIGQUIT`),
+/// while a hangup, a logout's `SIGTERM` or a stop the root helper reported with none caught here
+/// is an interruption; anything else, a refused or untyped password, Apple's window closed
+/// without the tools (whose button nothing tells) and a root half that exited 0 but left a step
+/// owed included, is unfinished and asked again by itself on the record's doubling schedule.
+fn episode_end(
+    ran: &Result<Option<i32>, crate::port::RunFailed>,
+    ended: Result<(), Unfinished>,
+    settled: bool,
+    caught: Option<i32>,
+) -> aterm_types::clt_mark::End {
+    use aterm_types::clt_mark::{Stop, TermExit, term_end};
+    term_end(match (ran, ended) {
+        (Err(crate::port::RunFailed::Spawn(_) | crate::port::RunFailed::Refused(_)), _) => {
+            TermExit::NotStarted
+        }
+        (_, Ok(())) => TermExit::Finished { settled },
+        (_, Err(Unfinished::Stopped)) => TermExit::Unfinished {
+            stop: Some(match caught {
+                Some(libc::SIGINT | libc::SIGQUIT) => Stop::Person,
+                _ => Stop::Interruption,
+            }),
+        },
+        (_, Err(_)) => TermExit::Unfinished { stop: None },
+    })
 }
 
 /// Why the person's choices in System State hold a run aterm decided back from asking for the
@@ -840,10 +1000,22 @@ pub fn held_by(holds: &crate::init::Holds) -> Option<String> {
 pub const PERSONS_STEP: &str = "run `aterm init --only base.clt` in a terminal, or use \
                                 Install Command Line Tools\u{2026} in System State when shown";
 
-/// Why a run aterm decided asks no password where this build asked by itself already: its tab,
-/// or an earlier run aterm decided ([`aterm_types::clt_mark`]).
-pub const ASK_ALREADY_SPENT: &str = "aterm has already asked for your Mac password for setup; \
-                                       updates do not ask again automatically";
+/// Why a run aterm decided asks no password where a person declined setup's last ask (a Stop
+/// or Ctrl-C at the password prompt, the Mac Setup tab closed while aterm ran on): no automatic
+/// ask comes until its long pause passes ([`aterm_types::clt_mark::DECLINE_AGAIN`]) or their own
+/// yes ([`aterm_types::clt_mark::Asked::Declined`]).
+pub const ASK_DECLINED: &str = "you declined aterm's last ask for your Mac password for setup, so \
+                                it asks for none by itself for now";
+
+/// Why a run aterm decided asks no password while another asker's attempt runs: System State's
+/// Mac Setup tab, or another run aterm decided ([`aterm_types::clt_mark::Asked::Asking`]).
+pub const ASKING_ELSEWHERE: &str = "another aterm is asking for your Mac password for setup now";
+
+/// Why a run aterm decided asks no password before the record's next try is due: the last
+/// attempt did not finish, or finished, and aterm asks again by itself on the record's schedule
+/// ([`aterm_types::clt_mark::ASK_AGAIN`]); the row goes on to say when.
+pub const ASKS_AGAIN: &str = "aterm asked for your Mac password for setup a short while ago and \
+                              asks again by itself";
 
 /// Why a run aterm decided asks no password where the record of its own ask has no place, or
 /// cannot say whether this build asked ([`aterm_types::clt_mark::Asked::Unread`]): the row goes on
@@ -855,8 +1027,8 @@ pub const UNREAD_RECORD: &str = "aterm cannot read its record of asking for them
 pub const NEWER: &str = "a newer aterm set this Mac up";
 
 /// Why a run aterm decided asked no password after all: its claim of the ask in the record failed
-/// (no hold on the record's lock, or a write that failed), so a later run could not tell that it
-/// asked.
+/// (no hold on the record's lock, a write that failed, or no readable birth of this process), so
+/// a later run could not tell that it asked, or whether it still runs.
 pub const NOT_NOTED: &str = "aterm could not note that it asked, so it asks for no Mac password \
                              by itself";
 
@@ -911,12 +1083,82 @@ fn held(sys: &dyn System) -> crate::items::developer::Holder {
     crate::items::developer::holder(sys, crate::items::developer::placeholder_state(sys))
 }
 
-/// Whether `row` is this item's, deferred: to an install under way, to Apple's installer window
-/// open for them, or to a person at this Mac's console. None is this run's to finish, so an
-/// apply or a plan completes with it.
+/// Whether `row` is this item's, or [`RootSteps`]', deferred: to an install under way, to
+/// Apple's installer window open for them, to a person at this Mac's console, or to setup's one
+/// Mac password, which this run may not ask for (or asked for, leaving a step owed). None is this
+/// run's to finish, so an apply or a plan completes with it, and `--check` reads it as not in
+/// place.
 #[must_use]
 pub fn deferred(row: &aterm_converge::ItemReport) -> bool {
-    row.id == ID && row.outcome == aterm_converge::Outcome::Deferred
+    (row.id == ID || row.id == ROOT_STEPS_ID) && row.outcome == aterm_converge::Outcome::Deferred
+}
+
+/// `steps` in plain words, `; ` between them.
+fn plain_steps(steps: &[crate::root_steps::Owed]) -> String {
+    steps
+        .iter()
+        .map(|step| step.plain())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `base.clt.root-steps`: what setup's one elevation still owes this Mac beside the tools
+/// (developer mode, the Mac's name rule, the LAN broker: [`crate::root_steps::owed`]), read fresh
+/// after [`CommandLineTools`]' own row, whose one Mac password does them. It never asks and
+/// changes nothing: in place where nothing is owed, else deferred, naming each step owed and who
+/// does it (that row's password, which this run may not ask for and why, or which ran and left
+/// it owed), so neither a run that may not ask nor a root half that left a step undone reads in
+/// place. In the Mac Setup tab a step still owed after its password is the tab's unfinished
+/// end ([`Unfinished::StepsOwed`]), unless the tools' own row said why first.
+pub struct RootSteps<'a>(&'a CommandLineTools);
+
+impl Item for RootSteps<'_> {
+    fn id(&self) -> String {
+        ROOT_STEPS_ID.to_owned()
+    }
+
+    fn family(&self) -> &'static str {
+        "developer"
+    }
+
+    fn title(&self) -> String {
+        "the administrator's part of setup (developer mode, the Mac's name rule, the local network \
+         helper)"
+            .to_owned()
+    }
+
+    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        let clt = self.0;
+        let owed = clt.owed_now(sys);
+        if owed.is_empty() {
+            return Probe::Ok {
+                now: "nothing owed".to_owned(),
+            };
+        }
+        let steps = plain_steps(&owed);
+        if clt.asked.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(tab) = &clt.tab
+                && tab.unfinished().is_none()
+            {
+                tab.note(Unfinished::StepsOwed);
+            }
+            return Probe::Deferred {
+                why: format!("still owed after this run's Mac password: {steps}"),
+            };
+        }
+        let from = format!("still owed: {steps}");
+        let why = match clt.held_back(sys, &from, false) {
+            Some((Probe::Deferred { why } | Probe::Blocked { why }, _)) => why,
+            Some(_) | None => format!("{from}; {ID}'s one Mac password does them"),
+        };
+        Probe::Deferred { why }
+    }
+
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err(format!(
+            "{ROOT_STEPS_ID} reads only; {ID}'s one Mac password does its steps"
+        ))
+    }
 }
 
 impl Item for CommandLineTools {
@@ -950,22 +1192,25 @@ impl Item for CommandLineTools {
         if !sys.has_tty() {
             return Err(NO_TTY.to_owned());
         }
-        // Persist the episode before sudo can ask. Explicit retries bypass its withholding
-        // decision, but consume the same record so a later update never retries unsolicited.
-        let mut claimed = false;
+        // The record is claimed before sudo can ask, once this run owns the terminal (a vault
+        // question can own it first): the queued root work, Stop and the automatic ask's holds
+        // are read again then, immediately before the root episode starts. Explicit retries
+        // bypass its withholding decision, but claim the same record, so its end decides the next
+        // automatic ask. A refusal here starts no child and keeps its own words; work no longer
+        // owed by then asks nothing and is no failure.
+        let mut refused: Option<String> = None;
         let mut skipped = false;
-        let mut plan_failure = None;
+        let mut ran_plan = plan;
         // The root half runs in this terminal's foreground, so a Ctrl-C (which the
         // through-installer wait invites) or a closed terminal reaches this run too: held until
         // the root half has finished its step and aterm's own ask is kept or taken back, then
         // sent again, so the run still stops as it would have.
         let stops = sys.defer_stops();
-        let ran = sys.run_tty(&self.command_for(plan), &mut |command| {
-            // A vault question can own the terminal first. Re-read work under that lease,
-            // then Stop and the current holds after those reads, before claiming the ask.
+        let ran = sys.run_tty(&self.root_command(sys, plan), &mut |command| {
+            // Re-read work under the terminal lease, bounded by the plan this apply admitted.
             let fresh = self.plan_after(sys, plan);
             if let Ok(Some(plan)) = &fresh {
-                *command = self.command_for(*plan);
+                *command = self.root_command(sys, *plan);
             }
             let admission = fresh.as_ref().ok().and_then(|plan| {
                 plan.and_then(|plan| self.admission_before_ask(sys, plan))
@@ -976,6 +1221,7 @@ impl Item for CommandLineTools {
                 ));
             }
             if let Some(why) = self.unbidden.as_ref().and_then(Unbidden::held) {
+                refused = Some(why.clone());
                 return Err(crate::port::RunFailed::Refused(why));
             }
             let plan = match fresh {
@@ -987,35 +1233,33 @@ impl Item for CommandLineTools {
                     ));
                 }
                 Err((why, _)) => {
-                    plan_failure = Some(why.clone());
+                    refused = Some(why.clone());
                     return Err(crate::port::RunFailed::Refused(why));
                 }
             };
             if let Some((why, _)) = admission {
-                plan_failure = Some(why.clone());
+                refused = Some(why.clone());
                 return Err(crate::port::RunFailed::Refused(why));
             }
+            ran_plan = plan;
             *self.root_plan.lock().unwrap_or_else(PoisonError::into_inner) = plan;
             if let Some(record) = &self.unbidden {
-                match record.claim(sys) {
-                    Ok(added) => {
-                        claimed = added;
-                        if !added && !record.explicit {
-                            return Err(crate::port::RunFailed::Refused(format!(
-                                "{ASK_ALREADY_SPENT}: {PERSONS_STEP}"
-                            )));
-                        }
-                    }
+                let why = match record.claim(sys) {
+                    Ok(true) => None,
+                    Ok(false) => Some(record.withheld(sys).unwrap_or_else(|| {
+                        format!("{ASKING_ELSEWHERE}: {PERSONS_STEP}")
+                    })),
                     Err(error) if record.explicit => {
                         aterm_log::warn!(
                             "aterm init: could not record the explicit administrator attempt: {error}"
                         );
+                        None
                     }
-                    Err(error) => {
-                        return Err(crate::port::RunFailed::Refused(format!(
-                            "{NOT_NOTED} ({error}): {PERSONS_STEP}"
-                        )));
-                    }
+                    Err(error) => Some(format!("{NOT_NOTED} ({error}): {PERSONS_STEP}")),
+                };
+                if let Some(why) = why {
+                    refused = Some(why.clone());
+                    return Err(crate::port::RunFailed::Refused(why));
                 }
             }
             (self.say)(&format!("{}\n", Self::intro(false, plan)));
@@ -1026,21 +1270,20 @@ impl Item for CommandLineTools {
             drop(stops);
             return Ok(());
         }
-        if let Some(why) = plan_failure {
+        if let Some(why) = refused {
             drop(stops);
             return Err(why);
         }
-        let ended = self.ended(sys, &ran, sys.stopped());
-        // Only these port results prove sudo never existed. A password refusal, installer
-        // failure, timeout or lost result may follow human interaction and keeps the episode.
-        if claimed
-            && matches!(
-                ran,
-                Err(crate::port::RunFailed::Spawn(_) | crate::port::RunFailed::Refused(_))
-            )
-            && let Some(record) = &self.unbidden
-        {
-            record.forget(sys);
+        let caught = sys.stopped();
+        let ended = self.ended(sys, &ran, caught);
+        if let Some(record) = &self.unbidden {
+            // Done only as read back now: no root step owed, and the tools in place where the
+            // root half was to install them (a steps-only or naming-permission run leaves a
+            // refusing or unread compiler as it was, which no password mends).
+            let settled = self.owed_now(sys).is_empty()
+                && (ran_plan != RootPlan::WithTools
+                    || matches!((self.found)(sys), Found::Present(_)));
+            record.end(sys, episode_end(&ran, ended, settled, caught));
         }
         drop(stops);
         match (ended, ran) {
@@ -1059,17 +1302,16 @@ impl CommandLineTools {
     /// this Mac's console (deferred to one: only a person there types the Mac password, never an
     /// agent's tab, a script or a remote shell), no terminal to ask in, Low Data Mode, or an
     /// account that is no administrator's (each blocked, asking nothing), or, in a run aterm
-    /// decided, the person's Stop as the setup records read now, this build's ask spent, or a
-    /// record that cannot say ([`Unbidden::withheld`]: deferred, naming the person's step); else
-    /// the change. With the tools present, the change is the elevation's other root steps where
-    /// any is owed ([`Self::with_owed`]) and this run may ask for the password now: in the tab,
-    /// a run that may not says why as it would for the tools (Low Data Mode and an install under
-    /// way aside, which hold only a download); outside it, the row reads the tools in place and
-    /// names the steps left for setup's one password, so no pass blocks on them. Once this run's
-    /// root half ran, its read-back says the tools alone: what that left owed is in the journal.
-    /// A refusing or unanswered compiler also defers to confirmed installer custody; without
-    /// that custody known independent root work may proceed once, while read-back retains
-    /// the compiler's blocked or unknown classification.
+    /// decided, the person's Stop as the setup records read now, or a record that says no
+    /// automatic ask goes now or cannot say ([`Unbidden::withheld`]: deferred, naming the
+    /// person's step); else the change. With the tools there, whether they build or refuse to,
+    /// or a compiler that did not answer, the change is the elevation's other root steps where
+    /// any is owed ([`Self::with_owed`]) and this run may ask for the password now
+    /// ([`Self::read_owed`]): the root steps never wait on the compiler's verdict, and run alone
+    /// ([`RootPlan::StepsOnly`]), installing and selecting no tools. A refusing or unanswered
+    /// compiler first defers to confirmed installer custody ([`Self::installer_hold`]). Once this
+    /// run's root half ran, its read-back says the tools alone: what is still owed is
+    /// [`RootSteps`]' row.
     fn read(&self, sys: &dyn System) -> (Probe, Option<Unfinished>) {
         let found = (self.found)(sys);
         *self
@@ -1081,7 +1323,10 @@ impl CommandLineTools {
             RootPlan::StepsOnly
         };
         let (from, unready) = match found {
-            Found::Present(now) => return self.read_root_steps(sys, now),
+            Found::Present(now) => {
+                let found = now.clone();
+                return self.read_owed(sys, (Probe::Ok { now }, None), &found);
+            }
             Found::Refuses(why) => (why, Some(Unfinished::Refuses)),
             Found::Unknown(why) => (why, Some(Unfinished::Unread)),
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
@@ -1091,16 +1336,12 @@ impl CommandLineTools {
             return (probe, Some(unfinished));
         }
         if let Some(unfinished) = unready {
-            let independent = self.read_root_steps(sys, from.clone());
-            if matches!(&independent.0, Probe::Change { .. }) {
-                return independent;
-            }
-            let probe = if unfinished == Unfinished::Refuses {
-                Probe::Blocked { why: from }
+            let verdict = if unfinished == Unfinished::Refuses {
+                Probe::Blocked { why: from.clone() }
             } else {
-                Probe::Unusable { why: from }
+                Probe::Unusable { why: from.clone() }
             };
-            return (probe, Some(unfinished));
+            return self.read_owed(sys, (verdict, Some(unfinished)), &from);
         }
         if let Some(held) = self.held_back(sys, &from, true) {
             return held;
@@ -1150,46 +1391,59 @@ impl CommandLineTools {
         }
     }
 
-    /// Independent root work. An `Ok` here does not establish compiler health; callers
-    /// with a refusing or unread compiler must retain that separate result.
-    fn read_root_steps(&self, sys: &dyn System, now: String) -> (Probe, Option<Unfinished>) {
+    /// [`Self::read`] where a compiler is there (`found`, what the probe read of it), whose own
+    /// reading is `verdict`: the change for the elevation's other root steps where any is owed
+    /// and this run may ask for the password now, else `verdict`. In the tab a run that may not
+    /// ask says why ([`Self::held_back`]), as it would for the tools (Low Data Mode and an
+    /// install under way aside, which hold only a download); outside it the row says the tools'
+    /// verdict alone, and [`RootSteps`]' row names what is left and who does it, so a step owed
+    /// never reads in place. Once this run's root half ran, its read-back is `verdict`.
+    fn read_owed(
+        &self,
+        sys: &dyn System,
+        verdict: (Probe, Option<Unfinished>),
+        found: &str,
+    ) -> (Probe, Option<Unfinished>) {
         if self.asked.load(std::sync::atomic::Ordering::Relaxed) {
-            return (Probe::Ok { now }, None);
+            return verdict;
         }
         let owed = self.owed_now(sys);
-        if owed.is_empty() || self.asked.load(std::sync::atomic::Ordering::Relaxed) {
-            return (Probe::Ok { now }, None);
+        if owed.is_empty() {
+            return verdict;
         }
+        let plan = self.independent_plan(&owed).expect("nonempty root work");
         *self
             .root_plan
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            self.independent_plan(&owed).expect("nonempty root work");
-        let steps = owed
-            .iter()
-            .map(|step| step.plain())
-            .collect::<Vec<_>>()
-            .join("; ");
-        let from = format!("{now}; still owed: {steps}");
+            .unwrap_or_else(PoisonError::into_inner) = plan;
+        let from = format!("{found}; still owed: {}", plain_steps(&owed));
+        // The flag the root half will run with, as `command_for` spells it for `plan`.
+        let only = if plan == RootPlan::NameRuleOnly {
+            "--name-rule-only"
+        } else {
+            "--root-steps-only"
+        };
         match self.held_back(sys, &from, false) {
             Some(held) if self.tab.is_some() => held,
-            Some(_) => (
-                Probe::Ok {
-                    now: format!("{now}; left for setup's one Mac password: {steps}"),
-                },
-                None,
-            ),
+            Some(_) => verdict,
             None => (
                 Probe::Change {
                     from,
                     to: format!(
-                        "done as root by `{} machines here apply --plain --root-steps-only` (one password prompt)",
+                        "done as root by `{} machines here apply --plain {only}` (one password prompt)",
                         Cmd::new(SUDO).arg(self.aterm.as_os_str()).display()
                     ),
                 },
                 None,
             ),
         }
+    }
+
+    /// The read-only row of what the elevation still owes this Mac beside the tools
+    /// ([`RootSteps`]), reading what this item reads.
+    #[must_use]
+    pub fn steps(&self) -> RootSteps<'_> {
+        RootSteps(self)
     }
 
     /// Why this run may not ask for the password now, as the probe reads it (`from`, what it
@@ -1315,10 +1569,10 @@ impl CommandLineTools {
         let mut skipped = false;
         let mut plan_failure = None;
         let stops = sys.catch_stops();
-        let ran = sys.run_tty(&self.command_for(plan), &mut |command| {
+        let ran = sys.run_tty(&self.root_command(sys, plan), &mut |command| {
             let fresh = self.plan_after(sys, plan);
             if let Ok(Some(plan)) = &fresh {
-                *command = self.command_for(*plan);
+                *command = self.root_command(sys, *plan);
             }
             let admission = fresh
                 .as_ref()
@@ -1374,2330 +1628,5 @@ impl CommandLineTools {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::bind;
-    use crate::items::defaults::tests::ctx;
-    use crate::model::{Mode, Outcome};
-    use crate::port::{Fake, Ran, Stat};
-    use aterm_converge::{Class, Layer, NoJournal, Scope};
-    use std::path::Path;
-
-    const ATERM: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
-
-    const CC: &str = "/Library/Developer/CommandLineTools/usr/bin/cc";
-
-    /// The person's own run at this Mac's console (alice, 501), with a terminal to ask in.
-    fn console() -> Fake {
-        let sys = unread_console();
-        sys.running(&[]);
-        sys
-    }
-
-    fn unread_console() -> Fake {
-        let mut sys = Fake::root();
-        sys.euid = 501;
-        sys.tty = true;
-        sys.stat_of(
-            "/dev/console",
-            Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: 0,
-            },
-        );
-        sys
-    }
-
-    /// The item over a probe that finds the tools only once [`CC`] is there, its line before
-    /// `sudo` said to nobody (a test that reads it says it through [`CommandLineTools::saying`]).
-    fn item(found: Found) -> CommandLineTools {
-        CommandLineTools::new(
-            Box::new(move |sys: &dyn System| {
-                if sys.read_file(std::path::Path::new(CC)).is_ok() {
-                    Found::Present(CC.into())
-                } else {
-                    found.clone()
-                }
-            }),
-            PathBuf::from(ATERM),
-        )
-        .saying(Arc::new(|_: &str| {}))
-    }
-
-    /// The root half's argv on the terminal, in the tab and outside it alike.
-    fn argv() -> String {
-        format!("tty /usr/bin/sudo -k -p 'Mac password: ' {ATERM} machines here apply --plain")
-    }
-
-    fn missing() -> CommandLineTools {
-        item(Found::Missing("no developer directory".into()))
-    }
-
-    fn run(sys: &Fake, item: &CommandLineTools, mode: Mode) -> aterm_converge::ItemReport {
-        let ctx = ctx(&[]);
-        let bound = bind([(item as &dyn Item, place())], sys, &ctx);
-        let mut rows =
-            aterm_converge::run_scoped(&bound, mode, Scope::EVERY, &mut NoJournal, &mut |_| {})
-                .unwrap();
-        rows.remove(0)
-    }
-
-    fn asked(sys: &Fake) -> Vec<String> {
-        sys.calls()
-            .into_iter()
-            .filter(|call| call.starts_with("tty "))
-            .collect()
-    }
-
-    /// The tools missing, a person's own run at the console plans the root half `--plain`, and
-    /// its apply runs it on the terminal: one password prompt, and no baseline file written for
-    /// root to read (the root half applies its own).
-    #[test]
-    fn missing_tools_plan_the_machines_here_argv_and_apply_runs_it_on_the_terminal() {
-        let sys = console();
-        let item = missing();
-
-        let row = run(&sys, &item, Mode::Plan);
-        assert_eq!(row.outcome, Outcome::Planned, "{row:?}");
-        assert_eq!(row.layer, Some(Layer::Base));
-        assert_eq!(row.class, Some(Class::Elevate));
-        assert!(
-            asked(&sys).is_empty(),
-            "a plan runs nothing: {:?}",
-            sys.calls()
-        );
-
-        let argv = argv();
-        sys.on(&argv, Ran::ok(""))
-            .on_write(&argv, std::path::Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        let calls = sys.calls();
-        assert_eq!(asked(&sys), [argv], "one password prompt: {calls:?}");
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.starts_with("write ") || call.starts_with("scratch")),
-            "nothing written for the root half to read: {calls:?}"
-        );
-        let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
-        assert_eq!(
-            parsed.developer.and_then(|table| table.command_line_tools),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn an_installation_plan_is_narrowed_when_tools_change_before_apply() {
-        for (later, owed, suffix, failed) in [
-            (
-                Found::Missing("still missing".into()),
-                false,
-                Some(""),
-                false,
-            ),
-            (Found::Present("Xcode works".into()), false, None, false),
-            (
-                Found::Present("Xcode works".into()),
-                true,
-                Some(" --root-steps-only"),
-                false,
-            ),
-            (Found::Refuses("compiler refuses".into()), false, None, true),
-            (Found::Unknown("compiler unread".into()), false, None, true),
-            (Found::NotHere("not applicable".into()), false, None, false),
-            (
-                Found::Refuses("compiler refuses".into()),
-                true,
-                Some(" --root-steps-only"),
-                false,
-            ),
-            (
-                Found::Unknown("compiler unread".into()),
-                true,
-                Some(" --root-steps-only"),
-                false,
-            ),
-        ] {
-            let state = Arc::new(Mutex::new(Found::Missing("missing at plan".into())));
-            let reader = state.clone();
-            let item = CommandLineTools::new(
-                Box::new(move |_| reader.lock().unwrap().clone()),
-                ATERM.into(),
-            )
-            .with_owed(Box::new(move |_| {
-                if owed {
-                    vec![crate::root_steps::Owed::Debugger]
-                } else {
-                    Vec::new()
-                }
-            }))
-            .saying(Arc::new(|_| {}));
-            let sys = console();
-            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-            *state.lock().unwrap() = later;
-            let expected: Vec<String> = suffix
-                .map(|suffix| format!("{}{suffix}", argv()))
-                .into_iter()
-                .collect();
-            for command in &expected {
-                sys.on(command, Ran::ok(""));
-            }
-            let result = item.apply(&sys, &ctx(&[]));
-            assert_eq!(result.is_err(), failed, "{result:?}");
-            assert_eq!(asked(&sys), expected);
-        }
-        // Losing tools after an independent plan cannot admit installation.
-        let state = Arc::new(Mutex::new(Found::Present("Xcode works".into())));
-        let reader = state.clone();
-        let item = CommandLineTools::new(
-            Box::new(move |_| reader.lock().unwrap().clone()),
-            ATERM.into(),
-        )
-        .with_owed(Box::new(|_| vec![crate::root_steps::Owed::Debugger]))
-        .saying(Arc::new(|_| {}));
-        let sys = console();
-        assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-        *state.lock().unwrap() = Found::Missing("lost before apply".into());
-        let root = format!("{} --root-steps-only", argv());
-        sys.on(&root, Ran::ok(""));
-        assert!(item.apply(&sys, &ctx(&[])).is_ok());
-        assert_eq!(asked(&sys), [root]);
-
-        // Another setup question can own stdin after apply has captured its plan. Change
-        // the world only after that capture, while holding the real shared terminal lease.
-        for tabbed in [false, true] {
-            for (later, owed, suffix, failed) in [
-                (
-                    Found::Present("Xcode arrived while queued".into()),
-                    true,
-                    Some(" --root-steps-only"),
-                    false,
-                ),
-                (Found::Present("already done".into()), false, None, false),
-                (
-                    Found::Missing("still missing".into()),
-                    false,
-                    Some(""),
-                    false,
-                ),
-                (
-                    Found::Refuses("compiler now refuses".into()),
-                    true,
-                    Some(" --root-steps-only"),
-                    false,
-                ),
-                (
-                    Found::Refuses("compiler now refuses".into()),
-                    false,
-                    None,
-                    true,
-                ),
-                (
-                    Found::Unknown("compiler now unread".into()),
-                    true,
-                    Some(" --root-steps-only"),
-                    false,
-                ),
-                (
-                    Found::Unknown("compiler now unread".into()),
-                    false,
-                    None,
-                    true,
-                ),
-                (
-                    Found::NotHere("no longer applicable".into()),
-                    false,
-                    None,
-                    false,
-                ),
-            ] {
-                let state = Arc::new(Mutex::new(Found::Missing("initially missing".into())));
-                let reader = state.clone();
-                let (captured, ready) = std::sync::mpsc::sync_channel(1);
-                let reads = std::sync::atomic::AtomicUsize::new(0);
-                let said = Arc::new(Mutex::new(String::new()));
-                let sink = said.clone();
-                let mut item = CommandLineTools::new(
-                    Box::new(move |_| {
-                        let found = reader.lock().unwrap().clone();
-                        if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                            captured.send(()).unwrap();
-                        }
-                        found
-                    }),
-                    ATERM.into(),
-                )
-                .with_owed(Box::new(move |_| {
-                    if owed {
-                        vec![crate::root_steps::Owed::Debugger]
-                    } else {
-                        Vec::new()
-                    }
-                }))
-                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
-                    crate::init::Holds::NONE
-                }))
-                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
-                let tab = Tab::new({
-                    let said = said.clone();
-                    Arc::new(move |text| said.lock().unwrap().push_str(text))
-                });
-                if tabbed {
-                    item = item.in_tab(tab.clone());
-                }
-                let sys = console();
-                sys.on(&argv(), Ran::ok(""));
-                sys.on(&format!("{} --root-steps-only", argv()), Ran::ok(""));
-                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-                let result = std::thread::scope(|scope| {
-                    let worker = crate::port::owning_terminal(|| {
-                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
-                        ready
-                            .recv_timeout(std::time::Duration::from_secs(60))
-                            .expect("apply captured its pre-terminal plan");
-                        assert!(asked(&sys).is_empty());
-                        assert!(said.lock().unwrap().is_empty());
-                        assert!(!marked(&sys));
-                        *state.lock().unwrap() = later;
-                        worker
-                    });
-                    worker.join().expect("the queued apply joins")
-                });
-                let expected: Vec<_> = suffix
-                    .map(|suffix| format!("{}{suffix}", argv()))
-                    .into_iter()
-                    .collect();
-                assert_eq!(asked(&sys), expected, "tabbed={tabbed}, {result:?}");
-                assert_eq!(result.is_err(), failed, "tabbed={tabbed}, {result:?}");
-                assert_eq!(marked(&sys), !tabbed && suffix.is_some());
-                assert_eq!(
-                    tab.entered.load(std::sync::atomic::Ordering::Relaxed),
-                    tabbed && suffix.is_some()
-                );
-                if suffix.is_none() {
-                    assert!(said.lock().unwrap().is_empty() || failed && tabbed);
-                }
-            }
-        }
-
-        // Admission can change while another question owns the real terminal lease too.
-        // Capture the old plan before changing console ownership or installer custody.
-        for tabbed in [false, true] {
-            for (console_uid, installer, tools_arrive, code, withdraw_root) in [
-                (Some(0), None, false, 7, false),
-                (Some(502), None, false, 7, false),
-                (None, Some("/usr/sbin/softwareupdate"), false, 8, false),
-                (
-                    None,
-                    Some(
-                        "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
-                    ),
-                    false,
-                    8,
-                    false,
-                ),
-                // A narrow plan owes only independent steps, which a tools installer cannot hold.
-                (None, Some("/usr/sbin/softwareupdate"), true, 0, false),
-                // A constrained download can enter for definite independent work, but
-                // loses that exception if the work completes while the terminal is held.
-                (None, None, false, 3, true),
-            ] {
-                let state = Arc::new(Mutex::new(Found::Missing("initially missing".into())));
-                let reader = state.clone();
-                let (captured, ready) = std::sync::mpsc::sync_channel(1);
-                let reads = std::sync::atomic::AtomicUsize::new(0);
-                let said = Arc::new(Mutex::new(String::new()));
-                let sink = said.clone();
-                let owed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                let owe = owed.clone();
-                let mut item = CommandLineTools::new(
-                    Box::new(move |_| {
-                        let found = reader.lock().unwrap().clone();
-                        if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                            captured.send(()).unwrap();
-                        }
-                        found
-                    }),
-                    ATERM.into(),
-                )
-                .with_owed(Box::new(move |_| {
-                    if owe.load(std::sync::atomic::Ordering::SeqCst) {
-                        vec![crate::root_steps::Owed::Debugger]
-                    } else {
-                        Vec::new()
-                    }
-                }))
-                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
-                    crate::init::Holds::NONE
-                }))
-                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
-                let tab = Tab::new({
-                    let said = said.clone();
-                    Arc::new(move |text| said.lock().unwrap().push_str(text))
-                });
-                if tabbed {
-                    item = item.in_tab(tab.clone());
-                }
-                let mut sys = console();
-                if withdraw_root {
-                    sys.low_data = Some(true);
-                }
-                sys.on(&argv(), Ran::ok(""));
-                let root = format!("{} --root-steps-only", argv());
-                sys.on(&root, Ran::ok(""));
-                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-                let result = std::thread::scope(|scope| {
-                    let worker = crate::port::owning_terminal(|| {
-                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
-                        ready
-                            .recv_timeout(std::time::Duration::from_secs(60))
-                            .expect("apply captured its plan before the terminal lease");
-                        assert!(asked(&sys).is_empty());
-                        assert!(!marked(&sys));
-                        assert!(said.lock().unwrap().is_empty());
-                        if let Some(uid) = console_uid {
-                            sys.stat_of(
-                                "/dev/console",
-                                Stat {
-                                    uid,
-                                    gid: 20,
-                                    mode: 0o600,
-                                    dir: false,
-                                    symlink: false,
-                                    len: 0,
-                                },
-                            );
-                        }
-                        if let Some(installer) = installer {
-                            sys.file(crate::items::developer::PLACEHOLDER, b"")
-                                .running(&["/sbin/launchd", installer]);
-                        }
-                        if tools_arrive {
-                            *state.lock().unwrap() = Found::Present("tools arrived".into());
-                        }
-                        if withdraw_root {
-                            owed.store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        worker
-                    });
-                    worker.join().expect("the queued apply joins")
-                });
-                if code == 0 {
-                    assert!(result.is_ok(), "{result:?}");
-                    assert_eq!(asked(&sys), [root]);
-                } else {
-                    assert!(result.is_err(), "{tabbed}: admission changed: {result:?}");
-                    assert!(asked(&sys).is_empty(), "{tabbed}: {:?}", asked(&sys));
-                    assert!(!marked(&sys));
-                    assert!(!tab.entered.load(std::sync::atomic::Ordering::Relaxed));
-                    assert!(said.lock().unwrap().is_empty());
-                    if tabbed {
-                        assert_eq!(tab.exit(tab.unfinished().unwrap()), code);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn independent_work_completed_before_apply_spends_no_password_episode() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        for found in [
-            Found::Present("healthy".into()),
-            Found::Refuses("broken".into()),
-            Found::Unknown("unread".into()),
-        ] {
-            let owed = Arc::new(AtomicBool::new(true));
-            let reader = owed.clone();
-            let said = Arc::new(Mutex::new(String::new()));
-            let sink = said.clone();
-            let item = item(found)
-                .with_owed(Box::new(move |_| {
-                    if reader.load(Ordering::Relaxed) {
-                        vec![crate::root_steps::Owed::Debugger]
-                    } else {
-                        Vec::new()
-                    }
-                }))
-                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
-                    crate::init::Holds::NONE
-                }))
-                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
-            let sys = console();
-            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-            owed.store(false, Ordering::Relaxed);
-            assert!(item.apply(&sys, &ctx(&[])).is_ok());
-            assert!(asked(&sys).is_empty());
-            assert!(said.lock().unwrap().is_empty());
-            assert!(!marked(&sys));
-            // Skipping obsolete work leaves the one episode available for genuinely owed work.
-            owed.store(true, Ordering::Relaxed);
-            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-            let root = format!("{} --root-steps-only", argv());
-            sys.on(&root, Ran::ok(""));
-            assert!(item.apply(&sys, &ctx(&[])).is_ok());
-            assert_eq!(asked(&sys), [root]);
-            assert!(marked(&sys));
-        }
-
-        for tabbed in [false, true] {
-            for still_owed in [false, true] {
-                let owed = Arc::new(AtomicBool::new(true));
-                let owing = owed.clone();
-                let found = Arc::new(Mutex::new(Found::Present("healthy at plan".into())));
-                let reader = found.clone();
-                let (captured, ready) = std::sync::mpsc::sync_channel(1);
-                let reads = std::sync::atomic::AtomicUsize::new(0);
-                let said = Arc::new(Mutex::new(String::new()));
-                let sink = said.clone();
-                let mut item = CommandLineTools::new(
-                    Box::new(move |_| reader.lock().unwrap().clone()),
-                    ATERM.into(),
-                )
-                .with_owed(Box::new(move |_| {
-                    let pending = owing.load(Ordering::SeqCst);
-                    if reads.fetch_add(1, Ordering::SeqCst) == 1 {
-                        captured.send(()).unwrap();
-                    }
-                    if pending {
-                        vec![crate::root_steps::Owed::Debugger]
-                    } else {
-                        Vec::new()
-                    }
-                }))
-                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
-                    crate::init::Holds::NONE
-                }))
-                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
-                let tab = Tab::new({
-                    let said = said.clone();
-                    Arc::new(move |text| said.lock().unwrap().push_str(text))
-                });
-                if tabbed {
-                    item = item.in_tab(tab.clone());
-                }
-                let sys = console();
-                let root = format!("{} --root-steps-only", argv());
-                sys.on(&root, Ran::ok(""));
-                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-                let result = std::thread::scope(|scope| {
-                    let worker = crate::port::owning_terminal(|| {
-                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
-                        ready
-                            .recv_timeout(std::time::Duration::from_secs(60))
-                            .expect("apply captured its independent work");
-                        assert!(asked(&sys).is_empty());
-                        assert!(said.lock().unwrap().is_empty());
-                        assert!(!marked(&sys));
-                        owed.store(still_owed, Ordering::SeqCst);
-                        if still_owed {
-                            *found.lock().unwrap() = Found::Missing("lost while queued".into());
-                            // A concurrent probe can plan a new full installation. It cannot
-                            // expand the independent command already waiting on this lease.
-                            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-                            assert_eq!(item.root_plan(), RootPlan::WithTools);
-                        }
-                        worker
-                    });
-                    worker.join().expect("the queued independent apply joins")
-                });
-                assert!(result.is_ok(), "tabbed={tabbed}, {result:?}");
-                let expected: Vec<_> = still_owed.then_some(root).into_iter().collect();
-                assert_eq!(asked(&sys), expected);
-                assert_eq!(marked(&sys), !tabbed && still_owed);
-                assert_eq!(tab.entered.load(Ordering::Relaxed), tabbed && still_owed);
-                assert_eq!(said.lock().unwrap().is_empty(), !still_owed);
-            }
-        }
-    }
-
-    #[test]
-    fn completed_root_work_needs_no_terminal() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        for tabbed in [false, true] {
-            let pending = Arc::new(AtomicBool::new(true));
-            let reader = pending.clone();
-            let mut item = item(Found::Present("healthy".into())).with_owed(Box::new(move |_| {
-                if reader.load(Ordering::Relaxed) {
-                    vec![crate::root_steps::Owed::Debugger]
-                } else {
-                    Vec::new()
-                }
-            }));
-            let tab = Tab::new(Arc::new(|_| {}));
-            if tabbed {
-                item = item.in_tab(tab.clone());
-            }
-            let mut sys = console();
-            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
-            pending.store(false, Ordering::Relaxed);
-            sys.tty = false;
-            assert!(item.apply(&sys, &ctx(&[])).is_ok());
-            assert!(asked(&sys).is_empty());
-            assert_eq!(tab.unfinished(), None);
-            pending.store(true, Ordering::Relaxed);
-            assert!(item.apply(&sys, &ctx(&[])).is_err());
-            assert!(asked(&sys).is_empty());
-        }
-    }
-
-    #[test]
-    fn independent_root_work_preserves_a_refusing_or_unread_compiler() {
-        use crate::root_steps::Owed;
-        for found in [
-            Found::Refuses("broken compiler".into()),
-            Found::Unknown("unread compiler".into()),
-        ] {
-            let mut away = console();
-            away.tty = false;
-            let held = item(found.clone()).with_owed(Box::new(|_| vec![Owed::Debugger]));
-            assert!(!matches!(held.read(&away).0, Probe::Change { .. }));
-            let _ = run(&away, &held, Mode::Apply);
-            assert!(asked(&away).is_empty());
-            let settled = item(found.clone());
-            assert!(!matches!(settled.read(&console()).0, Probe::Change { .. }));
-            let sys = console();
-            let item = item(found.clone()).with_owed(Box::new(|_| {
-                vec![Owed::Debugger, Owed::NameRule, Owed::LanBroker]
-            }));
-            let root = format!("{} --root-steps-only", argv());
-            let marker = Path::new("/independent-root-step");
-            sys.on(&root, Ran::ok("")).on_write(&root, marker, b"done");
-            assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-            // A successful independent root command is not a compiler repair.
-            let _ = run(&sys, &item, Mode::Apply);
-            assert_eq!(asked(&sys), std::slice::from_ref(&root));
-            assert_eq!(sys.read_file(marker).unwrap(), b"done");
-            assert!(sys.read_file(Path::new(CC)).is_err());
-            let expected = match found {
-                Found::Refuses(_) => matches!(item.read(&sys).0, Probe::Blocked { .. }),
-                Found::Unknown(_) => matches!(item.read(&sys).0, Probe::Unusable { .. }),
-                _ => unreachable!(),
-            };
-            assert!(expected);
-            let _ = run(&sys, &item, Mode::Apply);
-            assert_eq!(
-                asked(&sys),
-                [root],
-                "independent work consumes only one root episode"
-            );
-        }
-        let parsed =
-            crate::baseline::parse(&CommandLineTools::baseline_named(RootPlan::StepsOnly, None))
-                .unwrap();
-        let developer = parsed.developer.unwrap();
-        assert_eq!(developer.command_line_tools, Some(false));
-        assert_eq!(developer.debugger, Some(true));
-        assert_eq!(parsed.names.unwrap().admitted_name_rule, Some(true));
-        assert_eq!(parsed.lan.unwrap().broker, Some(true));
-    }
-
-    /// On a Mac that has the tools, the elevation still runs where its other root steps are
-    /// owed: a person's run at the console asks for the one password, saying the setup's own
-    /// line, and its read-back reads the tools in place whatever the root half left owed; the
-    /// root half's baseline turns on developer mode and puts the naming rule in place. A refused
-    /// password there is no success. NEGATIVE CONTROLS: with nothing owed nothing is asked, and a
-    /// run outside the tab that may not ask (no terminal) reads in place, naming what is left,
-    /// and asks nothing.
-    #[test]
-    fn a_mac_with_the_tools_still_gets_the_one_password_for_what_is_owed() {
-        use crate::root_steps::Owed;
-        let present = || item(Found::Present("installed".into()));
-        let owed_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owing = |item: CommandLineTools| {
-            let owed_reads = Arc::clone(&owed_reads);
-            item.with_owed(Box::new(move |_: &dyn System| {
-                owed_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                vec![Owed::Debugger, Owed::NameRule]
-            }))
-        };
-        let said = Arc::new(Mutex::new(String::new()));
-        let sink = said.clone();
-        let item = owing(present()).saying(Arc::new(move |text: &str| {
-            sink.lock().unwrap().push_str(text);
-        }));
-        let sys = console();
-        assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-        let root = format!("{} --root-steps-only", argv());
-        sys.on(&root, Ran::ok(""));
-        let reads_at_start = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
-        sys.tty_model({
-            let owed_reads = Arc::clone(&owed_reads);
-            let reads_at_start = Arc::clone(&reads_at_start);
-            move |_, _| {
-                reads_at_start.store(
-                    owed_reads.load(std::sync::atomic::Ordering::Relaxed),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                None
-            }
-        });
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        assert_eq!(
-            owed_reads.load(std::sync::atomic::Ordering::Relaxed),
-            reads_at_start.load(std::sync::atomic::Ordering::Relaxed),
-            "read-back does not re-probe root work after its command starts"
-        );
-        assert_eq!(
-            asked(&sys),
-            std::slice::from_ref(&root),
-            "one password prompt: {:?}",
-            sys.calls()
-        );
-        assert_eq!(*said.lock().unwrap(), format!("{INTRO_SETUP}\n"));
-        let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
-        assert_eq!(parsed.developer.and_then(|t| t.debugger), Some(true));
-        assert_eq!(parsed.names.and_then(|t| t.admitted_name_rule), Some(true));
-        assert_eq!(parsed.lan.and_then(|t| t.broker), Some(true));
-
-        let refused = console();
-        refused.on(&root, Ran::exit(1, "Sorry, try again."));
-        let row = run(&refused, &owing(present()), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-
-        let settled = console();
-        let row = run(&settled, &present(), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
-        assert!(asked(&settled).is_empty(), "{:?}", settled.calls());
-
-        let mut away = console();
-        away.tty = false;
-        let row = run(&away, &owing(present()), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
-        assert!(
-            format!("{row:?}").contains("left for setup's one Mac password"),
-            "{row:?}"
-        );
-        assert!(asked(&away).is_empty(), "{:?}", away.calls());
-
-        // A person's retry repairs the actual compiled permission, even when an old
-        // safe file made the automatic, metadata-only root inventory read current.
-        // The LAN image and plist are current, so no unrelated root work is owed.
-        let ready = |rule: &str| {
-            use aterm_uds::lan::{self, install};
-            let mut sys = console();
-            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
-            sys.on(
-                "/usr/sbin/DevToolsSecurity -status",
-                Ran::ok("Developer mode is currently enabled.\n"),
-            );
-            let source = Path::new("/Applications/aterm.app");
-            sys.running_app = Some(source.to_owned());
-            let image = install::test_image(0x0100_000c, &[b"same current code"]);
-            sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
-                .file(lan::IMAGE_EXECUTABLE, &image)
-                .file(lan::PLIST_PATH, install::plist_text(source).as_bytes());
-            assert!(crate::items::lan::reading(&sys).unwrap().unwrap().current());
-            let wanted = crate::root_steps::name_rule("alice").unwrap();
-            if rule != "missing" {
-                if rule != "opaque" {
-                    sys.file(
-                        crate::root_steps::ADMITTED_NAME_RULE,
-                        if rule == "current" {
-                            wanted.as_bytes()
-                        } else {
-                            b"old bare-mN rule"
-                        },
-                    );
-                }
-                sys.stat_of(
-                    crate::root_steps::ADMITTED_NAME_RULE,
-                    Stat {
-                        uid: 0,
-                        gid: 0,
-                        mode: 0o440,
-                        dir: false,
-                        symlink: false,
-                        len: wanted.len() as u64,
-                    },
-                );
-            }
-            sys
-        };
-        let composed = |decider: crate::init::Decider| {
-            decider
-                .compose(
-                    crate::init::Base {
-                        clt: Some(present().with_owed(Box::new(crate::root_steps::owed_here))),
-                        ..crate::init::Base::none()
-                    },
-                    || {
-                        Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
-                            crate::init::Holds::NONE
-                        })
-                    },
-                )
-                .clt
-                .unwrap()
-        };
-        let permission = format!("{} --name-rule-only", argv());
-        for rule in ["old", "opaque", "missing"] {
-            let sys = ready(rule);
-            let ordinary = crate::root_steps::owed_here(&sys);
-            assert_eq!(
-                ordinary,
-                if rule == "missing" {
-                    vec![Owed::NameRule]
-                } else {
-                    Vec::new()
-                }
-            );
-            assert!(!matches!(
-                crate::root_steps::name_rule_current(&sys),
-                Ok(true)
-            ));
-            aterm_types::clt_mark::explicit(&sys, Path::new(MARK), BUILD).unwrap();
-            let item = composed(crate::init::Decider::Person);
-            assert_eq!(
-                run(&sys, &item, Mode::Plan).outcome,
-                Outcome::Planned,
-                "explicit permission repair: {rule}"
-            );
-            assert_eq!(item.root_plan(), RootPlan::NameRuleOnly);
-            sys.on(&permission, Ran::ok(""));
-            assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
-            assert_eq!(asked(&sys), std::slice::from_ref(&permission));
-            assert!(
-                marked(&sys),
-                "an explicit repair consumes the same durable episode"
-            );
-            let row = run(&sys, &composed(crate::init::Decider::Aterm), Mode::Apply);
-            assert!(matches!(row.outcome, Outcome::Ok | Outcome::Deferred));
-            assert_eq!(
-                asked(&sys),
-                std::slice::from_ref(&permission),
-                "a later automatic pass never repeats the password"
-            );
-        }
-        let current = ready("current");
-        assert_eq!(crate::root_steps::name_rule_current(&current), Ok(true));
-        assert_eq!(
-            run(
-                &current,
-                &composed(crate::init::Decider::Person),
-                Mode::Apply
-            )
-            .outcome,
-            Outcome::Ok
-        );
-        assert!(asked(&current).is_empty());
-
-        let completed = ready("old");
-        let item = composed(crate::init::Decider::Person);
-        assert_eq!(run(&completed, &item, Mode::Plan).outcome, Outcome::Planned);
-        completed.file(
-            crate::root_steps::ADMITTED_NAME_RULE,
-            crate::root_steps::name_rule("alice").unwrap().as_bytes(),
-        );
-        assert!(item.apply(&completed, &ctx(&[])).is_ok());
-        assert!(
-            asked(&completed).is_empty(),
-            "fresh currency retires a queued repair"
-        );
-
-        for stopped in [false, true] {
-            let mut sys = ready("old");
-            if stopped {
-                sys.stop_now();
-            } else {
-                sys.admin = Some(false);
-            }
-            let _ = run(&sys, &composed(crate::init::Decider::Person), Mode::Apply);
-            assert!(
-                asked(&sys).is_empty(),
-                "permission debt bypassed live admission"
-            );
-        }
-    }
-
-    /// A swarm label known when the root half runs rides the same prompt: the one argv gains
-    /// `--name` and optional typed `--nickname`; the root baseline derives all three slots
-    /// from those values. No target leaves the argv and baseline unnamed.
-    #[test]
-    fn a_known_swarm_label_rides_the_one_password_prompt() {
-        use aterm_types::machine_name::{GeneratedNames, Nickname, Number};
-        let target = GeneratedNames::number_only(Number::parse("m42").unwrap());
-        let sys = console();
-        let item = missing().with_name(Box::new(|| {
-            Some(GeneratedNames::number_only(Number::parse("m42").unwrap()))
-        }));
-        let named = format!("{} --name m42", argv());
-        sys.on(&named, Ran::ok(""))
-            .on_write(&named, std::path::Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        assert_eq!(
-            asked(&sys),
-            [named],
-            "one password prompt: {:?}",
-            sys.calls()
-        );
-        let parsed = crate::baseline::parse(&CommandLineTools::baseline_named(
-            RootPlan::WithTools,
-            Some(&target),
-        ))
-        .unwrap();
-        let names = parsed.names.expect("a [names] table");
-        assert_eq!(names.computer_name.as_deref(), Some("m42"));
-        assert_eq!(names.local_host_name.as_deref(), Some("m42"));
-        assert_eq!(names.host_name.as_deref(), Some("m42"));
-        assert_eq!(names.admitted_name_rule, Some(true));
-
-        let target = GeneratedNames::new(
-            Number::parse("m85").unwrap(),
-            &Nickname::parse("Dog").unwrap(),
-        );
-        let sys = console();
-        let owned = target.clone();
-        let item = missing().with_name(Box::new(move || Some(owned.clone())));
-        let named = format!("{} --name m85 --nickname Dog", argv());
-        sys.on(&named, Ran::ok(""))
-            .on_write(&named, std::path::Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        assert_eq!(asked(&sys), [named]);
-        let parsed = crate::baseline::parse(&CommandLineTools::baseline_named(
-            RootPlan::WithTools,
-            Some(&target),
-        ))
-        .unwrap();
-        let names = parsed.names.unwrap();
-        assert_eq!(names.computer_name.as_deref(), Some("m85 Dog"));
-        assert_eq!(names.local_host_name.as_deref(), Some("m85-dog"));
-        assert_eq!(names.host_name.as_deref(), Some("m85-dog"));
-        let sys = console();
-        let item = missing().with_name(Box::new(|| None));
-        sys.on(&argv(), Ran::ok(""))
-            .on_write(&argv(), std::path::Path::new(CC), b"");
-        run(&sys, &item, Mode::Apply);
-        assert_eq!(asked(&sys), [argv()]);
-
-        let permission = crate::baseline::parse(&CommandLineTools::baseline_named(
-            RootPlan::NameRuleOnly,
-            Some(&target),
-        ))
-        .unwrap();
-        assert!(permission.developer.is_none() && permission.lan.is_none());
-        let names = permission.names.unwrap();
-        assert_eq!(names.admitted_name_rule, Some(true));
-        assert!(
-            names.computer_name.is_none()
-                && names.local_host_name.is_none()
-                && names.host_name.is_none()
-        );
-        let item = CommandLineTools::new(
-            Box::new(|_| panic!("permission repair reads no developer-tool state")),
-            PathBuf::from(ATERM),
-        )
-        .with_name(Box::new(|| {
-            panic!("permission repair reads no saved target")
-        }));
-        *item.root_plan.lock().unwrap() = RootPlan::NameRuleOnly;
-        let fixed = format!("{} --name-rule-only", argv());
-        let sys = console();
-        sys.on(&fixed, Ran::ok(""));
-        let out = Tab::new(Arc::new(|_| {}));
-        assert!(item.apply_in_tab(&sys, &out).is_ok());
-        assert_eq!(asked(&sys), std::slice::from_ref(&fixed));
-        // CLT already present cannot forgive this endpoint's own failed result.
-        let failed = console();
-        failed.on(&fixed, Ran::exit(87, "permission failed"));
-        assert!(item.apply_in_tab(&failed, &out).is_err());
-        assert_eq!(asked(&failed), [fixed]);
-    }
-
-    /// A run outside the tab says its one line right before `sudo` asks, whatever ran on the
-    /// terminal before it, and asks with the plain prompt under `sudo -k` (design §6.3): a
-    /// password cached for an earlier `sudo` never authorizes the root half, and none is kept
-    /// once it ends, so no `sudo -K` follows it, whether the install finished or not.
-    #[test]
-    fn a_run_outside_the_tab_says_why_right_before_sudo_asks_afresh() {
-        let argv = argv();
-        for (ran, outcome) in [
-            (Ran::ok(""), Outcome::Changed),
-            (Ran::exit(82, ""), Outcome::Failed),
-        ] {
-            let sys = Arc::new(console());
-            let said = Arc::new(Mutex::new(Vec::new()));
-            let item = missing().saying({
-                let said = Arc::clone(&said);
-                let sys = Arc::clone(&sys);
-                Arc::new(move |text: &str| {
-                    assert!(
-                        crate::port::terminal_free().is_none(),
-                        "the prelude owns the terminal"
-                    );
-                    said.lock()
-                        .unwrap()
-                        .push((text.to_owned(), sys.calls().len()));
-                })
-            });
-            let installs = ran.success();
-            sys.on(&argv, ran);
-            if installs {
-                sys.on_write(&argv, std::path::Path::new(CC), b"");
-            }
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, outcome, "{row:?}");
-            let calls = sys.calls();
-            let ran = calls
-                .iter()
-                .position(|seen| *seen == argv)
-                .unwrap_or_else(|| panic!("no root half: {calls:?}"));
-            assert_eq!(
-                *said.lock().unwrap(),
-                [(format!("{INTRO}\n"), ran)],
-                "said once under the same terminal lease immediately before sudo: {calls:?}"
-            );
-            let deferred = calls.iter().position(|call| call == "defer stops").unwrap();
-            let restored = calls
-                .iter()
-                .position(|call| call == "stops restored")
-                .unwrap();
-            assert!(deferred < ran && ran < restored, "{calls:?}");
-            assert_eq!(asked(&sys), std::slice::from_ref(&argv), "{calls:?}");
-            assert!(
-                !calls.iter().any(|call| call.contains("sudo -K")),
-                "nothing cached to forget: {calls:?}"
-            );
-        }
-        // A vault question may own the terminal first. The root pass must not print its
-        // prelude, claim its episode or start sudo while that question still owns stdin.
-        for stopped_while_queued in [false, true] {
-            let sys = Arc::new(console());
-            sys.on(&argv, Ran::ok(""));
-            sys.on_write(&argv, std::path::Path::new(CC), b"");
-            let (probed, ready) = std::sync::mpsc::sync_channel(1);
-            let once = std::sync::atomic::AtomicBool::new(false);
-            let said = Arc::new(Mutex::new(String::new()));
-            let question_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let item = CommandLineTools::new(
-                Box::new(move |sys| {
-                    if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        let _ = probed.send(());
-                    }
-                    if sys.read_file(std::path::Path::new(CC)).is_ok() {
-                        Found::Present(CC.into())
-                    } else {
-                        Found::Missing("no developer directory".into())
-                    }
-                }),
-                ATERM.into(),
-            )
-            .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
-                crate::init::Holds::NONE
-            }))
-            .saying({
-                let (said, question_done) = (Arc::clone(&said), Arc::clone(&question_done));
-                Arc::new(move |text| {
-                    assert!(question_done.load(std::sync::atomic::Ordering::SeqCst));
-                    assert!(crate::port::terminal_free().is_none());
-                    said.lock().unwrap().push_str(text);
-                })
-            });
-            let row = std::thread::scope(|scope| {
-                let worker = crate::port::owning_terminal(|| {
-                    let worker = scope.spawn(|| run(&sys, &item, Mode::Apply));
-                    ready
-                        .recv_timeout(std::time::Duration::from_secs(60))
-                        .expect("the root item probes");
-                    assert!(said.lock().unwrap().is_empty());
-                    assert!(asked(&sys).is_empty());
-                    assert!(!marked(&sys));
-                    if stopped_while_queued {
-                        sys.stop_now();
-                    }
-                    question_done.store(true, std::sync::atomic::Ordering::SeqCst);
-                    worker
-                });
-                worker.join().expect("the owned root pass joins")
-            });
-            if stopped_while_queued {
-                assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-                assert!(asked(&sys).is_empty());
-                assert!(said.lock().unwrap().is_empty());
-                assert!(
-                    !marked(&sys),
-                    "no root child or password episode was started"
-                );
-            } else {
-                assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
-                assert_eq!(asked(&sys), std::slice::from_ref(&argv));
-                assert!(marked(&sys));
-                assert_eq!(*said.lock().unwrap(), format!("{INTRO}\n"));
-            }
-        }
-    }
-
-    /// The root half's failure says why in plain words on a person's own run too, never the argv
-    /// it ran.
-    #[test]
-    fn a_person_s_own_run_says_why_in_plain_words_never_the_argv() {
-        let sys = console();
-        sys.on(&argv(), Ran::exit(82, ""));
-        let row = run(&sys, &missing(), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-        assert_eq!(row.why.as_deref(), Some(Unfinished::Download.reason()));
-    }
-
-    /// In Low Data Mode a download alone asks no password; definite independent root work
-    /// can enter the original batch, which retains the download behind its own network gate.
-    #[test]
-    fn low_data_mode_asks_no_password_and_says_how_to_go_on() {
-        let mut sys = console();
-        sys.low_data = Some(true);
-        let item = missing();
-        for mode in [Mode::Plan, Mode::Apply] {
-            let row = run(&sys, &item, mode);
-            assert_eq!(row.outcome, Outcome::Blocked, "{mode:?}: {row:?}");
-            let why = row.why.unwrap_or_default();
-            assert!(
-                why.starts_with("no developer directory; Low Data Mode is on"),
-                "{why}"
-            );
-        }
-        assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-        sys.low_data = Some(false);
-        assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-
-        // An authorized built-in batch does its independent steps before retaining that
-        // same root process while the tools' download waits for an unconstrained path.
-        for step in [
-            crate::root_steps::Owed::Debugger,
-            crate::root_steps::Owed::NameRule,
-            crate::root_steps::Owed::LanBroker,
-        ] {
-            for tabbed in [false, true] {
-                let mut sys = console();
-                sys.low_data = Some(true);
-                let mut item = missing().with_owed(Box::new(move |_| vec![step]));
-                let tab = Tab::new(Arc::new(|_| {}));
-                if tabbed {
-                    item = item.in_tab(tab.clone());
-                }
-                assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-                sys.on(&argv(), Ran::ok(""))
-                    .on_write(&argv(), std::path::Path::new(CC), b"");
-                let row = run(&sys, &item, Mode::Apply);
-                assert_eq!(row.outcome, Outcome::Changed, "{step:?}: {row:?}");
-                assert_eq!(asked(&sys), [argv()], "one full batch: {:?}", sys.calls());
-                assert_eq!(
-                    tab.entered.load(std::sync::atomic::Ordering::Relaxed),
-                    tabbed
-                );
-            }
-        }
-
-        // Unknown root state is no independent work that may admit the ask.
-        let mut unknown = console();
-        unknown.low_data = Some(true);
-        unknown
-            .on(
-                "/usr/sbin/DevToolsSecurity -status",
-                Ran::ok("Developer mode rights are in an unknown state.\n"),
-            )
-            .stat_fails(
-                crate::root_steps::ADMITTED_NAME_RULE,
-                std::io::ErrorKind::PermissionDenied,
-            );
-        let item = missing().with_owed(Box::new(crate::root_steps::owed));
-        assert_eq!(run(&unknown, &item, Mode::Apply).outcome, Outcome::Blocked);
-        assert!(asked(&unknown).is_empty());
-    }
-
-    /// An account that is not one of the Mac's administrators asks for no password (macOS's
-    /// `sudo` would refuse it, which read as a wrong password): the row says only an
-    /// administrator can install them, and the tab says so as its own class.
-    #[test]
-    fn an_account_that_is_no_administrator_asks_no_password() {
-        let mut sys = console();
-        sys.admin = Some(false);
-        let row = run(&sys, &missing(), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
-        assert!(
-            row.why
-                .as_deref()
-                .is_some_and(|why| why.ends_with(NOT_ADMIN)),
-            "{row:?}"
-        );
-        assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-
-        let sys = Arc::new(sys);
-        let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        let _ = run(&sys, &item, Mode::Apply);
-        assert_eq!(tab.unfinished(), Some(Unfinished::NotAdmin));
-        assert!(
-            said.lock().unwrap().is_empty(),
-            "nothing said before the end"
-        );
-        assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-
-        let mut sys = console();
-        sys.admin = Some(true);
-        assert_eq!(run(&sys, &missing(), Mode::Plan).outcome, Outcome::Planned);
-    }
-
-    /// An existing repair may temporarily break a compiler that was already installed. Its
-    /// custody defers both refusing and unanswered probes; losing custody restores the actual
-    /// failure, and a later ready probe recovers the row without another password attempt.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_active_repair_defers_a_refusing_or_unanswered_compiler_until_it_recovers() {
-        let apple = format!(
-            "/System/Library/CoreServices/{}",
-            aterm_types::macos_setup::APPLE_TOOLS_INSTALLER
-        );
-        for (found, unheld, unfinished) in [
-            (
-                Found::Refuses("compiler mid replacement".into()),
-                Outcome::Blocked,
-                Unfinished::Refuses,
-            ),
-            (
-                Found::Unknown("compiler did not answer during replacement".into()),
-                Outcome::Unknown,
-                Unfinished::Unread,
-            ),
-        ] {
-            for (owner, held) in [
-                ("/usr/sbin/softwareupdate", Unfinished::Busy),
-                ("/usr/sbin/installer", Unfinished::Busy),
-                (apple.as_str(), Unfinished::AppleWindow),
-            ] {
-                let sys = Arc::new(console());
-                sys.file(crate::items::developer::PLACEHOLDER, b"")
-                    .running(&["/sbin/launchd", owner]);
-                let (item, said, tab) = in_tab(&sys, found.clone());
-                let waiting = run(&sys, &item, Mode::Apply);
-                assert_eq!(waiting.outcome, Outcome::Deferred, "{owner}: {waiting:?}");
-                assert!(deferred(&waiting));
-                assert_eq!(tab.unfinished(), Some(held));
-                assert!(asked(&sys).is_empty());
-                assert!(said.lock().unwrap().is_empty());
-
-                sys.running(&["/sbin/launchd"]);
-                assert_eq!(run(&sys, &item, Mode::Apply).outcome, unheld);
-                assert_eq!(tab.unfinished(), Some(unfinished));
-
-                sys.file(CC, b"repaired compiler");
-                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Ok);
-                assert!(asked(&sys).is_empty());
-                assert!(said.lock().unwrap().is_empty());
-            }
-            let sys = Arc::new(unread_console());
-            let (item, said, tab) = in_tab(&sys, found);
-            assert_eq!(run(&sys, &item, Mode::Apply).outcome, unheld);
-            assert_eq!(tab.unfinished(), Some(unfinished));
-            assert!(asked(&sys).is_empty());
-            assert!(said.lock().unwrap().is_empty());
-        }
-    }
-
-    /// With an install of the tools under way (the placeholder held by `softwareupdate`, Apple's
-    /// package `installer`, or a live run of the root half), the item asks no password and fails
-    /// nothing: it is deferred to that install. A placeholder left behind beside other programs,
-    /// one merely called `installer` included, is no install.
-    #[test]
-    fn an_install_under_way_asks_no_password_and_fails_nothing() {
-        for installer in ["/usr/sbin/softwareupdate", "/usr/sbin/installer"] {
-            let sys = console();
-            sys.file(crate::items::developer::PLACEHOLDER, b"")
-                .running(&["/sbin/launchd", installer]);
-            let row = run(&sys, &missing(), Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Deferred, "{installer}: {row:?}");
-            assert!(deferred(&row));
-            assert!(
-                row.why
-                    .as_deref()
-                    .is_some_and(|why| why.ends_with(INSTALLING))
-            );
-            assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-        }
-
-        let stale = console();
-        stale
-            .file(crate::items::developer::PLACEHOLDER, b"")
-            .running(&["/sbin/launchd", "/tmp/installer"]);
-        assert_eq!(
-            run(&stale, &missing(), Mode::Plan).outcome,
-            Outcome::Planned
-        );
-
-        // A run of the root half that is still alive holds it, though no installer process
-        // runs this moment (it waits on Apple's installer window): a second `aterm init` defers
-        // to it, asking no password.
-        let held = console();
-        held.file(crate::items::developer::PLACEHOLDER, b"aterm 4242 1000\n")
-            .running(&["/sbin/launchd"])
-            .born(4242, 1000);
-        let row = run(&held, &missing(), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        assert!(asked(&held).is_empty(), "{:?}", held.calls());
-    }
-
-    /// Apple's installer window is Apple's own flow, at any age, with the placeholder beside it
-    /// (it made the placeholder as it opened, before any press, so a press hours later leaves no
-    /// trace aterm reads) or with none (it opened beside another install's, which has ended
-    /// since): the item asks no password and fails nothing, deferred to that window with the
-    /// person's step there named (finish in it, or quit it so aterm can install them), and the
-    /// tab says it as the window's class.
-    /// NEGATIVE CONTROL: the placeholder with no window beside it (left behind) plans the install.
-    #[test]
-    fn apples_window_defers_at_any_age_with_or_without_the_placeholder() {
-        let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
-                     Contents/MacOS/Install Command Line Developer Tools";
-        let placeholder = crate::items::developer::PLACEHOLDER;
-        let day = 24 * 60 * 60;
-        for beside in [true, false] {
-            for age in [Some(60), Some(3 * 60 * 60), Some(10 * day), None] {
-                let sys = Arc::new(console());
-                if beside {
-                    sys.file(placeholder, b"");
-                }
-                sys.running(&["/sbin/launchd", apple]);
-                if let Some(age) = age {
-                    sys.born(Fake::PIDS + 1, sys.now - age);
-                }
-                let row = run(&sys, &missing(), Mode::Apply);
-                assert_eq!(row.outcome, Outcome::Deferred, "{beside} {age:?}: {row:?}");
-                assert!(deferred(&row), "{beside} {age:?}");
-                assert!(
-                    row.why
-                        .as_deref()
-                        .is_some_and(|why| why.ends_with(APPLE_WINDOW_OPEN)),
-                    "{beside} {age:?}: {row:?}"
-                );
-                assert!(
-                    asked(&sys).is_empty(),
-                    "{beside} {age:?}: {:?}",
-                    sys.calls()
-                );
-                let (item, said, tab) =
-                    in_tab(&sys, Found::Missing("no developer directory".into()));
-                assert_eq!(
-                    run(&sys, &item, Mode::Apply).outcome,
-                    Outcome::Deferred,
-                    "{beside} {age:?}"
-                );
-                assert_eq!(
-                    tab.unfinished(),
-                    Some(Unfinished::AppleWindow),
-                    "{beside} {age:?}"
-                );
-                assert!(said.lock().unwrap().is_empty(), "{beside} {age:?}");
-                assert!(
-                    asked(&sys).is_empty(),
-                    "{beside} {age:?}: {:?}",
-                    sys.calls()
-                );
-            }
-        }
-
-        let left = console();
-        left.file(placeholder, b"").running(&["/sbin/launchd"]);
-        assert_eq!(run(&left, &missing(), Mode::Plan).outcome, Outcome::Planned);
-    }
-
-    /// A process the kernel names no executable for (one whose file a replacement deleted while
-    /// it ran) is none of Apple's installers: beside a stale placeholder whose stamped run is
-    /// gone, `aterm init` plans the install, as the root half then takes the placeholder's place.
-    /// NEGATIVE CONTROL: with `softwareupdate` named beside it, the item defers to that install.
-    #[test]
-    fn a_process_the_kernel_names_no_file_for_defers_nothing() {
-        let unnamed = crate::port::Process {
-            pid: Fake::PIDS + 7,
-            ppid: crate::port::Process::LAUNCHD,
-            terminal: false,
-            exe: None,
-            comm: "deleted".into(),
-        };
-        for (beside, outcome) in [
-            ("/sbin/launchd", Outcome::Planned),
-            ("/usr/sbin/softwareupdate", Outcome::Deferred),
-        ] {
-            let sys = console();
-            sys.file(crate::items::developer::PLACEHOLDER, b"aterm 4242 1000\n")
-                .running(&["/sbin/launchd", beside])
-                .process(unnamed.clone(), None);
-            assert_eq!(
-                run(&sys, &missing(), Mode::Plan).outcome,
-                outcome,
-                "{beside}"
-            );
-        }
-    }
-
-    /// Only a person at this Mac's console types the Mac password: an agent's tab (a terminal
-    /// a coding agent started), a run with no terminal, and a remote shell each defer the tools,
-    /// asking nothing, so the run fails nothing for them.
-    #[test]
-    fn off_the_console_the_tools_wait_for_a_person_and_nothing_is_asked() {
-        let mut agent = console();
-        agent.agent = Some("Claude Code");
-        let mut script = console();
-        script.terminal = false;
-        script.tty = false;
-        let mut remote = console();
-        remote.remote_login = true;
-        for (name, sys) in [("agent", agent), ("script", script), ("remote", remote)] {
-            for mode in [Mode::Plan, Mode::Apply] {
-                let row = run(&sys, &missing(), mode);
-                assert_eq!(row.outcome, Outcome::Deferred, "{name} {mode:?}: {row:?}");
-                assert!(deferred(&row), "{name}");
-                assert!(
-                    row.why
-                        .as_deref()
-                        .is_some_and(|why| why.contains("a person at this Mac's console")),
-                    "{name}: {row:?}"
-                );
-            }
-            assert!(asked(&sys).is_empty(), "{name}: {:?}", sys.calls());
-        }
-    }
-
-    /// At the console with no terminal to ask in (no `/dev/tty`), pending work stays blocked,
-    /// running nothing.
-    #[test]
-    fn without_a_terminal_pending_work_is_blocked() {
-        let mut sys = console();
-        sys.tty = false;
-        let item = missing();
-        for mode in [Mode::Plan, Mode::Apply] {
-            let row = run(&sys, &item, mode);
-            assert_eq!(row.outcome, Outcome::Blocked, "{mode:?}: {row:?}");
-        }
-        assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-    }
-
-    #[test]
-    fn the_probe_maps_each_finding() {
-        let sys = console();
-        for (found, outcome) in [
-            (Found::Present("cc".into()), Outcome::Ok),
-            (Found::Refuses("license".into()), Outcome::Blocked),
-            (Found::Unknown("no answer".into()), Outcome::Unknown),
-            (Found::NotHere("not macOS".into()), Outcome::NotApplicable),
-        ] {
-            let row = run(&sys, &item(found.clone()), Mode::Apply);
-            assert_eq!(row.outcome, outcome, "{found:?}: {row:?}");
-        }
-        assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-    }
-
-    #[test]
-    fn unread_installer_custody_asks_nothing_and_recovers_on_a_later_read() {
-        for placeholder in [false, true] {
-            let sys = Arc::new(unread_console());
-            if placeholder {
-                sys.file(crate::items::developer::PLACEHOLDER, b"");
-            }
-            let item = missing();
-            for mode in [Mode::Plan, Mode::Apply] {
-                let row = run(&sys, &item, mode);
-                assert_eq!(row.outcome, Outcome::Unknown, "{placeholder}: {row:?}");
-                assert!(asked(&sys).is_empty(), "no password with unread custody");
-            }
-            let (tab_item, said, tab) =
-                in_tab(&sys, Found::Missing("no developer directory".into()));
-            assert_eq!(run(&sys, &tab_item, Mode::Apply).outcome, Outcome::Unknown);
-            assert_eq!(tab.unfinished(), Some(Unfinished::Unread));
-            assert!(said.lock().unwrap().is_empty());
-            assert!(asked(&sys).is_empty());
-
-            sys.running(&[]);
-            assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-            sys.on(&argv(), Ran::ok(""))
-                .on_write(&argv(), std::path::Path::new(CC), b"");
-            assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
-            assert_eq!(asked(&sys), [argv()], "one prompt after known idle");
-        }
-    }
-
-    #[test]
-    fn an_unread_placeholder_does_not_admit_an_install_and_can_recover() {
-        use std::io::ErrorKind;
-        let placeholder = crate::items::developer::PLACEHOLDER;
-        for kind in [
-            ErrorKind::PermissionDenied,
-            ErrorKind::NotADirectory,
-            ErrorKind::Other,
-        ] {
-            for processes in [vec![], vec!["/usr/sbin/softwareupdate"]] {
-                let sys = Arc::new(console());
-                sys.running(&processes).stat_fails(placeholder, kind);
-                let (item, said, tab) =
-                    in_tab(&sys, Found::Missing("no developer directory".into()));
-                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Unknown);
-                assert_eq!(tab.unfinished(), Some(Unfinished::Unread));
-                assert!(asked(&sys).is_empty());
-                assert!(said.lock().unwrap().is_empty());
-
-                sys.running(&[])
-                    .stat_fails(placeholder, ErrorKind::NotFound);
-                sys.on(&argv(), Ran::ok(""))
-                    .on_write(&argv(), std::path::Path::new(CC), b"");
-                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
-                assert_eq!(asked(&sys), [argv()]);
-            }
-        }
-    }
-
-    type TabMessages = Arc<Mutex<Vec<(usize, String)>>>;
-
-    /// The tab's item over a probe that finds the tools only once [`CC`] is there, speaking
-    /// into `said`, each entry with how many calls `sys` had seen when it was said.
-    fn in_tab(sys: &Arc<Fake>, found: Found) -> (CommandLineTools, TabMessages, Tab) {
-        let said = Arc::new(Mutex::new(Vec::new()));
-        let tab = Tab::new({
-            let (said, sys) = (Arc::clone(&said), Arc::clone(sys));
-            Arc::new(move |text: &str| {
-                said.lock()
-                    .unwrap()
-                    .push((sys.calls().len(), text.to_owned()));
-            })
-        });
-        (item(found).in_tab(tab.clone()), said, tab)
-    }
-
-    /// In the tab, the apply says its one intro line right before `sudo` asks for the Mac
-    /// password with the plain prompt under `sudo -k`, as a run outside it does, runs the root
-    /// half `--plain`, and holds off a stop until it ended.
-    #[test]
-    fn in_the_tab_the_intro_comes_right_before_sudo_asks_with_the_plain_prompt() {
-        let sys = Arc::new(console());
-        let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        let argv = argv();
-        sys.on(&argv, Ran::ok(""))
-            .on_write(&argv, std::path::Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        let calls = sys.calls();
-        let at = |call: &str| {
-            calls
-                .iter()
-                .position(|c| c == call)
-                .unwrap_or_else(|| panic!("{call}: {calls:?}"))
-        };
-        let ran = at(&argv);
-        assert_eq!(
-            *said.lock().unwrap(),
-            [(ran, format!("{TAB_INTRO}\n"))],
-            "said once, right before sudo ({ran}): {calls:?}"
-        );
-        assert!(at("catch stops") < ran, "{calls:?}");
-        assert!(
-            ran < at("stops restored"),
-            "stops are held until the root half ended: {calls:?}"
-        );
-        assert!(
-            !calls.iter().any(|call| call.contains("sudo -K")),
-            "nothing cached to forget: {calls:?}"
-        );
-        assert_eq!(tab.unfinished(), None);
-    }
-
-    /// A run outside the tab, a person's own `aterm init` at the console and a run aterm decided
-    /// alike, runs the root half in the person's terminal's foreground, so a Ctrl-C there (which
-    /// the through-installer wait invites: "Ctrl-C stops waiting") reaches this run too. It is
-    /// held until the root half ended and, in a run aterm decided, its ask was kept or taken back,
-    /// then sent again: the run still stops as it would have, and the record says what the stop
-    /// left it. A person's run writes no record at all.
-    #[test]
-    fn a_run_on_the_persons_terminal_holds_a_stop_until_the_root_half_ended_and_the_ask_settled() {
-        let argv = argv();
-        for decider in [crate::init::Decider::Person, crate::init::Decider::Aterm] {
-            for status in [Some(0), Some(82)] {
-                let sys = console();
-                sys.tty_model(|sys, _| {
-                    sys.stop_now();
-                    None
-                });
-                sys.on(
-                    &argv,
-                    Ran {
-                        status,
-                        ..Ran::default()
-                    },
-                );
-                let installs = status == Some(0);
-                if installs {
-                    sys.on_write(&argv, std::path::Path::new(CC), b"");
-                }
-                let row = run(&sys, &decided(decider), Mode::Apply);
-                let calls = sys.calls();
-                let at = |call: &str| calls.iter().position(|seen| seen == call);
-                let ran = at(&argv).expect("the root half ran");
-                let restored = at("stops restored").expect("stops restored");
-                assert!(
-                    at("defer stops").is_some_and(|held| held < ran),
-                    "{decider:?}: no stop is held around the root half: {calls:?}"
-                );
-                assert!(restored > ran, "{decider:?}: {calls:?}");
-                assert!(
-                    calls
-                        .iter()
-                        .position(|seen| seen.starts_with("stop sent again"))
-                        .is_some_and(|sent| sent > restored),
-                    "{decider:?}: the stop is sent again once the run settled: {calls:?}"
-                );
-                // A stop during an install that did not finish is the person's: the ask stays
-                // spent.
-                assert_eq!(
-                    row.outcome,
-                    if installs {
-                        Outcome::Changed
-                    } else {
-                        Outcome::Failed
-                    },
-                    "{decider:?} {status:?}: {row:?}"
-                );
-                if !installs {
-                    assert_eq!(row.why.as_deref(), Some(Unfinished::Stopped.reason()));
-                }
-                assert!(marked(&sys), "{decider:?} {status:?}: {calls:?}");
-                assert!(
-                    !calls.iter().any(|call| call == &format!("remove {MARK}")),
-                    "the consumed episode survives stop delivery: {calls:?}"
-                );
-            }
-        }
-    }
-
-    /// This account's record of aterm's own ask, in the test world.
-    const MARK: &str = "/Users//alice/Library/Application Support/aterm/command-line-tools-tab";
-
-    /// The build that asks.
-    const BUILD: &str = "0.9.0+gabc1234";
-
-    /// The missing tools' item as `decider`'s run composes it, over [`MARK`] and [`BUILD`], the
-    /// person's choices read through `holds` each time the item reads them; a person's run reads
-    /// neither.
-    fn decided_with(
-        decider: crate::init::Decider,
-        holds: impl Fn() -> crate::init::Holds + Send + Sync + 'static,
-    ) -> CommandLineTools {
-        decider
-            .compose(
-                crate::init::Base {
-                    clt: Some(missing()),
-                    ..crate::init::Base::none()
-                },
-                || Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), holds),
-            )
-            .clt
-            .expect("base.clt")
-    }
-
-    /// [`decided_with`] where the person's choices hold nothing.
-    fn decided(decider: crate::init::Decider) -> CommandLineTools {
-        decided_with(decider, || crate::init::Holds::NONE)
-    }
-
-    /// The person's Stop of setup in System State.
-    fn stop() -> crate::init::Holds {
-        crate::init::Holds {
-            stopped: Some("you stopped setup in System State".to_owned()),
-            ..crate::init::Holds::NONE
-        }
-    }
-
-    /// Whether the record names `build`.
-    fn marked(sys: &Fake) -> bool {
-        aterm_types::clt_mark::spent(sys, std::path::Path::new(MARK))
-    }
-
-    /// In a run aterm decided (the follow-up of a person's own package install or update), the
-    /// first run asks once, claiming its ask before `sudo`; later automatic runs and updates
-    /// preserve that spent ask after a person's cancellation. The shared GUI claim holds too.
-    /// NEGATIVE CONTROL: explicit retries remain available and record the first human attempt.
-    #[test]
-    fn automatic_setup_preserves_its_spent_ask_across_updates_and_a_person_can_retry() {
-        let sys = console();
-        let argv = argv();
-        // Apple's window closed without the tools: the person's own press there, which keeps
-        // the ask spent.
-        sys.on(&argv, Ran::exit(88, ""));
-        let aterm = decided(crate::init::Decider::Aterm);
-
-        let row = run(&sys, &aterm, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-        let calls = sys.calls();
-        let claimed = calls
-            .iter()
-            .position(|call| *call == format!("write {MARK} 600"))
-            .unwrap_or_else(|| panic!("the ask is claimed: {calls:?}"));
-        let ran = calls.iter().position(|call| *call == argv).unwrap();
-        assert!(claimed < ran, "claimed before sudo asks: {calls:?}");
-        assert_eq!(asked(&sys), std::slice::from_ref(&argv));
-        assert!(marked(&sys));
-
-        for mode in [Mode::Plan, Mode::Apply] {
-            let row = run(&sys, &aterm, mode);
-            assert_eq!(row.outcome, Outcome::Deferred, "{mode:?}: {row:?}");
-            assert!(deferred(&row));
-            let why = row.why.unwrap_or_default();
-            assert!(
-                why.contains(ASK_ALREADY_SPENT) && why.ends_with(PERSONS_STEP),
-                "{why}"
-            );
-        }
-        assert_eq!(asked(&sys).len(), 1, "asked once: {:?}", sys.calls());
-
-        // The tab's own ask on this build, claimed by the window, holds the follow-up's too.
-        let tabbed = console();
-        assert!(aterm_types::clt_mark::claim(&tabbed, std::path::Path::new(MARK), BUILD).unwrap());
-        let row = run(&tabbed, &aterm, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        assert!(asked(&tabbed).is_empty(), "{:?}", tabbed.calls());
-
-        let update = crate::init::Decider::Aterm.compose(
-            crate::init::Base {
-                clt: Some(missing()),
-                ..crate::init::Base::none()
-            },
-            || {
-                Unbidden::new(
-                    Some(PathBuf::from(MARK)),
-                    "0.9.1+gdef5678".to_owned(),
-                    || crate::init::Holds::NONE,
-                )
-            },
-        );
-        let row = run(&sys, update.clt.as_ref().unwrap(), Mode::Apply);
-        assert_eq!(
-            asked(&sys).len(),
-            1,
-            "an update must not ask for the password again"
-        );
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        assert!(marked(&sys));
-
-        let person = console();
-        person.on(&argv, Ran::exit(88, ""));
-        let typed = crate::init::Decider::Person.compose(
-            crate::init::Base {
-                clt: Some(missing()),
-                ..crate::init::Base::none()
-            },
-            || {
-                Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
-                    panic!("an explicit retry never reads automatic holds")
-                })
-            },
-        );
-        let typed = typed.clt.as_ref().unwrap();
-        for _ in 0..2 {
-            assert_eq!(run(&person, typed, Mode::Apply).outcome, Outcome::Failed);
-        }
-        assert_eq!(asked(&person).len(), 2, "{:?}", person.calls());
-        assert_eq!(
-            run(&person, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
-            Outcome::Deferred
-        );
-        assert_eq!(
-            asked(&person).len(),
-            2,
-            "explicit attempts must hold unsolicited retries"
-        );
-        assert_eq!(
-            person
-                .calls()
-                .iter()
-                .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
-                .count(),
-            2,
-            "the explicit retry revokes the first attempt's release capability: {:?}",
-            person.calls()
-        );
-    }
-
-    /// A run aterm decided asks for no password while the person's choices hold System State's
-    /// own Mac Setup tab (their Stop, setup records that cannot be read, a newer
-    /// aterm's records) or where the record has no place or cannot be read: deferred, naming why
-    /// and the person's step, writing nothing; a record that cannot say is named as such, never
-    /// as this build's ask. A group turned off holds no tab, so it holds nothing here.
-    #[test]
-    fn a_run_aterm_decided_asks_nothing_under_a_stop() {
-        let newer = crate::init::Holds {
-            newer: true,
-            ..crate::init::Holds::NONE
-        };
-        assert_eq!(held_by(&crate::init::Holds::NONE), None);
-        assert_eq!(held_by(&newer).as_deref(), Some(NEWER));
-        assert!(held_by(&stop()).is_some());
-        let sys = console();
-        sys.on(&argv(), Ran::exit(88, ""));
-        let row = run(
-            &sys,
-            &decided_with(crate::init::Decider::Aterm, stop),
-            Mode::Apply,
-        );
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        let why = row.why.unwrap_or_default();
-        assert!(
-            why.contains("because you stopped setup in System State")
-                && why.ends_with(PERSONS_STEP),
-            "{why}"
-        );
-
-        let nowhere = crate::init::Decider::Aterm.compose(
-            crate::init::Base {
-                clt: Some(missing()),
-                ..crate::init::Base::none()
-            },
-            || Unbidden::new(None, BUILD.to_owned(), || crate::init::Holds::NONE),
-        );
-        let unread = console();
-        unread.link(MARK, "/Users//alice/elsewhere");
-        for (sys, item) in [
-            (&sys, nowhere.clt.as_ref().unwrap()),
-            (&unread, &decided(crate::init::Decider::Aterm)),
-        ] {
-            let row = run(sys, item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-            let why = row.why.unwrap_or_default();
-            assert!(
-                why.contains(UNREAD_RECORD)
-                    && !why.contains(ASK_ALREADY_SPENT)
-                    && why.ends_with(PERSONS_STEP),
-                "{why}"
-            );
-        }
-        let why = run(&unread, &decided(crate::init::Decider::Aterm), Mode::Plan)
-            .why
-            .unwrap_or_default();
-        assert!(why.contains(MARK), "names the record it cannot read: {why}");
-
-        for sys in [&sys, &unread] {
-            assert!(asked(sys).is_empty(), "{:?}", sys.calls());
-            assert!(
-                !sys.calls()
-                    .iter()
-                    .any(|call| call.starts_with("write ") || call.starts_with("remove ")),
-                "{:?}",
-                sys.calls()
-            );
-        }
-    }
-
-    /// The person's Stop holds a run aterm decided whenever it is pressed before `sudo` asks:
-    /// composing the run reads none of their choices, its probe reads them, so a Stop recorded
-    /// after the run began (while the base layer or the vault's join ran) defers it, and its apply
-    /// reads them once more right before it claims the ask, so a Stop recorded between the probe
-    /// and the apply asks nothing either (the row fails in the Stop's words, naming the person's
-    /// step). Neither asks or writes the record.
-    /// NEGATIVE CONTROL: with no Stop at either read, the same run asks once.
-    #[test]
-    fn a_stop_pressed_after_the_run_began_holds_its_ask() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let reads = Arc::new(AtomicUsize::new(0));
-        let now = Arc::new(Mutex::new(crate::init::Holds::NONE));
-        let item = decided_with(crate::init::Decider::Aterm, {
-            let (reads, now) = (Arc::clone(&reads), Arc::clone(&now));
-            move || {
-                reads.fetch_add(1, Ordering::SeqCst);
-                now.lock().unwrap().clone()
-            }
-        });
-        assert_eq!(reads.load(Ordering::SeqCst), 0, "composing reads no holds");
-        *now.lock().unwrap() = stop();
-        let sys = console();
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        assert!(
-            row.why
-                .as_deref()
-                .is_some_and(|why| why.contains("because you stopped setup in System State")),
-            "{row:?}"
-        );
-        assert!(reads.load(Ordering::SeqCst) > 0);
-
-        for stop_at_apply in [true, false] {
-            let reads = Arc::new(AtomicUsize::new(0));
-            let item = decided_with(crate::init::Decider::Aterm, {
-                let reads = Arc::clone(&reads);
-                move || {
-                    // The probe's read finds no Stop; the apply's, the read after it, finds one.
-                    if reads.fetch_add(1, Ordering::SeqCst) > 0 && stop_at_apply {
-                        stop()
-                    } else {
-                        crate::init::Holds::NONE
-                    }
-                }
-            });
-            let sys = console();
-            sys.on(&argv(), Ran::exit(88, ""));
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{stop_at_apply}: {row:?}");
-            assert_eq!(reads.load(Ordering::SeqCst), 2, "{stop_at_apply}");
-            let writes = sys
-                .calls()
-                .into_iter()
-                .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
-                .count();
-            if stop_at_apply {
-                let why = row.why.unwrap_or_default();
-                assert!(
-                    why.contains("because you stopped setup in System State")
-                        && why.ends_with(PERSONS_STEP),
-                    "{why}"
-                );
-                assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-                assert_eq!(writes, 0, "{:?}", sys.calls());
-            } else {
-                assert_eq!(asked(&sys).len(), 1, "{:?}", sys.calls());
-                assert!(marked(&sys));
-            }
-        }
-    }
-
-    /// A run aterm decided and System State's tab of the same build claim one record: where the
-    /// tab's landing claimed the build after this run's probe read the record, this run's claim
-    /// right before `sudo` loses, so it asks nothing (the row fails naming this build's ask and
-    /// the person's step) and never takes back the tab's line, which it did not add.
-    /// NEGATIVE CONTROL: with the record left alone, the same run's claim wins and it asks.
-    #[test]
-    fn a_run_whose_claim_lost_to_the_tab_asks_nothing_and_keeps_the_tabs_line() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        for tab_lands in [true, false] {
-            let sys = Arc::new(console());
-            sys.on(&argv(), Ran::exit(82, ""));
-            let reads = Arc::new(AtomicUsize::new(0));
-            let item = decided_with(crate::init::Decider::Aterm, {
-                let (reads, sys) = (Arc::clone(&reads), Arc::clone(&sys));
-                move || {
-                    // The tab lands between this run's probe and its apply: the apply's read of the
-                    // holds, the last before its claim, is when.
-                    if reads.fetch_add(1, Ordering::SeqCst) == 1 && tab_lands {
-                        assert!(
-                            aterm_types::clt_mark::claim(&*sys, std::path::Path::new(MARK), BUILD)
-                                .unwrap()
-                        );
-                    }
-                    crate::init::Holds::NONE
-                }
-            });
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{tab_lands}: {row:?}");
-            let calls = sys.calls();
-            if tab_lands {
-                let why = row.why.unwrap_or_default();
-                assert!(
-                    why.contains(ASK_ALREADY_SPENT) && why.ends_with(PERSONS_STEP),
-                    "{why}"
-                );
-                assert!(asked(&sys).is_empty(), "{calls:?}");
-                assert!(marked(&sys), "the tab's line stays: {calls:?}");
-                assert_eq!(
-                    calls
-                        .iter()
-                        .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
-                        .collect::<Vec<_>>(),
-                    [&format!("write {MARK} 600")],
-                    "the tab's write alone: {calls:?}"
-                );
-            } else {
-                assert_eq!(asked(&sys).len(), 1, "{calls:?}");
-                assert!(
-                    marked(&sys),
-                    "a failed install retains its consumed episode: {calls:?}"
-                );
-            }
-        }
-    }
-
-    /// A pending automatic claim must not release a later explicit person's real attempt,
-    /// even when the automatic sudo was proven never started afterward.
-    #[test]
-    fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        if !aterm_uds::test_binary::isolated_lifecycle(
-            "init_clt::tests::an_explicit_attempt_survives_an_older_automatic_no_start_result",
-        ) {
-            return;
-        }
-        let sys = Arc::new(console());
-        let automatic_entered = Arc::new(AtomicBool::new(false));
-        let explicit_ran = Arc::new(AtomicBool::new(false));
-        sys.tty_model({
-            let automatic_entered = Arc::clone(&automatic_entered);
-            move |_, _| {
-                if automatic_entered.swap(true, Ordering::SeqCst) {
-                    Some(Ran::exit(1, ""))
-                } else {
-                    None // A's real unscripted Spawn failure, after its claim.
-                }
-            }
-        });
-        let item = CommandLineTools::new(
-            Box::new({
-                let (sys, automatic_entered, explicit_ran) = (
-                    Arc::clone(&sys),
-                    Arc::clone(&automatic_entered),
-                    Arc::clone(&explicit_ran),
-                );
-                move |probe| {
-                    // `ended` reads back after A released the terminal, before it releases its
-                    // no-start claim. B must acquire the real terminal here, never recursively
-                    // from A's terminal-command callback, which still owns that mutex.
-                    if automatic_entered.load(Ordering::SeqCst)
-                        && !explicit_ran.swap(true, Ordering::SeqCst)
-                    {
-                        let person = decided(crate::init::Decider::Person);
-                        assert_eq!(run(&sys, &person, Mode::Apply).outcome, Outcome::Failed);
-                    }
-                    if probe.read_file(std::path::Path::new(CC)).is_ok() {
-                        Found::Present(CC.into())
-                    } else {
-                        Found::Missing("no developer directory".into())
-                    }
-                }
-            }),
-            ATERM.into(),
-        )
-        .saying(Arc::new(|_: &str| {}));
-        let automatic = crate::init::Decider::Aterm
-            .compose(
-                crate::init::Base {
-                    clt: Some(item),
-                    ..crate::init::Base::none()
-                },
-                || {
-                    Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
-                        crate::init::Holds::NONE
-                    })
-                },
-            )
-            .clt
-            .expect("base.clt");
-        assert_eq!(run(&sys, &automatic, Mode::Apply).outcome, Outcome::Failed);
-        assert!(explicit_ran.load(Ordering::SeqCst));
-        assert!(marked(&sys));
-        assert_eq!(
-            run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
-            Outcome::Deferred
-        );
-        assert_eq!(
-            asked(&sys).len(),
-            2,
-            "no third unsolicited attempt: {:?}",
-            sys.calls()
-        );
-    }
-
-    /// All outcomes after sudo may have asked a person and retain the episode. Only a proven
-    /// failure to start releases this exact claim; a lost post-start result does not.
-    #[test]
-    fn a_password_attempt_stays_spent_and_only_proven_no_start_releases_it() {
-        use crate::port::RunFailed;
-        for (reply, keeps) in [
-            (Some(Ok(Ran::exit(82, ""))), true),
-            (Some(Ok(Ran::exit(83, ""))), true),
-            (Some(Ok(Ran::exit(1, ""))), true),
-            (Some(Ok(Ran::exit(85, ""))), true),
-            (Some(Ok(Ran::exit(88, ""))), true),
-            (
-                Some(Err(RunFailed::AfterStart("lost wait result".into()))),
-                true,
-            ),
-            (
-                Some(Err(RunFailed::TimedOut(std::time::Duration::from_secs(60)))),
-                true,
-            ),
-            (Some(Err(RunFailed::Spawn("exec failed".into()))), false),
-            (
-                Some(Err(RunFailed::Refused("before child start".into()))),
-                false,
-            ),
-            (None, false), // The port's actual unscripted Spawn failure.
-        ] {
-            let sys = console();
-            if let Some(reply) = reply {
-                sys.on_result(&argv(), reply);
-            }
-            let aterm = decided(crate::init::Decider::Aterm);
-            let row = run(&sys, &aterm, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-            assert_eq!(marked(&sys), keeps, "{:?}", sys.calls());
-            assert_eq!(
-                run(&sys, &aterm, Mode::Plan).outcome,
-                if keeps {
-                    Outcome::Deferred
-                } else {
-                    Outcome::Planned
-                }
-            );
-            if keeps {
-                let attempts = asked(&sys);
-                let next = decided(crate::init::Decider::Aterm);
-                assert_eq!(run(&sys, &next, Mode::Apply).outcome, Outcome::Deferred);
-                assert_eq!(asked(&sys), attempts);
-            }
-        }
-    }
-
-    /// `sudo`'s exit says why the tab's install did not finish: 0 done, `sudo`'s own 1 the Mac
-    /// password, each root class's code that class, a signal after a stop the person sent
-    /// stopped, and anything else (a usage 2, a panic's 101, a failed exec's 126 or 127, a
-    /// signal nobody sent) the other class. The apply's error is the plain reason alone, never
-    /// the argv or a path.
-    #[test]
-    fn the_root_halfs_exit_says_why_the_tab_install_did_not_finish() {
-        assert_eq!(Unfinished::after_root(Some(0)), Ok(()));
-        assert_eq!(Unfinished::after_root(Some(1)), Err(Unfinished::Password));
-        for (code, why) in [
-            (80, Unfinished::Catalog),
-            (81, Unfinished::NoneOffered),
-            (82, Unfinished::Download),
-            (83, Unfinished::Installer),
-            (84, Unfinished::Busy),
-            (85, Unfinished::Stopped),
-            (86, Unfinished::AppleWindow),
-            (87, Unfinished::Other),
-            (88, Unfinished::WindowClosed),
-            (89, Unfinished::Unread),
-        ] {
-            assert_eq!(why.code(), Some(code), "{why:?}");
-            assert_eq!(
-                Unfinished::after_root(Some(i32::from(code))),
-                Err(why),
-                "{code}"
-            );
-        }
-        for code in [
-            Some(2),
-            Some(79),
-            Some(90),
-            Some(101),
-            Some(126),
-            Some(127),
-            Some(-1),
-            None,
-        ] {
-            assert_eq!(
-                Unfinished::after_root(code),
-                Err(Unfinished::Other),
-                "{code:?}"
-            );
-        }
-
-        for (status, stopped, why) in [
-            (Some(1), false, Unfinished::Password),
-            (Some(84), false, Unfinished::Busy),
-            (Some(82), false, Unfinished::Download),
-            (None, false, Unfinished::Other),
-            (None, true, Unfinished::Stopped),
-            // A Ctrl-C at `sudo`'s password prompt: `sudo` ends on its own 1.
-            (Some(1), true, Unfinished::Stopped),
-            (Some(82), true, Unfinished::Stopped),
-        ] {
-            let fake = console();
-            if stopped {
-                fake.tty_model(|sys, _| {
-                    sys.stop_now();
-                    None
-                });
-            }
-            let sys = Arc::new(fake);
-            let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-            sys.on(
-                &argv(),
-                Ran {
-                    status,
-                    ..Ran::default()
-                },
-            );
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{status:?}: {row:?}");
-            assert_eq!(row.why.as_deref(), Some(why.reason()), "{status:?}");
-            assert_eq!(tab.unfinished(), Some(why), "{status:?}");
-            for after in [
-                Unfinished::LowData,
-                Unfinished::NotOwnLogin,
-                Unfinished::Busy,
-                Unfinished::AppleWindow,
-            ] {
-                assert_eq!(
-                    tab.exit(after),
-                    1,
-                    "a post-sudo {after:?} diagnosis cannot release the episode"
-                );
-            }
-            assert_eq!(said.lock().unwrap().len(), 1, "the intro alone: {status:?}");
-        }
-
-        // Completed tools cannot hide a failed root helper transaction. This
-        // follows the actual tab producer through its installed-tools fallback.
-        let mut fake = console();
-        fake.running_app = Some("/Applications/aterm.app".into());
-        let sys = Arc::new(fake);
-        let image = aterm_uds::lan::install::test_image(0x0100_000c, &[b"this build"]);
-        sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
-            .file(aterm_uds::lan::IMAGE_EXECUTABLE, &image)
-            .file(
-                aterm_uds::lan::PLIST_PATH,
-                aterm_uds::lan::install::plist_text(Path::new("/Applications/aterm.app"))
-                    .as_bytes(),
-            )
-            .on(
-                "/bin/launchctl print system/systems.alab.aterm-lan",
-                Ran::exit(113, "Could not find service"),
-            );
-        let (item, _, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        sys.on(
-            &argv(),
-            Ran::exit(i32::from(Unfinished::Other.code().unwrap()), ""),
-        )
-        .on_write(&argv(), Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-        assert_eq!(tab.unfinished(), Some(Unfinished::Other));
-    }
-
-    #[test]
-    fn a_successful_installer_still_needs_a_working_compiler_and_can_recover() {
-        for (unready, unfinished) in [
-            (
-                Found::Refuses("SDK cannot link".into()),
-                Unfinished::Refuses,
-            ),
-            (
-                Found::Unknown("compiler did not answer".into()),
-                Unfinished::Unread,
-            ),
-        ] {
-            let sys = Arc::new(console());
-            let (mut item, _, tab) = in_tab(&sys, Found::Missing("not installed".into()));
-            item.found = Box::new(move |sys: &dyn System| match sys.read_file(Path::new(CC)) {
-                Ok(bytes) if bytes == b"ready" => Found::Present("compiler links".into()),
-                Ok(_) => unready.clone(),
-                Err(_) => Found::Missing("not installed".into()),
-            });
-            sys.on(&argv(), Ran::ok(""))
-                .on_write(&argv(), Path::new(CC), b"unready");
-
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
-            assert_eq!(tab.unfinished(), Some(unfinished));
-            assert_eq!(asked(&sys), [argv()]);
-
-            // Installing the files and exiting successfully is no compiler health proof.
-            let row = run(&sys, &item, Mode::Apply);
-            assert!(
-                matches!(row.outcome, Outcome::Blocked | Outcome::Unknown),
-                "{row:?}"
-            );
-            assert_eq!(tab.unfinished(), Some(unfinished));
-            assert_eq!(
-                asked(&sys),
-                [argv()],
-                "an unready read-back starts no second prompt"
-            );
-
-            sys.file(CC, b"ready");
-            let row = run(&sys, &item, Mode::Apply);
-            assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
-            assert_eq!(asked(&sys), [argv()], "recovery needs no new root episode");
-        }
-    }
-
-    /// A stop the person sent while the root half ran (a Ctrl-C in the tab, which reaches the
-    /// root half too) leaves the tab's run waiting for it: the root half finishes its step, and
-    /// tools that arrived anyway end the tab on installed, whatever its exit said.
-    #[test]
-    fn in_the_tab_a_stop_waits_for_the_root_half_and_tools_that_arrived_are_installed() {
-        let fake = console();
-        fake.tty_model(|sys, _| {
-            sys.stop_now();
-            None
-        });
-        let sys = Arc::new(fake);
-        let (item, _, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        let argv = argv();
-        sys.on(
-            &argv,
-            Ran {
-                status: None,
-                ..Ran::default()
-            },
-        )
-        .on_write(&argv, std::path::Path::new(CC), b"");
-        let row = run(&sys, &item, Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        assert_eq!(tab.unfinished(), None);
-    }
-
-    /// Each root code identifies only its own class and avoids generic process failures.
-    /// The tab preserves the distinct codes used by its parent for download waits and stops.
-    #[test]
-    fn root_codes_are_distinct_and_tab_exit_codes_preserve_their_classes() {
-        let mut codes = Vec::new();
-        for why in Unfinished::ALL {
-            match why {
-                Unfinished::LowData => {
-                    assert_eq!(
-                        why.tab_exit(),
-                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA
-                    );
-                }
-                Unfinished::NotAdmin => {
-                    assert_eq!(
-                        why.tab_exit(),
-                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN
-                    );
-                }
-                Unfinished::Stopped | Unfinished::WindowClosed => {
-                    assert_eq!(
-                        why.tab_exit(),
-                        if why == Unfinished::Stopped {
-                            aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED
-                        } else {
-                            aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED
-                        }
-                    );
-                }
-                _ => {
-                    assert_eq!(why.tab_exit(), 1, "{why:?}");
-                }
-            }
-            if let Some(code) = why.code() {
-                assert!(![0, 1, 2, 101, 126, 127].contains(&code), "{why:?}");
-                assert!(!codes.contains(&code), "{why:?}");
-                codes.push(code);
-            }
-        }
-    }
-
-    /// In the tab, what the probe finds that no install fixes is noted as its class: tools that
-    /// refuse to build, a probe that could not tell, and no terminal to ask in. Nothing runs.
-    #[test]
-    fn in_the_tab_the_probe_notes_what_no_install_fixes() {
-        for (found, why) in [
-            (Found::Refuses("license".into()), Unfinished::Refuses),
-            (Found::Unknown("no answer".into()), Unfinished::Unread),
-            (
-                Found::Missing("no developer directory".into()),
-                Unfinished::Other,
-            ),
-        ] {
-            let mut fake = console();
-            fake.tty = false;
-            let sys = Arc::new(fake);
-            let (item, said, tab) = in_tab(&sys, found.clone());
-            let row = run(&sys, &item, Mode::Apply);
-            assert!(
-                row.outcome.is_failure() || row.outcome == Outcome::Blocked,
-                "{row:?}"
-            );
-            assert_eq!(tab.unfinished(), Some(why), "{found:?}");
-            assert!(said.lock().unwrap().is_empty());
-            assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
-        }
-    }
-}
+#[path = "init_clt_tests.rs"]
+mod tests;

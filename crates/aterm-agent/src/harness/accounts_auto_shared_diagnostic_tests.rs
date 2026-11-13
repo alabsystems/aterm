@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here adopt a shared Claude account, whose sign-in opener aterm
+// links only on Unix (`cli::opener_link`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use crate::harness::cli::{Renewal, RenewalExit, RenewalFailure};
 use crate::harness::open_url::{Met, MetWord};
@@ -315,6 +325,7 @@ fn a_host_cannot_put_a_raw_url_or_path_in_a_retained_browser_outcome() {
     assert_eq!(fixture.bed.provider.calls.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_failure_diagnostics_do_not_change_custody_or_retry_policy() {
     for capture in [false, true] {
@@ -390,6 +401,7 @@ fn shared_failure_diagnostics_do_not_change_custody_or_retry_policy() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_new_shared_attempt_that_never_starts_does_not_reuse_the_previous_diagnostic() {
     let fixture = Fixture::new(Reply::Exit(
@@ -441,6 +453,7 @@ fn a_new_shared_attempt_that_never_starts_does_not_reuse_the_previous_diagnostic
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn successful_shared_publication_retires_prior_failure_evidence() {
     let fixture = Fixture::new(Reply::Exit(

@@ -5,17 +5,20 @@
 // replayed through the shipping effects pipeline and the real renderer at the default 260 ms, at
 // 1200 ms and at 60 ms, every kept frame's trail light summed against its clean twin.
 
-use crate::trail_letters_read::{DARK, Ev, GITHUB_LIGHT, Kept, Look, Replay, TYPING_TEXT, typed};
+use crate::trail_letters_read::{
+    DARK, Ev, GITHUB_LIGHT, Kept, Look, Replay, Spec, TYPING_TEXT, typed,
+};
 use aterm_effects::cursor_fx::TrailColor;
 use aterm_effects::cursor_glow::{GlowStyle, KnobContext, TrailKnob};
 
-/// Every style the Settings picker offers a trail for.
+/// Every trail style the Settings picker offers, and the rainbow's other bodies and pets
+/// ([`Spec`]).
 const STYLES: [&str; 14] = [
-    "rainbow kitty pet",
-    "rainbow kitty underline",
-    "rainbow dog",
-    "flat rainbow",
-    "nyan rainbow",
+    "tall rainbow + cat",
+    "rainbow + cat",
+    "tall rainbow + dog",
+    "flat rainbow + cat",
+    "tall rainbow",
     "phaser",
     "fire",
     "water",
@@ -43,9 +46,10 @@ const HEAD_CELLS: usize = 2;
 fn trail_light(style: &str, look: Look, duration_ms: u64, scaled: bool) -> u64 {
     let mut r = Replay::new(style, look, TrailColor::Automatic);
     let classic = style.eq_ignore_ascii_case("classic");
+    let spec = Spec::of(style);
     r.fx.set_cursor_glow(
         true,
-        style,
+        spec.trail,
         TrailColor::Automatic,
         None,
         duration_ms,
@@ -55,6 +59,9 @@ fn trail_light(style: &str, look: Look, duration_ms: u64, scaled: bool) -> u64 {
         true,
         look.cursor,
     );
+    if spec.tall {
+        r.fx.set_ribbon_shape(true, spec.flat);
+    }
     r.fx.set_typed_life_scaled(scaled);
     let last = 1_000 + 60 * (TYPING_TEXT.len() as u64 - 1);
     r.keep = (1_008..last + 1_200).step_by(48).collect();
@@ -117,7 +124,10 @@ fn trail_light_of(k: &Kept) -> u64 {
 fn trail_duration_shows_in_every_style_that_reads_it() {
     let reads: Vec<&str> = STYLES
         .into_iter()
-        .filter(|s| GlowStyle::parse(s).reads_knob(TrailKnob::Duration, KnobContext::widest(false)))
+        .filter(|s| {
+            GlowStyle::parse(Spec::of(s).trail)
+                .reads_knob(TrailKnob::Duration, KnobContext::widest(false))
+        })
         .collect();
     assert_eq!(
         reads.len(),

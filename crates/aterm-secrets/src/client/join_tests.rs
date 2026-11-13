@@ -2777,14 +2777,28 @@ fn a_failed_approval_publish_is_reported_on_its_first_pass_unless_the_vault_kept
 
 #[test]
 fn a_member_s_failures_to_read_are_not_an_approver_s_and_one_that_stops_being_admin_says_so() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Upkeep(Arc<AtomicUsize>);
+    impl AccountUpkeep for Upkeep {
+        fn step(&mut self, _: &Paths, _: &Admin, _: Instant) -> crate::Result<usize> {
+            panic!("failed or absent admin authority never dispatches upkeep")
+        }
+        fn pause(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (admin, _, _) = team(root.path(), &server);
     let logged = RefCell::new(Vec::<String>::new());
     let log = |line: &str| logged.borrow_mut().push(line.to_string());
     let held = StateLock::take(&admin).expect("the state lock");
+    let member_paused = Arc::new(AtomicUsize::new(0));
     let mut member = Approver {
         member: true,
+        account_upkeep: Some(Box::new(Upkeep(Arc::clone(&member_paused)))),
         ..Approver::default()
     };
     for _ in 0..3 {
@@ -2792,12 +2806,18 @@ fn a_member_s_failures_to_read_are_not_an_approver_s_and_one_that_stops_being_ad
     }
     assert_eq!(*logged.borrow(), Vec::<String>::new());
     assert_eq!(approver_stuck(&admin, std::process::id()), None);
+    assert_eq!(member_paused.load(Ordering::SeqCst), 3);
     // CONTROL: the same failures from an approver last read as an admin are reported.
-    let mut approver = Approver::default();
+    let admin_paused = Arc::new(AtomicUsize::new(0));
+    let mut approver = Approver {
+        account_upkeep: Some(Box::new(Upkeep(Arc::clone(&admin_paused)))),
+        ..Approver::default()
+    };
     for _ in 0..3 {
         approver_pass(&admin, &log, &mut approver);
     }
     assert_eq!(logged.borrow().len(), 1, "{logged:?}");
+    assert_eq!(admin_paused.load(Ordering::SeqCst), 3);
     drop(held);
 
     // A home with no vault: the reported failure is withdrawn without claiming approval.
@@ -2808,6 +2828,7 @@ fn a_member_s_failures_to_read_are_not_an_approver_s_and_one_that_stops_being_ad
         Some("not approving: this Mac is no admin of a vault now")
     );
     assert!(approver.member);
+    assert_eq!(admin_paused.load(Ordering::SeqCst), 4);
     server.stop();
 }
 
@@ -3269,6 +3290,22 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
     );
 }
 
+/// The readiness worker's projection as these tests drive it: `.0` hears each event, and a look
+/// is owed at every turn, as a lane whose inputs no watch covers owes one
+/// ([`member_routes::Projected::next_look`]). The worker then looks once a [`member_routes`]
+/// `LOOK`, which these tests take as their boundary between rounds.
+struct Paced<F>(F);
+
+impl<F: Fn(member_routes::ProjectionEvent) + Sync> member_routes::Projected for Paced<F> {
+    fn event(&self, event: member_routes::ProjectionEvent) {
+        (self.0)(event);
+    }
+
+    fn next_look(&self) -> Option<Instant> {
+        Some(Instant::now())
+    }
+}
+
 /// A route event reaches members while the vault's actual long poll remains held,
 /// even after the ordinary member requests backed off to fifteen minutes.
 #[test]
@@ -3317,7 +3354,7 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
         #[cfg(not(target_os = "macos"))]
         let (route, routes) = mpsc::channel();
         #[cfg(not(target_os = "macos"))]
-        let changes = move |most| routes.recv_timeout(most).is_ok();
+        let changes = move |deadline| routes.recv_timeout(member_routes::rest(deadline)).is_ok();
         let (handled, handling) = mpsc::channel();
         let result = std::thread::scope(|scope| {
             let mut server = EndServer(Some(server));
@@ -3381,7 +3418,7 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
                     &hearing.members,
                     &ask,
                     &|_| {},
-                    &|event| {
+                    &Paced(|event| {
                         crate::envelope::TEST_RETIRED
                             .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
                         if matches!(event, member_routes::ProjectionEvent::Maintenance)
@@ -3389,7 +3426,8 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
                         {
                             handled.send(()).unwrap();
                         }
-                    },
+                    }),
+                    member_routes::Rings::default(),
                     changes,
                     |maintain| {
                         subscriber_loop_projecting(
@@ -3553,7 +3591,7 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                         &hearing.members,
                         &ask,
                         &|_| {},
-                        &|event| {
+                        &Paced(|event| {
                             if matches!(event, member_routes::ProjectionEvent::Maintenance) {
                                 let adjusted = make_due.swap(false, Ordering::SeqCst);
                                 if adjusted {
@@ -3568,14 +3606,15 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                                 }
                                 looked.send(adjusted).unwrap();
                             }
-                        },
-                        move |most| {
+                        }),
+                        member_routes::Rings::default(),
+                        move |deadline| {
                             crate::envelope::TEST_RETIRED
                                 .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
                             if std::mem::take(&mut consumed) {
                                 handled.send(()).expect("turn handled");
                             }
-                            consumed = ticks.recv_timeout(most).is_ok();
+                            consumed = ticks.recv_timeout(member_routes::rest(deadline)).is_ok();
                             false // A broker's arrival changes no route.
                         },
                         |maintain| {
@@ -3739,6 +3778,7 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
             ConvergenceInputs::new(Box::new(|_| panic!("maintenance reads no readiness")))
                 .with_maintenance(Box::new(move || {
                     upkeep.fetch_add(1, Ordering::SeqCst);
+                    None
                 })),
         );
         let (route, routes) = std::sync::mpsc::channel();
@@ -3751,7 +3791,7 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
             &members,
             &|_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst)),
             &|_| {},
-            &|event| {
+            &Paced(|event| {
                 if matches!(event, member_routes::ProjectionEvent::Maintenance) {
                     projection.maintain();
                     let _ = handled.send(());
@@ -3767,10 +3807,11 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
                         observations.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-            },
-            move |most| {
+            }),
+            member_routes::Rings::default(),
+            move |deadline| {
                 crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-                let came = routes.recv_timeout(most).is_ok();
+                let came = routes.recv_timeout(member_routes::rest(deadline)).is_ok();
                 if off && came && !std::mem::replace(&mut failed, true) {
                     panic!("injected listener failure while sharing is off");
                 }
@@ -3855,21 +3896,24 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
                     &hearing.members,
                     &ask,
                     &|_| {},
-                    &|admitted| match admitted {
+                    &Paced(|admitted| match admitted {
                         member_routes::ProjectionEvent::Admitted => projection.admitted(),
                         member_routes::ProjectionEvent::Observe => projection.poll(),
                         member_routes::ProjectionEvent::Recovered => projection.recovered(),
-                        member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                        member_routes::ProjectionEvent::Maintenance => {
+                            projection.maintain();
+                        }
                         member_routes::ProjectionEvent::BrokerReady
                         | member_routes::ProjectionEvent::Ended => {}
-                    },
-                    move |most| {
+                    }),
+                    member_routes::Rings::default(),
+                    move |deadline| {
                         crate::envelope::TEST_RETIRED
                             .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
                         if std::mem::take(&mut consumed) {
                             handled.send(()).unwrap();
                         }
-                        consumed = routes.recv_timeout(most).is_ok();
+                        consumed = routes.recv_timeout(member_routes::rest(deadline)).is_ok();
                         consumed
                     },
                     |maintain| {
@@ -3922,6 +3966,7 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
 #[cfg(unix)]
 #[test]
 fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_still() {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicI32, AtomicUsize};
     for exit in [0, 76] {
         for changed in [true, false] {
@@ -3980,19 +4025,22 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         &hearing.members,
                         &|_| Ok(0),
                         &log,
-                        &|admitted| match admitted {
+                        &Paced(|admitted| match admitted {
                             member_routes::ProjectionEvent::Admitted => projection.admitted(),
                             member_routes::ProjectionEvent::Observe => {
                                 projection.poll();
                                 completed.send(()).unwrap();
                             }
                             member_routes::ProjectionEvent::Recovered => projection.recovered(),
-                            member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                            member_routes::ProjectionEvent::Maintenance => {
+                                projection.maintain();
+                            }
                             member_routes::ProjectionEvent::BrokerReady
                             | member_routes::ProjectionEvent::Ended => {}
-                        },
-                        |most| {
-                            std::thread::sleep(most);
+                        }),
+                        member_routes::Rings::default(),
+                        |deadline| {
+                            std::thread::sleep(member_routes::rest(deadline));
                             false
                         },
                         |maintain| {
@@ -4087,6 +4135,117 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
             });
         }
     }
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("identity"));
+    let config = paths.home.join(".config/aterm/aterm.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+    let pending = std::sync::Arc::new(AtomicBool::new(false));
+    let identity = std::sync::Arc::clone(&pending);
+    let samples = std::sync::Arc::new(AtomicUsize::new(0));
+    let sampled = std::sync::Arc::clone(&samples);
+    // Repository admission supplies no work; identity is a separate input subject.
+    let inputs = ConvergenceInputs::new(Box::new(move |_| {
+        sampled.fetch_add(1, Ordering::SeqCst);
+        None
+    }))
+    .with_identity(Box::new(move || {
+        if identity.swap(false, Ordering::SeqCst) {
+            projection::IdentityDebt::Changed
+        } else {
+            projection::IdentityDebt::None
+        }
+    }));
+    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let quick = root.path().join("identity-runner");
+    std::fs::write(&quick, format!("#!{}\nexit 0\n", sh.display())).unwrap();
+    std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let requests = std::sync::Mutex::new(Vec::new());
+    let refuse = AtomicBool::new(false);
+    let start = |_: &Path, request| {
+        requests.lock().unwrap().push(request);
+        if refuse.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        let child =
+            RefCell::new(crate::converge::start_requested(&quick, "subscriber", request).unwrap());
+        until("the identity runner exits", || {
+            child.borrow_mut().exited().unwrap()
+        });
+        Some(child.into_inner())
+    };
+    let ports = Converging {
+        start: &start,
+        routes: &|| [None; 3],
+    };
+    let now = std::sync::atomic::AtomicU64::new(0);
+    let projection = projection::Projection::observing(&paths, &ports, inputs)
+        .at_clock(|| now.load(Ordering::SeqCst));
+    projection.start();
+    projection.poll();
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    pending.store(true, Ordering::SeqCst);
+    projection.poll();
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    pending.store(true, Ordering::SeqCst);
+    projection.after_pass(&SyncOutcome::Unchanged { seq: 1 }, SourceSaid::AtOnce);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "the completed child's readback cannot consume a later identity input"
+    );
+    projection.poll();
+    refuse.store(true, Ordering::SeqCst);
+    pending.store(true, Ordering::SeqCst);
+    projection.poll();
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    now.store(crate::converge::FIRST_RETRY_MS - 1, Ordering::SeqCst);
+    projection.poll();
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    now.store(crate::converge::FIRST_RETRY_MS, Ordering::SeqCst);
+    projection.poll();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        5,
+        "a refused dispatch remains owed"
+    );
+    projection.poll();
+    pending.store(true, Ordering::SeqCst);
+    projection.recovered();
+    projection.poll();
+    assert_eq!(requests.lock().unwrap().len(), 6);
+    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
+    pending.store(true, Ordering::SeqCst);
+    let before = samples.load(Ordering::SeqCst);
+    projection.poll();
+    assert_eq!(samples.load(Ordering::SeqCst), before);
+    assert!(
+        pending.load(Ordering::SeqCst),
+        "sharing Off does not consume identity input"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 6);
+    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+    projection.poll();
+    projection.poll();
+    assert!(!pending.load(Ordering::SeqCst));
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.work())
+            .collect::<Vec<_>>(),
+        vec![
+            crate::converge::RepositoryWork::Refresh,
+            crate::converge::RepositoryWork::Repair,
+            crate::converge::RepositoryWork::Repair,
+            crate::converge::RepositoryWork::Repair,
+            crate::converge::RepositoryWork::Repair,
+            crate::converge::RepositoryWork::Refresh,
+            crate::converge::RepositoryWork::Refresh,
+        ]
+    );
 }
 
 /// A failed readiness round must not retire local observation while HTTP still holds
@@ -4140,16 +4299,19 @@ fn a_failed_readiness_round_recovers_local_inputs_while_http_is_held() {
                 &hearing.members,
                 &|_| Ok(0),
                 &|_| {},
-                &|event| match event {
+                &Paced(|event| match event {
                     member_routes::ProjectionEvent::Admitted => projection.admitted(),
                     member_routes::ProjectionEvent::Observe => projection.poll(),
                     member_routes::ProjectionEvent::Recovered => projection.recovered(),
-                    member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                    member_routes::ProjectionEvent::Maintenance => {
+                        projection.maintain();
+                    }
                     member_routes::ProjectionEvent::BrokerReady
                     | member_routes::ProjectionEvent::Ended => {}
-                },
-                move |most| {
-                    if failing.recv_timeout(most).is_ok() {
+                }),
+                member_routes::Rings::default(),
+                move |deadline| {
+                    if failing.recv_timeout(member_routes::rest(deadline)).is_ok() {
                         panic!("injected readiness round failure");
                     }
                     false
@@ -5483,4 +5645,94 @@ fn a_wake_on_the_same_network_does_not_start_the_asks_over() {
         "a wake on the same network asked at once and kept its pauses"
     );
     assert_eq!(elsewhere, (8, 1), "another network asks at once");
+}
+
+/// A call that starts or reaps the projection's runner, or moves its retry, rings the readiness
+/// worker's bell, whichever thread made it; a call that moves nothing does not.
+/// NEGATIVE CONTROL: a projection that rings only as it starts a runner leaves the retry a
+/// reaped one set unheard.
+#[cfg(unix)]
+#[test]
+fn the_projection_rings_as_what_its_worker_awaits_moves() {
+    use std::os::fd::AsFd as _;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::locate_for_home(home.path());
+    let start = |_: &Path, _: crate::converge::RepositoryRequest| {
+        let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        Some(
+            aterm_uds::spawnfd::command(&sh)
+                .args(["-c", "exit 76"])
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let ports = Converging {
+        start: &start,
+        routes: &|| [None; 3],
+    };
+    let bell = std::sync::Arc::new(aterm_uds::ready::Doorbell::new().unwrap());
+    let projection = projection::Projection::new(&paths, &ports)
+        .at_clock(|| 0)
+        .ringing(Some(std::sync::Arc::clone(&bell)));
+    projection.start();
+    assert!(bell.clear(), "a runner started rings");
+    let wakes = projection.wakes();
+    let [exit] = wakes.as_slice() else {
+        panic!("one runner's exit to wait on, not {}", wakes.len());
+    };
+    let ended =
+        aterm_uds::ready::any(&[exit.as_fd()], Some(Instant::now() + HANG_DETECTOR)).unwrap();
+    assert!(!ended.is_empty(), "the runner exits");
+    // Darwin's kqueue tells of the exit (NOTE_EXIT) before the child is a zombie `waitpid` can
+    // take, so a reap just after it can still find the runner running; it moves nothing and
+    // rings nothing, and a later reap takes the runner.
+    let deadline = Instant::now() + HANG_DETECTOR;
+    loop {
+        projection.reap();
+        if bell.clear() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a runner reaped, its retry set, rings"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+    assert!(
+        projection.wakes().is_empty(),
+        "the reaped runner's exit is let go"
+    );
+    projection.reap();
+    assert!(!bell.clear(), "a call that moved nothing rings nothing");
+}
+
+/// The HTTP round rings the readiness worker's bell at each move in what that worker reads of the
+/// members' asking: a wait begun, an ask that moves the next one, a wait ended. A move the worker
+/// does not read rings nothing.
+/// NEGATIVE CONTROL: telling only as asking begins or ends leaves an ask that moved the next one
+/// unheard, and the worker waits out the earlier pause.
+#[test]
+fn the_members_asking_rings_as_what_its_worker_reads_moves() {
+    let bell = std::sync::Arc::new(aterm_uds::ready::Doorbell::new().unwrap());
+    let mut asked = MembersAsked {
+        rung: Some(std::sync::Arc::clone(&bell)),
+        ..MembersAsked::default()
+    };
+    let now = Instant::now();
+    asked.telling(|asked| asked.said = "asked".to_owned());
+    assert!(!bell.clear(), "what the worker does not read rings nothing");
+    asked.telling(|asked| {
+        asked.at = Some(now);
+        asked.on = Some((None, 1));
+        asked.asks = 1;
+    });
+    assert!(bell.clear(), "a wait begun rings");
+    asked.telling(|asked| asked.asks = 2);
+    assert!(bell.clear(), "a longer pause, the wait standing, rings");
+    asked.telling(|asked| asked.at = Some(now + Duration::from_secs(1)));
+    assert!(bell.clear(), "an ask made again rings");
+    asked.telling(|_| {});
+    assert!(!bell.clear(), "a round that moved nothing rings nothing");
+    asked.telling(MembersAsked::ended);
+    assert!(bell.clear(), "a wait ended rings");
 }

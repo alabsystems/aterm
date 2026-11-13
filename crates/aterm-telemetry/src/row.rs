@@ -564,6 +564,14 @@ pub(crate) fn seal(mut line: String) -> String {
     line
 }
 
+/// `body` sealed as a line ([`seal`]): a test's line of a later aterm's row, whose words this
+/// aterm's rows do not write.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn sealed(body: String) -> String {
+    seal(body)
+}
+
 /// A line's body when its checksum holds; `None` for a torn or altered line.
 pub(crate) fn unseal(line: &str) -> Option<&str> {
     let line = line.strip_suffix('\n').unwrap_or(line);

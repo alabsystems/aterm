@@ -303,7 +303,7 @@ fn a_wakes_fact_over_the_lines_cap_waits_whole() {
     let ride = ride(3);
     let suffix = fact_suffix(ride.fact());
     let hung = Fact {
-        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7),
+        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7, 1),
         text: format!("{} and then some", ride.fact().text),
         as_of_ms: 0,
     };
@@ -380,7 +380,7 @@ fn the_one_slot_takes_a_hung_calls_fact_first_and_a_wakes_only_from_its_grant() 
     let st = TurnEndState::default();
     let r = idle("Added the flag; the parser is next.", Some(3 * MIN));
     let hung = Fact {
-        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7),
+        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7, 1),
         text: "shell task bplle5dxj (pid 27098) has made no progress for 31 min".to_string(),
         as_of_ms: 0,
     };

@@ -68,7 +68,161 @@ impl Drop for RestartReservation {
     }
 }
 
+/// A fresh constructor reserved for the existing SDK owner itself. The native
+/// host still owns signed-image admission, policy, input custody and its Go
+/// record; this reservation cannot grant entry while old SDK custody remains.
+pub struct SourceExecReservation {
+    restart: RestartReservation,
+    caller: slot::Caller,
+}
+
+impl std::fmt::Debug for SourceExecReservation {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("SourceExecConstructor(<private>)")
+    }
+}
+
+impl SourceExecReservation {
+    pub fn command(&self) -> &RestartCommand {
+        self.restart.command()
+    }
+
+    /// Called by the native operation owner only when publishing its exact Go.
+    /// Check the original kernel image and explicit SDK retirement together with
+    /// the registry-owned constructor. EOF and a caller's empty inventory do not
+    /// establish retirement. A successful retry retains the same constructor.
+    /// An error never retracts an earlier Go or proves rollback is safe.
+    pub fn grant(&self) -> Result<(), Error> {
+        let original = &self.restart.native.child;
+        if Process::observe(original.pid).as_ref() != Some(original) {
+            return Err(Error::Stale);
+        }
+        let state = self.restart._launch.state.upgrade().ok_or(Error::Stale)?;
+        let state = lock(&state)?;
+        if state
+            .actors
+            .get(&actor_key(&self.caller))
+            .is_none_or(|actor| actor.process != *original)
+        {
+            return Err(Error::Stale);
+        }
+        retired_actor(&state, &self.caller)?;
+        if state
+            .launches
+            .get(&self.restart._launch.token)
+            .and_then(|launch| launch.native_restart.as_ref())
+            .is_none_or(|native| !Arc::ptr_eq(native, &self.restart.native))
+        {
+            return Err(Error::Stale);
+        }
+        self.restart.grant(original)
+    }
+}
+
+fn retired_actor(state: &State, caller: &slot::Caller) -> Result<(), Error> {
+    let key = actor_key(caller);
+    let actor = state.actors.get(&key).ok_or(Error::Stale)?;
+    let prefix = format!("{key}:");
+    if !actor.issued.is_empty()
+        || state
+            .plain_retiring
+            .keys()
+            .any(|member| member.starts_with(&prefix))
+        || state
+            .members
+            .keys()
+            .any(|member| member.starts_with(&prefix))
+        || state
+            .unrelated
+            .keys()
+            .any(|member| member.starts_with(&prefix))
+        || state
+            .preloads
+            .iter()
+            .any(|(member, pending)| member.starts_with(&prefix) && !pending.retired())
+        || state.uses.keys().any(|member| {
+            member.starts_with(&prefix) && reservation::has_credential_uses(state, member)
+        })
+        || state.reservations.contains_key(&key)
+        || state.retired_reservations.iter().any(|(history, cell)| {
+            history.starts_with(&prefix) && lock(cell).map_or(true, |cell| !cell.custody_retired())
+        })
+        || reservation::target::resources::custody_pending(state, caller)
+    {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
+
+/// A granted constructor may enter another image in the same kernel process.
+/// Preserve the old actor until explicit member retirement has completed; an
+/// image change, socket EOF or matching PID alone cannot erase its SDK custody.
+pub(super) fn advance_exec_actor(state: &mut State, peer: &Peer) -> Result<(), Error> {
+    let key = actor_key(&peer.caller);
+    let Some(actor) = state.actors.get(&key) else {
+        return Ok(());
+    };
+    if actor.process == peer.process {
+        return Ok(());
+    }
+    let launch = peer
+        .launch
+        .as_ref()
+        .and_then(|token| state.launches.get(token))
+        .ok_or(Error::Denied)?;
+    let native = launch.native_restart.as_ref().ok_or(Error::Denied)?;
+    if native.child != actor.process
+        || !native.admits(&peer.process)
+        || launch.image != peer.process.image
+        || launch.process.as_ref() != Some(&peer.process)
+        || launch.sid != peer.caller.sid
+    {
+        return Err(Error::Denied);
+    }
+    retired_actor(state, &peer.caller)?;
+    // New member IDs cannot collide with the old image's retired ordinals or
+    // release-only replay metadata, which remains under its original epoch.
+    let epoch = aterm_uds::rand::hex_token::<8>().map_err(|_| Error::Unavailable)?;
+    version(state)?;
+    let actor = state.actors.get_mut(&key).ok_or(Error::Stale)?;
+    actor.process = peer.process.clone();
+    actor.epoch = epoch;
+    actor.highwater = 0;
+    Ok(())
+}
+
 impl Registry {
+    /// Reserve fresh SDK construction for an actual registered source process.
+    /// Preparation may precede reader teardown; Go independently requires the
+    /// explicit retirement of that exact actor. Legacy file readers are refused.
+    pub fn reserve_source_exec(
+        &self,
+        env: &Env,
+        sid: &str,
+        command: &RestartCommand,
+        source: &Process,
+    ) -> Result<SourceExecReservation, Error> {
+        let caller = slot::Caller {
+            sid: sid.into(),
+            pid: source.pid,
+            birth: source.birth,
+        };
+        {
+            let state = lock(&self.state)?;
+            if state
+                .actors
+                .get(&actor_key(&caller))
+                .is_none_or(|actor| actor.process != *source)
+            {
+                return Err(Error::Denied);
+            }
+        }
+        let restart = self
+            .reserve_native_restart(env, sid, command, source)?
+            .ok_or(Error::Unsupported)?;
+        Ok(SourceExecReservation { restart, caller })
+    }
+
     /// Called off the native operation locks after actual launcher observation.
     /// This prepares constructor custody, not a native execution grant.
     pub fn reserve_native_restart(
@@ -192,198 +346,5 @@ impl Registry {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use crate::harness::native_act::RestartCommand;
-
-    fn pending() -> (Registry, RestartReservation, aterm_tempfile::TempDir) {
-        // Constructor metadata injection only. The kernel child and shared gate
-        // are real; this does not qualify an SDK image or OAuth/source owner.
-        pending_child(Process::observe(std::process::id()).unwrap())
-    }
-
-    fn pending_child(child: Process) -> (Registry, RestartReservation, aterm_tempfile::TempDir) {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let registry = Registry::for_app(&lifetime);
-        let token = "a".repeat(32);
-        let native = Arc::new(NativeRestart {
-            child: child.clone(),
-            granted: AtomicBool::new(false),
-            revoked: AtomicBool::new(false),
-        });
-        let command = RestartCommand {
-            settles: None,
-            account_intent: None,
-            image: child.image.clone(),
-            program: std::env::current_exe()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            argv: vec!["resume".into(), "original-thread".into()],
-            env: vec![(LAUNCH_ENV.into(), token.clone())],
-            unset: None,
-            cwd: Some(home.path().to_string_lossy().into_owned()),
-            heal: None,
-            dialect: crate::harness::upgrade::Dialect::Zsh,
-        };
-        registry.state.lock().unwrap().launches.insert(
-            token.clone(),
-            Launch {
-                sid: "s-restart-source-fixture".into(),
-                image: child.image.clone(),
-                expected_env: Vec::new(),
-                expected_unset: Vec::new(),
-                process: None,
-                typed: true,
-                gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
-                _scope: Some(lifetime.enter().unwrap()),
-                initial: None,
-                native_restart: Some(native.clone()),
-            },
-        );
-        let reservation = RestartReservation {
-            _launch: LaunchReservation {
-                token,
-                executable: std::env::current_exe().unwrap(),
-                state: Arc::downgrade(&registry.state),
-            },
-            native,
-            command,
-        };
-        (registry, reservation, home)
-    }
-
-    #[test]
-    fn native_constructor_requires_exact_go_child_and_keeps_immutable_recipe() {
-        let (_registry, reservation, _home) = pending();
-        let child = reservation.native.child.clone();
-        let mut original = reservation.command.clone();
-        original.env.retain(|(name, _)| name != LAUNCH_ENV);
-        assert!(reservation.matches(&original, &child));
-        assert!(!reservation.native.admits(&child));
-        let first_delivery = reservation.command().encode().unwrap();
-        assert_eq!(
-            reservation.command().encode().unwrap(),
-            first_delivery,
-            "repeated Attach returns the same token and command"
-        );
-        let mut reused = child.clone();
-        reused.birth += 1;
-        assert!(reservation.grant(&reused).is_err());
-        let mut changed = original.clone();
-        changed.argv.push("invented-input".into());
-        assert!(!reservation.matches(&changed, &child));
-        changed = original.clone();
-        changed
-            .env
-            .push(("CODEX_AUTH_PATH".into(), "/other/auth.json".into()));
-        assert!(!reservation.matches(&changed, &child));
-        reservation.grant(&child).unwrap();
-        assert!(reservation.native.admits(&child));
-        assert!(!reservation.native.admits(&reused));
-    }
-
-    #[test]
-    fn cancelled_ungranted_constructor_releases_gate_but_go_stays_owned_until_ready_or_death() {
-        let (registry, reservation, home) = pending();
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
-        drop(reservation);
-        registry.reap_gone();
-        assert!(registry.state.lock().unwrap().launches.is_empty());
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
-
-        let (registry, reservation, home) = pending();
-        reservation.grant(&reservation.native.child).unwrap();
-        drop(reservation);
-        registry.reap_gone();
-        assert_eq!(registry.state.lock().unwrap().launches.len(), 1);
-        assert!(
-            crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_err(),
-            "losing local operation ownership is not child death or SDK Ready"
-        );
-    }
-    #[test]
-    fn granted_child_exec_is_not_death_and_actual_exit_releases_constructor_gate() {
-        use std::io::Write as _;
-        let mut child = aterm_uds::spawnfd::command("/bin/sh")
-            .args(["-c", "read gate; exec /bin/cat"])
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let before = Process::observe(child.id()).unwrap();
-        let (registry, reservation, home) = pending_child(before.clone());
-        reservation.grant(&before).unwrap();
-        let mut input = child.stdin.take().unwrap();
-        input.write_all(b"go\n").unwrap();
-        input.flush().unwrap();
-        child.stdin = Some(input);
-        // The echo proves cat runs and is waiting for more input. Reading its image
-        // while exec changes the mapping can correctly return no observation.
-        let input = aterm_uds::deadline::cat_echoes(&mut child);
-        let current = Process::observe(child.id()).expect("the echoing cat remains alive");
-        assert_ne!(current.image, before.image);
-        assert_eq!(current.birth, before.birth);
-        drop(reservation);
-        registry.reap_gone();
-        assert_eq!(registry.state.lock().unwrap().launches.len(), 1);
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
-        drop(input);
-        let mut exit = aterm_uds::deadline::ExitWait::new(&child);
-        let by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            let left = by.saturating_duration_since(std::time::Instant::now());
-            assert!(!left.is_zero(), "cat exits after its input closes");
-            exit.wait(left);
-        };
-        assert!(status.success());
-        registry.reap_gone();
-        assert!(registry.state.lock().unwrap().launches.is_empty());
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
-    }
-
-    #[test]
-    fn actual_unrelated_ready_releases_constructor_without_claiming_child_death() {
-        let (registry, reservation, home) = pending();
-        let process = reservation.native.child.clone();
-        reservation.grant(&process).unwrap();
-        let token = reservation._launch.token.clone();
-        let peer = Peer {
-            caller: slot::Caller {
-                sid: "s-restart-source-fixture".into(),
-                pid: process.pid,
-                birth: process.birth,
-            },
-            process: process.clone(),
-            launch: Some(token.clone()),
-        };
-        registry
-            .state
-            .lock()
-            .unwrap()
-            .launches
-            .get_mut(&token)
-            .unwrap()
-            .bind(process);
-        let connection = registry.fixture_connection();
-        let operation = "b".repeat(32);
-        let member = registry
-            .open_member(&peer, &connection, &operation)
-            .unwrap();
-        registry
-            .complete_unrelated(
-                peer,
-                &connection,
-                &member.member,
-                &operation,
-                NoNativeReaderKind::ApiKey,
-            )
-            .unwrap();
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
-        assert!(Process::observe(std::process::id()).is_some());
-    }
-}
+#[path = "codex_source_restart_tests.rs"]
+mod tests;

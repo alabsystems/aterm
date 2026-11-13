@@ -1108,6 +1108,53 @@ fn store_and_erase_are_never_read() {
 }
 
 #[test]
+fn authenticated_exact_ref_reads_use_no_rest_and_do_not_return_prefix_matches() {
+    let world = World::canonical("helper-private-refs");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    let oid = crate::git_runner::host_git(&bare, &["rev-parse", "HEAD"]);
+    crate::git_runner::host_git(&bare, &["update-ref", "refs/aterm/judged", &oid]);
+    crate::git_runner::host_git(&bare, &["update-ref", "refs/aterm/judged-other", &oid]);
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("fixture-dev/app", &bare);
+    world.fake.clear_seen();
+    assert_eq!(
+        common::run_cli(
+            &mut ctx,
+            &[
+                "repo",
+                "refs",
+                "fixture-dev/app",
+                "--ref",
+                "refs/aterm/judged"
+            ]
+        ),
+        0,
+        "{}",
+        captured.stderr_text()
+    );
+    assert_eq!(
+        common::stdout_json(&captured),
+        aterm_json::json!([{"ref":"refs/aterm/judged", "oid":oid.trim()}])
+    );
+    assert!(
+        world.fake.seen().is_empty(),
+        "native authenticated ref reads spend no REST quota"
+    );
+    for flag in [&["--anonymous"][..], &["--as", "dev"][..]] {
+        let mut args = flag.to_vec();
+        args.extend(["repo", "refs", "fixture-dev/app"]);
+        assert_eq!(
+            common::run_cli(&mut ctx, &args),
+            2,
+            "a native read must not ignore identity flags"
+        );
+    }
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
 fn public_refs_include_peeled_tags_without_rest_or_writer_identity() {
     let world = World::canonical("helper-public-refs");
     let bare = crate::git_runner::bare_repo(world.root.path(), "app");

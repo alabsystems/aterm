@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! In-grid popup menu for the Autopilot chip and composer-rule facts (`crate::fact_menu`).
+//! In-grid popup card of the composer-rule facts' menus (`crate::fact_menu`) and of the
+//! permission chip's box (`crate::permission_box`): the row model, its placement, painter,
+//! pointer, keys and reader tree. A row is an item a choice closes the card on, or a slider of
+//! snap stops ([`MenuRow::Stops`]) whose pick leaves the card open.
 
-use std::sync::Arc;
-
-use aterm_agent::supervise::Autopilot;
-use aterm_core::render::{FxBlend, FxContent, FxLayer, FxRect, FxSlot, FxSpace, PxRect};
 use aterm_core::terminal::RenderCell;
 use aterm_effects::glass_inks::{GlassInks, field};
 use aterm_effects::harness_card::CardPalette;
 use aterm_render::Theme;
 
-use crate::autopilot::AutopilotView;
-use crate::autopilot_timers::TimerChoice;
-use crate::claude_footer::quota::{TickInks, TickOn};
-use crate::claude_lights::{Fact, LandAtGlass};
+use crate::claude_lights::Fact;
 use crate::fact_menu::FactAct;
 use crate::menu_viewport::MenuViewport;
 use crate::tab_menu::{MenuRect, display_cells, ellipsize};
 use crate::{App, WindowId};
-
-/// Timed Cruise durations in minutes.
-pub(crate) const LAND_IN_MINUTES: [u32; 3] = [60, 120, 240];
 
 const H_PAD: usize = 1;
 const MIN_CONTENT: usize = 24;
@@ -32,29 +25,33 @@ pub(crate) const MAX_CONTENT: usize = 44;
 pub(crate) const TRAFFIC_MAX_CONTENT: usize = 60;
 const GLYPH_CELLS: usize = 3;
 const CHECK_CELLS: usize = 2;
+/// The cells between an item's label and its trailing words.
+const TRAIL_GAP_CELLS: usize = 2;
+/// The cells a [`MenuRow::Fact`]'s name column takes in the cell card, the value beginning at
+/// the next: a card's fact names are at most 8 cells, so one blank at least parts the two, and
+/// a builder wraps a value to the room less this.
+pub(crate) const FACT_LABEL_CELLS: usize = 9;
+/// The cells a slider's stop takes before its label: its mark and a space.
+const STOP_MARK_CELLS: usize = 2;
+/// The fewest cells of track between two stops of a slider with room for them: a space, three
+/// of track, a space.
+const STOP_TRACK_CELLS: usize = 5;
+/// A slider's stop the thumb stands on, and one it does not.
+const STOP_THUMB: char = '\u{25cf}';
+const STOP_MARK: char = '\u{25cb}';
 
 /// Action performed when a menu row is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAct {
-    Mode(Autopilot),
-    Timer(TimerChoice),
-    Settings,
     Fact(Fact, FactAct),
 }
 
-/// Owner of the open card (Autopilot chip or composer-rule fact).
+/// Owner of the open card: the composer-rule fact it hangs from, or the permission chip, whose
+/// box has no row to choose (`crate::permission_box`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuOwner {
-    Autopilot,
     Fact(Fact),
-}
-
-impl MenuOwner {
-    /// Whether the card is the Autopilot chip's menu.
-    #[must_use]
-    pub(crate) const fn is_autopilot(self) -> bool {
-        matches!(self, Self::Autopilot)
-    }
+    Permission,
 }
 
 impl MenuAct {
@@ -62,11 +59,6 @@ impl MenuAct {
     #[must_use]
     pub(crate) fn key(self) -> String {
         match self {
-            Self::Mode(mode) => format!("autopilot-menu/mode/{}", mode.word()),
-            Self::Timer(TimerChoice::In(minutes)) => format!("autopilot-menu/land-in/{minutes}"),
-            Self::Timer(TimerChoice::At) => "autopilot-menu/land-at".to_string(),
-            Self::Timer(TimerChoice::Cancel) => "autopilot-menu/land-cancel".to_string(),
-            Self::Settings => "autopilot-menu/settings".to_string(),
             Self::Fact(fact, act) => format!("fact-menu/{}/{}", fact.key(), act.key()),
         }
     }
@@ -84,23 +76,26 @@ pub(crate) enum MenuRow {
         spoken: String,
         tone: NoteTone,
     },
-    /// Provenance note (`set 14:05 …`), with `floor` width preserved across rebuilds.
-    SetBy {
-        text: String,
-        floor: usize,
-    },
     Rule,
+    /// A group heading: the title of the rows under it, to the next heading. Not a choice; a
+    /// screen reader is told the title as part of the card's name.
+    Section(String),
+    /// A named fact: its name (`Token`) and its value (`none in the vault`) in `tone`'s ink,
+    /// and the pair as a screen reader is told it (`spoken`, part of the card's name; empty on
+    /// a row that continues the fact above it, whose `label` is empty too). Not a choice. The
+    /// builder wraps a long value over rows: a row never wraps itself.
+    Fact {
+        label: String,
+        value: String,
+        spoken: String,
+        tone: NoteTone,
+    },
     /// Blank placeholder preserving row positions after a choice disappears.
     Gap(usize),
-    /// A drawn row (a chart, a bar, a strip) with the caption a screen reader is told for it,
-    /// and, on a row with a clock (the Accounts card's work row and lanes), its midnights'
-    /// ticks: each one's place from the row's left edge
-    /// ([`aterm_agent::harness::quota_view::CELL_PLACES`] a cell), drawn by [`plot_ticks`]. The
-    /// ticks move with the clock and are paint, not the row's reader identity (its `Hash`).
+    /// A drawn row (a chart, a bar, a strip) with the caption a screen reader is told for it.
     Plot {
         cells: Box<[PlotCell]>,
         spoken: String,
-        ticks: Box<[i64]>,
     },
     Item {
         glyph: &'static str,
@@ -109,7 +104,89 @@ pub(crate) enum MenuRow {
         act: MenuAct,
         enabled: bool,
         checked: bool,
+        /// Words set apart from the label at the row's far end (`≤88% left`): what the choice
+        /// stands at, not its name. Empty for none.
+        trail: String,
     },
+    /// A slider of snap stops: one selectable row whose pick does not close the card. The row
+    /// holds what a slider is, never how it is drawn: its stops in order, the stop its thumb
+    /// stands on (`None`: the value is none of them) and the stop the keys or the pointer rest
+    /// on. The rest is the card's own state, kept across a rebuild of its rows and left out of
+    /// the row's reader identity (its `Hash`).
+    Stops {
+        /// What the slider sets, as a screen reader names it (`Effort`).
+        name: String,
+        stops: Box<[Stop]>,
+        at: Option<usize>,
+        focus: Option<usize>,
+    },
+}
+
+/// One snap stop of a [`MenuRow::Stops`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stop {
+    /// The stop's word on the track (`medium`), which a screen reader is told as the value.
+    pub(crate) label: String,
+    /// What picking it does.
+    pub(crate) act: MenuAct,
+    pub(crate) enabled: bool,
+}
+
+/// The cells each of `stops` takes, mark and label, in a slider `room` cells wide, from the
+/// row's first text cell: the first stop at the left end, the last at the right, the track
+/// shared evenly between them. The painter and the pointer both read it, so a press lands on
+/// the stop drawn under it. In a row too narrow for every label the later spans are cut at
+/// `room`.
+#[must_use]
+pub(crate) fn stop_spans(stops: &[Stop], room: usize) -> Vec<std::ops::Range<usize>> {
+    let widths: Vec<usize> = stops
+        .iter()
+        .map(|stop| STOP_MARK_CELLS + display_cells(&stop.label))
+        .collect();
+    let gaps = stops.len().saturating_sub(1);
+    let track = room.saturating_sub(widths.iter().sum());
+    let mut at = 0;
+    widths
+        .iter()
+        .enumerate()
+        .map(|(i, width)| {
+            if i > 0 {
+                // An uneven track gives its odd cells to the leftmost gaps; a row with no room
+                // keeps one cell between two stops.
+                at += (track / gaps + usize::from(i <= track % gaps)).max(1);
+            }
+            let span = at.min(room)..(at + width).min(room);
+            at += width;
+            span
+        })
+        .collect()
+}
+
+/// The stop of a slider a press at `cell`, counted from the row's first text cell, snaps to:
+/// the one whose span ([`stop_spans`]) holds it, else the nearer of the two it lies between.
+#[must_use]
+pub(crate) fn stop_near(spans: &[std::ops::Range<usize>], cell: usize) -> Option<usize> {
+    let last = spans.len().checked_sub(1)?;
+    Some(
+        spans
+            .windows(2)
+            .position(|pair| 2 * cell < pair[0].end + pair[1].start)
+            .unwrap_or(last),
+    )
+}
+
+/// The enabled stop next to `from` on a slider, toward its `up` end; from no stop, the first
+/// enabled one from the other end. `None` where there is none that way: a slider's ends do not
+/// wrap.
+#[must_use]
+pub(crate) fn stop_step(stops: &[Stop], from: Option<usize>, up: bool) -> Option<usize> {
+    let live = |i: &usize| stops[*i].enabled;
+    match (from, up) {
+        (Some(from), true) => (from + 1..stops.len()).find(live),
+        (Some(from), false) => (0..from.min(stops.len())).rev().find(live),
+        (None, true) => (0..stops.len()).find(live),
+        (None, false) => (0..stops.len()).rev().find(live),
+    }
 }
 
 impl MenuRow {
@@ -135,43 +212,90 @@ impl MenuRow {
         }
     }
 
-    /// A drawn row of `cells` a screen reader is told as `spoken`, with no clock.
+    /// A drawn row of `cells` a screen reader is told as `spoken`.
     #[must_use]
     pub(crate) fn plot(cells: impl Into<Box<[PlotCell]>>, spoken: impl Into<String>) -> Self {
-        Self::plot_ticked(cells, spoken, Box::default())
-    }
-
-    /// A drawn row of `cells` a screen reader is told as `spoken`, its midnights' ticks at
-    /// `ticks` ([`MenuRow::Plot`]).
-    #[must_use]
-    pub(crate) fn plot_ticked(
-        cells: impl Into<Box<[PlotCell]>>,
-        spoken: impl Into<String>,
-        ticks: impl Into<Box<[i64]>>,
-    ) -> Self {
         Self::Plot {
             cells: cells.into(),
             spoken: spoken.into(),
-            ticks: ticks.into(),
+        }
+    }
+
+    /// A slider named `name` of `stops`, its thumb on `at`.
+    #[must_use]
+    pub(crate) fn stops(
+        name: impl Into<String>,
+        stops: impl Into<Box<[Stop]>>,
+        at: Option<usize>,
+    ) -> Self {
+        Self::Stops {
+            name: name.into(),
+            stops: stops.into(),
+            at,
+            focus: None,
         }
     }
 
     /// Whether a click or Return can choose this row.
     #[must_use]
-    pub(crate) const fn selectable(&self) -> bool {
-        matches!(self, Self::Item { enabled: true, .. })
+    pub(crate) fn selectable(&self) -> bool {
+        match self {
+            Self::Item { enabled, .. } => *enabled,
+            Self::Stops { stops, .. } => stops.iter().any(|stop| stop.enabled),
+            _ => false,
+        }
     }
 
-    fn text(&self) -> String {
+    /// The stop a slider's choice picks: the one the keys or the pointer rest on, else the one
+    /// its thumb stands on.
+    #[must_use]
+    pub(crate) fn rested_stop(&self) -> Option<usize> {
         match self {
-            Self::Header(text) | Self::Note { text, .. } | Self::SetBy { text, .. } => text.clone(),
+            Self::Stops { at, focus, .. } => focus.or(*at),
+            _ => None,
+        }
+    }
+
+    /// The row's words as its cells show them, unpainted.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Header(text) | Self::Note { text, .. } => text.clone(),
             Self::Name(name) => quoted(name),
+            Self::Section(title) => title.clone(),
+            Self::Fact { label, value, .. } if value.is_empty() => label.clone(),
+            Self::Fact { label, value, .. } => {
+                let pad = fact_value_at(label).saturating_sub(display_cells(label));
+                format!("{label}{}{value}", " ".repeat(pad))
+            }
             Self::Rule | Self::Gap(_) => String::new(),
             Self::Plot { cells, .. } => cells.iter().map(|cell| cell.ch).collect(),
-            Self::Item { glyph, label, .. } => {
+            Self::Item {
+                glyph,
+                label,
+                trail,
+                ..
+            } => {
                 let pad = GLYPH_CELLS.saturating_sub(display_cells(glyph));
-                format!("{glyph}{}{label}", " ".repeat(pad))
+                let gap = if trail.is_empty() { 0 } else { TRAIL_GAP_CELLS };
+                format!(
+                    "{glyph}{}{label}{}{trail}",
+                    " ".repeat(pad),
+                    " ".repeat(gap)
+                )
             }
+            Self::Stops { stops, at, .. } => stops
+                .iter()
+                .enumerate()
+                .map(|(i, stop)| {
+                    let mark = if *at == Some(i) {
+                        STOP_THUMB
+                    } else {
+                        STOP_MARK
+                    };
+                    format!("{mark} {}", stop.label)
+                })
+                .collect::<Vec<_>>()
+                .join(" \u{2500}\u{2500}\u{2500} "),
         }
     }
 }
@@ -179,8 +303,8 @@ impl MenuRow {
 /// `text` as a screen reader is told it: its words, the glyphs that mark or
 /// draw (`◆`, `⎇`, `▱▱▱`, an arrow) left out, and a `·` or `—` between two
 /// parts a comma: `⎆  sol@example.test · max 20x` is `sol@example.test, max 20x`.
-/// A lower bound's `≥` is a word, said `at least`: `weekly ≥38% used` is
-/// `weekly at least 38% used`, never the bound as an exact figure.
+/// A bound's sign is a word, `≥` said `at least` and `≤` `at most`: `weekly ≤62% left` is
+/// `weekly at most 62% left`, never the bound as an exact figure.
 #[must_use]
 pub(crate) fn spoken_words(text: &str) -> String {
     let glyph = |c: char| !c.is_ascii() && !c.is_alphanumeric();
@@ -199,11 +323,12 @@ pub(crate) fn spoken_words(text: &str) -> String {
             out.push_str(if part { ", " } else { " " });
         }
         part = false;
-        if token
-            .trim_start_matches(|c| glyph(c) && c != '\u{2265}')
-            .starts_with('\u{2265}')
-        {
+        // A bound's sign is a word: `≤30% left` is `at most 30% left`, `≥$40` `at least $40`.
+        let bound = token.trim_start_matches(|c| glyph(c) && !matches!(c, '\u{2264}' | '\u{2265}'));
+        if bound.starts_with('\u{2265}') {
             out.push_str("at least ");
+        } else if bound.starts_with('\u{2264}') {
+            out.push_str("at most ");
         }
         out.push_str(word);
     }
@@ -218,9 +343,9 @@ pub(crate) struct PlotCell {
     pub(crate) busy: bool,
 }
 
-/// Ink role for a [`PlotCell`]: the Accounts card's follow its `CardInk`
-/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1), each a token of the glass the card
-/// wears ([`GlassInks`]), a hued one at its column's palette position over the card's own width.
+/// Ink role for a [`PlotCell`] (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1): each a
+/// token of the glass the card wears ([`GlassInks`]), a hued one at its column's palette position
+/// over the card's own width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PlotInk {
     /// The traffic card's inbound band: the card's accent.
@@ -231,20 +356,17 @@ pub(crate) enum PlotInk {
     Axis,
     /// A measured level (`▁…█`): the glass's mark at the cell's column, 3:1 or more.
     Read,
-    /// The projected line (`▁ 🭻…🭶 ▔`; a lane's `▁ 🭻…🭸`): the glass's letter at the cell's
-    /// column, 4.5:1 or more.
-    Ahead,
     /// `→` and `↺`: the glass's lit ink.
     Mark,
     /// `┄`: the glass's track, 3:1 or more.
     Track,
-    /// `╳`, `$` and a lane's out line: the glass's warn ink, bold, on its wash ([`WARN_WASH`]).
+    /// `╳` and `$`: the glass's warn ink, bold, on its wash ([`WARN_WASH`]).
     Warn,
     /// A name inside a chart: the glass's value ink.
     Value,
 }
 
-/// The ink a [`MenuRow::Note`]'s words take.
+/// The ink a [`MenuRow::Note`]'s words, or a [`MenuRow::Fact`]'s value, take.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum NoteTone {
     /// The card's label ink, as every note before the outlook.
@@ -256,6 +378,26 @@ pub(crate) enum NoteTone {
     Warn,
 }
 
+impl NoteTone {
+    /// The tone's word on a `controls` line.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Value => "value",
+            Self::Warn => "warn",
+        }
+    }
+}
+
+/// The cell of a fact's row, from its first text cell, its value begins at: the name column's
+/// end ([`FACT_LABEL_CELLS`]), or one blank past a name that outruns the column.
+fn fact_value_at(label: &str) -> usize {
+    match display_cells(label) {
+        0 => FACT_LABEL_CELLS,
+        cells => FACT_LABEL_CELLS.max(cells + 1),
+    }
+}
+
 fn quoted(name: &str) -> String {
     format!("\u{201c}{name}\u{201d}")
 }
@@ -265,121 +407,6 @@ fn quoted_in(name: &str, room: usize) -> String {
         return quoted(name);
     }
     quoted(&ellipsize(name, room.saturating_sub(2)))
-}
-
-/// Snapshot of session state used to build the menu rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MenuFacts {
-    pub(crate) title: String,
-    pub(crate) name: Option<String>,
-    pub(crate) room: usize,
-    pub(crate) spoken: String,
-    pub(crate) view: AutopilotView,
-    pub(crate) carries: bool,
-    pub(crate) land_at: Option<LandAtGlass>,
-    pub(crate) armed_at_ms: Option<i64>,
-    pub(crate) armed: Option<LandAtGlass>,
-    pub(crate) set_by: Option<String>,
-}
-
-/// Format a landing time (`18:00` or `Sat 16:00`).
-pub(crate) fn when(at: LandAtGlass) -> String {
-    match at.other_day {
-        Some(day) => format!("{} {}", day.short(), at.clock.as_str()),
-        None => at.clock.as_str().to_string(),
-    }
-}
-
-/// Format [`when`] for screen readers (`18:00` or `Saturday 16:00`).
-pub(crate) fn spoken_when(at: LandAtGlass) -> String {
-    match at.other_day {
-        Some(day) => format!("{} {}", day.long(), at.clock.as_str()),
-        None => at.clock.as_str().to_string(),
-    }
-}
-
-/// Build the Autopilot menu rows from `facts`.
-#[must_use]
-pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
-    let on = facts.carries;
-    let mut out = header_rows(&facts.title, facts.name.as_deref(), facts.room);
-    if let Some(set_by) = &facts.set_by {
-        out.extend(set_by_rows(set_by, facts.room));
-    }
-    if !on {
-        let why = match facts.view {
-            AutopilotView::AgentOff(agent) => crate::autopilot::agent_switch_off(agent),
-            _ => "harness off in Settings",
-        };
-        out.push(MenuRow::note(why));
-    }
-    for (mode, glyph, label) in [
-        (Autopilot::Cruise, "\u{221e}", "Cruise"),
-        (Autopilot::Land, "\u{2913}", "Land now"),
-        (Autopilot::Off, "\u{25cb}", "Off"),
-    ] {
-        out.push(MenuRow::Item {
-            glyph,
-            label: label.to_string(),
-            spoken: label.to_string(),
-            act: MenuAct::Mode(mode),
-            enabled: on,
-            checked: on && facts.view.mode() == Some(mode),
-        });
-    }
-    out.push(MenuRow::Rule);
-    for minutes in LAND_IN_MINUTES {
-        let hours = minutes / 60;
-        let span = if hours == 1 {
-            "1 hour".to_string()
-        } else {
-            format!("{hours} hours")
-        };
-        out.push(MenuRow::Item {
-            glyph: "\u{221e}\u{2913}",
-            label: format!("Cruise {span}, then land"),
-            spoken: format!("Cruise for {span}, then land"),
-            act: MenuAct::Timer(TimerChoice::In(minutes)),
-            enabled: on,
-            checked: false,
-        });
-    }
-    if let Some(at) = facts.land_at {
-        out.push(MenuRow::Item {
-            glyph: "\u{221e}\u{2913}",
-            label: format!("Cruise until {}, then land", when(at)),
-            spoken: format!("Cruise until {}, then land", spoken_when(at)),
-            act: MenuAct::Timer(TimerChoice::At),
-            enabled: on,
-            checked: false,
-        });
-    }
-    if facts.armed_at_ms.is_some() {
-        out.push(MenuRow::Item {
-            glyph: "\u{2715}",
-            label: facts.armed.map_or_else(
-                || "Cancel landing".to_string(),
-                |armed| format!("Cancel landing at {}", when(armed)),
-            ),
-            spoken: facts.armed.map_or_else(
-                || "Cancel landing".to_string(),
-                |armed| format!("Cancel landing at {}", spoken_when(armed)),
-            ),
-            act: MenuAct::Timer(TimerChoice::Cancel),
-            enabled: on,
-            checked: false,
-        });
-    }
-    out.push(MenuRow::Rule);
-    out.push(MenuRow::Item {
-        glyph: "\u{2699}",
-        label: "Harness settings\u{2026}".to_string(),
-        spoken: "Harness settings".to_string(),
-        act: MenuAct::Settings,
-        enabled: true,
-        checked: false,
-    });
-    out
 }
 
 /// Build header rows for `title` and optional `name` within `room` cells.
@@ -410,53 +437,6 @@ fn place_rows(title: &str, room: usize) -> Vec<MenuRow> {
     }
 }
 
-fn set_by_rows(note: &str, room: usize) -> Vec<MenuRow> {
-    let row = |text: String| MenuRow::SetBy { text, floor: 0 };
-    if display_cells(note) <= room {
-        return vec![row(note.to_string())];
-    }
-    match note.rsplit_once(", ") {
-        Some((head, tail)) if display_cells(head) < room && display_cells(tail) <= room => {
-            vec![row(format!("{head},")), row(tail.to_string())]
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Drop [`MenuRow::SetBy`] rows when keeping them would truncate the card or flip its side.
-#[must_use]
-pub(crate) fn fit_rows(
-    rows: Vec<MenuRow>,
-    anchor: (usize, usize),
-    pane: (std::ops::Range<usize>, std::ops::Range<usize>),
-    frame: (usize, usize),
-    top: usize,
-) -> Vec<MenuRow> {
-    if !rows.iter().any(|row| matches!(row, MenuRow::SetBy { .. })) {
-        return rows;
-    }
-    let without: Vec<MenuRow> = rows
-        .iter()
-        .filter(|row| !matches!(row, MenuRow::SetBy { .. }))
-        .cloned()
-        .collect();
-    let side = |rect: MenuRect| {
-        if rect.row + rect.h <= anchor.0 {
-            0u8
-        } else if rect.row > anchor.0 {
-            2
-        } else {
-            1
-        }
-    };
-    let with = place(&rows, anchor, pane.clone(), frame, top);
-    let bare = place(&without, anchor, pane, frame, top);
-    match (with, bare) {
-        (Some(with), Some(bare)) if with.h == rows.len() + 2 && side(with) == side(bare) => rows,
-        _ => without,
-    }
-}
-
 fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
     match (a, b) {
         (
@@ -464,52 +444,55 @@ fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
                 act: act_a,
                 label: label_a,
                 enabled: enabled_a,
+                trail: trail_a,
                 ..
             },
             MenuRow::Item {
                 act: act_b,
                 label: label_b,
                 enabled: enabled_b,
+                trail: trail_b,
                 ..
             },
-        ) => act_a == act_b && label_a == label_b && enabled_a == enabled_b,
+        ) => act_a == act_b && label_a == label_b && enabled_a == enabled_b && trail_a == trail_b,
+        (MenuRow::Stops { stops: a, .. }, MenuRow::Stops { stops: b, .. }) => a == b,
         _ => false,
     }
 }
 
-/// Whether `shown` and `fresh` are the same rows but for their drawn rows' midnights' ticks
-/// ([`MenuRow::Plot`]): the same cells and captions, so the items a pointer presses and a reader
-/// is told are unchanged. The ticks are measured from the chart's now, so they move at each
-/// replay of the outlook (once a minute) while nothing the card says moves.
-fn same_but_ticks(shown: &[MenuRow], fresh: &[MenuRow]) -> bool {
-    shown.len() == fresh.len()
-        && shown.iter().zip(fresh).all(|pair| match pair {
-            (
-                MenuRow::Plot { cells, spoken, .. },
-                MenuRow::Plot {
-                    cells: fresh_cells,
-                    spoken: fresh_spoken,
-                    ..
-                },
-            ) => cells == fresh_cells && spoken == fresh_spoken,
-            (shown, fresh) => shown == fresh,
-        })
-}
-
 /// The cells `row` takes: its text's ([`MenuRow::text`]), counted without building it, since a
 /// text's cells are the sum of its characters' ([`display_cells`]); a card's width is read every
-/// frame it is painted ([`side_pad`]) and laid ([`plot_ticks`]), and so allocates nothing.
-fn row_width(row: &MenuRow) -> usize {
+/// frame it is painted ([`side_pad`]), and so allocates nothing.
+pub(crate) fn row_width(row: &MenuRow) -> usize {
     match row {
         MenuRow::Gap(cells) => *cells,
         MenuRow::Plot { cells, .. } => cells.len(),
-        MenuRow::Item { glyph, label, .. } => {
-            display_cells(glyph).max(GLYPH_CELLS) + display_cells(label) + CHECK_CELLS
+        MenuRow::Item {
+            glyph,
+            label,
+            trail,
+            ..
+        } => {
+            let trail = match display_cells(trail) {
+                0 => 0,
+                cells => TRAIL_GAP_CELLS + cells,
+            };
+            display_cells(glyph).max(GLYPH_CELLS) + display_cells(label) + trail + CHECK_CELLS
         }
-        MenuRow::SetBy { text, floor } => display_cells(text).max(*floor),
         MenuRow::Header(text) | MenuRow::Note { text, .. } => display_cells(text),
+        // The heading's blank and one cell of its rule at least.
+        MenuRow::Section(title) => display_cells(title) + 2,
+        MenuRow::Fact { label, value, .. } if value.is_empty() => display_cells(label),
+        MenuRow::Fact { label, value, .. } => fact_value_at(label) + display_cells(value),
         MenuRow::Name(name) => {
             display_cells("\u{201c}") + display_cells(name) + display_cells("\u{201d}")
+        }
+        MenuRow::Stops { stops, .. } => {
+            stops
+                .iter()
+                .map(|stop| STOP_MARK_CELLS + display_cells(&stop.label))
+                .sum::<usize>()
+                + stops.len().saturating_sub(1) * STOP_TRACK_CELLS
         }
         MenuRow::Rule => 0,
     }
@@ -555,10 +538,12 @@ fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
     }
 }
 
+/// The fewest rows a card of `rows` opens in, its border included: its head, the rows before
+/// its first rule or group heading, so a card of sections needs room for what it says first and
+/// scrolls the rest.
 fn least_rows(rows: &[MenuRow]) -> usize {
     rows.iter()
-        .take_while(|row| !matches!(row, MenuRow::Rule))
-        .filter(|row| !matches!(row, MenuRow::SetBy { .. }))
+        .take_while(|row| !matches!(row, MenuRow::Rule | MenuRow::Section(_)))
         .count()
         + 2
 }
@@ -569,9 +554,14 @@ fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
         | (MenuRow::Name(_), MenuRow::Name(_))
         | (MenuRow::Note { .. }, MenuRow::Note { .. })
         | (MenuRow::Plot { .. }, MenuRow::Plot { .. })
-        | (MenuRow::SetBy { .. }, MenuRow::SetBy { .. })
         | (MenuRow::Rule, MenuRow::Rule) => true,
+        (MenuRow::Section(a), MenuRow::Section(b)) => a == b,
+        (MenuRow::Fact { label: a, .. }, MenuRow::Fact { label: b, .. }) => a == b,
         (MenuRow::Item { act: a, .. }, MenuRow::Item { act: b, .. }) => a == b,
+        (MenuRow::Stops { stops: a, .. }, MenuRow::Stops { stops: b, .. }) => a
+            .iter()
+            .map(|stop| stop.act)
+            .eq(b.iter().map(|stop| stop.act)),
         _ => false,
     }
 }
@@ -584,10 +574,6 @@ pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<Me
         .iter()
         .map(
             |old| match next.next_if(|new| same_place(old, new)).cloned() {
-                Some(MenuRow::SetBy { text, floor }) => MenuRow::SetBy {
-                    text,
-                    floor: floor.max(row_width(old)),
-                },
                 Some(new) => new,
                 None => MenuRow::Gap(row_width(old)),
             },
@@ -671,6 +657,29 @@ pub(crate) fn item_at(
     rows.get(i).filter(|r| r.selectable()).map(|_| i)
 }
 
+/// A pointer's place on the card: a selectable row, and on a slider the stop under the column.
+pub(crate) type Hit = (usize, Option<usize>);
+
+/// The selectable row at frame `(row, col)` ([`item_at`]) and, on a slider, the stop the column
+/// snaps to ([`stop_near`] of the row's [`stop_spans`]).
+#[must_use]
+pub(crate) fn hit_at(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    row: usize,
+    col: usize,
+) -> Option<Hit> {
+    let i = item_at(rect, rows, viewport, row, col)?;
+    let MenuRow::Stops { stops, .. } = &rows[i] else {
+        return Some((i, None));
+    };
+    let (text_start, text_end) = text_span(rect.w, rows);
+    let cell = col.saturating_sub(rect.col + text_start);
+    let spans = stop_spans(stops, text_end.saturating_sub(text_start));
+    Some((i, stop_near(&spans, cell)))
+}
+
 /// Advance highlight through every selectable logical row, wrapping at either end.
 #[must_use]
 pub(crate) fn step(rows: &[MenuRow], from: Option<usize>, down: bool) -> Option<usize> {
@@ -732,6 +741,9 @@ pub(crate) enum MenuKey {
     End,
     PageUp,
     PageDown,
+    /// Toward a slider's low end, and toward its high end ([`MenuRow::Stops`]).
+    Left,
+    Right,
     Choose,
     Close,
     PassThrough,
@@ -752,7 +764,11 @@ pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
         Key::Named(Nk::End | Nk::NumpadEnd) => MenuKey::End,
         Key::Named(Nk::PageUp | Nk::NumpadPageUp) => MenuKey::PageUp,
         Key::Named(Nk::PageDown | Nk::NumpadPageDown) => MenuKey::PageDown,
-        Key::Named(Nk::Enter | Nk::NumpadEnter) => MenuKey::Choose,
+        Key::Named(Nk::ArrowLeft | Nk::NumpadArrowLeft) => MenuKey::Left,
+        Key::Named(Nk::ArrowRight | Nk::NumpadArrowRight) => MenuKey::Right,
+        Key::Named(Nk::Enter | Nk::NumpadEnter | Nk::Space) | Key::Character(' ') => {
+            MenuKey::Choose
+        }
         Key::Named(Nk::Escape) => MenuKey::Close,
         _ => MenuKey::PassThrough,
     }
@@ -809,90 +825,14 @@ fn text_span(w: usize, rows: &[MenuRow]) -> (usize, usize) {
     (1 + pad, w.saturating_sub(1 + pad))
 }
 
-/// The midnights' ticks on the card's visible drawn rows (§1.4, §2.2) into `out` (cleared
-/// first), in pixels from the card's top left corner at cells `cell` device pixels: each
-/// [`MenuRow::Plot`]'s ticks on the row it is painted on, from the card's text column as
-/// [`paint_plot`] lays its cells, and none past the text's end, as line E lays its own
-/// ([`crate::claude_footer::quota::push_ticks`]), each in the ink of what it stands on: a glyph
-/// that inks its foot (a measured step, a low projected line), a warn cell's wash, or the card's
-/// ground ([`TickOn`]).
-pub(crate) fn plot_ticks(
-    rect: MenuRect,
-    rows: &[MenuRow],
-    viewport: MenuViewport,
-    cell: (u16, u16),
-    out: &mut Vec<FxRect>,
-) {
-    out.clear();
-    let (text_start, text_end) = text_span(rect.w, rows);
-    let room = text_end.saturating_sub(text_start);
-    let left = i32::try_from(text_start)
-        .unwrap_or(i32::MAX)
-        .saturating_mul(i32::from(cell.0));
-    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
-    for (r, row) in rows
-        .iter()
-        .enumerate()
-        .take(visible.end)
-        .skip(visible.start)
-        .map(|(i, row)| (1 + i - visible.start, row))
-        .take_while(|&(r, _)| r + 1 < rect.h)
-    {
-        let MenuRow::Plot { cells, ticks, .. } = row else {
-            continue;
-        };
-        let from = out.len();
-        let top = i32::try_from(r)
-            .unwrap_or(i32::MAX)
-            .saturating_mul(i32::from(cell.1));
-        crate::claude_footer::quota::push_ticks(out, ticks, (top, room), cell, |i| {
-            cells
-                .get(i)
-                .map_or(TickOn::Ground, |c| TickOn::of(c.ch, c.ink == PlotInk::Warn))
-        });
-        for tick in &mut out[from..] {
-            tick.x = tick.x.saturating_add(left);
-        }
-    }
-}
-
-/// An open card's midnights' ticks ([`plot_ticks`]): this frame's rects, refilled in place,
-/// and the content sealed of them, which a frame whose ticks have not moved hands on again, so
-/// a card at rest seals and allocates nothing for them.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CardTicks {
-    rects: Vec<FxRect>,
-    content: Option<Arc<FxContent>>,
-}
-
-impl CardTicks {
-    /// The content of the ticks of `rows` on a card at `rect` ([`plot_ticks`]) in `inks`: the
-    /// last frame's where they and the inks are unchanged.
-    fn content(
-        &mut self,
-        (rect, rows, viewport): (MenuRect, &[MenuRow], MenuViewport),
-        cell: (u16, u16),
-        inks: TickInks,
-    ) -> Option<Arc<FxContent>> {
-        plot_ticks(rect, rows, viewport, cell, &mut self.rects);
-        let same = self.content.as_deref().map_or(self.rects.is_empty(), |c| {
-            crate::claude_footer::quota::draws_ticks(c, &self.rects, inks)
-        });
-        if !same {
-            self.content = crate::claude_footer::quota::tick_content(&self.rects, inks);
-        }
-        self.content.clone()
-    }
-}
-
 /// Render the menu card into `rect.h` rows of `rect.w` cells, wearing `palette`'s glass
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §4.1): a fact card the glass opens
 /// wears its pane's Autopilot palette on the pane's own ground ([`crate::tab_menu::glass_menu_colors`],
 /// the ground the glass's inks are solved on), its border the static arc
 /// ([`GlassInks::border`]), its rules inside the border, its drawn rows the glass's tokens with
 /// each column's hue and a warn cell on a wash of the warn ink ([`WARN_WASH`]); with no palette
-/// (the Autopilot chip's menu, a pane with no harness theme) the card stands on the band's
-/// grey, every token is neutral and the border is the card's rule ink.
+/// (a pane with no harness theme) the card stands on the band's grey, every token is neutral
+/// and the border is the card's rule ink.
 #[must_use]
 pub(crate) fn paint(
     rect: MenuRect,
@@ -968,7 +908,57 @@ pub(crate) fn paint(
             out.push(cells);
             continue;
         }
+        if let MenuRow::Section(title) = row {
+            // Inside the border on every card, as a glass card's rule is: the heading's words
+            // begin where every row's do.
+            let mut cells = vec![cell(' ', c.rule, c.card_bg, false, false); w];
+            sides(r, &mut cells);
+            let title = ellipsize(title, text_end.saturating_sub(text_start));
+            let rule_from = text_start + display_cells(&title) + 1;
+            let (fg, bg) = (c.band.value, c.card_bg);
+            crate::tab_menu::put_text(&mut cells, text_start, text_end, &title, fg, bg, true);
+            for slot in cells.iter_mut().take(text_end).skip(rule_from) {
+                *slot = cell('\u{2500}', c.rule, c.card_bg, false, false);
+            }
+            out.push(cells);
+            continue;
+        }
+        if let MenuRow::Fact {
+            label, value, tone, ..
+        } = row
+        {
+            let bg = c.card_bg;
+            let mut cells = vec![cell(' ', c.band.label, bg, false, false); w];
+            sides(r, &mut cells);
+            crate::tab_menu::put_text(
+                &mut cells,
+                text_start,
+                text_end,
+                &ellipsize(label, text_end.saturating_sub(text_start)),
+                c.band.label,
+                bg,
+                false,
+            );
+            let (fg, bold) = match tone {
+                NoteTone::Label => (c.band.label, false),
+                NoteTone::Value => (c.band.value, false),
+                NoteTone::Warn => (unpack(glass.inks.warn()), true),
+            };
+            let from = (text_start + fact_value_at(label)).min(text_end);
+            let value = ellipsize(value, text_end - from);
+            crate::tab_menu::put_text(&mut cells, from, text_end, &value, fg, bg, bold);
+            out.push(cells);
+            continue;
+        }
         let selected = highlight == Some(i) && row.selectable();
+        if let MenuRow::Stops { stops, at, .. } = row {
+            let mut cells = vec![cell(' ', c.band.value, c.card_bg, false, false); w];
+            sides(r, &mut cells);
+            let rested = row.rested_stop().filter(|_| selected);
+            paint_stops(&mut cells, (text_start, text_end), (stops, *at, rested), &c);
+            out.push(cells);
+            continue;
+        }
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match row {
             MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
@@ -980,23 +970,49 @@ pub(crate) fn paint(
                 tone: NoteTone::Warn,
                 ..
             } => (unpack(glass.inks.warn()), true),
-            MenuRow::Note { .. } | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
-                (c.disabled, false)
-            }
+            MenuRow::Note { .. } | MenuRow::Item { enabled: false, .. } => (c.disabled, false),
             MenuRow::Item { .. } if selected => (c.sel_fg, true),
             _ => (c.band.value, false),
         };
         let mut cells = vec![cell(' ', fg, bg, false, false); w];
         sides(out.len(), &mut cells);
         let checked = matches!(row, MenuRow::Item { checked: true, .. });
-        let room = text_end
-            .saturating_sub(text_start)
-            .saturating_sub(if checked { CHECK_CELLS } else { 0 });
+        // An item's trailing words end where a check would begin, on a checked row or not, so
+        // a card's trails share one right edge; the label has the room before them.
+        let trail = match row {
+            MenuRow::Item { trail, .. } if !trail.is_empty() => Some(trail.as_str()),
+            _ => None,
+        };
+        let held = if checked || trail.is_some() {
+            CHECK_CELLS
+        } else {
+            0
+        };
+        let trail_end = text_end.saturating_sub(held).max(text_start);
+        let trail_from = trail.map_or(trail_end, |trail| {
+            trail_end
+                .saturating_sub(display_cells(trail))
+                .max(text_start)
+        });
+        let room = match trail {
+            Some(_) => trail_from
+                .saturating_sub(text_start)
+                .saturating_sub(TRAIL_GAP_CELLS),
+            None => trail_end - text_start,
+        };
         let text = match row {
             MenuRow::Name(name) => quoted_in(name, room),
+            MenuRow::Item { glyph, label, .. } => {
+                let pad = GLYPH_CELLS.saturating_sub(display_cells(glyph));
+                ellipsize(&format!("{glyph}{}{label}", " ".repeat(pad)), room)
+            }
             row => ellipsize(&row.text(), room),
         };
         crate::tab_menu::put_text(&mut cells, text_start, text_end, &text, fg, bg, bold);
+        if let Some(trail) = trail {
+            let trail = ellipsize(trail, trail_end - trail_from);
+            crate::tab_menu::put_text(&mut cells, trail_from, trail_end, &trail, fg, bg, bold);
+        }
         if checked && text_end >= 1 {
             cells[text_end - 1] = cell('\u{25cf}', fg, bg, bold, false);
         }
@@ -1013,6 +1029,50 @@ pub(crate) fn paint(
     }
     out.truncate(rect.h);
     out
+}
+
+/// A slider's cells inside the border (its sides are the caller's), each stop on its span
+/// ([`stop_spans`]): its mark, the thumb's where the thumb stands, and its label; the track
+/// between two stops in the card's rule ink; the stop the keys or the pointer rest on (`rested`,
+/// on the card's selected row) on the selection's ground; a stop that cannot be picked in the
+/// disabled ink.
+fn paint_stops(
+    cells: &mut [RenderCell],
+    (text_start, text_end): (usize, usize),
+    (stops, at, rested): (&[Stop], Option<usize>, Option<usize>),
+    c: &crate::tab_menu::MenuColors,
+) {
+    let cell = crate::chrome_band::cell;
+    let spans = stop_spans(stops, text_end.saturating_sub(text_start));
+    for (i, (stop, span)) in stops.iter().zip(&spans).enumerate() {
+        if let Some(next) = spans.get(i + 1) {
+            // A space either side of the track where the gap has room for it.
+            let pad = usize::from(next.start - span.end >= 3);
+            for col in span.end + pad..next.start - pad {
+                cells[text_start + col] = cell('\u{2500}', c.rule, c.card_bg, false, false);
+            }
+        }
+        let thumb = at == Some(i);
+        let (fg, bg) = match (stop.enabled, rested == Some(i)) {
+            (false, _) => (c.disabled, c.card_bg),
+            (true, true) => (c.sel_fg, c.sel_bg),
+            (true, false) => (c.band.value, c.card_bg),
+        };
+        let mark = if thumb { STOP_THUMB } else { STOP_MARK };
+        let text = format!("{mark} {}", stop.label);
+        for col in span.clone() {
+            cells[text_start + col] = cell(' ', fg, bg, false, false);
+        }
+        crate::tab_menu::put_text(
+            cells,
+            text_start + span.start,
+            text_start + span.end,
+            &ellipsize(&text, span.len()),
+            fg,
+            bg,
+            thumb,
+        );
+    }
 }
 
 /// How far a warn cell's ground is mixed toward the warn ink on a drawn row: where the warn ink
@@ -1033,18 +1093,6 @@ fn warn_wash(c: &crate::tab_menu::MenuColors, glass: &GlassInks) -> Option<([u8;
         );
         (wash, unpack(ink))
     })
-}
-
-/// The inks of the card's midnights' ticks in `theme` under `palette` ([`TickInks`]): the
-/// glass's track on the card's ground, the ground across a glyph that inks a tick's foot, and
-/// the track floored on the warn wash where a warn cell stands on one ([`warn_wash`]).
-pub(crate) fn card_tick_inks(theme: Theme, palette: Option<CardPalette>) -> TickInks {
-    let (c, glass) = card_inks(theme, palette);
-    TickInks::new(
-        glass.track(),
-        pack(c.card_bg),
-        warn_wash(&c, &glass).map(|(wash, _)| pack(wash)),
-    )
 }
 
 /// A drawn row's cells inside the border (its sides are the caller's): each cell in its ink,
@@ -1068,7 +1116,6 @@ fn paint_plot(
             PlotInk::Out => (c.band.value, false),
             PlotInk::Axis => (unpack(glass.quiet()), false),
             PlotInk::Read => (unpack(glass.mark(at)), false),
-            PlotInk::Ahead => (unpack(glass.letter(at)), false),
             PlotInk::Mark => (unpack(glass.lit()), false),
             PlotInk::Track => (unpack(glass.track()), false),
             PlotInk::Warn => (warn_on.map_or(unpack(glass.warn()), |(_, ink)| ink), true),
@@ -1093,7 +1140,7 @@ pub(crate) struct SpentCard {
     pub(crate) at: std::time::Instant,
 }
 
-/// Open Autopilot or fact popup menu state.
+/// Open fact popup menu state.
 #[derive(Clone, Debug)]
 pub(crate) struct AutopilotMenu {
     pub(crate) owner: MenuOwner,
@@ -1103,8 +1150,6 @@ pub(crate) struct AutopilotMenu {
     pub(crate) anchor: (usize, usize),
     pub(crate) rows: Vec<MenuRow>,
     pub(crate) spoken: String,
-    /// Armed timer deadline (unix ms) targeted by the cancel row.
-    pub(crate) cancels: Option<i64>,
     pub(crate) highlight: Option<usize>,
     pub(crate) viewport: MenuViewport,
     /// Last painted capacity, retained while a changed viewport awaits its next frame.
@@ -1116,8 +1161,9 @@ pub(crate) struct AutopilotMenu {
     pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
     pub(crate) generation: u64,
     pub(crate) rest: PointerRest,
-    /// The midnights' ticks on its drawn rows as the last frame laid them.
-    pub(crate) ticks: CardTicks,
+    /// What the permission chip's box says and the cells of content its words were wrapped to
+    /// ([`crate::permission_box`]); `None` on a fact's card.
+    pub(crate) told: Option<(crate::permission_box::Told, usize)>,
 }
 
 /// Last pointer position and hovered choice recorded while the menu is open.
@@ -1155,7 +1201,8 @@ impl AutopilotMenu {
         }
     }
 
-    fn choice_at(&self, i: usize) -> Option<Choice> {
+    /// The choice at `hit`: an item's own, or the one of a slider's stop under the pointer.
+    fn choice_at(&self, (i, stop): Hit) -> Option<Choice> {
         match self.rows.get(i)? {
             MenuRow::Item {
                 act,
@@ -1163,55 +1210,107 @@ impl AutopilotMenu {
                 enabled,
                 ..
             } => Some((*act, label.clone(), *enabled)),
+            MenuRow::Stops { stops, .. } => {
+                let stop = stops.get(stop?)?;
+                Some((stop.act, stop.label.clone(), stop.enabled))
+            }
             _ => None,
         }
     }
 
-    fn note_pointer(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<usize>) {
+    fn note_pointer(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<Hit>) {
         if self.rest.px != Some(px) {
             self.rest_on(px, frame_row, hovered);
         }
     }
 
-    fn rest_on(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<usize>) {
+    fn rest_on(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<Hit>) {
         self.rest = PointerRest {
             px: Some(px),
             frame_row,
-            choice: hovered.and_then(|i| self.choice_at(i)),
+            choice: hovered.and_then(|hit| self.choice_at(hit)),
             generation: self.generation,
         };
     }
 
-    /// Whether a press at `(frame_row, i)` lands without rows having shifted under the pointer.
-    fn press_lands(&self, frame_row: usize, i: usize) -> bool {
+    /// Whether a press at `(frame_row, hit)` lands without rows having shifted under the
+    /// pointer.
+    fn press_lands(&self, frame_row: usize, hit: Hit) -> bool {
         let rest = &self.rest;
         rest.generation == self.generation
             || (rest.frame_row == Some(frame_row)
                 && rest.choice.is_some()
-                && rest.choice == self.choice_at(i))
+                && rest.choice == self.choice_at(hit))
     }
 
-    /// Rebuild menu rows in place, returning whether the card must be painted again. Rows that
-    /// differ from the shown ones only in their midnights' ticks ([`same_but_ticks`]) are taken
-    /// as they are, with no new generation: the rows under the pointer, the highlight, the
-    /// card's place and the items' reader identities ([`Self::a11y_epoch`]) all stay, and only
-    /// the ticks are painted anew ([`Self::fingerprint`]).
-    pub(crate) fn refresh_rows(
-        &mut self,
-        fresh: Vec<MenuRow>,
-        spoken: String,
-        cancels: Option<i64>,
-    ) -> bool {
-        self.cancels = cancels;
-        let kept = keep_places(&self.rows, &fresh);
-        let stays = kept.is_some();
-        let laid = kept.unwrap_or(fresh);
-        if self.rows == laid {
+    /// Rest the keys or the pointer on `stop` of the slider at row `i`, returning whether that
+    /// moved it: a stop that cannot be picked takes no rest.
+    fn rest_on_stop(&mut self, i: usize, stop: Option<usize>) -> bool {
+        let Some(MenuRow::Stops { stops, focus, .. }) = self.rows.get_mut(i) else {
+            return false;
+        };
+        let stop = stop.filter(|j| stops.get(*j).is_some_and(|stop| stop.enabled));
+        if stop.is_none() || *focus == stop {
             return false;
         }
-        if same_but_ticks(&self.rows, &laid) {
-            self.rows = laid;
-            return true;
+        *focus = stop;
+        true
+    }
+
+    /// Let every slider's rest go, returning whether one rested: the pointer left their stops.
+    fn leave_stops(&mut self) -> bool {
+        let mut left = false;
+        for row in &mut self.rows {
+            if let MenuRow::Stops { focus, .. } = row {
+                left |= focus.take().is_some();
+            }
+        }
+        left
+    }
+
+    /// The slider the Left and Right keys move: the selected row where it is one, else the
+    /// card's first.
+    fn slider_row(&self) -> Option<usize> {
+        let is_slider = |i: &usize| matches!(self.rows.get(*i), Some(MenuRow::Stops { .. }));
+        self.highlight.filter(is_slider).or_else(|| {
+            self.rows
+                .iter()
+                .position(|row| matches!(row, MenuRow::Stops { .. }) && row.selectable())
+        })
+    }
+
+    /// Take `rows` whole in place of a card's with no row to choose (the permission chip's
+    /// box): nothing is selected, and the card is laid afresh.
+    pub(crate) fn replace_rows(&mut self, rows: Vec<MenuRow>, spoken: String) {
+        self.rows = rows;
+        self.spoken = spoken;
+        self.highlight = None;
+        self.viewport = MenuViewport::default();
+        self.rect = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Rebuild menu rows in place, returning whether the card must be painted again.
+    pub(crate) fn refresh_rows(&mut self, fresh: Vec<MenuRow>, spoken: String) -> bool {
+        let kept = keep_places(&self.rows, &fresh);
+        let stays = kept.is_some();
+        let mut laid = kept.unwrap_or(fresh);
+        // Where the keys or the pointer rest on a slider is the card's, not the rebuilt rows':
+        // each slider keeps it, in the sliders' order, while the stop is still one to pick.
+        let mut rests = self.rows.iter().filter_map(|row| match row {
+            MenuRow::Stops { focus, .. } => Some(*focus),
+            _ => None,
+        });
+        for row in &mut laid {
+            if let MenuRow::Stops { stops, focus, .. } = row {
+                *focus = rests
+                    .next()
+                    .flatten()
+                    .filter(|j| stops.get(*j).is_some_and(|stop| stop.enabled));
+            }
+        }
+        if self.rows == laid {
+            return false;
         }
         self.spoken = spoken;
         let lit = self.highlight.and_then(|i| self.rows.get(i));
@@ -1230,12 +1329,13 @@ impl AutopilotMenu {
         true
     }
 
-    /// Format `controls autopilot-menu` or `controls fact-menu` lines.
+    /// Format `controls fact-menu` lines.
     #[must_use]
     pub(crate) fn controls_lines(&self, sid: &str) -> Vec<String> {
-        let (target, fact) = match self.owner {
-            MenuOwner::Autopilot => ("autopilot-menu", String::new()),
-            MenuOwner::Fact(fact) => ("fact-menu", format!(" fact={}", fact.key())),
+        let target = "fact-menu";
+        let fact = match self.owner {
+            MenuOwner::Fact(fact) => format!(" fact={}", fact.key()),
+            MenuOwner::Permission => " box=permission".to_owned(),
         };
         let mut out = vec![format!(
             "{target} open=true session={sid}{fact} rows={} selected={}",
@@ -1258,10 +1358,17 @@ impl AutopilotMenu {
                     row.text()
                 )),
                 MenuRow::Rule => out.push(format!("{target} rule index={i}")),
+                MenuRow::Section(title) => {
+                    out.push(format!("{target} section index={i} text={title:?}"));
+                }
+                MenuRow::Fact {
+                    label, value, tone, ..
+                } => out.push(format!(
+                    "{target} fact index={i} label={label:?} tone={} text={value:?}",
+                    tone.key()
+                )),
                 MenuRow::Gap(_) => out.push(format!("{target} gap index={i}")),
-                MenuRow::Header(text)
-                | MenuRow::Note { text, .. }
-                | MenuRow::SetBy { text, .. } => {
+                MenuRow::Header(text) | MenuRow::Note { text, .. } => {
                     out.push(format!("{target} label index={i} text={text:?}"));
                 }
                 MenuRow::Name(_) => {
@@ -1270,13 +1377,36 @@ impl AutopilotMenu {
                 MenuRow::Plot { .. } => {
                     out.push(format!("{target} plot index={i} text={:?}", row.text()));
                 }
+                MenuRow::Stops {
+                    stops, at, focus, ..
+                } => {
+                    out.push(format!(
+                        "{target} slider index={i} stops={} at={} selected={} text={:?}",
+                        stops.len(),
+                        at.and_then(|at| stops.get(at))
+                            .map_or("none", |stop| stop.label.as_str()),
+                        self.highlight == Some(i),
+                        row.text()
+                    ));
+                    for (j, stop) in stops.iter().enumerate() {
+                        out.push(format!(
+                            "{target} stop index={i} stop={j} key={} enabled={} current={} \
+                             rested={} text={:?}",
+                            stop.act.key(),
+                            stop.enabled,
+                            *at == Some(j),
+                            *focus == Some(j),
+                            stop.label
+                        ));
+                    }
+                }
             }
         }
         out
     }
 
     /// Compact accessibility epoch ([`crate::a11y_tree::menu_epoch_from`]) over session, spoken
-    /// title, cancel deadline, and rows.
+    /// title, and rows.
     #[cfg(a11y_tree)]
     #[must_use]
     fn a11y_epoch(&self) -> u32 {
@@ -1284,7 +1414,6 @@ impl AutopilotMenu {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.session.hash(&mut h);
         self.spoken.hash(&mut h);
-        self.cancels.hash(&mut h);
         self.rows.hash(&mut h);
         self.viewport.hash(&mut h);
         self.rect.hash(&mut h);
@@ -1299,11 +1428,11 @@ impl AutopilotMenu {
         self.anchor.hash(&mut h);
         self.highlight.hash(&mut h);
         self.rows.hash(&mut h);
-        // The midnights' ticks, which a row's identity leaves out ([`MenuRow`]'s `Hash`), are
-        // painted: a frame whose ticks moved repaints.
+        // Where the keys or the pointer rest on a slider, which a row's identity leaves out
+        // ([`MenuRow`]'s `Hash`), is painted.
         for row in &self.rows {
-            if let MenuRow::Plot { ticks, .. } = row {
-                ticks.hash(&mut h);
+            if let MenuRow::Stops { focus, .. } = row {
+                focus.hash(&mut h);
             }
         }
         self.viewport.hash(&mut h);
@@ -1319,20 +1448,32 @@ impl std::hash::Hash for MenuRow {
             Self::Name(t) => (5u8, t).hash(h),
             Self::Note { text, tone, .. } => (1u8, text, tone).hash(h),
             Self::Rule => 2u8.hash(h),
+            Self::Section(title) => (6u8, title).hash(h),
+            Self::Fact {
+                label, value, tone, ..
+            } => (9u8, label, value, tone).hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
-            Self::SetBy { text, floor } => (6u8, text, floor).hash(h),
-            // A drawn row is what it shows in cells and what a reader is told of it. Its
-            // midnights' ticks, measured from the chart's now, move at every replay of the
-            // outlook while nothing it says moves ([`same_but_ticks`]), so they stay out of the
-            // reader identity ([`AutopilotMenu::a11y_epoch`]); the repaint key hashes them.
-            Self::Plot { cells, spoken, .. } => (7u8, cells, spoken).hash(h),
+            // A drawn row is what it shows in cells and what a reader is told of it.
+            Self::Plot { cells, spoken } => (7u8, cells, spoken).hash(h),
             Self::Item {
                 label,
                 act,
                 enabled,
                 checked,
+                trail,
                 ..
-            } => (3u8, label, act.key(), enabled, checked).hash(h),
+            } => (3u8, label, act.key(), enabled, checked, trail).hash(h),
+            // A slider is its name, its stops and where its thumb stands. Where the keys or
+            // the pointer rest moves under them while nothing it says moves, so it stays out
+            // of the reader identity; the repaint key hashes it.
+            Self::Stops {
+                name, stops, at, ..
+            } => {
+                (8u8, name, at).hash(h);
+                for stop in stops {
+                    (&stop.label, stop.act.key(), stop.enabled).hash(h);
+                }
+            }
         }
     }
 }
@@ -1387,174 +1528,12 @@ impl App {
         (place, name)
     }
 
-    fn autopilot_menu_facts(&self, session: u64) -> MenuFacts {
-        let (_, view, _) = self.session_autopilot(session);
-        let (place, name) = self.menu_place_and_name(session);
-        let spoken = match &name {
-            Some(name) => format!("Autopilot, {place}, {name}"),
-            None => format!("Autopilot, {place}"),
-        };
-        let set_by = self
-            .pool
-            .get(session)
-            .is_some_and(|s| {
-                s.ctx
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .autopilot
-                    .is_some()
-            })
-            .then(|| self.autopilot_set_by_words(session))
-            .flatten()
-            .map(|words| {
-                let today = crate::harness_glass::local_day_at(
-                    crate::autopilot_timers::wall_ms().div_euclid(1000),
-                );
-                words.line(Some(today))
-            });
-        MenuFacts {
-            title: format!("Autopilot \u{b7} {place}"),
-            name,
-            room: MAX_CONTENT,
-            spoken,
-            view,
-            carries: view.mode().is_some(),
-            land_at: self.harness_policy.get().policy.land_at.map(|at| {
-                crate::autopilot_timers::offer_glass(
-                    at,
-                    crate::autopilot_timers::wall_ms(),
-                    &crate::autopilot_timers::local_offset_at,
-                )
-            }),
-            armed_at_ms: self.autopilot_timers.land_at_ms(session),
-            armed: self.autopilot_timers.glass(session),
-            set_by,
-        }
-    }
-
-    fn autopilot_menu_fit(
-        &self,
-        wid: WindowId,
-        session: u64,
-        anchor: (usize, usize),
-        rows: Vec<MenuRow>,
-    ) -> Vec<MenuRow> {
-        let frame = self.windows.get(&wid).map_or((0, 0), |ws| {
-            (ws.input_scratch.cols, ws.input_scratch.cells.len())
-        });
-        let top = usize::from(self.chrome_rows(wid)).max(self.top_confirmation_band_rows(wid));
-        fit_rows(
-            rows,
-            anchor,
-            self.autopilot_menu_pane(wid, session),
-            frame,
-            top,
-        )
-    }
-
-    /// Open `session`'s Autopilot menu in `wid` anchored at `anchor`.
-    pub(crate) fn open_autopilot_menu(
-        &mut self,
-        wid: WindowId,
-        session: u64,
-        anchor: (usize, usize),
-        keyboard: bool,
-    ) {
-        self.open_autopilot_menu_as(MenuOwner::Autopilot, wid, session, anchor, keyboard);
-    }
-
-    /// [`Self::open_autopilot_menu`] for `owner`, whose anchor [`Self::paint_autopilot_menu`] checks.
-    fn open_autopilot_menu_as(
-        &mut self,
-        owner: MenuOwner,
-        wid: WindowId,
-        session: u64,
-        anchor: (usize, usize),
-        keyboard: bool,
-    ) {
-        self.clear_strip_press(wid);
-        self.settle_rename_edit(wid);
-        self.close_autopilot_menu();
-        self.autopilot_menu_spent = None;
-        self.note_land_at_offer();
-        let facts = MenuFacts {
-            room: content_room(self.autopilot_menu_pane(wid, session).1.len()),
-            ..self.autopilot_menu_facts(session)
-        };
-        let rows = self.autopilot_menu_fit(wid, session, anchor, rows(&facts));
-        let highlight = keyboard.then(|| step(&rows, None, true)).flatten();
-        let focus = self.focused_session_id(wid);
-        let px = self
-            .windows
-            .get(&wid)
-            .filter(|ws| ws.pointer_position_known)
-            .map(|ws| ws.last_cursor_px);
-        self.autopilot_menu = Some(AutopilotMenu {
-            owner,
-            wid,
-            session,
-            focus,
-            anchor,
-            rows,
-            spoken: facts.spoken,
-            cancels: self.autopilot_timers.land_at_ms(session),
-            highlight,
-            viewport: MenuViewport::default(),
-            page_rows: 0,
-            wheel_residual: 0.0,
-            wheel_residual_x: 0.0,
-            rect: None,
-            laid: None,
-            generation: 0,
-            rest: PointerRest::at_open(px),
-            ticks: CardTicks::default(),
-        });
-        self.request_menu_frame(wid);
-    }
-
-    /// Rebuild the open Autopilot menu if it belongs to `local_id`.
-    pub(crate) fn refresh_autopilot_menu(&mut self, local_id: u64) {
-        if !self
-            .autopilot_menu
-            .as_ref()
-            .is_some_and(|menu| menu.session == local_id && menu.owner.is_autopilot())
-        {
-            return;
-        }
-        self.note_land_at_offer();
-        let Some((wid, anchor)) = self
-            .autopilot_menu
-            .as_ref()
-            .map(|menu| (menu.wid, menu.anchor))
-        else {
-            return;
-        };
-        let facts = MenuFacts {
-            room: content_room(self.autopilot_menu_pane(wid, local_id).1.len()),
-            ..self.autopilot_menu_facts(local_id)
-        };
-        let fresh = self.autopilot_menu_fit(wid, local_id, anchor, rows(&facts));
-        let cancels = self.autopilot_timers.land_at_ms(local_id);
-        let Some(menu) = self.autopilot_menu.as_mut() else {
-            return;
-        };
-        if !menu.refresh_rows(fresh, facts.spoken, cancels) {
-            return;
-        }
-        let wid = menu.wid;
-        self.request_menu_frame(wid);
-    }
-
     /// Close any open menu and request a redraw.
     pub(crate) fn close_autopilot_menu(&mut self) -> bool {
         let Some(menu) = self.autopilot_menu.take() else {
             return false;
         };
-        if matches!(
-            menu.owner,
-            MenuOwner::Fact(crate::claude_lights::Fact::Account)
-        ) {
+        if matches!(menu.owner, MenuOwner::Fact(Fact::Account)) {
             crate::accounts_outlook::card_open(None);
         }
         self.account_menu_read.close();
@@ -1594,60 +1573,6 @@ impl App {
         }
     }
 
-    fn frame_cell_centre(&self, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
-        let (cw, ch) = self.win_cell_size(wid);
-        let (cw, ch) = (cw.max(1), ch.max(1));
-        let pad = self.win_pad(wid);
-        let top = self.win_pad_top(wid) + self.win_head(wid);
-        let (ox, oy) = self.frame_origin(wid);
-        (
-            ox as f64 + (pad + col * cw) as f64 + cw as f64 / 2.0,
-            oy as f64 + (top + row * ch) as f64 + ch as f64 / 2.0,
-        )
-    }
-
-    fn shows_autopilot_chip(&self, wid: WindowId, session: u64, cell: (usize, usize)) -> bool {
-        let (x, y) = self.frame_cell_centre(wid, cell);
-        self.claude_chips_at(wid, x, y)
-            == Some((session, Some(crate::claude_lights::Chip::Autopilot)))
-    }
-
-    /// Open the Autopilot menu if `(x, y)` hits an Autopilot chip in `wid`.
-    pub(crate) fn open_autopilot_menu_at(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some((session, Some(crate::claude_lights::Chip::Autopilot))) =
-            self.claude_chips_at(wid, x, y)
-        else {
-            return false;
-        };
-        let Some((row, mut col)) = self.glass_cell_at(wid, x, y) else {
-            return false;
-        };
-        while col > 0 && self.shows_autopilot_chip(wid, session, (row, col - 1)) {
-            col -= 1;
-        }
-        self.open_autopilot_menu(wid, session, (row, col), false);
-        true
-    }
-
-    /// Open the Autopilot menu for the front window's focused session (`open autopilot-menu`).
-    pub(crate) fn open_front_autopilot_menu(&mut self) -> Result<(), String> {
-        let wid = self
-            .frontmost_window
-            .ok_or_else(|| "no front window to open the Autopilot menu on".to_string())?;
-        let session = self
-            .focused_session_id(wid)
-            .ok_or_else(|| "the front window has no focused session".to_string())?;
-        let (rows, cols) = self.windows.get(&wid).map_or((0, 0), |ws| {
-            (ws.input_scratch.cells.len(), ws.input_scratch.cols)
-        });
-        let anchor = (0..rows)
-            .flat_map(|row| (0..cols).map(move |col| (row, col)))
-            .find(|&cell| self.shows_autopilot_chip(wid, session, cell))
-            .ok_or_else(|| "the focused session shows no Autopilot chip".to_string())?;
-        self.open_autopilot_menu(wid, session, anchor, true);
-        Ok(())
-    }
-
     /// Paint the open menu into `wid`'s frame scratch, or close it if its anchor or focus moved.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
@@ -1665,7 +1590,10 @@ impl App {
         }
     }
 
-    /// Whether the menu open in `wid` still has its focus and its anchor row uncovered by chrome.
+    /// Whether the menu open in `wid` still has its focus and its anchor row uncovered by
+    /// chrome. The permission chip's box also stays while the click that opened it stands, its
+    /// chip gone with the agent between the signal and the relaunch
+    /// ([`Self::permission_box_anchored`]).
     pub(crate) fn autopilot_menu_anchored(&self, wid: WindowId) -> bool {
         let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
             return false;
@@ -1676,14 +1604,15 @@ impl App {
             return false;
         }
         match menu.owner {
-            MenuOwner::Autopilot => self.shows_autopilot_chip(wid, menu.session, menu.anchor),
             MenuOwner::Fact(fact) => self.shows_fact_on_row(wid, menu.session, fact, menu.anchor.0),
+            MenuOwner::Permission => self.permission_box_anchored(wid, menu.session, menu.anchor.0),
         }
     }
 
     fn paint_autopilot_menu(&mut self, wid: WindowId) -> Option<crate::tab_menu::MenuRect> {
+        self.fit_permission_box(wid);
         let menu = self.autopilot_menu.as_ref().filter(|m| m.wid == wid)?;
-        let (session, anchor, owner) = (menu.session, menu.anchor, menu.owner);
+        let (session, anchor) = (menu.session, menu.anchor);
         if !self.autopilot_menu_anchored(wid) {
             self.close_autopilot_menu();
             return None;
@@ -1692,20 +1621,9 @@ impl App {
         let theme = self.overlay_card_theme(wid);
         // A fact card wears the glass of its session's pane: its Autopilot palette, as the
         // pane's lines do (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).
-        let palette = match owner {
-            MenuOwner::Autopilot => None,
-            MenuOwner::Fact(_) => self.card_palette(session),
-        };
+        let palette = self.card_palette(session);
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
-        // The ticks' cell, as line E's: the laid grid's where there is one.
-        let cell = {
-            let (w, h) = self.glass_grid(wid).map_or((cw, ch), |g| g.cell());
-            (
-                u16::try_from(w).unwrap_or(u16::MAX),
-                u16::try_from(h).unwrap_or(u16::MAX),
-            )
-        };
         let pane = self.autopilot_menu_pane(wid, session);
         let menu = self.autopilot_menu.as_ref()?;
         let ws = self.windows.get(&wid)?;
@@ -1772,7 +1690,7 @@ impl App {
             }
         }
         crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
-        let occluder = crate::app_render::scrub_overlay_card(
+        crate::app_render::scrub_overlay_card(
             &mut ws.input_scratch,
             rect,
             (cw, ch),
@@ -1783,38 +1701,6 @@ impl App {
         for (r, row) in painted.iter().enumerate().take(on_frame) {
             ws.claude_card
                 .paint_marks(&mut ws.input_scratch, rect.row + r, rect.col, row);
-        }
-        // The midnights' ticks on its drawn rows (§1.4), over the cells just painted and
-        // clipped to the card's rows on the frame, standing on the card as its own (its
-        // occluder, which cuts every other layer, does not cut them); stripped with the marks.
-        if let Some(menu) = self.autopilot_menu.as_mut()
-            && let Some(content) = menu.ticks.content(
-                (rect, &menu.rows, menu.viewport),
-                cell,
-                card_tick_inks(theme, palette),
-            )
-        {
-            let px = |cells: usize, side: u16| {
-                i32::try_from(cells)
-                    .unwrap_or(i32::MAX)
-                    .saturating_mul(i32::from(side))
-            };
-            let mut layer = FxLayer::new(
-                crate::claude_footer::quota::card_tick_id(session),
-                content,
-                FxSlot::Over,
-                FxSpace::Grid,
-                FxBlend::Exact,
-            );
-            layer.offset = (px(rect.col, cell.0), px(rect.row, cell.1));
-            layer.clip = PxRect::new(
-                px(rect.col, cell.0),
-                px(rect.row, cell.1),
-                px(rect.col + rect.w, cell.0),
-                px(rect.row + rect.h.min(on_frame), cell.1),
-            );
-            layer.chrome = occluder;
-            ws.claude_card.paint_layer(&mut ws.input_scratch, layer);
         }
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
@@ -1827,59 +1713,42 @@ impl App {
         Some(rect)
     }
 
-    /// Execute selectable row `i` and close the menu.
+    /// Execute selectable row `i`: an item's act, the menu closed; a slider's rested stop, the
+    /// menu left open. A rest on the stop the thumb already stands on picks nothing: the level
+    /// is the one in use.
     pub(crate) fn choose_autopilot_menu_row(&mut self, i: usize) {
         let Some(menu) = self.autopilot_menu.as_ref() else {
             return;
         };
-        let (wid, session, cancels) = (menu.wid, menu.session, menu.cancels);
+        let (wid, session) = (menu.wid, menu.session);
+        // A slider's pick leaves the card open: the stop the keys or the pointer rest on.
+        if let Some(row @ MenuRow::Stops { stops, at, .. }) = menu.rows.get(i) {
+            let picked = row
+                .rested_stop()
+                .filter(|j| Some(*j) != *at)
+                .and_then(|j| stops.get(j))
+                .filter(|stop| stop.enabled)
+                .map(|stop| stop.act);
+            if let Some(MenuAct::Fact(fact, act)) = picked {
+                self.choose_fact_stop(wid, session, fact, act);
+            }
+            return;
+        }
         let Some(MenuRow::Item {
-            act, enabled: true, ..
+            act: MenuAct::Fact(fact, act),
+            enabled: true,
+            ..
         }) = menu.rows.get(i).cloned()
         else {
             return;
         };
-        if let MenuAct::Fact(
-            fact,
-            fact_act
-            @ (crate::fact_menu::FactAct::Type(_) | crate::fact_menu::FactAct::SwitchModel),
-        ) = act
-        {
+        if matches!(act, FactAct::Type(_) | FactAct::SetModel(..)) {
             let (anchor, keyboard) = (menu.anchor, menu.highlight.is_some());
-            self.choose_fact_type(wid, session, fact, fact_act, anchor, keyboard);
+            self.choose_fact_type(wid, session, fact, act, anchor, keyboard);
             return;
         }
         self.close_autopilot_menu();
-        match act {
-            MenuAct::Mode(mode) => {
-                if self
-                    .session_harness_posture(session)
-                    .default_mode()
-                    .is_some()
-                {
-                    self.set_session_autopilot(
-                        session,
-                        Some(mode),
-                        crate::autopilot::Surface::Menu,
-                    );
-                }
-            }
-            MenuAct::Timer(choice) => {
-                self.choose_autopilot_timer_naming(
-                    session,
-                    choice,
-                    cancels,
-                    crate::autopilot::Surface::Menu,
-                );
-            }
-            MenuAct::Settings => {
-                self.open_harness_settings(
-                    wid,
-                    crate::harness_screen::HarnessFocus::Session(session),
-                );
-            }
-            MenuAct::Fact(_, act) => self.choose_fact_act(wid, session, act),
-        }
+        self.choose_fact_act(wid, session, act);
     }
 
     /// Handle a window key event while the menu is open in `wid`.
@@ -1940,6 +1809,25 @@ impl App {
                     }
                     selected
                 };
+                menu.reveal_highlight();
+                self.request_menu_frame(wid);
+                true
+            }
+            MenuKey::Left | MenuKey::Right => {
+                // A slider's keys; on a card with none they are any other key.
+                let Some(i) = menu.slider_row() else {
+                    self.close_autopilot_menu();
+                    return false;
+                };
+                let from = menu.rows[i].rested_stop();
+                let to = match &menu.rows[i] {
+                    MenuRow::Stops { stops, .. } => {
+                        stop_step(stops, from, meaning == MenuKey::Right)
+                    }
+                    _ => None,
+                };
+                menu.highlight = Some(i);
+                menu.rest_on_stop(i, to);
                 menu.reveal_highlight();
                 self.request_menu_frame(wid);
                 true
@@ -2034,16 +1922,38 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
             return false;
         };
-        self.account_menu_read.cancel_keyboard_selection();
         let (laid, cell) = (menu.laid, self.laid_cell_at(wid, menu.laid, x, y));
         let on_card = menu
             .rect
             .zip(cell)
             .filter(|(rect, (row, col))| rect.contains(*row, *col));
+        // The box's own chip stays a chip beside it: a press there is the chip's. A press on
+        // the card is the card's, where it covers the chip too (a pane too short to hang it
+        // clear of its anchor row).
+        if left
+            && on_card.is_none()
+            && menu.owner == MenuOwner::Permission
+            && self.permission_box_chip_press(wid, (x, y), at)
+        {
+            return true;
+        }
+        let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
+            return true;
+        };
+        self.account_menu_read.cancel_keyboard_selection();
         match on_card {
             Some((rect, (row, col))) => {
-                if left && let Some(i) = item_at(rect, &menu.rows, menu.viewport, row, col) {
-                    if menu.press_lands(row, i) {
+                let hit = hit_at(rect, &menu.rows, menu.viewport, row, col);
+                // A slider's stop that cannot be picked takes no press.
+                let hit = hit.filter(|hit| {
+                    hit.1.is_none() || menu.choice_at(*hit).is_some_and(|choice| choice.2)
+                });
+                if left && let Some(hit @ (i, stop)) = hit {
+                    if menu.press_lands(row, hit) {
+                        if let Some(menu) = self.autopilot_menu.as_mut() {
+                            menu.highlight = Some(i);
+                            menu.rest_on_stop(i, stop);
+                        }
                         self.choose_autopilot_menu_row(i);
                         if self.autopilot_menu.as_ref().is_none_or(|m| m.wid != wid) {
                             self.autopilot_menu_spent = Some(SpentCard {
@@ -2055,7 +1965,8 @@ impl App {
                         }
                     } else if let Some(menu) = self.autopilot_menu.as_mut() {
                         menu.highlight = Some(i);
-                        menu.rest_on((x, y), Some(row), Some(i));
+                        menu.rest_on_stop(i, stop);
+                        menu.rest_on((x, y), Some(row), Some(hit));
                         self.request_menu_frame(wid);
                     }
                 }
@@ -2105,36 +2016,33 @@ impl App {
             .zip(cell)
             .filter(|(rect, (r, c))| rect.contains(*r, *c))
         else {
+            if moved && menu.leave_stops() {
+                self.request_menu_frame(wid);
+            }
+            let Some(menu) = self.autopilot_menu.as_mut() else {
+                return false;
+            };
             menu.note_pointer((x, y), cell.map(|(r, _)| r), None);
             return false;
         };
-        let hovered = item_at(rect, &menu.rows, menu.viewport, row, col);
+        let hovered = hit_at(rect, &menu.rows, menu.viewport, row, col);
         menu.note_pointer((x, y), Some(row), hovered);
-        if hovered.is_some() && hovered != menu.highlight {
-            menu.highlight = hovered;
+        // A pointer that left a slider's stops rests on none of them: the keys then start
+        // from the thumb, and Return picks nothing the pointer passed over.
+        if moved && !matches!(hovered, Some((_, Some(_)))) && menu.leave_stops() {
             self.request_menu_frame(wid);
         }
-        true
-    }
-
-    /// `controls autopilot-menu` output for the frontmost window.
-    #[must_use]
-    pub(crate) fn autopilot_menu_controls(&self) -> Vec<String> {
-        match self
-            .autopilot_menu
-            .as_ref()
-            .filter(|m| Some(m.wid) == self.frontmost_window && m.owner.is_autopilot())
-        {
-            Some(menu) => {
-                let sid = self
-                    .pool
-                    .get(menu.session)
-                    .map(|s| s.ctx.self_id.as_str().to_string())
-                    .unwrap_or_default();
-                menu.controls_lines(&sid)
+        let Some(menu) = self.autopilot_menu.as_mut() else {
+            return false;
+        };
+        if let Some((i, stop)) = hovered {
+            let rested = menu.rest_on_stop(i, stop);
+            if rested || menu.highlight != Some(i) {
+                menu.highlight = Some(i);
+                self.request_menu_frame(wid);
             }
-            None => vec!["autopilot-menu open=false".to_string()],
         }
+        true
     }
 
     /// Build the accessibility [`crate::a11y_tree::GridMenu`] for `wid`.
@@ -2148,7 +2056,6 @@ impl App {
         let mut items = Vec::new();
         let mut selected = None;
         let mut notes: Vec<&str> = Vec::new();
-        let mut set_by: Vec<&str> = Vec::new();
         let visible = menu.viewport.range(menu.rows.len(), shown_rows(rect));
         for (i, row) in menu
             .rows
@@ -2158,35 +2065,71 @@ impl App {
             .skip(visible.start)
         {
             match row {
-                MenuRow::Note { spoken, .. } | MenuRow::Plot { spoken, .. } => {
+                // What the card states between its choices, in row order: a group's heading
+                // before the facts under it.
+                MenuRow::Note { spoken, .. }
+                | MenuRow::Plot { spoken, .. }
+                | MenuRow::Fact { spoken, .. } => {
                     notes.push(spoken.as_str());
                 }
-                MenuRow::SetBy { text, .. } => set_by.push(text.as_str()),
+                MenuRow::Section(title) => notes.push(title.as_str()),
                 MenuRow::Item {
                     spoken,
-                    act,
                     enabled,
+                    act,
                     checked,
                     ..
                 } => {
                     if menu.highlight == Some(i) {
                         selected = Some(items.len());
                     }
+                    // A row that is one of a card's exclusive choices (the model card's two
+                    // models) is a radio, checked where it is the one in use; any other row is
+                    // an action.
+                    let radio = matches!(act, MenuAct::Fact(_, FactAct::SetModel(..)));
                     items.push(GridMenuItem {
                         label: spoken.clone(),
-                        checked: matches!(act, MenuAct::Mode(_)).then_some(*checked),
+                        checked: radio.then_some(*checked),
                         disabled: !enabled,
                         row: top + 1 + i - visible.start,
+                        slider: None,
+                    });
+                }
+                MenuRow::Stops {
+                    name, stops, at, ..
+                } => {
+                    if menu.highlight == Some(i) {
+                        selected = Some(items.len());
+                    }
+                    // Its value in words: the stop the thumb stands on, or that it stands on
+                    // none, which the card's own note then says the value of.
+                    let words = at.and_then(|at| stops.get(at)).map_or_else(
+                        || {
+                            let of = stops
+                                .iter()
+                                .map(|stop| stop.label.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("none of {of}")
+                        },
+                        |stop| stop.label.clone(),
+                    );
+                    items.push(GridMenuItem {
+                        label: name.clone(),
+                        checked: None,
+                        disabled: !row.selectable(),
+                        row: top + 1 + i - visible.start,
+                        slider: Some(crate::a11y_tree::GridSlider {
+                            at: at.map(|at| at + 1),
+                            stops: stops.len(),
+                            words,
+                        }),
                     });
                 }
                 MenuRow::Header(_) | MenuRow::Name(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
             }
         }
         let mut label = menu.spoken.clone();
-        if !set_by.is_empty() {
-            label.push_str(", ");
-            label.push_str(&set_by.join(" "));
-        }
         for note in notes.into_iter().filter(|note| !note.is_empty()) {
             label.push_str(", ");
             label.push_str(note);
@@ -2223,7 +2166,7 @@ impl App {
                     .enumerate()
                     .take(visible.end)
                     .skip(visible.start)
-                    .filter(|(_, row)| matches!(row, MenuRow::Item { .. }))
+                    .filter(|(_, row)| matches!(row, MenuRow::Item { .. } | MenuRow::Stops { .. }))
                     .nth(item)
                     .map(|(i, _)| i)
             })
@@ -2231,6 +2174,51 @@ impl App {
             return;
         };
         self.choose_autopilot_menu_row(row);
+    }
+
+    /// Move the slider published as `item` one stop for a screen reader's increment (`up`) or
+    /// decrement, from where its thumb stands, and pick that stop, if `epoch` matches the
+    /// painted menu. A slider whose thumb stands on no stop has nothing below its value to
+    /// decrement to; its increment picks its first stop.
+    #[cfg(a11y_tree)]
+    pub(crate) fn step_autopilot_menu_slider_for_reader(
+        &mut self,
+        wid: WindowId,
+        epoch: u32,
+        item: usize,
+        up: bool,
+    ) {
+        let Some(menu) = self
+            .autopilot_menu
+            .as_mut()
+            .filter(|m| m.wid == wid && m.a11y_epoch() == epoch)
+        else {
+            return;
+        };
+        let Some(rect) = menu.rect else {
+            return;
+        };
+        let visible = menu.viewport.range(menu.rows.len(), shown_rows(rect));
+        let Some((i, to)) = menu
+            .rows
+            .iter()
+            .enumerate()
+            .take(visible.end)
+            .skip(visible.start)
+            .filter(|(_, row)| matches!(row, MenuRow::Item { .. } | MenuRow::Stops { .. }))
+            .nth(item)
+            .and_then(|(i, row)| match row {
+                MenuRow::Stops { stops, at, .. } if up || at.is_some() => {
+                    Some((i, stop_step(stops, *at, up)?))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        menu.highlight = Some(i);
+        menu.rest_on_stop(i, Some(to));
+        self.choose_autopilot_menu_row(i);
     }
 }
 

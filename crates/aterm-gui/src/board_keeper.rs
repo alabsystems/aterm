@@ -22,7 +22,14 @@ pub(crate) fn start(state: PathBuf) {
                     aterm_ctl::board::keep(
                         &state,
                         &aterm_ctl::board::Keeper {
-                            drive: Some(aterm_agent::drive_fleet),
+                            // The window names no requester: it reads its board for no session.
+                            drive: Some(|host, within| {
+                                aterm_agent::drive_fleet(
+                                    host,
+                                    &aterm_types::control_verbs::Requester::default(),
+                                    within,
+                                )
+                            }),
                             here: &|| aterm_ctl::resolve_sock_for(None).ok(),
                             own_node: &aterm_agent::fleet_node,
                         },

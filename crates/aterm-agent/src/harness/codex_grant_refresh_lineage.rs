@@ -90,7 +90,18 @@ pub(in crate::harness::codex_grant_owner) fn lineage_history(
                         document.as_slice(),
                     )?);
                 }
-                Err(_) => uncertainty = LineageUncertainty::Global,
+                // A terminal answer is confined to this authenticated principal. A refusal
+                // issued no successor; a quarantined unusable answer may have issued one, but
+                // any such successor still belongs to this principal, which the catalogue
+                // continues to fence. While the answer is merely Responded, reconciliation
+                // has not made that terminal classification and its effect remains global.
+                Err(_) => {
+                    if !codex_app_login::owned_refresh_refused(response.status, body.as_slice())
+                        && pending.phase != Phase::Quarantined
+                    {
+                        uncertainty = LineageUncertainty::Global;
+                    }
+                }
             }
         }
         if pending.phase == Phase::Attempted {
@@ -112,14 +123,18 @@ pub(in crate::harness::codex_grant_owner) fn lineage_history(
             } else {
                 uncertainty = LineageUncertainty::Global;
             }
-        } else if pending.phase == Phase::Quarantined && !known_alias_response(journal, pending) {
-            uncertainty = LineageUncertainty::Global;
         }
     }
     observed.current()?;
     Ok(LineageHistory {
         tokens,
-        pending: journal.pending.is_some(),
+        // Rejected and Quarantined are terminal for this grant. Their retained response and
+        // principal/token facts still fence aliases, but neither holds another grant's code
+        // exchange or publication behind work that can no longer make progress.
+        pending: journal
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !matches!(pending.phase, Phase::Rejected | Phase::Quarantined)),
         uncertainty,
     })
 }
@@ -223,6 +238,10 @@ pub(in crate::harness::codex_grant_owner) struct OwnedRefreshInventorySource<'a>
     document: &'a [u8],
 }
 impl OwnedRefreshInventorySource<'_> {
+    pub(in crate::harness::codex_grant_owner) fn settling(&self) -> bool {
+        self.lease.purpose == LineagePurpose::Settlement
+    }
+
     pub(in crate::harness::codex_grant_owner) fn binding(&self) -> &GrantBinding {
         self.binding
     }

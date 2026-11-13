@@ -42,6 +42,7 @@ pub(super) fn fixture(
         claude_pid: None,
         codex_thread: None,
         codex_home: None,
+        xdg_config_home: None,
         codex_login: None,
         agy_conversation: None,
         now: 1_790_000_000,

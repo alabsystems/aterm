@@ -4,28 +4,22 @@
 //! AppKit status item, mug button, template images, and popup menu.
 
 use aterm_macos_ui::appkit::class;
+use aterm_macos_ui::status_button;
 use aterm_objc::send::{
-    alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_id_sel,
-    send_id_id_sel_id, send_id_size, send_isize_usize, send_rect, send_v, send_v_bool, send_v_id,
-    send_v_isize, send_v_sel, send_v_size, send_v_usize,
+    alloc, send_id, send_id_f64, send_id_id_sel_id, send_v, send_v_bool, send_v_id, send_v_isize,
+    send_v_usize,
 };
-use aterm_objc::{Bool, CGPoint, CGRect, CGSize, Id, Obj, Sel, autoreleasepool, sel};
+use aterm_objc::{CGSize, Id, Obj, Sel, autoreleasepool, sel};
 
 use crate::icon;
 use crate::menu::Row;
 
 const VARIABLE_LENGTH: f64 = -1.0;
 const IMAGE_ONLY: usize = 1;
-const CLICK_MASK: usize = (1 << 2) | (1 << 4);
 const STATE_ON: isize = 1;
 const STATE_OFF: isize = 0;
 const POINTS: u32 = 18;
 const SCALES: [u32; 2] = [1, 2];
-const POPUP_GAP: f64 = 3.0;
-/// The button's custom accessibility action, which opens the menu.
-pub(super) const SHOW_MENU: &str = "Show Menu";
-
-type PopUpFn = unsafe extern "C-unwind" fn(Id, Sel, Id, CGPoint, Id) -> Bool;
 
 /// The mug in the menu bar.
 pub(super) struct StatusUi {
@@ -59,7 +53,8 @@ pub(super) fn install(
         let items = add_rows(menu.id(), target, choose, &rows);
         // SAFETY: main-thread AppKit sends on live receivers, each in its method's prototype; the
         // item and its button answer at +0 and are retained here, and the caller keeps `target`
-        // (held weakly) alive.
+        // (held weakly) alive, which answers `click` as `v@:@` and `show` as `B@:@`
+        // (`status_button::wire_clicks`, `add_show_menu_action`).
         unsafe {
             let bar = send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
             if bar.is_null() {
@@ -72,13 +67,11 @@ pub(super) fn install(
             ))?;
             let button = Obj::retain(send_id(item.id(), sel!(button)))?;
             send_v_usize(button.id(), sel!(setImagePosition:), IMAGE_ONLY);
-            send_v_id(button.id(), sel!(setTarget:), target);
-            send_v_sel(button.id(), sel!(setAction:), click);
-            let _ = send_isize_usize(button.id(), sel!(sendActionOn:), CLICK_MASK);
+            status_button::wire_clicks(button.id(), target, click);
             if let Some(label) = aterm_objc::ns_string("aCaffeine") {
                 send_v_id(button.id(), sel!(setAccessibilityLabel:), label.id());
             }
-            set_show_menu_action(button.id(), target, show);
+            status_button::add_show_menu_action(button.id(), target, show);
             Some(StatusUi {
                 item,
                 button,
@@ -177,43 +170,9 @@ impl Drop for StatusUi {
 
 /// Show the menu below its button and return when it closes.
 pub(super) fn pop_up(popup: &Popup) {
-    autoreleasepool(|_| {
-        // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains.
-        // `-highlight:` is `v20@0:8B16`, `-bounds` `{CGRect=…}16@0:8`, `-isFlipped` `B16@0:8`, and
-        // the pop-up `PopUpFn`'s prototype: a nil positioning item puts the menu's top-left corner
-        // at the point, in the button's coordinates. It runs the menu's tracking loop and answers
-        // whether an item was chosen.
-        unsafe {
-            let button = popup.button.id();
-            send_v_bool(button, sel!(highlight:), true);
-            let at = popup_point(
-                send_rect(button, sel!(bounds)),
-                send_bool(button, sel!(isFlipped)),
-            );
-            let pop: PopUpFn = aterm_objc::checked_msg();
-            let _ = pop(
-                popup.menu.id(),
-                sel!(popUpMenuPositioningItem:atLocation:inView:),
-                Id::NIL,
-                at,
-                button,
-            );
-            send_v_bool(button, sel!(highlight:), false);
-        }
-    });
-}
-
-/// Where the menu's top-left corner goes for a button with `bounds`.
-pub(super) fn popup_point(bounds: CGRect, flipped: bool) -> CGPoint {
-    let y = if flipped {
-        bounds.origin.y + bounds.size.height + POPUP_GAP
-    } else {
-        bounds.origin.y - POPUP_GAP
-    };
-    CGPoint {
-        x: bounds.origin.x,
-        y,
-    }
+    // SAFETY: on the main thread (the caller is the target's click handler), with the live
+    // menu and button `popup` retains across the call, and outside every borrow of the mug.
+    unsafe { status_button::pop_up(popup.menu.id(), popup.button.id()) };
 }
 
 /// The rows of `now` that differ from `shown`, by index.
@@ -240,90 +199,15 @@ pub(super) const fn state_text(lit: bool) -> &'static str {
 
 fn template_image(lit: bool) -> Option<Obj> {
     let side = icon::SIZE_POINTS;
-    let size = CGSize {
-        width: side,
-        height: side,
-    };
-    // SAFETY: main-thread sends, inside the caller's pool; `-initWithSize:` is
-    // `@32@0:8{CGSize=dd}16`, consuming the `+alloc` and answering +1.
-    let image = unsafe {
-        Obj::from_owned(send_id_size(
-            alloc(class(c"NSImage")),
-            sel!(initWithSize:),
-            size,
-        ))
-    }?;
-    for scale in SCALES {
-        let rep = bitmap(&icon::png(lit, POINTS * scale))?;
-        // SAFETY: `-setSize:` (`v32@0:8{CGSize=dd}16`) makes the bitmap's pixels that many points;
-        // `-addRepresentation:` (`v24@0:8@16`) retains it into the live image.
-        unsafe {
-            send_v_size(rep.id(), sel!(setSize:), size);
-            send_v_id(image.id(), sel!(addRepresentation:), rep.id());
-        }
-    }
-    // SAFETY: `-setTemplate:` is `v20@0:8B16` and `-setAccessibilityDescription:` `v24@0:8@16`, on
-    // the live image.
-    unsafe {
-        send_v_bool(image.id(), sel!(setTemplate:), true);
-        if let Some(text) = aterm_objc::ns_string(state_text(lit)) {
-            send_v_id(image.id(), sel!(setAccessibilityDescription:), text.id());
-        }
-    }
-    Some(image)
-}
-
-fn bitmap(png: &[u8]) -> Option<Obj> {
-    if png.is_empty() {
-        return None;
-    }
-    autoreleasepool(|_| {
-        // SAFETY: `-initWithBytes:length:` is `@32@0:8r^v16Q24`, copying the `png.len()` bytes for
-        // the call and answering +1; `+imageRepWithData:` is `@24@0:8@16`, answering +0, retained
-        // before this pool pops.
-        unsafe {
-            let data = Obj::from_owned(send_id_cptr_usize(
-                alloc(class(c"NSData")),
-                sel!(initWithBytes:length:),
-                png.as_ptr().cast(),
-                png.len(),
-            ))?;
-            Obj::retain(send_id_id(
-                class(c"NSBitmapImageRep").as_id(),
-                sel!(imageRepWithData:),
-                data.id(),
-            ))
-        }
-    })
-}
-
-fn set_show_menu_action(button: Id, target: Id, show: Sel) {
-    let Some(name) = aterm_objc::ns_string(SHOW_MENU) else {
-        return;
-    };
-    // SAFETY: main-thread AppKit sends on live receivers. `-initWithName:target:selector:` is
-    // `@40@0:8@16@24:32` and consumes the +alloc (the target held weakly: the caller keeps it
-    // alive); `+arrayWithObject:` is `@24@0:8@16` and answers +0; `-setAccessibilityCustomActions:`
-    // is `v24@0:8@16` and copies the array.
-    unsafe {
-        let Some(action) = Obj::from_owned(send_id_id_id_sel(
-            alloc(class(c"NSAccessibilityCustomAction")),
-            sel!(initWithName:target:selector:),
-            name.id(),
-            target,
-            show,
-        )) else {
-            return;
-        };
-        let actions = send_id_id(
-            class(c"NSArray").as_id(),
-            sel!(arrayWithObject:),
-            action.id(),
-        );
-        if !actions.is_null() {
-            send_v_id(button, sel!(setAccessibilityCustomActions:), actions);
-        }
-    }
+    let pngs = SCALES.map(|scale| icon::png(lit, POINTS * scale));
+    status_button::template_image(
+        &pngs.each_ref().map(Vec::as_slice),
+        CGSize {
+            width: side,
+            height: side,
+        },
+        state_text(lit),
+    )
 }
 
 fn new_menu() -> Option<Obj> {

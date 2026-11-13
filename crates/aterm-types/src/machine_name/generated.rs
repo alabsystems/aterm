@@ -106,14 +106,15 @@ impl GeneratedNames {
         self.for_slot(slot) == Some(observed)
     }
 
-    /// A numeric Bonjour collision alias of this exact target. It remains a
+    /// A numeric macOS collision alias of this slot's exact target. It remains a
     /// mismatch for display and completion, but must not trigger a rename loop.
     #[must_use]
     pub fn collision(&self, slot: OsSlot, observed: &str) -> bool {
-        slot.collision(self.host_name(), observed)
+        self.for_slot(slot)
+            .is_some_and(|expected| slot.collision(expected, observed))
     }
 
-    /// Values a setter leaves alone: exact names and a diagnosed Bonjour alias.
+    /// Values a setter leaves alone: exact names and a diagnosed collision alias.
     #[must_use]
     pub fn accepts(&self, slot: OsSlot, observed: &str) -> bool {
         self.exact(slot, observed) || self.collision(slot, observed)

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Off Unix nothing is walked or looked at: every entry point answers
-//! [`Refusal::Unsupported`] for every path, a drive-letter path included, never
-//! [`Refusal::Relative`] (which `sys` shows as "refused" where it means "unsupported").
+//! Where there is no walker (neither Unix nor Windows) nothing is walked or looked at: every
+//! entry point answers [`Refusal::Unsupported`] for every path, a drive-letter path included,
+//! never [`Refusal::Relative`] (which `sys` shows as "refused" where it means "unsupported").
 
 use std::path::Path;
 use std::time::{Duration, Instant};

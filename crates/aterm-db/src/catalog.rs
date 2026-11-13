@@ -16,6 +16,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod absence;
+#[cfg(test)]
+pub(crate) use absence::ABSENCE_MUTANT;
 mod admission;
 pub(crate) mod command;
 mod descriptor;
@@ -63,6 +66,18 @@ pub(crate) const RECORDS_PER_CREATOR: usize = 64;
 pub(crate) const MAX_PAYLOAD: usize = 4096;
 pub(crate) fn scope(trust: Trust) -> Scope {
     descriptor::catalog_scope(trust)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PERMIT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread's [`Directory::permits`] read the catalog to judge a table (its
+/// last branch, past the policy, the catalog itself and the ring windows).
+#[cfg(test)]
+pub(crate) fn test_permit_reads() -> usize {
+    PERMIT_READS.with(std::cell::Cell::get)
 }
 
 /// Signed provenance of a declaration. Time is an author claim, never priority.
@@ -188,6 +203,26 @@ impl Directory {
         scope: Scope,
     ) -> Result<Option<Store>> {
         Store::observe_if_exists_region(session, &self.path(scope)?, scope, self.region)
+    }
+
+    /// Custody-verified but unauthenticated operation IDs, only for repair ordering hints.
+    pub(crate) fn repair_ids(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+    ) -> Result<Option<BTreeSet<Digest>>> {
+        Store::repair_ids_region(session, &self.path(scope)?, scope, self.region)
+    }
+
+    /// Whether [`Self::observe_store_if_exists`] finds the store, from its enrollment claim alone
+    /// ([`Store::enrollment_region`]): `Absent` or `Pending` exactly where that is `None`. It
+    /// opens no store.
+    pub(crate) fn enrollment(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+    ) -> Result<crate::table::store::Enrollment> {
+        Store::enrollment_region(session, &self.path(scope)?, scope, self.region)
     }
 
     /// Observe existing primary or recovery storage without creating it. A missing
@@ -330,6 +365,42 @@ impl Directory {
             }
             retained.extend(primary);
         }
+        Ok((retained, count))
+    }
+
+    /// Count both physical regions without confusing missing roots with damage.
+    fn retained_local(&self) -> Result<(BTreeSet<Digest>, usize)> {
+        use aterm_uds::private_file::{PrivateDir, judge_private_dir};
+        let mut retained = BTreeSet::new();
+        let mut unknown = 0;
+        for directory in [self.primary(), self.recovery()] {
+            match judge_private_dir(&directory.root)? {
+                PrivateDir::Missing => continue,
+                PrivateDir::Private => {}
+                _ => return Err(Error::new("retained table root is not private")),
+            }
+            let mut count = 0;
+            for entry in std::fs::read_dir(&directory.root)? {
+                let entry = entry?;
+                count += 1;
+                if count > MAX_TABLES + 1 {
+                    return Err(Error::new("retained table storage exceeds its bound"));
+                }
+                if let Some(name) = entry.file_name().to_str()
+                    && let Ok(id) = crate::database::decode_hex::<32>(name)
+                {
+                    retained.insert(id);
+                } else {
+                    unknown += 1;
+                }
+            }
+        }
+        if retained.len() + unknown > MAX_TABLES + 1 {
+            return Err(Error::new(
+                "combined retained table storage exceeds its bound",
+            ));
+        }
+        let count = retained.len() + unknown;
         Ok((retained, count))
     }
     /// Whether `scope`'s storage exists or one more directory fits beside every retained one
@@ -577,12 +648,21 @@ impl Directory {
         }
     }
 
-    pub(crate) fn observe_primary_with_config(
+    /// The primary catalog as a round's selection reads it, once (`Round::select_tables`). The
+    /// sharing configuration is read for its refusal alone, as the round's policy was read from
+    /// it (`Replica::round`'s `Policy::read(config)`): only `policy`, the round's, projects here.
+    /// Otherwise as [`Self::observe_primary`].
+    ///
+    /// # Errors
+    /// The sharing configuration is unreadable or invalid, or as [`Self::observe_primary`].
+    pub(crate) fn observe_primary_selecting(
         &self,
         session: &Session<'_>,
         config: &Path,
-    ) -> Result<Snapshot> {
-        self.observe_primary_with_policy(session, &Policy::read(config)?)
+        policy: &Policy,
+    ) -> Result<Option<Snapshot>> {
+        Policy::read(config)?;
+        self.observe_primary(session, policy)
     }
 
     fn observe_primary_with_policy(
@@ -590,6 +670,19 @@ impl Directory {
         session: &Session<'_>,
         policy: &Policy,
     ) -> Result<Snapshot> {
+        self.observe_primary(session, policy)
+            .map(Option::unwrap_or_default)
+    }
+
+    /// The primary catalog's declarations projected under `policy`, without enrolling: none where
+    /// no catalog is held and no table storage is either.
+    ///
+    /// # Errors
+    /// The storage root or the catalog cannot be read, the catalog is absent beside retained
+    /// table storage, or the retained table storage exceeds its bound (`retained()`: "retained
+    /// table storage exceeds its bound", or "combined retained table storage exceeds its bound"
+    /// where a recovery directory counts its primary's storage too).
+    fn observe_primary(&self, session: &Session<'_>, policy: &Policy) -> Result<Option<Snapshot>> {
         let root_exists = match aterm_uds::private_file::check_private_dir(&self.root) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -602,13 +695,14 @@ impl Directory {
                     "catalog is absent beside retained table storage",
                 ));
             }
-            return Ok(Snapshot::default());
+            return Ok(None);
         };
         self.project(
             session,
             self.discovery_records_from(session, &catalog)?,
             policy,
         )
+        .map(Some)
     }
 
     /// Read the catalog this Mac holds with default local projection policy, without enrolling
@@ -758,6 +852,8 @@ impl Directory {
         if self.ring_permits(session, id, now)? {
             return Ok(true);
         }
+        #[cfg(test)]
+        PERMIT_READS.with(|reads| reads.set(reads.get() + 1));
         Ok(self
             .project(session, self.discovery_records(session)?, policy)?
             .entries
@@ -783,6 +879,37 @@ impl Directory {
             self.discovery_records_from(session, &catalog)?,
             policy,
         )?;
+        self.subscribed_storage(&snapshot)
+    }
+
+    /// [`Self::existing_subscriptions`] from a primary catalog already read under `policy`
+    /// ([`Self::observe_primary_selecting`]), `None` where none is held: the selection a round
+    /// makes in one catalog read.
+    ///
+    /// # Errors
+    /// A subscribed table's storage cannot be examined, or the storage root's barrier fails.
+    pub(crate) fn selected_subscriptions(
+        &self,
+        observed: Option<Snapshot>,
+        policy: &Policy,
+    ) -> Result<Option<BTreeMap<Digest, (Scope, PathBuf)>>> {
+        let scope = self.catalog_scope();
+        if !policy.enabled || policy.excluded.contains(&scope.digest()) {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let Some(snapshot) = observed else {
+            return Ok(None);
+        };
+        self.subscribed_storage(&snapshot)
+    }
+
+    /// The catalog and each table `snapshot` subscribes, with its storage; `None` where a
+    /// subscribed table has no storage yet, which asks the caller for the writer.
+    fn subscribed_storage(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Option<BTreeMap<Digest, (Scope, PathBuf)>>> {
+        let scope = self.catalog_scope();
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
         for entry in snapshot
             .entries
@@ -943,6 +1070,18 @@ impl Directory {
         records: Vec<crate::table::Record>,
         policy: &Policy,
     ) -> Result<Snapshot> {
+        let (retained, total) = self.retained()?;
+        self.project_retained(session, records, policy, &retained, total)
+    }
+
+    fn project_retained(
+        &self,
+        session: &Session<'_>,
+        records: Vec<crate::table::Record>,
+        policy: &Policy,
+        retained: &BTreeSet<Digest>,
+        mut total: usize,
+    ) -> Result<Snapshot> {
         let mut snapshot = Snapshot {
             recovery: self.is_recovery(),
             ..Snapshot::default()
@@ -986,10 +1125,13 @@ impl Directory {
         // Already enrolled tables retain their storage slots. A later low
         // digest cannot evict one, nor can exclusion silently reclaim custody.
         // The rings' and the reserved tables' slots stay theirs: their storage counts against
-        // none of these.
-        let (retained, mut total) = self.retained()?;
-        let count = self.catalog_count(session, &retained, total);
-        let mut free = (CATALOG_SLOTS + 1).saturating_sub(count);
+        // none of these. The free slots are counted (`catalog_count`, which reads the rings'
+        // states) only once an entry competes for one in the last pass: subscribed, neither
+        // reserved nor retained. A snapshot in which no entry does, such as one whose every
+        // subscribed table holds its storage, reads no ring state here.
+        // What `retained` counted, before the reserved pass adds the reserved tables' room.
+        let stored = total;
+        let mut free: Option<usize> = None;
         let mut reserved = BTreeSet::new();
         for (id, entry) in &mut snapshot.entries {
             let first = &entry.declarations[0].descriptor;
@@ -1037,10 +1179,14 @@ impl Directory {
                 && entry.state == State::Subscribed
                 && !retained.contains(&id)
             {
-                if free == 0 {
+                let free = free.get_or_insert_with(|| {
+                    (CATALOG_SLOTS + 1)
+                        .saturating_sub(self.catalog_count(session, retained, stored))
+                });
+                if *free == 0 {
                     entry.state = State::Capacity;
                 } else {
-                    free -= 1;
+                    *free -= 1;
                 }
             }
         }

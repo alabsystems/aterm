@@ -17,6 +17,9 @@ claude/turn-duration/step-notice	ok	{"subtype":"turn_duration","type":"system"}
 claude/limit/steps	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
 claude/limit/steps-bare	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
 claude/limit/step-notice	ok	{"content":"You've hit your limit","error":"rate_limit","isApiErrorMessage":true,"quotaLimits":{"rateLimitType":"five_hour"},"subtype":"api_error","type":"system"}
+claude/mid-turn-command/steps	ok	{"isMeta":false,"isSidechain":false,"parentUuid":"u-6","subtype":"local_command","timestamp":"2026-11-11T03:55:49.135Z","type":"system","uuid":"u-7","version":"2.1.322"}
+claude/mid-turn-command/steps-bare	ok	{"isMeta":false,"isSidechain":false,"parentUuid":"u-6","subtype":"local_command","timestamp":"2026-11-11T03:55:49.135Z","type":"system","uuid":"u-7","version":"2.1.322"}
+claude/mid-turn-command/step-notice	ok	{"content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>","subtype":"local_command","type":"system"}
 claude/compact-boundary/steps	ok	{"isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
 claude/compact-boundary/steps-bare	ok	{"isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
 claude/compact-boundary/step-notice	ok	{"content":"Conversation compacted","subtype":"compact_boundary","type":"system"}

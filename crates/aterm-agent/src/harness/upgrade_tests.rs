@@ -739,6 +739,7 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
         name: "zsh".to_string(),
         age_s,
         command: command.to_string(),
+        ..Held::default()
     };
     let two = running_clause(&[
         held(
@@ -777,6 +778,7 @@ fn the_notice_names_the_oldest_processes_first() {
         name: "zsh".to_string(),
         age_s,
         command: String::new(),
+        ..Held::default()
     };
     let mut table: Vec<Held> = (0..14)
         .map(|i| held(60_000 + i, 60 + u64::from(i)))
@@ -806,6 +808,7 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
             name: "zsh".to_string(),
             age_s: 475_200,
             command: command.to_string(),
+            ..Held::default()
         }]);
         let (_, quoted) = clause.split_once("): ").expect("a command");
         let quoted = quoted.strip_suffix('.').expect("the clause's period");
@@ -1003,8 +1006,11 @@ fn idle_facts() -> Facts {
         unnoticed: false,
         own_hold_s: 0,
         tells: 0,
-        told_s: u64::MAX,
+        waits_only: false,
+        deadline_set: false,
+        work_due: false,
         may_tell: false,
+        silent: false,
         press: Press::None,
     }
 }
@@ -1068,15 +1074,16 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     );
 }
 
-/// A quiet round the agent's own work has held [`OWN_TELL_S`] at [`Rung::Land`], under an
-/// autopilot that carries the session: told at a break or at an idle point its work holds, never
-/// moved over that work, at most [`MAX_TELLS`] times and [`RETELL_S`] apart.
+/// A quiet round the agent's real work has held [`WORK_TELL_S`], under an autopilot that carries
+/// the session: told once, at a break or at an idle point its work holds, whatever the rung, and
+/// never moved over that work before the deadline the line names.
 #[test]
-fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_it() {
+fn a_quiet_round_its_real_work_holds_is_told_once_past_the_bound_and_not_moved_before_its_deadline()
+{
     let idle = Facts {
         quiet: true,
         rung: Rung::Land,
-        own_hold_s: OWN_TELL_S,
+        own_hold_s: WORK_TELL_S,
         may_tell: true,
         ..idle_facts()
     };
@@ -1095,7 +1102,7 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
         Step::Tell("background")
     );
     assert_eq!(
-        break_step(Step::Tell("background")),
+        break_step(Step::Tell("background"), &brk),
         Step::Tell("background")
     );
     assert_eq!(
@@ -1107,18 +1114,14 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
         Step::Terminate,
         "nothing of its own running: the move comes first"
     );
-    let unmoved: [Knock; 8] = [
-        (|f| f.own_hold_s = OWN_TELL_S - 1, "below the bound"),
-        (|f| f.rung = Rung::KeysOnly, "below the land rung"),
+    let unmoved: [Knock; 7] = [
+        (|f| f.own_hold_s = WORK_TELL_S - 1, "below the bound"),
         (|f| f.may_tell = false, "no autopilot carries it"),
         (
-            |f| (f.tells, f.told_s) = (1, RETELL_S - 1),
-            "told within the rest",
+            |f| f.deadline_set = true,
+            "this process was told its deadline",
         ),
-        (
-            |f| (f.tells, f.told_s) = (MAX_TELLS, u64::MAX),
-            "told the most times",
-        ),
+        (|f| f.tells = MAX_TELLS, "this target was told"),
         (|f| f.status = "busy".into(), "its turn runs"),
         (|f| f.taskless = true, "no task"),
         (|f| f.quiet = false, "the ask flow"),
@@ -1134,19 +1137,10 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
             assert!(!matches!(step, Step::Tell(_)), "{why}: {step:?}");
             assert!(
                 !matches!(step, Step::Terminate | Step::Fresh),
-                "{why}: never moved over its work: {step:?}"
+                "{why}: never moved over its work before its deadline: {step:?}"
             );
         }
     }
-    let rested = Facts {
-        tells: 1,
-        told_s: RETELL_S,
-        ..brk.clone()
-    };
-    assert_eq!(
-        next_step(&pending, &rested, false, 200),
-        Step::Tell("background")
-    );
     assert_eq!(
         next_step(
             &pending,
@@ -1193,16 +1187,11 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
             assert_eq!(gate_announce(&f), Gate::Wait(word), "{word}");
         }
     }
+    let mut told_below_land = false;
     for rung in [Rung::Prefer, Rung::Settled, Rung::KeysOnly, Rung::Land] {
         for (background, point) in [(true, false), (false, true), (true, true)] {
-            for own_hold_s in [0, OWN_TELL_S - 1, OWN_TELL_S, 10 * OWN_TELL_S] {
-                for (tells, told_s) in [
-                    (0, u64::MAX),
-                    (0, RETELL_S - 1),
-                    (1, 0),
-                    (1, RETELL_S),
-                    (MAX_TELLS, RETELL_S),
-                ] {
+            for own_hold_s in [0, WORK_TELL_S - 1, WORK_TELL_S, 10 * WORK_TELL_S] {
+                for (tells, deadline_set) in [(0, false), (0, true), (1, false), (1, true)] {
                     let f = Facts {
                         rung,
                         background: if background {
@@ -1213,7 +1202,7 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
                         background_point: point,
                         own_hold_s,
                         tells,
-                        told_s,
+                        deadline_set,
                         ..idle.clone()
                     };
                     let step = next_step(&pending, &f, false, 200);
@@ -1221,37 +1210,687 @@ fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_
                         !matches!(step, Step::Terminate | Step::Fresh),
                         "{f:?}: {step:?}"
                     );
+                    let tells_it = matches!(step, Step::Tell(_));
                     assert_eq!(
-                        matches!(step, Step::Tell(_)),
-                        rung == Rung::Land
-                            && own_hold_s >= OWN_TELL_S
+                        tells_it,
+                        own_hold_s >= WORK_TELL_S
                             && tells < MAX_TELLS
-                            && told_s >= RETELL_S,
+                            && !deadline_set
+                            && gate_announce(&f) == Gate::Go,
                         "{f:?}: {step:?}"
                     );
+                    told_below_land |= tells_it && rung < Rung::Land;
                 }
             }
         }
     }
+    assert!(
+        told_below_land,
+        "the bound is the work's, not the land rung's"
+    );
 }
 
-/// The quiet tell's line: a fact naming both builds and how long the work held, with the restart
-/// the agent may run itself only where the tab offers it.
+/// A quiet round in a session its autopilot carries moves over what the agent runs under it:
+/// at once where only proved waits run, and past the deadline it was told where work does. A
+/// person, a wall and a running turn still hold it, and with no autopilot nothing yields.
 #[test]
-fn the_quiet_tell_names_both_builds_and_its_verb_only_where_offered() {
-    let verb = tell_prompt(Agent::Claude, "2.1.305", "2.1.310", OWN_TELL_S, true);
+fn a_quiet_round_moves_over_waits_at_once_and_over_work_past_its_deadline() {
+    let idle = Facts {
+        quiet: true,
+        rung: Rung::Land,
+        may_tell: true,
+        background: vec!["zsh".into()],
+        ..idle_facts()
+    };
+    let brk = Facts {
+        status: "shell".into(),
+        background_point: true,
+        ..idle.clone()
+    };
+    let pending = Phase::Pending;
+    let step = |f: &Facts| {
+        let step = next_step(&pending, f, false, 200);
+        if f.background_point {
+            break_step(step, f)
+        } else {
+            step
+        }
+    };
+    for base in [&idle, &brk] {
+        let waits = Facts {
+            waits_only: true,
+            ..base.clone()
+        };
+        assert_eq!(own_yields(&waits), Some(Yield::Waits));
+        assert_eq!(step(&waits), Step::Terminate, "waits alone: {waits:?}");
+        assert_eq!(
+            step(&Facts {
+                own_hold_s: 10 * WORK_TELL_S,
+                ..waits.clone()
+            }),
+            Step::Terminate,
+            "waits are never told: the round moves"
+        );
+        let told = Facts {
+            own_hold_s: 10 * WORK_TELL_S,
+            tells: 1,
+            deadline_set: true,
+            ..base.clone()
+        };
+        assert_eq!(own_yields(&told), None);
+        assert_eq!(
+            step(&told),
+            Step::Wait("background"),
+            "work, before its deadline"
+        );
+        let due = Facts {
+            work_due: true,
+            ..told.clone()
+        };
+        assert_eq!(own_yields(&due), Some(Yield::Deadline));
+        assert_eq!(step(&due), Step::Terminate, "work, past its deadline");
+        /// One fact that holds the move, and the wait it says.
+        type Hold = (fn(&mut Facts), &'static str);
+        for f in [&waits, &due] {
+            let holds: [Hold; 8] = [
+                (|f| f.may_tell = false, "background"),
+                (|f| f.approval_box = true, "box"),
+                (|f| f.composer_empty = false, "draft"),
+                (|f| f.held = true, "held"),
+                (|f| f.typing = true, "attended"),
+                (|f| f.limited = true, "limited"),
+                (|f| f.login = true, "login"),
+                (|f| f.unnoticed = true, NOTICE_SHOWN),
+            ];
+            for (edit, word) in holds {
+                let mut held = f.clone();
+                edit(&mut held);
+                assert_eq!(step(&held), Step::Wait(word), "{word}: {held:?}");
+            }
+            let taskless = Facts {
+                taskless: true,
+                ..f.clone()
+            };
+            assert_eq!(own_yields(&taskless), None, "no task: the fresh flow's");
+            assert_ne!(step(&taskless), Step::Terminate, "{taskless:?}");
+            let mut running = f.clone();
+            running.busy_footer = true;
+            assert!(
+                matches!(step(&running), Step::Wait(_)),
+                "a running turn is never ended"
+            );
+            let asked = Facts {
+                quiet: false,
+                ..f.clone()
+            };
+            assert!(
+                !matches!(step(&asked), Step::Terminate | Step::Fresh),
+                "the ask flow never moves over the agent's own work: {:?}",
+                step(&asked)
+            );
+        }
+    }
+    // A break holds every other restart, whatever yields.
+    let waits = Facts {
+        waits_only: true,
+        ..brk.clone()
+    };
+    assert_eq!(break_step(Step::Fresh, &waits), Step::Wait("background"));
+    assert_eq!(
+        break_step(Step::Terminate, &brk),
+        Step::Wait("background"),
+        "work with no deadline passed"
+    );
+}
+
+/// What only waits ([`wait_command`]): a clock, a control wait the same line starts again with
+/// nothing missed, and a poll loop of those with read-only probes. Whatever writes, substitutes,
+/// groups, detaches or runs any other program is work, and so is what it cannot read. A follow
+/// and a control wait armed from now are work too: started again after the restart's gap they
+/// never see what happened in it (`tail -f` begins at the file's last lines, so a marker written
+/// in the gap with more lines after it is never read).
+#[test]
+fn a_command_is_a_wait_only_where_every_part_of_it_waits_or_reads() {
+    for wait in [
+        "aterm ctl await task @s-1 since=0",
+        "aterm ctl @self await sys 'mem=normal and thrash=no' for=1m timeout=3600000",
+        "/Applications/aterm.app/Contents/MacOS/aterm ctl await task @s-1,@s-2 since=0",
+        "aterm ctl @self await wake",
+        "sleep 600",
+        "until grep -q DEPLOY_DONE deploy.log; do sleep 5; done",
+        "until [ -f done ]; do sleep 5; done",
+        "while true; do aterm ctl @self sys; sleep 60; done",
+        "while ! pgrep -q targo; do sleep 2; done 2>/dev/null",
+        "N=5 sleep $N",
+        "if kill -0 4242; then sleep 30; fi; echo gone",
+        "sleep 5 > /dev/null 2>&1",
+    ] {
+        assert!(wait_command(wait), "{wait}");
+    }
+    let long = format!("sleep 1; echo {}", "x".repeat(REARM_COMMAND_CHARS));
+    for work in [
+        "",
+        "   ",
+        "aterm ctl await task @s-1 since=0; targo --unverified test",
+        "targo --unverified test -p aterm-agent",
+        "sleep 5 > out",
+        "sleep 5 >> log",
+        "sleep 5 2>err",
+        "sleep $(cat n)",
+        "sleep `cat n`",
+        "(sleep 5)",
+        "{ sleep 5; }",
+        "sleep 5 & targo test",
+        "sleep 5 &",
+        "amacs --wait f",
+        "sleep 5\\012rm -rf x",
+        "sleep 5\nmake",
+        "echo done",
+        "tail -n 5 x.log",
+        "tail -f x.log",
+        "tail -f deploy.log | grep -m1 DEPLOY_DONE",
+        "tail -n 0 -F x.log | grep -m1 done",
+        "tail --follow x.log",
+        "aterm ctl await task @s-1",
+        "aterm ctl @s-1 await seq",
+        "aterm ctl @s-1 await block",
+        "aterm ctl @s-1 await match Finished",
+        "aterm ctl @self await edit uri=file:///tmp/x",
+        "aterm ctl await",
+        "while make; do sleep 1; done",
+        "until [ -f done ]; do sleep 5; done; make install",
+        "aterm ctl @s-1 send 'await'",
+        "aterm ctl @self spawn agent=claude -",
+        "aterm ctl --sock /tmp/s await task @s-1",
+        "aterm secrets sync; sleep 1",
+        "kill 4242; sleep 1",
+        "kill -9 4242; sleep 1",
+        "sleep 5 | tee log",
+        "cat <<EOF",
+        "$CMD; sleep 1",
+        "exec sleep 5",
+        long.as_str(),
+    ] {
+        assert!(!wait_command(work), "{work}");
+    }
+}
+
+/// What runs under an agent is waits only where every shell is proved one ([`own_of`]): a top
+/// with its exact command, a wait, and nothing under it but waits' programs. A shell with no top
+/// above it, a command not exact, any other program, work the screen names, an unread table and
+/// more than the continuation carries are work.
+#[test]
+fn what_runs_under_an_agent_is_waits_only_where_each_shell_is_proved_one() {
+    let top = |pid: u32, command: &str, under: &[&str]| Held {
+        pid,
+        name: "zsh".into(),
+        age_s: 60,
+        command: command.into(),
+        seat: Seat::Top,
+        under: under.iter().map(ToString::to_string).collect(),
+        exact: true,
+    };
+    let wait = "until [ -f done ]; do sleep 5; done";
+    assert_eq!(own_of(&[], false, false), Own::None);
+    assert_eq!(
+        own_of(&[top(7, wait, &["sleep"])], false, false),
+        Own::Waits(vec![wait.to_string()])
+    );
+    let nested = Held {
+        pid: 8,
+        name: "sh".into(),
+        seat: Seat::Under,
+        ..Held::default()
+    };
+    assert_eq!(
+        own_of(
+            &[top(7, wait, &["sh", "sleep"]), nested.clone()],
+            false,
+            false
+        ),
+        Own::Waits(vec![wait.to_string()]),
+        "a shell under a wait is the wait's"
+    );
+    let work: [(&str, Vec<Held>, bool, bool); 10] = [
+        (
+            "the screen names work",
+            vec![top(7, wait, &[])],
+            true,
+            false,
+        ),
+        (
+            "the table went unread",
+            vec![top(7, wait, &[])],
+            false,
+            true,
+        ),
+        ("nothing held, the screen names work", vec![], true, false),
+        (
+            "a shell with no top above it",
+            vec![
+                top(7, wait, &[]),
+                Held {
+                    seat: Seat::Loose,
+                    ..nested.clone()
+                },
+            ],
+            false,
+            false,
+        ),
+        (
+            "a shell under no top this list names",
+            vec![nested.clone()],
+            false,
+            false,
+        ),
+        (
+            "another program under an accepted loop",
+            vec![top(7, wait, &["sleep", "targo"])],
+            false,
+            false,
+        ),
+        (
+            "a command not read byte for byte",
+            vec![Held {
+                exact: false,
+                ..top(7, wait, &[])
+            }],
+            false,
+            false,
+        ),
+        (
+            "a command that is no wait",
+            vec![top(7, "targo --unverified test", &[])],
+            false,
+            false,
+        ),
+        (
+            "one wait and one build",
+            vec![top(7, wait, &[]), top(9, "make", &["make"])],
+            false,
+            false,
+        ),
+        (
+            "a seat never read",
+            vec![Held {
+                pid: 7,
+                name: "zsh".into(),
+                command: wait.into(),
+                exact: true,
+                ..Held::default()
+            }],
+            false,
+            false,
+        ),
+    ];
+    for (why, held, screen, unreadable) in work {
+        assert_eq!(own_of(&held, screen, unreadable), Own::Work, "{why}");
+    }
+    let many = |n: u32| -> Vec<Held> { (0..n).map(|i| top(100 + i, "sleep 600", &[])).collect() };
+    assert!(matches!(
+        own_of(&many(u32::try_from(REARM_NAMED).expect("small")), false, false),
+        Own::Waits(w) if w.len() == REARM_NAMED
+    ));
+    assert_eq!(
+        own_of(
+            &many(u32::try_from(REARM_NAMED).expect("small") + 1),
+            false,
+            false
+        ),
+        Own::Work,
+        "more waits than one continuation carries"
+    );
+    let wide = format!("sleep 600; echo {}", "x".repeat(REARM_COMMAND_CHARS - 20));
+    let wide: Vec<Held> = (0..6).map(|i| top(200 + i, &wide, &[])).collect();
+    assert_eq!(
+        own_of(&wide, false, false),
+        Own::Work,
+        "more characters than one continuation carries"
+    );
+    assert_eq!(
+        own_of(&[top(7, wait, &["sleep", "tail"])], false, false),
+        Own::Work,
+        "a follow under a wait's shell is no wait"
+    );
+}
+
+/// The waits running at the last look are carried only where each has a carried command of its
+/// own ([`waits_carried`]): a second wait on a command line the continuation names once is not.
+/// NEGATIVE CONTROL: membership alone (`carried.contains`) passes the second `sleep 600`.
+#[test]
+fn a_second_wait_on_one_command_line_is_not_carried_by_the_first() {
+    let s = |words: &[&str]| -> Vec<String> { words.iter().map(ToString::to_string).collect() };
+    let carried = s(&["sleep 600", "aterm ctl await task @s-1 since=0"]);
+    assert!(waits_carried(&[], &carried), "a wait that ended is carried");
+    assert!(waits_carried(&s(&["sleep 600"]), &carried));
+    assert!(waits_carried(
+        &s(&["aterm ctl await task @s-1 since=0", "sleep 600"]),
+        &carried
+    ));
+    let twice = s(&["sleep 600", "sleep 600"]);
+    assert!(
+        twice.iter().all(|w| carried.contains(w)),
+        "the control: each is a member"
+    );
+    assert!(!waits_carried(&twice, &carried), "one line, one wait");
+    assert!(waits_carried(&twice, &s(&["sleep 600", "sleep 600"])));
+    assert!(!waits_carried(&s(&["sleep 86400"]), &carried));
+}
+
+/// A deadline stands over one hold by the agent's own work ([`deadline_voids`]): a look that
+/// finds a person or a wall, or an idle look with nothing of its own running, voids it; a look
+/// at the work still running, at waits, at a break, or at a status its in-process work keeps
+/// busy does not; and no look voids a deadline that does not stand.
+#[test]
+fn a_deadline_is_voided_by_a_person_a_wall_or_nothing_running() {
+    let told = Facts {
+        quiet: true,
+        may_tell: true,
+        deadline_set: true,
+        work_due: true,
+        background: vec!["zsh".into()],
+        status: "shell".into(),
+        background_point: true,
+        ..idle_facts()
+    };
+    assert!(!deadline_voids(&told), "the work it named still runs");
+    for (why, f) in [
+        (
+            "a usage limit",
+            Facts {
+                limited: true,
+                ..told.clone()
+            },
+        ),
+        (
+            "the login wall",
+            Facts {
+                login: true,
+                ..told.clone()
+            },
+        ),
+        (
+            "a draft",
+            Facts {
+                composer_empty: false,
+                ..told.clone()
+            },
+        ),
+        (
+            "a box",
+            Facts {
+                approval_box: true,
+                ..told.clone()
+            },
+        ),
+        (
+            "a key within their grace",
+            Facts {
+                attended: true,
+                ..told.clone()
+            },
+        ),
+        (
+            "a held tab",
+            Facts {
+                held: true,
+                ..told.clone()
+            },
+        ),
+        (
+            "nothing running at an idle point",
+            Facts {
+                background: Vec::new(),
+                status: "idle".into(),
+                background_point: false,
+                ..told.clone()
+            },
+        ),
+    ] {
+        assert!(deadline_voids(&f), "{why}");
+        assert!(
+            !deadline_voids(&Facts {
+                deadline_set: false,
+                ..f
+            }),
+            "{why}: no deadline stands"
+        );
+    }
+    for (why, f) in [
+        (
+            "waits alone",
+            Facts {
+                waits_only: true,
+                status: "idle".into(),
+                background_point: false,
+                ..told.clone()
+            },
+        ),
+        (
+            "a break with nothing named",
+            Facts {
+                background: Vec::new(),
+                status: "idle".into(),
+                ..told.clone()
+            },
+        ),
+        (
+            "a status its own work keeps busy",
+            Facts {
+                background: Vec::new(),
+                background_point: false,
+                ..told.clone()
+            },
+        ),
+        (
+            "a table that went unread",
+            Facts {
+                background: vec!["ps-unreadable".into()],
+                status: "idle".into(),
+                background_point: false,
+                ..told.clone()
+            },
+        ),
+        (
+            "an autopilot that carries nothing now",
+            Facts {
+                may_tell: false,
+                ..told.clone()
+            },
+        ),
+    ] {
+        assert!(!deadline_voids(&f), "{why}");
+    }
+}
+
+/// A session whose task finished or landed is typed no line before a move ([`Facts::silent`]):
+/// real work under it is told no deadline, and the round still moves over proved waits and past
+/// a deadline it was told before.
+#[test]
+fn a_finished_session_is_told_nothing_and_still_moves_over_what_yields() {
+    let brk = Facts {
+        quiet: true,
+        may_tell: true,
+        silent: true,
+        rung: Rung::Land,
+        background: vec!["zsh".into()],
+        status: "shell".into(),
+        background_point: true,
+        own_hold_s: WORK_TELL_S,
+        ..idle_facts()
+    };
+    let step = |f: &Facts| break_step(next_step(&Phase::Pending, f, false, 0), f);
+    assert!(!tell_due(&Phase::Pending, &brk));
+    assert_eq!(step(&brk), Step::Wait("background"), "no line, no deadline");
+    assert_eq!(
+        step(&Facts {
+            silent: false,
+            ..brk.clone()
+        }),
+        Step::Tell("background"),
+        "the control: a session still at work is told"
+    );
+    assert_eq!(
+        step(&Facts {
+            waits_only: true,
+            ..brk.clone()
+        }),
+        Step::Terminate,
+        "leftover waits never hold a finished session"
+    );
+    assert_eq!(
+        step(&Facts {
+            deadline_set: true,
+            work_due: true,
+            ..brk.clone()
+        }),
+        Step::Terminate,
+        "a deadline told before it finished stands"
+    );
+}
+
+/// The continuation after a restart that ended the agent's waits carries each command verbatim
+/// to start again, and one at the deadline names what ended; both keep the carry-on's close, so
+/// the done check still replaces it ([`checking`]).
+#[test]
+fn a_continuation_carries_each_ended_wait_verbatim_and_names_work_ended_at_its_deadline() {
+    let (from, to) = (v("2.1.305"), v("2.1.310"));
+    let waits = vec![
+        "aterm ctl await task @s-1,@s-2 since=0".to_string(),
+        "until [ -f /tmp/done ]; do sleep 5; done".to_string(),
+    ];
+    let text = continue_prompt(&from, &to, None, Ended::Waits(&waits));
+    assert!(text.starts_with(HARNESS_MARK), "{text}");
+    assert!(
+        text.contains("ended 2 background waits of yours and nothing else"),
+        "{text}"
+    );
+    for (i, command) in waits.iter().enumerate() {
+        assert!(
+            text.contains(&format!("({}) `{command}`", i + 1)),
+            "{command}: {text}"
+        );
+    }
+    assert!(
+        !text.contains(RELAUNCH_RESTORES),
+        "nothing else ended: {text}"
+    );
+    assert!(text.ends_with(CARRY_ON), "{text}");
+    assert!(
+        text.contains(
+            "Start each again now the way you ran it (a background command, or the Monitor tool \
+             where it was a monitor):"
+        ),
+        "a monitor is started again as one: {text}"
+    );
+    let one = continue_prompt(&from, &to, None, Ended::Waits(&waits[..1]));
+    assert!(one.contains("ended 1 background wait of yours"), "{one}");
+    // A version not read leaves the versions out, never what the restart ended.
+    let unversioned = ended_prompt(Ended::Waits(&waits));
+    assert!(unversioned.starts_with(HARNESS_MARK), "{unversioned}");
+    for command in &waits {
+        assert!(unversioned.contains(command.as_str()), "{unversioned}");
+    }
+    assert!(unversioned.ends_with(CARRY_ON), "{unversioned}");
+    let list = "pid 7 (zsh, 2h): targo --unverified test";
+    let work = continue_prompt(
+        &from,
+        &to,
+        Some("opus"),
+        Ended::Work {
+            told_s: WORK_DEADLINE_S,
+            list,
+        },
+    );
+    for part in [
+        "at the deadline aterm told you 1h ago",
+        "ended what still ran under you: pid 7 (zsh, 2h): targo --unverified test.",
+        RELAUNCH_RESTORES,
+        "it ran opus before the restart",
+    ] {
+        assert!(work.contains(part), "{part}: {work}");
+    }
+    assert!(work.ends_with(CARRY_ON), "{work}");
+    let unnamed = continue_prompt(
+        &from,
+        &to,
+        None,
+        Ended::Work {
+            told_s: 60,
+            list: "",
+        },
+    );
+    assert!(
+        unnamed.contains("ended what still ran inside your own process."),
+        "{unnamed}"
+    );
+    for text in [&text, &work] {
+        let checked = checking(text, false, false);
+        assert!(
+            !checked.ends_with(CARRY_ON) && checked != **text,
+            "{checked}"
+        );
+        assert!(own_words(text) && own_draft(text), "{text}");
+    }
+    assert_eq!(
+        continue_prompt(&from, &to, None, Ended::Nothing),
+        format!(
+            "{HARNESS_MARK} Upgraded: this session was restarted on Claude Code 2.1.310 (from \
+             2.1.305) and resumed. {RESTART_WATCHES} {RELAUNCH_RESTORES} {CARRY_ON}"
+        ),
+        "a restart that ended nothing of its own says what it always did"
+    );
+}
+
+/// The quiet tell's line: both builds, how long the work held, the deadline, and what runs under
+/// the agent, with the restart the agent may run itself only where the tab offers it.
+#[test]
+fn the_quiet_tell_names_both_builds_its_deadline_and_what_runs() {
+    let held = [Held {
+        pid: 4242,
+        name: "zsh".into(),
+        age_s: 7_200,
+        command: "targo --unverified test".into(),
+        ..Held::default()
+    }];
+    let telling = Telling {
+        from: "2.1.305",
+        to: "2.1.310",
+        held_s: WORK_TELL_S,
+        deadline_s: WORK_DEADLINE_S,
+        held: &held,
+        verb: true,
+    };
+    let verb = tell_prompt(Agent::Claude, &telling);
     assert!(verb.starts_with(TELL_HEAD), "{verb}");
     for part in [
         "Claude Code 2.1.310 is installed",
         "this session runs 2.1.305",
-        "held the move for 1h",
-        "`aterm ctl @self restart` moves it sooner and ends any still running.",
+        "held the move for 10m",
+        "restarts this conversation onto 2.1.310 at its first turn end 1h from now",
+        "what still runs under it then ends: pid 4242 (zsh, 2h): targo --unverified test.",
+        "Let it finish or save it before then.",
+        "`aterm ctl @self restart` moves it sooner and ends the same work.",
     ] {
         assert!(verb.contains(part), "{part}: {verb}");
     }
-    let fact = tell_prompt(Agent::Claude, "2.1.305", "2.1.310", OWN_TELL_S, false);
+    let fact = tell_prompt(
+        Agent::Claude,
+        &Telling {
+            verb: false,
+            held: &[],
+            ..telling
+        },
+    );
     assert!(!fact.contains("aterm ctl"), "{fact}");
-    assert!(fact.ends_with("subagent of its own running."), "{fact}");
+    assert!(
+        fact.contains(
+            "what still runs inside it then (a workflow, a subagent, a background task) ends."
+        ),
+        "{fact}"
+    );
+    assert!(fact.ends_with("before then."), "{fact}");
+    assert!(!fact.contains('\n') && !verb.contains('\n'), "one line");
     assert!(
         own_draft(&format!("❯ {fact}")),
         "a tell left in the composer is the harness's"
@@ -2259,13 +2898,13 @@ fn the_notices_and_continuations_keep_their_machine_parts() {
     );
     assert!(!notice.contains("--model"), "{notice}");
     for before in [None, Some("claude-opus-5")] {
-        let text = continue_prompt(&from, &to, before);
+        let text = continue_prompt(&from, &to, before, Ended::Nothing);
         assert!(!text.starts_with(ANNOUNCE_HEAD), "{text}");
         if let Some(model) = before {
             assert!(text.contains(model), "{text}");
         }
     }
-    let bare = continue_prompt(&from, &to, None);
+    let bare = continue_prompt(&from, &to, None, Ended::Nothing);
     assert!(!bare.contains("claude-"), "no model guessed: {bare}");
 }
 
@@ -2535,7 +3174,7 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let (from, to) = (v("2.1.281"), v("2.1.283"));
     for typed in [
         prepare_prompt(&from, &to, Source::Managed, "M"),
-        continue_prompt(&from, &to, Some("haiku")),
+        continue_prompt(&from, &to, Some("haiku"), Ended::Nothing),
         super::super::relaunch::resumed_prompt("2.1.283", "exit"),
         super::super::relaunch::resumed_prompt("2.1.283", "memory"),
     ] {
@@ -4275,7 +4914,7 @@ fn every_stopped_round_rests_then_rearms() {
                 "{why}: {place}"
             );
             assert_eq!(
-                break_step(next_step(&stopped, &f, false, 1)),
+                break_step(next_step(&stopped, &f, false, 1), &f),
                 Step::Rearm,
                 "{why}: {place}"
             );

@@ -23,7 +23,7 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
     let ordering_pin =
         queue_behind_existing.then(|| super::paste_order::pin_ordering_for_test(&sink));
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let cfg = app.glow_config();
     assert!(cfg.enabled && matches!(cfg.style, GlowStyle::RainbowKitty));
     let geom = Geom {
@@ -110,7 +110,7 @@ fn delivered_paste_then_hop(
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let cfg = app.glow_config();
     let geom = Geom {
         cw: 8,
@@ -233,7 +233,7 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
     use super::typed_kitty_summon_tests::{delivery_edge, observing_frame};
     use crate::app_render::CursorFxInputs;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-    for style in ["rainbow kitty", "comet"] {
+    for style in ["rainbow", "comet"] {
         for queued in [false, true] {
             let mut pipe = [0; 2];
             assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -360,7 +360,7 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                     .glow
                     .insert_tally()
                     .delivered,
-                u64::from(style == "rainbow kitty"),
+                u64::from(style == "rainbow"),
                 "{style} queued={queued}: the delivered paste arms B too"
             );
             drop(app);
@@ -389,7 +389,7 @@ fn prelude_paste_then_hop(
     let wid = WindowId(0);
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     app.config.trail_sounds = Some(false);
     app.windows.get_mut(&wid).unwrap().focused = true;
     app.frontmost_window = Some(wid);
@@ -476,7 +476,7 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
         let wid = WindowId(0);
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         app.config.trail_sounds = Some(false);
         app.windows.get_mut(&wid).unwrap().focused = true;
         app.frontmost_window = Some(wid);
@@ -578,7 +578,7 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
     let wid = WindowId(0);
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     app.config.trail_sounds = Some(false);
     app.windows.get_mut(&wid).unwrap().focused = true;
     app.frontmost_window = Some(wid);

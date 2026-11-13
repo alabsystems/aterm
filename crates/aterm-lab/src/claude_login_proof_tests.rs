@@ -599,7 +599,7 @@ fn the_safety_judges_fail_on_a_sighting_an_external_socket_or_an_open_home() {
     );
     let homes = vec!["/Users//example".to_string()];
     let jail = "(deny file-write* (subpath \"/Users//example\"))\n\
-                (deny file-write* (subpath \"/private/tmp/at.lab-501/aterm-32e6a5a1/runs/lp-run1\"))\n";
+                (deny file-write* (subpath \"/private/tmp/.ubd/at.lab-501/aterm-32e6a5a1/runs/lp-run1\"))\n";
     assert_eq!(judge_owner(jail, &homes).verdict, Verdict::Ok);
     assert_eq!(
         judge_owner(jail, &["/Users//other".to_string()]).verdict,

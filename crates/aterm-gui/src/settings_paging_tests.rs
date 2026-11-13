@@ -917,15 +917,44 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
         if scale > 1.5 {
             let short = (1_564.0, 180.0);
             // The chooser's frame gives way before its rows outgrow its list, so Themes keeps
-            // the bar's room and every row whole.
-            let (chrome, room, cuts, _, context) = seated(SettingsRoute::Themes, short, false);
+            // the bar's room and every row whole: in the shortest window from 180pt up whose
+            // chooser lays its list to the panel's edges. How tall its rows stand is the faces'
+            // to say (macOS's give way at 180pt, Windows' at 182pt).
+            let frameless = |compiled: &crate::native_ui::CompiledUi| {
+                let rect = |key: &str| {
+                    let key = UiKey::new(key);
+                    compiled
+                        .semantics
+                        .iter()
+                        .find(|node| node.key == key)
+                        .map(|node| node.rect)
+                        .or_else(|| {
+                            compiled
+                                .paint
+                                .iter()
+                                .find(|node| node.key == key)
+                                .map(|node| node.rect)
+                        })
+                };
+                rect("settings/showcase/list")
+                    .zip(rect("settings/showcase/chooser"))
+                    .is_some_and(|(list, chooser)| (list.x - chooser.x).abs() < 0.5)
+            };
+            let (gives_way, (chrome, room, cuts, _, context)) = (180..=400_u16)
+                .map(|height| (1_564.0, f32::from(height)))
+                .find_map(|window| {
+                    let seat = seated(SettingsRoute::Themes, window, false);
+                    frameless(&seat.3).then_some((window, seat))
+                })
+                .expect("a short window gives the chooser's frame way");
             assert_eq!(
                 chrome,
                 PageChrome::FULL,
-                "Themes keeps its chrome and the bar's room: {context}"
+                "Themes at {gives_way:?} keeps its chrome and the bar's room: {context}"
             );
             assert_eq!(cuts, 0, "every row of the chooser is whole in {room}pt");
-            let (still, barred, _, compiled, context) = seated(SettingsRoute::Themes, short, true);
+            let (still, barred, _, compiled, context) =
+                seated(SettingsRoute::Themes, gives_way, true);
             assert_eq!(
                 still, chrome,
                 "a bar that comes changes nothing of the chrome: {context}"
@@ -958,20 +987,35 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
                 );
             }
         }
-        let windows: &[((f32, f32), bool)] = if scale > 1.5 {
+        // Whether the preview is listed first or pinned (`None`: the faces decide).
+        let windows: &[((f32, f32), Option<bool>)] = if scale > 1.5 {
             &[
-                ((584.0, 236.0), true),
-                // Windows' UI face leaves the pinned preview's rows less room
-                // at 1564x180: every pinned seat cuts one, so the list takes it.
-                ((1_564.0, 180.0), cfg!(windows)),
-                ((1_564.0, 240.0), false),
-                ((1_564.0, 280.0), false),
-                ((1_074.0, 348.0), false),
+                ((584.0, 236.0), Some(true)),
+                // The pinned preview leaves the style rows 96pt for their 92pt in macOS's UI
+                // face; Windows' left them less on its aarch64 lane (listed there) and enough on
+                // x86_64: the faces decide, held below to the rule that decides.
+                ((1_564.0, 180.0), None),
+                ((1_564.0, 240.0), Some(false)),
+                ((1_564.0, 280.0), Some(false)),
+                ((1_074.0, 348.0), Some(false)),
             ]
         } else {
-            &[((849.0, 300.0), false), ((1_074.0, 348.0), false)]
+            &[
+                ((849.0, 300.0), Some(false)),
+                ((1_074.0, 348.0), Some(false)),
+            ]
         };
-        for &(window, listed) in windows {
+        // The cut stops of Cursor Styles' list seated in `chrome`, whatever the page would choose.
+        let cut_in = |window: (f32, f32), chrome: PageChrome| {
+            PAGE_CHROME_HELD.with(|held| held.set(Some(chrome)));
+            let cx = view_cx_at(window.0, window.1);
+            let (runtime, instance, view) = paging_view("", SettingsRoute::CursorStyles);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            PAGE_CHROME_HELD.with(|held| held.set(None));
+            let state = messages_view_state(&runtime, view);
+            state.scroll_plan().expect("a list").cut_stops()
+        };
+        for &(window, told) in windows {
             let cx = view_cx_at(window.0, window.1);
             let (runtime, instance, view) = paging_view("", SettingsRoute::CursorStyles);
             let _ = compile_settings_view(&runtime, instance, view, &cx);
@@ -983,12 +1027,26 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
                 "{window:?} at {scale}×: every stop whole in {}pt",
                 plan.room()
             );
+            let chrome = state.page_chrome.get();
+            let listed = told.unwrap_or(chrome.preview_listed);
             assert_eq!(
                 plan.stop_of_preview(&preview),
                 listed.then_some(0),
                 "{window:?} at {scale}×: the preview listed first ({listed}) or pinned"
             );
-            assert_eq!(state.page_chrome.get().preview_listed, listed);
+            assert_eq!(chrome.preview_listed, listed);
+            // THE PAGE LISTS ITS PREVIEW ONLY WHERE PINNED IT CUTS A STOP.
+            if listed {
+                let pinned = PageChrome {
+                    preview_listed: false,
+                    ..chrome
+                };
+                assert!(
+                    cut_in(window, pinned) > 0,
+                    "{window:?} at {scale}×: the preview pinned in {pinned:?} cuts no stop, \
+                     though the page lists it"
+                );
+            }
         }
         for route in [
             SettingsRoute::Themes,
@@ -2434,7 +2492,7 @@ fn no_page_down_only_moves_the_list() {
     // per thread within the walk, and on_n_workers gives each worker this thread's appearance.
     let turned = std::sync::atomic::AtomicUsize::new(0);
     let faults = std::sync::Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism().map_or(SWEEP_WORKERS, usize::from);
+    let workers = aterm_cores::available_parallelism().map_or(SWEEP_WORKERS, usize::from);
     on_n_workers(
         workers,
         &walks,

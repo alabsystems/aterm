@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The accounts outlook as the window holds it (`docs/DESIGN-accounts-outlook-2026-10-25.md`
+//! The accounts outlook as the window holds it (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
 //! §10): one machine-wide memo on the footer's resolver thread ([`crate::claude_footer`]),
 //! which replays the rotation's policy at most once a wall minute (and, while a pane shows a
 //! reading the last replay had not seen, at the store's next read), and the [`AccountsSnapshot`]
-//! it posts for the Accounts card, which the main thread maps to rows without reading a file
+//! it posts for the Account card, which the main thread maps to rows without reading a file
 //! (the card's account rows are the account reader's, read off the GUI thread,
 //! `crate::account_menu_read`).
 //!
@@ -32,7 +32,7 @@ const LOOK_EVERY: Duration = Duration::from_secs(10);
 /// read.
 pub(crate) const REPLAY_EVERY_S: i64 = 60;
 
-/// What the Accounts card maps to its outlook rows: the outlook the resolver last replayed for
+/// What the Account card maps to its outlook rows: the outlook the resolver last replayed for
 /// Claude Code's pool. The main thread reads no file for it (§10).
 #[derive(Debug)]
 pub(crate) struct AccountsSnapshot {
@@ -79,7 +79,7 @@ fn post(snapshot: Option<Arc<AccountsSnapshot>>) {
     wake_card();
 }
 
-/// Wake the open Accounts card's session, whose footer handler refreshes the card: a new
+/// Wake the open Account card's session, whose footer handler refreshes the card: a new
 /// snapshot, or new token facts ([`crate::token_shown::refresh`]).
 pub(crate) fn wake_card() {
     if let Some(session) = card_with(|card| card.session) {
@@ -87,7 +87,7 @@ pub(crate) fn wake_card() {
     }
 }
 
-/// The session whose Accounts card is open, and whether the next read looks at the store at
+/// The session whose Account card is open, and whether the next read looks at the store at
 /// once ([`card_open`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct Card {
@@ -124,7 +124,7 @@ fn card_with<T>(f: impl FnOnce(&mut Card) -> T) -> T {
     }
 }
 
-/// The Accounts card opened for `session` (`Some`), or closed: while it is open, a new
+/// The Account card opened for `session` (`Some`), or closed: while it is open, a new
 /// snapshot wakes the session's footer handler, which refreshes the card
 /// (`App::on_claude_footer_changed`); an open asks the next read to look at the store at once.
 pub(crate) fn card_open(session: Option<u64>) {

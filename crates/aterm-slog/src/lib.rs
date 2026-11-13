@@ -62,7 +62,7 @@ pub use turn::{
     within_lead,
 };
 pub use vocab::{
-    Actor, Conf, FLEET_ACTOR_PREFIX, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS, ShortId, Src,
-    UNAVAILABLE, is_reserved_actor_word,
+    Actor, Conf, FLEET_ACTOR_PREFIX, FLEET_NODE_HEAD, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS,
+    ShortId, Src, UNAVAILABLE, is_reserved_actor_word,
 };
 pub use words::{BoxWord, Out, RunOut, SessionOut, StepOut, TabAct, TurnOut, WallKind, need_rank};

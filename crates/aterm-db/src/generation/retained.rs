@@ -12,6 +12,44 @@ pub(crate) struct ReadValidation<'a> {
     pub(crate) custody: &'a dyn Fn() -> Result<()>,
 }
 
+/// A session paired with the control observation that keeps it current.
+/// Only this module can construct the pair, inside the retained callback.
+pub(crate) struct RetainedContext<'a, 's, 'v> {
+    session: &'a Session<'s>,
+    validation: &'a ReadValidation<'v>,
+}
+
+impl<'s> RetainedContext<'_, 's, '_> {
+    pub(crate) fn session(&self) -> &Session<'s> {
+        self.session
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        (self.validation.current)()
+    }
+
+    pub(crate) fn check_custody(&self) -> Result<()> {
+        (self.validation.custody)()
+    }
+}
+
+pub(crate) fn with_retained_context<T>(
+    paths: &Paths,
+    entry_vault: &Paths,
+    deadline: Instant,
+    action: impl FnOnce(&RetainedContext<'_, '_, '_>, &client::VaultLook<'_>) -> Result<T>,
+) -> Result<T> {
+    with_retained_session(paths, entry_vault, deadline, |session, look, validation| {
+        action(
+            &RetainedContext {
+                session,
+                validation,
+            },
+            look,
+        )
+    })
+}
+
 fn lineage(selected: &Paths) -> Result<Vec<Paths>> {
     let mut paths = vec![selected.clone()];
     while let Some(parent) = linked(paths.last().ok_or_else(fail)?)? {
@@ -60,7 +98,7 @@ pub(crate) fn with_retained_session<T>(
     deadline: Instant,
     action: impl FnOnce(&Session<'_>, &client::VaultLook<'_>, &ReadValidation<'_>) -> Result<T>,
 ) -> Result<T> {
-    let selected = observed_generation_until(paths, deadline)?;
+    let selected = completed_generation_until(paths, deadline)?;
     let lineage = lineage(&selected)?;
     if !lineage.contains(entry_vault) {
         return Err(Error::new(
@@ -86,7 +124,7 @@ pub(crate) fn with_retained_session<T>(
                 .map_err(crate::table::failure)
         })
         .collect::<Result<Vec<_>>>()?;
-    if observed_generation_until(paths, deadline)? != selected
+    if completed_generation_until(paths, deadline)? != selected
         || self::lineage(&selected)? != lineage
     {
         return Err(Error::snapshot_changed());
@@ -123,8 +161,15 @@ pub(crate) fn with_retained_session<T>(
         Ok(())
     };
     let revalidate = || {
+        // The looks live across every check: each revalidation derives what it judges afresh
+        // through their glances, as each did before a look kept what it derived; a check a caller
+        // makes outside one (`with_retained_store`'s store contexts) is given what the looks last
+        // derived (`client::VaultLook::forget_derived`).
+        for look in session.retained_look().into_iter().chain(&ancestors) {
+            look.forget_derived();
+        }
         check_custody()?;
-        if observed_generation_until(paths, deadline)? != selected
+        if completed_generation_until(paths, deadline)? != selected
             || self::lineage(&selected)? != lineage
         {
             return Err(Error::snapshot_changed());

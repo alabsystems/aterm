@@ -6,8 +6,8 @@
 
 use aterm_spec::derive::*;
 
-/// Four test binaries started in the plan's order on a share of `Share` cores and a claim of
-/// `Memory` bytes: binary `i` holds `Ci` cores and `Pi` bytes while it runs. The next binary
+/// Four test binaries considered in the plan's priority order on a share of `Share` cores and a bound of
+/// `Memory` bytes: binary `i` holds `Ci` cores and `Pi` bytes while it runs. The first fitting queued binary
 /// starts only while its charge fits in what the running binaries' charges leave of the share and
 /// its peak in what their peaks leave of the claim, and, beside a running binary, only while the
 /// running binaries' live rate (`live`, which their reads move a core at a time while one runs)
@@ -16,11 +16,12 @@ use aterm_spec::derive::*;
 ///
 /// The constants make each rule bind somewhere: the second binary beside the first passes the
 /// share and fits the claim; the third beside the second fits the share and passes the claim; the
-/// fourth beside the third fits both, so only the live rate can hold it back. Each charge is at
+/// fourth beside the third fits both, so only the live rate can hold it back. A blocked earlier
+/// binary cannot prevent that fourth from using spare capacity. Each charge is at
 /// most the share and each peak at most the claim, so the head always starts once nothing runs.
 ///
 /// The production projection: `pi` is binary `i`'s phase (0 queued, 1 running, 2 done), `next`
-/// the plan position of the next to start (1-based; 5 once all started), `held` and `bytes`
+/// the number started plus one (5 once all started), `held` and `bytes`
 /// what the dispatcher counts held, `halted` whether it halted. `started_halted` and `extra` are
 /// what only a mutant moves.
 ///
@@ -58,31 +59,31 @@ pub fn test_dispatch_model() -> Model {
             var started_halted = 0;
             var extra = 0;
 
-            action Start1 when (halted == 0 && next == 1 && held + C1 <= Share
+            action Start1 when (halted == 0 && p1 == 0 && held + C1 <= Share
                 && bytes + P1 <= Memory && (held == 0 || live + C1 <= Share + 1)) {
                 p1 = 1;
-                next = 2;
+                next = next + 1;
                 held = held + C1;
                 bytes = bytes + P1;
             }
-            action Start2 when (halted == 0 && next == 2 && held + C2 <= Share
+            action Start2 when (halted == 0 && p2 == 0 && (p1 > 0 || held + C1 > Share || bytes + P1 > Memory || (held > 0 && live + C1 > Share + 1)) && held + C2 <= Share
                 && bytes + P2 <= Memory && (held == 0 || live + C2 <= Share + 1)) {
                 p2 = 1;
-                next = 3;
+                next = next + 1;
                 held = held + C2;
                 bytes = bytes + P2;
             }
-            action Start3 when (halted == 0 && next == 3 && held + C3 <= Share
+            action Start3 when (halted == 0 && p3 == 0 && (p1 > 0 || held + C1 > Share || bytes + P1 > Memory || (held > 0 && live + C1 > Share + 1)) && (p2 > 0 || held + C2 > Share || bytes + P2 > Memory || (held > 0 && live + C2 > Share + 1)) && held + C3 <= Share
                 && bytes + P3 <= Memory && (held == 0 || live + C3 <= Share + 1)) {
                 p3 = 1;
-                next = 4;
+                next = next + 1;
                 held = held + C3;
                 bytes = bytes + P3;
             }
-            action Start4 when (halted == 0 && next == 4 && held + C4 <= Share
+            action Start4 when (halted == 0 && p4 == 0 && (p1 > 0 || held + C1 > Share || bytes + P1 > Memory || (held > 0 && live + C1 > Share + 1)) && (p2 > 0 || held + C2 > Share || bytes + P2 > Memory || (held > 0 && live + C2 > Share + 1)) && (p3 > 0 || held + C3 > Share || bytes + P3 > Memory || (held > 0 && live + C3 > Share + 1)) && held + C4 <= Share
                 && bytes + P4 <= Memory && (held == 0 || live + C4 <= Share + 1)) {
                 p4 = 1;
-                next = 5;
+                next = next + 1;
                 held = held + C4;
                 bytes = bytes + P4;
             }
@@ -166,10 +167,10 @@ pub fn test_dispatch_model() -> Model {
 }
 
 /// Every queued binary starts unless the run halts: `[]<>(halted == 1 || next == 5)`, with each
-/// start and each end that can hold a later start back weakly fair (the last binary's end holds
-/// none). The live rate holds a binary back only beside a running one, and a running one ends, so
-/// the head starts once nothing runs. Ending a binary while keeping what it
-/// held (`FinishKeepingCharge2`) leaves the third binary's peak no room, ever.
+/// start and finish weakly fair. Backfill can start the fourth binary before the third, so its
+/// finish now shares the same progress assumption. The live rate holds a binary back only beside
+/// a running one, and a running one ends, so the head starts once nothing runs. Ending a binary
+/// while keeping what it held (`FinishKeepingCharge2`) leaves the third binary's peak no room, ever.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(test_dispatch_model)]
@@ -178,7 +179,7 @@ pub fn test_dispatch_liveness() -> Liveness {
         name: "EveryQueuedBinaryStarts",
         goal: or_(eq(var("halted"), int(1)), eq(var("next"), int(5))),
         weak: vec![
-            "Start1", "Start2", "Start3", "Start4", "Finish1", "Finish2", "Finish3",
+            "Start1", "Start2", "Start3", "Start4", "Finish1", "Finish2", "Finish3", "Finish4",
         ],
         strong: vec![],
         mutants: vec!["FinishKeepingCharge2"],

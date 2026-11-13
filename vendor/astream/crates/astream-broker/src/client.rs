@@ -659,6 +659,30 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
     }
 }
 
+#[cfg(feature = "handshake")]
+impl Client<astream_aead::RoamStream> {
+    /// Connect to a broker served by [`serve_udp_roaming`](crate::Broker::serve_udp_roaming)
+    /// over forward-secret AEAD-over-UDP (`AROM` v1) under `psk`, returning both the
+    /// connected [`Client`] and its [`RoamHandle`](astream_aead::RoamHandle) migration
+    /// controller.
+    ///
+    /// Calling [`RoamHandle::migrate`](astream_aead::RoamHandle::migrate) or
+    /// [`RoamHandle::migrate_socket`](astream_aead::RoamHandle::migrate_socket) switches
+    /// the underlying [`std::net::UdpSocket`] (local IP/port) with RFC 9000 §8.2
+    /// `PATH_CHALLENGE` / `PATH_RESPONSE` validation while preserving live
+    /// [`Subscription`]s, pipelined publishes, attached capabilities, and registered
+    /// Last Wills with zero gap and zero reconnect.
+    pub fn connect_udp_roaming(
+        addr: impl ToSocketAddrs,
+        psk: [u8; astream_aead::KEY_LEN],
+    ) -> io::Result<(Client<astream_aead::RoamStream>, astream_aead::RoamHandle)> {
+        let (roam_stream, roam_handle) = astream_aead::client_roam_connect(addr, &psk)?;
+        let client =
+            Client::from_stream(roam_stream).nowait_by(astream_aead::RoamStream::set_nonblocking);
+        Ok((client, roam_handle))
+    }
+}
+
 #[cfg(feature = "identity")]
 impl Client<astream_aead::SealedStream<TcpStream>> {
     /// Connect to a broker served by [`serve_tcp_identity`](crate::Broker::serve_tcp_identity)

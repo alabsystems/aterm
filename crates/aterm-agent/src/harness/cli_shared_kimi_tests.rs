@@ -292,6 +292,7 @@ fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
         claude_pid: None,
         codex_thread: None,
         codex_home: None,
+        xdg_config_home: None,
         codex_login: None,
         agy_conversation: None,
         now: 1000,

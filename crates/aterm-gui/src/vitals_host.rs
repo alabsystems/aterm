@@ -2737,6 +2737,8 @@ impl WhyFixture {
             }],
             procs: live.procs.as_ref().and(scene.procs),
             mem: scene.mem.or(live.mem),
+            cpu_millicores: scene.cpu_millicores.or(live.cpu_millicores),
+            mem_bytes: scene.mem_bytes.or(live.mem_bytes),
             thermal: scene.thermal.or(live.thermal),
             thermal_pressure: live.thermal_pressure,
             clock_range: live.clock_range,
@@ -2998,12 +3000,30 @@ impl Reader {
             left: crate::vitals_left::LeftPass::new(),
             epoch: Instant::now(),
             clock: Instant::now,
-            slots: aterm_sysprobe::slots::SlotReader::new(aterm_sysprobe::slots::default_dir(
-                &home,
-            )),
+            slots: aterm_sysprobe::slots::SlotReader::new(
+                aterm_sysprobe::slots::default_dir(&home),
+                {
+                    #[cfg(all(target_os = "macos", not(test)))]
+                    {
+                        aterm_uds::account::home()
+                            .and_then(|home| std::fs::canonicalize(home).ok())
+                            .map(|home| aterm_sysprobe::slots::default_dir(&home).join("adopted"))
+                    }
+                    #[cfg(any(not(target_os = "macos"), test))]
+                    {
+                        None
+                    }
+                },
+            ),
             home,
             scratch: Vec::new(),
-            uid: cfg!(unix).then(aterm_agent::harness::disk::discover::own_uid),
+            // Whose a process is: this person's uid, and on Windows this process's session,
+            // which a sweep row's owner is there.
+            uid: if cfg!(unix) {
+                Some(aterm_agent::harness::disk::discover::own_uid())
+            } else {
+                aterm_sysprobe::own_session()
+            },
             survey,
             job_watch: aterm_vitals::events::JobWatch::default(),
             watched: None,
@@ -3134,7 +3154,11 @@ impl Reader {
             &mut self.split.coalition_ids,
         );
         let mut coalitions = self.coalitions();
-        let mut sample = self.machine_sample(req, at_unix_ms);
+        let mut sample = self.machine_sample(
+            req,
+            at_unix_ms,
+            sweep.as_ref().map(|sweep| sweep.procs.as_slice()),
+        );
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.machine_only = false;
         if let aterm_vitals::blockage::DStateRead::Census(pass) = &mut sample.dstate {
@@ -3245,7 +3269,7 @@ impl Reader {
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
         let mut coalitions = self.coalitions();
-        let mut sample = self.machine_sample(req, unix_ms_now());
+        let mut sample = self.machine_sample(req, unix_ms_now(), None);
         sample.machine_only = true;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
@@ -3314,8 +3338,15 @@ impl Reader {
         }
     }
 
-    /// The machine's counters, stamped `at_unix_ms` on the wall clock.
-    fn machine_sample(&mut self, req: &Request, at_unix_ms: i64) -> Sample {
+    /// The machine's counters, stamped `at_unix_ms` on the wall clock; `procs` is the whole
+    /// reading's sweep (`None` for a machine-only reading), which names Windows' compressed
+    /// memory ([`compression_named`]).
+    fn machine_sample(
+        &mut self,
+        req: &Request,
+        at_unix_ms: i64,
+        procs: Option<&[aterm_sysprobe::ProcessReading]>,
+    ) -> Sample {
         let since = self.epoch.elapsed();
         let shelf = &crate::disk_board::SHELF;
         let MachineVolumes {
@@ -3334,6 +3365,7 @@ impl Reader {
         let tcp_sum = (self.net.tcp)(&mut self.scratch);
         let gpu = aterm_sysprobe::gpu();
         let room = aterm_sysprobe::task_room(self.uid.unwrap_or(0));
+        let capacity = aterm_sysprobe::capacity();
         let mut sample = Sample {
             hardware: None,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
@@ -3347,7 +3379,10 @@ impl Reader {
                     .collect()
             }),
             clusters: self.clusters.clone(),
-            mem: aterm_sysprobe::memory_detail().map(mem_sample),
+            mem: aterm_sysprobe::memory_detail()
+                .map(|detail| mem_sample(compression_named(detail, procs))),
+            cpu_millicores: capacity.cpu_millicores,
+            mem_bytes: capacity.mem_bytes,
             host_watts: self.heat.host_watts(gpu.as_ref()),
             gpu: gpu.map(gpu_sample),
             gpu_clients: None,
@@ -3382,7 +3417,8 @@ impl Reader {
             room: task_room(room),
             run_queue: run_queue_read(room.run_queue),
             dstate: aterm_vitals::blockage::DStateRead::Unsupported,
-            // Windows' sweep reads no process state (`RunState::Unknown`), so no zombie.
+            // Windows' sweep reads a state from each process's threads and never an unreaped
+            // one (Windows keeps no zombie in its table), so its count is unread there, never 0.
             zombie_read: if cfg!(any(target_os = "macos", target_os = "linux")) {
                 aterm_vitals::blockage::ZombieRead::Sweep
             } else {
@@ -3531,6 +3567,23 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         version: p.version,
         birth_ms: p.birth_ms,
         reaps_unwaited: p.reaps_unwaited,
+    }
+}
+
+/// `detail` with Windows' memory compression store named as its compressed class from the
+/// whole reading's sweep (`aterm_sysprobe::windows::with_compression_store`): Windows' memory
+/// read names no compressed pages, and its store is a process the sweep lists. A machine-only
+/// reading has no sweep (`procs` is `None`), so its compressed class is unread; off Windows
+/// `detail` is as the memory read gave it.
+fn compression_named(
+    detail: aterm_sysprobe::MemoryDetail,
+    procs: Option<&[aterm_sysprobe::ProcessReading]>,
+) -> aterm_sysprobe::MemoryDetail {
+    match procs {
+        Some(procs) if cfg!(windows) => {
+            aterm_sysprobe::windows::with_compression_store(detail, procs)
+        }
+        _ => detail,
     }
 }
 
@@ -3729,11 +3782,18 @@ fn machine_volumes(
 ) -> MachineVolumes {
     #[cfg(windows)]
     {
-        // No block reader on Windows: the Disk row draws no units (A1 §4.4).
-        let _ = (keyed, front, read_block);
+        // No block reader on Windows: the Disk row draws no units (A1 §4.4). The key is the
+        // one the harness's disk watch files home's volume under, so the row shows its facts.
+        let _ = (front, read_block);
+        let key = keyed
+            .then(|| {
+                aterm_agent::harness::disk::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
+            })
+            .flatten()
+            .map(|r| r.key);
         MachineVolumes {
             home: aterm_sysprobe::volume(home),
-            key: None,
+            key,
             block: Vec::new(),
         }
     }
@@ -5087,6 +5147,8 @@ impl crate::App {
         // A new view is as old as the reading that made it, not its adoption: the probe's read and
         // the wait for the loop count toward the facts gate. A held view keeps its first post.
         let read = self.vitals.read_began.unwrap_or_else(Instant::now);
+        // A quiet agent call's wait is named before anything is said of it.
+        crate::auto_naming::name_quiet_calls(&view);
         self.vitals.board.post(view, sids, read);
     }
 

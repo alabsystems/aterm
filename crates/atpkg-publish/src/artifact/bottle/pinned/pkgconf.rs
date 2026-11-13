@@ -198,7 +198,7 @@ pub(super) fn build(source: &Path, work: &Path) -> Result<aterm_json::Value> {
             "pkgconf did not recognize its native build options",
         ));
     }
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cores = aterm_cores::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let jobs = std::env::var("CARGO_BUILD_JOBS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

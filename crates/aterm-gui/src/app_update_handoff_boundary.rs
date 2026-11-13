@@ -78,17 +78,5 @@ pub fn waiting() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Boundary, GuardedItem, is_held};
-
-    #[test]
-    fn an_item_on_the_process_registry_stays_out_of_a_tests_handoff() {
-        let _held = Boundary::process()
-            .try_hold(GuardedItem::HarnessNativeMutation)
-            .expect("no test latches the process's registry");
-        assert!(
-            !is_held(GuardedItem::HarnessNativeMutation),
-            "another test's handoff would read this guard as activity"
-        );
-    }
-}
+#[path = "app_update_handoff_boundary_tests.rs"]
+mod tests;

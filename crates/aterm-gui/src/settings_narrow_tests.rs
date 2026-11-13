@@ -1051,7 +1051,7 @@ fn messages_small_buttons_stay_on_the_page() {
 
 #[test]
 fn harness_keeps_its_words_with_sessions_open() {
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "Harness sessions", |scale| {
         let mut windows = Vec::new();
@@ -1954,9 +1954,9 @@ fn a_text_size_change_remeasures_a_scrolled_caption() {
     }
     at_each_text_scale(&[1.0], "a scrolled caption after text size changes", |_| {
         let cx = view_cx_at(width, height);
-        let target = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+        let target = UiKey::new(cursor_style_row_key("rainbow"));
         let wrong = UiKey::new(cursor_style_row_key("off"));
-        let caption = "settings/cursor-styles/companions/heading";
+        let caption = "settings/cursor-styles/trails/heading";
         let set_scale = |scale| {
             crate::native_appearance::install_preferences(
                 crate::native_appearance::AppearancePreferences {
@@ -2110,7 +2110,7 @@ fn a_text_size_change_remeasures_a_scrolled_caption() {
                 .expect("declared cursor style")
                 .label()
         };
-        let expected_caption = CursorStyleGroup::Companions
+        let expected_caption = CursorStyleGroup::Trails
             .caption()
             .expect("group caption")
             .to_ascii_uppercase();
@@ -3786,10 +3786,12 @@ fn a_path_field_keeps_its_file_name() {
                         assert!(joined.ends_with("ai-fleet.toml"), "{context}: {painted:?}");
                         // The whole path (the home folder said as ~) where its lines fit the
                         // field's most, as a home folder's does at every width; else a form that
-                        // keeps the file name.
-                        let said = path
+                        // keeps the file name. It paints the folder as the config file's path
+                        // spells it, `/` here on every host (`path` joins with `\` on Windows).
+                        let painted_path = format!("{folder}/ai-fleet.toml");
+                        let said = painted_path
                             .strip_prefix(home)
-                            .map_or_else(|| path.clone(), |rest| format!("~{rest}"));
+                            .map_or_else(|| painted_path.clone(), |rest| format!("~{rest}"));
                         let bare = |text: &str| {
                             text.chars()
                                 .filter(|c| !c.is_whitespace())

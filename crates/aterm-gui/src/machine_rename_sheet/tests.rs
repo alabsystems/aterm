@@ -531,7 +531,7 @@ fn a_read_reaches_only_the_press_that_asked_for_it() {
 }
 
 #[test]
-fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
+fn late_panel_observations_preserve_edits_and_each_others_status() {
     struct Inert;
     impl aterm_agent::machine_name::publish::SystemNames for Inert {
         fn read(&self) -> [Option<String>; 3] {
@@ -547,18 +547,50 @@ fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
         }
     }
     let (root, preview) = preview();
-    let held = Held::of_read(&preview);
-    let status = NamingStatus::read(
+    let now = FLOOR_MS + 300 * 86_400_000;
+    aterm_agent::machine_name::set_name(
         root.path(),
-        &root.path().join("aterm.toml"),
-        preview.name(),
-        &Inert,
+        &NameTo {
+            num: preview.name().num.unwrap(),
+            nick: None,
+        },
+        || Ok(LabLabels::default()),
+        aterm_net::fleet_member::name_record::ByKind::Person,
+        || Ok(None),
+        now,
+        false,
     )
-    .with_fleet_membership(aterm_agent::machine_name::InFleet::Out);
+    .unwrap();
+    let preview =
+        rename_preview(root.path(), || Ok(LabLabels::default()), || Ok(None), now).unwrap();
+    assert_eq!(
+        preview.name().class,
+        aterm_types::machine_name::Class::Chosen
+    );
+    let held = Held::of_read(&preview);
+    let name = preview.name().clone();
+    let diagnostics =
+        || NamingStatus::read(root.path(), &root.path().join("aterm.toml"), &name, &Inert);
+    let status =
+        NamingStatus::read_local(root.path(), &root.path().join("aterm.toml"), preview.name())
+            .with_fleet_membership(aterm_agent::machine_name::InFleet::Out);
     let number = typed("86");
     let nick = typed("Blue Heron");
     let mut slot = Some((2, Snapshot::named(preview, status)));
     let before = request(&slot.as_ref().unwrap().1, &held, &number, &nick).unwrap();
+    let draft = line(&slot.as_ref().unwrap().1, &held, &number, &nick);
+    assert!(
+        draft
+            .text
+            .contains(&format!("ID: expected m86 · saved {}", held.name)),
+        "{draft:?}"
+    );
+    assert!(draft.text.contains("Host name: expected m86-blue-heron"));
+    assert!(
+        draft
+            .text
+            .contains("Network name: expected m86-blue-heron.local")
+    );
     assert!(
         line(&slot.as_ref().unwrap().1, &held, &number, &nick)
             .text
@@ -566,6 +598,19 @@ fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
     );
     assert!(!keep_discovery(&mut slot, 1, Ok(true)));
     assert!(keep_discovery(&mut slot, 2, Ok(true)));
+    assert!(!keep_diagnostics(&mut slot, 1, Ok(diagnostics())));
+    assert!(keep_diagnostics(&mut slot, 2, Ok(diagnostics())));
+    let snapshot = &slot.as_ref().unwrap().1;
+    assert!(snapshot.authorization_unknown(&held));
+    assert_eq!(snapshot.authorize_saved(&held, &number, &nick), None);
+    assert_eq!(
+        snapshot.authorize_saved(
+            &held,
+            &Field::open(None, held.number_text()),
+            &Field::open(None, &held.word),
+        ),
+        Some(RenameTo::Authorize),
+    );
     assert_eq!(
         request(&slot.as_ref().unwrap().1, &held, &number, &nick).unwrap(),
         before
@@ -574,6 +619,21 @@ fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
         line(&slot.as_ref().unwrap().1, &held, &number, &nick)
             .text
             .contains("Available fleets: ALab")
+    );
+    assert!(
+        !line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("reading current name")
+    );
+    assert!(keep_diagnostics(
+        &mut slot,
+        2,
+        Err("worker unavailable".into())
+    ));
+    assert!(
+        line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("macOS names could not be read")
     );
     assert!(keep_discovery(&mut slot, 2, Ok(false)));
     assert!(
@@ -589,4 +649,5 @@ fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
     );
     close(&mut slot, 2);
     assert!(!keep_discovery(&mut slot, 2, Ok(true)));
+    assert!(!keep_diagnostics(&mut slot, 2, Ok(diagnostics())));
 }

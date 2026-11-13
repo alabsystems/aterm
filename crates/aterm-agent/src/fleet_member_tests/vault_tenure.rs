@@ -51,6 +51,98 @@ fn named(name: &str) -> String {
     format!("name {}\n", aterm_codec::hex::encode_lower(name.as_bytes()))
 }
 
+/// An explicit fixture take under the vault configured beside this world.
+fn take_here(world: &World) {
+    let under = Vault::configured(&vault_of(world)).unwrap();
+    member::write_held(&world.places.state, member::Began::Here, |book| {
+        crate::fleet_vault::take(book, under.as_ref())
+    })
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn init_keeps_the_vault_captured_before_its_book_wait() {
+    let world = World::new("init-captured-vault");
+    in_vault(&world, "alab", 1, &[]);
+    let port = closed_port().to_string();
+    let paths = vault_of(&world);
+    ok(with_step_hook(
+        move |step| {
+            if step == "key" {
+                configure(&paths, "other", 9, &[]);
+            }
+        },
+        || {
+            init(
+                &world.places,
+                &args(&["--host", "127.0.0.1", "--port", &port]),
+            )
+        },
+    ));
+    assert!(
+        member::read_vault(&world.places.state)
+            .unwrap()
+            .unwrap()
+            .contains(&named("alab"))
+    );
+    assert!(matches!(tenure_of(&world), Tenure::Elsewhere { .. }));
+}
+
+#[test]
+fn an_unreadable_or_unpinned_vault_is_never_an_explicit_standalone_take() {
+    let world = World::new("unread-take");
+    let paths = vault_of(&world);
+    aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+    let source = paths.dir.join("source.toml");
+    let port = closed_port().to_string();
+    let opts = args(&["--host", "127.0.0.1", "--port", &port]);
+    for contents in [
+        "not valid toml",
+        "url = \"http://127.0.0.1:9/v1/alab\"\nname = \"alab\"\nhost = \"m22\"\n",
+    ] {
+        aterm_secrets::fsx::write_atomic(&source, contents.as_bytes(), 0o600).unwrap();
+        assert!(vault_take_now(&world.places).is_err());
+        assert!(init(&world.places, &opts).is_err());
+        assert!(member::read_vault(&world.places.state).unwrap().is_none());
+        assert!(aterm_net::fleet::read_key_file(&world.places.state).is_err());
+    }
+    std::fs::remove_file(source).unwrap();
+    ok(init(&world.places, &opts));
+    assert!(
+        crate::fleet_vault::Traffic::capture(&world.places.state, Some(&paths))
+            .unwrap()
+            .current()
+    );
+}
+
+#[test]
+fn a_captured_take_survives_signer_widening_but_never_an_explicit_retake() {
+    let (world, _, _serving) = issuing("capture-take");
+    in_vault(&world, "alab", 1, &[]);
+    take_here(&world);
+    let captured =
+        crate::fleet_vault::Traffic::capture(&world.places.state, Some(&vault_of(&world))).unwrap();
+    assert!(captured.current());
+    in_vault(&world, "alab", 2, &[1]);
+    crate::fleet_vault::keep(&world.places.state, Some(&vault_of(&world)));
+    in_vault(&world, "alab", 2, &[]);
+    assert!(
+        captured.current(),
+        "acknowledged signer continuity keeps the take"
+    );
+    take_here(&world);
+    assert!(
+        !captured.current(),
+        "the same secret and vault cannot revive a previous take"
+    );
+    assert!(
+        crate::fleet_vault::Traffic::capture(&world.places.state, Some(&vault_of(&world)))
+            .unwrap()
+            .current()
+    );
+}
+
 /// Where a member of a loopback fleet listens: a port of its own.
 fn here() -> Opts {
     Opts {
@@ -97,6 +189,8 @@ fn a_fleet_taken_under_one_vault_drives_by_its_grants_under_it_alone() {
     let drives = || drives_here(&member.places, &issuer_node);
     assert_eq!(drives(), Some(true), "the grant made under \"alab\"");
     assert_eq!(void_grants(&member.places), None);
+    let secret = aterm_net::fleet::read_key_file(&member.places.state).unwrap();
+    assert!(local_fleet_matches(&member.places, &secret, None));
 
     in_vault(&member, "alab", 2, &[1]);
     assert_eq!(
@@ -122,6 +216,10 @@ fn a_fleet_taken_under_one_vault_drives_by_its_grants_under_it_alone() {
         ),
     ] {
         in_vault(&member, vault, signer, &[]);
+        assert!(
+            !local_fleet_matches(&member.places, &secret, None),
+            "credentials of the previous vault cannot start another CLI exchange"
+        );
         assert_eq!(
             drives(),
             Some(false),
@@ -160,7 +258,7 @@ fn a_fleet_taken_under_one_vault_drives_by_its_grants_under_it_alone() {
         (tenure_of(&member), drives()),
         (
             Tenure::Elsewhere {
-                taken: "alab".to_owned(),
+                taken: Some("alab".to_owned()),
                 now: None
             },
             Some(false)
@@ -217,123 +315,51 @@ fn a_fleet_taken_under_one_vault_drives_by_its_grants_under_it_alone() {
     assert_eq!(void_grants(&member.places), None);
 }
 
-/// A fleet with no vault drives by its grants as before, and its take records none. A record no
-/// take wrote (a fleet an older build joined, or one taken under no vault) is read as the vault
-/// configured now, and the first writer that reads one under the book's lock records it: a read
-/// of the issuer's book (`aterm fleet peers`) here, a heartbeat round, a sync in the fleet. From
-/// then that vault is the one its grants are of, and no writer under another moves it. A state
-/// that holds no fleet records nothing, and a leave takes the record with the fleet.
-///
-/// NEGATIVE CONTROLS (2026-11-05): no adoption (`kept` answering `None` where no record is
-/// there) fails "the first writer that reads a vault records it"; `keep_in` without its fleet
-/// check fails "a state that holds no fleet records nothing".
+/// Unknown custody cannot acquire a vault from background reads. An explicit join repairs it
+/// under the captured vault and removes grants whose provenance was unknown.
 #[test]
-fn a_record_no_take_wrote_adopts_the_vault_the_first_writer_reads() {
-    let (issuer, code, _serving) = issuing("adopt-issuer");
+fn missing_custody_requires_an_explicit_take_and_never_adopts_grants() {
+    let (issuer, code, _serving) = issuing("unknown-issuer");
     let issuer_node = member::node_id(&issuer.places.state).unwrap();
-    let member = World::new("adopt-member");
+    let member = World::new("unknown-member");
     ok(join(&member.places, &here(), &code));
     ok(allow(
         &member.places,
         &args(&["drive", "--from", &issuer_node]),
     ));
     let state = &member.places.state;
-    let drives = || drives_here(&member.places, &issuer_node);
-    assert_eq!(
-        member::read_vault(state).unwrap(),
-        None,
-        "a take under no vault records none"
-    );
-    assert_eq!(
-        (tenure(state, None), drives()),
-        (Tenure::Here, Some(true)),
-        "a fleet with no vault drives by its grants, as before"
-    );
-
+    let standalone = member::read_vault(state)
+        .unwrap()
+        .expect("an explicit standalone take");
     in_vault(&member, "alab", 1, &[]);
-    assert_eq!(
-        (tenure_of(&member), drives()),
-        (Tenure::Here, Some(true)),
-        "a vault configured since, which no writer has read yet: adopted"
-    );
-    ok(peers(&member.places, &args(&[])));
-    assert!(
-        member::read_vault(state)
-            .unwrap()
-            .is_some_and(|record| record.contains(&named("alab"))),
-        "the first writer that reads a vault records it"
-    );
-    in_vault(&member, "other", 9, &[]);
-    assert_eq!(
-        drives(),
-        Some(false),
-        "the vault adopted is the one the grants are of from then on"
-    );
-    crate::fleet_vault::keep(state, Some(&vault_of(&member)));
-    ok(peers(&member.places, &args(&[])));
-    assert!(
-        member::read_vault(state)
-            .unwrap()
-            .is_some_and(|record| record.contains(&named("alab"))),
-        "a writer under another vault moves the record"
-    );
-    assert_eq!(drives(), Some(false));
-
-    let bare = World::new("adopt-bare");
-    in_vault(&bare, "alab", 1, &[]);
-    member::ensure_private_dir(&bare.places.state).unwrap();
-    crate::fleet_vault::keep(&bare.places.state, Some(&vault_of(&bare)));
-    assert_eq!(
-        member::read_vault(&bare.places.state).unwrap(),
-        None,
-        "a state that holds no fleet records nothing"
-    );
-
-    ok(leave(&member.places, &args(&[])));
-    assert_eq!(
-        member::read_vault(state).unwrap(),
-        None,
-        "a leave takes the record with the fleet"
-    );
-
-    // A Mac that moved before any writer recorded a vault adopts the one it moved to, and a join
-    // of the same fleet again keeps the grants then (ATERM-KI-1105-10): what ends them is a
-    // level below drive, a leave, or a join of another fleet.
-    let moved = World::new("adopt-moved");
-    ok(join(&moved.places, &here(), &code));
-    ok(allow(
-        &moved.places,
-        &args(&["drive", "--from", &issuer_node]),
+    assert!(matches!(
+        tenure_of(&member),
+        Tenure::Elsewhere { taken: None, .. }
     ));
-    in_vault(&moved, "other", 9, &[]);
-    ok(peers(&moved.places, &args(&[])));
+    crate::fleet_vault::keep(state, Some(&vault_of(&member)));
+    assert_eq!(member::read_vault(state).unwrap(), Some(standalone));
+    member::write_held(state, member::Began::Here, |book| book.keep_vault(None))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(tenure_of(&member), Tenure::Unknown));
+    crate::fleet_vault::keep(state, Some(&vault_of(&member)));
+    assert_eq!(member::read_vault(state).unwrap(), None);
+    assert_eq!(drives_here(&member.places, &issuer_node), Some(false));
+    ok(join(&member.places, &here(), &code));
+    assert_eq!(tenure_of(&member), Tenure::Here);
+    assert!(configured_grants(&member.places).is_empty());
     assert!(
-        member::read_vault(&moved.places.state)
+        member::read_vault(state)
             .unwrap()
-            .is_some_and(|record| record.contains(&named("other")))
+            .unwrap()
+            .contains(&named("alab"))
     );
-    let drives = || drives_here(&moved.places, &issuer_node);
-    assert_eq!(
-        drives(),
-        Some(true),
-        "the grant made before the move, adopted"
-    );
-    ok(join(&moved.places, &here(), &code));
-    assert_eq!(
-        (configured_grants(&moved.places).len(), drives()),
-        (1, Some(true)),
-        "a join of the same fleet again keeps the grants of an adopted record"
-    );
-    ok(allow(&moved.places, &args(&["content"])));
-    assert_eq!(
-        (configured_grants(&moved.places).len(), drives()),
-        (0, Some(false)),
-        "a level below drive takes them out"
-    );
+    ok(leave(&member.places, &args(&[])));
+    assert_eq!(member::read_vault(state).unwrap(), None);
 }
 
 /// The vault's default fleet, taken by a sync under vault "alab", with its default grant (`*`,
-/// the ALab `--all` policy) letting every member drive, as before; a sync in that fleet adopts a
+/// the ALab `--all` policy) letting every member drive, as before; a sync in that fleet explicitly repairs a
 /// record no take wrote. Moved to vault "other", whose
 /// default fleet code names the same fleet, a sync takes it again under "other", as a join does:
 /// the grant made under "alab" goes and the default grant is made again under "other". An issuer
@@ -341,8 +367,7 @@ fn a_record_no_take_wrote_adopts_the_vault_the_first_writer_reads() {
 /// join its own, and a sync says how it issues the fleet anew.
 ///
 /// NEGATIVE CONTROLS (2026-11-05): `sync_plan` without its arms for a fleet taken elsewhere
-/// fails on its plan for the member, which owes no `Join`; no adoption fails "an issuer that
-/// took its fleet under another vault", whose record a heartbeat round adopted.
+/// fails on its plan for the member, which owes no `Join`; the issuer fixture records an explicit take before its move.
 #[test]
 fn a_sync_takes_the_default_fleet_again_under_the_vault_this_mac_moved_to() {
     let (issuer, code, _serving) = issuing("tenure-sync");
@@ -365,11 +390,11 @@ fn a_sync_takes_the_default_fleet_again_under_the_vault_this_mac_moved_to() {
         sync_plan(&member.places, &parsed, &key),
         Ok(SyncPlan::In)
     ));
-    // A record no take wrote: a sync that finds this Mac in the vault's fleet adopts the vault.
+    // An explicit sync repairs missing custody by taking the fleet again.
     remove_private(&member.places.state, member::VAULT_FILE).unwrap();
     assert!(matches!(
         converged(converge_on(&member.places, &code, &sync_here())),
-        FleetSync::Current
+        FleetSync::Joined(_)
     ));
     assert!(
         member::read_vault(&member.places.state)
@@ -410,7 +435,7 @@ fn a_sync_takes_the_default_fleet_again_under_the_vault_this_mac_moved_to() {
     ));
 
     in_vault(&issuer, "alab", 1, &[]);
-    crate::fleet_vault::keep(&issuer.places.state, Some(&vault_of(&issuer)));
+    take_here(&issuer);
     in_vault(&issuer, "other", 9, &[]);
     let another = JoinCode::parse(&a_code()).unwrap();
     let another_key = FleetSecret::new(&another.secret).unwrap();
@@ -441,7 +466,7 @@ fn the_issuer_of_the_vaults_default_fleet_takes_it_again_under_the_vault_configu
     ok(join(&member.places, &here(), &code));
     let member_node = member::node_id(&member.places.state).unwrap();
     in_vault(&issuer, "alab", 1, &[]);
-    crate::fleet_vault::keep(&issuer.places.state, Some(&vault_of(&issuer)));
+    take_here(&issuer);
     ok(allow(&issuer.places, &args(&["drive", "--all"])));
     let drives = || drives_here(&issuer.places, &member_node);
     let table = || fleet_table(&issuer.config()).unwrap();
@@ -548,15 +573,8 @@ fn the_issuer_of_the_vaults_default_fleet_takes_it_again_under_the_vault_configu
 /// Mac joins another vault (`aterm secrets join` beside the vault subscriber's pass) takes the
 /// fleet under the vault it read the code under, so its default grant admits no Mac under the
 /// vault moved to, and the join's report says so; a person's join, under the vault configured as
-/// it began. A sync that finds this Mac in the fleet, or rekeys it, adopts for a record no take
-/// wrote the vault it read the code under, not the one configured by the time it writes.
-///
-/// NEGATIVE CONTROLS (2026-11-05): the join's take of the vault configured as it writes
-/// (`fleet_vault::take` of `vault_now(places)` in place of `under`) fails "the sync's join takes
-/// the fleet under the vault it read the code under"; `in_fleet` adopting the vault configured
-/// (`keep_as` of `vault_now(places)`) fails "a sync in the fleet adopts the vault it read the
-/// code under"; `rekey` keeping the vault configured fails "a rekey adopts the vault it read the
-/// code under".
+/// it began. Unknown custody requires an explicit join under that captured vault; a later
+/// configuration change cannot relabel the result.
 #[test]
 fn a_move_while_a_take_is_under_way_leaves_the_fleet_the_vaults_it_was_decided_under() {
     let (issuer, code, _serving) = issuing("decided-issuer");
@@ -593,7 +611,7 @@ fn a_move_while_a_take_is_under_way_leaves_the_fleet_the_vaults_it_was_decided_u
         ),
         (
             Tenure::Elsewhere {
-                taken: "alab".to_owned(),
+                taken: Some("alab".to_owned()),
                 now: Some("other".to_owned())
             },
             vec![aterm_net::fleet::ALL_MEMBERS.to_owned()],
@@ -630,44 +648,8 @@ fn a_move_while_a_take_is_under_way_leaves_the_fleet_the_vaults_it_was_decided_u
         converged(converge_on(&adopting.places, &code, &sync_here())),
         FleetSync::Joined(_)
     ));
-    let alab = Vault::configured(&vault_of(&adopting));
+    let alab = Vault::configured(&vault_of(&adopting)).unwrap();
     assert!(alab.is_some());
-    remove_private(&adopting.places.state, member::VAULT_FILE).unwrap();
-    in_vault(&adopting, "other", 9, &[]);
-    assert_eq!(
-        converged(converge_under(
-            &adopting.places,
-            &code,
-            alab.as_ref(),
-            &sync_here()
-        )),
-        FleetSync::Current
-    );
-    assert!(
-        member::read_vault(&adopting.places.state)
-            .unwrap()
-            .is_some_and(|record| record.contains(&named("alab"))),
-        "a sync in the fleet adopts the vault it read the code under"
-    );
-    assert_eq!(drives_here(&adopting.places, &issuer_node), Some(false));
-
-    remove_private(&adopting.places.state, member::VAULT_FILE).unwrap();
-    let rotated = aterm_secrets::client::rotate_fleet_code_text(&code).unwrap();
-    assert!(matches!(
-        converged(converge_under(
-            &adopting.places,
-            &rotated,
-            alab.as_ref(),
-            &sync_here()
-        )),
-        FleetSync::Rekeyed(_)
-    ));
-    assert!(
-        member::read_vault(&adopting.places.state)
-            .unwrap()
-            .is_some_and(|record| record.contains(&named("alab"))),
-        "a rekey adopts the vault it read the code under"
-    );
 }
 
 /// A record of the vault the fleet was taken under that does not read is said as that, never as

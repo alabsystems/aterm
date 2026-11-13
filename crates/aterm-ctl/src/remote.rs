@@ -36,7 +36,9 @@ pub struct DriveLink {
     pub node: Option<String>,
 }
 
-/// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links.
+/// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links: its [`DriveLink`] has already sent
+/// the drive's requester line ([`aterm_types::control_verbs::Requester::line`]), so the stream
+/// takes requests at once.
 pub type FleetDriveFn = fn(&str, Duration) -> Result<DriveLink, DriveRefused>;
 
 /// Why a drive dial reached no peer to drive ([`FleetDriveFn`]).
@@ -320,7 +322,7 @@ pub(crate) fn run(
             head: &head,
             task: &task,
         };
-        return spawn_worker(worker, within, drive, aterm_telemetry::log::default_dir());
+        return spawn_worker(worker, within, drive);
     }
     if matches!(verb, "feed-bin" | "paste")
         || (verb == "send" && matches!(args, [one] if one == "--stdin" || one == "-"))
@@ -371,20 +373,46 @@ fn fleet_cwd(dir: &str) -> Result<bool, &'static str> {
     }
 }
 
-/// A plain remote shell carries no task or command and names its one destination folder.
+/// A plain remote shell carries no task or command, names its one destination folder, and says in
+/// `why=` what it is for: the one line the driven Mac keeps for a person reviewing what was asked
+/// of it (ATERM-KI-1109-3), held here to the rule that Mac holds it to. A `req=<id>` (an earlier
+/// spawn's reply named it) joins the new shell to that request there.
 fn shell_spawn_head(args: &[String]) -> io::Result<String> {
-    const FORM: &str = "a plain fleet shell is spawn cwd=/absolute|'cwd=~/<path>' [raise=false]; no \
-                        task, command or other options";
+    const FORM: &str = "a plain fleet shell is spawn cwd=/absolute|'cwd=~/<path>' 'why=<one line, at \
+                        most 200 characters, saying what it is for>' [req=<id>] [raise=false]; \
+                        no task, command or other options";
     let not = |arg: &str| {
         refused(format!(
             "{FORM}; not `{}`",
             aterm_codec::tty::one_line(arg, 32)
         ))
     };
-    let mut cwd = None;
+    let (mut cwd, mut why, mut req) = (None, None, None);
     let mut raised = false;
     for arg in args {
-        if let Some(dir) = arg.strip_prefix("cwd=") {
+        if let Some(id) = arg.strip_prefix("req=") {
+            let id = aterm_types::control_verbs::request_id(id).map_err(|bad| {
+                refused(format!(
+                    "{FORM}; its req= {bad}: `{}`",
+                    aterm_codec::tty::one_line(arg, 32)
+                ))
+            })?;
+            if req.replace(id).is_some() {
+                return Err(not(arg));
+            }
+            continue;
+        }
+        if let Some(said) = arg.strip_prefix("why=") {
+            let said = aterm_types::control_verbs::request_why(said).map_err(|bad| {
+                refused(format!(
+                    "{FORM}; its why= {bad}: `{}`",
+                    aterm_codec::tty::one_line(arg, 32)
+                ))
+            })?;
+            if why.replace(said).is_some() {
+                return Err(not(arg));
+            }
+        } else if let Some(dir) = arg.strip_prefix("cwd=") {
             if let Err(why) = fleet_cwd(dir) {
                 return Err(refused(format!(
                     "{FORM}; `{}` {why}",
@@ -402,6 +430,9 @@ fn shell_spawn_head(args: &[String]) -> io::Result<String> {
     }
     if cwd.is_none() {
         return Err(refused(format!("{FORM}: it names no cwd=")));
+    }
+    if why.is_none() {
+        return Err(refused(format!("{FORM}: it names no why=")));
     }
     let mut parts = vec!["spawn".to_owned()];
     parts.extend(args.iter().cloned());
@@ -522,7 +553,7 @@ fn any_host_node(
         node: Some(node.clone()),
         host: Some(member.host().to_owned()),
         account: (!chosen.row.label.is_empty())
-            .then(|| aterm_codec::tty::one_line(&survey::masked_label(&chosen.row.label), 32)),
+            .then(|| aterm_codec::tty::one_line(&chosen.row.label, 32)),
     };
     Ok((node, placed))
 }
@@ -724,18 +755,13 @@ struct Worker<'a> {
 }
 
 /// A worker's spawn over the drive `drive` dials, `within` its deadline: the exchange
-/// ([`spawn_exchange`]); then, from what it answered, the sender's `kind=spawn` row in the log in
-/// `log` ([`crate::fleet_telemetry::spawned`]: `refused` where the dial failed and nothing was
-/// sent) and the board's row of the worker the answer named; and only then the answer printed as
+/// ([`spawn_exchange`]); then, from what it answered, the sender's `kind=spawn` row in this Mac's
+/// log ([`crate::fleet_telemetry::here_log`], [`crate::fleet_telemetry::spawned`]: `refused` where
+/// the dial failed and nothing was sent) and the board's row of the worker the answer named; and only then the answer printed as
 /// on one Mac ([`print_frame_answer`]). A print that fails (stdout closed:
 /// `… spawn … - | head -0`) is the call's own error and sets its exit status alone: the worker
 /// started all the same, and the row and the board say so.
-fn spawn_worker(
-    worker: Worker<'_>,
-    within: Within,
-    drive: FleetDriveFn,
-    log: Option<std::path::PathBuf>,
-) -> io::Result<ExitCode> {
+fn spawn_worker(worker: Worker<'_>, within: Within, drive: FleetDriveFn) -> io::Result<ExitCode> {
     let Worker {
         host,
         mut placed,
@@ -754,6 +780,7 @@ fn spawn_worker(
     placed.node = placed.node.or(Some(host));
     let exchanged = dialled
         .map(|link| spawn_exchange(link, &format!("{head} len={}", task.len()), task, within));
+    let log = crate::fleet_telemetry::here_log();
     crate::fleet_telemetry::spawned(log, args, began, &exchanged, placed.node.as_deref());
     let (answer, sid) = exchanged??;
     if let Some(sid) = sid {

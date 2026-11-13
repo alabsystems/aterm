@@ -42,7 +42,7 @@ fn external_facts(
     intent: &aterm_agent::harness::native_act::ColdIntent,
     extra: &[String],
 ) -> aterm_agent::harness::native_act::ColdEnvironmentFacts {
-    let mut env = vec![format!("HOME={}", c.home.display())];
+    let mut env = vec![format!("{}={}", accounts::HOMEDIR_ENV, c.home.display())];
     env.extend_from_slice(extra);
     aterm_agent::harness::native_act::ColdEnvironmentFacts::observe_for_command(
         &env,
@@ -327,7 +327,7 @@ fn owned_helper_namespace_is_actual_and_unavailable_is_not_known_absence() {
     let actual = c.a.tmp.path().join("another-home");
     std::fs::create_dir_all(actual.join(".claude")).unwrap();
     let facts = aterm_agent::harness::native_act::ColdEnvironmentFacts::observe_for_command(
-        &[format!("HOME={}", actual.display())],
+        &[format!("{}={}", accounts::HOMEDIR_ENV, actual.display())],
         &intent,
         &seed,
         &c.home,
@@ -491,18 +491,23 @@ fn a_deferred_helper_relative_login_context_is_refused_before_local_policy_reads
             device: 1,
             inode: 1,
         },
-        program: "/private-fixture/claude".into(),
+        // The program and the directories are paths this host reads as absolute: only the
+        // login context the loop below makes relative is refused.
+        program: crate::test_host::abs("/private-fixture/claude"),
         argv: Vec::new(),
         env: Vec::new(),
         unset: None,
-        cwd: Some("/private-fixture".into()),
+        cwd: Some(crate::test_host::abs("/private-fixture")),
         heal: None,
         dialect: aterm_agent::harness::upgrade::Dialect::Zsh,
     };
     for field in 0..3 {
-        let mut facts =
-            ColdEnvironmentFacts::observe(&[], &intent, std::path::Path::new("/private-fixture"))
-                .unwrap();
+        let mut facts = ColdEnvironmentFacts::observe(
+            &[],
+            &intent,
+            std::path::Path::new(&crate::test_host::abs("/private-fixture")),
+        )
+        .unwrap();
         match field {
             0 => facts.login = Some("relative-login".into()),
             1 => facts.home = Some("relative-home".into()),
@@ -640,12 +645,12 @@ fn cold_case(case: i64, record: Option<&str>) -> ColdCase {
     if case == 20 || case == 21 || case == 23 || case == 24 {
         // What the snapshot read of the agent's own exec environment: what its shell passed it.
         let at = if case == 23 {
-            "/another/home".into()
+            crate::test_host::abs("/another/home")
         } else {
             home.display().to_string()
         };
         original.launch_env = accounts::LaunchEnv::of_exec_env(&[
-            format!("HOME={at}"),
+            format!("{}={at}", accounts::HOMEDIR_ENV),
             "PATH=/usr/bin".into(),
             format!("{}={original_dir}", accounts::LOGIN_ENV),
         ]);
@@ -671,7 +676,10 @@ fn cold_case(case: i64, record: Option<&str>) -> ColdCase {
             sessions.join(format!("{}.json", original.pid)),
             format!(
                 r#"{{"pid":{},"sessionId":"{session}","cwd":"{}","procStart":"{}","version":"2.1.317","kind":"interactive","entrypoint":"cli","status":"idle","statusUpdatedAt":1790000000000}}"#,
-                original.pid, original.cwd, original.start
+                original.pid,
+                // A JSON string, as Claude Code writes it: a Windows path's backslashes escaped.
+                crate::test_host::json(std::path::Path::new(&original.cwd)),
+                original.start
             ),
         )
         .unwrap();
@@ -704,12 +712,19 @@ fn shell_env(c: &ColdCase, case: i64) -> Option<Vec<String>> {
     if case == 20 || case == 22 || case == 23 {
         return PLATFORM_SHELL;
     }
-    let mut env = vec![format!("HOME={}", c.home.display()), "PATH=/usr/bin".into()];
+    let mut env = vec![
+        format!("{}={}", accounts::HOMEDIR_ENV, c.home.display()),
+        "PATH=/usr/bin".into(),
+    ];
     if case == 10 || case == 19 || case == 24 {
         env.push(format!("{}=fixture", accounts::CREDENTIAL_KEYS[0]));
     }
     if case == 18 {
-        env.push("HOME=/another/home".into());
+        env.push(format!(
+            "{}={}",
+            accounts::HOMEDIR_ENV,
+            crate::test_host::abs("/another/home")
+        ));
     }
     if case == 16 {
         env.push(format!("{}={}", accounts::LOGIN_ENV, c.original_dir));
@@ -895,7 +910,7 @@ fn restore_through_a_platform_shell(case: i64) -> PlatformRestore {
     }
 }
 
-/// THE OWNER'S RULE THAT A RESTART RESUMES ITS WORK, ON A PLATFORM SHELL: a stored-login Claude
+/// THE RULE THAT A RESTART RESUMES ITS WORK, ON A PLATFORM SHELL: a stored-login Claude
 /// whose tab shell is `/bin/zsh`, whose environment macOS shows no other process, relaunches on
 /// the launch environment its own exec environment recorded, under the current binding.
 #[test]
@@ -1106,7 +1121,7 @@ fn claude_cold_admission_onto_a_rows_own_login_notes_its_stretch_first() {
     assert!(default.a.state().login_dir_spans.is_empty(), "CONTROL");
 }
 
-/// RS1, THE OWNER'S RULE THAT MACHINES COME IN AND OUT: on a host whose native cold
+/// RS1, THE RULE THAT MACHINES COME IN AND OUT: on a host whose native cold
 /// constructor is qualified (Apple Silicon), an agent that ended under an earlier aterm process
 /// (a reboot) is admitted now, on its recorded launch environment, for the typed resume line;
 /// only an agent that ended under this host is deferred to the constructor, whose death

@@ -30,10 +30,15 @@ pub(crate) struct UpdateState {
     automatic_checks: bool,
     /// The same key as saved, which the next launch reads ([`Self::automatic_checks`]).
     automatic_checks_saved: bool,
+    /// This process's launch read of the key has no answer yet, and its checks start once it
+    /// does (`aterm_update::automatic_kept`).
+    automatic_checks_waiting: bool,
     /// The last updater outcome string (from the health ledger).
     outcome: String,
     /// The health ledger says this machine's updates are failing persistently.
     failing_persistent: bool,
+    /// See [`crate::native_updater_service::UpdaterSnapshot::check_unanswered_since`].
+    check_unanswered: bool,
     /// The most recent failing class (`apply`, `pipeline`, …).
     failing_kind: String,
     /// Consecutive apply failures.
@@ -149,6 +154,9 @@ pub(crate) struct UpdateProjection {
     pub(crate) channel_unreadable: bool,
     /// When the last check completed (Unix seconds), `None` before any has.
     pub(crate) checked_at: Option<i64>,
+    /// The headline says a check stopped answering: nothing the ladder knows outranks it
+    /// ([`crate::native_updater_service::UpdaterSnapshot::check_unanswered_since`]).
+    pub(crate) check_unanswered: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
     /// Meaning of the automatic-checks switch ([`UpdateState::automatic_checks_detail`]).
@@ -221,8 +229,10 @@ impl UpdateState {
             enabled: snapshot.enabled,
             automatic_checks: true,
             automatic_checks_saved: true,
+            automatic_checks_waiting: false,
             outcome: snapshot.outcome.clone(),
             failing_persistent: snapshot.failing_persistent,
+            check_unanswered: snapshot.check_unanswered_since.is_some(),
             failing_kind: snapshot.failing_kind.clone(),
             failing_applies: snapshot.failing_applies,
             apply_failure: snapshot.apply_failure.clone(),
@@ -282,8 +292,10 @@ impl UpdateState {
             enabled: status.map(|s| s.enabled).unwrap_or(false),
             automatic_checks: true,
             automatic_checks_saved: true,
+            automatic_checks_waiting: false,
             outcome: status.map(|s| s.outcome.clone()).unwrap_or_default(),
             failing_persistent: status.is_some_and(|s| s.enabled && s.is_failing_persistently()),
+            check_unanswered: false,
             failing_kind: status.map(|s| s.failing_kind.clone()).unwrap_or_default(),
             failing_applies: status.map_or(0, |s| s.failing_applies),
             apply_failure: String::new(),
@@ -309,6 +321,12 @@ impl UpdateState {
     pub(crate) const fn with_automatic_checks(mut self, running: bool, saved: bool) -> Self {
         self.automatic_checks = running;
         self.automatic_checks_saved = saved;
+        self
+    }
+
+    /// This process's launch read of "Check for updates automatically" has no answer yet.
+    pub(crate) const fn with_automatic_checks_waiting(mut self, waiting: bool) -> Self {
+        self.automatic_checks_waiting = waiting;
         self
     }
 
@@ -371,6 +389,13 @@ impl UpdateState {
         self
     }
 
+    /// A check gave up with no answer, on a `from_status` fixture.
+    #[cfg(test)]
+    pub(crate) const fn with_check_unanswered(mut self) -> Self {
+        self.check_unanswered = true;
+        self
+    }
+
     /// Attach the apply lane's facts to a `from_status` fixture.
     #[cfg(test)]
     pub(crate) fn with_apply_lane(mut self, reason: &str, retry: ApplyRetry) -> Self {
@@ -403,6 +428,7 @@ impl UpdateState {
         let automatic_checks_note = (detail.is_none() && !self.linux_host)
             .then(|| self.automatic_checks_detail())
             .flatten();
+        let headline = self.headline();
         UpdateProjection {
             linux_host: self.linux_host,
             linux: self.linux.clone(),
@@ -416,7 +442,11 @@ impl UpdateState {
             changelog: self.changelog.clone(),
             enabled: self.enabled,
             automatic_checks: self.automatic_checks,
-            outcome: self.outcome.clone(),
+            outcome: if self.linux_outcome_predates_silence() {
+                String::new()
+            } else {
+                self.outcome.clone()
+            },
             checking: self.checking,
             failing_persistent: self.failing_persistent && self.enabled && !self.checking,
             apply_is_failing: self.apply_is_failing() && self.enabled && !self.checking,
@@ -426,10 +456,21 @@ impl UpdateState {
             dev_build: self.dev_build.is_some(),
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
             checked_at: self.checked_at,
-            headline: self.headline(),
+            check_unanswered: headline == crate::native_updater_service::CHECK_DID_NOT_ANSWER,
+            headline,
             detail,
             automatic_checks_note,
         }
+    }
+
+    /// Only "Up to date — …" speaks for the channel on Linux, so it says nothing while a check has
+    /// stopped answering. The ledger's other words stay: a stage rejected on this read, a rollback's,
+    /// or an error's cause.
+    fn linux_outcome_predates_silence(&self) -> bool {
+        self.linux_host
+            && self.check_unanswered
+            && !self.checking
+            && self.outcome.trim_start().starts_with("Up to date")
     }
 
     /// The persistent failure is in the apply class.
@@ -468,6 +509,8 @@ impl UpdateState {
         } else if self.linux_host {
             if let Some(fact) = self.linux_fact_headline() {
                 fact.to_string()
+            } else if self.check_unanswered {
+                crate::native_updater_service::CHECK_DID_NOT_ANSWER.to_string()
             } else if !self.automatic_checks {
                 "Automatic checks are off.".to_string()
             } else {
@@ -494,6 +537,8 @@ impl UpdateState {
             "aterm can\u{2019}t check for updates on this machine.".to_string()
         } else if self.failing_persistent {
             "Updates are failing on this machine.".to_string()
+        } else if self.check_unanswered {
+            crate::native_updater_service::CHECK_DID_NOT_ANSWER.to_string()
         } else if !self.automatic_checks {
             "Automatic checks are off.".to_string()
         } else {
@@ -519,6 +564,10 @@ impl UpdateState {
             (false, false) => Some(format!(
                 "Nothing checks for updates by itself \u{2014} {manual} still checks now."
             )),
+            (false, true) if self.automatic_checks_waiting => Some(format!(
+                "Automatic checks start once aterm can read its settings \u{2014} until then, \
+                 {manual} still checks now."
+            )),
             (false, true) => Some(format!(
                 "Automatic checks start next launch \u{2014} until then, {manual} still \
                  checks now."
@@ -534,7 +583,20 @@ impl UpdateState {
     /// The secondary detail line under the headline, in plain words.
     fn detail(&self) -> Option<String> {
         if self.linux_host {
-            let outcome = self.outcome.trim().trim_end_matches('.');
+            let outcome = if self.linux_outcome_predates_silence() {
+                ""
+            } else {
+                self.outcome.trim().trim_end_matches('.')
+            };
+            // Under a fact's headline this is the only place left to say it.
+            let unanswered = if self.check_unanswered
+                && !self.checking
+                && self.linux_fact_headline().is_some()
+            {
+                crate::native_updater_service::CHECK_DID_NOT_ANSWER.trim_end_matches('.')
+            } else {
+                ""
+            };
             let own_facts = self.linux_error || outcome.is_empty();
             let direction = if own_facts
                 && self.installable.is_installable()
@@ -575,7 +637,7 @@ impl UpdateState {
                     facts.join(". ")
                 })
                 .unwrap_or_default();
-            let detail = [identity.as_str(), outcome, direction]
+            let detail = [unanswered, identity.as_str(), outcome, direction]
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
@@ -686,682 +748,5 @@ fn check_trouble_words(kind: &str) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn linux_state(linux: Option<aterm_update::LinuxUpdateStatus>, failures: u32) -> UpdateState {
-        let mut status = staged_status();
-        status.linux = linux;
-        status.staged_build = None;
-        status.staged_version = None;
-        status.staged_commit = None;
-        status.staged_dmg_sha256 = None;
-        status.failing_checks = failures;
-        status.outcome = "authenticated Linux status receipt".into();
-        let mut state = UpdateState::from_status(828, "0.5.14", Some(&status), false);
-        state.linux_host = true;
-        state
-    }
-
-    fn linux_facts() -> aterm_update::LinuxUpdateStatus {
-        aterm_update::LinuxUpdateStatus {
-            installed_build: 828,
-            installed_version: String::new(),
-            staged_build: Some(830),
-            staged_version: Some("0.5.15".into()),
-            staged_commit: Some("ab".repeat(20)),
-            trial_phase: None,
-            trial_starts: 0,
-            trial_healthy: false,
-            refused_newer: false,
-        }
-    }
-
-    const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it \
-         (\u{201c}Install updates automatically\u{201d} is off)";
-    const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} the next aterm you start \
-                                 finishes it; existing sessions continue unchanged";
-
-    #[test]
-    fn linux_update_status_download_is_read_only_and_directs_manual_apply() {
-        let mut state = linux_state(Some(linux_facts()), 0);
-        state.outcome = LINUX_HELD.into();
-        let projection = state.projection();
-        assert!(projection.headline.contains("downloaded"));
-        let detail = projection.detail.as_deref().unwrap();
-        assert_eq!(detail, LINUX_HELD);
-        assert!(!detail.contains("build 8"), "{detail}");
-        assert!(projection.staged.is_none());
-        assert_eq!(projection.linux.as_ref().unwrap().staged_build, Some(830));
-        assert!(
-            crate::native_settings::compact_update_detail_minimum(&projection)
-                .contains("aterm update apply")
-        );
-    }
-
-    #[test]
-    fn linux_update_status_pending_trial_never_claims_current() {
-        let mut facts = linux_facts();
-        facts.staged_build = None;
-        facts.staged_version = None;
-        facts.staged_commit = None;
-        facts.installed_build = 830;
-        facts.trial_phase = Some("Installed".into());
-        facts.trial_starts = 1;
-        let mut state = linux_state(Some(facts), 0);
-        state.outcome = LINUX_PENDING.into();
-        let projection = state.projection();
-        assert_eq!(projection.detail.as_deref(), Some(LINUX_PENDING));
-        let failing = linux_state(state.linux.clone(), 1).projection().detail;
-        assert!(
-            failing
-                .as_deref()
-                .unwrap_or_default()
-                .starts_with("Build 830 waits for a clean launch."),
-            "{failing:?}"
-        );
-        for phase in ["Prepared", "RollbackPrepared"] {
-            let mut facts = state.linux.clone().expect("the Linux facts");
-            facts.trial_phase = Some(phase.into());
-            let detail = linux_state(Some(facts), 1).projection().detail;
-            assert!(
-                !detail
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("clean launch"),
-                "{phase}: {detail:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn linux_update_status_first_error_remains_visible_with_a_download() {
-        let mut state = linux_state(Some(linux_facts()), 1);
-        state.outcome = "signature verification refused the new manifest".into();
-        let projection = state.projection();
-        assert!(projection.headline.contains("attention"));
-        let detail = projection.detail.as_deref().unwrap();
-        assert!(
-            detail.contains("0.5.15")
-                && detail.contains("signature verification refused the new manifest")
-                && detail.contains("`aterm update apply`"),
-            "{detail}"
-        );
-        state.outcome = "Another aterm is updating this copy right now.".into();
-        assert!(
-            !state.projection().detail.unwrap().contains(".."),
-            "one sentence ends once"
-        );
-        assert!(projection.linux_attention);
-    }
-
-    #[test]
-    fn linux_update_status_unenrolled_copy_keeps_exact_reason_and_linux_advice() {
-        let mut state = linux_state(None, 0);
-        state.enabled = false;
-        state.installable = UpdateInstallability::NotInstallable;
-        state.outcome = "installed prefix is group writable before a private ancestor".into();
-        let state = state.without_inapplicable_stage();
-        let projection = state.projection();
-        let detail = projection.detail.as_deref().unwrap();
-        assert!(detail.contains("group writable"));
-        assert!(!detail.contains("aterm update enable"), "{detail}");
-        assert!(!detail.contains("Applications"));
-        assert!(!detail.contains(".app"));
-        assert_eq!(projection.outcome, state.outcome);
-    }
-
-    #[test]
-    fn linux_automatic_checks_follow_the_running_checker_and_name_the_terminal_lane() {
-        let mut idle = linux_facts();
-        idle.staged_build = None;
-        idle.staged_version = None;
-        idle.staged_commit = None;
-        let page = |facts: aterm_update::LinuxUpdateStatus, failures, running, saved| {
-            linux_state(Some(facts), failures)
-                .with_automatic_checks(running, saved)
-                .projection()
-        };
-        let on = page(idle.clone(), 0, true, true);
-        assert!(
-            !on.detail.as_deref().unwrap().contains("Automatic checks"),
-            "{:?}",
-            on.detail
-        );
-
-        let off = page(idle.clone(), 0, false, false);
-        let detail = off.detail.expect("the Linux detail");
-        assert!(detail.contains("`aterm update check`"), "{detail}");
-        assert!(
-            detail.ends_with(on.detail.as_deref().unwrap()),
-            "the Linux detail follows whole: {detail}"
-        );
-        assert!(!detail.contains("Update to Latest Now"), "{detail}");
-        assert!(!detail.contains(".."), "one sentence ends once: {detail}");
-
-        let starting = page(idle.clone(), 0, false, true);
-        let starting = starting.detail.expect("the Linux detail");
-        assert!(starting.contains("`aterm update check`"), "{starting}");
-        assert_ne!(starting, detail, "a saved flip is its own detail");
-
-        let stopping = page(idle.clone(), 0, true, false);
-        assert!(
-            stopping
-                .detail
-                .as_deref()
-                .unwrap()
-                .starts_with("Automatic checks stop next launch"),
-            "{:?}",
-            stopping.detail
-        );
-
-        let downloaded = page(linux_facts(), 0, false, false);
-        assert!(
-            !downloaded
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("Automatic checks"),
-            "{:?}",
-            downloaded.detail
-        );
-        let attention = page(idle.clone(), 1, false, false);
-        assert!(
-            !attention
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("Automatic checks"),
-            "{:?}",
-            attention.detail
-        );
-        let mut trial = idle.clone();
-        trial.installed_build = 830;
-        trial.trial_phase = Some("Installed".into());
-        trial.trial_starts = 1;
-        let mut installed = idle;
-        installed.installed_build = 830;
-        for (facts, headline, fact) in [
-            (trial, "a pending trial", LINUX_PENDING),
-            (installed, "a newer install", "aterm 0.5.15 is installed"),
-        ] {
-            for (running, saved) in [(false, false), (false, true), (true, false)] {
-                let mut state = linux_state(Some(facts.clone()), 0);
-                state.outcome = fact.into();
-                let projection = state.with_automatic_checks(running, saved).projection();
-                let detail = projection.detail.expect("the Linux detail");
-                assert!(detail.starts_with(fact), "{headline} {detail}");
-                assert!(
-                    !detail.contains("healthy") && !detail.contains("starts 1"),
-                    "no raw trial fields: {headline} {detail}"
-                );
-                assert!(
-                    !detail.contains("Automatic checks") && !detail.contains("Nothing checks"),
-                    "{headline} {detail}"
-                );
-            }
-        }
-    }
-
-    fn staged_status() -> aterm_update::UpdateStatus {
-        aterm_update::UpdateStatus {
-            linux: None,
-            enabled: true,
-            current_build: 828,
-            staged_build: Some(830),
-            staged_version: Some("0.5.15".to_string()),
-            staged_commit: Some("deadbeefcafe".to_string()),
-            staged_dmg_sha256: Some("ab".repeat(32)),
-            changelog: Some("### Features\n- **DSU**: hot-swap\n- faster startup".to_string()),
-            outcome: "ok".to_string(),
-            updated_at: String::new(),
-            failing_checks: 0,
-            failing_kind: String::new(),
-            failing_applies: 0,
-            installable: true,
-            failing_since: String::new(),
-            failing_persistent: false,
-            failing_checks_kind: String::new(),
-            channel_unreadable: false,
-        }
-    }
-
-    #[test]
-    fn automatic_checks_off_is_named_and_leaves_the_manual_lane_standing() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        let off = UpdateState::from_status(828, "0.5.14", Some(&st), false)
-            .with_automatic_checks(false, false)
-            .projection();
-        assert!(
-            off.enabled,
-            "the updater still runs here: a person's check works"
-        );
-        assert_eq!(off.detail, None);
-        assert!(
-            off.automatic_checks_note.is_some(),
-            "the page says what is off"
-        );
-        let on = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert_eq!((on.detail, on.automatic_checks_note), (None, None));
-        let staged = UpdateState::from_status(828, "0.5.14", Some(&staged_status()), false)
-            .with_automatic_checks(false, false)
-            .projection();
-        assert!(staged.staged.is_some());
-        st.channel_unreadable = true;
-        st.outcome = "the channel is unreadable".to_string();
-        let stranded = UpdateState::from_status(828, "0.5.14", Some(&st), false)
-            .with_automatic_checks(false, false)
-            .projection();
-        assert_eq!(
-            stranded.detail.as_deref(),
-            Some("the channel is unreadable")
-        );
-        assert_eq!(stranded.automatic_checks_note, None);
-    }
-
-    #[test]
-    fn a_saved_flip_of_automatic_checks_is_named_as_next_launch_in_both_directions() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        let page = |running, saved| {
-            UpdateState::from_status(828, "0.5.14", Some(&st), false)
-                .with_automatic_checks(running, saved)
-                .projection()
-        };
-        let off = page(false, false)
-            .automatic_checks_note
-            .expect("off is named");
-        let stopping = page(true, false)
-            .automatic_checks_note
-            .expect("the pending stop is named");
-        let starting = page(false, true)
-            .automatic_checks_note
-            .expect("the pending start is named");
-        assert!(
-            off != stopping && off != starting && stopping != starting,
-            "each state is its own sentence: {off:?} / {stopping:?} / {starting:?}"
-        );
-        assert_eq!(page(true, true).automatic_checks_note, None);
-    }
-
-    #[test]
-    fn a_stage_this_copy_cannot_apply_is_not_shown_as_ready() {
-        let mut st = staged_status();
-        st.installable = false;
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert!(
-            p.staged.is_none(),
-            "a stage it cannot apply is not this copy's"
-        );
-        assert!(
-            p.changelog.is_empty(),
-            "…nor are that build's release notes"
-        );
-        assert!(p.outcome.is_empty(), "…nor the check verdict it never ran");
-
-        st.installable = true;
-        let ok = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert_eq!(ok.staged, Some((830, "0.5.15".to_string())));
-    }
-
-    #[test]
-    fn the_projection_carries_whether_this_copy_can_be_replaced_at_all() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        st.staged_dmg_sha256 = None;
-        st.changelog = None;
-        st.installable = false;
-        let projected = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert!(
-            projected.installable.cannot_install(),
-            "a copy with no replaceable bundle must project that fact, not just headline it"
-        );
-        st.installable = true;
-        assert!(
-            UpdateState::from_status(828, "0.5.14", Some(&st), false)
-                .projection()
-                .installable
-                .is_installable(),
-            "an ordinary install must stay installable"
-        );
-    }
-
-    #[test]
-    fn a_copy_that_cannot_replace_itself_says_so_instead_of_up_to_date() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        st.staged_dmg_sha256 = None;
-        st.changelog = None;
-        st.installable = false;
-        use aterm_update::which_copy::InstallPosture;
-        let page = |posture: Option<InstallPosture>| {
-            UpdateState::from_status(828, "0.5.14", Some(&st), false)
-                .with_install_posture(posture)
-                .projection()
-        };
-        let p = page(Some(InstallPosture::MountedImage));
-        assert_eq!(p.detail.as_deref(), InstallPosture::MountedImage.remedy());
-        assert_eq!(
-            page(Some(InstallPosture::Translocated)).detail.as_deref(),
-            InstallPosture::Translocated.remedy()
-        );
-        let binary = page(Some(InstallPosture::NotABundle)).detail;
-        assert_eq!(binary.as_deref(), Some(super::NOT_A_BUNDLE_DETAIL));
-        assert_eq!(page(None).detail, None);
-    }
-
-    #[test]
-    fn a_dev_build_is_told_where_it_stands_not_to_move() {
-        use aterm_update::dev_channel::DevLag;
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        st.staged_dmg_sha256 = None;
-        st.changelog = None;
-        st.installable = false;
-        let page = |standing: Option<DevLag>| {
-            UpdateState::from_status(828, "0.91.0", Some(&st), false)
-                .with_dev_build(Some(DevBuildPage { standing }))
-                .projection()
-        };
-        let unread = page(None);
-        let detail = unread.detail.expect("detail");
-        assert!(
-            detail.starts_with("The updater leaves a dev build alone"),
-            "{detail}"
-        );
-        let behind = page(Some(DevLag::Behind {
-            latest: "v0.93.0".into(),
-            releases: Some(2),
-        }));
-        assert!(
-            behind
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.starts_with("It is 2 releases behind aterm v0.93.0. ")),
-            "{:?}",
-            behind.detail
-        );
-        assert_eq!(
-            page(Some(DevLag::Behind {
-                latest: "v0.93.0".into(),
-                releases: Some(1),
-            }))
-            .headline,
-            "This dev build is 1 release behind."
-        );
-        assert_eq!(
-            page(Some(DevLag::Behind {
-                latest: "v1.0.0".into(),
-                releases: None,
-            }))
-            .headline,
-            "This dev build is older than aterm v1.0.0."
-        );
-        let current = page(Some(DevLag::Current {
-            latest: "v0.91.0".into(),
-        }));
-        assert!(
-            current
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.starts_with("It is at aterm v0.91.0, the newest release. ")),
-            "{:?}",
-            current.detail
-        );
-        assert!(behind.dev_build);
-        let plain = UpdateState::from_status(828, "0.91.0", Some(&st), false)
-            .with_install_posture(Some(aterm_update::which_copy::InstallPosture::MountedImage))
-            .projection();
-        assert!(!plain.dev_build);
-        assert!(
-            plain
-                .detail
-                .is_some_and(|d| d.contains("Drag aterm to Applications"))
-        );
-    }
-
-    #[test]
-    fn a_staged_build_that_keeps_failing_to_apply_says_so() {
-        let mut st = staged_status();
-        st.failing_applies = 3;
-        st.failing_kind = "apply".to_string();
-        st.failing_persistent = true;
-        st.outcome = "staged 0.5.15 (build 830) — verified and ready to apply".to_string();
-        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false).with_apply_lane(
-            "overlap handoff failed safely: handoff proof ended ChildDied",
-            ApplyRetry::ManualOnly,
-        );
-        let p = s.projection();
-        assert!(
-            p.failing_persistent,
-            "the projection no longer masks a failure while staged"
-        );
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.contains("0.5.15") && detail.contains("3 times"),
-            "the escalated detail names the version and how many attempts died: {detail}"
-        );
-        assert!(
-            !detail.contains("ready to apply"),
-            "not the ledger's healthy sentence: {detail}"
-        );
-        assert!(
-            detail.contains("Settings \u{25b8} Messages"),
-            "the escalated case keeps its pointer at the full history: {detail}"
-        );
-        assert!(
-            !detail.contains("build 830"),
-            "build numbers belong in About: {detail}"
-        );
-
-        let mut acquiring = staged_status();
-        acquiring.failing_checks = 3;
-        acquiring.failing_kind = "manifest".to_string();
-        acquiring.failing_persistent = true;
-        let s = UpdateState::from_status(828, "0.5.14", Some(&acquiring), false);
-        let p = s.projection();
-        assert!(p.failing_persistent && !p.apply_is_failing);
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.contains("0.5.15") && detail.contains("Messages"),
-            "the stage in hand is still ready; the log has the rest: {detail}"
-        );
-    }
-
-    #[test]
-    fn a_clean_staged_update_does_not_read_as_a_failure() {
-        let st = staged_status();
-        assert_eq!(st.failing_applies, 0, "the fixture is a clean stage");
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
-            .with_apply_lane(
-                "overlap handoff failed safely: handoff proof ended ChildDied",
-                ApplyRetry::Scheduled,
-            )
-            .projection();
-
-        assert!(
-            p.apply_trouble.is_none(),
-            "a reason with no attempts behind it is not an attempt"
-        );
-        let detail = p.detail.expect("detail");
-        assert!(detail.contains("0.5.15"), "{detail}");
-        for alarming in ["tried", "failed", "did not", "retry"] {
-            assert!(
-                !detail.contains(alarming),
-                "a stage that has simply not been attempted must not read as a \
-                 failure ({alarming:?} in {detail:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn an_installed_activation_is_not_called_downloaded() {
-        use crate::native_updater_service::{
-            NativeUpdaterService, StagedUpdate, installed_activation_digest,
-        };
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let detail_for = |dmg_sha256: String| {
-            let mut snapshot = NativeUpdaterService::new(828, "0.5.14", true)
-                .snapshot()
-                .clone();
-            snapshot.installable = UpdateInstallability::Installable;
-            snapshot.staged = Some(StagedUpdate {
-                build: 830,
-                version: "0.5.15".to_string(),
-                commit: Some(commit.to_string()),
-                dmg_sha256,
-                changelog: None,
-                generation: 1,
-            });
-            let p = UpdateState::from_service(&snapshot, false, ApplyRetry::Scheduled).projection();
-            p.detail
-        };
-
-        let activated = detail_for(installed_activation_digest(830, commit)).expect("detail");
-        assert!(!activated.contains("downloaded"), "{activated}");
-        let downloaded = detail_for("ab".repeat(32)).expect("detail");
-        assert!(downloaded.contains("downloaded"), "{downloaded}");
-    }
-
-    #[test]
-    fn the_surface_says_whether_the_update_will_retry_without_the_user() {
-        let mut st = staged_status();
-        st.failing_applies = 2;
-        let detail_for = |retry| {
-            UpdateState::from_status(828, "0.5.14", Some(&st), false)
-                .with_apply_lane("handoff proof ended ChildDied", retry)
-                .projection()
-                .detail
-                .expect("detail")
-        };
-        let scheduled = detail_for(ApplyRetry::Scheduled);
-        let manual = detail_for(ApplyRetry::ManualOnly);
-        assert_ne!(scheduled, manual);
-        assert!(
-            scheduled.contains("try again by itself"),
-            "a scheduled retry tells the reader to do nothing: {scheduled}"
-        );
-        assert!(
-            manual.contains("not try again until you ask"),
-            "a latched lane tells the reader it is now up to them: {manual}"
-        );
-    }
-
-    #[test]
-    fn observability_audit_the_page_tells_the_owner_to_reinstall_over_an_unsigned_install() {
-        let mut st = staged_status();
-        st.failing_applies = 6;
-        st.failing_kind = "apply".to_string();
-        st.failing_persistent = true;
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
-            .with_apply_lane(
-                "installed bundle failed pre-park verification: the installed bundle at \
-                 /Applications/aterm.app cannot be the rollback source the swap installs: \
-                 bundle policy: codesign --verify (team-pinned requirement) failed; the \
-                 terminal was left untouched",
-                ApplyRetry::NeedsPerson(
-                    crate::update_apply_trouble::PersonRemedy::InstallSignedRelease,
-                ),
-            )
-            .projection();
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.contains("the installed copy could not be verified for replacement"),
-            "the page must name the refused installed copy: {detail}"
-        );
-        assert!(
-            detail.contains("Install the signed release from the release DMG, then retry."),
-            "a current installed-source block must carry its remedy: {detail}"
-        );
-        assert!(
-            !detail.contains("try again by itself"),
-            "a current installed-source block cannot promise an automatic retry: {detail}"
-        );
-        assert!(
-            !detail.contains("could not be set up"),
-            "not the generic preparation clause — the installed copy is the cause: {detail}"
-        );
-    }
-
-    #[test]
-    fn a_healthy_page_says_when_it_last_checked() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        st.outcome = "up to date (latest release build 828) \u{b7} checks every 30 min".to_string();
-        st.updated_at = "2026-09-23T12:00:00Z".to_string();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert_eq!(p.detail, None, "nothing to add beyond when it last checked");
-        let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at).unwrap();
-        assert_eq!(p.checked_at, Some(checked));
-        assert!(
-            p.checked_line(checked + 12 * 60 + 5)
-                .is_some_and(|line| line.contains(&ago_words(checked, checked + 12 * 60 + 5)))
-        );
-        st.updated_at = String::new();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert_eq!(p.checked_line(checked), None);
-    }
-
-    #[test]
-    fn a_persistent_check_failure_is_plain_and_points_at_the_log() {
-        let mut st = staged_status();
-        st.staged_build = None;
-        st.staged_version = None;
-        st.failing_checks = 3;
-        st.failing_kind = "network".to_string();
-        st.failing_persistent = true;
-        st.outcome = "FAILING (3 consecutive checks since 2026-09-23T10:00:00Z): network: \
-                      curl exit 6"
-            .to_string();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.contains("Messages") && !detail.contains("FAILING") && !detail.contains("curl"),
-            "words, and where the rest is: {detail}"
-        );
-        st.failing_kind = "manifest".to_string();
-        st.outcome = "FAILING (3 consecutive checks since 2026-09-23T10:00:00Z): this build's \
-                      trust anchor cannot verify the channel's releases — reinstall aterm from \
-                      the current release"
-            .to_string();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.starts_with("This copy of aterm is too old"),
-            "{detail}"
-        );
-        assert!(detail.contains("Reinstall aterm"), "{detail}");
-        st.failing_kind = "apply".to_string();
-        st.failing_applies = aterm_update::PERSISTENT_AFTER;
-        st.outcome = "staged build did not apply: this install cannot update itself: \
-                      reinstall the signed release"
-            .to_string();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        let detail = p.detail.expect("detail");
-        assert!(
-            !detail.starts_with("This copy of aterm is too old") && detail.contains("Messages"),
-            "{detail}"
-        );
-    }
-
-    #[test]
-    fn snapshot_renders_staged_update_notes() {
-        let st = staged_status();
-        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
-        assert!(s.staged.is_some());
-        assert!(s.changelog.iter().any(|l| l.contains("DSU: hot-swap")));
-        assert!(
-            !s.changelog
-                .iter()
-                .any(|l| l.contains('#') || l.contains("**"))
-        );
-        assert!(s.detail().unwrap().contains("0.5.15"));
-    }
-}
+#[path = "update_screen_tests.rs"]
+mod tests;

@@ -811,6 +811,200 @@ fn a_bare_name_is_searched_on_the_childs_path_and_the_environment_is_exact() {
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
+/// Metadata denial does not prove absence or turn a directory into an executable.
+/// The real exec authority decides both the candidate to skip and the image to run.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_bare_path_search_uses_exec_authority_when_metadata_is_denied() {
+    const CHILD: &str = "ATERM_UDS_METADATA_SEARCH_CHILD";
+    const SEARCH: &str = "ATERM_UDS_METADATA_SEARCH_PATH";
+    const RECEIPT: &str = "metadata-denied-path-executed-echo";
+    if let Ok(stage) = std::env::var(CHILD) {
+        let search = std::env::var_os(SEARCH).unwrap();
+        let aliases: Vec<_> = std::env::split_paths(&search)
+            .map(|dir| dir.join("echo"))
+            .collect();
+        assert_eq!(aliases.len(), 2, "the directory and executable aliases");
+        for path in aliases {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "the sandbox denies metadata on {}",
+                path.display()
+            );
+        }
+        let denied = stage.starts_with("deny-");
+        let prepared = stage.ends_with("prepared");
+        assert!(
+            matches!(
+                stage.as_str(),
+                "spawn" | "prepared" | "deny-spawn" | "deny-prepared"
+            ),
+            "unexpected staged role: {stage}"
+        );
+        println!("STAGED {stage} metadata-denial-observed");
+        std::io::stdout().flush().unwrap();
+        if prepared {
+            let mut exec = transparent("echo");
+            exec.arg(RECEIPT).env_exactly([("PATH", &search)]);
+            let error = match exec.prepare_exec() {
+                Ok(prepared) => {
+                    // The prepared native image owns the original search and arguments
+                    // while its source command can change before dispatch is granted.
+                    exec.env("PATH", "/nonexistent").arg("too-late-argument");
+                    prepared.exec_until(u64::MAX)
+                }
+                Err(error) => error,
+            };
+            assert!(denied, "the permitted in-place exec returned: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        } else {
+            let result = command("echo").arg(RECEIPT).env("PATH", &search).output();
+            if denied {
+                assert_eq!(
+                    result
+                        .expect_err("the sandbox still denies execution")
+                        .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+            } else {
+                let output = result.expect("spawn through denied metadata");
+                assert!(output.status.success(), "echo failed: {output:?}");
+                assert_eq!(output.stdout, format!("{RECEIPT}\n").as_bytes());
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+        }
+        println!("STAGED {stage} completed");
+        return;
+    }
+    let root = aterm_tempfile::tempdir().expect("private PATH directory fixture");
+    let directory = root.path().canonicalize().unwrap().join("directory");
+    let first = directory.parent().unwrap().join("first/echo");
+    let second = directory.parent().unwrap().join("second/echo");
+    for path in [
+        directory.as_path(),
+        first.parent().unwrap(),
+        second.parent().unwrap(),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::os::unix::fs::symlink(&directory, &first).unwrap();
+    std::os::unix::fs::symlink("/bin/echo", &second).unwrap();
+    let search = std::env::join_paths([first.parent().unwrap(), second.parent().unwrap()]).unwrap();
+    let name = format!(
+        "{}::a_bare_path_search_uses_exec_authority_when_metadata_is_denied",
+        module_path!().split_once("::").expect("a crate's module").1
+    );
+    let literal = directory
+        .to_str()
+        .unwrap()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    for stage in ["spawn", "prepared", "deny-spawn", "deny-prepared"] {
+        let deny_exec = if stage.starts_with("deny-") {
+            "(deny process-exec (literal \"/bin/echo\"))"
+        } else {
+            ""
+        };
+        let policy = format!(
+            "(version 1)(allow default)\
+             (deny file-read-metadata (literal \"{literal}\") (literal \"/bin/echo\")){deny_exec}"
+        );
+        let output = crate::deadline::ends_within(
+            command("/usr/bin/sandbox-exec")
+                .args(["-p", &policy])
+                .arg(std::env::current_exe().expect("the original test image"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, stage)
+                .env(SEARCH, &search),
+            crate::deadline::ECHO_HANG,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains(&format!("STAGED {stage} metadata-denial-observed")),
+            "{stage}: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        assert_eq!(
+            stdout.lines().filter(|line| *line == RECEIPT).count(),
+            usize::from(!stage.starts_with("deny-")),
+            "{stage}: exactly the permitted image ran\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        if stage != "prepared" {
+            assert!(
+                stdout.contains(&format!("STAGED {stage} completed")),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+/// Descriptor exhaustion is an operational failure of the directory probe, never evidence
+/// that a PATH candidate is absent or a regular executable.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_prepared_path_search_preserves_directory_probe_descriptor_exhaustion() {
+    const STAGE: &str = "path-directory-probe-emfile";
+    const RECEIPT: &str = "STAGED path-directory-probe preserved EMFILE";
+    if std::env::var(STAGE_ENV).as_deref() != Ok(STAGE) {
+        let name = format!(
+            "{}::a_prepared_path_search_preserves_directory_probe_descriptor_exhaustion",
+            module_path!().split_once("::").expect("a crate's module").1
+        );
+        let output = run_staged(&name, STAGE);
+        assert!(output.contains(RECEIPT), "the exact child ran: {output}");
+        return;
+    }
+    let root = aterm_tempfile::tempdir().expect("private directory probe fixture");
+    let directory = root.path().join("first/echo");
+    std::fs::create_dir_all(&directory).unwrap();
+    let search =
+        std::env::join_paths([directory.parent().unwrap(), std::path::Path::new("/bin")]).unwrap();
+    let original = soft_limit();
+    assert_eq!(
+        set_soft_limit(64),
+        64,
+        "the isolated child's descriptor limit"
+    );
+    let prepared = transparent("echo")
+        .env_exactly([("PATH", &search)])
+        .prepare_exec()
+        .expect("skip the directory with descriptors available");
+    assert_eq!(prepared.captured().1.to_bytes(), b"/bin/echo");
+    drop(prepared);
+
+    let mut held = Vec::new();
+    let mut cloexec = true;
+    let exhausted = loop {
+        match std::fs::File::open("/dev/null") {
+            Ok(file) => {
+                cloexec &= flags(file.as_raw_fd()) & FD_CLOEXEC != 0;
+                held.push(file);
+            }
+            Err(error) => break error,
+        }
+    };
+    let refused = transparent("echo")
+        .env_exactly([("PATH", &search)])
+        .prepare_exec();
+    // Restore room before diagnostics or libtest's own completion can open another file.
+    drop(held);
+    set_soft_limit(original.cur);
+    assert!(cloexec, "the fixture held only close-on-exec descriptors");
+    assert_eq!(exhausted.raw_os_error(), Some(libc::EMFILE));
+    let error = refused
+        .err()
+        .expect("a directory probe with no free descriptor is refused");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(libc::EMFILE),
+        "the first directory probe's operational failure survives PATH search"
+    );
+    println!("{RECEIPT}");
+}
+
 #[test]
 fn a_key_named_twice_is_its_last_value_for_the_search_and_the_child_alike() {
     let (mut out, child_out) = UnixStream::pair().expect("socketpair");
@@ -879,102 +1073,6 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
         Some(Some(EACCES)),
         "alone, the candidate it may not run is EACCES: {refused:?}"
     );
-}
-
-/// The search a tethered spawn judges before it routes (`program_search::findable`) answers what
-/// the spawn itself answers: it passes exactly when a plain spawn of the program starts, and
-/// refuses with that spawn's own error, for a bare name on `PATH`, a relative path in the child's
-/// folder, an absolute path and an empty name; on Linux also where glibc's `execvp` loop parts
-/// from a plain walk of the candidates: an entry too long to join, which ends the search; one
-/// too long for glibc to copy, passed over for the working directory, unless it is the last; a
-/// link loop; and a folder this process may not search, which answers `EACCES`.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
-#[test]
-fn a_search_judged_before_the_spawn_answers_what_the_spawn_answers() {
-    use std::os::unix::fs::PermissionsExt;
-    let scratch = aterm_tempfile::tempdir().expect("scratch");
-    let dir = scratch.path();
-    std::fs::write(dir.join("tool"), b"#!/bin/sh\nexit 0\n").expect("write");
-    std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755))
-        .expect("chmod");
-    std::fs::write(dir.join("plain"), b"#!/bin/sh\nexit 0\n").expect("write");
-    std::fs::create_dir(dir.join("folder")).expect("mkdir");
-    let here = dir.display().to_string();
-    let gone_first = format!("{here}/gone:{here}");
-    let tool = format!("{here}/tool");
-    let plain = format!("{here}/plain");
-    let cases: Vec<(&str, &str, bool)> = vec![
-        ("tool", &here, false),
-        ("tool", &gone_first, false),
-        ("plain", &here, false),
-        ("folder", &here, false),
-        ("missing", &here, false),
-        ("plain", "/usr/bin:/bin", false),
-        ("./tool", "/usr/bin", true),
-        ("./plain", "/usr/bin", true),
-        ("./folder", "/usr/bin", true),
-        ("./missing", "/usr/bin", true),
-        (&tool, "/usr/bin", false),
-        (&plain, "/usr/bin", false),
-        ("", &here, false),
-        ("tool", "gone:.", true),
-    ];
-    #[cfg(target_os = "linux")]
-    let (joined_too_long, copied_too_long_then_gone, gone_then_copied_too_long, looped, shut) = {
-        std::fs::create_dir(dir.join("loop")).expect("mkdir");
-        std::os::unix::fs::symlink("tool", dir.join("loop/tool")).expect("a link to itself");
-        // Listed but never searched, so the scratch folder's removal still empties it.
-        std::fs::create_dir(dir.join("shut")).expect("mkdir");
-        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o600))
-            .expect("chmod");
-        let joined = format!("/{}", "c".repeat(4093));
-        let copied = format!("/{}", "b".repeat(4100));
-        (
-            format!("{joined}:{here}"),
-            format!("{copied}:{here}/gone"),
-            format!("{here}/gone:{copied}"),
-            format!("{here}/loop:{here}"),
-            format!("{here}/shut"),
-        )
-    };
-    #[cfg(target_os = "linux")]
-    let cases = {
-        let mut cases = cases;
-        cases.extend([
-            ("tool", joined_too_long.as_str(), false),
-            ("tool", copied_too_long_then_gone.as_str(), true),
-            ("tool", gone_then_copied_too_long.as_str(), true),
-            ("tool", looped.as_str(), false),
-        ]);
-        // SAFETY: `geteuid` takes nothing and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            cases.push(("tool", shut.as_str(), false));
-        }
-        cases
-    };
-    for (program, path, in_dir) in cases {
-        let base = in_dir.then_some(dir);
-        #[cfg(target_vendor = "apple")]
-        let judged =
-            program_search::findable(program.as_bytes(), Some(OsStr::new(path)), base, false);
-        #[cfg(target_os = "linux")]
-        let judged = program_search::findable(program.as_bytes(), Some(OsStr::new(path)), base);
-        let mut cmd = command(program);
-        cmd.env("PATH", path).stdin(Stdio::null());
-        if in_dir {
-            cmd.current_dir(dir);
-        }
-        let spawned = cmd.status();
-        assert_eq!(
-            judged.as_ref().map(|_| ()).map_err(io::Error::raw_os_error),
-            spawned
-                .as_ref()
-                .map(|_| ())
-                .map_err(io::Error::raw_os_error),
-            "{program:?} on PATH {path:?}{}: judged {judged:?}, spawned {spawned:?}",
-            if in_dir { ", in the folder" } else { "" }
-        );
-    }
 }
 
 #[test]

@@ -95,6 +95,11 @@ impl std::io::Write for Sink {
 }
 
 fn dialogue(answers: &str) -> (Option<super::Reading>, Vec<String>) {
+    let (got, methods) = dialogue_read(answers);
+    (got.ok(), methods)
+}
+
+fn dialogue_read(answers: &str) -> (Result<super::Reading, Missed>, Vec<String>) {
     let sink = Sink::default();
     let server = AppServer {
         from: Box::new(Cursor::new(answers.as_bytes().to_vec())),
@@ -231,4 +236,137 @@ fn an_inactive_refresh_never_falls_back_to_a_stale_read() {
     ));
     assert_eq!(got, None);
     assert_eq!(methods, ["initialize", "initialized", "usage/refresh"]);
+}
+
+/// A host that refuses in Muse Code's sign-in words is a login that is gone, told apart from a
+/// read that merely gave nothing, whichever call it refuses.
+/// NEGATIVE CONTROL: with `Rpc::call` answering `Fault::Unread` for every error (its words
+/// dropped), the sign-out reads as nothing: `` left: Err(Unanswered) right: Err(SignedOut) ``.
+#[test]
+fn a_refusal_in_sign_in_words_is_a_signed_out_login() {
+    let hello = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"muse\"}}}\n";
+    let refused = |id: u8, said: &str| {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"{said}\"}}}}\n"
+        )
+    };
+    let signed_out = format!(
+        "{hello}{}{}",
+        refused(2, "not logged in: run `muse login` first"),
+        refused(3, "not logged in: run `muse login` first"),
+    );
+    assert_eq!(dialogue_read(&signed_out).0, Err(Missed::SignedOut));
+    let at_hello = refused(1, "No Meta credentials were found");
+    assert_eq!(dialogue_read(&at_hello).0, Err(Missed::SignedOut));
+    let expired = format!(
+        "{hello}{}{}",
+        refused(2, "usage/refresh is rate limited"),
+        refused(
+            3,
+            "your saved login is no longer valid. Log in again or use a different account."
+        ),
+    );
+    assert_eq!(dialogue_read(&expired).0, Err(Missed::SignedOut));
+    // CONTROL: refusals that say nothing of the login, and a host that just closes.
+    let limited = format!(
+        "{hello}{}{}",
+        refused(2, "usage/refresh is rate limited"),
+        refused(3, "no usage was observed yet"),
+    );
+    assert_eq!(dialogue_read(&limited).0, Err(Missed::Unanswered));
+    assert_eq!(dialogue_read("").0, Err(Missed::Unanswered));
+    assert_eq!(
+        dialogue_read(&refused(1, "macOS Keychain access was canceled")).0,
+        Err(Missed::Unanswered)
+    );
+}
+
+/// The read's host runs under the no-desk sandbox: the command is `sandbox-exec` with the
+/// profile, then the binary and its `serve` words.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_serve_command_is_the_no_desk_sandbox_around_the_host() {
+    use super::super::login_drive::{NO_DESK, SANDBOX_EXEC};
+    let cmd = serve_command(Path::new("/opt/muse/bin/muse")).expect("a sandbox here");
+    assert_eq!(cmd.get_program(), std::ffi::OsStr::new(SANDBOX_EXEC));
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "-p",
+            NO_DESK,
+            "/opt/muse/bin/muse",
+            "serve",
+            "--no-session-log",
+            "--provider",
+            "meta"
+        ]
+    );
+}
+
+/// THE FOURTH FINDING: a signed-out `muse serve` can put nothing on the screen, and what it
+/// says of its login is heard. The stand-in host tries to start `/usr/bin/open` (with no
+/// arguments, which opens nothing and prints its usage), writes how that ended, says Muse
+/// Code's own sign-in words on its standard error and exits: under the sandbox the start is
+/// refused (`126`), and the read comes back signed out.
+/// NEGATIVE CONTROL (`ON_DESK`: the host run as a plain child, as before): `open` starts and
+/// exits `1`: `` left: "open=1" right: "open=126" ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_signed_out_host_runs_off_the_desk_and_is_heard() {
+    use super::super::provider_read::{Account, Read, Use};
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-muse-usage-nodesk-")
+            .tempdir()
+            .expect("temp dir")
+            .keep(),
+    );
+    let home = tmp.path().join("home");
+    let config = home.join(".config/muse");
+    std::fs::create_dir_all(&config).expect("config");
+    let marker = tmp.path().join("open-ended");
+    let host = tmp.path().join("fake-muse.sh");
+    crate::harness::stand_in::proven(
+        &host,
+        &format!(
+            "/usr/bin/open >/dev/null 2>&1\necho \"open=$?\" > '{}'\n\
+             echo 'error: not logged in: run `muse login` first' >&2\nexit 1\n",
+            marker.display()
+        ),
+    );
+    let read = |on_desk: bool| {
+        let _ = std::fs::remove_file(&marker);
+        ON_DESK.set(on_desk);
+        let permit = Use::fixture(Read::MuseUsage, &config, None)
+            .begin(Account::in_home(Read::MuseUsage, &config, None), 1, None)
+            .expect("its own account");
+        let got = fetch(
+            &host,
+            vec![
+                ("PATH", std::ffi::OsString::from("/usr/bin:/bin")),
+                ("HOME", home.clone().into_os_string()),
+            ],
+            tmp.path(),
+            permit,
+        );
+        ON_DESK.set(false);
+        (
+            got,
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        )
+    };
+    let (got, open) = read(false);
+    assert_eq!(open, "open=126", "the sandbox refuses the opener's start");
+    assert_eq!(got, Err(Missed::SignedOut), "its sign-in words are heard");
+    let (got, open) = read(true);
+    assert_eq!(open, "open=1", "CONTROL: a plain child starts it");
+    assert_eq!(got, Err(Missed::SignedOut));
+    tmp.ran();
 }

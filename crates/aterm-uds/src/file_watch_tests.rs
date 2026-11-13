@@ -192,10 +192,14 @@ fn a_partial_read_batch_leaves_native_input_ready_for_another_turn() {
 /// is in `armed` once (a directory arm on a folder not there falls back to a file arm, which is
 /// the one recorded), a directory arm that took in `entries` as well, and each wait's timeout in
 /// `waits`. Where `files_only`, it hears no folder's entries, as the stat poll does not; a key in
-/// `elsewhere` is armed on a volume that does not report every writer.
+/// `elsewhere` is armed on a volume that does not report every writer. Where `pins`, its
+/// listeners pin the folders above them, as the Windows arm's do, and it listens for no path
+/// under `outside`.
 #[derive(Clone, Default)]
 struct Scripted {
     files_only: bool,
+    pins: bool,
+    outside: Option<PathBuf>,
     elsewhere: Arc<Mutex<BTreeSet<u64>>>,
     queued: Arc<Mutex<Vec<u64>>>,
     armed: Arc<Mutex<Vec<(u64, PathBuf)>>>,
@@ -252,6 +256,17 @@ impl FileEvents for Scripted {
         !self.elsewhere.lock().unwrap().contains(&key)
     }
 
+    fn pins_folders(&self) -> bool {
+        self.pins
+    }
+
+    fn listens_for(&self, path: &Path) -> bool {
+        !self
+            .outside
+            .as_ref()
+            .is_some_and(|outside| path.starts_with(outside))
+    }
+
     fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
         self.waits.lock().unwrap().push(timeout);
         let queued = std::mem::take(&mut *self.queued.lock().unwrap());
@@ -278,13 +293,13 @@ fn scratch(name: &str) -> aterm_tempfile::TempDir {
 }
 
 /// Any arm, counting its arms so a test knows the watch took its baseline.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct Counted {
     inner: Box<dyn FileEvents>,
     arms: Arc<Mutex<usize>>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl FileEvents for Counted {
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
         let armed = self.inner.arm(key, path);
@@ -298,6 +313,14 @@ impl FileEvents for Counted {
 
     fn hears_every_writer(&self, key: u64) -> bool {
         self.inner.hears_every_writer(key)
+    }
+
+    fn pins_folders(&self) -> bool {
+        self.inner.pins_folders()
+    }
+
+    fn listens_for(&self, path: &Path) -> bool {
+        self.inner.listens_for(path)
     }
 
     fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
@@ -365,7 +388,7 @@ fn the_first_look_tells_then_an_event_tells_only_when_the_file_really_changed() 
 /// The platform's own events: a rewrite in place and a replace by rename (a
 /// new inode, as editors, formatters and `git checkout` save) are each heard,
 /// the second proving the watch armed again on the new file.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn the_platform_hears_a_rewrite_and_a_replace_by_rename() {
     let dir = scratch("amacs-watch-platform");
@@ -419,7 +442,7 @@ fn the_platform_hears_a_rewrite_and_a_replace_by_rename() {
 /// back, so the file made again in it is heard as well; a file
 /// in another folder, whose arm never failed, hears its writes throughout (the
 /// control).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn the_platform_hears_a_delete_and_the_file_made_again() {
     let dir = scratch("amacs-watch-recreate");
@@ -971,6 +994,55 @@ fn the_platform_hears_a_folder_behind_a_link_on_the_path_renamed() {
     assert_eq!(touched, [1]);
 }
 
+/// A path under a regular file (a records layout's data file, while the records entry is still a
+/// plain file) is a file not there yet: it arms on the nearest folder above, with no re-arm
+/// rounds, and that folder hears the file replaced by a folder, after which the arm goes lower
+/// and hears the path's own file written.
+///
+/// NEGATIVE CONTROL (2026-11-11): with `listen_folder` answering the file's `ENOTDIR` as it did a
+/// refusal, the arm fails, [`Took::of`] answers [`Took::No`] and the key is armed again every
+/// [`REARM_EVERY`] for as long as the file stands.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_path_under_a_regular_file_arms_on_the_folder_above_it() {
+    let dir = scratch("watch-under-a-file");
+    let entry = dir.path().join("records");
+    std::fs::write(&entry, "plain\n").unwrap();
+    let path = entry.join("current");
+    let mut events = platform_events().unwrap();
+    assert_eq!(
+        Took::of(&mut *events, 1, &path, Shape::File),
+        Took::File,
+        "armed on the folder above the file"
+    );
+    let mut pending = Unarmed::default();
+    assert_eq!(
+        pending.arm(&mut *events, 1, &path, Shape::File, Instant::now()),
+        Took::File
+    );
+    assert_eq!(pending.wait(Instant::now()), None, "no re-arm round is due");
+
+    let touched = heard_for(&mut *events, || {
+        let next = dir.path().join("records.next");
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(next.join("current"), "one\n").unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::rename(&next, &entry).unwrap();
+    });
+    assert_eq!(touched, [1], "the file replaced by a folder");
+
+    events.arm(1, &path).unwrap();
+    let touched = heard_for(&mut *events, || {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"two\n").unwrap();
+    });
+    assert_eq!(touched, [1], "a write on the end of the path's own file");
+}
+
 /// A file not yet made in a folder that is a link to one (a dotfiles `~/.config/aterm`) arms on
 /// the folder the link names, so its making is heard there with no re-arm rounds; and the link
 /// made to name another folder is heard by the link's own listener.
@@ -1125,6 +1197,181 @@ fn retry_batches_advance_and_restart_after_the_pending_set_empties() {
     assert_eq!(pending.wait(later), Some(REARM_EVERY));
     assert!(pending.due(later).is_empty());
     assert_eq!(pending.due(later + REARM_EVERY), [9]);
+}
+
+/// The files the watch only looks at are looked at `LOOK_EVERY` apart while a round finds one
+/// changed or one more comes to be watched, twice as far apart after each round that finds none
+/// up to `LOOK_SLOWEST`, and on no clock at all once none is left.
+#[test]
+fn looks_come_close_while_a_file_changes_and_far_apart_while_every_one_rests() {
+    let start = Instant::now();
+    let mut pending = Unarmed::default();
+    assert_eq!(pending.rest(start), None, "nothing to look at, no clock");
+    pending.look(7, start);
+    assert_eq!(pending.rest(start), Some(LOOK_EVERY));
+    assert_eq!(pending.looks.due(start + LOOK_EVERY / 2), None, "not yet");
+    assert_eq!(pending.wait(start), None, "it is in no round of arms");
+
+    // Rounds that find nothing changed: each rest is twice the last, up to the slowest.
+    let mut now = start + LOOK_EVERY;
+    let mut rests = Vec::new();
+    for _ in 0..5 {
+        assert_eq!(pending.looks.due(now), Some(vec![7]));
+        pending.looks.rest(false);
+        let rest = pending.rest(now).unwrap();
+        rests.push(rest);
+        now += rest;
+    }
+    let mut doubling = LOOK_EVERY;
+    let expected: Vec<Duration> = (0..5)
+        .map(|_| {
+            doubling = (doubling * 2).min(LOOK_SLOWEST);
+            doubling
+        })
+        .collect();
+    assert_eq!(rests, expected);
+    assert_eq!(rests.last(), Some(&LOOK_SLOWEST), "and no slower");
+    assert!(LOOK_EVERY < LOOK_SLOWEST);
+
+    // A round that finds a change brings the next one close again.
+    assert_eq!(pending.looks.due(now), Some(vec![7]));
+    pending.looks.rest(true);
+    assert_eq!(pending.rest(now), Some(LOOK_EVERY));
+
+    // So does one more file to look at, and the same file watched again does not.
+    now += LOOK_EVERY;
+    assert_eq!(pending.looks.due(now), Some(vec![7]));
+    pending.looks.rest(false);
+    assert_eq!(pending.rest(now), Some(LOOK_EVERY * 2));
+    pending.look(7, now);
+    assert_eq!(pending.rest(now), Some(LOOK_EVERY * 2));
+    pending.look(9, now);
+    assert_eq!(pending.rest(now), Some(LOOK_EVERY));
+    assert_eq!(pending.looks.due(now + LOOK_EVERY), Some(vec![7, 9]));
+
+    // A file no arm took is armed again on its own clock, and the watch rests for the sooner.
+    let path = Path::new("fixture/unavailable");
+    let mut events = Refusing::default();
+    events
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let later = now + LOOK_EVERY + LOOK_EVERY / 4;
+    assert_eq!(
+        pending.arm(&mut events, 11, path, Shape::File, later),
+        Took::No
+    );
+    assert_eq!(pending.wait(later), Some(REARM_EVERY));
+    assert_eq!(
+        pending.rest(later),
+        Some(REARM_EVERY.min(LOOK_EVERY - LOOK_EVERY / 4))
+    );
+
+    pending.forget(7);
+    pending.forget(9);
+    pending.forget(11);
+    assert_eq!(
+        pending.rest(later + LOOK_SLOWEST),
+        None,
+        "none left, no clock"
+    );
+}
+
+/// A file its host asks only to be looked at is never armed where the arm's listeners pin the
+/// folders above them, nor is any file the arm does not listen for, and each is still told its
+/// first look and its changes, by the watch's looks. The controls: the same arm arms a file
+/// watched the plain way, and an arm whose listeners pin nothing (macOS, Linux) arms a
+/// looked-at file as any other.
+#[test]
+fn a_looked_at_file_is_never_armed_where_listeners_pin_and_its_changes_are_told() {
+    let dir = scratch("looked");
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let (document, feed, config) = (
+        dir.path().join("doc.txt"),
+        project.join("feed.toml"),
+        dir.path().join("aterm.toml"),
+    );
+    for file in [&document, &feed, &config] {
+        std::fs::write(file, "one\n").unwrap();
+    }
+    let events = Scripted {
+        pins: true,
+        outside: Some(project.clone()),
+        ..Scripted::default()
+    };
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    let next = || heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    watch.watch_looked(1, document.clone());
+    assert_eq!(next(), Ok(1), "the looked-at file's first look");
+    watch.watch(2, feed.clone());
+    assert_eq!(next(), Ok(2), "the unlistened file's first look");
+    std::fs::write(&document, "two, longer\n").unwrap();
+    assert_eq!(next(), Ok(1), "the looked-at file's change");
+    std::fs::write(&feed, "two, longer\n").unwrap();
+    assert_eq!(next(), Ok(2), "the unlistened file's change");
+    std::fs::remove_file(&document).unwrap();
+    assert_eq!(next(), Ok(1), "the looked-at file gone");
+    assert!(
+        events.armed.lock().unwrap().is_empty(),
+        "neither was ever armed"
+    );
+
+    // The control: the same arm is asked for a file watched the plain way.
+    watch.watch(3, config.clone());
+    assert_eq!(next(), Ok(3), "the first look");
+    assert!(
+        events
+            .armed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(key, path)| *key == 3 && *path == config),
+        "only the plainly watched file is armed"
+    );
+    assert!(!events.armed.lock().unwrap().is_empty());
+    // A key watched again the other way changes hands: looked at, it is told with no event.
+    watch.watch_looked(3, config.clone());
+    assert_eq!(next(), Ok(3), "the first look again");
+    let arms = events.armed.lock().unwrap().len();
+    std::fs::write(&config, "two, longer\n").unwrap();
+    assert_eq!(next(), Ok(3), "its change, looked at");
+    assert_eq!(
+        events.armed.lock().unwrap().len(),
+        arms,
+        "and not armed again"
+    );
+    drop(watch);
+
+    // The control: where listeners pin nothing, a looked-at file is armed as any other.
+    let events = Scripted::default();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch_looked(1, config.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(1),
+        "the first look"
+    );
+    assert_eq!(
+        events.armed.lock().unwrap().first(),
+        Some(&(1, config.clone()))
+    );
+    drop(watch);
 }
 
 type CommandTurn = (usize, Option<Duration>);
@@ -1541,7 +1788,7 @@ fn a_directory_key_whose_arm_takes_in_a_round_is_told_as_at_a_first_look() {
 }
 
 /// A directory key on the platform's own events, telling each step it is driven through.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn platform_directory_watch(key: u64, path: PathBuf) -> (FileWatch, mpsc::Receiver<u64>) {
     let (told, heard) = mpsc::channel();
     let watch = FileWatch::platform(
@@ -1564,7 +1811,7 @@ fn platform_directory_watch(key: u64, path: PathBuf) -> (FileWatch, mpsc::Receiv
 /// was missing, then an entry made, replaced and removed, each told. Each step is one call, so
 /// one burst: a tell left over from a step that came as two would answer the next step's.
 /// Each tell comes after the arm its burst took, so the arm hears the step after it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn the_platform_tells_a_directory_key_its_folder_made_and_its_entries_changed() {
     let dir = scratch("watch-directory-platform");
@@ -2042,7 +2289,7 @@ fn a_due_wait_polls_at_once_and_a_short_one_never_spins() {
 
 /// Which keys `events` hears touched by `write`, past anything arming left to hear. The wait is a
 /// hang detector for an event that must come.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn heard_for<E: FileEvents + ?Sized>(events: &mut E, write: impl FnOnce()) -> Vec<u64> {
     let mut touched = Vec::new();
     events.wait(Some(Duration::ZERO), &mut touched).unwrap();
@@ -2140,7 +2387,7 @@ fn directory_and_named_events_share_watches_without_broadening_file_arms() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn directory_events_refuse_a_missing_directory_and_a_regular_file() {
     let dir = scratch("aterm-directory-events-refused");
@@ -2425,7 +2672,7 @@ fn a_folder_made_while_its_watch_arms_hears_the_file_made_in_it() {
 /// A file whose folder, and that folder's folder, are not there yet is heard
 /// once all three are made: the watch listens on the nearest folder that is
 /// there and arms again lower as each one below it is made.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn the_platform_hears_a_file_made_in_folders_made_after_the_watch() {
     let dir = scratch("amacs-watch-folders");
@@ -2531,7 +2778,7 @@ fn inotify_routes_match_registration_scans_through_replacement_and_release() {
             }
             2 => {
                 // A file watch made again on the same file, on another, or let go.
-                let new = ((seed >> 8) % 4 != 0).then_some(wd);
+                let new = (!(seed >> 8).is_multiple_of(4)).then_some(wd);
                 let old = match new {
                     Some(wd) => files.insert(key, wd),
                     None => files.remove(&key),
@@ -2990,7 +3237,7 @@ fn a_linux_volume_reports_every_writer_unless_written_elsewhere() {
 }
 
 /// The platform says a key in scratch, on this machine's own disk, hears every writer.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn the_platform_hears_every_writer_on_a_local_volume() {
     let dir = scratch("watch-local-volume");

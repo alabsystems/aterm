@@ -808,6 +808,7 @@ const CLAUDE: (aterm_phase::Program, Build) = (aterm_phase::Program::Claude, Bui
 const GHOST: KeyFace = KeyFace {
     ghost: Some(false),
     tag: None,
+    tag_lit: false,
     mark: None,
 };
 
@@ -1404,6 +1405,7 @@ fn the_mark_cell_survives_every_rung() {
                 let face = KeyFace {
                     ghost: None,
                     tag: Some(tag),
+                    tag_lit: false,
                     mark: Some('\u{25cc}'),
                 };
                 let top = composed_with((program, build), run, switch, palette, face, &tail);
@@ -1439,6 +1441,7 @@ fn the_mark_cell_survives_every_rung() {
         KeyFace {
             ghost: None,
             tag: Some(tag_in(len)),
+            tag_lit: false,
             mark: Some('\u{25cc}'),
         },
         &tail,
@@ -1748,19 +1751,30 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
             ..GHOST
         },
     );
-    for cell in &lit.cells[at - (lit.col - run.col)..] {
+    // Lit, the ghost wears the glass's one hover from its first glyph to its last, the blank
+    // between them too, and neither end blank.
+    let ghost = &lit.cells[at - (lit.col - run.col)..];
+    for (k, cell) in ghost.iter().enumerate() {
         let underlined = cell.underline == aterm_core::terminal::UnderlineStyle::Single;
-        assert_eq!(underlined, cell.ch != ' ', "{:?}", cell.ch);
-        assert_eq!(cell.fg, rgb_of(top_glass(None).value()), "the value ink");
+        let inked = (1..GHOST_CELLS - 1).contains(&k);
+        assert_eq!(underlined, inked, "cell {k} {:?}", cell.ch);
+        if inked {
+            assert_eq!(cell.fg, rgb_of(top_glass(None).lit()), "the lit ink");
+            assert_eq!(cell.underline_color, Some(rgb_of(top_glass(None).lit())));
+            assert!(!cell.bold, "no weight changes");
+        }
     }
+    assert_eq!(ghost.len(), GHOST_CELLS);
     let tail = claude_tail();
     let len = 60;
     let run = tailed_run(len, &tail);
     let tag = tag_in(len);
+    // The key under the pointer or the keyboard's selection, a press of it in flight.
     let selected = KeyFace {
         ghost: None,
         tag: Some(tag),
-        mark: Some('\u{25b8}'),
+        tag_lit: true,
+        mark: Some('\u{25cc}'),
     };
     for (switch, palette) in [
         (LIT, Some(CardPalette::Land)),
@@ -1777,16 +1791,46 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
             s.cols.end - SWITCH_SLOT,
             "{what}: the zone's blank, then `\u{2500}\u{2500}`, then the switch"
         );
+        // Claude's own cells, but the tag's: lit, they wear the glass's one hover, the hit's
+        // columns exactly.
+        let lit = rgb_of(top_glass(palette).lit());
+        for (k, cell) in tail.iter().enumerate() {
+            let col = moved.0 - 1 + k;
+            let drawn = top.cells[col - top.col];
+            if (moved.0..moved.1).contains(&col) {
+                assert_eq!(drawn.ch, cell.ch, "{what}: the tag's glyph {k}");
+                assert_eq!(drawn.fg, lit, "{what}: the lit ink");
+                assert_eq!(
+                    (drawn.underline, drawn.underline_color),
+                    (aterm_core::terminal::UnderlineStyle::Single, Some(lit)),
+                    "{what}: one underline in the lit ink"
+                );
+                assert_eq!(drawn.bold, cell.bold, "{what}: no weight changes");
+            } else {
+                assert_eq!(drawn, *cell, "{what}: Claude's own cell {k}");
+            }
+        }
+        let rest = composed_with(
+            CLAUDE,
+            run,
+            Some(switch),
+            palette,
+            KeyFace {
+                tag_lit: false,
+                ..selected
+            },
+            &tail,
+        );
         for (k, cell) in tail.iter().enumerate() {
             assert_eq!(
-                top.cells[moved.0 - 1 + k - top.col],
+                rest.cells[moved.0 - 1 + k - rest.col],
                 *cell,
-                "{what}: Claude's own cell {k}"
+                "{what}: CONTROL: at rest every cell is Claude's own"
             );
         }
         assert_eq!(
             top.cells[moved.0 - 2 - top.col].ch,
-            '\u{25b8}',
+            '\u{25cc}',
             "{what}: the mark"
         );
         assert_eq!(
@@ -1841,7 +1885,7 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
         );
         assert_eq!(
             top.cells[tag.0 - 2 - top.col].ch,
-            '\u{25b8}',
+            '\u{25cc}',
             "{what}: the mark"
         );
     }
@@ -1853,7 +1897,7 @@ fn the_tag_is_redrawn_whole_left_of_the_switch() {
     );
     assert_eq!(
         unhosted.cells.last().map(|c| c.ch),
-        Some('\u{25b8}'),
+        Some('\u{25cc}'),
         "the `\u{2500}` before the tag's blank"
     );
     assert_eq!(
@@ -2228,7 +2272,7 @@ fn marks_write_only_the_run() {
             let face = match what {
                 "claude, KEY tag" => KeyFace {
                     tag: Some((cols - 11, cols - 2)),
-                    mark: Some('\u{25b8}'),
+                    mark: Some('\u{25cc}'),
                     ..face
                 },
                 _ => face,
@@ -2360,7 +2404,7 @@ fn the_bare_switch_reads_on_every_ground() {
                     .cells()
                     .iter()
                     .map(|&ch| {
-                        let c = switch_cell(ch, &paint, &inks, blank);
+                        let c = switch_cell(ch, ch != ' ', &paint, &inks, blank);
                         (format!("switch {ch:?}"), c)
                     })
                     .collect();
@@ -2454,7 +2498,7 @@ fn the_themed_switch_reads_on_every_ground() {
                 for hover in [HoverAt::None, HoverAt::Switch] {
                     let paint = SwitchPaint { hover, ..paint };
                     for &ch in switch_face(paint).cells().iter().filter(|&&ch| ch != ' ') {
-                        let c = switch_cell(ch, &paint, &inks, blank);
+                        let c = switch_cell(ch, ch != ' ', &paint, &inks, blank);
                         let k = reads(c.fg, c.bg);
                         if c.bg != blank.bg || k < floor {
                             lows.push(format!(
@@ -3789,8 +3833,9 @@ fn a_slot_never_shows_a_cut_form() {
 }
 
 /// Why the switch `top` laid from `key` reads as a box, if it does: a cell of it off the pane's
-/// ground, bold, or in an ink other than the label's quiet one (the lit one under the pointer),
-/// or a sprite of `layers` that writes a pixel of its cells.
+/// ground, bold, or in an ink other than the label's quiet one (the lit one under High
+/// Contrast; under the pointer its inked cells in the lit ink over one lit underline and its
+/// side blanks plain), or a sprite of `layers` that writes a pixel of its cells.
 fn boxed(
     key: &TopKey,
     top: &ComposedTop,
@@ -3805,13 +3850,30 @@ fn boxed(
         pack_rgb(key.run.rule.fg),
     );
     let inks = FaceInks::of(&glass);
-    let ink = if paint.forced || paint.hovered() {
-        inks.lit
-    } else {
-        inks.muted
-    };
+    let rest = if paint.forced { inks.lit } else { inks.muted };
     for c in s.cols.clone() {
         let cell = top.cells[c - top.col];
+        let lit = paint.hovered() && s.ink.contains(&c);
+        let ink = if lit { inks.lit } else { rest };
+        let line = (cell.underline, cell.underline_color);
+        let want = if lit {
+            (aterm_core::terminal::UnderlineStyle::Single, Some(inks.lit))
+        } else {
+            (aterm_core::terminal::UnderlineStyle::None, None)
+        };
+        if line != want {
+            return Err(format!(
+                "column {c} {:?}: underlined {line:?}, not {want:?}",
+                cell.ch
+            ));
+        }
+        let end = c == s.ink.start || c + 1 == s.ink.end;
+        if (end || !s.ink.contains(&c)) && (cell.ch == ' ') == end {
+            return Err(format!(
+                "column {c} {:?}: the ink runs from the first glyph to the last",
+                cell.ch
+            ));
+        }
         if cell.bg != key.blank.bg {
             return Err(format!(
                 "column {c} {:?}: a ground of its own, {:?}",

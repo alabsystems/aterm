@@ -165,9 +165,6 @@ fn check(scenario: i64, mutant: u8) -> State {
             if mutant == 4 {
                 return Err(Error::new("injected available refusal"));
             }
-            if mutant == 5 {
-                contributor.release_guard_for_test();
-            }
             match scenario {
                 12 => {
                     std::fs::rename(&path, path.with_extension("saved"))?;
@@ -206,6 +203,11 @@ fn check(scenario: i64, mutant: u8) -> State {
                 contributor.check_custody()?;
             }
             (validate.custody)()?;
+            if mutant == 5 {
+                // Lose custody after the final validation, immediately before
+                // the simulated persistence point.
+                contributor.release_guard_for_test();
+            }
             if present {
                 held = match PrivateLock::take(&path, "table.lock", Duration::ZERO, "probe") {
                     Ok(_) => false,

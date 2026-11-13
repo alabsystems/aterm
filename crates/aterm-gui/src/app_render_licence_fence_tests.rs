@@ -27,7 +27,7 @@ fn lit_app_writing() -> (App, std::io::PipeReader) {
 fn lit(mut app: App) -> App {
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.config.trail_sounds = Some(false);
     app.kitty_cursor_enabled_cache = None;

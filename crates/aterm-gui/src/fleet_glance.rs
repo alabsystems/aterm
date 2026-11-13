@@ -80,6 +80,12 @@ pub(crate) struct FleetMac {
     pub(crate) content: bool,
     /// It lets this Mac drive it (its header's `drive=1`, the step-in).
     pub(crate) drive: bool,
+    /// Its fleet access, the ceiling on what a driver may do there (its header's `access=`,
+    /// `aterm_types::fleet_access::FleetAccess::of_header`: a proven peer that sends none is an
+    /// aterm from before the lock, which enforces none). `None` where it was not read: this
+    /// Mac's copy, and a peer whose key is not proven, whose word it would be. Absent, never a
+    /// level.
+    pub(crate) access: Option<aterm_types::fleet_access::FleetAccess>,
     /// Its rows publish no `needs=`: an older aterm, listed and never counted.
     pub(crate) older: bool,
     /// Answered without proving a node key this Mac binds (`"unproven":true`, [`BookFacts::unbound_issuer`]).
@@ -439,6 +445,8 @@ pub(crate) enum Reach {
     NoRoute,
     /// `refused-here`: this Mac refused the connection.
     RefusedHere,
+    /// `lan-broker`: this process could not ask the local LAN broker to dial.
+    LanBroker,
     /// `reset`: the connection was reset.
     Reset,
     /// `connect`: another connect failure.
@@ -495,6 +503,7 @@ impl Reach {
             "no-answer" => Self::NoAnswer,
             "no-route" => Self::NoRoute,
             "refused-here" => Self::RefusedHere,
+            "lan-broker" => Self::LanBroker,
             "reset" => Self::Reset,
             "connect" => Self::Connect,
             "no-handshake" => Self::NoHandshake,
@@ -517,6 +526,7 @@ impl Reach {
             Self::NoAnswer => "no-answer",
             Self::NoRoute => "no-route",
             Self::RefusedHere => "refused-here",
+            Self::LanBroker => "lan-broker",
             Self::Reset => "reset",
             Self::Connect => "connect",
             Self::NoHandshake => "no-handshake",
@@ -805,6 +815,8 @@ fn mac_of(
             .or_else(|| host_word(host_part(dial))),
         content,
         drive: proven("drive") == Some("1"),
+        access: (!unproven)
+            .then(|| aterm_types::fleet_access::FleetAccess::of_header(field(instance, "access"))),
         older,
         unproven,
         sessions: Some(rows.len()),
@@ -1153,6 +1165,38 @@ impl Quiet {
     pub(crate) fn moved(&mut self) {
         self.every = POLL_EVERY;
     }
+}
+
+/// What a fresh read of `slot` reached at `now_ms`: its instant and the node ids of every Mac
+/// it reached, lowercased, a [`FleetMac::carried`] Mac among them (it missed this read, and its
+/// last rows still count): what a leased plain shell's request reads to know its requester's
+/// Mac left the fleet (`aterm_requests::Store::lease`), which only a Mac missing from it says.
+/// `None` where no fresh, whole read says: this Mac in no fleet (whose leases the lease's own
+/// clock ends), a read that failed, one older than [`COUNT_FRESH`] or ahead of the clock, or one
+/// with a Mac it reached and cannot name (no proven node, no header) or did not keep (past
+/// [`MACS_MAX`], which also drops carried Macs).
+pub(crate) fn answered_nodes(slot: &FleetSlot, now_ms: u64) -> Option<aterm_requests::Answered> {
+    if !slot.book.in_fleet || slot.error.is_some() {
+        return None;
+    }
+    let snapshot = slot.snapshot.as_ref().filter(|read| read.fresh(now_ms))?;
+    if snapshot.macs.len() >= MACS_MAX
+        || snapshot
+            .unanswered
+            .iter()
+            .any(|mac| matches!(mac.reason, Reach::PastCap | Reach::NoHeader))
+    {
+        return None;
+    }
+    let nodes = snapshot
+        .macs
+        .iter()
+        .map(|mac| mac.node.as_deref().map(str::to_ascii_lowercase))
+        .collect::<Option<_>>()?;
+    Some(aterm_requests::Answered {
+        read_at_ms: snapshot.read_at_ms,
+        nodes,
+    })
 }
 
 /// The shared slot the reader writes and the status item reads.
@@ -1604,7 +1648,7 @@ pub(crate) enum Kick {
         expect(dead_code, reason = "the menu-bar status item is macOS's")
     )]
     MenuOpening,
-    /// Read the Fleet Now: read whatever the last read's age.
+    /// The Fleet submenu's Refresh Now: read whatever the last read's age.
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -1663,7 +1707,7 @@ pub(crate) struct ReaderSeams {
     pub(crate) moved: Option<crate::network_moved::Watch>,
     /// Whether aterm's own LAN traffic can go out now ([`crate::network_moved::lan_answers`]: on
     /// macOS the root LAN broker answers): a read dials the fleet's Macs, so none goes by itself
-    /// (the tick, a menu, a move) while it cannot. A person's Read the Fleet Now still reads, and
+    /// (the tick, a menu, a move) while it cannot. A person's Refresh Now still reads, and
     /// its unanswered rows carry the broker's words. It is asked only for a read the tick would
     /// make ([`should_poll`]), right before it.
     pub(crate) lan: Box<dyn Fn() -> bool + Send>,

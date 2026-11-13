@@ -2231,18 +2231,19 @@ impl GroupDecisions {
         })
     }
 
-    fn pin_hold(&self, layout: &Layout) -> Option<Vec<String>> {
-        if self.any_tombstone || !self.wants_upgrade {
-            return None;
+    fn pin_hold(&self, layout: &Layout) -> std::io::Result<Option<Vec<String>>> {
+        if self.any_tombstone || !self.wants_upgrade || !self.all_current_valid {
+            return Ok(None);
         }
+        let pins = crate::pin::pinned_set(layout)?;
         let held: Vec<String> = self
             .decisions
             .iter()
             .map(|(m, _)| m)
-            .filter(|m| crate::pin::is_pinned(layout, m))
+            .filter(|m| pins.contains(*m))
             .cloned()
             .collect();
-        (!held.is_empty() && self.all_current_valid).then_some(held)
+        Ok((!held.is_empty()).then_some(held))
     }
 }
 
@@ -2288,8 +2289,20 @@ fn apply_group_txn_inner(
         );
     }
 
-    if let Some(held) = decided.pin_hold(layout) {
-        return (TxnOutcome::Pinned(held), BTreeMap::new());
+    match decided.pin_hold(layout) {
+        Ok(Some(held)) => return (TxnOutcome::Pinned(held), BTreeMap::new()),
+        Err(error) => {
+            return (
+                TxnOutcome::Aborted {
+                    failed: group.members.first().cloned().unwrap_or_default(),
+                    during_flip: false,
+                    why: error.to_string(),
+                    rolled_back: Vec::new(),
+                },
+                BTreeMap::new(),
+            );
+        }
+        Ok(None) => {}
     }
     let decisions = &decided.decisions;
     let (any_tombstone, all_current_valid) = (decided.any_tombstone, decided.all_current_valid);
@@ -3013,7 +3026,7 @@ pub(crate) fn planned_landing(
         if decided.any_tombstone
             || members.is_empty()
             || decided.retired_requires(index).is_some()
-            || decided.pin_hold(layout).is_some()
+            || !matches!(decided.pin_hold(layout), Ok(None))
         {
             return PlannedLanding::Nothing;
         }
@@ -3395,6 +3408,8 @@ pub fn rollback_returning_index(
             "{program} is not installed \u{2014} nothing to roll back (aterm pkg list shows what is)"
         ))
     })?;
+    let pins =
+        crate::pin::pinned_set(layout).map_err(|error| FlowError::Rollback(error.to_string()))?;
     let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
     let coherence_group = index
         .program(program)
@@ -3448,7 +3463,6 @@ pub fn rollback_returning_index(
         let build = active.get(m).copied()?;
         (!crate::gate::current_build_ok(ch, m, Some(build))).then(|| (m.clone(), build))
     });
-    let pins = crate::pin::pinned_set(layout);
     let held_by = if revoked_member.is_some() {
         Vec::new()
     } else {

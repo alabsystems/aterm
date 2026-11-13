@@ -1004,7 +1004,7 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
 
 fn trail_line(h: &Host) -> String {
     aterm_effects::cursor_glow::TrailStatus {
-        style_raw: "rainbow kitty",
+        style_raw: "rainbow",
         style: Some(GlowStyle::RainbowKitty),
         unknown: false,
         config_enabled: true,

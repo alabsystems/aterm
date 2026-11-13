@@ -41,7 +41,7 @@ impl Startup<'_> {
         let busy = take_initial_setup_slot().unwrap();
         let claim = (setup_io().claim_rerun)().unwrap().unwrap();
         let generation = SETUP_APPLY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-        let choice = begin_setup_choice(&self.setup.plan(), true, generation);
+        let choice = begin_setup_choice(&self.setup.plan(), true, generation, false);
         let under_way = UnderWay::new(choice.sent);
         let manual = InitialSetupAdmissionStopTest::restart(self.root).unwrap();
         let revision = manual.choose().unwrap();

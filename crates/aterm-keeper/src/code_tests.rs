@@ -66,6 +66,46 @@ fn the_sweep_removes_only_copies_whose_keeper_is_gone_and_ran() {
     }
 }
 
+/// On a volume that clones (APFS), `copy_tree` clones each file instead of writing its bytes, so
+/// a keeper's copy of its code (600 MB in a debug build) waits on no disk throughput and takes
+/// no free space: the copy carries its source's extended attribute, which no byte copy writes.
+/// Negative control: a byte copy of the same file does not carry it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_copied_file_is_a_clone_of_its_source() {
+    let scratch = crate::test_scratch_dir("clone");
+    let dir = scratch.path();
+    let source = dir.join("code");
+    std::fs::write(&source, vec![0x5a; 1 << 20]).expect("code");
+    let (held, _) = aterm_uds::regular_file::open(&source).expect("open the code");
+    if !aterm_uds::regular_file::clone_held(&held, &dir.join("probe")).expect("clone probe") {
+        aterm_spec::host::could_not_run("this scratch volume cannot clone a file");
+    }
+    let xattr = |args: &[&str], path: &Path| {
+        aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command("/usr/bin/xattr")
+                .args(args)
+                .arg(path),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .expect("xattr")
+    };
+    const NAME: &str = "com.aterm.keeper.clonetest";
+    let set = xattr(&["-w", NAME, "1"], &source);
+    assert!(set.status.success(), "{set:?}");
+    let carries = |path: &Path| xattr(&["-p", NAME], path).status.success();
+    let copy = dir.join("copy");
+    copy_tree(&source, &copy).expect("copy");
+    assert_eq!(
+        std::fs::read(&copy).expect("the copy"),
+        std::fs::read(&source).expect("the code")
+    );
+    assert!(carries(&copy), "the copy is no clone of its source");
+    let bytes = dir.join("bytes");
+    std::fs::write(&bytes, std::fs::read(&source).expect("the code")).expect("byte copy");
+    assert!(!carries(&bytes), "a byte copy carries the attribute");
+}
+
 /// An ad-hoc-signed bundle (Info.plist and a resource sealed, an argv0 alias as a symbolic
 /// link) copied by `copy_tree` passes `codesign --verify --strict`. Negative control: the copy
 /// with its sealed resource changed does not.

@@ -175,8 +175,10 @@ impl<C: Ctl> Session<'_, C> {
                 seq,
             );
             if let Some(host) = self.stall_host.clone() {
+                // A hung call's fact is the agent's alone: no record of it reaches a person.
                 if told
                     && !left.seeded
+                    && !matches!(left.row, LeftRow::Fact { .. })
                     && (armed(Fault::InformUngranted)
                         || granted.is_some_and(|(prompt, stuck)| left.row.granted(prompt, stuck)))
                 {

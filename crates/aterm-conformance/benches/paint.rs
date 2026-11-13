@@ -28,26 +28,16 @@ mod measuring {
     /// traverse is per mark, so a ~10-key mark spans 2-3 of 12 hue buckets by
     /// design; at 29 keys the arc completes and the floors have margin.
     const MATURE_RUN: &str = "t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k";
-    /// One word, short of a mature claim for the long styles.
-    const WORD: &str = "r,a,i,n,b,o,w,k,i,t,t,y";
-    /// Four words: a sustained high-band run (48 keys at four a second), the
-    /// only run that earns the flying head.
-    const SUSTAINED: &str = concat!(
-        "r,a,i,n,b,o,w,k,i,t,t,y,",
-        "r,a,i,n,b,o,w,k,i,t,t,y,",
-        "r,a,i,n,b,o,w,k,i,t,t,y,",
-        "r,a,i,n,b,o,w,k,i,t,t,y"
-    );
     const OFF_PHRASE: &str = "r,a,i,n,b,o,w,space,o,n";
 
-    /// A trail row: the companion-free `flying` style, no split.
+    /// A trail row: the `rainbow` theme with the pet off, no split.
     const fn trail(scene: Scene, keys: &'static str, expect: Expect, capture: Capture) -> PaintRow {
         PaintRow {
             scene,
             keys,
             expect,
             capture,
-            style: Style::Flying,
+            style: Style::Rainbow,
             companion: None,
             split: None,
             reach: None,
@@ -172,13 +162,6 @@ mod measuring {
             PaintRow {
                 style: Style::Default,
                 companion: Some(Companion::Pet),
-                ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
-            },
-        ),
-        (
-            "explicit_underline_spelling_paints_an_underline_ribbon",
-            PaintRow {
-                style: Style::Underline,
                 ..trail(
                     Scene::Prompt,
                     MATURE_RUN,
@@ -188,23 +171,13 @@ mod measuring {
             },
         ),
         (
-            "explicit_tall_short_word_paints_four_hues",
-            PaintRow {
-                style: Style::Tall,
-                ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
-            },
-        ),
-        (
-            "explicit_tall_short_word_control_has_no_ribbon_when_effect_is_off",
-            PaintRow {
-                style: Style::Off,
-                ..trail(
-                    Scene::Prompt,
-                    WORD,
-                    Expect::EffectOff,
-                    Capture::UnpinnedFocused,
-                )
-            },
+            "the_rainbow_spelling_paints_the_underline_ribbon",
+            trail(
+                Scene::Prompt,
+                MATURE_RUN,
+                Expect::Ink,
+                Capture::UnpinnedFocused,
+            ),
         ),
         (
             "cold_output_paints_literally_nothing_for_a_companion_free_style",
@@ -216,18 +189,6 @@ mod measuring {
             ),
         ),
         (
-            "flying_style_sustained_typing_earns_and_paints_the_flying_kitty",
-            PaintRow {
-                companion: Some(Companion::Cat),
-                ..trail(
-                    Scene::Prompt,
-                    SUSTAINED,
-                    Expect::Ink,
-                    Capture::UnpinnedFocused,
-                )
-            },
-        ),
-        (
             "alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink",
             trail(
                 Scene::ColdStreamer,
@@ -235,27 +196,6 @@ mod measuring {
                 Expect::TrailDark,
                 Capture::PinnedVideo,
             ),
-        ),
-        (
-            "the_owners_rainbow_kitty_spelling_carries_the_resident_pet",
-            PaintRow {
-                style: Style::Classic,
-                companion: Some(Companion::Pet),
-                ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
-            },
-        ),
-        (
-            "the_owners_spelling_never_draws_two_companions_in_one_frame",
-            PaintRow {
-                style: Style::Classic,
-                companion: Some(Companion::Pet),
-                ..trail(
-                    Scene::Prompt,
-                    SUSTAINED,
-                    Expect::Ink,
-                    Capture::UnpinnedFocused,
-                )
-            },
         ),
         (
             "split_window_typing_paints_the_rainbow_body_in_the_focused_pane",
@@ -283,21 +223,8 @@ mod measuring {
             },
         ),
         (
-            "the_tall_body_stands_within_its_reach_above_the_typed_row",
-            PaintRow {
-                reach: Some(Reach::Tall),
-                ..trail(
-                    Scene::Plane,
-                    MATURE_RUN,
-                    Expect::Ink,
-                    Capture::UnpinnedFocused,
-                )
-            },
-        ),
-        (
             "the_underline_body_stands_within_its_reach_above_the_typed_row",
             PaintRow {
-                style: Style::Underline,
                 reach: Some(Reach::Underline),
                 ..trail(
                     Scene::Plane,

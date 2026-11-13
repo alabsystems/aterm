@@ -212,6 +212,9 @@ enum CarrySaid {
     /// The break parks on a go-ahead its limit of acts already answered
     /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_spent`]): nothing more goes.
     Refused,
+    /// The write's duty is not this loop's to carry out ([`Session::duty_withheld`]): another
+    /// supervisor holds it, or the host's word on who does could not be read.
+    Duty(Scope),
 }
 
 impl CarryWatch {
@@ -570,15 +573,16 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// CRUISE NEVER PARKS AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK (owner ruling
-    /// 2026-10-26): where nothing else went at the break that began at `at` (`line_gone`: a
+    /// CRUISE NEVER PARKS AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK:
+    /// where nothing else went at the break that began at `at` (`line_gone`: a
     /// wake's, the host's, the stuck fact's or the door's line), it has settled
     /// ([`background_settle`]) and the carry is due ([`BackgroundCarries::due`]), types
     /// [`BACKGROUND_CARRY`] under Cruise, after every guard a line at a break passes but the
     /// person's own exchange and a manager's wait, which hold no Cruise session: a brake (a stall,
     /// a limit episode, an act or line untaken, the wake's settle, a credits hold), a person
     /// typing or another driver's hand, a halt, a draft or unread input, a session nobody asked
-    /// anything, the memory wall, the API's route down, and the host's withhold. Off and Land type
+    /// anything, the memory wall, the API's route down, the host's withhold, and the write's
+    /// duty where another supervisor holds it ([`Self::duty_withheld`]). Off and Land type
     /// nothing here, by the mode the loop last read and again by the one read just before the
     /// write ([`Self::autopilot_at_busy`]). A `/compact`'s continuation owed is no act untaken:
     /// it is typed in the carry's place, as the policy's act
@@ -746,6 +750,33 @@ impl<C: Ctl> Session<'_, C> {
                 ),
             ),
         };
+        // The write is a semantic duty's, as a point's act is (`Session::turn_end_execute`): the
+        // continuation owed goes under its own where its rule names one; any other line goes
+        // under the questions duty where the break's turn ended on a prose question (the rest
+        // the break is published at, `ScreenReader::background_rest_seen`), since the line is
+        // then typed over a question that duty's holder answers, and under the turn end's
+        // otherwise. A window's host refuses a write that names no duty, and one whose duty
+        // another supervisor holds.
+        let scope = {
+            let reader = self.reader(&screen.rows);
+            let asked = reader
+                .background_rest_seen(&screen.rows, reader.runs(screen.title.as_deref()))
+                == Some(Phase::Question);
+            let rest = if asked {
+                Scope::Questions
+            } else {
+                Scope::TurnEnd
+            };
+            act.as_ref()
+                .and_then(duty::known_action_scope)
+                .unwrap_or(rest)
+        };
+        let _duty = self.duty_guard(scope);
+        if self.duty_withheld(scope) {
+            self.turn_end.go_ahead_unwritten();
+            self.carry_said(seq, CarrySaid::Duty(scope), review);
+            return Ok(false);
+        }
         let point = self.turn_of(screen.clone());
         let keyed = self.cruise_carry.keyed;
         let written = self.type_text_written(&point, &text, rule, review)?;
@@ -964,6 +995,21 @@ impl<C: Ctl> Session<'_, C> {
         self.sync_needs_under(screen, cfg, review)
     }
 
+    /// WHETHER A WRITE UNDER `scope` IS WITHHELD FROM THIS LOOP, read from the authority the duty's
+    /// guard just observed ([`Session::duty_guard`]): on a window's hosted loop
+    /// (`builtin_duties`), another supervisor holds that duty, one holds the whole session, or
+    /// the observation did not read. Such a write is refused by the host however often it is
+    /// tried, so the carry holds and says so once ([`CarrySaid::Duty`]) in place of a refused
+    /// write at every look. An ordinary loop keeps its claim protocol and is never withheld here.
+    fn duty_withheld(&self, scope: Scope) -> bool {
+        self.setup.builtin_duties
+            && match self.builtin_authority {
+                BuiltinAuthority::Complement { .. } => !self.builtin_authority.keeps(scope),
+                BuiltinAuthority::Unknown | BuiltinAuthority::Exclusive => true,
+                BuiltinAuthority::Legacy | BuiltinAuthority::Unsupported => false,
+            }
+    }
+
     /// Journal why a due carry was not typed, once a change.
     fn carry_said(&mut self, seq: u64, said: CarrySaid, review: &mut dyn Review) {
         if self.cruise_carry.said == Some(said) {
@@ -979,6 +1025,7 @@ impl<C: Ctl> Session<'_, C> {
             ),
             CarrySaid::Budget => "held:continue_per_hour".to_string(),
             CarrySaid::Refused => format!("recovering:{GO_AHEAD_REFUSED}"),
+            CarrySaid::Duty(scope) => format!("held:duty:{}", scope.word()),
         };
         review.note(&format!("DEFERRED seq={seq} {RULE_BACKGROUND} {why}"));
     }

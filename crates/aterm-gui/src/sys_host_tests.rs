@@ -8,6 +8,9 @@ use aterm_vitals::model::{
     ClusterView, CoreView, CpuView, MemSample, MemView, Pressure, ScopeView,
 };
 use aterm_vitals::sys::json::contract_violations;
+// A fixture's absolute path on every host (`C:` before it on Windows, where `/Users//a` is
+// relative and so no home `under=` could name).
+use crate::test_host::abs;
 
 fn live_snapshot() -> Snapshot {
     let mut reader = crate::vitals_host::Reader::new(std::sync::Arc::default());
@@ -74,6 +77,7 @@ fn gathered() -> Gathered {
             window_sessions: vec![0],
             cwd: None,
             fg_pgid: None,
+            request: None,
         },
         tabs: vec![TabFact {
             key: 0,
@@ -1133,6 +1137,27 @@ fn without_a_walker_the_seam_names_each_panes_folder_and_claims_no_size() {
     assert_eq!(roots[1].tab, Some(2));
 }
 
+/// AN ASK OF A WALKER NOT STARTED DEMANDS ITS SCOPES: a headless instance starts its walker
+/// only once a scope is demanded, so `sys disk` there demands what it asked at look pace, and
+/// the loop starts the walker for the next ask to read its sizes. The walker is a private one
+/// (`diskwalk_host::Shared`), demanded at a set instant. NEGATIVE CONTROLS: a walker nobody
+/// asked is not demanded, and an ask of no scope demands nothing.
+#[test]
+fn an_ask_of_a_walker_not_started_demands_what_it_asked() {
+    use crate::diskwalk_host::{DiskScope, WalkerState};
+    let walk = crate::diskwalk_host::Shared::new();
+    let now = Instant::now();
+    assert_eq!(walk.walker_state(), WalkerState::NotStarted);
+    assert!(!walk.demanded(now), "nobody has asked");
+    assert!(!ask_unstarted(&walk, &[], now));
+    assert!(!walk.demanded(now), "an ask of no scope");
+    let panes = [pane_fact(1, 1, 1)];
+    let ask = disk_ask(ScopeArg::Aterm, &panes, &[1], Some(1), true);
+    assert!(ask_unstarted(&walk, &ask.asked(), now));
+    assert!(walk.demanded(now), "the walker is demanded");
+    assert!(ask.asked().contains(&DiskScope::Aterm));
+}
+
 /// A board of two tabs: Tab 1's panes 1 and 2 at one repository, its build mirror walking
 /// behind its prior figure; Tab 2's pane 3 at home (too broad, named) and pane 4 on another
 /// machine; aterm's state folder; an opt-in inside a protected folder.
@@ -1184,9 +1209,10 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
             asked: None,
         })
     };
-    let repo = PathBuf::from("/Users//a/w/repo");
-    let mirror =
-        PathBuf::from("/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/w/repo");
+    let repo = PathBuf::from(abs("/Users//a/w/repo"));
+    let mirror = PathBuf::from(abs(
+        "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/w/repo",
+    ));
     let tab_pane = |key: u64, from: LiveFrom, live: &str| PaneView {
         key,
         from: Some(from),
@@ -1196,7 +1222,7 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
         project: Some(repo.clone()),
         why: None,
         members: vec![
-            claim("/Users//a/w/repo", RootKind::Project),
+            claim(&abs("/Users//a/w/repo"), RootKind::Project),
             claim(&mirror.display().to_string(), RootKind::Build),
         ],
     };
@@ -1230,8 +1256,8 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
             },
         ],
         panes: BTreeMap::from([
-            (1, tab_pane(1, LiveFrom::Fg, "/Users//a/w/repo/crates")),
-            (2, tab_pane(2, LiveFrom::Shell, "/Users//a/w/repo")),
+            (1, tab_pane(1, LiveFrom::Fg, &abs("/Users//a/w/repo/crates"))),
+            (2, tab_pane(2, LiveFrom::Shell, &abs("/Users//a/w/repo"))),
             (
                 3,
                 PaneView {
@@ -1239,7 +1265,7 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
                     from: Some(LiveFrom::Shell),
                     exe: Some("zsh".into()),
                     host: None,
-                    live: Some(PathBuf::from("/Users//a")),
+                    live: Some(PathBuf::from(abs("/Users//a"))),
                     project: None,
                     why: Some(PaneWhy::Refused(aterm_diskwalk::Refusal::TooBroad)),
                     members: Vec::new(),
@@ -1260,15 +1286,15 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
             ),
         ]),
         own_claims: vec![claim(
-            "/Users//a/Library/Application Support/aterm",
+            &abs("/Users//a/Library/Application Support/aterm"),
             RootKind::Own,
         )],
-        opt_in: vec![claim("/Users//a/Documents/x", RootKind::OptIn)],
+        opt_in: vec![claim(&abs("/Users//a/Documents/x"), RootKind::OptIn)],
         pools: [
-            "/Users//a/w/repo",
-            &mirror.display().to_string(),
-            "/Users//a/Library/Application Support/aterm",
-            "/Users//a/Documents/x",
+            abs("/Users//a/w/repo"),
+            mirror.display().to_string(),
+            abs("/Users//a/Library/Application Support/aterm"),
+            abs("/Users//a/Documents/x"),
         ]
         .iter()
         .map(|p| (PathBuf::from(p), Pool::Same))
@@ -1280,7 +1306,7 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
             (
                 repo.clone(),
                 rec(
-                    "/Users//a/w/repo",
+                    &abs("/Users//a/w/repo"),
                     RootState::Complete,
                     Some(done(
                         9_000,
@@ -1296,17 +1322,17 @@ fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
             ),
             (mirror.clone(), Arc::new(walking)),
             (
-                PathBuf::from("/Users//a/Library/Application Support/aterm"),
+                PathBuf::from(abs("/Users//a/Library/Application Support/aterm")),
                 rec(
-                    "/Users//a/Library/Application Support/aterm",
+                    &abs("/Users//a/Library/Application Support/aterm"),
                     RootState::Complete,
                     Some(done(2_000, Vec::new())),
                 ),
             ),
             (
-                PathBuf::from("/Users//a/Documents/x"),
+                PathBuf::from(abs("/Users//a/Documents/x")),
                 rec(
-                    "/Users//a/Documents/x",
+                    &abs("/Users//a/Documents/x"),
                     RootState::NotMeasured(aterm_diskwalk::Refusal::Protected),
                     None,
                 ),
@@ -1345,7 +1371,7 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
     let reports = sys_reports(&board, &ask);
     let (roots, t) = disk_view(&board, &reports, &ask, &[], None, now);
     assert_eq!(roots.len(), 2, "{roots:#?}");
-    assert_eq!(roots[0].path, "/Users//a/w/repo");
+    assert_eq!(roots[0].path, abs("/Users//a/w/repo"));
     assert_eq!(roots[0].kinds, ["project"]);
     assert_eq!(roots[0].keys, [1, 2], "the tab's panes");
     assert_eq!(roots[0].tab, Some(1));
@@ -1385,7 +1411,7 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
     let (roots, t) = disk_view(&board, &reports, &aterm, &[], None, now);
     let protected = roots
         .iter()
-        .find(|r| r.path == "/Users//a/Documents/x")
+        .find(|r| r.path == abs("/Users//a/Documents/x"))
         .expect("the opt-in's row");
     assert_eq!(protected.size, RootSize::NotMeasured("protected"));
     assert!(protected.scopes.is_empty(), "an opt-in is in no scope");
@@ -1481,22 +1507,32 @@ fn sys_disk_scope_lines_and_json_agree_with_the_bar() {
             (Some(2), 2, Some("osc7"), Some("elsewhere"), false),
         ]
     );
-    let line = t.panes[0].text(true, Some("/Users//a"), &aterm_vitals::sys::pct, &|e| {
-        aterm_vitals::sys::exe_word(e).to_owned()
-    });
+    let line = t.panes[0].text(
+        true,
+        Some(abs("/Users//a").as_str()),
+        &aterm_vitals::sys::pct,
+        &|e| aterm_vitals::sys::exe_word(e).to_owned(),
+    );
     assert_eq!(
         line,
-        "pane tab=1 pane=1 from=fg exe=zsh live=/Users//a/w/repo/crates project=/Users//a/w/repo member=yes"
+        format!(
+            "pane tab=1 pane=1 from=fg exe=zsh live={} project={} member=yes",
+            abs("/Users//a/w/repo/crates"),
+            abs("/Users//a/w/repo")
+        )
     );
-    let hidden = t.panes[0].text(false, Some("/Users//a"), &aterm_vitals::sys::pct, &|e| {
-        aterm_vitals::sys::exe_word(e).to_owned()
-    });
+    let hidden = t.panes[0].text(
+        false,
+        Some(abs("/Users//a").as_str()),
+        &aterm_vitals::sys::pct,
+        &|e| aterm_vitals::sys::exe_word(e).to_owned(),
+    );
     assert_eq!(
         hidden,
         "pane tab=1 pane=1 from=fg exe=zsh under=home member=yes"
     );
     for p in &t.panes {
-        let j = p.json(true, Some("/Users//a"), &|e| {
+        let j = p.json(true, Some(abs("/Users//a").as_str()), &|e| {
             aterm_vitals::sys::exe_word(e).to_owned()
         });
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
@@ -1820,4 +1856,37 @@ fn a_request_with_no_selector_needs_owner() {
         "usage"
     );
     assert_eq!(untargeted_left("status", "left", false), Ok(None));
+}
+
+/// `scope=request` finds the request that owns the target's tab, its tabs here and its totals,
+/// each unread figure `None`; a tab no request owns has none, which `cmd_sys` refuses.
+#[test]
+fn scope_request_reads_the_request_owning_the_tab() {
+    let folder = aterm_tempfile::tempdir().expect("a folder");
+    crate::requests_host::set_dir_for_test(Some(folder.path().to_path_buf()));
+    let store = crate::session_store::new_store();
+    let tab = crate::session_store::test_handle(61);
+    let (key, sid) = (tab.local_id, tab.sid.as_str().to_owned());
+    store.write().unwrap().register(tab);
+    // NEGATIVE first: no request owns it.
+    assert_eq!(request_facts(&store, &sid), None);
+    let id = crate::requests_host::opened_for_test(
+        true,
+        "87be5228c0ffee0087be5228c0ffee00",
+        "m114",
+        "fleet:87be5228:-",
+        crate::requests_host::Made::Shell,
+        &sid,
+    );
+    let facts = request_facts(&store, &sid).expect("its request");
+    assert_eq!(
+        (facts.id.as_str(), facts.sessions, facts.tabs, facts.claims),
+        (id.as_str(), vec![key], 1, 0)
+    );
+    assert_eq!(
+        (facts.cpu_s, facts.peak_mb, facts.written_mb),
+        (None, None, None),
+        "an unread tree is unread, never 0"
+    );
+    crate::requests_host::set_dir_for_test(None);
 }

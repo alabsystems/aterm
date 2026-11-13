@@ -205,6 +205,7 @@ mod models_account_usage_observation;
 mod models_account_worker_environment;
 mod models_account_workflow_scope;
 mod models_agent_verdict;
+mod models_claude_build_read;
 mod models_claude_cold_admission;
 mod models_claude_live_admission;
 mod models_claude_restore_auth;
@@ -434,6 +435,7 @@ pub use models_account_workflow_scope::{
     account_workflow_runtime_model, account_workflow_scope_model,
 };
 pub use models_agent_verdict::claude_idle_at_composer_model;
+pub use models_claude_build_read::claude_build_read_model;
 pub use models_claude_cold_admission::claude_cold_admission_model;
 pub use models_claude_live_admission::claude_live_admission_model;
 pub use models_claude_restore_auth::claude_restore_auth_model;
@@ -504,10 +506,12 @@ pub use models_supervise::{
     supervisor_claim_model, supervisor_condition_resume_model, supervisor_credits_hold_liveness,
     supervisor_credits_hold_model, supervisor_cruise_model, supervisor_decline_keys_model,
     supervisor_focus_choice_model, supervisor_host_turn_end_model, supervisor_land_liveness,
-    supervisor_land_model, supervisor_outage_wait_model, supervisor_question_answer_model,
-    supervisor_question_text_model, supervisor_stall_remedy_model, supervisor_survey_press_model,
-    supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
-    upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
+    supervisor_land_model, supervisor_model_switch_liveness, supervisor_model_switch_model,
+    supervisor_outage_wait_model, supervisor_question_answer_model, supervisor_question_text_model,
+    supervisor_stall_remedy_model, supervisor_survey_press_model, supervisor_turn_end_model,
+    supervisor_usage_wall_liveness, supervisor_usage_wall_model, upgrade_attended_turn_end_model,
+    upgrade_quiet_settle_turn_end_model, upgrade_refused_turn_end_model,
+    upgrade_settle_turn_end_model,
 };
 pub use models_supervise_accounts::{
     supervisor_account_rotation_liveness, supervisor_account_rotation_model,

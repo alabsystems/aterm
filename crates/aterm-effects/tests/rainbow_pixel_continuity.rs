@@ -1786,13 +1786,7 @@ fn build_render_input(term: &Terminal, rows: usize, cols: usize, dark: bool) -> 
 
 #[test]
 fn pixel_continuity_with_resident_pet_flying_kitty_sparkle_words_and_classic_rainbow() {
-    let styles = [
-        ("rainbow kitty pet", true),
-        ("rainbow kitty flying", true),
-        ("rainbow", true),
-        ("rainbow", false),
-        ("phaser", true),
-    ];
+    let styles = [("rainbow", true), ("rainbow", false), ("phaser", true)];
     let text = "the quick cat and fox shared state in lab ";
     let mut failures = Vec::new();
 

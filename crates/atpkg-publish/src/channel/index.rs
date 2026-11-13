@@ -341,8 +341,8 @@ fn describe(p: &Program) -> String {
 /// The index `delta` makes of `base`, signed by `machine_id` under `roster_seq`, valid until `valid_until` (already held to the clock).
 ///
 /// An ALab harness (`atpkg::harness`) pins like any table row: every client installs every
-/// program the index lists, a harness included (owner ruling 2026-10-27,
-/// `docs/DESIGN-harness-repos-2026-10-24.md` §11 D45), so no reader is left to keep one out.
+/// program the index lists, a harness included
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D45), so no reader is left to keep one out.
 /// # Errors
 /// A refusal for a downgrade, a repo switch under a build not above the head's pin or the head's cell on a target it keeps, an unknown or vendor-direct program, an overlay naming an unpinned program, a yank of an unpinned program that is not vendor-direct, a lift of an absent yank, a lowered floor not asked for, or a roster older than the head's.
 pub fn plan(

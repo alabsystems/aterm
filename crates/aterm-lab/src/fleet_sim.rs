@@ -662,6 +662,12 @@ impl Sim {
 
         checks.push(self.non_fleet_verbs_refused(self.world.insts[pick(1)].port)?);
 
+        // Before `facts_only`: a drive needs the member at `allow = "content"`.
+        checks.append(&mut self.graduation(pick(3))?);
+        if stop::check().is_err() {
+            return Ok(checks);
+        }
+
         checks.push(self.facts_only(pick(2))?);
         if stop::check().is_err() {
             return Ok(checks);
@@ -700,6 +706,191 @@ impl Sim {
                 "the member never served the rotated secret".to_owned()
             },
         ));
+        Ok(checks)
+    }
+
+    /// The graduation of fleet access on member `i`, which lets every fleet Mac drive it
+    /// (`fleet allow drive --all`) and so leaves only its level between the reader and its
+    /// sessions: at Read Only (where it starts) a spawn and a typed line are refused and the
+    /// reads answer; at Read and Write the line is typed and the spawn refused; at Full Access
+    /// both work; and a drop back to Read Only leaves the started worker running and readable.
+    /// The member's level is its scratch world's: `aterm fleet access`, run in that world. It
+    /// ends at Read Only with its grant taken back (`fleet allow content`) and the worker closed.
+    fn graduation(&self, i: usize) -> Result<Vec<Check>, Fail> {
+        let inst = &self.world.insts[i];
+        let host = format!("127.0.0.1:{}", inst.port);
+        let boot = format!("@{}", inst.boot_sid());
+        let home = format!("cwd={}", inst.home().display());
+        let member = |args: &[&str]| -> Result<String, Fail> {
+            let out = self.world.aterm_in(&inst.root, args, None);
+            if out.code == 0 {
+                Ok(out.stdout)
+            } else {
+                Err(Fail::die(format!(
+                    "m{i:02}: aterm {args:?} exited {}: {}{}",
+                    out.code,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                )))
+            }
+        };
+        let drive = |args: &[&str]| {
+            let mut all = vec!["--host", host.as_str()];
+            all.extend_from_slice(args);
+            self.read(&all)
+        };
+        let one_line = |text: &str| crate::util::one_line(text.trim(), 400);
+        let said = |out: &world::Out| one_line(&format!("{} {}", out.stdout, out.stderr));
+        // A refusal by the lock, and by nothing else: the level in force and the one it needs.
+        let locked = |out: &world::Out, level: &str, needs: &str| {
+            out.code == 1
+                && said(out).contains(&format!("ERR denied access={level} needs={needs}: "))
+        };
+        // The member's survey as the wire carries it to a fleet reader: whether it answered, its
+        // header (which says its fleet access to every reader) and how many sessions it shows.
+        let seen = || {
+            let rows = probe::with_proved(inst.port, &self.secret, FleetOp::Survey, |s, _| {
+                let head = probe::ask(s, "survey")?;
+                let rows: usize = head
+                    .strip_prefix("OK ")
+                    .and_then(|rest| rest.split(' ').next()?.parse().ok())
+                    .ok_or_else(|| format!("survey: {head}"))?;
+                (0..rows)
+                    .map(|_| probe::read_line(s).map_err(|e| format!("read: {e}")))
+                    .collect::<Result<Vec<String>, String>>()
+            });
+            match rows {
+                Ok(Ok(rows)) => {
+                    let head = rows
+                        .iter()
+                        .find(|l| l.starts_with("instance "))
+                        .cloned()
+                        .unwrap_or_default();
+                    let sessions = rows.iter().filter(|l| l.starts_with("session ")).count();
+                    (!head.is_empty(), head, sessions)
+                }
+                Ok(Err(e)) | Err(e) => (false, e, 0),
+            }
+        };
+        let at = |head: &str, level: &str| {
+            head.split_whitespace()
+                .any(|t| t == format!("access={level}"))
+        };
+
+        let began = member(&["fleet", "access"])?;
+        member(&["fleet", "allow", "drive", "--all"])?;
+        let granted = crate::wait_until(world::HANG, || drive(&[&boot, "status"]).code == 0);
+        if !granted {
+            return Ok(vec![Check::new(
+                "fleet access: the graduation",
+                false,
+                format!(
+                    "the control failed: m{i:02}'s `allow drive --all` never let the reader \
+                     read it: {}",
+                    said(&drive(&[&boot, "status"]))
+                ),
+            )]);
+        }
+        let mut checks = Vec::new();
+
+        let (read_ok, head, before) = seen();
+        let spawn = drive(&["spawn", &home]);
+        let line = drive(&[&boot, "send", "x"]);
+        let (_, _, after) = seen();
+        checks.push(Check::new(
+            "fleet access: a member starts Read Only, where a granted driver's spawn and typed \
+             line are refused and its reads answer",
+            began.starts_with("read ")
+                && read_ok
+                && at(&head, "read")
+                && locked(&spawn, "read", "full")
+                && locked(&line, "read", "write")
+                && after == before,
+            format!(
+                "m{i:02} `fleet access`: {} / header: {head} / spawn: {} / send: {} / sessions \
+                 {before} → {after}",
+                one_line(&began),
+                said(&spawn),
+                said(&line)
+            ),
+        ));
+
+        member(&["fleet", "access", "write"])?;
+        let (_, head, _) = seen();
+        let line = drive(&[&boot, "send", "x"]);
+        let erased = drive(&[&boot, "key", "backspace"]);
+        let spawn = drive(&["spawn", &home]);
+        let (_, _, after) = seen();
+        checks.push(Check::new(
+            "fleet access: at Read and Write the line is typed and the spawn is refused",
+            at(&head, "write")
+                && line.code == 0
+                && erased.code == 0
+                && locked(&spawn, "write", "full")
+                && after == before,
+            format!(
+                "header: {head} / send exited {}: {} / spawn: {} / sessions {before} → {after}",
+                line.code,
+                said(&line),
+                said(&spawn)
+            ),
+        ));
+
+        member(&["fleet", "access", "full"])?;
+        let (_, head, _) = seen();
+        let spawn = drive(&["spawn", &home]);
+        let worker = spawn
+            .stdout
+            .split_whitespace()
+            .nth(1)
+            .filter(|sid| spawn.code == 0 && sid.starts_with("s-"))
+            .map(|sid| format!("@{sid}"));
+        let line = worker
+            .as_deref()
+            .map(|worker| drive(&[worker, "send", "x"]));
+        let (_, _, after) = seen();
+        checks.push(Check::new(
+            "fleet access: at Full Access the spawn starts a worker and a line is typed into it",
+            at(&head, "full")
+                && worker.is_some()
+                && line.as_ref().is_some_and(|out| out.code == 0)
+                && after == before + 1,
+            format!(
+                "header: {head} / spawn: {} / send: {} / sessions {before} → {after}",
+                said(&spawn),
+                line.as_ref().map_or_else(|| "not sent".to_owned(), said)
+            ),
+        ));
+
+        member(&["fleet", "access", "read"])?;
+        let (_, head, left) = seen();
+        let status = worker.as_deref().map(|worker| drive(&[worker, "status"]));
+        let line = worker
+            .as_deref()
+            .map(|worker| drive(&[worker, "send", "x"]));
+        checks.push(Check::new(
+            "fleet access: a drop to Read Only leaves the started worker running and readable, \
+             and takes no more from the driver",
+            at(&head, "read")
+                && status.as_ref().is_some_and(|out| out.code == 0)
+                && line
+                    .as_ref()
+                    .is_some_and(|out| locked(out, "read", "write"))
+                && left == after,
+            format!(
+                "header: {head} / status exited {} / send: {} / sessions {after} → {left}",
+                status.as_ref().map_or(-1, |out| out.code),
+                line.as_ref().map_or_else(|| "not sent".to_owned(), said)
+            ),
+        ));
+        // The member as the later phases expect it: no drive grant, and the worker closed by
+        // its own Mac.
+        member(&["fleet", "allow", "content"])?;
+        if let Some(worker) = worker.as_deref() {
+            self.world
+                .ctl_ok(inst, &[worker, "close"])
+                .map_err(Fail::die)?;
+        }
         Ok(checks)
     }
 
@@ -1294,15 +1485,16 @@ impl Machine {
     }
 }
 
-/// `debug build` or `release build`, by the aterm's place under `target/`.
+/// `debug build` or `release build`, by the artifact's profile directory.
 fn build_kind(aterm: &Path) -> &'static str {
-    let s = aterm.to_string_lossy();
-    if s.contains("/target/debug/") {
-        "a debug build"
-    } else if s.contains("/target/release/") {
-        "a release build"
-    } else {
-        "a build"
+    match aterm
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+    {
+        Some("debug") => "a debug build",
+        Some("release") => "a release build",
+        _ => "a build",
     }
 }
 
@@ -1630,35 +1822,5 @@ fn want_of(world: &World) -> Vec<WantInstance> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_size_floor_is_four_machines() {
-        let a = |v: &[&str]| parse(&v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
-        assert!(a(&["--n", "3"]).is_err());
-        assert_eq!(a(&["--n", "4"]).map(|a| a.n).ok(), Some(4));
-        assert!(a(&["--record"]).is_ok_and(|a| a.record && a.n == 30));
-    }
-
-    #[test]
-    fn what_a_record_keeps_is_the_lines_between_its_markers() {
-        let text = "x\n| at | head |\n<!-- invocations -->\n| a | 1 |\n| b | 2 |\n\
-                    <!-- /invocations -->\n| run | 1 |\n<!-- notes -->\n- found\n\n\
-                    <!-- /notes -->\n";
-        assert_eq!(between(text, INVOCATIONS), ["| a | 1 |", "| b | 2 |"]);
-        assert_eq!(between(text, NOTES), ["- found", ""]);
-        assert!(between("no markers\n| a |\n", INVOCATIONS).is_empty());
-        assert!(between("<!-- notes -->\n- a\n", NOTES).is_empty());
-    }
-
-    /// Verify that `tty::one_line` produces every expected substring in [`HOSTILE_ESCAPED`].
-    #[test]
-    fn the_hostile_words_escape_to_the_forms_the_check_looks_for() {
-        let escaped = aterm_codec::tty::one_line(fixture::HOSTILE_SAID, 160);
-        for form in HOSTILE_ESCAPED {
-            assert!(escaped.contains(form), "{form} in {escaped}");
-        }
-        assert!(!escaped.contains("trust=human"), "{escaped}");
-    }
-}
+#[path = "fleet_sim_tests.rs"]
+mod tests;

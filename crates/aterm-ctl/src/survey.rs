@@ -7,6 +7,9 @@ use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
+#[path = "survey_release.rs"]
+mod release;
+
 /// Maximum characters in an instance header line.
 pub(crate) const HEADER_CHARS: usize = 160;
 /// The most characters a session's line carries.
@@ -77,6 +80,8 @@ pub struct FleetAsk<'a> {
 /// One fleet peer's answer to a [`FleetAsk`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerSurvey {
+    /// Identity verified on this connection; never inferred from the requested name or header.
+    pub authenticated: Option<AuthenticatedPeer>,
     /// Peer display label (`host` or `host:port`).
     pub label: String,
     /// Its `survey` reply's lines after `OK <n>`, or why there are none.
@@ -97,10 +102,20 @@ pub struct PeerSurvey {
     pub reason: Option<&'static str>,
 }
 
+/// The fleet transport's verified identity, retained for an in-process reader.
+/// This is an observation of the authenticated connection, not a portable proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPeer {
+    /// The node ID proved by the responder.
+    pub node: String,
+    /// The complete public key under which it proved that node ID.
+    pub key: [u8; 32],
+}
+
 /// Failure category for a fleet peer query ([`fleet_note`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PeerFault {
-    /// Answered, or failed for a peer-specific reason.
+    /// Answered, or failed without evidence of a shared network cause.
     #[default]
     Other,
     /// Not dialled (unresolvable name, missing host, or non-LAN address).
@@ -262,6 +277,8 @@ pub(crate) struct HostReply {
 /// One `survey` reply, parsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Survey {
+    /// Bounded per-hour GitHub quota groups; empty from peers predating attribution.
+    pub(crate) github_rate: Vec<Fields>,
     /// The `instance` header's fields, decoded.
     pub(crate) header: Fields,
     /// One record per session, in the server's order.
@@ -278,6 +295,9 @@ pub(crate) struct Survey {
     /// came are that many; `None` from an aterm that says nothing of them, one that read none yet
     /// (`repos=-`), or a reply whose lines a cap cut: unknown, never none.
     pub(crate) repos: Option<Vec<Fields>>,
+    /// Observed native release rows, not a complete inventory: old or capped replies have no
+    /// count or support marker. No usable row leaves this unknown, never an empty proof.
+    pub(crate) release_lines: Option<Vec<release::ReleaseLine>>,
 }
 
 /// A record's `key=value` fields in wire order, values decoded.
@@ -325,6 +345,10 @@ pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
             accounts.push(Fields::of(line));
         } else if line.starts_with("repo ") {
             repos.push(Fields::of(line));
+        } else if line.starts_with("github_rate ") {
+            survey.github_rate.push(Fields::of(line));
+        } else if let Some(release) = release::ReleaseLine::parse(line) {
+            survey.release_lines.get_or_insert_default().push(release);
         }
     }
     // Rows count only as many as the header says came: a reply cap drops every extra line at
@@ -363,7 +387,7 @@ enum Class {
     /// Ended unfinished within the last [`NEWLY_DONE_MS`]: a `failed` task, or one that exited
     /// before it finished (`task_conclusion=failed`). Never counted as done.
     Failed,
-    /// Completed within the last [`NEWLY_DONE_MS`].
+    /// Completed within the last [`NEWLY_DONE_MS`]: its task, or the turn of an agent with none.
     Done,
     /// Any other agent.
     Agent,
@@ -410,7 +434,9 @@ fn class_of(s: &Fields) -> Class {
     {
         Class::Failed
     } else if (matches!(task, Some("done" | "exited")) && recent("task_ms"))
-        || (agent == Some("idle") && recent("agent_ms"))
+        // An idle agent with an open task waits on its own work (a background command), which
+        // `await task` does not count as done either.
+        || (agent == Some("idle") && matches!(task, None | Some("-")) && recent("agent_ms"))
     {
         Class::Done
     } else if agent.is_some() {
@@ -570,25 +596,20 @@ fn fit_place(label: &str, cap: usize) -> String {
     format!("{}{tail}", fit(&name, cap.saturating_sub(n(&tail)).max(1)))
 }
 
-/// An account row's label as a survey carries and shows it: itself, or, where it holds an `@`
-/// (an email, which no row's label is: `accounts.toml`'s grammar refuses one), its first two
-/// characters and `…@…`, so no email crosses the fleet or reaches a screen.
-#[must_use]
-pub fn masked_label(label: &str) -> String {
-    if !label.contains('@') {
-        return label.to_owned();
-    }
-    let head: String = label.chars().take_while(|c| *c != '@').take(2).collect();
-    format!("{head}\u{2026}@\u{2026}")
+/// Whether `name` has an address's shape: one `@` between a non-empty local part and a domain
+/// with a dot, and no space or control character.
+fn is_address(name: &str) -> bool {
+    name.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && domain.contains('.') && !domain.contains('@')
+    }) && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// A label a reply's account row names, as [`accounts_line`] shows it: a peer's that is no plain
-/// word is `?`, but where it is an email, masked.
+/// The name a reply's account row is shown by, as [`accounts_line`] shows it: its address where
+/// the row sends one (`email=`), else its label (`id=`). A peer's name that is neither a plain
+/// word nor an address is `?`.
 fn label_shown(label: &str, remote: bool) -> String {
-    if !remote || is_word(label) {
-        shown(&masked_label(label), 32)
-    } else if label.contains('@') {
-        shown(&masked_label(label), 8)
+    if !remote || is_word(label) || is_address(label) {
+        shown(label, 48)
     } else {
         "?".to_owned()
     }
@@ -618,12 +639,24 @@ pub(crate) fn effective_pct7(row: &Fields, at_ms: Option<u64>) -> Option<u64> {
     row.number("pct7")
 }
 
-/// What one account row says, for [`accounts_line`]: its label (`id=`), and its windows where it
+/// What one account row says, for [`accounts_line`]: its address (`email=`) else its label
+/// (`id=`), and its windows where it
 /// can take a session, else why not (`walled 3h` from the instance's own clock, `at_ms=`, which a
 /// wall that ended by then no longer stands on: its rows may be read up to a minute before it
 /// answers).
+/// What is left of a window at a whole percent `used`, as every surface a person reads says an
+/// account's share (`N% left`, like a battery: `docs/DESIGN-account-discovery-2026-11-09.md`
+/// decision 8). The wire and the rows' fields keep the use.
+pub(crate) fn left_pct(used: u64) -> u64 {
+    100 - used.min(100)
+}
+
 fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
-    let label = label_shown(row.get("id").unwrap_or("?"), remote);
+    let name = row
+        .get("email")
+        .filter(|email| !email.is_empty() && *email != "-")
+        .or_else(|| row.get("id"));
+    let label = label_shown(name.unwrap_or("?"), remote);
     let condition = row.get("condition");
     if row.get("enrolled") == Some("0") || condition == Some("not-enrolled") {
         return format!("{label} not enrolled");
@@ -647,7 +680,7 @@ fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
         (row.number("pct5"), "5h"),
     ] {
         if let Some(pct) = pct {
-            said.push_str(&format!(" {window} {pct}%"));
+            said.push_str(&format!(" {window} {}% left", left_pct(pct)));
             figures = true;
         }
     }
@@ -678,7 +711,7 @@ fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
 
 /// The one line a block's header is followed by where its instance lists account rows: each
 /// pool's rows in the order it sent them, then each pool it could not read (`  accounts: claude
-/// main 7d 42% 5h 10%, work-2 walled 3h · codex codex-1 not enrolled · grok unread`), cut to
+/// main 7d 58% left 5h 90% left, w2 walled 3h · codex x1 not enrolled · grok unread`), cut to
 /// [`LINE_CHARS`]; `None` where it lists none or said nothing of them.
 fn accounts_line(survey: &Survey, remote: bool) -> Option<String> {
     let rows = survey.accounts.as_ref()?;
@@ -1054,9 +1087,11 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     if let Some(n) = s.number("ctx_left_pct") {
         line.push_str(&format!(" ctx_left={n}%"));
     }
+    // The row's fields are the use (`usage_5h_pct`); the line says what is left, as the context
+    // figure beside it does.
     for (key, label) in [("usage_5h_pct", "5h"), ("usage_7d_pct", "7d")] {
         if let Some(n) = s.number(key) {
-            line.push_str(&format!(" {label}={n}%"));
+            line.push_str(&format!(" {label}_left={}%", left_pct(n)));
         }
     }
     if let Some(ms) = s.number("human_ms").filter(|&ms| ms < NEWLY_DONE_MS) {
@@ -1088,6 +1123,31 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
         if whole {
             kept = line.chars().count();
         }
+    }
+    // A tab another Mac or an agent asked for names its request's requester and why, so the
+    // first read says what the tab is for (the requests design's §8): kept whole, the why cut
+    // to the room the line has left; at `facts` (`request_why=1`) without the why.
+    if s.get("request").is_some() {
+        let head = s.get("request_from").map_or_else(
+            || " request".to_owned(),
+            |from| format!(" request from {}", shown(from, 24)),
+        );
+        let part = match s.get("request_why").filter(|why| *why != "1") {
+            Some(why) => {
+                let left = LINE_CHARS.saturating_sub(line.chars().count() + head.chars().count());
+                format!(
+                    "{head} \"{}\"",
+                    shown(why, left.saturating_sub(3).clamp(16, 64))
+                )
+            }
+            None => head,
+        };
+        let before = LINE_CHARS.saturating_sub(part.chars().count());
+        if line.chars().count() > before {
+            line = fit(&line, before);
+        }
+        line.push_str(&part);
+        kept = line.chars().count();
     }
     let about = match agent {
         Some(_) => s.get("user_title").or_else(|| s.get("title")),
@@ -1254,6 +1314,8 @@ fn work_said(s: &Fields) -> Option<String> {
 
 struct Block {
     header: String,
+    /// Native release-holder observations, individually folded under a text budget.
+    releases: Vec<String>,
     /// Its home and checkout lines ([`home_lines`]): under the budget they fold after the shells
     /// and before any agent loses a word, each a line of its own, the checkout lines before any
     /// instance's home line, counted on the closing line.
@@ -1279,6 +1341,8 @@ struct Blocks {
 }
 
 struct Shown {
+    /// Number of release observations shown per block.
+    releases: Vec<usize>,
     /// Number of session lines shown per block (remaining entries fold into `+N`).
     lines: Vec<usize>,
     /// Per block, how many of its home lines show, from the first.
@@ -1301,6 +1365,11 @@ impl Shown {
             }
         }
         Shown {
+            releases: blocks
+                .items
+                .iter()
+                .map(|b| b.as_ref().map_or(0, |b| b.releases.len()))
+                .collect(),
             lines: blocks.items.iter().map(|b| entries(b).len()).collect(),
             homes: blocks
                 .items
@@ -1323,6 +1392,7 @@ impl Shown {
 
     fn filled(blocks: &Blocks, order: &[Unit], n: usize) -> Shown {
         let mut shown = Shown::all(blocks, Class::Agent, EXCERPT_CHARS);
+        shown.releases.iter_mut().for_each(|n| *n = 0);
         shown.lines.iter_mut().for_each(|n| *n = 0);
         shown.homes.iter_mut().for_each(|n| *n = 0);
         shown
@@ -1334,19 +1404,21 @@ impl Shown {
                 Unit::Line(b, e) => shown.lines[b] = shown.lines[b].max(e + 1),
                 Unit::Excerpt(b, e, j) => shown.excerpts[b][e] |= 1 << j,
                 Unit::Home(b, k) => shown.homes[b] = shown.homes[b].max(k + 1),
+                Unit::Release(b, k) => shown.releases[b] = shown.releases[b].max(k + 1),
             }
         }
         shown
     }
 }
 
-/// One step of budget allocation: a session line, a single excerpt line, or a block's `k`th home
-/// line (with every one before it).
+/// One step of budget allocation: a session line, a single excerpt line, or a block's `k`th
+/// release or home line (with every one of that kind before it).
 #[derive(Clone, Copy)]
 enum Unit {
     Line(usize, usize),
     Excerpt(usize, usize, usize),
     Home(usize, usize),
+    Release(usize, usize),
 }
 
 #[cfg(test)]
@@ -1397,6 +1469,10 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
         let Ok(block) = block else {
             continue;
         };
+        for k in 0..block.releases.len() {
+            // Retained old cuts are metadata, after every pressing agent and its excerpts.
+            keyed.push(((3, 0, k, 0, b), Unit::Release(b, k)));
+        }
         // Each home line is a unit of one line, so a long checkout list strands no room: every
         // instance's home line first, then the checkout lines a round at a time.
         if home_whole() {
@@ -1598,8 +1674,31 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
                     header.push('\n');
                     header.push_str(&line);
                 }
+                for row in &survey.github_rate {
+                    header.push('\n');
+                    header.push_str("  github_rate ");
+                    if let Some(data) = row.get("data") {
+                        header.push_str(data);
+                    } else {
+                        header.push_str(
+                            &row.0
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        );
+                    }
+                }
                 Ok(Block {
                     header,
+                    releases: survey
+                        .release_lines
+                        .iter()
+                        .flatten()
+                        .map(|row| {
+                            row.summary(release_observer_node(reply, survey), reply.unproven)
+                        })
+                        .collect(),
                     home: home_lines(survey),
                     entries,
                 })
@@ -1610,6 +1709,14 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
     Blocks {
         items,
         fleet: replies.iter().any(|reply| reply.remote),
+    }
+}
+
+fn release_observer_node<'a>(reply: &'a HostReply, survey: &'a Survey) -> Option<&'a str> {
+    if reply.remote {
+        reply.node.as_deref()
+    } else {
+        survey.header.get("node")
     }
 }
 
@@ -1625,6 +1732,7 @@ pub(crate) fn render_full(replies: &[HostReply], own: Option<&str>) -> String {
 fn render(blocks: &Blocks, shown: &Shown) -> String {
     let mut out = String::new();
     let (mut cut_sessions, mut cut_excerpts, mut cut_homes) = (0usize, 0usize, 0usize);
+    let mut cut_releases = 0;
     for (b, block) in blocks.items.iter().enumerate() {
         let block = match block {
             Ok(block) => block,
@@ -1636,6 +1744,12 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
         };
         out.push_str(&block.header);
         out.push('\n');
+        let releases = shown.releases[b].min(block.releases.len());
+        for line in &block.releases[..releases] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        cut_releases += block.releases.len() - releases;
         let homes = shown.homes[b].min(block.home.len());
         for line in &block.home[..homes] {
             out.push_str(line);
@@ -1670,6 +1784,12 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
             cut_excerpts,
             cut_homes,
             blocks.fleet,
+        ));
+    }
+    if cut_releases > 0 {
+        out.push_str(&format!(
+            "{LEFT_OUT_LEAD}{cut_releases} release observations; {} for more\n",
+            remedies(blocks.fleet)
         ));
     }
     out
@@ -1771,8 +1891,6 @@ pub(crate) fn render_sid(replies: &[HostReply], sid: &str, own: Option<&str>) ->
                 for row in value.split('\n') {
                     out.push_str(&format!("  {key}: {}\n", shown(row, EXCERPT_CHARS * 4)));
                 }
-            } else if key == "account" {
-                out.push_str(&format!("  account: {}\n", shown(&masked_label(value), 64)));
             } else {
                 out.push_str(&format!("  {key}: {}\n", shown(value, EXCERPT_CHARS * 4)));
             }
@@ -1847,28 +1965,21 @@ pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> St
 
 /// Render replies as a single-line JSON array (`--json`).
 pub(crate) fn render_json(replies: &[HostReply]) -> String {
-    // Each record as an object, its `masked` key (a session's `account`, an account row's `id`)
-    // as `masked_label` shows it, so a peer's email never reaches the page.
-    let object_masking = |fields: &Fields, masked: &str| {
+    // Each record as an object.
+    let object = |fields: &Fields| {
         let members: Vec<String> = fields
             .0
             .iter()
             .map(|(k, v)| {
-                let v = if k == masked {
-                    masked_label(v)
-                } else {
-                    v.clone()
-                };
                 format!(
                     "\"{}\":\"{}\"",
                     aterm_codec::json::escape(k),
-                    aterm_codec::json::escape(&v)
+                    aterm_codec::json::escape(v)
                 )
             })
             .collect();
         format!("{{{}}}", members.join(","))
     };
-    let object = |fields: &Fields| object_masking(fields, "account");
     let hosts: Vec<String> = replies
         .iter()
         .map(|reply| {
@@ -1884,16 +1995,13 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
             );
             match &reply.answer {
                 Ok(survey) => format!(
-                    "{{{head},\"instance\":{},\"accounts\":{},\"repos\":{},\"sessions\":[{}]}}",
+                    "{{{head},\"instance\":{},\"accounts\":{},\"repos\":{},\"github_rate\":[{}],\"release_lines\":{},\"sessions\":[{}]}}",
                     object(&survey.header),
                     survey.accounts.as_ref().map_or_else(
                         || "null".to_owned(),
                         |rows| format!(
                             "[{}]",
-                            rows.iter()
-                                .map(|row| object_masking(row, "id"))
-                                .collect::<Vec<_>>()
-                                .join(",")
+                            rows.iter().map(object).collect::<Vec<_>>().join(",")
                         )
                     ),
                     survey.repos.as_ref().map_or_else(
@@ -1902,6 +2010,20 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                             "[{}]",
                             rows.iter().map(object).collect::<Vec<_>>().join(",")
                         )
+                    ),
+                    survey.github_rate.iter().map(object).collect::<Vec<_>>().join(","),
+                    survey.release_lines.as_ref().map_or_else(
+                        || "null".to_owned(),
+                        |rows| format!(
+                            "[{}]",
+                            rows.iter()
+                                .map(|row| row.json(
+                                    release_observer_node(reply, survey),
+                                    reply.unproven,
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
                     ),
                     survey
                         .sessions
@@ -2081,6 +2203,7 @@ pub(crate) fn read_survey(
                 return Printed::refused(format!("ERR survey: {}", refused.why), code);
             }
             Err(refused) => vec![PeerSurvey {
+                authenticated: None,
                 label: "the fleet".to_string(),
                 answer: Err(refused.why),
                 fault: PeerFault::NotDialled,
@@ -2177,8 +2300,9 @@ fn place_now() -> Option<aterm_netplace::Place> {
 /// The note a fleet read ends with, given this Mac's network place `place`:
 ///
 /// - a sandbox that refused every connect is still said as the sandbox;
-/// - away from the ALab LAN (on another network), a read no dialled peer answered says where this
-///   Mac is (`aterm_netplace::words::survey_note`), not nothing (the timeouts of a hotspot);
+/// - only explicit route/network failures may use this Mac's remembered network place
+///   (`aterm_netplace::words::survey_note`); a specific refusal or unknown failure retains its own
+///   cause, even where that place says this Mac was away;
 /// - a no-route the on-link rule placed (`aterm_netplace::words::on_link`: off this network, or
 ///   on it, that member's own, off the link now, which its row says) needs no note; only one with
 ///   no address to judge keeps [`fleet_note`]'s, which is the rest's note.
@@ -2193,10 +2317,15 @@ pub(crate) fn fleet_note_at(
     }
     let on_link =
         place.map(|place| aterm_netplace::words::on_link(place, peers.iter().map(dial_of)));
-    let dialled = peers.iter().any(|peer| peer.fault != PeerFault::NotDialled);
-    let answered = peers.iter().any(|peer| peer.answer.is_ok());
-    if dialled
-        && !answered
+    let mut dialled = peers
+        .iter()
+        .filter(|peer| peer.fault != PeerFault::NotDialled)
+        .peekable();
+    let network_failed = dialled.peek().is_some()
+        && dialled.all(|peer| {
+            peer.answer.is_err() && matches!(peer.fault, PeerFault::NoRoute | PeerFault::NoNetwork)
+        });
+    if network_failed
         && let Some(away) = place.and_then(|place| aterm_netplace::words::survey_note(place, words))
     {
         return Some(away);
@@ -2311,6 +2440,23 @@ fn local_replies(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<HostReply>,
         .collect())
 }
 
+/// The program, model and account of session `sid`'s row in the survey of the one local instance
+/// at `sock` (the account masked as survey shows it), each `None` where the row names none or no
+/// row answers.
+pub(crate) fn session_identity(sock: &str, sid: &str) -> [Option<String>; 3] {
+    let Ok(replies) = local_replies(Some(sock), None) else {
+        return Default::default();
+    };
+    replies
+        .into_iter()
+        .filter_map(|reply| reply.answer.ok())
+        .flat_map(|survey| survey.sessions)
+        .find(|row| row.get("sid") == Some(sid))
+        .map_or_else(Default::default, |row| {
+            ["program", "model", "account"].map(|key| row.get(key).map(str::to_owned))
+        })
+}
+
 fn local_targets(
     sock: Option<&str>,
     pid: Option<u32>,
@@ -2367,3 +2513,7 @@ mod brief;
 #[cfg(test)]
 #[path = "survey_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "survey_release_tests.rs"]
+mod release_tests;

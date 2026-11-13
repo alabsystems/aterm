@@ -31,6 +31,9 @@ fn a_row_reads_back_as_it_was_written_its_values_escaped() {
     row.why = Some("tests red: 3 of 40".to_owned());
     row.checked = Some("0123456789ab@origin/main".to_owned());
     row.accept_ms = Some(9);
+    row.owed = vec!["kind=task a b\n".to_owned()];
+    row.paying = vec!["kind=task c\n".to_owned(), "kind=task d=e\n".to_owned()];
+    row.was_told = Some("ok.exit".to_owned());
     let line = row.line();
     assert!(
         !line.contains("a b"),
@@ -582,7 +585,7 @@ fn a_spawned_row_keeps_the_brief_by_digest_never_its_text() {
         Placed {
             node: Some("ab".repeat(16)),
             host: Some("m100".to_owned()),
-            account: Some("ab…@…".to_owned()),
+            account: Some("m22".to_owned()),
         },
         Some("EW-24".to_owned()),
         (&args, task),

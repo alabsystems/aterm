@@ -3,7 +3,13 @@
 
 use super::*;
 
+// It observes this process as the vendor's (`native_act::Process::observe`), which reads a
+// process group and session: Unix facts no Windows process has.
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "observes a process group and session, which only Unix has"
+)]
 fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload() {
     use super::super::native_act::{
         self, ClaimOutcome, ColdBilling, ColdIntent, NativePlan, Reply, Request,

@@ -45,7 +45,11 @@ struct Fixture {
     record: PathBuf,
 }
 
+/// The profile of a Claude Code that is signed in (`atpkg::vendor_direct::Login::profile`).
+const SIGNED_IN: &str = r#"{"oauthAccount":{"emailAddress":"person@example.com"}}"#;
+
 impl Fixture {
+    /// A home where Claude Code has run and is signed in.
     fn new(case: &str) -> Self {
         let root = aterm_tempfile::Builder::new()
             .prefix(&format!("atpkg-agent-warm-{case}-"))
@@ -55,6 +59,7 @@ impl Fixture {
         std::fs::create_dir_all(&home).unwrap();
         let home = home.canonicalize().unwrap();
         std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude.json"), SIGNED_IN).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         let fx = Self {
             record: root.path().join("record"),
@@ -339,6 +344,7 @@ fn the_users_own_config_home_reaches_the_warm() {
     fx.install_claude(2_001_280, 0);
     let config = fx.root.path().join("claude-config");
     std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(".claude.json"), SIGNED_IN).unwrap();
     let config = config.to_str().unwrap();
     silent_success(
         &fx.warm_build_with(2_001_280, &[("CLAUDE_CONFIG_DIR", config)]),
@@ -370,6 +376,47 @@ fn the_users_own_config_home_reaches_the_warm() {
     ] {
         assert!(env.lines().any(|v| v == want), "{want}: {env}");
     }
+}
+
+/// A Claude Code that is not signed in is not run, from a shell of the person's or from the
+/// window (where their login shell would be asked first: its rc file leaves a mark if it runs).
+/// Control: the same warm once the profile names an account runs both.
+#[test]
+fn a_signed_out_claude_runs_neither_the_program_nor_the_login_shell() {
+    let fx = Fixture::new("signed-out");
+    fx.install_claude(2_001_280, 0);
+    let profile = fx.home.join(".claude.json");
+    std::fs::write(&profile, "{}").unwrap();
+    let rc_ran = fx.root.path().join("rc-ran");
+    std::fs::write(
+        fx.home.join(".bash_profile"),
+        format!(": > '{}'\n", rc_ran.display()),
+    )
+    .unwrap();
+    let prefix = fx.prefix.to_str().unwrap().to_string();
+    let from_window = || {
+        fx.command(&["claude", &prefix, "2001280"], &[("SHELL", "/bin/bash")])
+            .env_remove("ATPKG_BIN")
+            .output()
+            .expect("run the dev atpkg")
+    };
+    silent_success(&fx.warm_build(2_001_280), "signed out, from a shell");
+    silent_success(&from_window(), "signed out, from the window");
+    assert!(fx.recorded("args").is_none(), "signed out: nothing ran");
+    assert!(
+        !rc_ran.exists(),
+        "signed out: the login shell was not asked"
+    );
+    let outcomes: Vec<String> = fx
+        .warm_lines()
+        .iter()
+        .map(|l| l.get("outcome").unwrap().to_string())
+        .collect();
+    assert_eq!(outcomes, ["signed-out", "signed-out"]);
+    std::fs::write(&profile, SIGNED_IN).unwrap();
+    silent_success(&from_window(), "the control");
+    assert!(fx.recorded("args").is_some(), "signed in: the program ran");
+    assert!(rc_ran.exists(), "signed in: the login shell was asked");
 }
 
 #[test]

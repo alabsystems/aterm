@@ -45,6 +45,8 @@ use crate::membership_log::{
     Body, EpochAudience, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn, Undo,
     audience_tag, entries::OpenedAudienceEntries,
 };
+use std::os::fd::{AsFd, BorrowedFd};
+use std::sync::Arc;
 
 /// What [`remove_member`] or [`remove_seat`] did.
 #[derive(Debug)]
@@ -523,13 +525,36 @@ fn removal_target(
             })
             .collect::<Vec<_>>();
         let matched_active = matching(who, &candidates);
-        if let Some((_, first_rec, _, _)) = matched_active.first()
-            && matched_active.len() > 1
-            && matched_active
+        // A Mac's writer successors carry its name (`super::successor::Lineages`), so its name
+        // names them too: the word names the Mac, whose removal takes them out with it
+        // ([`draft_removal`]). A successor alone is named by its own label or join code.
+        let below = super::successor::Lineages::of(log).under(
+            &matched_active
+                .iter()
+                .chain(&matching(who, &removed))
+                .map(|(actor, ..)| *actor)
+                .collect(),
+        );
+        let macs: Vec<_> = matched_active
+            .iter()
+            .copied()
+            .filter(|(actor, ..)| !below.contains(actor))
+            .collect();
+        if macs.len() < matched_active.len()
+            && let [(actor, recipient, label, _)] = macs.as_slice()
+        {
+            if actor == me {
+                return Err(Error::new("a Mac does not remove itself"));
+            }
+            return Ok((*actor, *recipient, label.clone()));
+        }
+        if let Some((_, first_rec, _, _)) = macs.first()
+            && macs.len() > 1
+            && macs
                 .iter()
                 .all(|(actor, rec, _, _)| rec == first_rec && actor != me)
             && let Some(&&(actor, recipient, ref label, _)) =
-                matched_active.iter().max_by_key(|(actor, _, _, _)| {
+                macs.iter().max_by_key(|(actor, _, _, _)| {
                     (
                         membership
                             .get(actor)
@@ -541,7 +566,11 @@ fn removal_target(
         {
             return Ok((actor, recipient, label.clone()));
         }
-        let matched_removed = matching(who, &removed);
+        // The removed Mac's writer successors, out with it, carry its name too.
+        let matched_removed: Vec<_> = matching(who, &removed)
+            .into_iter()
+            .filter(|(actor, ..)| !below.contains(actor))
+            .collect();
         if matched_active.is_empty()
             && let Some((_, first_rec, label, _)) = matched_removed.first()
             && matched_removed
@@ -799,24 +828,32 @@ fn cut_tables_first(paths: &Paths, target: Target<'_>) {
     let Ok(Some(log)) = trusted_store(paths).map(|s| s.and_then(|s| s.log().cloned())) else {
         return;
     };
-    let target = match target {
-        Target::Actor(actor) => actor,
+    let membership = log.membership();
+    let (target, heirs) = match target {
+        Target::Actor(actor) => (actor, BTreeSet::new()),
         Target::Word(_) | Target::Seat(_) => {
             let Ok(Some((me, _, _))) = log_entries::open_local_member_signer(paths, &log) else {
                 return;
             };
-            let Ok((target, _, _)) = named_target(&log, target, &me) else {
+            let Ok((target, recipient, _)) = named_target(&log, target, &me) else {
                 return;
             };
-            target
+            (target, heirs_of(&log, &membership, &target, &recipient))
         }
     };
-    let pass = if log.membership().removal(&target).is_none() {
+    let pass = if membership.removal(&target).is_none() {
         CutPass::BeforeRemove
     } else {
         CutPass::Share
     };
     cut(paths, &target, pass);
+    // The Mac's writer successors are the writers its tables have now: a person's removal
+    // takes their seats out too ([`draft_removal`]), so their tables are cut with them.
+    for heir in heirs {
+        if membership.contains(&heir) {
+            cut(paths, &heir, CutPass::BeforeRemove);
+        }
+    }
 }
 
 /// [`cut_tables_first`] for a vault revocation or retirement, which names its targets by
@@ -871,6 +908,37 @@ pub fn cut_own_removals(paths: &Paths) -> usize {
         .filter(|(_, by)| *by == me)
         .map(|(member, _)| cut(paths, &member, CutPass::Repair))
         .sum()
+}
+
+/// The writer successors a person's removal of the Mac whose seat is `target` (its age recipient
+/// `recipient`) takes out with it: every seat below the Mac's own seats, the one named and each
+/// other seat of its recipient, in or out, in a succession the log holds
+/// (`super::successor::Lineages`). A successor is the same Mac's writer under an age identity of
+/// its own, on the same disk: left in, it would be wrapped every epoch minted after the removal.
+fn heirs_of(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    target: &MemberId,
+    recipient: &Recipient,
+) -> BTreeSet<MemberId> {
+    let mut seats = BTreeSet::from([*target]);
+    seats.extend(
+        membership
+            .members()
+            .iter()
+            .filter(|(_, member)| member.binding.recipient() == *recipient)
+            .map(|(actor, _)| *actor),
+    );
+    seats.extend(
+        membership
+            .removed()
+            .keys()
+            .filter(|actor| seat_of(log, actor).is_some_and(|(seat, _, _)| seat == *recipient))
+            .copied(),
+    );
+    let mut heirs = super::successor::Lineages::of(log).under(&seats);
+    heirs.retain(|heir| !seats.contains(heir));
+    heirs
 }
 
 /// What a draft signed, beside what it reports to the person (its refusal, where it refused).
@@ -963,8 +1031,31 @@ fn draft_removal(
             "this Mac cannot open the membership log's epochs",
         ));
     };
-    let entry = log
-        .membership()
+    let membership = log.membership();
+    // A person's removal also takes out the Mac's writer successors ([`heirs_of`]): `gone` is
+    // every age recipient the batch removes, the Mac's and each successor seat's.
+    let heirs: Vec<(MemberId, Recipient)> = if by_person {
+        let heirs = heirs_of(&log, &membership, &target, &recipient);
+        if heirs.contains(&actor) {
+            return refuse(Error::new(format!(
+                "this Mac's seat is a writer successor of {label}, and a person's removal takes                  a Mac's successors out with it: a Mac does not remove itself"
+            )));
+        }
+        heirs
+            .into_iter()
+            .filter_map(|heir| {
+                membership
+                    .get(&heir)
+                    .map(|member| (heir, member.binding.recipient()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let gone: BTreeSet<Recipient> = std::iter::once(recipient)
+        .chain(heirs.iter().map(|(_, recipient)| *recipient))
+        .collect();
+    let entry = membership
         .get(&target)
         .map(|m| m.entry)
         .ok_or_else(|| Error::new("that Mac is no member"))?;
@@ -1035,10 +1126,11 @@ fn draft_removal(
         .get(&Audience::Everyone)
         .cloned()
         .unwrap_or_default();
-    let membership = log.membership();
     let is_other_active_member = |m: &crate::membership_log::Member| {
         let rec = m.binding.recipient();
-        rec != recipient && !log.recipient_is_removed(&rec) && !membership.member_node_removed(m)
+        !gone.contains(&rec)
+            && !log.recipient_is_removed(&rec)
+            && !membership.member_node_removed(m)
     };
     let other_active_labels: BTreeSet<String> = membership
         .members()
@@ -1100,7 +1192,7 @@ fn draft_removal(
     for (member_actor, member) in membership
         .members()
         .iter()
-        .filter(|(_, m)| m.binding.recipient() == recipient)
+        .filter(|(_, m)| gone.contains(&m.binding.recipient()))
     {
         target_actors.insert(*member_actor);
         if crate::membership_log::is_label(&member.label) && !held_by_other_active(&member.label) {
@@ -1115,7 +1207,7 @@ fn draft_removal(
     }
     for removed_actor in membership.removed().keys() {
         if let Some((rec, seat_label, _)) = seat_of(&log, removed_actor)
-            && rec == recipient
+            && gone.contains(&rec)
         {
             target_actors.insert(*removed_actor);
             if crate::membership_log::is_label(&seat_label) && !held_by_other_active(&seat_label) {
@@ -1171,7 +1263,7 @@ fn draft_removal(
         &log,
         &opened,
         &actor,
-        &BTreeSet::from([recipient]),
+        &gone,
         Some(&everyone),
         |audience, newest, gone| {
             let mints = match audience {
@@ -1195,7 +1287,7 @@ fn draft_removal(
         for (&seat_actor, seat_member) in membership.members() {
             if seat_actor != target
                 && seat_actor != actor
-                && seat_member.binding.recipient() == recipient
+                && gone.contains(&seat_member.binding.recipient())
             {
                 let seat_cutoff = log
                     .records()
@@ -1990,14 +2082,15 @@ pub struct NodePassPace {
     pub every: Duration,
     /// A pass that was busy or failed runs again after this.
     pub again: Duration,
-    /// How often the loop looks at the records file (one `stat`) and at its stop.
+    /// The least time between two looks. A loop nothing rings ([`NodePassHost::rung`] `None`)
+    /// looks this often: at its switches, the records file and its stop.
     pub look: Duration,
     /// How long one pass waits out a writer of the vault's state before it says busy.
     pub lock_wait: Duration,
 }
 
 impl NodePassPace {
-    /// The node service's pace: every 60 seconds, a new record seen within a second.
+    /// The node service's pace: every 60 seconds, its looks at least a second apart.
     pub const LIVE: Self = Self {
         every: Duration::from_secs(60),
         again: Duration::from_secs(5),
@@ -2271,7 +2364,7 @@ fn said_of(error: &Error) -> NodePassSaid {
 }
 
 /// What tells one records file's contents from another's: every writer renames a new file over it
-/// ([`fsx::FileStamp`]). `None` with no readable file.
+/// or appends to it ([`fsx::FileStamp`]). `None` with no readable file.
 fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(paths.records_data_file().ok()?).ok()?;
@@ -2309,6 +2402,21 @@ impl NodePassDue {
         self.ran_ms = Some(now_ms);
         self.wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
     }
+
+    /// When time alone next makes a pass due, the clock having said `now_ms` at `read`: at once
+    /// before the first pass or where the clock was set back. Counted from `read`, so however
+    /// long the look that read it took, its pass and the converge after it, the next pass comes
+    /// its wait after the pass looked. A new records file is heard, not timed. `None` past what
+    /// an [`Instant`] holds.
+    fn next_at(&self, now_ms: u64, read: Instant) -> Option<Instant> {
+        let left = match self.ran_ms {
+            Some(ran_ms) if now_ms >= ran_ms => {
+                ran_ms.saturating_add(self.wait_ms).saturating_sub(now_ms)
+            }
+            _ => 0,
+        };
+        read.checked_add(Duration::from_millis(left))
+    }
 }
 
 /// What a node service gives [`run_node_pass`].
@@ -2335,15 +2443,46 @@ pub struct NodePassHost<'a> {
     pub log: &'a dyn Fn(&str),
     /// Its pace.
     pub pace: NodePassPace,
+    /// Rung when an input the loop reads changes, by whoever hears it: the host's watch over what
+    /// `held` reads, the observer `make_inputs` makes (hand it this bell), a test that moves
+    /// `now_ms`. The loop rings it too, from its own watch over the records file and the
+    /// subscriber's off switch. `None`: nothing rings, and the loop looks every
+    /// [`NodePassPace::look`], as one whose inputs no watch hears must.
+    pub rung: Option<Arc<aterm_uds::ready::Doorbell>>,
+    /// Whether `may_post` reads this thread's LAN broker ([`aterm_uds::lan::dialled_socket`]), so
+    /// a loop [`Self::rung`] rings hears it arrive (macOS; elsewhere nothing is heard). A host
+    /// whose `may_post` reads a stand-in hears no broker: a test's, which a real one's arrival
+    /// would only wake for nothing.
+    pub broker: bool,
 }
 
 /// The vault pass of a node service (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13): one pass on
 /// every new log record, by whichever path it came (the relay's ingest, a pull, another process's
-/// write, this pass's own), seen by one `stat` of the records file each [`NodePassPace::look`], and
-/// one every [`NodePassPace::every`]. It runs until `stop`, each pass's end kept where `aterm
-/// secrets status` reads it. A person's `aterm secrets agent off` holds it too
-/// ([`crate::service::subscriber_turned_off`]), as it holds all automatic vault work.
+/// write, this pass's own), and one every [`NodePassPace::every`]. It runs until `stop`, each
+/// pass's end kept where `aterm secrets status` reads it. A person's `aterm secrets agent off`
+/// holds it too ([`crate::service::subscriber_turned_off`]), as it holds all automatic vault work.
+///
+/// Between looks it waits on what owes the next one ([`NodeHeard`]): a ring of
+/// [`NodePassHost::rung`] (a new records file, a switch, an input the observer reads), its
+/// converge runner's exit, a change of network, the LAN broker's arrival, or the first deadline
+/// it keeps: the next timed pass, the runner's retry or recheck, the LAN's retry of a start it
+/// held, and the observer's own next look. Looks stay [`NodePassPace::look`] apart. While held,
+/// what lifts the hold rings, and it looks again each [`NodePassPace::every`] even so: a watch
+/// tells a change against the last state it told, so a switch flipped and flipped back inside
+/// its settle, read midway by a look, is told by none. With no bell it looks every
+/// [`NodePassPace::look`].
 pub fn run_node_pass(host: &NodePassHost<'_>) {
+    run_node_pass_hearing(host, super::member_routes::NativeChanges::new, |_| {});
+}
+
+/// [`run_node_pass`], hearing changes of network through what `changes` makes once a bell rings
+/// the loop, and telling `told` each key its own watch tells ([`RECORDS_WATCH`], …) just before
+/// that tell rings it.
+fn run_node_pass_hearing<C: super::member_routes::Changes>(
+    host: &NodePassHost<'_>,
+    changes: impl FnOnce() -> C,
+    told: impl Fn(u64) + Send + 'static,
+) {
     // A removal's table cutoffs come before its `Remove`; one a crash or a busy table left
     // unsigned is signed as the node service starts.
     cut_own_removals(host.paths);
@@ -2353,11 +2492,22 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
     let mut unfinished = 0_u32;
     let mut converge = NodeConverge::default();
     let mut inputs = None;
+    let mut heard = host
+        .rung
+        .as_ref()
+        .and_then(|rung| NodeHeard::start(host, rung, changes(), told));
     while !host.stop.is_set() {
-        if !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home) {
+        let looked = Instant::now();
+        // What rang before this look, this look reads; what rings during it owes the next.
+        if let Some(heard) = &heard {
+            heard.rung.clear();
+        }
+        let open = !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home);
+        let next = if open {
             let inputs = inputs.get_or_insert_with(host.make_inputs);
             let stamp = records_stamp(host.paths);
             let now_ms = (host.now_ms)();
+            let read = Instant::now();
             if due.due(stamp, now_ms) {
                 let ended = pass.once(host.paths, now_ms, host.pace.lock_wait, host.may_post);
                 let done = !matches!(&ended, Some((r, _)) if r.said != NodePassSaid::Done);
@@ -2379,10 +2529,230 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
                 }
             }
             converge.tend(host, inputs);
+            [
+                due.next_at(now_ms, read),
+                converge.next_at(),
+                inputs.next_look(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
         } else {
             converge.due.paused();
+            Instant::now().checked_add(host.pace.every)
+        };
+        match &mut heard {
+            // A held loop reaps no runner, so its exit, ready until reaped, is not waited on.
+            Some(heard) => heard.wait(host, next, converge.exit().filter(|_| open), looked),
+            None => {
+                host.stop.sleep(host.pace.look);
+            }
         }
-        host.stop.sleep(host.pace.look);
+    }
+}
+
+/// [`NodeHeard`]'s keys in its watch: the records ([`Records`]: the data file, or the entry while
+/// its layout names none), the subscriber's off switch, and, while the layout names no data file,
+/// its readiness pin and its preparation intent.
+const RECORDS_WATCH: u64 = 0;
+const OFF_WATCH: u64 = 1;
+const PIN_WATCH: u64 = 2;
+const INTENT_WATCH: u64 = 3;
+
+/// What a node's loop watches of its records.
+#[derive(Debug, PartialEq, Eq)]
+enum Records {
+    /// The data file the layout names.
+    Data(std::path::PathBuf),
+    /// The entry, while its layout names no data file this build can read (a transition another
+    /// writer has yet to finish, a layout this build refuses): the entry, its pin and its intent,
+    /// what the selection is judged by, so the writer that finishes it is heard
+    /// ([`crate::records_storage::data_path`]). The next look names the data file again.
+    Unnamed(std::path::PathBuf),
+}
+
+/// What wakes a node's loop between looks where a bell rings it ([`NodePassHost::rung`]).
+struct NodeHeard<C> {
+    rung: Arc<aterm_uds::ready::Doorbell>,
+    /// The loop's own watch over what it reads: the records and the subscriber's off switch.
+    watch: aterm_uds::file_watch::FileWatch,
+    /// The records watched now: the layout names them, and can name others.
+    records: Option<Records>,
+    changes: C,
+    /// The LAN broker's arrival, where [`NodePassHost::broker`] says `may_post` reads it.
+    #[cfg(target_os = "macos")]
+    broker: Option<aterm_uds::lan::Arrivals>,
+    #[cfg(target_os = "macos")]
+    broker_error: Option<String>,
+}
+
+impl<C: super::member_routes::Changes> NodeHeard<C> {
+    /// `None` where the watch cannot start; the loop then looks at its pace. It watches before
+    /// the first look reads, so each file's first look, which always tells, comes once, together.
+    fn start(
+        host: &NodePassHost<'_>,
+        rung: &Arc<aterm_uds::ready::Doorbell>,
+        changes: C,
+        told: impl Fn(u64) + Send + 'static,
+    ) -> Option<Self> {
+        let paths = host.paths;
+        let ringing = Arc::clone(rung);
+        let watch = aterm_uds::file_watch::FileWatch::platform(
+            "node-pass",
+            Box::new(move |key| {
+                told(key);
+                ringing.ring();
+            }),
+        )
+        .ok()?;
+        watch.watch(OFF_WATCH, crate::service::subscriber_off_path(&paths.home));
+        let mut heard = Self {
+            rung: Arc::clone(rung),
+            watch,
+            records: None,
+            changes,
+            #[cfg(target_os = "macos")]
+            broker: host.broker.then(aterm_uds::lan::Arrivals::new),
+            #[cfg(target_os = "macos")]
+            broker_error: None,
+        };
+        heard.arm(paths);
+        Some(heard)
+    }
+
+    /// Watch the records the layout names now ([`Records`]), and no others.
+    fn arm(&mut self, paths: &Paths) {
+        let records = match paths.records_data_file() {
+            Ok(data) => Records::Data(data),
+            Err(_) => Records::Unnamed(paths.records_file()),
+        };
+        if self.records.as_ref() == Some(&records) {
+            return;
+        }
+        match &records {
+            Records::Data(data) => {
+                self.watch.watch(RECORDS_WATCH, data.clone());
+                self.watch.unwatch(PIN_WATCH);
+                self.watch.unwatch(INTENT_WATCH);
+            }
+            Records::Unnamed(entry) => {
+                self.watch.watch(RECORDS_WATCH, entry.clone());
+                // Each refuses only an entry with no valid name, which `Paths` never makes.
+                for (key, side) in [
+                    (PIN_WATCH, crate::records_storage::pin_path(entry)),
+                    (INTENT_WATCH, crate::records_storage::intent_path(entry)),
+                ] {
+                    match side {
+                        Ok(side) => self.watch.watch(key, side),
+                        Err(_) => self.watch.unwatch(key),
+                    }
+                }
+            }
+        }
+        self.records = Some(records);
+    }
+
+    /// Whether a broker answered at a socket made since the last poll: one the LAN may now be
+    /// used through. A watch that fails is said once and heard no more until it works again.
+    #[cfg(target_os = "macos")]
+    fn broker_arrived(&mut self, log: &dyn Fn(&str)) -> bool {
+        let Some(broker) = &mut self.broker else {
+            return false;
+        };
+        match broker.poll() {
+            Ok(arrived) => {
+                self.broker_error = None;
+                arrived
+            }
+            Err(error) => {
+                let why = error.to_string();
+                if self.broker_error.as_ref() != Some(&why) {
+                    log(&format!("cannot watch the LAN broker's arrival: {why}"));
+                    self.broker_error = Some(why);
+                }
+                false
+            }
+        }
+    }
+
+    /// Wait until the next look is owed: a ring, the runner's `exit`, a change of network, the
+    /// broker's arrival, or `deadline` (`None`: none); then until [`NodePassPace::look`] after
+    /// the last look (`looked`). The stop ends either wait. Whatever else ends one (a message that
+    /// names no change, a broker generation that answers nothing new, the broker's retry, which
+    /// dials again) waits again.
+    fn wait(
+        &mut self,
+        host: &NodePassHost<'_>,
+        deadline: Option<Instant>,
+        exit: Option<BorrowedFd<'_>>,
+        looked: Instant,
+    ) {
+        self.arm(host.paths);
+        // A route socket that failed is opened again; until one works, changes of network go
+        // unheard and the routes are read each look, so a look is owed a pace after this one.
+        // One that opens again owes that look too: a change may have come before it opened.
+        let deadline = if self.changes.check().is_err() {
+            self.changes.reset();
+            deadline.into_iter().chain([looked + host.pace.look]).min()
+        } else {
+            deadline
+        };
+        loop {
+            if host.stop.is_set() {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            if self.broker_arrived(host.log) {
+                break;
+            }
+            // The broker's retry bounds this wait, not the look: past it, the poll above dials
+            // again, and only a broker that answers owes the look.
+            #[cfg(target_os = "macos")]
+            let wake = match self
+                .broker
+                .as_ref()
+                .map_or(Duration::MAX, |broker| broker.wait_for(Duration::MAX))
+            {
+                Duration::MAX => deadline,
+                left => deadline
+                    .into_iter()
+                    .chain(Instant::now().checked_add(left))
+                    .min(),
+            };
+            #[cfg(not(target_os = "macos"))]
+            let wake = deadline;
+            let Ok(stop) = host.stop.bell() else {
+                // Out of descriptors: rest a look's while, as a loop nothing rings does.
+                host.stop.sleep(host.pace.look);
+                return;
+            };
+            let mut also = vec![stop, self.rung.fd()];
+            also.extend(exit);
+            #[cfg(target_os = "macos")]
+            also.extend(
+                self.broker
+                    .as_ref()
+                    .and_then(aterm_uds::lan::Arrivals::watch_fd),
+            );
+            let changed = self.changes.wait(wake, &also);
+            if host.stop.is_set() {
+                return;
+            }
+            let exited = exit.is_some_and(|fd| {
+                aterm_uds::ready::any_now(&[fd]).is_ok_and(|ready| !ready.is_empty())
+            });
+            if changed
+                || self.rung.clear()
+                || exited
+                || deadline.is_some_and(|at| Instant::now() >= at)
+            {
+                break;
+            }
+        }
+        let spaced = looked + host.pace.look;
+        if let Some(left) = spaced.checked_duration_since(Instant::now()) {
+            host.stop.sleep(left);
+        }
     }
 }
 
@@ -2404,6 +2774,12 @@ fn node_pass_wait(pace: &NodePassPace, unfinished: u32) -> Duration {
 struct NodeConverge {
     due: crate::converge::Due,
     runner: Option<aterm_uds::spawnfd::Child>,
+    /// Readable once `runner` has exited ([`aterm_uds::exitwatch::exit_fd`]); `None` with no
+    /// runner, or where none could be made.
+    exit: Option<std::os::fd::OwnedFd>,
+    /// A start the LAN held while one was owed, tried again on its own backoff; the broker's
+    /// arrival is heard sooner where it can be.
+    lan: crate::converge::RunnerRetry,
     clock: Option<Instant>,
 }
 
@@ -2411,10 +2787,13 @@ impl NodeConverge {
     fn tend(&mut self, host: &NodePassHost<'_>, inputs: &mut super::ConvergenceInputs) {
         let clock = self.clock.get_or_insert_with(Instant::now);
         let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (refresh, request) = inputs.snapshot();
-        self.due.observe(refresh);
-        if let Some(request) = request {
+        let snapshot = inputs.snapshot();
+        self.due.observe(snapshot.refresh);
+        if let Some(request) = snapshot.repositories {
             self.due.request(request);
+        }
+        if snapshot.identity == super::projection::IdentityDebt::Changed {
+            self.due.identity_changed();
         }
         self.tend_at(now_ms, (host.routes)(), host.may_post, host.start_converge);
     }
@@ -2427,16 +2806,55 @@ impl NodeConverge {
         start: &dyn Fn(crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>,
     ) {
         use crate::converge::Last;
-        // Each look reaps a runner that ended.
+        // Each look reaps a runner that ended, and lets its exit go.
         let last = Last::of(&mut self.runner);
+        if self.runner.is_none() {
+            self.exit = None;
+        }
         if !may_post() {
             self.due.hold(now_ms, routes, last);
-        } else if self.due.poll(now_ms, routes, last) {
-            self.runner = start(self.due.repository_request());
-            if self.runner.is_none() {
-                self.due.reaped(Last::Failed, now_ms);
+            if !self.due.owes_start(now_ms) {
+                self.lan = crate::converge::RunnerRetry::default();
+            } else if self.lan.remaining(now_ms).is_none_or(|left| left.is_zero()) {
+                self.lan.reaped(Last::Failed, now_ms);
+            }
+        } else {
+            self.lan = crate::converge::RunnerRetry::default();
+            if self.due.poll(now_ms, routes, last) {
+                self.runner = start(self.due.repository_request());
+                self.exit = self
+                    .runner
+                    .as_ref()
+                    .and_then(|child| aterm_uds::exitwatch::exit_fd(child.id()));
+                if self.runner.is_none() {
+                    self.due.reaped(Last::Failed, now_ms);
+                }
             }
         }
+    }
+
+    /// When this owes a look with nothing heard: none while a runner runs whose exit is heard,
+    /// at once while one runs whose exit is not, the LAN's retry while it holds a start that is
+    /// owed (the due's own times, past while it holds, start nothing until the LAN opens),
+    /// otherwise the due's next start ([`crate::converge::Due::next_at`]). `None` before the
+    /// first look.
+    fn next_at(&self) -> Option<Instant> {
+        let clock = self.clock?;
+        if self.runner.is_some() {
+            return self.exit.is_none().then(Instant::now);
+        }
+        let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(left) = self.lan.remaining(now_ms) {
+            return Instant::now().checked_add(left);
+        }
+        self.due
+            .next_at()
+            .and_then(|at| clock.checked_add(Duration::from_millis(at)))
+    }
+
+    /// The runner's exit, ready once it ended and until a look reaps it.
+    fn exit(&self) -> Option<BorrowedFd<'_>> {
+        self.exit.as_ref().map(AsFd::as_fd)
     }
 }
 

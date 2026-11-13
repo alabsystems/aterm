@@ -18,11 +18,5 @@ pub(crate) fn window_icon() -> Option<aterm_window::window::Icon> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_window_icon_decodes() {
-        assert!(window_icon().is_some());
-    }
-}
+#[path = "desktop_files_tests.rs"]
+mod tests;

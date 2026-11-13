@@ -20,7 +20,8 @@ fn roster(rows: &[(&str, Option<&str>, Option<&str>)]) -> Roster {
             "[[account]]\nlabel = \"{label}\"\nclass = \"dedicated\"\n"
         ));
         if let Some(dir) = dir {
-            text.push_str(&format!("dir = \"{dir}\"\n"));
+            let dir = crate::harness::host_path::toml(Path::new(dir));
+            text.push_str(&format!("dir = {dir}\n"));
         }
         if let Some(email) = email {
             text.push_str(&format!("email = \"{email}\"\n"));

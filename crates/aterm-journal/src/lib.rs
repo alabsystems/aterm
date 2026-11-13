@@ -57,6 +57,17 @@ pub fn write_private_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result
 /// Conservative framing allowance per append, in addition to body and subject.
 pub const APPEND_OVERHEAD: usize = 256;
 
+/// Decoded-record cache budget for each local history log. The newest record stays
+/// resident even if larger; retained indexes and records held by readers are outside this budget.
+pub const DECODED_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+/// Local-history log options with a bounded decoded window. Older records remain on disk
+/// and are decoded on demand; this sets no retention limit and preserves the requested durability.
+#[must_use]
+pub fn resident_options(durability: Durability) -> LogOptions {
+    LogOptions::new(durability).with_resident_budget(DECODED_WINDOW_BYTES)
+}
+
 /// Fixed resource bounds for one immutable generation. Retention is deliberately
 /// unavailable: dropping an old record could erase authorization or liabilities.
 #[derive(Clone, Copy)]
@@ -390,12 +401,26 @@ impl Log {
     }
     /// Bounded local replay; callers must validate each record before use.
     /// # Errors
-    /// An uncertain append withholds the handle's observations until reopen.
+    /// Uncertain writes, unavailable or changed private journal files or writer leases, and
+    /// unreadable retained records refuse the page. A decode failure never appears as the end
+    /// of the journal.
     pub fn read_range(&self, offset: Offset, count: usize) -> io::Result<Vec<Arc<BrokerRecord>>> {
         if self.is_poisoned() {
             return Err(io::Error::other("uncertain journal: reopen"));
         }
-        Ok(self.log.read_range(offset, count.min(256)))
+        let stats = self.log.stats();
+        let available = stats.head.0.saturating_sub(offset.0.max(stats.base.0));
+        let wanted = count
+            .min(256)
+            .min(usize::try_from(available).unwrap_or(usize::MAX));
+        let records = self.log.read_range(offset, wanted);
+        if records.len() != wanted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal retained records could not be decoded",
+            ));
+        }
+        Ok(records)
     }
     /// Acknowledge only once the record and the prefix checkpoint that attests it
     /// are on stable media. On a log astream serves Ordered the record and the
@@ -713,7 +738,7 @@ impl Log {
 /// commit (`Acks::FullFlush`), so a run that stopped without a clean close lost nothing it
 /// acknowledged: the next open, in another boot, moves no generation and says nothing.
 fn log_options() -> LogOptions {
-    let mut options = LogOptions::new(Durability::Ordered { horizon: None });
+    let mut options = resident_options(Durability::Ordered { horizon: None });
     options.acks = astream_broker::Acks::FullFlush;
     #[cfg(any(test, debug_assertions))]
     let options = seam::options(options);
@@ -884,7 +909,8 @@ pub struct Acknowledged {
 
 /// An acknowledged prefix a reader has already decoded, and how many records
 /// it holds. Hand it back to [`read_committed`] to be told only what changed.
-/// Up to eight MiB of private physical bytes are retained for fresh comparisons.
+/// Up to eight MiB of private physical bytes are retained for fresh comparisons,
+/// where the read that gave it was asked to ([`Retain::Bytes`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Prefix {
     acknowledged: Acknowledged,
@@ -909,6 +935,25 @@ impl Prefix {
     pub const fn records(&self) -> u64 {
         self.records
     }
+    /// Whether this prefix keeps the physical bytes it attests ([`Retain`]).
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn retains_bytes(&self) -> bool {
+        self.bytes.is_some()
+    }
+}
+
+/// Whether a read's [`Prefix`] keeps the physical bytes it attests (up to eight MiB), so that a
+/// later read handed it tells unchanged bytes by comparing them, or keeps only their digest, so
+/// that a later read hashes them again. Either answers every later read alike: only what the
+/// reader holds, and what an unchanged read costs, differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retain {
+    /// Keep the bytes, up to eight MiB: an unchanged read compares them and hashes nothing.
+    Bytes,
+    /// Keep only the digest: an unchanged read hashes the bytes it reads once.
+    Digest,
 }
 
 /// What [`read_committed`] found, measured against the prefix the caller holds.
@@ -1000,11 +1045,13 @@ pub fn read_committed(
     limits: Limits,
     known: Option<&Prefix>,
 ) -> io::Result<Committed> {
-    read_committed_opened(dir, name, anchor, limits, known).map(|(committed, _)| committed)
+    read_committed_opened(dir, name, anchor, limits, known, Retain::Bytes)
+        .map(|(committed, _)| committed)
 }
 
 /// [`read_committed`], with the files it opened ([`Opened`]): for a reader that keeps what it
-/// read while a witness of the paths stands, which must be a witness of those very files.
+/// read while a witness of the paths stands, which must be a witness of those very files. The
+/// new [`Prefix`] keeps its bytes or only their digest as `retain` asks.
 /// # Errors
 /// As [`read_committed`].
 pub fn read_committed_opened(
@@ -1013,6 +1060,7 @@ pub fn read_committed_opened(
     anchor: &[u8],
     limits: Limits,
     known: Option<&Prefix>,
+    retain: Retain,
 ) -> io::Result<(Committed, Opened)> {
     let layout = Layout::new(name, anchor, limits)?;
     // One directory verdict for the three files, as in `Log::intact`.
@@ -1142,7 +1190,8 @@ pub fn read_committed_opened(
                     acknowledged,
                     records: known.records + records.len() as u64,
                     max_record_bytes,
-                    bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
+                    bytes: (retain == Retain::Bytes && bytes.len() <= PREFIX_BYTES)
+                        .then(|| Arc::from(bytes)),
                 },
                 records,
             }
@@ -1155,7 +1204,8 @@ pub fn read_committed_opened(
                     acknowledged,
                     records: records.len() as u64,
                     max_record_bytes,
-                    bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
+                    bytes: (retain == Retain::Bytes && bytes.len() <= PREFIX_BYTES)
+                        .then(|| Arc::from(bytes)),
                 },
                 records,
             }

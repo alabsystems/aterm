@@ -13,8 +13,8 @@
 # `serde = { package = "aterm-serde", path = "crates/aterm-serde" }`, so every
 # member that writes `serde = { workspace = true }` gets this crate under that
 # name, with no call-site edits; a member that derives adds
-# `features = ["derive"]` to its own row (Trust PM-1,
-# docs/PLAN-pm1-proc-macro-reach-2026-10-16.md). Registry serde is left only on
+# `features = ["derive"]` to its own row (docs/TRUST-LANE.md (PM-1)).
+# Registry serde is left only on
 # linux, where zbus and zvariant pull it in.
 
 [package]

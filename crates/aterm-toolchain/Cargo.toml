@@ -5,7 +5,8 @@
 # is, where plain targo puts its build intermediates, when a checkout is gone, the
 # lease a run holds on the toolchain it resolved, the named lock and the interrupt
 # every wait for a lock or for capacity ends on, and the status digest a sealed
-# toolchain is rechecked by. Std only but for aterm-libc's signal declarations,
+# toolchain is rechecked by. Std plus the first-party TOML parser for configured
+# target custody, aterm-libc's signal declarations,
 # aterm-sysprobe's process sweep (a wait's stuck holder), aterm-uds's account
 # home (where a wait is marked) and aterm-digest's SHA-256 (the status digest),
 # so the check runner (aterm-verify), the libc oracle's gate and the package
@@ -22,6 +23,10 @@ publish = false
 description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule, the toolchain lease, the named lock whose wait names a stuck holder, and the status digest a sealed toolchain is rechecked by"
 
 [dependencies]
+# Resolve Cargo's configured final target without guessing its spelling, and follow a
+# config's `include` as Targo loads it (`build_cache::config_dirs`). The parser has no proc
+# macro dependency and already belongs to the tools' normal graph.
+aterm-toml = { workspace = true }
 # The process sweep (`aterm_sysprobe::processes`): a wait for a named lock reads
 # its holder's process tree, its CPU time and its writes, to tell a holder that
 # works from one that makes no progress (`src/stall.rs`). On Windows, where a

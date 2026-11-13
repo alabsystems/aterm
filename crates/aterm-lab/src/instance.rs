@@ -24,6 +24,9 @@ pub(crate) use cleanup::after_stop;
 #[path = "instance_compare.rs"]
 mod comparison;
 
+#[path = "instance_handoff.rs"]
+mod handoff;
+
 #[cfg(any(test, debug_assertions))]
 #[path = "instance_network_away.rs"]
 mod network_away;
@@ -364,84 +367,8 @@ pub(crate) fn world_parent() -> aterm_tempfile::TempDir {
 }
 
 #[cfg(test)]
-mod prepared_world_tests {
-    use super::{CONFIG_OFF, World, world_parent};
-
-    #[test]
-    fn prepared_world_reopens_without_overwriting_configuration_or_identity() {
-        let parent = world_parent();
-        let root = parent.path().join("world");
-        let world = World::create_at(&root, CONFIG_OFF).unwrap();
-        let config = world.cfg.join("aterm/aterm.toml");
-        let original = std::fs::read(&config).unwrap();
-        let identity = world.home.join("fixture-identity");
-        std::fs::write(&identity, b"retained identity").unwrap();
-        assert!(World::create_at(&root, "different configuration").is_err());
-        drop(world);
-        let reopened = World::open_at(&root).unwrap();
-        assert_eq!(reopened.cfg.join("aterm/aterm.toml"), config);
-        assert_eq!(std::fs::read(&config).unwrap(), original);
-        assert_eq!(std::fs::read(&identity).unwrap(), b"retained identity");
-        assert!(World::open_at(parent.path()).is_err());
-        let long = parent.path().join("x".repeat(100));
-        assert!(World::create_at(&long, CONFIG_OFF).is_err());
-        assert!(!long.exists());
-        drop(reopened);
-        assert!(identity.exists());
-    }
-
-    /// A WORLD LAID OUT ALREADY REFUSES A CONFIGURATION IT WOULD DROP: `instance --world DIR` on
-    /// a world an earlier run laid out keeps that world's `aterm.toml`, so a `--toml`,
-    /// `--toml-after`, `--harness` or `--harness-key` given with it is refused, never dropped
-    /// without a word, and the world reopens as it is with none. NEGATIVE CONTROL: reopen the
-    /// world whatever is configured, and the configured run is not refused.
-    #[test]
-    fn a_laid_out_world_refuses_a_configuration_it_would_drop() {
-        let parent = world_parent();
-        let root = parent.path().join("world");
-        let config = World::create_at(&root, CONFIG_OFF)
-            .unwrap()
-            .cfg
-            .join("aterm/aterm.toml");
-        let original = std::fs::read(&config).unwrap();
-        let refused = super::instance_world(Some(&root), "x = 1", true).err();
-        assert_eq!(
-            refused.map(|fail| fail.code),
-            Some(2),
-            "a configuration the world would drop is a usage error"
-        );
-        assert_eq!(std::fs::read(&config).unwrap(), original);
-        let reopened = super::instance_world(Some(&root), CONFIG_OFF, false).expect("reopened");
-        assert_eq!(reopened.cfg.join("aterm/aterm.toml"), config);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn world_config_is_never_group_or_world_writable() {
-        use std::os::unix::fs::PermissionsExt as _;
-        // A loose pre-existing file is the umask-002 case (664) made host-independent:
-        // the writer must pin it to a mode its reader accepts, not keep the old one.
-        let parent = world_parent();
-        let loose = parent.path().join("aterm.toml");
-        std::fs::write(&loose, "old").unwrap();
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o664)).unwrap();
-        super::write_aterm_toml(&loose, "new").unwrap();
-        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "new");
-        let mode = std::fs::metadata(&loose).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o022,
-            0,
-            "mode {mode:o} would be refused by aterm_config_refusal"
-        );
-
-        let world = World::create_at(&parent.path().join("world"), CONFIG_OFF).unwrap();
-        let mode = std::fs::metadata(world.cfg.join("aterm/aterm.toml"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o022, 0, "world config mode {mode:o} is writable");
-    }
-}
+#[path = "instance_prepared_world_tests.rs"]
+mod prepared_world_tests;
 
 /// The development seams every lab world sets ([`World::env`], the lab runs' `lab_vars`, the
 /// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), the
@@ -660,49 +587,8 @@ fn windowed_admission(l: &Launch, work: WindowWork) -> Result<Option<WindowAdmis
 }
 
 #[cfg(test)]
-mod window_admission_tests {
-    use super::*;
-
-    fn launch(world: &World, headless: bool) -> Launch {
-        Launch {
-            aterm: world.dir.join("must-not-start"),
-            headless,
-            args: Vec::new(),
-            env: world.env(),
-            cwd: world.home.clone(),
-            sandbox: None,
-            reroute: false,
-        }
-    }
-
-    #[test]
-    fn headless_work_takes_no_window_lane_or_capacity_claim() {
-        let world = World::new(CONFIG_OFF).unwrap();
-        assert!(
-            windowed_admission(&launch(&world, true), WindowWork::Timing)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!world.dir.join("aterm.log").exists());
-    }
-
-    #[test]
-    fn functional_window_rejects_headless_and_zero_before_starting() {
-        let world = World::new(CONFIG_OFF).unwrap();
-        for (headless, bytes) in [(true, 1024), (false, 0)] {
-            for start in [
-                Instance::start_functional,
-                Instance::start_ordinary_functional,
-            ] {
-                let why = start(&world, launch(&world, headless), bytes)
-                    .err()
-                    .expect("invalid functional request refused before spawn");
-                assert!(why.contains("started nothing"), "{why}");
-            }
-            assert!(!world.dir.join("aterm.log").exists());
-        }
-    }
-}
+#[path = "instance_window_admission_tests.rs"]
+mod window_admission_tests;
 
 /// A running private instance.
 pub struct Instance {
@@ -723,6 +609,7 @@ pub struct Instance {
     _admission: Option<WindowAdmission>,
     cleanup: cleanup::StopRecord,
     gui: Option<aterm_uds::process::Identity>,
+    handoff: Option<handoff::Tracking>,
     /// What its stop gives it before each signal ([`STOP_GRACES`]).
     graces: Graces,
 }
@@ -850,6 +737,40 @@ fn ordinary_roots_match(world: &World, env: &[(String, String)]) -> bool {
 }
 
 impl Instance {
+    /// Follow replacements through the actual retained original window description.
+    /// The seed is the GUI observed as this instance's own keeper's child.
+    /// # Errors
+    /// Retained custody or the bounded private credential is unavailable.
+    pub(crate) fn track_handoffs(
+        &mut self,
+    ) -> Result<Option<aterm_uds::process::Identity>, String> {
+        if !self.kept {
+            return Err("handoff tracking requires a guarded window".into());
+        }
+        if self.handoff.is_none() {
+            let tracking = crate::admission::window_custody()
+                .map_err(|why| {
+                    why.msg
+                        .unwrap_or_else(|| "original window custody unavailable".into())
+                })
+                .and_then(|original| handoff::Tracking::new(original, &self.sock, self.gui));
+            self.handoff = Some(match tracking {
+                Ok(tracking) => tracking,
+                Err(why) => {
+                    self.cleanup.require_evidence(format!(
+                        "handoff ownership could not be captured: {why}"
+                    ));
+                    return Err(why);
+                }
+            });
+        }
+        Ok(self
+            .handoff
+            .as_ref()
+            .expect("tracking installed above")
+            .identity())
+    }
+
     /// Start `l` in `world`, its output in `<world>/aterm.log`.
     /// # Errors
     /// The log, the lifeline or the process could not be made.
@@ -1039,6 +960,7 @@ impl Instance {
             _admission: admission,
             cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
             gui: None,
+            handoff: None,
             graces: STOP_GRACES,
         })
     }
@@ -1097,6 +1019,7 @@ impl Instance {
             _admission: admission,
             cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
             gui: None,
+            handoff: None,
             graces: STOP_GRACES,
         })
     }
@@ -1122,8 +1045,10 @@ impl Instance {
                 true
             };
             if ready_socket && self.sock.exists() && self.ctl(&["version"]).code == 0 {
-                if self.kept {
-                    self.gui = self.aterm_pid().and_then(aterm_uds::process::read_identity);
+                if self.kept && self.gui.is_none() {
+                    self.gui = self
+                        .original_aterm_pid()
+                        .and_then(aterm_uds::process::read_identity);
                 }
                 return Ok(());
             }
@@ -1229,12 +1154,23 @@ impl Instance {
     /// Whether it still runs.
     pub fn running(&mut self) -> bool {
         self.exited().is_none()
+            || self
+                .handoff
+                .as_mut()
+                .is_some_and(|owner| owner.running(&self.sock))
     }
 
-    /// aterm's own pid: [`Instance::pid`], or a windowed instance's keeper's child (`None`
-    /// while the keeper has none).
+    /// The still-matching proven handoff peer, else the launched process or keeper's child.
+    /// Returns `None` when neither an owned peer nor a keeper child can be observed.
     #[must_use]
     pub fn aterm_pid(&self) -> Option<i32> {
+        if let Some(pid) = self.handoff.as_ref().and_then(handoff::Tracking::pid) {
+            return Some(pid);
+        }
+        self.original_aterm_pid()
+    }
+
+    fn original_aterm_pid(&self) -> Option<i32> {
         if !self.kept {
             return Some(self.pid);
         }
@@ -1345,7 +1281,8 @@ impl Instance {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// Cut the lifeline and record one bounded stop attempt for the original process/job.
+    /// Cut the lifeline and record one bounded stop attempt for the original process/job
+    /// and any replacement whose original-description custody this instance proved.
     /// The signal that stops a run asks for this, so the attempt waits through it
     /// ([`stop::Grace`]). Repeated calls, including Drop, return the recorded result without
     /// another timeout.
@@ -1358,10 +1295,13 @@ impl Instance {
     pub fn stop(&mut self) -> Result<(), String> {
         let _grace = stop::grace();
         if self.kept && self.gui.is_none() {
-            self.gui = self.aterm_pid().and_then(aterm_uds::process::read_identity);
+            self.gui = self
+                .original_aterm_pid()
+                .and_then(aterm_uds::process::read_identity);
         }
         self.cleanup.attempt(|| {
-            stop_process(
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let original = stop_process(
                 &mut self.child,
                 &mut self.lifeline,
                 self.pid,
@@ -1374,7 +1314,17 @@ impl Instance {
                     "{why}; {}",
                     standing(&mut self.child, self.pid, self.kept, self.gui)
                 )
-            })
+            });
+            let handoff = self
+                .handoff
+                .as_mut()
+                .map_or(Ok(()), |owner| owner.stop(&self.sock, deadline));
+            match (original, handoff) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(original), Err(handoff)) => {
+                    Err(format!("{original}; successor cleanup: {handoff}"))
+                }
+            }
         })
     }
 }
@@ -1840,9 +1790,8 @@ pub fn cmd_instance(args: &[String]) -> Res {
     // release fallback: only a debug app has both the scripted facts seam and A12 lab identity.
     let aterm = resolve_aterm(if network_away.is_some() {
         Some(
-            paths()
-                .repo
-                .join("target/debug/aterm")
+            crate::paths::plain_target(&paths().repo)
+                .join("debug/aterm")
                 .to_string_lossy()
                 .into_owned(),
         )
@@ -1991,6 +1940,9 @@ fn drive(inst: &mut Instance, world: &World, run: &Drive<'_>) -> Res {
     stop::check()?;
     if ready.code != 0 {
         return Err(Fail::die(format!("instance: not ready: {}", ready.first())));
+    }
+    if run.window {
+        inst.track_handoffs().map_err(Fail::die)?;
     }
     run_verbs(run.pre, |args| inst.ctl(args))?;
     if let Some(dest) = &run.image {
@@ -2337,158 +2289,12 @@ fn request_settled_image(mut ctl: impl FnMut(&[&str]) -> Reply) -> Result<Reply,
 }
 
 #[cfg(test)]
-mod control_verb_tests {
-    use super::*;
-
-    #[test]
-    fn native_capture_needs_a_proven_empty_roster_not_a_missing_reading() {
-        for (code, stdout, stderr, allowed) in [
-            (0, "", "aterm-ctl: OK 0 (sessions: no results)\n", true),
-            (1, "", "aterm-ctl: OK 0 (sessions: no results)\n", false),
-            (0, "", "", false),
-            (0, "", "aterm-ctl: OK 1\n", false),
-            (0, "unread body", "aterm-ctl: OK 0\n", false),
-        ] {
-            let mut calls = Vec::new();
-            let result = request_settled_image(|args| {
-                calls.push(args.join(" "));
-                match args {
-                    ["sessions"] => Reply {
-                        code,
-                        stdout: stdout.into(),
-                        stderr: stderr.into(),
-                    },
-                    ["image", "frame.png"] => Reply {
-                        stdout: "OK 794 462 /tmp/frame.png".into(),
-                        ..Reply::default()
-                    },
-                    _ => panic!("unexpected request: {args:?}"),
-                }
-            });
-            assert_eq!(result.is_ok(), allowed);
-            assert_eq!(
-                calls,
-                if allowed {
-                    vec!["sessions", "image frame.png"]
-                } else {
-                    vec!["sessions"]
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn captures_with_a_terminal_require_a_successful_idle_wait() {
-        for code in [0, 1, 124, -1] {
-            let mut captured = false;
-            let result = request_settled_image(|args| match args {
-                ["sessions"] => Reply {
-                    stdout: "OK 1\n0 s-aa - alive shell active=1 wfocus=1\n".into(),
-                    ..Reply::default()
-                },
-                ["@s-aa", "await", "idle", "500", "timeout=60000"] => Reply {
-                    code,
-                    stderr: "idle wait result".into(),
-                    ..Reply::default()
-                },
-                ["image", "frame.png"] => {
-                    captured = true;
-                    Reply::default()
-                }
-                _ => panic!("unexpected request: {args:?}"),
-            });
-            assert_eq!(result.is_ok(), code == 0, "idle client exit {code}");
-            assert_eq!(captured, code == 0);
-        }
-    }
-
-    #[test]
-    fn failed_control_verbs_stop_the_requested_sequence() {
-        let verbs = ["first", "", "second", "third"].map(str::to_owned);
-        for code in [0, 1, 124, -1] {
-            let mut calls = Vec::new();
-            let result = run_verbs(&verbs, |args| {
-                calls.push(args.join(" "));
-                Reply {
-                    code: if args == ["second"] { code } else { 0 },
-                    stdout: if code == 0 {
-                        "OK".into()
-                    } else {
-                        String::new()
-                    },
-                    stderr: if code == 0 {
-                        String::new()
-                    } else {
-                        "control failed".into()
-                    },
-                }
-            });
-            if code == 0 {
-                assert!(result.is_ok());
-                assert_eq!(calls, ["first", "second", "third"]);
-            } else {
-                assert!(
-                    result.is_err(),
-                    "client exit {code} must fail the instance run"
-                );
-                assert_eq!(calls, ["first", "second"]);
-            }
-        }
-    }
-}
+#[path = "instance_control_verb_tests.rs"]
+mod control_verb_tests;
 
 #[cfg(test)]
-mod image_reply_tests {
-    use super::Reply;
-
-    #[test]
-    fn image_paths_keep_spaces_in_the_complete_path() {
-        for path in [
-            "/tmp/frame.png",
-            "/tmp/a world/run/images/frame.png",
-            "/tmp/画像 world/frame.png",
-        ] {
-            let reply = Reply {
-                stdout: format!("OK 794 462 {path}\n"),
-                ..Reply::default()
-            };
-            assert_eq!(reply.image_path(), Some(path));
-        }
-    }
-
-    #[test]
-    fn only_successful_sized_plain_images_supply_a_path() {
-        for text in [
-            "",
-            "ERR image failed",
-            "OK 0 462 /tmp/frame.png",
-            "OK 794 0 /tmp/frame.png",
-            "OK width 462 /tmp/frame.png",
-            "OK 794 462",
-            "OK 794 462 relative.png",
-            "OK 794 462 image-meta path=\"/tmp/frame.png\"",
-        ] {
-            assert_eq!(
-                Reply {
-                    stdout: text.into(),
-                    ..Reply::default()
-                }
-                .image_path(),
-                None,
-                "{text}"
-            );
-        }
-        assert_eq!(
-            Reply {
-                code: 1,
-                stdout: "OK 794 462 /tmp/frame.png\n".into(),
-                ..Reply::default()
-            }
-            .image_path(),
-            None
-        );
-    }
-}
+#[path = "instance_image_reply_tests.rs"]
+mod image_reply_tests;
 
 /// Why a keeper ends its aterm.
 enum KeeperEnd {
@@ -2690,512 +2496,29 @@ pub fn keeper_main(args: &[String]) -> i32 {
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-mod owned_world_store_tests {
-    use super::*;
-    use aterm_agent::supervise::tape::store;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[test]
-    fn rehoming_preserves_an_existing_home_and_initializes_only_a_new_one() {
-        let mut world = World::new(CONFIG_OFF).expect("fresh private world");
-        let original_home = world.home.clone();
-        std::fs::write(original_home.join(".profile"), b"owner profile").unwrap();
-        std::fs::write(original_home.join(".shrc"), b"owner shell configuration").unwrap();
-        std::fs::set_permissions(&original_home, std::fs::Permissions::from_mode(0o750)).unwrap();
-        assert!(world.rehome(&original_home).is_err());
-        assert_eq!(world.home, original_home);
-        assert_eq!(
-            std::fs::read(original_home.join(".profile")).unwrap(),
-            b"owner profile"
-        );
-        assert_eq!(
-            std::fs::read(original_home.join(".shrc")).unwrap(),
-            b"owner shell configuration"
-        );
-        assert_eq!(
-            std::fs::metadata(&original_home)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o750
-        );
-        let new_home = world.dir.join("new-home");
-        world.rehome(&new_home).expect("new private home");
-        assert_eq!(world.home, new_home);
-        assert_eq!(
-            std::fs::read(new_home.join(".profile")).unwrap(),
-            b"PS1='$ '\n"
-        );
-        for (name, value) in world.env() {
-            if matches!(
-                name.as_str(),
-                "TMPDIR"
-                    | "TMP"
-                    | "TEMP"
-                    | "XDG_CACHE_HOME"
-                    | "XDG_DATA_HOME"
-                    | "XDG_STATE_HOME"
-                    | "ATERM_STATE_HOME"
-            ) {
-                let path = Path::new(&value);
-                assert!(path.starts_with(&new_home), "{name} follows the new HOME");
-                assert!(path.is_dir(), "{name} already exists");
-                assert_eq!(
-                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                    0o700
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_new_world_publishes_a_home_that_its_hosted_store_can_admit() {
-        let world = World::new(CONFIG_OFF).expect("fresh private world");
-        let env = world.env();
-        let home = PathBuf::from(
-            &env.iter()
-                .find(|(name, _)| name == "HOME")
-                .expect("private HOME")
-                .1,
-        );
-        assert_eq!(home, world.home);
-        for name in [
-            "TMPDIR",
-            "TMP",
-            "TEMP",
-            "XDG_CACHE_HOME",
-            "XDG_DATA_HOME",
-            "XDG_STATE_HOME",
-            "ATERM_STATE_HOME",
-        ] {
-            let path = PathBuf::from(
-                &env.iter()
-                    .find(|(key, _)| key == name)
-                    .expect("explicit private root")
-                    .1,
-            );
-            assert!(path.starts_with(&home), "{name} belongs to the owned HOME");
-            assert!(path.is_dir(), "{name} already exists");
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-        }
-        let state = PathBuf::from(
-            &env.iter()
-                .find(|(name, _)| name == "ATERM_STATE_HOME")
-                .unwrap()
-                .1,
-        );
-        let root = store::store_under(&state);
-        let session = store::session_dir(&root, Some("s-world"));
-        std::fs::create_dir_all(&session).expect("fresh owned store");
-        for dir in [&root, &session] {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .expect("private fixture directory");
-        }
-        let tape = session.join("owned.atape");
-        let mut file = store::create(&tape).expect("new private tape");
-        file.write_all(b"owned diagnostic bytes")
-            .expect("fixture bytes");
-        drop(file);
-        let admitted = store::try_list(&root, None);
-        assert!(
-            admitted.as_ref().is_ok_and(|tapes| tapes.len() == 1
-                && tapes[0].path == tape
-                && tapes[0].bytes == 22),
-            "a newly owned Lab World must publish a HOME whose hosted store admits its private tape: {admitted:?}"
-        );
-    }
-}
+#[path = "instance_owned_world_store_tests.rs"]
+mod owned_world_store_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod cold_copy_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::process::ExitStatusExt as _;
-
-    fn version_output(code: i32, stdout: &[u8]) -> std::process::Output {
-        std::process::Output {
-            status: std::process::ExitStatus::from_raw(code << 8),
-            stdout: stdout.to_vec(),
-            stderr: Vec::new(),
-        }
-    }
-
-    /// A timed-out probe, a failed process that printed a banner, and a wrong banner all
-    /// leave the world in place. No executable is started by these injected failure effects.
-    #[test]
-    fn an_unproven_cold_version_keeps_its_world() {
-        for result in [
-            Err(aterm_uds::deadline::RunError::TimedOut),
-            Ok(version_output(1, b"aterm 0.0.0\n")),
-            Ok(version_output(0, b"another program\n")),
-        ] {
-            let mut world = World::new(CONFIG_OFF).unwrap();
-            let dir = world.dir.clone();
-            let exe = dir.join("unstarted");
-            std::fs::write(&exe, b"not an executable").unwrap();
-            let failed = prove_cold_version(&mut world, &exe, |cmd| {
-                assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
-                assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--version"]);
-                result
-            });
-            assert!(failed.is_err());
-            drop(world);
-            assert!(exe.is_file(), "an unproven image's directory was removed");
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    /// Successful proof restores the caller's keep choice, rather than clearing an explicit
-    /// request to retain the world. The ordinary cleanup arm is the negative control.
-    #[test]
-    fn a_proven_cold_version_preserves_the_callers_keep_choice() {
-        for keep in [false, true] {
-            let mut world = World::new(CONFIG_OFF).unwrap();
-            let dir = world.dir.clone();
-            world.keep = keep;
-            prove_cold_version(&mut world, &dir.join("unstarted"), |_| {
-                Ok(version_output(0, b"aterm 0.0.0\n"))
-            })
-            .unwrap();
-            drop(world);
-            assert_eq!(dir.exists(), keep);
-            if keep {
-                std::fs::remove_dir_all(dir).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {
-        let world_source = World::new(CONFIG_OFF).expect("fixture world");
-        let real = world_source.dir.join("aterm-real");
-        let script = b"#!/bin/sh\necho 'aterm 0.0.0'\n";
-        std::fs::write(&real, script).expect("stand-in");
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        let link = world_source.dir.join("aterm");
-        std::os::unix::fs::symlink(&real, &link).expect("link");
-        let mut world = World::new(CONFIG_OFF).expect("fresh private world");
-        let copy = cold_copy(&mut world, &link).expect("a cold copy");
-        let meta = std::fs::symlink_metadata(&copy.exe).expect("the copy");
-        assert!(meta.is_file(), "a file, not a link: {meta:?}");
-        assert!(copy.exe.starts_with(&world.dir), "{}", copy.exe.display());
-        assert_eq!(std::fs::read(&copy.exe).expect("read"), script);
-    }
-}
+#[path = "instance_cold_copy_tests.rs"]
+mod cold_copy_tests;
 
 #[cfg(test)]
-mod terminal_selection_tests {
-    use super::{Reply, terminal_request, terminal_selector};
-
-    #[test]
-    fn terminal_waits_name_the_registry_session_when_a_native_tab_is_front() {
-        for wait in [
-            &["ready"][..],
-            &["await", "idle", "500", "timeout=60000"][..],
-        ] {
-            let mut calls = Vec::new();
-            let reply = terminal_request(
-                |args| {
-                    calls.push(args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
-                    match args {
-                        ["sessions"] => Reply {
-                            stdout: "OK 2\n0 s-aa - exited previous active=0 wfocus=1\n7 s-bb - alive shell active=0 wfocus=1\n".into(),
-                            ..Reply::default()
-                        },
-                        ["@s-bb", rest @ ..] if rest == wait => Reply::default(),
-                        _ => Reply {
-                            code: 1,
-                            stderr: "ERR no active terminal".into(),
-                            ..Reply::default()
-                        },
-                    }
-                },
-                wait,
-            );
-            assert_eq!(reply.code, 0);
-            assert_eq!(calls.len(), 2, "discovery and one selected request");
-            assert_eq!(calls[1][0], "@s-bb");
-            assert_eq!(&calls[1][1..], wait);
-        }
-    }
-
-    #[test]
-    fn terminal_selection_tracks_the_focused_session_and_keeps_exited_commands_readable() {
-        let roster = "OK 3\n0 s-aa - alive active=1 active=0 wfocus=1\n1 s-bb - spawning shell active=1 wfocus=1\n2 s-cc - alive shell active=1 wfocus=0\n";
-        assert_eq!(terminal_selector(roster).as_deref(), Some("@s-bb"));
-        assert_eq!(
-            terminal_selector("0 s-aa - exited finished active=1 wfocus=1\n").as_deref(),
-            Some("@s-aa")
-        );
-        assert_eq!(terminal_selector("OK 0\n"), None);
-        assert_eq!(terminal_selector("0 native - native SystemState\n"), None);
-    }
-
-    #[test]
-    fn terminal_wait_errors_propagate_without_retrying_or_following_the_front() {
-        let mut calls = 0;
-        let reply = terminal_request(
-            |args| {
-                calls += 1;
-                if args == ["sessions"] {
-                    Reply {
-                        stdout: "0 s-aa - exited finished active=1 wfocus=1\n".into(),
-                        ..Reply::default()
-                    }
-                } else {
-                    assert_eq!(args, ["@s-aa", "ready"]);
-                    Reply {
-                        code: 3,
-                        stderr: "ERR selected session unavailable".into(),
-                        ..Reply::default()
-                    }
-                }
-            },
-            &["ready"],
-        );
-        assert_eq!(reply.code, 3);
-        assert_eq!(calls, 2);
-    }
-}
+#[path = "instance_terminal_selection_tests.rs"]
+mod terminal_selection_tests;
 
 #[cfg(test)]
-mod launch_line_tests {
-    use super::{Band, Launch, Via, line};
-    use std::path::{Path, PathBuf};
-
-    fn launch(headless: bool) -> Launch {
-        Launch {
-            aterm: PathBuf::from("/b/aterm"),
-            headless,
-            args: vec!["--columns".into(), "200".into()],
-            env: Vec::new(),
-            cwd: PathBuf::from("/w/home"),
-            sandbox: None,
-            reroute: false,
-        }
-    }
-
-    /// `lab instance` starts a window in the app band as a job, as it does a headless instance,
-    /// and either in the agent band as its child.
-    #[test]
-    fn the_app_band_starts_a_job_windowed_or_headless_and_the_agent_band_a_child() {
-        for headless in [false, true] {
-            let l = launch(headless);
-            assert_eq!(Via::of(&l, Band::App), Ok(Via::Job), "headless={headless}");
-            assert_eq!(
-                Via::of(&l, Band::Agent),
-                Ok(Via::Child),
-                "headless={headless}"
-            );
-            let sandboxed = Launch {
-                sandbox: Some("(version 1)".into()),
-                ..l
-            };
-            assert!(
-                Via::of(&sandboxed, Band::App).is_err(),
-                "headless={headless}"
-            );
-            assert_eq!(Via::of(&sandboxed, Band::Agent), Ok(Via::Child));
-        }
-    }
-
-    /// An app-band job's process is its line's program: a windowed instance's keeper, so its
-    /// aterm, the keeper's child, runs in the job's coalition, and as its own responsible
-    /// process (`--disclaim`, `tests/band.rs`); a child keeper's aterm is charged as the lab is.
-    #[test]
-    fn a_windowed_line_starts_its_keeper_and_a_headless_one_aterm_on_its_lifeline() {
-        let (keeper, sock) = (Path::new("/s/aterm-lab"), Path::new("/w/run/a.sock"));
-        let tail = [
-            "--no-reroute",
-            "--control-sock",
-            "/w/run/a.sock",
-            "--columns",
-            "200",
-        ];
-        let windowed = |keeper_flags: &[&str]| -> Vec<String> {
-            ["/s/aterm-lab", "keeper"]
-                .iter()
-                .chain(keeper_flags)
-                .chain(&["--", "/b/aterm", "--window"])
-                .chain(&tail)
-                .map(|a| (*a).to_string())
-                .collect()
-        };
-        let lifeline = aterm_uds::lifeline::STDIN.to_string();
-        let headless: Vec<String> = ["/b/aterm", "--headless", aterm_uds::lifeline::FLAG]
-            .into_iter()
-            .chain([lifeline.as_str()])
-            .chain(tail)
-            .map(str::to_string)
-            .collect();
-        assert_eq!(
-            line(&launch(false), Via::Job, keeper, sock),
-            windowed(&["--disclaim"])
-        );
-        assert_eq!(
-            line(&launch(false), Via::Child, keeper, sock),
-            windowed(&[])
-        );
-        assert_eq!(line(&launch(true), Via::Job, keeper, sock), headless);
-        assert_eq!(line(&launch(true), Via::Child, keeper, sock), headless);
-    }
-}
+#[path = "instance_launch_line_tests.rs"]
+mod launch_line_tests;
 
 #[cfg(test)]
-mod world_tests {
-    use super::*;
-
-    #[test]
-    fn ordinary_roots_reject_a_foreign_state_root_or_a_later_foreign_override() {
-        let world = World::new(CONFIG_OFF).expect("fresh private world");
-        let env = world.env();
-        assert!(ordinary_roots_match(&world, &env));
-        let mut unmarked = env.clone();
-        unmarked.retain(|(name, _)| name != "ATERM_STATE_HOME");
-        assert!(ordinary_roots_match(&world, &unmarked));
-        for name in [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_RUNTIME_DIR",
-            "ATERM_STATE_HOME",
-        ] {
-            let mut overridden = env.clone();
-            overridden.push((
-                name.into(),
-                world.dir.join("elsewhere").display().to_string(),
-            ));
-            assert!(!ordinary_roots_match(&world, &overridden), "{name}");
-            let why = Instance::start_ordinary_functional(
-                &world,
-                Launch {
-                    aterm: world.dir.join("must-not-start"),
-                    headless: false,
-                    args: Vec::new(),
-                    env: overridden,
-                    cwd: world.home.clone(),
-                    sandbox: None,
-                    reroute: false,
-                },
-                1024,
-            )
-            .err()
-            .expect("foreign roots refused before admission or spawn");
-            assert!(why.contains("private home, config and runtime"), "{why}");
-            assert!(!world.dir.join("aterm.log").exists());
-        }
-    }
-
-    #[test]
-    fn a_released_world_goes_when_it_drops() {
-        let mut kept = World::new(CONFIG_OFF).expect("fresh private world");
-        let dir = kept.dir.clone();
-        assert_eq!(dir.extension().and_then(|s| s.to_str()), Some("noindex"));
-        let observer = dir.join("cfg/aterm/network-state/observer.sock");
-        std::fs::create_dir(observer.parent().unwrap()).expect("network state");
-        let listener = std::os::unix::net::UnixListener::bind(&observer)
-            .expect("the longest world socket path fits after canonicalization");
-        drop(listener);
-        kept.keep();
-        drop(kept);
-        assert!(dir.is_dir(), "kept");
-        std::fs::remove_dir_all(&dir).unwrap();
-        let mut released = World::new(CONFIG_OFF).expect("fresh private world");
-        let dir = released.dir.clone();
-        released.keep();
-        released.release();
-        drop(released);
-        assert!(!dir.exists(), "released");
-    }
-}
+#[path = "instance_world_tests.rs"]
+mod world_tests;
 
 #[cfg(test)]
-mod bell_off_tests {
-    use super::*;
-
-    fn root_bell(text: &str) -> Option<bool> {
-        aterm_toml::from_str::<aterm_toml::Value>(text)
-            .ok()?
-            .get("bell_sound")
-            .and_then(aterm_toml::Value::as_bool)
-    }
-
-    #[test]
-    fn a_lab_world_starts_with_the_audible_bell_off() {
-        assert_eq!(
-            root_bell(CONFIG_OFF),
-            None,
-            "the base sets no bell_sound: aterm's default (on) would rule it",
-        );
-        let world = World::new(CONFIG_OFF).expect("fresh private world");
-        let text = std::fs::read_to_string(world.cfg.join("aterm/aterm.toml")).expect("written");
-        assert_eq!(root_bell(&text), Some(false), "{text}");
-        let doc = aterm_toml::from_str::<aterm_toml::Value>(&text).expect("one document");
-        assert_eq!(
-            doc.get("update")
-                .and_then(|t| t.get("enabled"))
-                .and_then(aterm_toml::Value::as_bool),
-            Some(false),
-            "the lanes stay off: {text}",
-        );
-    }
-
-    #[test]
-    fn a_bell_the_caller_sets_stands_alone() {
-        let asked = config_with(&["bell_sound = true".to_string()]);
-        assert!(
-            aterm_toml::from_str::<aterm_toml::Value>(&format!("bell_sound = false\n{asked}"))
-                .is_err(),
-            "a key written twice is no document",
-        );
-        assert_eq!(root_bell(&bell_off(&asked)), Some(true));
-        assert_eq!(bell_off(&asked), asked, "the caller's file, unchanged");
-    }
-
-    #[test]
-    fn a_bell_sound_inside_a_table_is_not_the_root_key() {
-        let text = bell_off("[x]\nbell_sound = true\n");
-        assert_eq!(root_bell(&text), Some(false), "{text}");
-        let doc = aterm_toml::from_str::<aterm_toml::Value>(&text).expect("one document");
-        assert_eq!(
-            doc.get("x")
-                .and_then(|t| t.get("bell_sound"))
-                .and_then(aterm_toml::Value::as_bool),
-            Some(true),
-        );
-    }
-}
+#[path = "instance_bell_off_tests.rs"]
+mod bell_off_tests;
 
 #[cfg(test)]
-mod harness_key_tests {
-    use aterm_agent::supervise::{Occupancy, SupervisorConfig};
-
-    use super::*;
-
-    #[test]
-    fn a_harness_key_lands_under_the_root_harness_table() {
-        let key = vec!["occupancy = \"prompt\"".to_string()];
-        let config = config_after(&config_with(&[]), true, &[]);
-        let keyed = with_harness_keys(&config, &key);
-        assert!(
-            keyed.contains("[harness]\nenabled = true\noccupancy = \"prompt\"\n"),
-            "{keyed}"
-        );
-        let (cfg, notes) = SupervisorConfig::from_aterm_toml(&keyed);
-        assert!(notes.is_empty(), "{notes:?}");
-        assert_eq!(cfg.occupancy, Occupancy::Prompt, "{keyed}");
-        assert!(cfg.enabled);
-        for unkeyed in [
-            with_harness_keys(&config, &[]),
-            config_after(&config_with(&[]), true, &key),
-        ] {
-            let (cfg, _) = SupervisorConfig::from_aterm_toml(&unkeyed);
-            assert_ne!(cfg.occupancy, Occupancy::Prompt, "{unkeyed}");
-        }
-        assert_eq!(with_harness_keys("[update]\n", &key), "[update]\n");
-    }
-}
+#[path = "instance_harness_key_tests.rs"]
+mod harness_key_tests;

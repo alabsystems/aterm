@@ -5044,7 +5044,7 @@ fn an_overdue_move_names_its_cause_by_class() {
         held_by: if held { vec![zsh.clone()] } else { Vec::new() },
         ..pending_with(wait)
     };
-    let classes: [(&[&str], Cause, &str, bool); 9] = [
+    let classes: [(&[&str], Cause, &str, bool); 10] = [
         (
             &[
                 "not-idle:busy",
@@ -5099,7 +5099,21 @@ fn an_overdue_move_names_its_cause_by_class() {
             "tab-unread",
             false,
         ),
-        (&["in-flight"], Cause::UnderWay, "under-way", false),
+        (
+            &["in-flight", "confirming"],
+            Cause::UnderWay,
+            "under-way",
+            false,
+        ),
+        (
+            &[
+                crate::harness::upgrade_drive::UNREAD_VERSION,
+                "version-unreadable",
+            ],
+            Cause::VersionUnread,
+            "version-unread",
+            false,
+        ),
         (
             &[
                 "tab-not-live",
@@ -5143,6 +5157,38 @@ fn an_overdue_move_names_its_cause_by_class() {
         assert_eq!(row.cause_word(NOW), "unclassified", "{wait}");
         assert!(row.overdue_cause(NOW).contains(wait), "{wait}: named");
     }
+}
+
+/// `no-version`, the wait the watch records while a version is unread, is classed and worded for
+/// what it is in every line the status prints: its own class, never `a wait aterm does not
+/// classify` and never a tab aterm cannot read, with or without a `release:` prefix. CONTROL: a
+/// word no arm names stays unclassified.
+#[test]
+fn an_unread_build_is_a_wait_the_status_classifies() {
+    let wait = crate::harness::upgrade_drive::UNREAD_VERSION;
+    assert_eq!(wait, "no-version");
+    assert_eq!(wait_class(wait), WaitClass::VersionUnread);
+    assert_eq!(wait_class("release:no-version"), WaitClass::VersionUnread);
+    assert_eq!(wait_class("no-such-version"), WaitClass::Unclassified);
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Muse] {
+        let row = Row {
+            agent,
+            wait_seen: NOW,
+            ..pending_with(wait)
+        };
+        let overdue = row.overdue_cause(NOW);
+        let line = row.waiting_line("09:00");
+        for words in [&overdue, &line] {
+            assert!(
+                words.contains("build it would move to") && !words.contains("its tab"),
+                "{agent:?}: {words}"
+            );
+        }
+    }
+    assert_eq!(
+        wait_words_of(upgrade::Agent::Claude, wait),
+        Some("aterm is still reading which build it would move to")
+    );
 }
 
 #[test]
@@ -5617,14 +5663,16 @@ fn a_limit_whose_named_reset_has_passed_is_told() {
 }
 
 /// Once the agent was told what waits on its own work ([`upgrade::Step::Tell`]), the row says so
-/// (`agent_told=`, `agent_tells`), and the person's digest line says it as a fact, not as a step
-/// of theirs. A tell about another build is none about this one.
+/// (`agent_told=`, `agent_tells`) with the deadline the line named (`agent_deadline_at`), and the
+/// person's digest line says when aterm restarts it as a fact, not as a step of theirs. A tell
+/// about another build is none about this one; the deadline is the process's, whatever build.
 #[test]
 fn a_told_agent_is_on_the_row_and_the_digest_says_it_as_a_fact() {
     let untold = pending(MOVE_BUDGET_S + 60);
     let told = Row {
         agent_tells: 1,
         agent_told_at: NOW - 600,
+        agent_deadline_at: NOW + 3_000,
         ..untold.clone()
     };
     let field = |row: &Row| {
@@ -5634,12 +5682,16 @@ fn a_told_agent_is_on_the_row_and_the_digest_says_it_as_a_fact() {
             .map(str::to_string)
     };
     assert_eq!(field(&untold).as_deref(), Some("-"));
-    assert_eq!(field(&told).as_deref(), Some("1/3@10m"));
+    assert_eq!(field(&told).as_deref(), Some("1/1@10m"));
     let json = told.to_json(NOW);
     assert_eq!(json.get("agent_tells").and_then(Value::as_u64), Some(1));
     assert_eq!(
         json.get("agent_told_at").and_then(Value::as_u64),
         Some(NOW - 600)
+    );
+    assert_eq!(
+        json.get("agent_deadline_at").and_then(Value::as_u64),
+        Some(NOW + 3_000)
     );
     let then = |row: &Row| match row.attention(NOW) {
         Attention::Digest(need) => need.then,
@@ -5647,9 +5699,26 @@ fn a_told_agent_is_on_the_row_and_the_digest_says_it_as_a_fact() {
     };
     assert_eq!(
         then(&told),
-        "aterm told the agent, and it moves once none of its own work runs"
+        "aterm told the agent: it restarts at its first turn end in 50m"
+    );
+    assert_eq!(
+        then(&Row {
+            agent_deadline_at: NOW - 60,
+            ..told.clone()
+        }),
+        "aterm told the agent: it restarts at its next turn end"
     );
     assert_ne!(then(&untold), then(&told));
+    for row in [&untold, &told] {
+        let Attention::Digest(need) = row.attention(NOW) else {
+            panic!("{row:?}");
+        };
+        assert!(
+            !need.why.contains("never ends"),
+            "aterm ends that work at its deadline: {}",
+            need.why
+        );
+    }
     let st = St {
         phase: Phase::Pending,
         to: "2.1.283".into(),
@@ -5657,9 +5726,15 @@ fn a_told_agent_is_on_the_row_and_the_digest_says_it_as_a_fact() {
         tells: 2,
         told_at: NOW - 60,
         told_to: "2.1.282".into(),
+        deadline_at: NOW + 3_540,
         ..St::default()
     };
     assert_eq!(Row::of("s", &st, NOW).agent_tells, 0, "another build's");
+    assert_eq!(
+        Row::of("s", &st, NOW).agent_deadline_at,
+        NOW + 3_540,
+        "the deadline stands whatever build its line named"
+    );
     let st = St {
         told_to: "2.1.283".into(),
         ..st
@@ -5801,10 +5876,12 @@ const WAITS: &[&str] = &[
     "argv-unreadable",
     "exe-unreadable",
     "version-unreadable",
+    "no-version",
     "home-unreadable",
     "tab-not-live",
     "no-socket",
     "conversation-in-other-tab",
+    crate::harness::upgrade_drive::UNREAD_VERSION,
 ];
 
 #[test]
@@ -6117,6 +6194,7 @@ fn a_whole_round_never_flips_the_owners_line_at_its_acts() {
                 name: "zsh".into(),
                 age_s: 600,
                 command: String::new(),
+                ..upgrade::Held::default()
             }]
         } else {
             Vec::new()
@@ -6852,6 +6930,45 @@ fn aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark() {
     assert_eq!(wait_class("home-unreadable"), WaitClass::TabUnread);
 }
 
+/// A version that went unread (`wait:no-version`: Claude Code's managed build, or Muse Code's or
+/// agy's running build or target) is aterm's own wait of its own class (`version-unread`), and like
+/// a tab aterm cannot read it is aterm's one-line fault once it stands past [`HARNESS_TELL_S`]: a
+/// lane that stays blind is said, never left quiet. CONTROLS: younger, it is quiet; a person's
+/// wait standing as long is no fault of aterm's.
+#[test]
+fn a_version_unread_past_the_bound_is_aterms_fault() {
+    let at = |agent, wait: &str, waited: u64| Row {
+        agent,
+        wait_since: NOW - waited,
+        ..pending_with(wait)
+    };
+    for agent in [
+        upgrade::Agent::Claude,
+        upgrade::Agent::Muse,
+        upgrade::Agent::Agy,
+    ] {
+        let unread = |waited| at(agent, crate::harness::upgrade_drive::UNREAD_VERSION, waited);
+        let young = unread(HARNESS_TELL_S - 60);
+        assert_eq!(young.cause(), Cause::VersionUnread, "{agent:?}");
+        assert_eq!(young.cause_word(NOW), "version-unread", "{agent:?}");
+        assert_eq!(young.attention(NOW), Attention::Quiet, "{agent:?}: young");
+        let old = unread(HARNESS_TELL_S + 60);
+        assert!(
+            matches!(old.attention(NOW), Attention::Fault(ref n) if n.kind == "harness-stuck"),
+            "{agent:?}: {:?}",
+            old.attention(NOW)
+        );
+        assert_eq!(old.badge(NOW), None, "{agent:?}: a fault marks no tab");
+        assert!(
+            !matches!(
+                at(agent, "draft", HARNESS_TELL_S + 60).attention(NOW),
+                Attention::Fault(_)
+            ),
+            "CONTROL: {agent:?}: a person's wait is not aterm's fault"
+        );
+    }
+}
+
 #[test]
 fn the_status_json_says_how_loud_the_owner_is_told_and_why() {
     let text = |row: &Row, key: &str| {
@@ -7159,6 +7276,7 @@ fn looks_at_the_same_work_do_not_change_the_row() {
             name: "zsh".into(),
             age_s: now - t0,
             command: String::new(),
+            ..upgrade::Held::default()
         }]
     };
     let mut rows: Vec<Row> = Vec::new();

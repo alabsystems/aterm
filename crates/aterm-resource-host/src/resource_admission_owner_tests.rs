@@ -241,10 +241,19 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let root =
-            aterm_uds::test_binary::scratch_root().expect("fixture requires Cargo test isolation");
-        Self::at(root)
+        aterm_uds::test_binary::scratch_root().expect("fixture requires Cargo test isolation");
+        // The test binary sweeps its whole root at exit, including a failed fixture that
+        // skipped its own removal. Own this directory independently so panic evidence
+        // survives that sweep; normal Drop still removes successful fixtures in place.
+        let path = aterm_tempfile::Builder::new()
+            .prefix("owner-engine-")
+            .suffix(".noindex")
+            .tempdir()
+            .unwrap()
+            .keep();
+        Self::created(path)
     }
+    #[cfg(target_os = "macos")]
     fn at(root: &std::path::Path) -> Self {
         let path = root.join(".ubd").join(format!(
             "owner-engine-{}.noindex",
@@ -255,6 +264,10 @@ impl Scratch {
             .mode(0o700)
             .create(&path)
             .unwrap();
+        Self::created(path)
+    }
+
+    fn created(path: PathBuf) -> Self {
         eprintln!("actual owner fixture: {}", path.display());
         Self {
             legacy: path.join("legacy"),
@@ -262,6 +275,71 @@ impl Scratch {
             preserve: false,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+const RETENTION_PROBE: &str = "ATERM_OWNER_FIXTURE_RETENTION_PROBE";
+
+#[test]
+#[cfg(target_os = "macos")]
+fn owner_fixture_retention_child() {
+    if std::env::var_os(RETENTION_PROBE).is_none() {
+        return;
+    }
+    let root = aterm_uds::test_binary::scratch_root().unwrap();
+    println!("retention-probe-root={}", root.display());
+    let successful = Scratch::new();
+    let removed = successful.path.clone();
+    drop(successful);
+    assert!(!removed.exists(), "successful fixtures are still removed");
+    assert!(
+        std::panic::catch_unwind(|| {
+            let scratch = Scratch::new();
+            std::fs::write(scratch.path.join("evidence"), b"original fixture evidence").unwrap();
+            println!("retention-probe-fixture={}", scratch.path.display());
+            panic!("controlled fixture failure");
+        })
+        .is_err()
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn owner_fixture_panic_evidence_survives_its_process_root_sweep() {
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "actor::owner::tests::owner_fixture_retention_child",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(RETENTION_PROBE, "1");
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        HANG,
+        "owner fixture retention probe",
+    )
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let path = |prefix: &str| {
+        PathBuf::from(
+            stdout
+                .lines()
+                .find_map(|line| line.split_once(prefix).map(|(_, path)| path))
+                .unwrap_or_else(|| panic!("missing {prefix}: {stdout}")),
+        )
+    };
+    let root = path("retention-probe-root=");
+    let fixture = path("retention-probe-fixture=");
+    assert!(!root.exists(), "the actual process root sweep must run");
+    assert_eq!(
+        std::fs::read(fixture.join("evidence")).unwrap(),
+        b"original fixture evidence"
+    );
+    // This fixture contains only the sentinel above; the child has already exited.
+    std::fs::remove_dir_all(fixture).unwrap();
 }
 
 impl Drop for Scratch {
@@ -623,7 +701,7 @@ fn queue_owned(
         primary: None,
         resolver: None,
         bootstrap_graph: None,
-        submission,
+        submission: submission.into(),
         events,
         recipe: Some(recipe::Recipe {
             ay: None,
@@ -644,6 +722,8 @@ fn queue_owned(
         admitted: None,
         scope_reference: None,
         cancelled: false,
+        preflight: None,
+        probe_scope: None,
     });
     (binding, reference, client)
 }
@@ -671,9 +751,23 @@ impl Drop for World {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[track_caller]
 fn read_event(client: &CtlStream, binding: &Binding) -> Event {
-    let bytes = wire::read_frame(client, Instant::now() + HANG).unwrap();
-    EventFrame::decode(&bytes, binding).unwrap().event
+    read_event_in_phase(client, binding, "lifecycle")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[track_caller]
+fn read_event_in_phase(client: &CtlStream, binding: &Binding, phase: &str) -> Event {
+    let caller = std::panic::Location::caller();
+    let bytes = wire::read_frame(client, Instant::now() + HANG).unwrap_or_else(|error| {
+        panic!("{phase} event read at {caller} for {binding:?} failed: {error:?}")
+    });
+    EventFrame::decode(&bytes, binding)
+        .unwrap_or_else(|error| {
+            panic!("{phase} event decode at {caller} for {binding:?} failed: {error:?}")
+        })
+        .event
 }
 
 #[test]
@@ -772,25 +866,53 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
     crate::runtime::test_endpoint().unwrap();
     for cancel_caller in [false, true] {
         let mut world = World::new();
-        let budget = Duration::from_millis(250);
+        let budget = HANG;
         let (binding, memory, client) = world.queue_sleep(budget);
-        assert_eq!(read_event(&client, &binding), Event::Queued);
+        // Keep the real child live until its owner terminates it. A sleeper with its
+        // own deadline could exit while successful native inspections are progressing.
+        let (input, continuation) = io::pipe().unwrap();
+        let pending = world.owner.pending.back_mut().unwrap();
+        pending.submission.request.argv = vec![b"/bin/cat".to_vec()];
+        pending.submission.fds.stdin = input.into();
+        let recipe = pending.recipe.as_mut().unwrap();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        assert_eq!(
+            read_event_in_phase(&client, &binding, "Queued"),
+            Event::Queued
+        );
         assert_eq!(world.owner.debt.reserved().unwrap(), 0);
-        // Deliberately remain queued longer than the execution budget. A queue timestamp
-        // used as the launch clock would now fail the Started/actual-runtime assertions.
-        let queued = Instant::now();
-        while queued.elapsed() < budget + POLL {
-            std::thread::sleep(POLL);
-        }
+        // A stale queue clock must not become the execution clock. Backdate it instead
+        // of requiring durable native preparation to fit a short wall-clock budget.
+        world.owner.pending.back_mut().unwrap().queued_at = Instant::now() - budget - POLL;
         assert!(world.owner.jobs.is_empty());
+        let launch_window = Instant::now();
         world.owner.tick_queue(); // Real advance -> prepare -> retained fixed grant -> launch.
         assert!(world.owner.failed.is_empty() && !world.owner.faulted);
+        assert!(
+            world
+                .owner
+                .jobs
+                .get(&(binding.session.clone(), binding.attempt))
+                .is_some_and(|job| job.launched),
+            "before Started: pending={}, jobs={}, failed={}, faulted={}, journal={:?}, faults={}",
+            world.owner.pending.len(),
+            world.owner.jobs.len(),
+            world.owner.failed.len(),
+            world.owner.faulted,
+            world.owner.journal.outstanding(),
+            world.owner.journal.fault_summary(),
+        );
+        assert!(
+            world.owner.jobs[&(binding.session.clone(), binding.attempt)].started >= launch_window,
+            "the launched execution clock must come from this launch, not the stale queue clock"
+        );
         let Event::Started {
             pid,
             birth,
             monotonic_ns,
             unix_ns,
-        } = read_event(&client, &binding)
+        } = read_event_in_phase(&client, &binding, "Started")
         else {
             panic!("actual host failed to publish Started")
         };
@@ -880,6 +1002,9 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             CohortClaimState::Retained
         );
         if cancel_caller {
+            // Cancellation owns this branch; native inspection time must not turn it
+            // into the separate timeout branch before the channel closes.
+            job.timeout = None;
             drop(client);
             assert!(
                 world
@@ -894,12 +1019,15 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             );
             world.settle();
         } else {
+            // Expire only the positively launched original job. The actual owner must
+            // still signal, reap and settle its real child and retained resources.
+            job.started = Instant::now() - budget;
             world.settle();
             let Event::Finished {
                 outcome,
                 cause,
                 runtime_ns,
-            } = read_event(&client, &binding)
+            } = read_event_in_phase(&client, &binding, "Finished after timeout")
             else {
                 panic!("actual host failed to publish Finished")
             };
@@ -908,6 +1036,7 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             assert!(runtime_ns >= budget.as_nanos() as u64);
         }
         world.assert_settled(&binding, &memory, pid);
+        drop(continuation);
     }
 }
 

@@ -14,11 +14,11 @@ use crate::error::{Error, Result};
 /// Maximum bytes retained in one machine-hour. Crossing it reports incomplete
 /// attribution at the caller; it never suppresses a GitHub operation.
 #[cfg(unix)]
-const HOUR_MAX: usize = 64 * 1024 * 1024;
+const HOUR_MAX: usize = aterm_ctl::github_usage::HOUR_MAX;
 
 impl RateBook {
     /// Append one attempt's attribution. The caller reports any failure, including
-    /// the explicit 64 MiB/hour storage bound, separately from its GitHub result.
+    /// the explicit per-hour storage bound, separately from its GitHub result.
     pub(crate) fn record_call(&self, now: u64, row: &Value) -> Result<()> {
         #[cfg(unix)]
         {
@@ -43,11 +43,26 @@ impl RateBook {
             let hour = now / 3600;
             let _lock = PrivateLock::take(
                 &dir,
-                &format!("{hour}.lock"),
+                "calls.lock",
                 Duration::from_secs(60),
                 "rate attribution hour is still locked after 60 seconds",
             )
             .map_err(local)?;
+            // One lock covers append and retention across processes. Keep exactly the
+            // current UTC hour and its preceding 23 hours, including failure markers.
+            for entry in std::fs::read_dir(&dir).map_err(local)? {
+                let entry = entry.map_err(local)?;
+                let name = entry.file_name();
+                let Some((stem, ext)) = name.to_str().and_then(|s| s.split_once('.')) else {
+                    continue;
+                };
+                if matches!(ext, "jsonl" | "incomplete" | "lock")
+                    && let Ok(old) = stem.parse::<u64>()
+                    && (old < hour.saturating_sub(23) || old > hour)
+                {
+                    std::fs::remove_file(entry.path()).map_err(local)?;
+                }
+            }
             let mut file = open_private_rw(&dir, &format!("{hour}.jsonl")).map_err(local)?;
             let mut bytes = aterm_json::to_vec(row).map_err(local)?;
             bytes.push(b'\n');
@@ -76,7 +91,7 @@ impl RateBook {
     }
 
     /// Read every attempt recorded in one UTC hour (`Unix seconds / 3600`).
-    /// The files remain on their originating machine until explicitly removed.
+    /// The last 24 UTC hours remain on their originating machine.
     /// # Errors
     /// Unreadable, oversized or incomplete attribution, or an unavailable rate book.
     pub fn calls_in_hour(&self, hour: u64) -> Result<Vec<Value>> {
@@ -98,7 +113,7 @@ impl RateBook {
             }
             let _lock = PrivateLock::take(
                 &dir,
-                &format!("{hour}.lock"),
+                "calls.lock",
                 std::time::Duration::from_secs(60),
                 "rate attribution hour is still locked after 60 seconds",
             )
@@ -142,49 +157,5 @@ fn local(error: impl std::fmt::Display) -> Error {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_rows_are_complete_and_storage_bound_is_explicit() {
-        let root = crate::test_fixtures::scratch_dir("rate-usage");
-        let book = RateBook::at(root.path().join("rate"));
-        std::thread::scope(|scope| {
-            for caller in 0..8 {
-                let book = &book;
-                scope.spawn(move || {
-                    for at in 0..16 {
-                        book.record_call(at, &aterm_json::json!({"caller": caller, "at": at}))
-                            .unwrap();
-                    }
-                });
-            }
-        });
-        let rows = book.calls_in_hour(0).unwrap();
-        assert_eq!(rows.len(), 128);
-        let distinct: std::collections::BTreeSet<_> = rows
-            .iter()
-            .map(|row| (row["caller"].as_u64().unwrap(), row["at"].as_u64().unwrap()))
-            .collect();
-        assert_eq!(distinct.len(), 128);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(root.path().join("rate/calls/0.jsonl"))
-            .unwrap();
-        file.set_len(HOUR_MAX as u64).unwrap();
-        let error = book
-            .record_call(0, &aterm_json::json!({"at": 0}))
-            .unwrap_err();
-        assert!(error.why.contains("67108864-byte machine-hour bound"));
-        assert!(
-            book.calls_in_hour(0)
-                .unwrap_err()
-                .why
-                .contains("incomplete")
-        );
-        // A full hour leaves the next hour writable.
-        book.record_call(3600, &aterm_json::json!({"at": 3600}))
-            .unwrap();
-        assert_eq!(book.calls_in_hour(1).unwrap().len(), 1);
-    }
-}
+#[path = "usage_tests.rs"]
+mod tests;

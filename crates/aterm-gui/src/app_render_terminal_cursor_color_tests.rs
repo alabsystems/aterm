@@ -60,7 +60,7 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
 fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
     use crate::cursor_glow::BlockFillOwner;
     for (style, owner, hi, lo) in [
-        ("rainbow kitty", BlockFillOwner::Rainbow, 200, 110),
+        ("rainbow", BlockFillOwner::Rainbow, 200, 110),
         ("phaser", BlockFillOwner::Phaser, 180, 130),
     ] {
         let mut app = App::headless_for_test();
@@ -147,7 +147,7 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         app.trail_status().expect("a front window exists")
     };
 
-    let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
+    let line = status_after_projection(&mut app, "rainbow", [0xFF, 0x00, 0x00], t0);
     assert!(
         line.contains(" block_fill=rainbow")
             && line.contains(" block_fill_base=none")
@@ -167,7 +167,7 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
     );
 
     app.config.cursor_color = Some("#ff0000".into());
-    let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
+    let line = status_after_projection(&mut app, "rainbow", [0xFF, 0x00, 0x00], t0);
     assert!(
         line.contains(" block_fill=rainbow")
             && line.contains(" block_fill_base=ff0000")
@@ -214,7 +214,7 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
     app.windows.get_mut(&wid).expect("fixture window").focused = false;
     let line = status_after_projection(
         &mut app,
-        "rainbow kitty",
+        "rainbow",
         [0xFF, 0x00, 0x00],
         t0 + Duration::from_millis(48),
     );

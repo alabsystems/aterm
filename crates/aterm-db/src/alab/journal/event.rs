@@ -97,6 +97,32 @@ impl Kind {
     }
 }
 
+/// The reason word of an `auth` event whose login reads signed in: the standing word a Mac
+/// states with no sign-in of its own to report.
+pub const AUTH_OK: &str = "ok";
+/// The reason word of an `auth` event that withdraws its Mac's word: the login the word was
+/// read of is no longer the account's there.
+pub const AUTH_UNSEEN: &str = "unseen";
+
+/// A Mac's sign-in word for one account (design §7: signed in, signed out, ended, wrong,
+/// unknown; `failed` is a sign-in that bound no login on an account not signed in there).
+pub const SIGNIN_IN: &str = "in";
+pub const SIGNIN_OUT: &str = "out";
+pub const SIGNIN_ENDED: &str = "ended";
+pub const SIGNIN_WRONG: &str = "wrong";
+pub const SIGNIN_FAILED: &str = "failed";
+/// The Mac withdrew its word: it holds none, and an older event never restores one.
+pub const SIGNIN_UNKNOWN: &str = "unknown";
+/// Every sign-in word.
+pub const SIGNIN_WORDS: [&str; 6] = [
+    SIGNIN_IN,
+    SIGNIN_OUT,
+    SIGNIN_ENDED,
+    SIGNIN_WRONG,
+    SIGNIN_FAILED,
+    SIGNIN_UNKNOWN,
+];
+
 /// The reason word a `seen` event carries on a first sighting of its (tab, account) pair.
 pub const SEEN_FIRST: &str = "first";
 /// The reason word a `seen` event carries when a tab's account changed.
@@ -255,6 +281,31 @@ pub struct Event {
 }
 
 impl Event {
+    /// The sign-in word this event states of its account on the Mac that logged it, where it
+    /// states one: the one mapping every fold reads (this Mac's book, the window's readers and
+    /// the relay), so no two of them can read one event two ways.
+    ///
+    /// An `auth` event states the login's standing word: `ok` is `in` (a login that reads
+    /// working again with no sign-in to report) and `unseen` withdraws the Mac's word; any other
+    /// reason (`epoch`) states none. A `seen` states none: a profile file names its account long
+    /// after the login ended, so a sighting never says `in` over an `ended`; and a
+    /// `wrong-account` that names a tab is a belief corrected, not a sign-in word.
+    pub fn signin(&self) -> Option<&'static str> {
+        match self.kind {
+            Kind::SignedIn | Kind::Renewed => Some(SIGNIN_IN),
+            Kind::SignedOut | Kind::Displaced => Some(SIGNIN_OUT),
+            Kind::LoginEnded => Some(SIGNIN_ENDED),
+            Kind::WrongAccount if self.tab.is_none() => Some(SIGNIN_WRONG),
+            Kind::SignInFailed => Some(SIGNIN_FAILED),
+            Kind::Auth => match self.why.as_ref().map(Word::as_str) {
+                Some(AUTH_OK) => Some(SIGNIN_IN),
+                Some(AUTH_UNSEEN) => Some(SIGNIN_UNKNOWN),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether the flusher sends this event out on its next pass (design §3.9): a sharp kind,
     /// or a `seen` of a tab's first sighting or changed account. An hourly refresh of a
     /// sighting waits for the routine flush.

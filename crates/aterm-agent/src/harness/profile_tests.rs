@@ -20,6 +20,15 @@ impl super::super::provider_read::FooterHost for FooterFixture<'_> {
     }
 }
 
+/// The Muse account records of a test whose user home is `home`: under that scratch home,
+/// never the machine's, and gone with it.
+fn muse_store(home: &Path) -> super::super::observed_account::Store {
+    super::super::observed_account::Store::at(
+        &home.join(".aterm-test-harness-state"),
+        super::super::journal::ObservedCli::Muse,
+    )
+}
+
 fn muse_subscription_for(
     argv: &[String],
     env: &[String],
@@ -27,7 +36,15 @@ fn muse_subscription_for(
     prev: &SubscriptionDisplay,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
-    super::muse_subscription_for(argv, env, home, prev, now, &FooterFixture { argv, env })
+    super::muse_subscription_in(
+        &muse_store(home),
+        argv,
+        env,
+        home,
+        prev,
+        now,
+        &FooterFixture { argv, env },
+    )
 }
 
 fn agy_subscription_for(
@@ -65,11 +82,21 @@ fn agy_subscription_in_dir(
         home,
         prev,
         model,
-        now,
+        (now, None),
         &FooterFixture { argv, env },
     )
 }
 
+/// The account gate of the agy session `env` runs, its pool kept under `home` (the user's home):
+/// the session's own `HOME` is its login.
+#[cfg(unix)]
+fn agy_gate(env: &[String], home: &Path) -> super::super::agy_gate::Gate {
+    let login = non_empty_env_var(env, "HOME").map(Path::new);
+    super::super::agy_gate::Gate::at(&home.join("gate-state"), home, None, login)
+}
+
+/// The footer's agy read for a login the account state knows signed in: a turn it served is put
+/// on record first, as the footer's own hook does.
 #[cfg(unix)]
 fn agy_subscription_with_store(
     argv: &[String],
@@ -80,6 +107,34 @@ fn agy_subscription_with_store(
     now: i64,
     store: Option<&super::super::agy_quota_store::Store>,
 ) -> Option<SubscriptionDisplay> {
+    let gate = agy_gate(env, home);
+    gate.served(None, 1, 1);
+    agy_subscription_gated(
+        argv,
+        env,
+        home,
+        prev,
+        model,
+        now,
+        (store, Some(&gate), None),
+    )
+}
+
+/// The footer's agy read behind `gate`, with the session's `served` turn as evidence.
+#[cfg(unix)]
+fn agy_subscription_gated(
+    argv: &[String],
+    env: &[String],
+    home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+    (store, gate, served): (
+        Option<&super::super::agy_quota_store::Store>,
+        Option<&super::super::agy_gate::Gate>,
+        Option<i64>,
+    ),
+) -> Option<SubscriptionDisplay> {
     super::agy_subscription_with_store_in_dir(
         argv,
         env,
@@ -88,7 +143,7 @@ fn agy_subscription_with_store(
         prev,
         model,
         now,
-        store,
+        (store, gate, served),
         &FooterFixture { argv, env },
     )
 }
@@ -161,7 +216,22 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     let display = parse_subscription(text.as_bytes(), now).unwrap();
     assert_eq!(display.email.as_deref(), Some("owner@example.com"));
     assert_eq!(display.plan.as_deref(), Some("Max 5x"));
-    assert_eq!(display.weekly.as_deref(), Some("weekly 71% used"));
+    assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+    // The cache's five-hour row while its window runs, and its credits word.
+    let five_reset = DAY + 18 * 3600 + 5 * 60;
+    assert_eq!(
+        display.five_hour,
+        Some(WeeklyFigure {
+            used_x10: 625,
+            resets_at: five_reset,
+            at: now,
+        })
+    );
+    assert_eq!(display.credits, Some("on"));
+    let past_five = parse_subscription(text.as_bytes(), five_reset).unwrap();
+    assert_eq!(past_five.five_hour, None, "its window reset: no figure");
+    let before = parse_subscription(text.as_bytes(), five_reset - 1).unwrap();
+    assert!(before.five_hour.is_some(), "CONTROL: held to its reset");
     assert!(!format!("{display:?}").contains(SENTINEL));
     assert!(!format!("{:?}", parse(text.as_bytes()).unwrap()).contains("owner@example.com"));
 
@@ -184,7 +254,7 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     let aged = parse_subscription(text.as_bytes(), now + 15 * 60 + 1).unwrap();
     assert_eq!(
         aged.weekly.as_deref(),
-        Some("weekly \u{2265}71% used"),
+        Some("weekly \u{2264}29% left"),
         "past fifteen minutes the cache shows as a lower bound"
     );
     for time in [now - 61, now + 60 * 60 + 1, DAY + 10 * 24 * 60 * 60] {
@@ -196,9 +266,10 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     }
 }
 
-/// Line D's fallback unit takes the figure alone from any weekly words: an exact share, a lower
-/// bound, a wall's `out`, a screen's share; none from a gap's words. Negative control: the
-/// retired `% left` words give none, so no unit ever says a share left.
+/// Line D's fallback unit takes the figure alone from any weekly words, with its word: an exact
+/// share left, an upper bound, a wall's `out`, a screen's share; none from a gap's words; and
+/// [`weekly_figure_said`] reads each back as the use it is. Negative control: the retired `% used`
+/// words give none, so no unit ever says a bare or used share.
 #[test]
 fn weekly_figure_words_reads_every_weekly_form() {
     const AT: i64 = 1_792_050_000;
@@ -209,24 +280,32 @@ fn weekly_figure_words_reads_every_weekly_form() {
     };
     let exact = figure.words(AT).expect("current");
     let bound = figure.words(AT + 30 * 60).expect("aged");
-    assert_eq!(weekly_figure_words(&exact), Some("38%"));
-    assert_eq!(weekly_figure_words(&bound), Some("\u{2265}38%"));
+    assert_eq!(weekly_figure_words(&exact), Some("62% left"));
+    assert_eq!(weekly_figure_words(&bound), Some("\u{2264}62% left"));
     assert_eq!(weekly_figure_words(WEEKLY_OUT), Some("out"));
-    assert_eq!(weekly_figure_words("weekly 22% used"), Some("22%"));
+    assert_eq!(weekly_figure_words("weekly 78% left"), Some("78% left"));
+    assert_eq!(
+        weekly_figure_said("weekly \u{2264}62% left"),
+        Some(super::super::outlook::Figure::AtLeast(380))
+    );
+    assert_eq!(
+        weekly_figure_said("weekly 62% left"),
+        Some(super::super::outlook::Figure::Exact(380))
+    );
     for gap in [WeeklyGap::TapOff, WeeklyGap::NoReply, WeeklyGap::Stale] {
         assert_eq!(weekly_figure_words(gap.words()), None, "{gap:?}");
     }
     assert_eq!(
-        weekly_figure_words("weekly 62% left"),
+        weekly_figure_words("weekly 38% used"),
         None,
-        "NEGATIVE CONTROL: the retired words"
+        "NEGATIVE CONTROL: the retired words, which said use"
     );
 }
 
 /// Every weekly figure's age rule: exact for fifteen minutes, then a lower bound (`≥`, use only
-/// rises within a window) up to an hour; nothing older, from the future or past its reset. The
-/// share is the one used, never `% left` (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-/// §2.1): an exact tenth rounds half up, a bound down.
+/// rises within a window, so what is left is at most `≤`) up to an hour; nothing older, from the
+/// future or past its reset. The share is the one left (`harness::left`, owner 2026-11-09): an
+/// exact reading says 100 less its use rounded half up, a bound 100 less its use rounded down.
 #[test]
 fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
     const AT: i64 = 1_792_050_000;
@@ -236,15 +315,15 @@ fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
         at: AT,
     };
     let words = |elapsed: i64| figure.words(AT + elapsed);
-    assert_eq!(words(0).as_deref(), Some("weekly 38% used"));
-    assert_eq!(words(15 * 60).as_deref(), Some("weekly 38% used"));
+    assert_eq!(words(0).as_deref(), Some("weekly 62% left"));
+    assert_eq!(words(15 * 60).as_deref(), Some("weekly 62% left"));
     assert!(figure.current(AT + 15 * 60) && !figure.current(AT + 15 * 60 + 1));
-    assert_eq!(words(16 * 60).as_deref(), Some("weekly \u{2265}38% used"));
-    assert_eq!(words(60 * 60).as_deref(), Some("weekly \u{2265}38% used"));
+    assert_eq!(words(16 * 60).as_deref(), Some("weekly \u{2264}62% left"));
+    assert_eq!(words(60 * 60).as_deref(), Some("weekly \u{2264}62% left"));
     assert_eq!(words(61 * 60), None, "older than an hour");
     assert_eq!(
         words(-60).as_deref(),
-        Some("weekly 38% used"),
+        Some("weekly 62% left"),
         "stamped up to a minute ahead of this clock: just read"
     );
     assert!(figure.current(AT - 60));
@@ -258,7 +337,7 @@ fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
         used_x10: 385,
         ..figure
     };
-    assert_eq!(tenths.words(AT).as_deref(), Some("weekly 39% used"));
+    assert_eq!(tenths.words(AT).as_deref(), Some("weekly 61% left"));
     let older = WeeklyFigure {
         at: AT - 1,
         ..tenths
@@ -389,7 +468,7 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
         "the week shown is the profile's own account's"
     );
     assert_eq!(first.plan.as_deref(), Some("Max 5x"));
-    assert_eq!(first.weekly.as_deref(), Some("weekly 71% used"));
+    assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
     assert!(read(&second_env, Some(&roster)).is_none());
 
     write("second@example.com");
@@ -1998,109 +2077,78 @@ fn identity_observation_rejects_nonregular_and_oversized_inputs() {
     );
 }
 
-/// THE USAGE CACHE SERVES A LANDED READING WITHOUT A FETCH only while it is
-/// current, treats a plan-only landing as landed for the same window, and holds
-/// a failed attempt for the host's mint bound — never erasing a good reading.
+/// THE RECORD SERVES A LANDED READING WITHOUT A READ only while it is current, and treats a
+/// plan-only landing as landed for the same window; a read that gave nothing is never fresh.
 #[test]
-fn muse_usage_cache_freshness_separates_attempts_from_landings() {
+fn muse_usage_record_freshness_separates_attempts_from_landings() {
+    use super::super::accounts::Auth;
+    use super::super::observed_account::Record;
     let figure = |at: i64| WeeklyFigure {
         used_x10: 400,
         resets_at: at + 7 * 86_400,
         at,
     };
-    let landed = MuseUsageEntry {
-        attempted_at: 1_000,
-        reading: Some((Some(figure(1_000)), Some("Muse Max Usage".into()))),
+    let landed = Record {
+        auth: Auth::Ok,
+        read_at: Some(1_000),
+        week: Some(figure(1_000)),
+        plan: Some("Muse Max Usage".into()),
+        ..Record::default()
     };
-    assert!(muse_usage_fresh(Some(&landed), 1_000 + USAGE_CURRENT_S));
-    assert!(!muse_usage_fresh(Some(&landed), 1_001 + USAGE_CURRENT_S));
-    let plan_only = MuseUsageEntry {
-        attempted_at: 1_000,
-        reading: Some((None, Some("Muse Max Usage".into()))),
+    assert!(muse_usage_fresh(&landed, 1_000 + USAGE_CURRENT_S));
+    assert!(!muse_usage_fresh(&landed, 1_001 + USAGE_CURRENT_S));
+    let plan_only = Record {
+        week: None,
+        ..landed.clone()
     };
     assert!(
-        muse_usage_fresh(Some(&plan_only), 1_000 + USAGE_CURRENT_S),
-        "a plan-only success is not retried every minute"
+        muse_usage_fresh(&plan_only, 1_000 + USAGE_CURRENT_S),
+        "a plan-only success is not read again every minute"
     );
-    assert!(!muse_usage_fresh(Some(&plan_only), 1_001 + USAGE_CURRENT_S));
-    let failed = MuseUsageEntry {
-        attempted_at: 1_000,
-        reading: None,
+    assert!(!muse_usage_fresh(&plan_only, 1_001 + USAGE_CURRENT_S));
+    let failed = Record {
+        auth: Auth::Unseen,
+        read_at: Some(1_000),
+        failed_at: Some(1_000),
+        ..Record::default()
     };
-    assert!(!muse_usage_fresh(Some(&failed), 1_000));
-    assert!(muse_usage_attempt_recent(Some(&failed), 1_059));
-    assert!(!muse_usage_attempt_recent(Some(&failed), 1_060));
-    assert!(!muse_usage_fresh(None, 1_000));
-    assert!(!muse_usage_attempt_recent(None, 1_000));
+    assert!(!muse_usage_fresh(&failed, 1_000));
+    assert!(!muse_usage_fresh(&Record::default(), 1_000));
 }
 
-/// A running Muse reads its usage once: an aged figure or a failed fetch is no reason for another,
-/// however long the tab stays open. CONTROL: a session that has not read yet, on the same entries,
-/// is owed its read, so `read_here` is what holds the others back.
+/// A running Muse reads its usage once: an aged figure or a failed read is no reason for another,
+/// however long the tab stays open. CONTROL: a session that has not read yet, on the same records,
+/// is owed its read, so `read_here` is what holds the others back. A person's ask, and a login
+/// nothing was read of since its sign-in, are each owed one more.
 #[test]
 fn a_running_muse_is_owed_one_usage_read() {
-    let failed = MuseUsageEntry {
-        attempted_at: 1_000,
-        reading: None,
+    use super::super::accounts::Auth;
+    use super::super::observed_account::Record;
+    let failed = Record {
+        read_at: Some(1_000),
+        failed_at: Some(1_000),
+        ..Record::default()
     };
     let later = 1_000 + 7 * USAGE_CURRENT_S;
-    assert!(muse_usage_owed(None, false, 1_000), "the first read");
-    assert!(muse_usage_owed(Some(&failed), false, later), "CONTROL");
-    assert!(!muse_usage_owed(None, true, 1_000));
-    assert!(!muse_usage_owed(Some(&failed), true, later));
-}
-
-/// A FETCH THAT LANDS AFTER ITS ENTRY WAS FORGOTTEN still names its reading (the
-/// forget asked for exactly this mint), a failed landing keeps the last good
-/// reading under a moved attempt stamp, and a landed reading replaces it.
-#[test]
-fn muse_usage_landings_survive_a_mid_flight_forget_and_a_failure() {
-    use std::path::PathBuf;
-
-    use super::super::muse_usage::Reading;
-
-    let key = (
-        PathBuf::from("/cfg/muse"),
-        "someone@example.test".to_string(),
+    assert!(
+        muse_usage_owed(&Record::default(), false, 1_000),
+        "the first read"
     );
-    let reading = |used_x10: u32| Reading {
-        plan: Some("Muse Max Usage".into()),
-        weekly_used_x10: Some(used_x10),
-        weekly_resets_at: Some(2_000 + 7 * 86_400),
-        observed_at: Some(2_000),
+    assert!(muse_usage_owed(&failed, false, later), "CONTROL");
+    assert!(!muse_usage_owed(&failed, true, later));
+    let asked = Record {
+        asked: true,
+        ..failed.clone()
     };
-    let mut map = MuseUsageCacheMap::new();
-    land_muse_usage(&mut map, &key, Some(reading(400)), 2_000);
-    let entry = map.get(&key).expect("the forgotten entry, re-created");
-    assert_eq!(entry.attempted_at, 2_000);
-    assert_eq!(
-        entry
-            .reading
-            .as_ref()
-            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
-        Some(400),
-        "the mint the forget asked for"
-    );
-    land_muse_usage(&mut map, &key, None, 3_000);
-    let entry = map.get(&key).expect("still cached");
-    assert_eq!(entry.attempted_at, 3_000, "the failure moves the backoff");
-    assert_eq!(
-        entry
-            .reading
-            .as_ref()
-            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
-        Some(400),
-        "and keeps the last good figure"
-    );
-    land_muse_usage(&mut map, &key, Some(reading(500)), 4_000);
-    let entry = map.get(&key).expect("still cached");
-    assert_eq!(
-        entry
-            .reading
-            .as_ref()
-            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
-        Some(500),
-        "a later landing replaces it"
+    assert!(muse_usage_owed(&asked, true, later), "a person's ask");
+    let signed_in_again = Record {
+        auth: Auth::Unseen,
+        read_at: None,
+        ..failed
+    };
+    assert!(
+        muse_usage_owed(&signed_in_again, true, later),
+        "a new sign-in"
     );
 }
 
@@ -2235,38 +2283,35 @@ fn a_future_muse_cache_cannot_hide_the_sessions_admitted_figure() {
         usage_read: true,
         ..Default::default()
     };
-    let key = (config, "clock@example.test".to_owned());
-    MUSE_USAGE_CACHE
-        .lock()
-        .unwrap()
-        .get_or_insert_with(Default::default)
-        .insert(
-            key.clone(),
-            MuseUsageEntry {
-                attempted_at: now + 120,
-                reading: Some((
-                    Some(WeeklyFigure {
-                        at: now + 120,
-                        used_x10: 950,
-                        ..figure
-                    }),
-                    None,
-                )),
-            },
-        );
-    let shown = muse_subscription_for(
-        &["/synthetic/muse".into()],
-        &[format!("HOME={}", home.display())],
+    // The record holds a figure stamped two minutes ahead of this pass's clock.
+    let argv = vec!["/synthetic/muse".to_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let store = muse_store(&home);
+    let seen = super::super::observe::muse(
+        &super::super::observe::Process {
+            argv: &argv,
+            env: &env,
+            cwd: None,
+        },
         &home,
-        &previous,
-        now,
     );
-    MUSE_USAGE_CACHE
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .remove(&key);
+    store.observe(&seen, now).expect("the login's record");
+    let pass = store
+        .admit(&config.join("auth.json"), "clock@example.test", false, now)
+        .expect("a first read");
+    store.landed(
+        pass,
+        super::super::observed_account::Landing::Read {
+            plan: None,
+            week: Some(WeeklyFigure {
+                at: now + 120,
+                used_x10: 950,
+                ..figure
+            }),
+        },
+        now + 120,
+    );
+    let shown = muse_subscription_for(&argv, &env, &home, &previous, now);
     let shown = shown.expect("synthetic native profile");
     assert_eq!(shown.weekly_figure, Some(figure));
     assert_eq!(shown.weekly, previous.weekly);
@@ -2360,6 +2405,7 @@ fn an_agy_usage_fetch_is_bounded_whole() {
             &config,
             None,
         );
+        let gate = super::super::agy_gate::Gate::at(&home.join("gate-state"), &home, None, None);
         let _ = tx.send(fetch_agy_usage_doc(
             &exe,
             &[],
@@ -2369,7 +2415,11 @@ fn an_agy_usage_fetch_is_bounded_whole() {
             budget,
             token,
             0,
-            None,
+            (
+                &gate,
+                super::super::agy_gate::Pass::fixture(0),
+                "person@example.com",
+            ),
         ));
     });
     let got = fetched.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
@@ -2400,7 +2450,7 @@ fn an_agy_usage_fetch_is_bounded_whole() {
 
 /// AGY'S WEEK IS SAID AS USED, NEVER AN INFERRED 100, AND ITS BOUND STAYS TRUE
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): `remaining_fraction` 0.004 is 99.6%
-/// used, `weekly 99% used` now and `weekly ≥99% used` once aged; 0.374 is 62.6% used and 0.37001
+/// used, `weekly 1% left` now and `weekly ≤1% left` once aged; 0.374 is 62.6% used and 0.37001
 /// is 62.999% used, whose bounds are `≥62%`, never above either reading; only 0.0 is `100%`.
 /// The exact JSON lexeme decides the boundary: 0.37000000000000001 is just under 63% used even
 /// where `f64` rounds it to 0.37, while exact 0.37 is 63% used, 0.8 is 20% and 0.32 is 68%.
@@ -2410,7 +2460,7 @@ fn an_agy_usage_fetch_is_bounded_whole() {
 /// under the readings (`≥19%`, `≥67%`) (run once, restored).
 /// The earlier negative control (run once, restored):
 /// rounding to a whole percent left first (`(100 - round(rem × 100)) × 10`) says 0.004 as
-/// `weekly 100% used` and fails.
+/// `weekly 0% left` and fails.
 #[test]
 fn agys_week_is_never_said_full_before_it_is() {
     let now = 1_792_796_000;
@@ -2429,51 +2479,51 @@ fn agys_week_is_never_said_full_before_it_is() {
     let words = |x10: u32, now: &str, aged: &str| (x10, now.to_owned(), aged.to_owned());
     assert_eq!(
         said("0.004"),
-        words(996, "weekly 99% used", "weekly \u{2265}99% used")
+        words(996, "weekly 1% left", "weekly \u{2264}1% left")
     );
     assert_eq!(
         said("0.00001"),
-        words(999, "weekly 99% used", "weekly \u{2265}99% used")
+        words(999, "weekly 1% left", "weekly \u{2264}1% left")
     );
     assert_eq!(
         said("0.374"),
-        words(626, "weekly 63% used", "weekly \u{2265}62% used")
+        words(626, "weekly 37% left", "weekly \u{2264}38% left")
     );
     assert_eq!(
         said("0.37001"),
-        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+        words(629, "weekly 37% left", "weekly \u{2264}38% left")
     );
     assert_eq!(
         said("0.37000000000000001"),
-        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+        words(629, "weekly 37% left", "weekly \u{2264}38% left")
     );
     assert_eq!(
         said("0.37"),
-        words(630, "weekly 63% used", "weekly \u{2265}63% used")
+        words(630, "weekly 37% left", "weekly \u{2264}37% left")
     );
     assert_eq!(
         said("0.8"),
-        words(200, "weekly 20% used", "weekly \u{2265}20% used")
+        words(200, "weekly 80% left", "weekly \u{2264}80% left")
     );
     assert_eq!(
         said("0.32"),
-        words(680, "weekly 68% used", "weekly \u{2265}68% used")
+        words(680, "weekly 32% left", "weekly \u{2264}32% left")
     );
     assert_eq!(
         said("0"),
-        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
-        "CONTROL: nothing left is 100"
+        words(1000, "weekly 0% left", "weekly 0% left"),
+        "CONTROL: nothing left is 100, and a bound of 100 used is the reading itself"
     );
 }
 
 /// CLAUDE CODE'S CACHED WEEK IS NEVER SAID FULL BEFORE IT IS, AND ITS BOUND STAYS TRUE
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1), as agy's and the tap's are: a
-/// `cachedUsageUtilization.seven_day.utilization` of 99.96 is 999 tenths, `weekly 99% used` read
-/// now and `weekly ≥99% used` once aged, and 62.96 is 629, whose bound is `≥62%`; 62.5 is said
+/// `cachedUsageUtilization.seven_day.utilization` of 99.96 is 999 tenths, `weekly 1% left` read
+/// now and `weekly ≤1% left` once aged, and 62.96 is 629, whose bound is `≥62%`; 62.5 is said
 /// `63%` read now (an exact figure rounds half up) and `≥62%` once aged; only 100 and above is
 /// 1000 and `100%`.
 /// NEGATIVE CONTROL: rounding the tenths half up (`(pct × 10).round()`, the old `pct_x10`) makes
-/// 99.96 1000, `weekly 100% used`, and 62.96 630, `≥63%` (run once, restored).
+/// 99.96 1000, `weekly 0% left`, and 62.96 630, `≥63%` (run once, restored).
 #[test]
 fn claudes_cached_week_is_never_said_full_before_it_is() {
     let fetched = 1_792_050_000;
@@ -2500,28 +2550,28 @@ fn claudes_cached_week_is_never_said_full_before_it_is() {
     let words = |x10: u32, now: &str, aged: &str| (x10, now.to_owned(), aged.to_owned());
     assert_eq!(
         said(json!(99.96)),
-        words(999, "weekly 99% used", "weekly \u{2265}99% used")
+        words(999, "weekly 1% left", "weekly \u{2264}1% left")
     );
     assert_eq!(
         said(json!(62.96)),
-        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+        words(629, "weekly 37% left", "weekly \u{2264}38% left")
     );
     assert_eq!(
         said(json!(62.5)),
-        words(625, "weekly 63% used", "weekly \u{2265}62% used")
+        words(625, "weekly 37% left", "weekly \u{2264}38% left")
     );
     assert_eq!(
         said(json!(0.05)),
-        words(0, "weekly 0% used", "weekly \u{2265}0% used")
+        words(0, "weekly 100% left", "weekly \u{2264}100% left")
     );
     assert_eq!(
         said(json!(100)),
-        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
-        "CONTROL: a reading of 100 is 100"
+        words(1000, "weekly 0% left", "weekly 0% left"),
+        "CONTROL: a reading of 100 is 0% left, aged or not (use cannot pass 100)"
     );
     assert_eq!(
         said(json!(104.2)),
-        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
+        words(1000, "weekly 0% left", "weekly 0% left"),
         "a reading past 100 is full"
     );
 }
@@ -2547,11 +2597,11 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     let usage_json = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.782786,"reset_time":"2026-10-29T16:31:22Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1.0,"reset_time":"2026-10-31T00:51:20Z"}]}]}}}"#;
     let now = 1_792_796_000;
     let gemini_fig = parse_agy_usage_json(usage_json, false, now).expect("gemini weekly");
-    assert_eq!(gemini_fig.words(now).as_deref(), Some("weekly 22% used"));
+    assert_eq!(gemini_fig.words(now).as_deref(), Some("weekly 78% left"));
     let third_party_fig = parse_agy_usage_json(usage_json, true, now).expect("3p weekly");
     assert_eq!(
         third_party_fig.words(now).as_deref(),
-        Some("weekly 0% used")
+        Some("weekly 100% left")
     );
 
     // The stand-ins the fetches below run live here: it is removed only once each showed it ran.
@@ -2599,7 +2649,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             Some(&store),
         )
         .expect("fetched agy subscription");
-        assert_eq!(fetched_sub.weekly.as_deref(), Some("weekly 22% used"));
+        assert_eq!(fetched_sub.weekly.as_deref(), Some("weekly 78% left"));
         assert!(store.last().is_some(), "fetch persisted reading to store");
         // The same fetch also cached the 3p-weekly bucket for Claude/GPT models.
         let cached_3p = agy_subscription_with_store(
@@ -2612,7 +2662,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             Some(&store),
         )
         .expect("cached 3p subscription");
-        assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 0% used"));
+        assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 100% left"));
         // With the in-memory cache cleared and another reader holding the store lock past
         // `FRESH_OPEN_S`, a stale store reading whose weekly window is still open is the fallback.
         AGY_USAGE_CACHE
@@ -2634,7 +2684,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         // §2.1); rounding the whole percent left first said `≥22%`, above the reading.
         assert_eq!(
             locked_fallback.weekly.as_deref(),
-            Some("weekly \u{2265}21% used")
+            Some("weekly \u{2264}79% left")
         );
         drop(held_lock);
         // Mid-session /login switch to a new email bypasses the previous account's
@@ -2670,7 +2720,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         )
         .expect("switched agy subscription");
         assert_eq!(switched_sub.email.as_deref(), Some("second@example.com"));
-        assert_eq!(switched_sub.weekly.as_deref(), Some("weekly 58% used"));
+        assert_eq!(switched_sub.weekly.as_deref(), Some("weekly 42% left"));
         std::fs::remove_file(&local_agy).expect("remove local agy");
         std::fs::write(cfg.join("cli.log"), log_bytes).expect("restore cli.log");
         AGY_USAGE_CACHE
@@ -2809,7 +2859,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     // until its reset time passes.
     let expired_prev = SubscriptionDisplay {
         email: Some("interviewstreetuser@gmail.com".to_owned()),
-        weekly: Some("weekly 22% used".to_owned()),
+        weekly: Some("weekly 78% left".to_owned()),
         weekly_figure: Some(gemini_fig),
         ..SubscriptionDisplay::default()
     };
@@ -2827,7 +2877,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
 
     let screen_prev = SubscriptionDisplay {
         email: Some("interviewstreetuser@gmail.com".to_owned()),
-        weekly: Some("weekly 22% used".to_owned()),
+        weekly: Some("weekly 78% left".to_owned()),
         weekly_figure: None,
         ..SubscriptionDisplay::default()
     };
@@ -2840,7 +2890,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         now + USAGE_SHOWN_S + 10,
     )
     .expect("subscription with screen weekly");
-    assert_eq!(kept_screen.weekly.as_deref(), Some("weekly 22% used"));
+    assert_eq!(kept_screen.weekly.as_deref(), Some("weekly 78% left"));
 
     // Switching models between Gemini (third_party=false) and Claude (third_party=true)
     // on the same email does not carry Gemini's cached weekly_figure across the bucket boundary.
@@ -3675,8 +3725,7 @@ fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
     assert!(muse_excerpts_for(0, &explicit_a, &env, dir.path(), None).is_none());
 }
 
-/// THE FOOTER NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12, 2026-10-24: "why does it
-/// say \"?\" and \"/usage\" ??? THE HARNESS MUST DO THIS STOP ASKING THE USER"): no reason a
+/// THE FOOTER NEVER ASKS THE PERSON FOR THE WEEK (docs/OWNER_RULINGS.md, 2026-10-24): no reason a
 /// Claude Code footer gives for a missing weekly figure, in its words or its spoken form, names
 /// `/usage` or a step for the person to take; each still says the figure is unknown.
 #[test]
@@ -3779,7 +3828,7 @@ fn a_running_agys_footer_reads_its_usage_once() {
     let (first, events) =
         super::super::provider_read::captured(|| pass(&SubscriptionDisplay::default(), now));
     assert_eq!(reads(), 1);
-    assert_eq!(first.weekly.as_deref(), Some("weekly 50% used"));
+    assert_eq!(first.weekly.as_deref(), Some("weekly 50% left"));
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].why,
@@ -3795,7 +3844,7 @@ fn a_running_agys_footer_reads_its_usage_once() {
     assert!(
         aged.weekly
             .as_deref()
-            .is_some_and(|w| w.contains('\u{2265}')),
+            .is_some_and(|w| w.contains('\u{2264}')),
         "it stands as a lower bound: {:?}",
         aged.weekly
     );
@@ -3869,9 +3918,9 @@ fn a_skipped_agy_footer_read_is_made_later_and_a_failed_one_is_not_repeated() {
     assert!(again.usage_read);
 }
 
-/// NEGATIVE CONTROL: `muse_usage_forget` (the fact menu's explicit `Refresh usage` action) clears
-/// `MUSE_USAGE_CACHE` so a live Muse session whose `prev.usage_read` is already `true` kicks one
-/// fresh read, whereas ordinary aged resolver passes with the cache intact never re-read.
+/// NEGATIVE CONTROL: a person's ask (the fact menu's explicit `Refresh usage` action, which
+/// `muse_usage_forget` records) lets a live Muse session whose `prev.usage_read` is already
+/// `true` kick one fresh read, whereas ordinary aged resolver passes never re-read.
 #[cfg(unix)]
 #[test]
 fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
@@ -3905,7 +3954,6 @@ fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
         });
     };
     wait_idle();
-    muse_usage_forget("forget@example.test");
 
     let first = muse_subscription_for(&argv, &env, &home, &SubscriptionDisplay::default(), now)
         .expect("initial muse subscription");
@@ -3920,17 +3968,17 @@ fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
     assert_eq!(
         reads(),
         1,
-        "aged pass with cache entry intact never re-polls"
+        "aged pass with the record intact never re-polls"
     );
     assert!(aged.usage_read);
 
-    muse_usage_forget("forget@example.test");
+    muse_store(&home).ask("forget@example.test");
     let refreshed = muse_subscription_for(
         &argv,
         &env,
         &home,
         &aged,
-        now + 2 * USAGE_CURRENT_S + MUSE_USAGE_RETRY_S + 5,
+        now + 2 * USAGE_CURRENT_S + super::super::observed_account::READ_APART_S + 5,
     )
     .expect("explicit fact-menu refresh");
     assert!(refreshed.usage_read);
@@ -3938,7 +3986,267 @@ fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
     assert_eq!(
         reads(),
         2,
-        "explicit muse_usage_forget must allow one fresh fetch on the live session"
+        "a person's ask must allow one fresh fetch on the live session"
     );
-    muse_usage_forget("forget@example.test");
+}
+
+/// What an agy footer test stands on: a user home whose agy config's log names its login, an
+/// agy stand-in that counts its runs, the home's quota store and its account gate.
+#[cfg(unix)]
+struct AgyFooter {
+    tmp: aterm_uds::deadline::KeptUntilRan,
+    home: PathBuf,
+    argv: Vec<String>,
+    env: Vec<String>,
+    store: super::super::agy_quota_store::Store,
+    gate: super::super::agy_gate::Gate,
+}
+
+#[cfg(unix)]
+const AGY_FOOTER_EMAIL: &str = "person@example.com";
+#[cfg(unix)]
+const AGY_FOOTER_NOW: i64 = 1_792_796_000;
+
+#[cfg(unix)]
+impl AgyFooter {
+    /// `body` is what the stand-in does once it has counted its run.
+    fn new(tag: &str, body: &str) -> Self {
+        let tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir(tag).keep());
+        let home = tmp.path().join("home");
+        let cfg = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cfg).expect("cfg");
+        std::fs::write(
+            cfg.join("cli.log"),
+            format!(
+                "I1022 09:30:10.447090 375 server_oauth.go:224] applyAuthResult: \
+                 email={AGY_FOOTER_EMAIL}, authMethod=consumer, quotaProject=\n"
+            ),
+        )
+        .expect("cli.log");
+        let agy = tmp.path().join("agy");
+        crate::harness::stand_in::proven(&agy, &format!("echo run >> \"$0.runs\"\n{body}"));
+        let env = vec![format!("HOME={}", home.display())];
+        let store = super::super::agy_quota_store::Store::new(tmp.path(), "home");
+        let gate = agy_gate(&env, &home);
+        Self {
+            argv: vec![agy.to_string_lossy().into_owned()],
+            tmp,
+            home,
+            env,
+            store,
+            gate,
+        }
+    }
+
+    /// A stand-in that answers `/usage` with 22% of the Gemini week used.
+    fn answering(tag: &str) -> Self {
+        Self::new(
+            tag,
+            r#"printf '%s' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.782786,"reset_time":"2026-10-29T16:31:22Z"}]}]}}}'"#,
+        )
+    }
+
+    /// A stand-in that prints agy's sign-in prompt and waits for a person.
+    fn asking(tag: &str) -> Self {
+        Self::new(
+            tag,
+            &format!(
+                "printf 'Authentication required. Please visit the URL to log in: https://accounts.example.invalid/\\n'\nexec /bin/sleep {}",
+                aterm_spec::wait::PARKED_SECS
+            ),
+        )
+    }
+
+    fn runs(&self) -> usize {
+        std::fs::read_to_string(self.tmp.path().join("agy.runs"))
+            .map_or(0, |text| text.lines().count())
+    }
+
+    /// One footer pass at `now`, after `prev`, with the session's `served` turn as evidence.
+    fn pass(
+        &self,
+        prev: &SubscriptionDisplay,
+        now: i64,
+        served: Option<i64>,
+    ) -> SubscriptionDisplay {
+        agy_subscription_gated(
+            &self.argv,
+            &self.env,
+            &self.home,
+            prev,
+            Some("Gemini 3.1 Pro"),
+            now,
+            (Some(&self.store), Some(&self.gate), served),
+        )
+        .expect("an agy footer")
+    }
+
+    fn signed_out_display() -> SubscriptionDisplay {
+        SubscriptionDisplay {
+            signed_out: true,
+            ..SubscriptionDisplay::default()
+        }
+    }
+}
+
+/// The footer's agy read passes the account gate before any process: a login nothing is known
+/// of is named and not read, a served turn opens it, and one on record as signed out shows no
+/// email or week and runs nothing, whatever this footer or the store still held of it.
+#[cfg(unix)]
+#[test]
+fn the_agy_footer_reads_only_a_login_known_signed_in_and_says_when_it_is_signed_out() {
+    let mut bed = AgyFooter::answering("agy-footer-gate");
+    let now = AGY_FOOTER_NOW;
+    let unknown = bed.pass(&SubscriptionDisplay::default(), now, None);
+    assert_eq!(unknown.email.as_deref(), Some(AGY_FOOTER_EMAIL));
+    assert_eq!(
+        (unknown.weekly.as_deref(), unknown.signed_out),
+        (None, false)
+    );
+    assert_eq!(bed.runs(), 0, "agy was run to find out");
+
+    // The hook: a turn the session served is on record, and the read is made.
+    let read = bed.pass(&unknown, now + 1, Some(now));
+    bed.tmp.ran();
+    assert_eq!(read.weekly.as_deref(), Some("weekly 78% left"));
+    assert_eq!(bed.runs(), 1);
+    assert!(bed.store.last().is_some(), "the reading is kept");
+
+    // Signed out on record: nothing of the login is shown, and nothing runs, now or an hour on.
+    bed.gate.signed_out(None, now + 10).expect("recorded");
+    let out = bed.pass(&read, now + 20, Some(now));
+    assert_eq!(out, AgyFooter::signed_out_display());
+    assert_eq!(
+        bed.pass(&out, now + 4_000, Some(now)),
+        AgyFooter::signed_out_display()
+    );
+    assert_eq!(bed.runs(), 1, "a signed-out login was read");
+
+    // CONTROL: a turn served after the sign-out is the person signed in again, and the footer
+    // names the login once more.
+    let back = bed.pass(&out, now + 4_100, Some(now + 4_050));
+    assert_eq!(back.email.as_deref(), Some(AGY_FOOTER_EMAIL));
+    assert!(!back.signed_out);
+    assert!(back.weekly.is_some(), "{back:?}");
+}
+
+/// A footer read that meets agy's sign-in prompt records the login signed out (a ledger row the
+/// journal carries as `signed-out`), says so, and no later pass starts agy.
+#[cfg(unix)]
+#[test]
+fn a_prompt_the_agy_footer_read_meets_is_recorded_and_not_met_again() {
+    use super::super::accounts::{Auth, Kind};
+    let mut bed = AgyFooter::asking("agy-footer-prompt");
+    let now = AGY_FOOTER_NOW;
+    let prev = SubscriptionDisplay {
+        email: Some(AGY_FOOTER_EMAIL.to_owned()),
+        weekly: Some("weekly 95% left".to_owned()),
+        ..SubscriptionDisplay::default()
+    };
+    // The installed journal's keyer, as a running aterm has one.
+    let out = super::super::journal::with_keyer(
+        |realm, email| {
+            Some(format!(
+                "ac-{:016x}",
+                (realm.len() * 31 + email.len()) as u64
+            ))
+        },
+        || bed.pass(&prev, now, Some(now - 5)),
+    );
+    bed.tmp.ran();
+    assert_eq!(
+        out,
+        AgyFooter::signed_out_display(),
+        "no stale email or week"
+    );
+    assert_eq!(bed.runs(), 1);
+    let (state, _) = bed.gate.store().load(now + 1).expect("state");
+    let account = state.account("main");
+    assert_eq!(account.auth, Auth::SignedOut);
+    assert!(
+        account.pk.is_some(),
+        "keyed by the login's address, so its rows reach the journal"
+    );
+    let ledger = bed.gate.store().tail(50).expect("ledger");
+    assert!(
+        ledger
+            .iter()
+            .any(|event| event.kind == Kind::Auth && event.why == "signed-out"),
+        "{ledger:?}"
+    );
+    for later in [now + 301, now + 3_700] {
+        assert_eq!(
+            bed.pass(&out, later, Some(now - 5)),
+            AgyFooter::signed_out_display()
+        );
+    }
+    assert_eq!(bed.runs(), 1, "the prompt was met again");
+}
+
+/// CONTROL: with the prompt left unrecorded, the footer starts agy again once the store's
+/// backoff has run out, which `a_prompt_the_agy_footer_read_meets_is_recorded_and_not_met_again`
+/// forbids.
+#[cfg(unix)]
+#[test]
+fn control_an_unrecorded_prompt_is_met_again_by_the_agy_footer() {
+    let mut bed = AgyFooter::asking("agy-footer-prompt-control");
+    let now = AGY_FOOTER_NOW;
+    super::super::agy_gate::PROMPT_UNRECORDED.set(true);
+    let out = bed.pass(&SubscriptionDisplay::default(), now, Some(now - 5));
+    bed.tmp.ran();
+    let _ = bed.pass(&out, now + 301, Some(now - 5));
+    super::super::agy_gate::PROMPT_UNRECORDED.set(false);
+    assert_eq!(bed.runs(), 2);
+}
+
+/// The evidence of a served turn is the session's own transcript: its newest row the model's
+/// answer, written since the process started. A prompt still unanswered, or an answer an
+/// earlier session wrote to a resumed conversation, is none.
+#[test]
+fn an_agy_turn_is_served_when_its_transcripts_newest_row_is_the_models_answer() {
+    let dir = tmp_dir("agy-served");
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    let cfg = home.join(".gemini/antigravity-cli");
+    let cid = "11111111-1111-4111-8111-111111111111";
+    let logs = cfg.join("brain").join(cid).join(".system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::create_dir_all(cfg.join("presence")).unwrap();
+    let lock = cfg.join("presence").join(format!("{cid}.lock"));
+    std::fs::write(&lock, b"").unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    let argv = vec!["agy".to_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let served = |born: Option<u64>| {
+        agy_served_at(&argv, &env, &home, Some(std::slice::from_ref(&lock)), born)
+    };
+    let asked = json!({"type":"USER_INPUT", "content":"<USER_REQUEST>\nhello\n</USER_REQUEST>"});
+    let answered = json!({"type":"PLANNER_RESPONSE", "content":"hello"});
+    std::fs::write(&transcript, format!("{asked}\n")).unwrap();
+    assert_eq!(served(Some(0)), None, "a prompt still unanswered");
+    std::fs::write(&transcript, format!("{asked}\n{answered}\n")).unwrap();
+    let written = std::fs::metadata(&transcript)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(served(Some(written)), i64::try_from(written).ok());
+    assert_eq!(
+        served(Some(written + 1)),
+        None,
+        "answered before this process started"
+    );
+    assert_eq!(
+        served(None),
+        None,
+        "a process whose start is unknown proves nothing"
+    );
+    assert_eq!(
+        agy_served_at(&argv, &env, &home, None, Some(0)),
+        None,
+        "no conversation is held"
+    );
+    std::fs::write(&transcript, format!("{asked}\n{answered}\n{asked}\n")).unwrap();
+    assert_eq!(served(Some(0)), None, "the next prompt is not yet answered");
 }

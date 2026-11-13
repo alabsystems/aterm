@@ -94,9 +94,9 @@ fn read_error(error: PrivateFileError) -> io::Error {
     match error {
         PrivateFileError::Io(error) => error,
         missing @ PrivateFileError::Missing => io::Error::new(io::ErrorKind::NotFound, missing),
-        denied @ (PrivateFileError::NotPrivate(_) | PrivateFileError::Symlink) => {
-            io::Error::new(io::ErrorKind::PermissionDenied, denied)
-        }
+        denied @ (PrivateFileError::NotPrivate(_)
+        | PrivateFileError::Writable(_)
+        | PrivateFileError::Symlink) => io::Error::new(io::ErrorKind::PermissionDenied, denied),
         malformed @ PrivateFileError::Malformed(_) => {
             io::Error::new(io::ErrorKind::InvalidData, malformed)
         }

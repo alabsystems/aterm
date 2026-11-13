@@ -1855,6 +1855,10 @@ fn collect_local_census_inputs_until(
 ) -> Result<CensusInputs, String> {
     use aterm_net::fleet_member::{Via, read_admitted_pushed_facts};
 
+    let traffic = crate::fleet_vault::Traffic::capture(
+        state_dir,
+        crate::fleet_vault::vault_paths_for(state_dir).as_ref(),
+    );
     let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
     let read_roster = home_paths
         .as_ref()
@@ -1933,6 +1937,11 @@ fn collect_local_census_inputs_until(
         &raw_peers,
         &roster.deny_nodes,
         log_keys.as_deref(),
+        &|| {
+            traffic
+                .as_ref()
+                .is_some_and(crate::fleet_vault::Traffic::current)
+        },
     );
     let pushed_facts = read_admitted_pushed_facts(
         state_dir,
@@ -2177,6 +2186,10 @@ pub fn note_fold_gate(
 fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Option<&Path>) -> bool {
     let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
     let mut log_keys = None;
+    let traffic = crate::fleet_vault::Traffic::capture(
+        state_dir,
+        crate::fleet_vault::vault_paths_for(state_dir).as_ref(),
+    );
     let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
     if let Some(paths) = home_paths.as_ref() {
         let Ok(read) = crate::harness::ai_pool::read_pass_roster(paths) else {
@@ -2209,6 +2222,11 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
             &raw_peers,
             &roster.deny_nodes,
             log_keys.as_deref(),
+            &|| {
+                traffic
+                    .as_ref()
+                    .is_some_and(crate::fleet_vault::Traffic::current)
+            },
         );
         return false;
     }

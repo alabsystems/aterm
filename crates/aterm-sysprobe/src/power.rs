@@ -12,6 +12,14 @@
 //!
 //! Which power assertions a process holds ([`assertions_of`]), as the power manager lists them;
 //! one of this process's own to hold ([`hold`]); and whether the lid is closed ([`lid_closed`]).
+//!
+//! On Windows [`hold`] holds a power request (`PowerCreateRequest`), and [`windows`] has that
+//! system's other power readers: the power source and battery, the boot time, the clock that
+//! stops in a suspend, and the suspend and resume announcements.
+
+/// Windows' power readers and its keep-awake request; what they decode compiles on every host.
+#[path = "win_power.rs"]
+pub mod windows;
 
 /// The machine's wake, as its power manager says it now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,12 +110,16 @@ pub fn lid_closed() -> Option<bool> {
 /// macOS does not honour it).
 pub const PREVENT_SYSTEM_SLEEP: &str = "PreventSystemSleep";
 
-/// A power assertion this process holds ([`hold`]); dropping it releases it.
+/// A power assertion this process holds ([`hold`]); dropping it releases it. On Windows it is a
+/// power request ([`windows::Held`]), which its own drop clears and closes.
 #[derive(Debug)]
 pub struct Hold {
     /// The power manager's id for it.
     #[cfg(target_os = "macos")]
     id: u32,
+    /// The power request and the kinds set on it.
+    #[cfg(windows)]
+    _request: windows::Held,
 }
 
 impl Drop for Hold {
@@ -119,14 +131,23 @@ impl Drop for Hold {
 
 /// Hold a power assertion of type `kind` ([`PREVENT_SYSTEM_SLEEP`], say) named `name`, which
 /// `pmset -g assertions` and [`assertions_of`] list it by, until the [`Hold`] is dropped; `None`
-/// when the power manager refused it, and off macOS.
+/// when the power manager refused it, and on Linux. On Windows `kind` is one of macOS's
+/// assertion types, held as the power requests [`windows::requests_of`] maps it to (the system
+/// kept from its idle sleep and this process running, and for the display's type, or on a PC
+/// with Modern Standby for every type, the display kept on), under `name`,
+/// which `powercfg /requests` lists it by; a closing lid or a person's own Sleep still sleeps
+/// the machine there, whatever the type.
 #[must_use]
 pub fn hold(kind: &str, name: &str) -> Option<Hold> {
     #[cfg(target_os = "macos")]
     {
         crate::macos::create_assertion(kind, name).map(|id| Hold { id })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        windows::hold(kind, name).map(|request| Hold { _request: request })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (kind, name);
         None

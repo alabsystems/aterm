@@ -12,6 +12,18 @@ mod clean_islands;
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
 
+// The cut Windows' default faces are made with (`src/no_ligatures.rs`).
+#[path = "src/no_ligatures.rs"]
+mod no_ligatures;
+
+/// The bundled Iosevka Term files Windows' default faces are cut from.
+const NO_LIGATURE_CUTS: &[&str] = &[
+    "IosevkaTerm-Regular",
+    "IosevkaTerm-Bold",
+    "IosevkaTerm-Italic",
+    "IosevkaTerm-BoldItalic",
+];
+
 const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled", "assets/test"];
 
 const LICENSE_SUFFIX: &str = ".LICENSE.txt";
@@ -28,6 +40,7 @@ const GRANT_MARKERS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/no_ligatures.rs");
     clean_islands::emit();
     anchor_rules::emit();
     let manifest =
@@ -37,6 +50,11 @@ fn main() {
         println!("cargo:rerun-if-changed={dir}");
         let root = manifest.join(dir);
         gate_dir(&root, &manifest, &mut failures);
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var_os("CARGO_FEATURE_EMBEDDED_FONT").is_some()
+    {
+        cut_no_ligature_faces(&manifest);
     }
     if !failures.is_empty() {
         panic!(
@@ -95,5 +113,25 @@ fn gate_dir(dir: &Path, root: &Path, failures: &mut Vec<String>) {
                 "  - {relative}: {stem}{LICENSE_SUFFIX} names no OFL / Apache / MIT grant"
             ));
         }
+    }
+}
+
+/// Write `<stem>.nl.ttf` into `OUT_DIR` for each of [`NO_LIGATURE_CUTS`]: the bundled file with
+/// its programming-ligature features taken out, which `bundled.rs` compiles in on Windows.
+fn cut_no_ligature_faces(manifest: &Path) {
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    for stem in NO_LIGATURE_CUTS {
+        let source = manifest.join("assets/bundled").join(format!("{stem}.ttf"));
+        let font = std::fs::read(&source)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+        let cut = no_ligatures::without_ligature_features(&font).unwrap_or_else(|| {
+            panic!(
+                "{}: no `calt` or `liga` feature to take out, so the cut would be the file itself",
+                source.display()
+            )
+        });
+        let target = out.join(format!("{stem}.nl.ttf"));
+        std::fs::write(&target, cut)
+            .unwrap_or_else(|error| panic!("cannot write {}: {error}", target.display()));
     }
 }

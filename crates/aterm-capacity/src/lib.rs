@@ -359,7 +359,7 @@ pub const RELEASE_RUN_ENV: &str = "ATERM_RELEASE_RUN";
 mod background;
 mod branch_shares;
 mod jobserver;
-pub use branch_shares::{BranchShares, InitialReservation};
+pub use branch_shares::{BranchShares, FixtureShare, InitialReservation};
 pub use jobserver::{IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token};
 
 /// What a claim needs. Sizes are bytes.
@@ -435,7 +435,8 @@ pub enum AtBound {
     #[default]
     Refuse,
     /// Admit it loaded ([`TimingCause::Loaded`]): its work runs and states that it ran without a
-    /// qualified quiet admission (owner ruling 2026-11-05: a busy machine never blocks a release).
+    /// qualified quiet admission (a busy machine never blocks a release: the row is named, not
+    /// counted red).
     /// A loaded claim held by its own process or an ancestor spends this one's patience: its first
     /// window decides, quiet or loaded.
     RunLoaded,

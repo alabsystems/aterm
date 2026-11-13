@@ -418,67 +418,6 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
     });
 }
 
-/// The login places of a Mac are its default home, where no row names it, and each row's
-/// directory, each read as a process started there would read it; a CLI with no observer, and a
-/// Mac whose home is not known, read nothing.
-/// NEGATIVE CONTROL: with `places` leaving out the default home no row names (the row-only loop
-/// the holdings report had), the Mac that lists no account has no place: `left: 0 right: 1`.
-#[test]
-fn places_are_the_default_home_and_each_rows_directory() {
-    let home = home("places");
-    write(&home.path().join(".claude.json"), &profile(UNICORN));
-    let dir = home.path().join("logins").join("m22");
-    write(&dir.join(".claude.json"), &profile(BRONTO));
-    let row = |dir: Option<&str>| Row {
-        label: "m22".into(),
-        email: Some(BRONTO.into()),
-        dir: dir.map(str::to_owned),
-        ..Row::default()
-    };
-    let none = Roster::default();
-    let got = places(Cli::Claude, &none, Some(home.path()));
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].row, None);
-    assert_eq!(got[0].login.seen.email(), Some(UNICORN));
-    assert_eq!(got[0].login.name(&none).as_deref(), Some(UNICORN));
-
-    let rows = Roster {
-        rows: vec![row(Some(dir.to_str().unwrap()))],
-    };
-    let got = places(Cli::Claude, &rows, Some(home.path()));
-    let seen: Vec<_> = got
-        .iter()
-        .map(|place| {
-            (
-                place.row.map(|row| row.label.as_str()),
-                place.login.seen.email(),
-            )
-        })
-        .collect();
-    assert_eq!(seen, [(None, Some(UNICORN)), (Some("m22"), Some(BRONTO))]);
-    assert!(matches!(
-        got[1].login.reconciled(&rows),
-        Reconciled::Agrees(row) if row.label == "m22"
-    ));
-
-    let default_row = Roster {
-        rows: vec![row(None)],
-    };
-    let got = places(Cli::Claude, &default_row, Some(home.path()));
-    assert_eq!(got.len(), 1, "the default home is the row's place");
-    assert!(matches!(
-        got[0].login.reconciled(&default_row),
-        Reconciled::Unlisted(seen) if seen.email == UNICORN
-    ));
-
-    for place in places(Cli::Codex, &rows, Some(home.path()))
-        .iter()
-        .chain(&places(Cli::Claude, &rows, None))
-    {
-        assert_eq!(place.login.seen, Observation::Unread);
-    }
-}
-
 /// A tab on a Mac that lists no account is sighted like any other: its `seen`, the login for the
 /// registry, and its session journaled under the observed account, since no row records it; a
 /// later pass in the hour writes nothing, and the tab's end closes the session. A roster that
@@ -752,9 +691,12 @@ fn muse_with_and_without_an_api_key() {
     );
 }
 
-/// A Muse `auth.json` that names no OAuth account is signed out; no file is unread.
+/// A Muse `auth.json` that names no OAuth account is signed out, and so is a config home Muse
+/// Code made whose `auth.json` is gone (`muse logout` may remove it); a home with no config is
+/// unread.
 /// NEGATIVE CONTROL: with `muse_login_for` answering `Unread` for a file with no account, the
-/// signed-out file is unread: `` left: Unread right: SignedOut { … } ``.
+/// signed-out file is unread: `` left: Unread right: SignedOut { … } ``; with it answering
+/// `Unread` for any missing file, the removed one is too.
 #[test]
 fn muse_without_an_account_is_not_an_account() {
     let home = home("muse-none");
@@ -762,6 +704,11 @@ fn muse_without_an_account_is_not_an_account() {
     assert_eq!(muse(&process(&env, None), home.path()), Observation::Unread);
     let path = home.path().join(".config/muse/auth.json");
     write(&path, &muse_auth(UNICORN, "api_key"));
+    assert_eq!(
+        muse(&process(&env, None), home.path()),
+        Observation::SignedOut { path: path.clone() }
+    );
+    std::fs::remove_file(&path).unwrap();
     assert_eq!(
         muse(&process(&env, None), home.path()),
         Observation::SignedOut { path }

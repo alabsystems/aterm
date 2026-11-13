@@ -246,7 +246,7 @@ fn project_with(
                 Some(fig) if !valid_time(fig.at) || !valid_time(fig.reset) => "Unknown; the recorded quota timestamps are invalid".into(),
                 Some(fig) if fig.at > now => "Unknown now; the quota observation is future-dated".into(),
                 Some(fig) if fig.source == account_stats::SOURCE_WALL => "Limit reached on record".into(),
-                Some(fig) => format!("{} used (retained)", account_stats::percent(fig.pct_x10, !fig.pct_x10.is_multiple_of(10))),
+                Some(fig) => format!("{} (retained)", account_stats::left(fig.pct_x10, !fig.pct_x10.is_multiple_of(10))),
                 None => match window.missing {
                     Some(Missing::WindowReset) => "Unknown now; the recorded window reset".into(),
                     Some(Missing::ResetUsed) => "Unknown now; a reset followed this reading".into(),

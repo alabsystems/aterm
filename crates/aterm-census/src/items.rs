@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A Rust source file read as token trees: what a build without `cfg(test)` compiles of it
-//! ([`Source::shipped`]), and each place in it that can bring another file into a build
-//! ([`Source::mounts`], [`Source::includes`]).
+//! A Rust source file read as token trees: what a build without `cfg(test)` compiles of it, its
+//! code ([`Source::code`]) apart from its comments ([`Source::comments`]), and each place in it
+//! that can bring another file into a build ([`Source::mounts`], [`Source::includes`]).
 //!
 //! The census lexer ([`crate::lex::spans`]) finds the comments and literals; the rest of the file
 //! is split into identifiers, lifetimes, numbers, punctuation and the delimiters that nest them, so
@@ -21,10 +21,23 @@
 //! kind can end at, never later: where that is earlier than the item's real end (a `{ N }` const
 //! argument in a test function's signature), the rest of the item reads as shipped.
 //!
+//! A comment is carried ([`Comment::carried`]) where a macro, or another front end, may read it, as
+//! a doc comment's `#[doc]` token or through a span's source text: inside a macro invocation's
+//! arguments, a `macro_rules!` or `macro` body, or an attribute's brackets; within an item whose
+//! attributes carry it ([`carrying`]: a `derive`, an attribute this reader cannot vouch for, or a
+//! `doc = …`, each also under `cfg_attr`), from its first attribute to an end at or past its real
+//! one ([`item_extent`]); within an item macro invocation, attributes included; within a group the
+//! item reader did not read whose tokens hold a carrying attribute at any depth (a local
+//! `#[derive]` item in a function body); within an item led by a word the item reader cannot name,
+//! and a `{…}` group the word `clean` precedes, since another front end may read either's text (a
+//! Trust `clean { … }` island is Lean, where a span that lexes as a Rust comment is code); in the
+//! rest of a level once the item reader cannot end an item there; and anywhere in a file whose own
+//! inner attributes carry.
+//!
 //! What this reader does not see: what a proc macro or a build script generates, which is assumed
 //! not to declare a module from a source file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::lex::{self, SpanKind};
 use crate::wasm_cfg::{Truth, when_test_disabled};
@@ -39,6 +52,9 @@ pub struct Source {
     test: Vec<(usize, usize)>,
     /// The file's own inner attributes include a test-only `cfg`: no build without tests reads it.
     whole: bool,
+    /// The byte ranges a macro may read ([`Comment::carried`]), sorted and disjoint.
+    carriers: Vec<(usize, usize)>,
+    test_modules: Vec<TestModule>,
     mounts: Vec<Mount>,
     includes: Vec<Include>,
     strings: Vec<(Option<String>, usize)>,
@@ -55,6 +71,18 @@ pub struct Shipped<'a> {
     pub before: &'a str,
 }
 
+/// A comment a build without `cfg(test)` reads, plain or doc ([`Source::comments`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Comment<'a> {
+    /// Its text and place, as a [`Shipped`] token's.
+    pub at: Shipped<'a>,
+    /// How many of the file's code tokens ([`Source::code`]) come before it: where it sits among
+    /// them.
+    pub gap: usize,
+    /// A macro, or another front end, may read it (the module's carriers).
+    pub carried: bool,
+}
+
 /// A `mod <name>;` declaration: a module from another file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mount {
@@ -67,8 +95,39 @@ pub struct Mount {
     /// It is at the top of its file, outside any inline module (whose name the directory of a
     /// default file takes): only a declaration this reader places can say so.
     pub top: bool,
+    /// A macro may read the module it declares: one of its own attributes carries
+    /// ([`carrying`]), or this reader did not place it (a declaration a macro's body or an
+    /// attribute macro's item holds is one).
+    pub carried: bool,
     /// The byte offset of its `mod`.
     pub at: usize,
+}
+
+/// A module whose own attributes make it test-only, written with its body inline
+/// (`#[cfg(test)] mod tests { … }`): a build without tests strips it, but only after reading its
+/// whole body from this file, so an edit to it changes what such a build reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestModule {
+    /// The module's name, as its file would be named (`r#type` is `type`).
+    pub name: String,
+    /// The enclosing inline modules' names, outermost first; empty at the top of the file.
+    pub within: Vec<String>,
+    /// One of them carries `#[path]` (outer or inner), which moves the folder its children's files
+    /// are found in away from the one `within` names.
+    pub pathed: bool,
+    /// Its test `cfg` is an inner attribute (`mod tests { #![cfg(test)] … }`), so its `mod` line
+    /// is not gated: out of line, a build without tests would still open its file to read it.
+    pub inner_gate: bool,
+    /// An outer attribute on it is no inert built-in, so a macro may read its body as written.
+    pub rewritten: bool,
+    /// The item's byte range: its first outer attribute or doc comment through its closing brace.
+    pub item: (usize, usize),
+    /// The byte offset where the item starts after its attributes (its visibility or `mod`).
+    pub head: usize,
+    /// The byte offset of the body's opening brace.
+    pub open: usize,
+    /// The body's byte range, strictly inside its braces.
+    pub body: (usize, usize),
 }
 
 /// Where a [`Mount`]'s file is.
@@ -132,6 +191,8 @@ impl Source {
             line_starts,
             test: Vec::new(),
             whole: false,
+            carriers: Vec::new(),
+            test_modules: Vec::new(),
             mounts: Vec::new(),
             includes: Vec::new(),
             strings: Vec::new(),
@@ -140,15 +201,34 @@ impl Source {
         let (inner, from) = inner_attributes(&source.text, &source.trees);
         source.whole = inner.iter().any(|attr| test_cfg(&source.text, attr));
         if !source.whole && inner.iter().all(|attr| inert(&source.text, attr)) {
-            items(&source.text, &source.trees, from, Level::Top, &mut found);
+            items(
+                &source.text,
+                &source.trees,
+                from,
+                Level::Top,
+                &mut Vec::new(),
+                &mut found,
+            );
+        }
+        if inner.iter().any(|attr| carrying(&source.text, attr)) {
+            found.carriers.push((0, source.text.len()));
         }
         let placed = std::mem::take(&mut found.placed);
-        scan(&source.text, &source.trees, false, &placed, &mut found);
+        scan(
+            &source.text,
+            &source.trees,
+            false,
+            Carriers::Open,
+            &placed,
+            &mut found,
+        );
         found.test.sort_unstable();
         source.test = found.test;
+        source.carriers = disjoint(found.carriers);
         for mount in &mut found.mounts {
             mount.test = source.test_only(mount.at);
         }
+        source.test_modules = found.test_modules;
         source.mounts = found.mounts;
         source.includes = found.includes;
         let path_strings = found.path_strings;
@@ -171,18 +251,90 @@ impl Source {
                 .any(|&(start, end)| (start..end).contains(&at))
     }
 
-    /// Every token outside the test-only items, in order: two versions of a file compile to the
-    /// same thing without tests where these are equal.
+    /// Whether the file's own inner attributes make all of it test-only (`#![cfg(test)]`): a build
+    /// without tests still opens it to read them, unless the declaration that mounts it is gated.
     #[must_use]
-    pub fn shipped(&self) -> Vec<Shipped<'_>> {
+    pub const fn whole(&self) -> bool {
+        self.whole
+    }
+
+    /// The test-only modules written inline ([`TestModule`]), in order, outermost only: one
+    /// inside another test-only item is that item's.
+    #[must_use]
+    pub fn test_modules(&self) -> &[TestModule] {
+        &self.test_modules
+    }
+
+    /// The text of every token that starts in `start..end`, comments and doc comments left out,
+    /// in order: two ranges hold the same code where these are equal.
+    #[must_use]
+    pub fn code_in(&self, start: usize, end: usize) -> Vec<&str> {
         let mut out = Vec::new();
+        self.code_of(&self.trees, start, end, &mut out);
+        out
+    }
+
+    fn code_of<'a>(&'a self, trees: &[Tree], start: usize, end: usize, out: &mut Vec<&'a str>) {
+        for tree in trees {
+            if tree.end() <= start || tree.start() >= end {
+                continue;
+            }
+            match tree {
+                Tree::Leaf(tok) => {
+                    if !matches!(tok.kind, Kind::Comment | Kind::OuterDoc | Kind::InnerDoc)
+                        && (start..end).contains(&tok.start)
+                    {
+                        out.push(&self.text[tok.start..tok.end]);
+                    }
+                }
+                Tree::Group {
+                    open,
+                    close,
+                    children,
+                } => {
+                    if (start..end).contains(&open.start) {
+                        out.push(&self.text[open.start..open.end]);
+                    }
+                    self.code_of(children, start, end, out);
+                    if (start..end).contains(&close.start) {
+                        out.push(&self.text[close.start..close.end]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every token outside the test-only items but the comments, in order, each in its place: two
+    /// versions of a file whose code is equal compile to the same thing without tests, apart from
+    /// what their comments make ([`Source::comments`]): doc strings, and whatever a macro that
+    /// reads a comment makes of it ([`Comment::carried`]).
+    #[must_use]
+    pub fn code(&self) -> Vec<Shipped<'_>> {
+        self.split().0
+    }
+
+    /// Every comment, plain or doc, outside the test-only items, in order.
+    #[must_use]
+    pub fn comments(&self) -> Vec<Comment<'_>> {
+        self.split().1
+    }
+
+    /// Whether a macro, or another front end, may read the byte at `at` (the module's carriers).
+    #[must_use]
+    pub fn carried(&self, at: usize) -> bool {
+        let after = self.carriers.partition_point(|&(start, _)| start <= at);
+        after > 0 && at < self.carriers[after - 1].1
+    }
+
+    fn split(&self) -> (Vec<Shipped<'_>>, Vec<Comment<'_>>) {
+        let mut out = (Vec::new(), Vec::new());
         if !self.whole {
             self.flatten(&self.trees, &mut out);
         }
         out
     }
 
-    fn flatten<'a>(&'a self, trees: &'a [Tree], out: &mut Vec<Shipped<'a>>) {
+    fn flatten<'a>(&'a self, trees: &'a [Tree], out: &mut (Vec<Shipped<'a>>, Vec<Comment<'a>>)) {
         for tree in trees {
             match tree {
                 Tree::Leaf(tok) => self.push(tok, out),
@@ -199,16 +351,25 @@ impl Source {
         }
     }
 
-    fn push<'a>(&'a self, tok: &Tok, out: &mut Vec<Shipped<'a>>) {
+    fn push<'a>(&'a self, tok: &Tok, (code, comments): &mut (Vec<Shipped<'a>>, Vec<Comment<'a>>)) {
         if self.test_only(tok.start) {
             return;
         }
         let line = self.line_of(tok.start);
-        out.push(Shipped {
+        let at = Shipped {
             text: &self.text[tok.start..tok.end],
             line,
             before: &self.text[self.line_starts[line - 1]..tok.start],
-        });
+        };
+        if matches!(tok.kind, Kind::Comment | Kind::OuterDoc | Kind::InnerDoc) {
+            comments.push(Comment {
+                at,
+                gap: code.len(),
+                carried: self.carried(tok.start),
+            });
+        } else {
+            code.push(at);
+        }
     }
 
     /// The 1-based line holding the byte at `at`.
@@ -624,6 +785,65 @@ fn inert(src: &str, attr: Attr<'_>) -> bool {
     }
 }
 
+/// Whether a macro may read the item an attribute sits on, the attribute and its doc comments
+/// included: it is not [`inert`] (an attribute macro), or it is a `derive` or a `doc = …` (whose
+/// value a macro may compute), alone, under `cfg_attr` or under `unsafe(…)`. A doc comment and
+/// the list form `doc(…)` do not carry.
+fn carrying(src: &str, attr: Attr<'_>) -> bool {
+    if !inert(src, attr) {
+        return true;
+    }
+    let sig = significant(attr);
+    let Some(name) = sig.first().and_then(|&i| word(src, &attr[i])) else {
+        return false;
+    };
+    let args = match sig.as_slice() {
+        [_, group] if delimiter(src, &attr[*group]) == Some(b'(') => match &attr[*group] {
+            Tree::Group { children, .. } => Some(children.as_slice()),
+            Tree::Leaf(_) => None,
+        },
+        _ => None,
+    };
+    match (name, args) {
+        ("derive", _) => true,
+        ("doc", _) => sig.get(1).is_some_and(|&i| is_punct(src, &attr[i], b'=')),
+        ("cfg_attr", Some(args)) => comma_parts(src, args)
+            .get(1..)
+            .is_some_and(|parts| parts.iter().any(|part| carrying(src, part))),
+        ("unsafe", Some(args)) => carrying(src, args),
+        _ => false,
+    }
+}
+
+/// Whether `trees` holds, at any depth, an attribute (`#[…]`, `#![…]`) that carries
+/// ([`carrying`]).
+fn holds_carrying(src: &str, trees: &[Tree]) -> bool {
+    let sig = significant(trees);
+    let punct_at = |k: usize, ch: u8| sig.get(k).is_some_and(|&i| is_punct(src, &trees[i], ch));
+    sig.iter().enumerate().any(|(k, &i)| match &trees[i] {
+        Tree::Group { children, .. } => {
+            let attr = delimiter(src, &trees[i]) == Some(b'[')
+                && (punct_at(k.wrapping_sub(1), b'#')
+                    || (punct_at(k.wrapping_sub(1), b'!') && punct_at(k.wrapping_sub(2), b'#')));
+            (attr && carrying(src, children)) || holds_carrying(src, children)
+        }
+        Tree::Leaf(_) => false,
+    })
+}
+
+/// `ranges` sorted, with those that overlap or touch merged.
+fn disjoint(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
 /// `trees` split at its top-level commas, a trailing empty part dropped.
 fn comma_parts<'t>(src: &str, trees: &'t [Tree]) -> Vec<&'t [Tree]> {
     let mut parts: Vec<&[Tree]> = trees.split(|tree| is_punct(src, tree, b',')).collect();
@@ -744,6 +964,7 @@ enum Shape {
 #[derive(Default)]
 struct Found {
     test: Vec<(usize, usize)>,
+    test_modules: Vec<TestModule>,
     /// The `mod` offsets of the declarations [`items`] placed.
     placed: BTreeSet<usize>,
     mounts: Vec<Mount>,
@@ -751,6 +972,10 @@ struct Found {
     strings: Vec<(Option<String>, usize)>,
     /// The offsets of the `#[path = "…"]` literals and those an include's arguments hold.
     path_strings: BTreeSet<usize>,
+    /// The byte ranges a macro may read.
+    carriers: Vec<(usize, usize)>,
+    /// The opening offsets of the groups whose items [`items`] read.
+    read: BTreeSet<usize>,
 }
 
 /// Where a level of items [`items`] reads is.
@@ -765,10 +990,24 @@ enum Level {
 }
 
 /// Read the items of one level, from `from` (an index in [`significant`] order): mark each
-/// test-only one, place each module declaration, and read on inside the containers whose
-/// attributes are inert.
-fn items(src: &str, trees: &[Tree], from: usize, level: Level, found: &mut Found) {
+/// test-only one, place each module declaration, mark what a macro may read, and read on inside
+/// the containers whose attributes are inert. `within` names the inline modules this level is in.
+fn items(
+    src: &str,
+    trees: &[Tree],
+    from: usize,
+    level: Level,
+    within: &mut Vec<(String, bool)>,
+    found: &mut Found,
+) {
     let sig = significant(trees);
+    let level_end = trees.last().map_or(0, Tree::end);
+    // Where the reader cannot end an item, what follows is unread: a macro may read any of it.
+    let unread = |from: usize, found: &mut Found| {
+        if let Some(&i) = sig.get(from) {
+            found.carriers.push((trees[i].start(), level_end));
+        }
+    };
     let mut p = from;
     while p < sig.len() {
         let first = p;
@@ -794,16 +1033,51 @@ fn items(src: &str, trees: &[Tree], from: usize, level: Level, found: &mut Found
             }
         }
         if p >= sig.len() {
+            unread(first, found);
             return;
         }
         let (end, shape, body) = item_end(src, trees, &sig, p);
         let Some(end) = end else {
+            unread(first, found);
             return;
         };
         let span = (trees[sig[first]].start(), trees[sig[end]].end());
         let test = shape != Shape::Unknown && attrs.iter().any(|attr| test_cfg(src, attr));
         if test {
             found.test.push(span);
+            if shape == Shape::ModInline
+                && level != Level::Body
+                && let Tree::Group { open, close, .. } = &trees[sig[end]]
+                && let Some(name) = word(src, &trees[sig[end - 1]])
+            {
+                found.test_modules.push(TestModule {
+                    name: module_name(name),
+                    within: within.iter().map(|(name, _)| name.clone()).collect(),
+                    pathed: within.iter().any(|&(_, pathed)| pathed),
+                    inner_gate: false,
+                    rewritten: !attrs.iter().all(|attr| inert(src, attr)),
+                    item: span,
+                    head: trees[sig[p]].start(),
+                    open: open.start,
+                    body: (open.end, close.start),
+                });
+            }
+        }
+        // From its first attribute to an end at or past its real one.
+        let whole = (
+            span.0,
+            trees[sig[item_extent(src, trees, &sig, p).max(end)]].end(),
+        );
+        let carried = attrs.iter().any(|attr| carrying(src, attr));
+        // An item led by a word this reader cannot name may be another front end's input, read as
+        // text: a Trust `clean { … }` island is Lean to the compiler, where a span that lexes as a
+        // Rust comment is code. (One led by punctuation is the rest of an item [`item_end`] ended
+        // early, as at a `{ N }` const default, whose kind it named.)
+        let foreign = shape == Shape::Unknown && word(src, &trees[sig[p]]).is_some();
+        if shape == Shape::Macro {
+            found.carriers.push(span);
+        } else if carried || foreign {
+            found.carriers.push(whole);
         }
         if shape == Shape::ModFile && level != Level::Body {
             let at = mod_keyword(src, trees, &sig, p, end);
@@ -816,24 +1090,55 @@ fn items(src: &str, trees: &[Tree], from: usize, level: Level, found: &mut Found
                 path: mount_path(src, &attrs),
                 test,
                 top: level == Level::Top,
+                carried,
                 at,
             });
         }
         if !test
             && attrs.iter().all(|attr| inert(src, attr))
             && matches!(shape, Shape::ModInline | Shape::Impl | Shape::Trait)
-            && let Some(Tree::Group { children, .. }) = body.map(|b| &trees[sig[b]])
+            && let Some(group @ Tree::Group { children, .. }) = body.map(|b| &trees[sig[b]])
         {
             let (inner, next) = inner_attributes(src, children);
+            if inner.iter().any(|attr| carrying(src, attr)) {
+                found.carriers.push(whole);
+            }
             if shape == Shape::ModInline && inner.iter().any(|attr| test_cfg(src, attr)) {
                 found.test.push(span);
+                if level != Level::Body
+                    && let Some(b) = body
+                    && let Tree::Group { open, close, .. } = &trees[sig[b]]
+                    && let Some(name) = word(src, &trees[sig[end - 1]])
+                {
+                    found.test_modules.push(TestModule {
+                        name: module_name(name),
+                        within: within.iter().map(|(name, _)| name.clone()).collect(),
+                        pathed: within.iter().any(|&(_, pathed)| pathed),
+                        inner_gate: true,
+                        rewritten: false,
+                        item: span,
+                        head: trees[sig[p]].start(),
+                        open: open.start,
+                        body: (open.end, close.start),
+                    });
+                }
             } else if inner.iter().all(|attr| inert(src, attr)) {
                 let level = if shape == Shape::ModInline {
                     Level::Inline
                 } else {
                     Level::Body
                 };
-                items(src, children, next, level, found);
+                found.read.insert(group.start());
+                let name = (shape == Shape::ModInline)
+                    .then(|| word(src, &trees[sig[end - 1]]).map(module_name))
+                    .flatten();
+                let pathed = !matches!(mount_path(src, &attrs), MountPath::Default)
+                    || !matches!(mount_path(src, &inner), MountPath::Default);
+                within.extend(name.clone().map(|name| (name, pathed)));
+                items(src, children, next, level, within, found);
+                if name.is_some() {
+                    within.pop();
+                }
             }
         }
         p = end + 1;
@@ -937,9 +1242,135 @@ fn item_end(
     (end, shape, body)
 }
 
+/// What [`scan`] knows of the carriers in what it reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carriers {
+    /// Its items' carriers are [`items`]'; a group it did not read may hold a carrying attribute.
+    Open,
+    /// It is in a group no reader read that holds no carrying attribute: only a macro's input
+    /// and a `clean { … }` island carry.
+    Clean,
+    /// It is in a carrier already: all of it is.
+    Covered,
+}
+
+/// Where the item starting at `p` (after its attributes) may end, at or past its real end, unlike
+/// [`item_end`]: the first `;` or `{…}` outside every `<…>` (a `>` of `->` or `=>` closes none),
+/// or the level's last tree where there is none. A const or static whose value is a block ends
+/// later, at the `;` [`item_end`] finds.
+fn item_extent(src: &str, trees: &[Tree], sig: &[usize], p: usize) -> usize {
+    item_terminator(src, trees, sig, p).unwrap_or_else(|| sig.len().saturating_sub(1))
+}
+
+fn item_terminator(src: &str, trees: &[Tree], sig: &[usize], p: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for k in p..sig.len() {
+        let tree = &trees[sig[k]];
+        if depth == 0 && (is_punct(src, tree, b';') || delimiter(src, tree) == Some(b'{')) {
+            return Some(k);
+        }
+        if is_punct(src, tree, b'<') {
+            depth += 1;
+        } else if is_punct(src, tree, b'>') {
+            let arrow = k > p
+                && (is_punct(src, &trees[sig[k - 1]], b'-')
+                    || is_punct(src, &trees[sig[k - 1]], b'='));
+            if !arrow {
+                depth = depth.saturating_sub(1);
+            }
+        }
+    }
+    None
+}
+
+/// Real body extents for caller-selected item starts. Each pair is the
+/// opening byte and its exclusive header bound. This determines extent only,
+/// not whether the caller's opening is a Rust item or an associated owner.
+/// Const-expression token groups remain opaque while the existing item
+/// terminator walks angle depth; a bodyless alias yields no body. Return the
+/// header with comments, literals and group interiors masked, so their comparisons and
+/// keywords cannot change the caller's lexical owner/type-parameter reading.
+pub(crate) fn item_bodies_at(
+    src: &str,
+    starts: &[(usize, usize)],
+) -> BTreeMap<usize, (String, usize)> {
+    fn visit(
+        src: &str,
+        trees: &[Tree],
+        starts: &BTreeMap<usize, usize>,
+        bodies: &mut BTreeMap<usize, (String, usize)>,
+    ) {
+        let sig = significant(trees);
+        for (p, &index) in sig.iter().enumerate() {
+            let tree = &trees[index];
+            if let Some(&limit) = starts.get(&tree.start()) {
+                let upper = sig.partition_point(|&index| trees[index].start() < limit);
+                if p < upper
+                    && let Some(end) = item_terminator(src, trees, &sig[..upper], p)
+                {
+                    let body = &trees[sig[end]];
+                    if delimiter(src, body) == Some(b'{') {
+                        let start = tree.start();
+                        let mut header = src.as_bytes()[start..body.start()].to_vec();
+                        for part in &trees[index..sig[end]] {
+                            let masked = match part {
+                                Tree::Group { open, close, .. } => Some((open.end, close.start)),
+                                Tree::Leaf(token)
+                                    if matches!(
+                                        token.kind,
+                                        Kind::Comment
+                                            | Kind::OuterDoc
+                                            | Kind::InnerDoc
+                                            | Kind::Str
+                                            | Kind::Char
+                                    ) =>
+                                {
+                                    Some((token.start, token.end))
+                                }
+                                _ => None,
+                            };
+                            if let Some((from, to)) = masked {
+                                header[from - start..to - start].fill(b' ');
+                            }
+                        }
+                        // Whole token/group boundaries are UTF-8 boundaries;
+                        // replacing their bytes with ASCII preserves UTF-8.
+                        let header =
+                            String::from_utf8(header).expect("masked source header is UTF-8");
+                        bodies.insert(start, (header, body.end()));
+                    }
+                }
+            }
+            if let Tree::Group { children, .. } = tree {
+                visit(src, children, starts, bodies);
+            }
+        }
+    }
+    if starts.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(tokens) = tokenize(src) else {
+        return BTreeMap::new();
+    };
+    let Some(trees) = build(src, tokens) else {
+        return BTreeMap::new();
+    };
+    let mut bodies = BTreeMap::new();
+    visit(src, &trees, &starts.iter().copied().collect(), &mut bodies);
+    bodies
+}
+
 /// Collect, at any depth: module declarations [`items`] did not place (each one this reader cannot
-/// vouch for), `include!`-family invocations and string literals.
-fn scan(src: &str, trees: &[Tree], in_macro: bool, placed: &BTreeSet<usize>, found: &mut Found) {
+/// vouch for), `include!`-family invocations, string literals, and what a macro or another front
+/// end may read outside the items [`items`] read.
+fn scan(
+    src: &str,
+    trees: &[Tree],
+    in_macro: bool,
+    carriers: Carriers,
+    placed: &BTreeSet<usize>,
+    found: &mut Found,
+) {
     let sig = significant(trees);
     let at = |k: usize| sig.get(k).map(|&i| &trees[i]);
     let word_at = |k: usize| at(k).and_then(|t| word(src, t));
@@ -960,7 +1391,30 @@ fn scan(src: &str, trees: &[Tree], in_macro: bool, placed: &BTreeSet<usize>, fou
                     || punct_at(k.wrapping_sub(1), b'#')
                     || (punct_at(k.wrapping_sub(1), b'!') && punct_at(k.wrapping_sub(2), b'#'));
                 let body = in_macro || args || macro_bodies.contains(&k);
-                scan(src, children, body, placed, found);
+                let tree = &trees[i];
+                // A Trust `clean { … }` island the item reader did not read, whose text the Clean
+                // front end reads ([`items`]).
+                let island = word_at(k.wrapping_sub(1)) == Some("clean")
+                    && delimiter(src, tree) == Some(b'{');
+                // A macro reads its input, and a group whose items no reader read is a macro's
+                // where an attribute in it carries.
+                let below = match carriers {
+                    Carriers::Covered => Carriers::Covered,
+                    _ if body || island => {
+                        found.carriers.push((tree.start(), tree.end()));
+                        Carriers::Covered
+                    }
+                    Carriers::Open if !found.read.contains(&tree.start()) => {
+                        if holds_carrying(src, children) {
+                            found.carriers.push((tree.start(), tree.end()));
+                            Carriers::Covered
+                        } else {
+                            Carriers::Clean
+                        }
+                    }
+                    open_or_clean => open_or_clean,
+                };
+                scan(src, children, body, below, placed, found);
             }
             Tree::Leaf(tok) => {
                 let name = word(src, &trees[i]);
@@ -985,6 +1439,7 @@ fn scan(src: &str, trees: &[Tree], in_macro: bool, placed: &BTreeSet<usize>, fou
                             path: MountPath::Unsettled,
                             test: false,
                             top: false,
+                            carried: true,
                             at: tok.start,
                         });
                     }

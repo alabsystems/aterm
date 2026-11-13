@@ -15,6 +15,10 @@ pub const SECRETS_VAULT_ROW: &str = "Secrets vault";
 /// Report row name indicating whether the vault subscriber runs.
 pub const SECRETS_SUBSCRIBER_ROW: &str = "Secrets subscriber";
 
+/// The launchd label of the login job that resumes an unfinished setup run with no window
+/// (`aterm_cli::macos_doctor::SETUP_RESUME_LABEL`), which an uninstall's sweep removes too.
+pub const SETUP_RESUME_LABEL: &str = "systems.alab.aterm-setup";
+
 /// Independently selectable part of the workstation profile, with discriminants as bit positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -321,9 +325,25 @@ pub enum Subject {
 }
 
 impl Subject {
-    /// The fixed public name used by cached setup status, without a setting's value.
+    /// Whether this row's read reads another app's data (the Mac settings, the sign-outs'
+    /// account state, Spotlight's project inventory), which an ordinary refresh withholds while
+    /// System State is not in front with a person ([`Observation::withheld`]): nothing in the
+    /// background reads it again, so its reading stands for the row now only while it is
+    /// [`Observation::current_at`].
     #[must_use]
-    pub const fn status_word(self) -> &'static str {
+    pub const fn reads_privately(self) -> bool {
+        match self {
+            Self::Setting(setting) => {
+                setting.is_workstation() || matches!(setting, Setting::Spotlight)
+            }
+            Self::Access(_) | Self::Sync(_) => false,
+        }
+    }
+
+    /// The row's word in the `setup=` status field and the coordinator's `setup status` reply
+    /// (`fda`, `dock`, `vault`, …): what a reader away from the page names the row by.
+    #[must_use]
+    pub const fn setup_word(self) -> &'static str {
         match self {
             Self::Access(Access::FullDiskAccess) => "fda",
             Self::Access(Access::DeveloperTools) => "devtools",
@@ -348,6 +368,16 @@ impl Subject {
             Self::Sync(SyncKind::SharedData) => "sync-shared-data",
             Self::Sync(SyncKind::Name) => "sync-name",
         }
+    }
+
+    /// The row whose [`Self::setup_word`] is `word`, if one: how a reader of `setup=` names a row
+    /// back.
+    #[must_use]
+    pub fn from_setup_word(word: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .chain(SyncKind::ALL.into_iter().map(Self::Sync))
+            .find(|subject| subject.setup_word() == word)
     }
 
     /// This reading describes the selected vault or credentials it supplied.
@@ -428,6 +458,10 @@ pub enum Standing {
     NeedsYou,
     /// Waiting on something else that will happen by itself.
     Waiting,
+    /// Asked, and nothing answered: aterm asks again by itself, with nothing for anyone to do,
+    /// and no answer may come (the ALab vault off its LAN). Neither done nor a step waited on: the
+    /// rest of setup is said set up beside it, and it is never counted in place.
+    Asking,
     /// Written; macOS takes it up at the next login.
     AtLogin,
     /// The last attempt failed, or the item cannot be changed here.
@@ -439,37 +473,6 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// One cached reading's fixed public status, without its note or value.
-    #[must_use]
-    pub const fn status_word(self) -> &'static str {
-        match self {
-            Self::InPlace => "in-place",
-            Self::Differs => "differs",
-            Self::NeedsYou => "needs-you",
-            Self::Waiting => "waiting",
-            Self::AtLogin => "at-login",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-            Self::NotNeeded => "not-needed",
-        }
-    }
-
-    /// Decode a cached status word. An absent reading (`unread`) is no Standing.
-    #[must_use]
-    pub fn from_status_word(word: &str) -> Option<Self> {
-        match word {
-            "in-place" => Some(Self::InPlace),
-            "differs" => Some(Self::Differs),
-            "needs-you" => Some(Self::NeedsYou),
-            "waiting" => Some(Self::Waiting),
-            "at-login" => Some(Self::AtLogin),
-            "failed" => Some(Self::Failed),
-            "unknown" => Some(Self::Unknown),
-            "not-needed" => Some(Self::NotNeeded),
-            _ => None,
-        }
-    }
-
     /// Whether the row counts as in place for the page's "N of M" count.
     #[must_use]
     pub const fn settled(self) -> bool {
@@ -482,6 +485,43 @@ impl Standing {
     pub const fn attention(self) -> bool {
         matches!(self, Self::NeedsYou | Self::Failed)
     }
+
+    /// Every standing.
+    pub const ALL: [Self; 9] = [
+        Self::InPlace,
+        Self::Differs,
+        Self::NeedsYou,
+        Self::Waiting,
+        Self::Asking,
+        Self::AtLogin,
+        Self::Failed,
+        Self::Unknown,
+        Self::NotNeeded,
+    ];
+
+    /// The standing's one word in a record (`in-place`, `at-login`, …).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::InPlace => "in-place",
+            Self::Differs => "differs",
+            Self::NeedsYou => "needs-you",
+            Self::Waiting => "waiting",
+            Self::Asking => "asking",
+            Self::AtLogin => "at-login",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::NotNeeded => "not-needed",
+        }
+    }
+
+    /// The standing whose [`Self::word`] is `word`, if one.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|standing| standing.word() == word)
+    }
 }
 
 /// What can end a failure (design §3.6), decided where the failure is found and carried to
@@ -490,9 +530,10 @@ impl Standing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FailureKind {
     /// A retry can help: a network blip, a vault that did not answer, a busy lock, a process
-    /// that exited oddly. While aterm still tries it again by itself the page is calm and
-    /// counts it as waiting; once those tries are spent it failed. A failure nobody classified
-    /// is one of these, never a person's.
+    /// that exited oddly. While the run's worker goes on, trying it again by itself on a pause
+    /// that grows and never ends (`aterm_types::retry_schedule`), the page is calm and counts it
+    /// as waiting; it failed only once no worker goes on with the run (it stopped, or aterm runs
+    /// none). A failure nobody classified is one of these, never a person's.
     Transient,
     /// Only a person's act ends it: a GitHub token refused or missing, a vault password to
     /// retype, an approval only an admin Mac gives, a switch only the person flips. It needs
@@ -510,7 +551,7 @@ impl FailureKind {
 
     /// The kind of failure a setup step's row `status` reports, `None` for a status that is no
     /// failure. `error` and `failed` name no kind, so they are [`Self::Transient`]: retried
-    /// while tries remain, then failed. A step only a person finishes is said by its row's
+    /// while the run's worker goes on, then failed. A step only a person finishes is said by its row's
     /// reading ([`Standing::NeedsYou`]), never by a step status.
     #[must_use]
     pub fn of_status(status: &str) -> Option<Self> {
@@ -526,21 +567,18 @@ impl FailureKind {
 /// for that try whatever the run's retry loop does.
 pub const TRIES_AGAIN_BY_ITSELF: &str = "aterm tries again by itself.";
 
-/// What a failed Secrets vault try's row says once two tries in a row failed: its tries on a
-/// pause are spent, so it waits, calm, for a change of this Mac's network or vault, which tries
-/// it again by itself ([`FailureKind::Transient`]).
-pub const TRIED_TWICE: &str =
-    "Two tries did not take, so aterm tries again once this Mac's network or vault changes.";
+/// What a failed Secrets vault try's row says once two tries in a row failed: aterm tries it
+/// again by itself, less often, up to once an hour, and at once when this Mac's network or vault
+/// changes ([`FailureKind::Transient`]).
+pub const TRIED_TWICE: &str = "Two tries did not take, so aterm tries again by itself, less often, and at once when this Mac's network or vault changes.";
 
-/// The GitHub repositories row's note while Apple's Command Line Tools, which every clone runs,
-/// are not installed: a person's remedy (`init_observe::Wait::CommandLineTools`), which System
-/// State's page starts in a terminal tab of its own (design §3.3).
-pub const COMMAND_LINE_TOOLS_MISSING: &str = "Install Apple's Command Line Tools";
-
-/// The note of a workstation row the person changed after aterm set it and read it back
-/// (design §6.9): no automatic pass sets it again, so the row reads as the person left it, with
-/// no chip saying it will change, until Restore, turning its group off and on, or Set up now.
-pub const CHANGED_BY_YOU: &str = "Changed by you";
+/// The note of a workstation row that read back as aterm set it and reads otherwise since
+/// (design §6.9). Nothing tells who changed it (the person, another app, macOS, a profile), so
+/// the row says only that it changed, never whose change it is. No automatic pass sets it again,
+/// so the row reads its value now, with no chip saying it will change, until Restore, turning its
+/// group off and on, or Set up now; it is not set up, so it counts neither done nor among the
+/// changes to make.
+pub const CHANGED_SINCE: &str = "Changed since aterm set it";
 
 /// The Secrets vault row's value on a member Mac whose sync the person turned off, which is
 /// also what the row wants then (design §4: an explicit opt-out is the row's wanted state), so
@@ -593,6 +631,12 @@ pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admi
 /// other end said nothing, and the window ends the tab with [`COMMAND_LINE_TOOLS_NOT_FINISHED`].
 pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
 
+/// The variable the window sets beside [`COMMAND_LINE_TOOLS_TAB`] where it reads developer mode
+/// off as the person's own choice (they turned it off in aterm's Settings ▸ Security, or
+/// something they ran turned it off after aterm saw it on): the tab's program owes nothing for
+/// it, and its root half leaves it as it reads.
+pub const COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE: &str =
+    "ATERM_COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE";
 /// The dedicated Mac Setup tab's program arguments, shared with its owned lab responder.
 pub const COMMAND_LINE_TOOLS_ARGS: [&str; 3] = ["init", "--only", "base.clt"];
 
@@ -611,8 +655,8 @@ pub const COMMAND_LINE_TOOLS_NOT_FINISHED: &str = "Mac Setup did not finish";
 /// What the Mac Setup tab's program exits with when the window's go line
 /// ([`COMMAND_LINE_TOOLS_TAB_GO`]) never came, or came behind other typing: it started nothing and
 /// said nothing (neither 0 nor 1, which say it printed its last line), so the window ends the tab
-/// with its own line and takes back an opening the tab spent, which installed nothing and which
-/// no person declined.
+/// with its own line and gives the attempt back in the account's record
+/// ([`crate::clt_mark::End::Released`]): it asked nothing, and no person declined it.
 pub const COMMAND_LINE_TOOLS_TAB_NOT_STARTED: u8 = 2;
 
 /// What the Mac Setup tab's program exits with once it said Low Data Mode holds the
@@ -626,18 +670,21 @@ pub const COMMAND_LINE_TOOLS_TAB_LOW_DATA: u8 = 3;
 pub const COMMAND_LINE_TOOLS_TAB_NOT_ADMIN: u8 = 4;
 
 /// What the Mac Setup tab's program exits with once it said a stop ended its install
-/// before the tools arrived: a Ctrl-C in the tab, at the password prompt or during the install.
-/// A person declined: the window keeps the account's opening spent, as it does for a closed
-/// tab, and no launch reopens it by itself.
+/// before the tools arrived: a Ctrl-C in the tab, at the password prompt or during the install,
+/// or System State's Stop. A person declined: the window records it in the account's record
+/// ([`crate::clt_mark::End::Declined`]), as it does for a tab they closed while aterm ran on, and
+/// no launch reopens it by itself before its long pause passes ([`crate::clt_mark::DECLINE_AGAIN`])
+/// or their own yes (Install…, a typed `aterm init`, Set up now).
 pub const COMMAND_LINE_TOOLS_TAB_STOPPED: u8 = 5;
 
 /// What the Mac Setup tab's program exits with once it said Apple's installer window
 /// closed without installing them: the window the program waited on (opened where Apple's
 /// catalog lists none, or already open) went with no installer running. A person pressed Not
 /// Now, Cancel, or Done on Apple's own failure there, each of which unlinks the placeholder, or
-/// quit the window before pressing Install, which leaves a placeholder aterm's root half stamped
-/// beside it ([`APPLE_TOOLS_INSTALLER`]), so the window keeps the account's opening spent, as
-/// for a stop, and Install… (or `aterm init`) is the way on.
+/// the window was quit before Install was pressed (a logout included), which leaves a
+/// placeholder aterm's root half stamped beside it ([`APPLE_TOOLS_INSTALLER`]). Nothing tells
+/// which, so the window records an unfinished try ([`crate::clt_mark::End::Unfinished`]), asked
+/// again by itself on the record's schedule, never a decline.
 pub const COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED: u8 = 6;
 
 /// The Mac Setup tab lost its own console before entering `sudo`. Only this launch's exact
@@ -817,9 +864,110 @@ pub struct Observation {
     /// needs a person, is not needed, was opted out of or failed (a row that
     /// differs or waits shows its note alone).
     pub detail: Option<String>,
+    /// Whether, and when, the row was read: what its age is told from, and what tells a read
+    /// that was withheld from one that ran and failed (design §3.5).
+    pub read: Read,
 }
 
+/// Whether, and when, a row was read ([`Observation::read`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Read {
+    /// No stamp: a placeholder, or a reading its reader returned before the observer that
+    /// publishes it stamped it. It is evidence of no age, so it verifies nothing.
+    #[default]
+    Unstamped,
+    /// Not read at all: an ordinary refresh reads no other app's data (the Mac settings, the
+    /// sign-outs' account state, Spotlight's project inventory) while System State is not in
+    /// front with a person ([`Observation::withheld`]). It is no value and no failure, and an
+    /// earlier reading of the row stands against it.
+    Withheld,
+    /// Read when the read started, in Unix seconds.
+    At(u64),
+}
+
+impl Read {
+    /// Whether a reading read so stands at `now` (Unix seconds): it was read, it was read no
+    /// later than `now` and no more than [`READING_STANDS_SECS`] before it. An unstamped or
+    /// withheld reading never does, nor one dated after `now` (the clock moved back, so its age
+    /// is unknown), nor one dated 0 (read with no clock to date it).
+    #[must_use]
+    pub const fn current_at(self, now: u64) -> bool {
+        match self {
+            Self::At(at) => at != 0 && at <= now && now - at <= READING_STANDS_SECS,
+            Self::Unstamped | Self::Withheld => false,
+        }
+    }
+}
+
+/// How long a reading of a row read privately ([`Subject::reads_privately`]) stands for the row
+/// now, in seconds: nothing in the background reads such a row again, so past this its reading
+/// is only what the row was. One that read it back settled ([`Observation::read_back_settled`])
+/// is the row set up as last read (or changed since aterm set it, as `;changed:` says), which
+/// `setup=` says `read-back:` and a check away from the console says with its age, never as in
+/// place now (design §3.5). System State in front with a person reads it again.
+pub const READING_STANDS_SECS: u64 = 10 * 60;
+
+/// The schema of the running aterm's prompt-free `setup status` answer (`OK schema=<n> setup=…
+/// verified=<bits> verified_at=<unix secs|-> observed_generation=<n>
+/// rows=<word:said,…|->`, design §3.5), which its writer (`aterm_gui`'s control front door) and
+/// its reader (`aterm init --check` and `aterm status` away from the console) share. Schema 6,
+/// one grammar above schemas 2, 4 and 5 (6 names the rows changed since aterm set them
+/// `;changed:`, which 5 named `;yours:` as if whoever changed them were known, and adds the
+/// `asking:` head and the `asking` standing, a row asked again by itself that no answer
+/// settled): `setup=` is the whole Mac's state as `status` says it, with `;changed:` naming
+/// those rows;
+/// `rows=` says each managed row in its word ([`Subject::setup_word`]) with its standing
+/// ([`Standing::word`]), `unread` for a row no usable reading stands behind (a withheld read, a
+/// read that said nothing, [`Observation::read_nothing`], or a private reading with no date)
+/// and `offered` for a grant on offer ([`Observation::on_offer`]); `verified` is every selected
+/// private row read back settled ([`Observation::read_back_settled`]: aterm's value, a value
+/// macOS takes up in full at the next login, or one changed since aterm set it, which no pass
+/// sets again) whatever its age, while no change that could move one is under way, and
+/// `verified_at` the oldest of those readings, whose age the reader judges at its own clock. A
+/// reader decides only the rows it asks about, from `rows=` and `verified`, and says a verified
+/// row `rows=` reads `differs` as changed since aterm set it, never as in place.
+pub const SETUP_STATUS_SCHEMA: u32 = 6;
+
 impl Observation {
+    /// Whether this is a grant on offer: one only a person gives, which nothing waits on and no
+    /// step of aterm's asks for now ([`ACCESS_OFFERED`]), or developer mode left to the person
+    /// once setup's one Mac password does not turn it on by itself ([`DEBUGGER_NOT_ASKED`]). It
+    /// is neither done nor a person's step: offered, never waited on.
+    #[must_use]
+    pub fn on_offer(&self) -> bool {
+        matches!(self.subject, Subject::Access(_))
+            && self.standing == Standing::NotNeeded
+            && self
+                .note
+                .as_deref()
+                .is_some_and(|note| note == ACCESS_OFFERED || note == DEBUGGER_NOT_ASKED)
+    }
+
+    /// Whether this row changed after aterm set it and read it back (design §6.6,
+    /// [`CHANGED_SINCE`]): it differs from aterm's value, by whoever changed it, and no automatic
+    /// pass sets it again. It is not in place.
+    #[must_use]
+    pub fn changed_since(&self) -> bool {
+        self.standing == Standing::Differs && self.note.as_deref() == Some(CHANGED_SINCE)
+    }
+
+    /// Whether this reading reads the row settled, whatever its age: as wanted (in place, not
+    /// needed, a grant on offer being neither, [`Self::on_offer`]; or set for macOS to take up in
+    /// full at the next login), or changed since aterm set it ([`Self::changed_since`]), which no
+    /// pass sets again and nothing reads as in place; and dated by a clock ([`Read::At`] past 0),
+    /// so its age can be told. Only such a reading verifies a row (`setup status`' `verified`:
+    /// nothing is left for setup to do on it); whether it stands for the row now is
+    /// [`Self::current_at`].
+    #[must_use]
+    pub fn read_back_settled(&self) -> bool {
+        (matches!(
+            self.standing,
+            Standing::InPlace | Standing::NotNeeded | Standing::AtLogin
+        ) || self.changed_since())
+            && !self.on_offer()
+            && self.read_at().is_some_and(|at| at != 0)
+    }
+
     /// An observation with no reading yet.
     #[must_use]
     pub fn unknown(subject: Subject) -> Self {
@@ -831,6 +979,70 @@ impl Observation {
             wanted: subject.wanted().to_owned(),
             note: None,
             detail: None,
+            read: Read::Unstamped,
+        }
+    }
+
+    /// A row an ordinary refresh did not read ([`Read::Withheld`]): [`Standing::Unknown`], with
+    /// no value, no note and no detail.
+    #[must_use]
+    pub fn withheld(subject: Subject) -> Self {
+        Self {
+            read: Read::Withheld,
+            ..Self::unknown(subject)
+        }
+    }
+
+    /// Whether an ordinary refresh withheld this row's read ([`Read::Withheld`]).
+    #[must_use]
+    pub const fn is_withheld(&self) -> bool {
+        matches!(self.read, Read::Withheld)
+    }
+
+    /// Whether a read of this row ran and said nothing of it: [`Standing::Unknown`] from a read
+    /// stamped as run ([`Read::At`]), such as a grant this process cannot read, or one whose note
+    /// says why (a reader that unwound). No read of it is under way, so it is unread here, never
+    /// a wait: a reader away from the page says it `unread`, as a withheld read is.
+    #[must_use]
+    pub const fn read_nothing(&self) -> bool {
+        matches!(self.standing, Standing::Unknown)
+            && !self.is_withheld()
+            && (self.note.is_some() || matches!(self.read, Read::At(_)))
+    }
+
+    /// When the row was read, in Unix seconds; `None` for a row nothing read.
+    #[must_use]
+    pub const fn read_at(&self) -> Option<u64> {
+        match self.read {
+            Read::At(at) => Some(at),
+            Read::Unstamped | Read::Withheld => None,
+        }
+    }
+
+    /// Whether this reading stands for the row at `now` (Unix seconds) ([`Read::current_at`]).
+    #[must_use]
+    pub const fn current_at(&self, now: u64) -> bool {
+        self.read.current_at(now)
+    }
+
+    /// Whether this reading was read, and is past standing for the row at `now`
+    /// ([`Self::current_at`]): a read of it is owed again. An unstamped or withheld reading is
+    /// neither current nor stale.
+    #[must_use]
+    pub const fn stale_at(&self, now: u64) -> bool {
+        matches!(self.read, Read::At(_)) && !self.current_at(now)
+    }
+
+    /// This reading, stamped as read at `at` (Unix seconds), unless its read was withheld,
+    /// which stays unread.
+    #[must_use]
+    pub fn stamped(self, at: u64) -> Self {
+        match self.read {
+            Read::Withheld => self,
+            Read::Unstamped | Read::At(_) => Self {
+                read: Read::At(at),
+                ..self
+            },
         }
     }
 }
@@ -991,6 +1203,20 @@ impl Selection {
         Self(self.0 & 0xff)
     }
 
+    /// The settings this selection selects whose rows are read privately
+    /// ([`Subject::reads_privately`]: the profile's and Rust in Spotlight), which `setup status`'
+    /// `verified` speaks for.
+    #[must_use]
+    pub const fn private(self) -> Self {
+        Self(self.workstation().0 | (self.0 & (1 << Setting::Spotlight as u8)))
+    }
+
+    /// Every setting both this selection and `other` select.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     /// Whether a setting is selected.
     #[must_use]
     pub const fn contains(self, setting: Setting) -> bool {
@@ -1059,12 +1285,20 @@ pub const ACCESS_OFFERED: &str =
 
 /// The Debugger row's note while developer mode reads off on an account that may turn it on:
 /// setup's one early Mac password, which aterm asks for by itself (`aterm_machines::root_steps`),
-/// turns it on, so the row is neither offered for a press nor waited on (owner ruling
-/// 2026-11-02). It names the two routes left once that tab was stopped: `aterm init --only
+/// turns it on, so the row is neither offered for a press nor waited on.
+/// It names the two routes left once that tab was stopped: `aterm init --only
 /// base.clt` asks for the same password now, and aterm's Settings ▸ Security turns developer
 /// mode on.
 pub const DEBUGGER_BY_ELEVATION: &str = "Setup's one Mac password turns it on. Stopped, `aterm \
      init --only base.clt` asks for it now, or turn it on in aterm's Settings \u{25b8} Security.";
+
+/// The Debugger row's note while developer mode reads off and setup's one Mac password does not
+/// turn it on by itself: a person declined its last ask, the account's record of it cannot be
+/// read ([`crate::clt_mark::Asked::coming`]), or setup's elevation finished once, so developer
+/// mode was turned off since and is left as it reads ([`crate::clt_mark::Record::finished`]).
+/// The row is the person's, never a calm wait, and names their two routes.
+pub const DEBUGGER_NOT_ASKED: &str = "aterm does not turn it on by itself: run `aterm init \
+     --only base.clt`, or turn it on in aterm's Settings \u{25b8} Security.";
 
 /// Persisted first-launch setup plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1191,10 +1425,11 @@ static WORKER_WAKE: DialogEndWake = DialogEndWake::new();
 /// another dialog up ([`wake_window_when_no_macos_dialog`]) looks again once none is.
 static WINDOW_WAKE: DialogEndWake = DialogEndWake::new();
 
-/// Register what wakes a caller that timed out waiting for another macOS
-/// dialog, once the last dialog ends. Immediate slot probes do not wait and
-/// do not subscribe here: a window's subscribes through
-/// [`wake_window_when_no_macos_dialog`]. The first registration wins.
+/// Register what wakes the setup worker once the last macOS dialog ends, after one of its steps
+/// timed out waiting for another (`MacosDialog::when_none_up`) or found one up without waiting
+/// (`MacosDialog::if_none_up`). The window's own immediate slot probes do not subscribe here: a
+/// window's subscribes through [`wake_window_when_no_macos_dialog`]. The first registration
+/// wins.
 pub fn on_macos_dialog_waiter_ready(ready: fn()) {
     let _ = WORKER_WAKE.ready.set(ready);
 }
@@ -1266,14 +1501,37 @@ impl MacosDialog {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
+
+    /// Count this one up if no other macOS dialog this process started is up, without waiting:
+    /// a step nobody waits for (the setup worker's unattended sign-outs) never holds its thread
+    /// on a person's answer to another. Where one is up it returns `None` and wakes the setup
+    /// worker once none is ([`on_macos_dialog_waiter_ready`]), so the step is looked at again
+    /// the moment it can go.
+    #[must_use = "the dialog counts as up only while the guard lives"]
+    pub fn if_none_up() -> Option<Self> {
+        let free = MACOS_DIALOGS
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if free {
+            return Some(Self(()));
+        }
+        WORKER_WAKE.arm();
+        None
+    }
 }
 
 /// Whether System State is the visible view of a focused window with a person at this Mac
-/// (input within the last minute, the screen unlocked): the only time a setup run may put the
-/// Accounts stage's Accessibility and Automation prompts, or its sign-outs, on screen
+/// (input within the last minute, the screen unlocked): the only time a setup run's ordinary read
+/// takes the rows it withholds from a page nobody is at
 /// (`docs/DESIGN-system-state-2026-10-21.md` §6, `docs/DESIGN-init-on-by-default-2026-10-25.md`
 /// §6.4). The window publishes it ([`set_system_state_front`]); a process with no window never
-/// has it, so its setup run leaves those steps for a window.
+/// has it, so its reads leave those rows for a window. The Messages and FaceTime sign-outs never
+/// read it: each reads its own login's session right before its clicks.
 static SYSTEM_STATE_FRONT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1657,270 +1915,7 @@ pub mod access_record {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        #[test]
-        fn access_record_an_unreadable_history_is_preserved_until_it_can_be_read() {
-            let dir = crate::test_scratch_dir("access");
-            let root = dir.path();
-            let revision = 8_176;
-            append(
-                root,
-                revision,
-                Access::DeveloperTools,
-                AccessOutcome::Declined,
-            )
-            .unwrap();
-            append(
-                root,
-                revision + 1,
-                Access::FullDiskAccess,
-                AccessOutcome::Granted,
-            )
-            .unwrap();
-            let path = root.join(FILE);
-            let readable = std::fs::read(&path).unwrap();
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap()
-                .write_all(&[0xff])
-                .unwrap();
-            let unreadable = std::fs::read(&path).unwrap();
-            assert_eq!(
-                std::fs::read_to_string(&path).unwrap_err().kind(),
-                std::io::ErrorKind::InvalidData
-            );
-
-            let result = append(root, revision, Access::Accessibility, AccessOutcome::Handed);
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                unreadable,
-                "a failed history read must preserve the earlier answers"
-            );
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-
-            // Repair this test's damaged input, then the same append can succeed
-            // while retaining both earlier outcomes and their separate revisions.
-            std::fs::write(&path, readable).unwrap();
-            append(root, revision, Access::Accessibility, AccessOutcome::Handed).unwrap();
-            assert_eq!(
-                read(root, revision),
-                [
-                    (Access::DeveloperTools, AccessOutcome::Declined),
-                    (Access::Accessibility, AccessOutcome::Handed),
-                ]
-            );
-            assert_eq!(
-                latest(root, revision + 1, Access::FullDiskAccess),
-                Some(AccessOutcome::Granted)
-            );
-        }
-
-        #[test]
-        fn access_record_write_failure_releases_its_lock_and_removes_its_staging() {
-            let dir = crate::test_scratch_dir("access");
-            let root = dir.path();
-            assert!(
-                append_with(
-                    root,
-                    8_175,
-                    Access::Debugger,
-                    AccessOutcome::Granted,
-                    || {
-                        std::fs::create_dir(root.join(FILE)).unwrap();
-                    }
-                )
-                .is_err()
-            );
-            let remaining: Vec<_> = std::fs::read_dir(root)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert_eq!(
-                remaining.len(),
-                2,
-                "a failed publication kept private staging"
-            );
-            assert!(remaining.contains(&std::ffi::OsString::from(FILE)));
-            assert!(remaining.contains(&std::ffi::OsString::from(LOCK_FILE)));
-            let probe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(root.join(LOCK_FILE))
-                .unwrap();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "an independent handle verifies the failed publication released its writer lock"
-            )]
-            probe.try_lock().unwrap();
-            probe.unlock().unwrap();
-            std::fs::remove_dir(root.join(FILE)).unwrap();
-            append(root, 8_175, Access::Debugger, AccessOutcome::Granted).unwrap();
-            assert_eq!(
-                latest(root, 8_175, Access::Debugger),
-                Some(AccessOutcome::Granted)
-            );
-        }
-
-        #[test]
-        fn access_record_concurrent_writers_keep_independent_outcomes_and_the_latest_decline() {
-            let dir = crate::test_scratch_dir("access");
-            let root = dir.path();
-            let revision = 8_173;
-            let other_revision = revision + 1;
-            append(
-                root,
-                revision,
-                Access::FullDiskAccess,
-                AccessOutcome::Handed,
-            )
-            .unwrap();
-            append(
-                root,
-                other_revision,
-                Access::FullDiskAccess,
-                AccessOutcome::Granted,
-            )
-            .unwrap();
-            let (ready, read_ready) = mpsc::sync_channel(1);
-            let (release, resume) = mpsc::sync_channel(1);
-            let (first_done, first_result) = mpsc::sync_channel(1);
-            let first_root = root.to_path_buf();
-            let first = std::thread::spawn(move || {
-                let result = append_with(
-                    &first_root,
-                    revision,
-                    Access::Debugger,
-                    AccessOutcome::Granted,
-                    || {
-                        // Coordinate the old unlocked path and the corrected locked path
-                        // without waiting for a writer held behind our own lock.
-                        let probe = std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(first_root.join(LOCK_FILE))
-                            .unwrap();
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "an independently opened handle samples writer ownership only to schedule this regression"
-                        )]
-                        let unlocked = match probe.try_lock() {
-                            Ok(()) => {
-                                probe.unlock().unwrap();
-                                true
-                            }
-                            Err(std::fs::TryLockError::WouldBlock) => false,
-                            Err(std::fs::TryLockError::Error(error)) => panic!("{error}"),
-                        };
-                        ready.send(unlocked).unwrap();
-                        resume.recv_timeout(Duration::from_secs(60)).unwrap();
-                    },
-                );
-                first_done.send(result).unwrap();
-            });
-            let unlocked = read_ready.recv_timeout(Duration::from_secs(60)).unwrap();
-            let (second_done, second_result) = mpsc::sync_channel(1);
-            let second_root = root.to_path_buf();
-            let second = std::thread::spawn(move || {
-                second_done
-                    .send(append(
-                        &second_root,
-                        revision,
-                        Access::FullDiskAccess,
-                        AccessOutcome::Declined,
-                    ))
-                    .unwrap();
-            });
-            let result = if unlocked {
-                let result = second_result.recv_timeout(Duration::from_secs(60)).unwrap();
-                release.send(()).unwrap();
-                result
-            } else {
-                release.send(()).unwrap();
-                second_result.recv_timeout(Duration::from_secs(60)).unwrap()
-            };
-            result.unwrap();
-            first_result
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .unwrap();
-            first.join().unwrap();
-            second.join().unwrap();
-
-            let rows = read(root, revision);
-            assert!(rows.contains(&(Access::Debugger, AccessOutcome::Granted)));
-            assert!(rows.contains(&(Access::FullDiskAccess, AccessOutcome::Handed)));
-            assert!(
-                rows.contains(&(Access::FullDiskAccess, AccessOutcome::Declined)),
-                "an independent append lost the newer Not now: {rows:?}"
-            );
-            assert_eq!(rows.len(), 3);
-            assert_eq!(
-                latest(root, revision, Access::FullDiskAccess),
-                Some(AccessOutcome::Declined)
-            );
-            assert_eq!(
-                read(root, other_revision),
-                [(Access::FullDiskAccess, AccessOutcome::Granted)]
-            );
-        }
-
-        /// The latest of any revision is the row's last line in any revision, revision 0 (an older
-        /// aterm's legacy run) included, past every line this build does not know: an older
-        /// aterm's `local-network` row, an older aterm's `triggered` outcome, an unknown outcome,
-        /// extra fields, an unparsed revision.
-        #[test]
-        fn access_record_the_latest_of_any_revision_reads_every_revision_and_skips_unknown_lines() {
-            let dir = crate::test_scratch_dir("access");
-            let root = dir.path();
-            assert_eq!(latest_of_any_revision(root, Access::Debugger), None);
-            append(root, 0, Access::Debugger, AccessOutcome::Handed).unwrap();
-            assert_eq!(
-                latest_of_any_revision(root, Access::Debugger),
-                Some(AccessOutcome::Handed)
-            );
-            std::fs::write(
-                root.join(FILE),
-                "0 debugger triggered\n\
-                 7 debugger granted\n\
-                 9 full-disk-access handed\n\
-                 10 local-network granted 5454545454545454545454545454545454545454545454545454545454545454\n\
-                 11 local-network triggered\n\
-                 12 debugger asked-twice\n\
-                 13 bluetooth triggered\n\
-                 14 debugger declined later\n\
-                 not-a-revision debugger declined\n",
-            )
-            .unwrap();
-            assert_eq!(
-                latest_of_any_revision(root, Access::Debugger),
-                Some(AccessOutcome::Granted),
-                "an older revision's line, past another row's and every unknown or newer line"
-            );
-            assert_eq!(
-                latest_of_any_revision(root, Access::FullDiskAccess),
-                Some(AccessOutcome::Handed)
-            );
-            assert_eq!(
-                read(root, 10),
-                [],
-                "an older aterm's local-network row is skipped"
-            );
-            assert_eq!(latest_of_any_revision(root, Access::Accessibility), None);
-            append(root, 3, Access::Debugger, AccessOutcome::Handed).unwrap();
-            assert_eq!(
-                latest_of_any_revision(root, Access::Debugger),
-                Some(AccessOutcome::Handed),
-                "the file's last line for the row, whatever its revision"
-            );
-        }
-    }
+    mod tests;
 }
 
 /// The GitHub repositories row's short note when GitHub refuses the token the vault syncs (the
@@ -1961,17 +1956,15 @@ pub struct StageRow {
 }
 
 impl StageRow {
-    /// How the words of a stage row parked after it took over an hour end (init-on-by-default
-    /// design §6.5): first why it stopped (`Took over an hour cloning GitHub repositories;`),
-    /// then this. System State checks again by itself, a little later each time, so nobody has
-    /// to: a stage that hangs again costs another hour, never aterm itself.
-    pub const PARKED_TAIL: &str = "aterm checks again by itself.";
-
-    /// How the words of a stage row parked after aterm stopped twice in it end (§6.5): first why
-    /// (`Stopped twice while cloning GitHub repositories;`), then this. The park guards against
-    /// a stage that stops aterm, every window with it, so nothing lifts it by itself: Check again
-    /// does, when the person chooses to try it.
-    pub const HELD_TAIL: &str = "it waits for Check again.";
+    /// How the words of a stage row parked after aterm stopped twice in it, or after it took over
+    /// an hour, end (init-on-by-default design §6.5): first why (`Stopped twice while cloning
+    /// GitHub repositories;`, `Took over an hour cloning GitHub repositories;`), then this. The
+    /// park is a pause: the run's worker begins the stage again by itself at its end, an hour
+    /// after the first park and longer after each, up to a day, so a stage that stops or hangs
+    /// aterm costs a stop that often at most and is never given up on; Check again lifts it at
+    /// once.
+    pub const PARKED_TAIL: &str =
+        "aterm tries it again by itself later, or at once on Check again.";
 
     /// How the words of a stage row end that has run past the hang limit in the aterm still
     /// running it (init-on-by-default design §6.5): first what it is still doing (`Still cloning
@@ -1979,17 +1972,17 @@ impl StageRow {
     /// stage still runs there, so a try now could change nothing.
     pub const STILL_RUNNING_TAIL: &str = "it ends by itself or when aterm quits.";
 
-    /// The words of a stage row resumed after aterm stopped in it.
-    pub const RESUMING: &str = "Resuming after aterm stopped.";
+    /// The words of a stage row cut off before it ended, which a pass resumes with no press:
+    /// aterm stopped in it (a quit, a crash, a logout, a restart), or a pass panicked in it and
+    /// its worker starts again after a pause, so they claim neither.
+    pub const RESUMING: &str = "Cut off before it finished; it runs again by itself.";
 
-    /// How the words of a Messages or FaceTime sign-out's row end while the Accounts stage is
-    /// parked for want of a person at this Mac (init-on-by-default design §6.4): the pass that
-    /// found nobody at System State only read the accounts, or a sign-out found nobody there
-    /// as its clicks were to start. System State reads them by this, and looks for the person's
-    /// return only then.
-    pub const WAITS_FOR_A_PERSON: &str = "runs while you are at this Mac with System State on \
-                                          screen: it opens Messages and FaceTime, and macOS may \
-                                          ask for Accessibility";
+    /// What a Messages or FaceTime sign-out's row says while macOS has given no answer aterm can
+    /// read to whether aterm may control System Events, which its clicks go through
+    /// (aterm-machines' `init_accounts`): an unattended run never asks it. The window reads
+    /// these words in the setup run's rows and asks macOS once Accessibility reads on, where no
+    /// walk's Accessibility page asks it (aterm-gui's `App::look_for_automation_ask`).
+    pub const AUTOMATION_UNANSWERED: &str = "aterm's window asks macOS once Accessibility is on";
 
     /// The stage whose row is named `name`, if one.
     #[must_use]
@@ -2052,580 +2045,5 @@ pub const STAGE_ROWS: [StageRow; 6] = [
 ];
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The tools are held by one of Apple's command-line installers (as the caller's exact
-    /// comparison names them: a stand-in here) beside the placeholder, whatever else runs, else
-    /// by Apple's own installer app, by absolute path, with the placeholder beside it or not: a
-    /// placeholder beside another program, even one named like an installer, or beside a process
-    /// the kernel names no executable for, is held by nothing, and a command-line installer with
-    /// no placeholder installs something else.
-    /// NEGATIVE CONTROL: the same processes with the installer's or the window's row taken out
-    /// hold nothing, placeholder or not.
-    #[test]
-    fn the_tools_are_held_only_by_their_own_installers() {
-        let cli = |exe: &std::path::Path| exe == std::path::Path::new("/stand-in/installs");
-        let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
-                     Contents/MacOS/Install Command Line Developer Tools";
-        let held = |placeholder: bool, exes: &[Option<&str>]| {
-            tools_held_by(placeholder, exes.iter().copied(), cli)
-        };
-        let (line, window) = (
-            Some(ToolsInstaller::CommandLine),
-            Some(ToolsInstaller::AppleWindow),
-        );
-        assert_eq!(held(true, &[Some("/stand-in/installs")]), line);
-        assert_eq!(held(true, &[Some("/bin/zsh"), Some(apple)]), window);
-        assert_eq!(
-            held(true, &[Some(apple), Some("/stand-in/installs")]),
-            line,
-            "an install under way outranks the window beside it"
-        );
-        assert_eq!(held(true, &[None, Some(apple)]), window, "{apple}");
-        assert_eq!(held(true, &[None, Some("/stand-in/installs")]), line);
-        assert_eq!(
-            held(true, &[None, Some("/bin/zsh")]),
-            None,
-            "an unnamed row"
-        );
-        assert_eq!(held(true, &[Some("/bin/zsh")]), None, "the control");
-        assert_eq!(held(true, &[]), None);
-        assert_eq!(
-            held(false, &[Some(apple)]),
-            window,
-            "the window with no placeholder beside it"
-        );
-        assert_eq!(
-            held(false, &[Some("/stand-in/installs"), Some(apple)]),
-            window,
-            "a command-line installer counts only beside the placeholder"
-        );
-        assert_eq!(held(false, &[None, Some(apple)]), window);
-        assert_eq!(held(false, &[Some("/stand-in/installs")]), None);
-        assert_eq!(held(false, &[Some("/bin/zsh"), None]), None, "the control");
-        assert_eq!(
-            tools_installer(std::path::Path::new("/stand-in/installs"), cli),
-            line
-        );
-        assert_eq!(tools_installer(std::path::Path::new(apple), cli), window);
-        for other in [
-            "/tmp/installs",
-            "stand-in/installs",
-            "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated",
-            "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
-        ] {
-            assert_eq!(held(true, &[Some(other)]), None, "{other}");
-            assert_eq!(
-                tools_installer(std::path::Path::new(other), cli),
-                None,
-                "{other}"
-            );
-        }
-    }
-
-    /// A placeholder is a live run's only when its stamp names a process alive from the start
-    /// the stamp names: a gone process, a pid another process took since, a start of `0` (which
-    /// matches nothing, whatever runs under the pid) and any other contents are no run's.
-    #[test]
-    fn a_placeholder_is_a_live_runs_only_from_the_start_its_stamp_names() {
-        let alive = |pid: u32| (pid == 4242).then_some(1000);
-        let stamp = placeholder_stamp(4242, 1000);
-        assert_eq!(stamp, "aterm 4242 1000\n");
-        assert!(placeholder_held_by_a_live_run(stamp.as_bytes(), alive));
-        for other in [
-            placeholder_stamp(4242, 999),
-            placeholder_stamp(4243, 1000),
-            placeholder_stamp(4242, 0),
-            "aterm 4242\n".to_owned(),
-            "aterm 4242 1000 extra\n".to_owned(),
-            "apple 4242 1000\n".to_owned(),
-            String::new(),
-        ] {
-            assert!(
-                !placeholder_held_by_a_live_run(other.as_bytes(), alive),
-                "{other:?}"
-            );
-        }
-        assert!(!placeholder_held_by_a_live_run(
-            placeholder_stamp(4242, 0).as_bytes(),
-            |_| Some(0)
-        ));
-        assert!(stamp.len() <= PLACEHOLDER_STAMP_MAX);
-        assert!(placeholder_stamp(u32::MAX, u64::MAX).len() <= PLACEHOLDER_STAMP_MAX);
-    }
-
-    /// A `Subject::Sync` row rides `Setting::Secrets` (its group, setting and wanted all follow
-    /// it, and it uses the vault source) and is not enumerated by `all()`, so no Sync row is
-    /// built in shipped code yet. Its six kinds are distinct and have distinct names. The
-    /// negative control is `all()`'s zero Sync subjects: were the stub enumerated, this would
-    /// fail.
-    #[test]
-    fn a_sync_row_is_a_stub_that_rides_secrets_and_stays_off_the_page() {
-        for kind in SyncKind::ALL {
-            let row = Subject::Sync(kind);
-            assert_eq!(row.group(), Setting::Secrets.group(), "{kind:?}");
-            assert_eq!(row.setting(), Setting::Secrets, "{kind:?}");
-            assert_eq!(row.wanted(), Setting::Secrets.wanted(), "{kind:?}");
-            assert_eq!(row.name(), kind.name(), "{kind:?}");
-            assert!(row.uses_vault_source(), "{kind:?}");
-        }
-        // Not enumerated: no Sync row is built in shipped code.
-        assert_eq!(
-            Subject::all()
-                .into_iter()
-                .filter(|subject| matches!(subject, Subject::Sync(_)))
-                .count(),
-            0
-        );
-        // The six kinds are distinct, and so are their names.
-        for (i, a) in SyncKind::ALL.iter().enumerate() {
-            for b in &SyncKind::ALL[i + 1..] {
-                assert_ne!(a, b);
-                assert_ne!(a.name(), b.name(), "{a:?} vs {b:?}");
-            }
-        }
-    }
-
-    /// A Restore's outcome holds one entry per row, its worst key speaking for it, in page
-    /// order with the keys of no row last.
-    #[test]
-    fn a_restore_outcome_is_one_entry_per_row_in_page_order_worst_first() {
-        let outcome = RestoreOutcome::of([
-            (None, PutBack::Failed),
-            (Some(Setting::Dock), PutBack::Back),
-            (Some(Setting::NaturalScrolling), PutBack::Back),
-            (Some(Setting::NaturalScrolling), PutBack::AtLogin),
-            (Some(Setting::Dock), PutBack::Waits),
-            (Some(Setting::Dock), PutBack::Back),
-            (Some(Setting::CapsLock), PutBack::AtLogin),
-        ]);
-        assert_eq!(
-            outcome.rows,
-            [
-                (Some(Setting::CapsLock), PutBack::AtLogin),
-                (Some(Setting::NaturalScrolling), PutBack::AtLogin),
-                (Some(Setting::Dock), PutBack::Waits),
-                (None, PutBack::Failed),
-            ]
-        );
-        assert!(!outcome.journal_refused);
-        assert_eq!(until_login("Control"), "Control · until login");
-        assert_eq!(live_until_login(&until_login("Control")), Some("Control"));
-        assert_eq!(live_until_login("Control"), None);
-    }
-
-    /// A pass's outcome names each row once per way its change did not finish, in page order,
-    /// and a later part of the pass adds to it: its rollback joins the earlier one row by row.
-    #[test]
-    fn a_pass_outcome_names_each_row_once_and_takes_in_its_later_parts() {
-        let mut outcome = PassOutcome::default();
-        outcome.unfinished(Setting::Dock, Unfinished::Failed);
-        outcome.unfinished(Setting::CapsLock, Unfinished::Unconfirmed);
-        outcome.unfinished(Setting::Dock, Unfinished::Failed);
-        outcome.unfinished(Setting::CapsLock, Unfinished::Failed);
-        assert_eq!(
-            outcome.unfinished,
-            [
-                (Setting::CapsLock, Unfinished::Unconfirmed),
-                (Setting::CapsLock, Unfinished::Failed),
-                (Setting::Dock, Unfinished::Failed),
-            ]
-        );
-        outcome.rolled_back = Some(RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]));
-        let mut later = RestoreOutcome::of([(Some(Setting::Dock), PutBack::AtLogin)]);
-        later.journal_refused = true;
-        outcome.merge(PassOutcome {
-            rolled_back: Some(later),
-            unfinished: vec![(Setting::Widgets, Unfinished::Failed)],
-        });
-        let rolled_back = outcome.rolled_back.unwrap();
-        assert_eq!(rolled_back.rows, [(Some(Setting::Dock), PutBack::AtLogin)]);
-        assert!(rolled_back.journal_refused);
-        assert_eq!(outcome.unfinished.len(), 4);
-    }
-
-    #[test]
-    fn every_row_defaults_on_and_each_checkbox_is_independent() {
-        assert_eq!(Selection::default(), Selection::all());
-        for row in Setting::ALL {
-            let mut selected = Selection::all();
-            selected.set(row, false);
-            for other in Setting::ALL {
-                assert_eq!(selected.contains(other), other != row);
-            }
-            selected.set(row, true);
-            assert_eq!(selected, Selection::all());
-        }
-    }
-
-    #[test]
-    fn plans_round_trip_and_unknown_groups_are_refused() {
-        for bits in 0..=Selection::all().bits() {
-            let selected = Selection::from_bits(bits).unwrap();
-            assert_eq!(selected.bits(), bits);
-            assert_eq!(selected.is_empty(), bits == 0);
-        }
-        assert_eq!(Selection::from_bits(1 << Setting::ALL.len()), None);
-        assert_eq!(Selection::from_bits(u16::MAX), None);
-    }
-
-    #[test]
-    fn every_setting_sits_in_exactly_the_group_that_lists_it() {
-        for setting in Setting::ALL {
-            let owners: Vec<_> = Group::ALL
-                .into_iter()
-                .filter(|group| group.settings().contains(&setting))
-                .collect();
-            assert_eq!(owners, vec![setting.group()], "{setting:?}");
-        }
-        let subjects = Subject::all();
-        assert_eq!(subjects.len(), Setting::ALL.len() - 1 + Access::ALL.len());
-        for subject in &subjects {
-            assert_eq!(subject.group(), subject.setting().group());
-            assert!(!subject.name().is_empty() && !subject.wanted().is_empty());
-        }
-        assert!(
-            subjects
-                .iter()
-                .all(|subject| *subject != Subject::Setting(Setting::Permissions))
-        );
-    }
-
-    #[test]
-    fn accessibility_is_needed_only_while_a_sign_out_is_managed() {
-        let mut selection = Selection::none();
-        assert!(!Access::Accessibility.needed_for(selection));
-        assert!(Access::FullDiskAccess.needed_for(selection));
-        selection.set(Setting::FaceTime, true);
-        assert!(Access::Accessibility.needed_for(selection));
-    }
-
-    #[test]
-    fn only_settled_rows_count_and_only_people_and_failures_draw_attention() {
-        for standing in [
-            Standing::InPlace,
-            Standing::Differs,
-            Standing::NeedsYou,
-            Standing::Waiting,
-            Standing::AtLogin,
-            Standing::Failed,
-            Standing::Unknown,
-            Standing::NotNeeded,
-        ] {
-            assert_eq!(
-                standing.settled(),
-                matches!(
-                    standing,
-                    Standing::InPlace | Standing::AtLogin | Standing::NotNeeded
-                )
-            );
-            assert_eq!(
-                standing.attention(),
-                matches!(standing, Standing::NeedsYou | Standing::Failed)
-            );
-        }
-        let unread = Observation::unknown(Subject::Access(Access::Debugger));
-        assert_eq!(unread.now, None);
-        assert_eq!(unread.wanted, "On");
-    }
-
-    /// Every failed step's status names its kind, a status that names none is a retry's, and
-    /// no status is ever a person's: a reading says that (design §3.6).
-    #[test]
-    fn a_step_status_names_its_failure_kind_and_never_a_persons() {
-        assert_eq!(
-            FailureKind::of_status("error"),
-            Some(FailureKind::Transient)
-        );
-        assert_eq!(
-            FailureKind::of_status("failed"),
-            Some(FailureKind::Transient)
-        );
-        for calm in ["ok", "applied", "waiting", "blocked", "unverified", "noted"] {
-            assert_eq!(FailureKind::of_status(calm), None, "{calm}");
-        }
-        assert!(FailureKind::Transient.retried());
-        assert!(!FailureKind::NeedsPerson.retried());
-    }
-
-    #[test]
-    fn the_original_workstation_bits_remain_separate_from_new_setup_stages() {
-        let original = Selection::all().workstation();
-        assert_eq!(original.bits(), 0xff);
-        for setting in Setting::ALL {
-            assert_eq!(original.contains(setting), setting.is_workstation());
-        }
-        assert_eq!(Plan::default().selection, Selection::all());
-        assert_eq!(Plan::from(Selection::none()).selection, Selection::none());
-    }
-
-    #[test]
-    fn the_access_record_keeps_each_revision_apart_and_skips_foreign_lines() {
-        let dir = crate::test_scratch_dir("access");
-        let root = dir.path();
-        assert!(access_record::read(root, 7).is_empty());
-        access_record::append(root, 7, Access::FullDiskAccess, AccessOutcome::Handed).unwrap();
-        access_record::append(root, 8, Access::Debugger, AccessOutcome::Declined).unwrap();
-        access_record::append(root, 7, Access::FullDiskAccess, AccessOutcome::Granted).unwrap();
-        std::fs::write(
-            root.join(access_record::FILE),
-            std::fs::read_to_string(root.join(access_record::FILE)).unwrap()
-                + "7 telepathy handed\nnot a line\n7 debugger handed extra\n",
-        )
-        .unwrap();
-        assert_eq!(
-            access_record::read(root, 7),
-            vec![
-                (Access::FullDiskAccess, AccessOutcome::Handed),
-                (Access::FullDiskAccess, AccessOutcome::Granted),
-            ]
-        );
-        assert_eq!(
-            access_record::latest(root, 7, Access::FullDiskAccess),
-            Some(AccessOutcome::Granted)
-        );
-        assert_eq!(access_record::latest(root, 7, Access::Debugger), None);
-        assert_eq!(
-            access_record::latest(root, 8, Access::Debugger),
-            Some(AccessOutcome::Declined)
-        );
-        let lines = || {
-            std::fs::read_to_string(root.join(access_record::FILE))
-                .unwrap()
-                .lines()
-                .count()
-        };
-        for n in 0..100 {
-            let outcome = [AccessOutcome::Handed, AccessOutcome::Granted][n % 2];
-            access_record::append(root, 9, Access::Accessibility, outcome).unwrap();
-            assert!(lines() <= 64, "{n}");
-        }
-        assert_eq!(lines(), 64, "the file is kept to its last lines");
-    }
-
-    /// A step judged again in each new process (a Not now that still holds) repeats its row's
-    /// latest outcome: the record keeps it once, so it never pushes the revision's earlier steps,
-    /// Accessibility's first, out of the kept lines. A changed outcome is written, a repeat of an
-    /// earlier one included, and so is the same outcome in another revision.
-    #[test]
-    fn the_access_record_does_not_repeat_a_rows_latest_outcome() {
-        let dir = crate::test_scratch_dir("access");
-        let root = dir.path();
-        let lines = || {
-            std::fs::read_to_string(root.join(access_record::FILE))
-                .unwrap()
-                .lines()
-                .count()
-        };
-        access_record::append(root, 9, Access::Accessibility, AccessOutcome::Handed).unwrap();
-        for _ in 0..100 {
-            access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined)
-                .unwrap();
-        }
-        assert_eq!(lines(), 2);
-        assert_eq!(
-            access_record::latest(root, 9, Access::Accessibility),
-            Some(AccessOutcome::Handed)
-        );
-        access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Handed).unwrap();
-        access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
-        access_record::append(root, 10, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
-        assert_eq!(lines(), 5);
-        assert_eq!(
-            access_record::read(root, 9),
-            vec![
-                (Access::Accessibility, AccessOutcome::Handed),
-                (Access::FullDiskAccess, AccessOutcome::Declined),
-                (Access::FullDiskAccess, AccessOutcome::Handed),
-                (Access::FullDiskAccess, AccessOutcome::Declined),
-            ]
-        );
-    }
-
-    /// The watcher reads the line back from disk; a failed write tells it nothing.
-    #[test]
-    fn a_written_access_step_tells_its_watcher_after_the_line_is_on_disk() {
-        use std::sync::Mutex;
-        /// A line the watcher was told of, and what the record held for it then.
-        type Seen = (u64, Access, AccessOutcome, Option<AccessOutcome>);
-        static SEEN: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
-        static DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-        fn appended(revision: u64, access: Access, outcome: AccessOutcome) {
-            // Only this test's lines: other tests append to their own directories.
-            if !(4_201..=4_202).contains(&revision) {
-                return;
-            }
-            let dir = DIR.lock().unwrap().clone().unwrap();
-            let probe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(dir.join(".system-state-access.lock"))
-                .unwrap();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the watcher must run after the publication has released its file lock"
-            )]
-            probe.try_lock().unwrap();
-            probe.unlock().unwrap();
-            let on_disk = access_record::latest(&dir, revision, access);
-            SEEN.lock()
-                .unwrap()
-                .push((revision, access, outcome, on_disk));
-            access_record::append(&dir, 4_203, Access::Debugger, AccessOutcome::Granted).unwrap();
-        }
-        access_record::on_append(appended);
-        let dir = crate::test_scratch_dir("access");
-        *DIR.lock().unwrap() = Some(dir.path().to_path_buf());
-        access_record::append(
-            dir.path(),
-            4_201,
-            Access::FullDiskAccess,
-            AccessOutcome::Granted,
-        )
-        .unwrap();
-        let unwritable = dir.path().join(access_record::FILE).join("no");
-        assert!(
-            access_record::append(&unwritable, 4_202, Access::Debugger, AccessOutcome::Granted)
-                .is_err()
-        );
-        assert_eq!(
-            *SEEN.lock().unwrap(),
-            [(
-                4_201,
-                Access::FullDiskAccess,
-                AccessOutcome::Granted,
-                Some(AccessOutcome::Granted)
-            )]
-        );
-        assert_eq!(
-            access_record::latest(dir.path(), 4_203, Access::Debugger),
-            Some(AccessOutcome::Granted),
-            "the watcher can append to the record it just observed"
-        );
-    }
-
-    #[test]
-    fn a_macos_dialog_counts_as_up_only_while_its_guard_lives() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static READY: AtomicUsize = AtomicUsize::new(0);
-        fn ready() {
-            READY.fetch_add(1, Ordering::SeqCst);
-        }
-        on_macos_dialog_waiter_ready(ready);
-        assert!(!macos_dialog_up());
-        let first = MacosDialog::up();
-        let second = MacosDialog::up();
-        drop(first);
-        assert!(macos_dialog_up());
-        assert!(MacosDialog::when_none_up(std::time::Duration::ZERO).is_none());
-        drop(second);
-        assert!(!macos_dialog_up());
-        let waited = MacosDialog::when_none_up(std::time::Duration::ZERO);
-        assert!(waited.is_some() && macos_dialog_up());
-        // Taken from none up in one step: a second caller sees it up.
-        assert!(MacosDialog::when_none_up(std::time::Duration::ZERO).is_none());
-        drop(waited);
-        assert!(!macos_dialog_up());
-        let max_waited = MacosDialog::when_none_up(std::time::Duration::MAX);
-        assert!(max_waited.is_some() && macos_dialog_up());
-        drop(max_waited);
-        assert!(!macos_dialog_up());
-        assert_eq!(READY.load(Ordering::SeqCst), 0);
-
-        let first = MacosDialog::up();
-        let last = MacosDialog::up();
-        assert!(MacosDialog::when_none_up(std::time::Duration::from_nanos(1)).is_none());
-        drop(first);
-        assert_eq!(READY.load(Ordering::SeqCst), 0);
-        drop(last);
-        assert_eq!(READY.load(Ordering::SeqCst), 1);
-        drop(MacosDialog::up());
-        assert_eq!(READY.load(Ordering::SeqCst), 1, "the waiter was consumed");
-
-        // The last dialog can end after the timed-out caller saw contention
-        // but before it arms the wake. Its post-arm check still notifies once.
-        WORKER_WAKE.arm();
-        assert_eq!(READY.load(Ordering::SeqCst), 2);
-        WORKER_WAKE.notify();
-        assert_eq!(READY.load(Ordering::SeqCst), 2);
-
-        // The window's wake is its own: a window gesture that probed the slot without waiting
-        // and found another dialog up (the Mac Setup tab behind the Commons runtime's Local
-        // Network question) is woken by the last one's end, and the worker, which did not wait,
-        // is not. NEGATIVE CONTROL: a drop that wakes only the worker leaves `WINDOW` at 0 here,
-        // which is how E3's first launch lost its one Mac password (2026-11-05).
-        static WINDOW: AtomicUsize = AtomicUsize::new(0);
-        fn window() {
-            WINDOW.fetch_add(1, Ordering::SeqCst);
-        }
-        on_no_macos_dialog_for_window(window);
-        let commons = MacosDialog::up();
-        wake_window_when_no_macos_dialog();
-        assert_eq!(WINDOW.load(Ordering::SeqCst), 0, "not while it is up");
-        drop(commons);
-        assert_eq!(WINDOW.load(Ordering::SeqCst), 1, "its end wakes the window");
-        assert_eq!(READY.load(Ordering::SeqCst), 2, "and not the worker");
-        drop(MacosDialog::up());
-        assert_eq!(WINDOW.load(Ordering::SeqCst), 1, "the wake was spent");
-        wake_window_when_no_macos_dialog();
-        assert_eq!(
-            WINDOW.load(Ordering::SeqCst),
-            2,
-            "armed with none up, at once"
-        );
-        // A worker's timed-out wait wakes the worker alone.
-        let up = MacosDialog::up();
-        assert!(MacosDialog::when_none_up(std::time::Duration::from_nanos(1)).is_none());
-        drop(up);
-        assert_eq!(READY.load(Ordering::SeqCst), 3);
-        assert_eq!(WINDOW.load(Ordering::SeqCst), 2);
-        assert!(!macos_dialog_up());
-    }
-
-    #[test]
-    fn system_state_coming_to_the_front_calls_its_watcher_once_per_arrival() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SHOWN: AtomicUsize = AtomicUsize::new(0);
-        fn shown() {
-            SHOWN.fetch_add(1, Ordering::SeqCst);
-        }
-        on_system_state_front(shown);
-        assert!(!system_state_front());
-        set_system_state_front(true);
-        set_system_state_front(true);
-        assert!(system_state_front());
-        assert_eq!(SHOWN.load(Ordering::SeqCst), 1);
-        set_system_state_front(false);
-        assert!(!system_state_front());
-        set_system_state_front(true);
-        assert_eq!(SHOWN.load(Ordering::SeqCst), 2);
-        set_system_state_front(false);
-    }
-
-    #[test]
-    fn an_opt_out_is_kept_per_grant_until_the_window_clears_it() {
-        use opt_out::OptOut;
-        let off = OptOut::WhileOff("You turned it off.");
-        assert_eq!(opt_out::get(Access::Debugger), None);
-        opt_out::set(Access::Debugger, Some(off));
-        assert_eq!(opt_out::get(Access::Debugger), Some(off));
-        for other in Access::ALL {
-            if other != Access::Debugger {
-                assert_eq!(opt_out::get(other), None, "{other:?}");
-            }
-        }
-        opt_out::set(Access::Debugger, None);
-        assert_eq!(opt_out::get(Access::Debugger), None);
-    }
-
-    #[test]
-    fn a_turned_off_opt_out_holds_only_of_an_off_reading() {
-        use opt_out::OptOut;
-        assert_eq!(OptOut::WhileOff("off").holds(true), Some("off"));
-        assert_eq!(OptOut::WhileOff("off").holds(false), None);
-        for reads_off in [true, false] {
-            assert_eq!(OptOut::Always("switch").holds(reads_off), Some("switch"));
-        }
-    }
-}
+#[path = "macos_setup_tests.rs"]
+mod tests;

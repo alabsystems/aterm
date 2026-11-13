@@ -9,9 +9,13 @@
 //! The event loop reads no file for it: [`latest`] answers the place the last background read
 //! made, and a read older than [`aterm_netplace::keeper::CACHE_FOR`] requests the next from its
 //! sole observation owner; paint takes [`cached`], which requests nothing. [`start`]
-//! starts this process's keeper candidate and registers the window with the owner that reads the
-//! place within `FOLLOW_EVERY` or at its earlier dwell deadline and wakes the event loop on
-//! an away-key transition
+//! starts this process's keeper candidate and registers the window with the owner, which reads
+//! the place again when an input it is made from changes (a file of the place's folder, or the
+//! routes it reads live: [`aterm_netplace::watch`], both armed before the owner's first read), at
+//! the place's own next time-only change or the away entry's dwell, on the keeper's bounded look
+//! for the gateway's ARP entry (which no event announces), and on no clock otherwise
+//! (ATERM-KI-1105-20: it read every ten seconds), and wakes
+//! the event loop on an away-key transition
 //! ([`App::follow_network_place`]: one Info fact in the exceptions digest while this Mac is away
 //! from the ALab LAN, none once it is back; never an alert, never NEEDS YOU). A unit test reads
 //! nothing of the person's: it sees only the place it held ([`hold`]), on its own thread.
@@ -37,8 +41,40 @@ struct Desk {
     requested: bool,
     closed: bool,
     changed: bool,
+    /// An input the place is made from (a file, the routes) changed since the owner's last read
+    /// began.
+    input: bool,
+    /// Whether those inputs are watched; where not, the owner reads again every
+    /// [`aterm_netplace::keeper::UNWATCHED_EVERY`].
+    watched: bool,
+    /// A watch the owner started with was lost since (its route socket failed).
+    lost: bool,
+    /// How many input changes were told, for a test to take a watch's first looks.
+    #[cfg(test)]
+    told: usize,
     following: FollowState,
     notice: Option<Arc<Notice>>,
+}
+
+#[cfg(unix)]
+impl Desk {
+    /// How long until the owner reads again with no request and no input change, `None` for no
+    /// clock at all: at once where it never read; else the earliest of the keeper's own bounded
+    /// look at the place last read (the gateway's ARP entry while a move settles or the network
+    /// keeps a weak id, which no event announces; every input where they are not watched,
+    /// [`aterm_netplace::keeper::next_look`]) and the place's own next time-only change or the
+    /// away key's dwell ([`FollowState::wait`]). `now` and `now_ms` are one moment.
+    fn until_read(&self, now: Instant, now_ms: u64) -> Option<std::time::Duration> {
+        let look = match (self.read_at, self.place.as_deref()) {
+            (Some(at), Some(place)) => aterm_netplace::keeper::next_look(place, self.watched)
+                .map(|look| look.saturating_sub(now.saturating_duration_since(at))),
+            _ => Some(std::time::Duration::ZERO),
+        };
+        match (self.following.wait(now_ms), look) {
+            (Some(due), Some(look)) => Some(due.min(look)),
+            (due, look) => due.or(look),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -79,6 +115,11 @@ impl ObservationDesk {
                 requested: false,
                 closed: false,
                 changed: true,
+                input: false,
+                watched: false,
+                lost: false,
+                #[cfg(test)]
+                told: 0,
                 following: FollowState {
                     stated: None,
                     next_change_ms: None,
@@ -125,6 +166,28 @@ impl ObservationDesk {
         self.wake.notify_one();
     }
 
+    /// An input the place is made from changed (a watch heard a file written or the routes
+    /// change): LATCHED for the owner, so a change during a read is read again as soon as that
+    /// read lands.
+    fn input_changed(&self) {
+        let mut held = self.state.lock_or_recover();
+        held.input = true;
+        #[cfg(test)]
+        {
+            held.told += 1;
+        }
+        self.wake.notify_one();
+    }
+
+    /// A watch the owner relied on failed: from now on it reads on
+    /// [`aterm_netplace::keeper::UNWATCHED_EVERY`] too.
+    fn unwatched(&self) {
+        let mut held = self.state.lock_or_recover();
+        held.lost = true;
+        held.watched = false;
+        self.wake.notify_one();
+    }
+
     fn take_change(&self) -> Option<Option<Arc<Place>>> {
         let mut held = self.state.lock_or_recover();
         if !std::mem::take(&mut held.changed) {
@@ -159,8 +222,12 @@ impl ObservationDesk {
         held.retry_at = Some(Instant::now() + aterm_netplace::keeper::CACHE_FOR);
     }
 
-    /// One owner alone performs reads. Requests arriving during I/O remain latched.
-    fn run(&self, mut read: impl FnMut() -> Arc<Place>) {
+    /// One owner alone performs reads, each answering the place and its own next time-only
+    /// change ([`aterm_netplace::keeper::read_projected`]). Requests and input changes arriving
+    /// during I/O remain latched: each is taken as the read that answers it begins, never after.
+    /// `watched` says whether the place's inputs are watched (the caller armed those watches
+    /// before this).
+    fn run(&self, watched: bool, mut read: impl FnMut() -> (Arc<Place>, Option<u64>)) {
         struct Running<'a>(&'a ObservationDesk);
         impl Drop for Running<'_> {
             fn drop(&mut self) {
@@ -171,6 +238,10 @@ impl ObservationDesk {
             }
         }
         let _running = Running(self);
+        {
+            let mut held = self.state.lock_or_recover();
+            held.watched = watched && !held.lost;
+        }
         loop {
             let observed_at = {
                 let mut held = self.state.lock_or_recover();
@@ -186,35 +257,40 @@ impl ObservationDesk {
                         continue;
                     }
                     let now = Instant::now();
-                    let external = held.read_at.map_or(std::time::Duration::ZERO, |at| {
-                        FOLLOW_EVERY.saturating_sub(now.saturating_duration_since(at))
-                    });
-                    let wait = held
-                        .following
-                        .wait(aterm_netplace::unix_ms_now())
-                        .min(external);
-                    if held.requested || wait.is_zero() {
+                    let wait = held.until_read(now, aterm_netplace::unix_ms_now());
+                    if held.requested || held.input || wait.is_some_and(|wait| wait.is_zero()) {
                         held.requested = false;
+                        held.input = false;
                         break now;
                     }
-                    held = self
-                        .wake
-                        .wait_timeout(held, wait)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .0;
+                    held = match wait {
+                        Some(wait) => {
+                            self.wake
+                                .wait_timeout(held, wait)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .0
+                        }
+                        None => self
+                            .wake
+                            .wait(held)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    };
                 }
             };
-            let place = read();
+            let (place, place_due) = read();
             let mut held = self.state.lock_or_recover();
             if held.closed {
                 return;
             }
             let changed = held
                 .following
-                .observe(&place, aterm_netplace::unix_ms_now());
+                .observe(&place, place_due, aterm_netplace::unix_ms_now());
             held.place = Some(place);
             held.read_at = Some(observed_at);
             held.retry_at = None;
+            // Tests await cache publication itself, which need not change the away key.
+            #[cfg(test)]
+            self.wake.notify_all();
             let notice = if changed {
                 held.changed = true;
                 held.notice.clone()
@@ -279,8 +355,9 @@ pub(crate) fn hold_scoped(place: Option<Place>) -> HeldPlace {
 }
 
 /// Register the window and start this process's keeper candidate. The observation owner may
-/// already serve on-demand reads; registration enables its capped follow schedule and flushes
-/// any accepted pending change. Unit tests compile no startup path: the root is the person's.
+/// already serve on-demand reads; registration enables its follow schedule (file changes and the
+/// dwell deadline) and flushes any accepted pending change. Unit tests compile no startup path:
+/// the root is the person's.
 #[cfg(all(unix, not(test)))]
 pub(crate) fn start(proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>) {
     let Some(state) = aterm_types::dirs::state_dir() else {
@@ -291,10 +368,6 @@ pub(crate) fn start(proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>
     let _ = latest();
 }
 
-/// The maximum wait before resampling external facts; dwell deadlines can wake sooner.
-#[cfg(any(unix, test))]
-pub(crate) const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-
 #[cfg(any(unix, test))]
 #[derive(Default)]
 struct FollowState {
@@ -304,36 +377,118 @@ struct FollowState {
 
 #[cfg(any(unix, test))]
 impl FollowState {
-    fn observe(&mut self, place: &Place, now_ms: u64) -> bool {
+    /// Follow `place`, read with `place_due` its own next time-only change: whether the away
+    /// key changed. The next deadline is the earlier of `place_due` and the key's dwell.
+    fn observe(&mut self, place: &Place, place_due: Option<u64>, now_ms: u64) -> bool {
         let projection = words::away_key_with_deadline(place, now_ms);
         let changed = self.stated != Some(projection.key);
         self.stated = Some(projection.key);
-        self.next_change_ms = projection.next_change_ms;
+        self.next_change_ms = match (projection.next_change_ms, place_due) {
+            (Some(dwell), Some(due)) => Some(dwell.min(due)),
+            (dwell, due) => dwell.or(due),
+        };
         changed
     }
 
-    /// Called with a fresh wall sample after publication and notification effects.
-    fn wait(&self, now_ms: u64) -> std::time::Duration {
-        self.next_change_ms.map_or(FOLLOW_EVERY, |at| {
-            std::time::Duration::from_millis(at.saturating_sub(now_ms)).min(FOLLOW_EVERY)
-        })
+    /// How long until the next deadline (the place's own time-only change or the away key's
+    /// dwell), `None` with none: called with a fresh wall sample after publication and
+    /// notification effects.
+    fn wait(&self, now_ms: u64) -> Option<std::time::Duration> {
+        self.next_change_ms
+            .map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms)))
     }
 }
 
 /// Start the sole observer outside the desk lock. It serves on-demand reads without a window;
-/// a registered window also enables `FOLLOW_EVERY` and earlier dwell boundaries. Each actual
-/// away-key transition wakes that window; internet-only changes generate no notification.
+/// a registered window also enables reads on each change of the place's inputs and at its
+/// deadlines ([`observe`]). Each actual away-key transition wakes that window; internet-only
+/// changes generate no notification.
 #[cfg(all(unix, not(test)))]
 fn follow(state: std::path::PathBuf) {
     let started = crate::qos::spawn_lane_thread(
         "aterm-netplace-follow",
         crate::qos::Role::Background,
-        move || DESK.run(|| Arc::new(aterm_netplace::read(&state))),
+        move || {
+            let files = watch_files(&DESK, &state);
+            let _wall = watch_wall(
+                &DESK,
+                aterm_uds::wall_watch::WallWatch::start().map(std::sync::Arc::new),
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let routes = watch_routes(&DESK, aterm_uds::network::RouteChanges::open());
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let routes = None::<()>;
+            observe(&DESK, &state, files, routes, || {
+                aterm_netplace::keeper::read_projected(&state)
+            });
+        },
     );
     if let Err(e) = started {
         DESK.failed_start();
         aterm_log::warn!("network place: the window's follow lane did not start: {e}");
     }
+}
+
+/// The place's folder under `state` watched for `desk` ([`aterm_netplace::watch::place_files`]):
+/// each settled burst of writes is an input change.
+#[cfg(unix)]
+fn watch_files(
+    desk: &'static ObservationDesk,
+    state: &std::path::Path,
+) -> Option<aterm_netplace::watch::Watch> {
+    aterm_netplace::watch::place_files(
+        &aterm_netplace::record::dir(state),
+        aterm_netplace::watch::Reads::Reader,
+        |_| desk.input_changed(),
+    )
+}
+
+/// The wall clock's moves heard for `desk` through `source` ([`aterm_netplace::watch::wall`]):
+/// a sleep's wake or a wall-clock step moves the place's wall-clock deadlines under the monotonic
+/// wait, so each is an input change (ATERM-KI-1105-20).
+#[cfg(unix)]
+fn watch_wall(
+    desk: &'static ObservationDesk,
+    source: Option<Arc<aterm_uds::wall_watch::WallWatch>>,
+) -> Option<aterm_netplace::watch::WallMoves> {
+    aterm_netplace::watch::wall(source, || desk.input_changed())
+}
+
+/// The routes watched for `desk` through `changes` ([`aterm_netplace::watch::routes`]): each
+/// change of network is an input change, and the socket failing puts `desk` on
+/// [`aterm_netplace::keeper::UNWATCHED_EVERY`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn watch_routes(
+    desk: &'static ObservationDesk,
+    changes: std::io::Result<aterm_uds::network::RouteChanges>,
+) -> Option<aterm_netplace::watch::Routes> {
+    aterm_netplace::watch::routes(changes, || desk.input_changed(), || desk.unwatched())
+}
+
+/// THE OBSERVATION OWNER over the state root `state`, on its thread until `desk` closes. The
+/// caller arms both of the place's watched inputs before this, so before its first read: the
+/// folder's files ([`watch_files`], pointed at the folder as each read resolves it, before
+/// reading) and the routes it reads live (`watch_routes`), which change with no file written
+/// whenever the keeper's record stays the same, and which no keeper writes while none keeps.
+/// Either missing, or the route socket failing later, puts the owner on
+/// [`aterm_netplace::keeper::UNWATCHED_EVERY`].
+/// `read` is the read itself (the window's: [`aterm_netplace::keeper::read_projected`]).
+#[cfg(unix)]
+fn observe<R>(
+    desk: &ObservationDesk,
+    state: &std::path::Path,
+    files: Option<aterm_netplace::watch::Watch>,
+    routes: Option<R>,
+    mut read: impl FnMut() -> (Place, Option<u64>),
+) {
+    desk.run(files.is_some() && routes.is_some(), || {
+        if let Some(files) = &files {
+            files.point(&aterm_netplace::record::dir(state));
+        }
+        let (place, due) = read();
+        (Arc::new(place), due)
+    });
+    drop((files, routes));
 }
 
 /// Stop notification and further reads when the owning application exits. An in-flight
@@ -426,9 +581,9 @@ pub(crate) fn latest() -> Option<Arc<Place>> {
 
 /// The place as last read, starting no read: what paint takes, which runs on the render thread
 /// and so never requests a read ([`latest`] does once its read is stale). The follow
-/// lane's read every `FOLLOW_EVERY`, and every other caller's [`latest`], keep it current; `None`
-/// until the first read lands, or off Unix. A unit test sees the place it held, and its call is
-/// no read asked ([`reads_asked`]).
+/// lane's read on each change of the place's inputs, and every other caller's [`latest`], keep
+/// it current; `None` until the first read lands, or off Unix. A unit test sees the place it
+/// held, and its call is no read asked ([`reads_asked`]).
 pub(crate) fn cached() -> Option<Arc<Place>> {
     #[cfg(test)]
     {

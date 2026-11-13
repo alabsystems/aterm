@@ -583,7 +583,7 @@ fn admit(
     lane: HandoffLaneFacts,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
 ) -> Result<crate::native_update_admission::ApplyLane, crate::UpdateHandoffStartError> {
-    let token = crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0, 0);
+    let token = crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0);
     app.admit_update_handoff(
         &[],
         AdmissionInputs {
@@ -930,6 +930,7 @@ fn a_lone_workers_list_goes_on_the_wire_only_to_a_target_that_declares_it() {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     }];
     tabbed.active_item = Some(0);
     let mixed = RestoreManifest::new(vec![tabbed.clone(), alone.windows[0].clone()]);
@@ -1036,6 +1037,8 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let artifact = "ab".repeat(32);
+    let artifact_digest =
+        crate::app_native::decode_dmg_sha256(&artifact).expect("fixture artifact digest");
     let mut app = crate::App::headless_for_test();
     let target = crate::running_build_number().saturating_add(1);
     let ticket = ApplyAttemptTicket::for_test(target, commit, &artifact);
@@ -1227,16 +1230,167 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
     };
     let running_deadline = running.deadline;
     app.handoff_preverify_in_flight = Some(running);
-    app.preverify_read_waited = Some((target, Instant::now()));
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: crate::app_native::decode_dmg_sha256(&artifact)
+            .expect("fixture artifact digest"),
+        until: Instant::now(),
+    });
     let held = app
         .sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
         .expect("the press waits for the later read");
     read_alone(&mut app);
     assert!(held.held_for_read_of().is_some(), "{held:?}");
     assert_eq!(deadline(&app), Some(running_deadline), "no second read");
+    // The read the attempt itself waited for outrunning its window answers the attempt and starts
+    // no other, so a read that never ends holds no press and spins no lane: re-reading here chained
+    // a hold every 20 s with no bound. A person on a replaced image goes on to the cold lane. As
+    // for any read that ends with no verdict, the automatic lane defers as a pre-park read's
+    // activity, charging no failure, and a person's press fails.
+    for (mode, kept, answer) in [
+        (
+            ApplyMode::Immediate,
+            true,
+            Some("press again to check again"),
+        ),
+        (ApplyMode::Immediate, false, None),
+        (ApplyMode::Automatic, true, Some("tried again later")),
+        (ApplyMode::Automatic, false, Some("tried again later")),
+    ] {
+        app.launch_image_kept = kept;
+        app.sessionless_waited = crate::app_update_handoff::SessionlessWaited::default();
+        let stuck = crate::PreverifyInFlight {
+            done: Arc::new(AtomicBool::new(false)),
+            passing: Arc::new(std::sync::OnceLock::new()),
+            deadline: Instant::now() - std::time::Duration::from_secs(1),
+            ..ended_passing(&lock)
+        };
+        let own = stuck.deadline;
+        app.handoff_preverify_in_flight = Some(stuck);
+        *app.sessionless_waited.of(mode) = Some(own);
+        app.preverify_read_waited = Some(crate::PreverifyReadWait {
+            build: target,
+            dmg_sha256: artifact_digest,
+            until: Instant::now(),
+        });
+        let got = app.sessionless_preverify_wait(mode, &ticket);
+        read_alone(&mut app);
+        assert_eq!(
+            deadline(&app),
+            Some(own),
+            "no second read: {mode:?} kept={kept}"
+        );
+        assert_eq!(waited(&mut app, mode), None, "{mode:?} kept={kept}");
+        assert_eq!(app.preverify_read_waited, None, "{mode:?} kept={kept}");
+        match (got, answer) {
+            (None, None) => {}
+            (Some(ended), Some(words)) => {
+                assert!(
+                    ended.held_for_read_of().is_none() && !ended.is_refused(),
+                    "{mode:?} kept={kept}: {ended:?}"
+                );
+                assert_eq!(
+                    ended.is_activity_deferred(),
+                    mode.is_automatic(),
+                    "the lane defers and a press fails: {mode:?} kept={kept}: {ended:?}"
+                );
+                assert!(ended.to_string().contains(words), "{ended}");
+            }
+            (got, answer) => panic!("{mode:?} kept={kept}: {got:?}, wanted {answer:?}"),
+        }
+    }
+    app.launch_image_kept = true;
+    // A read past its ceiling ends the wait with its window still open: the press got "was not read"
+    // there, from a read that had simply run out. The window goes too, or the next press finds it
+    // open with no read running and gets the same.
+    app.sessionless_waited = crate::app_update_handoff::SessionlessWaited::default();
+    let stuck = crate::PreverifyInFlight {
+        done: Arc::new(AtomicBool::new(false)),
+        passing: Arc::new(std::sync::OnceLock::new()),
+        deadline: Instant::now() - std::time::Duration::from_secs(1),
+        ..ended_passing(&lock)
+    };
+    let own = stuck.deadline;
+    app.handoff_preverify_in_flight = Some(stuck);
+    *app.sessionless_waited.of(ApplyMode::Immediate) = Some(own);
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: artifact_digest,
+        until: Instant::now() + std::time::Duration::from_secs(60),
+    });
+    let failed = app
+        .sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
+        .expect("a kept image's press is answered");
+    read_alone(&mut app);
+    assert!(failed.to_string().contains("did not end"), "{failed}");
+    assert_eq!(app.preverify_read_waited, None);
+    assert_eq!(waited(&mut app, ApplyMode::Immediate), None);
+    app.sessionless_waited = crate::app_update_handoff::SessionlessWaited::default();
+    // A read still inside its own ceiling keeps the attempt when a window it did not start runs out:
+    // a younger read failed there having had 8 s of its 18 s.
+    let young = crate::PreverifyInFlight {
+        done: Arc::new(AtomicBool::new(false)),
+        passing: Arc::new(std::sync::OnceLock::new()),
+        deadline: Instant::now() + std::time::Duration::from_secs(60),
+        ..ended_passing(&lock)
+    };
+    let own = young.deadline;
+    app.handoff_preverify_in_flight = Some(young);
+    *app.sessionless_waited.of(ApplyMode::Immediate) = Some(own);
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: artifact_digest,
+        until: Instant::now(),
+    });
+    let held = app
+        .sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
+        .expect("the press waits for its read");
+    read_alone(&mut app);
+    assert!(held.held_for_read_of().is_some(), "{held:?}");
+    assert_eq!(deadline(&app), Some(own), "no second read");
+    assert_eq!(
+        app.preverify_read_waited,
+        Some(crate::PreverifyReadWait {
+            build: target,
+            dmg_sha256: artifact_digest,
+            until: own,
+        }),
+        "the wait now runs to the read's own ceiling"
+    );
+    // A read that ended with its verdict aged says nothing of this attempt: it read as "did not
+    // end", which booked a failure against a build whose read had passed. It reads again.
+    app.sessionless_waited = crate::app_update_handoff::SessionlessWaited::default();
+    let ended = crate::PreverifyInFlight {
+        done: Arc::new(AtomicBool::new(true)),
+        passing: Arc::new(std::sync::OnceLock::new()),
+        deadline: Instant::now() - std::time::Duration::from_secs(1),
+        ..ended_passing(&lock)
+    };
+    let own = ended.deadline;
+    app.handoff_preverify_in_flight = Some(ended);
+    *app.sessionless_waited.of(ApplyMode::Automatic) = Some(own);
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: artifact_digest,
+        until: Instant::now(),
+    });
+    let got = app.sessionless_preverify_wait(ApplyMode::Automatic, &ticket);
+    read_alone(&mut app);
+    assert!(
+        got.as_ref()
+            .is_none_or(|wait| wait.is_activity_deferred() || wait.held_for_read_of().is_some()),
+        "no failure: {got:?}"
+    );
+    assert_ne!(deadline(&app), Some(own), "a read started");
+    app.sessionless_waited = crate::app_update_handoff::SessionlessWaited::default();
     // With none running, a spent window starts a read rather than answering "not read".
     app.handoff_preverify_in_flight = None;
-    app.preverify_read_waited = Some((target, Instant::now()));
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: crate::app_native::decode_dmg_sha256(&artifact)
+            .expect("fixture artifact digest"),
+        until: Instant::now(),
+    });
     read_alone(&mut app);
     let _ = app.sessionless_preverify_wait(ApplyMode::Immediate, &ticket);
     read_alone(&mut app);
@@ -1307,5 +1461,43 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
         app.sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
             .is_some_and(|failed| !failed.is_activity_deferred() && !failed.is_refused()),
         "a press over --hold panes is answered, and the next press checks again"
+    );
+}
+
+/// A DESK OF ONLY A PRIVATE DOCUMENT TAKES THE SESSIONLESS LANE, to a target with no `desk1`:
+/// a Recovery tab is an ordinary tab to it (`stand_in_for_private_documents`). The same window with
+/// nothing described stayed `NO_RESTORABLE_TAB` and held a kept image until the tab closed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desk_of_only_a_private_document_takes_the_sessionless_lane() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("att-edit-t.private.noindex");
+    std::fs::create_dir(&folder).expect("the private folder");
+    let path = folder.join("address.txt");
+    std::fs::write(&path, "name secret\n").expect("the file");
+    let uri = crate::native_document_host::path_to_file_uri(&path).expect("its uri");
+    let wid = crate::WindowId(0);
+    let mut app = crate::App::headless_for_test();
+    let shell = app.focused_session_id(wid).expect("the bootstrap shell");
+    app.use_document_journal_root_for_test(dir.path().join("drafts"));
+    app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
+        .expect("the document opens");
+    assert!(app.close_session_tab_for_test(shell));
+    app.sync_window(wid);
+    assert_eq!(
+        app.windows[&wid].tab_set.len(),
+        1,
+        "PRECONDITION: it stands alone"
+    );
+
+    let lane = HandoffLaneFacts {
+        sessions: 0,
+        grant_empty: true,
+        grant_desk: false,
+        ..eligible()
+    };
+    assert_eq!(
+        app.sessionless_lane(None, Some(SameImageHandoff::DebugSeam), lane),
+        SessionlessLane::Takes
     );
 }

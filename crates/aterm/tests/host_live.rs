@@ -1969,6 +1969,13 @@ fn write_restarting_fake(inst: &Instance, draft: &str) {
 /// The fake started in the tab, under a shell a relaunch can type at: its pid, for the `restart`
 /// the caller asks of it.
 fn start_the_fake(inst: &Instance) -> u32 {
+    let pid = launch_the_fake(inst);
+    program_is(inst, "claude", HANG);
+    pid
+}
+
+/// Launch receipt independent of the host's supervision and program attribution.
+fn launch_the_fake(inst: &Instance) -> u32 {
     let sel = format!("@{}", inst.sid);
     let shell = format!(
         "ANTHROPIC_API_KEY=aterm-host-live-standin '{}' --norc --noprofile -i",
@@ -1980,7 +1987,6 @@ fn start_the_fake(inst: &Instance) -> u32 {
     let line = relaunch_fake_line(&inst.tmp);
     ctl_ok(inst, &[&sel, "send", &line]);
     ctl_ok(inst, &[&sel, "key", "enter"]);
-    program_is(inst, "claude", HANG);
     first_launch(inst)[0].0
 }
 
@@ -2284,7 +2290,9 @@ fn under_off_a_restart_is_refused_and_nothing_is_typed() {
     let inst = boot("ro", "autopilot = \"off\"\n");
     write_restarting_fake(&inst, "");
     let sel = format!("@{}", inst.sid);
-    let old = start_the_fake(&inst);
+    let old = launch_the_fake(&inst);
+    let pid = i32::try_from(old).expect("fixture pid");
+    let birth = aterm_uds::process::read_birth(pid).expect("launched child is alive");
     let out = headless_boot::ctl(&inst, &[&sel, "restart"]);
     let said = format!(
         "{}{}",
@@ -2296,6 +2304,11 @@ fn under_off_a_restart_is_refused_and_nothing_is_typed() {
         "{said}"
     );
     assert_eq!(launches(&inst).len(), 1, "not relaunched: {said}");
+    assert_eq!(
+        aterm_uds::process::read_birth(pid),
+        Some(birth),
+        "the same child remains alive after refusal: {said}"
+    );
     assert!(
         !inst.tmp.join(format!("typed-{old}.log")).exists(),
         "nothing typed under Off"
@@ -2511,11 +2524,13 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
             ":".to_string()
         },
     );
-    // The build is the program and the twin atpkg's own shim for it, as a store lays them: a
-    // version probe runs a shebang file at `agents/claude` only as a producer shim it can pin
-    // (fd3b937ea1), and the build its forward reaches is an image to it, a script under
-    // [`claude_image`], never another `/bin/sh` script it would have to read as a shim.
-    let build = inst.tmp.join(format!("builds/{version}/claude"));
+    // The build is the program and the twin atpkg's own shim for it, as a store lays them: the
+    // live upgrade reads the build's version from where the twin's last line says it lies
+    // ([`staged_build`]) and executes nothing to learn it, and the start probe runs the twin
+    // only as a producer shim it can pin (fd3b937ea1), the build its forward reaches an image to
+    // it, a script under [`claude_image`], never another `/bin/sh` script it would have to read
+    // as a shim.
+    let build = staged_build(&inst.tmp, version);
     place_fake(&build, &fake);
     let twin = atpkg::platform::twin_executable_to_env(
         &fake_path(&inst.tmp),
@@ -2530,6 +2545,16 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
         std::str::from_utf8(&twin.body).expect("a UTF-8 shim"),
     );
     staged
+}
+
+/// Where the fake build of `version` lies: in the instance's store, under the build directory
+/// atpkg numbers that version with (`store/claude/<build>/bin/claude`).
+#[cfg(target_os = "macos")]
+fn staged_build(tmp: &Path, version: &str) -> PathBuf {
+    let build = atpkg::vendor_direct::Version::parse(version)
+        .expect("a version atpkg numbers a build with")
+        .build_id();
+    atpkg::store::default_prefix(&tmp.join("home")).join(format!("store/claude/{build}/bin/claude"))
 }
 
 #[cfg(target_os = "macos")]
@@ -2970,10 +2995,11 @@ fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool) 
     program_is(&inst, "bash", HANG);
     if !line.is_empty() {
         let twin = format!("'{}'", fake_path(&inst.tmp).display());
+        let build = format!("'{}'", staged_build(&inst.tmp, "2.1.281").display());
         let line = format!(
             "cd {}/work && {}",
             inst.tmp.display(),
-            line.replace("{twin}", &twin)
+            line.replace("{twin}", &twin).replace("{build}", &build)
         );
         ctl_ok(&inst, &[&sel, "send", &line]);
         ctl_ok(&inst, &[&sel, "key", "enter"]);
@@ -3039,7 +3065,7 @@ fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
     aterm_uds::deadline::kill_within(&mut proof, aterm_uds::deadline::ECHO_HANG);
     image.ran();
     let line = format!(
-        "cp ../builds/2.1.281/claude ../cli.js && '{}' \"$PWD/../cli.js\"",
+        "cp {{build}} ../cli.js && '{}' \"$PWD/../cli.js\"",
         node.display()
     );
     assert_eq!(
@@ -3104,7 +3130,7 @@ fn a_worker_spawned_from_inside_a_plain_tab_takes_the_launch_default() {
     );
 }
 
-/// A worker whose parent names no mode starts at a Claude Code worker's floor (owner, 2026-11-04),
+/// A worker whose parent names no mode starts at a Claude Code worker's floor,
 /// on Anthropic's own route, and the twin leaves a named mode as typed.
 #[cfg(target_os = "macos")]
 #[test]
@@ -3116,8 +3142,8 @@ fn a_worker_whose_parent_names_no_mode_starts_at_the_floor() {
 }
 
 /// A parent whose requests leave Anthropic's API keeps its worker off that floor, so the worker's
-/// line holds nothing the twin reads as typed. It runs with its parent's permissions all the same
-/// (owner ruling 2026-11-02): the build the twin execs, not the twin, which would turn it yolo.
+/// line holds nothing the twin reads as typed. It runs with its parent's permissions all the
+/// same: the build the twin execs, not the twin, which would turn it yolo.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_gateway_worker_with_no_flags_stays_out_of_the_twins_yolo() {

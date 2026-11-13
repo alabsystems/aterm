@@ -1112,7 +1112,9 @@ fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
 
 /// On a vault member whose subscriber rewrites `state.toml` to say when it last heard the vault,
 /// a row whose mailbox route ran and failed stays in its backoff: the rewrite delivered nothing.
-/// A file the vault delivers to `~/.secrets` ends the backoff at once.
+/// The vault's own bookkeeping, a rewrite of when it heard the vault or a new version that wrote
+/// nothing here, neither ends a row's backoff nor resets its step, so the next failure doubles
+/// it; a file the vault delivers to `~/.secrets` ends the backoff at once.
 ///
 /// Unix only, where aterm links the opener an unattended run's page is handed to
 /// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
@@ -1132,11 +1134,13 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
     let vault = desk.home.join(".config/aterm/secrets");
     fs::create_dir_all(&vault).unwrap();
     fs::write(vault.join("source.toml"), "# a vault member\n").unwrap();
-    let heard = |at: i64| {
+    let heard = |seq: u64, at: i64| {
         let state = vault.join("state.toml");
         fs::write(
             &state,
-            format!("membership = \"member\"\nseq = 51\nheard = {at}\n"),
+            format!(
+                "membership = \"member\"\nseq = {seq}\ndigest = \"{seq:064x}\"\nheard = {at}\n"
+            ),
         )
         .unwrap();
         let later =
@@ -1148,7 +1152,7 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
             .set_modified(later)
             .unwrap();
     };
-    heard(NOW);
+    heard(51, NOW);
     let bench = Bench::ending(Renewal::AuthFailed);
     assert!(bench.pass(&desk, NOW), "the mailbox route started");
     assert_eq!(bench.handed().len(), 1);
@@ -1157,13 +1161,36 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
         Some(accounts::AttemptOutcome::Failed)
     );
 
-    heard(NOW + 60);
+    heard(51, NOW + 60);
     bench.cool();
     assert!(
         !bench.pass(&desk, NOW + 60),
         "a rewrite of when it heard is no delivery"
     );
+    heard(52, NOW + 90);
+    bench.cool();
+    assert!(
+        !bench.pass(&desk, NOW + 90),
+        "nor is a version published elsewhere that wrote nothing here"
+    );
     assert_eq!(bench.handed().len(), 1);
+
+    bench.guard.lock().unwrap().ladder.moved(Instant::now());
+    bench.cool();
+    assert!(
+        bench.pass(&desk, NOW + 100),
+        "its wait over, the route runs"
+    );
+    let waits: Vec<String> = bench
+        .logged()
+        .iter()
+        .filter(|line| line.contains("tried again in"))
+        .cloned()
+        .collect();
+    assert!(
+        waits.len() == 2 && waits[1].contains("tried again in 30m"),
+        "the step the bookkeeping left doubles the wait: {waits:?}"
+    );
 
     let secrets = desk.home.join(".secrets");
     fs::create_dir_all(&secrets).unwrap();
@@ -1176,7 +1203,7 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
         bench.pass(&desk, NOW + 120),
         "a delivered file ends the backoff and the sign-in cooldown"
     );
-    assert_eq!(bench.handed().len(), 2);
+    assert_eq!(bench.handed().len(), 3);
 }
 
 /// A fleet discovery made lists every address this Mac's files show, a mailbox password's

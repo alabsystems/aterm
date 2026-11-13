@@ -7,24 +7,13 @@ use super::*;
 use aterm_models_effects::{rainbow_occupied_coverage_model, rainbow_retract_rearm_model};
 
 #[test]
-fn rainbow_kitty_parse_and_beam() {
-    assert_eq!(GlowStyle::parse("rainbow kitty"), GlowStyle::RainbowKitty);
-    assert_eq!(GlowStyle::parse("nyan rainbow"), GlowStyle::RainbowKitty);
-    assert_eq!(GlowStyle::parse("nyan"), GlowStyle::RainbowKitty);
+fn rainbow_parses_and_draws_its_own_body() {
     assert_eq!(GlowStyle::parse("rainbow"), GlowStyle::RainbowKitty);
     assert_eq!(GlowStyle::parse("RAINBOW"), GlowStyle::RainbowKitty);
-    for alias in [
-        "rainbow kitty underline",
-        "rainbow underline",
-        "underline rainbow",
-        "nyan underline",
-    ] {
-        assert_eq!(GlowStyle::parse(alias), GlowStyle::RainbowKitty, "{alias}");
-    }
     assert_eq!(GlowStyle::parse("phaser"), GlowStyle::Phaser);
     assert!(
-        !style_has_beam("nyan"),
-        "nyan draws its own continuous body, no beam"
+        !style_has_beam("rainbow"),
+        "the rainbow draws its own continuous body, no beam"
     );
     assert!(style_has_beam("phaser"), "phaser keeps the shared beam");
 }
@@ -51,8 +40,7 @@ fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     );
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 
-    let v2_cfg =
-        crate::rainbow_kitty::Config::from_glow(&cfg_for_style_name("rainbow kitty", true), false);
+    let v2_cfg = crate::rainbow_kitty::Config::from_glow(&tall_rainbow_cfg(), false);
     let mut state = model.init_state();
     assert_eq!(
         crate::rainbow_kitty::ribbon::clamp_bed_cov(&v2_cfg, false, 0.0).round() as i64,
@@ -98,7 +86,7 @@ fn rainbow_retract_rearm_model_proves_and_catches_brightness_snap() {
         .expect("Peak const")
         .1 as usize;
     let g = retina_geom();
-    let v2_cfg = V2Config::from_glow(&cfg_for_style_name("rainbow kitty", true), false);
+    let v2_cfg = V2Config::from_glow(&tall_rainbow_cfg(), false);
     let ctx_at = |now: Instant, caret: (u16, u16)| V2Ctx {
         now,
         geom: g,
@@ -311,8 +299,10 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
     let mut worst_margin = f32::INFINITY;
     let mut worst_at = String::new();
     let mut brightest_field = 0.0f32;
-    for raw in ["rainbow kitty", "rainbow kitty underline"] {
-        let c = cfg_for_style_name(raw, true);
+    for (raw, c) in [
+        ("tall", tall_rainbow_cfg()),
+        ("underline", underline_rainbow_cfg()),
+    ] {
         for gap_ms in [18u64, 28, 45, 90] {
             let (glow, over_engine, at) =
                 typed_burst(&c, g, row, 5..col + 1, Duration::from_millis(gap_ms));
@@ -465,94 +455,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
          {worst_margin:.1} levels of luminance, under the {promised:.0} its \
          own floor promises — at {worst_at}"
     );
-}
-
-#[test]
-fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
-    for s in [
-        "rainbow kitty",
-        "kitty",
-        "rainbow kitty pet",
-        "kitty pet",
-        "pet kitty",
-        "  Rainbow Kitty  ",
-        "rainbow kitty underline",
-        "rainbow underline",
-        "underline rainbow",
-        "nyan underline",
-        "  Rainbow Kitty Underline  ",
-        "rainbow kitty tall",
-        "rainbow tall",
-        "tall rainbow",
-        "nyan tall",
-    ] {
-        assert_eq!(GlowStyle::parse(s), GlowStyle::RainbowKitty, "{s}");
-        assert!(
-            GlowStyle::style_names_kitty_pet(s),
-            "{s:?} names a kitty and must draw the full-body resident"
-        );
-        assert!(GlowStyle::style_names_any_pet(s), "{s}");
-        assert!(!GlowStyle::style_names_flying_kitty(s), "{s}");
-    }
-    for s in [
-        "rainbow kitty flying",
-        "flying kitty",
-        "kitty flying",
-        "  Flying Kitty  ",
-        "nyan rainbow",
-        "nyan",
-        "rainbow",
-    ] {
-        assert_eq!(GlowStyle::parse(s), GlowStyle::RainbowKitty, "{s}");
-        assert!(
-            !GlowStyle::style_names_any_pet(s),
-            "{s:?} must keep the flying head"
-        );
-    }
-    for s in [
-        "rainbow kitty",
-        "kitty",
-        "rainbow kitty pet",
-        "kitty pet",
-        "pet kitty",
-        "rainbow kitty flying",
-        "flying kitty",
-        "kitty flying",
-        "rainbow dog pet",
-        "dog pet",
-        "pet dog",
-        "rainbow puppy pet",
-        "rainbow kitty underline",
-        "rainbow underline",
-        "underline rainbow",
-        "nyan underline",
-    ] {
-        assert!(
-            !(GlowStyle::style_names_any_pet(s) && GlowStyle::style_names_flying_kitty(s)),
-            "{s:?} claims both animals"
-        );
-    }
-    assert_eq!(
-        GlowStyle::style_names_any_pet("rainbow kitty"),
-        GlowStyle::style_names_any_pet("rainbow kitty underline"),
-        "appending the geometry word must not swap the companion"
-    );
-    assert!(
-        GlowStyle::style_names_underline_ribbon("rainbow kitty underline")
-            && !GlowStyle::style_names_underline_ribbon("rainbow kitty"),
-        "…and the two really are the geometry fork, or the line above is vacuous"
-    );
-    for dog in ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"] {
-        assert!(GlowStyle::style_names_dog_pet(dog), "{dog}");
-        assert!(!GlowStyle::style_names_kitty_pet(dog), "{dog}");
-    }
-    for cat in ["rainbow kitty", "kitty", "rainbow kitty pet"] {
-        assert!(!GlowStyle::style_names_dog_pet(cat), "{cat}");
-    }
-    for s in ["comet", "phaser", "lumen", "off"] {
-        assert!(!GlowStyle::style_names_kitty_pet(s), "{s}");
-        assert!(!GlowStyle::style_names_flying_kitty(s), "{s}");
-    }
 }
 
 #[test]
@@ -799,7 +701,7 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
 #[test]
 fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
     let g = geom();
-    let c = cfg_for_style_name("rainbow kitty", true);
+    let c = tall_rainbow_cfg();
     let t0 = Instant::now();
 
     let mut sequential = CursorGlow::default();
@@ -1154,7 +1056,7 @@ fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
     // A face over cols 6..12 of row 2, its chin two pixels into row 3.
     let icon = (48, 96, 20, 50);
     let on_icon = |dark: bool, shade: bool| -> usize {
-        let mut c = cfg_for_style_name("rainbow kitty pet", true);
+        let mut c = tall_rainbow_cfg();
         c.intensity = 1.0;
         if !dark {
             c.dark_theme = false;

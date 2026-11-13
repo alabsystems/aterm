@@ -748,37 +748,29 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
             .all(|r| drawn_marks(&app, wid, r).is_empty()),
         "control: no switch draws no mark"
     );
-    // The permission light's own mark (`● yolo`) is the one disc on the rule, drawn over its
-    // own cell as the switch's is; no switch face stands beside it.
+    // The permission light is its word alone (`yolo`), with no mark: no switch face, and no
+    // disc of the light's, stands on the rule.
     let faces = [BandIcon::Disc, BandIcon::Ring, BandIcon::DottedRing];
     let on_rule = drawn_marks(&app, wid, rule);
-    let light = app.windows[&wid].input_scratch.cells[rule]
-        .iter()
-        .position(|c| c.ch == BandIcon::Disc.ch())
-        .and_then(|col| u16::try_from(col).ok())
-        .expect("the light's mark is on the rule");
     assert_eq!(
         on_rule
             .iter()
             .copied()
             .filter(|i| faces.contains(&i.icon))
             .collect::<Vec<_>>(),
-        [ChromeIcon {
-            col: light,
-            icon: BandIcon::Disc,
-        }],
+        [],
         "control: the rule's chips and facts, no switch face: {on_rule:?} on {:?}",
         row_text(&app, wid, rule)
     );
     assert!(
-        row_text(&app, wid, rule).contains("\u{25cf} yolo"),
-        "the disc is the light's: {:?}",
+        row_text(&app, wid, rule).contains("yolo"),
+        "the light is on the rule: {:?}",
         row_text(&app, wid, rule)
     );
 }
 
-/// Line D's marks, the chips' (Autopilot's, and the permission light's `●`) and the facts' (`◆`,
-/// `⌂`, `⎇`), are drawn as the switch's is: each
+/// Line D's marks, the chips' (Autopilot's; the permission light is a word with none) and the
+/// facts' (`◆`, `⌂`, `⎇`), are drawn as the switch's is: each
 /// the glass's icon over its own cell, whole strokes in the marks' ink where the font's thin
 /// glyph read faint on Day at 1x (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1, §4.3,
 /// §7's "Day inks vivid"); Cruise's `∞` is no mark and keeps its glyph.
@@ -802,12 +794,7 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
     let marks = |app: &App, chip: Option<BandIcon>| {
         let mut want: Vec<ChromeIcon> = chip
             .into_iter()
-            .chain([
-                BandIcon::Disc,
-                BandIcon::Diamond,
-                BandIcon::House,
-                BandIcon::Fork,
-            ])
+            .chain([BandIcon::Diamond, BandIcon::House, BandIcon::Fork])
             .map(|icon| ChromeIcon {
                 col: at(app, icon.ch()),
                 icon,
@@ -824,7 +811,7 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
     assert_eq!(
         drawn(&app),
         marks(&app, None),
-        "Cruise: the light's mark and the facts', and no icon for ∞"
+        "Cruise: the facts' marks, none for the light and no icon for ∞"
     );
     for (mode, icon) in [
         (Autopilot::Off, BandIcon::Ring),
@@ -975,8 +962,11 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
         mark,
         "the mark before the menu"
     );
-    let chip = hit(&app, wid, Chip::Autopilot);
-    app.open_autopilot_menu(wid, session, chip, false);
+    // Hung over the pane's left: at the folder's own column the card would cover the mark.
+    let (fact_row, _) = app
+        .fact_anchor(wid, session, super::Fact::Path)
+        .expect("the folder is on the glass");
+    app.open_fact_menu(wid, session, super::Fact::Path, (fact_row, 2), false);
     frame(&mut app, wid);
     app.splice_autopilot_menu(wid);
     let rect = app
@@ -994,20 +984,30 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
         BandIcon::Disc.ch(),
         "the cell keeps its mark"
     );
+    let beside: Vec<ChromeIcon> = drawn_marks(&app, wid, row)
+        .into_iter()
+        .filter(|i| !rect.contains(row, usize::from(i.col)))
+        .collect();
     assert_eq!(
-        drawn_marks(&app, wid, row),
-        mark,
+        beside, mark,
         "the mark beside the card is still drawn, once"
     );
-    let over_card: Vec<ChromeIcon> = app.windows[&wid]
+    // The card's own rows draw their marks (a show choice's ring): every icon over the card is
+    // the one its own cell holds, none the rule's under it.
+    for icon in app.windows[&wid]
         .input_scratch
         .chrome_rasters
         .iter()
         .filter(|raster| usize::from(raster.row) == row)
         .flat_map(|raster| raster.icons.iter().copied())
         .filter(|i| rect.contains(row, usize::from(i.col)))
-        .collect();
-    assert_eq!(over_card, [], "control: no icon over the card");
+    {
+        assert_eq!(
+            cells[usize::from(icon.col)].ch,
+            icon.icon.ch(),
+            "control: an icon over the card is the card's own cell's: {icon:?}"
+        );
+    }
     assert!(app.close_autopilot_menu());
     frame(&mut app, wid);
     app.splice_autopilot_menu(wid);
@@ -1224,8 +1224,8 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     );
     assert_eq!(
         (off[0].col, off[0].width),
-        (b.cols.start, b.cols.len()),
-        "the node is the switch's cells"
+        (b.ink.start, b.ink.len()),
+        "the node is the cells a press turns the switch on, its side blanks left out"
     );
     let visual = words(&painted(&app, wid, &b, b.cols.clone()));
     assert_eq!(visual, "off");
@@ -1939,12 +1939,14 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
     );
 }
 
-/// THE WHOLE FACE IS THE SWITCH: a press on either end of ` ● on ` turns the harness off, on
-/// either end of the master's ` ○ off ` turns it back on, and on either end of the agent's own
-/// ` ○ off ` turns the agent's switch on; nothing reaches the program. CONTROL: the `─` just left
-/// of the face takes no press.
+/// THE SWITCH'S INK IS THE SWITCH: a press on either end of `● on` turns the harness off, on
+/// either end of the master's `○ off` turns it back on, and on either end of the agent's own
+/// `○ off` turns the agent's switch on; nothing reaches the program. The hit is the cells a
+/// hover underlines, its mark to its word's end. CONTROL: the `─` just left of the face and the
+/// face's own side blanks turn nothing; a side blank is the switch's own all the same, and its
+/// press is swallowed.
 #[test]
-fn the_whole_face_toggles_the_switch_in_every_state() {
+fn the_switchs_ink_toggles_it_in_every_state() {
     let cases = [
         ("lit", None, LIT_SWITCH, "harness.enabled", "false"),
         (
@@ -1982,7 +1984,31 @@ fn the_whole_face_toggles_the_switch_in_every_state() {
                 None,
                 "{what}: CONTROL: the rule beside the face takes no press"
             );
-            let col = if last { b.cols.end - 1 } else { b.cols.start };
+            assert_eq!(
+                (b.ink.start, b.ink.end),
+                (b.cols.start + 1, b.cols.end - 1),
+                "{what}: the ink is the face but its side blanks"
+            );
+            for blank in [b.cols.start, b.cols.end - 1] {
+                let (x, y) = px_of(&app, wid, (b.frame_row, blank));
+                assert_eq!(
+                    app.claude_glass_at(wid, x, y),
+                    Some((session, super::GlassAt::Gap)),
+                    "{what}: the blank at {blank} is the switch's own"
+                );
+                app.on_cursor_moved(wid, x, y);
+                assert!(
+                    app.press_claude_light(wid, Instant::now()),
+                    "{what}: its press is swallowed, never the program's"
+                );
+                click_at(&mut app, wid, (b.frame_row, blank));
+                assert_eq!(
+                    not_saved(&app, key),
+                    None,
+                    "{what}: CONTROL: the face's side blank at {blank} takes no press"
+                );
+            }
+            let col = if last { b.ink.end - 1 } else { b.ink.start };
             click_at(&mut app, wid, (b.frame_row, col));
             let said =
                 not_saved(&app, key).unwrap_or_else(|| panic!("{what} at {col}: a write of {key}"));
@@ -2057,7 +2083,7 @@ fn lines_b_d_and_e_ignore_the_system_accent() {
             on_light: accent,
         }));
         let (mut app, wid, session, _reader, _host) = claude_pane(110);
-        draw_claude(&app, session, "  week 63% used \u{b7} resets Sat 10:00");
+        draw_claude(&app, session, "  week 37% left \u{b7} resets Sat 10:00");
         {
             let entry = app.pool.get(session).expect("session");
             let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());

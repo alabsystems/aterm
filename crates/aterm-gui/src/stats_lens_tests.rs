@@ -3268,3 +3268,24 @@ fn lens_traces_keep_their_axes_and_time_base() {
         );
     }
 }
+
+/// The Jobs section's overflow line names a query `sys` accepts, and that
+/// query lists what the section lists: the Tab lens the caller's tab (the
+/// `jobs` view's default scope), the Global and aterm lenses every tab.
+#[test]
+fn the_jobs_overflow_names_the_sys_query_for_what_the_lens_lists() {
+    use aterm_vitals::sys::{ScopeArg, SysQuery, View};
+    for (bar, want) in [
+        (Bar::Tab, ScopeArg::Tab),
+        (Bar::Aterm, ScopeArg::Aterm),
+        (Bar::Global, ScopeArg::Aterm),
+    ] {
+        let line = jobs_query(bar);
+        let rest = line
+            .strip_prefix("aterm ctl sys ")
+            .unwrap_or_else(|| panic!("{line}"));
+        let q = SysQuery::parse(rest).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert_eq!(q.view, View::Jobs, "{line}");
+        assert_eq!(q.scope.or(q.view.default_scope()), Some(want), "{line}");
+    }
+}

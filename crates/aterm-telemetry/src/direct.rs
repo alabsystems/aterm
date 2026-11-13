@@ -141,12 +141,38 @@ pub fn write_now(dir: PathBuf, row: &Row) -> bool {
     write(dir, &facts().0, row, &LOST)
 }
 
+/// What a write of lines a writer keeps came to ([`write_kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// Written.
+    Written,
+    /// Not written, and the log holds none of them: the lock was not had, or the write that
+    /// failed was cut back.
+    Refused,
+    /// Not written whole: a write that failed could not be cut back, so the log may hold some
+    /// of them ([`crate::log::left_lines`]); the writer asks it before it writes them again
+    /// ([`holds`]).
+    Unsure,
+}
+
 /// Append `lines` (rows' lines, [`Row::line`]) to the log in `dir` in one write, with this
-/// process's [`facts`] and losses ([`write_kept_with`]): whether they were written. Lines it did
-/// not write are not counted lost: the caller keeps them, to write again or to give up
+/// process's [`facts`] and losses ([`write_kept_with`]): what came of it. Lines it did not
+/// write are not counted lost: the caller keeps them, to write again or to give up
 /// ([`give_up`]).
-pub fn write_kept(dir: PathBuf, lines: &[String]) -> bool {
+pub fn write_kept(dir: PathBuf, lines: &[String]) -> Kept {
     write_kept_with(dir, &facts().0, lines, &LOST)
+}
+
+/// Which of `lines` (rows' lines) the log in `dir` holds ([`crate::Log::holds`]), under one wait
+/// of at most [`LOCK_WAIT`] for its lock: a writer that kept them ([`write_kept`]) and lost its
+/// record of whether a write took them writes again only those it does not.
+///
+/// # Errors
+/// As [`crate::Log::holds`].
+pub fn holds(dir: PathBuf, lines: &[String]) -> std::io::Result<Vec<bool>> {
+    crate::Log::new(dir, crate::Limits::DEFAULT, facts().0.clone())
+        .waiting(LOCK_WAIT)
+        .holds(lines)
 }
 
 /// Count `rows` rows a writer kept ([`write_kept`]) and gave up on as lost from the log in `dir`,
@@ -156,44 +182,76 @@ pub fn give_up(dir: &Path, rows: u64) {
 }
 
 /// Append `row` to the log in `dir` within [`LOCK_WAIT`], after a gap line for the rows `lost`
-/// holds that no line has said yet: `false` (and the row counted in `lost`) when it was not
-/// written.
+/// holds that no line has said yet: `false` when it was not written, the row counted in `lost`
+/// unless the failed write may have left it ([`crate::log::left_lines`]: missing at worst,
+/// never said twice).
 pub fn write(dir: PathBuf, facts: &HostFacts, row: &Row, lost: &Lost) -> bool {
-    match append(dir, facts, &[row.line()], lost) {
+    wrote(append(dir, facts, &[row.line()], lost), lost)
+}
+
+/// Whether a row's append ([`append_to`]) wrote it, counting it in `lost` where it did not and
+/// the failed write left none of it.
+fn wrote(appended: Result<(), (PathBuf, bool)>, lost: &Lost) -> bool {
+    match appended {
         Ok(()) => true,
-        Err(dir) => {
-            lost.lose(&dir, 1);
+        Err((dir, left)) => {
+            if !left {
+                lost.lose(&dir, 1);
+            }
             false
         }
     }
 }
 
 /// Append `lines` to the log in `dir` in one write within [`LOCK_WAIT`], after a gap line for
-/// the rows `lost` holds that no line has said yet: whether they were written. A line it did not
-/// write is not counted in `lost`: its caller keeps it, and counts it once it gives it up
+/// the rows `lost` holds that no line has said yet: what came of it ([`Kept`]). A line it did
+/// not write is not counted in `lost`: its caller keeps it, and counts it once it gives it up
 /// ([`Lost::lose`]), so a row written late is never also said lost.
-pub fn write_kept_with(dir: PathBuf, facts: &HostFacts, lines: &[String], lost: &Lost) -> bool {
-    append(dir, facts, lines, lost).is_ok()
+pub fn write_kept_with(dir: PathBuf, facts: &HostFacts, lines: &[String], lost: &Lost) -> Kept {
+    kept(append(dir, facts, lines, lost))
+}
+
+/// What came of an append ([`append_to`]).
+fn kept(appended: Result<(), (PathBuf, bool)>) -> Kept {
+    match appended {
+        Ok(()) => Kept::Written,
+        Err((_, true)) => Kept::Unsure,
+        Err((_, false)) => Kept::Refused,
+    }
 }
 
 /// Append `lines` to the log in `dir` under one wait of at most [`LOCK_WAIT`] for its lock,
 /// after a gap line for the rows `lost` holds that no line has said: `Err` with the log's folder
-/// where they were not written, which counts nothing of them.
-fn append(dir: PathBuf, facts: &HostFacts, lines: &[String], lost: &Lost) -> Result<(), PathBuf> {
-    let log = crate::Log::new(dir, crate::Limits::DEFAULT, facts.clone()).waiting(LOCK_WAIT);
+/// where they were not written, which counts nothing of them, and whether the write that failed
+/// left some of them there ([`crate::log::left_lines`]).
+fn append(
+    dir: PathBuf,
+    facts: &HostFacts,
+    lines: &[String],
+    lost: &Lost,
+) -> Result<(), (PathBuf, bool)> {
+    append_to(
+        &crate::Log::new(dir, crate::Limits::DEFAULT, facts.clone()).waiting(LOCK_WAIT),
+        lines,
+        lost,
+    )
+}
+
+/// [`append`] to `log`.
+fn append_to(log: &crate::Log, lines: &[String], lost: &Lost) -> Result<(), (PathBuf, bool)> {
     // One wait for the lock; the gap line is a write of its own, so a row that fails after it
     // never has the line's rows given back and said twice.
     let claim = lost.claim();
     let said = claim.map_or(0, |(told, had)| had - told);
     match log.append_saying(said, lines) {
         Ok(_) => Ok(()),
-        Err((_, gap_written)) => {
+        Err((e, gap_written)) => {
             if let Some(claim) = claim
                 && !gap_written
             {
                 lost.unclaim(claim);
             }
-            Err(log.dir().to_owned())
+            Err((log.dir().to_owned(), crate::log::left_lines(&e)))
         }
     }
 }

@@ -114,7 +114,7 @@ mod measuring {
             },
         ),
         // The window above at full motion (what the shipped `auto` resolves to on a Mac whose
-        // Reduce Motion is off) under the shipped cursor style, the rainbow kitty pet, measured
+        // Reduce Motion is off) under the shipped cursor, the rainbow beside the cat, measured
         // once its status reports deep sleep. A pet in deep sleep takes no frame and offers no
         // deadline, so the cursor-effect lane is bounded at 0. A window without the focus asks its
         // pet for none either, so a take that does not open and end focused, at full motion with

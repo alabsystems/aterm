@@ -1727,3 +1727,148 @@ fn the_kernels_birth_reaches_a_reading_between_split_ticks() {
     let ms = i64::try_from(bsd.seconds * 1000 + bsd.microseconds / 1000).expect("ms");
     assert_eq!(own_birth(&snap), (Some(ms), Some(ms)));
 }
+
+/// A SWEEP ROW'S OWNER PLACES IT (Windows, whose rows carry the process's session as the owner
+/// and whose reader's own is this process's session, `aterm_sysprobe::own_session`): a row of
+/// the reader's own owner counts among the person's other processes, one of another owner
+/// (session 0, the services') among the services, and one whose owner did not read is unknown;
+/// each row's memory, peak and bytes moved reach its sample as swept. NEGATIVE CONTROL: a reader
+/// that could not read its own owner places none of them.
+#[cfg(windows)]
+#[test]
+fn a_swept_rows_owner_places_it_among_the_persons_or_the_services() {
+    const OWN: u32 = 3;
+    const MINE: u32 = 0x7fff_f010;
+    const SERVICE: u32 = 0x7fff_f020;
+    const UNREAD: u32 = 0x7fff_f030;
+    const SWEPT: CoalProbe = CoalProbe {
+        sweep: |_, _| {
+            let row = |pid: u32, owner: Option<u32>| aterm_sysprobe::ProcessReading {
+                pid,
+                start: Some(u64::from(pid)),
+                cpu_ns: Some(1_000_000),
+                footprint: Some(64 << 20),
+                resident: Some(32 << 20),
+                peak_footprint: Some(96 << 20),
+                disk_read: Some(1 << 20),
+                disk_written: Some(2 << 20),
+                name: format!("swept{pid}"),
+                uid: owner,
+                state: RunState::Sleeping,
+                birth_ms: Some(1_700_000_000_000),
+                ..aterm_sysprobe::ProcessReading::default()
+            };
+            Some(aterm_sysprobe::Sweep {
+                procs: vec![
+                    row(MINE, Some(OWN)),
+                    row(SERVICE, Some(0)),
+                    row(UNREAD, None),
+                ],
+                truncated: false,
+            })
+        },
+        ..STAND_IN
+    };
+    let scopes = |own: Option<u32>| {
+        let mut reader = Reader::new(Arc::default());
+        reader.split = SplitReader::new(SWEPT, gauge());
+        reader.uid = own;
+        let _ = reader.read(&bars());
+        let snap = reader.read(&bars());
+        [MINE, SERVICE, UNREAD].map(|pid| {
+            snap.procs
+                .iter()
+                .find(|row| row.pid == pid)
+                .map(|row| row.scope)
+        })
+    };
+    assert_eq!(
+        scopes(Some(OWN)),
+        [
+            Some(aterm_vitals::model::RowScope::Others),
+            Some(aterm_vitals::model::RowScope::Services),
+            Some(aterm_vitals::model::RowScope::Unknown)
+        ]
+    );
+    assert_eq!(
+        scopes(None),
+        [Some(aterm_vitals::model::RowScope::Unknown); 3]
+    );
+
+    let swept = (SWEPT.sweep)(
+        aterm_sysprobe::SweepOpts::default(),
+        &mut aterm_sysprobe::coalitions::CoalitionIds::default(),
+    )
+    .expect("the stand-in's sweep");
+    let sample = proc_sample(&swept.procs[0], Instant::now());
+    assert_eq!(sample.uid, Some(OWN));
+    assert_eq!(sample.footprint, Some(64 << 20));
+    assert_eq!(sample.peak, Some(96 << 20));
+    assert_eq!(
+        (sample.disk_read, sample.disk_written),
+        (Some(1 << 20), Some(2 << 20))
+    );
+    assert_eq!(sample.birth_ms, Some(1_700_000_000_000));
+}
+
+/// ONLY WINDOWS NAMES ITS COMPRESSED MEMORY FROM A SWEEP: there the store's row (session 0's
+/// `Memory Compression`) becomes the compressed class, taken out of the app class; elsewhere the
+/// memory read names its own (macOS's compressor, zswap) and a row of that name changes nothing.
+/// NEGATIVE CONTROL: no sweep (a machine-only reading) names nothing on any host.
+#[test]
+fn only_windows_names_its_compressed_memory_from_the_sweep() {
+    const STORE: u64 = 3 << 20;
+    let detail = aterm_sysprobe::MemoryDetail {
+        total: 16 << 30,
+        app: 4 << 30,
+        ..aterm_sysprobe::MemoryDetail::default()
+    };
+    let store = aterm_sysprobe::ProcessReading {
+        pid: 0x7fff_f040,
+        name: aterm_sysprobe::windows::MEMORY_COMPRESSION.to_owned(),
+        uid: Some(0),
+        resident: Some(STORE),
+        ..aterm_sysprobe::ProcessReading::default()
+    };
+    let named = compression_named(detail, Some(std::slice::from_ref(&store)));
+    if cfg!(windows) {
+        assert_eq!(named.compressed, Some(STORE));
+        assert_eq!(named.app, detail.app - STORE);
+        assert_eq!(named.used(), detail.used(), "the memory used does not move");
+    } else {
+        assert_eq!(named, detail);
+    }
+    assert_eq!(compression_named(detail, None), detail);
+}
+
+/// A WHOLE READING NAMES WINDOWS' COMPRESSED MEMORY (Windows): the store its sweep lists reaches
+/// the deck's memory sample as the compressed class. NEGATIVE CONTROL: the same reader's
+/// machine-only reading, which sweeps nothing, leaves the class unread.
+#[cfg(windows)]
+#[test]
+fn a_whole_readings_sweep_names_windows_compressed_memory() {
+    const STORE: u64 = 1 << 20;
+    const SWEPT: CoalProbe = CoalProbe {
+        sweep: |_, _| {
+            Some(aterm_sysprobe::Sweep {
+                procs: vec![aterm_sysprobe::ProcessReading {
+                    pid: 0x7fff_f040,
+                    name: aterm_sysprobe::windows::MEMORY_COMPRESSION.to_owned(),
+                    uid: Some(0),
+                    resident: Some(STORE),
+                    ..aterm_sysprobe::ProcessReading::default()
+                }],
+                truncated: false,
+            })
+        },
+        ..STAND_IN
+    };
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(SWEPT, gauge());
+    let whole = reader.read(&bars());
+    let compressed = whole.mem.map(|mem| mem.sample.compressed);
+    assert_eq!(compressed, Some(Some(STORE)), "a whole reading");
+    let machine = reader.read_machine(&bars());
+    let compressed = machine.mem.map(|mem| mem.sample.compressed);
+    assert_eq!(compressed, Some(None), "a machine-only reading");
+}

@@ -2,30 +2,63 @@
 // Copyright 2026 Andrew Yates
 
 use super::{
-    App, BootHealthConfirmation, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
-    WindowId, find_url_span, is_safe_url, native_preview_deadline, native_preview_may_tick,
-    run_capture_present_barrier, should_dispatch_boot_health_confirmation,
+    App, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, WindowId,
+    boot_checkpoint_reached, boot_health_ask_due, find_url_span, is_safe_url,
+    native_preview_deadline, native_preview_may_tick, run_capture_present_barrier,
+    should_dispatch_boot_health_confirmation,
 };
 use crate::app_config::Config;
+
+fn boot_health_ticket(request_sequence: u64) -> crate::app_native::BootHealthConfirmationTicket {
+    crate::app_native::BootHealthConfirmationTicket::for_test(request_sequence)
+}
+
+fn boot_health_pending() -> aterm_update::BootHealthVerdict {
+    aterm_update::BootHealthVerdict::Pending {
+        why: "build 10's update trial waits for this instance's control socket".to_string(),
+        retry_after: None,
+    }
+}
 
 #[test]
 fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     use std::sync::atomic::Ordering;
 
-    fn would_dispatch(app: &App) -> bool {
-        should_dispatch_boot_health_confirmation(
+    fn at_checkpoint(app: &App) -> bool {
+        let reached = boot_checkpoint_reached(
             app.headless,
             app.headless_boot_health_checkpoint(),
             app.first_present_done,
-            app.boot_health_confirmation != BootHealthConfirmation::Pending,
-            true,
             app.windows.values().any(|ws| ws.os_window.is_some()),
+        );
+        assert_eq!(reached, app.boot_health_checkpoint_reached());
+        assert_eq!(
+            reached && would_dispatch(app),
+            should_dispatch_boot_health_confirmation(
+                app.headless,
+                app.headless_boot_health_checkpoint(),
+                app.first_present_done,
+                app.boot_health_confirmation.dispatched(),
+                true,
+                app.windows.values().any(|ws| ws.os_window.is_some()),
+                app.incoming_handoff_pending,
+            ),
+            "an ask carries the checkpoint exactly where the dispatch predicate holds"
+        );
+        reached
+    }
+    fn would_dispatch(app: &App) -> bool {
+        let due = boot_health_ask_due(
+            app.boot_health_confirmation.dispatched(),
+            true,
             app.incoming_handoff_pending,
-        )
+        );
+        assert_eq!(due, app.boot_health_guard_open());
+        due
     }
 
     let mut app = App::headless_for_test();
-    app.boot_health_confirmation = BootHealthConfirmation::Pending;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
     assert!(
         app.headless,
         "negative control: this fixture IS the headless lane"
@@ -35,10 +68,16 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
         "negative control: the windowed checkpoint is unreachable here, so it \
          cannot be what disarms the sentinel"
     );
+    assert!(
+        !boot_checkpoint_reached(false, true, false, true)
+            && !boot_checkpoint_reached(false, true, true, false)
+            && boot_checkpoint_reached(false, false, true, true),
+        "a window's checkpoint is its first present on an OS window, nothing else"
+    );
 
     assert!(app.sock_plan.is_none());
     assert!(
-        would_dispatch(&app),
+        at_checkpoint(&app) && would_dispatch(&app),
         "a socketless headless build must still confirm"
     );
 
@@ -49,28 +88,266 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     });
     app.sock_bound.store(false, Ordering::Release);
     assert!(
-        !would_dispatch(&app),
+        !at_checkpoint(&app),
         "an unbound control socket is not a working engine"
+    );
+    assert!(
+        would_dispatch(&app),
+        "the ask still goes, without the checkpoint: the updater then only reads"
     );
 
     app.sock_bound.store(true, Ordering::Release);
     assert!(
-        would_dispatch(&app),
+        at_checkpoint(&app) && would_dispatch(&app),
         "a bound control socket is the headless health proof"
     );
 
-    app.boot_health_confirmation = BootHealthConfirmation::InFlight;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(boot_health_ticket(1));
     assert!(
         !would_dispatch(&app),
         "the same boundary cannot enqueue a second confirmation"
     );
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.incoming_handoff_pending = true;
+    assert!(
+        !would_dispatch(&app),
+        "an uncommitted handoff candidate asks nothing"
+    );
+}
+
+#[test]
+fn the_first_frame_asks_again_at_once() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let mut app = App::headless_for_test();
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.boot_health_checkpoint_seen = false;
+    app.boot_health_asked_at_checkpoint = false;
+    app.sock_plan = Some(crate::control_auth::SocketPlan {
+        sock_path: "/tmp/aterm-boot-health-first-frame.sock".into(),
+        token_path: std::path::PathBuf::from("/tmp/aterm-boot-health-first-frame.token"),
+        latest_link: None,
+    });
+    app.sock_bound.store(false, Ordering::Release);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(sender);
+    let now = std::time::Instant::now();
+
+    // Before the checkpoint the ask goes without it, and a pending trial is retried on backoff.
+    app.note_boot_health_checkpoint();
+    assert!(!app.boot_health_checkpoint_seen);
+    let early = app.request_native_boot_health_confirmation();
+    let crate::app_native::BootHealthDispatch::Queued(early_ticket) = early else {
+        panic!("an idle worker must accept the ask: {early:?}");
+    };
+    app.note_boot_health_dispatch(early, now);
+    assert!(matches!(
+        receiver.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(
+            crate::app_native::NativeUpdateWorkerRequest::ConfirmBootHealth {
+                checkpoint: false,
+                ..
+            }
+        )
+    ));
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(early_ticket, boot_health_pending(), now),
+        crate::app_native::BootHealthFinishDisposition::RetryArmed
+    );
+    assert_eq!(
+        app.boot_health_confirmation_retry_at,
+        Some(now + Duration::from_secs(1)),
+        "a trial that waits for the checkpoint is asked again on the backoff"
+    );
+    assert!(!app.native_boot_health_complete());
+
+    // The checkpoint: the next park asks at once, with it.
+    app.sock_bound.store(true, Ordering::Release);
+    app.note_boot_health_checkpoint();
+    assert!(app.boot_health_checkpoint_seen);
+    assert_eq!(app.boot_health_confirmation_retry_at, None);
+    let at_checkpoint = app.request_native_boot_health_confirmation();
+    let crate::app_native::BootHealthDispatch::Queued(ticket) = at_checkpoint else {
+        panic!("an idle worker must accept the ask: {at_checkpoint:?}");
+    };
+    app.note_boot_health_dispatch(at_checkpoint, now);
+    assert!(matches!(
+        receiver.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(
+            crate::app_native::NativeUpdateWorkerRequest::ConfirmBootHealth {
+                checkpoint: true,
+                ..
+            }
+        )
+    ));
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::Confirmed { settled: Some(10) },
+            now,
+        ),
+        crate::app_native::BootHealthFinishDisposition::Completed
+    );
+
+    // An ask from before the checkpoint that answers after it is asked again at once too.
+    let mut late = App::headless_for_test();
+    late.boot_health_checkpoint_seen = true;
+    late.boot_health_asked_at_checkpoint = false;
+    let late_ticket = boot_health_ticket(7);
+    late.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(late_ticket);
+    assert_eq!(
+        late.finish_native_boot_health_confirmation(late_ticket, boot_health_pending(), now),
+        crate::app_native::BootHealthFinishDisposition::RetryArmed
+    );
+    assert_eq!(late.boot_health_confirmation_retry_at, Some(now));
+    assert_eq!(
+        late.boot_health_confirmation_backoff,
+        crate::BOOT_HEALTH_RETRY_MIN,
+        "an answer that names its own retry leaves the backoff as it was"
+    );
+}
+
+/// A launch that owes no trial is confirmed by the ask it sends before its checkpoint, which
+/// lets the updater only read. The updater releases an ended window's kept predecessor at a
+/// checkpoint ask alone, so the park sends it that one ask once the checkpoint is reached, and
+/// the gate the first answer opened stays open.
+#[test]
+fn a_gate_opened_before_the_checkpoint_still_sends_the_updater_its_checkpoint_ask() {
+    use crate::app_native::{BootHealthFinishDisposition, NativeUpdateWorkerRequest};
+    use std::sync::atomic::Ordering;
+
+    let mut app = App::headless_for_test();
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.boot_health_checkpoint_seen = false;
+    app.boot_health_asked_at_checkpoint = false;
+    app.sock_plan = Some(crate::control_auth::SocketPlan {
+        sock_path: "/tmp/aterm-boot-health-owed-ask.sock".into(),
+        token_path: std::path::PathBuf::from("/tmp/aterm-boot-health-owed-ask.token"),
+        latest_link: None,
+    });
+    app.sock_bound.store(false, Ordering::Release);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(sender.clone());
+    let now = std::time::Instant::now();
+
+    // Before the checkpoint the ask goes without it, and its answer opens the gate.
+    app.service_boot_health(now);
+    let Ok(NativeUpdateWorkerRequest::ConfirmBootHealth {
+        ticket: early,
+        checkpoint: false,
+        ..
+    }) = receiver.try_recv()
+    else {
+        panic!("the park queues an ask that carries no checkpoint");
+    };
+    assert_eq!(
+        app.handle_native_boot_health_confirmation_finished(
+            early,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    assert!(app.native_boot_health_complete());
+    app.service_boot_health(now);
+    assert!(
+        receiver.try_recv().is_err(),
+        "nothing more is asked before the checkpoint"
+    );
+
+    // At the checkpoint with the worker's one slot taken, the ask is kept for a later park.
+    app.sock_bound.store(true, Ordering::Release);
+    let filler = boot_health_ticket(900);
+    assert!(
+        sender
+            .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+                ticket: filler,
+                current_build: 10,
+                witness: aterm_update::TrialWitness::Headless,
+                checkpoint: false,
+            })
+            .is_ok(),
+        "PRECONDITION: the queue's one slot is taken"
+    );
+    app.service_boot_health(now);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(NativeUpdateWorkerRequest::ConfirmBootHealth { ticket, .. }) if ticket == filler
+    ));
+    assert!(receiver.try_recv().is_err(), "a full queue took nothing");
+    app.service_boot_health(now);
+    let Ok(NativeUpdateWorkerRequest::ConfirmBootHealth {
+        ticket: owed,
+        current_build: 10,
+        witness: aterm_update::TrialWitness::Headless,
+        checkpoint: true,
+    }) = receiver.try_recv()
+    else {
+        panic!("the park at the checkpoint queues the one ask that carries it");
+    };
+
+    // It is one ask, and its answer finds no request in flight: the gate stays as it was.
+    app.service_boot_health(now);
+    assert!(receiver.try_recv().is_err(), "the ask is sent once");
+    assert_eq!(
+        app.handle_native_boot_health_confirmation_finished(owed, boot_health_pending(), now),
+        BootHealthFinishDisposition::IgnoredStale
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Complete
+    );
+    assert!(app.native_boot_health_complete());
+
+    // CONTROL: a gate opened by an ask sent at the checkpoint owes the updater nothing more.
+    let mut at_checkpoint = App::headless_for_test();
+    at_checkpoint.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    at_checkpoint.native_update_reconcile_worker = Some(sender);
+    at_checkpoint.service_boot_health(now);
+    let Ok(NativeUpdateWorkerRequest::ConfirmBootHealth {
+        ticket,
+        checkpoint: true,
+        ..
+    }) = receiver.try_recv()
+    else {
+        panic!("a socketless headless build asks at its checkpoint");
+    };
+    assert_eq!(
+        at_checkpoint.handle_native_boot_health_confirmation_finished(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    at_checkpoint.service_boot_health(now);
+    assert!(
+        receiver.try_recv().is_err(),
+        "the checkpoint ask that opened the gate is the only one"
+    );
+
+    // An unavailable worker ends the duty: no park retries it.
+    let mut unavailable = App::headless_for_test();
+    assert!(
+        unavailable.native_update_reconcile_worker.is_none() && unavailable.proxy.is_none(),
+        "PRECONDITION: this fixture has no worker and no proxy to start one"
+    );
+    unavailable.boot_health_checkpoint_ask_owed = true;
+    unavailable.service_boot_health(now);
+    assert!(
+        !unavailable.boot_health_checkpoint_ask_owed,
+        "an unavailable worker ends the duty"
+    );
+    assert!(unavailable.native_boot_health_complete());
 }
 
 #[test]
 fn boot_health_never_folds_a_past_deadline() {
     use std::time::{Duration, Instant};
     let mut app = App::headless_for_test();
-    app.boot_health_confirmation = BootHealthConfirmation::Pending;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
     let now = Instant::now();
     let past = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
     app.boot_health_confirmation_retry_at = Some(past);
@@ -91,12 +368,12 @@ fn boot_health_never_folds_a_past_deadline() {
     );
     app.incoming_handoff_pending = false;
 
-    app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Saturated, now);
+    app.note_boot_health_dispatch(crate::app_native::BootHealthDispatch::Saturated, now);
     assert_eq!(
         app.boot_health_confirmation_retry_at,
         Some(now + Duration::from_secs(1))
     );
-    app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Saturated, now);
+    app.note_boot_health_dispatch(crate::app_native::BootHealthDispatch::Saturated, now);
     assert_eq!(
         app.boot_health_confirmation_retry_at,
         Some(now + Duration::from_secs(2)),
@@ -104,16 +381,168 @@ fn boot_health_never_folds_a_past_deadline() {
     );
     assert!(app.boot_health_retry_deadline(now).is_some_and(|d| d > now));
 
-    app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Queued, now);
+    let first_ticket = boot_health_ticket(1);
+    app.note_boot_health_dispatch(
+        crate::app_native::BootHealthDispatch::Queued(first_ticket),
+        now,
+    );
     assert_eq!(
         app.boot_health_confirmation,
-        BootHealthConfirmation::InFlight
+        crate::BootHealthConfirmation::InFlight(first_ticket)
     );
-    assert_eq!(app.boot_health_retry_deadline(now), None);
-    app.finish_native_boot_health_confirmation(false, now);
+    let watchdog = app
+        .boot_health_confirmation_retry_at
+        .expect("queued confirmation has a lost-completion watchdog");
+    assert!(watchdog > now);
+    assert_eq!(app.boot_health_retry_deadline(now), Some(watchdog));
+    app.expire_boot_health_confirmation(watchdog);
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Awaiting
+    );
+    assert!(
+        app.boot_health_guard_open(),
+        "the watchdog reopens dispatch"
+    );
+    let retry_ticket = boot_health_ticket(2);
+    app.note_boot_health_dispatch(
+        crate::app_native::BootHealthDispatch::Queued(retry_ticket),
+        watchdog,
+    );
+    assert!(
+        app.boot_health_confirmation_retry_at
+            .is_some_and(|retry_at| retry_at > watchdog),
+        "the replacement request has its own watchdog"
+    );
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(retry_ticket, boot_health_pending(), watchdog,),
+        crate::app_native::BootHealthFinishDisposition::RetryArmed
+    );
     assert_eq!(
         app.boot_health_confirmation_retry_at,
-        Some(now + Duration::from_secs(4))
+        Some(watchdog + Duration::from_secs(4))
+    );
+    let completed_ticket = boot_health_ticket(3);
+    app.note_boot_health_dispatch(
+        crate::app_native::BootHealthDispatch::Queued(completed_ticket),
+        watchdog,
+    );
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            completed_ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            watchdog,
+        ),
+        crate::app_native::BootHealthFinishDisposition::Completed
+    );
+    assert_eq!(app.boot_health_retry_deadline(watchdog), None);
+}
+
+#[test]
+fn boot_health_lost_completion_reenters_the_normal_worker_lane() {
+    let mut app = App::headless_for_test();
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(sender);
+    let now = std::time::Instant::now();
+
+    let first = app.request_native_boot_health_confirmation();
+    let crate::app_native::BootHealthDispatch::Queued(first_ticket) = first else {
+        panic!("an idle worker must accept the first confirmation: {first:?}");
+    };
+    app.note_boot_health_dispatch(first, now);
+    let first_request = receiver
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("first request");
+    assert!(matches!(
+        first_request,
+        crate::app_native::NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket,
+            current_build: 10,
+            witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
+        } if ticket == first_ticket
+    ));
+    let watchdog = app
+        .boot_health_confirmation_retry_at
+        .expect("the first request's watchdog");
+    app.expire_boot_health_confirmation(watchdog);
+    let replacement = app.request_native_boot_health_confirmation();
+    let crate::app_native::BootHealthDispatch::Queued(replacement_ticket) = replacement else {
+        panic!("an idle worker must accept the idempotent replacement: {replacement:?}");
+    };
+    app.note_boot_health_dispatch(replacement, watchdog);
+    assert_ne!(first_ticket, replacement_ticket);
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::InFlight(replacement_ticket)
+    );
+    let request = receiver
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("replacement request");
+    assert!(matches!(
+        request,
+        crate::app_native::NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket,
+            current_build: 10,
+            witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
+        } if ticket == replacement_ticket
+    ));
+    let replacement_watchdog = app
+        .boot_health_confirmation_retry_at
+        .expect("the replacement request owns a watchdog");
+    let future = replacement_watchdog + Duration::from_secs(600);
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 11,
+        dmg_sha256: [0xab; 32],
+        retry_at: future,
+        attempts: 1,
+        deadline_owner: crate::AutoApplyDeadlineOwner::BootHealth,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    for stale_result in [
+        boot_health_pending(),
+        aterm_update::BootHealthVerdict::Confirmed { settled: Some(10) },
+    ] {
+        assert_eq!(
+            app.handle_native_boot_health_confirmation_finished(
+                first_ticket,
+                stale_result,
+                watchdog,
+            ),
+            crate::app_native::BootHealthFinishDisposition::IgnoredStale
+        );
+        assert_eq!(
+            app.boot_health_confirmation,
+            crate::BootHealthConfirmation::InFlight(replacement_ticket),
+            "a late first request cannot retire its replacement"
+        );
+        assert_eq!(
+            app.boot_health_confirmation_retry_at,
+            Some(replacement_watchdog),
+            "a late first request cannot replace the live watchdog"
+        );
+        assert!(
+            app.auto_apply_intent.is_some_and(|intent| {
+                intent.retry_at == future
+                    && intent.deadline_owner == crate::AutoApplyDeadlineOwner::BootHealth
+            }),
+            "a retired ticket cannot release the replacement gate's automatic deadline"
+        );
+    }
+    app.auto_apply_intent = None;
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            replacement_ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            watchdog,
+        ),
+        crate::app_native::BootHealthFinishDisposition::Completed
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Complete
     );
 }
 
@@ -563,7 +992,7 @@ fn lane_wake_census() -> LaneCensus {
 
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    app.config.cursor_trail_style = Some("rainbow".to_string());
     let glow_cfg = app.glow_config();
     assert!(matches!(
         glow_cfg.style,

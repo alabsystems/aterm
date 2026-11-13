@@ -47,7 +47,21 @@ pub const IOSEVKA_ITALIC_ID: &str = "bundled:Iosevka Term Italic";
 /// The bundled Iosevka Term's bold-italic face identity.
 pub const IOSEVKA_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Bold Italic";
 
-/// Whether this build compiles in the Iosevka Term SEMIBOLD faces, the Windows default.
+/// Whether this build compiles in the Iosevka Term NL faces, the Windows default.
+pub const IOSEVKA_NL_ACTIVE: bool = cfg!(all(feature = "embedded-font", windows));
+
+/// Iosevka Term NL's family name, as a user types it: Iosevka Term (the Regular set) with No programming Ligatures, cut from the bundled files at build time (`no_ligatures`), so `!=`, `->` and `>=` stay the characters a program wrote.
+pub const IOSEVKA_NL_FAMILY: &str = "Iosevka Term NL";
+/// The bundled Iosevka Term NL's virtual identity (regular face).
+pub const IOSEVKA_NL_ID: &str = "bundled:Iosevka Term NL";
+/// The bundled Iosevka Term NL's bold face identity.
+pub const IOSEVKA_NL_BOLD_ID: &str = "bundled:Iosevka Term NL Bold";
+/// The bundled Iosevka Term NL's italic face identity.
+pub const IOSEVKA_NL_ITALIC_ID: &str = "bundled:Iosevka Term NL Italic";
+/// The bundled Iosevka Term NL's bold-italic face identity.
+pub const IOSEVKA_NL_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term NL Bold Italic";
+
+/// Whether this build compiles in the Iosevka Term SEMIBOLD faces (Windows only, where they were the default before Iosevka Term NL).
 pub const IOSEVKA_SEMIBOLD_ACTIVE: bool = cfg!(all(feature = "embedded-font", windows));
 
 /// Iosevka Term Semibold's family name, as a user types it.
@@ -63,31 +77,31 @@ pub const IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Semibold
 
 /// The bundled PRIMARY's family name, as a user types it.
 #[cfg(windows)]
-pub const PRIMARY_FAMILY: &str = IOSEVKA_SEMIBOLD_FAMILY;
+pub const PRIMARY_FAMILY: &str = IOSEVKA_NL_FAMILY;
 /// The bundled primary's family name, as a user types it.
 #[cfg(not(windows))]
 pub const PRIMARY_FAMILY: &str = JETBRAINS_FAMILY;
 /// The bundled primary's virtual identity (regular face).
 #[cfg(windows)]
-pub const PRIMARY_ID: &str = IOSEVKA_SEMIBOLD_ID;
+pub const PRIMARY_ID: &str = IOSEVKA_NL_ID;
 /// The bundled primary's virtual identity (regular face).
 #[cfg(not(windows))]
 pub const PRIMARY_ID: &str = JETBRAINS_ID;
 /// The bundled primary's bold face identity.
 #[cfg(windows)]
-pub const PRIMARY_BOLD_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ID;
+pub const PRIMARY_BOLD_ID: &str = IOSEVKA_NL_BOLD_ID;
 /// The bundled primary's bold face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ID: &str = JETBRAINS_BOLD_ID;
 /// The bundled primary's italic face identity.
 #[cfg(windows)]
-pub const PRIMARY_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_ITALIC_ID;
+pub const PRIMARY_ITALIC_ID: &str = IOSEVKA_NL_ITALIC_ID;
 /// The bundled primary's italic face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_ITALIC_ID: &str = JETBRAINS_ITALIC_ID;
 /// The bundled primary's bold-italic face identity.
 #[cfg(windows)]
-pub const PRIMARY_BOLD_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID;
+pub const PRIMARY_BOLD_ITALIC_ID: &str = IOSEVKA_NL_BOLD_ITALIC_ID;
 /// The bundled primary's bold-italic face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = JETBRAINS_BOLD_ITALIC_ID;
@@ -112,6 +126,10 @@ const ALL_IDS: &[&str] = &[
     IOSEVKA_BOLD_ID,
     IOSEVKA_ITALIC_ID,
     IOSEVKA_BOLD_ITALIC_ID,
+    IOSEVKA_NL_ID,
+    IOSEVKA_NL_BOLD_ID,
+    IOSEVKA_NL_ITALIC_ID,
+    IOSEVKA_NL_BOLD_ITALIC_ID,
     IOSEVKA_SEMIBOLD_ID,
     IOSEVKA_SEMIBOLD_BOLD_ID,
     IOSEVKA_SEMIBOLD_ITALIC_ID,
@@ -161,6 +179,18 @@ mod bytes {
     pub(super) static CASCADIA_BOLD_ITALIC: &[u8] =
         include_bytes!("../assets/bundled/CascadiaMonoPL-BoldItalic.ttf");
     #[cfg(windows)]
+    pub(super) static IOSEVKA_NL_REGULAR: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/IosevkaTerm-Regular.nl.ttf"));
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_NL_BOLD: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/IosevkaTerm-Bold.nl.ttf"));
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_NL_ITALIC: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/IosevkaTerm-Italic.nl.ttf"));
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_NL_BOLD_ITALIC: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/IosevkaTerm-BoldItalic.nl.ttf"));
+    #[cfg(windows)]
     pub(super) static IOSEVKA_SEMIBOLD: &[u8] =
         include_bytes!("../assets/bundled/IosevkaTerm-SemiBold.ttf");
     #[cfg(windows)]
@@ -187,6 +217,14 @@ pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
         CASCADIA_ITALIC_ID => Some(bytes::CASCADIA_ITALIC),
         #[cfg(windows)]
         CASCADIA_BOLD_ITALIC_ID => Some(bytes::CASCADIA_BOLD_ITALIC),
+        #[cfg(windows)]
+        IOSEVKA_NL_ID => Some(bytes::IOSEVKA_NL_REGULAR),
+        #[cfg(windows)]
+        IOSEVKA_NL_BOLD_ID => Some(bytes::IOSEVKA_NL_BOLD),
+        #[cfg(windows)]
+        IOSEVKA_NL_ITALIC_ID => Some(bytes::IOSEVKA_NL_ITALIC),
+        #[cfg(windows)]
+        IOSEVKA_NL_BOLD_ITALIC_ID => Some(bytes::IOSEVKA_NL_BOLD_ITALIC),
         #[cfg(windows)]
         IOSEVKA_SEMIBOLD_ID => Some(bytes::IOSEVKA_SEMIBOLD),
         #[cfg(windows)]
@@ -263,6 +301,14 @@ pub fn face_for_family(family: &str) -> Option<(&'static str, &'static [u8])> {
         #[cfg(windows)]
         "cascadiamonoplbolditalic" => CASCADIA_BOLD_ITALIC_ID,
         #[cfg(windows)]
+        "iosevkatermnl" | "iosevkatermnlregular" => IOSEVKA_NL_ID,
+        #[cfg(windows)]
+        "iosevkatermnlbold" => IOSEVKA_NL_BOLD_ID,
+        #[cfg(windows)]
+        "iosevkatermnlitalic" => IOSEVKA_NL_ITALIC_ID,
+        #[cfg(windows)]
+        "iosevkatermnlbolditalic" => IOSEVKA_NL_BOLD_ITALIC_ID,
+        #[cfg(windows)]
         "iosevkatermsemibold" | "iosevkatermsemiboldregular" => IOSEVKA_SEMIBOLD_ID,
         #[cfg(windows)]
         "iosevkatermsemiboldbold" | "iosevkatermextrabold" => IOSEVKA_SEMIBOLD_BOLD_ID,
@@ -284,6 +330,8 @@ pub fn styled_siblings(primary: &str) -> [Option<&'static [u8]>; 3] {
         JETBRAINS_ID => JETBRAINS_FACES,
         #[cfg(windows)]
         CASCADIA_ID => CASCADIA_FACES,
+        #[cfg(windows)]
+        IOSEVKA_NL_ID => IOSEVKA_NL_FACES,
         #[cfg(windows)]
         IOSEVKA_SEMIBOLD_ID => IOSEVKA_SEMIBOLD_FACES,
         IOSEVKA_ID => IOSEVKA_FACES,
@@ -310,6 +358,12 @@ const IOSEVKA_FACES: [&str; 4] = [
     IOSEVKA_ITALIC_ID,
     IOSEVKA_BOLD_ITALIC_ID,
 ];
+const IOSEVKA_NL_FACES: [&str; 4] = [
+    IOSEVKA_NL_ID,
+    IOSEVKA_NL_BOLD_ID,
+    IOSEVKA_NL_ITALIC_ID,
+    IOSEVKA_NL_BOLD_ITALIC_ID,
+];
 const IOSEVKA_SEMIBOLD_FACES: [&str; 4] = [
     IOSEVKA_SEMIBOLD_ID,
     IOSEVKA_SEMIBOLD_BOLD_ID,
@@ -317,10 +371,11 @@ const IOSEVKA_SEMIBOLD_FACES: [&str; 4] = [
     IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
 ];
 
-const PRIMARY_FAMILIES: [[&str; 4]; 4] = [
+const PRIMARY_FAMILIES: [[&str; 4]; 5] = [
     CASCADIA_FACES,
     JETBRAINS_FACES,
     IOSEVKA_FACES,
+    IOSEVKA_NL_FACES,
     IOSEVKA_SEMIBOLD_FACES,
 ];
 
@@ -365,14 +420,14 @@ pub const fn is_two_cell_glyph(ch: char) -> bool {
 #[inline]
 #[must_use]
 pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
-    is_iosevka_semibold(bytes)
+    is_grid_fitted_iosevka(bytes)
 }
 
 /// THE GRID OWNS THE COLUMNS, the other way round.
 #[inline]
 #[must_use]
 pub fn yields_wide_characters(bytes: &[u8]) -> bool {
-    is_iosevka_semibold(bytes)
+    is_grid_fitted_iosevka(bytes)
 }
 
 /// The I CHING LINE SYMBOLS.
@@ -393,7 +448,7 @@ pub const fn is_small_dingbat(ch: char) -> bool {
 #[inline]
 #[must_use]
 pub fn yields_small_dingbats(bytes: &[u8]) -> bool {
-    is_iosevka_semibold(bytes)
+    is_grid_fitted_iosevka(bytes)
 }
 
 /// The text size.
@@ -401,6 +456,9 @@ pub const SPINNER_STARS_CRISP_PX: f32 = 32.0;
 
 /// The most one of Claude Code's spinner frames may outweigh another where a face draws them ([`SPINNER_STARS_CRISP_PX`] up).
 pub const SPINNER_FRAME_SPREAD: f32 = 1.4;
+
+/// The most a face-drawn spinner frame may outweigh the primary's own `*`, which Claude Code's cycle shows between the frames and which is not redrawn: a frame evened past it comes down to it. The rest ([`crate::procedural::SPINNER_REST`]) stays as its face draws it (thinned, its strokes go soft), so under a `*` light enough that the rest itself lies past this, the heavier frames come down to the rest.
+pub const SPINNER_CYCLE_SPREAD: f32 = 1.5;
 
 /// How far Iosevka's own HEX-LOW asterisk sits below its default hex-high one, per em.
 pub const HEX_LOW_DROP: f32 = 0.266;
@@ -432,7 +490,7 @@ impl LoweredAsterisk {
 /// Whether `bytes` are a bundled face that draws its `*` as Iosevka's own HEX-LOW asterisk.
 #[must_use]
 pub fn lowered_asterisk(bytes: &[u8]) -> Option<LoweredAsterisk> {
-    if !is_iosevka_semibold(bytes) {
+    if !is_grid_fitted_iosevka(bytes) {
         return None;
     }
     let face = aterm_font::Face::parse(bytes, 0).ok()?;
@@ -452,9 +510,11 @@ pub fn lowered_asterisk(bytes: &[u8]) -> Option<LoweredAsterisk> {
     })
 }
 
-fn is_iosevka_semibold(bytes: &[u8]) -> bool {
-    IOSEVKA_SEMIBOLD_FACES
+/// Whether `bytes` are a face of one of the Iosevka Term sets Windows has drawn by default, which the grid treatments above apply to: Iosevka Term NL and the Semibold set before it. Both are compiled in on Windows only; Iosevka Term by name, on any system, is drawn as the file is.
+fn is_grid_fitted_iosevka(bytes: &[u8]) -> bool {
+    IOSEVKA_NL_FACES
         .iter()
+        .chain(&IOSEVKA_SEMIBOLD_FACES)
         .any(|id| face_for_id(id).is_some_and(|face| same_face(face, bytes)))
 }
 
@@ -533,6 +593,7 @@ pub const fn selectable_families() -> &'static [&'static str] {
     #[cfg(windows)]
     {
         &[
+            IOSEVKA_NL_FAMILY,
             IOSEVKA_SEMIBOLD_FAMILY,
             CASCADIA_FAMILY,
             JETBRAINS_FAMILY,

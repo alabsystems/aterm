@@ -3,7 +3,8 @@
 
 //! Compact stats sill rendered in the window's bottom padding without re-gridding.
 
-use aterm_vitals::model::{CpuView, MemView, Snapshot};
+use aterm_vitals::ink::Rgb;
+use aterm_vitals::model::{CpuView, MemView, Resource, Snapshot, State};
 use aterm_vitals::trend::TrendView;
 use aterm_vitals::words;
 
@@ -22,6 +23,19 @@ pub(crate) fn sill_px(pad: usize, scale: f64) -> usize {
     let min = (SILL_MIN_PT * scale).round() as usize;
     if pad >= min { pad } else { 0 }
 }
+
+/// The sill card's height in device px: the `sill` pad less the bottom the
+/// drop-target border keeps ([`aterm_render::drop_overlay_border_px`] of the
+/// `frame_w` × `frame_h` frame, 2–6 px), so nothing the sill draws or answers a
+/// pointer in lies under that border. At 2× a 24 px pad keeps 18 px, the three
+/// lanes' whole height; at 1× a 12 px pad over a 6 px border keeps 6, so the
+/// Tab lane yields there ([`sill_paint`]).
+pub(crate) fn sill_card_px(sill: usize, frame_w: usize, frame_h: usize) -> usize {
+    sill.saturating_sub(aterm_render::drop_overlay_border_px(frame_w, frame_h, 0))
+}
+
+/// The gap between the sill's columns, in points.
+const COL_GAP_PT: f32 = 12.0;
 
 /// What the width law leaves at a sill `w_pt` points wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,27 +108,42 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     let fold = Fold::of((right - left) / s);
     let rows = lane_rows(s);
     let lane_bottom = rows[2].0 + rows[2].1;
-    let show_tab = input.tab_count >= 2 && lane_bottom <= h;
+    // The card ends where the drop-target border begins (`sill_card_px`), so
+    // a lane is drawn only where it fits whole: the lanes yield bottom-up,
+    // the Tab lane first (at 1× a 12 px pad over a 6 px border holds Global
+    // and aterm). The lens and the sentences still say every figure.
+    let fits = |i: usize| rows[i].0 + rows[i].1 <= h;
+    let show_aterm = fits(1);
+    let show_tab = input.tab_count >= 2 && fits(2);
+    let shown = [fits(0), show_aterm, show_tab];
     let band_y = 0.0f32;
     let band_h = (lane_bottom + s.round()).min(h);
 
     let well_w = p.px(56.0);
     let mut x = left;
     if !input.marks.is_empty() {
-        let r = (rows[2].0 + rows[2].1 - rows[0].0) / 2.0;
+        // The marks span the lanes the card holds; a count is drawn only
+        // where its figures fit the band whole.
+        let r = ((lane_bottom.min(band_h) - rows[0].0) / 2.0)
+            .floor()
+            .max(1.0);
         let cy = (rows[0].0 + r).round();
+        let counted = p.small_px.get() * crate::tray_raster::chrome_cap_ratio() <= band_h - band_y;
         let mut mx = x;
         let shown = input.marks.len().min(3);
         for m in input.marks.iter().take(shown) {
             p.mark(m.kind, mx + r, cy, r, m.frac);
             mx += 2.0 * r + p.px(1.0);
-            let c = m.count.to_string();
-            let cw = p.figure_w(&c, true);
-            let base = crate::tray_raster::row_baseline(band_y, band_h, p.small_px.get());
-            p.figure(mx, base, c, inks.words2, true);
-            mx += cw + p.px(4.0);
+            if counted {
+                let c = m.count.to_string();
+                let cw = p.figure_w(&c, true);
+                let base = crate::tray_raster::row_baseline(band_y, band_h, p.small_px.get());
+                p.figure(mx, base, c, inks.words2, true);
+                mx += cw;
+            }
+            mx += p.px(4.0);
         }
-        if input.marks.len() > 3 {
+        if counted && input.marks.len() > 3 {
             let base = crate::tray_raster::row_baseline(band_y, band_h, p.small_px.get());
             p.figure(
                 mx,
@@ -139,7 +168,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
 
     let total_cores = snap.total_cores().map_or(1.0, |n| n as f32).max(1.0);
     let room = (right - x).max(0.0);
-    let gap = p.px(12.0);
+    let gap = p.px(COL_GAP_PT);
     let bracket_room = p.px(2.0);
     let (cpu_w, mem_w, disk_w) = if fold.minimal {
         (room.max(0.0).min(room), 0.0, 0.0)
@@ -162,7 +191,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         };
         (share(0), share(1), share(2))
     };
-    if fold.minimal && cpu_w < p.px(80.0) {
+    if (fold.minimal && cpu_w < p.px(80.0)) || !shown[0] {
         return (p.prims, hits);
     }
 
@@ -172,7 +201,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         .is_some_and(|c| c.busy.level >= total_cores * 0.98);
     let tab = snap.tab_of(&input.tab_panes);
     let busy_level = snap.cpu.as_ref().map_or(0.0, |c| c.busy.level);
-    let lanes: [(Bar, Option<&TrendView>, aterm_vitals::ink::Rgb); 3] = [
+    let lanes: [(Bar, Option<&TrendView>, Rgb); 3] = [
         (
             Bar::Global,
             Some(&snap.global.cores),
@@ -186,7 +215,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         (Bar::Tab, tab.as_ref().map(|t| &t.scope.cores), inks.tab),
     ];
     for (i, (bar, trend, ink)) in lanes.iter().enumerate() {
-        if *bar == Bar::Tab && !show_tab {
+        if !shown[i] {
             continue;
         }
         let (ly, lh) = rows[i];
@@ -204,7 +233,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             *bar,
         ));
     }
-    let bh = (5.0 * s).round().min(band_h);
+    let bh = (5.0 * s).round().min(band_h - rows[0].0);
     p.bracket(x + cpu_w + 1.0, rows[0].0, bh, pinned);
     x += cpu_w + bracket_room + gap;
 
@@ -218,7 +247,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                 m,
                 snap,
                 tab.as_ref(),
-                show_tab,
+                shown,
                 &mut hits,
             );
             x += mem_w + gap;
@@ -239,7 +268,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     }
 
     if let Some(v) = snap.volume.as_ref() {
-        let low = v.total > 0 && (v.free as f64) < v.total as f64 * 0.1;
+        let wedge = disk_wedge(snap, &inks);
         if fold.disk && disk_w > 0.0 {
             let (ly, lh) = rows[0];
             let used = v.used();
@@ -259,16 +288,35 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                 slot,
                 true,
             );
-            if low {
-                filling_mark(&mut p, x + disk_w + 1.0, ly, lh, inks.warn);
+            if let Some(ink) = wedge {
+                filling_mark(&mut p, x + disk_w + 1.0, ly, lh, ink);
             }
             hits.push(Hit::row(
-                (x, 0.0, disk_w + p.px(4.0), band_h),
+                (x, 0.0, disk_w + p.px(4.0), lh + ly + 1.0),
                 Instrument::Disk,
                 Bar::Global,
             ));
-        } else if low && !fold.minimal {
-            filling_mark(&mut p, x, rows[0].0, rows[0].1, inks.warn);
+            let view = snap.resource(Resource::Disk, &input.tab_panes);
+            let tab_rate = (!input.tab_panes.is_empty())
+                .then_some(view.tab.now)
+                .flatten();
+            let scopes = [
+                (Bar::Aterm, view.aterm.now, inks.aterm, rows[1], shown[1]),
+                (Bar::Tab, tab_rate, inks.tab, rows[2], shown[2]),
+            ];
+            for (bar, rate, ink, (sy, sh), drawn) in scopes {
+                if !drawn {
+                    continue;
+                }
+                write_lane(&mut p, x, sy, disk_w, sh, rate, ink);
+                hits.push(Hit::row(
+                    (x, sy - 1.0, disk_w, sh + 2.0),
+                    Instrument::Disk,
+                    bar,
+                ));
+            }
+        } else if let Some(ink) = wedge.filter(|_| !fold.minimal) {
+            filling_mark(&mut p, x, rows[0].0, rows[0].1, ink);
             hits.push(Hit::row(
                 (x, 0.0, p.px(6.0), band_h),
                 Instrument::Disk,
@@ -279,6 +327,49 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     (p.prims, hits)
 }
 
+/// The ◢ the disk column ends in, and its ink, while the volume wants a look:
+/// the Disk row's state (the watch's level, sessions stuck on a full disk, a
+/// stalled watch, another volume low, filling within the hour), the judgement
+/// the Deck's Disk well marks, or time to full under a day (`facts.filling`).
+/// `None` on a calm volume, however full: a level alone is the lane's length.
+fn disk_wedge(snap: &Snapshot, inks: &aterm_vitals::ink::VitalsInks) -> Option<Rgb> {
+    match snap.resources[Resource::Disk.index()].state {
+        Some(State::Critical) => Some(inks.critical),
+        Some(_) => Some(inks.warn),
+        None => snap.facts.filling.map(|_| inks.warn),
+    }
+}
+
+/// Where the disk column's scope scale starts: 64 KiB/s, under which a
+/// scope's lane is its groove alone.
+const WRITE_FLOOR: f64 = 64.0 * 1024.0;
+/// Where it ends: 1 GiB/s fills the lane.
+const WRITE_CEIL: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// A write rate's length on the disk column's scope scale: log2 from
+/// [`WRITE_FLOOR`] to [`WRITE_CEIL`], in quarter octaves, so a steady rate
+/// keeps its pixel; `None` at or under the floor and for no reading.
+fn write_level(bytes_per_s: f64) -> Option<f32> {
+    if bytes_per_s.partial_cmp(&WRITE_FLOOR) != Some(std::cmp::Ordering::Greater) {
+        return None;
+    }
+    let octaves = ((bytes_per_s / WRITE_FLOOR).log2() * 4.0).round() / 4.0;
+    let span = (WRITE_CEIL / WRITE_FLOOR).log2();
+    Some((octaves / span).clamp(0.0, 1.0) as f32)
+}
+
+/// A scope's disk lane: its write rate, striped because it is a rate and not
+/// an amount, so it never nests under the volume's lane; the groove alone at
+/// or under 64 KiB/s.
+fn write_lane(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32, rate: Option<f64>, ink: Rgb) {
+    groove(p, x, y, w, h);
+    let Some(level) = rate.and_then(write_level) else {
+        return;
+    };
+    let len = (level * w).round().max(p.s.round().max(1.0));
+    p.dotted(x, y, x + len, y, h, rgba(ink, 0xFF));
+}
+
 fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
     let gh = (h / 2.0).round().max(1.0);
     let gy = y + ((h - gh) / 2.0).round();
@@ -287,7 +378,7 @@ fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
         .push(panel(x, gy, w, gh, (gh / 2.0).floor(), a(track, 0.7)));
 }
 
-fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::ink::Rgb) {
+fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: Rgb) {
     let side = (h + 2.0).round();
     let c = rgba(ink, 0xFF);
     for i in 0..side as usize {
@@ -297,10 +388,7 @@ fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::
     }
 }
 
-const fn pressure_ink(
-    inks: &aterm_vitals::ink::VitalsInks,
-    m: &MemView,
-) -> Option<aterm_vitals::ink::Rgb> {
+const fn pressure_ink(inks: &aterm_vitals::ink::VitalsInks, m: &MemView) -> Option<Rgb> {
     match m.sample.pressure {
         aterm_vitals::Pressure::Warn => Some(inks.warn),
         aterm_vitals::Pressure::Critical => Some(inks.critical),
@@ -308,7 +396,7 @@ const fn pressure_ink(
     }
 }
 
-/// The memory column's lanes.
+/// The memory column's lanes; `shown` is which lanes the card holds (Global, aterm, Tab).
 #[allow(clippy::too_many_arguments)]
 fn memory_lanes(
     p: &mut Painter<'_>,
@@ -318,7 +406,7 @@ fn memory_lanes(
     m: &MemView,
     snap: &Snapshot,
     tab: Option<&aterm_vitals::model::TabView>,
-    show_tab: bool,
+    shown: [bool; 3],
     hits: &mut Vec<Hit>,
 ) {
     let inks = *p.inks;
@@ -366,9 +454,11 @@ fn memory_lanes(
         ));
     }
     if m.sample.swap_used > 0 {
+        // Swap: a dashed capsule past the column's end, 1 pt after it and
+        // ending 1 pt before the next column, so it stays in the gap.
         let sw = (m.sample.swap_used as f32 / total * w)
             .round()
-            .clamp(p.px(2.0), p.px(12.0));
+            .clamp(p.px(2.0), p.px(COL_GAP_PT - 2.0));
         let sx = x + w + p.px(1.0);
         p.dotted(
             sx,
@@ -389,8 +479,8 @@ fn memory_lanes(
         (Bar::Aterm, snap.aterm.as_ref(), inks.aterm, rows[1]),
         (Bar::Tab, tab.map(|t| &t.scope), inks.tab, rows[2]),
     ];
-    for (bar, scope, ink, (sy, sh)) in scopes {
-        if bar == Bar::Tab && !show_tab {
+    for ((bar, scope, ink, (sy, sh)), &drawn) in scopes.into_iter().zip(&shown[1..]) {
+        if !drawn {
             continue;
         }
         match scope.and_then(|sc| sc.footprint.map(|f| (sc, f))) {
@@ -424,11 +514,13 @@ fn core_row(
 ) -> f32 {
     let s = p.s;
     let n = cpu.total();
+    // 16 px squares at 2×, 7 px at 1×; never taller than the lanes' band,
+    // which ends at the card's foot (6 px squares on a 6 px card at 1×).
+    let top = s.round().max(1.0) - (s / 2.0).round().min(1.0);
     let big = if s >= 1.5 { (8.0 * s).round() } else { 7.0 };
-    let big = big.min((band_h - s.round().max(1.0)).max(4.0));
+    let big = big.min((band_h - top).max(4.0));
     let gutter = (1.5 * s).round().max(1.0);
     let cluster_gap = (4.0 * s).round();
-    let top = s.round().max(1.0) - (s / 2.0).round().min(1.0);
     let per_cluster = !fold.per_core || n > 96;
     let two_rows = !per_cluster && n > 24;
     let tile = if two_rows {
@@ -498,243 +590,5 @@ fn core_row(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stats_deck::tests::{input, snapshot};
-
-    const GEOM: DeckGeom = DeckGeom {
-        w: 2238.0,
-        h: 24.0,
-        pad: 24.0,
-        scale: 2.0,
-        font_px: 26.0,
-    };
-
-    #[test]
-    fn the_sill_is_the_bottom_pad_and_needs_eight_points_of_it() {
-        assert_eq!(sill_px(24, 2.0), 24);
-        assert_eq!(sill_px(12, 1.0), 12);
-        assert_eq!(sill_px(15, 2.0), 0, "7.5 pt of pad hides the sill");
-        assert_eq!(sill_px(16, 2.0), 16);
-    }
-
-    #[test]
-    fn a_translucent_floor_puts_a_plate_behind_each_instrument_only() {
-        let snap = snapshot();
-        let mut i = input(&snap);
-        let plate = rgba(i.inks.ground, 235);
-        let is_plate = |p: &DrawPrim| matches!(p, DrawPrim::Panel { fill, .. } if *fill == plate);
-        let (bare, hits) = sill_paint(&GEOM, &i);
-        assert!(!hits.is_empty());
-        assert_eq!(bare.iter().filter(|p| is_plate(p)).count(), 0);
-        i.plate = Some(235);
-        let (plated, plated_hits) = sill_paint(&GEOM, &i);
-        assert_eq!(plated_hits, hits, "a plate moves no instrument");
-        assert_eq!(plated.len(), bare.len() + hits.len());
-        assert!(
-            plated[..hits.len()].iter().all(is_plate),
-            "the plates are under the instruments"
-        );
-        assert_eq!(format!("{:?}", &plated[hits.len()..]), format!("{bare:?}"));
-    }
-
-    #[test]
-    fn the_sill_stays_in_the_pad_and_leaves_the_drop_border() {
-        let snap = snapshot();
-        let mut i = input(&snap);
-        i.tab_count = 2;
-        let (prims, _) = sill_paint(&GEOM, &i);
-        assert!(!prims.is_empty());
-        let mut clip_depth = 0;
-        for p in &prims {
-            match p {
-                DrawPrim::ClipPush { y, h, .. } => {
-                    clip_depth += 1;
-                    assert!(*y >= -1.0 && *y + *h <= 19.0, "{p:?}");
-                }
-                DrawPrim::ClipPop => clip_depth -= 1,
-                DrawPrim::Panel { y, h, .. } | DrawPrim::Stroke { y, h, .. } if clip_depth == 0 => {
-                    assert!(*y >= -1.0 && *y + *h <= 19.0, "{p:?}");
-                }
-                DrawPrim::Text { .. } => panic!("the sill draws no words but the well's counts"),
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
-    fn the_lanes_sit_at_two_eight_and_fourteen_at_2x() {
-        assert_eq!(lane_rows(2.0), [(2.0, 4.0), (8.0, 4.0), (14.0, 4.0)]);
-        assert_eq!(lane_rows(1.0), [(1.0, 2.0), (4.0, 2.0), (7.0, 2.0)]);
-    }
-
-    #[test]
-    fn the_tab_lane_lights_at_two_tabs_and_moves_nothing_else() {
-        let snap = snapshot();
-        let one = input(&snap);
-        let mut two = input(&snap);
-        two.tab_count = 2;
-        let (_, h1) = sill_paint(&GEOM, &one);
-        let (_, h2) = sill_paint(&GEOM, &two);
-        assert!(!h1.iter().any(|h| h.bar() == Bar::Tab));
-        assert!(h2.iter().any(|h| h.bar() == Bar::Tab));
-        for h in &h1 {
-            assert!(h2.contains(h), "{h:?} moved");
-        }
-    }
-
-    /// A split front tab's CPU lane is the whole tab's: as long as all tabs' (aterm itself idles,
-    /// so both are claude's 1 core and cargo's 2), where the focused pane alone falls short.
-    #[test]
-    fn a_split_tabs_lane_is_the_whole_tab() {
-        let snap = crate::stats_deck::tests::split_tab(7, 8);
-        let fill = |panes: Vec<u64>, ink: fn(&DeckInput<'_>) -> aterm_vitals::ink::Rgb| {
-            let i = DeckInput {
-                tab_panes: panes,
-                tab_count: 2,
-                ..input(&snap)
-            };
-            let want = rgba(ink(&i), 0xFF);
-            let (prims, _) = sill_paint(&GEOM, &i);
-            prims
-                .windows(2)
-                .find_map(|w| match w {
-                    [DrawPrim::ClipPush { w, .. }, DrawPrim::Panel { fill, .. }]
-                        if *fill == want =>
-                    {
-                        Some(*w)
-                    }
-                    _ => None,
-                })
-                .expect("the lane's fill")
-        };
-        let tab = |i: &DeckInput<'_>| i.inks.tab;
-        let all = fill(vec![8, 7], |i| i.inks.aterm);
-        assert!(all > 1.0, "{all}");
-        assert_eq!(fill(vec![8, 7], tab), all);
-        assert_eq!(fill(vec![7, 8], tab), all);
-        let focused = fill(vec![8], tab);
-        assert!(focused < all, "CONTROL: {focused} vs {all}");
-    }
-
-    #[test]
-    fn the_width_law_folds_disk_then_memory_then_cores() {
-        assert_eq!(
-            Fold::of(1095.0),
-            Fold {
-                disk: true,
-                memory: true,
-                per_core: true,
-                minimal: false
-            }
-        );
-        assert!(!Fold::of(700.0).disk && Fold::of(700.0).memory);
-        assert!(!Fold::of(500.0).memory && Fold::of(500.0).per_core);
-        assert!(!Fold::of(300.0).per_core && !Fold::of(300.0).minimal);
-        assert!(Fold::of(200.0).minimal);
-        let snap = snapshot();
-        let i = input(&snap);
-        let instruments = |w_pt: f32| {
-            let g = DeckGeom {
-                w: w_pt * 2.0 + 48.0,
-                ..GEOM
-            };
-            let (_, hits) = sill_paint(&g, &i);
-            hits.iter().map(|h| h.instrument()).collect::<Vec<_>>()
-        };
-        let wide = instruments(1095.0);
-        assert!(wide.contains(&Instrument::Disk) && wide.contains(&Instrument::Memory));
-        let mid = instruments(700.0);
-        assert!(!mid.contains(&Instrument::Disk) && mid.contains(&Instrument::Memory));
-        let narrow = instruments(500.0);
-        assert!(!narrow.contains(&Instrument::Memory) && narrow.contains(&Instrument::Cpu));
-    }
-
-    #[test]
-    fn the_core_row_draws_one_square_a_core() {
-        let snap = snapshot();
-        let (prims, _) = sill_paint(&GEOM, &input(&snap));
-        let squares = prims
-            .iter()
-            .filter(|p| matches!(p, DrawPrim::Panel { w, h, radius, .. } if *w == 16.0 && *h == 16.0 && *radius >= 2.0))
-            .count();
-        assert!(squares >= 10, "{squares}");
-    }
-
-    #[test]
-    fn a_pinned_machine_fills_the_end_bracket() {
-        let mut snap = snapshot();
-        if let Some(cpu) = snap.cpu.as_mut() {
-            cpu.busy = TrendView::flat(10.0);
-        }
-        let i = input(&snap);
-        let hot = rgba(i.inks.load[4], 0xFF);
-        let (prims, _) = sill_paint(&GEOM, &i);
-        assert!(
-            prims.iter().any(
-                |p| matches!(p, DrawPrim::Panel { fill, h, .. } if *fill == hot && *h == 10.0)
-            )
-        );
-    }
-
-    /// The sill's core tiles keep the load ramp of the original scheme (979d8c3559) at every
-    /// load, a hot one too, and draw no glow (the owner, 2026-10-26: "go back to the orignal
-    /// color scheme"); orange stays on the dial. CONTROL: no tile takes a warm stop.
-    #[test]
-    fn hot_cores_draw_the_sills_load_ramp_and_no_glow() {
-        let mut snap = snapshot();
-        if let Some(cpu) = snap.cpu.as_mut() {
-            for core in &mut cpu.cores {
-                core.load = TrendView::flat(0.95);
-            }
-        }
-        let i = input(&snap);
-        let hot = rgba(i.inks.load_at(0.95), 0xFF);
-        let (prims, _) = sill_paint(&GEOM, &i);
-        let fills: Vec<[u8; 4]> = prims
-            .iter()
-            .filter_map(|p| match *p {
-                DrawPrim::Panel { fill, .. } => Some(fill),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            fills.contains(&hot),
-            "a hot core's tile draws load_at(0.95)"
-        );
-        for warm in &i.inks.thermal[2..] {
-            assert!(
-                !fills.contains(&rgba(*warm, 0xFF)),
-                "CONTROL: no tile draws the dial's warm stop {warm:?}"
-            );
-        }
-        // No glow: a hot sill strokes what a cold one does, every stroke inside the sill's pad.
-        let mut cold = snapshot();
-        if let Some(cpu) = cold.cpu.as_mut() {
-            for core in &mut cpu.cores {
-                core.load = TrendView::flat(0.05);
-            }
-        }
-        let (cold_prims, _) = sill_paint(&GEOM, &input(&cold));
-        let strokes = |prims: &[DrawPrim]| -> Vec<(f32, f32, f32, f32)> {
-            prims
-                .iter()
-                .filter_map(|p| match *p {
-                    DrawPrim::Stroke { x, y, w, h, .. } => Some((x, y, w, h)),
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(
-            strokes(&prims),
-            strokes(&cold_prims),
-            "a hot core strokes no glow"
-        );
-        for (_, y, _, h) in strokes(&prims) {
-            assert!(
-                y >= -1.0 && y + h <= 19.0,
-                "a stroke at {y}+{h} past the sill's pad"
-            );
-        }
-    }
-}
+#[path = "stats_sill_tests.rs"]
+mod tests;

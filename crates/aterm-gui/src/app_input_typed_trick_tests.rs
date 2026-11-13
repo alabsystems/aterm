@@ -47,7 +47,7 @@ fn pet_app() -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.windows.get_mut(&wid).expect("window").focused = true;
     app.recompute_sparkle();
@@ -611,9 +611,10 @@ fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
 #[test]
 fn with_no_pet_on_glass_a_typed_command_only_flashes() {
     let t0 = Instant::now();
-    for style in ["rainbow kitty flying", "off"] {
+    for style in ["rainbow", "off"] {
         let (mut app, wid, _) = pet_app();
         app.config.cursor_trail_style = Some(style.into());
+        app.config.cursor_pet = Some("off".into());
         assert!(!app.trail_is_kitty_pet(), "{style}: fixture — no pet");
         type_word(&mut app, wid, "sit ");
         assert_eq!(pending(&app, wid), None, "{style}: no pet, no latch");
@@ -1023,7 +1024,7 @@ fn a_no_echo_prompt_poisons_the_line_and_its_enter_resets_it() {
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.recompute_sparkle();
     type_word(&mut app, wid, "sleep ");
     assert_eq!(pending(&app, wid), None, "a secret never moves the cat");

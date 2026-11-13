@@ -28,6 +28,8 @@ use crate::common;
 mod abrupt_stop_tests;
 mod commit_ancestry_tests;
 mod inventory_retry_tests;
+mod partial_have_tests;
+mod raw_blob_tests;
 
 /// Exercise the real CLI entry and its signal-to-collector handoff. The fake Git waits for
 /// a release file, so even the old orphaning CLI can be cleaned without signalling a guessed
@@ -2278,13 +2280,16 @@ fn the_helper_command_is_quoted() {
         exe: PathBuf::from("/a b/agh"),
         args: Vec::new(),
     };
-    assert_eq!(plain.config_value(), "!\"/a b/agh\" auth git-credential");
+    assert_eq!(
+        plain.config_value().unwrap(),
+        "!\"/a b/agh\" auth git-credential"
+    );
     let aterm = HelperCommand {
         exe: PathBuf::from("/x/aterm"),
         args: vec!["agh".to_string()],
     };
     assert_eq!(
-        aterm.config_value(),
+        aterm.config_value().unwrap(),
         "!\"/x/aterm\" \"agh\" auth git-credential"
     );
     let dollar = HelperCommand {
@@ -2292,7 +2297,7 @@ fn the_helper_command_is_quoted() {
         args: Vec::new(),
     };
     assert_eq!(
-        dollar.config_value(),
+        dollar.config_value().unwrap(),
         "!\"/x/\\$y/agh\" auth git-credential"
     );
     let quotes = HelperCommand {
@@ -2300,9 +2305,21 @@ fn the_helper_command_is_quoted() {
         args: Vec::new(),
     };
     assert_eq!(
-        quotes.config_value(),
+        quotes.config_value().unwrap(),
         "!\"/x/\\\"\\`\\\\/agh\" auth git-credential"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unrepresentable_helper_path_refuses_instead_of_selecting_its_lossy_neighbour() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let exe = PathBuf::from(std::ffi::OsString::from_vec(b"/owned/helper-\xff".to_vec()));
+    let helper = HelperCommand {
+        exe,
+        args: Vec::new(),
+    };
+    assert!(helper.config_value().is_err());
 }
 
 #[test]
@@ -2564,7 +2581,13 @@ fn a_fetch_refuses_a_rewriting_config() {
         .expect_err("a config too long to screen is refused")
         .into_data();
     assert_eq!(err.kind, Kind::Refused, "{}", err.why);
-    assert!(err.why.contains("too long"), "{}", err.why);
+    assert!(
+        err.why
+            .starts_with(&format!("source common config {}: ", config.display()))
+            && err.why.contains("longer"),
+        "{}",
+        err.why
+    );
     assert_eq!(refs(), before, "the padded config moved the clone's refs");
     std::fs::write(&config, kept).expect("the clone's config, restored");
     host_git(&clone, &["config", "--local", "submodule.recurse", "true"]);
@@ -2882,6 +2905,75 @@ fn worktree_config_screen_does_not_follow_common_includes_or_inactive_worktree_f
     gh.run_git(&GitRun::check_local(&slug, &main)).unwrap();
     gh.run_git(&GitRun::fetch(&slug, &main)).unwrap();
     assert_eq!(host_git(&main, &["for-each-ref"]), before);
+}
+
+/// Git under umask 002 leaves a checkout's directories 0775 and its files 0664. agh still
+/// refuses them, and each refusal names the path, its mode and the cause, with the chmod that
+/// lifts it as the next action, never the policy check's; once each is run the run is admitted.
+#[test]
+fn a_group_writable_source_is_refused_with_the_chmod_that_lifts_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = World::canonical("git-group-writable-source");
+    let (gh, _bare, main, linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    let chmod = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap();
+    let (git, linked) = (real(&main.join(".git")), real(&linked));
+    let admin = git.join("worktrees/linked");
+    // Each directory a read judges, and the file it reads there, in the order of the reads.
+    let reads = [
+        ("gitfile", linked.clone(), ".git"),
+        ("commondir", admin.clone(), "commondir"),
+        ("common config", git.clone(), "config"),
+    ];
+    for (_, dir, name) in &reads {
+        chmod(dir, 0o775);
+        chmod(&dir.join(name), 0o664);
+    }
+    let refused = |what: &str| {
+        let err = gh
+            .run_git(&GitRun::check_local(&slug, &linked))
+            .expect_err("a group-writable source is refused")
+            .into_data();
+        assert_eq!(err.kind, Kind::Refused, "{what}: {}", err.why);
+        assert_eq!(err.repo.as_deref(), Some("fixture-dev/app"), "{what}");
+        (err.why, err.next)
+    };
+    for (what, dir, name) in &reads {
+        let file = dir.join(name);
+        let (d, f) = (dir.display(), file.display());
+        let (why, next) = refused(what);
+        assert!(
+            why.starts_with(&format!(
+                "source {what} {f}: its directory {d} is group-writable (mode 0775);"
+            )),
+            "{why}"
+        );
+        assert_eq!(
+            next,
+            format!("chmod go-w {d} {f} (inverse: chmod g+w {d} && chmod g+w {f})")
+        );
+        chmod(dir, 0o755);
+        chmod(&file, 0o644);
+    }
+    gh.run_git(&GitRun::check_local(&slug, &linked))
+        .unwrap_or_else(|e| panic!("the source once each chmod ran: {}", e.why));
+    let worktree = admin.join("config.worktree");
+    chmod(&worktree, 0o664);
+    let w = worktree.display();
+    let (why, next) = refused("worktree config");
+    assert!(
+        why.starts_with(&format!(
+            "source worktree config {w} is group-writable (mode 0664);"
+        )),
+        "{why}"
+    );
+    assert_eq!(next, format!("chmod go-w {w} (inverse: chmod g+w {w})"));
+    chmod(&worktree, 0o644);
+    gh.run_git(&GitRun::check_local(&slug, &linked))
+        .unwrap_or_else(|e| panic!("the source once its worktree config is right: {}", e.why));
 }
 
 #[test]
@@ -3362,8 +3454,8 @@ fn batch_fetch_checks_raw_tag_identities_in_one_transfer_and_preserves_the_check
         .collect::<Vec<_>>();
     assert_eq!(
         fetches.len(),
-        2,
-        "one network fetch and one local object import"
+        1,
+        "one network fetch; verified private packs handle local object intake"
     );
     assert!(
         fetches
@@ -3507,7 +3599,7 @@ fn a_cold_catalog_batch_larger_than_argv_transfers_all_1490_refs_once() {
             .iter()
             .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
             .count(),
-        2
+        1
     );
 }
 

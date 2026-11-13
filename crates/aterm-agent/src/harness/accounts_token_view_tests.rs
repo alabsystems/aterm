@@ -319,6 +319,7 @@ fn the_report_carries_the_fields() {
 
 fn peer(label: &str, answer: Result<Vec<String>, String>) -> aterm_ctl::PeerSurvey {
     aterm_ctl::PeerSurvey {
+        authenticated: None,
         label: label.to_owned(),
         answer,
         fault: aterm_ctl::PeerFault::Other,

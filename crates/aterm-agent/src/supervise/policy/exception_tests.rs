@@ -26,6 +26,7 @@ fn cfg() -> SupervisorConfig {
 
 fn walled(kind: WallKind, message: &str) -> TurnEndReading {
     TurnEndReading {
+        launch_model: crate::supervise::policy::turn_end::LaunchModel::Unread,
         phase: Phase::Idle,
         authoritative: true,
         survey: false,

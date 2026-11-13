@@ -955,6 +955,112 @@ fn read_batches_refuse_membership_or_custody_changes_before_returning() {
     }
 }
 
+/// A store read batch closes through a look at the vault of its own, made after its read
+/// (`Session::close_read`), never through the look its session keeps, whose first look at each
+/// file came before the read: in a log-backed session that keeps a look, with every vault file
+/// judged settled (`client::test_as_if_later`, within which the digests kept are this thread's
+/// own, so no other test's asks let one go) so that the kept look's digests stand, a batch whose
+/// read rewrites the network pin or the device's age identity (its custody's pinned files) with
+/// different bytes and a new inode, or writes the fold mark (whose arrival its currency judges:
+/// `commons::fold::on` reads no byte of it), is refused before it returns, one batch a file.
+/// CONTROLS: a batch that changes nothing returns; the read takes no key, so no key is checked
+/// again (`KEYS_REVALIDATED`); custody, and currency, through the kept look after the change still
+/// pass; and the fold mark's arrival leaves the access not current under a fresh look.
+/// NEGATIVE CONTROL: `close_read` judging through the session's kept look returns each batch's
+/// data (`each batch is refused before it returns: [("default.pin", None), ("device.age", None),
+/// ("fold", None)]`).
+#[test]
+fn a_read_batch_closes_through_a_look_made_after_its_read() {
+    const FILES: [&str; 3] = ["default.pin", "device.age", "fold"];
+    let mut refusals = Vec::new();
+    client::test_as_if_later(Duration::from_secs(3600), || {
+        for file in FILES {
+            let lab = Lab::with_foundation(&[Role::Writer]);
+            let paths = &lab.paths[0];
+            client::seed_vault_genesis(paths, &lab._home.path().join("genesis.v2")).unwrap();
+            let commons = paths.dir.join("commons");
+            let path = commons.join(file);
+            assert_eq!(
+                path.is_file(),
+                file != "fold",
+                "CONTROL: {file} is there, and the fold mark is not yet"
+            );
+            let bootstrap = lab.bootstrap(0);
+            let mut session = Session::observe(&bootstrap).unwrap();
+            assert!(session.is_log_backed(), "CONTROL: the seeded log backs it");
+            session
+                .keep_look(client::VaultLook::new(bootstrap.paths()))
+                .unwrap();
+            // As a table-repair admission does, the kept look judges the session's currency
+            // before any batch runs.
+            assert!(
+                session.access.is_current_in(
+                    &session.journal,
+                    session.look().expect("the session keeps its look")
+                ),
+                "CONTROL: {file}: current through the kept look, as an admission judges it"
+            );
+            let scope = Scope::fresh(session.journal.trust()).unwrap();
+            session
+                .with_read_batch(scope, |_| Ok(()))
+                .unwrap_or_else(|error| {
+                    panic!("CONTROL: {file}: an unchanged batch returns: {error}")
+                });
+            let keys = KEYS_REVALIDATED.get();
+            let refused = session.with_read_batch(scope, |_| {
+                use std::os::unix::fs::MetadataExt as _;
+                let inode = std::fs::symlink_metadata(&path).ok().map(|meta| meta.ino());
+                if file == "fold" {
+                    turn_fold_on(paths);
+                } else {
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes.push(b'\n');
+                    aterm_uds::private_file::write_private(&commons, file, &bytes).unwrap();
+                }
+                assert_ne!(
+                    std::fs::symlink_metadata(&path).ok().map(|meta| meta.ino()),
+                    inode,
+                    "CONTROL: {file} has a new inode"
+                );
+                let kept = session.look().expect("the session keeps its look");
+                assert!(
+                    bootstrap.revalidate_custody_in(kept).is_ok(),
+                    "CONTROL: {file}: custody through the kept look still passes"
+                );
+                assert!(
+                    session.access.is_current_in(&session.journal, kept),
+                    "CONTROL: {file}: currency through the kept look still passes"
+                );
+                if file == "fold" {
+                    assert!(
+                        !session
+                            .access
+                            .is_current_in(&session.journal, &client::VaultLook::new(paths)),
+                        "CONTROL: the fold mark's arrival leaves the access not current under \
+                         a fresh look"
+                    );
+                }
+                Ok(())
+            });
+            assert_eq!(
+                KEYS_REVALIDATED.get(),
+                keys,
+                "CONTROL: {file}: the read takes no key"
+            );
+            refusals.push((file, refused.err().map(|error| error.to_string())));
+        }
+    });
+    assert_eq!(
+        refusals
+            .iter()
+            .filter(|(_, refused)| refused.is_some())
+            .map(|(file, _)| *file)
+            .collect::<Vec<_>>(),
+        FILES,
+        "each batch is refused before it returns: {refusals:?}"
+    );
+}
+
 /// A vault writer that holds the state lock while a session judges a table's context (each store
 /// open asks it, outside a read batch's source reads) makes the context busy, which a read
 /// observes again (`att::reopened`), not "stale membership", which nothing retries: the access is
@@ -1764,21 +1870,30 @@ fn table_repair_refuses_a_peer_until_its_roster_is_read_then_keeps_the_last() {
     );
 }
 
-/// A writer session keeps no look ([`Session::keep_look`]): each check a write makes observes the
-/// vault on its own call, so a write is judged by the vault as it stands, never by the moment its
-/// admission looked. CONTROL: an observed session keeps the look it is given.
-/// NEGATIVE CONTROL (2026-11-10): a `keep_look` that keeps any session's look lets the writer
-/// keep it (`a writer session keeps no look`).
+/// A writer session keeps no look ([`Session::keep_look`]) and is lent none
+/// ([`Session::lend_look`]): each check a write makes observes the vault on its own call, so a
+/// write is judged by the vault as it stands, never by the moment its admission, or a round
+/// group's earlier admission, looked. CONTROL: an observed session keeps the look it is given, and
+/// judges through one it is lent.
+/// NEGATIVE CONTROLS: (2026-11-10) a `keep_look` that keeps any session's look lets the writer
+/// keep it (`a writer session keeps no look`); (2026-11-12) a `lend_look` that asks no
+/// `Session::reader` lends the writer one (`a writer session is lent no look`).
 #[test]
 fn a_writer_session_keeps_no_look() {
     let lab = Lab::new(&[Role::Writer]);
     let bootstrap = lab.bootstrap(0);
     let mut writer = Session::open(&bootstrap).unwrap();
     assert!(writer.journal.is_writer(), "the fixture's writer session");
+    let lent = client::VaultLook::new(bootstrap.paths());
     let refused = writer.keep_look(client::VaultLook::new(bootstrap.paths()));
     assert!(
-        refused.is_err() && writer.look.is_none(),
+        refused.is_err() && writer.look().is_none(),
         "a writer session keeps no look: {refused:?}"
+    );
+    let refused = writer.lend_look(&lent);
+    assert!(
+        refused.is_err() && writer.look().is_none(),
+        "a writer session is lent no look: {refused:?}"
     );
     drop(writer);
     let mut reader = Session::observe(&bootstrap).unwrap();
@@ -1786,7 +1901,14 @@ fn a_writer_session_keeps_no_look() {
         .keep_look(client::VaultLook::new(bootstrap.paths()))
         .unwrap();
     assert!(
-        reader.look.is_some(),
+        reader.look().is_some(),
         "CONTROL: an observed session keeps its look"
+    );
+    drop(reader);
+    let mut reader = Session::observe(&bootstrap).unwrap();
+    reader.lend_look(&lent).unwrap();
+    assert!(
+        reader.look().is_some_and(|look| std::ptr::eq(look, &lent)),
+        "CONTROL: an observed session judges through the look it is lent"
     );
 }

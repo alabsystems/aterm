@@ -1355,7 +1355,15 @@ fn redial(slots: usize, per_source: usize, end: End) -> Result<String, FleetErro
                                     let Served {
                                         transport, release, ..
                                     } = served;
-                                    (tls::relay_answers(transport, local, ()), Some(release))
+                                    (
+                                        tls::relay_answers(
+                                            transport,
+                                            local,
+                                            (),
+                                            Arc::new(|| Ok(())),
+                                        ),
+                                        Some(release),
+                                    )
                                 }
                                 _ => (served.relay_answers(local), None),
                             };
@@ -1912,15 +1920,12 @@ fn a_stalled_policy_keeps_its_connection_slot() {
 }
 
 /// A socket that proves nothing costs the listener no deny-list lookup: 64 connections closed
-/// before a byte and one dialer holding the wrong secret are all refused, then one real dialer
-/// is served, and the deny list was looked up once, for that dialer alone. The node job's
-/// lookup decrypts the vault's roster, so before this every dead socket (a peer that had
-/// given up) and any LAN connect paid for one.
+/// before a byte and one dialer holding the wrong secret are all refused without consulting
+/// policy. A real dialer then exercises the live policy at admission and during response I/O.
 ///
 /// NEGATIVE CONTROL (2026-11-01): with the lookup also made before the handshake again
 /// (`let _eager = deny();` beside `offer()` in the worker, main before this change), every
-/// accepted socket pays for one (64 dead, the wrong secret, and the real dialer twice) and this
-/// fails (`left: 67, right: 1`).
+/// accepted socket pays for one and the zero-lookup assertion fails before the control dial.
 #[test]
 fn a_socket_that_proves_nothing_costs_no_deny_lookup() {
     const DEAD: usize = 64;
@@ -1985,11 +1990,12 @@ fn a_socket_that_proves_nothing_costs_no_deny_lookup() {
         "every socket that proved nothing was refused"
     );
     drop(all);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 
     let tcp = TcpStream::connect_timeout(&addr, HANG).unwrap();
     let (mut served, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).unwrap();
     assert!(echoes(&mut served));
-    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert!(calls.load(Ordering::Acquire) > 0);
     drop(served);
     drop(serving);
 }

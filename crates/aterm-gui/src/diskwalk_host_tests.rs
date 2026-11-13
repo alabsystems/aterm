@@ -753,6 +753,56 @@ fn a_root_left_under_ten_minutes_ago_returns_without_a_walk() {
 }
 
 #[test]
+fn a_periodic_discovery_that_finds_nothing_new_stores_and_wakes_nothing() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let home = b.join("home");
+    let (w, x) = (home.join("w"), home.join("x"));
+    mkdir(&w.join(".git"));
+    mkdir(&x.join(".git"));
+    write(&w.join("f"), 9_000);
+    let mut r = Rig::new(&home);
+    r.facts(&[(1, 1, &w)], &[], &[]);
+    let tab = DiskScope::Tab(tab_id(1));
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    let round = |r: &mut Rig, s: u64| {
+        r.demand(tab, Pace::Glance, at(s));
+        r.engine.discover_if_due(at(s));
+        r.engine.publish_if_dirty();
+        r.engine.out.take()
+    };
+    assert!(round(&mut r, 0).is_some(), "the first discovery publishes");
+    r.settle(at(0));
+    r.engine.publish_if_dirty();
+    let walked = r.engine.out.take().expect("the walk publishes");
+    assert!(walked.records.contains_key(&w));
+    for s in [5, 10, 15] {
+        assert!(
+            round(&mut r, s).is_none(),
+            "a discovery {s} s on that finds the same panes stores nothing"
+        );
+    }
+    r.cd(1, &x);
+    let moved = round(&mut r, 20).expect("a cd the discovery sees publishes at once");
+    assert!(
+        moved
+            .panes
+            .get(&1)
+            .is_some_and(|v| v.project.as_ref() == Some(&x)),
+        "the pane's new project, joining: {:?}",
+        moved.panes.get(&1)
+    );
+    let joined = round(&mut r, 25).expect("its join publishes");
+    assert!(joined.members(tab).iter().any(|c| c.path == x), "joined");
+    assert_eq!(
+        *r.engine.last.as_deref().expect("stored"),
+        r.board(),
+        "what readers hold is the board now"
+    );
+}
+
+#[test]
 fn the_aterm_scope_is_every_open_tabs_folders_and_atermss_own_each_folder_once() {
     let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
     let b = base(&tmp);
@@ -2664,4 +2714,41 @@ fn the_disk_roots_opt_in_reads_the_home_and_drops_a_relative_folder() {
     );
     let none: crate::app_config::Config = aterm_toml::from_str("").expect("valid toml");
     assert!(none.sys_disk_roots(Some(home)).is_empty());
+}
+
+#[test]
+fn a_change_heard_between_reads_owes_the_walker_a_read_and_rest_owes_none() {
+    let t0 = Instant::now();
+    let mut host = DiskwalkHost::default();
+    assert!(host.facts_now(t0, false, true), "the first service reads");
+    assert_eq!(
+        host.facts_deadline(true),
+        None,
+        "at rest a read owes no wake"
+    );
+    let soon = t0 + Duration::from_millis(200);
+    assert!(
+        !host.facts_now(soon, false, true),
+        "a read 200 ms on is not due"
+    );
+    host.note_activity();
+    assert_eq!(
+        host.facts_deadline(true),
+        Some(t0 + FACTS_EVERY),
+        "an OSC 7 report heard between reads is read at the next read's time, not the next wake"
+    );
+    assert_eq!(
+        host.facts_deadline(false),
+        None,
+        "nothing demanded: no deadline"
+    );
+    assert!(
+        host.facts_now(t0 + FACTS_EVERY, false, true),
+        "the deadline's wake reads"
+    );
+    assert_eq!(
+        host.facts_deadline(true),
+        None,
+        "the read paid what was owed"
+    );
 }

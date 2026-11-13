@@ -84,6 +84,8 @@ astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 aterm-objc.workspace = true
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
+aterm-heap-count = { path = "../aterm-heap-count" }
 # The differential oracle for x25519.rs: ring's own X25519 (ephemeral keys from its
 # RNG) must agree with the first-party ladder in both directions.
 ring = { workspace = true, features = ["default"] }

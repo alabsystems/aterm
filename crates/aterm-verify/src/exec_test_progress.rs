@@ -131,11 +131,19 @@ pub(crate) enum Seen {
     /// progress information, never a failure or permission to stop the binary.
     RunningLong { case: String },
     /// With the failed cases before it, this one makes its binary a FAIL whatever comes after;
-    /// `marks`, its own block's.
-    Red { case: String, marks: Marks },
+    /// `marks`, its own block's; `execution`, this terminal event's libtest time when present.
+    Red {
+        case: String,
+        marks: Marks,
+        execution: Option<Duration>,
+    },
     /// Its block refused its machine or hit a full disk ([`Marks`]); its binary may yet be NOT
     /// RUN.
-    Spared { case: String, marks: Marks },
+    Spared {
+        case: String,
+        marks: Marks,
+        execution: Option<Duration>,
+    },
     /// Its block could not be read while the binary runs (a line over [`LINE_CAP`], one that does
     /// not parse, a human-format log); its binary's end decides it. `None` where the line was
     /// too long to name it.
@@ -290,11 +298,13 @@ impl LiveCases {
                 if !self.started.contains(&name) || !self.ended.insert(name.clone()) {
                     return None;
                 }
-                if ev.kind == Kind::Test
-                    && ev.event != "ignored"
-                    && let Some(seconds) = ev.exec_time
-                    && let Ok(execution) = Duration::try_from_secs_f64(seconds)
-                {
+                let execution = if ev.kind == Kind::Test && ev.event != "ignored" {
+                    ev.exec_time
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                } else {
+                    None
+                };
+                if let Some(execution) = execution {
                     self.observations.timings.push(Timing {
                         case: name.clone(),
                         execution,
@@ -324,9 +334,17 @@ impl LiveCases {
                 self.seen.push(marks);
                 if crate::libtest::decisive(&self.seen) {
                     self.red = true;
-                    Some(Seen::Red { case: name, marks })
+                    Some(Seen::Red {
+                        case: name,
+                        marks,
+                        execution,
+                    })
                 } else {
-                    Some(Seen::Spared { case: name, marks })
+                    Some(Seen::Spared {
+                        case: name,
+                        marks,
+                        execution,
+                    })
                 }
             }
             _ => None,

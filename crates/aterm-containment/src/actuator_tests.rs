@@ -693,7 +693,8 @@ fn select_scratch_home_parent(
 /// A scratch `$HOME` outside [`crate::sbpl::WRITABLE_ROOTS`] and
 /// [`crate::sbpl::USER_TEMP_PARENT`], under the test binary's target
 /// directory when outside temporary roots or `~/Library/Caches/aterm/sbpl-proof.noindex`
-/// when the checkout or target directory lives under `/tmp` or `$TMPDIR`.
+/// when the checkout or target directory lives under `/tmp` or `$TMPDIR`. If the runner
+/// also isolated `HOME` there, use the OS account's cache with the same canonical checks.
 #[cfg(target_os = "macos")]
 fn scratch_home_outside_writable_roots(tag: &str) -> ScratchHome {
     static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -706,8 +707,14 @@ fn scratch_home_outside_writable_roots(tag: &str) -> ScratchHome {
         .and_then(std::path::Path::parent)
         .unwrap_or_else(|| refuse(format!("{} has no profile directory", exe.display())));
     let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let dir =
-        select_scratch_home_parent(profile, real_home.as_deref()).unwrap_or_else(|why| refuse(why));
+    let dir = select_scratch_home_parent(profile, real_home.as_deref())
+        .or_else(|configured_error| {
+            let account_home = aterm_uds::account::home();
+            select_scratch_home_parent(profile, account_home.as_deref()).map_err(|account_error| {
+                format!("{configured_error}; OS account fallback: {account_error}")
+            })
+        })
+        .unwrap_or_else(|why| refuse(why));
     let seq = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let home = dir.join(format!(
         "aterm-sbpl-home-{tag}-{}-{seq}",
@@ -746,6 +753,7 @@ fn scratch_home_falls_back_from_writable_target_and_refuses_writable_home() {
         .map(std::path::PathBuf::from)
         .and_then(|h| std::fs::canonicalize(h).ok())
         .filter(|h| outside_writable_roots(h))
+        .or_else(|| aterm_uds::account::home().filter(|h| outside_writable_roots(h)))
     else {
         return;
     };

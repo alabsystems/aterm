@@ -163,8 +163,11 @@ fn shell_owner(
     HashMap::from([((1, "b1"), vec![(400, 4000)])])
 }
 
+/// The pass marks a shell wrapper with its detached descendant's work and leaves this reading's
+/// verdict alone: the wrapper's next step restarts its suspect run on the mark
+/// (`Evidence::tree_work`, S::a_working_detached_descendant_is_its_ancestors_progress_without_merging_jobs).
 #[test]
-fn shell_wrapper_exposes_detached_activity_without_erasing_its_local_stall() {
+fn shell_wrapper_is_marked_with_its_detached_descendants_activity() {
     for kind in [JobKind::Shell, JobKind::ShellBg] {
         for activity in [Class::BusySilent, Class::Running] {
             let (mut rows, mut sweep, mut facts) = fixture();

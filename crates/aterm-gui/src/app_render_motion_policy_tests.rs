@@ -213,7 +213,7 @@ fn trail_status_reads_the_focus_the_frame_path_used() {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     let wid = WindowId(0);
     assert_eq!(
         app.frontmost_window,
@@ -247,7 +247,7 @@ fn trail_status_intensity_folds_the_enable_gate() {
     use crate::WindowId;
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     let wid = WindowId(0);
     app.windows.get_mut(&wid).expect("window").focused = true;
 
@@ -276,7 +276,7 @@ fn video_recording_pins_motion_focus() {
     use crate::WindowId;
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     app.windows.get_mut(&wid).expect("window").focused = false;

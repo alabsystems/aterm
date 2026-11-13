@@ -19,8 +19,11 @@
 //! per session across key rotations), and the machine-number negotiation
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §6.6: who holds a number, the older builds' implied
 //! records and migration, a machine's primary, succession, stripped and opaque entries, and the
-//! automatic pick).
+//! automatic pick), and the fleet access lock
+//! (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §8 `FleetAccessLock`: a per-machine ceiling
+//! over the drive grants that fails closed and keeps the reads).
 
+mod models_access_lock;
 mod models_cached_log;
 mod models_cached_materialization;
 mod models_commons_log;
@@ -45,6 +48,7 @@ mod models_records_file;
 mod models_retained_frontier;
 mod models_role;
 
+pub use models_access_lock::fleet_access_lock_model;
 pub use models_cached_log::{
     cached_log_model, cached_publication_model, caller_custody_model, cold_read_model,
     configured_log_model,

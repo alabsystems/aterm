@@ -134,6 +134,7 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
             crate::status_item::MenuAt::parse("3.0").expect("a path")
         ))
     );
+    assert_eq!(armed("menubar click"), Ok(PersonAsked::Click));
     for junk in [
         "",
         "look",
@@ -522,5 +523,259 @@ fn status_says_a_carried_ends_cheer_is_spent() {
         field(&line, "end_cheered").as_deref(),
         Some("1"),
         "spent: {line}"
+    );
+}
+
+/// The `access=` and `shown=` words of the `statusitem` chrome line: the level in force and the
+/// level the lock shows.
+fn lock_words(app: &App) -> (Option<String>, Option<String>) {
+    let line = app.status_item_chrome_line();
+    (field(&line, "access"), field(&line, "shown"))
+}
+
+fn words(access: &str, shown: &str) -> (Option<String>, Option<String>) {
+    (Some(access.to_string()), Some(shown.to_string()))
+}
+
+/// The lock on a real App (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §6.3): a click's raise
+/// is stored only once its settle has passed, a lower level at once, and the chrome line says
+/// both levels throughout. The store is this test thread's (`control::store_fleet_access`).
+#[test]
+fn the_lock_stores_a_raise_after_its_settle_and_a_lower_level_at_once() {
+    use aterm_types::fleet_access::FleetAccess::{Full, ReadOnly, ReadWrite};
+    let settle = crate::status_item::SETTLE;
+    let (mut app, _sid, _host) = desk();
+    let stored = crate::control::fleet_access_now;
+    assert_eq!(stored(), ReadOnly, "PRECONDITION: the default");
+    assert_eq!(lock_words(&app), words("read", "read"));
+    let _ = app.take_status_rebuild();
+
+    let t0 = std::time::Instant::now();
+    app.rotate_fleet_access(t0, false);
+    assert_eq!(stored(), ReadOnly, "a raise is not stored by its click");
+    assert_eq!(lock_words(&app), words("read", "write"));
+    assert!(app.take_status_rebuild(), "the lock repaints");
+    app.tick_lock_face(t0 + settle / 2);
+    assert_eq!(stored(), ReadOnly, "nor before its settle");
+    assert!(!app.take_status_rebuild(), "nothing moved");
+    app.tick_lock_face(t0 + settle);
+    assert_eq!(stored(), ReadWrite);
+    assert_eq!(lock_words(&app), words("write", "write"));
+    assert!(app.take_status_rebuild());
+
+    // On over Full Access and round to Read Only inside one settle: Full Access is never stored.
+    let t1 = t0 + 10 * settle;
+    app.rotate_fleet_access(t1, false);
+    assert_eq!(lock_words(&app), words("write", "full"));
+    app.rotate_fleet_access(t1 + settle / 4, false);
+    assert_eq!(stored(), ReadOnly, "a lower level is stored at once");
+    assert_eq!(lock_words(&app), words("read", "read"));
+    app.tick_lock_face(t1 + 10 * settle);
+    assert_eq!(stored(), ReadOnly);
+
+    // A pick in the menu is stored at once, a raise included.
+    app.pick_fleet_access(Full);
+    assert_eq!(stored(), Full);
+    assert_eq!(lock_words(&app), words("full", "full"));
+}
+
+/// THE BUTTON'S OWN CLICKS, as AppKit counts them (`status_item::click_act`), on a real App: a
+/// quick second click is a multi-click's second release, and it is honoured where it lowers
+/// the level or cancels a raise and never where it would raise. From Read and Write, click and
+/// click again at once ends at Read Only, stored at that second click: the first click's raise
+/// to Full Access is dropped, never left to fall due. CONTROL: the same double-click from Read
+/// Only moves one step, to Read and Write, and from Full Access ends at Read Only.
+#[test]
+fn a_quick_second_click_lowers_at_once_and_never_raises_a_second_step() {
+    use aterm_types::fleet_access::FleetAccess::{self, Full, ReadOnly, ReadWrite};
+    use aterm_types::status_click::{EventKey, LEFT_MOUSE_UP};
+    let settle = crate::status_item::SETTLE;
+    let stored = crate::control::fleet_access_now;
+    let t0 = std::time::Instant::now();
+    // The two releases of a double-click 0.2 s apart, read as the button's handler reads them.
+    let double_click = |app: &mut App, at: std::time::Instant| {
+        let release = |seconds, clicks| EventKey {
+            kind: LEFT_MOUSE_UP,
+            flags: 0,
+            at: seconds,
+            clicks,
+        };
+        let (first, second) = (release(1.0, 1), release(1.2, 2));
+        for (event, stale, at) in [
+            (first, None, at),
+            (
+                second,
+                Some(first),
+                at + std::time::Duration::from_millis(200),
+            ),
+        ] {
+            match crate::status_item::click_act(Some(event), stale, true) {
+                crate::status_item::ClickAct::Rotate { repeated } => {
+                    app.rotate_fleet_access(at, repeated);
+                }
+                crate::status_item::ClickAct::Menu => panic!("a left release in a fleet rotates"),
+            }
+        }
+    };
+    let ends_at = |from: FleetAccess| {
+        let (mut app, _sid, _host) = desk();
+        app.pick_fleet_access(from);
+        assert_eq!(stored(), from, "PRECONDITION");
+        double_click(&mut app, t0);
+        let at_once = stored();
+        app.tick_lock_face(t0 + 10 * settle);
+        (at_once, stored(), lock_words(&app))
+    };
+    assert_eq!(
+        ends_at(ReadWrite),
+        (ReadOnly, ReadOnly, words("read", "read")),
+        "the second click closed it at once, and Full Access was never stored"
+    );
+    assert_eq!(
+        ends_at(ReadOnly),
+        (ReadOnly, ReadWrite, words("write", "write")),
+        "CONTROL: one step, after its settle"
+    );
+    assert_eq!(
+        ends_at(Full),
+        (ReadOnly, ReadOnly, words("read", "read")),
+        "CONTROL: closed by the first click, and the second raises nothing"
+    );
+}
+
+/// A level another writer stored (`aterm fleet access`, another window's lock) replaces the one
+/// this App holds and cancels its pending raise, at the App's next read of it.
+#[test]
+fn a_level_stored_elsewhere_cancels_the_locks_pending_raise() {
+    use aterm_types::fleet_access::FleetAccess::{Full, ReadOnly};
+    let settle = crate::status_item::SETTLE;
+    let (mut app, _sid, _host) = desk();
+    let t0 = std::time::Instant::now();
+    app.pick_fleet_access(Full);
+    app.rotate_fleet_access(t0, false);
+    assert_eq!(
+        lock_words(&app),
+        words("read", "read"),
+        "PRECONDITION: closed"
+    );
+    app.rotate_fleet_access(t0 + 10 * settle, false);
+    assert_eq!(
+        lock_words(&app),
+        words("read", "write"),
+        "PRECONDITION: a raise is pending"
+    );
+    // The other writer.
+    assert_eq!(crate::control::store_fleet_access(Full, None), Ok(true));
+    let _ = app.take_status_rebuild();
+    app.reread_fleet_access();
+    assert_eq!(lock_words(&app), words("full", "full"));
+    assert!(app.take_status_rebuild(), "the lock repaints");
+    assert_eq!(crate::control::store_fleet_access(ReadOnly, None), Ok(true));
+    app.tick_lock_face(t0 + 20 * settle);
+    assert_eq!(
+        crate::control::fleet_access_now(),
+        ReadOnly,
+        "the cancelled raise was never stored"
+    );
+}
+
+/// A PENDING RAISE IS WRITTEN ONLY OVER THE STATE ITS CLICK READ. Inside the settle the state
+/// moves with the level as it was: `aterm fleet access read` names the level in force, or this
+/// Mac leaves its fleet (which removes no level at the default), or joins another. No
+/// notification need arrive: the lock's own clock reads the state again before it writes, and
+/// the raise is dropped. CONTROL: the same click with nothing moved stores its raise.
+#[test]
+fn a_raise_is_dropped_where_the_state_moved_under_it_with_the_level_as_it_was() {
+    use aterm_types::fleet_access::FleetAccess::{ReadOnly, ReadWrite};
+    let settle = crate::status_item::SETTLE;
+    let stored = crate::control::fleet_access_now;
+    let t0 = std::time::Instant::now();
+    let clicked = || {
+        let (mut app, _sid, _host) = desk();
+        app.reread_fleet_access();
+        app.rotate_fleet_access(t0, false);
+        assert_eq!(
+            (stored(), lock_words(&app)),
+            (ReadOnly, words("read", "write")),
+            "PRECONDITION: a raise is pending at the default"
+        );
+        app
+    };
+
+    let mut app = clicked();
+    app.tick_lock_face(t0 + settle);
+    assert_eq!(stored(), ReadWrite, "CONTROL: nothing moved");
+    assert_eq!(crate::control::store_fleet_access(ReadOnly, None), Ok(true));
+
+    let mut app = clicked();
+    crate::control::test_state_moved();
+    let _ = app.take_status_rebuild();
+    app.tick_lock_face(t0 + settle);
+    assert_eq!(stored(), ReadOnly, "the raise was not written");
+    assert_eq!(lock_words(&app), words("read", "read"));
+    assert!(app.take_status_rebuild(), "the lock repaints closed");
+    app.tick_lock_face(t0 + 10 * settle);
+    assert_eq!(stored(), ReadOnly, "nor later");
+
+    // The notification, where it does arrive first, drops the raise at once.
+    let mut app = clicked();
+    crate::control::test_state_moved();
+    app.reread_fleet_access();
+    assert_eq!(lock_words(&app), words("read", "read"));
+    app.tick_lock_face(t0 + settle);
+    assert_eq!(stored(), ReadOnly);
+
+    // The store itself refuses a raise asked over a state that is gone, whatever the face
+    // believed (a state that moved between the clock's read and its write).
+    let over = crate::control::fleet_access_basis();
+    crate::control::test_state_moved();
+    assert_eq!(
+        crate::control::store_fleet_access(ReadWrite, Some(over)),
+        Ok(false)
+    );
+    assert_eq!(stored(), ReadOnly);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stand_in_click_rotates_the_lock_and_the_menus_open_cancels_its_raise() {
+    use aterm_types::fleet_access::FleetAccess::ReadOnly;
+    let (mut app, _sid, _host) = desk();
+    let mut posted = Vec::new();
+    let clicked = app.person_menubar_click(&mut |wake| {
+        posted.push(wake);
+        true
+    });
+    assert!(
+        clicked
+            .as_deref()
+            .is_ok_and(|said| said.starts_with("clicked ")),
+        "{clicked:?}"
+    );
+    assert_eq!(
+        lock_words(&app),
+        words("read", "read"),
+        "nothing ran before the wake"
+    );
+    assert_eq!(posted.len(), 1, "one click posted: {posted:?}");
+    for wake in posted {
+        let crate::Wake::StatusAction { action } = wake else {
+            panic!("a status action: {wake:?}");
+        };
+        assert_eq!(
+            action,
+            crate::status_item::StatusAction::RotateFleetAccess { repeated: false },
+            "the button's own action"
+        );
+        app.dispatch_status_action(action);
+    }
+    assert_eq!(lock_words(&app), words("read", "write"));
+    app.on_status_menu_opening(None);
+    assert_eq!(lock_words(&app), words("read", "read"));
+    app.tick_lock_face(std::time::Instant::now() + 10 * crate::status_item::SETTLE);
+    assert_eq!(crate::control::fleet_access_now(), ReadOnly);
+    assert_eq!(
+        app.person_menubar_click(&mut |_| false),
+        Err("event loop gone".to_string())
     );
 }

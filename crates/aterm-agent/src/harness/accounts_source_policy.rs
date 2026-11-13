@@ -79,9 +79,15 @@ pub(in crate::harness) fn aliases(left: &Path, right: &Path) -> Result<bool, Str
     if left == right {
         return Ok(true);
     }
+    // Windows opens no directory as a file: the open refuses it as `Access is denied` where Unix
+    // opens it and reads it as no regular file.
     let file = match astream_sys::open_nonblocking(&left, astream_sys::Links::Refuse) {
         Ok(file) => file,
         Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(false),
+        #[cfg(windows)]
+        Err(_) if std::fs::symlink_metadata(&left).is_ok_and(|meta| meta.is_dir()) => {
+            return Err("automatic source path is not a regular file".into());
+        }
         Err(why) => return Err(why.to_string()),
     };
     if !file.metadata().map_err(|why| why.to_string())?.is_file() {
@@ -90,6 +96,9 @@ pub(in crate::harness) fn aliases(left: &Path, right: &Path) -> Result<bool, Str
     match astream_sys::file_matches_path(&file, &right) {
         Ok(same) => Ok(same),
         Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(false),
+        // A directory is never the regular file `file` is.
+        #[cfg(windows)]
+        Err(_) if std::fs::metadata(&right).is_ok_and(|meta| meta.is_dir()) => Ok(false),
         Err(why) => Err(why.to_string()),
     }
 }

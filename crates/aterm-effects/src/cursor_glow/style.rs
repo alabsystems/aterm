@@ -32,76 +32,6 @@ pub enum GlowStyle {
 }
 
 impl GlowStyle {
-    /// Whether this style string asks for the full-body pet companion ([`crate::kitty_pet`]) rather than the flying kitty.
-    #[inline]
-    #[must_use]
-    pub const fn style_names_kitty_pet(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(
-            c.as_bytes(),
-            b"rainbow kitty pet" | b"rainbow kitty underline" | b"rainbow kitty flat"
-        )
-    }
-
-    /// Whether this style string explicitly requests the flying kitty head.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub const fn style_names_flying_kitty(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(c.as_bytes(), b"rainbow kitty flying")
-    }
-
-    /// Whether this style string asks for the pet drawn as a dog ([`crate::kitty_pet::PetSpecies::Dog`]).
-    #[inline]
-    #[must_use]
-    pub const fn style_names_dog_pet(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(c.as_bytes(), b"rainbow dog pet")
-    }
-
-    /// Whether this style string selects a full-body pet in any species.
-    #[inline]
-    #[must_use]
-    pub const fn style_names_any_pet(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(
-            c.as_bytes(),
-            b"rainbow kitty pet"
-                | b"rainbow kitty underline"
-                | b"rainbow kitty flat"
-                | b"rainbow dog pet"
-        )
-    }
-
-    /// Whether this style string selects the highlighter-plus-under-baseline ribbon: `rainbow kitty underline` and its aliases.
-    #[inline]
-    #[must_use]
-    pub const fn style_names_underline_ribbon(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(c.as_bytes(), b"rainbow kitty underline")
-    }
-
-    /// Whether this style string selects the flat rainbow ribbon body.
-    #[inline]
-    #[must_use]
-    pub const fn style_names_flat_ribbon(s: &str) -> bool {
-        let Some(c) = spellings::canonical(s) else {
-            return false;
-        };
-        matches!(c.as_bytes(), b"rainbow kitty flat")
-    }
-
     /// Diagnostic name of the resolved style.
     #[inline]
     #[must_use]
@@ -120,14 +50,20 @@ impl GlowStyle {
         }
     }
 
-    /// Whether a `classic` spelling selects the two-tone monochrome face.
+    /// Whether a `classic` spelling selects the two-tone monochrome face
+    /// ([`spellings::CLASSIC_MONO_SPELLINGS`]).
     #[inline]
     #[must_use]
     pub const fn style_names_classic_mono(style_raw: &str) -> bool {
         let s = spellings::trim_whitespace_bytes(style_raw);
-        spellings::eq_ascii_ci(s, "classic mono")
-            || spellings::eq_ascii_ci(s, "classic lumen")
-            || spellings::eq_ascii_ci(s, "mono classic")
+        let mut i = 0;
+        while i < spellings::CLASSIC_MONO_SPELLINGS.len() {
+            if spellings::eq_ascii_ci(s, spellings::CLASSIC_MONO_SPELLINGS[i]) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Parse a config string (trimmed, case-insensitive) through [`spellings::canonical`].
@@ -167,7 +103,8 @@ pub struct GlowConfig {
     pub length: usize,
     /// Additive brightness scale `0.0..=1.0` (`0` = off).
     pub intensity: f32,
-    /// Whether a key pressed on this tick's window should be heard.
+    /// Whether a key pressed on this tick's window may be heard. Starts false until the
+    /// host folds this window's focus and light policy; independent of the sound preference.
     pub audible: bool,
     /// Bloom-crown radius in cells (0 ⇒ no crown, comet only).
     pub radius: f32,
@@ -182,9 +119,11 @@ pub struct GlowConfig {
     pub beam: bool,
     /// Horizontal attach point of the live-cursor bridge as a fraction of cell width (`0.5` = centre).
     pub head_dx: f32,
-    /// The rainbow ribbon's dark-theme transverse presentation: tall body or explicit underline/highlighter.
+    /// The rainbow ribbon's shape, which is theme data: `false` is the underline with its
+    /// highlighter, the shape of the one `rainbow` theme; `true` is the tall body, which no
+    /// built-in theme picks.
     pub ribbon_tall: bool,
-    /// The flat body, selected only by the explicit `… flat` spelling ([`GlowStyle::style_names_flat_ribbon`]).
+    /// The flat body, a shape no built-in theme picks.
     pub ribbon_flat: bool,
     /// Whether the classic wake uses the two-tone tracer (`true`) instead of a rolling spectrum (`false`).
     pub classic_mono: bool,
@@ -385,8 +324,10 @@ impl GlowConfig {
 }
 
 /// The shipped resolve: what a window with no config resolves on the cold dark ground (the
-/// shipped `rainbow kitty pet`, the default theme's cursor colour, every knob unset), so a test
-/// that names only the fields it is about takes the rest from here (§15.1 P0.1).
+/// shipped `rainbow`, the default theme's cursor colour, every knob unset), so a test that
+/// names only the fields it is about takes the rest from here (§15.1 P0.1). One field differs
+/// from that window: `ribbon_tall` is true here, the tall body the engine's own tests judge,
+/// where every style a person can choose resolves the underline.
 impl Default for GlowConfig {
     #[inline]
     fn default() -> Self {

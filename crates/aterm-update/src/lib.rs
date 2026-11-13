@@ -165,12 +165,15 @@ pub mod service_artifact;
 #[cfg(target_os = "macos")]
 mod status;
 #[cfg(target_os = "macos")]
-mod sys;
+use aterm_update_core::app_swap as sys;
 #[cfg(target_os = "macos")]
 mod unreadable;
 #[cfg(target_os = "macos")]
 mod verify;
 pub mod which_copy;
+/// Windows: the locally staged build's pointer, its standing against the running copy, and the
+/// staged install.
+pub mod windows;
 
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 pub use manifest::failed_mark_suppression_projection;
@@ -230,7 +233,7 @@ fn read_ledger_text_checked(path: &std::path::Path) -> std::io::Result<Option<St
 /// The resolved GitHub release source and the compiled-in default owner/repo.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
-pub use progress::{Progress, ProgressNotify, set_progress_observer};
+pub use progress::{Progress, ProgressNotify, ProgressReport, set_progress_observer};
 
 /// Argv forwarding for every lane that relaunches aterm: the leading `--window` pins the boot
 /// swap adds are stripped, so no relaunch re-grows them.
@@ -356,10 +359,83 @@ pub enum TrialWitness {
     Headless,
 }
 
+/// What one ask of this process's boot-health confirmation came to.
+///
+/// The gate an answer opens ([`Self::opens_gate`]) is the caller's own: every apply lane is
+/// still judged by the durable trial under the apply lock. Only [`Self::settled_build`] names
+/// a trial this ask disarmed, the authority to release work deferred for that exact trial.
+///
+/// The bound: a proof that ran under the apply lock and was refused is retried, and after
+/// [`TRIAL_SETTLE_AFTER_REFUSALS`] refusals that lasted [`TRIAL_SETTLE_REFUSAL_SPAN`] of
+/// awake time in one process the trial is settled without the proof
+/// ([`Self::SettledUnproven`]), never reverted: the launch count alone reverts. Four holds
+/// stay unbounded here and are named, not settled ([`Self::Pending`]): a trial whose window
+/// never draws a frame (it is never asked at a checkpoint); a sentinel the filesystem will
+/// not remove; a refusal that says the installed bundle is not the running build while its
+/// predecessor verifies, which the launch count reverts; and a process with no awake clock,
+/// whose refusals span nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootHealthVerdict {
+    /// Nothing is owed: no trial of this build is armed, another installed copy owns it, or
+    /// this ask proved and disarmed it (`settled` then names the build).
+    Confirmed { settled: Option<u64> },
+    /// The trial was disarmed at its bound without its recovery proof; the build stays
+    /// installed and its predecessor stays at its rollback path, keyed to no process, until
+    /// the next update replaces it. `why` is the journal line.
+    SettledUnproven { build: u64, why: String },
+    /// The trial stays armed and the updater names why. `retry_after` is when asking again
+    /// can first change the answer; `None` leaves the pace to the caller.
+    Pending {
+        why: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The updater could not be asked (the apply lock was held, this process resolves no
+    /// install, the confirmation panicked). It counts toward no bound of the trial's.
+    Unanswered { why: String },
+}
+
+impl BootHealthVerdict {
+    /// The answer for a process that owes no trial.
+    pub const NO_TRIAL: Self = Self::Confirmed { settled: None };
+
+    /// Whether this process owes no further confirmation: confirmed, or settled at the bound.
+    #[must_use]
+    pub const fn opens_gate(&self) -> bool {
+        matches!(self, Self::Confirmed { .. } | Self::SettledUnproven { .. })
+    }
+
+    /// The exact build whose trial this ask durably disarmed, proven or at its bound.
+    #[must_use]
+    pub const fn settled_build(&self) -> Option<u64> {
+        match self {
+            Self::Confirmed { settled } => *settled,
+            Self::SettledUnproven { build, .. } => Some(*build),
+            Self::Pending { .. } | Self::Unanswered { .. } => None,
+        }
+    }
+}
+
+/// Refused recovery proofs, counted in one process, after which a boot trial is settled
+/// without its proof ([`BootHealthVerdict::SettledUnproven`]).
+pub const TRIAL_SETTLE_AFTER_REFUSALS: u32 = PERSISTENT_AFTER;
+
+/// The awake time the refusal must have lasted: the sum of the awake-clock gaps between one
+/// counted refusal and the next. A burst of asks is no lasting refusal, and a sleep, a wall
+/// clock step, and an ask that ran no proof add nothing.
+pub const TRIAL_SETTLE_REFUSAL_SPAN: std::time::Duration = PERSISTENT_SPAN;
+
 /// Whether the updater runs on this platform at all.
 #[must_use]
 pub const fn enabled() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
+/// Whether a window announces a build staged on this machine (`windows::Standing::offered`):
+/// Windows, where [`enabled`] is false and no checker runs. It reads one local file and never
+/// the network.
+#[must_use]
+pub const fn staged_notice_enabled() -> bool {
+    cfg!(windows)
 }
 
 /// Whether the running copy has a bundle the updater could replace.
@@ -389,18 +465,51 @@ pub fn running_is_dev_marked() -> bool {
 }
 
 /// "Check for updates automatically" (`[update] enabled`) on a platform the updater runs on
-/// ([`enabled`]). It gates only the lanes nobody asked for, such as the background checker.
+/// ([`enabled`]). It gates only the lanes nobody asked for, such as the background checker. Off
+/// for this call while [`automatic_at_launch`] has no answer yet.
 #[must_use]
 pub fn automatic() -> bool {
-    enabled() && aterm_update_core::settings::update_enabled()
+    automatic_at_launch().unwrap_or(false)
+}
+
+/// [`automatic`] as this process launched with it
+/// ([`aterm_update_core::settings::update_enabled_at_launch`]: only the process's first ask reads
+/// the file): `None` while no read of the setting has answered, which says nothing of a person's
+/// `false`.
+#[must_use]
+pub fn automatic_at_launch() -> Option<bool> {
+    if !enabled() {
+        return Some(false);
+    }
+    aterm_update_core::settings::update_enabled_at_launch()
+}
+
+/// [`automatic_at_launch`], reading the setting again while nothing is kept
+/// ([`aterm_update_core::settings::update_enabled_at_launch_read`]): for a thread that waits on the
+/// answer, never one a person waits on.
+#[must_use]
+pub fn automatic_at_launch_read() -> Option<bool> {
+    if !enabled() {
+        return Some(false);
+    }
+    aterm_update_core::settings::update_enabled_at_launch_read()
+}
+
+/// What [`automatic_at_launch`] has answered so far, with no file read: `None` until it answered.
+#[must_use]
+pub fn automatic_kept() -> Option<bool> {
+    if !enabled() {
+        return Some(false);
+    }
+    aterm_update_core::settings::update_enabled_kept()
 }
 
 /// [`automatic`] as the user config says now, read again at each call: a process whose own
-/// [`automatic`] differs runs under a setting changed since it started, which its next launch
-/// reads.
+/// [`automatic_at_launch`] differs runs under a setting changed since it started, which its next
+/// launch reads. `None` where the read hit a fault that can pass, which says nothing of the setting.
 #[must_use]
-pub fn automatic_as_saved() -> bool {
-    enabled() && aterm_update_core::settings::update_enabled_saved()
+pub fn automatic_as_saved() -> Option<bool> {
+    aterm_update_core::settings::update_enabled_saved().map(|saved| enabled() && saved)
 }
 
 /// Applies a staged update if one is ready and strictly newer than `current_build`.
@@ -569,6 +678,7 @@ pub(crate) fn quote_tool_output(text: &str) -> String {
         PASSING_REFUSAL_KEY,
         INSTALL_LOCATION_REFUSAL_KEY,
         ROSTER_UNCONFIRMED_KEY,
+        BOOT_TRIAL_UNCONFIRMED_KEY,
         NOT_INSTALLED_KEY,
         install::ROLLBACK_SOURCE_REFUSAL_KEY,
         github::STALE_ANCHOR_KEY,
@@ -593,6 +703,20 @@ pub const ROSTER_UNCONFIRMED_KEY: &str = "confirmed against a current machine ro
 #[must_use]
 pub fn is_roster_confirmation_wait(reason: &str) -> bool {
     is_passing_refusal(reason) && reason.contains(ROSTER_UNCONFIRMED_KEY)
+}
+
+/// Stable words in the wait for an installed build's boot trial to be confirmed.
+pub const BOOT_TRIAL_UNCONFIRMED_KEY: &str = "update trial for build";
+
+/// Whether `reason` is the passing wait for `current_build`'s own boot-health confirmation.
+/// The build match prevents a foreign or newer trial from being released by this process's
+/// health-proof event.
+#[must_use]
+pub fn is_boot_health_confirmation_wait(reason: &str, current_build: u64) -> bool {
+    is_passing_refusal(reason)
+        && reason.contains(&format!(
+            "{BOOT_TRIAL_UNCONFIRMED_KEY} {current_build} is still unconfirmed"
+        ))
 }
 
 /// Whether a refusal is a person's to clear.
@@ -688,6 +812,16 @@ pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::fr
 /// Off macOS a pre-verification checks nothing and returns.
 #[cfg(not(target_os = "macos"))]
 pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::ZERO;
+
+/// Longest ordinary enqueue-to-completion window for boot-health confirmation before its caller
+/// should retry idempotently. The shared FIFO permits one active reconcile read ahead of this
+/// request, then a macOS trial can take the apply lock twice and authenticate both the retained
+/// predecessor and the running bundle. Three handoff-preverification bounds cover those bounded
+/// operations; the small margin lets the worker publish completion after its last helper exits.
+pub const BOOT_HEALTH_CONFIRMATION_BOUND: std::time::Duration = HANDOFF_PREVERIFY_BOUND
+    .saturating_add(HANDOFF_PREVERIFY_BOUND)
+    .saturating_add(HANDOFF_PREVERIFY_BOUND)
+    .saturating_add(std::time::Duration::from_secs(2));
 
 /// The authenticated recipient-history protocol a candidate can recover.
 /// This is reader evidence, never writer or execution authority.
@@ -1049,15 +1183,21 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     }
 }
 
-/// Confirms the running build reached a healthy checkpoint (window up / first frame).
+/// Asks whether the running build's boot trial is settled. With `checkpoint` (a window's first
+/// frame, a headless instance's control socket) it runs the trial's recovery proof under the
+/// apply lock and confirms, or settles at the bound [`BootHealthVerdict`] states; that ask
+/// also releases the rollback bundle an ended window's proven settle kept. Without it it
+/// reads only: nothing is locked, written, removed or counted, and only a process that owes
+/// no trial is [`BootHealthVerdict::Confirmed`].
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn confirm_boot_health_exact(
     current_build: u64,
     current_commit: &str,
     witness: TrialWitness,
-) -> bool {
-    install::confirm_boot_health(current_build, Some(current_commit), witness)
+    checkpoint: bool,
+) -> BootHealthVerdict {
+    install::confirm_boot_health(current_build, Some(current_commit), witness, checkpoint)
 }
 
 /// A terminal session of this executable is starting (an interactive launch). On Linux it counts
@@ -1147,21 +1287,23 @@ pub fn confirm_linux_session(_current_build: u64, _current_commit: &str) -> Linu
     }
 }
 
-/// Linux confirms its exact inode trial.
+/// Linux confirms its exact inode trial at a `checkpoint`, and before one only reads whether
+/// a trial is owed; elsewhere nothing is on trial.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn confirm_boot_health_exact(
     _current_build: u64,
     _current_commit: &str,
     _witness: TrialWitness,
-) -> bool {
+    _checkpoint: bool,
+) -> BootHealthVerdict {
     #[cfg(target_os = "linux")]
     {
-        linux::confirm(_current_build, _current_commit)
+        linux::confirm(_current_build, _current_commit, _checkpoint)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        true
+        BootHealthVerdict::NO_TRIAL
     }
 }
 
@@ -1264,7 +1406,39 @@ fn preverify_installed_locked<R>(
     expected_commit: &str,
     read_policy: &dyn Fn(&std::path::Path) -> R,
 ) -> Result<R, String> {
-    let _preverify = install::enter_preverify(staging.map(|staging| staging.apply_lock.as_path()))?;
+    preverify_installed_locked_with_enter(
+        staging,
+        app_root,
+        current_build,
+        expected_build,
+        expected_commit,
+        read_policy,
+        || install::enter_preverify(staging.map(|staging| staging.apply_lock.as_path())),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn preverify_installed_locked_with_enter<R>(
+    staging: Option<&paths::Staging>,
+    app_root: &std::path::Path,
+    current_build: u64,
+    expected_build: u64,
+    expected_commit: &str,
+    read_policy: &dyn Fn(&std::path::Path) -> R,
+    enter: impl FnOnce() -> Result<install::PreverifyGuard, String>,
+) -> Result<R, String> {
+    let running_trial_unconfirmed = || {
+        staging.is_some_and(|staging| {
+            install::owned_running_trial_unconfirmed(staging, app_root, current_build)
+        })
+    };
+    if running_trial_unconfirmed() {
+        return Err(install::unconfirmed_trial_refusal(current_build));
+    }
+    let _preverify = enter()?;
+    if running_trial_unconfirmed() {
+        return Err(install::unconfirmed_trial_refusal(current_build));
+    }
     let floor = staging
         .map(|staging| manifest::Floor::read_for_gate(&staging.floor()))
         .transpose()?
@@ -1512,6 +1686,86 @@ pub fn supersede_installed_activation(
     Err(SupersedeRefusal::Settled(
         "installed-bundle activation is macOS-only".to_string(),
     ))
+}
+
+/// What [`install_over_failed_activation`] found and did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FailedActivationInstall {
+    /// No activation the window here failed to switch to waits with a newer stage ready to take
+    /// its place: the usual answer, read from a few small files. It is also the answer where the
+    /// look found one and the same look under the apply lock no longer does.
+    NoneFailed,
+    /// One waits, and stays installed for now, by a refusal a later look may not repeat: a moment
+    /// (a busy apply lock, a verification that did not finish, a window launch of it that may
+    /// still switch to it, the disk changing while its bundles were verified), or a gate read from
+    /// small files before any bundle was verified (the stage's roster confirmation, this process
+    /// running neither build). A later look costs what this one did.
+    Held(SupersedeRefusal),
+    /// One waits, and what its bundles' verified signatures show, judged under the apply lock,
+    /// holds it there: the install path or the retained predecessor sealed with another build or
+    /// failing verification with a verdict (not a passing refusal), this process running neither,
+    /// or a trial that names other bytes or belongs to another install. Only a change to those
+    /// bundles or that trial lets a later look through, so a caller need not verify the same
+    /// `(activation, newer)` pair again.
+    Refused(String),
+    /// It was retired, and the newer stage installed over the build retained for its rollback,
+    /// which stays retained.
+    Installed {
+        /// The retire.
+        retired: SupersededActivation,
+        /// The build now at the install path, on a fresh trial.
+        installed_build: u64,
+    },
+    /// It was retired and the retained build is back at the install path, but the newer stage
+    /// did not go in; the staged lane applies it as any stage.
+    RetiredOnly {
+        /// The retire.
+        retired: SupersededActivation,
+        /// Why the stage did not go in.
+        why: String,
+    },
+}
+
+/// The activation a window here failed to switch to, with the stage newer than it that is ready:
+/// `(activation, newer)`, read without the apply lock or a signature check. `None` is the usual
+/// answer.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn failed_activation_waiting() -> Option<(u64, u64)> {
+    install::failed_activation_waiting()
+}
+
+/// Non-macOS: there is no installed `.app` activation.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn failed_activation_waiting() -> Option<(u64, u64)> {
+    None
+}
+
+/// A process that is not a window (the node service) takes the install path from an activation
+/// the window here could not switch to, and installs the strictly newer verified stage over the
+/// build retained for its rollback, which stays retained. It moves nothing while the activation's
+/// trial is confirmed, a window launch of it runs or came after the window's last failure, or the
+/// stage is not admitted (quarantined, withdrawn, unverified). It verifies the bundles before it
+/// takes the apply lock, so the lock is held for the exchanges, the start probe and cheap
+/// re-reads.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn install_over_failed_activation(
+    current_build: u64,
+    current_commit: &str,
+) -> FailedActivationInstall {
+    install::install_over_failed_activation(current_build, current_commit)
+}
+
+/// Non-macOS: there is no installed `.app` activation to replace.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn install_over_failed_activation(
+    _current_build: u64,
+    _current_commit: &str,
+) -> FailedActivationInstall {
+    FailedActivationInstall::NoneFailed
 }
 
 /// A GUI-supplied hook the background check uses to surface self-healing events.
@@ -1924,457 +2178,8 @@ fn note_pending_update(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod persistent_notice_tests {
-
-    #[test]
-    fn the_notice_body_hands_back_the_date_it_was_written_with() {
-        for (class, count) in [
-            ("apply", 3),
-            ("pipeline", 20),
-            ("stage", 4),
-            ("manifest", 5),
-        ] {
-            let ledger = super::health::Health {
-                apply_since: "2026-09-14T05:42:50Z".to_string(),
-                pipeline_since: "2026-09-14T05:42:50Z".to_string(),
-                stage_since: "2026-09-14T05:42:50Z".to_string(),
-                manifest_since: "2026-09-14T05:42:50Z".to_string(),
-                last_error: "signature did not verify".to_string(),
-                last_apply_error: "the successor died".to_string(),
-                ..super::health::Health::default()
-            };
-            let (title, body) = super::persistent_failure_notice(class, count, &ledger, 7);
-            assert_eq!(title, super::health_failing_title(class));
-            assert_eq!(
-                super::health_notice_since(&body),
-                Some("2026-09-14T05:42:50Z"),
-                "{class}: {body}"
-            );
-        }
-        assert_eq!(super::health_notice_since("no date here"), None);
-        assert_eq!(
-            super::health_notice_since("broken since yesterday: it failed"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_failing_title_reads_back_to_its_class_old_words_and_new() {
-        for class in ["apply", "pipeline", "stage", "manifest", "future"] {
-            let title = super::health_failing_title(class);
-            assert!(title.starts_with("Couldn't "), "{title}");
-            let read = super::health_failing_class(title).expect("today's title");
-            assert_eq!(super::health_failing_title(read), title, "{class}");
-        }
-        for (old, class) in [
-            ("aterm can't install updates", "apply"),
-            ("aterm can't download updates", "pipeline"),
-            ("aterm can't check for updates", "manifest"),
-        ] {
-            assert_eq!(super::health_failing_class(old), Some(class), "{old}");
-        }
-        for other in [
-            super::HEALTH_RESTATED_TITLE,
-            super::HEALTH_RECOVERED_TITLE,
-            super::STRANDED_TITLE,
-            "aterm's update check stopped",
-            "Couldn't install update",
-            "",
-        ] {
-            assert_eq!(super::health_failing_class(other), None, "{other:?}");
-        }
-    }
-
-    #[test]
-    fn an_overdue_pending_build_is_announced_once() {
-        use super::health::Health;
-        let mut announcer = super::HealthAnnouncer::new("2026-09-22T00:00:00Z".to_string());
-        let stranded = Health {
-            apply_failures: 2,
-            apply_since: "2026-09-22T00:11:30Z".to_string(),
-            last_failure_at: "2026-09-22T00:11:31Z".to_string(),
-            kind: "apply".to_string(),
-            last_apply_error: "overlap handoff failed safely: handoff proof ended \
-                               AdoptionMismatch"
-                .to_string(),
-            last_apply_failure_build: 1790019739,
-            last_apply_failure_target_build: 1790120495,
-            apply_failures_for_target: 2,
-            last_apply_refusal: "automatic apply of build 1790120495 is out of retries".to_string(),
-            last_apply_refusal_at: "2026-09-22T00:11:32Z".to_string(),
-            last_apply_refusal_build: 1790019739,
-            pending_build: 1790120495,
-            pending_since: "2026-09-22T00:10:45Z".to_string(),
-            ..Health::default()
-        };
-        assert!(stranded.persistent_class().is_none());
-        assert!(
-            announcer
-                .tick_overdue(&stranded, "2026-09-25T00:00:00Z", 1790019739, false)
-                .is_none(),
-            "auto_apply = false is not a failure"
-        );
-        assert!(
-            announcer
-                .tick_overdue(&stranded, "2026-09-22T01:10:00Z", 1790019739, true)
-                .is_none(),
-            "fifty-nine minutes is not overdue"
-        );
-        let (title, _) = announcer
-            .tick_overdue(&stranded, "2026-09-22T01:11:00Z", 1790019739, true)
-            .expect("past the hour the stranded machine is announced");
-        assert_eq!(
-            title,
-            super::health_failing_title("apply"),
-            "an update that will not land is the install half failing"
-        );
-        assert!(
-            announcer
-                .tick_overdue(&stranded, "2026-09-22T09:00:00Z", 1790019739, true)
-                .is_none(),
-            "once per build: the row stands, the notice does not repeat"
-        );
-        assert!(
-            announcer
-                .tick_overdue(&stranded, "2026-09-23T00:00:00Z", 1790120495, true)
-                .is_none()
-        );
-        let unattempted = Health {
-            pending_build: 1790300000,
-            pending_since: "2026-09-23T00:00:00Z".to_string(),
-            ..Health::default()
-        };
-        assert!(
-            announcer
-                .tick_overdue(&unattempted, "2026-09-23T02:00:00Z", 1790120495, true)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn a_withdrawn_build_is_never_announced_as_waiting() {
-        use super::health::Health;
-        let started = "2026-09-22T00:00:00Z".to_string();
-        let later = "2026-09-22T05:00:00Z";
-        let backdate = |s: &super::paths::Staging| {
-            let mut h = Health::read(&s.health());
-            h.pending_since = "2026-09-22T01:00:00Z".to_string();
-            std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
-        };
-        for withdrawal in ["none", "quarantine", "yank", "revocation"] {
-            let s = super::paths::Staging::scratch("pending-withdrawn");
-            super::note_pending_update(&s, 10, Some(11), None);
-            backdate(&s);
-            match withdrawal {
-                "quarantine" => super::manifest::quarantine_artifact(
-                    &s,
-                    11,
-                    &"ab".repeat(32),
-                    aterm_durable::Flush::Durable,
-                ),
-                "yank" => super::manifest::Floor::bump_and_write(&s.floor(), 12, 0, 0),
-                "revocation" => super::github::retire_revoked_stage(&s, 11),
-                _ => {}
-            }
-            let h = super::note_pending_update(&s, 10, None, None);
-            let said =
-                super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
-            if withdrawal == "none" {
-                assert!(said.is_some(), "a stranded machine must still be told");
-            } else {
-                assert!(
-                    said.is_none(),
-                    "{withdrawal}: build 11 is withdrawn, not waiting: {said:?}"
-                );
-                assert_eq!(h.pending_build, 0, "{withdrawal}");
-            }
-            let _ = std::fs::remove_dir_all(&s.root);
-        }
-    }
-
-    #[test]
-    fn a_yanked_installed_bundle_is_never_announced_as_waiting() {
-        use super::health::Health;
-        let started = "2026-09-22T00:00:00Z".to_string();
-        let later = "2026-09-22T05:00:00Z";
-        let backdate = |s: &super::paths::Staging| {
-            let mut h = Health::read(&s.health());
-            h.pending_since = "2026-09-22T01:00:00Z".to_string();
-            std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
-        };
-        for yanked in [false, true] {
-            let s = super::paths::Staging::scratch("pending-installed-yanked");
-            super::note_pending_update(&s, 10, None, Some(11));
-            backdate(&s);
-            if yanked {
-                super::manifest::Floor::bump_and_write(&s.floor(), 12, 0, 0);
-            }
-            let h = super::note_pending_update(&s, 10, None, Some(11));
-            let said =
-                super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
-            if yanked {
-                assert_eq!(h.pending_build, 0, "a yanked build is never pending");
-                assert!(said.is_none(), "build 11 is yanked, not waiting: {said:?}");
-            } else {
-                assert_eq!(h.pending_build, 11);
-                assert!(said.is_some(), "a stranded machine must still be told");
-            }
-            let h = super::note_pending_update(&s, 10, Some(12), Some(11));
-            assert_eq!(h.pending_build, 12, "yanked: {yanked}");
-            assert!(
-                super::HealthAnnouncer::new(started.clone())
-                    .tick_overdue(&h, &super::install::now_rfc3339(), 10, true)
-                    .is_none(),
-                "the successor's clock starts now"
-            );
-        }
-    }
-
-    #[test]
-    fn the_announcer_restates_a_moved_count_quietly_and_re_announces_only_a_new_class() {
-        use super::health::Health;
-        let started = "2026-09-13T22:00:00Z".to_string();
-        let mut announcer = super::HealthAnnouncer::new(started);
-        let ledger = |apply_failures: u32, last: &str| Health {
-            apply_failures,
-            apply_since: "2026-09-13T22:40:00Z".to_string(),
-            last_failure_at: last.to_string(),
-            kind: "apply".to_string(),
-            last_apply_error: "the successor died".to_string(),
-            ..Health::default()
-        };
-        assert!(
-            announcer
-                .tick(
-                    &ledger(3, "2026-09-13T22:50:00Z"),
-                    "2026-09-13T23:00:00Z",
-                    7
-                )
-                .is_none()
-        );
-        let (title, _) = announcer
-            .tick(
-                &ledger(3, "2026-09-13T23:12:50Z"),
-                "2026-09-13T23:13:44Z",
-                7,
-            )
-            .expect("the first escalation is announced");
-        assert_eq!(title, super::health_failing_title("apply"));
-        assert!(
-            announcer
-                .tick(
-                    &ledger(3, "2026-09-13T23:12:50Z"),
-                    "2026-09-13T23:37:45Z",
-                    7
-                )
-                .is_none()
-        );
-        let (title, body) = announcer
-            .tick(
-                &ledger(6, "2026-09-14T00:10:00Z"),
-                "2026-09-14T00:12:34Z",
-                7,
-            )
-            .expect("a moved count is restated");
-        assert_eq!(title, super::HEALTH_RESTATED_TITLE);
-        assert!(body.starts_with('6'), "the new number: {body}");
-        let mut fresh = super::HealthAnnouncer::new("2026-09-14T01:00:00Z".to_string());
-        assert!(
-            fresh
-                .tick(
-                    &ledger(6, "2026-09-14T00:10:00Z"),
-                    "2026-09-14T01:05:00Z",
-                    7
-                )
-                .is_none()
-        );
-        let healed = Health::default();
-        let (title, body) = announcer
-            .tick(&healed, "2026-09-14T02:00:00Z", 7)
-            .expect("a failure this process reported gets its recovery reported");
-        assert_eq!(title, super::HEALTH_RECOVERED_TITLE);
-        assert_eq!(body, "apply", "the heal names the class it proves");
-        assert!(announcer.tick(&healed, "2026-09-14T02:01:00Z", 7).is_none());
-        let (title, _) = announcer
-            .tick(
-                &ledger(3, "2026-09-14T03:30:00Z"),
-                "2026-09-14T03:31:00Z",
-                7,
-            )
-            .expect("a new episode is news");
-        assert_eq!(title, super::health_failing_title("apply"));
-    }
-
-    #[test]
-    fn a_quick_streak_raises_no_notice_and_a_spanning_one_does() {
-        let started = "2026-10-15T09:00:00Z".to_string();
-        let streak = |newest: &str| super::health::Health {
-            pipeline_failures: 3,
-            pipeline_since: "2026-10-15T10:00:00Z".to_string(),
-            last_diagnosis_at: newest.to_string(),
-            last_diagnosis_error: "release manifests exist but could not be fetched".to_string(),
-            network_failures: 1,
-            network_since: "2026-10-15T18:00:00Z".to_string(),
-            last_failure_at: "2026-10-15T18:00:00Z".to_string(),
-            kind: "network".to_string(),
-            last_error: "curl: (6) Could not resolve host: github.com".to_string(),
-            ..super::health::Health::default()
-        };
-        let woke = "2026-10-15T18:00:01Z";
-        let mut announcer = super::HealthAnnouncer::new(started.clone());
-        assert_eq!(
-            announcer.tick(&streak("2026-10-15T10:06:00Z"), woke, 7),
-            None,
-            "three failures inside six minutes"
-        );
-        let mut announcer = super::HealthAnnouncer::new(started);
-        let (title, _) = announcer
-            .tick(&streak("2026-10-15T10:30:00Z"), woke, 7)
-            .expect("three failures spanning half an hour are news");
-        assert_eq!(title, super::health_failing_title("pipeline"));
-    }
-
-    fn failing_checks(last: &str) -> super::health::Health {
-        super::health::Health {
-            manifest_failures: 20,
-            manifest_since: "2026-09-14T22:04:36Z".to_string(),
-            last_failure_at: last.to_string(),
-            last_diagnosis_at: last.to_string(),
-            kind: "manifest".to_string(),
-            last_error: "the channel's manifest would not verify".to_string(),
-            ..super::health::Health::default()
-        }
-    }
-
-    #[test]
-    fn a_successor_sends_the_recovery_of_the_class_its_parent_announced() {
-        let started = "2026-09-29T10:00:00Z".to_string();
-        let process = super::AnnouncedHealth::new();
-        process.adopt("manifest");
-        let mut announcer = super::HealthAnnouncer::new(started.clone());
-        let (title, _) = announcer
-            .tick_for_process(
-                &process,
-                &failing_checks("2026-09-29T10:02:00Z"),
-                "2026-09-29T10:02:01Z",
-                7,
-            )
-            .expect("the adopted streak's count is restated");
-        assert_eq!(
-            title,
-            super::HEALTH_RESTATED_TITLE,
-            "NEGATIVE: the parent's class is not announced a second time"
-        );
-        assert_eq!(process.class(), Some("manifest"));
-
-        let process = super::AnnouncedHealth::new();
-        let mut announcer = super::HealthAnnouncer::new(started.clone());
-        assert!(
-            announcer
-                .tick_for_process(
-                    &process,
-                    &super::health::Health::default(),
-                    "2026-09-29T10:02:01Z",
-                    7
-                )
-                .is_none()
-        );
-
-        let process = super::AnnouncedHealth::new();
-        process.adopt("manifest");
-        let mut announcer = super::HealthAnnouncer::new(started.clone());
-        let healed = super::health::Health::default();
-        let (title, body) = announcer
-            .tick_for_process(&process, &healed, "2026-09-29T10:02:01Z", 7)
-            .expect("the adopted class's healing is sent");
-        assert_eq!(title, super::HEALTH_RECOVERED_TITLE);
-        assert_eq!(body, "manifest", "naming the class it proves");
-        assert_eq!(process.class(), None, "said once");
-        assert!(
-            announcer
-                .tick_for_process(&process, &healed, "2026-09-29T10:03:00Z", 7)
-                .is_none()
-        );
-        let mut later = failing_checks("2026-09-29T15:40:00Z");
-        later.manifest_since = "2026-09-29T15:00:00Z".to_string();
-        let (title, _) = announcer
-            .tick_for_process(&process, &later, "2026-09-29T15:40:01Z", 7)
-            .expect("a new episode is announced");
-        assert_eq!(title, super::health_failing_title("manifest"));
-    }
-
-    #[test]
-    fn a_replacement_generation_sends_the_recovery_its_predecessor_owed() {
-        let started = "2026-09-29T10:00:00Z".to_string();
-        let process = super::AnnouncedHealth::new();
-        let mut stalled = super::HealthAnnouncer::new(started.clone());
-        let (title, _) = stalled
-            .tick_for_process(
-                &process,
-                &failing_checks("2026-09-29T10:40:00Z"),
-                "2026-09-29T10:40:01Z",
-                7,
-            )
-            .expect("announced");
-        assert_eq!(title, super::health_failing_title("manifest"));
-        let healed = super::health::Health::default();
-        let mut replacement = super::HealthAnnouncer::new("2026-09-29T11:00:00Z".to_string());
-        assert!(
-            replacement
-                .tick(&healed, "2026-09-29T11:05:00Z", 7)
-                .is_none(),
-            "NEGATIVE: a fresh announcer alone owes nothing"
-        );
-        let mut replacement = super::HealthAnnouncer::new("2026-09-29T11:00:00Z".to_string());
-        let (title, body) = replacement
-            .tick_for_process(&process, &healed, "2026-09-29T11:05:00Z", 7)
-            .expect("the replacement heals what the process announced");
-        assert_eq!(title, super::HEALTH_RECOVERED_TITLE);
-        assert_eq!(body, "manifest");
-    }
-
-    #[test]
-    fn an_adopted_class_keeps_the_one_whose_recovery_answers_most() {
-        let process = super::AnnouncedHealth::new();
-        process.adopt("manifest");
-        process.adopt("pipeline");
-        assert_eq!(process.class(), Some("pipeline"));
-        process.adopt("manifest");
-        assert_eq!(process.class(), Some("pipeline"));
-        let process = super::AnnouncedHealth::new();
-        process.adopt("stage");
-        assert_eq!(process.class(), Some("pipeline"), "one title, one class");
-        process.adopt("future");
-        assert_eq!(process.class(), Some("pipeline"));
-    }
-
-    #[test]
-    fn a_taken_up_download_warning_is_not_said_again_for_its_sibling_class() {
-        let started = "2026-09-29T10:00:00Z".to_string();
-        let stage = super::health::Health {
-            stage_failures: 4,
-            stage_since: "2026-09-29T09:00:00Z".to_string(),
-            last_failure_at: "2026-09-29T10:02:00Z".to_string(),
-            last_diagnosis_at: "2026-09-29T10:02:00Z".to_string(),
-            kind: "stage".to_string(),
-            last_error: "the DMG would not verify".to_string(),
-            ..super::health::Health::default()
-        };
-        let process = super::AnnouncedHealth::new();
-        process.adopt("pipeline");
-        let mut announcer = super::HealthAnnouncer::new(started.clone());
-        let (title, _) = announcer
-            .tick_for_process(&process, &stage, "2026-09-29T10:02:01Z", 7)
-            .expect("the count is restated");
-        assert_eq!(title, super::HEALTH_RESTATED_TITLE);
-        let process = super::AnnouncedHealth::new();
-        let mut announcer = super::HealthAnnouncer::new(started);
-        let (title, _) = announcer
-            .tick_for_process(&process, &stage, "2026-09-29T10:02:01Z", 7)
-            .expect("announced");
-        assert_eq!(title, super::health_failing_title("stage"));
-    }
-}
+#[path = "lib_persistent_notice_tests.rs"]
+mod persistent_notice_tests;
 
 /// Supplies the current configured channel at the start of each background cycle.
 #[cfg(not(target_os = "linux"))]
@@ -2415,7 +2220,218 @@ pub fn check_now_with_settings(
     }
 }
 
+/// Start this process's background checker once [`automatic_at_launch`] answers
+/// ([`once_automatic_known`]): the platform's start reads [`automatic`] and runs no scheduled
+/// check where it is off.
 pub fn spawn_background_check_with_settings(
+    current_build: u64,
+    provider: CheckSettingsProvider,
+    notify: Option<HealthNotify>,
+    on_staged: Option<StagedNotify>,
+    on_checked: Option<CheckedNotify>,
+) {
+    once_automatic_known("automatic update checks", move || {
+        start_background_check(current_build, provider, notify, on_staged, on_checked);
+    });
+}
+
+/// How often a start waiting on [`automatic_at_launch`] asks again.
+const LAUNCH_SETTING_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Work run once, on whichever thread gets to it.
+type RunOnce = Box<dyn FnOnce() + Send>;
+
+/// A start that waits on [`automatic_at_launch`]: the lane it starts, and the start.
+type LaunchStart = (&'static str, RunOnce);
+
+/// What a wait on the launch setting runs on: a re-read of it, a sleep between re-reads, and a
+/// thread to do both on ([`LaunchWait::of_this_process`] in aterm, stand-ins in a test).
+#[derive(Clone)]
+struct LaunchWait {
+    read_again: std::sync::Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+    sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+    spawn: std::sync::Arc<dyn Fn(RunOnce) -> std::io::Result<()> + Send + Sync>,
+}
+
+impl LaunchWait {
+    /// The file's re-read ([`automatic_at_launch_read`]), the wall clock, and a named thread.
+    fn of_this_process() -> Self {
+        Self {
+            read_again: std::sync::Arc::new(automatic_at_launch_read),
+            sleep: std::sync::Arc::new(std::thread::sleep),
+            spawn: std::sync::Arc::new(|wait: RunOnce| {
+                std::thread::Builder::new()
+                    .name("aterm-update-setting".into())
+                    .spawn(wait)
+                    .map(drop)
+            }),
+        }
+    }
+
+    /// Start a thread that re-reads every [`LAUNCH_SETTING_RETRY`] and runs `start` at the read
+    /// that answers, whatever it says (`start` reads it itself). Gives `start` back where no thread
+    /// started.
+    fn begin(&self, lane: &'static str, start: RunOnce) -> Result<(), (RunOnce, std::io::Error)> {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(start)));
+        let waiting = std::sync::Arc::clone(&slot);
+        let wait = self.clone();
+        let started = (self.spawn)(Box::new(move || {
+            let mut reads: u64 = 1;
+            loop {
+                (wait.sleep)(LAUNCH_SETTING_RETRY);
+                reads += 1;
+                if (wait.read_again)().is_some() {
+                    aterm_log::info!(
+                        "aterm-update: [update] enabled read at attempt {reads}; {lane} go on as \
+                         it says"
+                    );
+                    if let Some(start) = take_start(&waiting) {
+                        start();
+                    }
+                    return;
+                }
+            }
+        }));
+        match started {
+            Ok(()) => Ok(()),
+            // A spawn that failed ran nothing, so the start is still in its slot.
+            Err(error) => take_start(&slot).map_or(Ok(()), |start| Err((start, error))),
+        }
+    }
+}
+
+fn take_start(slot: &std::sync::Mutex<Option<RunOnce>>) -> Option<RunOnce> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+use aterm_types::MutexExt as _;
+
+/// Starts whose wait on [`automatic_at_launch`] got no thread, and when to try one again.
+struct OwedLaunchStarts {
+    starts: Vec<LaunchStart>,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// This process's [`OwedLaunchStarts`]: [`start_owed_launch_waits`] answers them.
+static OWED_LAUNCH_STARTS: std::sync::Mutex<OwedLaunchStarts> =
+    std::sync::Mutex::new(OwedLaunchStarts {
+        starts: Vec::new(),
+        retry_at: None,
+    });
+
+/// Start `lane` once [`automatic_at_launch`] answers ([`once_known`]); where no thread could wait
+/// for it, the start is owed to [`start_owed_launch_waits`].
+fn once_automatic_known(lane: &'static str, start: impl FnOnce() + Send + 'static) {
+    let now = std::time::Instant::now();
+    if let Some(owed) = once_known(
+        lane,
+        automatic_at_launch(),
+        &LaunchWait::of_this_process(),
+        Box::new(start),
+    ) {
+        let mut owed_now = OWED_LAUNCH_STARTS.lock_or_recover();
+        owed_now.starts.push(owed);
+        owed_now.retry_at = Some(now + LAUNCH_SETTING_RETRY);
+    }
+}
+
+/// Answer the starts whose wait on [`automatic_at_launch`] got no thread, with no file read: run
+/// them once the setting has answered, else, from [`owed_launch_starts_due`] on, try a waiting
+/// thread for each again. The timers that already watch the update checker call it (the window's
+/// checker watch, a headless node's update loop); a terminal session has none, and its owed starts
+/// wait for its next launch.
+pub fn start_owed_launch_waits() {
+    if OWED_LAUNCH_STARTS.lock_or_recover().starts.is_empty() {
+        return;
+    }
+    start_owed(
+        &OWED_LAUNCH_STARTS,
+        automatic_kept(),
+        std::time::Instant::now(),
+        &LaunchWait::of_this_process(),
+    );
+}
+
+/// When [`start_owed_launch_waits`] has work, for the window to wake for: `None` while nothing is
+/// owed.
+#[must_use]
+pub fn owed_launch_starts_due() -> Option<std::time::Instant> {
+    let owed = OWED_LAUNCH_STARTS.lock_or_recover();
+    if owed.starts.is_empty() {
+        return None;
+    }
+    owed.retry_at
+}
+
+/// [`start_owed_launch_waits`] over `owed`, given what the setting has `kept`, at `now`.
+fn start_owed(
+    owed: &std::sync::Mutex<OwedLaunchStarts>,
+    kept: Option<bool>,
+    now: std::time::Instant,
+    wait: &LaunchWait,
+) {
+    let due = {
+        let mut owed = owed.lock_or_recover();
+        if owed.starts.is_empty() || (kept.is_none() && owed.retry_at.is_some_and(|at| now < at)) {
+            return;
+        }
+        owed.retry_at = Some(now + LAUNCH_SETTING_RETRY);
+        std::mem::take(&mut owed.starts)
+    };
+    let mut still = Vec::new();
+    for (lane, start) in due {
+        if kept.is_some() {
+            aterm_log::info!("aterm-update: [update] enabled read; {lane} go on as it says");
+            start();
+            continue;
+        }
+        match wait.begin(lane, start) {
+            Ok(()) => {
+                aterm_log::info!("aterm-update: a thread now waits on [update] enabled for {lane}")
+            }
+            Err((start, _)) => still.push((lane, start)),
+        }
+    }
+    owed.lock_or_recover().starts.extend(still);
+}
+
+/// Run `start` at once where the setting is `known_now`, else on a thread `wait` begins. A process
+/// whose first read of `[update] enabled` hit a fault that can pass neither runs a scheduled check
+/// over a person's `false` it could not read, nor, in a window or a headless node, leaves its
+/// checks off for the rest of its life once the fault passes. Gives `start` back, as `lane`'s,
+/// where no thread began, for [`start_owed`].
+fn once_known(
+    lane: &'static str,
+    known_now: Option<bool>,
+    wait: &LaunchWait,
+    start: RunOnce,
+) -> Option<LaunchStart> {
+    if known_now.is_some() {
+        start();
+        return None;
+    }
+    aterm_log::warn!(
+        "aterm-update: [update] enabled could not be read; {lane} wait, and aterm asks again \
+         every {} s",
+        LAUNCH_SETTING_RETRY.as_secs()
+    );
+    match wait.begin(lane, start) {
+        Ok(()) => None,
+        Err((start, error)) => {
+            aterm_log::warn!(
+                "aterm-update: no thread to wait on [update] enabled ({error}); a window or \
+                 headless node tries again, and a terminal session's {lane} wait for its next \
+                 launch"
+            );
+            Some((lane, start))
+        }
+    }
+}
+
+/// The platform's start of [`spawn_background_check_with_settings`].
+fn start_background_check(
     current_build: u64,
     provider: CheckSettingsProvider,
     notify: Option<HealthNotify>,
@@ -2438,6 +2454,10 @@ pub fn spawn_background_check_with_settings(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lib_launch_setting_tests.rs"]
+mod launch_setting_tests;
 
 /// Starts a replaced Linux executable gets to confirm itself ([`LinuxUpdateStatus::trial_starts`]).
 pub const LINUX_TRIAL_LAUNCHES: u32 = 3;
@@ -2844,7 +2864,8 @@ enum CheckerGate {
     Unavailable,
 }
 
-/// A cycle that took `checker.lock` writes its pid into it.
+/// A process that took an update lock (`checker.lock`, `stage.lock`, `apply.lock`) writes its pid
+/// into it.
 #[cfg(target_os = "macos")]
 fn note_checker_lock_holder(path: &std::path::Path) {
     use std::io::Write as _;
@@ -2859,7 +2880,7 @@ fn note_checker_lock_holder(path: &std::path::Path) {
     }
 }
 
-/// The pid the last process to take `checker.lock` wrote into it ([`note_checker_lock_holder`]).
+/// The pid the last process to take an update lock wrote into it ([`note_checker_lock_holder`]).
 #[cfg(target_os = "macos")]
 fn checker_lock_holder(path: &std::path::Path) -> Option<u32> {
     let pid: u32 = parse_uint(read_ledger_text(path)?.trim())?;
@@ -2868,6 +2889,83 @@ fn checker_lock_holder(path: &std::path::Path) -> Option<u32> {
     let exists = unsafe { libc::kill(raw, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     exists.then_some(pid)
+}
+
+/// Take `apply.lock`, waiting at most `wait`, naming this process as its holder; a wait that times
+/// out resumes a stopped holder ([`resume_stopped_lock_holder`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn take_apply_lock(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+) -> std::io::Result<aterm_update_core::FileLock> {
+    take_apply_lock_with(path, wait, is_an_aterm)
+}
+
+/// [`take_apply_lock`], asking `is_aterm` whether a stopped holder is one.
+#[cfg(target_os = "macos")]
+fn take_apply_lock_with(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+    is_aterm: impl FnOnce(u32) -> bool,
+) -> std::io::Result<aterm_update_core::FileLock> {
+    match aterm_update_core::FileLock::acquire_within(path, wait) {
+        Ok(lock) => {
+            note_checker_lock_holder(path);
+            Ok(lock)
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                resume_stopped_lock_holder(path, is_aterm);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Continue the process the held update lock at `path` names, if a stop is what holds it.
+///
+/// `aterm update check` at Ctrl-Z, or any interactive `aterm` whose background check holds the lock
+/// when its job stops, holds that lock until it runs again, and every aterm on this Mac waits on it.
+/// The lock itself stays: taking it from a live process would break one swap per build, so the
+/// holder finishes what it was doing and its guard lets go. The file names whoever last wrote it,
+/// which is not always who holds it now, so only ever `SIGCONT`, only to another aterm that has this
+/// lock open, and only after a wait timed out. A holder that stops again on its terminal (a job left
+/// in the background that reads it) gets its next run at the next wait that times out. Returns
+/// whether it sent one.
+#[cfg(target_os = "macos")]
+fn resume_stopped_lock_holder(path: &std::path::Path, is_aterm: impl FnOnce(u32) -> bool) -> bool {
+    let Some(pid) = checker_lock_holder(path).filter(|pid| *pid != std::process::id()) else {
+        return false;
+    };
+    if !aterm_uds::process::is_stopped(pid) || !is_aterm(pid) {
+        return false;
+    }
+    if !aterm_uds::holders::scan_file_holders(path, &[]).is_ok_and(|scan| scan.holds(pid)) {
+        return false;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: no pointer; `raw` is a live process of this account that the checks above named.
+    let sent = unsafe { libc::kill(raw, libc::SIGCONT) } == 0;
+    if sent {
+        log(&format!(
+            "{}: pid {pid}, which it names and which has it open, was stopped, so it is resumed to \
+             finish and let go",
+            path.display()
+        ));
+    }
+    sent
+}
+
+/// Whether `pid` runs an `aterm` executable, as a holder of an update lock does.
+#[cfg(target_os = "macos")]
+fn is_an_aterm(pid: u32) -> bool {
+    matches!(
+        aterm_uds::holders::exe_of(pid),
+        aterm_uds::holders::Exe::At(path)
+            if path.file_name().is_some_and(|name| name == "aterm")
+    )
 }
 
 /// When this machine last completed an update check.
@@ -3103,6 +3201,7 @@ fn run_checker(
             phase: CheckerPhase::Starting,
         };
     }
+    let _progress = progress::checker_scope(watch, generation);
     let interval = cadence::INTERVAL_SECS;
     let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
     let mut failures = cadence::FailureLog::default();
@@ -3574,6 +3673,17 @@ fn run_checker(
                         )),
                         (Streak::Quiet, _) => {}
                     }
+                    // A check stuck on the lane hides no stage a sibling or the node job wrote.
+                    if let Ok(hook) = args.staged_hook.lock()
+                        && let Some(hook) = hook.as_ref()
+                    {
+                        announce_sibling_stage(
+                            &mut announced_stage,
+                            current_build,
+                            status(current_build).as_ref(),
+                            Some(hook),
+                        );
+                    }
                 }
             }
             if strand_notice.due(unreadable::is_stranded()) && args.has_health_hook() {
@@ -3641,7 +3751,11 @@ fn settle_after_wake(
 /// The installed bundle's build number (`CFBundleVersion`).
 #[cfg(target_os = "macos")]
 fn installed_build_observed(app_root: &std::path::Path) -> Result<u64, String> {
-    observed_build_with(&INSTALLED_BUILD, app_root, verify::bundle_build_number)
+    observed_build_with(
+        &INSTALLED_BUILD,
+        app_root,
+        verify::bundle_build_number_from_file,
+    )
 }
 
 /// What identifies one version of a bundle's `Info.plist`.
@@ -3658,35 +3772,41 @@ static INSTALLED_BUILD: std::sync::Mutex<Option<(PlistIdentity, u64)>> =
 fn observed_build_with(
     cache: &std::sync::Mutex<Option<(PlistIdentity, u64)>>,
     app_root: &std::path::Path,
-    read: impl FnOnce(&std::path::Path) -> Result<u64, String>,
+    read: impl FnOnce(std::fs::File) -> Result<u64, String>,
 ) -> Result<u64, String> {
     use std::os::unix::fs::MetadataExt as _;
-    let identity = std::fs::metadata(app_root.join("Contents/Info.plist"))
-        .ok()
-        .map(|m| {
-            (
-                app_root.to_path_buf(),
-                m.dev(),
-                m.ino(),
-                m.size(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-            )
-        });
+    // Keep the cache identity and helper input on one file across bundle-path swaps.
+    let (file, metadata) = aterm_uds::regular_file::open(&app_root.join("Contents/Info.plist"))
+        .map_err(|error| format!("open installed Info.plist: {error}"))?;
+    let identity = |m: std::fs::Metadata| {
+        (
+            app_root.to_path_buf(),
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    let before = identity(metadata);
     let lock = || {
         cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if let (Some(identity), Some((seen, build))) = (identity.as_ref(), lock().as_ref())
-        && identity == seen
+    if let Some((seen, build)) = lock().as_ref()
+        && &before == seen
     {
         return Ok(*build);
     }
-    let build = read(app_root)?;
-    *lock() = identity.map(|identity| (identity, build));
+    let build = read(
+        file.try_clone()
+            .map_err(|error| format!("copy installed Info.plist handle: {error}"))?,
+    )?;
+    let after = file.metadata().ok().map(identity);
+    *lock() = (after.as_ref() == Some(&before)).then_some((before, build));
     Ok(build)
 }
 
@@ -3908,148 +4028,16 @@ impl UpdateStatus {
 /// The loop's schedule after a healthy check ([`after_healthy_check`]): the one-minute re-check
 /// while the head in flight's count is within `cadence::IN_FLIGHT_CHECKS`, else the base interval.
 #[cfg(all(test, target_os = "macos"))]
-mod after_healthy_check_tests {
-    use super::{after_healthy_check, cadence, github};
-    use std::time::Duration;
-
-    #[test]
-    fn a_healthy_check_that_found_a_head_in_flight_takes_its_quick_rung() {
-        let _guard = super::STRANDED_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = Duration::from_secs(cadence::INTERVAL_SECS);
-        let mut schedule = cadence::Cadence::new(base);
-        let spent = cadence::IN_FLIGHT_CHECKS;
-        for (latched, wait) in [
-            (Some(("v0.92.0".to_string(), 2)), Duration::from_secs(60)),
-            (
-                Some(("v0.92.0".to_string(), spent)),
-                Duration::from_secs(60),
-            ),
-            (Some(("v0.92.0".to_string(), spent + 1)), base),
-            (None, base),
-        ] {
-            github::set_head_in_flight(latched.clone());
-            after_healthy_check(&mut schedule);
-            assert_eq!(schedule.nominal(), wait, "{latched:?}");
-        }
-    }
-}
+#[path = "lib_after_healthy_check_tests.rs"]
+mod after_healthy_check_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod sibling_stage_tests {
-    use super::{StagedNotify, UpdateStatus, announce_sibling_stage};
-    use std::sync::{Arc, Mutex};
-
-    fn staged(build: Option<u64>) -> UpdateStatus {
-        let mut status = UpdateStatus::empty(true, 81, "another aterm process completed".into());
-        status.staged_build = build;
-        status.staged_version = build.map(|b| format!("0.{b}.0"));
-        status
-    }
-
-    #[test]
-    fn a_skip_announces_a_siblings_newer_stage_once_per_build() {
-        let calls: Arc<Mutex<Vec<(u64, String)>>> = Arc::default();
-        let sink = Arc::clone(&calls);
-        let hook: StagedNotify = Box::new(move |build, version| {
-            sink.lock().unwrap().push((build, version));
-        });
-        let mut announced = None;
-        let newer = staged(Some(85));
-        assert!(announce_sibling_stage(
-            &mut announced,
-            81,
-            Some(&newer),
-            Some(&hook)
-        ));
-        assert!(!announce_sibling_stage(
-            &mut announced,
-            81,
-            Some(&newer),
-            Some(&hook)
-        ));
-        assert_eq!(*calls.lock().unwrap(), vec![(85, "0.85.0".to_string())]);
-        let newest = staged(Some(86));
-        assert!(announce_sibling_stage(
-            &mut announced,
-            81,
-            Some(&newest),
-            Some(&hook)
-        ));
-        assert_eq!(calls.lock().unwrap().len(), 2);
-
-        let mut fresh = None;
-        for (label, current, status) in [
-            ("same build as running", 85, staged(Some(85))),
-            ("older than running", 90, staged(Some(85))),
-            ("nothing staged", 81, staged(None)),
-        ] {
-            assert!(
-                !announce_sibling_stage(&mut fresh, current, Some(&status), Some(&hook)),
-                "{label}"
-            );
-        }
-        assert!(
-            !announce_sibling_stage(&mut fresh, 81, None, Some(&hook)),
-            "no status"
-        );
-        assert!(
-            !announce_sibling_stage(&mut fresh, 81, Some(&newer), None),
-            "no hook"
-        );
-        assert_eq!(fresh, None, "nothing was latched without an announcement");
-        assert_eq!(calls.lock().unwrap().len(), 2);
-    }
-}
+#[path = "lib_sibling_stage_tests.rs"]
+mod sibling_stage_tests;
 
 #[cfg(test)]
-mod status_summary_tests {
-    use super::UpdateStatus;
-
-    fn staged(outcome: &str) -> UpdateStatus {
-        let mut status = UpdateStatus::empty(true, 81, outcome.to_string());
-        status.staged_build = Some(85);
-        status.staged_version = Some("0.85.0".to_string());
-        status
-    }
-
-    #[test]
-    fn a_staged_summary_preserves_refusals_and_independent_failure_classes() {
-        for (outcome, checks, applies) in [
-            ("staged 0.85.0 (build 85) — NOT applied: no successor", 0, 0),
-            (
-                "staged build did not apply: child exited before Ready",
-                0,
-                1,
-            ),
-            ("update check failed: network unavailable", 1, 0),
-        ] {
-            let mut status = staged(outcome);
-            status.failing_checks = checks;
-            status.failing_applies = applies;
-            assert_eq!(status.summary(), outcome);
-        }
-    }
-
-    #[test]
-    fn summary_is_one_bounded_unicode_line_for_outcomes_and_fallbacks() {
-        let status = staged(" apply refused:\nkeep\tthese sessions open\r\n");
-        assert_eq!(status.summary(), "apply refused: keep these sessions open");
-        let long = format!("apply refused: {}", "猫".repeat(600));
-        let line = staged(&long).summary();
-        assert!(line.starts_with("apply refused: "));
-        assert_eq!(line.chars().count(), 512);
-        assert!(line.ends_with('…'));
-        assert_eq!(staged(&"猫".repeat(512)).summary(), "猫".repeat(512));
-        let mut status = staged("");
-        status.staged_version = Some("猫\n".repeat(600));
-        let line = status.summary();
-        assert_eq!(line.chars().count(), 512);
-        assert!(!line.contains('\n'));
-        assert!(line.ends_with('…'));
-    }
-}
+#[path = "lib_status_summary_tests.rs"]
+mod status_summary_tests;
 
 /// Canonical equivalence for two git commit stamps from aterm's build metadata.
 #[must_use]
@@ -4681,1072 +4669,41 @@ pub(crate) fn warn(msg: &str) {
 
 /// Test-only capture of the updater's own log lines, with their level.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) mod log_capture {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static LINES: RefCell<Vec<(aterm_log::Level, String)>> = const { RefCell::new(Vec::new()) };
-    }
-
-    pub(crate) fn record(level: aterm_log::Level, msg: &str) {
-        LINES.with(|lines| lines.borrow_mut().push((level, msg.to_string())));
-    }
-
-    /// Drain this thread's captured lines.
-    pub(crate) fn take() -> Vec<(aterm_log::Level, String)> {
-        LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
-    }
-}
+#[path = "lib_log_capture_tests.rs"]
+pub(crate) mod log_capture;
 
 #[cfg(all(test, target_os = "macos"))]
-mod checker_gate_tests {
-    use super::unreachable_before_the_channel;
-
-    #[test]
-    fn only_this_checks_unreachable_channel_takes_the_quick_rungs() {
-        let dns = "curl HEAD https://github.com/alabsystems/aterm/releases/latest/download/\
-                   aterm-appcast.toml failed (exit status: 6): curl: (6) Could not resolve \
-                   host: github.com";
-        let stalled = "zip download failed: curl download failed (exit status: 28): curl: \
-                       (28) Operation too slow. Less than 4096 bytes/sec transferred the last \
-                       30 seconds";
-        let started = "2026-09-23T12:28:12Z";
-        let filed = |kind: &str, at: &str| crate::health::Health {
-            kind: kind.to_string(),
-            last_failure_at: at.to_string(),
-            ..Default::default()
-        };
-        assert!(unreachable_before_the_channel(
-            dns,
-            &filed("network", started),
-            started
-        ));
-        assert!(unreachable_before_the_channel(
-            "curl HEAD x failed (exit status: 5): curl: (5) Could not resolve proxy: proxy.invalid",
-            &filed("network", started),
-            started
-        ));
-        assert!(unreachable_before_the_channel(
-            dns,
-            &filed("network", "2026-09-23T12:28:15Z"),
-            started
-        ));
-        assert!(
-            !unreachable_before_the_channel(stalled, &filed("pipeline", started), started),
-            "a stalled container download is not a network that is down"
-        );
-        assert!(
-            !unreachable_before_the_channel(
-                dns,
-                &filed("network", "2026-09-23T12:18:12Z"),
-                started
-            ),
-            "an earlier check's record says nothing about this one"
-        );
-        assert!(!unreachable_before_the_channel(
-            "parse appcast: EOF while parsing",
-            &filed("network", started),
-            started
-        ));
-        assert!(!unreachable_before_the_channel(
-            dns,
-            &crate::health::Health::default(),
-            started
-        ));
-    }
-}
+#[path = "lib_checker_gate_tests.rs"]
+mod checker_gate_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod checker_skip_tests {
-    use std::time::Duration;
-
-    use super::{
-        SKIP_JITTER_SECS, checker_skip, checker_skip_at, paths::Staging, skip_timer_target,
-    };
-
-    fn staging(name: &str) -> crate::paths::ScratchStaging {
-        Staging::scratch(&format!("checker-{name}"))
-    }
-
-    fn now() -> u64 {
-        aterm_time::unix_secs().expect("clock")
-    }
-
-    fn write_receipt(s: &Staging, age_secs: u64, outcome: &str) {
-        let stamp = aterm_types::rfc3339::format_rfc3339(now().saturating_sub(age_secs));
-        std::fs::write(
-            super::check_receipt::path(s),
-            format!(
-                "schema = 1\ncurrent_build = 42\nsource = \"fixture/channel\"\n\
-                 updated_at = \"{stamp}\"\noutcome = \"{outcome}\"\n"
-            ),
-        )
-        .expect("write receipt");
-    }
-
-    const BASE: Duration = Duration::from_secs(30 * 60);
-
-    #[test]
-    fn a_skipping_process_points_its_timer_at_the_windows_end() {
-        let s = staging("window-end");
-        write_receipt(&s, 60, "completed");
-        let now = now();
-        let (_, expiry) = checker_skip_at(&s, BASE, now).expect("a fresh stamp skips");
-        let fresh = BASE.as_secs() * 7 / 10;
-        assert!(
-            ((now - 60 + fresh - 1)..=(now - 60 + fresh + 1)).contains(&expiry),
-            "checked_at + 0.7 × base: {expiry} vs now={now}"
-        );
-        assert_eq!(
-            skip_timer_target(expiry, 0),
-            expiry,
-            "no entropy, no scatter"
-        );
-        let scattered = skip_timer_target(expiry, 255);
-        assert!(
-            (expiry..expiry + SKIP_JITTER_SECS).contains(&scattered),
-            "the scatter is under a minute: {scattered} vs {expiry}"
-        );
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn a_stamp_ahead_of_the_clock_defers_no_check() {
-        let s = staging("future");
-        write_receipt(&s, 0, "completed");
-        assert!(checker_skip_at(&s, BASE, now() - 2 * 3600).is_none());
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn a_recorded_deferral_holds_off_every_process_not_just_the_one_that_saw_it() {
-        let s = staging("deferred");
-        write_receipt(&s, 25 * 60, "deferred");
-        let reason = checker_skip(&s, BASE).expect("the deferral widens the window");
-        assert!(reason.contains("deferred"), "{reason}");
-        write_receipt(&s, 50 * 60, "deferred");
-        assert!(checker_skip(&s, BASE).is_none(), "the retreat self-heals");
-        write_receipt(&s, 25 * 60, "completed");
-        assert!(
-            checker_skip(&s, BASE).is_none(),
-            "a healthy check returns the window to the base interval"
-        );
-        write_receipt(&s, 25 * 60, "deferred: install location not writable");
-        assert!(checker_skip(&s, BASE).is_none());
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn the_deferring_process_wakes_past_its_own_deferred_window() {
-        use super::cadence::Cadence;
-        let s = staging("own-deferral");
-        write_receipt(&s, 0, "deferred");
-        let stamped = now();
-        let (_, expiry) = checker_skip_at(&s, BASE, stamped).expect("the deferral's window");
-        let at = std::time::Instant::now();
-        for entropy in [0u8, 128, 255] {
-            let until = skip_timer_target(expiry, entropy);
-            let window_end = at + Duration::from_secs(until - stamped);
-            let mut schedule = Cadence::new(BASE);
-            schedule.deferred(Some(window_end), at, entropy);
-            let wake = stamped + schedule.delay_at(at, entropy).as_secs();
-            assert!(
-                checker_skip_at(&s, BASE, wake).is_none(),
-                "entropy {entropy}: woke at +{}s, inside its own window",
-                wake - stamped
-            );
-            let mut ladder = Cadence::new(BASE);
-            ladder.failed();
-            let early = stamped + ladder.delay_at(at, entropy).as_secs();
-            assert!(
-                checker_skip_at(&s, BASE, early)
-                    .is_some_and(|(reason, _)| reason.contains("deferred")),
-                "entropy {entropy}: the ladder alone woke at +{}s",
-                early - stamped
-            );
-        }
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn a_deferral_holds_the_machine_off_for_minutes_however_fast_the_base() {
-        use super::cadence::{Cadence, INTERVAL_SECS};
-        let base = Duration::from_secs(INTERVAL_SECS);
-        let s = staging("deferral-floor");
-        write_receipt(&s, 13 * 60, "deferred");
-        assert!(
-            checker_skip(&s, base).is_some_and(|reason| reason.contains("deferred")),
-            "13 minutes into the retreat, every process still holds off"
-        );
-        write_receipt(&s, 15 * 60, "deferred");
-        assert!(checker_skip(&s, base).is_none(), "and past it, they check");
-        write_receipt(&s, 13 * 60, "completed");
-        assert!(checker_skip(&s, base).is_none());
-
-        write_receipt(&s, 0, "deferred");
-        let stamped = now();
-        let (_, expiry) = checker_skip_at(&s, base, stamped).expect("the deferral's window");
-        assert!(expiry >= stamped + 10 * 60, "{}s", expiry - stamped);
-        let at = std::time::Instant::now();
-        for entropy in [0u8, 128, 255] {
-            let until = skip_timer_target(expiry, entropy);
-            let mut schedule = Cadence::new(base);
-            schedule.deferred(Some(at + Duration::from_secs(until - stamped)), at, entropy);
-            let wake = stamped + schedule.delay_at(at, entropy).as_secs();
-            assert!(
-                checker_skip_at(&s, base, wake).is_none(),
-                "entropy {entropy}: woke at +{}s, inside its own window",
-                wake - stamped
-            );
-        }
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn a_missing_or_empty_ledger_never_defers_a_check() {
-        let s = staging("missing");
-        assert!(checker_skip(&s, BASE).is_none(), "no ledger: check");
-        std::fs::write(
-            super::check_receipt::path(&s),
-            "schema = 1\ncurrent_build = 42\nsource = \"fixture/channel\"\nupdated_at = \"\"\n",
-        )
-        .expect("write");
-        assert!(checker_skip(&s, BASE).is_none(), "empty stamp: check");
-        std::fs::write(super::check_receipt::path(&s), "not toml at all {{{").expect("write");
-        assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
-        std::fs::write(
-            super::check_receipt::path(&s),
-            format!(
-                "schema = 1\nupdated_at = \"{}\"\n",
-                aterm_types::rfc3339::format_rfc3339(now())
-            ),
-        )
-        .expect("write");
-        assert!(
-            checker_skip(&s, BASE).is_none(),
-            "legacy, no provenance: check"
-        );
-        let _ = std::fs::remove_dir_all(&s.root);
-    }
-
-    #[test]
-    fn the_status_line_carries_delivery_only_when_recorded() {
-        use super::Delivery;
-        assert_eq!(
-            Delivery::from_ledger_text("schema = 1\noutcome = \"up to date\"\n")
-                .status_line_suffix(),
-            ""
-        );
-        assert_eq!(
-            Delivery::from_ledger_text("not toml {{{").status_line_suffix(),
-            ""
-        );
-        for note in ["deferred", "blocked"] {
-            assert_eq!(
-                Delivery::from_ledger_text(&format!("schema = 1\ndelivery = \"{note}\"\n"))
-                    .status_line_suffix(),
-                format!(" delivery={note}")
-            );
-        }
-    }
-}
+#[path = "lib_checker_skip_tests.rs"]
+mod checker_skip_tests;
 
 /// The per-cycle read of the installed bundle's build number spawns PlistBuddy only when the
 /// plist moved, and the floor that yanks it is a gate read.
 #[cfg(all(test, target_os = "macos"))]
-mod installed_build_tests {
-    use std::cell::Cell;
-    use std::sync::Mutex;
-
-    #[test]
-    fn an_unreadable_floor_does_not_admit_the_installed_build() {
-        use std::os::unix::fs::PermissionsExt;
-        let staging = crate::paths::Staging::scratch("installed-yank-floor");
-        let checks = |build: u64| crate::verify::BundleChecks {
-            policy: Ok(()),
-            build: Ok(build),
-            commit: Ok("0123456789abcdef0123456789abcdef01234567".to_string()),
-            team: None,
-            short_version: Some(Ok(format!("0.{build}.0"))),
-        };
-        let facts = |build| super::installed_facts_from(checks(build), Some(&staging));
-        let due = |build| super::installed_announcement_due(Some(&staging), build, 500, None);
-        std::fs::write(staging.floor(), "min_build = 530\n").unwrap();
-        assert_eq!(super::installed_build_yanked(Some(&staging), 520), Ok(true));
-        assert_eq!(
-            super::installed_build_yanked(Some(&staging), 530),
-            Ok(false)
-        );
-        assert_eq!(super::installed_build_yanked(None, 520), Ok(false));
-        assert!(facts(520).is_ok_and(|facts| facts.yanked));
-        assert!(facts(530).is_ok_and(|facts| !facts.yanked && facts.build_number == 530));
-        assert!(!due(520), "a yanked build is not announced");
-        assert!(due(530));
-        assert!(!super::installed_announcement_due(
-            Some(&staging),
-            530,
-            500,
-            Some(530)
-        ));
-        assert!(!super::installed_announcement_due(
-            Some(&staging),
-            530,
-            530,
-            None
-        ));
-        assert!(super::installed_announcement_due(None, 520, 500, None));
-        let mode =
-            |bits| std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(bits));
-        mode(0o000).unwrap();
-        if std::fs::File::open(staging.floor()).is_ok() {
-            aterm_uds::host::could_not_run(
-                "a mode-0 file opened anyway: root, or a file system that ignores modes",
-            );
-        }
-        let unreadable = super::installed_build_yanked(Some(&staging), 520);
-        let reported = facts(520);
-        let announced = due(520);
-        mode(0o600).unwrap();
-        assert!(
-            unreadable
-                .as_ref()
-                .is_err_and(|e| crate::is_passing_refusal(e)),
-            "an unreadable floor must be a passing refusal, not a verdict: {unreadable:?}"
-        );
-        assert!(
-            reported
-                .as_ref()
-                .is_err_and(|e| crate::is_passing_refusal(e)),
-            "the facts reported an installed build an unreadable floor may yank: {reported:?}"
-        );
-        assert!(
-            !announced,
-            "the checker announced an installed build an unreadable floor may yank"
-        );
-    }
-
-    #[test]
-    fn an_unchanged_plist_is_read_once_and_a_moved_one_again() {
-        let dir = crate::paths::scratch_dir("observed-plist");
-        let app = dir.path().join("aterm.app");
-        let plist = app.join("Contents/Info.plist");
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        let cache = Mutex::new(None);
-        let reads = Cell::new(0u32);
-        let answer = Cell::new(Some(900u64));
-        let observe = || {
-            super::observed_build_with(&cache, &app, |_| {
-                reads.set(reads.get() + 1);
-                answer
-                    .get()
-                    .ok_or_else(|| "PlistBuddy CFBundleVersion timed out".to_string())
-            })
-        };
-        std::fs::write(&plist, "build 900").unwrap();
-        for _ in 0..5 {
-            assert_eq!(observe(), Ok(900));
-        }
-        assert_eq!(reads.get(), 1, "five cycles, one read");
-
-        answer.set(Some(901));
-        std::fs::write(&plist, "build 9010").unwrap();
-        assert_eq!(observe(), Ok(901), "rewritten, another size");
-        assert_eq!(reads.get(), 2);
-
-        let mtime = std::fs::metadata(&plist).unwrap().modified().unwrap();
-        answer.set(Some(902));
-        std::fs::write(&plist, "build 9020").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&plist)
-            .and_then(|f| f.set_modified(mtime))
-            .unwrap();
-        assert_eq!(observe(), Ok(902), "the same size under a restored mtime");
-        assert_eq!(reads.get(), 3);
-
-        answer.set(Some(903));
-        let swapped = app.join("Contents/Info.plist.new");
-        std::fs::write(&swapped, "build 9030").unwrap();
-        std::fs::rename(&swapped, &plist).unwrap();
-        assert_eq!(observe(), Ok(903), "a new inode");
-        assert_eq!(reads.get(), 4);
-        assert_eq!(observe(), Ok(903));
-        assert_eq!(reads.get(), 4, "and then remembered");
-
-        answer.set(None);
-        std::fs::write(&plist, "build 9040").unwrap();
-        assert!(observe().is_err());
-        answer.set(Some(904));
-        assert_eq!(observe(), Ok(904), "a failed read is not remembered");
-        assert_eq!(reads.get(), 6);
-
-        std::fs::remove_file(&plist).unwrap();
-        answer.set(None);
-        assert!(observe().is_err());
-        assert!(observe().is_err());
-        assert_eq!(reads.get(), 8, "nothing to stat: every call reads");
-    }
-}
+#[path = "lib_installed_build_tests.rs"]
+mod installed_build_tests;
 
 #[cfg(test)]
-mod rfc3339_age_tests {
-    use super::rfc3339_older_than;
-
-    #[test]
-    fn empty_and_malformed_stamps_are_never_stale() {
-        assert!(!rfc3339_older_than("", 60));
-        assert!(!rfc3339_older_than("never", 60));
-        assert!(!rfc3339_older_than("-", 60));
-    }
-
-    #[test]
-    fn ancient_stamps_are_stale_and_future_stamps_are_not() {
-        assert!(rfc3339_older_than("2001-01-01T00:00:00Z", 60));
-        assert!(!rfc3339_older_than("2999-01-01T00:00:00Z", 60));
-    }
-}
+#[path = "lib_rfc3339_age_tests.rs"]
+mod rfc3339_age_tests;
 
 #[cfg(test)]
-mod commit_match_tests {
-    use std::collections::BTreeSet;
-
-    #[cfg(target_os = "macos")]
-    use super::persistent_notice_is_owed;
-    use super::{
-        ReconciledStatusOutcome, StatusReconciliation, commit_matches, compiled_update_pin_sha256,
-        persisted_claims_stage, reconcile_status_outcome, status_reconciliation_projection,
-        update_pubkey_sha256,
-    };
-
-    #[test]
-    fn update_pin_fingerprint_hashes_decoded_key_and_fails_closed() {
-        let encoded = aterm_codec::base64::encode(&[0_u8; 32]).unwrap();
-        assert_eq!(
-            update_pubkey_sha256(&encoded).unwrap().as_deref(),
-            Some("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
-        );
-        assert_eq!(update_pubkey_sha256("").unwrap(), None);
-        assert!(update_pubkey_sha256("not-base64").is_err());
-        let short = aterm_codec::base64::encode(&[0_u8; 31]).unwrap();
-        assert!(update_pubkey_sha256(&short).is_err());
-
-        let compiled = compiled_update_pin_sha256();
-        assert!(
-            compiled.len() == 64 && compiled.bytes().all(|b| b.is_ascii_hexdigit()),
-            "the armed master prints its fingerprint: {compiled}"
-        );
-        assert_eq!(
-            compiled,
-            update_pubkey_sha256(aterm_update_core::pins::PAPER_MASTER_PUBKEYS[0])
-                .unwrap()
-                .unwrap()
-        );
-    }
-
-    fn observed_outcome(reconciliation: &StatusReconciliation) -> (&str, bool) {
-        match &reconciliation.outcome {
-            ReconciledStatusOutcome::Preserved(outcome) => (outcome, false),
-            ReconciledStatusOutcome::Neutralized(outcome) => (outcome, true),
-        }
-    }
-
-    #[test]
-    fn status_reconciliation_exhaustively_refines_the_model() {
-        let model = aterm_models_update::native_update_status_reconciliation_model();
-        let reachable_inputs: BTreeSet<_> = model
-            .successors("PickStatusInputs", &model.init_state())
-            .into_iter()
-            .collect();
-        assert_eq!(
-            reachable_inputs.len(),
-            16,
-            "2 running × 2 ledger × 2 Ready × 2 persisted classes"
-        );
-
-        let persisted_cases = [
-            ("staged 0.2 (build 2) — applies on next launch", true),
-            ("network check failed", false),
-        ];
-        let ready_builds = [None, Some(1), Some(2), Some(3)];
-        let mut projected_inputs = BTreeSet::new();
-        let mut calls = 0usize;
-
-        for running_build in 1..=2 {
-            for checked_from_build in 1..=2 {
-                for ready_build in ready_builds {
-                    for (persisted, staged_claim) in persisted_cases {
-                        assert_eq!(persisted_claims_stage(persisted), staged_claim);
-                        let reconciliation = reconcile_status_outcome(
-                            running_build,
-                            checked_from_build,
-                            ready_build,
-                            persisted.to_string(),
-                        );
-                        let expected_ready = ready_build.is_some_and(|build| build > running_build);
-                        assert_eq!(
-                            reconciliation.current_build, running_build,
-                            "the ledger may never relabel its caller"
-                        );
-                        assert_eq!(
-                            reconciliation.ready_present, expected_ready,
-                            "Ready must be effective iff its build is strictly newer"
-                        );
-
-                        let expected_neutralized = !expected_ready
-                            && (checked_from_build != running_build || staged_claim);
-                        let (reported_outcome, neutralized) = observed_outcome(&reconciliation);
-                        assert_eq!(neutralized, expected_neutralized);
-                        if expected_neutralized {
-                            let expected = if checked_from_build == running_build {
-                                "no update is staged"
-                            } else {
-                                "no update is staged (checked from another build of aterm)"
-                            };
-                            assert_eq!(reported_outcome, expected);
-                        } else {
-                            assert_eq!(reported_outcome, persisted);
-                        }
-
-                        let (previous, next) = status_reconciliation_projection(
-                            running_build,
-                            checked_from_build,
-                            reconciliation.ready_present,
-                            persisted,
-                            reconciliation.current_build,
-                            reported_outcome,
-                            neutralized,
-                        );
-                        assert!(
-                            reachable_inputs.contains(&previous),
-                            "real input projection is unreachable: {previous:?}"
-                        );
-                        projected_inputs.insert(previous.clone());
-
-                        let label = format!(
-                            "status reconciliation running={running_build} ledger={checked_from_build} ready={ready_build:?} staged={staged_claim}"
-                        );
-                        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-                            &model,
-                            &[],
-                            &previous,
-                            &next,
-                            Some("ReconcileStatus"),
-                            &label,
-                        );
-                        assert!(admitted, "real reducer transition rejected: {why}");
-                        for invariant in &model.invariants {
-                            assert!(
-                                model.check_invariant(invariant.name, &next),
-                                "real reducer violated {}: {next:?}",
-                                invariant.name
-                            );
-                        }
-                        calls += 1;
-                    }
-                }
-            }
-        }
-
-        assert_eq!(
-            calls, 32,
-            "the concrete decision lattice must stay exhaustive"
-        );
-        assert_eq!(
-            projected_inputs, reachable_inputs,
-            "Tier-1 must cover every bounded PickStatusInputs class"
-        );
-    }
-
-    #[test]
-    fn status_reconciliation_model_negative_controls_are_non_vacuous() {
-        let model = aterm_models_update::native_update_status_reconciliation_model();
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-
-        let (caller_previous, caller_bug) = status_reconciliation_projection(
-            1,
-            2,
-            false,
-            "network check failed",
-            2,
-            "network check failed",
-            false,
-        );
-        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &caller_previous,
-            &caller_bug,
-            Some("ReconcileStatus"),
-            "status reconciliation caller-build negative control",
-        );
-        assert!(!admitted, "healthy model admitted caller relabeling: {why}");
-        assert!(
-            buggy
-                .successors("ReconcileTrustingLedger", &caller_previous)
-                .contains(&caller_bug),
-            "Buggy=1 must reproduce caller relabeling"
-        );
-        assert!(!buggy.check_invariant("CallerBuildIsAuthoritative", &caller_bug));
-
-        let persisted = "staged 0.2 (build 2) — applies on next launch";
-        let real = reconcile_status_outcome(2, 2, Some(2), persisted.to_string());
-        assert!(
-            !real.ready_present,
-            "an equal-build Ready marker must be treated as absent"
-        );
-        let (ready_previous, _) = status_reconciliation_projection(
-            2,
-            2,
-            real.ready_present,
-            persisted,
-            real.current_build,
-            observed_outcome(&real).0,
-            observed_outcome(&real).1,
-        );
-        let (_, ready_bug) =
-            status_reconciliation_projection(2, 2, false, persisted, 2, persisted, false);
-        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &ready_previous,
-            &ready_bug,
-            Some("ReconcileStatus"),
-            "status reconciliation strict-newer negative control",
-        );
-        assert!(!admitted, "healthy model admitted stale Ready prose: {why}");
-        assert!(
-            buggy
-                .successors("ReconcileOnMarkerPresence", &ready_previous)
-                .contains(&ready_bug),
-            "Buggy=1 must reproduce the mere-presence defect"
-        );
-        assert!(!buggy.check_invariant("AbsentReadyCannotAdvertiseStage", &ready_bug));
-
-        for (running, ledger, ready, persisted, mutant, law) in [
-            (
-                1,
-                2,
-                Some(2),
-                "staged 0.2 (build 2) — applies on next launch",
-                "NeutralizeDespiteReady",
-                "ReadyPreservesPersistedOutcome",
-            ),
-            (
-                2,
-                2,
-                None,
-                "up to date (latest release build 2)",
-                "NeutralizeEveryAbsentReady",
-                "HonestTerminalOutcomeIsPreserved",
-            ),
-        ] {
-            let real = reconcile_status_outcome(running, ledger, ready, persisted.to_string());
-            let (reported, neutralized) = observed_outcome(&real);
-            assert!(!neutralized, "the real reducer preserves {persisted:?}");
-            assert_eq!(reported, persisted);
-            let (previous, preserved) = status_reconciliation_projection(
-                running,
-                ledger,
-                real.ready_present,
-                persisted,
-                real.current_build,
-                reported,
-                neutralized,
-            );
-            let rewritten = buggy.successors(mutant, &previous)[0].clone();
-            assert_ne!(rewritten, preserved);
-            let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &previous,
-                &rewritten,
-                Some("ReconcileStatus"),
-                "status reconciliation over-correction negative control",
-            );
-            assert!(!admitted, "healthy model admitted {mutant}: {why}");
-            assert!(
-                !buggy.check_invariant(law, &rewritten),
-                "{mutant} escapes {law}"
-            );
-        }
-    }
-
-    #[test]
-    fn status_reconciliation_never_reports_an_old_build_or_absent_stage() {
-        let cases = [
-            (
-                53,
-                54,
-                None,
-                "installed 0.54 (build 54); activating now",
-                false,
-            ),
-            (
-                53,
-                53,
-                None,
-                "skipping re-stage of build 54 for another 5m; NOT skipping apply: \
-                 staged 0.54 (build 54) is verified and ready to apply",
-                false,
-            ),
-        ];
-        for (running, ledger, ready, persisted, preserve) in cases {
-            let reconciliation =
-                reconcile_status_outcome(running, ledger, ready, persisted.to_string());
-            assert_eq!(reconciliation.current_build, running);
-            let got = reconciliation.outcome.into_string();
-            if preserve {
-                assert_eq!(got, persisted);
-            } else {
-                let expected = if ledger == running {
-                    "no update is staged"
-                } else {
-                    "no update is staged (checked from another build of aterm)"
-                };
-                assert_eq!(got, expected);
-                assert!(!got.contains("applies on next launch"));
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ledger_reader_rejects_oversized_and_non_regular_inputs() {
-        let dir = crate::paths::scratch_dir("ledger-cap");
-        let valid = dir.join("valid.toml");
-        std::fs::write(&valid, b"enabled = true\n").unwrap();
-        assert_eq!(
-            super::read_ledger_text(&valid).as_deref(),
-            Some("enabled = true\n")
-        );
-
-        let oversized = dir.join("oversized.toml");
-        let file = std::fs::File::create(&oversized).unwrap();
-        file.set_len(super::MAX_LEDGER_BYTES + 1).unwrap();
-        assert!(super::read_ledger_text(&oversized).is_none());
-        assert!(super::read_ledger_text(&dir).is_none());
-        let link = dir.join("link.toml");
-        std::os::unix::fs::symlink(&valid, &link).unwrap();
-        assert!(super::read_ledger_text(&link).is_none());
-        assert!(super::read_ledger_text_checked(&link).is_err());
-    }
-
-    #[test]
-    fn commit_matches_classifies_every_pairing() {
-        const FULL: &str = "4e91d3334041788ad92f5b6568cb648cb25805d6";
-        for (a, b, matches, why) in [
-            (
-                "4e91d3334041",
-                FULL,
-                true,
-                "12-hex binary stamp vs 40-hex appcast commit",
-            ),
-            (FULL, "4e91d3334041", true, "order must not matter"),
-            (
-                "  4E91D3334041 ",
-                FULL,
-                true,
-                "case and surrounding whitespace are ignored",
-            ),
-            (FULL, FULL, true, "identical full hashes"),
-            (
-                "4e91d3334041",
-                "deadbeefcafe0000000000000000000000000000",
-                false,
-                "different commits",
-            ),
-            ("4e91d3334041-dirty", FULL, false, "dirty vs its own base"),
-            (
-                "4e91d3334041-dirty",
-                "4e91d3334041-dirty",
-                false,
-                "dirty vs itself",
-            ),
-            ("unknown", FULL, false, "the unknown stamp"),
-            ("", FULL, false, "empty"),
-            (
-                "-",
-                FULL,
-                false,
-                "the control socket's no-staged-commit sentinel",
-            ),
-            ("nothexatall12", FULL, false, "non-hex"),
-            (
-                "4e91d3",
-                FULL,
-                false,
-                "6 hex is below git's abbreviation floor",
-            ),
-            (
-                "4e91d33",
-                FULL,
-                true,
-                "7 hex is git's floor and is accepted",
-            ),
-        ] {
-            assert_eq!(commit_matches(a, b), matches, "{why}: {a:?} vs {b:?}");
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_second_persistent_class_still_speaks_but_the_same_one_stays_quiet() {
-        assert!(!persistent_notice_is_owed(None, None));
-        assert!(!persistent_notice_is_owed(Some("pipeline"), None));
-        assert!(persistent_notice_is_owed(None, Some("pipeline")));
-        assert!(!persistent_notice_is_owed(
-            Some("pipeline"),
-            Some("pipeline")
-        ));
-        assert!(persistent_notice_is_owed(Some("pipeline"), Some("apply")));
-        assert!(!persistent_notice_is_owed(Some("apply"), Some("apply")));
-        assert!(persistent_notice_is_owed(Some("apply"), Some("pipeline")));
-        assert!(!persistent_notice_is_owed(Some("pipeline"), Some("stage")));
-        assert!(!persistent_notice_is_owed(Some("stage"), Some("pipeline")));
-    }
-}
+#[path = "lib_commit_match_tests.rs"]
+mod commit_match_tests;
 
 #[cfg(test)]
-mod team_pin_tests {
-    #[test]
-    fn the_runtime_team_requirement_can_only_tighten() {
-        assert!(
-            !super::PINNED_TEAM_ID.is_empty(),
-            "Tier APPLE is armed; an empty pin changes this test's meaning"
-        );
-        assert_eq!(
-            super::effective_team_id(),
-            super::PINNED_TEAM_ID,
-            "the pin decides"
-        );
-
-        super::set_required_team_id(None);
-        super::set_required_team_id(Some("   "));
-        super::set_required_team_id(Some("ZZZZZ99999"));
-        assert_eq!(
-            super::effective_team_id(),
-            super::PINNED_TEAM_ID,
-            "a settings file can neither relax nor replace a compiled pin"
-        );
-    }
-}
+#[path = "lib_team_pin_tests.rs"]
+mod team_pin_tests;
 
 /// A policy this process could not read just then refuses the pre-verification as a passing
 /// condition.
 #[cfg(all(test, target_os = "macos"))]
-mod handoff_candidate_facts_tests {
-    use super::*;
-    use aterm_update_core::handoff_policy::{PolicyFile, PolicyRead};
-
-    #[test]
-    fn an_unread_policy_refuses_the_preverification_as_a_passing_condition() {
-        let unread = PolicyRead::Unread(
-            "/x/Contents/Resources/aterm-handoff-policy.toml: unreadable: Too many open files \
-             (os error 24)"
-                .into(),
-        );
-        let refused = HandoffCandidateFacts::admitted(unread, Ok(bundle::Capabilities::default()))
-            .expect_err("an unread policy is not a pass");
-        assert!(is_passing_refusal(&refused), "{refused}");
-        for policy in [
-            PolicyRead::Absent,
-            PolicyRead::Ignored("not TOML".into()),
-            PolicyRead::Parsed(PolicyFile::default()),
-        ] {
-            assert_eq!(
-                HandoffCandidateFacts::admitted(
-                    policy.clone(),
-                    Ok(bundle::Capabilities {
-                        grant_chunks: true,
-                        grant_empty: true,
-                        grant_desk: true,
-                        recipient_recovery: NativeRecipientRecovery::BoundJournal,
-                    })
-                ),
-                Ok(HandoffCandidateFacts {
-                    policy: policy.clone(),
-                    grant_chunks: true,
-                    grant_empty: true,
-                    grant_desk: true,
-                    recipient_recovery: NativeRecipientRecovery::BoundJournal,
-                }),
-                "{policy:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_info_plist_read_the_system_refused_for_now_refuses_the_preverification() {
-        let declared = "<plist><dict><key>ATermHandoffGrantChunks</key>\
-                        <string>chunks1</string></dict></plist>";
-        let plist = std::path::Path::new("/x/aterm.app/Contents/Info.plist");
-        let read = |errno: i32| {
-            bundle::Capabilities::judge(plist, Err(std::io::Error::from_raw_os_error(errno)))
-        };
-        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EIO] {
-            let refused = HandoffCandidateFacts::admitted(PolicyRead::Absent, read(errno))
-                .expect_err("a moment's read of the Info.plist is not a pass");
-            assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
-        }
-        assert_eq!(
-            HandoffCandidateFacts::admitted(PolicyRead::Absent, read(libc::EACCES)),
-            Ok(HandoffCandidateFacts {
-                policy: PolicyRead::Absent,
-                grant_chunks: false,
-                grant_empty: false,
-                grant_desk: false,
-                recipient_recovery: NativeRecipientRecovery::Absent,
-            })
-        );
-        assert_eq!(
-            bundle::Capabilities::judge(plist, Ok(Some(declared.to_string()))),
-            Ok(bundle::Capabilities {
-                grant_chunks: true,
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            bundle::Capabilities::judge(plist, Ok(None)),
-            Ok(bundle::Capabilities::default())
-        );
-    }
-
-    #[test]
-    fn capability_snapshots_follow_the_bundle_on_disk_without_changing_prior_reads() {
-        let root = crate::paths::scratch_dir("grant-chunks");
-        let contents = root.join("aterm.app/Contents");
-        std::fs::create_dir_all(&contents).unwrap();
-        let app = root.join("aterm.app");
-        let grants = |read: Result<HandoffCandidateFacts, String>| {
-            read.map(|facts| {
-                (
-                    facts.grant_chunks,
-                    facts.grant_empty,
-                    facts.grant_desk,
-                    facts.recipient_recovery,
-                )
-            })
-        };
-        assert_eq!(
-            grants(HandoffCandidateFacts::read(&app)),
-            Ok((false, false, false, NativeRecipientRecovery::Absent))
-        );
-        std::fs::write(
-            contents.join("Info.plist"),
-            "<plist><dict><key>ATermHandoffGrantChunks</key><string>chunks1</string>\
-             </dict></plist>",
-        )
-        .unwrap();
-        let chunks_only = HandoffCandidateFacts::read(&app);
-        std::fs::write(
-            contents.join("Info.plist"),
-            "<plist><dict><key>ATermHandoffGrantChunks</key><string>chunks1</string>\
-             <key>ATermHandoffGrantEmpty</key><string>empty1</string></dict></plist>",
-        )
-        .unwrap();
-        let both = HandoffCandidateFacts::read(&app);
-        std::fs::write(
-            contents.join("Info.plist"),
-            "<plist><dict><key>ATermHandoffGrantChunks</key><string>chunks1</string>\
-             <key>ATermHandoffGrantEmpty</key><string>empty1</string>\
-             <key>ATermHandoffGrantDesk</key><string>desk1</string></dict></plist>",
-        )
-        .unwrap();
-        let all = HandoffCandidateFacts::read(&app);
-        std::fs::write(
-            contents.join("Info.plist"),
-            "<plist><dict><key>ATermNativeRecipientRecovery</key><string>recipients5</string></dict></plist>",
-        ).unwrap();
-        let legacy_reader = HandoffCandidateFacts::read(&app);
-        std::fs::write(
-            contents.join("Info.plist"),
-            include_str!("../../../apps/aterm-mac/Info.plist"),
-        )
-        .unwrap();
-        let current = HandoffCandidateFacts::read(&app);
-        std::fs::write(contents.join("Info.plist"), "<plist><dict/></plist>").unwrap();
-        let replaced = HandoffCandidateFacts::read(&app);
-        assert_eq!(
-            grants(chunks_only),
-            Ok((true, false, false, NativeRecipientRecovery::Absent))
-        );
-        assert_eq!(
-            grants(both),
-            Ok((true, true, false, NativeRecipientRecovery::Absent))
-        );
-        assert_eq!(
-            grants(all),
-            Ok((true, true, true, NativeRecipientRecovery::Absent))
-        );
-        assert_eq!(
-            grants(legacy_reader),
-            Ok((false, false, false, NativeRecipientRecovery::LegacyJournal))
-        );
-        assert_eq!(
-            grants(current),
-            Ok((true, true, true, NativeRecipientRecovery::BoundJournal))
-        );
-        assert_eq!(
-            grants(replaced),
-            Ok((false, false, false, NativeRecipientRecovery::Absent))
-        );
-    }
-}
+#[path = "lib_handoff_candidate_facts_tests.rs"]
+mod handoff_candidate_facts_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod node_start_tests {
-    use super::{newer_for_a_start, older_than};
-
-    /// AN OLDER INSTALLED BUILD IS ONLY ONE BELOW THIS ONE: the build a revert put back, never
-    /// this build or a newer one, which [`newer_for_a_start`] judges.
-    #[test]
-    fn only_a_build_below_this_one_is_an_older_installed_build() {
-        assert_eq!(older_than(100, Some(99)), Some(99), "a revert put 99 back");
-        assert_eq!(older_than(100, Some(100)), None, "this build stands here");
-        assert_eq!(
-            older_than(100, Some(101)),
-            None,
-            "a newer build stands here"
-        );
-        assert_eq!(
-            older_than(100, None),
-            None,
-            "the installed build cannot be read"
-        );
-    }
-
-    /// A NODE START RUNS NO YANKED INSTALLED BUILD: the installed arm counts only once the floor
-    /// reads that it leaves the build, while a staged build above this one counts as it did. The
-    /// control is the same installed build with a floor that leaves it.
-    #[test]
-    fn a_yanked_or_unjudged_installed_build_is_no_newer_build_for_a_start() {
-        let leaves = |_: u64| Ok(false);
-        let yanks = |build: u64| Ok(build < 102);
-        let unread = |_: u64| Err("the floor is unreadable".to_owned());
-        assert_eq!(
-            newer_for_a_start(100, None, Some(101), leaves),
-            Some(101),
-            "CONTROL: a window installed 101 over this image and the floor leaves it"
-        );
-        assert_eq!(
-            newer_for_a_start(100, None, Some(101), yanks),
-            None,
-            "the floor yanks 101: a start would run a build a window refuses to activate"
-        );
-        assert_eq!(
-            newer_for_a_start(100, None, Some(101), unread),
-            None,
-            "a floor that cannot be read does not clear the installed build"
-        );
-        assert_eq!(
-            newer_for_a_start(100, Some(102), Some(101), yanks),
-            Some(102),
-            "a staged build above this one still counts beside a yanked installed one"
-        );
-        assert_eq!(
-            newer_for_a_start(100, Some(100), Some(99), leaves),
-            None,
-            "nothing above this build"
-        );
-    }
-}
+#[path = "lib_node_start_tests.rs"]
+mod node_start_tests;

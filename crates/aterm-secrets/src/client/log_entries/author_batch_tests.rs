@@ -276,3 +276,48 @@ fn signed_authoring_observation_cost() {
         }
     }
 }
+
+#[test]
+#[ignore = "accumulated acknowledgement authoring measurement; run explicitly with --ignored --nocapture"]
+fn accumulated_acknowledgement_authoring_cost() {
+    use std::hint::black_box;
+    const SAMPLES: usize = 32;
+    let root = aterm_tempfile::tempdir().unwrap();
+    for bounded in [false, true] {
+        let (mut store, writer) = rooted();
+        let paths = prepare(root.path(), bounded, &store);
+        for n in 1..=1024 {
+            if n > 1 {
+                let record = writer.name(store.log().unwrap(), 1_000 + n);
+                store.insert(record).unwrap();
+                fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600).unwrap();
+            }
+            // Each linear extension retires the previous acknowledged head. A single
+            // acknowledgement of a large log leaves that history empty instead.
+            super::super::retained_history::acknowledge(&paths, &store).unwrap();
+            if ![1, 128, 1024].contains(&n) {
+                continue;
+            }
+            let expected = store.log().unwrap().heads();
+            author(&paths, bounded, |_| Ok((Vec::new(), ()))).unwrap();
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let (records, snapshot, ()) =
+                    black_box(author(&paths, bounded, |_| Ok((Vec::new(), ())))).unwrap();
+                samples.push(started.elapsed().as_nanos());
+                assert!(records.is_empty());
+                assert_eq!(snapshot.log().unwrap().heads(), expected);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "ACCUMULATED-AUTHOR records={n} retired={} bounded={bounded} samples={SAMPLES} p50_ns={} p95_ns={} p99_ns={}{}",
+                n - 1,
+                samples[SAMPLES / 2],
+                samples[30],
+                samples[31],
+                aterm_durable::durable_flushes_note(),
+            );
+        }
+    }
+}

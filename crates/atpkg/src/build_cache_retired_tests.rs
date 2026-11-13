@@ -12,6 +12,21 @@ use std::time::{Duration, SystemTime};
 
 use super::{Git as _, GitCli, Kind, LOCKED, Roots, plan, retire, written_since};
 
+#[path = "build_cache_retired_lazy_fetch_tests.rs"]
+mod lazy_fetch;
+
+#[path = "build_cache_retired_registry_tests.rs"]
+mod registry;
+
+#[path = "build_cache_retired_registry_edge_tests.rs"]
+mod registry_edges;
+
+#[path = "build_cache_retired_history_tests.rs"]
+mod history;
+
+#[path = "build_cache_retired_history_edges_tests.rs"]
+mod history_edges;
+
 /// A scratch home holding the gate's leftovers, removed when the test ends.
 struct Gate {
     dir: aterm_tempfile::TempDir,
@@ -904,10 +919,23 @@ fn a_used_snapshot_stays_and_says_why() {
 fn gits_bookkeeping_is_no_write_and_a_held_lock_stays() {
     let g = gate();
     let modules = g.snapshot().join(".aterm-verify/modules/vendor/astream");
-    for d in ["objects", "refs"] {
-        std::fs::create_dir_all(modules.join(d)).expect("a git dir");
-    }
-    std::fs::write(modules.join("HEAD"), "ref: refs/heads/main\n").expect("w");
+    let sub = g.snapshot().join("vendor/astream");
+    let original = GitCli.run(&sub, &["rev-parse", "--absolute-git-dir"]);
+    assert_eq!(original.code, Some(0), "{}", original.err);
+    std::fs::create_dir_all(modules.parent().unwrap()).expect("legacy module namespace");
+    std::fs::rename(original.out.trim(), &modules).expect("actual private module store relocated");
+    std::fs::write(sub.join(".git"), format!("gitdir: {}\n", for_git(&modules)))
+        .expect("module rebound");
+    git(
+        &g.checkout(),
+        &[
+            "config",
+            "--file",
+            &for_git(&modules.join("config")),
+            "core.worktree",
+            &for_git(&sub),
+        ],
+    );
     std::fs::write(modules.join("index.lock"), "").expect("w");
     g.written(&modules, Duration::ZERO);
     let since = g.now - super::UNWRITTEN;
@@ -963,6 +991,17 @@ fn a_lock_taken_just_before_the_removal_keeps_the_snapshot() {
                 }
             }
             GitCli.run(dir, args)
+        }
+
+        fn read_history(
+            &self,
+            dir: &Path,
+            args: &[&str],
+            input: &[u8],
+            objects: Option<&Path>,
+            deadline: std::time::Instant,
+        ) -> super::Answer {
+            GitCli.read_history(dir, args, input, objects, deadline)
         }
     }
     let g = gate();
@@ -1532,6 +1571,17 @@ fn a_lock_taken_as_its_entry_goes_keeps_the_snapshot_listed() {
             }
             GitCli.run(dir, args)
         }
+
+        fn read_history(
+            &self,
+            dir: &Path,
+            args: &[&str],
+            input: &[u8],
+            objects: Option<&Path>,
+            deadline: std::time::Instant,
+        ) -> super::Answer {
+            GitCli.read_history(dir, args, input, objects, deadline)
+        }
     }
     let g = gate();
     let done = retire(&g.roots, g.now, &LockedAtDrop);
@@ -1559,4 +1609,65 @@ fn a_lock_taken_as_its_entry_goes_keeps_the_snapshot_listed() {
             .unwrap()
             .is_none()
     );
+}
+
+/// AN INTERRUPTED SNAPSHOT REMOVAL RECORDED IN AN EARLIER BOOT RESUMES BY ITS VOLUME'S UUID, AND
+/// ANOTHER VOLUME'S STAYS REFUSED: both `Prepared` (`tree_gone == false`) and `TreeGone`
+/// (`tree_gone == true`) receipts record the volume's UUID beside `[dev, ino]`; when a restart
+/// renumbers the volume (the same UUIDs and inodes, another device number), the next pass finishes
+/// the removal. NEGATIVE CONTROL: when `snapshot_volume` or `entry_volume` is another volume's
+/// UUID (though `[dev, ino]` matches this boot's), the receipt refuses and the leftover stays.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_interrupted_snapshot_removal_from_an_earlier_boot_resumes_by_volume_uuid_and_another_volumes_stays()
+ {
+    for tree_gone in [false, true] {
+        for elsewhere in [false, true] {
+            let g = gate();
+            let text = std::fs::read(g.snapshot().join(".git")).unwrap();
+            let entry = super::own_entry(&g.checkout(), &g.snapshot(), &text).unwrap();
+            let head = super::listed(&GitCli, &g.checkout(), &g.snapshot())
+                .unwrap()
+                .unwrap()
+                .head;
+            let mut pending =
+                super::pending::begin(&g.checkout(), &g.snapshot(), &entry, &head, &text).unwrap();
+            assert!(pending.snapshot_volume.is_some());
+            assert!(pending.entry_volume.is_some());
+            if tree_gone {
+                assert!(super::super::remove::tree(&g.snapshot().join(".git")).whole());
+                assert!(super::super::remove::tree(&g.snapshot()).whole());
+                super::pending::tree_gone(&g.checkout(), &g.snapshot(), &mut pending).unwrap();
+            }
+            if elsewhere {
+                if tree_gone {
+                    pending.entry_volume.as_mut().unwrap()[0] ^= 0xff;
+                } else {
+                    pending.snapshot_volume.as_mut().unwrap()[0] ^= 0xff;
+                }
+            } else {
+                pending.snapshot_id[0] = pending.snapshot_id[0].wrapping_add(1);
+                pending.entry_id[0] = pending.entry_id[0].wrapping_add(1);
+            }
+            let receipt = super::beside(&g.checkout(), super::pending::SUFFIX).unwrap();
+            std::fs::write(&receipt, aterm_json::to_vec(&pending).unwrap()).unwrap();
+            let done = retire(&g.roots, g.now, &GitCli);
+            if elsewhere {
+                assert!(
+                    done[0].1.is_err() && done[1].1.is_err(),
+                    "tree_gone={tree_gone}: {done:?}"
+                );
+                assert!(entry.join("gitdir").is_file() && receipt.is_file());
+                if !tree_gone {
+                    assert!(g.snapshot().join("Cargo.toml").is_file());
+                }
+            } else {
+                assert!(
+                    done.iter().all(|(_, result)| result.is_ok()),
+                    "tree_gone={tree_gone}: {done:?}"
+                );
+                assert!(!g.snapshot().exists() && !entry.exists() && !receipt.exists());
+            }
+        }
+    }
 }

@@ -26,7 +26,7 @@ const VS_VERSION_INFO_ID: u16 = 1;
 fn main() {
     anchor_rules::emit();
     link_rules::emit();
-    build_stamp::emit();
+    let stamp = build_stamp::emit();
     let compiler_flavor = compiler::emit();
     chained_fixups();
     macos_release_linker(compiler_flavor);
@@ -34,6 +34,11 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    assert_ne!(
+        std::env::var(aterm_stamp::input::MODE).as_deref(),
+        Ok("postlink"),
+        "Windows version resources require the selected build stamp at compile time"
+    );
 
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if msvc {
@@ -66,7 +71,7 @@ fn main() {
         );
     }
     let rc_path = out_dir.join("aterm.rc");
-    let rc_text = resource_script(&icon, (!msvc).then_some(app_manifest.as_path()));
+    let rc_text = resource_script(&icon, (!msvc).then_some(app_manifest.as_path()), &stamp);
     if let Err(e) = std::fs::write(&rc_path, rc_text) {
         report(&format!("could not write {}: {e}", rc_path.display()));
         return;
@@ -796,22 +801,22 @@ fn report(why: &str) {
         println!("cargo:warning={line}");
     }
 
-    let required = std::env::var("ATERM_REQUIRE_WIN_RESOURCES")
-        .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
-        .unwrap_or(false);
-    if required {
+    if env_flag("ATERM_REQUIRE_WIN_RESOURCES") {
         panic!("ATERM_REQUIRE_WIN_RESOURCES is set and the Windows resources did not link: {why}");
     }
 }
 
-/// Build the `.rc` script text from `CARGO_PKG_VERSION_*`.
-fn resource_script(icon: &std::path::Path, app_manifest: Option<&std::path::Path>) -> String {
-    let major = env_num("CARGO_PKG_VERSION_MAJOR");
-    let minor = env_num("CARGO_PKG_VERSION_MINOR");
-    let patch = env_num("CARGO_PKG_VERSION_PATCH");
-    let display = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
-
-    let quad = format!("{major},{minor},{patch},0");
+/// Build the `.rc` from the same selected stamp the binary carries.
+fn resource_script(
+    icon: &std::path::Path,
+    app_manifest: Option<&std::path::Path>,
+    stamp: &aterm_stamp::Stamp,
+) -> String {
+    let [epoch, high, middle, low] = stamp
+        .windows_numeric_version()
+        .unwrap_or_else(|why| panic!("{why}: {:?}", stamp.build_number));
+    let display = stamp.app_version;
+    let quad = format!("{epoch},{high},{middle},{low}");
 
     const VS_FF_DEBUG: u32 = 0x1;
     const VS_FF_PRERELEASE: u32 = 0x2;
@@ -889,34 +894,21 @@ fn rc_path_literal(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
-/// A `CARGO_PKG_VERSION_*` component clamped to `u16`.
-fn env_num(key: &str) -> u16 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .map(|v| v.min(u32::from(u16::MAX)) as u16)
-        .unwrap_or(0)
-}
-
 /// The system's git, by the path `aterm_uds::host::TOOLS`'s `git` row names (a build script links
 /// no workspace crate): never whichever git a `PATH` finds first. Off Unix the bare name, as
 /// there.
 const GIT: &str = if cfg!(unix) { "/usr/bin/git" } else { "git" };
 
+/// Whether the caller set the flag `key`: anything but unset, empty, `0`, `false` or `no`.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
+}
+
 /// `unix` seconds as RFC 3339 UTC (`2026-10-22T00:00:00Z`), as `date -u +%Y-%m-%dT%H:%M:%SZ`
-/// prints it, computed here (the civil calendar of Hinnant's `civil_from_days`, as
-/// `aterm_types::rfc3339` has it), so no `date` runs.
+/// prints it, using the shared civil calendar rather than running `date`.
 fn rfc3339_utc(unix: i64) -> String {
     let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (y, m, d) = aterm_stamp::civil::civil_from_days(days);
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
         secs / 3600,
@@ -942,7 +934,7 @@ mod stamp_paths;
 
 mod build_stamp {
     use super::stamp_paths::PATHSPEC;
-    use super::{GIT, rfc3339_utc, run};
+    use super::{GIT, env_flag, rfc3339_utc, run};
     use aterm_stamp::{Stamp, input};
     use std::path::PathBuf;
 
@@ -956,17 +948,30 @@ mod build_stamp {
     /// from the pins `ship dev-app`, a handoff fixture or a non-Mac release sets, and watches
     /// what the stamp is of. `postlink` writes a constant nonzero placeholder and watches no
     /// commit or reservation inputs: the macOS release patches that section after linking.
-    pub fn emit() {
+    pub fn emit() -> Stamp {
         println!("cargo:rerun-if-env-changed={}", input::MODE);
         let version =
             std::env::var("CARGO_PKG_VERSION").expect("cargo always sets CARGO_PKG_VERSION");
+        println!("cargo:rerun-if-env-changed={REQUIRE_STAMP}");
+        let required = env_flag(REQUIRE_STAMP);
         let stamp = match std::env::var(input::MODE)
             .ok()
             .filter(|m| !m.is_empty())
             .as_deref()
         {
+            None if required => panic!(
+                "{REQUIRE_STAMP} is set but {} is not `commit`: the build would carry no commit \
+                 and build number 0",
+                input::MODE
+            ),
             None => constant(&version),
-            Some("commit") => from_commit(&version),
+            Some("commit") => {
+                let stamp = from_commit(&version);
+                if required {
+                    require_identity(&stamp);
+                }
+                stamp
+            }
             Some("postlink") => Stamp::UNSTAMPED,
             Some(other) => panic!(
                 "{}={other}: expected unset, `commit` or `postlink`",
@@ -983,6 +988,41 @@ mod build_stamp {
         if std::fs::read(&out).ok().as_deref() != Some(&record[..]) {
             std::fs::write(&out, record).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
         }
+        stamp
+    }
+
+    /// The flag a packager sets (`apps/aterm-win/build.ps1` does) to make a stamp that names no
+    /// build a hard error: without it a build that cannot reach git (off Unix `git` is found on
+    /// `PATH`) or runs outside a work tree falls back to commit `unknown` and build number `0`,
+    /// and on Windows ships as numeric version `1.0.0.0`.
+    const REQUIRE_STAMP: &str = "ATERM_REQUIRE_STAMP";
+
+    /// Refuse a `commit` stamp that does not name its commit and build number
+    /// ([`REQUIRE_STAMP`]). A `-dirty` commit is still a commit: the packager rules on that.
+    fn require_identity(stamp: &Stamp) {
+        let hex = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let short = stamp
+            .git_commit
+            .strip_suffix("-dirty")
+            .unwrap_or(stamp.git_commit);
+        let why = if short.is_empty() || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+            format!("its commit is `{}`", stamp.git_commit)
+        } else if !hex(stamp.git_commit_full, 40) && !hex(stamp.git_commit_full, 64) {
+            format!("its full commit is `{}`", stamp.git_commit_full)
+        } else if stamp.build_number.bytes().all(|b| b == b'0') {
+            format!("its build number is `{}`", stamp.build_number)
+        } else {
+            return;
+        };
+        panic!(
+            "{REQUIRE_STAMP} is set and the stamp names no build: {why}. Build inside a git work \
+             tree with `{GIT}` runnable (HEAD's commit and committer time are the stamp), or pin \
+             {}, {}, {} and {}",
+            input::COMMIT,
+            input::FULL_COMMIT,
+            input::DEV_COMMITS,
+            input::EPOCH
+        );
     }
 
     /// The record of a build that asked for no identity: its version, nothing else. A pin set
@@ -1049,18 +1089,17 @@ mod build_stamp {
         };
 
         let dev_commits = pinned_dev_commits.unwrap_or_else(|| {
-            run(
-                GIT,
-                &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"],
-            )
-            .and_then(|tag| {
-                run(
-                    GIT,
-                    &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
-                )
-            })
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "0".into())
+            run(GIT, &["tag", "--list"])
+                .and_then(|tags| aterm_stamp::describe_release_args(&tags))
+                .and_then(|args| run(GIT, &args.iter().map(String::as_str).collect::<Vec<_>>()))
+                .and_then(|tag| {
+                    run(
+                        GIT,
+                        &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
+                    )
+                })
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "0".into())
         });
 
         println!("cargo:rerun-if-env-changed={}", input::EPOCH);
@@ -1187,10 +1226,15 @@ mod build_stamp {
     }
 }
 
-mod compiler {
-    use super::run;
+/// The compiler-provenance probe, mounted as a file module rather than `include!`d so that
+/// rustc and rustfmt both resolve its out-of-line `#[path]` test module next to it in `src/`
+/// (inside an inline `mod`, an `include!`d file's `#[path]` resolves under `compiler/`).
+#[path = "src/compiler_probe.rs"]
+mod compiler_probe;
 
-    include!("src/compiler_probe.rs");
+mod compiler {
+    use super::compiler_probe::{detect_flavor, parse_rustc_vv};
+    use super::run;
 
     /// Emits compiler, profile, and verification build facts. Returns the detected flavor.
     pub fn emit() -> &'static str {

@@ -254,7 +254,7 @@ fn example_b_an_agent_call_hung_on_a_silent_tcp_peer_is_stuck() {
     });
     assert_eq!(
         wire(&v, "a4711"),
-        "job id=a4711 kind=agent-call consumer=agent-bg promoted=timeout:120000 task=bm3k2x9q1 pgid=4711 exe=curl class=waiting wait=tcp remote=192.0.2.10:8080 state=ESTABLISHED queued=0 cpu_mc=0 quiet_ms=1142000 phi=8.27 mu_ms=60000 mu_from=prior verdict=stuck"
+        "job id=a4711 kind=agent-call consumer=agent-bg promoted=timeout:120000 task=bm3k2x9q1 pgid=4711 exe=curl class=waiting wait=tcp remote=192.0.2.10:8080 state=ESTABLISHED queued=0 cpu_mc=0 quiet_ms=1142000 phi=8.27 mu_ms=60000 mu_from=prior verdict=stuck no_progress=1"
     );
     let row = v.row("a4711").expect("the call");
     assert_eq!(row.verdict.mark(), Some('⊘'));
@@ -494,7 +494,7 @@ fn example_f_a_held_stop_under_an_agent_call_is_stuck_and_a_parked_one_is_parked
     let v = run_to(&mut w, 1_130_000, |_, _| {});
     assert_eq!(
         wire(&v, "a6301"),
-        "job id=a6301 kind=agent-call consumer=agent-bg task=a71pq0zz3 pgid=6301 exe=zsh class=stopped stop=held stopped_pid=6302:node cpu_mc=0 quiet_ms=1130000 phi=8.18 verdict=stuck"
+        "job id=a6301 kind=agent-call consumer=agent-bg task=a71pq0zz3 pgid=6301 exe=zsh class=stopped stop=held stopped_pid=6302:node cpu_mc=0 quiet_ms=1130000 phi=8.18 verdict=stuck no_progress=1"
     );
 
     let mut w = World::new();
@@ -5746,8 +5746,12 @@ fn nested_detached_work() -> World {
     w
 }
 
+/// A detached descendant's work is its ancestors' progress: while the compiler under the wrappers
+/// burns CPU, neither wrapper accrues a stall, though the jobs stay disjoint and no output is
+/// credited. NEGATIVE CONTROL: once the compiler stops, the wrappers' suspect run starts there and
+/// they stall afresh, a whole φ 8 later, not at once with their old quiet age.
 #[test]
-fn nested_detached_work_qualifies_local_stalls_without_merging_jobs_or_crediting_output() {
+fn a_working_detached_descendant_is_its_ancestors_progress_without_merging_jobs() {
     let mut w = nested_detached_work();
     let v = run_to(&mut w, 1_200_000, |_, _| {});
     let compiler = v.row("a402").expect("compiler");
@@ -5758,12 +5762,9 @@ fn nested_detached_work_qualifies_local_stalls_without_merging_jobs_or_crediting
         assert_eq!(row.working_descendant, Some((402, w.p(402).start)));
         assert!(row.tick.progress.is_none(), "CPU is no output progress");
         assert!(row.wire().contains(" working_descendant=402 "));
+        assert_eq!(row.verdict, Verdict::Fine, "{id}");
+        assert!(!row.no_progress, "{id}");
     }
-    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
-    assert!(
-        v.row("a401").unwrap().no_progress,
-        "the local evidence remains"
-    );
 
     w.p(402).cpu_per_s = 0;
     let v = run_to(&mut w, 10_000, |_, _| {});
@@ -5771,6 +5772,14 @@ fn nested_detached_work_qualifies_local_stalls_without_merging_jobs_or_crediting
         v.row("a401").unwrap().working_descendant.is_none(),
         "current work only"
     );
+    let v = run_to(&mut w, 600_000, |_, _| {});
+    assert!(
+        !v.row("a401").unwrap().no_progress,
+        "the run starts where the work stopped"
+    );
+    let v = run_to(&mut w, 600_000, |_, _| {});
+    assert!(v.row("a401").unwrap().no_progress);
+    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
 }
 
 #[test]
@@ -5830,7 +5839,7 @@ fn nested_work_keeps_its_witness_as_recent_output_gives_way_to_cpu_work() {
     let v = w.tick(aterm_vitals::jobs::RUNNING_WINDOW_MS);
     assert_eq!(v.row("a402").unwrap().class, Class::BusySilent);
     assert!(v.row("a401").unwrap().working_descendant.is_some());
-    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
+    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Fine);
 }
 
 /// `while sleep 2; do date; done` run by tab 1's shell under block `id`: each tick the shell
@@ -9964,6 +9973,8 @@ fn a_wrappers_own_child_comes_before_a_lower_pid_it_did_not_start() {
 fn a_call_judged_stuck_ends_stuck_whatever_the_pass_that_finds_it_gone_judges() {
     use aterm_vitals::jobs::{ExitOf, LeaderExit};
     let mut w = nested_detached_work();
+    // The compiler under it does no work, so the wrapper's stall is its own.
+    w.p(402).cpu_per_s = 0;
     let v = run_to(&mut w, 1_200_000, |_, _| {});
     assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
     // The person interrupts the stuck wrapper: its row keeps the judgement of the last pass that
@@ -9979,4 +9990,53 @@ fn a_call_judged_stuck_ends_stuck_whatever_the_pass_that_finds_it_gone_judges() 
     let call = ended_call(&mut w);
     assert!(call.stuck, "its last live pass judged it stuck: {call:?}");
     assert_eq!(call.ended_by, Some(ExitOf::Signal(2)));
+}
+
+/// A reader whose pipe's writer is another call burning CPU without output waits on that work,
+/// never stalls: the writer's job counts as progress for what waits on it. NEGATIVE CONTROL: the
+/// writer stops using CPU, and the same reader stalls a φ 8 later.
+#[test]
+fn a_pipe_whose_writer_works_silently_is_waiting_not_stalled() {
+    let mut w = World::new();
+    let mut reader = sleeper(401, "cat");
+    reader.fds.push(pipe_end(0, 0xB1, 0xB2, false, 0x8, 0));
+    w.call(1, 300, 400, reader, None);
+    let mut writer = spinner(501, "trustc");
+    writer.fds.push(pipe_end(1, 0xB2, 0xB1, true, 0, 0));
+    w.call(1, 300, 500, writer, None);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(v.row("a500").unwrap().class, Class::BusySilent);
+    let r = v.row("a400").unwrap();
+    assert_eq!(
+        (r.wait.as_ref().map(|w| (w.name, w.peer)), r.verdict),
+        (Some((WaitName::Pipe, Some(501))), Verdict::Fine)
+    );
+    assert!(!r.no_progress);
+
+    w.p(501).cpu_per_s = 0;
+    w.p(501).state = ProcState::Sleeping;
+    let v = run_to(&mut w, 1_300_000, |_, _| {});
+    assert!(
+        v.row("a400").unwrap().no_progress,
+        "an idle writer is no progress"
+    );
+}
+
+/// A driver whose short-lived children run and are reaped between two readings progresses by
+/// their CPU, which its own counters never show. NEGATIVE CONTROL: the same driver whose
+/// children use no CPU stalls.
+#[test]
+fn a_driver_whose_reaped_children_work_is_not_stalled() {
+    for (child_cpu_per_s, stalls) in [(100_000_000, false), (0, true)] {
+        let mut w = World::new();
+        let mut driver = sleeper(401, "make");
+        driver.child_cpu_per_s = child_cpu_per_s;
+        w.call(1, 300, 400, driver, None);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert_eq!(
+            v.row("a400").unwrap().no_progress,
+            stalls,
+            "children's CPU {child_cpu_per_s} ns/s"
+        );
+    }
 }

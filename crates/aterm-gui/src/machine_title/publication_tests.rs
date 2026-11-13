@@ -14,6 +14,44 @@ use super::{change_nickname, change_number, naming};
 
 const NOW: u64 = FLOOR_MS + 300 * 86_400_000;
 
+#[test]
+fn local_panel_facts_do_not_read_the_os_and_late_diagnostics_keep_discovery() {
+    let scratch = fresh();
+    let names = Names::new(false);
+    names.authorized.set(false);
+    let mut name = file::MachineName::unnumbered(Nickname::parse("Heron").unwrap(), NOW);
+    name.num = Some(Number::new(86).unwrap());
+    name.class = aterm_types::machine_name::Class::Chosen;
+    let pause_reason = "fleet custody moved to another vault";
+    let mut status = naming::NamingStatus::read_local(&scratch.state, &scratch.config, &name)
+        .with_fleet_membership(aterm_agent::machine_name::InFleet::Paused(
+            pause_reason.into(),
+        ));
+    assert!(names.calls.borrow().is_empty());
+    assert!(status.text("m86").contains("reading current name"));
+    assert!(
+        !status.authorize(),
+        "unknown OS permission grants no authorization action"
+    );
+    status.discovered(Ok(true));
+    let full = naming::NamingStatus::read(&scratch.state, &scratch.config, &name, &names);
+    let expected = (full.retry(), full.authorize());
+    assert_eq!(*names.calls.borrow(), [Call::Read]);
+    status.diagnosed(Ok(full));
+    assert_eq!((status.retry(), status.authorize()), expected);
+    assert!(status.authorize());
+    assert!(status.text("m86").contains("Available fleets: ALab"));
+    assert!(status.text("m86").contains(pause_reason));
+    assert!(!status.text("m86").contains("reading current name"));
+    names.authorization_unknown.set(true);
+    let unknown = naming::NamingStatus::read(&scratch.state, &scratch.config, &name, &names);
+    assert!(unknown.retry());
+    assert!(
+        !unknown.authorize(),
+        "an unread permission must try existing authorization first"
+    );
+}
+
 struct Scratch {
     _root: aterm_tempfile::TempDir,
     state: PathBuf,
@@ -52,6 +90,7 @@ struct Names {
     values: RefCell<[Option<String>; 3]>,
     fail: Cell<bool>,
     authorized: Cell<bool>,
+    authorization_unknown: Cell<bool>,
     calls: RefCell<Vec<Call>>,
 }
 
@@ -61,6 +100,7 @@ impl Names {
             values: RefCell::new(std::array::from_fn(|_| Some("m8".to_owned()))),
             fail: Cell::new(fail),
             authorized: Cell::new(true),
+            authorization_unknown: Cell::new(false),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -73,7 +113,11 @@ impl publish::SystemNames for Names {
     }
 
     fn authorization(&self, _: &std::path::Path, _: &std::path::Path) -> Result<bool, String> {
-        Ok(self.authorized.get())
+        if self.authorization_unknown.get() {
+            Err("the existing naming permission could not be read".into())
+        } else {
+            Ok(self.authorized.get())
+        }
     }
 
     fn apply(
@@ -305,7 +349,12 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
     unchanged_files();
 
     names.fail.set(false);
+    names.authorization_unknown.set(true);
+    let unknown = naming::NamingStatus::read(&scratch.state, &scratch.config, &edited.name, &names);
+    assert!(unknown.retry());
+    assert!(!unknown.authorize());
     naming::synchronize(&scratch.state, &scratch.config, requested.num, &names).unwrap();
+    names.authorization_unknown.set(false);
     assert_eq!(applies(), applied + 2);
     unchanged_files();
     assert_eq!(

@@ -119,75 +119,12 @@ pub const fn fold_window_audibility(
 }
 
 #[cfg(test)]
-mod sing_riff_gain_tests {
-    use super::sing_riff_gain;
-
-    /// The riff's own switch is independent of the trail-sound master, and
-    /// every other term of the trail-sound law still applies to the riff, so
-    /// the switch is not a bypass.
-    #[test]
-    fn the_riff_switch_silences_the_song_and_stays_under_focus_master_and_volume() {
-        assert_eq!(
-            sing_riff_gain(true, true, true, 0.4),
-            Some(0.4),
-            "precondition: the shipped default posture must actually sing",
-        );
-        assert_eq!(sing_riff_gain(true, true, false, 0.4), None, "riff switch");
-        assert_eq!(sing_riff_gain(false, true, true, 0.4), None, "raw focus");
-        assert_eq!(sing_riff_gain(true, false, true, 0.4), None, "trail_sounds");
-        assert_eq!(sing_riff_gain(true, true, true, 0.0), None, "volume");
-    }
-}
+#[path = "sound_policy_sing_riff_gain_tests.rs"]
+mod sing_riff_gain_tests;
 
 #[cfg(test)]
-mod voice_gain_tests {
-    use super::{Voice, VoiceTerms, voice_gain};
-
-    const OPEN: VoiceTerms = VoiceTerms {
-        master: true,
-        own: true,
-        volume: 0.4,
-        raw_focused: true,
-        reduced_motion: false,
-    };
-
-    /// THE VOICE TABLE: every voice plays with every gate open; the master,
-    /// its own switch, the volume and a background window silence each; a
-    /// reduced motion policy silences only the bonk and the pip, whose light
-    /// it stops.
-    #[test]
-    fn each_voice_obeys_exactly_its_gates() {
-        for voice in Voice::ALL {
-            assert_eq!(voice_gain(voice, &OPEN), Some(0.4), "{voice:?} plays");
-            for closed in [
-                VoiceTerms {
-                    master: false,
-                    ..OPEN
-                },
-                VoiceTerms { own: false, ..OPEN },
-                VoiceTerms {
-                    volume: 0.0,
-                    ..OPEN
-                },
-                VoiceTerms {
-                    raw_focused: false,
-                    ..OPEN
-                },
-            ] {
-                assert_eq!(voice_gain(voice, &closed), None, "{voice:?} {closed:?}");
-            }
-            let reduced = VoiceTerms {
-                reduced_motion: true,
-                ..OPEN
-            };
-            assert_eq!(
-                voice_gain(voice, &reduced).is_none(),
-                matches!(voice, Voice::Bonk | Voice::StreakPip),
-                "{voice:?}: reduced motion silences only the voices whose light it stops"
-            );
-        }
-    }
-}
+#[path = "sound_policy_voice_gain_tests.rs"]
+mod voice_gain_tests;
 
 /// The per-event trail-audio policy the host resolves once per drain and
 /// stamps on every emitted [`crate::trail_sound::SoundEvent`], so the synth stays policy-free.
@@ -393,41 +330,5 @@ pub fn drain_curse_bonk_cues(
 }
 
 #[cfg(test)]
-mod bonk_gain_tests {
-    use super::bonk_sound_gain;
-
-    /// Each `None` case flips one term of the audible precondition.
-    #[test]
-    fn bonk_gain_policy_gates_master_focus_knob_motion_and_volume() {
-        assert_eq!(
-            bonk_sound_gain(true, true, true, false, 0.4),
-            Some(0.4),
-            "precondition: the shipped posture must actually bonk",
-        );
-        assert_eq!(
-            bonk_sound_gain(false, true, true, false, 0.4),
-            None,
-            "raw focus"
-        );
-        assert_eq!(
-            bonk_sound_gain(true, false, true, false, 0.4),
-            None,
-            "Music effects master off silences the bonk with the knob still on"
-        );
-        assert_eq!(
-            bonk_sound_gain(true, true, false, false, 0.4),
-            None,
-            "bonk knob"
-        );
-        assert_eq!(
-            bonk_sound_gain(true, true, true, true, 0.4),
-            None,
-            "reduced motion"
-        );
-        assert_eq!(
-            bonk_sound_gain(true, true, true, false, 0.0),
-            None,
-            "zero volume"
-        );
-    }
-}
+#[path = "sound_policy_bonk_gain_tests.rs"]
+mod bonk_gain_tests;

@@ -14,6 +14,25 @@ use crate::claude_lights::{Clock, LandAtGlass, Weekday};
 /// The longest `+DURATION` (§9.3.5): a day of elapsed time.
 pub(crate) const MAX_IN_MINUTES: u32 = 24 * 60;
 
+/// Timed Cruise durations Settings ▸ Harness offers, in minutes.
+pub(crate) const LAND_IN_MINUTES: [u32; 3] = [60, 120, 240];
+
+/// Format a landing time (`18:00` or `Sat 16:00`).
+pub(crate) fn when(at: LandAtGlass) -> String {
+    match at.other_day {
+        Some(day) => format!("{} {}", day.short(), at.clock.as_str()),
+        None => at.clock.as_str().to_string(),
+    }
+}
+
+/// Format [`when`] for screen readers (`18:00` or `Saturday 16:00`).
+pub(crate) fn spoken_when(at: LandAtGlass) -> String {
+    match at.other_day {
+        Some(day) => format!("{} {}", day.long(), at.clock.as_str()),
+        None => at.clock.as_str().to_string(),
+    }
+}
+
 /// What `until=<when>` names, before it is resolved against now (§9.3.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum When {
@@ -366,7 +385,7 @@ pub(crate) struct AutopilotTimers {
     /// A seamless update's successor rebuilt the index after its Commit
     /// ([`App::settle_autopilot_commit`]): owed once, then never again.
     committed: bool,
-    /// When an open Autopilot menu's or Settings ▸ Harness page's `land_at`
+    /// When an open Settings ▸ Harness page's `land_at`
     /// offer turns its words ([`offer_turns_at`]): the wall instant, unix ms,
     /// and the monotonic `due` derived from it, noted where the offer is
     /// built ([`App::note_land_at_offer`]); `None` with nothing offered.
@@ -391,12 +410,6 @@ impl AutopilotTimers {
     #[must_use]
     pub(crate) fn entry(&self, local_id: u64) -> Option<&TimerEntry> {
         self.entries.get(&local_id)
-    }
-
-    /// The instant session `local_id`'s armed timer was indexed at, unix ms: what a cancel offered beside its face names ([`App::cancel_autopilot_timer`]).
-    #[must_use]
-    pub(crate) fn land_at_ms(&self, local_id: u64) -> Option<i64> {
-        self.entries.get(&local_id).map(|entry| entry.land_at_ms)
     }
 
     /// Every indexed session, in id order (introspection and tests).
@@ -576,12 +589,11 @@ impl App {
         };
         if moved {
             crate::claude_footer::post_changed(local_id);
-            self.refresh_autopilot_menu(local_id);
         }
         moved
     }
 
-    /// THE OFFER IS BUILT (the Autopilot menu's rows, Settings ▸ Harness's publish): note when its words turn ([`offer_turns_at`]), so a menu or a page held open across that minute is built again then ([`Self::expire_autopilot_offer`]) and never offers `18:36` for a press that arms tomorrow's.
+    /// THE OFFER IS BUILT (Settings ▸ Harness's publish): note when its words turn ([`offer_turns_at`]), so a page held open across that minute is built again then ([`Self::expire_autopilot_offer`]) and never offers `18:36` for a press that arms tomorrow's.
     pub(crate) fn note_land_at_offer(&mut self) {
         let land_at = self.harness_policy.get().policy.land_at;
         let (now, wall) = (mono_now(), wall_ms());
@@ -592,14 +604,14 @@ impl App {
         self.autopilot_timers.offer_due = turn.map(|turn| (turn, due_at(turn, now, wall)));
     }
 
-    /// When the offer an open menu or page shows turns its words, or `None`: with neither open, or nothing offered, nothing is folded.
+    /// When the offer an open page shows turns its words, or `None`: with none open, or nothing offered, nothing is folded.
     #[must_use]
     pub(crate) fn autopilot_offer_deadline(&self) -> Option<Instant> {
         let (_, due) = self.autopilot_timers.offer_due?;
-        (self.autopilot_menu.is_some() || self.harness_page_shown()).then_some(due)
+        self.harness_page_shown().then_some(due)
     }
 
-    /// The offer's words turned under an open menu or page: build them again (each notes its next turn).
+    /// The offer's words turned under an open page: build them again (it notes its next turn).
     pub(crate) fn expire_autopilot_offer(&mut self) {
         if self.autopilot_timers.offer_due.is_none() {
             return;
@@ -611,14 +623,10 @@ impl App {
         }
     }
 
-    /// The menu's rows and the page built again from the wall as it reads
-    /// now (each notes the next turn); the note dropped first, so with
-    /// neither open none is left.
+    /// The page built again from the wall as it reads now (it notes the next
+    /// turn); the note dropped first, so with none open none is left.
     fn autopilot_offer_turned(&mut self) {
         self.autopilot_timers.offer_due = None;
-        if let Some(session) = self.autopilot_menu.as_ref().map(|menu| menu.session) {
-            self.refresh_autopilot_menu(session);
-        }
         if self.harness_page_shown()
             && self
                 .harness_screen
@@ -665,12 +673,11 @@ impl App {
             .collect();
         for id in ids {
             crate::claude_footer::post_changed(id);
-            self.refresh_autopilot_menu(id);
             self.restamp_for_hover(id);
         }
     }
 
-    /// THE WALL CLOCK MOVED under the monotonic deadline (`Wake::WallMoved`: the watchdog saw the Mac sleep or the clock set forward), or a window gained focus: every armed timer is derived again from the wall — its due, its face's time and weekday — with one wall read, and none at all while nothing is armed.
+    /// THE WALL CLOCK MOVED under the monotonic deadline (`Wake::WallMoved`: the system announced a wake from sleep or a wall-clock step, which the watchdog's thread hears, `aterm_uds::wall_watch`), or a window gained focus: every armed timer is derived again from the wall — its due, its face's time and weekday — with one wall read, and none at all while nothing is armed.
     pub(crate) fn on_wall_moved(&mut self) {
         self.harness_ab_wall_moved();
         if let Some((turn, _)) = self.autopilot_timers.offer_due {
@@ -689,7 +696,6 @@ impl App {
             .rederive(mono_now(), wall_ms(), &local_offset_at)
         {
             crate::claude_footer::post_changed(id);
-            self.refresh_autopilot_menu(id);
         }
     }
 
@@ -738,7 +744,6 @@ impl App {
                         );
                     }
                     crate::claude_footer::post_changed(local_id);
-                    self.refresh_autopilot_menu(local_id);
                     self.restamp_for_hover(local_id);
                 }
             }
@@ -758,7 +763,6 @@ impl App {
             session.ctx.watchers.ring_watchers();
         }
         crate::claude_footer::post_changed(local_id);
-        self.refresh_autopilot_menu(local_id);
         self.note_harness_arm(local_id);
         self.harness_screen_moved();
         let sid = self
@@ -843,22 +847,11 @@ impl App {
         self.harness_screen_moved();
     }
 
-    /// A timer choice from the window (the menu, Settings ▸ Harness's disclosure): a timed Cruise written through the window's one writer ([`Self::set_session_autopilot_timed`]) with its instant, or the cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]), from `surface` (its setter, §11.7.3, item 2).
+    /// A timer choice from the window (Settings ▸ Harness's disclosure): a timed Cruise written through the window's one writer ([`Self::set_session_autopilot_timed`]) with its instant, or the cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]), from `surface` (its setter, §11.7.3, item 2).
     pub(crate) fn choose_autopilot_timer(
         &mut self,
         local_id: u64,
         choice: TimerChoice,
-        surface: crate::autopilot::Surface,
-    ) -> bool {
-        self.choose_autopilot_timer_naming(local_id, choice, None, surface)
-    }
-
-    /// [`Self::choose_autopilot_timer`] from a row that named the instant its cancel drops (`cancels`, the open menu's): the cancel then drops that timer and no other.
-    pub(crate) fn choose_autopilot_timer_naming(
-        &mut self,
-        local_id: u64,
-        choice: TimerChoice,
-        cancels: Option<i64>,
         surface: crate::autopilot::Surface,
     ) -> bool {
         if self
@@ -869,7 +862,7 @@ impl App {
             return false;
         }
         if choice == TimerChoice::Cancel {
-            return self.cancel_autopilot_timer(local_id, cancels, surface);
+            return self.cancel_autopilot_timer(local_id, surface);
         }
         let Some(land_at) = self.resolve_timer_choice(choice) else {
             return false;
@@ -877,17 +870,16 @@ impl App {
         self.set_session_autopilot_timed(local_id, Some(Autopilot::Cruise), Some(land_at), surface)
     }
 
-    /// "Cancel landing" (the menu's row, Settings' `Cancel`): session `local_id`'s timer dropped with its Cruise kept — a COMPARE-AND-SET on the stored pair (`session_timeline::cancel_land_at`), so it writes nothing unless the store still holds `cruise` with a timer (the very instant `expected` names, where the row named one).
+    /// "Cancel landing" (Settings' `Cancel`): session `local_id`'s timer dropped with its Cruise kept — a COMPARE-AND-SET on the stored pair (`session_timeline::cancel_land_at`), so it writes nothing unless the store still holds `cruise` with a timer.
     pub(crate) fn cancel_autopilot_timer(
         &mut self,
         local_id: u64,
-        expected: Option<i64>,
         surface: crate::autopilot::Surface,
     ) -> bool {
         let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return false;
         };
-        let write = crate::session_timeline::cancel_land_at(&ctx, expected, surface);
+        let write = crate::session_timeline::cancel_land_at(&ctx, surface);
         self.autopilot_pair_written(local_id, write)
     }
 }

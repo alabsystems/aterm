@@ -352,6 +352,8 @@ struct World {
     blocks1: String,
     out: Vec<String>,
     status_extra: Arc<Mutex<String>>,
+    screen_input: Arc<Mutex<Option<u64>>>,
+    human_fence: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
 }
 
@@ -364,14 +366,20 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
         let relaunched = w.relaunched.load(Ordering::SeqCst);
         match verb {
             "sessions" => format!("OK 1\nlocal {TAB} 0 idle codex"),
-            "text" => format!(
-                "OK {}",
-                if relaunched {
+            "text" => {
+                let mut screen = if relaunched {
                     w.after_relaunch.clone()
                 } else {
                     w.after_exit.clone()
+                };
+                if let Some(seq) = *w.screen_input.lock().expect("screen input") {
+                    screen = screen.replace(
+                        "\"human_ms\":null",
+                        &format!("\"human_ms\":null,\"human_seq\":{seq}"),
+                    );
                 }
-            ),
+                format!("OK {screen}")
+            }
             "cell" => "OK A 9b9b9c 2d2f33 dim".to_string(),
             "status" => format!(
                 "OK schema=1 hold=0 hand=- integration=on{}",
@@ -380,7 +388,13 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
             "help" if line.contains("help key") => {
                 "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES".to_string()
             }
-            "help" => "OK 1\nturn [if-gen=<epoch>.<seq>] <text>".to_string(),
+            "help" => {
+                if w.human_fence.load(Ordering::SeqCst) {
+                    "OK 1\nturn [if-gen=<epoch>.<seq>] [if-human=<seq>] <text>".to_string()
+                } else {
+                    "OK 1\nturn [if-gen=<epoch>.<seq>] <text>".to_string()
+                }
+            }
             "blocks" if line.contains("blocks 2") => format!("OK {}", w.blocks2),
             "blocks" => format!("OK {}", w.blocks1),
             "blocktext" => std::iter::once(format!("OK {}", w.out.len()))
@@ -442,6 +456,10 @@ impl Kernel for Crashed {
 
     fn restart_background(&self, _: u32) -> Vec<String> {
         crate::harness::upgrade_drive::tests::unstated("background")
+    }
+
+    fn restart_held(&self, _: u32) -> Option<Vec<crate::harness::upgrade::Held>> {
+        crate::harness::upgrade_drive::tests::unstated("held")
     }
 }
 
@@ -550,6 +568,8 @@ struct Rig {
     kernel: Crashed,
     asked: crate::harness::FakeInstanceLog,
     status_extra: Arc<Mutex<String>>,
+    screen_input: Arc<Mutex<Option<u64>>>,
+    human_fence: Arc<AtomicBool>,
     twin: PathBuf,
     /// The harness's waits on the test's thread run on their own steps
     /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
@@ -572,6 +592,8 @@ impl Rig {
         .expect("rollout");
         let relaunched = Arc::new(AtomicBool::new(false));
         let status_extra = Arc::new(Mutex::new(String::new()));
+        let screen_input = Arc::new(Mutex::new(None));
+        let human_fence = Arc::new(AtomicBool::new(true));
         let (blocks2, blocks1) = blocks_after(hint.len());
         let (sock, asked) = instance(
             &dir,
@@ -582,6 +604,8 @@ impl Rig {
                 blocks1,
                 out: hint.iter().map(|r| (*r).to_string()).collect(),
                 status_extra: Arc::clone(&status_extra),
+                screen_input: Arc::clone(&screen_input),
+                human_fence: Arc::clone(&human_fence),
                 relaunched: Arc::clone(&relaunched),
             },
         );
@@ -634,6 +658,8 @@ impl Rig {
             kernel,
             asked,
             status_extra,
+            screen_input,
+            human_fence,
             twin,
         }
     }
@@ -815,6 +841,208 @@ fn a_clean_exit_that_removed_its_writer_lock_resumes_the_same_conversation() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains(T2), "the same conversation: {lines:?}");
     assert!(Witnesses::under(&rig.opts.state).handled(snap.pid, &snap.start));
+}
+
+fn stamp_input(rig: &Rig, host: String) -> crate::harness::restart_stamp::Input {
+    use crate::harness::restart_stamp::{Cause, Input, Stamp, write};
+    let snap = rig.snap(None);
+    let input = Input { host, seq: 7 };
+    write(
+        &rig.opts.state,
+        TAB,
+        &Stamp {
+            pid: snap.pid,
+            start: snap.start,
+            cause: Cause::Asked,
+            at: now_s(),
+            input: Some(input.clone()),
+        },
+    )
+    .expect("the accepted explicit restart");
+    input
+}
+
+#[test]
+fn an_explicit_restart_resumes_past_the_input_it_already_accepted() {
+    let rig = Rig::new(
+        "explicit-restart-accepted-input",
+        &["zsh: terminated codex"],
+    );
+    let input = stamp_input(
+        &rig,
+        crate::harness::restart_stamp::input_host().expect("host"),
+    );
+    *rig.status_extra.lock().expect("status") = " human_ms=500 human_seq=7".to_string();
+    *rig.screen_input.lock().expect("screen input") = Some(7);
+    let r = self_claimed_after_exit(
+        &rig.opts,
+        &rig.snap(None),
+        &rig.resume(None),
+        ExitCause::Asked,
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "done:resumed", "{r:?}\n{:#?}", rig.asked());
+    let lines = rig.typed();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(T2), "the same conversation: {lines:?}");
+    assert!(
+        lines[0].contains("if-human=7 "),
+        "the accepted counter is fenced: {lines:?}"
+    );
+    assert_eq!(rig.state().line_input, Some(input));
+    assert!(crate::harness::restart_stamp::read(&rig.opts.state, TAB).is_none());
+}
+
+#[test]
+fn an_explicit_restart_receipt_does_not_override_new_or_unread_input_or_a_hand() {
+    for (name, status, foreign_host, screen_seq, cause) in [
+        (
+            "new-key",
+            " human_ms=500 human_seq=8",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "unread-counter",
+            " human_ms=500",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "malformed-counter",
+            " human_ms=500 human_seq=07",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "other-host",
+            " human_ms=500 human_seq=7",
+            true,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "pending-input",
+            " human_ms=500 human_seq=7 input=queued",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "held",
+            " human_ms=500 human_seq=7 hold=1",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "other-driver",
+            " human_ms=500 human_seq=7 hand=lease:other",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "key-after-status",
+            " human_ms=500 human_seq=7",
+            false,
+            Some(8),
+            ExitCause::Asked,
+        ),
+        (
+            "unread-screen-counter",
+            " human_ms=500 human_seq=7",
+            false,
+            None,
+            ExitCause::Asked,
+        ),
+        (
+            "unfenced-host",
+            " human_ms=500 human_seq=7",
+            false,
+            Some(7),
+            ExitCause::Asked,
+        ),
+        (
+            "unstamped",
+            " human_ms=500 human_seq=7",
+            false,
+            Some(7),
+            ExitCause::Asked,
+        ),
+        (
+            "natural-crash",
+            " human_ms=500 human_seq=7",
+            false,
+            None,
+            ExitCause::Exit,
+        ),
+    ] {
+        let rig = Rig::new(name, &["zsh: terminated codex"]);
+        if name != "unstamped" {
+            stamp_input(
+                &rig,
+                if foreign_host {
+                    "aterm-harness@another-host".to_string()
+                } else {
+                    crate::harness::restart_stamp::input_host().expect("host")
+                },
+            );
+        }
+        *rig.status_extra.lock().expect("status") = status.to_string();
+        *rig.screen_input.lock().expect("screen input") = screen_seq;
+        rig.human_fence
+            .store(name != "unfenced-host", Ordering::SeqCst);
+        let r = self_claimed_after_exit(
+            &rig.opts,
+            &rig.snap(None),
+            &rig.resume(None),
+            cause,
+            &rig.kernel,
+        );
+        assert_eq!(r.step, "wait:held", "{name}: {r:?}\n{:#?}", rig.asked());
+        assert!(rig.typed().is_empty(), "{name}: {:#?}", rig.asked());
+    }
+}
+
+#[test]
+fn an_explicit_restart_keeps_its_input_receipt_through_a_deferred_attempt() {
+    let rig = Rig::new(
+        "explicit-restart-deferred-input",
+        &["zsh: terminated codex"],
+    );
+    let input = stamp_input(
+        &rig,
+        crate::harness::restart_stamp::input_host().expect("host"),
+    );
+    *rig.screen_input.lock().expect("screen input") = Some(7);
+    *rig.status_extra.lock().expect("status") = " human_ms=500 human_seq=7 hold=1".to_string();
+    let snap = rig.snap(None);
+    let resume = rig.resume(None);
+    let step = || self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Asked, &rig.kernel);
+    assert_eq!(step().step, "wait:held");
+    assert!(rig.typed().is_empty());
+    assert_eq!(rig.state().line_input, Some(input.clone()));
+    assert!(crate::harness::restart_stamp::read(&rig.opts.state, TAB).is_none());
+    let mut timing = rig.opts.clone();
+    timing.only_sid = Some(TAB.to_string());
+    assert_eq!(
+        crate::harness::relaunch::carry_line_grace(&timing, Agent::Codex, Some(TUI)),
+        0
+    );
+    *rig.status_extra.lock().expect("status") = " human_ms=500 human_seq=7".to_string();
+    assert_eq!(step().step, "done:resumed");
+    assert_eq!(rig.state().line_input, Some(input));
+    assert_eq!(rig.typed().len(), 1);
+    assert_eq!(step().step, "ended:handled");
+    assert_eq!(
+        rig.typed().len(),
+        1,
+        "the resumed conversation is never typed twice"
+    );
 }
 
 #[test]

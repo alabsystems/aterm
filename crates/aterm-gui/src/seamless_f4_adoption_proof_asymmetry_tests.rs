@@ -104,6 +104,7 @@ fn realistic_layout() -> RestoreManifest {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }],
     }])
 }

@@ -170,8 +170,8 @@ fn history_prints_a_line_per_local_day_with_its_ledger_lines() {
     assert_eq!(
         day_lines(&text),
         [
-            "  Fri Sep 19  week 40% (resets Tue Sep 23 17:00) \u{b7} 5h 1 window, peak 30%",
-            "  Sat Sep 20  week 47% (resets Tue Sep 23 17:00) \u{b7} 5h 1 window, peak 60%",
+            "  Fri Sep 19  week 60% left (resets Tue Sep 23 17:00) \u{b7} 5h 1 window, lowest 70% left",
+            "  Sat Sep 20  week 53% left (resets Tue Sep 23 17:00) \u{b7} 5h 1 window, lowest 40% left",
         ],
         "{text}"
     );
@@ -259,8 +259,8 @@ fn history_by_key_finds_a_renamed_rows_series() {
         ["  Fri Sep 19", "  Sat Sep 20"],
         "the old label's day and the new one's, none of the stranger's: {by_label}"
     );
-    assert!(by_label.contains("week 20% "), "{by_label}");
-    assert!(!by_label.contains("week 90% "), "{by_label}");
+    assert!(by_label.contains("week 80% left "), "{by_label}");
+    assert!(!by_label.contains("week 10% left "), "{by_label}");
     assert!(
         by_label.contains(" \u{b7} series since Fri Sep 19\n"),
         "{by_label}"
@@ -538,7 +538,7 @@ fn history_holds_only_the_accounts_own_readings() {
         .unwrap_or_default();
     assert_eq!(
         friday,
-        "  Fri Sep 19  week 55% (resets Wed Sep 24 00:00) \u{b7} 5h 1 window, peak 80% \u{b7} \
+        "  Fri Sep 19  week 45% left (resets Wed Sep 24 00:00) \u{b7} 5h 1 window, lowest 20% left \u{b7} \
          another account signed in to the home 10:00",
         "{theirs}"
     );
@@ -552,22 +552,27 @@ fn history_holds_only_the_accounts_own_readings() {
         ],
         "{theirs}"
     );
-    for not_a in ["week 15%", "week 10%", "peak 20%", "reset used"] {
+    for not_a in [
+        "week 85% left",
+        "week 90% left",
+        "lowest 80% left",
+        "reset used",
+    ] {
         assert!(!theirs.contains(not_a), "{not_a}: {theirs}");
     }
     let mine = history_of(&env, Some("work"), (false, false), |_| 0);
     assert_eq!(dates(&mine), ["  Fri Sep 19", "  Sat Sep 20"], "{mine}");
     for not_b in [
-        "week 30%",
-        "week 50%",
-        "week 55%",
-        "peak 80%",
+        "week 70% left",
+        "week 50% left",
+        "week 45% left",
+        "lowest 20% left",
         "reset used",
         "another",
     ] {
         assert!(!mine.contains(not_b), "{not_b}: {mine}");
     }
-    assert!(mine.contains("5h 1 window, peak 20%"), "{mine}");
+    assert!(mine.contains("5h 1 window, lowest 80% left"), "{mine}");
     let by_key = history_of(&env, Some(&a.to_string()), (false, false), |_| 0);
     assert_eq!(by_key, theirs, "the key names the same account");
 }
@@ -602,7 +607,7 @@ fn history_reads_only_this_macs_series() {
     );
     let text = history_of(&env, Some("now"), (false, false), |_| 0);
     assert_eq!(dates(&text), ["  Sat Sep 20"], "{text}");
-    assert!(!text.contains("week 90%"), "{text}");
+    assert!(!text.contains("week 10% left"), "{text}");
 }
 
 /// A RENAMED DAY IS COUNTED ONCE. The row `before` became `now` at 10:30 on Friday, inside the
@@ -671,8 +676,8 @@ fn a_renamed_day_is_counted_once() {
     assert_eq!(
         day_lines(&text),
         [
-            "  Fri Sep 19  week 40% \u{2192} 52% (resets Wed Sep 24 00:00) \u{b7} 5h 2 windows, \
-          peak 100%, 1 full"
+            "  Fri Sep 19  week 60% \u{2192} 48% left (resets Wed Sep 24 00:00) \u{b7} 5h 2 windows, \
+          lowest 0% left, 1 used up"
         ],
         "{text}"
     );
@@ -763,8 +768,8 @@ fn a_renamed_day_counts_the_windows_a_file_past_the_bound_holds_by_its_day_row()
     assert_eq!(
         day_lines(&text),
         [
-            "  Fri Sep 19  week 38% \u{2192} 52% (resets Wed Sep 24 00:00) \u{b7} 5h 4 windows, \
-          peak 100%, 1 full"
+            "  Fri Sep 19  week 62% \u{2192} 48% left (resets Wed Sep 24 00:00) \u{b7} 5h 4 windows, \
+          lowest 0% left, 1 used up"
         ],
         "{text}"
     );
@@ -1031,7 +1036,7 @@ fn a_window_across_a_rename_counts_once_past_the_close_horizon() {
     let text = String::from_utf8(out).expect("utf-8");
     assert_eq!(
         day_lines(&text),
-        ["  Fri Jun 13  5h 2 windows, peak 100%, 1 full"],
+        ["  Fri Jun 13  5h 2 windows, lowest 0% left, 1 used up"],
         "{text}"
     );
 }
@@ -1067,19 +1072,19 @@ fn history_puts_the_open_window_on_its_rows_day() {
     let text = history_of(&env, Some("work"), (false, false), east);
     assert_eq!(
         day_lines(&text),
-        ["  Sun Sep 21  5h peak 40%, open 40%"],
+        ["  Sun Sep 21  5h lowest 60% left, open 60% left"],
         "{text}"
     );
 }
 
 /// A DAY IS SAID FULL ONLY WHERE A READING WAS. A five-hour window whose highest figure is
-/// 99.9% (999 tenths) prints `peak 99%`; at 100.0% it prints `peak 100%`
-/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: 100% is printed only when a reading
-/// says 100). Negative control: the history's whole percent rounded plain half up prints
-/// `peak 100%, open 100%` for 999, and the first case fails.
+/// 99.9% used (999 tenths) prints `lowest 1% left`; at 100.0% it prints `lowest 0% left`
+/// (`harness::left`: nothing is left only when a reading says 100). Negative control: the
+/// history's whole percent rounded plain half up prints `lowest 0% left, open 0% left` for 999,
+/// and the first case fails.
 #[test]
-fn a_days_peak_says_100_only_for_a_reading_of_100() {
-    for (x10, said) in [(999, "99%"), (1000, "100%")] {
+fn a_days_low_says_nothing_left_only_for_a_reading_of_100() {
+    for (x10, said) in [(999, "1% left"), (1000, "0% left")] {
         let tmp = tmp_dir(&format!("history-full-{x10}"));
         let env = env_at(&tmp);
         let now = env.now;
@@ -1098,7 +1103,7 @@ fn a_days_peak_says_100_only_for_a_reading_of_100() {
         let text = history_of(&env, Some("work"), (false, false), east);
         assert_eq!(
             day_lines(&text),
-            [format!("  Sun Sep 21  5h peak {said}, open {said}")],
+            [format!("  Sun Sep 21  5h lowest {said}, open {said}")],
             "{text}"
         );
     }

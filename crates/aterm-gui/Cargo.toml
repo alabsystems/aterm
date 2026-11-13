@@ -258,7 +258,12 @@ dev-seams = [
 ]
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
+# Source build discovery through Cargo's selected target on every platform.
+aterm-toolchain = { path = "../aterm-toolchain" }
 aterm-mail = { workspace = true }
+aterm-repository-progress = { workspace = true }
 aterm-core = { workspace = true, features = ["serde"] }
 # The anchor attributes' registry (std-only): this crate's own
 # `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]` anchors expand in
@@ -270,6 +275,9 @@ aterm-control = { workspace = true }
 # The in-GUI supervisor (`harness_host`) and the agent harness readers. This
 # crate remains host-agnostic and has no GUI edge.
 aterm-agent = { workspace = true }
+# The Tables page reads the registry and writes the owner's edits through its save
+# (`tables_store`). Already linked via aterm-agent.
+aterm-db = { workspace = true }
 # The control client's one token reader (no-follow, regular file, bounded) and its
 # connect-then-read order, for dials to a sibling instance. Already linked via
 # aterm-agent.
@@ -358,6 +366,10 @@ aterm-phase = { workspace = true }
 # record (session > run > turn > step), its turn tracker, fold and brief. Pure (no
 # clock, file, thread or socket); time enters as the host's `Stamp`.
 aterm-slog = { workspace = true }
+# The per-Mac request journal (ATERM-KI-1109-3): the request a spawn from another Mac or from
+# an agent's tab opens, the later verbs that attach to it and its tabs' leaving
+# (`crate::requests_host`).
+aterm-requests = { workspace = true }
 # The fleet: the opt-in (secure-default-OFF) TLS listener whose proved LAN
 # peers the control server serves as `Scope::Fleet` (see fleet_listen.rs).
 aterm-net = { workspace = true }
@@ -433,6 +445,10 @@ aterm-toml = { workspace = true }
 aterm-http = { workspace = true }
 # PNG codec: the `window` verb's full-window capture and wallpaper decoding.
 aterm-png = { workspace = true }
+# The menu-bar item's fleet access lock (`status_lock_icon.rs`): its shapes are drawn there and
+# this supersamples them to coverage and encodes the template PNGs. Pure, so the icon's tests
+# run on every OS.
+aterm-template-icon = { workspace = true }
 # First-party JPEG decode: the wallpaper lane reads PNG and JPEG on every
 # platform (`app_config::decode_wallpaper_portable`), not PNG alone off macOS.
 aterm-jpeg = { workspace = true }
@@ -544,7 +560,6 @@ aterm-win32 = { workspace = true }
 # Windows since LW.3 (`present/win32.rs`, GDI over aterm-win32 above).
 
 [target.'cfg(unix)'.dependencies]
-aterm-toolchain = { path = "../aterm-toolchain" }
 # The mesh logs and their relay (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7a): the node job
 # hosts tables.log and metrics.log, serves their `Bus` streams and relays them to its neighbours.
 aterm-mesh = { workspace = true }

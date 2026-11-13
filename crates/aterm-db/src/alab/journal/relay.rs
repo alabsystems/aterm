@@ -14,7 +14,7 @@
 
 use super::{
     book::{VERSION, WEEK},
-    event::{Event, Kind, Pk},
+    event::{Event, Kind, Pk, SIGNIN_ENDED, SIGNIN_IN, SIGNIN_OUT},
 };
 use crate::{
     Result,
@@ -107,8 +107,8 @@ impl Heard {
         if let Some(signin) = row.get("signin") {
             let t = signin.get("t").and_then(Value::as_u64).unwrap_or(0);
             match signin.get("state").and_then(Value::as_str) {
-                Some("in") => self.offer(account, Rk::SignIn, entry(t)),
-                Some("out" | "ended") => self.offer(account, Rk::SignOut, entry(t)),
+                Some(SIGNIN_IN) => self.offer(account, Rk::SignIn, entry(t)),
+                Some(SIGNIN_OUT | SIGNIN_ENDED) => self.offer(account, Rk::SignOut, entry(t)),
                 _ => {}
             }
         }
@@ -116,10 +116,10 @@ impl Heard {
 
     /// Read one event `machine` logged, from week `period`'s table.
     pub(crate) fn read_event(&mut self, machine: [u8; 16], period: u64, event: &Event) {
-        let kind = match event.kind {
-            Kind::SessionStart | Kind::SessionEnd => Rk::Use,
-            Kind::SignedIn | Kind::Renewed => Rk::SignIn,
-            Kind::SignedOut | Kind::LoginEnded | Kind::Displaced => Rk::SignOut,
+        let kind = match (event.kind, event.signin()) {
+            (Kind::SessionStart | Kind::SessionEnd, _) => Rk::Use,
+            (_, Some(SIGNIN_IN)) => Rk::SignIn,
+            (_, Some(SIGNIN_OUT | SIGNIN_ENDED)) => Rk::SignOut,
             _ => return,
         };
         let Some(account) = event.account else {

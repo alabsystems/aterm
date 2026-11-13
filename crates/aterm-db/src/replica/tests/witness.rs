@@ -65,6 +65,154 @@ fn held(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], table: usize, node: usize) 
         .count()
 }
 
+/// Hints read receipts without opening a store. A full observer is the independent healthy
+/// inventory oracle; putting that observer back in the witness path breaks the open count.
+#[test]
+fn ordering_witnesses_open_no_table_store() {
+    let lab = Lab::new(&[Role::Writer; 2]);
+    let tables = tables(&lab, 3);
+    write(&lab, &tables, 1, 0);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let salt = [0x49; 16];
+    let expected: Vec<_> = tables
+        .iter()
+        .map(|(scope, paths)| {
+            let store = Store::observe(&session, &paths[0], *scope).unwrap();
+            let known = store.inventory_unchecked();
+            crate::replica::witness::witness(
+                &salt,
+                &scope.digest(),
+                Some(InventorySummary::of_sorted(known.len(), known).fingerprint),
+            )
+        })
+        .collect();
+    drop(session);
+    let replica = Replica::new(
+        lab.paths[0].clone(),
+        tables
+            .iter()
+            .map(|(scope, paths)| (*scope, paths[0].clone()))
+            .collect(),
+    )
+    .unwrap();
+    let peer_bootstrap = lab.bootstrap(1);
+    let peer = Session::observe(&peer_bootstrap).unwrap().actor();
+    let round = replica.round(Some(peer)).unwrap();
+    let common = tables.iter().map(|(scope, _)| scope.digest()).collect();
+    let before = crate::table::store::test_opens_and_checks();
+    let actual = round.table_witnesses(peer, &common, &salt, tables.len());
+    assert_eq!(actual, expected);
+    assert!(
+        actual
+            .iter()
+            .all(|hint| *hint != crate::replica::witness::UNKNOWN)
+    );
+    assert_eq!(crate::table::store::test_opens_and_checks(), before);
+}
+
+/// Compare a recently written local table's hint read with its previous full observer read.
+/// This does not measure a network round or its subscription admission. Allocation counting
+/// runs separately from instruction sampling, and each sample reverses the pair's order.
+#[test]
+#[ignore = "manual paired receipt hint allocation and instruction measurement"]
+fn measure_receipt_hint_work() {
+    measure_receipt_hint_work_after(false, false);
+}
+
+/// Let the production journal and vault cache window elapse, warm both arms, then measure the
+/// same local reads as the recent-write probe. Both use the unchanged production cache rules.
+#[test]
+#[ignore = "manual paired settled receipt hint allocation and instruction measurement"]
+fn measure_settled_receipt_hint_work() {
+    measure_receipt_hint_work_after(true, false);
+}
+
+/// Keep the writing open measured too: a retained-wire optimization must account for opens
+/// that take a fresh journal read and return owned ciphertext rather than a retained observation.
+#[test]
+#[ignore = "manual paired settled writing open allocation and instruction measurement"]
+fn measure_settled_writer_hint_work() {
+    measure_receipt_hint_work_after(true, true);
+}
+
+fn measure_receipt_hint_work_after(settled: bool, writer_reference: bool) {
+    use aterm_bench::measurement_clock::{counters, declare_interactive};
+    use std::hint::black_box;
+    const CALLS: usize = 8;
+    let _ = declare_interactive();
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    for records in [1, 128, 1024] {
+        let session = Session::open(&bootstrap).unwrap();
+        let path = lab._home.path().join(format!("hint-{records}"));
+        let mut store = Store::create(&session, &path).unwrap();
+        let scope = store.scope();
+        for _ in 0..records {
+            store.commit_catalog(&session, &[0x57; 1024]).unwrap();
+        }
+        assert_eq!(store.inventory(&session).unwrap().len(), records);
+        drop(store);
+        drop(session);
+        let session = Session::observe(&bootstrap).unwrap();
+        let probe = |candidate| {
+            if candidate {
+                let ids = Store::repair_ids_region(
+                    &session,
+                    &path,
+                    scope,
+                    crate::table::store::Region::Primary,
+                )
+                .unwrap()
+                .unwrap();
+                InventorySummary::of(&ids).fingerprint
+            } else {
+                let store = if writer_reference {
+                    Store::open(&session, &path, scope).unwrap()
+                } else {
+                    Store::observe_if_exists(&session, &path, scope)
+                        .unwrap()
+                        .unwrap()
+                };
+                let ids = store.inventory_unchecked();
+                InventorySummary::of_sorted(ids.len(), ids).fingerprint
+            }
+        };
+        assert_eq!(probe(false), probe(true));
+        if settled {
+            std::thread::sleep(
+                aterm_secrets::client::test_settled_after() + std::time::Duration::from_millis(100),
+            );
+            for _ in 0..8 {
+                assert_eq!(probe(false), probe(true));
+            }
+        }
+        for sample in 0..5 {
+            for candidate in if sample % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let run = || {
+                    for _ in 0..CALLS {
+                        black_box(probe(candidate));
+                    }
+                };
+                let (_, allocations) = aterm_heap_count::allocations_in(run);
+                let before = counters();
+                run();
+                let after = counters();
+                let instructions = before
+                    .zip(after)
+                    .map(|(before, after)| after.instructions.saturating_sub(before.instructions));
+                eprintln!(
+                    "RECEIPT-HINT records={records} candidate={candidate} sample={sample} calls={CALLS} allocations={allocations} instructions={instructions:?} settled={settled} writer_reference={writer_reference}"
+                );
+            }
+        }
+    }
+}
+
 /// The table the initiator's last round selected, by its place in `tables`.
 fn selected(repair: &PeerRepair, tables: &[(Scope, [PathBuf; 2])]) -> usize {
     let table = repair.application().unwrap().table;

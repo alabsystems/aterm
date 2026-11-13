@@ -215,6 +215,9 @@ pub fn keeper(root: &Path) -> Proc {
     )]
     let mut cmd = std::process::Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
+    // Drop cannot reap a keeper when the test runner itself is killed. Run through the
+    // application's parent-death watcher, including across the keeper's self-exec.
+    tether_keeper(&mut cmd);
     cmd.args(["keeper", "serve", "--no-relaunch"])
         .stdin(Stdio::null())
         .stdout(file.try_clone().expect("log"))
@@ -276,6 +279,21 @@ pub fn keeper(root: &Path) -> Proc {
         headless_boot::log_tail(&log)
     );
     keeper
+}
+
+/// Keep the foreground test keeper tied to its test process even after an abrupt exit.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the shared std-typed launch helper closes non-stdio descriptors before spawn"
+)]
+pub fn tether_keeper(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    let exe = launch_isolation::aterm_executable();
+    cmd.arg(aterm_uds::tether::VERB)
+        .arg(std::process::id().to_string())
+        .arg(&exe)
+        .arg(&exe)
+        .process_group(0);
 }
 
 /// How far a keeper's start got ([`await_start`]).

@@ -377,10 +377,14 @@ fn a_click_on_claudes_tag_types_key_off_and_never_writes_its_cells() {
         chord(&mut app, wid);
         frame(&mut app, wid);
     }
-    assert!(
-        top_text(&app, wid).contains(&format!("\u{25b8}{}", ghost_text())),
-        "▸ selected"
-    );
+    // Selected, the ghost reads as under the pointer: its ink underlined, and no mark.
+    let lit: String = top_cells(&app, wid)
+        .iter()
+        .filter(|c| c.underline == UnderlineStyle::Single)
+        .map(|c| c.ch)
+        .collect();
+    assert_eq!(lit, format!("{KEY} off"), "selected: the one hover");
+    assert!(!top_text(&app, wid).contains('\u{25b8}'), "no mark");
     use aterm_window::keyboard::{KeyCode, NamedKey};
     tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
     assert_eq!(pty(&mut reader, 1), b"/", "Return is the click: on again");
@@ -581,7 +585,6 @@ fn the_keys_title_and_menu_are_its_own() {
     let menu = app.autopilot_menu.as_ref().expect("the menu");
     assert_eq!(menu.anchor, (hit.frame_row, hit.cols.0));
     assert!(menu_offers(&app, "fact-menu/top-effort/type/key-on"));
-    assert!(menu_offers(&app, "/type/effort"), "the slider");
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_some(), "it stays while the key does");
     tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");

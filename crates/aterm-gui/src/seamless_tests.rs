@@ -109,6 +109,15 @@ pub(crate) fn env_alone() -> Option<std::sync::MutexGuard<'static, ()>> {
     crate::test_alone::alone().then(|| ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// Admit a dense fixture before starting its isolated child's progress watchdog. The parent
+/// retains admission until the child exits and has closed every PTY; the child never takes it.
+#[cfg(unix)]
+pub(crate) fn env_alone_with_ptys() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let _lease = (!crate::test_alone::in_child())
+        .then(|| aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease"));
+    env_alone()
+}
+
 /// RAII save/RESTORE of one env var: puts the prior value BACK on drop, unwind included.
 pub(super) struct RestoreVar {
     key: &'static str,
@@ -205,6 +214,7 @@ pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
     (0..children)
         .map(|index| {
             let index = std::ffi::OsString::from(index.to_string());
+            let _lease = aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
             crate::test_alone::spawn_alone_with(&[(marker, &index)])
                 .passed()
                 .stdout
@@ -840,6 +850,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                 zoomed: false,
                 parked: false,
                 ephemeral: false,
+                fleet: false,
             })
             .collect(),
     }])
@@ -4028,6 +4039,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 zoomed: false,
                 parked: false,
                 ephemeral: false,
+                fleet: false,
             }];
         }),
         vec![untitled(0), titled(1, records[1])],
@@ -4302,6 +4314,7 @@ fn a_layout_naming_an_exited_pane_is_still_placed() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4361,6 +4374,7 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4662,6 +4676,7 @@ fn a_sessionless_handoff_with_a_native_tab_is_taken_over() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }];
         layout.to_toml().expect("the desk serializes")
     };

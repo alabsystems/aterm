@@ -13,7 +13,6 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
 
@@ -1084,6 +1083,7 @@ struct Listener {
     /// The serving round's own stop: a refusal under `rereads` ends that round alone.
     round: Arc<std::sync::Mutex<Arc<Stop>>>,
     serving: Option<std::thread::JoinHandle<TcpListener>>,
+    queries: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Listener {
@@ -1158,6 +1158,7 @@ impl Listener {
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(Stop::new());
         let round = Arc::new(std::sync::Mutex::new(Arc::new(Stop::new())));
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let node = member::read_node_identity(state).expect("a node key it can read");
         let issuer = Arc::new(Issuer {
             node: member::node_id(state).unwrap(),
@@ -1172,7 +1173,8 @@ impl Listener {
         let mut first = true;
         let state = state.to_path_buf();
         let serving = std::thread::spawn({
-            let (stop, round) = (Arc::clone(&stop), Arc::clone(&round));
+            let (stop, round, queries) =
+                (Arc::clone(&stop), Arc::clone(&round), Arc::clone(&queries));
             move || loop {
                 // The round's stop is in place before the listener's is read, so a stop set
                 // after that read finds this round's.
@@ -1197,6 +1199,7 @@ impl Listener {
                 };
                 let (issuer, claim, rows) = (Arc::clone(&issuer), claim.clone(), rows.clone());
                 let (state, secret) = (state.clone(), listening.secret.clone());
+                let queries = Arc::clone(&queries);
                 let refused = Arc::clone(&this_round);
                 serve_with_handshake(
                     &listener,
@@ -1214,7 +1217,14 @@ impl Listener {
                             }
                             if op != FleetOp::Join {
                                 let mut byte = [0u8; 1];
-                                while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {}
+                                let mut query = Vec::new();
+                                while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+                                    query.push(byte[0]);
+                                }
+                                queries
+                                    .lock()
+                                    .unwrap()
+                                    .push(String::from_utf8_lossy(&query).into_owned());
                                 let reply = format!(
                                     "OK {}\ninstance pid=1 host=127.0.0.1 version={} \
                                      sessions={} level=facts cut=0 at_ms=1 node={}{}\n{}",
@@ -1258,6 +1268,7 @@ impl Listener {
             stop,
             round,
             serving: Some(serving),
+            queries,
         }
     }
 
@@ -1301,6 +1312,42 @@ fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
     assert!(
         matches!(&read.peers[..], [one] if one.answer.as_ref().is_err_and(|why| why.contains(&at))),
         "{at}: {read:?}"
+    );
+}
+
+#[test]
+fn a_fleet_status_read_sends_the_explicit_facts_request() {
+    let (issuer, code, serving) = issuing("status-facts-issuer");
+    let member = World::new("status-facts-member");
+    ok(join(
+        &member.places,
+        &Opts {
+            port: Some(closed_port()),
+            ..Opts::default()
+        },
+        &code,
+    ));
+    serving.queries.lock().unwrap().clear();
+    let read = survey_all_facts_in(&member.places, HANG).unwrap();
+    assert!(
+        read.peers.iter().any(|peer| peer.answer.is_ok()),
+        "{read:?}"
+    );
+    let expected = member::read_node_identity(&issuer.places.state)
+        .unwrap()
+        .unwrap();
+    let authenticated = read
+        .peers
+        .iter()
+        .find_map(|peer| peer.authenticated.as_ref())
+        .unwrap();
+    assert_eq!(authenticated.node, expected.node());
+    assert_eq!(&authenticated.key, expected.key().bytes());
+    let queries = serving.queries.lock().unwrap();
+    assert!(!queries.is_empty());
+    assert!(
+        queries.iter().all(|query| query == "survey facts"),
+        "{queries:?}"
     );
 }
 
@@ -2370,6 +2417,258 @@ fn a_leave_says_it_narrowed_an_open_state() {
     );
 }
 
+/// `aterm fleet access` READS AND STATES THIS MACHINE'S LEVEL: with no level stored it is Read
+/// Only and a read writes nothing; a level named is written and read back, the one in force
+/// included (stated again, it changes no level, and a raise asked over the state before it is
+/// asked over a state that stands no more); and a stored file that is not usable is reported
+/// and enforced as Read Only. CONTROL: an unknown word, or two levels, change nothing.
+#[test]
+fn fleet_access_prints_the_level_in_force_and_states_the_one_named() {
+    use aterm_types::fleet_access::FleetAccess;
+    let world = World::new("access");
+    let state = &world.places.state;
+    let run = |words: &[&str]| access_from(&world.places, &args(words), None);
+    let json = |words: &[&str]| -> (aterm_json::Value, bool) {
+        let (said, changed) = run(&[words, &["--json"]].concat()).unwrap();
+        (
+            aterm_json::from_str(&said).expect("one JSON object"),
+            changed,
+        )
+    };
+    let level = || crate::fleet_access::read(state).level;
+    let (said, changed) = run(&[]).unwrap();
+    assert_eq!(said.split_whitespace().next(), Some("read"), "{said}");
+    assert!(!changed);
+    let (read, _) = json(&[]);
+    assert_eq!(read["access"].as_str(), Some("read"));
+    assert!(read["by"].is_null() && read["unread"].is_null(), "{read:?}");
+    assert!(
+        !state.join(crate::fleet_access::FILE).exists(),
+        "a read writes nothing"
+    );
+    let asked = crate::fleet_access::basis(state);
+    let (same, changed) = json(&["read"]);
+    assert_eq!(
+        (same["access"].as_str(), same["changed"].as_bool(), changed),
+        (Some("read"), Some(false), false),
+        "{same:?}"
+    );
+    assert_eq!(
+        crate::fleet_access::read(state).by,
+        Some(crate::fleet_access::By::Cli),
+        "the default named is this Mac's statement: written"
+    );
+    assert_ne!(
+        crate::fleet_access::basis(state),
+        asked,
+        "and a raise asked before it stands on a state that is gone"
+    );
+
+    let (said, changed) = json(&["full"]);
+    assert_eq!(
+        (
+            said["access"].as_str(),
+            said["from"].as_str(),
+            said["changed"].as_bool(),
+            changed
+        ),
+        (Some("full"), Some("read"), Some(true), true),
+        "{said:?}"
+    );
+    assert_eq!(level(), FleetAccess::Full);
+    let (said, changed) = run(&[]).unwrap();
+    assert_eq!(said.split_whitespace().next(), Some("full"), "{said}");
+    assert!(!changed);
+    let (same, changed) = json(&["full"]);
+    assert_eq!((same["changed"].as_bool(), changed), (Some(false), false));
+    let (said, changed) = json(&["write"]);
+    assert_eq!(
+        (
+            said["access"].as_str(),
+            said["from"].as_str(),
+            said["changed"].as_bool()
+        ),
+        (Some("write"), Some("full"), Some(true)),
+        "{said:?}"
+    );
+    assert!(changed);
+    assert_eq!(level(), FleetAccess::ReadWrite);
+    let (said, _) = json(&[]);
+    assert_eq!(
+        (said["access"].as_str(), said["by"].as_str()),
+        (Some("write"), Some("cli")),
+        "{said:?}"
+    );
+
+    for refused in [&["wide"][..], &["full", "read"], &["--all"], &["Full"]] {
+        assert!(
+            matches!(run(refused), Err(Failure::Usage(_))),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(level(), FleetAccess::ReadWrite, "CONTROL: nothing changed");
+
+    // A stored level that is there and not usable is Read Only, and the read says so.
+    aterm_uds::private_file::write_private(
+        state,
+        crate::fleet_access::FILE,
+        b"level=full\nlevel=write\n",
+    )
+    .unwrap();
+    let (said, _) = json(&[]);
+    assert_eq!(said["access"].as_str(), Some("read"), "{said:?}");
+    assert!(said["unread"].as_str().is_some(), "{said:?}");
+    let (said, _) = run(&[]).unwrap();
+    assert_eq!(said.split_whitespace().next(), Some("read"), "{said}");
+    // Naming Read Only over it writes a file that says so.
+    let (_, changed) = run(&["read"]).unwrap();
+    assert!(changed);
+    assert_eq!(crate::fleet_access::read(state).unread, None);
+}
+
+/// A WORKER ANOTHER FLEET MAC STARTED HERE NEVER RAISES THIS MAC'S LEVEL: a raise asked from a
+/// session with a `drive-workers` record is refused and writes nothing. CONTROL: the same
+/// session lowers it; a session with no record, and no session at all, raise it.
+#[test]
+fn a_fleet_started_worker_lowers_the_level_and_never_raises_it() {
+    use aterm_types::fleet_access::{DRIVE_WORKERS, FleetAccess};
+    let world = World::new("access-worker");
+    let state = &world.places.state;
+    const DRIVEN: &str = "s-00000000000000aa";
+    const LOCAL: &str = "s-00000000000000bb";
+    let run =
+        |words: &[&str], session: Option<&str>| access_from(&world.places, &args(words), session);
+    let level = || crate::fleet_access::read(state).level;
+    run(&["write"], None).unwrap();
+    std::fs::create_dir_all(state.join(DRIVE_WORKERS)).unwrap();
+    std::fs::write(state.join(DRIVE_WORKERS).join(DRIVEN), "0b".repeat(16)).unwrap();
+
+    let refused = run(&["full"], Some(DRIVEN)).expect_err("a raise");
+    assert!(
+        matches!(&refused, Failure::Failed(why) if why.contains(DRIVEN)),
+        "{refused:?}"
+    );
+    assert_eq!(level(), FleetAccess::ReadWrite, "nothing was written");
+    let (same, changed) = run(&["write"], Some(DRIVEN)).unwrap();
+    assert!(!changed, "the level it is at is no raise: {same}");
+    let (_, changed) = run(&["read"], Some(DRIVEN)).unwrap();
+    assert!(changed, "CONTROL: lowering is always allowed");
+    assert_eq!(level(), FleetAccess::ReadOnly);
+    assert!(run(&["write"], Some(DRIVEN)).is_err(), "and no way back up");
+    assert_eq!(level(), FleetAccess::ReadOnly);
+
+    run(&["write"], Some(LOCAL)).expect("CONTROL: a session this Mac started");
+    assert_eq!(level(), FleetAccess::ReadWrite);
+    run(&["full"], None).expect("CONTROL: no session");
+    assert_eq!(level(), FleetAccess::Full);
+}
+
+/// A LEVEL NEVER OUTLIVES THE MEMBERSHIP IT WAS CHOSEN FOR: `leave` removes the stored level,
+/// in a fleet or in none, and names the file it removed. CONTROL: until the leave it stands.
+#[test]
+fn a_leave_puts_fleet_access_back_to_read_only() {
+    use aterm_types::fleet_access::FleetAccess;
+    let world = World::new("access-leave");
+    let state = &world.places.state;
+    let level = || crate::fleet_access::read(state).level;
+    ok(init(
+        &world.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    access_from(&world.places, &args(&["full"]), None).unwrap();
+    assert_eq!(
+        level(),
+        FleetAccess::Full,
+        "CONTROL: it stands in the fleet"
+    );
+    let left = ok(leave(&world.places, &[]));
+    assert!(left.contains(crate::fleet_access::FILE), "{left}");
+    assert_eq!(level(), FleetAccess::ReadOnly);
+    assert!(!state.join(crate::fleet_access::FILE).exists());
+
+    // In no fleet a level may still be stored: the leave removes it all the same.
+    access_from(&world.places, &args(&["write"]), None).unwrap();
+    let none = ok(leave(&world.places, &[]));
+    assert!(none.contains(crate::fleet_access::FILE), "{none}");
+    assert_eq!(level(), FleetAccess::ReadOnly);
+}
+
+/// A LEVEL IS CHOSEN FOR ONE FLEET: every write of another fleet's key puts fleet access back
+/// to Read Only before that fleet's members are admitted, and names the file it removed. A sync
+/// that follows the vault's new code to another fleet, with nobody at the Mac and the default
+/// drive grant written again, a join by hand of another fleet, and an issuer's `init --rotate`
+/// (which no Mac can tell from a new fleet) each do. CONTROL: a join and a sync of the fleet
+/// held, and the vault's rotated secret taken in place (the same Macs), keep the level.
+#[test]
+fn a_move_to_another_fleet_puts_fleet_access_back_to_read_only() {
+    use aterm_types::fleet_access::FleetAccess;
+    let (first, first_code, _first_serving) = issuing("access-first");
+    let (_second, second_code, _second_serving) = issuing("access-second");
+    let follows = World::new("access-follows");
+    let joins = World::new("access-joins");
+    let rotates = World::new("access-rotates");
+    ok(init(&rotates.places, &args(&["--host", "m7.local"])));
+    let level = |world: &World| crate::fleet_access::read(&world.places.state).level;
+    let stored = |world: &World| world.places.state.join(crate::fleet_access::FILE).exists();
+    let open = |world: &World| {
+        access_from(&world.places, &args(&["full"]), None).unwrap();
+        assert_eq!(level(world), FleetAccess::Full);
+    };
+
+    // A level stored in no fleet goes as the first key is written.
+    open(&follows);
+    let joined = converged(converge_on(&follows.places, &first_code, &sync_here()));
+    assert!(
+        matches!(&joined, FleetSync::Joined(said) if said.contains(crate::fleet_access::FILE)),
+        "{joined:?}"
+    );
+    assert!(!stored(&follows), "a level stored in no fleet opens none");
+    ok(join(&joins.places, &by_hand(), &first_code));
+
+    // CONTROL: the fleet held, joined and synced again, and its rotated secret taken in place.
+    for world in [&follows, &joins, &first, &rotates] {
+        open(world);
+    }
+    ok(join(&joins.places, &by_hand(), &first_code));
+    for world in [&follows, &first] {
+        assert_eq!(
+            converged(converge_on(&world.places, &first_code, &sync_here())),
+            FleetSync::Current
+        );
+    }
+    let rotated = aterm_secrets::client::rotate_fleet_code_text(&first_code).unwrap();
+    for world in [&first, &follows] {
+        let took = converged(converge_on(&world.places, &rotated, &sync_here()));
+        assert!(matches!(took, FleetSync::Rekeyed(_)), "{took:?}");
+    }
+    for world in [&follows, &joins, &first] {
+        assert_eq!(level(world), FleetAccess::Full, "the same fleet keeps it");
+    }
+
+    // The moves.
+    let followed = converged(converge_on(&follows.places, &second_code, &sync_here()));
+    assert!(
+        matches!(&followed, FleetSync::Joined(said) if said.contains(crate::fleet_access::FILE)),
+        "{followed:?}"
+    );
+    assert_eq!(
+        fleet_table(&follows.config()).unwrap().drive_from,
+        [aterm_net::fleet::ALL_MEMBERS],
+        "the fleet it followed to is granted the default drive"
+    );
+    let joined = ok(join(&joins.places, &by_hand(), &second_code));
+    assert!(joined.contains(crate::fleet_access::FILE), "{joined}");
+    let minted = ok(init(&rotates.places, &args(&["--rotate"])));
+    assert!(minted.contains(crate::fleet_access::FILE), "{minted}");
+    for world in [&follows, &joins, &rotates] {
+        assert_eq!(level(world), FleetAccess::ReadOnly);
+        assert!(
+            !stored(world),
+            "the level went with the fleet it was chosen for"
+        );
+    }
+}
+
 /// NEGATIVE CONTROL: when `places.state` is a symlink to another directory holding fleet
 /// files, `leave` clears `[fleet]` from `aterm.toml` without unlinking or writing `fleet-off`
 /// inside the symlink target.
@@ -3251,143 +3550,6 @@ fn a_stall_on_the_port_the_node_job_claims_names_the_job_and_every_cause_it_leav
         assert!(said.contains(crate::node_service::NODE_LABEL), "{said}");
         assert!(said.contains("moves it"), "{said}");
     }
-}
-
-#[test]
-fn a_join_or_init_whose_listen_place_another_program_holds_never_says_it_listens() {
-    // Another program holds the place: it takes a connection and sends no fleet handshake. Held
-    // silent, a dial that connects there ends at its handshake at once, as the squatter's deadline
-    // ends it ([`member::HeldSilent`]), so each verb waits on nothing but its own window.
-    let squatter = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let held_silent = member::HeldSilent::at(squatter.local_addr().unwrap());
-    let held = squatter.local_addr().unwrap().port();
-    let stalled = format!("127.0.0.1:{held} takes a connection but finishes no fleet handshake");
-    let waited = " 3 s after the new key was written";
-    let retrying = || Here::Answers(Some("retrying".to_owned()));
-    let binds = "another program holds that port, so the aterm running here reads fleet=retrying, \
-                 and binds it once that program lets it go";
-    let rotate = "`aterm fleet init --rotate --port <n>` moves it (every member joins again)";
-    let cases = [
-        (retrying(), format!("{stalled}{waited}: {binds}; {rotate}")),
-        (
-            Here::Absent,
-            format!(
-                "{stalled}: another program holds that port, so no aterm runs here, and one \
-                 started here reads fleet=retrying until that program lets it go; {rotate}"
-            ),
-        ),
-        // Its own word, never retrying: macOS binds a wildcard listen beside a loopback one.
-        (
-            Here::Answers(Some("listening".to_owned())),
-            format!(
-                "{stalled}{waited}, though the aterm running here reads fleet=listening: another \
-                 program holds that port beside its wildcard listen (this machine's own dials of \
-                 the loopback reach that program, and a peer's of this Mac's LAN address the \
-                 aterm) or while it listens elsewhere, or the aterm is too busy to finish one in \
-                 time; {rotate}"
-            ),
-        ),
-        (
-            Here::Answers(Some("off".to_owned())),
-            format!(
-                "{stalled}{waited}: another program holds that port, so the aterm running here \
-                 reads fleet=off (`aterm ctl status` here), and once it tries this [fleet] \
-                 listen, fleet=retrying until that program lets it go; {rotate}"
-            ),
-        ),
-    ];
-    // Each verb waits out its own window on a thread of its own, its aterm here with it.
-    std::thread::scope(|scope| {
-        let joined = scope.spawn(|| {
-            let (_issuer, code, _serving) = issuing("join-squatted-issuer");
-            let member = World::new("join-squatted-member");
-            let opts = Opts {
-                port: Some(held),
-                host: Some("127.0.0.1".to_owned()),
-                ..Opts::default()
-            };
-            let joined = with_aterm_here(retrying, || ok(join(&member.places, &opts, &code)));
-            assert!(
-                joined.contains(&format!(
-                    "  listener   {stalled}{waited}: {binds}; `aterm fleet join --port <n>` moves \
-                     it\n"
-                )) && !joined.contains(FOLLOWS),
-                "{joined}"
-            );
-        });
-        aterm_spec::check::each(&cases, |(here, line)| {
-            let world = World::new("init-squatted");
-            let here = here.clone();
-            let said = with_aterm_here(
-                move || here.clone(),
-                || {
-                    ok(init(
-                        &world.places,
-                        &args(&["--host", "127.0.0.1", "--port", &held.to_string()]),
-                    ))
-                },
-            );
-            assert!(
-                said.contains(&format!("  listener   {line}\n")) && !said.contains(FOLLOWS),
-                "{said}"
-            );
-        });
-        joined
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    });
-    drop(held_silent);
-    drop(squatter);
-    // One that takes each connection and hangs up mid-handshake reads the same, in the join's line
-    // and the peers header alike.
-    let hangs_up = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let cut = hangs_up.local_addr().unwrap().port();
-    let stop = Arc::new(AtomicBool::new(false));
-    let cutter = std::thread::spawn({
-        let stop = Arc::clone(&stop);
-        move || {
-            loop {
-                let conn = aterm_uds::accept(
-                    &hangs_up,
-                    aterm_uds::AcceptWait::Forever,
-                    aterm_uds::AcceptedMode::Blocking,
-                )
-                .map(|(stream, _)| stream);
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                drop(conn);
-            }
-        }
-    });
-    let (_issuer, code, _serving) = issuing("join-hung-up-issuer");
-    let member = World::new("join-hung-up-member");
-    let opts = Opts {
-        port: Some(cut),
-        host: Some("127.0.0.1".to_owned()),
-        ..Opts::default()
-    };
-    let stalled = format!("127.0.0.1:{cut} takes a connection but finishes no fleet handshake");
-    let joined = with_aterm_here(retrying, || ok(join(&member.places, &opts, &code)));
-    assert!(
-        joined.contains(&format!(
-            "  listener   {stalled}{waited}: {binds}; `aterm fleet join --port <n>` moves it\n"
-        )) && !joined.contains(FOLLOWS),
-        "{joined}"
-    );
-    let listed = with_aterm_here(retrying, || {
-        with_peers_answering(|| ok(peers(&member.places, &[])))
-    });
-    let head = listed.lines().next().unwrap_or_default();
-    assert!(
-        head.contains(&format!(
-            "but {stalled} just now: {binds}; `aterm fleet join --port <n>` moves it)"
-        )),
-        "{listed}"
-    );
-    stop.store(true, Ordering::SeqCst);
-    drop(std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, cut)));
-    cutter.join().unwrap();
 }
 
 #[test]
@@ -5253,6 +5415,36 @@ fn a_first_join_its_issuer_never_answers_says_it_kept_the_node_key() {
 }
 
 #[test]
+fn a_broker_refusal_leaves_the_fleet_peer_unobserved() {
+    let at = std::net::SocketAddr::from(([192, 168, 1, 23], 7100));
+    let peer = Peer {
+        host: "192.168.1.23".to_owned(),
+        node: None,
+        key: None,
+        key_from: None,
+        addr: None,
+        port: 7100,
+        version: None,
+        seen_ms: None,
+        via: Via::Manual,
+        fleet: None,
+        signed: None,
+    };
+    let why = Unreached::Connect(
+        at,
+        aterm_uds::lan::LanError::Unavailable(aterm_uds::lan::Unavailable::Refused(
+            "code requirement".to_owned(),
+        ))
+        .into_io(),
+    );
+    let row = peer_survey(&peer, Err(why), (&[], None, None), false);
+    assert_eq!(row.fault, aterm_ctl::PeerFault::NotDialled);
+    assert_eq!(row.reason, Some("lan-broker"));
+    assert!(row.authenticated.is_none());
+    assert!(row.answer.is_err());
+}
+
+#[test]
 fn every_reason_a_fleet_read_gives_has_the_expected_fault() {
     use aterm_ctl::PeerFault;
     use aterm_net::fleet_member::Stage;
@@ -6920,12 +7112,16 @@ fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
             addr: std::net::SocketAddr::from(([10, 0, 0, 7], member::DEFAULT_PORT)),
             node: Some("c3".repeat(16)),
             proven,
-            key: None,
+            key: Some(NodeKey::from_bytes([9; 32])),
             lines: Vec::new(),
         })
     };
-    assert!(peer_survey(&peer, answered(false), (&[], None, None), false).unproven);
-    assert!(!peer_survey(&peer, answered(true), (&[], None, None), false).unproven);
+    let unproved = peer_survey(&peer, answered(false), (&[], None, None), false);
+    assert!(unproved.unproven);
+    assert!(unproved.authenticated.is_none());
+    let proved = peer_survey(&peer, answered(true), (&[], None, None), false);
+    assert!(!proved.unproven);
+    assert_eq!(proved.authenticated.unwrap().key, [9; 32]);
     let unreached = Unreached::Local("no".to_owned());
     assert!(!peer_survey(&peer, Err(unreached), (&[], None, None), false).unproven);
 }
@@ -8800,8 +8996,13 @@ fn a_read_that_ends_after_a_leave_keeps_nothing_of_the_fleet() {
         seed: None,
     });
     let own = member::node_id(&member.places.state).unwrap();
+    let traffic = crate::fleet_vault::Traffic::capture(
+        &member.places.state,
+        vault_paths_for(&member.places).as_ref(),
+    )
+    .unwrap();
     assert_eq!(
-        keep_book(&member.places, &secret, (&[], &read), Some(&own)),
+        keep_book(&member.places, &secret, (&[], &read), Some(&own), &traffic),
         None
     );
     assert!(member::holds_issuer_book(
@@ -8812,7 +9013,7 @@ fn a_read_that_ends_after_a_leave_keeps_nothing_of_the_fleet() {
     ok(leave(&member.places, &[]));
     for read in [read, BookRead::NoIssuer] {
         assert_eq!(
-            keep_book(&member.places, &secret, (&[], &read), Some(&own)),
+            keep_book(&member.places, &secret, (&[], &read), Some(&own), &traffic),
             None
         );
         assert!(
@@ -12177,6 +12378,16 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     let url = format!("http://{}/v1/test", running.addr);
     let paths = aterm_secrets::client::Paths::for_home(root);
     aterm_secrets::client::create(&paths, &url, None, Some("m100")).expect("create vault");
+    {
+        let book = member::hold_book(&member.places.state).unwrap();
+        crate::fleet_vault::take(
+            &book,
+            crate::fleet_vault::Vault::configured(&paths)
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+    }
     let id_recipient = aterm_secrets::client::machine_identity(&paths)
         .expect("identity")
         .recipient()
@@ -12487,4 +12698,43 @@ fn a_no_route_to_a_member_on_this_network_is_never_explained_by_being_away() {
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
     );
     assert!(!no_route_on_this_network(&refused, Some(&hotspot)));
+}
+
+/// A DRIVE'S FIRST LINE NAMES ITS REQUESTER, ahead of any request on the stream, whole and in
+/// the shape the driven Mac reads back; a dial for no requester names nobody.
+/// NEGATIVE CONTROL: the request written after it is not taken for it.
+#[test]
+fn a_drive_dial_sends_its_requester_before_any_request() {
+    /// Each write the stream made, as it made it.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+    impl std::io::Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    use aterm_types::control_verbs::Requester;
+    let asked = Requester::of(
+        Some("s-0123456789abcdef0123"),
+        Some("claude"),
+        Some("Opus 5.5"),
+        Some("team acct"),
+    );
+    for requester in [asked, Requester::default()] {
+        let mut stream = Introduced::new(Writes::default(), &requester);
+        std::io::Write::write_all(&mut stream, b"survey\n").expect("sent");
+        std::io::Write::flush(&mut stream).expect("flushed");
+        // One write carries the requester and the request: a refusing Mac's answer is not lost
+        // to a reset drawn by a second write.
+        assert_eq!(stream.inner.0.len(), 1, "{:?}", stream.inner.0);
+        let wire = String::from_utf8(stream.inner.0.concat()).expect("text");
+        let (first, rest) = wire.split_once('\n').expect("a first line");
+        assert_eq!(Requester::parse(first), Ok(requester), "{wire:?}");
+        assert_eq!(rest, "survey\n");
+        assert!(Requester::parse(rest).is_err(), "CONTROL: {rest:?}");
+    }
 }

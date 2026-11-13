@@ -1878,6 +1878,9 @@ const MAIN_THREAD_QUERY: &str = "repl_main_thread";
 
 const COMMAND_STDOUT: &str = "<local-command-stdout>";
 
+/// The `subtype` of the `system` row a command typed mid-turn is recorded in (2.1.322).
+const LOCAL_COMMAND: &str = "local_command";
+
 /// The effort levels the footer names, as `/effort` takes them.
 #[must_use]
 pub fn effort_level(word: &str) -> Option<&'static str> {
@@ -2151,13 +2154,7 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
             }
         }
         let kind = obj.get("type").and_then(Value::as_str);
-        if command
-            && kind == Some("user")
-            && let Some(content) = obj
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-        {
+        if command && let Some(content) = command_text(kind, obj) {
             let content = content.trim_start();
             if content.starts_with(COMMAND_STDOUT) {
                 under = fold_result(content, &mut facts);
@@ -2180,9 +2177,10 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
             }
         }
         // A main-thread request names the model and effort Claude Code sent it with, the moment
-        // it is sent: a switch no command row records (the top-effort key, an effort changed
-        // mid-turn) reads here, not only once the reply's first row lands minutes later. A side
-        // query (a title, a compaction) may run on another model, so only the main thread counts.
+        // it is sent, so the newest one stands until a newer row says otherwise; a command typed
+        // mid-turn reads from its `local_command` rows above once the turn's reply lands (2.1.322
+        // still sends that turn's later requests at the old effort). A side query (a title, a
+        // compaction) may run on another model, so only the main thread counts.
         if kind == Some("api-request") {
             if obj.get("querySource").and_then(Value::as_str) != Some(MAIN_THREAD_QUERY) {
                 continue;
@@ -2223,6 +2221,23 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
         }
     }
     (facts, false)
+}
+
+/// The text of a row that records a local command or its result: a `user` row's plain-string
+/// `message.content` (a command run between turns), or a `system` row of subtype
+/// [`LOCAL_COMMAND`]'s own `content` (one typed while a turn ran, which Claude Code 2.1.322 writes
+/// once that turn's reply lands, before the next turn's request).
+fn command_text<'a>(kind: Option<&str>, obj: &'a aterm_json::Map) -> Option<&'a str> {
+    match kind {
+        Some("user") => obj
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str),
+        Some("system") if obj.get("subtype").and_then(Value::as_str) == Some(LOCAL_COMMAND) => {
+            obj.get("content").and_then(Value::as_str)
+        }
+        _ => None,
+    }
 }
 
 fn is_word(s: &str) -> bool {
@@ -2961,18 +2976,12 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// The bit's one word on the lights block, whichever way it reads: the chip says `yolo` and its mark
-/// says whether it is on ([`YOLO_ON_MARK`]) or off ([`YOLO_OFF_MARK`]). The owner, 2026-11-09: the
-/// off chip names the flag a click turns on, never another word for it
-/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
+/// The bit's one word on the lights block, whichever way it reads: the chip says `yolo` with no
+/// mark, in the glass's value ink where Claude's pill reads bypass (`⏵⏵ bypass permissions on`) and
+/// in its quiet ink in any other mode, `auto` included. The off chip names the flag a click turns
+/// on, never another word for it (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
 pub const YOLO: &str = "yolo";
-/// The mark before [`YOLO`] where Claude's pill reads bypass (`⏵⏵ bypass permissions on`): `● yolo`,
-/// in the glass's value ink, as any value on the rule.
-pub const YOLO_ON_MARK: &str = "\u{25cf}";
-/// The mark before [`YOLO`] in any other mode its pill reads, `auto` included: `○ yolo`, in the
-/// glass's quiet ink.
-pub const YOLO_OFF_MARK: &str = "\u{25cb}";
-/// The bit set, in words (a screen reader's name for the chip, a log line): no mark is read aloud.
+/// The bit set, in words (a screen reader's name for the chip, a log line).
 pub const YOLO_ON_SAID: &str = "yolo on";
 /// The bit clear, in words.
 pub const YOLO_OFF_SAID: &str = "yolo off";
@@ -3543,7 +3552,7 @@ pub fn account_progress_phase(progress: &super::account_progress::AccountProgres
     }
 }
 
-/// Recovery evidence as the Accounts card and menu say it: the limit, the inventory, the
+/// Recovery evidence in one line of words: the limit, the inventory, the
 /// decision, its first finding, the next event and any independent pool work. The rule never
 /// says it (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1): the account's hover title
 /// says the rotation's words ([`rotation_words`]).
@@ -3595,7 +3604,7 @@ pub fn account_pool_work_text(work: &super::account_progress::ActiveSignIn) -> S
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1):
 /// `rotation: <phase>, <n> eligible of <m>, next check <when>`, then each independent pool
 /// sign-in. `when` says an instant on the glass's clock. Unknown parts are left unsaid; the
-/// Accounts card's activity rows say them ([`account_progress_text`]). Line D never carries
+/// Account card's `Copy details` holds the whole observation. Line D never carries
 /// these words: a person can act on a wall, not on a paused recovery.
 #[must_use]
 pub fn rotation_words(
@@ -3795,6 +3804,8 @@ impl FooterFacts {
             progress.phase = ProgressPhase::Unknown;
             progress.eligible = None;
             progress.next_at = None;
+            // Why the session stayed is the withdrawn decision's word, not a current one.
+            progress.stay = None;
             progress.independent_work.clear();
             for detail in &mut progress.details {
                 if detail.as_str() != UNOBSERVED_RECOVERY_FINDING
@@ -3840,7 +3851,7 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     // follows: the account is out now, and until when, its words in the warn ink and bold behind
     // `⧗` (§4.1, §4.3), the one fact here a person can act on. The unit follows it, where line E
     // is not the glass's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2); the
-    // plan is not on the rule (the hover title and the Accounts card say it).
+    // plan is not on the rule (the hover title and the Account card say it).
     let mut out: Vec<Segment> = model_effort_segment(facts, stubs).into_iter().collect();
     out.extend(usage.and_then(|u| u.wall.as_ref()).map(|wall| Segment {
         tone: Tone::Warn,
@@ -3881,9 +3892,14 @@ fn unit_figure(facts: &FooterFacts) -> Option<&str> {
 /// the one its login file names (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5, owner
 /// ruling 2026-11-09: an account is named by its email, whether or not a roster lists it), else
 /// its roster label; [`super::quota_view::THIS_LOGIN`] only for a login with a figure that
-/// neither an address nor a row names; `None` with none of these.
+/// neither an address nor a row names; `None` with none of these. A login the account state says
+/// is signed out ([`super::profile::SubscriptionDisplay::signed_out`]) is named by none of them:
+/// the glass says [`super::quota_view::NOT_SIGNED_IN`].
 #[must_use]
 pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
+    if signed_out(facts) {
+        return Some(super::quota_view::NOT_SIGNED_IN);
+    }
     let email = facts
         .subscription
         .as_ref()
@@ -3894,6 +3910,11 @@ pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
         .or(observed)
         .or(facts.account.as_deref())
         .or_else(|| unit_figure(facts).map(|_| super::quota_view::THIS_LOGIN))
+}
+
+/// Whether the pane's login is on record as signed out (`agy`'s account gate).
+fn signed_out(facts: &FooterFacts) -> bool {
+    facts.subscription.as_ref().is_some_and(|s| s.signed_out)
 }
 
 /// Line D's account unit (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2, §5.2): its
@@ -3925,6 +3946,25 @@ pub fn account_unit(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 role,
                 bold: role == Role::Warn,
             };
+            // A signed-out login's unit is the one warning, whole at every width, with no
+            // figure: none is true of it.
+            if signed_out(facts) {
+                return [[piece(
+                    super::quota_view::NOT_SIGNED_IN.to_owned(),
+                    Role::Warn,
+                )]]
+                .iter()
+                .map(|form| {
+                    form.iter()
+                        .map(|piece| Segment {
+                            tone: Tone::of(piece.role),
+                            bold: piece.bold,
+                            ..Segment::plain(ACCOUNT_MARK, piece.text.as_str())
+                        })
+                        .collect()
+                })
+                .collect();
+            }
             name.map(|name| {
                 let local = piece(super::quota_view::short(name), Role::Lit);
                 let name = piece(super::quota_view::cut(name), Role::Lit);
@@ -4262,7 +4302,7 @@ pub fn rule_room(run: &std::ops::Range<usize>) -> usize {
 }
 
 /// How many leaner forms a light's title may have between its whole and its short form.
-pub const LEAN_FORMS: usize = 4;
+pub const LEAN_FORMS: usize = 3;
 
 /// The widths of the lights' block (`claude_lights`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4552,7 +4592,6 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         TitleFit::Lean(0),
         TitleFit::Lean(1),
         TitleFit::Lean(2),
-        TitleFit::Lean(3),
         TitleFit::Short,
     ]
     .into_iter()

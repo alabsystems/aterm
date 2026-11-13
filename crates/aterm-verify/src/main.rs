@@ -12,7 +12,26 @@ fn main() -> std::process::ExitCode {
     }
     // First, while this process has one thread: a tethered child starts as this executable's
     // tether verb, and this executable is recorded as the one its own tethered spawns run through.
+    if let Err(error) = agh::git::HelperHost::Verifier.record() {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
     if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    let mut raw = raw;
+    // SAFETY: CLI entry has not started any other thread.
+    #[cfg(unix)]
+    if let Err(why) = unsafe { aterm_verify::land::own_judgment(&mut raw) } {
+        eprintln!("verify: {why}");
+        std::process::exit(aterm_verify::exit::COULD_NOT_RUN);
+    }
+    // Pin reads and writes to one usable provider before any worker dispatch.
+    let _ = aterm_verify::git_provider::pin();
+    // SAFETY: entry has started no other thread; the judgment watch leaves a process.
+    if let Some(code) = unsafe { aterm_verify::remote_cli::entry(&raw) } {
         return code;
     }
     // Before a stage can rebuild this executable: the census memo is keyed by the code that
@@ -22,7 +41,6 @@ fn main() -> std::process::ExitCode {
     // the test binaries, this binary re-invoked as a recorder or doc driver)
     // inherits the raised limit.
     aterm_uds::spawnfd::raise_soft_nofile();
-    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some(code) = aterm_verify::compile_width::wrapper_entry(&raw) {
         return std::process::ExitCode::from(code);
     }
@@ -56,6 +74,15 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = aterm_verify::watch::background_entry(&raw) {
         std::process::exit(code);
     }
+    let remote_host = match aterm_verify::remote_host::pin() {
+        Ok(host) => host,
+        Err(why) => {
+            eprintln!("verify: cannot capture remote transport host: {why}");
+            return std::process::ExitCode::from(aterm_verify::exit::COULD_NOT_RUN as u8);
+        }
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    std::process::exit(aterm_verify::run_cli(&args, &cwd));
+    let code = aterm_verify::run_cli(&args, &cwd);
+    drop(remote_host);
+    std::process::exit(code);
 }

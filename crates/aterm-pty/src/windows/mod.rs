@@ -4,6 +4,7 @@
 //! Windows ConPTY session management, job objects, and pipe I/O.
 mod cmdline;
 mod console_guard;
+mod detached;
 mod ffi;
 mod openconsole;
 mod outside_job;
@@ -14,6 +15,7 @@ mod winpath;
 pub use console_guard::serve_console_client;
 #[cfg(any(test, debug_assertions))]
 pub use console_guard::set_console_client;
+pub use detached::{Detached, in_a_job, start_outside_job};
 
 #[cfg(any(test, debug_assertions))]
 pub use openconsole::set_health_window_for_test;
@@ -48,6 +50,8 @@ struct WinSession {
     conhost: isize,
     job: isize,
     outside_job_ended: Mutex<bool>,
+    /// Where the shell runs its programs, as its listings have found ([`job_images`]).
+    programs: outside_job::Learned,
     close_evt: isize,
     pid: u32,
     exit_code: Mutex<Option<u32>>,
@@ -710,6 +714,7 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
             (0, host.into_raw(), ConsoleHostKind::OpenConsole)
         }
     };
+    let shell_image = console_guard::image_of_handle(h_process.raw());
     let session = Arc::new(WinSession {
         hpc: Mutex::new(hpc),
         signal: Mutex::new(signal),
@@ -721,6 +726,7 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
         conhost,
         job: job.into_raw(),
         outside_job_ended: Mutex::new(false),
+        programs: outside_job::Learned::of_shell(shell_image.as_deref()),
         close_evt: close_evt.into_raw(),
         pid: pi.dwProcessId,
         exit_code: Mutex::new(None),
@@ -805,6 +811,7 @@ pub fn adopt_handoff(
         conhost: 0,
         job: 0,
         outside_job_ended: Mutex::new(false),
+        programs: outside_job::Learned::of_shell(None),
         close_evt,
         pid,
         exit_code: Mutex::new(None),
@@ -856,13 +863,39 @@ fn paths_eq_ignore_ascii_case(a: &std::path::Path, b: &std::path::Path) -> bool 
 }
 
 /// The processes in the job of the session whose shell is `shell_pid`, as the job lists them now,
-/// each with its image's path (`QueryFullProcessImageNameW`): the programs its commands run. The
+/// each with its image's path (`QueryFullProcessImageNameW`): the programs its commands run. A
+/// job that holds none of them is a shell at rest or one whose programs Windows starts outside
+/// its jobs (a packaged shell's, a Store pwsh's), so then the processes below the shell that the
+/// job does not hold are listed instead (`outside_job::images`). That costs one snapshot of the
+/// machine's processes (about 3 ms measured among 231), so the session keeps what its listings
+/// have shown of its shell (`outside_job::Learned`) and asks only while the answer can
+/// matter: a shell whose job has once held a program runs its programs there, and its empty job
+/// is from then on a shell at rest, listed with no snapshot; a packaged shell (its image under
+/// `WindowsApps`) and one a walk has found a program below are walked each time their job holds
+/// none; and a shell nothing is known of yet is walked by this listing and not by
+/// [`job_images_at_pace`]. The
 /// shell's own process and the console host aterm started for the session ([`console_host_pid`])
 /// are left out, and so is a process whose image cannot be read (gone, or another user's). Nothing
 /// else of a process is read: never a window title, a command line or its memory. Empty for a
 /// session with no job (an adopted handoff) and for a pid no session's shell is.
 #[must_use]
 pub fn job_images(shell_pid: i32) -> Vec<(u32, std::path::PathBuf)> {
+    list_programs(shell_pid, true)
+}
+
+/// [`job_images`] for a listing taken at a pace while output is read, between a block's start
+/// and its end: it never takes the snapshot to find out where a shell runs its programs, only
+/// for a shell already known to run them outside its job. A shell nothing is known of yet
+/// lists what its job holds, which is nothing at rest.
+#[must_use]
+pub fn job_images_at_pace(shell_pid: i32) -> Vec<(u32, std::path::PathBuf)> {
+    list_programs(shell_pid, false)
+}
+
+/// The programs of the session whose shell is `shell_pid` ([`job_images`]); `discover` lets a
+/// session that does not know where its shell runs its programs walk below it to find out.
+fn list_programs(shell_pid: i32, discover: bool) -> Vec<(u32, std::path::PathBuf)> {
+    use outside_job::ProgramsRun;
     let Some(s) = session_by_pid(shell_pid) else {
         return Vec::new();
     };
@@ -870,11 +903,24 @@ pub fn job_images(shell_pid: i32) -> Vec<(u32, std::path::PathBuf)> {
         return Vec::new();
     }
     let host = host_pid(&s);
-    console_guard::pids_in(s.job)
+    let in_job: Vec<_> = console_guard::pids_in(s.job)
         .into_iter()
         .filter(|&pid| pid != 0 && pid != s.pid && Some(pid) != host)
         .filter_map(|pid| console_guard::image_of(pid).map(|image| (pid, image)))
-        .collect()
+        .collect();
+    if !in_job.is_empty() {
+        s.programs.found(ProgramsRun::InJob);
+        return in_job;
+    }
+    if !outside_job::walks(s.programs.get(), discover) {
+        return in_job;
+    }
+    let mut outside = outside_job::images(&s);
+    outside.retain(|&(pid, _)| Some(pid) != host);
+    if !outside.is_empty() {
+        s.programs.found(ProgramsRun::OutsideJob);
+    }
+    outside
 }
 
 /// The pid of the console host (conhost or OpenConsole) aterm started for the session whose shell

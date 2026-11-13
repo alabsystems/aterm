@@ -8,8 +8,9 @@
 //!
 //! * [`admit`] decides whether a commit can be carried: a non-merge commit of origin/main that
 //!   the line does not hold yet, moving no [`FROZEN`] path and not the release version. A
-//!   backport from the line's head may land through a neutral merge when one landed commit
-//!   holds every changed path at the backport's exact content and mode, deletions included.
+//!   backport from one of the line's heads (its base or a hop) may land through a neutral merge
+//!   when one landed commit holds every changed path at the backport's exact content and mode,
+//!   deletions included.
 //! * [`order`] puts the admitted fixes in ancestry order. [`carry`] makes one hop per fix
 //!   ([`hop_tree`]'s `git merge-tree` onto the head, then `git commit-tree` under the carried
 //!   commit's own author and committer, so a rebuild makes the same commit).
@@ -633,8 +634,10 @@ pub enum Recorded {
 /// carries it already ([`Admitted::Carried`]); it is not a merge (a refusal lists each side's
 /// non-merge commits, for the agent to name); it is on origin/main; the line's head does not
 /// hold it; it landed on main ([`landed_since`] the line's base: not only a record merge's
-/// second parent, like another line's hop), or is an exact backport from the line's head
-/// ([`backport_on_main`]); it moves no [`FROZEN`] path and not the release version.
+/// second parent, like another line's hop), or is an exact backport from one of the line's
+/// heads ([`backport_on_main`], the proof [`verify`] repeats for its hop: every head admission
+/// accepts precedes the hops one `--fix` run adds, so the proof holds wherever [`order`] places
+/// the fix among them); it moves no [`FROZEN`] path and not the release version.
 ///
 /// # Errors
 /// Each refusal above, and COULD NOT RUN when git cannot read this clone.
@@ -704,7 +707,7 @@ pub fn admit(git: &dyn GitRunner, line: &Line, rev: &str) -> Result<Admitted, St
         ));
     }
     let landed = landed_since(git, &line.base)?;
-    if !landed.contains(&commit) && !backport_on_main(git, line.head(), &parent, &commit, &landed)?
+    if !landed.contains(&commit) && !backport_on_main(git, &heads(line), &parent, &commit, &landed)?
     {
         return Err(unlanded(&commit, &read.subject));
     }
@@ -1132,10 +1135,11 @@ pub fn record(
 /// base is a commit this clone holds, named by its full sha, that declares the line's version and
 /// is on origin/main; each hop is such a commit whose one parent is the previous head, it
 /// carries, by its full sha, a non-merge commit of origin/main that no earlier hop carries and
-/// the previous head does not descend from, landed on main ([`landed_since`] the base) or
-/// proved by [`backport_on_main`]. Its tree is [`hop_tree`]'s for that commit onto the previous head and differs from it, its
-/// recorded paths are the ones it moves, none of them [`FROZEN`], and it declares the line's
-/// version; the head is on origin/main (its record merge landed). Ok is a one-line summary.
+/// the previous head does not descend from, landed on main ([`landed_since`] the base) or an
+/// exact backport from the base or a hop before it ([`backport_on_main`]), its tree is
+/// [`hop_tree`]'s for that commit onto the previous head and differs from it, its recorded
+/// paths are the ones it moves, none of them [`FROZEN`], and it declares the line's version;
+/// the head is on origin/main (its record merge landed). Ok is a one-line summary.
 ///
 /// # Errors
 /// A refusal naming the first mismatch, in that order; COULD NOT RUN when git cannot read an
@@ -1203,6 +1207,7 @@ fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<Strin
             format!("the base {} is not on origin/main", short(&line.base)),
         ));
     }
+    let heads = heads(line);
     let mut prev = line.base.as_str();
     let mut prev_tree = tree_of(git, prev)?;
     let mut landed = None;
@@ -1279,7 +1284,7 @@ fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<Strin
             .is_some_and(|set| set.contains(&hop.carries))
             && !backport_on_main(
                 git,
-                prev,
+                &heads[..=i],
                 &carried.parents[0],
                 &hop.carries,
                 landed.as_ref().expect("landed history was read above"),
@@ -1369,6 +1374,14 @@ fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<Strin
             short(prev)
         )
     })
+}
+
+/// The line's heads, oldest first: its base, then each hop. A hop's previous head is the entry
+/// before it.
+fn heads(line: &Line) -> Vec<&str> {
+    std::iter::once(line.base.as_str())
+        .chain(line.hops.iter().map(|hop| hop.commit.as_str()))
+        .collect()
 }
 
 /// [`verify`]'s remedy for a line it judged.
@@ -1464,7 +1477,9 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
     Ok(landed.into_iter().map(str::to_owned).collect())
 }
 
-/// An alternative to the history proof: a commit based exactly on the previous line head,
+/// An alternative to the history proof: a commit whose one parent is exactly one of `heads`
+/// (the line's base and its hops up to the previous head, so a backport authored on the head
+/// before a batch still proves when an earlier fix of that batch is carried before it),
 /// already in main's history, whose every changed path one landed commit holds at the
 /// backport's content and mode (or absent for a deletion). The witness is an immutable tree,
 /// so later edits on main do not invalidate the proof. A commit reached only through a
@@ -1474,12 +1489,12 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
 /// text conversion, pathspecs or checkout state take part in this proof.
 fn backport_on_main(
     git: &dyn GitRunner,
-    head: &str,
+    heads: &[&str],
     parent: &str,
     commit: &str,
     landed: &BTreeSet<String>,
 ) -> Result<bool, Stop> {
-    if parent != head {
+    if !heads.contains(&parent) {
         return Ok(false);
     }
     let changed = moved_bytes(git, parent, commit)?;
@@ -1502,8 +1517,9 @@ fn unlanded(commit: &str, subject: &str) -> Stop {
         format!(
             "{} ({subject}) is in origin/main's history only through a merge that keeps a \
              parent's tree (a release line's record merge, or one like it): its change never \
-             landed in main's tree by that history, and it is not an exact backport from the \
-             line's head whose changed paths a landed main commit holds in content and mode",
+             landed in main's tree by that history, and it is not an exact backport from one \
+             of the line's heads whose changed paths a landed main commit holds in content and \
+             mode",
             short(commit)
         ),
         format!(

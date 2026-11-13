@@ -19,6 +19,7 @@ fn restored_lab(incoming_handoff_pending: bool) -> crate::App {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     }];
     app.incoming_handoff_pending = incoming_handoff_pending;
     app.restore_into_window(crate::WindowId(0), layout);

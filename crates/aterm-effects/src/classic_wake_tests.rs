@@ -919,8 +919,8 @@ fn the_mono_crown_is_one_smooth_round_bloom() {
     );
 }
 
-/// The SPECTRUM wake on dark is v0.28's, byte for byte (the owner's
-/// ruling) at the shipped duration
+/// The SPECTRUM wake on dark is v0.28's, byte for byte
+/// at the shipped duration
 /// (`the_host_resolved_dark_wake_is_byte_identical_to_its_base`). The
 /// one-colour wake's fold was re-baked deliberately by looks8 K2, whose
 /// landing ring lies under the letters, again by looks9 (Q4's whole ring,

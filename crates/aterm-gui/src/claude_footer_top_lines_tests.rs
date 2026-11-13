@@ -437,9 +437,10 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         (
             HarnessChip::Switch,
             Some(Toggled::True),
-            b.cols.start,
-            b.cols.len()
-        )
+            b.ink.start,
+            b.ink.len()
+        ),
+        "the node is the switch's inked cells"
     );
     let label = harness_label(aterm_phase::CliHarness::Agy);
     assert_eq!(lit[0].label, format!("{label} on: harness"));
@@ -579,13 +580,16 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
 }
 
 /// EVERY CLI HARNESS SHARES THE SWITCH AND ITS LABEL: Claude Code, Antigravity, Muse Code and
-/// all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
+/// Kimi Code all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
 /// followed by its own label (`alab v0.5 (v<cli build>)`), every cell on the line's ground, the
 /// switch never bold; when off no cell wears the theme's active green accent.
 #[test]
 fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
     let agy_rows = fixture_rows(include_str!(
         "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
+    ));
+    let kimi_rows = fixture_rows(include_str!(
+        "../../aterm-phase/src/fixtures/kimi-2.4.0-idle.txt"
     ));
     let rule = "\u{2500}".repeat(120);
     let muse_rows: Vec<String> = vec![
@@ -604,8 +608,8 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
         "CONTROL: default theme's accent is bright green: {green_accent:?}"
     );
 
-    for prog in ["claude", "agy", "muse"] {
-        let rows_count = if matches!(prog, "claude" | "agy") {
+    for prog in ["claude", "agy", "muse", "kimi"] {
+        let rows_count = if matches!(prog, "claude" | "agy" | "kimi") {
             ROWS
         } else {
             24
@@ -626,6 +630,13 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
                 drawer(&app, session, PGID, "muse", "0.9.3");
                 feed(&app, session, &muse_rows);
             }
+            "kimi" => {
+                let ctx = app.pool.get(session).expect("session").ctx.clone();
+                let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(timeline.set_claude_footer(PGID, None, Some(facts())));
+                drop(timeline);
+                feed(&app, session, &kimi_rows);
+            }
             _ => unreachable!(),
         }
         // The running build each lane gives the label: the session registry's (Claude Code's),
@@ -645,6 +656,7 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
             "claude" => aterm_phase::CliHarness::ClaudeCode,
             "agy" => aterm_phase::CliHarness::Agy,
             "muse" => aterm_phase::CliHarness::Muse,
+            "kimi" => aterm_phase::CliHarness::Kimi,
             _ => unreachable!("only hosted CLI harnesses have a switch"),
         };
         let read = |app: &App, b: &crate::claude_lights::BorderSwitch, want: &str| {
@@ -681,6 +693,13 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
         let on = switch_of(&app, wid, session).unwrap_or_else(|| panic!("{prog}: lit switch"));
         assert_eq!(on.face, HarnessSwitch::On, "{prog}");
         let _ = read(&app, &on, LIT_SWITCH);
+        if prog == "kimi" {
+            let context = (0..usize::from(ROWS))
+                .find(|&row| glass_chars(&app, wid, row).contains("context:"))
+                .expect("Kimi's context row");
+            let rule = glass_chars(&app, wid, context - 2);
+            assert!(rule.contains('\u{221e}'), "Kimi's Autopilot chip: {rule:?}");
+        }
 
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
             crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),

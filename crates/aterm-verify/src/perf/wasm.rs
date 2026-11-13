@@ -59,12 +59,46 @@ pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 /// GPU module size ceiling in bytes after `wasm-opt -O3`.
 pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 6_133_315.0;
 
-fn output_root(root: &Path) -> PathBuf {
-    output_root_with(root, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+fn module_build_plan(
+    env: &crate::EnvSnapshot,
+    source: &Path,
+    artifacts: &Path,
+) -> Result<crate::NativeBuildPlan, String> {
+    let configured = env
+        .cargo_layout
+        .iter()
+        .find(|(name, _)| *name == "CARGO_TARGET_DIR")
+        .map(|(_, value)| value.as_os_str())
+        .or_else(|| env.cargo_target_dir.as_deref().map(Path::as_os_str));
+    match configured {
+        Some(path) if path.is_empty() => Err("CARGO_TARGET_DIR is empty".into()),
+        Some(path) => Ok(crate::NativeBuildPlan::for_target(
+            env,
+            source,
+            &artifacts.join(path),
+        )),
+        None => Ok(crate::NativeBuildPlan::for_default_target(
+            env, source, artifacts,
+        )),
+    }
 }
 
-fn output_root_with(root: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
-    configured.map_or_else(|| root.join("target"), |path| root.join(path))
+struct BuiltModules {
+    target: PathBuf,
+    directory: PathBuf,
+}
+
+fn run_module_build(
+    plan: &crate::NativeBuildPlan,
+    profile: &str,
+    build: impl FnOnce() -> Result<(), String>,
+) -> Result<BuiltModules, String> {
+    plan.prepare().map_err(|error| error.to_string())?;
+    build()?;
+    let target = plan.target().to_path_buf();
+    let profile = if profile == "dev" { "debug" } else { profile };
+    let directory = target.join(WASM32).join(profile);
+    Ok(BuiltModules { target, directory })
 }
 
 fn answers(program: &Path, args: &[&str]) -> bool {
@@ -158,8 +192,8 @@ pub(crate) fn gate_wasm_size() -> LaneRun {
             "release",
             Some("-C target-feature=+simd128"),
         )?;
-        let site = output_root(&root).join("wasm-size");
-        bind_modules(&built, &site, true)?;
+        let site = built.target.join("wasm-size");
+        bind_modules(&built.directory, &site, true)?;
         module_sizes(&site)
     })();
     let (cpu, gpu) = match sizes {
@@ -231,8 +265,8 @@ pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     };
     let mut record = || -> Result<(), Refused> {
         let built = build_modules(&root, &toolchain, "dev", None).map_err(Refused::Failed)?;
-        let site = output_root(&root).join("wasm-smoke");
-        bind_modules(&built, &site, false).map_err(Refused::Failed)?;
+        let site = built.target.join("wasm-smoke");
+        bind_modules(&built.directory, &site, false).map_err(Refused::Failed)?;
         wasm_page::lay_drivers(&root, &site).map_err(Refused::Failed)?;
         let mut page = Page::start(&browser, &site, &std::env::temp_dir())?;
         replay(&root, &site, &mut page, true, log)
@@ -329,7 +363,7 @@ fn build_modules(
     toolchain: &Toolchain,
     profile: &str,
     rustflags: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> Result<BuiltModules, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std.
     let neutral = aterm_tempfile::Builder::new()
         .prefix("aterm-wasm-bench-")
@@ -341,16 +375,16 @@ fn build_modules(
         toolchain.name
     );
     let mut build = toolchain.cargo();
-    let target = output_root(root);
-    if let Some(value) =
-        crate::fallback_build_dir(&crate::EnvSnapshot::capture(), neutral.path(), &target)
-    {
+    let env = crate::EnvSnapshot::capture();
+    let plan = module_build_plan(&env, neutral.path(), root)?;
+    plan.apply_to_command(&mut build)
+        .map_err(|error| error.to_string())?;
+    if let Some(value) = plan.build_dir() {
         build.arg("--config").arg(value);
     }
     build
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env("CARGO_TARGET_DIR", &target)
         .current_dir(neutral.path())
         .args([
             "build",
@@ -371,21 +405,20 @@ fn build_modules(
     if std::env::var_os("CARGO_NET_OFFLINE").is_none() {
         build.env("CARGO_NET_OFFLINE", "false");
     }
-    let built = build.status();
+    let built = run_module_build(&plan, profile, || match build.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "the {} wasm32 build exited {:?}",
+            toolchain.name,
+            status.code()
+        )),
+        Err(error) => Err(format!(
+            "could not run {}: {error}",
+            toolchain.cargo.display()
+        )),
+    });
     drop(neutral);
-    match built {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            return Err(format!(
-                "the {} wasm32 build exited {:?}",
-                toolchain.name,
-                s.code()
-            ));
-        }
-        Err(e) => return Err(format!("could not run {}: {e}", toolchain.cargo.display())),
-    }
-    let dir = if profile == "dev" { "debug" } else { profile };
-    Ok(target.join("wasm32-unknown-unknown").join(dir))
+    built
 }
 
 /// Bind both modules into `out/cpu` and `out/gpu` with `verify glue`'s generator, then apply the
@@ -429,8 +462,8 @@ fn build_and_bench(
         Some("-C target-feature=+simd128"),
     )
     .map_err(failed)?;
-    let site = output_root(root).join("wasm-bench");
-    bind_modules(&built, &site, true).map_err(failed)?;
+    let site = built.target.join("wasm-bench");
+    bind_modules(&built.directory, &site, true).map_err(failed)?;
     wasm_page::lay_drivers(root, &site).map_err(failed)?;
     let mut page = Page::start(browser, &site, &std::env::temp_dir())?;
     let product = page.product().to_string();
@@ -525,153 +558,5 @@ pub(crate) fn wasm_module_fences(json: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_pilot_wasm_outputs_respect_the_private_target_root() {
-        let cwd = std::env::current_dir().unwrap();
-        let sealed = cwd.join("sealed");
-        let private = cwd.join("private.noindex");
-        assert_eq!(output_root_with(&sealed, None), sealed.join("target"));
-        assert_eq!(
-            output_root_with(&sealed, Some(private.as_os_str())),
-            private
-        );
-        assert!(!output_root_with(&sealed, Some(private.as_os_str())).starts_with(&sealed));
-    }
-
-    fn json(text: &str) -> Value {
-        aterm_json::from_str(text).expect("test JSON parses")
-    }
-
-    fn sizes(cpu: u64, gpu: u64) -> Value {
-        json(&format!(
-            "{{\"wasm_cpu_module_bytes\":{cpu},\"wasm_gpu_module_bytes\":{gpu}}}"
-        ))
-    }
-
-    /// WITHOUT A RUSTUP THE WASM BUILDS END COULD NOT RUN NAMING THE WORKSPACE PROVIDER: where
-    /// the `rustup` row finds none (no stamped copy, nothing on PATH), the lanes that build
-    /// the web modules (wasm-smoke among them) refuse the machine, saying where the row looked
-    /// and naming `verify provision` (its provider) once, never Homebrew, even with a keg on
-    /// disk. Negative control: a rustup that is found gets past this refusal to the next
-    /// question (here, a stand-in with no wasm32 std).
-    #[test]
-    #[cfg(unix)]
-    fn with_no_rustup_the_wasm_builds_could_not_run_naming_verify_provision() {
-        use crate::perf::Status;
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let keg = tmp.path().join("opt/homebrew/opt/rustup/bin/rustup");
-        std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
-        std::fs::write(&keg, "#!/bin/false\n").unwrap();
-        let row = aterm_uds::host::tool("rustup");
-        let lookup = aterm_uds::host::Lookup {
-            named: None,
-            tooling: Some(tmp.path().join("tooling.noindex")),
-            path: Some(tmp.path().join("empty").into_os_string()),
-        };
-        let repo = workspace_root();
-        let Err(refused) = build_tools_with(row.locate_in(&lookup), &repo, false) else {
-            panic!("no rustup built the modules");
-        };
-        let Status::CouldNotRun { why, fix } = refused.status else {
-            panic!("{:?}", refused.status);
-        };
-        assert!(
-            why.starts_with("no rustup (looked in $ATERM_TEST_RUSTUP"),
-            "{why}"
-        );
-        assert_eq!(
-            fix,
-            format!("{}, with the stock pin's wasm32 std", row.remedy())
-        );
-        let said = format!("{why} {fix}");
-        assert_eq!(said.matches("verify provision").count(), 1, "{said}");
-        assert!(!said.contains("brew"), "{said}");
-
-        let Err(next) = build_tools_with(Ok(PathBuf::from("/usr/bin/false")), &repo, false) else {
-            panic!("a rustup that holds no stock pin built the modules");
-        };
-        assert!(
-            matches!(&next.status, Status::CouldNotRun { why, fix }
-                if why.starts_with("rustup could not list its toolchains")
-                    && fix == crate::rustup::PROVISION),
-            "{:?}",
-            next.status
-        );
-    }
-
-    #[test]
-    fn the_wasm_module_ceilings_hold_absolutely() {
-        assert!(wasm_module_fences(&sizes(4_703_802, 4_901_631)).is_empty());
-        assert!(wasm_module_fences(&sizes(5_886_685, 6_133_315)).is_empty());
-        let cpu_over = wasm_module_fences(&sizes(5_886_686, 6_133_315));
-        assert_eq!(cpu_over.len(), 1);
-        assert!(cpu_over[0].starts_with("wasm_cpu_module_bytes 5886686 B > ceiling"));
-        let gpu_over = wasm_module_fences(&sizes(5_886_685, 6_133_316));
-        assert_eq!(gpu_over.len(), 1);
-        assert!(gpu_over[0].starts_with("wasm_gpu_module_bytes 6133316 B > ceiling"));
-        assert_eq!(wasm_module_fences(&sizes(5_886_686, 6_133_316)).len(), 2);
-        assert_eq!(
-            wasm_module_fences(&json("{\"wasm_cpu_module_bytes\":1}")),
-            ["wasm_gpu_module_bytes missing from the bench report"]
-        );
-        assert_eq!(
-            wasm_module_fences(&json("{\"wasm_gpu_module_bytes\":1}")),
-            ["wasm_cpu_module_bytes missing from the bench report"]
-        );
-    }
-
-    /// The floors are judged and recorded only in the pinned shell: another
-    /// browser's run is not judged and keeps no samples for the trend, and a
-    /// record in it could not run. NEGATIVE CONTROL: the pinned product is
-    /// judged.
-    #[cfg(unix)]
-    #[test]
-    fn the_floors_are_judged_only_in_the_pinned_shell() {
-        let pinned = crate::browser::chromium::pinned_product();
-        assert!(floors_engine(&pinned, false).is_ok() && floors_engine(&pinned, true).is_ok());
-        let other = "HeadlessChrome/1.0.0.0";
-        let run = floors_engine(other, false).expect_err("another browser");
-        assert!(
-            matches!(&run.status, super::super::Status::NotJudged(why)
-                if why.contains(&pinned) && why.contains(other)),
-            "{run:?}"
-        );
-        assert!(run.samples.is_empty());
-        let record = floors_engine(other, true).expect_err("no record");
-        assert!(
-            matches!(&record.status, super::super::Status::CouldNotRun { why, .. }
-                if why.contains("records in the pinned shell only")),
-            "{record:?}"
-        );
-    }
-
-    #[test]
-    fn each_gated_keys_samples_print_in_lane_order() {
-        let report = json(
-            "{\"samples\":{\"wasm_gpu_frame_build_fps\":[3,4.5],\
-             \"wasm_cpu_ingest_mixed_mbps\":[1,2],\"ungated\":[9]}}",
-        );
-        assert_eq!(
-            sample_lines(&report),
-            [
-                "wasm_cpu_ingest_mixed_mbps: n=2 [1 2]",
-                "wasm_gpu_frame_build_fps: n=2 [3 4.5]"
-            ]
-        );
-        assert!(sample_lines(&json("{}")).is_empty());
-    }
-
-    #[test]
-    fn a_planted_frame_hash_changes_one_digit_of_the_first_frame() {
-        let a = "0".repeat(64);
-        let b = "f".repeat(64);
-        let text = format!("[\"x\",{{\"rgba\":\"{a}\"}}],\n[\"y\",{{\"rgba\":\"{b}\"}}]");
-        let (planted, hash) = plant_frame_hash(&text).expect("a frame to plant");
-        assert_eq!(hash, format!("1{}", &a[1..]));
-        assert_eq!(planted, text.replacen(&a, &hash, 1));
-        assert!(plant_frame_hash("{\"answers\": []}").is_none());
-    }
-}
+#[path = "wasm_tests.rs"]
+mod tests;

@@ -122,6 +122,12 @@ pub struct Evidence {
     pub cpu_unread: bool,
     /// Σ ΔCPU over the members, ns; `None` where unread.
     pub cpu_ns: Option<u64>,
+    /// Σ Δ CPU of the children the members reaped (their rusage's children), ns: work a short-lived
+    /// child did between two readings, which only the no-progress sum counts.
+    pub reaped_cpu_ns: u64,
+    /// A detached descendant of the job worked at its previous reading (its row's
+    /// `working_descendant`): the job's tree progresses, and its suspect run starts again.
+    pub tree_work: bool,
     /// Σ Δ(system calls + wakeups); `None` where unread.
     pub calls: Option<u64>,
     /// A member was born or reaped this tick.
@@ -300,7 +306,10 @@ impl Track {
             self.run_cpu = Some(0);
         }
         if ev.at_ms > from {
-            let read = ev.cpu_ns.filter(|_| !ev.cpu_unread);
+            let read = ev
+                .cpu_ns
+                .filter(|_| !ev.cpu_unread)
+                .map(|c| c.saturating_add(ev.reaped_cpu_ns));
             self.run_cpu = self.run_cpu.zip(read).map(|(s, c)| s.saturating_add(c));
         }
     }
@@ -317,7 +326,7 @@ fn no_progress(out: &Out, cx: &Cx, run_cpu: Option<u64>) -> bool {
         return false;
     };
     agent
-        && out.verdict == Verdict::Quiet
+        && matches!(out.verdict, Verdict::Quiet | Verdict::Stuck)
         && phi >= PHI_STUCK_MILLI
         && u128::from(cpu) * 60_000 < u128::from(quiet) * u128::from(NO_PROGRESS_CPU_NS_PER_MIN)
 }
@@ -377,6 +386,10 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         }
     }
     if ev.refused && fault(cx, Fault::RefusedResetsAge) {
+        t.suspect_since_ms = at;
+    }
+    // Work in the job's tree is the job's: its quiet clock and its CPU sum start again there.
+    if ev.tree_work {
         t.suspect_since_ms = at;
     }
 

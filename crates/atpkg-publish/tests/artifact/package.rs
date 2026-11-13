@@ -31,6 +31,71 @@ const MAC: &str = "aarch64-apple-darwin";
 const LIVE_CODEX: u64 = 2_026_101_501;
 const ALAB: u64 = 2_026_101_601;
 
+#[test]
+fn a_regular_release_binds_explicit_atpkg_ownership_to_committed_version_and_baseline() {
+    let w = world("regular-release");
+    put(&w.source.join("VERSION"), b"0.5.0\n");
+    put(
+        &w.source.join("alab/versions.toml"),
+        b"[[release]]\nversion = '0.5.0'\nbaseline = '0.167.1'\n",
+    );
+    git(&w.source, &["add", "."]);
+    git(&w.source, &["commit", "-q", "-m", "regular release"]);
+    git(&w.source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    let source = git(&w.source, &["rev-parse", "HEAD"]);
+    let lay = Lay {
+        version: "0.5.0".into(),
+        source,
+        baseline: Some("0.167.1".into()),
+        ..w.lay()
+    };
+    let root = w.package("regular", &lay);
+    let path = root.join("alab-build.json");
+    let mut record: aterm_json::Value =
+        aterm_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("record");
+    let read =
+        || package::read_package(&root, "codex", atpkg_publish::triple::AARCH64_APPLE_DARWIN);
+    assert!(format!("{}", read().expect_err("ownership required")).contains("updater"));
+    record
+        .as_object_mut()
+        .expect("object")
+        .insert("updater".into(), "atpkg".into());
+    std::fs::write(&path, aterm_json::to_vec(&record).expect("encode")).expect("write");
+    let mut package = read().expect("regular package admitted");
+    assert_eq!(package.count, None);
+    package::check_source(
+        w.host.as_ref(),
+        &w.source,
+        "alabsystems",
+        "codex-alab",
+        &package,
+    )
+    .expect("committed release identity");
+    package.version = "0.6.0".into();
+    assert!(
+        package::check_source(
+            w.host.as_ref(),
+            &w.source,
+            "alabsystems",
+            "codex-alab",
+            &package
+        )
+        .is_err()
+    );
+    package.version = "0.5.0".into();
+    package.baseline = Some("0.167.0".into());
+    assert!(
+        package::check_source(
+            w.host.as_ref(),
+            &w.source,
+            "alabsystems",
+            "codex-alab",
+            &package
+        )
+        .is_err()
+    );
+}
+
 struct World {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -758,7 +823,7 @@ fn each_gate_refuses_before_anything_is_signed() {
             "a stable version",
             ALAB,
             Box::new(|l| l.version = "0.164.0".into()),
-            "MAJOR.MINOR.0-dev",
+            "must explicitly name updater",
         ),
         (
             "a version naming another commit",

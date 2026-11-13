@@ -24,9 +24,13 @@ use crate::{
         keys,
     },
 };
+use aterm_codec::hex;
 use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 fn never_open(_: &Path, _: usize, _: &[String]) -> Result<()> {
     panic!("this verb opens no editor")
@@ -79,6 +83,162 @@ fn repair_new_registry(lab: &Lab) {
 fn repair_registry(lab: &Lab, rounds: usize) {
     let table = REGISTRY.descriptor(lab.bootstrap(0).trust()).unwrap().scope;
     repair_commons_first(lab, rounds, table.digest());
+}
+
+/// Append an authenticated operation with an explicit signed clock claim, preserving the
+/// installation chain and the complete observed frontier.
+fn append_history_at(handle: &Handle, command: Command, authored_ms: u64) -> Digest {
+    application::with_store(
+        &handle.paths,
+        false,
+        handle.descriptor(),
+        |session, store, scope| {
+            let evidence = store.metadata_evidence(session)?;
+            let headers: Vec<_> = evidence
+                .iter()
+                .filter(|op| op.catalog_eligible)
+                .map(|op| &op.header)
+                .collect();
+            let previous = headers
+                .iter()
+                .filter(|header| header.actor == session.actor())
+                .max_by_key(|header| header.sequence);
+            let mut parents: BTreeSet<_> = headers.iter().map(|header| header.id).collect();
+            for header in &headers {
+                for parent in header.parents.iter().chain(header.previous.iter()) {
+                    parents.remove(parent);
+                }
+            }
+            if let Some(previous) = previous {
+                parents.insert(previous.id);
+            }
+            let parents: Vec<_> = parents.into_iter().collect();
+            let wire = crate::table::fixture::seal_at(
+                session,
+                scope,
+                crate::crypto::Causal {
+                    sequence: previous.map_or(1, |header| header.sequence + 1),
+                    previous: previous.map(|header| header.id),
+                    parents: &parents,
+                },
+                &command.encode()?,
+                authored_ms,
+            )?;
+            Ok(store.ingest(session, &wire)?.id)
+        },
+    )
+    .unwrap()
+}
+
+/// Signed records survive repair with causal order intact despite a backward clock. Hidden
+/// merges and refused payloads still advance descendants; concurrent equal clocks use digest.
+/// Restoring the authored-time sort makes the parent follow its observed child (negative control).
+#[test]
+fn history_follows_causality_when_a_writer_clock_runs_behind() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let parent = append_history_at(
+        &handle,
+        Command::Write {
+            request: [71; 16],
+            changes: machine(MC),
+        },
+        u64::MAX,
+    );
+    repair_new_registry(&lab);
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let concurrent = append_history_at(
+        &peer,
+        Command::Write {
+            request: [72; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        0,
+    );
+    let sibling = append_history_at(
+        &handle,
+        Command::Write {
+            request: [75; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+        },
+        0,
+    );
+    let merge = append_history_at(&handle, Command::Merge { request: [73; 16] }, 0);
+    let refused = append_history_at(
+        &handle,
+        Command::Write {
+            request: [76; 16],
+            changes: vec![crate::database::Change {
+                collection: MACHINE.name.into(),
+                key: format!("{MC}.note"),
+                value: None,
+            }],
+        },
+        0,
+    );
+    let child = append_history_at(
+        &handle,
+        Command::Write {
+            request: [74; 16],
+            changes: vec![put(&MACHINE, MC, "location", json!("rack b"))],
+        },
+        0,
+    );
+    repair_registry(&lab, 2);
+    let history = handle.history().unwrap();
+    let peer_history = peer.history().unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| (entry.operation, entry.hlc))
+            .collect::<Vec<_>>(),
+        peer_history
+            .iter()
+            .map(|entry| (entry.operation, entry.hlc))
+            .collect::<Vec<_>>()
+    );
+    let position = |id| {
+        history
+            .iter()
+            .position(|entry| entry.operation == id)
+            .unwrap()
+    };
+    assert!(position(parent) < position(concurrent));
+    assert!(position(parent) < position(child));
+    assert!(!history.iter().any(|entry| entry.operation == merge));
+    assert!(!history.iter().any(|entry| entry.operation == refused));
+    for (id, counter, authored_ms) in [
+        (parent, 0, u64::MAX),
+        (concurrent, 1, 0),
+        (sibling, 1, 0),
+        (child, 4, 0),
+    ] {
+        let entry = &history[position(id)];
+        assert_eq!(
+            entry.hlc,
+            Hlc {
+                ms: u64::MAX,
+                counter
+            }
+        );
+        assert_eq!(entry.authored_ms, authored_ms);
+    }
+    assert!(
+        history
+            .windows(2)
+            .all(|pair| (pair[0].hlc, pair[0].operation) < (pair[1].hlc, pair[1].operation))
+    );
+    let Output::Json(output) = run(&lab.paths[0], &["history", "alab/registry", "machine"]) else {
+        panic!("history must return JSON");
+    };
+    let operations = output["operations"].as_array().unwrap();
+    let shown = operations
+        .iter()
+        .find(|op| op["operation"] == json!(hex::encode_lower(&child)))
+        .unwrap();
+    assert_eq!(shown["hlc"], json!({"ms": u64::MAX, "counter": 4}));
+    assert_eq!(shown["authored_ms"], json!(0));
 }
 
 /// A grid save on one Mac never overwrites what another Mac wrote after the export: of the

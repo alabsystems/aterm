@@ -12,8 +12,15 @@
 //!   member's hostname; an expired, revoked, mismatched or untrusted ring runs nothing;
 //! - xcrun has a developer directory that holds `notarytool` (the Command Line Tools', or the
 //!   selected Xcode's): without one, `/usr/bin/xcrun` puts Apple's install dialog on screen;
-//! - a successful check is reused for at most thirty minutes in this subscriber, and a
-//!   failed attempt backs off for one minute. A new subscriber checks again.
+//! - the login keychain is unlocked ([`aterm_uds::keychain::default_unlocked`]): notarytool
+//!   reads and stores its profile there, and macOS asks for a locked keychain's password in a
+//!   dialog;
+//! - a successful check is reused for at most thirty minutes in this subscriber, and a new
+//!   subscriber checks again;
+//! - a failed attempt is kept on disk ([`Failed`]) and backs off for one minute, doubling with
+//!   each further failure of the same entry up to a day, across restarts. A run that did not
+//!   finish (the mark of a dialog nobody answered) waits the whole day at once. A changed
+//!   entry is eligible immediately, and the explicit sync a release makes always runs.
 //!
 //! The name `notary`, which 0.145 reads after every applied version, is never read here.
 
@@ -39,6 +46,20 @@ pub fn roster_floor(paths: &Paths) -> crate::Result<u64> {
 pub(crate) const ENTRY: &str = crate::need::catalog::NOTARY_ENTRY;
 
 const NOTARY_RECHECK: Duration = Duration::from_secs(30 * 60);
+
+/// The wait after an entry's first failed attempt; each further failure doubles it.
+const NOTARY_RETRY: Duration = Duration::from_secs(60);
+
+/// The longest wait between attempts at an entry that keeps failing, and the wait after a run
+/// that did not finish.
+const NOTARY_RETRY_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The failed attempt's record, in the vault's state directory ([`Failed`]).
+const NOTARY_FAILED_FILE: &str = "release-notary-failed";
+
+/// What an error says when a notarytool run was cut off at its deadline: nothing it waits a
+/// minute for is the network's; a dialog nobody answered is.
+const UNANSWERED: &str = "did not complete";
 
 /// The release-credentials profile, under the home (`~/.aterm/release-ring/`, with fallback to
 /// the 0.145 `~/.aterm/` location while an older vault has not yet rotated its path).
@@ -69,6 +90,11 @@ const NOT_RELEASE_HOST: &str = "release-notary waits for an authorized release r
 /// What a round says on a Mac while xcrun has nothing to run notarytool with.
 const WAITS_FOR_CLT: &str = "release-notary waits for Command Line Tools: xcrun has no \
      developer directory with notarytool, so nothing runs it";
+
+/// What a round says while the login keychain would ask for its password.
+const WAITS_FOR_KEYCHAIN: &str = "release-notary waits for an unlocked login keychain: \
+     notarytool reads and stores its profile there, and macOS would ask for the keychain's \
+     password in a dialog";
 
 /// What a round says off a Mac, where no developer directory ever comes.
 const MAC_ONLY: &str = "release-notary runs on a Mac: notarytool comes with Apple's developer \
@@ -149,6 +175,8 @@ pub(super) struct Tools<'a> {
     pub(super) authorized_ring: &'a dyn Fn(&Paths) -> bool,
     /// The developer directory xcrun selects, where it holds notarytool ([`developer_dir_with`]).
     pub(super) developer_dir: &'a dyn Fn() -> Option<PathBuf>,
+    /// Whether the login keychain answers a read without asking for its password.
+    pub(super) keychain_answers: &'a dyn Fn() -> bool,
     /// Whether the `notary` profile authenticates now (`Ok(false)`: there is none).
     pub(super) history: &'a mut dyn FnMut() -> crate::Result<bool>,
     /// Store the profile from the entry.
@@ -209,7 +237,10 @@ mod live {
             Instant::now() + crate::keychain_tools::WAIT,
         )
         .map_err(|_| {
-            Error::new("notarytool authentication did not complete; automatic setup will retry")
+            Error::new(
+                "notarytool authentication did not complete within its minute; automatic setup \
+                 waits a day before it tries again",
+            )
         })
     }
 
@@ -251,7 +282,10 @@ mod live {
             Instant::now() + crate::keychain_tools::WAIT,
         )
         .map_err(|_| {
-            Error::new("notarytool credential storage did not complete; automatic setup will retry")
+            Error::new(
+                "notarytool credential storage did not complete within its minute; automatic \
+                 setup waits a day before it tries again",
+            )
         })?;
         if output.status.success() {
             Ok(())
@@ -277,6 +311,14 @@ const LIVE_DEVELOPER_DIR: fn() -> Option<PathBuf> = live::developer_dir;
 /// A test build's: none.
 #[cfg(test)]
 const LIVE_DEVELOPER_DIR: fn() -> Option<PathBuf> = || None;
+
+/// A live round's read of the login keychain's lock: only a keychain known to be unlocked
+/// answers.
+#[cfg(not(test))]
+const LIVE_KEYCHAIN: fn() -> bool = || aterm_uds::keychain::default_unlocked() == Some(true);
+/// A test build's: locked, so nothing reads the person's keychain.
+#[cfg(test)]
+const LIVE_KEYCHAIN: fn() -> bool = || false;
 
 /// A live round's check of the profile.
 #[cfg(not(test))]
@@ -523,6 +565,7 @@ pub fn sync_notary(paths: &Paths) -> crate::Result<Option<String>> {
     let mut tools = Tools {
         authorized_ring: &authorized_ring,
         developer_dir: &LIVE_DEVELOPER_DIR,
+        keychain_answers: &LIVE_KEYCHAIN,
         history: &mut history,
         store: &mut store,
     };
@@ -539,7 +582,118 @@ fn sync_notary_with(
     if (tools.developer_dir)().is_none() {
         return Err(Error::new(no_developer_dir()));
     }
-    materialize_with(paths, tools)
+    if !(tools.keychain_answers)() {
+        return Err(Error::new(WAITS_FOR_KEYCHAIN));
+    }
+    let done = materialize_with(paths, tools);
+    // What the release asked for is also what the subscriber's next round reads: a failure
+    // here backs its retries off, and a success ends a backoff.
+    if let (Ok(state), Some(now)) = (load_state(paths), aterm_time::unix_secs())
+        && let Some(digest) = state.manifest.files.get(ENTRY)
+    {
+        match &done {
+            Ok(Some(_)) => Failed::clear(paths),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = Failed::again(Failed::read(paths), digest, now, &error.to_string())
+                    .write(paths);
+            }
+        }
+    }
+    done
+}
+
+/// An entry's failed attempt, kept on disk so that no restart forgets it: which entry, when,
+/// how many attempts at it have failed in a row, and whether the last was cut off unanswered.
+/// A round reads it before anything runs ([`NotaryRounds::step`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Failed {
+    digest: String,
+    at: u64,
+    failures: u32,
+    unanswered: bool,
+    why: String,
+}
+
+impl Failed {
+    fn path(paths: &Paths) -> PathBuf {
+        paths.dir.join(NOTARY_FAILED_FILE)
+    }
+
+    /// The record on disk; `None` where there is none or it does not read as one.
+    pub(super) fn read(paths: &Paths) -> Option<Self> {
+        let bytes = fsx::read_private(&Self::path(paths), MAX_READ).ok()??;
+        let mut fields = std::collections::BTreeMap::new();
+        for line in bytes.as_str()?.lines() {
+            let (name, value) = line.split_once('=')?;
+            fields.insert(name, value);
+        }
+        Some(Self {
+            digest: (*fields.get("digest")?).to_owned(),
+            at: fields.get("at")?.parse().ok()?,
+            failures: fields.get("failures")?.parse().ok().filter(|n| *n > 0)?,
+            unanswered: match *fields.get("unanswered")? {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            },
+            why: (*fields.get("why")?).to_owned(),
+        })
+    }
+
+    /// The failure of `digest` at `now` for `why`, one more than `before` counted of that
+    /// same entry.
+    fn again(before: Option<Self>, digest: &str, now: u64, why: &str) -> Self {
+        let failures = before
+            .filter(|before| before.digest == digest)
+            .map_or(1, |before| before.failures.saturating_add(1));
+        Self {
+            digest: digest.to_owned(),
+            at: now,
+            failures,
+            unanswered: why.contains(UNANSWERED),
+            why: why.replace(['\n', '\r'], " "),
+        }
+    }
+
+    fn write(&self, paths: &Paths) -> crate::Result<()> {
+        fsx::write_atomic(
+            &Self::path(paths),
+            format!(
+                "digest={}\nat={}\nfailures={}\nunanswered={}\nwhy={}\n",
+                self.digest,
+                self.at,
+                self.failures,
+                u8::from(self.unanswered),
+                self.why
+            )
+            .as_bytes(),
+            0o600,
+        )
+    }
+
+    fn clear(paths: &Paths) {
+        let _ = std::fs::remove_file(Self::path(paths));
+    }
+
+    /// How long this failure holds the next attempt off.
+    fn wait(&self) -> Duration {
+        if self.unanswered {
+            return NOTARY_RETRY_MAX;
+        }
+        let doublings = self.failures.saturating_sub(1).min(16);
+        NOTARY_RETRY
+            .saturating_mul(1 << doublings)
+            .min(NOTARY_RETRY_MAX)
+    }
+
+    /// Whether this failure still holds an attempt at `digest` off at `now`.
+    fn holds(&self, digest: &str, now: u64) -> bool {
+        self.digest == digest
+            && now
+                .checked_sub(self.at)
+                .is_some_and(|since| since < self.wait().as_secs())
+    }
 }
 
 /// What one round's look at the entry decided.
@@ -553,13 +707,15 @@ pub(super) enum Step {
     Ran(Result<&'static str, String>),
 }
 
-/// The subscriber's notary rounds: the failed entry and its bounded retry backoff, and the
-/// last line said. Transient failures recover without requiring a process restart.
+/// The subscriber's notary rounds: this subscriber's last successful check, the failure a
+/// record could not be written for, and the last line said. A failed entry's backoff is on
+/// disk ([`Failed`]), so transient failures recover without a restart and a lasting one is not
+/// tried again by each new subscriber.
 #[derive(Debug, Default)]
 pub(super) struct NotaryRounds {
     signing: signing::Rounds,
     checked: Option<(String, Instant)>,
-    tried: Option<(String, Instant)>,
+    unrecorded: Option<Failed>,
     said: Option<Step>,
 }
 
@@ -573,6 +729,7 @@ impl NotaryRounds {
         let mut tools = Tools {
             authorized_ring: &authorized_ring,
             developer_dir: &LIVE_DEVELOPER_DIR,
+            keychain_answers: &LIVE_KEYCHAIN,
             history: &mut history,
             store: &mut store,
         };
@@ -589,17 +746,22 @@ impl NotaryRounds {
     }
 
     /// Recheck an unchanged entry after thirty minutes and after every subscriber restart.
-    /// The release ring and developer directory are checked before notarytool runs. Failed
-    /// attempts back off for a minute; a changed credential is eligible immediately.
+    /// The release ring, developer directory and login keychain are checked before notarytool
+    /// runs. A failed attempt backs off on disk ([`Failed`]); a changed credential is eligible
+    /// immediately.
     pub(super) fn step(&mut self, paths: &Paths, _config: &Config, tools: &mut Tools<'_>) -> Step {
-        self.step_with_clock(paths, tools, Instant::now)
+        self.step_with_clock(paths, tools, Instant::now, aterm_time::unix_secs)
     }
 
+    /// [`Self::step`] reading `clock` for this subscriber's own successful check and `wall`
+    /// for the failure on disk. With no wall clock nothing can be backed off across a restart,
+    /// so nothing runs.
     fn step_with_clock(
         &mut self,
         paths: &Paths,
         tools: &mut Tools<'_>,
         clock: impl Fn() -> Instant,
+        wall: impl Fn() -> Option<u64>,
     ) -> Step {
         let now = clock();
         let Ok(state) = load_state(paths) else {
@@ -608,11 +770,20 @@ impl NotaryRounds {
         let Some(digest) = state.manifest.files.get(ENTRY) else {
             return Step::Quiet;
         };
+        let Some(wall_now) = wall() else {
+            return Step::Quiet;
+        };
+        // The later of the record on disk and one that could not be written.
+        let failed = [Failed::read(paths), self.unrecorded.clone()]
+            .into_iter()
+            .flatten()
+            .max_by_key(|failed| failed.at);
         if self.checked.as_ref().is_some_and(|(checked, at)| {
             checked == digest && now.saturating_duration_since(*at) < NOTARY_RECHECK
-        }) || self.tried.as_ref().is_some_and(|(failed, at)| {
-            failed == digest && now.saturating_duration_since(*at) < Duration::from_secs(60)
-        }) {
+        }) || failed
+            .as_ref()
+            .is_some_and(|failed| failed.holds(digest, wall_now))
+        {
             return Step::Quiet;
         }
         if !(tools.authorized_ring)(paths) {
@@ -621,17 +792,23 @@ impl NotaryRounds {
         if (tools.developer_dir)().is_none() {
             return Step::Waits(no_developer_dir());
         }
+        if !(tools.keychain_answers)() {
+            return Step::Waits(WAITS_FOR_KEYCHAIN);
+        }
         self.checked = None;
         match materialize_with(paths, tools) {
             Ok(Some((line, stored))) => {
                 self.checked = Some((stored, clock()));
-                self.tried = None;
+                self.unrecorded = None;
+                Failed::clear(paths);
                 Step::Ran(Ok(line))
             }
             Ok(None) => Step::Quiet,
             Err(error) => {
-                self.tried = Some((digest.clone(), clock()));
-                Step::Ran(Err(error.to_string()))
+                let why = error.to_string();
+                let again = Failed::again(failed, digest, wall().unwrap_or(wall_now), &why);
+                self.unrecorded = again.write(paths).is_err().then_some(again);
+                Step::Ran(Err(why))
             }
         }
     }

@@ -338,7 +338,7 @@ fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged 
 
 /// `agh policy grant CALLER REPO` (design §6.2): `REPO` added to `CALLER`'s `[[writers]]`
 /// row of agh.toml, which is written again whole, atomically and 0600. It runs with or without
-/// a terminal (owner ruling 2026-10-26: an agent grants as a person does). When the file is
+/// a terminal (an agent grants as a person does). When the file is
 /// absent, healthy recorded vault identities seed `vault = true` and only the requested
 /// grant. Its answer is
 /// `{"caller","change","repos"}`: `added` or `unchanged`, and the row after the edit.

@@ -5,7 +5,11 @@
 
 use aterm_spec::derive::Model;
 
-/// Custody of two masters, `a` and `b`, across four processes.
+/// Custody of two masters, `a` and `b`, across four processes. A window's quit may keep `a` (the
+/// Mac Setup tab's installer, mid-install: `QuitKeepingA`), which the keeper then leaves orphaned
+/// for the next window a person or macOS launches (`LaunchAfterQuit`), owing no relaunch. That
+/// quit's guard names no relaunched window and no orphan, which every state with a live first
+/// window has (only a mutant relaunches beside it), so it bounds the mutant's space alone.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn pty_keeper_custody_model() -> Model {
@@ -36,6 +40,7 @@ pub fn pty_keeper_custody_model() -> Model {
             var pending = 0;
             var committed = 0;
             var bye = 0;
+            var keep_a = 0;
             var closed_a = 0;
             var closed_b = 0;
             var ever_registered_a = 0;
@@ -100,14 +105,33 @@ pub fn pty_keeper_custody_model() -> Model {
                 w_holds_b = 0;
                 w_reads_b = 0;
             }
+            action QuitKeepingA when (
+                w_live == 1 && pending == 0 && w_holds_a == 1 && k_holds_a == 1 && closed_a == 0 &&
+                r_live == 0 && orphan_a == 0 && orphan_b == 0
+            ) {
+                w_live = 0;
+                bye = 1;
+                keep_a = 1;
+                w_holds_a = 0;
+                w_reads_a = 0;
+                w_holds_b = 0;
+                w_reads_b = 0;
+            }
             action KeeperHonoursBye when (
                 bye == 1 && k_live == 1 && w_live == 0 && s_live == 0 && r_live == 0 &&
                 (k_holds_a == 1 || k_holds_b == 1) && orphan_a == 0 && orphan_b == 0
             ) {
-                k_holds_a = if Buggy == 1 { k_holds_a } else { 0 };
-                k_holds_b = if Buggy == 1 { k_holds_b } else { 0 };
-                orphan_a = if Buggy == 1 { k_holds_a } else { 0 };
-                orphan_b = if Buggy == 1 { k_holds_b } else { 0 };
+                k_holds_a = if keep_a + Buggy == 1 { k_holds_a } else { 0 };
+                k_holds_b = if Buggy == 1 && keep_a == 0 { k_holds_b } else { 0 };
+                orphan_a = if keep_a + Buggy == 1 { k_holds_a } else { 0 };
+                orphan_b = if Buggy == 1 && keep_a == 0 { k_holds_b } else { 0 };
+            }
+            action LaunchAfterQuit when (
+                bye == 1 && keep_a == 1 && k_live == 1 && w_live == 0 && s_live == 0 &&
+                r_live == 0 && orphan_a == 1
+            ) {
+                r_live = 1;
+                bye = 0;
             }
             action WindowCrashes when (w_live == 1) {
                 w_live = 0;
@@ -247,6 +271,7 @@ pub fn pty_keeper_custody_model() -> Model {
             action AdoptA when (r_live == 1 && r_holds_a == 1 && r_reads_a == 0) {
                 r_reads_a = 1;
                 orphan_a = 0;
+                keep_a = 0;
             }
             action AdoptB when (r_live == 1 && r_holds_b == 1 && r_reads_b == 0) {
                 r_reads_b = 1;
@@ -312,6 +337,7 @@ pub fn pty_keeper_custody_model() -> Model {
             invariant ClosedNeverReachesAWindowA: closed_a == 0 || s_holds_a + r_holds_a == 0;
             invariant ClosedNeverReachesAWindowB: closed_b == 0 || s_holds_b + r_holds_b == 0;
             invariant NoRelaunchAfterQuit: bye == 0 || r_live == 0;
+            invariant KeptMasterOutlivesTheQuitA: keep_a == 0 || k_holds_a == 1 || closed_a == 1 || k_faults > 0;
             invariant LossNeedsKeeperFaultA: lost_a == 0 || k_faults > 0 || ever_registered_a == 0;
             invariant LossNeedsKeeperFaultB: lost_b == 0 || k_faults > 0 || ever_registered_b == 0;
             bound RelaunchSpace: relaunches <= MaxRelaunch;

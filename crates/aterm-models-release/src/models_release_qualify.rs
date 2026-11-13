@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Step 4 of a release, qualify (tree ∥ build ∥ export), and the steps that read its records:
-//! 5 bundle, 6 ready, 7 publish, 8 cut (B4 of `docs/DESIGN-fast-build-release-2026-11-05.md`).
+//! The post-AppKit boundary of step 4 of a release, qualify (tree ∥ build ∥ export), and the
+//! steps that read its records: 5 bundle, 6 ready, 7 publish, 8 cut (B4 of
+//! `docs/DESIGN-fast-build-release-2026-11-05.md`). The synchronous AppKit gate precedes this
+//! model; its production conformance test holds that ordering separately.
 //!
 //! # Variables
 //! - `phase`: the release's step. 0 plan (step 4's skips being chosen), 1 qualify (step 4 runs),
@@ -13,7 +15,7 @@
 //!   5 stopped (killed on a red), 6 skipped (its record stood at the plan).
 //! - `export`: the export branch (`pub stage`), as above, plus 7 pushing (the staging push began;
 //!   a push is never stopped, it ends passed, red or could not run).
-//! - `bundle`: step 5, the bundle half (`verify release --bundle`: appkit and measure on the built
+//! - `bundle`: step 5, the remaining artifact-dependent bundle check (`measure` on the built
 //!   bundle). 0 idle, 1 running, 2 passed, 3 red, 4 could not run, 6 skipped (its record stood).
 //! - `tree_cpu`, `build_cpu`, `export_cpu`: the Release jobserver tokens the branch holds; their
 //!   sum is the pool's charge, at most `S`. A branch's end returns every token it held.
@@ -31,6 +33,7 @@
 //!   staging push began, while `red` was 1. No committed action sets them.
 //!
 //! # Actions
+//! AppKit has already passed or its record stood before the first action below.
 //! Plan (phase 0): `SkipTree` (sets `tree_rec` 2), `SkipBuild`, `SkipExport`, then `Plan` (to 1).
 //! `TreeMoves` (any time) is the environment: R's tree or the seal moved.
 //! Qualify (phase 1): `StartBuild`; `StartTree` once the build is running, ended or skipped;
@@ -62,7 +65,7 @@
 
 use aterm_spec::derive::*;
 
-/// The qualify graph and the records that make a release ready.
+/// The qualify graph after AppKit passed, and the records that make a release ready.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_qualify_model() -> Model {

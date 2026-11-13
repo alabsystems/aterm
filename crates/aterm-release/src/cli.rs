@@ -18,20 +18,41 @@ USAGE
   targo --unverified ship input-check --base COMMIT
       Judge unreceipted source inputs with the release's per-check records.
       No release, credentials, build of the product or publication.
-  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|matched|export \
-      [--tree-work compile-lint|release] [--export-seconds N | --export-work real]
-      Cold concurrent release slices, optionally beside test compilation and lint,
+  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|matched|export|fixtures \
+      [--tree-work compile-lint|release] [--export-seconds N | --export-work real] [--plant-red test] [--slice-cache warm|cold] [--tree-cache warm|cold] [--build-return early|retained|matched]
+      Concurrent release slices, optionally beside test compilation and lint,
       in one bounded Release allocation partitioned into private build/tree FIFOs
       plus an export reservation, with one-second descendant CPU/QoS/core samples.
       tree-work=release runs the full release tree and holds the measured export share
       for 763 seconds without publishing; export-seconds overrides that surrogate wall.
       chain lowers tree CPU priority; tree starts the tree child first as an ordering probe.
+      tree-cache=cold uses a dedicated owned target and clears native, lint and libc artifacts
+      before each real take; keep both measurement images outside that target.
       The retained pre-change binary, not tree mode, is the old-memory-order control.
       series requires --before-verify PATH and runs alone/shared/chain/chain/shared/tree
       with one fixed grant; shared and tree use the before verifier.
       matched requires --before-verify PATH and runs A/B/B/A under one grant and the
       same priority. export runs only the full local export. export-work=real includes
       the actual export guards and public-clone check, with no staging push.
+      Real export defaults to warm production slice targets; other modes default cold.
+      fixtures runs only the real producer from an existing candidate/compiler-bound index,
+      using the candidate's commit epoch as its deterministic diagnostic build number.
+      slice-cache selects either policy explicitly; prime warm targets with mode=alone.
+      Real takes run qualify's serial AppKit prefix before either branch starts, with
+      no carried AppKit groups. The common series reservation holds the matched grant;
+      AppKit keeps its production unpooled --admit now command. Its time and samples
+      belong to the full gate. Takes time the export client's build within that grant,
+      then reuse that candidate-bound client for parallel and serial export checks.
+      Their build child finishes both slices through production post-link stamping,
+      symbol processing, native/Rosetta probes and unsigned bundle assembly, using
+      the candidate's commit epoch as its diagnostic build number. No release credential
+      is used. The sampler and full gate wall include all of that work.
+      Real takes return drained compiler shares to tree, then lend one free token to the
+      indexed fixture producer, including any fallback compiler. build-return=retained
+      preserves the old handoff for measurement; matched uses retained/early/early/retained
+      with the same verifier in both arms. Takes then measure a serial local export
+      revalidation. No staging push is performed. plant-red=test records an opt-in failing test on the clean
+      candidate; only that named red is accepted as an expected-red take, never a pass.
   targo --unverified ship qualify-summary RETAINED-TAKE-DIRECTORY
   targo --unverified ship slice-memory [--takes 1|2]
       Measure native release links alone (default two), learning footprint peaks and
@@ -97,6 +118,13 @@ USAGE
       again resumes. A gap only the owner can close is asked once on the owner's
       aterm while the long steps run, and waited on at the publish. Ends in one
       line: RELEASED …, or REFUSED at <step>: <why> — <what is public>. <remedy>.
+      A refusal at a failing gate or build (the preflight's gates of R's source, the
+      release input, `verify release`, qualify's build, tree or export; never a COULD
+      NOT RUN or a dry run) first opens one Claude Code worker under Land on it
+      (`aterm ctl @self spawn agent=claude -`, its task the log and the cut's inputs),
+      once per failing input hash (the version, R and the prover), its sid kept in
+      .git/aterm-release/repairs.toml; outside an aterm session it prints that
+      command instead.
       Exit 0 released, prepared, qualified, or a dry run with nothing refused · 1 refused ·
       2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
       stop (run it again) · 130 interrupted.
@@ -106,7 +134,9 @@ USAGE
                            while this clone holds an unpublished line at another
         --supersede        with --commit REV, explicitly replace an unpublished
                            fleet line with a newer main base of the same version;
-                           records its retirement on main, after taking its claim.
+                           records its retirement on main, after taking its claim
+                           from whoever holds it: a live, stalled or unreadable
+                           holder alike, whose run then stops itself.
                            A staged, unpublished line can be replaced. The new base
                            qualifies again and appends its own staging snapshot
         --fix COMMIT...    carry these landed, non-merge main commits onto this
@@ -137,6 +167,8 @@ USAGE
                            stale prepare. With --dry-run: the plan of both halves
         --qualify          check the full export locally, build and verify, then
                            stop without pushing a staging snapshot or publishing.
+                           Keeps the selected source and clone's journal separate
+                           from fleet release lines; cannot combine with --fix.
                            Keeps the verified bundle for `cut --dry-run` signing;
                            a later release still stages before publishing.
                            Cannot combine with --bump or --prepare
@@ -1166,8 +1198,8 @@ fn parse_release<'a>(
     {
         return Err("--supersede requires --commit REV and cannot combine with --bump, --fix, --forget, --abandon or --qualify".into());
     }
-    if opts.qualify && (opts.bump || opts.prepare) {
-        return Err("--qualify cannot combine with --bump or --prepare".into());
+    if opts.qualify && (opts.bump || opts.prepare || !opts.fix.is_empty()) {
+        return Err("--qualify cannot combine with --bump, --prepare or --fix".into());
     }
     if opts.bump && opts.commit.is_some() {
         return Err(
@@ -1524,180 +1556,5 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn input_check_requires_only_a_base_and_cannot_request_publication() {
-        let args = |parts: &[&str]| parts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        assert!(matches!(parse(&args(&["input-check", "--base", "abc"])),
-            Ok(Cmd::InputCheck(base)) if base == "abc"));
-        for parts in [
-            vec!["input-check"],
-            vec!["input-check", "--base"],
-            vec!["input-check", "--base", "abc", "--publish"],
-        ] {
-            assert!(parse(&args(&parts)).is_err());
-        }
-    }
-
-    #[test]
-    fn qualify_replay_requires_historical_windows_and_independent_pilot_takes() {
-        let args = |parts: &[&str]| parts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        assert!(
-            matches!(parse(&args(&["qualify-replay","cuts","runs.json"])),Ok(Cmd::QualifyReplay(cuts,runs)) if cuts==std::path::Path::new("cuts") && runs==std::path::Path::new("runs.json"))
-        );
-        assert!(parse(&args(&["qualify-replay", "cuts"])).is_err());
-        assert!(parse(&args(&["qualify-replay", "cuts", "runs.json", "extra"])).is_err());
-    }
-    #[test]
-    fn prefreeze_is_a_standalone_nonpublishing_operation() {
-        let parse = |flags: &[&str]| parse_release(&mut flags.iter().copied());
-        assert!(parse(&["--prefreeze"]).unwrap().prefreeze);
-        assert!(!parse(&["--mac-only"]).unwrap().prefreeze);
-        for flags in [
-            vec!["--bump"],
-            vec!["--commit", "HEAD"],
-            vec!["--fix", "HEAD"],
-            vec!["--prepare"],
-            vec!["--qualify"],
-            vec!["--forget"],
-            vec!["--abandon", "v0.1.0"],
-            vec!["--dry-run"],
-            vec!["--mac-only"],
-            vec!["--release-credentials", "/unused/profile.toml"],
-        ] {
-            let mut args = vec!["--prefreeze"];
-            args.extend(flags);
-            assert!(parse(&args).is_err(), "{args:?}");
-        }
-    }
-    #[test]
-    fn supersede_requires_an_explicit_commit() {
-        let parse = |words: &[&str]| {
-            super::parse(
-                &words
-                    .iter()
-                    .map(|word| (*word).to_string())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        assert!(parse(&["release", "--supersede"]).is_err());
-        assert!(parse(&["release", "--commit", "abc", "--supersede"]).is_ok());
-        assert!(parse(&["release", "--commit", "abc", "--supersede", "--qualify"]).is_err());
-    }
-    use super::*;
-
-    #[test]
-    fn compat_checks_only_the_stable_compile_without_exporting_or_cutting() {
-        let args = ["check", "--compat"].map(str::to_owned);
-        let Cmd::Check(opts) = parse(&args).unwrap() else {
-            panic!("check verb");
-        };
-        assert!(opts.compat);
-        assert_eq!(opts.sections(), (false, false, false));
-        assert_eq!(
-            crate::release_steps::CheckOptions::default().sections(),
-            (true, true, true)
-        );
-        assert!(parse(&["check", "--source"].map(str::to_owned)).is_err());
-        let Cmd::Check(source) = parse(&["check", "--cut", "--source"].map(str::to_owned)).unwrap()
-        else {
-            panic!("source check");
-        };
-        assert!(source.cut && source.source);
-    }
-
-    /// `inputs` takes a new seal, `inputs --recheck` rechecks the kept one, and any other
-    /// argument is refused by its own spelling, after `--recheck` too. CONTROL: the two forms.
-    #[test]
-    fn inputs_takes_only_recheck_and_names_the_argument_it_refuses() {
-        let parse_args = |args: &[&str]| {
-            let args: Vec<String> = std::iter::once("inputs")
-                .chain(args.iter().copied())
-                .map(str::to_string)
-                .collect();
-            parse(&args)
-        };
-        assert!(matches!(
-            parse_args(&[]).unwrap(),
-            Cmd::Inputs { recheck: false }
-        ));
-        assert!(matches!(
-            parse_args(&["--recheck"]).unwrap(),
-            Cmd::Inputs { recheck: true }
-        ));
-        for (args, refused) in [
-            (&["--fresh"][..], "\"--fresh\""),
-            (&["--recheck", "extra"][..], "\"extra\""),
-            (&["--recheck", "--recheck"][..], "\"--recheck\""),
-        ] {
-            let error = parse_args(args).expect_err("refused");
-            assert!(
-                error.contains(&format!("(got {refused})")),
-                "{args:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn notary_only_cannot_select_other_provisioning_work() {
-        let parse_flags = |flags: &[&str]| {
-            let args: Vec<String> = ["provision", "--notary-only"]
-                .into_iter()
-                .chain(flags.iter().copied())
-                .map(str::to_string)
-                .collect();
-            parse(&args)
-        };
-        assert!(matches!(
-            parse_flags(&[]).unwrap(),
-            Cmd::NotaryOnly { check: false }
-        ));
-        assert!(matches!(
-            parse_flags(&["--check"]).unwrap(),
-            Cmd::NotaryOnly { check: true }
-        ));
-        for flags in [
-            vec!["--id", "m22"],
-            vec!["--roster-only"],
-            vec!["--roster", "/public/pair"],
-            vec!["--cert-dir", "/cert"],
-            vec!["--notary-only"],
-        ] {
-            assert!(parse_flags(&flags).is_err());
-        }
-    }
-
-    #[test]
-    fn roster_only_requires_an_explicit_pair_and_cannot_acquire_certificates() {
-        let parse_flags = |flags: &[&str]| {
-            let args: Vec<String> = ["provision", "--id", "m3"]
-                .into_iter()
-                .chain(flags.iter().copied())
-                .map(str::to_string)
-                .collect();
-            parse(&args)
-        };
-        for flags in [
-            vec!["--roster-only"],
-            vec!["--roster", "/public/pair"],
-            vec![
-                "--roster-only",
-                "--roster",
-                "/public/pair",
-                "--cert-dir",
-                "/cert",
-            ],
-        ] {
-            assert!(parse_flags(&flags).is_err());
-        }
-        assert!(
-            matches!(parse_flags(&["--roster-only", "--roster", "/public/pair", "--check"]).unwrap(),
-            Cmd::Provision { check: true, roster: Some(path), cert_dir: None, .. }
-                if path == std::path::Path::new("/public/pair"))
-        );
-        assert!(matches!(
-            parse_flags(&[]).unwrap(),
-            Cmd::Provision { roster: None, .. }
-        ));
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

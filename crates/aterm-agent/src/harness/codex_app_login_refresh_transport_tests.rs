@@ -1,0 +1,291 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+
+fn document(issuer: &str) -> Vec<u8> {
+    aterm_json::to_vec(&json!({"auth_mode":"chatgpt","tokens":{
+        "access_token":"test-old-access","refresh_token":"test-refresh-canary",
+        "account_id":"test-account","oauth_provenance":{"issuer":issuer,"client_id":CLIENT_ID}
+    }}))
+    .unwrap()
+}
+
+#[test]
+fn absent_budget_invalid_authority_and_failed_arm_never_send() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let doc = document(&format!("http://{}", listener.local_addr().unwrap()));
+    let armed = AtomicBool::new(false);
+    let result = exchange_owned_refresh(&doc, Deadline::after(Duration::ZERO), || {
+        armed.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(result.is_err() || matches!(result, Ok(RefreshExchange::NotSent)));
+    assert!(!armed.load(Ordering::SeqCst));
+    assert!(
+        exchange_owned_refresh(&doc, Deadline::after(Duration::from_secs(10)), || Err(
+            "not durable".into()
+        ))
+        .is_err()
+    );
+    assert!(
+        exchange_owned_refresh(
+            &document("http://not-loopback.example"),
+            Deadline::after(Duration::from_secs(10)),
+            || panic!("invalid authority armed")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+fn response_case(status: u16, body: Option<&'static str>) -> RefreshExchange {
+    response_case_with_clock(status, body, Instant::now)
+}
+
+fn response_case_with_clock(
+    status: u16,
+    body: Option<&'static str>,
+    request_started: impl FnOnce() -> Instant,
+) -> RefreshExchange {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let armed = Arc::new(AtomicBool::new(false));
+    let check = Arc::clone(&armed);
+    let finished = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&finished);
+    let server = std::thread::spawn(move || {
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut stream = loop {
+            let accept_until = until.min(Instant::now() + Duration::from_millis(1));
+            match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(accept_until),
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < until,
+                        "refresh fixture accept did not happen"
+                    );
+                }
+                Err(error) => panic!("refresh fixture accept failed: {error}"),
+            }
+        };
+        assert!(check.load(Ordering::SeqCst), "request preceded durable arm");
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(&stream);
+        let mut size = None;
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            assert!(!line.is_empty(), "refresh request ended before its headers");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                size = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut sent = vec![0; size.unwrap()];
+        reader.read_exact(&mut sent).unwrap();
+        let sent: Value = aterm_json::from_slice(&sent).unwrap();
+        assert_eq!(sent["grant_type"].as_str(), Some("refresh_token"));
+        drop(reader);
+        if let Some(body) = body {
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let result = exchange_owned_refresh_with_clock(
+        &document(&issuer),
+        Deadline::after(aterm_spec::wait::MUST_HAPPEN),
+        || {
+            armed.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        request_started,
+    )
+    .unwrap();
+    finished.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    result
+}
+
+#[test]
+fn required_token_response_keeps_owned_refresh_work() {
+    let RefreshExchange::Completed(received) =
+        response_case_with_clock(200, Some("native-response-canary"), || {
+            Instant::now() - Duration::from_secs(31)
+        })
+    else {
+        panic!("the required native response was abandoned");
+    };
+    assert_eq!(received.status(), 200);
+    assert_eq!(received.body(), b"native-response-canary");
+    assert!(received.received_at().is_some());
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let doc = document(&format!("http://{}", listener.local_addr().unwrap()));
+    let armed = AtomicBool::new(false);
+    let result = exchange_owned_refresh_with_clock(
+        &doc,
+        Deadline::after(aterm_spec::wait::MUST_HAPPEN * 2),
+        || {
+            armed.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        || Instant::now() - Duration::from_secs(61),
+    )
+    .unwrap();
+    assert!(armed.load(Ordering::SeqCst));
+    assert!(matches!(result, RefreshExchange::NotSent));
+    assert_eq!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn completed_responses_are_owned_before_any_payload_interpretation() {
+    for (status, body, refused) in [
+        (200, "not-json-test-canary", false),
+        (400, r#"{"error":"invalid_grant"}"#, true),
+    ] {
+        let RefreshExchange::Completed(received) = response_case(status, Some(body)) else {
+            panic!("completed refresh response was lost");
+        };
+        assert_eq!(received.status(), status);
+        assert_eq!(received.body(), body.as_bytes());
+        assert!(received.received_at().is_some());
+        assert_eq!(refresh_refused(received.status(), received.body()), refused);
+        assert!(!format!("{received:?}").contains(body));
+    }
+}
+
+#[test]
+fn a_sent_request_without_a_response_is_unknown_not_replayable() {
+    assert!(matches!(response_case(200, None), RefreshExchange::Unknown));
+}
+fn identity_token(user: &str, workspace: &str) -> String {
+    super::super::tests::make_jwt(&json!({"https://api.openai.com/auth": {
+        "chatgpt_user_id":user, "chatgpt_account_id":workspace
+    }}))
+}
+
+fn previous_document() -> Vec<u8> {
+    let token = identity_token("same-user", "jwt-default");
+    aterm_json::to_vec(
+        &json!({"auth_mode":"chatgpt", "login_owner_id":"fresh-code-owner",
+            "unknown_native_field":{"keep":[1,2]}, "tokens":{
+                "access_token":token, "id_token":token, "refresh_token":"old-refresh",
+                "account_id":"selected-workspace", "extra_native_token_field":true,
+                "oauth_provenance":{"issuer":DEFAULT_ISSUER,"client_id":CLIENT_ID}
+        }}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn owned_merge_preserves_selected_workspace_optional_tokens_and_native_metadata() {
+    let previous = previous_document();
+    let before: Value = aterm_json::from_slice(&previous).unwrap();
+    let access = identity_token("same-user", "another-jwt-default");
+    let body = aterm_json::to_vec(&json!({"access_token":access})).unwrap();
+    let merged = merge_owned_refresh(&previous, 200, &body, 1_800_000_000).unwrap();
+    let after: Value = aterm_json::from_slice(merged.as_slice()).unwrap();
+    for key in ["auth_mode", "login_owner_id", "unknown_native_field"] {
+        assert_eq!(before.get(key), after.get(key));
+    }
+    for key in [
+        "account_id",
+        "id_token",
+        "refresh_token",
+        "oauth_provenance",
+        "extra_native_token_field",
+    ] {
+        assert_eq!(before["tokens"].get(key), after["tokens"].get(key));
+    }
+    assert_eq!(
+        after["tokens"]["access_token"].as_str(),
+        Some(access.as_str())
+    );
+    assert_eq!(after["last_refresh"].as_str(), Some("2027-01-15T08:00:00Z"));
+    let body = aterm_json::to_vec(
+        &json!({"access_token":access, "id_token":identity_token("same-user","changed-default"),
+        "refresh_token":"rotated-refresh"}),
+    )
+    .unwrap();
+    let rotated = merge_owned_refresh(&previous, 200, &body, 1_800_000_001).unwrap();
+    let rotated: Value = aterm_json::from_slice(rotated.as_slice()).unwrap();
+    assert_eq!(
+        rotated["tokens"]["refresh_token"].as_str(),
+        Some("rotated-refresh")
+    );
+    assert_eq!(
+        rotated["tokens"]["account_id"].as_str(),
+        Some("selected-workspace")
+    );
+}
+
+#[test]
+fn owned_merge_refuses_changed_or_conflicting_users_malformed_and_oversize_documents() {
+    let previous = previous_document();
+    let other = identity_token("another-user", "selected-workspace");
+    for body in [
+        b"not-json".to_vec(),
+        b"{}".to_vec(),
+        br#"{"access_token":""}"#.to_vec(),
+        aterm_json::to_vec(&json!({"access_token":other})).unwrap(),
+        aterm_json::to_vec(&json!({"access_token":other,"id_token":other})).unwrap(),
+        aterm_json::to_vec(&json!({"access_token":"x".repeat(16*1024)})).unwrap(),
+    ] {
+        assert!(merge_owned_refresh(&previous, 200, &body, 1_800_000_000).is_err());
+    }
+    assert!(merge_owned_refresh(&previous, 401, b"{}", 1_800_000_000).is_err());
+    assert!(
+        merge_owned_refresh(&previous, 200, br#"{"access_token":"opaque"}"#, u64::MAX).is_err()
+    );
+    assert!(merge_owned_refresh(&vec![b'x'; 16 * 1024 + 1], 200, b"{}", 1_800_000_000).is_err());
+}
+#[test]
+fn owned_token_digest_matches_native_spent_token_correlation() {
+    let doc = previous_document();
+    assert_eq!(
+        owned_refresh_token_digest(&doc).unwrap(),
+        refresh_token_digest("old-refresh")
+    );
+    assert!(owned_refresh_token_digest(b"{}").is_err());
+    assert!(owned_refresh_token_digest(&vec![b' '; 16 * 1024 + 1]).is_err());
+}

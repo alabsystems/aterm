@@ -1276,7 +1276,7 @@ fn a_stacked_rows_flow_counts_its_setting_line() {
         },
     ));
     state.sessions[0].set_by = Some(crate::autopilot::SetByWords {
-        by: crate::autopilot::Surface::Menu.phrase().to_string(),
+        by: crate::autopilot::Surface::Settings.phrase().to_string(),
         at: Some(Stamp {
             clock: crate::claude_lights::Clock::of_minute(14 * 60 + 5),
             day: 0,

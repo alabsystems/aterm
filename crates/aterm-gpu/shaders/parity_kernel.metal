@@ -57,20 +57,27 @@ kernel void k_rain_parity(constant RainParityParams& p [[buffer(0)]],
 }
 
 // udiv_small (the glow ramp's and the fx sprite texel's divide) against the
-// integer divide: one thread per divisor d = d0 + gid.x, every quotient up to
-// q_max, and either every remainder (r_all) or the four where a float
-// estimate of n / d lands nearest the next quotient or the last: 0, 1, d - 2
-// and d - 1. Each thread writes how many cases disagreed and the first n.
-struct UdivParityParams { uint d0, q_max, r_all; };
+// integer divide: one thread per divisor d = d0 + gid.x and block of q_block
+// quotients from gid.y * q_block (the last block ends at q_max), and either
+// every remainder (r_all) or the four where a float estimate of n / d lands
+// nearest the next quotient or the last: 0, 1, d - 2 and d - 1. Each thread
+// writes, at gid.y * width + gid.x, how many cases disagreed, the first n
+// that did and how many cases it checked. A GPU thread runs its loop to the
+// end unpreempted, so the blocks bound what one thread holds its core for.
+struct UdivParityParams { uint d0, q_max, r_all, q_block, width; };
 
 kernel void k_udiv_parity(constant UdivParityParams& p [[buffer(0)]],
                           device uint* out_bad [[buffer(1)]],
                           device uint* out_first [[buffer(2)]],
+                          device uint* out_cases [[buffer(3)]],
                           uint2 gid [[thread_position_in_grid]]) {
     uint d = p.d0 + gid.x;
+    uint q0 = gid.y * p.q_block;
+    uint q1 = min(q0 + p.q_block - 1u, p.q_max);
     uint bad = 0u;
     uint first = 0xFFFFFFFFu;
-    for (uint q = 0u; q <= p.q_max; ++q) {
+    uint cases = 0u;
+    for (uint q = q0; q <= q1; ++q) {
         uint base = q * d;
         uint edge[4] = { 0u, min(1u, d - 1u), d - min(2u, d), d - 1u };
         uint count = p.r_all != 0u ? d : 4u;
@@ -81,7 +88,10 @@ kernel void k_udiv_parity(constant UdivParityParams& p [[buffer(0)]],
                 bad += 1u;
             }
         }
+        cases += count;
     }
-    out_bad[gid.x] = bad;
-    out_first[gid.x] = first;
+    uint slot = gid.y * p.width + gid.x;
+    out_bad[slot] = bad;
+    out_first[slot] = first;
+    out_cases[slot] = cases;
 }

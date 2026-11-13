@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
-use super::tests::{ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env};
+use super::tests::{
+    ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, pipe_pair, restore_env,
+};
 use super::*;
 
 /// The recorded handoff fixtures, a folder per release.
@@ -1907,6 +1909,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.197.0", "stalled-sequence"),
     ("v0.197.0", "twelve-panes"),
     ("v0.197.0", "variants"),
+    ("v0.198.0", "carried-state"),
+    ("v0.198.0", "claude-code-1049"),
+    ("v0.198.0", "colour-and-shell"),
+    ("v0.198.0", "engine-state"),
+    ("v0.198.0", "fold"),
+    ("v0.198.0", "held-failed"),
+    ("v0.198.0", "held-pane"),
+    ("v0.198.0", "held-withheld"),
+    ("v0.198.0", "history"),
+    ("v0.198.0", "history-carry"),
+    ("v0.198.0", "incident-55x149"),
+    ("v0.198.0", "link-dense"),
+    ("v0.198.0", "link-dense-history"),
+    ("v0.198.0", "lone-workers-list"),
+    ("v0.198.0", "policy-repaint"),
+    ("v0.198.0", "policy-visible"),
+    ("v0.198.0", "shell-integration"),
+    ("v0.198.0", "stalled-sequence"),
+    ("v0.198.0", "twelve-panes"),
+    ("v0.198.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -3355,7 +3377,6 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
 
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
-    const ACTIVE_CHILDREN: usize = 4;
     const BATCH: &str = "ATERM_SHIPPED_DESK_BATCH";
     const STARTED: &str = "shipped desk started: ";
     const COMPLETED: &str = "shipped desk completed: ";
@@ -3383,51 +3404,47 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         }
         let mut completed = std::collections::BTreeSet::new();
         let mut drafts_carried = 0usize;
-        // Joining each wave before starting another bounds live children even on a failure;
-        // Running's Drop kills and reaps every still-owned child when an assertion unwinds.
-        for first in (0..batches.len()).step_by(ACTIVE_CHILDREN) {
-            let running: Vec<_> = (first..batches.len().min(first + ACTIVE_CHILDREN))
-                .map(|index| {
-                    let value = std::ffi::OsString::from(index.to_string());
-                    (
-                        index,
-                        crate::test_alone::spawn_alone_with(&[(BATCH, &value)]),
-                    )
+        // Each desk needs real PTYs. Finish a batch before starting another so checked-in
+        // releases share one desk's PTY footprint instead of multiplying the kernel's use.
+        for (index, desks) in batches.iter().enumerate() {
+            let value = std::ffi::OsString::from(index.to_string());
+            let stdout = {
+                let _lease =
+                    aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
+                crate::test_alone::spawn_alone_with(&[(BATCH, &value)])
+                    .passed()
+                    .stdout
+            };
+            let actual: Vec<_> = stdout
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(COMPLETED)
+                        .map(|(_, label)| label.to_owned())
                 })
                 .collect();
-            for (index, child) in running {
-                let stdout = child.passed().stdout;
-                let actual: Vec<_> = stdout
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once(COMPLETED)
-                            .map(|(_, label)| label.to_owned())
-                    })
-                    .collect();
-                let wanted: Vec<_> = batches[index].iter().map(DeskPath::label).collect();
-                assert_eq!(
-                    actual, wanted,
-                    "batch {index} completed exactly its assigned desks"
-                );
-                for label in actual {
-                    assert!(completed.insert(label), "no desk runs in two batches");
-                }
-                let counts: Vec<_> = stdout
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once(DRAFTS).map(|(_, count)| {
-                            count
-                                .trim()
-                                .parse::<usize>()
-                                .expect("the draft count is a number")
-                        })
-                    })
-                    .collect();
-                let [count] = counts.as_slice() else {
-                    panic!("batch {index} reported no unique draft count");
-                };
-                drafts_carried += *count;
+            let wanted: Vec<_> = desks.iter().map(DeskPath::label).collect();
+            assert_eq!(
+                actual, wanted,
+                "batch {index} completed exactly its assigned desks"
+            );
+            for label in actual {
+                assert!(completed.insert(label), "no desk runs in two batches");
             }
+            let counts: Vec<_> = stdout
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(DRAFTS).map(|(_, count)| {
+                        count
+                            .trim()
+                            .parse::<usize>()
+                            .expect("the draft count is a number")
+                    })
+                })
+                .collect();
+            let [count] = counts.as_slice() else {
+                panic!("batch {index} reported no unique draft count");
+            };
+            drafts_carried += *count;
         }
         assert_eq!(
             completed, expected,

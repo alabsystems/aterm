@@ -35,29 +35,32 @@ use crate::members_cli::Standing;
 /// Whether this Mac is in a fleet, as the machine title's row and `aterm name`'s `fleet=` say it
 /// (`docs/DESIGN-machine-names-2026-11-04.md` §11.84, §11.85): its vault's membership standing
 /// ([`Standing`]), with a shared-secret fleet's key standing for membership until the one-mesh
-/// design's D2 deletes the key.
+/// design's D2 deletes the key. A retained key stands for active membership only while its
+/// custody admits traffic.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InFleet {
-    /// A member, or a holder of a fleet key that reads.
+    /// A member, or a holder of a readable fleet key with admitted custody.
     In,
     /// On its way in: let in and not yet recorded, asking, or let in with no seat yet.
     Joining,
     /// Never in, taken out, or let go.
     Out,
+    /// A retained fleet key whose custody does not admit traffic: why.
+    Paused(String),
     /// The vault's local state could not be read: why.
     Unread(String),
 }
 
 impl InFleet {
-    /// What `standing` says, where `fleet_key` is whether a fleet key reads and `revoked` whether
-    /// the vault let this Mac go or took it out ([`client::Membership::Revoked`]), which outranks
+    /// What `standing` says, where `admitted_key` means a readable key with admitted custody
+    /// and `revoked` means the vault let this Mac go or took it out ([`client::Membership::Revoked`]), which outranks
     /// a fleet key: the key it still holds is a secret it was let go from, not a membership.
     #[must_use]
-    pub fn of(fleet_key: bool, revoked: bool, standing: &Standing) -> Self {
+    pub fn of(admitted_key: bool, revoked: bool, standing: &Standing) -> Self {
         if revoked || matches!(standing, Standing::Dropped(_)) {
             return Self::Out;
         }
-        if fleet_key {
+        if admitted_key {
             return Self::In;
         }
         match standing {
@@ -71,7 +74,8 @@ impl InFleet {
     /// This Mac's, with its fleet key in `state` and its vault at `vault`
     /// ([`Standing::membership_of`], which spawns nothing), or the key alone where no vault is
     /// read ([`standing_vault`]). Revocation is read before the key decides membership; only
-    /// a keyless, nonrevoked Mac needs its standing read too.
+    /// a keyless, nonrevoked Mac needs its standing read too. A retained key with custody that
+    /// refuses traffic is paused until an explicit take restores custody.
     #[must_use]
     pub fn read(state: &Path, vault: Option<&client::Paths>) -> Self {
         let fleet_key = aterm_net::fleet::read_key_file(state).is_ok();
@@ -90,7 +94,10 @@ impl InFleet {
             return Self::Out;
         }
         if fleet_key {
-            return Self::In;
+            return match crate::fleet_vault::tenure(state, vault).void() {
+                Some(why) => Self::Paused(why),
+                None => Self::In,
+            };
         }
         Self::of(false, false, &Standing::membership_of(paths, status))
     }
@@ -102,18 +109,20 @@ impl InFleet {
             Self::In => "in",
             Self::Joining => "joining",
             Self::Out => "out",
+            Self::Paused(_) => "paused",
             Self::Unread(_) => "unread",
         }
     }
 
-    /// The machine menu's words: `in a fleet`, `joining a fleet`, `not in a fleet`, or
-    /// `fleet not read`.
+    /// The machine menu's words: `in a fleet`, `joining a fleet`, `not in a fleet`,
+    /// `fleet paused`, or `fleet not read`.
     #[must_use]
     pub const fn phrase(&self) -> &'static str {
         match self {
             Self::In => "in a fleet",
             Self::Joining => "joining a fleet",
             Self::Out => "not in a fleet",
+            Self::Paused(_) => "fleet paused",
             Self::Unread(_) => "fleet not read",
         }
     }

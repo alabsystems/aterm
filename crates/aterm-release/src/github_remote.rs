@@ -65,6 +65,7 @@ fn configured(dirs: &agh::config::Dirs) -> Result<Github, String> {
         .env(env)
         .fx(Arc::new(agh::Fx::live()))
         .caller(CALLER)
+        .core_reserve(0)
         .journal(dirs.clone())
         .rate_book(agh::rate::RateBook::at(dirs.rate()))
         .refuse_anonymous_api(true)
@@ -129,22 +130,21 @@ pub(crate) fn origin_slug(repo: &Path) -> Result<Slug, String> {
     Slug::parse(&slug).map_err(|error| error.why.clone())
 }
 
-/// The cutter embeds only the existing Git credential-helper grammar, never a
-/// second general operator CLI. Git appends exactly one protocol operation.
+/// Git's callback accepts only its existing credential-helper grammar. The verifier's
+/// linked remote transport has a separate entry. Git appends exactly one operation.
 pub(crate) fn helper_arguments(
     args: &[std::ffi::OsString],
 ) -> Result<Option<Vec<std::ffi::OsString>>, &'static str> {
     if args.first().is_none_or(|word| word != "agh") {
         return Ok(None);
     }
-    if let [_, auth, credential, operation] = args
+    if let [_, auth, credential, _operation] = args
         && auth == "auth"
         && credential == "git-credential"
-        && matches!(operation.to_str(), Some("get" | "store" | "erase"))
     {
         return Ok(Some(args[1..].to_vec()));
     }
-    Err("the cutter's agh entry accepts only auth git-credential get|store|erase")
+    Err("the cutter's agh entry accepts only auth git-credential OP")
 }
 
 impl Remote {

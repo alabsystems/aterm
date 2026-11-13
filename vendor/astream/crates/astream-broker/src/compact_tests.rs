@@ -643,6 +643,40 @@ fn the_compactions_files_are_never_readable_more_widely_than_the_log() {
     }
 }
 
+/// THE COPY READS THROUGH THE LOG'S OWN DESCRIPTOR, never a second open of its path. On
+/// Windows the open's whole-file exclusive lock (`LockFileEx` through the log's handle,
+/// `lock_exclusive`) denies reads through any other handle of the file, this process's
+/// included, so a copy read through a second open would fail every compaction there and the
+/// log would never shrink. The Unix stand-in for that lock: once the log is open, its path is
+/// made write-only (0o200), which the open's own descriptor reads past and a second open for
+/// reading does not. The carrying compaction still cuts, and the log reopens (every file made
+/// readable again first) as the uninterrupted compaction leaves it.
+#[cfg(unix)]
+#[test]
+fn the_copy_reads_through_the_logs_own_descriptor() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_, after) = reference(false, true);
+    let fx = Fixture::new("compact-own-descriptor", false);
+    let mut log = fx.create();
+    seed(&mut log, true);
+    drop(log);
+    let mut log = fx.open().unwrap();
+    std::fs::set_permissions(&fx.path, Permissions::from_mode(0o200)).unwrap();
+    let cut = compact(&mut log, true, MIN);
+    for entry in std::fs::read_dir(fx.dir()).unwrap() {
+        let p = entry.unwrap().path();
+        std::fs::set_permissions(&p, Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!(
+        cut.expect("a compaction reading the log through its own descriptor"),
+        MIN
+    );
+    drop(log);
+    let mut log = fx.open().unwrap();
+    assert_eq!(snap(&mut log), after);
+    assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+}
+
 /// THE COPY IS STREAMED: compacting a log many chunks long, no read the copy makes is
 /// larger than one chunk plus one frame (the frames it reads whole for their identities),
 /// while the suffix it copies is many times that.

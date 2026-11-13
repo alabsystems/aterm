@@ -214,7 +214,7 @@ fn the_stuck_line_holds_in_order_and_waits_for_the_upgrades_notice() {
 /// build does not know is passed over.
 #[test]
 fn a_successor_seeds_the_no_progress_rows_by_their_kind() {
-    let hung = EpisodeKey::no_progress(27098, 7);
+    let hung = EpisodeKey::no_progress(27098, 7, 1);
     let intent = fact_intent_reason(hung, FactDoor::Break);
     let skipped = fact_outcome_reason(hung, FactDoor::TurnEnd, Told::Skipped("not-written"));
     let rule = FactKind::NoProgress.rule();
@@ -247,7 +247,7 @@ fn a_successor_seeds_the_no_progress_rows_by_their_kind() {
 /// line and another session's line count for nothing.
 #[test]
 fn a_successor_paces_by_the_lines_typed_at_a_break_alone() {
-    let hung = EpisodeKey::no_progress(27098, 7);
+    let hung = EpisodeKey::no_progress(27098, 7, 1);
     let stuck = FactKind::NoProgress.rule();
     let hold = FactKind::Hold.rule();
     let went = fact_outcome_reason(hung, FactDoor::Break, Told::Typed);
@@ -615,7 +615,7 @@ fn a_left_lines_rows_read_back_whole_and_its_settle_as_its_doors() {
         kind: FactKind::Wake,
         id: 0xcd,
     };
-    let hung = EpisodeKey::no_progress(27098, 7);
+    let hung = EpisodeKey::no_progress(27098, 7, 1);
     let lefts = [
         (
             hold,
@@ -742,7 +742,7 @@ fn a_left_lines_rows_read_back_whole_and_its_settle_as_its_doors() {
 /// either door, and its `door=break` row comes back.
 #[test]
 fn a_leftover_or_overlap_left_line_reads_back_at_the_turn_end_alone() {
-    let hung = EpisodeKey::no_progress(27098, 7);
+    let hung = EpisodeKey::no_progress(27098, 7, 1);
     for kind in FactKind::ALL {
         let key = if kind == FactKind::NoProgress {
             hung

@@ -261,6 +261,68 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     assert!(try_with(&mut app, &SpawnAsk::new(Some("/usr")), grid).is_ok());
 }
 
+/// In each state adoption takes, the aging rule judges a spare at the age the adoption gate refuses
+/// it (G7): a millisecond short of it a tick keeps it and arms its age-out (a Parked one's none),
+/// and at it adoption refuses it with `age`, retires it there and books its successor at the next
+/// tick. A Verifying spare, whose verify reply never came, ages out as a Ready one does.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_spare_refused_for_age_is_retired_in_each_state_adoption_takes() {
+    let wid = WindowId(0);
+    let plain = SpawnAsk::new(None);
+    for (state, max_age, reason) in [
+        (SlotState::Parked, PARKED_MAX_AGE, "age"),
+        (SlotState::Warming, Duration::from_secs(4), "rc_timeout"),
+        (SlotState::Verifying, ready_max_age(), "age"),
+        (SlotState::Ready, ready_max_age(), "age"),
+    ] {
+        let mut app = app_in("/tmp");
+        app.spares.captured = Some(Vec::new());
+        app.session_factory.shell_override = Some("/bin/zsh".to_owned());
+        let grid = app.spawn_grid(wid);
+        let id = app.next_session_id;
+        app.next_session_id += 1;
+        let mut slot = parked_slot(&app, id, Some("/tmp"));
+        assert_eq!(slot.t_ready, Duration::from_secs(4), "Warming's age");
+        slot.state = state;
+        let since = slot.since;
+        app.spares.slot = Some(slot);
+        app.spares.tick_at.set(None);
+        app.spare_age(since + max_age - Duration::from_millis(1), SpareMode::Auto);
+        assert_eq!(
+            app.spares.slot.as_ref().map(|s| s.state),
+            Some(state),
+            "{state:?}: a millisecond short of its age a tick keeps it"
+        );
+        assert_eq!(
+            app.spares.tick_at.get(),
+            (state != SlotState::Parked).then_some(since + max_age),
+            "{state:?}: its own age-out armed, a parked spare's none"
+        );
+
+        app.spares.slot.as_mut().unwrap().since = Instant::now().checked_sub(max_age).unwrap();
+        app.spares.tick_at.set(None);
+        assert_eq!(
+            app.try_adopt_spare(wid, Some(wid), grid, &plain)
+                .map(|_| ()),
+            Err("age"),
+            "{state:?}"
+        );
+        assert!(
+            app.spares.slot.is_none(),
+            "{state:?}: retired where it is refused"
+        );
+        assert_eq!(app.spares.discards, vec![(reason, 1)], "{state:?}");
+        assert!(
+            app.spares
+                .tick_at
+                .get()
+                .is_some_and(|at| at <= Instant::now()),
+            "{state:?}: and its successor booked at the next tick"
+        );
+    }
+}
+
 /// A `Verifying` spare is adoptable through the warm gates while a `Spawned` one is not.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]

@@ -4,16 +4,17 @@
 //! The Access rows of System State (`docs/DESIGN-system-state-2026-10-21.md` §3.3 and §6): what
 //! each grant reads, read without a prompt, and when the Permissions stage of one revision is
 //! complete. Nothing here opens System Settings or raises a dialog: the window's access lanes hand
-//! each step to macOS and record it in [`access_record`], and the stage only reads that record.
+//! each step to macOS and record it in [`access_record`]. The stage reads that record for what was
+//! attempted and each grant afresh for whether it is on: a record never makes a row `ok`.
 //!
 //! A grant the person opted out of (§4: a `[privacy]` switch, a debugger access turned off, or a
 //! Not now in this approval) is honored as the row's wanted state and never asks for a person.
 
-use super::{Row, WAITING};
+use super::{OFFERED, Row, UNREAD, WAITING};
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    ACCESS_OFFERED, Access, AccessOutcome, Observation, Selection, Setting, Standing, Subject,
-    access_record, opt_out,
+    ACCESS_OFFERED, Access, AccessOutcome, DEBUGGER_NOT_ASKED, Observation, Selection, Setting,
+    Standing, Subject, access_record, opt_out,
 };
 use std::sync::Mutex;
 
@@ -104,7 +105,12 @@ pub(super) enum DevTools {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Debugger {
     On,
+    /// Off, and setup's one Mac password, which turns it on, is still coming by itself.
     Off,
+    /// Off, and that password does not turn it on by itself: a person declined its last ask, the
+    /// account's record of it cannot be read, or setup's elevation finished once, so it was turned
+    /// off since ([`turned_on_by_itself`], [`off`]).
+    OffNotAsked,
     /// A build that is not hardened lets a debugger attach without it.
     NotNeeded(&'static str),
     /// The account is neither an admin nor in `_developer`, so macOS lets it turn neither this nor
@@ -200,7 +206,13 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         }
         (_, DebuggerMember::NotMember, _) => Debugger::NeedsAdmin,
         (_, _, DebuggerMode::Enabled) => Debugger::On,
-        (_, _, DebuggerMode::Disabled) => Debugger::Off,
+        (_, _, DebuggerMode::Disabled) => off(aterm_types::clt_mark::path().is_some_and(|path| {
+            turned_on_by_itself(&aterm_types::clt_mark::record(
+                &aterm_types::clt_mark::Live,
+                &path,
+                super::ledger::now_secs(),
+            ))
+        })),
         _ => Debugger::Unknown,
     };
     let accessibility = Access::Accessibility
@@ -237,13 +249,48 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
     grants
 }
 
+/// Whether setup's one Mac password turns developer mode on by itself, as the account's `record`
+/// says: an automatic ask still comes, now or at its next try, and setup's elevation never
+/// finished on this account. Once it finished, developer mode off was turned off since, and the
+/// automatic asks leave it as it reads (`aterm_machines::init_clt`); while a decline holds, or where
+/// the record cannot be read, no ask comes by itself soon.
+pub(super) fn turned_on_by_itself(record: &aterm_types::clt_mark::Record) -> bool {
+    record.asked.coming() && !record.finished
+}
+
+/// Developer mode off, as setup's one Mac password reads (`coming`: it turns it on by itself,
+/// [`turned_on_by_itself`]): a calm wait on it while it comes, else the person's.
+pub(super) const fn off(coming: bool) -> Debugger {
+    if coming {
+        Debugger::Off
+    } else {
+        Debugger::OffNotAsked
+    }
+}
+
 impl Grants {
+    /// Grants a test reads from: nothing granted, developer mode off with its ask coming, nobody
+    /// acquiring grants.
+    #[cfg(test)]
+    pub(super) const fn fixture() -> Self {
+        Self {
+            fda: Fda::NotConfirmed,
+            stable: true,
+            devtools: DevTools::NeedsFullDiskAccess,
+            debugger: Debugger::Off,
+            accessibility: Some(false),
+            no_sign_out_owed: false,
+            opted_out: [None; Access::ALL.len()],
+            acquiring: false,
+        }
+    }
+
     /// Whether `access` reads a definite off. Full Disk Access never does (a refused probe reads
     /// `Not confirmed`).
     pub(super) fn reads_off(&self, access: Access) -> bool {
         match access {
             Access::DeveloperTools => self.devtools == DevTools::Off,
-            Access::Debugger => self.debugger == Debugger::Off,
+            Access::Debugger => matches!(self.debugger, Debugger::Off | Debugger::OffNotAsked),
             Access::Accessibility => self.accessibility == Some(false),
             Access::FullDiskAccess => false,
         }
@@ -271,14 +318,31 @@ fn devtools_listing() -> DevTools {
     }
 }
 
-/// One Access row as `grants` read it. `selection` decides whether the row is
-/// managed: an unmanaged row that differs reads Differs, never Needs you.
-pub(super) fn observation(access: Access, grants: &Grants, selection: Selection) -> Observation {
-    let managed = if access == Access::Accessibility {
+/// Whether `selection` manages `access`'s row: the sign-outs' Accessibility while they are
+/// selected, every other grant while Permissions is.
+fn managed(access: Access, selection: Selection) -> bool {
+    if access == Access::Accessibility {
         access.needed_for(selection)
     } else {
         selection.contains(Setting::Permissions)
-    };
+    }
+}
+
+/// One Access row as `grants` read it. `selection` decides whether the row is
+/// managed: an unmanaged row that differs reads Differs, never Needs you. A grant the person
+/// opted out of reads as they chose ([`honor_opt_out`]).
+pub(super) fn observation(access: Access, grants: &Grants, selection: Selection) -> Observation {
+    let seen = reading(access, grants, selection);
+    match opted(grants, access) {
+        Some(why) if managed(access, selection) => honor_opt_out(seen, why),
+        _ => seen,
+    }
+}
+
+/// [`observation`] before an opt-out is honored: what the grant reads, offered where nobody
+/// asked for it.
+fn reading(access: Access, grants: &Grants, selection: Selection) -> Observation {
+    let managed = managed(access, selection);
     let person = if managed {
         Standing::NeedsYou
     } else {
@@ -350,6 +414,12 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                     None,
                     Some("Turning it on lets debuggers attach without a password."),
                 ),
+                Debugger::OffNotAsked => (
+                    person,
+                    Some("Off"),
+                    managed.then_some(DEBUGGER_NOT_ASKED),
+                    Some("Turning it on lets debuggers attach without a password."),
+                ),
                 Debugger::NotNeeded(why) => (Standing::NotNeeded, None, None, Some(why)),
                 Debugger::NeedsAdmin => (person, Some("Off"), None, admin.as_deref()),
                 Debugger::Unknown => (Standing::Unknown, None, None, None),
@@ -380,20 +450,21 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
     // Nobody asked for macOS's grants: what only a person can give is offered, never waited on.
     // The sign-outs' Accessibility stays their own stage's, which waits for a person by design,
     // and a grant the person opted out of or refused reads as they chose ([`honor_opt_out`]),
-    // never offered again. Developer mode is setup's own elevation's, never a person's press.
-    let (standing, note) = if managed
+    // never offered again. Developer mode is setup's own elevation's while that comes by itself;
+    // once it does not, it is offered as theirs, its note naming their routes, never a Needs you.
+    let offered = managed
         && !grants.acquiring
         && access != Access::Accessibility
         && note != Some(DEBUGGER_BY_ELEVATION)
         && opted(grants, access).is_none()
-        && matches!(standing, Standing::NeedsYou | Standing::Waiting)
-    {
-        (Standing::NotNeeded, Some(ACCESS_OFFERED))
-    } else {
-        (standing, note)
+        && matches!(standing, Standing::NeedsYou | Standing::Waiting);
+    let (standing, note) = match note {
+        _ if !offered => (standing, note),
+        Some(DEBUGGER_NOT_ASKED) => (Standing::NotNeeded, note),
+        _ => (Standing::NotNeeded, Some(ACCESS_OFFERED)),
     };
     let subject = Subject::Access(access);
-    let seen = Observation {
+    Observation {
         subject,
         standing,
         now: now.map(str::to_owned),
@@ -401,10 +472,7 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
         wanted: subject.wanted().to_owned(),
         note: note.map(str::to_owned),
         detail: detail.map(str::to_owned),
-    };
-    match opted(grants, access) {
-        Some(why) if managed => honor_opt_out(seen, why),
-        _ => seen,
+        read: aterm_types::macos_setup::Read::Unstamped,
     }
 }
 
@@ -440,10 +508,18 @@ fn honor_opt_out(seen: Observation, why: &'static str) -> Observation {
     }
 }
 
-/// The Permissions stage's rows for the revision `records` belong to, complete per §6 once every
-/// grant is in place, not needed, waiting on Full Disk Access, unreadable here, or has a step
-/// recorded. Any other row waits for the
-/// window's lane or a person ([`WAITING`]): the pass parks, never retries it.
+/// The Permissions stage's rows for the revision `records` belong to (§6). A row is `ok` only on
+/// this process's reading: a grant that reads in place (an opt-out's definite reading included)
+/// or one this build does not need (an identity that changes with every build, a build that is
+/// not hardened). A grant whose reading is not in place yet waits for nobody is [`OFFERED`], its
+/// detail opening with that reading: one on offer, one only an administrator turns on, developer
+/// mode behind setup's one Mac password while that password comes by itself, developer mode left
+/// to the person once it does not ([`DEBUGGER_NOT_ASKED`]), one the person opted out of while it
+/// reads `Not confirmed`, and one this revision handed to macOS, whose record says what was
+/// attempted and never that the grant is on. One this process cannot read (or reads only with Full Disk
+/// Access), opted out of or not, is [`UNREAD`]. The stage completes on all of these
+/// ([`super::row_ready`]); any other row waits for the window's lane ([`WAITING`]): the pass
+/// parks, never retries it.
 pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -> Vec<Row> {
     let selection = {
         let mut selection = Selection::none();
@@ -457,79 +533,109 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
     ]
     .into_iter()
     .map(|access| {
+        let read = reading(access, grants, selection);
         let seen = observation(access, grants, selection);
         let recorded = records
             .iter()
             .rev()
             .find_map(|(row, outcome)| (*row == access).then_some(*outcome));
-        let (done, detail) = match (seen.standing, recorded) {
+        // What this revision's step did, as attempted: a record is no reading.
+        let step = recorded.map(|outcome| match outcome {
+            AccessOutcome::Handed => "handed to macOS in this revision",
+            AccessOutcome::Declined => "declined in this revision",
+            AccessOutcome::Granted => "answered in this revision",
+        });
+        let reading = seen.now.as_deref().unwrap_or("Not read");
+        let offered = |why: &str| (OFFERED, format!("{reading}; {why}"));
+        let (status, detail) = match seen.standing {
             // An opt-out read as the person's wanted value is in place as they chose.
-            (Standing::InPlace, _) => match opted(grants, access) {
+            Standing::InPlace => match opted(grants, access) {
                 Some(why) if seen.wanted != Subject::Access(access).wanted() => {
-                    (true, format!("as you chose: {why}"))
+                    ("ok", format!("as you chose: {why}"))
                 }
-                _ => (true, "on".to_owned()),
+                _ => ("ok", "on".to_owned()),
             },
-            (Standing::NotNeeded, _) if seen.note.as_deref() == Some(ACCESS_OFFERED) => {
-                (true, ACCESS_OFFERED.to_owned())
+            Standing::NotNeeded if seen.note.as_deref() == Some(ACCESS_OFFERED) => {
+                offered(step.unwrap_or(ACCESS_OFFERED))
             }
-            (Standing::NotNeeded, _) => (
-                true,
+            // Developer mode left to the person, setup's one Mac password not turning it on by
+            // itself (a decline, an unreadable record, or a finish it was turned off since): the
+            // row says so and names their routes, offered while nobody acquires grants and asked
+            // of them while a person does. Either way nothing here takes a step on it, so it is
+            // offered, never ok, and the stage completes on it as on a row only an administrator
+            // moves.
+            Standing::NotNeeded | Standing::NeedsYou
+                if seen.note.as_deref() == Some(DEBUGGER_NOT_ASKED) =>
+            {
+                offered(DEBUGGER_NOT_ASKED)
+            }
+            // An opt-out honored over a reading that is not definite ([`honor_opt_out`]): nothing
+            // asks for it, and nothing read it in place either.
+            Standing::NotNeeded if read.standing != Standing::NotNeeded => {
+                let why = seen.detail.as_deref().unwrap_or(NOT_NOW);
+                match read.now.as_deref() {
+                    Some(now) => (OFFERED, format!("{now}; {why}")),
+                    None => (
+                        UNREAD,
+                        format!("{}; {why}", read.note.as_deref().unwrap_or("Not read")),
+                    ),
+                }
+            }
+            Standing::NotNeeded => (
+                "ok",
                 format!(
                     "not needed: {}",
                     seen.detail.as_deref().unwrap_or("this Mac does not use it")
                 ),
             ),
-            (Standing::Waiting, _) if access == Access::DeveloperTools => {
-                (true, "waits on Full Disk Access".to_owned())
-            }
+            // The list is readable only with Full Disk Access, which nothing here waits on.
+            Standing::Waiting if access == Access::DeveloperTools => (
+                UNREAD,
+                format!(
+                    "{}{}",
+                    seen.note
+                        .as_deref()
+                        .unwrap_or("Readable once Full Disk Access is on"),
+                    step.map(|step| format!("; {step}")).unwrap_or_default()
+                ),
+            ),
             // The elevation's, which nothing here waits on.
-            (Standing::Waiting, _) if seen.note.as_deref() == Some(DEBUGGER_BY_ELEVATION) => {
-                (true, DEBUGGER_BY_ELEVATION.to_owned())
+            Standing::Waiting if seen.note.as_deref() == Some(DEBUGGER_BY_ELEVATION) => {
+                offered(DEBUGGER_BY_ELEVATION)
             }
             // The window takes no step on a grant this Mac does not let aterm read, so waiting
             // on one would park the run for good.
-            (Standing::Unknown, None) => (
-                true,
+            Standing::Unknown => (
+                UNREAD,
                 format!(
-                    "could not be read here, so aterm leaves it: {}",
-                    seen.detail.as_deref().unwrap_or("macOS did not say")
+                    "could not be read here, so aterm leaves it: {}{}",
+                    seen.detail.as_deref().unwrap_or("macOS did not say"),
+                    step.map(|step| format!("; {step}")).unwrap_or_default()
                 ),
             ),
-            // Only an administrator moves these on this account: answered, and the stage
-            // completes on the grants the person can give.
-            (Standing::NeedsYou, _)
+            // Only an administrator moves these on this account: the stage completes on the
+            // grants the person can give.
+            Standing::NeedsYou
                 if grants.debugger == Debugger::NeedsAdmin
                     && matches!(access, Access::DeveloperTools | Access::Debugger) =>
             {
-                (
-                    true,
-                    seen.detail
-                        .as_deref()
-                        .unwrap_or("needs an administrator")
-                        .to_owned(),
-                )
+                offered(seen.detail.as_deref().unwrap_or("needs an administrator"))
             }
-            // Nobody asked for the steps, so none is coming.
-            (_, None) if !grants.acquiring => (true, "macOS asks at the first use".to_owned()),
-            (_, Some(outcome)) => (
-                true,
-                match outcome {
-                    AccessOutcome::Handed => "handed to macOS in this revision",
-                    AccessOutcome::Declined => "declined in this revision",
-                    AccessOutcome::Granted => "granted in this revision",
-                }
-                .to_owned(),
-            ),
-            _ => (
-                false,
-                "waits for System State to hand its step to macOS while it is the visible view"
-                    .to_owned(),
-            ),
+            _ => match step {
+                Some(step) => offered(step),
+                // Nobody asked for the steps, so none is coming.
+                None if !grants.acquiring => offered(ACCESS_OFFERED),
+                None => (
+                    WAITING,
+                    "waits for System State to hand its step to macOS while it is the visible \
+                     view"
+                        .to_owned(),
+                ),
+            },
         };
         Row {
             name: access.name().into(),
-            status: if done { "ok" } else { WAITING }.into(),
+            status: status.into(),
             detail,
             elapsed_ms: None,
         }
@@ -553,420 +659,5 @@ pub(super) fn stage(revision: u64) -> Vec<Row> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn grants() -> Grants {
-        Grants {
-            fda: Fda::NotConfirmed,
-            stable: true,
-            devtools: DevTools::NeedsFullDiskAccess,
-            debugger: Debugger::Off,
-            accessibility: Some(false),
-            no_sign_out_owed: false,
-            opted_out: [None; Access::ALL.len()],
-            acquiring: true,
-        }
-    }
-
-    fn managed() -> Selection {
-        Selection::all()
-    }
-
-    /// With nobody asking, what only a person can give is on offer and the stage completes: the
-    /// run finishes by itself. Developer mode is never on offer: setup's one early Mac password
-    /// turns it on, so its row says so and waits on nothing. Negative control: a person's ask
-    /// parks on the same person's grants.
-    #[test]
-    fn a_grant_nobody_asked_for_is_offered_and_completes_the_stage() {
-        let offered = Grants {
-            acquiring: false,
-            ..grants()
-        };
-        for access in [Access::FullDiskAccess, Access::DeveloperTools] {
-            let seen = observation(access, &offered, managed());
-            assert_eq!(seen.standing, Standing::NotNeeded, "{access:?}");
-            assert_eq!(seen.note.as_deref(), Some(ACCESS_OFFERED), "{access:?}");
-        }
-        let debugger = observation(Access::Debugger, &offered, managed());
-        assert_eq!(debugger.standing, Standing::Waiting);
-        assert_eq!(debugger.note.as_deref(), Some(DEBUGGER_BY_ELEVATION));
-        assert_eq!(
-            observation(Access::Accessibility, &offered, managed()).standing,
-            Standing::NeedsYou,
-            "the sign-outs' own stage still waits for a person"
-        );
-        let rows = stage_rows(&offered, &[]);
-        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
-        let asked = stage_rows(&grants(), &[]);
-        assert!(
-            asked.iter().any(|row| row.status == WAITING),
-            "CONTROL: {asked:?}"
-        );
-    }
-
-    /// A grant the person refused or opted out of reads as they chose with nobody asking, never
-    /// as offered again. Negative control: the same grant with no opt-out is on offer.
-    #[test]
-    fn a_grant_the_person_refused_is_not_offered_again() {
-        let mut refused = Grants {
-            acquiring: false,
-            devtools: DevTools::Off,
-            ..grants()
-        };
-        let slot = Access::ALL
-            .iter()
-            .position(|row| *row == Access::DeveloperTools)
-            .unwrap();
-        refused.opted_out[slot] = Some(NOT_NOW);
-        let seen = observation(Access::DeveloperTools, &refused, managed());
-        assert_ne!(seen.note.as_deref(), Some(ACCESS_OFFERED), "{seen:?}");
-        assert_eq!(seen.detail.as_deref(), Some(NOT_NOW));
-        assert!(matches!(
-            seen.standing,
-            Standing::InPlace | Standing::NotNeeded
-        ));
-        refused.opted_out[slot] = None;
-        assert_eq!(
-            observation(Access::DeveloperTools, &refused, managed())
-                .note
-                .as_deref(),
-            Some(ACCESS_OFFERED),
-            "CONTROL: no opt-out, on offer"
-        );
-    }
-
-    #[test]
-    fn each_grant_reads_in_its_rows_words_and_never_guesses() {
-        let g = grants();
-        let fda = observation(Access::FullDiskAccess, &g, managed());
-        assert_eq!(
-            (fda.standing, fda.now.as_deref()),
-            (Standing::NeedsYou, Some("Not confirmed"))
-        );
-        let tools = observation(Access::DeveloperTools, &g, managed());
-        assert_eq!((tools.standing, tools.now), (Standing::Waiting, None));
-        assert_eq!(
-            tools.note.as_deref(),
-            Some("Readable once Full Disk Access is on")
-        );
-        let debugger = observation(Access::Debugger, &g, managed());
-        assert_eq!(
-            (debugger.standing, debugger.now.as_deref()),
-            (Standing::Waiting, Some("Off"))
-        );
-        assert_eq!(debugger.note.as_deref(), Some(DEBUGGER_BY_ELEVATION));
-        let unmanaged = observation(Access::Debugger, &g, Selection::none());
-        assert_eq!(
-            unmanaged.standing,
-            Standing::Differs,
-            "CONTROL: {unmanaged:?}"
-        );
-        for access in Access::ALL {
-            assert_eq!(observation(access, &g, managed()).wanted, "On");
-        }
-    }
-
-    /// Accessibility is off and the sign-outs are selected, but their plan found no account: the
-    /// page asks for nothing it would not use.
-    #[test]
-    fn accessibility_is_no_need_while_no_account_waits_to_be_signed_out() {
-        let owed = grants();
-        assert_eq!(owed.accessibility, Some(false));
-        assert_ne!(
-            observation(Access::Accessibility, &owed, Selection::all()).standing,
-            Standing::NotNeeded,
-            "CONTROL: an account to sign out keeps the need"
-        );
-        let none_owed = Grants {
-            no_sign_out_owed: true,
-            ..owed
-        };
-        let row = observation(Access::Accessibility, &none_owed, Selection::all());
-        assert_eq!(row.standing, Standing::NotNeeded);
-        assert_eq!(
-            row.detail.as_deref(),
-            Some("No Messages or FaceTime account here to sign out.")
-        );
-    }
-
-    #[test]
-    fn a_row_nobody_manages_differs_and_never_asks_for_a_person() {
-        let g = grants();
-        let mut none = Selection::none();
-        none.set(Setting::Permissions, false);
-        assert_eq!(
-            observation(Access::FullDiskAccess, &g, none).standing,
-            Standing::Differs
-        );
-        let accessibility = observation(Access::Accessibility, &g, none);
-        assert_eq!(accessibility.standing, Standing::NotNeeded);
-        let unstable = Grants { stable: false, ..g };
-        assert_eq!(
-            observation(Access::FullDiskAccess, &unstable, managed()).standing,
-            Standing::NotNeeded
-        );
-        let unhardened = Grants {
-            debugger: Debugger::NotNeeded("not hardened"),
-            ..g
-        };
-        assert_eq!(
-            observation(Access::Debugger, &unhardened, managed()).standing,
-            Standing::NotNeeded
-        );
-    }
-
-    #[test]
-    fn an_unreadable_grant_never_parks_the_run() {
-        let unread = Grants {
-            fda: Fda::Unknown,
-            debugger: Debugger::Unknown,
-            ..grants()
-        };
-        let rows = stage_rows(&unread, &[]);
-        let row = |name: &str| rows.iter().find(|row| row.name == name).unwrap();
-        for name in ["Full Disk Access", "Debugger access"] {
-            assert_eq!(row(name).status, "ok", "{name}: no step can be taken on it");
-            assert!(
-                row(name).detail.starts_with("could not be read here"),
-                "{name}"
-            );
-        }
-    }
-
-    /// An account that is neither an admin nor a developer cannot turn on debugger access or
-    /// aterm's Developer Tools switch: both rows need an administrator, name the one command
-    /// one runs, and count as answered, so the stage completes on the grants the person gives.
-    #[test]
-    fn a_standard_account_completes_the_stage_without_the_admin_only_grants() {
-        let standard = Grants {
-            fda: Fda::On,
-            devtools: DevTools::Off,
-            debugger: Debugger::NeedsAdmin,
-            ..grants()
-        };
-        let rows = stage_rows(&standard, &[]);
-        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
-        for name in ["Developer Tools", "Debugger access"] {
-            let row = rows.iter().find(|row| row.name == name).unwrap();
-            assert!(
-                row.detail.starts_with("Needs an administrator")
-                    && row.detail.contains("dseditgroup -o edit -a ")
-                    && row.detail.contains(" -t user _developer"),
-                "{row:?}"
-            );
-        }
-        for access in [Access::DeveloperTools, Access::Debugger] {
-            let seen = observation(access, &standard, managed());
-            assert_eq!(seen.standing, Standing::NeedsYou, "{access:?}");
-            assert!(seen.detail.unwrap().contains("_developer"));
-        }
-        // An admin's account that has not turned them on still waits for the window's
-        // Developer Tools step; developer mode is the early elevation's, waited on by nothing.
-        let admin = Grants {
-            debugger: Debugger::Off,
-            ..standard
-        };
-        let rows = stage_rows(&admin, &[]);
-        let row = |name: &str| rows.iter().find(|row| row.name == name).unwrap();
-        assert_eq!(row("Developer Tools").status, WAITING);
-        assert_eq!(row("Debugger access").status, "ok");
-        assert_eq!(row("Debugger access").detail, DEBUGGER_BY_ELEVATION);
-    }
-
-    #[test]
-    fn the_stage_completes_on_what_this_revision_handed_and_parks_otherwise() {
-        let g = grants();
-        let rows = stage_rows(&g, &[]);
-        let status = |rows: &[Row], name: &str| {
-            rows.iter()
-                .find(|row| row.name == name)
-                .map(|row| row.status.clone())
-                .unwrap()
-        };
-        assert_eq!(status(&rows, "Full Disk Access"), WAITING);
-        // Setup's one early Mac password turns developer mode on: nothing here waits on it.
-        assert_eq!(status(&rows, "Debugger access"), "ok");
-        // Developer Tools waits on Full Disk Access: complete for this stage.
-        assert_eq!(status(&rows, "Developer Tools"), "ok");
-        assert_eq!(
-            super::super::SetupNext::of(&rows),
-            super::super::SetupNext::Park
-        );
-
-        let handed = [
-            (Access::FullDiskAccess, AccessOutcome::Handed),
-            (Access::Debugger, AccessOutcome::Declined),
-        ];
-        let rows = stage_rows(&g, &handed);
-        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
-        assert_eq!(
-            super::super::SetupNext::of(&rows),
-            super::super::SetupNext::Done
-        );
-    }
-
-    #[test]
-    fn developer_tools_on_a_build_whose_identity_changes_is_not_needed_like_disk_access() {
-        for devtools in [DevTools::Off, DevTools::NotListed] {
-            let unstable = Grants {
-                stable: false,
-                devtools,
-                ..grants()
-            };
-            let tools = observation(Access::DeveloperTools, &unstable, managed());
-            assert_eq!(tools.standing, Standing::NotNeeded, "{devtools:?}");
-            assert!(tools.detail.is_some());
-            let stable = Grants {
-                stable: true,
-                ..unstable
-            };
-            assert_eq!(
-                observation(Access::DeveloperTools, &stable, managed()).standing,
-                Standing::NeedsYou
-            );
-        }
-    }
-
-    #[test]
-    fn an_opt_out_is_the_rows_wanted_state_and_never_a_standing_nag() {
-        let why = "You turned debugger access off in aterm.";
-        let mut opted = grants();
-        opted.opted_out[2] = Some(why); // Debugger
-        opted.opted_out[0] = Some(NOT_NOW); // Full Disk Access
-        // A definite reading is what the person wants: in place, as they chose.
-        let debugger = observation(Access::Debugger, &opted, managed());
-        assert_eq!(
-            (
-                debugger.standing,
-                debugger.now.as_deref(),
-                debugger.wanted.as_str()
-            ),
-            (Standing::InPlace, Some("Off"), "Off")
-        );
-        assert_eq!(debugger.detail.as_deref(), Some(why));
-        // An unconfirmed one is not claimed either way: not needed.
-        let fda = observation(Access::FullDiskAccess, &opted, managed());
-        assert_eq!(fda.standing, Standing::NotNeeded);
-        assert_eq!(fda.detail.as_deref(), Some(NOT_NOW));
-        // A row nobody manages keeps its plain reading.
-        let mut none = Selection::none();
-        none.set(Setting::Permissions, false);
-        assert_eq!(
-            observation(Access::Debugger, &opted, none).standing,
-            Standing::Differs
-        );
-        // The stage counts opted-out rows complete and says so.
-        let rows = stage_rows(&opted, &[]);
-        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
-        let debugger = rows
-            .iter()
-            .find(|row| row.name == "Debugger access")
-            .unwrap();
-        assert_eq!(debugger.detail, format!("as you chose: {why}"));
-    }
-
-    #[test]
-    fn a_not_now_in_this_approvals_record_is_an_opt_out() {
-        let records = [
-            (Access::FullDiskAccess, AccessOutcome::Handed),
-            (Access::DeveloperTools, AccessOutcome::Declined),
-            (Access::Accessibility, AccessOutcome::Declined),
-            // The latest step for a row decides it.
-            (Access::Accessibility, AccessOutcome::Handed),
-        ];
-        let opted = opted_out([None; 4], &records, [false; 4]);
-        assert_eq!(opted[0], None);
-        assert_eq!(opted[1], Some(NOT_NOW));
-        assert_eq!(opted[3], None);
-        // What the window published comes first.
-        let switch = "You turned aterm's privacy steps off.";
-        let mut published = [None; 4];
-        published[1] = Some(OptOut::Always(switch));
-        assert_eq!(opted_out(published, &records, [false; 4])[1], Some(switch));
-    }
-
-    /// The window publishes a debugger opt-out at every launch, before any probe (§4), so it is
-    /// said only of an Off reading; an On or unread debugger keeps its own row.
-    #[test]
-    fn a_turned_off_debugger_is_said_only_of_an_off_reading() {
-        let why = "You turned debugger access off, so aterm leaves it off.";
-        let mut published = [None; 4];
-        published[2] = Some(OptOut::WhileOff(why));
-        for (debugger, standing, now, stage) in [
-            (
-                Debugger::Off,
-                Standing::InPlace,
-                Some("Off"),
-                format!("as you chose: {why}"),
-            ),
-            (Debugger::On, Standing::InPlace, Some("On"), "on".to_owned()),
-            (
-                Debugger::Unknown,
-                Standing::Unknown,
-                None,
-                "could not be read here, so aterm leaves it: macOS did not say".to_owned(),
-            ),
-        ] {
-            let mut g = Grants {
-                debugger,
-                ..grants()
-            };
-            g.opted_out = opted_out(published, &[], Access::ALL.map(|a| g.reads_off(a)));
-            let row = observation(Access::Debugger, &g, managed());
-            assert_eq!(
-                (row.standing, row.now.as_deref()),
-                (standing, now),
-                "{debugger:?}"
-            );
-            assert_eq!(
-                row.detail.as_deref() == Some(why),
-                debugger == Debugger::Off,
-                "{debugger:?}: {:?}",
-                row.detail
-            );
-            let rows = stage_rows(&g, &[]);
-            let row = rows
-                .iter()
-                .find(|row| row.name == "Debugger access")
-                .unwrap();
-            assert_eq!(
-                (row.status.as_str(), &row.detail),
-                ("ok", &stage),
-                "{debugger:?}"
-            );
-        }
-        // A `[privacy]` switch off is true of any reading.
-        let switch = "You turned aterm's privacy steps off.";
-        let mut g = Grants {
-            debugger: Debugger::Unknown,
-            ..grants()
-        };
-        let mut published = [None; 4];
-        published[2] = Some(OptOut::Always(switch));
-        g.opted_out = opted_out(published, &[], Access::ALL.map(|a| g.reads_off(a)));
-        let row = observation(Access::Debugger, &g, managed());
-        assert_eq!(
-            (row.standing, row.detail.as_deref()),
-            (Standing::NotNeeded, Some(switch))
-        );
-    }
-
-    /// Nothing asks for debugger access on its own, so a declined Debugger record an earlier
-    /// aterm's step wrote is no opt-out: the row reads as setup's elevation leaves it.
-    /// NEGATIVE CONTROL: a declined Full Disk Access record is the person's Not now.
-    #[test]
-    fn a_declined_debugger_record_is_no_opt_out() {
-        let records = [
-            (Access::FullDiskAccess, AccessOutcome::Declined),
-            (Access::Debugger, AccessOutcome::Declined),
-        ];
-        let opted = opted_out([None; 4], &records, [false; 4]);
-        assert_eq!(opted[0], Some(NOT_NOW));
-        assert_eq!(opted[2], None);
-        let mut g = grants();
-        g.opted_out = opted;
-        let row = observation(Access::Debugger, &g, managed());
-        assert_ne!(row.standing, Standing::InPlace);
-    }
-}
+#[path = "access_tests.rs"]
+mod tests;

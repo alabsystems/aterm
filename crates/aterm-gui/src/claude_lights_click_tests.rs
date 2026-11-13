@@ -22,8 +22,11 @@ use super::gesture_tests::{
     snapshot, standing,
 };
 use super::{Chip, Refusal as Said};
-use crate::permission_click::Clicker;
+use crate::autopilot_menu::{MenuKey, MenuOwner, MenuRow};
+use crate::permission_box::{COST, Told, Would};
+use crate::permission_click::{Clicker, Defaults};
 use crate::{App, WindowId};
+use aterm_agent::supervise::policy::claude_settings::{PermissionDefault, Resolved};
 
 /// The conversation another agent in the tab holds ([`FIRST`] left it).
 const SECOND: &str = "0badf00d-2222-3333-4444-555566667777";
@@ -108,6 +111,74 @@ fn light_cells(app: &App, wid: WindowId) -> (Vec<(usize, usize)>, String) {
         .collect();
     let text = cells.iter().map(|&at| cell_at(app, wid, at).ch).collect();
     (cells, text)
+}
+
+/// The settings file a scripted default names.
+const SETTINGS: &str = "/etc/claude-code/managed-settings.json";
+
+/// The settings' default `mode`, as [`SETTINGS`] names it.
+fn named(mode: Mode) -> Resolved {
+    Resolved::Mode {
+        mode,
+        source: SETTINGS.into(),
+    }
+}
+
+/// Script the settings the click reads: their default `mode` named by [`SETTINGS`], or none
+/// named anywhere, and bypass turned off by [`SETTINGS`] where `bypass_off`.
+fn settings(app: &mut App, mode: Option<Mode>, bypass_off: bool) {
+    app.permission_clicks
+        .set_defaults(Defaults::new(move |_| PermissionDefault {
+            mode: mode.map_or(Resolved::Unset, named),
+            bypass_disabled: bypass_off.then(|| SETTINGS.into()),
+        }));
+}
+
+/// Script the settings' default mode the click reads, bypass allowed.
+fn default_mode(app: &mut App, mode: Option<Mode>) {
+    settings(app, mode, false);
+}
+
+/// What the open permission box says ([`Told`]), or `None` where none is open.
+fn box_told(app: &App) -> Option<Told> {
+    app.autopilot_menu
+        .as_ref()
+        .filter(|menu| menu.owner == MenuOwner::Permission)
+        .and_then(|menu| menu.told.as_ref())
+        .map(|(told, _)| told.clone())
+}
+
+/// The open permission box's words, its header and sentences joined by a blank, or `None`
+/// where no box of the permission chip is open.
+fn box_words(app: &App) -> Option<String> {
+    let menu = app
+        .autopilot_menu
+        .as_ref()
+        .filter(|menu| menu.owner == MenuOwner::Permission)?;
+    Some(
+        menu.rows
+            .iter()
+            .filter_map(|row| match row {
+                MenuRow::Header(text) => Some(text.as_str()),
+                // A wrapped sentence's first row carries it whole, as a reader is told it.
+                MenuRow::Note { spoken, .. } if !spoken.is_empty() => Some(spoken.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Whether every cell of the mode light is slanted: a standing click's face.
+fn light_slanted(app: &App, wid: WindowId) -> bool {
+    let (cells, _) = light_cells(app, wid);
+    !cells.is_empty() && cells.iter().all(|&at| cell_at(app, wid, at).italic)
+}
+
+/// One frame with the open card laid on it, which closes a card whose anchor is gone.
+fn lay(app: &mut App, wid: WindowId) {
+    frame(app, wid);
+    app.splice_autopilot_menu(wid);
 }
 
 /// Put the pointer on the mode light.
@@ -230,15 +301,16 @@ fn check_click_transition(
     }
 }
 
-/// THE CLICK CONFORMS TO ITS MODEL, ITS RESTART ITS ONE END, AND IT ONLY TURNS YOLO ON (owner,
-/// 2026-11-09: "it should go to yolo when I click"): a click on the off chip (`○ yolo`, here
-/// `auto`) types nothing and stands an ask for the bypass line (NEGATIVE CONTROLS: the retired
-/// toggle, which typed shift+tab and stood nothing; a click on the off chip that asks the
-/// settings' line); its lane's look that signalled keeps it standing, a click on it then takes
-/// nothing back, and the look that found the restart landed ends it while the pill still reads
-/// `auto` (a home that disables bypass; NEGATIVE CONTROL: an ask kept until the pill moves, which
-/// would restart again). A click on the on chip (`● yolo`) stands nothing, types nothing and says
-/// nothing: the model offers no `Click` there, so yolo is never turned off by a click.
+/// THE CLICK CONFORMS TO ITS MODEL EACH WAY, ITS RESTART ITS ONE END, AND ITS BOX SAYS WHAT IT
+/// DID: a click on the off chip (here `auto`) types nothing and stands an ask for the bypass
+/// line (NEGATIVE CONTROLS: the retired toggle, which typed shift+tab and stood nothing; a click
+/// on the off chip that asks the settings' line), and the chip's box opens on what yolo is and
+/// what the switch costs; its lane's look that signalled keeps it standing, a click on it then
+/// takes nothing back, and the look that found the restart landed ends it while the pill still
+/// reads `auto` (a home that disables bypass; NEGATIVE CONTROL: an ask kept until the pill moves,
+/// which would restart again). A click on the on chip stands an ask for the line with no
+/// permission flag (NEGATIVE CONTROL: the retired one-way click, which asked bypass or stood
+/// nothing), and its box names the mode the settings land it in and the file that says so.
 #[test]
 fn the_permission_click_conforms_to_its_model() {
     let model = aterm_models_gui::claude_permission_click_model();
@@ -249,6 +321,7 @@ fn the_permission_click_conforms_to_its_model() {
     frame(&mut app, wid);
     let mut state = model.init_state();
     let human = human_seq(&app, session);
+    assert!(!light_slanted(&app, wid), "control: upright at rest");
     hover_light(&mut app, wid);
     drive_click_action("Click", || press_at(&mut app, wid, a_minute_ago()));
     assert!(pty(&mut reader, 0).is_empty(), "a click types nothing");
@@ -274,13 +347,17 @@ fn the_permission_click_conforms_to_its_model() {
         Some((false, PermissionTo::Bypass)),
         "auto is not yolo: a click asks bypass"
     );
-    frame(&mut app, wid);
-    assert!(
-        light_cells(&app, wid)
-            .1
-            .contains(crate::autopilot::IN_FLIGHT),
-        "a standing click's face"
+    assert_eq!(
+        box_told(&app),
+        Some(Told::TurningOn),
+        "the click opens the chip's box on what it did"
     );
+    let said = box_words(&app).expect("the box");
+    assert!(said.contains(COST), "a switch says its cost: {said:?}");
+    assert!(!said.contains('\u{2026}'), "nothing cut: {said:?}");
+    frame(&mut app, wid);
+    assert_eq!(light_cells(&app, wid).1, "yolo", "the word keeps its cells");
+    assert!(light_slanted(&app, wid), "a standing click's face");
     script.then(Look::InFlight("signalled".into()));
     drive_click_action("Signal", || app.step_click(&tab));
     check_click_transition(&app, at, "Signal", &mut state, None);
@@ -303,42 +380,437 @@ fn the_permission_click_conforms_to_its_model() {
     let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
+    default_mode(&mut app, Some(Mode::Plan));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let mut state = model.init_state();
     check_click_transition(&app, at, "ToYolo", &mut state, None);
-    assert!(
-        model.successors("Click", &state).is_empty(),
-        "the model offers no click on the on chip"
+    assert_eq!(light_cells(&app, wid).1, "yolo", "yolo on, at rest");
+    hover_light(&mut app, wid);
+    let human = human_seq(&app, session);
+    drive_click_action("Click", || press_at(&mut app, wid, a_minute_ago()));
+    check_click_transition(&app, at, "Click", &mut state, Some(&[("to", 1)][..]));
+    assert_eq!(
+        standing(&app, session).map(|s| (s.from_yolo, s.click.to)),
+        Some((true, PermissionTo::Settings)),
+        "a click on the on chip asks the settings' line"
     );
+    assert!(pty(&mut reader, 0).is_empty(), "and types nothing");
+    assert_eq!(human_seq(&app, session), human, "no person's input");
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Leaving(named(Mode::Plan))),
+        "the box is on the mode the settings land it in"
+    );
+    let said = box_words(&app).expect("the box");
+    assert!(said.contains(SETTINGS), "it names the file: {said:?}");
+    frame(&mut app, wid);
     assert_eq!(
         light_cells(&app, wid).1,
-        "\u{25cf} yolo",
-        "yolo on, at rest"
+        "yolo",
+        "the same word, the same width"
+    );
+    assert!(light_slanted(&app, wid), "standing");
+}
+
+/// WHERE THE DEFAULT IS YOLO A CLICK ON THE ON CHIP CHANGES NOTHING AND SAYS SO: the settings
+/// name bypass as their default, so a restart would land where it left; the model offers no
+/// `Click` there, only `Explain`. The press stands nothing, types nothing and says no refusal;
+/// the chip's box says the default here is yolo and names the settings file (NEGATIVE CONTROL:
+/// an ask stood all the same). With no default named anywhere, the same press stands the ask
+/// and the box says Claude Code picks its own and what that was measured as.
+#[test]
+fn a_click_on_the_on_chip_changes_nothing_where_the_default_is_yolo() {
+    let model = aterm_models_gui::claude_permission_click_model();
+    let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
+    let tab = sid_of(&app, session);
+    let at = (wid, session, tab.as_str());
+    default_mode(&mut app, Some(Mode::Bypass));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let mut state = model.init_state();
+    check_click_transition(&app, at, "ToYolo", &mut state, None);
+    check_click_transition(&app, at, "DefaultYolo", &mut state, None);
+    assert!(
+        model.successors("Click", &state).is_empty(),
+        "the model offers no click where the default is yolo"
     );
     hover_light(&mut app, wid);
     let human = human_seq(&app, session);
-    press_at(&mut app, wid, a_minute_ago());
-    app.click_permission(wid, session, Light::Mode);
-    assert!(
-        standing(&app, session).is_none(),
-        "a click on the on chip stands nothing: it never turns yolo off"
+    drive_click_action("Explain", || press_at(&mut app, wid, a_minute_ago()));
+    check_click_transition(
+        &app,
+        at,
+        "Explain",
+        &mut state,
+        Some(&[("stands", 1), ("lane", 1)][..]),
     );
-    assert!(pty(&mut reader, 0).is_empty(), "and types nothing");
+    assert!(standing(&app, session).is_none(), "nothing stands");
+    assert!(pty(&mut reader, 0).is_empty(), "and nothing is typed");
     assert_eq!(human_seq(&app, session), human, "no person's input");
     assert!(
         app.windows[&wid].claude_lights.sessions[&session]
             .refused
             .is_none(),
-        "and is no refusal: nothing is said"
+        "it is no refusal"
     );
     assert_eq!(
-        project_permission_click(&app, wid, session, &tab, &state),
-        state,
-        "the model's state, unmoved"
+        box_told(&app),
+        Some(Told::DefaultIsYolo(SETTINGS.into())),
+        "the box says why"
     );
+    let said = box_words(&app).expect("the box");
+    for part in [SETTINGS, "permissions.defaultMode"] {
+        assert!(said.contains(part), "{part:?} in {said:?}");
+    }
+    assert!(!said.contains(COST), "no switch, no cost: {said:?}");
     frame(&mut app, wid);
-    assert_eq!(light_cells(&app, wid).1, "\u{25cf} yolo", "still on");
+    assert!(!light_slanted(&app, wid), "still on, at rest");
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    default_mode(&mut app, None);
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, a_minute_ago());
+    assert_eq!(
+        standing(&app, session).map(|s| s.click.to),
+        Some(PermissionTo::Settings),
+        "control: no default named, the click stands"
+    );
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Leaving(Resolved::Unset)),
+        "the box is on Claude Code's own default"
+    );
+}
+
+/// WHERE THE SETTINGS TURN BYPASS OFF A CLICK ON THE OFF CHIP CHANGES NOTHING AND SAYS SO:
+/// Claude Code would not start on the bypass line, so the model offers no `Click` there, only
+/// `Explain`. The press stands nothing, types nothing and says no refusal; the chip's box says
+/// bypass is turned off and names the settings file (NEGATIVE CONTROL: an ask stood for the
+/// bypass line all the same). CONTROL: with bypass allowed, the same press stands the ask.
+#[test]
+fn a_click_on_the_off_chip_changes_nothing_where_bypass_is_turned_off() {
+    let model = aterm_models_gui::claude_permission_click_model();
+    let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
+    let tab = sid_of(&app, session);
+    let at = (wid, session, tab.as_str());
+    settings(&mut app, None, true);
+    draw_claude(&app, session, AUTO);
+    frame(&mut app, wid);
+    let mut state = model.init_state();
+    check_click_transition(&app, at, "BypassBarred", &mut state, None);
+    assert!(
+        model.successors("Click", &state).is_empty(),
+        "the model offers no click onto a line the settings turn off"
+    );
+    hover_light(&mut app, wid);
+    let human = human_seq(&app, session);
+    drive_click_action("Explain", || press_at(&mut app, wid, a_minute_ago()));
+    check_click_transition(
+        &app,
+        at,
+        "Explain",
+        &mut state,
+        Some(&[("stands", 1), ("lane", 1)][..]),
+    );
+    assert!(standing(&app, session).is_none(), "nothing stands");
+    assert!(pty(&mut reader, 0).is_empty(), "and nothing is typed");
+    assert_eq!(human_seq(&app, session), human, "no person's input");
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .refused
+            .is_none(),
+        "it is no refusal"
+    );
+    assert_eq!(
+        box_told(&app),
+        Some(Told::BypassOff(SETTINGS.into())),
+        "the box says why"
+    );
+    let said = box_words(&app).expect("the box");
+    for part in [SETTINGS, "permissions.disableBypassPermissionsMode"] {
+        assert!(said.contains(part), "{part:?} in {said:?}");
+    }
+    assert!(!said.contains(COST), "no switch, no cost: {said:?}");
+    frame(&mut app, wid);
+    assert!(!light_slanted(&app, wid), "still off, at rest");
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    settings(&mut app, None, false);
+    draw_claude(&app, session, AUTO);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, a_minute_ago());
+    assert_eq!(
+        standing(&app, session).map(|s| s.click.to),
+        Some(PermissionTo::Bypass),
+        "CONTROL: bypass allowed, the click stands"
+    );
+}
+
+/// THE BOX FOLLOWS ITS CLICK AND ITS PANE. A refusal ends the click, and the box that announced
+/// its restart closes with it (NEGATIVE CONTROL: while the click only waits, the box stays). A
+/// box opened without a click on a standing restart offers its take-back until the restart is
+/// signalled, says the signal after, and closes when the restart lands. The chip dismisses a box
+/// its click would only open again (the default here is yolo), and a later press opens it
+/// again. A pane narrowed under an open box has its words wrapped again, none cut.
+#[test]
+fn the_box_follows_its_click_and_its_pane() {
+    let first = a_minute_ago();
+    let (mut app, wid, session, _reader, _host, script) = claude_app(120, true);
+    let tab = sid_of(&app, session);
+    draw_claude(&app, session, AUTO);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first);
+    lay(&mut app, wid);
+    app.step_click(&tab);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::TurningOn),
+        "CONTROL: a click that waits keeps its box"
+    );
+    script.then(Look::Refused(Refusal::Claimed));
+    app.step_click(&tab);
+    assert!(standing(&app, session).is_none(), "the refusal ended it");
+    assert_eq!(box_told(&app), None, "and its box, which said a restart");
+
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first + interval() * 3);
+    assert!(standing(&app, session).is_some(), "a click stands again");
+    app.close_autopilot_menu();
+    assert!(app.explain_permission(wid, session));
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Shown(Mode::Auto, Some(Would::TakeBack))),
+        "before the signal a click takes it back"
+    );
+    script.then(Look::InFlight("signalled".into()));
+    app.step_click(&tab);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Shown(Mode::Auto, Some(Would::Signalled))),
+        "after it, the box promises no take-back"
+    );
+    app.close_autopilot_menu();
+    assert!(app.explain_permission(wid, session));
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Shown(Mode::Auto, Some(Would::Signalled))),
+        "nor does one opened after the signal"
+    );
+    script.then(Look::Done);
+    app.step_click(&tab);
+    assert_eq!(box_told(&app), None, "the restart landed: the box is over");
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    default_mode(&mut app, Some(Mode::Bypass));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first);
+    lay(&mut app, wid);
+    assert_eq!(box_told(&app), Some(Told::DefaultIsYolo(SETTINGS.into())));
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first + interval() * 3);
+    assert_eq!(box_told(&app), None, "the chip dismisses its own box");
+    assert!(standing(&app, session).is_none());
+    press_at(&mut app, wid, first + interval() * 6);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::DefaultIsYolo(SETTINGS.into())),
+        "CONTROL: the next press is a click, and opens it again"
+    );
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    draw_claude(&app, session, AUTO);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first);
+    lay(&mut app, wid);
+    let widest = |app: &App| {
+        let menu = app.autopilot_menu.as_ref().expect("the box");
+        menu.rows
+            .iter()
+            .filter_map(|row| match row {
+                MenuRow::Note { text, .. } => Some(crate::tab_menu::display_cells(text)),
+                _ => None,
+            })
+            .max()
+            .expect("its sentences")
+    };
+    // A press on the card is the card's, where the card covers the chip too (a pane too
+    // short to hang it clear of its anchor row): the standing click is not taken back.
+    let chip = light_cells(&app, wid).0[0];
+    {
+        let menu = app.autopilot_menu.as_mut().expect("the box");
+        let rect = menu.rect.expect("laid");
+        menu.rect = Some(crate::tab_menu::MenuRect {
+            row: chip.0 + 1 - rect.h,
+            ..rect
+        });
+        assert!(menu.rect.is_some_and(|r| r.contains(chip.0, chip.1)));
+    }
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first + interval() * 3);
+    assert!(
+        standing(&app, session).is_some() && box_told(&app) == Some(Told::TurningOn),
+        "the press was the card's: nothing taken back, the box open"
+    );
+    lay(&mut app, wid);
+    assert!(
+        !app.autopilot_menu
+            .as_ref()
+            .and_then(|m| m.rect)
+            .expect("laid")
+            .contains(chip.0, chip.1),
+        "CONTROL: hung clear of its chip again"
+    );
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first + interval() * 6);
+    assert!(
+        standing(&app, session).is_none() && box_told(&app).is_none(),
+        "CONTROL: beside the card the press is the chip's, and takes the click back"
+    );
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first + interval() * 9);
+    lay(&mut app, wid);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::TurningOn),
+        "a click stands again"
+    );
+    const NARROW: u16 = 34;
+    let room = crate::autopilot_menu::content_room(usize::from(NARROW));
+    assert!(
+        widest(&app) > room,
+        "precondition: wrapped for the wide pane"
+    );
+    assert!(app.apply_term_resize(wid, 24, NARROW));
+    lay(&mut app, wid);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::TurningOn),
+        "the box stays: its click stands"
+    );
+    assert!(widest(&app) <= room, "wrapped again to the narrow pane");
+    let said = box_words(&app).expect("the box");
+    assert!(
+        said.contains(COST) && !said.contains('\u{2026}'),
+        "every sentence whole: {said:?}"
+    );
+}
+
+/// A SECONDARY PRESS OPENS THE BOX AND CLICKS NOTHING; ESC AND AN OUTSIDE PRESS CLOSE IT: a
+/// right press on the chip opens the box on the mode its pill reads and what a click would do,
+/// stands nothing and types nothing. Escape closes it; so does a press off the card, which is
+/// the card's own and reaches no program. CONTROL: a plain press then stands the click.
+#[test]
+fn a_right_press_on_the_chip_opens_its_box_and_clicks_nothing() {
+    use aterm_window::event::{ElementState, MouseButton};
+    let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
+    default_mode(&mut app, Some(Mode::AcceptEdits));
+    for (pill, told) in [
+        (PLAN, Told::Shown(Mode::Plan, Some(Would::TurnOn))),
+        (
+            BYPASS,
+            Told::Shown(Mode::Bypass, Some(Would::Leave(named(Mode::AcceptEdits)))),
+        ),
+    ] {
+        draw_claude(&app, session, pill);
+        frame(&mut app, wid);
+        hover_light(&mut app, wid);
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_mouse_input_at(wid, state, MouseButton::Right, a_minute_ago());
+        }
+        assert_eq!(box_told(&app), Some(told), "{pill}: the box");
+        let lines = app.fact_menu_controls();
+        assert!(
+            lines[0].contains(" box=permission ") && !lines[0].contains(" fact="),
+            "{pill}: a controller reads it as the permission box: {lines:?}"
+        );
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|l| l.starts_with("fact-menu label ") || l.starts_with("fact-menu rule ")),
+            "{pill}: words alone, no row to choose: {lines:?}"
+        );
+        assert!(standing(&app, session).is_none(), "{pill}: no click made");
+        assert!(pty(&mut reader, 0).is_empty(), "{pill}: nothing typed");
+        lay(&mut app, wid);
+        assert!(box_words(&app).is_some(), "{pill}: it stays over a frame");
+        assert!(app.autopilot_menu_nav(wid, MenuKey::Close), "Escape");
+        assert!(box_words(&app).is_none(), "{pill}: Escape closes it");
+    }
+    hover_light(&mut app, wid);
+    for state in [ElementState::Pressed, ElementState::Released] {
+        app.on_mouse_input_at(wid, state, MouseButton::Right, a_minute_ago());
+    }
+    lay(&mut app, wid);
+    assert!(box_words(&app).is_some());
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|menu| menu.rect)
+        .expect("the box is laid");
+    let beside = if rect.col >= 2 {
+        rect.col - 2
+    } else {
+        rect.col + rect.w + 2
+    };
+    let (x, y) = px_of(&app, wid, (rect.row, beside));
+    app.on_cursor_moved(wid, x, y);
+    press_at(&mut app, wid, a_minute_ago());
+    assert!(box_words(&app).is_none(), "an outside press closes it");
+    assert!(pty(&mut reader, 0).is_empty(), "and reaches no program");
+    assert!(standing(&app, session).is_none());
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, Instant::now());
+    assert!(
+        standing(&app, session).is_some(),
+        "CONTROL: a plain press on the chip stands its click"
+    );
+}
+
+/// THE BOX STAYS WHILE ITS CLICK STANDS, ITS CHIP GONE WITH THE AGENT: between the signal and
+/// the relaunch Claude Code's footer is off the screen, and the box, anchored at a chip no
+/// longer drawn, stays open because its click stands. NEGATIVE CONTROL: once the restart has
+/// landed and nothing stands, the same frame with no chip closes it.
+#[test]
+fn the_box_stays_through_the_relaunch_while_its_click_stands() {
+    let (mut app, wid, session, _reader, _host, script) = claude_app(120, true);
+    let tab = sid_of(&app, session);
+    draw_claude(&app, session, AUTO);
+    frame(&mut app, wid);
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, a_minute_ago());
+    lay(&mut app, wid);
+    assert!(box_words(&app).is_some(), "the click's box");
+    script.then(Look::InFlight("signalled".into()));
+    app.step_click(&tab);
+    feed(&app, session, b"\x1b[2J\x1b[H$ ");
+    {
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_program(PGID, Some("zsh".into()));
+    }
+    lay(&mut app, wid);
+    assert!(
+        light_cells(&app, wid).0.is_empty(),
+        "precondition: the chip is gone with the agent"
+    );
+    assert!(box_words(&app).is_some(), "the box stays: its click stands");
+    script.then(Look::Done);
+    app.step_click(&tab);
+    assert!(standing(&app, session).is_none(), "the restart landed");
+    lay(&mut app, wid);
+    assert!(
+        box_words(&app).is_none(),
+        "control: nothing stands and no chip is drawn, so it closes"
+    );
 }
 
 /// A CLICK ON A STANDING CLICK TAKES IT BACK, AND THE ENDS ARE ITS OWN: a click past the double
@@ -532,11 +1004,12 @@ fn a_tab_with_no_snapshot_is_clicked_on_the_conversation_its_footer_read() {
     }
 }
 
-/// A RUN OF CLICKS ON THE OFF CHIP STANDS ONE CLICK (review F1): the first press stands the ask; the
-/// double click's second press, at the interval's last instant, is the same gesture and takes
-/// nothing back; a slow triple click's third press, at the last instant of the interval after the
-/// second though past the first's, is the same run and does nothing either. A press a millisecond
-/// after the interval of the run's last press is a click of its own: the take-back.
+/// A RUN OF CLICKS ON THE OFF CHIP STANDS ONE CLICK (review F1): the first press stands the ask
+/// and opens the chip's box; the double click's second press, at the interval's last instant, is
+/// the same gesture and takes nothing back, nor closes the box; a slow triple click's third
+/// press, at the last instant of the interval after the second though past the first's, is the
+/// same run and does nothing either. A press a millisecond after the interval of the run's last
+/// press is a click of its own: it closes the box and is the take-back.
 #[test]
 fn a_run_of_clicks_on_the_off_chip_stands_one_click() {
     let model = aterm_models_gui::claude_permission_click_model();
@@ -546,7 +1019,7 @@ fn a_run_of_clicks_on_the_off_chip_stands_one_click() {
     draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
-    assert_eq!(light_cells(&app, wid).1, "\u{25cb} yolo", "off at rest");
+    assert_eq!(light_cells(&app, wid).1, "yolo", "off at rest");
     hover_light(&mut app, wid);
     let first = a_minute_ago();
     drive_click_action("Click", || press_at(&mut app, wid, first));
@@ -565,6 +1038,7 @@ fn a_run_of_clicks_on_the_off_chip_stands_one_click() {
             Some(id),
             "press {n} is the run's: the click stands, not taken back nor stood again"
         );
+        assert!(box_words(&app).is_some(), "press {n} leaves the box open");
         assert_eq!(
             project_permission_click(&app, wid, session, &tab, &state),
             state,
@@ -583,10 +1057,10 @@ fn a_run_of_clicks_on_the_off_chip_stands_one_click() {
         );
     });
     check_click_transition(&app, at, "TakeBack", &mut state, None);
+    assert!(box_words(&app).is_none(), "the take-back closes the box");
     frame(&mut app, wid);
-    assert_eq!(
-        light_cells(&app, wid).1,
-        "\u{25cb} yolo",
+    assert!(
+        !light_slanted(&app, wid),
         "a click of its own takes it back"
     );
     assert!(pty(&mut reader, 0).is_empty());

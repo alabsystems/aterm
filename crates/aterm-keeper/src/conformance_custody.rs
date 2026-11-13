@@ -275,7 +275,9 @@ const ENV_MOVES: &[&str] = &[
     "CloseTabA",
     "CloseTabB",
     "Quit",
+    "QuitKeepingA",
     "KeeperHonoursBye",
+    "LaunchAfterQuit",
     "WindowCrashes",
     "StartSuccessor",
     "Commit",
@@ -357,10 +359,48 @@ fn link_drops_close_tab(model: &Model, rig: &mut Rig, close: &'static str) -> Ve
     vec![(before, "LinkDrops", mid.clone()), (mid, close, after)]
 }
 
+/// A person's or macOS's launch after a quit that kept `a` (Quit & Reopen's reopen, a click on
+/// the Dock): a new window process says HELLO, which the keeper answers with an OFFER of each
+/// master it keeps orphaned, as a relaunch's HELLO is answered ([`tick`]).
+fn launch_after_quit(model: &Model, rig: &mut Rig) -> Vec<Step> {
+    let before = rig.st.clone();
+    let mut st = before.clone();
+    assert!(
+        model.fire("LaunchAfterQuit", &mut st),
+        "LaunchAfterQuit was enabled"
+    );
+    rig.pids.r = rig.next_pid;
+    rig.next_pid += 1;
+    let mut steps = vec![(before, "LaunchAfterQuit", st.clone())];
+    let outs = rig.connect("r", 0, &st);
+    for out in &outs {
+        if let Out::Offer { rdev, .. } = out {
+            let action = if *rdev == A { "OfferA" } else { "OfferB" };
+            let prev = st.clone();
+            assert!(
+                model.fire(action, &mut st),
+                "the real keeper offered where the model forbids it: {prev:?}"
+            );
+            steps.push((prev, action, st.clone()));
+        }
+    }
+    for action in ["OfferA", "OfferB"] {
+        assert!(
+            !model.action_enabled(action, &st),
+            "the model allows {action} the real keeper did not make: {st:?}"
+        );
+    }
+    let after = rig.project(&st);
+    assert_eq!(after, st, "the keeper's state after the launch's HELLO");
+    rig.st = after;
+    steps
+}
+
 fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
     match mv {
         LINK_DROPS_CLOSE_TAB_A => return link_drops_close_tab(model, rig, "CloseTabA"),
         LINK_DROPS_CLOSE_TAB_B => return link_drops_close_tab(model, rig, "CloseTabB"),
+        "LaunchAfterQuit" => return launch_after_quit(model, rig),
         _ => {}
     }
     let action = match mv {
@@ -444,6 +484,12 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
         "Quit" => {
             if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("w").copied()) {
                 core.bye(conn);
+                rig.quit_pending = true;
+            }
+        }
+        "QuitKeepingA" => {
+            if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("w").copied()) {
+                core.bye_keeping(conn, &[A]);
                 rig.quit_pending = true;
             }
         }
@@ -884,6 +930,14 @@ fn the_real_keeper_conforms_to_the_custody_model() {
             "the buggy model accepts every real {site} step: {rejected:?}"
         );
     }
+    assert!(
+        out.steps.iter().any(|(before, action, after)| {
+            *action == "KeeperHonoursBye"
+                && before["keep_a"] == 1
+                && !buggy.successors(action, before).contains(after)
+        }),
+        "the buggy model, whose keeper closes a master the quit kept, accepts every real kept quit"
+    );
 
     let mut per_action: BTreeMap<&str, usize> = BTreeMap::new();
     for (before, action, after) in &out.steps {

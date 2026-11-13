@@ -54,6 +54,8 @@ mod replaced_log;
 mod retention_live;
 mod roster_bye;
 mod sender_attestation;
+#[cfg(all(debug_assertions, target_os = "macos"))]
+mod source_image;
 mod subject_reclaim;
 mod topic_gap;
 mod topic_read_before_watch;

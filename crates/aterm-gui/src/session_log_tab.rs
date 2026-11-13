@@ -5,11 +5,19 @@
 //! each act on a session's tab is a `tab` mark in that session's log, attributed to who acted.
 //!
 //! ```text
-//! mark - tab act=open why=<gesture|act> parent=<sid> window=<n> parked=0|1 by=<actor> src=aterm conf=exact
+//! mark - tab act=open why=<gesture|act> parent=<sid> window=<n> parked=0|1 [why_text=<line>]
+//!     [agent=<program> model=<model> account=<login>] by=<actor> src=aterm conf=exact
 //! mark - tab act=keep parent=<sid> window=<n> parked=0 by=<actor> src=aterm conf=exact
 //! mark - tab act=close why=<act> parent=<sid> window=<n> parked=0|1 out=<exit reason> task=<state>[:<why>]
 //!     wall_s=<s> cpu_s=<s> peak_mb=<MB> tokens=<n> account=<login> by=<actor> src=aterm conf=exact
 //! ```
+//!
+//! An open a request asked for with a `why=` line (a fleet drive's plain shell must give one, the
+//! requests design (2026-11-09) §5) keeps it as `why_text=`, a host-tier text beside the `why=`
+//! word. An open a fleet drive asked for names the drive `by=fleet:<head>:<sid>` and keeps its
+//! requester's program, model and account (`agent=`, `model=`, `account=`, each where the
+//! requester named it) beside it ([`TabAsked`]); where they would take the mark past
+//! [`aterm_slog::MAX_RECORD_BYTES`], the open gives them up, account first, and is kept.
 //!
 //! The open records where the tab took its place ([`TabPlace`]), which the log keeps and a
 //! seamless update carries (`tab v=1`, the carry module), so the close names the same window and
@@ -20,8 +28,39 @@
 //! it found them before its terminal closed ([`SessionLog::note_tree_spent`]). A total aterm could
 //! not read is written `unavailable` ([`aterm_slog::UNAVAILABLE`]), never `0`.
 
+use std::sync::Arc;
+
 use super::SessionLog;
-use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Node, ShortId, Src, Stamp, TabAct};
+use aterm_slog::{
+    Actor, Conf, Fields, Key, Kind, Mark, Node, Refused, ShortId, Src, Stamp, TabAct,
+};
+use aterm_types::control_verbs::Requester;
+
+/// What the act that opens a tab asked: its request's own line (`spawn why=`, kept as
+/// `why_text=`), and for a fleet drive's act the requester on the other Mac.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TabAsked {
+    pub(crate) why_text: Option<Arc<str>>,
+    pub(crate) requester: Option<Arc<Requester>>,
+}
+
+/// `f` with the first `kept` of what `requester` names of itself, in the order an open gives them
+/// up last: `agent=` its program, `model=`, then `account=`.
+fn requester_fields(f: Fields, requester: &Requester, kept: usize) -> Fields {
+    let parts = [
+        (Key::Agent, requester.program()),
+        (Key::Model, requester.model()),
+        (Key::Account, requester.account()),
+    ];
+    parts
+        .into_iter()
+        .take(kept)
+        .fold(f, |f, (key, value)| match value {
+            Some(value) if key == Key::Account => f.clone().text(key, value).unwrap_or(f),
+            Some(value) => f.clone().tok(key, value).unwrap_or(f),
+            None => f,
+        })
+}
 
 /// Where a session's tab took its place, as its `act=open` said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +83,29 @@ pub(crate) struct TreeSpent {
     pub(crate) cpu_ns: Option<u64>,
     /// The largest footprint, bytes, any process alive at the read ever reached.
     pub(crate) peak_bytes: Option<u64>,
+    /// Bytes written to disk by the processes alive at the read.
+    pub(crate) written_bytes: Option<u64>,
+}
+
+impl TreeSpent {
+    /// The figures as a request's `spent` keeps them: whole seconds and whole MiB.
+    pub(crate) const fn as_spent(self) -> aterm_requests::Spent {
+        const MIB: u64 = 1024 * 1024;
+        aterm_requests::Spent {
+            cpu_s: match self.cpu_ns {
+                Some(ns) => Some(ns / 1_000_000_000),
+                None => None,
+            },
+            peak_mb: match self.peak_bytes {
+                Some(bytes) => Some(bytes / MIB),
+                None => None,
+            },
+            written_mb: match self.written_bytes {
+                Some(bytes) => Some(bytes / MIB),
+                None => None,
+            },
+        }
+    }
 }
 
 /// What the log was told a tab spent, for its close's totals (§8).
@@ -144,10 +206,32 @@ impl TabPlace {
 
 impl SessionLog {
     /// `mark - tab act=open`: the session took `place` (its open's wall time the place's), opened
-    /// `why` by `by`.
-    pub(crate) fn open_tab(&mut self, place: TabPlace, why: &'static str, by: Actor, at: Stamp) {
+    /// `why` by `by`, for what its asker `asked`: the request line where it gave one
+    /// (`why_text=`), and a fleet drive's requester's program, model and account. Where those
+    /// would take the mark past [`aterm_slog::MAX_RECORD_BYTES`], the account goes first, then
+    /// the model, then the program: the open is kept without them, never lost.
+    pub(crate) fn open_tab(
+        &mut self,
+        place: TabPlace,
+        why: &'static str,
+        asked: &TabAsked,
+        by: Actor,
+        at: Stamp,
+    ) {
         self.tab = Some(place);
         let f = place.fields(TabAct::Open, Some(why));
+        let f = match asked.why_text.as_deref() {
+            Some(line) => f.clone().text(Key::WhyText, line).unwrap_or(f),
+            None => f,
+        };
+        if let Some(requester) = asked.requester.as_deref() {
+            for kept in (1..=3).rev() {
+                match self.try_tab_mark(requester_fields(f.clone(), requester, kept), by, at) {
+                    Err(Refused::Encode(_)) => {}
+                    _ => return,
+                }
+            }
+        }
         self.tab_mark(f, by, at);
     }
 
@@ -250,6 +334,11 @@ impl SessionLog {
         }
     }
 
+    /// What the tab's process tree was last read to have spent ([`Self::note_tree_spent`]).
+    pub(crate) const fn tree_spent(&self) -> Option<TreeSpent> {
+        self.spend.tree
+    }
+
     /// One read of the tab's process tree, taken as its terminal closes ([`TreeSpent`]).
     pub(crate) const fn note_tree_spent(&mut self, spent: TreeSpent) {
         self.spend.tree = Some(spent);
@@ -296,12 +385,16 @@ impl SessionLog {
     }
 
     fn tab_mark(&mut self, f: Fields, by: Actor, at: Stamp) {
-        let _ = self.log.mark(
+        let _ = self.try_tab_mark(f, by, at);
+    }
+
+    fn try_tab_mark(&mut self, f: Fields, by: Actor, at: Stamp) -> Result<u64, Refused> {
+        self.log.mark(
             Mark::new(Kind::Tab, Src::Aterm, Conf::Exact)
                 .at(Node::SESSION)
                 .by(by)
                 .fields(f),
             at,
-        );
+        )
     }
 }

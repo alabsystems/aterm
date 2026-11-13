@@ -15,9 +15,10 @@
 //! browser profile, which opens a window and so is never used unattended, and
 //! `[harness] hosts`, which renew their own logins and none of this machine's. No route opens a
 //! window on this desk or the system's default browser, and none copies, stores or relays a
-//! login: a route that runs makes a fresh one on this machine. A blocked Claude OAuth page may
-//! instead use the fleet issuer's interactive challenge service, which returns only the exact
-//! loopback callback to this machine's own waiting sign-in.
+//! login: a route that runs makes a fresh one on this machine. A Claude OAuth page that
+//! Cloudflare's bot check holds ends the attempt as a stop on the account's own record
+//! ([`super::accounts::AttemptOutcome::Blocked`]), which holds the row out of the background and
+//! is what a person's own renewal reads; no other Mac is asked to open a browser for it.
 //!
 //! This module holds the ladder's words and its clocks; `accounts_sync` reads the machine and
 //! runs the routes.
@@ -432,7 +433,7 @@ struct VaultRun {
     seen: Option<Vault>,
 }
 
-/// An opaque digest of this home's source and stable applied-vault observations.
+/// An opaque digest of this home's vault source and this Mac's standing with that vault.
 pub(super) type VaultContext = [u8; 32];
 
 /// What the ladder remembers in this process between upkeeps: each failing row's backoff and
@@ -592,7 +593,7 @@ impl Ladder {
         aterm_spec_anchor::spec_unmodeled(
             machine = "VaultRefreshContext",
             action = "ContextA",
-            reason = "Observe a bounded local vault source/revision fingerprint."
+            reason = "Observe a bounded local vault source/membership fingerprint."
         )
     )]
     #[cfg_attr(
@@ -600,7 +601,7 @@ impl Ladder {
         aterm_spec_anchor::spec_unmodeled(
             machine = "VaultRefreshContext",
             action = "ContextB",
-            reason = "Observe a different bounded local vault source/revision fingerprint."
+            reason = "Observe a different bounded local vault source/membership fingerprint."
         )
     )]
     #[cfg_attr(
@@ -1410,57 +1411,5 @@ mod vault_context_tests;
 
 /// The ladder reads a row's mailbox from the lab registry (one-mesh design step A9).
 #[cfg(test)]
-mod registry_tests {
-    use super::super::{
-        accounts::Row,
-        accounts_sync::mailbox_offer,
-        alab_roster,
-        headless_oauth::{discover_mailbox_config_files, registry_tests as fixture},
-    };
-    use super::*;
-
-    /// With no mailbox file or sheet present, the upkeep's offer for a row whose email the
-    /// registry's webmail mailbox receives is that mailbox with the row's password, its login
-    /// masked, and the ladder routes the sign-in through it, all without revealing a value; a
-    /// registry mailbox with no password held is named as such and never tried.
-    /// NEGATIVE CONTROL: with `mailbox_offer` asking `password_for` again instead of
-    /// `holds_for`, the `reveals() == 0` assertion reads 1.
-    #[test]
-    fn the_ladder_routes_a_row_through_its_registry_mailbox_without_a_reveal() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let row = Row {
-            label: "claude-1".to_owned(),
-            email: Some("ai1@example.test".to_owned()),
-            ..Row::default()
-        };
-        let offer = |mail| {
-            alab_roster::with_mail(mail, fixture::secrets(), || {
-                let cfg = discover_mailbox_config_files(Some(home.path()), None, None);
-                (mailbox_offer(false, cfg, &row), alab_roster::reveals())
-            })
-        };
-        let ((mailbox, login), reveals) = offer(vec![fixture::mailbox()]);
-        assert_eq!(mailbox, Mailbox::WebmailOnly);
-        assert_eq!(login.as_deref(), Some("ow…@…"));
-        assert_eq!(reveals, 0, "the upkeep's look reveals nothing");
-        let read = Read {
-            profile: Profile::None,
-            mailbox,
-            mailbox_login: login,
-            vault: None,
-            browser: true,
-            row_browser: false,
-            hosts: 0,
-        };
-        assert_eq!(read.route(), Some(Route::Mailbox));
-        assert!(read.holds_mailbox());
-
-        let mut unheld = fixture::mailbox();
-        unheld.held.clear();
-        let ((mailbox, login), _) = offer(vec![unheld]);
-        assert_eq!(
-            (mailbox, login.as_deref()),
-            (Mailbox::SharedNoPassword, Some("ow…@…"))
-        );
-    }
-}
+#[path = "sign_in_ladder_registry_tests.rs"]
+mod registry_tests;

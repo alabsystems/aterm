@@ -15,7 +15,7 @@ use super::gesture_tests::*;
 use super::{Fact, FactNotice};
 use crate::autopilot_menu::MenuRow;
 use crate::claude_slash::{
-    ECHO, NOTICE_SHOWN, QUIET, REFUSAL_SHOWN, Slash, SlashEnd, SlashRefusal, Stage, key_capitalised,
+    ECHO, NOTICE_SHOWN, QUIET, Slash, SlashEnd, SlashRefusal, Stage, key_capitalised,
 };
 use crate::input::{InputEvent, Source};
 use crate::{App, WindowId};
@@ -165,6 +165,52 @@ fn menu_row(app: &App, key: &str) -> usize {
         .unwrap_or_else(|| panic!("the menu offers {key}"))
 }
 
+/// A slider as a test reads it: its row, its stops' words, the stop its thumb stands on and the
+/// one the keys or the pointer rest on.
+type SliderRead = (usize, Vec<String>, Option<usize>, Option<usize>);
+
+/// The open card's slider.
+fn effort_slider(app: &App) -> Option<SliderRead> {
+    let menu = app.autopilot_menu.as_ref()?;
+    menu.rows.iter().enumerate().find_map(|(i, row)| match row {
+        MenuRow::Stops {
+            stops, at, focus, ..
+        } => Some((
+            i,
+            stops.iter().map(|stop| stop.label.clone()).collect(),
+            *at,
+            *focus,
+        )),
+        _ => None,
+    })
+}
+
+/// Paint the open card where its fact stands on the glass, so its rows take keys and presses.
+fn paint_card(app: &mut App, wid: WindowId) {
+    frame(app, wid);
+    app.splice_autopilot_menu(wid);
+    assert!(
+        app.autopilot_menu
+            .as_ref()
+            .is_some_and(|m| m.rect.is_some()),
+        "the card is painted"
+    );
+}
+
+/// Open `session`'s effort card from the keys, where the effort stands on the glass, painted.
+fn open_effort_card(app: &mut App, wid: WindowId, session: u64) {
+    frame(app, wid);
+    let anchor = app.windows[&wid]
+        .claude_lights
+        .fact_hits
+        .iter()
+        .find(|h| h.fact == Fact::Effort)
+        .map(|h| (h.frame_row, h.cols.0))
+        .expect("the effort on the glass");
+    app.open_fact_menu(wid, session, Fact::Effort, anchor, true);
+    paint_card(app, wid);
+}
+
 fn menu_notes(app: &App) -> Vec<String> {
     app.autopilot_menu
         .as_ref()
@@ -214,8 +260,8 @@ fn a_menu_row_types_the_command_as_the_persons_and_enters_after_the_echo() {
     let (mut app, wid, session, mut reader) = idle();
     frame(&mut app, wid);
     let human = human_seq(&app, session);
-    app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
-    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/effort/type/key-on"));
+    app.open_fact_menu(wid, session, Fact::TopEffort, (0, 0), true);
+    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/top-effort/type/key-on"));
     assert!(app.autopilot_menu.is_none(), "begun, the menu closes");
     assert_eq!(pty(&mut reader, 1), b"/", "the probe alone");
     assert_eq!(human_seq(&app, session), human + 1, "the person's write");
@@ -254,7 +300,7 @@ fn a_menu_row_types_the_command_as_the_persons_and_enters_after_the_echo() {
     );
     assert!(crate::claude_slash::FOOTER_ASKED.with(std::cell::Cell::get) >= asked + 2);
     assert!(pty(&mut reader, 0).is_empty(), "nothing after the answer");
-    app.advance_slash_presses(Instant::now() + NOTICE_SHOWN);
+    app.advance_slash_presses(at + QUIET + NOTICE_SHOWN);
     assert_eq!(ended(&app, session), None);
 }
 
@@ -519,7 +565,7 @@ fn a_gesture_that_reaches_no_program_leaves_the_press_running() {
 
 #[test]
 fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
-    let slash = Slash::TopEffort(true);
+    let slash = Slash::Model(crate::claude_slash::ModelArg::new("fable").expect("an alias"));
     for late in [false, true] {
         let (mut app, wid, session, mut reader) = idle();
         feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
@@ -528,13 +574,13 @@ fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
             .claude_lights
             .fact_hits
             .iter()
-            .find(|h| h.fact == Fact::Effort)
+            .find(|h| h.fact == Fact::Model)
             .map(|h| (h.frame_row, h.cols.0))
-            .expect("the effort on the glass");
-        app.open_fact_menu(wid, session, Fact::Effort, anchor, false);
+            .expect("the model on the glass");
+        app.open_fact_menu(wid, session, Fact::Model, anchor, false);
         frame(&mut app, wid);
         app.splice_autopilot_menu(wid);
-        let i = menu_row(&app, "fact-menu/effort/type/key-on");
+        let i = menu_row(&app, "fact-menu/model/set-model/fable");
         let rect = app
             .autopilot_menu
             .as_ref()
@@ -949,29 +995,23 @@ fn a_press_arms_one_wake_at_a_time() {
         "one wake for the notice's end"
     );
     let (mut app, wid, session, mut reader) = idle();
-    app.press_slash(wid, session, Slash::ModelPicker)
+    app.press_slash(wid, session, Slash::Compact)
         .expect("begun");
     assert_eq!(pty(&mut reader, 1), b"/");
     echo(&app, session, CARET, "/");
     let at = Instant::now();
     app.advance_slash_presses(at);
-    assert_eq!(pty(&mut reader, 5), b"model");
+    assert_eq!(pty(&mut reader, 7), b"compact");
     feed(
         &app,
         session,
-        "\x1b[24;1H\x1b[2K  \u{276F} /model   Set the AI model".as_bytes(),
+        "\x1b[24;1H\x1b[2K  \u{276F} /compact   Compact the conversation".as_bytes(),
     );
-    echo(&app, session, CARET, "/model");
+    echo(&app, session, CARET, "/compact");
     app.advance_slash_presses(at);
     app.advance_slash_presses(at + QUIET);
     assert_eq!(pty(&mut reader, 1), b"\r");
-    draw_measured(
-        &mut app,
-        wid,
-        session,
-        include_str!("../../aterm-phase/src/fixtures/claude-2.1.304-top-model-picker-120col.txt"),
-        |_| {},
-    );
+    echo(&app, session, CARET, "");
     crate::work_counts::take_footer_wakes_armed();
     app.advance_slash_presses(at + QUIET);
     assert_eq!(ended(&app, session), Some(SlashEnd::Done));
@@ -1097,21 +1137,21 @@ fn a_typed_press_waits_through_half_a_frame() {
 }
 
 #[test]
-fn an_entered_picker_press_is_not_done_on_half_a_frame() {
+fn an_entered_press_is_not_done_on_half_a_frame() {
     let (mut app, wid, session, mut reader) = idle();
-    app.press_slash(wid, session, Slash::ModelPicker)
+    app.press_slash(wid, session, Slash::Compact)
         .expect("begun");
     assert_eq!(pty(&mut reader, 1), b"/");
     echo(&app, session, CARET, "/");
     let at = Instant::now();
     app.advance_slash_presses(at);
-    assert_eq!(pty(&mut reader, 5), b"model");
+    assert_eq!(pty(&mut reader, 7), b"compact");
     feed(
         &app,
         session,
-        "\x1b[24;1H\x1b[2K  \u{276F} /model   Set the AI model".as_bytes(),
+        "\x1b[24;1H\x1b[2K  \u{276F} /compact   Compact the conversation".as_bytes(),
     );
-    echo(&app, session, CARET, "/model");
+    echo(&app, session, CARET, "/compact");
     app.advance_slash_presses(at);
     app.advance_slash_presses(at + QUIET);
     assert_eq!(pty(&mut reader, 1), b"\r");
@@ -1123,19 +1163,10 @@ fn an_entered_picker_press_is_not_done_on_half_a_frame() {
     rest_of_frame(&app, session, "");
     app.advance_slash_presses(at + QUIET);
     assert_eq!(
-        stage(&app, session),
-        Some(Stage::Entered),
-        "still awaiting the answer"
+        ended(&app, session),
+        Some(SlashEnd::Done),
+        "the whole frame: the composer let go of the command"
     );
-    draw_measured(
-        &mut app,
-        wid,
-        session,
-        include_str!("../../aterm-phase/src/fixtures/claude-2.1.304-top-model-picker-120col.txt"),
-        |_| {},
-    );
-    app.advance_slash_presses(at + QUIET);
-    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
 }
 
 #[test]
@@ -1206,19 +1237,19 @@ fn one_aterm_input_per_session() {
     assert!(pty(&mut reader, 0).is_empty(), "a click types nothing");
     assert!(standing(&app, session).is_some(), "it stands");
     assert_eq!(
-        app.press_slash(wid, session, Slash::ModelPicker),
+        app.press_slash(wid, session, Slash::Compact),
         Ok(()),
         "a press beside a standing click"
     );
     assert_eq!(pty(&mut reader, 1), b"/");
     assert_eq!(
-        app.press_slash(wid, session, Slash::ModelPicker),
+        app.press_slash(wid, session, Slash::Compact),
         Err(SlashRefusal::InFlight),
         "one press at a time"
     );
 
     let (mut app, wid, session, mut reader) = idle();
-    app.press_slash(wid, session, Slash::ModelPicker)
+    app.press_slash(wid, session, Slash::Compact)
         .expect("begun");
     assert_eq!(pty(&mut reader, 1), b"/");
     clickable(&mut app, session, Look::Waits(Wait::Draft));
@@ -1311,62 +1342,6 @@ fn an_echo_that_differs_gets_no_enter_and_is_left() {
         said(&app, wid, session),
         Some(format!("{other} is in the composer; press Enter to run it"))
     );
-}
-
-#[test]
-fn an_open_picker_ends_the_press_and_aterm_presses_nothing_more() {
-    for pointed in ["/model", "/code-review"] {
-        let (mut app, wid, session, mut reader) = idle();
-        frame(&mut app, wid);
-        app.open_fact_menu(wid, session, Fact::Model, (0, 0), true);
-        app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/model/type/model"));
-        assert_eq!(pty(&mut reader, 1), b"/");
-        echo(&app, session, CARET, "/");
-        let at = Instant::now();
-        app.advance_slash_presses(at);
-        assert_eq!(pty(&mut reader, 5), b"model");
-        feed(
-            &app,
-            session,
-            format!(
-                "\x1b[18;1H\x1b[2K  \u{276F} {pointed}   Set the AI model\
-                 \x1b[19;1H\x1b[2K    /update-config   Configure\
-                 \x1b[20;1H\x1b[2K    /code-review   Review"
-            )
-            .as_bytes(),
-        );
-        echo(&app, session, CARET, "/model");
-        app.advance_slash_presses(at);
-        app.advance_slash_presses(at + QUIET);
-        if pointed != "/model" {
-            assert!(pty(&mut reader, 0).is_empty(), "CONTROL: no Enter");
-            app.advance_slash_presses(at + ECHO);
-            assert!(pty(&mut reader, 0).is_empty());
-            assert_eq!(
-                ended(&app, session),
-                Some(SlashEnd::Stopped(SlashRefusal::LeftTyped))
-            );
-            continue;
-        }
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        draw_measured(
-            &mut app,
-            wid,
-            session,
-            include_str!(
-                "../../aterm-phase/src/fixtures/claude-2.1.304-top-model-picker-120col.txt"
-            ),
-            |_| {},
-        );
-        app.advance_slash_presses(at + QUIET);
-        assert_eq!(ended(&app, session), Some(SlashEnd::Done));
-        assert_eq!(said(&app, wid, session), None, "the picker says itself");
-        for later in [QUIET, ECHO, REFUSAL_SHOWN * 2] {
-            app.advance_slash_presses(at + later);
-            app.on_claude_footer_changed(session);
-        }
-        assert!(pty(&mut reader, 0).is_empty(), "nothing into the picker");
-    }
 }
 
 #[test]
@@ -1606,24 +1581,24 @@ fn the_slash_menu_is_read_on_either_side_of_the_composer() {
 
 #[test]
 fn a_bare_commands_enter_waits_for_the_menu_under_the_composer() {
-    for pointed in ["/model", "/code-review"] {
+    for pointed in ["/compact", "/code-review"] {
         let (mut app, wid, session, mut reader) = idle();
-        app.press_slash(wid, session, Slash::ModelPicker)
+        app.press_slash(wid, session, Slash::Compact)
             .expect("begun");
         assert_eq!(pty(&mut reader, 1), b"/");
         echo(&app, session, CARET, "/");
         let at = Instant::now();
         app.advance_slash_presses(at);
-        assert_eq!(pty(&mut reader, 5), b"model");
+        assert_eq!(pty(&mut reader, 7), b"compact");
         feed(
             &app,
             session,
-            format!("\x1b[24;1H\x1b[2K  \u{276F} {pointed}   Set the AI model").as_bytes(),
+            format!("\x1b[24;1H\x1b[2K  \u{276F} {pointed}   Compact the conversation").as_bytes(),
         );
-        echo(&app, session, CARET, "/model");
+        echo(&app, session, CARET, "/compact");
         app.advance_slash_presses(at);
         app.advance_slash_presses(at + QUIET);
-        if pointed == "/model" {
+        if pointed == "/compact" {
             assert_eq!(pty(&mut reader, 1), b"\r", "its own entry: the Enter");
             continue;
         }
@@ -1752,11 +1727,12 @@ fn claudes_refusal_latches_the_key_row_for_that_model() {
         app.advance_slash_presses(at + QUIET);
         assert_eq!(ended(&app, session), Some(SlashEnd::Stopped(why)));
         assert_eq!(said(&app, wid, session), Some(says.clone()));
-        app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
+        app.open_fact_menu(wid, session, Fact::TopEffort, (0, 0), true);
         assert!(!menu_offers(&app, "/type/key-"), "{why:?}: latched");
-        assert!(menu_offers(&app, "/type/effort"), "the slider stays");
-        claude_on(&app, session, "Sonnet 5.5");
         app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
+        assert!(effort_slider(&app).is_some(), "the effort's slider stays");
+        claude_on(&app, session, "Sonnet 5.5");
+        app.open_fact_menu(wid, session, Fact::TopEffort, (0, 0), true);
         assert!(menu_offers(&app, "/type/key-on"), "{why:?}: a new model");
     }
 }
@@ -1766,7 +1742,7 @@ fn a_refused_menu_row_keeps_its_menu_under_a_note() {
     let (mut app, wid, session, mut reader) = idle();
     echo(&app, session, CARET, "draft");
     app.open_fact_menu(wid, session, Fact::Model, (0, 0), true);
-    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/model/type/model"));
+    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/model/set-model/opus"));
     assert!(pty(&mut reader, 0).is_empty());
     assert!(app.autopilot_menu.is_some(), "the menu stays");
     assert!(
@@ -1775,7 +1751,7 @@ fn a_refused_menu_row_keeps_its_menu_under_a_note() {
             .any(|n| n == "the composer holds a draft; nothing typed")
     );
     let menu = app.autopilot_menu.as_ref().expect("open");
-    let row = &menu.rows[menu_row(&app, "fact-menu/model/type/model")];
+    let row = &menu.rows[menu_row(&app, "fact-menu/model/set-model/opus")];
     assert!(matches!(row, MenuRow::Item { enabled: false, .. }));
     app.open_fact_menu(wid, session, Fact::Model, (0, 0), true);
     assert!(!menu_notes(&app).iter().any(|n| n.contains("nothing typed")));
@@ -1956,7 +1932,7 @@ fn the_slash_press_conforms_to_its_model() {
         drive_slash_action("Done", || app.advance_slash_presses(at + QUIET));
         check_slash_transition(&app, wid, session, "Done", &mut state, None);
         drive_slash_action("Rest", || {
-            app.advance_slash_presses(Instant::now() + NOTICE_SHOWN);
+            app.advance_slash_presses(at + QUIET + NOTICE_SHOWN);
         });
         check_slash_transition(&app, wid, session, "Rest", &mut state, None);
         assert!(pty(&mut reader, 0).is_empty());
@@ -2145,13 +2121,13 @@ fn in_flight(app: &App, session: u64) -> Option<Slash> {
 }
 
 /// From a probe written for `slash`: its echo, the rest, the Enter and Claude's answer, the
-/// composer let go.
+/// composer let go. Returns the instant the press ended at.
 fn typed_through(
     app: &mut App,
     session: u64,
     reader: &mut std::os::unix::net::UnixStream,
     slash: Slash,
-) {
+) -> Instant {
     assert_eq!(in_flight(app, session), Some(slash));
     assert_eq!(pty(reader, 1), b"/", "{slash:?}: the probe");
     echo(app, session, CARET, "/");
@@ -2164,127 +2140,194 @@ fn typed_through(
     assert_eq!(pty(reader, 1), b"\r", "{slash:?}: the Enter");
     answered(app, session, TOP, false);
     app.advance_slash_presses(at + QUIET);
+    at + QUIET
 }
 
+/// `session`'s footer on Claude Code `version`, its own build for a catalog held under it.
+fn claude_build(app: &App, session: u64, model: &str, effort: &str, version: &str) {
+    claude_with(app, session, model, effort);
+    let entry = app.pool.get(session).expect("session");
+    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let facts = timeline.claude_footer().cloned().map(|facts| FooterFacts {
+        version: Some(version.into()),
+        ..facts
+    });
+    timeline.set_claude_footer(PGID, None, facts);
+}
+
+/// A CLICK ON THE MODEL OPENS ITS TWO CHOICES AND TYPES NOTHING; a choice types `/model` with
+/// the build's newest model of the family and nothing after it, and closes the card.
 #[test]
-fn a_model_click_types_opus_then_xhigh_and_a_click_back_types_the_remembered_pick() {
-    use crate::claude_facts::Pick;
+fn a_model_click_opens_its_choices_and_a_choice_types_the_model_alone() {
     use crate::claude_slash::ModelArg;
     use aterm_agent::harness::footer::FactMask;
+    use aterm_agent::harness::switch_top::{Baked, BakedModel};
+    const BUILD: &str = "9.8.701";
+    let model = |id: &str, family: &str, name: &str| BakedModel {
+        id: id.into(),
+        family: family.into(),
+        display_name: name.into(),
+        native_1m: true,
+        efforts: vec!["medium".into(), "high".into()],
+    };
+    crate::claude_facts::hold_catalog(
+        BUILD,
+        Baked {
+            latest_per_family: vec![
+                ("fable".into(), "claude-fable-5-1".into()),
+                ("opus".into(), "claude-opus-5-5".into()),
+            ],
+            models: vec![
+                model("claude-fable-5-1", "fable", "Fable 5.1"),
+                model("claude-opus-5-5", "opus", "Opus 5.5"),
+            ],
+        },
+    );
     let (mut app, wid, session, mut reader) = idle();
-    claude_with(&app, session, "Sonnet 4.5", "high");
+    claude_build(&app, session, "Opus 5.5", "high", BUILD);
     frame(&mut app, wid);
     assert_eq!(
         app.fact_title(session, Fact::Model).1,
-        "click: switch to Opus 5.5 xhigh"
+        "click: choose model"
     );
     app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    assert!(pty(&mut reader, 0).is_empty(), "the click types nothing");
     assert_eq!(
         app.fact_mask(session),
         FactMask::default(),
         "nothing hidden"
     );
-    let model = Slash::Model(ModelArg::new("claude-opus-5-5"));
-    typed_through(&mut app, session, &mut reader, model);
-    let effort = Slash::Effort("xhigh");
+    let menu = app.autopilot_menu.as_ref().expect("the model's card");
+    let choices: Vec<(String, bool)> = menu
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            MenuRow::Item { label, checked, .. } => Some((label.clone(), *checked)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        in_flight(&app, session),
-        Some(effort),
-        "the `/effort` follows once `/model` is answered"
+        choices,
+        [
+            ("Fable 5.1".to_owned(), false),
+            ("Opus 5.5".to_owned(), true)
+        ],
+        "the build's newest of each family, the session's own checked, and no other row"
     );
-    typed_through(&mut app, session, &mut reader, effort);
+    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/model/set-model/fable"));
+    assert!(app.autopilot_menu.is_none(), "begun, the card closes");
+    let fable = Slash::Model(ModelArg::new("claude-fable-5-1").expect("an id"));
+    typed_through(&mut app, session, &mut reader, fable);
     assert_eq!(ended(&app, session), Some(SlashEnd::Done));
-    assert!(pty(&mut reader, 0).is_empty(), "two commands, no more");
-    let sonnet = Pick {
-        model: ModelArg::new("claude-sonnet-4-5"),
-        effort: Some("high"),
-    };
-    let switch = app
-        .model_switch(session)
-        .expect("a Claude Code session switches");
-    assert_eq!(
-        (switch.back, switch.then, switch.half),
-        (Some(sonnet), None, false)
-    );
-    assert_eq!(
-        switch.to,
-        Some(Pick {
-            model: ModelArg::new("claude-opus-5-5"),
-            effort: Some("xhigh"),
-        }),
-        "where the switch went is held while the session is there"
-    );
+    assert_eq!(in_flight(&app, session), None, "no `/effort` follows");
+    assert!(pty(&mut reader, 0).is_empty(), "one command, no more");
 
-    claude_with(&app, session, "Opus 5.5", "xhigh");
+    // A build with no catalog read: the family's alias, under the family's name.
+    let (mut app, wid, session, mut reader) = idle();
+    claude_build(&app, session, "Sonnet 4.5", "high", "9.8.702");
+    frame(&mut app, wid);
+    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    app.choose_autopilot_menu_row(menu_row(&app, "fact-menu/model/set-model/opus"));
+    let opus = Slash::Model(ModelArg::new("opus").expect("an alias"));
+    typed_through(&mut app, session, &mut reader, opus);
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+}
+
+/// A CLICK ON THE EFFORT OPENS ITS SLIDER AND TYPES NOTHING. Left and Right move where the keys
+/// rest, Return picks: the level is typed, the card stays open, and the thumb stands on the
+/// pick at once and then on what the footer reads.
+#[test]
+fn an_effort_pick_types_its_level_and_leaves_the_slider_open() {
+    use crate::autopilot_menu::MenuKey;
+    use aterm_agent::harness::footer::FactMask;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "medium");
     frame(&mut app, wid);
     assert_eq!(
         app.fact_title(session, Fact::Effort).1,
-        "click: back to Sonnet 4.5 high"
+        "click: effort slider"
     );
     app.press_claude_fact(wid, session, Fact::Effort, FactMask::default());
-    typed_through(
-        &mut app,
-        session,
-        &mut reader,
-        Slash::Model(ModelArg::new("claude-sonnet-4-5")),
-    );
-    typed_through(&mut app, session, &mut reader, Slash::Effort("high"));
-    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
-    assert!(pty(&mut reader, 0).is_empty());
+    assert!(pty(&mut reader, 0).is_empty(), "the click types nothing");
+    paint_card(&mut app, wid);
+    let stops = vec!["medium".to_owned(), "high".to_owned(), "xhigh".to_owned()];
+    let (row, shown, at, rest) = effort_slider(&app).expect("the slider");
+    assert_eq!((shown, at, rest), (stops.clone(), Some(0), None));
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Left), "at its low end");
     assert_eq!(
-        app.model_switch(session).and_then(|s| s.back),
-        Some(sonnet),
-        "kept"
+        effort_slider(&app).map(|s| s.3),
+        Some(None),
+        "no stop below"
     );
-    assert_eq!(
-        app.model_switch(session).and_then(|s| s.to),
-        None,
-        "a switch back is at no target of its own"
-    );
-}
-
-#[test]
-fn a_refused_model_click_types_nothing_remembers_nothing_and_says_why() {
-    use aterm_agent::harness::footer::FactMask;
-    let (mut app, wid, session, mut reader) = idle();
-    claude_with(&app, session, "Sonnet 4.5", "high");
-    echo(&app, session, CARET, "draft");
-    frame(&mut app, wid);
-    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
-    assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
-    assert_eq!(in_flight(&app, session), None);
-    assert_eq!(
-        app.model_switch(session),
-        Some(crate::claude_facts::ModelSwitch::default()),
-        "nothing remembered"
-    );
-    assert_eq!(
-        said(&app, wid, session).as_deref(),
-        Some("the composer holds a draft; nothing typed")
-    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
     assert!(
-        menu_notes(&app)
-            .iter()
-            .any(|n| n == "the composer holds a draft; nothing typed"),
-        "the model's menu opens under the note"
+        app.autopilot_menu_nav(wid, MenuKey::Right),
+        "at its high end"
     );
     assert_eq!(
-        app.fact_mask(session),
-        FactMask::default(),
-        "nothing hidden"
+        effort_slider(&app).map(|s| (s.2, s.3)),
+        Some((Some(0), Some(2))),
+        "the keys rest on xhigh; the thumb has not moved"
     );
+    assert_eq!(
+        app.autopilot_menu.as_ref().and_then(|m| m.highlight),
+        Some(row)
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "moving types nothing");
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
+    assert_eq!(
+        effort_slider(&app).map(|s| (s.2, s.3)),
+        Some((Some(2), Some(2))),
+        "the card stays open, the thumb on the pick at once"
+    );
+    typed_through(&mut app, session, &mut reader, Slash::Effort("xhigh"));
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(Some(2)),
+        "still open, the pick standing while the footer reads"
+    );
+    claude_with(&app, session, "Opus 5.5", "xhigh");
+    app.on_claude_footer_changed(session);
+    assert_eq!(effort_slider(&app).map(|s| s.2), Some(Some(2)));
+    assert!(pty(&mut reader, 0).is_empty(), "one command, no more");
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Close), "Escape");
+    assert!(app.autopilot_menu.is_none());
 }
 
+/// A PICK CLAUDE DID NOT TAKE GOES BACK: once the pick has settled the thumb is the footer's,
+/// whatever the press typed.
 #[test]
-fn a_switch_whose_model_is_refused_types_no_effort() {
-    use crate::claude_slash::ModelArg;
-    use aterm_agent::harness::footer::FactMask;
+fn a_pick_the_footer_never_takes_up_gives_the_thumb_back() {
     let (mut app, wid, session, mut reader) = idle();
-    claude_with(&app, session, "Sonnet 4.5", "high");
+    claude_with(&app, session, "Opus 5.5", "medium");
     frame(&mut app, wid);
-    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
-    let model = Slash::Model(ModelArg::new("claude-opus-5-5"));
-    assert_eq!(in_flight(&app, session), Some(model));
+    app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
+    assert_eq!(app.pick_effort(wid, session, "high"), Ok(()));
+    let end = typed_through(&mut app, session, &mut reader, Slash::Effort("high"));
+    let settled = end + crate::claude_facts::EFFORT_SETTLE;
+    assert_eq!(
+        app.effort_stops_at(session, settled - Duration::from_millis(1))
+            .map(|s| s.1),
+        Some(Some(1)),
+        "CONTROL: it stands while it settles"
+    );
+    assert_eq!(
+        app.effort_stops_at(session, settled).map(|s| s.1),
+        Some(Some(0)),
+        "and not once it has"
+    );
+    app.advance_slash_presses(settled);
+    app.on_claude_footer_changed(session);
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(Some(0)),
+        "the footer still says medium"
+    );
+    // A press that stopped short drops its pick at once.
+    assert_eq!(app.pick_effort(wid, session, "xhigh"), Ok(()));
+    assert_eq!(app.effort_stops(session).map(|s| s.1), Some(Some(2)));
     assert_eq!(pty(&mut reader, 1), b"/");
     echo(&app, session, CARET, "/x");
     app.advance_slash_presses(Instant::now());
@@ -2292,14 +2335,441 @@ fn a_switch_whose_model_is_refused_types_no_effort() {
         ended(&app, session),
         Some(SlashEnd::Stopped(SlashRefusal::Changed))
     );
-    assert_eq!(in_flight(&app, session), None, "no `/effort` follows");
-    let switch = app
-        .model_switch(session)
-        .expect("a Claude Code session switches");
-    assert_eq!(switch.then, None);
-    assert!(
-        !switch.half,
-        "a stopped switch is over: the next click remembers what the session then shows"
+    assert_eq!(effort_slider(&app).map(|s| s.2), Some(Some(0)));
+}
+
+/// PICKS MADE WHILE ONE IS TYPED WAIT, AND THE LATEST ALONE IS TYPED when that one ends: a
+/// slider run from medium past high to xhigh types two commands, never three.
+#[test]
+fn a_pick_made_while_another_is_typed_waits_and_the_latest_wins() {
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "low");
+    frame(&mut app, wid);
+    app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
+    let pick = |app: &mut App, level: &'static str| {
+        let key = format!("fact-menu/effort/set-effort/{level}");
+        let menu = app.autopilot_menu.as_mut().expect("the slider's card");
+        let (row, stop) = menu
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, row)| match row {
+                MenuRow::Stops { stops, .. } => stops
+                    .iter()
+                    .position(|stop| stop.act.key() == key)
+                    .map(|j| (i, j)),
+                _ => None,
+            })
+            .expect("the stop");
+        if let MenuRow::Stops { focus, .. } = &mut menu.rows[row] {
+            *focus = Some(stop);
+        }
+        app.choose_autopilot_menu_row(row);
+    };
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(None),
+        "low is no stop"
     );
+    pick(&mut app, "medium");
+    assert_eq!(in_flight(&app, session), Some(Slash::Effort("medium")));
+    pick(&mut app, "high");
+    pick(&mut app, "xhigh");
+    assert_eq!(
+        in_flight(&app, session),
+        Some(Slash::Effort("medium")),
+        "one press at a time"
+    );
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(Some(2)),
+        "the thumb is on the latest pick"
+    );
+    assert!(
+        menu_notes(&app)
+            .iter()
+            .all(|n| !n.contains("already typing"))
+    );
+    typed_through(&mut app, session, &mut reader, Slash::Effort("medium"));
+    typed_through(&mut app, session, &mut reader, Slash::Effort("xhigh"));
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+    assert_eq!(in_flight(&app, session), None);
+    assert!(pty(&mut reader, 0).is_empty(), "high was never typed");
+    assert!(
+        app.autopilot_menu.is_some(),
+        "the card stayed open throughout"
+    );
+    // A pick of the level being typed waits for nothing more.
+    claude_with(&app, session, "Opus 5.5", "xhigh");
+    pick(&mut app, "high");
+    pick(&mut app, "high");
+    typed_through(&mut app, session, &mut reader, Slash::Effort("high"));
+    assert_eq!(in_flight(&app, session), None, "typed once");
     assert!(pty(&mut reader, 0).is_empty());
+}
+
+/// A REFUSED PICK IS SAID IN THE CARD, IN PLACE: nothing is typed, the card stays open with its
+/// slider live and its thumb where the footer has it, and the next pick that begins clears the
+/// note.
+#[test]
+fn a_refused_effort_pick_is_said_in_the_open_card() {
+    use crate::autopilot_menu::MenuKey;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "medium");
+    echo(&app, session, CARET, "draft");
+    open_effort_card(&mut app, wid, session);
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
+    assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+    assert_eq!(in_flight(&app, session), None);
+    assert!(
+        menu_notes(&app)
+            .iter()
+            .any(|n| n == "the composer holds a draft; nothing typed"),
+        "{:?}",
+        menu_notes(&app)
+    );
+    let (row, _, at, rest) = effort_slider(&app).expect("the card stays open");
+    assert_eq!(
+        (at, rest),
+        (Some(0), Some(1)),
+        "the thumb unmoved, the keys' rest kept"
+    );
+    assert_eq!(
+        app.autopilot_menu.as_ref().and_then(|m| m.highlight),
+        Some(row),
+        "the slider is still the selected row"
+    );
+    echo(&app, session, CARET, "");
+    paint_card(&mut app, wid);
+    assert!(
+        app.autopilot_menu_nav(wid, MenuKey::Choose),
+        "again, in place"
+    );
+    assert_eq!(in_flight(&app, session), Some(Slash::Effort("high")));
+    assert!(
+        !menu_notes(&app).iter().any(|n| n.contains("nothing typed")),
+        "the note goes once a pick begins"
+    );
+    assert_eq!(effort_slider(&app).map(|s| s.2), Some(Some(1)));
+    assert_eq!(pty(&mut reader, 1), b"/");
+}
+
+/// A PRESS ON A STOP PICKS THAT STOP: the pointer's column chooses among the stops of one row,
+/// and the card it pressed stays open under it.
+#[test]
+fn a_press_on_a_stop_picks_the_stop_under_the_pointer() {
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "medium");
+    feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
+    frame(&mut app, wid);
+    let anchor = app.windows[&wid]
+        .claude_lights
+        .fact_hits
+        .iter()
+        .find(|h| h.fact == Fact::Effort)
+        .map(|h| (h.frame_row, h.cols.0))
+        .expect("the effort on the glass");
+    app.open_fact_menu(wid, session, Fact::Effort, anchor, false);
+    frame(&mut app, wid);
+    app.splice_autopilot_menu(wid);
+    let (row, _, _, _) = effort_slider(&app).expect("the slider");
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|m| m.rect)
+        .expect("painted");
+    // The last stop's cells are the row's last text cells: inside the border and the pad.
+    let (x, y) = px_of(&app, wid, (rect.row + 1 + row, rect.col + rect.w - 3));
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        effort_slider(&app).map(|s| s.3),
+        Some(Some(2)),
+        "the pointer rests on xhigh"
+    );
+    let at = Instant::now();
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+    assert_eq!(in_flight(&app, session), Some(Slash::Effort("xhigh")));
+    assert_eq!(
+        pty(&mut reader, 1),
+        b"/",
+        "the probe, and no press reported"
+    );
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(Some(2)),
+        "the card stays open, the thumb on the pick"
+    );
+    // The first stop, at the row's first text cells.
+    let (x, y) = px_of(&app, wid, (rect.row + 1 + row, rect.col + 2));
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(effort_slider(&app).map(|s| s.3), Some(Some(0)));
+}
+
+/// THE SLIDER'S REST LEAVES WITH THE POINTER, AND ITS OWN STOP TYPES NOTHING: a pointer that
+/// passed over a stop on its way off the card rests on none, so Right steps from the thumb
+/// (NEGATIVE CONTROL: from the stop the pointer crossed it would land on the thumb's own).
+/// Return with the rest on the thumb's own stop types nothing and leaves the card open;
+/// CONTROL: on another stop it types that level.
+#[test]
+fn the_sliders_rest_leaves_with_the_pointer_and_its_own_stop_types_nothing() {
+    use crate::autopilot_menu::MenuKey;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "high");
+    frame(&mut app, wid);
+    open_effort_card(&mut app, wid, session);
+    let (row, _, at, _) = effort_slider(&app).expect("the slider");
+    assert_eq!(at, Some(1), "precondition: the thumb on high");
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|m| m.rect)
+        .expect("painted");
+    let (x, y) = px_of(&app, wid, (rect.row + 1 + row, rect.col + 2));
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        effort_slider(&app).map(|s| s.3),
+        Some(Some(0)),
+        "CONTROL: the pointer rests on medium"
+    );
+    let off = if rect.row >= 2 {
+        (rect.row - 2, rect.col)
+    } else {
+        (rect.row + rect.h + 1, rect.col)
+    };
+    let (x, y) = px_of(&app, wid, off);
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        effort_slider(&app).map(|s| s.3),
+        Some(None),
+        "the rest left with the pointer"
+    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
+    assert_eq!(
+        effort_slider(&app).map(|s| s.3),
+        Some(Some(2)),
+        "Right steps from the thumb, to xhigh"
+    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Left));
+    assert_eq!(effort_slider(&app).map(|s| s.3), Some(Some(1)));
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
+    assert_eq!(in_flight(&app, session), None, "the level in use");
+    assert!(pty(&mut reader, 0).is_empty(), "types nothing");
+    assert!(app.autopilot_menu.is_some(), "and the card stays open");
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
+    assert_eq!(
+        in_flight(&app, session),
+        Some(Slash::Effort("xhigh")),
+        "CONTROL: another stop is typed"
+    );
+}
+
+/// A CONTROLLER READS THE SLIDER AND ITS STOPS: `controls fact-menu` heads the effort card
+/// with its fact, gives the slider one line naming the stop its thumb is on and each stop one
+/// line with its key, whether the thumb is on it (`current=`) and whether the keys rest on it
+/// (`rested=`); a Right moves the rest alone, and a pick moves the thumb.
+#[test]
+fn a_controller_reads_the_slider_and_its_stops() {
+    use crate::autopilot_menu::MenuKey;
+    let (mut app, wid, session, _reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "high");
+    frame(&mut app, wid);
+    open_effort_card(&mut app, wid, session);
+    let (row, ..) = effort_slider(&app).expect("the slider");
+    let read = |app: &App| {
+        let lines = app.fact_menu_controls();
+        assert!(
+            lines[0].starts_with("fact-menu open=true session=s-")
+                && lines[0].contains(" fact=effort "),
+            "{lines:?}"
+        );
+        let slider: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("fact-menu slider "))
+            .collect();
+        assert_eq!(slider.len(), 1, "{lines:?}");
+        let stops: Vec<(bool, bool)> = ["medium", "high", "xhigh"]
+            .iter()
+            .enumerate()
+            .map(|(j, level)| {
+                let head = format!(
+                    "fact-menu stop index={row} stop={j} \
+                     key=fact-menu/effort/set-effort/{level} enabled=true "
+                );
+                let line = lines
+                    .iter()
+                    .find(|l| l.starts_with(&head))
+                    .unwrap_or_else(|| panic!("{level}: {lines:?}"));
+                assert!(line.ends_with(&format!("text={level:?}")), "{line}");
+                (
+                    line.contains(" current=true "),
+                    line.contains(" rested=true "),
+                )
+            })
+            .collect();
+        (slider[0].clone(), stops)
+    };
+    let (slider, stops) = read(&app);
+    assert!(
+        slider.starts_with(&format!("fact-menu slider index={row} stops=3 at=high ")),
+        "{slider}"
+    );
+    assert_eq!(
+        stops,
+        [(false, false), (true, false), (false, false)],
+        "the thumb on high, no rest"
+    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Right));
+    assert_eq!(
+        read(&app).1,
+        [(false, false), (true, false), (false, true)],
+        "Right rests on xhigh; the thumb has not moved"
+    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
+    let (slider, stops) = read(&app);
+    assert!(slider.contains(" at=xhigh "), "{slider}");
+    assert_eq!(
+        stops,
+        [(false, false), (false, false), (true, true)],
+        "the pick moved the thumb"
+    );
+}
+
+/// A READER'S STEP MOVES THE SLIDER ONE STOP AND PICKS IT: Increment and Decrement on the
+/// published slider type the next level from the thumb and leave the card open; a step off
+/// either end does nothing; an id heard before the rows moved is refused; and with the thumb
+/// on no stop (`low`) a Decrement does nothing while an Increment picks the first stop.
+#[cfg(a11y_tree)]
+#[test]
+fn a_readers_step_moves_the_slider_one_stop_and_picks_it() {
+    use aterm_a11y::model::{Action, ActionRequest, NodeId, Role, TreeId};
+    let slider = |app: &App, wid: WindowId| -> NodeId {
+        let tree = app.grid_a11y_tree(wid, None).expect("a tree");
+        tree.nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::Slider && n.label() == Some("Effort"))
+            .map(|(id, _)| *id)
+            .expect("the slider is published")
+    };
+    let step = |app: &mut App, wid: WindowId, action: Action, node: NodeId| {
+        app.on_accessibility_action(
+            wid,
+            ActionRequest {
+                context: None,
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: node,
+                data: None,
+            },
+        );
+    };
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "high");
+    frame(&mut app, wid);
+    open_effort_card(&mut app, wid, session);
+    let heard = slider(&app, wid);
+    step(&mut app, wid, Action::Increment, heard);
+    assert_eq!(in_flight(&app, session), Some(Slash::Effort("xhigh")));
+    assert_eq!(
+        effort_slider(&app).map(|s| s.2),
+        Some(Some(2)),
+        "the card stays open, the thumb on the pick"
+    );
+    typed_through(&mut app, session, &mut reader, Slash::Effort("xhigh"));
+    claude_with(&app, session, "Opus 5.5", "xhigh");
+    app.on_claude_footer_changed(session);
+    paint_card(&mut app, wid);
+    let now = slider(&app, wid);
+    assert_ne!(heard, now, "the thumb moved: a new id");
+    step(&mut app, wid, Action::Decrement, heard);
+    assert_eq!(
+        in_flight(&app, session),
+        None,
+        "an id heard before: refused"
+    );
+    step(&mut app, wid, Action::Increment, now);
+    assert_eq!(in_flight(&app, session), None, "nothing above xhigh");
+    assert!(pty(&mut reader, 0).is_empty(), "neither typed");
+    step(&mut app, wid, Action::Decrement, now);
+    assert_eq!(
+        in_flight(&app, session),
+        Some(Slash::Effort("high")),
+        "CONTROL: the live id steps down"
+    );
+
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "low");
+    frame(&mut app, wid);
+    open_effort_card(&mut app, wid, session);
+    assert_eq!(effort_slider(&app).map(|s| s.2), Some(None), "low: no stop");
+    let node = slider(&app, wid);
+    step(&mut app, wid, Action::Decrement, node);
+    assert_eq!(in_flight(&app, session), None, "nothing below no stop");
+    assert!(pty(&mut reader, 0).is_empty());
+    step(&mut app, wid, Action::Increment, node);
+    assert_eq!(
+        in_flight(&app, session),
+        Some(Slash::Effort("medium")),
+        "up from no stop is the first"
+    );
+}
+
+/// A READER IS TOLD WHICH MODEL IS IN USE: the model card's two choices are published as radio
+/// items, the session's own checked and said by its name, the other unchecked and said as the
+/// switch it is. CONTROL: a card of actions (the effort's) publishes no checked state.
+#[cfg(a11y_tree)]
+#[test]
+fn a_reader_is_told_which_model_is_in_use() {
+    use aterm_agent::harness::footer::FactMask;
+    use aterm_agent::harness::switch_top::{Baked, BakedModel};
+    const BUILD: &str = "9.8.703";
+    let model = |id: &str, family: &str, name: &str| BakedModel {
+        id: id.into(),
+        family: family.into(),
+        display_name: name.into(),
+        native_1m: true,
+        efforts: vec!["medium".into(), "high".into()],
+    };
+    crate::claude_facts::hold_catalog(
+        BUILD,
+        Baked {
+            latest_per_family: vec![
+                ("fable".into(), "claude-fable-5-1".into()),
+                ("opus".into(), "claude-opus-5-5".into()),
+            ],
+            models: vec![
+                model("claude-fable-5-1", "fable", "Fable 5.1"),
+                model("claude-opus-5-5", "opus", "Opus 5.5"),
+            ],
+        },
+    );
+    let (mut app, wid, session, _reader) = idle();
+    claude_build(&app, session, "Opus 5.5", "high", BUILD);
+    frame(&mut app, wid);
+    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    paint_card(&mut app, wid);
+    let told = |app: &App| -> Vec<(String, Option<bool>)> {
+        app.autopilot_grid_menu(wid)
+            .expect("the card is published")
+            .items
+            .iter()
+            .map(|item| (item.label.clone(), item.checked))
+            .collect()
+    };
+    assert_eq!(
+        told(&app),
+        [
+            ("Switch to Fable 5.1".to_owned(), Some(false)),
+            ("Opus 5.5".to_owned(), Some(true)),
+        ]
+    );
+    assert!(app.close_autopilot_menu());
+    frame(&mut app, wid);
+    open_effort_card(&mut app, wid, session);
+    assert!(
+        told(&app).iter().all(|(_, checked)| checked.is_none()),
+        "control: no action row is a radio"
+    );
 }

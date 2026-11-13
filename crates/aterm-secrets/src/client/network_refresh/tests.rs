@@ -428,3 +428,58 @@ fn an_unanswered_poll_classified_by_the_real_transport_keeps_the_prior_failure_a
     .unwrap();
     assert_eq!(std::fs::read(paths.state_file()).unwrap(), before);
 }
+
+/// A pass that ends as the retained one did, within a minute of it, keeps the retained receipt
+/// and leaves `state.toml` as it is: each subscriber pass (about every 28 s) replaced the file
+/// for its completion time alone (2026-11-11). Another outcome is retained at once, the same
+/// outcome again once a minute has passed, and a completion before the retained one (the clock
+/// set back) at once.
+/// NEGATIVE CONTROL (2026-11-11): with `retain` saving whatever `record` took, the repeated
+/// failure 59.999 s later replaces the file (`the retained failure stands`).
+#[test]
+fn a_repeated_outcome_within_a_minute_keeps_the_retained_receipt_and_the_state_file() {
+    use VaultNetworkRefreshOutcome::{Failed, Succeeded};
+    let (_root, paths, config) = fixture();
+    let attempt = failure(&paths, &config);
+    let observed = || {
+        let refresh = observe_network_refresh(&paths, &config).unwrap().unwrap();
+        (refresh.outcome(), refresh.completed_at_ms())
+    };
+    let file = || fsx::stamp(&paths.state_file()).unwrap();
+
+    let failed = file();
+    retain(
+        &paths,
+        &config,
+        &attempt,
+        Failed,
+        1_000 + PERSIST_AGAIN_MS - 1,
+    );
+    assert_eq!(file(), failed, "the retained failure stands");
+    assert_eq!(observed(), (Failed, 1_000));
+
+    retain(&paths, &config, &attempt, Succeeded, 2_000);
+    assert_eq!(observed(), (Succeeded, 2_000), "another outcome at once");
+    let succeeded = file();
+    assert_ne!(succeeded, failed);
+    retain(
+        &paths,
+        &config,
+        &attempt,
+        Succeeded,
+        2_000 + PERSIST_AGAIN_MS - 1,
+    );
+    assert_eq!(file(), succeeded);
+    assert_eq!(observed(), (Succeeded, 2_000));
+
+    retain(
+        &paths,
+        &config,
+        &attempt,
+        Succeeded,
+        2_000 + PERSIST_AGAIN_MS,
+    );
+    assert_eq!(observed(), (Succeeded, 2_000 + PERSIST_AGAIN_MS));
+    retain(&paths, &config, &attempt, Succeeded, 1_500);
+    assert_eq!(observed(), (Succeeded, 1_500), "a clock set back");
+}

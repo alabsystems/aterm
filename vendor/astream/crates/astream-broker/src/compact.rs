@@ -72,18 +72,20 @@
 //! never the log.
 
 use crate::logid;
+use crate::storage::read_exact_at;
 use crate::store::{
-    create_like, create_like_read_write, flush_file, log_identity, open_regular_sidecar,
-    open_with_options, read_base, read_state_base, remove_file_path, rename_path, state_path,
-    sync_parent_dir, write_base, AtRestRef,
+    create_like, create_like_read_write, flush_file, log_identity, open_regular_sidecar, read_base,
+    read_state_base, remove_file_path, rename_path, state_path, sync_parent_dir, write_base,
+    AtRestRef,
 };
 use astream_wire::frame::decode_frame_header_bytes;
 use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
-use std::fs::{File, OpenOptions, Permissions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{File, Permissions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Mutex};
 
 /// The copy's buffer: the most of the log it holds at once, beside the one frame it reads
 /// whole for an identity.
@@ -838,13 +840,19 @@ fn cut_error() -> io::Error {
     )
 }
 
-/// THE KEPT-SUFFIX COPY: `<log>.kept`, filled from a read descriptor of its own on the
-/// log as it stood when the compaction began, in bounded chunks. It borrows nothing of
-/// the log, so the broker runs [`run`](Self::run) with no lock held.
+/// THE KEPT-SUFFIX COPY: `<log>.kept`, filled in bounded chunks by POSITIONAL reads
+/// through the log's own descriptor, shared (an `Arc`, as the flush handles share it),
+/// never a second open of its path: on Windows the open's whole-file exclusive lock
+/// (`LockFileEx` through that descriptor, `lock_exclusive`) denies reads through any other
+/// handle of the file, this process's included, so a copy read through one would fail every
+/// compaction there. It borrows nothing of the log, so the broker runs [`run`](Self::run)
+/// with no lock held while the writer appends: every append is written by position at the
+/// log's end (`storage::write_all_at`), so a read that moves the file cursor, as Windows'
+/// `seek_read` does, moves nothing an append depends on.
 pub(crate) struct KeptCopy {
-    /// The log's file as it was at the begin (the same inode: it is replaced only by a
+    /// The log's own descriptor at the begin (the same inode: it is replaced only by a
     /// compaction, and this is the one).
-    src: File,
+    src: Arc<File>,
     /// `<log>.kept`.
     dst: File,
     kept: PathBuf,
@@ -867,17 +875,19 @@ pub(crate) struct KeptCopy {
 }
 
 impl KeptCopy {
-    /// Open the log for reading and create `<log>.kept` with `perms`, the log's own (set
-    /// exactly, past the umask, so the kept records are never readable more widely than
-    /// the log they came from).
+    /// Take `src`, the log's own descriptor, for the copy's reads (which [`run`](Self::run)
+    /// and [`extend_to`](Self::extend_to) make; this reads nothing), and create
+    /// `<log>.kept` beside the log at `log` with `perms`, the log's own (set exactly, past
+    /// the umask, so the kept records are never readable more widely than the log they
+    /// came from).
     pub(crate) fn begin(
         log: &Path,
+        src: Arc<File>,
         perms: &Permissions,
         drop_count: u64,
         begin_len: u64,
         seam: Seam,
     ) -> io::Result<KeptCopy> {
-        let src = open_with_options(OpenOptions::new().read(true), log)?;
         let kept = kept_path(log);
         let dst = create_like_read_write(&kept, perms)?;
         let chunk = seam.chunk();
@@ -907,10 +917,9 @@ impl KeptCopy {
         self.flush()
     }
 
-    /// `len` bytes at `pos` into a fresh buffer, through the seam.
+    /// `buf.len()` bytes at `pos` into `buf`, by position, through the seam.
     fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.src.seek(SeekFrom::Start(pos))?;
-        self.src.read_exact(buf)?;
+        read_exact_at(&self.src, buf, pos)?;
         self.seam.read(buf.len());
         Ok(())
     }
@@ -995,7 +1004,6 @@ impl KeptCopy {
             copied,
             ..
         } = self;
-        src.seek(SeekFrom::Start(*copied))?;
         while *copied < end {
             let left = end.saturating_sub(*copied);
             let n = match usize::try_from(left) {
@@ -1008,7 +1016,7 @@ impl KeptCopy {
             if chunk.is_empty() {
                 return Err(cut_error());
             }
-            src.read_exact(chunk)?;
+            read_exact_at(src, chunk, *copied)?;
             seam.read(chunk.len());
             dst.write_all(chunk)?;
             *copied = copied.saturating_add(chunk.len() as u64);

@@ -7,7 +7,7 @@
 //! terminal, so a poll that still does not attempt is held by something else: a hold. Every hold
 //! the lane honours is a [`LaneHold`], and every one states its bound ([`LaneHold::bound`]): it
 //! lifts within a fixed time, at an event this program makes by itself, or, for a person's own
-//! state (a dialog up waiting on them, a draft they typed), only while that state is true. None
+//! state (a tab waiting on them, a draft or choice they made), only while that state is true. None
 //! waits for a window to take an event: a hold that did (the System State offer of 0.146.0,
 //! answered only once a person was at the screen) kept an owner's staged update waiting 3.45 days
 //! for a touch.
@@ -18,6 +18,14 @@
 //! `aterm ctl update status`.
 
 use std::time::{Duration, Instant};
+
+/// The `password-prompt` hold's bound: the askpass relay withdraws every password sheet by its
+/// deadline (`crate::askpass::ASKPASS_DEADLINE`).
+pub(crate) const PASSWORD_PROMPT_BOUND: Duration = Duration::from_secs(300);
+
+#[cfg(any(target_os = "macos", test))]
+const _: () =
+    assert!(PASSWORD_PROMPT_BOUND.as_secs() == crate::askpass::ASKPASS_DEADLINE.as_secs());
 
 /// Defines [`LaneHold`] and its wire tokens from one list, so [`LaneHold::ALL`] and
 /// [`LaneHold::token`] cannot leave a hold out.
@@ -56,6 +64,14 @@ lane_holds! {
     HandoffInFlight => "handoff-in-flight",
     /// A person's Install is held for the candidate's pre-park read, which ends by itself.
     PersonInstall => "person-install",
+    /// This build's own update trial is unconfirmed, or its confirmation has not answered yet.
+    /// The updater answers each ask: it confirms the trial, or settles it after
+    /// `aterm_update::TRIAL_SETTLE_AFTER_REFUSALS` refused proofs spanning
+    /// `aterm_update::TRIAL_SETTLE_REFUSAL_SPAN` of awake time; `crate::BOOT_HEALTH_UNANSWERED_TRIES`
+    /// asks nothing answers open the gate. Its unbounded answers are the updater's
+    /// (`aterm_update::BootHealthVerdict`) and are said in the hold's words: among them a trial
+    /// whose window never draws a frame, and a sentinel the filesystem will not remove.
+    BootHealth => "boot-health",
     /// The stage on disk is not yet the exact armed artifact (a download or reconcile settling).
     StagePending => "stage-pending",
     /// The installed build is being replaced by a verified newer build (`native_activation_supersede`).
@@ -88,16 +104,25 @@ lane_holds! {
     /// (`SystemStateApp::offer_hold`).
     SetupDraft => "setup-draft",
     /// A launch's Mac setup offer is being answered by the page itself: its own answer, a queued
-    /// page action or a Stop is under way, which the page settles by itself at its next ticks.
+    /// page action or a Stop is under way, which the page settles by itself at its next ticks;
+    /// at most [`crate::workstation_setup::SETUP_ANSWER_BACKSTOP`], past which the offer holds
+    /// only for a person's draft in it.
     SetupAnswer => "setup-answer",
-    /// A System State Apply, Restore or queued choice is still pending: the setup worker answers
-    /// it, or the other setup holding this Mac's records finishes.
+    /// A System State Apply nobody chose is still finding its footing; it holds at most
+    /// [`crate::system_state_host::UNPRESSED_APPLY_SETTLE`].
     SystemState => "system-state",
+    /// A setup choice someone made (an Apply of a chosen plan, a Restore, a choice queued behind
+    /// another setup) is not yet durable, so a handoff would drop it: it is that person's or
+    /// client's unsaved work and holds only while the setup worker has not taken it (a Restore:
+    /// finished it).
+    SetupChoice => "setup-choice",
     /// A Command Line Tools install's own tab is still running and cannot travel with the
     /// handoff (its password prompt waiting on the person, or a child the successor could not
     /// recover): it holds only while that tab's program runs.
     DeveloperTools => "developer-tools",
-    /// A sudo password prompt is open, waiting on the person: it holds only while it is open.
+    /// aterm's own sudo password sheet is up: every sheet is withdrawn within
+    /// [`PASSWORD_PROMPT_BOUND`], and one nobody has touched for the askpass relay's untouched
+    /// backstop (`crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP`) is refused at the next attempt.
     PasswordPrompt => "password-prompt",
     /// A new tab is still starting; a spawn is bounded by `aterm_pty::START_HANG`.
     TabStarting => "tab-starting",
@@ -105,7 +130,8 @@ lane_holds! {
     /// (before-grace) attempt reads it, so it never holds past `Land`.
     Activity => "activity",
     /// A handed session's command exited while its pane is still open; its reader sees the
-    /// hang-up and retires it.
+    /// hang-up and retires it, and a session hung up for
+    /// [`crate::app_update_handoff::PANE_EXITED_BACKSTOP`] is booked exited without it.
     PaneExited => "pane-exited",
     /// A live `video` take holds the park; only before `Land`.
     Recording => "recording",
@@ -118,17 +144,19 @@ lane_holds! {
 }
 
 /// A person's own state that is true now, the only thing that may hold the lane on a person
-/// ([`HoldBound::PersonNow`]): a dialog up waiting on them, or a draft they typed and have not
-/// applied. Each is one [`LaneHold`] ([`Self::hold`]), and holds only while it is.
+/// ([`HoldBound::PersonNow`]): a Command Line Tools tab waiting on them, a draft they typed and
+/// have not applied, or a choice not yet saved. Each is one [`LaneHold`] ([`Self::hold`]), and
+/// holds only while it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PersonHold {
-    /// A sudo password prompt is open, waiting on them.
-    PasswordPrompt,
     /// A Command Line Tools install's tab that cannot travel with the handoff, its password
     /// prompt waiting on them.
     DeveloperTools,
     /// Their draft in the launch's setup offer.
     SetupDraft,
+    /// A setup choice they (or a client) made that the setup worker has not taken yet, or a
+    /// Restore they started that it has not finished.
+    SetupChoice,
 }
 
 impl PersonHold {
@@ -137,9 +165,9 @@ impl PersonHold {
     #[must_use]
     pub(crate) const fn hold(self) -> LaneHold {
         match self {
-            Self::PasswordPrompt => LaneHold::PasswordPrompt,
             Self::DeveloperTools => LaneHold::DeveloperTools,
             Self::SetupDraft => LaneHold::SetupDraft,
+            Self::SetupChoice => LaneHold::SetupChoice,
         }
     }
 
@@ -147,9 +175,11 @@ impl PersonHold {
     #[must_use]
     pub(crate) const fn words(self) -> &'static str {
         match self {
-            Self::PasswordPrompt => " (a person's own prompt: it holds only while it is open)",
             Self::DeveloperTools => " (a person's own install tab: it holds only while it runs)",
             Self::SetupDraft => " (a person's own draft: it holds only while it is there)",
+            Self::SetupChoice => {
+                " (a choice someone made and not yet saved: it holds only while it is unsaved)"
+            }
         }
     }
 }
@@ -175,6 +205,9 @@ impl LaneHold {
             Self::UpdaterBusy => "the updater's running check or download ends",
             Self::HandoffInFlight => "the handoff in flight commits or stands down",
             Self::PersonInstall => "the candidate's pre-park read ends",
+            Self::BootHealth => {
+                "this build's boot-health confirmation lands, or its bound settles the trial"
+            }
             Self::StagePending => "the staged download settles as the armed artifact",
             Self::ActivationSupersede => "the verified newer build replaces the installed one",
             Self::ConsentWarmup => "the folder-access warm-up ends",
@@ -188,15 +221,18 @@ impl LaneHold {
             Self::SetupAnswer => {
                 "the setup page settles its own answer, its queued action or its Stop"
             }
-            Self::SystemState => {
-                "the setup worker answers the pending Apply or Restore, or the other setup \
-                 holding this Mac's records finishes"
+            Self::SystemState => "the Apply nobody chose is taken by the setup worker",
+            Self::SetupChoice => {
+                "the setup worker takes the chosen Apply or queued choice or finishes the \
+                 Restore, or it is stopped"
             }
             Self::DeveloperTools => "the Command Line Tools install's tab ends",
-            Self::PasswordPrompt => "the sudo password prompt is answered or closed",
+            Self::PasswordPrompt => {
+                "the sudo password prompt is answered, closed or withdrawn, or refused untouched"
+            }
             Self::TabStarting => "the new tab has started",
             Self::Activity => "a quiet epoch passes",
-            Self::PaneExited => "the exited pane's reader retires it",
+            Self::PaneExited => "the exited pane's reader retires it, or aterm books it exited",
             Self::Recording => "the video take ends or the ladder reaches land",
             Self::PolicyRead => "the target build's handoff policy is read",
             Self::ActivityRevoked => "a retry reaches its Commit with no activity in between",
@@ -220,21 +256,25 @@ impl LaneHold {
             Self::Activity | Self::Recording => {
                 HoldBound::Within(crate::native_update_auto_intent::LANDS_WITHIN)
             }
-            Self::PasswordPrompt => HoldBound::PersonNow(PersonHold::PasswordPrompt),
+            Self::PasswordPrompt => HoldBound::Within(PASSWORD_PROMPT_BOUND),
             Self::DeveloperTools => HoldBound::PersonNow(PersonHold::DeveloperTools),
             Self::SetupDraft => HoldBound::PersonNow(PersonHold::SetupDraft),
+            Self::SetupChoice => HoldBound::PersonNow(PersonHold::SetupChoice),
+            Self::SetupAnswer => HoldBound::Within(crate::workstation_setup::SETUP_ANSWER_BACKSTOP),
+            Self::SystemState => {
+                HoldBound::Within(crate::system_state_host::UNPRESSED_APPLY_SETTLE)
+            }
+            Self::PaneExited => HoldBound::Within(crate::app_update_handoff::PANE_EXITED_BACKSTOP),
             Self::UpdaterBusy
             | Self::PersonInstall
+            | Self::BootHealth
             | Self::StagePending
             | Self::ActivationSupersede
             | Self::RosterConfirmation
             | Self::PreparkRead
             | Self::LaunchRecordRenewal
             | Self::BoundaryItem
-            | Self::SetupAnswer
-            | Self::SystemState
             | Self::TabStarting
-            | Self::PaneExited
             | Self::PolicyRead
             | Self::ActivityRevoked => HoldBound::Program,
         }
@@ -263,6 +303,79 @@ impl LaneHold {
             Self::RestoredAgents | Self::RosterConfirmation | Self::ActivityRevoked
         )
     }
+}
+
+/// How long one condition has stood at every automatic attempt in a row: the clock a hold's own
+/// backstop reads. It is fed the condition's raw state, never what a backstop made of it, so the
+/// bound it reaches stays reached while the condition does. Two looks further apart than
+/// [`Self::SAMPLE_GAP`] are two episodes, so a clock left standing while nothing attempted never
+/// counts the time between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HoldClock {
+    since: Option<Instant>,
+    seen: Option<Instant>,
+}
+
+impl HoldClock {
+    /// The longest gap between two looks of one episode: well past the lane's slowest re-probe
+    /// (`PREFLIGHT_BLOCK_COOLDOWN`, 60 s).
+    pub(crate) const SAMPLE_GAP: Duration = Duration::from_secs(5 * 60);
+
+    /// One attempt's look: the condition `holds` now, or not.
+    pub(crate) fn observe(&mut self, holds: bool, now: Instant) {
+        if !holds {
+            *self = Self::default();
+            return;
+        }
+        let continuous = self
+            .seen
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= Self::SAMPLE_GAP);
+        self.since = Some(match self.since {
+            Some(since) if continuous => since,
+            _ => now,
+        });
+        self.seen = Some(now);
+    }
+
+    /// Whether the condition has stood for `bound` by `now`. A clock whose last look is more than
+    /// [`Self::SAMPLE_GAP`] before `now` says nothing: the condition it saw may have cleared and
+    /// come back unseen, so a reader between attempts never takes an old episode for a new one.
+    #[must_use]
+    pub(crate) fn overdue(&self, bound: Duration, now: Instant) -> bool {
+        let looked = self
+            .seen
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= Self::SAMPLE_GAP);
+        looked
+            && self
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) >= bound)
+    }
+
+    /// A clock that has seen its condition since `ago` before now, at every attempt.
+    #[cfg(all(test, unix))]
+    pub(crate) fn backdated_for_test(ago: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            since: now.checked_sub(ago),
+            seen: Some(now),
+        }
+    }
+}
+
+const _: () = assert!(HoldClock::SAMPLE_GAP.as_secs() >= 4 * 60);
+
+/// The clocks of the holds whose backstop the lane keeps itself (`App::tick_lane_hold_clocks`).
+#[derive(Debug, Default)]
+pub(crate) struct LaneHoldClocks {
+    /// aterm's own document work in the close preflight's way (`App::own_document_work_overdue`).
+    pub(crate) own_documents: HoldClock,
+    /// The setup page's own answer to a launch's offer ([`LaneHold::SetupAnswer`]).
+    #[cfg(unix)]
+    pub(crate) setup_answer: HoldClock,
+    /// Each handed session whose master has hung up, from the first attempt that saw it so
+    /// ([`LaneHold::PaneExited`]); a hang-up does not un-hang, so it needs no episode.
+    #[cfg(unix)]
+    pub(crate) hung_up: std::collections::BTreeMap<u64, Instant>,
 }
 
 /// A hold as the lane named it: which, and since when.
@@ -368,90 +481,5 @@ pub(crate) fn released_line(build: u64, hold: LaneHold, lasted: Duration) -> Str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every hold has a token of its own and a bound none of which is a person's event; a hold
-    /// that holds on a person is that person's own state now, by its own [`PersonHold`].
-    #[test]
-    fn every_hold_is_bounded_by_time_the_program_or_a_persons_state_now() {
-        let mut tokens = std::collections::BTreeSet::new();
-        for &hold in LaneHold::ALL {
-            assert!(tokens.insert(hold.token()), "{hold:?}: a token of its own");
-            assert!(!hold.lifts().is_empty(), "{hold:?}");
-            match hold.bound() {
-                HoldBound::Within(bound) => assert!(
-                    bound > Duration::ZERO && bound <= Duration::from_secs(60 * 60),
-                    "{hold:?}: {bound:?}"
-                ),
-                HoldBound::Program => {}
-                HoldBound::PersonNow(person) => assert_eq!(
-                    person.hold(),
-                    hold,
-                    "{hold:?} holds on a person's state that is not its own"
-                ),
-            }
-        }
-    }
-
-    /// A hold is said once when it begins, never per poll, again when it changes, and its end
-    /// once; each line carries the build, the hold's token, its start, what lifts it and its bound.
-    #[test]
-    fn a_hold_is_said_once_per_change_and_once_when_it_ends() {
-        let start = Instant::now();
-        let at = |s: u64| start + Duration::from_secs(s);
-        let since_unix = 1_793_338_376;
-        let mut named = NamedHold::default();
-        let line = named
-            .hold(7, LaneHold::SetupDraft, "a draft", at(0), since_unix)
-            .expect("a new hold is said");
-        for part in [
-            "build 7",
-            "a draft",
-            "(setup-draft)",
-            &aterm_types::rfc3339::format_rfc3339(since_unix),
-            LaneHold::SetupDraft.lifts(),
-            &LaneHold::SetupDraft.bound_words(),
-        ] {
-            assert!(line.contains(part), "{line:?} says {part:?}");
-        }
-        for s in 1..=600 {
-            assert_eq!(
-                named.hold(7, LaneHold::SetupDraft, "other words", at(s), 1),
-                None,
-                "poll {s}: the same hold is not said again"
-            );
-        }
-        assert_eq!(named.current().map(|held| held.since), Some(at(0)));
-        assert!(
-            named
-                .hold(7, LaneHold::SystemState, "an Apply", at(601), 2)
-                .is_some_and(|line| line.contains("(system-state)")),
-            "a change of hold is said"
-        );
-        let end = named.release(7, at(700)).expect("the end is said");
-        assert_eq!(
-            end,
-            released_line(7, LaneHold::SystemState, Duration::from_secs(99))
-        );
-        assert_eq!(named.release(7, at(701)), None, "an end is said once");
-        assert!(named.current().is_none());
-    }
-
-    /// A hold another line already names is kept for the status and says nothing of itself.
-    #[test]
-    fn a_hold_said_elsewhere_is_kept_but_not_said_twice() {
-        let now = Instant::now();
-        for hold in [
-            LaneHold::RestoredAgents,
-            LaneHold::RosterConfirmation,
-            LaneHold::ActivityRevoked,
-        ] {
-            let mut named = NamedHold::default();
-            assert_eq!(named.hold(7, hold, "words", now, 1), None, "{hold:?}");
-            assert_eq!(named.current().map(|held| held.hold), Some(hold));
-            assert_eq!(named.release(7, now), None, "{hold:?}");
-            assert_eq!(named.current(), None);
-        }
-    }
-}
+#[path = "native_update_lane_hold_tests.rs"]
+mod tests;

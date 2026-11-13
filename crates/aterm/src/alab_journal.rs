@@ -19,7 +19,7 @@ use aterm_agent::harness::{
     accounts::{self, Cli, Roster},
     alab_roster::{self, Lab},
     journal::{self, Note, Sink},
-    observe,
+    observe::{self, sweep::OnToken},
     provider_read::{self, ProbeEvent},
 };
 use aterm_db::alab::journal::{
@@ -41,6 +41,10 @@ struct Glue {
 impl Sink for Glue {
     fn account_pk(&self, realm: &str, email: &str) -> Option<String> {
         keyer(realm, email)
+    }
+
+    fn taking(&self) -> bool {
+        self.spool.is_some() && self.publishing.now()
     }
 
     fn note(&self, note: &Note) -> bool {
@@ -118,20 +122,39 @@ pub(super) fn install() {
     let _ = provider_read::install(Box::new(probe));
     let _ = place::install_holdings(Box::new(|| {
         let lab = alab_roster::current()?;
-        holdings_in(
-            &lab,
-            &aterm_types::dirs::aterm_config_path()?,
-            user_home().as_deref(),
-        )
+        let config = aterm_types::dirs::aterm_config_path()?;
+        let home = user_home();
+        // A Claude Code row on its vault token is held by its token's account, not by the
+        // profile its directory may still hold, as the login sweep reads it.
+        let on_token = match (
+            aterm_agent::harness::cli::harness_state_dir().ok(),
+            home.as_deref(),
+            roster_of(Some(&config), Cli::Claude),
+        ) {
+            (Some(state), Some(home), Some(roster)) => crate::alab_observed::on_token(
+                &state,
+                home,
+                &roster,
+                aterm_agent::supervise::limit::unix_now(),
+            ),
+            _ => OnToken::none(),
+        };
+        holdings_in(&lab, &config, home.as_deref(), &on_token)
     }));
 }
 
 /// What this Mac runs that it does not prefer (`alab_roster::holdings`), over every pooled CLI's
-/// login places (`observe::places`: the roster beside the `aterm.toml` at `config`, and the
-/// default home under `home`, which holds a login whether or not a row names it): `None` where
-/// the lab names no machine for this Mac or a roster that is there does not read, so a passing
-/// failure ends no place row.
-fn holdings_in(lab: &Lab, config: &Path, home: Option<&Path>) -> Option<Vec<Holding>> {
+/// login places (`observe::sweep::places_of`: the roster beside the `aterm.toml` at `config`,
+/// and the default home under `home`, which holds a login whether or not a row names it; a
+/// Claude Code row `on_token` names is read as its token's account): `None` where the lab names
+/// no machine for this Mac or a roster that is there does not read, so a passing failure ends
+/// no place row.
+fn holdings_in(
+    lab: &Lab,
+    config: &Path,
+    home: Option<&Path>,
+    on_token: &OnToken,
+) -> Option<Vec<Holding>> {
     lab.me.as_ref()?;
     let mut out = Vec::new();
     for cli in Cli::ALL {
@@ -139,7 +162,7 @@ fn holdings_in(lab: &Lab, config: &Path, home: Option<&Path>) -> Option<Vec<Hold
             continue;
         };
         let roster = Roster::load_for(cli, &path).ok()?;
-        let places = observe::places(cli, &roster, home);
+        let places = observe::sweep::places_of(cli, &roster, home, on_token);
         for (pk, why) in alab_roster::holdings(lab, cli, &roster, &places) {
             out.push(Holding {
                 account: Pk::new(&pk)?,
@@ -245,538 +268,5 @@ fn record(spool: &Spool, state: &Path, notes: &[Note]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every word a harness note can carry is a word of the journal's vocabulary and the widest
-    /// note of each shape the harness makes fits one event, so no note is dropped at the glue;
-    /// and the two realm tables agree: the harness's claims key and the lab's account key name
-    /// one account (design §5).
-    /// NEGATIVE CONTROL: with `event` dropping the other account (`to: None`), the switch names
-    /// no account: `` called `Option::unwrap()` on a `None` value ``.
-    #[test]
-    fn every_harness_word_is_a_journal_word() {
-        let account = journal::Key::new("ac-0123456789abcdef").unwrap();
-        for kind in journal::KINDS {
-            assert!(
-                Kind::parse(kind).is_some(),
-                "a harness kind the journal does not take: {kind:?}"
-            );
-        }
-        for window in journal::WINDOWS {
-            assert!(Window::parse(window).is_some(), "{window}");
-        }
-        for src in journal::SOURCES {
-            assert!(Source::parse(src).is_some(), "{src}");
-        }
-        for res in journal::RESES {
-            assert!(Res::parse(res).is_some(), "{res}");
-        }
-        for why in journal::WHYS {
-            assert!(Word::<16>::new(why).is_some(), "{why}");
-        }
-        for cli in Cli::ALL {
-            assert!(Word::<10>::new(cli.id()).is_some(), "{}", cli.id());
-        }
-        // The widest note of each shape the harness makes (`observe`): a reading, a wall, a
-        // switch, an error with its reason. Each fits one event (192 B).
-        let base = Note {
-            t: 9_999_999_999,
-            kind: "quota",
-            account: Some(account),
-            cli: "claude",
-            sub: None,
-            window: Some("7d-model"),
-            pct_x10: Some(1000),
-            reset: Some(9_999_999_999),
-            res: Some("exact"),
-            until: None,
-            src: "session-usage",
-            why: None,
-            to: None,
-            tab: None,
-            harness: None,
-        };
-        let shapes = [
-            base,
-            Note {
-                kind: "wall",
-                pct_x10: None,
-                reset: None,
-                res: None,
-                until: Some(9_999_999_999),
-                src: "cli-output",
-                ..base
-            },
-            Note {
-                kind: "switch",
-                window: None,
-                pct_x10: None,
-                reset: None,
-                res: None,
-                src: "cli-output",
-                to: journal::Key::new("ac-fedcba9876543210"),
-                ..base
-            },
-            Note {
-                kind: "sign-in-failed",
-                window: None,
-                pct_x10: None,
-                reset: None,
-                res: None,
-                src: "signin-flow",
-                why: Some("reset-failed"),
-                ..base
-            },
-            // A tab's sighting, with its tab and harness and the believed account of a
-            // wrong-account beside it.
-            journal::seen_note(
-                Cli::Codex,
-                account,
-                journal::Tab::of("machine", "s-41a2"),
-                "codex-alab-agent",
-                journal::ObservedSrc::VaultToken,
-                journal::SeenWhy::Changed,
-                9_999_999_999,
-            ),
-            journal::wrong_account_note(
-                Cli::Claude,
-                account,
-                journal::Key::new("ac-fedcba9876543210"),
-                journal::Tab::of("machine", "s-41a2"),
-                journal::ObservedSrc::Profile,
-                9_999_999_999,
-            ),
-            // The machine sweep's sighting of an idle login, which names no tab.
-            journal::idle_seen_note(
-                Cli::Kimi,
-                account,
-                journal::ObservedSrc::AuthFile,
-                journal::SeenWhy::First,
-                9_999_999_999,
-            ),
-        ];
-        let mut buf = [0; aterm_db::alab::journal::event::MAX_EVENT];
-        for note in &shapes {
-            let event = event(note).unwrap();
-            assert_eq!(event.kind.word(), note.kind);
-            assert!(event.encode(&mut buf).is_some(), "{note:?} fits an event");
-        }
-        let switch = event(&shapes[2]).unwrap();
-        assert_eq!(switch.kind, Kind::Switch);
-        assert_eq!(switch.to.unwrap().as_str(), "ac-fedcba9876543210");
-        for realm in [
-            "claude",
-            "anthropic",
-            "codex",
-            "openai",
-            "grok",
-            "xai",
-            "kimi",
-            "kimi:mainland-cn",
-        ] {
-            let lease =
-                aterm_agent::harness::claims::LeaseKey::new(realm, "Ann@Example.invalid").unwrap();
-            assert_eq!(
-                aterm_db::typed::keys::account_pk(&lease.pool, &lease.email).unwrap(),
-                aterm_db::typed::keys::account_pk(realm, "ann@example.invalid").unwrap(),
-                "{realm}"
-            );
-        }
-    }
-
-    /// The backfill is marked done only once its notes are in the spool: a spool that cannot
-    /// be written leaves it unmarked, so the next start backfills again and no note is lost.
-    /// NEGATIVE CONTROL: with `record` marking first (`journal::mark_backfilled(state)?` before
-    /// the appends), the failed backfill is marked done: `` the failed backfill is not marked ``.
-    #[test]
-    fn a_backfill_is_marked_only_once_its_notes_are_spooled() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let state = scratch.path().join("harness");
-        std::fs::create_dir_all(&state).unwrap();
-        let blocked = scratch.path().join("alab");
-        std::fs::write(&blocked, b"").unwrap();
-        let spool = Spool::at(blocked.clone());
-        let note = Note {
-            t: 1_800_000_000,
-            kind: "signed-in",
-            account: journal::Key::new("ac-0123456789abcdef"),
-            cli: "claude",
-            sub: None,
-            window: None,
-            pct_x10: None,
-            reset: None,
-            res: None,
-            until: None,
-            src: "cli-output",
-            why: None,
-            to: None,
-            tab: None,
-            harness: None,
-        };
-        assert!(record(&spool, &state, &[note]).is_err());
-        assert!(
-            !journal::backfilled(&state),
-            "the failed backfill is not marked"
-        );
-        std::fs::remove_file(&blocked).unwrap();
-        record(&spool, &state, &[note]).unwrap();
-        assert!(journal::backfilled(&state));
-        let spooled =
-            std::fs::read_to_string(blocked.join(aterm_db::alab::journal::spool::SPOOL)).unwrap();
-        assert_eq!(spooled.lines().count(), 1);
-    }
-
-    /// Before any harness has created its state directory, or when the clock is not yet past the
-    /// Unix epoch, `backfill_at` leaves the backfill unmarked instead of creating `<state>/alab`
-    /// and sealing an empty pass; and `event` rejects zero-timestamp or over-100% quota notes
-    /// rather than stripping `pct_x10`.
-    /// NEGATIVE CONTROL: with `backfill` calling `record` unconditionally on `!state.is_dir()`,
-    /// `journal::mark_backfilled` creates `state` and marks it done before any harness runs.
-    #[test]
-    fn missing_harness_state_or_pre_epoch_clock_leaves_backfill_unmarked_and_bad_notes_drop() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let spool = Spool::at(scratch.path().join("alab"));
-        let missing_state = scratch.path().join("no-harness-yet");
-        backfill_at(&spool, &missing_state, scratch.path(), None, 1_800_000_000).unwrap();
-        assert!(!missing_state.exists());
-        assert!(!journal::backfilled(&missing_state));
-
-        let present_state = scratch.path().join("harness");
-        std::fs::create_dir_all(&present_state).unwrap();
-        backfill_at(&spool, &present_state, scratch.path(), None, 0).unwrap();
-        assert!(!journal::backfilled(&present_state));
-
-        backfill_at(&spool, &present_state, scratch.path(), None, 1_800_000_000).unwrap();
-        assert!(journal::backfilled(&present_state));
-
-        let account = journal::Key::new("ac-0123456789abcdef").unwrap();
-        let zero_time = Note {
-            t: 0,
-            kind: "signed-in",
-            account: Some(account),
-            cli: "claude",
-            sub: None,
-            window: None,
-            pct_x10: None,
-            reset: None,
-            res: None,
-            until: None,
-            src: "cli-output",
-            why: None,
-            to: None,
-            tab: None,
-            harness: None,
-        };
-        assert!(event(&zero_time).is_none());
-        let over_pct = Note {
-            t: 1_800_000_000,
-            kind: "quota",
-            window: Some("5h"),
-            pct_x10: Some(1001),
-            ..zero_time
-        };
-        assert!(event(&over_pct).is_none());
-    }
-
-    /// A note's workspace and a realm-only probe reach the journal as they are: the workspace as
-    /// the event's `s`, an agy read with no login as a `probe` naming no account; a note of any
-    /// other kind without an account is dropped at the glue, as every reader would drop it.
-    /// NEGATIVE CONTROL: with `event` mapping no workspace (`sub: None`), the reading's `s` is
-    /// lost: `` left: None right: Some(0123456789ab) ``.
-    #[test]
-    fn a_workspace_and_a_realm_only_probe_reach_the_journal() {
-        let reading = Note {
-            t: 1_800_000_000,
-            kind: "quota",
-            account: journal::Key::new("ac-0123456789abcdef"),
-            cli: "codex",
-            sub: journal::SubKey::new("0123456789ab"),
-            window: Some("7d"),
-            pct_x10: Some(250),
-            reset: Some(1_800_003_600),
-            res: Some("exact"),
-            until: None,
-            src: "rollout",
-            why: None,
-            to: None,
-            tab: None,
-            harness: None,
-        };
-        assert_eq!(event(&reading).unwrap().sub, Word::new("0123456789ab"));
-        let probe = Note {
-            kind: "probe",
-            account: None,
-            cli: "agy",
-            sub: None,
-            window: None,
-            pct_x10: None,
-            reset: None,
-            res: None,
-            src: "probe",
-            why: Some("launching"),
-            ..reading
-        };
-        let mut buf = [0; aterm_db::alab::journal::event::MAX_EVENT];
-        let noted = event(&probe).unwrap();
-        let len = noted.encode(&mut buf).unwrap();
-        let line = &buf[..len];
-        assert_eq!(Event::from_line(line), Some(noted), "every reader takes it");
-        assert_eq!(noted.account, None);
-        let signin = Note {
-            kind: "signed-in",
-            src: "signin-flow",
-            why: None,
-            ..probe
-        };
-        assert_eq!(event(&signin), None);
-    }
-
-    /// A note made while `[alab] journal = false` is never spooled, so no pass can publish it
-    /// once the journal is on again; one made after it is turned on is.
-    /// NEGATIVE CONTROL: with `Glue::note` not asking `publishing` (its check removed), the
-    /// sign-in noted while off is spooled: `` nothing is spooled while off ``.
-    #[test]
-    fn a_note_made_while_the_journal_is_off_is_never_spooled() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let config = scratch.path().join("aterm.toml");
-        aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
-        let glue = Glue {
-            spool: Some(Spool::at(scratch.path().join("alab"))),
-            publishing: Publishing::new(Some(config.clone())),
-        };
-        let note = Note {
-            t: 1_800_000_000,
-            kind: "signed-in",
-            account: journal::Key::new("ac-0123456789abcdef"),
-            cli: "claude",
-            sub: None,
-            window: None,
-            pct_x10: None,
-            reset: None,
-            res: None,
-            until: None,
-            src: "signin-flow",
-            why: None,
-            to: None,
-            tab: None,
-            harness: None,
-        };
-        let spooled = scratch
-            .path()
-            .join("alab")
-            .join(aterm_db::alab::journal::spool::SPOOL);
-        assert!(!glue.note(&note), "a note made while off is not taken");
-        assert!(!spooled.exists(), "nothing is spooled while off");
-        std::fs::write(&config, "[alab]\njournal = true\n").unwrap();
-        assert!(glue.note(&note), "a spooled note is taken");
-        assert!(spooled.exists(), "on again, the note is spooled");
-    }
-
-    /// With `[alab] journal = false` the backfill is marked done and notes nothing, so turning
-    /// the journal on again publishes nothing from before.
-    /// NEGATIVE CONTROL: with `backfill_at` not reading `publishing` (its check removed), the
-    /// ledger's sign-in is spooled: `` nothing is spooled while off ``.
-    #[test]
-    fn a_backfill_with_the_journal_off_is_marked_and_notes_nothing() {
-        use aterm_agent::harness::accounts::{Event as Row, Kind as RowKind, Store};
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let state = scratch.path().join("harness");
-        let home = scratch.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let now = 1_800_000_000;
-        let store = Store::at_for(&state, Cli::Claude, &home);
-        store
-            .append(&[Row::new(now - 600, RowKind::SignedIn, "ann")])
-            .unwrap();
-        let mut keyed = accounts::State::default();
-        keyed.accounts.insert(
-            "ann".into(),
-            accounts::Account {
-                pk: Some("ac-0123456789abcdef".into()),
-                ..accounts::Account::default()
-            },
-        );
-        aterm_uds::private_file::write_private(
-            store.state_file().parent().unwrap(),
-            "state.json",
-            (keyed.to_json() + "\n").as_bytes(),
-        )
-        .unwrap();
-        let config = scratch.path().join("aterm.toml");
-        aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
-        let spool = Spool::at(scratch.path().join("alab"));
-        backfill_at(&spool, &state, &home, Some(&config), now).unwrap();
-        assert!(journal::backfilled(&state));
-        assert!(
-            !spool
-                .dir()
-                .join(aterm_db::alab::journal::spool::SPOOL)
-                .exists(),
-            "nothing is spooled while off"
-        );
-        // On, the same backfill notes the sign-in: the check above is what kept it out.
-        let on = scratch.path().join("on");
-        std::fs::create_dir_all(&on).unwrap();
-        std::fs::rename(state.join("alab"), on.join("mark")).unwrap();
-        backfill_at(&spool, &state, &home, None, now).unwrap();
-        assert!(
-            spool
-                .dir()
-                .join(aterm_db::alab::journal::spool::SPOOL)
-                .exists()
-        );
-    }
-
-    /// A Mac that lists no account holds the login its default home holds, and a default row
-    /// whose place holds another account's login reports that account, never its own.
-    /// NEGATIVE CONTROL: with `holdings_in` passing no home (`observe::places(cli, &roster,
-    /// None)`), the Mac with no roster reports nothing: `left: Some([]) right: Some([Holding {
-    /// .. Fill }])`.
-    #[test]
-    fn a_default_home_login_no_row_lists_is_held() {
-        use aterm_agent::harness::{
-            accounts::{Row, Vendor},
-            alab_roster::{LabAccount, MachineRef},
-        };
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let config = scratch.path().join("aterm.toml");
-        let home = scratch.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let account = |email: &str, preferred: Option<&str>| LabAccount {
-            pk: aterm_db::typed::keys::account_pk("claude", email).unwrap(),
-            cli: Cli::Claude,
-            vendor: Vendor::default(),
-            label: "claude-aaaaaa".into(),
-            legacy_label: None,
-            email: email.into(),
-            identity: None,
-            browser: None,
-            joinable: true,
-            preferred: preferred
-                .map(|machine| {
-                    (
-                        MachineRef::from_registry(
-                            format!("fixture-{machine}"),
-                            Some(machine.into()),
-                        ),
-                        Some(1),
-                    )
-                })
-                .into_iter()
-                .collect(),
-        };
-        let (uni, ann) = ("uni@example.test", "ann@example.test");
-        let lab = Lab {
-            me: Some(MachineRef::from_registry("fixture-m22", Some("m22".into()))),
-            accounts: vec![account(uni, None), account(ann, Some("m3"))],
-            ..Lab::default()
-        };
-        let held = |why| {
-            Some(vec![Holding {
-                account: Pk::new(&lab.accounts[0].pk).unwrap(),
-                why,
-            }])
-        };
-        std::fs::write(
-            home.join(".claude.json"),
-            format!(r#"{{"oauthAccount":{{"emailAddress":"{uni}"}}}}"#),
-        )
-        .unwrap();
-        assert_eq!(holdings_in(&lab, &config, Some(&home)), held(Why::Fill));
-        let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
-        let row = Row {
-            label: "m22".into(),
-            email: Some(ann.into()),
-            ..Row::default()
-        };
-        std::fs::write(
-            &roster,
-            accounts::append_rows_for(Cli::Claude, "", &[row]).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            holdings_in(&lab, &config, Some(&home)),
-            held(Why::Fill),
-            "the default row's place holds another account"
-        );
-        std::fs::remove_file(home.join(".claude.json")).unwrap();
-        assert_eq!(
-            holdings_in(&lab, &config, Some(&home)),
-            Some(vec![Holding {
-                account: Pk::new(&lab.accounts[1].pk).unwrap(),
-                why: Why::Borrow,
-            }]),
-            "nothing read: the row, the belief"
-        );
-    }
-
-    /// The flusher's holdings come from every pooled CLI's roster beside `aterm.toml`, keyed by
-    /// the lab's account key with the harness's reason; a lab that names no machine for this Mac,
-    /// or a roster that is there and does not read, reports nothing known (`None`), so no place
-    /// row ends on a passing failure; a CLI with no roster and no login in its home holds nothing.
-    /// NEGATIVE CONTROL: with `holdings_in` skipping a roster that does not read (`continue`
-    /// instead of `?`), the broken roster reports `Some([])` and every place row would end
-    /// (`left: Some([]) right: None`).
-    #[test]
-    fn holdings_come_from_the_rosters_beside_the_config() {
-        use aterm_agent::harness::{
-            accounts::{Row, Vendor},
-            alab_roster::{LabAccount, MachineRef},
-        };
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let config = scratch.path().join("aterm.toml");
-        let email = "ann@example.test";
-        let key = aterm_db::typed::keys::account_pk("claude", email).unwrap();
-        let lab = Lab {
-            me: Some(MachineRef::from_registry("fixture-m22", Some("m22".into()))),
-            accounts: vec![LabAccount {
-                pk: key.clone(),
-                cli: Cli::Claude,
-                vendor: Vendor::default(),
-                label: "claude-aaaaaa".into(),
-                legacy_label: None,
-                email: email.into(),
-                identity: None,
-                browser: None,
-                joinable: true,
-                preferred: vec![(
-                    MachineRef::from_registry("fixture-m3", Some("m3".into())),
-                    Some(1),
-                )],
-            }],
-            ..Lab::default()
-        };
-        assert_eq!(
-            holdings_in(&lab, &config, None),
-            Some(Vec::new()),
-            "no roster"
-        );
-        let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
-        let row = Row {
-            label: "claude-aaaaaa".into(),
-            dir: Some("/scratch/ann".into()),
-            email: Some(email.into()),
-            ..Row::default()
-        };
-        std::fs::write(
-            &roster,
-            accounts::append_rows_for(Cli::Claude, "", &[row]).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            holdings_in(&lab, &config, None),
-            Some(vec![Holding {
-                account: Pk::new(&key).unwrap(),
-                why: Why::Borrow,
-            }])
-        );
-        let unnamed = Lab {
-            me: None,
-            ..lab.clone()
-        };
-        assert_eq!(holdings_in(&unnamed, &config, None), None);
-        std::fs::write(&roster, "[[account]]\nlabel = 7\n").unwrap();
-        assert_eq!(holdings_in(&lab, &config, None), None, "a broken roster");
-    }
-}
+#[path = "alab_journal_tests.rs"]
+mod tests;

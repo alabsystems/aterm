@@ -12,7 +12,7 @@ use aterm_capacity::{
 };
 use aterm_ctl::resource_admission_transport::{AuthorizedSubmission, Peer};
 use aterm_types::{
-    resource_admission::{Binding, CompletionCause},
+    resource_admission::{Binding, CompletionCause, Submission},
     resource_inspection::Inspection,
 };
 use aterm_uds::spawnfd;
@@ -20,6 +20,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
     io,
+    os::fd::OwnedFd,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -60,6 +61,9 @@ pub(super) mod metadata;
 mod native_inputs;
 #[path = "resource_admission_parent_loan.rs"]
 mod parent_loan;
+
+#[path = "resource_admission_preflight.rs"]
+mod preflight;
 
 #[path = "resource_admission_preparation.rs"]
 mod preparation;
@@ -107,7 +111,7 @@ pub(super) struct Owner {
 }
 struct Pending {
     queued_at: Instant,
-    submission: AuthorizedSubmission,
+    submission: PendingSubmission,
     events: job::Events,
     recipe: Option<recipe::Recipe>,
     probe: Option<recipe::Probe>,
@@ -122,11 +126,39 @@ struct Pending {
     cancelled: bool,
     resolver: Option<resolver_root::Preparation>,
     bootstrap_graph: Option<bootstrap_graph::Root>,
+    preflight: Option<preflight::Prepared>,
+    probe_scope: Option<preflight::Scope>,
+}
+struct PendingSubmission {
+    request: Submission,
+    peer: Peer,
+    fds: PendingIo,
+}
+struct PendingIo {
+    stdin: OwnedFd,
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+}
+impl From<AuthorizedSubmission> for PendingSubmission {
+    fn from(submission: AuthorizedSubmission) -> Self {
+        Self {
+            request: submission.request,
+            peer: submission.peer,
+            fds: PendingIo {
+                stdin: submission.fds.stdin,
+                stdout: submission.fds.stdout,
+                stderr: submission.fds.stderr,
+            },
+        }
+    }
 }
 impl Pending {
     /// The new workload's original whole-attempt clock includes admission.
     /// Repeated inspections and final GO cannot renew that selected bound.
     fn original_deadline(&self) -> io::Result<Option<Instant>> {
+        if let Some(preflight) = &self.preflight {
+            return Ok(Some(preflight.deadline()));
+        }
         let graph = bootstrap_graph::purpose(&self.submission.request);
         if !workload::purpose(&self.submission.request) && !graph {
             return Ok(None);
@@ -202,6 +234,7 @@ struct Job {
     compiler: Option<compiler::Selection>,
     runtime_inputs: runtime_inputs::State,
     bootstrap_graph: Option<bootstrap_graph::Root>,
+    preflight: Option<preflight::Prepared>,
     events: job::Events,
     custody: Custody,
     child: aterm_capacity::cohort::launch::CohortChild,
@@ -344,8 +377,12 @@ impl Owner {
         aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY)})
     }
     pub(super) fn accepts(&self, binding: &Binding) -> bool {
+        self.accepts_with_queued(binding, 0)
+    }
+    fn accepts_with_queued(&self, binding: &Binding, queued: usize) -> bool {
         !self.faulted
-            && self.pending.len()
+            && queued
+                + self.pending.len()
                 + self.jobs.len()
                 + self
                     .jobs

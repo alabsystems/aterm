@@ -182,7 +182,7 @@ USAGE
 
 const PAGE_BODY: &str = r#"
 OPTIONS
-  scope=<s>       whose rows: pane|tab|window|aterm|global on jobs, procs, disk (default tab)
+  scope=<s>       whose rows: pane|tab|window|request|aterm|global on jobs procs disk (default tab)
   top=<1-64>      rows per list (default 8)
   fresh=<ms>      the oldest reading to take (default 2000; cores 1000, why 5000, disk 10000)
   depth=<1-8>     folder levels under each disk root (disk only; default 3)
@@ -223,12 +223,19 @@ EXAMPLES
 "#;
 
 const OPTIONS_BODY: &str = r#"  aterm ctl @self sys [<view>] [scope=] [top=] [fresh=] [depth=] [since=] [instances=all] [--json]
-  scope=pane|tab|window|aterm|global
+  scope=pane|tab|window|request|aterm|global
       whose rows jobs, procs and disk read: pane is the target session alone, tab its split
-      panes (the default), then its window, this aterm instance, or the machine. left takes
-      pane, tab or aterm. cores, gpu, mem and net take it and print the same rows; overview,
-      tab, aterm, global, why and report refuse it. Beyond the target's tab (disk: beyond its
-      window) a scope is the owner's.
+      panes (the default), then its window, every tab of the request the target's tab is one
+      of, this aterm instance, or the machine. left takes pane, tab or aterm. cores, gpu, mem
+      and net take it and print the same rows; overview, tab, aterm, global, why and report
+      refuse it. Beyond the target's tab (disk: beyond its window) a scope is the owner's.
+      scope=request adds a line request=<id> tabs=<n> cpu_s= peak_mb= disk_written_mb=
+      claims=<n> claimed_mb=: what its tabs' process trees spent (those that left as recorded,
+      the live ones as read now; a floor, since a process that ended between reads is missed)
+      and what the folders it claims hold, each unavailable(not_sampled) where nothing read
+      it (claimed_mb: where a folder's walk failed or was cut short), never 0 (JSON: a
+      "request" object). A tab no request owns is refused: ERR sys
+      scope=request: <sid> belongs to no request.
   top=<1-64>
       rows per list (default 8); disk's folders share it across roots, and on why it also
       lifts the 2,048-byte cut
@@ -464,7 +471,7 @@ fn jobs_body() -> String {
     )
 }
 
-const JOBS_HEAD: &str = r#"  aterm ctl @self sys jobs [scope=pane|tab|window|aterm|global] [top=<n>] [--json]
+const JOBS_HEAD: &str = r#"  aterm ctl @self sys jobs [scope=pane|tab|window|request|aterm|global] [top=<n>] [--json]
   One row per job: a command a tab's shell runs, an agent's tool call, and what either left
   running, judged by what its processes do (their file descriptors, sockets, kqueue and wait
   channels) and how long it has been silent. The `aterm ctl` that asks is itself one of the
@@ -584,7 +591,8 @@ LINES
   can differ from why's.
 "#;
 
-const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|aterm|global] [depth=<1-8>] [top=<n>] [--json]
+const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|request|aterm|global] [depth=<1-8>]
+      [top=<n>] [--json]
   Folder sizes come from a background walk, so a large tree can read state=walking for a
   while; nothing waits on a walk (`await sys` has no walk term), so read again until
   state=complete. A folder no walk measures (protected, another user's, remote, removable, too
@@ -731,7 +739,15 @@ fn machine_body() -> String {
     let mem = aterm_sysprobe::memory_detail();
     let gpu = aterm_sysprobe::gpu();
     let load = aterm_sysprobe::load_average();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // The home folder's volume: `HOME`, or on Windows `USERPROFILE` (Windows sets no `HOME`).
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("USERPROFILE"))
+                .flatten()
+        })
+        .map(PathBuf::from);
     let volume = home.as_deref().and_then(aterm_sysprobe::volume);
     let mut s = String::from("THIS MACHINE (read now)\n");
     let clusters: Vec<String> = layout
@@ -799,11 +815,42 @@ fn machine_body() -> String {
          yes: measured; estimate: approximated; unavailable(<why>): not read here, never zero\n",
     );
     for (name, word, meaning) in aterm_sysprobe::caps().described_rows() {
-        let _ = writeln!(s, "  {name:<18} {word:<12} {meaning}");
+        push_cap_row(&mut s, name, &word, meaning);
     }
     s.push_str(CAPS_NOTE);
     s.push_str(COVERAGE);
     s
+}
+
+/// The width a sys page keeps to.
+const PAGE_COLUMNS: usize = 100;
+
+/// One `WHAT THIS MACHINE CAN SAY` row: the name, its word, then its meaning, which wraps at a
+/// space onto lines under its own column, so a meaning that also names where one OS reads it
+/// keeps the page to [`PAGE_COLUMNS`].
+fn push_cap_row(s: &mut String, name: &str, word: &str, meaning: &str) {
+    let head = format!("  {name:<18} {word:<12} ");
+    let indent = head.chars().count();
+    let room = PAGE_COLUMNS.saturating_sub(indent).max(24);
+    let mut line = head;
+    let mut used = 0;
+    for part in meaning.split_whitespace() {
+        let len = part.chars().count();
+        if used > 0 && used + 1 + len > room {
+            s.push_str(line.trim_end());
+            s.push('\n');
+            line = " ".repeat(indent);
+            used = 0;
+        }
+        if used > 0 {
+            line.push(' ');
+            used += 1;
+        }
+        line.push_str(part);
+        used += len;
+    }
+    s.push_str(line.trim_end());
+    s.push('\n');
 }
 
 /// Where `sys` reads a figure through the window's own probe rather than the reader a row above
@@ -875,21 +922,33 @@ WHAT IT CANNOT MEASURE HERE
 const COVERAGE: &str = r#"
 WHAT THIS OS MEASURES (Windows)
   CPU per core, grouped by CPU Sets' efficiency class; memory in use, the kernel's pools, the
-  standby cache, the page files, and the commit charge against its enforced limit (with the
-  low-memory notification as pressure); every process in one system call (CPU time and
-  private commit); each fixed drive's free space.
+  standby cache, the compression store (the Memory Compression process's working set, an
+  estimate), the page files and their growth, and the commit charge against its enforced limit
+  (with the low-memory notification as pressure); every process in one system call (CPU time,
+  private commit and its peak, working set, a run state from its threads, and its session:
+  yours, another user's or services'); a process tree's memory, counting the orphans in its
+  console; the GPU: the busiest hardware adapter's busiest engine, its memory and name, and
+  each process's GPU time (the GPU Engine counters); the throttle level where the machine lists
+  an ACPI thermal zone (an estimate from its passive limit); each network link's counters and
+  speed, and TCP sockets by state; each fixed drive's free space; your tabs' folders' sizes
+  (`sys disk`, from a background walk that enters no junction or symbolic link).
 
 WHAT IT CANNOT MEASURE HERE
-  - the GPU (its engine counters are not read), the thermal level and the compression store:
+  - jobs (`sys jobs`): it lists none. A tab's processes are read (`sys procs` shows the shell
+    and its command), but nothing groups them into a job, so the stuck engine judges none.
+  - process groups, terminals, paging rates (only the page files' growth), time waiting to
+    run, CPU frequency, the load average and the run queue: not read here.
+  - the bytes a process wrote to disk: Windows counts its pipe, socket and console bytes with
+    them, so writers read unavailable(not_sampled).
+  - each storage device's throughput, open sockets per process, and TCP round-trip time.
+  - the thermal level on a machine with no thermal zone, the compression store where memory
+    compression is off, and a GPU that only Microsoft's software renderer drives:
     unavailable, never zero.
-  - jobs (`sys jobs`): the stuck engine reads no Windows process in this build.
-  - process groups, terminals, paging rates, time waiting to run and bytes written: Windows
-    has no such process facts here.
-  - ownership outside aterm: those process rows say scope=unknown, and the
-    own-processes/services split reads unavailable(not_sampled).
   - which core a process runs on, or a scope's share of a cluster (split_mc=):
     unavailable(not_sampled).
-  - folder sizes: no disk walker runs on Windows; they read unavailable, never zero.
+  - the size of a folder it does not walk (protected, another user's, remote, removable,
+    cloud-only, reached through a junction or symbolic link, too broad): unavailable(<why>),
+    never zero.
 "#;
 
 /// What this build measures on the OS the page runs on, and what it cannot.
@@ -923,85 +982,5 @@ ACTING ON WHAT YOU READ
 "#;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A sys page's lines fit a 100-column terminal. The one line that is this executable's
-    /// path (the cpu section's) is data, as long as the folder it was built in.
-    fn fits(name: &str, text: &str) {
-        let exe = std::env::current_exe().map(|p| p.display().to_string());
-        for line in text.lines() {
-            if exe.as_deref().is_ok_and(|exe| line.trim() == exe) {
-                continue;
-            }
-            assert!(
-                line.chars().count() <= 100,
-                "`aterm help {name}` has a line of {} columns: {line}",
-                line.chars().count()
-            );
-        }
-    }
-
-    /// The page's VIEWS rows are the server's views, in its order, then the two actions that
-    /// share the verb, and each of those parses as `sys` takes it: a view the parser gains
-    /// cannot go unlisted, and a row cannot name one it does not serve.
-    #[test]
-    fn the_page_lists_every_view_the_server_takes() {
-        use aterm_vitals::sys::{SysQuery, View};
-        let words: Vec<&str> = VIEW_ROWS.iter().map(|(w, _)| *w).collect();
-        let served: Vec<&str> = View::ALL.iter().map(|v| v.word()).collect();
-        assert_eq!(words[..served.len()], served[..]);
-        assert_eq!(words[served.len()..], ["name", "policy"]);
-        assert!(SysQuery::parse("name job=a1").is_ok());
-        let page = page();
-        for word in words {
-            assert!(
-                page.lines().any(|l| l.starts_with(&format!("  {word} "))),
-                "{word}: {page}"
-            );
-        }
-    }
-
-    /// Every section renders under its name, is in the page's MORE list, fits 100 columns and
-    /// teaches only served `aterm ctl` verbs; the page's basics fit one screen; and a word that
-    /// names no section is refused with the list.
-    #[test]
-    fn every_section_renders_and_the_basics_fit_one_screen() {
-        let page = page();
-        fits("sys", &page);
-        let basics = page.split("\nMORE").next().unwrap_or_default();
-        assert!(basics.lines().count() <= 66, "{basics}");
-        for sec in SECTIONS {
-            let text = section(sec.name).expect("a listed section renders");
-            assert!(page.contains(&format!("  {:<9} {}", sec.name, sec.summary)));
-            fits(&format!("sys {}", sec.name), &text);
-            for (command, verb) in aterm_primer::taught_ctl_verbs(&text) {
-                assert!(
-                    aterm_types::control_verbs::spec(&verb).is_some()
-                        || aterm_ctl::CLIENT_HELP_VERBS.contains(&verb.as_str()),
-                    "`aterm help sys {}` teaches `aterm ctl {command}`, which nothing serves",
-                    sec.name
-                );
-            }
-        }
-        assert!(section("bogus").is_none());
-        let refusal = unknown_section("bogus");
-        assert!(SECTIONS.iter().all(|sec| refusal.contains(sec.name)));
-    }
-
-    /// The machine section is read at the call: this machine's OS and core count as the
-    /// sampler's readers see them now, and every capability row they measure with its word.
-    #[test]
-    fn the_machine_section_reads_this_machine_at_the_call() {
-        let text = machine_body();
-        let cores = aterm_sysprobe::cpu_layout().logical_cores();
-        assert!(text.contains(&format!(" {cores} cores: ")), "{text}");
-        if let Some(os) = aterm_sysprobe::machine_words().os {
-            assert!(text.contains(&os), "{text}");
-        }
-        for (name, word) in aterm_sysprobe::caps().rows() {
-            assert!(text.contains(&format!("  {name} ")), "{name}: {text}");
-            assert!(text.contains(&word), "{name}={word}: {text}");
-        }
-    }
-}
+#[path = "sys_page_tests.rs"]
+mod tests;

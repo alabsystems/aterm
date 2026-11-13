@@ -8,11 +8,7 @@ use aterm_spec::interp::State;
 
 pub(super) fn pending() -> St {
     let image = Image {
-        path: if cfg!(windows) {
-            b"C:\\model\\agent".to_vec()
-        } else {
-            b"/model/agent".to_vec()
-        },
+        path: b"/model/agent".to_vec(),
         device: 1,
         inode: 2,
     };
@@ -56,11 +52,7 @@ pub(super) fn pending() -> St {
             observation: None,
             shell: Process { pid: 43, ..process },
             launcher: image,
-            socket: if cfg!(windows) {
-                "C:\\model\\control.sock".into()
-            } else {
-                "/model/control.sock".into()
-            },
+            socket: "/model/control.sock".into(),
             forward: Box::new(command.clone()),
             rollback: Some(Box::new(command)),
         },

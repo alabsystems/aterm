@@ -3,7 +3,8 @@
 
 //! Local writer succession after a table's directory binding is lost. The old
 //! actor and its files are never repaired or reused. One private shadow home
-//! joins through ordinary admission and imports independently witnessed signed
+//! is admitted to the vault on the fenced original's signed statement, with no
+//! person ([`admit_by_statement`]), and imports independently witnessed signed
 //! records before application authoring is enabled.
 
 use crate::admission::deadline as admission_deadline;
@@ -20,14 +21,21 @@ use aterm_digest::Sha256;
 use aterm_json::{Value, json};
 use aterm_secrets::{
     client::{self, Paths},
-    commons::{bootstrap::Bootstrap, journal::Journal, roster::Access},
+    commons::{
+        bootstrap::{Bootstrap, Device},
+        journal::Journal,
+        roster::Access,
+    },
     fsx,
+    members::{Allowed, Bundle, bundle::Reader},
     transport::Source,
 };
 use aterm_uds::private_file::{self, PrivateLock};
 
 mod retained;
-pub(crate) use retained::{ReadValidation, with_retained_session};
+#[cfg(test)]
+pub(crate) use retained::with_retained_session;
+pub(crate) use retained::{ReadValidation, RetainedContext, with_retained_context};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -36,6 +44,10 @@ use std::{
 const LINK: &str = "writer-generation-origin";
 const STATE: &str = "selection";
 const FENCE: &str = "reservation";
+/// The fenced original's signed statement for its successor ([`admit_by_statement`]).
+const STATEMENT: &str = "statement";
+/// Why the statement admitted nothing on the last recovery pass ([`note_statement`]).
+const REFUSED: &str = "statement-refused";
 const MAX_STATE: usize = 16 * 1024;
 const MAX_GENERATIONS: usize = 8;
 const ADVANCE_WITHIN: Duration = Duration::from_secs(20);
@@ -395,7 +407,12 @@ pub(crate) fn refresh_required(paths: &Paths) -> Result<bool> {
     Ok(false)
 }
 
-fn try_local_source_reads(paths: &Paths) -> Result<Option<Vec<client::CommonsSourceRead>>> {
+/// One try at the current and ancestor vault read locks, [`local_source_reads_until`]'s: `None`
+/// where a source's state lock is held by a writer or is absent, every guard taken before it let
+/// go. It never waits.
+pub(crate) fn try_local_source_reads(
+    paths: &Paths,
+) -> Result<Option<Vec<client::CommonsSourceRead>>> {
     let mut reads = Vec::new();
     let mut child = paths.clone();
     for depth in 0..=MAX_GENERATIONS {
@@ -439,77 +456,19 @@ pub(crate) fn local_source_reads_until(
         if remaining.is_zero() {
             return Err(unavailable());
         }
+        #[cfg(test)]
+        SOURCE_READ_SLEEPS.set(SOURCE_READ_SLEEPS.get() + 1);
         std::thread::sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(Duration::from_millis(50));
     }
 }
 
-/// Admit one completed application generation while holding every local vault
-/// source and control writer in its lineage. Take sources before any control
-/// writer, then controls from oldest to newest; no guard escapes this function.
-/// The callback is for bounded local persistence, never network I/O or a vault
-/// mutation. A caller's account writer, if any, must already be held.
-pub(crate) fn with_admitted_session<T>(
-    paths: &Paths,
-    deadline: Instant,
-    action: impl FnOnce(&Bootstrap, &Session<'_>) -> Result<T>,
-) -> Result<T> {
-    let selected = observed_generation_until(paths, deadline)?;
-    let sources = local_source_reads_until(&selected, deadline)?;
-    #[cfg(test)]
-    let sources = if RELEASE_SOURCE_EARLY.get() {
-        drop(sources);
-        Vec::new()
-    } else {
-        sources
-    };
-    let _sources = sources;
-    let mut lineage = vec![selected.clone()];
-    while let Some(parent) = linked(lineage.last().ok_or_else(fail)?)? {
-        if lineage.len() > MAX_GENERATIONS {
-            return Err(fail());
-        }
-        lineage.push(parent.original);
-    }
-    // Observe custody before taking any control writer. Established custody
-    // does not create, repair or enroll a generation.
-    let custody = lineage
-        .iter()
-        .rev()
-        .map(|path| {
-            Bootstrap::established_with_journal_until(path, deadline)
-                .map(|(bootstrap, _)| bootstrap)
-                .map_err(crate::table::failure)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Capture ancestor custody before taking any control writer, too: opening
-    // it later would invert a normal bootstrap's custody -> control order.
-    let observation = observe_generation(&selected, deadline, &|| deadline)?;
-    let mut controls = custody
-        .iter()
-        .map(|bootstrap| {
-            Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
-                .map_err(crate::table::failure)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let bootstrap = custody.last().ok_or_else(fail)?;
-    let journal = controls.pop().ok_or_else(fail)?;
-    // Revalidate the captured lineage after all waits, without reopening its
-    // custody. Earlier control writers remain
-    // held: neither an ancestor revocation nor a new succession fence can race
-    // the local receipt written by the callback.
-    if observed_generation_until(paths, deadline)? != selected {
-        return Err(fail());
-    }
-    let session = Session::admit_selected(bootstrap, journal, observation, deadline)?;
-    session.writer()?;
-    within(deadline)?;
-    action(bootstrap, &session)
-}
-
 #[cfg(test)]
 thread_local! {
-    pub(crate) static RELEASE_SOURCE_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many times this thread slept in [`local_source_reads_until`], waiting for a source
+    /// a writer held or that was absent.
+    pub(crate) static SOURCE_READ_SLEEPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// One table session shares its authenticated ancestor observations. Every use
@@ -640,6 +599,20 @@ impl Observation {
                 "original Commons writer is fenced by succession",
             ));
         }
+        self.check_lineage(authoring, deadline)
+    }
+
+    /// A read of the records this home holds: every predecessor's succession complete, as
+    /// authoring requires, but no refusal of this home's own fence. A fenced home is one whose
+    /// writer recovery is still pending; it may no longer write, and its records stay readable
+    /// until its successor has imported them ([`observed_generation_until`]).
+    pub(crate) fn check_read(&self, deadline: Instant) -> Result<()> {
+        within(deadline)?;
+        held_here(&self.paths)?;
+        self.check_lineage(true, deadline)
+    }
+
+    fn check_lineage(&self, authoring: bool, deadline: Instant) -> Result<()> {
         let mut child = self.paths.clone();
         for ancestor in &self.ancestors {
             let selected = linked(&child)?.ok_or_else(fail)?;
@@ -716,6 +689,38 @@ pub(crate) fn guard_until(paths: &Paths, authoring: bool, deadline: Instant) -> 
             "original Commons writer is fenced by succession",
         ));
     }
+    guard_lineage_until(paths, authoring, deadline)
+}
+
+/// [`guard_until`] for a read of the records `paths` holds: every predecessor's succession
+/// complete, as authoring requires, without refusing `paths`' own fence
+/// ([`Observation::check_read`]).
+pub(crate) fn guard_read_until(paths: &Paths, deadline: Instant) -> Result<()> {
+    within(deadline)?;
+    held_here(paths)?;
+    guard_lineage_until(paths, true, deadline)
+}
+
+/// Whether `paths` still holds the newest records of its lineage, as a read of them needs: it
+/// has no succession of its own, or one whose import has never completed, so its successor has
+/// authored nothing. A completed succession supersedes it, and one whose completion a later
+/// source receipt invalidated may have a successor that authored since: both refuse.
+fn held_here(paths: &Paths) -> Result<()> {
+    match Selection::read(paths)? {
+        None => Ok(()),
+        Some(selection) if selection.complete.is_none() => Ok(()),
+        Some(selection) if selection.complete == Some(seal(paths)?) => Err(Error::new(
+            "original Commons writer is fenced by succession",
+        )),
+        Some(_) => Err(preserving()),
+    }
+}
+
+fn preserving() -> Error {
+    Error::new("Commons writer succession is still preserving old records")
+}
+
+fn guard_lineage_until(paths: &Paths, authoring: bool, deadline: Instant) -> Result<()> {
     let Some(selection) = linked(paths)? else {
         return Ok(());
     };
@@ -795,16 +800,34 @@ pub(crate) fn observed_selection_within(
     read_by: Instant,
     wait: &dyn Fn() -> Instant,
 ) -> Result<Observation> {
-    observe_generation(&observed_generation_until(paths, read_by)?, read_by, wait)
+    let observation =
+        Observation::observe_within(&completed_generation_until(paths, read_by)?, read_by, wait)?;
+    observation.check(true, false, read_by)?;
+    Ok(observation)
 }
 
-/// The home [`observed_selection_within`] selects, named by its completed selections alone: a
-/// succession still preserving old records refuses here, as observing it would, so no reader
-/// opens a candidate before it is complete. No predecessor is observed yet, so this says which
-/// home a read opens, never that it may. A reader opens that home's established custody and then
-/// observes it ([`observe_generation`]), so the observation it keeps is no older than that
-/// custody's wait.
+/// The home a read of the records this Mac holds opens: each completed selection is followed to
+/// its successor, and the first succession whose import has never completed stops the walk at
+/// the home it is preserving. That home is fenced, so it writes nothing more, but every record it
+/// holds stays readable until its successor has imported them: a writer recovery that cannot
+/// finish (a successor the vault has not admitted, a missing history key) never makes the
+/// records already held unreadable. An incomplete candidate is never named, and a succession
+/// whose completion was invalidated refuses, as its successor may have authored since. No predecessor is
+/// observed yet, so this says which home a read opens, never that it may: a reader opens that
+/// home's established custody and then observes it ([`observe_generation`]), so the observation
+/// it keeps is no older than that custody's wait.
 pub(crate) fn observed_generation_until(paths: &Paths, read_by: Instant) -> Result<Paths> {
+    generation_until(paths, read_by, false)
+}
+
+/// The completed generation a writer, a retained subscriber or a "ready" answer needs: as
+/// [`observed_generation_until`], but a succession still preserving old records refuses here,
+/// so nothing that authors or retains opens a home whose successor is pending.
+pub(crate) fn completed_generation_until(paths: &Paths, read_by: Instant) -> Result<Paths> {
+    generation_until(paths, read_by, true)
+}
+
+fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<Paths> {
     // Ordinary recovery may repair local files; a public observation uses
     // only established custody, including every predecessor in the chain.
     let mut selected = paths.clone();
@@ -817,9 +840,13 @@ pub(crate) fn observed_generation_until(paths: &Paths, read_by: Instant) -> Resu
             return Err(fail());
         }
         if selection.complete != Some(seal(&selected)?) {
-            return Err(Error::new(
-                "Commons writer succession is still preserving old records",
-            ));
+            // An import that never completed leaves every record where it was; one whose
+            // completion was invalidated may have a successor that authored since, so no home
+            // in this lineage is known to hold the newest records.
+            if completed || selection.complete.is_some() {
+                return Err(preserving());
+            }
+            break;
         }
         selected = candidate(&selected);
     }
@@ -828,14 +855,15 @@ pub(crate) fn observed_generation_until(paths: &Paths, read_by: Instant) -> Resu
 
 /// Observe the generation [`observed_generation_until`] named, under
 /// [`Observation::observe_within`]'s two bounds: each predecessor observed and the chain
-/// complete, as every reader of a successor home must before it reads.
+/// complete, as every reader of a successor home must before it reads
+/// ([`Observation::check_read`]). A writer that observes this way still checks authoring itself.
 pub(crate) fn observe_generation(
     selected: &Paths,
     read_by: Instant,
     wait: &dyn Fn() -> Instant,
 ) -> Result<Observation> {
     let observation = Observation::observe_within(selected, read_by, wait)?;
-    observation.check(true, false, read_by)?;
+    observation.check_read(read_by)?;
     Ok(observation)
 }
 
@@ -1113,8 +1141,15 @@ pub(crate) fn status(paths: &Paths, deadline: Instant) -> Result<(Value, Result<
             tables.push(json!({"table":aterm_codec::hex::encode_lower(&id),
                 "retained_acknowledged":acknowledged, "retained_unconfirmed":unconfirmed}));
         }
-        sources.push(json!({"generation":generation, "source_preserved":true,
-            "import_complete":selection.complete == Some(seal(&source)?), "tables":tables}));
+        let mut reported = json!({"generation":generation, "source_preserved":true,
+            "import_complete":selection.complete == Some(seal(&source)?), "tables":tables});
+        if let Some(why) = statement_refused(&source) {
+            reported
+                .as_object_mut()
+                .expect("a source's report is an object")
+                .insert("statement_refused".into(), json!(why));
+        }
+        sources.push(reported);
         source = candidate(&source);
     }
     if sources.is_empty() {
@@ -1348,7 +1383,13 @@ fn import_until(
 /// custody or tables is held during normal vault network I/O.
 #[cfg(test)]
 fn advance(paths: &Paths, config: &Path) -> Result<Paths> {
-    advance_while(paths, config, &|| false)
+    // A test's pass must finish: it waits the hang detector, never the runtime's own budget
+    // ([`ADVANCE_WITHIN`]), which a loaded machine can outlast with nothing wrong.
+    let budget = Budget {
+        until: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        cancelled: &|| false,
+    };
+    advance_at(paths, config, 0, &budget)
 }
 
 pub(crate) fn advance_while(
@@ -1399,6 +1440,177 @@ fn recovery_required(session: &Session<'_>, reserved: bool) -> Result<bool> {
     Ok(false)
 }
 
+/// Whether writer succession enrolls a successor in `vault` by itself: the default ALab's vault
+/// alone. Other networks keep their existing receive-only recovery path.
+fn enrolls_itself(vault: &client::Config) -> bool {
+    #[cfg(test)]
+    if seams::stands_in_for_alab(vault) {
+        return true;
+    }
+    client::alab_vault(vault)
+}
+
+/// The machine name the successor's seat is admitted under: the original's, as its own plain
+/// ask would have named it.
+fn successor_name(host: &str) -> String {
+    let lower = host.to_ascii_lowercase();
+    if aterm_secrets::text::valid_machine_name(&lower) {
+        lower
+    } else {
+        "machine".to_owned()
+    }
+}
+
+/// End a pending succession with no person (ATERM-KI-1109-1,
+/// `docs/DESIGN-shared-files-2026-11-11.md` section 13, decision 1). The fenced original is
+/// still a current member of its vault. It signs one statement, an [`Allowed`] under its own
+/// device key that names the device key its reserved successor home holds, keeps that statement
+/// beside the fence before anything else is signed, and admits the successor on it through the
+/// vault's membership log ([`client::admit_successor`]); the successor's home then takes the log
+/// bundle as any admitted Mac does. Nothing here authors a Commons record or lifts the fence:
+/// the import and the seal run afterwards exactly as for a successor a person allowed.
+///
+/// What holds it to one lineage:
+/// - the signer is the selection's own original, authorized as every import step authorizes it
+///   (a current writer whose actor is the one the fence recorded), and the successor home is
+///   the one that fence linked;
+/// - the statement names exactly the device the successor home holds, which is a new actor;
+/// - a fenced original names one successor key, once: a kept statement that another key signed
+///   or that names another key (a replayed statement of an older generation, a successor home
+///   whose device changed) admits nothing, and no second statement is signed. Where the kept
+///   statement is gone with the fence (a home restored from a backup), the membership log
+///   holds the same rule: a member whose admission of one successor key it holds signs for no
+///   other ([`client::admit_successor`]).
+///
+/// # Errors
+/// The original is not authorized, the successor home is not this selection's, the kept
+/// statement is another's, or the vault's membership log admits nothing on this pass
+/// ([`client::Succession`]).
+fn admit_by_statement(selection: &Selection, budget: &Budget<'_>) -> Result<()> {
+    let deadline = budget.until;
+    budget.check()?;
+    let original = selection.authorize_until(deadline)?;
+    let next = candidate(&selection.original);
+    if linked(&next)?.is_none_or(|link| link.original != selection.original) {
+        return Err(fail());
+    }
+    client::machine_identity(&next).map_err(crate::table::failure)?;
+    let device = Device::open_until(&next, deadline)
+        .map_err(crate::table::failure)?
+        .ok_or_else(fail)?;
+    let trust = original.trust();
+    let request = device
+        .request(trust.network, trust.authority)
+        .map_err(crate::table::failure)?;
+    let binding = request.binding();
+    if aterm_codec::hex::encode_lower(&binding.actor()) == selection.actor {
+        return Err(Error::new("writer succession cannot reuse the old actor"));
+    }
+    let path = root(&selection.original).join(STATEMENT);
+    let kept = fsx::read_private(&path, MAX_STATE).map_err(crate::table::failure)?;
+    let statement = match kept {
+        Some(bytes) => Allowed::decode(bytes.as_slice()).map_err(|_| fail())?,
+        None => {
+            let host = client::config(&selection.original)
+                .map_err(crate::table::failure)?
+                .ok_or_else(fail)?
+                .host;
+            let statement = original
+                .device()
+                .with_seed(|seed| Allowed::sign(binding, &successor_name(&host), seed))
+                .map_err(crate::table::failure)?;
+            // Kept before the admission is signed: a crash between the two finds this same
+            // key named, and a successor home whose device changed finds another.
+            fsx::write_new(&path, statement.bytes(), 0o600).map_err(crate::table::failure)?;
+            if fsx::read_private(&path, MAX_STATE)
+                .map_err(crate::table::failure)?
+                .as_ref()
+                .map(|kept| kept.as_slice())
+                != Some(statement.bytes())
+            {
+                return Err(fail());
+            }
+            aterm_durable::durable_dir(&root(&selection.original))?;
+            statement
+        }
+    };
+    if !selection
+        .actor
+        .starts_with(&aterm_codec::hex::encode_lower(statement.signer()))
+        || statement.binding() != binding
+    {
+        return Err(Error::new(
+            "writer succession statement names another signer or successor",
+        ));
+    }
+    budget.check()?;
+    let held = client::load_records(&next).map_err(crate::table::failure)?;
+    let reader =
+        Reader::BoundedLog(client::records_bound(&next, &held).map_err(crate::table::failure)?);
+    let succeeding = client::Succeeding {
+        request: &request,
+        statement: &statement,
+        reader,
+        lab: device.lab().is_some(),
+    };
+    let admitted = client::admit_successor(
+        &selection.original,
+        &succeeding,
+        aterm_time::unix_millis().unwrap_or(0),
+        deadline,
+    )
+    .map_err(crate::table::failure)?;
+    let bundle = match admitted {
+        client::Succession::Let { bundle, .. } => bundle,
+        client::Succession::Refused(why) => return Err(Error::new(&why)),
+        client::Succession::Busy => return Err(Error::busy().context("writer succession")),
+        client::Succession::NotHere => {
+            return Err(Error::new(
+                "this member admits nobody through the membership log",
+            ));
+        }
+    };
+    budget.check()?;
+    selection.authorize_until(deadline)?;
+    let bundle = Bundle::decode(bundle.as_slice()).map_err(crate::table::failure)?;
+    client::readmit_from_log_bundle_until(&next, &bundle, deadline)
+        .map_err(crate::table::failure)?;
+    Ok(())
+}
+
+/// Keep, beside the fence of `paths`, why the statement admitted nothing on this pass, or
+/// forget it once it has (`refused` is `None`): what [`status`] reports as `statement_refused`,
+/// so `aterm db commons-status` on a Mac that stays pending names the reason (a full record
+/// budget, a vault read from a path, a freshness read nobody answered, another key named).
+/// Written only when the reason changes. A reason that cannot be kept changes nothing else:
+/// the pass goes on to the plain ask either way.
+fn note_statement(paths: &Paths, refused: Option<&Error>) {
+    let path = root(paths).join(REFUSED);
+    let held = fsx::read_private(&path, MAX_STATE).ok().flatten();
+    match refused {
+        None => {
+            if held.is_some() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Some(error) => {
+            let why = aterm_codec::tty::one_line(&error.to_string(), 512);
+            if held.as_ref().map(|held| held.as_slice()) != Some(why.as_bytes()) {
+                let _ = fsx::write_atomic(&path, why.as_bytes(), 0o600);
+            }
+        }
+    }
+}
+
+/// Why the statement of the fence at `paths` admitted nothing on its last pass, if it did not
+/// ([`note_statement`]).
+fn statement_refused(paths: &Paths) -> Option<String> {
+    let held = fsx::read_private(&root(paths).join(REFUSED), MAX_STATE)
+        .ok()
+        .flatten()?;
+    String::from_utf8(held.as_slice().to_vec()).ok()
+}
+
 fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -> Result<Paths> {
     budget.check()?;
     if depth > MAX_GENERATIONS {
@@ -1424,7 +1636,7 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
         let vault = client::config(paths)
             .map_err(crate::table::failure)?
             .ok_or_else(fail)?;
-        if !client::alab_vault(&vault) || !matches!(vault.source, Source::Url(_)) {
+        if !enrolls_itself(&vault) || !matches!(vault.source, Source::Url(_)) {
             // Other networks keep their existing receive-only recovery path;
             // this automatic enrollment policy belongs only to default ALab.
             return Ok(paths.clone());
@@ -1465,7 +1677,7 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
     let configured = client::config(&next).map_err(crate::table::failure)?;
     if let Some(configured) = &configured
         && (configured.name != original_config.name
-            || !client::alab_vault(configured)
+            || !enrolls_itself(configured)
             || !client::pin_admitted(configured, original_config.signer))
     {
         return Err(fail());
@@ -1477,7 +1689,17 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
                 .membership,
             client::Membership::Pending | client::Membership::Unconfigured
         );
-    if pending {
+    // The fenced original's signed statement admits its successor with no person. Where it
+    // admits nothing on this pass (a vault with no membership log, a busy vault state, a full
+    // record budget) the reason is kept for `status` and the successor still asks plainly,
+    // which a person's Allow answers.
+    let refused = if pending {
+        admit_by_statement(&selection, budget).err()
+    } else {
+        None
+    };
+    note_statement(paths, refused.as_ref());
+    if refused.is_some() {
         let options = client::JoinOptions {
             source: String::new(),
             host: None,
@@ -1491,7 +1713,7 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
         };
         // A lost or expired request is reposted with this same durable identity.
         let _ = client::join_if_unchanged_until(&next, &options, configured.as_ref(), budget.until);
-    } else {
+    } else if !pending {
         // The ordinary pass also syncs membership records and tries verified
         // ALab server candidates when the initially discovered URL is gone.
         let _ = client::sync_reader_until(&next, budget.until);
@@ -1500,7 +1722,7 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
     budget.check()?;
     if let Some(configured) = client::config(&next).map_err(crate::table::failure)?
         && (configured.name != original_config.name
-            || !client::alab_vault(&configured)
+            || !enrolls_itself(&configured)
             || !client::pin_admitted(&configured, original_config.signer))
     {
         return Err(fail());
@@ -1516,44 +1738,8 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
 
 /// Test seams of the generation checks.
 #[cfg(test)]
-pub(crate) mod seams {
-    use std::cell::RefCell;
-
-    /// Where in [`super::Observation::check`] a hook runs, for each predecessor.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum Point {
-        /// Its custody is revalidated; this Mac's standing in its vault is not yet judged.
-        BeforeDenial,
-        /// Its vault does not deny this Mac; the check's access is not yet judged current.
-        BeforeCurrent,
-    }
-
-    /// A hook and the point it waits for.
-    type Hook = (Point, Box<dyn FnMut()>);
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// Run `hook` once this thread's next generation check reaches `point`.
-    pub(crate) fn at(point: Point, hook: impl FnMut() + 'static) {
-        HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
-    }
-
-    pub(super) fn reached(point: Point) {
-        let hook = HOOK.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|(at, _)| *at == point) {
-                slot.take()
-            } else {
-                None
-            }
-        });
-        if let Some((_, mut hook)) = hook {
-            hook();
-        }
-    }
-}
+#[path = "generation_seams_tests.rs"]
+pub(crate) mod seams;
 
 #[cfg(test)]
 mod tests;

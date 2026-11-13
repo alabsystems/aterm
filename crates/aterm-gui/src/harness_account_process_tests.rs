@@ -245,8 +245,7 @@ fn a_pending_move_refreshes_a_snapshot_that_no_longer_matches() {
 #[cfg(target_os = "macos")]
 #[test]
 fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
-    use aterm_uds::spawnfd::{Child, Stdio, command};
-    use std::io::BufRead as _;
+    use aterm_uds::spawnfd::{Child, Stdio};
 
     struct Running(Child);
     impl Drop for Running {
@@ -254,33 +253,12 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
             aterm_uds::deadline::kill_within(&mut self.0, Duration::from_secs(60));
         }
     }
-    let mut cmd = command(std::env::current_exe().unwrap());
-    cmd.args([
-        "harness_host::tests::a_stand_in_agent_when_asked",
-        "--exact",
-    ])
-    .env_clear()
-    .env(STAND_IN_ENV, "1")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    let mut cmd = stand_in_agent();
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut running = Running(cmd.spawn().expect("stand-in"));
-    let stdout = running.0.stdout.take().unwrap();
-    static READY: aterm_uds::deadline::Gate =
-        aterm_uds::deadline::Gate::new("account-process-ready");
-    let ready = READY
-        .run(
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-            move || {
-                std::io::BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok)
-                    .any(|line| line == "ready")
-            },
-        )
-        .expect("stand-in startup");
-    assert!(ready, "stand-in did not report its startup");
+    aterm_uds::deadline::prints(&mut running.0, "ready", aterm_uds::deadline::ECHO_HANG);
 
     let pid = running.0.id();
     let args = atpkg::caller_shell::process_args(pid).expect("stand-in environment");

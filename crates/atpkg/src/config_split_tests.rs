@@ -156,14 +156,14 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
         command.ends_with(&format!(
             "ln -s {} {}",
             super::shell_word(&dots.join("aterm")),
-            super::shell_word(&h.join(".config/aterm"))
+            super::shell_word(&h.join(".config").join("aterm"))
         )),
         "{command}"
     );
     assert!(
         said.contains(&format!(
             "(undo: rm {})",
-            super::shell_word(&h.join(".config/aterm"))
+            super::shell_word(&h.join(".config").join("aterm"))
         )),
         "{said}"
     );

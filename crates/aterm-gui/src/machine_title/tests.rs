@@ -132,6 +132,7 @@ fn the_reader_posts_the_name_and_each_change_it_hears() {
             }
             3 => {
                 join(dir);
+                aterm_agent::fleet_vault::take_fixture(dir, Some(&vault(dir))).unwrap();
                 Heard::Change
             }
             _ => Heard::Ended,
@@ -243,12 +244,58 @@ fn the_watch_hears_a_rename_by_replace_a_vault_made_later_and_a_fleet_key_writte
         was.clone_from(why);
     }
     join(root.path());
+    let keyed = views.recv_timeout(hang).expect("the fleet key heard");
     assert_eq!(
-        views.recv_timeout(hang).expect("the fleet key heard"),
-        view(&first.name, RENAMED, true)
+        (keyed.name.as_str(), keyed.nick.as_str()),
+        (first.name.as_str(), RENAMED)
+    );
+    assert!(
+        matches!(keyed.fleet, InFleet::Paused(_)),
+        "invalid vault custody remains paused"
     );
     drop(watch);
     reader.join().expect("the reader ends with its watch");
+}
+
+/// A take and a damaged custody record change membership without changing the fleet key.
+#[test]
+fn the_watch_hears_custody_pause_and_recovery() {
+    let root = state();
+    join(root.path());
+    let dir = root.path().to_path_buf();
+    let secrets = vault(&dir);
+    let (watch, changes) = watch(&dir, Some(&secrets)).unwrap();
+    let (tell, views) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        read_loop(
+            &dir,
+            Some(&secrets),
+            || Ok(None),
+            |view| tell.send(view).is_ok(),
+            |timeout| heard(&changes, timeout),
+        );
+    });
+    let hang = Duration::from_secs(60);
+    assert!(matches!(
+        views.recv_timeout(hang).unwrap().fleet,
+        InFleet::Paused(_)
+    ));
+    aterm_agent::fleet_vault::take_fixture(root.path(), Some(&vault(root.path()))).unwrap();
+    assert_eq!(views.recv_timeout(hang).unwrap().fleet, InFleet::In);
+    aterm_uds::atomic_file::write(
+        &root.path().join(aterm_net::fleet_member::VAULT_FILE),
+        b"damaged custody\n",
+        0o600,
+    )
+    .unwrap();
+    assert!(matches!(
+        views.recv_timeout(hang).unwrap().fleet,
+        InFleet::Paused(_)
+    ));
+    aterm_agent::fleet_vault::take_fixture(root.path(), Some(&vault(root.path()))).unwrap();
+    assert_eq!(views.recv_timeout(hang).unwrap().fleet, InFleet::In);
+    drop(watch);
+    reader.join().unwrap();
 }
 
 #[test]
@@ -412,6 +459,18 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
 
 #[test]
 fn reading_and_posting_a_snapshot_share_the_same_serial_order() {
+    let mut input_wake = aterm_secrets::client::ConvergenceWake::default();
+    let arm_until = std::time::Instant::now() + Duration::from_secs(60);
+    let input_bell = loop {
+        assert!(
+            std::time::Instant::now() < arm_until,
+            "the input observer could not arm"
+        );
+        match input_wake.arm() {
+            Ok(bell) => break bell,
+            Err(generation) => input_wake.acknowledge(generation),
+        }
+    };
     let root = state();
     let posted = post_read(
         root.path(),
@@ -439,6 +498,10 @@ fn reading_and_posting_a_snapshot_share_the_same_serial_order() {
     )
     .expect("a first read");
     assert!(posted);
+    assert!(
+        input_bell.is_set(),
+        "the actual successful canonical reader retains an input wake"
+    );
 }
 
 #[test]

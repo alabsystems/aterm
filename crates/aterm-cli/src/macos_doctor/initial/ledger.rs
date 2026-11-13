@@ -12,15 +12,26 @@
 //! no press; one that had already begun twice is parked, and the other stages go on. A stage
 //! that runs past [`HANG_LIMIT`] of awake time with no end is parked the same way by the first
 //! reading of the run that sees it ([`Ledger::mark_hung`]), so a wedge, not only a crash, ends
-//! at a calm row; a stage cut off after that counts it as one stop, so it resumes once. Check
-//! again clears every park ([`Ledger::retry`]). A valid newer build with a different exact
-//! commit gives only its owned, unfinished stage a fresh budget; a legacy unattributed budget
-//! may be adopted once ([`Ledger::software_for`]). A quit or an update's handoff in the middle of
+//! at a calm row; a stage cut off after that counts it as one stop, so it resumes once. A park
+//! is a pause, never a hold: it comes due by itself ([`PARK_PAUSE`], [`Ledger::comes_due`]),
+//! longer after each park in a row, and the stage then begins once more, parking again should
+//! aterm stop in it again; the run's worker wakes for it ([`Ledger::park_due`]). Check again
+//! clears every park at once ([`Ledger::retry`]). A valid newer build with a different exact
+//! commit gives only its owned, unfinished stage a fresh budget, its park and pause gone with
+//! it; a legacy unattributed budget may be adopted once ([`Ledger::software_for`]). A quit or an
+//! update's handoff in the middle of
 //! a stage is no crash ([`Ledger::interrupt`]), unless the handoff is refused
 //! ([`Ledger::refused`]); from its note until it goes or is refused, no stage begins
-//! ([`quitting`]), so it cuts off only stages its note names.
+//! ([`quitting`]), so it cuts off only stages its note names. Nor is a restart of the Mac, or a
+//! logout, that ended aterm with no note (its quit cut short, a forced restart, a power loss):
+//! a stage whose begin ran in another known boot resumes without counting that begin
+//! ([`Ledger::recover`]), so only an end within one boot is aterm stopping in it.
 
 use super::*;
+
+#[path = "ledger_history.rs"]
+mod history;
+pub use history::{DisplayHistory, LastRead, SetupHistoryStore};
 
 /// The ledger's file, beside the progress record rather than in it: the progress record is
 /// read and written whole by every setup path and by an older aterm, which drops a field it
@@ -35,6 +46,15 @@ const LEDGER_LOCK: &str = "setup-ledger.lock";
 
 /// The format this build writes in the ledger's `format`: a later one is a newer aterm's.
 pub(super) const LEDGER_FORMAT: u64 = 2;
+
+/// How long a parked stage waits before it begins again by itself, after the park that is the
+/// `n`th in a row since it last ended: an hour after the first, so a stage that stops aterm costs
+/// a stop an hour at most, twice as long after each later park, and never more than a day.
+pub(super) const PARK_PAUSE: aterm_types::retry_schedule::Backoff =
+    aterm_types::retry_schedule::Backoff::new(
+        std::time::Duration::from_secs(60 * 60),
+        std::time::Duration::from_secs(24 * 60 * 60),
+    );
 
 /// How long a stage may run with no end before the run's next reading parks it: twice the
 /// longest budget any one step of a stage keeps (a GitHub clone's 30 minutes), so a step that
@@ -145,6 +165,19 @@ pub(super) struct Attempt {
     /// The profile.lock hold its latest begin ran under ([`Stamp::run`]); 0 when that could not
     /// be read, or an older aterm began it.
     pub(super) run: u128,
+    /// Parks in a row since it last ended or Check again cleared it: the next park's pause
+    /// grows with it ([`PARK_PAUSE`]).
+    pub(super) parks: u8,
+    /// When its latest park was set, in seconds since the epoch.
+    pub(super) parked: u64,
+}
+
+impl Attempt {
+    /// A park set at `now`: one more in a row, its pause counted from `now`.
+    fn parked_at(&mut self, now: u64) {
+        self.parks = self.parks.saturating_add(1);
+        self.parked = now;
+    }
 }
 
 /// What a begin records of the pass that makes it ([`Ledger::begin`]).
@@ -177,6 +210,9 @@ pub(super) struct Ledger {
     /// The running stages a quit or an update's handoff cut off: no crash.
     pub(super) quit: u16,
     pub(super) attempts: [Attempt; STAGES],
+    /// A person pressed Check again since the run's last pass began: that pass starts every
+    /// other automatic try of the run afresh ([`Self::take_afresh`]), under profile.lock.
+    pub(super) afresh: bool,
     /// Each stage owns its budget's attribution; a scoped pass cannot spend a sibling's epoch.
     pub(super) software: [Software; STAGES],
 }
@@ -194,7 +230,7 @@ pub(super) enum Admit {
     Quitting,
 }
 
-/// Why a stage waits for Check again.
+/// Why a stage waits out a pause before it begins again ([`PARK_PAUSE`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Park {
     /// aterm stopped twice while it ran.
@@ -280,10 +316,21 @@ pub(super) enum Defect {
     BeginIgnoresQuit,
     /// [`Ledger::recover`] resumes a stage aterm stopped in twice.
     RecoverNeverParks,
+    /// [`Ledger::recover`] parks a stage with no pause to come due: the hold only a person's
+    /// Check again lifted.
+    ParkWithoutDue,
+    /// [`Ledger::recover`] counts a stage the Mac restarted under as one aterm stopped in.
+    RestartCountsAsCrash,
     /// [`Ledger::refused`] leaves the notes of the handoff it takes back.
     RefusalKeepsNotes,
-    /// [`super::kept::Kept::hold`] leaves out a key the person changed.
+    /// [`super::kept::Kept::hold`] leaves out a kept key.
     HoldForgetsKept,
+    /// [`super::resume::owes`] reads a run as owing no pass, so its login job goes before it
+    /// finishes.
+    NothingOwed,
+    /// [`super::kept::Kept::hold`] leaves the first change after a read-back as it is, as if
+    /// whoever made it had chosen it: the key is kept with no try again.
+    KeepsFirstChange,
 }
 
 #[cfg(test)]
@@ -323,7 +370,7 @@ impl Ledger {
         self.attempts[Self::index(stage)]
     }
 
-    /// Why `stage` waits for Check again, if it does.
+    /// Why `stage` waits out a park, if it does.
     pub(super) const fn parked(&self, stage: Stage) -> Option<Park> {
         if self.hung & stage.bit() != 0 {
             Some(Park::Hung)
@@ -415,7 +462,8 @@ impl Ledger {
 
     /// Begin `stage`, as `stamp` says, unless aterm is quitting `root`'s setup (the process's
     /// latch, [`quitting`], which this reads itself, under the ledger's lock), the run's progress
-    /// has it `done` or it is parked: each begin counts.
+    /// has it `done`, or it is parked and its pause has not come due at `stamp` (one that has is
+    /// lifted, [`Self::comes_due`]): each begin counts.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -432,6 +480,22 @@ impl Ledger {
             project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "BeginDueA",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "BeginDueB",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
     pub(super) fn begin(&mut self, stage: Stage, done: u16, stamp: Stamp, root: &Path) -> Admit {
         if !planted(Defect::BeginIgnoresQuit) && quitting(root) {
             return Admit::Quitting;
@@ -439,9 +503,12 @@ impl Ledger {
         if done & stage.bit() != 0 && !planted(Defect::BeginIgnoresDone) {
             return Admit::Done;
         }
+        // A newer build's fresh budget first: it lifts the park outright, so the stage begins
+        // as any first begin does; else a park whose pause has passed comes due.
         if stamp.software.is_some() {
             self.software_for(stage, done, stamp.software, root);
         }
+        self.comes_due(stage, stamp.at);
         if let Some(park) = self.parked(stage)
             && !planted(Defect::BeginIgnoresPark)
         {
@@ -501,8 +568,8 @@ impl Ledger {
         self.attempts[Self::index(stage)] = Attempt::default();
     }
 
-    /// Park `stage` as hung, if it still runs the begin of `at` and is not parked already.
-    /// Whether that changed the ledger.
+    /// Park `stage` as hung at `now`, if it still runs the begin of `at` and is not parked
+    /// already. Whether that changed the ledger.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -519,17 +586,49 @@ impl Ledger {
             project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
         )
     )]
-    pub(super) fn mark_hung(&mut self, stage: Stage, at: u64) -> bool {
+    pub(super) fn mark_hung(&mut self, stage: Stage, at: u64, now: u64) -> bool {
         let bit = stage.bit();
         if self.running & bit == 0 || self.hung & bit != 0 || self.attempt(stage).at != at {
             return false;
         }
         self.hung |= bit;
+        self.attempts[Self::index(stage)].parked_at(now);
         true
     }
 
-    /// A person pressed Check again: every park is lifted and every stage's begins start from
-    /// none. Whether that changed the ledger.
+    /// When `stage`'s park comes due ([`PARK_PAUSE`]), in seconds since the epoch, read at `now`:
+    /// at once for a park set after `now`, the clock set back since, as a pause that cannot be
+    /// measured ([`aterm_types::retry_schedule::Backoff::due_by`]); `None` when it is not parked,
+    /// or is parked with no pause, which nothing but a press would lift.
+    pub(super) fn park_due(&self, stage: Stage, now: u64) -> Option<u64> {
+        let attempt = self.attempt(stage);
+        self.parked(stage)
+            .filter(|_| attempt.parks > 0)
+            .map(|_| PARK_PAUSE.due_by(attempt.parked, u32::from(attempt.parks), now))
+    }
+
+    /// `stage`'s park came due at `now` ([`Self::park_due`]), with no press: it is lifted, and the
+    /// begin that asked ([`Self::begin`]) is the stage's last before another stop parks it again,
+    /// for longer. A stage still running, or one whose pause is still ahead, stays as it is.
+    /// Whether that changed the ledger.
+    fn comes_due(&mut self, stage: Stage, now: u64) -> bool {
+        let bit = stage.bit();
+        let Some(due) = self.park_due(stage, now) else {
+            return false;
+        };
+        let attempt = &mut self.attempts[Self::index(stage)];
+        if self.running & bit != 0 || now < due {
+            return false;
+        }
+        self.crashed &= !bit;
+        self.hung &= !bit;
+        attempt.began = 1;
+        true
+    }
+
+    /// A person pressed Check again: every park is lifted, every stage's begins and parks start
+    /// from none, and the run's next pass starts every other automatic try afresh
+    /// ([`Self::afresh`]). Whether that changed the ledger.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -544,7 +643,10 @@ impl Ledger {
         self.hung = 0;
         for attempt in &mut self.attempts {
             attempt.began = 0;
+            attempt.parks = 0;
+            attempt.parked = 0;
         }
+        self.afresh = true;
         for software in &mut self.software {
             if *software == Software::Unread {
                 *software = Software::Unattributed;
@@ -553,9 +655,18 @@ impl Ledger {
         *self != before
     }
 
-    /// aterm is quitting, or an update's handoff is about to write its Commit: the stages
-    /// running now are cut off by no crash, so the next launch resumes them without counting
-    /// this begin. Whether that changed the ledger.
+    /// Whether a person pressed Check again since a pass last took it, which this takes: the
+    /// pass that holds profile.lock then starts the run's other automatic tries afresh.
+    pub(super) fn take_afresh(&mut self) -> bool {
+        std::mem::take(&mut self.afresh)
+    }
+
+    /// aterm is quitting, or an update's handoff is about to write its Commit, in the process
+    /// `process`: the stages it runs now are cut off by no crash, so the next launch resumes them
+    /// without counting this begin. A stage another process began (the login job's, while a
+    /// window quits, or a window's while the job is stopped) is left as it is: should that one
+    /// stop in it with no note, it counts. A begin that names no hold (an older aterm's, or a
+    /// mark that could not be read) is taken as this process's. Whether that changed the ledger.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -564,14 +675,28 @@ impl Ledger {
             project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
         )
     )]
-    pub(super) fn interrupt(&mut self) -> bool {
+    pub(super) fn interrupt(&mut self, process: u32) -> bool {
         let before = self.quit;
-        self.quit |= self.running;
+        self.quit |= self.running & self.begun_by(process);
         self.quit != before
     }
 
-    /// The handoff that noted the stages it would cut off ([`Self::interrupt`]) did not go:
-    /// aterm goes on, so aterm stopping in one of them later is a crash again, which counts.
+    /// The stages whose last begin ran under a profile.lock hold of the process `process`
+    /// ([`hold_process`]), or under no hold a mark names (an older aterm's begin, a mark that
+    /// could not be read), which every process takes as its own.
+    fn begun_by(&self, process: u32) -> u16 {
+        Stage::ALL
+            .into_iter()
+            .filter(|stage| {
+                let run = self.attempt(*stage).run;
+                run == 0 || hold_process(run) == process
+            })
+            .fold(0, |bits, stage| bits | stage.bit())
+    }
+
+    /// The handoff that noted the stages it would cut off ([`Self::interrupt`]) in the process
+    /// `process` did not go: aterm goes on, so aterm stopping in one of them later is a crash
+    /// again, which counts. Another process's notes stay (the login job's, as a logout ends it).
     /// Whether that changed the ledger.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -581,22 +706,33 @@ impl Ledger {
             project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
         )
     )]
-    pub(super) fn refused(&mut self) -> bool {
+    pub(super) fn refused(&mut self, process: u32) -> bool {
         if planted(Defect::RefusalKeepsNotes) {
             return false;
         }
         let before = self.quit;
-        self.quit = 0;
+        self.quit &= !self.begun_by(process);
         self.quit != before
     }
 
-    /// The first pass after aterm stopped, holding profile.lock, so whatever the ledger or the
-    /// progress record (`legacy`, what an older aterm or a cut-off write left) records running
-    /// was cut off: a stage the progress has `done` is spent, one a quit cut off gives its
-    /// begin back, and any other counts its begin and parks once it began twice. A stage a
-    /// reading parked as hung while it ran counts as stopped in, quit or not: its hung park goes,
-    /// so it resumes once with no press, and parks the second time. Nothing is running after.
-    /// Whether that changed the ledger.
+    /// The first pass after aterm stopped (the login job's, or a window's), holding profile.lock at
+    /// `now` in the Mac's boot `boot` (where read), so whatever the ledger or the progress record
+    /// (`legacy`, what an older aterm or a cut-off write left) records running was cut off: a stage
+    /// the progress has `done` is spent; one a quit cut off, or one whose begin ran in another boot
+    /// than `boot` (the Mac restarted, or its account logged out, under it: an interruption,
+    /// however aterm ended), gives its begin back; and any other counts its begin and parks once it
+    /// began twice, its pause counted from `now`. A boot that cannot be read, now or at the begin,
+    /// tells no restart. A stage a reading parked as hung while it ran counts as stopped in, quit
+    /// or restart or not: its hung park goes, so it resumes once with no press, and parks the
+    /// second time. Nothing is running after. Whether that changed the ledger.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "Login",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -605,24 +741,29 @@ impl Ledger {
             project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
         )
     )]
-    pub(super) fn recover(&mut self, done: u16, legacy: Option<Stage>) -> bool {
-        self.recover_scoped(done, legacy, u16::MAX)
-    }
-
-    pub(super) fn recover_scoped(&mut self, done: u16, legacy: Option<Stage>, scope: u16) -> bool {
+    pub(super) fn recover(
+        &mut self,
+        done: u16,
+        legacy: Option<Stage>,
+        boot: Option<u128>,
+        now: u64,
+    ) -> bool {
         let before = *self;
-        let recorded = (self.running | legacy.map_or(0, Stage::bit)) & scope;
+        let recorded = self.running | legacy.map_or(0, Stage::bit);
         for stage in Stage::ALL {
             let bit = stage.bit();
             if recorded & bit == 0 {
                 continue;
             }
             let attempt = &mut self.attempts[Self::index(stage)];
+            let restarted = attempt.boot != 0
+                && boot.is_some_and(|boot| boot != attempt.boot)
+                && !planted(Defect::RestartCountsAsCrash);
             if done & bit != 0 {
                 *attempt = Attempt::default();
                 self.crashed &= !bit;
                 self.hung &= !bit;
-            } else if self.quit & bit != 0 && self.hung & bit == 0 {
+            } else if (self.quit & bit != 0 || restarted) && self.hung & bit == 0 {
                 attempt.began = attempt.began.saturating_sub(1);
             } else {
                 // Parked as hung while it ran: the park says so again should it stop a second
@@ -636,11 +777,14 @@ impl Ledger {
                     } else {
                         self.crashed |= bit;
                     }
+                    if !planted(Defect::ParkWithoutDue) {
+                        attempt.parked_at(now);
+                    }
                 }
             }
         }
-        self.running &= !scope;
-        self.quit &= !scope;
+        self.running = 0;
+        self.quit = 0;
         *self != before
     }
 
@@ -688,7 +832,9 @@ impl Ledger {
                 Verdict::Running
             };
         }
-        if self.quit & bit == 0 && attempt.began.max(1) >= 2 {
+        // Cut off by a quit, or by a restart (its begin ran in another known boot): it resumes,
+        // as the next pass's recovery gives it its begin back ([`Self::recover`]).
+        if self.quit & bit == 0 && same_boot && attempt.began.max(1) >= 2 {
             Verdict::Parked(Park::Crashed)
         } else {
             Verdict::Resuming { running: false }
@@ -723,6 +869,8 @@ impl Ledger {
                     "at": attempt.at,
                     "awake": attempt.awake,
                     "run": format!("{:032x}", attempt.run),
+                    "parks": attempt.parks,
+                    "parked": attempt.parked,
                 })
             })
             .collect();
@@ -734,6 +882,7 @@ impl Ledger {
             "crashed": self.crashed,
             "hung": self.hung,
             "quit": self.quit,
+            "afresh": self.afresh,
             "stages": stages,
             "software": self.software.iter().map(|software| software.record()).collect::<Vec<_>>(),
         })
@@ -762,6 +911,11 @@ impl Ledger {
             hung: bits("hung")?,
             quit: bits("quit")?,
             attempts: [Attempt::default(); STAGES],
+            // A field an older aterm's ledger has not: no press waits.
+            afresh: match value.get("afresh") {
+                None | Some(Value::Null) => false,
+                Some(afresh) => afresh.as_bool().ok_or(Unread::Damaged)?,
+            },
             software: [Software::Unread; STAGES],
         };
         if value["format"].as_u64() == Some(1) && value.get("software").is_none() {
@@ -805,6 +959,19 @@ impl Ledger {
                         .and_then(|run| u128::from_str_radix(run, 16).ok())
                         .ok_or(Unread::Damaged)?,
                 },
+                // An older aterm's park kept no pause: it reads as one park, set at no time, so it
+                // comes due at once and is never a hold.
+                parks: match entry.get("parks") {
+                    None => 1,
+                    Some(parks) => parks
+                        .as_u64()
+                        .and_then(|parks| u8::try_from(parks).ok())
+                        .ok_or(Unread::Damaged)?,
+                },
+                parked: match entry.get("parked") {
+                    None => 0,
+                    Some(parked) => parked.as_u64().ok_or(Unread::Damaged)?,
+                },
             };
         }
         Ok(ledger)
@@ -829,26 +996,26 @@ pub(super) struct Loaded {
     pub(super) frozen: bool,
 }
 
-/// `revision`'s ledger: empty for a ledger of another revision (a newer aterm's among them,
-/// which is stale as any other's and written over once this run's changes), a damaged one,
-/// none, or one a newer aterm wrote of this revision or of none it names (then
-/// [`Loaded::frozen`]).
-pub(super) fn load(root: &Path, revision: u64) -> Loaded {
-    let read = match crate::macos_doctor::read_record_bytes(&root.join(LEDGER)) {
-        Ok(bytes) => match aterm_json::from_slice::<Value>(&bytes) {
-            Ok(value) => match Ledger::parse(&value) {
-                Err(Unread::Newer)
-                    if value["revision"].as_u64().is_some_and(|of| of != revision) =>
-                {
-                    Ok(None)
-                }
-                read => read.map(Some),
-            },
-            Err(_) => Err(Unread::Damaged),
-        },
+fn read_value(root: &Path) -> Result<Option<Value>, Unread> {
+    match crate::macos_doctor::read_record_bytes(&root.join(LEDGER)) {
+        Ok(bytes) => aterm_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| Unread::Damaged),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(Unread::Damaged),
-    };
+    }
+}
+
+fn loaded(value: Result<Option<&Value>, Unread>, revision: u64) -> Loaded {
+    let read = value.and_then(|value| match value {
+        Some(value) => match Ledger::parse(value) {
+            Err(Unread::Newer) if value["revision"].as_u64().is_some_and(|of| of != revision) => {
+                Ok(None)
+            }
+            read => read.map(Some),
+        },
+        None => Ok(None),
+    });
     match read {
         Ok(Some(ledger)) if ledger.revision == revision => Loaded {
             ledger,
@@ -868,6 +1035,18 @@ pub(super) fn load(root: &Path, revision: u64) -> Loaded {
     }
 }
 
+/// `revision`'s ledger: empty for a ledger of another revision (a newer aterm's among them,
+/// which is stale as any other's and written over once this run's changes), a damaged one,
+/// none, or one a newer aterm wrote of this revision or of none it names (then
+/// [`Loaded::frozen`]).
+pub(super) fn load(root: &Path, revision: u64) -> Loaded {
+    let value = read_value(root);
+    loaded(
+        value.as_ref().map(Option::as_ref).map_err(|why| *why),
+        revision,
+    )
+}
+
 /// Apply `change` to `revision`'s ledger under its short lock, and save it when that changed
 /// it, unless a newer aterm wrote the file ([`Loaded::frozen`]): then `change` sees an empty
 /// ledger, and the file is left as it is.
@@ -880,18 +1059,27 @@ pub(super) fn update<T>(
     change: impl FnOnce(&mut Ledger) -> T,
 ) -> Result<T, String> {
     let _lock = HeldLock::take_named(root, LEDGER_LOCK)?;
-    let Loaded { mut ledger, frozen } = load(root, revision);
+    let value = read_value(root);
+    let Loaded { mut ledger, frozen } = loaded(
+        value.as_ref().map(Option::as_ref).map_err(|why| *why),
+        revision,
+    );
     let before = ledger;
     let out = change(&mut ledger);
     if !frozen && ledger != before {
-        write_json(&root.join(LEDGER), &ledger.record())?;
+        let mut record = ledger.record();
+        history::preserve(value.as_ref().ok().and_then(Option::as_ref), &mut record);
+        write_json(&root.join(LEDGER), &record)?;
     }
     Ok(out)
 }
 
 /// A stage begun in the ledger, which ends it there when the pass leaves the stage by an error
 /// before its end is recorded ([`Self::ended`]): an error is the stage's failure, not aterm
-/// stopping. A panic leaves it running, as aterm stopping there would.
+/// stopping. A panic leaves it running, as aterm stopping there would: the worker's supervisor
+/// starts the run's worker again after a pause, and that pass's recovery counts the stage as one
+/// aterm stopped in, so a stage that keeps panicking parks with its own pause while the others go
+/// on, rather than failing over and over at once.
 pub(super) struct Begun<'r> {
     root: &'r Path,
     revision: u64,
@@ -931,8 +1119,8 @@ impl Drop for Begun<'_> {
 
 /// The ledger of the run `progress` records, for a reading of the run taken as `live` says: a
 /// stage a live process has run past the hang limit is parked by the first reading that sees it,
-/// a mark that outlives the process, so the next launch leaves the stage parked and runs the
-/// others. An empty ledger for no progress.
+/// a mark that outlives the process, so the next launch leaves the stage parked until its pause
+/// comes due and runs the others. An empty ledger for no progress.
 pub(super) fn read_marking_hung(root: &Path, progress: Option<Progress>, live: Live) -> Ledger {
     let Some(progress) = progress else {
         return Ledger::default();
@@ -943,13 +1131,25 @@ pub(super) fn read_marking_hung(root: &Path, progress: Option<Progress>, live: L
         if verdict == Verdict::Overdue
             && let Some(at) = ledger.overdue(stage, live)
             && let Ok(true) = update(root, progress.revision, |ledger| {
-                ledger.mark_hung(stage, at)
+                ledger.mark_hung(stage, at, live.now)
             })
         {
-            ledger.mark_hung(stage, at);
+            ledger.mark_hung(stage, at, live.now);
         }
     }
     ledger
+}
+
+/// When each parked, unfinished stage of the run `progress` records comes due, read at `now`
+/// ([`Ledger::park_due`]): what the run's worker sets its timer by. None for a ledger a newer
+/// aterm wrote, which this build's passes do not begin from.
+pub(super) fn park_dues(root: &Path, progress: Progress, now: u64) -> Vec<u64> {
+    let ledger = read(root, Some(progress));
+    Stage::ALL
+        .iter()
+        .filter(|stage| progress.done & stage.bit() == 0)
+        .filter_map(|stage| ledger.park_due(*stage, now))
+        .collect()
 }
 
 /// The ledger of the run `progress` records, as it stands: [`read_marking_hung`] for a reader
@@ -962,7 +1162,8 @@ pub(super) fn read(root: &Path, progress: Option<Progress>) -> Ledger {
 }
 
 /// A person pressed Check again: lift every parked stage of the current run, so its next pass
-/// runs them. Nothing for a run with no progress or a ledger a newer aterm wrote.
+/// runs them, and have that pass start the run's other automatic tries afresh
+/// ([`Ledger::take_afresh`]). Nothing for a run with no progress or a ledger a newer aterm wrote.
 ///
 /// # Errors
 /// The run's progress cannot be read, or its ledger cannot be saved.
@@ -1010,11 +1211,11 @@ pub(super) fn relaunched(root: &Path) {
     set_quitting(root, false);
 }
 
-/// aterm is quitting, or an update's handoff is about to write its Commit: the stages running
-/// now resume at the next launch without counting as a crash, and no stage begins from now in
-/// this process ([`quitting`]). The latch goes first, then the note under the ledger's lock: a
-/// begin, which reads the latch under that lock, either ran before the note, which then names
-/// its stage, or sees the latch and does not begin.
+/// aterm is quitting, or an update's handoff is about to write its Commit: the stages this
+/// process runs now resume at the next launch without counting as a crash, and no stage begins
+/// from now in this process ([`quitting`]). The latch goes first, then the note under the
+/// ledger's lock: a begin, which reads the latch under that lock, either ran before the note,
+/// which then names its stage, or sees the latch and does not begin.
 ///
 /// # Errors
 /// The run's progress cannot be read, or its ledger cannot be saved.
@@ -1023,7 +1224,15 @@ pub(super) fn interrupt_at(root: &Path) -> Result<bool, String> {
     let Some(progress) = progress(root)? else {
         return Ok(false);
     };
-    update(root, progress.revision, Ledger::interrupt)
+    update(root, progress.revision, |ledger| {
+        ledger.interrupt(std::process::id())
+    })
+}
+
+/// The process whose profile.lock hold wrote the mark `run` ([`Stamp::run`]): each hold's mark
+/// carries its process id in its top 32 bits.
+pub(super) fn hold_process(run: u128) -> u32 {
+    u32::try_from(run >> 96).unwrap_or(u32::MAX)
 }
 
 /// The handoff that noted the stages it would cut off ([`interrupt_at`]) did not go: those
@@ -1035,7 +1244,7 @@ pub(super) fn interrupt_at(root: &Path) -> Result<bool, String> {
 pub(super) fn refused_at(root: &Path) -> Result<bool, String> {
     let taken = progress(root).and_then(|progress| match progress {
         Some(progress) => update(root, progress.revision, |ledger| {
-            let taken = ledger.refused();
+            let taken = ledger.refused(std::process::id());
             set_quitting(root, false);
             taken
         }),
@@ -1045,20 +1254,17 @@ pub(super) fn refused_at(root: &Path) -> Result<bool, String> {
     taken
 }
 
-/// The words a parked stage's row says.
+/// The words a parked stage's row says: why, then that aterm tries it again by itself.
 pub(super) fn parked_words(stage: Stage, park: Park) -> String {
     match park {
-        Park::Crashed => format!("Stopped twice while {}; {HELD_TAIL}", gerund(stage)),
+        Park::Crashed => format!("Stopped twice while {}; {PARKED_TAIL}", gerund(stage)),
         Park::Hung => format!("Took over an hour {}; {PARKED_TAIL}", gerund(stage)),
     }
 }
 
-/// How a hung stage's words end, which System State reads them by: it checks again by itself.
+/// How a parked stage's words end, which System State reads them by: the park comes due by
+/// itself ([`PARK_PAUSE`]), or at once on Check again.
 const PARKED_TAIL: &str = aterm_types::macos_setup::StageRow::PARKED_TAIL;
-
-/// How a crashed stage's words end: the park guards against a stage that stops aterm, so only
-/// Check again lifts it.
-const HELD_TAIL: &str = aterm_types::macos_setup::StageRow::HELD_TAIL;
 
 /// The words the row of a stage still running past the hang limit says ([`Verdict::Overdue`]):
 /// it ends by itself or when aterm quits, and no Check again.
@@ -1088,10 +1294,11 @@ const fn gerund(stage: Stage) -> &'static str {
     }
 }
 
-/// The `SetupLedger` actions the setup run does not perform, named where the whole-source
-/// closure (aterm-models' `spec_xref_closure`) collects them: the environment's crash and the
-/// model's `Buggy=1` mutants, which the conformance test's negative control replays. A
-/// waiver in the test module would compile into that test alone, never into the closure.
+/// The `SetupLedger` and `SetupKeptKey` actions the setup run does not perform, named where the
+/// whole-source closure (aterm-models' `spec_xref_closure`) collects them: the environment's
+/// crash, quit and reboot, and the models' `Buggy=1` mutants, which the conformance test's
+/// negative control replays. A waiver in the test module would compile into that test alone,
+/// never into the closure.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -1099,6 +1306,16 @@ const fn gerund(stage: Stage) -> &'static str {
         action = "Crash",
         reason = "The environment: the process ends mid-stage (a crash, a kill, a power loss), \
                   leaving what it recorded; profile.lock's flock goes with it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupLedger",
+        action = "Reboot",
+        reason = "The environment: the Mac restarts or logs out and the process ends with it, \
+                  leaving what it recorded; the next launch's `recover` reads the new boot \
+                  against the begin's `kern.bootsessionuuid`."
     )
 )]
 #[cfg_attr(
@@ -1160,9 +1377,57 @@ const fn gerund(stage: Stage) -> &'static str {
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "SetupLedger",
+        action = "RelaunchParksForGood",
+        reason = "The Buggy=1 mutant: a relaunch that parks a stage with no pause to come due, \
+                  the hold only a person's Check again lifted; planted in `recover` by the \
+                  negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupLedger",
+        action = "RelaunchCountsRestart",
+        reason = "The Buggy=1 mutant: a relaunch after the Mac restarted that counts the stage \
+                  the restart cut off as aterm stopping in it, so a restart parks it as a second \
+                  stop would; planted in `recover` by the negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupKeptKey",
         action = "ApplyKept",
-        reason = "The Buggy=1 mutant: an unattended pass that writes a key the person changed; \
-                  planted in `Kept::hold` by the negative control."
+        reason = "The Buggy=1 mutant: an unattended pass that writes a kept key; planted in \
+                  `Kept::hold` by the negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupKeptKey",
+        action = "KeepAnyDrift",
+        reason = "The Buggy=1 mutant: an unattended pass that keeps the first change after a \
+                  read-back, with no try again; planted in `Kept::hold` by the negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupKeptKey",
+        action = "OtherWriterChanges",
+        reason = "The environment: something other than aterm (the person, an app, an \
+                  installer, macOS) changes a key aterm set; nothing records who, and no code \
+                  step runs until the next pass reads it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SetupLedger",
+        action = "DisarmWhileOwed",
+        reason = "The Buggy=1 mutant: a save that reads an unfinished run as owing nothing and \
+                  removes its login job; planted in `resume::owes` by the negative control."
     )
 )]
 #[doc(hidden)]

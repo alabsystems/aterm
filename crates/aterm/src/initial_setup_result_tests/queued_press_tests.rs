@@ -39,6 +39,41 @@ fn a_choice_that_finds_the_records_held_waits_from_that_moment() {
     assert_eq!(queued_mark(), 0, "an admitted choice waits for nothing");
 }
 
+/// A STOP LETS GO OF A CHOICE WAITING FOR ANOTHER SETUP, THROUGH THE WORKER'S OWN WAIT: nothing else
+/// ends that wait while the setup stays up, and the wait holds every update. Each step after the
+/// receipt's answer happens in order on the worker, so those are waits. NEGATIVE CONTROL: with no
+/// Stop the choice goes when the other setup lets go of the claim.
+#[test]
+fn a_stop_lets_go_of_a_choice_waiting_for_the_claim() {
+    let _globals = globals();
+    for stopped in [true, false] {
+        let _io = TestIo::install();
+        change(|script| script.admits = [Some(5)].into());
+        let root = CLAIM_ROOT.lock().unwrap().clone().unwrap();
+        let held = aterm_cli::macos_doctor::claim_initial_setup_rerun_at(&root)
+            .unwrap()
+            .unwrap();
+        let (receipt, accepted) = aterm_gui::InitialSetupApplyReceipt::detached(true);
+        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
+        wait_until("the choice waits for the claim", || queued_mark() != 0);
+        if stopped {
+            // Nothing is registered, so its answer says nothing here.
+            let _ = stop_initial_setup();
+            assert_eq!(accepted.recv_timeout(HANG), Ok(false));
+            wait_until("the choice lets go of the slot", || {
+                take_initial_setup_slot().is_some() && queued_mark() == 0
+            });
+            assert!(script().runs.is_empty(), "{:?}", script().runs);
+            assert_eq!(script().persists, 0);
+            drop(held);
+        } else {
+            drop(held);
+            assert_eq!(accepted.recv_timeout(HANG), Ok(true));
+            wait_until("the choice's run starts", || script().runs == [5]);
+        }
+    }
+}
+
 /// Lets the stand-in Restore's other setup go when dropped, so a Restore that is never let go
 /// still ends.
 struct OtherSetup(Arc<AtomicBool>);

@@ -561,7 +561,7 @@ fn spent_usage() -> Reading {
     })
 }
 
-/// The owner's rule at a launch: `work` is never asked about while `main` serves, and the read is
+/// The rule at a launch: `work` is never asked about while `main` serves, and the read is
 /// reported with its row and why. CONTROL: `a_read_that_shows_a_wall_...` below reads `work` once
 /// `main` cannot serve, so the silence here is the rule and not a reader that never reaches it.
 #[test]

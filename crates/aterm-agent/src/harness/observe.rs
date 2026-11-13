@@ -21,7 +21,7 @@
 //! [`Observation::KeyOnly`]; a process routed past any account of its own is
 //! [`Observation::Routed`]; none of them changes the belief.
 
-use super::accounts::{AuthRoute, Cli, ProcessLogin, Reconciled, Roster, Row, TokenEntry};
+use super::accounts::{AuthRoute, Cli, ProcessLogin, Reconciled, Roster, TokenEntry};
 use super::journal::{
     self, LoginState, Note, ObservedCli, ObservedLogin, ObservedSrc, SeenWhy, Tab,
 };
@@ -248,51 +248,6 @@ impl Login {
     pub fn name(&self, roster: &Roster) -> Option<String> {
         super::accounts::account_name(roster, &self.who, &self.seen)
     }
-}
-
-/// One place on this Mac a CLI keeps a login: the default home, or a roster row's directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Place<'a> {
-    /// The roster row that names this place, the belief; `None` for the default home where no
-    /// row names it.
-    pub row: Option<&'a Row>,
-    /// The place as a process started on it holds it.
-    pub login: Login,
-}
-
-/// Every login place `roster` names for `cli` on this Mac, each as its file holds it now: the
-/// default home first where no row names it, then each row's. Claude Code's are read
-/// ([`Login::claude`], as a stored login: a place is a file); another CLI's has no observer yet
-/// and is [`Observation::Unread`], as every place is with no `user_home`.
-#[must_use]
-pub fn places<'a>(cli: Cli, roster: &'a Roster, user_home: Option<&Path>) -> Vec<Place<'a>> {
-    let place = |row: Option<&'a Row>| {
-        let dir = row
-            .and_then(|row| row.dir.as_deref())
-            .filter(|dir| !dir.is_empty());
-        let login = if cli == Cli::Claude {
-            let env: Vec<String> = dir
-                .map(|dir| format!("{}={dir}", super::accounts::LOGIN_ENV))
-                .into_iter()
-                .collect();
-            Login::claude(&env, user_home, roster)
-        } else {
-            Login {
-                who: ProcessLogin {
-                    login: dir.map(str::to_owned),
-                    default_home: true,
-                    route: AuthRoute::Stored,
-                },
-                seen: Observation::Unread,
-            }
-        };
-        Place { row, login }
-    };
-    let default = roster.row_for_login(None).is_none().then(|| place(None));
-    default
-        .into_iter()
-        .chain(roster.rows.iter().map(|row| place(Some(row))))
-        .collect()
 }
 
 /// A CLI process as its observer reads it: its argv, its kernel exec environment (`KEY=value`)

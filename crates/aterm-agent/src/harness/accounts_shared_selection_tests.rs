@@ -361,11 +361,45 @@ const RUNS_HANDED: usize = 1;
 #[cfg(not(unix))]
 const RUNS_HANDED: usize = 0;
 
+/// Upkeep resumes the saved selection before any other sign-in. On Unix its worker retires
+/// it for its shared custody; elsewhere the manual sign-in queue's refusal retires it first,
+/// since that platform can never run it. Either way the selection is gone and the woken
+/// upkeep is free for the other account.
 #[test]
 fn retiring_a_shared_selection_wakes_a_settled_upkeep_for_another_account() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
     let before = bed.store.load_logins(NOW).unwrap().0.shared;
+    assert_eq!(progress(&bed), (true, RUNS_HANDED));
+    assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
+    assert_eq!(bed.store.load_logins(NOW).unwrap().0.shared, before);
+}
+
+/// The negative control of the retirement above, on every platform: a refusal that may pass
+/// next time (here the upkeep could not start the selection's worker) keeps the selection
+/// for a later upkeep, which then settles it.
+#[test]
+fn a_selection_whose_worker_could_not_start_waits_for_a_later_upkeep() {
+    let bed = Bed::new();
+    bed.shared(accounts::shared::Outcome::Unknown);
+    let before = bed.store.load_logins(NOW).unwrap().0.shared;
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let refused = |_work: Box<dyn FnOnce() + Send>| Err(io::Error::other("injected spawn refusal"));
+    let mut fx = live_effects();
+    fx.scope = lifetime.enter();
+    fx.spawn_renewal = &refused;
+    fx.renew_guard = &guard;
+    assert_eq!(
+        resume_pending_pin(&bed.home, &bed.state, &bed.path, NOW, &fx),
+        Some(RenewalDispatch::Held)
+    );
+    drop(fx);
+    assert_eq!(
+        bed.store.load(NOW).unwrap().0.pending_pin,
+        Some(bed.request.clone().into()),
+        "a worker that could not start keeps its selection"
+    );
     assert_eq!(progress(&bed), (true, RUNS_HANDED));
     assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
     assert_eq!(bed.store.load_logins(NOW).unwrap().0.shared, before);

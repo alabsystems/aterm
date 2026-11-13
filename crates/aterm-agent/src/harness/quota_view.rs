@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The quota view (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2, §5.1): line E's quota
-//! row and the Accounts card's chart and lanes, painted from one [`Outlook`].
+//! row, painted from one [`Outlook`].
 //!
 //! It is pure. Every instant it says comes from the outlook (its `as_of`, its passes, its rows'
 //! readings), and nothing here reads a clock, a file or a setting.
@@ -13,7 +13,6 @@
 //! - one rolling chart over [now − 1 d, now + 7 d) ([`Chart`], §2.2): this tab's account as read
 //!   on this Mac, `▕` for now, then the projected fill of whichever account carries the work,
 //!   with its milestones;
-//! - one burn-up lane per named account for the card ([`Burn`]);
 //! - the tail's two phrases ([`Tail`], §2.3), the hover title and the spoken words (§2.6).
 //!
 //! [`QuotaView::lay`] fits the row to a room by the ladder of §2.4. [`QuotaView::fallback`] gives
@@ -50,6 +49,9 @@ pub const NO_FIGURE: &str = "no week figure yet";
 pub const NO_FIGURE_FULL: &str = "no week figure yet \u{b7} Claude reports it with its next reply";
 /// The name of a login the roster cannot name (§2.5).
 pub const THIS_LOGIN: &str = "this login";
+/// What the glass names a login the account state says is signed out: no email, plan or week is
+/// known true of it any more (`agy`'s footer, [`super::agy_gate`]).
+pub const NOT_SIGNED_IN: &str = "not signed in";
 /// The title's last words: what a click on the row does (§2.6).
 pub const CLICK: &str = "click: accounts";
 
@@ -74,7 +76,7 @@ pub const CELL_PLACES: i64 = DAY;
 
 const SEP: &str = " \u{b7} ";
 
-/// The quota view of one pane ([`Outlook::quota`]): what line E and the Accounts card draw. It
+/// The quota view of one pane ([`Outlook::quota`]): what line E draws. It
 /// hashes into the footer's fingerprint; `as_of` is the outlook's instant, never a raw clock.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct QuotaView {
@@ -84,10 +86,8 @@ pub struct QuotaView {
     pub named: Vec<Named>,
     /// Every other roster row's label, in roster order: folded into `+N`, never dropped.
     pub folded: Vec<String>,
-    /// Line E's chart and the card's work row.
+    /// Line E's chart.
     pub chart: Chart,
-    /// The card's lanes: one burn-up per named roster account.
-    pub lanes: Vec<Burn>,
     /// The tail's two phrases.
     pub tail: Tail,
     /// The hover title of the lead and the tail.
@@ -134,7 +134,7 @@ pub struct Chart {
     /// From here the future is not projected (`┄`): a lean, a cut replay, or no projection.
     pub unknown_from: Option<i64>,
     /// Each local midnight inside the span: the instant each local day begins, for the ticks of
-    /// line E's chart and the card's work row and lanes ([`Chart::midnights_at`]).
+    /// line E's chart ([`Chart::midnights_at`]).
     pub midnights: Vec<i64>,
 }
 
@@ -178,14 +178,14 @@ pub enum Mark {
     Lean(String),
 }
 
-/// One cell of a chart or a lane.
+/// One cell of a chart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cell {
     /// Nothing to draw: before the first reading, across an epoch.
     Blank,
-    /// A measured level, 1 to 8: `▁…█` (U+2581–2588), an area.
+    /// A measured level of what is left ([`level`]), 1 to 8: `▁…█` (U+2581–2588), an area.
     Read(u8),
-    /// A projected level, 1 to 8: a one-eighth line, `▁ 🭻 🭺 🭹 🭸 🭷 🭶 ▔`.
+    /// A projected level of what is left, 1 to 8: a one-eighth line, `▁ 🭻 🭺 🭹 🭸 🭷 🭶 ▔`.
     Ahead(u8),
     /// `▕`, the now cell.
     Now,
@@ -201,9 +201,6 @@ pub enum Cell {
     Unknown,
     /// One character of the name after a `→`.
     Name(char),
-    /// A lane's week out: the projected line at the lane's ceiling ([`LANE_TOP`], `🭷`) in the
-    /// warn ink, so out never rests on the line's height alone.
-    Out,
 }
 
 impl Cell {
@@ -225,7 +222,6 @@ impl Cell {
             Cell::Credits => CREDITS_MARK,
             Cell::Unknown => UNKNOWN_MARK,
             Cell::Name(c) => c,
-            Cell::Out => Cell::Ahead(LANE_TOP).glyph(),
         }
     }
 
@@ -236,52 +232,23 @@ impl Cell {
             Cell::Blank | Cell::Now => Role::Quiet,
             Cell::Read(_) => Role::Mark,
             Cell::Ahead(_) => Role::Line,
-            Cell::Gap | Cell::Credits | Cell::Out => Role::Warn,
+            Cell::Gap | Cell::Credits => Role::Warn,
             Cell::Handoff | Cell::Reset => Role::Lit,
             Cell::Unknown => Role::Track,
             Cell::Name(_) => Role::Value,
         }
     }
 
-    /// A midnight's tick may stand in it on line E's chart or the card's work row (§2.2), and on
-    /// a lane but where it is blank ([`Cell::lane_ticks`]): it draws a level (a measured step,
-    /// the projected line, a lane's out line), `┄` or nothing, never a letter or a mark (a name,
-    /// `→`, `↺`, `╳`, `$`, `▕`), which a line of ink would strike through.
+    /// A midnight's tick may stand in it on line E's chart (§2.2): it draws a level (a measured
+    /// step, the projected line), `┄` or nothing, never a letter or a mark (a name, `→`, `↺`,
+    /// `╳`, `$`, `▕`), which a line of ink would strike through.
     #[must_use]
     pub const fn ticks(self) -> bool {
         matches!(
             self,
-            Cell::Blank | Cell::Read(_) | Cell::Ahead(_) | Cell::Unknown | Cell::Out
+            Cell::Blank | Cell::Read(_) | Cell::Ahead(_) | Cell::Unknown
         )
     }
-
-    /// A midnight's tick may stand in it on a card lane (§1.4): only where the lane draws (a
-    /// measured step, the projected line, its out line, `┄`). A lane's blank cell is the card's
-    /// ground, before its week's first reading on this Mac, as the ground after its `↺` is; a
-    /// tick there marks no day on any line and stands alone over the next item's words.
-    #[must_use]
-    pub const fn lane_ticks(self) -> bool {
-        !matches!(self, Cell::Blank) && self.ticks()
-    }
-}
-
-/// One account's own vendor week for the card: read, then projected, ending at its reset.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Burn {
-    /// The account.
-    pub label: String,
-    /// What the glass names it by ([`Outlook::name_of`]).
-    pub name: String,
-    /// Its week began (`renews` − 7 d).
-    pub start: i64,
-    /// Its week resets; at or before now where no reset is known ahead (nothing projected).
-    pub renews: i64,
-    /// Its week's readings on this Mac, oldest first.
-    pub read: Vec<Read>,
-    /// The replay's fill of it from now to `renews`.
-    pub ahead: Vec<Knot>,
-    /// It is out from here to its reset ([`Cell::Out`]).
-    pub out_at: Option<i64>,
 }
 
 /// A part's ink; the GUI maps each to a `GlassInks` token. A warn part is always bold.
@@ -291,7 +258,7 @@ pub enum Role {
     Lit,
     /// Other names and figures, times, names inside the chart.
     Value,
-    /// `used`, `·`, `+N`, `by`, `▕`, case (d)'s words.
+    /// `·`, `+N`, `at`, `▕`, case (d)'s words.
     Quiet,
     /// The measured levels.
     Mark,
@@ -363,7 +330,7 @@ impl QuotaLine {
 /// The tail (§2.3): at most two phrases.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tail {
-    /// Phrase 1, this tab's account: `~99% by ↺ Sat 10:00`, short `↺ Sat 10:00`. None where no
+    /// Phrase 1, this tab's account: `~1% left at ↺ Sat 10:00`, short `↺ Sat 10:00`. None where no
     /// reset is ahead, or where the work waits at a wall until this very reset (phrase 2's
     /// `⧗ until Sat 10:00` says it).
     pub own: Option<Own>,
@@ -374,9 +341,10 @@ pub struct Tail {
 /// Phrase 1 (§2.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Own {
-    /// The curve at the reset, whole percent half up, at most 99 (case (b)'s 98.875% is `~99%`):
-    /// none where the account fills or is left before its reset, or nothing is projected (the
-    /// full form is the short one).
+    /// The curve at the reset, whole percent used half up, at most 99, which the row says as
+    /// what is left, at least 1 (case (b)'s 98.875% used is `~1% left`): none where the account
+    /// fills or is left before its reset, or nothing is projected (the full form is the short
+    /// one).
     pub by_reset: Option<u16>,
     /// The reset's words (`Sat 10:00`), exact.
     pub reset: String,
@@ -412,19 +380,6 @@ impl Piece {
         let bold = text.chars().any(|c| heavy(c, role));
         Piece { text, role, bold }
     }
-}
-
-/// The Accounts card's verdict line ([`Outlook::card_verdict`], §1.4).
-pub(super) struct CardVerdict {
-    /// Its forms, widest first.
-    pub(super) forms: Vec<String>,
-    /// What a reader hears: no drawing glyph.
-    pub(super) spoken: String,
-    /// Its ink: warn behind `╳`, `⧗` or `$`, value, or quiet for case (d)'s words.
-    pub(super) ink: Role,
-    /// A lean's worst case, where it stops: its forms (indented under the verdict) and what a
-    /// reader hears.
-    pub(super) worst: Option<(Vec<String>, String)>,
 }
 
 /// Whether a glyph of the glass is laid bold whatever its phrase says: every warn glyph, and
@@ -494,31 +449,17 @@ impl Names {
     }
 }
 
-/// The level of `x10` tenths used (§2.2): `clamp(round(x·8/100), 1, 7)`, and 8 only at 1000 (a
-/// reading of 100, or a projected fill), so 63% and 98% are levels 5 and 7.
+/// The level of what is left of a week at `x10` tenths used (§2.2): the chart drains like a
+/// battery, so a week's readings step down and its projected line falls to the floor, where the
+/// stop's `╳` begins. It is `9 − clamp(round(x·8/100), 1, 7)`, 8 for the least-used week down to
+/// 2, and 1 (the floor) only at 1000 (a reading of 100, or a projected fill), so 63% and 98%
+/// used are levels 4 and 2.
 #[must_use]
 pub fn level(x10: u16) -> u8 {
     if x10 >= 1000 {
-        8
+        1
     } else {
-        u8::try_from(((u32::from(x10) * 8 + 500) / 1000).clamp(1, 7)).unwrap_or(7)
-    }
-}
-
-/// A lane's ceiling: the highest of its levels, its week out ([`Cell::Out`]). A lane sits
-/// right under its item's words, so it draws on six of the cell's eight steps and keeps the
-/// top quarter of the cell clear (two device pixels or more at any cell 8 px tall): neither
-/// its line nor a full week's reading reads as the words' underline.
-pub const LANE_TOP: u8 = 6;
-
-/// The lane level of `x10` tenths used ([`LANE_TOP`]): `clamp(round(x·5/100), 1, 5)`, and the
-/// ceiling only at 1000, so 63% is level 3 and 98% level 5.
-#[must_use]
-pub fn lane_level(x10: u16) -> u8 {
-    if x10 >= 1000 {
-        LANE_TOP
-    } else {
-        u8::try_from(((u32::from(x10) * 5 + 500) / 1000).clamp(1, 5)).unwrap_or(5)
+        9 - u8::try_from(((u32::from(x10) * 8 + 500) / 1000).clamp(1, 7)).unwrap_or(7)
     }
 }
 
@@ -562,7 +503,8 @@ fn cells(name: &str, max: usize) -> String {
         .collect()
 }
 
-/// Whole percent, half up, at most 99: a curve under 100 is never said `100%`.
+/// Whole percent used, half up, at most 99: a curve short of a fill is never said out of its
+/// week (`~0% left`).
 fn whole_under_full(x10: u16) -> u16 {
     ((x10.min(1000) + 5) / 10).min(99)
 }
@@ -733,11 +675,9 @@ impl Chart {
     }
 
     /// The midnights' ticks (§2.2) on a row whose cells from its `lead`-th are `cells`, drawn at
-    /// `per_day` cells a day on this chart's clock (the chart itself, or a card lane on it,
-    /// [`Burn::cells`]), into `out` (cleared first): each midnight's place from the row's left
-    /// edge ([`Chart::midnights_at`]) where its cell takes a tick by `takes` ([`Cell::ticks`] on
-    /// the chart and the work row, [`Cell::lane_ticks`] on a lane), so none past the row's last
-    /// cell (a lane ends at its reset).
+    /// `per_day` cells a day on this chart's clock, into `out` (cleared first): each midnight's
+    /// place from the row's left edge ([`Chart::midnights_at`]) where its cell takes a tick by
+    /// `takes` ([`Cell::ticks`]), so none past the row's last cell.
     pub fn ticks(
         &self,
         per_day: u8,
@@ -818,63 +758,6 @@ impl Chart {
     }
 }
 
-impl Burn {
-    /// The replay's fill of it at its reset, in tenths, where it is projected and known there.
-    #[must_use]
-    pub fn by_renewal(&self) -> Option<u16> {
-        fill_at(&self.ahead, self.renews, true).flatten()
-    }
-
-    /// The lane at `per_day` cells a day on the work row's clock ([`Chart::cells`] at `now`), into
-    /// `out` (cleared first), so the card's day axis reads across it: `per_day` past cells over
-    /// the last day as read on this Mac (the last reading at or before the cell's end, blank
-    /// before this week's first, `↺` in the cell its week began), `▕`, then the projected line
-    /// ([`Cell::Out`] once out, `┄` where nothing is projected) to the cell its reset falls in,
-    /// which is `↺` and the lane's last. A reset past the chart's end draws its `7 · per_day`
-    /// cells of line and no `↺`. Levels are the lane's ([`lane_level`]), under its ceiling.
-    pub fn cells(&self, per_day: u8, now: i64, out: &mut Vec<Cell>) {
-        out.clear();
-        if per_day == 0 {
-            return;
-        }
-        let k = i64::from(per_day);
-        let s = DAY / k;
-        for i in 0..k {
-            let a = now - DAY + i * s;
-            let b = if i + 1 == k { now } else { a + s };
-            out.push(if (a..b).contains(&self.start) {
-                Cell::Reset
-            } else {
-                let i = self.read.partition_point(|r| r.t <= b);
-                i.checked_sub(1)
-                    .and_then(|i| self.read.get(i))
-                    .filter(|r| r.t >= self.start)
-                    .map_or(Cell::Blank, |r| Cell::Read(lane_level(r.x10)))
-            });
-        }
-        out.push(Cell::Now);
-        if self.renews <= now {
-            return;
-        }
-        for j in 0..7 * k {
-            let a = now + j * s;
-            let b = a + s;
-            if self.renews < b {
-                out.push(Cell::Reset);
-                return;
-            }
-            out.push(if self.out_at.is_some_and(|o| b > o) {
-                Cell::Out
-            } else {
-                match fill_at(&self.ahead, b, true) {
-                    Some(Some(x10)) => Cell::Ahead(lane_level(x10)),
-                    _ => Cell::Unknown,
-                }
-            });
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // The view from the outlook
 
@@ -905,7 +788,7 @@ fn pick_named<T: Copy + PartialEq>(order: &[T], must: &[T]) -> Vec<T> {
 /// A row's week reset, where one is ahead of `as_of` on an admitted reading and no further
 /// ahead than a week's can be ([`accounts::believed_reset`], a week and a day): a stored
 /// reading keeps the vendor's `resets_at` as sent, so one in the wrong unit, or `i64::MAX`, is
-/// no reset to say, to draw a lane to, or to add a local offset to.
+/// no reset to say or to add a local offset to.
 pub(super) fn reset_ahead(row: &RowOutlook, as_of: i64) -> Option<i64> {
     row.window(Window::Week)
         .filter(|w| {
@@ -913,14 +796,6 @@ pub(super) fn reset_ahead(row: &RowOutlook, as_of: i64) -> Option<i64> {
         })
         .and_then(|w| accounts::believed_reset(w.reset, as_of))
         .filter(|r| *r > as_of)
-}
-
-/// The tenths a figure says, where it says a number.
-const fn figure_x10(figure: Figure) -> Option<u16> {
-    match figure {
-        Figure::Exact(x10) | Figure::AtLeast(x10) => Some(x10),
-        Figure::Out | Figure::Unread => None,
-    }
 }
 
 /// The instants of the week resets of a row whose reset is `reset`, in `[from, to)`.
@@ -1346,11 +1221,6 @@ impl Outlook {
         let drawn = movable.then_some(self.week.as_ref()).flatten();
         let wait = movable.then(|| self.wait_of(tab_row, tab_reset)).flatten();
         let chart = self.chart_of(tab, tab_row, tab_figure, tab_reset, drawn, wait);
-        let lanes = picked
-            .iter()
-            .flatten()
-            .map(|&i| self.lane_of(&self.rows[i], drawn.is_some()))
-            .collect();
         let words = Words {
             unseen: row_figure == Figure::Unread && tab_figure != Figure::Unread,
             ..self.words_for(tab)
@@ -1361,7 +1231,6 @@ impl Outlook {
             named,
             folded,
             chart,
-            lanes,
             tail,
             title: String::new(),
             spoken: String::new(),
@@ -1403,240 +1272,6 @@ impl Outlook {
             single: self.rows.len() <= 1,
             unseen: false,
         }
-    }
-
-    /// The Accounts card's verdict line for the pane whose account is `tab` and its `view`
-    /// (§1.4): `╳ out ~Sat 05:00–Sat 10:00, then main`, widest form first, in the tail's own
-    /// grammar (§2.3) with what the card has room to add (who is out, who carries the work
-    /// after). A tab the rotation cannot move (`movable` false) has no verdict, as its row has
-    /// none: the card says its reset, as the tail does, and that nothing is projected; a refused
-    /// outlook says its refusal either way, the reason nothing is projected for anyone.
-    pub(super) fn card_verdict(&self, view: &QuotaView, tab: &str, movable: bool) -> CardVerdict {
-        let words = self.words_for(tab);
-        if view.waiting() {
-            return CardVerdict {
-                forms: vec![NO_FIGURE_FULL.to_owned(), NO_FIGURE.to_owned()],
-                spoken: format!("{NO_FIGURE}; Claude reports it with its next reply."),
-                ink: Role::Quiet,
-                worst: None,
-            };
-        }
-        let tab_row = self.rows.iter().position(|r| r.label == tab);
-        let verdict = self.verdict_for(tab_row);
-        // A refused outlook says why nothing is projected, whoever the tab is.
-        if !movable && !matches!(verdict, Verdict::Refused(_)) {
-            const WHY: &str = "not projected: the rotation cannot move this tab";
-            let (forms, spoken) = match words.tab_reset {
-                Some(reset) => {
-                    let at = format!("{RESET_MARK} {}", words.when(reset));
-                    (
-                        vec![
-                            format!("{at}{SEP}{WHY}"),
-                            format!("{at}{SEP}not projected"),
-                            at,
-                        ],
-                        format!(
-                            "Resets {}. Not projected: the rotation cannot move this tab.",
-                            words.spoken_when(reset)
-                        ),
-                    )
-                }
-                None => (
-                    vec![WHY.to_owned(), "not projected".to_owned()],
-                    "Not projected: the rotation cannot move this tab.".to_owned(),
-                ),
-            };
-            return CardVerdict {
-                forms,
-                spoken,
-                ink: Role::Value,
-                worst: None,
-            };
-        }
-        let sentence = |s: String| {
-            let mut chars = s.chars();
-            let head: String = chars
-                .next()
-                .map(|c| c.to_uppercase().collect())
-                .unwrap_or_default();
-            format!("{head}{}.", chars.as_str())
-        };
-        let out_words =
-            |phrase: &str| phrase.replacen(&format!("{GAP_MARK} "), &format!("{GAP_MARK} out "), 1);
-        let stop = |from: i64, end: StopEnd, pass: PassKind, lean: Option<&str>| {
-            let (full, short) = words.stop_phrase(from, end);
-            let carried = match pass {
-                PassKind::Week => self.week.as_ref(),
-                PassKind::Working => self.working.as_ref(),
-            };
-            // Who carries the work after the stop, where more than one account could.
-            let then = carried
-                .filter(|_| !words.single)
-                .and_then(|p| p.chain.iter().find(|l| l.from >= from && l.to > l.from))
-                .map(|l| words.name(&l.label).to_owned());
-            let mut forms = Vec::new();
-            if let Some(next) = &then {
-                forms.push(format!("{}, then {next}", out_words(&full)));
-            }
-            forms.push(out_words(&full));
-            forms.push(out_words(&short));
-            let mut spoken = words.stop_said(
-                &StopSaid {
-                    pass,
-                    from,
-                    end,
-                    lean,
-                },
-                true,
-            );
-            if let Some(next) = then {
-                spoken.push_str(&format!(", then {next}"));
-            }
-            (forms, sentence(spoken))
-        };
-        let (forms, spoken, ink, worst) = match verdict {
-            Verdict::Stop {
-                pass,
-                from,
-                end,
-                lean,
-            } => {
-                let (forms, spoken) = stop(from, end, pass, lean.as_deref());
-                (forms, spoken, Role::Warn, None)
-            }
-            Verdict::Walled { to: None, until } => {
-                let spoken_until = until.map_or_else(
-                    || "its reset".to_owned(),
-                    |u| words.spoken_when(words.resumes(u)),
-                );
-                let until =
-                    until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)));
-                (
-                    vec![
-                        format!("{WAIT_MARK} out now, until {until}"),
-                        format!("{WAIT_MARK} until {until}"),
-                    ],
-                    format!("Out now: the work waits until {spoken_until}."),
-                    Role::Warn,
-                    None,
-                )
-            }
-            Verdict::Walled { to: Some(to), .. } => {
-                let to = words.name(&to);
-                (
-                    vec![
-                        format!("{HANDOFF_MARK} out now: the work moves to {to} at the turn's end"),
-                        format!("{HANDOFF_MARK} the work moves to {to}"),
-                    ],
-                    format!("Out now: the work moves to {to} at the turn's end."),
-                    Role::Value,
-                    None,
-                )
-            }
-            Verdict::Lean {
-                until,
-                row,
-                stop: s,
-                ..
-            } => {
-                let row = words.name(&row).to_owned();
-                let worst = s.map(|(from, end)| {
-                    let (forms, spoken) = stop(from, end, PassKind::Week, None);
-                    let (_, short) = words.stop_phrase(from, end);
-                    (
-                        forms
-                            .into_iter()
-                            .map(|f| format!("  if {} has nothing: {f}", cut(&row)))
-                            .chain([format!("  if nothing: {short}")])
-                            .collect(),
-                        format!("If {row} has nothing: {spoken}"),
-                    )
-                });
-                (
-                    vec![
-                        format!("? {} unread from {}", cut(&row), words.about(until)),
-                        format!("? {} {}", cut(&row), words.about(until)),
-                    ],
-                    format!(
-                        "The work reaches {row}, which aterm cannot read, from {}.",
-                        words.spoken_about(until)
-                    ),
-                    Role::Value,
-                    worst,
-                )
-            }
-            Verdict::Credits { at } => (
-                vec![
-                    format!("{CREDITS_MARK} usage credits from {}", words.about(at)),
-                    format!("{CREDITS_MARK} {}", words.about(at)),
-                ],
-                format!(
-                    "Usage credits would carry the work from {}.",
-                    words.spoken_about(at)
-                ),
-                Role::Warn,
-                None,
-            ),
-            Verdict::Refused(why) => (
-                vec![why.words(), why.short()],
-                why.spoken(),
-                Role::Value,
-                None,
-            ),
-            Verdict::Continuous => (
-                vec![
-                    "continuous for the next 7 days".to_owned(),
-                    "continuous 7 days".to_owned(),
-                ],
-                "Continuous for the next 7 days.".to_owned(),
-                Role::Value,
-                None,
-            ),
-        };
-        CardVerdict {
-            forms,
-            spoken,
-            ink,
-            worst,
-        }
-    }
-
-    /// The card's pace line (§1.4), widest form first (`at 36% a day (this Mac, the last 24 h)`,
-    /// `at 36% a day`), and what a reader hears; `None` where no pace stands or nothing carries
-    /// the work.
-    pub(super) fn card_pace(&self) -> Option<(Vec<String>, String)> {
-        let pace = self.demand.week.ok()?;
-        self.week.as_ref().filter(|p| !p.chain.is_empty())?;
-        let pct = self.day_pct()?;
-        let (basis, spoken) = match pace.basis {
-            Basis::Day => (
-                "this Mac, the last 24 h",
-                "this Mac's pace over the last 24 hours",
-            ),
-            Basis::Hour => (
-                "this Mac, the last hour",
-                "this Mac's pace over the last hour",
-            ),
-            Basis::WeekBegan | Basis::WindowOpened => {
-                ("this week so far", "this week's pace so far")
-            }
-        };
-        Some((
-            vec![
-                format!("at {pct}% a day ({basis})"),
-                format!("at {pct}% a day"),
-            ],
-            format!("At {pct} percent a day: {spoken}."),
-        ))
-    }
-
-    /// What a reader hears of the card's work row: the work as the view of `tab`'s pane says it
-    /// (§2.6), after its named accounts, which the card's items say; nothing projected for a tab
-    /// the rotation cannot move, as on its row.
-    pub(super) fn card_work_said(&self, tab: &str, movable: bool) -> String {
-        let words = self.words_for(tab);
-        let drawn = movable.then_some(self.week.as_ref()).flatten();
-        self.work_said(&words, drawn, movable)
     }
 
     /// The verdict this tab's pane says: its own wall, else the outlook's.
@@ -1724,7 +1359,7 @@ impl Outlook {
                 .saturating_sub(1);
             chart.past = row.read.get(start..).unwrap_or_default().to_vec();
             // The last past cell holds the lead's figure (§2.2): one figure at now.
-            if let (Some(x10), Some(reset)) = (figure_x10(tab_figure), tab_reset) {
+            if let (Some(x10), Some(reset)) = (tab_figure.used_x10(), tab_reset) {
                 let epoch = chart
                     .past
                     .last()
@@ -1793,7 +1428,7 @@ impl Outlook {
         }
         // One figure at now: the first run, where it is this tab's, is shifted to the lead's
         // figure until its first drop, clamped below a fill; a fill stays a fill.
-        if let (Some(first), Some(x10)) = (chart.runs.first_mut(), figure_x10(tab_figure))
+        if let (Some(first), Some(x10)) = (chart.runs.first_mut(), tab_figure.used_x10())
             && first.label == tab
             && first.from == as_of
             && let Some(Some(replay)) = first.knots.first().map(|k| k.x10)
@@ -1860,59 +1495,6 @@ impl Outlook {
         chart
     }
 
-    /// The burn-up lane of `row`'s own vendor week: its readings on this Mac and, where the week
-    /// pass is `drawn`, the replay's fill of it to its reset and the instant it runs out.
-    ///
-    /// Both come from the drawn pass's own fills ([`Pass::fills`]), which stop at its lean or its
-    /// cut: the lane is out ([`Cell::Out`], `out ~T` on its item) only where those knots reach a fill, and
-    /// is `┄` past them. A lean's worst case walls an unread row at the lean's instant as an
-    /// assumption, never a figure ([`Pass::projections`] carries it for the bars), so it is never
-    /// drawn or said as the account's own run-out: the card's verdict says it, conditionally
-    /// (`if alt1 has nothing: ╳ …`).
-    pub(super) fn lane_of(&self, row: &RowOutlook, drawn: bool) -> Burn {
-        let as_of = self.as_of;
-        let Some(renews) = reset_ahead(row, as_of) else {
-            return Burn {
-                label: row.label.clone(),
-                name: row.name.clone(),
-                start: as_of - WEEK,
-                renews: as_of,
-                read: Vec::new(),
-                ahead: Vec::new(),
-                out_at: None,
-            };
-        };
-        let ahead: Vec<Knot> = self
-            .week
-            .as_ref()
-            .filter(|_| drawn)
-            .and_then(|p| p.fills.get(&row.label))
-            .map(|k| knots_over(k, as_of, renews))
-            .unwrap_or_default();
-        let out_at = if row.figure(as_of) == Figure::Out {
-            Some(as_of)
-        } else {
-            ahead
-                .iter()
-                .find(|k| k.x10.is_some_and(|x10| x10 >= 1000) && k.t < renews)
-                .map(|k| k.t)
-        };
-        Burn {
-            label: row.label.clone(),
-            name: row.name.clone(),
-            start: renews - WEEK,
-            renews,
-            read: row
-                .read
-                .iter()
-                .filter(|r| r.reset == renews && r.t <= as_of)
-                .copied()
-                .collect(),
-            ahead,
-            out_at,
-        }
-    }
-
     fn tail_of(
         &self,
         words: &Words<'_>,
@@ -1971,10 +1553,10 @@ impl Outlook {
         let pace = self.demand.week.ok()?;
         let pct = self.day_pct()?;
         Some(match pace.basis {
-            Basis::Day => format!("at this Mac's last-24 h pace, {pct}% a day"),
-            Basis::Hour => format!("at this Mac's last-hour pace, {pct}% a day"),
+            Basis::Day => format!("at this Mac's last-24 h pace, {pct}% used a day"),
+            Basis::Hour => format!("at this Mac's last-hour pace, {pct}% used a day"),
             Basis::WeekBegan | Basis::WindowOpened => {
-                format!("at this week's pace so far, {pct}% a day")
+                format!("at this week's pace so far, {pct}% used a day")
             }
         })
     }
@@ -1995,17 +1577,19 @@ impl Outlook {
         let mut parts = vec![tab.name.clone()];
         parts.extend(tab.plan.clone());
         parts.push(match tab.figure {
-            Figure::Exact(_) => format!("{} of its week used, read now", tab.figure.words()),
-            Figure::AtLeast(x10) => format!(
-                "at least {}% of its week used, read earlier",
-                x10.min(1000) / 10
-            ),
+            Figure::Exact(_) => format!("{} of its week, read now", tab.figure.words()),
+            Figure::AtLeast(_) => format!("{} of its week, read earlier", tab.figure.words()),
             Figure::Out => "out now".to_owned(),
             Figure::Unread => format!("{NO_FIGURE}, Claude reports it with its next reply"),
         });
         if let Some(own) = &view.tail.own {
             parts.push(match own.by_reset {
-                Some(pct) => format!("~{pct}% by its reset {}", own.reset),
+                Some(pct) => format!(
+                    "~{}% {} at its reset {}",
+                    super::left::of_whole(u32::from(pct)),
+                    super::left::WORD,
+                    own.reset
+                ),
                 None => format!("resets {}", own.reset),
             });
         }
@@ -2108,23 +1692,18 @@ impl Outlook {
     }
 
     /// What a reader hears of the named accounts and the folded count: `Accounts. main, this
-    /// tab, 75 percent of its week used, resets Saturday 10:00. alt1 80 percent. 1 more
+    /// tab, 25 percent left of its week, resets Saturday 10:00. alt1 20 percent left. 1 more
     /// account.`
     fn named_said(words: &Words<'_>, view: &QuotaView) -> String {
         let mut s = String::from("Accounts.");
         for n in &view.named {
-            let pct = |x10: u16| x10.min(1000) / 10;
             if n.this_tab {
                 s.push_str(&format!(" {}, this tab, ", n.name));
                 s.push_str(&match n.figure {
-                    Figure::Exact(_) => format!(
-                        "{} percent of its week used",
-                        figure_x10(n.figure).map_or(0, whole_spoken)
-                    ),
-                    Figure::AtLeast(x10) => {
-                        format!("at least {} percent of its week used", pct(x10))
+                    Figure::Exact(_) | Figure::AtLeast(_) => {
+                        format!("{} of its week", n.figure.spoken())
                     }
-                    Figure::Out => "out until its reset".to_owned(),
+                    Figure::Out => n.figure.spoken(),
                     Figure::Unread => format!("{NO_FIGURE}; Claude reports it with its next reply"),
                 });
                 if let Some(reset) = n.reset.filter(|_| n.figure != Figure::Unread) {
@@ -2132,16 +1711,7 @@ impl Outlook {
                 }
                 s.push('.');
             } else {
-                s.push_str(&format!(
-                    " {} {}.",
-                    n.name,
-                    match n.figure {
-                        Figure::Exact(x10) => format!("{} percent", whole_spoken(x10)),
-                        Figure::AtLeast(x10) => format!("at least {} percent", pct(x10)),
-                        Figure::Out => "out".to_owned(),
-                        Figure::Unread => "not read".to_owned(),
-                    }
-                ));
+                s.push_str(&format!(" {} {}.", n.name, n.figure.spoken_short()));
             }
         }
         match view.folded.len() {
@@ -2176,7 +1746,7 @@ impl Outlook {
         if let Some(week) = drawn.filter(|p| !p.chain.is_empty()) {
             let pace = self
                 .day_pct()
-                .map_or_else(String::new, |p| format!(" at {p} percent a day"));
+                .map_or_else(String::new, |p| format!(" at {p} percent used a day"));
             s.push_str(&format!(
                 " Next 7 days{pace}: {}.",
                 words.chain_spoken(week)
@@ -2238,20 +1808,11 @@ impl Outlook {
     }
 }
 
-/// Whole percent, half up, `100` only for 1000: as [`Figure::words`] says an exact figure.
-pub(super) fn whole_spoken(x10: u16) -> u16 {
-    if x10 >= 1000 {
-        100
-    } else {
-        ((x10 + 5) / 10).min(99)
-    }
-}
-
 impl QuotaView {
     /// Case (b) of the glass design (§1) as a pane's view, built by hand for other crates' tests
     /// of what the window draws from a view: `main` at 63% of its week, its reset Sat 10:00
     /// (`~99%` by then), a gap projected from ~Thu 12 Nov 04:00 to its next reset, Sat 14 Nov
-    /// 10:00; no chart. Its words are case (b)'s replay's (`case_b_lays_r2_r5_r7` holds them
+    /// 10:00; no chart. Its words are case (b)'s replay's (`case_b_lays_r2_r6_r8` holds them
     /// equal); the outlook's own tests build views from replays ([`Outlook::quota`]).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
@@ -2279,12 +1840,12 @@ impl QuotaView {
                 }),
             },
             title: format!(
-                "main{SEP}Max 20x{SEP}63% of its week used, read now{SEP}~99% by its reset Sat \
+                "main{SEP}Max 20x{SEP}37% left of its week, read now{SEP}~1% left at its reset Sat \
                  10:00{SEP}next week out ~Thu 12 Nov 04:00 until its reset Sat 14 Nov 10:00{SEP}\
-                 at this Mac's last-24 h pace, 21% a day{SEP}{CLICK}"
+                 at this Mac's last-24 h pace, 21% used a day{SEP}{CLICK}"
             ),
-            spoken: "Accounts. main, this tab, 63 percent of its week used, resets Saturday \
-                     10:00. Next 7 days at 21 percent a day: main; next week out from about \
+            spoken: "Accounts. main, this tab, 37 percent left of its week, resets Saturday \
+                     10:00. Next 7 days at 21 percent used a day: main; next week out from about \
                      Thursday 12 November 04:00 until its reset Saturday 14 November 10:00."
                 .into(),
             ..QuotaView::default()
@@ -2401,8 +1962,6 @@ impl QuotaView {
                 }
                 if !self.folded.is_empty() {
                     out.put(&format!(" +{}", self.folded.len()), Role::Quiet, false);
-                } else if self.named.len() == 1 {
-                    out.put(" used", Role::Quiet, false);
                 }
             }
             Lead::Fold | Lead::Tab => {
@@ -2419,8 +1978,16 @@ impl QuotaView {
 
     fn write_own(own: &Own, full: bool, out: &mut QuotaLine) {
         if let Some(pct) = own.by_reset.filter(|_| full) {
-            out.put(&format!("~{pct}%"), Role::Value, false);
-            out.put(" by ", Role::Quiet, false);
+            out.put(
+                &format!(
+                    "~{}% {}",
+                    super::left::of_whole(u32::from(pct)),
+                    super::left::WORD
+                ),
+                Role::Value,
+                false,
+            );
+            out.put(" at ", Role::Quiet, false);
         }
         out.put(&RESET_MARK.to_string(), Role::Lit, false);
         out.put(" ", Role::Quiet, false);
@@ -2450,10 +2017,11 @@ impl QuotaView {
 
     /// What the pointer on cell `cell` of the chart laid at `per_day` cells a day names (§2.6),
     /// in local time by `offsets`: a past cell its span and the reading it holds (`Wed 4 Nov
-    /// 20:00–23:00 · main 50% (read on this Mac)`); a future level its span and the drawn
-    /// account's projected fill (`~Tue 10 Nov 14:00–17:00 · main ~69% (projected)`); a `→` the
-    /// hand-off (`~Fri 08:00 · the work moves from main (98%) to alt1`; `(out)` for a fill the
-    /// projection reaches, never 100%; a move where a wall lifts at a named account's reset said
+    /// 20:00–23:00 · main 50% left (read on this Mac)`); a future level its span and what the
+    /// drawn account is projected to have left (`~Tue 10 Nov 14:00–17:00 · main ~31% left
+    /// (projected)`); a `→` the hand-off (`~Fri 08:00 · the work moves from main (2% left) to
+    /// alt1`; `(out)` for a fill the projection reaches, never an inferred `0% left`; a move
+    /// where a wall lifts at a named account's reset said
     /// at that reset exactly, `Sat 10:00 · the work moves to main`), and a name after it the
     /// same; a `╳` its stop (`~Sat 05:00–Sat 10:00 · every account out until main's reset`); a
     /// `$` its span on credits; a `↺` the reset; `┄` that nothing is projected there. `None` for
@@ -2476,9 +2044,9 @@ impl QuotaView {
                     let i = chart.past.partition_point(|r| r.t <= b);
                     let r = chart.past.get(i.checked_sub(1)?)?;
                     format!(
-                        "{span}{SEP}{} {}% (read on this Mac)",
+                        "{span}{SEP}{} {} (read on this Mac)",
                         cut(tab),
-                        whole_spoken(r.x10)
+                        super::left::words(u32::from(r.x10))
                     )
                 }
                 Cell::Reset => format!("{span}{SEP}{}'s week reset", cut(tab)),
@@ -2564,7 +2132,11 @@ impl QuotaView {
                             .and_then(|r| r.at(*t))
                             .map(|x| match x {
                                 1000.. => " (out)".to_owned(),
-                                x => format!(" ({}%)", whole_under_full(x)),
+                                x => format!(
+                                    " ({}% {})",
+                                    super::left::ahead(u32::from(x)),
+                                    super::left::WORD
+                                ),
                             })
                             .unwrap_or_default();
                         // The work resumes where a wall lifts, `RESET_GRACE_S` after the reset
@@ -2609,16 +2181,15 @@ impl QuotaView {
                         format!("~{span}{SEP}{} out (projected)", cut(&run.name))
                     }
                     Some(x10) => format!(
-                        "~{span}{SEP}{} ~{}% (projected)",
+                        "~{span}{SEP}{} ~{}% {} (projected)",
                         cut(&run.name),
-                        whole_under_full(x10)
+                        super::left::ahead(u32::from(x10)),
+                        super::left::WORD
                     ),
                     None => format!("~{span}{SEP}not projected"),
                 }
             }
             Cell::Unknown => format!("~{span}{SEP}not projected"),
-            // A lane's cell, which line E's chart never draws; said as what it means.
-            Cell::Out => format!("~{span}{SEP}projected out"),
             Cell::Blank | Cell::Now | Cell::Read(_) => format!("~{span}{SEP}nothing projected"),
         };
         Some(words)

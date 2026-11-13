@@ -216,11 +216,7 @@ impl InitialHost for Host {
         unreachable!("not in the plan")
     }
 
-    fn accounts(
-        &mut self,
-        _root: &Path,
-        _on_screen: fn() -> bool,
-    ) -> Result<Option<Report>, String> {
+    fn accounts(&mut self, _root: &Path) -> Result<Option<Report>, String> {
         unreachable!("not in the plan")
     }
 
@@ -278,7 +274,19 @@ fn row(root: &Path) -> Reading {
     row_on(root, &HOME)
 }
 
-fn settled(note: &str) -> Reading {
+/// The vault row for aterm's own join where `note` was heard: a server at the vault's address
+/// holding none reads Not joined in place, the value it then wants; a look nobody answered is no
+/// such answer, so the row is asked again by itself (`Standing::Asking`), never in place and
+/// never a step waited on, as a typed join's is ([`waiting`]).
+fn own_join(note: &str) -> Reading {
+    if note == scope::NOT_REACHED {
+        return (
+            Standing::Asking,
+            "Not joined".into(),
+            Setting::Secrets.wanted().into(),
+            Some(note.into()),
+        );
+    }
     (
         Standing::InPlace,
         "Not joined".into(),
@@ -348,8 +356,14 @@ fn watched_pass(
 #[test]
 fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
     let secret = || Some(SecretBytes::from(b"typed join password".as_slice()));
-    let unanswered = || Try::new(UNREACHED, scope::NOT_REACHED);
-    for (lane, path) in [(false, "stage"), (true, "lane")] {
+    // Nobody answered, where aterm's own join waits as well, and a server there holding no
+    // vault, where only a typed join waits: the password's hold tells the two apart there.
+    for ((status, note), (lane, path)) in
+        [(UNREACHED, scope::NOT_REACHED), (ABSENT, scope::NO_VAULT)]
+            .into_iter()
+            .flat_map(|heard| [(false, "stage"), (true, "lane")].map(|run| (heard, run)))
+    {
+        let unanswered = || Try::new(status, note);
         let typed = |lane| {
             let (root, revision) = admitted(lane);
             let mut host = Host {
@@ -359,18 +373,18 @@ fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
             let mut password = secret();
             let ended = watched_pass(&mut host, root.path(), revision, &mut password);
             assert_eq!(host.attempt.ran(), [path]);
-            assert_eq!(ended, [waiting(scope::NOT_REACHED)], "{path}");
+            assert_eq!(ended, [waiting(note)], "{path}");
             assert!(password.is_some(), "{path}: the try handed it back");
-            assert_eq!(row(root.path()), waiting(scope::NOT_REACHED), "{path}");
+            assert_eq!(row(root.path()), waiting(note), "{path}");
             (root, revision, host, password)
         };
 
         let (root, revision, mut host, mut password) = typed(lane);
         pass(&mut host, root.path(), revision, &mut password);
         assert_eq!(host.attempt.ran(), [path], "{path}: inside the pause");
-        assert_eq!(row(root.path()), waiting(scope::NOT_REACHED), "{path}");
+        assert_eq!(row(root.path()), waiting(note), "{path}");
         request_stop_at(root.path(), revision).unwrap();
-        assert_eq!(row(root.path()), settled(scope::NOT_REACHED), "{path}");
+        assert_eq!(row(root.path()), own_join(note), "{path}");
 
         // Set up now, say, admits a new run of the plan, whose worker holds no password.
         let (root, _, mut host, _) = typed(lane);
@@ -381,7 +395,7 @@ fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
             [path, "stage"],
             "{path}: the new run tries"
         );
-        assert_eq!(row(root.path()), settled(scope::NOT_REACHED), "{path}");
+        assert_eq!(row(root.path()), own_join(note), "{path}");
 
         // Join again, the password retyped, admits a new run whose worker holds it.
         let (root, _, mut host, _) = typed(lane);
@@ -389,7 +403,7 @@ fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
         let mut password = secret();
         pass(&mut host, root.path(), retyped, &mut password);
         assert_eq!(host.attempt.ran(), [path, "stage"], "{path}: retyped");
-        assert_eq!(row(root.path()), waiting(scope::NOT_REACHED), "{path}");
+        assert_eq!(row(root.path()), waiting(note), "{path}");
 
         let (root, revision) = admitted(lane);
         let mut host = Host {
@@ -398,8 +412,8 @@ fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
         };
         let ended = watched_pass(&mut host, root.path(), revision, &mut None);
         assert_eq!(host.attempt.ran(), [path]);
-        assert_eq!(ended, [settled(scope::NOT_REACHED)], "{path}: no password");
-        assert_eq!(row(root.path()), settled(scope::NOT_REACHED), "{path}");
+        assert_eq!(ended, [own_join(note)], "{path}: no password");
+        assert_eq!(row(root.path()), own_join(note), "{path}");
 
         let (root, revision) = admitted(lane);
         let mut host = Host {
@@ -413,19 +427,19 @@ fn a_typed_join_waits_only_while_its_run_holds_the_password_for_a_try() {
         pass(&mut host, root.path(), revision, &mut password);
         assert_eq!(host.attempt.ran(), [path]);
         assert!(password.is_none(), "{path}");
-        assert_eq!(row(root.path()), settled(scope::NOT_REACHED), "{path}");
+        assert_eq!(row(root.path()), own_join(note), "{path}");
     }
 }
 
 /// A process that asked the ALab vault nothing, as one relaunched inside the Secrets retry pause
 /// is, whose pass tries nothing, reads what the run's last try heard: nobody answered, or a server
-/// there holds no vault, settled for aterm's own join, with that note, and still once the pause
+/// there holds no vault, as for aterm's own join ([`own_join`]), with that note, and still once the pause
 /// has ended, as a relaunch the next day reads it before a pass asks again. With no try kept, or
 /// only a try of another run, it has heard nothing, and the join is a change to make: a run the
 /// person admitted since keeps the older run's record until its own first try.
 #[test]
 fn a_process_that_asked_nothing_reads_what_the_runs_last_try_heard() {
-    for (status, note) in [(UNREACHED, scope::NOT_REACHED), (WAITING, scope::NO_VAULT)] {
+    for (status, note) in [(UNREACHED, scope::NOT_REACHED), (ABSENT, scope::NO_VAULT)] {
         let (root, revision) = admitted(false);
         let mut host = Host {
             attempt: Try::new(status, note),
@@ -434,10 +448,10 @@ fn a_process_that_asked_nothing_reads_what_the_runs_last_try_heard() {
         pass(&mut host, root.path(), revision, &mut None);
         pass(&mut host, root.path(), revision, &mut None);
         assert_eq!(host.attempt.ran(), ["stage"], "{note}: inside the pause");
-        assert_eq!(row(root.path()), settled(note));
+        assert_eq!(row(root.path()), own_join(note));
         assert_eq!(
             row_on(root.path(), &HOME_LATER),
-            settled(note),
+            own_join(note),
             "{note}: past the pause"
         );
     }
@@ -447,7 +461,7 @@ fn a_process_that_asked_nothing_reads_what_the_runs_last_try_heard() {
     secrets_retry::record(root.path(), revision + 1, &pace(), false, &mut unanswered()).unwrap();
     assert_eq!(row(root.path()), unheard(), "a newer run's try");
     secrets_retry::record(root.path(), revision, &pace(), false, &mut unanswered()).unwrap();
-    assert_eq!(row(root.path()), settled(scope::NOT_REACHED));
+    assert_eq!(row(root.path()), own_join(scope::NOT_REACHED));
     authorize_at(root.path(), &plan()).unwrap().unwrap();
     assert_eq!(row(root.path()), unheard(), "an older run's try");
 }
@@ -466,18 +480,18 @@ fn a_try_on_another_network_says_nothing_of_this_one() {
         lane: false,
     };
     pass(&mut host, root.path(), revision, &mut None);
-    assert_eq!(row(root.path()), settled(scope::NOT_REACHED));
+    assert_eq!(row(root.path()), own_join(scope::NOT_REACHED));
     assert_eq!(
         row_on(root.path(), &HOME_LATER),
-        settled(scope::NOT_REACHED),
+        own_join(scope::NOT_REACHED),
         "past the pause"
     );
     assert_eq!(row_on(root.path(), &OFFICE), unheard(), "the run goes on");
     request_stop_at(root.path(), revision).unwrap();
-    assert_eq!(row(root.path()), settled(scope::NOT_REACHED), "stopped");
+    assert_eq!(row(root.path()), own_join(scope::NOT_REACHED), "stopped");
     assert_eq!(
         row_on(root.path(), &HOME_LATER),
-        settled(scope::NOT_REACHED),
+        own_join(scope::NOT_REACHED),
         "stopped, a day later"
     );
     assert_eq!(row_on(root.path(), &OFFICE), unheard(), "stopped");
@@ -521,7 +535,7 @@ fn this_process_probe_speaks_only_for_the_network_it_ran_on() {
     };
     assert_eq!(
         heard(probe(Unreached, &HOME), &HOME),
-        settled(scope::NOT_REACHED)
+        own_join(scope::NOT_REACHED)
     );
     assert_eq!(
         heard(probe(Unreached, &HOME), &OFFICE),
@@ -530,17 +544,17 @@ fn this_process_probe_speaks_only_for_the_network_it_ran_on() {
     );
     assert_eq!(
         heard(probe(Absent, &HOME), &HOME),
-        settled(scope::NO_VAULT),
+        own_join(scope::NO_VAULT),
         "over the record"
     );
     assert_eq!(
         heard(probe(Absent, &OFFICE), &OFFICE),
-        settled(scope::NO_VAULT),
+        own_join(scope::NO_VAULT),
         "its own network"
     );
     assert_eq!(
         heard(probe(Absent, &UNREAD), &HOME),
-        settled(scope::NOT_REACHED),
+        own_join(scope::NOT_REACHED),
         "a probe on a network it could not read"
     );
     assert_eq!(
@@ -581,7 +595,7 @@ fn an_address_that_comes_and_goes_leaves_the_network_as_it_was() {
     request_stop_at(root.path(), revision).unwrap();
     assert_eq!(
         row_on(root.path(), &CHURNED),
-        settled(scope::NOT_REACHED),
+        own_join(scope::NOT_REACHED),
         "the try's record"
     );
     assert_eq!(row_on(root.path(), &SAME_ADDRESSES), unheard());
@@ -596,13 +610,13 @@ fn an_address_that_comes_and_goes_leaves_the_network_as_it_was() {
     };
     assert_eq!(
         heard(probe(&HOME), Some(root.path()), &CHURNED),
-        settled(scope::NO_VAULT),
+        own_join(scope::NO_VAULT),
         "this process's probe"
     );
     assert_eq!(heard(probe(&HOME), None, &SAME_ADDRESSES), unheard());
     assert_eq!(
         heard(probe(&NO_GATEWAY), None, &NO_GATEWAY),
-        settled(scope::NO_VAULT),
+        own_join(scope::NO_VAULT),
         "no gateway"
     );
     assert_eq!(
@@ -620,7 +634,7 @@ fn an_address_that_comes_and_goes_leaves_the_network_as_it_was() {
     write_json(&record, &kept).unwrap();
     assert_eq!(
         row(root.path()),
-        settled(scope::NOT_REACHED),
+        own_join(scope::NOT_REACHED),
         "an older build's try"
     );
     assert_eq!(
@@ -632,8 +646,8 @@ fn an_address_that_comes_and_goes_leaves_the_network_as_it_was() {
 
 /// Check again's look is what this process heard last ([`scope::look_again`]): a run stopped where
 /// nobody answered, whose vault answers there later, reads what that look heard on the same
-/// network, so its join is a change to make (**Set up now**), and settles again with the note of a
-/// look that hears nothing.
+/// network, so its join is a change to make (**Set up now**), and reads as for aterm's own join
+/// again with the note of a look that hears nothing.
 #[test]
 fn check_again_s_look_is_what_aterm_heard_last() {
     use scope::VaultHere::{Found, Unreached};
@@ -655,11 +669,15 @@ fn check_again_s_look_is_what_aterm_heard_last() {
             root.path(),
         )
     };
-    assert_eq!(read(), settled(scope::NOT_REACHED));
+    assert_eq!(read(), own_join(scope::NOT_REACHED));
     assert_eq!(scope::look_again_with(&kept, || Found, &HOME), Found);
     assert_eq!(read(), unheard(), "the vault answered");
     scope::look_again_with(&kept, || Unreached, &HOME);
-    assert_eq!(read(), settled(scope::NOT_REACHED), "nobody answered again");
+    assert_eq!(
+        read(),
+        own_join(scope::NOT_REACHED),
+        "nobody answered again"
+    );
 }
 
 /// A join password another aterm process sharing the state root holds for the run in force (a
@@ -671,53 +689,49 @@ fn check_again_s_look_is_what_aterm_heard_last() {
 #[test]
 fn a_typed_join_another_aterm_holds_waits_while_that_process_runs() {
     use aterm_uds::process::{Birth, Identity, read_identity, read_lineage};
-    let (root, revision) = admitted(false);
-    let mut host = Host {
-        attempt: Try::new(UNREACHED, scope::NOT_REACHED),
-        lane: false,
-    };
-    pass(&mut host, root.path(), revision, &mut None);
-    assert_eq!(row(root.path()), settled(scope::NOT_REACHED));
-    let me = i32::try_from(std::process::id()).unwrap();
-    let parent = read_lineage(me).expect("this process").parent;
-    let other: Identity = read_identity(i32::try_from(parent).unwrap())
-        .expect("the process that runs these tests, which outlives them");
-    scope::keep_join_held(root.path(), revision, &other).unwrap();
-    assert_eq!(
-        row(root.path()),
-        waiting(scope::NOT_REACHED),
-        "another aterm holds it"
-    );
-    pass(&mut host, root.path(), revision, &mut None);
-    assert_eq!(
-        row(root.path()),
-        waiting(scope::NOT_REACHED),
-        "another aterm holds it, past a pass of this one holding none"
-    );
-    let later = Identity {
-        birth: Birth(other.birth.0 + 1),
-        ..other
-    };
-    scope::keep_join_held(root.path(), revision, &later).unwrap();
-    assert_eq!(
-        row(root.path()),
-        settled(scope::NOT_REACHED),
-        "its pid, another process"
-    );
-    let ended = Identity {
-        pid: i32::MAX,
-        ..other
-    };
-    scope::keep_join_held(root.path(), revision, &ended).unwrap();
-    assert_eq!(
-        row(root.path()),
-        settled(scope::NOT_REACHED),
-        "a process that no longer runs"
-    );
-    let mark = root.path().join(scope::JOIN_HELD);
-    assert!(mark.exists());
-    pass(&mut host, root.path(), revision, &mut None);
-    assert!(!mark.exists(), "a pass takes an ended process's mark away");
+    // Nobody answered, where aterm's own join waits as well, and a server there holding no
+    // vault, where only the held join waits: the mark tells the two apart there.
+    for (status, note) in [(UNREACHED, scope::NOT_REACHED), (ABSENT, scope::NO_VAULT)] {
+        let (root, revision) = admitted(false);
+        let mut host = Host {
+            attempt: Try::new(status, note),
+            lane: false,
+        };
+        pass(&mut host, root.path(), revision, &mut None);
+        assert_eq!(row(root.path()), own_join(note));
+        let me = i32::try_from(std::process::id()).unwrap();
+        let parent = read_lineage(me).expect("this process").parent;
+        let other: Identity = read_identity(i32::try_from(parent).unwrap())
+            .expect("the process that runs these tests, which outlives them");
+        scope::keep_join_held(root.path(), revision, &other).unwrap();
+        assert_eq!(row(root.path()), waiting(note), "another aterm holds it");
+        pass(&mut host, root.path(), revision, &mut None);
+        assert_eq!(
+            row(root.path()),
+            waiting(note),
+            "another aterm holds it, past a pass of this one holding none"
+        );
+        let later = Identity {
+            birth: Birth(other.birth.0 + 1),
+            ..other
+        };
+        scope::keep_join_held(root.path(), revision, &later).unwrap();
+        assert_eq!(row(root.path()), own_join(note), "its pid, another process");
+        let ended = Identity {
+            pid: i32::MAX,
+            ..other
+        };
+        scope::keep_join_held(root.path(), revision, &ended).unwrap();
+        assert_eq!(
+            row(root.path()),
+            own_join(note),
+            "a process that no longer runs"
+        );
+        let mark = root.path().join(scope::JOIN_HELD);
+        assert!(mark.exists());
+        pass(&mut host, root.path(), revision, &mut None);
+        assert!(!mark.exists(), "a pass takes an ended process's mark away");
+    }
 }
 
 /// A Mac outside ALab whose plan sets up GitHub repositories too: the base plan and Repositories.
@@ -825,7 +839,7 @@ fn outside_alab_the_repositories_read_as_their_stage_runs_them() {
             .iter()
             .any(|call| call.ends_with(" agh GET /user"))
     };
-    for (status, note) in [(UNREACHED, scope::NOT_REACHED), (WAITING, scope::NO_VAULT)] {
+    for (status, note) in [(UNREACHED, scope::NOT_REACHED), (ABSENT, scope::NO_VAULT)] {
         let root = aterm_tempfile::tempdir().unwrap();
         let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
         let mut rows = [Try::new(status, note).row];

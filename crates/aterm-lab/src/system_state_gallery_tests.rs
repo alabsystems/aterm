@@ -8,6 +8,15 @@ fn args(words: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn presses_resolve_the_live_buttons_action_and_refuse_missing_or_ambiguous_controls() {
+    let controls = "ui key=\"a button\" role=Button label=\"Other action=wrong\" action=do/other state=enabled:true\nui key=\"text\" role=Text action=-\n";
+    assert_eq!(button_action(controls, "a button").unwrap(), "do/other");
+    assert!(button_action(controls, "text").is_err());
+    assert!(button_action(controls, "absent").is_err());
+    assert!(button_action(&format!("{controls}{controls}"), "a button").is_err());
+}
+
+#[test]
 fn the_fixtures_are_the_seams_own_list() {
     let all = parse_fixtures(FIXTURE_SOURCE).unwrap();
     assert!(all.len() > 10, "{all:?}");
@@ -18,13 +27,20 @@ fn the_fixtures_are_the_seams_own_list() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), all.len(), "each fixture once");
-    // A list whose count disagrees with its type, or no list at all, is refused.
-    assert!(parse_fixtures("const FIXTURES: [&str; 2] = [\"a\"];").is_err());
+    // Missing or unterminated slices are refused; appending names needs no second edit.
+    assert!(parse_fixtures("const FIXTURES: &[&str] = &[\"a\",").is_err());
     assert!(parse_fixtures("fn main() {}").is_err());
     assert_eq!(
-        parse_fixtures("pub(crate) const FIXTURES: [&str; 2] = [\n    \"a\",\n    \"b-c\",\n];")
+        parse_fixtures("pub(crate) const FIXTURES: &[&str] = &[\n    \"a\",\n    \"b-c\",\n];")
             .unwrap(),
         vec!["a", "b-c"]
+    );
+    assert_eq!(
+        parse_fixtures(
+            "pub(crate) const FIXTURES: &[&str] = &[\n    \"a\",\n    \"b-c\",\n    \"new\",\n];"
+        )
+        .unwrap(),
+        vec!["a", "b-c", "new"]
     );
 }
 
@@ -34,6 +50,7 @@ fn the_command_line_names_the_matrix() {
     assert_eq!(a.looks, Look::ALL.to_vec());
     assert_eq!(a.sizes, Size::ALL.to_vec());
     assert!(a.fixtures.is_none() && a.at.is_empty() && !a.quick);
+    assert_eq!(a.scroll, None);
     let a = parse_args(&args(&[
         "--quick",
         "--fixtures",
@@ -46,23 +63,42 @@ fn the_command_line_names_the_matrix() {
         "compact",
         "--at",
         "0,150",
+        "--scroll",
+        "bottom",
+        "--press",
+        "system-state/repositories/disclose",
+        "--press",
+        "system-state/repositories/repo//home/person/project,one",
+        "--press",
+        "system-state/repositories/disclose",
         "/tmp/out",
     ]))
     .unwrap();
     assert_eq!(a.looks, vec![Look::HcDark, Look::HcLight, Look::Light]);
     assert_eq!(a.sizes, vec![Size::Compact]);
     assert_eq!(a.at, vec![0, 150]);
+    assert_eq!(a.scroll, Some(ScrollPosition::Bottom));
+    assert_eq!(
+        a.press,
+        vec![
+            "system-state/repositories/disclose",
+            "system-state/repositories/repo//home/person/project,one",
+            "system-state/repositories/disclose",
+        ]
+    );
     assert_eq!(
         a.fixtures,
         Some(vec!["running".to_string(), "failed".to_string()])
     );
-    let quick = parse_args(&args(&["--quick", "/tmp/out"])).unwrap();
+    let quick = parse_args(&args(&["--quick", "--scroll", "top", "/tmp/out"])).unwrap();
+    assert_eq!(quick.scroll, Some(ScrollPosition::Top));
     assert_eq!(quick.looks, vec![Look::Dark, Look::Light]);
     assert_eq!(quick.sizes, vec![Size::Regular, Size::Compact]);
     for bad in [
         &["--looks", "sepia", "/tmp/out"][..],
         &["--sizes", "huge", "/tmp/out"],
         &["--at", "soon", "/tmp/out"],
+        &["--scroll", "middle", "/tmp/out"],
         &["--frobnicate", "/tmp/out"],
         &[],
         &["/tmp/a", "/tmp/b"],

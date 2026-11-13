@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use super::super::registered::volume;
+
 pub(super) const SUFFIX: &str = "-verify-retiring.noindex";
 const MAX_BYTES: usize = 32 << 10;
 
@@ -13,14 +15,50 @@ const MAX_BYTES: usize = 32 << 10;
 pub(super) struct Pending {
     schema: u32,
     snapshot: PathBuf,
-    snapshot_id: [u64; 2],
+    pub(super) snapshot_id: [u64; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) snapshot_volume: Option<volume::Uuid>,
     pub(super) entry: PathBuf,
-    entry_id: [u64; 2],
+    pub(super) entry_id: [u64; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) entry_volume: Option<volume::Uuid>,
     gitdir: Vec<u8>,
     pub(super) gitfile: Vec<u8>,
     pub(super) head: String,
     pub(super) tree_gone: bool,
     pub(super) started: [u64; 2],
+}
+
+impl Pending {
+    const fn snapshot_identity(&self) -> Identity {
+        Identity {
+            id: self.snapshot_id,
+            volume: self.snapshot_volume,
+        }
+    }
+
+    const fn entry_identity(&self) -> Identity {
+        Identity {
+            id: self.entry_id,
+            volume: self.entry_volume,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity {
+    id: [u64; 2],
+    volume: Option<volume::Uuid>,
+}
+
+impl Identity {
+    fn names(&self, now: &Self) -> bool {
+        self.id[1] == now.id[1]
+            && match &self.volume {
+                Some(volume) => now.volume.as_ref() == Some(volume),
+                None => self.id[0] == now.id[0],
+            }
+    }
 }
 
 fn location(path: &Path) -> Option<PathBuf> {
@@ -31,7 +69,7 @@ fn path(checkout: &Path) -> Result<PathBuf, String> {
     super::beside(checkout, SUFFIX).ok_or_else(|| "no snapshot receipt path".to_owned())
 }
 
-fn identity(path: &Path) -> Result<Option<[u64; 2]>, String> {
+fn identity(path: &Path) -> Result<Option<Identity>, String> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => meta,
         Ok(_) => return Err(format!("{} is no longer a directory", path.display())),
@@ -41,13 +79,31 @@ fn identity(path: &Path) -> Result<Option<[u64; 2]>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        Ok(Some([meta.dev(), meta.ino()]))
+        let volume = volume::at(aterm_dirfd::CWD, path)
+            .map_err(|error| format!("{} volume could not be read: {error}", path.display()))?;
+        let again = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+        if !again.is_dir() || (again.dev(), again.ino()) != (meta.dev(), meta.ino()) {
+            return Err(format!(
+                "{} changed while its identity was read",
+                path.display()
+            ));
+        }
+        Ok(Some(Identity {
+            id: [meta.dev(), meta.ino()],
+            volume,
+        }))
     }
     #[cfg(windows)]
     {
         let _ = meta;
         crate::platform::directory_identity(path)
-            .map(|(volume, index)| Some([u64::from(volume), index]))
+            .map(|(vol, index)| {
+                Some(Identity {
+                    id: [u64::from(vol), index],
+                    volume: None,
+                })
+            })
             .ok_or_else(|| "snapshot directory identity unavailable".to_owned())
     }
     #[cfg(not(any(unix, windows)))]
@@ -62,8 +118,36 @@ fn identity(path: &Path) -> Result<Option<[u64; 2]>, String> {
 /// ([`unchanged_since`]). Linux dates a write by its coarse clock (`CLOCK_REALTIME_COARSE`, the
 /// wall clock at its last tick), up to a tick behind the wall clock, so a file written just
 /// after a read of the wall clock can be dated before it; a write in the tick that reading
-/// falls in is then dated at the cutoff, and stays. Elsewhere it is the wall clock.
+/// falls in is then dated at the cutoff, and stays. Windows dates a write by the system time at
+/// its last tick too (about 15.6 ms), which `GetSystemTimeAsFileTime` reads, while
+/// [`SystemTime::now`] there is the precise clock: measured on Windows 11, 210 of 300 files
+/// written just after a precise read were dated before it, none of 300 after a coarse read.
+/// Elsewhere it is the wall clock.
 pub(super) fn file_clock_now() -> SystemTime {
+    #[cfg(windows)]
+    {
+        /// 100 ns ticks between the `FILETIME` epoch (1601-01-01 UTC) and the Unix epoch.
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        unsafe extern "system" {
+            fn GetSystemTimeAsFileTime(now: *mut FileTime);
+        }
+        let mut now = FileTime { low: 0, high: 0 };
+        // SAFETY: `GetSystemTimeAsFileTime` writes the one `FILETIME` it is handed, live on this
+        // frame, and cannot fail.
+        unsafe { GetSystemTimeAsFileTime(&raw mut now) };
+        let ticks = (u64::from(now.high) << 32) | u64::from(now.low);
+        if let Some(nanos) = ticks
+            .checked_sub(UNIX_EPOCH_TICKS)
+            .and_then(|since| since.checked_mul(100))
+        {
+            return SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos);
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         const CLOCK_REALTIME_COARSE: libc::clockid_t = 5;
@@ -179,8 +263,8 @@ fn read_bound(
     {
         return Err("snapshot removal receipt no longer names this snapshot".to_owned());
     }
-    if let Some(id) = identity(wt)? {
-        if pending.tree_gone || id != pending.snapshot_id {
+    if let Some(now) = identity(wt)? {
+        if pending.tree_gone || !pending.snapshot_identity().names(&now) {
             return Err("snapshot was replaced after removal began".to_owned());
         }
         let gitfile = wt.join(".git");
@@ -199,8 +283,8 @@ fn read_bound(
             "snapshot disappeared before its removal was proved; it may have moved".to_owned(),
         );
     }
-    if let Some(id) = identity(&pending.entry)? {
-        if id != pending.entry_id {
+    if let Some(now) = identity(&pending.entry)? {
+        if !pending.entry_identity().names(&now) {
             return Err("snapshot Git entry changed after removal began".to_owned());
         }
         let gitdir = pending.entry.join("gitdir");
@@ -229,12 +313,16 @@ pub(super) fn prepare(
     let started = started
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|error| format!("snapshot removal clock is before the epoch: {error}"))?;
+    let snapshot_identity = identity(wt)?.ok_or("snapshot disappeared before removal")?;
+    let entry_identity = identity(entry)?.ok_or("snapshot Git entry disappeared before removal")?;
     let pending = Pending {
         schema: 1,
         snapshot: location(wt).ok_or("snapshot location unavailable")?,
-        snapshot_id: identity(wt)?.ok_or("snapshot disappeared before removal")?,
+        snapshot_id: snapshot_identity.id,
+        snapshot_volume: snapshot_identity.volume,
         entry: entry.to_path_buf(),
-        entry_id: identity(entry)?.ok_or("snapshot Git entry disappeared before removal")?,
+        entry_id: entry_identity.id,
+        entry_volume: entry_identity.volume,
         gitdir: super::gitfile_text(&entry.join("gitdir")).ok_or("snapshot gitdir unreadable")?,
         gitfile: gitfile.to_vec(),
         head: head.to_owned(),

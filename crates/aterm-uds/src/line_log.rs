@@ -52,20 +52,125 @@ pub fn append(path: &Path, line: &str) -> io::Result<()> {
     if line.contains('\n') {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    let _lock = lock(path)?;
-    let mut file = open_append(path)?;
-    let len = file.metadata()?.len();
-    if len > 0 {
-        file.seek(SeekFrom::Start(len - 1))?;
-        let mut last = [0];
-        file.read_exact(&mut last)?;
-        if &last != b"\n" {
-            file.write_all(b"\n")?;
+    hold(path)?.append(&[line]).map(drop)
+}
+
+/// The log at a path, open under its [`lock`] until dropped: a writer that must read what other
+/// writers appended before it decides what to append (a counter folded from the rows) reads and
+/// appends under one hold.
+pub struct Held {
+    _lock: crate::file_lock::LockFile,
+    file: File,
+}
+
+/// Which file a [`Held`] log is and how long: a reader that kept an earlier identity reads only
+/// the bytes past its `len`, or the whole file again where `dev` or `ino` changed (another
+/// process replaced it) or it shrank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// The device the file is on (0 off Unix).
+    pub dev: u64,
+    /// Its inode (off Unix, its creation time in 100 ns units).
+    pub ino: u64,
+    /// Its length in bytes.
+    pub len: u64,
+}
+
+/// [`Identity`] of a file's metadata.
+#[must_use]
+pub fn identity_of(meta: &std::fs::Metadata) -> Identity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Identity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
         }
     }
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        Identity {
+            dev: 0,
+            ino: meta.creation_time(),
+            len: meta.len(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Identity {
+            dev: 0,
+            ino: 0,
+            len: meta.len(),
+        }
+    }
+}
+
+/// Open the log at `path` under its [`lock`], creating it as [`ensure`] does.
+///
+/// # Errors
+/// [`ensure`]'s.
+pub fn hold(path: &Path) -> io::Result<Held> {
+    let lock = lock(path)?;
+    let file = open_append(path)?;
+    Ok(Held { _lock: lock, file })
+}
+
+impl Held {
+    /// The held file's [`Identity`] now.
+    ///
+    /// # Errors
+    /// Its metadata's.
+    pub fn identity(&self) -> io::Result<Identity> {
+        Ok(identity_of(&self.file.metadata()?))
+    }
+
+    /// At most `max` bytes from `offset` on.
+    ///
+    /// # Errors
+    /// A seek or read error.
+    pub fn read_from(&mut self, offset: u64, max: u64) -> io::Result<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut out = Vec::new();
+        (&self.file).take(max).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Append `lines`, each with its newline, in one write after the delimiter an interrupted
+    /// final row lacks ([`append`]); the file's length after them.
+    ///
+    /// # Errors
+    /// A newline in any line (nothing is written), or any read, seek, write or flush error.
+    pub fn append(&mut self, lines: &[&str]) -> io::Result<u64> {
+        if lines.iter().any(|line| line.contains('\n')) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let len = self.file.metadata()?.len();
+        let mut bytes =
+            Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum::<usize>() + 1);
+        if len > 0 {
+            self.file.seek(SeekFrom::Start(len - 1))?;
+            let mut last = [0];
+            self.file.read_exact(&mut last)?;
+            if &last != b"\n" {
+                bytes.push(b'\n');
+            }
+        }
+        for line in lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        self.file.write_all(&bytes)?;
+        self.file.flush()?;
+        Ok(len + bytes.len() as u64)
+    }
+
+    /// The held file, for a flush ([`aterm_durable::ordered`]).
+    #[must_use]
+    pub const fn file(&self) -> &File {
+        &self.file
+    }
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -101,33 +206,5 @@ fn open_append(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_multiline_append_is_refused_without_mutation_or_creation() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let path = tmp.path().join("ledger");
-        assert_eq!(
-            append(&path, "a\nb").unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert!(!path.exists());
-        assert!(!path.with_file_name("ledger.lock").exists());
-        std::fs::write(&path, b"keep").unwrap();
-        assert!(append(&path, "\n").is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
-        append(&path, "next").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"keep\nnext\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let created = tmp.path().join("new");
-            ensure(&created).unwrap();
-            assert_eq!(
-                std::fs::metadata(created).unwrap().permissions().mode() & 0o077,
-                0
-            );
-        }
-    }
-}
+#[path = "line_log_tests.rs"]
+mod tests;

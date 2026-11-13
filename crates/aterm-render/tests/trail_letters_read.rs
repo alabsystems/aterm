@@ -92,12 +92,19 @@ fn median(n: usize, at: impl Fn(usize) -> u32) -> u32 {
     let first = at(0) & 0x00FF_FFFF;
     let mut chan = [[0u8; RING_MOST]; 3];
     let mut uniform = true;
-    for i in 0..n {
+    let [red, green, blue] = &mut chan;
+    for (i, ((r, g), b)) in red
+        .iter_mut()
+        .zip(green.iter_mut())
+        .zip(blue.iter_mut())
+        .take(n)
+        .enumerate()
+    {
         let p = at(i);
         uniform &= p & 0x00FF_FFFF == first;
-        chan[0][i] = (p >> 16) as u8;
-        chan[1][i] = (p >> 8) as u8;
-        chan[2][i] = p as u8;
+        *r = (p >> 16) as u8;
+        *g = (p >> 8) as u8;
+        *b = p as u8;
     }
     if uniform {
         return first;
@@ -448,11 +455,27 @@ pub struct Coat {
     /// it (`steam_tests::reach_of`): a box a pixel down into a lettered row reaches across every
     /// cell of it under its width.
     pub box_reach: usize,
-    /// The caret cell's pixels the body covers.
+    /// The caret cell's pixels the body covers: its runs on the knock layer, which a body drawn
+    /// under the letters has and one drawn over blank ground does not (`box_on_caret` reads that
+    /// one).
     pub caret_px: usize,
+    /// Whether the pet's drawn box lies on the caret's cell as the companion's brain judges a
+    /// box ([`aterm_effects::kitty_pet::lies_on_the_caret`]: past the box's first cell, short of
+    /// its transparent end), over the letters or under them alike.
+    pub box_on_caret: bool,
     /// The word icons on glass, frame px, and the pixels of the pet's box that meet them.
     pub icons: Vec<(i32, i32, i32, i32)>,
     pub icon_px: usize,
+    /// The page the frame drew, for a reader that seats a body on it (`seat_replay`): each
+    /// row's cells, lettered (a glyph that is no white space, and a wide glyph's second cell)
+    /// or not, across every column of the pane.
+    pub lettered: Vec<Vec<bool>>,
+    /// The caret's cell on that page, `(row, col)`.
+    pub caret_cell: (usize, usize),
+    /// The pet's drawn box and the word icons on the pane's grid, in cells from the grid's
+    /// first: `(col0, col1, row0, row1)`.
+    pub pet_cells: Option<(f32, f32, f32, f32)>,
+    pub icon_cells: Vec<(f32, f32, f32, f32)>,
 }
 
 /// The px band under a row's bottom a rail laid clear of the letter guard's ring lies in
@@ -564,6 +587,33 @@ pub struct Kept {
     /// The ground the effects read a bar or underline caret against this frame
     /// (`EffectsPipeline::thin_caret_ground`).
     pub caret_ground: Option<u32>,
+    /// What the frame's sidecars would say of it ([`Glass`]).
+    pub glass: Glass,
+}
+
+/// What a kept frame's sidecars say of it, as the trail gallery keeps them beside a real
+/// frame: the screen's rows (`aterm ctl text`), the caret's visibility and style (`cursor`),
+/// and of `trail status` the fields `aterm-lab`'s frame readers use. Boxes are frame px
+/// `(x0, x1, y0, y1)`, end exclusive.
+#[derive(Clone, Debug)]
+pub struct Glass {
+    pub text: Vec<String>,
+    pub caret_visible: bool,
+    pub caret_style: aterm_core::terminal::CursorStyle,
+    /// The companion's drawn body ([`Coat::pet`]) and the alpha the frame put it on glass at.
+    pub pet_body: Option<(i32, i32, i32, i32)>,
+    pub pet_alpha: u8,
+    /// The pose the frame drew and the brain's action (`pet_pose=`, `pet_action=`).
+    pub pet_pose: &'static str,
+    pub pet_action: String,
+    /// The one seat rule's answer beside the frame (`pet_seat=`); nothing is drawn from it.
+    pub pet_seat: String,
+    /// The flying head's drawn body (`head_body=`).
+    pub head_body: Option<(i32, i32, i32, i32)>,
+    /// The word icons on glass (`word_icons=`).
+    pub word_icons: Vec<(i32, i32, i32, i32)>,
+    /// Rainbow kitty v2's quads, halos, stars and meteors, where it owns the frame.
+    pub v2: Option<[u32; 4]>,
 }
 
 /// `cursor_glow_sdr_boost`'s default, the SDR crown's ([`Replay::post`]).
@@ -646,6 +696,80 @@ pub fn lays_the_bundled_cell() -> bool {
     gallery_cell() == BUNDLED_CELL
 }
 
+/// What a replay's `style` word asks for: a `cursor_trail_style`, the pet beside it, and the
+/// rainbow's ribbon body.
+///
+/// The word is `[tall |flat ]<cursor_trail_style>[ + cat| + dog]`. `rainbow` is the shipped
+/// theme, the underline, and `rainbow + cat` the shipped default beside its pet. `tall` and
+/// `flat` name the two ribbon bodies no built-in theme picks
+/// ([`EffectsPipeline::set_ribbon_shape`]): the replays keep judging them while the engine
+/// keeps them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spec<'a> {
+    pub trail: &'a str,
+    pub pet: Option<aterm_effects::kitty_pet::PetSpecies>,
+    pub tall: bool,
+    pub flat: bool,
+}
+
+impl<'a> Spec<'a> {
+    pub fn of(word: &'a str) -> Self {
+        let (body, pet) = match word.split_once(" + ") {
+            Some((body, pet)) => (
+                body,
+                Some(
+                    aterm_effects::cursor_pet::species(pet)
+                        .unwrap_or_else(|| panic!("{word:?}: {pet:?} is no pet")),
+                ),
+            ),
+            None => (word, None),
+        };
+        let (trail, tall, flat) = if let Some(trail) = body.strip_prefix("tall ") {
+            (trail, true, false)
+        } else if let Some(trail) = body.strip_prefix("flat ") {
+            (trail, true, true)
+        } else {
+            (body, false, false)
+        };
+        assert!(
+            aterm_effects::cursor_glow::spellings::row(trail).is_some(),
+            "{word:?}: {trail:?} is no cursor_trail_style"
+        );
+        Self {
+            trail,
+            pet,
+            tall,
+            flat,
+        }
+    }
+}
+
+/// `fx`'s glow as `word` ([`Spec`]) asks, at the gallery's knobs.
+pub fn set_glow(
+    fx: &mut EffectsPipeline,
+    word: &str,
+    trail_color: TrailColor,
+    intensity: f32,
+    cursor: u32,
+) {
+    let spec = Spec::of(word);
+    fx.set_cursor_glow(
+        true,
+        spec.trail,
+        trail_color,
+        None,
+        260,
+        24,
+        intensity,
+        0.6,
+        true,
+        cursor,
+    );
+    if spec.tall {
+        fx.set_ribbon_shape(true, spec.flat);
+    }
+}
+
 impl Replay {
     pub fn new(style: &str, look: Look, trail_color: TrailColor) -> Self {
         Self::sized(style, look, trail_color, ROWS)
@@ -700,20 +824,18 @@ impl Replay {
         let mut fx = EffectsPipeline::new();
         fx.set_focused(true);
         let classic = style.trim().eq_ignore_ascii_case("classic");
-        fx.set_cursor_glow(
-            true,
+        set_glow(
+            &mut fx,
             style,
             trail_color,
-            None,
-            260,
-            24,
             if classic { 0.7 } else { 1.0 },
-            0.6,
-            true,
             look.cursor,
         );
-        let pet = aterm_effects::cursor_glow::GlowStyle::style_names_any_pet(style);
-        fx.set_cursor_pet(pet, 0x5EED);
+        let pet = Spec::of(style).pet;
+        if let Some(species) = pet {
+            fx.set_cursor_pet_species(species);
+        }
+        fx.set_cursor_pet(pet.is_some(), 0x5EED);
         Self {
             term,
             fx,
@@ -758,6 +880,44 @@ impl Replay {
             wall_ms: None,
         };
         self.term.process_at(bytes, at);
+    }
+
+    /// The frame just applied as its sidecars would name it ([`Glass`]), the grid's origin on
+    /// the frame at `(px, py)`: the effects name their boxes in grid px here, as
+    /// [`Coat::pet`] reads the companion's.
+    fn glass(&self, (px, py): (i32, i32)) -> Glass {
+        let placed = |(x0, x1, y0, y1): (i32, i32, i32, i32)| (x0 + px, x1 + px, y0 + py, y1 + py);
+        let pet_body = self.fx.companion_hit_rect().map(placed);
+        let brain = self.fx.companion().brain();
+        Glass {
+            text: (0..usize::from(self.rows))
+                .map(|row| self.term.row_text(row).unwrap_or_default())
+                .collect(),
+            caret_visible: self.term.cursor_visible(),
+            caret_style: self.term.cursor_style(),
+            pet_body,
+            pet_alpha: self.fx.cursor_pet_alpha(),
+            pet_pose: brain.pose_name(),
+            pet_seat: brain.seat_shadow().to_string(),
+            pet_action: match pet_body {
+                Some(_) => format!("{:?}", brain.action()).to_ascii_lowercase(),
+                None => "none".to_string(),
+            },
+            head_body: self.fx.cursor().glow.head_body_window_box().map(placed),
+            word_icons: self
+                .fx
+                .word_icon_boxes()
+                .iter()
+                .copied()
+                .map(placed)
+                .collect(),
+            v2: self
+                .fx
+                .cursor()
+                .glow
+                .v2_status()
+                .map(|s| [s.quads, s.halos, s.stars, s.meteors]),
+        }
     }
 
     /// Present one frame and judge its letters.
@@ -895,7 +1055,42 @@ impl Replay {
                 .iter()
                 .map(|&(x0, x1, y0, y1)| (x0 + px, x1 + px, y0 + py, y1 + py))
                 .collect();
+            coat.caret_cell = caret;
+            coat.lettered = input
+                .cells
+                .iter()
+                .map(|line| {
+                    let mut row = vec![false; cols];
+                    for (col, c) in line.iter().enumerate().take(cols) {
+                        if !(c.ch == '\0' || c.ch.is_control() || c.ch.is_whitespace()) {
+                            row[col] = true;
+                            if c.wide && col + 1 < cols {
+                                row[col + 1] = true;
+                            }
+                        }
+                    }
+                    row
+                })
+                .collect();
+            let in_cells = |(x0, x1, y0, y1): (i32, i32, i32, i32)| {
+                (
+                    (x0 - px) as f32 / cw as f32,
+                    (x1 - px) as f32 / cw as f32,
+                    (y0 - py) as f32 / ch as f32,
+                    (y1 - py) as f32 / ch as f32,
+                )
+            };
+            coat.pet_cells = pet.map(in_cells);
+            coat.icon_cells = coat.icons.iter().copied().map(in_cells).collect();
             if let Some((qx0, qx1, qy0, qy1)) = pet {
+                let (crow, ccol) = caret;
+                let (cy0, cy1) = (place.grid_top + crow * ch, place.grid_top + (crow + 1) * ch);
+                let cell = |x: i32| (x - place.pad as i32) as f32 / cw as f32;
+                coat.box_on_caret = qy0 < cy1 as i32
+                    && qy1 > cy0 as i32
+                    && u16::try_from(ccol).is_ok_and(|cc| {
+                        aterm_effects::kitty_pet::lies_on_the_caret((cell(qx0), cell(qx1)), cc)
+                    });
                 let meets = |b: &aterm_render::KnockRect| {
                     b.x0 < qx1 && b.x1 > qx0 && b.y0 < qy1 && b.y1 > qy0
                 };
@@ -918,15 +1113,19 @@ impl Replay {
                     })
                 };
                 for (row, line) in input.cells.iter().enumerate() {
-                    for (col, c) in line.iter().enumerate().take(cols) {
+                    // Every column of the row, its cells or not: a row's cells end at its last
+                    // written one, and the caret past them (a line typed to its end, the margin's
+                    // wall) is judged too.
+                    for col in 0..cols {
+                        let letter = line.get(col).map_or(' ', |c| c.ch);
                         let is_caret = (row, col) == caret;
-                        let glyph = !(c.ch == ' ' || c.ch == '\0' || c.ch.is_control());
+                        let glyph = !(letter == ' ' || letter == '\0' || letter.is_control());
                         if !glyph && !is_caret {
                             continue;
                         }
                         let (x0, y0) = (place.pad + col * cw, place.grid_top + row * ch);
                         if glyph
-                            && !c.ch.is_whitespace()
+                            && !letter.is_whitespace()
                             && (x0 as i32) < qx1
                             && (x0 + cw) as i32 > qx0
                             && (y0 as i32) < qy1
@@ -983,6 +1182,7 @@ impl Replay {
                 caret,
                 cell: self.cell,
                 caret_ground: self.fx.thin_caret_ground(),
+                glass: self.glass((place.pad as i32, place.grid_top as i32)),
             };
             match &self.keep_to {
                 Some(to) => to.send(kept).expect("the kept frames' reader"),
@@ -1176,8 +1376,9 @@ impl Replay {
                     self.fx.note_console_input(PetInputKind::Delete);
                     self.fx.note_keystroke();
                 }
-                (0, Ev::Key(LEFT, _)) => {
-                    // A window's Left arrow: the console's move along the line and the keystroke.
+                (0, Ev::Key(LEFT | HOME | END, _)) => {
+                    // A window's Left arrow, Home or End: the console's move along the line and
+                    // the keystroke.
                     self.fx.note_console_input(PetInputKind::Navigate);
                     self.fx.note_keystroke();
                 }
@@ -1236,6 +1437,9 @@ pub const GAPPED_TEXT: &str = "echo the quick brown fox jumps over the lazy dog 
 const _: () = assert!(GAPPED_TEXT.len() == BURST_TEXT.len());
 /// A Left arrow's key in a replay's events: the console reads it as a move along the line.
 pub const LEFT: char = '\u{2190}';
+/// A Home key's and an End key's in a replay's events: each a move along the line, as [`LEFT`].
+pub const HOME: char = '\u{21e4}';
+pub const END: char = '\u{21e5}';
 
 /// What [`Scene::LastRowRoom`]'s line does once its burst is typed, before its Enter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1619,12 +1823,15 @@ pub fn worst(judged: &[Judged]) -> Option<(u64, Letter)> {
         .min_by(|a, b| a.1.judged().total_cmp(&b.1.judged()))
 }
 
-pub const STYLES: [&str; 14] = [
-    "rainbow kitty pet",
-    "rainbow kitty underline",
-    "rainbow dog",
-    "flat rainbow",
-    "nyan rainbow",
+pub const STYLES: [&str; 17] = [
+    "tall rainbow + cat",
+    "rainbow + cat",
+    "rainbow + dog",
+    "rainbow",
+    "tall rainbow + dog",
+    "flat rainbow + cat",
+    "tall rainbow",
+    "fire + dog",
     "phaser",
     "fire",
     "water",
@@ -1730,9 +1937,10 @@ fn replay_with(
     let mut r = Replay::sized(style, look, color, scene.rows());
     r.letters = true;
     if matches!(color, TrailColor::Pinned(_)) {
+        let spec = Spec::of(style);
         r.fx.set_cursor_glow(
             true,
-            style,
+            spec.trail,
             color,
             None,
             260,
@@ -1742,6 +1950,9 @@ fn replay_with(
             true,
             look.cursor,
         );
+        if spec.tall {
+            r.fx.set_ribbon_shape(true, spec.flat);
+        }
     }
     r.fx.set_letter_guard(guard);
     r.fx.set_bloom_spares_letters(spares);
@@ -1786,7 +1997,7 @@ pub fn replay_all_in(
     dump: impl Fn(&str, Look, Scene) -> Vec<(u64, String)> + Sync,
     color: TrailColor,
 ) -> Vec<Verdict> {
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let dump = &dump;
     std::thread::scope(|s| {
         let handles: Vec<_> = jobs
@@ -1967,7 +2178,7 @@ fn without_the_letter_guard_the_trails_bury_letters() {
         ("sparkle", DARK, Scene::Typing),
         ("water", DARK, Scene::Typing),
         ("water", DEFAULT_LIGHT, water),
-        ("nyan rainbow", DARK, Scene::Burst),
+        ("tall rainbow", DARK, Scene::Burst),
     ];
     if cfg!(target_os = "macos") {
         jobs.extend([
@@ -2223,7 +2434,7 @@ fn a_dim_theme_s_letters_take_no_bloom() {
             }
         }
     }
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let worst = &worst;
     let verdicts: Vec<(&str, Look, Scene, f64)> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
@@ -2436,7 +2647,7 @@ fn a_dim_letter_keeps_its_own_reading() {
         }
         (verdict, least)
     };
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let least = &least;
     let sweep = |jobs: &[(&'static str, Look, Scene)], k: Knobs| -> Vec<(Verdict, OwnShare)> {
         std::thread::scope(|s| {
@@ -2522,7 +2733,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     // does not (Linux's measured cell). The nyan rainbow's wrapped line, round 27's control, is
     // read by its ring at that size too.
     let fire = ("fire", DIM_GREY, Scene::Wrapped);
-    let nyan = ("nyan rainbow", SOLARIZED_DARK, Scene::Wrapped);
+    let nyan = ("tall rainbow", SOLARIZED_DARK, Scene::Wrapped);
     let px = if lays_the_gallery_row() {
         GALLERY_PX
     } else {
@@ -2542,10 +2753,13 @@ fn a_dim_letter_keeps_its_own_reading() {
             failed.join("\n")
         );
     }
+    // Windows' own face (Iosevka Term NL) lays thinner letters that keep their reading under
+    // this control at either size, so it replays in the face the control was measured in.
     let luminance = Knobs {
         ring: false,
         channels: false,
         px,
+        face: cfg!(windows).then_some(JETBRAINS_MONO),
         ..SHIPPED
     };
     assert!(
@@ -2556,7 +2770,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     // The underlined lines' controls, in the face and cell they were measured in: a letter read
     // by its solid ink against its grounds' least and greatest luminance, and the rails parting
     // round no underline's stroke.
-    let underlined = ("rainbow kitty underline", SOLARIZED_DARK, Scene::Underlined);
+    let underlined = ("rainbow + cat", SOLARIZED_DARK, Scene::Underlined);
     let luma = Knobs {
         channels: false,
         face: Some(JETBRAINS_MONO),
@@ -2568,7 +2782,7 @@ fn a_dim_letter_keeps_its_own_reading() {
          letter's own reading"
     );
     let over_selection = (
-        "rainbow kitty pet",
+        "tall rainbow + cat",
         SOLARIZED_DARK,
         Scene::UnderlinedContext,
     );
@@ -2599,7 +2813,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     );
     let controls = [
         ("sparkle", DIM_GREY, Scene::Typing),
-        ("rainbow kitty pet", DIM_GREY, Scene::Burst),
+        ("tall rainbow + cat", DIM_GREY, Scene::Burst),
         ("laser", SOLARIZED_DARK, Scene::EnterBottom),
         ("water", SOLARIZED_DARK, Scene::Typing),
     ];
@@ -2687,7 +2901,7 @@ fn a_dim_letter_with_no_raster_keeps_its_own_reading() {
     if control.3 != GALLERY_PX {
         jobs.push(control);
     }
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let least = &least;
     let verdicts: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
@@ -2755,22 +2969,6 @@ const PAPER_AT_AA: Look = Look {
     cursor: 0x001A_7F37,
 };
 
-/// The one scene [`a_letter_at_aa_keeps_aa`] holds to what it reads, not to AA: Beam bursting on
-/// Solarized Dark, whose light there was drawn past the letter guard's reach (PRISM-GLASS amendment
-/// 65's "Left", fix-forward). It read [`BEAM_BURST_LEFT_UNDER`] letters at AA under it, none under
-/// [`BEAM_BURST_LEFT_LEAST`]. On Linux's face that light is its body, a page shade the guard kept
-/// whole: held by the guard (`CursorGlow::hold_page_shades`), none of the burst's 376 readings of
-/// a letter at AA there is under it, the least a `j` at its own 4.5086, and with the shade kept
-/// whole 2 of 377 are, the least 4.4963 (Linux arm64, 2026-11-07). Whether it is the light under
-/// the `d` a Mac read is unmeasured: no Mac has read the burst under the hold, so its bound
-/// stands.
-const BEAM_BURST_LEFT: (&str, Look, Scene) = ("beam", SOLARIZED_DARK, Scene::Burst);
-/// The letters at AA [`BEAM_BURST_LEFT`] reads under it, as it was left.
-const BEAM_BURST_LEFT_UNDER: usize = 2;
-/// The least reading of a letter at AA under [`BEAM_BURST_LEFT`], as it was left (its `d`, 4.490 of
-/// its own 4.509), a hair under.
-const BEAM_BURST_LEFT_LEAST: f64 = 4.489;
-
 /// After-land round 3 (W8), A LETTER AT AA KEEPS AA: the legibility law's bar is 4.5, so a letter
 /// that reads 4.5 or more on its bare page reads 4.5 or more under every light, and only a letter
 /// under it keeps its share of its own (`OWN_SHARE`). The guard held a letter under its floor at
@@ -2778,22 +2976,22 @@ const BEAM_BURST_LEFT_LEAST: f64 = 4.489;
 /// Comet's tail. Every style (Classic's spectrum face is ruled on dark pages only), typing, a burst
 /// and an Enter at the bottom row on a paper page whose text reads between AA and the floor, and
 /// every style but Classic on Solarized Dark, through the host's post passes: every letter whose
-/// own reading lies between AA and the floor reads AA or more on every frame, save Beam's burst on
-/// Solarized Dark ([`BEAM_BURST_LEFT`]), which is held to what main read there: its light drawn
-/// past the guard's reach, two letters at AA under it, the least a `d` of its own 4.509 at 4.490
-/// (with the guard off, 18, the least 3.51). Negative control (`with_share_over_aa`): such a letter
-/// keeping 97% of its reading, some style buries one under AA on each page.
+/// own reading lies between AA and the floor reads AA or more on every frame. Negative control
+/// (`with_share_over_aa`): such a letter keeping 97% of its reading, some style buries one under
+/// AA on each page.
 ///
 /// Beam's body on Solarized Dark is a page shade (`InkLedger::note_page_shade_laid`), which the
-/// guard holds to the letters it reaches by itself. Kept whole, a ring lying on it and on the page
-/// read, by each channel's median (the upper one of an even count), a ground brighter than either,
-/// and on Linux's face Beam's `w`, 4.509 on its page, read 4.488 typing and at an Enter on the
-/// bottom row (Linux arm64, 2026-11-07). Negative control (`set_letter_guard_shades`): each page
-/// shade kept whole, Beam on Solarized Dark reads more letters at AA under AA over its three scenes
-/// than held where the face lays Linux's cells ([`lays_the_bundled_cell`]), 4 against none there
-/// (Linux arm64, 2026-11-07), and on another face at least as many. No Mac has measured it: main
-/// read 2 there with the shade kept whole, in the burst ([`BEAM_BURST_LEFT`]), and whether the hold
-/// lowers them on a Mac is unread.
+/// guard holds to the letters it reaches by itself (`CursorGlow::hold_page_shades`). Kept whole, a
+/// ring lying on it and on the page read, by each channel's median (the upper one of an even
+/// count), a ground brighter than either: on Linux's face Beam's `w`, 4.509 on its page, read 4.488
+/// typing and at an Enter on the bottom row (Linux arm64, 2026-11-07), and on the Mac's its burst's
+/// `d` (row 4, column 47), 4.5086 on its page, read 4.4900 and 4.4963 at 3584 and 3600 ms, the two
+/// letters this law left Beam's burst there before the hold was read on a Mac (macOS, 2026-11-11).
+/// Held, the `d` reads its own 4.5086. Negative control (`set_letter_guard_shades`): each page shade
+/// kept whole, Beam on Solarized Dark reads more letters at AA under AA over its three scenes than
+/// held where the face is one the hold was measured on: 4 against none on Linux's
+/// ([`lays_the_bundled_cell`]), 2 against none on the Mac's ([`lays_the_gallery_row`]), and on
+/// another face at least as many.
 #[test]
 fn a_letter_at_aa_keeps_aa() {
     const SCENES: [Scene; 3] = [Scene::Typing, Scene::Burst, Scene::EnterBottom];
@@ -2829,7 +3027,7 @@ fn a_letter_at_aa_keeps_aa() {
         (style, look.name, scene, at, under, least)
     };
     let sweep = |jobs: &[(&'static str, Look, Scene)], share: bool| {
-        let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+        let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
         let read = &read;
         std::thread::scope(|s| {
             let handles: Vec<_> = jobs
@@ -2856,22 +3054,10 @@ fn a_letter_at_aa_keeps_aa() {
             .filter(|&s| look.bg == PAPER_AT_AA.bg || s != "classic")
         {
             for scene in SCENES {
-                if (style, look.bg, scene)
-                    != (BEAM_BURST_LEFT.0, BEAM_BURST_LEFT.1.bg, BEAM_BURST_LEFT.2)
-                {
-                    jobs.push((style, look, scene));
-                }
+                jobs.push((style, look, scene));
             }
         }
     }
-    let (style, look, scene) = BEAM_BURST_LEFT;
-    let (.., at, burst_under, (least, ms, ch)) = read(style, look, scene, false, true);
-    assert!(
-        at > 0 && burst_under <= BEAM_BURST_LEFT_UNDER && least >= BEAM_BURST_LEFT_LEAST,
-        "{style} on {} {scene:?} reads worse than it was left: {burst_under} of {at} under AA (left \
-         {BEAM_BURST_LEFT_UNDER}), `{ch}` {least:.4} at {ms} ms (left {BEAM_BURST_LEFT_LEAST})",
-        look.name
-    );
     let swept = sweep(&jobs, false);
     assert_eq!(swept.len(), jobs.len());
     for look in [PAPER_AT_AA, SOLARIZED_DARK] {
@@ -2896,17 +3082,16 @@ fn a_letter_at_aa_keeps_aa() {
         "letters at AA read under it:\n{}",
         fell.join("\n")
     );
-    let held = burst_under
-        + swept
-            .iter()
-            .filter(|v| (v.0, v.1) == ("beam", SOLARIZED_DARK.name))
-            .map(|v| v.4)
-            .sum::<usize>();
+    let held: usize = swept
+        .iter()
+        .filter(|v| (v.0, v.1) == ("beam", SOLARIZED_DARK.name))
+        .map(|v| v.4)
+        .sum();
     let whole: usize = SCENES
         .into_iter()
         .map(|scene| read("beam", SOLARIZED_DARK, scene, false, false).4)
         .sum();
-    if lays_the_bundled_cell() {
+    if lays_the_bundled_cell() || lays_the_gallery_row() {
         assert!(
             whole > held,
             "control: each page shade kept whole, Beam on Solarized Dark reads {whole} letters at \
@@ -2990,7 +3175,7 @@ fn the_cursor_trail_s_fill_is_a_letter_s_ground() {
             }
         }
     }
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let run = &run;
     let verdicts: Vec<Verdict> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
@@ -3219,9 +3404,13 @@ fn beam_s_body_on_a_dim_page_reaches_the_caret() {
 ///
 /// Both the law and the second control rest on the face: they need a letter of its own reading
 /// under AA's level in hand behind the caret, which the whole body lifts short of that bar. They
-/// were measured on Linux's bundled face ([`lays_the_bundled_cell`]), where none falls held and the
-/// second control is required. On any other face, which no Mac has measured, each scene lets no
-/// more fall held than held to the raster bar.
+/// were measured on Linux's bundled face ([`lays_the_bundled_cell`]) and on the Mac's
+/// ([`lays_the_gallery_row`]), where none falls held and the second control is required. On the
+/// Mac's, of the 257 cells typing, 623 bursting, 98 typing CJK, 293 at the Enter and 950 past the
+/// margin that W6 reads at its bar with the body whole, none falls held; held to the raster bar, 16
+/// fall bursting and 22 past the margin, the first the `d` of column 47 at 0.035 against 0.052
+/// whole (macOS, 2026-11-11). On any other face each scene lets no more fall held than held to the
+/// raster bar.
 #[test]
 fn beam_s_held_body_reaches_the_caret_on_every_frame() {
     use std::sync::mpsc::sync_channel;
@@ -3300,7 +3489,7 @@ fn beam_s_held_body_reaches_the_caret_on_every_frame() {
             (scene, read, at_bar, fell, first)
         })
     };
-    let bundled = lays_the_bundled_cell();
+    let measured = lays_the_bundled_cell() || lays_the_gallery_row();
     let held = SCENES.map(|scene| read(scene, |_| {}));
     let to_bar = SCENES.map(|scene| read(scene, |fx| fx.set_letter_guard_shades_to_own(false)));
     for ((scene, frames, at_bar, fell, first), bar) in held.into_iter().zip(&to_bar) {
@@ -3308,7 +3497,7 @@ fn beam_s_held_body_reaches_the_caret_on_every_frame() {
             frames > 0 && at_bar > 0,
             "premise: {scene:?}: {frames} frames, {at_bar} cells behind the caret at W6's bar"
         );
-        if bundled {
+        if measured {
             assert_eq!(
                 fell, 0,
                 "{scene:?}: of {at_bar} cells behind the caret at W6's bar with Beam's body \
@@ -3330,7 +3519,7 @@ fn beam_s_held_body_reaches_the_caret_on_every_frame() {
         "control: weighed with the lights in its cells, Beam's body keeps W6's bar behind the \
          caret: {weighed:?}"
     );
-    if bundled {
+    if measured {
         assert!(
             to_bar.iter().any(|v| v.3 > 0),
             "control: each letter held to its raster bar, Beam's body keeps W6's bar behind the \
@@ -3681,9 +3870,10 @@ fn a_dim_page_s_rail_is_one_stroke() {
     let read = |style: &'static str, color: TrailColor, scene: Scene, clear: bool| {
         let mut r = Replay::new(style, SOLARIZED_DARK, color);
         if matches!(color, TrailColor::Pinned(_)) {
+            let spec = Spec::of(style);
             r.fx.set_cursor_glow(
                 true,
-                style,
+                spec.trail,
                 color,
                 None,
                 260,
@@ -3693,6 +3883,9 @@ fn a_dim_page_s_rail_is_one_stroke() {
                 true,
                 SOLARIZED_DARK.cursor,
             );
+            if spec.tall {
+                r.fx.set_ribbon_shape(true, spec.flat);
+            }
         }
         r.fx.set_letter_guard_rails_clear(clear);
         r.rail = true;
@@ -3715,18 +3908,8 @@ fn a_dim_page_s_rail_is_one_stroke() {
     let jobs = [
         ("classic", pink, Scene::Typing, true),
         ("comet", TrailColor::Automatic, Scene::Typing, false),
-        (
-            "rainbow kitty underline",
-            TrailColor::Automatic,
-            Scene::Typing,
-            true,
-        ),
-        (
-            "rainbow kitty underline",
-            TrailColor::Automatic,
-            Scene::Burst,
-            true,
-        ),
+        ("rainbow + cat", TrailColor::Automatic, Scene::Typing, true),
+        ("rainbow + cat", TrailColor::Automatic, Scene::Burst, true),
     ];
     for (style, color, scene, controlled) in jobs {
         let Some((share, ms, peak)) = read(style, color, scene, true) else {
@@ -3797,13 +3980,13 @@ fn a_dim_page_s_trail_shows_below_its_letters() {
         sizes.push(row_px);
     }
     for px in sizes {
-        for style in ["beam", "lumen", "comet", "flat rainbow"] {
+        for style in ["beam", "lumen", "comet", "flat rainbow + cat"] {
             let (on, cw) = lit(style, px, true);
             assert!(
                 on > cw / 2,
                 "{style} at {px} px: only {on} columns behind the caret lit below the row"
             );
-            if style != "flat rainbow" && px == row_px {
+            if style != "flat rainbow + cat" && px == row_px {
                 let (off, _) = lit(style, px, false);
                 assert!(
                     off <= cw / 4,
@@ -3982,7 +4165,7 @@ fn the_letter_under_the_caret_reads() {
             jobs.push((style, look));
         }
     }
-    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
     let verdicts: Vec<CaretVerdict> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
             .chunks(jobs.len().div_ceil(lanes).max(1))
@@ -4052,7 +4235,7 @@ fn the_letter_under_the_caret_reads() {
 /// combining marks unread when `unread` (`EffectsPipeline::set_frame_marks_unread`). Returns
 /// the worst judged reading of a row-5 letter and how many letter-frames fall under [`BAR`].
 fn accented_row_under_the_foot(accented: &str, unread: bool) -> (f64, usize) {
-    let mut r = Replay::new("rainbow kitty pet", DARK, TrailColor::Automatic);
+    let mut r = Replay::new("tall rainbow + cat", DARK, TrailColor::Automatic);
     r.letters = true;
     r.fx.set_frame_marks_unread(unread);
     let mut row = " ".repeat(7);
@@ -4120,15 +4303,19 @@ fn a_decomposed_accent_under_the_foot_reads() {
     );
 }
 
-/// A RAIL ON A GRID'S LAST ROW RUNS ON BEHIND EVERY DESCENDER, AT EVERY SIZE (after-land A5, its
-/// review). With no row below to dip into, the rail lies in the row's foot band and leaves each
-/// descender's ring on the row's last pixel row, a thread in the light that letter leaves
+/// A RAIL ON A GRID'S LAST ROW RUNS ON BEHIND EVERY DESCENDER, AT EVERY SIZE, IN ITS WHOLE BAND
+/// (after-land A5, its review; the forward round's W9). With no row below to dip into, the rail
+/// keeps its foot band past each descender, in the light that letter leaves near its ink
 /// (`bed::RowFeet::lane`). The real face leaves `q` a pixel at 22 px and `g` and `y` none, and
 /// nothing on any descender at 14 px; kept to a pixel the glyph left free, the rail broke at each
-/// of those in two pieces with a gap round the cell. So through the typed line of [`Scene::LastRow`],
-/// at each size, every ground pixel of the last pixel row between the rail's tail and the caret
-/// is lit, and every letter holds. Controls, by source edit: the lane kept to a free pixel, and the
-/// thread's light kept off a one-pixel band (14 px and under), each fail this.
+/// of those in two pieces with a gap round the cell, and laid as a thread on the row's last pixel
+/// round the foot's whole cell it read as that gap at 1x in the window (W9: `beam-dark-rail-g`'s
+/// `last-g`, the thread a pixel of `#073d57` beside the band's `#0774a6`, a 26 px gap under `g`).
+/// So through the typed line of [`Scene::LastRow`], at each size, every ground pixel of each of
+/// the band's pixel rows between the rail's tail and the caret is lit, and every letter holds.
+/// Controls, by source edit: the lane kept to a free pixel and the thread's light kept off a
+/// one-pixel band (14 px and under) each fail this. In the test (`set_rail_threaded`), the thread
+/// on the row's last pixel past each descender breaks the band's upper rows at 22 px (W9).
 #[test]
 fn a_last_row_rail_runs_on_behind_every_descender() {
     /// A lift (channels summed) past the tail's own first pixels, from where the rail is read.
@@ -4137,32 +4324,29 @@ fn a_last_row_rail_runs_on_behind_every_descender() {
     const LIT: i32 = 2;
     let scene = Scene::LastRow;
     let end = 1_000 + 50 * BURST_TEXT.len() as u64;
-    for px in [13.0, 14.0, 20.0, 22.0, 24.0] {
-        for (style, look, runs_on) in [
-            ("beam", DARK, true),
-            ("phaser", DARK, true),
-            // Solarized Dark's letters take almost no light: the thread is the page's own level.
-            ("beam", SOLARIZED_DARK, false),
-        ] {
-            let mut r = Replay::gridded_in(
-                px,
-                style,
-                look,
-                TrailColor::Automatic,
-                (scene.rows(), scene.cols()),
-            );
-            r.letters = true;
-            r.own = true;
-            r.post = true;
-            let (ev, _) = scene.events_on(look);
-            let ev: Vec<_> = ev.into_iter().filter(|e| e.0 <= end).collect();
-            r.keep = (1_504..end).step_by(48).collect();
-            let judged = r.run(&ev, 16);
-            let bar = look_bar(look);
-            for j in &judged {
-                for l in j.letters() {
-                    assert!(
-                        l.judged() >= bar.min(OWN_SHARE * l.own),
+    // The letters under their bar, and the breaks in the rail's band (`runs_on`).
+    let read = |px: f32, style: &str, look: Look, runs_on: bool, threaded: bool| {
+        let mut r = Replay::gridded_in(
+            px,
+            style,
+            look,
+            TrailColor::Automatic,
+            (scene.rows(), scene.cols()),
+        );
+        r.fx.cursor_mut().glow.set_rail_threaded(threaded);
+        r.letters = true;
+        r.own = true;
+        r.post = true;
+        let (ev, _) = scene.events_on(look);
+        let ev: Vec<_> = ev.into_iter().filter(|e| e.0 <= end).collect();
+        r.keep = (1_504..end).step_by(48).collect();
+        let judged = r.run(&ev, 16);
+        let bar = look_bar(look);
+        let mut under = Vec::new();
+        for j in &judged {
+            for l in j.letters() {
+                if l.judged() < bar.min(OWN_SHARE * l.own) {
+                    under.push(format!(
                         "{style} on {} at {px} px, {} ms: `{}` r{} c{} reads {:.2}, own {:.2}",
                         look.name,
                         j.ms,
@@ -4171,16 +4355,21 @@ fn a_last_row_rail_runs_on_behind_every_descender() {
                         l.col,
                         l.judged(),
                         l.own
-                    );
+                    ));
                 }
             }
-            if !runs_on {
-                continue;
-            }
+        }
+        let mut broken = Vec::new();
+        if runs_on {
             assert!(r.kept.len() > 30, "fixture: {} frames kept", r.kept.len());
-            for k in &r.kept {
-                let (cw, ch) = k.cell;
-                let row = k.top + (k.caret.0 + 1) * ch - 1;
+        }
+        for k in r.kept.iter().filter(|_| runs_on) {
+            let (cw, ch) = k.cell;
+            let band = ((aterm_effects::rainbow_kitty::ribbon::ROW_RAIL_CH * ch as f32).floor()
+                as usize)
+                .max(1);
+            let bottom = k.top + (k.caret.0 + 1) * ch;
+            for row in bottom - band..bottom {
                 let at = |x: usize| (k.px[row * k.w + x], k.clean[row * k.w + x]);
                 let ground = at(k.left).1;
                 let lift = |(a, b): (u32, u32)| {
@@ -4193,18 +4382,131 @@ fn a_last_row_rail_runs_on_behind_every_descender() {
                 let tail = (k.left..caret_x)
                     .find(|&x| lift(at(x)) >= TAIL)
                     .unwrap_or_else(|| {
-                        panic!("fixture: {style} at {px} px, {} ms lays no rail", k.ms)
+                        panic!(
+                            "fixture: {style} at {px} px, {} ms lays no rail on y{row}",
+                            k.ms
+                        )
                     });
                 let breaks: Vec<usize> = (tail..caret_x)
                     .filter(|&x| at(x).1 == ground && lift(at(x)) < LIT)
                     .collect();
-                assert!(
-                    breaks.is_empty(),
-                    "{style} at {px} px, {} ms: the rail breaks between x{tail} and the caret at \
-                     x{caret_x}, at {breaks:?}",
-                    k.ms
-                );
+                if !breaks.is_empty() {
+                    broken.push(format!(
+                        "{style} at {px} px, {} ms: the rail breaks on y{row} between x{tail} and \
+                         the caret at x{caret_x}, at {breaks:?}",
+                        k.ms
+                    ));
+                }
+            }
+        }
+        (under, broken)
+    };
+    for px in [13.0, 14.0, 20.0, 22.0, 24.0] {
+        for (style, look, runs_on) in [
+            ("beam", DARK, true),
+            ("phaser", DARK, true),
+            // Solarized Dark's letters take almost no light: the band is the page's own level.
+            ("beam", SOLARIZED_DARK, false),
+        ] {
+            let (under, broken) = read(px, style, look, runs_on, false);
+            assert!(
+                under.is_empty(),
+                "letters under their bar:\n{}",
+                under.join("\n")
+            );
+            assert!(broken.is_empty(), "{}", broken.join("\n"));
+        }
+    }
+    let (_, control) = read(22.0, "beam", DARK, true, true);
+    assert!(
+        !control.is_empty(),
+        "control: laid as a thread on the row's last pixel past each descender, the rail's band \
+         runs on unbroken"
+    );
+}
+
+/// THE FORWARD ROUND'S M-M4, A DEEP CELL'S FOOT LEAVES A RAIL NO LIGHT. A cell the frame lays
+/// deep ink in (an underline's stroke, a combining mark, a subscript) holds ink its glyph's raster
+/// does not, so its end is taken as the row's bottom; the light its letter leaves a rail with no
+/// lane was read off that raster all the same, and an underline's own stroke, in a colour of its
+/// own (SGR 58), took the light its glyph's ink could bear. Through [`Scene::LastRow`]'s typed
+/// line underlined straight, doubled and curled in `#c1c1c1` (solid beside the dark look's
+/// `#d0d0d0` ink, the judges' 85%, and under it), at each size, under each style whose rail
+/// takes a lane there, every letter holds its bar.
+/// Control (`set_deep_light_rastered`): with the light read off the raster, Phaser's curl at 24 px
+/// leaves a `p` at 4.10 of its own 10.32.
+#[test]
+fn a_deep_cell_s_foot_leaves_a_rail_no_light() {
+    let scene = Scene::LastRow;
+    let end = 1_000 + 50 * BURST_TEXT.len() as u64;
+    let look = DARK;
+    let bar = look_bar(look);
+    // The letter-frames judged, and those under their bar.
+    let read = |sgr: &[u8], line: &str, px: f32, style: &str, rastered: bool| {
+        let mut r = Replay::gridded_in(
+            px,
+            style,
+            look,
+            TrailColor::Automatic,
+            (scene.rows(), scene.cols()),
+        );
+        r.fx.cursor_mut().glow.set_deep_light_rastered(rastered);
+        r.letters = true;
+        r.own = true;
+        r.post = true;
+        let (mut ev, _) = scene.events_on(look);
+        if let Some((_, Ev::Out(page))) = ev.first_mut() {
+            page.extend_from_slice(sgr);
+        }
+        let ev: Vec<_> = ev.into_iter().filter(|e| e.0 <= end).collect();
+        let judged = r.run(&ev, 16);
+        let mut under = Vec::new();
+        let mut n = 0usize;
+        for j in &judged {
+            for l in j.letters() {
+                n += 1;
+                if l.judged() < bar.min(OWN_SHARE * l.own) {
+                    under.push(format!(
+                        "{style} at {px} px, {line}, {} ms: `{}` r{} c{} reads {:.2}, own {:.2}",
+                        j.ms,
+                        l.ch,
+                        l.row,
+                        l.col,
+                        l.judged(),
+                        l.own
+                    ));
+                }
+            }
+        }
+        (n, under)
+    };
+    const CURLED: &[u8] = b"\x1b[4:3m\x1b[58;2;193;193;193m";
+    let mut under = Vec::new();
+    let mut judged_n = 0usize;
+    for (sgr, line) in [
+        (&b"\x1b[4m\x1b[58;2;193;193;193m"[..], "straight"),
+        (&b"\x1b[4:2m\x1b[58;2;193;193;193m"[..], "doubled"),
+        (CURLED, "curled"),
+    ] {
+        for px in [13.0, 16.0, 20.0, 24.0] {
+            for style in ["beam", "phaser", "comet"] {
+                let (n, u) = read(sgr, line, px, style, false);
+                judged_n += n;
+                under.extend(u);
             }
         }
     }
+    assert!(judged_n > 1_000, "fixture: {judged_n} letter-frames judged");
+    assert!(
+        under.is_empty(),
+        "{} letter-frames under their bar:\n{}",
+        under.len(),
+        under.join("\n")
+    );
+    let (_, control) = read(CURLED, "curled", 24.0, "phaser", true);
+    assert!(
+        !control.is_empty(),
+        "control: with the light read off its glyph's raster, every letter over Phaser's curl at \
+         24 px holds its bar"
+    );
 }

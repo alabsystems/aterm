@@ -194,6 +194,53 @@ fn unknown_address_births_address_and_account() {
     );
 }
 
+/// A Muse Code login no row names is born as a Meta account whose service is the registry's
+/// word for Muse Code, and its `account-obs` row says the CLI.
+/// NEGATIVE CONTROL: with `service` answering `muse` for Meta (no word of
+/// [`crate::alab::registry::SERVICES`]), the plan is refused whole: `` called `Result::unwrap()`
+/// on an `Err` value ``.
+#[test]
+fn a_muse_login_is_born_as_a_meta_account() {
+    let held = cells(bronto_registry());
+    let seen = Sighting {
+        cli: "muse".into(),
+        realm: keys::META.into(),
+        email: UNICORN.into(),
+        state: "idle".into(),
+        tabs: 0,
+        src: "auth-file".into(),
+        at_ms: NOW,
+    };
+    let plan = run(ME, &[seen], &held, &OwnedRead::default(), NOW);
+    assert_eq!((plan.born, plan.marked), (1, 1));
+    let pk = keys::account_pk(
+        keys::META,
+        &keys::claims_email(None, Some(UNICORN)).unwrap(),
+    )
+    .unwrap();
+    let applied = cells([bronto_registry(), plan.changes.clone()].concat());
+    let accounts = cell::project(&ACCOUNT, &applied);
+    let account = &accounts.rows[&pk];
+    assert_eq!(account.get("provider"), Some(&json!(keys::META)));
+    assert_eq!(account.get("realm"), Some(&json!(keys::META)));
+    assert!(account.fields["services"].has_member("muse-code"));
+    assert!(account.live());
+    let row = plan
+        .changes
+        .iter()
+        .find(|c| c.collection == ACCOUNT_OBS.name)
+        .and_then(|c| c.value.as_ref())
+        .unwrap();
+    assert_eq!(
+        (
+            row["account"].clone(),
+            row["cli"].clone(),
+            row["state"].clone()
+        ),
+        (json!(pk), json!("muse"), json!("idle"))
+    );
+}
+
 /// Two live accounts at the realm say one address (one by its login, one by its identity):
 /// nothing is written and the pass names both by key.
 /// NEGATIVE CONTROL: with `matched` taking the first row, a mark is written: `` left: 1 right:

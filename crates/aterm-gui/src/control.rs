@@ -15,6 +15,7 @@ use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_session::{EdgeToken, Op, SessionId, decide_edge};
 use aterm_types::control_request::{self, Head, Selector, Sid};
 use aterm_types::control_verbs::{Body, Input, Resolved, input_of};
+use aterm_types::fleet_access::{DriveKind, FleetAccess};
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::budget::{BudgetEvent, Slot, Slots, UnitBudget, UnitPermit};
@@ -41,7 +42,7 @@ pub(crate) use control_query::{
     ScreenGen, StyledFrameSnapshot, gather_styled_frame, line_size_name, row_line_size, screen_gen,
     screen_text, serialize_styled_frame_within, styled_frame_floor, trimmed_len, visible_row,
 };
-pub(crate) use control_query::{SpawnMark, mark_ctl_spawned};
+pub(crate) use control_query::{SpawnMark, mark_ctl_spawned, marks_of};
 #[cfg(test)]
 pub(crate) use control_query::{cmd_screen_styled_json, cmd_text_json_looked, text_args};
 pub(crate) use control_query::{
@@ -122,6 +123,7 @@ pub(crate) use control_query::cmd_offscreen;
 pub(crate) use control_session::attach_needs_stream;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::autopilot_by_fields;
+pub(crate) use control_session::caller_actor_as;
 #[cfg(test)]
 pub(crate) use control_session::cmd_cast;
 #[cfg(all(test, unix))]
@@ -691,7 +693,6 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
             Some(
                 crate::app_introspect::AuxTarget::Menu
                 | crate::app_introspect::AuxTarget::TabMenu
-                | crate::app_introspect::AuxTarget::AutopilotMenu
                 | crate::app_introspect::AuxTarget::FactMenu
                 | crate::app_introspect::AuxTarget::Update,
             ) => Some(Need::OwnerOnly),
@@ -904,145 +905,8 @@ fn help_full_catalog() -> String {
 }
 
 #[cfg(test)]
-mod help_tests {
-    use aterm_types::control_verbs::{
-        CATALOG_TEXT_COLUMN, ENTRY_WRAP_COLUMNS, VERBS, catalog_lines, spec,
-    };
-
-    #[test]
-    fn help_short_form_is_the_summary_catalog() {
-        let h = super::cmd_help("");
-        let mut lines = h.lines();
-        let status = lines.next().unwrap();
-        assert_eq!(
-            status,
-            format!("OK {} aterm introspection protocol v1", VERBS.len() + 3)
-        );
-        let header: Vec<&str> = lines.clone().take(3).collect();
-        assert!(header.iter().all(|l| l.starts_with("# ")), "{header:?}");
-        assert!(
-            header[0].contains("ERR") && header[0].contains("empty"),
-            "framing line documents the OK/ERR/empty framing: {}",
-            header[0]
-        );
-        let rows: Vec<&str> = lines.skip(3).collect();
-        let want: Vec<String> = catalog_lines().collect();
-        assert_eq!(rows, want, "the rows are exactly the table's summary rows");
-        assert!(
-            !h.contains("image --meta"),
-            "a full entry leaked into the short form"
-        );
-        assert_eq!(super::cmd_help("  "), h);
-    }
-
-    #[test]
-    fn help_verb_form_is_the_wrapped_full_entry() {
-        let h = super::cmd_help("image");
-        let mut lines = h.lines();
-        let status = lines.next().unwrap();
-        let rows: Vec<&str> = lines.collect();
-        assert_eq!(status, format!("OK {}", rows.len()));
-        assert!(rows.len() > 5, "image's entry must wrap into several rows");
-        let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
-        for row in &rows[1..] {
-            assert!(
-                row.starts_with(&gutter),
-                "continuation row not indented: {row:?}"
-            );
-        }
-        for row in &rows {
-            assert!(
-                row.chars().count() <= ENTRY_WRAP_COLUMNS,
-                "row wider than {ENTRY_WRAP_COLUMNS}: {row:?}"
-            );
-        }
-        let joined: Vec<&str> = std::iter::once(&rows[0][CATALOG_TEXT_COLUMN..])
-            .chain(rows[1..].iter().map(|r| &r[CATALOG_TEXT_COLUMN..]))
-            .collect();
-        assert_eq!(joined.join(" "), spec("image").unwrap().help_line());
-        assert_eq!(super::cmd_help(" image "), h, "the tail is trimmed");
-    }
-
-    #[test]
-    fn help_rejects_unknown_verbs_and_bad_tails() {
-        assert_eq!(
-            super::cmd_help("nosuch"),
-            "ERR unknown verb 'nosuch' (help lists them)\n"
-        );
-        let inbox_get = super::cmd_help("inbox get");
-        assert!(inbox_get.starts_with("OK "), "{inbox_get}");
-        assert!(
-            inbox_get
-                .lines()
-                .nth(1)
-                .is_some_and(|row| row.starts_with("inbox get ")),
-            "{inbox_get}"
-        );
-        assert_eq!(
-            super::cmd_help(" inbox \t get "),
-            inbox_get,
-            "any separator"
-        );
-        for tail in [
-            "-h",
-            "--jsn",
-            "image --full",
-            "--full image",
-            "--json image",
-            "a b",
-            "inbox nope",
-            "inbox get extra",
-        ] {
-            assert_eq!(
-                super::cmd_help(tail),
-                "ERR usage: help [<verb> [<section>] | --full | --json]\n",
-                "tail {tail:?}"
-            );
-        }
-    }
-
-    /// `help <verb> <section>` answers that part of a long entry, framed as an entry is; a word
-    /// the verb's page has no section for is refused by name.
-    #[test]
-    fn help_verb_section_is_one_part_of_a_long_entry() {
-        let turn = spec("turn").expect("turn ships");
-        let page = turn.page.expect("turn's entry is a page");
-        assert!(!page.sections.is_empty());
-        for section in page.sections {
-            let h = super::cmd_help(&format!(" turn \t{} ", section.name));
-            let mut lines = h.lines();
-            let status = lines.next().unwrap();
-            let rows: Vec<&str> = lines.collect();
-            assert_eq!(status, format!("OK {}", rows.len()));
-            assert_eq!(rows, turn.section_lines(section.name).expect("listed"));
-        }
-        assert_eq!(
-            super::cmd_help("turn nope"),
-            "ERR unknown section 'nope' of turn (help turn lists them)\n"
-        );
-        let first = super::cmd_help("turn");
-        let named = page.sections.iter().all(|section| {
-            first
-                .lines()
-                .any(|l| l.trim_start().starts_with(&format!("{} ", section.name)))
-        });
-        assert!(named, "help turn lists its sections: {first}");
-    }
-
-    #[test]
-    fn help_full_is_the_header_and_every_catalog_row_in_order() {
-        let got = super::cmd_help("--full");
-        assert_eq!(super::cmd_help(" --full "), got, "the tail is trimmed");
-        assert!(!got.trim().is_empty(), "help --full is empty");
-        let mut rest = got.as_str();
-        for row in aterm_types::control_verbs::catalog_lines_full() {
-            let at = rest
-                .find(&row)
-                .unwrap_or_else(|| panic!("help --full lost (or reordered) the row: {row}"));
-            rest = &rest[at + row.len()..];
-        }
-    }
-}
+#[path = "control_help_tests.rs"]
+mod help_tests;
 
 struct UpdateCheckAsked<'a>(&'a EventLoopProxy<Wake>);
 
@@ -1075,28 +939,21 @@ fn update_status_unreadable_line() -> String {
             aterm_update::ledger_unreadable_cause()
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows has no checker and no ledger: its status is the running build against the build
+    // staged on this machine.
+    #[cfg(windows)]
+    {
+        crate::update_control::windows_status_line()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         "OK enabled=false outcome=\"no updater on this platform\"\n".to_string()
     }
 }
 
 #[cfg(test)]
-mod update_status_unreadable_tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unreadable_ledger_says_why_not_no_updater() {
-        let line = super::update_status_unreadable_line();
-        for field in ["enabled=unknown", "auto_apply=unknown"] {
-            assert!(line.split_whitespace().any(|word| word == field), "{line}");
-        }
-        assert!(
-            line.contains(&aterm_update::ledger_unreadable_cause()),
-            "{line}"
-        );
-        assert!(!line.contains("no updater"), "{line}");
-    }
-}
+#[path = "control_update_status_unreadable_tests.rs"]
+mod update_status_unreadable_tests;
 
 fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String {
     let build = crate::build_info::build_number()
@@ -1115,6 +972,8 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     }
     let st = match rest.trim() {
         "" | "status" => aterm_update::status(build),
+        // Windows reads the staged build's pointer; there is nothing to fetch.
+        "check" if cfg!(windows) => None,
         "check" => {
             // The check reads live settings on the main thread; under a dialog or
             // stall that hop is refused, which would otherwise surface as an
@@ -1138,7 +997,15 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
                     Err(error) => format!("ERR {error}\n"),
                 };
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            {
+                let reply = crate::update_control::windows_apply_reply();
+                if reply.starts_with("OK") && proxy.send_event(Wake::ApplyStagedUpdate).is_err() {
+                    return "ERR event loop gone\n".to_string();
+                }
+                return reply;
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 if proxy.send_event(Wake::ApplyStagedUpdate).is_err() {
                     return "ERR event loop gone\n".to_string();
@@ -1383,104 +1250,8 @@ fn fold_installed_activation(
 }
 
 #[cfg(test)]
-mod installed_activation_fold_tests {
-    use super::fold_installed_activation;
-    use crate::native_updater_service::{StagedUpdate, installed_activation_digest};
-
-    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
-
-    fn ledger() -> aterm_update::UpdateStatus {
-        aterm_update::UpdateStatus {
-            enabled: true,
-            installable: true,
-            current_build: 10,
-            staged_build: None,
-            staged_version: None,
-            staged_commit: None,
-            staged_dmg_sha256: None,
-            changelog: None,
-            outcome: "up to date".into(),
-            updated_at: String::new(),
-            failing_checks: 0,
-            failing_kind: String::new(),
-            failing_applies: 0,
-            failing_since: String::new(),
-            failing_persistent: false,
-            failing_checks_kind: String::new(),
-            channel_unreadable: false,
-            linux: None,
-        }
-    }
-
-    const DOWNLOAD_OUTCOME: &str = "staged 0.39.5 (build 11) — verified and ready to apply";
-
-    fn ledger_with_download() -> aterm_update::UpdateStatus {
-        aterm_update::UpdateStatus {
-            staged_build: Some(11),
-            staged_version: Some("0.39.5".into()),
-            staged_commit: Some("f".repeat(40)),
-            staged_dmg_sha256: Some("c".repeat(64)),
-            changelog: Some("notes".into()),
-            outcome: DOWNLOAD_OUTCOME.into(),
-            ..ledger()
-        }
-    }
-
-    fn activation(build: u64, version: &str) -> StagedUpdate {
-        StagedUpdate {
-            build,
-            version: version.into(),
-            commit: Some(COMMIT.into()),
-            dmg_sha256: installed_activation_digest(build, COMMIT),
-            changelog: None,
-            generation: 1,
-        }
-    }
-
-    #[test]
-    fn the_reducers_activation_is_the_stage_in_its_own_words() {
-        for (enabled, version, said) in [
-            (true, "0.40.0", Some("0.40.0")),
-            (true, "build 12", None),
-            (false, "0.40.0", Some("0.40.0")),
-            (false, "build 12", None),
-        ] {
-            let mut st = ledger_with_download();
-            st.enabled = enabled;
-            fold_installed_activation(&mut st, Some(&activation(12, version)));
-            assert_eq!(st.current_build, 10, "the target is not the running build");
-            assert_eq!(st.staged_build, Some(12), "{version}");
-            assert_eq!(st.staged_version.as_deref(), Some(version));
-            assert_eq!(st.staged_commit.as_deref(), Some(COMMIT), "{version}");
-            assert_eq!(st.staged_dmg_sha256, None, "an activation has no download");
-            assert_eq!(st.changelog, None, "nor the download's notes");
-            assert_eq!(
-                st.outcome,
-                format!(
-                    "{} (ledger: {DOWNLOAD_OUTCOME})",
-                    crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(
-                        said
-                    )
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn nothing_but_a_newer_activation_folds() {
-        let mut download = activation(12, "0.40.0");
-        download.dmg_sha256 = "b".repeat(64);
-        for (mut st, stage) in [
-            (ledger(), Some(download)),
-            (ledger(), Some(activation(10, "0.39.0"))),
-            (ledger(), None),
-        ] {
-            let before = format!("{st:?}");
-            fold_installed_activation(&mut st, stage.as_ref());
-            assert_eq!(format!("{st:?}"), before, "{stage:?}");
-        }
-    }
-}
+#[path = "control_installed_activation_fold_tests.rs"]
+mod installed_activation_fold_tests;
 
 fn first_line_scope(
     first: &str,
@@ -2698,7 +2469,6 @@ impl Drop for BridgeLostGuard {
 struct AccountServices {
     lifetime: aterm_agent::harness::account_work::Lifetime,
     source_registry: Arc<aterm_agent::harness::codex_source_registry::Registry>,
-    interactive_browser: bool,
 }
 
 /// The control host's actual source registry. Constructors must share this
@@ -2725,26 +2495,6 @@ impl AccountServices {
         rest: &str,
         serve: impl FnOnce(&aterm_agent::harness::account_work::Lifetime, &str, &str) -> String,
     ) -> String {
-        serve(&self.lifetime, caller, rest)
-    }
-
-    fn challenge(&self, caller: &str, rest: &str) -> String {
-        self.challenge_with(
-            caller,
-            rest,
-            aterm_agent::harness::challenge_relay::serve_scoped,
-        )
-    }
-
-    fn challenge_with(
-        &self,
-        caller: &str,
-        rest: &str,
-        serve: impl FnOnce(&aterm_agent::harness::account_work::Lifetime, &str, &str) -> String,
-    ) -> String {
-        if !self.interactive_browser {
-            return "ERR claude-challenge requires a serving window\n".into();
-        }
         serve(&self.lifetime, caller, rest)
     }
 }
@@ -2975,19 +2725,36 @@ impl ControlWorkerContext {
     #[cfg(unix)]
     fn serve_fleet(
         &self,
-        stream: CtlStream,
+        mut stream: CtlStream,
         (content, drive): (bool, bool),
         peer: Option<std::net::SocketAddr>,
-        driver: Option<crate::fabric::Driver>,
+        driver: Option<(crate::fabric::Driver, DriveRequester)>,
         driver_key: Option<aterm_net::fleet::NodeKey>,
         service_context: bool,
     ) {
+        // A drive names its requester on its first line, before any request; one that does not
+        // is refused and hung up on, with no line of it served. A relayed drive's came in its
+        // relay header, the node job having read that line.
+        let requested = match driver {
+            Some((driver, DriveRequester::Relayed(requester))) => {
+                Some(crate::fabric::DrivingAs::requested(driver, requester))
+            }
+            Some((driver, DriveRequester::OnStream)) => match read_requester(&mut stream) {
+                Ok(requester) => Some(crate::fabric::DrivingAs::requested(driver, requester)),
+                Err(why) => {
+                    let _ = stream.write_all(format!("ERR drive: {why}\n").as_bytes());
+                    let _ = stream.flush();
+                    aterm_uds::hangup::hang_up(&stream);
+                    return;
+                }
+            },
+            None => None,
+        };
+        let drive = drive || requested.is_some();
+        let content = content || requested.is_some();
         SERVING_FLEET_PEER.with(|serving| serving.set(peer));
         SERVING_FLEET_KEY.with(|serving| serving.set(driver_key));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(service_context));
-        let drive = drive || driver.is_some();
-        let content = content || driver.is_some();
-        let _driving = driver.map(crate::fabric::DrivingAs::enter);
         let _ = serve_preresolved(
             &stream,
             Scope::Fleet { content, drive },
@@ -3002,6 +2769,49 @@ impl ControlWorkerContext {
         SERVING_FLEET_KEY.with(|serving| serving.set(None));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(false));
         aterm_uds::hangup::hang_up(&stream);
+    }
+}
+
+/// Where a fleet drive's requester ([`aterm_types::control_verbs::Requester`]) is read.
+#[cfg(unix)]
+pub(crate) enum DriveRequester {
+    /// The drive's own first line, on the stream: a drive the fleet listener admitted here.
+    OnStream,
+    /// The node job read that line and named it in the relay header
+    /// (`node_serve::RelayHeader::Drive`): the stream starts at the drive's first request.
+    Relayed(aterm_types::control_verbs::Requester),
+}
+
+/// A drive connection's first line, its requester ([`aterm_types::control_verbs::Requester`]),
+/// read a byte at a time so nothing past it is taken from the requests behind it, within the
+/// fleet handshake's bound.
+/// # Errors
+/// Why the line is no requester line: none came in time, it is too long, or it does not parse.
+#[cfg(unix)]
+pub(crate) fn read_requester(
+    stream: &mut CtlStream,
+) -> Result<aterm_types::control_verbs::Requester, &'static str> {
+    read_requester_until(
+        stream,
+        std::time::Instant::now() + crate::fleet_listen::node_serve::HANDSHAKE,
+    )
+}
+
+#[cfg(unix)]
+fn read_requester_until(
+    stream: &mut CtlStream,
+    deadline: std::time::Instant,
+) -> Result<aterm_types::control_verbs::Requester, &'static str> {
+    let line = crate::fleet_listen::node_serve::read_line_raw(
+        &mut DeadlineRead::new(stream, deadline),
+        aterm_types::control_verbs::REQUESTER_LINE_MAX + 1,
+    );
+    let _ = stream.set_read_timeout(None);
+    match line {
+        Ok(Some(line)) => aterm_types::control_verbs::Requester::parse(&line),
+        Ok(None) | Err(_) => {
+            Err("a drive names its requester first: `requester sid=… program=… model=… account=…`")
+        }
     }
 }
 
@@ -3078,7 +2888,8 @@ pub(crate) fn lift_ungranted_remote_holds(granted: &dyn Fn(&str) -> bool) -> usi
     })
 }
 
-/// Serve one DRIVE connection the fleet listener admitted.
+/// Serve one DRIVE connection the fleet listener admitted, or the node job relayed, its
+/// requester read where `requester` says.
 #[cfg(unix)]
 pub(crate) fn attach_fleet_drive(
     stream: CtlStream,
@@ -3086,6 +2897,7 @@ pub(crate) fn attach_fleet_drive(
     driver: crate::fabric::Driver,
     driver_key: Option<aterm_net::fleet::NodeKey>,
     service_context: bool,
+    requester: DriveRequester,
 ) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
         return false;
@@ -3098,7 +2910,7 @@ pub(crate) fn attach_fleet_drive(
                 stream,
                 (true, true),
                 peer,
-                Some(driver),
+                Some((driver, requester)),
                 driver_key,
                 service_context,
             )
@@ -3514,7 +3326,7 @@ pub(crate) fn spawn(
     active: ActiveHandle,
     store: Store,
     proxy: EventLoopProxy<Wake>,
-    interactive_browser: bool,
+    windowed: bool,
     account_work: aterm_agent::harness::account_work::Lifetime,
     plan: control_auth::SocketPlan,
     startup_config: crate::app_config::Config,
@@ -3524,9 +3336,10 @@ pub(crate) fn spawn(
     recovery_count_admission: Arc<crate::keeper_link::RecoveryCountAdmission>,
     handoff: Option<IncomingControlHandoff>,
     publish_gate: Option<crate::spawn::DeferredReaderGate>,
+    headless: bool,
 ) -> ControlPreparation {
     #[cfg(not(unix))]
-    let _ = endpoint;
+    let _ = (endpoint, headless);
     let preparation = ControlPreparation::default();
     let preparation_guard = ControlPreparationGuard {
         preparation: preparation.clone(),
@@ -3593,7 +3406,6 @@ pub(crate) fn spawn(
                 account_services: AccountServices {
                     lifetime: account_work,
                     source_registry,
-                    interactive_browser,
                 },
                 token: token.clone(),
                 sock_dir: sock_dir.clone(),
@@ -3604,7 +3416,13 @@ pub(crate) fn spawn(
             #[cfg(unix)]
             aterm_agent::service_repair_rpc::start_recovery_in_window(&sock_dir);
             #[cfg(unix)]
-            crate::fleet_listen::node_serve::start_window_fleet_relay(&sock_dir);
+            crate::fleet_listen::node_serve::start_window_fleet_relay(
+                &sock_dir,
+                crate::fleet_listen::node_serve::window_applies_updates(
+                    headless,
+                    aterm_update::running_copy_installable(),
+                ),
+            );
             if workers != CONTROL_WORKERS {
                 aterm_log::warn!(
                     "control socket started with {workers}/{CONTROL_WORKERS} connection workers"
@@ -3650,8 +3468,11 @@ pub(crate) fn spawn(
                 }
             );
             crate::identity_claim::settle_transferred();
+            // A test build records no window presence.
+            #[cfg(test)]
+            let _ = windowed;
             #[cfg(not(test))]
-            if interactive_browser {
+            if windowed {
                 let live = Arc::downgrade(&store);
                 let _ = crate::qos::spawn_lane_thread(
                     "aterm-window-presence",
@@ -3731,7 +3552,7 @@ pub(crate) fn spawn(
                     Some(fresh)
                 };
                 crate::control_listener::Supervisor::new(listener, rebind, endpoint)
-                    .run(admit, || false);
+                    .run(admit, &aterm_uds::stop::Stop::new());
             }
             #[cfg(windows)]
             {
@@ -3941,26 +3762,8 @@ fn refuse_stray_args(verb: &str, rest: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod stray_args_tests {
-    use super::refuse_stray_args;
-
-    #[test]
-    fn a_zero_argument_verb_refuses_its_tail_and_passes_bare() {
-        for verb in ["version", "sessions", "who", "whoami"] {
-            assert_eq!(
-                refuse_stray_args(verb, " --json").as_deref(),
-                Some(format!("ERR usage: {verb}\n").as_str()),
-                "`{verb} --json` must be a usage error, not a silent drop"
-            );
-            assert_eq!(refuse_stray_args(verb, ""), None, "bare `{verb}` proceeds");
-            assert_eq!(
-                refuse_stray_args(verb, "   "),
-                None,
-                "whitespace tail is bare"
-            );
-        }
-    }
-}
+#[path = "control_stray_args_tests.rs"]
+mod stray_args_tests;
 
 fn dispatch_meta_verb(
     form: &Resolved,
@@ -4067,6 +3870,7 @@ fn dispatch_app_verb(
             rest,
             aim.session(),
             control_session::caller_actor_of(scope, None, store),
+            crate::requests_host::asker(scope, store),
         ),
         "telemetry" => crate::telemetry_host::cmd(rest, false),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
@@ -4354,6 +4158,9 @@ fn serve_meta_with_barrier(
                 control_session::cmd_meta_harness_held(ctx, serving_connection(), prove, rest)
             })
             .or_else(|| {
+                control_session::cmd_meta_harness_activity(ctx, serving_connection(), prove, rest)
+            })
+            .or_else(|| {
                 control_session::cmd_meta_harness_land(ctx, serving_connection(), prove, rest)
             })
             .or_else(|| {
@@ -4573,128 +4380,8 @@ fn cmd_rekey(
 }
 
 #[cfg(all(test, unix))]
-mod rekey_verb_tests {
-    use super::*;
-
-    struct Leader {
-        master: i32,
-        child: std::process::Child,
-    }
-
-    impl Drop for Leader {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            // SAFETY: the master fd this test opened and alone owns.
-            unsafe { libc::close(self.master) };
-        }
-    }
-
-    fn leader() -> Leader {
-        use std::os::fd::IntoRawFd as _;
-        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
-            let mut cmd = std::process::Command::new("/bin/sleep");
-            cmd.arg("30")
-                .stdout(std::process::Stdio::from(slave.try_clone()?))
-                .stderr(std::process::Stdio::from(slave.try_clone()?));
-            Ok(cmd)
-        })
-        .expect("spawn sleep");
-        drop(slave);
-        let led = Leader {
-            master: master.into_raw_fd(),
-            child,
-        };
-        let pid = libc::pid_t::try_from(led.child.id()).expect("pid");
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the child leads the pty's foreground",
-            // SAFETY: `tcgetpgrp` only reads the live master's foreground group.
-            || (unsafe { libc::tcgetpgrp(led.master) } == pid).then_some(()),
-        );
-        led
-    }
-
-    #[test]
-    fn rekey_is_owner_class_and_names_its_tab() {
-        let store = crate::session_store::new_store();
-        let tab = Some(Selector::parse("s-00000000000000000001"));
-        assert_eq!(
-            dispatch_rekey_verb(
-                "shell=4242",
-                tab.as_ref(),
-                Scope::Edge(aterm_session::EdgeToken::generate()),
-                &store
-            ),
-            "ERR denied\n"
-        );
-        assert_eq!(
-            dispatch_rekey_verb("shell=4242", None, Scope::Owner, &store),
-            REKEY_USAGE,
-            "the bare form names no tab to heal"
-        );
-        assert_eq!(
-            dispatch_rekey_verb("shell=4242", tab.as_ref(), Scope::Owner, &store),
-            "ERR no such session\n"
-        );
-    }
-
-    #[test]
-    fn rekey_is_issued_only_while_the_named_shell_leads_the_foreground() {
-        let led = leader();
-        let pid = led.child.id();
-        let sid = aterm_session::SessionId::new("s-00000000000000000002");
-        let mut healthy = Terminal::new(24, 80);
-        healthy.set_require_shell_integration_nonce(true);
-        healthy.authorize_shell_integration([3; 32]);
-        healthy.process(
-            format!(
-                "\x1b]633;P;AtermIntegration={};id={}\x07",
-                crate::shell_body::own_rev(),
-                aterm_core::shell_integration::hex_encode(&[3; 32])
-            )
-            .as_bytes(),
-        );
-        let healthy = Arc::new(Mutex::new(healthy));
-        let off = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        for bad in [
-            "",
-            "shell=",
-            "shell=abc",
-            "shell=1",
-            "shell=5 more",
-            "withdraw now",
-            "4242",
-        ] {
-            assert_eq!(
-                cmd_rekey(&healthy, led.master, &sid, bad),
-                REKEY_USAGE,
-                "{bad:?}"
-            );
-        }
-        let other = pid + 1;
-        assert_eq!(
-            cmd_rekey(&healthy, led.master, &sid, &format!("shell={other}")),
-            format!("ERR pid {other} is not the foreground process group ({pid})\n"),
-        );
-        assert_eq!(
-            cmd_rekey(&healthy, -1, &sid, &format!("shell={pid}")),
-            "ERR no foreground process group\n",
-        );
-        assert!(
-            cmd_rekey(&healthy, led.master, &sid, &format!("shell={pid}"))
-                .starts_with("ERR rekey integration=on"),
-        );
-        assert!(
-            cmd_rekey(&off, led.master, &sid, &format!("shell={pid}"))
-                .starts_with("ERR rekey integration=off"),
-        );
-        assert_eq!(
-            cmd_rekey(&healthy, led.master, &sid, "withdraw"),
-            "OK rekey none\n"
-        );
-    }
-}
+#[path = "control_rekey_verb_tests.rs"]
+mod rekey_verb_tests;
 
 fn dispatch_topic_verb(
     rest: &str,
@@ -5177,13 +4864,6 @@ fn dispatch_owner(
             );
             cx.account_services.renew(&caller, rest)
         }
-        "claude-challenge" => {
-            let caller = crate::fabric::serving_driver().map_or_else(
-                || "local".to_owned(),
-                |driver| format!("fleet:{}", driver.node),
-            );
-            cx.account_services.challenge(&caller, rest)
-        }
         "topic" => dispatch_topic_verb(rest, selector, scope, store, own_session),
         "story" => dispatch_story_verb(rest, selector, scope, store, own_session, proxy),
         "sessions" => match rest.trim() {
@@ -5203,6 +4883,10 @@ fn dispatch_owner(
             &crate::survey::Here::now(),
         ),
         "board" => board_reply(rest),
+        "request" | "requests" if selector.is_some() => {
+            format!("ERR {verb} names no session: drop the @<sid>\n")
+        }
+        "request" | "requests" => crate::requests_review::cmd(verb, rest, scope, store, proxy),
         "who" => refuse_stray_args(verb, rest).unwrap_or_else(|| control_session::cmd_who(store)),
         "reveal" => control_query::cmd_reveal(store, scope.is_bridge(), rest),
         "exits" => control_session::cmd_exits(store, rest, &control_session::exits_closed()),
@@ -6140,8 +5824,9 @@ fn kept_caller(
     })
 }
 
-#[cfg(any(unix, test))]
-fn typed_into(reply: &str) -> bool {
+/// Whether an input verb's `reply` says its input went in (a request's later verb attaches only
+/// then, `crate::requests_host::attach_after`).
+pub(crate) fn typed_into(reply: &str) -> bool {
     let Some(first) = reply.lines().next().filter(|first| first.starts_with("OK")) else {
         return false;
     };
@@ -6568,104 +6253,8 @@ fn connection_has_live_claim(store: &Store, conn: u64, now: u64) -> bool {
 }
 
 #[cfg(all(test, unix))]
-mod connection_claim_tests {
-    use super::*;
-
-    #[test]
-    fn only_live_connection_bound_claims_spare_their_connection() {
-        let store = crate::session_store::new_store();
-        let supervisor = crate::session_store::test_handle(1);
-        let driver = crate::session_store::test_handle(2);
-        store.write().unwrap().register(supervisor.clone());
-        store.write().unwrap().register(driver.clone());
-        let claimed = |conn, now| connection_has_live_claim(&store, conn, now);
-        assert!(!claimed(7, 100));
-        assert_eq!(
-            crate::session_timeline::claim_supervisor(&supervisor.ctx, "sup", Some(7), None, 100),
-            Ok(true)
-        );
-        assert!(claimed(7, 100));
-        assert!(!claimed(8, 100), "another connection owns no claim");
-        assert!(crate::session_timeline::release_supervisor(
-            &supervisor.ctx,
-            Some(7),
-            100,
-            aterm_slog::Actor::Ctl
-        ));
-        assert!(!claimed(7, 100), "release makes the connection evictable");
-        assert_eq!(
-            crate::session_timeline::claim_supervisor(&supervisor.ctx, "sup", None, Some(500), 100),
-            Ok(true)
-        );
-        assert!(
-            supervisor
-                .ctx
-                .meta
-                .lock()
-                .unwrap()
-                .live_claim(499)
-                .is_some()
-        );
-        assert!(
-            !claimed(7, 499),
-            "a detached live TTL outlives the connection"
-        );
-        assert!(
-            supervisor
-                .ctx
-                .meta
-                .lock()
-                .unwrap()
-                .live_claim(500)
-                .is_none()
-        );
-        assert!(
-            !claimed(7, 500),
-            "expired supervisor authority spares no connection"
-        );
-
-        struct Restore(Option<u64>, bool);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                SERVING_CONNECTION.with(|s| s.set(self.0));
-                CONNECTION_CLAIMED.with(|c| c.set(self.1));
-            }
-        }
-        let _restore = Restore(
-            SERVING_CONNECTION.with(|s| s.replace(Some(7))),
-            CONNECTION_CLAIMED.with(|c| c.replace(false)),
-        );
-        let lease = |rest| control_session::cmd_lease(&driver.ctx, rest);
-        assert!(lease("acquire holder=drive ttl=60000 hard here").starts_with("OK lease acquired"));
-        let expiry = match driver.ctx.turn_lease.lock().unwrap().as_ref().unwrap() {
-            crate::Lease::Drive { expires_us, .. } => *expires_us,
-            other => panic!("expected the acquired drive lease, got {other:?}"),
-        };
-        assert!(claimed(7, expiry - 1));
-        assert!(
-            !claimed(8, expiry - 1),
-            "another owner does not protect this connection"
-        );
-        assert!(
-            !claimed(7, expiry),
-            "the drive lease's expiry is authoritative"
-        );
-        assert_eq!(lease("release holder=drive here"), "OK lease released\n");
-        assert!(!claimed(7, crate::metrics::now_us()));
-        assert!(
-            CONNECTION_CLAIMED.with(std::cell::Cell::get),
-            "Drop still owes cleanup"
-        );
-        assert!(lease("acquire holder=drive ttl=60000 hard here").starts_with("OK lease acquired"));
-        SERVING_CONNECTION.with(|s| s.set(Some(8)));
-        assert!(lease("acquire holder=drive ttl=60000 hard").starts_with("OK lease acquired"));
-        assert!(!claimed(7, crate::metrics::now_us()));
-        assert!(
-            !claimed(8, crate::metrics::now_us()),
-            "a detached renewal outlives either connection"
-        );
-    }
-}
+#[path = "control_connection_claim_tests.rs"]
+mod connection_claim_tests;
 
 fn release_source_connection_claims(
     store: &Store,
@@ -6900,7 +6489,7 @@ fn audit_fleet_refusal(verb: &str, refused: &str) {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DriveAct {
-    verb: &'static str,
+    kind: DriveKind,
     sid: Option<SessionId>,
     hold: Option<HoldAsk>,
     shell: bool,
@@ -6916,13 +6505,214 @@ struct HoldAsk {
 #[derive(Debug, PartialEq, Eq)]
 enum DriveLine {
     Fleet,
+    /// A line the gate passes, with what it does here: a read carries [`DriveKind::Read`].
     Act {
         line: String,
-        write: Option<DriveAct>,
+        act: DriveAct,
     },
     /// The handler's own answer, given without it: `ERR no such session @<sid>` for an `await
     /// task` of an `s-` sid this instance hosts no more, as on one Mac.
     Answer(String),
+}
+
+/// This machine's fleet access as stored now (`aterm_agent::fleet_access`), read afresh at
+/// each call and failing closed: Read Only where no state folder is named or the file is not
+/// usable. A test reads the level its thread set ([`FleetAccessForTest`]), else its scratch
+/// state, which holds none: the production default.
+pub(crate) fn fleet_access_now() -> FleetAccess {
+    fleet_access_stated().0
+}
+
+/// [`fleet_access_now`], with how long ago that level was stated where the file says when
+/// (whole seconds, so never more than it was): a drop that has rested lifts the remote holds
+/// (`crate::fleet_listen::observe_access`).
+pub(crate) fn fleet_access_stated() -> (FleetAccess, Option<std::time::Duration>) {
+    #[cfg(test)]
+    if let Some(level) = FLEET_ACCESS.with(std::cell::Cell::get) {
+        return (level, None);
+    }
+    #[cfg(unix)]
+    {
+        aterm_types::dirs::state_dir().map_or((FleetAccess::ReadOnly, None), |state| {
+            let reading = aterm_agent::fleet_access::read(&state);
+            let age = reading
+                .at
+                .zip(aterm_time::unix_secs())
+                .map(|(at, now)| std::time::Duration::from_secs(now.saturating_sub(at)));
+            (reading.level, age)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        (FleetAccess::ReadOnly, None)
+    }
+}
+
+/// What a raise of this machine's fleet access asked now is asked over
+/// (`aterm_agent::fleet_access::basis`): the stored level's file as it stands and the fleet
+/// held. A test reads its thread's stand-in, which [`store_fleet_access`] and
+/// [`test_state_moved`] change.
+pub(crate) fn fleet_access_basis() -> aterm_agent::fleet_access::Basis {
+    #[cfg(test)]
+    {
+        FLEET_BASIS.with(std::cell::Cell::get)
+    }
+    #[cfg(all(unix, not(test)))]
+    {
+        aterm_types::dirs::state_dir()
+            .map(|state| aterm_agent::fleet_access::basis(&state))
+            .unwrap_or_default()
+    }
+    #[cfg(all(not(unix), not(test)))]
+    {
+        aterm_agent::fleet_access::Basis::default()
+    }
+}
+
+/// How long the menu-bar lock's write of a level above Read Only waits for the book's lock,
+/// which a join, an init or a leave holds while it writes: the main thread's wait, so a short
+/// one. A level that does not get it is not stored, and the lock shows the level in force
+/// again; Read Only waits for no lock.
+#[cfg(all(target_os = "macos", not(test)))]
+const RAISE_WITHIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Store `level` as this machine's fleet access, the menu-bar lock's change, and tell every
+/// running window (`announce`): `Ok(true)` once it is stored as the listeners read it. A raise
+/// is asked `over` the state its click or pick read (`aterm_agent::fleet_access::raise_over`)
+/// and answers `Ok(false)`, nothing written, where that state stands no more: the level was
+/// stated again elsewhere, or this machine left or changed its fleet. A lower (`over` is
+/// `None`) is written whatever stands (`aterm_agent::fleet_access::set_within`). A test stores
+/// the level as its thread's, under the same rule, and posts nothing.
+///
+/// # Errors
+/// No state folder is named, the book's lock was not taken for a level above Read Only, or the
+/// level was not stored as the listeners read it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn store_fleet_access(
+    level: FleetAccess,
+    over: Option<aterm_agent::fleet_access::Basis>,
+) -> Result<bool, String> {
+    #[cfg(test)]
+    {
+        if over.is_some_and(|over| over != fleet_access_basis()) {
+            return Ok(false);
+        }
+        FLEET_ACCESS.with(|now| now.set(Some(level)));
+        test_state_moved();
+        Ok(true)
+    }
+    #[cfg(not(test))]
+    {
+        use aterm_agent::fleet_access::{By, announce, raise_over, set_within};
+        let state =
+            aterm_types::dirs::state_dir().ok_or_else(|| "no state folder is named".to_string())?;
+        let stored = match over {
+            Some(over) => raise_over(&state, level, By::Menu, &over, RAISE_WITHIN),
+            None => set_within(&state, level, By::Menu, Some(RAISE_WITHIN)).map(Some),
+        }
+        .map_err(|e| e.to_string())?;
+        if stored.is_some() {
+            announce();
+        }
+        Ok(stored.is_some())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The level [`fleet_access_now`] answers on this test thread ([`FleetAccessForTest`]).
+    static FLEET_ACCESS: std::cell::Cell<Option<FleetAccess>> =
+        const { std::cell::Cell::new(None) };
+    /// What [`fleet_access_basis`] answers on this test thread: a stand-in for the level
+    /// file's stamp, moved by each write and by [`test_state_moved`].
+    static FLEET_BASIS: std::cell::Cell<aterm_agent::fleet_access::Basis> =
+        const { std::cell::Cell::new(aterm_agent::fleet_access::Basis { stored: None, fleet: None }) };
+}
+
+/// This test thread's state moved, the level as it was: a write of the level, or what another
+/// writer did (`aterm fleet access` naming the level in force, a leave, a join). The basis a
+/// raise was asked over stands no more.
+#[cfg(test)]
+pub(crate) fn test_state_moved() {
+    FLEET_BASIS.with(|basis| {
+        let ino = basis.get().stored.map_or(1, |stamp| stamp.ino + 1);
+        basis.set(aterm_agent::fleet_access::Basis {
+            stored: Some(aterm_agent::fleet_access::Stamp {
+                ino,
+                modified: (0, 0),
+            }),
+            fleet: None,
+        });
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many lines [`drive_gate`] judged on this test thread: each is every session,
+    /// ownership and path look the gate makes, so a line the lock refused counts none.
+    static DRIVE_GATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A test thread's fleet access level until it drops, when the level before it returns. The
+/// tests that drive are unix, as the fleet's serving code is.
+#[cfg(all(test, unix))]
+pub(crate) struct FleetAccessForTest(Option<FleetAccess>);
+
+#[cfg(all(test, unix))]
+impl FleetAccessForTest {
+    pub(crate) fn set(level: FleetAccess) -> Self {
+        Self(FLEET_ACCESS.with(|now| now.replace(Some(level))))
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for FleetAccessForTest {
+    fn drop(&mut self) {
+        FLEET_ACCESS.with(|now| now.set(self.0));
+    }
+}
+
+/// The lock's verdict on a driver's act of `kind` at this machine's `level`: `None` where the
+/// level admits it, else the refusal the driver reads, naming `word` of its line
+/// ([`FleetAccess::refusal`]). It is a ceiling over the grants and never one of them: it is
+/// asked only of a driver the grants already admitted, and admits nobody they did not.
+#[cfg(any(unix, test))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetAccessLock",
+        action = "Stored",
+        reason = "Model setup ranges over what the state file holds; the conformance harness decodes each class of stored bytes before calling the production Judge"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetAccessLock",
+        action = "Need",
+        reason = "Model setup ranges over the level an act needs; the conformance harness sends a line of every DriveKind of that need through drive_admission"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetAccessLock",
+        action = "Granted",
+        reason = "Model setup chooses whether the grants admit the driver; the listener's admission decides it and says so in the scope it hands drive_admission, which the conformance harness runs under both"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetAccessLock",
+        action = "Judge",
+        project = "control::fleet_access_model_tests::project"
+    )
+)]
+fn drive_lock_refusal(level: FleetAccess, kind: DriveKind, word: &str) -> Option<String> {
+    level
+        .refusal(kind)
+        .map(|why| format!("{}\n", drive_refused(&why, word)))
 }
 
 fn drive_admission(
@@ -6934,6 +6724,22 @@ fn drive_admission(
     if matches!(scope, Scope::Fleet { drive: true, .. })
         && let Some(driver) = crate::fabric::serving_driver()
     {
+        // The lock first, on the line's lexical kind: before any session, ownership or
+        // file-system look the gate makes. A line with no kind is the gate's to refuse, in its
+        // words. A test's level is its thread's, never this process's to observe.
+        #[cfg_attr(test, expect(unused_variables, reason = "a test observes no level"))]
+        let (level, age) = fleet_access_stated();
+        #[cfg(all(unix, not(test)))]
+        let _ = crate::fleet_listen::observe_access(level, age, None, None);
+        if let Ok(kind) = drive_kind(&request.head())
+            && let Some(refusal) = drive_lock_refusal(level, kind, kind.word())
+        {
+            audit_fleet_refusal(
+                request.head().verb,
+                &format!("{} driving: fleet access {}", driver.host, level.word()),
+            );
+            return Err(refusal);
+        }
         let hosts = |sid: &SessionId| {
             store
                 .read()
@@ -6954,12 +6760,12 @@ fn drive_admission(
         return match drive_gate(request.line(), &hosts, &spawned, &shell, &retired) {
             Ok(DriveLine::Fleet) => Ok((request, scope, None)),
             Ok(DriveLine::Answer(reply)) => Err(reply),
-            Ok(DriveLine::Act { line, mut write }) => {
-                if let Some(DriveAct {
+            Ok(DriveLine::Act { line, mut act }) => {
+                if let DriveAct {
                     sid: Some(sid),
                     hold: Some(ask),
                     ..
-                }) = &mut write
+                } = &mut act
                 {
                     ask.held = remote_held_by(store, sid, &driver.node);
                 }
@@ -6968,7 +6774,13 @@ fn drive_admission(
                 } else {
                     Request::parse(line)
                 };
-                Ok((request, Scope::Owner, write))
+                // What follows the dispatch (the shell-read recheck, the record) is an act's:
+                // a read has none.
+                Ok((
+                    request,
+                    Scope::Owner,
+                    (act.kind != DriveKind::Read).then_some(act),
+                ))
             }
             Err(refused) => {
                 audit_fleet_refusal(
@@ -7003,8 +6815,136 @@ fn drive_refused(why: &str, word: &str) -> String {
     format!("{why}; not `{}`", drive_word(word))
 }
 
+/// What a drive's line does here, by its selector, its verb and at most one word of its
+/// arguments: the one table of the acts a drive serves, which the lock judges
+/// ([`drive_lock_refusal`]) and [`drive_gate`] is keyed by. It looks at no session, no ownership
+/// and no file: `spawn` is a spawn whatever follows it, a shell read a shell read whoever's the
+/// shell is, a `close` a close whether or not the driver may close it, and the gate's later
+/// checks refuse what they refuse. `Err` is the gate's own grammar refusal: a verb a drive does
+/// not serve, a selector on `hold`, a `close` with none, or a fleet service's parser refusing
+/// its arguments, each in the words the driver reads.
+#[cfg(any(unix, test))]
+fn drive_kind(head: &Head) -> Result<DriveKind, String> {
+    const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
+                                 selector: hold s-… on|off [reason=<pct>]";
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    match selector {
+        None => match verb {
+            "survey" | "version" | "setup" => Ok(DriveKind::Read),
+            // A board names working folders and accounts: a drive grant reads it, as Owner.
+            "board" if rest.trim().is_empty() => Ok(DriveKind::Read),
+            "board" => Err(drive_refused(
+                "a drive reads a board whole: `board` (`board accept` is its own Mac's)",
+                rest.trim(),
+            )),
+            "service-repair" => {
+                let request = aterm_agent::service_repair_rpc::Request::parse(rest)?;
+                Ok(
+                    if matches!(request.operation.as_str(), "inspect" | "prepare") {
+                        DriveKind::Read
+                    } else {
+                        DriveKind::ServiceRepair
+                    },
+                )
+            }
+            #[cfg(unix)]
+            "vault" => {
+                if rest.trim() == "status" {
+                    return Ok(DriveKind::Read);
+                }
+                aterm_secrets::client::admin_service::Request::parse(rest)
+                    .map_err(|error| error.to_string())?;
+                Ok(DriveKind::Vault)
+            }
+            "accounts-renew" => {
+                use aterm_agent::harness::remote_renew::Request as RenewalRequest;
+                Ok(match RenewalRequest::parse(rest)? {
+                    RenewalRequest::Start(_) => DriveKind::AccountsRenew,
+                    RenewalRequest::Poll(_) => DriveKind::Read,
+                })
+            }
+            "hold" => Ok(DriveKind::Hold),
+            "spawn" => Ok(DriveKind::Spawn),
+            // A drive reads the requests its node made (`requests_review` filters them).
+            "requests" => Ok(DriveKind::Read),
+            "request" => match rest.split_whitespace().next() {
+                Some("claim") => Ok(DriveKind::Claim),
+                Some("show") => Ok(DriveKind::Read),
+                _ => Err(drive_refused(
+                    "a drive's request verbs are request claim path=<absolute|~/…> [req=<id>], \
+                     request show <id> and requests; review, keep and reply are this Mac's \
+                     person's",
+                    format!("request {}", rest.trim()).trim_end(),
+                )),
+            },
+            "await" if await_task_list(rest).is_some() => Ok(DriveKind::Read),
+            "await" => Err(drive_refused(
+                "a drive awaits only `await task @<sid>,…`",
+                format!("await {}", rest.trim()).trim_end(),
+            )),
+            "close" => Err(drive_refused(
+                "a drive's close names its session in front: @s-… close",
+                verb,
+            )),
+            _ => Err(drive_refused(
+                "a drive serves survey, version, board, requests, vault status|approve, hold, \
+                 spawn cwd=<absolute>|agent=<word>, request claim|show and await task, and \
+                 @<sid> status|text|screen|result|inbox|post|turn|key|send|close",
+                verb,
+            )),
+        },
+        Some(selector) => match verb {
+            "hold" => {
+                let selected = match selector {
+                    Selector::SelfTok => "@.".to_owned(),
+                    Selector::Local(local) => format!("@{local}"),
+                    Selector::Sid(sid) => format!("@{}", sid.as_str()),
+                    Selector::Invalid(body) => format!("@{body}"),
+                };
+                Err(drive_refused(HOLD_SELECTOR, &selected))
+            }
+            "status" | "text" | "screen" | "result" => Ok(DriveKind::Read),
+            // Under a driver `inbox seen …` marks a reply acknowledged in this Mac's mail store,
+            // a write; every other form lists and marks nothing for a driver.
+            "inbox" if rest.split_whitespace().next() == Some("seen") => Ok(DriveKind::MailSeen),
+            "inbox" => Ok(DriveKind::Read),
+            "blocks" | "blocktext" | "await" => Ok(DriveKind::ShellRead),
+            "post" => Ok(DriveKind::Post),
+            "turn" => Ok(DriveKind::Turn),
+            "key" => Ok(DriveKind::Key),
+            "send" => Ok(DriveKind::Send),
+            "close" => Ok(DriveKind::Close),
+            _ => Err(drive_refused(
+                "a drive serves @<sid> \
+                 status|text|screen|result|inbox|post|turn|key|send|close",
+                verb,
+            )),
+        },
+    }
+}
+
+/// [`drive_kind`] of a drive's raw `line`, for the node job, which judges a connection's first
+/// line by the same table before it serves or routes it.
+#[cfg(unix)]
+pub(crate) fn drive_kind_of_line(line: &str) -> Result<DriveKind, String> {
+    let request = Request::parse(line.trim_end_matches(['\r', '\n']).to_owned());
+    drive_kind(&request.head())
+}
+
+/// [`drive_lock_refusal`] for the node job: the answer to a first line of `kind` at `level`.
+#[cfg(unix)]
+pub(crate) fn drive_locked(level: FleetAccess, kind: DriveKind) -> Option<String> {
+    drive_lock_refusal(level, kind, kind.word())
+}
+
 /// Every refusal of the gate's own grammar names the word it refuses ([`drive_refused`]); a
-/// verb's own parser (`await task`'s, `vault`'s, …) answers in its words, as on one Mac.
+/// verb's own parser (`await task`'s, `vault`'s, …) answers in its words, as on one Mac. The
+/// line's [`drive_kind`] keys it: each arm makes only the session, ownership and path checks
+/// its kind needs.
 #[cfg(any(unix, test))]
 fn drive_gate(
     line: &str,
@@ -7019,9 +6959,9 @@ fn drive_gate(
                            answers only @<sid> result and await task";
     const HOLD_SID: &str = "a drive's hold names a session the driven Mac hosts by its bare sid, \
                             with no @: hold s-… on|off [reason=<pct>]";
-    const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
-                                 selector: hold s-… on|off [reason=<pct>]";
     const HOLD: &str = "hold <sid> on|off [reason=<pct>]";
+    #[cfg(test)]
+    DRIVE_GATED.with(|gated| gated.set(gated.get() + 1));
     let request = Request::parse(line.to_owned());
     if request.frame().is_some() || request.post_frame().is_some() {
         return Err(drive_refused(
@@ -7029,11 +6969,13 @@ fn drive_gate(
             request.head().verb,
         ));
     }
+    let head = request.head();
+    let kind = drive_kind(&head)?;
     let Head {
         selector,
         verb,
         rest,
-    } = request.head();
+    } = head;
     // The selector as the line spells it, which a refusal of it names.
     let selected = line.split_whitespace().next().unwrap_or_default();
     let hosted = |sid: &str| {
@@ -7046,174 +6988,157 @@ fn drive_gate(
         let sid = SessionId::new(sid);
         sid.as_str().starts_with("s-") && retired(&sid)
     };
-    let act = |verb: &'static str, sid: Option<SessionId>| DriveLine::Act {
+    // The hosted session the line's selector names, or why it names none.
+    let session = || match selector {
+        Some(Selector::Sid(sid)) => match hosted(sid.as_str()) {
+            Some(sid) => Ok(sid),
+            None if kept(sid.as_str()) => Err(drive_refused(RETIRED, verb)),
+            None => Err(drive_refused(SID, selected)),
+        },
+        _ => Err(drive_refused(SID, selected)),
+    };
+    let act = |sid: Option<SessionId>| DriveLine::Act {
         line: line.to_owned(),
-        write: Some(DriveAct {
-            verb,
+        act: DriveAct {
+            kind,
             sid,
             hold: None,
             shell: false,
-        }),
+        },
     };
-    let read = || DriveLine::Act {
-        line: line.to_owned(),
-        write: None,
-    };
-    match selector {
-        None => match verb {
-            "survey" | "version" | "setup" => Ok(DriveLine::Fleet),
-            // A board names working folders and accounts: a drive grant reads it, as Owner.
-            "board" if rest.trim().is_empty() => Ok(read()),
-            "board" => Err(drive_refused(
-                "a drive reads a board whole: `board` (`board accept` is its own Mac's)",
-                rest.trim(),
-            )),
-            "service-repair" => {
-                let request = aterm_agent::service_repair_rpc::Request::parse(rest)?;
-                if matches!(request.operation.as_str(), "inspect" | "prepare") {
-                    Ok(read())
-                } else {
-                    Ok(act("service-repair", None))
+    match kind {
+        DriveKind::Read => match selector {
+            None => match verb {
+                "survey" | "version" | "setup" => Ok(DriveLine::Fleet),
+                "await" => {
+                    let Some(words) = await_task_list(rest) else {
+                        return Err(drive_refused(
+                            "a drive awaits only `await task @<sid>,…`",
+                            format!("await {}", rest.trim()).trim_end(),
+                        ));
+                    };
+                    let args = crate::task_record::parse_await_task(&words, true)
+                        .map_err(|usage| usage.trim_end().trim_start_matches("ERR ").to_owned())?;
+                    for target in &args.targets {
+                        if hosted(&target.selector).is_some() || kept(&target.selector) {
+                            continue;
+                        }
+                        if !matches!(Selector::parse(&target.selector), Selector::Sid(_)) {
+                            return Err(drive_refused(SID, &format!("@{}", target.selector)));
+                        }
+                        return Ok(DriveLine::Answer(format!(
+                            "ERR no such session @{}\n",
+                            target.selector
+                        )));
+                    }
+                    Ok(act(None))
                 }
+                // A board, a vault's status, a fleet service's read: this Mac's, no session's.
+                _ => Ok(act(None)),
+            },
+            Some(Selector::Sid(sid))
+                if verb == "result" && hosted(sid.as_str()).is_none() && kept(sid.as_str()) =>
+            {
+                Ok(act(None))
             }
-            #[cfg(unix)]
-            "vault" => {
-                if rest.trim() == "status" {
-                    return Ok(read());
-                }
-                aterm_secrets::client::admin_service::Request::parse(rest)
-                    .map_err(|error| error.to_string())?;
-                Ok(act("vault", None))
+            Some(_) => session().map(|_| act(None)),
+        },
+        DriveKind::ShellRead => {
+            let sid = session()?;
+            if !shell(&sid) {
+                return Err(drive_refused(DRIVE_SHELL_REFUSED, verb));
             }
-            "accounts-renew" => {
-                use aterm_agent::harness::remote_renew::Request as RenewalRequest;
-                match RenewalRequest::parse(rest)? {
-                    RenewalRequest::Start(_) => Ok(act("accounts-renew", None)),
-                    RenewalRequest::Poll(_) => Ok(read()),
-                }
+            drive_shell_read(verb, rest)?;
+            Ok(act(Some(sid)))
+        }
+        DriveKind::Vault | DriveKind::ServiceRepair | DriveKind::AccountsRenew => Ok(act(None)),
+        DriveKind::Post | DriveKind::MailSeen | DriveKind::Key | DriveKind::Send => {
+            session().map(|sid| act(Some(sid)))
+        }
+        DriveKind::Turn => {
+            let sid = session()?;
+            drive_turn(rest)?;
+            Ok(act(Some(sid)))
+        }
+        DriveKind::Hold => {
+            let mut words = rest.split_whitespace();
+            let (sid, way) = (words.next(), words.next());
+            let (Some(sid), Some(way @ ("on" | "off"))) = (sid, way) else {
+                return Err(way.map_or_else(|| HOLD.to_owned(), |way| drive_refused(HOLD, way)));
+            };
+            if let Some(word) = words.find(|word| !word.starts_with("reason=")) {
+                return Err(drive_refused(
+                    &format!("a drive's hold names no origin: {HOLD}"),
+                    word,
+                ));
             }
-            "claude-challenge" => {
-                use aterm_agent::harness::challenge_relay::Request as ChallengeRequest;
-                match ChallengeRequest::parse(rest)? {
-                    ChallengeRequest::Start(_) => Ok(act("claude-challenge", None)),
-                    ChallengeRequest::Poll(_) => Ok(read()),
-                }
-            }
-            "hold" => {
-                let mut words = rest.split_whitespace();
-                let (sid, way) = (words.next(), words.next());
-                let (Some(sid), Some(way @ ("on" | "off"))) = (sid, way) else {
-                    return Err(way.map_or_else(|| HOLD.to_owned(), |way| drive_refused(HOLD, way)));
-                };
-                if let Some(word) = words.find(|word| !word.starts_with("reason=")) {
-                    return Err(drive_refused(
-                        &format!("a drive's hold names no origin: {HOLD}"),
-                        word,
-                    ));
-                }
-                let sid = hosted(sid).ok_or_else(|| {
-                    drive_refused(if sid.starts_with('@') { HOLD_SID } else { SID }, sid)
-                })?;
-                Ok(DriveLine::Act {
-                    line: line.to_owned(),
-                    write: Some(DriveAct {
-                        verb: "hold",
-                        sid: Some(sid),
-                        shell: false,
-                        hold: Some(HoldAsk {
-                            on: way == "on",
-                            held: false,
-                        }),
+            let sid = hosted(sid).ok_or_else(|| {
+                drive_refused(if sid.starts_with('@') { HOLD_SID } else { SID }, sid)
+            })?;
+            Ok(DriveLine::Act {
+                line: line.to_owned(),
+                act: DriveAct {
+                    kind,
+                    sid: Some(sid),
+                    shell: false,
+                    hold: Some(HoldAsk {
+                        on: way == "on",
+                        held: false,
                     }),
-                })
+                },
+            })
+        }
+        DriveKind::Close => {
+            let sid = session()?;
+            if !rest.trim().is_empty() {
+                return Err(drive_refused(
+                    "a drive's close takes no words: @<sid> close",
+                    rest.trim(),
+                ));
             }
-            // The act is judged by the line the gate passes (a `cwd=~/…` resolved in it), the
-            // line the spawn handler reads.
-            "spawn" => drive_spawn(line, rest, &hosts, aterm_types::dirs::home_dir().as_deref())
-                .map(|line| DriveLine::Act {
-                    write: Some(DriveAct {
+            if spawned(&sid) {
+                Ok(act(Some(sid)))
+            } else {
+                Err(drive_refused(DRIVE_CLOSE_REFUSED, selected))
+            }
+        }
+        // The act is judged by the line the gate passes (a `cwd=~/…` resolved in it), the
+        // line the spawn handler reads.
+        DriveKind::Spawn => {
+            drive_spawn(line, rest, &hosts, aterm_types::dirs::home_dir().as_deref()).map(|line| {
+                DriveLine::Act {
+                    act: DriveAct {
                         shell: !control_media::split_quoted_tokens(
                             line.trim_end_matches('\r')
                                 .strip_prefix("spawn ")
                                 .unwrap_or(rest),
                         )
                         .is_some_and(|tokens| tokens.iter().any(|t| t.starts_with("agent="))),
-                        verb: "spawn",
+                        kind,
                         sid: None,
                         hold: None,
-                    }),
+                    },
                     line,
-                }),
-            "await" => {
-                let Some(words) = await_task_list(rest) else {
-                    return Err(drive_refused(
-                        "a drive awaits only `await task @<sid>,…`",
-                        format!("await {}", rest.trim()).trim_end(),
-                    ));
-                };
-                let args = crate::task_record::parse_await_task(&words, true)
-                    .map_err(|usage| usage.trim_end().trim_start_matches("ERR ").to_owned())?;
-                for target in &args.targets {
-                    if hosted(&target.selector).is_some() || kept(&target.selector) {
-                        continue;
-                    }
-                    if !matches!(Selector::parse(&target.selector), Selector::Sid(_)) {
-                        return Err(drive_refused(SID, &format!("@{}", target.selector)));
-                    }
-                    return Ok(DriveLine::Answer(format!(
-                        "ERR no such session @{}\n",
-                        target.selector
-                    )));
                 }
-                Ok(read())
-            }
-            "close" => Err(drive_refused(
-                "a drive's close names its session in front: @s-… close",
-                verb,
-            )),
-            _ => Err(drive_refused(
-                "a drive serves survey, version, board, vault status|approve, hold, spawn \
-                 cwd=<absolute>|agent=<word> and await task, and @<sid> \
-                 status|text|screen|result|inbox|post|turn|key|send|close",
-                verb,
-            )),
-        },
-        Some(_) if verb == "hold" => Err(drive_refused(HOLD_SELECTOR, selected)),
-        Some(Selector::Sid(sid)) if hosted(sid.as_str()).is_none() && kept(sid.as_str()) => {
-            match verb {
-                "result" => Ok(read()),
-                _ => Err(drive_refused(RETIRED, verb)),
-            }
+            })
         }
-        Some(Selector::Sid(sid)) => {
-            let Some(sid) = hosted(sid.as_str()) else {
-                return Err(drive_refused(SID, selected));
-            };
-            match verb {
-                "status" | "text" | "screen" | "result" | "inbox" => Ok(read()),
-                "blocks" | "blocktext" | "await" if shell(&sid) => {
-                    drive_shell_read(verb, rest)?;
-                    Ok(act("shell-read", Some(sid)))
+        // The claim is judged by the line the gate passes (a `path=~/…` resolved in it), the
+        // line the claim handler reads; who may claim, and what, is that handler's.
+        DriveKind::Claim => {
+            drive_claim_line(rest, aterm_types::dirs::home_dir().as_deref()).map(|line| {
+                DriveLine::Act {
+                    line,
+                    act: DriveAct {
+                        kind,
+                        sid: None,
+                        hold: None,
+                        shell: false,
+                    },
                 }
-                "blocks" | "blocktext" | "await" => Err(drive_refused(DRIVE_SHELL_REFUSED, verb)),
-                "post" => Ok(act("post", Some(sid))),
-                "turn" => drive_turn(rest).map(|()| act("turn", Some(sid))),
-                "key" => Ok(act("key", Some(sid))),
-                "send" => Ok(act("send", Some(sid))),
-                "close" if !rest.trim().is_empty() => Err(drive_refused(
-                    "a drive's close takes no words: @<sid> close",
-                    rest.trim(),
-                )),
-                "close" if spawned(&sid) => Ok(act("close", Some(sid))),
-                "close" => Err(drive_refused(DRIVE_CLOSE_REFUSED, selected)),
-                _ => Err(drive_refused(
-                    "a drive serves @<sid> \
-                     status|text|screen|result|inbox|post|turn|key|send|close",
-                    verb,
-                )),
-            }
+            })
         }
-        Some(_) => Err(drive_refused(SID, selected)),
+        // The mesh's stream is admitted where it is served (`node_serve`), never as a line.
+        DriveKind::BusLog => Err(drive_refused("a drive serves no bus.log line", verb)),
     }
 }
 
@@ -7285,11 +7210,22 @@ fn drive_home_cwd(
     value: &str,
     home: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    drive_home_path("cwd", value, home)
+}
+
+/// [`drive_home_cwd`] for the `key=~/…` token of any line that takes one (`spawn cwd=`, `request
+/// claim path=`), each refusal naming that key.
+#[cfg(any(unix, test))]
+fn drive_home_path(
+    key: &str,
+    value: &str,
+    home: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
     let Some(under) = aterm_types::control_verbs::home_cwd(value) else {
         return Ok(None);
     };
-    let token = format!("cwd={value}");
-    let refuse = |why: &str| drive_refused(&format!("a drive's cwd=~/\u{2026} {why}"), &token);
+    let token = format!("{key}={value}");
+    let refuse = |why: &str| drive_refused(&format!("a drive's {key}=~/\u{2026} {why}"), &token);
     let under = under.map_err(refuse)?;
     let Some(home) = home.filter(|home| home.is_absolute()) else {
         return Err(refuse(
@@ -7307,6 +7243,29 @@ fn drive_home_cwd(
         Err(HomeWalk::Guarded) => Err(refuse("leaves this Mac's home for a folder macOS guards")),
         Err(HomeWalk::Gone) => Err(gone()),
     }
+}
+
+/// A drive's `request claim …` line (`rest` after its verb) as the claim handler reads it: its
+/// `path=~/…` (percent-encoded or not) resolved to the folder of this Mac's `home` it names
+/// ([`drive_home_path`]), every other word as it came. Refused where the `~` path is.
+#[cfg(any(unix, test))]
+fn drive_claim_line(rest: &str, home: Option<&std::path::Path>) -> Result<String, String> {
+    let mut words = Vec::new();
+    for word in rest.split_whitespace() {
+        let Some(value) = word.strip_prefix("path=") else {
+            words.push(word.to_owned());
+            continue;
+        };
+        let decoded = aterm_codec::pct::decode(value);
+        match drive_home_path("path", &decoded, home)? {
+            Some(real) => words.push(format!(
+                "path={}",
+                aterm_codec::pct::encode(&real.to_string_lossy())
+            )),
+            None => words.push(word.to_owned()),
+        }
+    }
+    Ok(format!("request {}", words.join(" ")))
 }
 
 /// Why [`walk_home_path`] found no folder.
@@ -7431,12 +7390,14 @@ fn drive_spawn(
     hosts: &dyn Fn(&SessionId) -> bool,
     home: Option<&std::path::Path>,
 ) -> Result<String, String> {
-    const SHELL: &str = "a plain fleet shell is spawn cwd=/absolute|~/<path> [raise=false]; no \
-                         task, command or other options";
+    const SHELL: &str = "a plain fleet shell is spawn cwd=/absolute|~/<path> why=<one line, at \
+                         most 200 characters, saying what it is for> [req=<id>] [raise=false]; \
+                         no task, command or other options";
     let usage = || {
         format!(
             "a drive's worker form is spawn agent=<{}> [model=<m>] [autopilot=<land|cruise>] \
-             [cwd=<absolute>|~/<path>] [from=<sid>] [raise=false] - < task",
+             [cwd=<absolute>|~/<path>] [from=<sid>] [why=<one line>] [req=<id>] [raise=false] \
+             - < task",
             aterm_agent::harness::worker::started_words()
         )
     };
@@ -7472,7 +7433,7 @@ fn drive_spawn(
         None => rest,
     };
     if !tokens.iter().any(|token| token.starts_with("agent=")) {
-        let mut cwd = None;
+        let (mut cwd, mut why, mut req) = (None, None, None);
         let mut raise = false;
         for token in &tokens {
             match token.split_once('=') {
@@ -7481,12 +7442,31 @@ fn drive_spawn(
                 {
                     cwd = Some(value);
                 }
+                Some(("why", value)) if why.is_none() => {
+                    why = Some(
+                        aterm_types::control_verbs::request_why(value).map_err(|bad| {
+                            drive_refused(&format!("{SHELL}: its why= {bad}"), token)
+                        })?,
+                    );
+                }
+                Some(("req", value)) if req.is_none() => {
+                    req = Some(
+                        aterm_types::control_verbs::request_id(value).map_err(|bad| {
+                            drive_refused(&format!("{SHELL}: its req= {bad}"), token)
+                        })?,
+                    );
+                }
                 Some(("raise", "false")) if !raise => raise = true,
                 _ => return Err(drive_refused(SHELL, token)),
             }
         }
         if cwd.is_none() {
             return Err("a plain fleet shell requires cwd=/absolute or 'cwd=~/<path>'".to_owned());
+        }
+        // The one form with no brief: a person reviewing what another Mac asked of this one has
+        // only this line to judge it by (the requests design (2026-11-09) §5, decision 2).
+        if why.is_none() {
+            return Err(format!("{SHELL}: it names no why="));
         }
         return Ok(if raise {
             line.to_owned()
@@ -7530,6 +7510,14 @@ fn drive_spawn(
                 ));
             }
             "from" => {}
+            "why" => {
+                aterm_types::control_verbs::request_why(value)
+                    .map_err(|bad| drive_refused(&format!("{}: its why= {bad}", usage()), token))?;
+            }
+            "req" => {
+                aterm_types::control_verbs::request_id(value)
+                    .map_err(|bad| drive_refused(&format!("{}: its req= {bad}", usage()), token))?;
+            }
             "raise" if value == "false" => raise = true,
             "raise" => return Err(drive_refused("a drive's worker opens raise=false", token)),
             _ => return Err(drive_refused(&usage(), token)),
@@ -7621,7 +7609,7 @@ struct DrivenSpawn {
 const DRIVE_SPAWNED_MAX: usize = 256;
 
 #[cfg(test)]
-fn drive_spawned_by(sid: &SessionId) -> Option<String> {
+pub(crate) fn drive_spawned_by(sid: &SessionId) -> Option<String> {
     DRIVE_SPAWNED
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -7696,7 +7684,7 @@ fn drive_worker_file(sid: &SessionId) -> Option<std::path::PathBuf> {
     #[cfg(test)]
     let dir = DRIVE_WORKERS_DIR.with(|dir| dir.borrow().clone())?;
     #[cfg(not(test))]
-    let dir = aterm_types::dirs::state_dir()?.join("drive-workers");
+    let dir = aterm_types::dirs::state_dir()?.join(aterm_types::fleet_access::DRIVE_WORKERS);
     Some(dir.join(sid.as_str()))
 }
 
@@ -7749,7 +7737,7 @@ fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
 
 #[cfg(any(unix, test))]
 fn drive_read_still_owned(act: &DriveAct, store: &Store) -> bool {
-    act.verb != "shell-read"
+    act.kind != DriveKind::ShellRead
         || act.sid.as_ref().is_some_and(|sid| {
             crate::fabric::serving_driver()
                 .is_some_and(|driver| drive_owns_shell(store, sid, &driver.node))
@@ -7814,23 +7802,59 @@ pub(crate) fn forget_driven_shell(sid: &SessionId) {
     let _ = sid;
 }
 
+/// A person kept `sid` (Keep as Tab): no drive's spawn owns it any more, as a plain shell or as
+/// a worker (its [`drive_worker_file`] too), so no drive closes the person's tab.
+pub(crate) fn forget_driven(sid: &SessionId) {
+    #[cfg(any(unix, test))]
+    {
+        DRIVE_SPAWNED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|spawned| &spawned.sid != sid);
+        if let Some(file) = drive_worker_file(sid) {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+    #[cfg(not(any(unix, test)))]
+    let _ = sid;
+}
+
 #[cfg(any(unix, test))]
 fn drive_record(act: &DriveAct, reply: &str, holds_now: bool) -> Option<&'static str> {
     let ok = reply.starts_with("OK");
-    match (act.verb, act.hold) {
-        ("turn", _) if typed_into(reply) => Some("turn"),
-        ("key", _) if typed_into(reply) => Some("key"),
-        ("send", _) if typed_into(reply) => Some("send"),
-        ("hold", Some(HoldAsk { on: true, held })) if ok && !held && holds_now => {
+    match (act.kind, act.hold) {
+        (DriveKind::Turn | DriveKind::Key | DriveKind::Send, _) if typed_into(reply) => {
+            Some(act.kind.word())
+        }
+        (DriveKind::Hold, Some(HoldAsk { on: true, held })) if ok && !held && holds_now => {
             Some("took (hold on)")
         }
-        ("hold", Some(HoldAsk { on: false, held })) if ok && held && !holds_now => {
+        (DriveKind::Hold, Some(HoldAsk { on: false, held })) if ok && held && !holds_now => {
             Some("handed back (hold off)")
         }
-        ("spawn", _) if ok && act.shell => Some("opened a plain shell in"),
-        ("spawn", _) if ok => Some("started a worker in"),
-        ("close", _) if ok => Some("closed"),
-        _ => None,
+        (DriveKind::Spawn, _) if ok && act.shell => Some("opened a plain shell in"),
+        (DriveKind::Spawn, _) if ok => Some("started a worker in"),
+        (DriveKind::Close, _) if ok => Some("closed"),
+        // A read, a fleet service, mail and the rest leave no record of a session driven; a
+        // claim's own journal row is its record.
+        (
+            DriveKind::Claim
+            | DriveKind::Read
+            | DriveKind::ShellRead
+            | DriveKind::Vault
+            | DriveKind::ServiceRepair
+            | DriveKind::AccountsRenew
+            | DriveKind::Post
+            | DriveKind::MailSeen
+            | DriveKind::Turn
+            | DriveKind::Key
+            | DriveKind::Send
+            | DriveKind::Hold
+            | DriveKind::Close
+            | DriveKind::BusLog
+            | DriveKind::Spawn,
+            _,
+        ) => None,
     }
 }
 
@@ -7847,8 +7871,8 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
     let Some(words) = drive_record(act, reply, holds_now) else {
         return;
     };
-    let sid = match act.verb {
-        "spawn" => {
+    let sid = match act.kind {
+        DriveKind::Spawn => {
             let worker = reply
                 .split_whitespace()
                 .nth(1)
@@ -7862,7 +7886,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
             }
             worker
         }
-        "close" => {
+        DriveKind::Close => {
             if let Some(sid) = &act.sid {
                 DRIVE_SPAWNED
                     .lock()
@@ -7874,7 +7898,19 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
             }
             act.sid.clone()
         }
-        _ => act.sid.clone(),
+        DriveKind::Read
+        | DriveKind::ShellRead
+        | DriveKind::Vault
+        | DriveKind::ServiceRepair
+        | DriveKind::AccountsRenew
+        | DriveKind::Post
+        | DriveKind::MailSeen
+        | DriveKind::Turn
+        | DriveKind::Key
+        | DriveKind::Send
+        | DriveKind::Hold
+        | DriveKind::Claim
+        | DriveKind::BusLog => act.sid.clone(),
     };
     if let Some(sid) = sid {
         crate::presence::post_driven(&sid, &driver.host, words);
@@ -7891,6 +7927,20 @@ fn recovery_count_refusal(
         Some("ERR recovery-count-custody unconfirmed\n")
     }
 }
+
+fn lab_custody_allowed(
+    scope: Scope,
+    principal: Principal,
+    selected: bool,
+    arguments: bool,
+    remote: bool,
+) -> bool {
+    scope == Scope::Owner && principal == Principal::Instance && !selected && !arguments && !remote
+}
+
+#[cfg(test)]
+#[path = "control_lab_custody_tests.rs"]
+mod lab_custody_tests;
 
 #[allow(clippy::too_many_arguments)]
 fn serve_request_line(
@@ -7915,6 +7965,34 @@ fn serve_request_line(
     // A drive promotion or forwarding route must never enter the local
     // owner-token/SCM_RIGHTS transport. Consume it before either path.
     let head = request.head();
+    if head.verb == aterm_types::lab_window_guard::CUSTODY_VERB {
+        let challenge = head
+            .rest
+            .strip_prefix("nonce=")
+            .filter(|value| aterm_codec::hex::is_lower(value, 64));
+        let allowed = lab_custody_allowed(
+            scope,
+            serving_principal(),
+            head.selector.is_some(),
+            challenge.is_none(),
+            crate::fabric::serving_driver().is_some(),
+        );
+        #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+        if allowed {
+            if crate::lab_window_custody::send_proof(
+                stream,
+                challenge.expect("challenge checked above"),
+            )
+            .is_err()
+            {
+                out.extend_from_slice(b"ERR lab-window-custody unavailable\n");
+            }
+            return Some(ServeDisposition::Close);
+        }
+        let _ = allowed;
+        out.extend_from_slice(b"ERR lab-window-custody local development owner only\n");
+        return Some(ServeDisposition::Close);
+    }
     if head.verb == "resource-admission-v3" {
         let reply = {
             #[cfg(unix)]
@@ -8003,6 +8081,9 @@ fn serve_request_line(
         out.push_owned(refusal.into_bytes());
         return Some(ServeDisposition::Close);
     }
+    // An `await` stays parked for its client while it is forwarded or served, so the jobs pass
+    // reads that client as waiting on aterm, never as making no progress.
+    let _parked = crate::parked_awaits::enter(head.verb, head.rest);
     if try_proxy_forward(&request, scope, store, sock_dir, stream, reader) {
         return Some(ServeDisposition::Close);
     }
@@ -8053,6 +8134,8 @@ fn serve_request_line(
         },
     };
     let _task = crate::task_launch::CarriedTask::enter(task);
+    // Before the verb runs: a `close` takes the tab, and with it what owns it.
+    let owned = crate::requests_host::owned_target(&request.head(), store);
     let resp = dispatch_request(
         &request,
         &DispatchCx {
@@ -8064,6 +8147,13 @@ fn serve_request_line(
             sock_dir,
         },
     );
+    if let Some(owned) = owned {
+        crate::requests_host::attach_after(
+            owned,
+            &resp.body,
+            &control_session::caller_actor_of(scope, None, store),
+        );
+    }
     #[cfg(any(unix, test))]
     if let Some(act) = &driven {
         if !drive_read_still_owned(act, store) {
@@ -8278,288 +8368,8 @@ pub(crate) fn settle_final_replies(bound: std::time::Duration, input: &InputRepl
 }
 
 #[cfg(test)]
-mod final_reply_tests {
-    use super::FinalReplies;
-    use aterm_types::control_request::head;
-    use std::time::Duration;
-
-    #[test]
-    fn only_a_request_that_can_end_the_process_is_owed() {
-        static REPLIES: FinalReplies = FinalReplies::new();
-        for line in [
-            "close",
-            "@s-1 close",
-            "tab close",
-            "tab close 1",
-            "invoke Quit",
-            "confirm yes",
-        ] {
-            let guard = REPLIES.enter(&head(line));
-            assert!(guard.is_some(), "{line:?} can end the process");
-            assert_eq!(REPLIES.owed(), 1, "{line:?}");
-            drop(guard);
-            assert_eq!(REPLIES.owed(), 0, "{line:?} delivered");
-        }
-        let close = REPLIES.enter(&head("close")).expect("close is owed");
-        assert_eq!(REPLIES.owed(), 1);
-        for line in [
-            "version",
-            "ls",
-            "tab new",
-            "tab 1",
-            "text",
-            "closed",
-            "await seq 3",
-        ] {
-            assert!(REPLIES.enter(&head(line)).is_none(), "{line:?}");
-            assert_eq!(REPLIES.owed(), 1, "{line:?} cannot deliver close's reply");
-        }
-        drop(close);
-        assert_eq!(REPLIES.owed(), 0, "only close's guard delivers its reply");
-    }
-
-    #[test]
-    fn the_exit_waits_for_an_owed_reply_and_only_to_its_bound() {
-        static REPLIES: FinalReplies = FinalReplies::new();
-        assert!(REPLIES.settle(Duration::ZERO), "nothing owed: no wait");
-        let guard = REPLIES.enter(&head("close")).expect("close is owed");
-        assert!(
-            !REPLIES.settle(Duration::from_millis(20)),
-            "owed: the wait ends at its bound"
-        );
-        let writer = std::thread::spawn(move || drop(guard));
-        assert!(
-            REPLIES.settle(aterm_spec::wait::MUST_HAPPEN),
-            "delivered: the wait ends"
-        );
-        writer.join().expect("writer thread");
-    }
-
-    #[test]
-    fn an_input_verbs_reply_is_owed_until_delivered_in_its_registry() {
-        let replies = super::InputReplies::default();
-        let other = super::InputReplies::default();
-        for line in [
-            "send ls",
-            "@s-1 key enter",
-            "hwkey a",
-            "ctrl c",
-            "paste hi",
-            "paste-bin 3",
-            "feed 6869",
-            "@s-1 feed-bin 3",
-            "mouse click left 1 1",
-        ] {
-            let guard = replies.enter(line);
-            assert!(guard.is_some(), "{line:?} writes input");
-            assert!(replies.owed(), "{line:?}");
-            assert!(
-                replies.try_fence().is_none(),
-                "{line:?}: its reply precedes Commit"
-            );
-            assert!(!other.owed(), "{line:?}: another registry owes nothing");
-            drop(guard);
-            assert!(!replies.owed(), "{line:?} delivered");
-        }
-        for line in [
-            "text",
-            "turn hi",
-            "close",
-            "tab close",
-            "ls",
-            "keys",
-            "native-focus",
-        ] {
-            assert!(replies.enter(line).is_none(), "{line:?}");
-        }
-        assert!(!replies.owed());
-
-        let fence = replies.try_fence().expect("nothing owed: admission closes");
-        assert!(
-            replies.try_fence().is_none(),
-            "one exclusive Commit admission"
-        );
-        assert!(
-            replies.enter("text").is_none(),
-            "a read takes no input admission"
-        );
-        assert!(
-            replies.enter("native-focus").is_none(),
-            "native focus remains readable under the exclusive input fence"
-        );
-        let elsewhere = other.enter("send hi").expect("another registry stays open");
-        drop(elsewhere);
-        drop(fence); // A failed Commit lets a later request start.
-        let later = replies.enter("send hi").expect("admission reopened");
-        assert!(
-            replies.try_fence().is_none(),
-            "the later request now precedes Commit"
-        );
-        drop(later);
-        assert!(
-            replies.try_fence().is_some(),
-            "delivered: Commit may fence again"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_lane_owes_an_input_reply_until_it_is_delivered() {
-        use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
-        use std::io::{BufRead as _, Write as _};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Default)]
-        struct Service {
-            replies: super::InputReplies,
-            seen: Mutex<Vec<(String, bool)>>,
-        }
-        impl LaneService for Service {
-            fn owed_input_reply(&self, request: &super::Request) -> Option<super::FinalReply> {
-                self.replies.enter_head(&request.head())
-            }
-            fn authenticate(
-                &self,
-                _stream: &aterm_uds::CtlStream,
-                reader: &mut LaneReader<'_>,
-            ) -> Option<(super::Scope, super::Principal, Option<String>)> {
-                (super::read_request_line(reader)? == "AUTH ok").then_some((
-                    super::Scope::Owner,
-                    super::Principal::Instance,
-                    None,
-                ))
-            }
-            fn serve_line(
-                &self,
-                request: super::Request,
-                _scope: super::Scope,
-                _stream: &aterm_uds::CtlStream,
-                _reader: &mut LaneReader<'_>,
-                out: &mut Outbox,
-            ) -> Option<super::ServeDisposition> {
-                let line = request.line().to_string();
-                out.extend_from_slice(format!("OK {line}\n").as_bytes());
-                let owed = self.replies.owed();
-                self.seen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((line, owed));
-                None
-            }
-            fn is_wait(&self, _request: &super::Request, _scope: super::Scope) -> bool {
-                false
-            }
-            fn subscribe(
-                &self,
-                _request: super::Request,
-                _scope: super::Scope,
-                _stream: aterm_uds::CtlStream,
-            ) {
-            }
-            fn release(&self, _id: u64) {}
-            fn has_live_claim(&self, _id: u64) -> bool {
-                false
-            }
-        }
-
-        let lanes = Lanes::new(LaneLimits {
-            rpc: 1,
-            wait: 1,
-            inline: 1,
-            open: 4,
-            subscriptions: 1,
-        });
-        let started = lanes.start();
-        let service = Arc::new(Service::default());
-        lanes.publish(service.clone());
-        started.activate();
-        let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
-        assert!(lanes.admit(server).is_ok(), "admitted");
-        client
-            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-            .expect("hang detector");
-        (&client)
-            .write_all(b"AUTH ok\nsend ls\ntext\n")
-            .expect("the requests");
-        let mut reader = std::io::BufReader::new(&client);
-        for expected in ["OK send ls\n", "OK text\n"] {
-            let mut reply = String::new();
-            reader.read_line(&mut reply).expect("a reply");
-            assert_eq!(reply, expected);
-        }
-        assert!(
-            service.replies.settle(aterm_spec::wait::MUST_HAPPEN),
-            "delivered: nothing is owed"
-        );
-        assert_eq!(
-            *service
-                .seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [("send ls".to_string(), true), ("text".to_string(), false)]
-        );
-    }
-
-    #[test]
-    fn a_relayed_input_request_owes_no_reply_here_and_a_read_takes_no_lock() {
-        use std::sync::{Arc, mpsc};
-        let store = crate::session_store::new_store();
-        let hosted = crate::session_store::test_handle(5);
-        let hosted_sid = hosted.sid.clone();
-        store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .register(hosted);
-        let replies = super::input_replies_of(&store);
-        let elsewhere = aterm_session::SessionId::generate();
-        for (line, counted) in [
-            ("send ls".to_string(), true),
-            ("@. key enter".to_string(), true),
-            (format!("@{} send ls", hosted_sid.as_str()), true),
-            (format!("@{} send ls", elsewhere.as_str()), false),
-            (format!("@{} paste hi", elsewhere.as_str()), false),
-        ] {
-            let guard = super::owed_input_reply(&store, &super::Request::parse(line.clone()));
-            assert_eq!(guard.is_some(), counted, "{line:?}");
-            assert_eq!(replies.owed(), counted, "{line:?}");
-            drop(guard);
-            assert!(!replies.owed(), "{line:?} delivered");
-        }
-
-        let (held_tx, held_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let holder = {
-            let store = Arc::clone(&store);
-            std::thread::spawn(move || {
-                let _write = store
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = held_tx.send(());
-                let _ = release_rx.recv();
-            })
-        };
-        held_rx
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("the store's write lock is held");
-        let (answer_tx, answer_rx) = mpsc::channel();
-        let asker = {
-            let store = Arc::clone(&store);
-            std::thread::spawn(move || {
-                let version = super::Request::parse("version".to_string());
-                let _ = answer_tx.send(super::owed_input_reply(&store, &version).is_none());
-            })
-        };
-        let answered = answer_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-        let _ = release_tx.send(());
-        holder.join().expect("holder thread");
-        asker.join().expect("asker thread");
-        assert_eq!(
-            answered,
-            Ok(true),
-            "`version` was answered while the store's write lock was held"
-        );
-    }
-}
+#[path = "control_final_reply_tests.rs"]
+mod final_reply_tests;
 
 #[cfg(test)]
 fn read_request_line(reader: &mut impl BufRead) -> Option<String> {
@@ -8595,6 +8405,13 @@ struct DeadlineRead<'a> {
     stream: &'a CtlStream,
     deadline: std::time::Instant,
     draining_detached_peer: bool,
+}
+
+impl Read for DeadlineRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.stream.read(buf)
+    }
 }
 
 impl<'a> DeadlineRead<'a> {
@@ -8801,9 +8618,7 @@ const MAX_FEED_BIN: usize = 256 * 1024;
 pub(crate) const MAX_SUBSCRIBE_TARGETS: usize = 256;
 
 fn post_frame_len(rest: &str) -> Option<Result<usize, String>> {
-    crate::fabric::post_options(rest.split_whitespace())
-        .find_map(|tok| tok.strip_prefix("len="))
-        .map(crate::fabric::post_len)
+    aterm_types::control_verbs::post_announced_len(rest).map(crate::fabric::post_len)
 }
 
 fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
@@ -11425,6 +11240,10 @@ fn typing_momentum_reading(
 mod tests;
 
 #[cfg(test)]
+#[path = "fleet_access_model_tests.rs"]
+mod fleet_access_model_tests;
+
+#[cfg(test)]
 #[path = "control_native_observe_tests.rs"]
 mod control_native_observe_tests;
 
@@ -11577,42 +11396,8 @@ fn meta_wakes_with_barrier_for_test(
 }
 
 #[cfg(test)]
-mod update_check_refusal_tests {
-    use super::control_media::MainHopError;
-
-    #[test]
-    fn a_refused_settings_read_is_answered_err_in_its_own_words() {
-        let dialog = MainHopError::Reason("aterm is showing a dialog; answer it, then retry");
-        assert_eq!(
-            super::update_check_refused(&dialog),
-            "ERR update check: aterm is showing a dialog; answer it, then retry\n"
-        );
-    }
-
-    #[test]
-    fn a_per_process_candidate_publishes_only_after_the_commit() {
-        assert!(super::await_commit_to_publish(None), "an ordinary launch");
-        let gate = crate::spawn::DeferredReaderGate::closed();
-        let waiter = {
-            let gate = gate.clone();
-            std::thread::spawn(move || super::await_commit_to_publish(Some(&gate)))
-        };
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the candidate's publication parks on the closed gate",
-            || (gate.parked() == 1 || waiter.is_finished()).then_some(()),
-        );
-        assert!(
-            !waiter.is_finished(),
-            "nothing is published before the Commit"
-        );
-        gate.release();
-        assert!(
-            waiter.join().unwrap(),
-            "the Commit releases the publication"
-        );
-    }
-}
+#[path = "control_update_check_refusal_tests.rs"]
+mod update_check_refusal_tests;
 
 #[cfg(test)]
 #[path = "control_wire_goldens_tests.rs"]

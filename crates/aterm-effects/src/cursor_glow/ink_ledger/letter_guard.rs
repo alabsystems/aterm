@@ -331,6 +331,8 @@ struct FrameMemo {
     text: (i32, usize, i32),
     text_rows: Vec<Option<(i32, i32)>>,
     text_pairs: Vec<Option<(Option<u32>, u32)>>,
+    /// The theme's ink where the frame draws the glass ([`LetterGuard::glass_ink`]).
+    glass_ink: Option<u32>,
     /// Its cells' glyphs, whether each draws its table raster alone, and the face's ink for
     /// them ([`CursorGlow::observe_glyph_ink`]).
     text_glyphs: Vec<u8>,
@@ -519,6 +521,13 @@ pub(crate) struct LetterGuard {
     memo: Option<Box<FrameMemo>>,
     /// This frame is drawn nowhere ([`CursorGlow::set_frame_unseen`]).
     unseen: bool,
+    /// The theme's ink (`0x00RRGGBB`) on a frame that draws the glass ([`Light::glass`]), whose
+    /// letters a cell read by its glyph's own pixels holds to the census's bar too
+    /// ([`Self::census_bar`]); `None` on every other frame. Set each frame by
+    /// [`CursorGlow::guard_letters`].
+    ///
+    /// [`Light::glass`]: crate::cursor_glow::Light::glass
+    glass_ink: Option<u32>,
     /// A test's counters: the cells judged afresh, the cells whose
     /// verdict was the last frame's, and the frames that took the last
     /// frame's streams back.
@@ -579,6 +588,27 @@ pub(crate) struct LetterGuard {
     /// ([`CursorGlow::hold_page_shades`]), as the hold's second pass held it (2026-11-07).
     #[cfg(any(test, debug_assertions))]
     pub(crate) shades_at_bar: bool,
+    /// A test's negative control: the share [`CursorGlow::verify_cuts`] lowers a cell to written
+    /// back over the cell's verdict, which the next frame takes back in place of the weighing, as
+    /// from 39ba2aa319 until the frame-alone law. Set for a whole run, so it is not in
+    /// [`Self::seams`]: a guard judging afresh takes no verdict back and publishes the same either
+    /// way.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) lowered_kept: bool,
+    /// The tests' switches that change what the guard makes of a frame, as one word
+    /// ([`CursorGlow::guard_seams`]), which [`CursorGlow::guard_letters`] sets each frame: the
+    /// frame memo and each verdict's key ([`Self::cell_key`]) read it, so a control switched
+    /// between two frames takes back neither a frame nor a verdict judged under the other.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) seams: u16,
+    /// A test's count of the cells read by their glyph's own pixels that a bound passed whole
+    /// without a paint ([`Self::ring_passes_whole`]).
+    #[cfg(test)]
+    bound_passed: usize,
+    /// A test's count of the cells [`Self::ring_passes_whole`] refused for their whole reading
+    /// alone ([`ring::RingCell::whole_clears`]): every other bound kept its bar.
+    #[cfg(test)]
+    whole_refused: usize,
 }
 
 impl LetterGuard {
@@ -640,6 +670,7 @@ impl LetterGuard {
         stacked: Vec::new(),
         memo: None,
         unseen: false,
+        glass_ink: None,
         #[cfg(any(test, debug_assertions))]
         judged: 0,
         #[cfg(any(test, debug_assertions))]
@@ -672,6 +703,14 @@ impl LetterGuard {
         shades_whole: false,
         #[cfg(any(test, debug_assertions))]
         shades_at_bar: false,
+        #[cfg(any(test, debug_assertions))]
+        lowered_kept: false,
+        #[cfg(any(test, debug_assertions))]
+        seams: 0,
+        #[cfg(test)]
+        bound_passed: 0,
+        #[cfg(test)]
+        whole_refused: 0,
     };
 }
 
@@ -1667,11 +1706,28 @@ impl LetterGuard {
             }
         }
         self.paint_ring(s, (j.x1 - j.x0) as usize, has_over);
+        let census = self.census_bar(j.fg);
         let text = std::mem::take(&mut self.px_text);
         let frame = Frame(&text);
-        let held = self.ring.holds(&frame, bar) && self.ring.whole_holds(&frame, j.hold);
+        let held = self.ring.holds(&frame, bar, census) && self.ring.whole_holds(&frame, j.hold);
         self.px_text = text;
         held
+    }
+
+    /// The census's bar ([`ring::RingCell::glass_bar`]) the letter of colour `fg` read last by its
+    /// glyph's own pixels keeps on this frame: on a frame that draws the glass, where `fg` is the
+    /// theme's ink ([`Self::glass_ink`]); `0` (none) on every other. The glass is solved so the
+    /// theme's letters keep that bar by each solid pixel (§15.2 1.12's glyph minimum), and the
+    /// lights laid over it (the caret's aurora, a halo) must leave them there: held only to its
+    /// raster bar, by the judges' row medians, Iosevka Term NL's `%` at 24 px read 5.19 by its
+    /// edge pixel beside the caret just after it was typed, under the glass's 5.25.
+    #[inline]
+    fn census_bar(&self, fg: u32) -> f32 {
+        if self.glass_ink == Some(fg & 0x00FF_FFFF) {
+            self.ring.glass_bar()
+        } else {
+            0.0
+        }
     }
 
     /// Whether every light that reaches the cell adds (no source-over
@@ -2769,12 +2825,14 @@ impl LetterGuard {
     }
 
     /// The hash of everything a cell's verdict ([`Self::judge`]) reads: its
-    /// ring box `(x0, y0, x1, y1)`, its ink and ground, its bar's room and
-    /// how its grounds are read (tests' controls, [`OWN_ROOM`],
-    /// [`Self::luma_ring`]), its face's core or
+    /// ring box `(x0, y0, x1, y1)`, its ink and ground, the tests' controls
+    /// that change a verdict ([`Self::seams`]: its bar's room, [`OWN_ROOM`],
+    /// how its grounds are read, [`Self::luma_ring`], its whole reading's
+    /// bar and [`letter_bar`]'s), its face's core or
     /// (`model`, `0` for none) the glyphs and grounds of the neighbourhood
     /// its ring is read from ([`Judge::ring`]) and the bars it keeps there
-    /// (`hold`), and each of [`Self::cell`]'s lights, in order, by what it
+    /// (`hold`, and the census's where it keeps that, [`Self::census_bar`]),
+    /// and each of [`Self::cell`]'s lights, in order, by what it
     /// draws (not its index, which a light laid before it moves).
     #[inline]
     const fn cell_key(
@@ -2784,13 +2842,12 @@ impl LetterGuard {
         (cover, model, hold): (Option<Cover>, u64, RasterHold),
         streams: Streams<'_>,
     ) -> u64 {
+        // The switches' word takes bits 48 to 62 above the ink and its ground, the hold bit 63.
         #[cfg(any(test, debug_assertions))]
-        let (no_room, luma_ring) = (self.no_room, self.luma_ring);
+        let seams = (self.seams as u64 & 0x7FFF) << 48;
         #[cfg(not(any(test, debug_assertions)))]
-        let (no_room, luma_ring) = (false, false);
-        let seams = (no_room as u64) << 48
-            | (luma_ring as u64) << 49
-            | (matches!(hold, RasterHold::Own) as u64) << 50;
+        let seams = 0u64;
+        let seams = seams | (matches!(hold, RasterHold::Own) as u64) << 63;
         let mut h = fold(
             fold(
                 fold(
@@ -2801,6 +2858,12 @@ impl LetterGuard {
             ),
             (ink as u64) | (ground as u64) << 24 | seams,
         );
+        // A letter held to the census's bar too ([`Self::census_bar`]) is weighed apart.
+        if let Some(glass) = self.glass_ink
+            && glass == ink & 0x00FF_FFFF
+        {
+            h = fold(h, 1 << 33);
+        }
         if let Some(Cover { c, seat }) = cover {
             h = fold(h, c.to_bits() as u64 | 1 << 32);
             if let Some([x0, y0, x1, y1]) = seat {
@@ -2974,22 +3037,11 @@ impl LetterGuard {
             hold: ring.unwrap_or(RasterHold::Bar),
         };
         if let Some(hold) = ring {
-            // Read as the judge reads it: the bar of its own reading on the bare page, and where
-            // every light adds, the brightest ground the lights can make (each channel's sum
-            // bounds each channel's median of a ring) against its dimmest solid ink.
+            // Read as the judge reads it: the bar of its own reading on the bare page, passed
+            // whole by the bounds where they settle it, else weighed by the bisection.
             let bar = hold.bar(self.ring.own);
-            if !self.ring.ring_text
-                && !self.ring.filled()
-                && self.ring.l_min > l_ground
-                && let Some((_, all)) = self.bound(j, streams)
-            {
-                let lg = crate::color_math::relative_luminance_with(table, lifted(ground, all));
-                if lg < self.ring.l_min
-                    && lum_ratio(self.ring.l_min, lg) >= bar
-                    && self.ring.whole_clears(lg, hold)
-                {
-                    return 1.0;
-                }
+            if self.ring_passes_whole(j, bar, hold, streams) {
+                return 1.0;
             }
             return self.share(j, bar, streams);
         }
@@ -3026,6 +3078,60 @@ impl LetterGuard {
             }
         }
         self.share(j, bar, streams)
+    }
+
+    /// THE BOUNDS ANSWER AS THE BISECTION. Whether [`Self::share`] gives the whole light,
+    /// `1.0` (its first weighing), to a cell read by its glyph's own pixels ([`Judge::ring`]),
+    /// held to `bar` and its whole reading's bar under `hold`, on every frame its lights can make,
+    /// so that no paint need weigh it. The bounds settle it only where every light adds, no
+    /// trail's fill lies in its ring box and no text lies on a pixel a reading reads as the ground
+    /// ([`ring::RingCell::filled`], [`ring::RingCell::ground_text`]): each such pixel is then the
+    /// ground plus its lights, at most `lg` in luminance, the ground lifted by each light's
+    /// brightest channels ([`Self::bound`]), and every text pixel the clean frame's or brighter
+    /// in each channel, the text's levels laid on a brighter ground
+    /// ([`aterm_render::TextLevel::over`]). Light ink on a darker ground then keeps its bar where
+    /// its dimmest solid ink keeps it against `lg`, and its core its whole reading's
+    /// ([`ring::RingCell::whole_clears`]). The bound reads each pixel's ratio as the frame does,
+    /// and `f32`'s rounding keeps their order, so it is exact.
+    ///
+    /// Ink darker than its ground is left to the bisection. A bound that gives it none (the
+    /// after-land A-A3 letters, at AA on the bare page and under AA's level in hand, which the
+    /// bisection paints eight times for none) needs the ground's pixels bounded, and a glyph's
+    /// faint rim that rounds to white lies on them for nearly every letter on paper; in the
+    /// gallery's flood such a bound answered no cell on GitHub Light, a dark page or a dim one
+    /// (2026-11-11, cost stream).
+    #[inline]
+    fn ring_passes_whole(
+        &mut self,
+        j: Judge,
+        bar: f32,
+        hold: RasterHold,
+        streams: Streams<'_>,
+    ) -> bool {
+        // Light ink's dimmest solid pixel against the brightest ground bounds each solid pixel's
+        // reading, so the census's bar ([`Self::census_bar`]) is bounded with the ring's.
+        let bar = bar.max(self.census_bar(j.fg));
+        let l_g = j.l_ground;
+        if self.ring.ground_text
+            || self.ring.filled()
+            || self.ring.l_min <= l_g
+            || (self.ring.l_min + 0.05) / (l_g + 0.05) < bar
+        {
+            return false;
+        }
+        let Some((_, all)) = self.bound(j, streams) else {
+            return false;
+        };
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, lifted(j.ground, all));
+        let ring_clears = lg < self.ring.l_min && (self.ring.l_min + 0.05) / (lg + 0.05) >= bar;
+        let passes = ring_clears && self.ring.whole_clears(lg, hold);
+        #[cfg(test)]
+        {
+            self.bound_passed += usize::from(passes);
+            self.whole_refused += usize::from(ring_clears && !passes);
+        }
+        passes
     }
 
     /// The largest share of the cell's lights that keeps the letter's `bar`
@@ -3315,10 +3421,12 @@ pub(super) fn raster_bar(bare: f32) -> f32 {
 /// body whole, 18 of 227 fell under it typing and 48 of 610 bursting (Linux arm64, 2026-11-07).
 /// Held here, a letter keeps every shade under which it reads its own reading or more, and loses
 /// only one that lowers it. Under a page shade such a letter gives up [`LEVEL_ROOM`]'s level in
-/// hand: held at its whole reading the guard let Beam's `d` read 4.490 in a window, and here it is
-/// held at its own reading with no level over it. Replayed on Linux's bundled face no letter at AA
-/// reads under AA in Beam's scenes on Solarized Dark (Linux arm64, 2026-11-07); no window and no
-/// Mac has read it.
+/// hand: held at its whole reading the guard let Beam's `d` read 4.490 replayed on a Mac, and here
+/// it is held at its own reading with no level over it. Replayed, no letter at AA reads under AA in
+/// Beam's scenes on Solarized Dark, on Linux's bundled face (Linux arm64, 2026-11-07) or on the
+/// Mac's, where the burst's `d` reads its own 4.5086 held and 4.490 with the shade whole (macOS,
+/// 2026-11-11). In a window, Beam's Solarized Settings card's `&&`, 4.220 of its own (bar 4.093),
+/// reads 4.16 held, where it read 4.03 to 4.04 with the shade whole.
 #[inline]
 #[must_use]
 fn shade_bar(bare: f32) -> f32 {
@@ -3348,26 +3456,45 @@ impl RasterHold {
     }
 }
 
-/// The most luminance a light against a glyph's foot may read and leave its letter at the bar
-/// the guard holds it to ([`raster_bar`]): a rail's foot quads go unweighed
-/// ([`InkLedger::note_foot_rail`]), so this bar is theirs to keep. It stands on the raster's
-/// lowest row the judges read ([`ring`]), by the least of that row's solid pixels (they read its
-/// lower median), because a light on the pixel row under it is all of that row's ring. A
-/// descender's last row is laid under the letter's colour: `q` in `#858585` on dim-grey reads 5.04
-/// by its colour and 4.51 by that row, so a bar from the colour left Comet's thread at 4.23 of
-/// that 4.51, and the reference dark's `q` at 4.46. A glyph with no raster, or whose ink does not
-/// stand brighter than its ground, leaves its ground's.
+/// What a glyph's foot leaves a light laid on its cell's pixel rows from `from` down
+/// ([`foot_ring`]): a rail in its row's foot band, in the judges' ring of each ink pixel within
+/// [`RING`] rows of the band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FootRing {
+    /// The most luminance a light in the ring round that ink may read and leave its letter at the
+    /// bar the guard holds it to.
+    pub(crate) light: f32,
+    /// The columns, px from the cell's left, that ink lies in on those rows, `[x0, x1)`: empty
+    /// where none of its pixels does, `None` where the face holds no raster for the glyph.
+    pub(crate) cols: Option<(i32, i32)>,
+}
+
+/// What glyph `glyph`, drawn in `ink` on `ground`, leaves a light laid on its cell's pixel rows
+/// from `from` down ([`FootRing`]): the most luminance that light may read and leave the letter
+/// at the bar the guard holds it to ([`raster_bar`]), and the columns of the ink it rings. A rail's
+/// foot quads go unweighed ([`InkLedger::note_foot_rail`]), so this bar is theirs to keep.
+///
+/// The light stands on the least of the solid pixels (the ones the judges read, [`ring`]) on the
+/// raster's rows from `from` down, because a light there is all of their ring that the band holds.
+/// A descender's last row is laid under the letter's colour: `q` in `#858585` on dim-grey reads
+/// 5.04 by its colour and 4.51 by that row, so a bar from the colour left Comet's thread at 4.23
+/// of that 4.51, and the reference dark's `q` at 4.46. A glyph with no raster, or whose ink does
+/// not stand brighter than its ground, leaves its ground's; then its columns are every inked one
+/// on those rows.
 #[must_use]
-pub(crate) fn foot_ring_light(
+pub(crate) fn foot_ring(
     inks: &aterm_render::GlyphInk,
     glyph: u8,
-    ink: u32,
-    ground: u32,
-) -> f32 {
+    (ink, ground): (u32, u32),
+    from: i32,
+) -> FootRing {
     let table = crate::color_math::relative_luminance_table();
     let l_ground = crate::color_math::relative_luminance_with(table, ground);
     let Some(raster) = inks.raster(glyph) else {
-        return l_ground;
+        return FootRing {
+            light: l_ground,
+            cols: None,
+        };
     };
     let reads = |cov: u8| {
         let laid = aterm_render::TextLevel::new(ink, ground, cov, inks.corrected()).over(ground);
@@ -3375,21 +3502,35 @@ pub(crate) fn foot_ring_light(
             / (l_ground + 0.05)
     };
     let full = reads(raster.cov.iter().copied().max().unwrap_or(0));
-    if full <= 1.0 {
-        return l_ground;
-    }
-    for row in raster.cov.rchunks_exact(raster.w) {
-        let least = row
-            .iter()
-            .copied()
-            .filter(|&cov| reads(cov) >= SOLID_SHARE * full)
-            .min();
-        if let Some(cov) = least {
-            let own = reads(cov);
-            return (own * (l_ground + 0.05) / raster_bar(own) - 0.05).max(l_ground);
+    let lit = full > 1.0;
+    let (mut x0, mut x1, mut least) = (i32::MAX, i32::MIN, None::<u8>);
+    for (r, row) in raster.cov.chunks_exact(raster.w).enumerate() {
+        if raster.y + (r as i32) < from {
+            continue;
+        }
+        for (x, &cov) in row.iter().enumerate() {
+            let solid = if lit {
+                reads(cov) >= SOLID_SHARE * full
+            } else {
+                cov > 0
+            };
+            if solid {
+                (x0, x1) = (x0.min(raster.x + x as i32), x1.max(raster.x + x as i32 + 1));
+                least = Some(least.map_or(cov, |l| l.min(cov)));
+            }
         }
     }
-    l_ground
+    let light = match least {
+        Some(cov) if lit => {
+            let own = reads(cov);
+            (own * (l_ground + 0.05) / raster_bar(own) - 0.05).max(l_ground)
+        }
+        _ => l_ground,
+    };
+    FootRing {
+        light,
+        cols: Some(if x0 < x1 { (x0, x1) } else { (0, 0) }),
+    }
 }
 
 /// `c` lifted by `lift` per channel, saturating.
@@ -4201,6 +4342,7 @@ impl CursorGlow {
         if self.letter_guard.unseen {
             return 0;
         }
+        self.letter_guard.glass_ink = cfg.light.glass().then_some(cfg.theme_fg & 0x00FF_FFFF);
         let style = cfg.style;
         #[cfg(any(test, debug_assertions))]
         let trail = if self.letter_guard.trail_off {
@@ -4214,21 +4356,9 @@ impl CursorGlow {
         }
         #[cfg(any(test, debug_assertions))]
         let (seams, reuse) = {
-            let g = &self.letter_guard;
-            let l = &self.ink_ledger;
-            (
-                u16::from(g.no_room)
-                    | u16::from(g.comb) << 1
-                    | u16::from(l.round_cuts) << 3
-                    | u16::from(l.rails_feathered) << 4
-                    | u16::from(l.foot_rails_weighed) << 5
-                    | u16::from(g.ring_off) << 8
-                    | u16::from(g.luma_ring) << 9
-                    | u16::from(g.ring.whole_off) << 10
-                    | u16::from(g.shades_whole) << 11
-                    | u16::from(g.shades_at_bar) << 12,
-                !g.no_reuse,
-            )
+            let seams = self.guard_seams();
+            self.letter_guard.seams = seams;
+            (seams, !self.letter_guard.no_reuse)
         };
         #[cfg(not(any(test, debug_assertions)))]
         let (seams, reuse) = (0u16, true);
@@ -4281,6 +4411,7 @@ impl CursorGlow {
             && memo.text_plain == text.plain
             && memo.trail.0 == trail.0
             && memo.trail.1 == trail.1
+            && memo.glass_ink == self.letter_guard.glass_ink
             && same_ink(memo.ink.as_ref(), self.glyph_ink.as_ref())
         {
             self.under_out.clone_from(&memo.made.0);
@@ -4305,6 +4436,7 @@ impl CursorGlow {
         memo.trail.0.clear();
         memo.trail.0.extend_from_slice(trail.0);
         memo.trail.1 = trail.1;
+        memo.glass_ink = self.letter_guard.glass_ink;
         memo.ink.clone_from(&self.glyph_ink);
         memo.seen.0.clone_from(&self.under_out);
         memo.seen.1.clone_from(over);
@@ -4328,6 +4460,29 @@ impl CursorGlow {
         memo.kept = true;
         self.letter_guard.memo = Some(memo);
         print
+    }
+
+    /// The tests' switches that change what [`Self::guard_letters`] makes of a frame, as one word
+    /// ([`LetterGuard::seams`]): the guard's controls, the ledger's, and [`letter_bar`]'s
+    /// ([`with_share_over_aa`], [`with_aa_unrounded`]). Bits 6 and 7 are the frame memo's own (the
+    /// caret's shape, a spared style).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    fn guard_seams(&self) -> u16 {
+        let g = &self.letter_guard;
+        let l = &self.ink_ledger;
+        u16::from(g.no_room)
+            | u16::from(g.comb) << 1
+            | u16::from(l.round_cuts) << 3
+            | u16::from(l.rails_feathered) << 4
+            | u16::from(l.foot_rails_weighed) << 5
+            | u16::from(g.ring_off) << 8
+            | u16::from(g.luma_ring) << 9
+            | u16::from(g.ring.whole_off) << 10
+            | u16::from(g.shades_whole) << 11
+            | u16::from(g.shades_at_bar) << 12
+            | u16::from(share_over_aa()) << 13
+            | u16::from(AA_UNROUNDED.with(std::cell::Cell::get)) << 14
     }
 
     /// Whether [`Self::guard_letters`] judges this frame's lights against its
@@ -4994,6 +5149,12 @@ impl CursorGlow {
             if less >= share {
                 continue;
             }
+            #[cfg(any(test, debug_assertions))]
+            if guard.lowered_kept
+                && let Some(v) = guard.fresh.iter_mut().find(|v| v.0 == c.key)
+            {
+                v.1 = less;
+            }
             match at {
                 Some(k) => cuts[k].1 = less,
                 // A cell its lights left uncut takes its place in its row's cuts, and the
@@ -5041,6 +5202,15 @@ impl CursorGlow {
     #[inline]
     pub const fn set_letter_guard_shades_to_own(&mut self, on: bool) {
         self.letter_guard.shades_at_bar = !on;
+    }
+
+    /// A test's negative control: the share [`Self::verify_cuts`] lowers a cell to written back
+    /// over its verdict (`true`), which the next frame takes back in place of the weighing
+    /// ([`LetterGuard::lowered_kept`]). Set it before a run's first frame.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_lowered_kept(&mut self, on: bool) {
+        self.letter_guard.lowered_kept = on;
     }
 
     /// A test's negative control: each letter kept by its ring alone (`false`), its whole reading

@@ -83,7 +83,7 @@ fn stop_interrupts_an_owned_installer_waiting_through_an_outage_once_without_rea
     );
     assert_eq!(app.workstation_setup.developer_tools_want, None);
     assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
-    assert!(app.workstation_setup.developer_tools_mark.opened());
+    assert!(app.workstation_setup.developer_tools_mark.held().is_some());
     app.developer_tools_install_ended(
         id,
         Some(aterm_pty::ChildExit::Code(i32::from(

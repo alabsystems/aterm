@@ -17,6 +17,8 @@ pub const MAX_TAG: usize = 1024;
 pub const MAX_META: usize = 4096;
 /// The largest body any frame may declare: a header, a tag and a META, plus room to grow.
 pub const MAX_BODY: usize = 8192;
+/// The most records one BYE names to keep past the quit ([`Frame::Bye`]).
+pub const MAX_KEEPS: usize = 64;
 /// The longest build/version string a HELLO or WELCOME carries.
 pub const MAX_LABEL: usize = 64;
 /// The longest STATUS reply text.
@@ -35,6 +37,16 @@ pub const CAP_LINK: u8 = 0x02;
 pub const CAP_JOURNAL: u8 = 0x04;
 /// WELCOME's trailing caps bit, from a keeper: it answers a SYNC with the same number once it has read every frame written before it on that connection.
 pub const CAP_SYNC: u8 = 0x08;
+/// WELCOME's trailing caps bit, from a keeper: it honours a BYE's keep set ([`Frame::Bye`]),
+/// leaving each record it names, its shell alive, for the next window's HELLO. An older keeper
+/// reads such a BYE as a plain one (the decoder's growth rule) and closes them all, so a window
+/// carries a session past its quit only to a keeper that states this. As a HELLO bit, from a
+/// window: it reads an OFFER's kept flag ([`Frame::Offer`]'s `kept`), which a keeper writes only
+/// to a window that states it.
+pub const CAP_KEEPS: u8 = 0x10;
+/// An OFFER's kept flag bit: a quit's BYE kept the record past it
+/// ([`Frame::Offer`]'s `kept`), not a crash.
+const OFFER_KEPT: u8 = 0x01;
 /// The one companion kind this build knows: a crash-restore journal region (`aterm-restore`).
 pub const COMPANION_JOURNAL: u8 = 1;
 
@@ -53,7 +65,7 @@ pub enum Kind {
     Release = 5,
     /// W→K: the update successor's kernel pid, before the grant.
     Pending = 6,
-    /// W→K: quit intent, written just before `exit(0)`.
+    /// W→K: quit intent, written just before `exit(0)`, with the records to keep past it.
     Bye = 7,
     /// K→W', with the master: the header, the tag, the META.
     Offer = 8,
@@ -295,13 +307,24 @@ pub enum Frame {
     Pending {
         pid: u32,
     },
-    Bye,
+    Bye {
+        /// The records whose shells go on past the quit for the next window to adopt (appended:
+        /// a BYE that keeps nothing is the older frame, and an older keeper ignores it), at
+        /// most [`MAX_KEEPS`].
+        keep: Vec<u64>,
+    },
     Offer {
         header: MasterHeader,
         tag: Vec<u8>,
         meta: Vec<u8>,
         /// The crash-restore journal's trailing fields, written only to a HELLO that stated [`CAP_JOURNAL`]; `None` when the body ends before them (an older keeper's OFFER, or one to a window that does not journal).
         journal: Option<JournalOffer>,
+        /// Whether the record outlived its last window because that window's quit kept it (its
+        /// BYE's keep set) rather than because the window crashed: a flags byte after the journal
+        /// fields (written as zeroes to a window that does not journal), only to a HELLO that
+        /// stated [`CAP_KEEPS`]; `None` when the body ends before it (an older keeper's OFFER, or
+        /// one to a window that does not read it).
+        kept: Option<bool>,
     },
     Orphans {
         n: u16,
@@ -399,7 +422,7 @@ impl Frame {
             Frame::Meta { .. } => Kind::Meta,
             Frame::Release { .. } => Kind::Release,
             Frame::Pending { .. } => Kind::Pending,
-            Frame::Bye => Kind::Bye,
+            Frame::Bye { .. } => Kind::Bye,
             Frame::Offer { .. } => Kind::Offer,
             Frame::Orphans { .. } => Kind::Orphans,
             Frame::Status { .. } => Kind::Status,
@@ -464,19 +487,35 @@ impl Frame {
             Frame::Release { rdev } => body.extend_from_slice(&rdev.to_be_bytes()),
             Frame::Sync { seq } => body.extend_from_slice(&seq.to_be_bytes()),
             Frame::Pending { pid } => body.extend_from_slice(&pid.to_be_bytes()),
-            Frame::Bye | Frame::RestartWhenSafe | Frame::Adopt => {}
+            Frame::Bye { keep } => {
+                if !keep.is_empty() {
+                    let n = u16::try_from(keep.len())
+                        .ok()
+                        .filter(|_| keep.len() <= MAX_KEEPS)
+                        .ok_or(WireError::Oversize(kind))?;
+                    body.extend_from_slice(&n.to_be_bytes());
+                    for rdev in keep {
+                        body.extend_from_slice(&rdev.to_be_bytes());
+                    }
+                }
+            }
+            Frame::RestartWhenSafe | Frame::Adopt => {}
             Frame::Offer {
                 header,
                 tag,
                 meta,
                 journal,
+                kept,
             } => {
                 put_header(&mut body, header);
                 put_long(&mut body, tag, MAX_TAG, kind)?;
                 put_long(&mut body, meta, MAX_META, kind)?;
-                if let Some(j) = journal {
+                if let Some(j) = journal.or_else(|| kept.map(|_| JournalOffer::default())) {
                     body.push(j.attempts);
                     body.push(j.companions);
+                }
+                if let Some(kept) = kept {
+                    body.push(if *kept { OFFER_KEPT } else { 0 });
                 }
             }
             Frame::Orphans { n } => body.extend_from_slice(&n.to_be_bytes()),
@@ -569,7 +608,17 @@ impl Frame {
             Kind::Release => Frame::Release { rdev: r.u64()? },
             Kind::Sync => Frame::Sync { seq: r.u64()? },
             Kind::Pending => Frame::Pending { pid: r.u32()? },
-            Kind::Bye => Frame::Bye,
+            Kind::Bye => Frame::Bye {
+                keep: if r.at < body.len() {
+                    let n = usize::from(r.u16()?);
+                    if n > MAX_KEEPS {
+                        return Err(WireError::Oversize(kind));
+                    }
+                    (0..n).map(|_| r.u64()).collect::<Result<_, _>>()?
+                } else {
+                    Vec::new()
+                },
+            },
             Kind::Offer => Frame::Offer {
                 header: r.master_header()?,
                 tag: r.long(MAX_TAG)?,
@@ -579,6 +628,12 @@ impl Frame {
                         attempts: r.u8()?,
                         companions: r.u8()?,
                     })
+                } else {
+                    None
+                },
+                // A flag bit this build does not know is a newer keeper's, and says nothing here.
+                kept: if r.at < body.len() {
+                    Some(r.u8()? & OFFER_KEPT != 0)
                 } else {
                     None
                 },

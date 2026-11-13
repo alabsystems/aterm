@@ -486,10 +486,15 @@ fn run_native_host_fixture_inner(
     let configured = policy.is_some();
     let expected = policy.as_ref().map_or_else(
         || {
-            // Shipping cold relaunch was qualified on Apple Silicon; generic
-            // constructors and sealed renewal discovery stay disabled.
-            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                vec![Constructor::ColdRestart, Constructor::AskedUpgrade]
+            // The shipping policy's answer (`SessionPolicy::constructor_enabled`): cold relaunch
+            // and both asked constructors where cold relaunch was qualified, on Apple Silicon;
+            // the own-image constructor and sealed renewal discovery stay disabled.
+            if crate::native_session_policy::cold_restart_qualified() {
+                vec![
+                    Constructor::ColdRestart,
+                    Constructor::AskedUpgrade,
+                    Constructor::AskedRelaunch,
+                ]
             } else {
                 Vec::new()
             }
@@ -542,7 +547,6 @@ fn run_native_host_fixture_inner(
         account_services: AccountServices {
             source_registry: Arc::new(Default::default()),
             lifetime: Default::default(),
-            interactive_browser: false,
         },
         token: Arc::new(token),
         sock_dir: world,

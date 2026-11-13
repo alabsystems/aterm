@@ -32,63 +32,29 @@ mod native {
 
     const ROOT: &str = "ATERM_SUBSCRIBER_PROBE_ROOT";
     const CHILD: &str = "ATERM_SUBSCRIBER_PROBE_CHILD";
-    const BASELINE: &str = "ATERM_SUBSCRIBER_PROBE_BASELINE";
-    const DEFAULT_PRIORITY: &str = "ATERM_SUBSCRIBER_PROBE_DEFAULT_PRIORITY";
-    const FALLBACK: &str = "ATERM_SUBSCRIBER_PROBE_FALLBACK";
-    const LEGACY: &str = "subscriber-old-destination";
     const HANG: Duration = Duration::from_secs(60);
     // A sampling interval, never an acceptance ceiling or a first-use delay.
     const IDLE: Duration = Duration::from_secs(5);
 
-    pub(super) fn enter(mut argv: Vec<OsString>) -> ExitCode {
-        // The old-destination control deliberately reaches the unchanged CLI parser,
-        // whose unsupported argument is refused before it constructs any vault Paths.
-        if argv.first().is_some_and(|arg| {
-            Path::new(arg)
-                .file_name()
-                .is_some_and(|name| name == LEGACY)
-        }) {
-            return aterm_secrets::cli::main_entry(argv.into_iter().skip(2).collect());
-        }
-        if argv.get(1).is_some_and(|arg| arg == "secrets")
-            && argv.get(2).is_some_and(|arg| arg == "watch")
-        {
-            // Match the unchanged unit's inherited Nice=5 before the first image
-            // replaces itself. Lowering priority requires no extra authority.
-            // SAFETY: modifies this owned process alone, without escalation.
-            if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 5) } != 0 {
-                return ExitCode::FAILURE;
-            }
-        }
-        if std::env::var_os(BASELINE).is_none() {
-            if std::env::var_os(FALLBACK).is_some()
-                && let Some(code) = fallback_entry(&argv)
-            {
-                return code;
-            }
-            super::subscriber_scheduling::enter(&mut argv);
-        }
+    pub(super) fn enter(argv: Vec<OsString>) -> ExitCode {
+        // The production entry applies only to exact plain watch, before any worker.
+        // No replacement image, hidden verb or priority adjustment is part of this probe.
+        super::subscriber_scheduling::enter(&argv);
         let args = argv.get(1..).unwrap_or_default();
-        let result = if args == ["--probe"] || args == ["--setexec-only"] {
-            controller(args == ["--setexec-only"])
+        let result = if args == ["--probe"] {
+            controller()
         } else if std::env::var_os(CHILD).is_some() {
             child_priority()
-        } else if args == ["--entry-contract"] {
-            entry_contract()
-        } else if args.len() == 2 && args[0] == "--replace" {
-            replace(Path::new(&args[1]))
-        } else if args.len() == 2 && args[0] == "--after-replace" {
-            after_replace(Path::new(&args[1]))
         } else if args.len() == 3 && args[0] == "--guard-job" {
             guard_job(args[1].to_string_lossy().as_ref(), Path::new(&args[2]))
         } else if args == ["secrets", "watch"] {
             watch()
         } else if args.first().is_some_and(|arg| arg == "init") {
-            // The actual local subscriber starts its ordinary converge runner. This
-            // qualification has no settings to apply and never dispatches a front door.
+            // The signed loopback subscriber may start its ordinary converge runner;
+            // this fixture has no settings to apply and dispatches no live front door.
             Ok(())
         } else {
-            Err(io::Error::other("use --probe or --setexec-only"))
+            Err(io::Error::other("use --probe"))
         };
         match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -106,47 +72,44 @@ mod native {
             .ok_or_else(|| io::Error::other("no owned fixture root"))
     }
 
-    fn fallback_entry(argv: &[OsString]) -> Option<ExitCode> {
-        let root = match own_root() {
-            Ok(root) => root,
-            Err(_) => return Some(ExitCode::FAILURE),
+    fn thread_id() -> io::Result<u64> {
+        unsafe extern "C" {
+            fn pthread_threadid_np(thread: *mut core::ffi::c_void, id: *mut u64) -> libc::c_int;
+        }
+        let mut id = 0;
+        // SAFETY: null names this thread, and id is a writable u64 slot.
+        let rc = unsafe { pthread_threadid_np(std::ptr::null_mut(), &mut id) };
+        if rc != 0 || id == 0 {
+            return Err(io::Error::other("the controlled thread id is unavailable"));
+        }
+        Ok(id)
+    }
+
+    fn thread_priority(pid: u32, thread: u64) -> io::Result<i32> {
+        // The existing UDS band fixture uses this exact by-thread-id flavor.
+        const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        let pid = i32::try_from(pid).map_err(io::Error::other)?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::uninit();
+        let size =
+            libc::c_int::try_from(size_of::<libc::proc_threadinfo>()).map_err(io::Error::other)?;
+        // SAFETY: info is size writable bytes; the caller retains the owned worker
+        // at a channel barrier, so its exact kernel thread id remains alive.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDTHREADID64INFO,
+                thread,
+                info.as_mut_ptr().cast(),
+                size,
+            )
         };
-        let args = argv.get(1..).unwrap_or_default();
-        if args == ["secrets", super::subscriber_scheduling::WATCH_REEXEC] {
-            let refused = json!({"pid":std::process::id(),"args":["secrets",super::subscriber_scheduling::WATCH_REEXEC]});
-            if aterm_json::to_vec(&refused).ok().is_none_or(|bytes| {
-                std::fs::write(root.join("marker-refused.json"), bytes).is_err()
-            }) {
-                return Some(ExitCode::FAILURE);
-            }
-            // Model replacement by the old image at this exact entry, using its
-            // unchanged parser. No setup handler, state, keeper or key is entered.
-            return Some(aterm_secrets::cli::main_entry(
-                argv.iter().skip(2).cloned().collect(),
+        if read != size {
+            return Err(io::Error::other(
+                "the controlled thread's kernel priority is unavailable",
             ));
         }
-        if args == ["secrets", "watch"] && root.join("marker-refused.json").exists() {
-            let parked = || -> io::Result<()> {
-                let mut stream = UnixStream::connect(root.join("fallback.sock"))?;
-                stream.set_read_timeout(Some(HANG))?;
-                stream.set_write_timeout(Some(HANG))?;
-                send(
-                    &mut stream,
-                    &json!({"stage":"plain-restarted","pid":std::process::id(),
-                    "args":["secrets","watch"],"priorities":priorities(std::process::id())?,
-                    "nice":usage(std::process::id())?.scheduling.and_then(|scheduling|scheduling.nice.ok())}),
-                )?;
-                let mut release = [0];
-                stream.read_exact(&mut release)?;
-                Ok(())
-            };
-            return Some(if parked().is_ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            });
-        }
-        None
+        // SAFETY: the exact-size read initialized every integer field.
+        Ok(unsafe { info.assume_init() }.pth_priority)
     }
 
     fn priorities(pid: u32) -> io::Result<Vec<i32>> {
@@ -168,14 +131,10 @@ mod native {
     }
 
     fn child_priority() -> io::Result<()> {
-        // SAFETY: retain the unit's Nice=5 in every paired child and outside-band
-        // reference, lowering only this owned child's priority.
-        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 5) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
         aterm_gui::hold_process_as_housekeeping();
         let _lift = aterm_uds::qos::lift();
-        println!("{}", json!({"priorities":priorities(std::process::id())?}));
+        let priority = thread_priority(std::process::id(), thread_id()?)?;
+        println!("{}", json!({"priorities":[priority]}));
         Ok(())
     }
 
@@ -193,57 +152,6 @@ mod native {
         aterm_json::from_value(value["priorities"].clone()).map_err(io::Error::other)
     }
 
-    fn replace(root: &Path) -> io::Result<()> {
-        // SAFETY: only lower this owned process's scheduling priority, retaining
-        // the Nice=5 an old subscriber unit supplies. No escalation is attempted.
-        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 5) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // This process really entered the Background task band. Ask for default
-        // before SETEXEC, so the record proves the old band rather than a QoS request.
-        aterm_gui::hold_process_as_housekeeping();
-        let _lift = aterm_uds::qos::lift();
-        let nice = usage(std::process::id())?
-            .scheduling
-            .and_then(|scheduling| scheduling.nice.ok());
-        std::fs::write(
-            root.join("before-exec.json"),
-            aterm_json::to_vec(&json!({
-                "pid":std::process::id(), "priorities":priorities(std::process::id())?,"nice":nice
-            }))
-            .map_err(io::Error::other)?,
-        )?;
-        let mut command = aterm_uds::spawnfd::command(std::env::current_exe()?);
-        command
-            .args([
-                OsString::from("--after-replace"),
-                root.as_os_str().to_owned(),
-            ])
-            .leave_background_band(true);
-        Err(command.exec())
-    }
-
-    fn after_replace(root: &Path) -> io::Result<()> {
-        // The primitive control isolates SETEXEC from any new watch-flag contract.
-        // Install the identical housekeeping policy before starting another thread.
-        super::subscriber_scheduling::install();
-        let at_rest = priorities(std::process::id())?;
-        let _lift = aterm_uds::qos::lift();
-        let raised = priorities(std::process::id())?;
-        let reading = usage(std::process::id())?;
-        let mut stream = UnixStream::connect(root.join("replace.sock"))?;
-        stream.set_read_timeout(Some(HANG))?;
-        stream.set_write_timeout(Some(HANG))?;
-        send(
-            &mut stream,
-            &json!({"pid":std::process::id(),"at_rest":at_rest,
-            "lifted":raised,"nice":reading.scheduling.and_then(|scheduling|scheduling.nice.ok())}),
-        )?;
-        let mut release = [0];
-        stream.read_exact(&mut release)?;
-        Ok(())
-    }
-
     fn watch() -> io::Result<()> {
         let root = own_root()?;
         let mut stream = UnixStream::connect(root.join("control.sock"))?;
@@ -256,11 +164,7 @@ mod native {
             aterm_secrets::converge::SUBSCRIBER,
             aterm_secrets::converge::RepositoryWork::Refresh,
         ))?;
-        let outside: i32 = std::env::var(DEFAULT_PRIORITY)
-            .map_err(io::Error::other)?
-            .parse()
-            .map_err(io::Error::other)?;
-        if ordinary.iter().any(|priority| *priority != 4) || escaped != [outside] {
+        if ordinary != [4] || escaped.len() != 1 || escaped[0] <= 4 {
             return Err(io::Error::other(format!(
                 "child policy differs: ordinary={ordinary:?}, escaped={escaped:?}"
             )));
@@ -288,14 +192,23 @@ mod native {
         std::fs::DirBuilder::new().mode(0o700).create(&fleet)?;
         let (held, mint_waiting) = mpsc::channel();
         let (release, mint_release) = mpsc::channel();
+        let (ended, mint_ended) = mpsc::channel();
+        let (finish, mint_finish) = mpsc::channel();
         let mint_dir = fleet.clone();
-        let mint = std::thread::spawn(move || {
-            aterm_net::fleet_member::node_identity_during_mint(&mint_dir, move || {
-                held.send(()).expect("mint observer is held");
-                mint_release.recv_timeout(HANG).expect("cold mint released");
-            })
+        let mint = std::thread::spawn(move || -> io::Result<_> {
+            let id = thread_id()?;
+            let before = thread_priority(std::process::id(), id)?;
+            let identity =
+                aterm_net::fleet_member::node_identity_during_mint(&mint_dir, move || {
+                    held.send((id, before)).expect("mint observer is held");
+                    mint_release.recv_timeout(HANG).expect("cold mint released");
+                })?;
+            let after = thread_priority(std::process::id(), id)?;
+            ended.send((id, after)).map_err(io::Error::other)?;
+            mint_finish.recv_timeout(HANG).map_err(io::Error::other)?;
+            Ok(identity)
         });
-        mint_waiting.recv_timeout(HANG).map_err(io::Error::other)?;
+        let (mint_thread, before) = mint_waiting.recv_timeout(HANG).map_err(io::Error::other)?;
         if aterm_net::fleet_member::read_node_identity(&fleet)?.is_some() {
             return Err(io::Error::other(
                 "the cold-mint barrier already published an identity",
@@ -305,12 +218,21 @@ mod native {
             &mut stream,
             &json!({
                 "stage":"mint-held", "pid":std::process::id(),
+                "mint_thread":mint_thread,"before_priority":before,
                 "ordinary_threads":baseline, "ordinary_child":ordinary, "escaped_child":escaped
             }),
         )?;
         let mut byte = [0];
         stream.read_exact(&mut byte)?;
         release.send(()).map_err(io::Error::other)?;
+        let (after_thread, after) = mint_ended.recv_timeout(HANG).map_err(io::Error::other)?;
+        send(
+            &mut stream,
+            &json!({"stage":"mint-released","mint_thread":after_thread,
+            "after_priority":after}),
+        )?;
+        stream.read_exact(&mut byte)?;
+        finish.send(()).map_err(io::Error::other)?;
         let minted = mint
             .join()
             .map_err(|_| io::Error::other("mint thread panicked"))??;
@@ -342,61 +264,6 @@ mod native {
         }
         send(&mut stream, &json!({"stage":"joined-idle"}))?;
         aterm_secrets::client::watch(&paths, &|_| {}).map_err(io::Error::other)
-    }
-
-    fn entry_contract() -> io::Result<()> {
-        let root = own_root()?;
-        let exe = std::env::current_exe()?;
-        let legacy = root.join(LEGACY);
-        let mut old = aterm_uds::spawnfd::command(&legacy);
-        old.args(["secrets", super::subscriber_scheduling::WATCH_REEXEC]);
-        let refused =
-            aterm_uds::deadline::output_within(&mut old, HANG).map_err(io::Error::other)?;
-        if refused.status.code() != Some(2)
-            || std::env::var_os("HOME").is_none_or(|home| Path::new(&home).exists())
-        {
-            return Err(io::Error::other(
-                "the old parser did not refuse the runtime entry before Paths",
-            ));
-        }
-        let args = vec!["secrets".to_owned(), "watch".to_owned()];
-        let unit = |name: &str, program: &Path| -> io::Result<String> {
-            let path = aterm_secrets::service::write_plist(
-                &root.join(name),
-                aterm_secrets::service::Job::Subscriber,
-                program,
-                &args,
-            )
-            .map_err(io::Error::other)?;
-            std::fs::read_to_string(path)
-        };
-        let new = unit("new-unit", &exe)?;
-        let old_unit = unit("old-unit", &legacy)?;
-        for unit in [&new, &old_unit] {
-            let argv = aterm_secrets::service::plist_argv(unit)
-                .ok_or_else(|| io::Error::other("unit arguments are unavailable"))?;
-            if !unit.contains("<key>ProcessType</key>\n\t<string>Background</string>")
-                || !unit.contains("<key>Nice</key>\n\t<integer>5</integer>")
-                || argv.get(1..) != Some(["secrets".to_owned(), "watch".to_owned()].as_slice())
-            {
-                return Err(io::Error::other(
-                    "the unchanged unit no longer restarts plain Background watch",
-                ));
-            }
-        }
-        println!(
-            "{}",
-            json!({"old_parser_exit":2,"current_unit":"Background Nice=5",
-            "old_unit":"Background Nice=5","restart_arguments":["secrets","watch"],"query_created_paths":false})
-        );
-        Ok(())
-    }
-
-    struct Owned(Child);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            aterm_uds::deadline::kill_within(&mut self.0, HANG);
-        }
     }
 
     fn launchctl(args: &[String]) -> io::Result<std::process::Output> {
@@ -532,165 +399,6 @@ mod native {
         Ok(stream)
     }
 
-    fn setexec_arm(exe: &Path, root: &Path, manager: bool) -> io::Result<Value> {
-        use aterm_secrets::service::{Domain, Launchctl};
-        std::fs::DirBuilder::new().mode(0o700).create(root)?;
-        let listener = UnixListener::bind(root.join("replace.sock"))?;
-        let mut child = None;
-        let mut job = None;
-        if manager {
-            let uid = aterm_uds::peer::our_uid();
-            let domain = if launchctl(&aterm_secrets::service::launchctl_argv(
-                uid,
-                Launchctl::PrintDomain(Domain::Gui),
-            ))?
-            .status
-            .success()
-            {
-                Domain::Gui
-            } else {
-                Domain::User
-            };
-            let label = format!(
-                "systems.alab.aterm.scheduler-probe-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(io::Error::other)?
-                    .as_nanos()
-            );
-            let target = format!("{}/{}", domain.target(uid), label);
-            if launchctl(&["print".into(), target.clone()])?
-                .status
-                .success()
-            {
-                return Err(io::Error::other(
-                    "the fresh private scheduler label already exists",
-                ));
-            }
-            let args = vec!["--replace".to_owned(), root.to_string_lossy().into_owned()];
-            let text = aterm_secrets::service::plist_text_in(
-                &label,
-                exe,
-                &args,
-                &root.join("probe.log"),
-                domain,
-                None,
-            );
-            if !text.contains("<key>ProcessType</key>\n\t<string>Background</string>")
-                || !text.contains("<key>Nice</key>\n\t<integer>5</integer>")
-            {
-                return Err(io::Error::other(
-                    "the primitive unit is not Background plus Nice=5",
-                ));
-            }
-            let plist = root.join("probe.plist");
-            std::fs::write(&plist, text)?;
-            let owned = PrivateJob::new(target, &plist)?;
-            job = Some(owned);
-        } else {
-            let mut command = aterm_uds::spawnfd::command(exe);
-            command.arg("--replace").arg(root).enter_background_band();
-            command.stdout(Stdio::null()).stderr(Stdio::inherit());
-            child = Some(Owned(command.spawn()?));
-        }
-        let stream = accept(&listener)?;
-        let mut reader = io::BufReader::new(stream.try_clone()?);
-        let after = read(&mut reader)?;
-        let before: Value = aterm_json::from_slice(&std::fs::read(root.join("before-exec.json"))?)
-            .map_err(io::Error::other)?;
-        if before["pid"] != after["pid"] || before["priorities"] != json!([4]) {
-            return Err(io::Error::other(
-                "SETEXEC did not retain the actual Background process",
-            ));
-        }
-        if before["nice"] != json!(5) || after["nice"] != before["nice"] {
-            return Err(io::Error::other("SETEXEC did not retain Nice=5"));
-        }
-        let report = json!({"manager":if manager {"private launchd job"} else {"posix_spawn task type"},
-            "before":before,"after":after,
-            "setexec_escaped":after["lifted"].as_array().is_some_and(|p|p.iter().any(|p|p.as_i64().is_some_and(|p|p>4)))});
-        // The job stays blocked until bootout, so KeepAlive cannot relaunch it between
-        // the measurement and cleanup. The spawned arm is killed and reaped by Owned.
-        if let Some(job) = job {
-            job.finish()?;
-        }
-        drop(child);
-        Ok(report)
-    }
-
-    fn keepalive_fallback(exe: &Path, root: &Path) -> io::Result<Value> {
-        use aterm_secrets::service::{Domain, Launchctl};
-        std::fs::DirBuilder::new().mode(0o700).create(root)?;
-        let listener = UnixListener::bind(root.join("fallback.sock"))?;
-        let uid = aterm_uds::peer::our_uid();
-        let domain = if launchctl(&aterm_secrets::service::launchctl_argv(
-            uid,
-            Launchctl::PrintDomain(Domain::Gui),
-        ))?
-        .status
-        .success()
-        {
-            Domain::Gui
-        } else {
-            Domain::User
-        };
-        let label = format!(
-            "systems.alab.aterm.scheduler-probe-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos()
-        );
-        let target = format!("{}/{}", domain.target(uid), label);
-        if launchctl(&["print".into(), target.clone()])?
-            .status
-            .success()
-        {
-            return Err(io::Error::other("the fresh fallback label already exists"));
-        }
-        let args = vec!["secrets".to_owned(), "watch".to_owned()];
-        let mut text = aterm_secrets::service::plist_text_in(
-            &label,
-            exe,
-            &args,
-            &root.join("probe.log"),
-            domain,
-            None,
-        );
-        if text.contains("<key>EnvironmentVariables</key>") {
-            return Err(io::Error::other("unexpected fixture environment"));
-        }
-        let escape = aterm_codec::xml::escape;
-        text=text.replacen("\t<key>RunAtLoad</key>",&format!(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{ROOT}</key>\n\t\t<string>{}</string>\n\t\t<key>{FALLBACK}</key>\n\t\t<string>1</string>\n\t\t<key>HOME</key>\n\t\t<string>{}</string>\n\t</dict>\n\t<key>RunAtLoad</key>",
-            escape(&root.to_string_lossy()),escape(&root.join("home").to_string_lossy())),1);
-        let plist = root.join("fallback.plist");
-        std::fs::write(&plist, text)?;
-        let job = PrivateJob::new(target, &plist)?;
-        let stream = accept(&listener)?;
-        let mut reader = io::BufReader::new(stream);
-        let restarted = read(&mut reader)?;
-        let refused: Value =
-            aterm_json::from_slice(&std::fs::read(root.join("marker-refused.json"))?)
-                .map_err(io::Error::other)?;
-        if restarted["stage"].as_str() != Some("plain-restarted")
-            || restarted["pid"] == refused["pid"]
-            || restarted["args"] != json!(["secrets", "watch"])
-            || restarted["priorities"] != json!([4])
-            || restarted["nice"] != json!(5)
-            || root.join("home").exists()
-        {
-            return Err(io::Error::other(
-                "old-parser refusal did not return to untouched plain Background watch",
-            ));
-        }
-        job.finish()?;
-        Ok(json!({"marker_refused":refused,"plain_restart":restarted,
-            "created_vault_paths":false,"private_job_unloaded":true}))
-    }
-
     fn usage(pid: u32) -> io::Result<aterm_sysprobe::procs::ProcessReading> {
         aterm_sysprobe::procs::processes()
             .and_then(|sweep| sweep.procs.into_iter().find(|process| process.pid == pid))
@@ -736,7 +444,7 @@ mod native {
             let admin = client::admin_open(&admin_paths).map_err(io::Error::other)?;
             let mut doc = admin.doc.clone();
             let mut recipients = Vec::new();
-            for name in ["baseline", "reexec"] {
+            for name in ["baseline", "current"] {
                 let paths = Paths::for_home(&root.join(name).join("home"));
                 let identity = client::machine_identity(&paths).map_err(io::Error::other)?;
                 let recipient = identity.recipient().to_bech32();
@@ -773,7 +481,7 @@ mod native {
                 aterm_secrets::transport::post_records(&url, &records).map_err(io::Error::other)?;
             }
             aterm_secrets::transport::publish(&target, &latest).map_err(io::Error::other)?;
-            for name in ["baseline", "reexec"] {
+            for name in ["baseline", "current"] {
                 let paths = Paths::for_home(&root.join(name).join("home"));
                 let outcome = client::join(
                     &paths,
@@ -833,47 +541,111 @@ mod native {
         // The fixture setup already created this private account and admitted it.
         server.wait_held(false)?;
         let listener = UnixListener::bind(root.join("control.sock"))?;
-        let mut command = aterm_uds::spawnfd::command(exe);
-        command
-            .env(ROOT, root)
-            .env("HOME", root.join("home"))
-            .env(DEFAULT_PRIORITY, outside.to_string());
-        command.args(["secrets", "watch"]);
-        command.enter_background_band();
-        if kind == "baseline" {
-            command.env(BASELINE, "1");
+        use aterm_secrets::service::{Domain, Job, Launchctl};
+        let uid = aterm_uds::peer::our_uid();
+        let domain = if launchctl(&aterm_secrets::service::launchctl_argv(
+            uid,
+            Launchctl::PrintDomain(Domain::Gui),
+        ))?
+        .status
+        .success()
+        {
+            Domain::Gui
+        } else {
+            Domain::User
+        };
+        let label = format!(
+            "systems.alab.aterm.scheduler-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos()
+        );
+        let target = format!("{}/{}", domain.target(uid), label);
+        if launchctl(&["print".into(), target.clone()])?
+            .status
+            .success()
+        {
+            return Err(io::Error::other(
+                "the fresh private scheduler label already exists",
+            ));
         }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let child = Owned(command.spawn()?);
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        // Select policy using the REAL canonical Subscriber label. Only afterwards
+        // rename this fixture's job, retaining the production scheduling definition.
+        let policy = match kind {
+            "current" => aterm_secrets::service::SubscriberProcessType::Interactive,
+            "baseline" => aterm_secrets::service::SubscriberProcessType::Background,
+            _ => return Err(io::Error::other("unknown private subscriber arm")),
+        };
+        let mut text = aterm_secrets::service::plist_text_in_with_subscriber_process_type(
+            Job::Subscriber.label(),
+            exe,
+            &args,
+            &root.join("probe.log"),
+            domain,
+            None,
+            policy,
+        );
+        // Record the produced policy, but let the actual kernel-thread oracle decide.
+        // A renderer fault must reach the held mint rather than stop at an XML assertion.
+        let rendered_interactive =
+            text.contains("<key>ProcessType</key>\n\t<string>Interactive</string>");
+        let rendered_nice = text.contains("<key>Nice</key>");
+        let canonical_label = format!("<string>{}</string>", Job::Subscriber.label());
+        text = text.replacen(
+            canonical_label.as_str(),
+            &format!("<string>{label}</string>"),
+            1,
+        );
+        if text.contains("<key>EnvironmentVariables</key>") {
+            return Err(io::Error::other("unexpected fixture environment"));
+        }
+        let escape = aterm_codec::xml::escape;
+        text = text.replacen("\t<key>RunAtLoad</key>", &format!(
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{ROOT}</key>\n\t\t<string>{}</string>\n\t\t<key>HOME</key>\n\t\t<string>{}</string>\n\t</dict>\n\t<key>RunAtLoad</key>",
+            escape(&root.to_string_lossy()), escape(&root.join("home").to_string_lossy())), 1);
+        let plist = root.join("probe.plist");
+        std::fs::write(&plist, text)?;
+        let job = PrivateJob::new(target.clone(), &plist)?;
         let mut stream = accept(&listener)?;
         let mut reader = io::BufReader::new(stream.try_clone()?);
         let held = read(&mut reader)?;
+        let loaded = launchctl(&["print".into(), target])?;
+        let loaded_pid =
+            aterm_secrets::service::print_pid(&String::from_utf8_lossy(&loaded.stdout));
+        let pid = held["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| Some(*pid) == loaded_pid)
+            .ok_or_else(|| io::Error::other("the mint worker is not the owned private job"))?;
+        let mint_thread = held["mint_thread"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("the held mint has no exact kernel thread id"))?;
+        let held_priority = thread_priority(pid, mint_thread)?;
+        let expected = if kind == "current" { outside } else { 4 };
         if held["stage"].as_str() != Some("mint-held")
-            || held["pid"].as_u64() != Some(u64::from(child.0.id()))
+            || held["before_priority"].as_i64() != Some(4)
+            || held_priority != expected
         {
-            return Err(io::Error::other(
-                "the private cold-mint barrier was not reached",
-            ));
-        }
-        let priorities = priorities(child.0.id())?;
-        let lifted = priorities
-            .iter()
-            .filter(|priority| **priority == outside)
-            .count()
-            == 1
-            && priorities
-                .iter()
-                .all(|priority| *priority == 4 || *priority == outside);
-        let background = priorities.iter().all(|priority| *priority == 4);
-        if (kind == "reexec" && !lifted) || (kind == "baseline" && !background) {
             return Err(io::Error::other(format!(
-                "{kind}: wrong held cold-mint priorities {priorities:?}"
+                "{kind}: exact mint worker priority {held_priority}, expected {expected}"
             )));
         }
-        stream.write_all(b"release")?;
+        stream.write_all(&[1])?;
+        let released = read(&mut reader)?;
+        let after_priority = thread_priority(pid, mint_thread)?;
+        if released["stage"].as_str() != Some("mint-released")
+            || released["mint_thread"].as_u64() != Some(mint_thread)
+            || released["after_priority"].as_i64() != Some(4)
+            || after_priority != 4
+        {
+            return Err(io::Error::other(
+                "the exact mint worker did not return to housekeeping",
+            ));
+        }
+        stream.write_all(&[1])?;
         let idle = read(&mut reader)?;
         if idle["stage"].as_str() != Some("joined-idle") {
             return Err(io::Error::other(
@@ -883,10 +655,10 @@ mod native {
         // The actual signed HTTP request must be held at the server before this
         // sample, so readiness and a parked stand-in cannot manufacture the arm.
         let held_before = server.wait_held(true)?;
-        let before = usage(child.0.id())?;
+        let before = usage(pid)?;
         let began = Instant::now();
         std::thread::sleep(IDLE);
-        let after = usage(child.0.id())?;
+        let after = usage(pid)?;
         let held_after = server.running().test_waiting();
         if held_after == 0 {
             return Err(io::Error::other(
@@ -911,8 +683,13 @@ mod native {
             }
             Some(delta)
         });
-        Ok(json!({"arm":kind,"held":held,"held_priorities":priorities,
-            "mint_lifted":lifted,
+        job.finish()?;
+        server.wait_held(false)?;
+        Ok(
+            json!({"arm":kind,"rendered_interactive":rendered_interactive,
+            "rendered_nice":rendered_nice,"held":held,"released":released,
+            "effective_mint_priority":{"before":4,"inside":held_priority,"after":after_priority},
+            "mint_lifted":held_priority == outside,"private_job_unloaded":true,
             "actual_joined_subscriber_idle":{"elapsed_ms":elapsed_ms,
                 "signed_loopback_long_polls_before":held_before,"signed_loopback_long_polls_after":held_after,
                 "cpu_ns":delta(before.cpu_ns,after.cpu_ns),
@@ -920,10 +697,11 @@ mod native {
                 "disk_read":delta(before.disk_read,after.disk_read),
                 "disk_written":delta(before.disk_written,after.disk_written),
                 "qos_cpu_ns":qos_delta,"footprint_before":before.footprint,
-                "footprint_after":after.footprint}}))
+                "footprint_after":after.footprint}}),
+        )
     }
 
-    fn controller(setexec_only: bool) -> io::Result<()> {
+    fn controller() -> io::Result<()> {
         let base = Path::new("/tmp/.ubd");
         std::fs::create_dir_all(base)?;
         let root = base.join(format!(
@@ -936,29 +714,6 @@ mod native {
         ));
         std::fs::DirBuilder::new().mode(0o700).create(&root)?;
         let exe = std::env::current_exe()?;
-        if setexec_only {
-            let task = setexec_arm(&exe, &root.join("task-type"), false)?;
-            let job = setexec_arm(&exe, &root.join("launchd"), true)?;
-            println!("{}", json!({"schema":1,"task":task,"job":job}));
-            return std::fs::remove_dir_all(root);
-        }
-        std::os::unix::fs::symlink(&exe, root.join(LEGACY))?;
-        let mut contract = aterm_uds::spawnfd::command(&exe);
-        contract
-            .arg("--entry-contract")
-            .env(ROOT, &root)
-            .env("HOME", root.join("query-home"));
-        let output =
-            aterm_uds::deadline::output_within(&mut contract, HANG).map_err(io::Error::other)?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "runtime entry contract fixture failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let contract: Value = aterm_json::from_slice(&output.stdout).map_err(io::Error::other)?;
-        let fallback = keepalive_fallback(&exe, &root.join("fallback"))
-            .map_err(|error| io::Error::other(format!("old-image KeepAlive restart: {error}")))?;
         let server = HttpWorld::start(&root)
             .map_err(|error| io::Error::other(format!("signed HTTP fixture admission: {error}")))?;
         let mut outside = aterm_uds::spawnfd::command(&exe);
@@ -966,11 +721,11 @@ mod native {
         let outside = child_read(outside)?;
         if outside.len() != 1 || outside[0] <= 4 {
             return Err(io::Error::other(
-                "the Nice=5 outside-band default reference is unavailable",
+                "the outside-band exact-thread default reference is unavailable",
             ));
         }
         let mut arms = Vec::new();
-        for kind in ["baseline", "reexec"] {
+        for kind in ["baseline", "current"] {
             arms.push(
                 arm(&exe, &root.join(kind), kind, outside[0], &server)
                     .map_err(|error| io::Error::other(format!("{kind} subscriber arm: {error}")))?,
@@ -980,8 +735,8 @@ mod native {
         drop(server);
         println!(
             "{}",
-            json!({"schema":1,"entry_contract":contract,"keepalive_fallback":fallback,"outside_band_default":outside,"arms":arms,
-            "isolation":"owned scratch nodes and explicitly pinned signed loopback HTTP vault; no LAN dials or advertisements"})
+            json!({"schema":2,"outside_band_default":outside,"arms":arms,
+            "isolation":"owned unique launchd jobs, scratch nodes and pinned signed loopback HTTP; no LAN dials or advertisements"})
         );
         std::fs::remove_dir_all(root)
     }

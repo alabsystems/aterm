@@ -12,9 +12,13 @@ description = "AppKit, Carbon, ServiceManagement and AudioQueue acquired by nati
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-objc = { workspace = true }
 aterm-dl = { workspace = true }
+# `status_click::EventKey`, the app's current event as the pure click classifier reads it.
+aterm-types = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 aterm-uds = { workspace = true }
+# A real template PNG for `status_button`'s bitmap and image tests.
+aterm-template-icon = { workspace = true }
 
 [lints]
 workspace = true

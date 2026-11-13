@@ -6939,6 +6939,55 @@ fn the_caret_delta_folds_only_its_three_seams() {
     }
 }
 
+/// The page's rise ([`page_rise`]): every lettered row up together, by the fewest rows; a
+/// blank row may come up written; a map that kept its lettered rows, changed height or had
+/// none to move did not rise.
+#[test]
+fn a_page_rises_by_the_rows_its_letters_went_up() {
+    let page = [
+        (0, 0),
+        (0, 40),
+        (2, 7),
+        (0, 33),
+        (0, 0),
+        (1, 12),
+        (0, 25),
+        (0, 0),
+    ];
+    let up = |by: usize, foot: &[(u16, u16)]| {
+        let mut v = page[by..].to_vec();
+        v.extend_from_slice(foot);
+        v
+    };
+    assert_eq!(page_rise(&page, &up(1, &[(0, 2)])), 1, "a line");
+    assert_eq!(
+        page_rise(&page, &up(2, &[(0, 17), (0, 2)])),
+        2,
+        "an Enter and its answer"
+    );
+    let mut answered = up(1, &[(0, 2)]);
+    answered[6] = (0, 17);
+    assert_eq!(
+        page_rise(&page, &answered),
+        1,
+        "an answer printed on the blank row before it scrolled"
+    );
+    let mut written = page.to_vec();
+    written[7] = (0, 9);
+    assert_eq!(page_rise(&page, &written), 0, "writing on a blank row");
+    let mut changed = up(1, &[(0, 2)]);
+    changed[4] = (3, 9);
+    assert_eq!(page_rise(&page, &changed), 0, "a lettered row rewritten");
+    assert_eq!(page_rise(&page, &up(1, &[])), 0, "a map of another height");
+    assert_eq!(page_rise(&[(0, 0); 8], &[(0, 0); 8]), 0, "nothing to move");
+    let mut pet = PetBrain::default();
+    pet.sense_ink(0, &page, Some(4));
+    pet.sense_ink(0, &up(2, &[(0, 17), (0, 2)]), Some(4));
+    assert_eq!(pet.ink_rose, 2);
+    pet.sense_ink(0, &up(2, &[(0, 17), (0, 2)]), Some(4));
+    assert_eq!(pet.ink_rose, 0, "read once: a still map rose none");
+}
+
 #[test]
 fn the_ink_map_scroll_fact_is_only_true_for_a_one_row_scroll() {
     let up = |m: &[(u16, u16)]| {

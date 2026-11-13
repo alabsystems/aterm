@@ -3,7 +3,8 @@
 
 //! The quit the system asked for (a logout, a restart or a shutdown), the quit System Settings
 //! asked for to reopen aterm ([`crate::quit_reopen`]), and the end of a failed event loop, after
-//! which the agents aterm hosted relaunch at the next start.
+//! which the agents aterm hosted relaunch at the next start. The first two are the person's
+//! answer already, so aterm puts no question of its own before them ([`explicit`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -98,6 +99,18 @@ pub(crate) fn asked() -> bool {
         || EVENT_LOOP_FAILED.load(Ordering::SeqCst)
 }
 
+/// Whether the quit of `generation` is one the system (a logout, a restart or a shutdown) or
+/// System Settings' Quit & Reopen asked for, by a quit nobody cancelled: that ask is the person's
+/// answer already (they chose to log out, or pressed Quit & Reopen), so aterm asks nothing more
+/// of it (`App::native_termination_ready`: aterm asks no question it can answer itself). A
+/// person's own quit (the menu, ⌘Q, the Dock) is not one.
+#[cfg(unix)]
+pub(crate) fn explicit(generation: u64) -> bool {
+    generation != 0
+        && (SYSTEM_QUIT.load(Ordering::SeqCst) == generation
+            || REOPEN_QUIT.load(Ordering::SeqCst) == generation)
+}
+
 /// Whether the system asked this process to quit (a logout, a restart or a shutdown) by a quit
 /// nobody cancelled: not System Settings' Quit & Reopen, whose quit reason is a logout's too
 /// ([`asker_of`]), nor a failed event loop. What gives up this Mac's account claims at the end of
@@ -154,209 +167,5 @@ pub(crate) fn clear_for_test() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_logout_a_restart_or_a_shutdown_is_the_systems() {
-        for r in [b"logo", b"rlgo", b"rrst", b"rest", b"rsdn", b"shut"] {
-            assert!(reason_is_the_systems(u32::from_be_bytes(*r)), "{r:?}");
-        }
-        for other in [
-            0,
-            u32::from_be_bytes(*b"quit"),
-            u32::from_be_bytes(*b"why?"),
-        ] {
-            assert!(!reason_is_the_systems(other), "{other:#x}");
-        }
-        assert_eq!(KEY_QUIT_REASON, 0x7768_793f);
-    }
-
-    #[test]
-    fn a_cancelled_system_quit_does_not_mark_a_later_person_quit() {
-        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
-        let _serial = crate::menu::terminate_test_serial();
-        let NativeTerminateDecision::Dispatch(logout) = admit_native_terminate(Asker::System)
-        else {
-            panic!("a first request dispatches");
-        };
-        assert!(asked() && asked_for(logout));
-        assert!(crate::menu::cancel_current_native_termination());
-        assert!(!asked(), "the cancelled logout left its mark");
-        let NativeTerminateDecision::Dispatch(person) = admit_native_terminate(Asker::Person)
-        else {
-            panic!("the arbiter is free again");
-        };
-        assert_ne!(person, logout);
-        assert!(!asked(), "the person's quit reads as the system's");
-
-        assert_eq!(
-            admit_native_terminate(Asker::System),
-            NativeTerminateDecision::DeferExisting(person)
-        );
-        assert!(asked_for(person));
-        #[cfg(unix)]
-        assert!(crate::menu::cancel_native_termination(person));
-        #[cfg(not(unix))]
-        assert!(crate::menu::cancel_current_native_termination());
-        assert!(!asked());
-
-        note(person + 100, Asker::System);
-        forget(person);
-        assert!(asked_for(person + 100));
-        forget(person + 100);
-        assert!(!asked());
-    }
-
-    #[test]
-    fn a_failed_event_loop_marks_the_quit_and_no_cancel_unmarks_it() {
-        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
-        let _serial = crate::menu::terminate_test_serial();
-        assert!(!asked());
-        note_event_loop_failed();
-        assert!(asked());
-        let NativeTerminateDecision::Dispatch(generation) = admit_native_terminate(Asker::Person)
-        else {
-            panic!("a first request dispatches");
-        };
-        assert!(crate::menu::cancel_current_native_termination());
-        forget(generation);
-        assert!(asked(), "a cancel unmarked a gone window system's quit");
-        clear_for_test();
-        assert!(!asked());
-    }
-
-    #[test]
-    fn a_quit_and_reopen_reopens_only_while_nothing_cancelled_or_outranks_it() {
-        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
-        let _serial = crate::menu::terminate_test_serial();
-        let NativeTerminateDecision::Dispatch(reopen) = admit_native_terminate(Asker::Reopen)
-        else {
-            panic!("a first request dispatches");
-        };
-        assert!(
-            reopens() && asked(),
-            "System Settings' quit neither reopens nor keeps agents"
-        );
-        assert!(crate::menu::cancel_current_native_termination());
-        assert!(
-            !reopens() && !asked(),
-            "the cancelled Quit & Reopen left its mark"
-        );
-
-        let NativeTerminateDecision::Dispatch(person) = admit_native_terminate(Asker::Person)
-        else {
-            panic!("the arbiter is free again");
-        };
-        assert_ne!(person, reopen);
-        assert!(!reopens(), "a person's quit reopens");
-        assert_eq!(
-            admit_native_terminate(Asker::Reopen),
-            NativeTerminateDecision::DeferExisting(person)
-        );
-        assert!(
-            reopens(),
-            "System Settings' quit onto a pending one does not reopen"
-        );
-        note(person, Asker::System);
-        assert!(
-            !reopens() && asked(),
-            "a logout under a Quit & Reopen reopens"
-        );
-        forget(person);
-        assert!(!reopens() && !asked());
-
-        note(person + 100, Asker::Reopen);
-        forget(person);
-        assert!(reopens(), "a cancel of another quit unmarked this one");
-        note_event_loop_failed();
-        assert!(!reopens(), "a gone window system's quit reopens");
-        clear_for_test();
-        assert!(!reopens() && !asked());
-    }
-
-    /// Only the system's quit nobody cancelled gives up this Mac's account claims at the end of the
-    /// run: a person's quit, System Settings' Quit & Reopen (its logout reason notwithstanding),
-    /// a failed event loop and a cancelled logout do not.
-    ///
-    /// NEGATIVE CONTROL: make `by_the_system` answer `asked()`, and the Quit & Reopen and the
-    /// failed event loop read as the system's.
-    #[test]
-    fn only_the_systems_quit_nobody_cancelled_is_by_the_system() {
-        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
-        let _serial = crate::menu::terminate_test_serial();
-        let NativeTerminateDecision::Dispatch(person) = admit_native_terminate(Asker::Person)
-        else {
-            panic!("a first request dispatches");
-        };
-        assert!(!by_the_system(), "a person's quit");
-        assert!(crate::menu::cancel_current_native_termination());
-
-        let NativeTerminateDecision::Dispatch(reopen) = admit_native_terminate(Asker::Reopen)
-        else {
-            panic!("the arbiter is free again");
-        };
-        assert!(
-            asked() && !by_the_system(),
-            "System Settings' Quit & Reopen"
-        );
-        assert!(crate::menu::cancel_current_native_termination());
-
-        let NativeTerminateDecision::Dispatch(logout) = admit_native_terminate(Asker::System)
-        else {
-            panic!("the arbiter is free again");
-        };
-        assert_ne!(logout, reopen);
-        assert_ne!(logout, person);
-        assert!(by_the_system(), "the logout");
-        assert!(crate::menu::cancel_current_native_termination());
-        assert!(!by_the_system(), "the cancelled logout");
-
-        note_event_loop_failed();
-        assert!(asked() && !by_the_system(), "a failed event loop");
-        clear_for_test();
-    }
-
-    #[test]
-    fn system_settings_quit_is_a_reopen_whatever_reason_it_gives() {
-        use std::path::Path;
-        let settings = Path::new(
-            "/System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/\
-             MacOS/SecurityPrivacyExtension",
-        );
-        let loginwindow =
-            Path::new("/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow");
-        let dock = Path::new("/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock");
-        let reason = |code: &[u8; 4]| Some(u32::from_be_bytes(*code));
-        assert_eq!(asker_of(reason(b"rlgo"), Some(settings)), Asker::Reopen);
-        assert_eq!(asker_of(reason(b"quit"), Some(settings)), Asker::Reopen);
-        assert_eq!(asker_of(None, Some(settings)), Asker::Reopen);
-        assert_eq!(asker_of(reason(b"rlgo"), Some(loginwindow)), Asker::System);
-        assert_eq!(asker_of(reason(b"shut"), None), Asker::System);
-        assert_eq!(asker_of(reason(b"quit"), Some(dock)), Asker::Person);
-        assert_eq!(asker_of(None, None), Asker::Person);
-    }
-
-    #[test]
-    fn only_a_dead_display_ends_the_run_as_a_logout() {
-        let (status, line) = failed_loop_end(&EventLoopError::DisplayLost(
-            std::io::ErrorKind::ConnectionReset.into(),
-        ));
-        assert_eq!(status, EXIT_WINDOW_SYSTEM_GONE);
-        assert!(line.starts_with("the display connection ended ("), "{line}");
-        assert!(
-            line.ends_with("quitting as a logout would, exit status 69"),
-            "{line}"
-        );
-        for other in [
-            EventLoopError::ExitFailure(1),
-            EventLoopError::ExitFailure(71),
-            EventLoopError::RecreationAttempt,
-        ] {
-            let (status, line) = failed_loop_end(&other);
-            assert_eq!(status, EXIT_EVENT_LOOP_FAILED, "{other}");
-            assert!(!line.contains("display connection ended"), "{line}");
-            assert!(line.starts_with("the event loop failed ("), "{line}");
-        }
-    }
-}
+#[path = "system_quit_tests.rs"]
+mod tests;

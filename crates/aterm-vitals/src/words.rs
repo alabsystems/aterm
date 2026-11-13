@@ -1759,19 +1759,28 @@ fn tokens_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     let mut out = Vec::new();
     match facts.plan.as_ref() {
         Some(plan) => {
-            let p = half_up(f64::from(plan.used_x10) / 10.0);
+            // What is left, as every surface says an account's share (aterm-agent's
+            // `harness::left`): 100 − the whole percent used, half up, and `0% left` only for a
+            // reading of 100.
+            let used = (plan.used_x10.min(1000) + 5) / 10;
+            let p = 100
+                - if plan.used_x10 < 1000 {
+                    used.min(99)
+                } else {
+                    used
+                };
             let t = loc.clock(plan.read_at, snap.at_unix_ms);
             let w = &plan.window_word;
             out.push(
                 Clause::new(
                     0,
                     vec![
-                        format!("{w} {p:.0}% used (account), read {t}"),
-                        format!("{w} {p:.0}% used, {t}"),
+                        format!("{w} {p}% left (account), read {t}"),
+                        format!("{w} {p}% left, {t}"),
                     ],
                 )
                 .said(sentence(&format!(
-                    "{w} limit {p:.0} percent used on the account, read at {t}"
+                    "{w} limit {p} percent left on the account, read at {t}"
                 ))),
             );
         }

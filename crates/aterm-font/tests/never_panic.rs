@@ -1712,7 +1712,7 @@ fn seeds_answer() {
 
 #[test]
 fn mutated_faces_never_panic() {
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
+    let workers = aterm_cores::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
     let (send, queue) = std::sync::mpsc::sync_channel::<(usize, &str, u32, Vec<u8>)>(workers);
     let queue = std::sync::Mutex::new(queue);
     let mut panicked: Vec<(usize, &str, u32)> = std::thread::scope(|scope| {

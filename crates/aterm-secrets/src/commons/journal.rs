@@ -8,7 +8,7 @@
 
 use super::constraints::Constraints;
 use super::node::{Kind, Node};
-use crate::{Error, Result, SecretBytes, age::Identity};
+use crate::{Error, Result, SecretBytes, age::Identity, fsx::JournalSeen};
 use astream_broker::BrokerRecord;
 use astream_wire::{
     Offset,
@@ -174,11 +174,11 @@ impl View {
 /// view is reused only for the exact prefix it was built from, extended only by
 /// records that pass the same verification, and rebuilt for anything else.
 /// Where the journal's folder and files stand as the settled `lstat` of each
-/// taken before the read that kept the view showed them ([`witness`]), the view
-/// is taken without reading them again: an append, a checkpoint renamed over, a
-/// new link and a mode, owner or access-list change each move what one shows,
-/// which nothing moves back, and a read is kept only where it opened the very
-/// files the witness saw ([`stands_for`]).
+/// taken before the read that kept the view showed them ([`JournalSeen`]), the
+/// view is taken without reading them again: an append, a checkpoint renamed
+/// over, a new link and a mode, owner or access-list change each move what one
+/// shows, which nothing moves back, and a read is kept only where it opened the
+/// very files the witness saw ([`JournalSeen::stands_for`]).
 struct Views {
     /// Most recently requested first. Only lookup and eviction hold this lock.
     kept: Mutex<Vec<Arc<Entry>>>,
@@ -193,46 +193,8 @@ struct Cached {
     prefix: Prefix,
     view: Arc<View>,
     /// The journal as it stood before the read that kept `view`, where it stands for what
-    /// that read found ([`stands_for`]).
-    witnessed: Option<Witness>,
-}
-
-/// What one `lstat` each showed of a journal's folder and of the files a read of it reads
-/// ([`aterm_journal::committed_files`]): the anchor, the checkpoint and the astream file.
-type Witness = [crate::fsx::Seen; 4];
-
-/// The journal in `dir` as `lstat` shows it now ([`Witness`]); `None` where the folder or a file
-/// is missing or cannot be examined, or is not what a read admits (the folder a directory, each
-/// file a regular file).
-fn witness(dir: &Path) -> Option<Witness> {
-    use crate::fsx::{Kind, seen_if_present};
-    let files = aterm_journal::committed_files(dir, NAME);
-    let seen = |path: &Path, kind| {
-        seen_if_present(path)
-            .ok()
-            .flatten()
-            .filter(|seen| seen.kind == kind)
-    };
-    Some([
-        seen(dir, Kind::Dir)?,
-        seen(&files.anchor, Kind::File)?,
-        seen(&files.checkpoint, Kind::File)?,
-        seen(&files.astream, Kind::File)?,
-    ])
-}
-
-/// Whether `seen`, taken before a read that opened `opened`, may stand for what that read found:
-/// it shows the very files the read opened, and none of what it shows changed within
-/// [`crate::fsx::settled`]'s window of `now`. A copy of the journal swapped in for the read,
-/// through a parent renamed aside and back, moves none of the times a witness holds, but each of
-/// its files is another inode, or one moved out of this folder, which moves the folder's times.
-/// The folder's own verdict is the read's: a folder swapped in for that verdict alone, and out
-/// again before the files are opened, is taken as a fresh read made then takes it.
-fn stands_for(seen: &Witness, opened: &aterm_journal::Opened, now: std::time::SystemTime) -> bool {
-    let [_, anchor, checkpoint, astream] = seen;
-    let id = |seen: &crate::fsx::Seen| (seen.stamp.dev, seen.stamp.ino);
-    (id(anchor), id(checkpoint), id(astream)) == (opened.anchor, opened.checkpoint, opened.astream)
-        && seen.iter().all(|seen| crate::fsx::settled(seen, now))
+    /// that read found ([`JournalSeen::stands_for`]).
+    witnessed: Option<JournalSeen>,
 }
 
 /// Views one process keeps: a running app reads one journal. A test binary
@@ -292,8 +254,8 @@ impl Views {
     ) -> Result<(Arc<View>, Acknowledged)> {
         let entry = self.entry(dir, trust);
         // Taken before the journal is read: a change after this moves the next witness, and a
-        // file swapped in for the read is another than this one saw ([`stands_for`]).
-        let seen = witness(dir);
+        // file swapped in for the read is another than this one saw ([`JournalSeen::stands_for`]).
+        let seen = JournalSeen::of(dir, NAME);
         let mut cached = entry.cached.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(kept) = cached.as_ref()
             && seen.is_some()
@@ -309,8 +271,9 @@ impl Views {
             &trust.bytes(),
             LIMITS,
             cached.as_ref().map(|cached| &cached.prefix),
+            aterm_journal::Retain::Bytes,
         )?;
-        let witnessed = seen.filter(|seen| stands_for(seen, &opened, now));
+        let witnessed = seen.filter(|seen| seen.stands_for(&opened, now));
         let unknown = || Error::new("control journal view extended an unknown prefix");
         let (prefix, view) = match committed {
             Committed::Unchanged => {

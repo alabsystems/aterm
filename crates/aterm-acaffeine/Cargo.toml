@@ -17,8 +17,9 @@ aterm-types = { workspace = true }
 aterm-time = { workspace = true }
 # The launchd plist's XML text escape (`xml::escape`).
 aterm-codec = { workspace = true }
-# The menu-bar icon is drawn here as coverage and handed to AppKit as PNG.
-aterm-png = { workspace = true }
+# The menu-bar icon's shapes are drawn here; this supersamples them to coverage and encodes the
+# template PNG AppKit is handed.
+aterm-template-icon = { workspace = true }
 # The per-path launchd label of a non-installed build.
 aterm-hash = { workspace = true }
 aterm-log = { workspace = true }
@@ -54,16 +55,26 @@ astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 [target.'cfg(unix)'.dependencies]
 # `kill` (`aterm acaffeine quit`), the code directory's backup exclusion
 # (`getxattr`/`setxattr`), the SIGTERM watch (`sigaction`, `raise`) and the
-# open flags; `notify_post` is declared by hand in notify.rs.
+# open flags.
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# `start_outside_job`: the holder `aterm acaffeine on` starts from a tab is started outside the
+# tab's kill-on-close job (under the aterm window), so closing the tab does not end it. The one
+# door through which aterm calls `CreateProcessW` itself.
+aterm-pty = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
-# The status item, its menu, the image and the NSProcessInfo activity.
+# The status item, its menu, the image and the NSProcessInfo activity. The click split, the
+# pop-up, the template image and the state file's change observer are aterm-macos-ui's
+# (`status_button`, `darwin_notify`), shared with aterm's own menu-bar item.
 aterm-objc = { workspace = true }
 aterm-macos-ui = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+# The icon's PNG is decoded back in its test.
+aterm-png = { workspace = true }
 
 [lints]
 workspace = true

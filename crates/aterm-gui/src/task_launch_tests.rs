@@ -1756,8 +1756,8 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
         cfg.join(accounts::ACCOUNTS_FILE),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .expect("roster");
@@ -1913,8 +1913,8 @@ fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
         cfg.join(accounts::ACCOUNTS_FILE),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .expect("roster with work");
@@ -3085,7 +3085,15 @@ fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_re
     }
 
     impl Source for AgyClockSource<'_> {
-        fn read(&self, _: &aterm_agent::harness::provider_read::Permit) -> Result<String, String> {
+        fn admit(&self, now: i64) -> Result<aterm_agent::harness::agy_gate::Pass, String> {
+            Ok(aterm_agent::harness::agy_gate::Pass::fixture(now))
+        }
+
+        fn read(
+            &self,
+            _: &aterm_agent::harness::provider_read::Permit,
+            _: aterm_agent::harness::agy_gate::Pass,
+        ) -> Result<String, String> {
             self.reads.set(self.reads.get() + 1);
             let third_5h = if self.clock.get() >= self.until {
                 1.0
@@ -3100,6 +3108,7 @@ fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_re
         fn default_model(
             &self,
             _: &aterm_agent::harness::provider_read::Permit,
+            _: aterm_agent::harness::agy_gate::Pass,
         ) -> Result<String, String> {
             Ok("gemini-4-argon-high".to_owned())
         }

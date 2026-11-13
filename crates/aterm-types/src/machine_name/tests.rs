@@ -563,6 +563,34 @@ fn each_os_gets_the_bare_number_where_it_addresses_and_the_long_form_where_it_de
     assert!(generated.exact(OsSlot::MacHostName, "m85-dog"));
     assert!(!generated.exact(OsSlot::MacLocalHostName, "m85-dog-2"));
     assert!(generated.accepts(OsSlot::MacLocalHostName, "m85-dog-2"));
+    for alias in ["m85 Dog (2)", "m85 Dog (27)"] {
+        assert!(generated.collision(OsSlot::MacComputerName, alias));
+        assert!(generated.accepts(OsSlot::MacComputerName, alias));
+        assert!(!generated.exact(OsSlot::MacComputerName, alias));
+    }
+    for alias in [
+        "m85 Dog (0)",
+        "m85 Dog (1)",
+        "m85 Dog (02)",
+        "m85 Dog (+2)",
+        "m85 Dog(2)",
+        "m85 dog (2)",
+        "m85 Dog (2) extra",
+        "m85 Dog (2) ",
+        "m85 Dog (2)\n",
+        "m85 Dog (-2)",
+        "m85 Dog (4294967296)",
+        "m85 Dog-2",
+        "m85 (2)",
+        "m84 Dog (2)",
+    ] {
+        assert!(
+            !generated.accepts(OsSlot::MacComputerName, alias),
+            "{alias:?}"
+        );
+    }
+    assert!(!generated.collision(OsSlot::MacHostName, "m85-dog (2)"));
+    assert!(!generated.collision(OsSlot::MacLocalHostName, "m85-dog (2)"));
     for alias in ["m85-dog-02", "m85-dog-1", "m85-dog-2.local", "m85-2"] {
         assert!(!generated.collision(OsSlot::MacLocalHostName, alias));
     }
@@ -572,9 +600,12 @@ fn each_os_gets_the_bare_number_where_it_addresses_and_the_long_form_where_it_de
     assert!(!suffixed.collision(OsSlot::MacLocalHostName, "m85-dog-2"));
     let unicode = GeneratedNames::new(n(85), &Nickname::parse("研究室").unwrap());
     assert_eq!(unicode.computer_name(), "m85 研究室");
+    assert!(unicode.collision(OsSlot::MacComputerName, "m85 研究室 (2)"));
     assert_eq!(unicode.host_name(), "m85-u7814-u7a76-u5ba4");
     let long = GeneratedNames::new(n(999_999), &Nickname::parse(&"研".repeat(21)).unwrap());
     assert!(long.computer_name().len() <= DNS_LABEL_MAX);
+    let alias = format!("{} (2)", long.computer_name());
+    assert!(long.collision(OsSlot::MacComputerName, &alias));
     assert!(long.host_name().len() <= DNS_LABEL_MAX);
     assert!(long.host_name().is_ascii());
     assert!(!long.host_name().ends_with('-'));

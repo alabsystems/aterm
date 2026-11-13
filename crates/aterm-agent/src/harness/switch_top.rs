@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a person's click on a Claude Code session's model fact switches it: the model order
-//! (`<state>/upgrade/models.json`'s `priority`, else [`SEED`]) and the catalog baked into the
-//! session's build, cached under `<state>/upgrade/builds` by the upgrade sweep. Nothing here
-//! chooses a model for a relaunch: a relaunch keeps the session's own `--model`.
+//! The model catalog baked into a Claude Code build: its newest model of each family and the
+//! efforts each model takes, cached under `<state>/upgrade/builds` by the upgrade sweep. A
+//! session's model card and effort slider read it ([`catalog`]). Nothing here chooses a model:
+//! a relaunch keeps the session's own `--model`.
 
 use std::io::Read as _;
 use std::path::Path;
 
-use super::claude_model::{base_id, family_version};
 use super::upgrade::is_model_id;
 
 /// Whether `s` is a three-part dotted version (`2.1.281`), each part 1-6 digits without leading zeros.
@@ -74,6 +73,13 @@ impl Baked {
             .iter()
             .find(|(f, _)| f == family)
             .map(|(_, id)| id.as_str())
+    }
+
+    /// The entry of the build's newest model of `family`: `None` where the catalog names no
+    /// newest of it, or lists no entry for the one it names.
+    #[must_use]
+    pub fn latest_of(&self, family: &str) -> Option<&BakedModel> {
+        self.model(self.latest(family)?)
     }
 }
 
@@ -421,359 +427,17 @@ pub fn cached_for_version(cache_dir: &Path, version: &str) -> Option<Baked> {
         .and_then(|facts| facts.baked)
 }
 
-/// The click's model order where `models.json` names none, best first.
-pub const SEED: [&str; 3] = ["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"];
-
-/// The most models an order holds.
-const ORDER_MAX: usize = 32;
-
-/// The effort levels `/effort` takes, least first.
-pub const EFFORT_LADDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-/// The effort taken for a model's top where no read catalog lists the model.
-pub const TOP_EFFORT_UNREAD: &str = "xhigh";
-
-/// The model families the automatic choice passes over while another stands: billed to usage
-/// credits where the account's billing is not read. A `[claude_footer] switch_model` setting
-/// can still name one.
-pub const CREDITS_BILLED_UNREAD: &[&str] = &["fable"];
-
-/// [`SEED`] as an order.
+/// The cached catalog of the build a session on Claude Code `version` runs, under the harness's
+/// `state` ([`cached_for_version`] of `<state>/upgrade/builds`): `None` where no sweep has cached
+/// the build, or `version` is not known. It reads, and writes nothing.
 #[must_use]
-pub fn seed() -> Vec<String> {
-    SEED.iter().map(|s| (*s).to_string()).collect()
-}
-
-/// The order a `models.json` text names in its `priority` array: `None` where it is not JSON,
-/// names no model, more than [`ORDER_MAX`], a word that is no model id, or one twice.
-#[must_use]
-pub fn parse_order(text: &str) -> Option<Vec<String>> {
-    let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
-    let ids: Vec<String> = v
-        .get("priority")?
-        .as_array()?
-        .iter()
-        .map(|x| {
-            x.as_str()
-                .filter(|s| family_version(s).is_some())
-                .map(str::to_string)
-        })
-        .collect::<Option<_>>()?;
-    let mut dedup = ids.clone();
-    dedup.sort();
-    dedup.dedup();
-    (!ids.is_empty() && ids.len() <= ORDER_MAX && dedup.len() == ids.len()).then_some(ids)
-}
-
-/// The highest effort `baked` admits for `model` ([`EFFORT_LADDER`]), [`TOP_EFFORT_UNREAD`]
-/// where no catalog was read or it lists neither the model nor an effort for it.
-#[must_use]
-pub fn top_effort(model: &str, baked: Option<&Baked>) -> &'static str {
-    baked
-        .and_then(|b| b.model(model))
-        .and_then(|m| {
-            EFFORT_LADDER
-                .iter()
-                .rev()
-                .find(|level| m.efforts.iter().any(|e| e == **level))
-                .copied()
-        })
-        .unwrap_or(TOP_EFFORT_UNREAD)
-}
-
-/// Where a person's switch "to the top" goes on one Claude Code build: the best model of the
-/// order the build offers, at that model's highest effort.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Top {
-    /// The model id (`claude-opus-5-5`).
-    pub model: String,
-    /// Its highest effort ([`top_effort`]).
-    pub effort: &'static str,
-    /// The build's own catalog, where one was read: what [`Self::effort_of`] another model reads.
-    pub baked: Option<Baked>,
-}
-
-impl Top {
-    /// The highest effort of `model` on this build ([`top_effort`]).
-    #[must_use]
-    pub fn effort_of(&self, model: &str) -> &'static str {
-        top_effort(model, self.baked.as_ref())
-    }
-}
-
-fn passed_over(id: &str) -> bool {
-    family_version(id).is_some_and(|(family, _)| CREDITS_BILLED_UNREAD.contains(&family.as_str()))
-}
-
-/// [`Top`] of `order` on the build whose catalog is `baked`. With a catalog: the order's first
-/// model the build lists, else the build's own newest of a family (in the order its catalog
-/// writes them). With none: the order's first. A family of [`CREDITS_BILLED_UNREAD`] is passed
-/// over while another stands; an empty order is [`SEED`]'s first.
-#[must_use]
-pub fn top(order: &[String], baked: Option<Baked>) -> Top {
-    let on_offer: Vec<&str> = baked.as_ref().map_or_else(Vec::new, |b| {
-        let mut out: Vec<&str> = Vec::new();
-        let latest = b.latest_per_family.iter().map(|(_, id)| id.as_str());
-        for id in latest.chain(order.iter().map(String::as_str)) {
-            let base = base_id(id);
-            if family_version(base).is_some()
-                && !passed_over(base)
-                && b.model(base).is_some()
-                && !out.contains(&base)
-            {
-                out.push(base);
-            }
-        }
-        out
-    });
-    let model = order
-        .iter()
-        .map(|id| base_id(id))
-        .find(|id| on_offer.contains(id))
-        .or_else(|| on_offer.first().copied())
-        .or_else(|| order.iter().map(String::as_str).find(|id| !passed_over(id)))
-        .or_else(|| order.first().map(String::as_str))
-        .unwrap_or(SEED[0])
-        .to_string();
-    Top {
-        effort: top_effort(&model, baked.as_ref()),
-        model,
-        baked,
-    }
-}
-
-/// Where a person's switch "to the top" goes for a session on Claude Code `version`
-/// ([`top`]): of the order under `state` ([`SEED`] where none is written) and that build's
-/// cached catalog (`None` where no sweep has cached the build, or `version` is not known). It
-/// reads, and writes nothing.
-#[must_use]
-pub fn switch_top(state: &Path, version: Option<&str>) -> Top {
-    use super::upgrade_drive::check_upgrade_tree;
-    let order = check_upgrade_tree(state, None)
+pub fn catalog(state: &Path, version: Option<&str>) -> Option<Baked> {
+    let dir = super::upgrade_drive::check_upgrade_tree(state, Some("builds"))
         .ok()
-        .flatten()
-        .and_then(|dir| {
-            super::accounts::read_bounded(&dir.join("models.json"), 1024 * 1024)
-                .ok()
-                .flatten()
-        })
-        .and_then(|text| parse_order(&text))
-        .unwrap_or_else(seed);
-    let baked = version.and_then(|version| {
-        check_upgrade_tree(state, Some("builds"))
-            .ok()
-            .flatten()
-            .and_then(|dir| cached_for_version(&dir, version))
-    });
-    top(&order, baked)
+        .flatten()?;
+    cached_for_version(&dir, version?)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const WINDOW: &str = concat!(
-        r#"models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5",knowledge_cutoff:"May 2026","#,
-        r#"context:{window:2e5,native_1m:!1,supports_1m_beta:!0},capabilities:["effort","max_effort","adaptive_thinking"],default_effort:"high"},"#,
-        r#"{id:"claude-opus-5-5",family:"opus",display_name:"Opus 5.5",knowledge_cutoff:"June 2026","#,
-        r#"context:{window:1e6,native_1m:!0,supports_1m_beta:!0,supports_1m_suffix:!0},capabilities:["effort","max_effort","xhigh_effort","adaptive_thinking"],default_effort:"medium",advisor_rank:4}],"#,
-        r#"aliases:{opus:{default:"claude-opus-5-5"}},defaults:{},best:"fable","#,
-        r#"latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5",sonnet:"claude-sonnet-5",haiku:"claude-haiku-4-5"},alias_migration:{}};"#,
-    );
-
-    #[test]
-    fn the_280_literal_parses() {
-        let b = parse_window(WINDOW).expect("parses");
-        assert_eq!(b.latest("opus"), Some("claude-opus-5-5"));
-        assert_eq!(b.latest("fable"), Some("claude-fable-5-1"));
-        assert_eq!(b.latest("mythos"), None);
-        let o55 = b.model("claude-opus-5-5").expect("entry");
-        assert_eq!(o55.family, "opus");
-        assert_eq!(o55.display_name, "Opus 5.5");
-        assert!(o55.native_1m);
-        assert_eq!(o55.efforts, ["low", "medium", "high", "xhigh", "max"]);
-        let o5 = b.model("claude-opus-5[1m]").expect("the suffix is ignored");
-        assert!(!o5.native_1m);
-        assert!(!o5.efforts.contains(&"xhigh".to_string()));
-    }
-
-    #[test]
-    fn a_hostile_value_is_not_a_model() {
-        let w = WINDOW.replace(
-            r#"opus:"claude-opus-5-5",sonnet"#,
-            r#"opus:"claude-opus-5-5;rm -rf ~",sonnet"#,
-        );
-        assert_ne!(w, WINDOW, "the fixture must contain the replaced text");
-        let b = parse_window(&w).expect("the rest still parses");
-        assert_eq!(b.latest("opus"), None);
-        assert_eq!(parse_window("no marker here"), None);
-    }
-
-    #[test]
-    fn build_facts_round_trip_through_the_disk_cache() {
-        let b = BuildFacts {
-            baked: parse_window(WINDOW),
-            version: Some("2.1.280".into()),
-        };
-        assert_eq!(parse_facts(&render_facts(&b)), Some(b));
-        assert_eq!(parse_facts("{}"), Some(BuildFacts::default()));
-        for bad in ["02.1.280", "2.01.280", "2.1.0280", "0.0.00"] {
-            assert!(!is_version(bad), "{bad}");
-            assert_eq!(version_triple(bad), None, "{bad}");
-            assert_eq!(
-                parse_facts(&format!(r#"{{"version":"{bad}"}}"#)).and_then(|facts| facts.version),
-                None,
-                "{bad}"
-            );
-        }
-        assert_eq!(version_triple("0.0.0"), Some((0, 0, 0)));
-    }
-
-    #[test]
-    fn a_cached_catalog_is_found_by_the_version_its_build_says() {
-        let dir = crate::supervise::ScratchDir::new("upgrade-catalog", "by-version");
-        let facts = |version: &str, id: &str| BuildFacts {
-            version: Some(version.to_string()),
-            baked: Some(Baked {
-                latest_per_family: vec![("opus".to_string(), id.to_string())],
-                models: vec![BakedModel {
-                    id: id.to_string(),
-                    family: "opus".to_string(),
-                    display_name: "Opus".to_string(),
-                    native_1m: false,
-                    efforts: vec!["high".to_string(), "max".to_string()],
-                }],
-            }),
-        };
-        for (name, f) in [
-            ("a.json", facts("2.1.300", "claude-opus-5")),
-            ("b.json", facts("2.1.321", "claude-opus-5-5")),
-        ] {
-            std::fs::write(dir.join(name), render_facts(&f)).expect("write");
-        }
-        std::fs::write(dir.join("c.json"), "not json").expect("write");
-        let found = cached_for_version(&dir, "2.1.321").expect("the build's catalog");
-        assert_eq!(found.latest("opus"), Some("claude-opus-5-5"));
-        assert_eq!(cached_for_version(&dir, "2.1.999"), None);
-        assert_eq!(cached_for_version(&dir.join("absent"), "2.1.321"), None);
-    }
-
-    #[test]
-    fn the_scan_finds_a_marker_across_a_chunk_boundary() {
-        const BOUNDARY_SINGLE: &[u8] = b"VERSION:\"9.9.9\"";
-        let dir = crate::supervise::ScratchDir::new("upgrade-catalog", "boundary");
-        let path = dir.join("claude");
-        let mut bytes = vec![b'x'; CHUNK - 15 - BOUNDARY_SINGLE.len()];
-        bytes.extend_from_slice(BOUNDARY_SINGLE);
-        bytes.extend_from_slice(WINDOW.as_bytes());
-        bytes.extend(std::iter::repeat_n(b'y', 1000));
-        bytes.extend_from_slice(b"VERSION:\"2.1.281\" VERSION:\"2.1.281\"");
-        std::fs::write(&path, &bytes).expect("write");
-        let f = scan_build(&path);
-        let b = f.baked.expect("found");
-        assert_eq!(b.latest("opus"), Some("claude-opus-5-5"));
-        assert_eq!(b.models.len(), 2);
-        assert_eq!(
-            f.version.as_deref(),
-            Some("2.1.281"),
-            "the most frequent literal wins without double-counting carry"
-        );
-
-        let mut near_end = vec![b'x'; CHUNK - WINDOW.len()];
-        near_end.extend_from_slice(WINDOW.as_bytes());
-        assert_eq!(near_end.len(), CHUNK);
-        near_end.extend_from_slice(b"VERSION:\"2.1.281\" VERSION:\"2.1.281\"");
-        std::fs::write(&path, &near_end).expect("write");
-        let f2 = scan_build(&path);
-        assert_eq!(
-            f2.baked.as_ref().and_then(|b| b.latest("opus")),
-            Some("claude-opus-5-5")
-        );
-        assert_eq!(
-            f2.version.as_deref(),
-            Some("2.1.281"),
-            "a marker near chunk end still scans version literals in the lookahead window"
-        );
-    }
-
-    fn baked(ids: &[&str], latest: &[(&str, &str)]) -> Baked {
-        Baked {
-            latest_per_family: latest
-                .iter()
-                .map(|(f, i)| ((*f).to_string(), (*i).to_string()))
-                .collect(),
-            models: ids
-                .iter()
-                .map(|id| BakedModel {
-                    id: (*id).to_string(),
-                    family: family_version(id).expect("id").0,
-                    display_name: (*id).to_string(),
-                    native_1m: true,
-                    efforts: vec![],
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn the_top_is_the_orders_best_the_build_offers_at_its_highest_effort() {
-        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let order = ids(&["claude-opus-6", "claude-opus-5-5", "claude-opus-5"]);
-        let none = top(&order, None);
-        assert_eq!(
-            (none.model.as_str(), none.effort),
-            ("claude-opus-6", TOP_EFFORT_UNREAD),
-            "no catalog read: the order's first, at the unread top"
-        );
-        let mut b = baked(
-            &["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"],
-            &[("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5")],
-        );
-        b.models[0].efforts = ids(&["low", "medium", "high", "xhigh", "max"]);
-        b.models[1].efforts = ids(&["low", "medium", "high"]);
-        let old = top(&order, Some(b.clone()));
-        assert_eq!(
-            (old.model.as_str(), old.effort),
-            ("claude-opus-5-5", "max"),
-            "a build that does not know the order's first goes to the next it offers"
-        );
-        assert_eq!(old.effort_of("claude-opus-5"), "high");
-        assert_eq!(
-            old.effort_of("claude-sonnet-5"),
-            TOP_EFFORT_UNREAD,
-            "a model with no effort listed"
-        );
-        assert_eq!(
-            top(&ids(&["claude-opus-7"]), Some(b)).model,
-            "claude-opus-5-5",
-            "nothing of the order on offer: the build's own newest"
-        );
-        assert_eq!(
-            top(&ids(&["claude-fable-5-1", "claude-opus-5-5"]), None).model,
-            "claude-opus-5-5",
-            "a family billed to credits where billing is unread is passed over"
-        );
-        assert_eq!(top(&seed(), None).model, SEED[0]);
-        assert_eq!(top(&[], None).model, SEED[0]);
-    }
-
-    #[test]
-    fn an_order_is_read_from_its_priority_array_and_refused_whole_when_bad() {
-        assert_eq!(
-            parse_order(r#"{"priority":["claude-opus-6","claude-opus-5-5"],"history":[]}"#),
-            Some(vec![
-                "claude-opus-6".to_string(),
-                "claude-opus-5-5".to_string()
-            ])
-        );
-        for bad in [
-            "not json",
-            r#"{"priority":[]}"#,
-            r#"{"priority":["claude-opus-6","claude-opus-6"]}"#,
-            r#"{"priority":["claude-opus-6","gpt-5"]}"#,
-            r#"{"history":[]}"#,
-        ] {
-            assert_eq!(parse_order(bad), None, "{bad}");
-        }
-    }
-}
+#[path = "switch_top_tests.rs"]
+mod tests;

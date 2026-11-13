@@ -973,5 +973,8 @@ fn qualified(root: &Path, compiler: &str, expected: &str, record: &V, installati
     doctor(&report, subject)
 }
 
-#[cfg(test)]
+// A seal's records carry its producer's paths, a Unix host's (Trust has no Windows build), and
+// are judged in that spelling: off Unix the qualified fixture cannot pass, which would leave
+// every refusal below passing for that reason alone.
+#[cfg(all(test, unix))]
 mod tests;

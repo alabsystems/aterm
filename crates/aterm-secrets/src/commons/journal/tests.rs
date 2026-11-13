@@ -1299,18 +1299,13 @@ fn reads() -> usize {
     READS.with(std::cell::Cell::get)
 }
 
-/// The earliest and the latest change a [`witness`] of the journal in `dir` shows.
+/// The earliest and the latest change a [`JournalSeen`] of the journal in `dir` shows.
 fn changes(dir: &Path) -> (std::time::SystemTime, std::time::SystemTime) {
-    let changed = witness(dir)
-        .unwrap()
-        .map(|seen| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns));
-    let at = |ns: &i128| {
-        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(*ns).unwrap())
+    let (first, last) = JournalSeen::of(dir, NAME).unwrap().test_changed_ns();
+    let at = |ns: i128| {
+        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(ns).unwrap())
     };
-    (
-        at(changed.iter().min().unwrap()),
-        at(changed.iter().max().unwrap()),
-    )
+    (at(first), at(last))
 }
 
 /// A settled journal is taken as its last read kept it, with no read, until its folder or a file
@@ -1422,8 +1417,8 @@ fn a_settled_journal_is_taken_without_a_read_until_its_folder_or_a_file_moves() 
 /// A read through a copy of the journal swapped in for it keeps no witness: its folder's parent
 /// renamed aside and back moves none of the times the witness holds, so the read is matched to the
 /// witness by the files it opened. NEGATIVE CONTROL: with the opened files left unmatched
-/// (`stands_for` by its settled rule alone), the copy's earlier prefix is taken after the original
-/// returns.
+/// (`JournalSeen::stands_for` by its settled rule alone), the copy's earlier prefix is taken after
+/// the original returns.
 #[test]
 fn a_journal_read_through_a_copy_swapped_in_is_not_kept() {
     let fixture = Fixture::new();

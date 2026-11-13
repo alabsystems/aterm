@@ -19,7 +19,7 @@ fn write(root: &Path, rel: &str, body: impl AsRef<[u8]>) {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+    let out = crate::git_provider::command()
         .current_dir(root)
         .args(args)
         .output()

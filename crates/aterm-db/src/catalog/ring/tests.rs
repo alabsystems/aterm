@@ -396,6 +396,153 @@ fn a_clock_back_from_running_ahead_takes_its_window_back() {
     });
 }
 
+/// Every window a state places lies within its ring's reach (`Ring::reach`), so a reader that
+/// reads a ring's state only for a table of that reach misses no window table: for each ring, on
+/// clocks at the epoch's first periods, at day D and at the last period a clock can name, with
+/// floors from three periods below the clock to three above it, none and the highest.
+/// NEGATIVE CONTROL: a reach of the clock's period and the next two (`clock..=clock + 2`)
+/// misses the period before the clock's, which the window holds wherever the floor is another
+/// period (`claims clock 1 floor 0: window 0..=2 reach 1..=3`); a reach ending one after the
+/// clock's (`..=clock + 1`) misses the window's end where the floor is the clock's period
+/// (`claims clock 0 floor 0: window 0..=2 reach 0..=1`).
+#[test]
+fn every_window_lies_within_its_reach() {
+    for ring in RINGS {
+        let last = u64::MAX / ring.period_s;
+        for clock in [0, 1, 2, D, D + 1, last] {
+            let now = clock * ring.period_s + 60;
+            assert_eq!(ring.epoch_of(now), clock, "CONTROL: {} {clock}", ring.role);
+            let floors = [0, u64::MAX]
+                .into_iter()
+                .chain(clock.saturating_sub(3)..=clock.saturating_add(3));
+            for floor in floors {
+                let state = RingState {
+                    floor,
+                    held: BTreeSet::new(),
+                };
+                let (window, reach) = (state.window(ring, now), ring.reach(now));
+                assert!(
+                    reach.contains(window.start()) && reach.contains(window.end()),
+                    "{} clock {clock} floor {floor}: window {window:?} reach {reach:?}",
+                    ring.role
+                );
+            }
+        }
+    }
+}
+
+/// A ring's state is read only where its reach (`Ring::reach`) holds the table asked about: with
+/// every state written and the claims floor at day D, so its window is D to D+2 on day D,
+/// `ring_of` of the claims table of day D+2 or D-1 reads the claims state alone, of the
+/// journal's table of the week after the clock's the journal's state alone, and of a declared
+/// application table no state; and the take-up's `ring_tables_among` of a set holding only the
+/// declared table reads no state and finds none, of only the claims table of day D+2 reads the
+/// claims state alone and finds it, and of only the claims table of day D-1 reads the claims
+/// state alone and finds none. Its return for an empty set saves only the twelve reach digests
+/// (three rings' four periods each) and has no law of its own.
+/// NEGATIVE CONTROL: `ring_of` without its reach filter reads every state for day D-1
+/// (`claims D-1`: `left: [1, 1, 1], right: [1, 0, 0]`); a reach lacking the
+/// period two after the clock's reads no state for day D+2, which it then names no ring table
+/// (`claims D+2`: `left: None, right: Some(20002)`).
+/// NEGATIVE CONTROL (2026-11-11): `ring_tables_among` without its reach filter, its return for
+/// an empty set kept, reads every state for a set of the declared table (`among {declared}
+/// reads [claims, recoveries, journal]`: `left: [1, 1, 1], right: [0, 0, 0]`).
+#[test]
+fn a_ring_state_is_read_only_where_its_window_could_hold_the_table() {
+    use aterm_uds::private_file::tally;
+    let lab = Lab::new(&[Role::Writer]);
+    let policy = Policy::default();
+    with_writer(&lab, |session, directory| {
+        let now = at(D, 60);
+        let declared = directory
+            .open_application(session, "stored", "rows", 1)
+            .unwrap()
+            .digest();
+        // Each ring's retirement finds no state, rebuilds one and writes it.
+        directory.ring_subscriptions(session, &policy, now).unwrap();
+        directory
+            .save_ring_state(
+                session,
+                &CLAIMS,
+                &RingState {
+                    floor: D,
+                    held: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            directory.ring_view(session, &CLAIMS).window(&CLAIMS, now),
+            D..=D + 2,
+            "CONTROL: the claims window is D to D+2"
+        );
+        let names: Vec<String> = RINGS.iter().map(|ring| ring.state_name()).collect();
+        let claims = claim_dir(session).unwrap();
+        for name in &names {
+            assert!(claims.join(name).is_file(), "CONTROL: {name} is written");
+        }
+        let week = JOURNAL.epoch_of(now) + 1;
+        let journal = JOURNAL.scope(directory.trust, week).unwrap();
+        let claims_day = |day| CLAIMS.scope(directory.trust, day).unwrap();
+        let counts = |read: &[tally::Read]| -> Vec<usize> {
+            names
+                .iter()
+                .map(|name| {
+                    read.iter()
+                        .find(|seen| &seen.name == name)
+                        .map_or(0, |seen| seen.reads)
+                })
+                .collect()
+        };
+        for (label, id, found, reads) in [
+            (
+                "claims D+2",
+                claims_day(D + 2).digest(),
+                Some(D + 2),
+                [1, 0, 0],
+            ),
+            ("claims D-1", claims_day(D - 1).digest(), None, [1, 0, 0]),
+            ("declared", declared, None, [0, 0, 0]),
+            ("journal", journal.digest(), Some(week), [0, 0, 1]),
+        ] {
+            let (of, read) = tally::counted(|| directory.ring_of(session, id, now));
+            let of = of.unwrap().map(|(_, epoch, scope)| {
+                assert_eq!(scope.digest(), id, "{label}");
+                epoch
+            });
+            assert_eq!(of, found, "{label}");
+            assert_eq!(
+                counts(&read),
+                reads,
+                "{label} reads [claims, recoveries, journal]"
+            );
+        }
+        let d2 = claims_day(D + 2).digest();
+        for (label, id, found, reads) in [
+            ("among {declared}", declared, None, [0, 0, 0]),
+            ("among {claims D+2}", d2, Some(d2), [1, 0, 0]),
+            (
+                "among {claims D-1}",
+                claims_day(D - 1).digest(),
+                None,
+                [1, 0, 0],
+            ),
+        ] {
+            let ids = BTreeSet::from([id]);
+            let (among, read) = tally::counted(|| directory.ring_tables_among(session, now, &ids));
+            assert_eq!(
+                among.unwrap(),
+                found.into_iter().collect::<BTreeSet<_>>(),
+                "{label}"
+            );
+            assert_eq!(
+                counts(&read),
+                reads,
+                "{label} reads [claims, recoveries, journal]"
+            );
+        }
+    });
+}
+
 /// Storage another Mac's tables fill up to the catalog's capacity (the point where a table
 /// declared here waits on `Capacity`) leaves the claims ring its slots: this Mac still takes up
 /// a day table on each of four days, and the catalog still refuses a table of its own.

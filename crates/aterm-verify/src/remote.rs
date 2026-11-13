@@ -19,7 +19,8 @@ pub(crate) enum Tool {
     Agh,
 }
 
-type Runner<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, String> + 'a;
+/// How a remote step is run: [`run`], or [`run_unless`].
+pub(crate) type Runner<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, String> + 'a;
 
 pub(crate) fn run(
     root: &Path,
@@ -28,9 +29,29 @@ pub(crate) fn run(
     args: &[OsString],
     until: Instant,
 ) -> Result<Output, String> {
-    let mut cmd = command(root, git, tool, args);
+    let mut cmd = command(root, git, tool, args)?;
     aterm_uds::deadline::output_until_complete_stdout(&mut cmd, until)
         .map_err(|e| format!("{tool:?} remote operation: {e}"))
+}
+
+/// [`run`], ended once `stopped` reads `true` (read at least every
+/// [`aterm_uds::deadline::STOP_TICK`]): an ended step publishes no output and is an error.
+pub(crate) fn run_unless(
+    root: &Path,
+    git: &dyn Fn(&Path) -> Command,
+    tool: Tool,
+    args: &[OsString],
+    until: Instant,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, String> {
+    let mut cmd = command(root, git, tool, args)?;
+    aterm_uds::deadline::output_until_complete_stdout_from_unless(
+        &mut cmd,
+        aterm_uds::spawnfd::Stdio::null(),
+        until,
+        stopped,
+    )
+    .map_err(|e| format!("{tool:?} remote operation: {e}"))
 }
 
 /// The command [`run`] runs, for a caller that waits on it its own way.
@@ -39,7 +60,7 @@ pub(crate) fn command(
     git: &dyn Fn(&Path) -> Command,
     tool: Tool,
     args: &[OsString],
-) -> Command {
+) -> Result<Command, String> {
     let mut cmd = match tool {
         Tool::Git => {
             let mut cmd = git(root);
@@ -56,13 +77,22 @@ pub(crate) fn command(
             cmd
         }
         Tool::Agh => {
-            let mut cmd = aterm_uds::spawnfd::command("agh");
-            cmd.current_dir(root);
+            #[cfg(target_os = "linux")]
+            let image = std::path::PathBuf::from("/proc/self/exe");
+            #[cfg(target_os = "macos")]
+            let image = crate::remote_host::image()?;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let image = std::env::current_exe()
+                .map_err(|e| format!("cannot name the remote transport host: {e}"))?;
+            let mut cmd = aterm_uds::spawnfd::command(image);
+            cmd.arg(crate::remote_cli::FLAG)
+                .arg(std::process::id().to_string())
+                .current_dir(root);
             cmd
         }
     };
     cmd.args(args);
-    cmd
+    Ok(cmd)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -229,6 +259,19 @@ impl<'a> Remote<'a> {
         })
     }
 
+    /// Reject a source agh cannot push before the caller spends time judging it.
+    /// Local Git remotes do not impose agh's complete-history requirement.
+    pub(crate) fn admit_push_source(&self) -> Result<(), String> {
+        if matches!(self.kind, Kind::Local(_)) {
+            return Ok(());
+        }
+        let stdout = success(
+            Tool::Git,
+            (self.run)(Tool::Git, &words(&["rev-parse", "--is-shallow-repository"]))?,
+        )?;
+        agh::git::require_complete_source(&stdout).map_err(|error| error.to_string())
+    }
+
     /// Refresh ordinary live main through agh's incremental snapshot operation.
     /// Pinned provenance reads still use [`Self::fetch`]. A failed refresh never
     /// turns a previous local snapshot into a successful current observation.
@@ -303,10 +346,12 @@ impl<'a> Remote<'a> {
                 let name = reference
                     .strip_prefix("refs/")
                     .ok_or("remote ref must start with refs/")?;
-                let endpoint = format!("repos/{slug}/git/matching-refs/{name}");
                 let out = success(
                     Tool::Agh,
-                    (self.run)(Tool::Agh, &words(&["api", &endpoint]))?,
+                    (self.run)(
+                        Tool::Agh,
+                        &words(&["repo", "refs", slug, "--ref", reference]),
+                    )?,
                 )?;
                 let value: Value =
                     aterm_json::from_slice(&out).map_err(|e| format!("agh refs: {e}"))?;
@@ -320,33 +365,79 @@ impl<'a> Remote<'a> {
                 let Some(row) = found.next() else {
                     return Ok(None);
                 };
-                let sha = row["object"]["sha"]
-                    .as_str()
-                    .ok_or("agh ref has no object ID")?;
-                if found.next().is_some()
-                    || row["object"]["type"].as_str() != Some("commit")
-                    || !aterm_types::land_trailer::object_id(sha)
-                {
+                let sha = row["oid"].as_str().ok_or("agh ref has no object ID")?;
+                if found.next().is_some() || !aterm_types::land_trailer::object_id(sha) {
                     return Err("agh did not return one exact commit ID".into());
                 }
-                let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-                let input = dir.path().join("fetch.json");
-                let into = format!("refs/agh/verify/{name}");
                 // The ref can advance after observation; import the immutable snapshot itself.
-                std::fs::write(
-                    &input,
-                    json!([{"source":sha,"into":into,"expected_oid":sha}]).to_string(),
-                )
-                .map_err(|e| e.to_string())?;
-                let mut args = words(&["repo", "fetch", slug]);
-                args.extend([
-                    self.root.as_os_str().to_owned(),
-                    "--input".into(),
-                    input.into_os_string(),
-                ]);
-                success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+                self.agh_commit(slug, sha, &format!("refs/agh/verify/{name}"))?;
                 Ok(Some(sha.to_owned()))
             }
+        }
+    }
+
+    /// Import the exact commit `sha` and what it reaches, publishing it at `into` alone: no
+    /// branch, index or checkout moves. Unlike [`Self::fetch`], `sha` need be no ref's tip, as a
+    /// superproject's gitlink can pin any commit the remote holds. A local remote is asked over
+    /// the file transport, GitHub through agh.
+    pub(crate) fn import_commit(&self, sha: &str, into: &str) -> Result<(), String> {
+        if !aterm_types::land_trailer::object_id(sha) {
+            return Err("a commit import needs one exact object ID".into());
+        }
+        match &self.kind {
+            Kind::Local(_) => {
+                let wanted = format!("+{sha}:{into}");
+                success(
+                    Tool::Git,
+                    (self.run)(
+                        Tool::Git,
+                        &local_words(&[
+                            "fetch",
+                            "--quiet",
+                            "--no-tags",
+                            "--no-write-fetch-head",
+                            "--recurse-submodules=no",
+                            self.name,
+                            &wanted,
+                        ]),
+                    )?,
+                )?;
+                self.require_commit(sha)
+            }
+            Kind::Github(slug) => self.agh_commit(slug, sha, into),
+        }
+    }
+
+    /// Import commit `sha` from GitHub's `slug` through agh into ref `into`, then require that
+    /// the object arrived as a commit.
+    fn agh_commit(&self, slug: &str, sha: &str, into: &str) -> Result<(), String> {
+        let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+        let input = dir.path().join("fetch.json");
+        std::fs::write(
+            &input,
+            json!([{"source":sha,"into":into,"expected_oid":sha}]).to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut args = words(&["repo", "fetch", slug]);
+        args.extend([
+            self.root.as_os_str().to_owned(),
+            "--input".into(),
+            input.into_os_string(),
+        ]);
+        success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+        self.require_commit(sha)
+    }
+
+    /// `sha` is a commit object in this repository.
+    fn require_commit(&self, sha: &str) -> Result<(), String> {
+        let object = success(
+            Tool::Git,
+            (self.run)(Tool::Git, &words(&["cat-file", "-t", sha]))?,
+        )?;
+        if object == b"commit\n" {
+            Ok(())
+        } else {
+            Err(format!("{sha} is not a commit object"))
         }
     }
 

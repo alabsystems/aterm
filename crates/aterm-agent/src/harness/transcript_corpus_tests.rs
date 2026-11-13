@@ -31,6 +31,10 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
         r#"{"type":"system","subtype":"api_error","isApiErrorMessage":true,"error":"rate_limit","content":"You've hit your limit","quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false},"uuid":"u-5","timestamp":"2026-10-15T20:37:00Z"}"#,
     ),
     (
+        "claude/mid-turn-command",
+        r#"{"parentUuid":"u-6","isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>","level":"info","timestamp":"2026-11-11T03:55:49.135Z","uuid":"u-7","isMeta":false,"commandRun":{"command":"effort","args":"high"},"sessionId":"s-1","version":"2.1.322"}"#,
+    ),
+    (
         "claude/compact-boundary",
         r#"{"parentUuid":null,"logicalParentUuid":"u-5","type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"isCompactSummary":true,"compactMetadata":{"trigger":"auto","preTokens":160000},"uuid":"u-6","timestamp":"2026-10-15T20:40:00Z"}"#,
     ),

@@ -64,12 +64,13 @@ pub enum Accounting {
     /// An immutable cohort-owned reservation, independent of execution lifetime.
     /// It never credits numeric creator ancestry, including before the first ARM.
     CohortOwned,
-    /// An ordinary detached memory claim reserves its full peak without numeric holder
-    /// credit or ancestry. It ends at the final actual guard close, not a cohort journal.
+    /// An ordinary detached reservation retains its full peak and admitted cores without
+    /// numeric holder credit or ancestry. It ends at final guard close, not a cohort journal.
     Detached,
 }
 
 pub(crate) const DETACHED_MEMORY: &[u8] = b"@aterm-detached-memory/1\n";
+pub(crate) const DETACHED_RESERVATION: &[u8] = b"@aterm-detached-reservation/1\n";
 #[cfg(all(test, unix))]
 thread_local! { static DETACH_FAIL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(test, unix))]
@@ -410,11 +411,14 @@ impl Record {
         let mut lines = text.lines();
         let encoded_head = lines.next()?;
         let poisoned = encoded_head.starts_with('@');
+        let marker = [DETACHED_MEMORY, DETACHED_RESERVATION]
+            .into_iter()
+            .find(|marker| text.as_bytes().ends_with(marker));
         let restored;
         let head = if poisoned {
             // Old readers reject this non-JSON head. Restore it only in memory after the
             // complete monotone final event exists; an interrupted transfer stays unknown.
-            if !held || !text.as_bytes().ends_with(DETACHED_MEMORY) {
+            if !held || marker.is_none() {
                 return None;
             }
             restored = format!("{{{}", encoded_head.strip_prefix('@')?);
@@ -496,7 +500,9 @@ impl Record {
         let mut lead_reservation: Option<crate::LeadReservation> = None;
         for l in lines {
             if l.starts_with('@') {
-                if l.as_bytes() == &DETACHED_MEMORY[..DETACHED_MEMORY.len() - 1] && !detached {
+                if marker.is_some_and(|marker| l.as_bytes() == &marker[..marker.len() - 1])
+                    && !detached
+                {
                     detached = true;
                 } else {
                     bad_detach = true;
@@ -543,13 +549,23 @@ impl Record {
                 lead_reservation = Some(proof);
             }
         }
-        if bad_detach || detached != poisoned || (detached && (!held || !memory_only(&need))) {
+        // A run phase's memory is less than the peak or none (CAP3). A step is a held claim's
+        // own: a waiter is never stepped, and one stepped below what it was admitted with is held
+        // as any other, no longer alone: its reservation is counted beside the other claims'.
+        let mut need = need;
+        need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
+        need.stepped = stepped.filter(|_| held);
+        let valid_detached_need = match marker {
+            Some(marker) if marker == DETACHED_MEMORY => memory_only(&need),
+            Some(_) => retained_reservation(&need),
+            None => false,
+        };
+        if bad_detach || detached != poisoned || (detached && (!held || !valid_detached_need)) {
             return None;
         }
         if detached && (explicit_held.is_none() || malformed_after) {
             return None;
         }
-        let mut need = need;
         if need.critical && (!need.leads || need.rank != crate::Rank::Release) {
             return None;
         }
@@ -558,11 +574,6 @@ impl Record {
             // cannot add a foreign dependency edge that the retained lead cannot recognize.
             credit.clear();
         }
-        // A run phase's memory is less than the peak or none (CAP3). A step is a held claim's
-        // own: a waiter is never stepped, and one stepped below what it was admitted with is held
-        // as any other, no longer alone: its reservation is counted beside the other claims'.
-        need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
-        need.stepped = stepped.filter(|_| held);
         need.lead_reservation = (!held && need.critical)
             .then_some(lead_reservation)
             .flatten();
@@ -620,11 +631,24 @@ impl Record {
 
 pub(crate) fn memory_only(need: &Need) -> bool {
     need.mem > 0
+        && need.run_mem.is_none()
+        && need.stepped.is_none()
         && need.cores == 0
         && need.disk == 0
         && need.quiet.is_none()
         && need.quiet_policy == crate::QuietPolicy::Load
         && !need.covers
+}
+
+pub(crate) fn retained_reservation(need: &Need) -> bool {
+    need.mem > 0
+        && need.disk == 0
+        && need.quiet.is_none()
+        && need.run_mem.is_none()
+        && need.stepped.is_none()
+        && need.quiet_policy == crate::QuietPolicy::Load
+        && !need.covers
+        && !need.critical
 }
 
 /// An optional owner is needed only for consuming transfer out of Laid's Drop. Normal
@@ -731,7 +755,7 @@ pub(crate) struct Laid {
     #[cfg(unix)]
     custody: Option<cohort_ledger::Custody>,
     #[cfg(unix)]
-    detaching: Option<Vec<u8>>,
+    detaching: Option<(Vec<u8>, &'static [u8])>,
 }
 
 impl Laid {
@@ -804,8 +828,14 @@ impl Laid {
         Ok(())
     }
 
-    pub(crate) fn detach_memory(&mut self) -> io::Result<()> {
+    pub(crate) fn detach_reservation(&mut self, marker: &'static [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt as _;
+        if marker != DETACHED_MEMORY && marker != DETACHED_RESERVATION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown detachment protocol",
+            ));
+        }
         if self.custody.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -835,7 +865,7 @@ impl Laid {
         self.check_named_memory()?;
         if self.detaching.is_none() {
             let offset = self.lock.metadata()?.len();
-            if offset.saturating_add(DETACHED_MEMORY.len() as u64) > RECORD_MAX {
+            if offset.saturating_add(marker.len() as u64) > RECORD_MAX {
                 return Err(io::Error::new(
                     io::ErrorKind::FileTooLarge,
                     "detached memory marker exceeds the original record bound",
@@ -849,9 +879,14 @@ impl Laid {
                 ));
             }
             // Record exact original bytes BEFORE any intent byte can reach disk.
-            self.detaching = Some(original);
+            self.detaching = Some((original, marker));
         }
-        let original = self.detaching.as_ref().expect("detachment intent");
+        let (original, selected) = self.detaching.as_ref().expect("detachment intent");
+        if *selected != marker {
+            return Err(io::Error::other(
+                "the original detachment protocol cannot change during retry",
+            ));
+        }
         let offset = original.len() as u64;
         let mut base = vec![0; original.len()];
         self.lock.read_exact_at(&mut base, 0)?;
@@ -865,11 +900,11 @@ impl Laid {
         let tail_len = length
             .checked_sub(offset)
             .and_then(|n| usize::try_from(n).ok())
-            .filter(|n| *n <= DETACHED_MEMORY.len())
+            .filter(|n| *n <= marker.len())
             .ok_or_else(|| io::Error::other("detachment intent has an unknown tail"))?;
         let mut tail = vec![0; tail_len];
         self.lock.read_exact_at(&mut tail, offset)?;
-        if !DETACHED_MEMORY.starts_with(&tail) {
+        if !marker.starts_with(&tail) {
             return Err(io::Error::other("detachment intent has foreign bytes"));
         }
         if &base == original {
@@ -887,7 +922,7 @@ impl Laid {
         aterm_durable::Flush::Durable.file(&self.lock)?;
         // Never remove an existing intent byte: a concurrent reader or owner crash must
         // not expose Holder again. Complete only this exact original owner's missing suffix.
-        let remaining = &DETACHED_MEMORY[tail_len..];
+        let remaining = &marker[tail_len..];
         self.lock.seek(SeekFrom::Start(length))?;
         #[cfg(test)]
         if let Some(bytes) = DETACH_FAIL.with(|failure| failure.take()) {
@@ -1426,7 +1461,7 @@ impl Ledger {
         self.try_turn()
     }
 
-    /// Take the admissions' lock if nobody holds it, writing this process's pid into it; `Err(holder)` while another waiter holds it (its pid, where it wrote one).
+    /// Take the admissions' lock if nobody holds it, leaving this process's pid in it; `Err(holder)` while another waiter holds it (its pid, where it wrote one). The pid is written only where the file does not already say it ([`names_holder`]): a waiter takes the lock at every look, and the one that held it last is most often the one that takes it again.
     pub(crate) fn try_turn(&self) -> io::Result<Result<Turn, Option<u32>>> {
         self.check_mode()?;
         #[cfg(unix)]
@@ -1438,10 +1473,13 @@ impl Ledger {
         let file = open_rendezvous(&path)?;
         match RecordLock::try_lock(file, RECORD_MAX) {
             Ok(mut lock) => {
-                let _ = lock
-                    .set_len(0)
-                    .and_then(|()| lock.seek(SeekFrom::Start(0)))
-                    .and_then(|_| writeln!(lock, "{}", std::process::id()));
+                let holder = format!("{}\n", std::process::id());
+                if !names_holder(&mut lock, holder.as_bytes()) {
+                    let _ = lock
+                        .set_len(0)
+                        .and_then(|()| lock.seek(SeekFrom::Start(0)))
+                        .and_then(|_| lock.write_all(holder.as_bytes()));
+                }
                 Ok(Ok(Turn { _lock: lock }))
             }
             Err(std::fs::TryLockError::WouldBlock) => Ok(Err(lock_holder(&path))),
@@ -1572,6 +1610,19 @@ fn ignored_claim_entry(e: &io::Error) -> bool {
     false
 }
 
+/// Whether the admissions' lock file `lock`, held, holds exactly `holder` (its holder's pid and a
+/// newline): the bytes [`Ledger::try_turn`] would write are the ones there. `false` for any other
+/// content, a longer or shorter file, or a read that failed, each of which is written over.
+fn names_holder(lock: &mut File, holder: &[u8]) -> bool {
+    let mut held = Vec::with_capacity(holder.len() + 1);
+    lock.seek(SeekFrom::Start(0)).is_ok()
+        && lock
+            .take(holder.len() as u64 + 1)
+            .read_to_end(&mut held)
+            .is_ok()
+        && held == holder
+}
+
 /// The pid the admissions' lock at `path` names: its holder's, unless it was let go meanwhile.
 fn lock_holder(path: &Path) -> Option<u32> {
     let mut file = crate::open_regular_reader(path).ok()?;
@@ -1624,9 +1675,13 @@ fn probe_opened(file: File, path: &Path, held: bool, reap: bool) -> io::Result<O
             if len > RECORD_MAX {
                 return Err(invalid("locked capacity record exceeds its size bound"));
             }
-            let mut bytes = Vec::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0));
-            (&file).take(RECORD_MAX + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > RECORD_MAX {
+            // Ask for no byte at or past RECORD_MAX: on Windows the holder's lock covers that
+            // range against every other handle, and a read reaching into it fails (a lock
+            // violation) even at the file's end. A record that grew past the bound while it
+            // was read is judged by the file's length after the read instead.
+            let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+            (&file).take(RECORD_MAX).read_to_end(&mut bytes)?;
+            if file.metadata()?.len() > RECORD_MAX {
                 return Err(invalid("locked capacity record grew past its size bound"));
             }
             let text = std::str::from_utf8(&bytes)

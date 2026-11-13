@@ -17,6 +17,90 @@ pub(super) fn open(dir: &Path) -> Log {
     }
 }
 
+/// The production window stays bounded while append, cold replay and reopen preserve every
+/// acknowledged record. Removing the budget retains twice its bytes and fails this oracle.
+#[test]
+fn a_long_log_keeps_its_decoded_window_within_budget() {
+    const BODY: usize = 64 * 1024;
+    let count = 2 * DECODED_WINDOW_BYTES / BODY;
+    let limits = Limits {
+        records: count + 1,
+        bytes: 3 * DECODED_WINDOW_BYTES,
+        record_bytes: BODY,
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut log = Log::open(dir.path(), "long", b"pinned", false, limits).unwrap();
+    log.finish_open().unwrap();
+    for index in 0..count {
+        let index = u64::try_from(index).unwrap();
+        let mut body = vec![0xa5; BODY];
+        body[..8].copy_from_slice(&index.to_le_bytes());
+        assert_eq!(log.append("app/1", body).unwrap(), Offset(index));
+        assert!(log.log.residency().1 <= DECODED_WINDOW_BYTES);
+    }
+    let check = |log: &Log| {
+        let (hot, bytes, retained) = log.log.residency();
+        assert_eq!(retained, count);
+        assert!(hot < retained && bytes <= DECODED_WINDOW_BYTES);
+        let cold_before = log.log.cold_reads();
+        for index in 0..count {
+            let index = u64::try_from(index).unwrap();
+            let records = log.read_range(Offset(index), 1).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].seq, Offset(index));
+            assert_eq!(records[0].subject, "app/1");
+            assert_eq!(&records[0].body[..8], &index.to_le_bytes());
+            assert!(records[0].body[8..].iter().all(|byte| *byte == 0xa5));
+        }
+        assert!(log.log.cold_reads() > cold_before);
+        assert!(
+            log.read_range(Offset(u64::try_from(count).unwrap()), 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(log.log.residency().1 <= DECODED_WINDOW_BYTES);
+    };
+    check(&log);
+    drop(log);
+    let mut log = Log::open(dir.path(), "long", b"pinned", true, limits).unwrap();
+    log.finish_open().unwrap();
+    check(&log);
+}
+
+/// A same-length fault in a cold frame is an error. The raw broker's empty page is the
+/// negative control: treating it as EOF would silently hide acknowledged history.
+#[test]
+fn an_unreadable_cold_record_is_not_the_end_of_the_journal() {
+    use std::os::unix::fs::FileExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut log = open(dir.path());
+    log.log.set_resident_budget(0);
+    log.append("app/1", vec![0xa5; 128]).unwrap();
+    log.append("app/1", vec![0x5a; 128]).unwrap();
+    let path = dir.path().join("test.astream");
+    let bytes = std::fs::read(&path).unwrap();
+    let at = bytes
+        .windows(32)
+        .position(|bytes| bytes == [0xa5; 32])
+        .unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(&[0], u64::try_from(at).unwrap())
+        .unwrap();
+    log.intact().unwrap();
+    assert!(log.log.read_range(Offset::ZERO, 1).is_empty());
+    assert_eq!(
+        log.read_range(Offset::ZERO, 1).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        log.read_range(Offset(1), 1).unwrap()[0].body,
+        vec![0x5a; 128]
+    );
+}
+
 #[test]
 fn writer_contention_is_typed_and_does_not_admit_a_second_writer() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -452,6 +536,151 @@ fn large_prefixes_still_verify_without_retaining_physical_bytes() {
         Committed::Unchanged
     ));
     assert_eq!(HASHES.with(std::cell::Cell::get), before + 1);
+}
+
+/// What a read handed a known prefix answered, as a reader sees it: the verdict, the records it
+/// gave, and what the new prefix counts; or the refusal's text.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    Unchanged,
+    Extended(Vec<BrokerRecord>, Acknowledged, u64, usize),
+    Rebuilt(Vec<BrokerRecord>, Acknowledged, u64, usize),
+    Refused(String),
+}
+
+/// A prefix that keeps only its digest ([`Retain::Digest`]) answers every read as one that keeps
+/// its bytes ([`Retain::Bytes`]) does: the journal unchanged, extended, rewritten in place at the
+/// same length under a checkpoint that attests the new bytes, replaced by a copy (another inode),
+/// truncated below its checkpoint, and read under narrowed limits each give the same verdict,
+/// records and prefix, or the same refusal; each new prefix keeps its bytes only where asked to.
+/// CONTROL: unchanged, the retained prefix hashes nothing and the digest-only one hashes once.
+/// NEGATIVE CONTROL: a digest-only prefix answered `Unchanged` on its identity and length alone
+/// answers the in-place rewrite `Unchanged`, where the retained one rebuilds.
+#[test]
+fn a_digest_only_prefix_answers_as_a_retained_one() {
+    type Change = fn(&Path);
+    fn none(_: &Path) {}
+    fn extend(dir: &Path) {
+        let mut log = Log::open(dir, "test", b"pinned", true, limits()).unwrap();
+        log.finish_open().unwrap();
+        log.append("app/1", vec![3; 30]).unwrap();
+    }
+    fn rewrite(dir: &Path) {
+        let journal = dir.join("test.astream");
+        substitute(&journal, 0, &[1; 30], &[9; 30]);
+        let bytes = std::fs::read(&journal).unwrap();
+        let mut checkpoint = (bytes.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend_from_slice(&aterm_digest::Sha256::digest(&bytes));
+        private_file::write_private(dir, "test.checkpoint", &checkpoint).unwrap();
+    }
+    fn copy(dir: &Path) {
+        let bytes = std::fs::read(dir.join("test.astream")).unwrap();
+        private_file::write_private(dir, "test.astream", &bytes).unwrap();
+    }
+    fn truncate(dir: &Path) {
+        let journal = OpenOptions::new()
+            .write(true)
+            .open(dir.join("test.astream"))
+            .unwrap();
+        let length = journal.metadata().unwrap().len();
+        journal.set_len(length - 1).unwrap();
+    }
+    fn answer(read: io::Result<Committed>, retain: Retain) -> Answer {
+        let prefix = |prefix: &Prefix| {
+            assert_eq!(
+                prefix.retains_bytes(),
+                retain == Retain::Bytes,
+                "a new prefix keeps its bytes only where asked to"
+            );
+            (
+                prefix.acknowledged(),
+                prefix.records(),
+                prefix.max_record_bytes,
+            )
+        };
+        match read {
+            Ok(Committed::Unchanged) => Answer::Unchanged,
+            Ok(Committed::Extended { records, prefix: p }) => {
+                let (acknowledged, count, max) = prefix(&p);
+                Answer::Extended(records, acknowledged, count, max)
+            }
+            Ok(Committed::Rebuilt { records, prefix: p }) => {
+                let (acknowledged, count, max) = prefix(&p);
+                Answer::Rebuilt(records, acknowledged, count, max)
+            }
+            Err(error) => Answer::Refused(error.to_string()),
+        }
+    }
+    let changes: [(&str, Change, Limits); 7] = [
+        ("unchanged", none, limits()),
+        ("extended", extend, limits()),
+        (
+            "rewritten in place under a new checkpoint",
+            rewrite,
+            limits(),
+        ),
+        ("replaced by a copy", copy, limits()),
+        ("truncated below its checkpoint", truncate, limits()),
+        (
+            "read under fewer records",
+            none,
+            Limits {
+                records: 1,
+                ..limits()
+            },
+        ),
+        (
+            "read under a smaller record",
+            none,
+            Limits {
+                record_bytes: 20,
+                ..limits()
+            },
+        ),
+    ];
+    let mut hashed = [0; 2];
+    for (what, change, read_under) in changes {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut log = open(dir.path());
+        log.append("app/1", vec![1; 30]).unwrap();
+        log.append("app/1", vec![2; 30]).unwrap();
+        drop(log);
+        let known = [Retain::Bytes, Retain::Digest].map(|retain| {
+            let (committed, _) =
+                read_committed_opened(dir.path(), "test", b"pinned", limits(), None, retain)
+                    .unwrap();
+            let Committed::Rebuilt { prefix, .. } = committed else {
+                panic!("a read with no known prefix replays from zero");
+            };
+            assert_eq!(prefix.retains_bytes(), retain == Retain::Bytes);
+            (retain, prefix)
+        });
+        change(dir.path());
+        let answers = known.map(|(retain, prefix)| {
+            let before = HASHES.with(std::cell::Cell::get);
+            let read = read_committed_opened(
+                dir.path(),
+                "test",
+                b"pinned",
+                read_under,
+                Some(&prefix),
+                retain,
+            )
+            .map(|(committed, _)| committed);
+            let answer = answer(read, retain);
+            (answer, HASHES.with(std::cell::Cell::get) - before)
+        });
+        assert_eq!(answers[0].0, answers[1].0, "{what}: the same answer");
+        if what == "unchanged" {
+            assert_eq!(answers[0].0, Answer::Unchanged);
+            hashed = [answers[0].1, answers[1].1];
+        }
+    }
+    assert_eq!(
+        hashed,
+        [0, 1],
+        "CONTROL: unchanged, retained bytes are compared and a digest is hashed again"
+    );
 }
 
 #[test]

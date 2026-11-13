@@ -76,7 +76,25 @@ fn the_survey_reads_every_session_of_an_instance() {
         data.starts_with("# ") && data.contains("trust=screen"),
         "{text}"
     );
-    let lines: Vec<&str> = rest.lines().collect();
+    let quota: Vec<&str> = rest
+        .lines()
+        .filter(|line| line.starts_with("  github_rate "))
+        .collect();
+    assert_eq!(
+        quota.len(),
+        2,
+        "the fresh instance reports both hourly observation windows: {text}"
+    );
+    assert!(
+        quota
+            .iter()
+            .all(|line| wire_field(line, "status").as_deref() == Some("unrecorded")),
+        "no quota history is zero use: {text}"
+    );
+    let lines: Vec<&str> = rest
+        .lines()
+        .filter(|line| !line.starts_with("  github_rate "))
+        .collect();
     assert_eq!(
         lines.len(),
         4,
@@ -106,6 +124,14 @@ fn the_survey_reads_every_session_of_an_instance() {
     );
 
     let json = survey(&inst, &["--json"]);
+    let document: aterm_json::Value = aterm_json::from_str(&json).expect("survey JSON");
+    assert_eq!(
+        document[0]["github_rate"]
+            .as_array()
+            .expect("quota rows")
+            .len(),
+        2
+    );
     assert!(json.starts_with("[{\"label\":\"pid "), "{json}");
     for sid in [&a, &b] {
         assert!(json.contains(&format!("\"sid\":\"{sid}\"")), "{json}");

@@ -184,9 +184,19 @@ pub fn main_entry(words: &[String], vendors: Option<&dyn Vendors>) -> ExitCode {
 /// it, so a product open's 2 s ([`crate::admission`]) is no measure of it: on a loaded Mac that
 /// budget refused a seed pass in 25 of 123 sealed imports. A pass that still overruns this says
 /// so, and running the import again resumes it, since each record's request id is its content's.
-/// The empty-view guard reads this Mac's retained repair history, so the deadline bounds only
-/// the passes that write.
+/// The empty-view guard reads this Mac's latest repair rounds on a bound of its own
+/// ([`OBSERVER_ANSWER`]), so this deadline bounds only the passes that write.
 const IMPORT_PASS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the empty-view guard asks a running network observer that did not answer
+/// ([`latest_rounds`]), once every [`OBSERVER_ASK`]. A running observer publishes every 2 s,
+/// its owner's waits included, so a read it refuses or that runs out of time is answered within
+/// a few periods; the guard asks again under the registry's writer, so the bound is several
+/// periods and no more.
+const OBSERVER_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause between two asks of a running observer that did not answer ([`OBSERVER_ANSWER`]).
+const OBSERVER_ASK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The key of the report's reason an import's seed pass wrote nothing.
 const SEEDS_FAILED: &str = "seeds_failed";
@@ -1276,11 +1286,68 @@ fn empty_view_catalog(paths: &Paths, ops: usize) -> Result<Option<[u8; 32]>> {
     }
 }
 
-/// [`empty_view_wait`] over this Mac's retained network history, for a registry it holds
-/// `ops` operations of, with the catalog [`empty_view_catalog`] read.
+/// This Mac's latest repair round with each peer `config`'s observer knows: the live
+/// observer's where one answers, else its retained history where that observer closed it as it
+/// stopped. A history is a checkpoint, written up to a minute after a round ends, and a round
+/// that just brought or deferred registry records must hold an import back at once
+/// ([`empty_view_guard`]): only a closed history has every round its observer saw
+/// (`network_state::read_closed_history`). An open one belongs to an observer that is running
+/// and did not answer, or that ended without closing it; either may know a later round, so it
+/// does not speak for the latest. A running observer that did not answer is asked again until
+/// it does or [`OBSERVER_ANSWER`] has passed; where none is listening
+/// (`network_state::no_live_observer`) nothing will answer, and the read fails at once.
 ///
 /// # Errors
-/// The history is there and cannot be read: whether the lab holds the registry is unknown.
+/// The history is open and no observer is listening, or one is and did not answer in time; or
+/// the history is there and cannot be read. The message says which, with the read's own error.
+fn latest_rounds(config: &Path) -> Result<aterm_types::network_state::NetworkObservation> {
+    latest_rounds_asking(
+        config,
+        std::time::Instant::now() + OBSERVER_ANSWER,
+        &mut || crate::network_state::read_live_observation(config),
+        &mut || std::thread::sleep(OBSERVER_ASK),
+    )
+}
+
+/// [`latest_rounds`] over `live`, the read of the live observer, asked again after `pause`
+/// until `until` while an observer is listening and the history is open.
+fn latest_rounds_asking(
+    config: &Path,
+    until: std::time::Instant,
+    live: &mut dyn FnMut() -> std::io::Result<aterm_types::network_state::NetworkObservation>,
+    pause: &mut dyn FnMut(),
+) -> Result<aterm_types::network_state::NetworkObservation> {
+    loop {
+        let error = match live() {
+            Ok(live) => return Ok(live),
+            Err(error) => error,
+        };
+        if let Some(closed) = crate::network_state::read_closed_history(config)? {
+            return Ok(closed);
+        }
+        if crate::network_state::no_live_observer(&error) {
+            return Err(Error::new(&format!(
+                "no running aterm answers for its network observation ({error}) and the \
+                 network history was left open by one that ended without quitting; start aterm \
+                 and import again"
+            )));
+        }
+        if std::time::Instant::now() >= until {
+            return Err(Error::new(&format!(
+                "the running aterm did not answer for its network observation ({error}) and \
+                 its network history is open; import again"
+            )));
+        }
+        pause();
+    }
+}
+
+/// [`empty_view_wait`] over this Mac's latest repair rounds ([`latest_rounds`]), for a registry
+/// it holds `ops` operations of, with the catalog [`empty_view_catalog`] read.
+///
+/// # Errors
+/// The rounds cannot be read: whether the lab holds the registry is unknown. The message keeps
+/// why ([`latest_rounds`]).
 fn empty_view_guard(
     paths: &Paths,
     ops: usize,
@@ -1293,8 +1360,10 @@ fn empty_view_guard(
     let Some(config) = aterm_types::dirs::aterm_config_path() else {
         return Ok(());
     };
-    let network = crate::network_state::read_history(&config).map_err(|_| {
-        Error::new("this Mac holds none of the registry and cannot read whether its peers do")
+    let network = latest_rounds(&config).map_err(|error| {
+        Error::new(&format!(
+            "this Mac holds none of the registry and cannot read whether its peers do: {error}"
+        ))
     })?;
     let table = Registry::at(paths.clone()).table().ok().flatten();
     let peers = network.peers.iter().map(|peer| peer.last_repair.as_ref());

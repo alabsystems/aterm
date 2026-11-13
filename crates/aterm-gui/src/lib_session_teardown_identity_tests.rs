@@ -276,7 +276,7 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
     adopted.handoff_commit = Some(Arc::new(crate::shell_rekey::Deferred::holding()));
     pool.insert(adopted);
 
-    pool.retire_at_quit();
+    pool.retire_at_quit(&[]);
     let settled = aterm_pty::wait_for_reaps(Duration::from_secs(60));
     let deadline = Instant::now() + Duration::from_secs(60);
     while running(&mut holdout) && Instant::now() < deadline {
@@ -297,6 +297,54 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
     assert!(
         kept,
         "the final exit hung up a shell the predecessor still owns"
+    );
+}
+
+/// A session this process left to the keeper (`Session::leave_to_keeper`, the Mac Setup tab's
+/// installer a quit carries) outlives the final exit's hang-up and its own drop.
+///
+/// NEGATIVE CONTROL: its pool sibling, not left to the keeper, is hung up.
+#[cfg(unix)]
+#[test]
+fn a_session_left_to_the_keeper_outlives_the_final_exit() {
+    let mut installer = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .setsid(true)
+        .spawn()
+        .expect("the installer stand-in must spawn");
+    let mut shell = setsid_sleep();
+    let mut pool = SessionPool::default();
+    let mut carried = stub_session(1);
+    carried.pid = i32::try_from(installer.id()).expect("pid fits i32");
+    carried.shell_identity = aterm_pty::record_spawned_shell(carried.pid);
+    pool.insert(carried);
+    let mut sibling = stub_session(2);
+    sibling.pid = i32::try_from(shell.id()).expect("pid fits i32");
+    sibling.shell_identity = aterm_pty::record_spawned_shell(sibling.pid);
+    pool.insert(sibling);
+    pool.get(1).expect("the carried session").leave_to_keeper();
+
+    pool.retire_at_quit(&[1]);
+    drop(pool);
+    let settled = aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN);
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while running(&mut shell) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let hung_up = !running(&mut shell);
+    let kept = running(&mut installer);
+    for child in [&mut installer, &mut shell] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(settled, "the reaps never settled");
+    assert!(
+        hung_up,
+        "CONTROL: the final exit hangs up a session it does not leave to the keeper"
+    );
+    assert!(
+        kept,
+        "the final exit hung up the installer it left to the keeper"
     );
 }
 
@@ -449,7 +497,7 @@ fn quitting_retires_each_master_it_hangs_up_so_a_handler_reading_its_terminal_en
     pool.insert(tab);
     pool.insert(adopted);
 
-    pool.retire_at_quit();
+    pool.retire_at_quit(&[]);
     let ended = aterm_spec::wait::within(
         aterm_spec::wait::MUST_HAPPEN,
         Duration::from_millis(5),

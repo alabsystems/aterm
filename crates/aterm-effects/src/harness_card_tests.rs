@@ -1916,6 +1916,45 @@ fn light_builtins() -> Vec<(&'static str, u32)> {
         .collect()
 }
 
+/// Ground polarity belongs to the product, including midtones between ordinary night and
+/// paper themes. The leading star uses the same polarity when choosing light or print ink.
+#[test]
+fn card_and_ink_agree_on_every_builtin_ground() {
+    use aterm_types::scheme::{builtin, builtin_names};
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    let grounds = builtin_names()
+        .into_iter()
+        .map(|name| rgb(builtin(name).unwrap().background))
+        .chain(aterm_theme_pack::themes().iter().map(|theme| {
+            rgb(aterm_types::scheme::parse_theme_str(theme.text)
+                .unwrap()
+                .scheme
+                .background)
+        }))
+        .chain((0..=255).map(|gray| [gray; 3]))
+        .chain([[112, 128, 144], [160, 100, 80], [60, 140, 100]]);
+    for bg in grounds {
+        let ground = (u32::from(bg[0]) << 16) | (u32::from(bg[1]) << 8) | u32::from(bg[2]);
+        let dark = !aterm_messages::ink::bg_is_light(bg);
+        assert_eq!(
+            dark,
+            aterm_messages::ink::contrast([255; 3], bg)
+                >= aterm_messages::ink::contrast([0; 3], bg),
+            "ground {ground:06x} chooses the ink with greater contrast"
+        );
+        assert_eq!(dark_ground(ground), dark, "ground {ground:06x}");
+        assert_eq!(
+            line_star(WHITE, ground).1,
+            if dark {
+                DecoBlend::Add
+            } else {
+                DecoBlend::Over
+            },
+            "the leading star's blend on {ground:06x}"
+        );
+    }
+}
+
 fn light_letters(palette: CardPalette, ground: u32) -> Vec<u32> {
     let t0 = Instant::now();
     let mut card = HarnessCard::default();
@@ -2121,15 +2160,14 @@ fn dark_theme_grounds() -> Vec<(String, u32)> {
         .collect()
 }
 
-/// The grounds [`dark_ground`] calls dark on which black reads at least as well as white: a
-/// grey every few steps from that polarity to the cut, a hue every 30° at mid value, the mid
-/// grounds imported themes bring (Silver Aerogel `#929292`, Unikitty `#ff8cd9`), and
-/// [`RASPBERRY`], on which a glint's flare reaches a light that reads.
-fn mid_grounds() -> Vec<u32> {
+/// Adversarial grounds for the low-level light-to-print fallback: black reads at least as
+/// well as white. These tests deliberately request light-emitting stars on those grounds,
+/// independently of the product's polarity decision, to exercise the fallback itself.
+fn print_fallback_grounds() -> Vec<u32> {
     let mut grounds: Vec<u32> = (0..=255u32).step_by(3).map(|v| v * 0x0001_0101).collect();
     grounds.extend((0..12u8).map(|k| crate::color_math::hsv2rgb(f32::from(k) * 30.0, 0.6, 0.8)));
     grounds.extend([AEROGEL, UNIKITTY, RASPBERRY]);
-    grounds.retain(|&g| dark_ground(g) && contrast(0, g) >= contrast(WHITE, g));
+    grounds.retain(|&g| contrast(0, g) >= contrast(WHITE, g));
     grounds
 }
 
@@ -2255,13 +2293,13 @@ fn every_dark_builtin_and_pack_theme_keeps_its_stars_or_lifts_them() {
     );
 }
 
-/// On every mid ground ([`mid_grounds`]) each star the frame lays reads [`MARK_CONTRAST`] at
+/// On every adversarial print ground ([`print_fallback_grounds`]) each star reads [`MARK_CONTRAST`] at
 /// a settled star's strength, and some print; a printed field star still twinkles, its
 /// coverage running under and up to [`STAR_PRINT_FULL`], which the settled star prints at.
 /// Negative control: the unchecked light misses the floor on Silver Aerogel.
 #[test]
-fn the_stars_read_on_every_mid_ground() {
-    let grounds = mid_grounds();
+fn light_emitting_stars_read_on_print_grounds() {
+    let grounds = print_fallback_grounds();
     assert!(grounds.len() >= 20, "{grounds:06x?}");
     let clocks = star_clocks();
     let (mut lows, mut printed) = (Vec::new(), 0usize);
@@ -2357,7 +2395,7 @@ fn the_lines_star_is_the_cards_mark_on_every_ground() {
             seen += 1;
         }
     }
-    for g in mid_grounds() {
+    for g in print_fallback_grounds() {
         for c in letters(g) {
             let k = reads(line_star(c, g), g);
             if k < MARK_CONTRAST {
@@ -2420,7 +2458,7 @@ fn the_stars_print_where_no_light_reads() {
     assert!(stars > 1_000, "CONTROL: {stars} stars");
 }
 
-/// On every mid ground the glints the frame lays ([`Emit::laid_glints`]) are all added light
+/// On every adversarial print ground the glints ([`Emit::laid_glints`]) are all added light
 /// where their rest light is ([`dark_mark`]), else all print the rest's floored ink, both
 /// seen. Negative control: on [`RASPBERRY`], glints laid frame by frame on their flared light
 /// ([`StarCall::laid_on`]) take both polarities.
@@ -2438,7 +2476,7 @@ fn a_glint_keeps_one_polarity_through_its_flare() {
         calls
     };
     let (mut seen, mut printed, mut wrong) = (0usize, 0usize, Vec::new());
-    for g in mid_grounds() {
+    for g in print_fallback_grounds() {
         for s in dark_scenes_on(g) {
             let rest = dark_mark(s.palette.glint_rest(), g);
             for &clock in &clocks {

@@ -51,7 +51,7 @@ pub const COLS: u16 = 512;
 /// verdict, the capture stops ([`Error::Output`]).
 pub const BUFFER: usize = 256 * 1024;
 
-/// A setup-token's lifetime as Claude Code asks for it (365 days), and the owner's rule for a
+/// A setup-token's lifetime as Claude Code asks for it (365 days), and the rule for a
 /// token whose lifetime it did not print: mint time plus this.
 pub const LIFETIME: u64 = 31_536_000;
 

@@ -5,6 +5,25 @@
 
 use super::*;
 
+/// [`line_fixture_waiting`] no key reaches while a command runs: each of its waits ends at once.
+fn line_fixture(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    mode: LineMode,
+    size: impl FnMut() -> Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    line_fixture_waiting(input, output, mode, size, &mut |_| Ok(false))
+}
+
+/// The `typing` scenario's fixture.
+fn typing_fixture(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    size: impl FnMut() -> Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    line_fixture(input, output, LineMode::Typing, size)
+}
+
 fn typed_terminal(keys: &[u8]) -> aterm_core::terminal::Terminal {
     typed_terminal_at(keys, 72)
 }
@@ -260,7 +279,7 @@ fn compiled_gallery_programs_preserve_an_occupied_script_and_argument_boundaries
     let root = crate::test_scratch_dir("compiled");
     let lab = root.path().join("lab with spaces");
     let script = root.path().join("paint.sh");
-    let typing = gallery_program(root.path(), Scenario::Typing, Theme::Light, &lab).unwrap();
+    let typing = gallery_program(root.path(), Scenario::Typing, Theme::Light, None, &lab).unwrap();
     assert_eq!(
         typing,
         vec![
@@ -285,7 +304,7 @@ fn compiled_gallery_programs_preserve_an_occupied_script_and_argument_boundaries
         (Scenario::Flood, Some("flood")),
         (Scenario::RailG, Some("rail-g")),
     ] {
-        let args = gallery_program(root.path(), scenario, Theme::Dark, &lab).unwrap();
+        let args = gallery_program(root.path(), scenario, Theme::Dark, None, &lab).unwrap();
         assert_eq!(args[0], lab.to_string_lossy().as_ref());
         assert_eq!(args[1], "__trail-redraw-fixture");
         assert_eq!(args.get(2).map(String::as_str), mode);
@@ -518,7 +537,7 @@ fn an_interrupted_hold_is_released_without_recording() {
 #[test]
 fn a_requested_rainbow_return_losing_eligibility_is_inconclusive() {
     let live = "trail resolved=rainbow-kitty config_enabled=true effective=true intensity=1.00 ribbon_segments=12 ribbon_drawn=30";
-    let expected = expects_rainbow(&config_lines("rainbow kitty pet", Theme::Dark, &[])).unwrap();
+    let expected = expects_rainbow(&config_lines("rainbow", Theme::Dark, &[])).unwrap();
     assert!(expected);
     let mut wrongly_measured = Vec::new();
     for (loss, line) in [
@@ -609,68 +628,27 @@ fn a_return_without_a_live_rainbow_is_inconclusive_but_other_styles_are_not() {
 #[test]
 fn rainbow_measurement_intent_uses_the_final_config_and_shared_style_and_motion_parsers() {
     for (style, extra, expected) in [
-        ("rainbow kitty pet", None, true),
-        ("nyan", None, true),
+        ("rainbow", None, true),
         ("off", None, false),
         ("comet", None, false),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_style = 'comet'"),
-            false,
-        ),
-        (
-            "comet",
-            Some("cursor_trail_style = 'rainbow kitty pet'"),
-            true,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_style = 'off'"),
-            false,
-        ),
-        ("rainbow kitty pet", Some("cursor_trail = false"), false),
-        ("rainbow kitty pet", Some("motion = ' REDUCE '"), false),
+        ("rainbow", Some("cursor_trail_style = 'comet'"), false),
+        ("comet", Some("cursor_trail_style = 'rainbow'"), true),
+        ("rainbow", Some("cursor_trail_style = 'off'"), false),
+        ("rainbow", Some("cursor_trail = false"), false),
+        ("rainbow", Some("motion = ' REDUCE '"), false),
         // `off` and `none` ask for no motion: the shared parser reads them as
         // Reduced (settings demo round 3), so no rainbow is expected.
-        ("rainbow kitty pet", Some("motion = 'off'"), false),
-        ("rainbow kitty pet", Some("motion = 'none'"), false),
-        ("rainbow kitty pet", Some("motion = 'unknown'"), true),
-        ("rainbow kitty pet", Some("serious_mode = true"), false),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = 0"),
-            false,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = 0.0"),
-            false,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = -1.0"),
-            false,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = nan"),
-            false,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = inf"),
-            false,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = 0.1"),
-            true,
-        ),
-        (
-            "rainbow kitty pet",
-            Some("cursor_trail_intensity = 2"),
-            true,
-        ),
+        ("rainbow", Some("motion = 'off'"), false),
+        ("rainbow", Some("motion = 'none'"), false),
+        ("rainbow", Some("motion = 'unknown'"), true),
+        ("rainbow", Some("serious_mode = true"), false),
+        ("rainbow", Some("cursor_trail_intensity = 0"), false),
+        ("rainbow", Some("cursor_trail_intensity = 0.0"), false),
+        ("rainbow", Some("cursor_trail_intensity = -1.0"), false),
+        ("rainbow", Some("cursor_trail_intensity = nan"), false),
+        ("rainbow", Some("cursor_trail_intensity = inf"), false),
+        ("rainbow", Some("cursor_trail_intensity = 0.1"), true),
+        ("rainbow", Some("cursor_trail_intensity = 2"), true),
     ] {
         let extra: Vec<String> = extra.into_iter().map(str::to_owned).collect();
         let config = config_lines(style, Theme::Dark, &extra);
@@ -678,6 +656,9 @@ fn rainbow_measurement_intent_uses_the_final_config_and_shared_style_and_motion_
     }
     for extra in [
         "cursor_trail_style = 'unknown'",
+        // A retired name is no style.
+        "cursor_trail_style = 'nyan'",
+        "cursor_trail_style = 'rainbow kitty pet'",
         "cursor_trail_style = 7",
         "cursor_trail = 'false'",
         "motion = false",
@@ -685,7 +666,7 @@ fn rainbow_measurement_intent_uses_the_final_config_and_shared_style_and_motion_
         "cursor_trail_intensity = '0'",
         "cursor_trail_intensity = [",
     ] {
-        let config = config_lines("rainbow kitty pet", Theme::Dark, &[extra.into()]);
+        let config = config_lines("rainbow", Theme::Dark, &[extra.into()]);
         assert!(expects_rainbow(&config).is_err(), "{config:?}");
     }
 }
@@ -721,7 +702,7 @@ fn options_go_anywhere_and_scenarios_repeat_in_order_once() {
         "phaser",
         "--theme",
         "light",
-        "rainbow kitty pet",
+        "classic mono",
         "--scenario",
         "typing,cjk",
         "--extra",
@@ -733,7 +714,7 @@ fn options_go_anywhere_and_scenarios_repeat_in_order_once() {
         "/b/aterm",
     ]))
     .unwrap();
-    assert_eq!(a.styles, vec!["phaser", "rainbow kitty pet"]);
+    assert_eq!(a.styles, vec!["phaser", "classic mono"]);
     assert_eq!(a.themes, vec![Theme::Light]);
     assert_eq!(
         a.scenarios,
@@ -799,10 +780,16 @@ fn an_extra_line_replaces_the_base_line_of_its_key() {
         base,
         vec![
             "cursor_trail_style = \"phaser\"",
+            "cursor_pet = \"cat\"",
             "motion = \"full\"",
             "trail_sounds = false",
         ]
     );
+    // The pet is named, the default unless an extra names another: a scratch file that
+    // names a style and no pet would be migrated to the pet that style once had.
+    let dog = config_lines("fire", Theme::Dark, &["cursor_pet = \"dog\"".to_string()]);
+    let pets: Vec<&String> = dog.iter().filter(|l| toml_key(l) == "cursor_pet").collect();
+    assert_eq!(pets, vec!["cursor_pet = \"dog\""]);
     let light = config_lines("fire", Theme::Light, &["motion=\"reduced\"".to_string()]);
     assert!(light.contains(&"theme = \"GitHub Light\"".to_string()));
     let motions: Vec<&String> = light.iter().filter(|l| toml_key(l) == "motion").collect();
@@ -815,8 +802,8 @@ fn names_are_the_audit_gallerys() {
     assert_eq!(slug("Rainbow Kitty: pet"), "rainbow-kitty--pet");
     assert_eq!(slug("classic mono"), "classic-mono");
     assert_eq!(
-        instance_name("rainbow kitty pet", Theme::Dark, Scenario::Typing),
-        "rainbow-kitty-pet-dark"
+        instance_name("classic mono", Theme::Dark, Scenario::Typing),
+        "classic-mono-dark"
     );
     assert_eq!(
         instance_name("off", Theme::Light, Scenario::EnterBottom),
@@ -831,7 +818,7 @@ fn names_are_the_audit_gallerys() {
 fn every_paint_ends_in_an_interactive_shell_and_context_paints_its_theme() {
     for s in Scenario::ALL {
         for t in [Theme::Dark, Theme::Light] {
-            let p = paint(s, t);
+            let p = paint(s, t, None);
             assert!(
                 p.starts_with("LC_ALL=en_US.UTF-8; export LC_ALL\n"),
                 "{s:?}"
@@ -839,19 +826,19 @@ fn every_paint_ends_in_an_interactive_shell_and_context_paints_its_theme() {
             assert!(p.ends_with("\nexec /bin/sh -i\n"), "{s:?}");
         }
     }
-    assert!(paint(Scenario::Context, Theme::Dark).contains("\\033[48;2;51;65;94m"));
-    assert!(paint(Scenario::Context, Theme::Light).contains("\\033[48;2;182;227;255m"));
-    assert!(!paint(Scenario::Context, Theme::Light).contains("@SEL@"));
+    assert!(paint(Scenario::Context, Theme::Dark, None).contains("\\033[48;2;51;65;94m"));
+    assert!(paint(Scenario::Context, Theme::Light, None).contains("\\033[48;2;182;227;255m"));
+    assert!(!paint(Scenario::Context, Theme::Light, None).contains("@SEL@"));
 }
 
 #[test]
 fn the_roster_is_the_pickers_options() {
     let prefs = "field key=cursor_trail_enabled label=\"Trail\" value=\"true\"\n\
                  field key=cursor_trail_style label=\"Cursor style\" value=\"beam\" effective=\"Beam\" kind=enum \
-                 options=[off,rainbow kitty pet,phaser,classic] visible=true\n";
+                 options=[off,rainbow,phaser,classic] visible=true\n";
     assert_eq!(
         roster_of(prefs),
-        Some(args(&["off", "rainbow kitty pet", "phaser", "classic"]))
+        Some(args(&["off", "rainbow", "phaser", "classic"]))
     );
     assert_eq!(roster_of("field key=cursor_trail_style options=[]"), None);
     assert_eq!(roster_of("nothing here"), None);
@@ -1024,12 +1011,12 @@ fn burst_frames_are_named_for_their_time() {
         "the start's frames come before `fly`"
     );
     assert_eq!(
-        instance_name("nyan rainbow", Theme::Dark, Scenario::Burst),
-        "nyan-rainbow-dark-burst"
+        instance_name("classic mono", Theme::Dark, Scenario::Burst),
+        "classic-mono-dark-burst"
     );
     assert_eq!(
-        paint(Scenario::Burst, Theme::Dark),
-        paint(Scenario::Typing, Theme::Dark)
+        paint(Scenario::Burst, Theme::Dark, None),
+        paint(Scenario::Typing, Theme::Dark, None)
     );
 }
 
@@ -1119,8 +1106,8 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
         "classic-light-move-up"
     );
     assert_eq!(
-        instance_name("rainbow kitty pet", Theme::Dark, Scenario::Split),
-        "rainbow-kitty-pet-dark-split"
+        instance_name("classic mono", Theme::Dark, Scenario::Split),
+        "classic-mono-dark-split"
     );
     for label in SPLIT_BURST_FRAMES {
         assert!(
@@ -1128,7 +1115,7 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
             "{label} is a typing frame's"
         );
     }
-    let page = paint(Scenario::MoveUp, Theme::Light);
+    let page = paint(Scenario::MoveUp, Theme::Light, None);
     let program = format!("printf '[vim] {MOVE_UP_MARK}\\033[{MOVE_UP_ROWS}A");
     assert!(page.contains(&program), "{page}");
     let held = &page[page.find(&program).expect("the move")..];
@@ -1143,7 +1130,10 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
         "the move crosses lettered rows: {lettered}"
     );
     for s in Scenario::ALL.into_iter().filter(|&s| s != Scenario::MoveUp) {
-        assert!(!paint(s, Theme::Light).contains(MOVE_UP_MARK), "{s:?}");
+        assert!(
+            !paint(s, Theme::Light, None).contains(MOVE_UP_MARK),
+            "{s:?}"
+        );
     }
 }
 
@@ -1629,7 +1619,7 @@ fn last_row_types_on_the_grids_last_row_under_full_and_ragged_rows() {
         );
     }
     assert_eq!(
-        paint(Scenario::EnterBottom, Theme::Dark),
+        paint(Scenario::EnterBottom, Theme::Dark, None),
         format!("{PAINT_HEAD}seq 1 40\nexec /bin/sh -i\n"),
         "control: enter-bottom's rows are a command's short numbers"
     );
@@ -1710,4 +1700,257 @@ fn a_card_reply_names_the_frames_sidecars() {
     let grid = crate::trail_contrast::grid_from_dims(get("dims.txt").unwrap()).expect("a grid");
     assert_eq!((grid.ox, grid.oy, grid.cw, grid.ch), (10, 20, 9, 16));
     assert!(card_sidecars("OK 1\ncursor OK 1 2 1 steady_block\n").is_err());
+}
+
+/// What a line fixture in `mode` leaves on a 14 by `cols` terminal after `keys`, a key
+/// waiting within every wait when `key_waits`.
+fn resident_terminal(
+    mode: LineMode,
+    keys: &[u8],
+    cols: u16,
+    key_waits: bool,
+) -> aterm_core::terminal::Terminal {
+    let mut output = Vec::new();
+    line_fixture_waiting(
+        &mut std::io::Cursor::new(keys),
+        &mut output,
+        mode,
+        || Some((14, cols)),
+        &mut |_| Ok(key_waits),
+    )
+    .unwrap();
+    let mut term = aterm_core::terminal::Terminal::new(14, cols);
+    term.process(&output);
+    term
+}
+
+#[test]
+fn bottom_prompt_types_on_the_last_row_of_a_shell_s_full_page() {
+    let mut term = resident_terminal(LineMode::BottomPrompt, RESIDENT_TEXT.as_bytes(), 72, false);
+    for (row, text) in crate::trail_scenes::SHELL_ROWS.iter().enumerate() {
+        assert_eq!(term.row_text(row).as_deref(), Some(*text), "row {row}");
+    }
+    assert_eq!(term.row_text(13), Some(format!("$ {RESIDENT_TEXT}")));
+    let frame = term.cell_frame(14, 72);
+    assert_eq!(
+        (frame.cursor_row, frame.cursor_col),
+        (13, 2 + RESIDENT_TEXT.len())
+    );
+    // The row over the prompt is a command's output and reaches past the typed line's end.
+    assert!(crate::trail_scenes::SHELL_ROWS[12].len() > 2 + RESIDENT_TEXT.len());
+    // A narrow grid cuts the page at its last column and keeps the prompt on the last row.
+    let narrow = resident_terminal(LineMode::BottomPrompt, b"ab", 40, false);
+    assert_eq!(
+        narrow.row_text(12).as_deref(),
+        Some(&crate::trail_scenes::SHELL_ROWS[12][..40])
+    );
+    assert_eq!(narrow.row_text(13).as_deref(), Some("$ ab"));
+}
+
+#[test]
+fn a_shell_line_s_return_runs_one_of_the_scenes_commands_between_marks() {
+    assert_eq!(ENTER_LONG_TEXT.len(), 40);
+    let mut keys = ENTER_LONG_TEXT.as_bytes().to_vec();
+    keys.push(b'\r');
+    let term = resident_terminal(LineMode::BottomPrompt, &keys, 72, false);
+    assert_eq!(term.row_text(11), Some(format!("$ {ENTER_LONG_TEXT}")));
+    assert_eq!(
+        term.row_text(12).as_deref(),
+        Some(&ENTER_LONG_TEXT["echo ".len()..])
+    );
+    assert_eq!(term.row_text(13).as_deref(), Some("$ "));
+    let exit = |keys: &[u8], key_waits| {
+        resident_terminal(LineMode::BottomPrompt, keys, 72, key_waits)
+            .last_completed_command()
+            .and_then(|command| command.exit_code)
+    };
+    assert_eq!(exit(&keys, false), Some(0));
+    for (_, command, _, code) in VERDICT_COMMANDS {
+        let keys = format!("{command}\r");
+        assert_eq!(
+            exit(keys.as_bytes(), false),
+            Some(i32::from(code)),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        exit(b"rm -rf /\r", false),
+        Some(127),
+        "no line reaches a shell"
+    );
+    // A Ctrl-C that arrives while the sleep runs ends it with 130 and the fixture goes on.
+    let interrupted = format!("{VERDICT_INTERRUPTED}\r\x03ok");
+    let term = resident_terminal(LineMode::BottomPrompt, interrupted.as_bytes(), 72, true);
+    assert_eq!(
+        term.last_completed_command().and_then(|c| c.exit_code),
+        Some(130)
+    );
+    assert_eq!(term.row_text(12).as_deref(), Some("^C"));
+    assert_eq!(term.row_text(13).as_deref(), Some("$ ok"));
+    // The build writes its lines and ends green.
+    let build = format!("{BUILD_COMMAND}\r");
+    let term = resident_terminal(LineMode::BottomPrompt, build.as_bytes(), 72, false);
+    assert_eq!(
+        term.last_completed_command().and_then(|c| c.exit_code),
+        Some(0)
+    );
+    assert!(
+        term.row_text(11)
+            .is_some_and(|row| row.contains("Compiling aterm-crate-39")),
+        "{:?}",
+        term.row_text(11)
+    );
+    assert!(
+        term.row_text(12)
+            .is_some_and(|row| row.contains("Finished"))
+    );
+}
+
+#[test]
+fn the_composer_is_claude_code_s_box_and_repaints_its_row_at_each_key() {
+    use crate::trail_scenes::{COMPOSER_FOOT, COMPOSER_TRANSCRIPT};
+    let mut term = resident_terminal(LineMode::Composer, RESIDENT_TEXT.as_bytes(), 72, false);
+    let rule = "\u{2500}".repeat(72);
+    // Fourteen rows keep the transcript's last eight, then a blank row, as Claude Code leaves
+    // one between its last message and the box.
+    for (row, text) in COMPOSER_TRANSCRIPT[2..].iter().enumerate() {
+        assert_eq!(term.row_text(row).as_deref(), Some(*text), "row {row}");
+    }
+    assert_eq!(term.row_text(8).as_deref(), Some(""));
+    assert_eq!(term.row_text(9).as_deref(), Some(rule.as_str()));
+    assert_eq!(
+        term.row_text(10),
+        Some(format!("{COMPOSER_PROMPT}{RESIDENT_TEXT}"))
+    );
+    assert_eq!(term.row_text(11).as_deref(), Some(rule.as_str()));
+    assert_eq!(term.row_text(12).as_deref(), Some(COMPOSER_FOOT[0]));
+    assert_eq!(term.row_text(13).as_deref(), Some(COMPOSER_FOOT[1]));
+    let frame = term.cell_frame(14, 72);
+    assert_eq!(
+        (frame.cursor_row, frame.cursor_col),
+        (10, 2 + RESIDENT_TEXT.len())
+    );
+    // The rules and the rows under the box are grey, the typed line the page's own ink:
+    // drawn in the default ink, the rules were the brightest thing on a dark page.
+    let ink = |row: usize, col: usize| frame.cells[row][col].fg;
+    assert_eq!(ink(9, 0), [0x88; 3]);
+    assert_eq!(ink(11, 71), [0x88; 3]);
+    assert_eq!(ink(12, 2), [0x99; 3]);
+    assert_eq!(ink(13, 5), [0x99; 3]);
+    assert_ne!(ink(10, 4), [0x88; 3]);
+    assert_ne!(ink(10, 4), [0x99; 3]);
+    // A Backspace and a Return repaint the row alone: the rules and the rows under them stay.
+    let term = resident_terminal(LineMode::Composer, b"abc\x7f\rxy", 72, false);
+    assert_eq!(term.row_text(10), Some(format!("{COMPOSER_PROMPT}xy")));
+    assert_eq!(term.row_text(9).as_deref(), Some(rule.as_str()));
+    assert_eq!(term.row_text(11).as_deref(), Some(rule.as_str()));
+    assert_eq!(term.row_text(12).as_deref(), Some(COMPOSER_FOOT[0]));
+    assert_eq!(term.row_text(13).as_deref(), Some(COMPOSER_FOOT[1]));
+}
+
+#[test]
+fn home_and_end_move_the_caret_along_the_typed_line() {
+    let at = |keys: &[u8]| {
+        let mut term = typed_terminal(keys);
+        let row = term.row_text(4).unwrap_or_default();
+        let frame = term.cell_frame(14, 72);
+        (frame.cursor_row, frame.cursor_col, row)
+    };
+    let line = format!("$ {RESIDENT_TEXT}");
+    let end = 2 + RESIDENT_TEXT.len();
+    let home = [RESIDENT_TEXT.as_bytes(), b"\x1b[H"].concat();
+    assert_eq!(at(&home), (4, 2, line.clone()));
+    assert_eq!(at(&[&home[..], b"\x1b[F"].concat()), (4, end, line.clone()));
+    // The application-keypad spellings, and a key typed from Home lands at the line's end.
+    let ss3 = [RESIDENT_TEXT.as_bytes(), b"\x1bOH\x1bOF"].concat();
+    assert_eq!(at(&ss3), (4, end, line.clone()));
+    assert_eq!(
+        at(&[&home[..], b"!"].concat()),
+        (4, end + 1, format!("{line}!"))
+    );
+}
+
+#[test]
+fn the_coloured_prompt_inks_each_word_and_shows_the_suggestion_s_rest_in_grey() {
+    let typed = &COLOURED_PROMPT_TEXT[.."git commit -m 'qu".len()];
+    let mut term = resident_terminal(LineMode::ColouredPrompt, typed.as_bytes(), 72, false);
+    assert_eq!(term.row_text(13), Some(format!("$ {COLOURED_PROMPT_TEXT}")));
+    let frame = term.cell_frame(14, 72);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (13, 2 + typed.len()));
+    let row = &frame.cells[13];
+    let ink = |col: usize| row[col].fg;
+    let (command, option, quote) = (
+        ink(2),
+        ink(2 + "git commit ".len()),
+        ink(2 + typed.len() - 1),
+    );
+    let ghost = ink(2 + typed.len());
+    assert_ne!(command, option);
+    assert_ne!(option, quote);
+    assert_eq!(
+        ink(2 + "git ".len()),
+        option,
+        "a parameter and an option share an ink"
+    );
+    assert_ne!(ghost, quote);
+    assert_eq!(ghost, ink(2 + COLOURED_PROMPT_TEXT.len() - 1));
+    // A line that leaves the suggestion shows none.
+    let off = resident_terminal(LineMode::ColouredPrompt, b"ls", 72, false);
+    assert_eq!(off.row_text(13).as_deref(), Some("$ ls"));
+}
+
+#[test]
+fn a_caret_is_named_set_by_the_program_and_added_to_the_instance_s_name() {
+    let none = parse_args(&args(&["/x/g"])).unwrap();
+    assert!(none.carets.is_empty());
+    let both = parse_args(&args(&[
+        "--caret",
+        "both",
+        "/x/g",
+        "--caret",
+        "underline,bar",
+    ]))
+    .unwrap();
+    assert_eq!(
+        both.carets,
+        vec![Caret::Block, Caret::Bar, Caret::Underline]
+    );
+    assert_eq!(
+        parse_args(&args(&["--caret", "all", "/x/g"]))
+            .unwrap()
+            .carets,
+        Caret::ALL.to_vec()
+    );
+    assert_eq!(
+        parse_args(&args(&["--caret", "beam", "/x/g"]))
+            .unwrap_err()
+            .code,
+        2
+    );
+    assert!(
+        paint(Scenario::Context, Theme::Dark, Some(Caret::Bar)).contains("printf '\\033[6 q'\n")
+    );
+    assert!(!paint(Scenario::Context, Theme::Dark, None).contains(" q'"));
+    let root = crate::test_scratch_dir("caret");
+    let lab = root.path().join("lab");
+    for (scenario, mode) in [
+        (Scenario::BottomPrompt, "bottom-prompt"),
+        (Scenario::EnterLong, "bottom-prompt"),
+        (Scenario::Wall, "bottom-prompt"),
+        (Scenario::Verdict, "bottom-prompt"),
+        (Scenario::LongBuild, "bottom-prompt"),
+        (Scenario::Composer, "composer"),
+        (Scenario::ColouredPrompt, "coloured-prompt"),
+        (Scenario::Jump, "typing"),
+    ] {
+        let plain = gallery_program(root.path(), scenario, Theme::Dark, None, &lab).unwrap();
+        assert_eq!(plain[2..], [mode.to_string()], "{scenario:?}");
+        let bar =
+            gallery_program(root.path(), scenario, Theme::Dark, Some(Caret::Bar), &lab).unwrap();
+        assert_eq!(bar[2..], [mode.to_string(), "caret=bar".to_string()]);
+    }
+    assert_eq!(Scenario::Wall.grid(), (WALL_COLUMNS, 14, 22));
+    assert_eq!("$ ".len() + BURST_TEXT.len() + 2, WALL_COLUMNS as usize);
+    let wall = parse_args(&args(&["--scenario", "wall", "--columns", "70", "/x/g"])).unwrap();
+    assert_eq!(Scenario::Wall.configured_grid(&wall), (70, 14, 22));
 }

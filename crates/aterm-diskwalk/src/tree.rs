@@ -21,7 +21,9 @@ pub struct Sums {
     pub logical: u64,
     /// Σ allocated of single-link files.
     pub released_floor: u64,
-    /// Σ private size / link count (macOS clones), or `None` when not sampled.
+    /// Σ private size / link count (macOS clones), or `None` when not sampled, or when it cannot
+    /// be told: a Windows volume whose files can share blocks (ReFS) says nothing of how much
+    /// of a file's allocation is its own.
     pub private: Option<u64>,
     /// Σ logical size of cloud placeholders (0 allocated).
     pub dataless_logical: u64,
@@ -199,7 +201,7 @@ impl Tree {
     }
 
     /// Add a child directory record (not yet walked).
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn push_child(&mut self, parent: DirId, name: &[u8], ino: u64) -> DirId {
         let name_at = u32::try_from(self.names.len()).unwrap_or(u32::MAX);
         self.names.extend_from_slice(name);
@@ -222,7 +224,7 @@ impl Tree {
         id
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     #[inline]
     pub(crate) fn rec_mut(&mut self, id: DirId) -> &mut DirRec {
         &mut self.dirs[id.ix()]

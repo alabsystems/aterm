@@ -1386,6 +1386,9 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
                 Some(&code),
             );
             fleet_ok(tmp, &["allow", "drive", "--all"], None);
+            // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+            // person would, rather than read as anything but the Read Only default.
+            fleet_ok(tmp, &["access", "full"], None);
             std::fs::create_dir_all(tmp.join("work")).unwrap();
             std::fs::create_dir_all(tmp.join("home/work")).unwrap();
             cmd.env("SHELL", "/bin/zsh")
@@ -1398,9 +1401,88 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     fleet_reads(&member, &original, "listening");
     let target = format!("127.0.0.1:{member_port}");
     let cwd = format!("cwd={}", member.tmp.join("work").display());
-    let (reply, _) = drive_ok(&issuer.tmp, &target, &["spawn", &cwd]);
-    let sid = reply.trim().strip_prefix("OK ").expect("plain shell sid");
+    // Asked from the issuer's own session: the drive's first line names it, and the shell's tab
+    // records the drive by the issuer's node and that session.
+    let spawned = ctl_with(
+        &issuer.tmp,
+        &[
+            "--host",
+            &target,
+            "spawn",
+            &cwd,
+            "why=check the work folder",
+        ],
+        None,
+        &[("ATERM_PARENT_SESSION_ID", original_issuer.as_str())],
+    );
+    assert!(
+        spawned.status.success(),
+        "spawn over the fleet: {spawned:?}"
+    );
+    let reply = String::from_utf8_lossy(&spawned.stdout).into_owned();
+    // `OK <sid> req=<id>`: the driven Mac opened a request for the spawn and names it.
+    let mut words = reply
+        .trim()
+        .strip_prefix("OK ")
+        .expect("plain shell sid")
+        .split(' ');
+    let sid = words.next().expect("plain shell sid");
+    let req = words
+        .next()
+        .and_then(|word| word.strip_prefix("req="))
+        .unwrap_or_else(|| panic!("the request it opened: {reply}"));
     let at = format!("@{sid}");
+    let issuer_node =
+        std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("its node id");
+    let head = &issuer_node.trim()[..aterm_slog::FLEET_NODE_HEAD];
+    assert!(
+        req.starts_with("r-") && req.contains(&format!("-{head}-")),
+        "the request id names its requester's node: {req}"
+    );
+    let requester = format!("fleet:{head}:{original_issuer}");
+    let by = format!("by={requester}");
+    // This Mac's owner reads the request back, its tabs paged.
+    let shown = ctl_ok(&member, &["request", "show", req, "limit=1", "--json"]);
+    let shown: aterm_json::Value =
+        aterm_json::from_str(shown.trim()).unwrap_or_else(|_| panic!("request show: {shown}"));
+    assert_eq!(shown["request"]["id"].as_str(), Some(req), "{shown}");
+    assert_eq!(
+        shown["request"]["by"].as_str(),
+        Some(requester.as_str()),
+        "{shown}"
+    );
+    assert_eq!(shown["page"]["shown"].as_str(), Some("1"), "{shown}");
+    let tabs = shown["tabs"].as_array().expect("its tabs");
+    assert!(
+        tabs.iter().any(|tab| tab["sid"].as_str() == Some(sid)),
+        "{shown}"
+    );
+    // The requester's own node reads its request over the drive, without the content tier.
+    let (listed, _) = drive_ok(&issuer.tmp, &target, &["requests"]);
+    assert!(
+        listed.contains(&format!("request id={req} ")),
+        "a drive reads its own node's request: {listed}"
+    );
+    let (driven, _) = drive_ok(&issuer.tmp, &target, &["request", "show", req]);
+    assert!(
+        driven.lines().any(|line| line.starts_with("request "))
+            && !driven.lines().any(|line| line.starts_with("said ")),
+        "{driven}"
+    );
+    let selected = ctl(&member, &[&at, "requests"]);
+    assert!(
+        !selected.status.success(),
+        "a request read takes no selector: {selected:?}"
+    );
+    let tabs = ctl_ok(&member, &[&at, "log", "tier=host", "kinds=tab"]);
+    let open = tabs
+        .lines()
+        .find(|line| line.contains(" tab act=open "))
+        .unwrap_or_else(|| panic!("no open: {tabs}"));
+    assert!(
+        open.split_whitespace().any(|word| word == by) && open.contains(" why_text="),
+        "{by}: {open}"
+    );
     assert_eq!(
         ctl_ok(&member, &[&at, "task"]).trim(),
         "OK task -",
@@ -1413,10 +1495,13 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     let command = "pwd; printf 'probe-before\\n'; i=0; while [ $i -lt 64 ]; do printf 'middle\\n'; i=$((i+1)); done; printf 'probe-after\\n'; (exit 7)";
     // A drive's turn is capped at 22 s, below the hang detector, so the turn waits only for its
     // submit (its whole timeout, not the default 2 s window) and the exit below is the detector's.
-    let (_, turn) = drive_ok(
+    // Typed from the session that asked for the shell, it attaches to that request.
+    let as_requester = [("ATERM_PARENT_SESSION_ID", original_issuer.as_str())];
+    let typed = ctl_with(
         &issuer.tmp,
-        &target,
         &[
+            "--host",
+            &target,
             &at,
             "turn",
             "settle=submitted",
@@ -1424,7 +1509,11 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
             "timeout=20000",
             command,
         ],
+        None,
+        &as_requester,
     );
+    assert!(typed.status.success(), "{typed:?}");
+    let turn = String::from_utf8_lossy(&typed.stderr).into_owned();
     assert!(turn.contains("submitted=1"), "{turn}");
     let block = aterm_spec::wait::until_within(HANG, "the exact command's exit", || {
         let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at, "blocks"]);
@@ -1518,7 +1607,10 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
         assert!(refused.contains("ERR denied"), "{refused}");
     }
     let missing = format!("cwd={}", member.tmp.join("missing").display());
-    assert!(drive_refused(&issuer.tmp, &target, &["spawn", &missing]).contains("no such folder"));
+    assert!(
+        drive_refused(&issuer.tmp, &target, &["spawn", &missing, "why=look"])
+            .contains("no such folder")
+    );
     // A folder named in the driven Mac's home resolves there: the shell starts in the member's
     // `~/work`, which the issuer's home does not hold. Typed as the help writes it, quoted, the
     // word reaches the client as `cwd=~/work` through bash. Negative control: unquoted, bash makes
@@ -1526,7 +1618,7 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     assert!(!issuer.tmp.join("home/work").exists());
     let unquoted = ctl_as(
         &issuer.tmp,
-        Typed::Bash(&format!("--host {target} spawn cwd=~/work")),
+        Typed::Bash(&format!("--host {target} spawn cwd=~/work why=look")),
         None,
         &[],
     );
@@ -1539,13 +1631,17 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     );
     let quoted = ctl_as(
         &issuer.tmp,
-        Typed::Bash(&format!("--host {target} spawn 'cwd=~/work'")),
+        Typed::Bash(&format!("--host {target} spawn 'cwd=~/work' why=look")),
         None,
         &[],
     );
     assert!(quoted.status.success(), "{quoted:?}");
     let reply = String::from_utf8_lossy(&quoted.stdout).into_owned();
-    let homed = reply.trim().strip_prefix("OK ").expect("plain shell sid");
+    let homed = reply
+        .trim()
+        .strip_prefix("OK ")
+        .and_then(|rest| rest.split(' ').next())
+        .expect("plain shell sid");
     let at_homed = format!("@{homed}");
     aterm_spec::wait::until_within(HANG, "the home-relative shell's prompt", || {
         let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at_homed, "blocks"]);
@@ -1588,17 +1684,23 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
         ("cwd=~/missing", "no such folder ~/missing"),
         ("cwd=~/Documents", "macOS guards"),
     ] {
-        let refused = drive_refused(&issuer.tmp, &target, &["spawn", cwd]);
+        let refused = drive_refused(&issuer.tmp, &target, &["spawn", cwd, "why=look"]);
         assert!(refused.contains(said), "{cwd}: {refused}");
     }
-    let leaving = drive_in(&issuer.tmp, &target, &["spawn", "cwd=~/../x"]);
+    let leaving = drive_in(&issuer.tmp, &target, &["spawn", "cwd=~/../x", "why=look"]);
     assert!(!leaving.status.success(), "{leaving:?}");
     assert!(
         String::from_utf8_lossy(&leaving.stderr).contains("may leave the home"),
         "refused here, never sent: {leaving:?}"
     );
     drive_ok(&issuer.tmp, &target, &[&at_homed, "close"]);
-    drive_ok(&issuer.tmp, &target, &[&at, "close"]);
+    let closed = ctl_with(
+        &issuer.tmp,
+        &["--host", &target, &at, "close"],
+        None,
+        &as_requester,
+    );
+    assert!(closed.status.success(), "{closed:?}");
     let left = ctl_ok(&member, &["sessions"]);
     assert!(
         !left
@@ -1607,6 +1709,57 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
         "only the owned shell closed: {left}"
     );
     assert!(left.contains(&original));
+    // The driven Mac's request journal holds the request whole: who asked and why, its tab, the
+    // requester's turn and close (the sid-less drive's turn and key on the same tab are another
+    // requester's and attach nothing), and its conclusion once its tab left: released, since its
+    // requester let it go.
+    let journal_at = member.tmp.join("state/requests/journal");
+    let journal = aterm_spec::wait::until_within(HANG, "the request's conclusion", || {
+        std::fs::read_to_string(&journal_at)
+            .ok()
+            .filter(|journal| journal.contains(&format!(" op=end req={req} ")))
+    });
+    let of_req: Vec<&str> = journal
+        .lines()
+        .filter(|line| line.contains(&format!(" req={req} ")))
+        .collect();
+    let has = |want: &str| of_req.iter().any(|line| line.contains(want));
+    assert!(
+        has(&format!(
+            " op=open req={req} via=fleet-shell form=shell node={head}"
+        )) && has(&format!(" {by} ")),
+        "{journal}"
+    );
+    assert!(
+        has(&format!(
+            " op=why req={req} text=check%20the%20work%20folder"
+        )),
+        "{journal}"
+    );
+    assert!(
+        has(&format!(" op=tab req={req} tab={sid} {by}")),
+        "{journal}"
+    );
+    assert!(
+        has(&format!(
+            " op=attach req={req} tab={sid} verb=turn n=1 {by}"
+        )),
+        "{journal}"
+    );
+    assert!(
+        has(&format!(
+            " op=attach req={req} tab={sid} verb=close n=1 {by}"
+        )),
+        "{journal}"
+    );
+    assert!(
+        !has("verb=turn n=2") && !has("verb=key"),
+        "only the requester's verbs attach: {journal}"
+    );
+    assert!(
+        has(&format!(" op=end req={req} out=released why=tabs-left")),
+        "{journal}"
+    );
 }
 
 fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
@@ -1694,6 +1847,9 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
                 Some(&code),
             );
             allowed = fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
+            // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+            // person would, rather than read as anything but the Read Only default.
+            fleet_ok(tmp, &["access", "full"], None);
             let cfg = tmp.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(
@@ -2072,6 +2228,9 @@ fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() 
         &["allow", "drive", "--from", &resumer_node],
         None,
     );
+    // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+    // person would, rather than read as anything but the Read Only default.
+    fleet_ok(&issuer.tmp, &["access", "full"], None);
 
     let (holder, member_port) = hold_a_port();
     drop(holder);
@@ -2104,6 +2263,8 @@ fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() 
                 ],
                 None,
             );
+            // The dispatchers start workers here: this scratch Mac is at Full Access.
+            fleet_ok(tmp, &["access", "full"], None);
             let cfg = tmp.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(
@@ -2583,6 +2744,9 @@ fn driven_pair_configured(
                 Some(&code),
             );
             fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
+            // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+            // person would, rather than read as anything but the Read Only default.
+            fleet_ok(tmp, &["access", "full"], None);
             cmd.env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .args(["--lines", "24", "--columns", "80"]);
@@ -3003,6 +3167,9 @@ mod any_host_walled {
                 Some(code),
             );
             fleet_ok(tmp, &["allow", "drive", "--from", issuer_node], None);
+            // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+            // person would, rather than read as anything but the Read Only default.
+            fleet_ok(tmp, &["access", "full"], None);
             let cfg = tmp.join("cfg/aterm/aterm.toml");
             let text = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(
@@ -3166,7 +3333,7 @@ mod any_host_walled {
             .unwrap_or_else(|| panic!("no choice said: {said}"));
         println!("{chose}");
         assert!(
-            chose.contains(&format!("codex account {FREE} 7d 60% 5h 10%,"))
+            chose.contains(&format!("codex account {FREE} 7d 40% left 5h 90% left,"))
                 && chose.ends_with("the best of 1 that can take it"),
             "{chose}"
         );
@@ -3256,7 +3423,23 @@ fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
     drive_refused(&issuer.tmp, &target, &[&format!("@{worker}"), "status"]);
 }
 
+/// A drive of `target` from the Mac at `root`, its first line sent: a requester naming nobody,
+/// as a window's own drives name it.
 fn open_drive(root: &Path, target: &str) -> aterm_net::fleet_member::Driven {
+    let mut driven = open_drive_bare(root, target);
+    driven
+        .write_all(
+            aterm_types::control_verbs::Requester::default()
+                .line()
+                .as_bytes(),
+        )
+        .and_then(|()| driven.flush())
+        .expect("send the requester line");
+    driven
+}
+
+/// [`open_drive`] with nothing sent on it: the handshake alone.
+fn open_drive_bare(root: &Path, target: &str) -> aterm_net::fleet_member::Driven {
     let state = root.join("state");
     let secret = aterm_net::fleet::read_key_file(&state).expect("the fleet's key");
     let me = read_node_identity(&state)
@@ -3582,12 +3765,21 @@ fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_aw
     let mut open = open_drive(&issuer.tmp, &target);
     let read = ask(&mut open, &format!("{at} status"));
     assert!(read.starts_with("OK schema="), "{read}");
+    // A drive whose first line is a request names no requester: it is refused, and hung up on,
+    // with nothing of it served.
+    let mut bare = open_drive_bare(&issuer.tmp, &target);
+    let refused = ask(&mut bare, &format!("{at} status"));
+    assert!(refused.starts_with("ERR drive: "), "{refused}");
+    assert!(closed(&mut bare), "the refused drive is hung up on");
 
     fleet_ok(
         &member.tmp,
         &["allow", "drive", "--from", &third_node],
         None,
     );
+    // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+    // person would, rather than read as anything but the Read Only default.
+    fleet_ok(&member.tmp, &["access", "full"], None);
     let (read, _) = drive_ok(&third.0, &target, &[&at, "status"]);
     assert!(
         read.starts_with("OK schema="),
@@ -3663,6 +3855,9 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     );
     fleet_ok(&member.tmp, &["allow", "content"], None);
     let all = fleet_ok(&member.tmp, &["allow", "drive", "--all"], None);
+    // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+    // person would, rather than read as anything but the Read Only default.
+    fleet_ok(&member.tmp, &["access", "full"], None);
     assert!(
         all.contains("drive_from = [\"*\"]")
             && all.contains(
@@ -4221,6 +4416,166 @@ fn a_drives_typed_turn_whose_issuer_goes_part_way_lands_whole_on_the_driven_mac(
     );
 }
 
+/// THE FLEET ACCESS GRADUATION OVER A REAL LOOPBACK FLEET
+/// (`docs/DESIGN-fleet-access-lock-2026-11-10.md`): a Mac that grants a member its drive and
+/// raises nothing is Read Only, so the member reads it and every write and spawn is refused
+/// under `ERR denied access=read`; at `write` the member takes a session over and still starts
+/// nothing; a drop back to `read` lifts that hold at the next fleet line; at `full` the spawn
+/// goes through. Its survey header says the level each time. The level is set on the driven
+/// Mac's scratch state by its own CLI, never by the driver.
+#[test]
+fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let port_word = port.to_string();
+    let held = boot_world(
+        "afga",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &["init", "--host", "127.0.0.1", "--port", &port_word],
+                None,
+            );
+            cmd.env("SHELL", "/bin/zsh")
+                .env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, sid) = boot_session(&held);
+    fleet_reads(&held, &sid, "listening");
+    let code = std::fs::read_to_string(held.tmp.join("state/fleet-join-code")).expect("a code");
+    let (holder, member_port) = hold_a_port();
+    drop(holder);
+    let member_port_word = member_port.to_string();
+    let driver = boot_world(
+        "afgb",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port_word,
+                    "--at",
+                    &listen_of(&held.tmp),
+                ],
+                Some(&code),
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, driver_sid) = boot_session(&driver);
+    fleet_reads(&driver, &driver_sid, "listening");
+    let node = std::fs::read_to_string(driver.tmp.join("state/fleet-node")).expect("its node id");
+    fleet_ok(&held.tmp, &["allow", "drive", "--from", node.trim()], None);
+    let target = format!("127.0.0.1:{port}");
+    let at = format!("@{sid}");
+
+    // No level was ever stored: the default.
+    assert!(
+        fleet_ok(&held.tmp, &["access"], None).starts_with("read "),
+        "a Mac starts Read Only"
+    );
+    // A read rides the drive at every level: it also says when the grant is in force.
+    let mut last = None;
+    let read = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        let out = drive_in(&driver.tmp, &target, &[&at, "status"]);
+        let read = out.status.success().then_some(());
+        last = Some(out);
+        read
+    });
+    assert!(read.is_some(), "the grant never let it read: {last:?}");
+    // The survey as the wire carries it to a member its grant lets drive: the header, then a
+    // row per session.
+    let wire = || ask_lines(&mut open_drive(&driver.tmp, &target), "survey");
+    let header = |want: &str| {
+        let rows = wire();
+        let head = rows
+            .iter()
+            .find(|line| line.starts_with("instance "))
+            .unwrap_or_else(|| panic!("no instance row: {rows:?}"));
+        assert!(
+            head.split_whitespace()
+                .any(|token| token == format!("access={want}"))
+                && head.split_whitespace().any(|token| token == "drive=1"),
+            "the header says access={want} beside drive=1: {head}"
+        );
+    };
+    let refused = |args: &[&str], level: &str, needs: &str| {
+        let out = drive_in(&driver.tmp, &target, args);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(
+            said.contains(&format!("ERR denied access={level} needs={needs}: ")),
+            "{args:?} at {level}: {said}"
+        );
+    };
+    let sessions = || {
+        wire()
+            .iter()
+            .filter(|line| line.starts_with("session "))
+            .count()
+    };
+    let before = sessions();
+
+    header("read");
+    refused(&["hold", &sid, "on"], "read", "write");
+    refused(&[&at, "send", "x"], "read", "write");
+    refused(&[&at, "key", "Enter"], "read", "write");
+    refused(
+        &[&at, "post", "key=k", "kind=note", "--", "hi"],
+        "read",
+        "write",
+    );
+    refused(&["spawn", "cwd=/private/tmp", "why=look"], "read", "full");
+    assert_eq!(field(&status(&held, &sid), "hold_by"), Some("-"));
+    assert_eq!(sessions(), before, "nothing was started");
+
+    fleet_ok(&held.tmp, &["access", "write"], None);
+    header("write");
+    drive_ok(&driver.tmp, &target, &["hold", &sid, "on"]);
+    assert_eq!(field(&status(&held, &sid), "hold_by"), Some("remote"));
+    refused(&["spawn", "cwd=/private/tmp", "why=look"], "write", "full");
+    assert_eq!(sessions(), before, "nothing was started");
+
+    // A drop: the member can hand the session back no more, so this Mac does, at the next
+    // fleet line its window serves.
+    fleet_ok(&held.tmp, &["access", "read"], None);
+    refused(&["hold", &sid, "off"], "read", "write");
+    let lifted = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        let _ = drive_in(&driver.tmp, &target, &[&at, "status"]);
+        (field(&status(&held, &sid), "hold_by") != Some("remote")).then_some(())
+    });
+    assert!(
+        lifted.is_some(),
+        "the drop never lifted the member's hold: {}",
+        status(&held, &sid)
+    );
+    header("read");
+
+    fleet_ok(&held.tmp, &["access", "full"], None);
+    header("full");
+    let (spawned, _) = drive_ok(
+        &driver.tmp,
+        &target,
+        &["spawn", "cwd=/private/tmp", "why=look"],
+    );
+    assert!(spawned.starts_with("OK s-"), "{spawned}");
+    assert_eq!(sessions(), before + 1, "the spawn opened one session");
+    // And the drop leaves what was started running, and readable.
+    fleet_ok(&held.tmp, &["access", "read"], None);
+    let worker = spawned.split_whitespace().nth(1).expect("its sid");
+    drive_ok(&driver.tmp, &target, &[&format!("@{worker}"), "status"]);
+    assert_eq!(sessions(), before + 1, "a drop closes nothing");
+}
+
 #[test]
 fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_not() {
     let (holder, port) = hold_a_port();
@@ -4273,6 +4628,9 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     let node = std::fs::read_to_string(driver.tmp.join("state/fleet-node")).expect("its node id");
     let node = node.trim().to_owned();
     fleet_ok(&held.tmp, &["allow", "drive", "--from", &node], None);
+    // The fixture drives this Mac: its fleet access is raised on its scratch state, as its
+    // person would, rather than read as anything but the Read Only default.
+    fleet_ok(&held.tmp, &["access", "full"], None);
     let target = format!("127.0.0.1:{port}");
     let mut last = None;
     let took = aterm_spec::wait::within(HANG, POLL_GAP, || {

@@ -154,6 +154,7 @@ fn stage_memory_survives_until_direct_and_pool_nested_workers_both_end() {
         crate::Seams {
             stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: admit,
             admit_memory: admit,
         },

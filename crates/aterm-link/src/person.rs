@@ -1361,7 +1361,8 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
          aterm fabric inbox --cap-file {cap}            read what agents posted to={person}\n  \
          aterm fabric post --cap-file {cap} to=@<sid>@<node> kind=answer re=<off> <text>\n  \
          aterm link notify --fleet {fleet} --broker {broker} --cap-file {cap} --on \
-         ask:{person} --exec <cmd>    be paged when an agent asks {person}\n\
+         ask:{person} --exec <cmd>    be paged when an agent asks {person} (one notifier per \
+         state dir: add selectors to its --on, or give another its own --state)\n\
          {task}"
     )
 }

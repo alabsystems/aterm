@@ -1067,6 +1067,12 @@ pub struct Sample {
     pub clusters: Vec<ClusterSpec>,
     /// Memory; `None` where unreadable.
     pub mem: Option<MemSample>,
+    /// The cgroup CPU quota (`cpu.max`), millicores (1000 per core); `None` when unlimited or off
+    /// cgroup v2 (`aterm_sysprobe::Capacity::cpu_millicores`).
+    pub cpu_millicores: Option<u32>,
+    /// The cgroup memory limit (`memory.max`), bytes; `None` when unlimited or off cgroup v2
+    /// (`aterm_sysprobe::Capacity::mem_bytes`).
+    pub mem_bytes: Option<u64>,
     /// The GPU; `None` where unreadable.
     pub gpu: Option<GpuSample>,
     /// Every GPU user client's GPU time, where the host read them this sample (not every one).
@@ -4532,8 +4538,16 @@ impl Rows {
         facts.runnable = self.runq.absorb(t, s.run_queue);
         facts.queue = crate::runq::RunQueue::of(facts.runnable, s.load1);
         let n_cores = s.cores.as_ref().map(Vec::len).filter(|&n| n > 0);
-        if let Some(n) = n_cores {
-            self.caps[Cpu.index()] = Some(n as f64);
+        let cgroup_cores = s
+            .cpu_millicores
+            .filter(|&m| m > 0)
+            .map(|m| f64::from(m) / 1000.0);
+        let cpu_cap = match (n_cores.map(|n| n as f64), cgroup_cores) {
+            (Some(h), Some(c)) => Some(h.min(c)),
+            (h, c) => h.or(c),
+        };
+        if let Some(c) = cpu_cap {
+            self.caps[Cpu.index()] = Some(c);
         }
         let cpu_over = crate::units::cpu_over(busy, n_cores, facts.queue);
         self.rings[Cpu.index()].push(t, busy, cpu_over);
@@ -4554,8 +4568,13 @@ impl Rows {
         }
 
         let mem = s.mem.filter(|m| m.total > 0);
-        if let Some(m) = mem {
-            self.caps[Memory.index()] = Some(m.total as f64);
+        let cgroup_mem = s.mem_bytes.filter(|&b| b > 0);
+        let mem_cap = match (mem.map(|m| m.total), cgroup_mem) {
+            (Some(h), Some(c)) => Some(h.min(c)),
+            (h, c) => h.or(c),
+        };
+        if let Some(b) = mem_cap {
+            self.caps[Memory.index()] = Some(b as f64);
         }
         if let Some(kib) = s.swapped_kib {
             facts.swap_rate = self.swap.and_then(|(then, before)| {

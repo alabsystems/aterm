@@ -6,8 +6,9 @@
 //! account home.
 
 use super::{
-    PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env, doctor_startup_env_from,
-    first_run_start, first_run_window_eligible, prepare_setup,
+    PreparedSetup, SCREEN_WAIT, SetupAdmission, SetupStartup, doctor_startup_env,
+    doctor_startup_env_from, first_run_start, first_run_window_eligible, prepare_setup,
+    start_at_the_screen, wait_for_the_screen,
 };
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
@@ -48,6 +49,12 @@ struct Startup {
     offered: Vec<Plan>,
     /// A real local read failure that starts after the startup captured readable state.
     after_bind: Option<AfterBind>,
+    /// Captures still to meet the records being written (another process saving them).
+    bind_fails: usize,
+    /// The last capture met them so: the next backoff waits for the write to settle.
+    bind_waits: bool,
+    /// The review ended unbound for a fresh one.
+    bound_afresh: bool,
 }
 
 impl Startup {
@@ -97,6 +104,11 @@ impl SetupStartup for Startup {
     fn bind_authorization(&mut self) -> Result<u64, String> {
         self.binds += 1;
         assert_eq!(self.binds, 1, "capture the resolved home's records once");
+        if self.bind_fails > 0 {
+            self.bind_fails -= 1;
+            self.bind_waits = true;
+            return Err("the setup records are being updated".into());
+        }
         let revision = self.snapshot()?.revision;
         let path = self.root().join("initial-setup.json");
         match self.after_bind {
@@ -108,6 +120,10 @@ impl SetupStartup for Startup {
             None => {}
         }
         Ok(revision)
+    }
+
+    fn bind_afresh(&mut self) {
+        self.bound_afresh = true;
     }
 
     fn revision(&mut self) -> Result<u64, String> {
@@ -172,7 +188,7 @@ impl SetupStartup for Startup {
 
     fn backoff(&mut self) {
         self.backoffs += 1;
-        if std::mem::take(&mut self.lock_waits) {
+        if std::mem::take(&mut self.lock_waits) || std::mem::take(&mut self.bind_waits) {
             return;
         }
         if matches!(self.after_bind, Some(AfterBind::TemporarilyUnreadable)) {
@@ -225,6 +241,9 @@ fn startup(home: &Path) -> Startup {
         fresh: false,
         offered: Vec::new(),
         after_bind: None,
+        bind_fails: 0,
+        bind_waits: false,
+        bound_afresh: false,
     }
 }
 
@@ -238,11 +257,7 @@ fn an_update_successor_admits_a_pending_plan() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let account = scratch.path().join("account");
     std::fs::create_dir(&account).unwrap();
-    let env = doctor_startup_env_from(
-        |_| None,
-        lasting_scope_refusal_at(&account, &account),
-        || false,
-    );
+    let env = doctor_startup_env_from(|_| None, lasting_scope_refusal_at(&account, &account));
     let window = [OsString::from("--window")];
     let launch = first_run_start(&window, false, env).expect("a launch starts setup");
     let successor = first_run_start(&window, true, env).expect("a successor starts setup");
@@ -290,9 +305,8 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
     std::fs::create_dir(&account).unwrap();
     std::fs::create_dir(&other).unwrap();
     let window = [OsString::from("--window")];
-    let at = |home: &Path| {
-        doctor_startup_env_from(|_| None, lasting_scope_refusal_at(home, &account), || false)
-    };
+    let at =
+        |home: &Path| doctor_startup_env_from(|_| None, lasting_scope_refusal_at(home, &account));
 
     let own = at(&account);
     assert!(!own.outside_person_scope);
@@ -305,23 +319,79 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
         let env = doctor_startup_env_from(
             |key| (key == marker).then(|| OsString::from("1")),
             lasting_scope_refusal_at(&account, &account),
-            || false,
         );
         assert!(!first_run_window_eligible(&window, env), "{marker}");
     }
-    // Outside the console owner's graphic session (no window server, another login at the
-    // screen), with no marker set, the window leaves setup to one started at this Mac.
-    let away = doctor_startup_env_from(
-        |_| None,
-        lasting_scope_refusal_at(&account, &account),
-        || true,
-    );
-    assert!(away.remote);
-    assert!(!first_run_window_eligible(&window, away));
 
     // The launch's own reader: a test binary runs under its private state root, a lasting
     // refusal, so this process is never the person's.
     assert!(doctor_startup_env().outside_person_scope);
+}
+
+/// H33: a window started while the person is away from this Mac's screen (another login at it,
+/// the login window) keeps its first-run start, which waits for them to come back: the launch's
+/// gate no longer reads the console, and the start looks again each [`SCREEN_WAIT`] (or on a
+/// wake) until the screen is this login's. Before, the launch's one reading of the console left
+/// that window without setup for its whole life.
+#[test]
+fn a_window_started_away_from_the_screen_keeps_its_first_run_start() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let account = scratch.path().join("account");
+    std::fs::create_dir(&account).unwrap();
+    let window = [OsString::from("--window")];
+    let env = doctor_startup_env_from(|_| None, lasting_scope_refusal_at(&account, &account));
+    assert!(
+        first_run_window_eligible(&window, env),
+        "a window away from the screen keeps its start"
+    );
+    assert!(first_run_start(&window, false, env).is_some());
+
+    let mut looks = [true, true, false].into_iter();
+    let mut waits = Vec::new();
+    wait_for_the_screen(
+        || looks.next().expect("no look after the screen came back"),
+        |pause| {
+            waits.push(pause);
+        },
+    );
+    assert_eq!(
+        waits,
+        [SCREEN_WAIT, SCREEN_WAIT],
+        "it waits while away, then starts"
+    );
+    assert_eq!(looks.next(), None);
+}
+
+/// H33's wiring: a window's start holds the window lock (from which the login job stands down)
+/// only once the screen is this login's again, starts its setup after that, and lets the lock go
+/// as its start returns; meanwhile the job goes on with the stages that need nobody, and after,
+/// with a run reopened once the window's own run returned.
+#[test]
+fn a_window_away_from_the_screen_holds_the_window_lock_only_once_it_is_back() {
+    struct Hold<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+    impl Drop for Hold<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("let go");
+        }
+    }
+    let did = std::cell::RefCell::new(Vec::new());
+    let mut looks = [true, false].into_iter();
+    start_at_the_screen(
+        || {
+            did.borrow_mut().push("look");
+            looks.next().expect("no look after the screen came back")
+        },
+        |_| did.borrow_mut().push("wait"),
+        || {
+            did.borrow_mut().push("hold");
+            Hold(&did)
+        },
+        || did.borrow_mut().push("start"),
+    );
+    assert_eq!(
+        did.into_inner(),
+        ["look", "wait", "look", "hold", "start", "let go"]
+    );
 }
 
 #[test]
@@ -505,6 +575,39 @@ fn startup_recovery_retires_a_bound_review_when_its_records_become_corrupt() {
     }
 }
 
+/// H32: a capture that meets the records mid-write (another process saving them as this launch
+/// starts) ends only this review: it says so calmly, waits the startup's pause holding nothing,
+/// and hands on to a fresh review, which binds the revision current then and resumes the admitted
+/// run with nothing offered. Before, the one failed capture ended the launch's setup, and the run
+/// waited for a later launch.
+#[test]
+fn a_bind_that_meets_records_being_written_hands_on_to_a_fresh_review() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let (revision, _) = pending(&home);
+    let mut old = startup(&home);
+    old.bind_fails = 1;
+
+    let prepared = prepare_setup(&mut old);
+    assert!(
+        matches!(prepared, Ok(PreparedSetup::Unavailable)),
+        "a capture that failed ends only this review: {:?}",
+        prepared.err()
+    );
+    assert_eq!(
+        (old.binds, old.backoffs),
+        (1, 1),
+        "one capture, then the pause"
+    );
+    assert_eq!(old.failures.len(), 1, "said calmly, as a retry");
+    assert!(old.bound_afresh, "it hands on to a fresh review");
+
+    let mut fresh = startup(&home);
+    let prepared = prepare_setup(&mut fresh).unwrap();
+    assert!(matches!(prepared, PreparedSetup::Authorized { revision: got, .. } if got == revision));
+    assert!(fresh.offered.is_empty(), "nothing is offered again");
+}
+
 #[test]
 fn startup_recovery_keeps_its_bound_revision_through_a_transient_local_read_error() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -546,7 +649,6 @@ fn the_secrets_lanes_end_leaves_workstation_running() {
         readback: None,
         readback_subjects: Vec::new(),
         readback_owner: None,
-        readback_missing: Vec::new(),
         input_readback: false,
     };
     let dock = Subject::Setting(Setting::Dock);

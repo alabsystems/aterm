@@ -38,7 +38,7 @@ pub(crate) fn land_worker(app: &mut App) -> u64 {
     let id = app.next_session_id;
     app.next_session_id += 1;
     let parent = app.new_tab_parent(WID);
-    app.install_tab_session_parked(WID, stub_session(id), parent);
+    app.install_tab_session_parked(WID, stub_session(id), parent, false);
     app.sync_window(WID);
     id
 }
@@ -590,7 +590,8 @@ fn spawn_split_is_refused_in_words_while_a_worker_is_in_front() {
         None,
         None,
         None,
-        reply,
+        false,
+        reply.into(),
     );
     assert_eq!(
         answer.recv().expect("answered"),
@@ -610,7 +611,8 @@ fn spawn_split_is_refused_in_words_while_a_worker_is_in_front() {
         None,
         None,
         None,
-        reply,
+        false,
+        reply.into(),
     );
     assert_ne!(
         answer.try_recv().ok(),
@@ -1052,7 +1054,7 @@ fn two_windows_workers_pages_keep_their_own_actions_and_revisions() {
     let worker1 = app.next_session_id;
     app.next_session_id += 1;
     let parent1 = app.new_tab_parent(other);
-    app.install_tab_session_parked(other, stub_session(worker1), parent1);
+    app.install_tab_session_parked(other, stub_session(worker1), parent1, false);
     app.sync_window(other);
 
     let (_, view0, instance0) = app.workers_page(WID).expect("window 0 page");
@@ -1666,4 +1668,199 @@ fn a_candidate_that_ends_before_its_commit_leaves_its_predecessors_results() {
         assert!(!kept(&app), "a quit drops the row");
         assert!(!result.exists(), "and what it left");
     });
+}
+
+/// A list a Finished row keeps, beside a private document: what a handoff carries depends on which
+/// is in front and what the target rebuilds. The list stands alone in the row only with it in front
+/// and for a target that declares `desk1`. Otherwise a Recovery tab stands in, with no list behind it.
+#[cfg(unix)]
+#[test]
+fn a_private_document_beside_a_kept_list_gets_a_recovery_tab_unless_the_list_is_carried() {
+    use crate::restore::{RestoredSplitTree, RestoredView};
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("att-edit-t.private.noindex");
+    std::fs::create_dir(&folder).expect("the private folder");
+    let path = folder.join("address.txt");
+    std::fs::write(&path, "name secret\n").expect("the file");
+    let uri = crate::native_document_host::path_to_file_uri(&path).expect("its uri");
+
+    let mut app = app_with_a_lone_list();
+    let (record, _) = TaskMark::new(TaskState::Done).apply(
+        None,
+        &Default::default(),
+        std::time::Instant::now(),
+        1_000,
+    );
+    let row = crate::retired_workers::Retired {
+        sid: aterm_session::SessionId::new("s-f1n1"),
+        local: Some(99),
+        window: Some(WID),
+        title: "a worker".to_owned(),
+        last_words: None,
+        record,
+        closed_unix_ms: 1_000,
+    };
+    app.store.write().unwrap().retired_workers_mut().keep(row);
+    app.use_document_journal_root_for_test(dir.path().join("drafts"));
+    app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
+        .expect("the document opens");
+    app.sync_window(WID);
+    assert!(
+        set(&app).home().is_some(),
+        "PRECONDITION: its row keeps the list"
+    );
+    assert_eq!(
+        set(&app).shown_len(),
+        2,
+        "PRECONDITION: beside the document"
+    );
+
+    let is_stand_in = |layout: &crate::restore::RestoreManifest| {
+        let row = &layout.windows[0];
+        !row.workers_in_front
+            && matches!(
+                row.restored_tabs[0].root,
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Placeholder(_)
+                }
+            )
+    };
+    assert!(
+        is_stand_in(&app.capture_handoff_layout_for(true)),
+        "the document in front"
+    );
+    assert!(
+        is_stand_in(&app.capture_handoff_layout_for(false)),
+        "the document in front"
+    );
+
+    let home = set(&app).home().expect("the list");
+    assert!(app.windows.get_mut(&WID).unwrap().tab_set.switch_to(home));
+    app.sync_window(WID);
+    let carried = app.capture_handoff_layout_for(true);
+    assert!(
+        carried.windows[0].is_lone_workers_list(),
+        "the list in front, for a target that rebuilds it"
+    );
+    assert!(
+        is_stand_in(&app.capture_handoff_layout_for(false)),
+        "the list in front, for a target that does not"
+    );
+}
+
+const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
+const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+
+/// This test thread's requests in a folder of its own until dropped.
+struct Requests(aterm_tempfile::TempDir);
+
+impl Requests {
+    fn new() -> Self {
+        let dir = aterm_tempfile::tempdir().expect("a folder");
+        crate::requests_host::set_dir_for_test(Some(dir.path().to_path_buf()));
+        Self(dir)
+    }
+
+    fn store(&self) -> aterm_requests::Store {
+        aterm_requests::Store::open(self.0.path()).expect("the store")
+    }
+}
+
+impl Drop for Requests {
+    fn drop(&mut self) {
+        crate::requests_host::set_dir_for_test(None);
+    }
+}
+
+/// A tab a fleet drive asked for, landed parked with no parent: its session's local id.
+pub(crate) fn land_fleet(app: &mut App) -> u64 {
+    let id = app.next_session_id;
+    app.next_session_id += 1;
+    app.install_tab_session_parked(WID, stub_session(id), None, true);
+    app.sync_window(WID);
+    id
+}
+
+fn sid_of(app: &App, session: u64) -> String {
+    app.session_id_text(session).expect("a live session")
+}
+
+fn mark_from(app: &App, session: u64, from: &str) {
+    let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+    let handle = store.by_local(session).expect("a live session");
+    let mut mark = TaskMark::new(TaskState::Working);
+    mark.from = Some(from.to_owned());
+    mark_session_task(&handle.ctx, handle.local_id, &mark).expect("unfenced");
+}
+
+/// A FLEET DRIVE'S SPAWNS SIT UNDER THE MAC THAT ASKED: its plain shell and its worker (whose
+/// task names a session on that Mac) share one `From <host>` group. NEGATIVE CONTROLS: a local
+/// manager's worker stays under that manager, and a drive's tab no request owns falls to aterm's.
+#[test]
+fn a_drives_spawns_sit_under_from_their_mac() {
+    use crate::requests_host::{Made, opened_for_test};
+    let _requests = Requests::new();
+    let (mut app, tabs, _) = app_with(1, 0);
+    let manager = sid_of(&app, tabs[0]);
+    let shell = land_fleet(&mut app);
+    opened_for_test(true, NODE, "m114", BY, Made::Shell, &sid_of(&app, shell));
+    let worker = land_fleet(&mut app);
+    mark_from(&app, worker, "s-0123456789abcdef0123");
+    opened_for_test(
+        true,
+        NODE,
+        "m114",
+        BY,
+        Made::Agent("claude"),
+        &sid_of(&app, worker),
+    );
+    let local = land_worker(&mut app);
+    mark_from(&app, local, &manager);
+    opened_for_test(
+        false,
+        "",
+        "this-mac",
+        &manager,
+        Made::Agent("claude"),
+        &sid_of(&app, local),
+    );
+    let unowned = land_fleet(&mut app);
+    let rows = rows(&app);
+    let groups: Vec<(String, Vec<u64>)> = crate::native_workers::grouped(&rows)
+        .into_iter()
+        .map(|(heading, members)| (heading, members.iter().map(|row| row.session).collect()))
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            ("From m114".to_owned(), vec![worker, shell]),
+            (app.tab_label_of_session(tabs[0]), vec![local]),
+            (crate::native_workers::ATERM_GROUP.to_owned(), vec![unowned]),
+        ]
+    );
+}
+
+/// Keep as Tab on a drive's shell moves it to the strip and its request records the keep, which
+/// concludes it released.
+#[test]
+fn keep_as_tab_on_a_drives_shell_records_the_keep() {
+    use crate::requests_host::{Made, opened_for_test};
+    let requests = Requests::new();
+    let (mut app, _, _) = app_with(1, 0);
+    let shell = land_fleet(&mut app);
+    let sid = sid_of(&app, shell);
+    let id = opened_for_test(true, NODE, "m114", BY, Made::Shell, &sid);
+    assert!(app.keep_as_tab(shell));
+    assert!(!app.session_is_parked(shell), "on the strip");
+    // A hang detector: the writer thread writes it.
+    assert!(crate::requests_host::flush_within(
+        std::time::Duration::from_secs(60)
+    ));
+    let store = requests.store();
+    let request = store.get(&id).expect("the request");
+    assert!(request.tabs[0].kept);
+    assert_eq!(
+        request.end,
+        Some((aterm_requests::Out::Released, aterm_requests::EndWhy::Kept))
+    );
 }

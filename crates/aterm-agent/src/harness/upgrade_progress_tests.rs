@@ -151,7 +151,7 @@ fn real_step(s: &State, look: Look) -> (Step, Facts) {
         TARGET,
     );
     let step = if look == Look::Point && s["posture"] == 1 {
-        upgrade::break_step(step)
+        upgrade::break_step(step, &f)
     } else {
         step
     };
@@ -386,6 +386,9 @@ fn the_real_reducer_is_the_derived_machine() {
     assert_eq!(
         anchored,
         [
+            ("LineTypedAtIdle", "look_types"),
+            ("LookClosesAtAPoint", "look_at"),
+            ("NextTargetTaken", "look_holds"),
             ("RestartAtIdle", "gate_restart"),
             ("RestartOnPress", "press_gate"),
             ("StepAtBreak", "break_step"),
@@ -402,6 +405,152 @@ fn the_real_reducer_is_the_derived_machine() {
         "HarnessUpgradeProgress::RestartOnPress @ press_gate",
     ] {
         assert!(entered.contains(id), "{id} entered: {entered:?}");
+    }
+}
+
+/// The record of a finished move in state `s`, its look's clock set against [`NOW`] as `age`
+/// says, and whether its resumed build warned.
+fn look_record(s: &State) -> (St, bool) {
+    use crate::harness::relaunch::{RESTORE_LOOK, RESTORE_TYPE_WITHIN_S};
+    let passed = match s["age"] {
+        0 => None,
+        1 => Some(RESTORE_TYPE_WITHIN_S / 2),
+        _ => Some(RESTORE_TYPE_WITHIN_S),
+    };
+    let confirm_by = match (s["closed"], passed) {
+        (1, _) => 0,
+        (_, None) => NOW + RESTORE_LOOK.as_secs(),
+        (_, Some(passed)) => NOW - passed,
+    };
+    let st = St {
+        phase: Phase::Done,
+        from: "2.1.283".to_string(),
+        to: TARGET.to_string(),
+        resumed_on: TARGET.to_string(),
+        done_at: NOW - 3_600,
+        confirm_by,
+        ..St::default()
+    };
+    (st, s["owes"] == 1)
+}
+
+/// A finished move's look ends on its own clock: past it, any point closes it and the next build
+/// is taken, a break included; only its line is an idle point's, typed there however late.
+///
+/// NEGATIVE CONTROLS: the lane before the look had a clock, which held the visit and the owed
+/// continuation on `St::confirming` alone (`OnlyIdleClosesALook`: under it the model's point
+/// leaves the newer build hidden exactly where that read still holds and the look's clock does
+/// not), and a step typing the look's line wherever the agent rests (`LineTypedAtBreak`: under it
+/// the model types at exactly the breaks the real `look_types` refuses).
+#[test]
+fn a_finished_moves_look_is_the_derived_machine() {
+    use crate::harness::relaunch::{LookAt, look_at, look_types};
+    let today = main_today();
+    let done: Vec<State> = reach(&today)
+        .into_iter()
+        .filter(|s| s["phase"] == 3)
+        .collect();
+    let idle_only = latched("idle_only");
+    let any_point = latched("any_point");
+    let (mut closes, mut typed, mut late, mut withheld, mut taken, mut waits) = (0, 0, 0, 0, 0, 0);
+    let mut caught: BTreeSet<&str> = BTreeSet::new();
+    for s in &done {
+        assert_eq!((s["hid"], s["off_idle"]), (0, 0), "{s:?}");
+        let (st, warned) = look_record(s);
+        let at = look_at(st.confirm_by, NOW, warned);
+        let holds = st.confirming() && at.holds();
+        let at_break = s["rests"] == 1;
+        assert_eq!(
+            today.action_enabled("LookClosesAtAPoint", s),
+            st.confirming() && !at.holds(),
+            "{s:?}: {at:?}"
+        );
+        assert_eq!(
+            today.action_enabled("LineTypedAtIdle", s),
+            st.confirming() && look_types(at, at_break),
+            "{s:?}: {at:?}"
+        );
+        assert_eq!(
+            today.action_enabled("NextTargetTaken", s),
+            s["next"] == 1 && !holds,
+            "{s:?}: {at:?}"
+        );
+        if today.action_enabled("LookClosesAtAPoint", s) {
+            closes += 1;
+        }
+        let mut after = s.clone();
+        if today.fire("LineTypedAtIdle", &mut after) {
+            assert_eq!((after["closed"], after["off_idle"]), (1, 0), "{s:?}");
+            typed += 1;
+            late += usize::from(at == LookAt::Lapsed);
+        } else if st.confirming() && warned {
+            assert!(at_break, "{s:?}: only a break withholds an owed line");
+            withheld += 1;
+        }
+        let mut after = s.clone();
+        if today.fire("NextTargetTaken", &mut after) {
+            assert_eq!((after["next"], after["closed"]), (2, 1), "{s:?}");
+            taken += 1;
+        }
+        if s["next"] == 1 && holds {
+            waits += 1;
+        }
+        let mut anywhere = with(s, "any_point", 1);
+        if any_point.fire("LineTypedAtIdle", &mut anywhere) && anywhere["off_idle"] == 1 {
+            assert!(
+                at_break && look_types(at, false) && !look_types(at, true),
+                "{s:?}: the model types where the real step refuses"
+            );
+            caught.insert("LineTypedAtBreak");
+        }
+        let mut old = with(s, "idle_only", 1);
+        if idle_only.fire("NextTargetTaken", &mut old) && old["hid"] == 1 {
+            assert_eq!(old["next"], 1, "{s:?}: the newer build stays hidden");
+            assert!(
+                st.confirming() && !holds,
+                "{s:?}: the old read holds, the look's clock does not"
+            );
+            caught.insert("OnlyIdleClosesALook");
+        }
+    }
+    assert!(
+        closes > 0 && typed > 0 && late > 0 && withheld > 0 && taken > 0 && waits > 0,
+        "{closes} {typed} {late} {withheld} {taken} {waits}"
+    );
+    assert_eq!(
+        caught,
+        BTreeSet::from(["LineTypedAtBreak", "OnlyIdleClosesALook"])
+    );
+}
+
+/// No law of the model is one nothing breaks: the non-vacuity sweep finds no fault, and each
+/// action dead at the committed config is a negative control that breaks a law alone.
+#[test]
+fn every_law_of_the_model_is_broken_by_a_mutant() {
+    let model = harness_upgrade_progress_model();
+    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
+    assert!(faults.is_empty(), "{faults:?}");
+    let controls = aterm_spec::verify::audit_dead_negative_controls(std::slice::from_ref(&model));
+    assert_eq!(controls, Ok(9), "the model's mutants, each a control");
+}
+
+/// A newer build behind a finished move's look is taken, as a law of every fair behaviour and not
+/// of single steps alone: the interpreter's full audit of the model's three liveness laws, each
+/// with the fairness it needs and no more, and each broken by its mutants alone.
+#[test]
+fn the_models_liveness_laws_hold_and_their_mutants_break_them() {
+    let m = harness_upgrade_progress_model();
+    for (live, mutants) in [
+        (aterm_models_harness::harness_upgrade_progress_liveness(), 2),
+        (aterm_models_harness::harness_upgrade_press_liveness(), 1),
+        (aterm_models_harness::harness_upgrade_look_liveness(), 1),
+    ] {
+        assert_eq!(
+            aterm_spec::verify::audit_liveness(&m, &live),
+            Ok(mutants),
+            "{}",
+            live.name
+        );
     }
 }
 

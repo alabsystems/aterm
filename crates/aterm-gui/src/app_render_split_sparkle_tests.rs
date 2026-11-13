@@ -251,7 +251,7 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     let focus = app.split_active_stub_tab(wid);
     configure_pane_backgrounds(&app, focus);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.recompute_sparkle();
     app.sparkle = None;
@@ -354,7 +354,7 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let right = app.split_active_stub_tab(wid);
     configure_pane_backgrounds(&app, right);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.recompute_sparkle();
     app.sparkle = None;

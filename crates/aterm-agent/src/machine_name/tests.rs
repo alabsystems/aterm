@@ -1264,6 +1264,7 @@ fn in_a_fleet_is_the_vaults_standing_or_a_fleet_key() {
         InFleet::In,
         InFleet::Joining,
         InFleet::Out,
+        InFleet::Paused(String::new()),
         InFleet::Unread(String::new()),
     ]
     .iter()
@@ -1275,21 +1276,50 @@ fn in_a_fleet_is_the_vaults_standing_or_a_fleet_key() {
             ("in", "in a fleet"),
             ("joining", "joining a fleet"),
             ("out", "not in a fleet"),
+            ("paused", "fleet paused"),
             ("unread", "fleet not read"),
         ]
     );
 }
 
-/// The read: no fleet key and a home with no vault is out, and a fleet key that reads is in.
+/// A retained key is active only under admitted custody; an explicit take restores it.
 /// Under a private state root (a test binary) no vault is read: `$HOME`'s is the person's.
 #[test]
-fn a_fleet_key_is_in_and_a_home_with_no_vault_is_out() {
+fn a_fleet_key_reports_its_custody_without_discarding_the_key() {
     let root = state();
     let vault = aterm_secrets::client::Paths::locate_for_home(&root.path().join("home"));
     assert_eq!(InFleet::read(root.path(), Some(&vault)), InFleet::Out);
     let key = format!("{}\n", "ab".repeat(32));
     write_private(root.path(), aterm_net::fleet::KEY_FILE, key.as_bytes()).expect("a fleet key");
+    assert!(matches!(
+        InFleet::read(root.path(), Some(&vault)),
+        InFleet::Paused(_)
+    ));
+    assert_eq!(InFleet::read(root.path(), None), InFleet::In);
+    crate::fleet_vault::take_fixture(root.path(), Some(&vault)).unwrap();
     assert_eq!(InFleet::read(root.path(), Some(&vault)), InFleet::In);
+    aterm_secrets::fsx::ensure_private_dir(&vault.dir).unwrap();
+    let source = vault.dir.join("source.toml");
+    for name in ["first", "second"] {
+        aterm_secrets::fsx::write_atomic(
+            &source,
+            format!(
+                "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = \"{}\"\nhost = \"m22\"\n",
+                aterm_secrets::b64::encode_padded(&[7; 32]),
+            ).as_bytes(),
+            0o600,
+        ).unwrap();
+        assert!(matches!(
+            InFleet::read(root.path(), Some(&vault)),
+            InFleet::Paused(_)
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join(aterm_net::fleet::KEY_FILE)).unwrap(),
+            key.as_bytes()
+        );
+        crate::fleet_vault::take_fixture(root.path(), Some(&vault)).unwrap();
+        assert_eq!(InFleet::read(root.path(), Some(&vault)), InFleet::In);
+    }
     assert!(super::standing_vault().is_none(), "a test reads no vault");
 }
 

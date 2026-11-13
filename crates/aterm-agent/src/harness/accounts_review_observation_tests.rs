@@ -438,3 +438,80 @@ fn a_reviews_login_error_ends_a_claude_login_its_profile_names() {
         assert_eq!(signed_out, named, "own home {own_home}, named {named}");
     }
 }
+
+/// AN UNLISTED LOGIN'S CHECK REACHES THE JOURNAL UNDER ITS OWN ACCOUNT: no roster row lists the
+/// default login, so the store has no record to carry what a review or a status read learned;
+/// the note names the account its files name, `signed-out` for a login that ended and `auth ok`
+/// for one that served.
+/// CONTROLS: a usage limit says nothing of the sign-in; a home whose files name no account, a
+/// CLI whose files aterm reads no account from, and a Mac with no key for the account, say
+/// nothing at all.
+#[test]
+fn an_unlisted_logins_check_is_noted_under_the_account_its_files_name() {
+    // One account per realm here: its key names the realm.
+    fn keyer(realm: &str, email: &str) -> Option<String> {
+        (email == "unlisted@example.test").then(|| match realm {
+            "claude" => "ac-00000000000000c1".to_owned(),
+            _ => "ac-00000000000000c2".to_owned(),
+        })
+    }
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let claude = root.path().join(Cli::Claude.accounts().default_home);
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        root.path().join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"unlisted@example.test"}}"#,
+    )
+    .unwrap();
+    let codex = root.path().join("codex-home");
+    write_codex_login(&codex, "unlisted@example.test");
+    let bare = root.path().join("bare").join(".claude");
+    fs::create_dir_all(&bare).unwrap();
+    let said = |cli, home: &Path, outcome| {
+        super::super::journal::with_keyer(keyer, || unlisted_login_notes(cli, home, outcome, NOW))
+            .into_iter()
+            .map(|note| {
+                (
+                    note.kind,
+                    note.why,
+                    note.account.map(|key| key.as_str().to_owned()),
+                    note.cli,
+                    note.t,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let ended = Outcome::Ended(Ended::ReviewAuth);
+    for (cli, home) in [(Cli::Claude, &claude), (Cli::Codex, &codex)] {
+        let (realm, email) =
+            super::super::journal::claims_of(cli, "unlisted@example.test").unwrap();
+        let key = keyer(&realm, &email);
+        let t = u64::try_from(NOW).unwrap();
+        assert_eq!(
+            said(cli, home, ended),
+            vec![("signed-out", None, key.clone(), cli.id(), t)],
+            "{cli:?}"
+        );
+        assert_eq!(
+            said(cli, home, Outcome::Worked),
+            vec![("auth", Some("ok"), key, cli.id(), t)],
+            "{cli:?}"
+        );
+        assert!(
+            said(cli, home, Outcome::Limited(None)).is_empty(),
+            "CONTROL: {cli:?}"
+        );
+        assert!(
+            unlisted_login_notes(cli, home, ended, NOW).is_empty(),
+            "CONTROL: no key for the account, {cli:?}"
+        );
+    }
+    assert!(
+        said(Cli::Claude, &bare, ended).is_empty(),
+        "CONTROL: no account named"
+    );
+    assert!(
+        said(Cli::Grok, &codex, ended).is_empty(),
+        "CONTROL: no reader"
+    );
+}

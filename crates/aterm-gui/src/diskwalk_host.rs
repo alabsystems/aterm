@@ -65,6 +65,11 @@ pub(crate) const GROWTH_WINDOW: Duration = Duration::from_secs(600);
 pub(crate) const TOP_DIRS: usize = 8;
 const NOT_MEASURED_ROWS: usize = 16;
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
+/// How long a walk in flight keeps no directory open between its steps on Windows, where an open
+/// directory fails a rename of every folder above it: a rename in the walk's way that is tried
+/// again at least this often gets through within one step ([`PUBLISH_EVERY`]) and this.
+#[cfg(windows)]
+const RELEASED_FOR: Duration = Duration::from_millis(100);
 /// How often the slow tier counts the entries of the build profiles outside every root.
 pub(crate) const PROFILES_EVERY: Duration = Duration::from_secs(600);
 const MAX_CHECKOUTS: usize = 512;
@@ -547,7 +552,9 @@ pub(crate) struct Probe {
 }
 
 /// The walker's whole answer, stored after each change: one board every scope is read from.
-#[derive(Debug, Default)]
+/// Two boards that compare equal tell every reader the same thing, so the walker stores (and
+/// wakes the loop for) only one that differs from the last it stored ([`Engine::publish_if_dirty`]).
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct Published {
     /// Every tab the facts named.
     pub(crate) tabs: Vec<TabFacts>,
@@ -1387,7 +1394,10 @@ struct Engine {
     budget: GlanceBudget,
     walker: Walker,
     active: Option<Active>,
+    /// Something the board reads may have moved since the last publication.
     dirty: bool,
+    /// The board last stored: a publication equal to it is not stored again.
+    last: Option<Arc<Published>>,
     /// Sleeps and walk starts, for [`Probe`].
     #[cfg(test)]
     tally: (u64, u64),
@@ -1438,6 +1448,7 @@ impl Engine {
             walker: Walker::new(),
             active: None,
             dirty: false,
+            last: None,
             #[cfg(test)]
             tally: (0, 0),
         }
@@ -1462,6 +1473,33 @@ impl Engine {
                 }
             }
             self.publish_if_dirty();
+            #[cfg(windows)]
+            if self.active.is_some() && !self.rest_released() {
+                return;
+            }
+        }
+    }
+
+    /// Close the walk in flight's directories and keep them closed for [`RELEASED_FOR`], taking
+    /// messages as they come; `false` when the thread is to stop.
+    #[cfg(windows)]
+    fn rest_released(&mut self) -> bool {
+        self.walker.release();
+        let until = Instant::now() + RELEASED_FOR;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            match self.inbox.recv_timeout(left) {
+                Ok(msg) => {
+                    if !self.apply(msg) {
+                        return false;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => return true,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
         }
     }
 
@@ -2150,6 +2188,10 @@ impl Engine {
                 }
             }
         }
+        // The thread turns to other work now (publishing, discovery, the slow tier's profile
+        // walks): the walk keeps no directory open meanwhile, which on Windows would fail a
+        // rename of every folder above its cursor.
+        self.walker.release();
         let now = Instant::now();
         if pace == Pace::Glance {
             self.budget.charge(now, cost.spent());
@@ -2323,12 +2365,21 @@ impl Engine {
         }
     }
 
+    /// Store the board and wake the loop, when something may have moved and the board differs
+    /// from the one last stored: a periodic discovery that finds the same panes, claims, pools
+    /// and records stores nothing and wakes nothing, so a deck at rest does not wake the loop
+    /// every [`DISCOVER_EVERY`] for a board it already holds.
     fn publish_if_dirty(&mut self) {
         if !self.dirty {
             return;
         }
         self.dirty = false;
-        let published = Arc::new(self.published());
+        let published = self.published();
+        if self.last.as_deref() == Some(&published) {
+            return;
+        }
+        let published = Arc::new(published);
+        self.last = Some(Arc::clone(&published));
         let proxy = self.proxy.as_ref();
         self.out.store(published, || {
             if let Some(proxy) = proxy {
@@ -2899,12 +2950,53 @@ pub(crate) struct DiskwalkHost {
     proxy_installed: bool,
     started: bool,
     facts_due: Option<Instant>,
+    /// Something that can move a pane's facts (input, output, a desk change) came after the
+    /// last read: the loop owes a read at `facts_due` while a scope is demanded.
+    facts_owed: bool,
     sent_facts: Option<Facts>,
     huge_seen: u64,
     /// When the deck last asked, and what.
     deck_asked: Option<(Instant, Vec<(DiskScope, Pace)>)>,
     /// Each pane's last OSC 7 report read, kept while its terminal is busy.
     reports: HashMap<u64, Option<CwdReport>>,
+}
+
+impl DiskwalkHost {
+    /// Something that was not a timer woke the loop: a pane's front program, its OSC 7 report
+    /// or the tabs may have moved, so a read of the facts is owed ([`Self::facts_deadline`]).
+    pub(crate) const fn note_activity(&mut self) {
+        self.facts_owed = true;
+    }
+
+    /// Whether this service reads the panes' facts (asked by a fresh demand, or due), and when
+    /// it does, the next read's time: [`FACTS_EVERY`] while a scope is `demanded`, else
+    /// [`FACTS_IDLE_EVERY`]. A read pays what was owed.
+    pub(crate) fn facts_now(&mut self, now: Instant, wanted: bool, demanded: bool) -> bool {
+        if !wanted && self.facts_due.is_some_and(|due| now < due) {
+            return false;
+        }
+        let every = if demanded {
+            FACTS_EVERY
+        } else {
+            FACTS_IDLE_EVERY
+        };
+        self.facts_due = Some(now + every);
+        self.facts_owed = false;
+        true
+    }
+
+    /// The loop's deadline for an owed read while a scope is `demanded`: the walker no longer
+    /// wakes the loop after each discovery, so a change heard between reads (a `cd`'s OSC 7, a
+    /// program brought to the front) reaches the walker at `facts_due`, not at whatever wake
+    /// comes next. Nothing owed, nothing demanded: no deadline, so a window at rest wakes for
+    /// none.
+    pub(crate) fn facts_deadline(&self, demanded: bool) -> Option<Instant> {
+        if self.facts_owed && demanded {
+            self.facts_due
+        } else {
+            None
+        }
+    }
 }
 
 /// A pane's OSC 7 report, or `Err` while its terminal is locked.
@@ -2975,19 +3067,18 @@ impl crate::App {
         }
         self.ask_for_deck(now);
         let wanted = DISKWALK.facts_wanted.swap(false, Ordering::Relaxed);
-        if wanted || self.diskwalk.facts_due.is_none_or(|due| now >= due) {
-            let every = if DISKWALK.demanded(now) {
-                FACTS_EVERY
-            } else {
-                FACTS_IDLE_EVERY
-            };
-            self.diskwalk.facts_due = Some(now + every);
+        if self.diskwalk.facts_now(now, wanted, DISKWALK.demanded(now)) {
             let facts = self.diskwalk_facts();
             if self.diskwalk.sent_facts.as_ref() != Some(&facts) {
                 DISKWALK.send(ToWalker::Facts(facts.clone()));
                 self.diskwalk.sent_facts = Some(facts);
             }
         }
+    }
+
+    /// The loop's deadline for the panes' facts ([`DiskwalkHost::facts_deadline`]).
+    pub(crate) fn diskwalk_deadline(&self, now: Instant) -> Option<Instant> {
+        self.diskwalk.facts_deadline(DISKWALK.demanded(now))
     }
 
     /// `Wake::DiskWalk`: the walker published, or a reader asked a scope anew.

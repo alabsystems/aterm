@@ -6,10 +6,14 @@
 # `[patch.crates-io]`, so rustybuzz, ttf-parser and skrifa resolve with their
 # real registry dependencies (core_maths -> libm, smallvec, log), not aterm's
 # first-party facades. skrifa runs here on macOS, whose shipped renderer uses
-# CoreText instead. Its Cargo.lock pins the versions aterm's own
-# lockfile held when the corpora were recorded; its aterm path crates move
-# with the workspace's version at each `ship release --bump`, so a `--locked`
-# run (and the Linux lane's read-only checkout) keeps working.
+# CoreText instead. Its Cargo.lock pins the registry versions aterm's own
+# lockfile held when the corpora were recorded. Its path crates stand at their
+# own versions (aterm's at 0.0.0), never the workspace's, so `ship release
+# --bump`, which moves only a path crate at the version it bumps from, leaves
+# this lock as it is. It goes stale when a path crate gains a dependency: a
+# `--locked` run (and the Linux lane's read-only checkout) then fails until
+# `targo update --workspace` here relocks the path crates (`--workspace` keeps
+# the registry pins).
 #
 # ttf-parser is built with `gvar-alloc`, as aterm's Linux build shipped it
 # until LW.5 (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph turned

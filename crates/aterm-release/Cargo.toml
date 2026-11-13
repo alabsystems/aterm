@@ -10,22 +10,30 @@ repository.workspace = true
 authors.workspace = true
 description = "aterm — the one-command release cutter behind the `targo --unverified ship` alias: ledger claim, universal build, bundle/sign/DMG, tag, one publication onto the release channel."
 
-# Binary-only (src/main.rs says why). The integration tests `#[path]`-mount src/ into one
+# The cutter is the binary. The integration tests `#[path]`-mount its src/ into one
 # test binary, tests/it/main.rs; every mount recompiles the cutter and reruns its inline
 # tests, so this bin has `test = false` and each inline test runs once, in `it`:
 #  - `targo --unverified test --bin aterm-release` runs nothing; `-p aterm-release` and
-#    `--tests` run `it`.
+#    `--tests` run the lib's tests and `it`.
 #  - `it` reaches `pub(crate)` items through the mounts, which carry
 #    `#[allow(dead_code)]`; the dead-code line is this binary's build, not the tests'.
-# A lib target would run each inline test once without any mounts, but every `pub`
-# item would then be exported and escape dead_code, and any crate could link the
-# cutter. That is a change to the spec's file plan, not to the test layout.
+# The cutter's modules stay out of the lib: there every `pub` item would be exported and
+# escape dead_code, and any crate could link the cutter.
 [[bin]]
 name = "aterm-release"
 path = "src/main.rs"
 test = false
 
+# The lib holds only what needs none of the cutter: the repair worker a failed cut opens
+# (src/repair.rs), which the binary links. Its tests run in the lib's own test binary
+# (`targo --unverified test -p aterm-release --lib`), without compiling the cutter.
+[lib]
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # RFC3339 civil-calendar math (`aterm_types::rfc3339`).
 # The identity record's input names (`aterm_stamp::input`), which release_env and `ship dev-app`
 # set for the `aterm` package's build script.
@@ -99,8 +107,8 @@ atpkg-keys = { workspace = true }
 # `ship site` builds alab.systems' `/terminal` engine itself (site/engine.rs): the
 # CPU module's JS glue comes from `verify glue`'s generator in process, the shipping
 # wasm-opt flags are the ones the wasm perf lane runs, and the wasm32 pin's rustup is
-# found the way the STOCK EXCEPTION lanes find it. First-party, no cycle: nothing
-# links this binary-only crate.
+# found the way the STOCK EXCEPTION lanes find it. First-party, no cycle: no crate
+# depends on this one.
 aterm-verify = { workspace = true }
 # The release layer `ship provision` audits (provision/layer.rs, design §4.6) is
 # aterm-converge items: one engine with `aterm init`, whose base report it reads back

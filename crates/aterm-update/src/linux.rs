@@ -1212,15 +1212,24 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
     }
     state.enabled = true;
     state.high_water = state.high_water.max(current_build);
-    state.outcome = if !crate::automatic() {
-        "Updates are on for this copy \u{2014} automatic checks are off, so `aterm update check` \
-         looks for a new release"
-    } else if aterm_update_core::settings::update_auto_apply() {
-        "Updates are on for this copy \u{2014} new releases install by themselves; running \
-         sessions are never restarted"
-    } else {
-        "Updates are on for this copy \u{2014} new releases download by themselves and `aterm \
-         update apply` installs them"
+    state.outcome = match crate::automatic_at_launch() {
+        Some(false) => {
+            "Updates are on for this copy \u{2014} automatic checks are off, so `aterm update \
+             check` looks for a new release"
+        }
+        None => {
+            "Updates are on for this copy \u{2014} aterm could not read its settings just now; \
+             automatic checks follow `[update] enabled` once it can, and `aterm update check` \
+             looks for a new release now"
+        }
+        Some(true) if aterm_update_core::settings::update_auto_apply() => {
+            "Updates are on for this copy \u{2014} new releases install by themselves; running \
+             sessions are never restarted"
+        }
+        Some(true) => {
+            "Updates are on for this copy \u{2014} new releases download by themselves and `aterm \
+             update apply` installs them"
+        }
     }
     .into();
     context.save(&state)?;
@@ -1936,12 +1945,21 @@ fn count_start_locked(
     Ok(false)
 }
 
-/// A start of this executable reached its healthy checkpoint in the GUI entry (a window's first frame, or a `--headless` instance's bound socket).
-pub fn confirm(current_build: u64, current_commit: &str) -> bool {
+/// A start of this executable asks whether its trial is settled. At a `checkpoint` in the GUI
+/// entry (a window's first frame, or a `--headless` instance's bound socket) it confirms the
+/// trial; before one it only reads whether a trial is owed. A process running some other file
+/// than the one on trial owes nothing (that file's own starts settle it), and a read or lock
+/// that failed is [`crate::BootHealthVerdict::Unanswered`], which the caller bounds.
+pub fn confirm(
+    current_build: u64,
+    current_commit: &str,
+    checkpoint: bool,
+) -> crate::BootHealthVerdict {
+    use crate::BootHealthVerdict;
     let lane = confirm_lane(SESSION_LANE.load(Ordering::Acquire));
-    (|| -> Result<bool, String> {
+    (|| -> Result<BootHealthVerdict, String> {
         let Ok(context) = context() else {
-            return Ok(true);
+            return Ok(BootHealthVerdict::NO_TRIAL);
         };
         let owes = |state: &State| {
             state.trial.as_ref().is_some_and(|trial| {
@@ -1950,7 +1968,15 @@ pub fn confirm(current_build: u64, current_commit: &str) -> bool {
             })
         };
         if !context.read_state()?.is_some_and(|state| owes(&state)) {
-            return Ok(true);
+            return Ok(BootHealthVerdict::NO_TRIAL);
+        }
+        if !checkpoint {
+            return Ok(BootHealthVerdict::Pending {
+                why: "this executable's update trial waits for this start's first frame or \
+                      control socket"
+                    .to_string(),
+                retry_after: None,
+            });
         }
         let _lock = context.lock()?;
         let mut state = context.read_state()?.ok_or(MISSING_ENROLLMENT)?;
@@ -1962,9 +1988,14 @@ pub fn confirm(current_build: u64, current_commit: &str) -> bool {
             current_commit,
             proc_self_inode()?,
         )
-        .map(|confirmed| matches!(confirmed, Confirmed::Yes | Confirmed::NotPending))
+        .map(|confirmed| match confirmed {
+            Confirmed::Yes => BootHealthVerdict::Confirmed {
+                settled: Some(current_build),
+            },
+            Confirmed::NotPending | Confirmed::OtherFile => BootHealthVerdict::NO_TRIAL,
+        })
     })()
-    .unwrap_or(false)
+    .unwrap_or_else(|why| BootHealthVerdict::Unanswered { why })
 }
 
 /// An interactive terminal session of this executable proved healthy (its shell's first output reached the terminal).

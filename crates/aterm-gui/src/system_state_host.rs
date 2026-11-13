@@ -30,8 +30,10 @@ pub struct InitialSetupHandlers {
     /// Start Check again for `plan`: its forced reading of every row, and the
     /// check itself, which a setup pass holding the worker refuses (design
     /// §3.2). Check again started when either did; the window labels it a
-    /// check only when the check did.
-    pub check: fn(Plan) -> CheckStarted,
+    /// check only when the check did. A press ([`CheckBy::Press`]) also wakes
+    /// the run's worker, which lifts every stage aterm parked; the page's own
+    /// reading ([`CheckBy::Page`]) reads and lifts nothing.
+    pub check: fn(Plan, CheckBy) -> CheckStarted,
     pub restore: fn() -> bool,
     pub status: fn() -> SetupStatus,
     /// Whether this login currently owns this Mac's local graphic console. Read only when
@@ -82,6 +84,10 @@ pub struct InitialSetupHandlers {
     /// access history. Refresh observations and finish any
     /// previously owed preference work on a worker, without admitting prompts.
     pub fda_granted: fn(),
+    /// A verified Full Disk Access grant reads off in the window (its consent card's own
+    /// probe): read the Access rows again on a worker, so `setup=` and the page follow what is
+    /// read now rather than the grant an earlier reading saw. Admits no prompt.
+    pub fda_off: fn(),
     /// The Secrets vault row's Join under its phrase field: on a worker, ALab lets this Mac in
     /// with the phrase a member shows once its person pressed Allow, as `aterm members join
     /// <phrase>` does (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 5); the receipt says
@@ -94,7 +100,7 @@ impl InitialSetupHandlers {
     pub(crate) fn inert_for_test() -> Self {
         Self {
             apply: |_, _, _, _| false,
-            check: |_| CheckStarted::default(),
+            check: |_, _| CheckStarted::default(),
             restore: || false,
             status: SetupStatus::default,
             own_console: || true,
@@ -107,6 +113,7 @@ impl InitialSetupHandlers {
             ask_access: || false,
             tools_installed: || {},
             fda_granted: || {},
+            fda_off: || {},
             join_phrase: |_, _| false,
         }
     }
@@ -171,6 +178,17 @@ impl Drop for PhraseJoinReceipt {
     }
 }
 
+/// Who asks for a Check ([`InitialSetupHandlers::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckBy {
+    /// A press of Check again: the run's worker also lifts every stage aterm parked and starts
+    /// the run's other automatic tries afresh (init-on-by-default design §6.5).
+    Press,
+    /// The page's own reading of a row a run or a Check could not confirm: it reads, and lifts
+    /// and starts afresh nothing, which the worker does on its own pauses.
+    Page,
+}
+
 /// What a press of Check again started ([`InitialSetupHandlers::check`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CheckStarted {
@@ -222,7 +240,17 @@ impl InitialSetupApplyReceipt {
     /// answer to an offer ([`Admission::Automatic`]), say.
     #[cfg(any(test, debug_assertions))]
     pub fn detached_as(admission: Admission, chosen: bool) -> (Self, Receiver<bool>) {
-        Self::new(admission, chosen, None, None)
+        Self::detached_with_change(admission, chosen, None)
+    }
+
+    /// A detached receipt carrying the same change delta as the page's Apply.
+    #[cfg(any(test, debug_assertions))]
+    pub fn detached_with_change(
+        admission: Admission,
+        chosen: bool,
+        changed: Option<Selection>,
+    ) -> (Self, Receiver<bool>) {
+        Self::new(admission, chosen, changed, None)
     }
 
     /// The settings the page changed since it last took the plan in force, which the worker
@@ -278,7 +306,33 @@ struct PendingApply {
     /// Stop may keep this admission's answer while withdrawing its right to
     /// release automatic permission guidance in this process.
     release_permissions: bool,
+    since: Instant,
+    /// The plan is someone's Choice or Join rather than the plan as it stands.
+    chosen: bool,
 }
+
+impl PendingApply {
+    /// See [`Admission::holds_unsaved_work`].
+    fn holds_unsaved_work(&self) -> bool {
+        self.admission.holds_unsaved_work(self.chosen)
+    }
+
+    /// An Apply that holds no unsaved work has had longer than one attempt takes and still is not
+    /// durable. It holds no update past this. A successor derives the offer's by-itself answer again.
+    /// A control client's Apply of the plan as it stands is only ever Set up now under a saved Stop:
+    /// the Stop stands, nothing runs, and the client presses again.
+    fn settled_unpressed(&self) -> bool {
+        !self.holds_unsaved_work() && self.since.elapsed() >= UNPRESSED_APPLY_SETTLE
+    }
+}
+
+/// How long an Apply nobody pressed may hold an update while it finds its footing: past one
+/// attempt's wait for the setup records (`CHOICE_LOCK_WAIT`, 10 s) and that attempt's write.
+pub(crate) const UNPRESSED_APPLY_SETTLE: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    UNPRESSED_APPLY_SETTLE.as_secs() < crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+);
 
 static HANDLERS: Mutex<Option<InitialSetupHandlers>> = Mutex::new(None);
 
@@ -288,11 +342,72 @@ pub fn set_initial_setup_handlers(handlers: InitialSetupHandlers) {
     }
 }
 
+/// A terminating signal ends this window, which dies of it with no quit of its event loop
+/// (`crate::harness_host::arm_claims_off_as_the_window_dies`): the setup stages running now are
+/// cut off by no crash, as a quit's are ([`InitialSetupHandlers::cut_off`]), so the next launch
+/// resumes them without counting this begin toward a park.
+#[cfg(target_os = "macos")]
+pub(crate) fn note_setup_cut_off_as_the_window_dies() {
+    let handlers = HANDLERS.lock().ok().and_then(|handlers| *handlers);
+    if let Some(handlers) = handlers {
+        (handlers.cut_off)(true);
+    }
+}
+
 pub fn publish_initial_setup_status(status: SetupStatus) {
-    crate::workstation_setup::send_setup_wake(Wake::InitialSetupStatus {
+    let taken = crate::workstation_setup::send_setup_wake(Wake::InitialSetupStatus {
         generation: None,
         status,
     });
+    readings_delivery(|delivery| delivery.status_sent(taken));
+}
+
+/// Whether the window is owed the setup worker's readings: its loop has taken none yet, or a
+/// publication of them since the last it took found no loop to take it. The window registers
+/// its wake proxy at its first pass after it painted (`App::tick_workstation_setup`), and a
+/// publication made before that is dropped. The first readings the loop takes also hand the
+/// window the callback it reads them with on every later status
+/// (`App::receive_system_state_readings`), so they are owed from the launch on, whether or not
+/// anything was dropped.
+pub(crate) struct ReadingsDelivery(std::sync::atomic::AtomicBool);
+
+impl ReadingsDelivery {
+    /// A launch's record: the loop has taken no readings, so they are owed.
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    /// A status was sent, and the loop took it or not. One the loop dropped leaves the window
+    /// without the readings it carried. One it took changes nothing here: only readings the
+    /// loop took ([`Self::readings_sent`]) say the window holds them, which at most costs one
+    /// more publication of them.
+    fn status_sent(&self, taken: bool) {
+        if !taken {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The readings were sent, and the loop took them or not. The window reads them as the wake
+    /// is delivered, so one the loop took leaves it nothing older.
+    fn readings_sent(&self, taken: bool) {
+        self.0.store(!taken, std::sync::atomic::Ordering::Release);
+    }
+
+    fn undelivered(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+static READINGS_DELIVERY: ReadingsDelivery = ReadingsDelivery::new();
+
+/// Ask `ask` of the record of what the window's loop took: this process's, or, on a thread
+/// where a test stands in for the loop (`SetupLoopForTest`), that stand-in's.
+fn readings_delivery<R>(ask: impl FnOnce(&ReadingsDelivery) -> R) -> R {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(window) = crate::workstation_setup::SetupLoopForTest::standing_in() {
+        return ask(&window.delivery);
+    }
+    ask(&READINGS_DELIVERY)
 }
 
 /// The setup worker's already-owned observations and current stage, read without
@@ -331,7 +446,18 @@ impl SetupReadings {
 /// Publish already-owned readings. The pure callback is invoked when delivered,
 /// so a queued wake cannot reinstall an earlier observation or stage state.
 pub fn publish_initial_setup_readings(read: fn() -> SetupReadings) {
-    crate::workstation_setup::send_setup_wake(Wake::InitialSetupReadings(read));
+    let taken = crate::workstation_setup::send_setup_wake(Wake::InitialSetupReadings(read));
+    readings_delivery(|delivery| delivery.readings_sent(taken));
+}
+
+/// Whether the window is owed the setup worker's readings: its loop has taken none since the
+/// launch, or a publication of them, alone ([`publish_initial_setup_readings`]) or in a status
+/// ([`publish_initial_setup_status`]), found no window loop to take it and none the loop took
+/// has followed. The window then holds no readings, or may hold older ones than the worker's,
+/// and whoever publishes them again to a loop that takes them ends that.
+#[must_use]
+pub fn initial_setup_readings_undelivered() -> bool {
+    readings_delivery(ReadingsDelivery::undelivered)
 }
 
 /// The dev seam that shows System State a fixed scenario in place of the
@@ -359,9 +485,9 @@ pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 /// ([`App::person_at_this_screen`]): a person who just opened aterm has.
 pub(crate) const PERSON_PRESENT_WITHIN: Duration = Duration::from_secs(60);
 
-/// How often a page in front whose sign-outs are parked for want of a person reads presence
-/// again with nothing else to wake it ([`Host::presence_look`]), so a person who comes back,
-/// with input anywhere, wakes the parked sign-outs within this.
+/// How often a page in front whose rows an ordinary refresh withheld reads presence again with
+/// nothing else to wake it ([`Host::presence_look`]), so a person who comes back, with input
+/// anywhere, has those rows read within this.
 pub(crate) const PRESENCE_LOOK: Duration = Duration::from_secs(1);
 
 /// How the window reads whether a person is at this Mac: macOS's idle time where it gives one,
@@ -409,12 +535,13 @@ pub(crate) fn person_touched(
     published.map_or_else(os, |presence| presence.within(PERSON_PRESENT_WITHIN, now))
 }
 
-/// The setup worker's `on_screen` port, which starts the Messages and FaceTime sign-outs, a
-/// person stage (init-on-by-default design §6.4): System State in front with a person at this
-/// Mac as the window last published it ([`aterm_types::macos_setup::system_state_front`], on
-/// its events and page ticks, the screen's lock included), and a person here now, read as the
-/// worker asks: a page with nothing running owes the window no tick, so a person who walked
-/// away from it since its last publication never opens the sign-outs.
+/// The setup worker's `page_front` port, which lets an ordinary read take the rows it withholds
+/// from a page nobody is at (`aterm_cli::macos_doctor::ObservationRead::Ordinary`): System
+/// State in front with a person at this Mac as the window last published it
+/// ([`aterm_types::macos_setup::system_state_front`], on its events and page ticks, the
+/// screen's lock included), and a person here now, read as the worker asks: a page with nothing
+/// running owes the window no tick, so a person who walked away from it since its last
+/// publication has no withheld row read.
 #[must_use]
 pub fn system_state_on_screen() -> bool {
     aterm_types::macos_setup::system_state_front()
@@ -423,6 +550,10 @@ pub fn system_state_on_screen() -> bool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some_and(|presence| presence.within(PERSON_PRESENT_WITHIN, Instant::now()))
 }
+
+/// How often, at most, the window reads whether this login's screen is away while the sign-outs
+/// wait on it ([`App::watch_session_return`]).
+pub(crate) const SESSION_LOOK: Duration = Duration::from_secs(1);
 
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,9 +595,17 @@ pub(crate) struct Host {
     /// Reads in a row that met a write of the saved setup ([`SetupStatus::changing`]).
     changing_reads: u8,
     next_tick: Option<Instant>,
-    /// When a page in front whose sign-outs are parked for want of a person reads presence again
-    /// ([`PRESENCE_LOOK`]): its return wakes them ([`App::publish_system_state_front`]).
+    /// When a page in front whose rows are owed a read reads presence again
+    /// ([`PRESENCE_LOOK`]): the person's return reads the page again
+    /// ([`App::publish_system_state_front`]).
     presence_look: Option<Instant>,
+    /// While the setup run's sign-outs wait ([`App::watch_session_return`]): when the window last
+    /// read whether this login's screen is away, and what it read.
+    session_look: Option<(Instant, bool)>,
+    /// The worker's status generation ([`SetupStatus::observed_generation`]) a read for a person
+    /// at the page last covered: a status the person is at that still owes a read is read once
+    /// per generation, and again at each return ([`App::publish_system_state_front`]).
+    read_for_a_person: Option<u64>,
     generation: u64,
     /// An offer was shown in this process: a later one (an offer no window could show the first
     /// time, or one whose page closed before it answered) opens its tab behind the person's,
@@ -488,6 +627,11 @@ pub(crate) struct Host {
     /// A new approval can keep the same plan and still needs fresh Access rows.
     observed_access_revision: Option<u64>,
     action_refusal: Option<SetupStatusRow>,
+    /// See [`SetupStatus::stopped_wait`]. Kept here so a page opened again keeps it too.
+    stopped_wait: bool,
+    /// The same Stop's hold on the automatic access steps. A person's Turn On… asks for those and ends
+    /// only this one: the plan's changes still wait for Set up now or a group.
+    stopped_access: bool,
     latest_status: SetupStatus,
     /// Read the worker's current owned facts at delivery. No observation or
     /// admission is retained here, and full status replies keep their other fields.
@@ -550,35 +694,6 @@ impl Host {
         self.generation
     }
 
-    /// Whether the run's Accounts stage, a person stage, is parked for want of a person: the
-    /// plan in force manages a Messages or FaceTime sign-out whose row does not read settled, its
-    /// run has not finished, and the stage's last pass said it waits for a person at this Mac
-    /// ([`aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON`]). Only then does a page in
-    /// front read presence again by itself ([`Self::presence_look`]): a sign-out waiting for
-    /// Check again, one that failed, or one waiting for Accessibility changes nothing on a
-    /// person's return, so it owes the page no look and no timer wake (§5.6's idle budget).
-    fn sign_outs_wait_for_a_person(&self) -> bool {
-        let status = &self.latest_status;
-        !status.finished
-            && status.rows.iter().any(|row| {
-                row.detail
-                    .ends_with(aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON)
-            })
-            && status.plan.as_ref().is_some_and(|plan| {
-                aterm_types::macos_setup::Group::Accounts
-                    .settings()
-                    .iter()
-                    .any(|setting| {
-                        plan.selection.contains(*setting)
-                            && !status.observed.iter().any(|observation| {
-                                observation.subject
-                                    == aterm_types::macos_setup::Subject::Setting(*setting)
-                                    && observation.standing.settled()
-                            })
-                    })
-            })
-    }
-
     /// The next observation retry or shown-page token look: a real reading timer, which the
     /// page's refresh clock must not postpone once it is due.
     fn read_timer(&self) -> Option<Instant> {
@@ -604,9 +719,11 @@ impl Host {
             .spawn(move || {
                 // Ends once the window lets the reader go and no poll is left to answer.
                 while let Ok((status, generation)) = asked.recv() {
+                    let mut status = status();
+                    status.repositories = aterm_repository_progress::read();
                     crate::workstation_setup::send_setup_wake(Wake::InitialSetupStatus {
                         generation: Some(generation),
-                        status: status(),
+                        status,
                     });
                 }
             });
@@ -785,6 +902,18 @@ impl Host {
         }
     }
 
+    /// See [`Self::stopped_access`](field@Self::stopped_access). The access lanes read this; the page
+    /// reads [`SetupStatus::stopped_wait`].
+    pub(crate) const fn stopped_access(&self) -> bool {
+        self.stopped_access
+    }
+
+    /// A press or a run nobody stopped took over from a stopped wait.
+    const fn end_stopped_wait(&mut self) {
+        self.stopped_wait = false;
+        self.stopped_access = false;
+    }
+
     /// Whether a dev scenario stands in for the worker (its actions inert).
     fn showing_fixture(&self) -> bool {
         #[cfg(any(debug_assertions, feature = "dev-seams"))]
@@ -822,6 +951,14 @@ impl App {
         }
     }
 
+    /// A verified Full Disk Access grant reads off: the worker reads the Access rows again
+    /// ([`InitialSetupHandlers::fda_off`]).
+    pub(crate) fn notify_initial_setup_fda_off(&self) {
+        if let Some(handlers) = self.system_state_handlers() {
+            (handlers.fda_off)();
+        }
+    }
+
     /// The event loop has ended: an offer nobody answered is let go, and setup
     /// resumes at the next launch, unless a Stop was pressed: the quit waits
     /// for what it owes the records ([`InitialSetupHandlers::settle`]).
@@ -839,28 +976,54 @@ impl App {
             .is_some_and(Request::pending)
     }
 
-    /// Queued setup and Restore still belong to this worker. A live installer with no
-    /// recoverable custody receipt keeps its prompt guard here until exit or detachment.
+    /// A plan someone chose and that is not yet durable ([`PendingApply::holds_unsaved_work`]), and
+    /// a Restore, still belong to this worker: that is their unsaved work. A choice waiting behind
+    /// another setup holds until that setup ends, a later choice replaces it, or a Stop lets it go
+    /// ([`SetupStatus::stoppable`]). What nobody chose holds no update: an Apply past its settle
+    /// ([`PendingApply::settled_unpressed`]) and the ALab profile's own widening
+    /// ([`SetupStatus::queued_widen`]), which the successor derives again from the records. Nor does
+    /// a live Mac Setup installer whose receipt lets the successor take its prompt guard back, since
+    /// a handoff carries its terminal like any other. One with no such receipt keeps that guard here
+    /// until it exits or detaches ([`Self::developer_tools_install_holds_handoff`]).
     pub(crate) fn system_state_handoff_pending(&self) -> bool {
         self.system_state_handoff_hold().is_some()
     }
 
     /// What of [`Self::system_state_handoff_pending`] holds, as the update lane names it: an
-    /// Apply the worker has not taken, a Restore or a queued choice is the worker's
-    /// ([`LaneHold::SystemState`]); else an installer tab that cannot travel with the handoff is
+    /// Apply someone chose, a Restore or a choice someone queued is that person's or client's
+    /// unsaved work ([`LaneHold::SetupChoice`]), which a handoff would drop; an Apply nobody
+    /// chose, queued behind another setup or not, holds until it settles
+    /// ([`LaneHold::SystemState`], at most [`UNPRESSED_APPLY_SETTLE`]); else an installer tab that cannot travel with the handoff is
     /// its own ([`LaneHold::DeveloperTools`]). An installer whose receipt lets it travel holds
     /// nothing.
     ///
+    /// [`LaneHold::SetupChoice`]: crate::native_update_lane_hold::LaneHold::SetupChoice
     /// [`LaneHold::SystemState`]: crate::native_update_lane_hold::LaneHold::SystemState
     /// [`LaneHold::DeveloperTools`]: crate::native_update_lane_hold::LaneHold::DeveloperTools
     pub(crate) fn system_state_handoff_hold(
         &self,
     ) -> Option<crate::native_update_lane_hold::LaneHold> {
         let host = &self.system_state_host;
-        if host.pending_apply.is_some()
+        let settled = host
+            .pending_apply
+            .as_ref()
+            .is_some_and(PendingApply::settled_unpressed);
+        let unpressed = host
+            .pending_apply
+            .as_ref()
+            .is_some_and(|apply| !apply.holds_unsaved_work());
+        if host
+            .pending_apply
+            .as_ref()
+            .is_some_and(PendingApply::holds_unsaved_work)
             || host.operation == Some(SetupOperation::Restore)
-            || host.latest_status.queued
+            || (host.latest_status.queued
+                && !host.latest_status.queued_widen
+                && !settled
+                && !unpressed)
         {
+            Some(crate::native_update_lane_hold::LaneHold::SetupChoice)
+        } else if host.pending_apply.is_some() && !settled {
             Some(crate::native_update_lane_hold::LaneHold::SystemState)
         } else if self.developer_tools_install_holds_handoff() {
             Some(crate::native_update_lane_hold::LaneHold::DeveloperTools)
@@ -1004,6 +1167,7 @@ impl App {
             && !self.system_state_host.latest_status.busy
             && self.system_state_host.pending.is_none()
             && self.system_state_host.pending_apply.is_none()
+            && self.system_state_host.phrase_join.is_none()
             && self
                 .native_runtime
                 .instance_by_kind(AppKind::SystemState)
@@ -1029,7 +1193,7 @@ impl App {
         self.system_state_host.action_refusal = None;
         // The page answers the offer on its first tick: tick now.
         self.system_state_host.next_tick = None;
-        self.system_state_host.latest_status = SetupStatus::default();
+        self.system_state_host.latest_status = self.system_state_host.latest_status.for_new_offer();
         let views: Vec<_> = self
             .view_store
             .iter()
@@ -1093,15 +1257,24 @@ impl App {
         if !self.system_state_host.showing_fixture() {
             status.asking_long = self.system_state_host.asking_long_at(Instant::now());
             status.ready_in = self.system_state_host.ready_in;
+            status.queued_held = self
+                .system_state_host
+                .pending_apply
+                .as_ref()
+                .is_some_and(PendingApply::holds_unsaved_work);
+            status.stopped_wait = self.system_state_host.stopped_wait;
         }
         (status, step)
     }
 
     /// The same cached worker snapshot and window intent, without the page's permission
-    /// callbacks, a status poll, or any change to the published readiness evidence.
+    /// callbacks, a status poll, or any change to the published readiness evidence, each
+    /// reading judged at this clock (an unreadable clock dates every reading after now, so none
+    /// stands: §3.5).
     pub(crate) fn cached_setup_status_fields(&self) -> String {
         crate::system_state_access::background_setup_fields(
             self.system_state_host.latest_status(),
+            aterm_time::unix_secs().unwrap_or(0),
             self.system_state_host.work_pending(),
         )
     }
@@ -1124,17 +1297,17 @@ impl App {
         // the window alone knows (its tab, Apple's installer); a scenario keeps its own.
         if !self.system_state_host.showing_fixture() {
             self.settle_missing_tools_exception();
+            status.tools_owed = self.developer_tools_owed(status.repositories_reading());
             if status.repositories_tools_wait().is_some() {
                 status.developer_tools = self.developer_tools_install_step(&status);
-            } else {
-                // A reading past the repositories' tools wait ends the calm kept since the tab
-                // installed them.
-                self.workstation_setup
-                    .developer_tools_after
-                    .settle(status.repositories_reading(), Instant::now());
             }
         }
         self.system_state_host.latest_status = status.clone();
+        // A stage running is a run a stopped wait did not stop, and one it did reach carries its own
+        // Stop. This comes before the projection, so the page reads it now.
+        if !status.running.is_empty() && !self.system_state_host.showing_fixture() {
+            self.system_state_host.end_stopped_wait();
+        }
         let (status, step) = self.project_system_state_status(status);
         // A stage running is a setup pass, whatever the window asked for last:
         // Check again and Restore never run one. A pass that took the worker
@@ -1184,6 +1357,11 @@ impl App {
     fn system_state_polls(&self, status: &SetupStatus) -> bool {
         let host = &self.system_state_host;
         status.busy
+            || (!host.showing_fixture()
+                && self
+                    .native_runtime
+                    .instance_by_kind(AppKind::SystemState)
+                    .is_some_and(|instance| !self.system_state_shown_views(instance).is_empty()))
             || host.awaiting_run
             || host.pending_apply.is_some()
             || host.operation.is_some()
@@ -1211,12 +1389,18 @@ impl App {
     /// publish (for example, `Install…` was queued behind a macOS permission gesture or started,
     /// its tab ended, or a press opened nothing), leaving the status poll as it was.
     pub(crate) fn republish_system_state_developer_tools(&mut self) {
-        if self.system_state_host.showing_fixture() {
+        // Only a status the window showed is shown again: a launch's empty one stays unshown, so
+        // an open page still asks for its first read.
+        if self.system_state_host.showing_fixture() || !self.system_state_host.status_shown {
             return;
         }
         let latest = self.system_state_host.latest_status.clone();
-        if latest.repositories_tools_wait().is_none()
-            || latest.developer_tools == self.developer_tools_install_step(&latest)
+        // Republished where the tools' typed reading moved, or where, owed, the install's step
+        // did.
+        let owed = self.developer_tools_owed(latest.repositories_reading());
+        if latest.tools_owed == owed
+            && (latest.repositories_tools_wait().is_none()
+                || latest.developer_tools == self.developer_tools_install_step(&latest))
         {
             return;
         }
@@ -1320,8 +1504,9 @@ impl App {
     }
 
     pub(crate) fn tick_system_state(&mut self, now: Instant) {
-        // The setup worker runs its on-screen steps (the sign-outs) only while
-        // System State is in front (design §6); its arrival wakes a parked run.
+        // The setup worker reads the rows it withholds from a page nobody is at only while
+        // System State is in front with a person at it (design §6); its arrival wakes a parked
+        // run.
         self.publish_system_state_front();
         // What the window says of the status (the walk's page, the join's asking running long)
         // reaches the page at once, whatever the page's own tick.
@@ -1481,35 +1666,95 @@ impl App {
     }
 
     /// Publish visibility before another event or worker step can use it: half of the setup
-    /// worker's `on_screen` port ([`system_state_on_screen`]), which starts the Messages and
-    /// FaceTime sign-outs, a person stage, only with a person at the page
+    /// worker's `page_front` port ([`system_state_on_screen`]), which lets an ordinary read take
+    /// the rows it withholds only with a person at the page
     /// ([`Self::system_state_front_with_a_person`]), and how the worker reads the other half,
     /// whether a person is here as it asks. Closing a passive copy keeps the visible page's
     /// authority; losing the last front page withdraws it even while a hidden controller
     /// survives. Every event and every page tick publishes it again; a page with nothing running
-    /// ticks only while it is in front with its sign-outs parked for want of a person, each
-    /// [`PRESENCE_LOOK`], so the published bit goes false within a second of the minute of no
-    /// input running out and true again within a second of the person's return, input anywhere,
-    /// which wakes the parked run (`aterm_types::macos_setup::on_system_state_front`). The port
-    /// never waits on a tick to go false: the worker reads presence itself, for the stage and
-    /// again right before each sign-out's clicks.
+    /// ticks only while it is in front with rows owed a read (below), each [`PRESENCE_LOOK`], so
+    /// the published bit goes false within a second of the minute of no input running out and
+    /// true again within a second of the person's return, input anywhere, which wakes a parked
+    /// run (`aterm_types::macos_setup::on_system_state_front`). The port never waits on a tick
+    /// to go false: the worker reads presence itself as it asks. The Messages and FaceTime
+    /// sign-outs read none of this: each reads its own login's session right before its clicks
+    /// (`aterm_machines::port::System::session_reach`).
+    ///
+    /// A page in front whose managed rows are owed a read ([`SetupStatus::owes_a_read`]: a read
+    /// an ordinary refresh withheld, or a private reading past standing) reads presence the same
+    /// way: a person at it is what lets those rows be read, so while the bit is true it reads the
+    /// page again, as a focus return does ([`Self::system_state_focus_returned`]), once for each
+    /// status that owes it (a withheld status that arrives after the person came back included)
+    /// and again at each return, input anywhere with no change of focus. A read that finds the
+    /// person gone changes nothing and asks for none more until they return.
     pub(crate) fn publish_system_state_front(&mut self) {
+        self.watch_session_return(Instant::now());
         let frontmost = self.system_state_frontmost();
         let front = self.system_state_front_with_a_person();
         *PRESENCE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.presence());
+        let was = aterm_types::macos_setup::system_state_front();
         aterm_types::macos_setup::set_system_state_front(front);
-        self.system_state_host.presence_look = (frontmost
-            && self.system_state_host.sign_outs_wait_for_a_person())
-        .then(|| Instant::now() + PRESENCE_LOOK);
+        // An unreadable clock dates every reading after now, which owes it a read.
+        let owes = frontmost
+            && self
+                .system_state_host
+                .latest_status
+                .owes_a_read(aterm_time::unix_secs().unwrap_or(0));
+        let generation = self.system_state_host.latest_status.observed_generation;
+        if front && owes && (!was || self.system_state_host.read_for_a_person != Some(generation)) {
+            self.system_state_host.read_for_a_person = Some(generation);
+            self.system_state_host.shown = false;
+            self.system_state_host.next_tick = None;
+        }
+        self.system_state_host.presence_look =
+            (frontmost && owes).then(|| Instant::now() + PRESENCE_LOOK);
+    }
+
+    /// A person coming back to this login's screen (unlocked, awake, switched back to it) while
+    /// the setup run's sign-outs wait ends their park at once
+    /// ([`crate::workstation_setup::session_returned`]), rather than at their next timed look,
+    /// which waits up to a quarter hour after a long lock (the doctor's `LOOK_AGAIN`, which stays
+    /// the fallback). Read at the window's events (an unlock brings the window's occlusion and the
+    /// person's input), at most once each [`SESSION_LOOK`], and only while the Accounts stage
+    /// waits ([`aterm_types::macos_setup::ACCOUNTS_STAGE`]), so no other moment pays for the
+    /// screen's reading and nothing wakes the loop by itself.
+    pub(crate) fn watch_session_return(&mut self, now: Instant) {
+        let waits = self.system_state_host.latest_status.rows.iter().any(|row| {
+            row.status == "waiting" && row.name == aterm_types::macos_setup::ACCOUNTS_STAGE.name
+        });
+        if !waits {
+            self.system_state_host.session_look = None;
+            return;
+        }
+        if self
+            .system_state_host
+            .session_look
+            .is_some_and(|(at, _)| now.saturating_duration_since(at) < SESSION_LOOK)
+        {
+            return;
+        }
+        let away = (self.screen_away)();
+        let was = self
+            .system_state_host
+            .session_look
+            .replace((now, away))
+            .map(|(_, away)| away);
+        if was == Some(true) && !away {
+            aterm_log::info!(
+                "setup: this login's screen is back while the sign-outs wait on it; they look \
+                 again now"
+            );
+            crate::workstation_setup::session_returned();
+        }
     }
 
     /// Whether a person stage may put its gesture on screen now (init-on-by-default design §6.4):
     /// System State is in front ([`Self::system_state_frontmost`]) and a person is at this Mac's
     /// screen ([`Self::person_at_this_screen`], SAFE-1's fence, moved from the admission onto the
-    /// person stages: the Messages and FaceTime sign-outs and the Command Line Tools'
-    /// authorization). The background stages never ask it. The input
+    /// person stages: the Command Line Tools' authorization, and the rows an ordinary read
+    /// withholds). The background stages never ask it. The input
     /// and screen readings (an IOKit and a window server read on this thread) are made only
     /// once the page is in front.
     pub(crate) fn system_state_front_with_a_person(&self) -> bool {
@@ -1518,7 +1763,7 @@ impl App {
 
     /// Whether a System State view is the visible, active view of a focused,
     /// on-screen window with no overlay: the only time a setup run's access
-    /// steps and the sign-outs may put a macOS gesture on
+    /// steps may put a macOS gesture on
     /// screen (design §6). A focused window macOS reports occluded (the screen
     /// locked or asleep, a screen saver up) stays key but shows nothing.
     pub(crate) fn system_state_frontmost(&self) -> bool {
@@ -1753,7 +1998,19 @@ impl App {
             // finished, and the worker keeps its ordinary durable Stop.
             SystemStateAction::Stop => {
                 let _ = self.take_system_state_press();
-                self.stop_initial_setup_permissions();
+                let status = &self.system_state_host.latest_status;
+                if status.queued && !status.queued_widen && status.running.is_empty() {
+                    // A choice waiting for another setup: the Stop lets that wait go. The Command
+                    // Line Tools' install runs beside that wait, not in it, so it stays: the Apply
+                    // took the gate to Decision, this one will never answer it, and the next status
+                    // does, for the tools' tab. These two hold the page and the automatic access
+                    // steps until a press.
+                    self.system_state_host.stopped_wait = true;
+                    self.system_state_host.stopped_access = true;
+                    self.recheck_initial_setup_permissions();
+                } else {
+                    self.stop_initial_setup_permissions();
+                }
                 if let Some(pending) = &mut self.system_state_host.pending_apply {
                     pending.release_permissions = false;
                 }
@@ -1794,6 +2051,7 @@ impl App {
                 // Only a status read after the record releases the steps, with this press as
                 // their admission: the one in flight was read before it.
                 self.person_asked_for_access();
+                self.system_state_host.stopped_access = false;
                 self.system_state_host.generation =
                     self.system_state_host.generation.wrapping_add(1);
                 self.system_state_host.status_in_flight = false;
@@ -1876,6 +2134,9 @@ impl App {
                 // reach this plan's own run.
                 self.begin_system_state_action(true, true);
                 self.note_system_state_apply(admission);
+                if admission != Admission::Automatic {
+                    self.system_state_host.end_stopped_wait();
+                }
                 // A person turning the Permissions group on asks for macOS's grants, as the offer's
                 // press does. Any other Apply (the page's automatic answer, Set up now, a Join, a
                 // press on another group) puts no macOS prompt up (AGENTS.md).
@@ -1910,13 +2171,22 @@ impl App {
                     plan: plan.clone(),
                     answer: receiver,
                     release_permissions: true,
+                    since: Instant::now(),
+                    chosen: answer.chosen,
                 });
                 let wants_repositories = plan
                     .selection
                     .contains(aterm_types::macos_setup::Setting::Repositories);
                 let started = if let Some(request) = self.system_state_host.pending.take() {
                     answer.receipt = Some(receipt);
-                    request.finish_answer(answer)
+                    // An answer that reached the worker ends a stopped wait, since the page answers
+                    // an offer whatever it holds and that run goes. One withdrawn before this took
+                    // the reply, so nothing went and the Stop stands.
+                    let delivered = request.finish_answer(answer);
+                    if delivered {
+                        self.system_state_host.end_stopped_wait();
+                    }
+                    delivered
                 } else if let Some(handlers) = handlers {
                     (handlers.apply)(plan, answer.vault_typed, answer.password, receipt)
                 } else {
@@ -1939,12 +2209,12 @@ impl App {
                 }
                 self.finish_system_state_action(started, "Setup");
             }
-            SystemStateAction::Check(plan) => {
+            SystemStateAction::Check(plan, by) => {
                 let _ = self.take_system_state_press();
                 // A read-only Check cannot revoke its durable permission decision.
                 self.begin_system_state_action(false, false);
                 let started = handlers.map_or_else(CheckStarted::default, |handlers| {
-                    let started = (handlers.check)(plan.clone());
+                    let started = (handlers.check)(plan.clone(), by);
                     // Check again is a check and a forced observation (§3.4).
                     if !(handlers.observe)(plan) {
                         aterm_log::info!("system state: the observation did not start");

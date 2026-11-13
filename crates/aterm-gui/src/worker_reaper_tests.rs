@@ -128,7 +128,7 @@ fn parked_worker(app: &mut crate::App) -> u64 {
     let session = app.next_session_id;
     app.next_session_id += 1;
     let parent = app.new_tab_parent(WID);
-    app.install_tab_session_parked(WID, crate::stub_session(session), parent);
+    app.install_tab_session_parked(WID, crate::stub_session(session), parent, false);
     app.sync_window(WID);
     session
 }

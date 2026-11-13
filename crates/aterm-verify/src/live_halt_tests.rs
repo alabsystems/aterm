@@ -106,6 +106,8 @@ fn standin_live_run() {
     }));
     let mut r = crate::ladder::Report::new("test");
     let planned = RunPlan::fixture(vec![a, b], 1);
+    // A stage meter, as a live run's, so `test-cpu-accounted` reconciles against the stage.
+    let _metering = crate::memory::metering(Some(crate::memory::Meter::new()));
     crate::testrun::run_planned(&ctx, &mut r, "test", planned, crate::checks::Check::Test);
     let rows: String = r
         .outcomes()
@@ -197,8 +199,10 @@ fn words(rows: &str) -> Vec<&str> {
 /// THE FIRST DECISIVE RED CASE ENDS ITS BINARY AND THE RUN: A's plain red ends A while its napper
 /// still waits for a release nobody writes, and B never starts. The row is FAIL with the red's
 /// finding and its nonce, the log says verify stopped A and holds no napper result, and the NOT
-/// RUN row names one of two binaries. NEGATIVE CONTROL: with no live halt the napper would wait
-/// out the hang detector and fail the stand-in's end.
+/// RUN row names one of two binaries. The CPU account counts B unstarted, not unread: where A's
+/// tree was read (macOS), the stage reconciles. NEGATIVE CONTROLS: with no live halt the napper
+/// would wait out the hang detector and fail the stand-in's end; the old account counted B, which
+/// never ran, as an unread sample (`"binary_unread":1`, `"reconciled":false`).
 #[test]
 fn a_decisive_red_case_ends_its_binary_and_the_run() {
     let dir = scratch();
@@ -219,6 +223,27 @@ fn a_decisive_red_case_ends_its_binary_and_the_run() {
             .contains("\"stopped_at\":\"libtest_fixture::c_plain\""),
         "{all}"
     );
+    let accounted = ran
+        .events
+        .lines()
+        .find(|line| line.contains("\"event\":\"test-cpu-accounted\""))
+        .unwrap_or_else(|| panic!("the CPU account: {all}"));
+    // A ran and was stopped; macOS reads its tree, every other unix host reads none.
+    let (reads, unread) = if cfg!(target_os = "macos") {
+        (1, 0)
+    } else {
+        (0, 1)
+    };
+    for field in [
+        format!("\"binary_reads\":{reads}"),
+        format!("\"binary_unread\":{unread}"),
+        "\"binary_unstarted\":1".to_owned(),
+    ] {
+        assert!(accounted.contains(&field), "{field}: {accounted}");
+    }
+    if cfg!(target_os = "macos") {
+        assert!(accounted.contains("\"reconciled\":true"), "{accounted}");
+    }
 }
 
 /// Wait for a spared case's `test-case-failed`, see A still running, release its napper.

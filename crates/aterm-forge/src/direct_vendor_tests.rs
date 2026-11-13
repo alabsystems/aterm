@@ -620,3 +620,87 @@ fn a_local_branch_named_origin_main_is_not_the_base() {
     f.commit_pin(Some(&base), &c1, "goes back to c1");
     assert_eq!(f.motion(), PinMotion::Unchanged);
 }
+
+#[test]
+fn the_pin_judgments_verify_makes_first_hold_the_checkout_and_the_motion_with_real_git() {
+    let f = Fixture::new("verify");
+    let root = f.root.path();
+    let a = f.astream_commit(None, "a");
+    let b = f.astream_commit(None, "b");
+    let c = f.astream_commit(None, "c");
+    let at = |commit: &str| {
+        f.run(
+            &root.join(SUBMODULE),
+            &["checkout", "-q", "--detach", commit],
+        )
+    };
+    let judged = || {
+        for var in REPO_ENV {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is exported: unset it, or this test reads a real repository"
+            );
+        }
+        astream_pin(root)
+    };
+
+    std::fs::write(root.join("README"), "x").unwrap();
+    f.run(root, &["add", "README"]);
+    f.run(root, &["commit", "-q", "-m", "no submodule yet"]);
+    assert_eq!(judged(), Ok(None), "no gitlink, nothing to judge");
+
+    let base = f.commit_pin(None, &a, "main pins a");
+    f.run(root, &["update-ref", "refs/remotes/origin/main", &base]);
+    at(&a);
+    assert_eq!(judged(), Ok(Some(a.clone())));
+
+    // A bump that main later overtook still went forward: the pin is judged against main's at
+    // the merge-base, never against main's tip.
+    let topic = f.commit_pin(Some(&base), &b, "topic bumps to b");
+    let main = f.commit_pin(Some(&base), &c, "main moves on to c");
+    f.run(root, &["update-ref", "refs/remotes/origin/main", &main]);
+    f.run(root, &["checkout", "-q", "--detach", &topic]);
+    at(&b);
+    assert_eq!(judged(), Ok(Some(b.clone())));
+
+    // A merge of main that records the branch's old pin moves it back behind c.
+    f.run(
+        root,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-s",
+            "ours",
+            "-m",
+            "merge main",
+            &main,
+        ],
+    );
+    let why = judged().expect_err("b is a strict ancestor of c, main's pin at the merge-base");
+    assert!(
+        why.contains("ANCESTOR") && why.contains(&c) && why.contains(ROLLBACK_TRAILER),
+        "{why}"
+    );
+    f.run(
+        root,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "keep b\n\nastream-pin-rollback: c broke the sealed wire",
+        ],
+    );
+    assert_eq!(judged(), Ok(Some(b.clone())), "a declared rollback passes");
+
+    // main's own tree with the submodule left at the branch's old pin: the build would compile b.
+    f.run(root, &["checkout", "-q", "--detach", &main]);
+    let why = judged().expect_err("the checkout is off the pin");
+    assert!(
+        why.contains(&format!("checked out at {b}")) && why.contains("git submodule update"),
+        "{why}"
+    );
+    at(&c);
+    assert_eq!(judged(), Ok(Some(c)));
+}

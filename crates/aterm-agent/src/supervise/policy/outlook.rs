@@ -17,8 +17,9 @@ pub enum ExceptionKind {
     /// A spend limit, a credit balance or an account the admin switched off:
     /// no time window ends it.
     Spend,
-    /// A model bucket no reset ends (`requires usage credits`): the session
-    /// waits until its person picks another model.
+    /// A model bucket no reset ends (`requires usage credits`) whose fallback
+    /// the tab cannot make: it waits on the tab's own running jobs, or there
+    /// is no other model.
     Bucket,
     /// Claude dropped the `/goal` after an unrecoverable error.
     GoalCleared,

@@ -786,7 +786,10 @@ fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool 
     };
     let resolved = crate::app_config::resolve_trail_style(config.cursor_trail_style_raw());
     let trail_consistent = *snapshot.assets.trail_style
-        == crate::app_config::TrailStyleCache::for_style(config.cursor_trail_style_raw());
+        == crate::app_config::TrailStyleCache::for_style(
+            config.cursor_trail_style_raw(),
+            config.cursor_pet_raw(),
+        );
     let kitty_consistent = match &snapshot.assets.kitty_sprite {
         crate::app_config::KittySpriteAsset::Ready { source_id, .. } => config
             .cursor_nyan_sprite

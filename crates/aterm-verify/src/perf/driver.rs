@@ -55,10 +55,12 @@ impl CargoDriver {
     }
 
     /// [`Self::command`] configured with [`workspace_build_dir`] for compiling verbs.
-    pub(crate) fn workspace_command(&self, verb: &str) -> Command {
+    pub(crate) fn workspace_command(&self, verb: &str) -> Result<Command, String> {
+        prepare_workspace_build_dir(verb, workspace_build_dir())?;
         let mut cmd = self.base_command();
         cmd.args(Self::lead(verb, workspace_build_dir()));
-        cmd
+        apply_workspace_layout(&mut cmd)?;
+        Ok(cmd)
     }
 
     fn lead(verb: &str, build_dir: Option<&str>) -> Vec<String> {
@@ -86,33 +88,69 @@ impl CargoDriver {
 
 /// Resolves the `--config` build-dir argument for performance builds in this workspace.
 pub(crate) fn workspace_build_dir() -> Option<&'static str> {
-    static DIR: OnceLock<Option<String>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let env = crate::EnvSnapshot::capture();
-        let root = super::workspace_root();
-        crate::main_build_dir(&env, &root).or_else(|| {
-            let target = target_dir().ok()?;
-            crate::fallback_build_dir(&env, &root, &target)
-        })
-    })
-    .as_deref()
+    workspace_layout().selected.as_deref()
 }
 
-/// Queries the workspace target directory from `targo metadata`.
+struct WorkspaceLayout {
+    plan: Result<crate::NativeBuildPlan, String>,
+    selected: Option<String>,
+}
+
+impl WorkspaceLayout {
+    fn resolve(env: crate::EnvSnapshot, root: PathBuf) -> Self {
+        let plan = crate::NativeBuildPlan::capture(&env, &root).map_err(|error| error.to_string());
+        let selected = plan
+            .as_ref()
+            .ok()
+            .and_then(|plan| plan.build_dir().map(str::to_owned));
+        Self { plan, selected }
+    }
+
+    fn prepare(&self, verb: &str, selected: Option<&str>) -> Result<(), String> {
+        if !LANE_VERBS.contains(&verb) {
+            return Ok(());
+        }
+        let plan = self.plan.as_ref().map_err(Clone::clone)?;
+        if selected == self.selected.as_deref() {
+            plan.prepare()
+        } else {
+            plan.prepare_target()
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn workspace_layout() -> &'static WorkspaceLayout {
+    static LAYOUT: OnceLock<WorkspaceLayout> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        let env = crate::EnvSnapshot::capture();
+        let root = super::workspace_root();
+        WorkspaceLayout::resolve(env, root)
+    })
+}
+
+/// The workspace and bench builders share this preparation immediately before a compiling
+/// command is constructed. A bench's explicit fixture directory is its own layout choice.
+pub(super) fn prepare_workspace_build_dir(
+    verb: &str,
+    selected: Option<&str>,
+) -> Result<(), String> {
+    workspace_layout().prepare(verb, selected)
+}
+
+pub(super) fn apply_workspace_layout(command: &mut Command) -> Result<(), String> {
+    let plan = workspace_layout().plan.as_ref().map_err(Clone::clone)?;
+    plan.apply_to_command(command)
+        .map_err(|error| error.to_string())
+}
+
+/// The captured workspace target shared by artifact readers and native compiler commands.
 pub(crate) fn target_dir() -> Result<PathBuf, String> {
-    let driver = cargo_driver()?;
-    let out = driver
-        .command("metadata")
-        .args(["--no-deps", "--format-version", "1"])
-        .current_dir(super::workspace_root())
-        .output()
-        .map_err(|e| format!("could not run targo metadata: {e}"))?;
-    let meta: aterm_json::Value = aterm_json::from_slice(&out.stdout)
-        .map_err(|e| format!("targo metadata did not answer JSON: {e}"))?;
-    meta.get("target_directory")
-        .and_then(aterm_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| "targo metadata names no target_directory".to_string())
+    workspace_layout()
+        .plan
+        .as_ref()
+        .map(|plan| plan.target().to_path_buf())
+        .map_err(Clone::clone)
 }
 
 /// The driver a discovered toolchain may be driven by, or why not.
@@ -139,175 +177,5 @@ pub(crate) fn cargo_driver() -> Result<&'static CargoDriver, &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_launcher_fixture(root: &std::path::Path) {
-        std::fs::create_dir(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"launcher_reuse_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 7 }\n").unwrap();
-        std::fs::write(
-            root.join("src/main.rs"),
-            r#"fn main() {
-    println!("{}|{}", std::env::var("CARGO_MANIFEST_DIR").unwrap(), std::env::var("OUT_DIR").unwrap());
-}
-"#,
-        )
-        .unwrap();
-        // Intentional compiled-in metadata in this disposable build script reproduces
-        // ring's environment fingerprint. Shipped code reads source paths at runtime.
-        std::fs::write(
-            root.join("build.rs"),
-            r#"const _: &str = env!("CARGO_MANIFEST_DIR");
-const _: Option<&str> = option_env!("OUT_DIR");
-fn main() { println!("cargo:rerun-if-changed=build.rs"); }
-"#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn nested_build_reuses_artifacts_across_launcher_metadata() {
-        const TEST: &str =
-            "perf::driver::tests::nested_build_reuses_artifacts_across_launcher_metadata";
-        const ROOT: &str = "ATERM_VERIFY_LAUNCHER_FIXTURE";
-        const PROGRAM: &str = "ATERM_VERIFY_LAUNCHER_TARGO";
-        if let Some(root) = std::env::var_os(ROOT) {
-            let root = PathBuf::from(root);
-            let driver = CargoDriver {
-                program: std::env::var_os(PROGRAM)
-                    .expect("the parent's pinned targo")
-                    .into(),
-            };
-            // The process inherited launcher metadata before the production constructor ran.
-            let mut cmd = driver.command("build");
-            cmd.args(["--offline", "--message-format=json"])
-                .current_dir(&root);
-            let output =
-                aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
-                    .expect("Cargo completed");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            std::fs::write(root.join("build.json"), output.stdout).unwrap();
-            return;
-        }
-        let driver = cargo_driver().unwrap_or_else(|why| {
-            aterm_spec::host::could_not_run(format_args!("pinned targo: {why}"))
-        });
-        let scratch = aterm_tempfile::tempdir().expect("isolated Cargo fixture");
-        let root = scratch.path();
-        write_launcher_fixture(root);
-        let mut executable = None;
-        for (launcher, want_fresh) in [("first", false), ("second", true)] {
-            let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-            cmd.args(["--exact", TEST, "--nocapture"])
-                .current_dir(root)
-                .env(ROOT, root)
-                .env(PROGRAM, &driver.program)
-                .env("CARGO_TARGET_DIR", root.join("target.noindex"))
-                .env("CARGO_BUILD_BUILD_DIR", root.join("build.noindex"))
-                .env("CARGO_MANIFEST_DIR", root.join(launcher))
-                .env("OUT_DIR", root.join(launcher).join("out"));
-            let output =
-                aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
-                    .expect("the nested Cargo test completed");
-            assert!(
-                output.status.success(),
-                "{launcher}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let built = std::fs::read_to_string(root.join("build.json")).unwrap();
-            let mut artifacts = 0;
-            for line in built.lines() {
-                let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
-                    continue;
-                };
-                if row["reason"].as_str() == Some("compiler-artifact") {
-                    assert_eq!(
-                        row["fresh"].as_bool(),
-                        Some(want_fresh),
-                        "{launcher}: {row}"
-                    );
-                    artifacts += 1;
-                    if row["target"]["name"].as_str() == Some("launcher_reuse_fixture")
-                        && let Some(path) = row["executable"].as_str()
-                    {
-                        executable = Some(PathBuf::from(path));
-                    }
-                }
-            }
-            assert_eq!(
-                artifacts, 3,
-                "the fixture's build script, library and binary"
-            );
-        }
-        let mut run = crate::exec::check_command(executable.expect("Cargo's built binary"));
-        let runtime_out = root.join("runtime-output");
-        run.env("CARGO_MANIFEST_DIR", root)
-            .env("OUT_DIR", &runtime_out);
-        super::super::bench_build::Targo::new(driver).environment(&mut run);
-        let output = aterm_uds::deadline::output_within(&mut run, aterm_spec::wait::MUST_HAPPEN)
-            .expect("the runtime fixture completed");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            format!("{}|{}", root.display(), runtime_out.display())
-        );
-    }
-
-    #[test]
-    fn a_refused_stage2_is_not_driven() {
-        let stage2 = PathBuf::from("/s/bin");
-        let refused = crate::Toolchain {
-            stage2_dir: stage2.clone(),
-            targo: stage2.join("targo"),
-            trustdoc: stage2.join("trustdoc"),
-            tippy: None,
-            trustfmt: None,
-            borrowed: Vec::new(),
-            refused: Some(stage2.clone()),
-            store_bin: None,
-            demoted: None,
-            lock: None,
-            lock_refusal: None,
-            lock_override: None,
-        };
-        let why = driver_of(&refused).expect_err("a refused directory drives nothing");
-        assert!(why.contains("NOT the toolchain"), "{why}");
-    }
-
-    #[test]
-    fn the_lane_flag_goes_on_compiling_verbs_only() {
-        let d = CargoDriver {
-            program: PathBuf::from("/s/targo"),
-        };
-        for verb in LANE_VERBS {
-            assert_eq!(CargoDriver::lane_args(verb), &["--unverified"], "{verb}");
-        }
-        assert_eq!(
-            d.display_led("metadata", None, &["--no-deps"]),
-            "/s/targo metadata --no-deps"
-        );
-        assert_eq!(
-            d.display_led("run", None, &["--release", "-p", "aterm-bench"]),
-            "/s/targo --unverified run --release -p aterm-bench"
-        );
-        let dir = Some("build.build-dir='/w/target/build.noindex'");
-        assert_eq!(
-            d.display_led("build", dir, &["--release"]),
-            "/s/targo --config build.build-dir='/w/target/build.noindex' --unverified build --release"
-        );
-        assert_eq!(d.display_led("metadata", dir, &[]), "/s/targo metadata");
-    }
-}
+#[path = "driver_tests.rs"]
+mod tests;

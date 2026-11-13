@@ -13,6 +13,10 @@ fn artifact() -> String {
     "ab".repeat(32)
 }
 
+fn artifact_digest() -> Option<[u8; 32]> {
+    crate::app_native::decode_dmg_sha256(&artifact())
+}
+
 fn read_in_flight(app: &mut crate::App, build: u64) -> Arc<AtomicBool> {
     let done = Arc::new(AtomicBool::new(false));
     app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
@@ -44,7 +48,7 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
         ApplyMode::AutomaticPastGrace,
     ] {
         let wait = app
-            .fork_lane_policy_wait(mode, target, unread(&app, &ticket))
+            .fork_lane_policy_wait(mode, target, artifact_digest(), unread(&app, &ticket))
             .expect("an automatic attempt waits while the policy is being read");
         assert!(
             wait.stops_routinely(mode),
@@ -53,7 +57,12 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
     }
     let before = Instant::now();
     let wait = app
-        .fork_lane_policy_wait(ApplyMode::Immediate, target, unread(&app, &ticket))
+        .fork_lane_policy_wait(
+            ApplyMode::Immediate,
+            target,
+            artifact_digest(),
+            unread(&app, &ticket),
+        )
         .expect("a person's apply waits while the policy is being read");
     assert!(!wait.is_activity_deferred(), "held, not deferred: {wait:?}");
     assert!(
@@ -62,8 +71,11 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
     );
     let held = wait.held_for_read_of().expect("a person's press is held");
     assert_eq!(held.target_build, target);
+    let crate::HeldPersonApplyGate::Preverify { until } = held.gate else {
+        panic!("the policy read uses the preverification gate")
+    };
     assert!(
-        held.until > before && held.until <= Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
+        until > before && until <= Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
         "bounded by the read's ceiling"
     );
 
@@ -87,8 +99,13 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
     assert!(policy.known, "the policy is known by the next park");
     assert_eq!(policy.carry_ceiling(), CarryCeiling::Repaint);
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, target, !policy.known)
-            .is_none(),
+        app.fork_lane_policy_wait(
+            ApplyMode::Automatic,
+            target,
+            artifact_digest(),
+            !policy.known,
+        )
+        .is_none(),
         "a known policy needs no wait"
     );
 }
@@ -101,7 +118,7 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     let target = running.saturating_add(1);
     read_in_flight(&mut app, target).store(true, Ordering::Release);
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, target, true)
+        app.fork_lane_policy_wait(ApplyMode::Automatic, target, artifact_digest(), true)
             .is_none(),
         "a read that ended with nothing: the fork lane parks as it always did"
     );
@@ -109,7 +126,7 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     let target = running.saturating_add(2);
     app.handoff_preverify_in_flight = None;
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, target, true)
+        app.fork_lane_policy_wait(ApplyMode::Automatic, target, artifact_digest(), true)
             .is_none(),
         "nothing is being read, so nothing is waited for"
     );
@@ -120,15 +137,19 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     let Some(spent) = Instant::now().checked_sub(Duration::from_millis(1)) else {
         aterm_spec::host::could_not_run("the monotonic clock here cannot reach back 1 ms");
     };
-    app.preverify_read_waited = Some((target, spent));
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: artifact_digest().expect("fixture digest"),
+        until: spent,
+    });
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, target, true)
+        app.fork_lane_policy_wait(ApplyMode::Automatic, target, artifact_digest(), true)
             .is_none(),
         "the wait is bounded: past its ceiling the fork lane parks"
     );
     let other = running.saturating_add(4);
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, other, true)
+        app.fork_lane_policy_wait(ApplyMode::Automatic, other, artifact_digest(), true)
             .is_none(),
         "only a read of this target is waited for"
     );
@@ -155,8 +176,12 @@ fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
         done: Arc::clone(&done),
         passing: Default::default(),
     });
-    app.preverify_read_waited = Some((target, until));
-    let deferred = app.fork_lane_policy_wait(ApplyMode::Automatic, target, true);
+    app.preverify_read_waited = Some(crate::PreverifyReadWait {
+        build: target,
+        dmg_sha256: artifact_digest().expect("fixture digest"),
+        until,
+    });
+    let deferred = app.fork_lane_policy_wait(ApplyMode::Automatic, target, artifact_digest(), true);
     assert!(
         deferred.is_some(),
         "a same-key read that may still hold the apply lock: the fork lane does not park"
@@ -169,7 +194,7 @@ fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
     );
     done.store(true, Ordering::Release);
     assert!(
-        app.fork_lane_policy_wait(ApplyMode::Automatic, target, true)
+        app.fork_lane_policy_wait(ApplyMode::Automatic, target, artifact_digest(), true)
             .is_none()
     );
 }

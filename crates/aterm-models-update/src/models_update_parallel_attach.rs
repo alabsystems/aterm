@@ -25,6 +25,7 @@ pub fn native_update_successor_attach_model() -> Model {
             var draining = 0;
             var lost = 0;
             var blocked = 0;
+            var waited = 0;
             action Widen when (lane == 0 && many == 0) {
                 many = 1;
             }
@@ -51,8 +52,13 @@ pub fn native_update_successor_attach_model() -> Model {
             action LeaveResume when (phase == 1 && (queued == 0 || lane == 2)) {
                 phase = 2;
             }
+            action GlassPatience when (
+                phase == 2 && queued == 1 && painted0 + painted_extras == 0 && waited == 0
+            ) {
+                waited = 1;
+            }
             action RebuildAtPark when (
-                phase == 2 && queued == 1 && painted0 + painted_extras > 0
+                phase == 2 && queued == 1 && (painted0 + painted_extras > 0 || waited == 1)
             ) {
                 queued = 0;
                 extras = many;
@@ -60,7 +66,8 @@ pub fn native_update_successor_attach_model() -> Model {
                 draining = 0;
             }
             action RebuildSliceAtPark when (
-                phase == 2 && queued == 1 && painted0 + painted_extras > 0 && handed == 0
+                phase == 2 && queued == 1 && (painted0 + painted_extras > 0 || waited == 1) &&
+                handed == 0
             ) {
                 draining = 1;
             }
@@ -121,6 +128,12 @@ pub fn native_update_successor_attach_model() -> Model {
                 extras = 1;
                 kicked = 0;
             }
+            action GlassWaitRearms when (
+                Buggy == 1 && phase == 2 && queued == 1 && waited == 1 &&
+                painted0 + painted_extras == 0
+            ) {
+                waited = 0;
+            }
             action RebuildWithUnnoticedLoss when (
                 Buggy == 1 && phase == 1 && queued == 1 && lane == 1 && many == 1
             ) {
@@ -129,8 +142,8 @@ pub fn native_update_successor_attach_model() -> Model {
                 kicked = 0;
                 lost = 1;
             }
-            invariant ColdRestoreAfterFirstPaint:
-                lane == 1 || queued == 1 || painted0 + painted_extras > 0;
+            invariant ColdRestoreWaitsForGlass:
+                lane == 1 || queued == 1 || painted0 + painted_extras > 0 || waited == 1;
             invariant HandoffAttachesInOnePass:
                 lane == 2 || phase <= 1 || queued == 0;
             invariant RemainingWindowsHaveRedrawRequests: kicked == extras;
@@ -138,8 +151,8 @@ pub fn native_update_successor_attach_model() -> Model {
                 proved == 0 || (queued == 0 && painted0 == 1 && painted_extras == extras);
             invariant ProofRetainsCompleteLayout: proved == 0 || lost == 0;
             invariant HandedRebuildsWhole: handed == 0 || draining == 0;
-            invariant ColdSlicesAfterFirstPaint:
-                draining == 0 || painted0 + painted_extras > 0;
+            invariant ColdSlicesWaitForGlass:
+                draining == 0 || painted0 + painted_extras > 0 || waited == 1;
         }
     }
 }
@@ -180,5 +193,27 @@ pub fn native_update_successor_attach_liveness() -> Liveness {
         ],
         strong: vec![],
         mutants: vec!["RebuildWithoutKick"],
+    }
+}
+
+/// A cold restore queued at the park runs even when no window ever reaches the glass: its wait
+/// for the first present is bounded, and a wait that re-arms itself never ends.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(native_update_successor_attach_model)]
+pub fn native_update_successor_restore_runs_liveness() -> Liveness {
+    Liveness {
+        name: "TheRestoreRunsWithoutGlass",
+        goal: eq(var("queued"), int(0)),
+        weak: vec![
+            "StartHandoff",
+            "Attach0",
+            "RebuildAtAttach",
+            "LeaveResume",
+            "GlassPatience",
+            "RebuildAtPark",
+        ],
+        strong: vec![],
+        mutants: vec!["GlassWaitRearms"],
     }
 }

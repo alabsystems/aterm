@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Machine boot, sleep, and wake timestamps on macOS.
+//! Machine boot, sleep, and wake timestamps: the kernel's own records on macOS; on Windows the
+//! kernel's boot time, and the last suspend and resume a listener of this process heard
+//! ([`crate::power::windows::listen`]), since Windows keeps neither where a process without
+//! privilege reads it.
 
 /// The longest wake-reason word kept ([`wake_word`]).
 pub const WAKE_WORD_CAP: usize = 64;
@@ -19,13 +22,16 @@ pub struct Timeline {
     pub wake_reason: Option<String>,
 }
 
-/// Read the machine's [`Timeline`], or `None` if unavailable or off macOS.
+/// Read the machine's [`Timeline`], or `None` if unavailable or on Linux. On Windows the sleep and
+/// the wake are the last this process heard announced (`None` until one was, or with no
+/// listener), and no wake reason is read.
 #[must_use]
 pub fn timeline() -> Option<Timeline> {
     imp::timeline()
 }
 
-/// Read the last wake timestamp in unix milliseconds (`kern.waketime`), if any.
+/// Read the last wake timestamp in unix milliseconds (`kern.waketime`; on Windows the last
+/// resume this process heard), if any.
 #[must_use]
 pub fn waketime_ms() -> Option<i64> {
     imp::waketime_ms()
@@ -75,7 +81,27 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+mod imp {
+    use super::Timeline;
+    use crate::power::windows::{boot_unix_ms, last_sleep};
+
+    pub(super) fn waketime_ms() -> Option<i64> {
+        last_sleep().1
+    }
+
+    pub(super) fn timeline() -> Option<Timeline> {
+        let (sleep_ms, wake_ms) = last_sleep();
+        Some(Timeline {
+            boot_ms: boot_unix_ms()?,
+            sleep_ms,
+            wake_ms,
+            wake_reason: None,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
     use super::Timeline;
 

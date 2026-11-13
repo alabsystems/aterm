@@ -153,9 +153,14 @@ fn a_change_inside_a_debug_assertions_seam_is_not_confined() {
 #[test]
 fn a_change_that_also_touches_a_shipped_line_is_not_confined() {
     let change = Change::services(&[])
-        .edit("src/services.rs", "\"tester\");", "\"probe\");")
+        .edit("src/services.rs", "    \"tester\"\n", "    \"probe\"\n")
         .edit("src/services.rs", "//! Services.", "//! The services.");
     assert_eq!(change.judge(), shipped("src/services.rs"));
+    // A doc comment no macro reads is no shipped line: beside a test hunk it stays confined.
+    let doc = Change::services(&[])
+        .edit("src/services.rs", "\"tester\");", "\"probe\");")
+        .edit("src/services.rs", "//! Services.", "//! The services.");
+    assert_eq!(doc.judge(), Ok(()));
     // Another file of the change that ships keeps the whole change unconfined.
     let two = Change::services(&[])
         .edit("src/services.rs", "\"tester\");", "\"probe\");")
@@ -481,7 +486,6 @@ fn files_of_other_targets_and_no_source_keep_the_cone() {
         ),
         ("build.rs", Doubt::OtherTarget(join(DIR, "build.rs"))),
         ("README.md", Doubt::NotRust(join(DIR, "README.md"))),
-        ("Cargo.toml", Doubt::NotRust(join(DIR, "Cargo.toml"))),
     ] {
         let text = format!("{}\n# changed\n", base.now[path]);
         assert_eq!(
@@ -631,4 +635,251 @@ fn binaries_ship_their_module_trees() {
             "{root}"
         );
     }
+}
+
+/// A plain comment is no token: editing one in shipped code is confined. CONTROL: the same edit to
+/// a shipped literal is not.
+#[test]
+fn a_plain_comment_edit_is_confined() {
+    let commented = SERVICES.replace("    \"tester\"\n", "    // The name.\n    \"tester\"\n");
+    let base = Change::services(&[("src/services.rs", &commented)]);
+    let edit = |from, to| base.clone().edit("src/services.rs", from, to).judge();
+    assert_eq!(edit("// The name.", "// The tester's name."), Ok(()));
+    assert_eq!(edit("// The name.", "/* The name. */"), Ok(()));
+    assert_eq!(
+        edit("    \"tester\"\n", "    \"probe\"\n"),
+        shipped("src/services.rs")
+    );
+}
+
+/// A doc comment no macro reads reaches no dependent's build: on a `pub fn`, a file's `//!`, or a
+/// plain comment that becomes a doc. CONTROL: a doc that grows a line moves the code after it.
+#[test]
+fn a_doc_comment_no_macro_reads_is_confined() {
+    let documented = SERVICES.replace(
+        "pub fn tester",
+        "/// The tester.\n#[must_use]\npub fn tester",
+    );
+    let base = Change::services(&[("src/services.rs", &documented)]);
+    let edit = |from, to| base.clone().edit("src/services.rs", from, to).judge();
+    assert_eq!(edit("/// The tester.", "/// The one tester."), Ok(()));
+    assert_eq!(edit("//! Services.", "//! What serves."), Ok(()));
+    assert_eq!(edit("/// The tester.", "// The tester."), Ok(()));
+    assert_eq!(
+        edit("/// The tester.", "/// The tester.\n/// More."),
+        shipped("src/services.rs")
+    );
+}
+
+/// A `// SAFETY:` comment rewritten in place is confined: only the member's own lint reads it, and
+/// a member judged alone keeps its lint. CONTROL: deleting its line moves the code after it.
+#[test]
+fn a_safety_comment_rewritten_in_place_is_confined() {
+    let unsafe_fn = "pub fn read(p: *const u8) -> u8 {\n    // SAFETY: the caller passes a live byte.\n    unsafe { *p }\n}\n";
+    let base = Change::services(&[("src/services.rs", unsafe_fn)]);
+    let rewritten = base
+        .clone()
+        .edit("src/services.rs", "// SAFETY: the caller", "// the caller");
+    assert_eq!(rewritten.judge(), Ok(()));
+    let deleted = base.edit(
+        "src/services.rs",
+        "    // SAFETY: the caller passes a live byte.\n",
+        "",
+    );
+    assert_eq!(deleted.judge(), shipped("src/services.rs"));
+}
+
+fn carried(rel: &str) -> Result<(), Doubt> {
+    Err(Doubt::Carried(join(DIR, rel)))
+}
+
+/// A comment a macro may read keeps the cone, one case per carrier. CONTROL: each without its
+/// carrier is confined.
+#[test]
+fn a_comment_a_macro_may_read_keeps_the_cone() {
+    for (with, without) in [
+        (
+            "/// A record.\n#[derive(Debug)]\npub struct R;\n",
+            "/// A record.\n#[must_use]\npub struct R;\n",
+        ),
+        (
+            "#[derive(Debug)]\npub struct R {\n    /// A record.\n    pub a: u8,\n}\n",
+            "pub struct R {\n    /// A record.\n    pub a: u8,\n}\n",
+        ),
+        (
+            "macro_rules! r {\n    () => {\n        // A record.\n    };\n}\n",
+            "pub fn r() {\n    // A record.\n}\n",
+        ),
+        (
+            "aterm_spec::ty_model! {\n    // A record.\n    model R {}\n}\n",
+            "pub mod r {\n    // A record.\n    pub struct R;\n}\n",
+        ),
+        (
+            "/// A record.\n#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(m))]\npub fn r() {}\n",
+            "/// A record.\n#[cfg_attr(trust_verify, trust::skip)]\npub fn r() {}\n",
+        ),
+        (
+            "/// A record.\n#[doc = \"More.\"]\npub fn r() {}\n",
+            "/// A record.\n#[doc(alias = \"rec\")]\npub fn r() {}\n",
+        ),
+    ] {
+        for (text, want) in [(with, carried("src/services.rs")), (without, Ok(()))] {
+            let change = Change::services(&[("src/services.rs", text)]).edit(
+                "src/services.rs",
+                "// A record.",
+                "// The record.",
+            );
+            assert_eq!(change.judge(), want, "{text}");
+        }
+    }
+    // A file a declaration a macro may read mounts, or that no declaration places.
+    let doc_edit = |change: Change, path: &str| {
+        change
+            .edit(path, "//! Services.", "//! The services.")
+            .judge()
+    };
+    let mounted = "#[some::wrap]\npub mod services;\n\npub fn f() -> u8 {\n    1\n}\n";
+    assert_eq!(
+        doc_edit(
+            Change::services(&[("src/lib.rs", mounted)]),
+            "src/services.rs"
+        ),
+        carried("src/services.rs")
+    );
+    let unplaced = format!("{LIB}elsewhere::declare!(hidden);\n");
+    assert_eq!(
+        doc_edit(
+            Change::services(&[("src/lib.rs", &unplaced), ("src/hidden.rs", SERVICES)]),
+            "src/hidden.rs"
+        ),
+        carried("src/hidden.rs")
+    );
+    // A file a test-only declaration placed before and none places now: a macro may declare it.
+    let tested = format!("{LIB}#[cfg(test)]\nmod x;\n");
+    assert_eq!(
+        doc_edit(
+            Change::services(&[("src/lib.rs", &tested), ("src/x.rs", SERVICES)])
+                .with("src/lib.rs", Some(LIB)),
+            "src/x.rs"
+        ),
+        carried("src/x.rs")
+    );
+    // A declaration whose path this reader cannot settle, and a plain one in a file a carried
+    // declaration mounts. (Neither path literal names the file, which would be [`Doubt::Named`].)
+    let unsettled = "#[cfg_attr(unix, path = \"elsewhere.rs\")]\npub mod services;\n\npub fn f() -> u8 {\n    1\n}\n";
+    assert_eq!(
+        doc_edit(
+            Change::services(&[("src/lib.rs", unsettled)]),
+            "src/services.rs"
+        ),
+        carried("src/services.rs")
+    );
+    let outer = "#[some::wrap]\npub mod outer;\n\npub fn f() -> u8 {\n    1\n}\n";
+    assert_eq!(
+        doc_edit(
+            Change::services(&[
+                ("src/lib.rs", outer),
+                ("src/outer.rs", "pub mod services;\n")
+            ]),
+            "src/services.rs"
+        ),
+        carried("src/services.rs")
+    );
+    assert_eq!(doc_edit(Change::services(&[]), "src/services.rs"), Ok(()));
+}
+
+/// A comment is carried where a carrier of either version holds it: a doc that becomes a plain
+/// comment before a derive leaves the derive's input in the old version only, and the reverse in
+/// the new one only. CONTROL: the same flips before an inert attribute are confined.
+#[test]
+fn a_comment_either_versions_carrier_holds_keeps_the_cone() {
+    let item = |attr: &str| format!("/// A record.\n#[{attr}]\npub struct R;\n");
+    let field = "#[derive(Debug)]\npub struct R {\n    /// A record.\n    pub a: u8,\n}\n";
+    for (from, to) in [("/// A", "// A"), ("// A", "/// A")] {
+        let flip = |text: &str| {
+            let text = text.replace("/// A", from);
+            Change::services(&[("src/services.rs", &text)])
+                .edit("src/services.rs", from, to)
+                .judge()
+        };
+        assert_eq!(
+            flip(&item("derive(Debug)")),
+            carried("src/services.rs"),
+            "{from}"
+        );
+        assert_eq!(flip(field), carried("src/services.rs"), "{from}");
+        assert_eq!(flip(&item("must_use")), Ok(()), "{from}");
+    }
+}
+
+/// A Trust `clean { … }` island is Lean to the compiler: a span in it that lexes as a Rust comment
+/// is code there, so its edit keeps the cone. CONTROL: the same text in a Rust function body is
+/// a comment.
+#[test]
+fn an_islands_comment_shaped_text_keeps_the_cone() {
+    let lib = "#[cfg(clean_islands)]\n#[rustfmt::skip]\n#[path = \"x_island.rs\"]\nmod x_island;\n\npub fn f() -> u8 {\n    1\n}\n";
+    let text = "    -- glob src/*.rs\n    def v (x : UInt64) : UInt64 := x + 1\n    -- end */\n";
+    for (island, want) in [
+        (format!("clean {{\n{text}}}\n"), carried("src/x_island.rs")),
+        (format!("pub fn g() {{\n{text}}}\n"), Ok(())),
+    ] {
+        let change = Change::of(&[("src/lib.rs", lib), ("src/x_island.rs", &island)]).edit(
+            "src/x_island.rs",
+            "x + 1",
+            "x + 2",
+        );
+        assert_eq!(change.judge(), want, "{island}");
+    }
+}
+
+/// The tokens of a file an `include!` reads keep the cone when its comments change. CONTROL: a
+/// change inside its test module is confined.
+#[test]
+fn an_included_files_comment_edit_keeps_the_cone() {
+    let lib = "include!(\"services.rs\");\n\npub fn f() -> u8 {\n    1\n}\n";
+    let base = Change::services(&[("src/lib.rs", lib)]);
+    assert_eq!(
+        base.clone()
+            .edit("src/services.rs", "//! Services.", "//! The services.")
+            .judge(),
+        Err(Doubt::Included(join(DIR, "src/services.rs")))
+    );
+    assert_eq!(
+        base.edit("src/services.rs", "\"tester\");", "\"probe\");")
+            .judge(),
+        Ok(())
+    );
+}
+
+/// A member's own manifest whose TOML values are the same before and after is confined. CONTROL:
+/// a value that changes, a shipped literal that names it, or a build script that may read it
+/// keeps the cone.
+#[test]
+fn a_member_manifest_whose_values_are_the_same_is_confined() {
+    let manifest = |files: &[(&str, &str)], to: &str| {
+        Change::services(files).with("Cargo.toml", Some(to)).judge()
+    };
+    let commented = format!("# The package.\n{MANIFEST}");
+    let respelled = MANIFEST.replace("name = \"a\"", "name = 'a'");
+    assert_eq!(manifest(&[], &commented), Ok(()));
+    assert_eq!(manifest(&[], &respelled), Ok(()));
+    let doubt = |doubt: fn(String) -> Doubt| Err(doubt(join(DIR, "Cargo.toml")));
+    assert_eq!(
+        manifest(&[], &MANIFEST.replace("0.1.0", "0.2.0")),
+        doubt(Doubt::NotRust)
+    );
+    let named = format!("{LIB}pub const M: &str = \"Cargo.toml\";\n");
+    assert_eq!(
+        manifest(&[("src/lib.rs", &named)], &commented),
+        doubt(Doubt::Named)
+    );
+    let walker = "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    walk(std::env::var(\"CARGO_MANIFEST_DIR\").unwrap());\n}\n";
+    assert_eq!(
+        manifest(&[("build.rs", walker)], &commented),
+        doubt(Doubt::BuildInput)
+    );
+    // Another file's manifest is no member's own.
+    let other =
+        Change::services(&[("README.toml", "a = 1\n")]).with("README.toml", Some("# x\na = 1\n"));
+    assert_eq!(other.judge(), Err(Doubt::NotRust(join(DIR, "README.toml"))));
 }

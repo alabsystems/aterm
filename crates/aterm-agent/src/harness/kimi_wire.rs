@@ -135,8 +135,9 @@ pub fn verdict(
 pub struct Wire {
     /// The byte after the last whole line folded.
     offset: u64,
-    /// The file the offset is into (device and inode on unix): Kimi rewrites a wire by an
-    /// atomic rename, which a new identity shows even where the new file is no shorter.
+    /// The file the offset is into (device and inode on unix, volume serial and file index on
+    /// Windows: [`super::session_usage::open_identity`]): Kimi rewrites a wire by an atomic
+    /// rename, which a new identity shows even where the new file is no shorter.
     identity: Option<(u64, u64)>,
     /// The requests asked and not resolved, in the order asked.
     open: Vec<Pending>,
@@ -404,7 +405,7 @@ fn refresh(wire: &mut Wire, path: &Path) -> bool {
     let Some((mut file, meta)) = super::footer::open_regular_with_meta(path) else {
         return false;
     };
-    let identity = identity_of(&meta);
+    let identity = super::session_usage::open_identity(&file, &meta);
     if meta.len() < wire.offset || identity != wire.identity {
         *wire = Wire {
             identity,
@@ -424,19 +425,6 @@ fn refresh(wire: &mut Wire, path: &Path) -> bool {
     }
     wire.advance(&appended);
     true
-}
-
-/// A file's device and inode, which an atomic rename over it changes.
-#[cfg(unix)]
-fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-    Some((meta.dev(), meta.ino()))
-}
-
-/// No identity off unix: a rewrite shows only as a shorter file.
-#[cfg(not(unix))]
-fn identity_of(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
 }
 
 /// Lines Kimi Code 2.5.2 wrote to its sessions' `agents/main/wire.jsonl` (MEASURED, each one

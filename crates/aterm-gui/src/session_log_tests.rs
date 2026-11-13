@@ -1827,7 +1827,7 @@ fn the_meta_and_fabric_producers_take_only_their_order() {
             Actor::Ctl,
             None,
         );
-        let _ = st::cancel_land_at(&ctx, Some(i64::MAX), crate::autopilot::Surface::Chip);
+        let _ = st::cancel_land_at(&ctx, crate::autopilot::Surface::Chip);
         let _ = st::fire_land_at(&ctx, 1, 2);
         let _ = st::write_attention_owned(&ctx, owner, MetaEdit::Set("stuck"), Actor::Harness);
         let _ = st::write_server_attention(&ctx, "aterm", Some("stalled".into()));
@@ -7071,6 +7071,98 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
     );
 }
 
+/// A TAB'S OPEN IS NEVER LOST TO ITS REQUESTER (ATERM-KI-1109-3): a fleet drive's open (no parent
+/// tab, as a drive's spawn has none) names a whole requesting sid in `by=` and the requester's
+/// program, model and account at their caps beside a short `why_text=`, within
+/// [`aterm_slog::MAX_RECORD_BYTES`]. With the longest `why_text=` a request admits it gives up the
+/// account and keeps the rest; with every field at its longest (a parent, the widest window) it
+/// gives up the model too. Each time the mark, its `why_text=` and its `by=` are kept.
+#[test]
+fn open_mark_fits_at_max_sizes() {
+    use aterm_types::control_verbs::{
+        REQUEST_WHY_BYTES, REQUESTER_ACCOUNT_BYTES, REQUESTER_TOKEN_MAX, Requester,
+    };
+    let longest_why = "w ".repeat(28) + &"w".repeat(144);
+    assert_eq!(
+        aterm_codec::pct::encoded_len(&longest_why),
+        REQUEST_WHY_BYTES
+    );
+    let sid = "s-0123456789abcdef0123";
+    let requester = Arc::new(Requester::of(
+        Some(sid),
+        Some(&"p".repeat(REQUESTER_TOKEN_MAX)),
+        Some(&"m".repeat(REQUESTER_TOKEN_MAX)),
+        Some(&"a".repeat(REQUESTER_ACCOUNT_BYTES)),
+    ));
+    assert!(requester.program().is_some() && requester.account().is_some());
+    let by = Actor::fleet_drive(&"ab".repeat(16), Some(sid));
+    let opened = |why: &str, parent: Option<aterm_slog::ShortId>, window: u64| -> String {
+        let epochs = process(None);
+        let mut log = spawned_in(&epochs, 1_000, 0);
+        let asked = TabAsked {
+            why_text: Some(Arc::from(why)),
+            requester: Some(Arc::clone(&requester)),
+        };
+        log.open_tab(
+            TabPlace {
+                opened_wall: at(1_000).wall_ms,
+                window,
+                parked: true,
+                parent,
+            },
+            "spawn",
+            &asked,
+            by,
+            at(1_000),
+        );
+        let opens: Vec<String> = log
+            .log()
+            .window()
+            .filter(|r| r.k == Kind::Tab)
+            .map(|r| aterm_slog::encode(r, Tier::Content).expect("fits"))
+            .collect();
+        assert_eq!(opens.len(), 1, "the open is kept: {opens:?}");
+        let open = opens.into_iter().next().expect("one open");
+        for want in [
+            format!("why_text={}", aterm_codec::pct::encode(why)),
+            format!("by=fleet:abababab:{sid}"),
+        ] {
+            assert!(open.split(' ').any(|word| word == want), "{want}: {open}");
+        }
+        open
+    };
+    let named = |open: &str| -> Vec<&'static str> {
+        ["agent", "model", "account"]
+            .into_iter()
+            .filter(|key| {
+                open.split(' ')
+                    .any(|word| word.starts_with(&format!("{key}=")))
+            })
+            .collect()
+    };
+    let short = opened("check the m72 disk", None, 1);
+    assert!(short.contains(&format!(" agent={} ", "p".repeat(REQUESTER_TOKEN_MAX))));
+    assert!(short.contains(&format!(" model={} ", "m".repeat(REQUESTER_TOKEN_MAX))));
+    assert!(short.contains(&format!(
+        " account={} ",
+        "a".repeat(REQUESTER_ACCOUNT_BYTES)
+    )));
+    assert_eq!(
+        named(&opened(&longest_why, None, 1)),
+        ["agent", "model"],
+        "the account goes first"
+    );
+    assert_eq!(
+        named(&opened(
+            &longest_why,
+            aterm_slog::ShortId::new(sid),
+            u64::MAX
+        )),
+        ["agent"],
+        "then the model; the program stays even at every field's longest"
+    );
+}
+
 /// A TAB'S PLACE AND ITS AGENTS' SPEND CROSS A SEAMLESS UPDATE (`tab v=1`, `spend v=1`): the
 /// adopted log's close of it names the window and parent its open named, counts `wall_s=` from
 /// that open, in the predecessor, and counts the tokens of the conversation that ended there
@@ -7090,6 +7182,7 @@ fn a_tabs_place_is_carried_and_its_close_counts_from_the_open() {
             parent,
         },
         "task",
+        &TabAsked::default(),
         Actor::Harness,
         at(1_000),
     );
@@ -7171,6 +7264,7 @@ fn a_tabs_tokens_are_each_runs_last_whole_read_and_one_never_read_whole_leaves_t
                 parent: None,
             },
             "task",
+            &TabAsked::default(),
             Actor::Harness,
             at(1_000),
         );

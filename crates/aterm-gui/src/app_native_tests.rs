@@ -15,6 +15,31 @@ mod settings_press_tests;
 #[path = "app_native_lane_hold_tests.rs"]
 mod lane_hold_tests;
 
+fn begin_boot_health_confirmation_for_test(
+    app: &mut App,
+    request_sequence: u64,
+) -> BootHealthConfirmationTicket {
+    let ticket = BootHealthConfirmationTicket::for_test(request_sequence);
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(ticket);
+    ticket
+}
+
+/// The updater's answer that the trial is still armed, with its reason.
+fn boot_health_pending() -> aterm_update::BootHealthVerdict {
+    aterm_update::BootHealthVerdict::Pending {
+        why: "a window reached its health checkpoint, but the trial's recovery proof failed"
+            .to_string(),
+        retry_after: None,
+    }
+}
+
+/// An ask the updater could not answer.
+fn boot_health_unanswered() -> aterm_update::BootHealthVerdict {
+    aterm_update::BootHealthVerdict::Unanswered {
+        why: "health lock: another aterm holds it".to_string(),
+    }
+}
+
 #[test]
 fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     use crate::native_app::AppViewState;
@@ -481,6 +506,49 @@ fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending(
     assert!(
         app.native_config_service.reconciliation_required(),
         "only an admitted disk generation may reopen the lane"
+    );
+}
+
+/// A RELOAD THAT DOES NOT LOAD STILL MOVES THE UPDATE SWITCHES: a running window went on installing
+/// over an `auto_apply = false` added to a file with a mistake elsewhere, and on holding after one
+/// was taken out, until the mistake was fixed. CONTROL: the file did not load, so its other keys
+/// did not reach the live config.
+#[cfg(unix)]
+#[test]
+fn a_reload_that_does_not_load_still_moves_the_update_switches() {
+    use crate::native_config_service::VersionedConfigService;
+    let scratch = aterm_tempfile::tempdir().expect("scratch config");
+    let path = scratch.path().join("aterm.toml");
+    let mut app = App::headless_for_test();
+    app.native_config_service = VersionedConfigService::new(String::new()).unwrap();
+    let reload = |app: &mut App, text: &str| {
+        crate::test_scratch::write_config(&path, text);
+        app.prepare_native_config_external_observation(
+            VersionedConfigService::observe_path(&path, false).unwrap(),
+        );
+    };
+    assert!(
+        crate::app_config::update_auto_apply(&app.config),
+        "PRECONDITION: the default"
+    );
+    reload(
+        &mut app,
+        "font_px = \"12\"\nserious_mode = true\n[update]\nauto_apply = false\n",
+    );
+    assert!(app.native_config_service.reconciliation_required());
+    assert_ne!(
+        app.config.serious_mode,
+        Some(true),
+        "CONTROL: the file did not load"
+    );
+    assert!(
+        !crate::app_config::update_auto_apply(&app.config),
+        "auto_apply = false holds"
+    );
+    reload(&mut app, "font_px = \"12\"\n");
+    assert!(
+        crate::app_config::update_auto_apply(&app.config),
+        "taking it out lets go, with the mistake still there"
     );
 }
 
@@ -1605,8 +1673,8 @@ fn sole_worker_stamps_fifo_read_order_not_request_order() {
                 installed_unproven: false,
                 installable: None,
             },
-            |_, _| panic!("no boot-health request was queued"),
-            |_| {},
+            |_, _, _| panic!("no boot-health request was queued"),
+            |_, _| {},
             || drained_tx.send(()).unwrap(),
         );
     });
@@ -1655,8 +1723,8 @@ fn failed_update_fact_reads_complete_and_leave_the_next_queued_read_intact() {
                 }
                 reconcile_facts(ticket.request_sequence(), observation, None)
             },
-            |_, _| panic!("no boot-health request was queued"),
-            |_| {},
+            |_, _, _| panic!("no boot-health request was queued"),
+            |_, _| {},
             || drained_tx.send(()).unwrap(),
         );
     });
@@ -1779,6 +1847,8 @@ fn a_panicked_boot_health_confirmation_reports_failure_and_keeps_the_worker() {
     let (health_tx, health_rx) = std::sync::mpsc::sync_channel(2);
     let (drained_tx, drained_rx) = std::sync::mpsc::sync_channel(3);
     let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let failed_ticket = BootHealthConfirmationTicket::for_test(1);
+    let settled_ticket = BootHealthConfirmationTicket::for_test(2);
     let worker = std::thread::spawn(move || {
         start_rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -1786,22 +1856,27 @@ fn a_panicked_boot_health_confirmation_reports_failure_and_keeps_the_worker() {
         run_native_update_worker(
             receiver,
             |ticket, observation, _| reconcile_facts(ticket.request_sequence(), observation, None),
-            |build, witness| {
+            |build, witness, checkpoint| {
                 assert_eq!(witness, aterm_update::TrialWitness::Headless);
+                assert!(checkpoint);
                 if build == 10 {
                     panic!("injected boot-health failure");
                 }
                 assert_eq!(build, 11);
-                true
+                aterm_update::BootHealthVerdict::Confirmed {
+                    settled: Some(build),
+                }
             },
-            |confirmed| health_tx.send(confirmed).unwrap(),
+            |ticket, result| health_tx.send((ticket, result)).unwrap(),
             || drained_tx.send(()).unwrap(),
         );
     });
     sender
         .send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: failed_ticket,
             current_build: 10,
             witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
         })
         .unwrap();
     let (reply, facts) = std::sync::mpsc::sync_channel(1);
@@ -1818,22 +1893,31 @@ fn a_panicked_boot_health_confirmation_reports_failure_and_keeps_the_worker() {
         .unwrap();
     sender
         .send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: settled_ticket,
             current_build: 11,
             witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
         })
         .unwrap();
     start_tx.send(()).unwrap();
 
     let mut app = App::headless_for_test();
-    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
-    let failed = health_rx
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(failed_ticket);
+    let (ticket, failed) = health_rx
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .unwrap();
-    assert!(!failed);
-    app.finish_native_boot_health_confirmation(failed, std::time::Instant::now());
+    assert_eq!(ticket, failed_ticket);
+    assert!(
+        matches!(&failed, aterm_update::BootHealthVerdict::Unanswered { why } if why.contains("panicked")),
+        "a panic is an ask nothing answered: {failed:?}"
+    );
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, failed, std::time::Instant::now()),
+        BootHealthFinishDisposition::RetryArmed
+    );
     assert_eq!(
         app.boot_health_confirmation,
-        crate::BootHealthConfirmation::Pending
+        crate::BootHealthConfirmation::Awaiting
     );
     assert!(app.boot_health_confirmation_retry_at.is_some());
     let observed = facts
@@ -1842,14 +1926,22 @@ fn a_panicked_boot_health_confirmation_reports_failure_and_keeps_the_worker() {
         .unwrap();
     assert_eq!(observed._ticket.request_sequence(), 7);
     assert_eq!(observed.observation_sequence, 1);
-    let confirmed = health_rx
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(settled_ticket);
+    let (ticket, confirmed) = health_rx
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .unwrap();
-    assert!(confirmed);
-    app.finish_native_boot_health_confirmation(confirmed, std::time::Instant::now());
+    assert_eq!(ticket, settled_ticket);
+    assert_eq!(
+        confirmed,
+        aterm_update::BootHealthVerdict::Confirmed { settled: Some(11) }
+    );
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, confirmed, std::time::Instant::now()),
+        BootHealthFinishDisposition::Completed
+    );
     assert_eq!(
         app.boot_health_confirmation,
-        crate::BootHealthConfirmation::Confirmed
+        crate::BootHealthConfirmation::Complete
     );
     assert!(app.boot_health_confirmation_retry_at.is_none());
     for _ in 0..3 {
@@ -1867,39 +1959,46 @@ fn saturated_boot_health_queue_retains_nonblocking_retry() {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     sender
         .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: BootHealthConfirmationTicket::for_test(1),
             current_build: 9,
             witness: aterm_update::TrialWitness::Window,
+            checkpoint: true,
         })
         .unwrap();
     app.native_update_reconcile_worker = Some(sender);
 
     assert_eq!(
         app.request_native_boot_health_confirmation(),
-        NativeUpdateDispatch::Saturated,
+        BootHealthDispatch::Saturated,
         "a full queue must retain the pending latch"
     );
     let _ = receiver.recv().unwrap();
-    assert_eq!(
+    assert!(matches!(
         app.request_native_boot_health_confirmation(),
-        NativeUpdateDispatch::Queued
-    );
+        BootHealthDispatch::Queued(_)
+    ));
     assert!(matches!(
         receiver.recv().unwrap(),
         NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: _,
             current_build: 10,
             witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
         }
     ));
     app.headless = false;
-    assert_eq!(
+    assert!(matches!(
         app.request_native_boot_health_confirmation(),
-        NativeUpdateDispatch::Queued
-    );
+        BootHealthDispatch::Queued(_)
+    ));
     assert!(matches!(
         receiver.recv().unwrap(),
         NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: _,
             current_build: 10,
             witness: aterm_update::TrialWitness::Window,
+            // No window has presented: the ask goes without the checkpoint.
+            checkpoint: false,
         }
     ));
 }
@@ -2297,8 +2396,10 @@ fn a_pending_control_apply_reports_its_refusal_when_the_worker_cannot_restart() 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender
             .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+                ticket: BootHealthConfirmationTicket::for_test(1),
                 current_build: current,
                 witness: aterm_update::TrialWitness::Headless,
+                checkpoint: true,
             })
             .unwrap();
         app.native_update_reconcile_worker = Some(sender);
@@ -2369,8 +2470,10 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
     let (sender, receiver) = std::sync::mpsc::sync_channel(NATIVE_UPDATE_WORKER_CAPACITY);
     sender
         .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: BootHealthConfirmationTicket::for_test(1),
             current_build: 9,
             witness: aterm_update::TrialWitness::Window,
+            checkpoint: true,
         })
         .unwrap();
     app.native_update_reconcile_worker = Some(sender);
@@ -2444,8 +2547,10 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     sender
         .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: BootHealthConfirmationTicket::for_test(1),
             current_build: 9,
             witness: aterm_update::TrialWitness::Window,
+            checkpoint: true,
         })
         .unwrap();
     disconnected_app.native_update_reconcile_worker = Some(sender);
@@ -2505,60 +2610,236 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
 }
 
 #[test]
-fn an_unavailable_boot_health_worker_keeps_a_bounded_retry_until_dispatch_succeeds() {
-    for outcome in [
-        NativeUpdateDispatch::Unavailable,
-        NativeUpdateDispatch::Saturated,
-    ] {
-        let mut app = App::headless_for_test();
-        let mut now = std::time::Instant::now();
-        app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
-        for _ in 0..12 {
-            app.note_boot_health_dispatch(outcome, now);
-            assert_eq!(
-                app.boot_health_confirmation,
-                crate::BootHealthConfirmation::Pending
-            );
-            let retry = app
-                .boot_health_confirmation_retry_at
-                .expect("retry retained");
-            assert!(retry >= now + crate::BOOT_HEALTH_RETRY_MIN);
-            assert!(retry <= now + crate::BOOT_HEALTH_RETRY_MAX);
-            assert_eq!(app.boot_health_retry_deadline(now), Some(retry));
-            now = retry;
-        }
-        app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
+fn an_unavailable_boot_health_worker_keeps_a_bounded_retry_and_opens_the_gate_at_five() {
+    let mut app = App::headless_for_test();
+    let (disconnected, disconnected_receiver) = std::sync::mpsc::sync_channel(1);
+    drop(disconnected_receiver);
+    app.native_update_reconcile_worker = Some(disconnected);
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let mut now = std::time::Instant::now();
+
+    for tries in 1..=12_u32 {
+        assert!(app.boot_health_guard_open());
+        assert!(
+            app.boot_health_confirmation_retry_at
+                .is_none_or(|retry_at| now >= retry_at)
+        );
+        let outcome = app.request_native_boot_health_confirmation();
+        assert_eq!(outcome, BootHealthDispatch::Unavailable);
+        app.note_boot_health_dispatch(outcome, now);
         assert_eq!(
             app.boot_health_confirmation,
-            crate::BootHealthConfirmation::InFlight
+            crate::BootHealthConfirmation::Awaiting
         );
-        assert!(app.boot_health_confirmation_retry_at.is_none());
-        app.finish_native_boot_health_confirmation(true, now);
         assert_eq!(
-            app.boot_health_confirmation_backoff,
-            crate::BOOT_HEALTH_RETRY_MIN
+            app.native_boot_health_complete(),
+            tries >= crate::BOOT_HEALTH_UNANSWERED_TRIES,
+            "the gate opens at the fifth ask nothing answered, not before: try {tries}"
         );
+        assert!(app.boot_health_hold_reason.is_some());
+        let retry = app
+            .boot_health_confirmation_retry_at
+            .expect("retry retained, with the gate open too");
+        assert!(retry >= now + crate::BOOT_HEALTH_RETRY_MIN);
+        assert!(retry <= now + crate::BOOT_HEALTH_RETRY_MAX);
+        assert_eq!(app.boot_health_retry_deadline(now), Some(retry));
+        now = retry;
     }
+    assert_eq!(
+        app.boot_health_unanswered,
+        crate::BOOT_HEALTH_UNANSWERED_TRIES,
+        "the count stops at its bound"
+    );
+
+    let (worker, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(worker);
+    let outcome = app.request_native_boot_health_confirmation();
+    let BootHealthDispatch::Queued(ticket) = outcome else {
+        panic!("a restored worker must accept the confirmation: {outcome:?}");
+    };
+    app.note_boot_health_dispatch(outcome, now);
+    assert!(matches!(
+        receiver.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket: queued_ticket,
+            current_build: 10,
+            witness: aterm_update::TrialWitness::Headless,
+            checkpoint: true,
+        }) if queued_ticket == ticket
+    ));
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::InFlight(ticket)
+    );
+    assert!(app.boot_health_confirmation_retry_at.is_some());
+    assert!(
+        app.native_boot_health_complete(),
+        "an ask in flight leaves the opened gate open"
+    );
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, boot_health_pending(), now),
+        BootHealthFinishDisposition::RetryArmed
+    );
+    assert!(
+        !app.native_boot_health_complete(),
+        "once the updater answers that the trial is pending, it holds by name again"
+    );
+    assert_eq!(app.boot_health_unanswered, 0);
+
+    let outcome = app.request_native_boot_health_confirmation();
+    let BootHealthDispatch::Queued(ticket) = outcome else {
+        panic!("the worker must accept the next ask: {outcome:?}");
+    };
+    app.note_boot_health_dispatch(outcome, now);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Complete
+    );
+    assert!(app.boot_health_confirmation_retry_at.is_none());
+    assert!(app.boot_health_hold_reason.is_none());
+    assert_eq!(
+        app.boot_health_confirmation_backoff,
+        crate::BOOT_HEALTH_RETRY_MIN
+    );
 }
 
 #[test]
-fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
+fn a_confirmation_that_never_answers_opens_the_gate() {
+    let mut app = App::headless_for_test();
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let mut now = std::time::Instant::now();
+    for tries in 1..=crate::BOOT_HEALTH_UNANSWERED_TRIES {
+        assert!(!app.native_boot_health_complete(), "before try {tries}");
+        let ticket = BootHealthConfirmationTicket::for_test(u64::from(tries));
+        app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
+        let watchdog = app
+            .boot_health_confirmation_retry_at
+            .expect("an ask in flight has a lost-answer watchdog");
+        assert!(watchdog > now);
+        app.expire_boot_health_confirmation(watchdog);
+        assert_eq!(
+            app.boot_health_confirmation,
+            crate::BootHealthConfirmation::Awaiting
+        );
+        assert_eq!(app.boot_health_unanswered, tries);
+        now = watchdog;
+    }
+    assert!(
+        app.native_boot_health_complete(),
+        "five answers that never came open the gate"
+    );
+    assert!(
+        app.boot_health_guard_open(),
+        "and the confirmation is still asked"
+    );
+}
+
+#[test]
+fn a_pending_boot_health_names_its_hold_and_parks_on_its_retry() {
+    let mut app = App::headless_for_test();
+    app.native_updater_service =
+        crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
+    let now = std::time::Instant::now();
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 12,
+        dmg_sha256: [0xab; 32],
+        retry_at: now,
+        attempts: 0,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    let aterm_update::BootHealthVerdict::Pending { why, .. } = boot_health_pending() else {
+        unreachable!("the fixture is a pending answer");
+    };
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, boot_health_pending(), now),
+        BootHealthFinishDisposition::RetryArmed
+    );
+    assert_eq!(app.boot_health_hold_reason.as_deref(), Some(why.as_str()));
+    let retry = app
+        .boot_health_confirmation_retry_at
+        .expect("a pending answer is asked again");
+
+    app.try_pending_native_auto_apply(false);
+    let held = app
+        .auto_apply_intent
+        .expect("a pending trial spends no attempt");
+    assert_eq!(held.attempts, 0);
+    assert_eq!(
+        held.deadline_owner,
+        crate::AutoApplyDeadlineOwner::BootHealth
+    );
+    assert_eq!(
+        held.retry_at, retry,
+        "the lane parks on the confirmation's retry, never on a past deadline"
+    );
+    assert!(
+        crate::fold_auto_apply_deadline(app.auto_apply_intent, None).is_some_and(|at| at > now)
+    );
+
+    // The bound's settle releases what the gate deferred at once.
+    let ticket = BootHealthConfirmationTicket::for_test(2);
+    app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
+    let settled = aterm_update::BootHealthVerdict::SettledUnproven {
+        build: 12,
+        why: "settled build 12's update trial unproven at its window checkpoint".to_string(),
+    };
+    assert!(settled.opens_gate());
+    assert_eq!(settled.settled_build(), Some(12));
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, settled, now),
+        BootHealthFinishDisposition::Completed
+    );
+    assert!(app.native_boot_health_complete());
+    assert!(app.boot_health_hold_reason.is_none());
+    let released = app
+        .auto_apply_intent
+        .expect("the settle releases before polling");
+    assert_eq!(released.retry_at, now);
+    assert_eq!(
+        released.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Ordinary
+    );
+}
+
+#[test]
+fn a_pending_boot_health_answer_rearms_a_bounded_retry_until_the_updater_settles() {
+    // The GUI retries a pending answer for as long as the updater gives it: the bound is the
+    // updater's (`aterm_update::TRIAL_SETTLE_AFTER_REFUSALS`), and its settle closes the latch.
+
     let mut app = App::headless_for_test();
     let now = std::time::Instant::now();
-    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
-    app.finish_native_boot_health_confirmation(false, now);
+    let first_ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(first_ticket, boot_health_pending(), now),
+        BootHealthFinishDisposition::RetryArmed
+    );
     assert_eq!(
         app.boot_health_confirmation,
-        crate::BootHealthConfirmation::Pending
+        crate::BootHealthConfirmation::Awaiting
     );
     let first = app
         .boot_health_confirmation_retry_at
         .expect("a failure re-arms a retry");
     assert!(first > now);
 
-    for _ in 0..16 {
-        app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Queued, now);
-        app.finish_native_boot_health_confirmation(false, now);
+    for request_sequence in 2..18 {
+        let ticket = BootHealthConfirmationTicket::for_test(request_sequence);
+        app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
+        assert_eq!(
+            app.finish_native_boot_health_confirmation(ticket, boot_health_pending(), now),
+            BootHealthFinishDisposition::RetryArmed
+        );
+        assert!(!app.native_boot_health_complete());
     }
     assert!(
         app.boot_health_confirmation_retry_at
@@ -2566,24 +2847,254 @@ fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
         "the backoff grows and stays bounded"
     );
 
-    app.finish_native_boot_health_confirmation(true, now);
+    let settled_ticket = BootHealthConfirmationTicket::for_test(18);
+    app.note_boot_health_dispatch(BootHealthDispatch::Queued(settled_ticket), now);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            settled_ticket,
+            aterm_update::BootHealthVerdict::SettledUnproven {
+                build: 10,
+                why: "settled build 10's update trial unproven".to_string(),
+            },
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
     assert_eq!(
         app.boot_health_confirmation,
-        crate::BootHealthConfirmation::Confirmed
+        crate::BootHealthConfirmation::Complete
     );
     assert!(app.boot_health_confirmation_retry_at.is_none());
-    app.finish_native_boot_health_confirmation(false, now);
-    assert_eq!(app.boot_health_confirmation_retry_at, Some(first));
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(settled_ticket, boot_health_pending(), now),
+        BootHealthFinishDisposition::IgnoredStale
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Complete,
+        "a stale failure cannot reopen a settled health gate"
+    );
+    assert!(app.boot_health_confirmation_retry_at.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn boot_health_completion_releases_only_its_exact_preverification_wait() {
+    use aterm_update::BootHealthVerdict::{Confirmed, SettledUnproven};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // An associated const, which no `use` can name.
+    const NO_TRIAL: aterm_update::BootHealthVerdict = aterm_update::BootHealthVerdict::NO_TRIAL;
+
+    fn passing_read(
+        build: u64,
+        now: std::time::Instant,
+        reason: String,
+    ) -> crate::PreverifyInFlight {
+        let done = std::sync::Arc::new(AtomicBool::new(true));
+        let passing = std::sync::Arc::new(std::sync::OnceLock::new());
+        passing
+            .set(crate::PassingPreverification { reason, ended: now })
+            .unwrap();
+        assert!(done.load(Ordering::Acquire));
+        crate::PreverifyInFlight {
+            build,
+            commit: PREFLIGHT_TEST_COMMIT.to_string(),
+            artifact: "ab".repeat(32),
+            deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+            done,
+            passing,
+        }
+    }
+
+    let now = std::time::Instant::now();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 1;
+    stage_one_build_for_test(&mut app, build);
+    let mut request_sequence = 1;
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, request_sequence);
+    let future = now + std::time::Duration::from_secs(600);
+    app.auto_apply_intent.as_mut().unwrap().retry_at = future;
+    app.auto_apply_intent.as_mut().unwrap().deadline_owner =
+        crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+    app.handoff_preverify_in_flight = Some(passing_read(
+        build,
+        now,
+        format!(
+            "staged update failed pre-park verification: update trial for build {current} is \
+             still unconfirmed ({})",
+            aterm_update::PASSING_REFUSAL_KEY
+        ),
+    ));
+
+    assert_eq!(boot_health_pending().settled_build(), None);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, boot_health_pending(), now),
+        BootHealthFinishDisposition::RetryArmed
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Awaiting
+    );
+    assert!(app.handoff_preverify_in_flight.is_some());
+    assert!(
+        app.auto_apply_intent
+            .is_some_and(|intent| intent.retry_at > now)
+    );
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, future);
+    assert!(app.auto_apply_physical_retry.is_none());
+    assert!(app.auto_apply_manual_only.is_none());
+
+    // Nothing owed (no trial, or another install's) opens the gate and settles no trial.
+    request_sequence += 1;
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, request_sequence);
+    assert_eq!(NO_TRIAL.settled_build(), None);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, NO_TRIAL, now),
+        BootHealthFinishDisposition::Completed
+    );
+    assert!(
+        app.resume_preverification_after_boot_health(build, None, now)
+            .is_none()
+    );
+    assert!(
+        app.handoff_preverify_in_flight.is_some(),
+        "an answer that settled no trial does not release an exact trial wait"
+    );
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, future);
+
+    // A settle at the updater's bound disarmed the exact trial as a proven one does.
+    assert_eq!(
+        SettledUnproven {
+            build: current,
+            why: String::new(),
+        }
+        .settled_build(),
+        Some(current)
+    );
+    let settled = Confirmed {
+        settled: Some(current),
+    };
+    let settled_build = settled.settled_build();
+    request_sequence += 1;
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, request_sequence);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(ticket, settled, now),
+        BootHealthFinishDisposition::Completed
+    );
+    let release = app
+        .resume_preverification_after_boot_health(build, settled_build, now)
+        .expect("the exact settlement consumes the exact passing wait");
+    assert!(
+        app.handoff_preverify_in_flight.is_none(),
+        "the exact settlement releases the exact build, commit, and artifact wait"
+    );
+    assert!(app.accelerate_auto_apply_after_boot_settlement(release, now));
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, now);
+    assert!(app.auto_apply_physical_retry.is_none());
+    assert!(app.auto_apply_manual_only.is_none());
+
+    let mut unrelated = App::headless_for_test();
+    stage_one_build_for_test(&mut unrelated, build);
+    unrelated.handoff_preverify_in_flight = Some(passing_read(
+        build,
+        now,
+        format!(
+            "codesign did not answer in time ({})",
+            aterm_update::PASSING_REFUSAL_KEY
+        ),
+    ));
+    assert!(
+        unrelated
+            .resume_preverification_after_boot_health(build, Some(current), now)
+            .is_none()
+    );
+    assert!(
+        unrelated.handoff_preverify_in_flight.is_some(),
+        "an unrelated passing read keeps its ordinary retry spacing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_boot_health_wake_cannot_consume_a_replacement_requests_wait() {
+    let now = std::time::Instant::now();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 1;
+    stage_one_build_for_test(&mut app, build);
+    let future = now + std::time::Duration::from_secs(600);
+    let intent = app.auto_apply_intent.as_mut().expect("the stage is armed");
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let passing = std::sync::Arc::new(std::sync::OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason: format!(
+                "staged update failed pre-park verification: update trial for build {current} is \
+                 still unconfirmed ({})",
+                aterm_update::PASSING_REFUSAL_KEY
+            ),
+            ended: now,
+        })
+        .unwrap();
+    app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+        build,
+        commit: PREFLIGHT_TEST_COMMIT.to_string(),
+        artifact: "ab".repeat(32),
+        deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+        done,
+        passing: std::sync::Arc::clone(&passing),
+    });
+
+    let stale_ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    let replacement_ticket = begin_boot_health_confirmation_for_test(&mut app, 2);
+    assert_eq!(
+        app.handle_native_boot_health_confirmation_finished(
+            stale_ticket,
+            aterm_update::BootHealthVerdict::Confirmed {
+                settled: Some(current),
+            },
+            now,
+        ),
+        BootHealthFinishDisposition::IgnoredStale
+    );
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::InFlight(replacement_ticket)
+    );
+    let retained = app
+        .handoff_preverify_in_flight
+        .as_ref()
+        .expect("a stale wake cannot restart the replacement request's exact wait");
+    assert!(std::sync::Arc::ptr_eq(&retained.passing, &passing));
+    assert!(app.auto_apply_intent.is_some_and(|intent| {
+        intent.retry_at == future
+            && intent.deadline_owner
+                == (crate::AutoApplyDeadlineOwner::Preverification { ended_at: now })
+    }));
 }
 
 #[test]
 fn boot_health_handlers_follow_the_confirmation_model() {
     let model = aterm_models_update::native_update_boot_health_confirmation_model();
+    let tries = model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "UnansweredTries")
+        .map(|(_, value)| *value)
+        .expect("the model declares its bound");
+    assert_eq!(tries, i64::from(crate::BOOT_HEALTH_UNANSWERED_TRIES));
     let now = std::time::Instant::now();
+    let watchdog = now + crate::BOOT_HEALTH_RETRY_MIN;
+    let ticket = BootHealthConfirmationTicket::for_test(1);
     let mut pending = vec![model.init_state()];
     let mut seen = std::collections::BTreeSet::new();
     while let Some(state) = pending.pop() {
-        if !seen.insert(state.clone()) {
+        // The handlers read nothing of an apply that already happened.
+        if state["applied"] == 1 || !seen.insert(state.clone()) {
             continue;
         }
         let app_at_state = || {
@@ -2591,13 +3102,14 @@ fn boot_health_handlers_follow_the_confirmation_model() {
             app.native_updater_service =
                 crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
             app.boot_health_confirmation = match state["state"] {
-                0 => crate::BootHealthConfirmation::Pending,
-                1 => crate::BootHealthConfirmation::InFlight,
-                2 => crate::BootHealthConfirmation::Confirmed,
+                0 => crate::BootHealthConfirmation::Awaiting,
+                1 => crate::BootHealthConfirmation::InFlight(ticket),
+                2 => crate::BootHealthConfirmation::Complete,
                 other => panic!("unexpected health state {other}"),
             };
             app.boot_health_confirmation_retry_at =
-                (state["retry"] == 1).then_some(now + crate::BOOT_HEALTH_RETRY_MIN);
+                (state["state"] == 1 || state["retry"] == 1).then_some(watchdog);
+            app.boot_health_unanswered = u32::try_from(state["unanswered"]).unwrap();
             app
         };
         let mut app = app_at_state();
@@ -2605,60 +3117,178 @@ fn boot_health_handlers_follow_the_confirmation_model() {
             app.boot_health_guard_open(),
             model.action_enabled("Queue", &state)
         );
-        if state["applied"] == 0 {
-            // An already-current target makes reaching the apply poll observable
-            // by consuming the intent without launching an installer.
-            let build = app.native_updater_service.snapshot().current_build;
-            app.auto_apply_intent = Some(crate::AutoApplyIntent {
-                build,
-                dmg_sha256: [0xab; 32],
-                retry_at: now,
-                attempts: 0,
-                held: crate::native_update_lane_hold::NamedHold::default(),
-            });
-            app.try_pending_native_auto_apply(false);
-            assert_eq!(
-                app.auto_apply_intent.is_none(),
-                model.action_enabled("Apply", &state)
-            );
-        }
+        assert_eq!(
+            app.native_boot_health_complete(),
+            model.action_enabled("Apply", &state),
+            "the gate is open exactly when the model may apply: {state:?}"
+        );
+        // An already-current target makes reaching the apply poll observable
+        // by consuming the intent without launching an installer.
+        let build = app.native_updater_service.snapshot().current_build;
+        app.auto_apply_intent = Some(crate::AutoApplyIntent {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: now,
+            attempts: 0,
+            deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
+            held: crate::native_update_lane_hold::NamedHold::default(),
+        });
+        app.try_pending_native_auto_apply(false);
+        assert_eq!(
+            app.auto_apply_intent.is_none(),
+            model.action_enabled("Apply", &state)
+        );
         for action in &model.actions {
             for next in model.successors(action.name, &state) {
-                let mut app = app_at_state();
+                // Each model action as the handlers that are it, one fresh app apiece.
+                let mut runs = Vec::new();
                 match action.name {
-                    "Queue" => app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now),
-                    "Unavailable" => {
-                        app.note_boot_health_dispatch(NativeUpdateDispatch::Unavailable, now)
+                    "Queue" => {
+                        let mut app = app_at_state();
+                        app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
+                        runs.push(app);
                     }
-                    "Failure" => app.finish_native_boot_health_confirmation(false, now),
-                    "Confirm" => app.finish_native_boot_health_confirmation(true, now),
+                    "Unavailable" => {
+                        for miss in [
+                            BootHealthDispatch::Unavailable,
+                            BootHealthDispatch::Saturated,
+                        ] {
+                            let mut app = app_at_state();
+                            app.note_boot_health_dispatch(miss, now);
+                            runs.push(app);
+                        }
+                    }
+                    "Failure" => {
+                        let mut app = app_at_state();
+                        assert_eq!(
+                            app.finish_native_boot_health_confirmation(
+                                ticket,
+                                boot_health_pending(),
+                                now,
+                            ),
+                            BootHealthFinishDisposition::RetryArmed
+                        );
+                        assert!(
+                            app.boot_health_hold_reason.is_some(),
+                            "a pending answer names the hold"
+                        );
+                        assert_eq!(next["held"], 1);
+                        runs.push(app);
+                    }
+                    "Unanswered" => {
+                        let mut app = app_at_state();
+                        assert_eq!(
+                            app.finish_native_boot_health_confirmation(
+                                ticket,
+                                boot_health_unanswered(),
+                                now,
+                            ),
+                            BootHealthFinishDisposition::RetryArmed
+                        );
+                        runs.push(app);
+                    }
+                    "Overdue" => {
+                        let mut app = app_at_state();
+                        app.expire_boot_health_confirmation(watchdog);
+                        runs.push(app);
+                    }
+                    "Confirm" => {
+                        for answer in [
+                            aterm_update::BootHealthVerdict::NO_TRIAL,
+                            aterm_update::BootHealthVerdict::Confirmed { settled: Some(12) },
+                            aterm_update::BootHealthVerdict::SettledUnproven {
+                                build: 12,
+                                why: "settled at its bound".to_string(),
+                            },
+                        ] {
+                            let mut app = app_at_state();
+                            assert_eq!(
+                                app.finish_native_boot_health_confirmation(ticket, answer, now),
+                                BootHealthFinishDisposition::Completed
+                            );
+                            runs.push(app);
+                        }
+                    }
                     "Apply" => {
                         pending.push(next);
                         continue;
                     }
                     other => panic!("unbound confirmation action {other}"),
                 }
-                let actual = match app.boot_health_confirmation {
-                    crate::BootHealthConfirmation::Pending => 0,
-                    crate::BootHealthConfirmation::InFlight => 1,
-                    crate::BootHealthConfirmation::Confirmed => 2,
-                };
-                assert_eq!(actual, next["state"], "{} from {state:?}", action.name);
-                assert_eq!(
-                    app.boot_health_confirmation_retry_at.is_some(),
-                    next["retry"] == 1
-                );
-                assert_eq!(i64::from(actual == 1), next["outstanding"]);
+                for app in runs {
+                    let actual = match app.boot_health_confirmation {
+                        crate::BootHealthConfirmation::Awaiting => 0,
+                        crate::BootHealthConfirmation::InFlight(actual_ticket) => {
+                            assert_eq!(actual_ticket, ticket);
+                            1
+                        }
+                        crate::BootHealthConfirmation::Complete => 2,
+                    };
+                    assert_eq!(actual, next["state"], "{} from {state:?}", action.name);
+                    match actual {
+                        0 => assert_eq!(
+                            app.boot_health_confirmation_retry_at.is_some(),
+                            next["retry"] == 1
+                        ),
+                        1 => {
+                            assert_eq!(next["retry"], 0);
+                            assert!(
+                                app.boot_health_confirmation_retry_at.is_some(),
+                                "an in-flight confirmation owns a lost-completion watchdog"
+                            );
+                        }
+                        2 => {
+                            assert_eq!(next["retry"], 0);
+                            assert!(
+                                app.boot_health_confirmation_retry_at.is_none(),
+                                "completed confirmation retires every retry/watchdog deadline"
+                            );
+                        }
+                        _ => unreachable!("the model has exactly three confirmation states"),
+                    }
+                    assert_eq!(i64::from(actual == 1), next["outstanding"]);
+                    assert_eq!(
+                        i64::from(app.boot_health_unanswered),
+                        next["unanswered"],
+                        "{} from {state:?}",
+                        action.name
+                    );
+                    // `AMissIsHeldOrCounted`, as the handlers keep it: a miss leaves the gate
+                    // awaiting with the updater's own hold, or counted toward the bound.
+                    if actual == 0 && next["missed"] == 1 {
+                        assert!(
+                            app.boot_health_hold_reason.is_some()
+                                && (next["held"] == 1 || app.boot_health_unanswered > 0),
+                            "{} from {state:?} is neither held nor counted",
+                            action.name
+                        );
+                    }
+                    assert_eq!(
+                        app.native_boot_health_complete(),
+                        model.action_enabled("Apply", &next),
+                        "the gate after {} from {state:?}",
+                        action.name
+                    );
+                }
                 pending.push(next);
             }
         }
     }
-    assert!(seen.len() > 3, "retry states must be reached");
+    assert!(
+        seen.iter().any(|state| state["unanswered"] == tries)
+            && seen.iter().any(|state| state["held"] == 1),
+        "the walk reaches the unanswered bound and a named hold"
+    );
 
     for (dial, trace, law) in [
-        (1, ["Queue", "Apply"].as_slice(), "ConfirmedBeforeApply"),
+        (4, ["Queue", "Apply"].as_slice(), "ConfirmedBeforeApply"),
         (2, ["Unavailable"].as_slice(), "RetryAfterMiss"),
         (3, ["Queue", "Queue"].as_slice(), "OneConfirmationInFlight"),
+        (
+            1,
+            ["Unavailable", "UnansweredForgotten"].as_slice(),
+            "AMissIsHeldOrCounted",
+        ),
     ] {
         let buggy = aterm_spec::interp::with_buggy(&model, dial);
         let mut state = buggy.init_state();
@@ -2677,13 +3307,14 @@ fn automatic_apply_waits_for_boot_health_and_confirmation_releases_it_now() {
     let mut app = App::headless_for_test();
     app.native_updater_service =
         crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
-    app.boot_health_confirmation = crate::BootHealthConfirmation::Pending;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
     let now = std::time::Instant::now();
     app.auto_apply_intent = Some(crate::AutoApplyIntent {
         build: 12,
         dmg_sha256: [0xab; 32],
         retry_at: now,
         attempts: 0,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
         held: crate::native_update_lane_hold::NamedHold::default(),
     });
 
@@ -2692,33 +3323,281 @@ fn automatic_apply_waits_for_boot_health_and_confirmation_releases_it_now() {
         app.auto_apply_intent.is_some(),
         "an unconfirmed build must not spend an automatic apply attempt"
     );
+    let held = app.auto_apply_intent.expect("the due intent is retained");
+    assert_eq!(
+        held.deadline_owner,
+        crate::AutoApplyDeadlineOwner::BootHealth
+    );
+    assert!(
+        held.retry_at > now,
+        "the startup gate owns the new deadline"
+    );
 
-    for _ in 0..2 {
-        app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
+    for request_sequence in 1..=2 {
+        let ticket = BootHealthConfirmationTicket::for_test(request_sequence);
+        app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
         assert_eq!(
             app.boot_health_confirmation,
-            crate::BootHealthConfirmation::InFlight
+            crate::BootHealthConfirmation::InFlight(ticket)
         );
         assert!(
             !app.boot_health_guard_open(),
             "one confirmation is already queued"
         );
+        app.auto_apply_intent
+            .as_mut()
+            .expect("queued confirmation retains the automatic intent")
+            .retry_at = std::time::Instant::now();
         app.try_pending_native_auto_apply(false);
-        assert!(app.auto_apply_intent.is_some(), "queued is not confirmed");
-        app.finish_native_boot_health_confirmation(false, now);
+        let queued = app
+            .auto_apply_intent
+            .expect("queued confirmation is not completed confirmation");
+        assert_eq!(
+            queued.deadline_owner,
+            crate::AutoApplyDeadlineOwner::BootHealth
+        );
+        assert_eq!(
+            app.finish_native_boot_health_confirmation(ticket, boot_health_pending(), now,),
+            BootHealthFinishDisposition::RetryArmed
+        );
+        app.auto_apply_intent
+            .as_mut()
+            .expect("failed confirmation retains the automatic intent")
+            .retry_at = std::time::Instant::now();
         app.try_pending_native_auto_apply(false);
-        assert!(
-            app.auto_apply_intent.is_some(),
-            "a failed confirmation releases nothing"
+        let retrying = app
+            .auto_apply_intent
+            .expect("a failed confirmation releases nothing");
+        assert_eq!(
+            retrying.deadline_owner,
+            crate::AutoApplyDeadlineOwner::BootHealth
         );
     }
 
-    app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
-    app.finish_native_boot_health_confirmation(true, now);
+    let ticket = BootHealthConfirmationTicket::for_test(3);
+    app.note_boot_health_dispatch(BootHealthDispatch::Queued(ticket), now);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    let released = app
+        .auto_apply_intent
+        .expect("completion releases before polling");
+    assert_eq!(
+        released.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Ordinary
+    );
+    assert_eq!(released.retry_at, now);
+    app.try_pending_native_auto_apply(false);
     assert!(
         app.auto_apply_intent.is_none(),
         "confirmation must release the retained intent immediately, not after a retry cooldown"
     );
+}
+
+#[test]
+fn boot_health_completion_does_not_accelerate_a_genuinely_future_auto_retry() {
+    let mut app = App::headless_for_test();
+    app.native_updater_service =
+        crate::native_updater_service::NativeUpdaterService::new(10, "1.0.10", true);
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let now = std::time::Instant::now();
+    let future = now + std::time::Duration::from_secs(60);
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 11,
+        dmg_sha256: [0xab; 32],
+        retry_at: future,
+        attempts: 1,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+
+    app.try_pending_native_auto_apply(false);
+    let retained = app
+        .auto_apply_intent
+        .expect("the future retry remains armed");
+    assert_eq!(retained.retry_at, future);
+    assert_eq!(
+        retained.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Ordinary
+    );
+
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    assert_eq!(
+        app.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    let retained = app
+        .auto_apply_intent
+        .expect("completion keeps the future retry");
+    assert_eq!(retained.retry_at, future);
+    assert_eq!(
+        retained.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Ordinary
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn boot_settlement_accelerates_only_the_deadline_owned_by_its_consumed_wait() {
+    let now = std::time::Instant::now();
+    let future = now + std::time::Duration::from_secs(600);
+
+    let mut replaced = App::headless_for_test();
+    let build = replaced.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut replaced, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut replaced, build, now);
+    replace_staged_artifact_for_test(&mut replaced, build, 0xcd);
+    replaced.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build,
+        dmg_sha256: [0xcd; 32],
+        retry_at: future,
+        attempts: 1,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Preverification { ended_at: now },
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    assert!(
+        !replaced.accelerate_auto_apply_after_boot_settlement(release, now),
+        "an old wait has no authority over a coherent stage-and-intent replacement"
+    );
+    assert_eq!(replaced.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut stage_only = App::headless_for_test();
+    let build = stage_only.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut stage_only, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut stage_only, build, now);
+    replace_staged_artifact_for_test(&mut stage_only, build, 0xcd);
+    let intent = stage_only.auto_apply_intent.as_mut().unwrap();
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+    assert!(
+        !stage_only.accelerate_auto_apply_after_boot_settlement(release, now),
+        "the token's digest must still name the stage even when the retained intent names it"
+    );
+    assert_eq!(stage_only.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut intent_only = App::headless_for_test();
+    let build = intent_only.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut intent_only, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut intent_only, build, now);
+    let intent = intent_only.auto_apply_intent.as_mut().unwrap();
+    intent.dmg_sha256 = [0xcd; 32];
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+    assert!(
+        !intent_only.accelerate_auto_apply_after_boot_settlement(release, now),
+        "the token's digest must still name the intent even when it names the stage"
+    );
+    assert_eq!(intent_only.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut recommitted = App::headless_for_test();
+    let build = recommitted.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut recommitted, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut recommitted, build, now);
+    let current = recommitted.native_updater_service.snapshot().current_build;
+    let mut replacement =
+        crate::native_updater_service::NativeUpdaterService::new(current, "test", true);
+    let CheckStart::Start(ticket) = replacement.request_check() else {
+        panic!("a fresh replacement service starts one check");
+    };
+    let mut durable = durable_download_status(&recommitted, build);
+    durable.staged_commit = Some("cd".repeat(20));
+    assert_eq!(
+        replacement.finish_check(ticket, durable),
+        CheckCompletion::Reduced,
+        "PRECONDITION: the recommitted same-build artifact is staged"
+    );
+    recommitted.native_updater_service = replacement;
+    let intent = recommitted.auto_apply_intent.as_mut().unwrap();
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+    assert!(
+        !recommitted.accelerate_auto_apply_after_boot_settlement(release, now),
+        "the token's commit must still name the stage even when build and digest match"
+    );
+    assert_eq!(recommitted.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut advanced = App::headless_for_test();
+    let current = advanced.native_updater_service.snapshot().current_build;
+    let build = current + 2;
+    stage_one_build_for_test(&mut advanced, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut advanced, build, now);
+    let mut replacement =
+        crate::native_updater_service::NativeUpdaterService::new(current + 1, "test", true);
+    let CheckStart::Start(ticket) = replacement.request_check() else {
+        panic!("a fresh replacement service starts one check");
+    };
+    let mut durable = durable_download_status(&advanced, build);
+    durable.current_build = current + 1;
+    assert_eq!(
+        replacement.finish_check(ticket, durable),
+        CheckCompletion::Reduced,
+        "PRECONDITION: the same target remains staged after the running build advances"
+    );
+    advanced.native_updater_service = replacement;
+    let intent = advanced.auto_apply_intent.as_mut().unwrap();
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Preverification { ended_at: now };
+    assert!(
+        !advanced.accelerate_auto_apply_after_boot_settlement(release, now),
+        "a token from an older running build cannot accelerate its successor process"
+    );
+    assert_eq!(advanced.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut retargeted = App::headless_for_test();
+    let original = retargeted.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut retargeted, original);
+    let release = consume_exact_boot_health_preverification_wait(&mut retargeted, original, now);
+    let replacement_build = original + 1;
+    let current = retargeted.native_updater_service.snapshot().current_build;
+    let mut replacement =
+        crate::native_updater_service::NativeUpdaterService::new(current, "test", true);
+    let CheckStart::Start(ticket) = replacement.request_check() else {
+        panic!("a fresh replacement service starts one check");
+    };
+    assert_eq!(
+        replacement.finish_check(
+            ticket,
+            durable_download_status(&retargeted, replacement_build)
+        ),
+        CheckCompletion::Reduced,
+        "PRECONDITION: the coherent replacement target is staged"
+    );
+    retargeted.native_updater_service = replacement;
+    retargeted.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: replacement_build,
+        dmg_sha256: [0xab; 32],
+        retry_at: future,
+        attempts: 1,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Preverification { ended_at: now },
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    assert!(
+        !retargeted.accelerate_auto_apply_after_boot_settlement(release, now),
+        "a token cannot transfer to a coherent replacement build with the same commit and digest"
+    );
+    assert_eq!(retargeted.auto_apply_intent.unwrap().retry_at, future);
+
+    let mut physical = App::headless_for_test();
+    let build = physical.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut physical, build);
+    let release = consume_exact_boot_health_preverification_wait(&mut physical, build, now);
+    let intent = physical.auto_apply_intent.as_mut().unwrap();
+    intent.retry_at = future;
+    intent.deadline_owner = crate::AutoApplyDeadlineOwner::Ordinary;
+    assert!(
+        !physical.accelerate_auto_apply_after_boot_settlement(release, now),
+        "target equality cannot shorten a later physical or grace retry for the same bytes"
+    );
+    assert_eq!(physical.auto_apply_intent.unwrap().retry_at, future);
 }
 
 #[test]
@@ -3686,6 +4565,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
             dmg_sha256: [0xcd; 32],
             activation: false,
             cycles: PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+            epoch_failures: 0,
             last_attempt: blocked_at,
         });
         let budget = app.auto_apply_physical_retry;
@@ -4662,6 +5542,660 @@ fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {
     }
 }
 
+/// A REFUSED FILE'S TEXT CAN ONLY ADD AN OFF TO AN ADMITTED TEXT: a window that read the file well
+/// went on installing over an `auto_apply = false` added to it once the watcher refused it (mode 0664,
+/// a stray byte), though the boot's and the node job's readers both held for that line. NEGATIVE
+/// CONTROLS: no refused text lifts a `false` an admitted text gave, a later one lifts only the off a
+/// refused text added, and an admitted text ends all of it.
+#[test]
+fn a_refused_file_s_text_can_only_add_an_off_to_an_admitted_text() {
+    use crate::app_config::UpdateConfig;
+    use crate::app_config::UpdateSwitchOrigin::Admitted;
+    const AUTO_OFF: &str = "[update]\nauto_apply = false\n";
+    const ENABLED_OFF: &str = "[update]\nenabled = false\n";
+    const SAYS_NOTHING: &str = "font_px = 12.0\n";
+    const SAYS_ON: &str = "[update]\nauto_apply = true\nenabled = true\n";
+    const WRONG_TYPE: &str = "[update]\nauto_apply = \"no\"\n";
+    const BROKEN: &str = "[update\nauto_apply = false\n";
+    let update = |enabled, auto_apply| {
+        Some(UpdateConfig {
+            enabled,
+            auto_apply,
+            ..UpdateConfig::default()
+        })
+    };
+    let mut app = App::headless_for_test();
+    assert_eq!(app.update_switch_origin, Admitted);
+    app.config.update = None;
+
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(app.config.update, None, "nothing to add");
+    app.take_refused_update_text(WRONG_TYPE);
+    assert_eq!(
+        app.config.update,
+        update(None, Some(false)),
+        "a wrong type may be a person's false"
+    );
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(app.config.update, None, "it ends as another off does");
+    app.take_refused_update_text(SAYS_ON);
+    assert_eq!(app.config.update, None, "an on adds nothing");
+
+    app.take_refused_update_text(AUTO_OFF);
+    assert_eq!(
+        app.config.update,
+        update(None, Some(false)),
+        "the added off"
+    );
+    assert_eq!(app.update_switch_origin, Admitted);
+    app.take_refused_update_text(AUTO_OFF);
+    assert_eq!(app.config.update, update(None, Some(false)), "it stays");
+    app.take_refused_update_text(ENABLED_OFF);
+    assert_eq!(
+        app.config.update,
+        update(Some(false), None),
+        "this text's off replaces the last text's"
+    );
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update, None,
+        "the line is gone, and so is its off"
+    );
+    app.take_refused_update_text(BROKEN);
+    assert_eq!(
+        app.config.update,
+        update(None, Some(false)),
+        "text that is not TOML names it, as the boot's reader takes it"
+    );
+    app.take_refused_update_text("");
+    assert_eq!(app.config.update, None, "a file that is gone is no off");
+    app.take_refused_update_text("[update]\nenabled = false\nbroken");
+    assert_eq!(
+        app.config.update,
+        update(Some(false), None),
+        "text that is not TOML says `enabled` as the boot's reader takes it"
+    );
+    app.take_refused_update_text("[keeper]\nenabled = false\nbroken");
+    assert_eq!(app.config.update, None, "and only under `[update]`");
+
+    app.config.update = update(None, Some(false));
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update,
+        update(None, Some(false)),
+        "NEGATIVE CONTROL: a false an admitted text gave"
+    );
+    app.take_refused_update_text(SAYS_ON);
+    assert_eq!(app.config.update, update(None, Some(false)));
+    app.take_refused_update_text(ENABLED_OFF);
+    assert_eq!(
+        app.config.update,
+        update(Some(false), Some(false)),
+        "an off beside the admitted one"
+    );
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update,
+        update(None, Some(false)),
+        "NEGATIVE CONTROL: only its own off ends"
+    );
+
+    app.config.update = None;
+    app.admitted_update_under_refused_off = None;
+    app.take_refused_update_text(AUTO_OFF);
+    app.take_update_switches_of_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update, None,
+        "a text a window takes speaks whole"
+    );
+    assert_eq!(
+        app.admitted_update_under_refused_off, None,
+        "and no copy stays"
+    );
+}
+
+/// A REFUSED FILE'S TEXT MOVES SWITCHES NO ADMITTED TEXT SET: no read the watcher admits ever came
+/// for a file it refuses, so a launch's off stayed for the process's life, whether it stood for a
+/// fault or for a line a person has since removed, and a torn first read lifted a false for good.
+/// CONTROLS: a read saying off keeps it off, and so does a wrong type, which may be a person's `false`.
+/// Over an admitted text see
+/// `a_refused_file_s_text_can_only_add_an_off_to_an_admitted_text`.
+#[test]
+fn a_refused_file_s_text_moves_switches_no_admitted_text_set() {
+    use crate::app_config::UpdateSwitchOrigin::{Admitted, FaultHold, RefusedRead};
+    const SAYS_OFF: &str = "[update]\nauto_apply = false\n";
+    const SAYS_NOTHING: &str = "font_px = 12.0\n";
+    const WRONG_TYPE: &str = "[update]\nauto_apply = \"no\"\n";
+    let mut app = App::headless_for_test();
+    let off = || {
+        Some(crate::app_config::UpdateConfig {
+            auto_apply: Some(false),
+            ..crate::app_config::UpdateConfig::default()
+        })
+    };
+    let stand_on = |app: &mut App, origin| {
+        app.config.update = off();
+        app.update_switch_origin = origin;
+    };
+
+    stand_on(&mut app, FaultHold);
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update, None,
+        "the file says nothing of the switch"
+    );
+    assert_eq!(app.update_switch_origin, RefusedRead, "it goes on asking");
+    app.take_refused_update_text(SAYS_OFF);
+    assert_eq!(
+        app.config.update,
+        off(),
+        "the complete file a torn read caught, and a false added to a refused file"
+    );
+    app.take_refused_update_text(WRONG_TYPE);
+    assert_eq!(app.config.update, off(), "CONTROL: so does a wrong type");
+    app.take_refused_update_text("");
+    assert_eq!(app.config.update, None, "the line is gone");
+
+    stand_on(&mut app, FaultHold);
+    app.take_refused_update_text(SAYS_OFF);
+    assert_eq!(
+        app.config.update,
+        off(),
+        "CONTROL: the file itself says off"
+    );
+    assert_eq!(app.update_switch_origin, RefusedRead);
+
+    stand_on(&mut app, FaultHold);
+    app.take_refused_update_text(WRONG_TYPE);
+    assert_eq!(app.config.update, off(), "the file itself may say off");
+    assert_eq!(app.update_switch_origin, RefusedRead);
+
+    stand_on(&mut app, FaultHold);
+    app.take_update_switches_of_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update, None,
+        "the fault's off ends at the read a window takes"
+    );
+    assert_eq!(app.update_switch_origin, RefusedRead);
+    app.config.update = off();
+    app.take_update_switches_of_text(WRONG_TYPE);
+    assert_eq!(app.config.update, off(), "CONTROL: one the text set stays");
+    stand_on(&mut app, Admitted);
+    app.take_update_switches_of_text("[update\nauto_apply = false\n");
+    assert_eq!(
+        app.config.update,
+        off(),
+        "that read saying off keeps it off"
+    );
+    assert_eq!(
+        app.update_switch_origin, RefusedRead,
+        "a text that did not load is no text a refused read must respect"
+    );
+    app.take_update_switches_of_text(WRONG_TYPE);
+    app.take_refused_update_text(SAYS_NOTHING);
+    assert_eq!(
+        app.config.update, None,
+        "so a refused file with the line gone ends an off a wrong type left standing"
+    );
+}
+
+/// A CHECK THAT NEVER ANSWERS STOPS HOLDING UPDATE WORK: only its worker's answer cleared `active`,
+/// and while it stood a stage another process wrote was never imported and Install found nothing
+/// staged, with the node job still leaving the apply to this window. It fails at its deadline, what
+/// it parked is asked for, its late answer changes nothing but asks for a stage it names, and a
+/// person can start another. With nothing parked it asks for a stage itself, since nothing else may
+/// say one was written. CONTROLS: a moment earlier changes nothing, and a late answer with no stage
+/// asks for nothing.
+#[test]
+fn a_check_that_never_answers_stops_holding_update_work() {
+    let mut app = App::headless_for_test();
+    let ticket = start(&mut app.native_updater_service);
+    let by = app
+        .native_updater_service
+        .check_answer_by()
+        .expect("a check owes an answer");
+    app.finish_native_update_reconcile(
+        NativeUpdateReconcilePurpose::Refresh,
+        reconcile_facts_with_installed(1, 3, Some(status(None, 0)), None),
+    );
+    assert!(
+        app.deferred_native_update_reconcile.is_some(),
+        "PRECONDITION: the check parks a reconcile"
+    );
+
+    app.retire_overdue_native_update_check(by - std::time::Duration::from_secs(1));
+    assert_eq!(
+        app.native_updater_service.snapshot().active,
+        Some(ticket),
+        "CONTROL: it is not overdue yet"
+    );
+
+    let mut asked = Vec::new();
+    app.retire_overdue_native_update_check_by(by, |_, purpose| {
+        asked.push(purpose);
+        true
+    });
+    assert_eq!(
+        asked,
+        [NativeUpdateReconcilePurpose::Refresh],
+        "what it parked"
+    );
+    let snapshot = app.native_updater_service.snapshot();
+    assert_eq!(snapshot.active, None);
+    assert_eq!(snapshot.phase, UpdaterPhase::Failed);
+    assert_eq!(snapshot.outcome, "", "nothing says it twice");
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("has said nothing")),
+        "{:?}",
+        snapshot.error
+    );
+    let ignored = snapshot.ignored_completions;
+    assert!(
+        app.deferred_native_update_reconcile.is_none(),
+        "the reconcile it parked is released"
+    );
+    assert_eq!(app.native_updater_service.check_answer_by(), None);
+
+    let newer = snapshot.current_build + 1;
+    for (stage, wanted) in [
+        (None, Vec::new()),
+        (
+            Some(newer),
+            vec![NativeUpdateReconcilePurpose::StageAvailable],
+        ),
+    ] {
+        let mut asked = Vec::new();
+        app.finish_native_update_check_by(ticket, status(stage, 0), |_, purpose| {
+            asked.push(purpose);
+            true
+        });
+        assert_eq!(asked, wanted, "a late answer naming {stage:?}");
+        let snapshot = app.native_updater_service.snapshot();
+        assert_eq!(
+            snapshot.phase,
+            UpdaterPhase::Failed,
+            "a late answer is ignored"
+        );
+        assert!(snapshot.staged.is_none(), "a late answer is ignored");
+    }
+    assert_eq!(
+        app.native_updater_service.snapshot().ignored_completions,
+        ignored + 2
+    );
+
+    let next = start(&mut app.native_updater_service);
+    assert_ne!(next, ticket);
+    let by = app
+        .native_updater_service
+        .check_answer_by()
+        .expect("a check owes an answer");
+    assert!(app.deferred_native_update_reconcile.is_none());
+    let mut asked = Vec::new();
+    app.retire_overdue_native_update_check_by(by, |_, purpose| {
+        asked.push(purpose);
+        true
+    });
+    assert_eq!(
+        asked,
+        [NativeUpdateReconcilePurpose::StageAvailable],
+        "nothing parked: it reads for a stage itself"
+    );
+}
+
+/// A CHECK THAT KEEPS MOVING IS NO STUCK CHECK: the 70 minutes counted from its start, shorter than a
+/// healthy slow download, so one making steady progress was reported as failed. They count from its
+/// last progress, to a ceiling: a report carries no ticket, so a scheduled check's failing downloads
+/// renewed a dead press's deadline with no bound. CONTROLS: a report that is no progress moves
+/// nothing, nor does a download that announced itself and has no byte yet.
+#[test]
+fn a_check_s_deadline_counts_from_its_last_progress() {
+    let mut app = App::headless_for_test();
+    let ticket = start(&mut app.native_updater_service);
+    let first = app
+        .native_updater_service
+        .check_answer_by()
+        .expect("a check owes an answer");
+    app.note_update_progress(&aterm_update::Progress::Deferred {
+        detail: "the host answered 429".to_string(),
+    });
+    assert_eq!(
+        app.native_updater_service.check_answer_by(),
+        Some(first),
+        "CONTROL: no progress"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    app.note_update_progress(&aterm_update::Progress::Downloading {
+        version: "1.2.0".to_string(),
+        bytes_done: 0,
+        bytes_total: 0,
+    });
+    assert_eq!(
+        app.native_updater_service.check_answer_by(),
+        Some(first),
+        "CONTROL: a download with no byte yet"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    app.note_update_progress(&aterm_update::Progress::Downloading {
+        version: "1.2.0".to_string(),
+        bytes_done: 1,
+        bytes_total: 2,
+    });
+    let moved = app
+        .native_updater_service
+        .check_answer_by()
+        .expect("still owed");
+    assert!(moved > first, "progress moves the deadline");
+    app.retire_overdue_native_update_check(first);
+    assert_eq!(
+        app.native_updater_service.snapshot().active,
+        Some(ticket),
+        "the old deadline retires nothing"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    app.note_update_progress(&aterm_update::Progress::Verifying {
+        version: "1.2.0".to_string(),
+    });
+    assert!(
+        app.native_updater_service
+            .check_answer_by()
+            .is_some_and(|by| by > moved),
+        "verifying is progress too"
+    );
+    let started = first
+        .checked_sub(crate::native_updater_service::check_answers_within())
+        .expect("this machine has been up long enough");
+    let ceiling = started + crate::native_updater_service::CHECK_ANSWER_CEILING;
+    app.native_updater_service.note_check_progress(ceiling);
+    assert_eq!(
+        app.native_updater_service.check_answer_by(),
+        Some(ceiling),
+        "progress moves it no further than the ceiling"
+    );
+    app.retire_overdue_native_update_check(ceiling);
+    let snapshot = app.native_updater_service.snapshot();
+    assert_eq!(snapshot.active, None);
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("has not answered in 24 h")),
+        "progress came moments ago, so it says only what it knows: {:?}",
+        snapshot.error
+    );
+}
+
+/// A CHECK THAT GAVE UP IS SAID ON THE PAGE UNTIL ONE COMPLETES: the very read its retirement asks for
+/// took the ledger's "up to date", so the page said "You're up to date." under a check nobody heard
+/// from. A stage and a receipt newer than its start end it, and that receipt counts from a later
+/// press, its own late answer, or a read at the checker's next phase. CONTROLS: a receipt from before
+/// it started does not end it, nor does any number of ledger reads, nor a later check that failed and
+/// wrote none (whose words the sentence does not contradict). A late answer asks for no read.
+#[test]
+fn a_check_that_gave_up_says_so_until_something_answers() {
+    const SAID: &str = crate::native_updater_service::CHECK_DID_NOT_ANSWER;
+    let headline = |app: &App| app.update_snapshot(false).projection().headline;
+    let give_up = |app: &mut App| {
+        let ticket = start(&mut app.native_updater_service);
+        let by = app
+            .native_updater_service
+            .check_answer_by()
+            .expect("a check owes an answer");
+        app.retire_overdue_native_update_check_by(by, |_, _| true);
+        ticket
+    };
+    let since = |app: &App| {
+        app.native_updater_service
+            .snapshot()
+            .check_unanswered_since
+            .expect("it gave up")
+    };
+    let mut app = App::headless_for_test();
+    let mut sequence = 2;
+    let mut read = |app: &mut App, status: DurableUpdateStatus| {
+        sequence += 1;
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::Refresh,
+            reconcile_facts_with_installed(1, sequence, Some(status), None),
+        );
+    };
+
+    let _ = give_up(&mut app);
+    read(&mut app, status(None, 0));
+    read(&mut app, status(None, 0));
+    assert_eq!(app.native_updater_service.snapshot().outcome, "up to date");
+    assert_eq!(headline(&app), SAID, "the ledger's words are not an answer");
+
+    let at = since(&app);
+    let mut older = status(None, 0);
+    older.checked_at = Some(at);
+    read(&mut app, older);
+    assert_eq!(
+        headline(&app),
+        SAID,
+        "CONTROL: a receipt from before it started"
+    );
+
+    let mut newer = status(None, 0);
+    newer.checked_at = Some(at + 1);
+    read(&mut app, newer);
+    assert_eq!(
+        app.native_updater_service.snapshot().check_unanswered_since,
+        None,
+        "a check answered on this Mac"
+    );
+    assert_ne!(headline(&app), SAID);
+
+    let ticket = give_up(&mut app);
+    read(&mut app, status(None, 0));
+    assert_eq!(headline(&app), SAID);
+    let next = start(&mut app.native_updater_service);
+    assert_ne!(next, ticket);
+    app.finish_native_update_check_by(next, status(None, 1), |_, _| true);
+    assert_eq!(
+        headline(&app),
+        SAID,
+        "CONTROL: that check failed and wrote no receipt"
+    );
+    let next = start(&mut app.native_updater_service);
+    let mut answered = status(None, 0);
+    answered.checked_at = Some(since(&app) + 1);
+    app.finish_native_update_check_by(next, answered, |_, _| true);
+    assert_eq!(
+        app.native_updater_service.snapshot().check_unanswered_since,
+        None,
+        "a later press left a receipt"
+    );
+    assert_ne!(headline(&app), SAID);
+
+    let mut asked = 0;
+    let ticket = give_up(&mut app);
+    let mut late = status(None, 0);
+    late.checked_at = Some(since(&app));
+    app.finish_native_update_check_by(ticket, late, |_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(
+        headline(&app),
+        SAID,
+        "CONTROL: a late answer with no newer receipt"
+    );
+    let ticket = give_up(&mut app);
+    let mut late = status(None, 0);
+    late.checked_at = Some(since(&app) + 1);
+    let published = FULL_UPDATE_PUBLISHES.with(std::cell::Cell::get);
+    app.finish_native_update_check_by(ticket, late, |_, _| {
+        asked += 1;
+        true
+    });
+    assert_ne!(headline(&app), SAID, "its late receipt counts");
+    assert!(
+        FULL_UPDATE_PUBLISHES.with(std::cell::Cell::get) > published,
+        "and an open page hears it"
+    );
+    assert_eq!(asked, 0, "CONTROL: a late answer asks for no read");
+
+    app.note_update_checker_phase_by(|_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "CONTROL: a healthy Mac reads nothing at a phase");
+    let _ = give_up(&mut app);
+    app.note_update_checker_phase_by(|_, purpose| {
+        assert!(
+            matches!(purpose, NativeUpdateReconcilePurpose::StageAvailable),
+            "only that purpose announces a stage this read finds first"
+        );
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 1, "while it stands, a phase asks for a read");
+    let mut newer = status(None, 0);
+    newer.checked_at = Some(since(&app) + 1);
+    read(&mut app, newer);
+    assert_ne!(headline(&app), SAID);
+
+    let _ = give_up(&mut app);
+    read(&mut app, status(None, 0));
+    assert_eq!(headline(&app), SAID);
+    let newer = app.native_updater_service.snapshot().current_build + 1;
+    read(&mut app, status(Some(newer), 0));
+    assert_eq!(
+        app.native_updater_service.snapshot().check_unanswered_since,
+        None,
+        "a stage replaces it"
+    );
+}
+
+/// LINUX SAYS IT TOO: its arm returned before the rung, so the settled page read "No update staged."
+/// over the ledger's "Up to date — …". Every fact outranks it, and keeps the sentence in its detail.
+/// CONTROLS: a new press owns the page, and a failing check's cause stays.
+#[test]
+fn a_check_that_gave_up_says_so_on_linux_under_its_facts() {
+    const SAID: &str = crate::native_updater_service::CHECK_DID_NOT_ANSWER;
+    let spoken = SAID.trim_end_matches('.');
+    let projection = |app: &App| app.update_snapshot(false).projection();
+    let mut app = App::headless_for_test();
+    let running = app.native_updater_service.snapshot().current_build;
+    let mut sequence = 2;
+    let mut read = |app: &mut App, status: DurableUpdateStatus| {
+        sequence += 1;
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::Refresh,
+            reconcile_facts_with_installed(1, sequence, Some(status), None),
+        );
+    };
+    let ledger = |staged: Option<u64>| {
+        let mut status = linux_status_holding(running, staged);
+        status.outcome = "Up to date \u{2014} the newest release is aterm 1.0".to_string();
+        status
+    };
+    read(&mut app, ledger(None));
+    let _ = start(&mut app.native_updater_service);
+    let by = app
+        .native_updater_service
+        .check_answer_by()
+        .expect("a check owes an answer");
+    app.retire_overdue_native_update_check_by(by, |_, _| true);
+    read(&mut app, ledger(None));
+    read(&mut app, ledger(None));
+    let settled = projection(&app);
+    assert!(settled.linux_host, "PRECONDITION: a Linux status");
+    assert_eq!(settled.headline, SAID);
+    assert!(settled.check_unanswered);
+    assert_eq!(
+        crate::native_settings::compact_update_headline(&settled),
+        "No answer"
+    );
+    assert_eq!(settled.outcome, "", "the ledger's words predate it");
+    assert!(
+        !settled
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Up to date"),
+        "{:?}",
+        settled.detail
+    );
+
+    let mut rejected = ledger(None);
+    rejected.outcome = "The downloaded aterm 9 is no longer allowed to install".to_string();
+    read(&mut app, rejected.clone());
+    let cause = projection(&app);
+    assert_eq!(cause.headline, SAID);
+    assert_eq!(
+        cause.outcome, rejected.outcome,
+        "CONTROL: only the words that claim currency stand aside"
+    );
+    assert!(
+        cause
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no longer allowed")),
+        "{:?}",
+        cause.detail
+    );
+
+    read(&mut app, ledger(Some(running + 1)));
+    let downloaded = projection(&app);
+    assert_eq!(downloaded.headline, "Update downloaded.");
+    assert!(
+        !downloaded.check_unanswered,
+        "a fact outranks it in every rung"
+    );
+    assert!(
+        downloaded
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with(spoken)),
+        "{:?}",
+        downloaded.detail
+    );
+
+    let mut failing = ledger(None);
+    failing.failing_checks = 1;
+    failing.outcome = "network failed".to_string();
+    read(&mut app, failing);
+    let failed = projection(&app);
+    assert_eq!(failed.headline, "Update needs attention.");
+    let detail = failed.detail.unwrap_or_default();
+    assert!(detail.contains(spoken), "{detail}");
+    assert!(detail.contains("network failed"), "CONTROL: {detail}");
+
+    let mut failing_over_old_words = ledger(None);
+    failing_over_old_words.failing_checks = 1;
+    read(&mut app, failing_over_old_words);
+    let stale = projection(&app);
+    assert_eq!(stale.headline, "Update needs attention.");
+    assert_eq!(stale.outcome, "", "a failing check is no claim of currency");
+    assert!(
+        !stale
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Up to date"),
+        "{:?}",
+        stale.detail
+    );
+
+    read(&mut app, ledger(Some(running + 1)));
+    let _press = start(&mut app.native_updater_service);
+    let pressed = app.update_snapshot(true).projection();
+    assert_ne!(pressed.headline, SAID);
+    assert!(
+        !pressed
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains(spoken),
+        "CONTROL: a new press owns the page: {:?}",
+        pressed.detail
+    );
+}
+
 #[test]
 fn a_panicked_manual_check_finishes_its_ticket_and_can_be_retried() {
     let mut app = App::headless_for_test();
@@ -4716,6 +6250,7 @@ fn arm_applies_each_decision_to_the_retained_intent() {
         dmg_sha256: [0xab; 32],
         retry_at: std::time::Instant::now() + std::time::Duration::from_secs(23),
         attempts: 3,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
         held: crate::native_update_lane_hold::NamedHold::default(),
     };
     app.auto_apply_intent = Some(retained);
@@ -4843,6 +6378,133 @@ fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
     assert!(
         last < crate::native_update_auto_intent::LANDS_WITHIN,
         "the saturated spacing fits inside the bound it serves"
+    );
+}
+
+/// The wait each of `shapes`' failures schedules, in turn, for one artifact, through
+/// `spend_physical_failure_budget`: `Some(d)` a retry `d` out, `None` a stand-down or convergence
+/// (each checked to wait at least the epoch cooldown). A wait is read from the booking's own clock
+/// (the budget's `last_attempt`), so a slow test changes nothing.
+#[cfg(unix)]
+fn physical_failure_walk(shapes: &[PhysicalFailureShape]) -> Vec<Option<std::time::Duration>> {
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    shapes
+        .iter()
+        .map(|&shape| {
+            let schedule = app.spend_physical_failure_budget(build, [0xab; 32], false, shape);
+            let booked = app
+                .auto_apply_physical_retry
+                .expect("every failure is booked")
+                .last_attempt;
+            let wait = schedule.retry_at().saturating_duration_since(booked);
+            match schedule {
+                PhysicalFailureSchedule::Retry(_) => Some(wait),
+                PhysicalFailureSchedule::StandDown(_)
+                | PhysicalFailureSchedule::Converged { .. } => {
+                    assert!(
+                        wait >= PHYSICAL_FAILURE_EPOCH_COOLDOWN,
+                        "{shape:?}: {schedule:?} waits at least the epoch cooldown"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Each shape's whole walk, failure by failure ([`physical_failure_walk`]).
+#[cfg(unix)]
+#[test]
+fn a_transient_failure_opening_its_epoch_is_retried_within_the_minute() {
+    use std::time::Duration;
+    let walk = |shape: PhysicalFailureShape, failures: u8| {
+        physical_failure_walk(&vec![shape; usize::from(failures)])
+    };
+    let (quick, spell, ceiling) = (
+        Some(TRANSIENT_FIRST_RETRY_AFTER),
+        Some(Duration::from_secs(600)),
+        Some(Duration::from_secs(1800)),
+    );
+    assert!(TRANSIENT_FIRST_RETRY_AFTER <= Duration::from_secs(60));
+    let epoch = [quick, spell, ceiling, None];
+    assert_eq!(
+        walk(
+            PhysicalFailureShape::Transient,
+            PHYSICAL_FAILURE_LIFETIME_ATTEMPTS + 1
+        ),
+        [epoch, epoch, [quick, spell, ceiling, None]]
+            .concat()
+            .into_iter()
+            .chain([None])
+            .collect::<Vec<_>>(),
+        "THE STALL: a transient failure that opens its epoch is retried within the minute, then \
+         on the long rungs every busy spell got before (10 min, 30 min), then the stand-down"
+    );
+    assert_eq!(
+        walk(
+            PhysicalFailureShape::Unexplained,
+            UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS
+        ),
+        [spell, ceiling, None, spell, ceiling, None],
+        "CONTROL: an unexplained death may be the machine's, so it keeps the long first rung"
+    );
+    assert_eq!(
+        walk(
+            PhysicalFailureShape::Structural,
+            STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS
+        ),
+        [spell, None],
+        "CONTROL: a structural failure's one confirming retry keeps its long rung, since the \
+         launch it spent may stay counted"
+    );
+    for shape in [
+        PhysicalFailureShape::Transient,
+        PhysicalFailureShape::Unexplained,
+        PhysicalFailureShape::Structural,
+    ] {
+        assert_eq!(
+            shape.lifetime_attempts() % shape.failures_per_epoch(),
+            0,
+            "{shape:?}: a lifetime is whole epochs"
+        );
+    }
+}
+
+/// An epoch ends where its last failure's own table does, whatever shapes came before it in
+/// that epoch. The shapes' epochs are of different lengths, and their place was read off the
+/// artifact's total failures (`cycles % failures_per_epoch`). So a transient failure after an
+/// unexplained epoch's three fell on a transient epoch's last place and stood down for six
+/// hours, where the epoch it opened owed it the quick retry.
+#[cfg(unix)]
+#[test]
+fn a_physical_failure_takes_its_place_in_its_epoch_whatever_shapes_came_before() {
+    use PhysicalFailureShape::{Structural, Transient, Unexplained};
+    use std::time::Duration;
+    let (quick, spell, ceiling) = (
+        Some(TRANSIENT_FIRST_RETRY_AFTER),
+        Some(Duration::from_secs(600)),
+        Some(Duration::from_secs(1800)),
+    );
+    assert_eq!(
+        physical_failure_walk(&[Unexplained, Unexplained, Unexplained, Transient, Transient]),
+        [spell, ceiling, None, quick, spell],
+        "THE STALL: the transient failure that opens the next epoch is retried within the minute"
+    );
+    assert_eq!(
+        physical_failure_walk(&[Transient, Transient, Unexplained, Transient]),
+        [quick, spell, None, quick],
+        "an unexplained failure past its own table ends the epoch, and the next opens one"
+    );
+    assert_eq!(
+        physical_failure_walk(&[Unexplained, Transient, Transient, Transient, Transient]),
+        [spell, spell, ceiling, None, quick],
+        "a transient failure inside an epoch takes that epoch's next place, never its first"
+    );
+    assert_eq!(
+        physical_failure_walk(&[Transient, Structural]),
+        [quick, None],
+        "CONTROL: a structural failure converges at the budget the artifact already spent"
     );
 }
 
@@ -5511,6 +7173,108 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
     );
 }
 
+/// A RETIRE THAT NEVER ANSWERS HOLDS EVERY APPLY ONLY WITHIN A BOUND: a running retire holds every
+/// apply, a person's press included, until its worker answers. A worker whose read never came back,
+/// or one that died, never answered, so the hold lasted the life of the process. Now the look at its
+/// answer deadline ends it as a refusal for now, the release given back for its next offer, and the
+/// given-up worker's late answer gives nothing back again, so a later retire's hold stands.
+/// CONTROLS: a look before the deadline moves nothing, and the event loop folds the deadline.
+#[test]
+fn a_retire_that_never_answers_holds_within_a_bound() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let installed = installed_update(11);
+    let (_, job) = converge_and_start_the_retire(&mut app, &installed);
+    assert!(
+        job.awaiting_facts.is_none(),
+        "PRECONDITION: the retire runs"
+    );
+    assert!(
+        job.look_at > std::time::Instant::now()
+            && job.look_at <= std::time::Instant::now() + RETIRE_ANSWER_WITHIN,
+        "its answer is due within the bound"
+    );
+    assert_eq!(
+        app.activation_replacement_retry_at(),
+        Some(job.look_at),
+        "CONTROL: the event loop folds the deadline"
+    );
+    assert!(
+        matches!(
+            app.apply_native_update(crate::native_updater_service::ApplyMode::Immediate),
+            crate::native_app::UpdateOutcome::Deferred {
+                hold: crate::native_update_lane_hold::LaneHold::ActivationSupersede,
+                ..
+            }
+        ),
+        "PRECONDITION: a press waits for the retire"
+    );
+    let _ = app.lapse_expired_auto_apply_manual_only();
+    assert_eq!(
+        app.native_activation_supersede.as_ref(),
+        Some(&job),
+        "CONTROL: a look before the deadline moves nothing"
+    );
+
+    app.native_activation_supersede
+        .as_mut()
+        .expect("the hold")
+        .look_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let given_up = app.native_activation_supersede.clone().expect("the hold");
+    let _ = app.lapse_expired_auto_apply_manual_only();
+    assert!(
+        app.native_activation_supersede.is_none(),
+        "the look at the deadline ends the hold"
+    );
+    let replacement = app
+        .auto_apply_manual_only
+        .and_then(|latch| latch.replacement)
+        .expect("known failure custody");
+    assert_eq!(
+        (replacement.newer_spent, replacement.newer_refusals),
+        (0, 1),
+        "12 is given back as refused for now"
+    );
+    assert_eq!(
+        app.activation_replacement_retry_at(),
+        replacement.newer_retry.map(|retry| retry.at),
+        "and offered again after its backoff"
+    );
+    assert!(
+        app.auto_apply_manual_only
+            .is_some_and(|latch| latch.activation),
+        "the activation latch stands"
+    );
+
+    let_the_retry_come_due(&mut app);
+    assert!(!app.lapse_expired_auto_apply_manual_only());
+    let retry = app
+        .native_activation_supersede
+        .clone()
+        .expect("the retry started");
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job: given_up,
+        outcome: Err(aterm_update::SupersedeRefusal::ForNow(
+            "apply lock: busy".to_string(),
+        )),
+        facts: None,
+    });
+    assert_eq!(
+        app.native_activation_supersede.as_ref(),
+        Some(&retry),
+        "the given-up retire's late answer ends no later hold"
+    );
+    let replacement = app
+        .auto_apply_manual_only
+        .and_then(|latch| latch.replacement)
+        .expect("known failure custody");
+    assert_eq!(
+        (replacement.newer_spent, replacement.newer_refusals),
+        (12, 1),
+        "and gives nothing back again"
+    );
+}
+
 #[test]
 fn a_retire_with_its_disarm_deferred_is_not_said_as_a_refusal() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5602,8 +7366,8 @@ fn a_newer_release_already_on_disk_at_convergence_supersedes_at_the_first_look()
 }
 
 /// With no newer release the latch holds, with no press: a converged activation latch whose
-/// re-sample the boot trial cannot afford has no deadline, and no start of the build may be
-/// offered (its next launch is the one the trial reverts on).
+/// re-sample the boot trial cannot afford moves its deadline a day on without an attempt, and no
+/// start of the build may be offered (its next launch is the one the trial reverts on).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newer_release() {
@@ -5694,38 +7458,53 @@ fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newe
     assert!(!app.latched_activation_trial_spent(11));
     assert_eq!(
         app.apply_retry_for(Some(11)),
-        crate::update_apply_trouble::ApplyRetry::ManualOnly
+        crate::update_apply_trouble::ApplyRetry::Scheduled,
+        "with the count unread, the next look is still to come"
     );
     assert_activation_stage(&app, 11, &spent_trial.commit);
 }
 
+/// A RE-SAMPLE THAT FAILS TRIES AGAIN THE NEXT DAY: it was final, and a latch with nothing to clear it
+/// but a press or a newer release held the update for good. The lane has not stopped, so nothing new
+/// is said and no decision row stands beside the warning (ruling 143).
 #[test]
-fn a_failed_structural_resample_is_said_again_with_its_decision_row() {
+fn a_failed_structural_resample_tries_again_the_next_day_and_says_nothing_new() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let installed = installed_update(11);
     let activation = converge_structurally_on_the_activation(&mut app, &installed, 1);
-    observe_after_the_attempt(&mut app, &installed, 2);
-    let_the_day_pass(&mut app);
-    assert!(app.lapse_expired_auto_apply_manual_only());
-    assert!(app.arm_native_auto_apply(11, &activation));
+    let announced = app.auto_apply_stranded_announced;
+    assert_eq!(announced, Some((11, true)), "PRECONDITION: said once");
+    for day in 1..=3 {
+        observe_after_the_attempt(&mut app, &installed, 1 + day);
+        let_the_day_pass(&mut app);
+        assert!(
+            app.lapse_expired_auto_apply_manual_only(),
+            "day {day}: the re-sample is released"
+        );
+        assert!(app.arm_native_auto_apply(11, &activation), "day {day}");
 
-    let outcome = fail_the_activation_structurally(&mut app, &installed, &activation);
-    app.surface_update_apply_outcome("automatic handoff", outcome, false);
-    assert_eq!(
-        app.auto_apply_stranded_announced,
-        Some((11, false)),
-        "the lane that stopped says so, though it said re-sampling before"
-    );
-    assert!(
-        app.messages
-            .live_by_key(crate::update_words::KEY_OUTCOME)
-            .is_some_and(|l| l
-                .msg
-                .actions
-                .contains(&aterm_messages::Intent::ApplyUpdate { build: 11 })),
-        "the stopped lane's decision row carries the press"
-    );
+        let outcome = fail_the_activation_structurally(&mut app, &installed, &activation);
+        app.surface_update_apply_outcome("automatic handoff", outcome, false);
+
+        let latch = app.auto_apply_manual_only.expect("the latch stands");
+        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        assert!(
+            latch.retry_at == verdict.resample_at
+                && latch.retry_at.is_some_and(|at| {
+                    at > std::time::Instant::now() + STRUCTURAL_RESAMPLE_AFTER
+                        - std::time::Duration::from_secs(60)
+                }),
+            "day {day}: the next is a day on: {verdict:?} {latch:?}"
+        );
+        assert_eq!(app.auto_apply_stranded_announced, announced, "day {day}");
+        assert!(
+            app.messages
+                .live_by_key(crate::update_words::KEY_OUTCOME)
+                .is_none(),
+            "day {day}: a lane with its re-sample to come has not stopped"
+        );
+    }
 }
 
 #[test]
@@ -5741,6 +7520,7 @@ fn updater_retry_deadlines_count_sleep_without_restarting_the_wait() {
         dmg_sha256: [1; 32],
         retry_at: now + wait,
         attempts: 2,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
         held: crate::native_update_lane_hold::NamedHold::default(),
     });
     app.boot_health_confirmation_retry_at = Some(now + wait);
@@ -5792,7 +7572,7 @@ fn a_structural_resample_counts_the_night_the_mac_slept() {
         app.auto_apply_structural_verdict
             .map(|verdict| verdict.resample_at),
         Some(None),
-        "the ONE re-sample is spent"
+        "the re-sample is out"
     );
 }
 
@@ -5857,10 +7637,15 @@ fn a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next() {
         Some(status(None, 0)),
         Some(two_kept.clone()),
     ));
-    assert_eq!(
-        app.auto_apply_manual_only.map(|manual| manual.retry_at),
-        Some(None),
+    assert!(
+        app.latched_activation_trial_spent(11),
         "measured after the attempt: one more launch would be the revert, so it is held"
+    );
+    assert!(
+        app.auto_apply_manual_only
+            .and_then(|manual| manual.retry_at)
+            .is_some_and(|at| at > std::time::Instant::now() + PHYSICAL_FAILURE_EPOCH_COOLDOWN),
+        "and the day's look moves a day on"
     );
 }
 
@@ -5945,16 +7730,11 @@ fn a_structural_failure_inherits_the_round_trips_the_artifact_already_cost() {
     let converged =
         app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Structural);
     assert!(
-        matches!(
-            converged,
-            PhysicalFailureSchedule::Converged {
-                resample_at: Some(_)
-            }
-        ),
+        matches!(converged, PhysicalFailureSchedule::Converged { .. }),
         "two round trips are already spent on these bytes and the structural \
          budget is {STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS}; a `Retry` here would \
          mean the structural verdict RESET the artifact's history — it \
-         converges, onto its one re-sample a day out: {converged:?}"
+         converges, onto its re-sample a day out: {converged:?}"
     );
 }
 
@@ -6078,10 +7858,7 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
     );
     let label = |schedule: PhysicalFailureSchedule| match schedule {
         PhysicalFailureSchedule::Retry(_) | PhysicalFailureSchedule::StandDown(_) => "retry",
-        PhysicalFailureSchedule::Converged { resample_at: None } => "done",
-        PhysicalFailureSchedule::Converged {
-            resample_at: Some(_),
-        } => "converged",
+        PhysicalFailureSchedule::Converged { .. } => "converged",
     };
     let relaunch = |carried: Option<&str>, reason: &str| {
         let mut app = App::headless_for_test();
@@ -6132,12 +7909,16 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
         "the re-sample is released"
     );
     let (third, rung) = relaunch(Some(&carry(&second)), cannot_start);
-    assert_eq!(rung, "done", "a spent re-sample that fails again is final");
+    assert_eq!(
+        rung, "converged",
+        "a re-sample that fails again stays converged"
+    );
     assert!(
         third
             .auto_apply_manual_only
-            .is_some_and(|latch| latch.retry_at.is_none()),
-        "no deadline left, so no relaunch"
+            .and_then(|latch| latch.retry_at)
+            .is_some_and(|at| at > std::time::Instant::now() + PHYSICAL_FAILURE_EPOCH_COOLDOWN),
+        "the next is a day on, with no relaunch before it"
     );
 
     let moment = passing_pre_park_reason();
@@ -6312,7 +8093,7 @@ fn a_physical_failure_ladder_survives_the_download_to_activation_flip() {
     let dmg = [0xab_u8; 32];
     let activation_dmg = [0xcd_u8; 32];
 
-    for cycle in 0..PHYSICAL_FAILURES_PER_EPOCH {
+    for cycle in 0..PhysicalFailureShape::Transient.failures_per_epoch() {
         let _ =
             app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Transient);
         assert_eq!(
@@ -6330,7 +8111,7 @@ fn a_physical_failure_ladder_survives_the_download_to_activation_flip() {
     );
     assert_eq!(
         app.auto_apply_physical_retry.map(|r| r.cycles),
-        Some(PHYSICAL_FAILURES_PER_EPOCH + 1),
+        Some(PhysicalFailureShape::Transient.failures_per_epoch() + 1),
         "the flip must not refill the lifetime counter"
     );
 }
@@ -6355,13 +8136,15 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
         dmg_sha256: [0xab; 32],
         activation: false,
         cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
+        epoch_failures: 0,
         last_attempt: std::time::Instant::now(),
     });
     let spent = crate::AutoOverlapRetry {
         build,
         dmg_sha256: [0xab; 32],
         activation: false,
-        cycles: MAX_PHYSICAL_FAILURE_CYCLES,
+        cycles: PhysicalFailureShape::Transient.failures_per_epoch() - 1,
+        epoch_failures: PhysicalFailureShape::Transient.failures_per_epoch() - 1,
         last_attempt: std::time::Instant::now(),
     };
     app.auto_apply_physical_retry = Some(spent);
@@ -6387,6 +8170,37 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
 }
 
 const PREFLIGHT_TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[cfg(unix)]
+fn consume_exact_boot_health_preverification_wait(
+    app: &mut App,
+    build: u64,
+    now: std::time::Instant,
+) -> BootHealthPreverificationRelease {
+    let current = app.native_updater_service.snapshot().current_build;
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let passing = std::sync::Arc::new(std::sync::OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason: format!(
+                "staged update failed pre-park verification: update trial for build {current} is \
+                 still unconfirmed ({})",
+                aterm_update::PASSING_REFUSAL_KEY
+            ),
+            ended: now,
+        })
+        .unwrap();
+    app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+        build,
+        commit: PREFLIGHT_TEST_COMMIT.to_string(),
+        artifact: "ab".repeat(32),
+        deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+        done,
+        passing,
+    });
+    app.resume_preverification_after_boot_health(build, Some(current), now)
+        .expect("the exact passing wait is consumed")
+}
 
 fn stage_one_build_for_test(app: &mut App, build: u64) {
     #[cfg(unix)]
@@ -6434,6 +8248,24 @@ fn stage_one_build_for_test(app: &mut App, build: u64) {
     );
 }
 
+#[cfg(unix)]
+fn replace_staged_artifact_for_test(app: &mut App, build: u64, digest_byte: u8) {
+    let current = app.native_updater_service.snapshot().current_build;
+    let mut replacement =
+        crate::native_updater_service::NativeUpdaterService::new(current, "test", true);
+    let CheckStart::Start(ticket) = replacement.request_check() else {
+        panic!("a fresh replacement service starts one check");
+    };
+    let mut durable = durable_download_status(app, build);
+    durable.staged_dmg_sha256 = Some(format!("{digest_byte:02x}").repeat(32));
+    assert_eq!(
+        replacement.finish_check(ticket, durable),
+        CheckCompletion::Reduced,
+        "PRECONDITION: the same-build replacement is staged"
+    );
+    app.native_updater_service = replacement;
+}
+
 /// The read a held press waits on: `build`'s pre-park verification, running
 /// until the returned flag is raised.
 #[cfg(unix)]
@@ -6458,10 +8290,18 @@ fn preverify_read_running(
 /// and the hold.
 #[cfg(unix)]
 fn press_held_for_the_read(app: &mut App, build: u64) {
-    app.hold_person_apply(crate::HeldPersonApply {
-        target_build: build,
-        until: std::time::Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
-    });
+    let dmg_sha256 = app
+        .native_updater_service
+        .snapshot()
+        .staged
+        .as_ref()
+        .and_then(|stage| decode_dmg_sha256(&stage.dmg_sha256))
+        .expect("PRECONDITION: the staged artifact has an exact digest");
+    app.hold_person_apply(crate::HeldPersonApply::preverify(
+        build,
+        dmg_sha256,
+        std::time::Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
+    ));
 }
 
 /// A person's install held for the candidate's read runs when the read ends. With `[update]
@@ -6539,6 +8379,619 @@ fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended(
     );
 }
 
+/// A person's Install pressed before this process finishes its boot-health duty is retained just
+/// like a preverification-held press. The completion event replays it through the ordinary exact
+/// stage and durable apply gates; polling before completion cannot consume it.
+#[cfg(unix)]
+#[test]
+fn a_person_s_install_held_for_boot_health_runs_when_confirmation_finishes() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    app.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    app.auto_apply_intent = None;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.clear_messages_for_test();
+
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    let held = app
+        .person_apply_held
+        .expect("the person's press is retained");
+    assert_eq!(held.target_build, build);
+    assert_eq!(held.target_dmg_sha256, [0xab; 32]);
+    assert_eq!(held.gate, crate::HeldPersonApplyGate::BootHealth);
+    let installing = app.update_row_text().expect("the retained press's row");
+    assert!(installing.contains("installing"), "{installing}");
+
+    let now = std::time::Instant::now();
+    app.run_held_person_apply(now);
+    assert!(
+        app.person_apply_is_held(),
+        "polling cannot consume the press before confirmation"
+    );
+    assert_eq!(app.update_row_text(), Some(installing));
+
+    let ticket = begin_boot_health_confirmation_for_test(&mut app, 1);
+    assert_eq!(
+        app.handle_native_boot_health_confirmation_finished(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    assert!(!app.person_apply_is_held());
+    assert!(
+        app.native_updater_service.snapshot().error.is_some(),
+        "the completion replayed the press through the ordinary apply admission gate"
+    );
+    assert!(
+        app.update_row_text()
+            .is_none_or(|row| !row.contains("installing")),
+        "the retained installing row ends with the replayed attempt"
+    );
+}
+
+/// The gate also opens with no answer, at the fifth ask in a row that nothing answered, and
+/// that ask is counted inside the park, after the park's look at the held press. The press runs
+/// in that same pass, not at the retry the pass armed.
+#[cfg(unix)]
+#[test]
+fn a_person_s_install_held_for_boot_health_runs_in_the_park_whose_count_opens_the_gate() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    app.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    app.auto_apply_intent = None;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    // No worker can be reached, so every ask is one nothing answered.
+    let (disconnected, disconnected_receiver) = std::sync::mpsc::sync_channel(1);
+    drop(disconnected_receiver);
+    app.native_update_reconcile_worker = Some(disconnected);
+    app.clear_messages_for_test();
+
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    assert_eq!(
+        app.person_apply_held
+            .expect("the person's press is retained")
+            .gate,
+        crate::HeldPersonApplyGate::BootHealth
+    );
+
+    let mut now = std::time::Instant::now();
+    for tries in 1..crate::BOOT_HEALTH_UNANSWERED_TRIES {
+        app.service_boot_health(now);
+        assert_eq!(app.boot_health_unanswered, tries);
+        assert!(
+            app.person_apply_is_held(),
+            "CONTROL: the gate is shut at try {tries}, so the press stays held"
+        );
+        now = app
+            .boot_health_confirmation_retry_at
+            .expect("an ask nothing answered arms its retry");
+    }
+    app.service_boot_health(now);
+    assert!(
+        app.native_boot_health_complete(),
+        "the fifth ask nothing answered opens the gate"
+    );
+    assert!(
+        !app.person_apply_is_held(),
+        "the press runs in the park that opened the gate"
+    );
+    assert!(
+        app.native_updater_service.snapshot().error.is_some(),
+        "the press went through the ordinary apply admission gate"
+    );
+}
+
+/// A held press belongs to the exact bytes the person pressed Install for. Replacing a stage
+/// under the same build cannot transfer that authority, whether boot health or the candidate's
+/// own pre-park read held it.
+#[cfg(unix)]
+#[test]
+fn held_person_installs_do_not_follow_a_same_build_artifact_replacement() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+
+    let mut preverify = App::headless_for_test();
+    let build = preverify.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut preverify, build);
+    let done = preverify_read_running(&mut preverify, build);
+    press_held_for_the_read(&mut preverify, build);
+    assert_eq!(
+        preverify
+            .person_apply_held
+            .expect("the read retains the press")
+            .target_dmg_sha256,
+        [0xab; 32]
+    );
+    replace_staged_artifact_for_test(&mut preverify, build, 0xcd);
+    done.store(true, std::sync::atomic::Ordering::Release);
+    preverify.run_held_person_apply(std::time::Instant::now());
+    assert!(!preverify.person_apply_is_held());
+    assert_eq!(
+        preverify
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .and_then(|stage| decode_dmg_sha256(&stage.dmg_sha256)),
+        Some([0xcd; 32])
+    );
+    assert!(
+        preverify.native_updater_service.snapshot().error.is_none(),
+        "the replacement was not attempted"
+    );
+
+    let mut boot = App::headless_for_test();
+    let build = boot.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut boot, build);
+    boot.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    boot.auto_apply_intent = None;
+    boot.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    assert_eq!(
+        boot.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    assert_eq!(
+        boot.person_apply_held
+            .expect("boot health retains the press")
+            .target_dmg_sha256,
+        [0xab; 32]
+    );
+    replace_staged_artifact_for_test(&mut boot, build, 0xcd);
+    let now = std::time::Instant::now();
+    let ticket = begin_boot_health_confirmation_for_test(&mut boot, 1);
+    assert_eq!(
+        boot.finish_native_boot_health_confirmation(
+            ticket,
+            aterm_update::BootHealthVerdict::NO_TRIAL,
+            now,
+        ),
+        BootHealthFinishDisposition::Completed
+    );
+    boot.run_held_person_apply(now);
+    assert!(!boot.person_apply_is_held());
+    assert_eq!(
+        boot.native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .and_then(|stage| decode_dmg_sha256(&stage.dmg_sha256)),
+        Some([0xcd; 32])
+    );
+    assert!(
+        boot.native_updater_service.snapshot().error.is_none(),
+        "the replacement was not attempted"
+    );
+
+    let mut second_press = App::headless_for_test();
+    let build = second_press.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut second_press, build);
+    second_press.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    second_press.auto_apply_intent = None;
+    second_press.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    assert_eq!(
+        second_press.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    replace_staged_artifact_for_test(&mut second_press, build, 0xcd);
+    assert_eq!(
+        second_press.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted,
+        "a press on the replacement enters admission as a new press"
+    );
+    assert_eq!(
+        second_press
+            .person_apply_held
+            .expect("the replacement press is retained")
+            .target_dmg_sha256,
+        [0xcd; 32],
+        "the second press never joins the obsolete artifact's hold"
+    );
+
+    let mut second_preverify_press = App::headless_for_test();
+    let build = second_preverify_press
+        .native_updater_service
+        .snapshot()
+        .current_build
+        + 1;
+    stage_one_build_for_test(&mut second_preverify_press, build);
+    second_preverify_press.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    second_preverify_press.auto_apply_intent = None;
+    let old_done = preverify_read_running(&mut second_preverify_press, build);
+    press_held_for_the_read(&mut second_preverify_press, build);
+    replace_staged_artifact_for_test(&mut second_preverify_press, build, 0xcd);
+    // A real stage notification starts this read before a press reaches admission. The fixture
+    // replaces the reducer wholesale, so drive that notification edge explicitly.
+    second_preverify_press.spawn_staged_handoff_preverification(build);
+    assert!(
+        second_preverify_press
+            .handoff_preverify_in_flight
+            .as_ref()
+            .is_some_and(|read| {
+                read.build == build && decode_dmg_sha256(&read.artifact) == Some([0xcd; 32])
+            }),
+        "the replacement started an exact read instead of inheriting the old one"
+    );
+    let outcome = second_preverify_press.apply_native_update(ApplyMode::Immediate);
+    assert!(
+        matches!(outcome, UpdateOutcome::Blocked { ref reasons }
+            if reasons.iter().any(|reason| reason.contains("--headless"))),
+        "the headless fixture has no seamless lane, so the replacement press reaches and is \
+         answered by structural admission instead of joining the old hold: {outcome:?}"
+    );
+    assert!(
+        !second_preverify_press.person_apply_is_held(),
+        "the replacement press never inherits the obsolete artifact's hold"
+    );
+    old_done.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A real attempt of the kind `apply_native_update` makes, for a handoff that then waited.
+#[cfg(unix)]
+fn attempt_for_a_stage(app: &mut App) -> crate::native_updater_service::ApplyAttemptTicket {
+    use crate::native_updater_service::{ApplyDecision, ApplyPreflightStart};
+    let ApplyPreflightStart::Inspect(ticket) = app.native_updater_service.begin_apply_preflight()
+    else {
+        panic!("PRECONDITION: a stage to inspect");
+    };
+    let (readiness, _) = app.native_update_close_preflight();
+    let ApplyDecision::Execute(command) = app
+        .native_updater_service
+        .finish_apply_preflight(ticket, readiness)
+    else {
+        panic!("PRECONDITION: a desk that may apply");
+    };
+    command.attempt()
+}
+
+/// What a test's handoff was when it began waiting on account work.
+#[cfg(unix)]
+fn waiting_handoff(
+    app: &App,
+    mode: ApplyMode,
+    attempt: crate::native_updater_service::ApplyAttemptTicket,
+) -> crate::app_account_work::Continuation {
+    crate::app_account_work::Continuation::Handoff {
+        mode,
+        attempt: Some(attempt),
+        same_image: None,
+        next_attempt: app.next_update_handoff_id,
+    }
+}
+
+/// A PRESS THAT WAITED ON ACCOUNT WORK IS ANSWERED AS ONE THAT DID NOT: what refuses it reads as a
+/// refusal and leaves the stage to press again, and a read of the candidate holds it, rather than
+/// either ending in a log line.
+#[cfg(unix)]
+#[test]
+fn a_press_that_waited_on_account_work_is_answered_as_one_that_did_not() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    let attempt = attempt_for_a_stage(&mut app);
+    let waiting = waiting_handoff(&app, ApplyMode::Immediate, attempt);
+    app.finish_account_handoff(waiting);
+    let snapshot = app.native_updater_service.snapshot();
+    assert_eq!(
+        snapshot.phase,
+        UpdaterPhase::Staged,
+        "the attempt is aborted"
+    );
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("seamless handoff unavailable")),
+        "the fixture's desk refuses a handoff: {:?}",
+        snapshot.error
+    );
+    assert!(
+        app.auto_apply_intent
+            .is_some_and(|intent| intent.build == build),
+        "the lane still means to land it"
+    );
+
+    let attempt = attempt_for_a_stage(&mut app);
+    let _read = preverify_read_running(&mut app, build);
+    let held = crate::UpdateHandoffStartError::held_for_read(
+        build,
+        [0xab; 32],
+        std::time::Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
+        "the read is running",
+    );
+    let outcome = app.unstarted_native_apply_outcome(&attempt, ApplyMode::Immediate, held);
+    assert_eq!(outcome, UpdateOutcome::Accepted);
+    assert!(app.person_apply_is_held(), "the press stands");
+}
+
+/// A PERSON HEARS WHAT CAME OF A PRESS THAT WAITED ON ACCOUNT WORK, and the automatic lane is armed
+/// again, as for a control request that did not land. CONTROL: one that started says nothing.
+#[test]
+fn a_person_hears_what_came_of_a_press_that_waited_on_account_work() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    let said = "the desk refused this install".to_string();
+    app.auto_apply_intent = None;
+    app.answer_handoff_after_accounts(
+        ApplyMode::Immediate,
+        Some(build),
+        false,
+        UpdateOutcome::Accepted,
+    );
+    assert!(app.auto_apply_intent.is_none(), "CONTROL");
+    assert_ne!(
+        app.native_updater_service.snapshot().apply_failure,
+        said,
+        "CONTROL"
+    );
+    app.answer_handoff_after_accounts(
+        ApplyMode::Immediate,
+        Some(build),
+        false,
+        UpdateOutcome::Failed {
+            message: said.clone(),
+        },
+    );
+    // The apply ledger the failure is heard through is kept on macOS alone
+    // (`aterm_update::record_apply_failure` records nothing elsewhere).
+    let heard = if cfg!(target_os = "macos") {
+        said.as_str()
+    } else {
+        ""
+    };
+    assert_eq!(app.native_updater_service.snapshot().apply_failure, heard);
+    assert!(
+        app.auto_apply_intent
+            .is_some_and(|intent| intent.build == build),
+        "the lane still means to land it"
+    );
+}
+
+/// A PRESS DEFERRED AT THE END OF ACCOUNT WORK, WITH NO LANE TO TRY AGAIN, IS SAID: the ready row is
+/// unchanged, so the person saw nothing, and a direct press's Settings tab would take focus this late.
+/// CONTROL: with the lane on and its intent standing it tries again, and nothing more is said. Whichever
+/// way a press stopped, held for a read or not, its row stops saying it is installing and its switch
+/// record ends, a Blocked press with the lane on included, where nothing else retires the row.
+#[cfg(unix)]
+#[test]
+fn a_press_deferred_after_account_work_with_no_lane_to_try_again_is_said() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let said = |auto_apply: Option<bool>, installing: bool, outcome: UpdateOutcome| {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        app.config.update = Some(crate::app_config::UpdateConfig {
+            auto_apply,
+            ..Default::default()
+        });
+        if auto_apply == Some(false) {
+            app.auto_apply_intent = None;
+        }
+        app.ensure_staged_decision_in(build, crate::update_words::ApplyPosture::ManualByConfig);
+        assert!(
+            app.staged_update_row().is_some(),
+            "PRECONDITION: a ready row offers the press"
+        );
+        if installing {
+            app.begin_update_installing(true);
+            assert!(
+                app.staged_update_row().is_none(),
+                "PRECONDITION: a press held for a read shows the row as installing"
+            );
+        }
+        app.update_switch_on_record = Some(Some("9.8.7".to_string()));
+        let routine =
+            matches!(outcome, UpdateOutcome::Deferred { .. }) && auto_apply != Some(false);
+        assert_eq!(
+            app.automatic_apply_retry_scheduled(build),
+            auto_apply != Some(false),
+            "PRECONDITION: the lane tries again only where it is on"
+        );
+        app.answer_handoff_after_accounts(ApplyMode::Immediate, Some(build), false, outcome);
+        assert!(
+            app.update_switch_on_record.is_none(),
+            "the press's switch record ends"
+        );
+        let stop = app
+            .messages
+            .log()
+            .records()
+            .rev()
+            .find(|record| record.title.contains("v9.8.7"))
+            .map(|record| record.title.clone())
+            .expect("the press's stop is on record");
+        assert_eq!(
+            stop.starts_with("Waiting to install"),
+            routine,
+            "routine only where the lane makes the switch again: {stop}"
+        );
+        assert!(
+            !app.live_update_flow()
+                .is_some_and(|flow| flow.phase == crate::messages_host::FlowPhase::Installing),
+            "the press's row no longer says it is installing"
+        );
+        app.messages
+            .live_by_key(crate::update_words::KEY_OUTCOME)
+            .is_some_and(|live| live.msg.title == crate::app_update_screen::UPDATE_DIDNT_INSTALL)
+    };
+    let deferred = || UpdateOutcome::Deferred {
+        reason: "a new tab is still starting".to_string(),
+        hold: crate::native_update_lane_hold::LaneHold::TabStarting,
+    };
+    let blocked = || UpdateOutcome::Blocked {
+        reasons: vec!["Wait: a draft journal write is in flight".to_string()],
+    };
+    for installing in [false, true] {
+        assert!(
+            said(Some(false), installing, deferred()),
+            "installing: {installing}"
+        );
+        assert!(
+            !said(None, installing, deferred()),
+            "CONTROL: the lane tries again, installing: {installing}"
+        );
+        said(Some(false), installing, blocked());
+        said(None, installing, blocked());
+    }
+}
+
+/// A HANDOFF THAT WAITED ON ACCOUNT WORK GIVES WAY TO WHAT CHANGED WHILE IT WAITED: a person's
+/// `auto_apply = false` under an automatic attempt, or another attempt taking the next id or the
+/// stage's ticket. Each aborts its attempt, so the lane can look again, and the lane reads the setting
+/// again. CONTROL: a person's press and a launch-record renewal are not held by that setting, and a
+/// press that joined an automatic attempt is a press.
+#[cfg(unix)]
+#[test]
+fn a_handoff_that_waited_on_account_work_gives_way_to_what_changed() {
+    use crate::app_account_work::Continuation;
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let off = |app: &mut App| {
+        app.config.update = Some(crate::app_config::UpdateConfig {
+            auto_apply: Some(false),
+            ..Default::default()
+        });
+    };
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    let attempt = attempt_for_a_stage(&mut app);
+    for mode in [
+        ApplyMode::Automatic,
+        ApplyMode::AutomaticPastGrace,
+        ApplyMode::Immediate,
+    ] {
+        assert_eq!(
+            app.handoff_gives_way(mode, Some(&attempt), false, false),
+            None,
+            "CONTROL: {mode:?} with nothing changed"
+        );
+        assert!(
+            app.handoff_gives_way(mode, Some(&attempt), false, true)
+                .is_some_and(|why| why.contains("changed")),
+            "{mode:?}: another took the next attempt"
+        );
+    }
+    off(&mut app);
+    for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+        assert!(
+            app.handoff_gives_way(mode, Some(&attempt), false, false)
+                .is_some_and(|why| why.contains("turned off")),
+            "{mode:?}"
+        );
+        assert_eq!(
+            app.handoff_gives_way(mode, None, true, false),
+            None,
+            "CONTROL: a renewal installs nothing"
+        );
+    }
+    assert_eq!(
+        app.handoff_gives_way(ApplyMode::Immediate, Some(&attempt), false, false),
+        None,
+        "CONTROL: a person's press is not held by that setting"
+    );
+
+    let waiting = waiting_handoff(&app, ApplyMode::Automatic, attempt);
+    app.finish_account_handoff(waiting);
+    assert_eq!(
+        app.native_updater_service.snapshot().phase,
+        UpdaterPhase::Staged,
+        "the attempt is aborted"
+    );
+
+    let attempt = attempt_for_a_stage(&mut app);
+    let _work = app.account_work.enter().unwrap();
+    assert!(!app.accounts_drained_before(waiting_handoff(&app, ApplyMode::Automatic, attempt)));
+    app.press_joins_handoff_waiting_on_accounts();
+    assert!(matches!(
+        app.account_drain_pending_for_test(),
+        Some(Continuation::Handoff {
+            mode: ApplyMode::Immediate,
+            ..
+        })
+    ));
+}
+
+/// A PRESS MADE WHILE AN AUTOMATIC HANDOFF WAITS ON ACCOUNT WORK JOINS IT: the press was answered
+/// Accepted, so a person must hear what became of it, and `auto_apply = false` does not stop it.
+/// CONTROL: an automatic attempt joining it leaves it automatic.
+#[cfg(unix)]
+#[test]
+fn a_press_made_while_an_automatic_handoff_waits_on_account_work_joins_it() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    let attempt = attempt_for_a_stage(&mut app);
+    let _work = app.account_work.enter().unwrap();
+    assert!(!app.accounts_drained_before(waiting_handoff(&app, ApplyMode::Automatic, attempt)));
+    let waits_as = |app: &App, expected: ApplyMode| {
+        matches!(
+            app.account_drain_pending_for_test(),
+            Some(crate::app_account_work::Continuation::Handoff { mode, .. }) if *mode == expected
+        )
+    };
+    assert_eq!(
+        app.apply_native_update(ApplyMode::AutomaticPastGrace),
+        UpdateOutcome::Accepted,
+        "PRECONDITION: the stage is applying"
+    );
+    assert!(waits_as(&app, ApplyMode::Automatic), "CONTROL");
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    assert!(waits_as(&app, ApplyMode::Immediate));
+}
+
+/// A HANDOFF WHOSE ATTEMPT WAS REPLACED WHILE IT WAITED DOES NOT START: its ticket no longer speaks
+/// for the stage.
+#[cfg(unix)]
+#[test]
+fn a_handoff_whose_attempt_was_replaced_while_it_waited_does_not_start() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    let attempt = attempt_for_a_stage(&mut app);
+    assert!(
+        app.native_updater_service
+            .abort_apply(&attempt, "another attempt came first"),
+        "PRECONDITION: the ticket was current"
+    );
+    assert!(
+        app.handoff_gives_way(ApplyMode::Immediate, Some(&attempt), false, false)
+            .is_some_and(|why| why.contains("took over"))
+    );
+}
+
 /// The held press's bounds: a read that outruns the hold's window does not keep the press (it
 /// runs, as the fork lane parks once the window is spent), and a stage that moved on under the
 /// hold drops it, running nothing, its row put back and its switch closed as a person's stop.
@@ -6586,10 +9039,13 @@ fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it
     );
 
     let held = app.person_apply_held.expect("held");
+    let crate::HeldPersonApplyGate::Preverify { until } = held.gate else {
+        panic!("fixture: preverification hold")
+    };
     if let Some(read) = app.handoff_preverify_in_flight.as_mut() {
-        read.deadline = held.until + std::time::Duration::from_secs(60);
+        read.deadline = until + std::time::Duration::from_secs(60);
     }
-    app.run_held_person_apply(held.until);
+    app.run_held_person_apply(until);
     assert!(!app.person_apply_is_held(), "the window bounds the hold");
     assert!(
         app.native_updater_service.snapshot().error.is_some(),
@@ -7698,6 +10154,7 @@ fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing()
     let carried = ColdLaneBudget {
         failures: Some(CarriedFailures {
             cycles: 2,
+            epoch_failures: 2,
             since_secs: 60,
             activation: false,
         }),
@@ -8288,7 +10745,7 @@ fn the_async_physical_lane_converges_and_stops_nagging() {
     assert_eq!(
         pills.iter().filter(|pill| pill.is_some()).count(),
         1,
-        "nine failures may cost at most one row, got {pills:?}"
+        "a whole lifetime of failures may cost at most one row, got {pills:?}"
     );
     assert!(
         pills[..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) - 1]
@@ -8375,11 +10832,11 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
     let deadline = app
         .auto_apply_manual_only
         .and_then(|manual| manual.retry_at)
-        .expect("a structural convergence re-samples ONCE, a day out");
+        .expect("a structural convergence re-samples a day out");
     assert!(
         app.auto_apply_structural_verdict
             .is_some_and(|verdict| verdict.resample_at == Some(deadline)),
-        "the latch's deadline is the verdict's one re-sample"
+        "the latch's deadline is the verdict's re-sample"
     );
     app.clear_messages_for_test();
     fail(&mut app);
@@ -8391,7 +10848,7 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
         app.auto_apply_manual_only
             .and_then(|manual| manual.retry_at),
         Some(deadline),
-        "the verdict's one re-sample keeps its deadline"
+        "the verdict's re-sample keeps its deadline"
     );
 }
 
@@ -8639,6 +11096,7 @@ fn an_idle_gap_restarts_the_activity_revoked_retry_spacing() {
         dmg_sha256: [0xab; 32],
         activation: false,
         cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
+        epoch_failures: 0,
         last_attempt: std::time::Instant::now(),
     });
     assert_eq!(
@@ -8651,6 +11109,7 @@ fn an_idle_gap_restarts_the_activity_revoked_retry_spacing() {
         dmg_sha256: [0xab; 32],
         activation: false,
         cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
+        epoch_failures: 0,
         last_attempt: std::time::Instant::now()
             - crate::ACTIVITY_RETRY_BUDGET_REPLENISH
             - std::time::Duration::from_secs(1),
@@ -8677,6 +11136,7 @@ fn absent_auto_apply_intent_contributes_no_event_loop_deadline() {
         dmg_sha256: [0xab; 32],
         retry_at: retry,
         attempts: 1,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
         held: crate::native_update_lane_hold::NamedHold::default(),
     };
     assert_eq!(
@@ -8942,36 +11402,58 @@ fn tab_walks_the_whole_settings_list() {
 /// TAB WALKS SYSTEM STATE'S WHOLE LIST, as it walks a Settings list: from
 /// the last control the list's screen shows, Tab goes on to the lines under
 /// it, the open line's vault fields and the lines after it, each scrolled into
-/// view, then out of the list and round to its first control again.
+/// view, then out of the list and round to its first control again. The
+/// window is the tallest, from 30 rows down, whose list's screen leaves
+/// controls under it: how many lines a screen holds is the faces' to say
+/// (macOS's 12 px cell leaves some at 30 rows, Windows' 17 px one none).
 #[test]
 fn tab_walks_the_whole_system_state_list() {
     use crate::native_ui::UiKey;
-    let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
-    window.rows = 30;
-    window.cols = 100;
-    assert!(app.open_system_state_tab());
-    app.native_runtime
-        .publish_system_state(crate::system_state::fixture_status("set-up").expect("a scenario"));
-    let (_, view) = app
-        .active_native_view(wid)
-        .expect("active System State view");
-    // The person opened Secrets & identity, then the fields of another vault under its row.
-    for key in [
-        "system-state/line/secrets/disclose",
-        "system-state/row/secrets/disclose",
-    ] {
-        app.dispatch_native_view_event(
-            wid,
-            view,
-            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                id: crate::native_ui::ActionId::new(key),
-                value: None,
-            }),
-        )
-        .unwrap();
-    }
+    // A System State tab `rows` tall: the person opened Secrets & identity, then the fields of
+    // another vault under its row.
+    let opened = |rows: u16| {
+        let mut app = App::headless_for_test();
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = rows;
+        window.cols = 100;
+        assert!(app.open_system_state_tab());
+        app.native_runtime.publish_system_state(
+            crate::system_state::fixture_status("set-up").expect("a scenario"),
+        );
+        let (_, view) = app
+            .active_native_view(wid)
+            .expect("active System State view");
+        for key in [
+            "system-state/line/secrets/disclose",
+            "system-state/row/secrets/disclose",
+        ] {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new(key),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        }
+        (app, view)
+    };
+    let (mut app, view) = (8..=30_u16)
+        .rev()
+        .map(opened)
+        .find_map(|(app, view)| {
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            let stops = &compiled.list_stops;
+            let shown = stops
+                .iter()
+                .rposition(|key| compiled.focus_order.contains(key));
+            shown
+                .is_some_and(|shown| shown + 1 < stops.len())
+                .then_some((app, view))
+        })
+        .expect("a window whose list's screen shows a control and leaves controls under it");
     let compiled = app.compiled_native_ui(wid).unwrap();
     // Each line's disclosure and switch, the open line's vault fields and Join among them.
     let stops: Vec<&str> = compiled.list_stops.iter().map(UiKey::as_str).collect();
@@ -8999,10 +11481,6 @@ fn tab_walks_the_whole_system_state_list() {
         .iter()
         .rposition(|key| compiled.focus_order.contains(key))
         .expect("the list's screen shows a control");
-    assert!(
-        shown + 1 < stops.len(),
-        "the list's screen leaves controls under it"
-    );
     let focus = |app: &App| {
         app.native_runtime
             .view_state(view)
@@ -11647,7 +14125,10 @@ fn page_down_before_a_pages_first_frame_steps_by_that_page() {
 /// EVERY PAGE DOWN SHOWS SOMETHING NEW UNTIL THE LIST'S LAST SCREEN, WHICH IS THE FIRST TO SHOW
 /// ITS END WHOLE ([`crate::settings_scroll`]'s `ScrollPlan::limit`): from the top of Cursor Styles
 /// in windows about 102x29, each Page Down that moves the list draws a line of words or a control
-/// whole that the screen before did not. At 102x29 the sixth screen drew Advanced tuning's card
+/// whole that the screen before did not. Drawn whole is drawn clear of the list's fade: a style
+/// whose card the room's edge cuts is drawn in the strip under it fading out, a peek that takes
+/// no click until a Page Down seats it in the room (Classic at 100x30 in Windows' faces: drawn
+/// fading under Beam, then clear). At 102x29 the sixth screen drew Advanced tuning's card
 /// whole, its foot in the strip kept for a bar, and was no last screen: the seventh Page Down
 /// only moved the card 5pt (the end seated on the room's edge flushed into the padding over the
 /// card's caption, which the plan took for a cut first stop); at 100x27 the tenth drew it whole
@@ -11694,6 +14175,7 @@ fn every_page_down_on_cursor_styles_shows_something_new() {
                         && (node.clip.height - node.rect.height).abs() < 0.5
                         && node.rect.y >= list.y - 0.5
                         && node.rect.bottom() <= list.bottom() + 0.5
+                        && node.fade.is_none()
                     {
                         whole.insert(key);
                     }

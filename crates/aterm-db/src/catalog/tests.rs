@@ -884,6 +884,178 @@ fn a_full_catalog_still_gives_the_registry_its_reserved_slot() {
     assert!(db.publish(&sb, &later).is_err());
 }
 
+/// A subscribed table that holds its storage competes for no catalog slot, so a projection in
+/// which no entry competes for one (subscribed, neither reserved nor retained) reads no ring's
+/// state to count the slots (`Directory::catalog_count`): with every ring's state written, a read
+/// session's `permits` of the one declared table reads no ring's state, since permits reads no
+/// ring's state for a table outside every ring's reach (`Directory::ring_of`), and its snapshot
+/// reads none.
+/// NEGATIVE CONTROL: `Directory::project` counting the slots before its passes whether or not an
+/// entry competes (`catalog_count` called eagerly) reads each state once in `permits`:
+/// `` left: [1, 1, 1], right: [0, 0, 0] ``; so does `ring_of` without its reach filter.
+#[test]
+fn a_stored_tables_projection_reads_no_ring_state() {
+    use aterm_uds::private_file::tally;
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let policy = Policy::default();
+    let now = 20_000 * ring::CLAIMS.period_s + 60;
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "stored", "rows", 1)
+        .unwrap();
+    assert!(
+        directory.path(scope).unwrap().exists(),
+        "CONTROL: declaring the table enrolls its storage"
+    );
+    // Each ring's retirement finds no state, rebuilds one and writes it.
+    directory
+        .ring_subscriptions(&session, &policy, now)
+        .unwrap();
+    let claims = crate::table::store::claim_dir(&session).unwrap();
+    let names: Vec<String> = ring::RINGS.iter().map(|ring| ring.state_name()).collect();
+    for name in &names {
+        assert!(claims.join(name).is_file(), "CONTROL: {name} is written");
+    }
+    drop(session);
+    let session = Session::observe(&bootstrap).unwrap();
+    let reads = |read: &[tally::Read]| -> Vec<usize> {
+        names
+            .iter()
+            .map(|name| {
+                read.iter()
+                    .find(|seen| &seen.name == name)
+                    .map_or(0, |seen| seen.reads)
+            })
+            .collect()
+    };
+    let (permitted, read) =
+        tally::counted(|| directory.permits(&session, &policy, scope.digest(), now));
+    assert!(permitted.unwrap(), "CONTROL: the stored table is permitted");
+    assert_eq!(
+        reads(&read),
+        [0, 0, 0],
+        "permits reads no ring's state for a table outside every ring's reach: {read:?}"
+    );
+    let (snapshot, read) = tally::counted(|| directory.snapshot(&session));
+    assert_eq!(
+        snapshot.unwrap().entries[&scope.digest()].state,
+        State::Subscribed
+    );
+    assert_eq!(
+        reads(&read),
+        [0, 0, 0],
+        "a snapshot whose one table holds storage reads no ring's state: {read:?}"
+    );
+}
+
+/// A catalog evidence read (`Store::catalog_and_evidence`) stands on the check its store's open
+/// ran and checks the store once more, closing: (b) a claim replaced after the open is refused by
+/// that closing check, before either answer leaves; (a) a read session's `permits` of a declared
+/// table opens the catalog once and checks it twice, at the open's end and at the batch's close.
+/// (b) runs first, so each control below fails at the part it pins.
+/// NEGATIVE CONTROL: the projection's opening check back (`catalog_and_evidence` through
+/// `catalog_projection`) gives (a) `` left: (1, 3), right: (1, 2) ``, as the parent did; the
+/// closing check removed returns (b)'s answers from the replaced claim
+/// (`a claim replaced after the open is refused: ()`).
+#[test]
+fn a_catalog_read_checks_its_store_at_its_open_and_its_close() {
+    use crate::table::store::{claim_dir, claim_name, test_opens_and_checks};
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let policy = Policy::default();
+    let now = 20_000 * ring::CLAIMS.period_s + 60;
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "stored", "rows", 1)
+        .unwrap();
+    drop(session);
+    let session = Session::observe(&bootstrap).unwrap();
+    let catalog_scope = directory.catalog_scope();
+    let catalog = directory.observe_store(&session, catalog_scope).unwrap();
+    let claims = claim_dir(&session).unwrap();
+    let name = claim_name(catalog_scope);
+    let claim = std::fs::read(claims.join(&name)).unwrap();
+    assert!(
+        catalog.catalog_and_evidence(&session).is_ok(),
+        "CONTROL: an unchanged claim's read returns"
+    );
+    let mut replaced = claim.clone();
+    replaced[5] ^= 0xff;
+    aterm_uds::private_file::write_private(&claims, &name, &replaced).unwrap();
+    let refused = catalog
+        .catalog_and_evidence(&session)
+        .map(|_| ())
+        .expect_err("a claim replaced after the open is refused");
+    assert_eq!(
+        refused.to_string(),
+        "table custody changed or append is uncertain; reopen",
+        "a claim replaced after the open is refused at the read's close"
+    );
+    drop(catalog);
+    aterm_uds::private_file::write_private(&claims, &name, &claim).unwrap();
+    let (opens, checks) = test_opens_and_checks();
+    assert!(
+        directory
+            .permits(&session, &policy, scope.digest(), now)
+            .unwrap(),
+        "CONTROL: the declared table is permitted"
+    );
+    let (opened, checked) = test_opens_and_checks();
+    assert_eq!(
+        (opened - opens, checked - checks),
+        (1, 2),
+        "permits opens the catalog once and checks it at its open and its read's close"
+    );
+}
+
+/// A reserved table declared here but awaiting its storage takes its own slot, not a shared one:
+/// with one shared slot left, a declaration that also awaits storage still takes it beside the
+/// registry. `Directory::project` counts the shared slots from the storage `retained` found,
+/// before its reserved pass adds the registry's room.
+/// NEGATIVE CONTROL: counting the shared slots (`catalog_count`) from the total the reserved pass
+/// raised, in place of what `retained` found, leaves the declaration waiting:
+/// `` left: Capacity, right: Subscribed ``.
+#[test]
+fn a_reserved_table_awaiting_storage_leaves_the_last_shared_slot() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let trust = bootstrap.trust();
+    let directory = Directory::new(&lab.paths[0], trust);
+    let session = Session::open(&bootstrap).unwrap();
+    let waiting = Descriptor::fresh(trust, "waiting", "data", 1).unwrap();
+    let registry = reserved(trust)[0].clone();
+    let mut catalog = directory.catalog(&session).unwrap();
+    for declared in [&waiting, &registry] {
+        catalog
+            .commit_catalog(&session, &declared.encode().unwrap())
+            .unwrap();
+    }
+    drop(catalog);
+    for _ in 1..CATALOG_SLOTS {
+        let scope = Scope::fresh(trust).unwrap();
+        Store::join(&session, &directory.path(scope).unwrap(), scope).unwrap();
+    }
+    for declared in [&waiting, &registry] {
+        assert!(
+            !directory.path(declared.scope).unwrap().exists(),
+            "CONTROL: {} awaits its storage",
+            declared.application
+        );
+    }
+    let snapshot = directory.snapshot(&session).unwrap();
+    assert_eq!(
+        snapshot.entries[&registry.scope.digest()].state,
+        State::Subscribed
+    );
+    assert_eq!(
+        snapshot.entries[&waiting.scope.digest()].state,
+        State::Subscribed
+    );
+}
+
 /// A declaration at the registry's identity with another version is a conflict, not a second
 /// reserved table: the reservation matches the compiled descriptor exactly.
 /// NEGATIVE CONTROL: with the conflict arm of `Directory::project` skipped for a reserved
@@ -909,4 +1081,27 @@ fn another_version_at_the_registrys_identity_conflicts() {
         da.snapshot(&sa).unwrap().entries[&registry.scope.digest()].state,
         State::Conflict
     );
+}
+
+/// The catalog scope a thread answers from what it keeps is the one derived under the trust asked:
+/// asked under two trusts in turn, each answer is that trust's derivation.
+/// NEGATIVE CONTROL: `descriptor::catalog_scope` answering its kept scope whatever trust is asked
+/// fails the second assertion.
+#[test]
+fn the_kept_catalog_scope_is_the_trust_asked() {
+    let trust = |byte: u8| Trust {
+        network: [byte; 16],
+        authority: [byte; 32],
+        genesis: [byte; 32],
+    };
+    let derived = |trust| descriptor::application_scope(trust, "aterm.catalog", "tables").unwrap();
+    let (first, second) = (trust(1), trust(2));
+    assert_ne!(
+        derived(first),
+        derived(second),
+        "CONTROL: two trusts, two scopes"
+    );
+    for asked in [first, first, second, second, first] {
+        assert_eq!(scope(asked), derived(asked), "the scope of the trust asked");
+    }
 }

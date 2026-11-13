@@ -39,6 +39,43 @@ fn a_clicked_password_field_keeps_normal_keys_and_other_windows() {
 }
 
 #[test]
+fn a_touch_marks_the_sheet_as_a_persons_but_admits_no_typing() {
+    let input = PasswordInput::new();
+    assert!(!input.touched(), "a sheet nobody touched is nobody's yet");
+    input.person_touched();
+    assert!(input.touched());
+    for key in [0x00, 0x24, 0x4c, 0x30] {
+        assert!(
+            !input.key_allowed(true, key),
+            "a click on Details or a key at the window still keeps typing out of the field"
+        );
+    }
+    let clicked = PasswordInput::new();
+    clicked.field_clicked();
+    assert!(clicked.touched(), "a click into the field is a touch too");
+}
+
+#[test]
+fn only_a_sheet_nobody_touched_is_refused_and_only_past_its_backstop() {
+    let now = Instant::now();
+    let raised = now.checked_sub(ASKPASS_UNTOUCHED_BACKSTOP).unwrap();
+    assert!(untouched_sheet_overdue(raised, false, now));
+    assert!(
+        !untouched_sheet_overdue(raised, true, now),
+        "a sheet a person touched is theirs until it is answered or withdrawn"
+    );
+    let inside = raised + Duration::from_secs(1);
+    assert!(
+        !untouched_sheet_overdue(inside, false, now),
+        "inside the backstop it holds"
+    );
+    assert!(
+        !untouched_sheet_overdue(now, false, raised),
+        "a clock read before the raise is not past it"
+    );
+}
+
+#[test]
 fn a_password_prompt_refuses_synthetic_input_before_it_is_attached() {
     let gate = PromptInputGate::new();
     let mut posted = Vec::new();

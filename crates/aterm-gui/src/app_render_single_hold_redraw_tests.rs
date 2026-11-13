@@ -26,7 +26,7 @@ fn lit_app() -> crate::App {
     let mut app = scripted_app();
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();
     app
@@ -36,10 +36,7 @@ fn lit_app() -> crate::App {
 #[test]
 fn an_ordinary_echo_frame_takes_the_terminal_lock_once() {
     let wid = WindowId(0);
-    for (name, mut app) in [
-        ("effects off", scripted_app()),
-        ("rainbow kitty", lit_app()),
-    ] {
+    for (name, mut app) in [("effects off", scripted_app()), ("rainbow", lit_app())] {
         app.redraw_window(wid);
         for echo in [&b"e"[..], b"c", b"h", b"o"] {
             feed(&app, echo);

@@ -34,7 +34,13 @@ fn read(source: &Agy) -> Result<String, String> {
             None,
         )
         .unwrap();
-    source.read(&permit)
+    source.read(&permit, source.admit(NOW)?)
+}
+
+/// Why the gate refuses a read of `source` now, if it does.
+#[cfg(unix)]
+fn refused(source: &Agy) -> Option<String> {
+    source.admit(NOW).err()
 }
 
 fn tmp(tag: &str) -> aterm_tempfile::TempDir {
@@ -54,6 +60,10 @@ struct Recorded {
     doc: Result<String, String>,
     reads: Cell<u32>,
     default: Option<&'static str>,
+    /// How often its default model was asked.
+    defaults: Cell<u32>,
+    /// Why its gate refuses, where it does.
+    out: Option<String>,
 }
 
 impl Recorded {
@@ -62,21 +72,92 @@ impl Recorded {
             doc,
             reads: Cell::new(0),
             default: None,
+            defaults: Cell::new(0),
+            out: None,
         }
     }
 }
 
 impl Source for Recorded {
-    fn read(&self, _: &provider_read::Permit) -> Result<String, String> {
+    fn admit(&self, now: i64) -> Result<Pass, String> {
+        self.out.clone().map_or_else(|| Ok(Pass::fixture(now)), Err)
+    }
+
+    fn read(&self, _: &provider_read::Permit, _: Pass) -> Result<String, String> {
         self.reads.set(self.reads.get() + 1);
         self.doc.clone()
     }
 
-    fn default_model(&self, _: &provider_read::Permit) -> Result<String, String> {
+    fn default_model(&self, _: &provider_read::Permit, _: Pass) -> Result<String, String> {
+        self.defaults.set(self.defaults.get() + 1);
         self.default
             .map(str::to_owned)
             .ok_or_else(|| "no default".to_owned())
     }
+}
+
+/// A login not known signed in has no reading at all: not the fresh one kept of it, not a stale
+/// one, and nothing is read or backed off.
+#[test]
+fn a_login_the_gate_refuses_has_no_reading_kept_or_read() {
+    let dir = tmp("gate-first");
+    let store = Store::new(dir.path(), "home");
+    let mut agy = Recorded::new(Ok(doc(0.8, 0.9, 0.9)));
+    current_fixture(&store, &agy, NOW, 0.1, false).expect("a reading is kept");
+    // CONTROL: admitted, the kept reading answers.
+    assert_eq!(
+        current_fixture(&store, &agy, NOW + 1, 0.1, false).map(|(_, got)| got),
+        Ok(Got::Kept)
+    );
+    let why = format!("{}: not known", super::super::agy_gate::NOT_KNOWN);
+    agy.out = Some(why.clone());
+    for (at, force) in [
+        (NOW + 2, false),
+        (NOW + FRESH_OPEN_S, false),
+        (NOW + 3, true),
+    ] {
+        assert_eq!(
+            current_fixture(&store, &agy, at, 0.1, force).map(|_| ()),
+            Err(why.clone())
+        );
+    }
+    assert_eq!(agy.reads.get(), 1, "the refused source was never read");
+    assert!(
+        store.recent_failure(NOW + 3).is_none(),
+        "nothing ran to back off"
+    );
+    let rotation = agy_quota::Rotation::default();
+    assert_eq!(
+        rotate_launch_at(None, &store, &agy, &rotation, NOW + 4, false),
+        None
+    );
+    assert_eq!(agy.defaults.get(), 0, "nor asked its default model");
+}
+
+/// A `/model` read that failed is not asked again at the next launch, while its backoff lasts.
+#[test]
+fn a_failed_default_model_read_is_backed_off() {
+    let dir = tmp("model-backoff");
+    let store = Store::new(dir.path(), "home");
+    let agy = Recorded::new(Ok(doc(0.8, 0.9, 0.9)));
+    let rotation = agy_quota::Rotation::default();
+    for at in [NOW, NOW + 1, NOW + FAIL_BACKOFF_S - 1] {
+        assert_eq!(
+            rotate_launch_at(None, &store, &agy, &rotation, at, false),
+            None
+        );
+    }
+    assert_eq!(agy.defaults.get(), 1, "one ask, then the backoff");
+    assert!(
+        store.recent_failure(NOW + 1).is_none(),
+        "the usage read's own backoff is untouched"
+    );
+    // CONTROL: once the backoff has run out, the next launch asks again.
+    assert_eq!(
+        rotate_launch_at(None, &store, &agy, &rotation, NOW + FAIL_BACKOFF_S, false),
+        None
+    );
+    assert_eq!(agy.defaults.get(), 2);
 }
 
 const NOW: i64 = 1_792_803_313;
@@ -810,8 +891,16 @@ fn stand_in_agy(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
     (agy, ran)
 }
 
+/// An agy whose `HOME` (in `env`) is a login directory no account answers to, behind the gate
+/// of a pool kept beside `program`: such a home passes on its grant file alone.
 #[cfg(unix)]
 fn agy_at(program: &Path, env: &[(&str, &str)], flags: &[String]) -> Agy {
+    let root = program.parent().expect("the stand-in's directory");
+    let login = env
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == "HOME")
+        .map(|(_, home)| Path::new(home));
     Agy {
         program: program.as_os_str().to_owned(),
         env: env
@@ -822,7 +911,30 @@ fn agy_at(program: &Path, env: &[(&str, &str)], flags: &[String]) -> Agy {
         budget: LAUNCH_READ_BUDGET,
         inherited_home: std::env::var(crate::harness::upgrade_agy::HOME_ENV).ok(),
         credentials_set: Vec::new(),
+        gate: Some(Gate::at(
+            &root.join("gate-state"),
+            &root.join("gate-home"),
+            None,
+            login,
+        )),
     }
+}
+
+/// The person's own agy in `home` (agy's keyring backend: no grant file speaks), behind the gate
+/// of this machine's own agy login.
+#[cfg(unix)]
+fn own_agy(program: &Path, home: &Path) -> Agy {
+    let root = program.parent().expect("the stand-in's directory");
+    let mut agy = agy_at(program, &[("HOME", home.to_str().expect("utf-8"))], &[]);
+    agy.gate = Some(Gate::at(&root.join("gate-state"), home, None, None));
+    agy
+}
+
+/// Put a served turn on record for `agy`'s login, as the footer's hook does.
+#[cfg(unix)]
+fn serve(agy: &Agy, at: i64) {
+    let gate = agy.gate.as_ref().expect("a gate");
+    assert!(gate.served(Some("person@example.com"), at, at));
 }
 
 #[cfg(unix)]
@@ -841,7 +953,8 @@ fn a_signed_out_file_profile_answers_at_once_and_never_runs_agy() {
     let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
     let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
     let why = read(&agy).expect_err("no grant file, no reading");
-    assert!(why.starts_with("signed-out: agy is signed out"), "{why}");
+    assert!(why.starts_with("signed-out: agy's login"), "{why}");
+    assert!(why.contains("is signed out on this machine"), "{why}");
     assert!(why.contains("antigravity-oauth-token"), "{why}");
     assert!(why.contains("aterm harness agy login <account>"), "{why}");
     assert!(is_signed_out(&why));
@@ -877,13 +990,10 @@ fn a_signed_out_file_profile_answers_at_once_and_never_runs_agy() {
     let config = profile.join(".gemini/antigravity-cli");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"").unwrap();
-    assert!(agy.signed_out().is_some(), "an empty grant file");
+    assert!(refused(&agy).is_some(), "an empty grant file");
     std::fs::remove_file(config.join(crate::harness::upgrade_agy::GRANT_FILE)).unwrap();
     std::fs::create_dir(config.join(crate::harness::upgrade_agy::GRANT_FILE)).unwrap();
-    assert!(
-        agy.signed_out().is_some(),
-        "a directory named like the grant"
-    );
+    assert!(refused(&agy).is_some(), "a directory named like the grant");
     assert!(!ran.exists(), "agy ran on a profile with no grant");
 }
 
@@ -896,7 +1006,7 @@ fn a_profile_with_its_grant_reads_as_before() {
     put_grant(&profile.join(".gemini/antigravity-cli"));
     let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
     let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
-    assert_eq!(agy.signed_out(), None);
+    assert_eq!(refused(&agy), None);
     let wrong = provider_read::Use::fixture(
         provider_read::Read::AgyUsage,
         Path::new("another-home"),
@@ -912,7 +1022,7 @@ fn a_profile_with_its_grant_reads_as_before() {
         None,
     )
     .unwrap();
-    assert!(agy.read(&wrong).is_err());
+    assert!(agy.read(&wrong, agy.admit(NOW).unwrap()).is_err());
     assert!(
         !ran.exists(),
         "a permit for another home cannot run the provider"
@@ -1053,7 +1163,7 @@ fn the_model_read_never_runs_agy_without_this_homes_authority() {
         NOW,
     )
     .unwrap();
-    assert!(agy.default_model(&wrong).is_err());
+    assert!(agy.default_model(&wrong, agy.admit(NOW).unwrap()).is_err());
     assert!(
         !marker.exists(),
         "agy's /model ran without this home's authority"
@@ -1087,7 +1197,7 @@ fn a_signed_out_home_never_runs_agy_for_its_default_model() {
             .join(crate::harness::upgrade_agy::GRANT_FILE),
     )
     .unwrap();
-    assert!(agy.signed_out().is_some());
+    assert!(refused(&agy).is_some());
     let rotation = agy_quota::Rotation::default();
     let (picks, probes) = provider_read::captured(|| {
         (
@@ -1111,7 +1221,7 @@ fn a_carried_gemini_dir_names_the_grant_it_reads() {
     put_grant(&profile.join(".gemini/antigravity-cli"));
     let flags = [format!("--gemini_dir={}", alt.display())];
     let agy = agy_at(
-        Path::new("/no/such/agy"),
+        &dir.path().join("no-such-agy"),
         &[("HOME", &home), FILE_BACKEND],
         &flags,
     );
@@ -1119,29 +1229,33 @@ fn a_carried_gemini_dir_names_the_grant_it_reads() {
         agy.grant_file(),
         Some(alt.join("antigravity-cli/antigravity-oauth-token"))
     );
-    let why = agy
-        .signed_out()
-        .expect("the home's grant is not the carried dir's");
+    let why = refused(&agy).expect("the home's grant is not the carried dir's");
     assert!(
         why.contains(&alt.join("antigravity-cli").display().to_string()),
         "{why}"
     );
     put_grant(&alt.join("antigravity-cli"));
-    assert_eq!(agy.signed_out(), None);
+    assert_eq!(refused(&agy), None);
 }
 
 /// Only agy's file backend makes the grant file the answer: under the OS keyring (no
-/// `SSH_CONNECTION`), or with another credential or an unplaced config, agy is asked.
+/// `SSH_CONNECTION`), or with another credential or an unplaced config, no file speaks, and the
+/// account's record alone admits the read. agy is never run to find out.
 #[cfg(unix)]
 #[test]
-fn without_the_file_backend_a_missing_grant_file_says_nothing() {
+fn without_the_file_backend_only_the_accounts_record_admits_a_read() {
     let dir = tmp("keyring");
     let profile = dir.path().join("profile");
     let home = profile.display().to_string();
     let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
-    let keyring = agy_at(&program, &[("HOME", &home)], &[]);
-    assert_eq!((keyring.grant_file(), keyring.signed_out()), (None, None));
-    read(&keyring).expect("a keyring profile is read");
+    let keyring = own_agy(&program, &profile);
+    assert_eq!((keyring.grant_file(), keyring.proof()), (None, Proof::None));
+    let why = read(&keyring).expect_err("nothing on record of the login");
+    assert!(why.starts_with(super::super::agy_gate::NOT_KNOWN), "{why}");
+    assert!(!ran.exists(), "agy was run to find out");
+    // A turn served on it is on record: now it is read.
+    serve(&keyring, NOW - 1);
+    read(&keyring).expect("a keyring login known signed in is read");
     assert!(ran.exists());
     for other in [
         ("GEMINI_API_KEY", "k"),
@@ -1149,7 +1263,7 @@ fn without_the_file_backend_a_missing_grant_file_says_nothing() {
         ("AGY_CLI_CONFIG_DIR", "/elsewhere"),
     ] {
         let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND, other], &[]);
-        assert_eq!(agy.signed_out(), None, "{other:?}");
+        assert_eq!(agy.proof(), Proof::None, "{other:?}");
     }
     let blank = agy_at(&program, &[("HOME", &home), ("SSH_CONNECTION", " ")], &[]);
     assert_eq!(
@@ -1193,9 +1307,59 @@ fn a_sign_in_prompt_ends_the_read_as_signed_out() {
              exec /bin/sleep {parked}"
         ),
     );
-    let why = read(&agy_at(&program, &[("HOME", &home)], &[])).expect_err("a prompt is no reading");
+    let own = own_agy(&program, &profile);
+    serve(&own, NOW - 1);
+    let why = read(&own).expect_err("a prompt is no reading");
     assert!(
         why.starts_with("signed-out: agy asked for a Google sign-in"),
         "{why}"
     );
+    // The prompt is the account's record: the next read is refused at the gate.
+    let why = refused(&own).expect("the gate holds");
+    assert!(why.starts_with("signed-out: agy's login"), "{why}");
+}
+
+/// A read that meets the prompt answers no stale reading, and no later read runs agy, forced or
+/// past the backoff: the login's account says it is signed out.
+#[cfg(unix)]
+#[test]
+fn a_prompt_leaves_no_stale_reading_and_no_later_read_runs_agy() {
+    let dir = tmp("prompt-current");
+    let profile = dir.path().join("profile");
+    let parked = aterm_spec::wait::PARKED_SECS;
+    let agy = dir.path().join("agy");
+    crate::harness::stand_in::proven(
+        &agy,
+        &format!(
+            "echo run >> \"$0.runs\"\n\
+             printf 'Authentication required. Please visit the URL to log in:\\n' >&2\n\
+             exec /bin/sleep {parked}"
+        ),
+    );
+    let own = own_agy(&agy, &profile);
+    serve(&own, NOW - 1);
+    let store = Store::new(dir.path(), &launch_key(profile.to_str(), &[]));
+    current_fixture(
+        &store,
+        &Recorded::new(Ok(doc(0.8, 0.9, 0.9))),
+        NOW,
+        0.1,
+        false,
+    )
+    .expect("a reading is kept");
+    let runs = || {
+        std::fs::read_to_string(dir.path().join("agy.runs")).map_or(0, |text| text.lines().count())
+    };
+    let why = current_fixture(&store, &own, NOW + 1, 0.1, true).expect_err("no stale answer");
+    assert!(is_signed_out(&why), "{why}");
+    assert_eq!(runs(), 1);
+    for at in [NOW + 2, NOW + FAIL_BACKOFF_S + 1, NOW + 3_700] {
+        let why = current_fixture(&store, &own, at, 0.1, true).expect_err("the gate holds");
+        assert!(why.starts_with("signed-out: agy's login"), "{why}");
+    }
+    assert_eq!(runs(), 1, "no later read started agy");
+    // CONTROL: signed in again by a turn served since, the next read runs agy.
+    serve(&own, NOW + 3_800);
+    let _ = current_fixture(&store, &own, NOW + 3_900, 0.1, true);
+    assert_eq!(runs(), 2);
 }

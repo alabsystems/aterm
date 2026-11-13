@@ -44,8 +44,9 @@ mod watch;
 #[path = "upgrade_build_start.rs"]
 mod build_start;
 pub use build_start::BUILD_FAILS;
-#[cfg(all(test, unix))]
-pub(super) fn first_exec_probe_for_test(
+/// Run the actual managed start probe in an isolated native qualification world.
+#[cfg(all(any(test, debug_assertions), unix))]
+pub fn first_exec_probe_for_test(
     exe: &std::path::Path,
     limit: std::time::Duration,
     holds: &std::path::Path,
@@ -397,11 +398,68 @@ pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, 
         reason = "Buggy=1 negative control only; a standing press read as the plain Now it writes, so its lane waits for background work and the watch records the Now's word. The Tier-1 binds replay that read against the real one, and aterm-spec's liveness sweep breaks `APressMovesPastRunningWork` with it."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "LookClockPasses",
+        reason = "Time passing a finished restart's look: its window (`relaunch::RESTORE_LOOK`), then the bound a warned look's line is typed within (`relaunch::RESTORE_TYPE_WITHIN_S`). The Tier-1 binds set `now` against `confirm_by` exactly so."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "ResumedBuildWarns",
+        reason = "Claude Code's own row in the conversation: the resumed build warning that something did not come back (`upgrade::resumed_build_warned`). The Tier-1 binds read it as the `warned` of `relaunch::look_at`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "NewerBuildLands",
+        reason = "A newer build installed behind a finished move: atpkg's step. The Tier-1 binds read it as a target newer than the record's."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "OnlyIdleClosesALook",
+        reason = "Buggy=1 negative control only; the lane before the look had a clock of its own, where only an idle point closed it (`St::confirming` alone held the visit and the owed continuation), so a point past the look's clock waits `confirming` behind it instead of taking the newer build. The Tier-1 binds replay that read against the real `relaunch::look_holds`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "LineTypedAtBreak",
+        reason = "Buggy=1 negative control only; a step that types the look's line wherever the agent rests, a break of its own background work included, where the real `relaunch::look_types` refuses a background step. The Tier-1 binds replay that read against the real one at both points."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "RestsAtABreak",
+        reason = "The agent of a finished move comes to rest at a break of its own background work: the agent's step, read by the loop as the point it offers (`Opts::background`). The Tier-1 binds read it as the `background` of `relaunch::look_types`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "RestsIdle",
+        reason = "The agent of a finished move comes to rest idle at its prompt: the agent's step, read by the loop as an idle point. The Tier-1 binds read it as a step that is not `background`."
+    )
+)]
 #[doc(hidden)]
 pub fn progress_environment() {}
 
-/// The quiet round's projection ([`upgrade::tell_due`], [`upgrade::quiet_move`]): the
-/// `HarnessUpgradeQuiet` variables a look's real [`Facts`] stand for.
+/// The quiet round's projection ([`upgrade::tell_due`], [`upgrade::quiet_move`],
+/// [`upgrade::own_yields`]): the `HarnessUpgradeQuiet` variables a look's real [`Facts`] stand
+/// for.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -426,18 +484,20 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
         ("posture", posture),
         (
             "work",
-            flag(!f.background.is_empty() || (lags && !f.owner_now)),
+            if f.waits_only {
+                1
+            } else if !f.background.is_empty() || (lags && !f.owner_now) {
+                2
+            } else {
+                0
+            },
         ),
         ("near", flag(f.attended)),
-        (
-            "held",
-            flag(
-                upgrade::rung_in_force(f) == upgrade::Rung::Land
-                    && f.own_hold_s >= upgrade::OWN_TELL_S,
-            ),
-        ),
-        ("tells", i64::from(f.tells)),
-        ("rest", flag(f.told_s < upgrade::RETELL_S)),
+        ("held", flag(f.own_hold_s >= upgrade::WORK_TELL_S)),
+        // The line is the process's while its deadline stands: one it was told about an earlier
+        // target counts, and one a look voided does not (`upgrade::deadline_voids`).
+        ("tells", i64::from(f.tells).max(flag(f.deadline_set))),
+        ("due", flag(f.work_due)),
         ("moved", 0),
     ])
 }
@@ -503,8 +563,16 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
-        action = "WorkStarts",
-        reason = "A process starting under the agent: the agent's step. The Tier-1 binds name it in `Facts::background` exactly there."
+        action = "WaitStarts",
+        reason = "A background wait starting under the agent with nothing else: the agent's step. The Tier-1 binds name its shell in `Facts::background` and set `Facts::waits_only` exactly there, as the drive does where `upgrade::own_of` proves every shell a wait."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "RealWorkStarts",
+        reason = "Work starting under the agent (a process `upgrade::own_of` does not prove a wait, work its screen names, a status its in-process work keeps busy): the agent's step. The Tier-1 binds name it in `Facts::background` with `Facts::waits_only` clear exactly there."
     )
 )]
 #[cfg_attr(
@@ -512,7 +580,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "WorkEnds",
-        reason = "That process ending: the agent's step. The Tier-1 binds empty `Facts::background` exactly there."
+        reason = "What ran under the agent ending: the agent's step. The Tier-1 binds empty `Facts::background` exactly there."
     )
 )]
 #[cfg_attr(
@@ -520,7 +588,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "HoldOutlasts",
-        reason = "The agent's own work holding the round past `upgrade::OWN_TELL_S`: the clock's step over `St::own_since`, which `St::note_wait` starts at the first own-work wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock test binds the record."
+        reason = "The agent's real work holding the round past `upgrade::WORK_TELL_S`: the clock's step over `St::own_since`, which `St::note_wait` starts at the first own-work wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock test binds the record."
     )
 )]
 #[cfg_attr(
@@ -535,8 +603,8 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
-        action = "RestRuns",
-        reason = "The rest after a tell running out: the clock's step (`upgrade::RETELL_S` since `St::told_at`). The Tier-1 binds build it through `Facts::told_s`."
+        action = "DeadlinePasses",
+        reason = "The deadline a tell named passing: the clock's step (`upgrade::WORK_DEADLINE_S` past the tell's spend, `St::deadline_at`, for the process `St::deadline_pid` names). The Tier-1 binds build it through `Facts::work_due`, and the drive's deadline test binds the record."
     )
 )]
 #[cfg_attr(
@@ -560,7 +628,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "TellsEarly",
-        reason = "Buggy=1 negative control only; a tell before the agent's work held the round `upgrade::OWN_TELL_S`. The Tier-1 bind's control drops that bound."
+        reason = "Buggy=1 negative control only; a tell before the agent's work held the round `upgrade::WORK_TELL_S`. The Tier-1 bind's control drops that bound."
     )
 )]
 #[cfg_attr(
@@ -568,7 +636,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "TellsPastTheCap",
-        reason = "Buggy=1 negative control only; a tell past `upgrade::MAX_TELLS`. The Tier-1 bind's control drops that cap."
+        reason = "Buggy=1 negative control only; a second line to a process whose deadline stands (`upgrade::MAX_TELLS`, `Facts::deadline_set`). The Tier-1 bind's control drops both."
     )
 )]
 #[cfg_attr(
@@ -576,7 +644,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "MoveOverWork",
-        reason = "Buggy=1 negative control only; the move over processes under the agent, where `quiet_move` waits `background`. The Tier-1 bind's control clears `Facts::background`."
+        reason = "Buggy=1 negative control only; the move over work under the agent before any deadline it was told has passed, where `quiet_move` waits `background`. The Tier-1 bind's control clears `Facts::background`."
     )
 )]
 #[cfg_attr(
@@ -584,7 +652,23 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "MoveAtABreak",
-        reason = "Buggy=1 negative control only; the move at a break of the agent's background work, where `quiet_step` waits `background`. The Tier-1 bind's control reads the break as an idle point."
+        reason = "Buggy=1 negative control only; the move at a break of the agent's background work that is no proved wait, before any deadline, where `quiet_step` waits `background`. The Tier-1 bind's control reads the break as an idle point."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WaitsDropped",
+        reason = "Buggy=1 negative control only; the move over the agent's waits with their commands left behind. The Tier-1 drive bind (`a_round_over_waits_alone_moves_at_a_break_and_carries_their_commands`) reads each command in the continuation typed after the resume, and its control empties `St::ended_waits` before that line."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "DeadlineUntold",
+        reason = "Buggy=1 negative control only; a deadline in force that no line named. The drive stamps `St::deadline_at` only for a line the host took whole (`tell`), and `Facts::work_due` reads only that stamp; the Tier-1 drive bind's control sets the fact with no stamp."
     )
 )]
 #[cfg_attr(
@@ -592,7 +676,15 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "TellNeverTyped",
-        reason = "Buggy=1 negative control only; a round that owes its tell and never types it. The Tier-1 drive bind (`a_quiet_round_held_by_its_own_work_tells_the_agent_once_and_ends_nothing`) types it, and aterm-spec's liveness sweep breaks the law with it."
+        reason = "Buggy=1 negative control only; a round that owes its tell and never types it. The Tier-1 drive bind (`a_quiet_round_held_by_its_own_work_is_told_its_deadline_once`) types it, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "OwnWorkHolds",
+        reason = "Buggy=1 negative control only; the agent's own work holding the round with no bound, as it did before `upgrade::own_yields`. The Tier-1 bind's control clears `Facts::waits_only` and `Facts::work_due`, and aterm-spec's liveness sweep breaks the law with it."
     )
 )]
 #[doc(hidden)]
@@ -631,9 +723,16 @@ pub struct Opts {
 /// What a quiet round may type to an agent whose own work holds its move ([`Opts::tell`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tell {
-    /// Nothing: no autopilot carries the session, so a person reads what is typed.
+    /// Nothing: no autopilot carries the session at this look (the tab's Autopilot off, a guard
+    /// of its loop's holding the point, a lane that reads neither), so a person reads what is
+    /// typed. The agent's own work holds the round there, and nothing moves over it.
     #[default]
     Off,
+    /// No line, under an autopilot that carries the session: its task finished or landed, and
+    /// nothing is typed into it before a move. The round still moves over proved waits, and past
+    /// a deadline the process was told before, and the line after the resume says what ended
+    /// ([`upgrade::Facts::silent`]).
+    Silent,
     /// The line, under an autopilot that carries the session.
     Fact,
     /// The line with the restart the agent may run itself (`aterm ctl @self restart`), where that
@@ -726,12 +825,14 @@ pub(super) fn at_second<R>(now: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-#[cfg(all(not(test), not(target_os = "macos")))]
+#[cfg(all(not(windows), not(test), not(target_os = "macos")))]
 const PS_WAIT: Duration = Duration::from_secs(10);
-#[cfg(test)]
+#[cfg(all(not(windows), test))]
 const PS_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-#[cfg(any(not(target_os = "macos"), test))]
+/// `ps`, which Windows does not have: nothing there compiles this, and each reader that asks it
+/// elsewhere has a Windows arm that reads the kernel in process.
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 fn ps(args: &[&str]) -> Option<String> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"));
     cmd.args(args).env("LC_ALL", "C").env("TZ", "UTC");
@@ -805,7 +906,19 @@ pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
     {
         aterm_uds::process::read_process_ids(i32::try_from(pid).ok()?)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    // Windows has no process group and no terminal foreground group, so no process there has
+    // these ids: a reader of the parent alone asks [`parent_of`].
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android"
+    )))]
     {
         let out = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()])?;
         let mut it = out.split_whitespace();
@@ -814,6 +927,23 @@ pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
             crate::parse_int(it.next()?)?,
             crate::parse_int(it.next()?)?,
         ))
+    }
+}
+
+/// `pid`'s parent, `None` when `pid` is gone or unread. On Windows it is the process table's
+/// ([`table`]), whose parent is `0` where the pid the kernel recorded now names a younger
+/// process; elsewhere it is [`ids`]'s.
+pub(super) fn parent_of(pid: u32) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        kernel_rows()
+            .into_iter()
+            .find(|r| r.pid == pid)
+            .map(|r| r.ppid)
+    }
+    #[cfg(not(windows))]
+    {
+        ids(pid).map(|(ppid, _, _)| ppid)
     }
 }
 
@@ -924,13 +1054,45 @@ pub(super) fn table() -> Vec<ProcRow> {
             .map(|r| (r.pid, r.ppid, Comm::named_when_asked(r)))
             .collect()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        kernel_rows()
+            .into_iter()
+            .map(|r| (r.pid, r.ppid, image_word(&r.name).into()))
+            .collect()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         ps_table()
     }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+/// Every process on Windows, from one in-process read of the kernel's table
+/// ([`aterm_sysprobe::processes`]): no child process is started, where the `ps` this module asks
+/// elsewhere is, on Windows, whatever MSYS tool `PATH` holds or nothing. A row's parent is `0`
+/// where the pid the kernel recorded as its parent now names a process created after it
+/// (Windows reuses pids and never rewrites the recorded parent), so a walk over parents never
+/// crosses into a process that is no ancestor. Empty where the read fails.
+#[cfg(windows)]
+fn kernel_rows() -> Vec<aterm_sysprobe::ProcessReading> {
+    aterm_sysprobe::processes()
+        .map(|sweep| sweep.procs)
+        .unwrap_or_default()
+}
+
+/// A Windows image name as the word the other platforms' `comm` is: lowercase (Windows file
+/// names differ in case alone, so `Claude.EXE` and `claude.exe` are one program) with its `.exe`
+/// dropped, so `claude.exe` is the `claude` every reader of a [`ProcRow`] matches by name.
+#[cfg(windows)]
+fn image_word(name: &str) -> String {
+    let word = name.to_ascii_lowercase();
+    match word.strip_suffix(".exe") {
+        Some(stem) if !stem.is_empty() => stem.to_owned(),
+        _ => word,
+    }
+}
+
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 fn ps_table() -> Vec<ProcRow> {
     let Some(out) = ps(&["-A", "-o", "pid=,ppid=,comm="]) else {
         return Vec::new();
@@ -996,14 +1158,14 @@ fn base_name(comm: &str) -> String {
 /// number `ps` prints from the kernel's record: its `tty` name comes from `devname(3)`, a scan of
 /// `/dev` that skips a live terminal's node while an earlier node is removed, so under another
 /// process's pty churn it prints `??` for a process that holds a terminal.
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 const PS_TTY: &str = if cfg!(target_os = "macos") {
     "tdev"
 } else {
     "tty"
 };
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 fn tty_table() -> Vec<(u32, u32, String, String)> {
     let Some(out) = ps(&["-A", "-o", &format!("pid=,ppid=,{PS_TTY}=,comm=")]) else {
         return Vec::new();
@@ -1019,6 +1181,7 @@ fn tty_table() -> Vec<(u32, u32, String, String)> {
         .collect()
 }
 
+#[cfg(not(windows))]
 fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &str)> {
     let row = |p: u32| t.iter().find(|(q, _, _, _)| *q == p);
     let tty = row(pid)?.2.as_str();
@@ -1049,7 +1212,14 @@ fn live_terminal(pid: u32) -> Option<(u32, String)> {
         let r = rows.iter().find(|r| r.pid == owner)?;
         Some((owner, comm_name(r)))
     }
-    #[cfg(not(target_os = "macos"))]
+    // No process on Windows has a controlling terminal: a pseudoconsole is not an identity the
+    // kernel records against the processes attached to it.
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         terminal_owner(pid, &tty_table()).map(|(owner, name)| (owner, name.to_string()))
     }
@@ -1062,13 +1232,18 @@ fn opener(agent: u32, parent: u32) -> Option<String> {
         let parent = aterm_sysprobe::kproc::record(parent)?;
         (parent.tty != Some(tty)).then(|| comm_name(&parent))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = (agent, parent);
+        None
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         ps_opener(agent, parent)
     }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 fn ps_opener(agent: u32, parent: u32) -> Option<String> {
     // One pid per `ps`: asked for two or more at once, a `ps` whose own device read is
     // wedged never returns, while each pid asked alone answers — the oracle is the same
@@ -1193,9 +1368,15 @@ pub(super) trait Kernel {
         super::relaunch::shell_dialect(shell, processes)
     }
     /// The work under `pid` a restart would end ([`live_background`]; [`UNREADABLE_TABLE`] where
-    /// the process table was not read), which the last look before a signal requires to be none
+    /// its processes were not read), which the last look before a signal requires to be none
     /// unless the owner pressed the restart.
     fn restart_background(&self, pid: u32) -> Vec<String>;
+    /// The shells under `pid` as the last look before a signal reads them again, each with its
+    /// seat and command ([`held_read`], on macOS [`held_by_children`]; `None`: its processes or a
+    /// row of them were not read). A move
+    /// over the agent's waits ([`upgrade::Yield::Waits`]) signals only where these are still
+    /// waits it carries. Required, as [`Self::restart_background`] is.
+    fn restart_held(&self, pid: u32) -> Option<Vec<upgrade::Held>>;
     fn image(&self, pid: u32) -> Option<PathBuf> {
         exe_of(pid)
     }
@@ -1206,15 +1387,18 @@ pub(super) trait Kernel {
         let (_, pgid, tpgid) = self.ids(shell)?;
         Some(pgid == i64::from(shell) && pgid == tpgid)
     }
-    fn describe(&self, agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
-        let _ = agent;
+    /// What each of `procs`, the shells under `agent` in table `t`, is: its age, its seat and,
+    /// for a direct child, its command. The default reads no machine: every one a top with no
+    /// command, which is never a wait ([`upgrade::own_of`]).
+    fn describe(&self, agent: u32, procs: &[(u32, String)], t: &[ProcRow]) -> Vec<upgrade::Held> {
+        let _ = (agent, t);
         procs
             .iter()
             .map(|(pid, name)| upgrade::Held {
                 pid: *pid,
                 name: name.clone(),
-                age_s: 0,
-                command: String::new(),
+                seat: upgrade::Seat::Top,
+                ..upgrade::Held::default()
             })
             .collect()
     }
@@ -1227,7 +1411,7 @@ impl Kernel for Live {
         if !alive(pid) {
             return None;
         }
-        ids(pid).map(|(ppid, _, _)| ppid)
+        parent_of(pid)
     }
 
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
@@ -1246,21 +1430,112 @@ impl Kernel for Live {
         live_background(pid)
     }
 
-    fn describe(&self, agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
-        held_of(agent, procs)
+    fn restart_held(&self, pid: u32) -> Option<Vec<upgrade::Held>> {
+        // Read as the last look's work is ([`live_background`]): on macOS from the agent's own
+        // children, never the whole table, whose read a busy machine holds past its bound.
+        #[cfg(target_os = "macos")]
+        {
+            held_by_children(self, pid, aterm_sysprobe::jobs::child_pids, live_child_row)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            held_read(self, pid, &table())
+        }
+    }
+
+    fn describe(&self, agent: u32, procs: &[(u32, String)], t: &[ProcRow]) -> Vec<upgrade::Held> {
+        held_of(agent, procs, t)
     }
 }
 
-const BACKGROUND: &[&str] = &[
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "dash",
-    "ksh",
-    "tcsh",
-    "caffeinate",
-];
+/// Every shell under `agent` in table `t` as `k` describes it, or `None` where the table was not
+/// read or a row of it went unread (a shell that left between the table and its own read): what
+/// [`upgrade::own_of`] may class. An unread row is never a wait.
+pub(super) fn held_read(
+    k: &(impl Kernel + ?Sized),
+    agent: u32,
+    t: &[ProcRow],
+) -> Option<Vec<upgrade::Held>> {
+    if t.is_empty() {
+        return None;
+    }
+    held_in(k, agent, t)
+}
+
+/// The shells under `agent` as `k` describes them, read from `agent`'s own descendants
+/// ([`descendant_rows`]) and never the whole table, whose read a busy machine holds past its bound
+/// ([`live_background`]): `None` where those or a shell's own row were not read, and nothing held
+/// where nothing is under `agent`.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+pub(super) fn held_by_children(
+    k: &(impl Kernel + ?Sized),
+    agent: u32,
+    children: impl Fn(u32) -> Option<Vec<u32>>,
+    row: impl Fn(u32) -> std::io::Result<Option<(u32, Comm)>>,
+) -> Option<Vec<upgrade::Held>> {
+    held_in(k, agent, &descendant_rows(agent, children, row)?)
+}
+
+/// Every shell under `agent` in rows `t` as `k` describes it, or `None` where a shell's own row
+/// went unread (one that left between `t` and its own read).
+fn held_in(k: &(impl Kernel + ?Sized), agent: u32, t: &[ProcRow]) -> Option<Vec<upgrade::Held>> {
+    let procs = background_procs(agent, t);
+    let held = k.describe(agent, &procs, t);
+    (held.len() == procs.len()).then_some(held)
+}
+
+/// Where the shell `pid` sits under `agent` in `t`, and the names of all under it where it is a
+/// top ([`upgrade::Seat`]).
+fn seat_of(agent: u32, pid: u32, t: &[ProcRow]) -> (upgrade::Seat, Vec<String>) {
+    let parent = |p: u32| t.iter().find(|(c, _, _)| *c == p).map(|(_, pp, _)| *pp);
+    if parent(pid) == Some(agent) {
+        let mut under = Vec::new();
+        let mut frontier = vec![pid];
+        let mut seen = 0;
+        while let Some(p) = frontier.pop() {
+            seen += 1;
+            if seen > 4096 {
+                // A table too deep to walk names something this list does not: no wait.
+                under.push(UNREADABLE_TABLE.to_string());
+                break;
+            }
+            for (c, pp, name) in t {
+                if *pp == p {
+                    frontier.push(*c);
+                    under.push(name.to_string());
+                }
+            }
+        }
+        return (upgrade::Seat::Top, under);
+    }
+    // Under a top: the agent's child above it is one of its held shells.
+    let mut p = pid;
+    for _ in 0..64 {
+        let Some(pp) = parent(p) else { break };
+        if pp == agent {
+            let held = t.iter().any(|(c, _, name)| {
+                *c == p && BACKGROUND.contains(&name.as_str()) && name != OWN_KEEP_AWAKE
+            });
+            if held {
+                return (upgrade::Seat::Under, Vec::new());
+            }
+            break;
+        }
+        p = pp;
+    }
+    (upgrade::Seat::Loose, Vec::new())
+}
+
+/// Whether `raw`, a process's arguments as the kernel gave them and `ps` prints them, are the
+/// words it was started with, byte for byte: no escape `ps` wrote for a byte it does not print
+/// (a newline, a tab, a byte above ASCII; a backslash of the command's own reads the same) and
+/// no run of blanks [`squash`] folds.
+#[cfg(target_os = "macos")]
+fn exact_args(raw: &str) -> bool {
+    !raw.contains('\\') && raw == squash(raw)
+}
+
+const BACKGROUND: &[&str] = upgrade::BACKGROUND;
 
 const OWN_KEEP_AWAKE: &str = "caffeinate";
 
@@ -1310,10 +1585,90 @@ pub(super) fn background_procs(pid: u32, t: &[ProcRow]) -> Vec<(u32, String)> {
 
 pub(super) const UNREADABLE_TABLE: &str = "ps-unreadable";
 
+/// What opens a record's `ended_work` where one is owed ([`St::ended_work`]), so that work the
+/// process table named nothing of still reads as owed.
+const ENDED_WORK_MARK: &str = "ended:";
+
+/// The work under `pid` a restart would end ([`background`]; [`UNREADABLE_TABLE`] where it was not
+/// read). On macOS it is read from `pid`'s own descendants ([`background_by_children`]): each
+/// parent's children by themselves (libproc's `proc_listchildpids`,
+/// [`aterm_sysprobe::jobs::child_pids`]) and each child's record by its pid, never a read of the
+/// whole table. The kernel answers a `KERN_PROC_ALL` read only once every process it lists is
+/// through an exec in progress, and [`table`] gives that read one second; on a busy machine (a
+/// test run, a build, anything that execs freshly signed programs) it misses that bound, and the
+/// restart's last look read the unread table as work and refused a restart it had already taken
+/// the tab's hand for. Elsewhere the table's rows are walked as before.
 pub(super) fn live_background(pid: u32) -> Vec<String> {
-    background_or_unreadable(pid, &table())
+    #[cfg(target_os = "macos")]
+    {
+        background_by_children(pid, aterm_sysprobe::jobs::child_pids, live_child_row)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        background_or_unreadable(pid, &table())
+    }
 }
 
+/// One child's parent and name as the live kernel records them by its pid, for
+/// [`descendant_rows`]: `Ok(None)` where it is gone or a zombie, which runs nothing.
+#[cfg(target_os = "macos")]
+fn live_child_row(child: u32) -> std::io::Result<Option<(u32, Comm)>> {
+    aterm_sysprobe::kproc::record_read(child).map(|record| {
+        record
+            .filter(|r| !r.zombie)
+            .map(|r| (r.ppid, Comm::named_when_asked(r)))
+    })
+}
+
+/// [`background`] over `pid`'s descendants ([`descendant_rows`]). Descendants that were not read
+/// make the whole read [`UNREADABLE_TABLE`], as an unread table does: no work can be ruled out.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+pub(super) fn background_by_children(
+    pid: u32,
+    children: impl Fn(u32) -> Option<Vec<u32>>,
+    row: impl Fn(u32) -> std::io::Result<Option<(u32, Comm)>>,
+) -> Vec<String> {
+    descendant_rows(pid, children, row).map_or_else(
+        || vec![UNREADABLE_TABLE.to_string()],
+        |rows| background(pid, &rows),
+    )
+}
+
+/// `pid`'s descendants as table rows, found one parent at a time: `children` lists a parent's
+/// children (`None`: not read), and `row` reads one child's parent and name (`Ok(None)`: gone, or
+/// a zombie, which runs nothing; `Err`: not read). `None` where a list or a row does not read. A
+/// child that names another parent by the time its row is read left `pid`'s tree and is not
+/// walked, and the walk stops past [`background_procs`]'s 4096 parents, reading as unread. No rows
+/// is a process with nothing under it, which an empty whole table never is.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+pub(super) fn descendant_rows(
+    pid: u32,
+    children: impl Fn(u32) -> Option<Vec<u32>>,
+    row: impl Fn(u32) -> std::io::Result<Option<(u32, Comm)>>,
+) -> Option<Vec<ProcRow>> {
+    let mut rows: Vec<ProcRow> = Vec::new();
+    let mut frontier = vec![pid];
+    let mut seen = 0;
+    while let Some(parent) = frontier.pop() {
+        seen += 1;
+        if seen > 4096 {
+            return None;
+        }
+        for child in children(parent)? {
+            match row(child) {
+                Ok(Some((ppid, name))) if ppid == parent => {
+                    frontier.push(child);
+                    rows.push((child, parent, name));
+                }
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(rows)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
 pub(super) fn background_or_unreadable(pid: u32, t: &[ProcRow]) -> Vec<String> {
     if t.is_empty() {
         return vec![UNREADABLE_TABLE.to_string()];
@@ -1321,7 +1676,7 @@ pub(super) fn background_or_unreadable(pid: u32, t: &[ProcRow]) -> Vec<String> {
     background(pid, t)
 }
 
-pub(super) fn held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
+pub(super) fn held_of(agent: u32, procs: &[(u32, String)], t: &[ProcRow]) -> Vec<upgrade::Held> {
     if procs.is_empty() {
         return Vec::new();
     }
@@ -1333,27 +1688,74 @@ pub(super) fn held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held>
             .iter()
             .filter_map(|(p, name)| {
                 let r = kproc::record(*p)?;
+                let (seat, under) = seat_of(agent, *p, t);
+                let raw = (r.ppid == agent).then(|| kproc::ps_args(&r, kproc::Locale::C));
                 Some(upgrade::Held {
                     pid: *p,
                     name: name.clone(),
                     age_s: now.saturating_sub(r.start_s),
-                    command: if r.ppid == agent {
-                        command_head(&squash(&kproc::ps_args(&r, kproc::Locale::C)))
+                    command: raw
+                        .as_deref()
+                        .map(|raw| command_head(&squash(raw)))
+                        .unwrap_or_default(),
+                    // The kernel's parent and the table's agree, or the seat is not known.
+                    seat: if (r.ppid == agent) == (seat == upgrade::Seat::Top) {
+                        seat
                     } else {
-                        String::new()
+                        upgrade::Seat::Loose
                     },
+                    under,
+                    exact: raw.as_deref().is_some_and(exact_args),
                 })
             })
             .collect()
     }
-    #[cfg(not(target_os = "macos"))]
+    // One sweep names each process's parent and creation time; the command line of the agent's
+    // own children is read from each one's process parameters, empty where that read is refused.
+    #[cfg(windows)]
     {
-        ps_held_of(agent, procs)
+        let rows = kernel_rows();
+        let now_ms = aterm_time::since_epoch().and_then(|d| i64::try_from(d.as_millis()).ok());
+        procs
+            .iter()
+            .filter_map(|(p, name)| {
+                let r = rows.iter().find(|r| r.pid == *p)?;
+                let age_ms = now_ms?.saturating_sub(r.birth_ms?);
+                let (seat, under) = seat_of(agent, *p, t);
+                Some(upgrade::Held {
+                    pid: *p,
+                    name: name.clone(),
+                    age_s: u64::try_from(age_ms / 1000).unwrap_or(0),
+                    command: if r.ppid == agent {
+                        atpkg::caller_shell::process_args(*p)
+                            .map(|a| command_head(&squash(&a.argv.join(" "))))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    // This sweep's parent and the table's agree, or the seat is not known.
+                    seat: if (r.ppid == agent) == (seat == upgrade::Seat::Top) {
+                        seat
+                    } else {
+                        upgrade::Seat::Loose
+                    },
+                    under,
+                    // The words are the parsed arguments joined with blanks, not the command
+                    // line Windows keeps as one string: never the command byte for byte, so
+                    // never handed back to start again.
+                    exact: false,
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        ps_held_of(agent, procs, t)
     }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
-fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
+fn ps_held_of(agent: u32, procs: &[(u32, String)], t: &[ProcRow]) -> Vec<upgrade::Held> {
     // On macOS this is only the tests' oracle (production reads the kernel), and there
     // `ps` is read a pid at a time, as in [`ps_opener`]: asked for a list at once, a
     // `ps` whose own device read is wedged never returns at all. Elsewhere one call
@@ -1386,6 +1788,7 @@ fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
             let ppid: u32 = crate::parse_uint(it.next()?)?;
             let age_s = parse_etime(it.next()?)?;
             let args = it.collect::<Vec<_>>().join(" ");
+            let (seat, under) = seat_of(agent, *p, t);
             Some(upgrade::Held {
                 pid: *p,
                 name: name.clone(),
@@ -1395,6 +1798,11 @@ fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
                 } else {
                     String::new()
                 },
+                seat,
+                under,
+                // `ps` may cut its `args` column and these words were split on blanks: never
+                // the command byte for byte, so never handed back to start again.
+                exact: false,
             })
         })
         .collect()
@@ -1444,7 +1852,7 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
     }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
 pub(super) fn parse_etime(etime: &str) -> Option<u64> {
     let (days, clock) = match etime.split_once('-') {
         Some((d, rest)) => (crate::parse_uint::<u64>(d)?, rest),
@@ -1473,18 +1881,55 @@ pub(super) fn command_head(args: &str) -> String {
     payload.replace("'\"'\"'", "'")
 }
 
+/// Whether `pid` is this process or one of its ancestors, which no sweep signals. Each link of
+/// this process's chain comes from `t` or, where `t` lacks it, from the kernel's record of that
+/// one process ([`link_above`]). That record answers while [`table`] gives up on a whole-table read that
+/// an exec elsewhere holds past its bound and returns no rows. A link neither gives, and a chain
+/// deeper than 64, count as an ancestor: a sweep never signals what it cannot prove is not its
+/// own.
+///
+/// On Windows the kernel reparents nothing: a process whose parent exited still names it. So
+/// there a pid with no row in a whole table is a process that is gone, where this process's
+/// chain ends, and only a table that was not read whole leaves a link ungiven.
 pub(super) fn is_our_ancestor(pid: u32, t: &[ProcRow]) -> bool {
     let mut p = std::process::id();
     for _ in 0..64 {
         if p == pid {
             return true;
         }
-        match t.iter().find(|(c, _, _)| *c == p) {
-            Some((_, pp, _)) if *pp != p && *pp != 0 => p = *pp,
-            _ => return false,
+        let parent = t
+            .iter()
+            .find(|(c, _, _)| *c == p)
+            .map(|(_, pp, _)| *pp)
+            .or_else(|| link_above(p));
+        match parent {
+            Some(pp) if pp != p && pp != 0 => p = pp,
+            Some(_) => return false,
+            None => return true,
         }
     }
-    false
+    true
+}
+
+/// The parent of `p`, a link of this process's chain its caller's table lacks
+/// ([`is_our_ancestor`]): `0` where the chain ends at `p`, `None` where the link is not known.
+fn link_above(p: u32) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let whole = aterm_sysprobe::processes()
+            .filter(|sweep| !sweep.truncated && !sweep.procs.is_empty())?;
+        Some(
+            whole
+                .procs
+                .iter()
+                .find(|r| r.pid == p)
+                .map_or(0, |r| r.ppid),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        ids(p).map(|(pp, _, _)| pp)
+    }
 }
 
 pub(super) fn cwd_of(pid: u32) -> Option<String> {
@@ -1611,15 +2056,25 @@ pub(super) fn line_status(c: &mut Client, tab: &str, block: Option<u64>) -> Opti
 }
 
 pub(super) fn started_ms(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    let age_s = {
-        let r = aterm_sysprobe::kproc::record(pid)?;
-        aterm_time::unix_secs()?.saturating_sub(r.start_s)
-    };
-    #[cfg(not(target_os = "macos"))]
-    let age_s = parse_etime(ps(&["-o", "etime=", "-p", &pid.to_string()])?.trim())?;
-    let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
-    Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
+    // The kernel's own creation time, to the millisecond, where the others subtract an age in
+    // whole seconds from now.
+    #[cfg(windows)]
+    {
+        let ticks = aterm_uds::process::read_creation_filetime(i32::try_from(pid).ok()?)?;
+        u64::try_from(aterm_sysprobe::procs::birth_of_filetime(ticks)?).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let age_s = {
+            let r = aterm_sysprobe::kproc::record(pid)?;
+            aterm_time::unix_secs()?.saturating_sub(r.start_s)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let age_s = parse_etime(ps(&["-o", "etime=", "-p", &pid.to_string()])?.trim())?;
+        let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
+        Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
+    }
 }
 
 pub(super) fn shell_dialect_of(
@@ -1639,22 +2094,111 @@ pub(super) fn shell_dialect_of(
         .and_then(upgrade::Dialect::from_exe_name)
 }
 
+/// The build directory's name where `program` is `name`'s executable in an atpkg store
+/// (`…/store/<name>/<build>/bin/<exe>`).
+fn store_build_dir<'a>(program: &'a Path, name: &str) -> Option<&'a str> {
+    let plain = program.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    });
+    if !program.has_root() || !plain || !names_program(program, name) {
+        return None;
+    }
+    let mut up = program.components().rev().skip(1).map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    let (bin, build, tool, store) = (up.next()??, up.next()??, up.next()??, up.next()??);
+    (bin == "bin" && tool == name && store == "store").then_some(build)
+}
+
+/// The `version` the store record beside the build directory `build` names
+/// (`store/<program>/<build>.vendor`), `None` when the record is unread or names none.
+fn record_version(build: &Path) -> Option<String> {
+    let record = build.with_file_name(format!("{}.vendor", build.file_name()?.to_str()?));
+    let text = crate::harness::accounts::read_bounded(&record, 64 * 1024)
+        .ok()
+        .flatten()?;
+    text.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("version")?.trim_start();
+        let v = v.strip_prefix('=')?.trim().trim_matches('"');
+        (!v.is_empty() && !v.chars().any(char::is_control)).then(|| v.to_string())
+    })
+}
+
+/// The version of the store build `program` is (Muse Code's, agy's or Claude Code's), as its
+/// store record names it and its build directory agrees; nothing is executed.
 pub(super) fn store_version(program: &Path) -> Option<String> {
-    if !super::upgrade_muse::store_build(program) && !super::upgrade_agy::store_build(program) {
+    if !super::upgrade_muse::store_build(program)
+        && !super::upgrade_agy::store_build(program)
+        && store_build_dir(program, "claude").is_none()
+    {
         return None;
     }
     let build = program.parent()?.parent()?;
     let dir = build.file_name()?.to_str()?;
-    let record = build.with_extension("vendor");
-    let text = crate::harness::accounts::read_bounded(&record, 64 * 1024)
-        .ok()
-        .flatten()?;
-    let version = text.lines().find_map(|l| {
-        let v = l.trim().strip_prefix("version")?.trim_start();
-        let v = v.strip_prefix('=')?.trim().trim_matches('"');
-        (!v.is_empty() && !v.chars().any(char::is_control)).then(|| v.to_string())
-    })?;
+    let version = record_version(build)?;
     super::upgrade_muse_live::build_version(&version, Some(dir)).map(|_| version)
+}
+
+/// The Claude Code build `exe` is, read from where it lies and never by running it. A store
+/// build (`…/store/claude/<build>/bin/claude`) is named by its store record
+/// ([`record_version`]) and by its build directory where that is the version's own number
+/// (`atpkg::vendor_direct::Version::build_id`): either alone names it, and two that disagree
+/// name none. A legacy index build has neither (its directory is the index's build number), and
+/// is named by the version atpkg read from its signed manifest and kept in the program's stamp
+/// ([`legacy_build_version`]). A native build (`…/.local/share/claude/versions/<version>`) is
+/// named by its file name. `None` for any other path.
+pub(super) fn claude_build_version(exe: &Path) -> Option<Version> {
+    if let Some(dir) = store_build_dir(exe, "claude") {
+        let build_dir = exe.parent()?.parent()?;
+        let build = Some(dir)
+            .filter(|dir| !(dir.len() > 1 && dir.starts_with('0')))
+            .and_then(crate::parse_uint::<u64>);
+        let numbered = build
+            .and_then(atpkg::vendor_direct::Version::from_build_id)
+            .map(|version| version.to_string());
+        let named = match (record_version(build_dir), numbered) {
+            (Some(recorded), Some(numbered)) if recorded != numbered => return None,
+            (None, None) => legacy_build_version(build_dir, build?)?,
+            (recorded, numbered) => recorded.or(numbered)?,
+        };
+        return Version::parse(&named);
+    }
+    exe.parent()
+        .filter(|versions| versions.ends_with(".local/share/claude/versions"))
+        .and(exe.file_name())
+        .and_then(|name| Version::parse(&name.to_string_lossy()))
+}
+
+/// The version of Claude Code's legacy index build `build` at `build_dir`
+/// (`<prefix>/store/claude/<build>`), as atpkg's stamp under that prefix names it
+/// (`atpkg::vendor_direct::legacy_version`): `None` until a pass of atpkg's lane has read the
+/// build's signed manifest; a legacy build atpkg vouches for and cannot name, its lane replaces
+/// with the vendor's own (`InstallReason::ReplacesLegacy`).
+fn legacy_build_version(build_dir: &Path, build: u64) -> Option<String> {
+    let layout = atpkg::store::Layout {
+        prefix: build_dir.parent()?.parent()?.parent()?.to_path_buf(),
+    };
+    atpkg::vendor_direct::legacy_version(&layout, "claude", build)
+        .map(|version| version.to_string())
+}
+
+/// The build `sf`'s session runs: the version its record names, and for a record that names
+/// none readable, the build its process's executable is ([`claude_build_version`]).
+pub(super) fn running_version(sf: &SessionFile) -> Option<Version> {
+    running_version_with(sf, exe_of)
+}
+
+fn running_version_with(
+    sf: &SessionFile,
+    exe: impl FnOnce(u32) -> Option<PathBuf>,
+) -> Option<Version> {
+    Version::parse(&sf.version).or_else(|| claude_build_version(&exe(sf.pid)?))
 }
 
 /// Whether `exe` is `program`'s executable by its file name, as atpkg names one in a build's
@@ -1725,121 +2269,12 @@ pub(super) fn twin_version(twin: &Path) -> Option<String> {
     store_version(&exe)
 }
 
+/// The bound of a build's start probe ([`super::upgrade_build_start`]), the one place a target
+/// build is executed before a session moves onto it.
 #[cfg(not(test))]
-const VERSION_WAIT: Duration = Duration::from_secs(5);
+pub(super) const VERSION_WAIT: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Probed {
-    Version(Version),
-    NoVersion,
-    TimedOut,
-}
-
-fn version_of(exe: &Path, holds: &Path) -> Probed {
-    version_within(exe, VERSION_WAIT, Some(holds))
-}
-
-/// `<exe> --version` within `limit`, its process group killed whole at the bound; the program is
-/// held from before its start until it exits with a code of its own or never started
-/// ([`super::first_exec::hold`], under `holds` unless atpkg's store holds it), and with no
-/// `holds` not held.
-fn version_within(exe: &Path, limit: Duration, holds: Option<&Path>) -> Probed {
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(limit)
-        .unwrap_or_else(|| now + Duration::from_secs(3600));
-    let Ok(super::first_exec::Prepared {
-        command: mut cmd,
-        mut hold,
-    }) = super::first_exec::prepare(exe, holds, super::first_exec::ProbeWord::Version)
-    else {
-        return Probed::TimedOut;
-    };
-    cmd.stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::null());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let Ok(mut child) = cmd.spawn() else {
-        super::first_exec::never_started(&mut hold);
-        return Probed::NoVersion;
-    };
-    #[cfg(unix)]
-    let group = libc::pid_t::try_from(child.id()).ok();
-    let kill_group = || {
-        #[cfg(unix)]
-        if let Some(group) = group {
-            // `process_group(0)` made this unreaped child's PID its private PGID.
-            let _ = aterm_uds::process::kill_group_until_empty(group);
-        }
-    };
-    let Some(stdout) = child.stdout.take() else {
-        kill_group();
-        let _ = child.kill();
-        let _ = child.wait();
-        return Probed::NoVersion;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _reader = std::thread::Builder::new()
-        .name("agent-version-probe".into())
-        .spawn(move || {
-            #[cfg(unix)]
-            let read = super::align::read_capture_pipe(stdout, 64 * 1024, deadline);
-            #[cfg(not(unix))]
-            let read = {
-                let mut buf = Vec::new();
-                stdout.take(64 * 1024).read_to_end(&mut buf).map(|_| buf)
-            };
-            let _ = tx.send(read);
-        });
-    let out = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(Ok(out)) => out,
-        Ok(Err(error)) => {
-            kill_group();
-            let _ = child.kill();
-            let _ = child.wait();
-            return if error.kind() == std::io::ErrorKind::TimedOut {
-                Probed::TimedOut
-            } else {
-                Probed::NoVersion
-            };
-        }
-        Err(_) => {
-            kill_group();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Probed::TimedOut;
-        }
-    };
-    let succeeded = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // a signal's end shows nothing of a run: the hold stands
-                if status.code().is_some() {
-                    super::first_exec::ran(&mut hold);
-                }
-                break status.success();
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                kill_group();
-                let _ = child.kill();
-                let _ = child.wait();
-                return Probed::TimedOut;
-            }
-        }
-    };
-    if !succeeded {
-        return Probed::NoVersion;
-    }
-    let text = String::from_utf8_lossy(&out);
-    text.split_whitespace()
-        .next()
-        .and_then(Version::parse)
-        .map_or(Probed::NoVersion, Probed::Version)
-}
+pub(super) const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 #[cfg_attr(not(all(test, unix)), allow(dead_code))]
 pub(super) fn bounded_output(
@@ -1882,14 +2317,17 @@ fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf>
 pub(super) struct Targets {
     managed: Option<Candidate>,
     native: Option<Candidate>,
+    /// A managed twin lies there and the build it execs was not read ([`TargetRead::Unread`]).
+    /// The managed build is every session's target ([`Targets::for_session`]), so no session
+    /// is known current while this holds.
     unanswered: bool,
 }
 
 impl Targets {
     /// Cache the catalog baked into each target build under `<state>/upgrade/builds`
-    /// ([`super::switch_top::baked_cached`], one scan per build), where a person's click on a
-    /// session's model fact reads it ([`super::switch_top::switch_top`]). A dry run writes
-    /// nothing; a cache that cannot be written is left for the next sweep.
+    /// ([`super::switch_top::baked_cached`], one scan per build), where a session's model card
+    /// and effort slider read it ([`super::switch_top::catalog`]). A dry run writes nothing; a
+    /// cache that cannot be written is left for the next sweep.
     fn cache_catalogs(&self, opts: &Opts) {
         if opts.dry_run {
             return;
@@ -1907,42 +2345,45 @@ impl Targets {
         }
     }
 
-    /// The targets under `opts.home`, each program a version is asked of held until it exited
-    /// with a code of its own ([`super::first_exec`]).
+    /// The targets under `opts.home`, each read from where its build lies and none executed
+    /// ([`managed_target`], [`claude_build_version`]). Nothing is remembered between reads: a
+    /// read that failed is read again by the next look. The native target is the file
+    /// `~/.local/bin/claude` resolves to under [`native_root`], which Claude Code's installer
+    /// names by its version: a link that resolves to nothing there, or to a file of another
+    /// name (`latest`, a download in flight), is no native target, and that is an answer.
     pub(super) fn read(opts: &Opts) -> Targets {
-        let holds = super::first_exec::holds_dir(&opts.state);
         Targets::read_with(
             atpkg::store::resolve_configured().and_then(|layout| managed_twin(&layout, "claude")),
             &opts.home,
-            |exe| cached_version(exe, &holds),
         )
     }
 
-    fn read_with(twin: Option<PathBuf>, home: &Path, ask: impl Fn(&Path) -> Asked) -> Targets {
-        let unanswered = std::cell::Cell::new(false);
-        let version = |exe: &Path| match ask(exe) {
-            Asked::Answered(v) => v,
-            Asked::Unanswered => {
-                unanswered.set(true);
-                None
-            }
-        };
-        let managed = twin.and_then(|twin| {
-            let version = version(&twin)?;
-            Some(Candidate {
+    fn read_with(twin: Option<PathBuf>, home: &Path) -> Targets {
+        let mut unanswered = false;
+        let managed = twin.and_then(|twin| match managed_target(&twin) {
+            TargetRead::Version(version) => Some(Candidate {
                 exe: twin,
                 version,
                 source: Source::Managed,
-            })
+            }),
+            TargetRead::Absent => None,
+            TargetRead::Unread(why) => {
+                aterm_log::debug!("upgrade target unread twin={} why={why}", twin.display());
+                unanswered = true;
+                None
+            }
         });
         let native = std::fs::canonicalize(home.join(".local/bin/claude"))
             .ok()
             .filter(|target| target.starts_with(native_root(home)))
             .and_then(|target| {
-                let version = target
-                    .file_name()
-                    .and_then(|n| Version::parse(&n.to_string_lossy()))
-                    .or_else(|| version(&target))?;
+                let Some(version) = claude_build_version(&target) else {
+                    aterm_log::debug!(
+                        "upgrade no native target: {} names no version",
+                        target.display()
+                    );
+                    return None;
+                };
                 Some(Candidate {
                     exe: target,
                     version,
@@ -1952,7 +2393,18 @@ impl Targets {
         Targets {
             managed,
             native,
-            unanswered: unanswered.get(),
+            unanswered,
+        }
+    }
+
+    /// What a visit says of a session none of these targets is ahead of: `current`, or, while
+    /// the managed build is unread, `wait:no-version` ([`UNREAD_VERSION`]), because a session
+    /// behind a build nobody read is not known to be current.
+    fn untargeted_word(&self) -> String {
+        if self.unanswered {
+            format!("wait:{UNREAD_VERSION}")
+        } else {
+            "current".to_string()
         }
     }
 
@@ -1965,74 +2417,41 @@ impl Targets {
     }
 }
 
-const VERSION_RETRY_FIRST: Duration = Duration::from_secs(2 * 60);
-const VERSION_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
-
-#[derive(Clone, Debug)]
-enum Seen {
-    Answered(Option<Version>),
-    TimedOut { streak: u32, retry: Instant },
-}
-
+/// What a read of the managed twin's build gave ([`managed_target`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Asked {
-    Answered(Option<Version>),
-    Unanswered,
+enum TargetRead {
+    /// No managed copy is installed: no twin lies there.
+    Absent,
+    /// The build the twin execs.
+    Version(Version),
+    /// A twin lies there and its build was not read; the word says where the read stopped.
+    /// Never an answer that there is no version.
+    Unread(&'static str),
 }
 
-fn cached_version(exe: &Path, holds: &Path) -> Asked {
-    cached_version_with(exe, Instant::now(), |exe| version_of(exe, holds))
-}
-
-fn cached_version_with(exe: &Path, now: Instant, probe: impl FnOnce(&Path) -> Probed) -> Asked {
-    type Cache = std::collections::HashMap<PathBuf, (u64, SystemTime, Seen)>;
-    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
-    let Some(meta) = std::fs::metadata(exe)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-    else {
-        return Asked::Answered(None);
-    };
-    let Ok(modified) = meta.modified() else {
-        return Asked::Answered(None);
-    };
-    let stamp = (meta.len(), modified);
-    let before = CACHE.lock().ok().and_then(|cache| {
-        cache
-            .as_ref()
-            .and_then(|c| c.get(exe))
-            .filter(|(len, at, _)| (*len, *at) == stamp)
-            .map(|(_, _, seen)| seen.clone())
-    });
-    let streak = match before {
-        Some(Seen::Answered(v)) => return Asked::Answered(v),
-        Some(Seen::TimedOut { retry, .. }) if now < retry => return Asked::Unanswered,
-        Some(Seen::TimedOut { streak, .. }) => streak,
-        None => 0,
-    };
-    let (seen, asked) = match probe(exe) {
-        Probed::Version(v) => (Seen::Answered(Some(v.clone())), Asked::Answered(Some(v))),
-        Probed::NoVersion => (Seen::Answered(None), Asked::Answered(None)),
-        Probed::TimedOut => {
-            let wait = VERSION_RETRY_FIRST
-                .saturating_mul(1 << streak.min(16))
-                .min(VERSION_RETRY_MAX);
-            let retry = now.checked_add(wait).unwrap_or(now);
-            (
-                Seen::TimedOut {
-                    streak: streak.saturating_add(1),
-                    retry,
-                },
-                Asked::Unanswered,
-            )
-        }
-    };
-    if let Ok(mut cache) = CACHE.lock() {
-        cache
-            .get_or_insert_with(Cache::new)
-            .insert(exe.to_path_buf(), (stamp.0, stamp.1, seen));
+/// The build the managed twin `twin` execs, read with nothing executed: the twin's own last line
+/// names the store build ([`super::twin::twin_binary`]), and the store names its version
+/// ([`claude_build_version`]).
+fn managed_target(twin: &Path) -> TargetRead {
+    match std::fs::metadata(twin) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return TargetRead::Absent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return TargetRead::Absent,
+        Err(_) => return TargetRead::Unread("twin-unreadable"),
     }
-    asked
+    let Some(text) = crate::harness::accounts::read_bounded(twin, 64 * 1024)
+        .ok()
+        .flatten()
+    else {
+        return TargetRead::Unread("twin-unreadable");
+    };
+    let Some(exe) = super::twin::twin_binary(&text) else {
+        return TargetRead::Unread("twin-names-no-build");
+    };
+    if !exe.is_file() {
+        return TargetRead::Unread("build-missing");
+    }
+    claude_build_version(&exe).map_or(TargetRead::Unread("build-unversioned"), TargetRead::Version)
 }
 
 pub(super) type Client = RelayClient<aterm_uds::CtlStream>;
@@ -2891,7 +3310,7 @@ fn turn_takes_rows(c: &mut Client) -> bool {
 
 /// Whether the host's `turn` fences on the person (`if-human=`): an older one reads the word as the
 /// turn's text, so it is sent only where `help turn` names it.
-fn turn_takes_human(c: &mut Client) -> bool {
+pub(super) fn turn_takes_human(c: &mut Client) -> bool {
     c.help_counted("turn")
         .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-human="))
 }
@@ -3134,9 +3553,9 @@ pub fn tap_profile_store_at(home: &Path) -> bool {
 
 /// [`tap_profile_store_at`] with the host's `XDG_CONFIG_HOME` passed in.
 fn tap_profile_store_in(home: &Path, host_xdg: Option<&str>) -> bool {
-    use super::accounts::{profile_configs_dir, profile_configured};
+    use super::accounts::{HOMEDIR_ENV, profile_configs_dir, profile_configured};
     let home = home.display().to_string();
-    let by_home = profile_configs_dir([("HOME", home.as_str())]);
+    let by_home = profile_configs_dir([(HOMEDIR_ENV, home.as_str())]);
     let by_xdg = host_xdg.and_then(|xdg| profile_configs_dir([("XDG_CONFIG_HOME", xdg)]));
     by_home
         .into_iter()
@@ -3329,6 +3748,8 @@ pub(super) struct St {
     /// ([`Self::roll_back`]); `None`: none recorded (no end of aterm's, or an earlier build's
     /// record), and the line keeps the whole grace.
     pub(super) line_grace_s: Option<u32>,
+    /// The input already accepted by an explicit restart; only its original host can use it.
+    pub(super) line_input: Option<super::restart_stamp::Input>,
     pub(super) back_line: String,
     pub(super) prompt: Option<PromptMark>,
     pub(super) line_block: Option<u64>,
@@ -3415,6 +3836,20 @@ pub(super) struct St {
     pub(super) tells: u32,
     pub(super) told_at: u64,
     pub(super) told_to: String,
+    /// When the restart stops waiting for the real work of the agent process
+    /// [`Self::deadline_pid`] ([`upgrade::WORK_DEADLINE_S`] past the line that told it, stamped
+    /// once that line's turn was taken whole); 0: none stands. It is the process's, whatever
+    /// target the line named: a newer build never starts the clock again. A look that finds the
+    /// hold broken voids it ([`Self::void_deadline`]).
+    pub(super) deadline_at: u64,
+    pub(super) deadline_pid: u32,
+    /// The commands of the background waits this restart ends, each to start again after the
+    /// resume ([`upgrade::Yield::Waits`]); owed to the continuation until it is typed.
+    pub(super) ended_waits: Vec<String>,
+    /// That this restart came at the deadline and ended the agent's work
+    /// ([`upgrade::Yield::Deadline`]), and what ran under it then as the process table named it
+    /// (empty: nothing it names); owed to the continuation until it is typed.
+    pub(super) ended_work: Option<String>,
     pub(super) work_end_at: Vec<u64>,
     pub(super) goal: bool,
     pub(super) firsts: Vec<(String, u64)>,
@@ -3520,6 +3955,8 @@ struct History {
     tells: u32,
     told_at: u64,
     told_to: String,
+    deadline_at: u64,
+    deadline_pid: u32,
     firsts: Vec<(String, u64)>,
     work_end_at: Vec<u64>,
     goal: bool,
@@ -3667,7 +4104,7 @@ impl St {
     }
 
     /// Release an announced round no build is ahead to restart onto: its build this session
-    /// already runs or has passed, or, where every target probe was `answered`, one no target
+    /// already runs or has passed, or, where every target was read (`answered`), one no target
     /// offers any more.
     fn release_untargeted(&mut self, running: &Version, answered: bool, now: u64) -> bool {
         let reached = Version::parse(&self.to).is_some_and(|to| to <= *running);
@@ -3764,6 +4201,7 @@ impl St {
         self.account_intent = self.back_account_intent.take();
         self.native_rollback = self.native.is_some() || !self.native_prepare.is_empty();
         self.line_grace_s = Some(grace_s);
+        self.line_input = None;
         self.prompt = None;
         self.phase = Phase::Exiting { at_s: now };
         true
@@ -3780,6 +4218,8 @@ impl St {
             tells: self.tells,
             told_at: self.told_at,
             told_to: self.told_to.clone(),
+            deadline_at: self.deadline_at,
+            deadline_pid: self.deadline_pid,
             firsts: self.firsts.clone(),
             work_end_at: self.work_end_at.clone(),
             goal: self.goal,
@@ -3796,6 +4236,8 @@ impl St {
         self.tells = history.tells;
         self.told_at = history.told_at;
         self.told_to = history.told_to;
+        self.deadline_at = history.deadline_at;
+        self.deadline_pid = history.deadline_pid;
         self.firsts = history.firsts;
         self.work_end_at = history.work_end_at;
         self.goal = history.goal;
@@ -3885,6 +4327,8 @@ impl St {
                     st.tells = 0;
                     st.told_at = 0;
                     st.told_to.clear();
+                    st.deadline_at = 0;
+                    st.deadline_pid = 0;
                     st.work_end_at.clear();
                     st.goal = false;
                 } else if st.proc_start.is_empty()
@@ -4230,6 +4674,7 @@ impl St {
             return;
         }
         self.account_intent = None;
+        self.line_input = None;
         self.back_account_intent = None;
         if self.pending_since == 0 {
             self.pending_since = self.salt;
@@ -4288,6 +4733,17 @@ impl St {
         self.still_since != 0
             && self.still_print == print
             && now.saturating_sub(self.still_at) <= IDLE_RUN_GAP_S
+    }
+
+    /// Voids the deadline the agent process was told, and the line that named it
+    /// ([`upgrade::deadline_voids`]): the own-work hold starts again from nothing.
+    pub(super) fn void_deadline(&mut self) {
+        self.deadline_at = 0;
+        self.deadline_pid = 0;
+        self.tells = 0;
+        self.told_at = 0;
+        self.told_to.clear();
+        self.own_since = 0;
     }
 
     pub(super) fn note_wait(&mut self, word: &str, now: u64) {
@@ -4461,6 +4917,14 @@ impl St {
             ("release", &self.release),
             ("last_stop", &self.last_stop),
             ("told_to", &self.told_to),
+            (
+                "ended_work",
+                &self
+                    .ended_work
+                    .as_ref()
+                    .map(|list| format!("{ENDED_WORK_MARK}{list}"))
+                    .unwrap_or_default(),
+            ),
             ("streak_why", &self.streak_why),
             ("still_print", &self.still_print),
             ("proc_start", &self.proc_start),
@@ -4558,6 +5022,9 @@ impl St {
         if let Some(grace) = self.line_grace_s {
             o.insert("line_grace".into(), Value::from(u64::from(grace)));
         }
+        if let Some(input) = &self.line_input {
+            o.insert("line_input".into(), input.to_value());
+        }
         if let Some(block) = self.line_block {
             o.insert("line_block".into(), Value::from(block));
         }
@@ -4614,6 +5081,8 @@ impl St {
             ("own_since", self.own_since),
             ("tells", u64::from(self.tells)),
             ("told_at", self.told_at),
+            ("deadline_at", self.deadline_at),
+            ("deadline_pid", u64::from(self.deadline_pid)),
             ("goal", u64::from(self.goal)),
             ("limit_until", self.limit_until),
             ("quiet", u64::from(self.quiet)),
@@ -4651,6 +5120,7 @@ impl St {
             ("tabs", &self.tabs),
             ("tabs_until", &tabs_until),
             ("resume_argv", &self.resume_argv),
+            ("ended_waits", &self.ended_waits),
             ("markers", &self.markers),
             ("asked", &self.asked),
             ("held_by", &held_by),
@@ -4805,6 +5275,9 @@ impl St {
                 .get("line_grace")
                 .and_then(Value::as_u64)
                 .and_then(|g| u32::try_from(g).ok()),
+            line_input: v
+                .get("line_input")
+                .and_then(super::restart_stamp::Input::from_value),
             back_line: s("back_line"),
             prompt: PromptMark::parse(&s("prompt")),
             line_block: v.get("line_block").and_then(Value::as_u64),
@@ -4917,6 +5390,12 @@ impl St {
             tells: small("tells"),
             told_at: n("told_at"),
             told_to: s("told_to"),
+            deadline_at: n("deadline_at"),
+            deadline_pid: small("deadline_pid"),
+            ended_waits: list("ended_waits"),
+            ended_work: s("ended_work")
+                .strip_prefix(ENDED_WORK_MARK)
+                .map(str::to_owned),
             proc_start: s("proc_start"),
             waits: list("waits")
                 .iter()
@@ -5021,6 +5500,7 @@ impl St {
         let start = squash(start);
         if (self.pid, self.pid_start.as_str()) != (pid, start.as_str()) {
             self.exited_at = 0;
+            self.line_input = None;
         }
         self.pid = pid;
         self.pid_start = start;
@@ -5162,6 +5642,16 @@ impl St {
         !self.native_retired_unissued && self.phase == Phase::Done && self.confirm_by != 0
     }
 
+    /// Ends this record's look in memory, for a read that writes nothing (the watch's), where
+    /// its clock already has (`relaunch::look_holds`). A step closes one through
+    /// `relaunch::confirm`, which says its last word.
+    fn close_look(&mut self) {
+        if self.confirming() {
+            self.confirm_by = 0;
+            self.look_word.clear();
+        }
+    }
+
     fn notice_belongs_to(&self, sf: &SessionFile, tab: &str) -> bool {
         self.tab == tab
             && self.notice_pid == sf.pid
@@ -5265,6 +5755,7 @@ impl St {
         self.relaunched_start.clear();
         self.noted.clear();
         self.cause.clear();
+        self.line_input = None;
         self.hold_since_s = 0;
         self.hold_seen_s = 0;
         self.work_seen = false;
@@ -5301,6 +5792,7 @@ impl St {
         self.native_rollback = false;
         self.line_dir.clear();
         self.line_grace_s = None;
+        self.line_input = None;
         self.back_line.clear();
         self.back_account_intent = None;
         self.exited_at = 0;
@@ -5309,6 +5801,8 @@ impl St {
     }
 
     pub(super) fn unsent(&mut self, back: Unsent) {
+        self.ended_waits.clear();
+        self.ended_work = None;
         self.account_intent = None;
         self.phase = back.phase;
         self.release = back.release;
@@ -6657,7 +7151,7 @@ fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&
     if prior.is_some_and(|st| st.landed_after_stop(sf, &Live)) {
         return true;
     }
-    let Some(running) = Version::parse(&sf.version) else {
+    let Some(running) = running_version(sf) else {
         return true;
     };
     let needed = targets
@@ -6673,6 +7167,17 @@ fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&
         targets.native.as_ref().map(|target| &target.version),
     );
     needed
+}
+
+/// Whether a tab's step visits `sf`: a session the host would inspect
+/// ([`needs_upgrade_inspection`]), or any session while the managed build is unread
+/// ([`Targets::unanswered`]). No read target is ahead of a session behind a build nobody read, so
+/// the first alone drops it and its tab's step falls back to `current`; visited, it says
+/// `wait:no-version` ([`Targets::untargeted_word`]), which the watch records as its wait. The
+/// host's own look keeps the narrower question and answers [`Due::Unread`] for the same session
+/// ([`due_among`]).
+fn step_visits(sf: &SessionFile, targets: &Targets, prior: Option<&St>) -> bool {
+    needs_upgrade_inspection(sf, targets, prior) || targets.unanswered
 }
 
 fn claim_still_live(c: &mut Client, pid: u32, claim: &HostClaim) -> bool {
@@ -8727,12 +9232,12 @@ pub const UNREAD_PROCESS: &str = "no-process";
 pub const UNREAD_FILES: &str = "session-files-unreadable";
 /// `Due::Wait` reason when a behind agent has moved away from its recorded home.
 pub const HOME_MOVED: &str = "home-moved";
-/// `Due::Unread` reason when no newer agent version is available.
+/// [`Due::Unread`]'s word for a look that could not read the build a target runs ([`TargetRead::Unread`]): nothing is decided, and the next look reads it again.
 pub const UNREAD_VERSION: &str = "no-version";
 
 /// Mints the session's upgrade state the moment its host sees it behind. Everything is read
 /// before the sweep lock is taken, which covers the mint alone ([`behind_after_lanes`]): a socket
-/// that answers late, or a build's version probe, holds no other session's sweep.
+/// that answers late, or a target's read, holds no other session's sweep.
 pub fn note_behind(opts: &Opts, since: u64) -> Behind {
     let Some(tab) = opts.only_sid.as_deref().filter(|_| !opts.dry_run) else {
         return Behind::Nothing;
@@ -8819,6 +9324,10 @@ pub enum Behind {
     Unread(&'static str),
 }
 
+/// Whether a newer build `to` is minted over `st`. A look still unclosed is never minted over,
+/// held or past its clock: its last word (a line lost, in the ledger and to the host) is said by
+/// the step that closes it, and that step's visit mints the newer target ([`due`] stays `Yes`
+/// while a look is unclosed).
 pub(super) fn behind_anew(st: &St, to: &Version) -> bool {
     matches!(st.phase, Phase::Done | Phase::Failed(_))
         && !st.confirming()
@@ -8833,7 +9342,7 @@ fn mint_behind(
     native: bool,
     since: u64,
 ) -> bool {
-    let Some(running) = Version::parse(&sf.version) else {
+    let Some(running) = running_version(sf) else {
         return false;
     };
     let Some(target) = upgrade::choose_target(&running, &targets.for_session(native)) else {
@@ -9182,6 +9691,33 @@ pub const OWNED_BACKGROUND_LOOKS: u32 = 3;
 /// How many quick looks in a row the upgrade may own the session's turn ends for.
 pub const OWNED_SETTLE_LOOKS: u32 = 2;
 
+/// How many turn ends one quiet round's settle may hold ([`quiet_settle_owned`]).
+pub const QUIET_SETTLE_POINTS: u32 = 3;
+
+/// Whether a quiet round's settle (`wait:settling` under the quiet flow) owns the session's turn
+/// end after a look. `looks` counts the bounded waits at this point before it (since the last
+/// turn, any word's), `held` the turn ends this round's settle has held, and `this_held` says
+/// whether this point is one of them. Each turn end is held for at most [`OWNED_SETTLE_LOOKS`]
+/// looks, each [`first_look`] apart ([`after_quiet_settle`]), and a round holds at most
+/// [`QUIET_SETTLE_POINTS`] turn ends; a turn starts the looks over but not the round's count, which
+/// only the round's next act, word or nothing due starts over. Refines `UpgradeQuietSettleTurnEnd`.
+#[must_use]
+pub const fn quiet_settle_owned(looks: u32, held: u32, this_held: bool) -> bool {
+    looks < OWNED_SETTLE_LOOKS && (this_held || held < QUIET_SETTLE_POINTS)
+}
+
+/// [`After`] a quiet round's settle: at the first rung while the look owned the turn end, so the
+/// Autopilot's continuation is held for at most [`OWNED_SETTLE_LOOKS`] times [`first_look`] at a
+/// point, and up the ladder once it let go.
+#[must_use]
+pub fn after_quiet_settle(owned: bool, same: u32) -> After {
+    if owned {
+        After::Later(first_look())
+    } else {
+        ladder(same)
+    }
+}
+
 /// Return whether the upgrade owns the session's turn ends after `step`.
 #[must_use]
 pub fn owns_turn_ends(step: &str, looks: u32, grace_s: u32) -> bool {
@@ -9322,7 +9858,12 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
 
 /// [`sweep_with_roster`] over each lane's pass `pass`, under the sweep lock: the confirmations
 /// are closed first and reported after the lanes' reports, so [`pick`] names a tab's live
-/// conversation's act before the closed look of a conversation whose agent ended.
+/// conversation's act before the closed look of a conversation whose agent ended. A tab's own
+/// step ends on the last word of its live agent's look that its host must hear
+/// ([`look_ends_step`]): the lanes go at the tab's next look, so no act of theirs is said in that
+/// word's place. Any other close of a look (`done:resumed`, a model confirmed) yields in a tab's
+/// own step to what the lanes say of that tab, an act or a wait: the close is in the record and
+/// the ledger already, and a wait it stood before would lose its host the wait's next look.
 fn sweep_with_lanes(
     opts: &Opts,
     live_tabs: Option<&[LiveTab]>,
@@ -9341,16 +9882,41 @@ fn sweep_with_lanes(
             }];
         }
     };
-    let confirmed = if opts.background || opts.press.is_some() {
+    // A break's step closes a look too: closing types nothing, and the line a look owes stays
+    // an idle point's (`relaunch::look_types`).
+    let confirmed = if opts.press.is_some() {
         Vec::new()
     } else {
         confirmations(opts)
     };
+    if opts.only_sid.is_some()
+        && confirmed
+            .iter()
+            .any(|r| look_ends_step(&r.step) && alive(r.pid))
+    {
+        return confirmed;
+    }
     muse::sweep_prune(opts, live_tabs);
     agy::sweep_prune(opts, live_tabs);
     let mut reports = lanes(opts, live_tabs, pass);
+    let mut confirmed = confirmed;
+    if opts.only_sid.is_some() {
+        confirmed.retain(|c| {
+            look_ends_step(&c.step)
+                || !reports
+                    .iter()
+                    .any(|r| r.tab == c.tab && r.step != "current")
+        });
+    }
     reports.extend(confirmed);
     reports
+}
+
+/// Whether `step` is a look's last word that ends its tab's step: its restore line typed into
+/// the agent, which starts a turn, or the line recorded lost, which the host records where a
+/// person reads it.
+fn look_ends_step(step: &str) -> bool {
+    matches!(step, "continued:restore" | "done:lost")
 }
 
 fn lanes(
@@ -9548,49 +10114,15 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     }
     let mut reports = Vec::new();
     reports.extend(if let Some(tabs) = live_tabs {
-        let targets = std::cell::OnceCell::new();
-        let candidates = host_candidates(
+        roster_reports(
+            opts,
             &files,
             tabs,
-            |sf, tab| {
-                let tg = targets.get_or_init(|| Targets::read(opts));
-                if opts.only_sid.as_deref().is_some_and(|only| only != tab) {
-                    return false;
-                }
-                match load_record(opts, &sf.session_id) {
-                    Err(_) => true,
-                    Ok(prior) => needs_upgrade_inspection(sf, tg, prior.as_ref()),
-                }
-            },
+            || Targets::read(opts),
             atpkg::caller_shell::process_args,
             process_group,
             ids,
-        );
-        let (mut claimed, mut waits) = (Vec::new(), Vec::new());
-        for candidate in candidates {
-            match candidate {
-                Ok(c) => claimed.push(c),
-                Err(wait) => waits.push(wait),
-            }
-        }
-        if !claimed.is_empty() {
-            let t = table();
-            let targets = targets.get_or_init(|| Targets::read(opts));
-            targets.cache_catalogs(opts);
-            waits.extend(claimed.into_iter().map(|(sf, args, claim)| {
-                visit_build(
-                    opts,
-                    sf,
-                    Some(&files),
-                    &t,
-                    targets,
-                    &Live,
-                    Some(&args),
-                    Some(&claim),
-                )
-            }));
-        }
-        waits
+        )
     } else if files.is_empty() {
         Vec::new()
     } else {
@@ -9618,6 +10150,64 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
         reports.extend(orphans(opts, &files, live_tabs));
     }
     reports
+}
+
+/// Claude Code's reports over the live roster `tabs`: each session its tab claims that
+/// [`step_visits`] lets through is visited ([`visit_build`]) against the targets `read_targets`
+/// reads, at most once and only where a session is asked of; a claim whose process cannot be
+/// read whole says its wait.
+fn roster_reports(
+    opts: &Opts,
+    files: &[SessionFile],
+    tabs: &[LiveTab],
+    read_targets: impl Fn() -> Targets,
+    read_args: impl FnMut(u32) -> Option<atpkg::caller_shell::ProcArgs>,
+    read_group: impl FnMut(u32) -> Option<i64>,
+    read_ids: impl FnMut(u32) -> Option<(u32, i64, i64)>,
+) -> Vec<Report> {
+    let targets = std::cell::OnceCell::new();
+    let candidates = host_candidates(
+        files,
+        tabs,
+        |sf, tab| {
+            let tg = targets.get_or_init(&read_targets);
+            if opts.only_sid.as_deref().is_some_and(|only| only != tab) {
+                return false;
+            }
+            match load_record(opts, &sf.session_id) {
+                Err(_) => true,
+                Ok(prior) => step_visits(sf, tg, prior.as_ref()),
+            }
+        },
+        read_args,
+        read_group,
+        read_ids,
+    );
+    let (mut claimed, mut waits) = (Vec::new(), Vec::new());
+    for candidate in candidates {
+        match candidate {
+            Ok(c) => claimed.push(c),
+            Err(wait) => waits.push(wait),
+        }
+    }
+    if !claimed.is_empty() {
+        let t = table();
+        let targets = targets.get_or_init(&read_targets);
+        targets.cache_catalogs(opts);
+        waits.extend(claimed.into_iter().map(|(sf, args, claim)| {
+            visit_build(
+                opts,
+                sf,
+                Some(files),
+                &t,
+                targets,
+                &Live,
+                Some(&args),
+                Some(&claim),
+            )
+        }));
+    }
+    waits
 }
 
 pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str> {
@@ -9977,7 +10567,7 @@ fn visit_build(
         }
         return carry_on(opts, r, &mut st, &mut c, &sf.session_id.clone(), sf, None);
     }
-    let Some(running) = Version::parse(&sf.version) else {
+    let Some(running) = running_version(sf) else {
         return said(r, "wait:version-unreadable");
     };
     let exe = exe_of(sf.pid).unwrap_or_default();
@@ -10009,7 +10599,7 @@ fn visit_build(
                 ),
             );
         }
-        return said(r, "current");
+        return said(r, targets.untargeted_word());
     };
     r.to = format!("{}({})", target.version, target.source.as_str());
     if Records::of_file(&opts.home, sf).left_by(
@@ -10019,10 +10609,32 @@ fn visit_build(
     ) {
         return said(r, format!("wait:{HOME_MOVED}"));
     }
-    if prior.as_ref().is_some_and(St::confirming) {
+    let now = now_s();
+    if prior
+        .as_ref()
+        .is_some_and(|st| super::relaunch::look_holds(opts, &sf.session_id, st, now))
+    {
         return said(r, "wait:confirming");
     }
-    let now = now_s();
+    // A look past its own clock hides no newer build. A step's confirmations closed it before
+    // this visit; a press's lane, whose sweep runs none, closes it here, its last word in the
+    // ledger; a read that writes nothing (the watch's) treats it as closed.
+    if let Some(st) = prior.as_mut().filter(|st| st.confirming()) {
+        if opts.dry_run {
+            st.close_look();
+        } else {
+            let look = look_report(st, &sf.session_id);
+            let closed = confirm(opts, &look, st, &sf.session_id, now);
+            if st.confirming() {
+                return said(r, "wait:confirming");
+            }
+            if opts.press.is_none()
+                && let Some(last) = closed.filter(|c| look_ends_step(&c.step))
+            {
+                return last;
+            }
+        }
+    }
     let who = squash(&sf.proc_start);
     let who = Proc {
         start: &who,
@@ -10096,6 +10708,60 @@ fn visit_build(
             Err(why) => return said(r, format!("wait:{why}")),
         };
     facts.press = press_of(opts, &st, &tab, now);
+    if t.is_empty() {
+        // The sweep's process table was not read (it has no row): what runs under the agent is
+        // unknown, which is work, held and clocked as work is, never nothing to restart over.
+        facts.background.push(UNREADABLE_TABLE.to_string());
+    }
+    // What runs under the agent, classed once at this look: a quiet round moves over proved
+    // waits and carries their commands, and tells real work its deadline.
+    let own_held = if facts.quiet && !facts.background.is_empty() {
+        held_read(k, sf.pid, t)
+    } else {
+        Some(Vec::new())
+    };
+    let own = own_at(&facts, own_held.as_deref());
+    let own_held = own_held.unwrap_or_default();
+    facts.waits_only = matches!(own, upgrade::Own::Waits(_));
+    facts.deadline_set = st.deadline_at != 0 && st.deadline_pid == sf.pid;
+    if upgrade::deadline_voids(&facts) {
+        // The hold the line named is broken (a person, a wall, or nothing running): the
+        // deadline is void, and work that holds the round again is told its own.
+        let was = st.deadline_at;
+        st.void_deadline();
+        facts.deadline_set = false;
+        facts.own_hold_s = 0;
+        ledger(
+            opts,
+            &Report {
+                step: "deadline-void".to_string(),
+                ..r.clone()
+            },
+            &format!(
+                "the deadline aterm told the agent ({}) is void: this look found {}; work of its \
+                 own that holds the upgrade again is told a deadline of its own",
+                if was > now {
+                    format!("{} ahead", upgrade::span(was - now))
+                } else {
+                    format!("{} past", upgrade::span(now - was))
+                },
+                if facts.limited || facts.login {
+                    "a wall"
+                } else if upgrade::person_seen(&facts) {
+                    "a person at the session"
+                } else {
+                    "nothing of its own running"
+                },
+            ),
+        );
+    }
+    facts.work_due = facts.deadline_set && now >= st.deadline_at;
+    if !facts.deadline_set {
+        // A line counts only while its deadline stands: one that never reached the agent, one
+        // an older build typed with no deadline and one a look voided are none, and the work
+        // that holds the round is told.
+        facts.tells = 0;
+    }
     if let Some(r) = left_first(opts, &r, &mut st, &mut c, &tab, sf, now) {
         return r;
     }
@@ -10123,7 +10789,7 @@ fn visit_build(
     let taken_back = asked_about != st.phase;
     let mut step = upgrade::requested_step(&request, &asked_about, &facts, ready, now, &st.to);
     if opts.background {
-        step = upgrade::break_step(step);
+        step = upgrade::break_step(step, &facts);
     }
     let mut rearmed_here = None;
     if step == Step::Rearm
@@ -10230,7 +10896,7 @@ fn visit_build(
                 &r,
                 &gave_up_words(
                     upgrade::Agent::Claude,
-                    &k.describe(sf.pid, &background_procs(sf.pid, t)),
+                    &k.describe(sf.pid, &background_procs(sf.pid, t), t),
                     facts.quiet,
                 ),
             );
@@ -10279,7 +10945,7 @@ fn visit_build(
                 );
                 let text = upgrade::with_running(
                     &upgrade::prepare_prompt(&running, &target.version, target.source, &marker),
-                    &upgrade::running_clause(&k.describe(sf.pid, &background_procs(sf.pid, t))),
+                    &upgrade::running_clause(&k.describe(sf.pid, &background_procs(sf.pid, t), t)),
                 );
                 require_unique_owner(&opts.home, sf).map_err(str::to_string)?;
                 if host_claim.is_some_and(|claim| !claim_still_live(&mut c, sf.pid, claim)) {
@@ -10335,6 +11001,7 @@ fn visit_build(
                     why,
                     from: &running.to_string(),
                     held_s: facts.own_hold_s,
+                    held: &own_held,
                     verb,
                 },
                 k,
@@ -10354,12 +11021,28 @@ fn visit_build(
                         && (asked_about == Phase::Pending || opts.press.is_some_and(|p| p.off))));
             let owed_here = !st.release.is_empty() && st.notice_belongs_to(sf, &tab);
             // A press past the agent's own background work ends that work, so the agent is told:
-            // with the tab's harness on, the relaunch owes its carry-on. Every other quiet move
-            // ends no work (`upgrade::quiet_move`), and the loop's own first point goes on.
+            // with the tab's harness on, the relaunch owes its carry-on. A quiet round's own move
+            // over that work (`upgrade::own_yields`) ends it too: the carry-on is owed, with the
+            // waits' commands or the work that ended at its deadline. Every other quiet move ends
+            // no work (`upgrade::quiet_move`), and the loop's own first point goes on.
+            let over = if fresh || pressed {
+                None
+            } else {
+                upgrade::own_yields(&facts)
+            };
             let ended_work =
-                pressed && !facts.background.is_empty() && !opts.press.is_some_and(|p| p.off);
+                (pressed && !facts.background.is_empty() && !opts.press.is_some_and(|p| p.off))
+                    || over.is_some();
             let quiet = unasked && !owed_here;
             st.quiet = quiet && !ended_work;
+            // The waits are this look's, so one that ends by itself before the signal is still
+            // started again; the last look before the signal holds what runs then to this list.
+            st.ended_waits = match (&over, &own) {
+                (Some(upgrade::Yield::Waits), upgrade::Own::Waits(commands)) => commands.clone(),
+                _ => Vec::new(),
+            };
+            st.ended_work =
+                (over == Some(upgrade::Yield::Deadline)).then(|| upgrade::held_list(&own_held));
             if !fresh {
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }
@@ -10380,6 +11063,7 @@ fn visit_build(
                 fresh,
                 quiet,
                 pressed,
+                over,
                 lagging: !fresh
                     && facts.quiet
                     && request == Request::Now
@@ -10391,7 +11075,14 @@ fn visit_build(
                 auth_observed: !args.env.is_empty(),
                 launch_env: launch_record.as_ref(),
             };
-            restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
+            let before = st.phase.clone();
+            let r = restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting);
+            if st.phase == before {
+                // No signal went: nothing ended, and nothing is owed a continuation.
+                st.ended_waits.clear();
+                st.ended_work = None;
+            }
+            r
         }
     };
     let restart_word = (!opts.dry_run && matches!(step, Step::Terminate | Step::Fresh))
@@ -10431,7 +11122,7 @@ fn visit_build(
     {
         Vec::new()
     } else {
-        k.describe(sf.pid, &background_procs(sf.pid, t))
+        k.describe(sf.pid, &background_procs(sf.pid, t), t)
     };
     st.note_held(&result.step, &held, now);
     save(opts, &sf.session_id, &st);
@@ -10442,6 +11133,14 @@ fn visit_build(
         }
         _ => result,
     }
+}
+
+/// What runs under the agent at look `f`, classed ([`upgrade::own_of`]): `held` its shells as
+/// read ([`held_read`]; `None`: unread, which is work), the work its screen names off
+/// [`Facts::background`] ([`own_work`]).
+fn own_at(f: &Facts, held: Option<&[upgrade::Held]>) -> upgrade::Own {
+    let screen = f.background.iter().any(|w| w.starts_with("screen:"));
+    upgrade::own_of(held.unwrap_or_default(), screen, held.is_none())
 }
 
 pub(super) const AT_POINT: char = '@';
@@ -10670,12 +11369,8 @@ pub(super) fn look_facts(
             now.saturating_sub(st.own_since)
         },
         tells: if st.told_to == st.to { st.tells } else { 0 },
-        told_s: if st.told_at == 0 {
-            u64::MAX
-        } else {
-            now.saturating_sub(st.told_at)
-        },
         may_tell: opts.tell != Tell::Off,
+        silent: opts.tell == Tell::Silent,
         press: upgrade::Press::None,
         ..press_facts(&sf.status, read)
     };
@@ -10933,16 +11628,24 @@ struct Told<'a> {
     why: &'static str,
     from: &'a str,
     held_s: u64,
+    /// What runs under the agent at this look, as the process table names it.
+    held: &'a [upgrade::Held],
     /// The line names `aterm ctl @self restart` ([`Tell::Verb`], the target proved to start).
     verb: bool,
 }
 
-/// Types the quiet round's one line to the agent whose own work (`told.why`) holds its move
-/// ([`Step::Tell`]), at most [`upgrade::MAX_TELLS`] times for one target. The count is spent and
-/// saved once the fence is read, right before the first key ([`type_fenced_then`]), so a line cut
-/// short, a reply lost after the keys or a crash mid-type is never typed again sooner than
-/// [`upgrade::RETELL_S`]. A refusal before that spends nothing, a save that fails types nothing,
-/// and a turn the server reports untyped (`changed`, a yield to a person) gives the count back.
+/// Types the quiet round's line to the agent whose own work (`told.why`) holds its move
+/// ([`Step::Tell`]): what waits, and the deadline after which the restart goes at its first turn
+/// end ([`upgrade::WORK_DEADLINE_S`]). The deadline is stamped only for a line the host took
+/// whole, submit included: nothing moves over work on a line that never reached the agent. Every
+/// other end names no deadline and counts no line, so the work that holds the round is told again:
+/// - a refusal before the first key, or a turn the server reports untyped (`changed`, a yield to
+///   a person), changes nothing, and the next look types it;
+/// - a line cut short, refused after its keys or unanswered may stand in the composer or may
+///   have landed, so the own-work hold starts again from now ([`St::own_since`], saved once the
+///   fence is read, right before the first key, so a crash mid-type starts it again too): what
+///   stands is settled first ([`left_first`]), and the line is typed again only once the work
+///   has held the round [`upgrade::WORK_TELL_S`] more. A save that fails types nothing.
 fn tell(
     opts: &Opts,
     r: Report,
@@ -10959,6 +11662,7 @@ fn tell(
         why,
         from,
         held_s,
+        held,
         verb,
     } = *told;
     let waits = |r| said(r, format!("wait:{why}"));
@@ -10972,10 +11676,23 @@ fn tell(
     {
         return waits(r);
     }
-    let text = upgrade::tell_prompt(st.agent, from, &st.to, held_s, verb);
-    let spent = (st.tells, st.told_at, st.told_to.clone());
+    let text = upgrade::tell_prompt(
+        st.agent,
+        &upgrade::Telling {
+            from,
+            to: &st.to,
+            held_s,
+            deadline_s: upgrade::WORK_DEADLINE_S,
+            held,
+            verb,
+        },
+    );
+    let held_since = st.own_since;
+    // Whether the first key may have gone: the fence was read and the record saved.
+    let mut keyed = false;
     let typed = {
         let st = &mut *st;
+        let keyed = &mut keyed;
         type_fenced_then(
             c,
             tab,
@@ -10984,45 +11701,48 @@ fn tell(
             Put::Pressed,
             opts.timings.fence_every,
             &mut || {
-                st.tells = if st.told_to == st.to {
-                    spent.0.saturating_add(1)
-                } else {
-                    1
-                };
-                st.told_at = now;
-                st.told_to.clone_from(&st.to);
-                save_checked(opts, &sf.session_id, st).map_err(|_| {
-                    (st.tells, st.told_at, st.told_to) = spent.clone();
-                    Typed::Refused("unsaved".to_string())
-                })
+                st.own_since = now;
+                if save_checked(opts, &sf.session_id, st).is_err() {
+                    st.own_since = held_since;
+                    return Err(Typed::Refused("unsaved".to_string()));
+                }
+                *keyed = true;
+                Ok(())
             },
         )
     };
     match typed {
         Ok(()) => {
+            st.own_since = held_since;
+            st.tells = 1;
+            st.told_at = now;
+            st.told_to.clone_from(&st.to);
+            st.deadline_at = now.saturating_add(upgrade::WORK_DEADLINE_S);
+            st.deadline_pid = sf.pid;
             let r = said(r, format!("told:{why}"));
             ledger(
                 opts,
                 &r,
                 &format!(
                     "the agent's own running work held the quiet upgrade to {} for {}: one line \
-                     told it what waits and when it moves (tell {} of {}); nothing it runs was \
-                     ended or asked of it",
+                     told it what waits and that the restart goes at its first turn end {} from \
+                     now, ending what still runs under it then; nothing was ended or asked of it \
+                     now",
                     st.to,
                     upgrade::span(held_s),
-                    st.tells,
-                    upgrade::MAX_TELLS
+                    upgrade::span(upgrade::WORK_DEADLINE_S),
                 ),
             );
             r
         }
-        Err(Typed::Cut(why)) => {
-            left_cut(st, c, tab, &text);
-            said(r, format!("wait:cut-{why}"))
-        }
         Err(e) => {
-            if matches!(e, Typed::Changed | Typed::Yielded | Typed::Person) {
-                (st.tells, st.told_at, st.told_to) = spent;
+            if !keyed || matches!(e, Typed::Changed | Typed::Yielded | Typed::Person) {
+                // Nothing was typed: the hold stands as it was, and the next look types it.
+                st.own_since = held_since;
+            } else {
+                // Keys may have gone: what stands of the line is settled before anything else
+                // is typed, and no deadline is named by a line the agent may never have read.
+                left_cut(st, c, tab, &text);
             }
             said(r, format!("wait:{}", e.word()))
         }
@@ -12017,6 +12737,10 @@ struct Restarting<'a> {
     /// The owner's press moves the tab ([`upgrade::Press::Acting`]): the signal waits only for
     /// what [`upgrade::press_gate`] waits for, read again on the screen before it is sent.
     pressed: bool,
+    /// The quiet round moves over the agent's own background work ([`upgrade::own_yields`]):
+    /// the signal goes with that work running, over waits only where the last look still reads
+    /// nothing but the waits the continuation carries.
+    over: Option<upgrade::Yield>,
     lagging: bool,
     mode: Option<&'a str>,
     login: Option<&'a str>,
@@ -12029,10 +12753,12 @@ struct Restarting<'a> {
 }
 
 fn status_lets_signal(a: &SessionFile, looked: &SessionFile, lagging: bool) -> bool {
-    a.status == "idle"
-        || (lagging
-            && a.status == looked.status
-            && a.status_updated_at_ms == looked.status_updated_at_ms)
+    a.status == "idle" || (lagging && status_unmoved(a, looked))
+}
+
+/// Whether the session file `a` holds the status `looked` held, not written since.
+fn status_unmoved(a: &SessionFile, looked: &SessionFile) -> bool {
+    a.status == looked.status && a.status_updated_at_ms == looked.status_updated_at_ms
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12058,6 +12784,7 @@ fn restart(
         fresh,
         quiet,
         pressed,
+        over,
         lagging,
         mode: shown_mode,
         login,
@@ -12079,13 +12806,37 @@ fn restart(
     };
     // A press restarts over the agent's own background work and a status that has not caught
     // up with its turn's end; what it waits for, it reads off the screen.
-    let status_holds = |a: &SessionFile| pressed || status_lets_signal(a, sf, lagging);
-    let turn_over = |read: &Screen| {
-        if pressed {
-            press_lets_signal(read)
-        } else {
-            turn_over_shown(read, lagging)
+    // A move over the agent's own background work goes with its status still `shell` or `busy`
+    // for that work, so it reads the turn's end off the screen, and over waits requires that the
+    // screen name no work of its own. Its status must be idle or the very one the step looked
+    // at, unwritten since: a turn that started after that look (a wait ended and its notice
+    // reached the model) rewrites it before its footer is drawn, and nobody consented to ending
+    // that turn, as a person's press does.
+    let status_holds = |a: &SessionFile| {
+        pressed || status_lets_signal(a, sf, lagging) || (over.is_some() && status_unmoved(a, sf))
+    };
+    let turn_over = |read: &Screen| match over {
+        _ if pressed => press_lets_signal(read),
+        Some(upgrade::Yield::Waits) => {
+            press_lets_signal(read) && aterm_phase::phase::unlisted_work(&read.rows).is_none()
         }
+        Some(upgrade::Yield::Deadline) => press_lets_signal(read),
+        None => turn_over_shown(read, lagging),
+    };
+    // What runs under the agent at the last look: nothing, unless a press or the deadline moves
+    // over it, or only waits whose commands the continuation carries.
+    let own_lets_signal = |st: &St| match over {
+        _ if pressed => true,
+        Some(upgrade::Yield::Deadline) => true,
+        Some(upgrade::Yield::Waits) => {
+            k.restart_held(sf.pid)
+                .is_some_and(|held| match upgrade::own_of(&held, false, false) {
+                    upgrade::Own::None => true,
+                    upgrade::Own::Waits(now) => upgrade::waits_carried(&now, &st.ended_waits),
+                    upgrade::Own::Work => false,
+                })
+        }
+        None => k.restart_background(sf.pid).is_empty(),
     };
     let ours = |st: &St, a: &SessionFile| {
         if fresh {
@@ -12199,7 +12950,7 @@ fn restart(
                 && k.process_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         }) && foreground_shell(k.job(sf.pid)) == Ok(shell)
             && scr.is_some_and(|s| turn_over(&s) && composer_empty(c, tab, &s))
-            && (pressed || k.restart_background(sf.pid).is_empty())
+            && own_lets_signal(st)
             && !held(c, tab, grace)
             && host_claim.is_none_or(|claim| claim_still_live(c, sf.pid, claim));
         if !still {
@@ -12406,6 +13157,12 @@ fn restart(
              the relaunch line; any background shell ends with it)"
         } else if pressed {
             "SIGTERM (the owner pressed the update arrow: any background shell ends with it)"
+        } else if over == Some(upgrade::Yield::Waits) {
+            "SIGTERM (only background waits ran under it: they end with it, and the continuation \
+             carries each one's command to start again)"
+        } else if over == Some(upgrade::Yield::Deadline) {
+            "SIGTERM (the deadline it was told has passed: what still ran under it ends with it, \
+             and the continuation names it)"
         } else if quiet {
             "SIGTERM (idle: nothing asked or typed; resumed as it was)"
         } else {
@@ -12443,17 +13200,62 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
         if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {
             continue;
         }
-        let r = Report {
-            pid: st.resumed_pid,
-            tab: st.tab.clone(),
-            session: session.clone(),
-            from: st.from.clone(),
-            to: format!("{}({})", st.resumed_on, st.source),
-            step: String::new(),
-        };
+        let r = look_report(&st, &session);
         out.extend(confirm(opts, &r, &mut st, &session, now));
     }
     out
+}
+
+/// Tab `opts.only_sid`'s looks past their clock, closed where no upgrade step runs to close them
+/// (`[harness] upgrade` off, whose sweep never comes): its idle point's own close. It only
+/// records, as a break's sweep does ([`super::relaunch::look_types`]): a typed continuation's
+/// model is read into its `done` row, and a warned look's line is never typed, the look recorded
+/// lost once the bound it holds its conversation for has passed. Nothing is typed and nothing
+/// restarts, whatever the tab's Autopilot. `None` where nothing closed (a look still inside its
+/// clock, no look); `busy:<why>` where a look stands and the sweep lock was refused (another
+/// sweep at work), which its host looks at again later, as at any step the lock refuses: with
+/// the switch off no other step of its comes back to the look; else the close's report,
+/// `done:lost` first, which its host records where a person reads it.
+#[must_use]
+pub fn close_looks(opts: &Opts) -> Option<Report> {
+    let tab = opts.only_sid.as_ref()?;
+    if !confirming(opts) {
+        return None;
+    }
+    let recording = Opts {
+        background: true,
+        press: None,
+        ..opts.clone()
+    };
+    let _held = match sweep_lock(&recording) {
+        Ok(lock) => lock,
+        Err(why) => {
+            return Some(Report {
+                pid: 0,
+                tab: tab.clone(),
+                session: "-".to_string(),
+                from: "-".to_string(),
+                to: "-".to_string(),
+                step: format!("busy:{why}"),
+            });
+        }
+    };
+    let mut closed = confirmations(&recording);
+    let lost = closed.iter().position(|r| r.step == "done:lost");
+    lost.map(|at| closed.swap_remove(at))
+        .or_else(|| closed.into_iter().next())
+}
+
+/// The report a look's close is said under: its own conversation and resumed agent.
+fn look_report(st: &St, session: &str) -> Report {
+    Report {
+        pid: st.resumed_pid,
+        tab: st.tab.clone(),
+        session: session.to_string(),
+        from: st.from.clone(),
+        to: format!("{}({})", st.resumed_on, st.source),
+        step: String::new(),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -12473,19 +13275,9 @@ mod hang_tests;
 mod snapshot_env_tests;
 
 #[cfg(all(test, windows))]
-mod kernel_start_win_tests {
-    #[test]
-    fn the_start_is_the_filetime_decimal_read_by_syscall() {
-        let me = std::process::id();
-        let start = super::kernel_start(me).expect("this process's start");
-        assert!(
-            start.chars().all(|c| c.is_ascii_digit()),
-            "a FILETIME decimal, not a `ps` lstart: {start:?}"
-        );
-        let ticks = aterm_uds::process::read_creation_filetime(i32::try_from(me).unwrap())
-            .expect("the raw creation time");
-        assert_eq!(start, ticks.to_string(), "the syscall's exact decimal");
-        assert_eq!(super::kernel_start(0x7fff_fff0), None, "no such process");
-        assert_eq!(super::kernel_start(0), None, "never pid 0");
-    }
-}
+#[path = "upgrade_drive_kernel_start_win_tests.rs"]
+mod kernel_start_win_tests;
+
+#[cfg(all(test, windows))]
+#[path = "upgrade_drive_table_win_tests.rs"]
+mod table_win_tests;

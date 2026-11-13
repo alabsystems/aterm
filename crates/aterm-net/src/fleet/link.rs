@@ -564,7 +564,7 @@ impl Shared {
             Seat::Member => true,
             Seat::Unread => false,
             Seat::Out => {
-                self.fail("the membership log took the neighbour's key out");
+                self.fail("the fleet verdict no longer admits the neighbour's key");
                 false
             }
             Seat::Unknown => {
@@ -1830,14 +1830,14 @@ impl Neighbours {
         self.ticks.load(Ordering::Acquire)
     }
 
-    /// End every link whose peer this Mac's membership log no longer seats (its verdict read now).
+    /// End every link whose peer this Mac's fleet verdict no longer admits (read now).
     pub fn judge(&self) {
         let verdict = (self.cfg.verdict)();
         for link in self.links() {
             match verdict.seat(link.peer()) {
                 Seat::Member | Seat::Unread => {}
                 Seat::Out | Seat::Unknown => {
-                    link.close("the membership log no longer seats the neighbour's key");
+                    link.close("the fleet verdict no longer admits the neighbour's key");
                 }
             }
         }

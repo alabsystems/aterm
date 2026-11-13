@@ -10,6 +10,39 @@ fn seq(peer: &Peer) -> u64 {
     peer.signed.unwrap().seq
 }
 
+#[test]
+fn custody_is_checked_again_under_the_descriptor_writer_lock() {
+    let state = State::new("custody-descriptor");
+    write_key(state.dir(), &[5; SECRET_LEN]).unwrap();
+    let me = node_identity(state.dir()).unwrap();
+    let reg = Registration {
+        node: me.node().to_owned(),
+        host: "127.0.0.1".into(),
+        port: 7100,
+        version: "0.149.0".into(),
+        key: None,
+        signed: None,
+    };
+    let reads = std::cell::Cell::new(0);
+    let current = || {
+        let read = reads.get();
+        reads.set(read + 1);
+        read == 0
+    };
+    let answered = heartbeat_members_while(
+        state.dir(),
+        (&secret(5), &me),
+        &reg,
+        aterm_spec::wait::MUST_HAPPEN,
+        (None, &[], &Vec::new),
+        &Stop::new(),
+        &current,
+    )
+    .unwrap();
+    assert!(answered.is_empty());
+    assert!(!state.dir().join(SELF_ENTRY_FILE).exists());
+}
+
 /// The old listener passed its early current check, but has not acquired the descriptor
 /// writer's lock. Ending it and publishing the new listener must leave that newer descriptor
 /// intact when the old worker resumes. Removing only the under-lock current check overwrites
@@ -66,6 +99,7 @@ fn an_ended_heartbeat_cannot_replace_the_new_generations_descriptor() {
                     HANG,
                     (Some(&log), &[], &Vec::new),
                     &ended,
+                    &|| true,
                 )
                 .unwrap()
             })
@@ -80,6 +114,7 @@ fn an_ended_heartbeat_cannot_replace_the_new_generations_descriptor() {
             HANG,
             (Some(&log), &[], &Vec::new),
             &Stop::new(),
+            &|| true,
         )
         .unwrap();
         assert_eq!(answered.len(), 1);
@@ -175,6 +210,7 @@ fn a_heartbeat_ended_during_its_book_read_keeps_no_observations() {
         HANG,
         (None, &[], &hints),
         &ended,
+        &|| true,
     )
     .unwrap();
     assert_eq!(books.load(Ordering::Acquire), 1);

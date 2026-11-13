@@ -157,6 +157,7 @@ fn standin_run_reports_once_interrupted() {
         Seams {
             stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },

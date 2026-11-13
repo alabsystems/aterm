@@ -1579,9 +1579,13 @@ fn deck_frame_cost() {
 
 /// A beat's patch costs its narrow rects, not the card: of the text the whole raster blends, it
 /// blends only the glyphs of the texts over its rects (`Canvas::texels_meet_canvas`), so at each
-/// window checked a beat frame touches under a sixteenth of the card's glyphs. (The bound was 5%
-/// while each row printed a column of figures past its strip; without them the Folded card at
-/// 1524 pt holds 146 glyphs, of which the patch blends 8.)
+/// window checked a beat frame touches no more glyphs than may reach a rect the beat moved, each
+/// glyph granted the span from its text's start to the em after its place in the text (an advance
+/// is under an em, in any face), and the card holds more glyphs than that, so a patch that
+/// blended the card would break that bound. The share of the card the patch blends (8 of 146
+/// glyphs for the Folded card at 1524 pt in macOS's UI face, 10 of 158 at 1119 pt 1x in
+/// Windows') is the face's to say. (The bound was a sixteenth of the card, macOS's share; before
+/// that 5%, while each row printed a column of figures past its strip.)
 #[test]
 fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
@@ -1657,9 +1661,47 @@ fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
             patched <= over,
             "{at}: the beat's patch blends {patched} glyphs, the texts over its rects {over}"
         );
+        // Of the texts whose line meets a rect the beat moved, the glyphs that may reach one: the
+        // `i`th glyph lies between the text's start and the `i + 1`th em after it (a glyph's
+        // advance is under an em), granted a pixel either side for its coverage.
+        let moved: Vec<_> = out
+            .rects
+            .iter()
+            .filter(|(layer, _)| layer.moved(&was, &now))
+            .map(|&(_, rect)| rect)
+            .collect();
+        let mut glyphs = 0_u64;
+        for prim in &after {
+            let DrawPrim::Text {
+                x, baseline, s, px, ..
+            } = prim
+            else {
+                continue;
+            };
+            let (y0, y1) = (baseline - px, baseline + px);
+            let rows: Vec<_> = moved
+                .iter()
+                .filter(|&&(_, ry, _, rh)| y0 < ry + rh && y1 > ry)
+                .collect();
+            let reaches = |end: f32| {
+                rows.iter()
+                    .any(|&&(rx, _, rw, _)| x - 1.0 < rx + rw && end + 1.0 > rx)
+            };
+            glyphs += s
+                .chars()
+                .enumerate()
+                .filter(|&(i, c)| !c.is_whitespace() && reaches(x + px * (i + 1) as f32))
+                .count() as u64;
+        }
         assert!(
-            patched * 16 < whole,
-            "{at}: the beat's patch blends {patched} of the card's {whole} glyphs"
+            patched <= glyphs,
+            "{at}: the beat's patch blends {patched} glyphs, more than the {glyphs} that may reach \
+             its rects"
+        );
+        assert!(
+            glyphs < whole,
+            "CONTROL {at}: a patch that blended the card ({whole} glyphs) would blend more than \
+             the {glyphs} that may reach its rects"
         );
     }
 }
@@ -2113,8 +2155,7 @@ fn the_live_now_box_steps_through_the_heat_ramp_with_no_halo_and_patches_byte_fo
                 assert_eq!(
                     glow_strokes(prims),
                     0,
-                    "{ground} {form:?}: a {said} live now box is a plain box, no halo \
-                     (owner ruling 2026-10-26)"
+                    "{ground} {form:?}: a {said} live now box is a plain box, no halo"
                 );
             }
 

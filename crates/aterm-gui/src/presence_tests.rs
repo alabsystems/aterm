@@ -1,0 +1,1925 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+
+fn t0() -> Instant {
+    Instant::now()
+}
+
+/// REVIEW FINDING (2026-11-03): at 20 columns Claude Code's `Claude in Chrome` intro (51
+/// rows) is taller than the live zone ([`CLASSIFY_ROWS`]), whose rows hold neither its rule
+/// nor its title, so a pane tall enough to show it whole published no prompt. Its cut read
+/// sends the verdict to the whole screen, which reads it whole.
+#[test]
+fn a_chrome_intro_taller_than_the_live_zone_is_read_on_the_whole_screen() {
+    use aterm_phase::prompt::fixtures::{CHROME_INTRO_HEAD_OFF, CHROME_INTRO_INLINE, screen};
+    let mut rows = screen(CHROME_INTRO_INLINE[4].1);
+    let under = rows.len();
+    rows.resize(60, String::new());
+    assert!(
+        live_zone(&rows).len() < under,
+        "PRECONDITION: the zone cuts the intro"
+    );
+    let reader = aterm_phase::identify(Some("claude"), live_zone(&rows));
+    let (read, _) = verdict_rows(reader, &rows, Cursor::At(Some(under)));
+    assert_eq!(read.len(), rows.len(), "the whole screen is read");
+    assert!(
+        reader
+            .prompt(read)
+            .is_some_and(|p| !p.head_off_screen && p.chrome_intro_confirm().is_some()),
+        "and holds the intro whole"
+    );
+    // CONTROL: an intro the zone holds whole, under rows the zone leaves out, is read in the
+    // zone.
+    let mut wide: Vec<String> = (0..50).map(|i| format!("  earlier output {i}")).collect();
+    wide.push(String::new());
+    wide.extend(screen(CHROME_INTRO_INLINE[0].1));
+    assert!(
+        live_zone(&wide).len() < wide.len(),
+        "PRECONDITION: the zone is shorter than the screen"
+    );
+    let (read, _) = verdict_rows(reader, &wide, Cursor::Unknown);
+    assert_eq!(read.len(), live_zone(&wide).len(), "CONTROL: the zone");
+    assert!(
+        reader.prompt(read).is_some_and(|p| !p.head_off_screen),
+        "CONTROL: whole in the zone"
+    );
+    let v = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &rows,
+        Cursor::At(Some(under)),
+        "",
+        t0(),
+    );
+    assert_eq!(
+        (v.word(), v.detail()),
+        ("prompt", Some("chrome-intro".to_string()))
+    );
+    // A pane too short for it publishes the intro too, read cut.
+    let short = screen(CHROME_INTRO_HEAD_OFF[0].1);
+    let v = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &short,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(
+        (v.word(), v.detail()),
+        ("prompt", Some("chrome-intro".to_string()))
+    );
+}
+
+#[test]
+fn aterms_own_hand_is_no_row_and_its_turn_is_no_story() {
+    let now = t0();
+    let turn = |id| {
+        Some(TurnFact {
+            id,
+            settled: true,
+            dur_ms: 10,
+            carried: false,
+            aterm: false,
+            opened: None,
+        })
+    };
+    let run = |holder: String, before: Option<TurnFact>, inside: bool| {
+        let mut s = Slot::new(now);
+        s.absorb(
+            Facts {
+                turn: before,
+                ..Facts::default()
+            },
+            now,
+        );
+        let lease = Hand::DrivenLease {
+            holder,
+            pid: Some(std::process::id()),
+        };
+        let mut at = now;
+        for (hand, t) in [
+            (lease.clone(), before),
+            (
+                Hand::DrivenTurn {
+                    id: 2,
+                    holder: None,
+                },
+                if inside { turn(2) } else { before },
+            ),
+            (lease.clone(), turn(2)),
+            (Hand::None, turn(2)),
+        ] {
+            at += Duration::from_secs(1);
+            s.absorb(
+                Facts {
+                    hand,
+                    turn: t,
+                    ..Facts::default()
+                },
+                at,
+            );
+        }
+        s
+    };
+    let own = crate::harness_host::holder();
+    for inside in [false, true] {
+        let s = run(own.clone(), None, inside);
+        assert_eq!(
+            s.level(0),
+            Level::Quiet,
+            "aterm's turn read as news ({inside})"
+        );
+        assert_eq!(s.story_seq, 1, "the point is still kept (`story=`)");
+        assert_eq!(s.chip(), ChipLevel::Off, "no mark on the tab");
+    }
+    let mut held = Slot::new(now);
+    held.absorb(
+        Facts {
+            hand: Hand::DrivenLease {
+                holder: own.clone(),
+                pid: Some(std::process::id()),
+            },
+            ..Facts::default()
+        },
+        now,
+    );
+    assert_eq!(
+        held.level(0),
+        Level::Driven,
+        "`status level=` keeps the hand"
+    );
+
+    let s = run("manager".into(), None, true);
+    assert_eq!(s.level(0), Level::Story, "a manager's turn is news");
+    let s = run("aterm-harness@1".into(), None, false);
+    assert_eq!(s.level(0), Level::Story);
+
+    let s = run(own, turn(1), false);
+    assert_eq!(s.level(0), Level::Story, "the earlier turn is still news");
+    assert_eq!(
+        (s.story_seq, s.level(1)),
+        (2, Level::Quiet),
+        "the earlier turn alone is news: read up to it, aterm's own turn is none"
+    );
+}
+
+#[test]
+fn a_turn_the_harness_typed_is_no_story_without_a_refresh_inside_its_hand() {
+    let now = t0();
+    let level = |aterm: bool| {
+        let mut s = Slot::new(now);
+        s.absorb(Facts::default(), now);
+        s.absorb(
+            Facts {
+                turn: Some(TurnFact {
+                    id: 3,
+                    settled: false,
+                    dur_ms: 600,
+                    carried: false,
+                    aterm,
+                    opened: None,
+                }),
+                ..Facts::default()
+            },
+            now + Duration::from_secs(1),
+        );
+        (s.level(0), s.story_seq)
+    };
+    assert_eq!(
+        level(true),
+        (Level::Quiet, 1),
+        "the harness's turn is kept, not news"
+    );
+    assert_eq!(
+        level(false),
+        (Level::Story, 1),
+        "anyone else's turn is news"
+    );
+}
+
+/// `classify` publishes aterm-phase's verdict, its busy at a turn over under the agent's own
+/// background work as the phase that turn rests at ([`aterm_phase::background_rest`]).
+#[test]
+fn classify_is_aterm_phases_verdict_or_its_background_rest() {
+    let rows = |body: &[&str]| body.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut done_at_composer = rows(&["\u{23fa} Done.", ""]);
+    done_at_composer.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+    let screens = [
+        rows(&["\u{23fa} Which do you prefer?", ""]),
+        rows(&["\u{23fa} Done.", ""]),
+        done_at_composer,
+        rows(&[
+            "\u{23fa} Running the tests.",
+            "",
+            "\u{00b7} Cogitating\u{2026} (12s)",
+        ]),
+        rows(&[]),
+        aterm_phase::prompt::fixtures::screen(
+            aterm_phase::prompt::fixtures::WAITING_WORKFLOWS_2_1_310,
+        ),
+    ];
+    let mut words = Vec::new();
+    for screen in &screens {
+        let verdict = aterm_phase::read(Some("claude"), screen, None);
+        let (ours, _, _) = classify(
+            &aterm_phase::ClaudeReader,
+            screen,
+            Cursor::Unknown,
+            "",
+            Instant::now(),
+        );
+        let want = if verdict.phase_authoritative {
+            aterm_phase::background_rest(screen)
+                .filter(|_| verdict.phase == aterm_phase::Phase::Busy)
+                .unwrap_or(verdict.phase)
+                .name()
+        } else {
+            "unknown"
+        };
+        assert_eq!(ours.phase.word(), want, "{screen:?}");
+        assert_eq!(ours.context_pct, verdict.context_left);
+        words.push(ours.phase.word());
+    }
+    assert_eq!(
+        words,
+        ["question", "unknown", "idle", "busy", "unknown", "idle"],
+        "both halves of the mapping and the rest are exercised"
+    );
+    let (limited, _, _) = classify(
+        &aterm_phase::ClaudeReader,
+        &rows(&[
+            "\u{23fa} You've hit your weekly limit \u{00b7} resets Sep 19 at 11am (America/Los_Angeles)",
+            "",
+        ]),
+        Cursor::Unknown,
+        "",
+        Instant::now(),
+    );
+    if let AgentPhase::Wall { reset, .. } = &limited.phase {
+        assert!(
+            reset.as_deref().is_none_or(|r| !r.contains("weekly")),
+            "{reset:?}"
+        );
+    }
+}
+
+/// A Claude Code turn that ended while its own background work runs on is published at the
+/// phase it rests at, never `busy` for as long as the work runs (the cruise stall of
+/// 2026-10-24..27: a tab read `agent=busy` for 19 h over three dynamic workflows it started,
+/// its log's turn open for 70 h); a live turn over the same work stays `busy`.
+#[test]
+fn a_turn_over_under_its_own_background_work_publishes_its_rest() {
+    use aterm_phase::prompt::fixtures::{IDLE_SHELLS_2_1_271, WAITING_WORKFLOWS_2_1_310, screen};
+    let word = |rows: &[String], cursor: Option<usize>| {
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            rows,
+            Cursor::At(cursor),
+            "",
+            t0(),
+        )
+        .word()
+    };
+    let caret_of = |rows: &[String]| rows.iter().rposition(|r| r.starts_with('❯'));
+    let workflows = screen(WAITING_WORKFLOWS_2_1_310);
+    let caret = caret_of(&workflows);
+    assert!(caret.is_some(), "the composer's row");
+    assert_eq!(
+        aterm_phase::read(Some("claude"), &workflows, None).phase,
+        aterm_phase::Phase::Busy,
+        "the reader's phase stays busy for the supervisor's break"
+    );
+    assert_eq!(word(&workflows, caret), "idle", "captured 2.1.310 screen");
+    let shells = screen(IDLE_SHELLS_2_1_271);
+    let at_caret = caret_of(&shells);
+    assert_eq!(word(&shells, at_caret), "idle", "two shells left running");
+    let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
+    let at = shells.iter().position(|r| r == done).expect("the done row");
+    let mut asked = shells.clone();
+    asked[at - 2] = asked[at - 2].replace("when they notify.", "when they notify?");
+    assert_eq!(word(&asked, at_caret), "question", "its turn ended asking");
+    assert_eq!(
+        word(&asked, None),
+        "question",
+        "a question stands wherever the cursor is, as the reader's own does"
+    );
+    // NEGATIVE CONTROLS: a live turn over the same background work is busy.
+    let mut live = shells.clone();
+    live[at] = "✶ Pondering… (2m 5s · esc to interrupt)".to_string();
+    assert_eq!(word(&live, at_caret), "busy", "a live turn over two shells");
+    let (head, panel) = workflows
+        .iter()
+        .find_map(|r| {
+            r.starts_with("✻ Waiting for 3 dynamic workflows")
+                .then(|| r.split_once('│'))
+                .flatten()
+        })
+        .expect("the waiting row and its panel");
+    let mut working = workflows.clone();
+    let wait = working
+        .iter()
+        .position(|r| r.starts_with("✻ Waiting for 3"))
+        .expect("the waiting row");
+    working[wait] = format!(
+        "{:<w$}│{panel}",
+        "· Wibbling… (4m 36s · ↓ 16.4k tokens)",
+        w = head.chars().count()
+    );
+    assert_eq!(
+        word(&working, caret),
+        "busy",
+        "a live turn over three workflows"
+    );
+}
+
+/// The rest's idle stands only as the reader's own idle would: with the cursor in the
+/// composer. An agents panel holding the cursor (a key typed there goes to the panel: `x`
+/// stops the agent) or no cursor read keeps the busy the reader read, never `idle` and never a
+/// wall the turn has not ended on.
+#[test]
+fn a_rest_is_published_only_where_the_reader_would_vouch_for_it() {
+    use aterm_phase::prompt::fixtures::{
+        AGENTS_PANEL_AGENT_SELECTED_2_1_304, IDLE_SHELLS_2_1_271, WAITING_WORKFLOWS_2_1_310,
+        WRAPUP_WAITING_2_1_283, screen,
+    };
+    let word = |rows: &[String], cursor: Option<usize>| {
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            rows,
+            Cursor::At(cursor),
+            "",
+            t0(),
+        )
+        .word()
+    };
+    let panel = screen(AGENTS_PANEL_AGENT_SELECTED_2_1_304);
+    assert_eq!(
+        aterm_phase::read(Some("claude"), &panel, None).phase,
+        aterm_phase::Phase::Busy
+    );
+    assert_eq!(
+        aterm_phase::background_rest(&panel),
+        Some(aterm_phase::Phase::Idle),
+        "its turn is over under a background agent"
+    );
+    let selected = panel
+        .iter()
+        .position(|r| r.starts_with("❯ ◯ general-purpose"))
+        .expect("the selected agent row");
+    let composer = panel
+        .iter()
+        .position(|r| r.trim_end() == "❯")
+        .expect("the composer's caret row");
+    assert!(composer < selected);
+    assert_eq!(
+        word(&panel, Some(selected)),
+        "busy",
+        "the panel holds the cursor"
+    );
+    assert_eq!(word(&panel, None), "busy", "no cursor read");
+    assert_eq!(
+        word(&panel, Some(composer)),
+        "idle",
+        "CONTROL: the composer holds it"
+    );
+    for text in [WAITING_WORKFLOWS_2_1_310, IDLE_SHELLS_2_1_271] {
+        let rows = screen(text);
+        assert_eq!(word(&rows, None), "busy", "no cursor read");
+    }
+    // A limit's notice drawn while the turn wraps up is no wall yet, and no rest.
+    let wrapup = screen(WRAPUP_WAITING_2_1_283);
+    let caret = wrapup.iter().rposition(|r| r.starts_with('❯'));
+    assert_eq!(word(&wrapup, caret), "busy");
+}
+
+/// A `/goal` runs on through its wait, its mark run into the update hint's row as Claude Code
+/// 2.1.283 draws it (`✔ Update installed · Restart to update◎ /goal active (1d)`): the
+/// measured wrap-up screen with its limit notice gone, the cursor in the composer, publishes
+/// `busy`, never the rest's `idle`. CONTROL: with its goal mark gone too, `idle`.
+#[test]
+fn a_goal_run_into_the_update_hint_publishes_no_rest() {
+    use aterm_phase::prompt::fixtures::{WRAPUP_WAITING_2_1_283, screen};
+    let word = |rows: &[String]| {
+        let caret = rows.iter().rposition(|r| r.starts_with('❯'));
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            rows,
+            Cursor::At(caret),
+            "",
+            t0(),
+        )
+        .word()
+    };
+    let unnoticed: Vec<String> = screen(WRAPUP_WAITING_2_1_283)
+        .into_iter()
+        .filter(|r| !r.contains("Usage limit reached"))
+        .collect();
+    assert_eq!(word(&unnoticed), "busy", "its goal runs on");
+    let hint = "✔ Update installed · Restart to update";
+    let goalless: Vec<String> = unnoticed
+        .iter()
+        .map(|r| match r.split_once(hint) {
+            Some((lead, _)) => format!("{lead}{hint}"),
+            None => r.clone(),
+        })
+        .collect();
+    assert_ne!(goalless, unnoticed, "the goal mark is cut");
+    assert_eq!(
+        word(&goalless),
+        "idle",
+        "CONTROL: the goal mark is what keeps it busy"
+    );
+}
+
+/// The live Claude Code 2.1.316 session this fix was measured on (2026-10-31, aterm 0.147.0
+/// publishing `agent=busy` for 30 minutes over its rest): with the cursor where it was
+/// captured, row 47 column 2, its turn over under two background agents and three dynamic
+/// workflows publishes `idle`, and the live turn it ran 17 minutes earlier, with the cursor
+/// on its empty composer, publishes `busy`.
+#[test]
+fn the_live_2_1_316_sessions_rest_publishes_idle_and_its_live_turn_busy() {
+    use aterm_phase::prompt::fixtures::{
+        INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316, screen,
+    };
+    let word = |rows: &[String], cursor: Option<usize>| {
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            rows,
+            Cursor::At(cursor),
+            "",
+            t0(),
+        )
+        .word()
+    };
+    let rest = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+    assert_eq!(
+        aterm_phase::read(Some("claude"), &rest, Some(2)).phase,
+        aterm_phase::Phase::Busy,
+        "the reader's phase stays busy for the supervisor's break"
+    );
+    assert_eq!(word(&rest, Some(47)), "idle", "the captured cursor");
+    assert_eq!(word(&rest, None), "busy", "no cursor read");
+    let live = screen(INFERRING_OVER_BACKGROUND_2_1_316);
+    let caret = live.iter().rposition(|r| r.starts_with('❯'));
+    assert!(caret.is_some(), "the composer's row");
+    assert_eq!(word(&live, caret), "busy", "a live turn");
+    for title in ["◐ Claude Code", "◑ Claude Code"] {
+        let titled = |rows: &[String], cursor: Option<usize>| {
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(cursor),
+                title,
+                t0(),
+            )
+            .word()
+        };
+        assert_eq!(
+            titled(&rest, Some(47)),
+            "idle",
+            "{title}: the title runs for the handed-off work, not for a turn"
+        );
+        assert_eq!(titled(&live, caret), "busy", "{title}: a live turn");
+    }
+}
+
+/// The window title beside the rows (ATERM-KI-1027-3): Claude Code 2.1.311 draws its reply
+/// under a status line with no busy sign on the screen, so its running title (`◐`/`◑`) is
+/// what reads it busy; a title at rest, one with no glyph and none at all read the screen
+/// alone, and the finished reply's done row stands under a running title.
+#[test]
+fn a_reply_under_a_status_line_reads_busy_by_its_running_title() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let word = |rows: &[String], title: &str| {
+        let caret = rows.iter().rposition(|r| r.starts_with('❯'));
+        assert!(caret.is_some(), "the composer's row");
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            rows,
+            Cursor::At(caret),
+            title,
+            t0(),
+        )
+        .word()
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    for title in ["◐ Claude Code", "◑ Claude Code"] {
+        assert_eq!(word(&mid, title), "busy", "{title}: mid-reply");
+        assert_eq!(word(&done, title), "idle", "{title}: its done row");
+    }
+    for title in ["✳ Claude Code", "Claude Code", ""] {
+        assert_eq!(word(&mid, title), "idle", "{title:?}: the screen alone");
+    }
+}
+
+/// A shell pill under a reply its title runs is the live turn, not a turn that rests beside
+/// the agent's own background work: the rest is read beside the title
+/// ([`aterm_phase::ScreenReader::background_rest_seen`]), so the word stays busy, and the
+/// same screen with no title running publishes the rest.
+#[test]
+fn a_shell_pill_under_a_running_title_publishes_no_rest() {
+    use aterm_phase::ScreenReader as _;
+    use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen};
+    let mut shells = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let footer = shells
+        .iter_mut()
+        .find(|r| r.contains("(shift+tab to cycle)"))
+        .expect("the footer");
+    *footer = footer.replace("(shift+tab to cycle)", "(shift+tab to cycle) · 2 shells");
+    assert_eq!(
+        aterm_phase::ClaudeReader.background_rest(&shells),
+        Some(aterm_phase::Phase::Idle),
+        "the screen alone: a turn over under a shell"
+    );
+    let caret = shells.iter().rposition(|r| r.starts_with('❯'));
+    let word = |title: &str| {
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &shells,
+            Cursor::At(caret),
+            title,
+            t0(),
+        )
+        .word()
+    };
+    assert_eq!(word(""), "idle", "CONTROL: no title publishes the rest");
+    for title in ["◐ Claude Code", "◑ Claude Code"] {
+        assert_eq!(word(title), "busy", "{title}");
+    }
+}
+
+#[test]
+fn kimi_composer_status_distinguishes_empty_draft_and_no_composer() {
+    use aterm_messages::presence::ComposerState;
+    use aterm_phase::kimi::fixtures::{BOX_SHELL_240, DRAFT, IDLE};
+    use aterm_phase::prompt::fixtures::screen;
+
+    for (fixture, want) in [
+        (IDLE, ComposerState::Empty),
+        (DRAFT, ComposerState::Draft),
+        (BOX_SHELL_240, ComposerState::Unknown),
+    ] {
+        let (reading, _, _) = classify(
+            &aterm_phase::KimiReader,
+            &screen(fixture),
+            Cursor::Unknown,
+            "",
+            Instant::now(),
+        );
+        assert_eq!(reading.composer, want);
+    }
+}
+
+#[test]
+fn a_reader_panic_degrades_the_verdict_to_unknown_and_the_thread_lives() {
+    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_RM);
+    let boom = || -> AgentVerdict { panic!("stand-in reader panic") };
+    let unknown = |v: &AgentVerdict| {
+        matches!(
+            v,
+            AgentVerdict::Agent {
+                reading: AgentReading {
+                    phase: AgentPhase::Unknown,
+                    context_pct: None,
+                    composer: aterm_messages::presence::ComposerState::Unknown,
+                },
+                by_frame: false,
+                subject: None,
+                ..
+            }
+        )
+    };
+    let claude = fenced_verdict(9_001, Some("claude"), false, None, &rows, boom);
+    assert!(unknown(&claude), "{claude:?}");
+    assert_eq!(claude.program(), Some(aterm_phase::Program::Claude));
+    assert_eq!(claude.word(), "unknown");
+    let codex = fenced_verdict(9_001, Some("codex"), false, None, &rows, boom);
+    assert_eq!(codex.program(), Some(aterm_phase::Program::Codex));
+    assert!(unknown(&codex), "{codex:?}");
+    let node = fenced_verdict(
+        9_001,
+        Some("node"),
+        false,
+        Some(aterm_phase::Program::Claude),
+        &rows,
+        boom,
+    );
+    assert!(unknown(&node), "{node:?}");
+    let codex_job = fenced_verdict(
+        9_001,
+        None,
+        false,
+        Some(aterm_phase::Program::Codex),
+        &rows,
+        boom,
+    );
+    assert!(unknown(&codex_job));
+    assert_eq!(codex_job.program(), Some(aterm_phase::Program::Codex));
+    let claude = Some(aterm_phase::Program::Claude);
+    for (program, pending, known) in [
+        (Some("node"), false, None),
+        (None, false, None),
+        (None, true, claude),
+        (Some("zsh"), false, claude),
+    ] {
+        let v = fenced_verdict(9_001, program, pending, known, &rows, boom);
+        assert_eq!(v, AgentVerdict::NotAgent, "{program:?} {pending} {known:?}");
+    }
+    let guarded = agent_verdict_guarded(
+        9_001,
+        Some("claude"),
+        false,
+        None,
+        &rows,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    let plain = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &rows,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(guarded, plain);
+    assert_eq!(guarded.word(), "prompt");
+    assert!(guarded.subject().is_some());
+}
+
+#[test]
+fn a_wall_is_published_by_kind() {
+    use aterm_phase::prompt::fixtures::{
+        END_529, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, screen,
+    };
+    let framed = |body: &[&str]| {
+        let mut r: Vec<String> = body.iter().map(|s| s.to_string()).collect();
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    let full: Vec<String> = IDLE_AFTER_LIMIT_AND_MODEL_SWITCH
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut fable = full[..56].to_vec();
+    fable.extend_from_slice(&full[58..]);
+    let context = framed(&[
+        "\u{23fa} Reading the remaining modules.",
+        "  \u{23bf}  Context limit reached \u{00b7} /compact or /clear to continue",
+        "",
+    ]);
+    let quoted = framed(&[
+        "\u{23fa} Bash(tail -1 build.log)",
+        "  \u{23bf}  API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+        "",
+    ]);
+    let cases: [(&str, Vec<String>, &str); 5] = [
+        ("529", screen(END_529), "wall:overloaded"),
+        ("session", screen(END_SESSION_LIMIT), "wall:usage-session"),
+        ("fable", fable, "wall:model-bucket"),
+        ("context", context, "wall:context"),
+        ("quoted 529", quoted, "idle"),
+    ];
+    for (name, rows, want) in &cases {
+        let v = agent_verdict(Some("claude"), false, None, rows, Cursor::Unknown, "", t0());
+        assert_eq!(v.word(), *want, "{name}");
+        let shell = agent_verdict(Some("zsh"), false, None, rows, Cursor::Unknown, "", t0());
+        assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
+    }
+    let session = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &cases[1].1,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(
+        session.detail().as_deref(),
+        Some("3pm (America/Los_Angeles)")
+    );
+}
+
+#[test]
+fn claude_code_is_published_idle_only_at_its_composer() {
+    use aterm_phase::prompt::fixtures::{
+        LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN, LAUNCH_REPL_READY, SHELL_MODE,
+        SHELL_MODE_DRAFT, TRUST, screen,
+    };
+    for (name, text) in [
+        ("before the REPL", LAUNCH_BEFORE_REPL),
+        ("the REPL half drawn", LAUNCH_REPL_HALF_DRAWN),
+    ] {
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(text),
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
+        assert_eq!(v.word(), "unknown", "{name}: {v:?}");
+        assert_eq!(v.program(), Some(aterm_phase::Program::Claude), "{name}");
+        let shell = agent_verdict(
+            Some("zsh"),
+            false,
+            None,
+            &screen(text),
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
+        assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
+    }
+    let ready = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(LAUNCH_REPL_READY),
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(ready.word(), "idle", "the control: {ready:?}");
+    for (name, text) in [
+        ("shell mode", SHELL_MODE),
+        ("shell mode, a command typed", SHELL_MODE_DRAFT),
+    ] {
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(text),
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
+        assert_eq!(v.word(), "idle", "{name}: {v:?}");
+    }
+    let dialog = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(TRUST),
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(
+        (dialog.word(), dialog.detail().as_deref()),
+        ("prompt", Some("trust"))
+    );
+}
+
+#[test]
+fn an_inline_repl_at_the_top_of_a_tall_pane_is_published_idle() {
+    use aterm_phase::prompt::fixtures::{
+        INLINE_REPL_HALF_DRAWN, INLINE_REPL_READY, INLINE_TRUST, LAUNCH_BEFORE_REPL,
+        LAUNCH_REPL_READY, screen,
+    };
+    let pad = |text: &str, rows: usize| {
+        let mut r = screen(text);
+        r.resize(rows.max(r.len()), String::new());
+        r
+    };
+    for rows in [50, 51, 80, 200] {
+        let ready = pad(INLINE_REPL_READY, rows);
+        for program in ["claude", "node"] {
+            let v = agent_verdict(
+                Some(program),
+                false,
+                None,
+                &ready,
+                Cursor::Unknown,
+                "",
+                t0(),
+            );
+            assert_eq!(v.word(), "idle", "{program} at {rows} rows: {v:?}");
+            assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+        }
+        let shell = agent_verdict(Some("zsh"), false, None, &ready, Cursor::Unknown, "", t0());
+        assert_eq!(shell.word(), "-", "a shell is never an agent");
+        let dialog = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &pad(INLINE_TRUST, rows),
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
+        assert_eq!(
+            (dialog.word(), dialog.detail().as_deref()),
+            ("prompt", Some("trust")),
+            "{rows} rows"
+        );
+        for (name, text) in [
+            ("the REPL half drawn", INLINE_REPL_HALF_DRAWN),
+            ("the shell's rows", LAUNCH_BEFORE_REPL),
+        ] {
+            let v = agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &pad(text, rows),
+                Cursor::Unknown,
+                "",
+                t0(),
+            );
+            assert_eq!(v.word(), "unknown", "{name} at {rows} rows: {v:?}");
+        }
+    }
+    let full = screen(LAUNCH_REPL_READY);
+    assert_eq!(full.len(), 50);
+    let v = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &full,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(v.word(), "idle", "the fullscreen REPL: {v:?}");
+}
+
+#[test]
+fn a_relaunched_inline_repl_is_published_idle_only_at_the_box_that_holds_the_cursor() {
+    use aterm_phase::prompt::fixtures::{
+        INLINE_RELAUNCH_BEFORE_REPL, INLINE_RELAUNCH_REPL_HALF_DRAWN, INLINE_RELAUNCH_REPL_READY,
+        INLINE_RELAUNCH_TRUST, cursor, screen,
+    };
+    let at = |text: &str| Cursor::At(cursor(text).map(|(row, _)| row));
+    let stale = screen(INLINE_RELAUNCH_BEFORE_REPL);
+    let v = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &stale,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(v.word(), "idle", "RED: the old box by its frame alone");
+    for rows in [50, 80] {
+        let pad = |text: &str| {
+            let mut r = screen(text);
+            r.resize(rows, String::new());
+            r
+        };
+        for (name, text, word, detail) in [
+            (
+                "before the new REPL",
+                INLINE_RELAUNCH_BEFORE_REPL,
+                "unknown",
+                None,
+            ),
+            ("the dialog", INLINE_RELAUNCH_TRUST, "prompt", Some("trust")),
+            (
+                "the new REPL half drawn",
+                INLINE_RELAUNCH_REPL_HALF_DRAWN,
+                "unknown",
+                None,
+            ),
+            ("the new REPL", INLINE_RELAUNCH_REPL_READY, "idle", None),
+        ] {
+            let v = agent_verdict(Some("claude"), false, None, &pad(text), at(text), "", t0());
+            assert_eq!(
+                (v.word(), v.detail().as_deref()),
+                (word, detail),
+                "{name} at {rows} rows: {v:?}"
+            );
+            assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+        }
+    }
+    let ready = screen(INLINE_RELAUNCH_REPL_READY);
+    let (caret, _) = cursor(INLINE_RELAUNCH_REPL_READY).expect("measured");
+    let bottom = (caret..ready.len())
+        .find(|&i| ready[i].starts_with('─'))
+        .expect("the new bottom rule");
+    let old_caret = ready
+        .iter()
+        .position(|r| r.starts_with('❯'))
+        .expect("the old caret");
+    assert!(old_caret < caret, "the old box is above the new one");
+    for (name, cursor, word) in [
+        ("on the new caret", Cursor::At(Some(caret)), "idle"),
+        ("on the new bottom rule", Cursor::At(Some(bottom)), "idle"),
+        ("under the new box", Cursor::At(Some(bottom + 1)), "unknown"),
+        ("on no row read", Cursor::At(None), "unknown"),
+        ("in the old box", Cursor::At(Some(old_caret)), "idle"),
+    ] {
+        let v = agent_verdict(Some("claude"), false, None, &ready, cursor, "", t0());
+        assert_eq!(v.word(), word, "the cursor {name}: {v:?}");
+    }
+}
+
+#[test]
+fn the_memory_banner_publishes_wall_memory_under_a_busy_spinner() {
+    use aterm_phase::prompt::fixtures::composer;
+    let banner = format!(
+        "{} (140.4GB) \u{2014} restart and resume with claude --continue",
+        aterm_phase::anchor!("wall.memory"),
+    );
+    let screen = |banner_row: &str, draft: &str| {
+        let mut r = vec![
+            "\u{23fa} Running the reflow suite.".to_string(),
+            String::new(),
+            "\u{00b7} Gesticulating\u{2026} (36m 1s)".to_string(),
+            banner_row.to_string(),
+        ];
+        let mut frame =
+            composer("  \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt");
+        frame[1] = format!("\u{276f} {draft}");
+        r.extend(frame);
+        r
+    };
+    let live = screen(&format!("{banner:>118}"), "");
+    let v = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &live,
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(v.word(), "wall:memory");
+    assert_eq!(v.detail(), None);
+    assert!(!aterm_phase::WallKind::Memory.reads_limited());
+    let quoted = screen("", &banner);
+    assert_eq!(
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &quoted,
+            Cursor::Unknown,
+            "",
+            t0()
+        )
+        .word(),
+        "busy",
+        "the draft's quote"
+    );
+    assert_eq!(
+        agent_verdict(Some("zsh"), false, None, &live, Cursor::Unknown, "", t0()).word(),
+        "-"
+    );
+}
+
+#[test]
+fn a_reading_without_evidence_is_unknown_not_idle() {
+    use aterm_phase::prompt::fixtures::{TRUST, screen};
+    let idle = screen("\u{203a} ready\n\n  gpt-5 \u{00b7} 100% context left\n");
+    let gate = screen(
+        "  Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, \
+         quit\n\n  Press enter to continue\n",
+    );
+    for rows in [idle, gate] {
+        match agent_verdict(Some("codex"), false, None, &rows, Cursor::Unknown, "", t0()) {
+            AgentVerdict::Agent { reading, .. } => {
+                assert_eq!(reading.phase, AgentPhase::Unknown);
+                assert_eq!(reading.phase.word(), "unknown");
+            }
+            AgentVerdict::NotAgent => panic!("codex is an agent by name"),
+        }
+    }
+    let claude = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(TRUST),
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(claude.word(), "prompt", "the control");
+}
+
+#[test]
+fn the_prompt_subject_comes_from_the_reading() {
+    use aterm_phase::prompt::fixtures::{BOX_RM, END_529, screen};
+    let rm = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(BOX_RM),
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(rm.word(), "prompt");
+    let subject = rm.subject().expect("the rm box names its command");
+    assert!(subject.contains("rm"), "{subject}");
+    assert!(!subject.contains('\n'));
+    let wall = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(END_529),
+        Cursor::Unknown,
+        "",
+        t0(),
+    );
+    assert_eq!(wall.subject(), None);
+}
+
+#[test]
+fn an_api_wall_says_its_cause() {
+    use aterm_phase::prompt::fixtures::{
+        API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_SLEEP, screen,
+    };
+    use aterm_phase::{ApiCause, WallKind};
+    let wall = |cause| AgentPhase::Wall {
+        kind: WallKind::ApiError {
+            code: None,
+            retryable: cause != ApiCause::Config,
+            cause,
+        },
+        reset: None,
+        until: None,
+    };
+    for cause in [
+        ApiCause::Unreachable,
+        ApiCause::CutOff,
+        ApiCause::Config,
+        ApiCause::Request,
+        ApiCause::Overlong,
+        ApiCause::Server,
+    ] {
+        assert_eq!(wall(cause).word(), "wall:api-error", "{cause:?}");
+    }
+    let now = t0();
+    let out = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(API_ERROR_ENOTFOUND),
+        Cursor::Unknown,
+        "",
+        now,
+    );
+    assert_eq!(out.word(), "wall:api-error");
+    assert_eq!(out.subject(), Some(API_UNREACHABLE));
+    let cut = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(API_ERROR_SLEEP),
+        Cursor::Unknown,
+        "",
+        now,
+    );
+    assert_eq!(cut.subject(), Some(API_CUT_OFF));
+    let overloaded = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &screen(API_ERROR_529),
+        Cursor::Unknown,
+        "",
+        now,
+    );
+    assert_eq!(overloaded.word(), "wall:overloaded");
+    assert_eq!(overloaded.subject(), None);
+}
+
+#[test]
+fn retry_plan_clock_handles_the_entire_timestamp_range() {
+    for (at, offset, expected) in [
+        (i64::MAX, 3600, "16:30"),
+        (i64::MIN, -3600, "07:29"),
+        (i64::MAX, i64::MAX, "07:00"),
+        (i64::MIN, i64::MAX, "23:59"),
+    ] {
+        let plan = RetryPlan::with_offset(at, Some(offset));
+        assert_eq!(plan.at_unix, at);
+        assert_eq!(plan.clock.as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn retry_plan_ordering_survives_extreme_timestamp_differences() {
+    let agent = AgentReading {
+        phase: AgentPhase::Wall {
+            kind: aterm_phase::WallKind::Overloaded,
+            reset: None,
+            until: None,
+        },
+        context_pct: Some(40),
+        composer: aterm_messages::presence::ComposerState::Unknown,
+    };
+    let now = t0();
+    let past = RetryPlan::with_offset(i64::MIN, Some(0));
+    assert_eq!(
+        with_retry_plan(Some(agent.clone()), Some(&past), i64::MAX, now),
+        Some(agent.clone())
+    );
+    let future = RetryPlan::with_offset(i64::MAX, Some(0));
+    let got = with_retry_plan(Some(agent), Some(&future), i64::MIN, now).unwrap();
+    let AgentPhase::Wall { reset, until, .. } = got.phase else {
+        panic!("still a wall");
+    };
+    assert_eq!(reset, future.clock);
+    assert!(until.is_none(), "the monotonic deadline is unrepresentable");
+    assert_eq!(got.context_pct, Some(40));
+}
+
+#[test]
+fn a_retry_plan_is_laid_on_an_api_wall_and_nothing_else() {
+    use aterm_phase::{ApiCause, WallKind};
+    const NOW_UNIX: i64 = 1_789_660_500;
+    const PDT: i64 = -7 * 3600;
+    let now = t0();
+    let wall = |kind: WallKind, reset: Option<&str>| {
+        Some(AgentReading {
+            phase: AgentPhase::Wall {
+                kind,
+                reset: reset.map(str::to_string),
+                until: None,
+            },
+            context_pct: Some(40),
+            composer: aterm_messages::presence::ComposerState::Unknown,
+        })
+    };
+    let unreachable = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Unreachable,
+    };
+    let lay = |agent: Option<AgentReading>, at: Option<i64>, zone: Option<i64>| {
+        let plan = at.map(|at| RetryPlan::with_offset(at, zone));
+        with_retry_plan(agent, plan.as_ref(), NOW_UNIX, now)
+    };
+    let got = lay(wall(unreachable, None), Some(NOW_UNIX + 180), Some(PDT)).unwrap();
+    assert_eq!(got.context_pct, Some(40), "nothing else moves");
+    let AgentPhase::Wall { kind, reset, until } = got.phase else {
+        panic!("still a wall");
+    };
+    assert_eq!(kind, unreachable, "the wall's kind is the screen's");
+    assert_eq!(reset.as_deref(), Some("08:58"));
+    assert_eq!(until, now.checked_add(Duration::from_secs(180)));
+    let got = lay(
+        wall(unreachable, None),
+        Some(NOW_UNIX + 180),
+        Some(PDT + 3600),
+    )
+    .unwrap();
+    let AgentPhase::Wall { reset, .. } = got.phase else {
+        panic!("still a wall");
+    };
+    assert_eq!(reset.as_deref(), Some("09:58"));
+    let got = lay(wall(WallKind::Overloaded, None), Some(NOW_UNIX + 60), None).unwrap();
+    let AgentPhase::Wall { reset, until, .. } = got.phase else {
+        panic!("still a wall");
+    };
+    assert_eq!((reset, until.is_some()), (None, true));
+    let rate = WallKind::ApiError {
+        code: Some(429),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    assert!(rate.reads_limited(), "a 429 reads `limited`");
+    let got = lay(wall(rate, None), Some(NOW_UNIX + 300), Some(PDT)).unwrap();
+    let AgentPhase::Wall { reset, until, .. } = got.phase else {
+        panic!("still a wall");
+    };
+    assert_eq!(reset.as_deref(), Some("09:00"));
+    assert_eq!(until, now.checked_add(Duration::from_secs(300)));
+    for (name, agent, at) in [
+        ("past", wall(unreachable, None), Some(NOW_UNIX - 5)),
+        ("now", wall(unreachable, None), Some(NOW_UNIX)),
+        ("no plan", wall(unreachable, None), None),
+        (
+            "its own reset",
+            wall(unreachable, Some("7:30pm")),
+            Some(NOW_UNIX + 60),
+        ),
+        (
+            "a rate limit's own reset",
+            wall(rate, Some("7:30pm")),
+            Some(NOW_UNIX + 60),
+        ),
+        (
+            "a usage limit",
+            wall(WallKind::UsageSession, None),
+            Some(NOW_UNIX + 60),
+        ),
+        (
+            "not a wall",
+            Some(AgentReading {
+                phase: AgentPhase::Idle,
+                context_pct: None,
+                composer: aterm_messages::presence::ComposerState::Unknown,
+            }),
+            Some(NOW_UNIX + 60),
+        ),
+    ] {
+        assert_eq!(lay(agent.clone(), at, Some(PDT)), agent, "{name}");
+    }
+    assert_eq!(lay(None, Some(NOW_UNIX + 60), Some(PDT)), None);
+}
+
+#[test]
+fn an_api_error_far_above_the_composer_is_a_wall_in_the_verdict() {
+    use aterm_phase::prompt::fixtures::{API_ERROR_TALL_PANE_MEASURED, screen};
+    let rows = screen(API_ERROR_TALL_PANE_MEASURED);
+    let caret = Cursor::At(rows.iter().rposition(|r| r.trim() == "❯"));
+    for program in [Some("claude"), None] {
+        let v = agent_verdict(program, false, None, &rows, caret, "", t0());
+        assert_eq!(v.word(), "wall:api-error", "{program:?}");
+        assert_eq!(v.subject(), Some(API_UNREACHABLE), "{program:?}");
+    }
+}
+
+#[test]
+fn a_box_above_the_last_rows_of_a_mostly_blank_pane_is_classified() {
+    use aterm_phase::prompt::fixtures::{self as f, composer, screen};
+    let on = |rows: &[String], row: fn(&str) -> bool| {
+        Cursor::At(Some(
+            rows.iter().position(|r| row(r)).expect("the cursor's row"),
+        ))
+    };
+    let blank_foot = |rows: &[String]| {
+        rows[rows.len() - CLASSIFY_ROWS..]
+            .iter()
+            .all(String::is_empty)
+    };
+    let trust = screen(f::TRUST_FRESH_PANE);
+    assert_eq!(trust.len(), 62);
+    assert!(
+        blank_foot(&trust),
+        "the dialog is wholly above the last 40 rows"
+    );
+    assert_eq!(
+        live_zone(&trust),
+        &trust[..],
+        "21 rows of content: all of it"
+    );
+    let focus = on(&trust, |r| r == " ❯ No, exit");
+    assert_eq!(focus, Cursor::At(Some(17)), "the measured cursor");
+    for program in [Some("claude"), None] {
+        let v = agent_verdict(program, false, None, &trust, focus, "", t0());
+        assert_eq!(v.word(), "prompt", "{program:?}");
+        assert_eq!(v.detail().as_deref(), Some("trust"), "{program:?}");
+        assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+    }
+
+    let live = screen(f::BOX_RM_SUBAGENT_FRESH_PANE);
+    let mut boxed = vec![String::new()];
+    boxed.extend_from_slice(&live[22..=40]);
+    boxed.resize(62, String::new());
+    assert!(blank_foot(&boxed));
+    let focus = on(&boxed, |r| r == " ❯ 1. Yes");
+    for program in [Some("claude"), None] {
+        let v = agent_verdict(program, false, None, &boxed, focus, "", t0());
+        assert_eq!(v.word(), "prompt", "{program:?}");
+        assert_eq!(
+            v.detail().as_deref(),
+            Some("bash:not-read-only"),
+            "{program:?}"
+        );
+        assert!(
+            v.subject()
+                .is_some_and(|s| s.starts_with("cd /var/folders/")),
+            "{:?}",
+            v.subject()
+        );
+    }
+
+    let mut idle = aterm_phase::prompt::fixtures::rows(&[
+        "\u{23fa} Done.",
+        "",
+        "\u{273b} Cogitated for 4s \u{00b7} done 2:41 PM",
+        "",
+    ]);
+    idle.extend(composer("  ? for shortcuts"));
+    idle.resize(62, String::new());
+    assert!(blank_foot(&idle));
+    let caret = on(&idle, |r| r.starts_with('❯'));
+    for program in [Some("claude"), None] {
+        let v = agent_verdict(program, false, None, &idle, caret, "", t0());
+        assert_eq!(v.word(), "idle", "{program:?}");
+    }
+
+    assert_eq!(live_zone(&live), &live[41 - CLASSIFY_ROWS..]);
+    let drawn: Vec<String> = (0..62).map(|i| format!("row {i}")).collect();
+    assert_eq!(live_zone(&drawn), &drawn[62 - CLASSIFY_ROWS..]);
+    let mut full = trust.clone();
+    full[61] = "x".to_string();
+    assert!(live_zone(&full).len() > CLASSIFY_ROWS);
+    assert!(
+        live_zone(&full)
+            .iter()
+            .any(|r| r.contains("Accessing workspace"))
+    );
+    let blank = vec![String::new(); 62];
+    assert_eq!(live_zone(&blank).len(), 62);
+}
+
+#[test]
+fn relative_reset_countdown_keeps_extreme_timestamp_distances() {
+    assert_eq!(
+        countdown_at("in 18446744073709551615s", i64::MIN, 0, None),
+        Some(Duration::from_secs(u64::MAX))
+    );
+    assert_eq!(
+        countdown_at("in 9223372036854775808s", i64::MIN, 0, None),
+        Some(Duration::from_secs(1u64 << 63))
+    );
+    assert_eq!(
+        countdown_at("in 18446744073709551615s", i64::MAX, 0, None),
+        None,
+        "a reset saturated at the current instant has no countdown"
+    );
+    assert_eq!(countdown_at("in 0s", i64::MIN, 0, None), None);
+}
+
+#[test]
+fn the_countdown_is_to_the_reset_on_this_clock() {
+    let now = 1_789_812_000_i64;
+    let off = -7 * 3600;
+    let la = Some("America/Los_Angeles");
+    let at = |text: &str| countdown_at(text, now, off, la);
+    assert_eq!(at("5am"), Some(Duration::from_secs(2 * 3600)));
+    assert_eq!(at("2am"), None, "an hour ago has fallen");
+    assert_eq!(at("3am"), None, "now is no countdown");
+    assert_eq!(
+        at("Sep 21 at 11am (America/Los_Angeles)"),
+        Some(Duration::from_secs(2 * 86_400 + 8 * 3600))
+    );
+    assert_eq!(at("Sep 18 at 11am"), None, "behind us");
+    assert_eq!(at("Sep 19 at 2am"), None, "behind us today");
+    assert_eq!(at("in 45m"), Some(Duration::from_secs(45 * 60)));
+    assert_eq!(
+        at("continuing automatically at 5am"),
+        Some(Duration::from_secs(2 * 3600))
+    );
+    assert_eq!(at("5am (Etc/UTC)"), None, "another zone");
+    assert_eq!(at("soon"), None);
+    // On this machine's clock: a reset named by the wall clock two hours on. A clock change
+    // between moves how far ahead that wall clock falls, never what it reads there.
+    let now = limit::unix_now();
+    let then = now + 2 * 3600;
+    if let Some(offset) = local_offset_at(then) {
+        let tod = (then + offset).rem_euclid(86_400);
+        let text = format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
+        let ahead = countdown_to_reset(&text).expect("placeable");
+        let after = limit::unix_now();
+        assert!(ahead <= Duration::from_secs(2 * 3600), "{text}: {ahead:?}");
+        let placed = place_reset(&text, now).expect("placeable");
+        let reads = placed + local_offset_at(placed).expect("the zone reads");
+        assert_eq!(reads.rem_euclid(86_400), tod - tod % 60, "{text}");
+        // The countdown runs to that placement from the clock it read, which reads
+        // between `now` and `after`; the placement two hours on is the same from either.
+        let ahead = i64::try_from(ahead.as_secs()).expect("seconds fit");
+        assert!(
+            (placed - after..=placed - now).contains(&ahead),
+            "{text}: {ahead}s to {placed}, the clock read in [{now}, {after}]"
+        );
+    }
+    assert_eq!(countdown_to_reset("soon"), None);
+}
+
+/// Replacing the system zone changes its name as well as its offsets: a
+/// notice naming the former zone is no figure under the new one, and one
+/// naming the new zone is placed with its offsets.
+#[cfg(unix)]
+#[test]
+fn the_countdown_tracks_replacement_of_the_local_zone_link() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("localtime");
+    std::os::unix::fs::symlink("/usr/share/zoneinfo/America/Los_Angeles", &path).unwrap();
+    let now = 1_789_812_000_i64;
+    let source_offset = std::cell::Cell::new(-7 * 3600);
+    let cached_offset = std::cell::Cell::new(-7 * 3600);
+    // A reader that reads the zone again before every answer, as
+    // `aterm_uds::zone::local_offset_at` does (`tzset`, then `localtime_r`).
+    let offset_at = |_| {
+        cached_offset.set(source_offset.get());
+        Some(cached_offset.get())
+    };
+    let old = local_zone_at(&path);
+    assert_eq!(old.as_deref(), Some("America/Los_Angeles"));
+    assert_eq!(
+        countdown_in("5pm (America/Los_Angeles)", now, &offset_at, old.as_deref()),
+        Some(Duration::from_secs(14 * 3600))
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("/usr/share/zoneinfo/Etc/UTC", &path).unwrap();
+    source_offset.set(0);
+    let current = local_zone_at(&path);
+    assert_eq!(current.as_deref(), Some("Etc/UTC"));
+    assert_eq!(
+        countdown_in(
+            "5pm (Etc/UTC)",
+            now,
+            &|_| Some(cached_offset.get()),
+            current.as_deref(),
+        ),
+        Some(Duration::from_secs(14 * 3600))
+    );
+    assert_eq!(
+        countdown_in(
+            "5pm (America/Los_Angeles)",
+            now,
+            &offset_at,
+            current.as_deref(),
+        ),
+        None,
+        "the former zone's notice must not use the new zone's offset"
+    );
+    assert_eq!(
+        countdown_in("5pm (Etc/UTC)", now, &offset_at, current.as_deref()),
+        Some(Duration::from_secs(7 * 3600))
+    );
+}
+
+#[test]
+fn the_hold_reason_is_decoded_and_sanitized_on_every_surface() {
+    assert_eq!(hold_reason_words("main%20broken"), "main broken");
+    assert_eq!(
+        hold_reason_words("main%e2%80%aebroken%0a%1b[31m"),
+        "mainbroken [31m"
+    );
+    assert_eq!(hold_reason_words("-"), "-");
+    assert_eq!(
+        hold_reason_words("hold=x%20%e2%8a%98%20review"),
+        "hold=x review"
+    );
+}
+
+fn bash_box(block: &[&str]) -> Vec<String> {
+    let mut rows = vec![" Bash command".to_string(), String::new()];
+    rows.extend(block.iter().map(|r| format!("   {r}")));
+    rows.extend(
+        [
+            "",
+            " Do you want to proceed?",
+            " \u{276f} 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel \u{00b7} Tab to amend",
+        ]
+        .iter()
+        .map(|r| (*r).to_string()),
+    );
+    rows.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+    rows
+}
+
+fn detail_of(rows: &[String]) -> Option<String> {
+    match classify(&aterm_phase::ClaudeReader, rows, Cursor::Unknown, "", t0())
+        .0
+        .phase
+    {
+        AgentPhase::Prompt { detail } => detail,
+        other => panic!("not a prompt: {other:?}"),
+    }
+}
+
+#[test]
+fn a_bash_verdict_is_read_only_only_when_every_reading_is() {
+    use aterm_agent::supervise::classify::classify_command;
+    let all_read_only = |rows: &[String]| {
+        let p = aterm_phase::parse_prompt_v2(rows).expect("a box");
+        let readings = p.readings();
+        !readings.is_empty() && readings.iter().all(|r| classify_command(r).read_only)
+    };
+    let one = bash_box(&["git log --oneline -5", "Show the five most recent commits"]);
+    assert_eq!(detail_of(&one).as_deref(), Some("bash:read-only"));
+
+    let bars = bash_box(&["\u{2502} git status", "\u{2502} node scripts/migrate.js"]);
+    let p = aterm_phase::parse_prompt(&bars).expect("a box");
+    assert_eq!(p.command, "git status node scripts/migrate.js");
+    assert!(
+        classify_command(&p.command).read_only,
+        "NEGATIVE CONTROL: the flattened reading is read-only"
+    );
+    assert_eq!(detail_of(&bars).as_deref(), Some("bash:not-read-only"));
+
+    for block in [
+        &["git status &&", "rm -rf build"][..],
+        &["echo hi >", "out.txt"][..],
+        &["rm -rf build", "List the files"][..],
+    ] {
+        let rows = bash_box(block);
+        assert!(!all_read_only(&rows), "{block:?}");
+        assert_eq!(
+            detail_of(&rows).as_deref(),
+            Some("bash:not-read-only"),
+            "{block:?}"
+        );
+    }
+    let wrapped = bash_box(&["git status", "node scripts/migrate.js"]);
+    let want = if all_read_only(&wrapped) {
+        "bash:read-only"
+    } else {
+        "bash:not-read-only"
+    };
+    assert_eq!(detail_of(&wrapped).as_deref(), Some(want));
+}
+
+#[test]
+fn a_bash_verdict_is_the_read_only_rules_on_the_command_as_drawn() {
+    use aterm_agent::supervise::classify::classify_command;
+    use aterm_agent::supervise::policy::approval::readings_read_only;
+    use aterm_phase::prompt::fixtures::{
+        BOX_BASH_AWK_MULTI_LINE_2_1_308, BOX_BASH_FIND_CONTINUED_2_1_308, screen,
+    };
+    let continued = screen(BOX_BASH_FIND_CONTINUED_2_1_308);
+    let p = aterm_phase::parse_prompt_v2(&continued).expect("the box");
+    assert_eq!(p.readings().len(), 2, "{:?}", p.readings());
+    for reading in p.readings() {
+        assert!(classify_command(&reading).read_only, "{reading:?}");
+    }
+    let refused = readings_read_only(&p.readings(), &[]);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("a backslash ends a line")),
+        "{refused:?}"
+    );
+    assert_eq!(detail_of(&continued).as_deref(), Some("bash:not-read-only"));
+    let awk = screen(BOX_BASH_AWK_MULTI_LINE_2_1_308);
+    let p = aterm_phase::parse_prompt_v2(&awk).expect("the box");
+    assert_eq!(readings_read_only(&p.readings(), &[]), Ok(()));
+    assert_eq!(detail_of(&awk).as_deref(), Some("bash:read-only"));
+}
+
+#[test]
+fn a_bash_verdict_reads_the_default_python_allowlist() {
+    use aterm_agent::supervise::policy::approval::readings_read_only;
+    let rows = bash_box(&["python3 report.py"]);
+    let p = aterm_phase::parse_prompt_v2(&rows).expect("a box");
+    let refused = readings_read_only(&p.readings(), &[]);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("not on the read-only script allowlist")),
+        "{refused:?}"
+    );
+    assert_eq!(detail_of(&rows).as_deref(), Some("bash:not-read-only"));
+    assert_eq!(
+        readings_read_only(&p.readings(), &["report.py".to_string()]),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_bash_verdict_refuses_a_secret_and_a_proof_gap() {
+    use aterm_agent::supervise::classify::classify_command;
+    for line in ["cat ~/.ssh/id_rsa", "FOO=1 cat README.md"] {
+        assert!(classify_command(line).read_only, "{line}");
+        assert_eq!(
+            detail_of(&bash_box(&[line])).as_deref(),
+            Some("bash:not-read-only"),
+            "{line}"
+        );
+    }
+    for line in ["cat README.md", "grep -m 1 credentials src/"] {
+        assert_eq!(
+            detail_of(&bash_box(&[line])).as_deref(),
+            Some("bash:read-only"),
+            "{line}"
+        );
+    }
+}
+
+/// A GROK BUILD OR KIMI CODE TAB PUBLISHES WHAT ITS SCREEN DECIDES (their measured frames,
+/// `aterm_phase::grok::phase` and `aterm_phase::kimi::phase`): a running turn `busy`, a
+/// turn's end `idle`, and the walls their readers read (Grok Build's sign-in screen, its
+/// 401's failure and its weekly upsell; Kimi Code's spent quota), where every frame read
+/// `unknown` and every wall was dropped before. A card in the composer's place and Grok
+/// Build's plan approval publish `prompt` with the box's kind (and, for a command, the
+/// read-only rule's verdict; none for a Kimi Code command its box shows only part of, a
+/// fullscreen panel's body taller than its dock or squeezed under it, one a blank row splits,
+/// or one under Kimi's own `Dangerous:` row, which backspaces in it can redraw as a read).
+/// CONTROL: a shell showing those frames runs no agent.
+#[test]
+fn grok_and_kimi_tabs_publish_the_phase_and_walls_their_screens_decide() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::{WallKind, grok, kimi};
+    let verdict = |program: &str, text: &str| {
+        agent_verdict(
+            Some(program),
+            false,
+            None,
+            &screen(text),
+            Cursor::Unknown,
+            "",
+            t0(),
+        )
+    };
+    let wall_of = |v: &AgentVerdict| match v.reading().map(|r| &r.phase) {
+        Some(AgentPhase::Wall { kind, .. }) => Some(*kind),
+        _ => None,
+    };
+    for (program, text, word) in [
+        ("grok", grok::fixtures::BUSY_STREAMING, "busy"),
+        ("grok", grok::fixtures::BUSY_DRAFT, "busy"),
+        ("grok", grok::fixtures::TURN_ENDED_EMPTY, "idle"),
+        ("grok", grok::fixtures::IDLE_DRAFT, "idle"),
+        ("grok", grok::fixtures::BOX_SHELL, "prompt"),
+        ("grok", grok::fixtures::PLAN_APPROVAL, "prompt"),
+        ("kimi", kimi::fixtures::BUSY_HELD_240, "busy"),
+        ("kimi", kimi::fixtures::LIMIT_429_RETRYING_240, "busy"),
+        ("kimi", kimi::fixtures::END_OF_TURN_240, "idle"),
+        ("kimi", kimi::fixtures::BOX_SHELL_240, "prompt"),
+        ("kimi", kimi::fixtures::QUESTION_240, "prompt"),
+    ] {
+        let v = verdict(program, text);
+        assert_eq!(v.word(), word, "{program}: {v:?}");
+        assert_eq!(v.program(), aterm_phase::program_of(program), "{program}");
+        assert_eq!(
+            verdict("zsh", text).word(),
+            "-",
+            "CONTROL: {program} under a shell"
+        );
+    }
+    for (program, text, kind) in [
+        ("grok", grok::fixtures::SIGNED_OUT, WallKind::Auth),
+        ("grok", grok::fixtures::WALL_401_1_0_70, WallKind::Auth),
+        (
+            "grok",
+            grok::fixtures::UPSELL_WEEKLY_1_0_70,
+            WallKind::UsageWeekly,
+        ),
+        (
+            "kimi",
+            kimi::fixtures::LIMIT_429_FINAL_240,
+            WallKind::UsageSession,
+        ),
+    ] {
+        let v = verdict(program, text);
+        assert_eq!(wall_of(&v), Some(kind), "{program}: {v:?}");
+    }
+    assert_eq!(
+        verdict("grok", grok::fixtures::SIGNED_OUT).word(),
+        "wall:auth"
+    );
+    // Only the sign-in screen's wall names it: the machine's one Grok Build sign-in keys on it,
+    // and a 401's failure row, which runs no sign-in, carries no such subject.
+    assert_eq!(
+        verdict("grok", grok::fixtures::SIGNED_OUT).subject(),
+        Some(SIGN_IN_SCREEN)
+    );
+    assert_eq!(
+        verdict("grok", grok::fixtures::WALL_401_1_0_70).subject(),
+        None
+    );
+    let detail_of = |v: &AgentVerdict| match v.reading().map(|r| &r.phase) {
+        Some(AgentPhase::Prompt { detail }) => detail.clone(),
+        _ => None,
+    };
+    for (program, text, detail) in [
+        ("grok", grok::fixtures::BOX_SHELL, "bash:not-read-only"),
+        ("grok", grok::fixtures::PLAN_APPROVAL, "plan-exit"),
+        ("grok", grok::fixtures::QUESTION, "question"),
+        ("kimi", kimi::fixtures::BOX_SHELL_240, "bash:read-only"),
+        ("kimi", kimi::fixtures::QUESTION_240, "question"),
+        ("kimi", kimi::fixtures::BOX_EDIT_252, "edit"),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_EMPTY_LINE_252,
+            "bash:not-read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::FULLSCREEN_BOX_SHELL_252,
+            "bash:not-read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::FULLSCREEN_BOX_SHELL_OVERFLOW_252,
+            "bash",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::FULLSCREEN_BOX_SHELL_FEEDBACK_WIDE_252,
+            "bash",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::FULLSCREEN_BOX_SHELL_SQUEEZED_252,
+            "bash",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_CARRIAGE_RETURN_252,
+            "bash",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_SPACED_252,
+            "bash:not-read-only",
+        ),
+        ("kimi", kimi::fixtures::BOX_SHELL_BACKSPACED_252, "bash"),
+        // Its screen alone passes the spoof as the honest read; Kimi's record tells them
+        // apart (`kimi_record`).
+        ("kimi", kimi::fixtures::BOX_SHELL_READ_252, "bash:read-only"),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_BACKSPACED_PUSH_252,
+            "bash:read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_LONG_WORD_252,
+            "bash:not-read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_CARRIAGE_RETURN_MID_252,
+            "bash:not-read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_OPTION_SHAPED_252,
+            "bash:not-read-only",
+        ),
+        (
+            "kimi",
+            kimi::fixtures::BOX_SHELL_OPTION_SHAPED_CR_252,
+            "bash",
+        ),
+        ("kimi", kimi::fixtures::BOX_PLAN_FORGED_252, "plan-exit"),
+    ] {
+        let v = verdict(program, text);
+        assert_eq!(detail_of(&v).as_deref(), Some(detail), "{program}: {v:?}");
+    }
+    // A command's later line is judged on its own: `rm` on the `· ` row under a read-only
+    // first line makes the box not read-only. CONTROL: the first line alone is read-only.
+    let measured = "   $ echo lab-kimi-tool\n";
+    assert!(
+        kimi::fixtures::BOX_SHELL_240.contains(measured),
+        "PRECONDITION"
+    );
+    for (lines, detail) in [
+        ("   $ cat README.md\n", "bash:read-only"),
+        (
+            "   $ cat README.md\n   \u{b7} rm -rf build\n",
+            "bash:not-read-only",
+        ),
+    ] {
+        let text = kimi::fixtures::BOX_SHELL_240.replace(measured, lines);
+        let v = verdict("kimi", &text);
+        assert_eq!(detail_of(&v).as_deref(), Some(detail), "{lines:?}: {v:?}");
+    }
+}
+
+#[test]
+fn a_node_run_codex_is_named_by_no_screen() {
+    use aterm_phase::Program;
+    use aterm_phase::prompt::fixtures::{composer, rows, screen};
+    let idle = screen("\u{203a} Ask Codex to do anything\n\n  gpt-5 \u{00b7} ~/src\n");
+    assert!(
+        matches!(
+            agent_verdict(Some("node"), false, None, &idle, Cursor::Unknown, "", t0()),
+            AgentVerdict::NotAgent
+        ),
+        "a Codex composer names nothing"
+    );
+    match agent_verdict(
+        Some("node"),
+        false,
+        Some(Program::Codex),
+        &idle,
+        Cursor::Unknown,
+        "",
+        t0(),
+    ) {
+        AgentVerdict::Agent {
+            program, reading, ..
+        } => {
+            assert_eq!(program, Program::Codex);
+            assert_eq!(reading.phase, AgentPhase::Unknown);
+        }
+        AgentVerdict::NotAgent => panic!("the job's identity is kept"),
+    }
+    let mut framed = rows(&["\u{23fa} Done.", ""]);
+    framed.extend(composer("  ? for shortcuts"));
+    match agent_verdict(
+        Some("node"),
+        false,
+        None,
+        &framed,
+        Cursor::Unknown,
+        "",
+        t0(),
+    ) {
+        AgentVerdict::Agent {
+            by_frame, program, ..
+        } => assert!(by_frame && program == Program::Claude, "{program:?}"),
+        AgentVerdict::NotAgent => panic!("the control: Claude Code's frame identifies it"),
+    }
+}
+
+#[test]
+fn a_shell_showing_a_captured_claude_frame_is_not_an_agent() {
+    let mut rows = vec![
+        "\u{23fa} Should I also delete the old logs?".to_string(),
+        String::new(),
+    ];
+    rows.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+    assert!(
+        aterm_phase::phase::has_composer_frame(&rows),
+        "PRECONDITION"
+    );
+    for program in ["sh", "zsh", "cat", "less"] {
+        for known in [None, Some(aterm_phase::Program::Claude)] {
+            assert!(
+                matches!(
+                    agent_verdict(
+                        Some(program),
+                        false,
+                        known,
+                        &rows,
+                        Cursor::Unknown,
+                        "",
+                        t0()
+                    ),
+                    AgentVerdict::NotAgent
+                ),
+                "{program} (known={known:?}) is not an agent"
+            );
+        }
+    }
+    assert!(matches!(
+        agent_verdict(None, true, None, &rows, Cursor::Unknown, "", t0()),
+        AgentVerdict::NotAgent
+    ));
+    for program in [None, Some("node")] {
+        match agent_verdict(program, false, None, &rows, Cursor::Unknown, "", t0()) {
+            AgentVerdict::Agent {
+                reading, by_frame, ..
+            } => {
+                assert!(by_frame, "{program:?}");
+                assert_eq!(reading.phase, AgentPhase::Question, "{program:?}");
+            }
+            AgentVerdict::NotAgent => panic!("{program:?} is identified by its frame"),
+        }
+    }
+}
+
+/// The band's countdown places a reset with the offset that holds at the
+/// reset, not one process-wide offset: a dated reset on the far side of a
+/// daylight-saving change counts down to the real instant, read from a fixed
+/// September morning in New York to noon that December. CONTROL: the morning's
+/// offset held flat lands an hour early.
+#[cfg(unix)]
+#[test]
+fn r44_hb5_the_reset_countdown_places_a_reset_with_the_offset_that_holds_then() {
+    if !crate::test_alone::in_child() {
+        crate::test_alone::run_alone_with(&[("TZ", std::ffi::OsStr::new("America/New_York"))]);
+        return;
+    }
+    const NOW: i64 = 1_789_812_000; // 2026-09-19 06:00 EDT
+    const NOON: i64 = 1_796_144_400; // 2026-12-01 12:00 EST (17:00Z)
+    const RESET: &str = "Dec 1 at 12pm";
+    let (edt, est) = (local_offset_at(NOW), local_offset_at(NOON));
+    if edt != Some(-4 * 3600) || est != Some(-5 * 3600) {
+        aterm_spec::host::could_not_run(format!(
+            "America/New_York reads {edt:?} and {est:?} here: no zone database to read it from"
+        ));
+    }
+    assert_eq!(place_reset(RESET, NOW), Some(NOON));
+    assert_eq!(
+        countdown_in(RESET, NOW, &local_offset_at, local_zone().as_deref()),
+        Some(Duration::from_secs(u64::try_from(NOON - NOW).unwrap()))
+    );
+    assert_eq!(
+        countdown_at(RESET, NOW, -4 * 3600, None),
+        Some(Duration::from_secs(
+            u64::try_from(NOON - 3600 - NOW).unwrap()
+        )),
+        "CONTROL: one offset for the whole span"
+    );
+}

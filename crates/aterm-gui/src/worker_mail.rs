@@ -18,7 +18,10 @@
 //! bridge here, so this Mac's bus carries nothing; a peer that refuses or does not answer; a
 //! manager that is no session here and whose Mac no spawn named; a session here once the worker
 //! left this Mac's roster, which the bus carries no word from) is a record in Messages and a line
-//! in aterm's log, and nothing else happens: no mail is sent again.
+//! in aterm's log, and nothing else happens: no mail is sent again. A manager's Mac whose fleet
+//! access is Read Only takes no mail, a worker's report included (direct fleet mail is a `post`
+//! drive, which needs Read and Write there): the record says so once, and that the manager reads
+//! this worker with `await task` and `@<sid> result`, which every level keeps.
 //!
 //! What was told lives on the task record ([`Told`]), which a seamless update and a restore carry,
 //! so a need its harness tells again sends nothing, in this process or its successor. A need

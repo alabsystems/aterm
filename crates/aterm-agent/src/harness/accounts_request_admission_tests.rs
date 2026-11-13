@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use std::sync::{Arc, Mutex};
 
@@ -295,6 +305,7 @@ pub(crate) fn admission_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn queued_selection_conforms_through_local_refusal_and_repair() {
     let model = aterm_models_harness::account_queued_selection_model();
@@ -375,7 +386,7 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
             &fixture.home,
             &fixture.state,
             &fixture.path,
-            owner,
+            (owner, Gesture::Clicked),
             NOW,
             &fx,
         ));
@@ -400,6 +411,7 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replaced_queued_selection_starts_no_authentication() {
     for superseded in [false, true] {
@@ -453,6 +465,9 @@ fn queued_selection(superseded: bool) {
     assert!(fixture.store.signin_now().unwrap().is_some());
 }
 
+// Its Claude sign-in runs from a headless profile, which needs the opener only Unix links
+// (`cli::opener_link`): off Unix the attempt ends before its renewal is called.
+#[cfg(unix)]
 #[test]
 fn fallback_admission_failure_keeps_the_current_request() {
     for case in 0..5 {

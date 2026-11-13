@@ -1352,7 +1352,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     st.time_failed(&mut f, now);
     let mut step = upgrade::requested_step(&Request::None, &st.phase, &f, ready, now, &st.to);
     if f.background_point {
-        step = upgrade::break_step(step);
+        step = upgrade::break_step(step, &f);
     }
     if s["fails"] == 1
         && (upgrade::asked_for_a_move(&st.phase, ready)

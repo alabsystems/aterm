@@ -67,7 +67,8 @@ impl EntryRef<'_> {
 /// Which lister a walk uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListerChoice {
-    /// The platform's bulk lister (`getattrlistbulk`, `getdents64` + `statx`).
+    /// The platform's bulk lister (`getattrlistbulk`, `getdents64` + `statx`, the directory
+    /// index plus a by-name read on Windows, which has this one lister).
     #[default]
     Native,
     /// `readdir` + `fstatat` everywhere: the fallback, and the oracle the native arms are tested

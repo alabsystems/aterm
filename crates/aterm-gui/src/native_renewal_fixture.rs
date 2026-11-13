@@ -655,7 +655,6 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         account_services: AccountServices {
             source_registry: Arc::new(Default::default()),
             lifetime: Default::default(),
-            interactive_browser: false,
         },
         token: Arc::new(token),
         sock_dir: config.root.clone(),

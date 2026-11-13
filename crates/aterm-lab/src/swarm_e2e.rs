@@ -812,6 +812,8 @@ fn run(lab: &mut Lab) -> Result<Vec<Check>, Fail> {
         .map_err(Fail::die)?;
     for mac in ["d", "t"] {
         lab.aterm_ok(mac, &["fleet", "allow", "drive", "--all"], None)?;
+        // Each lab Mac starts Read Only: the grant alone would admit no spawn, turn or mail.
+        lab.aterm_ok(mac, &["fleet", "access", "full"], None)?;
     }
     let (d_node, t_node) = (lab.node("d")?, lab.node("t")?);
     let t_key = t_node.key().hex();
@@ -820,7 +822,7 @@ fn run(lab: &mut Lab) -> Result<Vec<Check>, Fail> {
         (keys.bound(t_node.node()) == Some(t_node.key())).then_some(())
     })?;
     lab.say(&format!(
-        "fleet formed: d ({}) minted, t ({}) joined at d; both allow drive --all",
+        "fleet formed: d ({}) minted, t ({}) joined at d; both allow drive --all at Full Access",
         d_node.node(),
         t_node.node()
     ));

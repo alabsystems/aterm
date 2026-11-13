@@ -320,6 +320,7 @@ fn native_response_journal_is_redacted_and_generic_refresh_cannot_apply_or_disca
 
 /// Exercise the actual native exchange for a caller's genuine Store-admitted artifact.
 /// The fixture owns and joins its only local HTTP provider before returning.
+#[cfg(unix)]
 pub(in crate::harness) fn native_enrollment_exchange_fixture(
     request: &crate::harness::login_drive::Request<'_>,
     cut: Option<EnrollmentCut>,
@@ -364,6 +365,7 @@ pub(in crate::harness) fn native_ordinary_exchange_fixture(
     )
 }
 
+#[cfg(unix)]
 fn native_exchange_fixture(
     home: &Path,
     destination: NativeDestination<'_>,
@@ -384,6 +386,7 @@ fn native_exchange_fixture(
     .0
 }
 
+#[cfg(unix)]
 fn native_exchange_capturing<C: CodeGrantCapture>(
     home: &Path,
     destination: NativeDestination<'_>,
@@ -2050,6 +2053,7 @@ fn identified_usage_keeps_the_request_identity_when_the_file_changes_before_the_
         now,
         Some("same@example.test"),
     )
+    .usage()
     .expect("identity-bound usage");
     server.join().unwrap();
     assert_eq!(
@@ -2138,6 +2142,7 @@ fn identified_usage_uses_the_shared_configuration_and_the_selected_auth_file() {
             None,
         ),
     )
+    .usage()
     .expect("shared route");
     server.join().unwrap();
     assert_eq!(
@@ -4788,6 +4793,96 @@ fn a_rejected_refresh_stays_unknown_and_a_nonrefreshable_login_can_be_signed_out
     }
 }
 
+/// A revoked login is signed out from its second look on. The issuer refuses the refresh token
+/// for good at the first read, which stays unknown while another program's rotation of it could
+/// still be landing; a read made once that refusal is settled ([`ROTATION_HANG`] later), with
+/// no rotation on disk and the access token refused again, reads `SignedOut` under the login's
+/// own credential context, and the refused token is never posted again.
+/// CONTROL: the same second read inside the hang stays unknown; one made after the login was
+/// replaced (another refresh token) is that login's own first look; and one the provider
+/// serves reads its usage, not a sign-out.
+#[test]
+fn a_refresh_refused_for_good_reads_signed_out_once_its_refusal_is_settled() {
+    let now = 1_790_000_000;
+    let hang = i64::try_from(ROTATION_HANG.as_secs()).unwrap();
+    for (later, replaced, served, want) in [
+        (hang, false, false, Reading::SignedOut),
+        (hang - 1, false, false, Reading::Unread),
+        (hang, true, false, Reading::Unread),
+        (hang, false, true, Reading::Unread),
+    ] {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("login");
+        hour_login(&home, now, Some("spent"));
+        let read = |at: i64, serve: bool| {
+            let (port, server) = provider(move |_, target| match target {
+                "/oauth/token" => ("400 Bad Request", json!({"error":"invalid_grant"})),
+                _ if serve => ("200 OK", json!({})),
+                _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
+            });
+            let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+            let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+            let snapshot = read_login_snapshot_confirming(
+                &home,
+                (&usage_url, &token_url),
+                aterm_spec::wait::MUST_HAPPEN,
+                at,
+                None,
+                None,
+                |stored, deadline| {
+                    confirmed_signed_out(
+                        &home,
+                        stored,
+                        (&usage_url, &token_url),
+                        (deadline, Instant::now() - Duration::from_secs(61), || {}),
+                        at,
+                        None,
+                        None,
+                    )
+                },
+            );
+            let context = CredentialContext::for_login(
+                &load_stored_auth(&home).unwrap(),
+                &usage_url,
+                &token_url,
+            );
+            (snapshot, context, provider_seen(port, server))
+        };
+        let (first, _, seen) = read(now, false);
+        assert_eq!(first.reading, Reading::Unread, "{seen:?}");
+        assert_eq!(
+            seen.iter().filter(|r| r.starts_with("POST")).count(),
+            1,
+            "the refresh is asked once: {seen:?}"
+        );
+        assert!(
+            matches!(
+                RefreshJournal::read(&home),
+                Ok(Some(RefreshJournal::Rejected { at: Some(at), .. })) if at == now
+            ),
+            "the refusal is dated"
+        );
+        if replaced {
+            hour_login(&home, now, Some("another"));
+        }
+        let (second, context, seen) = read(now + later, served);
+        assert_eq!(
+            second.reading, want,
+            "later={later} replaced={replaced} served={served}: {seen:?}"
+        );
+        assert_eq!(
+            second.context,
+            (want == Reading::SignedOut).then_some(context),
+            "a sign-out is this credential's alone"
+        );
+        assert_eq!(
+            seen.iter().filter(|r| r.starts_with("POST")).count(),
+            usize::from(replaced),
+            "a refused token is never posted again: {seen:?}"
+        );
+    }
+}
+
 /// codex-alab spent the single-use refresh token first (it takes no lock on `auth.json`): aterm's
 /// refresh is refused as reused, and the rotated login codex-alab writes is the login, not a
 /// sign-out that would end the owner's pin. The rotation lands only after aterm has read the
@@ -5939,6 +6034,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     .expect("write initial auth");
     RefreshJournal::Rejected {
         token: refresh_token_digest(concat!("reused-", "refresh")),
+        at: Some(1_790_000_000),
     }
     .write(&relogin_home)
     .expect("write rejected journal");

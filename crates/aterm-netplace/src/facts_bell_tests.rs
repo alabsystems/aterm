@@ -252,3 +252,36 @@ fn a_path_notification_wakes_the_failed_route_fallback() {
 fn a_path_notification_wakes_the_path_only_wait() {
     notified_wait(false);
 }
+
+/// A LIVE NUDGE IS LATCHED: a watched file's change told while no one waits (the keeper is
+/// reading) ends the next wait on the route socket and the bell at once, answered as a change,
+/// and is consumed by it, so the wait after that sleeps again.
+/// NEGATIVE CONTROL: a nudge that only rings the bell (`bell.ring()` without `tell`'s change
+/// flag) is hushed as a stray ring and the wait sleeps on: "the nudge ended the wait" fails at
+/// the hang detector.
+#[test]
+fn a_nudge_told_before_the_wait_ends_it_as_a_change() {
+    let sense = sense();
+    let wake = sense.stop_wake().unwrap();
+    let stop = AtomicBool::new(false);
+    let routes = aterm_uds::network::RouteChanges::open().unwrap();
+    wake.nudge();
+    let changed = wait_on_routes(
+        &sense.path,
+        &stop,
+        Duration::from_secs(60),
+        Instant::now,
+        |left| poll_both(&routes, sense.path.bell_fd(), left),
+        |held, left| sense.path.wait_reading(held, left, &stop),
+    );
+    assert!(changed, "the nudge ended the wait");
+    let again = wait_on_routes(
+        &sense.path,
+        &stop,
+        Duration::ZERO,
+        Instant::now,
+        |left| poll_both(&routes, sense.path.bell_fd(), left),
+        |held, left| sense.path.wait_reading(held, left, &stop),
+    );
+    assert!(!again, "the nudge was consumed");
+}

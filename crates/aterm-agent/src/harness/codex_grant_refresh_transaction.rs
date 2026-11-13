@@ -468,6 +468,30 @@ fn reconcile_held_with_lineage(
             .journal
             .as_ref()
             .and_then(|journal| journal.pending.as_ref().map(|pending| pending.phase));
+        if phase == Some(Phase::Rejected) {
+            let response = claimed
+                .journal
+                .as_ref()
+                .and_then(|journal| journal.pending.as_ref())
+                .and_then(|pending| pending.response.as_ref())
+                .ok_or("rejected owner response absent")?;
+            let body = response.bytes()?;
+            let Some(settled_at) = codex_app_login::owned_refresh_refusal_settled_at(
+                response.status,
+                body.as_slice(),
+                response.received_at,
+                env.now,
+            ) else {
+                // Keep the maintenance ticket paced until the same credential has outlived
+                // every permitted rotation publication. The terminal Rejected lineage no
+                // longer blocks other grants while this grant waits for that local proof.
+                return Err("refresh refusal settlement pending".into());
+            };
+            let settlement = anchor.record_settled_refusal(&witness, settled_at)?;
+            anchor.retire_catalogue(env, &settlement)?;
+            changed = true;
+            return Ok(changed);
+        }
         match phase {
             Some(Phase::Responded) => {
                 let journal = claimed.journal.as_mut().ok_or("owner journal absent")?;
@@ -557,8 +581,17 @@ fn reconcile_held_with_lineage(
                         };
                     }
                     Err(_) => {
-                        journal.pending.as_mut().expect("checked pending").phase =
-                            Phase::Quarantined;
+                        // A refusal for good issued no token, aliased grant or not: the
+                        // exchange's outcome is known, so the grant is rejected and no lineage
+                        // is in doubt (`lineage_history`). Any other answer it cannot use is
+                        // quarantined as uncertain.
+                        let refused =
+                            codex_app_login::owned_refresh_refused(response.status, raw.as_slice());
+                        journal.pending.as_mut().expect("checked pending").phase = if refused {
+                            Phase::Rejected
+                        } else {
+                            Phase::Quarantined
+                        };
                         journal.transition = JournalTransition {
                             expected: Some(witness),
                             kind: TransitionKind::Response,
@@ -720,6 +753,49 @@ pub(super) fn reconcile_retained_in_source(
     })
 }
 
+/// Terminally retain an answer that cannot be interpreted. This strengthens `Responded` into a
+/// principal-confined quarantine: any unknown successor remains fenced by the authenticated
+/// principal, while unrelated grants no longer wait. It cannot publish a token, reject a grant or
+/// send HTTP.
+fn quarantine_uncertain_response(
+    env: &Env,
+    binding: &GrantBinding,
+    anchor: &mut codex_enrollment::OwnerAnchorWriter<'_>,
+    retained: &mut Option<Box<OwnedRefreshRetention>>,
+) -> Result<bool, String> {
+    let witness = anchor.read()?.ok_or("canonical owner anchor absent")?;
+    let mut claimed = Claimed::open(env, binding, false)?.ok_or("owner journal absent")?;
+    claimed.view(&witness)?;
+    let journal = claimed.journal.as_mut().ok_or("owner journal absent")?;
+    let pending = match journal.pending.as_ref() {
+        Some(pending) if pending.phase == Phase::Responded => pending,
+        _ => return Ok(false),
+    };
+    let response = pending.response.as_ref().ok_or("owner response absent")?;
+    let body = response.bytes()?;
+    let base = journal.current.open()?;
+    let mergeable = response.received_at.is_some_and(|received| {
+        codex_app_login::merge_owned_refresh(
+            base.document.as_slice(),
+            response.status,
+            body.as_slice(),
+            received,
+        )
+        .is_ok()
+    });
+    if mergeable || codex_app_login::owned_refresh_refused(response.status, body.as_slice()) {
+        return Ok(false);
+    }
+    journal.pending.as_mut().expect("checked response").phase = Phase::Quarantined;
+    journal.transition = JournalTransition {
+        expected: Some(witness),
+        kind: TransitionKind::Response,
+    };
+    claimed = persist_owned(claimed, retained)?;
+    anchor.compare_exchange(&claimed.transition()?)?;
+    Ok(true)
+}
+
 pub(super) fn reconcile_retained_held_work(
     env: &Env,
     binding: &GrantBinding,
@@ -732,9 +808,28 @@ pub(super) fn reconcile_retained_held_work(
         .map_err(|_| OwnerRefreshError::Unavailable)?;
     #[cfg(all(test, unix))]
     super::native_usage::test_stage("maintenance_lineage_inventory");
-    let lineage = source
-        .reconcile_lineage(env, binding)
-        .map_err(|_| OwnerRefreshError::Unavailable)?;
+    let lineage = match source.reconcile_lineage(env, binding) {
+        Ok(lineage) => lineage,
+        Err(_) => {
+            let mut retained = None;
+            let result = super::super::with_maintenance_owner(env, binding, scope, |mut grant| {
+                quarantine_uncertain_response(env, binding, grant.anchor(), &mut retained).and_then(
+                    |changed| {
+                        changed
+                            .then_some(())
+                            .ok_or_else(|| "refresh lineage reconciliation pending".to_owned())
+                    },
+                )
+            });
+            if let Some(retained) = retained {
+                return Err(OwnerRefreshError::Retaining(retained));
+            }
+            source
+                .current()
+                .map_err(|_| OwnerRefreshError::Unavailable)?;
+            return result.map_err(|_| OwnerRefreshError::Unavailable);
+        }
+    };
     let mut retained = None;
     #[cfg(all(test, unix))]
     super::native_usage::test_stage("maintenance_canonical_owner");
@@ -1203,683 +1298,5 @@ pub(in crate::harness) fn fixture_promote_lineage_response(
 mod native_wait_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    fn exchange_file(env: &Env) -> std::fs::File {
-        let namespace = crate::harness::codex_source_gate::existing_namespace_for_home(
-            env.home.as_deref().unwrap(),
-        )
-        .unwrap();
-        private_file::open_private_rw(namespace.directory().unwrap(), "native-code-exchange.lock")
-            .unwrap()
-    }
-
-    #[cfg(unix)]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test the actual kernel exclusion used by native refresh"
-    )]
-    fn exchange_is_exclusive(file: &std::fs::File) -> bool {
-        match file.try_lock() {
-            Ok(()) => true,
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(std::fs::TryLockError::Error(error)) => panic!("kernel lock failed: {error}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_exchange_exclusion_precedes_owner_work_and_releases_after_completion() {
-        // Real kernel locks only; this fixture grants no credential or HTTP authority.
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let lease = RefreshWorkLease::for_env(&fixture.env).unwrap();
-        let file = exchange_file(&fixture.env);
-        assert!(!exchange_is_exclusive(&file));
-        drop(lease);
-        assert!(exchange_is_exclusive(&file));
-        let mut entered = false;
-        let result = with_refresh_work(&fixture.env, |_| {
-            entered = true;
-            Ok(())
-        });
-        assert!(matches!(result, Err(OwnerRefreshError::Unavailable)));
-        assert!(!entered, "exchange contention must precede owner work");
-        let retained = file.try_clone().unwrap();
-        // Release this test-owned probe explicitly: a forked child's duplicate
-        // must not keep our deliberate blocker held until its exec.
-        file.unlock().unwrap();
-        drop(file);
-        with_refresh_work(&fixture.env, |work| {
-            work.current().unwrap();
-            assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
-            Ok(())
-        })
-        .unwrap();
-        drop(retained);
-        assert!(exchange_is_exclusive(&exchange_file(&fixture.env)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_signin_excludes_refresh_before_owner_work() {
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let store = fixture
-            .env
-            .accounts_store_for(crate::harness::accounts::Cli::Codex)
-            .unwrap();
-        let signin = store.signin_now().unwrap().unwrap();
-        let mut entered = false;
-        let result = with_refresh_work(&fixture.env, |_| {
-            entered = true;
-            Ok(())
-        });
-        assert!(matches!(result, Err(OwnerRefreshError::Unavailable)));
-        assert!(
-            !entered,
-            "legacy sign-in must exclude refresh before owner work"
-        );
-        let publication = crate::harness::codex_source_gate::PublicationLock::for_home(
-            fixture.env.home.as_deref().unwrap(),
-        )
-        .expect("failed refresh admission must release its source lease");
-        drop(publication);
-        drop(signin);
-        with_refresh_work(&fixture.env, |work| {
-            work.current().unwrap();
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn uncertain_retention_and_continuation_keep_the_original_exchange_lease() {
-        // Force an actual encrypted-store failure. This tests custody plumbing,
-        // not a provider response or a qualified process/source census.
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let scope = lifetime.enter().unwrap();
-        let claimed = super::super::super::with_maintenance_owner(
-            &fixture.env,
-            &fixture.binding,
-            &scope,
-            |_| {
-                Claimed::open(&fixture.env, &fixture.binding, false)?.ok_or("journal absent".into())
-            },
-        )
-        .unwrap();
-        let directory = claimed.directory.clone();
-        let held_directory = directory.with_extension("retention-test-held");
-        let result = with_refresh_work::<()>(&fixture.env, |_| {
-            std::fs::rename(&directory, &held_directory).unwrap();
-            let Err(retention) = claimed.persist() else {
-                panic!("moved store must refuse the write");
-            };
-            Err(OwnerRefreshError::Retaining(retention))
-        });
-        let Err(OwnerRefreshError::Retaining(retention)) = result else {
-            panic!("uncertain write lost its owned retention");
-        };
-        assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
-        std::fs::rename(&held_directory, &directory).unwrap();
-        let continuation = retention.retry().unwrap();
-        assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
-        continuation.reconcile(&fixture.env, &scope).unwrap();
-        assert!(exchange_is_exclusive(&exchange_file(&fixture.env)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn completed_raw_retains_original_scope_through_end_and_paused_no_caller_settlement() {
-        completed_raw_after_end(false);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn explicit_hold_defers_durable_raw_without_pinning_ended_source_scope() {
-        completed_raw_after_end(true);
-    }
-
-    #[cfg(unix)]
-    fn completed_raw_after_end(held: bool) {
-        let fixture = super::super::super::maintenance_tests::fixture();
-        completed_raw_in(&fixture.env, &fixture.binding, &fixture.auth, held, false);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn global_held_raw_deferral_retires_actual_principal_and_token_resources() {
-        let fixture =
-            crate::harness::codex_enrollment::NativeRowRecoveryFixture::new(&"b".repeat(64));
-        fixture.retire_originals().unwrap();
-        let status = fixture.publish_first().unwrap();
-        assert_eq!(
-            status.phase,
-            crate::harness::codex_enrollment::Phase::Applied
-        );
-        let env = fixture.env();
-        let store = env
-            .accounts_store_for(crate::harness::accounts::Cli::Codex)
-            .unwrap();
-        let (logins, warning) = store.load_logins(env.now).unwrap();
-        assert!(warning.is_none());
-        let request = &fixture.requests()[0];
-        let binding = logins
-            .enrollment
-            .published_grant(&request.label, status.generation.unwrap())
-            .unwrap();
-        let auth = logins
-            .enrollment
-            .catalogue_staging(request)
-            .unwrap()
-            .directory
-            .join("auth.json");
-        completed_raw_in(env, &binding, &auth, true, true);
-    }
-
-    #[cfg(unix)]
-    fn completed_raw_in(env: &Env, binding: &GrantBinding, auth: &Path, held: bool, global: bool) {
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let source_use = lifetime.enter().unwrap();
-        let worker = lifetime.enter().unwrap();
-        let source_status = source_use.cancellation();
-        inject_received_response(env, binding, &source_use);
-        let claimed =
-            super::super::super::with_maintenance_owner(env, binding, &source_use, |_| {
-                Claimed::open(env, binding, false)?.ok_or("owned response missing".into())
-            })
-            .unwrap();
-        let resource_probe = global.then(|| {
-            super::super::super::response_resource_identity(
-                &binding.request,
-                &codex_app_login::renewal_identity(auth.parent().unwrap()).unwrap(),
-                &std::fs::read(auth).unwrap(),
-            )
-            .unwrap()
-        });
-        let directory = claimed.directory.clone();
-        let displaced = directory.with_extension("counted-raw-held");
-        let failed = with_refresh_work_scoped::<()>(env, &source_use, None, |work| {
-            work.provider_current().unwrap();
-            let lineage = work.reconcile_lineage(env, binding).unwrap();
-            assert_eq!(lineage.is_some(), global);
-            drop(lineage); // The Work retains the real resource claim.
-            if let Some(proof) = &resource_probe {
-                let namespace = crate::harness::codex_source_gate::existing_namespace_for_home(
-                    env.home.as_deref().unwrap(),
-                )
-                .unwrap();
-                assert!(
-                    crate::harness::native_enrollment_admission::RefreshResourceTurn::try_acquire(
-                        namespace, proof
-                    )
-                    .unwrap()
-                    .is_none()
-                );
-            }
-            std::fs::rename(&directory, &displaced).unwrap();
-            let Err(retention) = claimed.persist() else {
-                panic!("fixture write must fail");
-            };
-            Err(OwnerRefreshError::Retaining(retention))
-        });
-        let Err(OwnerRefreshError::Retaining(retention)) = failed else {
-            panic!("owned raw response was erased");
-        };
-        source_status.cancel();
-        drop(source_use);
-        assert!(
-            !source_status.retired(),
-            "End cannot retire the actual source operation while raw custody remains"
-        );
-        let pause = lifetime.pause().unwrap();
-        let pause = match pause.try_wait() {
-            Err(pause) => pause,
-            Ok(_) => panic!("raw and worker operations still count"),
-        };
-        let work = retention.work_lease.as_ref().unwrap();
-        assert!(
-            work.provider_current().is_err(),
-            "revoked source cannot mint a new provider request"
-        );
-        work.current().unwrap();
-        std::fs::rename(&displaced, &directory).unwrap();
-        let continuation = retention.retry().unwrap();
-        assert!(!source_status.retired());
-        // The caller PID/Slot is never consulted. The genuine captured source
-        // scope, rather than the worker's separate operation, counts promotion.
-        let roster = env
-            .accounts_roster_for(crate::harness::accounts::Cli::Codex)
-            .unwrap();
-        let original_roster = std::fs::read(&roster).unwrap();
-        let original_auth = std::fs::read(auth).unwrap();
-        if held {
-            let mut held_roster = crate::harness::accounts::Roster::parse_for(
-                crate::harness::accounts::Cli::Codex,
-                std::str::from_utf8(&original_roster).unwrap(),
-            )
-            .unwrap();
-            held_roster
-                .rows
-                .iter_mut()
-                .find(|row| row.label == binding.request.label)
-                .unwrap()
-                .held_by = Some("explicit-security-hold".into());
-            let held_text = held_roster
-                .rows
-                .iter()
-                .map(|row| crate::harness::accounts::row_text(row).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(&roster, held_text).unwrap();
-            assert!(matches!(
-                continuation.reconcile(env, &worker),
-                Err(OwnerRefreshError::Unavailable)
-            ));
-            assert_eq!(std::fs::read(auth).unwrap(), original_auth);
-            let store = env
-                .accounts_store_for(crate::harness::accounts::Cli::Codex)
-                .unwrap();
-            let (logins, warning) = store.load_logins(env.now).unwrap();
-            assert!(warning.is_none());
-            let witness = logins.enrollment.owner_witness(binding).unwrap().unwrap();
-            assert_eq!(witness.revision.generation, 1);
-            assert!(witness.pending.is_some());
-            let claimed = Claimed::open(env, binding, false).unwrap().unwrap();
-            assert!(matches!(
-                claimed
-                    .journal
-                    .as_ref()
-                    .unwrap()
-                    .pending
-                    .as_ref()
-                    .unwrap()
-                    .phase,
-                Phase::Responded
-            ));
-            drop(claimed);
-        } else {
-            continuation.reconcile(env, &worker).unwrap();
-        }
-        assert!(source_status.retired());
-        assert!(exchange_is_exclusive(&exchange_file(env)));
-        let publication = crate::harness::codex_source_gate::PublicationLock::for_home(
-            env.home.as_deref().unwrap(),
-        )
-        .expect("settled or durably deferred response must release source exclusion");
-        drop(publication);
-        if let Some(proof) = &resource_probe {
-            let namespace = crate::harness::codex_source_gate::existing_namespace_for_home(
-                env.home.as_deref().unwrap(),
-            )
-            .unwrap();
-            let released =
-                crate::harness::native_enrollment_admission::RefreshResourceTurn::try_acquire(
-                    namespace, proof,
-                )
-                .unwrap();
-            assert!(
-                released.is_some(),
-                "no principal/actual-token claim may outlive the retired source count"
-            );
-            drop(released);
-        }
-        assert!(worker.cancelled());
-        drop(worker);
-        assert!(pause.try_wait().is_ok());
-        if held {
-            // Explicit hold never grants delivery or cache mutation. A later
-            // actual counted maintenance operation may settle the same durable
-            // response after the hold is removed; no second HTTP send occurs.
-            std::fs::write(&roster, original_roster).unwrap();
-            let maintenance_lifetime = crate::harness::account_work::Lifetime::default();
-            let maintenance_scope = maintenance_lifetime.enter().unwrap();
-            reconcile_retained(env, binding, &maintenance_scope).unwrap();
-        }
-        let (logins, warning) = env
-            .accounts_store_for(crate::harness::accounts::Cli::Codex)
-            .unwrap()
-            .load_logins(env.now)
-            .unwrap();
-        assert!(warning.is_none());
-        assert_eq!(
-            logins
-                .enrollment
-                .owner_witness(binding)
-                .unwrap()
-                .unwrap()
-                .revision
-                .generation,
-            2
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn confirmed_received_token_alias_is_durable_without_self_pinning_source_end() {
-        let fixture =
-            crate::harness::codex_enrollment::NativeRowRecoveryFixture::new(&"b".repeat(64));
-        fixture.retire_originals().unwrap();
-        let applied_a = fixture.publish_first().unwrap();
-        let env = fixture.env();
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let scope = lifetime.enter().unwrap();
-        let (work, _) = crate::harness::codex_enrollment::owned_work(
-            fixture.requests()[1].clone(),
-            scope.clone(),
-        );
-        let applied_b = fixture.run_recovery(work).unwrap();
-        assert_eq!(
-            applied_b.phase,
-            crate::harness::codex_enrollment::Phase::Applied
-        );
-        let store = env
-            .accounts_store_for(crate::harness::accounts::Cli::Codex)
-            .unwrap();
-        let (logins, warning) = store.load_logins(env.now).unwrap();
-        assert!(warning.is_none());
-        let a = logins
-            .enrollment
-            .published_grant(&fixture.requests()[0].label, applied_a.generation.unwrap())
-            .unwrap();
-        let b = logins
-            .enrollment
-            .published_grant(&fixture.requests()[1].label, applied_b.generation.unwrap())
-            .unwrap();
-        fixture_promote_lineage_response(env, &a, &scope, "shared-actual-candidate-fixture");
-        inject_lineage_response(env, &b, &scope, None, "shared-actual-candidate-fixture");
-        let auth_b = logins
-            .enrollment
-            .catalogue_staging(&b.request)
-            .unwrap()
-            .directory
-            .join("auth.json");
-        let unchanged_b = std::fs::read(&auth_b).unwrap();
-        let ended = scope.cancellation();
-        ended.cancel();
-        assert!(matches!(
-            reconcile_retained(env, &b, &scope),
-            Err(OwnerRefreshError::Unavailable)
-        ));
-        let (after, warning) = store.load_logins(env.now).unwrap();
-        assert!(warning.is_none());
-        let witness = after.enrollment.owner_witness(&b).unwrap().unwrap();
-        assert_eq!(witness.revision.generation, 1);
-        assert!(witness.pending.is_some());
-        let claimed = Claimed::open(env, &b, false).unwrap().unwrap();
-        let journal = claimed.journal.as_ref().unwrap();
-        assert_eq!(journal.schema, 4);
-        assert!(journal.completed.is_empty());
-        let pending = journal.pending.as_ref().unwrap();
-        assert!(pending.phase == Phase::Quarantined);
-        assert!(pending.quarantine_reason == Some(QuarantineReason::KnownAlias));
-        assert!(pending.response.is_some());
-        drop(claimed);
-        assert_eq!(std::fs::read(&auth_b).unwrap(), unchanged_b);
-        drop(scope);
-        assert!(
-            ended.retired(),
-            "durable refusal must not retain the ended source's count"
-        );
-        let next_lifetime = crate::harness::account_work::Lifetime::default();
-        let next = next_lifetime.enter().unwrap();
-        for binding in [&a, &b] {
-            with_refresh_work_scoped(env, &next, None, |work| {
-                assert!(
-                    work.send_lineage(env, binding).is_err(),
-                    "neither overlapping owner may reuse the shared token"
-                );
-                Ok(())
-            })
-            .unwrap();
-        }
-        // These are synthetic received-boundary bodies with real encrypted
-        // journals/anchors/resources. No network or provider independence is
-        // inferred from this adversarial catalogue control.
-    }
-
-    fn operation() -> Operation {
-        Operation {
-            id: "a".repeat(32),
-            caller: slot::Caller {
-                sid: "s-fixture".into(),
-                pid: 123,
-                birth: 456,
-            },
-            slot: "b".repeat(64),
-            expected_digest: "c".repeat(64),
-            assignment_generation: 7,
-            source_authority: SourceAuthority::Assignment {
-                operation: "d".repeat(32),
-            },
-            credential_generation: 11,
-        }
-    }
-
-    /// Synthetic received-boundary input; real owner/anchor/journal writes.
-    /// No network, Slot, Caller admission or provider-origin proof is minted.
-    #[cfg(unix)]
-    pub(super) fn inject_received_response(
-        env: &crate::harness::cli::Env,
-        binding: &super::super::GrantBinding,
-        scope: &crate::harness::account_work::Scope,
-    ) {
-        // This generic promotion fixture models distinct issuer bundles. Alias
-        // controls use inject_lineage_response with an explicit shared token.
-        let refresh = format!("rotated-refresh-only-{}", binding.request.id);
-        inject_lineage_response(env, binding, scope, None, &refresh)
-    }
-    #[cfg(unix)]
-    pub(super) fn inject_lineage_response(
-        env: &crate::harness::cli::Env,
-        binding: &super::super::GrantBinding,
-        scope: &crate::harness::account_work::Scope,
-        operation_id: Option<String>,
-        refresh: &str,
-    ) {
-        super::super::super::with_maintenance_owner(
-            env, binding, scope, |mut grant| {
-                let mut witness = grant.anchor().read()?.ok_or("fixture witness missing")?;
-                let mut claimed = Claimed::open(env, binding, false)?
-                    .ok_or("fixture journal missing")?;
-                let current = claimed.view(&witness)?;
-                let mut original = operation();
-                if let Some(id) = operation_id { original.id = id; }
-                original.expected_digest = current.revision.digest;
-                original.credential_generation = 1;
-                let token_digest = codex_app_login::owned_refresh_token_digest(
-                    current.document.as_slice())?;
-                let journal = claimed.journal.as_mut().ok_or("fixture journal missing")?;
-                journal.pending = Some(Pending {
-                    operation: original.into(), phase: Phase::Prepared, quarantine_reason: None,
-                    base_generation: journal.current.generation,
-                    base_digest: journal.current.digest.clone(),
-                    token_digest: Some(token_digest), response: None,
-                });
-                journal.transition = JournalTransition {
-                    expected: Some(witness), kind: TransitionKind::Attempt,
-                };
-                claimed = claimed.persist().map_err(|_| "fixture reservation write failed")?;
-                grant.anchor().compare_exchange(&claimed.transition()?)?;
-                witness = grant.anchor().read()?.ok_or("fixture reservation missing")?;
-                claimed = claimed.arm_for_send(witness)
-                    .map_err(|_| "fixture attempted write failed")?;
-                grant.anchor().compare_exchange(&claimed.transition()?)?;
-                witness = grant.anchor().read()?.ok_or("fixture attempt missing")?;
-                // Inject bytes at the received-response boundary: no network
-                // function is called by this regression or by reconciliation.
-                let journal = claimed.journal.as_mut().ok_or("fixture journal missing")?;
-                let pending = journal.pending.as_mut().ok_or("fixture attempt missing")?;
-                pending.phase = Phase::Responded;
-                pending.response = Some(Response {
-                    status: 200, received_at: Some(env.now as u64),
-                    body: aterm_codec::base64::encode(&aterm_json::to_vec(&aterm_json::json!({"access_token":"fresh-access-only", "refresh_token":refresh})).map_err(|_| "fixture encoding failed")?)
-                        .map_err(|_| "fixture encoding failed")?,
-                });
-                journal.transition = JournalTransition {
-                    expected: Some(witness), kind: TransitionKind::Response,
-                };
-                claimed = claimed.persist().map_err(|_| "fixture response write failed")?;
-                grant.anchor().compare_exchange(&claimed.transition()?)?;
-                Ok(())
-            },
-        ).unwrap();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn cancelled_sender_durable_response_promotes_shared_owner_once_without_delivery() {
-        // Synthetic provider completion; all account, issuer-seal, encrypted
-        // journal and canonical generation/witness paths are real. This does
-        // not qualify OAuth or the prospective source-publication barrier.
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let scope = lifetime.enter().unwrap();
-        inject_received_response(&fixture.env, &fixture.binding, &scope);
-        scope.cancellation().cancel();
-        assert!(scope.cancelled());
-        for _ in 0..2 {
-            assert!(reconcile_retained(&fixture.env, &fixture.binding, &scope).is_ok());
-        }
-        super::super::super::with_maintenance_owner(
-            &fixture.env,
-            &fixture.binding,
-            &scope,
-            |mut grant| {
-                let witness = grant.anchor().read()?.ok_or("settled witness missing")?;
-                assert_eq!(witness.revision.generation, 2);
-                assert!(witness.pending.is_none());
-                let claimed = Claimed::open(&fixture.env, &fixture.binding, false)?
-                    .ok_or("settled journal missing")?;
-                let current = claimed.view(&witness)?;
-                assert_eq!(current.revision.generation, 2);
-                assert!(std::fs::read(&fixture.auth).unwrap() == current.document.as_slice());
-                let journal = claimed.journal.as_ref().unwrap();
-                assert!(journal.pending.is_none());
-                assert!(journal.previous_current.is_none());
-                assert_eq!(journal.completed.len(), 1);
-                assert_eq!(journal.completed[0].operation.id(), "a".repeat(32));
-                assert!(journal.completed[0].spent_token_digest.is_some());
-                Ok(())
-            },
-        )
-        .unwrap();
-        let store = fixture
-            .env
-            .accounts_store_for(crate::harness::accounts::Cli::Codex)
-            .unwrap();
-        assert!(!store.dir.join("session-slots").exists());
-        assert!(!scope.cancellation().retired());
-    }
-
-    #[test]
-    fn immutable_delivery_digest_binds_every_caller_assignment_and_request_field() {
-        let original = operation();
-        let expected = operation_digest(&original).unwrap();
-        for field in 0..8 {
-            let mut changed = original.clone();
-            match field {
-                0 => changed.id = "e".repeat(32),
-                1 => changed.caller.sid = "s-other".into(),
-                2 => changed.caller.pid += 1,
-                3 => changed.caller.birth += 1,
-                4 => changed.slot = "e".repeat(64),
-                5 => changed.expected_digest = "e".repeat(64),
-                6 => changed.assignment_generation += 1,
-                _ => {
-                    changed.source_authority = SourceAuthority::Assignment {
-                        operation: "e".repeat(32),
-                    }
-                }
-            }
-            assert_ne!(operation_digest(&changed).unwrap(), expected);
-            assert!(!same_wire_operation(&original, &changed));
-        }
-        let mut observed = original.clone();
-        observed.credential_generation += 1;
-        assert!(
-            same_wire_operation(&original, &observed),
-            "lost ACK can advance the authenticated slot fact"
-        );
-        assert_ne!(
-            operation_digest(&observed).unwrap(),
-            expected,
-            "the recorded attempt still binds its original fact"
-        );
-    }
-
-    #[test]
-    fn startup_refresh_correlation_is_distinct_from_an_assignment_intent() {
-        let mut startup = operation();
-        startup.assignment_generation = 0;
-        assert!(!startup.valid());
-        startup.source_authority = SourceAuthority::Startup {
-            nonce: "d".repeat(32),
-        };
-        assert!(startup.valid());
-        assert!(!same_wire_operation(&operation(), &startup));
-        assert_ne!(
-            operation_digest(&operation()).unwrap(),
-            operation_digest(&startup).unwrap()
-        );
-        let mut changed = startup.clone();
-        changed.source_authority = SourceAuthority::Startup {
-            nonce: "e".repeat(32),
-        };
-        assert!(!same_wire_operation(&startup, &changed));
-        changed.credential_generation = 0;
-        assert!(!changed.valid());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn missing_assignment_book_refuses_the_actual_refresh_send_for_both_source_modes() {
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let document = aterm_json::to_vec(&aterm_json::json!({
-            "auth_mode":"chatgpt","tokens":{
-                "access_token":"synthetic-source-guard-access",
-                "refresh_token":"synthetic-source-guard-refresh",
-                "account_id":"synthetic-source-guard-account",
-                "oauth_provenance":{
-                    "issuer":format!("http://{}",listener.local_addr().unwrap()),
-                    "client_id":codex_app_login::CLIENT_ID
-                }
-            }
-        }))
-        .unwrap();
-        for startup in [false, true] {
-            let mut operation = operation();
-            if startup {
-                operation.assignment_generation = 0;
-                operation.source_authority = SourceAuthority::Startup {
-                    nonce: "d".repeat(32),
-                };
-            }
-            assert!(operation.valid());
-            let mut checked = false;
-            let result = codex_app_login::exchange_owned_refresh(
-                &document,
-                crate::harness::auth_deadline::Deadline::after(aterm_spec::wait::MUST_HAPPEN),
-                || {
-                    checked = true;
-                    current_source(&fixture.env, &fixture.binding, &operation, None)
-                },
-            );
-            assert!(checked, "the real pre-send admission was reached");
-            assert!(result.is_err());
-            assert_eq!(
-                aterm_uds::accept(
-                    &listener,
-                    aterm_uds::AcceptWait::Ready,
-                    aterm_uds::AcceptedMode::Blocking,
-                )
-                .unwrap_err()
-                .kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-        }
-    }
-}
+#[path = "codex_grant_refresh_transaction_tests.rs"]
+mod tests;

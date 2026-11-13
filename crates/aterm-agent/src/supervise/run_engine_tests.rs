@@ -3892,6 +3892,16 @@ struct TestHost {
     decided: std::sync::Mutex<Vec<String>>,
     /// Each wait the loop told, in order: its `at_unix`, or `None` for a wait ended.
     told: std::sync::Mutex<Vec<Option<i64>>>,
+    /// Whether the steps are [`Self::script`]'s alone.
+    scripted: AtomicBool,
+    /// The steps a [`Self::scripted`] host takes, in order: each its line, whether it moved the
+    /// session, and whether the host owns the turn end after it. A step that leaves the turn end
+    /// to the loop asks for no further point, as the window's next look is not due at once, and
+    /// past the script a step takes nothing and the host asks for no point.
+    script: std::sync::Mutex<VecDeque<(&'static str, bool, bool)>>,
+    /// Set once a scripted step moved the session: the restart its move made, which a screen the
+    /// mock holds until then waits on ([`Mock::host_releases`]).
+    moved: Arc<AtomicBool>,
 }
 
 const HEALTHY_MIB: u64 = 450;
@@ -3903,6 +3913,28 @@ impl IdleHost for TestHost {
         n >= self.deaf_for.load(Ordering::SeqCst) && self.wants.load(Ordering::SeqCst)
     }
     fn at_idle(&self) -> Option<HostStep> {
+        if self.scripted.load(Ordering::SeqCst) {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            let mut script = self.script.lock().unwrap();
+            let next = script.pop_front();
+            let owns_after = next.is_some_and(|(_, _, owns)| owns);
+            self.wants
+                .store(!script.is_empty() && owns_after, Ordering::SeqCst);
+            let Some((line, moved, owns)) = next else {
+                self.owns.store(false, Ordering::SeqCst);
+                return None;
+            };
+            self.owns.store(owns, Ordering::SeqCst);
+            if moved {
+                self.moved.store(true, Ordering::SeqCst);
+            }
+            return Some(HostStep {
+                line: line.to_string(),
+                moved,
+                typed: None,
+                repeat: false,
+            });
+        }
         let again = self.again.load(Ordering::SeqCst) > 0;
         if again {
             self.again.fetch_sub(1, Ordering::SeqCst);
@@ -6944,6 +6976,102 @@ fn a_turn_end_the_host_let_go_is_decided_again() {
     }
 }
 
+/// A QUIET MOVE AT A TURN END ITS SETTLE HELD LEAVES CRUISE'S CONTINUATION TO THE RESUMED SCREEN,
+/// TYPED THERE ONCE. The host's first look at the turn end is a quiet settle that owns it
+/// (`upgrade step=wait:settling`), so the loop types nothing there. Its next look makes the quiet
+/// move (`upgrade step=terminated:quiet`, nothing typed); the restarted agent draws its
+/// conversation again, its turn's status line gone, and only then does the screen move on
+/// ([`Mock::host_releases`]). The loop types its continuation once, into that resumed screen,
+/// after the move.
+///
+/// NEGATIVE CONTROL: the same settle owning nothing leaves the turn end to the loop, which types
+/// its continuation at the turn end, before the move.
+#[test]
+fn a_quiet_move_at_a_held_turn_end_types_the_continuation_once_into_the_resumed_screen() {
+    let resumed = || {
+        let mut r = rows(&["⏺ Done.", "", "", ""]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    let run = |held: bool| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.scripted.store(true, Ordering::SeqCst);
+        *host.script.lock().unwrap() = VecDeque::from([
+            ("upgrade step=wait:settling", false, held),
+            ("upgrade step=terminated:quiet", true, false),
+        ]);
+        let mut m = Mock::new(vec![busy_screen(), idle_screen(), resumed(), busy_screen()]);
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.host_releases = Some((1, Arc::clone(&host.moved)));
+        m.turn_releases = Some(2);
+        let tag = if held {
+            "quiet-move-held"
+        } else {
+            "quiet-move-let-go"
+        };
+        let (jdir, journal) = journal_file(tag);
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            journal: Some(journal.clone()),
+            ..SuperviseOpts::hosted()
+        };
+        assert_eq!(
+            opts.policy.autopilot,
+            crate::supervise::config::Autopilot::Cruise
+        );
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &opts,
+            &host,
+            Stop::After(Duration::from_secs(20)),
+            Some(TurnEndTiming {
+                short_backoff: Duration::from_millis(10),
+                ..TurnEndTiming::default()
+            }),
+        );
+        assert_eq!(r, Ok(()));
+        let noted: Vec<String> = journal_records(&journal)
+            .0
+            .into_iter()
+            .map(|r| r.line)
+            .collect();
+        let _ = std::fs::remove_dir_all(&jdir);
+        (m, noted)
+    };
+    let at = |noted: &[String], what: &dyn Fn(&str) -> bool| noted.iter().position(|l| what(l));
+    let moved =
+        |l: &str| l.starts_with("HOST seq=") && l.ends_with(" upgrade step=terminated:quiet");
+    let typed = |l: &str| l.starts_with("CONTINUED seq=") || l.starts_with("TYPED seq=");
+
+    let (m, noted) = run(true);
+    assert_eq!(
+        (count(&m, "@s-1 turn"), m.turns_served.as_slice()),
+        (1, &[3][..]),
+        "one continuation, typed once the resumed screen was served: {noted:#?}\n{:#?}",
+        m.requests
+    );
+    let (move_at, typed_at) = (at(&noted, &moved), at(&noted, &typed));
+    assert!(
+        matches!((move_at, typed_at), (Some(mv), Some(ty)) if mv < ty),
+        "the move, then the continuation: {noted:#?}"
+    );
+
+    let (m, noted) = run(false);
+    assert_eq!(
+        m.turns_served.first(),
+        Some(&2),
+        "NEGATIVE CONTROL: typed at the turn end: {noted:#?}\n{:#?}",
+        m.requests
+    );
+    let (move_at, typed_at) = (at(&noted, &moved), at(&noted, &typed));
+    assert!(
+        typed_at.is_some_and(|ty| move_at.is_none_or(|mv| ty < mv)),
+        "NEGATIVE CONTROL: the continuation before the move: {noted:#?}"
+    );
+}
+
 /// What the host's looks at one point came to ([`looks_at_one_point`]).
 #[derive(Debug)]
 struct LooksAtOnePoint {
@@ -8940,12 +9068,12 @@ fn a_question_asked_a_third_time_is_answered_again_after_a_pause() {
 
 #[test]
 fn the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_earn() {
-    use crate::supervise::policy::{Answer, AnswerTarget, QuestionPriority};
+    use crate::supervise::policy::{Answer, AnswerTarget, PriorityWord, QuestionPriority};
     use aterm_phase::prompt::fixtures as f;
     const GRACE: Duration = Duration::from_secs(10);
     let text = Answer::Type {
         steps: 0,
-        text: QuestionPriority::LongTerm,
+        text: QuestionPriority::Word(PriorityWord::LongTerm),
     };
     let press = |m: &mut Mock, answer: &Answer| {
         let mut s = session(m, None);
@@ -8984,7 +9112,7 @@ fn the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_ea
         &mut m,
         &Answer::FocusEnter {
             steps: 0,
-            target: AnswerTarget::OwnText(QuestionPriority::LongTerm),
+            target: AnswerTarget::OwnText(QuestionPriority::Word(PriorityWord::LongTerm)),
         },
     ) {
         Pressing::Unconfirmed { why, .. } => {
@@ -9004,7 +9132,7 @@ fn the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_ea
             .expect("read whole");
         s.question.typed.insert(
             approval_loop::question_key(&dialog, &screen.rows),
-            QuestionPriority::LongTerm,
+            QuestionPriority::Word(PriorityWord::LongTerm),
         );
         match s
             .press_question(&text, &screen, GRACE)
@@ -9088,10 +9216,8 @@ fn the_sessions_word_decides_its_question_dialog_over_the_switch() {
     let (keys, badge) = run(true, Some("sometimes"));
     assert_eq!(keys, 0, "an unknown word types nothing");
     assert!(
-        badge.iter().any(|b| b.contains(
-            "this session's `questions` word sometimes is not one this supervisor knows"
-        )),
-        "{badge:?}"
+        badge.iter().any(|b| b.contains("sometimes")),
+        "the badge names the unknown word: {badge:?}"
     );
     assert_eq!(run(true, None).0, 1, "unset: the switch answers");
     let (keys, badge) = run(false, None);
@@ -9696,9 +9822,9 @@ fn q_projected(
         &BTreeSet<String>,
     )>,
 ) -> QRead {
-    use crate::supervise::policy::QuestionPriority;
     use crate::supervise::policy::approval::{Choice, Decision};
     use crate::supervise::policy::question::{answer_question, target_focus};
+    use crate::supervise::policy::{PriorityWord, QuestionPriority};
     use aterm_phase::{QuestionFocus, QuestionForm};
     let Some(p) = aterm_phase::parse_prompt_v2(rows) else {
         return (tabs + 1, 0, 0, 0, 0, 0, None);
@@ -9713,7 +9839,7 @@ fn q_projected(
             priority,
             d.question().is_some_and(|q| sent.contains(&q.text)),
         ),
-        None => (QuestionPriority::Recommended, false),
+        None => (QuestionPriority::Word(PriorityWord::Recommended), false),
     };
     let free = match &d.form {
         QuestionForm::Single { free_text, .. } | QuestionForm::Multi { free_text, .. } => {
@@ -14019,7 +14145,7 @@ fn a_retry_mark_whose_outage_resumed_on_a_witness_is_taken_up_and_handed_on() {
     }
 }
 
-/// A SESSION THAT WORKED UNDER A LOOP BEFORE THIS ONE IS SEEDED SO (owner ruling 2026-10-27): a
+/// A SESSION THAT WORKED UNDER A LOOP BEFORE THIS ONE IS SEEDED SO: a
 /// point row its books recorded for it, or an act typed into it, marks the policy's state
 /// ([`TurnEndState::seed_worked`]), so under Land a person's message after the restart interrupts
 /// the work, never opens the session. A turn-ran row alone (the opening turn a restart cut, no

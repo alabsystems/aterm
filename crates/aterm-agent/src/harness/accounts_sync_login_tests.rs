@@ -1873,3 +1873,40 @@ fn a_renamed_row_follows_the_default_login() {
         assert!(raw.row(renamed).is_some(), "{raw:?}");
     }
 }
+
+/// Muse Code's login store is read where a Muse Code this command started would keep it: under
+/// the command's `XDG_CONFIG_HOME`, else `~/.config` ([`super::super::profile::muse_config_home`]),
+/// as the footer and the account record read it.
+/// NEGATIVE CONTROL: with the read fixed at `~/.config/muse/auth.json`, the address under
+/// `XDG_CONFIG_HOME` is not shown: `assertion failed: xdg.credentials.contains(..)`.
+#[test]
+fn muse_codes_login_is_read_from_its_xdg_config_home() {
+    let desk = Desk::new("m30");
+    let login = |path: &Path, email: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(r#"{{"providers":{{"meta":{{"mechanism":"oauth","user_email":"{email}"}}}}}}"#),
+        )
+        .unwrap();
+    };
+    login(
+        &desk.home.join(".config/muse/auth.json"),
+        "home-muse@example.test",
+    );
+    let xdg_home = desk.home.join("xdg");
+    login(&xdg_home.join("muse/auth.json"), "xdg-muse@example.test");
+    let mut env = quiet_env(
+        &desk.home,
+        &desk.state,
+        &desk.config.join("aterm.toml"),
+        NOW,
+    );
+    let plain = local_shows(&env, &read_local_source_text);
+    assert!(plain.credentials.contains("home-muse@example.test"));
+    assert!(!plain.credentials.contains("xdg-muse@example.test"));
+    env.xdg_config_home = Some(xdg_home.display().to_string());
+    let xdg = local_shows(&env, &read_local_source_text);
+    assert!(xdg.credentials.contains("xdg-muse@example.test"));
+    assert!(!xdg.credentials.contains("home-muse@example.test"));
+}

@@ -204,6 +204,60 @@ pub fn book_facts(spool: &Spool, now: u64) -> BookFacts {
     book::Book::load(spool).facts(now)
 }
 
+/// The sign-in word two folds hold of one account after what `spool` took in
+/// ([`fold_signin_for_test`]).
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedSignIn {
+    /// This Mac's book: what its `use` row and its metrics quota row state.
+    pub book: Option<&'static str>,
+    /// A peer that holds this Mac's events and not yet the `use` row that follows them.
+    pub peer_events: Option<&'static str>,
+    /// A peer that holds the events and the `use` row.
+    pub peer: Option<&'static str>,
+}
+
+/// Test seam for the harness's side (`crates/aterm`, which links both): run the local half of two
+/// flusher passes over `spool` at `now` (the first takes the spool, the second absorbs it) (the spool's lines merged into the outbox and folded into
+/// the book, as [`run`] does before it reads a table) and say which sign-in word of `account`
+/// each fold ends on: this Mac's book, and a peer's reading of what this Mac would publish (the
+/// outbox as an `ev` batch, with and without the book's `use` row), through the folds
+/// themselves ([`book::Book::fold`], [`seen::Seen`]).
+///
+/// # Errors
+/// The spool, outbox or book cannot be read or written, or a `use` row cannot be built.
+#[cfg(any(test, debug_assertions))]
+pub fn fold_signin_for_test(spool: &Spool, account: &Pk, now: u64) -> crate::Result<FoldedSignIn> {
+    const PEER: &str = "00000000000000000000000000000001";
+    // A pass absorbs the file the pass before it took: the second takes in what was spooled.
+    flush::take_in(spool, false, now)?;
+    let (book, outbox) = flush::take_in(spool, false, now)?;
+    let mut uses = Vec::new();
+    for (pk, facts) in &book.accounts {
+        if pk.as_str().starts_with("ac-") {
+            let row = facts.use_row(1, now / book::WEEK, now, caps::USE_ROW)?;
+            uses.push((*pk, row));
+        }
+    }
+    let read = |uses: &[(Pk, aterm_json::Value)]| {
+        seen::Seen::of_published(PEER, &outbox, uses, now)
+            .signins
+            .get(account.as_str())
+            .and_then(|by_mac| by_mac.get(PEER))
+            .map(|signed| signed.state)
+    };
+    Ok(FoldedSignIn {
+        book: book
+            .facts(now)
+            .accounts
+            .get(account)
+            .and_then(|facts| facts.signin)
+            .map(|(state, _)| state),
+        peer_events: read(&[]),
+        peer: read(&uses),
+    })
+}
+
 /// What the `aterm.toml` at `config` says of the journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Setting {

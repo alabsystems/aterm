@@ -452,7 +452,7 @@ fn a_capture_shades_the_sky_where_the_pet_is_drawn() {
     fn pet_app() -> App {
         let mut app = App::headless_for_test();
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.config.cursor_trail_style = Some("rainbow".into());
         app.config.motion = Some("full".into());
         app.windows.get_mut(&WindowId(0)).expect("window").focused = true;
         app.recompute_sparkle();
@@ -533,7 +533,8 @@ fn a_capture_s_word_icons_reach_the_sky_s_keep_out() {
     use aterm_render::sprites::{FreeZ, published};
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow dog".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
+    app.config.cursor_pet = Some("dog".into());
     app.config.motion = Some("full".into());
     let wid = WindowId(0);
     app.windows.get_mut(&wid).expect("window").focused = true;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! File-descriptor-relative directory walker and disk space accounting.
+//! File-descriptor-relative (handle-relative on Windows) directory walker and disk space
+//! accounting.
 
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 #![warn(missing_docs)]
@@ -12,6 +13,8 @@ pub mod look;
 pub mod refuse;
 pub mod tree;
 pub mod walk;
+#[cfg(windows)]
+mod win;
 
 pub use iopol::{
     DiskIo, MaterializePolicy, PolicyOutcome, main_thread_never_materializes,
@@ -54,7 +57,10 @@ pub mod touched {
     }
 
     /// Note `path` in the running [`record`], if any.
-    #[cfg_attr(not(unix), expect(dead_code, reason = "off Unix nothing is touched"))]
+    #[cfg_attr(
+        not(any(unix, windows)),
+        expect(dead_code, reason = "with no walker nothing is touched")
+    )]
     pub(crate) fn note(path: &Path) {
         LOG.with(|log| {
             if let Some(seen) = log.borrow_mut().as_mut() {
@@ -71,7 +77,11 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "walk_tests.rs"]
 mod walk_tests;
-// Off Unix every walk and look is `Refusal::Unsupported`.
-#[cfg(all(test, not(unix)))]
+// The Windows walker against trees the tests create, and the Windows path test.
+#[cfg(all(test, windows))]
+#[path = "win_tests.rs"]
+mod win_tests;
+// With no walker every walk and look is `Refusal::Unsupported`.
+#[cfg(all(test, not(any(unix, windows))))]
 #[path = "off_unix_tests.rs"]
 mod off_unix_tests;

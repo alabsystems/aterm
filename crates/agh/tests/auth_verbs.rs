@@ -107,7 +107,7 @@ const ADD_DEV: [&str; 10] = [
     "--format",
 ];
 
-/// An agent provisions with no terminal on stderr or stdin (owner ruling 2026-10-26): from a
+/// An agent provisions with no terminal on stderr or stdin: from a
 /// file in place and from a piped stdin alike.
 #[test]
 fn auth_add_without_a_terminal_provisions() {
@@ -758,7 +758,7 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
         captured.stderr_text()
     );
 
-    // No terminal: an agent removes a profile as a person does (owner ruling 2026-10-26).
+    // No terminal: an agent removes a profile as a person does.
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(
         run(&mut ctx, &["auth", "remove", "release"]),

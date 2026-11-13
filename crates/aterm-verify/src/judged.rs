@@ -54,6 +54,9 @@ pub struct Record {
     pub tree: String,
     pub host: String,
     pub verifier: String,
+    /// Controller image at claim time, independent of the sampled verifier.
+    #[serde(default)]
+    pub controller: String,
     pub inputs: String,
     pub token: String,
     pub state: String,
@@ -76,7 +79,7 @@ impl Record {
 }
 
 pub fn command(root: &Path, args: &[&str]) -> Command {
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = crate::git_provider::command();
     cmd.current_dir(root).args(args).env_remove("GITHUB_TOKEN");
     cmd
 }
@@ -148,7 +151,7 @@ pub fn head(
     let git = |root: &Path| command(root, &[]);
     let run = |tool, args: &[std::ffi::OsString]| {
         capture_until(
-            &mut crate::remote::command(root, &git, tool, args),
+            &mut crate::remote::command(root, &git, tool, args)?,
             None,
             until,
         )
@@ -201,6 +204,59 @@ pub fn record(
         return Err("journal record is filed under another tree".into());
     }
     Ok(Some(record))
+}
+
+/// Attempts updated since `since`, including attempts overwritten by a later tree claim.
+pub fn history(root: &Path, head: &str, since: u64) -> Result<Vec<Record>, String> {
+    let until = deadline();
+    // Git commit dates are not record times. Read the immutable chain, including pruned
+    // paths, then apply the window to the lane's timestamps. Newest occurrence wins even
+    // when a host's wall clock went backwards. A heartbeat keeps the same attempt token.
+    let changes = git_until(
+        root,
+        &[
+            "log",
+            "--format=",
+            "--raw",
+            "--no-abbrev",
+            head,
+            "--",
+            "verdicts/",
+        ],
+        until,
+    )?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut objects = Vec::new();
+    for line in changes.lines().filter(|line| line.starts_with(':')) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let Some(object) = fields.get(3) else {
+            return Err("invalid journal change header".into());
+        };
+        if object.bytes().all(|b| b == b'0') || !seen.insert(*object) {
+            continue;
+        }
+        objects.push(*object);
+    }
+    let mut attempts = std::collections::BTreeMap::new();
+    // Bound each batch's decoded allocation; output_until bounds the shared wall clock
+    // and byte budget. No per-blob child process, even for thousands of renewals.
+    for batch in objects.chunks(64) {
+        let input = format!("{}\n", batch.join("\n"));
+        let bytes = output_until(
+            &mut command(root, &["cat-file", "--batch"]),
+            Some(input.as_bytes()),
+            until,
+        )?;
+        for record in decode_objects(bytes.as_bytes())? {
+            attempts
+                .entry((record.tree.clone(), record.token.clone()))
+                .or_insert(record);
+        }
+    }
+    Ok(attempts
+        .into_values()
+        .filter(|record| record.updated >= since)
+        .collect())
 }
 
 fn decode_objects(mut bytes: &[u8]) -> Result<Vec<Record>, String> {
@@ -346,143 +402,5 @@ pub fn append(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn renewal_interrupts_abort_only_scoped_journal_work() {
-        const CHILD: &str = "ATERM_VERIFY_RENEWAL_INTERRUPT_CHILD";
-        const TEST: &str = "judged::tests::renewal_interrupts_abort_only_scoped_journal_work";
-        if std::env::var_os(CHILD).is_some() {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let root = dir.path();
-            git(root, &["init", "--quiet"]).unwrap();
-            git(root, &["init", "--bare", "--quiet", "remote"]).unwrap();
-            git(root, &["remote", "add", "origin", "remote"]).unwrap();
-            let watch = aterm_toolchain::interrupt::Watch::enter();
-            // SAFETY: raise sends this valid signal to this isolated child test process;
-            // its live Watch owns the disposition and retains it for the controller.
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "this isolated child catches non-core SIGTERM in its live Watch to test journal cancellation; it must not die by SIGKILL"
-            )]
-            let raised = unsafe { libc::raise(libc::SIGTERM) };
-            assert_eq!(raised, 0);
-            let stopped = interruptible(|| output(&mut command(root, &["--version"]), None));
-            assert!(stopped.unwrap_err().contains("interrupted"));
-            let stopped_remote = interruptible(|| head(root, "origin", deadline()));
-            assert!(stopped_remote.unwrap_err().contains("interrupted"));
-            assert_eq!(watch.caught(), Some(libc::SIGTERM));
-            // The terminal append's scope must work even with the same signal pending.
-            assert!(
-                output(&mut command(root, &["--version"]), None)
-                    .unwrap()
-                    .contains("git version")
-            );
-            assert_eq!(watch.take(), Some(libc::SIGTERM));
-            return;
-        }
-        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-        cmd.args(["--exact", TEST, "--nocapture"]).env(CHILD, "1");
-        let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    fn only_decided_verdicts_or_unexpired_claims_exclude_another_sample() {
-        let mut r = Record {
-            commit: "c".into(),
-            tree: "t".into(),
-            host: "h".into(),
-            verifier: "v".into(),
-            inputs: "i".into(),
-            token: "one".into(),
-            state: "judging".into(),
-            cause: String::new(),
-            started: 0,
-            updated: 0,
-            lease_until: 120,
-            rows: vec![],
-        };
-        assert!(r.occupied(119));
-        assert!(!r.occupied(120));
-        for state in ["cancelled", "could-not-run"] {
-            r.state = state.into();
-            assert!(!r.occupied(1));
-        }
-        for state in ["pass", "red"] {
-            r.state = state.into();
-            assert!(r.occupied(1000));
-        }
-    }
-
-    #[test]
-    fn competing_append_cannot_replace_a_claim_and_pruning_keeps_recent_rows() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "--bare", "remote"]).unwrap();
-        git(root, &["clone", "remote", "one"]).unwrap();
-        let one = root.join("one");
-        git(&one, &["config", "user.name", "Andrew Yates"]).unwrap();
-        git(&one, &["config", "user.email", "test@example.invalid"]).unwrap();
-        let mut r = Record {
-            commit: "c".into(),
-            tree: "t".into(),
-            host: "h".into(),
-            verifier: "v".into(),
-            inputs: "i".into(),
-            token: "one".into(),
-            state: "judging".into(),
-            cause: String::new(),
-            started: 0,
-            updated: 1,
-            lease_until: 120,
-            rows: vec![],
-        };
-        assert!(append(&one, "origin", None, &r, deadline()).unwrap());
-        let first = head(&one, "origin", deadline()).unwrap().unwrap();
-        assert!(
-            append(
-                &one,
-                "origin",
-                Some(&first),
-                &r,
-                std::time::Instant::now() - std::time::Duration::from_secs(1)
-            )
-            .is_err()
-        );
-        assert_eq!(
-            head(&one, "origin", deadline()).unwrap().as_deref(),
-            Some(first.as_str())
-        );
-        let blob = git(&one, &["rev-parse", &format!("{first}:verdicts/t.toml")]).unwrap();
-        let input = format!("{blob}\n").repeat(3000);
-        let objects = output(
-            &mut command(&one, &["cat-file", "--batch"]),
-            Some(input.as_bytes()),
-        )
-        .unwrap();
-        assert_eq!(
-            decode_objects(objects.as_bytes()).unwrap().len(),
-            3000,
-            "large journals must drain output while feeding more object requests"
-        );
-        r.token = "two".into();
-        assert!(!append(&one, "origin", None, &r, deadline()).unwrap());
-        assert_eq!(
-            records(&one, Some(&first), deadline()).unwrap()[0].token,
-            "one"
-        );
-        r.tree = "new".into();
-        r.updated = RETENTION + 2;
-        assert!(append(&one, "origin", Some(&first), &r, deadline()).unwrap());
-        let last = head(&one, "origin", deadline()).unwrap().unwrap();
-        assert_eq!(records(&one, Some(&last), deadline()).unwrap(), vec![r]);
-    }
-}
+#[path = "judged_tests.rs"]
+mod tests;

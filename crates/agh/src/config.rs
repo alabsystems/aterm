@@ -1994,14 +1994,16 @@ pub(crate) fn read_config_in(
         Err(error) => {
             let file = dir.join(name);
             let remedy = match &error {
-                PrivateFileError::NotPrivate(_) => match private_fix(dir, &file, home, held) {
-                    PrivateFix::Fix(fix) => Some(fix),
-                    PrivateFix::NotAFile => {
-                        Some(format!("{} must be a regular file", tilde(&file, home)))
+                PrivateFileError::NotPrivate(_) | PrivateFileError::Writable(_) => {
+                    match private_fix(dir, &file, home, held) {
+                        PrivateFix::Fix(fix) => Some(fix),
+                        PrivateFix::NotAFile => {
+                            Some(format!("{} must be a regular file", tilde(&file, home)))
+                        }
+                        PrivateFix::NoChmod => Some(keep_elsewhere(dir, name, home, held)),
+                        PrivateFix::Unseen => None,
                     }
-                    PrivateFix::NoChmod => Some(keep_elsewhere(dir, name, home, held)),
-                    PrivateFix::Unseen => None,
-                },
+                }
                 PrivateFileError::Symlink => Some(symlink_remedy(dir, name, home, held)),
                 PrivateFileError::Io(_) => return ConfigText::Io(error.to_string()),
                 PrivateFileError::Missing | PrivateFileError::Malformed(_) => None,

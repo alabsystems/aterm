@@ -22,6 +22,7 @@ fn land() -> Vec<Check> {
             !matches!(
                 c,
                 Check::Fmt
+                    | Check::ReleasedShim
                     | Check::Census
                     | Check::ExportScan
                     | Check::Forge
@@ -46,7 +47,7 @@ struct FakeRepo {
     home: PathBuf,
 }
 
-const DRIVERS: &str = "target";
+const DRIVERS: &str = aterm_toolchain::build_cache::DEFAULT_TARGET;
 
 impl FakeRepo {
     fn new() -> Self {
@@ -338,12 +339,12 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     );
 }
 
-/// A TEST COMPILE THAT DID NOT PASS STARTS NO CARGO BEHIND IT: its stand-in compile exits 101,
-/// and the test stage, behind it in the main lane, is one COULD NOT RUN row naming the failed
-/// compile and starts no compile of its own, so the trace holds the test compile's start line
-/// alone. NEGATIVE CONTROL: without the flag the test stage would start a recording pass.
+/// THE TREE TEST COMPILE NEVER PREBUILDS APPKIT'S DRIVERS: the cutter has already run their own
+/// build-and-drive gate before it starts the tree. Both a release-shaped compile and the ordinary
+/// negative control therefore make only their test-compile call, whether that call passes or
+/// fails, and name no redraw binary or Objective-C example.
 #[test]
-fn release_compile_prebuilds_the_bundle_drivers_only_after_success() {
+fn release_compile_has_no_late_appkit_driver_prebuild() {
     for (release, succeeds) in [(true, true), (false, true), (true, false)] {
         let repo = FakeRepo::new();
         let trace = repo.scratch.join("prebuild-starts");
@@ -362,18 +363,17 @@ fn release_compile_prebuilds_the_bundle_drivers_only_after_success() {
             .unwrap();
         let _report = stages::run_stage(&ctx, &spec);
         let starts = fs::read_to_string(&trace).unwrap();
-        assert_eq!(
-            starts.contains("--bin aterm-redraw-conformance"),
-            release && succeeds,
+        assert!(
+            !starts.contains("--bin aterm-redraw-conformance"),
             "{starts}"
         );
         for drive in stages::OBJC_DRIVES {
-            assert_eq!(
-                starts.contains(&format!("--example {}", drive.example)),
-                release && succeeds && cfg!(target_os = "macos"),
+            assert!(
+                !starts.contains(&format!("--example {}", drive.example)),
                 "{starts}"
             );
         }
+        assert_eq!(starts.lines().count(), 1, "{starts}");
         assert!(starts.lines().next().unwrap().contains("--no-run"));
     }
 }
@@ -415,8 +415,8 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
 
     assert_eq!(code, exit::PASS, "{ladder}");
     let lead = format!(
-        "argv: --config build.build-dir='{}/target/build.noindex' ",
-        repo.root.display()
+        "argv: --config build.build-dir='{}' ",
+        aterm_toolchain::build_cache::target_build_path(&repo.root.join(DRIVERS)).display()
     );
     let config = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG.join(" ");
     let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
@@ -1320,12 +1320,11 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     assert!(t.could_not_run.is_empty(), "{t:?}");
 }
 
-/// A BINARY WHOSE LAST RUN FAILED STARTS FIRST, so a red shows early: the run keeps what each
-/// binary took and how it ended, and the next plans by it; the failing binary is kept as the
-/// shortest by far, so by length alone it would start last. NEGATIVE CONTROL: the first run, with
-/// nothing kept, starts them in cargo's order, the failing one second.
+/// Recorded durations order real binary starts, with memory breaking equal durations. A short
+/// failed binary retains its failure evidence without jumping a longer peer. NEGATIVE CONTROL:
+/// the first run, with nothing kept, starts in Cargo order, the failing binary second.
 #[test]
-fn a_binary_that_failed_last_run_starts_first() {
+fn binary_order_uses_recorded_duration_then_memory() {
     let repo = FakeRepo::new();
     let order = repo.scratch.join("order");
     let bins = [
@@ -1373,6 +1372,7 @@ fn a_binary_that_failed_last_run_starts_first() {
     assert!(!kept.seen("-p fixture --test a").expect("a was kept").failed);
     let took = |wall_ms: u64, outcome: &str| aterm_verify::test_history::Sample {
         partition: None,
+        exe_sha256: None,
         at_ms: 1,
         outcome: outcome.to_owned(),
         wall_ms,
@@ -1380,6 +1380,7 @@ fn a_binary_that_failed_last_run_starts_first() {
         starved_ms: None,
         peak_bytes: None,
         width: 1,
+        cores: None,
         tests: Some(1),
     };
     aterm_verify::test_history::keep(
@@ -1391,12 +1392,33 @@ fn a_binary_that_failed_last_run_starts_first() {
         ],
     )
     .expect("keep");
-    assert_eq!(ran(&ctx), "b\na\nc\n");
+    assert_eq!(ran(&ctx), "a\nc\nb\n");
+    let with_peak = |peak_bytes| aterm_verify::test_history::Sample {
+        peak_bytes: Some(peak_bytes),
+        ..took(10_000, "ok")
+    };
+    aterm_verify::test_history::keep(
+        ctx.test_history.as_deref().expect("history"),
+        vec![
+            ("-p fixture --test a".to_owned(), with_peak(64 << 20)),
+            (
+                "-p fixture --test b".to_owned(),
+                aterm_verify::test_history::Sample {
+                    outcome: "FAIL".into(),
+                    ..with_peak(128 << 20)
+                },
+            ),
+            ("-p fixture --test c".to_owned(), with_peak(96 << 20)),
+        ],
+    )
+    .expect("keep memory tie");
+    assert_eq!(ran(&ctx), "b\nc\na\n");
 }
 
 /// A FAILED TEST RERUNS AT THE WIDTH ITS BINARY RAN AT: on a share of four, the plan runs `b`,
 /// whose history kept one test, one thread wide, and its failure's rerun line sets
-/// `RUST_TEST_THREADS=1`, so a failure only one test thread shows is shown again.
+/// `RUST_TEST_THREADS=1`, so a failure only one test thread shows is shown again; each line
+/// carries the grant its binary ran under (`ATERM_TEST_CORES`, one core a thread for both).
 /// NEGATIVE CONTROL: `c`, with no history, runs at the run's width, and its rerun line sets 4.
 #[test]
 fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
@@ -1425,6 +1447,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
             "-p fixture --test b".to_owned(),
             aterm_verify::test_history::Sample {
                 partition: None,
+                exe_sha256: None,
                 at_ms: 1,
                 outcome: "ok".to_owned(),
                 wall_ms: 10,
@@ -1432,6 +1455,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
                 starved_ms: None,
                 peak_bytes: None,
                 width: 4,
+                cores: None,
                 tests: Some(1),
             },
         )],
@@ -1453,8 +1477,8 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
     assert_eq!(
         reruns,
         [
-            "1 targo --unverified test -p fixture --test b -- t::b --exact",
-            "4 targo --unverified test -p fixture --test c -- t::c --exact"
+            "1 ATERM_TEST_CORES=1 targo --unverified test -p fixture --test b -- t::b --exact",
+            "4 ATERM_TEST_CORES=1 targo --unverified test -p fixture --test c -- t::c --exact"
         ],
         "{block}"
     );

@@ -103,48 +103,35 @@ impl Capture {
     }
 }
 
-/// The cursor-trail config line a row runs under.
+/// The cursor config a row runs under: its `cursor_trail_style` and its `cursor_pet`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
-    /// `"rainbow kitty"`: the walking pet.
-    Classic,
-    /// The key left absent: the shipped default (`rainbow kitty pet`).
+    /// Both keys left absent: the shipped default, the `rainbow` theme beside the cat.
     Default,
-    Underline,
-    /// `"rainbow kitty flying"`: the companion-free style that earns the flying head.
-    Flying,
-    Tall,
-    /// The canonical off spelling: the matched negative control.
+    /// `cursor_trail_style = "rainbow"` with `cursor_pet = "off"`: the trail and no companion.
+    Rainbow,
+    /// The canonical off spelling of both: the matched negative control.
     Off,
 }
 
 impl Style {
-    /// The config line, or `None` for the shipped default.
+    /// The config lines, or `None` for the shipped default.
     #[must_use]
     pub const fn config_line(self) -> Option<&'static str> {
         match self {
-            Self::Classic => Some("cursor_trail_style = \"rainbow kitty\""),
             Self::Default => None,
-            Self::Underline => Some("cursor_trail_style = \"rainbow kitty underline\""),
-            Self::Flying => Some("cursor_trail_style = \"rainbow kitty flying\""),
-            Self::Tall => Some("cursor_trail_style = \"rainbow kitty tall\""),
-            Self::Off => Some("cursor_trail_style = \"off\""),
+            Self::Rainbow => Some("cursor_trail_style = \"rainbow\"\ncursor_pet = \"off\""),
+            Self::Off => Some("cursor_trail_style = \"off\"\ncursor_pet = \"off\""),
         }
     }
 
     /// The `style="…"` the engine must report, and the tokens that bind it to what it resolved to.
     #[must_use]
     pub const fn binding(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
-        const TALL: &[(&str, &str)] = &[("resolved", "rainbow-kitty"), ("ribbon_look", "tall")];
+        const RAINBOW: &[(&str, &str)] =
+            &[("resolved", "rainbow-kitty"), ("ribbon_look", "underline")];
         match self {
-            Self::Classic => ("rainbow kitty", TALL),
-            Self::Default => ("rainbow kitty pet", TALL),
-            Self::Underline => (
-                "rainbow kitty underline",
-                &[("resolved", "rainbow-kitty"), ("ribbon_look", "underline")],
-            ),
-            Self::Flying => ("rainbow kitty flying", TALL),
-            Self::Tall => ("rainbow kitty tall", TALL),
+            Self::Default | Self::Rainbow => ("rainbow", RAINBOW),
             Self::Off => ("off", &[("effective", "false")]),
         }
     }
@@ -152,11 +139,8 @@ impl Style {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Classic => "classic",
             Self::Default => "default",
-            Self::Underline => "underline",
-            Self::Flying => "flying",
-            Self::Tall => "tall",
+            Self::Rainbow => "rainbow",
             Self::Off => "off",
         }
     }
@@ -175,6 +159,8 @@ pub enum Companion {
     /// The resident pet: claimed and visibly whole from frame zero on.
     Pet,
     /// The flying head: earned by a sustained run, then whole in three isolated final stills.
+    /// No style selects it now (the pet is the one companion, `cursor_pet`); the scanner and the
+    /// verdict keep reading it while the engine keeps its art.
     Cat,
 }
 
@@ -220,10 +206,11 @@ pub enum Split {
 /// least `lo` and at most `hi` hundredths of a cell above that edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// The tall body every `ribbon_look=tall` spelling lays (aterm-effects `TALL_UP_CH` above its
-    /// spine, `TALL_CORE_CH` of it at full strength).
+    /// The tall body (aterm-effects `TALL_UP_CH` above its spine, `TALL_CORE_CH` of it at full
+    /// strength). No style lays it now; the scanner keeps measuring it on its recorded frames
+    /// while the engine keeps the body.
     Tall,
-    /// The underline spelling's body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH`
+    /// The `rainbow` theme's body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH`
     /// at full strength and the rest a wash at `SHOULDER_UNDERLINE`).
     Underline,
 }
@@ -250,11 +237,8 @@ impl Reach {
     #[must_use]
     pub const fn laid_by(self, style: Style) -> bool {
         match self {
-            Self::Tall => matches!(
-                style,
-                Style::Classic | Style::Default | Style::Flying | Style::Tall
-            ),
-            Self::Underline => matches!(style, Style::Underline),
+            Self::Tall => false,
+            Self::Underline => matches!(style, Style::Default | Style::Rainbow),
         }
     }
 
@@ -324,8 +308,8 @@ impl PaintRow {
                 return could_not_run("companion morphology uses the isolated prompt plane");
             }
             let ok = match c {
-                Companion::Pet => matches!(self.style, Style::Default | Style::Classic),
-                Companion::Cat => self.style == Style::Flying,
+                Companion::Pet => self.style == Style::Default,
+                Companion::Cat => false,
             };
             if !ok {
                 return could_not_run("the companion judges a spelling its style does not select");

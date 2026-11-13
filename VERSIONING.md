@@ -49,6 +49,29 @@ and Codex snapshot count/source/upstream bindings remain required; their source
 version generators still need coordinated migration. Compiler and upstream
 technical versions remain separate. No build number is interpreted as a date.
 
+Windows numeric file and package versions are technical artifact identities.
+New resources encode `1.HI.MID.LO`, where `HI`, `MID` and `LO` are the selected
+stamp's build number split into three big-endian 16-bit words. The leading
+migration epoch `1` orders these resources above the historical `0.MINOR.0.0`
+line. Builds outside the unsigned 48-bit range refuse instead of being clamped;
+the exact public version, including Calendar counters and qualifiers, remains
+in the `FileVersion` and `ProductVersion` strings. Windows release producers
+select the stamp before linking; the macOS postlink placeholder is not a
+Windows resource identity. MSIX packaging reads the selected executable's
+numeric tuple and requires both public strings to match the workspace version.
+The existing Windows build script defaults its child to commit-stamp mode,
+preserving explicit caller selections; MSIX refuses the new epoch's unknown
+zero-build placeholder. It never derives a second version from the date or
+increments a repack.
+
+Build stamps count development commits from the newest reachable stable
+three-component product tag, including positive Calendar counters. Prerelease
+and build-metadata tags, invalid dates, zero Calendar counters and nonzero
+historical patches are excluded by the same canonical product-version parser
+used for release admission. The dependency-free stamp crate owns that policy
+and its civil calendar; existing `aterm_types` API paths re-export them. This
+observation does not allocate a release version or change an unfinished journal.
+
 ## How an installed copy picks a release
 
 The updater decides in two stages, and only the second uses the build number.

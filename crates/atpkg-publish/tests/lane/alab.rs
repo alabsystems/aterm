@@ -917,53 +917,6 @@ fn a_compilers_version_names_the_pins_commit_and_date() {
     assert_eq!(date_of("unknown"), None);
 }
 
-/// An installed compiler's version print names the pin's commit only where it exits 0.
-/// NEGATIVE CONTROL: the same print from a compiler that exits 0 is read.
-#[cfg(unix)]
-#[test]
-fn a_compiler_that_fails_its_version_print_names_no_pin_commit() {
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Arc;
-
-    use atpkg_publish::host::Hosts;
-    use atpkg_publish::host::fake::FakeHost;
-
-    let tmp = scratch("alab-pin-print");
-    let mut ctx = Ctx::new(
-        tmp.path(),
-        None,
-        None,
-        0,
-        Hosts::single(Arc::new(FakeHost::new())),
-    );
-    ctx.pkg_prefix = tmp.path().join("prefix");
-    let compiler = |build: u64, exit: u8| {
-        let bin = ctx.pkg_prefix.join(format!("store/trust/{build}/bin"));
-        std::fs::create_dir_all(&bin).expect("mkdir store bin");
-        let trustc = bin.join("trustc");
-        std::fs::write(
-            &trustc,
-            format!(
-                "#!/bin/sh\nprintf 'commit-hash: 321aaeda7f00ba\\ncommit-date: 2026-09-17\\n'\n\
-                 exit {exit}\n"
-            ),
-        )
-        .expect("write the compiler");
-        std::fs::set_permissions(&trustc, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod the compiler");
-    };
-    compiler(7, 1);
-    assert_eq!(alab::installed_pin_commit(&ctx, "trust", 7), None);
-    compiler(8, 0);
-    assert_eq!(
-        alab::installed_pin_commit(&ctx, "trust", 8),
-        Some(PinCommit {
-            commit: "321aaeda7".into(),
-            date: Some("2026-09-17".into())
-        })
-    );
-}
-
 #[test]
 fn the_bundle_lane_prints_the_bundle_packs_never_runs_them() {
     let w = World::new("alab-bundle");

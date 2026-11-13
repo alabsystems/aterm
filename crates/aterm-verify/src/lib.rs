@@ -7,8 +7,9 @@
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
 )]
 
-// These fixtures judge write ordering and recovery. The durable crate judges the hardware
-// flush itself; keep every requested flush here without draining the SSD for each fixture.
+// Dependencies these fixtures drive flush durably (aterm-capacity's records among them). The
+// durable crate judges the hardware flush itself; keep every requested flush here without
+// draining the SSD for each fixture.
 #[cfg(all(test, unix))]
 aterm_durable::plain_durable_flushes_in_tests!();
 
@@ -38,10 +39,12 @@ pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
 #[cfg(all(test, unix, debug_assertions))]
 mod benchmark_fixture_tests;
 
-#[cfg(unix)]
+pub mod appkit_content;
 pub mod browser;
 pub mod cells;
+mod census_fix;
 pub mod changed;
+pub mod changelog_guard;
 pub mod checks;
 pub mod cli;
 pub mod compile_account;
@@ -60,6 +63,7 @@ pub mod export_scan;
 pub mod findings;
 pub mod fmt;
 pub mod git_paths;
+pub mod git_provider;
 mod harness_debt;
 pub mod input_content;
 pub mod ladder;
@@ -67,13 +71,16 @@ pub mod libtest;
 pub mod libtest_json;
 pub mod lint_content;
 pub mod memory;
+pub mod native_verifier;
 pub mod own_tests;
 pub mod perf;
 pub mod plan;
 #[cfg(unix)]
 pub mod provision;
 pub mod release_input;
+mod released_shim;
 pub mod report;
+mod resource_waits;
 mod run_log;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
 pub mod runs;
@@ -107,6 +114,8 @@ pub mod judged;
 pub mod land;
 #[cfg(unix)]
 mod remote;
+pub mod remote_cli;
+pub mod remote_host;
 pub mod wasm_glue;
 mod wasm_page;
 pub mod wasm_smoke;
@@ -175,12 +184,18 @@ pub struct EnvSnapshot {
     pub rustc_vars: Vec<(&'static str, String)>,
     /// `CARGO_TARGET_DIR`, absolute.
     pub cargo_target_dir: Option<PathBuf>,
-    /// The variables that choose cargo's layout, raw and only when set ([`CARGO_LAYOUT_VARS`]).
+    /// Cargo's explicitly set layout selectors ([`CARGO_LAYOUT_VARS`]). Startup capture anchors
+    /// relative environment paths at its working directory; manually supplied values retain
+    /// the selected source root as their base.
     pub cargo_layout: Vec<(&'static str, OsString)>,
+    /// Explicit C compiler, SDK and native build inputs, captured before test isolation.
+    pub native_toolchain: Vec<(OsString, OsString)>,
     /// `RUST_TEST_THREADS`, raw.
     pub rust_test_threads: Option<OsString>,
     /// `CARGO_HOME`.
     pub cargo_home: Option<PathBuf>,
+    /// The qualify pilot's opt-in failing-test marker, explicitly declared for test children.
+    pub qualify_red_marker: Option<PathBuf>,
     /// The enabled native package prefix, resolved by the package manager.
     pub native_packages: Option<PathBuf>,
     /// `PUBLICATION_ENGINE`, raw: an engine checkout whose HEAD commit the engine's readers
@@ -195,6 +210,100 @@ pub struct EnvSnapshot {
 }
 
 impl EnvSnapshot {
+    fn cargo_var(&self, name: &str) -> Option<OsString> {
+        if name == "CARGO_TARGET_DIR" && self.cargo_target_dir.is_some() {
+            return self
+                .cargo_target_dir
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned());
+        }
+        if let Some((_, value)) = self.cargo_layout.iter().find(|(key, _)| *key == name) {
+            Some(value.clone())
+        } else if name == "CARGO_HOME" {
+            self.cargo_home
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned())
+        } else {
+            None
+        }
+    }
+
+    /// The caller's captured Cargo selectors for a new verifier, including explicit removals.
+    /// Compiler-selected final and intermediate paths never become runtime caller choices.
+    /// Captured relative environment paths retain their startup base, while Cargo expands valid
+    /// build-directory templates. An absent Cargo home remains absent.
+    pub fn cargo_selector_env(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, Option<OsString>)> + '_ {
+        CARGO_LAYOUT_VARS
+            .into_iter()
+            .map(|name| (name, self.cargo_var(name)))
+    }
+
+    /// Restore the original Cargo selectors on a verifier runtime command. Missing selectors
+    /// are removed, so a bootstrap compiler's generated placement cannot leak into the run.
+    pub fn apply_cargo_selectors(&self, command: &mut aterm_uds::spawnfd::Command) {
+        for (name, value) in self.cargo_selector_env() {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else {
+                command.env_remove(name);
+            }
+        }
+    }
+
+    fn cargo_layout_at(
+        cwd: &Path,
+        mut selectors: Vec<(&'static str, OsString)>,
+    ) -> Vec<(&'static str, OsString)> {
+        for (name, value) in &mut selectors {
+            if matches!(
+                *name,
+                "CARGO_TARGET_DIR" | "CARGO_BUILD_TARGET_DIR" | "CARGO_HOME"
+            ) && !value.is_empty()
+                && !Path::new(value.as_os_str()).is_absolute()
+            {
+                *value = cwd.join(value.as_os_str()).into_os_string();
+            }
+        }
+        if selectors
+            .iter()
+            .any(|(name, _)| *name == "CARGO_BUILD_BUILD_DIR")
+        {
+            // Only an environment choice is projected. The shared resolver supplies its
+            // template/base rules without looking up or injecting Cargo configuration.
+            let selected = {
+                let lookup = |name: &str| {
+                    selectors
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| value.clone())
+                };
+                let machine = aterm_toolchain::build_cache::Machine {
+                    home: None,
+                    root: None,
+                    cwd: Some(cwd),
+                    env: &lookup,
+                    read: &|_| Ok(None),
+                    writable: &|_| Some(false),
+                };
+                aterm_toolchain::build_cache::cargo_build_dir_hint_with(&machine)
+                    .ok()
+                    .flatten()
+                    .map(|hint| hint.value().to_owned())
+            };
+            if let Some(selected) = selected
+                && let Some((_, value)) = selectors
+                    .iter_mut()
+                    .find(|(name, _)| *name == "CARGO_BUILD_BUILD_DIR")
+            {
+                *value = selected;
+            }
+            // Invalid or empty choices stay unchanged for NativeBuildPlan's ordinary refusal.
+        }
+        selectors
+    }
+
     /// The variables that name the publication engine ([`engine::named`]), as this snapshot
     /// holds them: `PUBLICATION_ENGINE` and `HOME`.
     #[must_use]
@@ -209,6 +318,24 @@ impl EnvSnapshot {
     /// Read the process environment.
     #[must_use]
     pub fn capture() -> Self {
+        let cwd = std::env::current_dir().ok();
+        let selectors = CARGO_LAYOUT_VARS
+            .iter()
+            .filter_map(|name| Some((*name, std::env::var_os(name)?)))
+            .collect();
+        let cargo_layout = match cwd.as_deref() {
+            Some(cwd) => Self::cargo_layout_at(cwd, selectors),
+            None => selectors,
+        };
+        let cargo_path = |name: &str| {
+            cargo_layout
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| PathBuf::from(value))
+        };
+        let cargo_target_dir =
+            cargo_path("CARGO_TARGET_DIR").filter(|path| !path.as_os_str().is_empty());
+        let cargo_home = cargo_path("CARGO_HOME").filter(|path| path.is_absolute());
         let var_path = |k: &str| std::env::var_os(k).map(PathBuf::from);
         let native = atpkg::abrew::prefix::Prefix::resolve();
         let native_packages =
@@ -234,14 +361,11 @@ impl EnvSnapshot {
                 .iter()
                 .filter_map(|k| Some((*k, std::env::var_os(k)?.to_string_lossy().into_owned())))
                 .collect(),
-            cargo_target_dir: var_path("CARGO_TARGET_DIR")
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| std::path::absolute(&p).unwrap_or(p)),
-            cargo_home: var_path("CARGO_HOME").filter(|p| p.is_absolute()),
-            cargo_layout: CARGO_LAYOUT_VARS
-                .iter()
-                .filter_map(|k| Some((*k, std::env::var_os(k)?)))
-                .collect(),
+            cargo_target_dir,
+            cargo_home,
+            qualify_red_marker: var_path("ATERM_QUALIFY_RED_MARKER").filter(|p| p.is_absolute()),
+            cargo_layout,
+            native_toolchain: test_env::native_inputs(std::env::vars_os()),
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
             native_packages,
             publication_engine: std::env::var_os("PUBLICATION_ENGINE").filter(|v| !v.is_empty()),
@@ -251,6 +375,9 @@ impl EnvSnapshot {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod runtime_selector_tests;
 
 /// Keep the caller's choices first, then expose enabled native package tools
 /// to build and test children even when the invoking agent predates shellenv.
@@ -275,24 +402,17 @@ pub const CARGO_LAYOUT_VARS: [&str; 4] = [
     "CARGO_HOME",
 ];
 
-/// The `build.build-dir` value atpkg's `targo` shim on `env`'s `PATH` uses for `root`
-/// (`aterm_toolchain::build_cache::decide`), in the cache root that shim names
-/// (`aterm_toolchain::build_cache::shim_root`): a shim laid before the cache moved under `.ubd`
-/// builds in the old root until an update of aterm lays the new one, and the main lane builds
-/// there with it, so plain `targo` and verify share one build.
+/// The `build.build-dir` value this version's atpkg shim chooses for `root`
+/// (`aterm_toolchain::build_cache::decide`), using the quiet cache regardless of an older
+/// installed shim's path.
 #[must_use]
 pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
-    use aterm_toolchain::build_cache::{BuildDir, Machine, Tool, decide, read_config, shim_root};
+    use aterm_toolchain::build_cache::{BuildDir, Machine, Tool, cache_root, decide, read_config};
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let lookup = |k: &str| {
-        env.cargo_layout
-            .iter()
-            .find(|(name, _)| *name == k)
-            .map(|(_, v)| v.clone())
-    };
-    let cache = shim_root(&env.home, &env.path);
+    let lookup = |key: &str| env.cargo_var(key);
+    let cache = cache_root(&env.home);
     let machine = Machine {
         home: Some(&env.home),
         root: Some(&cache),
@@ -320,33 +440,263 @@ pub fn physical(path: &Path) -> PathBuf {
     }
 }
 
-/// The run's target directory, physical ([`physical`]): the caller's `CARGO_TARGET_DIR`, else
-/// `<root>/target`. Every child but a side lane's (handed its lane directory, physical too) gets it
-/// as `CARGO_TARGET_DIR` ([`Ctx::child_env_add`]), so cargo spells each `CARGO_BIN_EXE_*` and
-/// `CARGO_TARGET_TMPDIR` it compiles into a test through it and never through a link: a release
-/// clone reaches its target through `target -> target.noindex`, and a test that resolved one
-/// spelling and compared it with the other failed there. Cargo does not fingerprint either value,
-/// so a test binary compiled before keeps its spelling until it recompiles. A missing directory is
-/// not created: the spelling of its existing ancestor decides.
-#[must_use]
-pub fn physical_target(env: &EnvSnapshot, root: &Path) -> PathBuf {
-    physical(
-        &env.cargo_target_dir
-            .clone()
-            .unwrap_or_else(|| root.join("target")),
-    )
+/// A native compiler's immutable target and intermediate selection. Resolution creates nothing;
+/// automatic final directories remain lexical until descriptor preparation checks every component.
+#[derive(Clone, Debug)]
+pub struct NativeBuildPlan {
+    env: EnvSnapshot,
+    root: PathBuf,
+    target: PathBuf,
+    default_root: Option<PathBuf>,
+    shared_build_dir: Option<String>,
+    build_dir: Option<String>,
+    compiler_layout: Result<CompilerLayout, String>,
+}
+
+#[derive(Clone, Debug)]
+struct CompilerLayout {
+    cargo_home: Option<PathBuf>,
+    caller_build_dir: Option<aterm_toolchain::build_cache::CargoBuildDirHint>,
+}
+
+impl NativeBuildPlan {
+    /// Capture Cargo's target choice from this environment and the selected workspace's config.
+    /// Caller-selected final paths are physical; the automatic path stays under the physical root.
+    ///
+    /// # Errors
+    /// Cargo's target selection is empty, unreadable, malformed or has unresolved configuration.
+    pub fn capture(env: &EnvSnapshot, root: &Path) -> std::io::Result<Self> {
+        use aterm_toolchain::build_cache::{Machine, cargo_target_hint_with, read_config};
+        let root = physical(root);
+        let lookup = |key: &str| env.cargo_var(key);
+        let machine = Machine {
+            home: Some(env.home.as_path()).filter(|home| !home.as_os_str().is_empty()),
+            root: None,
+            cwd: Some(&root),
+            env: &lookup,
+            read: &read_config,
+            writable: &writable_dir,
+        };
+        let selected = cargo_target_hint_with(&machine)
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
+        let default_root = selected.is_none().then(|| root.clone());
+        let target = selected.map_or_else(
+            || root.join(aterm_toolchain::build_cache::DEFAULT_TARGET),
+            |target| physical(&target),
+        );
+        let plan = Self::selected(env, root, target, default_root);
+        plan.layout()?;
+        Ok(plan)
+    }
+
+    /// Capture an actual explicit native `--target-dir`, independently of Cargo's configured target.
+    #[must_use]
+    pub fn for_target(env: &EnvSnapshot, root: &Path, target: &Path) -> Self {
+        let root = physical(root);
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            root.join(target)
+        };
+        Self::selected(env, root, physical(&target), None)
+    }
+
+    /// Capture a generated final target under an artifact root independent of the source tree.
+    /// Source configuration still selects intermediates; cleaning the source cannot remove finals.
+    #[must_use]
+    pub fn for_default_target(env: &EnvSnapshot, source_root: &Path, target_root: &Path) -> Self {
+        let target_root = physical(target_root);
+        let target = target_root.join(aterm_toolchain::build_cache::DEFAULT_TARGET);
+        Self::selected(env, physical(source_root), target, Some(target_root))
+    }
+
+    fn selected(
+        env: &EnvSnapshot,
+        root: PathBuf,
+        target: PathBuf,
+        default_root: Option<PathBuf>,
+    ) -> Self {
+        use aterm_toolchain::build_cache::{
+            Machine, cargo_build_dir_hint_with, cargo_home_hint_with, read_config,
+        };
+        let lookup = |name: &str| env.cargo_var(name);
+        let machine = Machine {
+            home: Some(env.home.as_path()).filter(|home| !home.as_os_str().is_empty()),
+            root: None,
+            cwd: Some(&root),
+            env: &lookup,
+            read: &read_config,
+            writable: &writable_dir,
+        };
+        let compiler_layout = cargo_home_hint_with(&machine).and_then(|cargo_home| {
+            Ok(CompilerLayout {
+                cargo_home,
+                caller_build_dir: cargo_build_dir_hint_with(&machine)?,
+            })
+        });
+        let mut env = env.clone();
+        if let Ok(layout) = &compiler_layout {
+            env.cargo_layout.retain(|(name, _)| *name != "CARGO_HOME");
+            if let Some(home) = &layout.cargo_home {
+                env.cargo_layout
+                    .push(("CARGO_HOME", home.as_os_str().to_owned()));
+            }
+        }
+        let generated = compiler_layout
+            .as_ref()
+            .is_ok_and(|layout| layout.caller_build_dir.is_none());
+        let shared_build_dir = if generated {
+            main_build_dir(&env, &root)
+        } else {
+            None
+        };
+        let build_dir = if generated {
+            shared_build_dir
+                .clone()
+                .or_else(|| fallback_build_dir(&env, &root, &target))
+        } else {
+            None
+        };
+        Self {
+            env,
+            root,
+            target,
+            default_root,
+            shared_build_dir,
+            build_dir,
+            compiler_layout,
+        }
+    }
+
+    /// The exact final directory every child receives as `--target-dir` or `CARGO_TARGET_DIR`.
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// The exact intermediate-directory configuration selected with this target.
+    #[must_use]
+    pub fn build_dir(&self) -> Option<&str> {
+        self.build_dir.as_deref()
+    }
+
+    fn layout(&self) -> std::io::Result<&CompilerLayout> {
+        self.compiler_layout
+            .as_ref()
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.clone()))
+    }
+
+    /// Whether the caller selected intermediates, including valid opaque Cargo templates.
+    #[must_use]
+    pub fn has_explicit_build_dir(&self) -> bool {
+        self.compiler_layout
+            .as_ref()
+            .is_ok_and(|layout| layout.caller_build_dir.is_some())
+    }
+
+    /// The absolute lexical caller path, when Cargo need not compute a template to name it.
+    #[must_use]
+    pub fn explicit_build_dir(&self) -> Option<&Path> {
+        self.compiler_layout
+            .as_ref()
+            .ok()?
+            .caller_build_dir
+            .as_ref()?
+            .path()
+    }
+
+    /// Set/remove projection for every Cargo layout variable. Values come only from this plan;
+    /// valid Cargo templates remain unexpanded for the command's actual manifest workspace.
+    ///
+    /// # Errors
+    /// The captured layout was invalid or unresolved.
+    pub fn compiler_env(
+        &self,
+    ) -> std::io::Result<impl Iterator<Item = (&'static str, Option<&OsStr>)>> {
+        Ok(self.layout_env(self.layout()?))
+    }
+
+    fn layout_env<'a>(
+        &'a self,
+        layout: &'a CompilerLayout,
+    ) -> impl Iterator<Item = (&'static str, Option<&'a OsStr>)> {
+        [
+            ("CARGO_TARGET_DIR", Some(self.target.as_os_str())),
+            ("CARGO_BUILD_TARGET_DIR", None),
+            (
+                "CARGO_BUILD_BUILD_DIR",
+                layout
+                    .caller_build_dir
+                    .as_ref()
+                    .map(|choice| choice.value()),
+            ),
+            (
+                "CARGO_HOME",
+                layout.cargo_home.as_deref().map(Path::as_os_str),
+            ),
+        ]
+        .into_iter()
+    }
+
+    /// Apply the captured set/remove projection as command-local compiler environment.
+    ///
+    /// # Errors
+    /// The captured layout was invalid or unresolved.
+    pub fn apply_to_command(
+        &self,
+        command: &mut aterm_uds::spawnfd::Command,
+    ) -> std::io::Result<()> {
+        for (name, value) in self.compiler_env()? {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else {
+                command.env_remove(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_to_cmd(&self, layout: &CompilerLayout, mut command: exec::Cmd) -> exec::Cmd {
+        for (name, value) in self.layout_env(layout) {
+            command = if let Some(value) = value {
+                command.env(name, value)
+            } else {
+                command.remove_env(name)
+            };
+        }
+        command
+    }
+
+    fn prepare_target(&self) -> std::io::Result<()> {
+        self.layout()?;
+        if let Some(root) = &self.default_root {
+            atpkg::build_cache::registered::prepare_default_target(root)?;
+        }
+        Ok(())
+    }
+
+    /// Prepare the captured automatic final path and selected intermediates without reselecting
+    /// a target from later configuration or environment. Final target selection alone grants no custody.
+    ///
+    /// # Errors
+    /// The automatic final path or selected fallback cannot be prepared safely.
+    pub fn prepare(&self) -> std::io::Result<()> {
+        self.prepare_target()?;
+        prepare_selected_build_dir(
+            &self.env,
+            &self.root,
+            &self.target,
+            self.build_dir(),
+            self.default_root.is_some(),
+        )
+    }
 }
 
 /// The `build.build-dir` for main-lane children when [`main_build_dir`] is `None` and `target` is pinned.
 #[must_use]
 pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Option<String> {
     use aterm_toolchain::build_cache::{Machine, read_config, target_build_dir};
-    let lookup = |k: &str| {
-        env.cargo_layout
-            .iter()
-            .find(|(name, _)| *name == k)
-            .map(|(_, v)| v.clone())
-    };
+    let lookup = |key: &str| env.cargo_var(key);
     let target = std::path::absolute(target).ok()?;
     let machine = Machine {
         home: Some(&env.home)
@@ -359,6 +709,89 @@ pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Opti
         writable: &writable_dir,
     };
     target_build_dir(&target, &machine)
+}
+
+/// Native children bypass atpkg's shell shim. Prepare their captured automatic final target
+/// independently of intermediate placement, binding every child path to that same plan.
+fn prepare_main_build_dir(ctx: &Ctx) -> std::io::Result<()> {
+    let plan = ctx
+        .native_build_plan()
+        .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.clone()))?;
+    let child_target = ctx
+        .child_env_add
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CARGO_TARGET_DIR")
+        .map(|(_, value)| value.as_os_str());
+    if plan.root != ctx.root
+        || plan.target != ctx.target_dir
+        || plan.build_dir != ctx.main_build_dir
+        || child_target != Some(plan.target.as_os_str())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the captured native build plan differs from its child configuration",
+        ));
+    }
+    if ctx.checks.iter().copied().any(disk::builds) {
+        plan.prepare()
+    } else {
+        plan.prepare_target()
+    }
+}
+
+/// Prepare an exact producer-selected fallback before a native compiler starts. Layout
+/// resolution stays pure: a caller's override or a shared cache receives no new authority.
+///
+/// # Errors
+/// The generated fallback is no longer eligible, or its private directory or managed custody
+/// cannot be established.
+fn prepare_selected_build_dir(
+    env: &EnvSnapshot,
+    root: &Path,
+    target: &Path,
+    selected: Option<&str>,
+    automatic_target: bool,
+) -> std::io::Result<()> {
+    use aterm_toolchain::build_cache::{Machine, Tool, read_config};
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let generated = aterm_toolchain::build_cache::target_build_config(target);
+    if selected.is_none() || selected != generated.as_deref() {
+        return Ok(());
+    }
+    if fallback_build_dir(env, root, target).as_deref() != selected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected build-directory fallback changed before native admission; no compiler started",
+        ));
+    }
+    let lookup = |key: &str| {
+        if key == "CARGO_TARGET_DIR" {
+            Some(target.as_os_str().to_owned())
+        } else {
+            env.cargo_var(key)
+        }
+    };
+    let machine = Machine {
+        home: Some(env.home.as_path()).filter(|home| !home.as_os_str().is_empty()),
+        root: None,
+        cwd: Some(root),
+        env: &lookup,
+        read: &read_config,
+        writable: &writable_dir,
+    };
+    if !automatic_target {
+        atpkg::build_cache::registered::observe_command_with(
+            &["--unverified".into(), "check".into()],
+            Tool::Targo,
+            &machine,
+        )?;
+    }
+    // Scope limits custody, never the safety of a directory this producer selected. An
+    // external workspace receives no receipt but cannot redirect its new intermediates.
+    atpkg::build_cache::registered::prepare_target_build_dir(target)
 }
 
 /// Whether this process may write the directory `dir` (`access(2)`, which a
@@ -598,9 +1031,10 @@ fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 pub struct Ctx {
     /// The checkout's root, physical (every symlink resolved).
     pub root: PathBuf,
-    /// The caller's `CARGO_TARGET_DIR`, else `<root>/target`, physical ([`physical_target`]):
+    /// The captured Cargo target, else `<root>/target/.ubd/main.noindex` ([`NativeBuildPlan`]):
     /// the `CARGO_TARGET_DIR` of every child but a side lane's ([`Self::child_env_add`]).
     pub target_dir: PathBuf,
+    native_build_plan: Result<NativeBuildPlan, String>,
     /// The checks this run runs, in [`checks::CHECKS`] order.
     pub checks: Vec<Check>,
     /// The `release` set.
@@ -630,7 +1064,7 @@ pub struct Ctx {
     pub child_env_add: Vec<(OsString, OsString)>,
     /// The `build.build-dir` the main lane's children are handed as `--config`.
     pub main_build_dir: Option<String>,
-    /// Side-lane artifacts under the managed build cache, when the shim selected one.
+    /// Side-lane artifacts under the managed shared build cache, when selected.
     /// Caller-selected layouts keep side lanes beside their target directory.
     pub cached_lanes_dir: Option<PathBuf>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
@@ -645,6 +1079,8 @@ pub struct Ctx {
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`.
     pub no_windows: bool,
+    /// Fresh console-lock reading for native-window stages. Inert in constructed test contexts.
+    pub screen_locked: fn() -> bool,
     /// A focused GUI pacing measurement, never release qualification.
     pub cursor_pacing: bool,
     /// Run only the test compilation stage, never a release qualification.
@@ -667,9 +1103,11 @@ pub struct Ctx {
     /// How the timing stages ([`plan::TIMED`]), and the browser lane where Safari's window takes
     /// the desk (`browser::takes_the_desk`), take the quiet machine: the run waits in the
     /// per-user capacity ledger for measured admission before its first (`Some(Wait)`), and
-    /// retains bounded protection through its stages. `Some(Now)` cannot qualify Timing and
-    /// starts no timed callback. `None` is the caller's explicit untimed/outer-owned contract;
-    /// it supplies no CPU observation or measurement qualification.
+    /// retains bounded protection through its stages. `Some(Now)` cannot qualify Timing: a
+    /// measurement stage starts no callback, while the AppKit correctness drivers make one
+    /// non-overriding attempt to own the per-user window admission, then run and report their
+    /// live load without claiming measurement qualification. `None` is the caller's explicit
+    /// untimed/outer-owned contract; it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
     /// A repeatable watch sample whose stage admissions rank behind overlapping Ordinary work.
     pub background: bool,
@@ -686,11 +1124,18 @@ pub struct Ctx {
     pub passed_binaries: Option<testrun::Passed>,
     /// Per-package lint successes a release resume may carry by complete content key.
     pub passed_lint_packages: Option<lint_content::Passed>,
+    /// Prior successful AppKit groups whose current executable bytes must be re-keyed before
+    /// their WindowServer work can be carried.
+    pub passed_appkit_groups: Option<appkit_content::Passed>,
     /// Source-reader candidates from the immediately preceding preflight attempt.
     pub input_items: Vec<input_content::Proof>,
     /// The release cutter's frozen verifier, seal and toolchain context, salted into each test
     /// binary and lint-package content key (`--carry-context`).
     pub carry_context: Option<String>,
+    /// A development test run brackets each test binary's executable and declared runtime
+    /// inputs, as a release's does (`--input-drift`, [`testrun::evidence_context`]): a successful
+    /// binary whose inputs changed while it ran makes the test check NOT RUN. It carries nothing.
+    pub input_drift: bool,
     /// Where a run writes each `check-finished`, `test-binary-finished` and
     /// `lint-package-finished` line whole, apart from its output, and its check-terminal
     /// `run-finished` line (`--events`; later accounting may follow): a release's cutter keeps its
@@ -706,10 +1151,14 @@ pub struct Ctx {
     /// What the run's first proven red ends ([`halt_of`]): the tree half finishes its sweep
     /// unless explicitly fail-fast; other releases halt, and ordinary runs halt at preflight.
     pub halt: sched::Halt,
-    /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]): its
-    /// `--unit-graph` document, or why not; [`stages::unit_graph`] (resolved, never built) but
-    /// in a test.
-    pub unit_graph: fn(&Ctx, &shape::Piece) -> Result<String, String>,
+    /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]). The
+    /// boolean marks the exact closing call, whose graph includes every command folded into that
+    /// stage; [`stages::unit_graph`] resolves them without building, while tests supply fixtures.
+    pub unit_graph:
+        fn(&Ctx, &shape::Piece, bool, &mut unitgraph::Interner) -> Result<unitgraph::Graph, String>,
+    /// What enumerates the workspace members for adaptive test-compile shaping. Production reads
+    /// Cargo's resolved workspace; a planner test supplies a fixed graph beside [`Ctx::unit_graph`].
+    pub workspace_members: fn(&Ctx) -> changed::Members,
     /// What the run's shaped test compile has built so far, and what the fresh check said
     /// ([`shape::fresh_check`]).
     pub shape_run: Mutex<shape::Run>,
@@ -773,6 +1222,23 @@ pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
 }
 
 impl Ctx {
+    pub(crate) fn native_build_plan(&self) -> Result<&NativeBuildPlan, String> {
+        let plan = self.native_build_plan.as_ref().map_err(Clone::clone)?;
+        plan.layout().map_err(|why| why.to_string())?;
+        Ok(plan)
+    }
+
+    /// Stage construction is infallible; admission reports a captured-plan refusal before
+    /// any stage runs. Valid compiler commands carry their complete layout locally.
+    pub(crate) fn compiler_command(&self, command: exec::Cmd) -> exec::Cmd {
+        match &self.native_build_plan {
+            Ok(plan) => match &plan.compiler_layout {
+                Ok(layout) => plan.apply_to_cmd(layout, command),
+                Err(_) => command,
+            },
+            Err(_) => command,
+        }
+    }
     /// The run context, discovering its toolchain ([`run_toolchain`]).
     #[must_use]
     pub fn new(root: PathBuf, scope: Scope, env: EnvSnapshot, scratch: PathBuf) -> Self {
@@ -795,21 +1261,29 @@ impl Ctx {
             env.native_packages.as_deref(),
         );
         let root = physical(&root);
-        let target_dir = physical_target(&env, &root);
-        let shim_build_dir = main_build_dir(&env, &root);
+        let native_build_plan =
+            NativeBuildPlan::capture(&env, &root).map_err(|why| why.to_string());
+        let target_dir = native_build_plan.as_ref().map_or_else(
+            |_| root.join(aterm_toolchain::build_cache::DEFAULT_TARGET),
+            |plan| plan.target().to_path_buf(),
+        );
         // Physical as the target is: a side lane hands its children this as their target.
-        let cached_lanes_dir = shim_build_dir
-            .as_deref()
+        let cached_lanes_dir = native_build_plan
+            .as_ref()
+            .ok()
+            .and_then(|plan| plan.shared_build_dir.as_deref())
             .and_then(|value| disk::build_dir_path(value, &root))
             .map(|dir| physical(&dir.join("verify").join(aterm_tempfile::QUIET)));
         // The main lane names its build directory itself (`--config build.build-dir`), so the
-        // target this pins never moves the shim's cache; a side lane sets its own.
+        // target this pins never moves the shared intermediates; a side lane sets its own.
         let mut child_env_add: Vec<(OsString, OsString)> = vec![(
             "CARGO_TARGET_DIR".into(),
             target_dir.clone().into_os_string(),
         )];
-        let main_build_dir =
-            shim_build_dir.or_else(|| fallback_build_dir(&env, &root, &target_dir));
+        let main_build_dir = native_build_plan
+            .as_ref()
+            .ok()
+            .and_then(|plan| plan.build_dir().map(str::to_owned));
         if tools.have_targo() {
             child_env_add.push((
                 "TRUST_STAGE2_BIN".into(),
@@ -820,6 +1294,7 @@ impl Ctx {
         let mut ctx = Self {
             root,
             target_dir,
+            native_build_plan,
             checks: checks::DEV.to_vec(),
             release: false,
             fix: false,
@@ -840,6 +1315,7 @@ impl Ctx {
             head_at_start: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
+            screen_locked: || false,
             cursor_pacing: false,
             compile_only: false,
             checkers_in_tests: false,
@@ -855,13 +1331,16 @@ impl Ctx {
             test_history: None,
             passed_binaries: None,
             passed_lint_packages: None,
+            passed_appkit_groups: None,
             input_items: Vec::new(),
             carry_context: None,
+            input_drift: false,
             events: None,
             hang_samples: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
             halt: sched::Halt::off(),
             unit_graph: stages::unit_graph,
+            workspace_members: |ctx| changed::read_members(&ctx.root, &ctx.tools, &ctx.path_env),
             shape_run: Mutex::new(shape::Run::default()),
             began: std::time::SystemTime::now(),
             unit_reader: memory::read_unit,
@@ -970,12 +1449,12 @@ impl Ctx {
         self.target_dir.join("verify")
     }
 
-    /// This process's parallelism (`available_parallelism`: the cores it may run on, which an
-    /// affinity mask or a cgroup quota narrows), at least one: what bounds the run's own direct
-    /// concurrency. The machine's cores are [`aterm_capacity::cores`].
+    /// This process's parallelism ([`aterm_cores::available_parallelism`]: the cores it may run
+    /// on, which an affinity mask, a cgroup quota or a verifier's grant narrows), at least one:
+    /// what bounds the run's own direct concurrency. The machine's cores are [`aterm_capacity::cores`].
     #[must_use]
     pub fn parallelism(&self) -> u32 {
-        std::thread::available_parallelism()
+        aterm_cores::available_parallelism()
             .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
     }
 
@@ -1086,6 +1565,13 @@ impl Ctx {
         self
     }
 
+    /// Inject the console-lock source used before native-window stages.
+    #[must_use]
+    pub const fn with_screen_lock_source(mut self, source: fn() -> bool) -> Self {
+        self.screen_locked = source;
+        self
+    }
+
     /// Select only the GUI cursor-pacing burst.
     #[must_use]
     pub const fn with_cursor_pacing(mut self, focused: bool) -> Self {
@@ -1142,11 +1628,25 @@ impl Ctx {
         self
     }
 
+    /// Carry prior AppKit group successes when their current executable bytes still match.
+    #[must_use]
+    pub fn with_passed_appkit_groups(mut self, passed: Option<appkit_content::Passed>) -> Self {
+        self.passed_appkit_groups = passed;
+        self
+    }
+
     /// Salt test evidence with its frozen caller context, or release lint with its frozen
     /// verifier, seal and toolchain context.
     #[must_use]
     pub fn with_carry_context(mut self, context: Option<String>) -> Self {
         self.carry_context = context;
+        self
+    }
+
+    /// Bracket each development test binary's inputs ([`Ctx::input_drift`]).
+    #[must_use]
+    pub fn with_input_drift(mut self, input_drift: bool) -> Self {
+        self.input_drift = input_drift;
         self
     }
 
@@ -1280,6 +1780,7 @@ pub(crate) type Admitter = fn(
 #[derive(Clone, Copy)]
 struct Seams {
     stage: fn(&Ctx, &plan::StageSpec) -> Report,
+    prepare_build_dir: fn(&Ctx) -> std::io::Result<()>,
     prepare_cells: Option<fn(&Ctx) -> Option<cells::PreparedRun>>,
     admit_quiet: Admitter,
     admit_memory: Admitter,
@@ -1292,6 +1793,7 @@ mod stage_diagnostic_tests;
 /// The stages themselves, and the per-user capacity ledger on the live machine.
 const LIVE: Seams = Seams {
     stage: stages::run_stage,
+    prepare_build_dir: prepare_main_build_dir,
     prepare_cells: Some(stages::prepare_cells),
     admit_quiet: admit_live,
     admit_memory: admit_live,
@@ -1447,6 +1949,22 @@ impl Quiet {
         if self.left == 0 {
             self.claim = None;
         }
+    }
+}
+
+/// One started timed stage's turn in the run's [`Quiet`]: dropped, on return or on a panic's
+/// unwind ([`sched::run_stages`] re-raises a stage's panic), it calls [`Quiet::passed`], so a
+/// stage that panics never leaves the run's quiet or window claim held behind it until every
+/// other running stage ends.
+#[must_use = "the stage's turn passes when the guard drops"]
+struct Passes<'a>(&'a Mutex<Quiet>);
+
+impl Drop for Passes<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .passed();
     }
 }
 
@@ -1759,12 +2277,8 @@ fn quietly_with<T>(
     let claim = q.claim.clone();
     drop(q);
     let _quiet = holding_quiet_claim(claim);
-    let out = f();
-    quiet
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .passed();
-    Ok((out, Some(said)))
+    let _passes = Passes(quiet);
+    Ok((f(), Some(said)))
 }
 
 /// The ` time ` line under a stage in the log: how long it ran, when it started, and `machine`,
@@ -1792,6 +2306,97 @@ pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
 fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
     let desk = id == plan::StageId::BrowserLane && browser::takes_the_desk(ctx);
     (id.timed() || desk) && !plan::named_skip(ctx, id)
+}
+
+const APPKIT_NOW: &str = "ran immediately under --admit now without quiet qualification; live \
+load is reported, not a refusal";
+
+/// Make one non-overriding attempt to own the per-user window admission on the live machine.
+///
+/// # Errors
+/// The capacity ledger is unavailable.
+fn try_window_live(
+    need: aterm_capacity::Need,
+) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
+    let ledger = aterm_capacity::Ledger::user().ok_or_else(|| {
+        aterm_capacity::Error::Ledger(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to keep the ledger under",
+        ))
+    })?;
+    aterm_capacity::admit::try_admit_with(&ledger, &aterm_capacity::Live, need)
+}
+
+/// Run `f` under the timing rule for `id`. AppKit's live correctness drivers have no timing
+/// verdict: an explicit immediate release gate must execute them under the load it finds, while
+/// the machine readings around the stage retain that load in its time line. Measurements still
+/// require qualified timing admission and therefore fail closed under `--admit now`.
+fn run_timed<T>(
+    ctx: &Ctx,
+    quiet: &Mutex<Quiet>,
+    id: plan::StageId,
+    title: &str,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<String>), String> {
+    run_timed_with(ctx, quiet, id, title, try_window_live, f)
+}
+
+fn run_timed_with<T>(
+    ctx: &Ctx,
+    quiet: &Mutex<Quiet>,
+    id: plan::StageId,
+    title: &str,
+    mut try_window: impl FnMut(
+        aterm_capacity::Need,
+    ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<String>), String> {
+    if !takes_quiet(ctx, id) {
+        return f().map(|out| (out, None));
+    }
+    if ctx.quiet == Some(aterm_capacity::Admit::Now)
+        && matches!(
+            id,
+            plan::StageId::RedrawConformance | plan::StageId::ObjcDrives
+        )
+    {
+        let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(why) = ended(ctx) {
+            q.passed();
+            return Err(why);
+        }
+        if q.claim.is_none() {
+            let need = aterm_capacity::Need::new(format!("verify {title}"))
+                // Infinity ignores load while retaining the ledger's cross-process exclusion:
+                // another quiet/window claim is still a shortfall. No patience means no GPU or
+                // timing wait, and `try_admit_with` makes exactly one non-overriding look.
+                .quiet(f64::INFINITY)
+                .checkout(ctx.root.to_string_lossy());
+            match try_window(need) {
+                Ok(Some(claim)) => q.claim = Some(Arc::new(claim)),
+                Ok(None) => {
+                    q.passed();
+                    return Err(format!(
+                        "{title}: the per-user window admission was unavailable at its immediate \
+                         look; started nothing"
+                    ));
+                }
+                Err(error) => {
+                    q.passed();
+                    return Err(format!(
+                        "{title}: the per-user window admission is unavailable: {error}; started \
+                         nothing"
+                    ));
+                }
+            }
+        }
+        let claim = q.claim.clone();
+        drop(q);
+        let _quiet = holding_quiet_claim(claim);
+        let _passes = Passes(quiet);
+        return f().map(|out| (out, Some(APPKIT_NOW.to_owned())));
+    }
+    quietly(ctx, quiet, title, f).and_then(|(out, admitted)| Ok((out?, admitted)))
 }
 
 /// What stage `spec`'s memory did, for its time line, what it held read off `meter`
@@ -1847,18 +2452,17 @@ fn measured(
         ),
         Err(e) => format!("memory: peaked {size}, not kept: {e}"),
     };
-    // The shaping book remains meter-derived and independent of release pooling. It is what a
-    // later test compile uses to split heavy packages even in ordinary, unpooled verification.
-    if spec.id == plan::StageId::TestCompile
-        && let Err(error) = book.keep_units(&key.checkout, &meter.unit_peaks())
+    // The shaping book remains meter-derived and independent of release pooling. It retains every
+    // compiler the meter identified, raising a light one to the meter's floor, because a later
+    // plan may sum unit peaks only when its history covers every named unit.
+    let unit_peaks = (spec.id == plan::StageId::TestCompile).then(|| meter.unit_claim_peaks());
+    if let Some(unit_peaks) = &unit_peaks
+        && let Err(error) = book.keep_units(&key.checkout, unit_peaks)
     {
         said.push_str(&format!("; test compiler shapes not kept: {error}"));
     }
-    if spec.id == plan::StageId::TestCompile
-        && let Some(units) = units
-    {
-        let unit_peaks = meter.unit_claim_peaks();
-        match compile_width::keep_meter_units(book, spec.id, units, &unit_peaks) {
+    if let (Some(units), Some(unit_peaks)) = (units, &unit_peaks) {
+        match compile_width::keep_meter_units(book, spec.id, units, unit_peaks) {
             Ok(kept) if kept > 0 => said.push_str(&format!(
                 "; {kept} compiler footprint peak{} merged into its unit book",
                 if kept == 1 { "" } else { "s" }
@@ -1940,7 +2544,8 @@ impl EarlyClaims {
             .map(|stage| {
                 // Branded Tippy deliberately excludes outer compiler wrappers, so its retained
                 // whole-stage history is the only enforceable memory envelope. Its pooled claim
-                // applies the measured floor after this normally planned estimate.
+                // is that measured peak, or the machine's memory alone where none is kept
+                // (`compile_width::lint_claim`).
                 let early = stage.clone();
                 before_stage_claim(ctx)
                     .and_then(|()| claim_memory(ctx, &early, admit))
@@ -2152,6 +2757,7 @@ fn claim_bytes(
     } else {
         format!("claimed {why}")
     };
+    let resource = if cores > 0 { "resource" } else { "memory" };
     match admitted {
         Ok(claim) => {
             let how = admitted_how(&claim, mode);
@@ -2159,7 +2765,7 @@ fn claim_bytes(
                 claim: Arc::new(claim),
                 said: format!(
                     "{}: {what}{how}",
-                    if cores > 0 { "resources" } else { "memory" }
+                    if cores > 0 { "resources" } else { resource }
                 ),
                 units: None,
             })
@@ -2169,21 +2775,21 @@ fn claim_bytes(
         }
         Err(e @ aterm_capacity::Error::Stopped { .. }) => {
             eprintln!(
-                "verify: {title}: its memory claim was {e}; the run ends, and what it did not \
+                "verify: {title}: its {resource} claim was {e}; the run ends, and what it did not \
                  decide COULD NOT RUN"
             );
             #[cfg(unix)]
             exec::group::stop_run();
             Err(format!(
-                "its memory claim was {e}; it started nothing, and the run ends"
+                "its {resource} claim was {e}; it started nothing, and the run ends"
             ))
         }
         Err(e @ aterm_capacity::Error::Stuck { .. }) => {
-            eprintln!("verify: {title}: its memory claim {e}; {title} decided nothing");
-            Err(format!("its memory claim {e}; it started nothing"))
+            eprintln!("verify: {title}: its {resource} claim {e}; {title} decided nothing");
+            Err(format!("its {resource} claim {e}; it started nothing"))
         }
         Err(e) => Err(format!(
-            "its memory claim could not be admitted ({e}); it started nothing"
+            "its {resource} claim could not be admitted ({e}); it started nothing"
         )),
     }
 }
@@ -2262,11 +2868,7 @@ fn staged(
             .map_err(|e| format!("CPU tokens could not be acquired: {e}"))?;
         Ok((report, begun, machine, claim, jobs))
     };
-    let ran = if takes_quiet(ctx, spec.id) {
-        quietly(ctx, quiet, &spec.title, run).and_then(|(ran, admitted)| Ok((ran?, admitted)))
-    } else {
-        run().map(|ran| (ran, None))
-    };
+    let ran = run_timed(ctx, quiet, spec.id, &spec.title, run);
     let ((report, begun, mut machine, claim, jobs), admitted) = match ran {
         Ok(ran) => ran,
         Err(why) => return could_not_run(why, held),
@@ -2316,17 +2918,27 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
     let holds = |p: &str| ctx.scope.includes_crate(p);
     let pulled = checks::pulled(&checks::DEV, holds);
     let pulled_without_forge = checks::with_pulled(&checks::DEV, false, holds);
+    let appkit = (!ctx.release && own.contains(&Check::Appkit))
+        .then(|| {
+            checks::appkit_pull(&checks::DEV, false, cfg!(target_os = "macos"), |p| {
+                ctx.scope.includes_crate(p)
+            })
+        })
+        .flatten();
+    let mut pulled_set = pulled_without_forge;
+    if appkit.is_some() {
+        pulled_set = checks::with(&pulled_set, Check::Appkit);
+    }
     let looks_like_forge_pull = !ctx.release
         && own.contains(&Check::Forge)
         && own
             .iter()
             .copied()
             .filter(|check| *check != Check::Forge)
-            .eq(pulled_without_forge.iter().copied());
+            .eq(pulled_set.iter().copied());
     let forge = looks_like_forge_pull
         .then(|| checks::forge_pull(&checks::DEV, false, &ctx.root, |p| ctx.scope.touches(p)))
         .flatten();
-    let mut pulled_set = pulled_without_forge;
     if forge.is_some() {
         pulled_set = checks::with(&pulled_set, Check::Forge);
     }
@@ -2343,11 +2955,15 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         }
     } else if own == checks::DEV {
         "dev".to_string()
-    } else if (!pulled.is_empty() || forge.is_some()) && own == pulled_set {
+    } else if (!pulled.is_empty() || forge.is_some() || appkit.is_some()) && own == pulled_set {
         let (mut added, mut by): (Vec<&str>, Vec<&str>) =
             pulled.iter().map(|(c, p)| (c.name(), *p)).unzip();
         if let Some(reason) = forge.as_deref() {
             added.push(Check::Forge.name());
+            by.push(reason);
+        }
+        if let Some(reason) = appkit {
+            added.push(Check::Appkit.name());
             by.push(reason);
         }
         format!(
@@ -2422,7 +3038,10 @@ fn run_with(
 ) -> std::io::Result<i32> {
     ctx.record_event(&format!(
         "verify-event: {}",
-        aterm_json::json!({"schema":1,"event":"measure-driver","sha256":report::running_driver()})
+        crate::event_log::event_value(
+            crate::event_log::EventKind::MeasureDriver,
+            aterm_json::json!({"sha256":report::running_driver()})
+        )
     ));
     if let Err(why) = test_workers::admitted_share(&ctx.env)
         .and_then(|_| test_workers::share(&ctx.env, ctx.pool.as_deref()))
@@ -2430,6 +3049,17 @@ fn run_with(
         writeln!(out, "verify: {why}; no check was run")?;
         let _ = writeln!(log, "verify: {why}; no check was run");
         return Ok(exit::USAGE);
+    }
+    if let Err(why) = (seams.prepare_build_dir)(ctx) {
+        writeln!(
+            out,
+            "verify: could not prepare the build directory: {why}; no check was run"
+        )?;
+        let _ = writeln!(
+            log,
+            "verify: could not prepare the build directory: {why}; no check was run"
+        );
+        return Ok(exit::COULD_NOT_RUN);
     }
     let cone = show.cone;
     let started = Instant::now();
@@ -2494,10 +3124,13 @@ fn run_with(
         for (cell, triple, why) in prepared.unavailable(ctx) {
             let event = ctx.record_event(&format!(
                 "verify-event: {}",
-                aterm_json::json!({
-                    "schema":1, "event":"cell-prerequisite-unavailable", "complete":false,
-                    "cell":cell, "triple":triple, "detail":why
-                })
+                crate::event_log::event_value(
+                    crate::event_log::EventKind::CellPrerequisiteUnavailable,
+                    aterm_json::json!({
+                          "complete":false,
+                        "cell":cell, "triple":triple, "detail":why
+                    })
+                )
             ));
             out.write_all(event.as_bytes())?;
             writeln!(
@@ -2670,6 +3303,10 @@ fn run_with(
         head_at_start.as_deref(),
         head_commit(&ctx.root, &ctx.path_env).as_deref(),
     );
+    #[cfg(unix)]
+    for evidence in aterm_uds::signal_origin::records() {
+        let _ = writeln!(log, "{evidence}");
+    }
     ctx.record_event(&report::run_event(&results, code));
     let _ = writeln!(log, "\n{line}");
     writeln!(out, "{line}")?;
@@ -2711,27 +3348,21 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     for note in &ctx.lock_notes {
         s.push_str(&format!("toolchain note: {note}\n"));
     }
-    // Only the shim's cache has a verification cache in it ([`Ctx::cached_lanes_dir`]).
+    // Only the managed shared cache carries verification artifacts ([`Ctx::cached_lanes_dir`]).
     let shared = ctx.cached_lanes_dir.is_some();
     match (&ctx.main_build_dir, shared) {
-        (Some(value), true) if value.contains(&format!("/{}/", aterm_tempfile::QUIET)) => {
+        (Some(value), true) => {
             s.push_str(&format!(
-                "build cache: the main lane shares plain targo's ({value}), its target {}\n",
+                "build cache: shared intermediates ({value}), target {}\n",
                 ctx.target_dir.display()
             ));
         }
-        (Some(value), true) => s.push_str(&format!(
-            "build cache: the main lane shares plain targo's ({value}), its target {}, outside \
-             .ubd: the targo shim on PATH predates the quiet cache, and an aterm update lays the \
-             new one\n",
-            ctx.target_dir.display()
-        )),
         (Some(value), false) => s.push_str(&format!(
-            "build cache: CARGO_TARGET_DIR={}, intermediates out of Spotlight ({value}; no shim cache here)\n",
+            "build cache: CARGO_TARGET_DIR={}, local intermediates ({value})\n",
             ctx.target_dir.display()
         )),
         (None, _) => s.push_str(&format!(
-            "build cache: CARGO_TARGET_DIR={} (no shim cache here; the caller chose the build directory)\n",
+            "build cache: CARGO_TARGET_DIR={} (no managed intermediates directory)\n",
             ctx.target_dir.display()
         )),
     }
@@ -2917,7 +3548,12 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
 /// The checks a parsed invocation runs after selection-sensitive pulls. This is the one planner
 /// used by [`run_cli`]: tests exercise it directly so a check cannot be implemented correctly but
 /// left disconnected from the command that lands changes.
-fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>, bool) {
+fn planned_checks_for_host(
+    parsed: &cli::Args,
+    scope: &Scope,
+    root: &Path,
+    macos: bool,
+) -> (Vec<Check>, bool) {
     let mut wanted = parsed.wanted(|package| scope.includes_crate(package));
     if checks::forge_pull(
         &parsed.checks,
@@ -2929,11 +3565,25 @@ fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>
     {
         wanted = checks::with(&wanted, Check::Forge);
     }
+    if checks::appkit_pull(
+        &parsed.checks,
+        parsed.release || parsed.as_release,
+        macos,
+        |package| scope.includes_crate(package),
+    )
+    .is_some()
+    {
+        wanted = checks::with(&wanted, Check::Appkit);
+    }
     let cells_pulled = checks::pulls_cells(&wanted, parsed.release, !scope.selects_nothing());
     if cells_pulled {
         wanted = checks::with(&wanted, Check::Cells);
     }
     (wanted, cells_pulled)
+}
+
+fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>, bool) {
+    planned_checks_for_host(parsed, scope, root, cfg!(target_os = "macos"))
 }
 
 /// The whole CLI, in-process.
@@ -3034,6 +3684,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Some(Ok(passed)) => Some(passed),
         None => None,
     };
+    let passed_appkit_groups = match parsed.passed_appkit_groups.as_deref().map(|path| {
+        aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 64 * 1024)
+            .map_err(|error| error.to_string())
+            .and_then(|text| appkit_content::read_passed(&text))
+            .map_err(|why| format!("verify: --passed-appkit-groups {}: {why}", path.display()))
+    }) {
+        Some(Err(why)) => return stop(exit::USAGE, why),
+        Some(Ok(passed)) => Some(passed),
+        None => None,
+    };
     let events = match parsed
         .events
         .as_deref()
@@ -3045,6 +3705,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     };
     if let Some(note) = cli::ignored_selection(&parsed) {
         eprintln!("verify: {note}");
+    }
+    if git_provider::pin().is_none() {
+        return could_not_run("no absolute executable Git on PATH".into());
     }
     let Some(root) = checkout_root(cwd) else {
         return could_not_run(format!(
@@ -3082,6 +3745,15 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     };
     if let Some(d) = &tools.demoted {
         eprintln!("verify: toolchain: {}", d.sentence());
+    }
+    // A conflicted or plain `git merge` leaves vendor/astream checked out at the branch's old
+    // pin, and staging that records it: forge's own OB-1 pin judgments refuse both before
+    // anything builds the older astream, in every run, not only those that pull `forge`.
+    if let Err(why) = aterm_forge::astream_pin(&root) {
+        return stop(
+            exit::FAILED,
+            format!("verify: FAIL — [OB-1] {why}; no check was run"),
+        );
     }
     if parsed.builds_packages_here() {
         let path_env = tools.path_with_stage2_first(&env.path);
@@ -3160,7 +3832,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_cores(parsed.test_cores)
         .with_passed_binaries(passed_binaries)
         .with_passed_lint_packages(passed_lint_packages)
+        .with_passed_appkit_groups(passed_appkit_groups)
         .with_carry_context(parsed.carry_context.clone())
+        .with_input_drift(parsed.input_drift)
         .with_events(events)
         .with_quiet(Some(if parsed.background {
             aterm_capacity::Admit::Preemptible
@@ -3177,7 +3851,15 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
     ctx.background = parsed.background;
+    #[cfg(target_os = "macos")]
+    {
+        ctx.screen_locked = smoke::screen_locked;
+    }
     ctx.test_seed = parsed.test_seed;
+    if let Err(error) = prepare_main_build_dir(&ctx) {
+        end_run(&ctx, &scratch);
+        return could_not_run(format!("cannot prepare the captured build plan: {error}"));
+    }
     let mut ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
@@ -3204,6 +3886,12 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     let mut log = open_run_log(&mut ctx, parsed.log.as_deref(), cwd);
+    #[cfg(unix)]
+    if let Some(log) = &log
+        && let Err(why) = log.observe_signals(ctx.events.clone())
+    {
+        eprintln!("signal log unavailable: {why}");
+    }
     ctx.hang_samples = log.as_ref().map(|log| run_log::sample_dir(&log.path));
     let log_shown = log.as_ref().map(|log| log.path.display().to_string());
     let mut sink = std::io::sink();
@@ -3268,7 +3956,13 @@ fn open_run_log(ctx: &mut Ctx, chosen: Option<&Path>, cwd: &Path) -> Option<run_
     }
     event_log::emit(
         ctx.events.as_ref(),
-        "verify-event: {\"schema\":1,\"event\":\"invocation-started\"}",
+        &format!(
+            "verify-event: {}",
+            event_log::event_value(
+                event_log::EventKind::InvocationStarted,
+                aterm_json::json!({})
+            )
+        ),
     );
     log
 }
@@ -3369,37 +4063,23 @@ fn end_run(ctx: &Ctx, scratch: &Path) {
     exec::group::end_interrupted();
 }
 
-/// A private scratch directory named for `tag`, made atomically. On Unix it is `mktemp -d`'s,
-/// under `/tmp`, which keeps unix-socket paths under macOS's 104-byte `sockaddr_un` limit;
-/// elsewhere (Windows has no `mktemp`) it is [`aterm_tempfile`]'s, in the temporary directory.
-/// The caller removes it.
+/// A private scratch directory named for `tag`, made atomically by [`aterm_tempfile`]. Unix
+/// uses the short `/tmp` root (its `.ubd` folder on macOS), keeping smoke socket paths below
+/// macOS's 104-byte `sockaddr_un` limit. Elsewhere it uses the system temporary directory.
+/// The caller removes it; the `.noindex` suffix keeps the tree out of Spotlight too.
 ///
 /// # Errors
-/// Fails when `mktemp` is absent or refuses to create the directory, or, off Unix, when the
-/// temporary directory refuses it.
+/// Fails when the temporary directory refuses creation or `tag` contains a path separator.
 pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
-    if !cfg!(unix) {
-        return Ok(aterm_tempfile::Builder::new()
-            .prefix(&format!("{tag}."))
-            .suffix(".noindex")
-            .tempdir()?
-            .keep());
-    }
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("mktemp"))
-        .arg("-d")
-        .arg(format!("/tmp/{tag}.XXXXXX"))
-        .output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "mktemp -d /tmp/{tag}.XXXXXX failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err(std::io::Error::other("mktemp -d printed no path"));
-    }
-    Ok(PathBuf::from(path))
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("{tag}."))
+        .suffix(".noindex");
+    let directory = if cfg!(unix) {
+        builder.tempdir_in("/tmp")
+    } else {
+        builder.tempdir()
+    }?;
+    Ok(directory.keep())
 }
 
 /// Put an executable `#!/bin/sh` stand-in running `body` at `path`, replacing whatever is there.
@@ -3520,1642 +4200,5 @@ mod live_halt_tests;
 mod memory_claim_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_production_planner_pulls_forge_only_for_a_dev_touch_of_a_fork() {
-        let manifest_dir = aterm_tempfile::manifest_dir();
-        let root = manifest_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("aterm-verify is two directories below the workspace root");
-        let parsed = |words: &[&str]| {
-            let parsed = cli::parse(words.iter().copied()).expect("the invocation parses");
-            let scope = Scope::packages(&parsed.packages);
-            planned_checks(&parsed, &scope, root).0
-        };
-
-        let fork = parsed(&["-p", "aterm-window"]);
-        assert!(fork.contains(&Check::Forge), "default dev plan: {fork:?}");
-        assert!(
-            checks::stages_of(&fork).contains(&plan::StageId::Forge),
-            "`verify -p aterm-window` must carry the Forge stage that runs OB-7: {fork:?}"
-        );
-        let unrelated = parsed(&["-p", "aterm-types"]);
-        assert!(
-            !unrelated.contains(&Check::Forge),
-            "an unrelated package does not pay for Forge: {unrelated:?}"
-        );
-        let explicit_lint = parsed(&["lint", "-p", "aterm-window"]);
-        assert!(
-            !explicit_lint.contains(&Check::Forge),
-            "an explicitly narrow non-dev invocation stays exact: {explicit_lint:?}"
-        );
-
-        let dev = cli::parse(std::iter::empty::<&str>()).expect("default invocation parses");
-        let vendored_seed = Scope::changed("origin/main", vec!["aterm-gui".into()], true)
-            .with_seeds(vec!["aterm-window".into()]);
-        let changed = planned_checks(&dev, &vendored_seed, root).0;
-        assert!(
-            changed.contains(&Check::Forge),
-            "a touched vendored seed need not itself be a workspace cone member: {changed:?}"
-        );
-        let dependent_only = Scope::changed(
-            "origin/main",
-            vec!["aterm-window".into(), "aterm-gui".into()],
-            true,
-        )
-        .with_seeds(vec!["aterm-gui".into()]);
-        let dependent = planned_checks(&dev, &dependent_only, root).0;
-        assert!(
-            !dependent.contains(&Check::Forge),
-            "a fork merely present in the dependent cone was not touched: {dependent:?}"
-        );
-    }
-
-    #[test]
-    fn background_runs_admit_their_disk_as_background() {
-        assert_eq!(
-            run_admit_mode(true, aterm_capacity::Admit::Wait),
-            aterm_capacity::Admit::Preemptible
-        );
-        assert_eq!(
-            run_admit_mode(false, aterm_capacity::Admit::Wait),
-            aterm_capacity::Admit::Wait,
-            "negative control: an ordinary verifier keeps its requested mode"
-        );
-        assert_eq!(
-            run_admit_mode(false, aterm_capacity::Admit::Now),
-            aterm_capacity::Admit::Now,
-            "negative control: --admit now remains an ordinary override"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scratch_permission_changes_refuse_links_and_regular_files() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let root = aterm_tempfile::tempdir().unwrap();
-        let directory = root.path().join("directory");
-        std::fs::create_dir(&directory).unwrap();
-        set_dir_mode_nofollow(&directory, 0o700).unwrap();
-        let link = root.path().join("link");
-        symlink(&directory, &link).unwrap();
-        assert!(set_dir_mode_nofollow(&link, 0o777).is_err());
-        assert_eq!(
-            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
-            0o700
-        );
-        let file = root.path().join("file");
-        std::fs::write(&file, b"untouched").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(set_dir_mode_nofollow(&file, 0o777).is_err());
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
-            0o600
-        );
-    }
-
-    /// A child's captured output past the cap on the files verify reads is read whole (a sparse
-    /// file, so the test writes no 128 MiB to disk).
-    #[test]
-    fn a_childs_output_is_read_whole_past_the_file_cap() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let out = dir.path().join("stdout");
-        std::fs::File::create(&out)
-            .unwrap()
-            .set_len(MAX_VERIFY_FILE_BYTES + 1)
-            .unwrap();
-        assert!(read_regular(&out).is_err(), "an input file past the cap");
-        let read = read_captured(&out).expect("a child's output past the cap");
-        assert_eq!(
-            u64::try_from(read.len()).unwrap(),
-            MAX_VERIFY_FILE_BYTES + 1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn child_tools_find_native_packages_after_the_callers_choices() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let caller = dir.path().join("caller");
-        let native = dir.path().join("native");
-        standin(&caller.join("oracle"), "printf caller");
-        standin(&native.join("bin/oracle"), "printf native");
-        let ctx = Ctx::new(
-            dir.path().into(),
-            Scope::workspace(),
-            EnvSnapshot {
-                path: caller.as_os_str().to_owned(),
-                native_packages: Some(native),
-                ..EnvSnapshot::default()
-            },
-            dir.path().into(),
-        );
-        let run = || {
-            exec::run(
-                &exec::Cmd::new(aterm_uds::os_path!("sh")).args(["-c", "oracle"]),
-                ctx.exec_env(),
-            )
-        };
-        let first = run();
-        assert!(first.ok, "{}", first.output);
-        assert_eq!(first.output, "caller");
-        std::fs::remove_file(caller.join("oracle")).unwrap();
-        let second = run();
-        assert!(second.ok, "{}", second.output);
-        assert_eq!(second.output, "native");
-        assert_eq!(
-            native_package_path(caller.as_os_str(), None),
-            caller.as_os_str(),
-            "an absent or disabled native prefix adds no search path"
-        );
-    }
-
-    /// A fixture going removes no name of the file another fixture's stand-in of the same text
-    /// runs ([`standin`]): that file has one name, outside every fixture, and the stand-in
-    /// still reads its body beside its own path.
-    #[cfg(unix)]
-    #[test]
-    fn a_fixture_going_leaves_the_file_another_standin_runs_its_one_name() {
-        use std::os::unix::fs::MetadataExt as _;
-        let gone = mktemp_dir("atv-standin-gone").expect("mktemp");
-        let kept = mktemp_dir("atv-standin-kept").expect("mktemp");
-        standin_body(&gone.join("tool"), "exit 6");
-        standin_body(&kept.join("tool"), "exit 7");
-        std::fs::remove_dir_all(&gone).expect("the first fixture goes");
-        let ran = aterm_uds::spawnfd::command(kept.join("tool"))
-            .status()
-            .map(|s| s.code());
-        let runs = std::fs::canonicalize(kept.join("tool")).expect("the stand-in resolves");
-        let fixture = std::fs::canonicalize(&kept).expect("the fixture resolves");
-        let names = std::fs::metadata(&runs).map(|m| m.nlink());
-        std::fs::remove_dir_all(&kept).expect("the second fixture goes");
-        assert_eq!(ran.ok(), Some(Some(7)), "the stand-in ran its own body");
-        assert!(
-            !runs.starts_with(&fixture),
-            "{} runs from inside its fixture",
-            runs.display()
-        );
-        assert_eq!(
-            names.ok(),
-            Some(1),
-            "{} has names a fixture removes",
-            runs.display()
-        );
-    }
-
-    #[test]
-    fn a_borrowed_tools_build_is_held_for_the_run() {
-        #[cfg(unix)]
-        if !aterm_uds::test_binary::isolated_lifecycle(
-            "tests::a_borrowed_tools_build_is_held_for_the_run",
-        ) {
-            return;
-        }
-        use aterm_toolchain::lease::{self, Holders, Subject};
-        let home = std::fs::canonicalize(mktemp_dir("atv-lease").expect("mktemp")).expect("real");
-        let env = EnvSnapshot {
-            home: home.clone(),
-            xdg_config_home: Some(home.join("xdg")),
-            ..EnvSnapshot::default()
-        };
-        let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
-        let managed = prefix.join("store/trust/9192/bin");
-        std::fs::create_dir_all(&managed).expect("store build");
-        let own = home.join("trust/build/host/stage2/bin");
-        let tools = Toolchain {
-            stage2_dir: own.clone(),
-            targo: own.join("targo"),
-            trustdoc: own.join("trustdoc"),
-            tippy: Some(managed.join(toolchain::TIPPY)),
-            trustfmt: Some(managed.join(toolchain::TRUSTFMT)),
-            borrowed: vec![
-                (toolchain::TRUSTFMT, managed.join(toolchain::TRUSTFMT)),
-                (toolchain::TIPPY, managed.join(toolchain::TIPPY)),
-            ],
-            refused: None,
-            store_bin: Some(prefix.join("store/trust/current/bin")),
-            demoted: None,
-            lock: None,
-            lock_refusal: None,
-            lock_override: None,
-        };
-        let subject = Subject::of_dir(&prefix, &managed).expect("a store build");
-        let (held, said) = hold_toolchain(&env, &tools, Path::new("/repo"));
-        assert_eq!(held.len(), 1, "one build, held once");
-        assert_eq!(held[0].subject(), &subject);
-        assert!(matches!(
-            lease::holders(&prefix, &subject),
-            Holders::Held(_)
-        ));
-        let said = said.expect("said in the log");
-        assert!(said.contains("trust build 9192"), "{said}");
-        // A lease this run never offered to a child lets go by LOCK_UN at its drop, so a
-        // sibling spawn's copy, held until its exec, does not keep it held.
-        #[cfg(unix)]
-        let fork = aterm_uds::fork_window::Parked::park();
-        drop(held);
-        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
-        #[cfg(unix)]
-        assert!(fork.release().success());
-
-        let own_only = Toolchain {
-            borrowed: Vec::new(),
-            ..tools
-        };
-        let (none, said) = hold_toolchain(&env, &own_only, Path::new("/repo"));
-        assert!(none.is_empty(), "an unmanaged directory takes no lease");
-        assert_eq!(said, None);
-        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let runnable = |path: &Path, body: &str| {
-                std::fs::create_dir_all(path.parent().expect("bin")).expect("mkdir");
-                std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-                aterm_uds::spawnfd::command(path)
-                    .output()
-                    .expect("a stand-in just laid runs");
-            };
-            for bin in [&own, &managed] {
-                std::fs::create_dir_all(bin.parent().expect("sysroot").join("lib/rustlib"))
-                    .expect("rustlib");
-            }
-            runnable(&own.join("targo"), "exit 0");
-            runnable(
-                &own.join("trustc"),
-                &format!("echo '{}'", own.parent().expect("sysroot").display()),
-            );
-            runnable(&managed.join(toolchain::TIPPY), "exit 0");
-            let rustup = home.join("rustup");
-            std::fs::create_dir_all(rustup.join("toolchains")).expect("toolchains");
-            std::os::unix::fs::symlink(
-                own.parent().expect("sysroot"),
-                rustup.join("toolchains/trust"),
-            )
-            .expect("rustup entry");
-            let shims = prefix.join("bin");
-            runnable(&shims.join(toolchain::TIPPY), "exit 0");
-            runnable(
-                &shims.join("trustc"),
-                &format!("echo '{}'", managed.parent().expect("sysroot").display()),
-            );
-            let discovered = Toolchain::discover_with_store(
-                None,
-                &rustup,
-                Some(&prefix),
-                shims.as_os_str(),
-                Some("trust"),
-                None,
-            );
-            let (held, _) = hold_toolchain(&env, &discovered, Path::new("/repo"));
-            assert!(
-                matches!(lease::holders(&prefix, &subject), Holders::Held(_)),
-                "BORROWED_SHIM_MUST_HOLD_THE_PHYSICAL_BUILD"
-            );
-            assert_eq!(held.len(), 1);
-            assert_eq!(discovered.tippy, Some(managed.join(toolchain::TIPPY)));
-            drop(held);
-            aterm_uds::deadline::once_released(|| match lease::holders(&prefix, &subject) {
-                Holders::Free => Ok(()),
-                Holders::Held(_) => Err(std::io::ErrorKind::WouldBlock.into()),
-                Holders::Unknown(error) => panic!("lease probe failed: {error}"),
-            });
-            assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
-        }
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn every_child_builds_in_the_callers_target_dir_and_gets_the_threads_asked_for() {
-        let theirs = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot {
-                cargo_target_dir: Some(PathBuf::from("/fast/tgt")),
-                ..EnvSnapshot::default()
-            },
-            PathBuf::from("/tmp"),
-        );
-        let has = |c: &Ctx, k: &str, v: &str| {
-            c.exec_env()
-                .add_env
-                .iter()
-                .any(|(ek, ev)| ek == k && ev == v)
-        };
-        assert!(has(&theirs, "CARGO_TARGET_DIR", "/fast/tgt"));
-        assert!(
-            !theirs
-                .child_env_add
-                .iter()
-                .any(|(k, _)| k == "RUST_TEST_THREADS")
-        );
-        let env = theirs.exec_env();
-        assert_eq!(env.remove_env, CHILD_ENV_REMOVED);
-        for k in ["CARGO_MANIFEST_DIR", "CARGO_PKG_*", "CARGO_PRIMARY_PACKAGE"] {
-            assert!(env.remove_env.contains(&k), "{k}");
-        }
-        let threaded = theirs.with_test_threads(std::num::NonZeroU32::new(3));
-        assert!(has(&threaded, "RUST_TEST_THREADS", "3"));
-    }
-
-    /// A run's children get the temp directory's quiet folder as `TMPDIR` on macOS. The loud
-    /// directory is a private scratch one, not `/tmp`, whose shared quiet folder another program
-    /// or user may have made in a form this one refuses (verify passes `std::env::temp_dir()`).
-    /// NEGATIVE CONTROL: a temp directory quiet already, and any off macOS, is left as it is.
-    #[test]
-    fn stage_children_get_a_quiet_tmpdir() {
-        let ctx = || {
-            Ctx::new(
-                PathBuf::from("/repo"),
-                Scope::workspace(),
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-        };
-        let tmpdir = |c: &Ctx| {
-            c.child_env_add
-                .iter()
-                .find(|(k, _)| k == "TMPDIR")
-                .map(|(_, v)| PathBuf::from(v))
-        };
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
-        assert_eq!(tmpdir(&ctx().with_quiet_tmpdir(scratch.path())), None);
-        let loud = aterm_tempfile::Builder::new()
-            .heard()
-            .tempdir()
-            .expect("a loud scratch directory");
-        let got = tmpdir(&ctx().with_quiet_tmpdir(loud.path()));
-        if cfg!(target_os = "macos") {
-            let got = got.expect("a quiet TMPDIR");
-            assert_eq!(got, loud.path().join(".ubd"));
-            assert!(got.as_os_str().to_string_lossy().ends_with("/.ubd/"));
-            assert!(aterm_tempfile::is_quiet(scratch.path()), "{scratch:?}");
-        } else {
-            assert_eq!(got, None);
-        }
-    }
-
-    #[test]
-    fn the_main_lane_shares_plain_targos_cache_exactly_where_the_shim_would() {
-        let tmp = std::fs::canonicalize(mktemp_dir("atv-cache").expect("mktemp")).expect("real");
-        let home = tmp.join("home");
-        let root = home.join("Developer/repo");
-        std::fs::create_dir_all(home.join("Library/Caches")).expect("mkdir");
-        std::fs::create_dir_all(&root).expect("mkdir");
-        let env = EnvSnapshot {
-            home: home.clone(),
-            ..EnvSnapshot::default()
-        };
-        let got = main_build_dir(&env, &root);
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                got,
-                Some(format!(
-                    "build.build-dir='{}/Library/Caches/aterm/.ubd/cargo-build.noindex\
-                     {{workspace-root}}/.cargo-build'",
-                    home.display()
-                ))
-            );
-            let c = Ctx::new(
-                root.clone(),
-                Scope::workspace(),
-                env.clone(),
-                PathBuf::from("/tmp"),
-            );
-            assert_eq!(c.main_build_dir, got);
-            let cache = disk::build_dir_path(got.as_deref().unwrap(), &root).unwrap();
-            assert_eq!(plan::lanes_dir(&c), cache.join("verify/.ubd"));
-            assert!(plan::lanes_dir(&c).starts_with(&cache));
-            assert!(!plan::lanes_dir(&c).starts_with(&root));
-            let disk = disk::run_of(&c).unwrap();
-            assert!(disk.dirs.contains(&cache));
-            let lane = plan::lane_dir(&c, plan::Lane::TippyTarget).unwrap();
-            std::fs::create_dir_all(&lane).unwrap();
-            std::fs::write(lane.join("retained-artifact"), b"cached").unwrap();
-            std::fs::remove_dir(&root).unwrap();
-            std::fs::create_dir_all(&root).unwrap();
-            let recreated = Ctx::new(
-                root.clone(),
-                Scope::workspace(),
-                env.clone(),
-                PathBuf::from("/tmp"),
-            );
-            let retained = plan::lane_dir(&recreated, plan::Lane::TippyTarget).unwrap();
-            assert_eq!(retained, lane);
-            assert_eq!(
-                std::fs::read(retained.join("retained-artifact")).unwrap(),
-                b"cached"
-            );
-            let other = home.join("Developer/other");
-            std::fs::create_dir_all(&other).unwrap();
-            let other = Ctx::new(
-                other,
-                Scope::workspace(),
-                env.clone(),
-                PathBuf::from("/tmp"),
-            );
-            assert_ne!(plan::lane_dir(&other, plan::Lane::TippyTarget), Some(lane));
-            assert_eq!(
-                c.child_env_add
-                    .iter()
-                    .find(|(k, _)| k == "CARGO_TARGET_DIR")
-                    .map(|(_, v)| PathBuf::from(v)),
-                Some(root.join("target")),
-                "pinned beside the shim's cache, which the main lane names by --config"
-            );
-            assert_eq!(c.target_dir, root.join("target"));
-            for var in &CARGO_LAYOUT_VARS[..3] {
-                let chosen = EnvSnapshot {
-                    cargo_layout: vec![(*var, OsString::new())],
-                    ..env.clone()
-                };
-                assert_eq!(main_build_dir(&chosen, &root), None, "{var}");
-                let selected = Ctx::new(
-                    root.clone(),
-                    Scope::workspace(),
-                    chosen,
-                    PathBuf::from("/tmp"),
-                );
-                assert_eq!(selected.cached_lanes_dir, None, "{var}");
-            }
-            assert_eq!(
-                main_build_dir(&env, &tmp.join("elsewhere")),
-                None,
-                "outside HOME"
-            );
-            // A shim laid before the cache moved under .ubd names the old root: the main lane
-            // builds there with it. NEGATIVE CONTROL: this version's shim names the quiet one.
-            let bin = tmp.join("bin");
-            std::fs::create_dir_all(&bin).expect("mkdir");
-            let on_path = EnvSnapshot {
-                path: bin.clone().into_os_string(),
-                ..env.clone()
-            };
-            for (under, quiet) in [
-                (aterm_toolchain::build_cache::MOVED_FROM_UNDER_HOME, false),
-                (aterm_toolchain::build_cache::CACHE_UNDER_HOME, true),
-            ] {
-                std::fs::write(
-                    bin.join("targo"),
-                    format!("#!/bin/sh\n# atpkg shim\n__atb_t=\n__atb_c=${{HOME-}}/{under}\n"),
-                )
-                .expect("a shim");
-                let value = main_build_dir(&on_path, &root).expect("the shim's cache");
-                assert_eq!(
-                    value,
-                    format!(
-                        "build.build-dir='{}/{under}{{workspace-root}}/.cargo-build'",
-                        home.display()
-                    )
-                );
-                assert_eq!(value.contains("/.ubd/"), quiet, "{value}");
-            }
-        } else {
-            assert_eq!(got, None, "the shim's cache is macOS only");
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// A checkout whose target is a link (a release clone's `target -> target.noindex`), itself
-    /// under a linked folder (`/tmp`): every child is handed the physical target, so cargo spells
-    /// each `CARGO_BIN_EXE_*` it compiles into a test (`<CARGO_TARGET_DIR>/debug/<bin>`, never
-    /// resolved) as verify's own paths are. NEGATIVE CONTROL: without [`physical_target`] the
-    /// target keeps the link's spelling, and without the pin a shim-mode child gets none.
-    #[cfg(unix)]
-    #[test]
-    fn every_child_builds_through_the_physical_target_however_the_checkout_reaches_it() {
-        let tmp = mktemp_dir("atv-physical").expect("mktemp");
-        // HOME is physical, so the shim's cache holds the checkout; the root is handed spelled
-        // through a link of its own (and, on macOS, the one `/tmp` is).
-        let home = std::fs::canonicalize(&tmp).expect("real").join("home");
-        std::fs::create_dir_all(home.join("Library/Caches")).expect("mkdir");
-        std::os::unix::fs::symlink("home", tmp.join("linked-home")).expect("link");
-        let root = tmp.join("linked-home/Developer/repo");
-        std::fs::create_dir_all(root.join("target.noindex")).expect("mkdir");
-        std::os::unix::fs::symlink("target.noindex", root.join("target")).expect("link");
-        let real_root = std::fs::canonicalize(&root).expect("real");
-        let physical = real_root.join("target.noindex");
-        let pinned = |c: &Ctx| {
-            c.child_env_add
-                .iter()
-                .find(|(k, _)| k == "CARGO_TARGET_DIR")
-                .map(|(_, v)| PathBuf::from(v))
-        };
-        let shim = EnvSnapshot {
-            home: home.clone(),
-            ..EnvSnapshot::default()
-        };
-        let linked = root.join("target");
-        let theirs = EnvSnapshot {
-            cargo_target_dir: Some(linked.clone()),
-            cargo_layout: vec![("CARGO_TARGET_DIR", linked.into_os_string())],
-            ..EnvSnapshot::default()
-        };
-        let shares = cfg!(target_os = "macos");
-        // HOME spelled through the link holds no physical checkout, so no shim cache, as the
-        // shim decides from its own physical working directory: the target is pinned all the same.
-        let linked_home = EnvSnapshot {
-            home: tmp.join("linked-home"),
-            ..EnvSnapshot::default()
-        };
-        for (env, cache) in [
-            (shim, shares),
-            (linked_home, false),
-            (EnvSnapshot::default(), false),
-            (theirs, false),
-        ] {
-            let c = Ctx::new(
-                root.clone(),
-                Scope::workspace(),
-                env.clone(),
-                PathBuf::from("/tmp"),
-            );
-            assert_eq!(c.cached_lanes_dir.is_some(), cache, "{env:?}");
-            assert_eq!(c.root, real_root, "{env:?}");
-            assert_eq!(c.target_dir, physical, "{env:?}");
-            assert_eq!(pinned(&c), Some(physical.clone()), "{env:?}");
-            assert_eq!(stages::main_bin(&c, "aterm"), physical.join("debug/aterm"));
-            assert!(c.state_dir().starts_with(&physical), "{env:?}");
-            let lanes = plan::lanes_dir(&c);
-            assert_eq!(lanes, crate::physical(&lanes), "{env:?}");
-        }
-        std::fs::remove_dir_all(&tmp).expect("cleanup");
-    }
-
-    #[test]
-    fn a_pinned_main_lane_keeps_its_intermediates_out_of_spotlight() {
-        let pinned = |c: &Ctx| {
-            c.child_env_add
-                .iter()
-                .find(|(k, _)| k == "CARGO_TARGET_DIR")
-                .map(|(_, v)| PathBuf::from(v))
-        };
-        let ctx = |root: &Path, env: EnvSnapshot| {
-            Ctx::new(
-                root.to_path_buf(),
-                Scope::workspace(),
-                env,
-                PathBuf::from("/tmp"),
-            )
-        };
-        let fast = std::path::absolute("/fast/tgt").expect("absolute");
-        let theirs = EnvSnapshot {
-            cargo_target_dir: Some(fast.clone()),
-            cargo_layout: vec![("CARGO_TARGET_DIR", fast.clone().into_os_string())],
-            ..EnvSnapshot::default()
-        };
-        let repo = std::path::absolute("/repo").expect("absolute");
-        let c = ctx(&repo, theirs.clone());
-        let fast_cfg = format!("build.build-dir='{}'", fast.join("build.noindex").display());
-        assert_eq!(pinned(&c), Some(fast));
-        assert_eq!(c.main_build_dir.as_deref(), Some(fast_cfg.as_str()));
-        let argv = stages::main_targo(&c, vec!["--unverified".into(), "test".into()]).argv();
-        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
-        assert_eq!(
-            argv[1..],
-            [
-                "--config",
-                fast_cfg.as_str(),
-                "--unverified",
-                config,
-                workspace,
-                "test",
-                aterm_toolchain::build_cache::TEST_GRAPH_FLAG
-            ]
-        );
-        let c = ctx(&repo, EnvSnapshot::default());
-        let repo_cfg = format!(
-            "build.build-dir='{}'",
-            repo.join("target").join("build.noindex").display()
-        );
-        assert_eq!(pinned(&c), Some(repo.join("target")));
-        assert_eq!(c.main_build_dir.as_deref(), Some(repo_cfg.as_str()));
-        let chose = EnvSnapshot {
-            cargo_layout: vec![("CARGO_BUILD_BUILD_DIR", OsString::new())],
-            ..theirs.clone()
-        };
-        let c = ctx(Path::new("/repo"), chose);
-        assert_eq!((pinned(&c).is_some(), c.main_build_dir), (true, None));
-        let tmp = std::fs::canonicalize(mktemp_dir("atv-bdir").expect("mktemp")).expect("real");
-        let root = tmp.join("repo");
-        std::fs::create_dir_all(root.join(".cargo")).expect("mkdir");
-        std::fs::write(
-            root.join(".cargo/config.toml"),
-            "[build]\nbuild-dir = 'mine'\n",
-        )
-        .expect("config");
-        let c = ctx(&root, theirs);
-        assert_eq!((pinned(&c).is_some(), c.main_build_dir), (true, None));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn requested_test_cores_narrow_but_never_grant_a_share() {
-        let make = |env| {
-            Ctx::new(
-                PathBuf::from("/repo"),
-                Scope::workspace(),
-                env,
-                PathBuf::from("/tmp"),
-            )
-        };
-        let held = || {
-            make(EnvSnapshot {
-                build_slot_held: Some("1".into()),
-                cargo_build_jobs: Some("6".into()),
-                ..EnvSnapshot::default()
-            })
-        };
-        let capped = held().with_test_cores(std::num::NonZeroU32::new(3));
-        assert_eq!(capped.test_share(), 3);
-        assert_eq!(capped.test_thread_override(), Some(3));
-        assert_eq!(
-            held()
-                .with_test_cores(std::num::NonZeroU32::new(20))
-                .test_share(),
-            6
-        );
-        let unheld = make(EnvSnapshot::default()).with_test_cores(std::num::NonZeroU32::new(1));
-        assert_eq!(unheld.test_share(), 1);
-        assert_eq!(
-            test_workers::share(&unheld.env, None),
-            Ok(test_workers::Share::Claim(None))
-        );
-        let malformed = make(EnvSnapshot {
-            build_slot_held: Some("1".into()),
-            ..EnvSnapshot::default()
-        })
-        .with_test_cores(std::num::NonZeroU32::new(20));
-        assert_eq!(malformed.test_share(), 1);
-        assert!(test_workers::share(&malformed.env, None).is_err());
-    }
-
-    #[test]
-    fn a_callers_rust_test_threads_pins_every_binary() {
-        let c = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot {
-                rust_test_threads: Some("5".into()),
-                ..EnvSnapshot::default()
-            },
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(c.test_threads, Some(5));
-        assert_eq!(c.test_threads(), 5);
-        let unpinned = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(unpinned.test_threads, None);
-    }
-
-    /// A red narrowed cell's rerun judges that crate again, not the whole graph and the oracles.
-    #[test]
-    fn a_cells_rerun_keeps_the_p_that_narrowed_it() {
-        let c = |scope| {
-            Ctx::new(
-                PathBuf::from("/repo"),
-                scope,
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-        };
-        let narrowed = c(Scope::packages(&["aterm-agent".to_string()]));
-        assert!(narrowed.rerun(Check::Cells).contains(" -p aterm-agent"));
-        let whole = c(Scope::workspace());
-        assert!(!whole.rerun(Check::Cells).contains(" --all"));
-        assert!(!whole.rerun(Check::Cells).contains(" -p "));
-    }
-
-    #[test]
-    fn a_rerun_keeps_no_windows_where_the_flag_changes_the_check() {
-        let c = |no_windows| {
-            Ctx::new(
-                PathBuf::from("/repo"),
-                Scope::workspace(),
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-            .with_no_windows(no_windows)
-        };
-        let (quiet, plain) = (c(true), c(false));
-        for check in [Check::Browser, Check::Appkit] {
-            assert!(quiet.rerun(check).ends_with(" --no-windows"), "{check:?}");
-            assert!(!plain.rerun(check).contains("--no-windows"), "{check:?}");
-        }
-        assert!(!quiet.rerun(Check::Fmt).contains("--no-windows"));
-    }
-
-    /// A bundle names its version and commit from its `Info.plist`, and HEAD built it only when
-    /// that commit, less `-dirty`, begins HEAD.
-    #[cfg(unix)]
-    #[test]
-    fn a_measured_bundle_names_the_commit_that_built_it() {
-        let tmp = mktemp_dir("atv-app").expect("mktemp");
-        let app = tmp.join("aterm.app");
-        std::fs::create_dir_all(app.join("Contents/MacOS")).expect("mkdir");
-        let bin = app.join("Contents/MacOS/aterm");
-        std::fs::write(&bin, "#!/bin/sh\n").expect("write");
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
-        let unnamed = MeasureArtifact::at(&app).expect("a bundle");
-        assert_eq!(
-            (unnamed.version.as_deref(), unnamed.commit.as_deref()),
-            (None, None)
-        );
-        assert!(
-            !unnamed.built_from("22cb722a2ec9ab"),
-            "no commit is no build of HEAD"
-        );
-        std::fs::write(
-            app.join("Contents/Info.plist"),
-            "<dict>\n\t<key>ATermGitCommit</key>\n\t<string>22cb722a2ec9</string>\n\
-             \t<key>CFBundleShortVersionString</key>\n\t<string>0.137.0</string>\n</dict>\n",
-        )
-        .expect("write");
-        let named = MeasureArtifact::at(&app).expect("a bundle");
-        assert_eq!(named.version.as_deref(), Some("0.137.0"));
-        assert_eq!(named.commit.as_deref(), Some("22cb722a2ec9"));
-        assert!(
-            named
-                .describe()
-                .starts_with("aterm 0.137.0 (22cb722a2ec9) at ")
-        );
-        assert!(named.built_from("22cb722a2ec9abcdef0123456789abcdef012345"));
-        assert!(!named.built_from("215fb53331abd9acb2a33e7d7a21d1fa3c2bd8f2"));
-        let dirty = MeasureArtifact {
-            commit: Some("22cb722a2ec9-dirty".into()),
-            ..named
-        };
-        assert!(dirty.built_from("22cb722a2ec9abcdef0123456789abcdef012345"));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// A usage error is 2; no checkout or no pin is 3 with its fix, before anything runs.
-    #[cfg(unix)]
-    #[test]
-    fn the_cli_refuses_usage_and_a_place_it_cannot_run_from() {
-        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let tmp = mktemp_dir("atv-cli").expect("mktemp");
-        assert_eq!(run_cli(&args(&["--fast"]), &tmp), exit::USAGE);
-        assert_eq!(run_cli(&args(&["release"]), &tmp), exit::USAGE);
-        assert_eq!(
-            run_cli(&args(&["measure", "--app", "/nonexistent/aterm.app"]), &tmp),
-            exit::USAGE
-        );
-        assert_eq!(
-            run_cli(&args(&["fmt"]), &tmp),
-            exit::COULD_NOT_RUN,
-            "no checkout"
-        );
-        let git = std::process::Command::new(aterm_uds::os_path!("git"))
-            .args(["init", "-q"])
-            .current_dir(&tmp)
-            .status()
-            .expect("git");
-        assert!(git.success());
-        assert_eq!(
-            run_cli(&args(&["fmt"]), &tmp),
-            exit::COULD_NOT_RUN,
-            "no rust-toolchain.toml"
-        );
-        assert_eq!(run_cli(&args(&["list"]), &tmp), exit::PASS);
-        assert_eq!(run_cli(&args(&["--help"]), &tmp), exit::PASS);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// A release's header names the half it runs, or the checks `--checks` listed, so its log
-    /// says which part of the release it answers for.
-    #[test]
-    fn a_release_header_names_its_half() {
-        let head = |words: &[&str]| {
-            let a = cli::parse(words.iter().copied()).expect("parses");
-            let ctx = Ctx::new(
-                PathBuf::from("/repo"),
-                Scope::workspace(),
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-            .with_checks(&a.wanted(|_| true))
-            .with_release(a.release);
-            header(&ctx, None)
-        };
-        let starts = |words: &[&str], what: &str| {
-            let line = head(words);
-            assert!(line.starts_with(&format!("verify: {what} — ")), "{line}");
-        };
-        starts(&["release", "--app", "a"], "release");
-        starts(&["release", "--tree"], "release --tree");
-        starts(&["release", "--bundle", "--app", "a"], "release --bundle");
-        starts(&["release", "--checks", "test,spec"], "release: test spec");
-    }
-
-    #[test]
-    fn the_header_names_what_the_selection_pulled_and_why() {
-        let head = |crates: &[&str]| {
-            let scope = Scope::changed(
-                "origin/main",
-                crates.iter().map(|c| c.to_string()).collect(),
-                true,
-            );
-            let holds = |p: &str| scope.includes_crate(p);
-            let checks = checks::with_pulled(&checks::DEV, false, holds);
-            let ctx = Ctx::new(
-                PathBuf::from("/repo"),
-                scope.clone(),
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-            .with_checks(&checks);
-            header(&ctx, Some("the cone"))
-        };
-        assert_eq!(head(&["aterm-gui"]), "verify: dev — the cone");
-        assert_eq!(head(&["aterm-gpu"]), "verify: dev — the cone");
-        assert_eq!(
-            head(&["aterm-core", "aterm-gpu", "aterm-gpu-web", "aterm-wasm"]),
-            "verify: dev + wasm-smoke (the selection holds aterm-wasm) — the cone"
-        );
-        let pulled = |crates: &[&str]| {
-            let scope = Scope::changed(
-                "origin/main",
-                crates.iter().map(|c| c.to_string()).collect(),
-                true,
-            );
-            let holds = |p: &str| scope.includes_crate(p);
-            let checks = checks::with(
-                &checks::with_pulled(&checks::DEV, false, holds),
-                Check::Cells,
-            );
-            let ctx = Ctx::new(
-                PathBuf::from("/repo"),
-                scope.clone(),
-                EnvSnapshot::default(),
-                PathBuf::from("/tmp"),
-            )
-            .with_checks(&checks)
-            .with_cells_pulled(true);
-            header(&ctx, Some("the cone"))
-        };
-        assert_eq!(
-            pulled(&["aterm-gui"]),
-            "verify: dev + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
-        );
-        assert_eq!(
-            pulled(&["aterm-wasm"]),
-            "verify: dev + wasm-smoke (the selection holds aterm-wasm) + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
-        );
-    }
-
-    /// A stage that commits in the run's checkout, standing in for another session's
-    /// fast-forward of a shared checkout mid-run.
-    fn committing_stage(ctx: &Ctx, spec: &plan::StageSpec) -> Report {
-        let out = changed::git(&ctx.root, &ctx.path_env)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(["commit", "-q", "--allow-empty", "-m", "moved"])
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "commit: {out:?}");
-        let mut r = Report::new(spec.title.clone());
-        r.pass("ran");
-        r
-    }
-
-    fn passing_stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
-        let mut r = Report::new(spec.title.clone());
-        r.pass("ran");
-        r
-    }
-
-    #[test]
-    fn the_tree_half_collects_every_report_after_a_red() {
-        let args = cli::parse(["release", "--tree"]).unwrap();
-        assert!(args.tree_only);
-        let halt = halt_of(&args);
-        assert!(!halt.armed());
-        let ctx = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            PathBuf::from("/tmp"),
-        )
-        .with_checks(&args.checks);
-        let specs = plan::plan(&ctx);
-        let mut seen = Vec::new();
-        let reports = sched::run_stages(
-            &specs,
-            u64::MAX,
-            &halt,
-            |spec, _| {
-                let mut report = Report::new(spec.title.clone());
-                if spec.id == plan::StageId::Formatting {
-                    assert!(!halt.red("fmt"));
-                    report.fail("planted formatting red");
-                } else {
-                    report.pass("ran after or beside the red");
-                }
-                report
-            },
-            |i, _| seen.push(i),
-        );
-        assert_eq!(seen, (0..specs.len()).collect::<Vec<_>>());
-        assert_eq!(reports.len(), specs.len());
-        assert!(halt.words().is_none());
-        for words in [
-            vec!["release", "--tree", "--fail-fast"],
-            vec!["release", "--bundle", "--app", "/a.app"],
-            vec!["release", "--tree", "--bundle", "--app", "/a.app"],
-            vec!["--fail-fast"],
-        ] {
-            assert!(halt_of(&cli::parse(words).unwrap()).armed());
-        }
-    }
-
-    #[test]
-    fn a_completed_stage_is_reported_before_its_dependent_runs() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        static STARTED: AtomicBool = AtomicBool::new(false);
-        static DEPENDENT_RAN: AtomicBool = AtomicBool::new(false);
-        struct LiveOutput;
-        impl std::io::Write for LiveOutput {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if let Some(json) = bytes.strip_prefix(b"verify-event: ") {
-                    let event: aterm_json::Value = aterm_json::from_slice(json).unwrap();
-                    match event["event"].as_str() {
-                        Some("stage-started") => STARTED.store(true, Ordering::SeqCst),
-                        Some("stage-finished") => REPORTED.store(true, Ordering::SeqCst),
-                        _ => {}
-                    }
-                }
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
-            assert!(
-                STARTED.load(Ordering::SeqCst),
-                "stage start was not reported"
-            );
-            if spec.id != plan::StageId::TestCompile {
-                assert!(
-                    REPORTED.load(Ordering::SeqCst),
-                    "compile completion was buffered"
-                );
-                DEPENDENT_RAN.store(true, Ordering::SeqCst);
-            }
-            let mut report = Report::new(spec.title.clone());
-            report.pass("ran");
-            report
-        }
-        REPORTED.store(false, Ordering::SeqCst);
-        STARTED.store(false, Ordering::SeqCst);
-        DEPENDENT_RAN.store(false, Ordering::SeqCst);
-        let ctx = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::crate_only("aterm-verify"),
-            EnvSnapshot::default(),
-            PathBuf::from("/tmp"),
-        )
-        .with_checks(&[Check::Test]);
-        let result = run_with(
-            &ctx,
-            &mut LiveOutput,
-            &mut std::io::sink(),
-            &Show::default(),
-            Seams {
-                stage,
-                prepare_cells: None,
-                ..LIVE
-            },
-        );
-        assert_eq!(result.unwrap(), exit::PASS);
-        assert!(REPORTED.load(Ordering::SeqCst));
-        assert!(DEPENDENT_RAN.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn a_private_companion_refuses_public_aliases_and_keeps_internal_producer_records() {
-        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
-            let mut report = Report::new(spec.title.clone());
-            report.pass("ran");
-            report
-        }
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("chosen.log");
-        let context = || {
-            Ctx::new(
-                dir.path().to_path_buf(),
-                Scope::crate_only("aterm-verify"),
-                EnvSnapshot::default(),
-                dir.path().join("scratch"),
-            )
-            .with_checks(&[Check::Fmt])
-        };
-        let mut previous = context();
-        let log = open_run_log(&mut previous, Some(&path), dir.path()).unwrap();
-        drop(log);
-        drop(previous);
-        let alias = dir.path().join("external-alias.events");
-        std::fs::hard_link(run_log::events_path(&path), &alias).unwrap();
-        assert!(event_log::EventLog::open(&alias).is_err());
-        assert!(event_log::EventLog::open(&run_log::events_path(&path)).is_err());
-        let human_alias = dir.path().join("external-human-alias.log");
-        std::fs::hard_link(&path, &human_alias).unwrap();
-        assert!(event_log::EventLog::open(&path).is_err());
-        assert!(event_log::EventLog::open(&human_alias).is_err());
-        let mut ctx = context();
-        let mut log = open_run_log(&mut ctx, Some(&path), dir.path()).unwrap();
-        assert_eq!(
-            run_with(
-                &ctx,
-                &mut Vec::new(),
-                &mut log,
-                &Show::default(),
-                Seams {
-                    stage,
-                    prepare_cells: None,
-                    ..LIVE
-                }
-            )
-            .unwrap(),
-            exit::PASS
-        );
-        drop(log);
-        drop(ctx);
-        assert!(
-            std::fs::read(&path)
-                .unwrap()
-                .starts_with(run_log::PRIVATE_HUMAN_HEADER.as_bytes())
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            std::fs::read(&human_alias).unwrap()
-        );
-        assert!(event_log::EventLog::open(&human_alias).is_err());
-        let text = std::fs::read_to_string(&alias).unwrap();
-        assert_eq!(
-            std::fs::read(&alias).unwrap(),
-            std::fs::read(run_log::events_path(&path)).unwrap()
-        );
-        let observed = status::observe(&text);
-        assert!(text.starts_with(run_log::PRIVATE_EVENTS_HEADER));
-        assert_eq!(observed.malformed_complete_records, 0);
-        assert_eq!(observed.invocations.len(), 1);
-        assert_eq!(observed.invocations[0].observed.terminal_records, 1);
-        assert_eq!(
-            observed.invocations[0].observed.terminal_consistency,
-            "matching-observed-rows"
-        );
-        assert_eq!(observed.invocations[0].observed.checks[0].occurrences, 1);
-        assert_eq!(
-            text.lines()
-                .filter(|line| line.contains("invocation-started"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn structured_records_survive_the_external_temp_directory_and_keep_actual_producer_bytes() {
-        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
-            let mut report = Report::new(spec.title.clone());
-            report.pass("ran the bounded fixture stage");
-            report
-        }
-        let retained = aterm_tempfile::tempdir().unwrap();
-        let transient = aterm_tempfile::tempdir().unwrap();
-        let external = transient.path().join("verify.events");
-        let mut ctx = Ctx::new(
-            retained.path().to_path_buf(),
-            Scope::crate_only("aterm-verify"),
-            EnvSnapshot::default(),
-            retained.path().join("scratch"),
-        )
-        .with_checks(&[Check::Fmt])
-        .with_events(Some(event_log::EventLog::open(&external).unwrap()));
-        let path = retained.path().join("kept.log");
-        let mut log = open_run_log(&mut ctx, Some(&path), retained.path()).unwrap();
-        let id = ctx.events.as_ref().unwrap().id().unwrap().to_owned();
-        let mut out = Vec::new();
-        let code = run_with(
-            &ctx,
-            &mut out,
-            &mut log,
-            &Show::default(),
-            Seams {
-                stage,
-                prepare_cells: None,
-                ..LIVE
-            },
-        )
-        .unwrap();
-        assert_eq!(code, exit::PASS);
-        #[cfg(unix)]
-        let_disk_go(
-            disk::Disk::Unclaimed,
-            true,
-            Some(&mut log),
-            ctx.events.as_ref(),
-        );
-        drop(log);
-        drop(ctx);
-        let external_bytes = std::fs::read(&external).unwrap();
-        drop(transient);
-        assert!(!external.exists());
-        let at = run_log::events_path(&path);
-        let kept = std::fs::read(&at).unwrap();
-        assert_eq!(
-            kept.strip_prefix(run_log::PRIVATE_EVENTS_HEADER.as_bytes())
-                .unwrap(),
-            external_bytes
-        );
-        let text = String::from_utf8(kept).unwrap();
-        let observed = status::observe(&text);
-        assert_eq!(observed.malformed_complete_records, 0);
-        assert_eq!(observed.invocations.len(), 1);
-        let run = &observed.invocations[0];
-        assert_eq!(run.id, id);
-        assert!(run.source_observation.is_some());
-        assert_eq!(run.observed.terminal_consistency, "matching-observed-rows");
-        let rows = text
-            .lines()
-            .filter_map(event_log::CheckRow::of_event)
-            .collect();
-        let finished = text
-            .lines()
-            .rev()
-            .find_map(event_log::Finished::of_event)
-            .unwrap();
-        assert!(
-            event_log::Judged {
-                code: finished.code,
-                checks: rows,
-                secs: 0,
-                finished: Some(finished)
-            }
-            .whole()
-        );
-        let output = String::from_utf8(out).unwrap();
-        for line in output
-            .lines()
-            .filter(|line| line.starts_with("verify-event: "))
-        {
-            assert!(
-                text.lines().any(|kept| kept == line),
-                "same prepared bytes in both sinks"
-            );
-        }
-        let kinds = text
-            .lines()
-            .map(|line| {
-                aterm_json::from_str::<aterm_json::Value>(
-                    line.strip_prefix("verify-event: ").unwrap(),
-                )
-                .unwrap()["event"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        assert!(kinds.iter().any(|kind| kind == "stage-started"));
-        assert!(kinds.iter().any(|kind| kind == "stage-finished"));
-        #[cfg(unix)]
-        assert!(
-            kinds
-                .iter()
-                .position(|kind| kind == "run-finished")
-                .unwrap()
-                < kinds.iter().position(|kind| kind == "disk").unwrap()
-        );
-        assert_eq!(
-            status::run(
-                &[
-                    "--events".into(),
-                    at.to_string_lossy().into_owned(),
-                    "--json".into()
-                ],
-                retained.path()
-            ),
-            exit::PASS
-        );
-    }
-
-    /// Each check's `check-finished` event is written once, whole, right before its own line and
-    /// before the verdict, with the word that line opens with, and the same line to the run's
-    /// events file, which a release's cutter keeps one record per check from (A19); the file
-    /// ends with the run's `run-finished` line, naming its exit and each check's word, by which
-    /// `verify land` knows the record whole (B10). Negative controls: emitting the event after
-    /// the rendered line fails the order assertion; one never recorded leaves the events file
-    /// without it.
-    #[test]
-    fn each_check_says_check_finished_once_before_its_line_and_the_verdict() {
-        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
-            let mut report = Report::new(spec.title.clone());
-            if spec.id == plan::StageId::Census {
-                report.fail("a guard found a banned call");
-            } else {
-                report.pass("ran");
-            }
-            report
-        }
-        let ctx = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            PathBuf::from("/tmp"),
-        )
-        .with_checks(&[Check::Fmt, Check::Census]);
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let at = dir.path().join("06-verify.events");
-        let ctx = ctx.with_events(Some(event_log::EventLog::open(&at).unwrap()));
-        let mut out: Vec<u8> = Vec::new();
-        let code = run_with(
-            &ctx,
-            &mut out,
-            &mut std::io::sink(),
-            &Show::default(),
-            Seams {
-                stage,
-                prepare_cells: None,
-                ..LIVE
-            },
-        )
-        .unwrap();
-        assert_eq!(code, exit::FAILED);
-        let text = String::from_utf8(out).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        let verdict = lines
-            .iter()
-            .position(|l| l.starts_with("verify: FAIL"))
-            .expect("a verdict line");
-        for (name, word) in [("fmt", "ok"), ("census", "FAIL")] {
-            let events: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter_map(|(i, l)| {
-                    let json = l.strip_prefix("verify-event: ")?;
-                    let event: aterm_json::Value = aterm_json::from_slice(json.as_bytes()).ok()?;
-                    (event["event"].as_str() == Some("check-finished")
-                        && event["check"].as_str() == Some(name))
-                    .then(|| {
-                        assert_eq!(event["outcome"].as_str(), Some(word), "{l}");
-                        i
-                    })
-                })
-                .collect();
-            assert_eq!(events.len(), 1, "{name}: {text}");
-            let own = lines
-                .iter()
-                .position(|l| l.starts_with(word) && l.split_whitespace().nth(1) == Some(name))
-                .expect("the check's own line");
-            assert_eq!(
-                events[0] + 1,
-                own,
-                "{name}'s event comes right before its line: {text}"
-            );
-            assert!(own < verdict, "{text}");
-        }
-        let said: Vec<&str> = lines
-            .iter()
-            .copied()
-            .filter(|l| {
-                l.strip_prefix("verify-event: ")
-                    .and_then(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
-                    .is_some_and(|event| event["event"].as_str() == Some("check-finished"))
-            })
-            .collect();
-        let kept = std::fs::read_to_string(&at).unwrap();
-        let drivers = kept
-            .lines()
-            .filter_map(|line| line.strip_prefix("verify-event: "))
-            .filter_map(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
-            .filter(|event| event["event"].as_str() == Some("measure-driver"))
-            .collect::<Vec<_>>();
-        assert_eq!(drivers.len(), 1);
-        assert_eq!(drivers[0]["sha256"].as_str(), report::running_driver());
-        let (last, checks) = kept
-            .lines()
-            .collect::<Vec<_>>()
-            .split_last()
-            .map(|(last, checks)| (last.to_string(), checks.to_vec()))
-            .expect("the events file");
-        let mut kept_checks = checks
-            .iter()
-            .copied()
-            .filter(|line| event_log::CheckRow::of_event(line).is_some())
-            .collect::<Vec<_>>();
-        let mut said = said;
-        kept_checks.sort_unstable();
-        said.sort_unstable();
-        assert_eq!(
-            kept_checks, said,
-            "exact records in both sinks, independent concurrent ordering: {kept}"
-        );
-        assert!(
-            checks.iter().any(|line| line.contains("stage-started")),
-            "actual stage records are retained too"
-        );
-        let finished: aterm_json::Value =
-            aterm_json::from_str(last.strip_prefix("verify-event: ").expect("an event")).unwrap();
-        assert_eq!(finished["event"].as_str(), Some("run-finished"), "{last}");
-        assert_eq!(
-            finished["code"].as_i64(),
-            Some(i64::from(exit::FAILED)),
-            "{last}"
-        );
-        let words: Vec<(&str, &str)> = finished["checks"]
-            .as_array()
-            .expect("checks")
-            .iter()
-            .filter_map(|c| Some((c["check"].as_str()?, c["outcome"].as_str()?)))
-            .collect();
-        assert_eq!(words, [("fmt", "ok"), ("census", "FAIL")], "{last}");
-    }
-
-    /// A run whose checkout's HEAD moves while its stages run ends COULD NOT RUN, its checks'
-    /// own PASS beside it. Negative control: the same run with HEAD still ends PASS.
-    #[test]
-    fn a_run_whose_checkout_moved_under_its_stages_could_not_run() {
-        let root = mktemp_dir("atv-moved-checkout").expect("mktemp");
-        let path_env = std::env::var_os("PATH").unwrap_or_default();
-        for args in [
-            &["init", "-q"][..],
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "base",
-            ],
-        ] {
-            let out = changed::git(&root, &path_env)
-                .args(args)
-                .output()
-                .expect("git runs");
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        }
-        let run = |stage: fn(&Ctx, &plan::StageSpec) -> Report| {
-            let mut ctx = Ctx::new(
-                root.clone(),
-                Scope::crate_only("aterm-verify"),
-                EnvSnapshot::default(),
-                root.join("scratch"),
-            )
-            .with_checks(&[Check::Fmt]);
-            ctx.path_env.clone_from(&path_env);
-            let mut out = Vec::new();
-            let code = run_with(
-                &ctx,
-                &mut out,
-                &mut std::io::sink(),
-                &Show::default(),
-                Seams {
-                    stage,
-                    prepare_cells: None,
-                    admit_quiet: LIVE.admit_quiet,
-                    admit_memory: LIVE.admit_memory,
-                },
-            )
-            .expect("the result written");
-            (code, String::from_utf8_lossy(&out).into_owned())
-        };
-
-        let (code, out) = run(passing_stage);
-        assert_eq!(code, exit::PASS, "HEAD never moved: {out}");
-
-        let (code, out) = run(committing_stage);
-        assert_eq!(code, exit::COULD_NOT_RUN, "{out}");
-        assert!(out.contains("the checkout moved from"), "{out}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// A stage the run's memory budget held back says so on its time line, naming for how long,
-    /// behind which stages, and what it claims of the budget; one never held says nothing.
-    /// NEGATIVE CONTROL: the same stage, not held, has no note.
-    #[test]
-    fn a_stage_held_for_memory_says_how_long_and_behind_what() {
-        const GIB: u64 = 1 << 30;
-        let stages: Vec<plan::StageSpec> = plan::declared(&Scope::crate_only("aterm-gui"))
-            .into_iter()
-            .filter(|s| matches!(s.id, plan::StageId::TestCompile | plan::StageId::Tippy))
-            .map(|s| plan::StageSpec { mem: 12 * GIB, ..s })
-            .collect();
-        let test_compile = stages
-            .iter()
-            .position(|s| s.id == plan::StageId::TestCompile)
-            .expect("test compile");
-        let tippy = stages
-            .iter()
-            .position(|s| s.id == plan::StageId::Tippy)
-            .expect("tippy");
-        let held = sched::Held {
-            waited: Duration::from_millis(41_250),
-            behind: vec![test_compile],
-        };
-        let note = held_note(&stages, tippy, &held, 43 * GIB / 2).expect("held");
-        assert_eq!(
-            note,
-            "memory: held 41.2s for room behind test compile (-p aterm-gui): it claims 12 GiB of \
-             the run's 21.5 GiB"
-        );
-        assert_eq!(
-            held_note(&stages, tippy, &sched::Held::default(), 43 * GIB / 2),
-            None
-        );
-    }
-
-    #[test]
-    fn built_from_rejects_short_or_non_hex_commits() {
-        let art = |commit: &str| MeasureArtifact {
-            app: PathBuf::from("/tmp/aterm.app"),
-            version: Some("0.137.0".into()),
-            commit: Some(commit.into()),
-        };
-        let head = "22cb722a2ec9abcdef0123456789abcdef012345";
-        assert!(!art("22cb72").built_from(head), "6 hex chars is too short");
-        assert!(art("22cb722").built_from(head), "7 hex chars is valid");
-        assert!(!art("22cb722z").built_from("22cb722zabcdef0123456789abcdef0123456789"));
-    }
-
-    /// A complete store build `build` under `prefix` whose `trustc` answers `--print sysroot` and
-    /// `-vV` (commit `commit`) and whose `targo` runs: its tree's fold.
-    #[cfg(unix)]
-    fn locked_build(prefix: &Path, build: u64, commit: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = atpkg::trust_lock::build_dir(prefix, build);
-        std::fs::create_dir_all(dir.join("lib/rustlib")).expect("rustlib");
-        std::fs::write(atpkg::trust_lock::ready_marker(prefix, build), "ok\n").expect("ready");
-        std::fs::create_dir_all(dir.join("bin")).expect("bin");
-        for (tool, body) in [
-            ("targo", "exit 0".to_string()),
-            (
-                "trustc",
-                format!(
-                    "case \"$1\" in -vV) printf 'commit-hash: {commit}\\n' ;; *) echo '{}' ;; esac",
-                    dir.display()
-                ),
-            ),
-        ] {
-            let path = dir.join("bin").join(tool);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("stand-in");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        // A store build's `rustc` is a hard link of its `trustc`.
-        std::fs::hard_link(dir.join("bin/trustc"), dir.join("bin/rustc")).expect("rustc");
-        atpkg::tree::tree_root(&dir).expect("fold")
-    }
-
-    /// A LOCKED CHECKOUT'S RUN COMPILES WITH THE LOCK'S BUILD (A14): the store's `current` names
-    /// another build, and the run takes the lock's, folding and recording a build installed before
-    /// records; it says so in its log, and says a `targo` shim laid for `current` makes plain
-    /// builds and the run alternate units; a `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` whose
-    /// compiler is not the lock's refuses the run's preflight. NEGATIVE CONTROL: without the lock
-    /// the run takes `current`, says no lock, notes nothing and takes any `RUSTC`.
-    #[cfg(unix)]
-    #[test]
-    fn a_locked_checkout_runs_the_locked_build_and_says_a_shim_that_does_not() {
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
-        let home = scratch.path().canonicalize().expect("canonical");
-        let env = EnvSnapshot {
-            home: home.clone(),
-            xdg_config_home: Some(home.join("xdg")),
-            ..EnvSnapshot::default()
-        };
-        let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
-        let commit = "29ebb403de7a102850d6cb10a62d5cc3baf723ed";
-        let root_of_locked = locked_build(&prefix, 16387, commit);
-        locked_build(&prefix, 16500, &"b".repeat(40));
-        std::os::unix::fs::symlink(
-            atpkg::trust_lock::build_dir(&prefix, 16500),
-            prefix.join("store/trust/current"),
-        )
-        .expect("current");
-        std::fs::create_dir_all(prefix.join("bin")).expect("shims");
-        std::fs::write(
-            prefix.join("bin/targo"),
-            format!(
-                "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
-                atpkg::trust_lock::build_dir(&prefix, 16500)
-                    .join("bin/targo")
-                    .display()
-            ),
-        )
-        .expect("a shim laid for current");
-        let checkout = home.join("checkout");
-        std::fs::create_dir_all(&checkout).expect("checkout");
-        std::fs::write(
-            checkout.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"trust\"\n",
-        )
-        .expect("pin");
-
-        let unlocked = run_toolchain(&env, &checkout);
-        assert_eq!(
-            unlocked.stage2_dir,
-            atpkg::trust_lock::build_dir(&prefix, 16500).join("bin"),
-            "no lock: current"
-        );
-        assert_eq!(lock_line(&unlocked), None);
-        assert!(lock_notes(&env, &unlocked).is_empty());
-
-        let lock = atpkg::trust_lock::TrustLock {
-            build: 16387,
-            tree_root: root_of_locked,
-            compiler_commit: commit.to_string(),
-            receipt: "SEED-MINT sha256:00".to_string(),
-            stock_toolchain: "1.99.1".to_string(),
-        };
-        std::fs::write(
-            checkout.join(atpkg::trust_lock::LOCK_FILE),
-            atpkg::trust_lock::render_body(&lock),
-        )
-        .expect("lock");
-        let locked = run_toolchain(&env, &checkout);
-        assert!(locked.have_targo(), "{}", locked.missing_targo_label());
-        assert_eq!(
-            locked.stage2_dir,
-            atpkg::trust_lock::build_dir(&prefix, 16387).join("bin")
-        );
-        assert!(
-            lock_line(&locked).is_some_and(|l| l.contains("names Trust build 16387")),
-            "{:?}",
-            lock_line(&locked)
-        );
-        let notes = lock_notes(&env, &locked);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(
-            notes[0].starts_with("plain `targo` resolves 16500"),
-            "{notes:?}"
-        );
-
-        // What names another compiler reaches every compile child: only the lock's compiler
-        // passes the run's preflight, wherever it is named, resolved as the child resolves it.
-        let trustc_of = |build| atpkg::trust_lock::build_dir(&prefix, build).join("bin/trustc");
-        let with = |vars: &[(&'static str, &Path)]| EnvSnapshot {
-            rustc_vars: vars
-                .iter()
-                .map(|(k, v)| (*k, v.display().to_string()))
-                .collect(),
-            ..env.clone()
-        };
-        let other = trustc_of(16500);
-        let same = trustc_of(16387);
-        assert!(preflight(&env, &checkout).is_ok(), "nothing names another");
-        for var in ["RUSTC", "CARGO_BUILD_RUSTC"] {
-            let refused = preflight(&with(&[(var, &other)]), &checkout).expect_err(var);
-            assert!(
-                refused.contains(&format!("commit {}", "b".repeat(40)))
-                    && refused.contains(&format!("Fix: unset {var}")),
-                "{refused}"
-            );
-            assert!(
-                preflight(&with(&[(var, &same)]), &checkout).is_ok(),
-                "{var}"
-            );
-        }
-        assert!(
-            preflight(&with(&[("RUSTC", Path::new("rustc"))]), &checkout).is_ok(),
-            "a bare name is the child's PATH's, whose first entry is the locked build"
-        );
-        let config = checkout.join(".cargo/config.toml");
-        std::fs::create_dir_all(checkout.join(".cargo")).expect(".cargo");
-        std::fs::write(
-            &config,
-            format!("[build]\nrustc = \"{}\"\n", other.display()),
-        )
-        .expect("config");
-        let refused = preflight(&env, &checkout).expect_err("build.rustc in the checkout's config");
-        assert!(
-            refused.contains(&format!(
-                "Fix: remove build.rustc from {}",
-                config.display()
-            )),
-            "{refused}"
-        );
-        assert!(
-            preflight(&with(&[("RUSTC", &same)]), &checkout).is_ok(),
-            "RUSTC outranks build.rustc"
-        );
-        std::fs::remove_file(&config).expect("rm config");
-        std::fs::remove_file(checkout.join(atpkg::trust_lock::LOCK_FILE)).expect("rm lock");
-        assert!(
-            preflight(&with(&[("RUSTC", &other)]), &checkout).is_ok(),
-            "no lock: RUSTC is the caller's"
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

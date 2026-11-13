@@ -2,24 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Whether a member's change is confined to its own tests ([`confined`]): no build without
-//! `cfg(test)` compiles any of it, so no dependent's build, lint or test can see it, and the cone
-//! judges that member alone ([`crate::changed::select`]). A dependent links the member's library
-//! as it builds without `cfg(test)`; only the member's own test targets compile its test code.
+//! Whether a member's change is confined to the member itself ([`confined`]): no dependent's
+//! build reads any of it, so no dependent's build, lint or test can see it, and the cone judges
+//! that member alone, with all of its own rows ([`crate::changed::select`]). A dependent links the
+//! member's library as it builds without `cfg(test)`; only the member's own test targets compile
+//! its test code, and only the member's own lint and doctests read its comments.
 //!
 //! A changed file is confined when all of these hold:
 //! - It is a `.rs` file of the package's library, binary or integration-test sources: not under
-//!   `benches/` or `examples/`, no `[[bench]]` or `[[example]]` path, not the build script.
-//! - Either what a build without tests compiles of it is the same, token for token, each on the
-//!   same line after the same text, before and after (every hunk inside a test-only item,
-//!   [`aterm_census::items::Source::shipped`]); or no build without tests compiles it, before or
-//!   after: an integration-test root or a module declaration in test code names it, none outside
-//!   test code may, and no `include!` outside test code may read it. A declaration is matched to
-//!   files by name alone,
-//!   ignoring ASCII case as the Mac's file system does (`mod x;` may be any `x.rs` or `x/mod.rs` in
-//!   the package, `#[path = "…/y.rs"]` any `y.rs`), and one whose path or name this reader cannot
-//!   settle may be any file. A file no declaration names may be one a macro declares, so it is
-//!   judged by its tokens.
+//!   `benches/` or `examples/`, no `[[bench]]` or `[[example]]` path, not the build script. Or it
+//!   is the package's own `Cargo.toml` and its TOML values are the same before and after, so
+//!   Cargo reads it as nothing changed.
+//! - Either the code a build without tests compiles of it is the same, token for token, each on
+//!   the same line after the same text, before and after, comments apart
+//!   ([`aterm_census::items::Source::code`]: every other hunk is inside a test-only item or a
+//!   comment), and each comment that changed is one no macro may read; or no build without tests
+//!   compiles it, before or after: an integration-test root or a module declaration in test code
+//!   names it, none outside test code may, and no `include!` outside test code may read it. A
+//!   declaration is matched to files by name alone, ignoring ASCII case as the Mac's file system
+//!   does (`mod x;` may be any `x.rs` or `x/mod.rs` in the package, `#[path = "…/y.rs"]` any
+//!   `y.rs`), and one whose path or name this reader cannot settle may be any file. A file no
+//!   declaration names may be one a macro declares, so it is judged by its tokens.
+//! - A changed comment is one no macro may read: none of the census reader's carriers holds it in
+//!   either version ([`aterm_census::items::Comment::carried`]: a macro's input, an item a derive,
+//!   an attribute macro or a `doc = …` sits on, a Trust `clean { … }` island, and what that
+//!   reader cannot read); no declaration a macro may read, or whose path this reader cannot
+//!   settle, may mount the file, nor any file such a declaration mounts; no `include!` outside
+//!   test code may read its tokens; and in each version it is placed: a target root (the
+//!   library's, a binary's, an integration test's) or a file a declaration this reader places
+//!   names (its shipped or tested set). Plain comments are no tokens, and a doc comment no macro
+//!   reads is a doc string only the member's own lint and doctests read.
 //! - Nothing outside test code may embed its bytes (`include_str!`, `include_bytes!`, an include
 //!   this reader cannot settle) or names it in a string literal.
 //! - The build script cannot read it: the package has no build-dependencies (whose code may declare
@@ -30,7 +42,8 @@
 //!
 //! Anything this reader cannot settle is a [`Doubt`], and a doubt keeps the whole cone. What this
 //! reader takes on trust: a macro from another crate declares no module from a file a test-only
-//! declaration may also name. What other members read is [`crate::changed::resolve_paths`]'s to
+//! declaration may also name, and no dependent reads the member's sources as files at run time
+//! without naming them. What other members read is [`crate::changed::resolve_paths`]'s to
 //! judge: a member file that reads another's by a `../` literal, or names its path, is not
 //! confined.
 
@@ -38,7 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
-use aterm_census::items::{IncludeArg, IncludeKind, Mount, MountPath, Source};
+use aterm_census::items::{Comment, IncludeArg, IncludeKind, Mount, MountPath, Source};
 
 /// A checkout's files as [`confined`] reads them, by repo-relative path.
 pub trait Files {
@@ -58,7 +71,7 @@ pub trait Files {
     fn before(&self, path: &str) -> Result<Option<String>, String>;
 }
 
-/// Why a changed file may reach a build without tests. Each keeps the whole cone.
+/// Why a dependent's build may read a changed file. Each keeps the whole cone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Doubt {
     /// It is no Rust source: a manifest, a fixture, a document.
@@ -67,8 +80,17 @@ pub enum Doubt {
     OtherTarget(String),
     /// A file this reads does not read or lex, or the manifest does not parse.
     Unread(String),
-    /// What a build without tests compiles of it changed.
+    /// What a build without tests compiles of it changed: a token other than a comment, or a
+    /// token's place.
     Shipped(String),
+    /// Its comments changed where a macro or another front end may read them: in a macro's
+    /// input, on or in an item a macro reads, in a Trust `clean { … }` island
+    /// ([`aterm_census::items::Comment::carried`]), or anywhere in a file a macro may mount or
+    /// that, in a version, is neither a target root nor named by a declaration this reader
+    /// places.
+    Carried(String),
+    /// Its comments changed, and an `include!` outside the tests may read its tokens.
+    Included(String),
     /// Code outside the tests may embed its bytes.
     Embedded(String),
     /// A string literal outside the tests names it.
@@ -78,16 +100,18 @@ pub enum Doubt {
 }
 
 /// Whether every one of `changed`, the repo-relative paths that changed in the package whose
-/// manifest is in `dir`, is confined to the package's own tests (the module's rules), or the first
+/// manifest is in `dir`, is confined to the package itself (the module's rules), or the first
 /// doubt.
 ///
 /// # Errors
 /// The first [`Doubt`] of a changed file.
 pub fn confined(files: &dyn Files, dir: &str, changed: &[&str]) -> Result<(), Doubt> {
-    if let Some(path) = changed.iter().find(|path| !path.ends_with(".rs")) {
+    let manifest_path = join(dir, "Cargo.toml");
+    if let Some(path) = changed.iter().find(|path| {
+        !path.ends_with(".rs") && (**path != manifest_path || !same_values(files, path))
+    }) {
         return Err(Doubt::NotRust((*path).to_string()));
     }
-    let manifest_path = join(dir, "Cargo.toml");
     let manifest = files
         .now(&manifest_path)
         .ok()
@@ -128,6 +152,10 @@ pub fn confined(files: &dyn Files, dir: &str, changed: &[&str]) -> Result<(), Do
         if before.named.contains(path) || now.named.contains(path) {
             return Err(Doubt::Named(path.to_string()));
         }
+        // The package's manifest, whose values are the same before and after.
+        if !path.ends_with(".rs") {
+            continue;
+        }
         // A file no declaration names in a version it exists in may be one a macro declares.
         let unplaced = |reach: &Reach, when: When| -> Result<bool, Doubt> {
             Ok(!reach.tested.contains(path) && reader.text(path, when)?.is_some())
@@ -146,12 +174,70 @@ pub fn confined(files: &dyn Files, dir: &str, changed: &[&str]) -> Result<(), Do
             let (Some(was), Some(is)) = (Source::read(was), Source::read(is)) else {
                 return Err(Doubt::Unread(path.to_string()));
             };
-            if was.shipped() != is.shipped() {
+            if was.code() != is.code() {
                 return Err(Doubt::Shipped(path.to_string()));
+            }
+            let edited = edited(&was, &is);
+            if edited.is_empty() {
+                continue;
+            }
+            if before.included.contains(path) || now.included.contains(path) {
+                return Err(Doubt::Included(path.to_string()));
+            }
+            let placed =
+                |reach: &Reach| reach.shipped.contains(path) || reach.tested.contains(path);
+            if before.carried.contains(path)
+                || now.carried.contains(path)
+                || !placed(&before)
+                || !placed(&now)
+                || edited.iter().any(|comment| comment.carried)
+            {
+                return Err(Doubt::Carried(path.to_string()));
             }
         }
     }
     Ok(())
+}
+
+/// The comments of either version that sit among the code where the two differ: every one, of
+/// both, between two code tokens whose comments are not the same, each in the same place. The
+/// code must be the same, so each gap is the same place in both.
+fn edited<'a>(was: &'a Source, is: &'a Source) -> Vec<Comment<'a>> {
+    let by_gap = |source: &'a Source| {
+        let mut gaps: BTreeMap<usize, Vec<Comment<'a>>> = BTreeMap::new();
+        for comment in source.comments() {
+            gaps.entry(comment.gap).or_default().push(comment);
+        }
+        gaps
+    };
+    let (was, is) = (by_gap(was), by_gap(is));
+    let places = |comments: Option<&Vec<Comment<'a>>>| {
+        comments.map_or_else(Vec::new, |comments| comments.iter().map(|c| c.at).collect())
+    };
+    was.keys()
+        .chain(is.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|gap| places(was.get(gap)) != places(is.get(gap)))
+        .flat_map(|gap| {
+            was.get(gap)
+                .into_iter()
+                .chain(is.get(gap))
+                .flatten()
+                .copied()
+        })
+        .collect()
+}
+
+/// Whether the manifest at `path` holds the same TOML values before and after, so Cargo reads it
+/// as if it had not changed. A manifest either version lacks, or one that does not read or
+/// parse, holds no such values.
+fn same_values(files: &dyn Files, path: &str) -> bool {
+    let value = |text: Result<Option<String>, String>| {
+        aterm_toml::from_str::<aterm_toml::Value>(&text.ok()??).ok()
+    };
+    let before = value(files.before(path));
+    before.is_some() && before == value(files.now(path))
 }
 
 /// What a package's manifest says of its targets, by package-relative path.
@@ -337,6 +423,12 @@ impl Reader<'_> {
 struct Reach {
     /// The files it may compile.
     shipped: BTreeSet<String>,
+    /// The files among those an `include!` may read the tokens of.
+    included: BTreeSet<String>,
+    /// The files among those a macro may read the tokens of, mounted by a declaration a macro
+    /// may read ([`Mount::carried`]) or whose path this reader cannot settle, or by any
+    /// declaration or `include!` such a file holds.
+    carried: BTreeSet<String>,
     /// The files a declaration or `include!` in test code may bring in, and theirs in turn.
     tested: BTreeSet<String>,
     /// The files it may embed the bytes of.
@@ -356,45 +448,60 @@ impl Reach {
         when: When,
     ) -> Result<Self, Doubt> {
         let mut reach = Self::default();
-        let mut queue: Vec<String> = listed
+        // Each with whether a macro may read its tokens.
+        let mut queue: Vec<(String, bool)> = listed
             .iter()
             .filter(|path| {
                 within(dir, path).is_some_and(|rel| {
                     manifest.roots.iter().any(|root| root == rel) || rel.starts_with("src/bin/")
                 })
             })
-            .cloned()
+            .map(|path| (path.clone(), false))
             .collect();
+        // Only a Rust source declares a module or brings in tokens.
+        let sources = || listed.iter().filter(|path| path.ends_with(".rs"));
         // What test code of a shipped file brings in, and everything those files bring in.
         let mut tested: Vec<String> = listed
             .iter()
             .filter(|path| within(dir, path).is_some_and(|rel| manifest.test_root(rel)))
             .cloned()
             .collect();
-        while let Some(file) = queue.pop() {
-            if reach.shipped.contains(&file) {
+        while let Some((file, carried)) = queue.pop() {
+            if reach.shipped.contains(&file) && (!carried || reach.carried.contains(&file)) {
                 continue;
             }
             let Some(read) = reader.read(&file, when)? else {
                 continue;
             };
-            reach.shipped.insert(file);
+            reach.shipped.insert(file.clone());
+            if carried {
+                reach.carried.insert(file);
+            }
             for mount in &read.mounts {
-                let named = listed.iter().filter(|path| may_mount(mount, path)).cloned();
+                let named = sources().filter(|path| may_mount(mount, path)).cloned();
                 if mount.test {
                     tested.extend(named);
                 } else {
-                    queue.extend(named);
+                    let carried = carried
+                        || mount.carried
+                        || mount.name.is_none()
+                        || mount.path == MountPath::Unsettled;
+                    queue.extend(named.map(|path| (path, carried)));
                 }
             }
             for (kind, arg, test) in &read.includes {
                 let targets = included(listed, arg);
                 if *test {
                     if *kind == IncludeKind::Tokens {
-                        tested.extend(targets);
+                        tested.extend(targets.into_iter().filter(|path| path.ends_with(".rs")));
                     }
                 } else if *kind == IncludeKind::Tokens {
-                    queue.extend(targets);
+                    let targets: Vec<String> = targets
+                        .into_iter()
+                        .filter(|path| path.ends_with(".rs"))
+                        .collect();
+                    reach.included.extend(targets.iter().cloned());
+                    queue.extend(targets.into_iter().map(|path| (path, carried)));
                 } else {
                     reach.embeds_any |= *arg == IncludeArg::Unknown;
                     reach.embedded.extend(targets);
@@ -418,11 +525,15 @@ impl Reach {
                 continue;
             };
             for mount in &read.mounts {
-                tested.extend(listed.iter().filter(|path| may_mount(mount, path)).cloned());
+                tested.extend(sources().filter(|path| may_mount(mount, path)).cloned());
             }
             for (kind, arg, _) in &read.includes {
                 if *kind == IncludeKind::Tokens {
-                    tested.extend(included(listed, arg));
+                    tested.extend(
+                        included(listed, arg)
+                            .into_iter()
+                            .filter(|path| path.ends_with(".rs")),
+                    );
                 }
             }
         }

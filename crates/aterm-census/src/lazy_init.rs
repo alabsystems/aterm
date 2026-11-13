@@ -17,38 +17,27 @@ use calls::{CallScope, known_free_exports};
 /// This walker's limits, printed after every red verdict.
 pub const LAZY_INIT_PRECISION_NOTE: &str =
     "    PRECISION / SCOPE (the honest limits of this census):
-      - LEXICAL, name-based: cells are found at their `static NAME: <Lazy…>`
-        declarations, blocking touches by the receiver identifier before a
-        blocking method (or any mention, for a deref-lazy cell), and calls as
-        `<ident>(` over rustfmt-segmented fn bodies. A two-segment dependency
-        call selects its crate only when Cargo's alias, an unshadowed source
-        name and an ordinary public free export are proved in source without
-        blocking lazy surfaces; all other calls keep the conservative by-name
-        walk. A differently named borrowed cell is not proved independent.
-        No type, trait or borrow
-        information exists here. Two cells sharing an identifier are ONE node.
-      - REACH IS DELIBERATELY SHALLOW, and this is the load-bearing precision
-        decision. A name-merged call graph's transitive closure over an
-        84-crate workspace reaches almost everything from almost everything —
-        measured on this tree, an unbounded walk turned 87 cells into one
-        27-cell `cycle` of pure noise. So the walk follows: (a) the
-        initializer's own text, (b) its DIRECT callees, resolved workspace-wide,
-        and (c) transitively, only callees DEFINED IN THE SAME FILE, to a small
-        depth. A name with many definitions carries no information once merged
-        and is not followed at all. Consequence, stated plainly: an initializer
-        that re-enters its own cell through a chain of cross-file helpers is
-        NOT caught. Every instance of this hazard that has actually shipped —
-        including the v0.65.0 freeze this census exists for — is a direct
-        self-call, and that is caught with the path printed.
-      - CELLS ARE FOUND TWO WAYS, and the second is narrower on purpose: a
-        `static NAME: <LazyType>` anywhere (including inside a fn body, as the
-        shipped bug was), and a STRUCT FIELD `name: <LazyType>,`. A field cell
-        is tracked through its blocking METHODS only, never through a bare
-        mention of its name: `cache` or `state` is not globally unique the way
-        a static's name is, and treating every occurrence as a touch would
-        manufacture edges in an obligation that has no waiver channel. So a
-        `LazyLock` FIELD re-entered by a plain deref is NOT caught, and a field
-        written without rustfmt's trailing comma is not seen as a field.
+      - LEXICAL: statics retain distinct file/declaration/enclosing-function
+        identities. An unqualified proved-local static selects that declaration;
+        uncertain imported globals and field receivers retain conservative candidates.
+        Dot calls stay in the method domain; unproved associated/module paths may
+        name either domain. Impl and trait bodies use the existing bounded item parser.
+        A Cargo alias selects a free export only when its source binding is proved.
+      - REACH IS DELIBERATELY SHALLOW: direct initializer calls are resolved across
+        the scan set. The initializer file and directly called providers contribute
+        bounded same-file helper effects; additional cross-file chains and dynamic
+        dispatch remain outside this walk. Ambiguous names limit deeper reach.
+        Direct cell-value arguments retain their originating call through the same
+        bounded helper walk. Transitive parameter substitution is NOT proved:
+        even an ignored root borrow may conservatively reach a deeper helper.
+        Such a candidate refuses without claiming a proven runtime cycle.
+        Aliases, arbitrary call-result values and dynamic containers need
+        type/dataflow analysis outside this lexical census.
+      - CELLS ARE FOUND TWO WAYS: static lazy declarations, including fn-local
+        statics, and struct fields written with a trailing comma. Fields retain
+        a conservative field-name domain. They contribute blocking method/helper
+        effects, never an unconditional blocking touch from a bare field mention.
+        A LazyLock field re-entered only by a plain deref is not caught.
       - SCOPE: non-test sources of every workspace member (`crates/*/src`).
         `tools/*/src` and the sibling workspaces are NOT censused — they are
         dev/host code outside the shipped binary — so a lazy cell there is
@@ -89,6 +78,10 @@ const AMBIGUOUS_DEFS: usize = 3;
 /// A lazily-initialised cell found at its `static` declaration.
 #[derive(Debug, Clone)]
 struct Cell {
+    /// Declaration identity, separate from its display spelling.
+    id: String,
+    file: String,
+    owner: Option<String>,
     /// The static's identifier.
     name: String,
     /// `LazyLock`/`OnceLock`/… — the spelling found, for the diagnostic.
@@ -119,10 +112,12 @@ struct Initializer {
     span: String,
     /// Repo-relative file the initializer is written in (the same-file walk).
     file: String,
-    /// Every `<ident>(` called directly in the initializer's text.
+    /// Direct callees, with method and free-function domains kept separate.
     callees: BTreeSet<String>,
     /// Cells this initializer blockingly touches in its own text (depth 0).
     direct_touches: BTreeSet<String>,
+    /// Direct cell-value arguments, keyed by the initializer call receiving them.
+    borrowed_calls: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One edge of the lazy-init graph, with the witness that produced it.
@@ -130,6 +125,8 @@ struct Initializer {
 struct Edge {
     from: String,
     to: String,
+    /// Root-borrow association through helpers without parameter substitution.
+    conservative: bool,
     /// The rendered witness: where the initializer is and how it gets back.
     path: String,
 }
@@ -170,7 +167,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
         d.cells.len(),
         d.inits.len(),
         d.touches.len(),
-        d.defs.len()
+        d.ambiguities.len()
     );
 
     let mut failures = 0usize;
@@ -198,6 +195,16 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
     for edge in &self_loops {
         failures += 1;
         let cell = d.cell(&edge.from);
+        if edge.conservative {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-19] POTENTIALLY SELF-REENTRANT lazy init: `{}` ({}).\n    {}\n    REFUSAL: the root cell borrow is conservatively associated with a deeper blocking helper. Parameter substitution is unresolved; this is not proof of runtime recursion.",
+                cell.map_or(edge.from.as_str(), |cell| cell.name.as_str()),
+                cell.map_or("unknown declaration", |cell| cell.span.as_str()),
+                edge.path
+            );
+            continue;
+        }
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-19] SELF-REENTRANT lazy init: `{}` ({} declared at {}) is \
@@ -212,7 +219,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
              parsed config, a constant — never by asking the accessor you are running \
              under. If the nested read is only a cache peek, use the non-blocking `get()` \
              and handle `None`.",
-            edge.from,
+            cell.map_or(edge.from.as_str(), |cell| cell.name.as_str()),
             cell.map_or("lazy cell".to_string(), |c| {
                 if c.field {
                     format!("{} FIELD", c.kind)
@@ -221,7 +228,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
                 }
             }),
             cell.map_or("<unknown>", |c| c.span.as_str()),
-            edge.from,
+            cell.map_or(edge.from.as_str(), |cell| cell.name.as_str()),
             edge.path
         );
     }
@@ -229,15 +236,45 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
     for component in &components {
         failures += 1;
         let members: BTreeSet<&str> = component.iter().map(|e| e.from.as_str()).collect();
-        let rendered = members.iter().copied().collect::<Vec<_>>().join(", ");
+        let rendered = members
+            .iter()
+            .map(|id| {
+                d.cell(id).map_or_else(
+                    || (*id).to_owned(),
+                    |cell| format!("`{}` ({})", cell.name, cell.span),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let potential = component.iter().any(|edge| edge.conservative);
+        let qualifier = if potential { "POTENTIALLY " } else { "" };
         let _ = writeln!(
             log,
-            "  ✗ FAIL [OB-20] MUTUALLY-REENTRANT lazy init: {{{rendered}}} is a strongly \
+            "  ✗ FAIL [OB-20] {qualifier}MUTUALLY-REENTRANT lazy init: {{{rendered}}} is a strongly \
              connected component of the lazy-init graph — each of these cells can reach a \
              blocking touch of the others."
         );
         for e in component {
-            let _ = writeln!(log, "\x20     {} -> {}: {}", e.from, e.to, e.path);
+            let display = |id: &str| {
+                d.cell(id).map_or_else(
+                    || id.to_owned(),
+                    |cell| format!("`{}` ({})", cell.name, cell.span),
+                )
+            };
+            let _ = writeln!(
+                log,
+                "\x20     {} -> {}: {}",
+                display(&e.from),
+                display(&e.to),
+                e.path
+            );
+        }
+        if potential {
+            let _ = writeln!(
+                log,
+                "    REFUSAL: a conservative root-borrow association participates in this cycle. Transitive parameter substitution is unresolved; this is not proof of runtime recursion."
+            );
+            continue;
         }
         let _ = writeln!(
             log,
@@ -293,19 +330,22 @@ struct Derived {
     cells: Vec<Cell>,
     inits: Vec<Initializer>,
     touches: Vec<Touch>,
-    /// fn name -> how many definitions carry it (the ambiguity filter).
-    defs: BTreeMap<String, usize>,
+    /// Actual declaration membership; file identity is never discarded at a join.
+    defs: BTreeSet<(String, String)>,
+    /// The existing corpus-wide ambiguity boundary for body traversal.
+    ambiguities: BTreeMap<String, usize>,
+    borrowed_triggers: BTreeMap<String, BTreeSet<String>>,
     /// file -> (fn name -> the names it calls directly), for the local walk.
     local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// cell -> the fns that blockingly touch it (its trigger entry points).
-    triggers: BTreeMap<String, BTreeSet<String>>,
-    /// (cell, trigger fn) -> a representative touch span, for the diagnostic.
-    trigger_spans: BTreeMap<(String, String), String>,
+    triggers: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// (cell, actual source file, trigger fn) -> the representative touch span.
+    trigger_spans: BTreeMap<(String, String, String), String>,
 }
 
 impl Derived {
     fn cell(&self, name: &str) -> Option<&Cell> {
-        self.cells.iter().find(|c| c.name == name)
+        self.cells.iter().find(|c| c.id == name)
     }
 }
 
@@ -351,7 +391,7 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
 /// this thread's memo scope ([`crate::memo::threads`]), so what it reads is the census unit's
 /// question.
 fn par_map<'s, T: Sync, R: Send>(items: &'s [T], f: impl Fn(&'s T) -> R + Sync) -> Vec<R> {
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    let workers = aterm_cores::available_parallelism().map_or(4, |n| n.get().min(16));
     let next = AtomicUsize::new(0);
     let work = || {
         let mut done = Vec::new();
@@ -399,6 +439,10 @@ fn source_crate(file: &str) -> Option<&str> {
         .filter(|dir| dir.starts_with("crates/"))
 }
 
+fn method_fn(name: &str) -> String {
+    format!("method::{name}")
+}
+
 fn owned_fn(dir: &str, name: &str) -> String {
     format!("{dir}::{name}")
 }
@@ -407,9 +451,9 @@ fn owned_fn(dir: &str, name: &str) -> String {
 /// which need every file's cells.
 struct FileWalk<'a> {
     rel: &'a str,
-    /// Each line's code, [`crate::strip_line_comment`] of the line.
-    code: Vec<&'a str>,
     fns: Enclosing,
+    blocks: Vec<Vec<(usize, usize)>>,
+    scope_code: Vec<String>,
     calls: CallScope<'a>,
     /// fn name (and its crate-owned name) -> the names it calls directly.
     local: BTreeMap<String, BTreeSet<String>>,
@@ -426,17 +470,31 @@ impl<'a> FileWalk<'a> {
         scopes: &DependencyScopes,
         exports: &'a BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
-        let lines: Vec<&str> = text.lines().collect();
-        let fns = enclosing_fns(&lines);
-        let code: Vec<&str> = lines.iter().map(|line| line_code(line)).collect();
+        let scope_code: Vec<String> = crate::lex::blank_non_code(text)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let fns = enclosing_fns(&scope_code.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut blocks = Vec::new();
+        let mut stack = Vec::new();
+        for (line, code) in scope_code.iter().enumerate() {
+            blocks.push(stack.clone());
+            for (at, byte) in code.bytes().enumerate() {
+                match byte {
+                    b'{' => stack.push((line, at)),
+                    b'}' => {
+                        stack.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let code: Vec<&str> = scope_code.iter().map(String::as_str).collect();
         let calls = CallScope::new(rel, text, &code, scopes, exports);
         let dir = source_crate(rel);
         let mut local: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for span in &fns.spans {
-            let mut targets = BTreeSet::new();
-            for line in &code[span.first..=span.last] {
-                calls.line_callees(line, &mut targets);
-            }
+            let targets = calls.callees(&scope_code[span.first..=span.last]);
             if let Some(dir) = dir {
                 local
                     .entry(owned_fn(dir, &span.name))
@@ -445,26 +503,29 @@ impl<'a> FileWalk<'a> {
             }
             local.entry(span.name.clone()).or_default().extend(targets);
         }
-        let statics = static_cells(&code, rel);
+        let mut statics = static_cells(&code, rel);
+        for cell in &mut statics {
+            let line = cell
+                .span
+                .rsplit_once(':')
+                .and_then(|(_, line)| line.parse::<usize>().ok())
+                .unwrap_or(1)
+                - 1;
+            cell.owner = fns
+                .span_at(line)
+                .map(|span| format!("{}:{}", span.first, span.name));
+        }
         let fields = field_cells(&code, rel);
         Self {
             rel,
-            code,
             fns,
+            blocks,
+            scope_code,
             calls,
             local,
             statics,
             fields,
         }
-    }
-}
-
-/// [`crate::strip_line_comment`] of `line`, which a line holding no `/` cannot change.
-fn line_code(line: &str) -> &str {
-    if line.as_bytes().contains(&b'/') {
-        crate::strip_line_comment(line)
-    } else {
-        line
     }
 }
 
@@ -478,7 +539,8 @@ fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScope
         FileWalk::of(rel, text, scopes, &exports)
     });
     let mut cells: Vec<Cell> = Vec::new();
-    let mut defs: BTreeMap<String, usize> = BTreeMap::new();
+    let mut defs = BTreeSet::new();
+    let mut ambiguities: BTreeMap<String, usize> = BTreeMap::new();
     let mut local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
     for file in &mut files {
@@ -486,9 +548,12 @@ fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScope
         let mut seen_here: BTreeSet<&str> = BTreeSet::new();
         for span in &file.fns.spans {
             if seen_here.insert(&span.name) {
-                *defs.entry(span.name.clone()).or_default() += 1;
+                defs.insert((file.rel.to_owned(), span.name.clone()));
+                *ambiguities.entry(span.name.clone()).or_default() += 1;
                 if let Some(dir) = dir {
-                    *defs.entry(owned_fn(dir, &span.name)).or_default() += 1;
+                    let owned = owned_fn(dir, &span.name);
+                    defs.insert((file.rel.to_owned(), owned.clone()));
+                    *ambiguities.entry(owned).or_default() += 1;
                 }
             }
         }
@@ -511,64 +576,73 @@ fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScope
     let deref = DerefNames::of(&cells);
     let mut touches: Vec<Touch> = Vec::new();
     let mut inits: Vec<Initializer> = Vec::new();
-    for (file_touches, file_inits) in par_map(&files, |file| {
-        collect_touches_and_inits(file, &cells, &deref)
-    }) {
+    let mut borrowed_by_file = BTreeMap::new();
+    for (rel, (file_touches, file_inits, borrowed)) in
+        files
+            .iter()
+            .map(|file| file.rel)
+            .zip(par_map(&files, |file| {
+                collect_touches_and_inits(file, &cells, &deref)
+            }))
+    {
+        borrowed_by_file.insert(rel.to_owned(), borrowed);
         touches.extend(file_touches);
         inits.extend(file_inits);
     }
 
-    let mut triggers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut trigger_spans: BTreeMap<(String, String), String> = BTreeMap::new();
-    for t in &touches {
-        let Some(f) = t.in_fn.as_ref() else { continue };
-        triggers
-            .entry(t.cell.clone())
-            .or_default()
-            .insert(f.clone());
-        trigger_spans
-            .entry((t.cell.clone(), f.clone()))
-            .or_insert_with(|| format!("{} ({})", t.span, t.how));
-        if let Some(dir) = t
-            .span
-            .rsplit_once(':')
-            .and_then(|(file, _)| source_crate(file))
-        {
-            let owned = owned_fn(dir, f);
+    let mut triggers: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut trigger_spans: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    for touch in &touches {
+        let Some(function) = &touch.in_fn else {
+            continue;
+        };
+        let Some((file, _)) = touch.span.rsplit_once(':') else {
+            continue;
+        };
+        let mut names = vec![function.clone()];
+        if let Some(dir) = source_crate(file) {
+            names.push(owned_fn(dir, function));
+        }
+        for name in names {
             triggers
-                .entry(t.cell.clone())
+                .entry(touch.cell.clone())
                 .or_default()
-                .insert(owned.clone());
+                .insert((file.to_owned(), name.clone()));
             trigger_spans
-                .entry((t.cell.clone(), owned))
-                .or_insert_with(|| format!("{} ({})", t.span, t.how));
+                .entry((touch.cell.clone(), file.to_owned(), name))
+                .or_insert_with(|| format!("{} ({})", touch.span, touch.how));
         }
     }
+
+    // Keep direct effects in their actual source context. The single bounded
+    // traversal below accounts for every helper hop; no pre-expanded summary
+    // gets another depth budget or bypasses the ambiguity boundary.
+    for (file, functions) in &mut borrowed_by_file {
+        if let Some(dir) = source_crate(file) {
+            functions.extend(functions.clone().iter().map(|name| owned_fn(dir, name)));
+        }
+    }
+    let borrowed_triggers = borrowed_by_file;
 
     Derived {
         cells,
         inits,
         touches,
         defs,
+        ambiguities,
+        borrowed_triggers,
         local,
         triggers,
         trigger_spans,
     }
 }
 
-/// Merge one file's declarations into `out`, its `static`s before its fields. A `static`
-/// seen before folds into the cell already found; a field never replaces any cell.
+/// Keep each static declaration distinct. Unresolved field receivers retain the
+/// existing conservative field-name domain, separate from all static declarations.
 fn add_cells(out: &mut Vec<Cell>, statics: Vec<Cell>, fields: Vec<Cell>) {
-    for cell in statics {
-        if let Some(existing) = out.iter_mut().find(|c| c.name == cell.name) {
-            existing.deref_lazy |= cell.deref_lazy;
-            existing.field = false;
-            continue;
-        }
-        out.push(cell);
-    }
+    out.extend(statics);
     for cell in fields {
-        if !out.iter().any(|c| c.name == cell.name) {
+        if !out.iter().any(|existing| existing.id == cell.id) {
             out.push(cell);
         }
     }
@@ -594,6 +668,9 @@ fn static_cells(code: &[&str], rel: &str) -> Vec<Cell> {
             .map_or("lazy", |t| t.trim_end_matches('<'))
             .to_string();
         out.push(Cell {
+            id: format!("static::{rel}:{}::{name}", i + 1),
+            file: rel.to_owned(),
+            owner: None,
             name: name.to_string(),
             kind,
             span: format!("{rel}:{}", i + 1),
@@ -618,6 +695,9 @@ fn field_cells(code: &[&str], rel: &str) -> Vec<Cell> {
             .map_or("lazy", |t| t.trim_end_matches('<'))
             .to_string();
         out.push(Cell {
+            id: format!("field::{name}"),
+            file: rel.to_owned(),
+            owner: None,
             name,
             kind,
             span: format!("{rel}:{}", i + 1),
@@ -710,21 +790,260 @@ fn declaration_text(code_lines: &[&str], line_idx: usize) -> String {
     out
 }
 
+/// Bind an occurrence to a proved local declaration before considering unknown
+/// imported globals or fields. Function-local statics never alias other functions.
+fn bound_cells<'a>(
+    file: &FileWalk<'_>,
+    cells: &'a [Cell],
+    text: &str,
+    end: usize,
+    line: usize,
+    name: &str,
+) -> Vec<&'a Cell> {
+    let before = text[..end].trim_end();
+    let prefix = before.strip_suffix(name).unwrap_or("").trim_end();
+    let matching = || cells.iter().filter(|cell| cell.name == name);
+    if prefix.ends_with('.') {
+        return matching().filter(|cell| cell.field).collect();
+    }
+    if let Some(path) = prefix.strip_suffix("::") {
+        let path = path.trim_end();
+        let alias = crate::ident_ending_at(path, path.len()).unwrap_or("");
+        let owner = if matches!(alias, "crate" | "self" | "super") {
+            source_crate(file.rel)
+        } else {
+            file.calls.dependency(alias)
+        };
+        return matching()
+            .filter(|cell| {
+                !cell.field
+                    && cell.owner.is_none()
+                    && owner.is_none_or(|dir| source_crate(&cell.file) == Some(dir))
+            })
+            .collect();
+    }
+    let owner = file
+        .fns
+        .span_at(line)
+        .map(|span| format!("{}:{}", span.first, span.name));
+    let column = text[..end].rsplit('\n').next().map_or(0, str::len);
+    let mut scope = file.blocks.get(line).cloned().unwrap_or_default();
+    if let Some(code) = file.scope_code.get(line) {
+        for (at, byte) in code.bytes().enumerate().take(column) {
+            match byte {
+                b'{' => scope.push((line, at)),
+                b'}' => {
+                    scope.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut local: Vec<_> = matching()
+        .filter(|cell| {
+            if cell.field || cell.file != file.rel || cell.owner.is_none() || cell.owner != owner {
+                return false;
+            }
+            let declaration = cell
+                .span
+                .rsplit_once(':')
+                .and_then(|(_, line)| line.parse::<usize>().ok())
+                .unwrap_or(0)
+                .saturating_sub(1);
+            file.blocks
+                .get(declaration)
+                .is_some_and(|block| scope.starts_with(block))
+        })
+        .collect();
+    // Static items are visible throughout their enclosing block, including
+    // before their declaration. Only the nearest proved enclosing block shadows.
+    if let Some(depth) = local
+        .iter()
+        .filter_map(|cell| {
+            cell.span
+                .rsplit_once(':')
+                .and_then(|(_, line)| line.parse::<usize>().ok())
+                .and_then(|line| file.blocks.get(line - 1))
+                .map(Vec::len)
+        })
+        .max()
+    {
+        local.retain(|cell| {
+            cell.span
+                .rsplit_once(':')
+                .and_then(|(_, line)| line.parse::<usize>().ok())
+                .and_then(|line| file.blocks.get(line - 1))
+                .is_some_and(|block| block.len() == depth)
+        });
+        return local;
+    }
+    let globals: Vec<_> = matching()
+        .filter(|cell| !cell.field && cell.file == file.rel && cell.owner.is_none())
+        .collect();
+    if !globals.is_empty() {
+        return globals;
+    }
+    matching()
+        .filter(|cell| cell.field || cell.owner.is_none())
+        .collect()
+}
+
+fn unresolved_receiver(
+    file: &FileWalk<'_>,
+    cells: &[Cell],
+    text: &str,
+    end: usize,
+    line: usize,
+    name: &str,
+) -> bool {
+    let before = text[..end].trim_end();
+    let prefix = before.strip_suffix(name).unwrap_or("").trim_end();
+    if prefix.ends_with('.') || prefix.ends_with("::") {
+        return false;
+    }
+    !bound_cells(file, cells, text, end, line, name)
+        .iter()
+        .any(|cell| !cell.field && cell.file == file.rel)
+}
+
+fn ident_ends<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(name).filter_map(move |(at, _)| {
+        let end = at + name.len();
+        (text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            && text[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_'))
+        .then_some(end)
+    })
+}
+
+/// A direct cell-value argument. Derived values returned by arbitrary calls,
+/// aliases and dynamic containers require type/dataflow analysis outside this
+/// lexical census; they are not inferred from a matching word elsewhere.
+fn cell_value_path(mut value: &str) -> Option<&str> {
+    loop {
+        value = value.trim();
+        if let Some(rest) = value.strip_prefix('&') {
+            value = rest
+                .trim_start()
+                .strip_prefix("mut ")
+                .unwrap_or(rest)
+                .trim_start();
+        } else if value.starts_with('(') && value.ends_with(')') {
+            value = &value[1..value.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let path = value;
+    let mut rest = value.strip_prefix("::").unwrap_or(value).trim_start();
+    loop {
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if end == 0
+            || !rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+        {
+            return None;
+        }
+        rest = rest[end..].trim_start();
+        if rest.is_empty() {
+            return Some(path);
+        }
+        rest = rest
+            .strip_prefix("::")
+            .or_else(|| rest.strip_prefix('.'))?
+            .trim_start();
+    }
+}
+
+fn borrowed_call_arguments(
+    file: &FileWalk<'_>,
+    cells: &[Cell],
+    body: &[String],
+    line: usize,
+    first_column: usize,
+) -> BTreeMap<String, BTreeSet<String>> {
+    // `body` is a slice of the one whole-source lexical view. Retain its
+    // original first-line column so block lookup uses actual source offsets.
+    let code = format!("{}{}", " ".repeat(first_column), body.join("\n"));
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (open, byte) in code.bytes().enumerate() {
+        if byte != b'(' {
+            continue;
+        }
+        let functions = file.calls.reference(&code[..open]);
+        if functions.is_empty() {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut first = open + 1;
+        for (relative, byte) in code[open + 1..].bytes().enumerate() {
+            let at = open + 1 + relative;
+            let boundary = match byte {
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    false
+                }
+                b')' if depth == 0 => true,
+                b')' | b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                    false
+                }
+                b',' if depth == 0 => true,
+                _ => false,
+            };
+            if !boundary {
+                continue;
+            }
+            let argument = &code[first..at];
+            if let Some(value) = cell_value_path(argument) {
+                let end = first + argument.find(value).expect("argument subslice") + value.len();
+                let name = crate::ident_ending_at(value, value.len()).unwrap_or("");
+                let prefix = value[..value.len() - name.len()].trim_end();
+                let value_line = line + code[..end].bytes().filter(|byte| *byte == b'\n').count();
+                let targets = bound_cells(file, cells, &code, end, value_line, name);
+                for function in &functions {
+                    found.entry(function.clone()).or_default().extend(
+                        targets
+                            .iter()
+                            .filter(|cell| !cell.field || prefix.ends_with('.'))
+                            .map(|cell| cell.id.clone()),
+                    );
+                }
+            }
+            first = at + 1;
+            if byte == b')' {
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// Blocking touches and initializers in one file.
 fn collect_touches_and_inits(
     file: &FileWalk<'_>,
     cells: &[Cell],
     deref: &DerefNames<'_>,
-) -> (Vec<Touch>, Vec<Initializer>) {
+) -> (Vec<Touch>, Vec<Initializer>, BTreeSet<String>) {
     let FileWalk {
         rel,
-        code: masked,
         fns: enclosing,
         calls,
         ..
     } = file;
     let mut touches = Vec::new();
     let mut inits = Vec::new();
+    let mut borrowed = BTreeSet::new();
+    let masked: Vec<&str> = file.scope_code.iter().map(String::as_str).collect();
     let joined = masked.join("\n");
     let line_starts = line_start_index(&joined);
     let line_of = |at: usize| match line_starts.binary_search(&at) {
@@ -753,27 +1072,51 @@ fn collect_touches_and_inits(
                 continue;
             };
             from = open + 1;
-            let Some(recv) = receiver_before(&joined, at) else {
-                continue;
-            };
-            let Some(cell) = cells.iter().find(|c| c.name == recv) else {
-                continue;
-            };
             let ln = line_of(at);
-            touches.push(Touch {
-                cell: cell.name.clone(),
-                in_fn: enclosing.at(ln).map(str::to_string),
-                span: format!("{rel}:{}", ln + 1),
-                how: (*method).to_string(),
-            });
+            let Some(recv) = receiver_before(&joined, at) else {
+                if let Some(function) = enclosing.at(ln) {
+                    borrowed.insert(function.to_owned());
+                }
+                continue;
+            };
+            let targets = bound_cells(file, cells, &joined, at, ln, recv);
+            if (targets.is_empty() || unresolved_receiver(file, cells, &joined, at, ln, recv))
+                && let Some(function) = enclosing.at(ln)
+            {
+                borrowed.insert(function.to_owned());
+            }
+            if targets.is_empty() {
+                continue;
+            }
             let body = balanced(&joined, open);
-            inits.push(Initializer {
-                cell: cell.name.clone(),
-                span: format!("{rel}:{}", ln + 1),
-                file: rel.to_string(),
-                callees: initializer_callees(&body, calls),
-                direct_touches: direct_touches(&body, cells),
-            });
+            for cell in targets {
+                touches.push(Touch {
+                    cell: cell.id.clone(),
+                    in_fn: enclosing.at(ln).map(str::to_string),
+                    span: format!("{rel}:{}", ln + 1),
+                    how: (*method).to_string(),
+                });
+                inits.push(Initializer {
+                    cell: cell.id.clone(),
+                    span: format!("{rel}:{}", ln + 1),
+                    file: rel.to_string(),
+                    callees: initializer_callees(&body, calls),
+                    direct_touches: direct_touches(
+                        file,
+                        &body,
+                        cells,
+                        line_of(open),
+                        open - line_starts[line_of(open)],
+                    ),
+                    borrowed_calls: borrowed_call_arguments(
+                        file,
+                        cells,
+                        &body,
+                        line_of(open),
+                        open - line_starts[line_of(open)],
+                    ),
+                });
+            }
         }
     }
 
@@ -786,8 +1129,8 @@ fn collect_touches_and_inits(
             if !mentions_ident(code, &cell.name) {
                 continue;
             }
-            if declares == Some(cell.name.as_str()) {
-                let decl = declaration_text(masked, i);
+            if declares == Some(cell.name.as_str()) && cell.span == format!("{rel}:{}", i + 1) {
+                let decl = declaration_text(&masked, i);
                 for ctor in LAZY_CTORS {
                     let Some(off) = decl
                         .find(ctor)
@@ -801,24 +1144,32 @@ fn collect_touches_and_inits(
                     let abs = line_starts.get(i + dl).map_or(0, |s| s + col);
                     let body = balanced(&joined, abs);
                     inits.push(Initializer {
-                        cell: cell.name.clone(),
+                        cell: cell.id.clone(),
                         span: format!("{rel}:{}", i + 1),
                         file: rel.to_string(),
                         callees: initializer_callees(&body, calls),
-                        direct_touches: direct_touches(&body, cells),
+                        direct_touches: direct_touches(file, &body, cells, i + dl, col),
+                        borrowed_calls: borrowed_call_arguments(file, cells, &body, i + dl, col),
                     });
                 }
                 continue;
             }
+            if !ident_ends(code, &cell.name).any(|end| {
+                bound_cells(file, cells, code, end, i, &cell.name)
+                    .iter()
+                    .any(|bound| bound.id == cell.id)
+            }) {
+                continue;
+            }
             touches.push(Touch {
-                cell: cell.name.clone(),
+                cell: cell.id.clone(),
                 in_fn: enclosing.at(i).map(str::to_string),
                 span: format!("{rel}:{}", i + 1),
                 how: "deref".to_string(),
             });
         }
     }
-    (touches, inits)
+    (touches, inits, borrowed)
 }
 
 /// Byte offset of the start of each line in `joined`.
@@ -1043,19 +1394,20 @@ struct FnSpan {
 }
 
 impl Enclosing {
-    /// The fn whose body `line` sits in.
-    fn at(&self, line: usize) -> Option<&str> {
+    fn span_at(&self, line: usize) -> Option<&FnSpan> {
         let next = self.spans.partition_point(|span| span.last < line);
-        self.spans
-            .get(next)
-            .filter(|span| span.first <= line)
-            .map(|span| span.name.as_str())
+        self.spans.get(next).filter(|span| span.first <= line)
+    }
+    /// The fn whose body `line` sits in, including its dispatch domain.
+    fn at(&self, line: usize) -> Option<&str> {
+        self.span_at(line).map(|span| span.name.as_str())
     }
 }
 
 /// The fn bodies of a file's lines: every line of a span sits in that fn's body.
 fn enclosing_fns(lines: &[&str]) -> Enclosing {
     let mut spans = Vec::new();
+    let impls = crate::lock_order::method_owner_spans(&lines.join("\n"));
     let mut i = 0usize;
     while i < lines.len() {
         let Some((indent, name)) = crate::parse_fn_def(lines[i]) else {
@@ -1080,6 +1432,15 @@ fn enclosing_fns(lines: &[&str]) -> Enclosing {
                 j += 1;
             }
         }
+        let line_number = i + 1;
+        let name = if impls
+            .iter()
+            .any(|span| span.start <= line_number && line_number <= span.end)
+        {
+            method_fn(&name)
+        } else {
+            name
+        };
         spans.push(FnSpan {
             name,
             first: i,
@@ -1109,7 +1470,7 @@ fn balanced(joined: &str, at: usize) -> Vec<String> {
     joined[at..end].lines().map(str::to_string).collect()
 }
 
-/// Every `<ident>(` in the initializer.
+/// Direct calls and function-path references in the initializer.
 fn initializer_callees(body: &[String], calls: &CallScope<'_>) -> BTreeSet<String> {
     let mut out = calls.callees(body);
     let joined = body.join(" ");
@@ -1118,34 +1479,49 @@ fn initializer_callees(body: &[String], calls: &CallScope<'_>) -> BTreeSet<Strin
         .trim_start_matches('(')
         .trim_end_matches(')')
         .trim();
-    if !inner.contains('|')
-        && !inner.contains('(')
-        && !inner.is_empty()
-        && let Some(target) = calls.reference(inner)
-    {
-        out.insert(target);
+    if !inner.contains('|') && !inner.contains('(') && !inner.is_empty() {
+        out.extend(calls.reference(inner));
     }
     out
 }
 
 /// Cells this initializer text touches blockingly in its own body (depth 0).
-fn direct_touches(body: &[String], cells: &[Cell]) -> BTreeSet<String> {
+fn direct_touches(
+    file: &FileWalk<'_>,
+    body: &[String],
+    cells: &[Cell],
+    first_line: usize,
+    first_column: usize,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for line in body {
+    for (offset, body_line) in body.iter().enumerate() {
+        let aligned = if offset == 0 {
+            format!("{}{body_line}", " ".repeat(first_column))
+        } else {
+            body_line.clone()
+        };
+        let line = aligned.as_str();
         for method in BLOCKING_METHODS {
-            let mut from = 0usize;
+            let mut from = 0;
             while let Some((at, open)) = find_method_call(line, method, from) {
                 from = open + 1;
-                if let Some(recv) = receiver_before(line, at)
-                    && cells.iter().any(|c| c.name == recv)
-                {
-                    out.insert(recv.to_string());
+                if let Some(recv) = receiver_before(line, at) {
+                    out.extend(
+                        bound_cells(file, cells, line, at, first_line + offset, recv)
+                            .into_iter()
+                            .map(|cell| cell.id.clone()),
+                    );
                 }
             }
         }
-        for cell in cells.iter().filter(|c| c.deref_lazy) {
-            if mentions_ident(line, &cell.name) {
-                out.insert(cell.name.clone());
+        for cell in cells.iter().filter(|cell| cell.deref_lazy) {
+            for end in ident_ends(line, &cell.name) {
+                out.extend(
+                    bound_cells(file, cells, line, end, first_line + offset, &cell.name)
+                        .into_iter()
+                        .filter(|bound| bound.deref_lazy)
+                        .map(|cell| cell.id.clone()),
+                );
             }
         }
     }
@@ -1162,13 +1538,32 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
                 edges.push(Edge {
                     from: init.cell.clone(),
                     to: target.clone(),
-                    path: format!("initializer at {} touches `{target}` directly", init.span),
+                    conservative: false,
+                    path: format!(
+                        "initializer at {} touches `{}` directly",
+                        init.span,
+                        d.cell(target)
+                            .map_or(target.as_str(), |cell| cell.name.as_str())
+                    ),
                 });
             }
         }
         let reach = reachable(d, init);
+        for hit in reach.inspected.iter().filter(|(file, function, _)| {
+            d.borrowed_triggers
+                .get(file)
+                .is_some_and(|functions| functions.contains(function))
+        }) {
+            for target in init.borrowed_calls.get(&hit.2).into_iter().flatten() {
+                if seen.insert((init.cell.clone(), target.clone())) {
+                    edges.push(Edge { from: init.cell.clone(), to: target.clone(), conservative: true, path: format!("initializer at {} passes a cell value to `{}` and conservatively reaches unresolved blocking helper {}", init.span, hit.2, render_path(&reach, hit)) });
+                }
+            }
+        }
         for (target, trigger_fns) in &d.triggers {
-            let Some(hit) = trigger_fns.iter().find(|f| reach.contains_key(f.as_str())) else {
+            let Some(hit) = reach.paths.keys().find(|(file, function, _)| {
+                trigger_fns.contains(&(file.clone(), function.clone()))
+            }) else {
                 continue;
             };
             if !seen.insert((init.cell.clone(), target.clone())) {
@@ -1176,15 +1571,18 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
             }
             let touch = d
                 .trigger_spans
-                .get(&(target.clone(), hit.clone()))
+                .get(&(target.clone(), hit.0.clone(), hit.1.clone()))
                 .map_or("?", String::as_str);
             edges.push(Edge {
                 from: init.cell.clone(),
                 to: target.clone(),
+                conservative: false,
                 path: format!(
-                    "initializer at {} calls {}, which touches `{target}` at {touch}",
+                    "initializer at {} calls {}, which touches `{}` at {touch}",
                     init.span,
-                    render_path(&reach, hit)
+                    render_path(&reach, hit),
+                    d.cell(target)
+                        .map_or(target.as_str(), |cell| cell.name.as_str())
                 ),
             });
         }
@@ -1193,50 +1591,95 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
     edges
 }
 
-/// Fn names reachable from `init` ([`LAZY_INIT_PRECISION_NOTE`]).
-fn reachable(d: &Derived, init: &Initializer) -> BTreeMap<String, Option<String>> {
-    let empty = BTreeMap::new();
-    let local = d.local.get(&init.file).unwrap_or(&empty);
-    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    for c in &init.callees {
-        if seen.insert(c.clone(), None).is_none() {
-            queue.push_back((c.clone(), 0));
+/// A function name in the file whose body the bounded walk may inspect.
+type FunctionSite = (String, String, String);
+struct Reach {
+    paths: BTreeMap<FunctionSite, Option<FunctionSite>>,
+    inspected: BTreeSet<FunctionSite>,
+}
+
+/// One original bounded budget for initializer and directly-called provider
+/// helpers. A provider's later hops stay in that provider's source context.
+fn reachable(d: &Derived, init: &Initializer) -> Reach {
+    let mut reach = Reach {
+        paths: BTreeMap::new(),
+        inspected: BTreeSet::new(),
+    };
+    let mut queue = VecDeque::new();
+    for function in &init.callees {
+        let mut providers = Vec::new();
+        if d.local
+            .get(&init.file)
+            .is_some_and(|functions| functions.contains_key(function))
+        {
+            providers.push(init.file.clone());
         }
-    }
-    while let Some((f, depth)) = queue.pop_front() {
-        if depth >= MAX_LOCAL_DEPTH || d.defs.get(&f).copied().unwrap_or(0) > AMBIGUOUS_DEFS {
-            continue;
+        // An unproved qualified call may have flattened to this symbol. A
+        // same-file spelling does not prove it is the only possible provider.
+        if d.ambiguities.get(function).copied().unwrap_or(0) <= AMBIGUOUS_DEFS {
+            providers.extend(
+                d.local
+                    .iter()
+                    .filter(|(_, functions)| functions.contains_key(function))
+                    .map(|(file, _)| file.clone()),
+            );
         }
-        let Some(callees) = local.get(&f) else {
-            continue;
-        };
-        for c in callees {
-            if seen.insert(c.clone(), Some(f.clone())).is_none() {
-                queue.push_back((c.clone(), depth + 1));
+        providers.sort();
+        providers.dedup();
+        if providers.is_empty() {
+            providers.push(init.file.clone());
+        }
+        for file in providers {
+            let site = (file, function.clone(), function.clone());
+            if reach.paths.insert(site.clone(), None).is_none() {
+                queue.push_back((site, 0));
             }
         }
     }
-    seen
+    while let Some((site, depth)) = queue.pop_front() {
+        if depth >= MAX_LOCAL_DEPTH
+            || d.ambiguities.get(&site.1).copied().unwrap_or(0) > AMBIGUOUS_DEFS
+        {
+            continue;
+        }
+        let Some(callees) = d
+            .local
+            .get(&site.0)
+            .and_then(|functions| functions.get(&site.1))
+        else {
+            continue;
+        };
+        if !d.defs.contains(&(site.0.clone(), site.1.clone())) {
+            continue;
+        }
+        reach.inspected.insert(site.clone());
+        for function in callees {
+            let next = (site.0.clone(), function.clone(), site.2.clone());
+            if !reach.paths.contains_key(&next) {
+                reach.paths.insert(next.clone(), Some(site.clone()));
+                queue.push_back((next, depth + 1));
+            }
+        }
+    }
+    reach
 }
 
 /// `` `a` -> `b` -> `c` `` for the path the walk took to `target`.
-fn render_path(reach: &BTreeMap<String, Option<String>>, target: &str) -> String {
-    let mut chain = vec![target.to_string()];
-    let mut cur = target.to_string();
-    let mut guard: BTreeSet<String> = BTreeSet::new();
-    guard.insert(cur.clone());
-    while let Some(prev) = reach.get(&cur).and_then(Clone::clone) {
-        if !guard.insert(prev.clone()) {
+fn render_path(reach: &Reach, target: &FunctionSite) -> String {
+    let mut chain = vec![target.1.clone()];
+    let mut current = target.clone();
+    let mut guard = BTreeSet::from([current.clone()]);
+    while let Some(previous) = reach.paths.get(&current).and_then(Clone::clone) {
+        if !guard.insert(previous.clone()) {
             break;
         }
-        chain.push(prev.clone());
-        cur = prev;
+        chain.push(previous.1.clone());
+        current = previous;
     }
     chain.reverse();
     chain
         .iter()
-        .map(|s| format!("`{s}`"))
+        .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(" -> ")
 }
@@ -1341,395 +1784,9 @@ fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "lazy_init_tests.rs"]
+mod tests;
 
-    /// The self-reentrant `debug_seamless_reexec_armed` shape that shipped in
-    /// v0.65 (fn-local `OnceLock`, multi-statement closure, self-call first)
-    /// and its main-thread caller.
-    const V065_SHIPPED_SHAPE: &str = r#"
-pub(crate) fn debug_seamless_reexec_armed() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        let on = crate::app_update_screen::debug_seamless_reexec_armed();
-        if on {
-            aterm_log::warn!("the QA seam is armed");
-        }
-        on
-    })
-}
-
-pub(crate) fn apply_staged_update_now() -> bool {
-    let debug_seamless = debug_seamless_reexec_armed();
-    debug_seamless
-}
-"#;
-
-    /// One synthetic tree: its name, its `(path, source)` files, and `None`
-    /// for GREEN or `Some(tokens)` for RED with every token in the log.
-    type Case = (String, Vec<(String, String)>, Option<Vec<&'static str>>);
-
-    fn case(name: &str, files: &[(&str, &str)], red: Option<&[&'static str]>) -> Case {
-        (
-            name.to_string(),
-            files
-                .iter()
-                .map(|(path, body)| ((*path).to_string(), (*body).to_string()))
-                .collect(),
-            red.map(<[&str]>::to_vec),
-        )
-    }
-
-    /// Every shape the derivation must judge: each red one a re-entry it
-    /// must reach (naming its obligation and cell), each green one a shape
-    /// that must not fabricate a finding.
-    #[test]
-    fn every_reentry_shape_is_judged() {
-        let mut cases: Vec<Case> = vec![
-            case(
-                "the v0.65 self-recursive fn-local OnceLock",
-                &[(
-                    "crates/aterm-gui/src/app_update_screen.rs",
-                    V065_SHIPPED_SHAPE,
-                )],
-                Some(&["[OB-19]", "`ARMED`", "debug_seamless_reexec_armed"]),
-            ),
-            case(
-                "the shipped repair of that site (it reads the environment)",
-                &[(
-                    "crates/aterm-gui/src/app_update_screen.rs",
-                    r#"
-pub(crate) fn debug_seamless_reexec_armed() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        let on = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
-        if on {
-            aterm_log::warn!("the QA seam is armed");
-        }
-        on
-    })
-}
-"#,
-                )],
-                None,
-            ),
-            case(
-                "OB-20: two accessors that initialise through each other",
-                &[(
-                    "crates/aterm-gui/src/pair.rs",
-                    r#"
-fn alpha() -> bool {
-    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *A.get_or_init(|| beta())
-}
-
-fn beta() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| alpha())
-}
-"#,
-                )],
-                Some(&["[OB-20]", "`A`", "`B`"]),
-            ),
-            case(
-                "a non-blocking get() peek at the own cell",
-                &[(
-                    "crates/aterm-gui/src/peek.rs",
-                    r#"
-fn armed() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        let previously = ARMED.get().copied().unwrap_or(false);
-        previously || std::env::var_os("KNOB").is_some()
-    })
-}
-"#,
-                )],
-                None,
-            ),
-            case(
-                "a deref LazyLock re-entered through a reader",
-                &[(
-                    "crates/aterm-gui/src/table.rs",
-                    r#"
-static TABLE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| build());
-
-fn build() -> Vec<u8> {
-    seed()
-}
-
-fn seed() -> Vec<u8> {
-    TABLE.clone()
-}
-"#,
-                )],
-                Some(&["`TABLE`"]),
-            ),
-            case(
-                "OB-21: an empty tree is not vacuously green",
-                &[],
-                Some(&["[OB-21]"]),
-            ),
-            case(
-                "a body-less extern declaration absorbs no fn body",
-                &[(
-                    "crates/aterm-gui/src/keymap.rs",
-                    r#"
-unsafe extern "C" {
-    fn IOServiceMatching(name: *const u8) -> *mut u8;
-    fn IOServiceOpen(
-        service: u32,
-        task: u32,
-    ) -> i32;
-}
-
-fn connection() -> Option<u32> {
-    static CONN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *CONN.get_or_init(|| unsafe { open_port(IOServiceMatching(b"x\0".as_ptr())) })
-}
-
-fn open_port(dict: *mut u8) -> Option<u32> {
-    let _ = dict;
-    None
-}
-"#,
-                )],
-                None,
-            ),
-            case(
-                "a qualified ctor reference (`Type::new`) is not followed",
-                &[
-                    (
-                        "crates/aterm-core/src/terminal/color_resolve.rs",
-                        r#"
-fn transfer_tables() -> &'static TransferTables {
-    static TABLES: std::sync::OnceLock<TransferTables> = std::sync::OnceLock::new();
-    TABLES.get_or_init(TransferTables::new)
-}
-"#,
-                    ),
-                    (
-                        "crates/aterm-core/src/other.rs",
-                        r#"
-fn new() -> u8 {
-    transfer_tables_reader()
-}
-
-fn transfer_tables_reader() -> u8 {
-    0
-}
-"#,
-                    ),
-                ],
-                None,
-            ),
-            case(
-                "an unqualified fn-reference initializer is followed",
-                &[(
-                    "crates/aterm-gui/src/terse.rs",
-                    r#"
-fn rules() -> &'static Rules {
-    static RULES: std::sync::OnceLock<Rules> = std::sync::OnceLock::new();
-    RULES.get_or_init(build_rules)
-}
-
-fn build_rules() -> Rules {
-    rules().clone()
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-            case(
-                "a cfg(test) self-recursion never ships",
-                &[(
-                    "crates/aterm-gui/src/gated.rs",
-                    r#"
 #[cfg(test)]
-fn probe() -> bool {
-    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| probe())
-}
-
-fn live() -> bool {
-    static L: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *L.get_or_init(|| std::env::var_os("K").is_some())
-}
-"#,
-                )],
-                None,
-            ),
-            case(
-                "a self-recursive Once::call_once",
-                &[(
-                    "crates/aterm-http/src/tls.rs",
-                    r#"
-fn init_crypto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        init_crypto();
-    });
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-            case(
-                "a OnceLock struct field re-entered from its initializer",
-                &[(
-                    "crates/demo/src/session.rs",
-                    r#"
-pub struct Session {
-    cache: std::sync::OnceLock<bool>,
-}
-
-impl Session {
-    pub fn armed(&self) -> bool {
-        *self.cache.get_or_init(|| self.armed())
-    }
-}
-"#,
-                )],
-                Some(&["[OB-19]", "FIELD"]),
-            ),
-            case(
-                "an ordinary OnceLock field",
-                &[(
-                    "crates/demo/src/session.rs",
-                    r#"
-pub struct Session {
-    cache: std::sync::OnceLock<bool>,
-    name: String,
-}
-
-impl Session {
-    pub fn armed(&self) -> bool {
-        *self.cache.get_or_init(|| self.name.is_empty())
-    }
-}
-"#,
-                )],
-                None,
-            ),
-            case(
-                "a receiver rustfmt wrapped onto its own line",
-                &[(
-                    "crates/aterm-gui/src/app_update_screen.rs",
-                    r#"
-pub fn debug_seamless_reexec_armed() -> bool {
-    static ARMED_SEAMLESS_REEXEC_FLAG: std::sync::OnceLock<bool> =
-        std::sync::OnceLock::new();
-    *ARMED_SEAMLESS_REEXEC_FLAG
-        .get_or_init(|| crate::app_update_screen::debug_seamless_reexec_armed())
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-            case(
-                "an array length in a signature keeps the fn in the graph",
-                &[(
-                    "crates/demo/src/lut.rs",
-                    r#"
-static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-
-pub fn table() -> &'static [f32; 256] {
-    TABLE.get_or_init(|| build())
-}
-
-fn build() -> [f32; 256] {
-    let t = table();
-    *t
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-            case(
-                "a wrapped LazyLock ctor after a `;` in the type",
-                &[(
-                    "crates/demo/src/lut.rs",
-                    r#"
-static SRGB_TO_LINEAR_LUT: std::sync::LazyLock<[f32; 256]> =
-    std::sync::LazyLock::new(|| build());
-
-fn build() -> [f32; 256] {
-    *SRGB_TO_LINEAR_LUT
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-            case(
-                "a turbofished get_or_init",
-                &[(
-                    "crates/demo/src/lib.rs",
-                    r#"
-static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub fn armed() -> bool {
-    *ARMED.get_or_init::<_>(|| armed())
-}
-"#,
-                )],
-                Some(&["[OB-19]"]),
-            ),
-        ];
-        for vis in ["pub ", "pub(crate) ", "pub(super) "] {
-            let body = format!(
-                "\n{vis}static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();\n\n\
-                 pub fn armed() -> bool {{\n    *ARMED.get_or_init(|| armed())\n}}\n"
-            );
-            cases.push((
-                format!("a `{vis}static` cell"),
-                vec![("crates/demo/src/lib.rs".to_string(), body)],
-                Some(vec!["[OB-19]"]),
-            ));
-        }
-        let mut multibyte = String::from("(");
-        multibyte.push_str(&"x".repeat(39_998));
-        multibyte.push('\u{00a0}');
-        multibyte.push(')');
-        assert!(!balanced(&multibyte, 0).is_empty());
-        for (name, sources, red) in &cases {
-            let out = run_synth_sources(sources);
-            match red {
-                None => assert!(out.ok, "{name}: must be GREEN:\n{}", out.log),
-                Some(tokens) => {
-                    assert!(!out.ok, "{name}: must be RED:\n{}", out.log);
-                    for token in tokens {
-                        assert!(
-                            out.log.contains(token),
-                            "{name}: no `{token}`:\n{}",
-                            out.log
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A borrowed `&OnceLock<T>` parameter is not a declaration; the owner
-    /// declares the cell.
-    #[test]
-    fn a_borrowed_cell_parameter_is_not_a_declaration() {
-        assert!(field_cell_name("    cache: std::sync::OnceLock<bool>,").is_some());
-        assert!(field_cell_name("    cell: &OnceLock<T>,").is_none());
-        assert!(field_cell_name("    let cache: OnceLock<bool> = OnceLock::new(),").is_none());
-        assert!(field_cell_name("    pub(crate) cache: OnceLock<bool>,").is_some());
-        assert!(field_cell_name("    pub cache: OnceLock<bool>,").is_some());
-        assert!(field_cell_name("    name: String,").is_none());
-    }
-
-    /// The name must end at the method: `get_or_init_with` is its own
-    /// vocabulary entry, not `get_or_init` with a suffix.
-    #[test]
-    fn a_longer_method_name_is_not_matched_as_a_shorter_one() {
-        let hay = "CELL.get_or_init_with(|| 1)";
-        assert!(find_method_call(hay, "get_or_init", 0).is_none());
-        assert!(find_method_call(hay, "get_or_init_with", 0).is_some());
-        assert!(find_method_call("C.call_once::<F>(f)", "call_once", 0).is_some());
-        assert!(find_method_call("C.get_or_init ( f )", "get_or_init", 0).is_some());
-        assert!(find_method_call("// see .get_or_init above", "get_or_init", 0).is_none());
-    }
-}
+#[path = "lazy_init_binding_tests.rs"]
+mod binding_tests;

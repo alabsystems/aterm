@@ -33,6 +33,8 @@ name = "aterm-lab-standin"
 path = "src/standin/main.rs"
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # The in-process control connection (`RelayClient`): the frame stream
 # (`subscribe`) and `await match` waits ride one authenticated socket instead of
 # a client process per read. And the shipped price table and its loader

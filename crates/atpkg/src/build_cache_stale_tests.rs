@@ -108,6 +108,11 @@ const OLD: &str = "1111111111111111";
 const NEW: &str = "2222222222222222";
 const FRESH: &str = "3333333333333333";
 
+/// The store [`world`] lays its compilers in, absolute on this platform: a sysroot is read only
+/// when it is absolute, and Windows reads a path with no drive as relative. Cases that spell
+/// `/store/trust/…` themselves stay Unix only.
+const STORE: &str = if cfg!(windows) { "C:/store" } else { "/store" };
+
 /// `.rustc_info.json` as cargo keeps it.
 fn rustc_info(sysroots: &[&str]) -> Vec<u8> {
     let mut outputs = String::from(
@@ -164,13 +169,13 @@ fn output_metadata(schema: u64, rustc: u64) -> aterm_json::Value {
 fn world(moved: SystemTime, old_age: Duration) -> Fake {
     let then = now() - old_age;
     let mut fs = Fake::default();
-    fs.dir("/store/trust/9192", now() - 60 * DAY)
-        .dir("/store/trust/15698", moved)
-        .link("/store/trust/current", moved, "15698")
+    fs.dir(&format!("{STORE}/trust/9192"), now() - 60 * DAY)
+        .dir(&format!("{STORE}/trust/15698"), moved)
+        .link(&format!("{STORE}/trust/current"), moved, "15698")
         .file(
             &format!("{LEAF}/.rustc_info.json"),
             moved,
-            &rustc_info(&["/store/trust/15698"]),
+            &rustc_info(&[&format!("{STORE}/trust/15698")]),
         )
         .file(
             &format!("{PROFILE}/.cargo-build-lock"),
@@ -227,7 +232,7 @@ fn surveyed(fs: &Fake) -> Survey {
         fs,
         Path::new(LEAF),
         &[PathBuf::from(PROFILE)],
-        Some(Path::new("/store")),
+        Some(Path::new(STORE)),
     )
 }
 
@@ -238,7 +243,11 @@ fn paths(doomed: &[Doomed]) -> Vec<(Part, Vec<String>)> {
             let mut p: Vec<String> = d
                 .paths
                 .iter()
-                .map(|p| p.strip_prefix(PROFILE).unwrap().display().to_string())
+                .map(|p| {
+                    let rel = p.strip_prefix(PROFILE).unwrap().components();
+                    let parts: Vec<_> = rel.map(|c| c.as_os_str().to_string_lossy()).collect();
+                    parts.join("/")
+                })
                 .collect();
             p.sort();
             (d.part, p)
@@ -350,10 +359,7 @@ fn observations_distinguish_release_records_and_do_not_count_omitted_layouts() {
     );
 }
 
-/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
-/// absolute, which a path with no drive is not on Windows.
 #[test]
-#[cfg(unix)]
 fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     let fs = world(now() - 2 * DAY, 4 * DAY);
     let s = surveyed(&fs);

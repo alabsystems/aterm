@@ -23,5 +23,5 @@
 ────────────────────────────────────────────────────────────
 ❯
 ────────────────────────────────────────────────────────────
-  week 63% used · resets Sat 10:00 Now using usage credits
+  week 37% left · resets Sat 10:00 Now using usage credits
   ⏸ manual mode on

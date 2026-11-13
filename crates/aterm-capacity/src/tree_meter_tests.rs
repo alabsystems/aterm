@@ -557,8 +557,10 @@ fn a_meter_reads_what_survives_its_root() {
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(out).lines() {
             let Ok(line) = line else { return };
-            let said = match line.strip_prefix("LEFT ") {
-                Some(pid) => pid.trim().parse::<u32>().ok(),
+            // The shell's line and libtest's `test <name> ... ` share one pipe: the shell's
+            // `LEFT <pid>` can land after that open prefix, on its line.
+            let said = match line.rsplit_once("LEFT ") {
+                Some((_, pid)) => pid.trim().parse::<u32>().ok(),
                 None => line.ends_with(TOUCHED).then_some(0),
             };
             if let Some(said) = said {

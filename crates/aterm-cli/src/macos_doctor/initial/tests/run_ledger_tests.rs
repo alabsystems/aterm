@@ -185,7 +185,8 @@ fn a_crash_resumes_once_and_a_second_parks_while_the_others_complete() {
     assert_eq!(after.person_access, records.person_access);
     assert!(finished_at(root.path()).unwrap());
 
-    // A scoped Caps pass cannot consume the new code on behalf of another parked stage.
+    // The login job's pass, which leaves the person stages to a window, cannot consume the new
+    // code on behalf of a parked person stage.
     let root = aterm_tempfile::tempdir().unwrap();
     let revision = authorize_at(root.path(), &Plan::default())
         .unwrap()
@@ -193,21 +194,19 @@ fn a_crash_resumes_once_and_a_second_parks_while_the_others_complete() {
     let mut host = Fake {
         software_epoch: Some(old),
         pending: Some(Stage::Workstation),
-        crash: Some(Stage::Spotlight),
+        crash: Some(Stage::Accounts),
         ..Fake::default()
     };
     for _ in 0..2 {
         launch(&mut host, root.path());
     }
-    assert_eq!(runs(&host.calls, Stage::Spotlight), 2);
-    assert_eq!(row(root.path(), Stage::Spotlight), parked);
-    assert_eq!(
-        input_setup_scope_at(root.path()).unwrap(),
-        InputSetupScope::Pending(revision)
+    assert_eq!(runs(&host.calls, Stage::Accounts), 2);
+    let accounts_parked = (
+        WAITING.to_owned(),
+        ledger::parked_words(Stage::Accounts, ledger::Park::Crashed),
     );
+    assert_eq!(row(root.path(), Stage::Accounts), accounts_parked);
     let before = ledger::load(root.path(), revision).ledger;
-    let mut caps = Selection::none();
-    caps.set(Setting::CapsLock, true);
     host.software_epoch = Some(newer);
     host.pending = None;
     host.crash = None;
@@ -220,35 +219,33 @@ fn a_crash_resumes_once_and_a_second_parks_while_the_others_complete() {
             revision,
             &mut None,
             SetupHooks::NONE,
-            PassTarget::Inputs(caps),
+            PassTarget::Background,
         )
         .unwrap()
         .unwrap();
     }
     assert_eq!(host.calls[start..], [Stage::Workstation]);
-    assert_eq!(host.only.last(), Some(&Some(caps)));
-    assert_eq!(
-        input_activation::revision_at(root.path()).unwrap(),
-        Some(revision)
-    );
     let after = ledger::load(root.path(), revision).ledger;
+    // The job's pass recovers the dead process's stage, as every launch does (its second crash
+    // parks it), and gives it no fresh budget from the new code.
     assert_eq!(
-        after.attempt(Stage::Spotlight),
-        before.attempt(Stage::Spotlight)
+        after.attempt(Stage::Accounts).began,
+        before.attempt(Stage::Accounts).began
     );
     assert_eq!(
-        after.record()["software"][Stage::Spotlight as usize],
-        before.record()["software"][Stage::Spotlight as usize],
-        "the scoped pass leaves the sibling's software attribution untouched"
+        after.parked(Stage::Accounts),
+        Some(ledger::Park::Crashed),
+        "{after:?}"
     );
     assert_eq!(
-        after.crashed & Stage::Spotlight.bit(),
-        before.crashed & Stage::Spotlight.bit()
+        after.record()["software"][Stage::Accounts as usize],
+        before.record()["software"][Stage::Accounts as usize],
+        "the job's pass leaves the person stage's software attribution untouched"
     );
-    assert_eq!(row(root.path(), Stage::Spotlight), parked);
+    assert_eq!(row(root.path(), Stage::Accounts), accounts_parked);
     let start = host.calls.len();
     launch(&mut host, root.path());
-    assert_eq!(runs(&host.calls[start..], Stage::Spotlight), 1);
+    assert_eq!(runs(&host.calls[start..], Stage::Accounts), 1);
     assert_eq!(progress(root.path()).unwrap().unwrap().revision, revision);
     assert!(finished_at(root.path()).unwrap());
 
@@ -300,6 +297,125 @@ fn a_crash_resumes_once_and_a_second_parks_while_the_others_complete() {
     );
     assert_eq!(row(root.path(), Stage::Spotlight), parked);
     assert_eq!(progress(root.path()).unwrap(), Some(saved));
+}
+
+/// A PARK IS A TIMED BACKOFF, NOT A HOLD: a stage aterm stopped in twice waits out its pause and
+/// then begins again with no press, as the ledger on disk says, so a relaunch or a reboot reads
+/// the same deadline.
+#[test]
+fn a_crash_parked_stage_begins_again_by_itself_once_its_wait_is_over() {
+    let root = Path::new(UNLATCHED);
+    let stamp = |at| ledger::Stamp {
+        at,
+        ..ledger::Stamp::default()
+    };
+    let mut ledger = ledger::Ledger::of(1);
+    for at in [100, 200] {
+        assert_eq!(
+            ledger.begin(Stage::Spotlight, 0, stamp(at), root),
+            ledger::Admit::Run
+        );
+        ledger.recover(0, None, None, at);
+    }
+    assert_eq!(ledger.parked(Stage::Spotlight), Some(ledger::Park::Crashed));
+    // What a relaunch reads: the same park, with the same deadline.
+    let due = ledger.park_due(Stage::Spotlight, 201);
+    let mut ledger = ledger::Ledger::parse(&ledger.record()).expect("the ledger reads back");
+    assert_eq!(ledger.park_due(Stage::Spotlight, 201), due);
+    assert_eq!(
+        ledger.begin(Stage::Spotlight, 0, stamp(201), root),
+        ledger::Admit::Parked(ledger::Park::Crashed),
+        "it waits its turn"
+    );
+    assert_eq!(
+        ledger.begin(Stage::Spotlight, 0, stamp(200 + 24 * 60 * 60), root),
+        ledger::Admit::Run,
+        "its wait is over: it begins with no press"
+    );
+    // Its one begin left: aterm stopping in it again parks it again, for twice as long.
+    let at = 200 + 24 * 60 * 60;
+    ledger.recover(0, None, None, at);
+    assert_eq!(ledger.parked(Stage::Spotlight), Some(ledger::Park::Crashed));
+    assert_eq!(
+        ledger.park_due(Stage::Spotlight, at),
+        Some(at + 2 * 60 * 60),
+        "the second park waits twice the first's hour"
+    );
+}
+
+/// A RESTART IS NO CRASH: a stage the Mac restarted (or logged out) under, whatever ended aterm
+/// then, resumes at the next launch in the new boot without counting that begin, however many
+/// restarts a long stage meets, and reads as resuming meanwhile; two ends within one boot still
+/// park it, and a boot that could not be read, then or now, tells no restart. NEGATIVE CONTROL:
+/// count a restart as a crash (`Defect::RestartCountsAsCrash`, as before the ledger read the
+/// boot) and the second restart parks the stage as crash-looping.
+#[test]
+fn a_stage_the_mac_restarted_under_resumes_without_a_strike() {
+    let root = Path::new(UNLATCHED);
+    let begin = |ledger: &mut ledger::Ledger, boot: Option<u128>, at: u64| {
+        let stamp = ledger::Stamp {
+            boot,
+            at,
+            ..ledger::Stamp::default()
+        };
+        assert_eq!(
+            ledger.begin(Stage::Repositories, 0, stamp, root),
+            ledger::Admit::Run
+        );
+    };
+    let live = |boot| ledger::Live {
+        boot: Some(boot),
+        now: 1_000,
+        ..ledger::Live::default()
+    };
+    // Three restarts during one long stage, each in a boot of its own.
+    let mut ledger = ledger::Ledger::of(1);
+    for boot in 1..=3_u128 {
+        begin(&mut ledger, Some(boot), 100 * u64::try_from(boot).unwrap());
+        assert_eq!(
+            ledger.verdict(Stage::Repositories, 0, None, live(boot + 1)),
+            ledger::Verdict::Resuming { running: false },
+            "boot {boot}: read after the restart, before the pass resumes it"
+        );
+        ledger.recover(0, None, Some(boot + 1), 1_000);
+        assert_eq!(ledger.parked(Stage::Repositories), None, "boot {boot}");
+        assert_eq!(ledger.attempt(Stage::Repositories).began, 0, "boot {boot}");
+    }
+    // Within one boot, aterm stopping twice still parks it.
+    begin(&mut ledger, Some(9), 500);
+    ledger.recover(0, None, Some(9), 500);
+    begin(&mut ledger, Some(9), 600);
+    ledger.recover(0, None, Some(9), 600);
+    assert_eq!(
+        ledger.parked(Stage::Repositories),
+        Some(ledger::Park::Crashed)
+    );
+    // A boot unread at the begin or at the recovery tells no restart.
+    for (began, now) in [(None, Some(2)), (Some(1), None)] {
+        let mut ledger = ledger::Ledger::of(1);
+        for at in [100, 200] {
+            begin(&mut ledger, began, at);
+            ledger.recover(0, None, now, at);
+        }
+        assert_eq!(
+            ledger.parked(Stage::Repositories),
+            Some(ledger::Park::Crashed),
+            "{began:?} then {now:?}"
+        );
+    }
+    // The defect: a restart counted as a crash parks it at the second.
+    let mut ledger = ledger::Ledger::of(1);
+    ledger::PLANTED.with(|planted| planted.set(Some(ledger::Defect::RestartCountsAsCrash)));
+    for boot in 1..=2_u128 {
+        begin(&mut ledger, Some(boot), 100);
+        ledger.recover(0, None, Some(boot + 1), 100);
+    }
+    ledger::PLANTED.with(|planted| planted.set(None));
+    assert_eq!(
+        ledger.parked(Stage::Repositories),
+        Some(ledger::Park::Crashed),
+        "the control fails as the defect would"
+    );
 }
 
 /// Control: a stage recorded running while the hold that began it has profile.lock, in this
@@ -570,8 +686,8 @@ fn a_stage_alive_across_a_sleep_resumes_after_a_clean_quit() {
         ledger.verdict(Stage::Repositories, 0, None, woke),
         ledger::Verdict::Running
     );
-    assert!(ledger.interrupt());
-    ledger.recover(0, None);
+    assert!(ledger.interrupt(ledger::hold_process(9)));
+    ledger.recover(0, None, None, woke.now);
     assert_eq!(
         ledger.begin(
             Stage::Repositories,
@@ -593,9 +709,9 @@ fn a_stage_alive_across_a_sleep_resumes_after_a_clean_quit() {
         let at = ledger
             .overdue(Stage::Repositories, late)
             .expect("an hour awake");
-        assert!(ledger.mark_hung(Stage::Repositories, at));
-        assert!(ledger.interrupt());
-        ledger.recover(0, None);
+        assert!(ledger.mark_hung(Stage::Repositories, at, t0));
+        assert!(ledger.interrupt(ledger::hold_process(9)));
+        ledger.recover(0, None, None, t0);
         awake += ledger::HANG_LIMIT + 60;
         let next = ledger.begin(
             Stage::Repositories,
@@ -613,10 +729,80 @@ fn a_stage_alive_across_a_sleep_resumes_after_a_clean_quit() {
             assert_eq!(
                 next,
                 ledger::Admit::Parked(ledger::Park::Hung),
-                "the second time it waits for Check again"
+                "the second time it parks, for its pause"
             );
         }
     }
+}
+
+/// A quit notes only the stages its own process began: a window that quits while the login job
+/// runs a stage leaves the job's stage as it is (should the job then be killed in it, that
+/// counts), and the job's own note, as a logout's SIGTERM ends it, gives its begin back, so two
+/// logouts in one long stage park nothing. Before, a quit noted every running stage, whichever
+/// process ran it, and the job noted none.
+#[test]
+fn a_quit_notes_only_the_stages_its_own_process_began() {
+    const WINDOW: u32 = 4_100;
+    const JOB: u32 = 4_200;
+    let held_by = |process: u32| (u128::from(process) << 96) | 7;
+    let stamp = |process: u32| ledger::Stamp {
+        boot: Some(7),
+        at: 1_800_000_000,
+        awake: Some(100),
+        run: Some(held_by(process)),
+        software: None,
+    };
+    let mut ledger = ledger::Ledger::of(1);
+    for (stage, process) in [(Stage::Spotlight, WINDOW), (Stage::Repositories, JOB)] {
+        assert_eq!(ledger::hold_process(held_by(process)), process);
+        assert_eq!(
+            ledger.begin(stage, 0, stamp(process), Path::new(UNLATCHED)),
+            ledger::Admit::Run
+        );
+    }
+    assert!(ledger.interrupt(WINDOW), "the window notes its own stage");
+    assert_eq!(ledger.quit, Stage::Spotlight.bit(), "and only its own");
+    assert!(ledger.interrupt(JOB));
+    assert!(ledger.refused(WINDOW), "the window's handoff is refused");
+    assert_eq!(
+        ledger.quit,
+        Stage::Repositories.bit(),
+        "it takes back its own note, never the job's"
+    );
+    for logout in 0..2 {
+        ledger.interrupt(JOB);
+        assert_ne!(
+            ledger.quit & Stage::Repositories.bit(),
+            0,
+            "logout {logout}: the job notes its stage"
+        );
+        ledger.recover(0, None, Some(7), 1_800_000_000);
+        assert_eq!(
+            ledger.begin(Stage::Repositories, 0, stamp(JOB), Path::new(UNLATCHED)),
+            ledger::Admit::Run,
+            "logout {logout}: a noted stage resumes with its begin given back"
+        );
+    }
+    assert_eq!(ledger.parked(Stage::Repositories), None, "{ledger:?}");
+
+    // An unnoted end of the job's stage (a SIGKILL after the window's quit) counts.
+    let mut ledger = ledger::Ledger::of(1);
+    for _ in 0..2 {
+        assert_eq!(
+            ledger.begin(Stage::Repositories, 0, stamp(JOB), Path::new(UNLATCHED)),
+            ledger::Admit::Run
+        );
+        assert!(
+            !ledger.interrupt(WINDOW),
+            "a window's quit leaves the job's stage"
+        );
+        ledger.recover(0, None, Some(7), 1_800_000_000);
+    }
+    assert_eq!(
+        ledger.parked(Stage::Repositories),
+        Some(ledger::Park::Crashed),
+        "{ledger:?}"
+    );
 }
 
 /// At each launch an update's handoff notes the stage it would cut off and is then refused (a
@@ -666,9 +852,9 @@ fn refused_handoffs_keep_the_two_crash_park() {
             ledger.begin(Stage::Spotlight, 0, stamp, Path::new(UNLATCHED)),
             ledger::Admit::Run
         );
-        assert!(ledger.interrupt());
-        assert!(ledger.refused());
-        ledger.recover(0, None);
+        assert!(ledger.interrupt(ledger::hold_process(0)));
+        assert!(ledger.refused(ledger::hold_process(0)));
+        ledger.recover(0, None, None, stamp.at);
     }
     assert_eq!(
         ledger.parked(Stage::Spotlight),
@@ -724,6 +910,136 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
     .unwrap();
     assert_eq!(
         std::fs::read(root.path().join(ledger::LEDGER)).unwrap(),
+        before
+    );
+
+    // Display history is optional context. Stage writes preserve even a future or malformed
+    // optional envelope without using it to decide whether a stage can run.
+    for history in [
+        json!({"format":1,"generation":1,"uid":501,"home":"/fixture", "vault_source":"", "rows":[{"subject":"capslock","standing":"in-place","value":"Control","read_at_ms":1234}]}),
+        json!({"format":999,"generation":77,"future":"left intact"}),
+        Value::from("not a display-history object"),
+    ] {
+        let mut record = ledger::Ledger::of(revision).record();
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("display_history".into(), history.clone());
+        write_json(&root.path().join(ledger::LEDGER), &record).unwrap();
+        let admitted = ledger::update(root.path(), revision, |ledger| {
+            ledger.begin(
+                Stage::Spotlight,
+                0,
+                ledger::Stamp::default(),
+                Path::new(UNLATCHED),
+            )
+        })
+        .unwrap();
+        assert_eq!(admitted, ledger::Admit::Run);
+        let saved: Value =
+            aterm_json::from_slice(&std::fs::read(root.path().join(ledger::LEDGER)).unwrap())
+                .unwrap();
+        assert_eq!(
+            aterm_json::to_vec(&saved["display_history"]).unwrap(),
+            aterm_json::to_vec(&history).unwrap(),
+            "a stage update must preserve optional historical context independently of its format"
+        );
+        assert_ne!(saved["running"].as_u64().unwrap(), 0);
+    }
+
+    let display_root = aterm_tempfile::tempdir().unwrap();
+    let store = SetupHistoryStore::at(display_root.path(), Path::new("/fixture"));
+    let mut authority = ledger::Ledger::of(revision).record();
+    authority
+        .as_object_mut()
+        .unwrap()
+        .insert("future_stage_field".into(), Value::from("kept"));
+    write_json(&display_root.path().join(ledger::LEDGER), &authority).unwrap();
+    let basis = store.begin().unwrap();
+    let read = LastRead::capture(
+        &aterm_types::macos_setup::Observation {
+            standing: aterm_types::macos_setup::Standing::AtLogin,
+            now: Some("Caps Lock".into()),
+            wanted: "Control".into(),
+            note: Some("private approval canary".into()),
+            detail: Some("private detail canary".into()),
+            ..aterm_types::macos_setup::Observation::unknown(Subject::Setting(Setting::CapsLock))
+        },
+        1234,
+    )
+    .unwrap();
+    let before = std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap();
+    assert!(!store.save(basis.generation, "", std::slice::from_ref(&read), || false));
+    assert_eq!(
+        std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap(),
+        before
+    );
+    assert!(store.save(basis.generation, "", std::slice::from_ref(&read), || true));
+    let saved = store.begin().unwrap();
+    assert_eq!(saved.rows, [read]);
+    assert_eq!(saved.rows[0].read_at_ms, 1234);
+    let past = saved.rows[0].observation();
+    assert_eq!(
+        past.wanted, "Control",
+        "AtLogin keeps the original displayed value"
+    );
+    assert!(past.note.is_none() && past.detail.is_none());
+    assert!(!store.save(basis.generation, "", &saved.rows, || panic!(
+        "a stale file generation is rejected before cache admission"
+    )));
+    let wrong_home =
+        SetupHistoryStore::at(display_root.path(), Path::new("/different-account-home"));
+    assert!(wrong_home.begin().is_none());
+    assert!(!wrong_home.save(saved.generation, "", &saved.rows, || true));
+    let bytes = std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap();
+    let saved_authority: Value = aterm_json::from_slice(&bytes).unwrap();
+    assert_eq!(saved_authority["revision"].as_u64(), Some(revision));
+    assert_eq!(saved_authority["future_stage_field"].as_str(), Some("kept"));
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains("private approval canary") && !text.contains("private detail canary"));
+
+    // Unrecognized display data stays optional even at its storage boundary: stage
+    // growth must remain readable, and a display-only save cannot exceed the whole cap.
+    let mut oversized = ledger::Ledger::of(revision).record();
+    oversized.as_object_mut().unwrap().insert(
+        "display_history".into(),
+        Value::from("x".repeat(64 * 1024 + 1)),
+    );
+    write_json(&display_root.path().join(ledger::LEDGER), &oversized).unwrap();
+    ledger::update(display_root.path(), revision, |ledger| {
+        ledger.begin(
+            Stage::Spotlight,
+            0,
+            ledger::Stamp::default(),
+            Path::new(UNLATCHED),
+        )
+    })
+    .unwrap();
+    let bounded: Value =
+        aterm_json::from_slice(&std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap())
+            .unwrap();
+    assert!(bounded.get("display_history").is_none());
+    assert_ne!(
+        ledger::load(display_root.path(), revision).ledger.running,
+        0
+    );
+
+    let mut near_cap = ledger::Ledger::of(revision).record();
+    near_cap
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_stage_metadata".into(), Value::from(""));
+    let size = aterm_json::to_vec(&near_cap).unwrap().len();
+    near_cap.as_object_mut().unwrap().insert(
+        "unknown_stage_metadata".into(),
+        Value::from("x".repeat(aterm_uds::atomic_file::MAX_CONFIG_BYTES as usize - size - 1)),
+    );
+    write_json(&display_root.path().join(ledger::LEDGER), &near_cap).unwrap();
+    let before = std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap();
+    let basis = store.begin().unwrap();
+    assert!(!store.save(basis.generation, "", &saved.rows, || true));
+    assert_eq!(
+        std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap(),
         before
     );
 }

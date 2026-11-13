@@ -14,7 +14,7 @@ use crate::{
     table::{
         Scope, Session,
         conflict::ProofKey,
-        store::{Fence, Receipt, Store, Via},
+        store::{Enrollment, Fence, Receipt, Store, Via},
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -132,7 +132,19 @@ pub struct InventorySummary {
     /// Local and peer sets use exactly the same encoding.
     pub fingerprint: Digest,
 }
+
+#[cfg(test)]
+thread_local! {
+    static INVENTORY_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl InventorySummary {
+    // The empty set's encoding has no scope or actor input. Keep only that protocol constant.
+    fn empty() -> Self {
+        static EMPTY: std::sync::OnceLock<InventorySummary> = std::sync::OnceLock::new();
+        *EMPTY.get_or_init(|| Self::of_sorted(0, &[]))
+    }
+
     /// Summarize an exact operation-ID set with the same canonical encoding as
     /// authenticated repair reports. Counts alone do not establish equality.
     pub fn of(ids: &BTreeSet<Digest>) -> Self {
@@ -140,6 +152,8 @@ impl InventorySummary {
     }
 
     pub(crate) fn of_sorted<'a>(count: usize, ids: impl IntoIterator<Item = &'a Digest>) -> Self {
+        #[cfg(test)]
+        INVENTORY_HASHES.set(INVENTORY_HASHES.get().saturating_add(1));
         let mut hash = Sha256::new();
         hash.update(b"aterm/commons/table-operation-inventory/1\0");
         hash.update((count as u64).to_le_bytes());
@@ -169,7 +183,10 @@ pub(crate) struct InventoryObservation {
 /// This establishes neither projection equality, decryptability, nor current/global currency.
 /// Its final read, under a fresh admission, stands on the store's unchanged enrollment claim where
 /// the store has not moved (`Round::fenced_observation`): it reads neither the table's journal nor
-/// its records again, so damage to them under an unchanged claim is the next open's to find.
+/// its records again, so damage to them under an unchanged claim is found by the next open that
+/// reads the journal: a writer's, or an observer's whose folder or files moved since a settled
+/// read of them, and in any case one within a fixed count of observer opens
+/// (`table::store::journals`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchingInventory {
     observed: InventoryObservation,
@@ -578,8 +595,9 @@ pub struct Replica {
     /// and that period: what a peer that sends no mark offered is matched against.
     offers: Arc<Mutex<Option<RingOffers>>>,
     /// The bootstrap the last open of this replica's vault gave, which each round takes while it
-    /// stands ([`Bootstrap::stands`], [`Self::bootstrap`]) and opens afresh, and keeps, only once
-    /// it falls: a quiet round's open re-derived from unchanged files the bootstrap the round
+    /// stands ([`Self::opening`]: [`Bootstrap::stands_in`] through the round's opening batch, else
+    /// [`Bootstrap::stands`] in [`Self::bootstrap`]) and opens afresh, and keeps, only once it
+    /// falls: a quiet round's open re-derived from unchanged files the bootstrap the round
     /// before it had (about a seventh of its CPU: over origin/main `7514a3dd04`, 14.6% of a
     /// sustained round's on-CPU samples over a long log and 16.3% over a short one, 2026-11-09).
     ///
@@ -599,6 +617,9 @@ pub struct Replica {
     /// The bootstraps [`Self::bootstrap`] opened afresh, where none it kept stood.
     #[cfg(test)]
     bootstrap_opens: std::sync::atomic::AtomicUsize,
+    /// The rounds [`Self::opening`]'s try took the kept bootstrap in.
+    #[cfg(test)]
+    kept_takes: std::sync::atomic::AtomicUsize,
     /// The clock that places the ring windows, in place of the system's.
     #[cfg(test)]
     pub(crate) ring_clock: Option<u64>,
@@ -644,6 +665,8 @@ impl Replica {
             #[cfg(test)]
             bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            kept_takes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             ring_clock: None,
             #[cfg(test)]
             echoes: false,
@@ -661,7 +684,7 @@ impl Replica {
     /// [`Self::commons`] sharing an absolute local-admission deadline. It still
     /// caches no grant: every application batch revalidates custody/membership,
     /// and its rounds take the bootstrap it opened only while it stands
-    /// ([`Self::bootstrap`]).
+    /// ([`Self::opening`]).
     pub fn commons_until(
         paths: Paths,
         config: PathBuf,
@@ -720,6 +743,8 @@ impl Replica {
             kept: Mutex::new(None),
             #[cfg(test)]
             bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            kept_takes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             ring_clock: None,
             #[cfg(test)]
@@ -816,22 +841,181 @@ impl Replica {
 
     /// One admitted local batch. `peer`, where given, is the channel's authenticated actor and
     /// must be a current member; a record the mesh delivered has no channel peer, and its own
-    /// writer grant, which every ingest checks, stands alone.
+    /// writer grant, which every ingest checks, stands alone. Through `group`, a round's group
+    /// look ([`GroupLook`]), a read batch is lent the look the group keeps, where it keeps one
+    /// ([`Self::follow`]), and is otherwise the group's first ([`Self::lead`]); a write lets the
+    /// group's look go first and admits as it would with no group, as does any admission inside
+    /// another's batch.
     fn observe<T>(
         &self,
         bootstrap: &Bootstrap,
         peer: impl Into<Option<Actor>>,
         expected: Option<[u8; 64]>,
         write: bool,
+        group: Option<&GroupLook<'_>>,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
         if bootstrap.trust() != self.trust {
             return Err(Error::new("table repair trust changed"));
         }
+        let peer = peer.into();
+        let group = group.filter(|group| group.depth.get() == 0);
+        if write && let Some(group) = group {
+            group.let_go();
+            return group.within(|| self.observe(bootstrap, peer, expected, write, None, run));
+        }
+        if let Some(group) = group
+            && let Some(look) = group.take()
+        {
+            return self.follow(bootstrap, look, peer, expected, group, run);
+        }
         // Acquire every source before session admission and keep it through
         // this local batch. No guard survives the return to network I/O.
-        let mut sources =
+        let sources =
             crate::generation::local_source_reads_until(bootstrap.paths(), admission_deadline())?;
+        match group {
+            Some(group) => self.lead(bootstrap, sources, peer, expected, group, run),
+            None => self.admit(bootstrap, sources, peer, expected, write, run),
+        }
+    }
+
+    /// [`Self::observe`]'s read batch as its round group's first ([`GroupLook`]), admitted on
+    /// `sources`, the vault sources read for it, as [`Self::admit`] admits a read, but with its
+    /// session lent the look of this vault's source read in place of keeping it, which the group
+    /// then keeps for the read admissions after it ([`GroupLook::keep`]), where the batch
+    /// succeeded. A read of more than this vault's source (a successor generation's), a writer
+    /// generation's candidate home (whose session observes its predecessors, which waits) or
+    /// another vault than the group's is admitted as with no group, and leaves the group with
+    /// nothing.
+    fn lead<T>(
+        &self,
+        bootstrap: &Bootstrap,
+        mut sources: Vec<aterm_secrets::client::CommonsSourceRead>,
+        peer: Option<Actor>,
+        expected: Option<[u8; 64]>,
+        group: &GroupLook<'_>,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        if sources.len() != 1
+            || crate::generation::is_candidate(bootstrap.paths())
+            || bootstrap.paths() != group.paths
+        {
+            return self.admit(bootstrap, sources, peer, expected, false, run);
+        }
+        #[cfg(test)]
+        count_grouped(Grouped::Own);
+        #[cfg(test)]
+        tests::session_boundary(0);
+        let look = sources.remove(0).into_look(group.paths);
+        let session = Session::observe_in(bootstrap, Some(&look))
+            .map_err(|error| error.context("table repair session admission"))?;
+        let result = self.lent(session, &look, peer, expected, group, run);
+        if result.is_ok() {
+            group.keep(bootstrap, look);
+        }
+        result
+    }
+
+    /// [`Self::observe`]'s read batch as a follower in its round group ([`GroupLook`]), admitted
+    /// through `look`, the look the group kept, taken out of it for this batch: its own control
+    /// journal read, then whether the look's observation still guards the state lock at the
+    /// vault's path ([`aterm_secrets::client::VaultLook::guards_source`]) and the look still
+    /// shows the control anchor as it first saw it ([`Bootstrap::anchor_stands_in`]), so what the
+    /// state lock guards and the anchor that read read stand as of after the read
+    /// ([`Session::observe_after_in`]); then its custody, access, generation guard, actor, peer
+    /// and expected observation through the look, as a group's first judges them. Where the look
+    /// no longer stands, it is dropped with that read, and the batch is admitted on a source read
+    /// of its own as the group's first ([`Self::lead`]). The group keeps the look again where the
+    /// batch succeeded.
+    fn follow<'p, T>(
+        &self,
+        bootstrap: &Bootstrap,
+        look: aterm_secrets::client::VaultLook<'p>,
+        peer: Option<Actor>,
+        expected: Option<[u8; 64]>,
+        group: &GroupLook<'p>,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(test)]
+        tests::session_boundary(0);
+        let session = Session::observe_after_in(bootstrap, &look, || {
+            look.guards_source() && bootstrap.anchor_stands_in(&look)
+        })
+        .map_err(|error| error.context("table repair session admission"))?;
+        let Some(session) = session else {
+            drop(look);
+            #[cfg(test)]
+            count_grouped(Grouped::Reopened);
+            let sources = crate::generation::local_source_reads_until(
+                bootstrap.paths(),
+                admission_deadline(),
+            )?;
+            return self.lead(bootstrap, sources, peer, expected, group, run);
+        };
+        #[cfg(test)]
+        count_grouped(Grouped::Lent);
+        let result = self.lent(session, &look, peer, expected, group, run);
+        if result.is_ok() {
+            group.keep(bootstrap, look);
+        }
+        result
+    }
+
+    /// A round group's read batch ([`GroupLook`]) on its admitted `session`: the checks every
+    /// admission makes at once after its session's open ([`Self::admitted`]) through `look`, the
+    /// look lent to the session for the batch ([`Session::lend_look`]), and `run` inside the
+    /// group, where an admission admits as with no group ([`GroupLook::within`]).
+    fn lent<'s, T>(
+        &self,
+        mut session: Session<'s>,
+        look: &'s aterm_secrets::client::VaultLook<'s>,
+        peer: Option<Actor>,
+        expected: Option<[u8; 64]>,
+        group: &GroupLook<'_>,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(test)]
+        tests::session_boundary(1);
+        self.admitted(&session, look, peer, expected)?;
+        session.lend_look(look)?;
+        group.within(|| run(&session))
+    }
+
+    /// The checks an admission makes through `look` at once after its session's open: the
+    /// session's actor is this replica's, `peer` where given a current member, and its
+    /// observation the `expected` one, where given.
+    fn admitted(
+        &self,
+        session: &Session<'_>,
+        look: &aterm_secrets::client::VaultLook<'_>,
+        peer: Option<Actor>,
+        expected: Option<[u8; 64]>,
+    ) -> Result<()> {
+        if session.actor() != self.actor {
+            return Err(Error::new("table repair local identity changed"));
+        }
+        if let Some(peer) = peer {
+            session.peer_in(peer, Some(look))?;
+        }
+        if expected
+            .is_some_and(|expected| session.observation_in(Some(look)).ok() != Some(expected))
+        {
+            return Err(Error::new("control history changed during table repair"));
+        }
+        Ok(())
+    }
+
+    /// [`Self::observe`]'s batch admitted on `sources`, the vault sources read for it, this
+    /// vault's first, outside a round group ([`GroupLook`]).
+    fn admit<T>(
+        &self,
+        bootstrap: &Bootstrap,
+        mut sources: Vec<aterm_secrets::client::CommonsSourceRead>,
+        peer: Option<Actor>,
+        expected: Option<[u8; 64]>,
+        write: bool,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
         #[cfg(test)]
         tests::session_boundary(0);
         // Both sessions revalidate the exact vault observation and immutable
@@ -843,9 +1027,11 @@ impl Replica {
         // state lock's files out from before the admission until the batch returns, and
         // its session keeps it: the batch's own checks (its currency, its stores'
         // contexts, its peers' roster) judge the moment its admission did, and its
-        // store opens and store read batches hold the vault through it. A write's
-        // look observes the lock beside the sources and ends before its batch runs,
-        // whose checks each observe the vault again.
+        // store opens and store read batches hold the vault through it. A read admitted
+        // through a round group (`Self::lead`, `Self::follow`) is lent its look instead:
+        // its group's first's source read's, which the group keeps after the batch. A
+        // write's look observes the lock beside the sources and ends before its batch
+        // runs, whose checks each observe the vault again.
         let look = if write || sources.is_empty() {
             aterm_secrets::client::VaultLook::new(bootstrap.paths())
         } else {
@@ -859,17 +1045,7 @@ impl Replica {
         .map_err(|error| error.context("table repair session admission"))?;
         #[cfg(test)]
         tests::session_boundary(1);
-        if session.actor() != self.actor {
-            return Err(Error::new("table repair local identity changed"));
-        }
-        if let Some(peer) = peer.into() {
-            session.peer_in(peer, Some(&look))?;
-        }
-        if expected
-            .is_some_and(|expected| session.observation_in(Some(&look)).ok() != Some(expected))
-        {
-            return Err(Error::new("control history changed during table repair"));
-        }
+        self.admitted(&session, &look, peer, expected)?;
         if write {
             drop(look);
         } else {
@@ -878,9 +1054,77 @@ impl Replica {
         run(&session)
     }
 
-    /// The bootstrap a round admits its batches through: the one this replica keeps while it
-    /// stands ([`Bootstrap::stands`]), else a fresh open of its vault, kept in its place. A round
-    /// keeps the one it took; another round's fresh open only replaces what this replica keeps.
+    /// The bootstrap a round admits its batches through, and what its opening batch observed of
+    /// the control history ([`Opened`]).
+    ///
+    /// Where this replica keeps a bootstrap of its trust, the opening batch is first tried on it
+    /// with no wait anywhere, and the kept bootstrap judged through that batch's admission: one try
+    /// at the vault's sources ([`crate::generation::try_local_source_reads`], which finds none
+    /// while a writer holds one), for a home that is no writer generation's candidate (a
+    /// candidate's session observes its predecessors' custody, which waits), admitted as every read
+    /// batch is ([`Self::admit`]), whose batch asks first whether the kept bootstrap stands, partly
+    /// through the look and the control view its admission took ([`Session::bootstrap_stands`], as
+    /// below). Where the try admits and the bootstrap stands, the round takes it with that batch's
+    /// observations. On any other outcome (no try, a source busy or absent, the admission refused,
+    /// the bootstrap fallen) the try's sources and session drop with it, and the round runs as it
+    /// did before the try: the bootstrap this replica keeps while it stands ([`Self::bootstrap`]),
+    /// else a fresh open of its vault, and its opening batch on that with the admission's waits
+    /// ([`Self::observe`]).
+    ///
+    /// The try judges the kept bootstrap's vault observation, its pinned files' digests and its
+    /// control journal as its admission's look and read saw them, and the rest (the vault's
+    /// folders, its custody locks and its creation claim) on its batch's first call, after the
+    /// admission and its peer check, where the round judged all of it before the admission: a
+    /// change landing between that earlier moment and the one that judges it now makes this round
+    /// open afresh and admit, as the round did for a change landing before its judgement, where
+    /// for one landing after it the round failed at its admission (or, for a change its admission
+    /// does not judge, went on with the bootstrap that had fallen) and the next one opened afresh.
+    ///
+    /// Through `group`, the round's group look ([`GroupLook`]), the opening batch is its group's
+    /// first, the try's ([`Self::lead`]) or the fallback's ([`Self::observe`]), and the group
+    /// keeps its look after it where [`GroupLook::keep`] keeps one (the batch went through
+    /// [`Self::lead`], not its fallback to [`Self::admit`], and succeeded, and its glance first saw
+    /// the control anchor settled): no call on the round's stream separates the opening from the
+    /// round's first admission, which is then lent that look.
+    fn opening(
+        &self,
+        peer: Option<Actor>,
+        group: Option<&GroupLook<'_>>,
+    ) -> Result<(Arc<Bootstrap>, Opened)> {
+        let opened =
+            |session: &Session<'_>| Ok((session.observation()?, session.legacy_observation()?));
+        let held = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let stands = |session: &Session<'_>| {
+            session.bootstrap_stands()?;
+            opened(session)
+        };
+        if let Some(held) = held
+            && held.trust() == self.trust
+            && !crate::generation::is_candidate(held.paths())
+            && let Ok(Some(sources)) = crate::generation::try_local_source_reads(held.paths())
+            && let Ok(observed) = match group {
+                Some(group) => self.lead(&held, sources, peer, None, group, stands),
+                None => self.admit(&held, sources, peer, None, false, stands),
+            }
+        {
+            #[cfg(test)]
+            self.kept_takes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok((held, observed));
+        }
+        let bootstrap = self.bootstrap()?;
+        let observed = self.observe(&bootstrap, peer, None, false, group, opened)?;
+        Ok((bootstrap, observed))
+    }
+
+    /// The bootstrap a round admits its batches through where its opening's try on the one this
+    /// replica keeps did not ([`Self::opening`]): the one this replica keeps while it stands
+    /// ([`Bootstrap::stands`]), else a fresh open of its vault, kept in its place. A round keeps
+    /// the one it took; another round's fresh open only replaces what this replica keeps.
     fn bootstrap(&self) -> Result<Arc<Bootstrap>> {
         let kept = || {
             self.kept
@@ -917,17 +1161,34 @@ impl Replica {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many rounds [`Self::opening`]'s try took the kept bootstrap in.
+    #[cfg(test)]
+    pub(crate) fn test_kept_takes(&self) -> usize {
+        self.kept_takes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A round outside any round group ([`Self::round_in`]): the mesh's rounds, which no stream
+    /// bounds, and a round a test builds directly. Each of its read batches keeps the look its own
+    /// source read stands on ([`Session::keep_look`]).
     fn round(&self, peer: impl Into<Option<Actor>>) -> Result<Round<'_>> {
+        self.round_in(peer, None)
+    }
+
+    /// A round whose admissions go through `group` where given, the group look of the stream the
+    /// round exchanges on ([`GroupLook`], [`Wire`]): its read admissions with no call on that
+    /// stream between them, its opening batch's first among them, share one look at the vault,
+    /// where the group keeps it ([`GroupLook::keep`]).
+    fn round_in<'a>(
+        &'a self,
+        peer: impl Into<Option<Actor>>,
+        group: Option<&'a GroupLook<'a>>,
+    ) -> Result<Round<'a>> {
         let policy = self
             .commons
             .as_ref()
             .map(|(_, config)| crate::catalog::policy::Policy::read(config))
             .transpose()?;
-        let bootstrap = self.bootstrap()?;
-        let (observation, legacy_observation) =
-            self.observe(&bootstrap, peer, None, false, |session| {
-                Ok((session.observation()?, session.legacy_observation()?))
-            })?;
+        let (bootstrap, (observation, legacy_observation)) = self.opening(peer.into(), group)?;
         Ok(Round {
             replica: self,
             started: Instant::now(),
@@ -940,6 +1201,7 @@ impl Replica {
             commons: self.commons.clone(),
             active_table: std::cell::Cell::new(None),
             inventory_read: std::cell::RefCell::new(None),
+            group,
         })
     }
 
@@ -1053,8 +1315,21 @@ impl Replica {
         repair.batch_deferral = None;
         repair.interrupted = None;
         repair.clock = None;
-        let round = self.round(peer)?;
-        round.exchange_with_policy(stream, peer, side, repair, policy)
+        // The round's read admissions with no call on `stream` between them share one look
+        // (`GroupLook`); every call on it lets that look go first (`Wire`), and the group drops
+        // here, before the control exchange's next network step.
+        let group = GroupLook::new(&self.paths);
+        let round = self.round_in(peer, Some(&group))?;
+        round.exchange_with_policy(
+            &mut Wire {
+                stream,
+                group: &group,
+            },
+            peer,
+            side,
+            repair,
+            policy,
+        )
     }
 }
 
@@ -1279,10 +1554,7 @@ impl Replica {
             return Ok(false);
         }
         let now = round.now;
-        if !round
-            .local(None, |session| directory.ring_window(session, now))?
-            .contains(&table)
-        {
+        if !round.local(None, |session| directory.ring_permits(session, table, now))? {
             return Ok(false);
         }
         let offered = BTreeSet::from([table]);
@@ -1385,20 +1657,142 @@ impl ProbeFailure {
     }
 }
 
+enum OfferedIds {
+    All,
+    Only(BTreeSet<Digest>),
+    Except(BTreeSet<Digest>),
+}
+
 struct Inventory {
     known: BTreeSet<Digest>,
-    offered: BTreeSet<Digest>,
+    offered: OfferedIds,
+    offered_count: usize,
     observation: InventoryObservation,
     /// The store's custody as this read found it, which the round's matching inventory stands
     /// on where it holds ([`Round::fenced_observation`]).
     fence: Option<Fence>,
 }
 
+impl Inventory {
+    fn new(
+        known: BTreeSet<Digest>,
+        excluded: BTreeSet<Digest>,
+        observation: InventoryObservation,
+        fence: Option<Fence>,
+    ) -> Self {
+        let (offered_count, offered) = if known.is_empty() || excluded.is_empty() {
+            (known.len(), OfferedIds::All)
+        } else if excluded.len() <= known.len() / 2 {
+            // At most E of N known IDs can be excluded. Here E <= N/2, so the mask
+            // is no larger than the offer; keep it and count only their intersection.
+            let count = known.len() - known.intersection(&excluded).count();
+            if count == known.len() {
+                (count, OfferedIds::All)
+            } else {
+                (count, OfferedIds::Except(excluded))
+            }
+        } else if known.is_disjoint(&excluded) {
+            (known.len(), OfferedIds::All)
+        } else {
+            // A dense mask can leave a sparse offer. Build that set once rather than
+            // counting its IDs and then visiting them again to materialize the same set.
+            let ids: BTreeSet<_> = known.difference(&excluded).copied().collect();
+            (ids.len(), OfferedIds::Only(ids))
+        };
+        Self {
+            known,
+            offered,
+            offered_count,
+            observation,
+            fence,
+        }
+    }
+
+    fn offered_summary(&self) -> InventorySummary {
+        match &self.offered {
+            OfferedIds::All => self.observation.inventory,
+            OfferedIds::Only(ids) if ids.is_empty() => InventorySummary::empty(),
+            OfferedIds::Only(ids) => InventorySummary::of(ids),
+            OfferedIds::Except(excluded) => {
+                InventorySummary::of_sorted(self.offered_count, self.known.difference(excluded))
+            }
+        }
+    }
+
+    /// Reuse this admitted sample's canonical fingerprint only for the exact same ID set.
+    /// This compares retained inventories, never the offered subset or authority to use them.
+    fn peer_summary(&self, peer: &BTreeSet<Digest>) -> InventorySummary {
+        if *peer == self.known {
+            self.observation.inventory
+        } else {
+            InventorySummary::of(peer)
+        }
+    }
+
+    fn offered_cycle(&self, after: Option<Digest>) -> impl Iterator<Item = &Digest> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        (self.offered_count != 0)
+            .then(|| {
+                let tail = self.offered_range(match after {
+                    Some(after) => (Excluded(after), Unbounded),
+                    None => (Unbounded, Unbounded),
+                });
+                let head = after
+                    .into_iter()
+                    .flat_map(move |after| self.offered_range((Unbounded, Included(after))));
+                tail.chain(head)
+            })
+            .into_iter()
+            .flatten()
+    }
+
+    fn offered_range(
+        &self,
+        bounds: (std::ops::Bound<Digest>, std::ops::Bound<Digest>),
+    ) -> impl Iterator<Item = &Digest> {
+        let (included, exclusions) = match &self.offered {
+            OfferedIds::All => (&self.known, None),
+            OfferedIds::Only(ids) => (ids, None),
+            OfferedIds::Except(excluded) => (&self.known, Some(excluded)),
+        };
+        let all = exclusions.is_none();
+        let mut excluded = exclusions
+            .map(|excluded| excluded.range(bounds))
+            .into_iter()
+            .flatten()
+            .peekable();
+        included.range(bounds).filter(move |id| {
+            if all {
+                return true;
+            }
+            // Both ranges are sorted. Advance each excluded ID at most once instead of searching the
+            // exclusion tree again for each retained ID.
+            loop {
+                match excluded.peek().map(|blocked| (*blocked).cmp(*id)) {
+                    Some(std::cmp::Ordering::Less) => {
+                        excluded.next();
+                    }
+                    Some(std::cmp::Ordering::Equal) => {
+                        excluded.next();
+                        return false;
+                    }
+                    Some(std::cmp::Ordering::Greater) | None => return true,
+                }
+            }
+        })
+    }
+}
+
+/// What a round's opening batch observed of the control history (`Replica::opening`): its
+/// session's observation and legacy observation, the round keeps as its own (`Round`'s
+/// `observation` and `legacy_observation`).
+type Opened = ([u8; 64], Option<[u8; 64]>);
+
 struct Round<'a> {
     replica: &'a Replica,
     /// When this side began the round, before its probe: a peer builds its mark after this.
     started: Instant,
-    /// What its batches are admitted through ([`Replica::bootstrap`]).
+    /// What its batches are admitted through ([`Replica::opening`]).
     bootstrap: Arc<Bootstrap>,
     observation: [u8; 64],
     legacy_observation: Option<[u8; 64]>,
@@ -1411,7 +1805,278 @@ struct Round<'a> {
     active_table: std::cell::Cell<Option<Digest>>,
     /// The table's operation inventory as the round read it, with that read's fence.
     inventory_read: std::cell::RefCell<Option<(InventoryObservation, Option<Fence>)>>,
+    /// The group look its admissions go through ([`GroupLook`]): a round on a stream's, `None`
+    /// for the mesh's and a round a test builds directly ([`Replica::round`]).
+    group: Option<&'a GroupLook<'a>>,
 }
+
+/// One look at a replica's vault ([`aterm_secrets::client::VaultLook`]) that a round's read
+/// admissions share while no call on the round's stream separates them: a round group. The
+/// group's first read admission takes its look from its own source read of the vault, as every
+/// read batch does, and is lent it ([`Session::lend_look`]); the group keeps it after that batch
+/// returns, where its glance first saw the control anchor settled
+/// ([`Bootstrap::anchor_settled_in`], no `lstat` taken), so an anchor that has not settled starts
+/// no follower ([`Replica::lead`]). Each read admission after it, a follower, is lent that look in
+/// place of a source read and a look of its own ([`Replica::follow`]), and makes the rest of its
+/// admission as any read: its own control journal read; then, through the look, whether its
+/// observation still guards the state lock at the vault's path
+/// ([`aterm_secrets::client::VaultLook::guards_source`]) and it still shows the control anchor as
+/// its glance first saw it ([`Bootstrap::anchor_stands_in`]), a fresh `lstat` of each, where
+/// either does not the look dropped and the batch admitted as a group's first; then its custody,
+/// access and generation guard, its actor, peer and expected observation, the round's policy and,
+/// where its gate asks, the table's subscription ([`Round::admit`]).
+///
+/// The group lets its look go at every call on the round's stream ([`Wire`]), before every write
+/// admission, at any read batch's error (a follower takes the look out of the group for its batch,
+/// and the group keeps it again only after a batch that succeeded), and at the round's end, where
+/// it drops (`Replica::exchange_with_policy`). An admission inside another's batch admits as with
+/// no group ([`Self::within`]). A loop of admissions whose length the peer or the table count sets
+/// ends a group at each of them: each witness read ([`Round::table_witnesses`], one admission for
+/// each table both sides list) lets the group's look go before its admission and after it, so no
+/// group spans a read of every listed table. Every other loop of a round admits once, or calls the
+/// stream at each turn, except `Round::local_gated`'s retries, which admit up to [`LOCAL_READS`]
+/// times with no stream call between them: each admission after its first follows one that
+/// failed, after which the group keeps no look, so each admits as a group's first. A group is so
+/// the in-process work between two calls on the stream, with no witness read inside it. The loops
+/// it can span between its admissions are in memory and make no admission and no I/O, each over
+/// at most [`MAX_TABLES`] table IDs (as the responder's `witness::split` of a peer's list, and its
+/// common tables) or [`BATCH`] items (as `Round::receive_batch`'s backfill hints and receipts for
+/// a received batch's records).
+///
+/// Against each read admission taking its own look, this changes:
+/// - BC-34a, a state-lock writer waits for the group. A taker of the vault's state lock that could
+///   take it between two read admissions no stream call separates finds it held shared until the
+///   group's next stream call, error or end. A blocking writer waits for the group plus any shared
+///   holds that overlap it. The takers that make one try and do not wait (`aterm-secrets`'
+///   `Admin::retire_commons_members` through `StateLock::try_take`, `network_refresh::retain` and
+///   `http204_observation::retain` through `StateLock::try_take_existing`,
+///   `waiting::forget_unsent` and the waiting view's `StateLock::try_take`) meet Busy more often
+///   only by the gaps between a group's admissions that they could have entered before. A blocking
+///   writer's outcome is a run of today's with the writer arriving after the group's last
+///   admission. A one-try taker's Busy is a run of today's with the taker trying during one of the
+///   group's admissions.
+/// - BC-34b, a change made without the state lock is seen at the next group, not the next
+///   admission. A change by no holder of the vault's state lock (neither the lock the group holds
+///   shared nor one at a lock file put in its place, which a follower sees) to a file the look
+///   stamps or judges (the vault's folder made a symlink, replaced, or given another mode or
+///   owner; the lock file given another mode, owner or link count; the memo inputs, the records or
+///   `state.toml` written by a process that ignores the lock; the identity, the device age
+///   identity and claim, under the Commons custody locks, the fold mark, the Commons claim and the
+///   default pin), landing after the group's first admission looked at it, is seen at the next
+///   group's first admission, or sooner at a fresh check within the group (a store read batch's
+///   opening fence and closing look). A follower's reuse of a kept digest is judged against the
+///   group's first `lstat` of the file, at most one group old. A refusal of such a change can move
+///   past the stream call that ends the group, and carries the stage context of the admission that
+///   makes it. A lock file replaced or removed, and the control anchor, are not among these: each
+///   follower looks at them afresh.
+/// - BC-34c, at a follower the generation link is checked after its control journal read and its
+///   custody, by its session's generation guard, where a group's first checks it in its source read
+///   before either: a different check can refuse first, and the link's refusal is the same failure,
+///   under the session admission's context ("table repair session admission").
+struct GroupLook<'p> {
+    /// The replica's vault: only a look at it is kept.
+    paths: &'p Paths,
+    look: std::cell::Cell<Option<aterm_secrets::client::VaultLook<'p>>>,
+    /// How many admissions through this group run inside one another's batch: one inside a batch
+    /// admits as with no group.
+    depth: std::cell::Cell<u32>,
+}
+
+impl<'p> GroupLook<'p> {
+    const fn new(paths: &'p Paths) -> Self {
+        Self {
+            paths,
+            look: std::cell::Cell::new(None),
+            depth: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Drop the look this group keeps, if any, and the shared hold of the vault's state lock it
+    /// stands on.
+    fn let_go(&self) {
+        drop(self.look.take());
+    }
+
+    /// The look this group keeps, taken out of it for a follower's batch.
+    fn take(&self) -> Option<aterm_secrets::client::VaultLook<'p>> {
+        self.look.take()
+    }
+
+    /// Keep `look`, a group admission's after its batch succeeded, for the next read admission,
+    /// where its glance first saw `bootstrap`'s control anchor settled
+    /// ([`Bootstrap::anchor_settled_in`]); otherwise drop it.
+    fn keep(&self, bootstrap: &Bootstrap, look: aterm_secrets::client::VaultLook<'p>) {
+        if bootstrap.anchor_settled_in(&look) {
+            self.look.set(Some(look));
+        }
+    }
+
+    /// `run`, where any admission through this group admits as with no group: a batch's own run.
+    fn within<T>(&self, run: impl FnOnce() -> T) -> T {
+        self.depth.set(self.depth.get() + 1);
+        let result = run();
+        self.depth.set(self.depth.get() - 1);
+        result
+    }
+}
+
+/// A round's stream: each call lets the round's group look go first ([`GroupLook::let_go`]), then
+/// makes the same call on the stream, so the stream sees the calls it would without the group and
+/// no shared hold of the vault crosses network I/O. A method this does not forward is the
+/// default, made of `read` or `write` calls, which let go too.
+struct Wire<'w, 'p, S> {
+    stream: &'w mut S,
+    group: &'w GroupLook<'p>,
+}
+
+impl<S: Read> Read for Wire<'_, '_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.read(buf)
+    }
+
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.read_vectored(bufs)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.group.let_go();
+        self.stream.read_exact(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.read_to_string(buf)
+    }
+}
+
+impl<S: Write> Write for Wire<'_, '_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.group.let_go();
+        self.stream.write_vectored(bufs)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.group.let_go();
+        self.stream.write_all(buf)
+    }
+
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        self.group.let_go();
+        self.stream.write_fmt(args)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.group.let_go();
+        self.stream.flush()
+    }
+}
+
+/// How a read admission through a round group was made ([`GroupLook`]), counted on its thread
+/// ([`GROUPED`]).
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum Grouped {
+    /// On its own source read and look, as its group's first: the opening batch, the first after a
+    /// stream call, error or write, and a follower's re-admission.
+    Own,
+    /// Lent its group's look, a follower.
+    Lent,
+    /// A follower whose look no longer stood after its journal read, re-admitted as a first.
+    Reopened,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The read admissions through a round group on this thread, by how each was made
+    /// ([`Grouped`]): own, lent, reopened.
+    static GROUPED: std::cell::Cell<(u32, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+fn count_grouped(how: Grouped) {
+    GROUPED.with(|grouped| {
+        let (own, lent, reopened) = grouped.get();
+        grouped.set(match how {
+            Grouped::Own => (own + 1, lent, reopened),
+            Grouped::Lent => (own, lent + 1, reopened),
+            Grouped::Reopened => (own, lent, reopened + 1),
+        });
+    });
+}
+
+/// What a round's admission ([`Round::admit`]) checks besides its session, peer and observation.
+/// Every admission checks the local policy: Commons enabled, the policy the round captured
+/// unchanged, the catalog not excluded. The active table's subscription
+/// ([`crate::catalog::Directory::permits`], which reads the catalog for an application table
+/// outside the ring windows) is checked where the table's data leaves or enters this Mac: at
+/// [`Gate::Subscription`] admissions, and at each batch's send boundary, which checks it inside
+/// the batch's [`Gate::Policy`] admission once the batch is prepared ([`Round::send_batch`]).
+/// Below, either is a subscription check. A quiet application round of a Commons catalog read
+/// the catalog for it 13 times on each side, at every admission and again at each send boundary,
+/// and reads it 5 times: at the conflict and operation inventories' authorizes, each batch's send
+/// boundary and the matching inventory's read (2026-11-11).
+///
+/// Against checking the subscription at every admission, this changes:
+/// - BC1, where a refusal lands. A withdrawal of the table (by a catalog conflict, a ring
+///   retirement or the storage listing), or an error reading those, that a `Policy` admission
+///   meets is refused at the next subscription check, with the same message, and no more of the
+///   table is sent before it. Its stage changes: "storage admission" becomes "storage enrollment"
+///   or "conflicts", "operation inventory" becomes "inventory exchange", the initiator's empty
+///   conflict batch's "conflicts" becomes "inventory exchange", and the responder's "operation
+///   receive" becomes "operation send". A send whose preparation fails while the table is
+///   withdrawn meets the withdrawal's refusal ([`Round::send_batch`]): withdrawn before the
+///   batch's admission, as when that admission checked the subscription, and, newly, withdrawn
+///   during the preparation, where that admission's check, made before preparing, let the
+///   preparation's own error through.
+/// - BC2, a withdrawal that lifts before the next subscription check no longer fails the round;
+///   every send still stands on its own check.
+/// - BC3, catalog read errors at `Policy` admissions. At the enrollment read and the empty batches'
+///   admissions, busy, damage or a catalog that keeps advancing failed the round and no longer
+///   does. At `retain_primary`'s read and the proof and operation inventory reads, a catalog that
+///   keeps advancing deferred the table and no longer does, and busy or damage failed the round
+///   and no longer does. Under sustained churn the round still fails, at the next subscription
+///   check, after [`LOCAL_READS`] reads (the matching inventory's read gives up its match
+///   instead, BC4); a burst that only those reads meet now repairs instead of deferring or failing.
+/// - BC4, the initiator's last receive of an empty batch. A withdrawal visible only there no
+///   longer fails the round, which reads as completed. After a quiet step the matching
+///   inventory's reads check the subscription and refuse it, so no match is published. A step
+///   that moved records reads no matching inventory (the inventories differ, and
+///   [`Round::matching_inventory`] returns `None` before any admission) and checks nothing more,
+///   since nothing of the table leaves this Mac after that receive.
+/// - BC5, a `Policy` admission reads a withdrawn table's store (its claim, inventories, batch
+///   wires) before the next subscription check refuses: a `Subscription` admission, or, for a
+///   batch's wires, the send boundary inside the batch's own admission. These are read sessions,
+///   which write nothing, each authenticated under its own session, their results dropped on the
+///   refusal. What those reads put in the report (`recovery`, a deferral's local error) can differ
+///   in an interrupted round's report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The local policy and the active table's subscription: every write admission, the last
+    /// admission before each inventory or receipt send, the matching inventory's read the runtime
+    /// publishes, the witness reads, every mesh entry and every admission before a table is
+    /// active. The default ([`Round::local`]). A batch's send is checked at its send boundary
+    /// instead, inside its `Policy` admission ([`Round::send_batch`]).
+    Subscription,
+    /// The local policy alone ([`Round::local_policy_only`]): a read whose result leaves this Mac
+    /// only after a check of the table's subscription, with nothing of the table sent or written
+    /// in between, or never. That check is a later `Subscription` admission of this round and
+    /// table, or a batch's send boundary ([`Round::send_batch`]): the batch's own, within the same
+    /// admission, or a later batch's.
+    Policy,
+}
+
 impl std::ops::Deref for Round<'_> {
     type Target = Replica;
     fn deref(&self) -> &Replica {
@@ -1430,13 +2095,13 @@ impl Round<'_> {
         self.exchange_with_policy(stream, peer, side, repair, ProbePolicy::Projection)
     }
 
-    /// Table `id`'s store, opened in `session`. In a read session (each [`Self::local`]'s), every
-    /// path ends in an open whose last step checks the store (`Store::check`: the session's
-    /// currency and the enrollment claim), so the reads that follow it in the same closure stand on
-    /// that check and take the store's unchecked accessors: a checked one would check the store
-    /// again for nothing, once more for each store a quiet table round opens (2026-11-09). A
-    /// control writer's `Store::open` seals its pending writes after that check, so this holds of
-    /// read sessions only.
+    /// Table `id`'s store, opened in `session`. In a read session (each [`Self::local`]'s or
+    /// [`Self::local_policy_only`]'s), every path ends in an open whose last step checks the store
+    /// (`Store::check`: the session's currency and the enrollment claim), so the reads that follow
+    /// it in the same closure stand on that check and take the store's unchecked accessors: a
+    /// checked one would check the store again for nothing, once more for each store a quiet table
+    /// round opens (2026-11-09). A control writer's `Store::open` seals its pending writes after
+    /// that check, so this holds of read sessions only.
     fn store(&self, session: &Session<'_>, id: Digest) -> Result<Store> {
         let (scope, path) = &self.tables[&id];
         if let Some((directory, _)) = &self.commons
@@ -1506,7 +2171,22 @@ impl Round<'_> {
         }
         let primary = directory.primary();
         let recovery = directory.recovery();
-        let needs = self.local(peer, |session| {
+        // Whether to retain is no table data: the write below and the conflict round's
+        // authorize check the subscription (`Gate`).
+        let needs = self.local_policy_only(peer, |session| {
+            // With no recovery store there is nothing to retain into, and its claim alone says so
+            // (`Store::enrollment_region`), so the primary is not opened here: a primary that
+            // would refuse busy (`FailureKind::Busy`; a snapshot that changed was already deferred
+            // by this check's caller, `Self::table_read`) beside no recovery store is not this
+            // check's refusal, which would fail the round, but the proof inventory read's that
+            // follows, which defers. Beside a recovery store, or a recovery claim that cannot be
+            // judged, the primary is read first.
+            if matches!(
+                recovery.enrollment(session, scope),
+                Ok(Enrollment::Absent | Enrollment::Pending)
+            ) {
+                return Ok(false);
+            }
             let source = match primary.observe_store_if_exists(session, scope) {
                 Ok(Some(source)) => source,
                 Err(error) if error.is_busy() => return Err(error),
@@ -1531,35 +2211,56 @@ impl Round<'_> {
         })
     }
 
-    /// One admitted read of this Mac's state. A store's observer refuses a witness that advances
-    /// while it reads ([`Error::snapshot_changed`]). Another of this Mac's rounds ingesting into
-    /// that table does just that, as does one ingesting into the catalog, which a Commons round's
-    /// admission reads once it has selected an application table outside the ring window
-    /// ([`Self::check_table_policy`]). A fresh admission and read is the answer, where giving up
-    /// would cost both peers this round. [`LOCAL_READS`] bounds the reads: no sleep separates
-    /// them, though each still waits for its own admission.
+    /// One admitted read of this Mac's state, which checks the active table's subscription
+    /// ([`Gate::Subscription`]): the catalog is read for it only at such admissions and at a
+    /// batch's send boundary ([`Self::send_batch`]). A store's observer refuses a witness that
+    /// advances while it reads ([`Error::snapshot_changed`]). Another of this Mac's rounds
+    /// ingesting into that table does just that, as does one ingesting into the catalog, which a
+    /// Commons round's subscription check reads once it has selected an application table outside
+    /// the ring window ([`Self::check_table_policy`]). A fresh admission and read is the answer,
+    /// where giving up would cost both peers this round. [`LOCAL_READS`] bounds the reads: no
+    /// sleep separates them, though each still waits for its own admission.
     fn local<T>(
         &self,
         peer: impl Into<Option<Actor>>,
+        run: impl FnMut(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.local_gated(peer, Gate::Subscription, run)
+    }
+
+    /// [`Self::local`], its admissions checking the local policy alone ([`Gate::Policy`]): a read
+    /// whose result leaves this Mac only after a check of the table's subscription, with nothing
+    /// of the table sent or written in between, or never.
+    fn local_policy_only<T>(
+        &self,
+        peer: impl Into<Option<Actor>>,
+        run: impl FnMut(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.local_gated(peer, Gate::Policy, run)
+    }
+
+    fn local_gated<T>(
+        &self,
+        peer: impl Into<Option<Actor>>,
+        gate: Gate,
         mut run: impl FnMut(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
         let peer = peer.into();
         for _ in 1..LOCAL_READS {
-            match self.admit(peer, false, &mut run) {
+            match self.admit(peer, false, gate, &mut run) {
                 Err(error) if error.is_snapshot_changed() => {}
                 result => return result,
             }
         }
-        self.admit(peer, false, run)
+        self.admit(peer, false, gate, run)
     }
 
-    /// A [`Self::local`] read's result where the round sends an inventory next: a table that kept
-    /// advancing through every read is deferred with `refusal`, as any other store this side
-    /// cannot read now, and the round goes on, because an inventory can say it is unavailable and
-    /// the peer defers on that too. That covers these reads' own admissions, whose read of a
-    /// catalog that keeps advancing refuses the same way. No other read defers like this. A batch
-    /// cannot say so ([`Self::send_batch`]), and a bare admission, such as the authorize that runs
-    /// next, refuses what it could not authorize, so each of those still costs both peers the round.
+    /// A read's result where the round sends an inventory next: a table that kept advancing
+    /// through every read is deferred with `refusal`, as any other store this side cannot read
+    /// now, and the round goes on, because an inventory can say it is unavailable and the peer
+    /// defers on that too. No other read defers like this. A batch cannot say so
+    /// ([`Self::send_batch`]), and a bare admission, such as the authorize that runs next, refuses
+    /// what it could not authorize, so each of those still costs both peers the round.
     fn table_read<T>(
         result: Result<Option<T>>,
         refusal: &mut Option<String>,
@@ -1575,12 +2276,14 @@ impl Round<'_> {
         }
     }
 
+    /// One admitted write of this Mac's state, which checks the active table's subscription: no
+    /// write is admitted on the local policy alone ([`Gate`]).
     fn local_write<T>(
         &self,
         peer: impl Into<Option<Actor>>,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.admit(peer, true, run)
+        self.admit(peer, true, Gate::Subscription, run)
     }
 
     #[cfg_attr(
@@ -1611,27 +2314,44 @@ impl Round<'_> {
         &self,
         peer: impl Into<Option<Actor>>,
         write: bool,
+        gate: Gate,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
         // A peer shares the view this round probed, so each admission holds it to that view.
         // With no peer (the mesh's calls) nobody shares it: a control change since the round
         // began is no refusal, and each record's own writer grant is checked at its ingest.
+        // Through the round's group look a read shares the look of the read admissions before it
+        // since the group last ended (a call on its stream, a write admission, a witness read, an
+        // error), where the group kept it (`GroupLook`).
         let peer = peer.into();
+        #[cfg(test)]
+        tests::table_admission(self.active_table.get());
         self.replica.observe(
             &self.bootstrap,
             peer,
             peer.map(|_| self.observation),
             write,
+            self.group,
             |session| {
-                // Custody and journal replay can take time. Read local policy
-                // after admitting the session, before admitting this batch.
-                self.check_table_policy(session)?;
+                // Custody and journal replay can take time. Read local policy, and where `gate`
+                // says the table's subscription, after admitting the session, before admitting
+                // this batch.
+                self.check_table_policy(session, gate)?;
                 run(session)
             },
         )
     }
 
-    fn check_table_policy(&self, session: &Session<'_>) -> Result<()> {
+    /// End the round's group ([`GroupLook::let_go`]): the next read admission takes its own look.
+    fn end_group(&self) {
+        if let Some(group) = self.group {
+            group.let_go();
+        }
+    }
+
+    /// Refuse a changed or disabled local policy, and, where `gate` is [`Gate::Subscription`], an
+    /// active table this Mac no longer subscribes.
+    fn check_table_policy(&self, session: &Session<'_>, gate: Gate) -> Result<()> {
         if let Some((directory, config)) = &self.commons {
             let policy = crate::catalog::policy::Policy::read(config)?;
             if !policy.enabled
@@ -1645,7 +2365,8 @@ impl Round<'_> {
                 ));
             }
         }
-        if let Some((directory, _)) = &self.commons
+        if gate == Gate::Subscription
+            && let Some((directory, _)) = &self.commons
             && let Some(id) = self.active_table.get()
             && !directory.permits(
                 session,
@@ -1718,56 +2439,70 @@ impl Round<'_> {
 
     /// Select this Mac's tables for the round: the Commons storage region (recovery when the
     /// primary catalog cannot be read), then its subscriptions, enrolling them under a write
-    /// admission when none is established yet.
+    /// admission when none is established yet. One read admission reads the primary catalog once
+    /// for both: whether it can be read places the round, and its projection under the round's
+    /// policy names the subscriptions. A retry of that admission (`Round::local`) decides the
+    /// region afresh.
     fn select_tables(&mut self, peer: Option<Actor>, report: &mut Report) -> Result<()> {
-        if let Some((directory, config)) = self.commons.as_ref() {
-            let recovery = self.local(peer, |session| {
-                match directory.observe_primary_with_config(session, config) {
-                    Ok(_) => Ok(false),
-                    Err(error) if error.is_busy() => Err(error),
-                    Err(_) => Ok(true),
+        let Some((directory, config)) = self.commons.clone() else {
+            return Ok(());
+        };
+        let policy = self.policy.clone().expect("Commons policy captured");
+        let recovery = std::cell::Cell::new(false);
+        let existing = self.local(peer, |session| {
+            recovery.set(false);
+            match directory.observe_primary_selecting(session, &config, &policy) {
+                Err(error) if error.is_busy() => Err(error),
+                Err(_) => {
+                    recovery.set(true);
+                    directory
+                        .recovery()
+                        .existing_subscriptions(session, &policy)
                 }
-            })?;
-            if recovery {
-                self.commons = Some((directory.recovery(), config.clone()));
-                report.recovery = true;
+                Ok(observed) => {
+                    let Some(mut tables) = directory.selected_subscriptions(observed, &policy)?
+                    else {
+                        return Ok(None);
+                    };
+                    // Ring tables join the catalog's; damaged ring state asks for the writer,
+                    // whose retirement rebuilds it. The catalog's tables are repaired whatever the
+                    // rings say: the offered tables' window reads a damaged state as none
+                    // (`ring_view`).
+                    if directory.is_recovery() {
+                        return Ok(Some(tables));
+                    }
+                    match directory.existing_ring_subscriptions(session, &policy, self.now) {
+                        Ok(Some(rings)) => {
+                            tables.extend(rings);
+                            Ok(Some(tables))
+                        }
+                        Ok(None) | Err(_) => Ok(None),
+                    }
+                }
             }
+        });
+        if recovery.get() {
+            self.commons = Some((directory.recovery(), config));
+            report.recovery = true;
         }
-        if let Some((directory, _)) = &self.commons {
-            let policy = self.policy.as_ref().expect("Commons policy captured");
-            let existing = self.local(peer, |session| {
-                let Some(mut tables) = directory.existing_subscriptions(session, policy)? else {
-                    return Ok(None);
-                };
-                // Ring tables join the catalog's; damaged ring state asks for the writer, whose
-                // retirement rebuilds it. The catalog's tables are repaired whatever the rings
-                // say: the offered tables' window reads a damaged state as none (`ring_view`).
-                if directory.is_recovery() {
-                    return Ok(Some(tables));
+        let existing = existing?;
+        let Some((directory, _)) = &self.commons else {
+            return Ok(());
+        };
+        self.tables = match existing {
+            Some(tables) => tables,
+            None => self.local_write(peer, |session| {
+                let mut tables = directory.subscriptions(session, &policy)?;
+                if !directory.is_recovery() {
+                    tables.extend(
+                        directory
+                            .ring_subscriptions(session, &policy, self.now)
+                            .unwrap_or_default(),
+                    );
                 }
-                match directory.existing_ring_subscriptions(session, policy, self.now) {
-                    Ok(Some(rings)) => {
-                        tables.extend(rings);
-                        Ok(Some(tables))
-                    }
-                    Ok(None) | Err(_) => Ok(None),
-                }
-            })?;
-            self.tables = match existing {
-                Some(tables) => tables,
-                None => self.local_write(peer, |session| {
-                    let mut tables = directory.subscriptions(session, policy)?;
-                    if !directory.is_recovery() {
-                        tables.extend(
-                            directory
-                                .ring_subscriptions(session, policy, self.now)
-                                .unwrap_or_default(),
-                        );
-                    }
-                    Ok(tables)
-                })?,
-            };
-        }
+                Ok(tables)
+            })?,
+        };
         Ok(())
     }
 
@@ -1980,12 +2715,8 @@ impl Round<'_> {
         {
             let policy = self.policy.as_ref().expect("Commons policy captured");
             let offered = self.local(peer, |session| {
-                let window = directory.ring_window(session, self.now)?;
-                Ok(remote
-                    .difference(&local)
-                    .filter(|id| window.contains(*id))
-                    .copied()
-                    .collect::<BTreeSet<_>>())
+                let lacked: BTreeSet<_> = remote.difference(&local).copied().collect();
+                directory.ring_tables_among(session, self.now, &lacked)
             })?;
             if !offered.is_empty() {
                 let _ = self.local_write(peer, |session| {
@@ -2192,6 +2923,8 @@ impl Round<'_> {
         Ok(())
     }
 
+    /// Table `id`'s operation inventory under an admission that checks its subscription
+    /// ([`Gate::Subscription`]); a store this side cannot read now is `None`, with `refusal`.
     fn inventory(
         &self,
         peer: Actor,
@@ -2199,7 +2932,19 @@ impl Round<'_> {
         refusal: &mut Option<String>,
         cause: &mut Option<aterm_types::network_state::RepairCause>,
     ) -> Result<Option<Inventory>> {
-        let read = self.local(peer, |session| {
+        self.inventory_gated(peer, id, Gate::Subscription, refusal, cause)
+    }
+
+    /// [`Self::inventory`] under `gate`'s admission.
+    fn inventory_gated(
+        &self,
+        peer: Actor,
+        id: Digest,
+        gate: Gate,
+        refusal: &mut Option<String>,
+        cause: &mut Option<aterm_types::network_state::RepairCause>,
+    ) -> Result<Option<Inventory>> {
+        let read = self.local_gated(peer, gate, |session| {
             let sampled_at = Instant::now();
             let observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
             let store = match self.store(session, id) {
@@ -2212,29 +2957,34 @@ impl Round<'_> {
                 }
             };
             let known = store.inventory_unchecked().copied().collect();
-            Ok(Some(Inventory {
-                observation: InventoryObservation {
-                    scope: store.scope(),
-                    local_actor: session.actor(),
-                    peer_actor: peer,
-                    control_observation: session.observation()?,
-                    inventory: InventorySummary::of(&known),
-                    observed_at_ms,
-                    sampled_at,
-                },
+            let observation = InventoryObservation {
+                scope: store.scope(),
+                local_actor: session.actor(),
+                peer_actor: peer,
+                control_observation: session.observation()?,
+                inventory: InventorySummary::of(&known),
+                observed_at_ms,
+                sampled_at,
+            };
+            Ok(Some(Inventory::new(
                 known,
-                offered: store.replication_inventory_unchecked().copied().collect(),
-                fence: store.fence(),
-            }))
+                store.quarantine_closure(),
+                observation,
+                store.fence(),
+            )))
         });
         Self::table_read(read, refusal, cause)
     }
 
-    /// The witnesses of `common` under `salt` (`witness`), in digest order: each table's operation
-    /// inventory as its table round reads it, under the admission and subscription check that
-    /// round's reads take. A table this side cannot read now, holds no storage for, lies past the
+    /// The witnesses of `common` under `salt` (`witness`), in digest order: operation IDs in each
+    /// table's independently witnessed receipts, under the round's admission and subscription
+    /// check, without authenticating envelopes or decrypting values. These only order repairs;
+    /// the selected table still takes every full inventory and data check. A table this side
+    /// cannot inspect now, holds no storage for, lies past the
     /// first `read` tables, or comes after [`WITNESS_BUDGET`] reads as [`witness::UNKNOWN`]: it is
-    /// repaired early, never skipped.
+    /// repaired early, never skipped. Each table's read ends the round's group before its
+    /// admission and after it ([`Self::end_group`]): the peer and the table count set how many
+    /// there are, so none shares a look with another admission ([`GroupLook`]).
     fn table_witnesses(
         &self,
         peer: Actor,
@@ -2251,32 +3001,39 @@ impl Round<'_> {
                     return witness::UNKNOWN;
                 }
                 let before = self.active_table.replace(Some(*id));
+                self.end_group();
                 let content = self.local(peer, |session| {
-                    let store = if let Some((directory, _)) = &self.commons {
+                    let ids = if let Some((directory, _)) = &self.commons {
                         let (scope, _) = &self.tables[id];
                         // Storage this side never enrolled stays so until its table round.
-                        let Some(store) = directory.observe_store_if_exists(session, *scope)?
-                        else {
+                        let Some(ids) = directory.repair_ids(session, *scope)? else {
                             return Ok(None);
                         };
                         if !directory.is_recovery()
                             && *scope != directory.catalog_scope()
-                            && let Some(recovery) = directory
-                                .recovery()
-                                .observe_store_if_exists(session, *scope)?
+                            && let Some(recovery) =
+                                directory.recovery().repair_ids(session, *scope)?
                         {
                             recovery
                         } else {
-                            store
+                            ids
                         }
                     } else {
-                        self.store(session, *id)?
+                        let (scope, path) = &self.tables[id];
+                        let Some(ids) = Store::repair_ids_region(
+                            session,
+                            path,
+                            *scope,
+                            crate::table::store::Region::Primary,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        ids
                     };
-                    let known = store.inventory_unchecked();
-                    Ok(Some(
-                        InventorySummary::of_sorted(known.len(), known).fingerprint,
-                    ))
+                    Ok(Some(InventorySummary::of(&ids).fingerprint))
                 });
+                self.end_group();
                 self.active_table.set(before);
                 witness::witness(salt, id, content.ok().flatten())
             })
@@ -2389,7 +3146,9 @@ impl Round<'_> {
             &mut local_cause,
         )?;
         report.recovery |= ready == Some(false);
-        let local = self.local(peer, |session| {
+        // Sent only after the authorize that `exchange_inventory` runs first, which checks the
+        // table's subscription (`Gate`).
+        let local = self.local_policy_only(peer, |session| {
             if ready != Some(true) {
                 return Ok(None);
             }
@@ -2472,18 +3231,21 @@ impl Round<'_> {
         };
         if self.commons.is_some() {
             let (scope, _) = &self.tables[&id];
+            // Whether to enroll is no table data: the enrollment below, or else the conflict
+            // round's authorize, checks the table's subscription (`Gate`).
             let absent = self
-                .local(peer, |session| {
+                .local_policy_only(peer, |session| {
                     // A damaged established store stays deferred. Only storage with no
                     // enrollment yet (an empty discovery reservation, or a first
-                    // enrollment cut short after its pending claim) needs `join`.
+                    // enrollment cut short after its pending claim) needs `join`, which its
+                    // claim alone says (`Store::enrollment_region`): this opens no store.
                     Ok(matches!(
                         self.commons
                             .as_ref()
                             .expect("Commons checked")
                             .0
-                            .observe_store_if_exists(session, *scope),
-                        Ok(None)
+                            .enrollment(session, *scope),
+                        Ok(Enrollment::Absent | Enrollment::Pending)
                     ))
                 })
                 .map_err(|error| at("storage admission", error))?;
@@ -2501,8 +3263,10 @@ impl Round<'_> {
         // Reopen after negative evidence is durably applied in both directions.
         let mut local_error = None;
         let mut local_cause = None;
+        // Sent only after the authorize that `exchange_inventory` runs first, which checks the
+        // table's subscription (`Gate`).
         let local = self
-            .inventory(peer, id, &mut local_error, &mut local_cause)
+            .inventory_gated(peer, id, Gate::Policy, &mut local_error, &mut local_cause)
             .map_err(|error| at("operation inventory", error))?;
         let remote = exchange_inventory(
             stream,
@@ -2530,19 +3294,20 @@ impl Round<'_> {
             report.retained_after = local.known.len();
         }
         report.local_known = Some(local.observation.inventory);
-        report.local_offered = Some(InventorySummary::of(&local.offered));
-        report.peer_known = Some(InventorySummary::of(&remote));
+        report.local_offered = Some(local.offered_summary());
+        report.peer_known = Some(local.peer_summary(&remote));
         self.backfill
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .observe(id, &local.known, &remote);
-        self.inventory_read
-            .replace(Some((local.observation, local.fence)));
-        let mut ids: Vec<_> = cycle(&local.offered, repair.records.get(&id).copied())
+        let mut ids: Vec<_> = local
+            .offered_cycle(repair.records.get(&id).copied())
             .filter(|v| !remote.contains(*v))
             .take(BATCH + 1)
             .copied()
             .collect();
+        self.inventory_read
+            .replace(Some((local.observation, local.fence)));
         // One more than a batch says the peer lacks more than this round sends.
         let whole = ids.len() <= BATCH;
         ids.truncate(BATCH);
@@ -2582,6 +3347,9 @@ impl Round<'_> {
     /// The peer's round would then read as leaving nothing to fetch
     /// ([`crate::runtime::RepairRound::drained_table`]), and as exchanged with nothing to bring
     /// to the wait before a first import (`empty_view_wait`).
+    /// The batch's admission checks the local policy; its send boundary, after preparing, checks
+    /// the policy and the table's subscription ([`Gate`]). A preparation that fails while the
+    /// table is withdrawn meets the withdrawal's refusal, not its own error.
     fn send_batch(
         &self,
         stream: &mut (impl Read + Write),
@@ -2592,11 +3360,22 @@ impl Round<'_> {
     ) -> Result<()> {
         // Prepare under the same current custody, membership and policy admission
         // that permits this send. Release its guards before any network I/O.
-        let batch = self.local(peer, |session| {
-            let batch = prepare(session)?;
-            // Config writers need no custody lock. Preserve the send boundary's
-            // policy check even when preparation takes time.
-            self.check_table_policy(session)?;
+        let batch = self.local_policy_only(peer, |session| {
+            let batch = match prepare(session) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    // A preparation that fails while the table is withdrawn (its storage
+                    // retired, say) meets the withdrawal's refusal first: a withdrawal before
+                    // this admission, as when the admission checked the subscription, and one
+                    // during the preparation, which that admission did not see.
+                    self.check_table_policy(session, Gate::Subscription)?;
+                    return Err(error);
+                }
+            };
+            // Config writers need no custody lock. The send boundary checks the policy and the
+            // table's subscription after preparing, however long preparation takes: the
+            // admission checked the policy alone (`Gate`).
+            self.check_table_policy(session, Gate::Subscription)?;
             Ok(batch)
         })?;
         stream.write_all(&(batch.len() as u32).to_le_bytes())?;
@@ -2655,7 +3434,10 @@ impl Round<'_> {
             wires.push((record, wire));
         }
         if wires.is_empty() {
-            self.local(peer, |_| Ok(()))?;
+            // Nothing to write, and the flush has nothing to send: every send before it flushed.
+            // What this side sends next stands on its own check of the table's subscription
+            // (`Gate`).
+            self.local_policy_only(peer, |_| Ok(()))?;
             stream.flush()?;
             return Ok(());
         }

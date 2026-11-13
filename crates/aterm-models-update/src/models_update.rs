@@ -936,6 +936,9 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_newer = superseded;
             }
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
+            // A structural latch's Release is outside this model: every Release, a passing failure's
+            // retry included, starts a new ladder (`App::look_at_activation_latch`), of LANDS_WITHIN
+            // at most.
             invariant TheLadderNeverRestarts: reached <= phase;
             invariant RefusalNeverRetriesAsActivity: refusals == 0;
             invariant NoEarlyRelease:
@@ -1879,7 +1882,6 @@ pub fn native_update_structural_latch_model() -> Model {
             var pending = 0;
             var day = 0;
             var owed = 1;
-            var spent = 0;
             var structural = 1;
             var eligible = 1;
             var newer = 0;
@@ -1891,6 +1893,7 @@ pub fn native_update_structural_latch_model() -> Model {
             var refused = 0;
             var backoff = 0;
             var booted_old = 0;
+            var transient = 0;
             action TrialHasRoom when (phase == 0) {
                 room = 1;
                 phase = 1;
@@ -1905,7 +1908,6 @@ pub fn native_update_structural_latch_model() -> Model {
                 structural = 0;
                 eligible = 1;
                 owed = 0;
-                spent = 0;
                 day = 0;
                 phase = 1;
                 pending = 1;
@@ -1917,12 +1919,12 @@ pub fn native_update_structural_latch_model() -> Model {
                 eligible = 0;
                 structural = 0;
                 owed = 0;
-                spent = 0;
                 day = 0;
                 looks = 0;
                 doubts = 0;
                 newer_spent = 0;
                 backoff = 0;
+                transient = 0;
                 pending = 1;
             }
             action TrialUnreadable when (phase == 1 && (unread == 0 || unread == 2) &&
@@ -1940,8 +1942,10 @@ pub fn native_update_structural_latch_model() -> Model {
                 unread = 0;
                 pending = 1;
             }
+            // Only a structural latch's owed re-sample has a day to pass; a physical latch's day
+            // passing is the mutant.
             action DayPasses when (phase == 1 && eligible == 1 && day == 0 && superseded == 0 &&
-                (structural == 1 || Buggy == 1)) {
+                ((structural == 1 && owed == 1) || (structural == 0 && Buggy == 1))) {
                 day = 1;
                 pending = 1;
             }
@@ -1998,35 +2002,15 @@ pub fn native_update_structural_latch_model() -> Model {
                 };
                 owed = if structural == 0 || eligible == 0 {
                     owed
-                } else if (Buggy == 0 && (newer == 0 || newer_spent == 1) && unread == 0 &&
-                        ((day == 1 && owed == 1) || room == 0)) ||
-                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
-                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
-                    (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
-                        unread == 0 && room == 0) ||
+                } else if (Buggy == 0 && (newer == 0 || newer_spent == 1) &&
+                        day == 1 && owed == 1 && unread == 0 && room == 1) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
                         day == 0 && unread == 0 && room == 0) ||
-                    (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && unread == 0 && room == 0) {
+                    (Buggy == 1 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
+                        unread == 0 && room == 0) {
                     0
                 } else {
                     owed
-                };
-                spent = if structural == 0 || eligible == 0 {
-                    spent
-                } else if (Buggy == 0 && (newer == 0 || newer_spent == 1) && owed == 1 &&
-                        unread == 0 && (day == 1 || room == 0)) ||
-                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
-                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
-                    (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
-                        owed == 1 && unread == 0 && room == 0) ||
-                    (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                        day == 0 && owed == 1 && unread == 0 && room == 0) ||
-                    (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && unread == 0 && room == 0) {
-                    1
-                } else {
-                    spent
                 };
                 newer_spent = if (eligible == 1 || Buggy == 1) && newer == 1 &&
                     newer_spent == 0 && backoff == 0 {
@@ -2038,8 +2022,6 @@ pub fn native_update_structural_latch_model() -> Model {
                     said
                 } else if (Buggy == 0 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
                         owed == 1 && unread == 0 && room == 0) ||
-                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
-                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
                         day == 0 && unread == 0 && room == 0) {
                     1
@@ -2049,8 +2031,12 @@ pub fn native_update_structural_latch_model() -> Model {
                 looks = if structural == 0 || eligible == 0 {
                     looks
                 } else if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
-                    unread == 1 && looks <= UnreadLooks - 1 {
+                    unread == 1 &&
+                    (looks <= UnreadLooks - 1 || (Buggy == 1 && looks == UnreadLooks)) {
                     looks + 1
+                } else if Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                    owed == 1 && unread == 2 && doubts == UnprovenLooks {
+                    0
                 } else if (unread == 1 &&
                     ((newer == 1 && newer_spent == 0) || day == 0 || owed == 0)) ||
                     unread == 2 {
@@ -2070,16 +2056,20 @@ pub fn native_update_structural_latch_model() -> Model {
                 } else {
                     0
                 };
-                day = if structural == 1 && eligible == 1 && Buggy == 0 &&
-                    (newer == 0 || newer_spent == 1) && day == 1 &&
-                    owed == 1 && unread == 2 && doubts == UnprovenLooks {
+                day = if structural == 1 && eligible == 1 &&
+                    ((Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                        owed == 1 && ((unread == 1 && looks == UnreadLooks) ||
+                            (unread == 2 && doubts == UnprovenLooks))) ||
+                    (Buggy == 0 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
+                        day == 1 && owed == 1 && unread == 0 && room == 0)) {
                     0
                 } else {
                     day
                 };
                 pending = if structural == 1 && eligible == 1 &&
                     (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
-                    ((unread == 1 && looks <= UnreadLooks - 1) ||
+                    ((unread == 1 && (looks <= UnreadLooks - 1 ||
+                            (Buggy == 1 && looks == UnreadLooks))) ||
                         (unread == 2 && (doubts <= UnprovenLooks - 1 ||
                             (Buggy == 1 && doubts == UnprovenLooks)))) {
                     1
@@ -2092,6 +2082,7 @@ pub fn native_update_structural_latch_model() -> Model {
                 superseded = 1;
                 latched = 0;
                 eligible = 0;
+                transient = 0;
             }
             action SupersedeRefused when (phase == 1 && superseding == 1) {
                 superseding = 0;
@@ -2109,8 +2100,29 @@ pub fn native_update_structural_latch_model() -> Model {
                 latched == 0 && superseded == 0) {
                 latched = 1;
                 eligible = 1;
-                owed = if Buggy == 1 { 1 } else { owed };
-                day = if Buggy == 1 { 0 } else { day };
+                owed = if Buggy == 1 { owed } else { 1 };
+                day = if Buggy == 1 { day } else { 0 };
+                said = 0;
+            }
+            action AttemptFailsTransiently when (phase == 1 && structural == 1 &&
+                latched == 0 && superseded == 0) {
+                latched = 1;
+                eligible = 1;
+                transient = 1;
+                day = 0;
+                said = 0;
+            }
+            action TransientRetryDue when (phase == 1 && transient == 1) {
+                transient = 0;
+                latched = if Buggy == 1 { 0 } else { latched };
+                owed = if Buggy == 1 { owed } else { 1 };
+                day = 1;
+                pending = if Buggy == 1 { pending } else { 1 };
+            }
+            action TrialRoomMoves when (phase == 1 && structural == 1 && eligible == 1 &&
+                latched == 1) {
+                room = if room == 1 { 0 } else { 1 };
+                pending = 1;
             }
             action ArmSameBuild when (phase == 1 && latched == 1) {
                 latched = if Buggy == 1 { 0 } else { latched };
@@ -2124,42 +2136,44 @@ pub fn native_update_structural_latch_model() -> Model {
                 };
             invariant NeverBootsTheOlderActivation: booted_old == 0;
             invariant ResampleAfterADay:
-                if structural == 1 && pending == 0 && latched == 1 && room == 1 && day == 1 &&
+                if structural == 1 && pending == 0 && latched == 1 && room == 1 &&
                     superseding == 0 && backoff == 0 {
-                    owed == 0
+                    day == 0
+                } else {
+                    day <= 1
+                };
+            invariant ALatchOwesAResample:
+                if structural == 1 && latched == 1 && transient == 0 {
+                    owed == 1
                 } else {
                     owed <= 1
+                };
+            invariant ATrialHoldMovesItsDay:
+                if structural == 1 && pending == 0 && latched == 1 && unread == 0 &&
+                    room == 0 && superseding == 0 {
+                    day == 0
+                } else {
+                    day <= 1
                 };
             invariant ATrialHoldIsSaid:
                 if structural == 1 && pending == 0 && phase == 1 && unread == 0 &&
                     room == 0 && superseding == 0 &&
-                    superseded == 0 && (day == 1 || newer == 1) {
+                    superseded == 0 && transient == 0 {
                     said == 1
                 } else {
                     said <= 1
                 };
-            invariant NoRetryPromisedPastTheTrial:
-                if structural == 1 && pending == 0 && phase == 1 && unread == 0 && room == 0 &&
-                    superseding == 0 && superseded == 0 {
-                    owed == 0
-                } else {
-                    owed <= 1
-                };
-            invariant NoRetryPromisedPastTheBound:
-                if structural == 1 && pending == 0 && latched == 1 && unread == 1 && day == 1 &&
-                    (newer == 0 || newer_spent == 1) && superseding == 0 {
-                    owed == 0
-                } else {
-                    owed <= 1
-                };
+            invariant UnreadLooksAreBounded: looks <= UnreadLooks;
             invariant UnprovenLooksAreBounded: doubts <= UnprovenLooks;
             invariant NeverSpendsTheRevertingLaunch:
                 if room == 0 { latched == 1 || superseded == 1 } else { latched <= 1 };
-            invariant ResampleAtMostOnce:
-                if spent == 1 { owed == 0 } else { owed <= 1 };
             invariant SameBuildStaysLatched: escaped == 0;
             invariant OnlyStructuralLatchesHaveResamples:
-                if structural == 0 { owed == 0 && spent == 0 && day == 0 } else { owed <= 1 };
+                if structural == 0 {
+                    owed == 0 && day == 0 && transient == 0
+                } else {
+                    owed <= 1
+                };
             invariant IneligibleLatchNeverStartsRetire:
                 if eligible == 0 { superseding == 0 } else { superseding <= 1 };
             invariant ReleasedOnlyByAnEvent:

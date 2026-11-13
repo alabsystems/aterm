@@ -69,6 +69,18 @@ fn git_host(c: ApprovalCtx) -> ApprovalCtx {
     }
 }
 
+/// [`git_host`] with the owner's home spelled as this host spells an absolute one, its default
+/// secrets below it: on Windows `/Users/_owner` names no drive, so no place below it (jq's
+/// `~/.jq`, python's user site) can be placed and every jq or python read is held.
+fn owner_host(c: ApprovalCtx) -> ApprovalCtx {
+    let home = PathBuf::from(at!("/Users/_owner"));
+    ApprovalCtx {
+        secrets: default_secrets(Some(&home)),
+        home: Some(home),
+        ..git_host(c)
+    }
+}
+
 fn none(ctx: ApprovalCtx) -> ApprovalCtx {
     ApprovalCtx {
         approve: Approve::None,
@@ -423,6 +435,9 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
     assert!(reason(&on_screen(&read, &with(&unread, ctx()))).contains("not read"));
 }
 
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
 #[test]
 fn under_zsh_only_a_plain_line_is_a_proven_read() {
     let zsh = zsh_startup("", "");
@@ -3169,7 +3184,6 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
     for name in [
         "n01-awk-read",
         "n03-compound-outside",
-        "n05-less",
         "n21-dev-null",
         "n26-pipeline",
         "n31-two-lines",
@@ -3214,6 +3228,12 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
         (
             "h5-hidden-sed-w",
             "not read-only (space reading): sed s///w",
+        ),
+        // `less README.md`: the environment's $LESSOPEN/$LESSCLOSE would run a command, which
+        // this check does not read, so the no-rule box goes to a person.
+        (
+            "n05-less",
+            "less reads what the environment names (space reading)",
         ),
     ] {
         let rows = note_box(name);
@@ -3813,6 +3833,9 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
     assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
 }
 
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
 #[test]
 fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
     for (cmd, braces) in [
@@ -3912,18 +3935,26 @@ fn a_long_option_flag_protects_its_files_and_exempts_its_pattern() {
 fn a_bash_read_of_a_secret_is_not_read_only() {
     for cmd in [
         "cat ~/.ssh/id_rsa",
-        "cat /Users/_owner/.aws/credentials",
+        at!("cat ", "/Users/_owner/.aws/credentials", ""),
         "cat .env",
         "grep -n token ~/.ssh/config",
-        "awk 'NR<3' /Users/_owner/.gnupg/secring.gpg",
+        at!("awk 'NR<3' ", "/Users/_owner/.gnupg/secring.gpg", ""),
         "cat < ~/.ssh/id_ed25519",
-        "head -c40 /Users/_owner/Library/Keychains/login.keychain-db",
+        at!(
+            "head -c40 ",
+            "/Users/_owner/Library/Keychains/login.keychain-db",
+            ""
+        ),
         "cat ./deploy.pem",
-        "diff --from-file=/Users/_owner/.ssh/id_rsa notes.txt",
+        at!(
+            "diff --from-file=",
+            "/Users/_owner/.ssh/id_rsa",
+            " notes.txt"
+        ),
         "cat <~/.ssh/id_rsa",
         "cat ~/.secrets/github-token",
         "cat ~/.config/gh/hosts.yml",
-        "echo \"$(</Users/_owner/.gnupg/secring.gpg)\"",
+        at!("echo \"$(<", "/Users/_owner/.gnupg/secring.gpg", ")\""),
         "wc -l $(< ~/.ssh/id_rsa)",
         "cat $HOME/.ssh/id_rsa",
         "cat \"$HOME/.config/gh/hosts.yml\"",
@@ -3931,27 +3962,39 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         "grep -e token ~/.ssh/config",
         "grep -etoken ~/.ssh/config",
         "grep -- -abc ~/.ssh/config",
-        "grep -r token . --include /Users/_owner/.ssh/id_rsa",
+        at!(
+            "grep -r token . --include ",
+            "/Users/_owner/.ssh/id_rsa",
+            ""
+        ),
         "grep -f ~/.ssh/id_rsa src/",
         "grep token ~/.ssh/config -e x",
         "rg -g '*.rs' token ~/.ssh",
         "jq --rawfile k ~/.ssh/id_rsa -n '$k'",
         "jq . ~/.docker/config.json",
-        "jq -n 'import \"/Users/_owner/.config/gh/hosts\" as $h; $h'",
-        "awk 'BEGIN { while ((getline l < \"/Users/_owner/.ssh/id_rsa\") > 0) print l }'",
+        at!(
+            "jq -n 'import \"",
+            "/Users/_owner/.config/gh/hosts",
+            "\" as $h; $h'"
+        ),
+        at!(
+            "awk 'BEGIN { while ((getline l < \"",
+            "/Users/_owner/.ssh/id_rsa",
+            "\") > 0) print l }'"
+        ),
         "cat $(find ~/.ssh -type f)",
         "cat $(ls ~/.ssh/id_*)",
         "find ~/.ssh -print0 | sort --files0-from=-",
         "find ~/.ssh -type f -exec cat {} +",
-        "wc --files0-from=/Users/_owner/.ssh/id_rsa",
+        at!("wc --files0-from=", "/Users/_owner/.ssh/id_rsa", ""),
         "cat .env.example",
         "cat ~/../_owner/.secrets/github-token",
-        "cat /Users/_owner/project/../.claude.json",
+        at!("cat ", "/Users/_owner/project/../.claude.json", ""),
         "cat ~/.ssh/../notes.txt",
-        "cat /Users/_owner/.aws/../notes.txt",
-        "cat /Users/_owner/.secrets/../notes.txt",
+        at!("cat ", "/Users/_owner/.aws/../notes.txt", ""),
+        at!("cat ", "/Users/_owner/.secrets/../notes.txt", ""),
     ] {
-        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &owner_host(ctx()));
         let r = reason(&d);
         assert!(
             r.contains("a read of a secret"),
@@ -4007,6 +4050,9 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
     );
 }
 
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
 #[test]
 fn a_non_secret_read_beside_it_stays_read_only() {
     for cmd in [
@@ -4057,8 +4103,9 @@ fn a_non_secret_read_beside_it_stays_read_only() {
 /// A read rule holds a line to the secrets as the shell resolves its paths, on the note-free
 /// folder box and the no-rule box alike, and the advisory word with them: a relative path after
 /// a `cd`, a glob by what it may expand to, a recursive reader by the trees it descends, and
-/// `~user` under its owner's home; a path built at run time, and a relative one after a `cd`
-/// this check cannot follow, are refused as unproven.
+/// `~user` under its owner's home; a path built at run time, a relative one after a `cd` this
+/// check cannot follow, and one below a bare `cd` target a CDPATH entry may place, are refused
+/// as unproven.
 #[test]
 fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
     let home_str = if cfg!(windows) {
@@ -4124,6 +4171,7 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         ("cat $(<files.txt)", "builds at run time"),
         ("cd \"$(dirname /etc/hosts)\" && cat hosts", "at run time"),
         ("cd - && cat .claude.json", "cannot follow"),
+        ("cd src && cat README.md", "a CDPATH"),
         ("cd -1 && cat .claude.json", "cannot follow"),
         ("cat ~-/.claude.json", "`~-`"),
         (
@@ -4168,7 +4216,7 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         "the word"
     );
     let flat = [
-        "cd src && cat README.md",
+        "cd ./src && cat README.md",
         "cd ~/proj && cat README.md",
         "cd /etc && cat hosts",
         "cat ~/notes/*.md",
@@ -4609,7 +4657,7 @@ fn unlisted_on_windows(d: &Decision) -> bool {
 #[test]
 fn a_git_pathspec_glob_reads_every_file_below_its_literal_directory() {
     let (home, proj) = owner_dirs();
-    let work_dir = ctx().cwd.to_string_lossy().into_owned();
+    let work_dir = git_host(ctx()).cwd.to_string_lossy().into_owned();
     let work = work_dir.as_str();
     escalates_in(
         &[
@@ -4840,7 +4888,7 @@ fn a_read_that_prints_the_environment_proves_no_box() {
         "awk '{print $1}' README.md",
     ] {
         for rows in boxes(line) {
-            let d = on_screen(&rows, &git_host(ctx()));
+            let d = on_screen(&rows, &owner_host(ctx()));
             assert!(approved(&d).is_some(), "{line}: {d:?}");
         }
         assert_eq!(
@@ -4943,13 +4991,15 @@ fn a_relative_read_starts_where_the_session_stands() {
 
 /// A `cd` or `pushd` target bash and zsh may look up in a `CDPATH` (zsh's `cdpath`, which the
 /// worker's environment or a `.zshenv` may set): a relative one that is not `.` or `..` and not
-/// led by `./` or `../`, is also read from a directory the check cannot place, with every relative
-/// move after it, so a read below it is refused when a trailing part of a home rule's path leads
-/// the target and the read together, or when that directory is the root and an alias of the root
-/// leads them (`cd Volumes`, which a `CDPATH` of `/` places in `/Volumes`). A git read after such
-/// a move is refused, as git's settings there cannot be read, and so is a tree a reader descends
-/// there, whose files no walk can list. A line whose commands may stand in more than 64
-/// directories reads no relative path.
+/// led by `./` or `../`, is read from a directory this check cannot place, with every relative
+/// move after it. A read below such a directory is refused: when a trailing part of a home rule's
+/// path leads the target and the read together, or that directory is the root and an alias of the
+/// root leads them (`cd Volumes`, a `CDPATH` of `/`); and, since the directory may itself lie
+/// inside a secret (a `CDPATH` entry inside one), every other relative read below it too, a tree
+/// a reader descends there included. A git read after such a move is refused, as git's settings
+/// there cannot be read. A line whose commands may stand in more than 64 directories reads no
+/// relative path. `cd ./sub` and `cd ../sub` are not `CDPATH`-searched and still read where they
+/// stand.
 #[test]
 fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
     let in_project = ApprovalCtx {
@@ -4957,6 +5007,8 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         ..git_host(ctx())
     };
     let floated = "from a directory this check cannot place";
+    // A `CDPATH` directory this check cannot see may itself lie inside a secret.
+    let inside = "may place inside a secret directory this check cannot see";
     let mut many = String::new();
     for k in 0..22 {
         many.push_str(&format!("cd d{k}; "));
@@ -4978,10 +5030,6 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         ),
         ("cd proc && cat self/cwd/x", "through /proc's cwd"),
         ("cd sub && git status", "CDPATH"),
-        (
-            "cd crates && grep -rn token .",
-            "whose files it cannot list",
-        ),
         ("cd sub; git log -1", "CDPATH"),
         ("cd .config && cat gh/hosts.yml", floated),
         ("cd src && cd .config && cat gh/hosts.yml", floated),
@@ -4994,22 +5042,46 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
             "more than 64 directories",
         ),
         (many.as_str(), "more than 64 directories"),
+        // The `CDPATH` directory may itself lie inside a secret: a read below it is refused even
+        // when no home rule's path lexically leads the read (`cd ./sub` would stay a read).
+        ("cd sub && cat README.md", inside),
+        ("cd sub && cat .claude.json", inside),
+        ("cd crates/aterm-agent && cat SPECS.md", inside),
+        ("cd crates && grep -rn token .", inside),
+        ("cd crates && grep -rn token", inside),
+        ("cd src && rg -n token", inside),
+        ("cd -P sub && head -3 notes.txt", inside),
+        (
+            "cd a; cd a; cd a; cd a; cd a; cd a; cd a; cd a; cat README.md",
+            inside,
+        ),
+        ("cd Volumes && cat 'Macintosh HD/notes.txt'", inside),
+        ("cd proc && cat self/status", inside),
     ] {
         let d = on_screen(&bash_box(&[cmd], Some("Read it")), &in_project);
         let r = reason(&d);
         assert!(r.contains(why), "{cmd}: expected {why:?}, got {r}");
     }
-    // NEGATIVE CONTROL
+    // A word read beside the move is still a read below it (on a box with no description, whose
+    // words the space reading would read below it too).
+    let r = reason(&on_screen(
+        &bash_box(&["cd src && cat src"], None),
+        &in_project,
+    ))
+    .to_string();
+    assert!(r.contains(inside), "{r}");
+    // NEGATIVE CONTROL: `./` and `../` moves are not `CDPATH`-searched, so a read below them
+    // stays where it stands; a `cd` target is the directory it moves to, not a read below one,
+    // and a line that reads no file below it stays a read.
     for cmd in [
+        "cd src && ls -la",
+        "cd src; ls *.rs",
         "cd ./gh && cat hosts.yml",
-        "cd sub && cat README.md",
-        "cd sub && cat .claude.json",
-        "cd crates/aterm-agent && cat SPECS.md",
+        "cd ./sub && cat README.md",
+        "cd ./sub && cat .claude.json",
         "cd .. && cat notes.txt",
         "cd -P .. && cat notes.txt",
-        "cd a; cd a; cd a; cd a; cd a; cd a; cd a; cd a; cat README.md",
-        "cd Volumes && cat 'Macintosh HD/notes.txt'",
-        "cd proc && cat self/status",
+        "cd ../x && cat notes.txt",
     ]
     .into_iter()
     // A git read after a move no `CDPATH` takes, where this check runs the worker's git (on
@@ -5038,6 +5110,231 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         approved(&d) == Some(RULE_READ_ONLY) || unlisted_on_windows(&d),
         "{d:?}"
     );
+}
+
+/// A reader whose input no word names and no recorded probe reads (less's and more's
+/// `$LESSOPEN`/`$LESSCLOSE` and lesskey file, file's magic file, shasum's perl, macOS strings'
+/// xcrun) may run a command or read another file (each MEASURED 2026-11-05 on macOS 27.0.1), so
+/// a box that runs one goes to a person however the line runs it: directly, behind a prefix, in a
+/// pipeline or a substitution, or as a `find -exec` command (behind `env` or `xargs` the read-only
+/// proof refuses the line already). The readers that read the file and nothing else stay reads.
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
+#[test]
+fn a_reader_whose_input_the_environment_names_is_not_read_only() {
+    let at = |p: &str| ApprovalCtx {
+        cwd: PathBuf::from(p),
+        ..git_host(ctx())
+    };
+    let proj = at("/Users/_owner/proj");
+    for (cmd, reader) in [
+        ("less /etc/hosts", "less"),
+        ("more /etc/hosts", "more"),
+        ("less README.md", "less"),
+        ("git log | less", "less"),
+        ("time less README.md", "less"),
+        ("cat x | more", "more"),
+        ("cat x | /usr/bin/less -R", "less"),
+        ("file README.md", "file"),
+        ("file -b --mime-type README.md", "file"),
+        ("find . -name '*.rs' -exec file {} +", "file"),
+        ("find . -type f -execdir /usr/bin/file -b {} \\;", "file"),
+        ("time file README.md", "file"),
+        ("shasum -a 256 README.md", "shasum"),
+        ("echo $(shasum README.md)", "shasum"),
+        ("strings /bin/ls | head", "strings"),
+        ("strings -a /bin/ls", "strings"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &proj);
+        let r = reason(&d);
+        assert!(
+            r.contains(&format!("{reader} reads what the environment names")),
+            "{cmd}: {r}"
+        );
+    }
+    // NEGATIVE CONTROL: readers that read the file and run nothing, and these names as a data
+    // word rather than the command, stay reads.
+    for cmd in [
+        "cat /etc/hosts",
+        "head -5 README.md",
+        "sha256sum README.md",
+        "md5 README.md",
+        "grep less README.md",
+        "cat less.txt file.txt",
+        "rg more src",
+        "find . -name file -print",
+        "find . -type f -exec cat {} +",
+        "echo strings shasum",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &proj);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    // The advisory word refuses them too (stricter is safe).
+    for cmd in ["less README.md", "file README.md", "shasum README.md"] {
+        assert!(
+            readings_read_only_at(&[cmd.to_string()], &[], Some(Path::new("/Users/_owner")))
+                .unwrap_err()
+                .contains("reads what the environment names"),
+            "{cmd}"
+        );
+    }
+}
+
+/// A shell startup that may set a `shell_startup::READER_ENV` variable (the worker's
+/// environment, Claude Code's settings or a `.zshenv`, `shell_startup::read`) fails a line that
+/// may run a reader it redirects, by name or by path, in a pipeline or as a `find -exec` command
+/// (`GREP_OPTIONS='-e x f'` makes BSD grep read `f`, MEASURED 2026-11-05 on macOS 27.0.1); a
+/// line that runs another reader, or names it only inside a longer word, is still approved.
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
+#[test]
+fn a_reader_the_startup_may_redirect_is_not_approved() {
+    let set = |vars: &[&str]| ApprovalCtx {
+        cwd: PathBuf::from("/Users/_owner/proj"),
+        shell: Ok(ShellStartup::of_parts(
+            vars.iter()
+                .map(|v| {
+                    (
+                        format!("${v}"),
+                        "the worker's environment sets".to_string(),
+                        false,
+                    )
+                })
+                .collect(),
+            true,
+            false,
+            false,
+        )),
+        ..git_host(ctx())
+    };
+    let grep = set(&["GREP_OPTIONS"]);
+    for cmd in [
+        "grep -n foo README.md",
+        "egrep 'a|b' README.md",
+        "/usr/bin/grep foo README.md",
+        "find . -name '*.md' -exec grep -l foo {} +",
+        "cat list.txt | fgrep foo",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &grep);
+        assert!(reason(&d).contains("reads `$GREP_OPTIONS`"), "{cmd}: {d:?}");
+    }
+    let rg = set(&["RIPGREP_CONFIG_PATH"]);
+    let d = on_screen(&bash_box(&["rg -n foo src"], Some("Read it")), &rg);
+    assert!(reason(&d).contains("reads `$RIPGREP_CONFIG_PATH`"), "{d:?}");
+    // macOS's /usr/bin/python3 is an xcrun shim (MEASURED 2026-11-05: `DEVELOPER_DIR=<dir>` ran
+    // `<dir>/usr/bin/xcrun`): an allowlisted script is no read under a developer directory.
+    let allowed = |c: ApprovalCtx| ApprovalCtx {
+        python_allow: vec!["tools/*.py".to_string()],
+        ..c
+    };
+    let script = bash_box(&["python3 tools/r.py"], None);
+    for var in ["DEVELOPER_DIR", "SDKROOT"] {
+        let d = on_screen(&script, &allowed(set(&[var])));
+        assert!(
+            reason(&d).contains(&format!("reads `${var}`")),
+            "{var}: {d:?}"
+        );
+    }
+    assert_eq!(
+        approved(&on_screen(&script, &allowed(set(&[])))),
+        Some(RULE_READ_ONLY)
+    );
+    // NEGATIVE CONTROL: another reader, or the name inside a longer word, is approved.
+    for (ctx, cmd) in [
+        (&grep, "rg -n foo src"),
+        (&grep, "cat grep.txt"),
+        (&grep, "head -3 notes-grep.md"),
+        (&rg, "grep -n foo README.md"),
+        (&set(&[]), "grep -n foo README.md"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), ctx);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+}
+
+/// jq sources `~/.jq` and python runs its user site's `usercustomize` (MEASURED 2026-11-05: a
+/// `~/.jq` of `def keys: env;` made jq-1.7.1-apple's `jq -c keys x.json` print the environment,
+/// and python 3.9.6 ran a `usercustomize.py` planted in `~/Library/Python/3.9/...`), so a jq or
+/// python line is not approved where the worker may write that place without approval: a cwd or
+/// a Bash tool's stand at the home or above it, or one below the place, under the worker's `HOME`
+/// when it names one; nor under a relative `HOME`. A line run where the worker writes neither is
+/// read as before, as is another reader at the home.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_loads_a_place_below_a_home_the_worker_writes_is_not_approved() {
+    let at = |cwd: &str, stands: &[&str], home: Option<&str>| ApprovalCtx {
+        cwd: PathBuf::from(cwd),
+        shell_cwds: stands.iter().map(PathBuf::from).collect(),
+        worker: Ok(home.map_or_else(
+            || WorkerEnv::hermetic(None),
+            |h| WorkerEnv::hermetic(None).with(&format!("HOME={h}")),
+        )),
+        python_allow: vec!["tools/*.py".to_string()],
+        ..ctx()
+    };
+    let (jq, py) = ("jq -c keys x.json", "python3 tools/r.py");
+    for (c, cmd, place) in [
+        (at("/Users/_owner", &[], None), jq, "/Users/_owner/.jq"),
+        (at("/Users", &[], None), jq, "/Users/_owner/.jq"),
+        (
+            at("/Users/_owner/proj", &["/Users/_owner"], None),
+            jq,
+            "/Users/_owner/.jq",
+        ),
+        (
+            at("/Users/_owner", &[], None),
+            py,
+            "/Users/_owner/Library/Python",
+        ),
+        (
+            at("/Users/_owner/.local/lib", &[], None),
+            py,
+            "/Users/_owner/.local",
+        ),
+        (
+            at("/Users/_owner/proj", &[], Some("/Users/_owner/proj/h")),
+            jq,
+            "/Users/_owner/proj/h/.jq",
+        ),
+        (
+            at("/Users/_owner/proj", &[], Some("h")),
+            py,
+            "a home this check cannot place",
+        ),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], None), &c);
+        let r = reason(&d);
+        assert!(
+            r.contains(&format!("the worker may write {place}")),
+            "{cmd} at {}: {r}",
+            c.cwd.display()
+        );
+    }
+    for cmd in [
+        "cat x.json | /usr/bin/jq -c keys",
+        "time python3 tools/r.py",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], None), &at("/Users/_owner", &[], None));
+        assert!(reason(&d).contains("without approval"), "{cmd}: {d:?}");
+    }
+    // NEGATIVE CONTROL: neither place the worker writes, the worker's HOME away from where it
+    // stands, or another reader at the home.
+    for (c, cmd) in [
+        (at("/Users/_owner/proj", &[], None), jq),
+        (at("/Users/_owner/proj", &["/Users/_owner/other"], None), py),
+        (at("/Users/_owner", &[], Some("/Users/_elsewhere")), jq),
+        (at("/Users/_owner", &[], None), "head -3 notes.txt"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], None), &c);
+        assert_eq!(
+            approved(&d),
+            Some(RULE_READ_ONLY),
+            "{cmd} at {}: {d:?}",
+            c.cwd.display()
+        );
+    }
 }
 
 /// The loop reads where the Bash tool stands for a box whose command reads a path from where it
@@ -5076,6 +5373,9 @@ fn a_box_is_placed_where_the_bash_tool_stands_only_when_it_reads_from_there() {
 /// (`../.claude.json`, a recursive read of `.`), and a tree a reader descends there, whose files
 /// it cannot list; `aterm drive classify` reads one from the directory it is asked from, where
 /// the asking agent's line runs, and walks the tree there.
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
 #[test]
 fn the_advisory_word_and_the_classify_verb_place_a_relative_read() {
     let home = Path::new("/Users/_owner");
@@ -5124,7 +5424,7 @@ fn the_advisory_word_and_the_classify_verb_place_a_relative_read() {
     for line in [
         "cat ../README.md",
         "cat src/main.rs",
-        "cd src && cat lib.rs",
+        "cd ./src && cat lib.rs",
         "cat System/Volumes/Data/Users/_owner/notes.txt",
     ] {
         assert_eq!(word(line), Ok(()), "the word: {line}");
@@ -5599,6 +5899,9 @@ fn a_case_folded_spelling_of_a_secret_is_not_read_only() {
     }
 }
 
+// It approves reads that descend a tree, which Windows never lists
+// (`probe_live::below_within`).
+#[cfg(not(windows))]
 #[test]
 fn a_grep_or_rg_value_option_is_no_pattern_to_the_secret_check() {
     for cmd in [
@@ -9064,7 +9367,8 @@ fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
     let named = bash_box(&[&format!("git -C {} status", shell_word(&other))], None);
     assert!(reason(&on_screen(&named, &c)).contains("core.fsmonitor"));
     let cd = bash_box(&[&format!("cd {} && git log -1", shell_word(&other))], None);
-    assert!(reason(&on_screen(&cd, &c)).contains("core.fsmonitor"));
+    let why = reason(&on_screen(&cd, &c)).to_string();
+    assert!(why.contains("core.fsmonitor"), "{why}");
     let remote = bash_box(&["git remote show origin"], None);
     assert!(reason(&on_screen(&remote, &c)).contains("contacts a remote"));
 
@@ -9266,6 +9570,64 @@ fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
     assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&launch);
+}
+
+/// macOS's `/usr/bin/git` is an xcrun shim that runs the git `$DEVELOPER_DIR` holds (MEASURED
+/// 2026-11-05 on macOS 27.0.1: it runs `<dir>/usr/bin/xcrun`), so a git read whose worker names a
+/// developer directory the worker writes is refused before the probe runs that git; one that
+/// names none is read as before.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_developer_dir_the_worker_writes_is_refused_before_the_probe_runs_its_git() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = scratch_repo("developer-dir");
+    let dev = repo.join("dev");
+    std::fs::create_dir_all(dev.join("usr/bin")).expect("developer dir");
+    let marker = repo.join("planted-ran");
+    let planted = dev.join("usr/bin/xcrun");
+    std::fs::write(
+        &planted,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .expect("xcrun");
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            repo.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+        )
+    };
+    let shim = |extra: Option<String>| {
+        let w = WorkerEnv::hermetic(None).with("PATH=/usr/bin:/bin");
+        ApprovalCtx {
+            worker: Ok(extra.map_or(w.clone(), |kv| w.with(&kv))),
+            ..c.clone()
+        }
+    };
+    let status = bash_box(&["git status --short"], None);
+    for key in ["DEVELOPER_DIR", "SDKROOT"] {
+        let why = reason(&on_screen(
+            &status,
+            &shim(Some(format!("{key}={}", dev.display()))),
+        ))
+        .to_string();
+        assert!(
+            why.contains(&format!("`{key}`")) && why.contains("xcrun shim"),
+            "{key}: {why}"
+        );
+        assert!(!marker.exists(), "{key}: the planted xcrun ran");
+    }
+    // NEGATIVE CONTROL: no developer directory named, the shim's own git is read.
+    assert_eq!(
+        approved(&on_screen(&status, &shim(None))),
+        Some(RULE_READ_ONLY)
+    );
+    assert!(!marker.exists(), "the planted xcrun ran");
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 #[test]

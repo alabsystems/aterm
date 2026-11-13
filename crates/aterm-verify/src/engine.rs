@@ -24,7 +24,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::{Command, command};
+use aterm_uds::spawnfd::Command;
 
 /// How a git child is run and waited for (a release forwards its interrupts to it).
 pub type RunGit<'a> = &'a dyn Fn(&mut Command) -> std::io::Result<std::process::Output>;
@@ -121,7 +121,7 @@ pub fn release_dir(repo: &Path) -> PathBuf {
 /// anything else aligns (`~/publication`) moved under 0.172.0's stage on m3 (2026-11-07).
 #[must_use]
 pub fn engine_copy(release: &Path) -> PathBuf {
-    release.join("engine")
+    release.join(aterm_tempfile::QUIET).join("engine")
 }
 
 /// What kept a reader from the engine's file.
@@ -403,7 +403,7 @@ impl OriginMain {
 /// The remote's own words: an origin that is neither GitHub nor a local path, or a failed read.
 pub fn native(at: &Path, _by: &Path) -> Result<String, String> {
     let run = |tool, args: &[OsString]| {
-        let mut cmd = crate::remote::command(at, &in_dir, tool, args);
+        let mut cmd = crate::remote::command(at, &in_dir, tool, args)?;
         bounded_remote(tool, &mut cmd).map_err(|e| format!("{tool:?} remote operation: {e}"))
     };
     crate::remote::Remote::open(at, "origin", &run)?.refresh_main()
@@ -418,7 +418,7 @@ fn in_dir(root: &Path) -> Command {
 /// A git command that asks no one and that no inherited `GIT_DIR` (or other redirect) points
 /// elsewhere.
 fn git() -> Command {
-    let mut cmd = command(aterm_uds::os_path!("git"));
+    let mut cmd = crate::git_provider::command();
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     for var in crate::changed::GIT_REDIRECTS {
         cmd.env_remove(var);

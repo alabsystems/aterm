@@ -73,7 +73,7 @@ fn fallback_uses_the_post_poll_state_as_its_preparation_snapshot() {
 }
 
 #[test]
-fn a_failed_in_place_relogin_can_leave_its_own_proven_unpinned_account() {
+fn a_lost_login_is_recorded_before_any_move_and_never_retried_in_place() {
     for default in [false, true] {
         for mode in 0..3 {
             let world = World::new("lost-login-fallback");
@@ -115,19 +115,30 @@ fn a_failed_in_place_relogin_can_leave_its_own_proven_unpinned_account() {
                 let env = login_env(Cli::Codex, row, &world.home).ok()?;
                 relaunch::pool_line(&session.relaunch, Cli::Codex, &env).ok()
             });
-            if mode == 0 {
-                assert_eq!(attempted, [source, other]);
-                assert!(matches!(moved.advice, Advice::Move { to, .. } if to == other));
+            // The lost login is the row's fact before any move is weighed: the row reads
+            // signed out under its credential context, so no relaunch is tried on it again
+            // (a renewal gives it a new context, which this word does not cover).
+            assert!(
+                !attempted.iter().any(|label| label == source),
+                "{attempted:?}"
+            );
+            if let Advice::Move { to, .. } = &moved.advice {
+                assert_eq!(to, other);
                 assert!(moved.line.is_some());
-                assert_eq!(world.load(Cli::Codex).rotations.len(), 1);
-            } else {
-                assert_eq!(attempted, [source]);
-                assert_eq!(moved, Moved::stay(StayWhy::NoLine));
-                assert!(world.load(Cli::Codex).rotations.is_empty());
             }
-            assert_ne!(
-                world.load(Cli::Codex).account(source).auth,
-                accounts::Auth::SignedOut
+            if mode == 0 {
+                assert!(matches!(moved.advice, Advice::Move { to, .. } if to == other));
+                assert_eq!(world.load(Cli::Codex).rotations.len(), 1);
+            }
+            let mut state = world.load(Cli::Codex);
+            let roster = world.seat().bound_roster(Cli::Codex).unwrap();
+            store.hydrate_auth_contexts(&mut state, &roster);
+            assert_eq!(
+                state
+                    .account(source)
+                    .current_auth(roster.row(source).unwrap()),
+                accounts::Auth::SignedOut,
+                "mode {mode}, default {default}"
             );
         }
     }

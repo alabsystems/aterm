@@ -635,7 +635,7 @@ fn renewal_refused(result: super::cli::Renewal) -> Result<(), super::worker::Ref
 #[cfg(unix)]
 fn recover_google_worker_with(
     seat: &Seat<'_>,
-    mut starter: super::worker::Starter,
+    starter: super::worker::Starter,
     mut check: impl FnMut(
         &Row,
         &Path,
@@ -665,6 +665,92 @@ fn recover_google_worker_with(
     let Some(row) = signed_out else {
         return first.map_err(super::worker::Refused::Preparation);
     };
+    let now = || {
+        seat.now
+            .saturating_add(i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX))
+    };
+    // The login the last check found signed out: the row as it was checked and its renewal
+    // generation then. A launch that ends refused leaves that on the row's record
+    // ([`note_launch_signed_out`]); one whose renewal took leaves nothing, and nothing is
+    // written before the renewal, whose selection a signed-out word would move.
+    let mut seen = (
+        row.clone(),
+        captured
+            .logins
+            .labels
+            .get(&row.label)
+            .map(|binding| binding.renewal_generation),
+    );
+    let recovered = recover_signed_out_google_worker(
+        seat,
+        starter,
+        &mut check,
+        renew,
+        (&captured, &selection, &row),
+        &now,
+        &mut seen,
+    );
+    if recovered.is_err() {
+        note_launch_signed_out(seat, &seen.0, seen.1, now());
+    }
+    recovered
+}
+
+/// Record that a launch found `observed`'s published Google grant missing and ended refused:
+/// the row is signed out on this Mac, once, through the store's transaction, so its ledger and
+/// the journal hold it. Nothing is written where the row or its login changed since the check
+/// (its renewal generation moved): the check's fact is not about that login. A write that
+/// fails changes nothing of the launch's refusal.
+#[cfg(unix)]
+fn note_launch_signed_out(seat: &Seat<'_>, observed: &Row, generation: Option<u64>, at: i64) {
+    let path = seat.config_dir.join(Cli::Agy.accounts().roster_file);
+    let _ = seat.store(Cli::Agy).transact_pool_logins_within(
+        &accounts::LOCK_LADDER,
+        &path,
+        at,
+        &mut None,
+        |raw, state, logins| {
+            if accounts::bound(raw, logins).row(&observed.label) != Some(observed)
+                || logins
+                    .labels
+                    .get(&observed.label)
+                    .map(|binding| binding.renewal_generation)
+                    != generation
+            {
+                return Ok(Vec::new());
+            }
+            Ok(accounts::note_auth_for_observed_row(
+                state,
+                logins,
+                observed,
+                accounts::Auth::SignedOut,
+                at,
+            ))
+        },
+    );
+}
+
+/// [`recover_google_worker_with`] past a first check that found `row` signed out: one renewal,
+/// then one more check. `seen` follows the login the last check found signed out.
+#[cfg(unix)]
+#[allow(clippy::type_complexity)]
+fn recover_signed_out_google_worker(
+    seat: &Seat<'_>,
+    mut starter: super::worker::Starter,
+    check: &mut dyn FnMut(
+        &Row,
+        &Path,
+    ) -> Result<
+        super::agy_signin::PublishedGoogleGrant,
+        super::agy_signin::PublishedRefusal,
+    >,
+    renew: impl FnOnce(&Row, &accounts::Logins) -> Result<(), super::worker::Refused>,
+    (captured, selection, row): (&PoolSnapshot, &GoogleSelection, &Row),
+    now: &dyn Fn() -> i64,
+    seen: &mut (Row, Option<u64>),
+) -> Result<Option<GooglePoolWorker>, super::worker::Refused> {
+    let selection = selection.clone();
+    let row = row.clone();
     // Drop the failed check's profile claim before staging. A policy change
     // or another renewal wins; neither permits authentication on this stale scope.
     let current = pool_snapshot(seat, Cli::Agy)?;
@@ -674,10 +760,6 @@ fn recover_google_worker_with(
     {
         return Err("Native Google account changed before renewal".into());
     }
-    let now = || {
-        seat.now
-            .saturating_add(i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX))
-    };
     selection.permits(&row, &current.state, now())?;
     renew(&row, &captured.logins)?;
     let renewed = pool_snapshot(seat, Cli::Agy)?;
@@ -725,15 +807,25 @@ fn recover_google_worker_with(
             signed_out_again = matches!(error, super::agy_signin::PublishedRefusal::SignedOut);
             error.to_string()
         })
-    })
-    .map_err(|why| {
+    });
+    // Past the renewal, only a second signed-out answer is news, and of the renewed login.
+    *seen = (
         if signed_out_again {
-            super::worker::Refused::SignedOut(why)
+            next.clone()
         } else {
-            super::worker::Refused::Preparation(why)
-        }
-    })?
-    .ok_or("Renewed Google profile lost its pool binding")?;
+            row.clone()
+        },
+        signed_out_again.then_some(binding.renewal_generation),
+    );
+    let worker = worker
+        .map_err(|why| {
+            if signed_out_again {
+                super::worker::Refused::SignedOut(why)
+            } else {
+                super::worker::Refused::Preparation(why)
+            }
+        })?
+        .ok_or("Renewed Google profile lost its pool binding")?;
     if worker.selection != selection
         || worker.generation != binding.renewal_generation
         || worker.principal
@@ -946,26 +1038,33 @@ pub struct SyncHere<'a> {
     pub now: i64,
 }
 
-/// The sign-in that makes `row`'s login its own: its own sign-in, or where `program` keeps no row's
-/// login its own ([`super::codex_alab::auth_path_unread`]) and the row is on the default login, the
-/// vendor's in that home, since `accounts login` refuses it there
+/// The sign-in that makes `row`'s login its own: its own ([`Step::sign_in`]: a row with an address
+/// renews where aterm approves the vendor's page, so it asks nobody), or where `program` keeps no
+/// row's login its own ([`super::codex_alab::auth_path_unread`]) and the row is on the default
+/// login, the vendor's in that home, since a pool sign-in refuses it there
 /// ([`super::codex_alab::default_row_staging`]).
 #[must_use]
 pub fn row_sign_in_step(cli: Cli, row: &Row, program: Option<&Path>) -> Step {
     if row.dir.is_none() {
-        default_row_sign_in_step(cli, &row.label, program)
+        default_row_sign_in_step(cli, &row.label, row.email.is_some(), program)
     } else {
-        Step::Login(cli, row.label.clone())
+        Step::sign_in(cli, &row.label, row.email.is_some())
     }
 }
 
-/// [`row_sign_in_step`] of `label`, the row on the default login.
+/// [`row_sign_in_step`] of a row on the default login, known by its label and whether it has an
+/// `email`.
 #[must_use]
-pub fn default_row_sign_in_step(cli: Cli, label: &str, program: Option<&Path>) -> Step {
+pub fn default_row_sign_in_step(
+    cli: Cli,
+    label: &str,
+    addressed: bool,
+    program: Option<&Path>,
+) -> Step {
     if program.is_some_and(|program| super::codex_alab::auth_path_unread(program).is_some()) {
         Step::VendorLogin(cli)
     } else {
-        Step::Login(cli, label.to_owned())
+        Step::sign_in(cli, label, addressed)
     }
 }
 
@@ -1563,23 +1662,29 @@ fn poll_usage(
     Ok((snapshot_held(seat, cli, &store, &held)?.state, true))
 }
 
-/// What a handoff read of one row it might move a session to, and the credential it read under.
+/// What a handoff read of one row, the walled session's own login or one it might move the session
+/// to, and the credential it read under.
 #[derive(Debug)]
 pub(super) struct FreshRead {
     /// The row.
     pub label: String,
     /// The login's context as it stood before the read; `None` where it could not be captured.
     pub context: Option<accounts::AuthContext>,
-    /// What it read.
-    pub usage: super::codex_app_login::Usage,
+    /// What the provider answered.
+    pub answer: FreshAnswer,
 }
 
-/// Records what a handoff read of `reads`' rows, as [`poll_usage`] records a launch's read, so a
-/// report and a later writer judge each row by it: a row whose credential changed during its read
-/// or that is gone keeps what it had.
-///
-/// # Errors
-/// The records could not be locked or written.
+/// What a handoff's read of one row answered.
+#[derive(Debug)]
+pub(super) enum FreshAnswer {
+    /// The usage it read: the login served it.
+    Usage(super::codex_app_login::Usage),
+    /// The provider read the login signed out.
+    SignedOut,
+    /// The provider answered no figure ([`accounts::note_unanswered`]).
+    Unanswered,
+}
+
 /// The steps of [`accounts::LOCK_LADDER`] that fit in `wait`: a record that a caller's deadline
 /// does not hang on gives way to that deadline.
 pub(super) fn ladder_within(wait: std::time::Duration) -> Vec<std::time::Duration> {
@@ -1595,6 +1700,15 @@ pub(super) fn ladder_within(wait: std::time::Duration) -> Vec<std::time::Duratio
         .collect()
 }
 
+/// Records what a handoff read of `reads`' rows, as [`poll_usage`] records a launch's read, so a
+/// report and a later writer judge each row by it: its usage and that its login served it, that
+/// its login read signed out, or a read that answered no figure as one more in its row's run
+/// ([`accounts::note_unanswered`]). A row whose credential changed during its read or that is
+/// gone keeps what it had. Only a read that answered no figure is kept where no credential could
+/// be captured, before the read and now: such a login fails locally at every ask.
+///
+/// # Errors
+/// The records could not be locked or written.
 pub(super) fn note_fresh_reads(
     seat: &Seat<'_>,
     cli: Cli,
@@ -1619,14 +1733,51 @@ pub(super) fn note_fresh_reads(
                     let Some(row) = current.row(&read.label) else {
                         continue;
                     };
-                    if read.context.is_none() || store.capture_auth_context(row) != read.context {
+                    if store.capture_auth_context(row) != read.context {
                         continue;
                     }
+                    let Some(raw_row) = raw.row(&read.label) else {
+                        continue;
+                    };
+                    let usage = match &read.answer {
+                        FreshAnswer::Usage(usage) => usage,
+                        FreshAnswer::SignedOut => {
+                            if let Some(context) = read.context.clone() {
+                                accounts::stage_auth(
+                                    state,
+                                    raw_row,
+                                    logins,
+                                    context,
+                                    accounts::Auth::SignedOut,
+                                    seat.now,
+                                );
+                            }
+                            continue;
+                        }
+                        // A login whose context cannot be captured (no file store, an `auth.json`
+                        // that does not parse) fails its read locally at every ask, so it is
+                        // paced too.
+                        FreshAnswer::Unanswered => {
+                            accounts::note_unanswered(state, &read.label, seat.now);
+                            continue;
+                        }
+                    };
+                    let Some(context) = read.context.clone() else {
+                        continue;
+                    };
                     let renewed = logins.get(&read.label).and_then(|b| b.renewed_at);
-                    let sample = &read.usage.sample;
+                    let sample = &usage.sample;
                     if sample.at > seat.now || renewed.is_some_and(|at| sample.at < at) {
                         continue;
                     }
+                    accounts::stage_auth(
+                        state,
+                        raw_row,
+                        logins,
+                        context,
+                        accounts::Auth::Ok,
+                        seat.now,
+                    );
                     let noted = accounts::note_sample(state, &read.label, sample.clone(), seat.now);
                     if !noted.is_empty()
                         && let Some(account) = state.accounts.get_mut(&read.label)
@@ -1634,7 +1785,7 @@ pub(super) fn note_fresh_reads(
                         account.sample_context = Some(sample_context(seat, cli, row, logins));
                     }
                     events.extend(noted);
-                    for &(window, until) in &read.usage.walls {
+                    for &(window, until) in &usage.walls {
                         events.extend(accounts::note_wall(
                             state,
                             &read.label,
@@ -2975,19 +3126,21 @@ fn cold_launch_who_capturing(
     seat.claim(cli, super::claims::Act::Look);
     // An empty roster can still retain a withdrawn account's credentials. The
     // ordinary launch's empty-pool shortcut must not hide that custody here.
-    let mut snapshot = {
+    let snapshot = {
         let store = seat.store(cli);
         let held = store
             .acquire_within(&accounts::LOCK_LADDER)
             .map_err(|why| why.to_string())?
             .ok_or(accounts::LOCK_HELD)?;
         let current = snapshot_held(seat, cli, &store, &held)?;
-        if accounts::judged_label(&current.roster, &who).is_none() {
+        let ran = cold_row(cli, &current.roster, &who, &env_of(&who), seat.home).cloned();
+        if ran.is_none() {
             capture(&current, None)?;
         }
-        current
+        (current, ran)
     };
-    let Some(label) = accounts::judged_label(&snapshot.roster, &who) else {
+    let (mut snapshot, ran) = snapshot;
+    let Some(ran) = ran else {
         // A process on a login's own credential, stored or a vault token's, never reuses a
         // login retained without a binding.
         let own = match who.route {
@@ -3012,9 +3165,6 @@ fn cold_launch_who_capturing(
                 return Err("cold login is retained without a current account binding".into());
             }
         }
-        return Ok(None);
-    };
-    let Some(ran) = snapshot.roster.row(label).cloned() else {
         return Ok(None);
     };
     // A retained old directory identifies the account, but cannot authorize reusing
@@ -3105,6 +3255,40 @@ fn cold_launch_who_capturing(
         );
     }
     Ok(pick)
+}
+
+/// The row a cold start on `who` (a process started with `env`, `KEY=value` entries) runs on:
+/// the row its environment makes the roster believe ([`accounts::judged_label`]), reconciled
+/// with the account Claude Code's login file at that place names ([`accounts::reconcile`]), as
+/// every other launch planner reads it (`docs/DESIGN-account-discovery-2026-11-09.md`): the
+/// row the file names where it names a listed one, the belief where nothing was read, and
+/// `None` where the file names an account no row lists, which no cold pick charges, leases or
+/// rotates away from. Another CLI's is the belief: nothing observes its login file yet.
+fn cold_row<'a>(
+    cli: Cli,
+    roster: &'a Roster,
+    who: &accounts::ProcessLogin,
+    env: &[String],
+    home: &Path,
+) -> Option<&'a Row> {
+    let believed = roster.row(accounts::judged_label(roster, who)?)?;
+    if cli != Cli::Claude {
+        return Some(believed);
+    }
+    let seen = super::observe::claude(env, home, who.route, Some(roster));
+    match accounts::reconcile(roster, who, &seen) {
+        accounts::Reconciled::Agrees(row) | accounts::Reconciled::Other(row) => Some(row),
+        accounts::Reconciled::Unread(_) => Some(believed),
+        accounts::Reconciled::Unlisted(_) => None,
+    }
+}
+
+/// The environment (`KEY=value`) that names `who`'s login directory, as a start on it carries.
+fn env_of(who: &accounts::ProcessLogin) -> Vec<String> {
+    who.login
+        .iter()
+        .map(|dir| format!("{}={dir}", accounts::LOGIN_ENV))
+        .collect()
 }
 
 /// An unchanged command is still a new execution. Recheck its exact row and binding under
@@ -3272,7 +3456,11 @@ fn cold_resume_pick(
     let roster = accounts::bound(&raw, &logins);
     store.hydrate_auth_contexts(&mut state, &roster);
     let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
-    let ran = roster.row(accounts::judged_label(&roster, &who)?)?;
+    let raw_env: Vec<String> = env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    let ran = cold_row(cli, &roster, &who, &raw_env, seat.home)?;
     let enrolled = accounts::enrolled_in(cli, &roster, seat.home);
     let ready = |row: &Row| -> Option<LoginEnv> {
         check_login_identity(cli, row, seat.home).ok()?;
@@ -3942,10 +4130,12 @@ pub fn session_login_plan(
     )
 }
 
-/// Prepare a self-supervised Codex weekly-quota move using the normal pool's
-/// policy and commit-time revalidation. The caller must first verify the native
-/// failed turn and its credential identity. This function grants no process
-/// mutation authority and performs no restart.
+/// Prepare a self-supervised Codex quota move, at a weekly or a five-hour
+/// wall, using the normal pool's policy and commit-time revalidation. The
+/// session's point names which wall, and so which window's reset its row's
+/// record keeps. The caller must first verify the native failed turn and its
+/// credential identity. This function grants no process mutation authority
+/// and performs no restart.
 ///
 /// The window's ordinary path still refuses self-supervised sessions. Only the
 /// native host can combine this plan with its separately validated handoff.
@@ -4006,8 +4196,11 @@ fn native_quota_plan_preparing<T, R>(
     if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
         return SessionPlan::stay(StayWhy::OtherSupervisor);
     }
+    // A stamped wall of one of the two windows a Codex login's usage read names: the plan records
+    // it under that window, so a wall of no window, or of one no read names, is none to plan at.
     if !matches!(&session.point, Point::Wall { window, at: Some(at) }
-        if window == "seven_day" && *at <= seat.now)
+        if matches!(window.as_str(), accounts::WEEK_LIMIT | accounts::SESSION_LIMIT)
+            && *at <= seat.now)
     {
         return SessionPlan::stay(StayWhy::NothingDue);
     }
@@ -4107,35 +4300,69 @@ pub(super) fn native_target_admitted(row: &Row, state: &accounts::State, now: i6
     accounts::condition(row, state, true, now).fresh()
 }
 
-/// The row a Codex session on `from` moves to at its weekly limit as the records stand, or `None`
-/// where nothing moves it: what [`native_quota_plan`] selects where each provider read admits its
-/// candidate. `default_login` is the address the default login names
-/// ([`accounts::default_login_address`]): a candidate of the session's own account is passed over,
-/// as the handoff's own read of it is. A default row that login moved off neither takes a session,
-/// whose preparation refuses it, nor hands one off, whose usage [`record_session`] will not
-/// attribute to it. A session stays on a held row ([`held_source`]) and under another row's pin;
-/// its wall ends a pin on its own row.
+/// Whether a usage-limit handoff reads `row` now, as the walled session's own login or as a
+/// candidate: not while its last handoff reads answered no figure and their wait has not passed
+/// ([`accounts::Account::unanswered_until`]). Only the handoff's choice of what to read asks this,
+/// its forecast ([`native_quota_target`]) and its reads (`codex_rotation::prepare_quota_wall`); a
+/// writer judging a selection already made never does.
+pub(super) fn handoff_reads(row: &Row, state: &accounts::State, now: i64) -> bool {
+    state
+        .accounts
+        .get(&row.label)
+        .and_then(|account| account.unanswered_until(now))
+        .is_none()
+}
+
+/// [`native_quota_target_at`] for the week's wall ([`accounts::WEEK_LIMIT`]): the row the report
+/// forecasts for a session on `from`. A five-hour wall there moves the session to the same row,
+/// since the target is judged of the other rows' records, each by every wall on its own.
 #[must_use]
 pub fn native_quota_target(
+    pool: (Cli, Mode),
+    records: (
+        &Roster,
+        &accounts::State,
+        &std::collections::BTreeSet<String>,
+    ),
+    from: &Row,
+    login: (Option<&str>, &Path),
+    now: i64,
+) -> Option<String> {
+    native_quota_target_at(pool, records, (from, accounts::WEEK_LIMIT), login, now)
+}
+
+/// The row a Codex session on `from` moves to at a wall of its `window` (the week's or the
+/// five-hour one, [`accounts::WEEK_LIMIT`] or [`accounts::SESSION_LIMIT`]) as the records stand,
+/// or `None` where nothing moves it: what [`native_quota_plan`] selects where each provider read
+/// admits its candidate, passing over a candidate the handoff does not read yet
+/// ([`handoff_reads`]), as its plan's reads do. The window is the wall this forecast stands on
+/// `from`, as the plan's record of it would; which row takes the session is judged of the other
+/// rows, each by every wall on its own record. `default_login` is the address the default login
+/// names ([`accounts::default_login_address`]), under the user home `home`: a candidate of the
+/// session's own account is passed over, as the handoff's own read of it is. A row whose login
+/// names another account ([`check_login_identity`], on the default login or a directory of its
+/// own) neither takes a session nor hands one off. A session stays on a held row
+/// ([`held_source`]) and under another row's pin; its wall ends a pin on its own row.
+#[must_use]
+pub fn native_quota_target_at(
     (cli, mode): (Cli, Mode),
     (roster, state, enrolled): (
         &Roster,
         &accounts::State,
         &std::collections::BTreeSet<String>,
     ),
-    from: &Row,
-    default_login: Option<&str>,
+    (from, window): (&Row, &str),
+    (default_login, home): (Option<&str>, &Path),
     now: i64,
 ) -> Option<String> {
-    let moved = accounts::default_login_moved_off(roster, default_login);
+    let names_another = |row: &Row| check_login_identity(cli, row, home).is_err();
     if held_source(from)
         || (state.pinned && state.active.as_deref() != Some(from.label.as_str()))
-        || moved.is_some_and(|moved| moved.label == from.label)
+        || names_another(from)
     {
         return None;
     }
     let mut state = state.clone();
-    let window = "seven_day";
     accounts::note_wall(&mut state, &from.label, window, None, now, now);
     state.pinned = false;
     let me = accounts::Me {
@@ -4175,8 +4402,9 @@ pub fn native_quota_target(
         let row = roster.row(&to)?;
         if to != from.label
             && native_target_admitted(row, &state, now)
+            && handoff_reads(row, &state, now)
             && !one_account(row)
-            && moved.is_none_or(|moved| moved.label != to)
+            && !names_another(row)
         {
             return Some(to);
         }
@@ -4788,6 +5016,200 @@ fn record_session<R>(
     row: &accounts::Row,
     note: impl FnOnce(SessionNote<'_>),
 ) -> Result<Roster, String> {
+    observe_session(seat, session, who, row, |seen| {
+        let SessionSeen {
+            raw,
+            state,
+            logins,
+            current_login,
+            context,
+        } = seen;
+        let mut events = Vec::new();
+        if session.point == Point::TurnEnd {
+            if current_login {
+                events.extend(accounts::prove_in_context(
+                    state, logins, &row.label, seat.now,
+                ));
+            }
+            note(SessionNote {
+                state,
+                events: &mut events,
+                sid: session.sid,
+                account: &row.label,
+                now: seat.now,
+            });
+        }
+        if let Some(sample) = session.sample.clone() {
+            events.extend(accounts::note_sample(state, &row.label, sample, seat.now));
+        }
+        if let Point::Wall { window, at } = &session.point {
+            let at = at.unwrap_or(seat.now);
+            events.extend(accounts::note_wall(
+                state,
+                &row.label,
+                window,
+                session
+                    .sample
+                    .as_ref()
+                    .and_then(|sample| sample.reached_reset(window))
+                    .filter(|until| *until > at),
+                at,
+                seat.now,
+            ));
+        }
+        // The session's own sign-in wall is its login's end, whatever is advised for it: a
+        // process on a login a renewal replaced says nothing of the renewed one.
+        if matches!(session.point, Point::LostLogin { .. } | Point::LoginEnded) && current_login {
+            events.extend(note_session_login(
+                session.cli,
+                LoginSeen::Lost,
+                raw,
+                state,
+                logins,
+                &row.label,
+                context,
+                seat.now,
+            ));
+        }
+        events
+    })
+}
+
+/// What a pooled session's own point showed of the login its process runs on
+/// ([`session_seen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginSeen {
+    /// Its CLI's sign-in wall.
+    Lost,
+    /// A turn it worked and ended with no wall.
+    Served,
+}
+
+/// One session observation inside the pool's writer transaction ([`observe_session`]).
+struct SessionSeen<'a> {
+    raw: &'a Roster,
+    state: &'a mut accounts::State,
+    logins: &'a mut accounts::Logins,
+    /// The process's login is the row's current one, not one a renewal replaced.
+    current_login: bool,
+    /// Codex's credential context, captured before the transaction; its store takes an
+    /// authentication word only under one ([`accounts::stage_login_end`]).
+    context: Option<accounts::AuthContext>,
+}
+
+/// The login fact of a session, by the row's own recorders: Codex's contextual store stages it
+/// against the credentials captured before the transaction and records nothing without them;
+/// every other pool writes its word and its login's end or return at once.
+#[allow(clippy::too_many_arguments)]
+fn note_session_login(
+    cli: Cli,
+    seen: LoginSeen,
+    raw: &Roster,
+    state: &mut accounts::State,
+    logins: &mut accounts::Logins,
+    label: &str,
+    context: Option<accounts::AuthContext>,
+    now: i64,
+) -> Vec<accounts::Event> {
+    if cli == Cli::Codex {
+        if let (Some(context), Some(raw_row)) = (context, raw.row(label)) {
+            match seen {
+                LoginSeen::Lost => accounts::stage_login_end(state, raw_row, logins, context, now),
+                LoginSeen::Served => {
+                    accounts::stage_signed_back(state, raw_row, logins, context, now);
+                }
+            }
+        }
+        return Vec::new();
+    }
+    match seen {
+        LoginSeen::Lost => accounts::note_login_end(state, logins, label, now),
+        LoginSeen::Served => {
+            let events = accounts::note_signed_back(state, logins, label, now);
+            if !events.is_empty() {
+                accounts::note_served_login(logins, label, now);
+            }
+            events
+        }
+    }
+}
+
+/// Record what a pooled session's own point showed of its login on the row its process runs
+/// on, and nothing else: no advice, no canary and no session note. This is the one writer a
+/// tab's sign-in wall and its served turn reach for every pooled CLI, whatever its pool's
+/// switches say and whoever answers its walls; a failed sign-in is a fact of the account, not
+/// a decision about it. Returns whether an event was written. `Ok(false)` where the process is
+/// on no row's own login (no roster, another home, an environment credential), the row is
+/// another supervisor's, the row already says so, or a renewal replaced the login the process
+/// holds.
+///
+/// # Errors
+/// The roster or store cannot be read or written, or the login changed under the observation.
+pub fn session_seen<R>(
+    seat: &Seat<'_>,
+    session: &Session<'_, R>,
+    seen: LoginSeen,
+) -> Result<bool, String> {
+    let location = MoveLocation::capture(seat).map_err(|why| why.to_string())?;
+    let owned_seat = location.at(seat.now);
+    let seat = &owned_seat;
+    let Ok(roster) = seat.bound_roster(session.cli) else {
+        return Ok(false);
+    };
+    let who = accounts::ProcessLogin::of_env_for(session.cli, session.env.iter().copied());
+    let me = who.me(&roster);
+    let Some(row) = me
+        .account
+        .filter(|_| me.default_home && me.route.on_account())
+        .and_then(|label| roster.row(label))
+        .filter(|row| !held_source(row))
+    else {
+        return Ok(false);
+    };
+    let store = seat.store(session.cli);
+    let (mut state, _) = store.load(seat.now)?;
+    // A Codex word applies only under the credential context it was read in.
+    store.hydrate_auth_contexts(&mut state, &roster);
+    let account = state.account(&row.label);
+    let told = match seen {
+        LoginSeen::Lost => account.current_auth(row) == accounts::Auth::SignedOut,
+        LoginSeen::Served => account.auth != accounts::Auth::SignedOut,
+    };
+    if told {
+        return Ok(false);
+    }
+    let mut wrote = false;
+    observe_session(seat, session, &who, row, |observed| {
+        if !observed.current_login {
+            return Vec::new();
+        }
+        let events = note_session_login(
+            session.cli,
+            seen,
+            observed.raw,
+            observed.state,
+            observed.logins,
+            &row.label,
+            observed.context,
+            seat.now,
+        );
+        // Codex's staged word is applied at the commit, after this closure.
+        wrote = session.cli == Cli::Codex || !events.is_empty();
+        events
+    })?;
+    Ok(wrote)
+}
+
+/// The pool's login writer for one session observation: under the store's lock, the process
+/// must still be on `row`'s login in the default home and that login must not contradict the
+/// row's identity; `edit` then records what was seen.
+fn observe_session<R>(
+    seat: &Seat<'_>,
+    session: &Session<'_, R>,
+    who: &accounts::ProcessLogin,
+    row: &accounts::Row,
+    edit: impl FnOnce(SessionSeen<'_>) -> Vec<accounts::Event>,
+) -> Result<Roster, String> {
     let path = seat.config_dir.join(session.cli.accounts().roster_file);
     let observation = accounts::LoginObservation {
         roster_path: &path,
@@ -4795,8 +5217,10 @@ fn record_session<R>(
         who,
         seen: session.seen,
     };
+    let store = seat.store(session.cli);
+    let context = store.capture_auth_context(row);
     let mut recorded = None;
-    seat.store(session.cli).transact_pool_logins_within(
+    store.transact_pool_logins_within(
         &accounts::LOCK_LADDER,
         &path,
         seat.now,
@@ -4816,39 +5240,13 @@ fn record_session<R>(
             observed.dir.clone_from(&who.login);
             check_login_identity(session.cli, &observed, seat.home)
                 .map_err(|why| why.to_string())?;
-            let mut events = Vec::new();
-            if session.point == Point::TurnEnd {
-                if observation.matches_current(&current) {
-                    events.extend(accounts::prove_in_context(
-                        state, logins, &row.label, seat.now,
-                    ));
-                }
-                note(SessionNote {
-                    state,
-                    events: &mut events,
-                    sid: session.sid,
-                    account: &row.label,
-                    now: seat.now,
-                });
-            }
-            if let Some(sample) = session.sample.clone() {
-                events.extend(accounts::note_sample(state, &row.label, sample, seat.now));
-            }
-            if let Point::Wall { window, at } = &session.point {
-                let at = at.unwrap_or(seat.now);
-                events.extend(accounts::note_wall(
-                    state,
-                    &row.label,
-                    window,
-                    session
-                        .sample
-                        .as_ref()
-                        .and_then(|sample| sample.reached_reset(window))
-                        .filter(|until| *until > at),
-                    at,
-                    seat.now,
-                ));
-            }
+            let events = edit(SessionSeen {
+                raw,
+                state,
+                logins,
+                current_login: observation.matches_current(&current),
+                context,
+            });
             recorded = Some(current);
             Ok(events)
         },

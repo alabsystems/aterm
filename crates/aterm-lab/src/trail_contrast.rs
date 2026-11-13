@@ -719,7 +719,7 @@ impl Local {
 /// for a glyph with no ground that near, or with no clean twin. A light laid away from the strokes
 /// that the whole cell's median ground counts, or a body over part of the cell, is not what the
 /// letter is read against.
-fn judged(cell: &J) -> Option<f64> {
+pub(crate) fn judged(cell: &J) -> Option<f64> {
     cell.get("local_contrast")
         .and_then(J::as_f64)
         .or_else(|| cell.get("contrast").and_then(J::as_f64))
@@ -735,7 +735,7 @@ fn clean_judged(cell: &J) -> Option<f64> {
 /// Whether the effects took `cell` under `bar`: it reads under it, and its own clean reading
 /// ([`clean_judged`]) reads the bar or more, or it reads under [`LOWERED_SHARE`] of that reading
 /// too (the letter guard's law: a letter at the bar keeps the bar, a dimmer one its share).
-fn lowered_under(cell: &J, bar: f64) -> bool {
+pub(crate) fn lowered_under(cell: &J, bar: f64) -> bool {
     match (judged(cell), clean_judged(cell)) {
         (Some(now), Some(own)) => now < bar && (own >= bar || now < own * LOWERED_SHARE),
         _ => false,

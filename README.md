@@ -105,7 +105,7 @@ every window, tab and live shell survives the handoff. `aterm update status`
 and Settings ▸ Software Update show where it stands; `aterm help update` has
 the rest (Linux adds `enable`, `apply` and `rollback`). `[update] enabled =
 false` stops background checks, and `[update] auto_apply = false` leaves
-installing to you. Windows has no published build and no updater.
+installing to you. Windows has no published build and no network updater.
 
 ### Build from source
 
@@ -211,8 +211,8 @@ instance hosting your terminal, else the newest one.
 
 ## Fun is a feature
 
-The default cursor is the **rainbow kitty pet**: a full-body cat that walks,
-runs and pounces along your line on a rainbow ribbon, with a typing sound on
+The default cursor is the **rainbow kitty**: a full-body cat that walks,
+runs and pounces along your line over a rainbow line, with a typing sound on
 macOS. It cheers a green build, sulks at a failed one and chases your mouse.
 Type `sit`, `kitty jump` or `good kitty` and a space, and the cat does it
 (`aterm help kitty`).
@@ -221,11 +221,11 @@ Type `sit`, `kitty jump` or `good kitty` and a space, and the cat does it
   <img src="assets/aterm-rainbow-kitty.png" width="880" alt="Close-up from a real aterm frame: the rainbow kitty and its ribbon under a typed command">
 </p>
 
-`cursor_trail_style` takes `rainbow kitty pet` (also `rainbow kitty`, `kitty`),
-`rainbow underline`, `rainbow dog pet`, `rainbow kitty flying`,
-`rainbow kitty flat`, `phaser`, `fire`, `water`, `laser` (shown as Lightning),
-`comet`, `sparkle`, `lumen`, `beam`, `classic` or `off`; Settings ▸ Cursor
-Styles previews each, and Settings ▸ Sound picks the typing sound. **Sparkle
+`cursor_trail_style` takes `rainbow`, `phaser`, `fire`, `water`, `laser`
+(shown as Lightning), `comet`, `sparkle`, `lumen`, `beam`, `classic` or `off`,
+and `cursor_pet` takes `cat`, `dog`, `flying cat` or `off`: the cat or dog
+walks beside any trail, or beside a plain cursor, and the flying cat flies in at
+the head of the rainbow once typing gathers speed. Settings ▸ Cursor Styles previews each, and Settings ▸ Sound picks the typing sound. **Sparkle
 Words**, TOML Toy Packs and **Matrix rain** (View ▸ Matrix Rain,
 `aterm ctl rain toggle`) are purely visual: copied text and logs
 read the exact bytes. `motion = reduced` (or the OS Reduce Motion setting)
@@ -319,13 +319,22 @@ it as privileged:
   addresses only, admits peers that prove the shared fleet secret, and answers
   reads at the configured `[fleet] allow` level, never as the owner. Driving needs
   `allow = "drive"` and a grant (`aterm fleet allow drive --from <node>` or
-  `--all`) checked against each peer's node key. A local Take Over always wins
+  `--all`) checked against each peer's node key, and goes only as far as the
+  driven machine's fleet access lets it. A local Take Over always wins
   (`aterm help fleet`).
+- Fleet access is each machine's own ceiling on what a granted member may do
+  to it, and starts at Read Only: other members read its sessions, and none
+  starts a job, sends a message or types into one. Its person raises it at
+  that machine, with the lock in its menu bar or `aterm fleet access write`
+  (the sessions already there, no new tabs) or `full`; no other machine can.
+  Leaving a fleet, or coming to hold another fleet's key, puts it back to Read
+  Only.
 - On the trusted ALab LAN, setup automatically joins the vault, materializes
-  available shared credentials and syncs fleet membership. A synced join enables
-  drive access from every member by default. Being on this LAN is the admission
-  authority; no per-machine approval is required. Members can read and drive one
-  another's sessions. Explicit sharing Off and lower access choices remain in
+  available shared credentials and syncs fleet membership. A synced join grants
+  drive access to every member by default. Being on this LAN is the admission
+  authority; no per-machine approval is required. Members can read one
+  another's sessions, and drive those of a machine whose person raised its
+  fleet access. Explicit sharing Off and lower access choices remain in
   force, and macOS permissions remain separate OS decisions.
 - Capture paths are confined to server-managed runtime directories.
 - Browser automation never adds Chromium's `--no-sandbox` flag. On Linux, run

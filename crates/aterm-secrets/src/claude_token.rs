@@ -25,6 +25,7 @@ use crate::client::{
     MemberEntry, MemberUnset, MemberWritten, OnBusy, Paths, member_unset_names, member_waits_here,
     member_write, read_claude_token_until, recipient_label, seat_label,
 };
+pub use crate::entry_class::Mismatch;
 use crate::entry_class::{CLAUDE_TOKEN_META, CLAUDE_TOKEN_PREFIX};
 use crate::membership_log::entries::inner::{self, Form};
 use crate::membership_log::{Log, MemberId};
@@ -223,15 +224,6 @@ impl Meta {
             verified,
         })
     }
-}
-
-/// Which check of a stored token failed (§4.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mismatch {
-    /// The two names' winning `Put`s are not one draft, a name is conflicted, or one is absent.
-    Draft,
-    /// A value is not inner-sealed, the token is not a setup-token, or the meta does not parse.
-    Value,
 }
 
 /// What this Mac reads of a stored token's two entries.

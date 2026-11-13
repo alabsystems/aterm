@@ -1271,7 +1271,7 @@ fn run_analyze(args: &[String]) -> i32 {
             let _ = write!(curves, "{name}");
             for (tau, v) in curve
                 .iter()
-                .filter(|(t, _)| (*t as u32) % 5 == 0 && *t <= 150.0)
+                .filter(|(t, _)| (*t as u32).is_multiple_of(5) && *t <= 150.0)
             {
                 let _ = write!(curves, " {tau:.0}:{:.2}", v / step);
             }

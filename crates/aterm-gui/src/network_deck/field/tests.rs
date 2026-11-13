@@ -1033,6 +1033,7 @@ fn observer_fallback() {
                 reachability: reach,
                 instances: None,
                 samples: Vec::new(),
+                lease_ms: None,
             });
     }
     let g = crate::stats_deck::DeckGeom {
@@ -1062,7 +1063,11 @@ fn observer_fallback() {
             SeatKey::Observed(7)
         ]
     );
-    assert!(texts(&prims).iter().any(|(_, s)| s == "1 reachable"));
+    assert!(
+        texts(&prims)
+            .iter()
+            .any(|(_, s)| s == "1 reachable · 1 last seen")
+    );
     assert!(
         corner_drawn(&prims, 1.0, inks.over),
         "the unknown peer's tick"
@@ -1094,6 +1099,62 @@ fn observer_fallback() {
         observed.starts_with("3 known · 1 reachable · 1 last seen"),
         "{observed}"
     );
+    for (reach, expected, answered) in [
+        (Some(Reachability::Reachable), "63 reachable", 63),
+        (
+            Some(Reachability::LastSeen),
+            "0 reachable · 63 last seen",
+            0,
+        ),
+        (Some(Reachability::Unknown), "0 reachable", 0),
+        (None, "21 reachable · 21 last seen", 21),
+    ] {
+        let mut sample = self::observed(63);
+        for (i, peer) in sample.network.peers.iter_mut().enumerate() {
+            peer.reachability = reach.unwrap_or(
+                [
+                    Reachability::Reachable,
+                    Reachability::LastSeen,
+                    Reachability::Unknown,
+                ][i % 3],
+            );
+        }
+        let field = observer(&sample.network);
+        assert_eq!(
+            field
+                .seats
+                .iter()
+                .filter(|seat| seat.presence == Presence::Answered)
+                .count(),
+            answered
+        );
+        for scale in [1.0, 2.0] {
+            for width in [400.0, 700.0] {
+                let g = crate::stats_deck::DeckGeom {
+                    w: width * scale,
+                    scale,
+                    ..g
+                };
+                let (prims, _) = super::super::paint_with_inks(
+                    &g, 100.0, &sample, &lab, None, None, &inks, false,
+                );
+                let (x, text) = words_drawn(&prims);
+                assert_eq!(text, expected);
+                assert!(x + text_w(&text, scale) <= g.w - GAP_PT * scale);
+            }
+        }
+        if reach == Some(Reachability::LastSeen) {
+            let caption = PlaceCaption {
+                long: "Nearby".into(),
+                short: "Nearby".into(),
+                offline: false,
+            };
+            assert!(
+                observer_words(1.0, &sample.network, Some(&caption), false, 1000.0)
+                    .starts_with(expected)
+            );
+        }
+    }
 }
 
 /// B2 #21: the field's words are the band's 9.5 pt UI face, 12 pt clear of the last column.
@@ -1142,11 +1203,9 @@ fn seat_lens_says_what_was_read() {
     let row = |rows: &[(String, String)], name: &str| {
         rows.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
     };
-    assert!(
-        row(&rows, "Sessions")
-            .unwrap()
-            .contains("s-1a2b · claude · wall:usage-weekly · working · ctx 40 % · 5h/7d –/98 %")
-    );
+    assert!(row(&rows, "Sessions").unwrap().contains(
+        "s-1a2b · claude · wall:usage-weekly · working · ctx 40 % left · 5h/7d –/2 % left"
+    ));
     let older = details(&field, Target::Seat(field.seats[1].key));
     assert_eq!(row(&older, "Agents").unwrap(), "not read: older aterm");
     assert_eq!(field.seats[1].presence, Presence::NotCounted);
@@ -1154,7 +1213,7 @@ fn seat_lens_says_what_was_read() {
     assert!(
         row(&lens, "At a limit")
             .unwrap()
-            .starts_with("wall:usage-weekly — m1 · s-1a2b · 7d 98 %")
+            .starts_with("wall:usage-weekly — m1 · s-1a2b · 7d 2 % left")
     );
     assert!(row(&lens, "Tasks").unwrap().starts_with("1 working"));
     let group = details(&field, Target::Group(SeatClass::NotCounted));
@@ -1236,7 +1295,7 @@ fn live_lab() -> FleetSnapshot {
 /// B2 #23: the band's line 1 at 0, 5, 63 and 250 seats, 700 and 1100 pt, 2×, in dark, light,
 /// Increase Contrast and Differentiate Without Color, as PNGs in `ATERM_DECK_GALLERY` (a scratch
 /// folder without it), with each frame's line-1 words in `field_text.tsv`. The 63-seat frame is
-/// [`live_lab`]; the others are [`fleet`].
+/// [`live_lab`]; the others are [`fleet`]. A mixed observer frame uses 400 and 700 pt.
 #[test]
 fn network_field_gallery() {
     let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
@@ -1272,6 +1331,10 @@ fn network_field_gallery() {
             (format!("{n}seats"), field)
         })
         .collect();
+    let mut retained = observed(3);
+    retained.network.peers[1].reachability = Reachability::LastSeen;
+    retained.network.peers[2].reachability = Reachability::Unknown;
+    scenes.push(("observed".into(), observer(&retained.network)));
     // A captured `aterm ctl survey --fleet --json` (`ATERM_FIELD_SURVEY=<file>`) is drawn as the
     // glance would parse it, so the field can be judged on what the fleet's builds really write.
     // The capture holds session ids and titles: it stays outside the checkout.
@@ -1289,7 +1352,12 @@ fn network_field_gallery() {
     for (scene, field) in &scenes {
         let field = field.clone();
         let n = scene;
-        for w in [700.0f32, 1100.0] {
+        let (network, widths) = if field.source == Source::Observer {
+            (&retained, [400.0f32, 700.0])
+        } else {
+            (&network, [700.0f32, 1100.0])
+        };
+        for w in widths {
             let g = crate::stats_deck::DeckGeom {
                 w: w * scale,
                 h: height as f32,
@@ -1301,7 +1369,7 @@ fn network_field_gallery() {
                 let (prims, _) = super::super::paint_with_inks(
                     &g,
                     0.0,
-                    &network,
+                    network,
                     &crate::lab_deck::LabDeck::default(),
                     Some(&field),
                     None,
@@ -1571,6 +1639,7 @@ fn observed_rows_are_words() {
             reachability: Reachability::Unknown,
             instances: None,
             samples: Vec::new(),
+            lease_ms: None,
         });
     let rows = observed_rows(&network);
     let (_, words) = rows.iter().find(|(n, _)| n == "peer3").expect("its row");
@@ -1827,6 +1896,7 @@ fn observed(n: u64) -> aterm_types::network_state::NetworkStateSnapshot {
                 reachability: Reachability::Reachable,
                 instances: None,
                 samples: Vec::new(),
+                lease_ms: None,
             });
     }
     network

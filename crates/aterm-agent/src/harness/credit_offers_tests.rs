@@ -394,7 +394,7 @@ fn the_claim_task_is_one_guarded_string() {
     ] {
         assert!(task.contains(guard), "{guard}: {task}");
     }
-    // A BROWSER NOT CONNECTED YET IS WAITED FOR, never a stop (the owner, 2026-11-04: a worker
+    // A BROWSER NOT CONNECTED YET IS WAITED FOR, never a stop (a worker
     // that stopped because the Chrome tools were missing was the blocking message to end).
     assert!(
         !task.contains("Chrome tools are not available"),

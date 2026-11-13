@@ -1275,6 +1275,28 @@ fn the_cluster_layout_is_read_from_the_device_tree() {
 }
 
 #[test]
+fn three_core_classes_with_shared_l2_sizes_follow_the_device_tree() {
+    let levels = vec![
+        level("Performance", 4, 20),
+        level("Efficiency", 6, 8),
+        level("Super", 2, 20),
+    ];
+    let mut cpus: Vec<_> = (0..12)
+        .map(|id| match id {
+            0..6 => node(id, b'E', 8),
+            6..8 => node(id, b'P', 20),
+            _ => node(id, b'M', 20),
+        })
+        .collect();
+    assert_eq!(
+        machine::dt_assignment(&levels, &cpus, 12),
+        Some(vec![vec![8, 9, 10, 11], vec![0, 1, 2, 3, 4, 5], vec![6, 7]])
+    );
+    cpus[8].kind = Some(b'X');
+    assert_eq!(machine::dt_assignment(&levels, &cpus, 12), None);
+}
+
+#[test]
 fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     let (levels, cpus) = m5();
     let read = machine::layout_of(&levels, &cpus, 10);
@@ -1895,7 +1917,13 @@ fn nvml_reads_the_nvidia_card_on_this_host() {
         return;
     }
     let first = Instant::now();
-    let card = crate::nvml::card(&slot);
+    let card = loop {
+        let c = crate::nvml::card(&slot);
+        if c.busy != Err(Why::NotRead) || first.elapsed() >= aterm_spec::wait::MUST_HAPPEN {
+            break c;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
     let first = first.elapsed();
     let again = Instant::now();
     let card2 = crate::nvml::card(&slot);
@@ -1959,6 +1987,57 @@ fn the_root_volume_reads_on_this_host() {
 }
 
 #[test]
+fn nvml_one_shot_initialises_on_its_own_thread_without_blocking_the_caller() {
+    static SHOT: crate::nvml::OneShot<String> = crate::nvml::OneShot::new();
+    static ENTERED: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
+    static RELEASE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    fn blocking_init() -> Result<String, Why> {
+        let (lock, cvar) = &ENTERED;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+        let (rlock, rcvar) = &RELEASE;
+        let mut go = rlock.lock().unwrap();
+        while !*go {
+            go = rcvar.wait(go).unwrap();
+        }
+        Ok(std::thread::current().name().unwrap_or_default().to_owned())
+    }
+
+    assert_eq!(SHOT.get(blocking_init), Err(Why::NotRead));
+    {
+        let (lock, cvar) = &ENTERED;
+        let mut entered = lock.lock().unwrap();
+        while !*entered {
+            entered = cvar.wait(entered).unwrap();
+        }
+    }
+    assert_eq!(
+        SHOT.get(blocking_init),
+        Err(Why::NotRead),
+        "CONTROL: caller returns NotRead without blocking while the init thread is parked"
+    );
+    {
+        let (rlock, rcvar) = &RELEASE;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+    }
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let thread_name = loop {
+        match SHOT.get(blocking_init) {
+            Ok(name) => break name.as_str(),
+            Err(Why::NotRead) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(why) => panic!("expected Ok after release, got {why:?}"),
+        }
+    };
+    assert_eq!(thread_name, "aterm-nvml");
+}
+
+#[test]
 fn a_quiet_guard_cannot_leave_its_thread() {
     trait OnItsThread<A> {}
     impl<T> OnItsThread<()> for T {}
@@ -1997,9 +2076,11 @@ fn only_the_machines_own_links_count_toward_its_traffic() {
     for name in ["docker0", "veth12ab", "br-1f2e", "tun0", "wg0", "lo"] {
         assert!(!counts_toward_machine(&link(name, Some(false))), "{name}");
     }
-    assert!(
-        !counts_toward_machine(&link("bridge0", Some(true))),
-        "a prefix outranks a device"
+    // On Windows a link's name is the alias a person gave it, so no prefix is asked of it.
+    assert_eq!(
+        counts_toward_machine(&link("bridge0", Some(true))),
+        cfg!(windows),
+        "a prefix outranks a device where names are the kernel's"
     );
     let mut loopback = link("en9", None);
     loopback.loopback = true;
@@ -2466,15 +2547,28 @@ fn is_os_build(text: &str) -> bool {
 }
 
 /// The OS build reads on macOS, spelled as a build (the release's build-inputs seal holds an
-/// update by it), and nowhere else. CONTROL: the product version (`26.1`) is no build.
+/// update by it), on Windows as its build number and update revision (`26200.7171`), and
+/// nowhere else. CONTROL: the product version (`26.1`) is no build.
 #[test]
-fn the_os_build_reads_on_macos_and_nowhere_else() {
+fn the_os_build_reads_on_macos_and_windows_and_nowhere_else() {
     #[cfg(target_os = "macos")]
     {
         let build = os_build().expect("kern.osversion reads on macOS");
         assert!(is_os_build(&build), "{build:?}");
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let build = os_build().expect("CurrentBuildNumber reads on Windows");
+        assert!(
+            build.split('.').count() <= 2
+                && build
+                    .split('.')
+                    .all(|part| crate::parse_uint::<u32>(part).is_some()),
+            "{build:?}"
+        );
+        assert!(!is_os_build(&build), "{build:?} is not spelled as Apple's");
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     assert_eq!(os_build(), None);
     for build in ["25B78", "25A5279m", "9L31a"] {
         assert!(is_os_build(build), "{build}");

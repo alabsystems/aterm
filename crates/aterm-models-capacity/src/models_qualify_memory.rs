@@ -52,8 +52,10 @@ pub fn qualify_memory_model() -> Model {
             // measured concurrent corner so both live scheduling paths remain non-vacuous.
             scenario SliceBudget = 5200, Parent = 5600,
                 NativeLink = 5200, CompatLink = 2900;
-            // The whole-lint claim floor: above the largest retained 24.636-GiB peak, while the
-            // parent and lint together remain inside m3's 75.8-GiB release bound.
+            // A whole-lint claim as m3 measures it (a retained peak near 23.3 GiB and a fifth
+            // more), while the parent and lint together remain inside m3's 75.8-GiB release
+            // bound. The claim is the verifier's measurement on each machine, not a constant;
+            // one never measured queues to run alone, the `WholeLintQueues` path.
             const WholeLint = 2800;
             const TreeDriver = 200;
             const TreeUnit = 200;

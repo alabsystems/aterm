@@ -62,7 +62,7 @@ fn reading(i: u64) -> Sample {
             app: (8 << 30) + wobble * 65_537,
             wired: (3 << 30) + wobble * 4_093,
             free: 12 << 30,
-            pressure: if wobble % 3 == 0 {
+            pressure: if wobble.is_multiple_of(3) {
                 Pressure::Warn
             } else {
                 Pressure::Normal

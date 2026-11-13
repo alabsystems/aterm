@@ -39,11 +39,13 @@ dev-seams = []
 #   no font is configured, and Noto Sans Symbols 2 + Noto Sans Math (~1.6MB,
 #   OFL-1.1) join the symbol tier ahead of the system faces; the embedded DejaVu
 #   Sans Mono leads the broad fallback tier. On WINDOWS the default primary is
-#   Iosevka Term Semibold instead (a ~2.3MB subset of Iosevka Term 34.9.0's
-#   SemiBold/ExtraBold faces and their italics, without calt ligatures, OFL-1.1,
-#   compiled in on Windows only), with Cascadia Mono PL 2407.24 (static
-#   Regular/Bold/Italic/BoldItalic, ~2.4MB, OFL-1.1, Windows only) and JetBrains
-#   Mono still compiled in there and selectable by name. See `src/bundled.rs` and
+#   Iosevka Term NL instead (the Regular set below with its calt feature taken
+#   out by the build script, `src/no_ligatures.rs`, a second ~2.3MB copy compiled
+#   in on Windows only), with Iosevka Term Semibold (the default before it: a
+#   ~2.3MB subset of Iosevka Term 34.9.0's SemiBold/ExtraBold faces and their
+#   italics, without calt ligatures, OFL-1.1, Windows only), Cascadia Mono PL
+#   2407.24 (static Regular/Bold/Italic/BoldItalic, ~2.4MB, OFL-1.1, Windows
+#   only) and JetBrains Mono compiled in there and selectable by name. See `src/bundled.rs` and
 #   assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS targets only: the macOS
 #   default stays SF Mono + CoreText system coverage, and a universal binary would
 #   carry the ~2.8MB twice for faces it never selects. The one exception is
@@ -91,6 +93,17 @@ aterm-spec-anchor = { workspace = true }
 # keeps the capability out of spawned children.
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# AppKit's font bridge (UIFoundation's NSCTFont), loaded before src/lib.rs's
+# `macos_coretext` makes its first Core Text font or descriptor: Core Text keeps
+# an object made before the bridge exists as a __NSCFType, and NSFont raises on it.
+aterm-macos-ui = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The font-bridge test asks, in a fresh process and under exception containment,
+# whether a Core Text font is an NSFont and NSFont for the system font.
+aterm-objc = { workspace = true }
+
 [target.'cfg(any(all(unix, not(target_os = "macos")), windows))'.dependencies]
 # NATIVE CRISPNESS (see src/hinted.rs): grid-fitted glyph outlines for the two
 # native raster paths that are NOT CoreText — Linux (W13) and Windows. The
@@ -110,6 +123,8 @@ libc = { workspace = true }
 aterm-font = { workspace = true, features = ["hint"] }
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 aterm-bench = { path = "../aterm-bench" }
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }

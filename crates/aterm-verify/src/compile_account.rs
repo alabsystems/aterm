@@ -287,16 +287,19 @@ pub fn span_events(call: &str, spans: &[crate::memory::UnitSpan]) -> Vec<String>
         .map(|s| {
             format!(
                 "verify-event: {}",
-                aterm_json::json!({
-                    "schema": 1, "event": "compile-unit-timed", "call": call,
-                    "package": s.unit.package, "unit": s.unit.kind,
-                    "codegen_requested": s.codegen_requested,
-                    "queued_at_unix_ms": s.queued_at_unix_ms,
-                    "started_at_unix_ms": s.started_at_unix_ms,
-                    "ended_at_unix_ms": s.ended_at_unix_ms,
-                    "cpu_s": s.cpu_s, "peak_bytes": s.peak_bytes,
-                    "read_every_ms": crate::exec::READ_USAGE_EVERY.as_millis(),
-                })
+                crate::event_log::event_value(
+                    crate::event_log::EventKind::CompileUnitTimed,
+                    aterm_json::json!({
+                          "call": call,
+                        "package": s.unit.package, "unit": s.unit.kind,
+                        "codegen_requested": s.codegen_requested,
+                        "queued_at_unix_ms": s.queued_at_unix_ms,
+                        "started_at_unix_ms": s.started_at_unix_ms,
+                        "ended_at_unix_ms": s.ended_at_unix_ms,
+                        "cpu_s": s.cpu_s, "peak_bytes": s.peak_bytes,
+                        "read_every_ms": crate::exec::READ_USAGE_EVERY.as_millis(),
+                    })
+                )
             )
         })
         .collect()
@@ -391,23 +394,26 @@ impl Account {
         };
         format!(
             "verify-event: {}",
-            aterm_json::json!({
-                "schema": 1, "event": "compile-finished", "step": self.step, "call": self.call,
-                "units": self.units.map(|u| aterm_json::json!({
-                    "fresh": u.fresh, "compiled": u.compiled, "unknown": u.unknown,
-                })),
-                "cpu_s": secs(|u| u.cpu),
-                "starved_s": secs(|u| u.starved),
-                "waited_s": secs(|u| u.waited),
-                "wall_s": self.wall.as_secs_f64(),
-                "peak_bytes": self.usage.map(|u| u.peak_bytes),
-                "output_bytes": self.output_bytes,
-                "compilers": self.overlap.map(|o| aterm_json::json!({
-                    "timed": o.timed, "avg": o.avg, "p95": o.p95, "max": o.max,
-                    "waiting_avg": o.waiting_avg, "waiting_max": o.waiting_max,
-                    "waited_s": o.waited_s,
-                })),
-            })
+            crate::event_log::event_value(
+                crate::event_log::EventKind::CompileFinished,
+                aterm_json::json!({
+                      "step": self.step, "call": self.call,
+                    "units": self.units.map(|u| aterm_json::json!({
+                        "fresh": u.fresh, "compiled": u.compiled, "unknown": u.unknown,
+                    })),
+                    "cpu_s": secs(|u| u.cpu),
+                    "starved_s": secs(|u| u.starved),
+                    "waited_s": secs(|u| u.waited),
+                    "wall_s": self.wall.as_secs_f64(),
+                    "peak_bytes": self.usage.map(|u| u.peak_bytes),
+                    "output_bytes": self.output_bytes,
+                    "compilers": self.overlap.map(|o| aterm_json::json!({
+                        "timed": o.timed, "avg": o.avg, "p95": o.p95, "max": o.max,
+                        "waiting_avg": o.waiting_avg, "waiting_max": o.waiting_max,
+                        "waited_s": o.waited_s,
+                    })),
+                })
+            )
         )
     }
 }

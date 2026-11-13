@@ -621,8 +621,13 @@ fn inside_aterm_managed_git_and_gh_lead_ahead_of_clt_stubs_and_outside_stay_behi
     write_executable(
         &git_build.join("bin/git"),
         "#!/bin/sh\n\
-         __atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
-         __atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
+         case $0 in\n\
+           */*) __atpkg_bin_dir=${0%/*} ;;\n\
+           *) __atpkg_bin_dir=. ;;\n\
+         esac\n\
+         __atpkg_bin_dir=$(CDPATH='' cd -P -- \"${__atpkg_bin_dir:-/}\" && pwd -P) || exit 1\n\
+         __atpkg_root=${__atpkg_bin_dir%/*}\n\
+         __atpkg_root=${__atpkg_root:-/}\n\
          export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
          if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
            export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\

@@ -123,6 +123,7 @@ fn run(ctx: &Ctx, prepare: Option<fn(&Ctx) -> Option<PreparedRun>>) -> (i32, Str
         Seams {
             stage: native,
             prepare_cells: prepare,
+            prepare_build_dir: |_| Ok(()),
             ..crate::LIVE
         },
     )
@@ -291,6 +292,7 @@ fn preparation_admission_refusal_defers_cells_but_other_checks_still_run() {
             Seams {
                 stage: native,
                 prepare_cells: Some(captured),
+                prepare_build_dir: |_| Ok(()),
                 admit_memory: refuse,
                 ..crate::LIVE
             },

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    Access, AccessOutcome, MacosDialog, Selection, Setting, Standing, Subject,
+    Access, AccessOutcome, MacosDialog, Observation, Selection, Setting, Standing, Subject,
 };
 
 use crate::status_item::SystemStateLine;
@@ -182,12 +182,14 @@ pub(crate) struct AccessSteps {
     pane_act: Option<(Access, Instant)>,
     /// Until when a pane aterm opened for one of those rows counts as up.
     pane_until: Option<Instant>,
-    /// A verified Full Disk Access grant reads off (§3.6): the menu line names it,
-    /// unless the approved revision's Full Disk Access step is declined
-    /// ([`App::fda_declined_in_revision`]).
+    /// A verified Full Disk Access grant reads off (§3.6): its row is read again
+    /// ([`App::note_fda_regression`]), and while that reading says it needs the person the menu
+    /// line's note can say an update left it off, unless the approved revision's Full Disk
+    /// Access step is declined ([`App::fda_declined_in_revision`]).
     fda_regressed: bool,
     /// The regressed grant reads off in a build newer than the one that verified it
-    /// ([`App::note_fda_off_after_update`]): the menu line says the update needs it re-allowed.
+    /// ([`App::note_fda_off_after_update`]): a menu line that names it says the update needs it
+    /// re-allowed.
     fda_after_update: bool,
     /// Whether the window's own Full Disk Access step is declined under the
     /// marker key it was read for (the approved revision's): read once per key,
@@ -284,7 +286,7 @@ impl AccessSteps {
         self.reach = reach;
     }
 
-    /// Whether the menu line names a regressed Full Disk Access grant (tests).
+    /// Whether a verified Full Disk Access grant reads off (tests).
     #[cfg(test)]
     pub(crate) const fn fda_regressed(&self) -> bool {
         self.fda_regressed
@@ -295,77 +297,260 @@ impl AccessSteps {
     }
 }
 
-/// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
-/// published (its progress record and its prompt-free readings), so a `status` costs no probe.
-/// `pending:<row,...>` names each managed row that needs a person, waits, failed or
-/// still differs without a recorded personal change; `unknown:<row,...>` names rows with no
-/// usable reading, separately after `;unknown:` while known work is pending. Then `;needs:<row,...>`
-/// for those of them that wait on a person's press (their reading is Needs you), so a reader
-/// tells a press from a wait without the page; `done` once System State's current headline
-/// says this Mac is set up ([`crate::system_state::Headline::set_up`]), including before its run finished,
-/// nothing left for anyone to do now; then `;asking:<row,...>` names each stage the run's last
-/// pass parked to ask again by itself (an ALab vault that did not answer or is absent off the
-/// ALab LAN, `vault`; a step an engine put off), so `done` is never read as a finished record;
-/// `pending` while a run goes with none read; `-` before the worker said anything (no setup in
-/// this process). Grants still on offer remain named as pending personal steps
-/// ([`crate::system_state::offered_access`]); their stage record alone claims no grant.
-pub(crate) fn setup_field(status: &SetupStatus) -> String {
+/// Whether the private rows' readings this process holds stand as published: nothing is under
+/// way that could change one (a pass busy, a change, a queued run, a stage running that sets a
+/// row read privately, [`Subject::reads_privately`]). While one is, no private row is verified
+/// and none is said read back ([`row_said`]).
+fn readings_hold(status: &SetupStatus) -> bool {
+    !status.changing
+        && !status.busy
+        && !status.queued
+        && !status
+            .running
+            .iter()
+            .any(|setting| Subject::Setting(*setting).reads_privately())
+}
+
+/// What `setup=` ([`setup_field`]) and `rows=` ([`background_setup_fields`]) say of one managed
+/// row: the one classification both are built from, so the two never say two things of one
+/// reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSaid {
+    /// A grant on offer ([`Observation::on_offer`]): neither done nor a person's step, and it
+    /// holds nothing back: offered, never waited on.
+    Offered,
+    /// No usable reading stands behind it and none is under way: a read an ordinary refresh
+    /// withheld, one that ran and said nothing ([`Observation::read_nothing`]), or a private
+    /// row's settled reading with no date (or more than one) while readings hold. Neither done
+    /// nor a wait.
+    Unread,
+    /// A step left: a read still to come, a press (`needs`), a wait, a failure, or a value that
+    /// differs with no record that it changed since aterm set it.
+    Left { needs: bool },
+    /// Read as wanted, or changed since aterm set it, which setup leaves as it is (design
+    /// §6.6). `verified` is when a private row's one reading read it back settled
+    /// ([`Observation::read_back_settled`]), while readings hold ([`readings_hold`]);
+    /// `stands` whether that reading stands at the time asked ([`Observation::current_at`]),
+    /// always for a row nothing reads privately.
+    Settled { verified: Option<u64>, stands: bool },
+    /// Asked, and nothing answered ([`Standing::Asking`]): aterm asks again by itself. Neither
+    /// done nor a step left, and nothing waits on it.
+    Asking,
+}
+
+impl RowSaid {
+    /// The row's word in `rows=`: its standing ([`Standing::word`], `unknown` before any
+    /// reading), save `unread` and `offered`, which say what its standing alone does not.
+    fn word(self, standing: Option<Standing>) -> &'static str {
+        match self {
+            Self::Offered => "offered",
+            Self::Unread => "unread",
+            Self::Left { .. } | Self::Settled { .. } | Self::Asking => {
+                standing.unwrap_or(Standing::Unknown).word()
+            }
+        }
+    }
+}
+
+/// What `setup=` and `rows=` say of `row` at `now` (Unix seconds) ([`RowSaid`]).
+fn row_said(
+    status: &SetupStatus,
+    row: &crate::system_state::RowView,
+    now: u64,
+    hold: bool,
+) -> RowSaid {
+    let mut readings = status
+        .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+        .filter(|seen| seen.subject == row.subject);
+    let first = readings.next();
+    let one = first.filter(|_| readings.next().is_none());
+    if first.is_some_and(Observation::on_offer) {
+        return RowSaid::Offered;
+    }
+    if row.standing == Some(Standing::Unknown)
+        && (row.note.is_some()
+            || first.is_some_and(|seen| seen.is_withheld() || seen.read_nothing()))
+    {
+        return RowSaid::Unread;
+    }
+    let left = match row.standing {
+        None
+        | Some(Standing::Unknown | Standing::NeedsYou | Standing::Waiting | Standing::Failed) => {
+            true
+        }
+        // The kept record (a key changed since aterm set it and read it back, design §6.6)
+        // settles a row that differs: setup leaves it as it is. A finished stage alone says
+        // nothing about why a current reading differs.
+        Some(Standing::Differs) => !row.changed_since,
+        _ => false,
+    };
+    if left {
+        return RowSaid::Left {
+            needs: row.standing == Some(Standing::NeedsYou),
+        };
+    }
+    if row.standing == Some(Standing::Asking) {
+        return RowSaid::Asking;
+    }
+    if !row.subject.reads_privately() {
+        return RowSaid::Settled {
+            verified: None,
+            stands: true,
+        };
+    }
+    // A settled reading of another app's data stands for the row now only while it is young:
+    // nothing in the background reads it again (§3.5). Past that it is what the row was when
+    // last read, which verifies it only while nothing that could change it is under way; with
+    // no date (or two readings) it is no reading of any time.
+    let verified = one
+        .filter(|seen| hold && seen.read_back_settled())
+        .and_then(Observation::read_at);
+    let stands = one.is_some_and(|seen| seen.current_at(now));
+    if hold && !stands && verified.is_none() {
+        return RowSaid::Unread;
+    }
+    RowSaid::Settled { verified, stands }
+}
+
+/// One managed row as `setup=` and `rows=` say it ([`rows_said`]).
+#[derive(Clone, Copy)]
+struct SaidRow {
+    subject: Subject,
+    standing: Option<Standing>,
+    changed_since: bool,
+    said: RowSaid,
+}
+
+/// `status`'s rows, and each managed row of its plan with what is said of it at `now`, in page
+/// order ([`row_said`]).
+fn rows_said(status: &SetupStatus, now: u64) -> (Vec<crate::system_state::RowView>, Vec<SaidRow>) {
     let selection = status
         .plan
         .as_ref()
         .map_or_else(Selection::none, |plan| plan.selection);
     let rows = crate::system_state::rows(status, selection);
-    setup_field_with_rows(status, selection, &rows)
+    let hold = readings_hold(status);
+    let said = rows
+        .iter()
+        .filter(|row| row.managed)
+        .map(|row| SaidRow {
+            subject: row.subject,
+            standing: row.standing,
+            changed_since: row.changed_since,
+            said: row_said(status, row, now, hold),
+        })
+        .collect();
+    (rows, said)
 }
 
-fn setup_field_with_rows(
+/// `status`'s `setup=` at `now` (Unix seconds; pure): where this Mac's setup stands, from the last
+/// status the worker published (its progress record and its prompt-free readings), so a
+/// `status` costs no probe (design §3.5). It leads with one head, then the tails that apply, each
+/// a comma-separated list of rows in their words ([`Subject::setup_word`]: `fda`, `dock`, `vault`,
+/// …), each row said as [`row_said`] classifies it:
+///
+/// - `pending:<rows>`: each managed row with a step left (a read still to come, a press, a wait,
+///   a failure, a value that differs with no record that it changed since aterm set it); then
+///   `;needs:<rows>`
+///   for those of them that wait on a person's press (their reading is Needs you), so a reader
+///   tells a press from a wait without the page.
+/// - `pending` while a pass is under way (a change, a queued pass, a stage running; where it could
+///   move a private row nothing is verified, [`readings_hold`]), or the headline says no more (a step that failed, one tried again, one not
+///   confirmed), with no row to name; `-` before the worker said anything (no setup in this
+///   process).
+/// - `done` once System State's current headline says this Mac is set up
+///   ([`crate::system_state::Headline::set_up`]), including before its run finished, nothing is
+///   left for anyone to do now, and every managed row read privately ([`Subject::reads_privately`]:
+///   another app's data, read only while System State is in front with a person) has a reading
+///   that stands at `now` ([`Observation::current_at`]).
+/// - `read-back:<rows>` where everything else is as for `done`, and these private rows were
+///   read back settled ([`Observation::read_back_settled`]) longer ago than a reading stands
+///   ([`aterm_types::macos_setup::READING_STANDS_SECS`]) and nothing read them since: set up as
+///   last read (or, named `;changed:` too, changed since aterm set it as last read), which a
+///   reader tells with that reading's age (`verified_at`, [`background_setup_fields`]), never as
+///   in place now. Each is verified there: one classification decides both.
+/// - `unread:<rows>` where every other row is settled and no usable reading stands behind these
+///   ([`RowSaid::Unread`]: a withheld read, a read that said nothing, a private reading with no
+///   date). They are neither pending nor done, and nothing waits on them.
+/// - `asking:<rows>` where every other row is settled and these were asked and not answered
+///   ([`RowSaid::Asking`], [`Standing::Asking`]: the ALab vault off its LAN), which aterm asks
+///   again by itself ([`crate::system_state::Headline::asking`]). Neither done nor pending:
+///   nothing is left for anyone to do, and no answer may come. Its tails are `done`'s, with
+///   `;read-back:`, and its `;asking:` names only stages whose rows the head does not.
+///
+/// Tails: `;unread:<rows>` and `;read-back:<rows>` name those rows after a head that does not;
+/// after `done`, `read-back:` or `unread:`, `;asking:<rows>` names each stage the run's last pass
+/// parked to ask again by itself (an ALab vault that answered none is there, `vault`; a step an
+/// engine put off), so `done` is never read as a finished record,
+/// `;at-login:<rows>` the rows set for macOS to take up in full at the next login, and
+/// `;changed:<rows>` the rows that changed since aterm set them and read them back, which setup
+/// leaves as they are and never says in place, nor whose change it is, which nothing tells
+/// (design §6.6); after any head, `;offered:<rows>` names each grant
+/// on offer ([`Observation::on_offer`]), which is neither done nor a person's step and holds
+/// nothing back: offered, never waited on.
+pub(crate) fn setup_field(status: &SetupStatus, now: u64) -> String {
+    let (rows, said) = rows_said(status, now);
+    setup_field_of(status, &rows, &said)
+}
+
+fn setup_field_of(
     status: &SetupStatus,
-    selection: Selection,
     rows: &[crate::system_state::RowView],
+    said: &[SaidRow],
 ) -> String {
+    let selection = status
+        .plan
+        .as_ref()
+        .map_or_else(Selection::none, |plan| plan.selection);
+    let headline = status
+        .plan
+        .as_ref()
+        .map(|plan| crate::system_state::headline(status, rows, Some(plan)));
     let mut pending: Vec<&str> = Vec::new();
     let mut needs: Vec<&str> = Vec::new();
-    let mut unknown: Vec<&str> = Vec::new();
-    let offered_access: Vec<_> = crate::system_state::offered_access(status)
-        .into_iter()
-        .filter(|access| crate::system_state::manages(selection, Subject::Access(*access)))
-        .collect();
-    for access in &offered_access {
-        let word = Subject::Access(*access).status_word();
-        if !pending.contains(&word) {
-            pending.push(word);
-            needs.push(word);
+    let mut unread: Vec<&str> = Vec::new();
+    let mut read_back: Vec<&str> = Vec::new();
+    let mut at_login: Vec<&str> = Vec::new();
+    let mut changed: Vec<&str> = Vec::new();
+    let mut offered: Vec<&str> = Vec::new();
+    let mut asked: Vec<&str> = Vec::new();
+    let add = |list: &mut Vec<&'static str>, word: &'static str| {
+        if !list.contains(&word) {
+            list.push(word);
         }
-    }
-    for row in rows.iter().filter(|row| row.managed) {
-        let word = row.subject.status_word();
-        if matches!(row.standing, None | Some(Standing::Unknown)) {
-            if !pending.contains(&word) && !unknown.contains(&word) {
-                unknown.push(word);
+    };
+    for row in said {
+        let word = row.subject.setup_word();
+        match row.said {
+            RowSaid::Offered => add(&mut offered, word),
+            RowSaid::Unread => add(&mut unread, word),
+            RowSaid::Asking => add(&mut asked, word),
+            RowSaid::Left { needs: press } => {
+                add(&mut pending, word);
+                if press {
+                    add(&mut needs, word);
+                }
             }
-            continue;
-        }
-        let left = match row.standing {
-            Some(Standing::NeedsYou | Standing::Waiting | Standing::Failed) => true,
-            // The probe's personal-change record is evidence of a choice; a finished stage
-            // alone says nothing about why a current reading differs.
-            Some(Standing::Differs) => !row.changed_by_you,
-            _ => false,
-        };
-        if left {
-            if !pending.contains(&word) {
-                pending.push(word);
-            }
-            if row.standing == Some(Standing::NeedsYou) && !needs.contains(&word) {
-                needs.push(word);
+            RowSaid::Settled { verified, stands } => {
+                if row.standing == Some(Standing::AtLogin) {
+                    add(&mut at_login, word);
+                }
+                if row.changed_since {
+                    add(&mut changed, word);
+                }
+                if !stands && verified.is_some() {
+                    add(&mut read_back, word);
+                }
             }
         }
     }
     // What the page says: a run going, a step that waits or failed, or a row not read yet keeps
     // its headline off set up.
-    let set_up = || {
-        status.plan.as_ref().is_some_and(|plan| {
-            let headline = crate::system_state::headline(status, rows, Some(plan));
+    let set_up = status
+        .plan
+        .as_ref()
+        .zip(headline.as_ref())
+        .is_some_and(|(plan, headline)| {
             headline.set_up
                 // A completed explicit opt-out has no managed work to prove. Keep the
                 // readable idle terminal case without reviving finished-only success.
@@ -376,119 +561,159 @@ fn setup_field_with_rows(
                     && !status.queued
                     && status.running.is_empty()
                     && headline.left_as_is)
+        });
+    // The stages the run's last pass parked to ask again by itself, in the rows' words: a
+    // vault nobody answered (`unreached`) or that answered none is there (`absent`), a person's
+    // wait (`waiting`), a step put off.
+    let mut asking: Vec<&str> = Vec::new();
+    for stage in status
+        .rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.status.as_str(),
+                "waiting" | "unreached" | "absent" | "deferred"
+            )
         })
-    };
-    let offered = || {
-        if offered_access.is_empty() {
+        .filter_map(|row| aterm_types::macos_setup::StageRow::named(&row.name))
+    {
+        for setting in stage.settings.iter().filter(|s| selection.contains(**s)) {
+            add(&mut asking, Subject::Setting(*setting).setup_word());
+        }
+    }
+    let tail = |key: &str, words: &[&str]| {
+        if words.is_empty() {
             String::new()
         } else {
-            let words: Vec<&str> = offered_access
-                .iter()
-                .map(|access| Subject::Access(*access).status_word())
-                .collect();
-            format!(";offered:{}", words.join(","))
+            format!(";{key}:{}", words.join(","))
         }
     };
-    let active = status.busy || status.changing || status.queued || !status.running.is_empty();
-    if !pending.is_empty() || (active && !unknown.is_empty()) {
-        let pending = if pending.is_empty() {
-            "pending".to_owned()
-        } else {
-            format!("pending:{}", pending.join(","))
-        };
-        let needs = if needs.is_empty() {
-            String::new()
-        } else {
-            format!(";needs:{}", needs.join(","))
-        };
-        let unknown = if unknown.is_empty() {
-            String::new()
-        } else {
-            format!(";unknown:{}", unknown.join(","))
-        };
-        format!("{pending}{needs}{unknown}")
-    } else if !unknown.is_empty() {
-        format!("unknown:{}", unknown.join(","))
-    } else if set_up() {
-        // The stages the run's last pass parked to ask again by itself, in the rows' words: a
-        // vault nobody answered (`unreached`) or none here (`waiting`), a step put off.
-        let mut asking: Vec<&str> = Vec::new();
-        for stage in status
-            .rows
+    let offered = tail("offered", &offered);
+    let settled_tails = || {
+        format!(
+            "{}{}{}{offered}",
+            tail("asking", &asking),
+            tail("at-login", &at_login),
+            tail("changed", &changed),
+        )
+    };
+    // What the headline names as asked again by itself, every other row settled.
+    let asked_alone = headline
+        .as_ref()
+        .is_some_and(|headline| !headline.asking.is_empty());
+    if !pending.is_empty() {
+        format!(
+            "pending:{}{}{}{}{offered}",
+            pending.join(","),
+            tail("needs", &needs),
+            tail("unread", &unread),
+            tail("read-back", &read_back),
+        )
+    } else if status.busy || status.changing || status.queued || !status.running.is_empty() {
+        // A pass is under way, so not every other row is settled: what it reads next decides.
+        // Where it could move a private row ([`readings_hold`]) nothing is verified, so nothing
+        // is said read back.
+        format!(
+            "pending{}{}{offered}",
+            tail("unread", &unread),
+            tail("read-back", &read_back),
+        )
+    } else if asked_alone && !asked.is_empty() && unread.is_empty() {
+        // A row the head names is not said again in the stages' tail.
+        let parked: Vec<&str> = asking
             .iter()
-            .filter(|row| matches!(row.status.as_str(), "waiting" | "unreached" | "deferred"))
-            .filter_map(|row| aterm_types::macos_setup::StageRow::named(&row.name))
-        {
-            for setting in stage.settings.iter().filter(|s| selection.contains(**s)) {
-                let word = Subject::Setting(*setting).status_word();
-                if !asking.contains(&word) {
-                    asking.push(word);
-                }
-            }
-        }
-        let asking = if asking.is_empty() {
-            String::new()
-        } else {
-            format!(";asking:{}", asking.join(","))
-        };
-        format!("done{asking}{}", offered())
+            .copied()
+            .filter(|word| !asked.contains(word))
+            .collect();
+        format!(
+            "asking:{}{}{}{}{}{offered}",
+            asked.join(","),
+            tail("read-back", &read_back),
+            tail("asking", &parked),
+            tail("at-login", &at_login),
+            tail("changed", &changed),
+        )
+    } else if set_up && unread.is_empty() && read_back.is_empty() {
+        format!("done{}", settled_tails())
+    } else if set_up && unread.is_empty() {
+        format!("read-back:{}{}", read_back.join(","), settled_tails())
+    } else if !unread.is_empty()
+        && (set_up
+            || headline
+                .as_ref()
+                .is_some_and(|headline| !headline.unread.is_empty()))
+    {
+        format!(
+            "unread:{}{}{}",
+            unread.join(","),
+            tail("read-back", &read_back),
+            settled_tails()
+        )
     } else if status.plan.is_some() || status.run.is_some() {
-        "pending".to_owned()
+        format!(
+            "pending{}{}{offered}",
+            tail("unread", &unread),
+            tail("read-back", &read_back),
+        )
     } else {
         "-".to_owned()
     }
 }
 
-/// The background check's coherent cached evidence. A finished plan or a held group alone
-/// verifies no private value; only current native readings cover a requested preference.
-/// `caps_live` separately describes reported OS/HID mappings for service cohorts, not a
-/// physical key-press test or saved Caps readiness; it never contributes a verified bit.
-/// Lifecycle fields describe this cached publication, with pending window intent contributing
-/// only to `busy`. A finished run may have stopped or left work; it proves no readiness.
-pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool) -> String {
-    let selection = status
-        .plan
-        .as_ref()
-        .map_or_else(Selection::none, |plan| plan.selection);
-    let rows = crate::system_state::rows(status, selection);
+/// The background check's coherent cached evidence at `now` (Unix seconds): `setup=…
+/// verified=<bits> verified_at=<unix secs|-> observed_generation=<n> rows=<word:said,…|->
+/// caps_live=<mapping> busy=<0|1> finished=<0|1> queued=<0|1> changing=<0|1> retrying=<0|1>
+/// running=<words|->`, the reply `setup status` carries under
+/// [`aterm_types::macos_setup::SETUP_STATUS_SCHEMA`], every readiness part from one
+/// classification of each managed row ([`row_said`]). `setup=` is [`setup_field`]'s. `verified`
+/// is each selected row read privately ([`Subject::reads_privately`]: the Mac settings, the
+/// sign-outs' account state and Spotlight) whose one reading this process holds reads it
+/// settled, whatever its age ([`Observation::read_back_settled`]: in place, not needed, set for
+/// the next login, or changed since aterm set it, which `setup=` names `;changed:`), and
+/// `verified_at` when the oldest of those was read (`-` with none); a finished plan or a held
+/// group alone verifies nothing, nor does anything while a change that could move one is under
+/// way ([`readings_hold`]). `observed_generation` counts the readings published, not time.
+/// `rows=` names each managed row with its standing word ([`Standing::word`], `unknown` before
+/// any reading), `unread` for one no usable reading stands behind and `offered` for a grant on
+/// offer ([`RowSaid::word`]), never a note or a value. A reader judges a reading's age at its
+/// own clock and says it, so evidence past its standing is said as last read, never as current.
+///
+/// `caps_live` separately describes reported OS/HID mappings for service cohorts, not a physical
+/// key-press test or saved Caps readiness; it never contributes a verified bit. The lifecycle
+/// fields describe this cached publication, with pending window intent (`window_pending`)
+/// contributing only to `busy`; `finished` says the last run ended, which proves no readiness.
+pub(crate) fn background_setup_fields(
+    status: &SetupStatus,
+    now: u64,
+    window_pending: bool,
+) -> String {
+    let (rows, said) = rows_said(status, now);
     let mut verified = Selection::none();
-    if let Some(plan) = status.plan.as_ref()
-        && !status.changing
-        && !status.busy
-        && !status.queued
-        && !status
-            .running
-            .iter()
-            .any(|setting| setting.is_workstation())
-    {
-        for setting in Setting::ALL
-            .into_iter()
-            .filter(|setting| setting.is_workstation() && plan.selection.contains(*setting))
+    let mut oldest: Option<u64> = None;
+    for row in &said {
+        if let (
+            Subject::Setting(setting),
+            RowSaid::Settled {
+                verified: Some(at), ..
+            },
+        ) = (row.subject, row.said)
         {
-            let mut rows = status
-                .observations_for(Some(&plan.vault_url))
-                .filter(|row| row.subject == Subject::Setting(setting));
-            if let Some(row) = rows.next()
-                && rows.next().is_none()
-                && matches!(row.standing, Standing::InPlace | Standing::NotNeeded)
-            {
-                verified.set(setting, true);
-            }
+            verified.set(setting, true);
+            oldest = Some(oldest.map_or(at, |oldest| oldest.min(at)));
         }
     }
-    let cached: Vec<_> = rows
+    let cached: Vec<String> = said
         .iter()
-        .filter(|row| row.managed)
         .map(|row| {
             format!(
                 "{}:{}",
-                row.subject.status_word(),
-                row.standing.map_or("unread", Standing::status_word)
+                row.subject.setup_word(),
+                row.said.word(row.standing)
             )
         })
         .collect();
     let cached = if cached.is_empty() {
-        "-".into()
+        "-".to_owned()
     } else {
         cached.join(",")
     };
@@ -510,7 +735,7 @@ pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool
     let running: Vec<_> = Setting::ALL
         .into_iter()
         .filter(|setting| status.running.contains(setting))
-        .map(|setting| Subject::Setting(setting).status_word())
+        .map(|setting| Subject::Setting(setting).setup_word())
         .collect();
     let running = if running.is_empty() {
         "-".to_owned()
@@ -518,10 +743,12 @@ pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool
         running.join(",")
     };
     format!(
-        "setup={} verified={} observed_generation={} rows={cached} caps_live={caps_live} \
-         busy={} finished={} queued={} changing={} retrying={} running={running}",
-        setup_field_with_rows(status, selection, &rows),
+        "setup={} verified={} verified_at={} observed_generation={} rows={cached} \
+         caps_live={caps_live} busy={} finished={} queued={} changing={} retrying={} \
+         running={running}",
+        setup_field_of(status, &rows, &said),
         verified.bits(),
+        oldest.map_or_else(|| "-".to_owned(), |at| at.to_string()),
         status.observed_generation,
         u8::from(status.busy || window_pending),
         u8::from(status.finished),
@@ -531,8 +758,20 @@ pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool
     )
 }
 
+/// The front door's one-line answer to `setup status` carrying `fields`
+/// ([`background_setup_fields`]) under its schema
+/// ([`aterm_types::macos_setup::SETUP_STATUS_SCHEMA`]).
+pub(crate) fn setup_status_answer(fields: &str) -> String {
+    format!(
+        "OK schema={} {fields}\n",
+        aterm_types::macos_setup::SETUP_STATUS_SCHEMA
+    )
+}
+
 /// The one quiet signal (§3.6, pure): `System State: Needs you: <row>`, from the managed rows
-/// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
+/// that wait for a person, as their readings say: a verified Full Disk Access grant that reads
+/// off is read again ([`App::note_fda_regression`]), and its row's reading says whether it needs
+/// the person, so the line, the page and `setup=` say one thing. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
 /// failed`) once nothing tries it again by itself (§3.5); a Check's result never does, since a
 /// Check only reads and pressing it again is its remedy ([`SetupStatus::failed_steps`]).
@@ -541,7 +780,7 @@ pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool
 /// while it needs you (a waiting vault approval code, or a move to Applications), else the
 /// GitHub repositories row's while it needs you (its token's remedy, in the page's words).
 /// `None` when nothing does.
-pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
+pub(crate) fn menu_line(status: &SetupStatus) -> Option<SystemStateLine> {
     let selection = status
         .plan
         .as_ref()
@@ -555,7 +794,6 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
             })
             .map(|observation| observation.subject)
     };
-    let fda = Subject::Access(Access::FullDiskAccess);
     let repositories = Subject::Setting(Setting::Repositories);
     let tools = status.repositories_tools_wait();
     // Apple's Command Line Tools installing, or a press of Install… waiting for a dialog, is a
@@ -567,8 +805,14 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         .filter(|subject| *subject != repositories || !tools.is_some_and(ToolsWait::calm))
         .filter(|subject| *subject != secrets || !status.joins_quietly())
         .collect();
-    if fda_regressed && !needs.contains(&fda) {
-        needs.push(fda);
+    // Apple's Command Line Tools waiting on the person (their tab's password, Apple's window, or
+    // nothing installing them) need them whatever the repositories row reads: the row may read a
+    // calm wait for Git while the tools it needs are missing.
+    if tools.is_some_and(|wait| !wait.calm())
+        && selection.contains(Setting::Repositories)
+        && !needs.contains(&repositories)
+    {
+        needs.push(repositories);
     }
     needs.dedup();
     // A failure the run still retries by itself is the page's alone (§3.5).
@@ -626,13 +870,16 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
     };
     // Their tab asking for the password or restored, or Apple's installer window, says where the
     // person is needed, as the page does.
-    let note = note_of(Setting::Secrets).or_else(|| {
-        note_of(Setting::Repositories).map(|note| match tools {
-            Some(ToolsWait::Password) => crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned(),
-            Some(ToolsWait::Recovered) => crate::system_state::TOOLS_RECOVERED_HEADLINE.to_owned(),
-            Some(ToolsWait::AppleWindow) => crate::system_state::APPLE_WINDOW_NOTE.to_owned(),
-            _ => note,
-        })
+    let note = note_of(Setting::Secrets).or_else(|| match tools {
+        Some(ToolsWait::Password) => Some(crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned()),
+        Some(ToolsWait::Recovered) => {
+            Some(crate::system_state::TOOLS_RECOVERED_HEADLINE.to_owned())
+        }
+        Some(ToolsWait::AppleWindow) => Some(crate::system_state::APPLE_WINDOW_NOTE.to_owned()),
+        Some(ToolsWait::Missing { .. }) if needs.contains(&repositories) => {
+            Some(crate::system_state::TOOLS_NEEDED_NOTE.to_owned())
+        }
+        _ => note_of(Setting::Repositories),
     });
     Some(SystemStateLine { label, note })
 }
@@ -641,7 +888,9 @@ impl App {
     /// The approved setup revision whose access steps may run: the admitted
     /// plan's revision while the permission gate allows it, else none.
     pub(crate) fn access_revision(&self) -> Option<u64> {
-        self.workstation_setup.access_revision()
+        self.workstation_setup
+            .access_revision()
+            .filter(|_| !self.system_state_host.stopped_access())
     }
 
     /// Whether the latest answer taken here for this approval and row is Not
@@ -686,6 +935,12 @@ impl App {
                 .then_some(OptOut::WhileOff(DEBUGGER_OFF))),
             _ => off,
         })
+    }
+
+    /// Whether the Debugger row is the person's opt-out ([`Self::access_opt_outs`]): aterm's
+    /// privacy steps are off, or they chose developer mode off.
+    pub(crate) fn debugger_opted_out(&self) -> bool {
+        !self.access_steps_allowed() || self.debugger_change.off_is_chosen()
     }
 
     /// Tell the setup worker which Permissions rows the person opted out of
@@ -752,20 +1007,21 @@ impl App {
             .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &key))
     }
 
-    /// Whether System State's row for `access` offers its button: the setup run reads it as
-    /// needing the person.
+    /// Whether System State's row for `access` offers its button: the setup run's last status
+    /// ([`crate::system_state_host::Host::latest_status`]) reads it as needing the
+    /// person under the plan in force, by the row rule (`system_state::row_view`), whether or
+    /// not a System State tab is open to show it. None before the run publishes a plan.
     pub(crate) fn system_state_offers(&self, access: Access) -> bool {
-        self.native_runtime
-            .instance_by_kind(crate::native_app::AppKind::SystemState)
-            .is_some_and(|instance| {
-                matches!(self.native_runtime.app(instance),
-                    Some(crate::native_app::NativeApp::SystemState(state)) if state.can_open_access(access))
-            })
+        let status = self.system_state_host.latest_status();
+        status.plan.as_ref().is_some_and(|plan| {
+            crate::system_state::row_view(Subject::Access(access), status, plan.selection).open
+                == Some(access)
+        })
     }
 
     /// Whether one of the window's own access gestures is up: a hand-over panel (or the
-    /// permission walk between its pages), a folder warm-up walking, an installer terminal, or
-    /// a pane's hold.
+    /// permission walk between its pages), a folder warm-up walking, an installer terminal that
+    /// may still ask, or a pane's hold.
     pub(crate) fn access_gesture_up(&self, now: Instant) -> bool {
         self.devtools_helper.panel().is_some()
             || self.permission_walk.active()
@@ -774,9 +1030,10 @@ impl App {
 
     /// [`Self::access_gesture_up`] leaving out the permission walk and its own panel: a
     /// hand-over panel the walk did not bring up, a folder warm-up walking, an installer
-    /// terminal, or a pane's hold.
+    /// terminal that may still ask (`App::developer_tools_install_may_ask`: one carried past its
+    /// password holds nothing), or a pane's hold.
     pub(crate) fn access_gesture_up_beside_walk(&self, now: Instant) -> bool {
-        self.developer_tools_install_active()
+        self.developer_tools_install_may_ask()
             || self
                 .devtools_helper
                 .panel()
@@ -1069,11 +1326,26 @@ impl App {
         let status = self.system_state_host.latest_status();
         // While the launch's offer waits for the page's answer at its first tick, its headline
         // is the one signal: no menu line, as no diamond (§3.3, §3.6).
+        // The update's note goes under a line that names the grant as its reading needs the
+        // person, never under one about another row.
+        let fda_needs_you = status.plan.as_ref().is_some_and(|plan| {
+            crate::system_state::manages(plan.selection, Subject::Access(Access::FullDiskAccess))
+                && status
+                    .observations_for(Some(&plan.vault_url))
+                    .any(|observation| {
+                        observation.subject == Subject::Access(Access::FullDiskAccess)
+                            && observation.standing == Standing::NeedsYou
+                    })
+        });
         let line = if self.system_state_launch_offer_waits() {
             None
         } else {
-            menu_line(status, regressed).map(|mut line| {
-                if regressed && self.access_steps.fda_after_update && line.note.is_none() {
+            menu_line(status).map(|mut line| {
+                if regressed
+                    && fda_needs_you
+                    && self.access_steps.fda_after_update
+                    && line.note.is_none()
+                {
                     line.note = Some(FDA_AFTER_UPDATE.to_owned());
                 }
                 line
@@ -1195,8 +1467,10 @@ impl App {
             .is_some_and(|gate| gate.is_retired())
     }
 
-    /// A verified Full Disk Access grant reads off (`true`), or that ended: the
-    /// menu line follows. It never opens a page by itself (§3.6).
+    /// A verified Full Disk Access grant reads off (`true`), or that ended: as it goes off the
+    /// worker reads the Access rows again, so the page, `setup=` and the menu line say what is
+    /// read now, never `done` on the grant an earlier reading saw (§3.5), and the menu line's
+    /// update note follows. It never opens a page by itself (§3.6).
     pub(crate) fn note_fda_regression(&mut self, regressed: bool) {
         if !regressed {
             self.access_steps.fda_after_update = false;
@@ -1207,6 +1481,9 @@ impl App {
                 "system state: a verified Full Disk Access grant {}",
                 if regressed { "reads off" } else { "is settled" }
             );
+            if regressed {
+                self.notify_initial_setup_fda_off();
+            }
             self.refresh_system_state_menu_line();
         }
     }
@@ -1477,9 +1754,10 @@ impl App {
 
     /// A person's press on the Full Disk Access, Developer Tools or Accessibility row starts the
     /// permission walk with that row's page first, going on to every other grant missing
-    /// (`crate::permission_walk`); a walk at another page gives way to it, and one at its page is
-    /// the person's from there on, so a control verb's walk waiting there opens it now
-    /// (`WalkLane::pressed`). `None` leaves the
+    /// (`crate::permission_walk`); a walk at another page gives way to it, its unanswered pages
+    /// kept for the walk that starts by itself (`WalkLane::give_way`: the press answered none of
+    /// them), and one at its page is the person's from there on, so a control verb's walk waiting
+    /// there opens it now (`WalkLane::pressed`). `None` leaves the
     /// press to its own page: another row, a headless instance, or a grant the window reads held,
     /// whose page an owner's press opens anyway.
     fn walk_from_row(&mut self, access: Access) -> Option<(bool, &'static str)> {
@@ -1498,7 +1776,9 @@ impl App {
                 self.drive_permission_walk(now);
                 return Some((true, "walking"));
             }
-            Some(_) => self.permission_walk.end("a person's press on another row"),
+            Some(_) => self
+                .permission_walk
+                .give_way("a person's press on another row"),
             None => {}
         }
         if !self.walk_missing(subject, true) {

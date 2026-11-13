@@ -10,6 +10,7 @@ use crate::{
         tests::Lab,
     },
 };
+use astream_wire::sync::Digest;
 use aterm_secrets::{
     client,
     commons::{
@@ -18,10 +19,13 @@ use aterm_secrets::{
         roster::{Grant, Role},
     },
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod closure;
 mod conflict;
+mod identified;
+mod lazy_index;
+mod policy;
 
 #[test]
 fn transient_control_uncertainty_invalidates_a_discarded_metadata_batch() {
@@ -227,6 +231,161 @@ fn an_observer_cannot_append_or_recover_an_unwitnessed_tail() {
     assert!(Store::observe(&session, &path, scope).is_err());
 }
 
+/// What an observer open judged a table to hold under its session: what it quarantines, retains,
+/// offers and shows, whether its liabilities are complete, and the witness it read; or its
+/// refusal's text.
+type Judged = std::result::Result<
+    (
+        Vec<super::super::Quarantined>,
+        Vec<Digest>,
+        Vec<Digest>,
+        usize,
+        bool,
+        u64,
+    ),
+    String,
+>;
+
+fn judged(store: Result<Store>, session: &Session<'_>) -> Judged {
+    let text = |error: Error| error.to_string();
+    let store = store.map_err(text)?;
+    Ok((
+        store.quarantined(session).map_err(text)?,
+        store.inventory(session).map_err(text)?.copied().collect(),
+        store
+            .replication_inventory(session)
+            .map_err(text)?
+            .copied()
+            .collect(),
+        store.catalog(session).map_err(text)?.len(),
+        store.liability_evidence(session).is_ok(),
+        store.witness.count,
+    ))
+}
+
+/// Each observer open of a kept table judges what it keeps under its own session, as an open of
+/// the table read afresh (nothing kept) does: answered from what is kept (no read), an open after
+/// a control recovery discarded its record's source quarantines the record; an open under a
+/// writing session, and one whose session's control journal moved during its replay, answer as
+/// a fresh open does; and of a table with an unwitnessed append, an open under the claim before
+/// it exposes the witnessed records, and one after the writer adopted it exposes it too, read and
+/// then answered from what is kept.
+/// NEGATIVE CONTROL: the restore's classification of a record kept by its identifier and reused
+/// when the journal is answered from what is kept takes the discarded record as live after the
+/// recovery, and opens it under a roster the recovery left out, which refuses the open a fresh
+/// one quarantines.
+#[test]
+fn each_open_of_a_kept_table_judges_it_under_its_own_session() {
+    use super::super::journals::{Journals, as_if_later, with_own};
+    use std::sync::Arc;
+    // An hour on: an observed journal stood settled at each ask.
+    let later = std::time::Duration::from_secs(3600);
+    let kept = Arc::new(Journals::new(32, 1 << 30, 1 << 30));
+    let cold = Arc::new(Journals::new(32, 0, 0));
+    let observe = |journals: &Arc<Journals>, session: &Session<'_>, dir: &Path, scope| {
+        let store = as_if_later(later, || {
+            with_own(Arc::clone(journals), || Store::observe(session, dir, scope))
+        });
+        judged(store, session)
+    };
+    // Answered from what is kept where `read` says, and as a fresh open answers.
+    let alike = |what: &str, session: &Session<'_>, dir: &Path, scope, read: Option<usize>| {
+        let start = kept.test_reads();
+        let answer = observe(&kept, session, dir, scope);
+        if let Some(read) = read {
+            assert_eq!(kept.test_reads() - start, read, "{what}: reads");
+        }
+        assert_eq!(answer, observe(&cold, session, dir, scope), "{what}");
+        answer
+    };
+
+    let f = Fixture::new(false, false, false);
+    let a = f.lab.bootstrap(0);
+    let session = Session::observe(&a).unwrap();
+    let live = alike("warmed", &session, &f.dirs[0], f.scope, Some(1)).unwrap();
+    assert!(live.0.is_empty(), "nothing quarantined before the recovery");
+    alike("kept", &session, &f.dirs[0], f.scope, Some(0)).unwrap();
+    drop(session);
+    f.recover();
+    let session = Session::observe(&a).unwrap();
+    let recovered = alike("recovered", &session, &f.dirs[0], f.scope, Some(0)).unwrap();
+    assert_eq!(
+        recovered.0.iter().map(|q| q.receipt.id).collect::<Vec<_>>(),
+        [f.receipt.id],
+        "the discarded source's record is quarantined"
+    );
+    drop(session);
+    let writing = Session::open(&a).unwrap();
+    alike("a writing session", &writing, &f.dirs[0], f.scope, Some(0)).unwrap();
+    let anchor = a.journal_dir().join("control.anchor");
+    let moved = anchor.with_extension("moved");
+    // The control journal's anchor moved away once the table's records are replayed, and back.
+    let during = |journals: &Arc<Journals>| {
+        let (from, to) = (anchor.clone(), moved.clone());
+        let answer = super::super::with_replay_observer(
+            move || std::fs::rename(&from, &to).unwrap(),
+            || observe(journals, &writing, &f.dirs[0], f.scope),
+        );
+        std::fs::rename(&moved, &anchor).unwrap();
+        answer
+    };
+    let start = kept.test_reads();
+    let answer = during(&kept);
+    assert_eq!(kept.test_reads(), start, "answered from what is kept");
+    assert!(answer.is_err(), "a moved control journal refuses the open");
+    assert_eq!(
+        answer,
+        during(&cold),
+        "a control journal moved during the replay"
+    );
+    drop(writing);
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (a, b) = (lab.bootstrap(0), lab.bootstrap(1));
+    let session = Session::open(&a).unwrap();
+    let peer_session = Session::open(&b).unwrap();
+    let path = root.path().join("table");
+    let mut held = Store::create(&session, &path).unwrap();
+    let scope = held.scope();
+    held.commit_catalog(&session, b"witnessed").unwrap();
+    let mut peer = Store::join(&peer_session, &root.path().join("peer"), scope).unwrap();
+    let receipt = peer.commit_catalog(&peer_session, b"unwitnessed").unwrap();
+    let wire = peer
+        .wire(&peer_session, &receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    alike("before the append", &session, &path, scope, Some(1)).unwrap();
+    let mut body = receipt.received_ms.to_le_bytes().to_vec();
+    body.extend_from_slice(&wire);
+    held.log.as_mut().unwrap().append(SUBJECT, body).unwrap();
+    let witnessed = alike("an unwitnessed append", &session, &path, scope, Some(1)).unwrap();
+    assert_eq!(
+        (witnessed.1.len(), witnessed.5),
+        (1, 1),
+        "the claim's record alone"
+    );
+    alike(
+        "an unwitnessed append, kept",
+        &session,
+        &path,
+        scope,
+        Some(0),
+    )
+    .unwrap();
+    drop(held);
+    // The writer's open moves what the witness shows: the next ask reads, with the kept prefix.
+    drop(Store::open(&session, &path, scope).unwrap());
+    let adopted = alike("the append adopted", &session, &path, scope, None).unwrap();
+    assert_eq!(
+        (adopted.1.len(), adopted.5),
+        (2, 2),
+        "the adopted record too"
+    );
+    alike("the append adopted, kept", &session, &path, scope, Some(0)).unwrap();
+}
+
 struct Fixture {
     lab: Lab,
     scope: Scope,
@@ -359,10 +518,23 @@ fn missing_selected_key() -> bool {
         .ingest(&session, &wire)
         .unwrap();
     drop(session);
-    for file in std::fs::read_dir(lab.paths[1].dir.join("commons/history")).unwrap() {
-        std::fs::remove_file(file.unwrap().path()).unwrap();
-    }
-    Store::open(&Session::open(&b).unwrap(), &dirs[1], scope).is_ok()
+    super::super::journals::with_own(
+        std::sync::Arc::new(super::super::journals::Journals::new(
+            1,
+            64 * 1024,
+            64 * 1024,
+        )),
+        || {
+            // Retain successful payload facts before taking the real history key away. Both a fresh
+            // writing replay and an observation of those retained wires must still ask for that key.
+            Store::observe(&Session::observe(&b).unwrap(), &dirs[1], scope).unwrap();
+            for file in std::fs::read_dir(lab.paths[1].dir.join("commons/history")).unwrap() {
+                std::fs::remove_file(file.unwrap().path()).unwrap();
+            }
+            Store::open(&Session::open(&b).unwrap(), &dirs[1], scope).is_ok()
+                || Store::observe(&Session::observe(&b).unwrap(), &dirs[1], scope).is_ok()
+        },
+    )
 }
 
 fn quarantine_transition(
@@ -515,10 +687,17 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     f.recover();
     let a = f.lab.bootstrap(0);
     let session = Session::open(&a).unwrap();
+    let catalog = f.scope == crate::catalog::scope(f.scope.trust());
     assert!(
         session
             .with_read_batch(f.scope, |batch| {
-                restore(batch, f.receipt, Identified::new(f.wire.clone()), 0)
+                restore(
+                    batch,
+                    f.receipt,
+                    Identified::new(f.wire.clone()),
+                    0,
+                    catalog,
+                )
             })
             .is_err()
     );
@@ -526,7 +705,7 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     // exact same unwitnessed tail. The model must reject that unsafe composition.
     let promoted = session
         .with_read_batch(f.scope, |batch| {
-            restore(batch, f.receipt, Identified::new(f.wire), 1)
+            restore(batch, f.receipt, Identified::new(f.wire), 1, catalog)
         })
         .unwrap();
     assert!(promoted.quarantine.is_some());
@@ -543,7 +722,10 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     let store = Store::open(&session, &f.dirs[0], f.scope).unwrap();
     let mut visible = initial;
     visible.insert("scenario", 2);
-    visible.insert("visible", store.index.project().ordered.len() as i64);
+    visible.insert(
+        "visible",
+        store.index().unwrap().project().ordered.len() as i64,
+    );
     assert!(!model.check_invariant("NoQuarantineProjection", &visible));
 }
 
@@ -653,7 +835,7 @@ fn quarantined_cutoff_frontiers_do_not_change_projection_between_replicas() {
             .journal
             .constraints()
             .unwrap()
-            .catalog(scope.digest(), &store.index)
+            .catalog(scope.digest(), store.index().unwrap())
             .permits(&r1.id)
     );
     assert!(
@@ -661,7 +843,7 @@ fn quarantined_cutoff_frontiers_do_not_change_projection_between_replicas() {
             .journal
             .constraints()
             .unwrap()
-            .catalog(scope.digest(), &peer.index)
+            .catalog(scope.digest(), peer.index().unwrap())
             .permits(&r1.id)
     );
 }

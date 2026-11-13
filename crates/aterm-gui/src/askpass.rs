@@ -63,20 +63,31 @@ impl Drop for PromptInputFence<'_> {
 #[cfg(target_os = "macos")]
 pub(crate) static PROMPT_INPUT: PromptInputGate = PromptInputGate::new();
 
-/// Keyboard admission for the secure field, shared with its native monitor.
+/// Keyboard admission for the secure field, shared with its native monitor, and whether a person
+/// has touched the sheet at all.
 pub(crate) struct PasswordInput {
     clicked: std::sync::atomic::AtomicBool,
+    touched: std::sync::atomic::AtomicBool,
 }
 
 impl PasswordInput {
     pub(crate) const fn new() -> Self {
         Self {
             clicked: std::sync::atomic::AtomicBool::new(false),
+            touched: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub(crate) fn field_clicked(&self) {
         self.clicked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.person_touched();
+    }
+
+    /// A person's own click on the sheet or key at its window (never a posted one): the sheet is
+    /// theirs from now on. It admits no typing; only [`Self::field_clicked`] does.
+    pub(crate) fn person_touched(&self) {
+        self.touched
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -85,11 +96,34 @@ impl PasswordInput {
             || key_code == 0x35 // Escape remains the owner's Cancel.
             || self.clicked.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Whether a person has clicked on the sheet or pressed a key at its window.
+    pub(crate) fn touched(&self) -> bool {
+        self.touched.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
-/// The sheet's wait for the owner, matched to `await consent`'s default timeout.
-#[cfg(target_os = "macos")]
+/// The sheet's wait for the owner, matched to `await consent`'s default timeout. The update
+/// lane's `password-prompt` hold is bounded by it, since every sheet is withdrawn by then.
 pub(crate) const ASKPASS_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long aterm's own password sheet may hold a waiting update while nobody has touched it:
+/// past this, with an update waiting, aterm refuses it, as an unanswered prompt is recorded and
+/// the rest goes on. A sheet a person clicked on or typed at is theirs until it is answered or
+/// its [`ASKPASS_DEADLINE`].
+pub(crate) const ASKPASS_UNTOUCHED_BACKSTOP: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    ASKPASS_UNTOUCHED_BACKSTOP.as_secs() > crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+        && ASKPASS_UNTOUCHED_BACKSTOP.as_secs() < ASKPASS_DEADLINE.as_secs()
+);
+
+/// Whether an update waiting on aterm's own password sheet, raised at `raised` and `touched` or
+/// not, refuses it at `now` ([`ASKPASS_UNTOUCHED_BACKSTOP`]).
+#[must_use]
+pub(crate) fn untouched_sheet_overdue(raised: Instant, touched: bool, now: Instant) -> bool {
+    !touched && now.saturating_duration_since(raised) >= ASKPASS_UNTOUCHED_BACKSTOP
+}
 /// One park between hang-up checks, so a killed `sudo`/helper frees the lane promptly.
 pub(crate) const ASKPASS_TICK: Duration = Duration::from_millis(200);
 

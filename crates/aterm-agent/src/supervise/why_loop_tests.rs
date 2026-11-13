@@ -616,7 +616,16 @@ fn the_runs_python_globs_reach_the_decision_made_again() {
     m.vanish_after = Some(2);
     let mut opts = auto(30);
     opts.python_allow = vec!["tools/*.py".to_string()];
-    let run = record_watch(&mut m, &opts, |_| {});
+    // python runs its user site below the home, which the check refuses where the worker writes
+    // it (`home_loads_unwritten`): a test's own HOME may lie in a scratch root (verify's does, in
+    // `TMPDIR`), so the run names a home the worker does not write, one this host reads as
+    // absolute.
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_env(ApprovalEnv {
+            home: Some(PathBuf::from(at!("/Users/_owner"))),
+            ..ApprovalEnv::of_process()
+        });
+    });
     let header = run.header.encode();
     let items = recover(&run.tape.reframed(&header)).items;
     let seq = *marked(&items, doors::DECIDE_APPROVAL)

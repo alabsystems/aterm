@@ -377,6 +377,14 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
         ),
         "negative control: a live OS window is not evidence that any content presented"
     );
+    // An ask does go before the present (`boot_health_ask_due`), but without the checkpoint,
+    // and the updater then only reads: `aterm-update`'s
+    // `before_the_checkpoint_only_an_unarmed_build_is_confirmed` shows it disarms nothing.
+    assert!(
+        crate::boot_health_ask_due(false, true, false)
+            && !crate::boot_checkpoint_reached(false, false, false, true),
+        "the pre-present ask carries no checkpoint"
+    );
     assert!(
         model.successors("ProveInstalledHealth", &state).is_empty(),
         "the healthy model must agree with the shipping pre-present guard"
@@ -398,6 +406,7 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     assert!(crate::should_dispatch_boot_health_confirmation(
         false, false, true, false, true, true, false,
     ));
+    assert!(crate::boot_checkpoint_reached(false, false, true, true));
     assert!(
         !crate::should_dispatch_boot_health_confirmation(
             false, false, true, false, true, true, true
@@ -1272,6 +1281,7 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
             deadline_ready: true,
             current_build: 10,
             target_build: 11,
+            boot_health_complete: true,
             work_active: false,
             applying: false,
             activity_quiet: crate::automatic_output_activity_quiet(quiet_now_ns, latest_output_ns,),
@@ -1335,6 +1345,9 @@ pub(crate) struct StructuralLatchObservation {
     pub(crate) backoff: bool,
     /// The latched build was launched for an attempt while a newer release waited behind it.
     pub(crate) booted_old: bool,
+    /// The latch waits out the retry of a re-sample that failed for a passing reason, and owes
+    /// nothing until then.
+    pub(crate) transient: bool,
 }
 
 /// Project one [`StructuralLatchObservation`] onto the model's variables.
@@ -1361,7 +1374,6 @@ pub(crate) fn project_structural_latch(
     state.insert("pending", i64::from(observed.pending));
     state.insert("day", i64::from(observed.day));
     state.insert("owed", i64::from(observed.owed));
-    state.insert("spent", i64::from(observed.structural && !observed.owed));
     state.insert("newer", i64::from(observed.newer));
     state.insert("newer_spent", i64::from(observed.newer_spent));
     state.insert("said", i64::from(observed.said));
@@ -1370,6 +1382,7 @@ pub(crate) fn project_structural_latch(
     state.insert("superseded", i64::from(observed.superseded));
     state.insert("refused", i64::from(observed.refused));
     state.insert("backoff", i64::from(observed.backoff));
+    state.insert("transient", i64::from(observed.transient));
     state.insert("booted_old", i64::from(observed.booted_old));
     state
 }
@@ -1411,7 +1424,11 @@ fn observation(
 }
 
 fn fail_activation_11(app: &mut crate::App) {
-    use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
+    fail_activation_11_as(app, crate::app_native::PhysicalFailureShape::Structural);
+}
+
+fn fail_activation_11_as(app: &mut crate::App, shape: crate::app_native::PhysicalFailureShape) {
+    use crate::app_native::HandoffFailureLane;
     let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
     let ticket =
         crate::native_updater_service::ApplyAttemptTicket::for_test(11, COMMIT, &activation);
@@ -1419,7 +1436,7 @@ fn fail_activation_11(app: &mut crate::App) {
     let _ = app.abort_reaped_native_apply_before_reconcile(
         &ticket,
         "overlap handoff failed safely: handoff proof ended AdoptionMismatch".to_string(),
-        HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+        HandoffFailureLane::Physical(shape),
     );
 }
 
@@ -1461,12 +1478,19 @@ fn observe_latch(model: &Model, app: &crate::App, day: bool, pending: bool) -> S
             refused: false,
             backoff: false,
             booted_old: false,
+            transient: app.auto_apply_manual_only.is_some() && verdict.resample_at.is_none(),
         },
     )
 }
 
 fn past() -> std::time::Instant {
     std::time::Instant::now() - std::time::Duration::from_secs(1)
+}
+
+/// Whether `at` is the day [`crate::app_native::STRUCTURAL_RESAMPLE_AFTER`] out from about now.
+fn a_day_out(at: Option<std::time::Instant>) -> bool {
+    let tomorrow = std::time::Instant::now() + crate::app_native::STRUCTURAL_RESAMPLE_AFTER;
+    at.is_some_and(|at| at <= tomorrow && at + std::time::Duration::from_secs(60) >= tomorrow)
 }
 
 fn due_look(app: &mut crate::App) -> bool {
@@ -1492,7 +1516,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
     let mut superseded = 0;
     let mut waited = 0;
     let mut unread_counted = 0;
-    let mut unread_held = 0;
+    let mut unread_moved = 0;
     let mut unproven_counted = 0;
     let mut unproven_moved = 0;
     assert_eq!(
@@ -1559,7 +1583,8 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
             }
             StructuralLatchDecision::HoldForTrial => {
                 earned += 1;
-                (true, true, false, true, false)
+                moved = state["day"] == 1 && state["owed"] == 1;
+                (true, false, false, true, false)
             }
             StructuralLatchDecision::Unmeasured => {
                 assert!(
@@ -1570,6 +1595,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                     if doubts >= crate::app_native::STRUCTURAL_TRIAL_UNPROVEN_LOOKS {
                         unproven_moved += 1;
                         doubts_after = 0;
+                        looks_after = 0;
                         moved = true;
                     } else {
                         unproven_counted += 1;
@@ -1578,9 +1604,10 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                     }
                     (true, false, false, false, false)
                 } else if looks >= crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS {
-                    unread_held += 1;
+                    unread_moved += 1;
                     looks_after = 0;
-                    (true, true, false, true, false)
+                    moved = true;
+                    (true, false, false, false, false)
                 } else {
                     unread_counted += 1;
                     looks_after = looks + 1;
@@ -1612,6 +1639,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                 refused: state["refused"] == 1,
                 backoff: state["backoff"] == 1,
                 booted_old: state["booted_old"] == 1 || (!latched && unspent),
+                transient: state["transient"] == 1,
             },
         );
         assert_exact_model_action(&model, "Decide", &state, &after);
@@ -1649,12 +1677,12 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
             && superseded > 0
             && waited > 0
             && unread_counted > 0
-            && unread_held > 0
+            && unread_moved > 0
             && unproven_counted > 0
             && unproven_moved > 0,
         "the sweep decided {decided}, earned {earned}, superseded {superseded}, waited \
-         {waited}, counted {unread_counted} unreadable looks and held {unread_held} at the \
-         bound, counted {unproven_counted} unproven looks and moved {unproven_moved} a day"
+         {waited}, counted {unread_counted} unreadable looks and moved {unread_moved} a day, \
+         counted {unproven_counted} unproven looks and moved {unproven_moved} a day"
     );
 }
 
@@ -1736,6 +1764,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                     backoff: replacement
                         .is_some_and(|replacement| replacement.newer_retry.is_some()),
                     booted_old: false,
+                    transient: false,
                 },
             )
         };
@@ -2024,6 +2053,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                                 })
                             }),
                             booted_old: false,
+                            transient: false,
                         },
                     )
                 };
@@ -2044,7 +2074,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             if !room {
                 let promise = buggy.successors("Decide", &counted)[0].clone();
                 assert_ne!(promise, converged);
-                assert!(!buggy.check_invariant("NoRetryPromisedPastTheTrial", &promise));
+                assert!(!buggy.check_invariant("ALatchOwesAResample", &promise));
             }
 
             let escaped = app.arm_native_auto_apply(11, &"ef".repeat(32));
@@ -2170,32 +2200,33 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
 
             let dawn = model.successors("DayPasses", &relooked)[0].clone();
             let dawn_look = model.successors("Decide", &dawn)[0].clone();
+            let latch = app.auto_apply_manual_only.expect("still latched");
+            let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+            app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                retry_at: Some(past()),
+                ..latch
+            });
+            app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+                resample_at: Some(past()),
+                ..verdict
+            });
+            assert!(
+                !app.lapse_expired_auto_apply_manual_only(),
+                "{arc}: the day releases nothing while a newer release waits"
+            );
             if room {
-                let latch = app.auto_apply_manual_only.expect("still latched");
-                let verdict = app.auto_apply_structural_verdict.expect("the verdict");
-                let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-                app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-                    retry_at: Some(past),
-                    ..latch
-                });
-                app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
-                    resample_at: Some(past),
-                    ..verdict
-                });
-                assert!(
-                    !app.lapse_expired_auto_apply_manual_only(),
-                    "{arc}: the day releases nothing while a newer release waits"
-                );
                 assert_eq!(
                     app.auto_apply_manual_only.and_then(|latch| latch.retry_at),
                     app.activation_replacement_retry_at(),
                     "{arc}: the day's deadline moves to the retry's, so the fold does not spin"
                 );
             } else {
-                assert!(!app.lapse_expired_auto_apply_manual_only());
-                let _ = app.reconcile_native_update_facts(facts(6, 11, Some(12)));
+                assert!(
+                    a_day_out(app.auto_apply_manual_only.and_then(|latch| latch.retry_at)),
+                    "{arc}: with no launch to spare, the day's look moves a day on"
+                );
             }
-            let outranked = observe(&app, true, true, false, true);
+            let outranked = observe(&app, room, true, false, true);
             assert_exact_model_action(&model, "Decide", &dawn, &outranked);
             assert_eq!(outranked, dawn_look);
 
@@ -2211,7 +2242,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 ..retry
             });
             assert!(!app.lapse_expired_auto_apply_manual_only());
-            let retried = observe(&app, true, true, false, true);
+            let retried = observe(&app, room, true, false, true);
             assert_exact_model_action(&model, "Decide", &due, &retried);
             let job = app
                 .native_activation_supersede
@@ -2219,7 +2250,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 .expect("the retire of 11 for 12 is under way again");
             let landed = model.successors("Supersede", &retried)[0].clone();
             land(&mut app, job, 7);
-            let after_retire = observe(&app, true, true, false, true);
+            let after_retire = observe(&app, room, true, false, true);
             assert_exact_model_action(&model, "Supersede", &retried, &after_retire);
             assert_eq!(after_retire, landed);
             assert_eq!(
@@ -2262,13 +2293,63 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
         let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
         assert!(app.arm_native_auto_apply(11, &activation));
         fail_activation_11(&mut app);
-        let done = observe(&app, true);
-        assert_exact_model_action(&model, "AttemptFails", &resampled, &done);
-        assert_eq!(
-            app.auto_apply_manual_only.map(|manual| manual.retry_at),
-            Some(None),
-            "after its one re-sample the verdict owes nothing"
+        let mut failed = observe(&app, false);
+        assert_exact_model_action(&model, "AttemptFails", &resampled, &failed);
+        assert_ne!(
+            buggy.successors("AttemptFails", &resampled)[0],
+            failed,
+            "the shipping failure is not the mutant"
         );
+        assert!(
+            !buggy.check_invariant(
+                "ALatchOwesAResample",
+                &buggy.successors("AttemptFails", &resampled)[0]
+            ),
+            "a failure that leaves no re-sample is caught"
+        );
+        for round in 1..=3 {
+            let latch = app.auto_apply_manual_only.expect("latched");
+            let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+            assert!(
+                a_day_out(latch.retry_at) && latch.retry_at == verdict.resample_at,
+                "round {round}: a re-sample that fails moves a day on: {verdict:?} {latch:?}"
+            );
+            let dawn = model.successors("DayPasses", &failed)[0].clone();
+            let _ = app.reconcile_native_update_facts(facts(2 + round));
+            app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+                resample_at: Some(past()),
+                ..verdict
+            });
+            assert!(due_look(&mut app), "round {round}: it is released again");
+            let resampled = observe(&app, true);
+            assert_exact_model_action(&model, "Decide", &dawn, &resampled);
+            assert!(app.arm_native_auto_apply(11, &activation), "round {round}");
+            fail_activation_11(&mut app);
+            failed = observe(&app, false);
+            assert_exact_model_action(&model, "AttemptFails", &resampled, &failed);
+        }
+
+        // A re-sample that fails for a passing reason owes nothing until its own retry comes due,
+        // and that retry takes the look every due re-sample takes.
+        let dawn = model.successors("DayPasses", &failed)[0].clone();
+        let _ = app.reconcile_native_update_facts(facts(6));
+        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+            resample_at: Some(past()),
+            ..verdict
+        });
+        assert!(due_look(&mut app), "the next day's re-sample");
+        let resampled = observe(&app, true);
+        assert_exact_model_action(&model, "Decide", &dawn, &resampled);
+        assert!(app.arm_native_auto_apply(11, &activation));
+        fail_activation_11_as(&mut app, crate::app_native::PhysicalFailureShape::Transient);
+        let waiting = observe(&app, false);
+        assert_exact_model_action(&model, "AttemptFailsTransiently", &resampled, &waiting);
+        let due = model.successors("TransientRetryDue", &waiting)[0].clone();
+        let _ = app.reconcile_native_update_facts(facts(7));
+        assert!(due_look(&mut app), "its own retry releases it");
+        let released = observe(&app, true);
+        assert_exact_model_action(&model, "Decide", &due, &released);
     }
 
     let entered = aterm_spec::xref::entered_anchor_ids();
@@ -2282,6 +2363,160 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             anchor.entry_id
         );
     }
+}
+
+/// A PASSING FAILURE OF A RE-SAMPLE ASKS THE BOOT TRIAL AGAIN: it lapsed plainly, with no look at the
+/// count, so a launch counted meanwhile made the next attempt the one the trial reverts on. Its own
+/// retry now takes the look every due re-sample takes: with no launch to spare it holds, says so and
+/// moves a day on, and until then a press cannot start the launch the trial reverts on. CONTROLS: with
+/// room it releases and a press goes, and until that retry it owes nothing, so a count that moved
+/// raises nothing yet.
+#[test]
+fn a_passing_failure_of_a_re_sample_asks_the_boot_trial_again() {
+    use crate::app_native::{BOOT_TRIAL_LAUNCH_LIMIT, PhysicalFailureShape};
+    let model = aterm_models_update::native_update_structural_latch_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
+    for spent in [false, true] {
+        let case = format!("spent={spent}");
+        let facts = |sequence: u64, launches: u32| {
+            observation(sequence, Some(installed_bundle(11, launches)), None, false)
+        };
+        let observe = |app: &crate::App, room: bool, day: bool| {
+            let mut state = observe_latch(&model, app, day, false);
+            state.insert("room", i64::from(room));
+            state.insert("unread", 0);
+            state
+        };
+        let mut app = converged_on_11(installed_bundle(11, 0));
+        let mut counted = model.init_state();
+        assert!(model.fire("TrialHasRoom", &mut counted));
+        let _ = app.reconcile_native_update_facts(facts(2, 0));
+        let converged = observe(&app, true, false);
+        assert_exact_model_action(&model, "Decide", &counted, &converged);
+
+        let dawn = model.successors("DayPasses", &converged)[0].clone();
+        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+            resample_at: Some(past()),
+            ..verdict
+        });
+        assert!(due_look(&mut app), "{case}: the re-sample is released");
+        let released = observe(&app, true, true);
+        assert_exact_model_action(&model, "Decide", &dawn, &released);
+
+        assert!(app.arm_native_auto_apply(11, &activation), "{case}");
+        fail_activation_11_as(&mut app, PhysicalFailureShape::Transient);
+        let waiting = observe(&app, true, false);
+        assert_exact_model_action(&model, "AttemptFailsTransiently", &released, &waiting);
+        assert_eq!(
+            (waiting["latched"], waiting["owed"], waiting["transient"]),
+            (1, 0, 1),
+            "{case}"
+        );
+
+        let launches = if spent {
+            BOOT_TRIAL_LAUNCH_LIMIT - 1
+        } else {
+            0
+        };
+        let _ = app.reconcile_native_update_facts(facts(3, launches));
+        assert_eq!(app.latched_activation_trial_spent(11), spent, "{case}");
+        let mut before_retry = waiting;
+        if spent {
+            assert!(model.fire("TrialRoomMoves", &mut before_retry));
+            let held = observe(&app, false, false);
+            assert_exact_model_action(&model, "Decide", &before_retry, &held);
+            assert_eq!(
+                held["said"], 0,
+                "{case}: nothing owed yet, so nothing raised"
+            );
+            assert!(
+                matches!(
+                    app.apply_native_update(crate::native_updater_service::ApplyMode::Immediate),
+                    crate::native_app::UpdateOutcome::Blocked { .. }
+                ),
+                "{case}: the press would start the launch the trial reverts on"
+            );
+            assert_eq!(
+                observe(&app, false, false),
+                held,
+                "{case}: and moves nothing"
+            );
+            before_retry = held;
+        } else {
+            assert_eq!(observe(&app, true, false), before_retry, "{case}");
+        }
+
+        let due = model.successors("TransientRetryDue", &before_retry)[0].clone();
+        assert_eq!(due_look(&mut app), !spent, "{case}: its own retry");
+        let after = observe(&app, !spent, !spent);
+        assert_exact_model_action(&model, "Decide", &due, &after);
+        if spent {
+            let latch = app.auto_apply_manual_only.expect("the latch stands");
+            let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+            assert!(
+                a_day_out(latch.retry_at) && a_day_out(verdict.resample_at),
+                "{case}: the look moves a day on: {verdict:?} {latch:?}"
+            );
+            assert_eq!(after["said"], 1, "{case}: and says why");
+            assert!(
+                !buggy.check_invariant(
+                    "NeverSpendsTheRevertingLaunch",
+                    &buggy.successors("TransientRetryDue", &before_retry)[0]
+                ),
+                "{case}: a plain lapse here spends the launch the trial reverts on"
+            );
+        }
+    }
+}
+
+/// A RE-SAMPLE SEEKS A QUIET MOMENT: it came round a day after its ladder was armed, so that clock
+/// read Land and parked the terminal over typing every day. A Release starts a new ladder, which
+/// itself lands within its bound. CONTROL:
+/// `a_physical_latch_lapse_resumes_the_ladder_where_the_clock_left_it` keeps a plain lapse on its
+/// clock.
+#[test]
+fn a_re_sample_starts_a_new_ladder() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
+    let mut app = converged_on_11(installed_bundle(11, 0));
+    let _ = app.reconcile_native_update_facts(observation(
+        2,
+        Some(installed_bundle(11, 0)),
+        None,
+        false,
+    ));
+    let long_ago = std::time::Instant::now()
+        - crate::native_update_auto_intent::LANDS_WITHIN
+        - std::time::Duration::from_secs(30);
+    app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+        build: 11,
+        armed_at: long_ago,
+        announced: ApplyPhase::KeysOnly,
+        restored_hold_said: false,
+    });
+    assert_eq!(
+        app.automatic_apply_phase(std::time::Instant::now()),
+        ApplyPhase::Land,
+        "PRECONDITION: that clock has run out"
+    );
+    let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+    app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+        resample_at: Some(past()),
+        ..verdict
+    });
+    assert!(due_look(&mut app), "the re-sample is released");
+    assert!(app.arm_native_auto_apply(11, &activation));
+    assert_eq!(
+        app.automatic_apply_phase(std::time::Instant::now()),
+        ApplyPhase::PreferIdle
+    );
+    assert!(
+        app.auto_apply_ladder
+            .is_some_and(|ladder| ladder.build == 11 && ladder.armed_at > long_ago)
+    );
 }
 
 #[test]
@@ -2359,49 +2594,203 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
             assert_eq!(
                 (real["latched"], real["looks"], real["owed"]),
                 (0, 0, 0),
-                "{case}: the count is cleared, the one re-sample taken"
+                "{case}: the count is cleared, the re-sample taken"
             );
             continue;
         }
         let mutant = buggy.successors("Decide", &modeled)[0].clone();
-        assert!(!due_look(&mut app), "{case}: the bound holds");
-        let real = observe(&app, true, false);
+        assert!(!due_look(&mut app), "{case}: the look at the bound");
+        let real = observe(&app, false, false);
         assert_exact_model_action(&model, "Decide", &modeled, &real);
         let latch = app.auto_apply_manual_only.expect("the latch stands");
         let verdict = app.auto_apply_structural_verdict.expect("the verdict");
-        assert_eq!(
-            (latch.retry_at, verdict.resample_at),
-            (None, None),
-            "{case}: nothing promised"
+        assert!(
+            a_day_out(verdict.resample_at) && a_day_out(latch.retry_at),
+            "{case}: the re-sample and the latch's deadline move a day: {verdict:?} {latch:?}"
         );
         assert_eq!(
-            app.auto_apply_stranded_announced,
-            Some((11, false)),
-            "{case}: the hold is said"
+            real["said"], 0,
+            "{case}: nothing asked of a person, so no hold raised"
         );
         assert_ne!(mutant, real, "{case}: the shipping look is not the mutant");
-        assert!(!buggy.check_invariant("NoRetryPromisedPastTheBound", &mutant));
-        let spent = installed_bundle(11, crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1);
+        assert!(!buggy.check_invariant("UnreadLooksAreBounded", &mutant));
+        modeled = real;
+
+        // The count reads again, with room, past the bound: it used to wait for a press with
+        // nothing protected, since the re-sample had been given up and no deadline was left.
+        assert!(model.fire("TrialReadAgain", &mut modeled));
         sequence += 1;
-        let _ = app.reconcile_native_update_facts(facts(sequence, Some(spent)));
-        assert!(app.latched_activation_trial_spent(11), "{case}: spent");
-        use crate::update_words::LiveHealth as _;
-        let said = app
-            .messages
-            .live_health()
-            .map(|live| live.msg.detail.join("; "))
-            .expect("the warning is up");
-        assert!(
-            !said.contains(crate::update_words::INSTALL_FROM_MENU),
-            "{case}: the notice names no start the trial rolls back: {said}"
-        );
-        assert!(
-            !app.auto_apply_structural_verdict
-                .expect("the verdict")
-                .held_unmeasured,
-            "{case}: said once"
+        let _ = app.reconcile_native_update_facts(facts(sequence, Some(bundle.clone())));
+        let real = observe(&app, false, false);
+        assert_exact_model_action(&model, "Decide", &modeled, &real);
+        assert_eq!(real["latched"], 1, "{case}: the day has not passed");
+        modeled = real;
+        assert!(model.fire("DayPasses", &mut modeled));
+        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+            resample_at: Some(past()),
+            ..verdict
+        });
+        assert!(due_look(&mut app), "{case}: the next day releases it");
+        let real = observe(&app, true, false);
+        assert_exact_model_action(&model, "Decide", &modeled, &real);
+        assert_eq!(
+            (real["latched"], real["owed"]),
+            (0, 0),
+            "{case}: the re-sample taken"
         );
     }
+}
+
+/// A count read as spent past the bound holds for the trial, as a count read in time does: the
+/// notice names no start the trial would roll back.
+#[test]
+fn a_spent_count_read_past_the_bound_holds_for_the_trial() {
+    let model = aterm_models_update::native_update_structural_latch_model();
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let bundle = installed_bundle(11, 0);
+    let facts = |sequence: u64, installed| observation(sequence, installed, None, false);
+    let mut app = converged_on_11(bundle.clone());
+    let _ = app.reconcile_native_update_facts(facts(2, Some(bundle)));
+    let _ = app.reconcile_native_update_facts(facts(3, None));
+    let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+    app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+        resample_at: Some(past()),
+        ..verdict
+    });
+    let mut sequence = 3;
+    for _ in 0..=crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS {
+        assert!(!due_look(&mut app));
+        sequence += 1;
+        let _ = app.reconcile_native_update_facts(facts(sequence, None));
+    }
+    let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+    assert!(
+        a_day_out(verdict.resample_at),
+        "PRECONDITION: past the bound, the re-sample a day out"
+    );
+    let spent = installed_bundle(11, crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1);
+    sequence += 1;
+    let _ = app.reconcile_native_update_facts(facts(sequence, Some(spent)));
+    assert!(app.latched_activation_trial_spent(11), "spent");
+    assert_eq!(
+        (
+            app.auto_apply_structural_verdict
+                .expect("the verdict")
+                .resample_at,
+            app.auto_apply_manual_only.map(|latch| latch.retry_at),
+        ),
+        (verdict.resample_at, Some(verdict.resample_at)),
+        "held for the trial, and a deadline not yet due stays where it was"
+    );
+    assert_eq!(
+        observe_latch(&model, &app, false, false)["said"],
+        1,
+        "and said"
+    );
+    use crate::update_words::LiveHealth as _;
+    let said = app
+        .messages
+        .live_health()
+        .map(|live| live.msg.detail.join("; "))
+        .expect("the warning is up");
+    assert!(
+        !said.contains(crate::update_words::INSTALL_FROM_MENU),
+        "the notice names no start the trial rolls back: {said}"
+    );
+}
+
+/// A TRIAL THAT REGAINS ROOM RELEASES THE LATCH: a hold for the trial dropped the re-sample, so a
+/// count that came back (a fresh install resets it) left the latch standing until a press or a newer
+/// release. Now the day's look moves a day on and spends nothing. CONTROLS: an observation with the
+/// deadline not due leaves it where it is and says nothing again, and regained room waits out the day.
+#[test]
+fn a_trial_that_regains_room_releases_the_next_day_s_re_sample() {
+    let model = aterm_models_update::native_update_structural_latch_model();
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let spent = installed_bundle(11, crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1);
+    let fresh = installed_bundle(11, 0);
+    let facts = |sequence: u64, installed| observation(sequence, Some(installed), None, false);
+    let observe = |app: &crate::App, room: bool, day: bool| {
+        let mut state = observe_latch(&model, app, day, false);
+        state.insert("room", i64::from(room));
+        state
+    };
+    let day_passes = |app: &mut crate::App, modeled: &mut State| {
+        assert!(model.fire("DayPasses", modeled));
+        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+            resample_at: Some(past()),
+            ..verdict
+        });
+    };
+    let mut app = converged_on_11(spent.clone());
+
+    let mut modeled = model.init_state();
+    assert!(model.fire("TrialIsSpent", &mut modeled));
+    let _ = app.reconcile_native_update_facts(facts(2, spent.clone()));
+    let real = observe(&app, false, false);
+    assert_exact_model_action(&model, "Decide", &modeled, &real);
+    assert_eq!(real["said"], 1, "the hold is said");
+    assert!(app.latched_activation_trial_spent(11));
+    assert_eq!(
+        app.apply_retry_for(Some(11)),
+        crate::update_apply_trouble::ApplyRetry::NewerRelease,
+        "what the hold says is the way out, though a look still comes"
+    );
+    modeled = real;
+
+    day_passes(&mut app, &mut modeled);
+    assert!(!due_look(&mut app), "the day finds no launch to spare");
+    let real = observe(&app, false, false);
+    assert_exact_model_action(&model, "Decide", &modeled, &real);
+    let latch = app.auto_apply_manual_only.expect("the latch stands");
+    let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+    assert!(
+        a_day_out(verdict.resample_at) && latch.retry_at == verdict.resample_at,
+        "the look moves a day on: {verdict:?} {latch:?}"
+    );
+    modeled = real;
+
+    let logged = crate::test_log::logged_while(|| {
+        let _ = app.reconcile_native_update_facts(facts(3, spent.clone()));
+    });
+    assert_eq!(
+        app.auto_apply_structural_verdict
+            .expect("the verdict")
+            .resample_at,
+        verdict.resample_at,
+        "CONTROL: an observation does not push a deadline that is not due"
+    );
+    assert!(
+        !logged.iter().any(|line| line.contains("is on hold")),
+        "CONTROL: nor say the hold again: {logged:?}"
+    );
+
+    assert!(model.fire("TrialRoomMoves", &mut modeled));
+    let _ = app.reconcile_native_update_facts(facts(4, fresh.clone()));
+    let real = observe(&app, true, false);
+    assert_exact_model_action(&model, "Decide", &modeled, &real);
+    assert!(
+        app.auto_apply_manual_only.is_some(),
+        "CONTROL: regained room waits out the day"
+    );
+    assert!(!app.latched_activation_trial_spent(11));
+    assert_eq!(
+        app.apply_retry_for(Some(11)),
+        crate::update_apply_trouble::ApplyRetry::Scheduled
+    );
+    modeled = real;
+
+    day_passes(&mut app, &mut modeled);
+    assert!(due_look(&mut app), "the next day releases it");
+    let real = observe(&app, true, true);
+    assert_exact_model_action(&model, "Decide", &modeled, &real);
+    assert_eq!(
+        (real["latched"], real["owed"]),
+        (0, 0),
+        "the re-sample taken"
+    );
 }
 
 #[test]
@@ -2469,10 +2858,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_exact_model_action(&model, "Decide", &modeled, &real);
     let latch = app.auto_apply_manual_only.expect("the latch stands");
     let verdict = app.auto_apply_structural_verdict.expect("the verdict");
-    let tomorrow = std::time::Instant::now() + crate::app_native::STRUCTURAL_RESAMPLE_AFTER;
-    let a_day_out = |at: Option<std::time::Instant>| {
-        at.is_some_and(|at| at <= tomorrow && at + std::time::Duration::from_secs(60) >= tomorrow)
-    };
     assert!(
         a_day_out(verdict.resample_at) && a_day_out(latch.retry_at),
         "{case}: the re-sample and the latch's deadline move a day: {verdict:?} {latch:?}"
@@ -2480,7 +2865,7 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_eq!(
         (verdict.unproven_looks, verdict.unmeasured_looks),
         (0, 0),
-        "{case}: a fresh count for the next day; the unread count untouched"
+        "{case}: a fresh count of each kind for the next day"
     );
     assert_eq!(
         real["said"], 0,
@@ -2512,6 +2897,142 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_eq!(
         (real["latched"], real["doubts"], real["owed"]),
         (0, 0, 0),
-        "{case}: the one re-sample taken"
+        "{case}: the re-sample taken"
+    );
+}
+
+/// A TRIAL HOLD MOVES A LATCH DEADLINE THAT CAME DUE BEFORE ITS RE-SAMPLE: a passing failure's retry
+/// can come due while the re-sample is still a day out, and while a refused newer release waits out
+/// its own retry every lapse goes to the look. The hold for the trial left that deadline where it
+/// was, so the event loop woke on it every turn until the re-sample or the newer retry came due. Now
+/// it moves to the re-sample. CONTROL: once moved, a look before it is due moves nothing.
+#[test]
+fn a_trial_hold_moves_a_latch_deadline_due_before_its_re_sample() {
+    use crate::app_native::ActivationSupersedeCompletion;
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let spent = installed_bundle(11, crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1);
+    let mut app = converged_on_11(spent.clone());
+    let _ = app.reconcile_native_update_facts(observation(2, Some(spent.clone()), None, false));
+    assert!(
+        app.latched_activation_trial_spent(11),
+        "PRECONDITION: no launch to spare"
+    );
+    let _ = app.reconcile_native_update_facts(observation(3, Some(spent.clone()), Some(12), false));
+    let job = app
+        .native_activation_supersede
+        .clone()
+        .expect("PRECONDITION: 12 is offered the install path");
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Err(aterm_update::SupersedeRefusal::ForNow(
+            "apply lock: busy".to_string(),
+        )),
+        facts: Some(observation(4, Some(spent), Some(12), false)),
+    });
+    let now = std::time::Instant::now();
+    assert!(
+        app.native_activation_supersede.is_none()
+            && app
+                .activation_replacement_retry_at()
+                .is_some_and(|at| at > now),
+        "PRECONDITION: 12 waits out its retry"
+    );
+    let resample_at = app
+        .auto_apply_structural_verdict
+        .and_then(|verdict| verdict.resample_at)
+        .expect("PRECONDITION: the re-sample is owed");
+    assert!(resample_at > now, "PRECONDITION: and not yet due");
+
+    assert!(!due_look(&mut app), "the hold releases nothing");
+    assert_eq!(
+        app.auto_apply_manual_only.and_then(|latch| latch.retry_at),
+        Some(resample_at),
+        "the due deadline moves to the re-sample, so the fold does not wake on it every turn"
+    );
+    assert_eq!(
+        app.auto_apply_structural_verdict
+            .and_then(|verdict| verdict.resample_at),
+        Some(resample_at),
+        "and the re-sample stays where it was"
+    );
+    let moved = app.auto_apply_manual_only;
+    assert!(!app.lapse_expired_auto_apply_manual_only());
+    assert_eq!(
+        app.auto_apply_manual_only, moved,
+        "CONTROL: a look before it is due moves nothing"
+    );
+}
+
+/// AN ACCEPTED RETIRE HOLDS EVERY APPLY ONLY WITHIN A BOUND: it waits for a read requested after it
+/// to confirm the old install place. A read that kept failing to (here, one that could not check the
+/// installed bundle) held every update, a person's press included, for the life of the process. Now
+/// each due look asks for a fresh read, and the due look after the last ask ends the hold. CONTROLS:
+/// an unproven read ends nothing, nor does a look before it is due, and the event loop folds each
+/// look.
+#[test]
+fn an_accepted_retire_that_no_read_confirms_holds_within_a_bound() {
+    use crate::app_native::{ActivationSupersedeCompletion, RETIRE_CONFIRM_ASKS};
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_bundle(11, 0);
+    let mut app = converged_on_11(installed.clone());
+    let _ = app.reconcile_native_update_facts(observation(2, Some(installed.clone()), None, false));
+    let _ = app.reconcile_native_update_facts(observation(3, Some(installed), Some(12), false));
+    let job = app
+        .native_activation_supersede
+        .clone()
+        .expect("PRECONDITION: 12 is offered the install path");
+    app.next_native_update_reconcile_sequence = 4;
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Ok(aterm_update::SupersededActivation {
+            activation_build: 11,
+            restored_build: 10,
+            newer_build: 12,
+            trial_launches: 0,
+            trial_disarm_deferred: None,
+        }),
+        facts: None,
+    });
+    let held = |app: &mut crate::App| {
+        matches!(
+            app.apply_native_update(crate::native_updater_service::ApplyMode::Immediate),
+            crate::native_app::UpdateOutcome::Deferred { .. }
+        )
+    };
+    for ask in 0..=RETIRE_CONFIRM_ASKS {
+        // Each read is requested after the retire answered, so each is past its floor (4).
+        let sequence = 4 + u64::from(ask);
+        let _ = app.reconcile_native_update_facts(observation(sequence, None, Some(12), true));
+        let job = app
+            .native_activation_supersede
+            .clone()
+            .expect("CONTROL: an unproven read confirms nothing");
+        assert!(
+            job.awaiting_facts.is_some() && job.confirm_asks == ask,
+            "ask {ask}: {job:?}"
+        );
+        assert!(held(&mut app), "ask {ask}: a press waits for the read");
+        let at = job.look_at;
+        assert!(at > std::time::Instant::now(), "ask {ask}: its next look");
+        assert_eq!(
+            app.activation_replacement_retry_at(),
+            Some(at),
+            "CONTROL: ask {ask}: the event loop folds the look"
+        );
+        let _ = app.lapse_expired_auto_apply_manual_only();
+        assert_eq!(
+            app.native_activation_supersede.as_ref(),
+            Some(&job),
+            "CONTROL: ask {ask}: a look before it is due moves nothing"
+        );
+        app.native_activation_supersede
+            .as_mut()
+            .expect("the hold")
+            .look_at = past();
+        let _ = app.lapse_expired_auto_apply_manual_only();
+    }
+    assert!(
+        app.native_activation_supersede.is_none(),
+        "the due look after the last ask ends the hold"
     );
 }

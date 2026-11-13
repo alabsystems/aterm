@@ -451,8 +451,8 @@ pub struct FleetJoin {
     pub phase: Phase,
     /// Whether it exited 0 and the instance listens.
     pub ok: bool,
-    /// Its words when it did not (one line), or, where it did, what its `allow drive --all`
-    /// said when that failed.
+    /// Its words when it did not (one line), or, where it did, what its `allow drive --all` or
+    /// its `access full` said when that failed.
     pub words: String,
 }
 
@@ -2395,10 +2395,13 @@ fn form_fleet(lane: &mut Lane) -> Result<(), Fail> {
     }
     for mac in fleet_before() {
         lane.aterm_ok(mac, &["fleet", "allow", "drive", "--all"], None)?;
+        // Each lab Mac starts Read Only: the grant alone would admit no spawn, turn or mail.
+        lane.aterm_ok(mac, &["fleet", "access", "full"], None)?;
     }
     lane.formed = Some(Instant::now());
     lane.say(&format!(
-        "fleet formed: a1 minted its secret; joined: {}; every member allows drive --all",
+        "fleet formed: a1 minted its secret; joined: {}; every member allows drive --all at Full \
+         Access",
         joined.join(", ")
     ));
     Ok(())
@@ -2655,6 +2658,11 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             let mut why = deaf;
             why.extend(refused.into_iter().map(|r| format!("drive {r}")));
             why.extend(unbound);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a reading of this Mac's cores for a report, not a pool's size"
+            )]
+            let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
             return Err(Fail::exit(
                 3,
                 format!(
@@ -2662,8 +2670,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
                     HANG.as_secs(),
                     why.join("; "),
                     crate::bench_stats::load_average().map_or(String::new(), |l| format!(
-                        " (this Mac's 1-minute load {l:.1} on {} cores)",
-                        std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
+                        " (this Mac's 1-minute load {l:.1} on {cores} cores)"
                     ))
                 ),
             ));
@@ -3284,18 +3291,27 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
 }
 
 /// b3's `aterm fleet join` at the member its spec names, and, where it joined, its `allow drive
-/// --all`, as every other member's, said on the timeline.
+/// --all` and `access full`, as every other member's, said on the timeline.
 fn join_b3(lane: &Lane, phase: Phase) -> FleetJoin {
     let at = spec("b3").joins_at.unwrap_or("b1");
     let (ok, mut words) = lane.fleet_join("b3", at);
     if ok {
-        let out = lane.aterm("b3", &["fleet", "allow", "drive", "--all"], None);
-        if out.code != 0 {
-            words = format!(
-                "joined; allow drive --all exited {}: {}",
-                out.code,
-                one_line(&format!("{} {}", out.stdout, out.stderr))
-            );
+        for (said, args) in [
+            (
+                "allow drive --all",
+                &["fleet", "allow", "drive", "--all"][..],
+            ),
+            ("access full", &["fleet", "access", "full"][..]),
+        ] {
+            let out = lane.aterm("b3", args, None);
+            if out.code != 0 {
+                words = format!(
+                    "joined; {said} exited {}: {}",
+                    out.code,
+                    one_line(&format!("{} {}", out.stdout, out.stderr))
+                );
+                break;
+            }
         }
     }
     lane.say(&format!(
@@ -3354,10 +3370,14 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
     let _ = writeln!(out, "The cut lasted {:.1}s.", secs(ev.cut_ms));
     let _ = writeln!(out);
     if !ev.load.is_empty() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a reading of this Mac's cores for a report, not a pool's size"
+        )]
+        let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
         let _ = writeln!(
             out,
-            "This Mac: {} cores; 1-minute load {}.",
-            std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+            "This Mac: {cores} cores; 1-minute load {}.",
             ev.load
                 .iter()
                 .map(|(at, l)| format!("{l:.1} at the {at}"))

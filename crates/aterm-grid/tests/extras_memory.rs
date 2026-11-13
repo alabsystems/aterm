@@ -5,25 +5,34 @@
 
 use aterm_bench::allocator::{Observed, Observer};
 use std::alloc::System;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
-static ALLOCATED: AtomicU64 = AtomicU64::new(0);
-static FREED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// The bytes this thread allocated and freed. The grids are built and measured on the test's
+    /// own thread, so no other thread's allocation is charged to them: a process-wide count took
+    /// whatever another thread allocated or freed inside a measured window as the grid's.
+    static ALLOCATED: Cell<u64> = const { Cell::new(0) };
+    static FREED: Cell<u64> = const { Cell::new(0) };
+}
 struct Counting;
 
-// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+// SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
 unsafe impl Observer for Counting {
     fn retained(&self, old: usize, new: usize) {
-        ALLOCATED.fetch_add(new as u64, Ordering::Relaxed);
-        FREED.fetch_add(old as u64, Ordering::Relaxed);
+        let _ = ALLOCATED.try_with(|bytes| bytes.set(bytes.get().wrapping_add(new as u64)));
+        let _ = FREED.try_with(|bytes| bytes.set(bytes.get().wrapping_add(old as u64)));
     }
 }
 
 #[global_allocator]
 static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
+/// This thread's live bytes, wrapping: it may free what another thread allocated (the harness
+/// hands it its test), so only the difference of two readings on this thread means anything.
 fn live() -> u64 {
-    ALLOCATED.load(Ordering::Relaxed) - FREED.load(Ordering::Relaxed)
+    ALLOCATED
+        .with(Cell::get)
+        .wrapping_sub(FREED.with(Cell::get))
 }
 
 #[test]
@@ -64,7 +73,7 @@ fn sparse_extras_estimate_covers_retained_table_allocations() {
             if state == "clear" {
                 grid.extras_mut().clear();
             }
-            let retained = live() - allocated;
+            let retained = live().wrapping_sub(allocated);
             let reported = grid.memory_used() - baseline;
             let expected = match state {
                 "full" => entries,
@@ -109,16 +118,19 @@ fn sparse_erase_shrinks_retained_buckets() {
                 .set_underline_color_u32(Some(0x02000007));
         }
         grid.extras_mut().clear_range(0, 0, entries - keep);
-        let retained = live() - baseline;
+        let retained = live().wrapping_sub(baseline);
         let reported = grid.memory_used() - reported_baseline;
-        assert!((reported as u64) >= retained && (reported as u64) <= retained + 32);
+        assert!(
+            (reported as u64) >= retained && (reported as u64) <= retained + 32,
+            "entries={entries} keep={keep}: {reported} bytes reported for {retained} retained"
+        );
         for col in entries - keep..entries {
             reference
                 .extras_mut()
                 .get_or_create(aterm_grid::CellCoord::new(0, col))
                 .set_underline_color_u32(Some(0x02000007));
         }
-        let fresh = live() - baseline - retained;
+        let fresh = live().wrapping_sub(baseline).wrapping_sub(retained);
         assert_eq!(grid.extras().len(), usize::from(keep));
         for col in entries - keep..entries {
             assert_eq!(

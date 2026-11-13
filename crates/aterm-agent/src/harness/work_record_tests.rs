@@ -9,15 +9,20 @@ use super::*;
 /// path is never chosen, whichever input holds it.
 #[test]
 fn each_agent_finds_its_folder() {
-    let tail = concat!(
-        "{\"type\":\"user\",\"cwd\":\"/work/first\"}\n",
-        "{\"type\":\"assistant\",\"cwd\":\"/work/now\"}\n",
-        "{\"type\":\"assistant\"}\n",
+    let tail = format!(
+        "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n\
+         {{\"type\":\"assistant\",\"cwd\":\"{}\"}}\n\
+         {{\"type\":\"assistant\"}}\n",
+        at!("/work/first"),
+        at!("/work/now"),
     );
-    let (rollout, engine) = (Path::new("/work/rollout"), Path::new("/work/engine"));
+    let (rollout, engine) = (
+        Path::new(at!("/work/rollout")),
+        Path::new(at!("/work/engine")),
+    );
     let every = Folders {
-        started: Some("/work/started"),
-        transcript: Some(tail),
+        started: Some(at!("/work/started")),
+        transcript: Some(&tail),
         rollout: Some(rollout),
         engine: Some(engine),
     };
@@ -28,29 +33,29 @@ fn each_agent_finds_its_folder() {
         engine: Some(engine),
     };
     let rows: [(Program, Folders<'_>, Option<&str>); 9] = [
-        (Program::Claude, every, Some("/work/now")),
+        (Program::Claude, every, Some(at!("/work/now"))),
         (
             Program::Claude,
             Folders {
                 transcript: None,
                 ..every
             },
-            Some("/work/started"),
+            Some(at!("/work/started")),
         ),
-        (Program::Claude, unstarted, Some("/work/engine")),
-        (Program::Codex, every, Some("/work/rollout")),
+        (Program::Claude, unstarted, Some(at!("/work/engine"))),
+        (Program::Codex, every, Some(at!("/work/rollout"))),
         (
             Program::Codex,
             Folders {
                 rollout: None,
                 ..every
             },
-            Some("/work/started"),
+            Some(at!("/work/started")),
         ),
-        (Program::Codex, unstarted, Some("/work/engine")),
-        (Program::Agy, every, Some("/work/started")),
-        (Program::Generic, every, Some("/work/started")),
-        (Program::Muse, unstarted, Some("/work/engine")),
+        (Program::Codex, unstarted, Some(at!("/work/engine"))),
+        (Program::Agy, every, Some(at!("/work/started"))),
+        (Program::Generic, every, Some(at!("/work/started"))),
+        (Program::Muse, unstarted, Some(at!("/work/engine"))),
     ];
     for (agent, at, want) in rows {
         assert_eq!(

@@ -2041,3 +2041,37 @@ fn a_sighting_never_says_signed_in_over_an_ended_login() {
     facts.fold(&ev(400, Kind::SignedIn, account));
     assert_eq!(word(&facts), Some(("in", 400)));
 }
+
+/// This Mac's book hears a heal and a withdrawal as a peer does: `auth` saying `ok` is `in` over
+/// an older `signed-out`, and `auth` saying `unseen` withdraws the word, which the book keeps
+/// (and saves) so an older event folded later restores nothing, while its `use` row and its
+/// readers are given no sign-in at all.
+/// NEGATIVE CONTROLS: with the `Kind::Auth` arm of `Event::signin` removed, `` left:
+/// Some(("out", 100)) right: Some(("in", 200)) ``; with `use_row` writing the held word unfiltered
+/// (`SignIn::stated` not asked), the row says `unknown`: `` left: Object {"cli": …, "state":
+/// String("unknown"), …} right: Null ``.
+#[test]
+fn the_book_hears_a_heal_and_keeps_a_withdrawn_word_to_itself() {
+    let account = pk("unicorn.m15.2@proton.example");
+    let auth = |t, why: &str| Event {
+        why: Word::new(why),
+        ..ev(t, Kind::Auth, account)
+    };
+    let word = |facts: &Facts| facts.signin.as_ref().map(|s| (s.state, s.t));
+    let mut facts = Facts::default();
+    facts.fold(&ev(100, Kind::SignedOut, account));
+    facts.fold(&auth(150, "epoch"));
+    assert_eq!(word(&facts), Some(("out", 100)), "no word in an epoch");
+    facts.fold(&auth(200, "ok"));
+    assert_eq!(word(&facts), Some(("in", 200)));
+    facts.fold(&auth(300, "unseen"));
+    facts.fold(&ev(250, Kind::SignedIn, account));
+    assert_eq!(word(&facts), Some(("unknown", 300)), "kept against older");
+    let row = facts.use_row(1, 0, 400, caps::USE_ROW).unwrap();
+    assert_eq!(row["signin"], Value::Null, "no reader is given it");
+    let mut book = Book::default();
+    book.accounts.insert(account, facts);
+    assert_eq!(book.facts(400).accounts[&account].signin, None);
+    let back = Book::from_value(&book.to_value());
+    assert_eq!(word(&back.accounts[&account]), Some(("unknown", 300)));
+}

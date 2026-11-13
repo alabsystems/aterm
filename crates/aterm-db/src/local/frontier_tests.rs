@@ -87,7 +87,7 @@ fn private_database_writes_and_retries_survive_wide_frontiers() {
                 .len(),
             writers
         );
-        let count = db.history.index.inventory().count();
+        let count = db.history.index().inventory().count();
         assert!(db.commit(write(1, "reused", json!(true))).is_err());
         assert!(
             db.commit(Command::Write {
@@ -96,11 +96,11 @@ fn private_database_writes_and_retries_survive_wide_frontiers() {
             })
             .is_err()
         );
-        assert_eq!(db.history.index.inventory().count(), count);
+        assert_eq!(db.history.index().inventory().count(), count);
         let oversized = write(9, "oversized", json!("x".repeat(crypto::MAX_BODY)));
         assert!(Command::decode(&oversized.encode().unwrap()).is_err());
         assert!(db.commit(oversized).is_err());
-        assert_eq!(db.history.index.inventory().count(), count);
+        assert_eq!(db.history.index().inventory().count(), count);
         let request = write(3, "after", json!(true));
         let receipt = db.commit(request.clone()).unwrap();
         let after = db.view();
@@ -109,13 +109,13 @@ fn private_database_writes_and_retries_survive_wide_frontiers() {
             after.cells[&("example".into(), "shared".into())],
             before.cells[&("example".into(), "shared".into())]
         );
-        assert!(db.history.index.inventory().count() > count + 1);
+        assert!(db.history.index().inventory().count() > count + 1);
         if writers > 2 * MAX_PARENTS {
-            assert!(db.history.index.inventory().count() >= count + 3);
+            assert!(db.history.index().inventory().count() >= count + 3);
         }
         assert_eq!(db.commit(request).unwrap(), receipt);
-        for id in db.history.index.inventory() {
-            assert!(db.history.index.get(id).unwrap().parents.len() <= MAX_PARENTS);
+        for id in db.history.index().inventory() {
+            assert!(db.history.index().get(id).unwrap().parents.len() <= MAX_PARENTS);
         }
         drop(db);
         let retained = wires(&peers.paths[0]);
@@ -148,7 +148,7 @@ fn private_database_fixed_share_receipts_do_not_need_the_whole_frontier() {
     let mut db = Database::open(&peers.paths[1]).unwrap();
     assert_eq!(db.view().causal.heads.len(), MAX_PARENTS + 1);
     let first = db.spend([3; 16], "window", 2).unwrap();
-    assert_eq!(db.history.index.get(&first).unwrap().parents.len(), 2);
+    assert_eq!(db.history.index().get(&first).unwrap().parents.len(), 2);
     assert_eq!(db.spend([3; 16], "window", 2).unwrap(), first);
     assert_eq!(db.view().spent[&(grant, actor)], 2);
     drop(db);
@@ -161,7 +161,7 @@ fn private_database_fixed_share_receipts_do_not_need_the_whole_frontier() {
     peers.receive(1, &wires(&peers.paths[0]));
     let mut db = Database::open(&peers.paths[1]).unwrap();
     let last = db.spend([5; 16], "window", 1).unwrap();
-    assert!(db.history.index.get(&last).unwrap().parents.len() <= 2);
+    assert!(db.history.index().get(&last).unwrap().parents.len() <= 2);
     assert_eq!(db.spend([5; 16], "window", 1).unwrap(), last);
     assert_eq!(db.view().spent[&(grant, actor)], 3);
     assert_eq!(db.view().liability[&(grant, actor)], 3);
@@ -204,18 +204,18 @@ fn a_valid_spend_retry_survives_withdrawn_catalog_ancestry() {
     assert!(!view.causal.ordered.contains(&receipt));
     assert_eq!(view.spent[&(grant, actor)], 1);
     assert_eq!(view.liability[&(grant, actor)], 1);
-    let count = db.history.index.inventory().count();
+    let count = db.history.index().inventory().count();
     assert_eq!(db.spend([4; 16], "window", 1).unwrap(), receipt);
-    assert_eq!(db.history.index.inventory().count(), count);
+    assert_eq!(db.history.index().inventory().count(), count);
     assert_eq!(db.view().spent[&(grant, actor)], 1);
     let final_receipt = db.spend([6; 16], "window", 1).unwrap();
     assert!(!db.view().causal.ordered.contains(&final_receipt));
     assert_eq!(db.view().spent[&(grant, actor)], 2);
     assert_eq!(db.view().liability[&(grant, actor)], 2);
-    let final_count = db.history.index.inventory().count();
+    let final_count = db.history.index().inventory().count();
     assert_eq!(db.spend([6; 16], "window", 1).unwrap(), final_receipt);
     assert_eq!(db.spend([4; 16], "window", 1).unwrap(), receipt);
-    assert_eq!(db.history.index.inventory().count(), final_count);
+    assert_eq!(db.history.index().inventory().count(), final_count);
     assert!(db.spend([7; 16], "window", 1).is_err());
     assert!(db.commit(write(8, "still-revoked", json!(true))).is_err());
 }
@@ -243,13 +243,13 @@ fn pending_budget_history_cannot_authorize_a_debit() {
     let view = db.view();
     assert!(view.causal.pending.contains(&grant));
     assert_eq!(view.budgets["window"], vec![grant]);
-    let count = db.history.index.inventory().count();
+    let count = db.history.index().inventory().count();
     let result = db.spend([3; 16], "window", 1);
     assert!(
         result.is_err(),
         "pending grant authorized a debit: {result:?}"
     );
-    assert_eq!(db.history.index.inventory().count(), count);
+    assert_eq!(db.history.index().inventory().count(), count);
     assert!(view.disputed_shares.contains(&(grant, actor)));
 
     db.ingest(&predecessor_wire).unwrap();
@@ -257,8 +257,8 @@ fn pending_budget_history_cannot_authorize_a_debit() {
     let receipt = db.spend([3; 16], "window", 1).unwrap();
     assert_eq!(db.view().spent[&(grant, actor)], 1);
     assert_eq!(db.view().liability[&(grant, actor)], 1);
-    let count = db.history.index.inventory().count();
+    let count = db.history.index().inventory().count();
     assert_eq!(db.spend([3; 16], "window", 1).unwrap(), receipt);
-    assert_eq!(db.history.index.inventory().count(), count);
+    assert_eq!(db.history.index().inventory().count(), count);
     assert!(db.view().invalid.is_empty());
 }

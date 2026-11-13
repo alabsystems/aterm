@@ -25,6 +25,9 @@ fn census_ranks_destinations_and_reports_incomplete_delivery() {
     assert_eq!(census.ranked(&["/owned".into()])[0].1, 3);
 }
 
+/// On Unix only: the roots are Unix absolute paths (`/owned/state`), which Windows reads as
+/// relative and the census refuses; the capture itself is macOS's.
+#[cfg(unix)]
 #[test]
 fn focused_files_distinguish_journals_and_keys_without_hiding_global_drops() {
     let mut files = Census::configured(&["/owned/state".into()], true).unwrap();

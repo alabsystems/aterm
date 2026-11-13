@@ -14,6 +14,7 @@ pub(in crate::harness) enum CataloguePhase {
     Quarantined,
     NotDispatched,
     Rejected,
+    Retired,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

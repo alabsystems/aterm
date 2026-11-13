@@ -2311,6 +2311,24 @@ fn taped(
     Repair,
     Vec<crate::control::peer_check::tape::Step>,
 ) {
+    responded(initiator, responder, wire, |answer| {
+        let ((result, repair), tape) = crate::control::peer_check::tape::recorded(answer);
+        (result, repair, tape)
+    })
+}
+
+/// The responder's side of a session: what it returned, and its repair.
+type Answer<'a> = Box<dyn FnOnce() -> (Result<Report>, Repair) + 'a>;
+
+/// One session from `initiator` to `responder` under `wire` over loopback, the responder's side
+/// answered inside `within`, on the responder's own thread, which is handed it to call: what
+/// `within` gave.
+fn responded<W: Send>(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    wire: Wire,
+    within: impl FnOnce(Answer<'_>) -> W + Send,
+) -> W {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let run = |endpoint: &Endpoint, peer: &Endpoint, mut stream: TcpStream, side: Side| {
@@ -2337,9 +2355,9 @@ fn taped(
             )
             .unwrap()
             .0;
-            crate::control::peer_check::tape::recorded(|| {
+            within(Box::new(|| {
                 run(responder, initiator, stream, Side::Responder)
-            })
+            }))
         });
         let _ = run(
             initiator,
@@ -2347,8 +2365,7 @@ fn taped(
             TcpStream::connect(address).unwrap(),
             Side::Initiator,
         );
-        let ((result, repair), tape) = answered.join().unwrap();
-        (result, repair, tape)
+        answered.join().unwrap()
     })
 }
 
@@ -2441,6 +2458,194 @@ fn every_grant_of_a_real_session_spends_one_fresh_pass() {
             "{wire:?}: a refused Mac is granted nothing"
         );
     }
+}
+
+/// Lab Macs 1 and 2 founded together ([`founded_then_removed`]'s genesis log): Mac 2 with that log
+/// as its evidence and no records custody, and Mac 1 holding it in records custody of its own, so
+/// each of Mac 1's checks of Mac 2 reads every stage of a log endpoint.
+fn founded_pair(lab: &Lab) -> (Endpoint, Endpoint, Log) {
+    drop(lab.journal(1));
+    let (founded, _) = founded_then_removed(lab);
+    let witnessed = witnessed(lab, 1, founded.clone());
+    let custodied = custodied(lab, 0, "kept", founded.clone(), &founded);
+    (witnessed, custodied, founded)
+}
+
+/// Whether a writer's exclusive take of the state lock of the vault at `paths`, tried once on a
+/// descriptor of its own, takes it; one that does lets it go at once.
+fn writer_takes(paths: &client::Paths) -> bool {
+    let file = aterm_uds::private_file::open_private(&paths.dir, ".lock")
+        .unwrap()
+        .0;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a writer's one try at the vault's state lock, let go at once by File::unlock"
+    )]
+    let attempt = file.try_lock();
+    match attempt {
+        Ok(()) => {
+            file.unlock().unwrap();
+            true
+        }
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(error) => panic!("the writer's take of the state lock failed: {error}"),
+    }
+}
+
+/// P-L1: a peer check reads every stage through one look at the vault (`peer_check::check`'s
+/// kept look). Over a quiet `atdb/5` session from a Mac whose evidence is its log to a Mac that
+/// holds that log in records custody ([`founded_pair`]), after a session that warmed the memos,
+/// each of the responder's checks opens one look on an observation of its own
+/// (`client::test_looks_observed`), its files judged settled (`client::test_as_if_later`,
+/// installed in the responder's thread, as it and these counts are each thread's own). The files
+/// the vault's memos read are stamped through that look (`client::Derivations::vault_stamps`),
+/// held to at least once and not to exactly once: in this crate's test process aterm-secrets'
+/// cache of what `state.toml` showed (`STATE_LOOKS`) keeps at most sixteen folders, the oldest let
+/// go first, which every test running beside this one fills, and an entry let go before a check's
+/// first stamping makes that stamping read the file afresh, which the look then does not keep, so
+/// its next ask stamps again. The exact count is aterm-secrets' own look laws', whose test process
+/// keeps every live folder. CONTROL: each check reads four stages (the roster, every record held,
+/// the acknowledged log, and that log with the peer's evidence).
+///
+/// NEGATIVE CONTROL (2026-11-11): with the Held stage on a look of its own again
+/// (`held(&VaultLook::new(paths), ..)`), each check opens two looks.
+#[test]
+fn a_peer_check_reads_every_stage_through_one_look() {
+    use crate::control::peer_check::tape::{self, Step};
+    let lab = Lab::new();
+    let (mac2, responder, _) = founded_pair(&lab);
+    let session = || {
+        responded(&mac2, &responder, Wire::Delta, |answer| {
+            client::test_as_if_later(std::time::Duration::from_secs(3600), || {
+                let (((result, _), checks), steps) =
+                    tape::recorded(|| tape::probed(|_| {}, |_| {}, answer));
+                (result, checks, steps)
+            })
+        })
+    };
+    let (warmed, _, _) = session();
+    assert!(warmed.is_ok(), "the warming session: {warmed:?}");
+    let (result, checks, steps) = session();
+    assert!(result.is_ok(), "{result:?}");
+    let mut reads = Vec::new();
+    for step in &steps {
+        match step {
+            Step::Begin(..) => reads.push(0),
+            Step::Read(..) => *reads.last_mut().expect("a read inside a check") += 1,
+            Step::Pass | Step::Refuse | Step::Grant => {}
+        }
+    }
+    assert!(
+        !reads.is_empty() && reads.iter().all(|reads| *reads == 4),
+        "CONTROL: each check reads its four stages: {steps:?}"
+    );
+    assert_eq!(
+        checks.len(),
+        reads.len(),
+        "each check is counted: {checks:?}"
+    );
+    assert!(
+        checks
+            .iter()
+            .all(|checked| checked.looks == 1 && checked.vault_stamps >= 1),
+        "each check reads every stage through one look: {checks:?}"
+    );
+}
+
+/// P-L2: no writer of the state lock enters between a peer check's stages. Wherever one of the
+/// session's responder's checks ended a stage it read and has not asked for the next
+/// (`peer_check::tape::between`), a writer's exclusive take of the vault's state lock, tried once
+/// on a descriptor of its own ([`writer_takes`]), finds it held: the check's look holds it shared
+/// from its first stage to its last. It judges only whether the vault's state lock is held at each
+/// boundary, which the check's kept look decides whatever its memos keep, so it needs no settled
+/// files (`client::test_as_if_later`) and no warming session. CONTROL: the same take after the
+/// session takes the lock.
+///
+/// NEGATIVE CONTROL (2026-11-11): with each stage on a look of its own again, let go at its arm's
+/// end (`&VaultLook::new(paths)` in each arm), the take takes the lock at every boundary.
+#[test]
+fn no_state_lock_writer_enters_between_a_peer_checks_stages() {
+    use crate::control::peer_check::tape;
+    let lab = Lab::new();
+    let (mac2, responder, _) = founded_pair(&lab);
+    let (result, boundaries) = responded(&mac2, &responder, Wire::Delta, |answer| {
+        let taken = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let between = {
+            let taken = taken.clone();
+            move |paths: &client::Paths| taken.borrow_mut().push(writer_takes(paths))
+        };
+        let ((result, _), _) = tape::probed(|_| {}, between, answer);
+        (result, taken.take())
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        !boundaries.is_empty(),
+        "CONTROL: the responder's checks read stages"
+    );
+    assert!(
+        boundaries.iter().all(|taken| !taken),
+        "a writer took the vault's state lock between a check's stages: {boundaries:?}"
+    );
+    assert!(
+        writer_takes(responder.paths.as_ref().unwrap()),
+        "CONTROL: the same take after the session takes the lock"
+    );
+}
+
+/// P-L3: a stage after a look that holds nothing takes a look of its own. A writer holds the
+/// vault's state lock exclusively as a check begins, so the look its Roster stage takes observes
+/// nothing (the vault is busy), and lets go once that look is taken
+/// (`peer_check::tape::look_taken`): the check passes, through two looks, the Held stage's its own
+/// (`client::test_looks_observed`). CONTROL: with no writer the same check passes through one.
+///
+/// NEGATIVE CONTROL (2026-11-11): with `peer_check::through` keeping any look it holds, whether or
+/// not it holds the vault (its `holds_vault` test left out), the contended check passes through
+/// one look.
+#[test]
+fn a_stage_after_a_look_that_holds_nothing_takes_a_look_of_its_own() {
+    use crate::control::peer_check::{self, Judged, tape};
+    let lab = Lab::new();
+    let (_, responder, founded) = founded_pair(&lab);
+    let judged = Judged::Peer {
+        request: &lab.requests[1],
+        log: Some(&founded),
+    };
+    let checked = |writer: Option<std::fs::File>| {
+        let mut writer = writer;
+        let before = client::test_looks_observed();
+        let (passed, checks) = tape::probed(
+            move |_| {
+                if let Some(writer) = writer.take() {
+                    writer.unlock().unwrap();
+                }
+            },
+            |_| {},
+            || peer_check::check(responder.custody(), responder.trust, &judged),
+        );
+        (
+            passed.map(peer_check::Pass::waive),
+            client::test_looks_observed() - before,
+            checks,
+        )
+    };
+    let (passed, looks, checks) = checked(None);
+    assert!(passed.is_ok(), "CONTROL: {passed:?}");
+    assert_eq!(looks, 1, "CONTROL: one look with no writer: {checks:?}");
+    let writer =
+        aterm_uds::private_file::open_private(&responder.paths.as_ref().unwrap().dir, ".lock")
+            .unwrap()
+            .0;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a writer holds the vault's state lock as the check begins; its probe lets go"
+    )]
+    writer.try_lock().unwrap();
+    let (passed, looks, checks) = checked(Some(writer));
+    assert!(passed.is_ok(), "{passed:?}");
+    assert_eq!(
+        looks, 2,
+        "a stage after a look that holds nothing takes its own: {checks:?}"
+    );
 }
 
 /// What a test names `protocol` by: its ALPN, or none.

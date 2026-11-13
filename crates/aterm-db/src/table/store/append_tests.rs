@@ -4,6 +4,156 @@
 use super::*;
 use crate::table::tests::frontier::built_wide_lab;
 
+/// A retained application payload needs no second cryptographic opening merely to find that it
+/// is not a removal cutoff. A real cutoff still opens, under the ordinary fresh key admission.
+#[test]
+fn retained_non_cut_payloads_avoid_decryption_but_cutoffs_still_open() {
+    journals::with_own(
+        std::sync::Arc::new(journals::Journals::new(1, 64 * 1024, 64 * 1024)),
+        || {
+            let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+            let bootstrap = lab.bootstrap(0);
+            let session = Session::open(&bootstrap).unwrap();
+            let directory = lab._home.path().join("retained-payload");
+            let mut store = Store::create(&session, &directory).unwrap();
+            let scope = store.scope();
+            store
+                .commit_catalog(&session, b"first application record")
+                .unwrap();
+            let cut = cutoff::Cut {
+                actor: session.actor(),
+                through: None,
+            };
+            store
+                .commit_catalog(&session, &cutoff::encode(&cut))
+                .unwrap();
+            store
+                .commit_catalog(&session, b"second application record")
+                .unwrap();
+            drop((store, session));
+            let session = Session::observe(&bootstrap).unwrap();
+            let warm = Store::observe(&session, &directory, scope).unwrap();
+            assert_eq!(
+                warm.records
+                    .values()
+                    .filter(|record| record.cut.is_some())
+                    .count(),
+                1
+            );
+            let before = crate::crypto::test_cipher_constructions();
+            let observed = Store::observe(&session, &directory, scope).unwrap();
+            for (id, retained) in &warm.records {
+                assert_eq!(
+                    observed.records[id].wire.as_ptr(),
+                    retained.wire.as_ptr(),
+                    "replays share immutable ciphertext instead of copying it"
+                );
+            }
+            drop(warm);
+            assert_eq!(observed.inventory_unchecked().len(), 3);
+            assert_eq!(
+                observed
+                    .records
+                    .values()
+                    .filter(|record| record.cut.is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                crate::crypto::test_cipher_constructions() - before,
+                1,
+                "only the cutoff needs a fresh payload opening"
+            );
+        },
+    );
+}
+
+/// A fact under another key must not hide a real cutoff. This supplies a wrong comparison
+/// token on valid signed ciphertext, then takes the real key through ordinary source admission.
+#[test]
+fn payload_facts_require_the_current_key_and_exact_ciphertext() {
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = lab._home.path().join("wrong-payload-key");
+    let mut store = Store::create(&session, &directory).unwrap();
+    let scope = store.scope();
+    let cut = cutoff::Cut {
+        actor: session.actor(),
+        through: None,
+    };
+    let receipt = store
+        .commit_catalog(&session, &cutoff::encode(&cut))
+        .unwrap();
+    let application = store
+        .commit_catalog(&session, b"application payload")
+        .unwrap();
+    let bytes = store.wire(&session, &receipt.id).unwrap().unwrap().to_vec();
+    let wire = crate::table::signatures::Identified::new(bytes);
+    let application = crate::table::signatures::Identified::new(
+        store
+            .wire(&session, &application.id)
+            .unwrap()
+            .unwrap()
+            .to_vec(),
+    );
+    let mut invalid = application.wire().to_vec();
+    invalid.truncate(invalid.len() - 64);
+    *invalid.last_mut().unwrap() ^= 1;
+    let signature = session
+        .bootstrap
+        .device()
+        .with_seed(|seed| crypto::signed(seed, crate::table::DOMAIN, &invalid))
+        .unwrap();
+    invalid.extend_from_slice(&signature);
+    let invalid = crate::table::signatures::Identified::new(invalid);
+    let envelope = crate::table::Envelope::parse_identified(scope, &wire).unwrap();
+    session
+        .with_payload_key(scope, &envelope, false, None, |key, _| {
+            let mut wrong = zeroize::Zeroizing::new(*key);
+            wrong[0] ^= 1;
+            wire.remember_non_cut(crypto::payload_key_identity(&wrong));
+            Ok(Some(()))
+        })
+        .unwrap()
+        .unwrap();
+    let sources = session.local_source_reads().unwrap();
+    let before = crate::crypto::test_cipher_constructions();
+    let decoded = sources
+        .with_store_replay(scope, 2, |batch| {
+            let (_, decoded) = batch.replay_metadata(&wire, envelope)?;
+            let (_, ordinary) = batch.replay_metadata(
+                &application,
+                crate::table::Envelope::parse_identified(scope, &application)?,
+            )?;
+            assert!(ordinary.is_none());
+            assert!(
+                batch
+                    .replay_metadata(
+                        &application,
+                        crate::table::Envelope::parse_identified(scope, &wire)?
+                    )
+                    .is_err(),
+                "another ciphertext cannot borrow the ordinary payload's fact"
+            );
+            for _ in 0..2 {
+                assert!(
+                    batch
+                        .replay_metadata(
+                            &invalid,
+                            crate::table::Envelope::parse_identified(scope, &invalid)?
+                        )
+                        .is_err(),
+                    "a correctly signed but unauthenticated payload never becomes a fact"
+                );
+            }
+            Ok(decoded)
+        })
+        .unwrap();
+    assert_eq!(decoded, Some(cut));
+    assert_eq!(crate::crypto::test_cipher_constructions() - before, 4);
+}
+
 /// At 129 writers an append needs two joins and its edit, so a bound of 3. A refusal by records,
 /// bytes, payload or a factory failure on the second join spends no table slot and writes nothing,
 /// and the exact capacity then admits the whole edit. This is the crate's one frontier wide enough
@@ -226,7 +376,23 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
         }
         walked
     };
+    let check_usage = |store: &Store, session: &Session<'_>| {
+        let walked = walked(store);
+        for actor in walked.keys().copied().chain(std::iter::once([255; 48])) {
+            let (writer_records, writer_bytes) = walked.get(&actor).copied().unwrap_or_default();
+            assert_eq!(
+                store.retained_use(session, actor).unwrap(),
+                crate::catalog::ring::Used {
+                    records: walked.values().map(|held| held.0).sum(),
+                    bytes: walked.values().map(|held| held.1).sum(),
+                    writer_records,
+                    writer_bytes,
+                }
+            );
+        }
+    };
     let mut store = Store::create(&session, &dir).unwrap();
+    check_usage(&store, &session);
     let scope = store.scope();
     for row in [&b"first"[..], b"second row", b"third, longer row"] {
         store.commit_catalog(&session, row).unwrap();
@@ -244,6 +410,9 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
         .unwrap();
     store.ingest(&session, &wire).unwrap();
     assert_eq!(counted(&store), walked(&store), "held by commit and ingest");
+    check_usage(&store, &session);
+    store.ingest(&session, &wire).unwrap();
+    check_usage(&store, &session);
     assert_eq!(
         walked(&store).len(),
         2,
@@ -251,6 +420,7 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
     );
     drop(store);
     let mut reopened = Store::open(&session, &dir, scope).unwrap();
+    check_usage(&reopened, &session);
     assert_eq!(
         counted(&reopened),
         walked(&reopened),
@@ -267,13 +437,16 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
         "a writer holding its quota is refused its next record: {refused:?}"
     );
     reopened.writer_records = 4;
+    check_usage(&reopened, &session);
     reopened
         .commit_catalog(&session, b"within the quota")
         .unwrap();
     assert_eq!(counted(&reopened), walked(&reopened));
+    check_usage(&reopened, &session);
     drop(reopened);
     let observer = Session::observe(&bootstrap).unwrap();
     let observed = Store::observe(&observer, &dir, scope).unwrap();
+    check_usage(&observed, &observer);
     assert_eq!(
         counted(&observed),
         walked(&observed),
@@ -300,15 +473,20 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
     );
     assert_eq!(combined.retained_by(&session, session.actor()).unwrap(), 4);
     assert_eq!(combined.retained_by(&session, signer.actor()).unwrap(), 1);
+    check_usage(&combined, &session);
+    check_usage(combined.observed_primary.as_ref().unwrap(), &session);
 }
 
 /// An open's replay checks each operation record's signature under the identifier its receipt took
 /// as the journal was read (`signatures::Identified`), so each operation record's wire is hashed
-/// once: a writing reopen and an observation of a table of three operation records hash three
-/// wires each, where a plain check of a record's envelope hashes its wire again.
+/// once: a writing reopen and a first observation of a table of three operation records hash
+/// three wires each, an observation of the table as it was kept (`journals`) hashes none, and
+/// one after a fourth record was committed hashes that record's alone, where a plain check of a
+/// record's envelope hashes its wire again.
 /// NEGATIVE CONTROL: `replay::restore` parsing its envelope with `Envelope::parse` hashes six.
 #[test]
 fn a_replay_hashes_each_records_wire_once() {
+    use super::journals::{Journals, as_if_later, with_own};
     use crate::table::signatures::test_hashed;
     let lab = crate::table::tests::Lab::new(&[Role::Writer]);
     let dir = lab._home.path().join("hashed-once");
@@ -332,13 +510,28 @@ fn a_replay_hashes_each_records_wire_once() {
     );
     drop(reopened);
     let observer = Session::observe(&bootstrap).unwrap();
-    let before = test_hashed();
-    let observed = Store::observe(&observer, &dir, scope).unwrap();
-    assert_eq!(observed.records.len(), 3);
+    let journals = std::sync::Arc::new(Journals::new(32, 1 << 30, 1 << 30));
+    // An hour on: the journal stood settled at each observation.
+    let observed = |records: usize| {
+        let before = test_hashed();
+        let observed = as_if_later(std::time::Duration::from_secs(3600), || {
+            with_own(std::sync::Arc::clone(&journals), || {
+                Store::observe(&observer, &dir, scope)
+            })
+        })
+        .unwrap();
+        assert_eq!(observed.records.len(), records);
+        test_hashed() - before
+    };
+    assert_eq!(observed(3), 3, "a first observation hashes each wire once");
+    assert_eq!(observed(3), 0, "a kept observation hashes none");
+    let mut store = Store::open(&session, &dir, scope).unwrap();
+    store.commit_catalog(&session, b"four").unwrap();
+    drop(store);
     assert_eq!(
-        test_hashed() - before,
-        3,
-        "an observation hashes each wire once"
+        observed(4),
+        1,
+        "an observation after a commit hashes the new wire alone"
     );
     let before = test_hashed();
     crate::table::Envelope::parse(scope, &wire).unwrap();

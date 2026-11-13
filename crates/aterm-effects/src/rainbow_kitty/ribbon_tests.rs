@@ -113,6 +113,7 @@ fn the_dark_bed_keeps_its_stops_chroma() {
 use aterm_render::{GlowQuad, RainHalo, over_premul, premul_rgb};
 use std::time::Duration;
 
+use super::super::companion::FootSpan;
 use super::super::{CaretSeam, Dir, TypedClass};
 
 const DEFAULT_BG: u32 = 0x001A_1B26;
@@ -12197,4 +12198,379 @@ fn chained_word_kills_retract_right_to_left_without_a_gap() {
             &cx_after,
         );
     }
+}
+
+/// CT-05, THE LINE IS DRAWN ON THE ROW YOU TYPE ON: a row held over letters (a prompt
+/// over a full page's last row, a composer over its rule) and the pane's last row lay the
+/// vivid rail in their own foot band ([`ROW_RAIL_CH`]), under the typed words, and none
+/// of it past the row's bottom. Where the face names a foot's ink the line parts round
+/// that ink alone, by [`FOOT_CLEAR_PX`], as a typeset underline skips a descender, and
+/// under a bar or an underline caret it ends [`CARET_CLEAR_PX`] before the caret's cell.
+/// Negative controls: as it was (`held_rail_off`) the row lays no rail at all; with no
+/// ink named the line runs through the descender's columns; under a block caret it runs
+/// to the caret's cell.
+#[test]
+fn the_row_you_type_on_keeps_the_line_under_its_words() {
+    #[derive(Clone, Copy)]
+    struct Case {
+        last_row: bool,
+        off: bool,
+        ink: bool,
+        thin: bool,
+    }
+    let c = cfg(true, false);
+    let g = geom();
+    let ch = g.ch as f32;
+    let (ox, cw) = (i32::from(g.origin_x), g.cw as i32);
+    let row_bottom = f32::from(g.origin_y) + 3.0 * ch;
+    let row = (row_bottom - ch) as i32;
+    let band = (ROW_RAIL_CH * ch).floor().max(1.0);
+    let sole = (ox, ox + 40 * cw, row, row_bottom as i32);
+    // A descender in column 13: its ink stands in three columns and reaches the row's
+    // bottom, and the next ink under it starts 3 px on (no room for the line to dip).
+    let ink = (ox + 13 * cw + 3, ox + 13 * cw + 6);
+    let foot = FootSpan {
+        x0: ox + 13 * cw,
+        x1: ox + 14 * cw,
+        y0: row,
+        end: row_bottom as i32,
+        below: row_bottom as i32 + 3,
+        ink,
+    };
+    let caret_x = ox + 18 * cw;
+    let mut inked = GlyphProbe::new();
+    inked.probe_row(3, &[true; 40]);
+    let mut blank = GlyphProbe::new();
+    blank.probe_row(3, &[false; 120]);
+    // The lit rail quads of the row's own foot band, as `(x0, x1)`, and how many lit
+    // quads of any rail lie past the row's bottom.
+    let line = |case: Case| -> (Vec<(i32, i32)>, usize) {
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        rib.held_rail_off = case.off;
+        rib.set_thin_caret(case.thin);
+        rib.keep_out.set_feet([], [sole]);
+        if case.ink {
+            rib.keep_out.set_foot_spans([foot]);
+        }
+        let probe = if case.last_row {
+            rib.set_pane_rows(Some((0, 3)));
+            &blank
+        } else {
+            &inked
+        };
+        type_run(&mut rib, t0, 10, 8, &c, 0.9);
+        rib.plan_over(&ctx(at(t0, 8 * 60), &c, (2, 18), 0.9), Some(probe));
+        let judged_at = at(t0, 8 * 60 + (HOLD_EASE_S * 1000.0) as u64 + 16);
+        let cx = ctx(judged_at, &c, (2, 18), 0.9);
+        rib.plan_over(&cx, Some(probe));
+        let mut sink = Sink::default();
+        {
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+        }
+        let lit = |q: &&GlowQuad| q.alpha.max(q.alpha2) >= 32;
+        let in_band: Vec<(i32, i32)> = rib
+            .rail_spans()
+            .iter()
+            .filter(|span| span.2)
+            .flat_map(|&(from, to, _)| &sink.under[from.0..to.0])
+            .filter(lit)
+            .filter(|q| {
+                let (y0, y1) = (f32::from(q.y), f32::from(q.y) + f32::from(q.h));
+                y0 >= row_bottom - band - 1.0 && y1 <= row_bottom
+            })
+            .map(|q| (i32::from(q.x), i32::from(q.x) + i32::from(q.w)))
+            .collect();
+        let past = rib
+            .rail_spans()
+            .iter()
+            .flat_map(|&(from, to, _)| &sink.under[from.0..to.0])
+            .filter(lit)
+            .filter(|q| f32::from(q.y) + f32::from(q.h) > row_bottom)
+            .count();
+        (in_band, past)
+    };
+    let covers = |quads: &[(i32, i32)], x: i32| quads.iter().any(|&(a, b)| a <= x && x < b);
+    let clear = FOOT_CLEAR_PX as i32;
+    for last_row in [false, true] {
+        let case = Case {
+            last_row,
+            off: false,
+            ink: true,
+            thin: true,
+        };
+        let (quads, past) = line(case);
+        assert_eq!(
+            past, 0,
+            "last row {last_row}: the rail lays {past} lit quads past its row's bottom"
+        );
+        // Under the typed words, clear of the descender and of the caret.
+        for col in [10, 11, 12, 15, 16] {
+            let x = ox + col * cw + cw / 2;
+            assert!(
+                covers(&quads, x),
+                "last row {last_row}: no line under the typed cell in column {col} (x {x})"
+            );
+        }
+        for x in ink.0 - clear..ink.1 + clear {
+            assert!(
+                !covers(&quads, x),
+                "last row {last_row}: the line is lit at x {x}, within {clear} px of the \
+                 descender's ink at {ink:?}"
+            );
+        }
+        // The gap is the ink's and its clearance's, not the cell's: the cell before the
+        // descender's is lined whole and the descender's own is lined past the ease.
+        let reach = clear + ROW_RAIL_INK_EASE_PX as i32 + 1;
+        assert!(
+            covers(&quads, ink.0 - reach - 1) && covers(&quads, ink.1 + reach),
+            "last row {last_row}: the gap round the ink at {ink:?} is wider than its \
+             clearance and ease ({reach} px)"
+        );
+        for x in caret_x - CARET_CLEAR_PX as i32..caret_x + cw {
+            assert!(
+                !covers(&quads, x),
+                "last row {last_row}: the line is lit at x {x}, within the thin caret's \
+                 clearance (its cell starts at {caret_x})"
+            );
+        }
+        let (was, _) = line(Case { off: true, ..case });
+        assert!(
+            was.is_empty(),
+            "negative control (last row {last_row}): as it was, the row lays {} rail \
+             quads in its foot band",
+            was.len()
+        );
+        let (whole, _) = line(Case { ink: false, ..case });
+        assert!(
+            (ink.0..ink.1).all(|x| covers(&whole, x)),
+            "negative control (last row {last_row}): with no ink named the line runs \
+             under the descender's columns"
+        );
+        let (block, _) = line(Case {
+            thin: false,
+            ..case
+        });
+        assert!(
+            covers(&block, caret_x - 2),
+            "negative control (last row {last_row}): under a block caret the line runs \
+             to the caret's cell"
+        );
+    }
+}
+
+/// The typed row of [`the_row_you_type_on_keeps_the_line_under_its_words`], 8 keys along
+/// columns 10..18 of row 2 with a descender's ink named in column 13 and a thin caret in
+/// column 18, a frame past the hold's ease: every quad the ribbon laid under the letters, and
+/// which of them are the rails'. `below` is the pixel row the ink under the descender starts
+/// on; `set` is applied to the ribbon before the keys.
+fn typed_row_quads(
+    c: &Config,
+    last_row: bool,
+    below: i32,
+    set: impl FnOnce(&mut Ribbon),
+) -> (Vec<GlowQuad>, Vec<bool>, (i32, i32)) {
+    let g = geom();
+    let ch = g.ch as f32;
+    let (ox, cw) = (i32::from(g.origin_x), g.cw as i32);
+    let row_bottom = f32::from(g.origin_y) + 3.0 * ch;
+    let row = (row_bottom - ch) as i32;
+    let ink = (ox + 13 * cw + 3, ox + 13 * cw + 6);
+    let mut inked = GlyphProbe::new();
+    inked.probe_row(3, &[true; 40]);
+    let mut blank = GlyphProbe::new();
+    blank.probe_row(3, &[false; 120]);
+    let t0 = Instant::now();
+    let mut rib = Ribbon::new();
+    set(&mut rib);
+    rib.set_thin_caret(true);
+    rib.keep_out
+        .set_feet([], [(ox, ox + 40 * cw, row, row_bottom as i32)]);
+    rib.keep_out.set_foot_spans([FootSpan {
+        x0: ox + 13 * cw,
+        x1: ox + 14 * cw,
+        y0: row,
+        end: row_bottom as i32,
+        below,
+        ink,
+    }]);
+    let probe = if last_row {
+        rib.set_pane_rows(Some((0, 3)));
+        &blank
+    } else {
+        &inked
+    };
+    type_run(&mut rib, t0, 10, 8, c, 0.9);
+    rib.plan_over(&ctx(at(t0, 8 * 60), c, (2, 18), 0.9), Some(probe));
+    let cx = ctx(
+        at(t0, 8 * 60 + (HOLD_EASE_S * 1000.0) as u64 + 16),
+        c,
+        (2, 18),
+        0.9,
+    );
+    rib.plan_over(&cx, Some(probe));
+    let mut sink = Sink::default();
+    {
+        let mut f = sink.frame();
+        rib.emit(&cx, &mut f);
+    }
+    let mut rail = vec![false; sink.under.len()];
+    for &(from, to, _) in rib.rail_spans() {
+        rail[from.0..to.0].fill(true);
+    }
+    (sink.under, rail, ink)
+}
+
+/// CT-05, THE GAPS OF THE LINE ARE EMPTY: on a row that keeps its line in its own foot band the
+/// underline's body is a band there too, under the rail, and it parts where the rail does. No
+/// lit quad of the ribbon, body or rail, lies in the row's foot within [`FOOT_CLEAR_PX`] of a
+/// descender's named ink or within [`CARET_CLEAR_PX`] of a thin caret's cell, on a dark page
+/// and on paper, on a row held over letters and on the pane's last row; the body still lies
+/// under the typed words either side.
+///
+/// Negative control ([`with_body_band_whole`]): laid whole, as it was, the body lights the
+/// descender's columns and the pixels before the caret, which is what a bottom prompt showed
+/// on GitHub Light (a mint band through the foot of `q` and on to the bar caret).
+#[test]
+fn the_body_s_band_parts_where_the_line_does() {
+    let g = geom();
+    let ch = g.ch as f32;
+    let (ox, cw) = (i32::from(g.origin_x), g.cw as i32);
+    let row_bottom = (f32::from(g.origin_y) + 3.0 * ch) as i32;
+    let foot = row_bottom - (UNDERLINE_UP_CH * ch).ceil() as i32 - 1;
+    let caret_x = ox + 18 * cw;
+    let clear = FOOT_CLEAR_PX as i32;
+    // The lit quads over `x0..x1` of the row's foot, the rails' and the body's.
+    let lit = |quads: &[GlowQuad], rail: &[bool], (x0, x1): (i32, i32)| -> (usize, usize) {
+        let mut n = (0, 0);
+        for (q, &is_rail) in quads.iter().zip(rail) {
+            let (qx, qy) = (i32::from(q.x), i32::from(q.y));
+            if q.alpha.max(q.alpha2) >= 32
+                && qx < x1
+                && qx + i32::from(q.w) > x0
+                && qy < row_bottom
+                && qy + i32::from(q.h) > foot
+            {
+                if is_rail {
+                    n.0 += 1;
+                } else {
+                    n.1 += 1;
+                }
+            }
+        }
+        n
+    };
+    for dark in [true, false] {
+        let c = cfg(dark, false);
+        for last_row in [false, true] {
+            let what = format!("dark={dark} last row {last_row}");
+            let (quads, rail, ink) = typed_row_quads(&c, last_row, row_bottom + 3, |_| {});
+            let gap = (ink.0 - clear, ink.1 + clear);
+            let before_caret = (caret_x - CARET_CLEAR_PX as i32, caret_x + cw);
+            assert_eq!(
+                lit(&quads, &rail, gap),
+                (0, 0),
+                "{what}: lit (rail, body) quads lie within {clear} px of the descender's ink \
+                 at {ink:?}"
+            );
+            assert_eq!(
+                lit(&quads, &rail, before_caret),
+                (0, 0),
+                "{what}: lit (rail, body) quads lie within the thin caret's clearance (its \
+                 cell starts at {caret_x})"
+            );
+            for col in [10, 11, 12, 15, 16] {
+                let x = ox + col * cw + cw / 2;
+                let (r, b) = lit(&quads, &rail, (x, x + 1));
+                assert!(
+                    r > 0 && b > 0,
+                    "{what}: under the typed cell in column {col} the row's foot holds {r} \
+                     lit rail quads and {b} of the body"
+                );
+            }
+            let (quads, rail, _) =
+                with_body_band_whole(|| typed_row_quads(&c, last_row, row_bottom + 3, |_| {}));
+            let (r, b) = lit(&quads, &rail, (ink.0, ink.1));
+            assert!(
+                r == 0 && b > 0,
+                "control, {what}: laid whole the body lights the descender's columns ({b} \
+                 quads; the rail {r})"
+            );
+            let (_, b) = lit(&quads, &rail, (caret_x - 2, caret_x));
+            assert!(
+                b > 0,
+                "control, {what}: laid whole the body runs up to the thin caret's cell"
+            );
+        }
+    }
+    // The tall body is a wash behind its row's letters, not a band under them: left whole.
+    let c = cfg(true, true);
+    let (quads, rail, ink) = typed_row_quads(&c, true, row_bottom + 3, |_| {});
+    let (r, b) = lit(&quads, &rail, (ink.0, ink.1));
+    assert!(
+        r == 0 && b > 0,
+        "the tall body is parted round a descender ({b} body quads, {r} of the rail)"
+    );
+}
+
+/// CT-05, THE LINE DIPS UNDER A DESCENDER WHERE THERE IS ROOM: on a row held over letters
+/// whose ink starts low enough under a descender (a short glyph's, a third of its cell down),
+/// the rail does not part: it runs on under the descender's ink and that ink's ring, over the
+/// ink below and its ring. Nothing of it lies in the ring of either.
+///
+/// Negative controls: parted (`row_rail_parted`) the rail lays nothing under the descender's
+/// columns; with the ink below 3 px under the row there is no room and it parts too.
+#[test]
+fn the_line_dips_under_a_descender_where_the_row_below_leaves_room() {
+    let c = cfg(true, false);
+    let g = geom();
+    let row_bottom = (f32::from(g.origin_y) + 3.0 * g.ch as f32) as i32;
+    let ring = crate::cursor_glow::LETTER_GUARD_RING;
+    let clear = FOOT_CLEAR_PX as i32;
+    let below = row_bottom + 8;
+    // The lit rail quads over the descender's columns and their clearance, as `(y0, y1)`.
+    let under = |below: i32, parted: bool| -> (Vec<(i32, i32)>, (i32, i32)) {
+        let (quads, rail, ink) =
+            typed_row_quads(&c, false, below, |rib| rib.row_rail_parted = parted);
+        let ys = quads
+            .iter()
+            .zip(&rail)
+            .filter(|&(q, &is_rail)| {
+                is_rail
+                    && q.alpha.max(q.alpha2) >= 32
+                    && i32::from(q.x) < ink.1 + clear
+                    && i32::from(q.x) + i32::from(q.w) > ink.0 - clear
+            })
+            .map(|(q, _)| (i32::from(q.y), i32::from(q.y) + i32::from(q.h)))
+            .collect();
+        (ys, ink)
+    };
+    let (dipped, ink) = under(below, false);
+    assert!(
+        !dipped.is_empty(),
+        "with {} px free under the descender at {ink:?} the line parts instead of dipping",
+        below - row_bottom
+    );
+    for &(y0, y1) in &dipped {
+        assert!(
+            y0 >= row_bottom + ring && y1 <= below - ring,
+            "the dipped line lies at y {y0}..{y1}: inside the ring ({ring} px) of the \
+             descender's ink, which ends at {row_bottom}, or of the ink below, which starts \
+             at {below}"
+        );
+    }
+    let (parted, _) = under(below, true);
+    assert!(
+        parted.is_empty(),
+        "control: parted, the rail still lays {} quads under the descender",
+        parted.len()
+    );
+    let (no_room, _) = under(row_bottom + 3, false);
+    assert!(
+        no_room.is_empty(),
+        "control: with the ink below 3 px under the row the rail lays {} quads under the \
+         descender",
+        no_room.len()
+    );
 }

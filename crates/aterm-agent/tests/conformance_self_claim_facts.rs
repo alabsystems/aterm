@@ -60,33 +60,36 @@ const ENVIRONMENT: [&str; 10] = [
     "R2Starts",
 ];
 
-/// Episode `e`'s call (1 or 2): the first quiet longer, each its own group and birth.
-fn call(e: usize) -> BackgroundCall {
+/// Episode `e`'s call (1 or 2) in its run `run` (the engine's episode, which each `Open` moves
+/// on): the first quiet longer, each its own group and birth.
+fn call(e: usize, run: u32) -> BackgroundCall {
     let pid = 700 + u32::try_from(e).expect("an episode");
     BackgroundCall {
         pid,
         pgid: pid,
         birth: Some(u64::from(pid) * 10),
-        exe: "python3".into(),
+        episode: run,
         task: None,
         quiet_ms: if e == 1 { 9 } else { 5 } * 60_000,
         wait: None,
+        held_by: None,
     }
 }
 
-/// Episode `e`'s key.
-fn key(e: usize) -> EpisodeKey {
-    EpisodeKey::of_call(&call(e)).expect("a call with a birth")
+/// Episode `e`'s key in `r`'s run of it.
+fn key(e: usize, r: &Real) -> EpisodeKey {
+    EpisodeKey::of_call(&call(e, r.runs[e - 1])).expect("a call with a birth")
 }
 
-/// The reading at `now` naming the episodes open in `st`, the first first.
-fn reading(st: &State, now: i64) -> FactsReading {
+/// The reading at `now` naming the episodes open in `st`, the first first, each in `r`'s run.
+fn reading(st: &State, r: &Real, now: i64) -> FactsReading {
     FactsReading {
+        waiting: 0,
         as_of_ms: now,
         no_progress: [1, 2]
             .into_iter()
             .filter(|e| st[open(*e)] == 1)
-            .map(call)
+            .map(|e| call(e, r.runs[e - 1]))
             .collect(),
         held: None,
         left: None,
@@ -121,6 +124,8 @@ struct Real {
     account: SelfClaimFacts<&'static str>,
     /// When each episode was last offered (the walk's own note, for `Lapse`).
     at: [i64; 2],
+    /// Each call's run (the engine's episode number): an `Open` is a new run of no progress.
+    runs: [u32; 2],
 }
 
 impl Real {
@@ -129,6 +134,7 @@ impl Real {
             now: T0,
             account: SelfClaimFacts::default(),
             at: [T0; 2],
+            runs: [1; 2],
         }
     }
 }
@@ -138,7 +144,7 @@ impl Real {
 fn project(r: &Real) -> State {
     let mut out = State::new();
     for e in [1, 2] {
-        let tells = r.account.clone().ack(key(e).id, &CLAIM, r.now).is_some();
+        let tells = r.account.clone().ack(key(e, r).id, &CLAIM, r.now).is_some();
         out.insert(offer(e), i64::from(tells));
     }
     out
@@ -171,13 +177,13 @@ fn offered(st: &State, r: usize) -> Result<usize, &'static str> {
 /// The account agrees with the model at `st`: what each reader would be offered, and whether
 /// an ack of each episode would tell it.
 fn agrees(st: &State, r: &Real) -> bool {
-    let read = reading(st, r.now);
+    let read = reading(st, r, r.now);
     let picks = [1, 2].into_iter().all(|reader| {
         let pick = r
             .account
             .pick(Some(&read), &CLAIM, READERS[reader - 1], r.now);
         match (offered(st, reader), pick) {
-            (Ok(e), Pick::Fact(fact)) => fact.key == key(e),
+            (Ok(e), Pick::Fact(fact)) => fact.key == key(e, r),
             (Err(why), Pick::Why(got)) => why == got,
             _ => false,
         }
@@ -207,8 +213,12 @@ impl Ev {
 fn mirror(action: &'static str, st: &State, r: &mut Real, ev: &mut Ev) -> bool {
     let now = r.now;
     match action {
-        "Open1" | "Open2" | "R1Drops" | "R2Drops" | "R1Starts" | "R2Starts" | "R1LosesAck"
-        | "R2LosesAck" => true,
+        "Open1" | "Open2" => {
+            let e = if action == "Open1" { 1 } else { 2 };
+            r.runs[e - 1] += 1;
+            true
+        }
+        "R1Drops" | "R2Drops" | "R1Starts" | "R2Starts" | "R1LosesAck" | "R2LosesAck" => true,
         "Lapse1" | "Lapse2" => {
             let e = if action == "Lapse1" { 1 } else { 2 };
             r.now = r.now.max(r.at[e - 1] + OFFER_MS);
@@ -218,7 +228,7 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, ev: &mut Ev) -> bool {
             let e = if action == "Close1" { 1 } else { 2 };
             let mut after = st.clone();
             after.insert(open(e), 0);
-            let read = reading(&after, now);
+            let read = reading(&after, r, now);
             ev.step(action, || r.account.observe(Some(&read), now));
             true
         }
@@ -235,7 +245,7 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, ev: &mut Ev) -> bool {
                 r.now = r.now.max(r.at[other - 1] + 1);
             }
             let now = r.now;
-            let read = reading(st, now);
+            let read = reading(st, r, now);
             // The verb's observe at the read: the account forgets nothing the model keeps open.
             r.account.observe(Some(&read), now);
             let by = READERS[reader - 1];
@@ -248,7 +258,7 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, ev: &mut Ev) -> bool {
                 pick
             });
             r.at[e - 1] = now;
-            matches!(pick, Pick::Fact(fact) if fact.key == key(e))
+            matches!(pick, Pick::Fact(fact) if fact.key == key(e, r))
         }
         "R1Acks" | "R2Acks" => {
             let reader = if action == "R1Acks" { 1 } else { 2 };
@@ -256,8 +266,9 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, ev: &mut Ev) -> bool {
             if e == 0 {
                 return false;
             }
+            let id = key(e, r).id;
             let account = &mut r.account;
-            let answer = ev.step(action, || account.ack(key(e).id, &CLAIM, now));
+            let answer = ev.step(action, || account.ack(id, &CLAIM, now));
             answer.is_some() == (st[offer(e)] > 0 && st[told(e)] == 0)
         }
         other => panic!("no real step for `{other}`"),

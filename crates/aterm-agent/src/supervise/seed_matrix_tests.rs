@@ -4778,7 +4778,7 @@ fn person_scenarios() -> Vec<Scenario> {
         out.push(Scenario {
             name: format!("KI1016-P6 the act's answer Esc'd, then a person's exchange ({tag})"),
             t0: T0,
-            // Land carries a person's message once the session worked (owner ruling 2026-10-27).
+            // Land carries a person's message once the session worked.
             policy: land_policy(),
             host: None,
             beats,
@@ -5668,8 +5668,7 @@ fn a_sleep_inside_a_tries_turn_is_no_work_of_the_turns() {
 
 /// A sleep inside a person's turn is no work of it: the message that opens the session is theirs
 /// by the work its turn did awake, and one after the session worked (here after an Esc'd act) is
-/// carried at its turn's end, read first at the wake, whatever its length (owner ruling
-/// 2026-10-27).
+/// carried at its turn's end, read first at the wake, whatever its length.
 #[test]
 fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-in-person");
@@ -5805,7 +5804,7 @@ fn sleep_in_person(what: &str, worked: i64, asleep: i64, at: Asked, left: bool) 
     Scenario {
         name: format!("{what}: after an Esc"),
         t0: T0,
-        // Land carries a person's message once the session worked (owner ruling 2026-10-27).
+        // Land carries a person's message once the session worked.
         policy: land_policy(),
         host: None,
         beats,
@@ -5845,8 +5844,7 @@ fn sleep_in_opening(what: &str, worked: i64, asleep: i64, left: bool) -> Scenari
     Scenario {
         name: format!("{what}: the session's opening message"),
         t0: T0,
-        // The person's own exchange is Land's to leave where it opens the session (owner rulings
-        // 2026-10-26 and 2026-10-27).
+        // The person's own exchange is Land's to leave where it opens the session.
         policy: land_policy(),
         host: None,
         beats,
@@ -5858,7 +5856,7 @@ fn sleep_in_opening(what: &str, worked: i64, asleep: i64, left: bool) -> Scenari
 
 /// A sleep before a person's prompt is no part of their turn: the message that opens the session,
 /// sent once the Mac woke with the session fresh, is theirs by its own turn's length (the
-/// exchange's bound applies to the opening message alone under Land, owner ruling 2026-10-27).
+/// exchange's bound applies to the opening message alone under Land).
 #[test]
 fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-before-person");
@@ -5953,8 +5951,7 @@ fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario
     Scenario {
         name: format!("a person's {work} s turn, the Mac {mac} (adj {adj})"),
         t0: T0,
-        // The person's own exchange is Land's to leave where it opens the session (owner rulings
-        // 2026-10-26 and 2026-10-27).
+        // The person's own exchange is Land's to leave where it opens the session.
         policy: land_policy(),
         host: None,
         beats,
@@ -6061,8 +6058,7 @@ fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     Scenario {
         name,
         t0: T0,
-        // The person's own exchange is Land's to leave where it opens the session (owner rulings
-        // 2026-10-26 and 2026-10-27).
+        // The person's own exchange is Land's to leave where it opens the session.
         policy: land_policy(),
         host: None,
         beats,
@@ -6722,8 +6718,7 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
     let point = approvals::point_reason(approvals::Carried::streak(0), false);
     // The opening turn a restart cut (the books hold its turn-ran row alone) is still the one that
     // opens the session: the person's own exchange where it is short; once a point is recorded the
-    // session worked, and Land carries the person's message whatever its date (owner ruling
-    // 2026-10-27).
+    // session worked, and Land carries the person's message whatever its date.
     for (worked, ran_min, key_ms, left) in [
         (false, 2, 10_000, true),
         (false, 15, 10_000, false),
@@ -6779,8 +6774,7 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
         s.ctl.served = 0;
         let mut p = point_at(&s, reply, 102);
         p.screen.human = crate::supervise::screen::HumanInput::Ago(key_ms);
-        // The person's own exchange is Land's to leave where it opens the session (owner rulings
-        // 2026-10-26 and 2026-10-27).
+        // The person's own exchange is Land's to leave where it opens the session.
         let land = SuperviseOpts {
             policy: land_policy(),
             ..auto(30)
@@ -7084,8 +7078,7 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let first = run_first(&sc, &dir);
-        // The act, then Land's carry after the person's message: the session worked before it
-        // (owner ruling 2026-10-27).
+        // The act, then Land's carry after the person's message: the session worked before it.
         assert_eq!(first.acts.len(), 2, "{}: {:?}", sc.name, first.acts);
         let act = first.acts.first().expect("the first loop's act").at;
         let esc = first

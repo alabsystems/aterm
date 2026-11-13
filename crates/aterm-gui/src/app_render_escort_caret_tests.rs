@@ -63,7 +63,9 @@ fn summoned(arm: Arm) -> (App, Instant, i32) {
     let mut app = App::headless_for_test();
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty flying".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
+    // The summoned head alone: no pet stands beside the caret for `head` to read instead.
+    app.config.cursor_pet = Some("off".into());
     app.config.motion = Some("full".into());
     app.config.trail_sounds = Some(false);
     app.kitty_cursor_enabled_cache = None;

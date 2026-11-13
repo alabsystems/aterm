@@ -1132,32 +1132,8 @@ impl Code<PaneSchema> for PrebuiltPane {
 
 /// Test-only switch the host step reads: a config install that leaves the state's config where it was, the negative control of one that moves it.
 #[cfg(test)]
-pub(crate) mod config_step {
-    use std::cell::Cell;
-
-    thread_local! {
-        static KEPT: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Moves the state's config again when dropped.
-    pub(crate) struct Kept;
-
-    impl Drop for Kept {
-        fn drop(&mut self) {
-            KEPT.with(|k| k.set(false));
-        }
-    }
-
-    /// Leave the state's config on every later config install on this thread, until the returned guard drops.
-    pub(crate) fn keep_old() -> Kept {
-        KEPT.with(|k| k.set(true));
-        Kept
-    }
-
-    pub(super) fn kept() -> bool {
-        KEPT.with(Cell::get)
-    }
-}
+#[path = "lib_config_step_tests.rs"]
+pub(crate) mod config_step;
 
 /// `pane.faithful-replay` v1: every live witness is the replayed screen ([`WITNESS_MATCHES`]), every slice's replies are the live engine's ([`REPLIES_MATCH`]), and every slice carries its clock ([`CLOCK_RECORDED`]).
 #[derive(Clone, Debug)]

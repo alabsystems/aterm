@@ -16,8 +16,10 @@ pub(super) struct Inputs {
 }
 
 pub(super) enum Standing {
-    /// Explicit policy, absent enrollment prerequisites, or an unavailable LAN broker.
+    /// Explicit policy or absent enrollment prerequisites.
     Held,
+    /// An input that does not read now, which says nothing of this build
+    /// ([`NodeUpdates::trial_unprovable`]).
     Unread(&'static str),
     Admitted(Box<Basis>),
 }
@@ -70,7 +72,7 @@ impl Inputs {
             Err(_) => return Standing::Unread("node identity is unreadable or invalid"),
         };
         if (self.lan_unavailable)().is_some() {
-            return Standing::Held;
+            return Standing::Unread("the LAN broker does not answer");
         }
         let (vault, denied) = match self.vault.as_ref() {
             Some(paths) => {
@@ -93,7 +95,12 @@ impl Inputs {
         if log.as_ref().is_some_and(|log| log.unread().is_some()) {
             return Standing::Unread("node membership log is unreadable");
         }
-        let verdict = denied_under(Some(&denied), log.as_deref());
+        let verdict = super::super::denied_for_fleet(
+            &self.state,
+            self.vault.as_ref(),
+            Some(&denied),
+            log.as_deref(),
+        );
         let own = aterm_net::fleet::NodeProof {
             node: node.node().to_owned(),
             key: node.key(),
@@ -143,6 +150,42 @@ impl Basis {
 #[derive(Debug)]
 pub(super) struct Proven(());
 
+fn loopback_of(mut addr: SocketAddr) -> SocketAddr {
+    addr.set_ip(if addr.is_ipv4() {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        std::net::Ipv6Addr::LOCALHOST.into()
+    });
+    addr
+}
+
+/// Whether another socket holds the loopback address of a wildcard listener's port. macOS lets the
+/// two coexist and gives a dial of that address to the more specific socket, so a self-dial reaches
+/// something else (an `ssh -L`, a local server) while this listener serves every other address, and
+/// its miss says nothing of this build. Binding that address fails only for such a socket: the
+/// listener's own wildcard one does not conflict.
+pub(super) fn loopback_held_elsewhere(addr: SocketAddr) -> bool {
+    addr.ip().is_unspecified()
+        && matches!(
+            aterm_uds::kept_out(|| std::net::TcpListener::bind(loopback_of(addr))),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse
+        )
+}
+
+/// Why a self-dial of the listener at `addr` that missed says nothing of this build, if it does not.
+/// Its loopback address may be another socket's ([`loopback_held_elsewhere`]). A listener named on an
+/// address that is no fleet source (a Tailscale or public one) refuses a connection from that address
+/// as it does any peer's, so no dial of it can ever answer, and every later release would meet the same.
+pub(super) fn self_dial_says_nothing(addr: SocketAddr) -> Option<&'static str> {
+    if loopback_held_elsewhere(addr) {
+        Some("another socket holds this listener's loopback address")
+    } else if !addr.ip().is_unspecified() && !aterm_net::fleet::is_fleet_source(addr.ip()) {
+        Some("this listener refuses a dial from its own address, which is no fleet source")
+    } else {
+        None
+    }
+}
+
 fn prove(
     mut addr: SocketAddr,
     secret: &aterm_net::fleet::FleetSecret,
@@ -153,11 +196,7 @@ fn prove(
         .checked_add(within)
         .ok_or("node health deadline is out of range")?;
     if addr.ip().is_unspecified() {
-        addr.set_ip(if addr.is_ipv4() {
-            std::net::Ipv4Addr::LOCALHOST.into()
-        } else {
-            std::net::Ipv6Addr::LOCALHOST.into()
-        });
+        addr = loopback_of(addr);
     }
     let left = || {
         until
@@ -190,6 +229,12 @@ fn prove(
     if reply.len() > limit + 6 || !reply.ends_with('\n') {
         return Err("node health reply is oversized or unfinished".into());
     }
+    // A framed refusal from the authenticated node proves its listener as a census does. The census's
+    // own inputs (a vault this Mac has no Commons in, a writer holding the roster) say nothing of this
+    // build, and a Mac in that state would otherwise revert every update.
+    if reply.starts_with("ERR ") {
+        return Ok(Proven(()));
+    }
     let json = reply
         .strip_prefix("OK ")
         .ok_or("node health request was not answered successfully")?;
@@ -199,56 +244,5 @@ fn prove(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn health_requires_the_expected_authenticated_node_and_a_complete_census() {
-        let expected = NodeIdentity::from_seed(&"1".repeat(32), &[1; 32]).unwrap();
-        let other = NodeIdentity::from_seed(&"2".repeat(32), &[2; 32]).unwrap();
-        let census = aterm_agent::fleet_census::SwarmCensus::default().to_json();
-        for (node, reply, succeeds) in [
-            (expected.clone(), Some(format!("OK {census}\n")), true),
-            (other, Some(format!("OK {census}\n")), false),
-            (expected.clone(), None, false),
-            (expected.clone(), Some("OK {}\n".to_owned()), false),
-        ] {
-            let secret = aterm_net::fleet::FleetSecret::new(&[0x5a; 24]).unwrap();
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let stop = Arc::new(Stop::new());
-            let serve_stop = Arc::clone(&stop);
-            let listening = aterm_net::fleet::Listening {
-                secret: secret.clone(),
-                scope: FleetScope::Facts,
-                node: Some(node),
-                serves: &[FleetOp::Census],
-                slots: 2,
-                per_source: 2,
-                lifetime: aterm_spec::wait::MUST_HAPPEN,
-            };
-            let server = std::thread::spawn(move || {
-                aterm_net::fleet::serve_with_handshake(
-                    &listener,
-                    &listening,
-                    &serve_stop,
-                    aterm_spec::wait::MUST_HAPPEN,
-                    move |served, _| {
-                        served.answer(|stream| {
-                            if let Some(reply) = &reply {
-                                stream.write_all(reply.as_bytes())?;
-                                stream.flush()?;
-                            }
-                            Ok(())
-                        })
-                    },
-                    |_| {},
-                );
-            });
-            let proved = prove(addr, &secret, &expected, aterm_spec::wait::MUST_HAPPEN);
-            stop.set();
-            server.join().unwrap();
-            assert_eq!(proved.is_ok(), succeeds, "{proved:?}");
-        }
-    }
-}
+#[path = "health_tests.rs"]
+mod tests;

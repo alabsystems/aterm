@@ -861,7 +861,7 @@ fn effects_off_is_byte_identical() {
     toggled.set_cursor_trail(true, 260, 24, None);
     toggled.advance_effects(50.0);
     toggled.render().expect("renderable frame");
-    toggled.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
+    toggled.set_cursor_glow(true, "fire", None, None, 400, 64, 1.0, 2.0, true);
     toggled.process(b"z\x1b[D \x1b[D");
     toggled.advance_effects(50.0);
     toggled.render().expect("renderable frame");
@@ -870,7 +870,7 @@ fn effects_off_is_byte_identical() {
         toggled.rgba(),
         "a live burn must visibly change the frame (non-vacuous toggle)"
     );
-    toggled.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+    toggled.set_cursor_glow(true, "rainbow", None, None, 260, 24, 0.7, 0.6, true);
     toggled.set_cursor_pet(true, 7);
     toggled.render().expect("renderable frame");
     toggled.note_typed_char('p');
@@ -948,7 +948,7 @@ fn spill_exports_track_band_content_through_the_real_pipeline() {
     let (pad, head) = (12usize, 30usize);
     t.set_chrome(pad as u16, head as u16)
         .expect("admitted geometry");
-    t.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
+    t.set_cursor_glow(true, "fire", None, None, 400, 64, 1.0, 2.0, true);
     t.render().expect("renderable frame");
     for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c"), ('d', b"d")] {
         assert!(
@@ -1030,10 +1030,10 @@ fn spill_exports_track_band_content_through_the_real_pipeline() {
     );
 }
 
-/// Drive the pet onto the glass through the binding alone (the naming glow style,
+/// Drive the pet onto the glass through the binding alone (the rainbow trail,
 /// the seed, witnessed keystrokes at 33 ms) until `cursor_pet_alpha` goes positive.
 fn wake_the_pet(t: &mut AtermTerminal, seed: u64) -> Option<u32> {
-    t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+    t.set_cursor_glow(true, "rainbow", None, None, 260, 24, 0.7, 0.6, true);
     t.set_cursor_pet(true, seed);
     t.render().expect("renderable frame");
     for frame in 0..240u32 {

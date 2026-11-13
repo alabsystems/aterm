@@ -39,7 +39,7 @@ fn spelling(style: GlowStyle) -> &'static str {
     match style {
         GlowStyle::Lumen => "lumen",
         GlowStyle::Phaser => "phaser",
-        GlowStyle::RainbowKitty => "rainbow kitty",
+        GlowStyle::RainbowKitty => "rainbow",
         GlowStyle::Sparkle => "sparkle",
         GlowStyle::Fire => "fire",
         GlowStyle::Laser => "laser",
@@ -187,7 +187,7 @@ fn geom(grid: Grid) -> Geom {
 /// Resolved config for one input and style via `App::glow_config_for`.
 fn resolved(i: HostInputs, style: GlowStyle) -> GlowConfig {
     let raw = spelling(style);
-    let presentation = resolve_trail_presentation(raw);
+    let presentation = resolve_trail_presentation(raw, "off");
     assert_eq!(
         presentation.style.style,
         Some(style),
@@ -514,7 +514,7 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
         }
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let threads = aterm_cores::available_parallelism().map_or(1, usize::from);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {

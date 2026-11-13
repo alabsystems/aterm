@@ -21,20 +21,16 @@ use aterm_objc::send::{
 };
 use aterm_objc::{autoreleasepool, class, sel, Bool, Id, MainThread};
 
-static QUIT_CONFIRM_HOOK: OnceLock<fn() -> bool> = OnceLock::new();
+static QUIT_CONFIRM_HOOK: OnceLock<fn(ReplyWait) -> TerminateAnswer> = OnceLock::new();
 
-// `NSApplicationTerminateReply`, named here because the Objective-C seam deliberately has no
-// AppKit dependency.
-const NS_TERMINATE_CANCEL: usize = 0;
-const NS_TERMINATE_NOW: usize = 1;
-
-/// Registers a handler consulted before the app terminates via AppKit's `terminate:`.
-pub(crate) fn set_quit_confirm_hook(hook: fn() -> bool) {
+/// Registers the handler that answers AppKit's `applicationShouldTerminate:` (`terminate:`).
+pub(crate) fn set_quit_confirm_hook(hook: fn(ReplyWait) -> TerminateAnswer) {
     let _ = QUIT_CONFIRM_HOOK.set(hook);
 }
 
-fn quit_confirm_allows() -> bool {
-    QUIT_CONFIRM_HOOK.get().is_none_or(|hook| hook())
+/// The handler's answer to an ask `wait` describes; with none registered, AppKit terminates now.
+fn quit_confirm_answer(wait: ReplyWait) -> TerminateAnswer {
+    QUIT_CONFIRM_HOOK.get().map_or(TerminateAnswer::Now, |hook| hook(wait))
 }
 
 type HandlerCallback = Box<dyn FnOnce(&ApplicationDelegate)>;
@@ -104,6 +100,26 @@ impl<T> PendingHandlerWork<T> {
         self.batch_in_progress = false;
     }
 
+    /// Begins a batch over the queue, armed or not, where an exit commits without the exit
+    /// barrier's block (`ApplicationDelegate::run_owed_work`): false inside a batch in progress,
+    /// which owns its items. The batch stays in progress, so nothing arms and what its work
+    /// queues joins it ([`Self::pop_owed`]), until `finish_batch` or `finish_batch_and_take_tail`
+    /// ends it, an empty one included.
+    fn begin_owed(&mut self) -> bool {
+        if self.batch_in_progress {
+            return false;
+        }
+        self.drain_armed = false;
+        self.batch_in_progress = true;
+        true
+    }
+
+    /// The owed batch's next item, work queued while it runs included.
+    fn pop_owed(&mut self) -> Option<T> {
+        debug_assert!(self.batch_in_progress, "only an owed batch pops past its snapshot");
+        self.queue.pop_front()
+    }
+
     /// Finishes the active batch and extracts everything behind its ordered exit barrier.
     ///
     /// The caller drops the returned work after releasing the FIFO's `RefCell` borrow, so a
@@ -133,6 +149,30 @@ impl<T> fmt::Debug for PendingHandlerWork<T> {
 /// previous behavior of leaving work unarmed on that fatal path.
 struct HandlerWorkRearm<'a>(&'a ApplicationDelegate);
 
+/// Ends the batch `ApplicationDelegate::run_owed_work` began, on its return or its unwind: a
+/// completed run gives up the rest, as the exit barrier gives up its tail; a run a panic stopped
+/// keeps it for the fatal turn, as the batch block does. The given-up work is dropped after the
+/// FIFO's `RefCell` borrow is released.
+struct OwedBatch<'a> {
+    delegate: &'a ApplicationDelegate,
+    completed: Cell<bool>,
+}
+
+impl Drop for OwedBatch<'_> {
+    fn drop(&mut self) {
+        let given_up = {
+            let mut pending = self.delegate.ivars().pending_handler_work.borrow_mut();
+            if self.completed.get() {
+                Some(pending.finish_batch_and_take_tail())
+            } else {
+                pending.finish_batch();
+                None
+            }
+        };
+        drop(given_up);
+    }
+}
+
 impl Drop for HandlerWorkRearm<'_> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
@@ -147,6 +187,7 @@ use super::event_loop::{
     notify_windows_of_exit, stop_app_immediately, stop_app_on_panic, ActiveEventLoop, PanicInfo,
 };
 use super::observer::{EventLoopWaker, RunLoop};
+use super::terminate::{self, ReplyWait, TerminateAnswer};
 use super::{menu, wake_queue, WindowId};
 use crate::event::{Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
@@ -211,31 +252,37 @@ aterm_objc::declare_class! {
             self.will_terminate()
         }
 
+        // LOCAL PATCH (aterm): the application's handler decides, told whether it could reply
+        // from AppKit's wait; a quit it takes up answers `NSTerminateLater`, and AppKit then
+        // waits for the one reply the loop's exit or a refusal sends (`terminate.rs`).
         @sel(applicationShouldTerminate:)
         fn app_should_terminate(&self, _sender: Id) -> usize {
             if self.exiting() {
-                return NS_TERMINATE_CANCEL;
+                // LOCAL PATCH (aterm): the loop already exits, so this quit asks no question. A
+                // Cancel would make macOS abandon a logout, restart or shutdown; where a reply
+                // can come the quit is taken up (`Later`), the exit commits inside AppKit's wait
+                // ([`Self::commit_owed_exit`]) and AppKit hears YES after it. Where none can, it
+                // is refused, as `should_terminate` refuses any such `Later`.
+                let wait = self.reply_wait();
+                return terminate::should_terminate(TerminateAnswer::Later, wait);
             }
             if self.ivars().termination_retry_pending.get() {
-                return NS_TERMINATE_CANCEL;
+                return terminate::should_terminate(TerminateAnswer::Cancel, ReplyWait::Unanswerable);
             }
-            if !quit_confirm_allows() {
-                return NS_TERMINATE_CANCEL;
+            if self.is_running() && self.ivars().event_handler.in_use() {
+                // `terminate:` arrived from a nested modal run loop while an outer callback still
+                // owns EventHandler's RefCell. Nothing can answer a `Later` from here, and a `Now`
+                // would enter `applicationWillTerminate:` and deliver LoopExiting through that same
+                // handler. Cancel only this synchronous attempt, before the application's handler
+                // is asked (so a person's quit question is put once, on the retry), and retry it
+                // from the ordered handler-work queue once every older callback has completed,
+                // where the retry is answerable and takes the ordinary path below.
+                self.ivars().termination_retry_pending.set(true);
+                self.defer_termination_retry();
+                return terminate::should_terminate(TerminateAnswer::Cancel, ReplyWait::Unanswerable);
             }
-            if !self.ivars().event_handler.in_use() {
-                return NS_TERMINATE_NOW;
-            }
-
-            // `terminate:` may arrive from a nested modal run loop while the outer user callback
-            // still owns EventHandler's RefCell. Returning Now would synchronously enter
-            // `applicationWillTerminate:` and deliver LoopExiting through that same handler,
-            // panicking at the second mutable borrow. NSTerminateLater cannot defer this safely:
-            // AppKit's `terminate:` waits in `_shouldTerminate` for its reply, so the outer
-            // callback cannot unwind. Cancel only this synchronous attempt and retry it from the
-            // ordered handler-work queue, once every older callback has completed.
-            self.ivars().termination_retry_pending.set(true);
-            self.defer_termination_retry();
-            NS_TERMINATE_CANCEL
+            let wait = self.reply_wait();
+            terminate::should_terminate(quit_confirm_answer(wait), wait)
         }
     }
 }
@@ -327,12 +374,46 @@ impl ApplicationDelegate {
         }
     }
 
+    /// LOCAL PATCH (aterm): whether the application's handler could run in AppKit's wait for a
+    /// reply to the quit it asks about now: the loop runs and the handler is set and not on the
+    /// stack (AppKit asking from inside it, from a modal alert or panel it runs, is not).
+    ///
+    /// Nor can it with a panic pending: the observers then deliver nothing (`cleared`), so no
+    /// exit would commit to reply to a `Later`, and AppKit would wait on it for good.
+    fn reply_wait(&self) -> ReplyWait {
+        let panicking = self.ivars().panic_info.upgrade().is_some_and(|info| info.is_panicking());
+        if self.is_running() && self.ivars().event_handler.ready() && !panicking {
+            ReplyWait::Answerable
+        } else {
+            ReplyWait::Unanswerable
+        }
+    }
+
+    /// LOCAL PATCH (aterm): AppKit calls `exit(0)` once this returns, so `run_app` never returns:
+    /// the loop's exit, the application's shutdown in it, is delivered here, inside AppKit
+    /// (`terminate::exit_ends_in_appkit`), unless a deferred quit's YES delivered it already, or
+    /// the event handler is on the stack (AppKit terminating from inside a modal alert or panel
+    /// it runs), where it could not be handed `LoopExiting` (`terminate::appkit_terminates`).
+    /// AppKit terminating is the exit: asked for here where the application did not ask
+    /// ([`Self::exit`]), which closes the handler queue as the exit barrier does, so the work
+    /// queued before it runs first and ends at the barrier ([`Self::run_owed_work`]), and
+    /// nothing that work causes can feed it. The exit is then committed, as the barrier's block
+    /// would commit it, so each window's `Destroyed` reaches the handler, the one an `exit()`
+    /// already asked for included (AppKit terminating at once, a second `terminate:` during its
+    /// wait on a deferred quit's reply). A panic that stops that work still leaves the windows
+    /// closed before `LoopExiting`.
     fn will_terminate(&self) {
         trace_scope!("applicationWillTerminate:");
         let _ = self.mtm();
-        // SAFETY: `app()` is the live shared `NSApplication`.
-        unsafe { notify_windows_of_exit(app()) };
-        self.internal_exit();
+        terminate::appkit_terminates(self.ivars().event_handler.in_use(), || {
+            if self.is_running() {
+                self.exit();
+                let _ = self.run_owed_work();
+                self.close_windows_and_exit();
+            } else {
+                self.internal_exit();
+            }
+        });
     }
 
     /// The delegate `NSApp` is holding, as this class.
@@ -437,8 +518,13 @@ impl ApplicationDelegate {
     }
 
     /// Clears the `running` state and resets the `control_flow` state when an `EventLoop` exits.
+    ///
+    /// LOCAL PATCH (aterm): `LoopExiting` goes out once per run: a run whose exit was delivered
+    /// inside AppKit (a deferred quit's YES, then `applicationWillTerminate:`) is not told again.
     pub fn internal_exit(&self) {
-        self.handle_event(Event::LoopExiting);
+        if self.is_running() {
+            self.handle_event(Event::LoopExiting);
+        }
 
         self.set_is_running(false);
         self.set_stop_on_redraw(false);
@@ -612,17 +698,102 @@ impl ApplicationDelegate {
             self.ivars().pending_handler_work.borrow().can_run_inline(),
             "the exit barrier must release the handler FIFO before closing windows"
         );
+        self.deliver_exit();
+    }
+
+    /// LOCAL PATCH (aterm): the exit barrier's block runs in the default mode, but while AppKit
+    /// waits on a deferred quit's reply it turns the run loop in `NSModalPanelRunLoopMode`
+    /// (`terminate.rs`, measured), where that block never runs and only the common-mode observers
+    /// do, so a requested exit would never commit and AppKit would wait on its reply for good.
+    /// With a reply owed this observer commits it instead, the handler free, after the work the
+    /// barrier would have run first ([`Self::run_owed_work`]). That work runs inside the exit,
+    /// which ends the process whatever it answers, so a cancel in it is no refusal
+    /// (`terminate::refuse`): a NO there would tell macOS the quit was refused while the exit
+    /// went on all the same, the windows closed and the run ended once `terminate:` returned
+    /// (measured by `objc_window_drive` stage [15j]'s negative control). Only the panic guard
+    /// refuses the quit, for a panic in that work, and nothing is delivered after it.
+    /// Without a reply owed the barrier owns the exit.
+    fn commit_owed_exit(&self) {
+        if !terminate::reply_owed() {
+            return;
+        }
+        let _ = terminate::exit_then_proceed(|| {
+            if self.run_owed_work() {
+                self.close_windows_and_exit();
+            }
+        });
+    }
+
+    /// LOCAL PATCH (aterm): runs the handler work queued before an exit that commits without the
+    /// exit barrier's block (AppKit's wait on a deferred quit's reply, `applicationWillTerminate:`),
+    /// in order, up to the barrier, each callback contained as the batch block contains it: with
+    /// the exit asked for in both callers every enqueue refuses, so nothing joins the batch and
+    /// it ends; what is behind the barrier is given up, since the exit that follows ends the
+    /// process ([`OwedBatch`]). Answers whether the exit may go on: false once a panic is
+    /// pending, which a deeper guard caught (it refused the quit). Inside a batch in progress
+    /// nothing runs: that batch owns its items, and it is on the stack beneath AppKit's
+    /// `terminate:`, which ends the process before the batch resumes.
+    fn run_owed_work(&self) -> bool {
+        debug_assert!(self.exiting(), "owed work runs only once the exit is asked for");
+        let panicking =
+            || self.ivars().panic_info.upgrade().is_some_and(|info| info.is_panicking());
+        if !self.ivars().pending_handler_work.borrow_mut().begin_owed() {
+            return !panicking();
+        }
+        let batch = OwedBatch { delegate: self, completed: Cell::new(false) };
+        loop {
+            if panicking() {
+                return false;
+            }
+            let work = self.ivars().pending_handler_work.borrow_mut().pop_owed();
+            match work {
+                Some(HandlerWork::Callback(work)) => {
+                    let _ = aterm_objc::contain("owed event-handler work", || work(self));
+                },
+                Some(HandlerWork::ExitBarrier) | None => break,
+            }
+        }
+        let completed = !panicking();
+        batch.completed.set(completed);
+        completed
+    }
+
+    /// The exit committed: each window's `Destroyed` passes from here on, and no `terminate:`
+    /// retry is owed.
+    fn mark_exit_committed(&self) {
         self.ivars().exit_committed.set(true);
         self.ivars().termination_retry_pending.set(false);
+    }
 
-        // Post the stop first so an Objective-C exception during a synchronous close cannot
-        // strand a committed exit. `NSApp run` cannot return until this block returns, so each
-        // `Destroyed` still runs inline before `pump_events` emits `LoopExiting`.
+    /// The exit delivered where it ends inside AppKit: committed, the windows closed, then
+    /// `LoopExiting`.
+    fn close_windows_and_exit(&self) {
+        self.mark_exit_committed();
         // SAFETY: `app()` is the live shared `NSApplication`.
-        unsafe {
-            let app = app();
-            stop_app_immediately(app);
-            notify_windows_of_exit(app);
+        unsafe { notify_windows_of_exit(app()) };
+        self.internal_exit();
+    }
+
+    /// The committed exit: the windows closed, then `LoopExiting`.
+    fn deliver_exit(&self) {
+        self.mark_exit_committed();
+        let app = app();
+        // LOCAL PATCH (aterm): while AppKit waits on a deferred quit's reply its `terminate:` is
+        // on the stack, `-[NSApp run]` cannot return and a `-stop:` ends nothing until
+        // `terminate:` returns, so the exit is delivered here (the windows closed, then
+        // `LoopExiting`, the application's shutdown in it), and AppKit hears YES after it and
+        // ends the process (`terminate.rs`). After the panic guard's NO during that exit the
+        // run ends once `terminate:` returns, on the stop the guard queued.
+        let ended_in_appkit = terminate::exit_then_proceed(|| self.close_windows_and_exit());
+        if !ended_in_appkit {
+            // Post the stop first so an Objective-C exception during a synchronous close cannot
+            // strand a committed exit. `NSApp run` cannot return until this block returns, so
+            // each `Destroyed` still runs inline before `pump_events` emits `LoopExiting`.
+            // SAFETY: `app` is the live shared `NSApplication`.
+            unsafe {
+                stop_app_immediately(app);
+                notify_windows_of_exit(app);
+            }
         }
     }
 
@@ -793,6 +964,7 @@ impl ApplicationDelegate {
             return;
         }
         if self.exiting() {
+            self.commit_owed_exit();
             return;
         }
 
@@ -827,9 +999,10 @@ impl ApplicationDelegate {
             self.handle_event(Event::AboutToWait);
         });
 
+        // An exit this turn's handlers asked for: the barrier armed by `exit()` owns closing and
+        // stopping, unless AppKit waits on a deferred quit's reply ([`Self::commit_owed_exit`]).
         if self.exiting() {
-            // The barrier armed by `exit()` owns closing and stopping. Let the current turn end,
-            // but do not let a pump stop overtake callbacks queued ahead of that barrier.
+            self.commit_owed_exit();
             return;
         }
 

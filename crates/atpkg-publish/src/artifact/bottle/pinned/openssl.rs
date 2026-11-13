@@ -80,7 +80,7 @@ pub(super) fn build(source: &Path, work: &Path) -> Result<aterm_json::Value> {
         .chain(std::iter::once(format!("--prefix={PREFIX}")))
         .collect();
     build_step(source, work, "/usr/bin/perl", &options)?;
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cores = aterm_cores::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let jobs = std::env::var("CARGO_BUILD_JOBS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

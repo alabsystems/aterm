@@ -215,8 +215,63 @@ pub(super) fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
                 ctx.target.window_sessions.clone()
             }
         }
+        ScopeArg::Request => match ctx.target.request.as_ref() {
+            Some(request) if !request.sessions.is_empty() => request.sessions.clone(),
+            _ => vec![ctx.target.key],
+        },
         ScopeArg::Aterm | ScopeArg::Global => ctx.tabs.iter().map(|t| t.key).collect(),
     }
+}
+
+/// `scope=request`'s label: `request <id> (<n> tabs)`.
+fn request_label(ctx: &Ctx<'_>) -> String {
+    ctx.target.request.as_ref().map_or_else(
+        || "request -".to_owned(),
+        |request| {
+            let n = request.tabs;
+            format!(
+                "request {} ({n} tab{})",
+                request.id,
+                if n == 1 { "" } else { "s" }
+            )
+        },
+    )
+}
+
+/// `scope=request`'s totals: what the request's tabs' trees spent and what its claimed folders
+/// hold, each `unavailable` where nothing was read, never 0.
+fn request_line(ctx: &Ctx<'_>) -> Option<Line> {
+    let request = ctx.target.request.as_ref()?;
+    let fig = |v: Option<u64>| v.map_or_else(|| unavailable("not_sampled"), |v| v.to_string());
+    Some(line(
+        "request",
+        format!(
+            "request={} tabs={} cpu_s={} peak_mb={} disk_written_mb={} claims={} claimed_mb={} \
+             (spend: a floor; a process that ended between reads is missed)",
+            request.id,
+            request.tabs,
+            fig(request.cpu_s),
+            fig(request.peak_mb),
+            fig(request.written_mb),
+            request.claims,
+            fig(request.claimed_mb),
+        ),
+    ))
+}
+
+/// `scope=request`'s totals as JSON.
+fn request_json(ctx: &Ctx<'_>) -> Option<Jv> {
+    let request = ctx.target.request.as_ref()?;
+    let fig = |v: Option<u64>| v.map_or_else(|| Jv::why("not_sampled"), Jv::u);
+    Some(Jv::obj([
+        ("id", Jv::s(request.id.clone())),
+        ("tabs", Jv::u(request.tabs as u64)),
+        ("cpu_s", fig(request.cpu_s)),
+        ("peak_mb", fig(request.peak_mb)),
+        ("disk_written_mb", fig(request.written_mb)),
+        ("claims", Jv::u(request.claims as u64)),
+        ("claimed_mb", fig(request.claimed_mb)),
+    ]))
 }
 
 fn tabs_fig(s: &Snapshot, keys: &[u64], target: u64) -> Fig {
@@ -1360,7 +1415,8 @@ pub(super) fn exact_partition(ctx: &Ctx<'_>) -> bool {
 }
 
 /// The classes, bytes; `None` for one the OS does not say (Windows'
-/// compression store), never a false zero. The last is the remainder:
+/// compressed class with compression off, or on a reading that swept no
+/// processes, where its store is read), never a false zero. The last is the remainder:
 /// `not_in_vm` where the partition is exact, else `unnamed`.
 pub(super) fn mem_classes(
     m: &crate::model::MemView,
@@ -1482,9 +1538,13 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 .window
                 .map_or_else(|| "-".to_owned(), |w| w.to_string())
         ),
+        ScopeArg::Request => request_label(ctx),
         ScopeArg::Aterm => "aterm".into(),
         ScopeArg::Global => "global".into(),
     };
+    if scope == ScopeArg::Request {
+        lines.extend(request_line(ctx));
+    }
     let Some(v) = s.jobs.as_deref() else {
         lines.push(line(
             "jobs",
@@ -1540,7 +1600,9 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             },
         );
     let wider = match scope {
-        ScopeArg::Pane | ScopeArg::Tab | ScopeArg::Window => " · sys jobs scope=aterm (owner)",
+        ScopeArg::Pane | ScopeArg::Tab | ScopeArg::Window | ScopeArg::Request => {
+            " · sys jobs scope=aterm (owner)"
+        }
         ScopeArg::Aterm => " · sys jobs scope=global (owner)",
         ScopeArg::Global => "",
     };
@@ -1855,7 +1917,7 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 r.pid,
                 exe_word(&r.name),
                 rec(r.footprint, "refused"),
-                rec(r.peak, "not_sampled")
+                rec(r.peak, proc_unread(ctx, r, false))
             ),
         ));
     }
@@ -1993,9 +2055,13 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 .window
                 .map_or_else(|| "-".to_owned(), |w| w.to_string())
         ),
+        ScopeArg::Request => request_label(ctx),
         ScopeArg::Aterm => "aterm".into(),
         ScopeArg::Global => "global".into(),
     };
+    if scope == ScopeArg::Request {
+        lines.extend(request_line(ctx));
+    }
     if let Some(v) = ctx.volume {
         let volume = crate::model::VolumeSample {
             total: v.total,
@@ -2354,12 +2420,26 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
 /// Default subtree depth listed by `sys disk` under each root.
 pub const DISK_DEPTH_DEFAULT: u8 = 3;
 
+/// `sys disk`'s summary when no walker's sizes came with the reading. On Windows the walker
+/// starts when first asked in a headless instance, so it may yet measure them, and no process's
+/// disk writes are read there (a process's handle I/O counts pipes, consoles and sockets too, so
+/// no disk figure is made of it); elsewhere the walker measures none here and the writers are.
+fn disk_unmeasured(windows: bool) -> String {
+    let unread = unavailable("not_sampled");
+    if windows {
+        format!(
+            "summary folder sizes, entry counts and growth are {unread} here (the disk walker has measured none yet; a headless instance starts it at the first ask); free space is measured, each process's disk writes are not"
+        )
+    } else {
+        format!(
+            "summary folder sizes, entry counts and growth are {unread} here (no disk walker measures them); free space and writers are measured"
+        )
+    }
+}
+
 fn disk_summary(ctx: &Ctx<'_>) -> String {
     let Some(t) = ctx.disk else {
-        return format!(
-            "summary folder sizes, entry counts and growth are {} here (no disk walker measures them); free space and writers are measured",
-            unavailable("not_sampled")
-        );
+        return disk_unmeasured(ctx.machine.family == "Windows");
     };
     let warnings = if t.warnings.is_empty() {
         "none".to_owned()
@@ -2455,9 +2535,13 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
                 .window
                 .map_or_else(|| "-".to_owned(), |w| w.to_string())
         ),
+        ScopeArg::Request => request_label(ctx),
         ScopeArg::Aterm => "aterm".into(),
         ScopeArg::Global => "global (the busiest and largest rows)".into(),
     };
+    if scope == ScopeArg::Request {
+        lines.extend(request_line(ctx));
+    }
     if s.procs_window_ns.is_none() {
         lines.push(line(
             "procs",
@@ -2484,15 +2568,12 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             proc_label(ctx, s, r),
             r.pgid,
             proc_cpu(r),
-            rec(
-                mc_opt(r.wait),
-                if r.refused { "refused" } else { "warming" }
-            ),
+            rec(mc_opt(r.wait), proc_unread(ctx, r, true)),
             rec(r.footprint, "refused"),
-            rec(r.peak, "refused"),
+            rec(r.peak, proc_unread(ctx, r, false)),
             rec(
                 r.write_bps.map(|b| b.round() as u64),
-                if r.refused { "refused" } else { "warming" }
+                proc_unread(ctx, r, true)
             ),
             rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
             r.state.word(),
@@ -2812,6 +2893,11 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     ]);
     if let Some(sc) = q.view.default_scope().and(scope) {
         o.set("scope", Jv::s(sc.word()));
+        if sc == ScopeArg::Request
+            && let Some(request) = request_json(ctx)
+        {
+            o.set("request", request);
+        }
     }
     o.set("as_of", as_of_json(q.view, ctx));
     if let Some(g) = ctx.gap {
@@ -3422,12 +3508,21 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
         "cpu_accounting",
         cpu_accounting_json(&r.cpu_accounting, ctx.machine.family),
     );
-    o.set("wait_mc", Jv::known_or(r.wait.map(mc), why));
+    o.set(
+        "wait_mc",
+        Jv::known_or(r.wait.map(mc), proc_unread(ctx, r, true)),
+    );
     o.set("footprint_bytes", Jv::known_or(r.footprint, "refused"));
-    o.set("peak_bytes", Jv::known_or(r.peak, "refused"));
+    o.set(
+        "peak_bytes",
+        Jv::known_or(r.peak, proc_unread(ctx, r, false)),
+    );
     o.set(
         "write_bytes_per_s",
-        Jv::known_or(r.write_bps.map(|b| b.round() as u64), why),
+        Jv::known_or(
+            r.write_bps.map(|b| b.round() as u64),
+            proc_unread(ctx, r, true),
+        ),
     );
     o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
@@ -3452,6 +3547,20 @@ fn scheduling_read<T>(read: Result<T, i32>, value: impl FnOnce(T) -> Jv) -> Jv {
         },
         value,
     )
+}
+
+/// Why a process's time waiting for a core, peak footprint or write rate is unread
+/// ([`ProcView::wait`], [`ProcView::peak`], [`ProcView::write_bps`]; a `rate` needs a second
+/// sweep): only macOS's sweep reads them, from `proc_pid_rusage`, which it refuses for another
+/// user's process; elsewhere none is sampled, however long the sweep runs.
+fn proc_unread(ctx: &Ctx<'_>, r: &ProcView, rate: bool) -> &'static str {
+    if ctx.machine.family != "macOS" {
+        "not_sampled"
+    } else if r.refused || !rate {
+        "refused"
+    } else {
+        "warming"
+    }
 }
 
 pub(super) fn cpu_accounting_json(c: &crate::model::CpuAccounting, family: &str) -> Jv {

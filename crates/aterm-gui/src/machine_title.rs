@@ -4,13 +4,17 @@
 //! The menu bar's machine title, `m8 Heron` right of the version
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §5.1). A reader thread makes this machine's name
 //! where none is there yet ([`aterm_agent::machine_name::ensure_in_view`]), reads it again when
-//! `machine-name.toml`, the fleet key or one of the vault's standing files changes
+//! `machine-name.toml`, the fleet key, its custody or one of the vault's standing files changes
 //! ([`aterm_secrets::client::Paths::standing_files`]), and posts [`Wake::MachineName`] when what
 //! it shows changed. It hears a change through [`FileWatch`] (kqueue on each file and its
-//! folder, so a replace by rename is heard), so it polls nothing; but while the vault's
-//! subscriber runs it replaces its `state.toml` at least once a minute, and each replace is one
-//! read of the name and the vault's local files, which posts nothing when nothing changed. The
-//! window thread only sets titles, so opening the menu reads no file.
+//! folder, so a replace by rename is heard), so it polls nothing. The standing files are the
+//! vault's source, saved state, identity and handed-over Allowed, and the trusted log's entry,
+//! pin, intent, header and data file. The vault's subscriber replaces its `state.toml` only
+//! when what it holds changed (when it last heard its vault is among that, and moves about once
+//! a minute while it runs), and it puts a record that arrives on the end of the log's data file
+//! in place. Each such change is one read of the name and the vault's local files, which posts
+//! nothing when nothing changed. The window thread only sets titles, so opening the menu reads
+//! no file.
 
 use std::io;
 use std::path::Path;
@@ -25,8 +29,8 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-mod discovery;
 pub(crate) mod naming;
+mod panel_reads;
 #[cfg(test)]
 mod publication_tests;
 
@@ -69,7 +73,7 @@ pub(crate) struct MachineView {
     pub(crate) nick: String,
     /// The display spelling the Name field starts with (`Heron`).
     pub(crate) word: String,
-    /// Whether this machine is in a fleet: its vault's standing, or a fleet key that reads
+    /// Whether this machine is in a fleet: its vault's standing, or a key with admitted custody
     /// ([`InFleet`], §11.85).
     pub(crate) fleet: InFleet,
 }
@@ -93,11 +97,12 @@ pub(crate) fn machine_menu_bar_title(view: &MachineView) -> String {
 }
 
 /// The menu's first row: `m8 · Heron · in ALab`, or `· joining ALab`, `· not in a fleet`,
-/// `· fleet not read` ([`InFleet::phrase`]).
+/// `· ALab paused`, or `· fleet not read` ([`InFleet::phrase`]).
 pub(crate) fn machine_menu_info_row(view: &MachineView) -> String {
     let fleet = match &view.fleet {
         InFleet::In => "in ALab",
         InFleet::Joining => "joining ALab",
+        InFleet::Paused(_) => "ALab paused",
         state => state.phrase(),
     };
     format!("{} \u{00B7} {} \u{00B7} {}", view.name, view.nick, fleet)
@@ -154,7 +159,7 @@ enum Heard {
     Ended,
 }
 
-/// The watch on the files the title comes from, `machine-name.toml`, the fleet key and the
+/// The watch on the files the title comes from, `machine-name.toml`, the fleet key, its custody and the
 /// standing files of `vault` where one is read: `changes` hears one `()` for each whose stamp
 /// (device, inode, length, modification and change times) moved, and one at the watch's first
 /// look at each. The state directory is made private first, as a reader makes it; the vault's
@@ -174,7 +179,8 @@ fn watch(state: &Path, vault: Option<&Paths>) -> io::Result<(FileWatch, mpsc::Re
     )?;
     watch.watch(0, state.join(aterm_agent::machine_name::file::FILE));
     watch.watch(1, state.join(aterm_net::fleet::KEY_FILE));
-    for (key, file) in (2..).zip(vault.into_iter().flat_map(Paths::standing_files)) {
+    watch.watch(2, state.join(aterm_net::fleet_member::VAULT_FILE));
+    for (key, file) in (3..).zip(vault.into_iter().flat_map(Paths::standing_files)) {
         watch.watch(key, file);
     }
     Ok((watch, changes))
@@ -245,7 +251,11 @@ fn post_read(
     let _serial = READ_POST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read(state, vault, roster).map(post)
+    let view = read(state, vault, roster)?;
+    // This existing reader already owns canonical-file events. Wake the shared input
+    // subject, whose semantic cursor ignores metadata-only changes and rereads at dispatch.
+    aterm_secrets::client::ConvergenceInputs::identity_changed();
+    Ok(post(view))
 }
 
 /// Read the name and `post` it, then read again at each change `wait` hears, posting only a view
@@ -385,13 +395,14 @@ struct NameJob {
 impl NameWriter {
     fn start(proxy: EventLoopProxy<Wake>) -> io::Result<Self> {
         let (jobs, queued) = mpsc::channel();
-        let discovery = discovery::start().map_err(|why| why.to_string());
+        let discovery = panel_reads::discovery().map_err(|why| why.to_string());
+        let diagnostics = panel_reads::diagnostics().map_err(|why| why.to_string());
         std::thread::Builder::new()
             .name("aterm-name-writer".to_owned())
             .spawn(move || {
                 write_changes(queued, |job| match job {
                     Job::Change(job) => apply_change(&proxy, job),
-                    Job::Preview(press) => read_preview(press, &discovery),
+                    Job::Preview(press) => read_preview(press, &discovery, &diagnostics),
                 });
             })?;
         Ok(Self { jobs })
@@ -441,12 +452,17 @@ fn queue(writer: &mut Option<NameWriter>, proxy: EventLoopProxy<Wake>, job: Job)
 /// Read what Rename This Mac… judges a number by ([`aterm_agent::machine_name::rename_preview`])
 /// off the window thread, and bring it to press `press`'s alert through the main queue, which
 /// AppKit's modal loop serves while the alert is up.
-fn read_preview(press: u64, discovery: &Result<mpsc::Sender<u64>, String>) {
+fn read_preview(
+    press: u64,
+    discovery: &Result<panel_reads::Sender<u64>, String>,
+    diagnostics: &Result<panel_reads::Sender<panel_reads::Diagnostics>, String>,
+) {
     use crate::machine_rename_sheet::Snapshot;
     use aterm_agent::machine_name::{
         lab_labels, rename_preview, standing_vault, vault_roster_label,
     };
     let mut browse = false;
+    let mut diagnostic = None;
     let snapshot = match aterm_types::dirs::state_dir() {
         None => Snapshot::Unread("aterm has no state folder".to_owned()),
         Some(state) => {
@@ -462,13 +478,15 @@ fn read_preview(press: u64, discovery: &Result<mpsc::Sender<u64>, String>) {
                     Some(config) => {
                         let membership = InFleet::read(&state, vault.as_ref());
                         browse = !matches!(membership, InFleet::In | InFleet::Joining);
-                        let names = naming::NamingStatus::read(
-                            &state,
-                            &config,
-                            preview.name(),
-                            &MacSystemNames,
-                        )
-                        .with_fleet_membership(membership);
+                        diagnostic = Some(panel_reads::Diagnostics {
+                            press,
+                            state: state.clone(),
+                            config: config.clone(),
+                            name: preview.name().clone(),
+                        });
+                        let names =
+                            naming::NamingStatus::read_local(&state, &config, preview.name())
+                                .with_fleet_membership(membership);
                         Snapshot::named(preview, names)
                     }
                     None => Snapshot::Unread("aterm has no configuration path".into()),
@@ -481,6 +499,17 @@ fn read_preview(press: u64, discovery: &Result<mpsc::Sender<u64>, String>) {
         }
     };
     aterm_objc::run_on_main(move |_| crate::machine_rename_sheet::deliver(press, snapshot));
+    if let Some(request) = diagnostic {
+        let queued = diagnostics
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|sender| sender.send(request).map_err(|why| why.to_string()));
+        if let Err(why) = queued {
+            aterm_objc::run_on_main(move |_| {
+                crate::machine_rename_sheet::deliver_diagnostics(press, Err(why));
+            });
+        }
+    }
     if browse {
         let queued = discovery
             .as_ref()

@@ -18,6 +18,9 @@ use crate::store::Layout;
 
 mod named;
 pub use named::configured_build;
+pub use named::configured_tool;
+#[cfg(unix)]
+pub mod handoff;
 
 /// Stable native-runner admission capability; older clients refuse the query.
 pub const LEASE_CAPABILITY: &str = "aterm-signed-prerequisite-leases-v1";
@@ -177,6 +180,8 @@ pub enum Prerequisite {
     AtpkgKeys,
     /// AY's maintained solver and campaign executable.
     Ay,
+    /// Codex's retained process-update target.
+    Codex,
 }
 
 impl Prerequisite {
@@ -189,7 +194,7 @@ impl Prerequisite {
             Self::Python => Some(&upstream::CPYTHON),
             Self::OpenSslSigning => Some(&upstream::OPENSSL_SIGNING),
             Self::Lake => Some(&upstream::LEAN4),
-            Self::AtpkgKeys | Self::Ay => None,
+            Self::AtpkgKeys | Self::Ay | Self::Codex => None,
         }
     }
 
@@ -203,6 +208,7 @@ impl Prerequisite {
             Self::Lake => upstream::LEAN4.name,
             Self::AtpkgKeys => "atpkg-keys",
             Self::Ay => "ay",
+            Self::Codex => "codex",
         }
     }
 
@@ -216,6 +222,7 @@ impl Prerequisite {
             Self::Lake => "lake",
             Self::AtpkgKeys => "atpkg-keys",
             Self::Ay => "ay",
+            Self::Codex => "codex",
         }
     }
 
@@ -229,6 +236,7 @@ impl Prerequisite {
             Self::Lake,
             Self::AtpkgKeys,
             Self::Ay,
+            Self::Codex,
         ]
         .into_iter()
         .find(|want| want.executable() == name)

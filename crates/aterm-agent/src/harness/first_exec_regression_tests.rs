@@ -139,7 +139,7 @@ fn malformed_nonempty_native_stamps_do_not_use_expiry_fallback() {
 }
 
 #[test]
-fn both_probe_descriptors_keep_the_admitted_native_image_after_alias_retarget() {
+fn the_probe_descriptor_keeps_the_admitted_native_image_after_alias_retarget() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(scratch.path()).unwrap();
     let a = root.join("person's native A");
@@ -147,18 +147,16 @@ fn both_probe_descriptors_keep_the_admitted_native_image_after_alias_retarget() 
     std::fs::write(&a, [0xcf, 0xfa, 0xed, 0xfe, 0xff]).unwrap();
     std::fs::write(&b, b"different inert image").unwrap();
     let holds = root.join("holds");
-    let ordinary = prepare(&a, Some(&holds), ProbeWord::Version).unwrap();
+    let ordinary = prepare(&a, Some(&holds), ProbeWord::Help).unwrap();
     assert_eq!(ordinary.command.get_program(), a.as_os_str());
-    assert_eq!(
-        ordinary.command.get_args().collect::<Vec<_>>(),
-        ["--version"]
-    );
+    assert_eq!(ordinary.command.get_args().collect::<Vec<_>>(), ["--help"]);
     assert!(held(&holds, &a, std::time::SystemTime::now()));
     ordinary.hold.unwrap().ran();
     assert!(!held(&holds, &a, std::time::SystemTime::now()));
 
     let alias = root.join("native-alias");
-    for word in [ProbeWord::Version, ProbeWord::Help] {
+    {
+        let word = ProbeWord::Help;
         let expected = word.word();
         std::os::unix::fs::symlink(&a, &alias).unwrap();
         let prepared = prepare(&alias, Some(&holds), word).unwrap();
@@ -203,7 +201,7 @@ fn both_probe_descriptors_keep_the_admitted_native_image_after_alias_retarget() 
 }
 
 #[test]
-fn both_probe_descriptors_keep_a_complete_factory_twin_after_normal_publication() {
+fn the_probe_descriptor_keeps_a_complete_factory_twin_after_normal_publication() {
     use std::os::unix::fs::PermissionsExt as _;
     let scratch = aterm_tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(scratch.path()).unwrap();
@@ -245,7 +243,8 @@ fn both_probe_descriptors_keep_a_complete_factory_twin_after_normal_publication(
     let rendered =
         |target| atpkg::platform::twin_executable_to_env(&wrapper, target, &env, &prelude).unwrap();
     let holds = root.join("holds");
-    for word in [ProbeWord::Version, ProbeWord::Help] {
+    {
+        let word = ProbeWord::Help;
         atpkg::lay::write_in_process(&rendered(&a)).unwrap();
         let expected_word = word.word();
         let prepared = prepare_using(&wrapper, Some(&holds), word, |holds, exe| {

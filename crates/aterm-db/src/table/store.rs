@@ -13,7 +13,7 @@ use crate::{
     Error, Result,
     crypto::{self, Causal},
 };
-use astream_wire::sync::{Actor, Digest, Header, Index, MAX_PARENTS, Projection};
+use astream_wire::sync::{Actor, Digest, Fork, Header, Index, MAX_PARENTS, Projection};
 use aterm_journal::{Limits, Log};
 use aterm_secrets::{
     commons::{constraints::Fact, roster::Role},
@@ -21,31 +21,51 @@ use aterm_secrets::{
 };
 use aterm_uds::private_file::{self, PrivateFileError};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::VacantEntry},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 #[cfg(test)]
 mod append_tests;
 mod contributor;
 pub mod custody;
-pub(crate) use contributor::Contributor;
-mod cutoff;
+#[cfg(test)]
+pub(crate) use contributor::OMIT_REGION;
+pub(crate) use contributor::{OwnedTable, ReplicaRevision};
+pub(super) mod cutoff;
 #[cfg(all(test, unix))]
 pub(crate) use cutoff::Signing;
 #[cfg(unix)]
 pub use cutoff::cut_removed_writer;
 mod directory;
+#[cfg(test)]
+mod enrollment_tests;
+pub(crate) use directory::remove_claim_files;
+
+#[cfg(test)]
+pub(crate) fn with_volume_for_test<T>(volume: [u8; 16], run: impl FnOnce() -> T) -> T {
+    directory::with_probe(
+        directory::Probe {
+            dev_shift: 0,
+            volume: Some(volume),
+        },
+        run,
+    )
+}
 mod held;
 #[cfg(test)]
 mod hook_tests;
+mod journals;
 #[cfg(unix)]
 mod pending;
 #[cfg(test)]
 mod recovery_tests;
 mod replay;
+mod replay_index;
 mod replicas;
 mod witness;
+use replay_index::ReplayIndex;
 use witness::Witness;
 
 pub use held::{Held, held_length, held_lengths, read_held};
@@ -90,12 +110,96 @@ thread_local! {
     static OPENS_AND_CHECKS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many causal indexes this thread's stores have built ([`Store::index`]).
+    static INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_ADMITTED: std::cell::RefCell<Option<Vec<Header>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read`, with each header this thread's store opens admit to their causal index as they replay
+/// (`ReplayIndex`), in order: what an index each open built as it replayed would have been given.
+#[cfg(test)]
+fn with_replay_admitted<T>(read: impl FnOnce() -> T) -> (T, Vec<Header>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REPLAY_ADMITTED.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    REPLAY_ADMITTED.with(|slot| assert!(slot.borrow_mut().replace(Vec::new()).is_none()));
+    let _reset = Reset;
+    let out = read();
+    let admitted = REPLAY_ADMITTED.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    (out, admitted)
+}
+
+#[cfg(test)]
+fn replay_admitted(header: &Header) {
+    REPLAY_ADMITTED.with(|slot| {
+        if let Some(admitted) = slot.borrow_mut().as_mut() {
+            admitted.push(header.clone());
+        }
+    });
+}
+
 /// How many stores this thread has opened and how many times it has checked one
 /// ([`Store::check`]). Every open ends `open_region` by checking its store, so a read that stands
 /// on that check adds none.
 #[cfg(test)]
 pub(crate) fn test_opens_and_checks() -> (usize, usize) {
     OPENS_AND_CHECKS.get()
+}
+
+#[cfg(test)]
+type OpenHook = Option<(PathBuf, std::rc::Rc<dyn Fn() -> Result<()>>)>;
+#[cfg(test)]
+thread_local! {
+    static OPEN_HOOK: std::cell::RefCell<OpenHook> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read`, with `hook` run by each open on this thread of the store in data folder `dir` once the
+/// open has judged its claim and before it reads the journal, the open refusing what `hook`
+/// refuses: a count of the opens that went past the claim, or a refusal the open meets there (a
+/// busy store). An enrollment probe ([`Store::enrollment_region`]) reads the claim alone and never
+/// runs it.
+#[cfg(test)]
+pub(crate) fn with_open_hook<T>(
+    dir: &Path,
+    hook: impl Fn() -> Result<()> + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OPEN_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    OPEN_HOOK.with(|slot| {
+        assert!(
+            slot.borrow_mut()
+                .replace((dir.into(), std::rc::Rc::new(hook)))
+                .is_none()
+        );
+    });
+    let _reset = Reset;
+    read()
+}
+
+/// What the hook [`with_open_hook`] set for `dir` says, if it set one.
+#[cfg(test)]
+fn open_hook(dir: &Path) -> Result<()> {
+    let hook = OPEN_HOOK.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(at, _)| at == dir)
+            .map(|(_, hook)| hook.clone())
+    });
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 /// `read`, with `observe` run once a combined store's check has checked its primary and before it
@@ -133,6 +237,9 @@ pub(crate) const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONFLICTS: usize = aterm_secrets::commons::constraints::MAX_BINDINGS;
 const DISCARDED_OVERHEAD: usize = 5 + 32 + 4;
 const JOURNAL_RECORDS: usize = MAX_RECORDS * 2 + MAX_CONFLICTS;
+/// The causal index's bound ([`Store::index`]): the operations a store may hold, and as many
+/// discarded sources.
+const INDEX_CAPACITY: usize = MAX_RECORDS * 2;
 
 #[derive(Clone, Copy)]
 struct Capacity {
@@ -330,13 +437,38 @@ fn appended(record: &Appended<'_>) {
     }
 }
 struct Stored {
-    wire: Vec<u8>,
+    wire: StoredWire,
     header: Header,
     receipt: Receipt,
     quarantine: Option<(Digest, u64, u64)>,
     /// The member-signed removal cutoff this operation is ([`cutoff`]), read once as it is
     /// admitted.
     cut: Option<cutoff::Cut>,
+}
+
+/// Replays share the journal's immutable allocation. An ingest owns its new bytes without
+/// allocating another identifier or shared wrapper merely to retain them. Neither arm permits
+/// mutation, and both keep their bytes alive independently of the journal cache's lifetime.
+enum StoredWire {
+    Owned(Vec<u8>),
+    Shared(super::signatures::Identified),
+}
+
+impl StoredWire {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(wire) => wire,
+            Self::Shared(wire) => wire.wire(),
+        }
+    }
+}
+
+impl std::ops::Deref for StoredWire {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
 }
 
 /// A member-signed cutoff a reader counts ([`Store::removal_cuts`]).
@@ -388,9 +520,13 @@ pub struct MetadataEvidence {
 
 /// A local handle for authenticated table data. Writers are exclusive;
 /// observations retain verified committed snapshots. A recovery observation
-/// can include healthy primary data, with both custody claims rechecked. The index retains
-/// authenticated records and previously witnessed quarantined headers.
-/// Plaintext is decrypted per read. Reopen after a control change; open for a
+/// can include healthy primary data, with both custody claims rechecked. Its causal index
+/// ([`Self::index`]) holds the headers of its authenticated records, the signed headers of the
+/// quarantined records its witnessed prefix holds (replay opens no payload of those), and the
+/// headers of the discarded sources its certificates keep; an open admits each header as that
+/// index would and builds the index only at first use.
+/// Application plaintext is decrypted per read. Replay can reuse a retained non-cutoff
+/// authentication fact only after fresh historical-writer and key admission. Reopen after a control change; open for a
 /// short local batch, then drop the store and session before network I/O.
 pub struct Store {
     region: Region,
@@ -405,7 +541,9 @@ pub struct Store {
     poisoned: bool,
     capacity: Capacity,
     operation_bytes: usize,
-    index: Index,
+    /// The causal index of `records`' headers and the discarded sources `conflicts` keeps, built
+    /// at first use ([`Self::index`]); once built, each site that adds to either adds to it too.
+    index: OnceLock<Index>,
     records: BTreeMap<Digest, Stored>,
     /// What `records` holds of each writer, counted as each record is held ([`Self::hold`]):
     /// the sums a walk of every record gives, which the writer quota ([`Self::admit_records`])
@@ -434,7 +572,7 @@ struct WriterHeld {
 /// enrollment claim it read; and its region, so a round can tell a recovery store's fence
 /// ([`Self::is_recovery`]). It grants no authority and holds no guard, lock or file, so it can
 /// outlive the batch that read the store and cross network I/O.
-/// An observer's records are the claim's witnessed prefix (`replay::read_observed`), so where
+/// An observer's records are the claim's witnessed prefix (`replay::witnessed`), so where
 /// [`Self::stands`] in a later session, a read of the store then that succeeds reads the same
 /// records.
 pub(crate) struct Fence {
@@ -478,6 +616,30 @@ impl Fence {
         Ok(custody.admits(session)?
             && custody.current_claim()?.as_deref() == Some(self.claim.as_slice()))
     }
+}
+
+/// Whether a table's local storage in one region is enrolled, read from its enrollment claim
+/// alone ([`Store::enrollment_region`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Enrollment {
+    /// No claim, and no data folder or only an empty discovery reservation.
+    Absent,
+    /// A valid first enrollment cut short after its pending claim, which `join` resumes. It holds
+    /// no record: none is authored or ingested before the claim is ready.
+    Pending,
+    /// A ready claim that holds its data folder: established custody, whose records an open
+    /// still judges in full.
+    Enrolled,
+}
+
+/// What an open reads before its journal ([`Store::claimed`]): the session's source reads its
+/// replay holds, and the enrollment claim, judged, with whether it is pending.
+struct Claimed<'s, 'a> {
+    sources: super::SourceReads<'s, 'a>,
+    claim_dir: PathBuf,
+    claim_name: String,
+    claim: Vec<u8>,
+    pending: bool,
 }
 
 /// The custody a store was read under, which [`Store::check`] and a [`Fence`] judge alike.
@@ -615,6 +777,8 @@ impl Store {
     /// Read the independently witnessed committed prefix beside any live writer.
     /// This handle cannot append, repair a tail, publish a witness or enroll storage.
     /// A custody change during the read is refused, so no unchecked snapshot escapes.
+    /// Within one process a table journal whose folder and files stand as a settled read of them
+    /// saw them is not read again (`journals`); every claim, session and record check still runs.
     pub fn observe(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
         Self::open_capacity_mode(session, dir, scope, false, Capacity::default(), true)
     }
@@ -689,25 +853,8 @@ impl Store {
         scope: Scope,
         region: Region,
     ) -> Result<Option<Self>> {
-        session.context(scope)?;
-        region.validate_directory(session, dir, scope)?;
-        let claim_dir = region.claims(session)?;
-        let claim_name = claim_name(scope);
-        if matches!(
-            private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN),
-            Err(PrivateFileError::Missing)
-        ) {
-            match private_file::judge_private_dir(dir)? {
-                private_file::PrivateDir::Missing => return Ok(None),
-                private_file::PrivateDir::Private
-                    if std::fs::read_dir(dir)?.next().transpose()?.is_none() =>
-                {
-                    // subscriptions() reserves a slot before Store::join creates
-                    // its independent enrollment claim and journal.
-                    return Ok(None);
-                }
-                _ => {}
-            }
+        if Self::unenrolled(session, dir, scope, region)? {
+            return Ok(None);
         }
         // Enrollment may start after the absence check. Classify its freshly
         // validated claim inside the open, rather than trusting an earlier read.
@@ -724,6 +871,111 @@ impl Store {
             Err(error) if error.is_enrollment_pending() => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether [`Self::observe_if_exists_region`] finds `scope`'s storage at `dir`, answered from
+    /// the enrollment claim by the observation's own steps up to its journal read: `Absent` or
+    /// `Pending` exactly where the observation is `None`, whose two causes these are; an error
+    /// wherever one of those steps refuses, where the observation refuses too; and `Enrolled` for
+    /// a ready claim that holds its data folder, which the observation opens in full and can
+    /// still refuse (a journal that lost acknowledged records). It reads no journal and opens no
+    /// store: a caller that needs only whether the store exists, or must be joined, does not pay
+    /// for authenticating and decrypting every record.
+    ///
+    /// # Errors
+    /// The observation's steps before its journal read refuse: the session's context or its
+    /// source read of the vault, a noncanonical recovery location, a data folder that cannot be
+    /// judged or listed, or a claim missing beside storage, damaged, of another scope or writer,
+    /// or not holding its data folder.
+    pub(crate) fn enrollment_region(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        region: Region,
+    ) -> Result<Enrollment> {
+        if Self::unenrolled(session, dir, scope, region)? {
+            return Ok(Enrollment::Absent);
+        }
+        let claimed = Self::claimed(session, dir, scope, Capacity::default(), true, region)?;
+        Ok(if claimed.pending {
+            Enrollment::Pending
+        } else {
+            Enrollment::Enrolled
+        })
+    }
+
+    /// Operation IDs in existing custody, for a repair ordering hint alone. This takes the
+    /// observing open's admission, enrollment and exact witnessed-prefix checks, then rechecks
+    /// custody before returning. It authenticates no envelope, classifies no historical record
+    /// and decrypts no payload. Never use its answer as an inventory or convergence evidence.
+    ///
+    /// # Errors
+    /// The session, enrollment, directory binding or witnessed journal refuses, or custody
+    /// changes during the read.
+    pub(crate) fn repair_ids_region(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        region: Region,
+    ) -> Result<Option<BTreeSet<Digest>>> {
+        if Self::unenrolled(session, dir, scope, region)? {
+            return Ok(None);
+        }
+        let Claimed {
+            sources,
+            claim_dir,
+            claim_name,
+            claim,
+            pending,
+        } = Self::claimed(session, dir, scope, Capacity::default(), true, region)?;
+        if pending {
+            return Ok(None);
+        }
+        let observation = session.access_observation();
+        let custody = Custody {
+            scope,
+            actor: session.actor(),
+            observation: &observation,
+            data_dir: dir,
+            claim_dir: &claim_dir,
+            claim_name: &claim_name,
+            claim: &claim,
+        };
+        let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
+        let ids = journals::read(dir, &claim[..ANCHOR_LEN], Capacity::default().journal())?
+            .repair_ids(acknowledged)?;
+        if !custody.admits(session)? || custody.current_claim()?.as_deref() != Some(&claim) {
+            return Err(Error::snapshot_changed());
+        }
+        drop(sources);
+        Ok(Some(ids))
+    }
+
+    /// Whether `region` holds no enrollment of `scope` at `dir`: no claim, and no data folder or
+    /// an empty one, the slot `subscriptions()` reserves before `Store::join` creates its
+    /// independent enrollment claim and journal. Storage beside no claim is not absence; an
+    /// open judges it, and every claim.
+    ///
+    /// # Errors
+    /// The session's context refuses, the recovery location is noncanonical, or the data folder
+    /// cannot be judged or listed.
+    fn unenrolled(session: &Session<'_>, dir: &Path, scope: Scope, region: Region) -> Result<bool> {
+        session.context(scope)?;
+        region.validate_directory(session, dir, scope)?;
+        let claim_dir = region.claims(session)?;
+        if !matches!(
+            private_file::read_private(&claim_dir, &claim_name(scope), CLAIM_LEN),
+            Err(PrivateFileError::Missing)
+        ) {
+            return Ok(false);
+        }
+        Ok(match private_file::judge_private_dir(dir)? {
+            private_file::PrivateDir::Missing => true,
+            private_file::PrivateDir::Private => {
+                std::fs::read_dir(dir)?.next().transpose()?.is_none()
+            }
+            _ => false,
+        })
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -858,6 +1110,52 @@ impl Store {
         )
     }
 
+    /// What every open of `scope`'s store at `dir` reads before its journal, and the enrollment
+    /// probe reads alone ([`Self::enrollment_region`]): it takes the session's source reads, the
+    /// mutation guard unless `read_only`, and judges the location, `capacity` and the session's
+    /// context, then reads and judges the enrollment claim, and a ready claim's hold on its data
+    /// folder (`directory::check`). A pending claim has bound no folder yet.
+    ///
+    /// # Errors
+    /// One of those judgments refuses, or the claim is missing, damaged, or of another scope or
+    /// writer.
+    fn claimed<'s, 'a>(
+        session: &'s Session<'a>,
+        dir: &Path,
+        scope: Scope,
+        capacity: Capacity,
+        read_only: bool,
+        region: Region,
+    ) -> Result<Claimed<'s, 'a>> {
+        let sources = session.local_source_reads()?;
+        if !read_only {
+            session.mutation_guard()?;
+        }
+        region.validate_directory(session, dir, scope)?;
+        if capacity.operations > MAX_RECORDS
+            || capacity.bytes > MAX_BYTES
+            || capacity.conflicts > MAX_CONFLICTS
+        {
+            return Err(Error::new("table capacity exceeds custody bounds"));
+        }
+        session.context(scope)?;
+        let claim_dir = region.claims(session)?;
+        let claim_name = claim_name(scope);
+        let claim = private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
+            .map_err(|_| Error::new("table enrollment claim is missing or damaged"))?;
+        let pending = validate_claim_region(session, scope, &claim, region)?;
+        if !pending {
+            directory::check(dir, &claim_dir, &claim_name, &claim)?;
+        }
+        Ok(Claimed {
+            sources,
+            claim_dir,
+            claim_name,
+            claim,
+            pending,
+        })
+    }
+
     fn open_region(
         session: &Session<'_>,
         dir: &Path,
@@ -875,49 +1173,28 @@ impl Store {
         // the batch returns, is this open's. Every record still authenticates
         // its signed envelope and historical evidence. No guard this open takes
         // escapes it, and none crosses network I/O.
-        let sources = session.local_source_reads()?;
-        if !read_only {
-            session.mutation_guard()?;
-        }
-        region.validate_directory(session, dir, scope)?;
-        if capacity.operations > MAX_RECORDS
-            || capacity.bytes > MAX_BYTES
-            || capacity.conflicts > MAX_CONFLICTS
-        {
-            return Err(Error::new("table capacity exceeds custody bounds"));
-        }
-        session.context(scope)?;
-        let claim_dir = region.claims(session)?;
-        let claim_name = claim_name(scope);
-        let mut claim = private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
-            .map_err(|_| Error::new("table enrollment claim is missing or damaged"))?;
-        let pending = validate_claim_region(session, scope, &claim, region)?;
-        if !pending {
-            directory::check(dir, &claim_dir, &claim_name, &claim)?;
-        }
+        let Claimed {
+            sources,
+            claim_dir,
+            claim_name,
+            mut claim,
+            pending,
+        } = Self::claimed(session, dir, scope, capacity, read_only, region)?;
         if pending && !initialize {
             return Err(Error::enrollment_pending());
         }
+        #[cfg(test)]
+        open_hook(dir)?;
         // The stable token binds the data directory even while the claim changes
         // from pending to ready. No record can be authored in the pending state.
         claim[4] = b'1';
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
         let (log, replay) = if read_only {
-            let records = match aterm_journal::read_committed(
-                dir,
-                "table",
-                &claim[..ANCHOR_LEN],
-                capacity.journal(),
+            (
                 None,
-            )? {
-                aterm_journal::Committed::Rebuilt { records, .. } => records,
-                _ => {
-                    return Err(Error::new(
-                        "table observation did not provide its complete prefix",
-                    ));
-                }
-            };
-            (None, replay::read_observed(records, acknowledged)?)
+                journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?
+                    .witnessed(acknowledged)?,
+            )
         } else {
             let mut log = Log::open(
                 dir,
@@ -936,6 +1213,9 @@ impl Store {
             let replay = replay::read(&mut log, acknowledged, pending)?;
             (Some(log), replay)
         };
+        // The scope is fixed for the open: whether it is the catalog is judged once, here, for the
+        // writer quota and every record replay admits (`operation_policy_in`).
+        let catalog = scope == crate::catalog::scope(scope.trust());
         let mut store = Self {
             region,
             scope,
@@ -949,10 +1229,10 @@ impl Store {
             poisoned: false,
             capacity,
             operation_bytes: 0,
-            index: Index::new(MAX_RECORDS * 2),
+            index: OnceLock::new(),
             records: BTreeMap::new(),
             writers: BTreeMap::new(),
-            writer_records: if scope == crate::catalog::scope(scope.trust()) {
+            writer_records: if catalog {
                 crate::catalog::RECORDS_PER_CREATOR
             } else {
                 WRITER_RECORDS
@@ -984,6 +1264,10 @@ impl Store {
             observe();
         }
         if !replay.entries.is_empty() {
+            // Each header is admitted as the causal index would admit it, and the index is built
+            // at first use (`Self::index`): an observer that never projects or ingests builds
+            // none.
+            let mut causal = ReplayIndex::new(INDEX_CAPACITY);
             sources.with_store_replay(scope, replay.entries.len(), |batch| {
                 for entry in replay.entries {
                     let replay::Entry {
@@ -995,10 +1279,11 @@ impl Store {
                         let conflict = Conflict::restore(session, scope, wire.wire())?;
                         store.admit_proof(&conflict)?;
                         if let Some(source) = conflict.discarded() {
-                            store
-                                .index
-                                .insert(source.header.clone())
+                            causal
+                                .source(&store.records, |held| &held.header, &source.header)
                                 .map_err(|_| Error::new("invalid discarded-source header"))?;
+                            #[cfg(test)]
+                            replay_admitted(&source.header);
                         }
                         if store
                             .conflicts
@@ -1008,16 +1293,23 @@ impl Store {
                             return Err(Error::new("duplicate physical table conflict"));
                         }
                     } else {
-                        let stored = replay::restore(batch, receipt, wire, acknowledged.count)?;
+                        let stored =
+                            replay::restore(batch, receipt, wire, acknowledged.count, catalog)?;
                         store.admit(&stored.header, stored.wire.len())?;
                         store.operation_bytes += stored.wire.len();
-                        store
-                            .index
-                            .insert(stored.header.clone())
-                            .map_err(|_| Error::new("invalid table replay header"))?;
-                        if !store.hold(receipt.id, stored) {
+                        let Some(slot) = causal
+                            .operation(
+                                store.records.entry(receipt.id),
+                                |held| &held.header,
+                                &stored.header,
+                            )
+                            .map_err(|_| Error::new("invalid table replay header"))?
+                        else {
                             return Err(Error::new("duplicate physical table record"));
-                        }
+                        };
+                        #[cfg(test)]
+                        replay_admitted(&stored.header);
+                        Self::hold_vacant(&mut store.writers, slot, stored);
                     }
                 }
                 Ok(())
@@ -1194,11 +1486,21 @@ impl Store {
         let std::collections::btree_map::Entry::Vacant(entry) = self.records.entry(id) else {
             return false;
         };
-        let held = self.writers.entry(stored.header.actor).or_default();
+        Self::hold_vacant(&mut self.writers, entry, stored);
+        true
+    }
+
+    /// Hold `stored` in `entry`, a vacant entry of `records`, and count it toward its writer in
+    /// `writers` ([`Self::writers`]).
+    fn hold_vacant(
+        writers: &mut BTreeMap<Actor, WriterHeld>,
+        entry: VacantEntry<'_, Digest, Stored>,
+        stored: Stored,
+    ) {
+        let held = writers.entry(stored.header.actor).or_default();
         held.records += 1;
         held.bytes = held.bytes.saturating_add(stored.wire.len());
         entry.insert(stored);
-        true
     }
     /// Retain authenticated evidence even when current catalog policy excludes
     /// it. Peers may acknowledge only the returned durable receipt.
@@ -1238,7 +1540,7 @@ impl Store {
         operation_policy(self.scope, record.header(), record.payload().len())?;
         let id = record.header().id;
         if let Some(stored) = self.records.get(&id) {
-            if stored.wire != wire {
+            if stored.wire.as_slice() != wire {
                 return Err(Error::new("different bytes for a retained table digest"));
             }
             return Ok(stored.receipt);
@@ -1247,17 +1549,17 @@ impl Store {
             return Err(Error::new("table actor has restricted signed history"));
         }
         self.admit(record.header(), wire.len())?;
-        let mut proposed = self.index.clone();
+        let mut proposed = self.index()?.clone();
         proposed
             .insert(record.header().clone())
             .map_err(|_| Error::new("table index refused header or capacity"))?;
         let receipt = self.append(SUBJECT, wire, id, via)?;
         self.operation_bytes += wire.len();
-        self.index = proposed;
+        self.index = OnceLock::from(proposed);
         self.hold(
             id,
             Stored {
-                wire: wire.into(),
+                wire: StoredWire::Owned(wire.into()),
                 header: record.header().clone(),
                 receipt,
                 quarantine: None,
@@ -1377,7 +1679,7 @@ impl Store {
         }
         self.admit_proof(&conflict)?;
         let updated_index = if let Some(source) = conflict.discarded() {
-            let mut index = self.index.clone();
+            let mut index = self.index()?.clone();
             index
                 .insert(source.header.clone())
                 .map_err(|_| Error::new("invalid discarded-source header"))?;
@@ -1389,15 +1691,69 @@ impl Store {
         self.conflicts
             .insert(key, StoredConflict { conflict, receipt });
         if let Some(index) = updated_index {
-            self.index = index;
+            self.index = OnceLock::from(index);
         }
         self.poisoned = false;
         Ok(receipt)
     }
 
+    /// The headers the causal index holds ([`Self::index`]): each record's, then each discarded
+    /// source `conflicts` keeps. Headers sharing an id are equal, and each is shaped: an open
+    /// admits each one as the index would (`ReplayIndex`), and every later site that adds a record
+    /// or a source to this store admits it to the index first.
+    fn retained_headers(&self) -> impl Iterator<Item = &Header> {
+        self.records.values().map(|stored| &stored.header).chain(
+            self.conflicts
+                .values()
+                .filter_map(|stored| stored.conflict.discarded())
+                .map(|source| &source.header),
+        )
+    }
+
+    /// The causal index's `forks` ([`Index::forks`]), read from the headers it holds with no index
+    /// built.
+    fn forks(&self) -> BTreeMap<Actor, Fork> {
+        astream_wire::sync::forks_of(self.retained_headers())
+    }
+
+    /// The causal index of the headers this store holds ([`Self::retained_headers`]), built at the
+    /// first ask and kept for the rest of this store's life. Each header was admitted as the index
+    /// admits one, so the index refuses none: its error, "invalid retained table header", names an
+    /// admission that broke.
+    fn index(&self) -> Result<&Index> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let mut index = Index::new(INDEX_CAPACITY);
+        for header in self.retained_headers() {
+            index
+                .insert(header.clone())
+                .map_err(|_| Error::new("invalid retained table header"))?;
+        }
+        #[cfg(test)]
+        INDEX_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        Ok(self.index.get_or_init(|| index))
+    }
+
+    /// The causal index's `get` ([`Index::get`]), with no index built: a record's header, else a
+    /// discarded source's. Build it once and ask it many times.
+    fn header_lookup<'s>(&'s self) -> impl Fn(&Digest) -> Option<&'s Header> + 's {
+        let sources: BTreeMap<&Digest, &Header> = self
+            .conflicts
+            .values()
+            .filter_map(|stored| stored.conflict.discarded())
+            .map(|source| (&source.header.id, &source.header))
+            .collect();
+        move |id| {
+            self.records
+                .get(id)
+                .map(|stored| &stored.header)
+                .or_else(|| sources.get(id).copied())
+        }
+    }
+
     fn conflicted(&self) -> BTreeSet<Actor> {
-        self.index
-            .forks()
+        self.forks()
             .into_keys()
             .chain(
                 self.conflicts
@@ -1546,7 +1902,6 @@ impl Store {
         let actor: Actor = key[..48].try_into().unwrap();
         if key[48] == 1 {
             return self
-                .index
                 .forks()
                 .get(&actor)
                 .map(|fork| {
@@ -1664,7 +2019,7 @@ impl Store {
             .authoring_predecessor(session, &projection.ordered)?
             .cloned();
         let mut heads = projection.heads;
-        let mut proposed = self.index.clone();
+        let mut proposed = self.index()?.clone();
         let mut prepared = Vec::new();
         let mut bytes = 0usize;
         // Admit the exact sealed sizes and headers, including the final edit.
@@ -1957,22 +2312,20 @@ impl Store {
         actor: Actor,
     ) -> Result<crate::catalog::ring::Used> {
         self.check(session)?;
-        let mut used = crate::catalog::ring::Used::default();
-        for stored in self.records.values() {
-            used.records += 1;
-            used.bytes = used.bytes.saturating_add(stored.wire.len());
-            if stored.header.actor == actor {
-                used.writer_records += 1;
-                used.writer_bytes = used.writer_bytes.saturating_add(stored.wire.len());
-            }
-        }
-        Ok(used)
+        let writer = self.writers.get(&actor).copied().unwrap_or_default();
+        Ok(crate::catalog::ring::Used {
+            records: self.records.len(),
+            bytes: self.operation_bytes,
+            writer_records: writer.records,
+            writer_bytes: writer.bytes,
+        })
     }
 
     fn previous(&self, retained: &[Digest]) -> Option<&Header> {
+        let lookup = self.header_lookup();
         retained
             .iter()
-            .filter_map(|id| self.index.get(id))
+            .filter_map(&lookup)
             .filter(|header| header.actor == self.actor)
             .max_by_key(|header| header.sequence)
     }
@@ -2304,6 +2657,13 @@ impl Store {
 
     fn catalog_projection(&self, session: &Session<'_>) -> Result<Projection> {
         self.check(session)?;
+        self.projected(session)
+    }
+
+    /// [`Self::catalog_projection`] without its opening check, for a read batch that stands on
+    /// the check its store's open ran in this session and closes with its own
+    /// ([`Self::catalog_and_evidence`]).
+    fn projected(&self, session: &Session<'_>) -> Result<Projection> {
         // Peers cannot admit quarantine, so it and its withheld dependents do
         // not form transferable cutoff evidence. Exclude those local-only
         // frontiers; the full index below still retains restrictive forks.
@@ -2315,7 +2675,7 @@ impl Store {
                 .values()
                 .any(|stored| stored.conflict.discarded().is_some())
         {
-            &self.index
+            self.index()?
         } else {
             owned_index = self.replication_index_with(&withheld)?;
             &owned_index
@@ -2401,7 +2761,7 @@ impl Store {
         excluded.extend(withheld);
         // Keep all witnessed fork evidence restrictive. Filtering the cutoff
         // input must not make a conflicting selected writer valid again.
-        Ok(self.index.project_excluding(&excluded))
+        Ok(self.index()?.project_excluding(&excluded))
     }
     /// Revalidate current membership and all table-specific cutoffs, including
     /// causal dependents. Old keys and author timestamps cannot bypass demotion.
@@ -2445,12 +2805,27 @@ impl Store {
     /// [`Self::catalog`] and [`Self::metadata_evidence`] from one projection and one read batch,
     /// whose closing checks hold both answers. Positive catalog-eligible records are moved into
     /// the returned `Vec<Record>` rather than decrypted twice.
+    ///
+    /// Every caller opens this store in `session` just before (`discovery_records_from`'s and
+    /// `snapshot_from_primary`'s callers), and the open ends with its check (`open_region`); a
+    /// control writer's open then seals its pending writes (`seal_pending`), whose commits run
+    /// checks of their own, and where one is refused before it appends, its error is dropped and
+    /// the open returns the store ([`Self::open`]). The batch stands on the open's check, or on
+    /// those its seal's commits ran, and projects without one of its own ([`Self::projected`]):
+    /// it checks the store once more, closing, which repeats [`Self::check`] whatever ran since
+    /// the open, so a custody change that still holds at the close refuses the call before either
+    /// answer leaves; one made and undone between the open and the close is not seen. The
+    /// projection asks the session's currency and generation on no call of its own
+    /// (`Session::context`): in a session that keeps no look, the first to ask them after the
+    /// batch's opening fence is a discarded conflict source's negative read
+    /// (`Session::negative_record`, in `metadata_from`), where the store holds an inactive conflict
+    /// whose discarded source it holds no record of, or else that closing check.
     pub(crate) fn catalog_and_evidence(
         &self,
         session: &Session<'_>,
     ) -> Result<(Vec<Record>, Vec<MetadataEvidence>)> {
         session.with_read_batch(self.scope, |batch| {
-            let projection = self.catalog_projection(session)?;
+            let projection = self.projected(session)?;
             let ordered = projection.ordered.clone();
             let mut evidence = self.metadata_from(session, batch, projection)?;
             let positive = &mut evidence[..self.records.len()];
@@ -2627,6 +3002,8 @@ impl Store {
             .filter(move |(id, _)| !excluded.contains(*id))
             .map(|(id, _)| id)
     }
+    /// IDs withheld from replication by quarantine and its causal closure. As with
+    /// `inventory_unchecked`, the caller stands on the store's check in its admitted session.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2651,7 +3028,7 @@ impl Store {
             project = "aterm_db::table::store::replay::tests::closure::closure_transition"
         )
     )]
-    fn quarantine_closure(&self) -> BTreeSet<Digest> {
+    pub(crate) fn quarantine_closure(&self) -> BTreeSet<Digest> {
         let mut pending = Vec::new();
         for stored in self.conflicts.values() {
             for header in stored.conflict.headers() {
@@ -2685,12 +3062,13 @@ impl Store {
                 children.entry(*parent).or_default().push(*id);
             }
         }
+        let lookup = self.header_lookup();
         let mut excluded = BTreeSet::new();
         let mut floors = BTreeMap::<Actor, u64>::new();
         while let Some(id) = pending.pop() {
             if excluded.insert(id) {
                 pending.extend(children.get(&id).into_iter().flatten().copied());
-                let Some(header) = self.index.get(&id) else {
+                let Some(header) = lookup(&id) else {
                     continue;
                 };
                 // Dense sequences above an excluded record either depend on it
@@ -2883,7 +3261,7 @@ impl Store {
             }
             !positive.project().pending.is_empty()
         } else {
-            !self.index.project().pending.is_empty()
+            !self.index()?.project().pending.is_empty()
         };
         if has_pending {
             return Err(Error::new(
@@ -2953,8 +3331,22 @@ fn session_constraints(
     }
 }
 
+/// [`operation_policy_in`] of an operation of `scope`'s table, judging for this one operation
+/// whether `scope` is the catalog; a store's open judges that once and asks `operation_policy_in`
+/// itself.
 fn operation_policy(scope: Scope, header: &Header, payload: usize) -> Result<()> {
-    if scope == crate::catalog::scope(scope.trust())
+    operation_policy_in(
+        scope == crate::catalog::scope(scope.trust()),
+        header,
+        payload,
+    )
+}
+
+/// The catalog's schema and causal bounds on one operation, `payload` bytes long, where `catalog`
+/// says its table is the catalog ([`crate::catalog::scope`]); this sets no bound on any other
+/// table's operations.
+fn operation_policy_in(catalog: bool, header: &Header, payload: usize) -> Result<()> {
+    if catalog
         && (payload > crate::catalog::MAX_PAYLOAD
             || header.sequence > crate::catalog::RECORDS_PER_CREATOR as u64
             || header.parents.iter().copied().ne(header.previous))

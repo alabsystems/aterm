@@ -31,6 +31,8 @@ aterm-types = { workspace = true }
 aterm-win32 = { workspace = true }
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 aterm-uds = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]

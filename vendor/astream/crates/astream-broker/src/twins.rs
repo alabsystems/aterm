@@ -407,6 +407,62 @@ pub const fn sticky_fence_admits_code(fenced: u64, fence_seq: u64, req_seq: u64)
     }
 }
 
+/// `last_view_available_advance` as `last_view_island.rs` defines it in Clean:
+/// `if cur_avail < vis_head then vis_head else cur_avail`.
+#[must_use]
+pub const fn last_view_available_advance(cur_avail: u64, vis_head: u64) -> u64 {
+    if cur_avail < vis_head {
+        vis_head
+    } else {
+        cur_avail
+    }
+}
+
+/// `last_view_prune_clamp` as `last_view_island.rs` defines it in Clean:
+/// `if steps < max_work then steps else max_work`.
+#[must_use]
+pub const fn last_view_prune_clamp(steps: u64, max_work: u64) -> u64 {
+    if steps < max_work {
+        steps
+    } else {
+        max_work
+    }
+}
+
+/// `last_view_not_before_avail` as `last_view_island.rs` defines it in Clean:
+/// `if req_vis < avail then 0 else 1`.
+#[must_use]
+pub const fn last_view_not_before_avail(avail: u64, req_vis: u64) -> u64 {
+    if req_vis < avail {
+        0
+    } else {
+        1
+    }
+}
+
+/// `last_view_not_above_pub` as `last_view_island.rs` defines it in Clean:
+/// `if pub_head < req_vis then 0 else 1`.
+#[must_use]
+pub const fn last_view_not_above_pub(pub_head: u64, req_vis: u64) -> u64 {
+    if pub_head < req_vis {
+        0
+    } else {
+        1
+    }
+}
+
+/// `last_view_window_admits_code_isl` as `last_view_island.rs` defines it in Clean:
+/// `if 0 < last_view_not_before_avail avail req_vis then last_view_not_above_pub pub_head req_vis else 0`.
+#[cfg(test)]
+#[must_use]
+pub const fn last_view_window_admits_code(avail: u64, pub_head: u64, req_vis: u64) -> u64 {
+    if 0 < last_view_not_before_avail(avail, req_vis) {
+        last_view_not_above_pub(pub_head, req_vis)
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -539,6 +595,14 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::relay_floor_raise(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::refill_join_cursor_max(a, b)), want);
         assert_eq!(answers(|[a, b]| super::refill_join_cursor_max(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::last_view_available_advance(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::last_view_available_advance(a, b)),
+            want
+        );
         let want = "000011012";
         assert_eq!(answers(|[a, b]| crate::sharded_clamp_index(a, b)), want);
         assert_eq!(answers(|[a, b]| super::sharded_clamp_index(a, b)), want);
@@ -583,6 +647,30 @@ mod tests {
         );
         assert_eq!(
             answers(|[a, b, c]| super::sticky_fence_admits_code(a, b, c)),
+            want
+        );
+        let want = "000011012";
+        assert_eq!(answers(|[a, b]| crate::last_view_prune_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::last_view_prune_clamp(a, b)), want);
+        let want = "100110111";
+        assert_eq!(answers(|[a, b]| crate::last_view_not_above_pub(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::last_view_not_above_pub(a, b)), want);
+        let want = "111011001";
+        assert_eq!(
+            answers(|[a, b]| crate::last_view_not_before_avail(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::last_view_not_before_avail(a, b)),
+            want
+        );
+        let want = "100110111000010011000000001";
+        assert_eq!(
+            answers(|[a, b, c]| crate::last_view_window_admits_code(a, b, c)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b, c]| super::last_view_window_admits_code(a, b, c)),
             want
         );
     }

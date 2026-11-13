@@ -1316,16 +1316,8 @@ fn capture_pipe_ready(
     }
 }
 
-#[cfg(unix)]
-pub(super) fn read_capture_pipe(
-    pipe: std::process::ChildStdout,
-    max_stdout: usize,
-    deadline: Instant,
-) -> std::io::Result<Vec<u8>> {
-    read_capture_pipe_until(pipe, max_stdout, deadline, None, None).map(|(bytes, _)| bytes)
-}
-
-/// [`read_capture_pipe`] that returns early, with `true`, once `stop` occurs in what was read,
+/// Reads a capture's stdout pipe, up to `max_stdout` bytes and until `deadline`; it returns
+/// early, with `true`, once `stop` occurs in what was read,
 /// and once `cancel` (the read end of a pipe whose writer the waiting thread holds) becomes
 /// readable or hangs up, with what the pipe holds by then: a capture stopped on stderr, or an
 /// owned one whose child exited by itself, joins this reader at once even while a holder outside

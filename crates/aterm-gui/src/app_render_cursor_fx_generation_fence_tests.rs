@@ -10,7 +10,7 @@ fn rainbow_window_with_a_lit_band(t0: Instant) -> (App, WindowId, Instant) {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     let mut seed = super::CursorFxInputs::sample_for_test(t0);

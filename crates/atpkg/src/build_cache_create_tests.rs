@@ -341,6 +341,9 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
     std::fs::create_dir(&world.target).unwrap();
     std::fs::write(world.target.join("kept"), b"unmanaged").unwrap();
     std::fs::write(world.target.join("CACHEDIR.TAG"), cache_tag_bytes()).unwrap();
+    let child = super::super::super::target_build_path(&world.target);
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("kept"), b"unmanaged intermediates").unwrap();
     assert!(
         super::super::observe_for_producer(&words("build"), tool, &world.home, &machine, true)
             .is_err()
@@ -387,6 +390,8 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
         .join(format!("{}.json", key(&fresh).unwrap()));
     let before = std::fs::read(&record).unwrap();
     let unmanaged = world.home.join("custom-output.noindex");
+    std::fs::create_dir(&unmanaged).unwrap();
+    std::fs::write(unmanaged.join("kept"), b"unmanaged intermediates").unwrap();
     args.extend([
         "--config".into(),
         format!("build.build-dir='{}'", unmanaged.display()),
@@ -400,7 +405,11 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
         before,
         "refusal does not taint ownership"
     );
-    assert!(!unmanaged.exists());
+    assert!(!unmanaged.join(MARKER).exists());
+    assert_eq!(
+        std::fs::read(unmanaged.join("kept")).unwrap(),
+        b"unmanaged intermediates"
+    );
     assert!(!read(&record).unwrap().owners_unknown);
 
     let nested_fresh = world.owner.join("target/mine.noindex");
@@ -597,8 +606,106 @@ fn cargo_laid(root: &Path) {
         .mode(0o755)
         .create(root.join("debug/deps"))
         .unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(root.join("debug/.fingerprint/probe-0123456789abcdef"))
+        .unwrap();
+    put(
+        &root.join("debug/.fingerprint/probe-0123456789abcdef/invoked.timestamp"),
+        b"invoked",
+    );
     put(&root.join("debug/.cargo-lock"), b"");
     put(&root.join("debug/deps/libprobe.rlib"), b"reusable output");
+}
+
+#[test]
+fn compiler_probe_alone_never_grants_cache_custody() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    // `targo metadata` leaves precisely the tag and compiler probe in an existing root.
+    std::fs::remove_dir_all(world.target.join("debug")).unwrap();
+    let before = std::fs::read(world.target.join(".rustc_info.json")).unwrap();
+    assert!(!create_checked(&world.home, &world.target, &world.owner).unwrap());
+    assert!(!world.target.join(MARKER).exists());
+    assert!(read(&world.record()).is_none());
+    assert_eq!(
+        std::fs::read(world.target.join(".rustc_info.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn adoption_requires_unlinked_private_compilation_evidence_in_known_layouts() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for layout in [
+        "custom/.fingerprint/probe-hash",
+        "some-target/custom/.fingerprint/probe-hash",
+        "custom/build/probe/hash/fingerprint",
+        "some-target/custom/build/probe/hash/fingerprint",
+    ] {
+        for case in [
+            "built",
+            "linked-file",
+            "hardlinked-file",
+            "linked-dir",
+            "shared-dir",
+            "shared-file",
+            "directory-file",
+            "missing",
+        ] {
+            let world = World::new();
+            cargo_laid(&world.target);
+            std::fs::remove_dir_all(world.target.join("debug/.fingerprint")).unwrap();
+            let evidence = world.target.join(layout);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(&evidence)
+                .unwrap();
+            let stamp = evidence.join("invoked.timestamp");
+            std::fs::write(&stamp, b"This file has an mtime of when this was started.").unwrap();
+            std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            match case {
+                "built" => {}
+                "linked-file" => {
+                    let outside = world.home.join("stamp");
+                    std::fs::rename(&stamp, &outside).unwrap();
+                    std::os::unix::fs::symlink(&outside, &stamp).unwrap();
+                }
+                "hardlinked-file" => std::fs::hard_link(&stamp, world.home.join("stamp")).unwrap(),
+                "linked-dir" => {
+                    let outside = world.home.join("fingerprint");
+                    std::fs::rename(&evidence, &outside).unwrap();
+                    std::os::unix::fs::symlink(&outside, &evidence).unwrap();
+                }
+                "shared-dir" => {
+                    std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o777))
+                        .unwrap()
+                }
+                "shared-file" => {
+                    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o666))
+                        .unwrap()
+                }
+                "directory-file" => {
+                    std::fs::remove_file(&stamp).unwrap();
+                    std::fs::create_dir(&stamp).unwrap();
+                }
+                "missing" => std::fs::remove_file(&stamp).unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(world.admit().unwrap(), case == "built", "{layout}: {case}");
+            assert_eq!(
+                world.target.join(MARKER).exists(),
+                case == "built",
+                "{layout}: {case}"
+            );
+            assert_eq!(
+                std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+                b"reusable output"
+            );
+        }
+    }
 }
 
 fn producer_machine(world: &World) -> super::super::super::Machine<'_> {
@@ -625,6 +732,225 @@ fn build_into(world: &World, target: &Path) -> Vec<String> {
 }
 
 #[test]
+fn quiet_intermediates_prepare_an_owned_target_without_changing_existing_data_or_modes() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let world = World::new();
+    assert!(world.admit().unwrap());
+    let quiet = world.target.join(".ubd");
+    let build = super::super::super::target_build_path(&world.target);
+    for (directory, mode) in [(&quiet, 0o755), (&build, 0o711)] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(std::fs::metadata(directory).unwrap().mode() & 0o777, mode);
+    }
+    let old = world.target.join("build.noindex");
+    std::fs::create_dir(&old).unwrap();
+    for directory in [&old, &build] {
+        std::fs::write(directory.join("keep"), b"existing units").unwrap();
+    }
+    let receipt = std::fs::read(world.record()).unwrap();
+    let identities = [identity(&quiet), identity(&build)];
+    let args = build_into(&world, &world.target);
+    assert!(
+        super::super::observe_for_producer(
+            &args,
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        )
+        .unwrap()
+    );
+    assert_eq!([identity(&quiet), identity(&build)], identities);
+    assert_eq!(std::fs::metadata(&quiet).unwrap().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::metadata(&build).unwrap().mode() & 0o777, 0o711);
+    assert_eq!(std::fs::read(world.record()).unwrap(), receipt);
+    for directory in [&old, &build] {
+        assert_eq!(
+            std::fs::read(directory.join("keep")).unwrap(),
+            b"existing units"
+        );
+    }
+    // An unsafe existing component is refused, never repaired into admission.
+    std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        super::super::observe_for_producer(
+            &args,
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::metadata(&quiet).unwrap().mode() & 0o777, 0o777);
+    assert_eq!(std::fs::read(world.record()).unwrap(), receipt);
+}
+
+#[test]
+fn quiet_intermediates_revalidate_the_owned_root_binding_before_the_next_child() {
+    let world = World::new();
+    assert!(world.admit().unwrap());
+    let target = world.target.clone();
+    let moved = world.home.join("old-target");
+    let moved_for_hook = moved.clone();
+    let mut replaced = false;
+    faults::set(move |point| {
+        if point == Point::Parent && !replaced {
+            replaced = true;
+            std::fs::rename(&target, &moved_for_hook).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("keep"), b"replacement output").unwrap();
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(
+        super::super::observe_for_producer(
+            &build_into(&world, &world.target),
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        )
+        .is_err()
+    );
+    drop(fault);
+    assert!(
+        moved.join(".ubd").is_dir(),
+        "the deterministic replacement ran"
+    );
+    assert!(!super::super::super::target_build_path(&moved).exists());
+    assert!(!world.target.join(".ubd").exists());
+    assert_eq!(
+        std::fs::read(world.target.join("keep")).unwrap(),
+        b"replacement output"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn placed_argv_and_config_changes_cannot_bypass_selected_owned_preparation() {
+    for shape in ["safe", "argv-mismatch", "config-changed"] {
+        let world = World::new();
+        assert!(world.admit().unwrap());
+        let machine = super::super::super::Machine {
+            read: &super::super::super::read_config,
+            ..producer_machine(&world)
+        };
+        let mut args = build_into(&world, &world.target);
+        args.insert(0, "+trust".into());
+        let (_, mut placed) = super::super::super::placed_build_dir(
+            &args,
+            super::super::super::Tool::Cargo,
+            &machine,
+        )
+        .unwrap();
+        if shape == "argv-mismatch" {
+            placed.push("--offline".into());
+        }
+        let config = world.owner.join(".cargo/config.toml");
+        if shape == "config-changed" {
+            std::fs::create_dir(config.parent().unwrap()).unwrap();
+            let mut changed = false;
+            faults::set(move |point| {
+                if point == Point::Parent && !changed {
+                    changed = true;
+                    std::fs::write(&config, "[build]\nbuild-dir = 'caller-layout'\n").unwrap();
+                }
+                Some(())
+            });
+        }
+        let fault = Fault;
+        let result = super::super::observe_placed_command_with(
+            &args,
+            &placed,
+            super::super::super::Tool::Cargo,
+            &machine,
+        );
+        drop(fault);
+        assert_eq!(result.is_ok(), shape == "safe", "{shape}: {result:?}");
+        if shape != "safe" {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let child = super::super::super::target_build_path(&world.target);
+        assert_eq!(child.is_dir(), shape != "argv-mismatch");
+        assert_eq!(roots(&world.home).len(), 1);
+        assert!(!world.owner.join("caller-layout").exists());
+    }
+}
+
+#[test]
+fn quiet_intermediates_do_not_create_below_a_descendant_moved_outside_the_target() {
+    let world = World::new();
+    assert!(world.admit().unwrap());
+    let quiet = world.target.join(".ubd");
+    let moved = world.home.join("moved-parent");
+    let moved_for_hook = moved.clone();
+    let mut replaced = false;
+    faults::set(move |point| {
+        if point == Point::Parent && !replaced {
+            replaced = true;
+            std::fs::rename(&quiet, &moved_for_hook).unwrap();
+            std::fs::create_dir(&quiet).unwrap();
+            std::fs::write(moved_for_hook.join("keep"), b"moved output").unwrap();
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(
+        super::super::observe_for_producer(
+            &build_into(&world, &world.target),
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        )
+        .is_err()
+    );
+    drop(fault);
+    assert_eq!(std::fs::read(moved.join("keep")).unwrap(), b"moved output");
+    assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    assert!(!super::super::super::target_build_path(&world.target).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn quiet_receiptless_preparation_revalidates_its_anchor_before_the_next_descendant() {
+    let world = World::new();
+    let target = world.owner.join("missing-target");
+    let anchor = world.owner.clone();
+    let moved = world.home.join("moved-anchor");
+    let moved_for_hook = moved.clone();
+    let mut replaced = false;
+    faults::set(move |point| {
+        if point == Point::Parent && !replaced {
+            replaced = true;
+            std::fs::rename(&anchor, &moved_for_hook).unwrap();
+            std::fs::create_dir(&anchor).unwrap();
+            std::fs::write(anchor.join("keep"), b"replacement workspace").unwrap();
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(super::super::prepare_target_build_dir(&target).is_err());
+    drop(fault);
+    let created = moved.join("missing-target");
+    assert!(
+        created.is_dir(),
+        "the anchor was replaced after its first child was prepared"
+    );
+    assert_eq!(std::fs::read_dir(&created).unwrap().count(), 0);
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read(world.owner.join("keep")).unwrap(),
+        b"replacement workspace"
+    );
+    assert!(roots(&world.home).is_empty());
+    assert!(!world.home.join(INDEX).exists());
+}
+
+#[test]
 fn a_target_cargo_made_before_registration_is_adopted_where_it_stands() {
     // A build keeps its rustc facts at the target's top, or in the build leaf cargo also makes
     // when the shim names it.
@@ -632,12 +958,22 @@ fn a_target_cargo_made_before_registration_is_adopted_where_it_stands() {
         let world = World::new();
         cargo_laid(&world.target);
         if facts == "leaf" {
-            let leaf = world.target.join(super::super::super::TARGET_BUILD_LEAF);
+            let leaf = super::super::super::target_build_path(&world.target);
             std::fs::DirBuilder::new()
                 .mode(0o755)
+                .recursive(true)
                 .create(&leaf)
                 .unwrap();
             std::fs::write(leaf.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(leaf.join("debug"))
+                .unwrap();
+            std::fs::rename(
+                world.target.join("debug/.fingerprint"),
+                leaf.join("debug/.fingerprint"),
+            )
+            .unwrap();
             std::fs::rename(
                 world.target.join(".rustc_info.json"),
                 leaf.join(".rustc_info.json"),
@@ -689,6 +1025,12 @@ fn cargo_laid_by_umask(root: &Path) {
     std::fs::write(root.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
     std::fs::write(root.join(".rustc_info.json"), b"{}").unwrap();
     std::fs::create_dir_all(root.join("debug/deps")).unwrap();
+    std::fs::create_dir_all(root.join("debug/.fingerprint/probe-0123456789abcdef")).unwrap();
+    std::fs::write(
+        root.join("debug/.fingerprint/probe-0123456789abcdef/invoked.timestamp"),
+        b"invoked",
+    )
+    .unwrap();
     std::fs::write(root.join("debug/.cargo-lock"), b"").unwrap();
     std::fs::write(root.join("debug/deps/libprobe.rlib"), b"reusable output").unwrap();
 }
@@ -769,6 +1111,7 @@ fn a_folder_cargo_did_not_make_as_its_build_directory_is_never_adopted() {
         "coordinator",
         "leaf-marked",
         "leaf-linked",
+        "quiet-linked",
         "nested",
         "shared-cache",
     ] {
@@ -823,18 +1166,24 @@ fn a_folder_cargo_did_not_make_as_its_build_directory_is_never_adopted() {
                 std::fs::write(world.target.join(super::super::package::COORDINATOR), b"").unwrap();
             }
             "leaf-marked" => {
-                let leaf = world.target.join(super::super::super::TARGET_BUILD_LEAF);
-                std::fs::create_dir(&leaf).unwrap();
+                let leaf = super::super::super::target_build_path(&world.target);
+                std::fs::create_dir_all(&leaf).unwrap();
                 std::fs::write(leaf.join(super::super::package::COORDINATOR), b"").unwrap();
             }
             "leaf-linked" => {
                 let elsewhere = world.home.join("leaf.noindex");
                 std::fs::create_dir(&elsewhere).unwrap();
+                std::fs::create_dir(world.target.join(".ubd")).unwrap();
                 std::os::unix::fs::symlink(
                     &elsewhere,
-                    world.target.join(super::super::super::TARGET_BUILD_LEAF),
+                    super::super::super::target_build_path(&world.target),
                 )
                 .unwrap();
+            }
+            "quiet-linked" => {
+                let elsewhere = world.home.join("quiet-elsewhere");
+                std::fs::create_dir(&elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, world.target.join(".ubd")).unwrap();
             }
             "nested" => {
                 assert!(
@@ -1158,6 +1507,9 @@ fn legacy_and_required_shim_argv_cannot_acknowledge_unmanaged_explicit_output() 
         if unowned {
             std::fs::create_dir(&world.target).unwrap();
             std::fs::write(world.target.join("kept"), b"unmanaged").unwrap();
+            let child = super::super::super::target_build_path(&world.target);
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("kept"), b"unmanaged intermediates").unwrap();
         }
         let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         command

@@ -134,15 +134,17 @@ pub enum Statement {
 pub struct Judgment {
     /// The tree the last judgment ran on, as [`HEAD_DIGITS`] lowercase hex digits.
     pub tree: String,
-    /// How often a moved main was merged and the branch judged again
-    /// ([`land_trailer::Stated::rejudges`]).
+    /// How often a moved main was merged and the branch judged again, after an interrupted
+    /// judgment included ([`land_trailer::Stated::rejudges`]).
     pub rejudges: u32,
-    /// The main commit the last judgment was composed onto, as [`HEAD_DIGITS`] lowercase hex
-    /// digits; empty where it landed as judged.
+    /// The main commit the last judgment was composed onto, by a run-free composition or a
+    /// recheck ([`land_trailer::Stated::onto`]), as [`HEAD_DIGITS`] lowercase hex digits; empty
+    /// where it landed as judged.
     pub onto: String,
     /// How many red items main already had outside the branch the landing inherited.
     pub inherited: u32,
-    /// Every judgment's wall seconds, summed.
+    /// Every judgment's wall seconds, interrupted ones included, summed
+    /// ([`land_trailer::Stated::secs`]).
     pub secs: u64,
 }
 
@@ -161,16 +163,9 @@ impl Statement {
         Self::Stated(Judgment {
             tree: digits(&last.tree),
             rejudges: u32::try_from(stated.rejudges()).unwrap_or(u32::MAX),
-            onto: stated
-                .composed_onto
-                .as_deref()
-                .map(digits)
-                .unwrap_or_default(),
+            onto: stated.onto().map(digits).unwrap_or_default(),
             inherited: u32::try_from(stated.inherited.len()).unwrap_or(u32::MAX),
-            secs: stated
-                .checked
-                .iter()
-                .fold(0u64, |sum, checked| sum.saturating_add(checked.secs)),
+            secs: stated.secs(),
         })
     }
 

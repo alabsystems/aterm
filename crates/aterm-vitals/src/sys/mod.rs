@@ -159,6 +159,30 @@ pub struct Target {
     pub cwd: Option<String>,
     /// The terminal's foreground process group.
     pub fg_pgid: Option<u32>,
+    /// The request that owns its tab, where one does (`scope=request`).
+    pub request: Option<RequestFacts>,
+}
+
+/// The request a target's tab is one of (ATERM-KI-1109-3), as `scope=request` reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestFacts {
+    /// Its id.
+    pub id: String,
+    /// The keys of its tabs this instance hosts.
+    pub sessions: Vec<u64>,
+    /// How many tabs it has had, here or gone.
+    pub tabs: usize,
+    /// CPU its tabs' process trees spent, whole seconds: the tabs that left as recorded, the
+    /// live ones as read now.
+    pub cpu_s: Option<u64>,
+    /// The largest resident set any of them reached, MiB.
+    pub peak_mb: Option<u64>,
+    /// Bytes they wrote to disk, MiB.
+    pub written_mb: Option<u64>,
+    /// The folders it claims.
+    pub claims: usize,
+    /// What those folders hold, MiB, where every one was measured.
+    pub claimed_mb: Option<u64>,
 }
 
 /// One folder a scope works in (a disk root).
@@ -204,8 +228,11 @@ pub fn under(path: &str, home: Option<&str>) -> &'static str {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return "volume";
     }
+    // A home must be rooted, so it never prefixes a relative path. Rooted, not absolute:
+    // Windows calls `\Users\a` relative to its drive, yet it prefixes only paths that share
+    // its root and prefix, which is all the comparison needs on every platform.
     let valid_home = home.map(Path::new).filter(|h| {
-        h.is_absolute()
+        h.has_root()
             && h.components().any(|c| matches!(c, Component::Normal(_)))
             && !h.components().any(|c| matches!(c, Component::ParentDir))
     });

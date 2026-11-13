@@ -37,9 +37,10 @@ pub struct Sink {
 pub struct Counts {
     /// Rows handed to the writer.
     pub emitted: AtomicU64,
-    /// Rows written.
+    /// Rows written, a failed append's rows the log holds whole among them.
     pub written: AtomicU64,
-    /// Rows lost: the queue was full, or their append failed.
+    /// Rows lost: the queue was full, or their append failed and the log does not hold them. A
+    /// failed append the log could not judge counts its rows in neither.
     pub dropped: AtomicU64,
 }
 
@@ -116,11 +117,24 @@ fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
                     told = lost;
                     counts.written.fetch_add(rows as u64, Ordering::Relaxed);
                 }
-                Err((_, gap_written)) => {
+                Err((e, gap_written)) => {
                     if gap_written {
                         told = lost;
                     }
-                    counts.dropped.fetch_add(rows as u64, Ordering::Relaxed);
+                    // A write whose cut back failed may have left rows of the batch whole: the
+                    // log counts them from its length after the write, those are written and
+                    // only the rest lost; where it cannot say, neither (missing at worst, never
+                    // said lost while the log holds it).
+                    let (whole, lost_rows) = if crate::log::left_lines(&e) {
+                        crate::log::whole_lines(&e)
+                            .map_or((0, 0), |whole| (whole, rows.saturating_sub(whole)))
+                    } else {
+                        (0, rows)
+                    };
+                    counts.written.fetch_add(whole as u64, Ordering::Relaxed);
+                    counts
+                        .dropped
+                        .fetch_add(lost_rows as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -153,3 +167,7 @@ pub fn emit(row: Row) {
         sink.emit(row);
     }
 }
+
+#[cfg(test)]
+#[path = "sink_tests.rs"]
+mod tests;

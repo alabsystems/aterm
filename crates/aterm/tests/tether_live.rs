@@ -86,7 +86,8 @@ fn tethered_script(word: &str) -> Option<[&'static str; 2]> {
 }
 
 /// [`PARITY`]'s cases: a name, the program (None names [`PARITY_TOOL`]'s basename), and its
-/// `PATH`. Each runs in [`PARITY_DIR`], which holds only the non-executable `plain` file.
+/// `PATH`. Each runs in [`PARITY_DIR`], which holds the non-executable `plain` file,
+/// [`EXEC_CASES`]' `orphan` and `loop`, and [`DARWIN_CASES`]' `folder` and executable `runs` too.
 const CASES: [(&str, Option<&str>, Search); 6] = [
     ("missing", Some("no-such-program"), Search::Dir),
     ("not-runnable", Some("plain"), Search::Dir),
@@ -95,6 +96,55 @@ const CASES: [(&str, Option<&str>, Search); 6] = [
     ("missing-path", Some("./no-such-program"), Search::Dir),
     ("not-runnable-path", Some("./plain"), Search::Dir),
 ];
+
+/// The further [`PARITY`] cases, which a search judged before its spawn could not answer as the
+/// exec does, so the tether reports its own exec's error: a script whose interpreter is missing
+/// (`orphan`, which `access` passes and the exec refuses `ENOENT`); a `PATH` whose last entry is a
+/// file (glibc's `execvp` answers that entry's `ENOTDIR`, Darwin's search passes it over); one
+/// whose first entry is too long to join to the name, which ends glibc's search
+/// (`ENAMETOOLONG`) and which Darwin's search of a `PATH` its spawn set passes over; and a link
+/// to itself on the way (`ELOOP`, which ends glibc's search too, and which Darwin's passes over).
+/// On macOS, too, one whose `PATH` the spawn left the stand-in's own, whose first entry is too
+/// long to join to the name: Darwin's search of its own `PATH` ends there (`ENAMETOOLONG`).
+#[cfg(target_os = "linux")]
+const EXEC_CASES: [(&str, Option<&str>, Search); 4] = [
+    ("no-interpreter", Some("orphan"), Search::Dir),
+    ("file-last", Some("no-such-program"), Search::FileLast),
+    ("joined-too-long", None, Search::JoinedLong),
+    ("looped", None, Search::Looped),
+];
+#[cfg(target_os = "macos")]
+const EXEC_CASES: [(&str, Option<&str>, Search); 5] = [
+    ("no-interpreter", Some("orphan"), Search::Dir),
+    ("file-last", Some("no-such-program"), Search::FileLast),
+    ("joined-too-long", None, Search::JoinedLong),
+    ("looped", None, Search::Looped),
+    ("own-path-too-long", None, Search::Own),
+];
+
+/// The further macOS [`PARITY`] cases that held the search a Darwin tethered spawn once judged
+/// before it routed to the plain spawn's answer, and now hold its tether's exec to it: a folder by
+/// a bare name and by a path, an empty name, an absolute path that may not be run (a program
+/// that starts with `/` names that path under [`PARITY_DIR`]), and a relative `PATH` entry, which
+/// the search resolves in the child's folder.
+#[cfg(target_os = "macos")]
+const DARWIN_CASES: [(&str, Option<&str>, Search); 5] = [
+    ("folder", Some("folder"), Search::Dir),
+    ("folder-path", Some("./folder"), Search::Dir),
+    ("empty", Some(""), Search::Dir),
+    ("not-runnable-absolute", Some("/plain"), Search::Tool),
+    ("relative-entry", Some("runs"), Search::Relative),
+];
+#[cfg(target_os = "linux")]
+const DARWIN_CASES: [(&str, Option<&str>, Search); 0] = [];
+
+/// The stand-in's own `PATH` on macOS, which [`Search::Own`] leaves its case: an entry too long to
+/// join to a name (longer than Darwin's `PATH_MAX`), then `tool_dir`.
+fn own_path(tool_dir: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(format!("/{}:", "o".repeat(2_000)));
+    path.push(tool_dir);
+    path
+}
 
 /// A [`CASES`] program's `PATH`, which its spawn sets.
 #[derive(Clone, Copy)]
@@ -106,20 +156,44 @@ enum Search {
     /// The tool's folder after one too long to join to a name (longer than Linux's `PATH_MAX`,
     /// and so Darwin's): the search of a `PATH` its spawn set passes over it.
     PastLong,
+    /// A folder that is not there, then [`PARITY_DIR`]'s `plain` file as a folder.
+    FileLast,
+    /// One entry that joins to the name past Linux's `PATH_MAX`, then the tool's folder.
+    JoinedLong,
+    /// [`PARITY_DIR`]'s `loop` folder, whose entry of the tool's name links to itself, then the
+    /// tool's folder.
+    Looped,
+    /// No `PATH` set: the stand-in's own ([`own_path`]).
+    #[cfg(target_os = "macos")]
+    Own,
+    /// A folder that is not there, then `.`: the child's folder, [`PARITY_DIR`].
+    #[cfg(target_os = "macos")]
+    Relative,
 }
 
 impl Search {
-    /// The `PATH`, with `dir` as [`PARITY_DIR`] and `tool_dir` holding [`PARITY_TOOL`].
-    fn path(self, dir: &std::ffi::OsStr, tool_dir: &std::ffi::OsStr) -> std::ffi::OsString {
-        match self {
+    /// The `PATH` the case's spawn sets, with `dir` as [`PARITY_DIR`] and `tool_dir` holding
+    /// [`PARITY_TOOL`]: `None` leaves it the stand-in's own.
+    fn path(self, dir: &std::ffi::OsStr, tool_dir: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        let joined = |head: std::ffi::OsString, tail: &std::ffi::OsStr| {
+            let mut path = head;
+            path.push(":");
+            path.push(tail);
+            path
+        };
+        let at = |name: &str| std::path::Path::new(dir).join(name).into_os_string();
+        Some(match self {
             Self::Dir => dir.to_owned(),
             Self::Tool => tool_dir.to_owned(),
-            Self::PastLong => {
-                let mut path = std::ffi::OsString::from(format!("/{}:", "l".repeat(5_000)));
-                path.push(tool_dir);
-                path
-            }
-        }
+            Self::PastLong => joined(format!("/{}", "l".repeat(5_000)).into(), tool_dir),
+            Self::FileLast => joined(at("gone"), &at("plain")),
+            Self::JoinedLong => joined(format!("/{}", "c".repeat(4_093)).into(), tool_dir),
+            Self::Looped => joined(at("loop"), tool_dir),
+            #[cfg(target_os = "macos")]
+            Self::Own => return None,
+            #[cfg(target_os = "macos")]
+            Self::Relative => joined(at("gone"), std::ffi::OsStr::new(".")),
+        })
     }
 }
 
@@ -185,42 +259,65 @@ fn play_parent() -> ! {
     }
 }
 
-/// Each case run plainly, tethered, then tethered at the head of a group of its own (which on
-/// Linux too runs through its tether): a line `<case> <plain> <tethered> <leader>`, each
-/// `exit <code>` or `refused <errno>`.
+/// How [`play_parity`] spawns a case.
+#[derive(Clone, Copy)]
+enum Column {
+    /// Untethered, at the head of a group of its own (the collector's, `deadline::output_until`).
+    Plain,
+    /// Tethered in the stand-in's own group, by a spawn no collector puts at the head of one: on
+    /// Linux tied by its parent-death signal alone, on macOS run through its tether.
+    Tethered,
+    /// Tethered at the head of a group of its own (the collector's), which on Linux too runs
+    /// through its tether.
+    Leader,
+}
+
+/// Each case run [`Column::Plain`], [`Column::Tethered`], then [`Column::Leader`]: a line
+/// `<case> <plain> <tethered> <leader>`, each `exit <code>` or `refused <errno>`.
 fn play_parity() -> ! {
     let dir = std::env::var_os(PARITY_DIR).expect("the cases' folder");
     let tool = std::path::PathBuf::from(std::env::var_os(PARITY_TOOL).expect("the kept tool"));
     let tool_dir = tool.parent().expect("the tool's folder").as_os_str();
-    let run = |program: Option<&str>, search: Search, tethered: bool, leads: bool| {
-        let program = program.map_or_else(
-            || tool.file_name().expect("the tool's basename"),
-            std::ffi::OsStr::new,
-        );
+    let run = |program: Option<&str>, search: Search, column: Column| {
+        let program = match program {
+            None => tool.file_name().expect("the tool's basename").to_owned(),
+            Some(under) if under.starts_with('/') => std::path::Path::new(&dir)
+                .join(&under[1..])
+                .into_os_string(),
+            Some(name) => name.into(),
+        };
         let mut cmd = aterm_uds::spawnfd::command(program);
-        cmd.current_dir(&dir)
-            .env("PATH", search.path(&dir, tool_dir));
-        if tethered {
-            cmd.tether();
+        cmd.current_dir(&dir);
+        if let Some(path) = search.path(&dir, tool_dir) {
+            cmd.env("PATH", path);
         }
-        if leads {
-            cmd.process_group(0);
-        }
-        match aterm_uds::deadline::output_until(&mut cmd, Instant::now() + MUST_HAPPEN) {
-            Ok(out) => format!("exit {}", out.status.code().unwrap_or(-1)),
-            Err(aterm_uds::deadline::RunError::Spawn(e)) => {
-                format!("refused {}", e.raw_os_error().unwrap_or(-1))
+        let ran = match column {
+            Column::Tethered => cmd.tether().output().map_err(Ok),
+            Column::Plain | Column::Leader => {
+                if matches!(column, Column::Leader) {
+                    cmd.tether();
+                }
+                aterm_uds::deadline::output_until(&mut cmd, Instant::now() + MUST_HAPPEN).map_err(
+                    |e| match e {
+                        aterm_uds::deadline::RunError::Spawn(e) => Ok(e),
+                        e => Err(e.to_string()),
+                    },
+                )
             }
-            Err(e) => format!("failed {e}"),
+        };
+        match ran {
+            Ok(out) => format!("exit {}", out.status.code().unwrap_or(-1)),
+            Err(Ok(e)) => format!("refused {}", e.raw_os_error().unwrap_or(-1)),
+            Err(Err(e)) => format!("failed {e}"),
         }
         .replace(' ', "_")
     };
-    for (case, program, search) in CASES {
+    for &(case, program, search) in CASES.iter().chain(&EXEC_CASES).chain(&DARWIN_CASES) {
         let line = format!(
             "{case} {} {} {}\n",
-            run(program, search, false, false),
-            run(program, search, true, false),
-            run(program, search, true, true)
+            run(program, search, Column::Plain),
+            run(program, search, Column::Tethered),
+            run(program, search, Column::Leader)
         );
         standin::put(line.as_bytes());
     }
@@ -496,15 +593,37 @@ impl Started {
     }
 }
 
-/// Start the stand-in window as the test `entry`, its tethered helper `helper` ([`TERMED`],
-/// [`DEAF`], [`SESSION`] or [`GROUP`]), and wait for both its helpers to say they ran.
-fn start_parent(entry: &str, helper: &str) -> Started {
-    start_parent_then(entry, helper, false)
+/// How a Linux watcher holds its helper's group: as the kernel lets it (by the helper's pidfd
+/// from Linux 6.9, which signals a group by one), or by its anchor and listings, as before 6.9
+/// ([`aterm_uds::tether::BY_LISTING_VAR`]); on macOS, `Unlisted` has the watcher find its
+/// descriptor listing failed, so it closes every number below the descriptor bound
+/// ([`aterm_uds::tether::NO_LISTING_VAR`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    Default,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "Linux's mode alone")
+    )]
+    ByListing,
+    #[cfg(target_os = "macos")]
+    Unlisted,
 }
 
-/// [`start_parent`], the window exec'ing in its own place when `then_exec` ([`THEN_EXEC`]), once a
-/// byte comes on its piped stdin.
-fn start_parent_then(entry: &str, helper: &str, then_exec: bool) -> Started {
+impl Hold {
+    /// Whether the Linux watcher holds its group by an anchor, a zombie of its own in that group:
+    /// by listing, or where the kernel signals no group by pidfd (a macOS watcher always does).
+    #[cfg(target_os = "linux")]
+    fn anchors(self) -> bool {
+        self == Self::ByListing || !aterm_uds::tether::signals_groups_by_pidfd()
+    }
+}
+
+/// Start the stand-in window as the test `entry`, its tethered helper `helper` ([`TERMED`],
+/// [`DEAF`], [`SESSION`] or [`GROUP`]), and wait for both its helpers to say they ran: the window
+/// exec'ing in its own place when `then_exec` ([`THEN_EXEC`]), once a byte comes on its piped
+/// stdin, and its watcher holding its group as `hold` says.
+fn start_parent_with(entry: &str, helper: &str, then_exec: bool, hold: Hold) -> Started {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
     let mut parent = aterm_uds::spawnfd::command(standin::exe());
@@ -515,6 +634,16 @@ fn start_parent_then(entry: &str, helper: &str, then_exec: bool) -> Started {
     if then_exec {
         parent.env(THEN_EXEC, "1");
     }
+    #[cfg(target_os = "linux")]
+    if hold == Hold::ByListing {
+        parent.env(aterm_uds::tether::BY_LISTING_VAR, "1");
+    }
+    #[cfg(target_os = "macos")]
+    if hold == Hold::Unlisted {
+        parent.env(aterm_uds::tether::NO_LISTING_VAR, "1");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = hold;
     let mut parent = parent
         .stdin(if then_exec {
             Stdio::piped()
@@ -622,10 +751,31 @@ fn plain_ran_on(started: Started) {
 #[test]
 fn a_tethered_helper_ends_with_its_sigkilled_starter() {
     play_if_asked();
-    let mut started = start_parent(
+    sigkilled_starter(
         "tether_live::a_tethered_helper_ends_with_its_sigkilled_starter",
-        TERMED,
+        Hold::Default,
     );
+}
+
+/// [`a_tethered_helper_ends_with_its_sigkilled_starter`], the macOS watcher finding its
+/// descriptor listing failed: it closes every number below the descriptor bound, the spawn's exec
+/// status among them, so the helper's spawn returns once the helper runs. NEGATIVE CONTROL: a
+/// watcher that closes nothing when its listing fails holds the status open, the starter's spawn
+/// waits for the helper's end, and the starter never says the helpers' pids.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_tethered_helper_ends_with_its_sigkilled_starter_when_its_watcher_cannot_list() {
+    play_if_asked();
+    sigkilled_starter(
+        "tether_live::a_tethered_helper_ends_with_its_sigkilled_starter_when_its_watcher_cannot_list",
+        Hold::Unlisted,
+    );
+}
+
+/// The body of [`a_tethered_helper_ends_with_its_sigkilled_starter`], its watcher holding as
+/// `hold` says.
+fn sigkilled_starter(entry: &str, hold: Hold) {
+    let mut started = start_parent_with(entry, TERMED, false, hold);
     let tethered = started.tethered;
     let killed = Instant::now();
     started.parent.kill().expect("SIGKILL the stand-in window");
@@ -658,9 +808,11 @@ fn a_tethered_helper_ends_with_its_sigkilled_starter() {
 #[test]
 fn a_tethered_helper_deaf_to_sigterm_ends_after_the_grace() {
     play_if_asked();
-    let mut started = start_parent(
+    let mut started = start_parent_with(
         "tether_live::a_tethered_helper_deaf_to_sigterm_ends_after_the_grace",
         DEAF,
+        false,
+        Hold::Default,
     );
     let tethered = started.tethered;
     runs_sleep_with_its_thread_run(tethered);
@@ -708,30 +860,51 @@ fn runs_sleep_with_its_thread_run(pid: u32) {
     );
 }
 
-/// A tethered helper that leads a session and group of its own holds that group with its
-/// watcher's anchor alone, a zombie that holds the group's number while the watcher lives: the
-/// watcher leads a session of its own ([`Watcher::of`] reads it), so a listing of the helper's
-/// group (a stage sweep's), a kill of it or a hangup of its terminal never counts or reaches the
-/// watcher. macOS lists the anchor; Linux's listing passes a zombie by, so there the anchor is
-/// found as the watcher's exited child in the helper's group ([`zombies_of`]). NEGATIVE CONTROL:
-/// a watcher with no anchor has none. The watcher still ends the helper when the stand-in window
-/// is `SIGKILL`ed, then ends itself, and the plain helper runs on. The window is killed only once
-/// the helper runs its last image with its thread run, as the watcher's proof reads it.
+/// A tethered helper that leads a session and group of its own holds that group alone, but for
+/// its watcher's anchor where the watcher holds the group by one (macOS; Linux before 6.9, or by
+/// listing, [`Hold::anchors`]), a zombie that holds the group's number while the watcher lives;
+/// from Linux 6.9 the watcher holds it by the helper's pidfd, with no anchor. The watcher leads a
+/// session of its own ([`Watcher::of`] reads it), so a listing of the helper's group (a stage
+/// sweep's), a kill of it or a hangup of its terminal never counts or reaches the watcher. macOS
+/// lists the anchor; Linux's listing passes a zombie by, so there the anchor is found as the
+/// watcher's exited child in the helper's group ([`zombies_of`]). NEGATIVE CONTROL: a watcher
+/// with no anchor has none, and one that makes an anchor though it holds the group by pidfd has
+/// one. The watcher still ends the helper when the stand-in window is `SIGKILL`ed, then ends
+/// itself, and the plain helper runs on. The window is killed only once the helper runs its last
+/// image with its thread run, as the watcher's proof reads it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_watcher_leaves_its_helpers_group_and_session() {
     play_if_asked();
-    let mut started = start_parent(
+    the_watcher_leaves_its_helpers_group_and_session_held(
         "tether_live::the_watcher_leaves_its_helpers_group_and_session",
-        SESSION,
+        Hold::Default,
     );
+}
+
+/// [`the_watcher_leaves_its_helpers_group_and_session`] with the watcher holding the group by its anchor and listings, as before Linux 6.9.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_watcher_leaves_its_helpers_group_and_session_by_listing() {
+    play_if_asked();
+    the_watcher_leaves_its_helpers_group_and_session_held(
+        "tether_live::the_watcher_leaves_its_helpers_group_and_session_by_listing",
+        Hold::ByListing,
+    );
+}
+
+/// [`the_watcher_leaves_its_helpers_group_and_session`]'s body, the stand-in window `entry`, its watcher holding the group as `hold` says.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn the_watcher_leaves_its_helpers_group_and_session_held(entry: &str, hold: Hold) {
+    let mut started = start_parent_with(entry, SESSION, false, hold);
     let tethered = started.tethered;
     let helper = i32::try_from(tethered).expect("a pid");
     let helpers_group = Group::of(helper);
-    let members = aterm_uds::process::group_members(tethered).expect("list the helper's group");
-    assert!(
-        members.complete,
-        "the listing of the tethered helper's group (pid {tethered}) is whole: {members:?}"
+    // A Linux listing is incomplete while the machine allocates ids faster than it can follow.
+    let members = aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        &format!("a whole listing of the tethered helper's group (pid {tethered})"),
+        || aterm_uds::process::group_members(tethered).filter(|members| members.complete),
     );
     let others: Vec<i32> = members
         .pids
@@ -760,11 +933,19 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
              watcher (pid {watcher}), which leads a session of its own: {members:?}"
         );
         let anchors = zombies_of(watcher, helper);
-        assert!(
-            matches!(anchors[..], [_]),
-            "the watcher (pid {watcher}) holds the helper's group (pid {tethered}) by one anchor, \
-             an exited child of its own in that group: {anchors:?}"
-        );
+        if hold.anchors() {
+            assert!(
+                matches!(anchors[..], [_]),
+                "the watcher (pid {watcher}) holds the helper's group (pid {tethered}) by one \
+                 anchor, an exited child of its own in that group: {anchors:?}"
+            );
+        } else {
+            assert!(
+                anchors.is_empty(),
+                "the watcher (pid {watcher}) holds the helper's group (pid {tethered}) by the \
+                 helper's pidfd, with no anchor: {anchors:?}"
+            );
+        }
     }
     runs_sleep_with_its_thread_run(tethered);
     started.parent.kill().expect("SIGKILL the stand-in window");
@@ -811,10 +992,27 @@ fn zombies_of(parent: i32, pgid: i32) -> Vec<i32> {
 #[test]
 fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
     play_if_asked();
-    let mut started = start_parent(
+    a_tethered_group_leaders_group_ends_with_its_sigkilled_starter_held(
         "tether_live::a_tethered_group_leaders_group_ends_with_its_sigkilled_starter",
-        GROUP,
+        Hold::Default,
     );
+}
+
+/// [`a_tethered_group_leaders_group_ends_with_its_sigkilled_starter`] with the watcher holding the group by its anchor and listings, as before Linux 6.9.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter_by_listing() {
+    play_if_asked();
+    a_tethered_group_leaders_group_ends_with_its_sigkilled_starter_held(
+        "tether_live::a_tethered_group_leaders_group_ends_with_its_sigkilled_starter_by_listing",
+        Hold::ByListing,
+    );
+}
+
+/// [`a_tethered_group_leaders_group_ends_with_its_sigkilled_starter`]'s body, the stand-in window `entry`, its watcher holding the group as `hold` says.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter_held(entry: &str, hold: Hold) {
+    let mut started = start_parent_with(entry, GROUP, false, hold);
     let (helpers_group, kid) = group_runs_sleep(&started);
     started.parent.kill().expect("SIGKILL the stand-in window");
     started.parent.wait().expect("reap it");
@@ -839,11 +1037,27 @@ fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
 #[test]
 fn a_tethered_group_leaders_group_ends_at_its_starters_exec() {
     play_if_asked();
-    let mut started = start_parent_then(
+    a_tethered_group_leaders_group_ends_at_its_starters_exec_held(
         "tether_live::a_tethered_group_leaders_group_ends_at_its_starters_exec",
-        GROUP,
-        true,
+        Hold::Default,
     );
+}
+
+/// [`a_tethered_group_leaders_group_ends_at_its_starters_exec`] with the watcher holding the group by its anchor and listings, as before Linux 6.9.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tethered_group_leaders_group_ends_at_its_starters_exec_by_listing() {
+    play_if_asked();
+    a_tethered_group_leaders_group_ends_at_its_starters_exec_held(
+        "tether_live::a_tethered_group_leaders_group_ends_at_its_starters_exec_by_listing",
+        Hold::ByListing,
+    );
+}
+
+/// [`a_tethered_group_leaders_group_ends_at_its_starters_exec`]'s body, the stand-in window `entry`, its watcher holding the group as `hold` says.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn a_tethered_group_leaders_group_ends_at_its_starters_exec_held(entry: &str, hold: Hold) {
+    let mut started = start_parent_with(entry, GROUP, true, hold);
     let (helpers_group, kid) = group_runs_sleep(&started);
     {
         use std::io::Write as _;
@@ -983,10 +1197,30 @@ fn group_ended(started: &Started, helpers_group: &Group, kid: i32) {
 #[test]
 fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter() {
     play_if_asked();
-    let mut started = start_parent(
+    a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter_held(
         "tether_live::a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter",
-        GROUP,
+        Hold::Default,
     );
+}
+
+/// [`a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter`] with the watcher holding the group by its anchor and listings, as before Linux 6.9.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter_by_listing() {
+    play_if_asked();
+    a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter_held(
+        "tether_live::a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter_by_listing",
+        Hold::ByListing,
+    );
+}
+
+/// [`a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter`]'s body, the stand-in window `entry`, its watcher holding the group as `hold` says.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter_held(
+    entry: &str,
+    hold: Hold,
+) {
+    let mut started = start_parent_with(entry, GROUP, false, hold);
     let tethered = started.tethered;
     let helper = i32::try_from(tethered).expect("a pid");
     let helpers_group = Group::of(helper);
@@ -1037,10 +1271,13 @@ fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter() {
 
 /// A tethered spawn of a program that cannot run fails as the plain spawn does, with its error
 /// (`ENOENT`, `EACCES`), a bare name searched on the child's `PATH` and a relative path in its
-/// folder included: on macOS the tether execs the program only after the spawn returned, and it
-/// once exited 127 for a bare name the search could not find, and for one it found past a `PATH`
-/// entry too long to search, which its own search of that `PATH` ended at. Only a program that
-/// runs runs.
+/// folder included, whether it is tied by its signal alone or runs through its tether: the tether
+/// execs the program only after the spawn started it, and reports its own exec's error back to
+/// the spawn ([`EXEC_CASES`] are what a search judged before the spawn answered otherwise: on
+/// macOS a script whose interpreter is missing started a tether that exited 127). Only a program
+/// that runs runs; the group tests show a group leader's spawn routes here. NEGATIVE CONTROL: a
+/// spawn that drops its tether's exec status unread returns a child for each that cannot run (on
+/// Linux its tether, writing the error to a pipe nobody reads, dies of `SIGPIPE`: `exit_-1`).
 #[test]
 fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
     play_if_asked();
@@ -1049,6 +1286,22 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     std::fs::write(dir.path().join("plain"), b"#!/bin/sh\nexit 0\n").expect("write plain");
     let tool = aterm_uds::deadline::stand_in(std::path::Path::new("/usr/bin/true"));
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let orphan = dir.path().join("orphan");
+        std::fs::write(&orphan, b"#!/nonexistent/interpreter\nexit 0\n").expect("write orphan");
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod orphan");
+        std::fs::create_dir(dir.path().join("loop")).expect("mkdir loop");
+        std::fs::create_dir(dir.path().join("folder")).expect("mkdir folder");
+        let runs = dir.path().join("runs");
+        std::fs::write(&runs, b"#!/bin/sh\nexit 0\n").expect("write runs");
+        std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod runs");
+        let name = tool.file_name().expect("the tool's basename");
+        std::os::unix::fs::symlink(name, dir.path().join("loop").join(name))
+            .expect("a link to itself");
+    }
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(standin::exe())
             .args(standin::argv(
@@ -1056,7 +1309,11 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
             ))
             .env(standin::ENV, PARITY)
             .env(PARITY_DIR, dir.path())
-            .env(PARITY_TOOL, &tool),
+            .env(PARITY_TOOL, &tool)
+            .env(
+                "PATH",
+                own_path(tool.parent().expect("the tool's folder").as_os_str()),
+            ),
         Instant::now() + MUST_HAPPEN,
     )
     .expect("run the stand-in");
@@ -1070,6 +1327,26 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
         ("missing-path", "refused_2"),
         ("not-runnable-path", "refused_13"),
     ];
+    #[cfg(target_os = "linux")]
+    let expected = expected.into_iter().chain([
+        ("no-interpreter", "refused_2"),
+        ("file-last", "refused_20"),
+        ("joined-too-long", "refused_36"),
+        ("looped", "refused_40"),
+    ]);
+    #[cfg(target_os = "macos")]
+    let expected = expected.into_iter().chain([
+        ("no-interpreter", "refused_2"),
+        ("file-last", "refused_2"),
+        ("joined-too-long", "exit_0"),
+        ("looped", "exit_0"),
+        ("own-path-too-long", "refused_63"),
+        ("folder", "refused_13"),
+        ("folder-path", "refused_13"),
+        ("empty", "refused_2"),
+        ("not-runnable-absolute", "refused_13"),
+        ("relative-entry", "exit_0"),
+    ]);
     for (case, plain) in expected {
         let line = said
             .lines()

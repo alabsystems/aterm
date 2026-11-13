@@ -448,13 +448,20 @@ pub(crate) fn move_transition(
 
 #[test]
 fn session_move_policy_conforms_for_rotation_and_following() {
+    use crate::harness::accounts_overlay::{links_here, model_provider};
     let model = aterm_models_harness::account_pool_move_policy_model();
     assert_eq!(model.mutant_dials(), (1..=29).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    let mut checked = 0;
+    let (mut checked, mut unlinked) = (0, 0);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                // A Kimi move's line runs in an overlay home, which aterm makes only where it
+                // makes links (`accounts_overlay::links_here`).
+                if action.name == "Finish" && !links_here(model_provider(state["provider"])) {
+                    unlinked += 1;
+                    continue;
+                }
                 let next = move_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
@@ -465,7 +472,7 @@ fn session_move_policy_conforms_for_rotation_and_following() {
             }
         }
     }
-    assert_eq!(checked, 2 * 24 + 2 * 2);
+    assert_eq!(checked + unlinked, 2 * 24 + 2 * 2);
     let mut stale = model.init_state();
     stale.insert("case", 3);
     stale.insert("phase", 1);

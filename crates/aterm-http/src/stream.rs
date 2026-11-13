@@ -84,6 +84,14 @@ fn later(now: Instant, budget: Duration) -> Instant {
 }
 
 impl Deadline {
+    /// Keep an enclosing operation's original absolute bound without restarting its clock.
+    #[must_use]
+    pub(crate) fn until(mut self, until: Instant) -> Self {
+        if until < self.at {
+            self.at = until;
+        }
+        self
+    }
     /// Creates a deadline `budget` from now with no idle cap.
     #[must_use]
     pub fn after(budget: Duration) -> Self {

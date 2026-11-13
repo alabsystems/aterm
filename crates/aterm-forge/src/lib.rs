@@ -25,6 +25,8 @@ pub mod resolve;
 pub mod serde_attrs;
 pub mod survey;
 
+pub use direct_vendor::astream_pin;
+
 /// Exit codes matching `aterm-verify`.
 pub mod exit {
     /// Every obligation held.

@@ -1111,14 +1111,19 @@ impl Store {
             let before = state.clone();
             let mut events = edit(&mut state)?;
             let auth_changed = auth_scope::clear(&mut state);
-            let new_state = if state != before || (!events.is_empty() && old_state.is_none()) {
+            let edited = state != before || (!events.is_empty() && old_state.is_none());
+            if edited {
                 drop_stale_sessions(&mut state, now);
+            }
+            // Attribute ledger rows, and record what the journal is told, before retaining the
+            // transaction's exact images.
+            let notes =
+                super::super::journal::observe(self.cli, &before, &mut state, &mut events, now);
+            let new_state = if edited || state != before {
                 Some(state.to_json() + "\n")
             } else {
                 old_state.clone()
             };
-            // Attribute ledger rows before retaining the transaction's exact images.
-            let notes = super::super::journal::observe(self.cli, &before, &state, &mut events, now);
             (events, new_state, Some(notes), auth_changed)
         } else {
             if old_state.is_none() {
@@ -2086,13 +2091,18 @@ impl Store {
         logins.enrollment.require_complete_row_publications()?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
-        let new_state = if state != before.0 || (!events.is_empty() && old_state.is_none()) {
+        let edited = state != before.0 || (!events.is_empty() && old_state.is_none());
+        if edited {
             drop_stale_sessions(&mut state, now);
+        }
+        // Before the state's image: what the journal is told is recorded in it.
+        let notes =
+            super::super::journal::observe(self.cli, &before.0, &mut state, &mut events, now);
+        let new_state = if edited || state != before.0 {
             Some(state.to_json() + "\n")
         } else {
             old_state.clone()
         };
-        let notes = super::super::journal::observe(self.cli, &before.0, &state, &mut events, now);
         let new_logins = if logins != before.1 {
             Some(logins.to_json() + "\n")
         } else {

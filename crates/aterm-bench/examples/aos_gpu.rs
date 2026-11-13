@@ -1242,7 +1242,7 @@ fn arm_cpu(r: &mut Run<'_>, threads: bool) -> R<()> {
 }
 
 fn aterm_parallelism() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    aterm_cores::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
 /// T's pool: threads made once, at the main thread's QoS, each claiming row chunks of a job through one atomic cursor.

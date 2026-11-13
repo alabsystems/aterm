@@ -6,8 +6,8 @@
 
 use super::super::{ChildExitNotice, Proof, Watched, end_group_once_ready};
 use super::{
-    GroupControl, GroupEnded, KILL_ROUNDS, Live, Readiness, UNWATCHED_RECHECK, Woke, end_group,
-    end_group_guarded, linger, live,
+    GroupControl, GroupEnded, KILL_ROUNDS, Listed, Live, MEMBER_RECHECK, Readiness,
+    UNWATCHED_RECHECK, Woke, end_group, end_group_guarded, linger, live,
 };
 use crate::process::{Birth, EndControl, Identity, ProcessPresence};
 use std::collections::VecDeque;
@@ -30,6 +30,8 @@ struct Proc {
     arrives: usize,
     /// The script time at which it exits by itself, if it does.
     leaves: Option<usize>,
+    /// The script time at which it leaves the group for one it leads (`setsid`), alive.
+    moves: Option<usize>,
     alive: bool,
 }
 
@@ -40,9 +42,13 @@ const fn ours(pid: i32, ends_on: &'static [i32]) -> Proc {
         ends_on,
         arrives: 0,
         leaves: None,
+        moves: None,
         alive: true,
     }
 }
+
+/// The steps a wait with no patience that nothing wakes takes in the script, standing for ever.
+const STUCK: usize = 100_000;
 
 const TERM: &[i32] = &[SIGTERM, SIGKILL];
 const KILL: &[i32] = &[SIGKILL];
@@ -110,8 +116,9 @@ impl World {
     }
     /// The live members of the leader's group left at the end.
     fn left(&self) -> Vec<i32> {
+        let events = self.events();
         self.here()
-            .filter(|p| p.pgid == LEADER)
+            .filter(|p| p.group_at(events) == LEADER)
             .map(|p| p.pid)
             .collect()
     }
@@ -130,7 +137,18 @@ impl World {
     }
 }
 
-impl GroupControl for World {
+impl Proc {
+    /// Its group at script time `events`: its own once it moved.
+    fn group_at(&self, events: usize) -> i32 {
+        if self.moves.is_some_and(|at| at <= events) {
+            self.pid
+        } else {
+            self.pgid
+        }
+    }
+}
+
+impl Listed for World {
     fn anchor(&self) -> i32 {
         ANCHOR
     }
@@ -139,7 +157,10 @@ impl GroupControl for World {
         if self.unread || self.unread_group == Some(pid) {
             return None;
         }
-        self.here().find(|p| p.pid == pid).map(|p| p.pgid)
+        let events = self.events();
+        self.here()
+            .find(|p| p.pid == pid)
+            .map(|p| p.group_at(events))
     }
     fn presence(&mut self, pid: i32) -> ProcessPresence {
         self.fork_reused_before_read(pid);
@@ -159,9 +180,10 @@ impl GroupControl for World {
             return None;
         }
         (!self.unlisted).then(|| {
+            let events = self.events();
             let mut pids: Vec<i32> = self
                 .here()
-                .filter(|p| p.pgid == pgid)
+                .filter(|p| p.group_at(events) == pgid)
                 .map(|p| p.pid)
                 .collect();
             if pgid == LEADER {
@@ -187,6 +209,12 @@ impl GroupControl for World {
             (pids, true)
         })
     }
+}
+
+impl GroupControl for World {
+    fn census(&mut self, pgid: i32) -> Live {
+        live(self, pgid)
+    }
     fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
         let events = self.events();
         self.signals.push((pgid, sig));
@@ -195,7 +223,7 @@ impl GroupControl for World {
             p.alive
                 && p.arrives <= events
                 && p.leaves.is_none_or(|left| left > events)
-                && p.pgid == pgid
+                && p.group_at(events) == pgid
         }) {
             any = true;
             if p.ends_on.contains(&sig) {
@@ -217,11 +245,28 @@ impl GroupControl for World {
             Err(std::io::Error::from_raw_os_error(1))
         }
     }
+    /// A wait with patience takes one step of it; one without blocks, as a poll of exit
+    /// descriptors does, until a listed member has exited (a move to another group wakes nothing)
+    /// or the parent leaves, or for good, which the script stands for by [`STUCK`] steps.
     fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
         self.waits.push((members.to_vec(), patience));
-        self.naps += 1;
-        self.clock += patience.unwrap_or(Duration::from_millis(1));
-        if self.parent_leaves.is_some_and(|at| at <= self.events()) {
+        let parent_gone = |world: &Self| world.parent_leaves.is_some_and(|at| at <= world.events());
+        if let Some(patience) = patience {
+            self.naps += 1;
+            self.clock += patience;
+        } else {
+            for _ in 0..STUCK {
+                self.naps += 1;
+                self.clock += Duration::from_millis(1);
+                let exited = members
+                    .iter()
+                    .any(|&pid| !self.here().any(|p| p.pid == pid));
+                if exited || parent_gone(self) {
+                    break;
+                }
+            }
+        }
+        if parent_gone(self) {
             Woke::Parent
         } else {
             Woke::Other
@@ -600,8 +645,8 @@ fn a_leader_that_exits_first_leaves_its_group_watched() {
     assert!(linger(LEADER, &mut world), "the parent went first");
     assert_eq!(
         world.waits.first(),
-        Some(&(vec![5001, 5002], None)),
-        "the wait is on the live members' exits, the anchor not among them"
+        Some(&(vec![5001, 5002], Some(MEMBER_RECHECK))),
+        "the wait is on the live members' exits, the anchor not among them, bounded"
     );
     assert!(world.signals.is_empty(), "the watch itself signals nothing");
     let out = end_group(LEADER, Duration::from_millis(100), &mut world);
@@ -659,5 +704,30 @@ fn a_leader_that_exits_first_leaves_its_group_watched() {
         world.signals,
         [(LEADER, SIGTERM), (LEADER, SIGKILL)],
         "the anchored group still ends despite its unread individual member"
+    );
+}
+
+/// A member listed while the group is watched can leave it alive (a `setsid`, a daemon's detach),
+/// which no exit watch sees: the watch lists the group again after [`MEMBER_RECHECK`], finds only
+/// its anchor, and ends without a signal, long before the parent or the member that left.
+/// NEGATIVE CONTROL: an unbounded wait on the listed member (`None`, the previous rule) wakes only
+/// when the parent leaves, so the watch outlives the group it held and `linger` answers `true`.
+#[test]
+fn a_member_that_leaves_the_group_alive_ends_the_watch() {
+    let mut world = World::new(vec![Proc {
+        moves: Some(1),
+        ..ours(5001, TERM)
+    }]);
+    world.parent_leaves = Some(1_000);
+    assert!(
+        !linger(LEADER, &mut world),
+        "the group emptied when its member left it: waits {:?}",
+        world.waits
+    );
+    assert!(world.signals.is_empty(), "sent {:?}", world.signals);
+    assert_eq!(world.waits, vec![(vec![5001], Some(MEMBER_RECHECK))]);
+    assert!(
+        world.here().any(|p| p.pid == 5001) && world.left().is_empty(),
+        "the member runs on in a group of its own"
     );
 }

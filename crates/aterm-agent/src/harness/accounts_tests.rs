@@ -3,6 +3,9 @@
 
 //! Tests for the accounts core.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+
 use std::collections::BTreeSet;
 
 use aterm_tempfile::TempDir as Tmp;
@@ -5151,6 +5154,7 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
         why: format!("failed:\r\n\t{long}"),
         pk: None,
         workflow: None,
+        step: None,
     };
     let line = hostile.to_json_line();
     assert!(!line.contains(['\n', '\r', '\u{2028}']));
@@ -5651,6 +5655,7 @@ fn the_machine_id_is_minted_once_and_kept() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sign_in() {
     let dir = tmp("selection");
@@ -7141,20 +7146,29 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
         assert_eq!(env_of(&[(name, "")]), stored(), "{name}=");
     }
 
+    // The home is the one `os.homedir()` reads: `USERPROFILE` on Windows, where a `HOME` (a
+    // Git Bash's, say) names no home of the vendor's.
     let dir = |pairs: &[(&str, &str)]| profile_configs_dir(pairs.iter().copied());
     assert_eq!(
-        dir(&[("HOME", "/h")]),
+        dir(&[(HOMEDIR_ENV, "/h")]),
         Some(PathBuf::from("/h/.config/anthropic/configs"))
     );
+    if HOMEDIR_ENV != "HOME" {
+        assert_eq!(dir(&[("HOME", "/h")]), None, "HOME is not the home here");
+        assert_eq!(
+            dir(&[("HOME", "/other"), (HOMEDIR_ENV, "/h")]),
+            Some(PathBuf::from("/h/.config/anthropic/configs"))
+        );
+    }
     assert_eq!(
-        dir(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")]),
+        dir(&[(HOMEDIR_ENV, "/h"), ("XDG_CONFIG_HOME", "/x")]),
         Some(PathBuf::from("/x/anthropic/configs"))
     );
     assert_eq!(
         dir(&[
             ("XDG_CONFIG_HOME", "/x"),
             ("ANTHROPIC_CONFIG_DIR", "/a"),
-            ("HOME", "/h")
+            (HOMEDIR_ENV, "/h")
         ]),
         Some(PathBuf::from("/a/configs"))
     );
@@ -7162,11 +7176,11 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
         dir(&[
             ("ANTHROPIC_CONFIG_DIR", " "),
             ("XDG_CONFIG_HOME", ""),
-            ("HOME", "/h")
+            (HOMEDIR_ENV, "/h")
         ]),
         Some(PathBuf::from("/h/.config/anthropic/configs"))
     );
-    assert_eq!(dir(&[("PATH", "/usr/bin"), ("HOME", "")]), None);
+    assert_eq!(dir(&[("PATH", "/usr/bin"), (HOMEDIR_ENV, "")]), None);
 
     let store = tmp("profile-store");
     let configs = store.path().join("configs");

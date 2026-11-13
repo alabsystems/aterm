@@ -96,6 +96,8 @@ fn spawn_pass<'scope>(
             now_ms: &|| clock.load(Ordering::Acquire),
             log: &|_| {},
             pace: QUICK,
+            rung: None,
+            broker: false,
         });
     });
     Running { stop }
@@ -224,6 +226,8 @@ fn a_stopped_node_does_not_make_inputs_or_start_convergence() {
         now_ms: &|| panic!("a stopped loop reads no clock"),
         log: &|_| {},
         pace: QUICK,
+        rung: None,
+        broker: false,
     });
     assert_eq!(node_pass_receipt(&macs.m7), None);
 }
@@ -314,6 +318,34 @@ fn a_pass_is_due_on_a_new_record_on_its_timer_and_after_a_clock_set_back() {
     // A record that came while a pass ran is due at the next look.
     due.ran(stamp(1), 2_000, Duration::from_secs(60));
     assert!(due.due(stamp(3), 2_000));
+}
+
+/// The next timed pass counts from the look that read the clock, however long that look, its
+/// pass and the converge after it took.
+/// NEGATIVE CONTROL: a deadline counted from when the look ended comes that look's length late.
+#[test]
+fn a_passs_timer_counts_from_the_look_that_read_the_clock() {
+    let wait = Duration::from_secs(60);
+    // The look read the clock 10 s ago, and its pass ran then.
+    let read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+    let mut due = NodePassDue::default();
+    assert_eq!(
+        due.next_at(1_000, read),
+        Some(read),
+        "before the first pass, at once"
+    );
+    due.ran(None, 1_000, wait);
+    assert_eq!(due.next_at(1_000, read), read.checked_add(wait));
+    assert_eq!(
+        due.next_at(31_000, read),
+        read.checked_add(wait / 2),
+        "a later look, half the wait on"
+    );
+    assert_eq!(
+        due.next_at(999, read),
+        Some(read),
+        "a clock set back, at once"
+    );
 }
 
 #[test]
@@ -453,6 +485,7 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
     let stop = aterm_uds::stop::Stop::new();
     let writer = StateLock::take(m22).unwrap();
     std::thread::scope(|scope| {
+        let _running = Running { stop: &stop };
         scope.spawn(|| {
             run_node_pass(&NodePassHost {
                 paths: m22,
@@ -468,6 +501,8 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
                     lock_wait: Duration::ZERO,
                     ..QUICK
                 },
+                rung: None,
+                broker: false,
             });
         });
         aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "a busy pass", || {
@@ -512,6 +547,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let work = std::sync::Mutex::new(Vec::new());
     let looked = AtomicUsize::new(0);
     let source = std::sync::Arc::new(AtomicUsize::new(0));
+    let identity = std::sync::Arc::new(AtomicUsize::new(0));
     let made_inputs = AtomicUsize::new(0);
     let successful = converge_program(macs.root.path(), "converge-success", "exit 0");
     std::thread::scope(|scope| {
@@ -529,7 +565,9 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                 make_inputs: &|| {
                     made_inputs.fetch_add(1, Ordering::AcqRel);
                     let source = std::sync::Arc::clone(&source);
+                    let identity = std::sync::Arc::clone(&identity);
                     let mut seen = source.load(Ordering::Acquire);
+                    let mut identity_seen = identity.load(Ordering::Acquire);
                     ConvergenceInputs::new(Box::new(move |refresh| {
                         let current = source.load(Ordering::Acquire);
                         if current == seen {
@@ -544,14 +582,21 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                             ))
                         }
                     }))
-                    .with_refresh(Box::new(|| {
-                        crate::converge::RefreshObservation {
-                            version: crate::converge::RefreshVersion {
-                                input: 7,
-                                attempt: 9,
-                                ..crate::converge::RefreshVersion::default()
-                            },
-                            ..crate::converge::RefreshObservation::default()
+                    .with_refresh(Box::new(|| crate::converge::RefreshObservation {
+                        version: crate::converge::RefreshVersion {
+                            input: 7,
+                            attempt: 9,
+                            ..crate::converge::RefreshVersion::default()
+                        },
+                        ..crate::converge::RefreshObservation::default()
+                    }))
+                    .with_identity(Box::new(move || {
+                        let current = identity.load(Ordering::Acquire);
+                        if current == identity_seen {
+                            crate::client::IdentityDebt::None
+                        } else {
+                            identity_seen = current;
+                            crate::client::IdentityDebt::Changed
                         }
                     }))
                 },
@@ -563,6 +608,8 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                 now_ms: &|| clock.load(Ordering::Acquire),
                 log: &|_| {},
                 pace: QUICK,
+                rung: None,
+                broker: false,
             });
         });
         a_pass_ran_after(m7, start);
@@ -603,10 +650,17 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             2,
             "the unrelated applied version owes one repair"
         );
+        identity.store(1, Ordering::Release);
+        looks_past(10);
+        assert_eq!(
+            runners.load(Ordering::Acquire),
+            3,
+            "a late identity input owes local repair after the initial work completed"
+        );
         let records = load_records(m7).unwrap().encode();
         source.store(1, Ordering::Release);
         looks_past(10);
-        assert_eq!(runners.load(Ordering::Acquire), 3);
+        assert_eq!(runners.load(Ordering::Acquire), 4);
         for subscriber_off in [false, true] {
             if subscriber_off {
                 crate::service::record_subscriber_off(&m7.home).unwrap();
@@ -615,6 +669,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             }
             looks_past(5);
             let before = runners.load(Ordering::Acquire);
+            identity.fetch_add(1, Ordering::Release);
             looks_past(5);
             assert_eq!(
                 runners.load(Ordering::Acquire),
@@ -646,6 +701,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             vec![
                 crate::converge::RepositoryWork::Refresh,
                 crate::converge::RepositoryWork::Repair,
+                crate::converge::RepositoryWork::Repair,
                 crate::converge::RepositoryWork::Refresh,
                 crate::converge::RepositoryWork::Refresh,
                 crate::converge::RepositoryWork::Refresh,
@@ -665,7 +721,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             "startup shares an existing generation without inventing a later fence"
         );
         assert_eq!(
-            requests[2],
+            requests[3],
             crate::converge::RepositoryRequest::Refresh(crate::converge::RefreshRequest::inputs(
                 crate::converge::RefreshScope::new([1; 32]),
                 version,
@@ -673,6 +729,615 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             "the local transition retains its sampled input epoch and expected scope"
         );
     });
+}
+
+/// A pace whose timer never comes in a test, after a pass that finished or one that did not: a
+/// loop a bell rings looks only on what it hears.
+const FAR: NodePassPace = NodePassPace {
+    every: Duration::from_secs(3_600),
+    again: Duration::from_secs(3_600),
+    ..QUICK
+};
+
+/// What a loop a bell rings did, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    /// A look: its read of the switches.
+    Look,
+    /// A wait, until its deadline (`None`: none).
+    Wait(Option<Instant>),
+    /// A change of network a wait heard.
+    Moved,
+    /// The loop's own watch told this key, and rings it next.
+    Told(u64),
+}
+
+/// Changes of network a test makes by ringing `moved`. Each wait waits on what the loop waits on
+/// too, and notes itself and what it heard.
+struct TestRoutes<'a> {
+    moved: &'a aterm_uds::ready::Doorbell,
+    seen: &'a std::sync::Mutex<Vec<Seen>>,
+}
+
+impl super::super::member_routes::Changes for TestRoutes<'_> {
+    fn wait(&mut self, deadline: Option<Instant>, also: &[BorrowedFd<'_>]) -> bool {
+        self.seen.lock().unwrap().push(Seen::Wait(deadline));
+        let mut fds = also.to_vec();
+        fds.push(self.moved.fd());
+        let _ = aterm_uds::ready::any(&fds, deadline);
+        let moved = self.moved.clear();
+        if moved {
+            self.seen.lock().unwrap().push(Seen::Moved);
+        }
+        moved
+    }
+}
+
+/// [`run_node_pass_hearing`] on a Mac, its bell rung by its own watches and the test, its routes
+/// moved by the test, and each look and wait noted.
+struct Ringing<'a> {
+    paths: &'a Paths,
+    stop: aterm_uds::stop::Stop,
+    held: AtomicBool,
+    rung: Arc<aterm_uds::ready::Doorbell>,
+    moved: aterm_uds::ready::Doorbell,
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    clock: u64,
+    /// Where its LAN broker's socket would be: none, unless the test makes one.
+    #[cfg(target_os = "macos")]
+    broker: PathBuf,
+    pace: NodePassPace,
+}
+
+impl<'a> Ringing<'a> {
+    fn new(paths: &'a Paths, held: bool) -> Self {
+        Self {
+            paths,
+            stop: aterm_uds::stop::Stop::new(),
+            held: AtomicBool::new(held),
+            rung: Arc::new(aterm_uds::ready::Doorbell::new().unwrap()),
+            moved: aterm_uds::ready::Doorbell::new().unwrap(),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            clock: aterm_time::unix_millis().unwrap(),
+            #[cfg(target_os = "macos")]
+            broker: paths.home.join("absent-broker.sock"),
+            pace: FAR,
+        }
+    }
+
+    /// Run the loop until its stop, hearing its LAN broker at a socket of its own (macOS), where
+    /// none answers.
+    fn run(
+        &self,
+        make_inputs: &dyn Fn() -> ConvergenceInputs,
+        start_converge: &dyn Fn(
+            crate::converge::RepositoryRequest,
+        ) -> Option<aterm_uds::spawnfd::Child>,
+    ) {
+        #[cfg(target_os = "macos")]
+        aterm_uds::lan::seam_here(
+            aterm_uds::lan::Seam {
+                socket: Some(self.broker.clone()),
+                ..aterm_uds::lan::Seam::default()
+            },
+            || self.hear(make_inputs, start_converge),
+        );
+        #[cfg(not(target_os = "macos"))]
+        self.hear(make_inputs, start_converge);
+    }
+
+    fn hear(
+        &self,
+        make_inputs: &dyn Fn() -> ConvergenceInputs,
+        start_converge: &dyn Fn(
+            crate::converge::RepositoryRequest,
+        ) -> Option<aterm_uds::spawnfd::Child>,
+    ) {
+        run_node_pass_hearing(
+            &NodePassHost {
+                paths: self.paths,
+                stop: &self.stop,
+                held: &|| {
+                    self.seen.lock().unwrap().push(Seen::Look);
+                    self.held.load(Ordering::Acquire)
+                },
+                may_post: &|| true,
+                routes: &|| [None; 3],
+                make_inputs,
+                start_converge,
+                now_ms: &|| self.clock,
+                log: &|_| {},
+                pace: self.pace,
+                rung: Some(Arc::clone(&self.rung)),
+                broker: true,
+            },
+            || TestRoutes {
+                moved: &self.moved,
+                seen: &self.seen,
+            },
+            {
+                let seen = Arc::clone(&self.seen);
+                move |key| seen.lock().unwrap().push(Seen::Told(key))
+            },
+        );
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Wait until `holds` of what the loop did since its `from`th note.
+    fn until(&self, what: &str, from: usize, holds: impl Fn(&[Seen]) -> bool) {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            holds(&self.seen()[from..]).then_some(())
+        });
+    }
+
+    /// Wait until the loop's watch told each of `keys` (each file's first look tells, whatever
+    /// it finds), the loop looked after its last tell, and it waits again with its bell quiet:
+    /// from then on what rings it is what the test does. Answers where the notes stand then.
+    fn quiet(&self, keys: &[u64]) -> usize {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the watch's first looks told and looked at, and the loop waits again",
+            || {
+                let seen = self.seen();
+                let told = seen
+                    .iter()
+                    .rposition(|seen| matches!(seen, Seen::Told(_)))?;
+                let quiet = keys.iter().all(|key| seen.contains(&Seen::Told(*key)))
+                    && seen[told..].contains(&Seen::Look)
+                    && matches!(seen.last(), Some(Seen::Wait(_)))
+                    && self.bell_quiet();
+                quiet.then_some(seen.len())
+            },
+        )
+    }
+
+    /// Whether nothing rang the loop since its last look.
+    fn bell_quiet(&self) -> bool {
+        aterm_uds::ready::any_now(&[self.rung.fd()]).is_ok_and(|ready| ready.is_empty())
+    }
+}
+
+/// A converge pass that ends at once, well: nothing it leaves owes a look sooner than its recheck.
+fn ended_well(
+    root: &Path,
+) -> impl Fn(crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child> {
+    let success = converge_program(root, "converge-success", "exit 0");
+    move |_| Some(ended_runner(&success))
+}
+
+/// A held loop looks on its bell, and else only once a pass's wait, its backstop: the ring that
+/// lifts the hold runs the pass, after which the loop keeps its timer's deadline.
+/// NEGATIVE CONTROL: a wait that does not clear and read the bell spins on it and never looks.
+#[test]
+fn a_held_loop_waits_for_its_bell_and_its_backstop() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    let ringing = Ringing::new(m7, true);
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        ringing.until("the held loop waits", 0, |seen| {
+            seen.iter().any(|seen| matches!(seen, Seen::Wait(_)))
+        });
+        let seen = ringing.seen();
+        let backstop = Instant::now() + FAR.every / 2;
+        assert!(
+            seen.iter()
+                .all(|seen| !matches!(seen, Seen::Wait(at) if at.is_none_or(|at| at < backstop))),
+            "a held loop's one deadline is its backstop: {seen:?}"
+        );
+        let from = seen.len();
+        ringing.rung.ring();
+        ringing.until("a ring looks again", from, |seen| {
+            seen.contains(&Seen::Look)
+        });
+        assert_eq!(node_pass_receipt(m7), None, "still held");
+
+        ringing.held.store(false, Ordering::Release);
+        ringing.rung.ring();
+        a_pass_ran_after(m7, ringing.clock);
+        // The pass ran in a look already noted, and the waits after it may be noted too: every
+        // look from the receipt's on is open, so read from the latest.
+        let open = |seen: &[Seen]| seen.iter().rposition(|seen| *seen == Seen::Look);
+        ringing.until("the open loop waits on its timer", 0, |seen| {
+            open(seen).is_some_and(|at| {
+                seen[at..]
+                    .iter()
+                    .any(|seen| matches!(seen, Seen::Wait(Some(_))))
+            })
+        });
+        let seen = ringing.seen();
+        let waits = seen[open(&seen).unwrap()..].to_vec();
+        let latest = Instant::now() + FAR.every;
+        assert!(
+            waits
+                .iter()
+                .all(|seen| !matches!(seen, Seen::Wait(at) if at.is_none_or(|at| at > latest))),
+            "no deadline past the pass's timer: {waits:?}"
+        );
+    });
+}
+
+/// The loop's own watch over the records file rings it: a new one runs a pass with no clock moved
+/// and no deadline come. The record comes once the off switch's watch's first look was told and
+/// looked at.
+/// NEGATIVE CONTROL: a loop that watched no records file waits out its hour-long timer.
+#[test]
+fn a_ringing_loop_hears_a_new_records_file() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let ringing = Ringing::new(m7, false);
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        a_pass_ran_after(m7, ringing.clock);
+        ringing.quiet(&[OFF_WATCH]);
+        test_put_everyone(m22, "later", b"later-v1").expect("m22 signs an entry");
+        save_records(m7, &load_records(m22).unwrap().encode()).expect("the record reaches m7");
+        let later = m7.home.join(".secrets/later");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the pass the new records file rang materializes its entry",
+            || (std::fs::read(&later).ok()? == b"later-v1").then_some(()),
+        );
+    });
+}
+
+/// The loop's own watch over the subscriber's off switch rings it: the switch it found on, taken
+/// away once the records watch's first look was told and looked at, runs the pass with no
+/// deadline come.
+/// NEGATIVE CONTROL: a loop that watched no off switch waits out its hour-long backstop.
+#[test]
+fn a_ringing_loop_hears_its_off_switch_taken_away() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    crate::service::record_subscriber_off(&m7.home).unwrap();
+    let ringing = Ringing::new(m7, false);
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        ringing.quiet(&[RECORDS_WATCH]);
+        assert_eq!(node_pass_receipt(m7), None, "off");
+        std::fs::remove_file(crate::service::subscriber_off_path(&m7.home)).unwrap();
+        a_pass_ran_after(m7, ringing.clock);
+    });
+}
+
+/// A records layout the loop cannot read, a transition another writer holds unfinished, is
+/// watched by what its selection is judged by: that writer, finishing it, rings the loop, whose
+/// pass then runs on the records it names, with no deadline come. The node's own pass, which
+/// finishes such a transition when it takes the vault, finds the vault taken; the writer lets it
+/// go and finishes once the off switch's watch's first look was told and looked at.
+/// NEGATIVE CONTROL: a loop that watches no records while their layout names none waits out its
+/// hour-long retry.
+#[test]
+fn a_ringing_loop_hears_its_unfinished_records_layout_finished() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    let entry = m7.records_file();
+    let writer = StateLock::take(m7).unwrap();
+    assert!(crate::records_storage::interrupt_after_exchange(&entry).is_err());
+    assert!(
+        m7.records_data_file().is_err(),
+        "the layout names no data file"
+    );
+    let mut ringing = Ringing::new(m7, false);
+    ringing.pace = NodePassPace {
+        lock_wait: Duration::ZERO,
+        ..FAR
+    };
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        a_pass_ran_after(m7, ringing.clock);
+        assert_eq!(
+            node_pass_receipt(m7).map(|receipt| receipt.said),
+            Some(NodePassSaid::Busy),
+            "the vault is taken"
+        );
+        ringing.quiet(&[OFF_WATCH]);
+        assert!(m7.records_data_file().is_err(), "still unfinished");
+        drop(writer);
+        crate::records_storage::recover_pending(&entry).expect("the writer finishes it");
+        assert!(m7.records_data_file().is_ok());
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the pass the finished layout rang finishes",
+            || {
+                node_pass_receipt(m7)
+                    .filter(|receipt| receipt.said == NodePassSaid::Done)
+                    .map(|_| ())
+            },
+        );
+    });
+}
+
+/// A broker socket no broker answers is dialled again on its own backoff, and only a broker that
+/// answers owes a look: a retry that finds none waits again.
+/// NEGATIVE CONTROL: a wait that ends at the broker's retry looks at each one.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dead_brokers_retry_dials_again_without_a_look() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    let sockets = aterm_tempfile::tempdir().unwrap();
+    let mut ringing = Ringing::new(m7, false);
+    ringing.broker = sockets.path().join("broker.sock");
+    // The socket of a broker that is gone: a dial finds no listener.
+    drop(std::os::unix::net::UnixListener::bind(&ringing.broker).unwrap());
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        a_pass_ran_after(m7, ringing.clock);
+        let from = ringing.quiet(&[RECORDS_WATCH, OFF_WATCH]);
+        let far = Instant::now() + FAR.every / 4;
+        // What the loop did, its watch's tells left out: a wait that ran to a retry's time and
+        // then waited for a later one, with no look between.
+        ringing.until("a retry that finds no broker waits again", from, |seen| {
+            let done: Vec<Seen> = seen
+                .iter()
+                .copied()
+                .filter(|seen| !matches!(seen, Seen::Told(_)))
+                .collect();
+            done.windows(2).any(|pair| {
+                matches!(pair, [Seen::Wait(Some(retry)), Seen::Wait(Some(next))]
+                    if *retry < far && next > retry)
+            })
+        });
+    });
+}
+
+/// A change of network owes a look at once: the wait that hears one looks next, rather than
+/// waiting again. It comes while the loop, its watch's first looks told and looked at, waits on a
+/// far deadline.
+/// NEGATIVE CONTROL: a wait that drops what its changes said waits again.
+#[test]
+fn a_change_of_network_owes_a_look() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    let ringing = Ringing::new(m7, false);
+    let start = ended_well(macs.root.path());
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(&|| ConvergenceInputs::new(Box::new(|_| None)), &start);
+        });
+        a_pass_ran_after(m7, ringing.clock);
+        ringing.quiet(&[RECORDS_WATCH, OFF_WATCH]);
+        let far = Instant::now() + FAR.every / 4;
+        ringing.until(
+            "the loop waits on a far deadline",
+            0,
+            |seen| matches!(seen.last(), Some(Seen::Wait(Some(at))) if *at > far),
+        );
+        let from = ringing.seen().len();
+        ringing.moved.ring();
+        ringing.until(
+            "the change is heard and something follows it",
+            from,
+            |seen| {
+                seen.iter()
+                    .position(|seen| *seen == Seen::Moved)
+                    .is_some_and(|at| at + 1 < seen.len())
+            },
+        );
+        let seen = ringing.seen()[from..].to_vec();
+        let at = seen.iter().position(|seen| *seen == Seen::Moved).unwrap();
+        assert_eq!(seen[at + 1], Seen::Look, "{seen:?}");
+    });
+}
+
+/// A runner's exit owes a look: the work its run left owed starts as it ends, with no deadline
+/// come and no ring. It ends once the watch's first looks were told and looked at, and the ring
+/// that read the moved input was looked at too.
+/// NEGATIVE CONTROL: a wait that leaves the exit out waits out its timer and its recheck.
+#[test]
+fn a_runners_exit_owes_a_look() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m7 = &macs.m7;
+    let root = macs.root.path();
+    let release = root.join("release");
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    // It ends with the test's folder too, should the test end before it releases the runner.
+    let running = converge_program(
+        root,
+        "converge-until-released",
+        &format!(
+            "until [ -e \"{}\" ] || [ ! -d \"{}\" ]; do {} 0.01; done",
+            release.display(),
+            root.display(),
+            sleep.display()
+        ),
+    );
+    let success = converge_program(root, "converge-success", "exit 0");
+    let calls = AtomicUsize::new(0);
+    let start = |_| {
+        Some(if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::converge::start(
+                &running,
+                crate::converge::SUBSCRIBER,
+                crate::converge::RepositoryWork::Repair,
+            )
+            .unwrap()
+        } else {
+            ended_runner(&success)
+        })
+    };
+    let source = Arc::new(AtomicUsize::new(0));
+    let ringing = Ringing::new(m7, false);
+    std::thread::scope(|scope| {
+        let _running = Running {
+            stop: &ringing.stop,
+        };
+        scope.spawn(|| {
+            ringing.run(
+                &|| {
+                    let source = Arc::clone(&source);
+                    let mut seen = source.load(Ordering::Acquire);
+                    ConvergenceInputs::new(Box::new(move |refresh| {
+                        let current = source.load(Ordering::Acquire);
+                        (current != seen).then(|| {
+                            seen = current;
+                            crate::converge::RepositoryRequest::Refresh(
+                                crate::converge::RefreshRequest::inputs(
+                                    crate::converge::RefreshScope::new([1; 32]),
+                                    refresh.version,
+                                ),
+                            )
+                        })
+                    }))
+                },
+                &start,
+            );
+        });
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the first runner", || {
+            (calls.load(Ordering::Acquire) == 1).then_some(())
+        });
+        let from = ringing.quiet(&[RECORDS_WATCH, OFF_WATCH]);
+        // An input moves while the runner runs: its work is owed to the runner's end.
+        source.store(1, Ordering::Release);
+        ringing.rung.ring();
+        ringing.until("a look reads the input, then waits", from, |seen| {
+            seen.iter()
+                .position(|seen| *seen == Seen::Look)
+                .is_some_and(|at| seen[at..].iter().any(|seen| matches!(seen, Seen::Wait(_))))
+                && matches!(seen.last(), Some(Seen::Wait(_)))
+                && ringing.bell_quiet()
+        });
+        assert_eq!(calls.load(Ordering::Acquire), 1, "one runner at a time");
+        std::fs::write(&release, b"").unwrap();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the owed runner starts as the first one exits",
+            || (calls.load(Ordering::Acquire) == 2).then_some(()),
+        );
+    });
+}
+
+/// A start the LAN holds waits on the LAN's own backoff, not on the due's times, which stay past
+/// while it holds; a start the LAN lets through ends that backoff, and an exit is heard while its
+/// runner runs.
+/// NEGATIVE CONTROL: a `next_at` that takes the due's past retry wakes the loop each look.
+#[test]
+fn a_start_the_lan_holds_waits_on_the_lans_backoff() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let failed = converge_program(root.path(), "failed", "exit 1");
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    // It runs until killed, or until the test's folder goes, should the test end before it kills.
+    let running = converge_program(
+        root.path(),
+        "running",
+        &format!(
+            "while [ -d \"{}\" ]; do {} 0.01; done",
+            root.path().display(),
+            sleep.display()
+        ),
+    );
+    let calls = std::cell::Cell::new(0);
+    let start = |_: crate::converge::RepositoryRequest| {
+        calls.set(calls.get() + 1);
+        Some(if calls.get() == 1 {
+            ended_runner(&failed)
+        } else {
+            crate::converge::start(
+                &running,
+                crate::converge::SUBSCRIBER,
+                crate::converge::RepositoryWork::Repair,
+            )
+            .unwrap()
+        })
+    };
+    let mut converge = NodeConverge::default();
+    converge.tend_at(0, [None; 3], &|| true, &start);
+    converge.tend_at(1, [None; 3], &|| true, &start);
+    assert_eq!(calls.get(), 1);
+    assert!(
+        converge.due.next_at().is_some_and(|at| at <= 6_000),
+        "the failure's retry"
+    );
+
+    converge.tend_at(6_000, [None; 3], &|| false, &start);
+    assert_eq!(converge.lan.remaining(6_000), Some(Duration::from_secs(5)));
+    converge.tend_at(9_000, [None; 3], &|| false, &start);
+    assert_eq!(
+        converge.lan.remaining(9_000),
+        Some(Duration::from_secs(2)),
+        "a look before the LAN's retry keeps it"
+    );
+    converge.tend_at(11_000, [None; 3], &|| false, &start);
+    assert_eq!(
+        converge.lan.remaining(11_000),
+        Some(Duration::from_secs(10)),
+        "the LAN's retry backs off"
+    );
+    // On the loop's clock at 11 s, the due's retry is 5 s past, and the LAN's is 10 s ahead.
+    converge.clock = Instant::now().checked_sub(Duration::from_millis(11_000));
+    let next = converge.next_at().expect("a held start owes a look");
+    assert!(
+        next >= Instant::now() + Duration::from_secs(9),
+        "the LAN's retry, not the due's past one"
+    );
+
+    converge.tend_at(11_001, [None; 3], &|| true, &start);
+    assert_eq!(calls.get(), 2, "the LAN let the owed start through");
+    assert_eq!(converge.lan.remaining(11_001), None, "and its backoff ends");
+    assert_eq!(
+        converge.next_at(),
+        None,
+        "a runner whose exit is heard owes no deadline"
+    );
+    let exit = converge.exit().expect("its exit is heard");
+    assert!(
+        aterm_uds::ready::any_now(&[exit]).unwrap().is_empty(),
+        "it runs"
+    );
+    converge.runner.as_mut().unwrap().kill().unwrap();
+    let exit = converge.exit().unwrap();
+    let ready = aterm_uds::ready::any(
+        &[exit],
+        Instant::now().checked_add(aterm_spec::wait::MUST_HAPPEN),
+    );
+    assert_eq!(ready.unwrap(), vec![0], "its end is heard");
+    // The kernel tells an exit before the child can be reaped: a look in between finds it running.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a look reaps the ended runner",
+        || {
+            converge.tend_at(11_002, [None; 3], &|| true, &start);
+            converge.runner.is_none().then_some(())
+        },
+    );
+    assert!(converge.exit().is_none(), "the look lets its exit go");
 }
 
 fn converge_program(root: &Path, name: &str, body: &str) -> PathBuf {
@@ -799,10 +1464,8 @@ fn node_convergence_coalesces_new_versions_while_a_runner_still_runs() {
     };
     let mut converge = NodeConverge::default();
     converge.tend_at(0, [None; 3], &|| true, &start);
-    converge
-        .due
-        .request(crate::converge::RepositoryRequest::Repair);
     for at in [1, 2, 3] {
+        converge.due.identity_changed();
         converge.tend_at(at, [None; 3], &|| true, &start);
     }
     assert_eq!(calls.get(), 1, "new work cannot start a concurrent runner");

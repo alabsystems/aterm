@@ -3,155 +3,146 @@
 
 use super::*;
 use crate::table::tests::Lab;
-use aterm_secrets::{commons::roster::Role, fsx};
-use aterm_spec::interp::State;
+use aterm_secrets::{client, commons::roster::Role, fsx};
 use aterm_uds::private_file::PrivateLock;
 use std::time::Duration;
 
-fn locked(dir: &Path, name: &str) -> bool {
-    match PrivateLock::take(dir, name, Duration::ZERO, "source held") {
-        Ok(_) => false,
-        Err(why) if why.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(why) => panic!("cannot probe source lock: {why}"),
-    }
-}
-
-fn check(scenario: i64, mutant: u8) -> State {
+#[test]
+fn native_projection_refuses_each_changed_source_field_and_excluded_scope() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
     let scope = registry.open().unwrap();
     let config = paths.home.join("source.toml");
-    let source = registry
-        .with_admitted_source(&config, None, |source| Ok(source.clone()))
-        .unwrap();
-    let mut expected = source.revision;
-    match scenario {
-        1 => expected.inventory.0[0] ^= 1,
-        2 => expected.scope[0] ^= 1,
-        3 => expected.actor[0] ^= 1,
-        4 => expected.control[0] ^= 1,
-        5 | 6 => {
-            let id = if scenario == 5 {
-                scope.digest()
-            } else {
-                crate::catalog::Directory::new(paths, lab.bootstrap(0).trust())
-                    .catalog_scope()
-                    .digest()
-            };
-            fsx::write_atomic(
-                &config,
-                format!(
-                    "[commons]\nexclude_tables = [\"{}\"]\n",
-                    aterm_codec::hex::encode_lower(&id)
-                )
-                .as_bytes(),
-                0o600,
-            )
-            .unwrap();
-        }
-        7 => fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap(),
-        9 => Arc::make_mut(&mut expected.projection).me = Some("another-projection".into()),
-        _ => {}
-    }
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            MUTANT.set(0);
-            crate::generation::RELEASE_SOURCE_EARLY.set(false);
-        }
-    }
-    let _reset = Reset;
-    MUTANT.set(mutant);
-    crate::generation::RELEASE_SOURCE_EARLY.set(mutant == 3);
-    let table = crate::catalog::Directory::new(paths, lab.bootstrap(0).trust())
-        .path(scope)
-        .unwrap();
-    let locks = [
-        (paths.dir.clone(), ".lock"),
-        (paths.dir.join("commons/control"), "control.lock"),
-        (table, "table.lock"),
-    ];
-    let mut called = false;
-    let mut held = true;
-    let receipt = paths.home.join("local-receipt");
-    let result = registry.with_admitted_source(&config, Some(&expected), |_| {
-        called = true;
-        fsx::write_atomic(&receipt, b"admitted", 0o600).unwrap();
-        held = locks.iter().all(|(dir, name)| locked(dir, name));
-        if scenario == 8 {
-            Err(Error::new("local receipt refused"))
-        } else {
-            Ok(())
-        }
-    });
-    let released = locks.iter().all(|(dir, name)| !locked(dir, name));
-    assert_eq!(receipt.exists(), called);
-    State::from([
-        ("scenario", scenario),
-        ("done", 1),
-        ("called", i64::from(called)),
-        ("accepted", i64::from(result.is_ok())),
-        ("held", i64::from(held)),
-        ("released", i64::from(released)),
-    ])
-}
-
-pub(crate) fn transition(state: &State, action: &str) -> State {
-    if action == "Scenario" {
-        let mut next = state.clone();
-        next.insert("scenario", state["scenario"] + 1);
-        next
-    } else {
-        assert_eq!(action, "Admit");
-        check(state["scenario"], 0)
-    }
-}
-
-#[test]
-fn native_source_admission_refines_receipt_custody() {
-    let model = aterm_models_db::native_source_model();
-    aterm_spec::interp::prove_and_catch(&model);
-    let mut admitted = 0;
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{state:?} -> {next:?}"
-                );
-                admitted += usize::from(action.name == "Admit");
+    let vault = client::config(paths).unwrap().unwrap();
+    let source = registry.observe_projection(&config).unwrap();
+    for scenario in 1..=6 {
+        let mut expected = source.revision.clone();
+        match scenario {
+            1 => expected.source.revision.inventory.0[0] ^= 1,
+            2 => expected.source.revision.scope[0] ^= 1,
+            3 => expected.source.revision.actor[0] ^= 1,
+            4 => expected.source.revision.control[0] ^= 1,
+            5 => expected.source.revision.catalog[0] ^= 1,
+            6 => {
+                Arc::make_mut(&mut expected.source.revision.projection).me =
+                    Some("another-projection".into())
             }
+            _ => unreachable!(),
         }
-    }
-    assert_eq!(admitted, 10);
-    for (mutant, scenario, law) in [
-        (1, 2, "RefuseChangedOrExcluded"),
-        (2, 5, "RefuseChangedOrExcluded"),
-        (3, 0, "HoldThroughReceipt"),
-    ] {
         assert!(
-            !model.check_invariant(law, &check(scenario, mutant)),
-            "mutant {mutant}: {law}"
+            registry
+                .with_admitted_projection::<()>(
+                    &config,
+                    paths,
+                    &vault,
+                    Some(&expected),
+                    |_, _| panic!("changed field {scenario} admitted")
+                )
+                .is_err()
+        );
+    }
+    for id in [scope.digest(), source.source().revision.catalog] {
+        fsx::write_atomic(
+            &config,
+            format!(
+                "[commons]\nexclude_tables = [\"{}\"]\n",
+                aterm_codec::hex::encode_lower(&id)
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .observe_projection(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("excluded")
+        );
+        assert!(
+            registry
+                .with_admitted_projection::<()>(
+                    &config,
+                    paths,
+                    &vault,
+                    Some(source.revision()),
+                    |_, _| panic!("excluded source admitted")
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("excluded")
         );
     }
 }
 
 #[test]
-fn native_source_refuses_a_changed_registry_before_saving_a_receipt() {
+fn installed_projection_is_absent_only_on_a_new_installation_and_refuses_a_busy_vault() {
+    let empty = aterm_tempfile::tempdir().unwrap();
+    let paths = client::Paths::for_home(empty.path());
+    assert!(
+        Registry::at(paths.clone())
+            .observe_installed_projection(&paths.home.join("config.toml"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!paths.dir.exists());
+
     let lab = Lab::new(&[Role::Writer]);
-    let registry = Registry::at(lab.paths[0].clone());
+    let paths = &lab.paths[0];
+    let registry = Registry::at(paths.clone());
+    let config = paths.home.join("config.toml");
+    drop(lab.bootstrap(0));
+    // Inside an established vault a missing registry is unavailable, never absence.
+    assert!(registry.observe_installed_projection(&config).is_err());
+    registry.open().unwrap();
+    assert!(
+        registry
+            .observe_installed_projection(&config)
+            .unwrap()
+            .is_some()
+    );
+    let writer = client::test_hold_state_lock(paths).unwrap();
+    assert!(
+        registry
+            .observe_installed_projection(&config)
+            .unwrap_err()
+            .is_busy()
+    );
+    drop(writer);
+    fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap();
+    assert!(
+        registry
+            .observe_installed_projection(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("excluded")
+    );
+}
+
+#[test]
+fn native_projection_refuses_a_changed_registry_before_saving_a_receipt() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let vault = client::config(paths).unwrap().unwrap();
+    let registry = Registry::at(paths.clone());
     registry.open().unwrap();
     let config = lab.paths[0].home.join("source.toml");
-    let old = registry.observe_source(&config).unwrap().unwrap();
+    let old = registry.observe_projection(&config).unwrap();
     registry
-        .with_admitted_source(&config, Some(&old.revision), |source| {
-            assert_eq!(source.revision, old.revision);
-            assert_eq!(source.view(), old.view());
-            assert!(Arc::ptr_eq(source.view(), &source.revision.projection));
-            Ok(())
-        })
+        .with_admitted_projection(
+            &config,
+            paths,
+            &vault,
+            Some(old.revision()),
+            |current, _| {
+                let source = current.source();
+                assert_eq!(current.revision(), old.revision());
+                assert_eq!(source.view(), old.source().view());
+                assert!(Arc::ptr_eq(source.view(), &source.revision.projection));
+                Ok(())
+            },
+        )
         .unwrap();
     registry
         .write(vec![vec![
@@ -169,27 +160,33 @@ fn native_source_refuses_a_changed_registry_before_saving_a_receipt() {
         .unwrap();
     assert!(
         registry
-            .with_admitted_source::<()>(&config, Some(&old.revision), |_| panic!(
-                "changed inventory admitted"
-            ))
+            .with_admitted_projection::<()>(
+                &config,
+                paths,
+                &vault,
+                Some(old.revision()),
+                |_, _| panic!("changed inventory admitted")
+            )
             .is_err()
     );
-    let new = registry.observe_source(&config).unwrap().unwrap();
+    let new = registry.observe_projection(&config).unwrap();
     assert_eq!(
-        old.view(),
-        new.view(),
+        old.source().view(),
+        new.source().view(),
         "the edit changes no projected account"
     );
     assert_ne!(old.revision, new.revision);
 }
 
 #[test]
-fn native_source_retains_mail_and_address_identity_from_one_view() {
+fn native_projection_retains_mail_and_address_identity_from_one_view() {
     use crate::typed::grid::tests::put;
     use aterm_json::json;
 
     let lab = Lab::new(&[Role::Writer]);
-    let registry = Registry::at(lab.paths[0].clone());
+    let paths = &lab.paths[0];
+    let vault = client::config(paths).unwrap().unwrap();
+    let registry = Registry::at(paths.clone());
     let scope = registry.open().unwrap();
     let config = lab.paths[0].home.join("source.toml");
     let login = keys::address_pk("before@example.test").unwrap();
@@ -200,7 +197,8 @@ fn native_source_retains_mail_and_address_identity_from_one_view() {
             put(&MAILBOX, &mailbox, "login", json!(login)),
         ]])
         .unwrap();
-    let before = registry.observe_source(&config).unwrap().unwrap();
+    let before_projection = registry.observe_projection(&config).unwrap();
+    let before = before_projection.source();
     assert_eq!(before.table(), scope.digest());
     for excluded in [before.revision.catalog, before.table()] {
         let policy = crate::catalog::Policy {
@@ -223,7 +221,8 @@ fn native_source_retains_mail_and_address_identity_from_one_view() {
             json!("after@example.test"),
         )]])
         .unwrap();
-    let after = registry.observe_source(&config).unwrap().unwrap();
+    let after_projection = registry.observe_projection(&config).unwrap();
+    let after = after_projection.source();
     assert_eq!(before.mailboxes()[0].login, "before@example.test");
     assert_eq!(after.mailboxes()[0].login, "after@example.test");
     assert_eq!(
@@ -233,123 +232,61 @@ fn native_source_retains_mail_and_address_identity_from_one_view() {
     assert_ne!(before.revision(), after.revision());
     assert!(!format!("{after:?}").contains("after@example.test"));
     registry
-        .with_admitted_source(&config, Some(after.revision()), |current| {
-            assert_eq!(current.mailboxes(), after.mailboxes());
-            assert_eq!(current.addresses(), after.addresses());
-            Ok(())
-        })
+        .with_admitted_projection(
+            &config,
+            paths,
+            &vault,
+            Some(after_projection.revision()),
+            |projection, _| {
+                let current = projection.source();
+                assert_eq!(current.mailboxes(), after.mailboxes());
+                assert_eq!(current.addresses(), after.addresses());
+                Ok(())
+            },
+        )
         .unwrap();
     assert!(
         registry
-            .with_admitted_source::<()>(&config, Some(before.revision()), |_| {
-                panic!("mailbox rename admitted an older source")
-            })
+            .with_admitted_projection::<()>(
+                &config,
+                paths,
+                &vault,
+                Some(before_projection.revision()),
+                |_, _| { panic!("mailbox rename admitted an older source") }
+            )
             .is_err()
     );
 }
 
 #[test]
-fn native_source_selection_does_not_initialize_missing_custody() {
+fn native_projection_selection_does_not_initialize_missing_custody() {
     let lab = Lab::with_foundation_enrolled(&[Role::Writer, Role::Writer], 1);
     let paths = &lab.paths[1];
+    let vault = client::config(paths).unwrap().unwrap();
     let before = crate::tests::files(&paths.dir);
-    let result = Registry::at(paths.clone()).with_admitted_source::<()>(
+    let result = Registry::at(paths.clone()).with_admitted_projection::<()>(
         &paths.home.join("config.toml"),
+        paths,
+        &vault,
         None,
-        |_| panic!("unestablished source admitted"),
+        |_, _| panic!("unestablished source admitted"),
     );
     assert!(result.is_err());
     assert!(
         Registry::at(paths.clone())
-            .observe_source(&paths.home.join("config.toml"))
+            .observe_projection(&paths.home.join("config.toml"))
+            .is_err()
+    );
+    assert!(
+        Registry::at(paths.clone())
+            .observe_local_source(&paths.home.join("config.toml"))
             .is_err()
     );
     assert_eq!(crate::tests::files(&paths.dir), before);
 }
 
 #[test]
-fn native_source_observer_needs_no_writer_and_changes_no_storage() {
-    let lab = Lab::new(&[Role::Writer]);
-    let paths = &lab.paths[0];
-    let registry = Registry::at(paths.clone());
-    let scope = registry.open().unwrap();
-    let config = paths.home.join("config.toml");
-    let table = crate::catalog::Directory::new(paths, lab.bootstrap(0).trust())
-        .path(scope)
-        .unwrap();
-    let control = paths.dir.join("commons/control");
-    let before = crate::tests::files(&paths.dir);
-    let control_writer = PrivateLock::take(
-        &control,
-        "control.lock",
-        Duration::ZERO,
-        "hold control writer",
-    )
-    .unwrap();
-    let table_writer =
-        PrivateLock::take(&table, "table.lock", Duration::ZERO, "hold table writer").unwrap();
-    let source = registry.observe_source(&config).unwrap().unwrap();
-    assert!(Arc::ptr_eq(source.view(), &source.revision.projection));
-    drop(table_writer);
-    drop(control_writer);
-    assert_eq!(crate::tests::files(&paths.dir), before);
-    registry
-        .with_admitted_source(&config, Some(&source.revision), |_| Ok(()))
-        .unwrap();
-}
-
-#[test]
-fn native_source_observer_distinguishes_absence_exclusion_and_busy_state() {
-    let empty = aterm_tempfile::tempdir().unwrap();
-    let paths = Paths::for_home(empty.path());
-    assert!(
-        Registry::at(paths.clone())
-            .observe_source(&paths.home.join("config.toml"))
-            .unwrap()
-            .is_none()
-    );
-    assert!(!paths.dir.exists());
-
-    let lab = Lab::new(&[Role::Writer]);
-    let paths = &lab.paths[0];
-    let registry = Registry::at(paths.clone());
-    let config = paths.home.join("config.toml");
-    drop(lab.bootstrap(0));
-    assert!(registry.observe_source(&config).unwrap().is_none());
-    let scope = registry.open().unwrap();
-    assert!(registry.observe_source(&config).unwrap().is_some());
-    let writer = aterm_secrets::client::test_hold_state_lock(paths).unwrap();
-    assert!(registry.observe_source(&config).unwrap_err().is_busy());
-    drop(writer);
-    fsx::write_atomic(
-        &config,
-        format!(
-            "[commons]\nexclude_tables = [\"{}\"]\n",
-            aterm_codec::hex::encode_lower(&scope.digest())
-        )
-        .as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    assert!(
-        registry
-            .observe_source(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("excluded")
-    );
-    fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap();
-    assert!(
-        registry
-            .observe_source(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("excluded")
-    );
-}
-
-#[test]
-fn native_source_selects_a_rolled_table_inside_current_admission() {
+fn native_projection_selects_a_rolled_table_inside_current_admission() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
@@ -357,55 +294,40 @@ fn native_source_selects_a_rolled_table_inside_current_admission() {
     registry.seed().unwrap();
     registry.publish_schema().unwrap();
     let config = paths.home.join("config.toml");
-    let old = registry.observe_source(&config).unwrap().unwrap();
+    let vault = client::config(paths).unwrap().unwrap();
+    let old = registry.observe_projection(&config).unwrap();
     let rolled = registry
         .roll(true, aterm_time::unix_millis().unwrap())
         .unwrap();
     assert!(rolled.sealed, "{rolled:?}");
     assert!(
         registry
-            .with_admitted_source::<()>(&config, Some(&old.revision), |_| panic!(
-                "old table revision admitted"
-            ))
+            .with_admitted_projection::<()>(
+                &config,
+                paths,
+                &vault,
+                Some(old.revision()),
+                |_, _| panic!("old table revision admitted")
+            )
             .is_err()
     );
-    let new = registry.observe_source(&config).unwrap().unwrap();
-    assert_ne!(old.revision.scope, new.revision.scope);
-    assert_eq!(old.view(), new.view());
+    let new = registry.observe_projection(&config).unwrap();
+    assert_ne!(old.table(), new.table());
+    assert_eq!(old.source().view(), new.source().view());
     registry
-        .with_admitted_source(&config, Some(&new.revision), |_| Ok(()))
+        .with_admitted_projection(&config, paths, &vault, Some(new.revision()), |_, _| Ok(()))
         .unwrap();
 }
 
 #[test]
-fn native_source_observation_does_not_grant_a_reader_receipt_authority() {
+fn native_projection_retains_a_registry_in_an_authenticated_recovery_catalog() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
     registry.open().unwrap();
     let config = paths.home.join("config.toml");
-    let before = registry.observe_source(&config).unwrap().unwrap();
-    lab.rotate(&[Role::Reader]);
-    let reader = registry.observe_source(&config).unwrap().unwrap();
-    assert_eq!(before.view(), reader.view());
-    assert_ne!(before.revision(), reader.revision());
-    assert!(
-        registry
-            .with_admitted_source::<()>(&config, Some(reader.revision()), |_| panic!(
-                "an observer token granted a reader writer authority"
-            ))
-            .is_err()
-    );
-}
-
-#[test]
-fn native_source_observer_retains_a_registry_in_an_authenticated_recovery_catalog() {
-    let lab = Lab::new(&[Role::Writer]);
-    let paths = &lab.paths[0];
-    let registry = Registry::at(paths.clone());
-    registry.open().unwrap();
-    let config = paths.home.join("config.toml");
-    let before = registry.observe_source(&config).unwrap().unwrap();
+    let vault = client::config(paths).unwrap().unwrap();
+    let before = registry.observe_projection(&config).unwrap();
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
     let directory = crate::catalog::Directory::new(paths, bootstrap.trust());
@@ -422,6 +344,13 @@ fn native_source_observer_retains_a_registry_in_an_authenticated_recovery_catalo
         paths.home.join("preserved-native-catalog"),
     )
     .unwrap();
+    let claim = crate::table::store::claim_dir(&session)
+        .unwrap()
+        .join(format!(
+            "{}.claim",
+            aterm_codec::hex::encode_lower(&catalog.digest())
+        ));
+    std::fs::rename(claim, paths.home.join("preserved-native-catalog.claim")).unwrap();
     let mut recovery = crate::table::store::Store::join_recovery(
         &session,
         &directory.recovery().path(catalog).unwrap(),
@@ -434,13 +363,33 @@ fn native_source_observer_retains_a_registry_in_an_authenticated_recovery_catalo
     drop(recovery);
     drop(session);
     drop(bootstrap);
-    let recovered = registry.observe_source(&config).unwrap().unwrap();
-    assert_eq!(before.view(), recovered.view());
-    assert_eq!(before.revision(), recovered.revision());
+    let recovered = registry.observe_projection(&config).unwrap();
+    assert_eq!(before.source(), recovered.source());
+    assert_ne!(before.revision(), recovered.revision());
+    assert!(
+        registry
+            .with_admitted_projection::<()>(
+                &config,
+                paths,
+                &vault,
+                Some(before.revision()),
+                |_, _| panic!("old physical catalog admitted")
+            )
+            .is_err()
+    );
+    registry
+        .with_admitted_projection(
+            &config,
+            paths,
+            &vault,
+            Some(recovered.revision()),
+            |_, _| Ok(()),
+        )
+        .unwrap();
 }
 
 #[test]
-fn native_source_observer_keeps_lost_vault_configuration_distinct_from_absence() {
+fn native_projection_keeps_lost_vault_configuration_distinct_from_absence() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
@@ -452,14 +401,19 @@ fn native_source_observer_keeps_lost_vault_configuration_distinct_from_absence()
     .unwrap();
     assert!(
         registry
-            .observe_source(&paths.home.join("config.toml"))
+            .observe_projection(&paths.home.join("config.toml"))
             .is_err(),
         "an established registry cannot become an absent source by losing its vault configuration"
+    );
+    assert!(
+        registry
+            .observe_local_source(&paths.home.join("config.toml"))
+            .is_err()
     );
 }
 
 #[test]
-fn native_source_observer_keeps_a_lost_catalog_distinct_from_absence() {
+fn native_projection_keeps_a_lost_catalog_distinct_from_absence() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let registry = Registry::at(paths.clone());
@@ -486,24 +440,57 @@ fn native_source_observer_keeps_a_lost_catalog_distinct_from_absence() {
     drop(bootstrap);
     assert!(
         registry
-            .observe_source(&paths.home.join("config.toml"))
+            .observe_projection(&paths.home.join("config.toml"))
             .is_err(),
         "retained registry storage is evidence that the catalog is missing, not absent"
+    );
+    assert!(
+        registry
+            .observe_local_source(&paths.home.join("config.toml"))
+            .is_err()
     );
 }
 
 #[test]
-fn native_source_observer_refuses_a_control_change_during_projection() {
+fn native_projection_refuses_control_drift_and_holds_control_during_persistence() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
-    Registry::at(paths.clone()).open().unwrap();
-    let observed =
-        application::observe_existing_session(paths, crate::admission::deadline(), |_| {
-            lab.rotate(&[Role::Reader]);
-            Ok(())
-        });
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let config = paths.home.join("config.toml");
+    let vault = client::config(paths).unwrap().unwrap();
+    let before = registry.observe_projection(&config).unwrap();
+    lab.rotate(&[Role::Reader]);
+    let after = registry.observe_projection(&config).unwrap();
+    assert_eq!(before.source().view(), after.source().view());
+    assert_ne!(before.revision(), after.revision());
     assert!(
-        observed.is_err(),
-        "the observed control prefix changed during the read"
+        registry
+            .with_admitted_projection::<()>(
+                &config,
+                paths,
+                &vault,
+                Some(before.revision()),
+                |_, _| panic!("stale control admitted")
+            )
+            .is_err()
     );
+    let control = paths.dir.join("commons/control");
+    registry
+        .with_admitted_projection(&config, paths, &vault, Some(after.revision()), |_, _| {
+            assert_eq!(
+                PrivateLock::take(
+                    &control,
+                    "control.lock",
+                    Duration::ZERO,
+                    "contending writer"
+                )
+                .err()
+                .map(|error| error.kind()),
+                Some(std::io::ErrorKind::WouldBlock)
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(PrivateLock::take(&control, "control.lock", Duration::ZERO, "released").unwrap());
 }

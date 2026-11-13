@@ -658,6 +658,29 @@ fn named_prerequisite_leases_preserve_the_command_and_refuse_ambiguous_or_unmana
         LeaseSubject::NamedPrerequisite(Prerequisite::AtpkgKeys, 7)
     );
     assert_eq!(keys.command, ["sign-release"]);
+    let codex = parse_lease_args(&args(&[
+        "--tool",
+        "codex=2026111101",
+        "--",
+        "/store/codex/2026111101/bin/codex",
+        "debug",
+        "upgrade-capabilities",
+        "--hold",
+    ]))
+    .unwrap();
+    assert_eq!(
+        codex.subject,
+        LeaseSubject::NamedPrerequisite(Prerequisite::Codex, 2026111101)
+    );
+    assert_eq!(
+        codex.command,
+        [
+            "/store/codex/2026111101/bin/codex",
+            "debug",
+            "upgrade-capabilities",
+            "--hold",
+        ]
+    );
     for bad in [
         &["--tool", "lake=0", "--", "run"][..],
         &["--tool", "lake=oops", "--", "run"],
@@ -4690,6 +4713,7 @@ fn repair_counts_an_unread_item_undone() {
         class: Some(aterm_converge::Class::Relay),
         explain: None,
         stood_aside: None,
+        waits_on: None,
         essential: false,
         elapsed_ms: None,
     };
@@ -5577,7 +5601,7 @@ fn the_default_set_holds_the_index_programs_and_every_vendor_row_serving_here() 
     ] {
         assert!(
             set.contains(program),
-            "{program} is in the default set here (a harness too, owner ruling 2026-10-27)"
+            "{program} is in the default set here (a harness too)"
         );
     }
     for spec in crate::vendor_direct::VENDORS {
@@ -7522,8 +7546,8 @@ fn write_registry_with_harness(dir: &Path, index_build: u64, harness_build: u64)
     write_pkg(dir, "muse-alab", harness_build);
 }
 
-/// A HARNESS IS ON BY DEFAULT LIKE EVERY PROGRAM, AND A PERSON'S OFF STAYS (owner ruling
-/// 2026-10-27): the pass that completes the default set installs the pinned `muse-alab` beside
+/// A HARNESS IS ON BY DEFAULT LIKE EVERY PROGRAM, AND A PERSON'S OFF STAYS:
+/// the pass that completes the default set installs the pinned `muse-alab` beside
 /// `ay` unasked, the next update pass moves it to the index's newer pin, and neither a person's
 /// uninstall nor a `[packages].exclude` naming it is undone by the set pass.
 #[cfg(unix)]

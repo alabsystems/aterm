@@ -30,6 +30,18 @@ use std::{path::PathBuf, time::Duration};
 /// The test vault's Commons network.
 pub const NETWORK: [u8; 16] = [9; 16];
 
+/// Signed table bytes with an explicit clock claim, without changing the host's clock.
+#[cfg(test)]
+pub(crate) fn seal_at(
+    session: &super::Session<'_>,
+    scope: super::Scope,
+    causal: crate::crypto::Causal<'_>,
+    payload: &[u8],
+    authored_ms: u64,
+) -> crate::Result<Vec<u8>> {
+    session.seal_at(scope, causal, payload, authored_ms)
+}
+
 /// `rounds` repair passes in which the first Mac exchanges with every other, as a runtime does.
 pub fn repair_commons(lab: &Lab, rounds: usize) {
     let members: Vec<usize> = (0..lab.paths.len()).collect();

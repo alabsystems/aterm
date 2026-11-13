@@ -10,6 +10,12 @@
 #[cfg(unix)]
 #[path = "native_recipient_recovery.rs"]
 mod recipient_recovery;
+#[cfg(unix)]
+#[path = "native_runtime_data.rs"]
+mod runtime_data;
+#[cfg(unix)]
+#[path = "native_source_exec.rs"]
+mod source_exec;
 #[path = "native_source_restart.rs"]
 mod source_restart;
 
@@ -165,12 +171,20 @@ pub(crate) fn serve_codex_enrollment(
 
 pub(crate) fn cancel_renewal_owner(ctx: &crate::SessionCtx) -> Result<bool, &'static str> {
     #[cfg(unix)]
+    let source = source_exec::cancel_owner(ctx);
+    #[cfg(not(unix))]
+    let source = false;
+    #[cfg(unix)]
     let exec = exec_handoff::cancel_owner(ctx);
     #[cfg(not(unix))]
     let exec = false;
-    renewal::cancel_owner(ctx).map(|cancelled| cancelled || exec)
+    renewal::cancel_owner(ctx).map(|cancelled| cancelled || exec || source)
 }
 pub(crate) fn renewal_pending(ctx: &crate::SessionCtx) -> bool {
+    #[cfg(unix)]
+    if source_exec::pending(ctx) {
+        return true;
+    }
     #[cfg(unix)]
     if exec_handoff::pending(ctx) {
         return true;
@@ -299,6 +313,10 @@ impl Clock {
 
 #[derive(Debug, Default)]
 pub(crate) struct Operations {
+    #[cfg(unix)]
+    source_exec: Option<Arc<source_exec::Operation>>,
+    #[cfg(unix)]
+    runtime_data: Option<Arc<runtime_data::Slot>>,
     asked_binding: asked_upgrade::CurrentBinding,
     relaunch_pending: Option<Arc<relaunch_permit::Permit>>,
     #[cfg(unix)]
@@ -3313,7 +3331,9 @@ fn serve_launcher(
         (
             op.request.clone(),
             op.binding.clone(),
-            op.custody.as_ref().map(|custody| custody.handoff_guard()),
+            op.custody
+                .as_ref()
+                .and_then(|custody| custody.handoff_guard()),
             attempt,
         )
     };
@@ -4101,6 +4121,11 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             continue;
         }
         let Some(reason) = retirement(&op, kernel) else {
+            if starts_nothing_more(&op)
+                && let Some(custody) = &op.custody
+            {
+                custody.release_handoff_guard();
+            }
             continue;
         };
         let completion = op.seal_retirement(reason, kernel);
@@ -4110,12 +4135,35 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
     }
 }
 
+/// A restart signalled before its deadline and past it now, with no Resume, grant or child: Signal
+/// and Resume refuse past the deadline and no child exists without a Resume, so all it can still
+/// do is wait for the source's own exit, which a source that outlives its SIGTERM, or a group that
+/// keeps a member, may never make. The update's handoff stops waiting on that
+/// ([`NativeCustody::release_handoff_guard`]); the input position stays until it retires.
+fn starts_nothing_more(op: &Operation) -> bool {
+    matches!(op.request.plan, NativePlan::Restart { .. })
+        && op.clock.remaining(op.request.deadline_us).is_none()
+        && op.signal_accepted == Some(true)
+        && !op.resume_sent
+        && op.resume_attempt.is_none()
+        && op.grant_record == GrantRecord::None
+        && op.children.iter().all(Option::is_none)
+}
+
 pub(crate) fn serve(
     ctx: &Arc<crate::SessionCtx>,
     master: i32,
     tail: &str,
     resume: &mut dyn FnMut(&str) -> String,
 ) -> String {
+    #[cfg(unix)]
+    if let Some(reply) = source_exec::route(ctx, master, tail) {
+        return reply;
+    }
+    #[cfg(unix)]
+    if let Some(command) = tail.strip_prefix("runtime-data ") {
+        return runtime_data::serve(ctx, master, command);
+    }
     let Some(request) = Request::parse(tail) else {
         return "ERR usage: native-act <prepare|precommit|commit|query|signal|resume> <bounded fields>\n".into();
     };
@@ -4372,7 +4420,7 @@ fn serve_with_publication(
             .unwrap_or_else(|p| p.into_inner())
             .custody
             .as_ref()
-            .map(|custody| custody.handoff_guard())
+            .and_then(|custody| custody.handoff_guard())
     });
     let reply = execute(request);
     if matches!(&saved, Request::Prepare(prepare) if prepare.asked.is_some()) {

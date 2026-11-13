@@ -412,6 +412,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         release_id: Some(55),
         release_intent: true,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "unlock")

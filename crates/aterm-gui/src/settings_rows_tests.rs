@@ -2034,12 +2034,7 @@ fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
             let mut previews = std::collections::BTreeSet::new();
             for theme in ["Dracula", "GitHub Light"] {
                 for bloom in [true, false] {
-                    for saved in [
-                        "off",
-                        prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-                        "comet",
-                        "rainbow kitty flying",
-                    ] {
+                    for saved in ["off", prefs::DEFAULT_CURSOR_TRAIL_STYLE, "comet", "fire"] {
                         let mut lab = Lab::new(&trail_drawn(&format!(
                             "theme = \"{theme}\"\ncursor_trail_bloom = {bloom}\ncursor_trail_style = \"{saved}\"\n"
                         )));
@@ -5158,7 +5153,7 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
     let mut faults = Vec::new();
     // Music effects' row, which a row-detail holds where it says why no audio plays (off macOS).
     let trail_sounds: &[&str] = &[
-        "settings/row/80/trail_sounds",
+        "settings/row/81/trail_sounds",
         "settings/row-detail/trail_sounds",
     ];
     for (route, (width, height), from, starts) in [
@@ -7331,7 +7326,7 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
     // written and with every key written: each page's walk on a worker of its rung, each screen
     // the one its turn compiled.
     let written = every_key_written();
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "no blank line", |scale| {
         let blank = std::sync::Mutex::new(Vec::new());
@@ -7657,7 +7652,7 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
     // was on both, whole, and no status's bar covers it, whichever side of the list it takes. Past
     // the first sweep the press is drawn again with no frame in flight too, so the side its
     // landed status takes is weighed from the press's screen.
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "a bar beside a pressed switch", |scale| {
         let mut presses = Vec::new();
@@ -8424,10 +8419,10 @@ fn tab_on(
 #[test]
 fn tab_takes_the_cursor_styles_as_one_stop_at_the_saved_style() {
     let (width, height) = (738.0, 418.0);
-    let mut lab = Lab::new("cursor_trail_style = \"rainbow dog\"\n");
+    let mut lab = Lab::new("cursor_trail_style = \"comet\"\n");
     lab.state_mut().navigate(SettingsRoute::CursorStyles);
     let saved = UiKey::new(cursor_style_row_key(&saved_cursor_style(lab.state())));
-    assert!(saved.as_str().contains("dog"), "{saved:?}");
+    assert!(saved.as_str().contains("comet"), "{saved:?}");
     lab.compile(width, height);
     lab.dispatch(AppEvent::FocusChanged(Some(UiKey::new("settings/search"))));
     let style = |key: &UiKey| key.as_str().starts_with("settings/cursor-style/");
@@ -8470,7 +8465,7 @@ fn a_page_down_lets_go_of_the_style_a_resting_pointer_tried() {
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::CursorStyles);
     lab.compile(width, height);
-    let row = UiKey::new("settings/cursor-style/rainbow-kitty-underline");
+    let row = UiKey::new("settings/cursor-style/phaser");
     lab.state_mut().common.hovered = Some(row.clone());
     assert_eq!(lab.state().common.last_focus, None, "no keyboard focus");
     assert!(
@@ -8824,7 +8819,7 @@ fn rows_read_as_separate_units_at_every_width() {
                     let (above, below) = (&pair[0], &pair[1]);
                     let between = below.1 - above.2;
                     // Side by side, or across a card's edge or a heading.
-                    if between < 0.0 || between > 60.0 {
+                    if !(0.0..=60.0).contains(&between) {
                         continue;
                     }
                     pairs += 1;

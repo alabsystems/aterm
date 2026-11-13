@@ -131,7 +131,7 @@ fn guard_breaches(
 /// that was not inert ([`breach`]), in the order given.
 fn breaches(scratch: &Scratch, text: &str, cuts: Vec<(usize, String)>) -> Vec<String> {
     let shim = shims(scratch);
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    let workers = aterm_cores::available_parallelism().map_or(4, |n| n.get().min(8));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -955,6 +955,10 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
         "aterm-9.9.9-mac.zip — 123 MB".into(),
         format!("{}/Applications/aterm.app", s(home)),
         format!("{}/.local/bin", s(home)),
+        format!("{}/.local/share/man", s(home)),
+        format!("{}/.local/share/bash-completion/completions", s(home)),
+        format!("{}/.local/share/zsh/site-functions", s(home)),
+        format!("{}/.config/fish/completions", s(home)),
         "no pinned Team ID".into(),
     ] {
         assert!(plan.contains(&fact), "the plan names {fact:?}: {plan}");

@@ -605,7 +605,7 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
 }
 
 /// The dial's thermal stops on `heat`: its steps 1 and 3, then amber, the over orange and crimson,
-/// each floored on `ground`; the theme's accent has no part in them (owner ruling 2026-10-26).
+/// each floored on `ground`; the theme's accent has no part in them.
 fn thermal_stops(heat: &[Rgb; 7], ground: Rgb, warn: Rgb, dark: bool) -> [Rgb; 5] {
     let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
     let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);

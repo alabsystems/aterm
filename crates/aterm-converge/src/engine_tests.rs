@@ -884,6 +884,59 @@ fn an_unreadable_probe_that_lacked_the_network_stands_aside_offline() {
     assert_eq!(rows[0].stood_aside, None);
 }
 
+/// A row that did not run because what it waits for stood aside carries that stand-aside and
+/// names the row it comes from: the one that stood aside of its own accord, through every
+/// row behind it, so a caller tells an inherited wait (and its source) from an item's own.
+/// NEGATIVE CONTROL: the row that stood aside itself, and a row behind a prerequisite that
+/// failed without standing aside, name none.
+#[test]
+fn an_inherited_stand_aside_names_the_row_it_comes_from() {
+    let waiting = StoodAside::Waiting("an admin approves this Mac".into());
+    let unusable = || Probe::Unusable {
+        why: "the vault has not let this Mac in".into(),
+    };
+    let vault = Scripted::new(vec![unusable()], Ok(()));
+    let origin = vault.id();
+    let auth = Named {
+        id: "test.auth",
+        probe: ok(),
+        after: vec![origin.clone()],
+    };
+    let repos = Named {
+        id: "test.repos",
+        probe: ok(),
+        after: vec!["test.auth".into()],
+    };
+    let items: Vec<Box<dyn Item>> = vec![
+        Box::new(ReadAside(vault, Some(waiting.clone()))),
+        Box::new(auth),
+        Box::new(repos),
+    ];
+    let rows = run(&items, Mode::Apply, &mut NoJournal).unwrap();
+    assert_eq!(rows[0].stood_aside, Some(waiting.clone()));
+    assert_eq!(rows[0].waits_on, None, "CONTROL: its own stand-aside");
+    for row in &rows[1..] {
+        assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+        assert_eq!(row.stood_aside, Some(waiting.clone()), "{row:?}");
+        assert_eq!(row.waits_on.as_deref(), Some(origin.as_str()), "{row:?}");
+    }
+    let failed = Scripted::new(vec![unusable()], Ok(()));
+    let behind = Named {
+        id: "test.behind",
+        probe: ok(),
+        after: vec![failed.id()],
+    };
+    let items: Vec<Box<dyn Item>> = vec![Box::new(ReadAside(failed, None)), Box::new(behind)];
+    let rows = run(&items, Mode::Apply, &mut NoJournal).unwrap();
+    assert_eq!(rows[1].outcome, Outcome::Blocked);
+    assert_eq!(
+        (&rows[1].stood_aside, &rows[1].waits_on),
+        (&None, &None),
+        "CONTROL: {:?}",
+        rows[1]
+    );
+}
+
 #[test]
 fn a_failed_refresh_and_a_refused_record_are_explained_by_what_failed() {
     let item = Refreshing {

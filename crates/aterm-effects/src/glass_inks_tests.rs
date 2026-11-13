@@ -161,7 +161,7 @@ const DAY_DEEPEST: f32 = 5.0;
 /// DAY'S LETTERS STAY VIVID: on Aterm Day, under Cruise and Land, every letter and mark keeps an
 /// OKLCh chroma of 0.12 or more at every column, or, where sRGB holds less at its hue and the
 /// lightness it reads at (a teal at 4.5:1 on white holds about 0.09), nearly the most it holds:
-/// vivid, never the washed-out mix the owner ruled against; a letter that holds less than 0.12
+/// vivid, never the washed-out mix that is ruled out; a letter that holds less than 0.12
 /// reads no deeper than its floor needs ([`DAY_DEEPEST`]), so its own lightness does not lower
 /// the bar. CONTROL: a letter mixed 40% toward Day's paper falls under it.
 #[test]
@@ -540,6 +540,68 @@ fn values_read_apart_from_quiet_words() {
         apart < VALUE_APART_L,
         "CONTROL: the old value {old:06x} reads {apart:.3} L from quiet {quiet:06x}"
     );
+}
+
+/// ONE HOVER, WHATEVER THE COLUMN AND THE INK AT REST: on every built-in theme's ground, under
+/// every palette and none, a hovered word is the lit ink over a lit underline from each ink it
+/// rests in at each column, never reading quieter than it rested; a warning keeps its ink over
+/// that same line; a chart's cell keeps its own and takes none. CONTROL: under Cruise the
+/// letters a hover used to take differ along the row.
+#[test]
+fn a_hover_is_one_ink_at_every_column() {
+    for g in grounds() {
+        for rule in rule_greys(&g) {
+            for palette in PALETTES {
+                let inks = GlassInks::of(palette, g.ground, g.ink, rule);
+                let word = Hovered {
+                    fg: inks.lit(),
+                    underline: Some(inks.lit()),
+                };
+                for t in positions() {
+                    let rests = [
+                        inks.letter(t),
+                        inks.mark(t),
+                        inks.value(),
+                        inks.quiet(),
+                        inks.lit(),
+                    ];
+                    for rest in rests {
+                        assert_eq!(inks.hovered(rest, HoverPart::Text), word, "{}", g.name);
+                    }
+                    for rest in [inks.value(), inks.quiet()] {
+                        assert!(
+                            reads(word.fg, g.ground) >= reads(rest, g.ground),
+                            "{} under {palette:?}: a hover dims {rest:06x}",
+                            g.name
+                        );
+                    }
+                    assert_eq!(
+                        inks.hovered(inks.track(), HoverPart::Chart),
+                        Hovered {
+                            fg: inks.track(),
+                            underline: None
+                        }
+                    );
+                }
+                assert_eq!(
+                    inks.hovered(inks.warn(), HoverPart::Warn),
+                    Hovered {
+                        fg: inks.warn(),
+                        underline: Some(inks.lit())
+                    }
+                );
+            }
+        }
+    }
+    let night = ground("Aterm Night");
+    let cruise = GlassInks::of(
+        Some(CardPalette::Cruise),
+        night.ground,
+        night.ink,
+        0x0088_8888,
+    );
+    let letters: std::collections::BTreeSet<u32> = positions().map(|t| cruise.letter(t)).collect();
+    assert!(letters.len() > 1, "CONTROL: Cruise's letters are one ink");
 }
 
 /// A card's border cells along the launch card's arc, clockwise from the top-left corner: the

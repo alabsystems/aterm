@@ -407,8 +407,19 @@ pub(crate) fn get_via(spawn: Option<&Arc<dyn Spawn>>, path: &str) -> Result<Valu
 /// # Errors
 /// As [`retried`], but a 404.
 pub(crate) fn get_optional(path: &str) -> Result<Option<Value>> {
+    get_optional_via(None, path)
+}
+
+/// [`get_optional`], its curls started through `spawn` when one is given ([`Launched`]).
+/// # Errors
+/// As [`get_optional`].
+pub(crate) fn get_optional_via(
+    spawn: Option<&Arc<dyn Spawn>>,
+    path: &str,
+) -> Result<Option<Value>> {
     let path = api_path(path);
-    retried(
+    retried_via(
+        spawn,
         &format!("GET {path}"),
         || Ok(()),
         |c| match c.read(&path) {

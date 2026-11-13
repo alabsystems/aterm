@@ -1,40 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the Autopilot menu model, geometry, hit testing, paint, and accessibility.
+//! Tests for the in-grid card's model, geometry, hit testing, paint, and accessibility, hosted
+//! on a fact's menu (the folder's).
 
 use std::time::Instant;
 
-use aterm_agent::harness::footer::FooterFacts;
+use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 
 use super::*;
-use crate::claude_lights::{Clock, LandAtGlass, Weekday};
 use crate::{App, WindowId, term_lock};
 
 #[path = "autopilot_menu_viewport_tests.rs"]
 mod viewport_tests;
-
-fn offer(hh: u16, mm: u16, day: Option<Weekday>) -> Option<LandAtGlass> {
-    Some(LandAtGlass {
-        clock: Clock::of_minute(hh * 60 + mm),
-        other_day: day,
-    })
-}
-
-fn facts(view: AutopilotView) -> MenuFacts {
-    MenuFacts {
-        title: "Autopilot \u{b7} tab 3".to_string(),
-        name: Some("fix the footer".to_string()),
-        room: MAX_CONTENT,
-        spoken: "Autopilot, tab 3, fix the footer".to_string(),
-        view,
-        carries: view.mode().is_some(),
-        land_at: None,
-        armed_at_ms: None,
-        armed: None,
-        set_by: None,
-    }
-}
 
 fn keys(rows: &[MenuRow]) -> Vec<Option<String>> {
     rows.iter()
@@ -45,216 +23,116 @@ fn keys(rows: &[MenuRow]) -> Vec<Option<String>> {
         .collect()
 }
 
-fn item(rows: &[MenuRow], key: &str) -> MenuRow {
-    rows.iter()
-        .find(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
-        .cloned()
-        .unwrap_or_else(|| panic!("no row {key}"))
-}
-
-#[test]
-fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
-    let rows = rows(&facts(AutopilotView::Cruise));
-    assert_eq!(
-        keys(&rows),
-        [
-            None,
-            Some("autopilot-menu/mode/cruise".into()),
-            Some("autopilot-menu/mode/land".into()),
-            Some("autopilot-menu/mode/off".into()),
-            None,
-            Some("autopilot-menu/land-in/60".into()),
-            Some("autopilot-menu/land-in/120".into()),
-            Some("autopilot-menu/land-in/240".into()),
-            None,
-            Some("autopilot-menu/settings".into()),
-        ]
-    );
-    assert_eq!(
-        rows[0],
-        MenuRow::Header("Autopilot \u{b7} tab 3 \u{201c}fix the footer\u{201d}".into())
-    );
-    assert!(
-        rows.iter()
-            .all(|r| !matches!(r, MenuRow::Item { enabled: false, .. }))
-    );
-    let checked: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match r {
-            MenuRow::Item {
-                checked: true, act, ..
-            } => Some(act.key()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(checked, ["autopilot-menu/mode/cruise"]);
-    for (key, text) in [
-        ("autopilot-menu/mode/cruise", "\u{221e}  Cruise"),
-        ("autopilot-menu/mode/land", "\u{2913}  Land now"),
-        ("autopilot-menu/mode/off", "\u{25cb}  Off"),
-        (
-            "autopilot-menu/land-in/60",
-            "\u{221e}\u{2913} Cruise 1 hour, then land",
-        ),
-        (
-            "autopilot-menu/land-in/120",
-            "\u{221e}\u{2913} Cruise 2 hours, then land",
-        ),
-        (
-            "autopilot-menu/land-in/240",
-            "\u{221e}\u{2913} Cruise 4 hours, then land",
-        ),
-    ] {
-        assert_eq!(item(&rows, key).text(), text);
-    }
-
-    let mut f = facts(AutopilotView::Land);
-    f.land_at = offer(18, 0, None);
-    f.armed_at_ms = Some(1_792_177_200_000);
-    f.armed = Some(crate::claude_lights::LandAtGlass {
-        clock: Clock::of_minute(16 * 60),
-        other_day: Some(Weekday::Sat),
-    });
-    let rows = super::rows(&f);
-    assert!(matches!(
-        item(&rows, "autopilot-menu/mode/land"),
-        MenuRow::Item { checked: true, .. }
-    ));
-    assert_eq!(
-        item(&rows, "autopilot-menu/land-at").text(),
-        "\u{221e}\u{2913} Cruise until 18:00, then land"
-    );
-    let mut later = f.clone();
-    later.land_at = offer(18, 0, Some(Weekday::Sat));
-    let MenuRow::Item { label, spoken, .. } = item(&super::rows(&later), "autopilot-menu/land-at")
-    else {
-        unreachable!()
-    };
-    assert_eq!(
-        (label.as_str(), spoken.as_str()),
-        (
-            "Cruise until Sat 18:00, then land",
-            "Cruise until Saturday 18:00, then land"
-        )
-    );
-    let MenuRow::Item { label, spoken, .. } = item(&rows, "autopilot-menu/land-cancel") else {
-        unreachable!()
-    };
-    assert_eq!(label, "Cancel landing at Sat 16:00");
-    assert_eq!(spoken, "Cancel landing at Saturday 16:00");
-    let order = keys(&rows);
-    let at = |k: &str| order.iter().position(|o| o.as_deref() == Some(k)).unwrap();
-    assert!(
-        at("autopilot-menu/land-in/240") < at("autopilot-menu/land-at")
-            && at("autopilot-menu/land-at") < at("autopilot-menu/land-cancel")
-            && at("autopilot-menu/land-cancel") < at("autopilot-menu/settings")
-    );
-
-    for view in [AutopilotView::MasterOff, AutopilotView::Unhosted] {
-        let mut f = facts(view);
-        f.land_at = offer(18, 0, None);
-        let rows = super::rows(&f);
-        assert_eq!(
-            rows[1],
-            MenuRow::note("harness off in Settings"),
-            "{view:?}"
-        );
-        for row in &rows {
-            if let MenuRow::Item {
-                act,
-                enabled,
-                checked,
-                ..
-            } = row
-            {
-                assert_eq!(*enabled, *act == MenuAct::Settings, "{view:?} {act:?}");
-                assert!(!checked, "{view:?} {act:?}");
-            }
-        }
-    }
-    for row in super::rows(&f) {
-        if let MenuRow::Item { spoken, .. } = row {
-            assert!(
-                spoken
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || " .:,".contains(c)),
-                "{spoken:?}"
-            );
-        }
+fn choice(glyph: &'static str, label: &str, act: FactAct, enabled: bool, checked: bool) -> MenuRow {
+    MenuRow::Item {
+        glyph,
+        label: label.to_string(),
+        spoken: label.to_string(),
+        act: MenuAct::Fact(Fact::Path, act),
+        enabled,
+        checked,
+        trail: String::new(),
     }
 }
 
-#[test]
-fn under_an_agents_own_switch_the_menu_names_that_switch() {
-    use aterm_phase::Program;
-    for (agent, why) in [
-        (Program::Codex, "Enable codex-alab Autopilot is off"),
-        (Program::Claude, "Supervise Claude Code sessions is off"),
-        (Program::Muse, "Supervise Muse Code sessions is off"),
-    ] {
-        let view = AutopilotView::AgentOff(agent);
-        let mut f = facts(view);
-        f.land_at = offer(18, 0, None);
-        let rows = rows(&f);
-        assert_eq!(rows[1], MenuRow::note(why), "{agent:?}");
-        assert_eq!(
-            rows.iter()
-                .filter(|r| matches!(r, MenuRow::Note { .. }))
-                .count(),
-            1,
-            "{agent:?}"
-        );
-        for row in &rows {
-            if let MenuRow::Item {
-                act,
-                enabled,
-                checked,
-                ..
-            } = row
-            {
-                assert_eq!(*enabled, *act == MenuAct::Settings, "{agent:?} {act:?}");
-                assert!(!checked, "{agent:?} {act:?}");
-            }
-        }
+/// The longest label of [`card`]'s choices, as the card lays it.
+const LONGEST: &str = "+  New tab at the repository root";
+
+/// A card of every row kind the engine lays: a header, three choices (the first checked), a
+/// rule, three more, a rule and a last choice that is always live. With `live` off a note
+/// stands under the header and every choice but the last is disabled.
+fn card_titled(title: &str, name: Option<&str>, room: usize, live: bool) -> Vec<MenuRow> {
+    let mut out = header_rows(title, name, room);
+    if !live {
+        out.push(MenuRow::note("no working directory"));
     }
-    for view in [AutopilotView::MasterOff, AutopilotView::Unhosted] {
-        assert_eq!(
-            rows(&facts(view))[1],
-            MenuRow::note("harness off in Settings"),
-            "{view:?}"
-        );
-    }
+    out.extend([
+        choice("+", "New tab here", FactAct::NewTabHere, live, live),
+        choice("\u{29c9}", "Copy path", FactAct::CopyPath, live, false),
+        choice(
+            "\u{2387}",
+            "Copy branch name",
+            FactAct::CopyBranch,
+            live,
+            false,
+        ),
+        MenuRow::Rule,
+        choice(
+            "+",
+            "New tab at the repository root",
+            FactAct::NewTabAtRoot,
+            live,
+            false,
+        ),
+        choice(
+            "\u{25cb}",
+            "Hide folder",
+            FactAct::Hide(FactKind::Path),
+            live,
+            false,
+        ),
+        choice(
+            "\u{25cf}",
+            "Show branch",
+            FactAct::Show(FactKind::Branch),
+            live,
+            false,
+        ),
+        MenuRow::Rule,
+        choice(
+            "\u{2386}",
+            "Account settings\u{2026}",
+            FactAct::AccountSettings,
+            true,
+            false,
+        ),
+    ]);
+    out
+}
+
+fn card(live: bool) -> Vec<MenuRow> {
+    card_titled(
+        "Folder \u{b7} tab 3",
+        Some("fix the footer"),
+        MAX_CONTENT,
+        live,
+    )
 }
 
 #[test]
 fn rows_built_again_keep_their_places_and_a_row_that_left_leaves_a_gap() {
-    let armed = MenuFacts {
-        armed_at_ms: Some(1),
-        armed: offer(18, 36, None),
-        ..facts(AutopilotView::Cruise)
-    };
-    let shown = rows(&armed);
-    let fresh = rows(&facts(AutopilotView::Land));
-    let cancel = keys(&shown)
-        .iter()
-        .position(|k| k.as_deref() == Some("autopilot-menu/land-cancel"))
-        .expect("armed: the cancel");
+    let fresh = card(true);
+    let mut shown = fresh.clone();
+    let leaving = 8;
+    shown.insert(
+        leaving,
+        choice(
+            "\u{21ba}",
+            "Refresh usage",
+            FactAct::RefreshUsage,
+            true,
+            false,
+        ),
+    );
     let laid = keep_places(&shown, &fresh).expect("only a row left");
     assert_eq!(laid.len(), shown.len());
-    assert_eq!(laid[cancel], MenuRow::Gap(super::row_width(&shown[cancel])));
+    assert_eq!(
+        laid[leaving],
+        MenuRow::Gap(super::row_width(&shown[leaving]))
+    );
     for (i, (was, now)) in keys(&shown).iter().zip(keys(&laid)).enumerate() {
-        if i != cancel {
+        if i != leaving {
             assert_eq!(*was, now, "row {i} kept its place");
         }
     }
-    assert!(!laid[cancel].selectable());
+    assert!(!laid[leaving].selectable());
     assert_eq!(super::content_width(&laid), super::content_width(&shown));
     assert_eq!(
         place(&laid, (30, 4), (0..40, 0..120), (120, 40), 1),
         place(&shown, (30, 4), (0..40, 0..120), (120, 40), 1)
     );
     assert!(
-        (0..laid.len()).all(|from| step(&laid, Some(from), true) != Some(cancel)),
+        (0..laid.len()).all(|from| step(&laid, Some(from), true) != Some(leaving)),
         "the keys skip the gap"
     );
     assert_eq!(keep_places(&shown, &shown).as_deref(), Some(&shown[..]));
@@ -264,25 +142,29 @@ fn rows_built_again_keep_their_places_and_a_row_that_left_leaves_a_gap() {
 }
 
 #[test]
-fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above() {
-    let rows = rows(&facts(AutopilotView::Cruise));
+fn the_card_hangs_above_its_anchor_and_opens_down_only_where_fewer_rows_are_above() {
+    let rows = card(true);
     let h = rows.len() + 2;
     let rect = place(&rows, (30, 10), (0..40, 0..120), (120, 40), 1).unwrap();
     assert_eq!(
         (rect.row, rect.col, rect.h),
         (30 - h, 10, h),
-        "above, at the chip"
+        "above, at the anchor"
     );
-    assert!(rect.w >= "\u{221e}\u{2913} Cruise 4 hours, then land".chars().count());
+    assert!(rect.w >= LONGEST.chars().count());
     let right = place(&rows, (30, 115), (0..40, 0..120), (120, 40), 1).unwrap();
     assert_eq!(right.col + right.w, 120, "shifted left, whole");
     let low = place(&rows, (3, 10), (0..40, 0..120), (120, 40), 1).unwrap();
-    assert_eq!((low.row, low.h), (4, h), "fewer rows above: below the chip");
+    assert_eq!(
+        (low.row, low.h),
+        (4, h),
+        "fewer rows above: below the anchor"
+    );
     let middle = place(&rows, (10, 0), (0..20, 0..120), (120, 20), 1).unwrap();
     assert_eq!(
         (middle.row, middle.h),
         (1, h),
-        "neither side holds it: whole, over the chip's row"
+        "neither side holds it: whole, over the anchor's row"
     );
     let short = place(&rows, (6, 0), (0..10, 0..120), (120, 10), 1).unwrap();
     assert_eq!(
@@ -312,7 +194,7 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
     assert_eq!(
         (ruled.row, ruled.h),
         (1, 6),
-        "the modes, not the rule under them"
+        "the first choices, not the rule under them"
     );
     assert_eq!(
         place(&rows, (30, 0), (0..40, 0..3), (3, 40), 1),
@@ -329,7 +211,7 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
 
 #[test]
 fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
-    let rows = rows(&facts(AutopilotView::Cruise));
+    let rows = card(true);
     let want = rows.len() + 2;
     let top = place(&rows, (10, 4), (1..12, 0..100), (100, 30), 1).unwrap();
     assert_eq!((top.row, top.h), (1, 10), "its pane's rows, a prefix");
@@ -349,19 +231,24 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
     assert_eq!(
         (lower.row, lower.h),
         (16 - want, want),
-        "over the chip, from below"
+        "over the anchor, from below"
     );
     assert!(
         lower.row <= 5 && 5 < lower.row + lower.h,
-        "{lower:?} covers the chip"
+        "{lower:?} covers the anchor"
     );
     let lent = place(&rows, (28, 4), (25..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!((lent.row, lent.h), (28 - want, want), "lent the frame");
-    let named = |cols: usize| MenuFacts {
-        title: "Autopilot \u{b7} tab 1, right pane".to_string(),
-        name: Some("\u{2733} Claude Code".to_string()),
-        room: content_room(cols),
-        ..facts(AutopilotView::Cruise)
+    // A title of 29 cells: as wide as a pane of 31 leaves it, border to border.
+    const TITLE: &str = "Workspace \u{b7} tab 1, right pane";
+    assert_eq!(display_cells(TITLE), 29);
+    let named = |cols: usize| {
+        card_titled(
+            TITLE,
+            Some("\u{2733} Claude Code"),
+            content_room(cols),
+            true,
+        )
     };
     let theme = aterm_render::Theme {
         fg: 0x00E0_E0E0,
@@ -370,37 +257,29 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         selection: 0x0044_4466,
     };
     let text = |r: &[RenderCell]| r.iter().map(|c| c.ch).collect::<String>();
-    let tight = super::rows(&named(31));
+    let tight = named(31);
     let rect = place(&tight, (28, 40), (1..30, 33..64), (64, 30), 1).unwrap();
     assert_eq!((rect.col, rect.w), (33, 31), "as wide as its pane");
     let painted: Vec<String> = paint(rect, &tight, MenuViewport::default(), None, theme, None)
         .iter()
         .map(|r| text(r))
         .collect();
-    assert_eq!(
-        painted[1],
-        "\u{2502}Autopilot \u{b7} tab 1, right pane\u{2502}"
-    );
+    assert_eq!(painted[1], format!("\u{2502}{TITLE}\u{2502}"));
     assert!(
-        painted
-            .iter()
-            .any(|row| row.contains("\u{221e}\u{2913} Cruise 4 hours, then land")),
+        painted.iter().any(|row| row.contains("Copy branch name")),
         "{painted:#?}"
     );
-    let tighter = super::rows(&named(29));
+    let tighter = named(29);
     assert_eq!(
         tighter[..3],
         [
-            MenuRow::Header("Autopilot \u{b7} tab 1,".to_string()),
+            MenuRow::Header("Workspace \u{b7} tab 1,".to_string()),
             MenuRow::Header("right pane".to_string()),
             MenuRow::Name("\u{2733} Claude Code".to_string()),
         ]
     );
-    let wide = super::rows(&named(100));
-    assert_eq!(
-        wide[0],
-        MenuRow::Header("Autopilot \u{b7} tab 1, right pane".to_string())
-    );
+    let wide = named(100);
+    assert_eq!(wide[0], MenuRow::Header(TITLE.to_string()));
     let rect = place(&wide, (28, 40), (1..30, 0..100), (100, 30), 1).unwrap();
     let painted = paint(rect, &wide, MenuViewport::default(), None, theme, None);
     assert_eq!(text(&painted[1]).chars().nth(1), Some(' '), "padded");
@@ -408,7 +287,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
 
 #[test]
 fn the_hit_test_and_the_keys_land_only_on_live_choices() {
-    let rows = rows(&facts(AutopilotView::Cruise));
+    let rows = card(true);
     let rect = place(&rows, (30, 10), (0..40, 0..120), (120, 40), 1).unwrap();
     let at = |i: usize| {
         item_at(
@@ -420,7 +299,7 @@ fn the_hit_test_and_the_keys_land_only_on_live_choices() {
         )
     };
     assert_eq!(at(0), None, "the header");
-    assert_eq!(at(1), Some(1), "Cruise");
+    assert_eq!(at(1), Some(1), "the first choice");
     assert_eq!(at(4), None, "a rule");
     assert_eq!(
         item_at(rect, &rows, MenuViewport::default(), rect.row, rect.col + 3),
@@ -443,23 +322,26 @@ fn the_hit_test_and_the_keys_land_only_on_live_choices() {
     assert_eq!(step(&rows, Some(3), true), Some(5), "over the rule");
     assert_eq!(step(&rows, Some(n - 1), true), Some(1), "wraps");
     assert_eq!(step(&rows, Some(1), false), Some(n - 1), "wraps back");
-    let off = super::rows(&facts(AutopilotView::MasterOff));
-    let settings = off.len() - 1;
+    let off = card(false);
+    let last = off.len() - 1;
     assert_eq!(
         step(&off, None, true),
-        Some(settings),
-        "only Settings is live"
+        Some(last),
+        "only the last choice is live"
     );
-    assert_eq!(step(&off, Some(settings), true), Some(settings));
+    assert_eq!(step(&off, Some(last), true), Some(last));
     use aterm_types::keyboard::{Key, NamedKey as Nk};
     for (key, want) in [
         (Key::Named(Nk::ArrowUp), MenuKey::Up),
         (Key::Named(Nk::ArrowDown), MenuKey::Down),
+        (Key::Named(Nk::ArrowLeft), MenuKey::Left),
+        (Key::Named(Nk::ArrowRight), MenuKey::Right),
         (Key::Named(Nk::Enter), MenuKey::Choose),
+        (Key::Named(Nk::Space), MenuKey::Choose),
+        (Key::Character(' '), MenuKey::Choose),
         (Key::Named(Nk::Escape), MenuKey::Close),
         (Key::Named(Nk::ShiftLeft), MenuKey::Inert),
         (Key::Character('a'), MenuKey::PassThrough),
-        (Key::Character(' '), MenuKey::PassThrough),
         (Key::Named(Nk::Tab), MenuKey::PassThrough),
     ] {
         assert_eq!(key_of(&key), want, "{key:?}");
@@ -474,14 +356,14 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
         cursor: 0x00FF_FFFF,
         selection: 0x0044_4466,
     };
-    let rows = rows(&facts(AutopilotView::Cruise));
+    let rows = card(true);
     let rect = place(&rows, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
     let painted = paint(rect, &rows, MenuViewport::default(), Some(2), theme, None);
     assert_eq!(painted.len(), rect.h);
     assert!(painted.iter().all(|r| r.len() == rect.w));
     let text = |r: &[RenderCell]| r.iter().map(|c| c.ch).collect::<String>();
     assert!(
-        text(&painted[2]).contains("Cruise"),
+        text(&painted[2]).contains("New tab here"),
         "{}",
         text(&painted[2])
     );
@@ -491,92 +373,339 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
         "the check, flush right"
     );
     assert_ne!(painted[3][3].bg, painted[2][3].bg, "the highlight's ground");
-    let off = super::rows(&facts(AutopilotView::MasterOff));
+    let off = card(false);
     let rect = place(&off, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
     let painted = paint(rect, &off, MenuViewport::default(), None, theme, None);
-    let cruise = 1 + 2;
-    let settings = off.len();
+    let first = 1 + 2;
+    let last = off.len();
     assert_ne!(
-        painted[cruise][3].fg, painted[settings][3].fg,
+        painted[first][3].fg, painted[last][3].fg,
         "a disabled row reads as one"
     );
 }
 
+fn stop(label: &'static str, enabled: bool) -> Stop {
+    Stop {
+        label: label.to_string(),
+        act: MenuAct::Fact(Fact::Effort, FactAct::SetEffort(label)),
+        enabled,
+    }
+}
+
+/// A card of a note, a slider of `medium`, `high` and `xhigh` with its thumb on `at`, a rule
+/// and one choice.
+fn slider_card(at: Option<usize>, xhigh: bool) -> Vec<MenuRow> {
+    vec![
+        MenuRow::Header("Effort".to_string()),
+        MenuRow::note("effort high"),
+        MenuRow::stops(
+            "Effort",
+            [
+                stop("medium", true),
+                stop("high", true),
+                stop("xhigh", xhigh),
+            ],
+            at,
+        ),
+        MenuRow::Rule,
+        choice("", "Hide effort", FactAct::CopyPath, true, false),
+    ]
+}
+
+/// A SLIDER'S STOPS ARE LAID ONCE FOR THE PAINTER AND THE POINTER: the first stop at the row's
+/// left end and the last at its right, a press snapping to the stop whose cells hold it or the
+/// nearer of the two it lies between, and the keys stepping to the next stop that can be
+/// picked without wrapping at an end.
 #[test]
-fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
-    let with = |set_by: &str, room: usize| {
-        rows(&MenuFacts {
-            set_by: Some(set_by.to_string()),
-            room,
-            ..facts(AutopilotView::Off)
+fn a_sliders_stops_span_its_row_and_a_cell_snaps_to_the_nearer() {
+    let stops = [
+        stop("medium", true),
+        stop("high", true),
+        stop("xhigh", true),
+    ];
+    // `○ medium` 8 cells, `○ high` 6, `○ xhigh` 7: 21 of the 31, so two gaps of five.
+    let spans = stop_spans(&stops, 31);
+    assert_eq!(spans, [0..8, 13..19, 24..31]);
+    assert_eq!(
+        stop_spans(&stops, 32),
+        [0..8, 14..20, 25..32],
+        "the odd cell goes left"
+    );
+    let tight = stop_spans(&stops, 12);
+    assert_eq!(
+        tight,
+        [0..8, 9..12, 12..12],
+        "a narrow row keeps a cell between"
+    );
+    for (cell, want) in [
+        (0, 0),
+        (7, 0),
+        (10, 0),
+        (11, 1),
+        (13, 1),
+        (18, 1),
+        (21, 1),
+        (22, 2),
+        (30, 2),
+        (90, 2),
+    ] {
+        assert_eq!(stop_near(&spans, cell), Some(want), "cell {cell}");
+    }
+    assert_eq!(stop_near(&[], 3), None);
+    assert_eq!(stop_step(&stops, Some(0), true), Some(1));
+    assert_eq!(
+        stop_step(&stops, Some(2), true),
+        None,
+        "the high end does not wrap"
+    );
+    assert_eq!(stop_step(&stops, Some(0), false), None, "nor the low end");
+    assert_eq!(
+        stop_step(&stops, None, true),
+        Some(0),
+        "from no stop, the low end"
+    );
+    assert_eq!(stop_step(&stops, None, false), Some(2));
+    let gated = [
+        stop("medium", true),
+        stop("high", false),
+        stop("xhigh", true),
+    ];
+    assert_eq!(
+        stop_step(&gated, Some(0), true),
+        Some(2),
+        "over a stop not offered"
+    );
+    assert_eq!(stop_step(&gated, Some(2), false), Some(0));
+
+    let rows = slider_card(Some(1), true);
+    let rect = place(&rows, (30, 10), (0..40, 0..120), (120, 40), 1).unwrap();
+    let (text_start, text_end) = super::text_span(rect.w, &rows);
+    let spans = stop_spans(&stops, text_end - text_start);
+    let slider = rect.row + 1 + 2;
+    let hit = |row, col| hit_at(rect, &rows, MenuViewport::default(), row, col);
+    for (j, span) in spans.iter().enumerate() {
+        assert_eq!(
+            hit(slider, rect.col + text_start + span.start),
+            Some((2, Some(j))),
+            "stop {j}'s mark"
+        );
+        assert_eq!(
+            hit(slider, rect.col + text_start + span.end - 1),
+            Some((2, Some(j)))
+        );
+    }
+    assert_eq!(
+        hit(slider, rect.col),
+        Some((2, Some(0))),
+        "the border snaps to the end"
+    );
+    assert_eq!(
+        hit(slider + 2, rect.col + 3),
+        Some((4, None)),
+        "a choice has no stop"
+    );
+    assert_eq!(hit(slider - 1, rect.col + 3), None, "the note");
+    assert_eq!(hit(slider + 1, rect.col + 3), None, "the rule");
+    let none = slider_card(Some(0), false);
+    let off: Vec<MenuRow> = none
+        .iter()
+        .map(|row| match row {
+            MenuRow::Stops {
+                name, stops, at, ..
+            } => MenuRow::stops(
+                name.clone(),
+                stops
+                    .iter()
+                    .map(|s| Stop {
+                        enabled: false,
+                        ..s.clone()
+                    })
+                    .collect::<Vec<_>>(),
+                *at,
+            ),
+            row => row.clone(),
         })
+        .collect();
+    assert!(none[2].selectable(), "one stop to pick is a row to choose");
+    assert!(!off[2].selectable(), "none is not");
+    assert_eq!(
+        step(&off, None, true),
+        Some(4),
+        "the keys pass a slider with no stop"
+    );
+}
+
+/// THE SLIDER IS DRAWN AS ITS STOPS: a filled mark and bold word where the thumb stands, a
+/// hollow mark at every other stop, the track between them, the rested stop alone on the
+/// highlight's ground and a stop not offered in the disabled ink. Control: with the row not
+/// selected nothing stands on the highlight's ground.
+#[test]
+fn the_slider_paints_its_thumb_its_track_and_its_rested_stop() {
+    let theme = aterm_render::Theme {
+        fg: 0x00E0_E0E0,
+        bg: 0x0018_1818,
+        cursor: 0x00FF_FFFF,
+        selection: 0x0044_4466,
     };
-    let notes = |rows: &[MenuRow]| -> Vec<String> {
-        rows.iter()
-            .filter_map(|r| match r {
-                MenuRow::SetBy { text, .. } => Some(text.clone()),
-                _ => None,
-            })
+    let mut rows = slider_card(Some(1), false);
+    let rect = place(&rows, (30, 10), (0..40, 0..120), (120, 40), 1).unwrap();
+    let (text_start, text_end) = super::text_span(rect.w, &rows);
+    let MenuRow::Stops { stops, focus, .. } = &mut rows[2] else {
+        panic!("the slider");
+    };
+    *focus = Some(0);
+    let spans = stop_spans(stops, text_end - text_start);
+    let painted = paint(rect, &rows, MenuViewport::default(), Some(2), theme, None);
+    let line = &painted[1 + 2];
+    assert_eq!(line.len(), rect.w);
+    let at = |j: usize| &line[text_start + spans[j].start];
+    assert_eq!(
+        (at(0).ch, at(1).ch, at(2).ch),
+        ('\u{25cb}', '\u{25cf}', '\u{25cb}'),
+        "the thumb is the filled mark"
+    );
+    let word = |j: usize| -> String {
+        spans[j]
+            .clone()
+            .map(|col| line[text_start + col].ch)
             .collect()
     };
-    let plain = rows(&facts(AutopilotView::Off));
-    let noted = with("set 14:05 over aterm ctl", MAX_CONTENT);
-    assert_eq!(notes(&plain), Vec::<String>::new(), "no setter, no note");
     assert_eq!(
-        noted[1],
-        MenuRow::SetBy {
-            text: "set 14:05 over aterm ctl".into(),
-            floor: 0
-        },
-        "under the header"
+        [word(0), word(1), word(2)],
+        ["\u{25cb} medium", "\u{25cf} high", "\u{25cb} xhigh"]
     );
-    assert_eq!(noted.len(), plain.len() + 1);
-    assert_eq!(keys(&noted[2..]), keys(&plain[1..]), "every choice kept");
-    assert!(!noted[1].selectable());
+    assert!(at(1).bold && !at(0).bold, "the thumb's word is bold");
+    let card_bg = line[text_start + spans[0].end].bg;
+    assert_ne!(at(0).bg, card_bg, "the rested stop stands on the highlight");
+    assert_eq!(at(1).bg, card_bg, "the thumb's own stop does not");
+    assert_ne!(at(2).fg, at(1).fg, "a stop not offered reads as one");
+    let track: String = (spans[0].end..spans[1].start)
+        .map(|col| line[text_start + col].ch)
+        .collect();
     assert_eq!(
-        step(&noted, None, true),
-        Some(2),
-        "the first choice is lit, never the note"
+        track
+            .trim_matches(' ')
+            .chars()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ['\u{2500}'].into(),
+        "the track between two stops: {track:?}"
     );
-    let bulk = "set 14:05 from Settings \u{25b8} Harness, every session";
-    assert!(display_cells(bulk) > MAX_CONTENT);
-    assert_eq!(
-        notes(&with(bulk, MAX_CONTENT)),
-        ["set 14:05 from Settings \u{25b8} Harness,", "every session"]
-    );
-    assert_eq!(notes(&with(bulk, 24)), Vec::<String>::new());
-    assert_eq!(
-        notes(&with("set 14:05 over aterm ctl", 20)),
-        Vec::<String>::new()
-    );
-
-    let fit = |frame_rows: usize, chip_row: usize| {
-        let pane = (0..frame_rows, 0..120);
-        let fitted = fit_rows(
-            noted.clone(),
-            (chip_row, 4),
-            pane.clone(),
-            (120, frame_rows),
-            1,
-        );
-        let rect = place(&fitted, (chip_row, 4), pane, (120, frame_rows), 1).expect("a card");
-        (fitted, rect)
-    };
-    let (kept, rect) = fit(24, 23);
-    assert_eq!(kept, noted, "room for it: kept");
-    assert_eq!(rect.h, noted.len() + 2, "whole");
-    assert!(rect.row + rect.h <= 23, "above its chip");
-    let (fitted, rect) = fit(15, 13);
-    assert_eq!(fitted, plain, "the note gave way");
-    assert_eq!(rect.h, plain.len() + 2, "every choice whole");
-    assert!(rect.row + rect.h <= 13, "still above its chip");
-    let (fitted, rect) = fit(13, 12);
-    assert_eq!(fitted, plain);
-    assert_eq!(rect.h, plain.len() + 2, "whole");
-    let cut = place(&noted, (12, 4), (0..13, 0..120), (120, 13), 1).expect("a card");
+    let unlit = paint(rect, &rows, MenuViewport::default(), Some(4), theme, None);
     assert!(
-        cut.h < noted.len() + 2,
-        "CONTROL: with the note this pane shows a prefix ({cut:?})"
+        unlit[1 + 2][1..rect.w - 1].iter().all(|c| c.bg == card_bg),
+        "control: no rest is drawn on a row the highlight left"
+    );
+}
+
+/// WHERE THE KEYS REST ON A SLIDER IS THE CARD'S, NOT THE ROW'S IDENTITY: a row whose rest
+/// moved is the same row to a reader (its `Hash`), the same choice and the same place, so
+/// rebuilt rows keep the highlight and their layout; a thumb that moved is the same place and
+/// a new reader identity.
+#[test]
+fn a_sliders_rest_is_no_part_of_what_the_row_is() {
+    use std::hash::{Hash, Hasher};
+    let id = |row: &MenuRow| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        row.hash(&mut h);
+        h.finish()
+    };
+    let shown = slider_card(Some(1), true);
+    let mut rested = shown.clone();
+    let MenuRow::Stops { focus, .. } = &mut rested[2] else {
+        panic!("the slider");
+    };
+    *focus = Some(2);
+    assert_eq!(
+        id(&shown[2]),
+        id(&rested[2]),
+        "a rest moves no reader identity"
+    );
+    assert!(super::same_choice(&shown[2], &rested[2]));
+    assert_eq!(rested[2].rested_stop(), Some(2));
+    assert_eq!(
+        shown[2].rested_stop(),
+        Some(1),
+        "with no rest, the thumb's stop"
+    );
+    let moved = slider_card(Some(2), true);
+    assert_ne!(id(&shown[2]), id(&moved[2]), "the thumb's stop is said");
+    assert!(
+        super::same_choice(&shown[2], &moved[2]),
+        "and is the same slider"
+    );
+    assert_eq!(
+        keep_places(&shown, &moved).as_deref(),
+        Some(&moved[..]),
+        "a thumb that moved moves no row"
+    );
+    assert_eq!(super::row_width(&shown[2]), super::row_width(&moved[2]));
+    let gated = slider_card(Some(1), false);
+    assert!(
+        !super::same_choice(&shown[2], &gated[2]),
+        "a slider whose stops changed is another choice"
+    );
+    assert_eq!(slider_card(None, true)[2].rested_stop(), None);
+}
+
+/// The fact the engine's window tests hang their card from: the model's, in a session that is
+/// no Claude Code, whose card hides and shows facts and types nothing.
+const FACT: Fact = Fact::Model;
+/// The facts hidden before those tests open the model's card, so it is three choices a test
+/// can tell apart by the session's mask alone, one row after another.
+const BASE: FactMask = FactMask::PATH.with(FactKind::Branch, true);
+const HIDE: &str = "fact-menu/model/hide/model";
+const SHOW_FOLDER: &str = "fact-menu/model/show/path";
+const SHOW_BRANCH: &str = "fact-menu/model/show/branch";
+
+/// The session's mask once the choice `key` of the card is taken from [`BASE`].
+fn taken(key: &str) -> FactMask {
+    match key {
+        HIDE => BASE.with(FactKind::Model, true),
+        SHOW_FOLDER => BASE.with(FactKind::Path, false),
+        SHOW_BRANCH => BASE.with(FactKind::Branch, false),
+        other => panic!("{other} moves no mask"),
+    }
+}
+
+/// The mask row `i` of `rows` leaves the session with, taken from [`BASE`]; `None` for a row
+/// that is no hide or show choice.
+fn mask_of(rows: &[MenuRow], i: usize) -> Option<FactMask> {
+    match rows.get(i)? {
+        MenuRow::Item {
+            act: MenuAct::Fact(_, FactAct::Hide(kind)),
+            enabled: true,
+            ..
+        } => Some(BASE.with(*kind, true)),
+        MenuRow::Item {
+            act: MenuAct::Fact(_, FactAct::Show(kind)),
+            enabled: true,
+            ..
+        } => Some(BASE.with(*kind, false)),
+        _ => None,
+    }
+}
+
+fn publish(app: &App, session: u64) {
+    let entry = app.pool.get(session).expect("session");
+    let mut timeline = entry.ctx.timeline.lock().unwrap();
+    timeline.note_foreground_group(4242);
+    assert!(timeline.set_claude_footer(
+        4242,
+        None,
+        Some(FooterFacts {
+            model: Some("Opus 5.5".into()),
+            effort: Some("xhigh".into()),
+            path: Some("~/aterm".into()),
+            branch: Some("main".into()),
+            ..FooterFacts::default()
+        }),
+    ));
+    timeline.set_claude_side(
+        4242,
+        Some(std::sync::Arc::new(crate::claude_footer::FactSide::at(
+            Some("/Users//someone/aterm".into()),
+            Some("/Users//someone".into()),
+        ))),
     );
 }
 
@@ -590,31 +719,10 @@ fn claude_app() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
         std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
     );
     app.harness = Some(host.clone());
-    {
-        let entry = app.pool.get(session).expect("session");
-        let mut timeline = entry.ctx.timeline.lock().unwrap();
-        timeline.note_foreground_group(4242);
-        assert!(timeline.set_claude_footer(
-            4242,
-            None,
-            Some(FooterFacts {
-                model: Some("Opus 5.5".into()),
-                effort: Some("xhigh".into()),
-                path: Some("~/aterm".into()),
-                branch: Some("main".into()),
-                ..FooterFacts::default()
-            }),
-        ));
-    }
+    publish(&app, session);
+    app.set_fact_mask(session, BASE);
     draw_composer(&app, session);
     (app, wid, session, host)
-}
-
-/// Name [`claude_app`]'s foreground group's program Claude Code.
-fn claude_named(app: &App, session: u64) {
-    let entry = app.pool.get(session).expect("session");
-    let mut timeline = entry.ctx.timeline.lock().unwrap();
-    timeline.set_program(4242, Some("claude".into()));
 }
 
 fn feed(app: &App, session: u64, bytes: &[u8]) {
@@ -671,21 +779,86 @@ fn row_text(app: &App, wid: WindowId, row: usize) -> String {
         .collect()
 }
 
+/// The window pixel at the centre of frame cell `(row, col)`.
+fn cell_centre(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
+    let (cw, ch) = app.win_cell_size(wid);
+    let (cw, ch) = (cw.max(1), ch.max(1));
+    let pad = app.win_pad(wid);
+    let top = app.win_pad_top(wid) + app.win_head(wid);
+    let (ox, oy) = app.frame_origin(wid);
+    (
+        ox as f64 + (pad + col * cw) as f64 + cw as f64 / 2.0,
+        oy as f64 + (top + row * ch) as f64 + ch as f64 / 2.0,
+    )
+}
+
+/// Open the folder's card as a key does: its first choice lit.
+fn open_card(app: &mut App) {
+    app.open_front_fact_menu(FACT)
+        .expect("the folder is on the glass");
+}
+
+/// Open the folder's card as a pointer does, hung over the pane's left where the facts' own
+/// column (against the pane's right edge) leaves no room beside the card: no choice lit.
+fn open_card_at_the_left(app: &mut App, wid: WindowId, session: u64, keyboard: bool) {
+    let (row, _) = app
+        .fact_anchor(wid, session, FACT)
+        .expect("the folder is on the glass");
+    app.open_fact_menu(wid, session, FACT, (row, 2), keyboard);
+}
+
+/// Open the folder's card as a pointer does: no choice lit.
+fn open_card_by_pointer(app: &mut App, wid: WindowId, session: u64) {
+    let anchor = app
+        .fact_anchor(wid, session, FACT)
+        .expect("the folder is on the glass");
+    app.open_fact_menu(wid, session, FACT, anchor, false);
+}
+
+/// The open card's rows built again as `edit` leaves them: what a session's facts moving under
+/// an open card does ([`AutopilotMenu::refresh_rows`]).
+fn relay(app: &mut App, wid: WindowId, edit: impl FnOnce(&mut Vec<MenuRow>)) {
+    let menu = app.autopilot_menu.as_mut().expect("open");
+    let mut fresh: Vec<MenuRow> = menu
+        .rows
+        .iter()
+        .filter(|row| !matches!(row, MenuRow::Gap(_)))
+        .cloned()
+        .collect();
+    edit(&mut fresh);
+    let spoken = menu.spoken.clone();
+    assert!(menu.refresh_rows(fresh, spoken), "the rows moved");
+    app.request_menu_frame(wid);
+}
+
+fn row_of(app: &App, key: &str) -> Option<usize> {
+    app.autopilot_menu.as_ref().and_then(|menu| {
+        menu.rows
+            .iter()
+            .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
+    })
+}
+
+struct MenuTestHost(crate::harness_host::HostHandle);
+
+impl Drop for MenuTestHost {
+    fn drop(&mut self) {
+        self.0.shutdown_and_join();
+    }
+}
+
 #[test]
-fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
+fn the_card_opens_from_its_fact_steps_and_closes_with_it() {
     let (mut app, wid, session, host) = claude_app();
-    let mono = Instant::now();
-    let wall = 1_792_177_200_000_i64;
-    crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
+    let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    assert_eq!(app.autopilot_menu_controls(), ["autopilot-menu open=false"]);
+    assert_eq!(app.fact_menu_controls(), ["fact-menu open=false"]);
     assert_eq!(
         super::fingerprint(app.autopilot_menu.as_ref(), wid),
         0,
         "0 at rest"
     );
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
+    open_card(&mut app);
     let anchor = app.autopilot_menu.as_ref().unwrap().anchor;
     let open_fp = super::fingerprint(app.autopilot_menu.as_ref(), wid);
     assert_ne!(open_fp, 0, "the open repaints");
@@ -695,25 +868,26 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
         .as_ref()
         .and_then(|m| m.rect)
         .expect("painted");
-    assert_eq!(
-        (rect.row + rect.h, rect.col),
-        anchor,
-        "hung above the chip, at its column"
-    );
-    assert!(row_text(&app, wid, rect.row + 2).contains("Cruise"));
-    frame(&mut app, wid);
-    assert!(app.autopilot_menu.is_some(), "the chip is there: it stays");
-    let lines = app.autopilot_menu_controls();
+    assert_eq!(rect.row + rect.h, anchor.0, "hung above the fact");
     assert!(
-        lines[0].starts_with("autopilot-menu open=true session=s-"),
+        (rect.col..rect.col + rect.w).contains(&anchor.1),
+        "over the fact's column, kept inside the pane: {rect:?}, {anchor:?}"
+    );
+    assert!(row_text(&app, wid, rect.row + 2).contains("Opus 5.5"));
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some(), "the fact is there: it stays");
+    let lines = app.fact_menu_controls();
+    assert!(
+        lines[0].starts_with("fact-menu open=true session=s-"),
         "{lines:?}"
     );
     assert!(
         lines.iter().any(|l| l
-            .contains("key=autopilot-menu/mode/cruise enabled=true checked=true selected=true")),
+            .contains("key=fact-menu/model/hide/model enabled=true checked=false selected=true")),
         "{lines:?}"
     );
-    for _ in 0..4 {
+    let hide = row_of(&app, HIDE).expect("the hide row");
+    while app.autopilot_menu.as_ref().unwrap().highlight != Some(hide + 1) {
         assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
     }
     assert_ne!(
@@ -724,26 +898,11 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     assert!(app.autopilot_menu_nav(wid, MenuKey::Up));
     assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
     assert!(app.autopilot_menu.is_none(), "chosen and closed");
-    let land_at = app
-        .pool
-        .get(session)
-        .unwrap()
-        .ctx
-        .meta
-        .lock()
-        .unwrap()
-        .land_at;
-    assert_eq!(land_at, Some(wall + 3_600_000), "Cruise 1 hour, then land");
-    assert!(app.chip_glass(session).land_at.is_some());
+    assert_eq!(app.fact_mask(session), taken(HIDE), "Hide model");
+    app.set_fact_mask(session, BASE);
 
     frame(&mut app, wid);
-    let (x, y) = app.frame_cell_centre(wid, anchor);
-    assert!(app.open_autopilot_menu_at(wid, x, y));
-    assert!(
-        app.autopilot_menu_controls()
-            .iter()
-            .any(|l| l.contains("key=autopilot-menu/land-cancel enabled=true")),
-    );
+    open_card_by_pointer(&mut app, wid, session);
     assert_eq!(
         app.autopilot_menu.as_ref().unwrap().highlight,
         None,
@@ -753,18 +912,18 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     assert!(app.autopilot_menu.is_none());
     assert!(!app.autopilot_menu_nav(wid, MenuKey::Close), "nothing open");
 
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     assert!(!app.autopilot_menu_nav(wid, MenuKey::PassThrough));
     assert!(app.autopilot_menu.is_none());
 
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_some(), "the same focus: it stays");
     app.autopilot_menu.as_mut().unwrap().focus = Some(session + 1);
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_none(), "the focus moved: closed");
 
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_some());
     feed(
@@ -774,228 +933,51 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
             .as_bytes(),
     );
     frame(&mut app, wid);
-    assert!(app.autopilot_menu.is_none(), "closed with its chip");
+    assert!(app.autopilot_menu.is_none(), "closed with its fact");
     assert_eq!(super::fingerprint(app.autopilot_menu.as_ref(), wid), 0);
-    crate::autopilot_timers::set_fake_clocks(None);
-    host.shutdown_and_join();
 }
 
 #[test]
-fn a_controller_focus_out_closes_the_menu_as_the_os_edge_does() {
+fn a_controller_focus_out_closes_the_card_as_the_os_edge_does() {
     let (mut app, wid, _session, host) = claude_app();
-    crate::autopilot_timers::set_fake_clocks(None);
+    let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
+    open_card(&mut app);
     app.on_focus(wid, true);
     assert!(app.autopilot_menu.is_some(), "the same focus: it stays");
     app.on_focus(wid, false);
     assert!(app.autopilot_menu.is_none(), "focus out: closed");
-    host.shutdown_and_join();
 }
 
 #[test]
-fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
+fn a_controllers_keys_step_and_choose_on_the_open_card() {
     let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    crate::autopilot_timers::set_fake_clocks(None);
-    assert!(app.choose_autopilot_timer(
-        session,
-        crate::autopilot_timers::TimerChoice::In(120),
-        crate::autopilot::Surface::Menu
-    ));
+    open_card(&mut app);
     frame(&mut app, wid);
-    let press_row = |app: &mut App, key: &str| {
-        let menu = app.autopilot_menu.as_ref().unwrap();
-        let rect = menu.rect.unwrap();
-        let i = menu
-            .rows
-            .iter()
-            .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
-            .unwrap();
-        let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y, Instant::now())
+    let key = |name: aterm_types::keyboard::NamedKey| crate::input::InputEvent::Key {
+        key: aterm_types::keyboard::Key::Named(name),
+        mods: aterm_types::keyboard::Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: aterm_types::keyboard::KeyEventType::Press,
     };
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    let rect = app.autopilot_menu.as_ref().unwrap().rect.unwrap();
-    let (x, y) = app.frame_cell_centre(wid, (rect.row + 1, rect.col + 3));
-    assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
-    assert!(app.autopilot_menu.is_some());
-    assert!(press_row(&mut app, "autopilot-menu/mode/off"));
-    assert!(app.autopilot_menu.is_none());
-    let meta = app
-        .pool
-        .get(session)
-        .unwrap()
-        .ctx
-        .meta
-        .lock()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        (meta.autopilot.as_deref(), meta.land_at),
-        (Some("off"), None)
-    );
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    let (x, y) = app.frame_cell_centre(wid, (0, 0));
-    assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
-    assert!(app.autopilot_menu.is_none());
-    // Claude Code's top rule carries the switch, so its pane is left bare under the switch off
-    // (`App::pane_bare`; a program the timeline does not name keeps its `⊘ off` chip).
-    claude_named(&app, session);
-    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
-    );
-    frame(&mut app, wid);
-    assert!(
-        app.open_front_autopilot_menu().is_err(),
-        "under the switch off no chip stands, and no menu opens from one"
-    );
-    assert!(app.autopilot_menu.is_none());
-    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-        crate::app_config::HarnessPolicy::read("[harness]\n"),
-    );
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    assert!(press_row(&mut app, "autopilot-menu/settings"));
-    assert!(app.autopilot_menu.is_none());
-    host.shutdown_and_join();
-}
-
-#[test]
-fn the_land_at_row_names_the_day_it_would_arm_as_the_state_line_does() {
-    let (mut app, wid, session, host) = claude_app();
-    let zone = crate::autopilot_timers::local_offset_at;
-    let fri = 1_792_177_200_i64;
-    let off = zone(fri).expect("the zone reads");
-    let day = (fri + off).div_euclid(86_400);
-    let now = day * 86_400 + 18 * 3_600 + 49 * 60 - off;
-    assert_eq!(zone(now), Some(off), "no clock change between");
-    crate::autopilot_timers::set_fake_clocks(Some((Instant::now(), now * 1000)));
-    let tomorrow = Weekday::of_days(day + 1).short();
-    let press_row = |app: &mut App, key: &str| {
-        let menu = app.autopilot_menu.as_ref().unwrap();
-        let rect = menu.rect.unwrap();
-        let i = menu
-            .rows
-            .iter()
-            .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
-            .unwrap();
-        let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y, Instant::now())
-    };
-    for (land_at, words, other_day) in [
-        ("18:36", format!("{tomorrow} 18:36"), true),
-        ("18:55", "18:55".to_string(), false),
-    ] {
-        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-            crate::app_config::HarnessPolicy::read(&format!(
-                "[harness]\nland_at = \"{land_at}\"\n"
-            )),
+    let hide = row_of(&app, HIDE).expect("the hide row");
+    while app.autopilot_menu.as_ref().unwrap().highlight != Some(hide) {
+        assert!(
+            app.autopilot_menu_input_event(wid, &key(aterm_types::keyboard::NamedKey::ArrowDown))
         );
-        frame(&mut app, wid);
-        app.open_front_autopilot_menu()
-            .expect("the chip is on the glass");
-        frame(&mut app, wid);
-        let row = format!(
-            "key=autopilot-menu/land-at enabled=true checked=false selected=false \
-             text=\"\u{221e}\u{2913} Cruise until {words}, then land\""
-        );
-        let lines = app.autopilot_menu_controls();
-        assert!(lines.iter().any(|l| l.ends_with(&row)), "{row}\n{lines:?}");
-        assert!(press_row(&mut app, "autopilot-menu/land-at"));
-        assert!(app.autopilot_menu.is_none(), "chosen and closed");
-        let armed = app.chip_glass(session).land_at.expect("armed");
-        assert_eq!(super::when(armed), words, "the state line's words");
-        assert_eq!(armed.other_day.is_some(), other_day);
     }
-    crate::autopilot_timers::set_fake_clocks(None);
-    host.shutdown_and_join();
+    assert!(app.autopilot_menu_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter)));
+    assert!(app.autopilot_menu.is_none());
+    assert_eq!(app.fact_mask(session), taken(HIDE), "Hide model");
 }
 
 #[test]
-fn a_menu_held_open_across_the_minute_names_the_day_from_then_on() {
-    let (mut app, wid, _session, host) = claude_app();
-    let zone = crate::autopilot_timers::local_offset_at;
-    let fri = 1_792_177_200_i64;
-    let off = zone(fri).expect("the zone reads");
-    let day = (fri + off).div_euclid(86_400);
-    let local = |days: i64, hh: i64, mm: i64| (days * 86_400 + hh * 3_600 + mm * 60 - off) * 1000;
-    let opened = local(day, 18, 30);
-    assert_eq!(
-        zone(local(day + 1, 18, 36) / 1000),
-        Some(off),
-        "no clock change between"
-    );
-    let t0 = Instant::now();
-    let mono = |wall: i64| {
-        t0 + std::time::Duration::from_millis(u64::try_from(wall - opened).expect("ahead"))
-    };
-    let clocks = |wall: i64| crate::autopilot_timers::set_fake_clocks(Some((mono(wall), wall)));
-    clocks(opened);
-    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-        crate::app_config::HarnessPolicy::read("[harness]\nland_at = \"18:36\"\n"),
-    );
-    let row = |app: &App| {
-        app.autopilot_menu_controls()
-            .into_iter()
-            .find(|l| l.contains("key=autopilot-menu/land-at"))
-            .expect("the land_at row")
-    };
-    let says = |words: &str| format!("text=\"\u{221e}\u{2913} Cruise until {words}, then land\"");
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
-    frame(&mut app, wid);
-    assert!(row(&app).ends_with(&says("18:36")), "{}", row(&app));
-    assert_eq!(
-        app.autopilot_offer_deadline(),
-        Some(mono(local(day, 18, 36))),
-        "one wake, at 18:36"
-    );
-
-    clocks(local(day, 18, 36) - 1);
-    app.expire_autopilot_offer();
-    assert!(row(&app).ends_with(&says("18:36")), "short of the turn");
-
-    clocks(local(day, 18, 36));
-    app.expire_autopilot_offer();
-    frame(&mut app, wid);
-    let sat = Weekday::of_days(day + 1).short();
-    assert!(
-        row(&app).ends_with(&says(&format!("{sat} 18:36"))),
-        "{}",
-        row(&app)
-    );
-    assert_eq!(
-        app.autopilot_offer_deadline(),
-        Some(mono(local(day + 1, 0, 0))),
-        "then midnight"
-    );
-
-    clocks(local(day + 1, 0, 0));
-    app.expire_autopilot_offer();
-    frame(&mut app, wid);
-    assert!(row(&app).ends_with(&says("18:36")), "{}", row(&app));
-
-    assert!(app.close_autopilot_menu());
-    assert_eq!(
-        app.autopilot_offer_deadline(),
-        None,
-        "no wake for a closed menu"
-    );
-    app.expire_autopilot_offer();
-    assert_eq!(app.autopilot_timers.offer_due(), None, "the note dropped");
-    crate::autopilot_timers::set_fake_clocks(None);
-    host.shutdown_and_join();
-}
-
-#[test]
-fn the_menus_name_drops_the_agents_spinner_frame() {
+fn the_cards_name_drops_the_agents_spinner_frame() {
     let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
     frame(&mut app, wid);
     for (title, name) in [
         (
@@ -1014,12 +996,11 @@ fn the_menus_name_drops_the_agents_spinner_frame() {
             .lock()
             .unwrap()
             .process(format!("\x1b]2;{title}\x07").as_bytes());
-        app.open_front_autopilot_menu()
-            .expect("the chip is on the glass");
+        open_card(&mut app);
         let labels: Vec<String> = app
-            .autopilot_menu_controls()
+            .fact_menu_controls()
             .into_iter()
-            .filter(|l| l.starts_with("autopilot-menu label"))
+            .filter(|l| l.starts_with("fact-menu label"))
             .collect();
         assert!(
             labels
@@ -1030,370 +1011,15 @@ fn the_menus_name_drops_the_agents_spinner_frame() {
         );
         assert!(app.autopilot_menu_nav(wid, MenuKey::Close));
     }
-    host.shutdown_and_join();
 }
 
-/// A synthetic winit key press and release, as a person types it.
-#[cfg(target_os = "macos")]
-fn tap(
-    app: &mut App,
-    wid: WindowId,
-    key: aterm_window::keyboard::Key,
-    code: aterm_window::keyboard::KeyCode,
-    text: Option<&str>,
-) {
-    use aterm_window::event::ElementState;
-    use aterm_window::keyboard::{KeyLocation, PhysicalKey, SmolStr};
-    for state in [ElementState::Pressed, ElementState::Released] {
-        app.on_key(
-            wid,
-            aterm_window::event::KeyEvent::synthetic_for_test(
-                PhysicalKey::Code(code),
-                key.clone(),
-                text.map(SmolStr::new),
-                KeyLocation::Standard,
-                state,
-                false,
-            ),
-        );
-    }
-}
-
-fn chip_cell(app: &App, wid: WindowId, session: u64) -> (usize, usize) {
-    let ws = &app.windows[&wid];
-    (0..ws.input_scratch.cells.len())
-        .flat_map(|row| (0..ws.input_scratch.cols).map(move |col| (row, col)))
-        .find(|&cell| app.shows_autopilot_chip(wid, session, cell))
-        .expect("the Autopilot chip is on the glass")
-}
-
-#[test]
-fn the_pointer_opens_the_menu_from_the_chip_and_chooses_a_row() {
-    use aterm_window::event::{ElementState, MouseButton};
-    let (mut app, wid, session, host) = claude_app();
-    frame(&mut app, wid);
-    let chip = chip_cell(&app, wid, session);
-    let (x, y) = app.frame_cell_centre(wid, chip);
-    let word = |app: &App| {
-        app.pool
-            .get(session)
-            .unwrap()
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .autopilot
-            .clone()
-    };
-    app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
-    let menu = app.autopilot_menu.as_ref().expect("a right press opens it");
-    assert_eq!(
-        (menu.session, menu.anchor, menu.highlight),
-        (session, chip, None)
-    );
-    assert_eq!(word(&app), None, "the right press cycles nothing");
-    frame(&mut app, wid);
-    let rect = app.autopilot_menu.as_ref().unwrap().rect.expect("painted");
-    let off_row = rect.row + 1 + 3;
-    let (ox, oy) = app.frame_cell_centre(wid, (off_row, rect.col + 3));
-    app.on_cursor_moved(wid, ox, oy);
-    assert_eq!(
-        app.autopilot_menu.as_ref().unwrap().highlight,
-        Some(3),
-        "Off lit"
-    );
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-    assert!(app.autopilot_menu.is_none(), "chosen and closed");
-    assert_eq!(word(&app).as_deref(), Some("off"));
-    frame(&mut app, wid);
-    let chip = chip_cell(&app, wid, session);
-    let (x, y) = app.frame_cell_centre(wid, chip);
-    app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
-    assert!(app.autopilot_menu.is_some());
-    frame(&mut app, wid);
-    app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-    assert!(
-        app.autopilot_menu.is_none(),
-        "a press off the card closes it"
-    );
-    assert_eq!(word(&app).as_deref(), Some("off"), "and is spent on that");
-    frame(&mut app, wid);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-    assert!(app.autopilot_menu.is_none(), "a click opens no menu");
-    assert_eq!(word(&app).as_deref(), Some("cruise"), "off → cruise");
-    host.shutdown_and_join();
-}
-
-/// THE KEYBOARD (macOS: `ctrl+shift+tab` selects the chips): with the
-/// Autopilot chip selected, `↓` opens the menu, its first choice lit; `↓`
-/// steps, Return chooses; shift+F10 opens it too; Esc closes it; a key it
-/// does not own closes it and goes on to the pane.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_keyboard_opens_the_menu_from_the_selected_chip() {
-    use aterm_window::keyboard::{Key, KeyCode, ModifiersState, NamedKey};
-    let (mut app, wid, session, host) = claude_app();
-    frame(&mut app, wid);
-    let down = |app: &mut App| {
-        tap(
-            app,
-            wid,
-            Key::Named(NamedKey::ArrowDown),
-            KeyCode::ArrowDown,
-            None,
-        );
-    };
-    down(&mut app);
-    assert!(app.autopilot_menu.is_none(), "no chip selected: no menu");
-    let select = |app: &mut App| {
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        tap(
-            app,
-            wid,
-            Key::Named(NamedKey::Tab),
-            KeyCode::Tab,
-            Some("\t"),
-        );
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-    };
-    select(&mut app);
-    frame(&mut app, wid);
-    down(&mut app);
-    let menu = app.autopilot_menu.as_ref().expect("↓ opens it");
-    assert_eq!(
-        (menu.session, menu.highlight),
-        (session, Some(1)),
-        "Cruise lit"
-    );
-    frame(&mut app, wid);
-    down(&mut app);
-    assert_eq!(app.autopilot_menu.as_ref().unwrap().highlight, Some(2));
-    tap(
-        &mut app,
-        wid,
-        Key::Named(NamedKey::Escape),
-        KeyCode::Escape,
-        None,
-    );
-    assert!(app.autopilot_menu.is_none(), "Esc closes it");
-    select(&mut app);
-    frame(&mut app, wid);
-    app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
-    tap(&mut app, wid, Key::Named(NamedKey::F10), KeyCode::F10, None);
-    app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-    assert!(app.autopilot_menu.is_some(), "shift+F10 opens it");
-    tap(
-        &mut app,
-        wid,
-        Key::Character("x".into()),
-        KeyCode::KeyX,
-        Some("x"),
-    );
-    assert!(app.autopilot_menu.is_none(), "a letter closes it");
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    let key = |name: aterm_types::keyboard::NamedKey| crate::input::InputEvent::Key {
-        key: aterm_types::keyboard::Key::Named(name),
-        mods: aterm_types::keyboard::Modifiers::empty(),
-        base_layout: None,
-        layout_text: None,
-        event_type: aterm_types::keyboard::KeyEventType::Press,
-    };
-    assert!(app.autopilot_menu_input_event(wid, &key(aterm_types::keyboard::NamedKey::ArrowDown)));
-    assert!(app.autopilot_menu_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter)));
-    assert!(app.autopilot_menu.is_none());
-    assert_eq!(
-        app.pool
-            .get(session)
-            .unwrap()
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .autopilot
-            .as_deref(),
-        Some("land"),
-        "Land now"
-    );
-    host.shutdown_and_join();
-}
-
-fn pair(app: &App, session: u64) -> (Option<String>, Option<i64>) {
-    let meta = app.pool.get(session).unwrap().ctx.meta.lock().unwrap();
-    (meta.autopilot.clone(), meta.land_at)
-}
-
-fn wire(app: &App, session: u64, rest: &str) {
-    let entry = app.pool.get(session).unwrap();
-    let (term, ctx) = (entry.term.clone(), entry.ctx.clone());
-    let (reply, _) = crate::control::cmd_meta(&term, &app.store, session, &ctx, rest);
-    assert!(reply.starts_with("OK"), "{rest}: {reply}");
-}
-
-fn row_of(app: &App, key: &str) -> Option<usize> {
-    app.autopilot_menu.as_ref().and_then(|menu| {
-        menu.rows
-            .iter()
-            .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
-    })
-}
-
-#[test]
-fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
-    let (mut app, wid, session, host) = claude_app();
-    let mono = Instant::now();
-    let wall = 1_792_177_200_000_i64;
-    crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
-    frame(&mut app, wid);
-    let cancel = "autopilot-menu/land-cancel";
-    let lines = |app: &App| app.autopilot_menu_controls().join("\n");
-
-    assert!(app.choose_autopilot_timer(
-        session,
-        crate::autopilot_timers::TimerChoice::In(120),
-        crate::autopilot::Surface::Menu
-    ));
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    let at = row_of(&app, cancel).expect("the cancel is offered while armed");
-    app.autopilot_menu.as_mut().unwrap().highlight = Some(at);
-    wire(&app, session, "set autopilot off");
-    app.on_meta_changed(session);
-    let shown = lines(&app);
-    assert!(app.autopilot_menu.is_some(), "still open: {shown}");
-    assert!(
-        shown.contains("key=autopilot-menu/mode/off enabled=true checked=true"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("key=autopilot-menu/mode/cruise enabled=true checked=false"),
-        "{shown}"
-    );
-    assert!(!shown.contains(cancel), "no timer, no cancel: {shown}");
-    assert_eq!(
-        app.autopilot_menu.as_ref().unwrap().highlight,
-        None,
-        "the lit cancel went dark"
-    );
-    assert!(app.autopilot_menu_nav(wid, MenuKey::Choose));
-    assert!(app.autopilot_menu.is_none(), "Return closed it");
-    assert_eq!(
-        pair(&app, session),
-        (Some("off".into()), None),
-        "and acted on nothing"
-    );
-
-    assert!(app.choose_autopilot_timer(
-        session,
-        crate::autopilot_timers::TimerChoice::In(120),
-        crate::autopilot::Surface::Menu
-    ));
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    let at = row_of(&app, cancel).expect("offered");
-    wire(&app, session, "set autopilot off");
-    app.choose_autopilot_menu_row(at);
-    assert!(app.autopilot_menu.is_none());
-    assert_eq!(
-        pair(&app, session),
-        (Some("off".into()), None),
-        "the hand wins"
-    );
-
-    assert!(app.choose_autopilot_timer(
-        session,
-        crate::autopilot_timers::TimerChoice::In(60),
-        crate::autopilot::Surface::Menu
-    ));
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    let at = row_of(&app, cancel).expect("offered");
-    wire(&app, session, "set autopilot cruise until=+4h");
-    app.choose_autopilot_menu_row(at);
-    assert_eq!(
-        pair(&app, session),
-        (Some("cruise".into()), Some(wall + 4 * 3_600_000)),
-        "the new arm stands"
-    );
-    app.on_meta_changed(session);
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    let at = row_of(&app, cancel).expect("offered");
-    app.choose_autopilot_menu_row(at);
-    assert_eq!(
-        pair(&app, session),
-        (Some("cruise".into()), None),
-        "cancelled"
-    );
-
-    assert!(app.choose_autopilot_timer(
-        session,
-        crate::autopilot_timers::TimerChoice::In(60),
-        crate::autopilot::Surface::Menu
-    ));
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    assert!(row_of(&app, cancel).is_some());
-    crate::autopilot_timers::set_fake_clocks(Some((
-        mono + std::time::Duration::from_secs(3_600),
-        wall + 3_600_000,
-    )));
-    app.expire_autopilot_timers();
-    assert_eq!(pair(&app, session), (Some("land".into()), None), "landed");
-    let shown = lines(&app);
-    assert!(
-        shown.contains("key=autopilot-menu/mode/land enabled=true checked=true"),
-        "{shown}"
-    );
-    assert!(!shown.contains(cancel), "{shown}");
-    let cancel_now = |app: &mut App| {
-        app.choose_autopilot_timer(
-            session,
-            crate::autopilot_timers::TimerChoice::Cancel,
-            crate::autopilot::Surface::Menu,
-        )
-    };
-    assert!(!cancel_now(&mut app));
-    assert_eq!(pair(&app, session), (Some("land".into()), None));
-    assert!(app.set_session_autopilot(
-        session,
-        Some(Autopilot::Off),
-        crate::autopilot::Surface::Menu
-    ));
-    assert!(!cancel_now(&mut app));
-    assert_eq!(pair(&app, session), (Some("off".into()), None));
-    assert!(app.set_session_autopilot(
-        session,
-        Some(Autopilot::Cruise),
-        crate::autopilot::Surface::Menu
-    ));
-    assert!(!cancel_now(&mut app));
-    assert_eq!(pair(&app, session), (Some("cruise".into()), None));
-    crate::autopilot_timers::set_fake_clocks(None);
-    host.shutdown_and_join();
-}
-
-/// THE OPEN MENU IS PUBLISHED IN WORDS, ITS HIGHLIGHTED ROW FOCUSED (design
-/// §9.2.1, §9.3.3): the tree the window publishes (`App::grid_a11y_tree`,
-/// what `push_a11y_tree` hands the adapter) holds, once a frame has painted
-/// the menu, one `Role::Menu` named in words (`Autopilot, tab 1…`) with one
-/// item per choice the card shows, each in words — Cruise, Land now and Off
-/// radios, the session's mode checked; the timed Cruises and Harness
-/// settings plain items — over the card's cells, and the tree's focus on the
-/// highlighted row, which follows `↓`.
+/// THE OPEN CARD IS PUBLISHED IN WORDS: a menu node named in the card's spoken title and its
+/// notes, its choices menu items in words, top down, each where the card paints it, the
+/// tree's focus the highlighted row, which follows `↓`; a reader's click on one chooses it.
 #[cfg(a11y_tree)]
 #[test]
-fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
-    use aterm_a11y::model::{Action, ActionRequest, NodeId, Role, Toggled, TreeId, TreeUpdate};
+fn the_open_card_is_published_in_words_its_highlighted_row_focused() {
+    use aterm_a11y::model::{Action, ActionRequest, NodeId, Role, TreeId, TreeUpdate};
     let menu_nodes = |update: &TreeUpdate| -> Vec<NodeId> {
         update
             .nodes
@@ -1420,7 +1046,7 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
     let bare = app.grid_a11y_tree(wid, None).expect("the grid's tree");
     assert!(menu_nodes(&bare).is_empty(), "no menu, no menu node");
     assert_eq!(crate::a11y_tree::menu_item_for(bare.focus), None);
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     let unpainted = app.grid_a11y_tree(wid, None).unwrap();
     assert!(
         menu_nodes(&unpainted).is_empty(),
@@ -1428,6 +1054,7 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
     );
     frame(&mut app, wid);
     let rect = app.autopilot_menu.as_ref().unwrap().rect.expect("painted");
+    let first = row_of(&app, HIDE).expect("the first choice");
     let tree = app.grid_a11y_tree(wid, None).unwrap();
     let menu = tree
         .nodes
@@ -1436,9 +1063,9 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
         .map(|(_, n)| n.clone())
         .expect("the menu is published");
     let label = menu.label().expect("named");
-    assert!(label.starts_with("Autopilot, tab 1"), "{label}");
+    assert!(label.starts_with("Model, tab 1"), "{label}");
     assert!(
-        !label.contains('\u{b7}') && !label.contains('\u{201c}'),
+        !label.contains('\u{b7}') && !label.contains('\u{201c}') && !label.contains('\u{25c6}'),
         "{label}"
     );
     let items: Vec<_> = menu
@@ -1447,18 +1074,7 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
         .map(|id| (*id, node(&tree, *id)))
         .collect();
     let said: Vec<&str> = items.iter().map(|(_, n)| n.label().unwrap()).collect();
-    assert_eq!(
-        said,
-        [
-            "Cruise",
-            "Land now",
-            "Off",
-            "Cruise for 1 hour, then land",
-            "Cruise for 2 hours, then land",
-            "Cruise for 4 hours, then land",
-            "Harness settings",
-        ]
-    );
+    assert_eq!(said, ["Hide model", "Show folder", "Show branch"]);
     for (i, (id, n)) in items.iter().enumerate() {
         let label = n.label().unwrap();
         assert!(words(label), "in words: {label}");
@@ -1470,35 +1086,23 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
             !n.is_disabled() && n.supports_action(Action::Click),
             "{label}"
         );
-        if i < 3 {
-            assert_eq!(n.role(), Role::MenuItemRadio, "{label}");
-            let want = if i == 0 {
-                Toggled::True
-            } else {
-                Toggled::False
-            };
-            assert_eq!(
-                n.toggled(),
-                Some(want),
-                "{label}: the session's mode checked"
-            );
-        } else {
-            assert_eq!(n.role(), Role::MenuItem, "{label}");
-            assert_eq!(n.toggled(), None, "{label}");
-        }
+        assert_eq!(n.role(), Role::MenuItem, "{label}");
+        assert_eq!(n.toggled(), None, "{label}");
     }
-    if let (Some(menu_box), Some(first)) = (menu.bounds(), items[0].1.bounds()) {
+    if let (Some(menu_box), Some(top)) = (menu.bounds(), items[0].1.bounds()) {
         let cell_h = (menu_box.y1 - menu_box.y0) / rect.h as f64;
         assert!(
-            (first.y0 - (menu_box.y0 + cell_h * 2.0)).abs() < 0.5,
-            "Cruise is the card's third row"
+            (top.y0 - (menu_box.y0 + cell_h * (1 + first) as f64)).abs() < 0.5,
+            "the first choice is on the row the card paints it on"
         );
     }
-    assert_eq!(tree.focus, items[0].0, "the highlighted row: Cruise");
-    assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
+    assert_eq!(tree.focus, items[0].0, "the highlighted row: the first");
+    while app.autopilot_menu.as_ref().unwrap().highlight != row_of(&app, SHOW_FOLDER) {
+        assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
+    }
     frame(&mut app, wid);
     let stepped = app.grid_a11y_tree(wid, None).unwrap();
-    assert_eq!(stepped.focus, items[1].0, "↓: Land now");
+    assert_eq!(stepped.focus, items[1].0, "↓: Show folder");
     app.on_accessibility_action(
         wid,
         ActionRequest {
@@ -1510,25 +1114,11 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
         },
     );
     assert!(app.autopilot_menu.is_none(), "chosen and closed");
-    assert_eq!(pair(&app, session).0.as_deref(), Some("land"), "Land now");
+    assert_eq!(app.fact_mask(session), taken(SHOW_FOLDER), "Show folder");
     frame(&mut app, wid);
     let closed = app.grid_a11y_tree(wid, None).unwrap();
     assert!(menu_nodes(&closed).is_empty(), "closed: no menu node");
     assert_eq!(crate::a11y_tree::menu_item_for(closed.focus), None);
-    // Claude Code's top rule carries the switch, so its pane is left bare under the switch off
-    // (`App::pane_bare`; a program the timeline does not name keeps its `⊘ off` chip).
-    claude_named(&app, session);
-    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
-    );
-    frame(&mut app, wid);
-    assert!(
-        app.open_front_autopilot_menu().is_err(),
-        "under the switch off no chip stands, and no menu opens from one"
-    );
-    frame(&mut app, wid);
-    let off = app.grid_a11y_tree(wid, None).unwrap();
-    assert!(menu_nodes(&off).is_empty(), "off: no menu node");
 }
 
 /// The open menu's items as window `wid` publishes them (`App::grid_a11y_tree`):
@@ -1573,14 +1163,16 @@ fn reader(
     );
 }
 
-/// A READER'S CLICK HEARD FROM ROWS THAT MOVED CHOOSES NOTHING.
+/// A READER'S CLICK HEARD FROM ROWS THAT MOVED CHOOSES NOTHING: once the card's rows are built
+/// again every item has a new id, and a click on an id heard before is refused, before the new
+/// rows are painted and after; so is a click from another window, and one on a row the card
+/// does not show. A click on an id of the rows on the glass chooses it.
 #[cfg(a11y_tree)]
 #[test]
 fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
     use aterm_a11y::model::Action;
     let (mut app, wid, session, host) = claude_app();
     let _host = MenuTestHost(host);
-    crate::autopilot_timers::set_fake_clocks(Some((Instant::now(), 1_792_177_200_000)));
     let named = |items: &[(aterm_a11y::model::NodeId, String)], prefix: &str| {
         items
             .iter()
@@ -1589,65 +1181,66 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
             .unwrap_or_else(|| panic!("no item {prefix}: {items:?}"))
     };
     frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     frame(&mut app, wid);
     let heard = published_items(&app, wid);
-    let settings = named(&heard, "Harness settings");
-    assert_eq!(heard.last().map(|(id, _)| *id), Some(settings), "{heard:?}");
+    let last = named(&heard, "Show branch");
+    assert_eq!(heard.last().map(|(id, _)| *id), Some(last), "{heard:?}");
 
-    wire(&app, session, "set autopilot cruise until=+4h");
-    app.on_meta_changed(session);
-    let armed = pair(&app, session);
-    assert!(
-        armed.0.as_deref() == Some("cruise") && armed.1.is_some(),
-        "{armed:?}"
-    );
-    assert!(
-        row_of(&app, "autopilot-menu/land-cancel").is_some(),
-        "rebuilt"
-    );
-    reader(&mut app, wid, Action::Click, settings);
+    relay(&mut app, wid, |rows| {
+        let at = rows
+            .iter()
+            .rposition(|row| matches!(row, MenuRow::Rule))
+            .expect("the rule");
+        rows.insert(
+            at,
+            choice(
+                "\u{21ba}",
+                "Refresh usage",
+                FactAct::RefreshUsage,
+                true,
+                false,
+            ),
+        );
+    });
+    reader(&mut app, wid, Action::Click, last);
     assert!(
         app.autopilot_menu.is_some(),
         "unpainted rows: nothing chosen"
     );
-    assert_eq!(pair(&app, session), armed, "the timer stands");
+    assert_eq!(app.fact_mask(session), BASE, "nothing hidden or shown");
     frame(&mut app, wid);
     let now = published_items(&app, wid);
     assert_eq!(now.len(), heard.len() + 1, "{now:?}");
-    assert!(
-        now[heard.len() - 1].1.starts_with("Cancel landing"),
-        "the cancel took Settings' place: {now:?}"
-    );
     assert!(
         now.iter()
             .all(|(id, _)| heard.iter().all(|(old, _)| old != id)),
         "every id names the new rows"
     );
-    reader(&mut app, wid, Action::Click, settings);
+    reader(&mut app, wid, Action::Click, last);
     assert!(
         app.autopilot_menu.is_some(),
         "a click heard from the old rows is refused"
     );
-    assert_eq!(pair(&app, session), armed, "the timer someone armed stands");
+    assert_eq!(app.fact_mask(session), BASE);
 
-    let cancel = named(&now, "Cancel landing");
+    let show = named(&now, "Show branch");
     let other = WindowId(wid.0 + 1);
     assert!(app.autopilot_grid_menu(other).is_none());
-    reader(&mut app, other, Action::Click, cancel);
+    reader(&mut app, other, Action::Click, show);
     assert!(app.autopilot_menu.is_some(), "another window's: nothing");
-    assert_eq!(pair(&app, session), armed);
+    assert_eq!(app.fact_mask(session), BASE);
     {
         let menu = app.autopilot_menu.as_mut().unwrap();
         let rect = menu.rect.expect("painted");
         menu.rect = Some(MenuRect { h: 2 + 3, ..rect });
     }
-    reader(&mut app, wid, Action::Click, cancel);
+    reader(&mut app, wid, Action::Click, show);
     assert!(
         app.autopilot_menu.is_some(),
         "a row it does not show: refused"
     );
-    assert_eq!(pair(&app, session), armed);
+    assert_eq!(app.fact_mask(session), BASE);
 
     frame(&mut app, wid);
     assert_eq!(
@@ -1655,91 +1248,9 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
         now,
         "the same rows, the same ids"
     );
-    reader(&mut app, wid, Action::Click, cancel);
+    reader(&mut app, wid, Action::Click, show);
     assert!(app.autopilot_menu.is_none(), "chosen and closed");
-    assert_eq!(
-        pair(&app, session),
-        (Some("cruise".into()), None),
-        "cancelled"
-    );
-}
-
-/// A READER OPENS THE MENU FROM THE CHIP (design §9.3.3):
-/// the Autopilot
-/// chip's node says it has a menu (`HasPopup::Menu`) and offers
-/// `ShowContextMenu`, which opens it as the keyboard does — its first
-/// choice lit — so once a frame has painted it the tree's focus is Cruise.
-#[cfg(a11y_tree)]
-#[test]
-fn a_reader_opens_the_menu_from_the_autopilot_chip() {
-    use crate::a11y_tree::{HarnessChip, chip_for};
-    use aterm_a11y::model::{Action, HasPopup};
-    let (mut app, wid, session, host) = claude_app();
-    let _host = MenuTestHost(host);
-    frame(&mut app, wid);
-    let chip = |app: &App, which: HarnessChip| {
-        let tree = app.grid_a11y_tree(wid, None).expect("the grid's tree");
-        tree.nodes
-            .iter()
-            .find(|(id, _)| chip_for(*id) == Some((session, which)))
-            .map(|(id, node)| (*id, node.clone()))
-            .expect("the chip is published")
-    };
-    let (autopilot, node) = chip(&app, HarnessChip::Autopilot);
-    assert_eq!(node.has_popup(), Some(HasPopup::Menu));
-    assert!(node.supports_action(Action::ShowContextMenu));
-    assert!(node.supports_action(Action::Click));
-
-    let before = pair(&app, session).0;
-    reader(&mut app, wid, Action::Click, autopilot);
-    assert!(app.autopilot_menu.is_none(), "a click opens no menu");
-    let after = pair(&app, session).0;
-    assert!(after.is_some() && after != before, "{before:?} → {after:?}");
-    frame(&mut app, wid);
-
-    reader(&mut app, wid, Action::ShowContextMenu, autopilot);
-    let menu = app.autopilot_menu.as_ref().expect("opened");
-    assert_eq!(menu.session, session);
-    assert!(
-        matches!(menu.rows.get(1), Some(MenuRow::SetBy { text, .. }) if text.ends_with(" from the chip")),
-        "{:?}",
-        menu.rows.get(1)
-    );
-    assert_eq!(
-        menu.highlight,
-        Some(2),
-        "the first choice lit, as a keyboard open"
-    );
-    frame(&mut app, wid);
-    let tree = app.grid_a11y_tree(wid, None).unwrap();
-    let items = published_items(&app, wid);
-    assert_eq!(items.first().map(|(_, l)| l.as_str()), Some("Cruise"));
-    assert_eq!(tree.focus, items[0].0, "the focus is the lit row");
-    assert_eq!(pair(&app, session).0, after, "opening writes nothing");
-    assert!(app.autopilot_menu_nav(wid, MenuKey::Close));
-
-    feed(
-        &app,
-        session,
-        "\x1b[2J\x1b[18;1H Bash command\x1b[20;1H Do you want to proceed?\x1b[21;1H \u{276F} 1. \
-         Yes\x1b[22;1H   2. No"
-            .as_bytes(),
-    );
-    frame(&mut app, wid);
-    reader(&mut app, wid, Action::ShowContextMenu, autopilot);
-    assert!(
-        app.autopilot_menu.is_none(),
-        "no chip on the glass: no menu"
-    );
-}
-
-struct MenuTestHost(crate::harness_host::HostHandle);
-
-impl Drop for MenuTestHost {
-    fn drop(&mut self) {
-        crate::autopilot_timers::set_fake_clocks(None);
-        self.0.shutdown_and_join();
-    }
+    assert_eq!(app.fact_mask(session), taken(SHOW_BRANCH), "Show branch");
 }
 
 fn beside_settings(app: &mut App, wid: WindowId) -> u64 {
@@ -1747,21 +1258,9 @@ fn beside_settings(app: &mut App, wid: WindowId) -> u64 {
     assert!(app.apply_term_resize(wid, 60, 120));
     let (session, _) =
         app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+    publish(app, session);
+    app.set_fact_mask(session, BASE);
     let entry = app.pool.get(session).expect("the new stub terminal");
-    let mut timeline = entry.ctx.timeline.lock().unwrap();
-    timeline.note_foreground_group(4242);
-    assert!(timeline.set_claude_footer(
-        4242,
-        None,
-        Some(FooterFacts {
-            model: Some("Opus 5.5".into()),
-            effort: Some("xhigh".into()),
-            path: Some("~/aterm".into()),
-            branch: Some("main".into()),
-            ..FooterFacts::default()
-        }),
-    ));
-    drop(timeline);
     let (rows, cols) = {
         let term = term_lock(&entry.term);
         (usize::from(term.rows()), usize::from(term.cols()))
@@ -1790,12 +1289,16 @@ fn beside_settings(app: &mut App, wid: WindowId) -> u64 {
     session
 }
 
-/// macOS secondary activation has the same meaning on terminal-only and
-/// heterogeneous tabs; an ordinary press still cycles, and a non-chip does not
-/// open the menu.
+/// SECONDARY ACTIVATION MEANS THE SAME ON TERMINAL-ONLY AND MIXED TABS: beside a native page
+/// (the heterogeneous route) as on a terminal alone, a plain press on the Autopilot chip
+/// cycles it and opens nothing; a Control-click there opens nothing and writes no word; a
+/// Control-click on `yolo` opens the permission chip's box and stands no click; and a
+/// Control-click on a fact opens its card.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_control_click_opens_the_menu_in_terminal_and_mixed_tabs() {
+fn a_control_click_means_the_same_in_terminal_and_mixed_tabs() {
+    use crate::claude_lights::Chip;
+    use aterm_agent::harness::lights::Light;
     use aterm_window::event::{ElementState, MouseButton};
     use aterm_window::keyboard::ModifiersState;
     for mixed in [false, true] {
@@ -1806,243 +1309,83 @@ fn a_control_click_opens_the_menu_in_terminal_and_mixed_tabs() {
         } else {
             frame(&mut app, wid);
         }
-        eprintln!("Ctrl-click fixture: mixed={mixed}, initial composed chip");
-        let chip = chip_cell(&app, wid, session);
-        let (x, y) = app.frame_cell_centre(wid, chip);
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        let before = pair(&app, session);
-        app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        assert!(
-            app.autopilot_menu.is_none(),
-            "an ordinary press cycles: mixed={mixed}"
-        );
-        assert_ne!(
-            pair(&app, session),
-            before,
-            "the real chip acts: mixed={mixed}"
-        );
-        assert!(app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu));
+        // The chip's first cell on the glass: the light's from its laid cells, the Autopilot
+        // chip's the first cell of the light's row the glass answers as it.
+        let chip_at = |app: &App, chip: Chip| {
+            let (row, light) = app.windows[&wid]
+                .claude_lights
+                .light_cells(session)
+                .map(|(frame_row, _, col)| (frame_row, col))
+                .min()
+                .unwrap_or_else(|| panic!("mixed={mixed}: the light is on the glass"));
+            (0..=light)
+                .map(|col| (row, col))
+                .find(|&cell| {
+                    let (x, y) = cell_centre(app, wid, cell);
+                    app.claude_glass_at(wid, x, y)
+                        == Some((session, crate::claude_lights::GlassAt::Chip(Some(chip))))
+                })
+                .unwrap_or_else(|| panic!("mixed={mixed}: {chip:?} is on the glass"))
+        };
+        let press = |app: &mut App, cell: (usize, usize), mods: ModifiersState| {
+            let (x, y) = cell_centre(app, wid, cell);
+            app.windows.get_mut(&wid).unwrap().mods = mods;
+            app.on_cursor_moved(wid, x, y);
+            app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+            app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        };
+        let word = |app: &App| app.session_autopilot(session).0;
+        let before = word(&app);
+        let chip = chip_at(&app, Chip::Autopilot);
+        press(&mut app, chip, ModifiersState::empty());
+        assert!(app.autopilot_menu.is_none(), "mixed={mixed}: no menu");
+        assert_ne!(word(&app), before, "mixed={mixed}: a plain press cycles");
         frame(&mut app, wid);
-        eprintln!("Ctrl-click fixture: mixed={mixed}, restored composed chip");
-        let chip = chip_cell(&app, wid, session);
-        let (x, y) = app.frame_cell_centre(wid, chip);
 
-        let off_chip = app.frame_cell_centre(wid, (chip.0 - 3, chip.1));
-        assert!(app.claude_chips_at(wid, off_chip.0, off_chip.1).is_none());
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL;
-        app.on_cursor_moved(wid, off_chip.0, off_chip.1);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        let before = word(&app);
+        let chip = chip_at(&app, Chip::Autopilot);
+        press(&mut app, chip, ModifiersState::CONTROL);
         assert!(
             app.autopilot_menu.is_none(),
-            "a non-chip does not open it: mixed={mixed}"
+            "mixed={mixed}: a Control-click on the Autopilot chip opens nothing"
         );
-        assert_eq!(pair(&app, session), (None, None));
+        assert_eq!(word(&app), before, "mixed={mixed}: and writes no word");
 
-        app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        let menu = app
-            .autopilot_menu
-            .as_ref()
-            .expect("a Ctrl-click opens the chip's menu");
+        let light = chip_at(&app, Chip::Light(Light::Mode));
+        press(&mut app, light, ModifiersState::CONTROL);
         assert_eq!(
-            (menu.session, menu.anchor, menu.highlight),
-            (session, chip, None)
+            app.autopilot_menu.as_ref().map(|m| (m.owner, m.session)),
+            Some((MenuOwner::Permission, session)),
+            "mixed={mixed}: a Control-click on yolo opens its box"
         );
+        let sid = app
+            .pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .self_id
+            .as_str()
+            .to_owned();
+        assert!(
+            app.permission_clicks.clicks.get(&sid).is_none(),
+            "mixed={mixed}: and stands no click"
+        );
+        assert!(app.close_autopilot_menu());
+        frame(&mut app, wid);
+
+        let fact = app.fact_anchor(wid, session, FACT).expect("the model");
+        press(&mut app, fact, ModifiersState::CONTROL);
         assert_eq!(
-            pair(&app, session),
-            (None, None),
-            "secondary activation never cycles"
+            app.autopilot_menu.as_ref().map(|m| (m.owner, m.session)),
+            Some((MenuOwner::Fact(FACT), session)),
+            "mixed={mixed}: a Control-click on a fact opens its card"
         );
     }
 }
 
 #[test]
-fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
-    use crate::autopilot_timers::{TimerChoice, When, resolve};
-    let (mut app, wid, session, host) = claude_app();
-    let _host = MenuTestHost(host);
-    let mono = Instant::now();
-    let wall = 1_792_177_200_000_i64;
-    crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
-    frame(&mut app, wid);
-    assert!(app.choose_autopilot_timer(
-        session,
-        TimerChoice::In(60),
-        crate::autopilot::Surface::Menu
-    ));
-    app.open_front_autopilot_menu().unwrap();
-    assert!(row_of(&app, "autopilot-menu/land-cancel").is_some());
-    app.close_autopilot_menu();
-    assert!(app.choose_autopilot_timer(
-        session,
-        TimerChoice::Cancel,
-        crate::autopilot::Surface::Menu
-    ));
-    let resolved = resolve(When::In(120), wall, &|_| None).expect("elapsed duration needs no zone");
-    assert_eq!(resolved.offset_s, None);
-    assert!(app.set_session_autopilot_timed(
-        session,
-        Some(Autopilot::Cruise),
-        Some(resolved.at_ms),
-        crate::autopilot::Surface::Menu
-    ));
-    app.autopilot_timers
-        .arm(session, resolved.at_ms, mono, wall, &|_| None, None);
-    assert_eq!(
-        pair(&app, session),
-        (Some("cruise".into()), Some(resolved.at_ms))
-    );
-    assert_eq!(app.autopilot_timers.glass(session), None);
-    app.open_front_autopilot_menu().unwrap();
-    let cancel = row_of(&app, "autopilot-menu/land-cancel")
-        .expect("armed without a face still offers Cancel");
-    assert_eq!(
-        app.autopilot_menu.as_ref().unwrap().cancels,
-        Some(resolved.at_ms)
-    );
-    wire(&app, session, "set autopilot cruise until=+4h");
-    app.choose_autopilot_menu_row(cancel);
-    assert_eq!(
-        pair(&app, session),
-        (Some("cruise".into()), Some(wall + 4 * 3_600_000))
-    );
-    app.autopilot_timers
-        .arm(session, wall + 4 * 3_600_000, mono, wall, &|_| None, None);
-    app.open_front_autopilot_menu().unwrap();
-    let cancel = row_of(&app, "autopilot-menu/land-cancel").expect("the current arm is offered");
-    app.choose_autopilot_menu_row(cancel);
-    assert_eq!(pair(&app, session), (Some("cruise".into()), None));
-    app.open_front_autopilot_menu().unwrap();
-    assert!(
-        row_of(&app, "autopilot-menu/land-cancel").is_none(),
-        "no timer means no Cancel"
-    );
-}
-
-#[test]
-fn a_menu_opened_before_the_master_switch_went_off_cannot_write_a_mode() {
-    let (mut app, wid, session, host) = claude_app();
-    let _host = MenuTestHost(host);
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    let land = row_of(&app, "autopilot-menu/mode/land").unwrap();
-    app.choose_autopilot_menu_row(land);
-    assert_eq!(pair(&app, session), (Some("land".into()), None));
-    assert!(app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu));
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
-    let land = row_of(&app, "autopilot-menu/mode/land").unwrap();
-    let mut stamps = crate::harness_policy_cell::HarnessStampSource::new();
-    app.adopt_harness_policy(stamps.stamp(crate::app_config::HarnessPolicy::read(
-        "[harness]\nenabled = false\n",
-    )));
-    assert_eq!(
-        app.harness_posture(),
-        crate::autopilot::HarnessPosture::MasterOff
-    );
-    assert_eq!(
-        pair(&app, session),
-        (None, None),
-        "adoption changes no session word"
-    );
-    app.choose_autopilot_menu_row(land);
-    assert_eq!(
-        pair(&app, session),
-        (None, None),
-        "a stale enabled row cannot write under master Off"
-    );
-}
-
-/// A cancel's reader identity follows its exact stored instant, even when
-/// the local face cannot be read or two instants share one HH:MM face.
-#[cfg(a11y_tree)]
-#[test]
-fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
-    const FIRST: i64 = 1_792_177_200_001;
-    const SECOND: i64 = FIRST + 1;
-    let face = crate::autopilot_timers::glass_of(FIRST, FIRST - 60_000, &|_| Some(0))
-        .expect("the supplied UTC offset has a face");
-    assert_eq!(
-        crate::autopilot_timers::glass_of(SECOND, FIRST - 60_000, &|_| Some(0)),
-        Some(face),
-        "distinct instants in the same minute have the same face"
-    );
-    let mut changed = Vec::new();
-    for shown in [None, Some(face)] {
-        let mut f = facts(AutopilotView::Cruise);
-        f.armed_at_ms = Some(FIRST);
-        f.armed = shown;
-        let rect = MenuRect {
-            row: 0,
-            col: 0,
-            w: 40,
-            h: 20,
-        };
-        let mut menu = AutopilotMenu {
-            owner: MenuOwner::Autopilot,
-            wid: WindowId(0),
-            session: 7,
-            focus: Some(7),
-            anchor: (20, 0),
-            rows: rows(&f),
-            spoken: f.spoken.clone(),
-            cancels: f.armed_at_ms,
-            highlight: Some(1),
-            viewport: MenuViewport::default(),
-            page_rows: rect.h.saturating_sub(2),
-            wheel_residual: 0.0,
-            wheel_residual_x: 0.0,
-            rect: Some(rect),
-            laid: None,
-            generation: 0,
-            rest: PointerRest::at_open(None),
-            ticks: CardTicks::default(),
-        };
-        let heard = menu.a11y_epoch();
-        menu.highlight = Some(2);
-        assert_eq!(
-            menu.a11y_epoch(),
-            heard,
-            "highlight keeps the item identities"
-        );
-        assert!(!menu.refresh_rows(rows(&f), f.spoken.clone(), f.armed_at_ms));
-        assert_eq!(
-            menu.a11y_epoch(),
-            heard,
-            "the same timer keeps its identity"
-        );
-        assert_eq!(menu.rect, Some(rect), "equal rows remain painted");
-
-        let mut ordinary = menu.clone();
-        let mut land = f.clone();
-        land.view = AutopilotView::Land;
-        let mut changed_rows = rows(&land);
-        changed_rows.push(MenuRow::note("a row the card did not have"));
-        assert!(ordinary.refresh_rows(changed_rows, land.spoken, land.armed_at_ms));
-        assert_eq!(ordinary.rect, None);
-        assert_ne!(ordinary.a11y_epoch(), heard, "ordinary row-change control");
-
-        f.armed_at_ms = Some(SECOND);
-        let fresh = rows(&f);
-        assert_eq!(fresh, menu.rows, "neither the labels nor choices moved");
-        assert!(!menu.refresh_rows(fresh, f.spoken.clone(), f.armed_at_ms));
-        assert_eq!(menu.cancels, Some(SECOND), "the replacement is current");
-        assert_eq!(menu.rect, Some(rect), "the equal rows remain painted");
-        changed.push((shown.is_some(), menu.a11y_epoch() != heard));
-    }
-    assert_eq!(
-        changed,
-        [(false, true), (true, true)],
-        "reader cancel identity must change with the exact timer"
-    );
-}
-
-#[test]
-fn the_menus_header_names_its_pane_where_two_agents_share_a_tab() {
+fn the_cards_header_names_its_pane_where_two_agents_share_a_tab() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let right = app.split_active_stub_tab(wid);
@@ -2053,24 +1396,13 @@ fn the_menus_header_names_its_pane_where_two_agents_share_a_tab() {
         tl.set_program(7, Some("claude".into()));
     };
     claude(&app, 0);
-    let alone = app.autopilot_menu_facts(0);
-    assert!(!alone.title.contains("pane"), "{}", alone.title);
+    let (alone, _) = app.menu_place_and_name(0);
+    assert!(!alone.contains("pane"), "{alone}");
     claude(&app, right);
-    let (left, right) = (app.autopilot_menu_facts(0), app.autopilot_menu_facts(right));
-    assert!(
-        left.title.starts_with("Autopilot \u{b7} tab 1, left pane"),
-        "{}",
-        left.title
-    );
-    assert!(
-        right
-            .title
-            .starts_with("Autopilot \u{b7} tab 1, right pane"),
-        "{}",
-        right.title
-    );
-    assert!(left.spoken.contains("left pane"), "{}", left.spoken);
-    assert_ne!(left.title, right.title);
+    let ((left, _), (right, _)) = (app.menu_place_and_name(0), app.menu_place_and_name(right));
+    assert!(left.starts_with("tab 1, left pane"), "{left}");
+    assert!(right.starts_with("tab 1, right pane"), "{right}");
+    assert_ne!(left, right);
 }
 
 fn claude_split(
@@ -2092,20 +1424,13 @@ fn claude_split(
     );
     app.harness = Some(host.clone());
     for session in [first, second] {
+        publish(&app, session);
         {
             let entry = app.pool.get(session).expect("session");
             let mut timeline = entry.ctx.timeline.lock().unwrap();
-            timeline.note_foreground_group(4242);
             timeline.set_program(4242, Some("claude".into()));
-            assert!(timeline.set_claude_footer(
-                4242,
-                None,
-                Some(FooterFacts {
-                    model: Some("Opus 5.5".into()),
-                    ..FooterFacts::default()
-                }),
-            ));
         }
+        app.set_fact_mask(session, BASE);
         let (_, _, rows, width) = app
             .visible_session_rect(wid, session)
             .expect("both panes are shown");
@@ -2126,7 +1451,7 @@ fn claude_split(
 }
 
 #[test]
-fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
+fn the_card_keeps_its_name_whole_and_stays_in_its_pane() {
     use crate::pane::SplitDir;
     let cells = |app: &App, wid: WindowId, row: usize, span: std::ops::Range<usize>| -> String {
         row_text(app, wid, row)
@@ -2148,6 +1473,7 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
         ((24, 80), SplitDir::Horizontal),
     ] {
         let (mut app, wid, first, second, host) = claude_split(size, dir);
+        let _host = MenuTestHost(host);
         frame(&mut app, wid);
         let sides = match dir {
             SplitDir::Vertical => ["left", "right"],
@@ -2178,7 +1504,12 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
                     .collect()
             };
             let before = the_other(&app);
-            app.open_front_autopilot_menu()
+            // Whichever fact the pane's width leaves on its rule: the card's place is the same.
+            let fact = [Fact::Path, Fact::Effort, Fact::Model]
+                .into_iter()
+                .find(|fact| app.fact_anchor(wid, session, *fact).is_some())
+                .unwrap_or_else(|| panic!("{context}: a fact on the glass"));
+            app.open_front_fact_menu(fact)
                 .unwrap_or_else(|why| panic!("{context}: {why}"));
             frame(&mut app, wid);
             let rect = rect_of(&app).unwrap_or_else(|| panic!("{context}: painted"));
@@ -2208,7 +1539,7 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
             assert!(
                 shown
                     .iter()
-                    .any(|row| row.contains("Autopilot \u{b7} tab 1")),
+                    .any(|row| row.contains(&format!("{} \u{b7} tab 1", fact.name()))),
                 "{context}: the place: {shown:?}"
             );
             assert!(
@@ -2217,45 +1548,24 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
                     .any(|row| row.contains("\u{201c}\u{2733} Claude Code\u{201d}")),
                 "{context}: the name whole: {shown:?}"
             );
-            for mode in ["Cruise", "Land now", "Off"] {
-                assert!(
-                    shown.iter().any(|row| row.contains(mode)),
-                    "{context}: {mode} shown: {shown:?}"
-                );
-            }
-            for (key, span) in [
-                ("autopilot-menu/land-in/60", "Cruise 1 hour"),
-                ("autopilot-menu/land-in/240", "Cruise 4 hours"),
-            ] {
-                let i = row_of(&app, key).expect("the timed Cruise");
-                if let Some(text) = shown.get(i) {
-                    assert!(
-                        text.contains(span),
-                        "{context}: {text:?} says {span} in a pane of {}",
-                        pane.len()
-                    );
-                }
-            }
             let want = menu.rows.len() + 2;
             if rows.len() >= want {
                 assert_eq!(rect.h, want, "{context}: whole");
+                let last = menu
+                    .rows
+                    .iter()
+                    .rev()
+                    .find_map(|row| match row {
+                        MenuRow::Item { label, .. } => Some(label.as_str()),
+                        _ => None,
+                    })
+                    .expect("a choice");
                 assert!(
-                    shown.iter().any(|row| row.contains("Harness settings")),
-                    "{context}: {shown:?}"
+                    shown.iter().any(|row| row.contains(last)),
+                    "{context}: its last choice {last:?}: {shown:?}"
                 );
             } else {
                 assert!(rect.h < want, "{context}: a prefix {rect:?}");
-            }
-            let longest = "\u{221e}\u{2913} Cruise 4 hours, then land";
-            let four = row_of(&app, "autopilot-menu/land-in/240").expect("the 4 h row");
-            if let Some(text) = shown.get(four)
-                && pane.len() >= display_cells(longest) + 2
-            {
-                assert!(
-                    text.contains("Cruise 4 hours, then land"),
-                    "{context}: {text:?} in a pane of {}",
-                    pane.len()
-                );
             }
             if pane.len() < menu.rows.iter().map(row_width).max().unwrap() + CHROME_W {
                 assert_eq!(rect.w, pane.len(), "{context}: as narrow as its pane");
@@ -2263,76 +1573,15 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
             assert!(app.close_autopilot_menu());
             frame(&mut app, wid);
         }
-        host.shutdown_and_join();
     }
 }
 
 #[test]
-fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
-    use crate::app_introspect::AuxTarget;
-    use crate::harness_screen::HarnessFocus;
-    use crate::native_settings::SettingsRoute;
-    let (mut app, wid, session, host) = claude_app();
-    app.pool
-        .get(session)
-        .expect("session")
-        .ctx
-        .timeline
-        .lock()
-        .unwrap()
-        .set_program(4242, Some("claude".into()));
-    let other = app.next_session_id;
-    app.push_stub_tab(wid, crate::stub_session(other));
-    {
-        let ctx = app.pool.get(other).expect("the other session").ctx.clone();
-        let mut tl = ctx.timeline.lock().unwrap();
-        tl.note_foreground_group(7);
-        tl.set_program(7, Some("claude".into()));
-    }
-    let landed = |app: &App| {
-        app.native_settings_route_view_target(SettingsRoute::Harness)
-            .map(|(_, _, _, state)| state.harness_focus)
-    };
-    let selected = |app: &App, s: u64| {
-        let show = format!("ui key=\"harness/session/{s}/show\" ");
-        app.read_aux_controls(AuxTarget::Prefs)
-            .iter()
-            .any(|l| l.starts_with(&show) && l.contains("selected:true"))
-    };
-    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
-    assert_eq!(landed(&app), Some(HarnessFocus::Top));
-    assert!(!selected(&app, session) && !selected(&app, other));
-    app.switch_tab_in(wid, 0);
-    assert_eq!(app.focused_session_id(wid), Some(session));
-    draw_composer(&app, session);
-    frame(&mut app, wid);
-    let press_row = |app: &mut App, key: &str| {
-        let menu = app.autopilot_menu.as_ref().unwrap();
-        let rect = menu.rect.unwrap();
-        let i = menu
-            .rows
-            .iter()
-            .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
-            .unwrap();
-        let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y, Instant::now())
-    };
-    app.open_front_autopilot_menu().unwrap();
-    frame(&mut app, wid);
-    assert!(press_row(&mut app, "autopilot-menu/settings"));
-    assert!(app.autopilot_menu.is_none(), "chosen: the menu closed");
-    assert_eq!(landed(&app), Some(HarnessFocus::Session(session)));
-    assert!(selected(&app, session), "its row's Show, selected");
-    assert!(!selected(&app, other), "and no other row's");
-    host.shutdown_and_join();
-}
-
-#[test]
-fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
+fn the_open_cards_rect_is_the_pets_overlay_not_its_ground() {
     let (mut app, wid, _session, host) = claude_app();
     let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     frame(&mut app, wid);
     let rect = app
         .autopilot_menu
@@ -2361,7 +1610,7 @@ fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
 }
 
 #[test]
-fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
+fn the_open_card_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
     use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers, is_sprite_layer, published};
     for mixed in [false, true] {
         let (mut app, wid, mut session, host) = claude_app();
@@ -2371,7 +1620,7 @@ fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
         } else {
             frame(&mut app, wid);
         }
-        app.open_front_autopilot_menu().unwrap();
+        open_card_at_the_left(&mut app, wid, session, true);
         assert_eq!(app.autopilot_menu.as_ref().unwrap().session, session);
         frame(&mut app, wid);
         let rect = app
@@ -2477,7 +1726,7 @@ fn repainted(
 }
 
 #[test]
-fn the_open_menu_is_repainted_whole_where_the_program_drew_nothing() {
+fn the_open_card_is_repainted_whole_where_the_program_drew_nothing() {
     for mixed in [false, true] {
         let (mut app, wid, _, host) = claude_app();
         let _host = MenuTestHost(host);
@@ -2489,7 +1738,7 @@ fn the_open_menu_is_repainted_whole_where_the_program_drew_nothing() {
         let ch = app.win_cell_size(wid).1;
         let scratch = |app: &App| app.windows[&wid].input_scratch.clone();
         let closed = scratch(&app);
-        app.open_front_autopilot_menu().unwrap();
+        open_card(&mut app);
         frame(&mut app, wid);
         let open = scratch(&app);
         let rect = rect_of(&app).expect("painted");
@@ -2563,7 +1812,7 @@ fn row_px(app: &App, wid: WindowId, i: usize) -> ((f64, f64), usize) {
         .range(menu.rows.len(), rect.h.saturating_sub(2));
     assert!(visible.contains(&i), "logical row {i} outside {visible:?}");
     let row = rect.row + 1 + i - visible.start;
-    (app.frame_cell_centre(wid, (row, rect.col + 3)), row)
+    (cell_centre(app, wid, (row, rect.col + 3)), row)
 }
 
 fn key_on(app: &App, row: usize) -> Option<String> {
@@ -2573,58 +1822,65 @@ fn key_on(app: &App, row: usize) -> Option<String> {
     keys(&menu.rows).get(i)?.clone()
 }
 
-fn arm_elsewhere(app: &mut App, session: u64) {
-    wire(app, session, "set autopilot cruise until=+1h");
-    app.on_meta_changed(session);
+/// A note arrives under the card's last choice: the card, hung above its fact, grows upward,
+/// so every row above the note stands one frame row higher.
+fn a_note_arrives(app: &mut App, wid: WindowId) {
+    relay(app, wid, |rows| rows.push(MenuRow::note("a note arrived")));
 }
 
+/// A ROW NEVER MOVES UNDER A STILL POINTER TO ANOTHER CHOICE. A row that leaves a card leaves a
+/// gap, so the choice under a resting pointer keeps its row and a press there takes it at once,
+/// before the next frame and after. Where rows arrive and another choice comes to stand under a
+/// pointer that has not moved (whether it came to rest over this card, an earlier one, or the
+/// bare pane before the open), or the card widens under a pointer beside it, the first press
+/// chooses nothing and lights what is there; the next press takes it. A pointer that moved onto
+/// a choice presses at once.
 #[test]
 fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
-    use crate::autopilot_timers::TimerChoice;
-    const LAND: &str = "autopilot-menu/mode/land";
-    const OFF: &str = "autopilot-menu/mode/off";
     let menu_open = |app: &App| app.autopilot_menu.is_some();
+    const LEAVING: &str = "fact-menu/path/refresh-usage";
     for how in [Press::Bare, Press::Ctl, Press::AppKit] {
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
-        let (mono, wall) = (Instant::now(), 1_792_177_200_000_i64);
-        crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
         frame(&mut app, wid);
-        let fire = |app: &mut App, session: u64| {
-            crate::autopilot_timers::set_fake_clocks(Some((
-                mono + std::time::Duration::from_secs(3_600),
-                wall + 3_600_000,
-            )));
-            app.expire_autopilot_timers();
-            assert_eq!(pair(app, session), (Some("land".into()), None), "landed");
-        };
         for before_the_frame in [true, false] {
-            crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
-            assert!(app.choose_autopilot_timer(
-                session,
-                TimerChoice::In(60),
-                crate::autopilot::Surface::Menu
-            ));
+            app.set_fact_mask(session, BASE);
             frame(&mut app, wid);
-            app.open_front_autopilot_menu().unwrap();
+            open_card(&mut app);
+            relay(&mut app, wid, |rows| {
+                let at = rows
+                    .iter()
+                    .position(|row| matches!(row, MenuRow::Rule))
+                    .expect("the rule");
+                rows.insert(
+                    at,
+                    choice(
+                        "\u{21ba}",
+                        "Refresh usage",
+                        FactAct::RefreshUsage,
+                        true,
+                        false,
+                    ),
+                );
+            });
             frame(&mut app, wid);
             let rect = rect_of(&app).expect("painted");
-            let (target, want) = if before_the_frame {
-                (OFF, "off")
-            } else {
-                (LAND, "land")
-            };
+            let target = if before_the_frame { HIDE } else { SHOW_FOLDER };
             let i = row_of(&app, target).expect("the target row");
             let (at, frame_row) = row_px(&app, wid, i);
             app.on_cursor_moved(wid, at.0, at.1);
             assert_eq!(app.autopilot_menu.as_ref().unwrap().highlight, Some(i));
-            fire(&mut app, session);
+            relay(&mut app, wid, |rows| {
+                rows.retain(
+                    |row| !matches!(row, MenuRow::Item { act, .. } if act.key() == LEAVING),
+                );
+            });
             assert_eq!(rect_of(&app), Some(rect), "{how:?}: the card kept its rect");
             if !before_the_frame {
                 frame(&mut app, wid);
-                let shown = app.autopilot_menu_controls().join("\n");
-                assert!(!shown.contains("land-cancel"), "{shown}");
-                assert!(shown.contains("autopilot-menu gap index="), "{shown}");
+                let shown = app.fact_menu_controls().join("\n");
+                assert!(!shown.contains(LEAVING), "{shown}");
+                assert!(shown.contains("fact-menu gap index="), "{shown}");
                 assert_eq!(rect_of(&app), Some(rect), "{how:?}: and kept it painted");
             }
             assert_eq!(
@@ -2635,8 +1891,8 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
             click(&mut app, wid, at, how);
             assert!(!menu_open(&app), "{how:?}: chosen");
             assert_eq!(
-                pair(&app, session),
-                (Some(want.into()), None),
+                app.fact_mask(session),
+                taken(target),
                 "{how:?}, before the frame={before_the_frame}: the press chose {target}, as \
                  the pointer saw"
             );
@@ -2645,43 +1901,42 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
 
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
-        crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
         frame(&mut app, wid);
-        app.open_front_autopilot_menu().unwrap();
+        open_card(&mut app);
         frame(&mut app, wid);
         let rect = rect_of(&app).expect("painted");
-        let (at, frame_row) = row_px(&app, wid, row_of(&app, LAND).unwrap());
+        let (at, frame_row) = row_px(&app, wid, row_of(&app, HIDE).unwrap());
         app.on_cursor_moved(wid, at.0, at.1);
-        arm_elsewhere(&mut app, session);
+        a_note_arrives(&mut app, wid);
         frame(&mut app, wid);
         let grown = rect_of(&app).expect("painted");
-        assert_eq!(grown.h, rect.h + 2, "the cancel row arrived: the card grew");
+        assert_eq!(grown.h, rect.h + 1, "the note arrived: the card grew");
         assert_eq!(
             key_on(&app, frame_row).as_deref(),
-            Some(OFF),
-            "Off now stands where the pointer rests"
+            Some(SHOW_FOLDER),
+            "Show model now stands where the pointer rests"
         );
-        let armed = pair(&app, session);
-        assert_eq!(armed.0.as_deref(), Some("cruise"));
         click(&mut app, wid, at, how);
         assert!(
             menu_open(&app),
             "{how:?}: the press the rows moved under chose nothing"
         );
-        assert_eq!(pair(&app, session), armed, "{how:?}: nothing written");
+        assert_eq!(app.fact_mask(session), BASE, "{how:?}: nothing written");
         assert_eq!(
             app.autopilot_menu.as_ref().unwrap().highlight,
-            row_of(&app, OFF),
+            row_of(&app, SHOW_FOLDER),
             "{how:?}: it lit the choice under the pointer"
         );
         click(&mut app, wid, at, how);
         assert!(!menu_open(&app), "{how:?}: the next press chose it");
-        assert_eq!(pair(&app, session), (Some("off".into()), None));
+        assert_eq!(app.fact_mask(session), taken(SHOW_FOLDER));
 
         for over_a_menu in [false, true] {
-            app.open_front_autopilot_menu().unwrap();
+            app.set_fact_mask(session, BASE);
             frame(&mut app, wid);
-            let (at, frame_row) = row_px(&app, wid, row_of(&app, LAND).unwrap());
+            open_card(&mut app);
+            frame(&mut app, wid);
+            let (at, frame_row) = row_px(&app, wid, row_of(&app, HIDE).unwrap());
             if over_a_menu {
                 app.on_cursor_moved(wid, at.0, at.1);
             }
@@ -2690,64 +1945,60 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
             if !over_a_menu {
                 app.on_cursor_moved(wid, at.0, at.1);
             }
-            app.open_front_autopilot_menu().unwrap();
+            open_card(&mut app);
             frame(&mut app, wid);
-            assert_eq!(key_on(&app, frame_row).as_deref(), Some(LAND));
-            arm_elsewhere(&mut app, session);
+            assert_eq!(key_on(&app, frame_row).as_deref(), Some(HIDE));
+            a_note_arrives(&mut app, wid);
             frame(&mut app, wid);
-            assert_eq!(key_on(&app, frame_row).as_deref(), Some(OFF));
-            let armed = pair(&app, session);
+            assert_eq!(key_on(&app, frame_row).as_deref(), Some(SHOW_FOLDER));
             click(&mut app, wid, at, how);
             assert!(
                 menu_open(&app),
                 "{how:?}, over a menu={over_a_menu}: a pointer still since before the open \
                  chose nothing"
             );
-            assert_eq!(pair(&app, session), armed, "{how:?}: nothing written");
+            assert_eq!(app.fact_mask(session), BASE, "{how:?}: nothing written");
             click(&mut app, wid, at, how);
             assert!(!menu_open(&app), "{how:?}: the next press chose it");
-            assert_eq!(pair(&app, session), (Some("off".into()), None));
+            assert_eq!(app.fact_mask(session), taken(SHOW_FOLDER));
             app.on_cursor_left(wid);
         }
 
         let (mut wide_app, wwid, wsession, whost) = claude_app();
         let _whost = MenuTestHost(whost);
         frame(&mut wide_app, wwid);
-        wide_app.open_front_autopilot_menu().unwrap();
+        open_card(&mut wide_app);
         frame(&mut wide_app, wwid);
         let rect = rect_of(&wide_app).expect("painted");
+        // The card hangs from the model at the rule's left end, so it widens to its right.
         let beside_cell = (
-            rect.row + 1 + row_of(&wide_app, LAND).unwrap(),
+            rect.row + 1 + row_of(&wide_app, HIDE).unwrap(),
             rect.col + rect.w + 1,
         );
-        let beside = wide_app.frame_cell_centre(wwid, beside_cell);
+        let beside = cell_centre(&wide_app, wwid, beside_cell);
         wide_app.on_cursor_moved(wwid, beside.0, beside.1);
-        wide_app
-            .pool
-            .get(wsession)
-            .unwrap()
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .user_title = Some("a far longer name for this tab, past the card's edge".into());
-        wide_app.on_meta_changed(wsession);
+        relay(&mut wide_app, wwid, |rows| {
+            let note = rows
+                .iter_mut()
+                .find(|row| matches!(row, MenuRow::Note { .. }))
+                .expect("the model's note");
+            *note = MenuRow::note("\u{25c6}  a far longer model name past the card's edge");
+        });
         frame(&mut wide_app, wwid);
         let wide = rect_of(&wide_app).expect("painted");
         assert!(
             wide.contains(beside_cell.0, beside_cell.1),
             "the card widened under the pointer: {rect:?} -> {wide:?}"
         );
-        assert_eq!(key_on(&wide_app, beside_cell.0).as_deref(), Some(LAND));
-        let before = pair(&wide_app, wsession);
+        assert_eq!(key_on(&wide_app, beside_cell.0).as_deref(), Some(HIDE));
         click(&mut wide_app, wwid, beside, how);
         assert!(
             wide_app.autopilot_menu.is_some(),
             "{how:?}: a press beside the card it grew under chose nothing"
         );
         assert_eq!(
-            pair(&wide_app, wsession),
-            before,
+            wide_app.fact_mask(wsession),
+            BASE,
             "{how:?}: nothing written"
         );
         click(&mut wide_app, wwid, beside, how);
@@ -2755,35 +2006,49 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
             wide_app.autopilot_menu.is_none(),
             "{how:?}: the next press chose it"
         );
-        assert_eq!(pair(&wide_app, wsession), (Some("land".into()), None));
+        assert_eq!(wide_app.fact_mask(wsession), taken(HIDE));
         drop(wide_app);
 
-        app.open_front_autopilot_menu().unwrap();
+        app.set_fact_mask(session, BASE);
         frame(&mut app, wid);
-        let (at, _) = row_px(&app, wid, row_of(&app, LAND).unwrap());
+        open_card(&mut app);
+        frame(&mut app, wid);
+        let (at, _) = row_px(&app, wid, row_of(&app, HIDE).unwrap());
         app.on_cursor_moved(wid, at.0, at.1);
-        arm_elsewhere(&mut app, session);
+        a_note_arrives(&mut app, wid);
         frame(&mut app, wid);
-        let (moved, _) = row_px(&app, wid, row_of(&app, LAND).unwrap());
+        let (moved, _) = row_px(&app, wid, row_of(&app, HIDE).unwrap());
         assert_ne!(moved, at);
         app.on_cursor_moved(wid, moved.0, moved.1);
         click(&mut app, wid, moved, how);
         assert!(!menu_open(&app), "{how:?}: a moved pointer presses at once");
-        assert_eq!(pair(&app, session), (Some("land".into()), None));
-        crate::autopilot_timers::set_fake_clocks(None);
+        assert_eq!(app.fact_mask(session), taken(HIDE));
     }
 }
 
+/// A CARD PAINTED UNDER A RESTING POINTER TAKES NO PRESS IT DID NOT SEE: in a pane too short to
+/// hang the card clear of its fact, a right press opens it over the pointer; the first press
+/// there chooses nothing and lights the choice, the next takes it. The same holds for a card a
+/// key opened under the pointer. A pointer that moved since the card came up presses at once.
 #[test]
 fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
     use crate::pane::SplitDir;
     use aterm_window::event::{ElementState, MouseButton};
     for how in [Press::Bare, Press::Ctl, Press::AppKit] {
-        let (mut app, wid, _first, session, host) = claude_split((24, 80), SplitDir::Horizontal);
+        // Panes too short to hang the card above its fact: it is laid over it.
+        let (mut app, wid, _first, session, host) = claude_split((16, 80), SplitDir::Horizontal);
         let _host = MenuTestHost(host);
+        // No Claude Code: the model's card hides and shows facts, each choice a mask of its own.
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap();
+            timeline.set_program(4242, None);
+        }
         frame(&mut app, wid);
-        let chip = chip_cell(&app, wid, session);
-        let at = app.frame_cell_centre(wid, chip);
+        let fact = app
+            .fact_anchor(wid, session, FACT)
+            .expect("the folder is on the glass");
+        let at = cell_centre(&app, wid, fact);
         let open_by_hand = |app: &mut App| {
             app.on_cursor_moved(wid, at.0, at.1);
             app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
@@ -2794,20 +2059,22 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
             );
             frame(app, wid);
         };
-        let before = pair(&app, session);
         open_by_hand(&mut app);
         let rect = rect_of(&app).expect("painted");
         assert!(
-            rect.contains(chip.0, chip.1),
-            "{how:?}: the card {rect:?} covers its chip {chip:?}"
+            rect.contains(fact.0, fact.1),
+            "{how:?}: the card {rect:?} covers its fact {fact:?}"
         );
-        let under = key_on(&app, chip.0).expect("a choice under the pointer");
+        let under = key_on(&app, fact.0).expect("a choice under the pointer");
+        let rows = app.autopilot_menu.as_ref().unwrap().rows.clone();
+        let want = mask_of(&rows, row_of(&app, &under).unwrap())
+            .unwrap_or_else(|| panic!("{under} hides or shows a fact"));
         click(&mut app, wid, at, how);
         assert!(
             app.autopilot_menu.is_some(),
             "{how:?}: a press on {under}, which came up under a still pointer, chose nothing"
         );
-        assert_eq!(pair(&app, session), before, "{how:?}: nothing written");
+        assert_eq!(app.fact_mask(session), BASE, "{how:?}: nothing written");
         assert_eq!(
             app.autopilot_menu.as_ref().unwrap().highlight,
             row_of(&app, &under),
@@ -2818,21 +2085,20 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
             app.autopilot_menu.is_none(),
             "{how:?}: the next press chose it"
         );
-        assert_ne!(pair(&app, session), before, "{how:?}: {under} written");
-        app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu);
-        let before = pair(&app, session);
+        assert_eq!(app.fact_mask(session), want, "{how:?}: {under} written");
+        app.set_fact_mask(session, BASE);
         frame(&mut app, wid);
-        app.open_front_autopilot_menu().unwrap();
+        open_card(&mut app);
         frame(&mut app, wid);
-        assert!(rect_of(&app).is_some_and(|r| r.contains(chip.0, chip.1)));
+        assert!(rect_of(&app).is_some_and(|r| r.contains(fact.0, fact.1)));
         click(&mut app, wid, at, how);
         assert!(
             app.autopilot_menu.is_some(),
             "{how:?}: keyboard open, nothing chosen"
         );
         assert_eq!(
-            pair(&app, session),
-            before,
+            app.fact_mask(session),
+            BASE,
             "{how:?}: keyboard open, nothing written"
         );
         assert!(app.close_autopilot_menu());
@@ -2840,40 +2106,40 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
         open_by_hand(&mut app);
         let moved = (at.0 + 1.0, at.1);
         app.on_cursor_moved(wid, moved.0, moved.1);
-        assert_eq!(key_on(&app, chip.0), Some(under.clone()));
+        assert_eq!(key_on(&app, fact.0), Some(under.clone()));
         click(&mut app, wid, moved, how);
         assert!(
             app.autopilot_menu.is_none(),
             "{how:?}: a moved pointer chooses at once"
         );
-        assert_ne!(pair(&app, session), before, "{how:?}: {under} written");
+        assert_eq!(app.fact_mask(session), want, "{how:?}: {under} written");
         app.on_cursor_left(wid);
     }
 }
 
 #[test]
-fn fx_occluders_compose_over_the_autopilot_menu_and_the_paste_banner() {
+fn fx_occluders_compose_over_a_fact_card_and_the_paste_banner() {
     use crate::app_render::fx_occluder_tests::{
         Shape, assert_chrome_cuts_the_light, chrome_written, trace_splice,
     };
-    let (mut app, wid, session, _host) = claude_app();
+    let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
+    open_card(&mut app);
     let mut before = None;
     frame_with(&mut app, wid, |app| {
         before = Some(app.windows[&wid].input_scratch.clone());
     });
     assert!(
         app.autopilot_menu.as_ref().and_then(|m| m.rect).is_some(),
-        "the menu painted"
+        "the card painted"
     );
     let menu = chrome_written(
         &mut app,
         wid,
-        "Autopilot menu",
+        "fact card",
         Shape::Card,
-        &before.expect("the frame reached the menu's splice"),
+        &before.expect("the frame reached the card's splice"),
     );
     app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
         wid,
@@ -2889,35 +2155,35 @@ fn fx_occluders_compose_over_the_autopilot_menu_and_the_paste_banner() {
 }
 
 #[test]
-fn fx_occluders_compose_over_the_autopilot_menu_the_question_and_the_caption() {
+fn fx_occluders_compose_over_a_fact_card_the_question_and_the_caption() {
     use crate::app_render::fx_occluder_tests::{
         Shape, assert_chrome_cuts_the_light, chrome_written, trace_splice,
     };
-    let (mut app, wid, session, _host) = claude_app();
+    let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
     feed(
         &app,
         session,
         b"\x1b[7;1HVisit \x1b]8;;https://example.com/a\x1b\\example.com\x1b]8;;\x1b\\ now\x1b[22;3H",
     );
     frame(&mut app, wid);
-    let (x, y) = app.frame_cell_centre(wid, (6, 8));
+    let (x, y) = cell_centre(&app, wid, (6, 8));
     app.on_cursor_moved(wid, x, y);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
+    open_card(&mut app);
     let mut before = None;
     frame_with(&mut app, wid, |app| {
         before = Some(app.windows[&wid].input_scratch.clone());
     });
     assert!(
         app.autopilot_menu.as_ref().and_then(|m| m.rect).is_some(),
-        "the menu painted"
+        "the card painted"
     );
     let menu = chrome_written(
         &mut app,
         wid,
-        "Autopilot menu",
+        "fact card",
         Shape::Card,
-        &before.expect("the frame reached the menu's splice"),
+        &before.expect("the frame reached the card's splice"),
     );
     app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
         wid,
@@ -2940,38 +2206,16 @@ fn zoom(app: &mut App, size: f32) {
     assert!(app.set_font_size_with(size, |_| true), "zoomed to {size}");
 }
 
-fn mode_word(rows: &[MenuRow], i: usize) -> Option<&'static str> {
-    match rows.get(i)? {
-        MenuRow::Item {
-            act: MenuAct::Mode(mode),
-            enabled: true,
-            ..
-        } => Some(mode.word()),
-        _ => None,
-    }
-}
-
-/// A chip's menu takes the keys, so the session field it opens over gives them up: a client told of
-/// a row would otherwise press Enter on it and commit the name.
+/// A card's menu takes the keys, so the session field it opens over gives them up: a client
+/// told of a row would otherwise press Enter on it and commit the name.
 #[cfg(a11y_tree)]
 #[test]
-fn a_chip_s_menu_settles_the_session_field_it_opens_over() {
+fn a_cards_menu_settles_the_session_field_it_opens_over() {
     let (mut app, wid, session, host) = claude_app();
     let _host = MenuTestHost(host);
     app.tab_strip_rows = 1;
     frame(&mut app, wid);
     let tab = app.windows[&wid].tab_set.active().unwrap().id;
-
-    assert!(app.begin_session_rename(wid, tab));
-    app.windows.get_mut(&wid).unwrap().strip_press = Some((Instant::now(), tab));
-    assert!(app.windows[&wid].rename_edit.is_some(), "CONTROL");
-    app.open_front_autopilot_menu().unwrap();
-    assert!(app.windows[&wid].rename_edit.is_none(), "Autopilot's");
-    assert!(
-        app.windows[&wid].strip_press.is_none(),
-        "Autopilot's menu breaks the strip's double-click streak"
-    );
-    app.close_autopilot_menu();
 
     assert!(app.begin_session_rename(wid, tab));
     app.windows.get_mut(&wid).unwrap().strip_press = Some((Instant::now(), tab));
@@ -2989,12 +2233,12 @@ fn a_chip_s_menu_settles_the_session_field_it_opens_over() {
 /// presses: the tree may not announce one menu while Enter acts on another.
 #[cfg(a11y_tree)]
 #[test]
-fn a_tab_menu_over_autopilot_s_is_the_menu_a_client_reads() {
+fn a_tab_menu_over_a_fact_card_is_the_menu_a_client_reads() {
     let (mut app, wid, _, host) = claude_app();
     let _host = MenuTestHost(host);
     app.tab_strip_rows = 1;
     frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
+    open_card(&mut app);
     frame(&mut app, wid);
 
     assert!(app.open_tab_context_menu(wid, 0, 3, true));
@@ -3015,19 +2259,20 @@ fn a_tab_menu_over_autopilot_s_is_the_menu_a_client_reads() {
     );
 }
 
+/// Open the folder's card over the pane's left and find a zoom that puts one of its hide and show
+/// choices under the pixel of another: the zoom's size, the two rows and the pixel.
 fn open_where_a_zoom_moves_a_choice(
     app: &mut App,
     wid: WindowId,
     session: u64,
 ) -> (f32, usize, usize, (f64, f64)) {
     frame(app, wid);
-    let chip = chip_cell(app, wid, session);
-    app.open_autopilot_menu(wid, session, chip, false);
+    open_card_at_the_left(app, wid, session, false);
     frame(app, wid);
     let rect = rect_of(app).expect("painted");
     let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
     let cells: Vec<(usize, (f64, f64))> = (0..rows.len())
-        .filter(|&i| mode_word(&rows, i).is_some())
+        .filter(|&i| mask_of(&rows, i).is_some())
         .map(|i| (i, row_px(app, wid, i).0))
         .collect();
     let base = app.font_size;
@@ -3038,13 +2283,13 @@ fn open_where_a_zoom_moves_a_choice(
             let found = cells.iter().find_map(|&(i, (x, y))| {
                 let (row, col) = app.frame_cell_at(wid, x, y)?;
                 let j = item_at(rect, &rows, MenuViewport::default(), row, col)
-                    .filter(|&j| mode_word(&rows, j).is_some())?;
+                    .filter(|&j| mask_of(&rows, j).is_some())?;
                 (j != i).then_some((size, i, j, (x, y)))
             });
             zoom(app, base);
             found
         })
-        .expect("a zoom puts another mode choice under one's pixel");
+        .expect("a zoom puts another hide or show choice under one's pixel");
     assert_eq!(
         app.autopilot_menu.as_ref().and_then(|m| m.laid),
         app.glass_grid(wid),
@@ -3058,7 +2303,7 @@ fn lit(app: &App) -> Option<usize> {
 }
 
 #[test]
-fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
+fn a_regrid_leaves_the_cards_last_rect_answering_nothing() {
     for forged in [true, false] {
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
@@ -3070,7 +2315,6 @@ fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
             Some(was),
             "on the grid it was laid on, its choice"
         );
-        let before = pair(&app, session);
         zoom(&mut app, size);
         let laid = app.autopilot_menu.as_ref().and_then(|m| m.laid);
         assert_ne!(app.glass_grid(wid), laid, "the zoom re-grids the window");
@@ -3098,13 +2342,12 @@ fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
         );
         if forged {
             assert_eq!(
-                pair(&app, session).0.as_deref(),
-                mode_word(&rows, now),
+                Some(app.fact_mask(session)),
+                mask_of(&rows, now),
                 "CONTROL: the choice the pointer never rested on is chosen"
             );
-            assert_ne!(pair(&app, session), before, "CONTROL");
         } else {
-            assert_eq!(pair(&app, session), before, "nothing is chosen");
+            assert_eq!(app.fact_mask(session), BASE, "nothing is chosen");
         }
     }
 }
@@ -3119,7 +2362,6 @@ fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
         let rect = rect_of(&app).expect("painted");
         app.on_cursor_moved(wid, x, y);
         assert_eq!(lit(&app), Some(was));
-        let before = pair(&app, session);
         zoom(&mut app, size);
         frame(&mut app, wid);
         assert_eq!(rect_of(&app), Some(rect), "laid again at the same cells");
@@ -3135,25 +2377,21 @@ fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
             "another choice under the pixel"
         );
         if moved {
-            let (cx, cy) = app.frame_cell_centre(wid, (row, col));
+            let (cx, cy) = cell_centre(&app, wid, (row, col));
             app.on_cursor_moved(wid, cx, cy + 1.0);
             app.on_cursor_moved(wid, x, y);
         }
         click(&mut app, wid, (x, y), Press::Bare);
         if moved {
             assert!(app.autopilot_menu.is_none(), "CONTROL: chosen at once");
-            assert_eq!(
-                pair(&app, session).0.as_deref(),
-                mode_word(&rows, now),
-                "CONTROL"
-            );
+            assert_eq!(Some(app.fact_mask(session)), mask_of(&rows, now), "CONTROL");
             continue;
         }
         assert!(
             app.autopilot_menu.is_some(),
             "the press the rows moved under is refused"
         );
-        assert_eq!(pair(&app, session), before, "nothing is chosen");
+        assert_eq!(app.fact_mask(session), BASE, "nothing is chosen");
         assert_eq!(
             lit(&app),
             Some(now),
@@ -3161,7 +2399,7 @@ fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
         );
         click(&mut app, wid, (x, y), Press::Bare);
         assert!(app.autopilot_menu.is_none(), "the next press takes it");
-        assert_eq!(pair(&app, session).0.as_deref(), mode_word(&rows, now));
+        assert_eq!(Some(app.fact_mask(session)), mask_of(&rows, now));
     }
 }
 
@@ -3171,16 +2409,15 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
         frame(&mut app, wid);
-        let chip = chip_cell(&app, wid, session);
-        app.open_autopilot_menu(wid, session, chip, false);
+        open_card_by_pointer(&mut app, wid, session);
         frame(&mut app, wid);
         let rect = rect_of(&app).expect("painted");
         let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
         let i = (0..rows.len())
-            .find(|&i| mode_word(&rows, i).is_some())
-            .expect("a mode choice");
+            .find(|&i| mask_of(&rows, i).is_some())
+            .expect("a hide or show choice");
         let ((x, y), _) = row_px(&app, wid, i);
-        let off = app.frame_cell_centre(wid, (0, 0));
+        let off = cell_centre(&app, wid, (0, 0));
         assert!(!rect.contains(0, 0), "the corner is off the card");
         app.on_cursor_moved(wid, x, y);
         click(&mut app, wid, (x, y), Press::Bare);
@@ -3228,14 +2465,14 @@ fn the_card_border_is_the_static_arc() {
         selection: 0x0044_4466,
     };
     let rows = vec![
-        MenuRow::Header("Accounts \u{b7} tab 1".to_string()),
+        MenuRow::Header("Account \u{b7} tab 1".to_string()),
         MenuRow::note("continuous for the next 7 days"),
         MenuRow::Rule,
-        MenuRow::note("main   75%  Max 20x"),
-        MenuRow::note("alt    40%  Max 20x"),
-        MenuRow::note("pool   12%  Max 5x"),
+        MenuRow::note("main   25% left  Max 20x"),
+        MenuRow::note("alt    60% left  Max 20x"),
+        MenuRow::note("pool   88% left  Max 5x"),
         MenuRow::Rule,
-        MenuRow::note("No pinned account"),
+        MenuRow::note("Not pinned: the next agent here takes the freshest account."),
     ];
     let rect = MenuRect {
         row: 0,
@@ -3312,600 +2549,49 @@ fn the_card_border_is_the_static_arc() {
     );
 }
 
-/// Case (c)'s Accounts card (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4) on `fx`'s
-/// clock at `room` cells, as the window lays it: `main`'s pane, every account listed, a card as
-/// wide as its rows ask and as tall.
-fn case_c_card(
-    fx: &aterm_agent::harness::quota_scenes::Fx,
-    room: usize,
-) -> (
-    aterm_agent::harness::quota_view::QuotaView,
-    Vec<MenuRow>,
-    MenuRect,
-) {
-    use crate::fact_menu::{FactMenuFacts, SessionWeek, account_menu_rows_from};
-    let out = std::sync::Arc::new(fx.outlook());
-    let (accounts, pool_unpinned) = account_menu_rows_from(
-        &fx.roster,
-        &fx.state,
-        &fx.enrolled,
-        true,
-        Some("main"),
-        None,
-        SessionWeek::default(),
-        fx.now,
-    );
-    let facts = FactMenuFacts {
-        title: "Accounts \u{b7} tab 1".into(),
-        spoken: "Accounts, tab 1".into(),
-        room,
-        accounts,
-        pool_unpinned,
-        outlook: Some(std::sync::Arc::clone(&out)),
-        account_row: Some("main".into()),
-        movable: true,
-        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
-        ..FactMenuFacts::default()
-    };
-    let rows = crate::fact_menu::rows(Fact::Account, &facts);
-    let rect = MenuRect {
-        row: 3,
-        col: 2,
-        w: content_width(&rows) + CHROME_W,
-        h: rows.len() + 2,
-    };
-    (out.quota("main", None, true), rows, rect)
-}
-
-/// A CARD'S MIDNIGHT TICKS STAND AT THEIR MIDNIGHTS' PIXELS, UNDER THEIR DAYS' LABELS (§1.4,
-/// §2.2): on case (c)'s card at 60 and 44 cells (6 and 4 cells a day), with cells 8 by 16 and 7
-/// by 15 device pixels, on clocks that put each midnight at another place in its cell (UTC,
-/// +05:30, +09:45) and on one that springs forward over midnight, each tick on the work row and
-/// the lanes is one pixel wide at the foot of its painted row, a quarter of the cell tall, at
-/// `x` = the card's text column plus the midnight's own offset from the row's left edge at the
-/// row's grain, floored to the pixel; the painted cell under it draws a level, `┄` or (on the
-/// work row) nothing, never a name, `→`, `↺`, `▕` or `╳`, nor a lane's blank ground; every
-/// midnight whose painted cell draws one has its tick;
-/// and each tick of a midnight ahead stands under that day's label on the axis row, where the
-/// label fits before the axis's end. Negative
-/// controls: a card whose plots carry no ticks lays none; the ticks laid from the card's own
-/// border column (no text offset) stand a column early, under no label.
-#[test]
-fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
-    use aterm_agent::harness::quota_scenes::{D, H, MIN, case_c};
-    use aterm_agent::harness::quota_view::{GAP_MARK, HANDOFF_MARK, NOW_MARK, RESET_MARK};
-    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    /// A clock's name and its offset from UTC at an instant.
-    type Clock = (&'static str, fn(i64) -> i64);
-    let theme = aterm_render::Theme {
-        fg: 0x0020_2020,
-        bg: 0x00F8_F8F4,
-        cursor: 0x0000_0000,
-        selection: 0x00CC_CCEE,
-    };
-    let clocks: [Clock; 4] = [
-        ("UTC", |_| 0),
-        ("+05:30", |_| 5 * H + 30 * MIN),
-        ("+09:45", |_| 9 * H + 45 * MIN),
-        ("spring", |t| {
-            let spring = (case_c().now + 3 * D).div_euclid(D) * D + 4 * H;
-            if t < spring { -4 * H } else { -3 * H }
-        }),
-    ];
-    let (mut laid, mut under_label, mut skipped, mut bare) = (0, 0, 0, 0);
-    let mut out = Vec::new();
-    for (clock, offset) in clocks {
-        let mut fx = case_c();
-        fx.offset = offset;
-        for room in [60, 44] {
-            let (view, rows, rect) = case_c_card(&fx, room);
-            let k = aterm_agent::harness::outlook::card_per_day(room);
-            let s = D / i64::from(k);
-            let now = view.chart.now;
-            let painted = paint(
-                rect,
-                &rows,
-                MenuViewport::default(),
-                None,
-                theme,
-                Some(CardPalette::Cruise),
-            );
-            let (text_start, _) = text_span(rect.w, &rows);
-            // The rows on the work row's clock (it and the lanes), by their painted rows, and the
-            // axis row above the work row.
-            let clocked: Vec<usize> = rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| {
-                    matches!(r, MenuRow::Plot { spoken, .. }
-                        if spoken.starts_with("Work,") || spoken.contains("'s week, "))
-                })
-                .map(|(i, _)| 1 + i)
-                .collect();
-            assert_eq!(
-                clocked.len(),
-                4,
-                "{clock} {room}: the work row and three lanes"
-            );
-            let work = rows
-                .iter()
-                .position(
-                    |r| matches!(r, MenuRow::Plot { spoken, .. } if spoken.starts_with("Work,")),
-                )
-                .map(|i| 1 + i)
-                .expect("the work row");
-            let axis: String = painted[work - 1].iter().map(|c| c.ch).collect();
-            let MenuRow::Plot {
-                cells: axis_cells, ..
-            } = &rows[work - 2]
-            else {
-                panic!("{clock} {room}: the axis over the work row")
-            };
-            for (cw, ch) in [(8u16, 16u16), (7, 15)] {
-                let what = format!("{clock} {room} {cw}x{ch}");
-                plot_ticks(rect, &rows, MenuViewport::default(), (cw, ch), &mut out);
-                let (cw_, ch_) = (i64::from(cw), i32::from(ch));
-                // The midnights' pixels from a drawn row's left edge, read off the instants.
-                let x_of = |m: i64| -> i64 {
-                    let lead = i64::try_from(aterm_agent::harness::outlook::WORK_WORD.len())
-                        .expect("cells");
-                    if m < now {
-                        lead * cw_ + (m - (now - D)) * cw_ / s
-                    } else {
-                        (lead + i64::from(k) + 1) * cw_ + (m - now) * cw_ / s
-                    }
-                };
-                let left = i64::try_from(text_start).expect("a column") * cw_;
-                let mut want = Vec::new();
-                for &r in &clocked {
-                    for &m in &view.chart.midnights {
-                        let x = left + x_of(m);
-                        let col = usize::try_from(x / cw_).expect("a column");
-                        let glyph = painted[r][col].ch;
-                        let line = |c: char| {
-                            ('\u{2581}'..='\u{2588}').contains(&c)
-                                || ('\u{1fb76}'..='\u{1fb7b}').contains(&c)
-                                || c == '\u{2594}'
-                                || c == '\u{2504}'
-                        };
-                        // The row's own cells: a lane ends at its reset, past it the card's ground.
-                        let MenuRow::Plot { cells, .. } = &rows[r - 1] else {
-                            unreachable!()
-                        };
-                        if col - text_start >= cells.len() {
-                            continue;
-                        }
-                        if (glyph == ' ' && r == work) || line(glyph) {
-                            let y = i32::try_from(r).expect("a row") * ch_ + ch_ - ch_ / 4;
-                            want.push((i32::try_from(x).expect("px"), y));
-                            // A label that would pass the axis's end is not laid (§1.4).
-                            if r == work && m >= now && col - text_start + 3 <= axis_cells.len() {
-                                let local = (m + offset(m)).div_euclid(D).rem_euclid(7);
-                                let day = WEEKDAYS[usize::try_from(local).expect("a day")];
-                                assert_eq!(
-                                    axis.chars().skip(col).take(3).collect::<String>(),
-                                    day,
-                                    "{what}: the tick at {x} under its label in {axis:?}"
-                                );
-                                under_label += 1;
-                            }
-                        } else {
-                            assert!(
-                                glyph.is_alphanumeric()
-                                    || [HANDOFF_MARK, RESET_MARK, NOW_MARK, GAP_MARK, '$']
-                                        .contains(&glyph)
-                                    || glyph == ' ',
-                                "{what}: a midnight in {glyph:?}"
-                            );
-                            skipped += 1;
-                            bare += usize::from(glyph == ' ');
-                        }
-                    }
-                }
-                let got: Vec<(i32, i32)> = out.iter().map(|t| (t.x, t.y)).collect();
-                assert_eq!(got, want, "{what}");
-                assert!(
-                    out.iter().all(|t| (t.w, t.h) == (1, ch / 4)),
-                    "{what}: one pixel wide, a quarter of the cell tall"
-                );
-                laid += out.len();
-            }
-        }
-    }
-    assert!(
-        laid > 0 && under_label > 0,
-        "{laid} ticks, {under_label} under labels"
-    );
-    assert!(
-        skipped > bare && bare > 0,
-        "the cards hold midnights in a letter's or a mark's cell and on a lane's ground ({bare})"
-    );
-}
-
-/// A CARD'S TICKS READ ON WHAT THEY STAND ON (§1.3, §1.4): on case (c)'s card at 60 and 44 cells
-/// under Cruise, Day and Night, every tick stands at least 3:1 from what is painted under it: the
-/// card's ground (the track, solved there), a measured step (the ground's own ink, a notch through
-/// the step's foot, as far from the step as the step is from the ground) or a lane's out line's
-/// warn wash (the track floored on it); the card holds ticks on all three, and each tick's ink is
-/// that of the cell under it (no projected line of case (c) lies low enough beside a midnight to
-/// ink a tick's foot; `no_midnight_strikes_a_letter` holds line E's that do). NEGATIVE CONTROL: the
-/// track on every tick (as the card first drew them, the Day and Night captures of scene J
-/// measuring 1.0:1 on Night's steps and 2.4:1 on the wash) fails both.
-#[test]
-fn a_cards_ticks_read_on_what_they_stand_on() {
-    use aterm_agent::harness::quota_scenes::case_c;
-    use aterm_effects::color_math::contrast_ratio;
-    /// A look's name and its theme.
-    type Look = (&'static str, aterm_render::Theme);
-    let looks: [Look; 2] = [
-        (
-            "Day",
-            aterm_render::Theme {
-                fg: 0x0020_2020,
-                bg: 0x00F8_FAFD,
-                cursor: 0x0000_0000,
-                selection: 0x00CC_CCEE,
-            },
-        ),
-        (
-            "Night",
-            aterm_render::Theme {
-                fg: 0x00D8_DEE9,
-                bg: 0x0012_1721,
-                cursor: 0x00FF_FFFF,
-                selection: 0x0033_3D4F,
-            },
-        ),
-    ];
-    let palette = Some(CardPalette::Cruise);
-    let (cw, ch) = (8u16, 16u16);
-    let mut on = [0usize; 3];
-    let mut least = [f32::MAX; 3];
-    let mut out = Vec::new();
-    for (look, theme) in looks {
-        let inks = card_tick_inks(theme, palette);
-        let ground = pack(card_inks(theme, palette).0.card_bg);
-        for room in [60, 44] {
-            let (_, rows, rect) = case_c_card(&case_c(), room);
-            let painted = paint(rect, &rows, MenuViewport::default(), None, theme, palette);
-            plot_ticks(rect, &rows, MenuViewport::default(), (cw, ch), &mut out);
-            assert!(!out.is_empty(), "{look} {room}: ticks");
-            for t in &out {
-                let r = usize::try_from(t.y).expect("a row") / usize::from(ch);
-                let col = usize::try_from(t.x).expect("a column") / usize::from(cw);
-                let cell = &painted[r][col];
-                // A measured step's block fills the tick's foot quarter (here no projected line
-                // is low enough to); a warn cell is washed.
-                let step = ('\u{2581}'..='\u{2588}').contains(&cell.ch);
-                let wash = pack(cell.bg) != ground;
-                let want = if step {
-                    TickOn::Fill
-                } else if wash {
-                    TickOn::Wash
-                } else {
-                    TickOn::Ground
-                };
-                assert_eq!(t.ink, want.ink(), "{look} {room}: over {:?}", cell.ch);
-                let under = if step { cell.fg } else { cell.bg };
-                let i = usize::try_from(t.ink / 2).expect("an ink");
-                let ratio = contrast_ratio(inks.color(t.ink), pack(under));
-                least[i] = least[i].min(ratio);
-                on[i] += 1;
-                assert!(
-                    ratio >= aterm_effects::cli_marks::ICON_CONTRAST,
-                    "{look} {room}: a tick over {:?} at {ratio:.2}:1",
-                    cell.ch
-                );
-            }
-        }
-    }
-    assert!(
-        on.iter().all(|&n| n > 0),
-        "ticks on the ground, a step and a wash: {on:?}, least {least:?}"
-    );
-}
-
-/// A CARD'S TICKS ARE ONE LAYER WHILE IT IS OPEN, SEALED ONCE, AND GONE ONCE IT CLOSES (§1.4):
-/// with case (c)'s card open over a Claude Code pane, a frame lays one layer of the card's ticks
-/// over the glyphs, at the card's corner and clipped to it, its rects [`plot_ticks`]' for the
-/// painted card; the layer stands on the card (its chrome is the occluder the card pushed, which
-/// cuts every other layer), so the renderer's slicing, through the frame's occluders, draws
-/// every pixel of every tick; a frame at rest hands on the same content, and refilling the
-/// ticks allocates nothing; a closed card leaves no tick behind. Negative controls: a card that
-/// never lays its layer fails the first; one whose layer stands on no chrome draws no tick
-/// (the card's own occluder cuts them all, as the Day and Night captures first showed); one
-/// that seals its ticks anew each frame fails the rest.
-#[test]
-fn a_cards_ticks_are_one_layer_while_it_is_open_and_cost_nothing_at_rest() {
-    use aterm_agent::harness::quota_scenes::case_c;
-    let (mut app, wid, session, _host) = claude_app();
-    frame(&mut app, wid);
-    app.open_front_autopilot_menu()
-        .expect("the chip is on the glass");
-    let (_, rows, _) = case_c_card(&case_c(), 60);
-    app.autopilot_menu.as_mut().expect("open").rows = rows;
-    frame(&mut app, wid);
-    let id = crate::claude_footer::quota::card_tick_id(session);
-    let ours = |app: &App| -> Vec<FxLayer> {
-        app.windows[&wid]
-            .input_scratch
-            .fx_layers
-            .iter()
-            .filter(|l| l.id == id)
-            .cloned()
-            .collect()
-    };
-    let first = ours(&app);
-    assert_eq!(first.len(), 1, "one layer of ticks");
-    let layer = &first[0];
-    let menu = app.autopilot_menu.as_ref().expect("open");
-    let rect = menu.rect.expect("painted");
-    let (cw, ch) = app
-        .glass_grid(wid)
-        .map_or_else(|| app.win_cell_size(wid), |g| g.cell());
-    let cell = (
-        u16::try_from(cw).expect("a cell"),
-        u16::try_from(ch).expect("a cell"),
-    );
-    let mut want = Vec::new();
-    plot_ticks(rect, &menu.rows, menu.viewport, cell, &mut want);
-    assert!(!want.is_empty(), "the card's rows in view hold ticks");
-    let laid: Vec<FxRect> = layer
-        .content
-        .items()
-        .iter()
-        .filter_map(|item| match item {
-            aterm_core::render::FxItem::Rect(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(laid, want);
-    let px = |cells: usize, side: usize| i32::try_from(cells * side).expect("px");
-    assert_eq!(layer.offset, (px(rect.col, cw), px(rect.row, ch)));
-    assert_eq!(
-        (layer.slot, layer.space, layer.blend),
-        (FxSlot::Over, FxSpace::Grid, FxBlend::Exact)
-    );
-    assert_eq!(
-        (layer.clip.x0, layer.clip.y0),
-        (px(rect.col, cw), px(rect.row, ch))
-    );
-    let inks = card_tick_inks(app.overlay_card_theme(wid), None);
-    assert_eq!(
-        layer.content.palette(),
-        inks.palette(),
-        "the inks of what the ticks stand on"
-    );
-    let scratch = &app.windows[&wid].input_scratch;
-    let occluder = layer.chrome.expect("the ticks stand on the card");
-    assert!(
-        scratch.fx_occluders.contains(&occluder),
-        "the card's own occluder, {occluder:?}, in {:?}",
-        scratch.fx_occluders
-    );
-    let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
-    let fx = aterm_render::FxFrame {
-        w: 2 * pad + scratch.cols * cw,
-        h: grid_top + scratch.cells.len() * ch + pad,
-        pad,
-        grid_top,
-        cell_h: ch,
-        rows: scratch.cells.len(),
-    };
-    let ticks: std::collections::BTreeSet<(usize, usize)> = want
-        .iter()
-        .flat_map(|r| {
-            let x = usize::try_from(i64::from(r.x) + i64::from(layer.offset.0)).expect("x");
-            let y = usize::try_from(i64::from(r.y) + i64::from(layer.offset.1)).expect("y");
-            (0..usize::from(r.h))
-                .flat_map(move |dy| (0..usize::from(r.w)).map(move |dx| (x + dx, y + dy)))
-        })
-        .map(|(x, y)| (pad + x, grid_top + y))
-        .collect();
-    let drawn = |layer: &FxLayer| sliced(&fx, layer, &scratch.fx_occluders);
-    assert_eq!(
-        drawn(layer),
-        ticks,
-        "every tick pixel is drawn through the frame's occluders"
-    );
-    let bare = FxLayer {
-        chrome: None,
-        ..layer.clone()
-    };
-    assert!(
-        drawn(&bare).is_empty(),
-        "on no chrome, the card's occluder cuts every tick"
-    );
-    frame(&mut app, wid);
-    let again = ours(&app);
-    assert_eq!(again.len(), 1, "still one layer");
-    assert!(
-        Arc::ptr_eq(&again[0].content, &layer.content),
-        "a frame at rest seals no new content"
-    );
-    let menu = app.autopilot_menu.as_mut().expect("open");
-    let (content, allocations) = crate::work_counts::allocations_in(|| {
-        menu.ticks
-            .content((rect, &menu.rows, menu.viewport), cell, inks)
-    });
-    assert_eq!(
-        allocations, 0,
-        "refilling the ticks at rest allocates nothing"
-    );
-    assert!(content.is_some_and(|c| Arc::ptr_eq(&c, &layer.content)));
-    assert!(app.close_autopilot_menu(), "closed");
-    frame(&mut app, wid);
-    assert!(ours(&app).is_empty(), "no tick once the card is gone");
-}
-
-/// The window pixels the renderer's slicing draws of `layer` in `fx` through `occluders`.
-fn sliced(
-    fx: &aterm_render::FxFrame,
-    layer: &FxLayer,
-    occluders: &[aterm_core::render::PxRect],
-) -> std::collections::BTreeSet<(usize, usize)> {
-    struct Px<'o>(&'o mut std::collections::BTreeSet<(usize, usize)>);
-    impl<'a> aterm_render::FxSliceSink<'a> for Px<'_> {
-        fn item(
-            &mut self,
-            _: &'a FxLayer,
-            _: &'a aterm_core::render::FxItem,
-            _: (i64, i64),
-        ) -> bool {
-            true
-        }
-
-        fn slice(&mut self, s: aterm_render::FxSlice, _: usize) {
-            for y in s.y0..s.y1 {
-                for x in s.x0..s.x1 {
-                    self.0.insert((x, y));
-                }
-            }
-        }
-    }
-    let mut out = std::collections::BTreeSet::new();
-    aterm_render::slice_layers(
-        fx,
-        std::slice::from_ref(layer),
-        occluders,
-        |_| true,
-        |_| true,
-        &mut aterm_render::FxSlicer::default(),
-        &mut Px(&mut out),
-    );
-    out
-}
-
-/// A CARD'S TICKS MOVE WITHOUT MOVING ITS ITEMS' READER IDENTITIES (§1.4): the outlook replays
-/// once a minute with a new now, and every midnight's place moves with it while, between
-/// readings, no cell or caption does. Case (c)'s Accounts card ten minutes after its readings
-/// (its resets fall on cell edges at the readings' own instant, so the first minute moves a
-/// lane's `↺`), open with its `alt1` item lit, rebuilt a minute later takes the fresh ticks and
-/// asks for a frame (its repaint key moves), but keeps its generation,
-/// its painted place, its highlight and its accessibility epoch, so a focused item keeps its
-/// AccessKit node and a reader's activation sent under the epoch still lands. Control: a rebuild
-/// that changes what the card shows (case (c) four hours on) moves the epoch. NEGATIVE CONTROL
-/// (run once, restored): hashing the ticks into a row's identity, as the ticks' first cut did,
-/// moves the epoch on the minute's rebuild and fails.
-#[cfg(a11y_tree)]
-#[test]
-fn a_cards_ticks_move_with_the_clock_and_keep_its_items_reader_identities() {
-    use aterm_agent::harness::quota_scenes::{H, MIN, case_c};
-    let at = |later: i64| {
-        let mut fx = case_c();
-        fx.now += later;
-        case_c_card(&fx, 60)
-    };
-    let (_, rows, rect) = at(10 * MIN);
-    let alt1 = rows
-        .iter()
-        .position(|row| matches!(row, MenuRow::Item { label, .. } if label.contains("alt1")))
-        .expect("the alt1 item");
-    let mut menu = AutopilotMenu {
-        owner: MenuOwner::Fact(Fact::Account),
-        wid: WindowId(0),
-        session: 7,
-        focus: Some(7),
-        anchor: (20, 0),
-        rows,
-        spoken: "Accounts, tab 1".into(),
-        cancels: None,
-        highlight: Some(alt1),
-        viewport: MenuViewport::default(),
-        page_rows: rect.h.saturating_sub(2),
-        wheel_residual: 0.0,
-        wheel_residual_x: 0.0,
-        rect: Some(rect),
-        laid: None,
-        generation: 3,
-        rest: PointerRest::at_open(None),
-        ticks: CardTicks::default(),
-    };
-    let ticks = |rows: &[MenuRow]| -> Vec<Vec<i64>> {
-        rows.iter()
-            .filter_map(|row| match row {
-                MenuRow::Plot { ticks, .. } => Some(ticks.to_vec()),
-                _ => None,
-            })
-            .collect()
-    };
-    let (heard, painted) = (menu.a11y_epoch(), menu.fingerprint());
-    let (_, fresh, _) = at(11 * MIN);
-    assert_ne!(
-        ticks(&fresh),
-        ticks(&menu.rows),
-        "the minute moved the midnights' places"
-    );
-    assert!(
-        same_but_ticks(&menu.rows, &fresh),
-        "and nothing the card shows or says"
-    );
-    assert!(
-        menu.refresh_rows(fresh.clone(), "Accounts, tab 1".into(), None),
-        "moved ticks are painted anew"
-    );
-    assert_eq!(menu.rows, fresh, "the card holds the fresh ticks");
-    assert_ne!(menu.fingerprint(), painted, "its repaint key moved");
-    assert_eq!(
-        menu.a11y_epoch(),
-        heard,
-        "the items keep their reader identities"
-    );
-    assert_eq!(
-        (menu.generation, menu.rect, menu.highlight),
-        (3, Some(rect), Some(alt1)),
-        "the rows under the pointer, the card's place and the lit item stay"
-    );
-    assert!(
-        !menu.refresh_rows(fresh, "Accounts, tab 1".into(), None),
-        "the same rows again ask for nothing"
-    );
-    let (_, moved, _) = at(4 * H);
-    assert!(
-        !same_but_ticks(&menu.rows, &moved),
-        "CONTROL: four hours on, the card shows more than its ticks moved"
-    );
-    menu.refresh_rows(moved, "Accounts, tab 1".into(), None);
-    assert_ne!(
-        menu.a11y_epoch(),
-        heard,
-        "CONTROL: a changed card's epoch moves"
-    );
-}
-
-/// A ROW'S WIDTH IS ITS TEXT'S, COUNTED WITHOUT BUILDING IT: over case (c)'s card and rows of
-/// every kind (a name in quotes, an item behind a glyph narrower and one wider than its column,
-/// a setter's note under its floor, a gap), [`row_width`] is the cells of the row's text, an
-/// item's check included and a setter's floor kept, and reading a whole card's width allocates
-/// nothing. Negative control: the width read off [`MenuRow::text`], as every frame read it
-/// before the card's ticks, allocates once a row.
+/// A ROW'S WIDTH IS ITS TEXT'S, COUNTED WITHOUT BUILDING IT: over rows of every kind (a card's
+/// head, a note, a drawn row, a name in quotes, an item behind a glyph narrower and one wider
+/// than its column, a gap), [`row_width`] is the cells of the row's text, an item's check and a
+/// group heading's blank and first cell of rule included, and reading a whole card's width
+/// allocates nothing. Negative control: the width read off [`MenuRow::text`] allocates once a
+/// row.
 #[test]
 fn a_rows_width_is_its_texts_counted_without_building_it() {
-    use aterm_agent::harness::quota_scenes::case_c;
-    let (_, mut rows, _) = case_c_card(&case_c(), 60);
+    let mut rows = header_rows("Account \u{b7} tab 1", None, 60);
+    rows.push(MenuRow::note("61% left \u{b7} resets Sat 10:00"));
+    rows.push(MenuRow::plot(
+        "8 days   \u{2588}\u{2587}\u{2586}\u{21ba}\u{2504}\u{2573}"
+            .chars()
+            .map(|ch| PlotCell {
+                ch,
+                ink: PlotInk::Read,
+                busy: false,
+            })
+            .collect::<Vec<_>>(),
+        "Week left over the last 8 days",
+    ));
     let item = |glyph: &'static str, label: &str| MenuRow::Item {
         glyph,
         label: label.into(),
         spoken: label.into(),
-        act: MenuAct::Settings,
+        act: MenuAct::Fact(Fact::Account, FactAct::AccountSettings),
         enabled: true,
         checked: false,
+        trail: String::new(),
     };
     rows.extend([
         MenuRow::Name("caf\u{e9} \u{4e2d}".into()),
         item("\u{2386}", "main  75%"),
         item("\u{1f600}\u{1f600}\u{1f600}", "wide"),
-        MenuRow::SetBy {
-            text: "set 14:05".into(),
-            floor: 20,
-        },
         MenuRow::Gap(7),
     ]);
+    rows.extend(grouped_card());
+    rows.push(fact("Token", "", NoteTone::Label));
     for row in &rows {
         let text = display_cells(&row.text());
         let want = match row {
             MenuRow::Item { .. } => text + CHECK_CELLS,
-            MenuRow::SetBy { floor, .. } => text.max(*floor),
+            MenuRow::Section(_) => text + 2,
             MenuRow::Gap(cells) => *cells,
             _ => text,
         };
@@ -3917,4 +2603,440 @@ fn a_rows_width_is_its_texts_counted_without_building_it() {
         width,
         TRAFFIC_MAX_CONTENT.min(rows.iter().map(row_width).max().unwrap_or(0))
     );
+}
+
+fn fact(label: &str, value: &str, tone: NoteTone) -> MenuRow {
+    MenuRow::Fact {
+        label: label.into(),
+        value: value.into(),
+        spoken: if label.is_empty() {
+            String::new()
+        } else {
+            format!("{label}: {value}")
+        },
+        tone,
+    }
+}
+
+fn trailed(label: &str, trail: &str, enabled: bool, checked: bool) -> MenuRow {
+    MenuRow::Item {
+        glyph: "\u{2386}",
+        label: label.into(),
+        spoken: format!("{label}, {trail}"),
+        act: MenuAct::Fact(Fact::Account, FactAct::AccountSettings),
+        enabled,
+        checked,
+        trail: trail.into(),
+    }
+}
+
+/// The rows of [`grouped_card`], by index.
+const GROUP_TOKEN: usize = 1;
+const GROUP_BUDGET: usize = 2;
+const GROUP_MACHINE: usize = 3;
+const GROUP_CONTINUED: usize = 4;
+const GROUP_HEADING: usize = 5;
+const GROUP_CHECKED: usize = 6;
+const GROUP_PLAIN: usize = 7;
+const GROUP_DISABLED: usize = 8;
+
+/// A card of groups: a header, a fact in each tone, a row that continues the last, a group
+/// heading, and three choices with trailing words (one checked, one plain, one disabled).
+fn grouped_card() -> Vec<MenuRow> {
+    vec![
+        MenuRow::Header("Account \u{b7} tab 2".into()),
+        fact("Token", "none in the vault", NoteTone::Value),
+        fact("Budget", "out until Sat 10:00", NoteTone::Warn),
+        fact("Machine", "use there not known:", NoteTone::Label),
+        fact("", "no other Mac is read", NoteTone::Label),
+        MenuRow::Section("Switch this Mac to".into()),
+        trailed("alpha@example.test", "61% left", true, true),
+        trailed("beta@example.test", "\u{2264}88% left", true, false),
+        trailed("gamma@example.test", "not signed in", false, false),
+    ]
+}
+
+fn every_shipped_theme() -> Vec<(String, aterm_render::Theme)> {
+    let builtins = aterm_types::scheme::builtin_names()
+        .into_iter()
+        .filter_map(|name| Some((name.to_owned(), aterm_types::scheme::builtin(name)?)));
+    let packs = aterm_theme_pack::themes().iter().map(|theme| {
+        let scheme = aterm_types::scheme::parse_scheme_str(theme.text).expect("a pack theme");
+        (theme.id.to_owned(), scheme)
+    });
+    builtins
+        .chain(packs)
+        .map(|(name, scheme)| (name, aterm_render::Theme::from(&scheme)))
+        .collect()
+}
+
+/// A GROUP HEADING AND A NAMED FACT ON THE CELL CARD. A heading is its title, bold in the value
+/// ink, a blank, then the rule to the text's end, inside the border on a glass card and a plain
+/// one alike. A fact is its name in the label ink from the first text cell and its value from
+/// the name column's end ([`FACT_LABEL_CELLS`]) in its tone's ink, the warn one bold; a row that
+/// continues a fact leaves the name column blank. On every shipped theme and every glass the
+/// name's ink reads at 4.5:1 on the card.
+#[test]
+fn a_group_heading_and_a_fact_paint_their_title_rule_and_two_columns() {
+    let rows = grouped_card();
+    let rect = MenuRect {
+        row: 0,
+        col: 0,
+        w: 48,
+        h: rows.len() + 2,
+    };
+    let (text_start, text_end) = text_span(rect.w, &rows);
+    assert_eq!((text_start, text_end), (2, 46), "padded: the card has room");
+    let value_at = text_start + FACT_LABEL_CELLS;
+    let said = |cells: &[RenderCell]| cells.iter().map(|c| c.ch).collect::<String>();
+    let themes = every_shipped_theme();
+    assert!(themes.len() > 37, "{} themes swept", themes.len());
+    for (name, theme) in themes {
+        for palette in [
+            None,
+            Some(CardPalette::Cruise),
+            Some(CardPalette::Land),
+            Some(CardPalette::Off),
+        ] {
+            let at = format!("{name} {palette:?}");
+            let (c, inks) = card_inks(theme, palette);
+            let painted = paint(rect, &rows, MenuViewport::default(), None, theme, palette);
+            assert_eq!(painted.len(), rect.h, "{at}");
+            let line = |i: usize| &painted[1 + i];
+            assert!(
+                crate::native_appearance::contrast_ratio(c.band.label, c.card_bg) >= 4.5,
+                "{at}: a fact's name reads on the card"
+            );
+
+            let heading = line(GROUP_HEADING);
+            let title = "Switch this Mac to";
+            let rule_from = text_start + title.len() + 1;
+            assert_eq!(said(&heading[text_start..rule_from - 1]), title, "{at}");
+            for cell in &heading[text_start..rule_from - 1] {
+                assert_eq!((cell.fg, cell.bold), (c.band.value, true), "{at}");
+            }
+            assert_eq!(heading[rule_from - 1].ch, ' ', "{at}: one blank");
+            for cell in &heading[rule_from..text_end] {
+                assert_eq!((cell.ch, cell.fg), ('\u{2500}', c.rule), "{at}");
+            }
+            assert_eq!(
+                (heading[0].ch, heading[rect.w - 1].ch, heading[text_end].ch),
+                ('\u{2502}', '\u{2502}', ' '),
+                "{at}: the rule stays inside the border"
+            );
+
+            for (i, label, value, ink, bold) in [
+                (
+                    GROUP_TOKEN,
+                    "Token",
+                    "none in the vault",
+                    c.band.value,
+                    false,
+                ),
+                (
+                    GROUP_BUDGET,
+                    "Budget",
+                    "out until Sat 10:00",
+                    unpack(inks.warn()),
+                    true,
+                ),
+                (
+                    GROUP_MACHINE,
+                    "Machine",
+                    "use there not known:",
+                    c.band.label,
+                    false,
+                ),
+                (
+                    GROUP_CONTINUED,
+                    "",
+                    "no other Mac is read",
+                    c.band.label,
+                    false,
+                ),
+            ] {
+                let cells = line(i);
+                assert_eq!(
+                    said(&cells[text_start..value_at]).trim_end(),
+                    label,
+                    "{at}: the name column"
+                );
+                for cell in &cells[text_start..text_start + label.len()] {
+                    assert_eq!((cell.fg, cell.bold), (c.band.label, false), "{at} {label}");
+                }
+                let end = value_at + value.len();
+                assert_eq!(said(&cells[value_at..end]), value, "{at}");
+                for cell in &cells[value_at..end] {
+                    assert_eq!((cell.fg, cell.bold), (ink, bold), "{at} {label}");
+                }
+                assert!(cells.iter().all(|cell| cell.bg == c.card_bg), "{at}");
+            }
+        }
+    }
+}
+
+/// AN ITEM'S TRAILING WORDS: right-aligned to one edge, the cell a check begins at, on a
+/// checked row and an unchecked one alike, in the row's own ink: the selection's on the
+/// highlighted row, the disabled ink on a row that cannot be chosen. In a card too narrow for
+/// both, the label gives way and the trail stays whole.
+#[test]
+fn an_items_trail_ends_where_a_check_begins_in_the_rows_own_ink() {
+    let theme = aterm_render::Theme {
+        fg: 0x00E0_E0E0,
+        bg: 0x0018_1818,
+        cursor: 0x00FF_FFFF,
+        selection: 0x0044_4466,
+    };
+    let rows = grouped_card();
+    let said = |cells: &[RenderCell]| cells.iter().map(|c| c.ch).collect::<String>();
+    let rect = MenuRect {
+        row: 0,
+        col: 0,
+        w: 48,
+        h: rows.len() + 2,
+    };
+    let (text_start, text_end) = text_span(rect.w, &rows);
+    let edge = text_end - CHECK_CELLS;
+    let (c, _) = card_inks(theme, Some(CardPalette::Cruise));
+    let painted = paint(
+        rect,
+        &rows,
+        MenuViewport::default(),
+        Some(GROUP_PLAIN),
+        theme,
+        Some(CardPalette::Cruise),
+    );
+    for (i, label, trail, (fg, bg, bold)) in [
+        (
+            GROUP_CHECKED,
+            "\u{2386}  alpha@example.test",
+            "61% left",
+            (c.band.value, c.card_bg, false),
+        ),
+        (
+            GROUP_PLAIN,
+            "\u{2386}  beta@example.test",
+            "\u{2264}88% left",
+            (c.sel_fg, c.sel_bg, true),
+        ),
+        (
+            GROUP_DISABLED,
+            "\u{2386}  gamma@example.test",
+            "not signed in",
+            (c.disabled, c.card_bg, false),
+        ),
+    ] {
+        let cells = &painted[1 + i];
+        let from = edge - trail.chars().count();
+        assert_eq!(said(&cells[from..edge]), trail, "row {i}");
+        for cell in &cells[from..edge] {
+            assert_eq!((cell.fg, cell.bg, cell.bold), (fg, bg, bold), "row {i}");
+        }
+        assert_eq!(
+            said(&cells[text_start..from]).trim_end(),
+            label,
+            "row {i}: the label, whole"
+        );
+        assert_eq!(
+            cells[text_end - 1].ch,
+            if i == GROUP_CHECKED { '\u{25cf}' } else { ' ' },
+            "row {i}: the check's own cell"
+        );
+    }
+
+    let narrow = MenuRect { w: 30, ..rect };
+    let (text_start, text_end) = text_span(narrow.w, &rows);
+    assert_eq!((text_start, text_end), (1, 29), "no room: no padding");
+    let painted = paint(narrow, &rows, MenuViewport::default(), None, theme, None);
+    let cells = &painted[1 + GROUP_DISABLED];
+    let trail = "not signed in";
+    let from = text_end - CHECK_CELLS - trail.len();
+    assert_eq!(said(&cells[from..text_end - CHECK_CELLS]), trail);
+    let label = said(&cells[text_start..from]);
+    assert!(
+        label.starts_with("\u{2386}  gamma") && label.trim_end().ends_with('\u{2026}'),
+        "{label:?}"
+    );
+    assert!(
+        label.ends_with("  "),
+        "{label:?}: two blanks before the trail"
+    );
+}
+
+/// WHAT A GROUP HEADING, A FACT AND A TRAIL ARE TO THE CARD'S MODEL. A heading keeps its place
+/// while its title is the same and a fact while its name is, whatever its value, so a card
+/// built again with a new figure moves no row; a row that left leaves a gap of its width. An
+/// item whose trail changed is the same place and another choice. A row's reader identity is a
+/// heading's title, a fact's name, value and tone, and an item's trail. Neither a heading nor a
+/// fact is a row to choose, and a card opens in no fewer rows than stand before its first
+/// heading.
+#[test]
+fn a_group_heading_a_fact_and_a_trail_in_the_cards_model() {
+    use std::hash::{Hash, Hasher};
+    let hash = |row: &MenuRow| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        row.hash(&mut h);
+        h.finish()
+    };
+    let shown = grouped_card();
+    assert!(
+        shown[..=GROUP_HEADING].iter().all(|row| !row.selectable()),
+        "a heading and a fact are no choice"
+    );
+    assert_eq!(
+        shown[GROUP_PLAIN].text(),
+        "\u{2386}  beta@example.test  \u{2264}88% left"
+    );
+    assert_eq!(shown[GROUP_TOKEN].text(), "Token    none in the vault");
+    assert_eq!(
+        shown[GROUP_CONTINUED].text(),
+        "         no other Mac is read"
+    );
+    assert_eq!(fact("Token", "", NoteTone::Label).text(), "Token");
+    assert_eq!(
+        fact("A long name", "its value", NoteTone::Label).text(),
+        "A long name its value",
+        "a name past its column keeps a blank before the value"
+    );
+
+    let mut fresh = shown.clone();
+    fresh[GROUP_TOKEN] = fact("Token", "in the vault", NoteTone::Value);
+    fresh[GROUP_PLAIN] = trailed("beta@example.test", "out", true, false);
+    assert!(same_place(&shown[GROUP_TOKEN], &fresh[GROUP_TOKEN]));
+    assert!(same_place(&shown[GROUP_PLAIN], &fresh[GROUP_PLAIN]));
+    assert!(
+        !same_choice(&shown[GROUP_PLAIN], &fresh[GROUP_PLAIN]),
+        "another trail is another choice"
+    );
+    assert!(same_choice(&shown[GROUP_PLAIN], &shown[GROUP_PLAIN]));
+    assert_eq!(
+        keep_places(&shown, &fresh).as_deref(),
+        Some(&fresh[..]),
+        "a new value and a new trail move no row"
+    );
+    for i in [GROUP_TOKEN, GROUP_PLAIN] {
+        assert_ne!(hash(&shown[i]), hash(&fresh[i]), "row {i} reads anew");
+    }
+
+    let mut left = shown.clone();
+    left.remove(GROUP_BUDGET);
+    let laid = keep_places(&shown, &left).expect("only a row left");
+    assert_eq!(
+        laid[GROUP_BUDGET],
+        MenuRow::Gap(row_width(&shown[GROUP_BUDGET]))
+    );
+    assert_eq!(laid[GROUP_HEADING], shown[GROUP_HEADING]);
+
+    let mut retitled = shown.clone();
+    retitled[GROUP_HEADING] = MenuRow::Section("Switch to".into());
+    assert!(!same_place(&shown[GROUP_HEADING], &retitled[GROUP_HEADING]));
+    assert_ne!(hash(&shown[GROUP_HEADING]), hash(&retitled[GROUP_HEADING]));
+    assert!(!same_place(
+        &shown[GROUP_TOKEN],
+        &fact("Login", "none in the vault", NoteTone::Value)
+    ));
+    assert!(!same_place(&shown[GROUP_HEADING], &MenuRow::Rule));
+    assert_ne!(
+        hash(&shown[GROUP_TOKEN]),
+        hash(&fact("Token", "none in the vault", NoteTone::Warn)),
+        "a tone is read"
+    );
+    let MenuRow::Fact {
+        label, value, tone, ..
+    } = shown[GROUP_TOKEN].clone()
+    else {
+        unreachable!("a fact")
+    };
+    let respoken = MenuRow::Fact {
+        label,
+        value,
+        tone,
+        spoken: "said another way".into(),
+    };
+    assert_eq!(
+        hash(&shown[GROUP_TOKEN]),
+        hash(&respoken),
+        "as a note's: its words are its identity"
+    );
+
+    assert_eq!(least_rows(&shown), GROUP_HEADING + 2, "its head and border");
+    let mut ruled = shown.clone();
+    ruled.insert(2, MenuRow::Rule);
+    assert_eq!(least_rows(&ruled), 2 + 2, "the first rule or heading");
+}
+
+/// A GROUPED CARD AS A CLIENT AND A SCREEN READER READ IT. `controls fact-menu` gives a heading
+/// a `section` line and a fact a `fact` line with its name, tone and value, and an item's
+/// `text=` carries its trail. The menu's name folds each heading's title and each fact's words
+/// in, in row order; a row that continues a fact adds nothing.
+#[test]
+fn a_grouped_card_is_read_by_controls_and_named_in_row_order() {
+    let (mut app, wid, _session, host) = claude_app();
+    let _host = MenuTestHost(host);
+    frame(&mut app, wid);
+    open_card(&mut app);
+    let before = app.autopilot_menu.as_ref().unwrap().rows.len();
+    relay(&mut app, wid, |rows| {
+        rows.extend(grouped_card().into_iter().skip(GROUP_BUDGET));
+    });
+    frame(&mut app, wid);
+    let at = |i: usize| before + i - GROUP_BUDGET;
+    let lines = app.autopilot_menu.as_ref().unwrap().controls_lines("7");
+    let line = |i: usize| lines[1 + at(i)].clone();
+    assert_eq!(
+        line(GROUP_BUDGET),
+        format!(
+            "fact-menu fact index={} label=\"Budget\" tone=warn text=\"out until Sat 10:00\"",
+            at(GROUP_BUDGET)
+        )
+    );
+    assert_eq!(
+        line(GROUP_MACHINE),
+        format!(
+            "fact-menu fact index={} label=\"Machine\" tone=label text=\"use there not known:\"",
+            at(GROUP_MACHINE)
+        )
+    );
+    assert_eq!(
+        line(GROUP_CONTINUED),
+        format!(
+            "fact-menu fact index={} label=\"\" tone=label text=\"no other Mac is read\"",
+            at(GROUP_CONTINUED)
+        )
+    );
+    assert_eq!(
+        line(GROUP_HEADING),
+        format!(
+            "fact-menu section index={} text=\"Switch this Mac to\"",
+            at(GROUP_HEADING)
+        )
+    );
+    assert_eq!(
+        line(GROUP_CHECKED),
+        format!(
+            "fact-menu item index={} key=fact-menu/account/account-settings enabled=true \
+             checked=true selected=false text=\"\u{2386}  alpha@example.test  61% left\"",
+            at(GROUP_CHECKED)
+        )
+    );
+    #[cfg(a11y_tree)]
+    {
+        let menu = app.autopilot_grid_menu(wid).expect("painted");
+        assert!(
+            menu.label.ends_with(
+                ", Budget: out until Sat 10:00, Machine: use there not known:, Switch this Mac to"
+            ),
+            "{}",
+            menu.label
+        );
+        let said: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            said.ends_with(&[
+                "alpha@example.test, 61% left",
+                "beta@example.test, \u{2264}88% left",
+                "gamma@example.test, not signed in"
+            ]),
+            "{said:?}"
+        );
+    }
 }

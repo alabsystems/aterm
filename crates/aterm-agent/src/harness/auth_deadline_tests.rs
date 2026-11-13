@@ -330,7 +330,11 @@ fn read_to_end_checks_the_deadline_again_after_partial_input() {
             let _ = socket.shutdown(std::net::Shutdown::Write);
             let mut from_client = Vec::new();
             if let Err(error) = socket.read_to_end(&mut from_client) {
-                assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+                // The client closes with `y` unread, which resets the connection; Windows may
+                // name that reset an abort of this end (WSAECONNABORTED).
+                let reset = error.kind() == io::ErrorKind::ConnectionReset
+                    || cfg!(windows) && error.kind() == io::ErrorKind::ConnectionAborted;
+                assert!(reset, "{error}");
             }
             from_client
         });

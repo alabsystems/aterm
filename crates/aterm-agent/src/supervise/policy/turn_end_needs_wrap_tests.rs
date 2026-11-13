@@ -231,17 +231,15 @@ fn a_need_past_an_exactly_full_row_is_read_whole() {
     }
 }
 
-/// A BARE HEAD BEFORE A FINITE AUXILIARY IS PROSE on Claude Code, agy and Muse Code at 80 columns
-/// and at 50 (live 2026-11-04: `claude needs you: can be lost.` in `aterm ctl survey`): the
+/// A BARE HEAD ITS CLAUSE HAS FOR SUBJECT IS PROSE on Claude Code, agy and Muse Code at 80
+/// columns and at 50 (live 2026-11-04: `claude needs you: can be lost.` in `aterm ctl survey`): the
 /// incident's bullet, as written and as drawn, and the same sentence wrapped so that a row opens
-/// on the head, name no need. A question after a bare head, wrapped by the width, is one need read
-/// whole: its rows join the head's row (`needs::apart`). NEGATIVE CONTROL: on the reader before
-/// the rule each prose screen named `can be lost. …`, and the question named the same need.
+/// on the head, name no need. A question after a bare head, and a modal and its verb after one,
+/// wrapped by the width, are each one need read whole: its rows join the head's row
+/// (`needs::apart`).
 #[test]
-fn a_bare_head_before_an_auxiliary_is_prose_on_every_reader() {
+fn a_bare_head_its_clause_has_for_subject_is_prose_on_every_reader() {
     const LOST: &str = "NEEDS YOU can be lost. Nothing else is open.";
-    const QUESTION: &str = "NEEDS YOU can the release go out today, or should it wait for the \
-                            notary to answer the ticket?";
     for (program, cols) in PANES {
         let room = room(program, cols);
         let at = format!("{program:?} at {cols}");
@@ -267,12 +265,19 @@ fn a_bare_head_before_an_auxiliary_is_prose_on_every_reader() {
             Vec::<String>::new(),
             "{at}: {rows:#?}"
         );
-        assert!(ink_wrap(QUESTION, room).len() > 1, "{at}");
-        let rows = reply_screen(program, cols, &[&["Merged the parser."], &[QUESTION]]);
-        assert_eq!(
-            needs_at_point(program, &rows),
-            [QUESTION.trim_start_matches("NEEDS YOU ")],
-            "{at}: {rows:#?}"
-        );
+        for need in [
+            "NEEDS YOU is the release key still valid for the notary's ticket, or should it be \
+             rotated before the release goes out?",
+            "NEEDS YOU must log in to the Apple Developer portal and accept the new agreement \
+             before the notary run.",
+        ] {
+            assert!(ink_wrap(need, room).len() > 1, "{at}");
+            let rows = reply_screen(program, cols, &[&["Merged the parser."], &[need]]);
+            assert_eq!(
+                needs_at_point(program, &rows),
+                [need.trim_start_matches("NEEDS YOU ")],
+                "{at}: {rows:#?}"
+            );
+        }
     }
 }

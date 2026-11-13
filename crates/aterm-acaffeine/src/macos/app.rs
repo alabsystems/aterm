@@ -9,12 +9,14 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use aterm_macos_ui::appkit::class;
+use aterm_macos_ui::status_button::current_event;
 use aterm_objc::send::{
-    send_bool_isize, send_f64, send_id, send_id_idptr_usize,
-    send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_isize, send_u32, send_usize,
-    send_v, send_v_id, send_v_id_bool, send_v_id_sel_id_id, send_v_sel_id_f64,
+    send_bool_isize, send_id, send_id_idptr_usize,
+    send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_isize, send_u32, send_v,
+    send_v_id, send_v_id_bool, send_v_id_sel_id_id, send_v_sel_id_f64,
 };
 use aterm_objc::{Bool, CGPoint, Id, MainThread, Obj, Retained, Sel, autoreleasepool, sel};
+use aterm_types::status_click::{self, Click, EventKey};
 
 use super::ServeContext;
 use super::awake::{AWAKE_REASON, Awake};
@@ -25,20 +27,15 @@ use super::ui::{self, StatusUi};
 use super::watch::Watch;
 use crate::instance::Instance;
 use crate::launchd::{self, Startup, StartupDoors};
-use crate::menu::{self, Click, Face, MenuAction, Row, Shown};
+use crate::menu::{self, Face, MenuAction, Row, Shown};
 use crate::model::{Clocks, Hold, Machine, Mode};
-use crate::notify::ChangedObserver;
 use crate::paths::Paths;
 use crate::state;
 
 /// `NSApplicationActivationPolicyAccessory`.
 const ACTIVATION_POLICY_ACCESSORY: isize = 1;
-/// `NSEventTypeRightMouseUp`.
-const EVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
 /// `NSEventTypeApplicationDefined`.
 const EVENT_TYPE_APPLICATION_DEFINED: usize = 15;
-/// `NSEventModifierFlagControl`.
-const MODIFIER_FLAG_CONTROL: usize = 1 << 18;
 /// `NSControlStateValueOn`, a checked menu item's `-state`.
 const CONTROL_STATE_ON: isize = 1;
 /// How often the mug looks again (the time left it shows, a deadline, the update watch).
@@ -102,29 +99,6 @@ const fn next_tick_secs(mode: Mode, now: Clocks) -> u64 {
         Some(left) if left < TICK_SECS => left + 1,
         _ => TICK_SECS,
     }
-}
-
-/// What a click with the event `(type, modifier flags)` means.
-fn click_of(event: Option<(usize, usize)>) -> Click {
-    let (kind, flags) = event.unwrap_or((0, 0));
-    menu::classify_click(
-        kind == EVENT_TYPE_RIGHT_MOUSE_UP,
-        flags & MODIFIER_FLAG_CONTROL != 0,
-    )
-}
-
-/// An event as [`click_from`] tells one from another.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct EventKey {
-    kind: usize,
-    flags: usize,
-    at: f64,
-}
-
-/// What a press of the button means when the app's current event is `event`.
-fn click_from(event: Option<EventKey>, stale: Option<EventKey>) -> Click {
-    let fresh = event.filter(|event| Some(*event) != stale);
-    click_of(fresh.map(|event| (event.kind, event.flags)))
 }
 
 /// Both clocks, read now ([`state::clocks`]).
@@ -567,7 +541,7 @@ impl Mug {
 struct TargetIvars {
     /// A `RefCell` because AppKit messages the target through `&self`.
     mug: RefCell<Mug>,
-    /// Current event when the last press was read or menu closed ([`click_from`]).
+    /// Current event when the last press was read or menu closed ([`status_click::classify`]).
     stale: Cell<Option<EventKey>>,
     /// Whether the menu is open ([`ui::pop_up`]).
     tracking: Cell<bool>,
@@ -584,19 +558,19 @@ aterm_objc::declare_class! {
         /// The button was released.
         @sel(statusClicked:)
         fn status_clicked(&self, _sender: Id) {
-            if MainThread::new().is_none() {
+            let Some(main) = MainThread::new() else {
                 return;
-            }
+            };
             let now = now();
-            let event = autoreleasepool(|_| current_event());
-            let click = click_from(event, self.ivars().stale.replace(event));
-            match click {
-                Click::Toggle => self.handle_choice(|mug| mug.toggle(now)),
+            let event = current_event(main);
+            // The mug toggles on every primary click, a double-click's second one included.
+            match status_click::classify(event, self.ivars().stale.replace(event)) {
+                Click::Primary => self.handle_choice(|mug| mug.toggle(now)),
                 Click::Menu => self.show_menu(now),
             }
         }
 
-        /// The button's [`ui::SHOW_MENU`] accessibility action.
+        /// The button's [`aterm_macos_ui::status_button::SHOW_MENU`] accessibility action.
         @sel(showMenuAction:)
         fn show_menu_action(&self, _action: Id) -> Bool {
             if MainThread::new().is_none() {
@@ -778,7 +752,9 @@ impl CaffeineTarget {
             self.ivars().tracking.set(true);
             ui::pop_up(&popup);
             self.ivars().tracking.set(false);
-            self.ivars().stale.set(autoreleasepool(|_| current_event()));
+            self.ivars()
+                .stale
+                .set(MainThread::new().and_then(current_event));
             autoreleasepool(|_| drop(popup));
         }
     }
@@ -844,24 +820,6 @@ fn shared_app() -> Id {
     // SAFETY: `+sharedApplication` is `@16@0:8`; every caller is on the main thread, and the app
     // it answers (+0) lives as long as the process.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
-}
-
-/// The app's current event.
-fn current_event() -> Option<EventKey> {
-    let app = shared_app();
-    if app.is_null() {
-        return None;
-    }
-    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or nil;
-    // on it `-type` and `-modifierFlags` are `Q16@0:8` and `-timestamp` `d16@0:8`.
-    unsafe {
-        let event = send_id(app, sel!(currentEvent));
-        (!event.is_null()).then(|| EventKey {
-            kind: send_usize(event, sel!(type)),
-            flags: send_usize(event, sel!(modifierFlags)),
-            at: send_f64(event, sel!(timestamp)),
-        })
-    }
 }
 
 /// `-[NSAppleEventDescriptor attributeDescriptorForKeyword:]`, `@20@0:8I16`.
@@ -1367,7 +1325,7 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
     let changed = {
         let target = target.clone_retained();
         // SAFETY (in the hook): `stateChanged:` is `v@:@` on the live target it retains.
-        ChangedObserver::register(move || unsafe {
+        crate::notify::observe_changed(move || unsafe {
             send_v_id(target.as_id(), sel!(stateChanged:), Id::NIL);
         })
     };

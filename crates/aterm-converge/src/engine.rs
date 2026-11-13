@@ -252,12 +252,13 @@ pub fn run_scoped(
                     .then(|| unmet_prerequisite(item, &rows))
                     .flatten();
                 match blocker {
-                    Some((on, Some(aside))) => {
+                    Some((on, Some((aside, origin)))) => {
                         let mut row = blank(item);
                         row.outcome = Outcome::Blocked;
                         row.why = Some(format!("waits for {on}: {}", aside.why()));
                         row.explain = Some(explain_aside(item, &aside));
                         row.stood_aside = Some(aside);
+                        row.waits_on = Some(origin);
                         (row, false)
                     }
                     Some((on, None)) => {
@@ -450,14 +451,21 @@ fn finish(item: &dyn Item, row: &mut ItemReport, last: &Probe) {
     }
 }
 
+/// The first row `item` waits for ([`Item::after`]) that did not end `Ok` or `Changed`: its id,
+/// and, where it stood aside, its stand-aside with the row that stand-aside comes from (the row
+/// itself, or the one it in turn inherited it from, [`ItemReport::waits_on`]).
 fn unmet_prerequisite(
     item: &dyn Item,
     rows: &[ItemReport],
-) -> Option<(String, Option<StoodAside>)> {
+) -> Option<(String, Option<(StoodAside, String)>)> {
     for want in item.after() {
         for row in rows.iter().filter(|r| names(&want, &r.id)) {
             if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
-                return Some((row.id.clone(), row.stood_aside.clone()));
+                let origin = row.waits_on.clone().unwrap_or_else(|| row.id.clone());
+                return Some((
+                    row.id.clone(),
+                    row.stood_aside.clone().map(|aside| (aside, origin)),
+                ));
             }
         }
     }
@@ -480,6 +488,7 @@ fn blank(item: &dyn Item) -> ItemReport {
         class: Some(item.class()),
         explain: None,
         stood_aside: None,
+        waits_on: None,
         essential: item.essential(),
         elapsed_ms: None,
     }
@@ -644,7 +653,7 @@ fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
     let why = aside.why().to_owned();
     let remedy = match aside {
         StoodAside::Offline(_) => Remedy::Network,
-        StoodAside::Lock(_) | StoodAside::Waiting(_) => {
+        StoodAside::Lock(_) | StoodAside::Waiting(_) | StoodAside::Absent(_) => {
             item.explain(&Probe::Deferred { why: why.clone() }).remedy
         }
         StoodAside::Permission(_) => item.explain(&Probe::Blocked { why: why.clone() }).remedy,

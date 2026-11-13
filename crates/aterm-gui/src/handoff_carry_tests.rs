@@ -628,9 +628,9 @@ fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
 #[test]
 fn fleet_turn_identity_survives_sidecar_and_adopted_ledger_without_reading_turn_text() {
     let (term, turns) = session(10);
-    let actor = crate::session_store::ExitActor::fleet("m72 / remote=desk");
-    let by = TurnBy::from_wire(actor.as_wire());
-    assert!(matches!(by, TurnBy::Fleet(_)));
+    let sid = aterm_session::SessionId::generate();
+    let by = TurnBy::fleet(&"87be5228".repeat(4), Some(sid.as_str()));
+    assert_eq!(by.as_wire(), format!("fleet:87be5228:{}", sid.as_str()));
     let mut turn = record(1, true, ArchMark::of(&term.lock().unwrap()));
     turn.by = by.clone();
     turn.text = "by=harness fleet:somebody-else".into();
@@ -661,7 +661,7 @@ fn fleet_turn_identity_survives_sidecar_and_adopted_ledger_without_reading_turn_
     );
     assert_eq!(
         previous,
-        Some(aterm_json::Value::String(actor.as_wire().to_owned()))
+        Some(aterm_json::Value::String(by.as_wire().to_owned()))
     );
     let malformed = aterm_json::to_vec(&wire).unwrap();
     let decoded = decode(&malformed).unwrap();

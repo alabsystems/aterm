@@ -29,7 +29,7 @@ impl App {
         let (session, stage) = if let Some((session, recovered)) = existing {
             (session, if recovered { "adopted" } else { "seeded" })
         } else {
-            if self.workstation_setup.developer_tools_mark.opened() {
+            if self.workstation_setup.developer_tools_mark.held().is_some() {
                 return Ok(());
             }
             let child = self.pool.get(0).ok_or("missing initial fixture terminal")?;
@@ -48,19 +48,14 @@ impl App {
             if !self.workstation_setup.developer_tools_mark.claim() {
                 return Err("fixture installer mark was already claimed or unavailable".into());
             }
-            let record = receipt::Receipt::for_child(
-                &mark,
-                &sid,
-                pid,
-                birth,
-                Some(&aterm_stamp::build_id()),
-            )
-            .ok_or("fixture child has no exact native identity")?;
+            let claim = self.workstation_setup.developer_tools_mark.hand(pid);
+            let record = receipt::Receipt::for_child(&mark, &sid, pid, birth, claim.as_ref())
+                .ok_or("fixture child has no exact native identity")?;
             record
                 .write_exclusive()
                 .map_err(|error| error.to_string())?;
             let mut terminal = Terminal::running(0, false, Some(record));
-            terminal.claim_owner = Some(aterm_stamp::build_id());
+            terminal.claim = claim;
             self.workstation_setup
                 .developer_tools_session
                 .push(terminal);

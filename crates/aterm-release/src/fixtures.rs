@@ -194,19 +194,33 @@ pub fn generator_args() -> Vec<&'static str> {
 /// fixture target itself.
 pub(crate) struct GeneratorIndex {
     tree: PathBuf,
+    plan: aterm_verify::NativeBuildPlan,
     path: PathBuf,
     tree_id: String,
     compiler: String,
 }
 
+/// One compiler layout shared by an explicit diagnostic tree and its fixture handoff.
+pub(crate) type CompileLayout = aterm_verify::NativeBuildPlan;
+
 impl GeneratorIndex {
     /// Locate the test-executable index for `tree` and bind its candidate/compiler identity once.
     ///
     /// # Errors
-    /// The candidate is dirty or cannot be identified, or the compiler cannot report its identity.
+    /// The build layout cannot be resolved, the candidate is dirty or cannot be identified,
+    /// or the compiler cannot report its identity.
     pub(crate) fn new(targo: &Path, tree: &Path) -> Result<Self> {
+        let plan = crate::release_steps::verify_plan(tree)
+            .map_err(|e| Error::new(format!("handoff fixtures: generator layout: {e}")))?;
+        Self::from_plan(targo, tree, plan)
+    }
+
+    pub(crate) fn from_plan(
+        targo: &Path,
+        tree: &Path,
+        plan: aterm_verify::NativeBuildPlan,
+    ) -> Result<Self> {
         let tree = aterm_verify::physical(tree);
-        let (target, _) = crate::release_steps::verify_layout(&tree);
         let (tree_id, compiler) =
             aterm_verify::test_index::identities(&tree, targo).map_err(|e| {
                 Error::new(format!(
@@ -214,9 +228,11 @@ impl GeneratorIndex {
                     tree.display()
                 ))
             })?;
+        let path = plan.target().join("verify/test-executables.json");
         Ok(Self {
             tree,
-            path: target.join("verify/test-executables.json"),
+            plan,
+            path,
             tree_id,
             compiler,
         })
@@ -237,6 +253,20 @@ impl GeneratorIndex {
             .and_then(|index| self.selected(&index))
             .is_some()
     }
+}
+
+fn generator_compile_command(
+    targo: &Path,
+    tree: &Path,
+    plan: &aterm_verify::NativeBuildPlan,
+) -> Result<Command> {
+    let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, plan.target());
+    plan.apply_to_command(&mut compile)
+        .map_err(|e| Error::new(format!("generator compiler environment: {e}")))?;
+    if let Some(layout) = plan.build_dir() {
+        compile.arg("--config").arg(layout);
+    }
+    Ok(compile)
 }
 
 /// macOS assesses a first exec by path, even if a later compiler would replace its bytes.
@@ -276,6 +306,20 @@ pub fn stage(
     pins: &Pins,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
 ) -> Result<Staged> {
+    stage_with_layout(targo, tree, root, pins, None, run)
+}
+
+/// Use the measured verifier's target for both index reuse and any fallback compile.
+/// # Errors
+/// The same candidate, generator, execution-hold and I/O refusals as [`stage`].
+pub(crate) fn stage_with_layout(
+    targo: &Path,
+    tree: &Path,
+    root: &Path,
+    pins: &Pins,
+    layout: Option<&CompileLayout>,
+    run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
+) -> Result<Staged> {
     let physical_tree = aterm_verify::physical(tree);
     let tree = physical_tree.as_path();
     if let Some(found) = staged(root, pins) {
@@ -296,8 +340,10 @@ pub fn stage(
     let at = pins.staged_in(root);
     let dir = at.join(pins.tag());
     fs::create_dir_all(&dir).map_err(|e| io("cannot create", &dir, e))?;
-    let (target, layout) = crate::release_steps::verify_layout(tree);
-    let generator_index = GeneratorIndex::new(targo, tree)?;
+    let generator_index = match layout {
+        Some(plan) => GeneratorIndex::from_plan(targo, tree, plan.clone())?,
+        None => GeneratorIndex::new(targo, tree)?,
+    };
     let previous = aterm_verify::test_index::Index::read(&generator_index.path);
     if let Some(previous) = &previous {
         for entry in &previous.binaries {
@@ -313,10 +359,13 @@ pub fn stage(
     let entry = match previous.and_then(|i| generator_index.selected(&i)) {
         Some(entry) => entry,
         None => {
-            let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, &target);
-            if let Some(layout) = &layout {
-                compile.arg("--config").arg(layout);
-            }
+            let mut compile = generator_compile_command(targo, tree, &generator_index.plan)?;
+            generator_index.plan.prepare().map_err(|e| {
+                Error::new(format!(
+                    "handoff fixtures: prepare generator build directory: {e}"
+                ))
+            })?;
+
             let output = run(&mut compile).map_err(|e| io("cannot compile generator", targo, e))?;
             if !output.status.success() {
                 return Err(Error::new(format!(
@@ -787,7 +836,9 @@ impl MainReader {
     ) -> Result<()> {
         clear_marker(&self.scratch.join("prebuilt")).map_err(|e| Error::new(e.to_string()))?;
         let tree = self.prepare(revision)?;
-        let mut compile = self.compile_command(targo, &tree);
+        let (mut compile, plan) = self.compile_command(targo, &tree)?;
+        plan.prepare()
+            .map_err(|e| Error::new(format!("main reader prebuild directory: {e}")))?;
         let output = run(&mut compile).map_err(|e| Error::new(e.to_string()))?;
         if !output.status.success() {
             return Err(Error::new(format!(
@@ -899,13 +950,14 @@ impl MainReader {
         Ok(tree)
     }
 
-    fn compile_command(&self, targo: &Path, tree: &Path) -> Command {
-        let (target, layout) = crate::release_steps::verify_layout(&self.repo);
-        let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, &target);
-        if let Some(layout) = layout {
-            compile.arg("--config").arg(layout);
-        }
-        compile
+    fn compile_command(
+        &self,
+        targo: &Path,
+        tree: &Path,
+    ) -> Result<(Command, aterm_verify::NativeBuildPlan)> {
+        let plan = crate::release_steps::verify_plan_for_default_target(tree, &self.scratch);
+        let compile = generator_compile_command(targo, tree, &plan)?;
+        Ok((compile, plan))
     }
 
     /// Lease the clone's persistent, isolated reader workspace.
@@ -959,7 +1011,7 @@ impl MainReader {
             let tree = self.prepare(preview)?;
             // The stable source path keeps its own lane across releases; no live
             // directory is shared with the cut and no cross-root seeding is needed.
-            let mut compile = self.compile_command(targo, &tree);
+            let (mut compile, plan) = self.compile_command(targo, &tree)?;
             let compile_start = std::time::Instant::now();
             let messages = if let Some((_, messages)) = &prebuilt {
                 let at = rev_parse(&git, &format!("{preview}^"))?;
@@ -973,6 +1025,8 @@ impl MainReader {
                 let tip = rev_parse(&git, &format!("{requested}^"))
                     .unwrap_or_else(|_| requested.to_owned());
                 timings.push(format!("compiled {tip} (fixture preview {requested})"));
+                plan.prepare()
+                    .map_err(|e| Error::new(format!("main reader build directory: {e}")))?;
                 let compiled = run(&mut compile)
                     .map_err(|e| Error::new(format!("main reader compile: {e}")))?;
                 let units =
@@ -1483,154 +1537,5 @@ fn fixture_preview(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins)
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    /// Both prebuilt reuse (restricted to fixture inputs) and disjoint composition
-    /// (all paths) must see an octopus's parent-equal fixture resolution.
-    #[test]
-    fn octopus_fixture_history_is_not_a_combined_diff() {
-        use super::*;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = crate::ledger::GitCli::new(root);
-        let read = |args: &[&str]| git_ok(&git, args).unwrap().stdout_utf8().trim().to_owned();
-        read(&["init", "-q"]);
-        read(&["config", "user.name", "Fixture"]);
-        read(&["config", "user.email", "fixture@example.invalid"]);
-        std::fs::write(root.join("guard"), "old\n").unwrap();
-        read(&["add", "."]);
-        read(&["commit", "-qm", "a"]);
-        let a = read(&["rev-parse", "HEAD"]);
-        let old_tree = read(&["rev-parse", "HEAD^{tree}"]);
-        let b = read(&["commit-tree", &old_tree, "-p", &a, "-m", "b"]);
-        std::fs::write(root.join("guard"), "current\n").unwrap();
-        read(&["add", "."]);
-        let tree = read(&["write-tree"]);
-        let base = read(&["commit-tree", &tree, "-p", &a, "-p", &b, "-m", "released"]);
-        std::fs::write(root.join("manifest"), "kept\n").unwrap();
-        read(&["add", "."]);
-        let tree = read(&["write-tree"]);
-        let tip = read(&[
-            "commit-tree",
-            &tree,
-            "-p",
-            &base,
-            "-p",
-            &a,
-            "-p",
-            &b,
-            "-m",
-            "archive",
-        ]);
-        let restricted = touched(&git, &base, &tip, &["guard"]).unwrap();
-        let all = touched(&git, &base, &tip, &[]).unwrap();
-        assert_eq!(
-            restricted,
-            std::collections::BTreeSet::from([b"guard".to_vec()])
-        );
-        assert_eq!(
-            all,
-            std::collections::BTreeSet::from([b"guard".to_vec(), b"manifest".to_vec()])
-        );
-        assert!(touched(&git, &base, &base, &["guard"]).unwrap().is_empty());
-        // NEGATIVE CONTROL: the old range query hides guard, unsafely reusing or composing.
-        assert_eq!(
-            read(&[
-                "log",
-                "--format=",
-                "--name-only",
-                "--diff-merges=combined",
-                &format!("{base}..{tip}")
-            ]),
-            "manifest"
-        );
-    }
-
-    use super::files_under;
-
-    /// Historical forward windows, not a timing assertion or a release operation.
-    #[test]
-    #[ignore = "models seven-minute reader churn from local origin/main history"]
-    fn model_reader_refresh_windows() {
-        use super::*;
-        let root = aterm_tempfile::manifest_dir()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let git = crate::ledger::GitCli::new(&root);
-        let mut metadata = aterm_uds::spawnfd::command(crate::gates::resolve_targo().unwrap());
-        let metadata = metadata
-            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        assert!(metadata.status.success());
-        let inputs = reader_inputs::Inputs::from_metadata(&metadata.stdout, &root).unwrap();
-        let head =
-            std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "origin/main".into());
-        let history = git_ok(
-            &git,
-            &[
-                "log",
-                "--first-parent",
-                "--since=24 hours ago",
-                "--format=%ct %H",
-                &head,
-            ],
-        )
-        .unwrap()
-        .stdout_utf8();
-        let commits: Vec<_> = history
-            .lines()
-            .map(|line| {
-                let (time, sha) = line.split_once(' ').unwrap();
-                (time.parse::<i64>().unwrap(), sha)
-            })
-            .collect();
-        let mut samples = 0;
-        let mut cone = 0;
-        let mut fixtures = 0;
-        for &(time, base) in &commits {
-            if commits[0].0 < time + 420 {
-                continue;
-            }
-            let tip = commits.iter().find(|(t, _)| *t <= time + 420).unwrap().1;
-            let paths = git_ok(&git, &["diff", "--name-only", base, tip])
-                .unwrap()
-                .stdout_utf8();
-            samples += 1;
-            cone += usize::from(paths.lines().any(|p| !inputs.ignores(Path::new(p))));
-            let touched = touched(&git, base, tip, &[]).unwrap();
-            fixtures += usize::from(
-                touched
-                    .iter()
-                    .filter_map(|p| std::str::from_utf8(p).ok())
-                    .any(|p| {
-                        p.starts_with(HANDOFF_FIXTURE_ROOT)
-                            || p == HANDOFF_FIXTURE_GUARD
-                            || p == SHIPPED_STATE_CORPUS
-                    }),
-            );
-        }
-        println!(
-            "head {head}; 7-minute windows: {samples}; reader cone changed: {cone}; any fixture edit: {fixtures}"
-        );
-        assert!(samples > 0);
-    }
-
-    #[test]
-    fn files_under_ignores_symlinks() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub/a.txt"), b"ok").unwrap();
-        std::os::unix::fs::symlink(dir.path(), dir.path().join("sub/cycle")).unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("sub/a.txt"),
-            dir.path().join("sub/link.txt"),
-        )
-        .unwrap();
-        let found = files_under(dir.path()).unwrap();
-        assert_eq!(found, vec![("sub/a.txt".to_string(), b"ok".to_vec())]);
-    }
-}
+#[path = "fixtures_tests.rs"]
+mod tests;

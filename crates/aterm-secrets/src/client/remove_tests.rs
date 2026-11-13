@@ -998,6 +998,273 @@ fn an_undo_names_the_incarnation_with_removals_to_undo() {
     assert_eq!(named, first.actor());
 }
 
+/// SF-A: a person's `aterm members remove <Mac> --stolen` takes the Mac's writer successor out
+/// with it. m7 lets its own successor in on its statement, with nobody asked: a seat with an
+/// age identity of its own, under m7's name. m22 then removes m7 by that name, which names both
+/// seats. The removal resolves it to the Mac, cuts the tables of both writers before their
+/// `Remove`s, removes both in one batch, wraps the epoch it mints to neither, and writes both
+/// labels to the deny-list of the roster it reseals: a seat the batch removes is no other Mac
+/// that still holds its label.
+///
+/// NEGATIVE CONTROLS: in `draft_removal`, make the successors' list empty (`if by_person &&
+/// false`): the successor stays a member and the `"both seats are removed"` assert fails. Make
+/// `is_other_active_member` read the one recipient again (`rec != recipient`): the successor
+/// counts as another Mac holding its own label, and the deny-list assert fails.
+#[test]
+fn a_persons_removal_of_a_stolen_mac_cuts_removes_and_denies_its_writer_successor() {
+    use crate::client::{Succeeding, Succession, admit_successor};
+    on_table_cuts(record_table_cuts);
+    let _answering = crate::client::ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    admin_seed_swarm_roster(m22, &[]).expect("roster");
+    sync(m7, None).expect("m7 syncs");
+    let (_, actor7, _) = member_key(m7);
+    let seat7 = log_of(m7)
+        .membership()
+        .get(&actor7)
+        .expect("m7's seat")
+        .clone();
+
+    // The home of m7's writer successor asks, and m7's own device signs for it.
+    let (home, request, statement) = asker(macs.root.path(), m7, "m7-successor", &seat7.name);
+    let successor = request.binding().clone();
+    let admitted = admit_successor(
+        m7,
+        &Succeeding {
+            request: &request,
+            statement: &statement,
+            reader: crate::members::bundle::Reader::BoundedLog(
+                records_bound(&home, &load_records(&home).expect("records")).expect("bound"),
+            ),
+            lab: false,
+        },
+        aterm_time::unix_millis().expect("clock"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("the admission");
+    assert!(matches!(admitted, Succession::Let { .. }), "{admitted:?}");
+    save_records(m22, &load_records(m7).expect("m7's records").encode()).expect("m22 hears");
+    let before = log_of(m22);
+    let heir = before
+        .membership()
+        .get(&successor.actor())
+        .expect("CONTROL: the log seats the successor")
+        .clone();
+    assert_eq!(
+        (heir.name.as_str(), heir.admitted_by, heir.node_key),
+        (seat7.name.as_str(), Some(actor7), None)
+    );
+    assert_ne!(successor.recipient(), seat7.binding.recipient());
+    let id22 = read_identity(m22).unwrap().unwrap();
+    let newest = |log: &Log| {
+        log.open_audience_entries(&id22)
+            .unwrap()
+            .unwrap()
+            .maximal_epochs[&EpochAudience::Everyone]
+            .clone()
+    };
+    assert!(
+        newest(&before)
+            .iter()
+            .all(|id| epochs_wrapped_to(&before, &successor.recipient()).contains(id)),
+        "CONTROL: the successor holds the newest [everyone] epoch before the removal"
+    );
+
+    let removal = remove_member(m22, &seat7.name, true).expect("m22 removes the stolen m7");
+    assert_eq!(removal.label, seat7.label);
+    let after = log_of(m22);
+    let membership = after.membership();
+    assert!(
+        membership.removal(&actor7).is_some() && membership.removal(&successor.actor()).is_some(),
+        "both seats are removed"
+    );
+    for gone in [successor.recipient(), seat7.binding.recipient()] {
+        assert!(
+            newest(&after)
+                .iter()
+                .all(|id| !epochs_wrapped_to(&after, &gone).contains(id)),
+            "no Wrap hands a key on the stolen disk the epoch minted because of the theft"
+        );
+    }
+    let calls: Vec<(MemberId, CutPass, bool)> = TABLE_CUT_CALLS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(dir, ..)| *dir == m22.dir)
+        .map(|(_, member, pass, seated)| (*member, *pass, *seated))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            (actor7, CutPass::BeforeRemove, true),
+            (successor.actor(), CutPass::BeforeRemove, true)
+        ],
+        "each writer's tables are cut once, before its Remove"
+    );
+    // The roster as the removal resealed it, before any reader overlays the log's removals.
+    let opened = after.open_audience_entries(&id22).unwrap().unwrap();
+    let roster = crate::swarm_roster::SwarmRoster::from_toml(
+        std::str::from_utf8(
+            opened.by_audience[&Audience::Everyone][crate::swarm_roster::ROSTER_ENTRY]
+                .value
+                .as_slice(),
+        )
+        .unwrap(),
+    )
+    .expect("the roster");
+    assert!(
+        roster.deny_labels.contains(&seat7.label) && roster.deny_labels.contains(&heir.label),
+        "{:?}",
+        roster.deny_labels
+    );
+    macs.server.stop();
+}
+
+/// SF-A: a Mac's writer successors are the seats one of its own seats admitted alone
+/// ([`crate::membership_log::Evidence::Manual`]), with no fleet node key, under the name the log
+/// gave the admitting seat when it came in, and theirs in turn. Every other seat the Mac
+/// admitted is a Mac of its own and stays when a person removes it: one under another name (a
+/// vault machine it enrolled), one with a fleet node key, one a person's phrase let in, and one
+/// another member admitted under that name. The Mac's name, which its successors carry, names
+/// the Mac to a removal; a successor is named by its own label.
+///
+/// NEGATIVE CONTROL: in `Lineages::of`, drop the name from the filter (`by != successor`
+/// alone): the vault machine reads as a successor of the Mac, and the assert on the successors
+/// the Mac itself admitted fails.
+#[test]
+fn a_macs_writer_successors_are_the_seats_it_admitted_alone_under_its_own_name() {
+    use crate::membership_log::{Entrant, Evidence};
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (remover, mac) = (seat(1), seat(2));
+    let (first, second, machine, fleet, phrase, other) =
+        (seat(11), seat(12), seat(13), seat(14), seat(15), seat(16));
+    let mut log = Log::new(
+        Record::found(&[99; 32], vec![remover.entrant("m1"), mac.entrant("m2")], 1)
+            .expect("genesis"),
+    )
+    .expect("log");
+    let admit = |log: &mut Log, by: &Seat, entrant: Entrant, evidence: Evidence| {
+        by.sign(log, Body::Admit { entrant, evidence });
+    };
+    let alone = |seat: &Seat, label: &str, name: &str| Entrant {
+        node_key: [0; 32],
+        name: name.to_owned(),
+        ..seat.entrant(label)
+    };
+    admit(
+        &mut log,
+        &mac,
+        alone(&first, "m11", "MAC-2"),
+        Evidence::Manual,
+    );
+    admit(
+        &mut log,
+        &first,
+        alone(&second, "m12", "mac-2"),
+        Evidence::Manual,
+    );
+    admit(
+        &mut log,
+        &mac,
+        alone(&machine, "m13", "mac-13"),
+        Evidence::Manual,
+    );
+    admit(
+        &mut log,
+        &mac,
+        Entrant {
+            name: "mac-2".to_owned(),
+            ..fleet.entrant("m14")
+        },
+        Evidence::Manual,
+    );
+    admit(
+        &mut log,
+        &mac,
+        alone(&phrase, "m15", "mac-2"),
+        Evidence::Phrase,
+    );
+    admit(
+        &mut log,
+        &remover,
+        alone(&other, "m16", "mac-2"),
+        Evidence::Manual,
+    );
+    let membership = log.membership();
+    assert_eq!(membership.members().len(), 8, "CONTROL: every seat is in");
+
+    let lineages = crate::client::successor::Lineages::of(&log);
+    assert_eq!(
+        lineages.of_member(&mac.actor()).collect::<Vec<_>>(),
+        vec![&first.actor()]
+    );
+    let successors = BTreeSet::from([first.actor(), second.actor()]);
+    assert_eq!(
+        lineages.under(&BTreeSet::from([mac.actor()])),
+        successors,
+        "the Mac's successors"
+    );
+    assert_eq!(
+        heirs_of(&log, &membership, &mac.actor(), &mac.identity.recipient()),
+        successors
+    );
+    assert!(
+        heirs_of(
+            &log,
+            &membership,
+            &remover.actor(),
+            &remover.identity.recipient()
+        )
+        .is_empty(),
+        "a seat a member admitted under another Mac's name is no successor of the member"
+    );
+
+    // The successors' own labels name each alone, and a successor's removal takes those below
+    // it, never the Mac above.
+    let (named, _, label) = removal_target(&log, "m11", &remover.actor()).expect("by its label");
+    assert_eq!((named, label.as_str()), (first.actor(), "m11"));
+    assert_eq!(
+        heirs_of(
+            &log,
+            &membership,
+            &first.actor(),
+            &first.identity.recipient()
+        ),
+        BTreeSet::from([second.actor()])
+    );
+
+    // With only the Mac and its successors under its name, the name names the Mac.
+    let mut lineage = Log::new(
+        Record::found(&[99; 32], vec![remover.entrant("m1"), mac.entrant("m2")], 1)
+            .expect("genesis"),
+    )
+    .expect("log");
+    admit(
+        &mut lineage,
+        &mac,
+        alone(&first, "m11", "mac-2"),
+        Evidence::Manual,
+    );
+    admit(
+        &mut lineage,
+        &first,
+        alone(&second, "m12", "mac-2"),
+        Evidence::Manual,
+    );
+    let (named, recipient, label) =
+        removal_target(&lineage, "mac-2", &remover.actor()).expect("the name names the Mac");
+    assert_eq!(
+        (named, recipient, label.as_str()),
+        (mac.actor(), mac.identity.recipient(), "m2")
+    );
+    let error = removal_target(&lineage, "mac-2", &mac.actor()).expect_err("its own name");
+    assert!(error.to_string().contains("itself"), "{error}");
+}
+
 /// F16's review: a founder the genesis lists that has proved no device key (a 0.145 Mac after
 /// F12b's Genesis v2), and a Mac only the vault's `[machines]` names, have no seat in the log, and
 /// the envelope 0.145 Macs read still lists them (an admin's mirror wraps the log's keys to every

@@ -1140,33 +1140,72 @@ NEED the task is complete || Merged and pushed main.\nNEEDS YOU: none at this ti
 NEED it's yours to publish || Merged and pushed main.\nNEEDS YOU: nothing; it's yours to publish.\nNothing left: all of it is on origin/main.
 NEED it's on you || Merged and pushed main.\nNEEDS YOU: nothing; it's on you to sign.\nNothing left: all of it is on origin/main.
 
-# A BARE HEAD BEFORE A FINITE AUXILIARY IS PROSE (live 2026-11-04: an agent's
-# bullet `- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended
-# on a usage wall …` showed in `aterm ctl survey` as `claude needs you: can be
-# lost.`). NEEDS YOU there is the subject of its clause; the needs reader read
-# the predicate as the need, and Land read the token's YOU as the person
-# (`you can`). The rows are the incident's, the triage's and CHANGELOG.md's
-# standing prose, verbatim, and a negative contraction; each named a need
-# before the rule but the last, a label before the head, which named none (a
-# control). Prose of the same shape that Land reads open on words of its own
-# (`is dropped`, `should stay`, `only a person can`) is held by needs_tests.rs,
-# not here: a NONE row lands.
+# A BARE HEAD ITS CLAUSE HAS FOR SUBJECT IS PROSE (live 2026-11-04: an
+# agent's bullet `- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that
+# ended on a usage wall …` showed in `aterm ctl survey` as `claude needs you:
+# can be lost.`). Before a singular finite (`is`, `was`, `has`, `does` and
+# their negatives) or a modal whose verb is `be`, NEEDS YOU is the subject of
+# its clause; the needs reader read the predicate as the need, and Land read
+# the token's YOU as the person (`you can`). The rows are the incident's, the
+# triage's and CHANGELOG.md's standing prose, verbatim, a negative
+# contraction, and a label before the head (a control: the reader before the
+# rule named no need there either). Prose of the same shape that Land reads
+# open on words of its own (`is dropped`, `only a person can`) is held by
+# needs_tests.rs, not here: a NONE row lands.
 NONE || Merged and pushed main.\n- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …\nNothing left: all on origin/main.
 NONE || NEEDS YOU is now read only past a colon.\nNothing left: all on origin/main.
 NONE || ## NEEDS YOU was raised twice by tab 3\nNothing left: all on origin/main.
-NONE || NEEDS YOU won't block Land any more.\nNothing left: all on origin/main.
+NONE || NEEDS YOU doesn't block Land any more.\nNothing left: all on origin/main.
 NONE || NEEDS YOU can't be answered by the harness.\nNothing left: all on origin/main.
 NONE ||   - **NEEDS YOU is loud and never blocks.**\nNothing left: all on origin/main.
 NONE || * **N: NEEDS YOU is never hidden.** The quota wall's need was one of codex-alab's `owner=codex-alab` reasons, of\nNothing left: all on origin/main.
-# A `you can` that is no token's still asks the person.
+# A question mark asks only where it ends the head's first sentence: one in
+# brackets or in a URL asks the person nothing. (A question in a later
+# sentence names no need either, but Land reads it open on words of its own:
+# needs_tests.rs holds those rows.)
+NONE || Merged and pushed main.\nNEEDS YOU is never hidden (is it ever hidden? no).\nNothing left: all on origin/main.
+NONE || Merged and pushed main.\nNEEDS YOU is documented at https://example.com/docs?page=needs\nNothing left: all on origin/main.
+# A `you can` that is no token's, and a NEEDS YOU past a row's start that no
+# closing mark makes a head, still ask the person.
 HEADLESS you can || Merged and pushed main.\nThe signing step needs you: you can run it from the Settings page.\nNothing left: all on origin/main.
-# A question after a bare head asks the person, so it stays a need: an
-# auxiliary before a subject, a question mark in the line, wrapped or not.
+HEADLESS must approve the deploy || Merged and pushed main. NEEDS YOU must approve the deploy at https://example.com/deploy.\nNothing left: all on origin/main.
+# A question after a bare head asks the person, so it stays a need: a
+# singular finite before a subject pronoun, or a first sentence that ends on a
+# question mark, wrapped or not.
 NEED can you sign in to GitHub || Merged and pushed main.\nNEEDS YOU can you sign in to GitHub?\nNothing left: all on origin/main.
 NEED should I force-push main || Merged and pushed main.\nNEEDS YOU should I force-push main?\nNothing left: all on origin/main.
 NEED could you approve the deploy || Merged and pushed main.\nNEEDS YOU could you approve the deploy\nNothing left: all on origin/main.
 NEED is the release key still valid || Merged and pushed main.\nNEEDS YOU is the release key still valid? If not, rotate it.\nNothing left: all on origin/main.
 NEED can the release go out today || Merged and pushed main.\nNEEDS YOU can the release go out\ntoday?\nNothing left: all on origin/main.
+NEED is the release key still valid for the notary || Merged and pushed main.\nNEEDS YOU is the release key still\nvalid for the notary?\nNothing left: all on origin/main.
+NEED will be at the desk for the notary call || Merged and pushed main.\nNEEDS YOU will be at the desk for the notary call?\nNothing left: all on origin/main.
+NEED is it OK to force-push main || Merged and pushed main.\nNEEDS YOU is it OK to force-push main\nNothing left: all on origin/main.
+NEED was I right to revert the pin || Merged and pushed main.\nNEEDS YOU was I right to revert the pin\nNothing left: all on origin/main.
+NEED does he have the notary password || Merged and pushed main.\nNEEDS YOU does he have the notary password\nNothing left: all on origin/main.
+NEED has she signed the agreement || Merged and pushed main.\nNEEDS YOU has she signed the agreement\nNothing left: all on origin/main.
+NEED does someone hold the deploy key || Merged and pushed main.\nNEEDS YOU does someone hold the deploy key\nNothing left: all on origin/main.
+NEED is somebody at the desk for the notary || Merged and pushed main.\nNEEDS YOU is somebody at the desk for the notary\nNothing left: all on origin/main.
+NEED has anyone rotated the deploy key || Merged and pushed main.\nNEEDS YOU has anyone rotated the deploy key\nNothing left: all on origin/main.
+NEED is anybody watching the release || Merged and pushed main.\nNEEDS YOU is anybody watching the release\nNothing left: all on origin/main.
+NEED does everyone agree to the freeze || Merged and pushed main.\nNEEDS YOU does everyone agree to the freeze\nNothing left: all on origin/main.
+NEED has everybody signed off on the release || Merged and pushed main.\nNEEDS YOU has everybody signed off on the release\nNothing left: all on origin/main.
+# A modal agrees with the person's `you`, so a bare head before a modal and
+# any verb but `be` names its need, whoever the verb's subject is.
+NEED must approve the deploy || Merged and pushed main.\nNEEDS YOU must approve the deploy at https://example.com/deploy\nNothing left: all on origin/main.
+NEED should sign in to GitHub || Merged and pushed main.\nNEEDS YOU should sign in to GitHub (gh auth login) so I can push.\nNothing left: all on origin/main.
+NEED will need to accept the Xcode license || Merged and pushed main.\nNEEDS YOU will need to accept the Xcode license.\nNothing left: all on origin/main.
+NEED must sign the notarization agreement || Merged and pushed main.\n**NEEDS YOU** must sign the notarization agreement.\nNothing left: all on origin/main.
+NEED would need to rotate the key || Merged and pushed main.\nNEEDS YOU would need to rotate the key.\nNothing left: all on origin/main.
+NEED must provide the App Store Connect API key || Merged and pushed main.\nNEEDS YOU must provide the App Store Connect API key.\nNothing left: all on origin/main.
+NEED should run `gh auth login` || Merged and pushed main.\nNEEDS YOU should run `gh auth login`, then I can push.\nNothing left: all on origin/main.
+NEED can the owner sign in to GitHub || Merged and pushed main.\nNEEDS YOU can the owner sign in to GitHub\nNothing left: all on origin/main.
+NEED must log in to the Apple Developer portal || Merged and pushed main.\nNEEDS YOU must log in to the Apple Developer portal and accept the new agreement.\nNothing left: all on origin/main.
+NEED can the release go out once the notary answers || Merged and pushed main.\nNEEDS YOU can the release go out once the notary answers on\nFriday?\nNothing left: all on origin/main.
+NEED should the release wait for || Merged and pushed main.\nNEEDS YOU should the release wait for\nGitHub to restore Actions?\nNothing left: all on origin/main.
+NEED could the owner rotate the deploy key || Merged and pushed main.\nNEEDS YOU could the owner rotate the deploy key\nNothing left: all on origin/main.
+NEED can't push || Merged and pushed main.\nNEEDS YOU can't push: the token for alabsystems expired.\nNothing left: all on origin/main.
+# A colon after the finite opens the need on it.
+NEED approve the deploy || Merged and pushed main.\nNEEDS YOU is: approve the deploy\nNothing left: all on origin/main.
 # A separator or a qualifier says the writer meant a head; an imperative's
 # base form (`have`, `do`) is no auxiliary.
 NEED can you sign in to GitHub || Merged and pushed main.\n- **NEEDS YOU:** can you sign in to GitHub\nNothing left: all on origin/main.

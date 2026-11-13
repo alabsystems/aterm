@@ -82,7 +82,23 @@ pub fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
 /// The inode of the executable image `pid` runs.
 #[must_use]
 pub fn image_inode(pid: u32) -> Option<u64> {
-    imp::image_inode(pid)
+    image_file(pid).map(|file| file.inode)
+}
+
+/// The kernel's file identity for a loaded executable. Inodes are scoped to their device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageFile {
+    /// `vst_dev`, normalized as `std::os::unix::fs::MetadataExt::dev` normalizes `st_dev`.
+    pub device: u64,
+    /// `vst_ino`.
+    pub inode: u64,
+}
+
+/// The device and inode of the executable image `pid` runs, read from its kernel mapping.
+/// Unavailable reads and unsupported platforms return `None`.
+#[must_use]
+pub fn image_file(pid: u32) -> Option<ImageFile> {
+    imp::image_file(pid)
 }
 
 /// `ps -o comm=` for `r` in `locale` ([`vis`], [`unread`]).
@@ -164,6 +180,14 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     (
         "offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_size)",
         imp::REGION_LEN as i64,
+    ),
+    (
+        "offsetof(struct proc_regionwithpathinfo, prp_vip.vip_vi.vi_stat.vst_dev)",
+        imp::REGION_DEVICE as i64,
+    ),
+    (
+        "sizeof(((struct proc_regionwithpathinfo *)0)->prp_vip.vip_vi.vi_stat.vst_dev)",
+        4,
     ),
     (
         "offsetof(struct proc_regionwithpathinfo, prp_vip.vip_vi.vi_stat.vst_ino)",
@@ -285,6 +309,7 @@ mod imp {
     pub(super) const REGION_SIZE: usize = 1272;
     pub(super) const REGION_ADDRESS: usize = 80;
     pub(super) const REGION_LEN: usize = 88;
+    pub(super) const REGION_DEVICE: usize = 96;
     pub(super) const REGION_INODE: usize = 104;
     /// The regions walked before the image's.
     const REGIONS: usize = 64;
@@ -551,7 +576,7 @@ mod imp {
         None
     }
 
-    pub(super) fn image_inode(pid: u32) -> Option<u64> {
+    pub(super) fn image_file(pid: u32) -> Option<super::ImageFile> {
         let pid = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
         let mut at = 0u64;
         for _ in 0..REGIONS {
@@ -572,7 +597,10 @@ mod imp {
             }
             let inode = u64_at(&buf, REGION_INODE)?;
             if inode != 0 {
-                return Some(inode);
+                return Some(super::ImageFile {
+                    device: i32_at(&buf, REGION_DEVICE)? as u64,
+                    inode,
+                });
             }
             let next = u64_at(&buf, REGION_ADDRESS)?.checked_add(u64_at(&buf, REGION_LEN)?)?;
             if next <= at {
@@ -612,7 +640,7 @@ mod imp {
         None
     }
 
-    pub(super) fn image_inode(_pid: u32) -> Option<u64> {
+    pub(super) fn image_file(_pid: u32) -> Option<super::ImageFile> {
         None
     }
 }

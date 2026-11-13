@@ -49,7 +49,7 @@ pub(crate) fn intent_show(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh intent retract REPO ID --confirm ID`: an open intent retracted, its id typed again.
-/// It takes no terminal step (owner ruling 2026-10-26 (a)): an agent retracts after
+/// It takes no terminal step: an agent retracts after
 /// `agh intent show` and a look at GitHub, with or without a terminal.
 ///
 /// # Errors

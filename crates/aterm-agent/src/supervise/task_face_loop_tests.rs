@@ -1906,7 +1906,7 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
         );
         if !hand.is_empty() {
             // A person's turn after the landing is no exchange of theirs under Land: the session
-            // worked before it (owner ruling 2026-10-27).
+            // worked before it.
             assert!(!told.contains(&TaskFace::Theirs), "{tag}: {log}");
         }
         assert_eq!(
@@ -2400,8 +2400,8 @@ fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
 }
 
 /// A person's turn after a landing whose reply claims no done seeds `open`, and stays open: under
-/// Land it is no exchange of theirs, since the session worked before it (owner ruling
-/// 2026-10-27), so Land carries it on with its nudge, nothing journals it LEFT and the face never
+/// Land it is no exchange of theirs, since the session worked before it,
+/// so Land carries it on with its nudge, nothing journals it LEFT and the face never
 /// turns to theirs.
 #[test]
 fn a_persons_turn_after_a_landing_that_leaves_the_task_open_seeds_open() {

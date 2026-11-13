@@ -9910,7 +9910,6 @@ fn sentence_case_token(value: &str) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CursorStyleGroup {
-    Companions,
     Trails,
     Off,
 }
@@ -9918,7 +9917,6 @@ enum CursorStyleGroup {
 impl CursorStyleGroup {
     const fn caption(self) -> Option<&'static str> {
         match self {
-            Self::Companions => Some("Companions"),
             Self::Trails => Some("Trails"),
             Self::Off => None,
         }
@@ -9930,7 +9928,6 @@ const fn cursor_style_group(
 ) -> CursorStyleGroup {
     match row.style {
         None => CursorStyleGroup::Off,
-        Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty) => CursorStyleGroup::Companions,
         Some(_) => CursorStyleGroup::Trails,
     }
 }
@@ -9978,7 +9975,7 @@ impl ListedCursorStyle {
     }
 }
 
-const OFF_PLAIN_DESCRIPTION: &str = "No trail; the cursor stays plain";
+const OFF_PLAIN_DESCRIPTION: &str = "No trail behind the cursor";
 const OFF_GLOW_DESCRIPTION: &str = "No trail; typing still makes the cursor glow";
 
 fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
@@ -11701,7 +11698,15 @@ fn renderer_preview_spec_for_key_with_font(
             crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
         ),
         cursor_color_pinned: field_color(state, prefs::EDIT_CURSOR_COLOR).is_some(),
+        pet: None,
+        pet_flies: false,
     };
+    let pet = crate::app_config::resolve_cursor_pet(&field_text(
+        state,
+        prefs::EDIT_CURSOR_PET,
+        crate::app_config::default_cursor_pet(),
+    ));
+    (cursor.pet, cursor.pet_flies) = (pet.species, pet.flies);
     if !serious_preview_suppression && focused_key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
         cursor.trail_style = PreviewTrailStyle::Fire;
         cursor.trail_enabled = true;
@@ -23701,7 +23706,7 @@ fn cursor_styles_page(
             items.push(ListItem::Card(Box::new(row), height));
         }
     }
-    for group in [CursorStyleGroup::Companions, CursorStyleGroup::Trails] {
+    for group in [CursorStyleGroup::Trails] {
         let caption = group.caption();
         let chrome = cursor_styles_card("-", caption, "-", Vec::new(), text_width).height() + 6.0;
         let rows = styles
@@ -23732,6 +23737,17 @@ fn cursor_styles_page(
             card.gap,
         ));
         items.push(ListItem::Split(card));
+    }
+    // The pet is its own setting, beside any style and beside none: its card follows the
+    // styles, so the spans the preview yields to (the Off row and the first styles) are theirs.
+    if let Some(row) = page_setting_row(state, prefs::EDIT_CURSOR_PET, width, text_width) {
+        items.push(ListItem::Split(cursor_styles_card(
+            "pet",
+            Some("Pet"),
+            "Pet",
+            vec![row],
+            text_width,
+        )));
     }
     let tuning = |room: f32| cursor_style_tuning_card(state, &saved, width, text_width, room);
     let tuning_bound = cursor_style_tuning_bound(state, &styles, width, text_width);
@@ -26052,11 +26068,12 @@ fn search_page_hits(state: &SettingsViewState, query: SearchQuery<'_>) -> Vec<Pa
     {
         scratch.clear();
         scratch.extend(row.label.chars().map(|c| c.to_ascii_lowercase()));
-        let aliases = prefs::CURSOR_TRAIL_STYLE_ALIASES
+        // Classic's one-colour face goes by its own spellings; it is the Classic row's.
+        let faces = aterm_effects::cursor_glow::spellings::CLASSIC_MONO_SPELLINGS
             .iter()
-            .filter(|(_, canonical)| *canonical == row.name)
-            .map(|(alias, _)| *alias);
-        let words = [scratch.as_str(), row.name].into_iter().chain(aliases);
+            .copied()
+            .filter(|_| row.style == Some(aterm_effects::cursor_glow::GlowStyle::Classic));
+        let words = [scratch.as_str(), row.name].into_iter().chain(faces);
         let Some(score) =
             crate::native_config_language::query_match_score(words, query.text, query.reach)
                 .map(SearchRank::own)
@@ -26634,8 +26651,9 @@ fn settings_fields_page_seated(
                 SettingsRoute::CursorMotion => (
                     "settings/cursor-motion/cursor-style",
                     "Cursor style",
-                    page_setting_row(state, prefs::EDIT_CURSOR_TRAIL_STYLE, width, text_width)
+                    [prefs::EDIT_CURSOR_TRAIL_STYLE, prefs::EDIT_CURSOR_PET]
                         .into_iter()
+                        .filter_map(|key| page_setting_row(state, key, width, text_width))
                         .collect(),
                 ),
                 SettingsRoute::Sound => (
@@ -37857,6 +37875,8 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
             .is_some_and(|status| status.installed_build > update.current_build)
         {
             "Installed"
+        } else if update.check_unanswered {
+            "No answer"
         } else if !update.automatic_checks {
             "Checks off"
         } else {
@@ -37879,6 +37899,8 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
         "Can\u{2019}t check".to_string()
     } else if !update.enabled {
         "No updater".to_string()
+    } else if update.check_unanswered {
+        "No answer".to_string()
     } else if !update.automatic_checks {
         "Checks off".to_string()
     } else {
@@ -37963,6 +37985,8 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
         "Channel unread."
     } else if !update.enabled {
         "Unavailable."
+    } else if update.check_unanswered {
+        "No answer."
     } else if !update.automatic_checks {
         "Manual checks."
     } else {
@@ -38015,6 +38039,8 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         "Channel unreadable"
     } else if !update.enabled {
         "Unavailable"
+    } else if update.check_unanswered {
+        "Check didn\u{2019}t answer"
     } else if !update.automatic_checks {
         "Manual checks"
     } else {
@@ -38605,8 +38631,10 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
     {
         // Never "the newest version" where this copy does not update; the status card says why.
         "Release notes appear here when an update is ready.".to_string()
-    } else if update.enabled && (update.channel_unreadable || update.checked_at.is_none()) {
-        // Channel unreadable or first check still pending.
+    } else if update.enabled
+        && (update.channel_unreadable || update.check_unanswered || update.checked_at.is_none())
+    {
+        // Channel unreadable, a check that stopped answering, or the first still pending.
         "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled {
         format!(

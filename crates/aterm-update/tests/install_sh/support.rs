@@ -835,7 +835,7 @@ __drain() {
 /// How many rows ([`Lib::row`]) a batch runs at once: four, or one per core on a machine with
 /// fewer.
 fn rows_at_once() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().min(4))
+    aterm_cores::available_parallelism().map_or(4, |n| n.get().min(4))
 }
 
 /// A deterministic generator for the differential corpora (xorshift64*).

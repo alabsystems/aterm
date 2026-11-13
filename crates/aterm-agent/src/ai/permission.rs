@@ -338,7 +338,7 @@ pub fn cli_of_path(path: &str) -> Option<&'static Connector> {
 
 /// Finds the nearest supported AI CLI with proven explicit permissions, or a complete walk to root.
 #[must_use]
-pub fn asker(procs: &dyn Procs, _claude_default: &dyn Fn() -> Option<String>) -> Asker {
+pub fn asker(procs: &dyn Procs) -> Asker {
     let Some(mut pid) = procs.first() else {
         return Asker::Unknown;
     };
@@ -380,19 +380,6 @@ pub fn asker(procs: &dyn Procs, _claude_default: &dyn Fn() -> Option<String>) ->
         pid = parent;
     }
     Asker::Unknown
-}
-
-/// Claude Code's `permissions.defaultMode` in the user settings of its home.
-#[must_use]
-pub fn claude_default_mode(home: &Path) -> Option<String> {
-    let text = crate::harness::accounts::read_bounded(&home.join("settings.json"), 1024 * 1024)
-        .ok()
-        .flatten()?;
-    let v: aterm_json::Value = aterm_json::from_str(&text).ok()?;
-    v.get("permissions")?
-        .get("defaultMode")?
-        .as_str()
-        .map(str::to_string)
 }
 
 #[cfg(test)]

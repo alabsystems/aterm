@@ -1023,7 +1023,7 @@ fn a_ring_cell_is_painted_as_every_pixel_composited() {
         let has_over = cell.iter().any(|&(st, _)| !st.on_ground());
         over += usize::from(has_over);
         halos_on += usize::from(!halos.is_empty());
-        rim += usize::from(guard.ring.ring_text);
+        rim += usize::from(guard.ring.ground_text);
         guard.cell.clear();
         guard.cell.extend_from_slice(&cell);
         guard.lay_lights(j, streams, has_over);
@@ -1089,7 +1089,255 @@ fn a_ring_cell_is_painted_as_every_pixel_composited() {
         ("with no light beneath its text", bare),
         ("lit over it", over),
         ("under a halo", halos_on),
-        ("with text on a ring", rim),
+        ("with text on a pixel read as its ground", rim),
+    ] {
+        assert!(n > 0, "no cell {what}");
+    }
+}
+
+/// A ground and a letter's ink for [`the_bounds_answer_as_the_bisection`]: mostly a dark page
+/// and light ink, which a bound can pass whole, and some paper and dark ink, which no bound
+/// answers.
+fn bounded_pair(mix: &mut Mix) -> (u32, u32) {
+    let rgb = |r: u32, g: u32, b: u32| (r << 16) | (g << 8) | b;
+    if mix.chance(4) {
+        let ground = rgb(
+            232 + mix.below(24),
+            232 + mix.below(24),
+            214 + mix.below(42),
+        );
+        return (ground, rgb(mix.below(120), mix.below(120), mix.below(120)));
+    }
+    let ground = rgb(mix.below(56), mix.below(56), mix.below(56));
+    let ink = rgb(
+        150 + mix.below(106),
+        150 + mix.below(106),
+        150 + mix.below(106),
+    );
+    (ground, ink)
+}
+
+/// A thin stroke's rasters for [`the_bounds_answer_as_the_bisection`]: [`ring_rasters`]' four,
+/// then strokes of one full column between four part-covered ones, each at its own coverage, so
+/// that the glyph's core (pixels [`aterm_render::glyph_ink::CORE_SHARE`] of the way to its
+/// extreme) is mostly part-covered ink, dimmer than its solid ink: its whole reading falls under
+/// its bar on a lifted ground where its ring still keeps its own.
+fn bound_rasters() -> ring::RasterTable {
+    let (cw, ch) = RING_CELL;
+    let mut table: Vec<_> = ring_rasters().iter().cloned().collect();
+    for part in [180u8, 200, 220, 240] {
+        let mut cov = vec![0u8; cw * ch];
+        for y in 3..35 {
+            for (x, c) in [(6, part), (7, part), (8, 255), (9, part), (10, part)] {
+                cov[y * cw + x] = c;
+            }
+        }
+        table.push(Some(
+            aterm_render::GlyphRaster::placed(&cov, cw, (0, 0)).expect("ink"),
+        ));
+    }
+    table.into()
+}
+
+/// THE BOUNDS ANSWER AS THE BISECTION. A cell read by its glyph's own pixels whose lights all
+/// add, with no cursor trail's fill in its ring box and no text on a pixel a reading reads as its
+/// ground, is passed whole by [`LetterGuard::judge`] with no paint where its light ink on a darker
+/// ground keeps its bar on every frame its lights can make: the brightest ground they can make
+/// keeps its dimmest solid ink at its bar and its core at its whole reading's
+/// ([`LetterGuard::ring_passes_whole`]). Over randomized neighbourhoods (fills and faint rims
+/// among them, and thin strokes whose core is dimmer than their solid ink under a light washing
+/// the whole box) on dark pages and paper under randomized adding lights, faint to bright, the
+/// judge's share is the bisection's ([`LetterGuard::share`]) on every cell, under the frame's
+/// lights ([`RasterHold::Bar`]) and under the page shades ([`RasterHold::Own`], the hold
+/// [`CursorGlow::hold_page_shades`] judges with), and the bound passes some and refuses some for
+/// their whole reading alone, which the bisection cuts.
+/// NEGATIVE CONTROLS (2026-11-11): `filled` as it was (some box pixel's clean colour not its
+/// neighbour's base, so every lettered cell) fired "no cell the bound passed whole"; the fill left
+/// unread fired "case 1, #ad99a2 on #1b0228: the judge's share 1 (the bound passing it: true)
+/// against the bisection's 0"; the whole reading left unread (`whole_clears`) fired "case 83, Bar,
+/// #cbe1a0 on #052703: the judge's share 1 (the bound passing it: true) against the bisection's
+/// 0.8203125". Text on the ground left unread, on the bed alone or anywhere, fails no case: each
+/// faint rim here that rounds to the ground on the clean frame rounds to the lifted ground under
+/// the lights, so that precondition of the bound is held and not pinned.
+#[test]
+fn the_bounds_answer_as_the_bisection() {
+    let table = bound_rasters();
+    let mut mix = Mix(0x0062_6F75_6E64);
+    let mut guard = LetterGuard::default();
+    let (cw, ch) = RING_CELL;
+    let (w, h) = (cw + 2 * RING as usize, ch + 2 * RING as usize);
+    let (mut passed, mut whole, mut cut, mut none) = (0, 0, 0, 0);
+    let (mut filled, mut texted, mut refused, mut refused_cut) = (0, 0, 0, 0);
+    let mut owned = 0;
+    for case in 0..3000 {
+        let (ground, ink) = bounded_pair(&mut mix);
+        let (x0, y0) = (40 + mix.below(200) as i32, 40 + mix.below(200) as i32);
+        let (x1, y1) = (x0 + w as i32, y0 + h as i32);
+        // Faint to bright: a bound settles the first, the bisection weighs the last.
+        let mask = [0x0001_0101_u32, 0x0003_0303, 0x000F_0F0F, 0x003F_3F3F][case % 4];
+        let mut quads: [Vec<GlowQuad>; 4] = Default::default();
+        let mut cell = Vec::new();
+        for _ in 0..mix.below(9) {
+            let at = mix.below(4) as usize;
+            let row = at % 2 == 1;
+            let color = (mix.next() as u32) & mask;
+            let color2 = if mix.chance(5) {
+                color
+            } else {
+                (mix.next() as u32) & mask
+            };
+            quads[at].push(GlowQuad {
+                row: 0,
+                x: (x0 - 6 + mix.below(w as u32 + 12) as i32) as u16,
+                y: (y0 - 4 + mix.below(h as u32 + 8) as i32) as u16,
+                w: 1 + mix.below(if row { 9 } else { 30 }) as u16,
+                h: if row { 1 } else { 1 + mix.below(20) as u16 },
+                color,
+                alpha: 0,
+                color2,
+                alpha2: 0,
+            });
+            let st = [
+                Stream::Under,
+                Stream::UnderRow,
+                Stream::Over,
+                Stream::OverRow,
+            ][at];
+            cell.push((st, (quads[at].len() - 1) as u32));
+        }
+        // The guard's order: the under stream's lights, then the over stream's, then halos.
+        cell.sort_by_key(|&(st, _)| u8::from(!st.on_ground()));
+        let mut halos = Vec::new();
+        if mix.chance(3) {
+            let (cx, cy) = (
+                x0 + mix.below(w as u32) as i32,
+                y0 + mix.below(h as u32) as i32,
+            );
+            let (rx, ry) = (2 + mix.below(24) as i32, 2 + mix.below(24) as i32);
+            halos.push(RainHalo {
+                row: 0,
+                x: (cx - rx).max(0) as u16,
+                y: (cy - ry).max(0) as u16,
+                w: (2 * rx + 1) as u16,
+                h: (2 * ry + 1) as u16,
+                color: (mix.next() as u32) & mask,
+                cx: cx as u16,
+                cy: cy as u16,
+                rx: rx as u16,
+                ry: ry as u16,
+                mode: HaloMode::Add,
+            });
+            cell.push((Stream::HaloAdd, 0));
+        }
+        if cell.is_empty() {
+            continue;
+        }
+        let mut cells = random_hood(&mut mix, ground, ink);
+        // A third with no lettered neighbour, whose text would lie on pixels read as ground.
+        if case % 3 == 0 {
+            for (i, n) in cells.iter_mut().enumerate() {
+                if let (false, ring::Neighbour::Known { glyph, .. }) = (i == 4, n) {
+                    *glyph = None;
+                }
+            }
+        }
+        guard
+            .ring
+            .read((w, h), (cw, ch), RING as usize, &cells, (&table, false));
+        // A sixth of the light letters on a dark page a thin stroke ([`bound_rasters`]) on its
+        // bare page, alone under one grey light washing its whole box, the brightest that keeps
+        // its ring's bar on the ground it lifts to: the bound reckons that ground exactly, and a
+        // core dimmer than the solid ink may not keep its whole reading's bar there.
+        let table_l = crate::color_math::relative_luminance_table();
+        let lum = |c: u32| crate::color_math::relative_luminance_with(table_l, c);
+        if case % 6 == 5 && lum(ink) > lum(ground) {
+            for (i, n) in cells.iter_mut().enumerate() {
+                if let ring::Neighbour::Known { glyph, base, .. } = n {
+                    *glyph = (i == 4).then_some((4 + (case / 6 % 4) as u8, ink));
+                    if i == 4 {
+                        *base = ground;
+                    }
+                }
+            }
+            guard
+                .ring
+                .read((w, h), (cw, ch), RING as usize, &cells, (&table, false));
+            let l_min = guard.ring.l_min;
+            let bar = raster_bar(guard.ring.own);
+            let grey = (0..=255u32).rev().find(|&g| {
+                let lg = lum(lifted(ground, [g; 3]));
+                lg < l_min && (l_min + 0.05) / (lg + 0.05) >= bar
+            });
+            if let Some(g) = grey {
+                quads = Default::default();
+                quads[0].push(GlowQuad {
+                    row: 0,
+                    x: (x0 - 2) as u16,
+                    y: (y0 - 2) as u16,
+                    w: w as u16 + 4,
+                    h: h as u16 + 4,
+                    color: 0x0001_0101 * g,
+                    alpha: 0,
+                    color2: 0x0001_0101 * g,
+                    alpha2: 0,
+                });
+                cell = vec![(Stream::Under, 0)];
+                halos.clear();
+            }
+        }
+        let streams = Streams {
+            quads: [&quads[0], &quads[1], &quads[2], &quads[3]],
+            halos: &halos,
+        };
+        filled += usize::from(guard.ring.filled());
+        texted += usize::from(guard.ring.ground_text);
+        guard.cell.clear();
+        guard.cell.extend_from_slice(&cell);
+        for hold in [RasterHold::Bar, RasterHold::Own] {
+            let before = (guard.bound_passed, guard.whole_refused);
+            let got = guard.judge(
+                (x0, y0, x1, y1),
+                (ink, ground),
+                &mut None,
+                (None, Some(hold)),
+                streams,
+            );
+            let bound = guard.bound_passed > before.0;
+            let refused_whole = guard.whole_refused > before.1;
+            let bar = hold.bar(guard.ring.own);
+            let j = Judge {
+                hold,
+                ..Judge::ring((x0, y0, x1, y1), (ink, ground))
+            };
+            let want = guard.share(j, bar, streams);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "case {case}, {hold:?}, #{ink:06x} on #{ground:06x}: the judge's share {got} (the \
+                 bound passing it: {bound}) against the bisection's {want}"
+            );
+            passed += usize::from(bound);
+            owned += usize::from(bound && hold == RasterHold::Own);
+            whole += usize::from(!bound && got >= 1.0);
+            none += usize::from(got == 0.0);
+            cut += usize::from(got > 0.0 && got < 1.0);
+            refused += usize::from(refused_whole);
+            refused_cut += usize::from(refused_whole && got < 1.0);
+        }
+    }
+    for (what, n) in [
+        ("the bound passed whole", passed),
+        ("the bound passed whole under the page shades' hold", owned),
+        ("the bisection kept whole", whole),
+        ("given none", none),
+        ("cut", cut),
+        ("under a trail's fill", filled),
+        ("with text on a pixel read as its ground", texted),
+        ("the bound refused for its whole reading alone", refused),
+        (
+            "the bound refused for its whole reading alone and the bisection cut",
+            refused_cut,
+        ),
     ] {
         assert!(n > 0, "no cell {what}");
     }
@@ -2191,4 +2439,156 @@ fn a_letter_under_its_raster_bar_keeps_a_shade_that_does_not_lower_it() {
         lowered > 0,
         "no edge row's shade lowers a letter under its own reading"
     );
+}
+
+/// ON THE GLASS THE THEME'S LETTERS KEEP ITS BAR BY EACH SOLID PIXEL ([`LetterGuard::census_bar`],
+/// §15.2 1.12's glyph minimum): Default Light's text (`#2b2d33` on `#f6f7f9`), a row of `l`s whose
+/// stem is two whole columns and an edge column at 253 of 255 (solid ink to the judges), under an
+/// additive light over the edge column and the ground right of it, as the caret's aurora lies
+/// over the letter it has just printed. The light lifts the edge pixel under the glass's 5.25
+/// against its lit ring while each pixel row's lower median, a whole pixel the light misses,
+/// keeps the whole ink's reading. On a frame that draws the glass the guard cuts the light over
+/// the letters, and a guard reading again over what it laid cuts nothing more; a light that
+/// leaves the edge pixel over the bar is kept whole there. Negative controls: on main's paper,
+/// and on a sheer page that draws no glass, where the letters keep their raster bar alone, the
+/// whole light is kept.
+#[test]
+fn on_the_glass_the_theme_s_letters_keep_its_bar_by_each_solid_pixel() {
+    use aterm_render::glyph_ink::GlyphCoverage;
+    fn ratio(a: u32, b: u32) -> f32 {
+        let (x, y) = (
+            crate::color_math::relative_luminance(a),
+            crate::color_math::relative_luminance(b),
+        );
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+    const FG: u32 = 0x002B_2D33;
+    const PAGE: u32 = 0x00F6_F7F9;
+    const EDGE: u8 = 253;
+    let g = Geom {
+        cw: 8,
+        ch: 16,
+        rows: 6,
+        cols: 40,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 320,
+        win_h: 96,
+        head: 0,
+    };
+    let row = 2u16;
+    let paper = aterm_core::terminal::RenderCell {
+        fg: [0x2B, 0x2D, 0x33],
+        bg: [0xF6, 0xF7, 0xF9],
+        ..aterm_core::terminal::RenderCell::default()
+    };
+    let mut cells = vec![vec![paper; g.cols]; g.rows];
+    let letters = 2..6;
+    for col in letters.clone() {
+        cells[usize::from(row)][col].ch = 'l';
+    }
+    // The face's `l`: columns 3 and 4 whole and column 5 at `EDGE`, rows 2 to 13 of its cell.
+    let at = usize::from(aterm_render::GlyphInk::index('l', false));
+    let mut regular: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+    let bold: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+    regular[at].max = 255;
+    regular[at].cell_box = Some([3, 2, 6, 14]);
+    let mut rasters = vec![None; 190];
+    rasters[at] = Some(aterm_render::GlyphRaster {
+        x: 3,
+        y: 2,
+        w: 3,
+        cov: [255, 255, EDGE].repeat(12).into_boxed_slice(),
+    });
+    let face = std::sync::Arc::new(
+        aterm_render::GlyphInk::from_coverage(regular, bold, false).with_rasters(rasters),
+    );
+    // An additive light of `lift` on each channel over each letter's edge column and the two
+    // ground columns right of it, down its stem.
+    let light = |lift: u32| -> Vec<GlowQuad> {
+        letters
+            .clone()
+            .map(|col| GlowQuad {
+                row,
+                x: col as u16 * 8 + 5,
+                y: row * 16 + 2,
+                w: 3,
+                h: 12,
+                color: lift * 0x0001_0101,
+                alpha: 0,
+                color2: lift * 0x0001_0101,
+                alpha2: 0,
+            })
+            .collect()
+    };
+    let guard = |over: &[GlowQuad], light: Light| -> Vec<GlowQuad> {
+        let mut glow = CursorGlow::default();
+        glow.observe_glyph_ink(Some(face.clone()));
+        glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+        let cfg = GlowConfig {
+            style: GlowStyle::RainbowKitty,
+            dark_theme: false,
+            theme_fg: FG,
+            theme_bg: PAGE,
+            light,
+            ..GlowConfig::default()
+        };
+        let mut over = over.to_vec();
+        let _ = glow.guard_letters(&mut over, (Some((row, 30)), true), (g, &cfg), (&[], 0));
+        over
+    };
+    // What the edge pixel reads under a light of `lift` against its ring, which the light lifts
+    // to white, and what the whole ink reads against the page beside it.
+    let edge = aterm_render::blend_text(PAGE, FG, PAGE, EDGE, false);
+    let lit = |lift: u32| {
+        ratio(
+            aterm_render::add_sat(edge, lift * 0x0001_0101),
+            aterm_render::add_sat(PAGE, lift * 0x0001_0101),
+        )
+    };
+    let whole = ratio(FG, PAGE);
+    assert!(
+        ratio(edge, PAGE) >= SOLID_SHARE * whole && whole >= LETTER_FLOOR,
+        "fixture: the edge column is solid ink ({} of {whole})",
+        ratio(edge, PAGE)
+    );
+    let bar = crate::rainbow_kitty::prism_glass::GLASS_BAR as f32;
+    let (strong, faint) = (0x3C, 0x14);
+    assert!(
+        lit(strong) < bar && lit(faint) >= bar,
+        "fixture: the strong light lifts the edge under the glass's bar ({}), the faint one not \
+         ({})",
+        lit(strong),
+        lit(faint)
+    );
+    let glass = Light::at(Live::Glass).on_page(true);
+    assert!(glass.glass(), "fixture: the frame draws the glass");
+    let laid = light(strong);
+    let held = guard(&laid, glass);
+    assert_ne!(
+        held, laid,
+        "on the glass the strong light over the edge is cut"
+    );
+    assert_eq!(
+        guard(&held, glass),
+        held,
+        "a letter under the light as the guard laid it reads under the glass's bar"
+    );
+    let faint = light(faint);
+    assert_eq!(
+        guard(&faint, glass),
+        faint,
+        "a light that keeps every solid pixel over the bar is kept whole on the glass"
+    );
+    for (page, what) in [
+        (Light::OFF, "main's paper"),
+        (Light::at(Live::Glass).on_page(false), "a sheer page"),
+    ] {
+        assert!(!page.glass(), "fixture: {what} draws no glass");
+        assert_eq!(
+            guard(&laid, page),
+            laid,
+            "control, {what}: held to its raster bar alone, the letter keeps the whole light"
+        );
+    }
 }

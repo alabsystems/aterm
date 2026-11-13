@@ -303,44 +303,52 @@ fn asks_with(paths: &Paths, seat_of: &dyn Fn(&Paths) -> Seat) -> bool {
         && refuse_lab_member_browse(paths).is_ok()
 }
 
-/// What a [`SEATS`] entry was read at: the records file's and `source.toml`'s size and change
-/// time. A seat changes only with the records or the configuration (its pin and handoffs); the
-/// state's move off `In` is checked on every call before the memo is read.
-type Mark = [Option<(u64, std::time::SystemTime)>; 2];
+/// What a [`SEATS`] entry was read at: every file the selection of the records' data is judged
+/// by, as it stood ([`crate::records_storage::standing`]: the entry and its pin, its intent where
+/// neither of those stands, and a layout's header and data file), and `source.toml`
+/// ([`fsx::Seen`]). A seat changes only with
+/// the records or the configuration (its pin and handoffs); the state's move off `In` is checked
+/// on every call before the memo is read. The data file is among them because a record that
+/// arrives is put on its end in place (`persist_records`), which in a layout changes nothing
+/// at the records entry, a directory.
+type Mark = (crate::records_storage::Standing, fsx::Seen);
 
 /// The last judged [`seat`] (never [`Seat::Unjudged`]) for each vault folder, with its [`Mark`]:
 /// a subscriber round asks [`asks_for_seat`] every round.
 type Memo = std::collections::BTreeMap<PathBuf, (Mark, Seat)>;
 static SEATS: std::sync::Mutex<Memo> = std::sync::Mutex::new(Memo::new());
 
-fn file_mark(path: &Path) -> Option<(u64, std::time::SystemTime)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
+/// [`Mark`] of `paths` now; `None` where the records' selection refuses its files or
+/// `source.toml` cannot be seen.
+fn mark(paths: &Paths) -> Option<Mark> {
+    Some((
+        crate::records_storage::standing(&paths.records_file(), None)?,
+        fsx::seen_if_present(&paths.source_file()).ok()??,
+    ))
 }
 
 /// [`seat`], memoized by [`Mark`]: an unreadable mark or an unjudged seat is read afresh.
 fn seat_memoized(paths: &Paths) -> Seat {
-    let mark = [
-        file_mark(&paths.records_file()),
-        file_mark(&paths.source_file()),
-    ];
-    let known = mark.iter().all(Option::is_some);
+    let mark = mark(paths);
     let seats = || {
         SEATS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if known
-        && let Some((at, held)) = seats().get(&paths.dir).copied()
+    if let Some(mark) = &mark
+        && let Some((at, held)) = seats().get(&paths.dir)
         && at == mark
     {
-        return held;
+        return *held;
     }
     let read = seat(paths);
-    if known && read != Seat::Unjudged {
-        seats().insert(paths.dir.clone(), (mark, read));
-    } else {
-        seats().remove(&paths.dir);
+    match mark {
+        Some(mark) if read != Seat::Unjudged => {
+            seats().insert(paths.dir.clone(), (mark, read));
+        }
+        _ => {
+            seats().remove(&paths.dir);
+        }
     }
     read
 }

@@ -180,11 +180,16 @@ const HAZARD_VARS: &[&str] = &[
     "XDG_CONFIG_HOME",
     "ZDOTDIR",
     "RIPGREP_CONFIG_PATH",
+    "GREP_OPTIONS",
+    "DEVELOPER_DIR",
+    "SDKROOT",
     "PERL5OPT",
     "NODE_OPTIONS",
     "PYTHONSTARTUP",
     "PYTHONPATH",
     "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "APPDATA",
 ];
 
 /// `LESS` covers every variable less reads: a `LESSKEYIN` file's `#env` can set `LESSOPEN` (MEASURED, less 668).

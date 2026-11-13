@@ -30,7 +30,12 @@ fn landed_source(mark: &std::path::Path, owner: u64) -> (App, u64, std::fs::File
     source.next_session_id += owner;
     source.workstation_setup.developer_tools_mark = Mark::at(mark.to_path_buf());
     source.access_steps.set_reach(dialog_reach());
-    let id = if source.workstation_setup.developer_tools_mark.opened() {
+    let id = if source
+        .workstation_setup
+        .developer_tools_mark
+        .held()
+        .is_some()
+    {
         source.workstation_setup.developer_tools = Install::Pressed;
         test_support::book(&mut source, wid, pressed_tab_then())
     } else {
@@ -69,7 +74,7 @@ fn recovered_page(mark: &std::path::Path) -> (App, WindowId) {
     let (mut app, wid) = page();
     app.workstation_setup.developer_tools_mark = Mark::at(mark.to_path_buf());
     app.access_steps.set_reach(dialog_reach());
-    assert!(app.workstation_setup.developer_tools_mark.opened());
+    assert!(app.workstation_setup.developer_tools_mark.held().is_some());
     assert!(!app.developer_tools_install_due(false));
     assert!(!app.developer_tools_install_active());
     (app, wid)
@@ -101,7 +106,7 @@ fn receipt_for(
 fn new_receipt(
     mark: &std::path::Path,
     session: &crate::Session,
-    claimed: Option<&str>,
+    claimed: Option<&aterm_types::clt_mark::Claim>,
 ) -> crate::clt_install::receipt::Receipt {
     crate::clt_install::receipt::Receipt::for_child(
         mark,
@@ -114,9 +119,9 @@ fn new_receipt(
 }
 
 /// An installer that travels with the handoff holds none of it, and a queued setup choice beside
-/// it holds as the setup worker's, never as the install tab's: the lane names what holds.
+/// it holds as the choice someone made, never as the install tab's: the lane names what holds.
 #[test]
-fn clt_recovery_a_traveling_installer_beside_a_queued_choice_holds_as_system_state() {
+fn clt_recovery_a_traveling_installer_beside_a_queued_choice_holds_as_that_choice() {
     use crate::native_update_lane_hold::LaneHold;
     if !crate::test_alone::alone() {
         return;
@@ -139,8 +144,8 @@ fn clt_recovery_a_traveling_installer_beside_a_queued_choice_holds_as_system_sta
     );
     assert_eq!(
         source.system_state_handoff_hold(),
-        Some(LaneHold::SystemState),
-        "the queued choice holds, as the worker's"
+        Some(LaneHold::SetupChoice),
+        "the queued choice holds, as the unsaved choice it is"
     );
     assert!(source.system_state_handoff_pending());
 }
@@ -156,10 +161,11 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
     let (session, read) = landed_child(&mark);
     let receipt = receipt_for(&mark, &session);
     assert!(receipt.matches());
-    assert_eq!(
-        receipt.claimed(),
-        Some(aterm_stamp::build_id().as_str()),
-        "the automatic landing's claim added this build's line"
+    assert!(
+        receipt
+            .claimed()
+            .is_some_and(|claim| claim.asker.build == aterm_stamp::build_id()),
+        "the receipt names the automatic landing's claim"
     );
     let original_sid = session.ctx.self_id.clone();
     let original_identity = session.shell_identity;
@@ -176,7 +182,10 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
         "a verified live child must recover its installer custody, not just its PTY"
     );
     assert!(step(&mut recovered).is_some());
-    assert!(!recovered.system_state_handoff_pending());
+    assert!(
+        !recovered.system_state_handoff_pending(),
+        "a recovered installer holds no second update either"
+    );
     assert!(macos_dialog_up(), "other automatic prompts remain held");
     assert!(
         drain(&read).is_empty(),
@@ -238,9 +247,13 @@ fn clt_recovery_only_exact_durable_installer_custody_allows_an_update() {
         .shell_identity = original;
     assert!(!recovered.system_state_handoff_pending());
     let child = recovered.pool.get(local).unwrap();
-    let mut successor_receipt = receipt_for(&mark, child);
-    successor_receipt.claim("successor-test-build").unwrap();
-    assert!(!receipt.matches(), "the successor changed the build claim");
+    // A successor's receipt of the same child names another claim.
+    std::fs::remove_file(receipt.path()).unwrap();
+    let mut other = receipt.claimed().cloned().unwrap();
+    other.asker.build = "successor-test-build".to_owned();
+    let successor_receipt = new_receipt(&mark, child, Some(&other));
+    successor_receipt.write_exclusive().unwrap();
+    assert!(!receipt.matches(), "the successor changed the claim");
     assert!(!recovered.system_state_handoff_pending());
     successor_receipt.remove_if_matching();
     assert!(recovered.system_state_handoff_pending());
@@ -291,42 +304,54 @@ fn clt_recovery_an_adopted_live_installer_puts_the_shim_back_on_new_shells() {
     );
 }
 
-/// An earlier build's tab and exact original receipt, as an update hands them over.
-fn earlier_builds_tab(mark: &std::path::Path, earlier: &str) -> (crate::Session, std::fs::File) {
+/// An earlier build's tab and exact original receipt, as an update hands them over: the earlier
+/// build's attempt holds the record, its asker running (this test's own process stands in for
+/// the tab's program), and the receipt names that claim.
+fn earlier_builds_tab(
+    mark: &std::path::Path,
+    earlier: &str,
+) -> (crate::Session, std::fs::File, aterm_types::clt_mark::Claim) {
     let (session, read) = landed_child(mark);
-    std::fs::write(mark, format!("opened {earlier}\n")).unwrap();
+    std::fs::remove_file(mark).unwrap();
+    let asker = aterm_types::clt_mark::Asker::this_process(earlier).unwrap();
+    let claim = aterm_types::clt_mark::claim(&aterm_types::clt_mark::Live, mark, &asker, unix())
+        .unwrap()
+        .unwrap();
     std::fs::remove_file(receipt_for(mark, &session).path()).unwrap();
-    new_receipt(mark, &session, Some(earlier))
+    new_receipt(mark, &session, Some(&claim))
         .write_exclusive()
         .unwrap();
-    (session, read)
+    (session, read, claim)
 }
 
-/// An adopted live child retains its exact original claim across updates. A failed password
-/// keeps that episode; a proven preprompt end can release it without touching a historical hold.
+/// An adopted live child records its end with the exact claim its receipt names, across updates:
+/// a failed password is unfinished (held until the next try is due), a proven preprompt end (Low
+/// Data Mode, a deferral to another login or another installer, a program that never ran) gives
+/// the claim back (an automatic ask may go at once). An unclaimed receipt ends no attempt, so an
+/// older attempt's late release never erases the record's. No adopted end is a fresh reading of
+/// the root steps: the hint the window holds stays.
 #[test]
-fn clt_recovery_an_update_preserves_the_original_episode_and_exact_release_owner() {
+fn clt_recovery_an_update_records_the_adopted_attempts_end_with_its_exact_claim() {
     use aterm_pty::ChildExit;
     if !crate::test_alone::alone() {
         return;
     }
     let earlier = "0.1.0+gdeadbeef";
     let low_data = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA);
-    for (history, unclaimed, end, held) in [
-        (false, false, ChildExit::Code(1), true),
-        (false, false, ChildExit::Code(low_data), false),
-        (true, false, ChildExit::Code(low_data), true),
-        (false, false, ChildExit::Code(127), false),
-        (false, true, ChildExit::Code(1), true),
-        (false, false, ChildExit::Code(7), true),
-        (false, false, ChildExit::Code(8), true),
+    let not_own_login = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_OWN_LOGIN);
+    let installer_held = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_INSTALLER_HELD);
+    for (unclaimed, end, held) in [
+        (false, ChildExit::Code(1), true),
+        (false, ChildExit::Code(low_data), false),
+        (false, ChildExit::Code(127), false),
+        (false, ChildExit::Code(not_own_login), false),
+        (false, ChildExit::Code(installer_held), false),
+        (true, ChildExit::Code(1), true),
+        (true, ChildExit::Code(not_own_login), true),
     ] {
         let directory = aterm_tempfile::tempdir().unwrap();
         let mark = directory.path().join("command-line-tools-tab");
-        let (session, _read) = earlier_builds_tab(&mark, earlier);
-        if history {
-            std::fs::write(&mark, format!("opened historical\nopened {earlier}\n")).unwrap();
-        }
+        let (session, _read, claim) = earlier_builds_tab(&mark, earlier);
         if unclaimed {
             std::fs::remove_file(receipt_for(&mark, &session).path()).unwrap();
             new_receipt(&mark, &session, None)
@@ -341,36 +366,26 @@ fn clt_recovery_an_update_preserves_the_original_episode_and_exact_release_owner
         assert!(recovered.developer_tools_install_active());
         assert_eq!(
             receipt_for(&mark, recovered.pool.get(local).unwrap()).claimed(),
-            (!unclaimed).then_some(earlier)
+            (!unclaimed).then_some(&claim)
         );
-        if unclaimed {
-            aterm_types::clt_mark::forget(&aterm_types::clt_mark::Live, &mark, earlier).unwrap();
-            assert!(
-                Mark::at(mark.clone()).opened(),
-                "adopted explicit attempt survives older release"
-            );
-        }
-        recovered.root_steps_owed(true);
+        recovered.root_steps_owed(RootSteps::OTHER);
         recovered.developer_tools_install_ended(local, Some(end));
-        assert!(
+        assert_eq!(
             recovered.workstation_setup.developer_tools_root_owed,
+            RootSteps::OTHER,
             "an adopted child's {end:?} is not a fresh root-work reading"
         );
-        assert_eq!(Mark::at(mark.clone()).opened(), held, "{history} {end:?}");
-        if history {
-            assert_eq!(
-                std::fs::read_to_string(&mark).unwrap(),
-                "opened historical\n"
-            );
-        }
+        let read = Mark::at(mark.clone());
+        assert_eq!(read.held().is_some(), held, "{unclaimed} {end:?}");
+        assert!(read.coming(), "{unclaimed} {end:?}");
         assert!(recovered.exit_session_logical(local).is_empty());
         assert!(!recovered.developer_tools_install_active());
         assert!(!macos_dialog_up());
     }
 }
 
-/// Repeated adoption after an update and crash preserves the original receipt owner and the
-/// consumed episode even when the password or installer failed.
+/// Repeated adoption after an update and a crash keeps the receipt's exact claim, so the second
+/// adopter records the attempt's end: unfinished after a failed password, declined after a Stop.
 #[test]
 fn clt_recovery_an_update_adopted_tab_keeps_its_episode_after_a_second_crash() {
     use aterm_pty::ChildExit;
@@ -382,26 +397,32 @@ fn clt_recovery_an_update_adopted_tab_keeps_its_episode_after_a_second_crash() {
     for (end, kept) in [(ChildExit::Code(1), true), (ChildExit::Code(stopped), true)] {
         let directory = aterm_tempfile::tempdir().unwrap();
         let mark = directory.path().join("command-line-tools-tab");
-        let (session, _read) = earlier_builds_tab(&mark, earlier);
+        let (session, _read, claim) = earlier_builds_tab(&mark, earlier);
 
-        // The update: this build adopts the earlier build's tab and claims its own line.
+        // The update: this build adopts the earlier build's tab, claiming nothing.
         let (mut first, _) = page();
         first.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
         first.access_steps.set_reach(dialog_reach());
-        assert!(first.workstation_setup.developer_tools_mark.opened());
+        assert!(
+            first
+                .workstation_setup
+                .developer_tools_mark
+                .held()
+                .is_some()
+        );
         let local = first.next_session_id + 30;
         let session = adopted(session, local);
         App::register_session(&first.store, &session, None);
         first.pool_insert(session);
         assert!(first.developer_tools_install_active(), "{end:?}");
         assert!(
-            Mark::at(mark.clone()).opened(),
-            "{end:?}: the line is added"
+            Mark::at(mark.clone()).held().is_some(),
+            "{end:?}: the attempt still runs"
         );
         assert_eq!(
             receipt_for(&mark, first.pool.get(local).unwrap()).claimed(),
-            Some(earlier),
-            "{end:?}: the receipt retains the original owner"
+            Some(&claim),
+            "{end:?}: the receipt keeps the exact claim"
         );
 
         // The crash: that window goes, while the keeper keeps the child.
@@ -417,10 +438,18 @@ fn clt_recovery_an_update_adopted_tab_keeps_its_episode_after_a_second_crash() {
         second.pool_insert(session);
         assert!(second.developer_tools_install_active(), "{end:?}");
         second.developer_tools_install_ended(local, Some(end));
-        assert_eq!(Mark::at(mark.clone()).opened(), kept, "{end:?}");
+        assert_eq!(Mark::at(mark.clone()).held().is_some(), kept, "{end:?}");
         assert!(
-            aterm_types::clt_mark::spent(&aterm_types::clt_mark::Live, &mark),
-            "{end:?}: the earlier build's line stays"
+            matches!(
+                aterm_types::clt_mark::reading(
+                    &aterm_types::clt_mark::Live,
+                    &mark,
+                    super::unix_now()
+                ),
+                aterm_types::clt_mark::Asked::Unfinished { tries: 1, .. }
+                    | aterm_types::clt_mark::Asked::Declined { .. }
+            ),
+            "{end:?}: the end is recorded"
         );
         assert!(second.exit_session_logical(local).is_empty());
         assert!(!second.developer_tools_install_active(), "{end:?}");
@@ -428,8 +457,144 @@ fn clt_recovery_an_update_adopted_tab_keeps_its_episode_after_a_second_crash() {
     }
 }
 
-/// A live tab an earlier aterm opened whose recovery record this launch cannot read (none, an
-/// earlier format, another folder) gives no custody here, but it still runs the Mac Setup
+/// An update from a build whose receipts named only the build that claimed (`v2`) and whose
+/// record said only `opened <build>` hands this build that build's live Mac Setup tab, its
+/// `sudo` perhaps asking now (review finding: such a receipt was refused, so the tab's end was
+/// recorded nowhere and its `opened` line read as a try long since due). The launch takes
+/// custody of the tab, and once the handoff is in carries its attempt into the record as the
+/// tab's program's and rewrites the receipt as this build's: the record then reads it asking, so
+/// no automatic ask goes beside it, and its end is recorded against that claim, a Stop as a
+/// decline that holds the next automatic ask for its long pause. A carry the record refused (an
+/// asker holding its lock past the window's wait) is tried again by itself on its schedule, the
+/// window waking for it.
+/// NEGATIVE CONTROL: the earlier build's record alone lets an automatic ask go at once, and until
+/// the handoff is in nothing is carried and the receipt stays as the earlier build wrote it; a
+/// carry that failed changes neither, and none is tried again before its pause has passed.
+#[test]
+fn clt_recovery_an_earlier_formats_live_tab_carries_its_attempt_and_records_its_end() {
+    use aterm_types::clt_mark::Asked;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let earlier = "0.193.0+g5a297ec3fd7c";
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    let reading = |mark: &std::path::Path| {
+        aterm_types::clt_mark::reading(&aterm_types::clt_mark::Live, mark, unix())
+    };
+    for claimed in [true, false] {
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mark = directory.path().join("command-line-tools-tab");
+        let (session, read) = landed_child(&mark);
+        // What the earlier build left: its record's line, and its receipt for the same child.
+        std::fs::write(&mark, format!("opened {earlier}\n")).unwrap();
+        let path = receipt_for(&mark, &session).path().to_path_buf();
+        let line = if claimed {
+            format!("claimed {earlier}")
+        } else {
+            "unclaimed".to_owned()
+        };
+        let v2 = format!(
+            "v2\n{}\n{}\n{}\n{line}\n",
+            session.ctx.self_id.as_str(),
+            session.pid,
+            session.shell_identity.birth.unwrap()
+        );
+        std::fs::write(&path, &v2).unwrap();
+        assert!(
+            Mark::at(mark.clone()).held().is_none(),
+            "{claimed}: the earlier record alone lets an automatic ask go now"
+        );
+
+        let (mut recovered, _) = page();
+        recovered.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+        recovered.access_steps.set_reach(dialog_reach());
+        let local = recovered.next_session_id + 30;
+        let session = adopted(session, local);
+        App::register_session(&recovered.store, &session, None);
+        recovered.pool_insert(session);
+        assert!(
+            recovered.developer_tools_install_active(),
+            "{claimed}: custody of the earlier build's live tab"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            v2,
+            "{claimed}: the receipt stays the earlier build's until the handoff is in"
+        );
+
+        let now = std::time::Instant::now();
+        let stalled =
+            aterm_types::clt_mark::Files::lock(&aterm_types::clt_mark::Live, &mark).unwrap();
+        recovered.carry_earlier_developer_tools_tabs(now);
+        drop(stalled);
+        let historical = format!("opened {earlier}\n");
+        assert_eq!(std::fs::read_to_string(&mark).unwrap(), historical);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+        let retry = now + LOOK_AGAIN.after(1);
+        assert_eq!(
+            recovered.workstation_setup.developer_tools_carry_retry,
+            Some(retry),
+            "{claimed}: a carry that failed is tried again on its schedule"
+        );
+        assert!(
+            recovered
+                .workstation_setup
+                .deadline(now)
+                .is_some_and(|wake| wake <= retry),
+            "{claimed}: the window wakes for it"
+        );
+        recovered.carry_earlier_developer_tools_tabs(retry - Duration::from_secs(1));
+        assert_eq!(
+            std::fs::read_to_string(&mark).unwrap(),
+            historical,
+            "{claimed}: not before its pause has passed"
+        );
+
+        recovered.carry_earlier_developer_tools_tabs(retry);
+        assert!(
+            matches!(reading(&mark), Asked::Asking),
+            "{claimed}: the record reads the carried tab asking"
+        );
+        assert_eq!(
+            recovered.workstation_setup.developer_tools_carry_retry,
+            None
+        );
+        assert!(
+            recovered
+                .workstation_setup
+                .developer_tools_mark
+                .held()
+                .is_some(),
+            "{claimed}: no automatic ask beside it"
+        );
+        let carried = receipt_for(&mark, recovered.pool.get(local).unwrap());
+        assert!(
+            carried.earlier().is_none() && carried.claimed().is_some(),
+            "{claimed}: the receipt is this build's, naming the claim it carried"
+        );
+        let asking = std::fs::read_to_string(&mark).unwrap();
+        recovered.carry_earlier_developer_tools_tabs(retry);
+        assert_eq!(
+            std::fs::read_to_string(&mark).unwrap(),
+            asking,
+            "{claimed}: carried once"
+        );
+
+        recovered.developer_tools_install_ended(local, Some(aterm_pty::ChildExit::Code(stopped)));
+        assert!(
+            matches!(reading(&mark), Asked::Declined { declines: 1, .. }),
+            "{claimed}: its Stop is recorded as a decline"
+        );
+        assert!(recovered.exit_session_logical(local).is_empty());
+        assert!(!recovered.developer_tools_install_active());
+        assert!(!path.exists(), "{claimed}: its exit retires the receipt");
+        assert!(drain(&read).is_empty(), "adoption types nothing");
+        assert!(!macos_dialog_up());
+    }
+}
+
+/// A live tab an earlier aterm opened whose recovery record this launch cannot read (none, a
+/// malformed one, another folder) gives no custody here, but it still runs the Mac Setup
 /// tab's program under aterm's pinned title, its `sudo` perhaps asking now with nothing a
 /// probe could see: the automatic tab waits for it, at its due check and at its landing, and
 /// opens once that tab's program has ended.
@@ -538,7 +703,13 @@ fn clt_recovery_a_cold_or_mismatched_child_never_inherits_installer_custody() {
         App::register_session(&recovered.store, &session, None);
         recovered.pool_insert(session);
         assert!(!recovered.developer_tools_install_active(), "{case}");
-        assert_eq!(step(&mut recovered), None, "{case}");
+        // No custody: no password, restored tab or install is claimed for it; at most the row
+        // says aterm's own ask comes, on the record's schedule.
+        let step = step(&mut recovered);
+        assert!(
+            matches!(step, None | Some(ToolsInstall::Coming)),
+            "{case}: {step:?}"
+        );
         assert!(!recovered.system_state_handoff_pending(), "{case}");
         assert!(!macos_dialog_up(), "{case}");
         assert!(
@@ -629,7 +800,7 @@ fn clt_recovery_receipt_before_command_bytes_restores_custody_without_starting_t
     }
     let directory = aterm_tempfile::tempdir().unwrap();
     let mark = directory.path().join("command-line-tools-tab");
-    this_builds_mark(&mark);
+    asking_now(&mark);
     let (mut child, read) = registered_piped_session(37);
     child.pid = CHILD_PID;
     child.shell_identity =
@@ -699,7 +870,12 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
         "the result tab says why, in plain words: {shown:?}"
     );
     assert!(
-        !source.workstation_setup.developer_tools_mark.opened() && !Mark::at(mark.clone()).opened(),
+        !source
+            .workstation_setup
+            .developer_tools_mark
+            .held()
+            .is_some()
+            && !Mark::at(mark.clone()).held().is_some(),
         "an install that never started takes its opening back: the next launch asks again"
     );
     assert!(source.developer_tools_install_active());
@@ -707,7 +883,7 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
     assert!(receipt.matches());
     assert!(source.exit_session_logical(id).is_empty());
     assert!(
-        !Mark::at(mark.clone()).opened(),
+        !Mark::at(mark.clone()).held().is_some(),
         "its end keeps it taken back"
     );
     assert!(!source.developer_tools_install_active());
@@ -719,10 +895,11 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
     assert!(drain(&read).is_empty());
 }
 
-/// An orphan with no terminal outcome retains its automatic hold. A missing record is rebuilt
-/// from exact receipt custody; live children remain available for adoption.
+/// H8: an orphan (its tab's program gone with no end any window saw) was cut off: the record
+/// its program held reads due at once, so a launch wants the tools again by itself, and the
+/// orphan's receipt goes. A live child's receipt stays for adoption.
 #[test]
-fn clt_recovery_an_unknown_orphan_never_reauthorizes_an_automatic_password_request() {
+fn clt_recovery_an_orphans_attempt_was_cut_off_and_is_asked_again() {
     if !crate::test_alone::alone() {
         return;
     }
@@ -730,16 +907,44 @@ fn clt_recovery_an_unknown_orphan_never_reauthorizes_an_automatic_password_reque
     let mark = directory.path().join("command-line-tools-tab");
     let (child, _read) = landed_child(&mark);
     let receipt = receipt_for(&mark, &child);
-    assert!(
-        Mark::launched(mark.clone(), |pid, birth| pid == CHILD_PID
-            && birth == CHILD_BIRTH)
-        .opened()
-    );
-    assert!(receipt.matches());
+    // The record as the tab's program held it: that program is gone.
     std::fs::remove_file(&mark).unwrap();
-    let next = Mark::launched(mark.clone(), |_, _| false);
-    assert!(next.opened());
-    assert!(!launch_install(true, true, true, next.opened()).want);
-    assert!(!receipt.matches());
-    assert!(Mark::at(mark).opened());
+    let program = aterm_types::clt_mark::Asker {
+        build: aterm_stamp::build_id(),
+        pid: CHILD_PID,
+        birth: CHILD_BIRTH,
+    };
+    aterm_types::clt_mark::claim(&aterm_types::clt_mark::Live, &mark, &program, unix())
+        .unwrap()
+        .unwrap();
+    Mark::launched(mark.clone(), false, |pid, birth| {
+        pid == CHILD_PID && birth == CHILD_BIRTH
+    });
+    assert!(receipt.matches(), "a live child's receipt stays");
+    let next = Mark::launched(mark.clone(), false, |_, _| false);
+    assert_eq!(next.held(), None, "cut off: asked again at once");
+    assert!(launch_install(true, true, true, !next.coming()).want);
+    assert!(!receipt.matches(), "the orphan's receipt goes");
+}
+
+/// AN UPDATE'S SUCCESSOR RETIRES NO TAB ITS PARENT STILL HOLDS: a program that ended while a descendant
+/// holds its PTY reads as no longer running, and its parent has not seen the end. Retiring it took
+/// the receipt the parent's handoff was admitted on, which then refused every later attempt for as
+/// long as that descendant lived, and made the parent's own release find no line. NEGATIVE CONTROL: a
+/// launch with no parent reads it as an orphan.
+#[test]
+fn clt_recovery_an_update_s_successor_retires_no_tab_its_parent_holds() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mark = directory.path().join("command-line-tools-tab");
+    let (child, _read) = landed_child(&mark);
+    let receipt = receipt_for(&mark, &child);
+    let record = std::fs::read(&mark).unwrap();
+    Mark::launched(mark.clone(), true, |_, _| false);
+    assert!(receipt.matches(), "the parent's receipt stays");
+    assert_eq!(std::fs::read(&mark).unwrap(), record, "and the record");
+    Mark::launched(mark.clone(), false, |_, _| false);
+    assert!(!receipt.matches(), "NEGATIVE CONTROL");
 }

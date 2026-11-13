@@ -849,3 +849,138 @@ fn a_pin_the_static_documents_cannot_show_is_read_on_the_safe_side() {
         );
     }
 }
+
+/// THE DEFAULT PERMISSION MODE IS THE HIGHEST DOCUMENT'S THAT NAMES ONE: with nothing written it
+/// is unset; the user's settings name it; the project's outrank the user's, the project's local
+/// ones the project's, the command line's `--settings` those, the managed file all of them, and
+/// a managed drop-in the managed file. Each answer names the document that won. NEGATIVE
+/// CONTROL: a document below the winner that cannot be parsed changes nothing, and the same
+/// document above it makes the answer unread.
+#[test]
+fn the_default_permission_mode_is_read_in_claude_codes_precedence() {
+    use crate::harness::lights::Mode;
+    let s = ScratchDir::new("claude-settings", "default-mode");
+    let claude = s.join("claude");
+    let proj = s.join("proj");
+    let managed = s.join("managed");
+    let prefs = s.join("prefs");
+    std::fs::create_dir_all(&proj).expect("proj");
+    std::fs::create_dir_all(&prefs).expect("prefs");
+    let line = s.join("line.json");
+    let worker = WorkerEnv::hermetic(None)
+        .with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()))
+        .with("USER=me")
+        .launched_with(&["claude", "--settings", &line.display().to_string()]);
+    let read = || permission_default_under(&worker, &proj, Some(&managed), &prefs, None);
+    let named = |mode: Mode, at: &Path| Resolved::Mode {
+        mode,
+        source: at.display().to_string(),
+    };
+    let doc = |mode: &str| format!(r#"{{"permissions":{{"defaultMode":"{mode}"}}}}"#);
+    assert_eq!(read().mode, Resolved::Unset, "nothing written");
+    assert_eq!(read().bypass_disabled, None);
+    let user = claude.join("settings.json");
+    write(
+        &user,
+        r#"{"model":"opus","permissions":{"allow":["Read"]}}"#,
+    );
+    assert_eq!(read().mode, Resolved::Unset, "permissions with no default");
+    let project = proj.join(".claude/settings.json");
+    let local = proj.join(".claude/settings.local.json");
+    let file = managed.join("managed-settings.json");
+    let drop_in = managed.join("managed-settings.d").join("10-a.json");
+    for (at, word, mode) in [
+        (&user, "plan", Mode::Plan),
+        (&project, "acceptEdits", Mode::AcceptEdits),
+        (&local, "dontAsk", Mode::DontAsk),
+        (&line, "auto", Mode::Auto),
+        (&file, "default", Mode::Manual),
+        (&drop_in, "bypassPermissions", Mode::Bypass),
+    ] {
+        write(at, &doc(word));
+        assert_eq!(read().mode, named(mode, at), "{}", at.display());
+    }
+    std::fs::remove_file(&drop_in).expect("the drop-in");
+    std::fs::remove_file(&file).expect("the managed file");
+    assert_eq!(read().mode, named(Mode::Auto, &line), "the line's again");
+    write(&user, "{ not json");
+    assert_eq!(
+        read().mode,
+        named(Mode::Auto, &line),
+        "control: an unparsed document below the winner says nothing"
+    );
+    write(&file, "{ not json");
+    assert!(
+        matches!(&read().mode, Resolved::Unread(why) if why.contains("managed-settings.json")),
+        "an unparsed document above it is not read past: {:?}",
+        read().mode
+    );
+}
+
+/// WHAT THE RESOLVER WILL NOT GUESS, AND THE BYPASS SWITCH: a mode word this build does not
+/// know, a `defaultMode` that is no string, one nested where no document of this shape keeps it,
+/// a policy helper and a managed preference domain each read as unread, never as unset. `manual`
+/// is `default`. `permissions.disableBypassPermissionsMode: "disable"` in any readable document
+/// names that document, whatever names the mode; any other value of it does not.
+#[test]
+fn the_default_permission_mode_is_unread_wherever_it_cannot_be_told() {
+    use crate::harness::lights::Mode;
+    let source = |name: &str, text: &str| Source {
+        name: name.to_string(),
+        text: Ok(Some(text.to_string())),
+    };
+    let mode = |text: &str| permission_default(&[source("a.json", text)]).mode;
+    assert_eq!(
+        mode(r#"{"permissions":{"defaultMode":"manual"}}"#),
+        Resolved::Mode {
+            mode: Mode::Manual,
+            source: "a.json".into()
+        }
+    );
+    assert_eq!(
+        mode(r#"{"permissions":{"defaultMode":null}}"#),
+        Resolved::Unset
+    );
+    for text in [
+        r#"{"permissions":{"defaultMode":"turbo"}}"#,
+        r#"{"permissions":{"defaultMode":7}}"#,
+        r#"{"policy":{"permissions":{"defaultMode":"plan"}}}"#,
+        r#"{"policyHelper":"/usr/local/bin/policy"}"#,
+    ] {
+        assert!(
+            matches!(mode(text), Resolved::Unread(why) if why.contains("a.json")),
+            "{text}"
+        );
+    }
+    let prefs = Source {
+        name: "com.anthropic.claudecode.plist".into(),
+        text: Err("are a managed preference domain this reader does not parse".into()),
+    };
+    let user = source("user.json", r#"{"permissions":{"defaultMode":"plan"}}"#);
+    assert!(matches!(
+        permission_default(&[prefs.clone(), user.clone()]).mode,
+        Resolved::Unread(_)
+    ));
+    assert!(
+        matches!(
+            permission_default(&[user.clone(), prefs]).mode,
+            Resolved::Mode {
+                mode: Mode::Plan,
+                ..
+            }
+        ),
+        "control: unread below the winner"
+    );
+    let off = source(
+        "managed.json",
+        r#"{"permissions":{"disableBypassPermissionsMode":"disable"}}"#,
+    );
+    let got = permission_default(&[user.clone(), off]);
+    assert_eq!(got.bypass_disabled.as_deref(), Some("managed.json"));
+    assert!(matches!(got.mode, Resolved::Mode { .. }));
+    let on = source(
+        "managed.json",
+        r#"{"permissions":{"disableBypassPermissionsMode":"enable"}}"#,
+    );
+    assert_eq!(permission_default(&[user, on]).bypass_disabled, None);
+}

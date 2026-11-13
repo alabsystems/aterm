@@ -2,9 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+#[cfg(not(windows))]
 use std::time::Duration;
 
-/// A zone `dir` the kernel names `name` (its `name` file).
+/// A zone `dir` the kernel names `name` (its `name` file). Not on Windows: a zone's directory
+/// name holds a colon (`intel-rapl:0`), which no file name there may, so the tests that write
+/// one run where the reader does.
+#[cfg(not(windows))]
 fn zone(root: &Path, dir: &str, name: &str, energy: u64, range: u64) {
     let dir = root.join("sys/class/powercap").join(dir);
     std::fs::create_dir_all(&dir).expect("zone dir");
@@ -13,6 +17,7 @@ fn zone(root: &Path, dir: &str, name: &str, energy: u64, range: u64) {
     std::fs::write(dir.join("max_energy_range_uj"), format!("{range}\n")).expect("range");
 }
 
+#[cfg(not(windows))]
 fn set(root: &Path, name: &str, energy: u64) {
     let path = root.join("sys/class/powercap").join(name).join("energy_uj");
     std::fs::write(path, format!("{energy}\n")).expect("energy");
@@ -22,6 +27,7 @@ fn set(root: &Path, name: &str, energy: u64) {
 /// base; a counter that wrapped counts to its top and on from 0. CONTROLS: the package's
 /// subzone, which the package already counts, is not read (counted, it would add 5 W), and
 /// neither is the platform's top-level `psys`, which counts the packages again (12 W more).
+#[cfg(not(windows))]
 #[test]
 fn the_packages_watts_are_their_counters_change_over_the_time_between() {
     let root = aterm_tempfile::tempdir().expect("scratch root");

@@ -67,7 +67,7 @@ fn an_inflight_cache_read_cannot_overwrite_the_followers_newer_observation() {
     let mut reads = 0;
     let worker = std::thread::spawn(move || {
         let mut gates_ok = true;
-        worker_desk.run(|| {
+        worker_desk.run(true, || {
             reads += 1;
             let place = aterm_netplace::keeper::read_with(
                 &path,
@@ -88,7 +88,7 @@ fn an_inflight_cache_read_cannot_overwrite_the_followers_newer_observation() {
                 gates_ok &= new_captured.send(()).is_ok();
                 gates_ok &= new_released.recv_timeout(hang).is_ok();
             }
-            Arc::new(place)
+            (Arc::new(place), None)
         });
         let _ = done.send((reads, gates_ok));
     });
@@ -591,22 +591,22 @@ fn the_follow_lane_marks_a_change_of_the_away_fact_alone() {
     let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
     let mut following = FollowState::default();
     assert!(
-        following.observe(&away, early.now_ms),
+        following.observe(&away, None, early.now_ms),
         "the first publication clears any old entry"
     );
     assert_eq!(following.stated, Some(None), "a blip states nothing");
-    assert!(!following.observe(&away, early.now_ms));
-    assert!(following.observe(&away, later.now_ms));
+    assert!(!following.observe(&away, None, early.now_ms));
+    assert!(following.observe(&away, None, later.now_ms));
     let stated = following.stated;
     assert!(stated.flatten().is_some());
     let mut answering = away.clone();
     answering.internet.state = aterm_netplace::InternetState::Ok;
-    assert!(!following.observe(&answering, later.now_ms));
+    assert!(!following.observe(&answering, None, later.now_ms));
     assert_eq!(following.stated, stated);
     let home = aterm_netplace::sample::home(SINCE_MS, 3);
-    assert!(following.observe(&home, later.now_ms));
+    assert!(following.observe(&home, None, later.now_ms));
     assert_eq!(following.stated, Some(None));
-    assert!(!following.observe(&home, later.now_ms));
+    assert!(!following.observe(&home, None, later.now_ms));
 }
 
 #[test]
@@ -615,53 +615,400 @@ fn the_follower_schedules_the_dwell_entry_without_repeating_a_due_wait() {
     let due = SINCE_MS + aterm_netplace::words::AWAY_ENTRY_AFTER_MS;
     let mut following = FollowState::default();
     let mut app = crate::App::headless_for_test();
-    assert!(following.observe(&away, due - 1));
-    assert_eq!(following.wait(due - 1), std::time::Duration::from_millis(1));
+    assert!(following.observe(&away, None, due - 1));
+    assert_eq!(
+        following.wait(due - 1),
+        Some(std::time::Duration::from_millis(1))
+    );
     app.state_network_place(Some(&away), &words_at(due - 1));
     settle(&mut app);
     assert_eq!(away_entries_in(&app), 0);
     // Time spent publishing is not added back to the absolute deadline.
     let mut delayed = FollowState::default();
-    delayed.observe(&away, due - 1);
-    assert_eq!(delayed.wait(due + 5), std::time::Duration::ZERO);
-    assert!(delayed.observe(&away, due + 5));
-    assert_eq!(delayed.wait(due + 5), FOLLOW_EVERY);
-    assert!(following.observe(&away, due));
+    delayed.observe(&away, None, due - 1);
+    assert_eq!(delayed.wait(due + 5), Some(std::time::Duration::ZERO));
+    assert!(delayed.observe(&away, None, due + 5));
+    assert_eq!(delayed.wait(due + 5), None);
+    assert!(following.observe(&away, None, due));
     app.state_network_place(Some(&away), &words_at(due));
     settle(&mut app);
     assert_eq!(away_entries_in(&app), 1);
     assert_eq!(alerts_in(&app), 0);
-    assert_eq!(following.wait(due), FOLLOW_EVERY);
+    assert_eq!(following.wait(due), None);
     assert!(
-        !following.observe(&away, due + 1),
+        !following.observe(&away, None, due + 1),
         "no repeated key notification"
     );
 }
 
+/// The away key's own deadline is its dwell; with none representable (clock extremes, fixed
+/// states) it has none, and the follower waits for a change of the place's inputs alone, on no
+/// clock (it read every ten seconds, ATERM-KI-1105-20).
 #[test]
-fn the_follower_keeps_its_external_fact_cap_at_clock_extremes_and_fixed_states() {
+fn the_follower_has_no_deadline_of_its_own_at_clock_extremes_and_fixed_states() {
     let mut away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
     let mut following = FollowState::default();
-    following.observe(&away, SINCE_MS);
-    assert_eq!(following.wait(SINCE_MS), FOLLOW_EVERY);
+    following.observe(&away, None, SINCE_MS);
     assert_eq!(
-        following.wait(0),
-        FOLLOW_EVERY,
-        "rollback still resamples facts"
+        following.wait(SINCE_MS),
+        Some(std::time::Duration::from_millis(
+            aterm_netplace::words::AWAY_ENTRY_AFTER_MS
+        )),
+        "the dwell is the one deadline"
     );
     away.since_ms = Some(u64::MAX);
-    following.observe(&away, u64::MAX - 1);
-    assert_eq!(
-        following.wait(u64::MAX),
-        FOLLOW_EVERY,
-        "no representable dwell"
-    );
+    following.observe(&away, None, u64::MAX - 1);
+    assert_eq!(following.wait(u64::MAX), None, "no representable dwell");
     away.since_before = true;
-    following.observe(&away, u64::MAX);
+    following.observe(&away, None, u64::MAX);
     assert!(following.stated.flatten().is_some());
-    assert_eq!(following.wait(u64::MAX), FOLLOW_EVERY);
+    assert_eq!(following.wait(u64::MAX), None);
     away.once_alab = true;
-    following.observe(&away, u64::MAX);
+    following.observe(&away, None, u64::MAX);
     assert_eq!(following.stated, Some(None));
-    assert_eq!(following.wait(u64::MAX), FOLLOW_EVERY);
+    assert_eq!(following.wait(u64::MAX), None);
+}
+
+/// A WRITE WHILE THE FOLLOWER READS IS READ AGAIN: a change of the place's files told during a
+/// read (after the owner took the last one, before it waits again) is latched, so the owner reads
+/// once more as that read lands, though, watched and with no dwell pending, it waits on no clock.
+/// NEGATIVE CONTROL: taking the change after the read instead of as it begins (`held.files =
+/// false` beside `held.read_at = …`) loses the one told mid-read, and "the change told during
+/// the second read is read again" fails at the hang detector.
+#[cfg(unix)]
+#[test]
+fn a_file_change_during_the_followers_read_is_read_again() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let hang = Duration::from_secs(60);
+    let desk = Arc::new(ObservationDesk::new());
+    let (notice, _notices) = mpsc::channel();
+    desk.register(Notice::Test(notice));
+    let (read, reads) = mpsc::channel();
+    let worker_desk = Arc::clone(&desk);
+    let worker = std::thread::spawn(move || {
+        let mut count = 0;
+        worker_desk.run(true, || {
+            count += 1;
+            if count == 2 {
+                worker_desk.input_changed();
+            }
+            let _ = read.send(count);
+            (Arc::new(aterm_netplace::sample::home(SINCE_MS, 3)), None)
+        });
+    });
+    let first = reads.recv_timeout(hang);
+    desk.input_changed();
+    let second = reads.recv_timeout(hang);
+    let third = reads.recv_timeout(hang);
+    desk.close();
+    worker.join().unwrap();
+    assert_eq!(first, Ok(1), "the first read needs no change");
+    assert_eq!(second, Ok(2), "a change at rest is read");
+    assert_eq!(
+        third,
+        Ok(3),
+        "the change told during the second read is read again"
+    );
+}
+
+/// The follower's cost at rest, measured: the actual observation owner over a scratch place
+/// folder (as the window starts it, with the folder and the routes watched as `follow` watches
+/// them), its
+/// reads counted, and this process's interrupt wakeups (`proc_pid_rusage`) over a span.
+/// `ATERM_MEASURE_REST_SECS` sets the span (default 65). A manual measurement, never a timing
+/// gate (ATERM-KI-1105-20).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "manual idle measurement of the follower at rest, not a timing gate"]
+fn follower_rest_wakeups() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    fn wakeups() -> u64 {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // SAFETY: a V4 buffer of the right size for this process's own usage.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                info.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: proc_pid_rusage filled it.
+        unsafe { info.assume_init() }.ri_interrupt_wkups
+    }
+    let span = Duration::from_secs(
+        std::env::var("ATERM_MEASURE_REST_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(65),
+    );
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().to_owned();
+    let dir = aterm_netplace::record::dir(&state);
+    aterm_netplace::record::write(&dir, &aterm_netplace::record::Written::default()).unwrap();
+    let desk: &'static ObservationDesk = Box::leak(Box::new(ObservationDesk::new()));
+    let (notice, _notices) = std::sync::mpsc::channel();
+    desk.register(Notice::Test(notice));
+    let reads: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let worker = std::thread::spawn(move || {
+        let files = watch_files(desk, &state);
+        let routes = watch_routes(desk, aterm_uds::network::RouteChanges::open());
+        observe(desk, &state, files, routes, || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            aterm_netplace::keeper::read_projected(&state)
+        });
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let (wake0, reads0) = (wakeups(), reads.load(Ordering::SeqCst));
+    std::thread::sleep(span);
+    let (wake1, reads1) = (wakeups(), reads.load(Ordering::SeqCst));
+    desk.close();
+    worker.join().unwrap();
+    eprintln!(
+        "follower at rest: span_s={} reads={} interrupt_wkups={}",
+        span.as_secs(),
+        reads1 - reads0,
+        wake1 - wake0
+    );
+}
+
+/// THE FOLLOWER'S CLOCKS ARE THE KEEPER'S, NO MORE: with nothing requested and no input changed,
+/// it reads again at once where it never read; on no clock where its inputs are watched and the
+/// place it read is settled; at the place's own next time-only change (no file need change when
+/// only the time does: an internet answer going stale); on the keeper's bounded look while a
+/// move settles (the gateway's ARP entry, which no event announces, so the window is not left on
+/// `checking` when no keeper keeps); and on the slow look once a watch it relied on is lost,
+/// which also holds against a later start of the owner's loop.
+/// NEGATIVE CONTROL: the owner's old watched arm (no look once watched, whatever the place)
+/// fails "a settling move is looked at on the keeper's ARP look"; dropping `place_due` from
+/// `FollowState::observe` fails "the place's own time-only change"; `run` setting `watched`
+/// without `!held.lost` fails "a watch lost before the loop starts stays lost".
+#[cfg(unix)]
+#[test]
+fn the_followers_clocks_are_the_keepers_bounded_looks_and_the_places_own_deadline() {
+    use aterm_netplace::place::Checking;
+    use std::time::Duration;
+    let desk = ObservationDesk::new();
+    let now = Instant::now();
+    let home = aterm_netplace::sample::home(SINCE_MS, 3);
+    {
+        let mut held = desk.state.lock_or_recover();
+        assert_eq!(
+            held.until_read(now, SINCE_MS),
+            Some(Duration::ZERO),
+            "never read: at once"
+        );
+        held.place = Some(Arc::new(home.clone()));
+        held.read_at = Some(now);
+        held.watched = true;
+        held.following.observe(&home, None, SINCE_MS);
+        assert_eq!(
+            held.until_read(now, SINCE_MS),
+            None,
+            "watched and settled: no clock"
+        );
+        held.following
+            .observe(&home, Some(SINCE_MS + 5_000), SINCE_MS);
+        assert_eq!(
+            held.until_read(now, SINCE_MS),
+            Some(Duration::from_secs(5)),
+            "the place's own time-only change"
+        );
+        held.following.observe(&home, None, SINCE_MS);
+        let mut moved = home.clone();
+        moved.at = aterm_netplace::Where::Checking(Checking::Moved);
+        held.place = Some(Arc::new(moved));
+        assert_eq!(
+            held.until_read(now, SINCE_MS),
+            Some(aterm_netplace::keeper::MOVED_EVERY),
+            "a settling move is looked at on the keeper's ARP look"
+        );
+        held.place = Some(Arc::new(home));
+    }
+    desk.unwatched();
+    assert_eq!(
+        desk.state.lock_or_recover().until_read(now, SINCE_MS),
+        Some(aterm_netplace::keeper::UNWATCHED_EVERY),
+        "a lost watch: the slow look"
+    );
+    let (read, reads) = std::sync::mpsc::channel();
+    let desk = Arc::new(desk);
+    desk.state.lock_or_recover().read_at = None;
+    desk.request();
+    let worker_desk = Arc::clone(&desk);
+    let worker = std::thread::spawn(move || {
+        worker_desk.run(true, || {
+            let _ = read.send(());
+            (Arc::new(aterm_netplace::sample::home(SINCE_MS, 3)), None)
+        });
+    });
+    let first = reads.recv_timeout(Duration::from_secs(60));
+    let watched = desk.state.lock_or_recover().watched;
+    desk.close();
+    worker.join().unwrap();
+    assert!(first.is_ok());
+    assert!(!watched, "a watch lost before the loop starts stays lost");
+}
+
+/// A ROUTE CHANGE WITH NO FILE WRITTEN IS READ AGAIN: the owner as the window starts it, its
+/// folder ([`watch_files`]) and its routes ([`watch_routes`], over a stand-in route socket)
+/// watched. A VPN raised within one remote stay changes the place's kind (`remote · hotspot` to
+/// `remote · vpn`) but not the keeper's record, so no file of the folder changes; the route
+/// socket's change alone makes the owner read again, and the cached place is the new one. The
+/// file watch's first looks (one per file, each of which always tells) are taken before the
+/// owner starts, so no read but the route change's can follow the first.
+/// NEGATIVE CONTROL: `watch_routes` arming with a `changed` that tells nothing (`|| {}` for
+/// `|| desk.input_changed()`) hangs "the route change is read again" at the detector.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_route_change_with_no_file_written_is_read_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    let hang = Duration::from_secs(60);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().to_owned();
+    aterm_netplace::record::write(
+        &aterm_netplace::record::dir(&state),
+        &aterm_netplace::record::Written::default(),
+    )
+    .unwrap();
+    let mut lan = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    // This transition owes a notice even when the symbolic fixture time is in the future.
+    lan.since_before = true;
+    let mut vpn = lan.clone();
+    vpn.at = aterm_netplace::Where::Remote(aterm_netplace::Kind::Vpn);
+    vpn.kind = Some(aterm_netplace::Kind::Vpn);
+    vpn.tunnel = Some("utun4".to_owned());
+    assert_ne!(
+        aterm_netplace::words::away_key(&lan, 0).expect("the old stay is settled"),
+        aterm_netplace::words::away_key(&vpn, 0).expect("the new stay is settled"),
+        "the route change owes a publication notice independently of the wall clock"
+    );
+    let desk: &'static ObservationDesk = Box::leak(Box::new(ObservationDesk::new()));
+    let (notice, _notices) = std::sync::mpsc::channel();
+    desk.register(Notice::Test(notice));
+    let files = watch_files(desk, &state);
+    let looks = files
+        .as_ref()
+        .map_or(0, aterm_netplace::watch::Watch::first_looks);
+    let first_look = {
+        // No owner runs yet: the test alone waits on the desk's wake for every first look's tell.
+        let deadline = Instant::now() + hang;
+        let mut held = desk.state.lock_or_recover();
+        while held.told < looks && Instant::now() < deadline {
+            held = desk
+                .wake
+                .wait_timeout(held, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        held.told == looks && std::mem::take(&mut held.input)
+    };
+    let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let routes = watch_routes(
+        desk,
+        Ok(aterm_uds::network::RouteChanges::over(heard.into())),
+    );
+    let armed = (files.is_some(), routes.is_some());
+    let (read, reads) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let count: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let (worker_lan, worker_vpn) = (lan.clone(), vpn.clone());
+    let worker = std::thread::spawn(move || {
+        observe(desk, &state, files, routes, || {
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = read.send(n);
+            if n == 2 {
+                // Entering the callback does not publish its result. Hold it here so the
+                // test observes that boundary independently of the worker's scheduling.
+                let _ = released.recv_timeout(hang);
+            }
+            if n == 1 {
+                (worker_lan.clone(), None)
+            } else {
+                (worker_vpn.clone(), None)
+            }
+        });
+    });
+    let first = reads.recv_timeout(hang);
+    let sent = kernel.send(
+        &[24_u32, 1, 1, 1, 37, 1]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let after = reads.recv_timeout(hang);
+    let watched = desk.state.lock_or_recover().watched;
+    let before_publication = desk.state.lock_or_recover().place.clone();
+    let _ = release.send(());
+    let deadline = Instant::now() + hang;
+    let place = {
+        let mut held = desk.state.lock_or_recover();
+        while held.place.as_deref() != Some(&vpn) && Instant::now() < deadline {
+            held = desk
+                .wake
+                .wait_timeout(held, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        held.place.clone()
+    };
+    desk.close();
+    worker.join().unwrap();
+    assert!(first_look, "the folder watch's first look tells");
+    assert_eq!(armed, (true, true), "the folder and the routes are watched");
+    assert!(watched);
+    assert_eq!(first, Ok(1));
+    assert!(sent.is_ok());
+    assert_eq!(after, Ok(2), "the route change is read again");
+    assert_eq!(
+        before_publication.as_deref(),
+        Some(&lan),
+        "callback entry still holds the previous published place"
+    );
+    assert_eq!(
+        place.as_deref(),
+        Some(&vpn),
+        "the cached place is the new one"
+    );
+}
+
+/// A WALL MOVE IS AN INPUT CHANGE FOR THE WINDOW'S FOLLOWER: an announced wake or clock step
+/// heard through the follower's wall watch (`watch_wall`) latches an input change on its desk, so
+/// the owner steps again at the wall's new now instead of at the next network change
+/// (ATERM-KI-1105-20).
+/// NEGATIVE CONTROL: `watch_wall` arming with a `moved` that tells nothing (`|| {}` for
+/// `|| desk.input_changed()`) hangs "the move is told" at the detector.
+#[cfg(unix)]
+#[test]
+fn a_wall_move_is_an_input_change_for_the_follower() {
+    let hang = std::time::Duration::from_secs(60);
+    let desk: &'static ObservationDesk = Box::leak(Box::new(ObservationDesk::new()));
+    assert!(watch_wall(desk, None).is_none(), "no source, no watch");
+    let source = Arc::new(aterm_uds::wall_watch::WallWatch::by_hand().expect("doorbell"));
+    let watch = watch_wall(desk, Some(Arc::clone(&source))).expect("the watch starts");
+    source.tell(aterm_uds::wall_watch::Moved {
+        stepped: true,
+        ..Default::default()
+    });
+    let told = {
+        let deadline = Instant::now() + hang;
+        let mut held = desk.state.lock_or_recover();
+        while held.told == 0 && Instant::now() < deadline {
+            held = desk
+                .wake
+                .wait_timeout(held, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        (held.told, std::mem::take(&mut held.input))
+    };
+    drop(watch);
+    assert_eq!(
+        told,
+        (1, true),
+        "the move is told, latched as an input change"
+    );
 }

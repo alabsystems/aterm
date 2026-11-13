@@ -1381,13 +1381,15 @@ fn a_shaped_calls_record_is_kept_under_its_own_crates_and_variant() {
 
 /// A book keeps what a metered stage took, and the next run of it claims by it; it keeps nothing
 /// for a stage that touches no target directory, nor with no file. Its budget is what can ever be
-/// available, unbounded where that is unread. NEGATIVE CONTROL: before it keeps anything the
-/// compile claims the cold figure.
+/// available, unbounded where that is unread. Its shaping budget can be a smaller snapshot
+/// without lowering the scheduler budget. NEGATIVE CONTROL: before it keeps anything the compile
+/// claims the cold figure.
 #[test]
 fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let path = dir.path().join("stage-memory.json");
-    let book = Book::at(Some(path.clone()), Some(24 * GIB), Some(21 * GIB));
+    let book = Book::at(Some(path.clone()), Some(24 * GIB), Some(21 * GIB))
+        .with_shape_budget(Some(17 * GIB));
     assert_eq!(
         book.need(&compile(), &over(&compile(), &gui()), None).how,
         How::Cold
@@ -1403,7 +1405,17 @@ fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
         .expect("nothing to keep");
     assert_eq!(book.records().rows().len(), 1);
     let nowhere = Book::at(None, Some(24 * GIB), None);
-    assert_eq!((book.budget(), nowhere.budget()), (21 * GIB, u64::MAX));
+    let capped = Book::at(None, Some(24 * GIB), Some(21 * GIB)).with_shape_budget(Some(23 * GIB));
+    assert_eq!(
+        (
+            book.budget(),
+            book.shape_budget(),
+            nowhere.budget(),
+            nowhere.shape_budget(),
+            capped.shape_budget()
+        ),
+        (21 * GIB, 17 * GIB, u64::MAX, u64::MAX, 21 * GIB)
+    );
     nowhere
         .keep(&compile(), &over(&compile(), &gui()), 5 * GIB)
         .expect("nowhere");

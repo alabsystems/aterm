@@ -25,7 +25,7 @@ fn glyphs(lines: &[&str]) -> Vec<Glyph> {
 
 #[test]
 fn the_status_names_the_body_and_the_icons() {
-    let row = "trail style=\"rainbow kitty pet\" pet_body=436,509,88,132 pet_focus=typing \
+    let row = "trail style=\"rainbow\" pet_body=436,509,88,132 pet_focus=typing \
                word_icons=40,60,10,30;100,120,10,30 selection=front";
     assert_eq!(status_box(row, "pet_body"), Ok(Some((436, 509, 88, 132))));
     assert_eq!(
@@ -116,7 +116,7 @@ fn write_frame_with_head(
     // (and over the letters), so the walk's exclusion of the twin is what the counts below hold.
     put(
         format!("{stem}.{frame}.clean.status.txt"),
-        "trail style=\"rainbow kitty pet\" pet_body=250,320,88,132 pet_focus=typing word_icons=none\n",
+        "trail style=\"rainbow\" pet_body=250,320,88,132 pet_focus=typing word_icons=none\n",
     );
     put(
         format!("{stem}.{frame}.text.txt"),
@@ -130,9 +130,7 @@ fn write_frame_with_head(
     let head = head.map_or(String::new(), |h| format!(" head_body={h}"));
     put(
         format!("{stem}.{frame}.status.txt"),
-        &format!(
-            "trail style=\"rainbow kitty pet\" pet_body={body}{head} pet_focus=typing{icons}\n"
-        ),
+        &format!("trail style=\"rainbow\" pet_body={body}{head} pet_focus=typing{icons}\n"),
     );
 }
 
@@ -320,13 +318,13 @@ fn a_frame_not_read_is_never_counted_clean() {
     assert_eq!(failed(&open), 0, "{}", render(&open));
 }
 
-/// looks10 L10: nyan's flying head names its drawn body in `head_body=`, and the verb reads it as it reads the pet's.
+/// looks10 L10: the flying head names its drawn body in `head_body=`, and the verb reads it as it reads the pet's.
 /// A head clear of the line and the caret meets nothing; negative control: one laid over `fox` and the caret counts in
 /// `head_over`, `on_letters` and `on_caret`; a status that names no head is counted in `heads_unread`.
 #[test]
 fn the_flying_head_is_read_as_the_pet_is() {
     let dir = scratch("head");
-    let stem = "nyan-rainbow-dark";
+    let stem = "flying-head-dark";
     write_frame_with_head(
         &dir,
         stem,

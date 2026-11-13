@@ -179,13 +179,8 @@ impl Source for Official {
                 "official bottle URL does not name its pinned digest",
             ));
         }
-        let token = api::ghcr_token(&repo).map_err(Error::cannot_run)?;
-        fetch::curl_to_file(
-            &bottle.url,
-            path,
-            &[&format!("Authorization: Bearer {token}")],
-        )
-        .map_err(Error::cannot_run)
+        let authorization = api::ghcr_authorization(&repo).map_err(Error::cannot_run)?;
+        fetch::curl_to_file(&bottle.url, path, &[authorization.as_str()]).map_err(Error::cannot_run)
     }
 }
 

@@ -35,11 +35,298 @@ pub fn home_cwd(value: &str) -> Option<Result<&str, &'static str>> {
     Some(Ok(path.trim_matches('/')))
 }
 
+/// The most characters a request's `why=` holds (ATERM-KI-1109-3).
+pub const REQUEST_WHY_MAX: usize = 200;
+
+/// The most bytes a request's `why=` takes percent-encoded ([`aterm_codec::pct::encoded_len`]), as
+/// the session log records it (`why_text=`, whose cap this is), so a line a request admitted is
+/// kept whole: a space, a `%` and each byte of a non-ASCII character take three.
+pub const REQUEST_WHY_BYTES: usize = 256;
+
+/// A spawn's `why=` value as a request keeps it: the one line a person reviewing the request reads
+/// to judge what it is for, trimmed. An error, saying why, where it is empty, longer than
+/// [`REQUEST_WHY_MAX`] characters or [`REQUEST_WHY_BYTES`] encoded bytes, more than one line (any
+/// control character), holds a character no surface prints
+/// ([`crate::hidden_char::is_hidden_char`]: a line separator, a zero-width, bidi or other format
+/// character, which the log would drop, leaving a reason that reads as nothing), or holds a quote,
+/// which no request line carries inside a value.
+/// # Errors
+/// As above.
+pub fn request_why(value: &str) -> Result<&str, &'static str> {
+    let why = value.trim();
+    if why.is_empty() {
+        return Err("names nothing: why= is one line saying what the request is for");
+    }
+    if why.chars().count() > REQUEST_WHY_MAX {
+        return Err("is longer than 200 characters: why= is one line");
+    }
+    if why.chars().any(char::is_control) {
+        return Err("is more than one line: why= is one line");
+    }
+    if why.chars().any(crate::hidden_char::is_hidden_char) {
+        return Err(
+            "holds a character no screen shows (a line separator, zero-width, bidi or other format character): why= is one visible line",
+        );
+    }
+    if why.contains('"') {
+        return Err("holds a quote, which no request line carries in a value");
+    }
+    if aterm_codec::pct::encoded_len(why) > REQUEST_WHY_BYTES {
+        return Err(
+            "takes more than the 256 bytes the request record keeps (a space, a % and each byte of a non-ASCII letter take three): say it in fewer words",
+        );
+    }
+    Ok(why)
+}
+
+/// The most characters of a request id's requester head (`r-<date>-<hhmm>-<head>-<n>`): a node
+/// id's first eight letters and digits, or `local`.
+pub const REQUEST_ID_HEAD_MAX: usize = 8;
+
+/// A `req=<id>` value as aterm mints a request id (ATERM-KI-1109-3): `r-`, the UTC date as 8
+/// digits, `-`, the UTC hour and minute as 4 digits, `-`, the requester's head (1 to
+/// [`REQUEST_ID_HEAD_MAX`] lowercase letters and digits: a node id's head, or `local`), `-`, and
+/// the request's count within that minute and head (2 or more digits).
+/// # Errors
+/// What `value` lacks of that shape: an id aterm never mints is refused, never looked up.
+pub fn request_id(value: &str) -> Result<&str, &'static str> {
+    const SHAPE: &str =
+        "is not a request id (r-<yyyymmdd>-<hhmm>-<head>-<n>, as a spawn's reply names it)";
+    let mut parts = value.split('-');
+    let ok = parts.next() == Some("r")
+        && parts
+            .next()
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+        && parts
+            .next()
+            .is_some_and(|hhmm| hhmm.len() == 4 && hhmm.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_some_and(|head| {
+            (1..=REQUEST_ID_HEAD_MAX).contains(&head.len())
+                && head
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+        && parts.next().is_some_and(|n| {
+            n.bytes().all(|b| b.is_ascii_digit())
+                && n.parse::<u32>()
+                    .is_ok_and(|count| count > 0 && format!("{count:02}") == n)
+        })
+        && parts.next().is_none();
+    if ok { Ok(value) } else { Err(SHAPE) }
+}
+
+/// The verb of the line a fleet drive sends first, before any request ([`Requester::line`]).
+pub const REQUESTER_VERB: &str = "requester";
+
+/// The most bytes a requester's program or model takes, as the session log's `agent=` and
+/// `model=` keep them ([`Requester`]).
+pub const REQUESTER_TOKEN_MAX: usize = 32;
+
+/// The most bytes a requester's account takes percent-encoded, as the session log's `account=`
+/// keeps it ([`Requester`]).
+pub const REQUESTER_ACCOUNT_BYTES: usize = 64;
+
+/// The longest requester line the driven Mac reads, its newline not counted: the verb and its four
+/// keys at their longest fit with room to spare.
+pub const REQUESTER_LINE_MAX: usize = 256;
+
+/// Whether `s` has the shape aterm mints a session id in: `s-` and 20 lowercase hex digits. The
+/// same check as `aterm_session::is_minted_sid`, which this crate cannot reach; a test holds the
+/// two to one answer.
+#[must_use]
+pub fn is_minted_sid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 22
+        && b.starts_with(b"s-")
+        && b[2..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// `raw` (a program, or a model as a footer shows it: `Opus 5.5`) as a requester names it: trimmed,
+/// ASCII-lowercased and each run of spaces one `-` (`opus-5.5`). `None` where what is left is not
+/// `[a-z0-9.-]` of 1 to [`REQUESTER_TOKEN_MAX`] bytes, or is the bare `-` that names nothing: such a
+/// value is left out, never cut.
+#[must_use]
+pub fn requester_token(raw: &str) -> Option<String> {
+    let token = raw
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase();
+    is_requester_token(&token).then_some(token)
+}
+
+fn is_requester_token(s: &str) -> bool {
+    !s.is_empty()
+        && s != "-"
+        && s.len() <= REQUESTER_TOKEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+}
+
+fn is_requester_account(s: &str) -> bool {
+    !s.is_empty()
+        && s != "-"
+        && s.trim() == s
+        && !s.chars().any(char::is_control)
+        && !s.chars().any(crate::hidden_char::is_hidden_char)
+        && aterm_codec::pct::encoded_len(s) <= REQUESTER_ACCOUNT_BYTES
+}
+
+/// The next of a requester line's `words`, which must be `<key>=<value>`: the value, `None` for `-`.
+fn requester_value<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    key: &str,
+) -> Result<Option<&'a str>, &'static str> {
+    let value = words
+        .next()
+        .and_then(|word| word.strip_prefix(key))
+        .and_then(|word| word.strip_prefix('='))
+        .ok_or("a requester line is `requester sid=… program=… model=… account=…`")?;
+    Ok((value != "-").then_some(value))
+}
+
+/// Who on the driving Mac asks for a fleet drive (ATERM-KI-1109-3): the session the drive came
+/// from, the program that runs in it, that program's model and its account, each `None` where the
+/// driving Mac could not name it in its shape. The driving Mac claims it on the drive's first line
+/// ([`Requester::line`]) and the driven Mac records it beside the node the drive's handshake
+/// proved: it names who asked within that node, and never authorizes anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Requester {
+    sid: Option<String>,
+    program: Option<String>,
+    model: Option<String>,
+    account: Option<String>,
+}
+
+impl Requester {
+    /// A requester of these parts, each one that does not fit its shape left out: a `sid` aterm
+    /// did not mint, a `program` or `model` [`requester_token`] does not take, an `account` that
+    /// is not one visible line of at most [`REQUESTER_ACCOUNT_BYTES`] bytes percent-encoded.
+    #[must_use]
+    pub fn of(
+        sid: Option<&str>,
+        program: Option<&str>,
+        model: Option<&str>,
+        account: Option<&str>,
+    ) -> Self {
+        Self {
+            sid: sid.filter(|sid| is_minted_sid(sid)).map(str::to_owned),
+            program: program.and_then(requester_token),
+            model: model.and_then(requester_token),
+            account: account
+                .map(str::trim)
+                .filter(|account| is_requester_account(account))
+                .map(str::to_owned),
+        }
+    }
+
+    /// The requesting session (`s-` and 20 lowercase hex digits).
+    #[must_use]
+    pub fn sid(&self) -> Option<&str> {
+        self.sid.as_deref()
+    }
+
+    /// The program that runs in it (`claude`).
+    #[must_use]
+    pub fn program(&self) -> Option<&str> {
+        self.program.as_deref()
+    }
+
+    /// That program's model (`opus-5.5`).
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Its account, as the driving Mac's survey shows it (masked).
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// The line a fleet drive sends first, newline included:
+    /// `requester sid=<sid|-> program=<word|-> model=<word|-> account=<pct|->`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let word = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_owned());
+        format!(
+            "{REQUESTER_VERB} sid={} program={} model={} account={}\n",
+            word(&self.sid),
+            word(&self.program),
+            word(&self.model),
+            self.account
+                .as_deref()
+                .map_or_else(|| "-".to_owned(), aterm_codec::pct::encode),
+        )
+    }
+
+    /// [`Self::line`]'s inverse, strict: the verb, then `sid=`, `program=`, `model=` and
+    /// `account=` once each in that order, one space apart, each `-` or a value of its shape
+    /// (the account percent-encoded as [`Self::line`] writes it). A line ending is taken.
+    /// # Errors
+    /// Why `line` is no requester line, where any word is missing, extra, out of order or out of
+    /// its shape: a value that does not fit is refused, never cut.
+    pub fn parse(line: &str) -> Result<Self, &'static str> {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut words = line.split(' ');
+        if words.next() != Some(REQUESTER_VERB) {
+            return Err(
+                "a drive names its requester first: `requester sid=… program=… model=… account=…`",
+            );
+        }
+        let sid = requester_value(&mut words, "sid")?;
+        let program = requester_value(&mut words, "program")?;
+        let model = requester_value(&mut words, "model")?;
+        let account = requester_value(&mut words, "account")?;
+        if words.next().is_some() {
+            return Err("a requester line names sid, program, model and account, and nothing more");
+        }
+        if sid.is_some_and(|sid| !is_minted_sid(sid)) {
+            return Err("a requester's sid= is a session aterm minted (`s-` and 20 hex digits)");
+        }
+        if [program, model]
+            .into_iter()
+            .flatten()
+            .any(|token| !is_requester_token(token))
+        {
+            return Err(
+                "a requester's program= and model= are lowercase words of letters, digits, `.` and \
+                 `-`, at most 32 bytes",
+            );
+        }
+        let account = match account {
+            Some(raw) => {
+                let decoded = aterm_codec::pct::decode(raw);
+                if aterm_codec::pct::encode(&decoded) != raw || !is_requester_account(&decoded) {
+                    return Err(
+                        "a requester's account= is one visible line, percent-encoded, at most 64 \
+                         bytes",
+                    );
+                }
+                Some(decoded)
+            }
+            None => None,
+        };
+        Ok(Self {
+            sid: sid.map(str::to_owned),
+            program: program.map(str::to_owned),
+            model: model.map(str::to_owned),
+            account,
+        })
+    }
+}
+
 /// How long a `turn` waits for a Claude Code composer to show the text it typed, from the first look that finds the program has read the text and again from each look that finds it unread, a minute after the typing at most; a text the composer does not show by then leaves the screen to judge the Enter.
 pub const TURN_ECHO_CAP_MS: u64 = 5_000;
 
 /// The head, before why, of a drive's admission refusal where no grant on the driven Mac admits the dialer's node as its grants and books read then stand (no grant names it, its grant holds another key, or no book binds it); a book it could not read, and a request's refusal, answer `ERR denied: `.
 pub const DRIVE_UNGRANTED: &str = "ERR denied grant=none: ";
+
+/// The head of a drive's refusal where the driven Mac's fleet access is below what the act needs ([`crate::fleet_access::FleetAccess::refusal`]): the level in force follows it as a word, then ` needs=<word>: ` and why. It is not [`DRIVE_UNGRANTED`]: the dialer's grant stands, and the same line is admitted once that Mac's person raises its access.
+pub const DRIVE_LOCKED: &str = "ERR denied access=";
 
 /// The options a `turn` reads before its text, past its leading `id=`, `if-supervisor=` and `cause=`.
 pub const TURN_OPTIONS: [&str; 16] = [
@@ -219,6 +506,33 @@ pub enum Body {
     },
     /// A `len=<n>` among the leading options announces `n` bytes (`post`).
     PostLen,
+}
+
+/// `post`'s end of options: the words after it are the post's text.
+pub const POST_OPTIONS_END: &str = "--";
+
+/// `post`'s leading option words out of `toks`: they end at [`POST_OPTIONS_END`] or at the first
+/// word that is not an option, where the inline text begins.
+pub fn post_options<'a>(toks: impl Iterator<Item = &'a str>) -> impl Iterator<Item = &'a str> {
+    toks.take_while(|tok| *tok != POST_OPTIONS_END && is_post_option(tok))
+}
+
+/// Whether `tok` is one of `post`'s option words.
+pub fn is_post_option(tok: &str) -> bool {
+    tok == "--wait"
+        || tok.starts_with("--wait=")
+        || tok == "--wait-ack"
+        || tok.starts_with("--wait-ack=")
+        || ["to=", "kind=", "re=", "dl=", "via=", "key=", "len="]
+            .iter()
+            .any(|k| tok.starts_with(k))
+}
+
+/// The `<n>` of a `len=<n>` among `post`'s leading options in `rest`, the request line after
+/// the verb: the [`Body::PostLen`] body the server reads after the line. A `len=` word in the
+/// post's text announces nothing.
+pub fn post_announced_len(rest: &str) -> Option<&str> {
+    post_options(rest.split_whitespace()).find_map(|tok| tok.strip_prefix("len="))
 }
 
 /// What a verb's request does to a session's input, as the server's input gates ask it: a set of the flags below.
@@ -408,12 +722,40 @@ pub struct Form {
     pub ack: Option<bool>,
 }
 
+/// `setup=`'s grammar as a literal, which the `setup status` entry and the `status` page's setup
+/// section (`verb_page::status`) quote through `concat!` (`aterm_gui`'s `setup_field`, design
+/// §3.5): one text, so the two cannot drift.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! setup_state {
+    () => {
+        "`setup=<done|read-back:<rows>|unread:<rows>|pending[:<rows>]|->` then its tails (this \
+         Mac's first-run setup, read from the last status its worker published: no probe, \
+         nothing changed). `done` leaves nothing for anyone to do now, each private row (the \
+         profile's settings and Rust in Spotlight, which System State reads only while it is in \
+         front with a person) read in the last 10 minutes; `read-back:` names private rows read \
+         back as wanted longer ago and not read since: set up as last read, never in place now; \
+         `unread:` names rows no usable reading stands behind (a read withheld, one that said \
+         nothing, such as a grant this process cannot read), neither done nor pending, which \
+         nothing waits on; `pending` a step left, a run going or a change under way. After \
+         `pending`: `;needs:<rows>` the pending rows that wait on a person's press, then \
+         `;unread:<rows>` and `;read-back:<rows>`. After `done`, `read-back:` or `unread:`: \
+         `;read-back:<rows>` (after `unread:`), `;asking:<rows>` what a parked run still asks \
+         for again by itself (an absent vault, a step put off), `;at-login:<rows>` rows that \
+         take full effect at the next login, `;changed:<rows>` rows changed since aterm set \
+         them, which setup leaves as they are and never says in place (nothing tells who changed \
+         them). After any head, `;offered:<rows>` the macOS grants on offer, which \
+         nothing waits for. Rows are `fda`, `devtools`, `debugger`, `ax`, `capslock`, `dock`, \
+         `spotlight`, `vault`, `repos`, …"
+    };
+}
+
 /// [`HOLD_COST`] as a literal, so the `hold` entry and the window's Take Over tool tip quote it through `concat!`.
 #[macro_export]
 macro_rules! hold_cost {
     () => {
         "While any tab is held, agents on this aterm cannot use invoke, tab, pane, hwkey, \
-         pointer or confirm, or open the palette, a tab menu, the Autopilot menu or Overview, \
+         pointer or confirm, or open the palette, a tab menu, a fact menu or Overview, \
          and a sudo with no terminal cannot ask for its password in any tab."
     };
 }
@@ -564,9 +906,7 @@ aux_targets! {
         Menu = "menu" | "palette",
         /// The in-grid session context menu (the tab menu).
         TabMenu = "tab-menu",
-        /// The Autopilot menu, the chip's card over the pane.
-        AutopilotMenu = "autopilot-menu",
-        /// A fact's menu, the same card hung from a fact of Claude Code's composer rule (the usage's: its Traffic card, a graph over time).
+        /// A fact's menu, a card hung over the pane from a fact of Claude Code's composer rule (the usage's: its Traffic card, a graph over time).
         FactMenu = "fact-menu",
         /// The Overview; `open overview` raises it on the front window, `controls overview` reads the open card's groups, chips and manages lines (where this aterm's fabric is on, its "On the fabric" group too: `overview fabric chip node= sid= need= age= mark= older=` lines, read off the fabric's log and never acted on), and every wire read of it is Owner-gated.
         Overview = "overview" | "connections",
@@ -1023,7 +1363,10 @@ pub const VERBS: &[VerbSpec] = &[
          proved by its key, also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
          `spawn agent=<claude|codex|agy|muse|grok>` with its task, `await task`, `board`, and \
-         `@<sid> close` on a worker it spawned (`aterm help fleet`).",
+         `@<sid> close` on a worker it spawned, each as far as that Mac's fleet access admits \
+         it (`aterm fleet access`: Read Only, the default, admits the reads; `write` also the \
+         acts on a session already there; `full` also `spawn`); an act above it answers `ERR \
+         denied access=<level> needs=<level>: …` (`aterm help fleet`).",
     )
     .input(Input::NONE)
     .for_fleet(),
@@ -1055,13 +1398,15 @@ pub const VERBS: &[VerbSpec] = &[
          `apply_held=` names the one hold the apply waits on while it holds (the log says it \
          once, `held by … since …; it lands when …`): `restored-agents` (up to 7 min while \
          reopened tabs' agents relaunch), `consent-warmup`, `setup-draft` (a person's setup \
-         draft not yet applied), `setup-answer` (the setup page taking its own answer), \
-         `password-prompt`, `developer-tools`, `system-state`, \
-         `boundary-item`, `tab-starting`, `pane-exited`, `signer-unconfirmed`, `prepark-read`, \
+         draft not yet applied), `setup-answer` (the setup page taking its own answer, up to 30 s), \
+         `setup-choice` (a setup choice someone made and not yet saved), `password-prompt` (up to \
+         5 min; one nobody touched for 2 min is refused), `developer-tools`, `system-state` \
+         (an Apply nobody chose, up to 30 s), \
+         `boundary-item`, `tab-starting`, `pane-exited` (up to 90 s), `signer-unconfirmed`, `prepark-read`, \
          `capture-refused`, `policy-read`, `launch-record-renewal`, `activity-revoked`, \
          `handoff-in-flight`, `updater-busy`, `person-install`, `stage-pending`, \
          `activation-superseded`. Each lifts by time or at aterm's own next step, but a person's \
-         own draft, prompt or install tab, which holds only while it is there; none waits on \
+         own draft, choice or install tab, which holds only while it is there; none waits on \
          whether anyone is at the Mac. `apply_held=account-work` names an accepted apply \
          waiting for admitted account work to retire. `check` (Owner-only) runs one channel \
          check and answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
@@ -1696,28 +2041,34 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         AnyScopeMeta,
         "setup status: the background coordinator's last published observation",
-        "— read-only instance posture, including with no terminal selected. Replies \
-         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|-> [caps_live=<mapping>] busy=<0|1> finished=<0|1> queued=<0|1> changing=<0|1> retrying=<0|1> running=<settings|->` \
-         with the same `setup=` state as `status`: `done`, `unknown:<rows>`, \
-         `pending[:<rows>][;needs:<rows>][;unknown:<rows>]`, or `-` before any observation; \
-         `unknown` names settings without a usable cached reading, separately from known work. \
-         The row metadata uses fixed public names and standings (`unread` before any reading), \
-         never notes or values. The generation counts cached observation changes, not time. \
-         Lifecycle fields are separate from readiness: `busy` includes cached pending window \
-         work; `finished` says the last published run ended, including a Stop, not that it \
-         succeeded or the current request was accepted. `queued` waits for another setup, \
-         `changing` means its saved records were being written, and `retrying` means its worker \
-         still retries. `running` lists fixed public setting names in checklist order, or `-`. \
-         Idle flags before admission prove no readiness, and these fields certify no whole-GUI \
-         or root-password phase settlement. They read only cached state. \
-         The optional `caps_live` is `unknown`, `unknown:held=N`, `control`, or \
-         `mixed:control=N,other=N,held=N`: cached reported OS/HID mapping composition. Counts \
-         are HID services, not physical keyboards; held services supply no Control claim. \
-         This field verifies no physical keypress or saved Caps readiness and sets no \
-         `verified` bits. Use `verified` for confirmed private-setting readiness. `done` may carry \
-         `;asking:<rows>` for automatic work still continuing and `;offered:<rows>` for grants \
-         which hold nothing back. Starts no probe or setup, requests no permission, changes \
-         no focus and counts as no input.",
+        concat!(
+            "— read-only instance posture, including with no terminal selected. Replies `OK \
+             schema=<n> setup=<state> verified=<bits> verified_at=<unix secs|-> \
+             observed_generation=<n> rows=<row:said,…|-> caps_live=<mapping> busy=<0|1> \
+             finished=<0|1> queued=<0|1> changing=<0|1> retrying=<0|1> running=<rows|->`, with \
+             `setup=` as `status` says it: ",
+            setup_state!(),
+            ". `rows=` says each row the plan manages with its standing (`in-place`, `differs`, \
+             `needs-you`, `waiting`, `at-login`, `failed`, `not-needed`, `unknown` before any \
+             reading), or `unread` or `offered` as `setup=` says it, never a note or a value. \
+             `verified` is the selection bitset of the private rows read back as wanted, \
+             whatever the reading's age, while no change that could move one is under way, and \
+             `verified_at` when the oldest of those readings started (`-` with none), whose age \
+             the reader judges; `observed_generation` counts published readings, not time. A \
+             reader decides only the rows it asks about. `caps_live` is `unknown`, \
+             `unknown:held=N`, `control`, or `mixed:control=N,other=N,held=N`: cached reported \
+             OS/HID mapping composition. Counts are HID services, not physical keyboards; held \
+             services supply no Control claim. It verifies no physical keypress or saved Caps \
+             readiness and sets no `verified` bit. The lifecycle fields are apart from readiness: \
+             `busy` includes cached pending window work; `finished` says the last published run \
+             ended, including a Stop, not that it succeeded or the current request was accepted; \
+             `queued` waits for another setup, `changing` means its saved records were being \
+             written, and `retrying` means its worker still retries; `running` lists the rows \
+             whose stage runs, in checklist order, or `-`. Idle flags before admission prove no \
+             readiness, and these fields certify no whole-GUI or root-password phase settlement. \
+             They read only cached state. Starts no probe or setup, requests no permission, \
+             changes no focus and counts as no input."
+        ),
     )
     .input(Input::NONE)
     .for_fleet(),
@@ -1823,8 +2174,10 @@ pub const VERBS: &[VerbSpec] = &[
         "program-check [full|live|held <pid>|held -]: the stuck check's macOS program-check board",
         "— answers `OK reading=<live|full> held=<pid|-> syspolicyd=<-|ok|full|stuck> \
          syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|-> syspolicyd_pid=<pid|-> \
-         syspolicyd_up_ms=<ms|->`, the board `status` \
-         carries (`aterm help permissions`), sampled once a minute on macOS. The forms below \
+         syspolicyd_up_ms=<ms|-> syspolicyd_age_ms=<ms|->`, the board `status` \
+         carries (`aterm help permissions`), read on macOS a minute after the window starts, \
+         each minute while the pool reads full or a program of this user waits at the check, \
+         and at an ask (this verb's or `status`'s) that finds the last look a minute old. The forms below \
          need `dev-seams`: `program-check full` stages `syspolicyd` at the kernel thread limit \
          (after 5 min it reads `stuck`, raising the restart alert and pausing harness \
          continuations); `program-check live` restores live sampling; `program-check held <pid>` \
@@ -1963,7 +2316,9 @@ pub const VERBS: &[VerbSpec] = &[
          sid=<sid> role=<role> label=\"<words>\" description=\"<words>\"|description=-` \
          lines: each Autopilot and Account chip's node as the window's accessibility tree is \
          built for a screen reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
-         done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
+         done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>> access=<read|write|full> \
+         shown=<read|write|full>` (this Mac's fleet access in force, and the level its lock \
+         shows: a raise not yet in effect) and, on macOS, the `❯` menu's \
          `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
          [submenu]` lines (`statusmenu ---` for a separator; debug builds add `at=<i>[.<j>…]` for \
          `person menubar press`).",
@@ -1977,11 +2332,18 @@ pub const VERBS: &[VerbSpec] = &[
         concat!(
             "— targets: ",
             window_targets!(),
-            " (`connections` aliases `overview`). `controls autopilot-menu` lists open Autopilot \
-             menu rows (`autopilot-menu/mode/<word>`, `autopilot-menu/land-in/<minutes>`, \
-             `autopilot-menu/land-at`, `autopilot-menu/land-cancel`, `autopilot-menu/settings`, \
-             or `autopilot-menu gap index=<i>`). `controls fact-menu` reads a fact menu \
-             (`fact-menu open=true session=<sid> fact=<fact>`, rows `fact-menu/<fact>/<act>`). \
+            " (`connections` aliases `overview`). `controls fact-menu` reads a fact menu \
+             (`fact-menu open=true session=<sid> fact=<fact>`, rows `fact-menu/<fact>/<act>`, \
+             or `fact-menu gap index=<i>`; a group heading is `fact-menu section index=<i> \
+             text=<title>` and a named fact `fact-menu fact index=<i> label=<name> \
+             tone=<label|value|warn> text=<value>`, its label empty on a row that continues the \
+             fact above; an item's `text=` ends with its trailing words where it has them; the \
+             permission chip's box is a card of the same kind, \
+             headed `fact-menu open=true session=<sid> box=permission` with no `fact=` and \
+             `label` lines alone, no row to choose; a slider row is `fact-menu slider index=<i> \
+             stops=<n> at=<label|none>` and one `fact-menu stop index=<i> stop=<j> \
+             key=fact-menu/<fact>/<act> current=<bool> rested=<bool>` per stop: Left and \
+             Right move the rest, Enter picks it and the menu stays open). \
              `controls overview` is Owner-escalated and includes remote fabric needs (`overview \
              fabric chip node=<id> sid=<sid> need=<word> age=<s|-> mark=<decide|stuck> \
              older=<0|1> selected=<bool>`, header `fabric=<n> \
@@ -2847,6 +3209,9 @@ pub const VERBS: &[VerbSpec] = &[
         form(Word("info")).op(Read),
         form(Word("constructors")).op(Read),
         form(Word("cancel-support")).op(Read),
+        // Opaque data custody only; its private kernel owner checks grant no
+        // execution, SDK access or PTY input, including while work is held.
+        form(Word("runtime-data")).op(Read),
     ]),
     v(
         "native-observe",
@@ -2930,6 +3295,9 @@ pub const VERBS: &[VerbSpec] = &[
          unavailable: \
          <not-the-hosts-agent|not-relaunchable|not-supervised|driver-lease|driver-turn|halted|start-unread|no-state>` \
          (or `ERR not-stalled`, `ERR bad restart argument: <word>`, `ERR restart failed: <what>`). \
+         `OK restarting` acknowledges acceptance; verify the new live process and its version \
+         after resuming. Earlier typing does not hold an accepted restart's resume line; new \
+         input, a draft, a hold or another driver's hand still does. \
          Works even when `[harness] relaunch = false`. Restart requires a matching host snapshot \
          and a validated relaunch route. Codex's `supervisor_proven=1` confirms a direct foreground \
          claim. `not-the-hosts-agent` means the host lacks a snapshot for this PID and kernel start. \
@@ -2982,7 +3350,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "open a tab app: `open app mail|about|settings`",
+        "open a tab app: `open app mail|about|settings|tables`",
         concat!(
             "`open app settings [/route]` selects a Settings page; `open app system-state` \
              opens setup; `open app markdown|editor <local-file-uri>` opens a document. \
@@ -2994,12 +3362,9 @@ pub const VERBS: &[VerbSpec] = &[
             "), replying `OK opened <target>` or `OK closed <target>`. `open fact-menu \
              <model|effort|path|branch|context|usage|top-effort|account|close>` opens or closes \
              that composer-rule menu. Opening requires the named fact to be visible in the \
-             front window's focused session. `open autopilot-menu` opens the front window's \
-             focused session's menu at its visible Autopilot chip; it refuses when no such \
-             chip is present. `open autopilot-menu close` closes it. These Autopilot-menu \
-             forms accept no coordinate (`at=`) or pointer/keyboard-origin (`by=`) operands. \
+             front window's focused session. \
              While any session is held, opening `menu`, `tab-menu`, \
-             `overview`, `autopilot-menu` or `fact-menu` is `ERR halted` (see `hold`); the \
+             `overview` or `fact-menu` is `ERR halted` (see `hold`); the \
              `close` forms remain available while held."
         ),
     )
@@ -3106,7 +3471,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "person look <window>|off | person menubar press <at>: the person, stood in for (debug \
+        "person look <window>|off | menubar press <at>|click: the person, stood in for (debug \
          builds)",
         "— debug-only stand-in for the human at the window; requires `ATERM_DEBUG_PERSON_INVOKE=1` \
          at launch (`ERR denied: …` or `ERR person needs a debug build` otherwise). `person look \
@@ -3115,7 +3480,10 @@ pub const VERBS: &[VerbSpec] = &[
          look off`; `ERR no window <n>`, `ERR a window looks for itself`). `person menubar press \
          <at>` clicks the `statusmenu` row at path `at=<i>[.<j>…]` from `chrome` (`OK pressed \
          \"<label>\"`, or `ERR no row at <at>`, `ERR not an action`, `ERR disabled \"<label>\"`, \
-         `ERR no menu-bar item off macOS`).",
+         `ERR no menu-bar item off macOS`). `person menubar click` left-clicks the menu-bar lock: \
+         this Mac's fleet access one step on, a lower level at once and a raise after its \
+         2-second settle (`OK clicked the lock at <word>: <word> next`; `chrome` prints \
+         `access=` and `shown=`).",
     )
     .input(Input::NONE),
     v(
@@ -3257,10 +3625,63 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [<option>…]: a new tab, pane, or worker on a task: OK <sid>",
+        "spawn [<option>…]: a new tab, pane, or worker on a task: OK <sid> [req=<id>]",
         "",
     )
     .page(&crate::verb_page::spawn::PAGE)
+    .input(Input::NONE),
+    va(
+        "request",
+        Write,
+        Status,
+        Meta,
+        OwnerOnly,
+        "request claim|show|review|keep|reply …: name a request's folder, read one, or act on it",
+        "— a request is one thing another Mac or an agent here asked this Mac to do \
+         (ATERM-KI-1109-3). `request claim path=<abs|~/…> [req=<id>]` records the folder as one \
+         the request claims, which a later cleanup may delete once the request is reviewed, \
+         after archiving it; nothing is deleted now. The request is the caller's tab's (run it \
+         in one of its tabs, `req=` then optional and checked), or the `req=` one of the \
+         caller's own requests (a drive's, or an agent tab's spawn's). Replies `OK claimed \
+         req=<id> path=<pct> born=in|before|unread` (`before`: the folder is older than the \
+         request, so it is listed and never deleted), `OK already req=<id> path=<pct>`, or `OK \
+         inside req=<id> path=<pct> claim=<pct>` (a folder the request claims holds it). \
+         Refuses `/`, this Mac's home and every folder holding it, a folder macOS guards, the \
+         state home, a path that is no folder, names a `..` or encodes past 256 bytes, a folder \
+         another request claims (`ERR request claim: <id> claims it`), and a caller with no \
+         request. A drive (read and write) may name `path=~/…` in this Mac's home; a local \
+         caller's shell expands `~`. `request show <id> [offset=<n>] [limit=<1..512>] \
+         [--json]` replies `OK <n>`, the request's `request` row (as `requests` prints it), a \
+         `page offset= shown= tabs= next_offset=<n|-> skipped= window_complete=0|1` row (its \
+         tabs from the `offset=`th, at most `limit=`, default 50; follow `next_offset`), then a \
+         `said why= goal= asked=` row (the content tier; not over a drive), one `tab sid= \
+         opened_ms= last_ms= verbs=<verb>:<n>,…|- left=<out|-> left_ms= reason= code= task= \
+         kept=0|1 cpu_s= peak_mb= written_mb=` row per tab of the page, one `claim path= src= \
+         by= tab= born_ms= alone= at_ms= keep=<word|-> bytes=<n|->[+] measured_ms=` row per \
+         claimed folder (`keep=` why a cleanup would keep it), a `review by= at_ms= note=` row, \
+         one `reply by= at_ms= key= sent=0|1 text=` row per reply, and the `timeline t= what= \
+         …` rows of its records (of the page's tabs), oldest first; values percent-encoded, `-` \
+         for none. A journal this Mac cannot read refuses the read. `request review <id> \
+         [note=<pct>]` marks a concluded request reviewed (`OK reviewed req=<id>`; a repeat \
+         with no new note `OK already req=<id>`; `ERR request review: the request has not \
+         concluded…` while it runs). `request keep <id>` makes its tabs and folders the \
+         person's, which no cleanup touches, and keeps each open tab as a tab (`OK kept \
+         req=<id> tabs=<n>`). `request reply <id> [--] <text>` mails the requester's session, \
+         wherever it runs, a `kind=report` line `reply to request <id> from <host>: <text>`, and \
+         records it (`OK replied req=<id> to=@<sid>[@<node>] <answer>`, or `ERR request reply: \
+         <why>` with the reply recorded unsent). A note or reply is one visible line of at most \
+         200 characters with no double quote, and a note is not `-`. Review, keep and reply \
+         are a person's: this Mac's person through aterm's own window, an `aterm ctl` in no \
+         tab, or a shell tab a person opened where no agent runs and no control client typed; \
+         an agent's tab (its requester's included), a tab a request owns or `ctl spawn` \
+         started, one an update carried over or under the remote hold, aterm's harness and a \
+         fleet drive are refused. A drive reads `request show` of its own requests only, \
+         without the `said` row, and may `request claim`.",
+    )
+    .forms(&[
+        form(Word("show")).op(Read).framing(Lines),
+        form(Word("reply")).lane(Wait),
+    ])
     .input(Input::NONE),
     v(
         "close",
@@ -3629,7 +4050,7 @@ pub const VERBS: &[VerbSpec] = &[
              invoke hwkey pane tab confirm askpass sudo` — and while any session is held the \
              session-independent window verbs (`invoke`, `hwkey`, `pane`, `pointer`, `tab`, \
              `confirm`, `askpass`, `sudo`, and `open \
-             menu|palette|tab-menu|autopilot-menu|fact-menu|overview|connections`) are refused \
+             menu|palette|tab-menu|fact-menu|overview|connections`) are refused \
              across the instance: \"",
             hold_cost!(),
             "\" `spawn`, `survey`, `await`, `result`, `post`, `inbox seen`, `meta set`, `lease` \
@@ -3756,24 +4177,6 @@ pub const VERBS: &[VerbSpec] = &[
     .lane(Lane::Wait)
     .input(Input::NONE),
     va(
-        "claude-challenge",
-        Owner,
-        Lines,
-        Meta,
-        OwnerOnly,
-        "claude-challenge: interactive OAuth handoff (start|poll)",
-        "— Local owner or admitted native fleet Drive only, on a serving window. Starts the \
-         exact pinned Claude OAuth URL in this machine's visible browser and returns only its \
-         state-checked loopback callback to the caller. No mailbox or Claude credential file is \
-         accepted. Software performs no CAPTCHA or consent action. Replies `OK 1` and a schema-1 \
-         JSON object with request, state (working|done|failed), and callback when done. IDs are \
-         32 lowercase hex digits and caller-bound. One challenge runs at a time, bounded to 180 \
-         seconds. Repeat start observes only the identical retained request; a lost reply is \
-         recovered by polling the same ID.",
-    )
-    .lane(Lane::Wait)
-    .input(Input::NONE),
-    va(
         "service-repair",
         Owner,
         Lines,
@@ -3864,6 +4267,34 @@ pub const VERBS: &[VerbSpec] = &[
     .page(&crate::verb_page::survey::PAGE)
     .for_fleet(),
     va(
+        "requests",
+        Read,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "requests [state=…] [from=<node|sid>] [n=<1..512>] [before=<id>] [--json]: what was asked here",
+        "— Owner-only; a member this Mac lets drive it reads its own requests over a drive \
+         (`aterm ctl --host <h> requests`). Replies `OK <n>`, a `requests total=<n> \
+         unreviewed=<n> shown=<n> next=<id|-> skipped=<n> window_complete=0|1` header, then one \
+         row per request, newest first by opening time, then id, at most `n=` (default 50, at \
+         most 512) and those older than `before=` (a `next=` a page ended at; one this reader \
+         sees no request by is refused): `request id= opened_ms= stage=<open|running|concluded|\
+         reviewed> out=<done|failed|abandoned|released|-> end_why= via=<fleet-shell|\
+         fleet-worker|ctl-spawn> form= node= host= by= program= model= tabs= open_tabs= claims= \
+         bytes=<n|->[+] reviewed_by= kept=0|1 why_src=<given|brief|goal|asked|none> why=`, \
+         values percent-encoded, `-` for none (`why=` a fallback's text only to this Mac's \
+         owner, `1` to a drive; `bytes=` the claimed folders' last measured size, `+` where a \
+         read was cut short). `state=` filters by stage: `open`, `running`, `concluded` (any \
+         concluded request), `unreviewed` (concluded, not reviewed), `reviewed`, `kept`, or \
+         `all` (the default). `from=` names a requester: its whole node, its node head, its \
+         actor token (`fleet:<head>:<sid>`, a local tab's sid) or the sid it names. \
+         `skipped=` counts journal rows no record could be read from, and `window_complete=0` \
+         says the journal outgrew what one read takes, so older requests are missing. A \
+         journal this Mac cannot read refuses the read rather than answer from an older one. \
+         `request show|review|keep|reply` read and act on one.",
+    )
+    .json(Json::Emits),
+    va(
         "board",
         Read,
         Lines,
@@ -3879,15 +4310,22 @@ pub const VERBS: &[VerbSpec] = &[
          state=<working|done|exited|stalled|failed|closed> rev= conclusion= why= \
          checked=<12 hex>@<ref>|pushed|no-remote|no-repo|gone landed=<12 hex> attention= \
          accept= accept_ms= heard_ms= after= area= told=<outcome>.<stop> ended= ended_why= \
-         owed=`, values percent-encoded, `-` for none (`node=-`: this Mac; never the brief's \
-         text; `told=` the end the worker's last `kind=task` telemetry row told, so a close to the \
-         end it last told, or the end of the newest row it owes, writes no second; `ended=` and \
-         `ended_why=` the last conclusion its Mac reported while the row stood open, a stall's \
-         excepted, kept past a live row naming none until the row closes; `owed=` the lines of \
-         the `kind=task` rows the log's lock or disk refused, oldest first, at most 4, kept until \
-         a write takes them at their own close's time, each counted lost once where a write fails \
-         an hour or more after its close, a fifth is owed, or the row is pruned or written \
-         over). A row is written when `aterm ctl [--host <h>|any] spawn agent=… \
+         owed= paying= was_told=`, values percent-encoded, `-` for none (`node=-`: this Mac; never the \
+         brief's text; `told=` the end the worker's last `kind=task` telemetry row told, so a \
+         close to the end of the newest row it owes, or, with none, to the end it told, writes \
+         no second; `ended=` and `ended_why=` the last \
+         conclusion its Mac reported while the row stood open, a stall's excepted, kept past a \
+         live row naming none until the row closes; `owed=` the lines of the `kind=task` rows \
+         the log's lock or disk refused, oldest first, at most 4, kept until a write takes them \
+         at their own close's time, each counted lost once where a write fails an hour or more \
+         after its close, a fifth is owed, its line holds no task row, or the row is pruned or \
+         written over; `paying=` the lines a write to the log was taking when the row was last \
+         written, `told=` their end and `was_told=` the end told before them, which the log \
+         settles: `told=` the end of the newest it holds, else `was_told=`, and those it does not \
+         hold owed again, unless `told=` moved since (a newer row an aterm that knows no \
+         `paying=` wrote, whose end it keeps), which counts them lost, as it does one that holds \
+         no task row; any it cannot be read for until an hour after their close are dropped \
+         unsaid, never counted lost). A row is written when `aterm ctl [--host <h>|any] spawn agent=… \
          [label=<word>]` starts a worker (`label=` stays on this Mac), and moved on by the \
          aterm serving it, which waits on each open row, and by a wait here that asks a worker \
          where its row says it runs. `aterm ctl board accept <@sid|label> <word>` records the \
@@ -3904,10 +4342,11 @@ pub const VERBS: &[VerbSpec] = &[
         "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
         "— one `exit <id> t=<ms> sid=<sid> local=<n> \
          reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown> exit_code=<n|-> \
-         by=<sid|human|ctl|bridge|harness|fleet:<host>|-> left=<n|->` line per exited session \
-         (`by=` the session that asked, an owner-token `aterm ctl` run from a tab included; `ctl` \
-         a client in no tab; `fleet:<host>` another Mac's drive; the closed tab's own `tab \
-         act=close` mark in its `log` names the same actor), read from \
+         by=<sid|human|ctl|bridge|harness|fleet:<node>:<sid>|-> left=<n|->` line per exited \
+         session (`by=` the session that asked, an owner-token `aterm ctl` run from a tab \
+         included; `ctl` a client in no tab; `fleet:<node>:<sid>` another Mac's drive, by the \
+         head of its node and the session there that asked, `-` where none; the closed tab's \
+         own `tab act=close` mark in its `log` names the same actor), read from \
          the closed-session index (its last 512 closes, in the order they left the registry; also \
          pushed live via `subscribe @<sid> events` `closing reason= by=` and `subscribe … \
          sessions` `session-exited <sid> reason=`). `left=` counts the processes the tab left \

@@ -2,25 +2,54 @@
 // Copyright 2026 Andrew Yates
 
 //! Supervised control-socket listener with watchdog rebind and cold-`exec` retirement.
+//!
+//! At rest almost nothing here wakes. The accept thread parks in one `poll(2)` on its listener and
+//! its generation's quit bell, with no timeout; the watchdog parks in one `poll(2)` on the same
+//! listener, its doorbell and the supervisor's stop, bounded only by its [`REST_LOOK`]. The
+//! watchdog arms (judges the accept thread once a [`TICK`]) only while there is something to
+//! judge: the accept thread is in a turn (the listener's readiness woke both, or the thread rings
+//! the doorbell as it leaves its park while the watchdog rests), or the kernel counts a connection
+//! in the listener's completed-connection queue. That count is read on every wake, the rest
+//! look's included, so a parked thread that missed its wake is caught by the watchdog's own poll
+//! of the listener, and a queue whose readiness never fires at all by the rest look. It disarms
+//! at its next tick once the thread is parked over an empty queue.
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use aterm_uds::ready::Doorbell;
+#[cfg(unix)]
+use aterm_uds::stop::Stop;
+#[cfg(unix)]
 use aterm_uds::{CtlListener, CtlStream};
 
-/// Listener `poll` timeout between queue drains.
+/// The watchdog's judging pace while armed, and the accept thread's `poll` timeout only where it
+/// has no quit bell to wait on (a process out of descriptors).
 #[cfg(unix)]
 pub(crate) const TICK: Duration = Duration::from_secs(1);
+
+/// The longest the disarmed watchdog rests before it reads the listener's completed-connection
+/// queue by the kernel's own count. A queued connection whose read readiness never fires (a lost
+/// wakeup on the socket itself, which the watchdog's poll of the listener shares with the accept
+/// thread's) is seen within this, then judged within [`WEDGE_AFTER`]: a bound well inside a
+/// client's patience, at one wakeup a minute. On every Unix: macOS counts the queue itself
+/// (`soi_qlen`), and elsewhere the reading is a zero-timeout `poll(2)`, which has the kernel
+/// recompute the socket's readiness from its queue as it stands, so it sees a connection whose
+/// wakeup was lost.
+#[cfg(unix)]
+const REST_LOOK: Option<Duration> = Some(Duration::from_secs(60));
 
 /// Duration a non-empty queue with zero accepts may persist before rebind.
 #[cfg(unix)]
@@ -47,8 +76,9 @@ struct ListenerHealth {
     /// The metrics clock (`metrics::now_us`) at the last successful accept, or
     /// at supervisor start before the first one.
     last_accept_us: AtomicU64,
-    /// The completed-connection queue length the last tick read (0 when the
-    /// platform offers no reading).
+    /// The completed-connection queue length the accept thread's last turn or the watchdog's last
+    /// look read (0 when the platform offers no reading). A turn ends with a drain, so at rest
+    /// this reads 0; a queue nobody accepts from reads what waits in it.
     queue_pending: AtomicU64,
     /// Wedged sockets replaced.
     rebinds: AtomicU64,
@@ -135,6 +165,17 @@ struct Beat {
     accepts: AtomicU64,
     /// The queue length its last turn read; [`NO_READING`] for none.
     pending: AtomicU64,
+    /// The thread is in its park: past a turn that left the queue empty, waiting for its
+    /// listener or its quit. It turns nothing there, so a beat standing still while parked is
+    /// rest, not a wedge, unless a connection is queued. `false` from the start, so a thread that
+    /// never ran reads busy and is judged.
+    parked: AtomicBool,
+    /// The watchdog rests (disarmed) over this beat, so the thread rings its doorbell as it leaves
+    /// its park; an armed watchdog wants no ring, so a thread that turns at once (a listener that
+    /// reads ready and accepts nothing) never drags it along turn for turn. Set and read against
+    /// `parked` in sequentially consistent order ([`Beat::rest_watched`]), so either the thread
+    /// sees it set or the watchdog sees the thread out of its park.
+    watch_resting: AtomicBool,
 }
 
 /// A [`Beat::pending`] with no reading.
@@ -160,6 +201,28 @@ impl Beat {
             pending: (pending != NO_READING).then_some(pending),
         }
     }
+
+    fn parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// The watchdog's claim to rest over this beat: true when the thread is still parked once the
+    /// watchdog has said it rests, so the thread's next leaving rings it; false (and the claim
+    /// withdrawn) when the thread has left its park, which the watchdog then judges armed.
+    fn rest_watched(&self) -> bool {
+        self.watch_resting.store(true, Ordering::SeqCst);
+        if self.parked() {
+            return true;
+        }
+        self.watch_resting.store(false, Ordering::SeqCst);
+        false
+    }
+
+    /// The thread leaves its park: whether the watchdog rests and must be rung.
+    fn leave_park(&self) -> bool {
+        self.parked.store(false, Ordering::SeqCst);
+        self.watch_resting.load(Ordering::SeqCst)
+    }
 }
 
 /// Why the watchdog judged the listening socket wedged.
@@ -176,8 +239,9 @@ enum Wedge {
 
 /// How many consecutive watchdog ticks must see no progress before a stuck
 /// thread is judged (on top of [`WEDGE_AFTER`]): a process that was suspended
-/// (a sleeping laptop, `SIGSTOP`) wakes both threads together, and the accept
-/// thread turns within a [`TICK`] of waking — long before this many ticks.
+/// (a sleeping laptop, `SIGSTOP`) wakes both threads together, and an accept
+/// thread in a turn, or parked over a queued connection, turns within a [`TICK`]
+/// of waking — long before this many ticks.
 #[cfg(unix)]
 const STUCK_TICKS: u32 = 3;
 
@@ -255,6 +319,16 @@ impl Watch {
         })
     }
 
+    /// Start judging again from `reading` after a rest the watchdog did not judge (the thread
+    /// parked over an empty queue): what stood still while parked is not a stand-still, so the
+    /// beat and the queue are counted from now. The last rebind's backoff stands.
+    const fn resume(&mut self, reading: Reading, now: Instant) {
+        self.last = reading;
+        self.progress_at = now;
+        self.unchanged_ticks = 0;
+        self.stalled_since = None;
+    }
+
     const fn attempted(&mut self, now: Instant) {
         self.last_rebind = Some(now);
     }
@@ -287,8 +361,11 @@ pub(crate) struct Endpoint {
 #[derive(Default)]
 struct EndpointShared {
     endpoint_state: Mutex<EndpointState>,
-    /// Rung when [`Endpoint::reopen`] hands the watchdog a listener to serve.
-    handed_over: Condvar,
+    /// The watchdog's doorbell, made by the first [`Endpoint::watch_bell`]: rung when
+    /// [`Endpoint::reopen`] hands it a listener to serve, when [`Endpoint::retire`] closes the
+    /// serving one, and by an accept thread leaving its park while the watchdog rests. `None`
+    /// where no pipe could be made, and the watchdog then looks once a tick instead.
+    doorbell: OnceLock<Option<Doorbell>>,
 }
 
 #[cfg(unix)]
@@ -299,6 +376,9 @@ struct EndpointState {
     /// under this lock ([`Endpoint::install`]), so while it is here it names
     /// that listening socket.
     serving: Option<RawFd>,
+    /// The serving generation's quit, which [`Endpoint::retire`] sets so its parked accept
+    /// thread wakes and ends.
+    serving_quit: Option<Arc<Stop>>,
     /// Every name a generation's listening socket was bound at — the published
     /// path, a rebind's temporary name: the local address every connection it
     /// accepted carries.
@@ -341,8 +421,12 @@ impl Endpoint {
                 }
                 _ => false,
             };
+            if let Some(quit) = endpoint.serving_quit.take() {
+                quit.set();
+            }
             (listener, endpoint.names.clone())
         };
+        self.ring();
         Retired {
             listener,
             connections: shutdown_accepted(&names),
@@ -367,8 +451,21 @@ impl Endpoint {
             return false;
         };
         endpoint.handed = Some(fresh);
-        self.shared.handed_over.notify_all();
+        drop(endpoint);
+        self.ring();
         true
+    }
+
+    /// The watchdog's doorbell, made on the first call; `None` where no pipe could be made.
+    fn watch_bell(&self) -> Option<&Doorbell> {
+        self.shared.doorbell.get_or_init(make_doorbell).as_ref()
+    }
+
+    /// Wake the watchdog to look again.
+    fn ring(&self) {
+        if let Some(doorbell) = self.watch_bell() {
+            doorbell.ring();
+        }
     }
 
     fn is_retired(&self) -> bool {
@@ -392,6 +489,7 @@ impl Endpoint {
         listener: CtlListener,
         generation: u64,
         current: &AtomicU64,
+        quit: &Arc<Stop>,
     ) -> Option<CtlListener> {
         let mut endpoint = self
             .shared
@@ -403,6 +501,7 @@ impl Endpoint {
         }
         current.store(generation, Ordering::Release);
         endpoint.serving = Some(listener.as_raw_fd());
+        endpoint.serving_quit = Some(quit.clone());
         if let Some(name) = bound_name(&listener)
             && !endpoint.names.contains(&name)
         {
@@ -419,21 +518,18 @@ impl Endpoint {
             .unwrap_or_else(PoisonError::into_inner);
         if endpoint.serving == Some(listener.as_raw_fd()) {
             endpoint.serving = None;
+            endpoint.serving_quit = None;
         }
     }
 
-    fn tick(&self, tick: Duration) -> Option<CtlListener> {
-        let endpoint = self
-            .shared
+    /// The listener [`Endpoint::reopen`] handed over, if one waits.
+    fn take_handed(&self) -> Option<CtlListener> {
+        self.shared
             .endpoint_state
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let (mut endpoint, _) = self
-            .shared
-            .handed_over
-            .wait_timeout_while(endpoint, tick, |endpoint| endpoint.handed.is_none())
-            .unwrap_or_else(PoisonError::into_inner);
-        endpoint.handed.take()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handed
+            .take()
     }
 
     fn replacement(&self) -> Option<CtlListener> {
@@ -459,7 +555,22 @@ impl Endpoint {
             .unwrap_or_else(PoisonError::into_inner);
         endpoint.serving = None;
         current.store(u64::MAX, Ordering::Release);
+        if let Some(quit) = endpoint.serving_quit.take() {
+            quit.set();
+        }
     }
+}
+
+/// A fresh doorbell for the watchdog, or `None` (warned) where no pipe could be made.
+#[cfg(unix)]
+fn make_doorbell() -> Option<Doorbell> {
+    Doorbell::new()
+        .inspect_err(|error| {
+            aterm_log::warn!(
+                "control listener: no doorbell ({error}); the watchdog looks once a tick"
+            );
+        })
+        .ok()
 }
 
 /// The name a listening socket was bound at, if it has one.
@@ -571,6 +682,8 @@ fn is_socket(fd: RawFd) -> bool {
 struct Pace {
     tick: Duration,
     wedge_after: Duration,
+    /// The disarmed watchdog's longest rest ([`REST_LOOK`]); `None` rests with no deadline.
+    rest_look: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -578,6 +691,7 @@ impl Pace {
     const PRODUCTION: Self = Self {
         tick: TICK,
         wedge_after: WEDGE_AFTER,
+        rest_look: REST_LOOK,
     };
 }
 
@@ -594,6 +708,17 @@ struct Seams {
     park: Arc<AtomicU64>,
     /// Generation currently parked inside its accept step (`u64::MAX` for none).
     parked: Arc<AtomicU64>,
+    /// Generation whose park waits on its quit alone, deaf to its listener: the wake a lost
+    /// `poll(2)` wakeup would miss.
+    deaf: Arc<AtomicU64>,
+    /// Generation whose listener's readiness the resting watchdog never hears either: with
+    /// `deaf`, a queue whose readiness never fires at all, which only the kernel's count of the
+    /// queue (read at the rest look) reveals.
+    blind: Arc<AtomicU64>,
+    /// Generation whose accept thread is in its park with no timeout (`u64::MAX` for none).
+    accept_resting: Arc<AtomicU64>,
+    /// The watchdog is disarmed, in a wait bounded by nothing but its rest look.
+    watch_resting: Arc<AtomicBool>,
     /// The watchdog's pace for this test ([`Pace::PRODUCTION`] unless the test
     /// shortens it).
     pace: Pace,
@@ -645,12 +770,18 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
         }
     }
 
-    /// Run the watchdog loop until stopped, serving each accepted connection via `serve`.
-    pub(crate) fn run(
-        self,
-        serve: impl Fn(CtlStream) + Send + Sync + 'static,
-        stop: impl Fn() -> bool,
-    ) {
+    /// Run the watchdog loop until `stop` is set, serving each accepted connection via `serve`.
+    ///
+    /// The watchdog judges the accept thread's beat once a [`Pace::tick`] only while it is armed:
+    /// the thread is out of its park (in a turn, or pacing a stalled queue), or the kernel counts
+    /// a connection queued on the listener. Otherwise it rests in one `poll(2)` on its doorbell,
+    /// the stop's bell and the listener, bounded only by [`Pace::rest_look`], so a resting window
+    /// spends at most a wakeup a minute here: an arriving connection, an accept thread leaving its
+    /// park, a cold exec's retire or reopen and the stop each wake it, and the rest look reads the
+    /// queue's count where its readiness never fired. A thread parked over a queued connection
+    /// (one that missed its wake) stands still while armed, which [`Watch`] judges a wedge as it
+    /// judges one stuck in a call.
+    pub(crate) fn run(self, serve: impl Fn(CtlStream) + Send + Sync + 'static, stop: &Stop) {
         let Self {
             listener,
             rebind,
@@ -662,35 +793,87 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
         let serve: Serve = Arc::new(serve);
         let current = Arc::new(AtomicU64::new(0));
         let mut generation = 0;
-        let mut beat = match endpoint.install(listener, generation, &current) {
+        let mut quit = Arc::new(Stop::new());
+        let mut serving: Option<Arc<CtlListener>> = None;
+        let mut beat = match endpoint.install(listener, generation, &current, &quit) {
             None => Arc::new(Beat::default()),
-            Some(listener) => match AcceptThread::spawn(
-                listener,
-                generation,
-                &current,
-                &serve,
-                #[cfg(test)]
-                seams.clone(),
-            ) {
-                Ok(beat) => beat,
-                Err(accept) => return accept.run(),
-            },
+            Some(listener) => {
+                let listener = Arc::new(listener);
+                match AcceptThread::spawn(
+                    listener.clone(),
+                    generation,
+                    &current,
+                    &serve,
+                    &quit,
+                    &endpoint,
+                    #[cfg(test)]
+                    seams.clone(),
+                ) {
+                    Ok(beat) => {
+                        serving = Some(listener);
+                        beat
+                    }
+                    Err(accept) => return (*accept).run(),
+                }
+            }
         };
         #[cfg(test)]
         let pace = seams.as_ref().map_or(Pace::PRODUCTION, |s| s.pace);
         #[cfg(not(test))]
         let pace = Pace::PRODUCTION;
         let mut watch = Watch::paced(Instant::now(), pace.wedge_after);
-        while !stop() {
-            let handed = endpoint.tick(pace.tick);
+        // Armed from the start: the first accept thread has not parked yet.
+        let mut next_look = Some(Instant::now() + pace.tick);
+        loop {
+            #[cfg(test)]
+            let blind = seams
+                .as_ref()
+                .is_some_and(|s| s.blind.load(Ordering::Acquire) == generation);
+            #[cfg(not(test))]
+            let blind = false;
+            let disarmed = next_look.is_none();
+            let listening = disarmed
+                .then_some(serving.as_deref())
+                .flatten()
+                .filter(|_| !blind && !endpoint.is_retired());
+            let until = next_look.or_else(|| pace.rest_look.map(|look| Instant::now() + look));
+            #[cfg(test)]
+            if let Some(seams) = &seams {
+                seams.watch_resting.store(disarmed, Ordering::Release);
+            }
+            rest(&endpoint, stop, listening, until, pace.tick);
+            #[cfg(test)]
+            if let Some(seams) = &seams {
+                seams.watch_resting.store(false, Ordering::Release);
+            }
+            if stop.is_set() {
+                break;
+            }
             let now = Instant::now();
+            let handed = endpoint.take_handed();
             let reopened = handed.is_some();
             let fresh = match handed {
                 Some(fresh) => fresh,
                 None => {
                     if endpoint.is_retired() {
+                        next_look = None;
                         continue;
                     }
+                    let queued = serving.as_deref().is_some_and(queued);
+                    if beat.parked() && !queued && beat.rest_watched() {
+                        next_look = None;
+                        continue;
+                    }
+                    beat.watch_resting.store(false, Ordering::SeqCst);
+                    let Some(due) = next_look else {
+                        watch.resume(beat.read(), now);
+                        next_look = Some(now + pace.tick);
+                        continue;
+                    };
+                    if now < due {
+                        continue;
+                    }
+                    next_look = Some(now + pace.tick);
                     let Some(wedge) = watch.observe(beat.read(), now) else {
                         continue;
                     };
@@ -719,32 +902,45 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                 }
             };
             generation += 1;
-            let Some(fresh) = endpoint.install(fresh, generation, &current) else {
+            let previous = std::mem::replace(&mut quit, Arc::new(Stop::new()));
+            let installed = endpoint.install(fresh, generation, &current, &quit);
+            // The generation this one replaces ends at its next turn, or now from its park; a
+            // retired one was told already.
+            previous.set();
+            let Some(fresh) = installed else {
                 continue;
             };
+            let fresh = Arc::new(fresh);
             // Counted before the fresh accept thread starts, which may serve a queued client at
             // once: whoever that client tells of the rebind then reads it in `control_rebinds`.
             if !reopened {
                 HEALTH.rebinds.fetch_add(1, Ordering::Relaxed);
             }
             beat = match AcceptThread::spawn(
-                fresh,
+                fresh.clone(),
                 generation,
                 &current,
                 &serve,
+                &quit,
+                &endpoint,
                 #[cfg(test)]
                 seams.clone(),
             ) {
-                Ok(beat) => beat,
+                Ok(beat) => {
+                    serving = Some(fresh);
+                    beat
+                }
                 Err(unstarted) => {
                     endpoint.forget(&unstarted.listener);
                     drop(unstarted);
+                    serving = None;
                     HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
                     aterm_log::warn!("control listener rebind: no accept thread could start");
                     Arc::new(Beat::default())
                 }
             };
             watch.rebound(now);
+            next_look = Some(now + pace.tick);
             if reopened {
                 aterm_log::info!(
                     "control listener reopened (generation {generation}) after a cold exec \
@@ -757,18 +953,77 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
             }
         }
         endpoint.stop(&current);
+        quit.set();
     }
+}
+
+/// The watchdog's wait: until `until` (`None`: no deadline), a ring of the endpoint's doorbell,
+/// the stop, or a connection queued on `listening` (passed only while resting, since a queue the
+/// armed watchdog is judging would end every wait at once). Without the doorbell or the stop's
+/// bell a ring or the stop is heard only by looking, so the wait then ends within a `tick`. The
+/// doorbell is cleared after the wait and before the caller reads what a ring announces, so a
+/// ring during that read ends the next wait.
+#[cfg(unix)]
+fn rest(
+    endpoint: &Endpoint,
+    stop: &Stop,
+    listening: Option<&CtlListener>,
+    until: Option<Instant>,
+    tick: Duration,
+) {
+    let doorbell = endpoint.watch_bell();
+    let bell = stop.bell().ok();
+    let until = if doorbell.is_some() && bell.is_some() {
+        until
+    } else {
+        let looks = Instant::now() + tick;
+        Some(until.map_or(looks, |until| until.min(looks)))
+    };
+    let mut fds = Vec::with_capacity(3);
+    fds.extend(doorbell.map(Doorbell::fd));
+    fds.extend(bell);
+    fds.extend(listening.map(|listener| listener.as_fd()));
+    if aterm_uds::ready::any(&fds, until).is_err() {
+        // An empty set (neither bell could be made, nothing to listen to) or a failing `poll(2)`:
+        // a look a tick later, on the stop, never a spin.
+        let _ = stop.sleep(tick);
+    }
+    if let Some(doorbell) = doorbell {
+        doorbell.clear();
+    }
+}
+
+/// Whether a connection is queued on `listener` now, by [`queue_pending`]: on macOS the kernel's
+/// own count of its completed-connection queue, which stands whether or not its read readiness
+/// fired. The reading is published as `control_queue_pending`, so a queue nobody accepts from
+/// reads what waits in it, not the 0 the last turn left.
+#[cfg(unix)]
+fn queued(listener: &CtlListener) -> bool {
+    let pending = queue_pending(listener);
+    if let Some(pending) = pending {
+        HEALTH
+            .queue_pending
+            .store(u64::from(pending), Ordering::Relaxed);
+    }
+    pending.is_some_and(|n| n > 0)
 }
 
 /// One generation's accept loop: the listening socket, what it answers to,
 /// and the beat it publishes.
 #[cfg(unix)]
 struct AcceptThread {
-    listener: CtlListener,
+    /// Shared with the watchdog, which polls it while it rests: its descriptor closes once both
+    /// let go, so the number the watchdog polls names this socket (or, retired for a cold exec,
+    /// `/dev/null`) and never a descriptor opened since.
+    listener: Arc<CtlListener>,
     generation: u64,
     current: Arc<AtomicU64>,
     serve: Serve,
     beat: Arc<Beat>,
+    /// Set when this generation is replaced or retired: it ends the park.
+    quit: Arc<Stop>,
+    /// Whose doorbell the thread rings as it leaves its park, which arms the watchdog.
+    endpoint: Endpoint,
     #[cfg(test)]
     seams: Option<Seams>,
 }
@@ -776,12 +1031,14 @@ struct AcceptThread {
 #[cfg(unix)]
 impl AcceptThread {
     fn spawn(
-        listener: CtlListener,
+        listener: Arc<CtlListener>,
         generation: u64,
         current: &Arc<AtomicU64>,
         serve: &Serve,
+        quit: &Arc<Stop>,
+        endpoint: &Endpoint,
         #[cfg(test)] seams: Option<Seams>,
-    ) -> Result<Arc<Beat>, Self> {
+    ) -> Result<Arc<Beat>, Box<Self>> {
         let beat = Arc::new(Beat::default());
         let accept = Self {
             listener,
@@ -789,6 +1046,8 @@ impl AcceptThread {
             current: current.clone(),
             serve: serve.clone(),
             beat: beat.clone(),
+            quit: quit.clone(),
+            endpoint: endpoint.clone(),
             #[cfg(test)]
             seams,
         };
@@ -814,13 +1073,47 @@ impl AcceptThread {
                 slot.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
-                    .map_or(Ok(beat), Err)
+                    .map_or(Ok(beat), |accept| Err(Box::new(accept)))
             }
         }
     }
 
     fn retired(&self) -> bool {
-        self.current.load(Ordering::Acquire) != self.generation
+        self.quit.is_set() || self.current.load(Ordering::Acquire) != self.generation
+    }
+
+    /// Wait in one `poll(2)` with no timeout for the listener or the quit, published as parked
+    /// for the watchdog. On the way out the thread rings the watchdog's doorbell only while the
+    /// watchdog rests ([`Beat::leave_park`]), so it judges the turn that follows; an armed
+    /// watchdog sees the thread parked again at its next tick and disarms. Where the quit's bell
+    /// cannot be made the wait is bounded by `tick` instead.
+    fn park(&self, tick: Duration) {
+        self.beat.parked.store(true, Ordering::SeqCst);
+        let listener = [self.listener.as_fd()];
+        #[cfg(test)]
+        let deaf = self
+            .seams
+            .as_ref()
+            .is_some_and(|s| s.deaf.load(Ordering::Acquire) == self.generation);
+        #[cfg(not(test))]
+        let deaf = false;
+        let fds: &[_] = if deaf { &[] } else { &listener };
+        #[cfg(test)]
+        let resting = self
+            .seams
+            .as_ref()
+            .filter(|_| self.quit.bell().is_ok())
+            .inspect(|s| s.accept_resting.store(self.generation, Ordering::Release));
+        if self.quit.wait_ready(fds, None).is_err() {
+            wait_readable(&self.listener, tick);
+        }
+        #[cfg(test)]
+        if let Some(seams) = resting {
+            seams.accept_resting.store(u64::MAX, Ordering::Release);
+        }
+        if self.beat.leave_park() {
+            self.endpoint.ring();
+        }
     }
 
     #[cfg(test)]
@@ -854,7 +1147,7 @@ impl AcceptThread {
             if stalled {
                 std::thread::sleep(STALL_PACE);
             } else {
-                wait_readable(&self.listener, tick);
+                self.park(tick);
             }
             if self.retired() {
                 break;
@@ -1079,328 +1372,5 @@ pub(crate) fn rebind_socket(path: &str, expected: &mut Option<(u64, u64)>) -> Op
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    fn scratch() -> aterm_tempfile::TempDir {
-        crate::test_scratch::short_dir("a listener's socket")
-    }
-
-    #[test]
-    fn queue_pending_reads_the_kernel_queue() {
-        let dir = scratch();
-        let path = dir.path().join("q.sock");
-        let listener = CtlListener::bind(&path).expect("bind");
-        assert_eq!(
-            queue_pending(&listener),
-            Some(0),
-            "an idle listener queues nothing"
-        );
-        let clients: Vec<_> = (0..3)
-            .map(|_| CtlStream::connect(&path).expect("connect"))
-            .collect();
-        let expected = if cfg!(target_os = "macos") { 3 } else { 1 };
-        assert_eq!(queue_pending(&listener), Some(expected));
-        for _ in 0..3 {
-            drop(
-                aterm_uds::accept(
-                    &listener,
-                    aterm_uds::AcceptWait::Forever,
-                    aterm_uds::AcceptedMode::Blocking,
-                )
-                .expect("accept"),
-            );
-        }
-        assert_eq!(queue_pending(&listener), Some(0), "a drained queue reads 0");
-        drop(clients);
-    }
-
-    fn supervised(
-        path: &std::path::Path,
-        pace: Pace,
-    ) -> (Arc<AtomicBool>, Seams, std::thread::JoinHandle<()>) {
-        let listener = CtlListener::bind(path).expect("bind");
-        let published = path.to_str().expect("utf8").to_string();
-        let mut expected = socket_file_id(&published);
-        let rebind_path = published.clone();
-        let mut supervisor = Supervisor::new(
-            listener,
-            move || rebind_socket(&rebind_path, &mut expected),
-            Endpoint::default(),
-        );
-        let seams = Seams {
-            withhold: Arc::new(AtomicU64::new(u64::MAX)),
-            withholding: Arc::new(AtomicU64::new(u64::MAX)),
-            park: Arc::new(AtomicU64::new(u64::MAX)),
-            parked: Arc::new(AtomicU64::new(u64::MAX)),
-            pace,
-        };
-        supervisor.seams = Some(seams.clone());
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
-        let thread = std::thread::spawn(move || {
-            supervisor.run(
-                |mut stream| {
-                    let _ = stream.write_all(b"OK served\n");
-                },
-                move || stopping.load(Ordering::Acquire),
-            );
-        });
-        (stop, seams, thread)
-    }
-
-    fn arm(stream: &CtlStream, patience: Duration) -> std::io::Result<()> {
-        match stream.set_read_timeout(Some(patience)) {
-            Err(error)
-                if cfg!(target_vendor = "apple")
-                    && error.kind() == std::io::ErrorKind::InvalidInput
-                    && error.raw_os_error().is_some() =>
-            {
-                Ok(())
-            }
-            other => other,
-        }
-    }
-
-    fn ask(path: &std::path::Path, patience: Duration) -> std::io::Result<String> {
-        let stream = CtlStream::connect(path)?;
-        arm(&stream, patience)?;
-        read_reply(&stream)
-    }
-
-    fn read_reply(stream: &CtlStream) -> std::io::Result<String> {
-        use std::io::BufRead as _;
-        let mut reply = String::new();
-        std::io::BufReader::new(stream).read_line(&mut reply)?;
-        Ok(reply)
-    }
-
-    fn served_after_rebind(path: &std::path::Path, before: Option<(u64, u64)>) -> String {
-        let published = path.to_str().expect("utf8");
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the watchdog to rebind the published path",
-            || (socket_file_id(published) != before).then_some(()),
-        );
-        ask(path, aterm_spec::wait::MUST_HAPPEN).expect("the fresh socket answers")
-    }
-
-    fn assert_rebound_owner_only(path: &std::path::Path, before: Option<(u64, u64)>) {
-        assert_ne!(
-            socket_file_id(path.to_str().expect("utf8")),
-            before,
-            "the published path must name the fresh socket"
-        );
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
-        };
-        assert_eq!(mode, 0o600, "the rebound socket is owner-only");
-    }
-
-    #[test]
-    fn a_stalled_listener_is_detected_and_rebound() {
-        let dir = scratch();
-        let path = dir.path().join("w.sock");
-        let pace = Pace {
-            tick: Duration::from_millis(50),
-            wedge_after: Duration::from_millis(300),
-        };
-        let (stop, seams, thread) = supervised(&path, pace);
-        let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
-
-        assert_eq!(
-            ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),
-            "OK served\n",
-            "a healthy listener serves"
-        );
-
-        seams.withhold.store(0, Ordering::Release);
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the accept thread to reach its withhold check",
-            || (seams.withholding.load(Ordering::Acquire) == 0).then_some(()),
-        );
-        let inode_before = socket_file_id(path.to_str().expect("utf8"));
-        let queued = CtlStream::connect(&path).expect("connect into the wedged queue");
-        arm(&queued, aterm_spec::wait::MUST_HAPPEN).expect("deadline");
-
-        let mut sink = String::new();
-        let released = (&queued).read_to_string(&mut sink);
-        assert!(
-            released.is_err() || sink.is_empty(),
-            "the wedged socket served a peer it was withholding: {sink:?}"
-        );
-
-        assert_eq!(served_after_rebind(&path, inode_before), "OK served\n");
-        assert_rebound_owner_only(&path, inode_before);
-        assert!(HEALTH.rebinds.load(Ordering::Relaxed) > rebinds_before);
-
-        stop.store(true, Ordering::Release);
-        thread.join().expect("supervisor thread");
-    }
-
-    #[test]
-    fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
-        let dir = scratch();
-        let path = dir.path().join("p.sock");
-        let pace = Pace {
-            tick: Duration::from_millis(100),
-            wedge_after: Duration::from_secs(1),
-        };
-        let (stop, seams, thread) = supervised(&path, pace);
-        let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
-        assert_eq!(
-            ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),
-            "OK served\n",
-            "a healthy listener serves"
-        );
-
-        seams.park.store(0, Ordering::Release);
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "generation 0 to reach its park",
-            || (seams.parked.load(Ordering::Acquire) == 0).then_some(()),
-        );
-        let inode_before = socket_file_id(path.to_str().expect("utf8"));
-        let queued = CtlStream::connect(&path).expect("connect into the stuck queue");
-        arm(&queued, aterm_spec::wait::MUST_HAPPEN).expect("deadline");
-
-        assert_eq!(served_after_rebind(&path, inode_before), "OK served\n");
-        assert_rebound_owner_only(&path, inode_before);
-        assert!(HEALTH.rebinds.load(Ordering::Relaxed) > rebinds_before);
-
-        seams.park.store(u64::MAX, Ordering::Release);
-        assert_eq!(
-            read_reply(&queued).expect("the retired thread's answer"),
-            "OK served\n",
-            "the retired thread served its queue"
-        );
-
-        stop.store(true, Ordering::Release);
-        thread.join().expect("supervisor thread");
-    }
-
-    fn reading(progress: u64, accepts: u64, pending: Option<u64>) -> Reading {
-        Reading {
-            progress,
-            accepts,
-            pending,
-        }
-    }
-
-    #[test]
-    fn the_watch_judges_stuck_stalled_and_healthy() {
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Pace::PRODUCTION.tick * u32::try_from(s).expect("a few ticks");
-
-        let mut watch = Watch::new(t0);
-        for s in 1..=10 {
-            assert_eq!(watch.observe(reading(s, s, Some(1)), at(s)), None);
-        }
-
-        let mut watch = Watch::new(t0);
-        assert_eq!(watch.observe(reading(1, 0, Some(0)), at(1)), None);
-        assert_eq!(
-            watch.observe(reading(1, 0, Some(0)), at(60)),
-            None,
-            "one stale tick after a long gap is a suspension, not a wedge"
-        );
-        assert_eq!(watch.observe(reading(1, 0, Some(0)), at(61)), None);
-        assert!(matches!(
-            watch.observe(reading(1, 0, Some(0)), at(62)),
-            Some(Wedge::Stuck { .. })
-        ));
-
-        let mut watch = Watch::new(t0);
-        assert_eq!(watch.observe(reading(1, 7, Some(5)), at(1)), None);
-        assert_eq!(watch.observe(reading(2, 7, Some(5)), at(2)), None);
-        assert_eq!(watch.observe(reading(3, 7, Some(5)), at(3)), None);
-        assert_eq!(watch.observe(reading(4, 7, Some(5)), at(4)), None);
-        assert_eq!(
-            watch.observe(reading(5, 7, Some(5)), at(5)),
-            Some(Wedge::Stalled {
-                queued: 5,
-                for_ms: 3000
-            })
-        );
-        assert_eq!(watch.observe(reading(6, 8, Some(5)), at(6)), None);
-
-        watch.rebound(at(6));
-        for s in 7..=15 {
-            assert_eq!(watch.observe(reading(s, 0, Some(5)), at(s)), None, "{s}");
-        }
-        assert!(matches!(
-            watch.observe(reading(16, 0, Some(5)), at(16)),
-            Some(Wedge::Stalled { .. })
-        ));
-    }
-
-    #[test]
-    fn shutting_accepted_connections_down_reaches_a_client_that_half_closed() {
-        let dir = scratch();
-        let path = dir.path().join("h.sock");
-        let listener = CtlListener::bind(&path).expect("bind");
-        let open = CtlStream::connect(&path).expect("connect");
-        let (open_held, _) = aterm_uds::accept(
-            &listener,
-            aterm_uds::AcceptWait::Forever,
-            aterm_uds::AcceptedMode::Blocking,
-        )
-        .expect("accept");
-        let half_closed = CtlStream::connect(&path).expect("connect");
-        let (half_closed_held, _) = aterm_uds::accept(
-            &listener,
-            aterm_uds::AcceptWait::Forever,
-            aterm_uds::AcceptedMode::Blocking,
-        )
-        .expect("accept");
-        (&half_closed)
-            .write_all(b"AUTH ok\nawait idle\n")
-            .expect("the request");
-        half_closed
-            .shutdown(std::net::Shutdown::Write)
-            .expect("the client half-closes after its request");
-        drop(listener);
-
-        assert_eq!(
-            shutdown_accepted(&[path]),
-            2,
-            "both accepted connections are shut down"
-        );
-        for (client, what) in [
-            (&open, "the open client"),
-            (&half_closed, "the half-closed client"),
-        ] {
-            client.set_nonblocking(true).expect("non-blocking");
-            assert_eq!(
-                (&*client).read(&mut [0u8; 16]).map_err(|e| e.kind()),
-                Ok(0),
-                "{what} reads its end-of-file"
-            );
-        }
-        drop((open_held, half_closed_held));
-    }
-
-    #[test]
-    fn rebind_refuses_a_path_it_does_not_own() {
-        let dir = scratch();
-        let path = dir.path().join("o.sock");
-        let published = path.to_str().expect("utf8").to_string();
-        let ours = CtlListener::bind(&path).expect("bind ours");
-        let mut expected = socket_file_id(&published);
-        std::fs::remove_file(&path).expect("unlink ours");
-        let theirs = CtlListener::bind(&path).expect("someone else binds the path");
-        let theirs_id = socket_file_id(&published);
-        assert!(rebind_socket(&published, &mut expected).is_none());
-        assert_eq!(
-            socket_file_id(&published),
-            theirs_id,
-            "their socket keeps the path"
-        );
-        drop((ours, theirs));
-    }
-}
+#[path = "control_listener_tests.rs"]
+mod tests;

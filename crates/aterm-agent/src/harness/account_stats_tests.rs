@@ -325,13 +325,13 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     assert_eq!(five["missing"], Value::Null);
     let shown = text(&l, &view(&l));
     assert!(
-        shown.contains("  5h     42.5% used \u{b7} 57.5% left \u{b7} resets 18:05 (in 1h25m)   as of 1m (tap, here)\n"),
+        shown.contains(
+            "  5h     57.5% left \u{b7} resets 18:05 (in 1h25m)   as of 1m (tap, here)\n"
+        ),
         "{shown}"
     );
     assert!(
-        shown.contains(
-            "  week   71.0% used \u{b7} 29.0% left \u{b7} resets Sun Oct 18 20:50 (in 3d4h)"
-        ),
+        shown.contains("  week   29.0% left \u{b7} resets Sun Oct 18 20:50 (in 3d4h)"),
         "{shown}"
     );
     let after = Look {
@@ -719,10 +719,7 @@ fn every_source_of_a_window_merges_by_one_rule() {
     let f = fable.current(NOW).expect("as last seen");
     assert_eq!((f.pct_x10, f.at), (400, NOW - 2 * DAY));
     let shown = text(&l, &view(&l));
-    assert!(
-        shown.contains("  Fable  40% used \u{b7} 60% left"),
-        "{shown}"
-    );
+    assert!(shown.contains("  Fable  60% left"), "{shown}");
     assert!(
         shown.contains("as of 2d (/usage, here) \u{b7} plan: Fable included\n"),
         "{shown}"
@@ -894,7 +891,7 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
     ] {
         assert!(shown.contains(row), "{row:?} in {shown}");
     }
-    assert!(!shown.contains("100%"), "{shown}");
+    assert!(!shown.contains(" 0% left"), "{shown}");
     let a = profile(None);
     let (d, shown) = shown_with(&spend, &a, state.accounts.get("main"));
     let five = &d["accounts"][0]["windows"][0];
@@ -903,7 +900,7 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
         (&Value::from(100u64), &Value::from("wall"))
     );
     assert!(on_credits(&d), "{d}");
-    assert!(shown.contains("  5h     100% used"), "{shown}");
+    assert!(shown.contains("  5h     0% left"), "{shown}");
     let mut unkeyed = state.clone();
     unkeyed.accounts.get_mut("main").expect("held").key = None;
     let (d, _) = shown_with(&spend, &b, unkeyed.accounts.get("main"));
@@ -936,9 +933,9 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
             assert_eq!(window["source"], Value::from("usage-cache"));
         }
         assert!(!on_credits(&d));
-        assert!(shown.contains("  5h     20% used"), "{shown}");
-        assert!(shown.contains("  week   60% used"), "{shown}");
-        assert!(!shown.contains("100%"), "{shown}");
+        assert!(shown.contains("  5h     80% left"), "{shown}");
+        assert!(shown.contains("  week   40% left"), "{shown}");
+        assert!(!shown.contains(" 0% left"), "{shown}");
         for key in [Some(b_key), None] {
             let mut admitted = state.accounts["main"].clone();
             admitted.key = key;
@@ -953,7 +950,7 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
             assert_eq!(five["source"], Value::from("wall"));
             assert!(on_credits(&d));
             let shown = text(&same, &view(&same));
-            assert!(shown.contains("  5h     100% used"), "{shown}");
+            assert!(shown.contains("  5h     0% left"), "{shown}");
         }
     }
 }
@@ -1461,7 +1458,7 @@ fn a_screens_fable_week_shows_with_its_source_and_a_newer_window_wins() {
         );
         assert_eq!(fable.void_at, None);
         let row = format!(
-            "  Fable  {pct}% used \u{b7} {}% left \u{b7} resets Sun Oct 18 20:50 (in 3d4h)   as of 1h ({source}, here) \u{b7} plan: Fable included\n",
+            "  Fable  {}% left \u{b7} resets Sun Oct 18 20:50 (in 3d4h)   as of 1h ({source}, here) \u{b7} plan: Fable included\n",
             100 - pct
         );
         let shown = text(&l, &v);
@@ -1507,8 +1504,7 @@ fn a_fable_wall_that_named_no_reset_is_full_with_no_reset_given() {
     );
     assert_eq!(fable.resets_at(), None);
     let shown = text(&l, &v);
-    let row =
-        "  Fable  100%, no reset given \u{b7} as of 1h (wall, here) \u{b7} plan: Fable included\n";
+    let row = "  Fable  0% left, no reset given \u{b7} as of 1h (wall, here) \u{b7} plan: Fable included\n";
     assert!(shown.contains(row), "{row:?} in {shown}");
     let j = fable_doc(&l);
     assert_eq!(
@@ -1842,7 +1838,8 @@ fn since_view(five: u32, week: u32, rows: &[SeriesRow], span_s: i64) -> (View, S
 }
 
 /// SINCE SAYS THE RISE, A NEW WINDOW OR A RESET USED. Against a day of readings, the week rose
-/// from 53% a day ago to 71% now (+18, not +31 from the older reading before it), and the
+/// from 53% used a day ago to 71% now (`18 used since 24h`, not 31 from the older reading
+/// before it: a rise of use says `used`, beside the share left the row leads with), and the
 /// five-hour window a day ago is one that has since ended, so a new one began at its reset less
 /// five hours; a week that refilled says the reset used and when; a series younger than the
 /// span says its own age, and one whose newest reading before the span's start is older than a
@@ -1850,7 +1847,7 @@ fn since_view(five: u32, week: u32, rows: &[SeriesRow], span_s: i64) -> (View, S
 /// inside 24h; a figure that fell by less than a refill rose by nothing, never a negative
 /// number; and the window with no figure has no `since`. Text and JSON say the same.
 /// Negative control: taking the baseline as the newest figure (`max_by_key` over every `fig`
-/// in `since_of`, ignoring `now − span_s`) compares now with now, gives `+0 since 24h`, and the
+/// in `since_of`, ignoring `now − span_s`) compares now with now, gives `0 used since 24h`, and the
 /// first assertion fails.
 #[test]
 fn since_says_the_rise_a_new_window_or_a_reset_used() {
@@ -1896,7 +1893,10 @@ fn since_says_the_rise_a_new_window_or_a_reset_used() {
             .unwrap_or_default()
             .to_owned()
     };
-    assert!(row("week").ends_with(" \u{b7} +18 since 24h"), "{shown}");
+    assert!(
+        row("week").ends_with(" \u{b7} 18 used since 24h"),
+        "{shown}"
+    );
     assert!(
         row("5h").ends_with(" \u{b7} new window since 13:05"),
         "{shown}"
@@ -1950,7 +1950,7 @@ fn since_says_the_rise_a_new_window_or_a_reset_used() {
             moved: Moved::Rose(5)
         })
     );
-    assert!(shown.contains(" \u{b7} +5 since 3h\n"), "{shown}");
+    assert!(shown.contains(" \u{b7} 5 used since 3h\n"), "{shown}");
 
     let fell = [series_fig(NOW - 2 * DAY, None, Some((715, WEEK_END)))];
     let (v, shown, _) = since_view(380, 710, &fell, DAY);
@@ -1961,7 +1961,7 @@ fn since_says_the_rise_a_new_window_or_a_reset_used() {
             moved: Moved::Rose(0)
         })
     );
-    assert!(shown.contains(" \u{b7} +0 since 2d\n"), "{shown}");
+    assert!(shown.contains(" \u{b7} 0 used since 2d\n"), "{shown}");
 }
 
 /// Thursday, November 12, 2026, at the hour and minute of [`NOW`] (UTC).

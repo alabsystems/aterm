@@ -59,6 +59,106 @@ fn the_default_place_names_the_observed_login_beside_the_belief() {
     assert!(parsed("accounts observed --cli codex").is_err());
 }
 
+/// THE FIRST FINDING, as the verb shows it: Muse Code's login is a place too. Its row names the
+/// account its store names, whether that login works and its week, all from the account's
+/// record; a store that names no login reads as signed out, and a home Muse Code never used is
+/// no place at all.
+/// NEGATIVE CONTROL: with `muse_place_seen` reading no record, the signed-in row has no week:
+/// `` left: None right: Some("weekly 54% left") ``.
+#[test]
+fn muse_codes_login_place_shows_its_account_sign_in_and_week() {
+    use crate::harness::journal::ObservedCli;
+    use crate::harness::observed_account::{Landing, Store};
+    const NOW: i64 = 1_790_000_000;
+    let home = home();
+    let state = home.path().join("state");
+    let store = Store::at(&state, ObservedCli::Muse);
+    assert_eq!(
+        muse_place_seen(&store, home.path(), NOW),
+        None,
+        "a home Muse Code made no config in"
+    );
+    let auth = home.path().join(".config/muse/auth.json");
+    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    std::fs::write(
+        &auth,
+        format!(
+            r#"{{"schema_version":2,"providers":{{"meta":{{"mechanism":"oauth","storage":"keychain","user_email":"{UNICORN}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    // Before any session saw it: the file's account, nothing known of its sign-in.
+    let rows = [muse_place_seen(&store, home.path(), NOW).unwrap()];
+    assert_eq!(
+        (
+            rows[0].cli,
+            rows[0].place.as_str(),
+            rows[0].observed.as_deref(),
+            rows[0].believed.as_deref(),
+            rows[0].src,
+            rows[0].auth,
+            rows[0].week.as_deref(),
+        ),
+        (
+            "muse",
+            "~/.config/muse/auth.json",
+            Some(UNICORN),
+            None,
+            "auth-file",
+            Some("unseen"),
+            None
+        )
+    );
+    // A session's pass took the login into the record, and a read gave its week.
+    let seen = crate::harness::observe::muse(
+        &crate::harness::observe::Process {
+            argv: &[],
+            env: &[],
+            cwd: None,
+        },
+        home.path(),
+    );
+    store.observe(&seen, NOW);
+    let pass = store.admit(&auth, UNICORN, false, NOW).unwrap();
+    store.landed(
+        pass,
+        Landing::Read {
+            plan: None,
+            week: Some(profile::WeeklyFigure {
+                used_x10: 460,
+                resets_at: NOW + 86_400,
+                at: NOW,
+            }),
+        },
+        NOW,
+    );
+    let rows = [muse_place_seen(&store, home.path(), NOW + 60).unwrap()];
+    assert_eq!(
+        (rows[0].auth, rows[0].week.as_deref()),
+        (Some("ok"), Some("weekly 54% left"))
+    );
+    // The read met a sign-in wall: the file still names the account, the record says its
+    // login is gone, and no week is shown for it.
+    let pass = store.admit(&auth, UNICORN, false, NOW + 120).unwrap();
+    store.landed(pass, Landing::SignedOut, NOW + 121);
+    let rows = [muse_place_seen(&store, home.path(), NOW + 130).unwrap()];
+    assert_eq!(
+        (
+            rows[0].observed.as_deref(),
+            rows[0].auth,
+            rows[0].week.as_deref()
+        ),
+        (Some(UNICORN), Some("signed-out"), None)
+    );
+    // The store names no login.
+    std::fs::write(&auth, r#"{"schema_version":2,"providers":{}}"#).unwrap();
+    let rows = [muse_place_seen(&store, home.path(), NOW + 140).unwrap()];
+    assert_eq!(
+        (rows[0].observed.as_deref(), rows[0].auth),
+        (None, Some("signed-out"))
+    );
+}
+
 /// An unsigned stand-in for a ChatGPT token whose claims name `email`: it authenticates nothing.
 fn claims_token(email: &str) -> String {
     let part = |bytes: &[u8]| {
@@ -92,6 +192,10 @@ fn write(path: &Path, text: &str) {
 #[test]
 fn codex_agy_and_muse_places_are_observed_too() {
     let home = home();
+    let muse_store = crate::harness::observed_account::Store::at(
+        &home.path().join("state"),
+        crate::harness::journal::ObservedCli::Muse,
+    );
     let token = claims_token(BRONTO);
     write(
         &home.path().join(".codex/auth.json"),
@@ -108,8 +212,8 @@ fn codex_agy_and_muse_places_are_observed_too() {
         &format!(
             "[[account]]\nlabel = \"m22\"\nclass = \"dedicated\"\nemail = \"{STEGO}\"\n\n\
              [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\nemail = \"{UNICORN}\"\n\
-             dir = \"{}\"\n",
-            own.display()
+             dir = {}\n",
+            crate::harness::host_path::toml(&own)
         ),
     )
     .unwrap();
@@ -159,12 +263,15 @@ fn codex_agy_and_muse_places_are_observed_too() {
         ("agy", Some(UNICORN), "cli-log")
     );
     assert_eq!(agy[0].believed, None);
-    assert_eq!(muse_place_seen(home.path(), 1_790_000_000), None);
+    assert_eq!(
+        muse_place_seen(&muse_store, home.path(), 1_790_000_000),
+        None
+    );
     write(
         &home.path().join(".config/muse/auth.json"),
         &format!(r#"{{"providers":{{"meta":{{"mechanism":"oauth","user_email":"{BRONTO}"}}}}}}"#),
     );
-    let muse = muse_place_seen(home.path(), 1_790_000_000).unwrap();
+    let muse = muse_place_seen(&muse_store, home.path(), 1_790_000_000).unwrap();
     assert_eq!(
         (muse.cli, muse.place.as_str(), muse.observed.as_deref()),
         ("muse", "~/.config/muse/auth.json", Some(BRONTO))

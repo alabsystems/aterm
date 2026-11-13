@@ -3,12 +3,11 @@
 
 use super::*;
 
-// The test's own posts, in libSystem's notify (`notify.h`): 0 on success; and the key's name
+// The test's own state, in libSystem's notify (`notify.h`): 0 on success; and the key's name
 // as `OSThermalNotification.h` exports it.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn notify_set_state(token: std::ffi::c_int, state: u64) -> u32;
-    fn notify_post(name: *const std::ffi::c_char) -> u32;
     #[link_name = "kOSThermalNotificationPressureLevelName"]
     static PRESSURE_LEVEL_NAME: *const std::ffi::c_char;
 }
@@ -46,11 +45,11 @@ fn the_pressure_key_reads_a_documented_level_and_rereads_on_change() {
     assert_eq!(quiet.get_states, 1, "nothing posted, nothing read");
 
     let token = quiet.token.expect("registered");
-    // SAFETY: the watch's live token, and a NUL-terminated name.
+    // SAFETY: the watch's live token.
     unsafe {
         assert_eq!(notify_set_state(token, 42), 0);
-        assert_eq!(notify_post(name.as_ptr()), 0);
     }
+    assert!(post(&name), "notifyd takes the post");
     // notifyd delivers the post on its own time: a one-minute hang detector.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while quiet.state() != Ok(42) {
@@ -63,9 +62,10 @@ fn the_pressure_key_reads_a_documented_level_and_rereads_on_change() {
     assert_eq!(quiet.get_states, 2, "control: one post, one read");
 }
 
-/// Off macOS a watch says it has no source, never a level.
+/// Off macOS a watch says it has no source, never a level, and a post goes nowhere.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_system_without_notify_reads_unsupported() {
     assert_eq!(thermal_pressure().state(), Err("unsupported"));
+    assert!(!post(c"com.aterm.sysprobe.test.notify-none"));
 }

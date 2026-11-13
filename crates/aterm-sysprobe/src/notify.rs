@@ -109,6 +109,21 @@ impl Drop for Watch {
     }
 }
 
+/// Posts the Darwin notification `name` to every process registered for it, and answers whether
+/// notifyd took it. Off macOS there is no notify and nothing is posted: `false`.
+pub fn post(name: &CStr) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a NUL-terminated name, read for the call.
+        unsafe { ffi::notify_post(name.as_ptr()) == 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 /// A watch on the documented thermal pressure level ([`THERMAL_PRESSURE`]).
 #[must_use]
 pub fn thermal_pressure() -> Watch {

@@ -3801,6 +3801,39 @@ fn a_local_pin_holds_a_whole_group_and_never_moves_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn unreadable_pins_abort_a_group_before_staging() {
+    let dir = scratch("pin-unreadable");
+    let fake = group_fixture(&dir);
+    let layout = layout(&dir);
+    seed_build(&layout, "ay", 17, true);
+    std::fs::write(layout.prefix.join("pins"), b"ay\n\xff").unwrap();
+    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+    let report = apply_channel(
+        &fake,
+        &layout,
+        &anchor(),
+        "stable",
+        TRIPLE,
+        &installed,
+        &[],
+        fl(0),
+        0,
+    )
+    .unwrap();
+    assert_eq!(report.groups.len(), 1);
+    assert!(
+        matches!(&report.groups[0].1, TxnOutcome::Aborted { during_flip: false, why, .. } if why.contains("local pins"))
+    );
+    assert_eq!(
+        crate::ops::active_builds(&layout).get("ay").copied(),
+        Some(17)
+    );
+    assert!(!layout.build_dir("ay", 18).exists());
+    assert!(!layout.build_dir("trust", 4821).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
     let mut f = group_fixture(dir);
     let index_body = format!(
@@ -4512,9 +4545,16 @@ fn install_report_carries_signed_tree_root() {
 
 fn mark_linked(layout: &Layout, program: &str) {
     std::fs::create_dir_all(layout.links_dir()).unwrap();
+    // A marker's checkout is absolute, and Windows reads a path without a drive as relative;
+    // a literal TOML string keeps Windows' separators as they are.
+    let checkout = if cfg!(windows) {
+        r"C:\nonexistent"
+    } else {
+        "/nonexistent"
+    };
     std::fs::write(
         layout.link_marker(program),
-        format!("schema = 1\nprogram = \"{program}\"\ncheckout = \"/nonexistent\"\nbins = []\n"),
+        format!("schema = 1\nprogram = \"{program}\"\ncheckout = '{checkout}'\nbins = []\n"),
     )
     .unwrap();
 }
@@ -7316,7 +7356,7 @@ fn a_named_build_withdrawn_floored_or_not_the_tree_asked_for_is_refused() {
 
     let held = layout.build_dir("ay", 17);
     std::fs::create_dir_all(held.join("bin")).unwrap();
-    std::fs::write(held.join("bin/ay"), b"not the signed bytes").unwrap();
+    std::fs::write(held.join(bin_entry("ay")), b"not the signed bytes").unwrap();
     crate::store::mark_build_ready(&held).unwrap();
     assert_eq!(
         install_build(&fake, &layout, &anchor(), fl(0), 0, &AY, named(17, None)).unwrap(),
@@ -7326,7 +7366,7 @@ fn a_named_build_withdrawn_floored_or_not_the_tree_asked_for_is_refused() {
         "a store copy of another tree is staged over from the signed pack"
     );
     assert_ne!(
-        std::fs::read(held.join("bin/ay")).unwrap(),
+        std::fs::read(held.join(bin_entry("ay"))).unwrap(),
         b"not the signed bytes"
     );
     assert_eq!(

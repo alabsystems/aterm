@@ -44,6 +44,32 @@ fn capacity_never_evicts_a_live_lease_and_idle_eviction_is_oldest_first() {
     assert_eq!(cache.0.lock().unwrap().idle.len(), CAPACITY);
 }
 
+/// Every peer a full roster can name keeps its hint between rounds: each of them released with a
+/// hint of its own, the first asked again finds its own, and so does each other on a second turn.
+/// NEGATIVE CONTROL: a capacity of 64, fewer than m111's 85 peers, lets the first peer's hint go
+/// before the turn through a full roster comes back to it.
+#[test]
+fn a_roster_of_peers_keeps_each_hint() {
+    let peers = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
+    let hint = |n: usize| {
+        let mut hint = [0; 32];
+        hint[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        hint
+    };
+    let cache = Cache::default();
+    for n in 0..peers {
+        let mut repair = Repair::default();
+        let mut lease = cache.acquire(actor(n), &mut repair).unwrap();
+        assert_eq!(lease.cursor, None, "a first round starts with no hint");
+        lease.cursor = Some(hint(n));
+    }
+    for n in 0..peers {
+        let mut repair = Repair::default();
+        let lease = cache.acquire(actor(n), &mut repair).unwrap();
+        assert_eq!(lease.cursor, Some(hint(n)), "peer {n} keeps its hint");
+    }
+}
+
 #[test]
 fn a_lone_channel_in_either_direction_needs_no_preference_or_wait() {
     let cache = Cache::default();

@@ -31,11 +31,11 @@ fn overview() -> String {
 /// bundle and Linux its executable, both from the signed appcast.
 #[cfg(not(windows))]
 const OVERVIEW_SELF_UPDATE: &str = "aterm updates itself through its own signed appcast.";
-/// Windows has no updater: the lane is `crate::WINDOWS_UPDATE_LANE`, which `aterm help update`
-/// spells out.
+/// Windows downloads nothing: it installs a build staged on the machine, which `aterm help
+/// update` spells out beside the by-hand lane (`crate::WINDOWS_UPDATE_LANE`).
 #[cfg(windows)]
 const OVERVIEW_SELF_UPDATE: &str =
-    "aterm has no updater on Windows: `aterm help update` says how to update it.";
+    "aterm installs a build staged on this machine on Windows: `aterm help update` says how.";
 
 /// A manual page for one tool or topic.
 struct Topic {
@@ -109,8 +109,10 @@ approval code to run on an admin Mac, and a step that failed with what aterm doe
 Five lines follow (Mac settings, Permissions, Secrets & identity, Developer, and Sign out
 of Messages & FaceTime), each with a switch and a phrase saying what is true now and,
 where setup changes it, now → wanted; open a line to see its rows. Nothing waits for a
-press that aterm can make itself: changes to make start by themselves, and a step or a
-check that did not take is tried again after 1, 2, 4, 8, then every 15 minutes.
+press that aterm can make itself: changes to make start by themselves, a step that did not
+take is tried again by itself a minute later, then less and less often, up to once an hour,
+whether or not the page is open, and a check that did not take reads again after 1, 2, 4, 8,
+then every 15 minutes while the page is open.
 Every Mac gets the base plan: aterm's own
 permissions, the secrets vault (ALab's open vault, where it answers on the LAN) and Rust
 kept out of Spotlight, and a plan an older aterm set up with the permissions alone gains
@@ -128,7 +130,7 @@ grant: the Mac Setup tab's one password turns developer mode on, and the Debugge
 Waiting until it does. That authorized tab retries network and catalog failures by itself,
 without another password. Once that tab was stopped, `aterm init --only base.clt` asks for the
 password now, or aterm's Settings ▸ Security turns it on. Once you pressed Turn On macOS
-Access…, the permission pages, like the Messages and FaceTime sign-outs, start
+Access…, the permission pages start
 while System State is in front and you are at the Mac (a key, click or trackpad used
 within the last minute, the screen unlocked), stop waiting when you lock the screen or
 step away, and go on when you come back. Once aterm finds the ALab signal before
@@ -177,16 +179,29 @@ Setup choices:
   Authenticate GitHub via synced credentials, clone your own repositories and initialize
     dependencies selected by the private inventory at exact gitlink commits; no --develop
 
-Approved setup resumes unfinished steps on later launches, silently, and so does a
-choice cut short by a quit or a crash, which still sets only what it changed. A step
-aterm stopped in (a crash, a kill, a power loss) resumes once at the next launch with no
-press, its rows reading Resuming after aterm stopped; stopped in it twice, or still in it
+Approved setup resumes unfinished steps by itself, silently, with no window and nobody
+at the Mac: while a run is unfinished its login job (launchd's systems.alab.aterm-setup,
+in ~/Library/LaunchAgents) is there, which launchd starts at each login and again after
+a crash or a kill, and which runs the steps that need nobody (the Mac settings, Spotlight,
+the vault, the repositories) until the run is done, then removes itself. What needs you
+waits, unfinished, for an aterm window at the Mac's screen, which aterm never opens by
+itself: the Permissions offers, the sign-outs, the Command Line Tools install and the
+widening of a plan once ALab answers. The job gives way to any window that runs setup at
+its next step. A choice cut short by a quit or a crash resumes the same way and still sets
+only what it changed. A step aterm stopped in (a crash, a kill, a power loss) resumes once
+at its next start with no press, its rows reading Cut off before it finished; it runs
+again by itself; stopped in it twice, or still in it
 after an hour of the Mac awake (sleep does not count), its rows read Waiting and say why,
-the headline names the step with Check again beside it, and the step waits for that press
-while the others go on. A quit or an update is no stop, though a step already waiting an
+the headline names the step with Check again beside it, and the others go on: aterm tries
+that step again by itself an hour later, then less often, up to once a day, and at once
+when you press Check again. A quit or an update is no stop, though a step already waiting an
 hour that one cuts off counts once; an update that did not go ahead is no quit. A clone a
 killed aterm left half done is swept at the next
-GitHub repositories step, never one still cloning or a published clone. A choice
+GitHub repositories step, never one still cloning or a published clone. A checkout in
+your home folder that a cut-off `git clone` left with a commit and no index, or with a
+branch that names a commit it never fetched, is never counted in place: the row names
+it, left untouched. One cut off before it fetched any commit is an unfinished checkout,
+which the step finishes from GitHub where nothing of yours is in it. A choice
 made while another setup holds the records (another aterm, or aterm doctor in a
 terminal) waits for it and is applied when it finishes, as are a Restore and the ALab
 widening; a later choice
@@ -199,15 +214,20 @@ System State says so in its headline, reads the rows as they are, and reads them
 on Check again. A row that waits for you is not retried until you act, press Check
 again, or launch aterm again; a vault approval waits the same way, and the run goes on once an
 admin Mac approves. A step that fails for a passing reason (GitHub or the vault not
-answering, a change that did not take) is tried again by itself a minute later, up to ten
-times, and System State shows it waiting meanwhile, saying Failed only once those tries
-are spent. It then stays Failed until something it waits on changes, you press Check
-again or Set up now or make a choice, or aterm launches again; switching windows does not
-try it again. One only you can fix (a GitHub token to renew in the vault, Apple's Command
+answering, a change that did not take) is tried again by itself a minute later, then less
+often after each try that does not take, up to once an hour (a Mac setting: ten minutes,
+then up to once a day), and never given up on, so it finishes once whatever it waited on
+comes back; the pause is kept on disk, so a relaunch or a restart goes on from it. System
+State shows it waiting meanwhile, never Failed while aterm still tries it. A vault that
+did not answer on this network (every Mac off the ALab LAN) is no proof there is none:
+its row reads Not joined, never in place and never a step waited on, while aterm looks
+again by itself, and the headline says what of the rest is set up, never a permission
+only offered. Something it
+waits on changing, Check again, Set up now or a choice tries it at once; switching windows
+does not. One only you can fix (a GitHub token to renew in the vault, Apple's Command
 Line Tools to install) reads Needs you with what to do. Apple's Command Line Tools install
 early in the first launch, in a terminal tab titled Mac Setup, which aterm opens by itself, in
-front, once per build for your account on this Mac (an update retries unfinished setup) and
-where you type your Mac password once. That one password also turns developer mode on, so a
+front, where you type your Mac password once. That one password also turns developer mode on, so a
 debugger attaches with no further dialog, which is why a Mac that already has the tools may
 still get the tab once; System State's Go to tab brings it to the front. Until they exist the GitHub repositories row waits calmly, and `git`, `cc`, `python3`
 and their kin, in the shells aterm opens, say so and exit instead of raising Apple's install
@@ -221,14 +241,26 @@ another terminal app), one that empties its environment (`env -i`, `sudo`), one 
 root, and one that sets its own `DEVELOPER_DIR`.
 A shell that ran one keeps working once they arrive: `git`, `cc` and the
 rest run through Apple's own `/usr/bin/<tool>` then, `xcrun` included, with the SDK it sets.
-The tab ends on one line that says they are installed, or why the install did not finish; an
-install that failed, or a tab whose program never started, asks again at the next launch where
-that tab's own ask spent this build's opening. Network and catalog outages keep the already
-authorized run waiting and retrying by itself; they ask for no further password. One you
-stopped (System State's Stop, a Ctrl-C, a closed tab, or
-Apple's installer window closed without installing them) does not by itself on that build, and
-neither does a failed Install… you pressed after you declined on that build or after your own
-`aterm pkg install` or `update` asked: the card's Install Command Line Tools… opens it at once.
+The tab ends on one line that says they are installed, or why the install did not finish. An
+attempt that did not finish (a refused password, a failed download or install, Apple's
+installer window closed without them) asks again by itself after a pause, ten minutes at first
+and doubling up to twelve hours, in a tab behind the one you are in that takes the place of the
+last one, and one cut off (the Mac restarted, or aterm quit or crashed with no keeper to carry
+it) asks again at once, whichever build or launch comes next; a tab whose program never started
+asks again at once too. An install aterm's quit finds running (Quit & Reopen after a Full Disk
+Access switch, Cmd-Q) goes on with no window when aterm's keeper holds its terminal, and the next
+launch shows its tab again, behind the one you are in, with the install still going, so the
+password is typed once; nothing reads what it prints meanwhile, so once that fills its terminal
+it waits for that launch. No launch brings a Mac Setup tab back as a plain shell. While the
+tools download past the password, with aterm's keeper able to carry the install past a quit and
+no Apple installer window open, the install holds no other setup prompt back: System Settings'
+pages may come beside it.
+Network and catalog outages keep the already authorized run waiting and retrying by itself; they
+ask for no further password. One you declined (System State's Stop, a Ctrl-C at the password
+prompt, or the Mac Setup tab closed while it asked) is not asked again by itself until you say
+yes: Set up now asks again, and the card's Install Command Line Tools… or
+`aterm init --only base.clt` opens it at once. Once setup's password has done its steps, aterm
+leaves developer mode as you set it afterwards; only an `aterm init` you type turns it on again.
 In Low Data Mode the row waits calmly
 and the tab opens by itself once the mode is off; an account
 that is not one of the Mac's administrators is told so, with no Install…. While Apple's own
@@ -265,13 +297,15 @@ Local Network question about aterm and System State has no row for it; Check aga
 looks for the vault again through the broker. Completed setup preserves later local changes: a line
 turned on later sets only its own preferences, and a Join or a line turned off sets
 none. So it is after an older aterm's setup: its plan gains aterm's
-permissions, and a choice never resets its Dock or signs out again. A setting you changed
-after aterm set it and read it back is yours: no retry, widened plan, update, other
-Mac's profile or older aterm's records make this aterm set it again (an older aterm may),
-and its row reads Changed by you until Restore, turning its line off and on, or Set up
-now; it is not counted among the changes to make. A setting a newer aterm saved as yours
-that this one does not know is left alone, the rest are honoured, and the record is never
-written over. Rust in Spotlight
+permissions, and a choice never resets its Dock or signs out again. A setting that changed
+after aterm set it and read it back (by you, another app or macOS: nothing tells aterm who)
+is set once more by the next pass, and left as it is if it changes again after that: no
+retry, widened plan, update, other Mac's profile or older aterm's records make this aterm
+set it again (an older aterm may), and its row reads Changed since aterm set it until
+Restore, turning its line off and on, or Set up now; it is counted neither as set up nor
+among the changes to make, and the headline names it. A setting a
+newer aterm saved as changed that this one does not know is left alone, the rest are
+honoured, and the record is never written over. Rust in Spotlight
 keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out by
 itself (the toolchain it is using moves at its next update, which the row notes); your
 projects' build folders Spotlight indexes are yours, counted in the row's note and
@@ -310,16 +344,30 @@ repositories. A line you turned off stays as it is, and while your Stop, or a Ca
 earlier aterm recorded, holds setup `doctor --apply` changes nothing and saves nothing;
 one row says so, and at the console how to set it up anyway (its switch, or the narrowest
 `aterm init` naming it). `doctor --check` reads such a line, and a line outside this
-Mac's scope, as off or not in scope, and a setting you changed as yours, never as a
-failure. `aterm init` leaves the same lines, a Stop pressed while it waits or runs
-included, and a setting you changed after aterm set it (`doctor --apply` forgets those
-and sets them again); its line names a way back that runs where it is printed, and
+Mac's scope, as off or not in scope, and a setting changed since aterm set it as
+`changed`, left as it is, never as a failure nor as in place. A setting that changed since
+aterm set it is set once more by setup, since nothing says who changed it, and left as it
+is once it changes again; a sign-out signed in again is left at once. `aterm init` leaves
+the same lines, a Stop pressed while it waits or runs included, and a setting left so
+(`doctor --apply` forgets those and sets them again); its line names a way back
+that runs where it is printed, and
 records a newer aterm saved hold every line, which it says plainly. The Messages and
-FaceTime sign-outs run last, only while System State is on screen and you are at the
-Mac, where Stop can end them, or with `aterm init` at the console; it reads that you
-are at the screen again as they start, and leaves them for the next run if you have
-gone. A Stop, or a line you turned off, while `aterm init` runs holds what it has not
+FaceTime sign-outs run last, by themselves, and Stop can end them. Each reads your login
+right before its clicks, and clicks only while its screen is unlocked, at this Mac's
+console and the keyboard and pointer at rest (at a terminal, your own typing there holds
+nothing; an agent's tab is not you); otherwise it clicks nothing and waits, calm,
+never failed, and aterm looks again by itself a minute later, then less often, up to every
+15 minutes, and at once when you unlock. They need Accessibility and macOS's Automation
+answer for System Events: a run nobody watches never asks that question, and an
+unanswered one reads waiting, never off; aterm's window asks it early, beside the
+permission pages, once Accessibility is on and you are at the Mac, and asks again only a
+day or more later while it is still unanswered, or `aterm init` at the console asks it.
+`aterm init` with no terminal leaves them out while nobody is at the screen.
+A Stop, or a line you turned off, while `aterm init` runs holds what it has not
 reached yet, a clone not yet started included, even where a flag named the line.
+Over a setup System State finished, a whole `aterm init` or `doctor --apply` that sets
+up no line the run left out keeps it finished while it runs, so one cut short reopens
+nothing.
 
 DEVELOP MACHINES
 On a develop machine (~/.config/aterm/init.toml records [develop] checkouts) doctor,
@@ -758,7 +806,10 @@ STATUS & RESTORE
   the replay since the last keyframe was not exact (`restore_why=` names why), or
   `restore=meta`, a blank screen, when no region was usable or the restore failed
   (`history_lost=` counts shed scrollback). A clean quit closes its terminals as
-  usual; `stop` hangs up the shells only the keeper holds.
+  usual, but the Mac Setup tab's install, which the keeper keeps running with no
+  window until aterm next opens and shows it again (`ends kept=` counts them;
+  nothing reads its output meanwhile, so it pauses once that fills its terminal);
+  `stop` hangs up the shells only the keeper holds.
   The installed app's keeper (in /Applications or ~/Applications) reopens it after a crash, up to 3 times in a row
   (after 0 s, 10 s, 60 s), and never after a quit. A peer must be the same user and, by default, satisfy
   this build's designated requirement; each dev tree has its own socket and label."#,
@@ -1283,15 +1334,25 @@ HOW A MAC LEAVES
         tagline: None,
         body: Some(
             r#"status — one read of this machine (macOS and Linux): each area, where it stands,
-its next step and who takes that step. It reads local state only: no prompt, no dial, no
-write, never a secret's value or an email address, and every area answers within 3 s.
+its next step and who takes that step. It reads local state only (local files, and the
+running aterm's answer over its own control socket): no prompt, no network dial, no write,
+never a secret's value or an email address, and every area answers within 3 s.
 
   aterm status            the report, one line an area and its step under it
   aterm status --json     {"schema":1,"areas":[{"area","state","says","next":{"who","act"}|null}]}
 
 AREAS (each read by its own verb's reader, which says more)
   setup       macOS's first-launch setup, as System State reads it; before aterm.app's first
-              launch (installed from a terminal, the app never opened) `aterm init` is the step
+              launch (installed from a terminal, the app never opened) `aterm init` is the step.
+              A run's record says only what it did: once it leaves no step to run, setup is ok
+              only when the running aterm read back as wanted each selected setting it reads
+              only with a person at System State, and says how long ago: within 10 minutes,
+              as wanted then; past that, set up as it last read them, never as in place now
+              (it keeps that reading across a relaunch while no aterm process journaled a
+              change since that reading's read started). It is unknown on anything short of
+              that (no answer, a wait, a setting not read yet, a reading dated after this
+              Mac's clock, a grant waiting on a person's press); a grant on offer is named as
+              offered and holds nothing back
   membership  this Mac in ALab                      `aterm members status`
   vault       the secrets vault: names only         `aterm secrets status`
   fleet       what a fleet sync would do, the peers `aterm fleet peers`
@@ -1411,9 +1472,12 @@ WHAT IT IS
     offer (`Teach auto mode about your environment?`) is put off with `Not now`.
   * Usage limits: waits at the limit dialog, resumes after the reset, rotates across
     configured accounts (`accounts`), or takes an eligible reset (`limit_reset`) or
-    usage credits (`usage_credits`). It never moves a session to another model: a
-    model-bucket limit waits for its reset, and one no reset ends is left for its person
-    to `/model`. A limit that names no reset is retried after 30 min, 2 h, then every 6 h.
+    usage credits (`usage_credits`). Fable's own limit relaunches a Claude Code session
+    whose launch names no `--model` (or names Fable) on the same conversation and the same
+    account with `--model claude-opus-5-5`, and back on its own model at the reset the
+    notice named; every other model's limit waits for its reset, and one no reset ends is
+    left for its person to `/model`. A limit that names no reset is retried after 30 min,
+    2 h, then every 6 h.
   * Recovery: retries transient API and overload errors, runs `/compact` on a context
     wall, renews expired logins, and relaunches a crashed agent on its conversation.
     Under Cruise (the default) and Land (until its work lands), a Claude Code, Muse
@@ -1515,7 +1579,7 @@ AUTOPILOT — how far the harness carries a session's work
   typing; …)`); and `status held=` names why (`same-reply`, `no-work`, `-` when
   typing). It types again at your turn or once the agent works, and under Cruise
   at your switch to Land, which the words then name. Your own switch to Land over a
-  stopped tab (the chip, the Autopilot menu or a Settings ▸ Harness row) counts as
+  stopped tab (the chip or a Settings ▸ Harness row) counts as
   your turn: Land types its instruction once, opened by one sentence quoting where
   the agent stopped, and the Settings ▸ Harness state line says Land asked once
   more until its answer is read (`status land_asked=switch`); the same answer stops
@@ -1702,7 +1766,7 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              `~/.secrets/ai-pool.toml`, else `ai-accounts-<cli>.toml`, else its column of
              `ai-accounts.csv`, even where this machine keeps no roster yet (the sync writes it;
              `[harness] accounts = "off"` stops that sync); Claude Code's report ends with
-             the outlook the footer and Accounts card show (`--json`: `outlook`, and `fresh`
+             the outlook the footer and the Account card's forecast show (`--json`: `outlook`, and `fresh`
              and `projection` beside each figure)
   upgrade    move live sessions onto a newer build, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
@@ -1734,8 +1798,8 @@ VAULT TOKENS (Claude Code's pool, macOS)
   and that renewal is off for it), `signin.lock`, and typing `/login` into a token session.
   Where to see it: `aterm harness accounts` (and `--json` under `tokens`), `ctl @self status`
   (`auth=`, `token=`), `ctl survey` (`auth=`, `token=` on session rows; `token=` on account
-  lines), `aterm doctor`'s accounts row, `aterm secrets ls --describe`, the Accounts card, the
-  Lab page and Settings ▸ Harness's state line. Where an account a session here is on has no
+  lines), `aterm doctor`'s accounts row, `aterm secrets ls --describe`, the Account
+  card's `Token` row, the Lab page and Settings ▸ Harness's state line. Where an account a session here is on has no
   token in use, or one ending within 30 days or handed to a removed Mac, each says one quiet
   offer once per change of the token's and the login's state, never as a dialog, a banner or a
   notification; its one step opens a tab beside yours that runs the verb (with `--replace` for
@@ -1751,25 +1815,39 @@ THE FOOTER
   and the banners over Claude Code's update notice and startup announcement) and
   `agents` (the agents panel's colours). Clicking the chip moves Autopilot to its next
   mode (Cruise, Land, Off, round again), its name shown after the glyph for a moment
-  (`⤓ land`); a right-click (control-click on a Mac) opens
-  the Autopilot menu (Cruise, Land now, Off, a timed Cruise that then lands, Cancel
-  landing while one is armed, and Harness settings…). `aterm ctl chrome` reports the
+  (`⤓ land`); the chip is that three-way toggle and no more, so a right-click
+  (control-click on a Mac) on it opens nothing. A timed Cruise that then lands, and
+  its cancellation, are a SESSIONS row's in Settings ▸ Harness, or `aterm ctl meta
+  set autopilot cruise until=+2h`. `aterm ctl chrome` reports the
   chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds
-  `title=`, the title its hover reads).
-  On Claude Code the permission chip beside it says one bit: `● yolo` where Claude's
-  pill reads bypass permissions, a quiet `○ yolo` in any other mode, `auto` included.
-  Its hover names the mode in Claude Code's own words and what a click does
-  (`plan mode on · click: yolo`, `bypass permissions on · no prompts`). Clicking
-  `○ yolo` (or Return or Space with it selected) turns yolo on: it restarts the
-  conversation with `--dangerously-skip-permissions`, every other permission flag
-  taken off the line. A later restart or update resumes the mode the session is in,
-  so it keeps that flag while Claude's pill reads bypass permissions and puts it
-  back once the pill reads bypass again after a shift+tab away. Clicking
-  `● yolo` does nothing: a click never turns yolo off (shift+tab in Claude Code
-  changes its mode). The conversation, build, model and login stay, and background
+  `title=`, the title its hover reads). A headless instance has no window footer;
+  `aterm ctl status` and `aterm ctl harness policy` remain its read views.
+  On Claude Code the permission chip beside it is the one word `yolo`, with no
+  mark: lit where Claude's pill reads bypass permissions, quiet in any other mode,
+  `auto` included. Its hover names the mode in Claude Code's own words and what a
+  click does (`plan mode on · click: yolo`, `bypass permissions on · click:
+  settings default`). Clicking it (or Return or Space with it selected) toggles
+  it by restarting the conversation. Off, it turns yolo on:
+  `--dangerously-skip-permissions`, every other permission flag taken off the
+  line. On, it leaves yolo for the default mode of Claude Code's settings
+  (`permissions.defaultMode`, read through managed, `--settings`, local project,
+  project and user settings): no permission flag on the line. Either click opens
+  a box at the chip that names the mode it lands in, says what that mode is, and
+  what the switch costs; where the settings name no mode the box says so and that
+  Claude Code's own default applies, and where they cannot be read it says why.
+  Where the default is itself bypass permissions, a click on the lit chip
+  restarts nothing and the box names the settings file that says so; where the
+  settings turn bypass off, a click on the quiet chip does the same. A right-click
+  (control-click on a Mac) on the chip opens the box without clicking. Escape,
+  Return or a press elsewhere closes it, and it closes by itself when the restart
+  it said lands, is refused or is taken back. A click on the chip under a box that
+  only explains closes the box. A later restart or update resumes the
+  mode the session is in, so it keeps the bypass flag while Claude's pill reads
+  bypass permissions and puts it back once the pill reads bypass again after a
+  shift+tab away. The conversation, build, model and login stay, and background
   shells end (the hover says how many: `· ends 1 shell`). A click waits as a press of
-  ⬆️ does, for a turn, a box, a draft, a held tab, a usage limit or a login, drawn
-  `◌ yolo` with what it waits for on its hover; a second click takes it back until the
+  ⬆️ does, for a turn, a box, a draft, a held tab, a usage limit or a login, the
+  word slanted with what it waits for on its hover; a second click takes it back until the
   restart begins. Where no restart can be
   made (not started from a shell, a shell other than zsh, bash or fish, a command line
   it cannot read or rewrite, another supervisor's tab, a credit claim's worker, or an
@@ -1781,66 +1859,81 @@ THE FOOTER
   its version opens native build and update details. Its plain interface has no ALab
   controls; aterm draws no overlay over either interface. There is no separate Codex
   harness version. Vendor `codex` has no aterm footer.
-  Around Claude Code's composer the glass draws three lines whose hues are one field
-  across the pane, so a column wears one hue on all three (Autopilot's palette: Cruise
-  the rainbow, Land the sunset, Off the moonbow; neutral inks with no harness). Line B,
-  the rule above the composer, ends with the harness label `alab v<ver> (v<cli>)`, or
-  `alab v<ver>` where the CLI's build does not fit or is not known.
+  Around a hosted composer's three lines the glass draws one hue field across the pane,
+  so a column wears one hue on all three (Autopilot's palette: Cruise the rainbow, Land
+  the sunset, Off the moonbow; neutral inks with no harness). This includes Claude Code,
+  agy, Muse Code and Kimi Code. Line B, the rule above the composer, ends with the
+  harness label `alab v<ver> (v<cli>)`, or `alab v<ver>` where the CLI's build does not
+  fit or is not known.
   Line D, the rule below it, sets its facts at one size, as terminal text: `◆` the model
   and effort at the far left, then `⧗ until <when>` only while the account is out at a
   usage limit (that slot carries a wall and nothing else), the account unit, `⌂` the
-  path, `⎇` the branch, `◐` the context and `Σ` the session's usage. As the rule
+  path, `⎇` the branch, `◐` the context and `Σ` the session's usage. Facts already on
+  Muse's or Kimi's own status rows stay there rather than repeat on line D. As the rule
   narrows the model gives way last: the workspace facts first, then the account unit's
-  forms, then the wall, then the effort. In Claude Code a click (or Enter or Space) on
-  the model or its effort switches the session to the first model of the click's model
-  order (`models.json`'s `priority` under the harness's upgrade state, else Opus 5.5,
-  Fable 5.1, Opus 5) that its Claude Code build offers, at the highest effort that build
-  admits for it (the order's first model at xhigh where the build's catalog is not read),
-  keeping a
-  1M-context variant the usage tap names, remembering what it ran as its own, and from
-  there back to that (Claude's default model and auto effort where nothing is
-  remembered). `[claude_footer] switch_model` (a model id such as `claude-opus-5-5`,
-  or the name the footer shows) and `switch_effort` (`low`, `medium`, `high`, `xhigh`
-  or `max`) name another target, each `auto` by default: aterm types `/model <id>` into an idle, empty composer and, once Claude
-  answers, `/effort <level>`, refusing as the fact menus' typed rows do (the hover names
-  where a click goes). Their right-click menus offer the same switch beside `Change
-  model…` and `Effort slider…`. In any other program a click hides them. It names the account only where line E is not aterm's: 10 s
+  forms, then the wall, then the effort. In Claude Code a click (or Enter or Space, or a
+  right-click) on the model opens a card of two choices, the newest Fable and the
+  newest Opus its Claude Code build offers, each by the name that build gives it and the
+  one in use checked; choosing one types `/model <id>` into an idle, empty composer,
+  keeping a 1M-context variant the session runs, and changes no effort. Where the
+  build's model catalog is not read the choices are `Fable` and `Opus` and type
+  `/model fable` or `/model opus`. A note under Fable says when it is billed to usage
+  credits, or that billing is not read. A click on the effort opens a slider of
+  `medium`, `high` and `xhigh` (those of them the model takes), its thumb on the level
+  in use and on none where the level is another: a click on a stop, or Left and Right
+  then Enter or Space, types `/effort <level>`, and the card stays open with the thumb
+  on the new level, so the next pick needs no reopening (a pick made while another is
+  still being typed waits, and the latest wins); Esc or a click elsewhere closes it. A
+  pick aterm cannot type (a turn in flight, a draft, a box) says why on the card and
+  types nothing, and so does Enter on the level already in use. The row that turns
+  the top-effort key on or off is on that key's own card, not the effort's. In any
+  other program a click hides them. A click on the path, the
+  branch or the context does nothing, and the pointer changes neither their look nor
+  the arrow: a right-click (or Enter or Space on one the keyboard selected) opens its
+  card (copy, a new tab there, compact). Everything on the footer a click acts on looks
+  one way under the pointer or the keyboard's selection: its words in the lit ink over
+  one underline from its first glyph to its last, no weight changed, a warning still in
+  the warning ink, a chart as it was; and the hand shows over exactly those cells.
+  It names the account only where line E is not aterm's: 10 s
   after the session's first frame or its last claim of line E with no claim since (the
-  grace is the session's, so a tab shown again keeps its state), and always for agy, a
-  CLI with no line E, or a harness switched off. That unit is words only:
-  `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`, then without the reset, then the
+  grace is the session's, so a tab shown again keeps its state), and always for a CLI
+  with no line E of aterm's, or a harness switched off. That unit is words only:
+  `⎆ main 37% left · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`, then without the reset, then the
   name and figure, then its email's local part and figure, then the local part, each
   shorter form only after the other facts gave way.
   Line E is the row Claude Code prints from aterm's usage tap under the bottom rule:
-  `week 63% used · resets Sat 10:00` (`week 63% used` with no reset to say,
+  `week 37% left · resets Sat 10:00` (`week 37% left` with no reset to say,
   `week · no figure yet` before a figure). Where the tap's newest reading says the row
   is its own and its cells are plain, aterm lays its quota row over it, from column 2 to
   two cells before a notice of Claude's on the row; the grid, a copy and a recording keep
   the tap's words, which also show in a frame with a selection or the cursor on the row.
   A row Claude cut with `…`, an owner's statusLine and a room no form fits stay Claude's.
   The quota row holds, in order:
-  * the named accounts and their weeks used, `main 75% · alt1 80% · alt2 90%`: at most
-    three in roster order (preferred first), this tab's in bold and the one carrying the
-    work always among them, the rest folded into `+N`, never dropped; one account reads
-    `main 63% used`. An account is named by its email (`owner@example.com 75%`) wherever
-    aterm shows it, on line D, line E, their hovers and the Accounts card, and by its
+  * the named accounts and what is left of their weeks, `main 25% left · alt1 20% left ·
+    alt2 10% left`: at most three in roster order (preferred first), this tab's in bold
+    and the one carrying the work always among them, the rest folded into `+N`, never
+    dropped. An account is named by its email (`owner@example.com 25% left`) wherever
+    aterm shows it, on line D, line E, their hovers and the Account card, and by its
     roster label only where its roster row has no email; the label stays the account's
     key, and no email leaves the Mac. An email takes up to 32 cells; a longer one shows
     its local part, the words before `@`, cut with `…` past 32 cells, and once the row
     narrows past its widest rungs every name shows its local part cut with `…` past 12
-    cells. A figure is `63%` read within 15 minutes, `≥70%` for an older
-    reading (use only rises within a week), `out` at a wall and `?` unread; `100%` only
-    for a reading of 100.
-  * one chart over [now − 1 d, now + 7 d) at 3 to 12 cells a day: this tab's week as
-    read on this Mac in solid steps (blank before its first reading), `▕` now, then the
-    projected fill of whichever account carries the work as a thin line, with `↺` a
+    cells. Every account figure aterm shows is what is left, like a battery, and says
+    so: `37% left` read within 15 minutes (of 63% used), `≤30% left` for an older
+    reading (use only rises within a week, so no more can be left), `out` at a wall and
+    `?` unread; `0% left` only for a reading of 100. The files, the journal and
+    `--json` keep the use.
+  * one chart over [now − 1 d, now + 7 d) at 3 to 12 cells a day, which drains as the
+    week is used: what was left of this tab's week as read on this Mac in solid steps
+    (blank before its first reading), `▕` now, then what is projected to be left of
+    whichever account carries the work as a thin line falling to the floor, with `↺` a
     reset, `→` a hand-off (the next account's name after it where it fits, else its
     local part, else that cut to 12 cells), `╳` a stop
     (every account out, or the wall the work waits at now), `$` usage credits and `┄`
     not projected (after an unread account the work would reach, or the whole week with
     no pace yet, a paused recovery or a tab the rotation cannot move). Ticks at the foot
     of its level cells mark local midnights.
-  * at most two phrases: `~99% by ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
+  * at most two phrases: `~1% left at ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
     `╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00` (a stop, to the vendor reset that resumes
     the work, or `–~<when>`; `╳ from ~Wed 16:00` where nothing ends it in reach),
     `⧗ until Sat 10:00` (the work waits at a wall now), `? alt2 unread from ~Sat 06:00`,
@@ -1854,19 +1947,29 @@ THE FOOTER
   alerts or moves anything, and a pane whose profile the account gate refused names no
   account's figure. Hovering the row titles it (each week, the pace, the rotation's
   progress); hovering a chart column names its span; clicking it, or line D's unit,
-  opens the Accounts card.
-  The Accounts card shows the verdict and its pace (`at 36% a day (this Mac, the last
-  24 h)`), a day axis over the work row (line E's chart), then each named account's item
-  (`⎆ main  75%  Max 20x  ↺ Sat 10:00`, the active one checked; one whose week runs out
-  says `out ~Sat 03:00`, kept after its plan gives way) over its burn-up lane: its own
-  vendor week on the work row's clock, read then projected to its reset, out drawn as a
-  line along the lane's top. Folded accounts are items under a rule, and a legend names
-  the glyphs; an account the outlook has no words for keeps the store's own
-  (`m27@example.com · preferred · 39% used`), and without an outlook every item does. Choosing an item
-  switches this machine to that account and pins it;
-  `⇄ No pinned account · this machine` releases the pin; `⋯ Account settings…` opens a
-  tab in aterm's configuration folder. The window's thread reads no file for the card:
-  its outlook is the one the footer last replayed.
+  opens the Account card.
+  The Account card answers three questions first, one row each: `Token` (whether this
+  account has a token in the vault and when it ends), `Budget` (what is left of its
+  week and when that resets) and `Machine` (which Mac is its home and where it is in
+  use). Under them a section for each holds the facts behind the answer: the login
+  this tab runs on and, where it applies, `+ Make a vault token` (the token's own
+  dates are in `Copy details`); the plan, the five-hour window, credits, when
+  and where the figure was read, a `Forecast` for a pool account (`runs out ~Sat 03:00`,
+  `lasts to its reset`, or `none:` and the reason) and the account's history as two
+  charts (the last eight days, and whole weeks ending today; words in a narrow pane);
+  this account's home, this Mac and the others that hold it. What aterm does not know
+  it says so, with the reason (`not read yet`, `not checked on this Mac`,
+  `not known: ...`), never as none or zero: a Mac whose clock disagrees with this one
+  is `held for it`, not `in use`. Every time is on your local clock. Nothing
+  is cut with `…`: words that do not fit wrap. `Switch this Mac to` lists the pool's
+  accounts, each with what is left of its week (`owner@example.com   25% left`), the
+  active one checked; choosing one switches this machine to that account and pins it.
+  `Automatic switching` says in one sentence what the rotation is doing, then `Pin`, and
+  `⇄ Move this Mac to the next account` (`Unpin and move to the next account` while a
+  pin holds). `Copy details` copies every fact on the card with its full diagnostics,
+  times in local time and UTC; `⋯ Account settings…` opens a tab in aterm's configuration
+  folder. The window's thread reads no file for the card: its facts are read on a
+  worker, and its forecast is the one the footer last replayed.
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
   a 7-day comparison of the Autopilot modes, and every `[harness]` key. Its WHAT THE
   HARNESS DID counts today and the last 7 days: `Forced continues` (the agent said it
@@ -2570,8 +2673,8 @@ const KITTY_PAGE_HEAD: &str = r#"kitty — talk to the cursor cat: the words it 
   aterm list-kitty-commands   every word, language by language
   aterm help kitty            this page (also: help pet | cat | tricks)
 
-With the full-body pet on glass (`cursor_trail_style = "rainbow kitty pet"`, or
-"rainbow dog pet") type a command word at the terminal and two things happen:
+With the pet on glass (`cursor_pet = "cat"`, the default, or "dog"; it walks
+beside any cursor trail or none) type a command word at the terminal and two things happen:
 the word you typed flashes RAINBOW for about a second, and once your hands pause
 the pet pricks its ears and does it. sit, stay, down, sleep, nap, stretch, jump,
 play, roll, purr, meow, paw, hide, boo, treat — and the internet's cat-speak:
@@ -2959,9 +3062,18 @@ LINUX
   from the next launch; `check` and `apply` still work.
 
 WINDOWS
-  Windows has no updater: nothing is checked, staged or installed. `aterm update
-  status` and `aterm update check` say so and name the way to update a copy you
-  built, in your aterm checkout:
+  Windows downloads nothing. `aterm update status` and `aterm update check` name
+  the running build and the newer one a build on this machine staged
+  (%LOCALAPPDATA%\aterm\dist\latest.json); the window marks its version label
+  and offers an install row while one is staged and not yet installed. A build
+  already installed under an open window (BUILD.json beside the executable) is
+  named as installed: restart aterm to use it. A copy run from a build tree, a
+  dist folder or an MSIX package is told why apply does not install over it.
+  aterm update apply      install the staged build; nothing is stopped, and open
+                          windows keep running until they are restarted
+  aterm update apply --restart
+                          save the open windows, install, start aterm again
+  To build a copy by hand, in your aterm checkout:
     "#;
 
 /// [`update_page`], the MSIX variant of the Windows lane — only where the
@@ -3104,7 +3216,8 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
   aterm ctl @self spawn agent=claude - <<'EOF'
   <task: up to 64 KiB>
   EOF
-                             start a worker in a background tab (`OK <sid>`); also
+                             start a worker in a background tab (`OK <sid> req=<id>`,
+                             the sid first); also
                              `cwd=<path>`, `model=<m>`, `autopilot=land|cruise`, and
                              `label=<word>`, the package it works on, kept on this Mac's
                              board alone
@@ -3189,6 +3302,14 @@ ANY OTHER PROGRAM
                              refused here by name.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>`)
+  What a drive may do on `<h>` is capped by that Mac's fleet access (`aterm help fleet`,
+  FLEET ACCESS; `survey --host <h>`'s header says it, `access=`). Every Mac starts at
+  Read Only, which admits `await task` and `@<w> result|status|text|screen` alone;
+  `turn`, `key`, `send`, `hold` and `close` need `access=write`, and `spawn` needs
+  `access=full`. An act above it answers `ERR denied access=<level> needs=<level>: …`
+  (exit 1) and changes nothing there. Only that Mac's person raises it (its menu-bar
+  lock, or `aterm fleet access full` there); an agent records the refusal and takes the
+  work elsewhere.
   `<h>` is a peer's host, node id or address (`aterm fleet peers`), its host's first label,
   or its short name: the lead word of its host (`m102` of `m102-macbook-…`), else a word
   `m<N>` in it (`m27` of `MacbookAir-m27-…`, never a chip's `M5`). A short name two Macs
@@ -3208,7 +3329,8 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
                          [need=repo:<name>[,free:<n>g]] [cwd=<abs-path>|'cwd=~/<path>']
                          - < task
                              one survey of every member picks the Mac: of those that let
-                             this Mac drive them, meet every `need=` by their own survey
+                             this Mac drive them, are at Full Access (`access=full`),
+                             meet every `need=` by their own survey
                              facts and would start it on an account of that program with no
                              known wall or sign-out, one read working before an unseen one
                              and an unseen one before a low one, then the least used week,
@@ -3259,7 +3381,7 @@ THE SURVEY & CHANNELS
   aterm ctl survey --host <h> | --fleet [--sid <s>]
                              one fleet peer, or the whole fleet (`aterm help fleet`); each
                              instance's line is followed by its pooled CLIs' accounts
-                             (`  accounts: claude main 7d 42% 5h 10%, work-2 walled 3h`),
+                             (`  accounts: claude main 7d 58% left 5h 90% left, work-2 walled 3h`),
                              each by its label, never its email, and a pool it could not
                              read as `unread`; `--json` carries every row
                              (`"accounts":null` from an aterm before 0.146). Then its home,
@@ -3285,7 +3407,9 @@ THE SURVEY & CHANNELS
   result= | step: …`), from the worker's sid here and from `fleet:<node>` when the
   manager spawned it from another Mac; a tab that closes before its conclusion was told
   sends `state=closed` to a manager on another Mac. Mail nothing takes is a record in
-  Messages.
+  Messages. A manager's Mac at Read Only takes no mail (`aterm help fleet`, FLEET
+  ACCESS): its workers on other Macs record that once, and the manager reads them with
+  `await task` and `@<sid> result`, which carry the same facts.
 
 GOTCHAS
   * Hand over a task with `spawn agent=… -`, never by typing a `turn` into someone
@@ -3334,8 +3458,10 @@ THE WORDS
     question   question dialog under the same conditions
 
 WHERE IT SHOWS
-  * Menu bar (`❯`): a stable entry to diagnostics whose title never changes; open it to see
-    Needs you and To look at.
+  * Menu bar (`❯`): a stable entry to diagnostics; open it to see Needs you and To look at.
+    In a fleet the item carries this Mac's fleet access lock (`aterm help fleet`): a
+    pointer's plain click there is the lock's, and a right-click, a Control-click or a
+    press from the keyboard or an accessibility client opens the menu.
   * Tab hover: what the tab needs. A worker's `NEEDS YOU:` report shows here, in the menu
     bar and in Overview, and a direct request outranks a report in the same session.
   * Overview: each session's chip opens with its mark, `◆` stuck or `◇` decide.
@@ -3603,7 +3729,9 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
      Privacy & Security ▸ Developer Tools (`aterm doctor` opens the pane).
   3. A tab adopted across an in-place update (`attribution=adopted`) still gets scans;
      open a fresh tab for heavy builds. When `syspolicyd` deadlocks with `tccd`
-     (`syspolicyd=stuck` in `status`), only a restart of the Mac clears it.
+     (`syspolicyd=stuck` in `status`), only a restart of the Mac clears it. At rest
+     that board is its last look's (`syspolicyd_age_ms=` says how old); an ask that
+     finds it a minute old brings a fresh look, which the next ask reads.
   4. A held program gets no token, and nothing but what started it ends it: `targo
      --unverified verify` ends only its own stage child (step 5), a test wait only its
      own child. `aterm ctl @self sys left` shows what waits (`state=program-check`,
@@ -3660,18 +3788,22 @@ const FLEET_PAGE: &str = r#"fleet — the lab at a glance; the aterms of one LAN
 
   aterm fleet [--json]
   aterm fleet remove | admit | invite | requests | ignore
-  aterm fleet init | join | peers | name | allow | publish | sync | census | leave
+  aterm fleet init | join | peers | name | allow | access | publish | sync | census | leave
                                                        (`aterm fleet --help` has the flags)
 
 THE LAB AT A GLANCE
   `aterm fleet` prints the lab's status line (its members, how many are up, the
-  members that need an update, whether their tables are in step with this Mac's and
-  the slowest's lag, and how full the membership log is) and one row per seat: its
-  label, log name, node id, up or silent for how long, build, and tables. It reads
-  only this Mac's own copy: the node service's presence view, the membership log and
-  the book's signed entries. It dials no Mac and starts nothing; where no node serves
-  presence it says so and reads no one up. `--json` gives one object. `aterm status`'s
-  fleet line is this Mac's own row of it.
+  members that need an update, and how full the membership log is) and one row per
+  seat: label, log name, node id, up or unanswered, build, free disk, session count
+  and account use over five hours and seven days. It reads the fleet's survey facts
+  with a three-second deadline per peer, joining responses by the signed node-key
+  binding, never a machine name. A local network or permission failure is unknown,
+  not evidence that another machine is down. Unbound or unproved peers stay unknown.
+  `--json` gives one object: `unknown` counts unobserved seats, `build_source`
+  distinguishes a survey build from the book's older entry, and missing metrics
+  remain null. `observed_at_ms` is the local response observation; an account's
+  `read_at` is its separate usage observation. `aterm status` and the UI's cached
+  fleet view keep their local reads and do not start peer surveys.
   `remove`, `admit` (`aterm members allow`), `invite`, `requests` and `ignore` run the
   same code as `aterm members`: `aterm fleet remove m12` signs what `aterm members
   remove m12` signs, and both name the log name and node id they acted on. A node
@@ -3690,8 +3822,10 @@ WHAT IT IS
 
 MEMBERSHIP
   Normal ALab setup joins the signed default fleet automatically once its
-  code is available from the vault. Members may read and drive each other
-  by default. Explicit access restrictions, a different manually joined
+  code is available from the vault. Members may read each other and are
+  trusted to drive each other by default; each Mac's fleet access, Read Only
+  until its person raises it, decides what a drive may do (FLEET ACCESS).
+  Explicit access restrictions, a different manually joined
   fleet, and a previous `leave` are preserved. Use `aterm fleet peers` or
   `aterm ctl survey --fleet` to inspect the current state; no per-machine
   `init` or `join` command is needed for the normal ALab setup.
@@ -3713,16 +3847,21 @@ MEMBERSHIP
   member `--at <host[:port]>` names, the place a vault's code names, a member its book
   holds, or one advertising `_alab._tcp` on the LAN. `init --rotate` mints
   a new secret, which every member joins again with and which keeps no drive grant on
-  either side; `peers` checks every known peer (3 s) and `peers add|rm` edits the
+  either side and no fleet access above Read Only; `peers` checks every known peer (3 s) and `peers add|rm` edits the
   book of peers (`add` refuses an address past the LAN, an IPv6 one but ::1, and
   this machine's own listener, writing nothing); `leave` removes the fleet secret, the join code, both
-  books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
+  books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay), and
+  puts this Mac's fleet access back to Read Only.
   `aterm fleet sync [--on]` joins the signed default ALab fleet, or its newer code from
   the default fleet this machine is in (a rotated secret of that fleet it takes in
   place, book and grants kept), keeping the level set here; its first join lets
   every member drive this machine (`drive_from = ["*"]`, a vault admin's too), and it
   leaves a fleet joined by hand to another code, one minted here, and a key it cannot
   read as they are.
+  A fleet access level is chosen for one fleet: an `init`, a `join` or a `sync` that
+  writes another fleet's key here (or a first one) removes `<state>/fleet-access` first
+  and says so, so that fleet's members find this Mac at Read Only. The fleet held,
+  joined or synced again, and its rotated secret taken in place, keep the level.
   `aterm fleet publish`, run by an ALab vault admin where the code was minted,
   publishes its join code to every current and future ALab member. A `leave`, in a fleet
   or not, writes `<state>/fleet-off`, which keeps sync off until `sync --on` or a join
@@ -3745,11 +3884,66 @@ READING & DRIVING ACROSS THE FLEET
     `hold` and `close` (`aterm help workers`). A local Take Over always wins and lifts
     remote holds. Every member reads a Mac at drive as at content: a grant at `facts`
     raises them, and `aterm fleet allow facts` lowers them again. Every write that
-    leaves the level below drive removes every grant and says so.
+    leaves the level below drive removes every grant and says so. What a granted
+    member may do is capped by this Mac's fleet access (below).
+
+FLEET ACCESS (what a member this Mac's grants trust may do here now)
+  aterm fleet access [read|write|full] [--json]
+                       print this Mac's fleet access, or change it
+  A grant says who is trusted to drive this Mac; its fleet access says what a trusted
+  driver may do, and never lets in a Mac no grant names. It is one of three levels,
+  each admitting what the one before it does:
+  * `read` (Read Only, the default on every Mac, new or updated): members read.
+    `survey`, `board`, `await task`, `@<sid> status|text|screen|result|inbox`, a vault's
+    status, and `blocks|blocktext|await` on a plain shell the same member opened.
+  * `write` (Read and Write, No New Tabs): also the acts on a session already here.
+    `@<sid> post` (mail from another Mac, a remote worker's report to its manager
+    here included), `@<sid> inbox seen`, `@<sid> turn|key|send`, `hold <sid> on|off`
+    and `@<sid> close`.
+  * `full` (Full Access): also `spawn`, a worker or a plain shell, and the window the
+    node job opens for one where none is open.
+  An act above the level answers `ERR denied access=<level> needs=<level>: …` and
+  closes the connection; the grant stands, and the same line is admitted once this
+  Mac's person raises the level. Every survey header says the level (`access=`), so a
+  caller knows before it tries, and `--host any` picks only Macs at `access=full`.
+  Three fleet services are not governed and answer at every level, each under its own
+  authorization and running a fixed implementation with no caller-supplied command:
+  vault approval (this Mac's vault admin service judges the request), `service-repair`
+  (one fixed repair operation) and `accounts-renew` (this Mac's own bounded renewal
+  pass). No fleet verb opens a browser on this Mac. Membership, replication and
+  heartbeats go on at every level too.
+  The level is this Mac's alone to change: `aterm fleet access` here, or the lock in its
+  menu bar (macOS, in a fleet: the `❯` item shows a lock, closed, half open or open). A
+  click on it moves one level on: a lower level takes effect at once, and a raise once
+  the lock has rested on it for 2 seconds, the level named beside the `❯` meanwhile, so
+  a click admits nothing until then. The second click of a double-click only lowers
+  (round to Read Only) or takes back a raise still resting, and never raises. A raise
+  still resting is dropped where the level was stated again, or this Mac left or
+  changed its fleet, meanwhile. A right-click, a Control-click, and a press that is no
+  pointer's (the keyboard's, an accessibility client's) open the menu, whose Fleet
+  Access submenu sets a level directly. `aterm fleet access <level>` states the level
+  it names even where that is the one in force. A raise is written under the lock a
+  join, an init and a leave write under, and is refused where it cannot take it. The
+  level is kept in `<state>/fleet-access`; a file that is missing, not private or not
+  understood is Read Only, and `aterm fleet leave` and the write of another fleet's key
+  (MEMBERSHIP) remove it. Lowering it lets jobs another Mac already started run on
+  (their results stay readable, and this Mac closes each tab when its task concludes).
+  A level below Read and Write lifts every hold another Mac has here once it has stood
+  for 2 seconds: a click passing Read Only on its way round lifts none.
+  A manager on a Read Only Mac gets no mail from its workers on other Macs: it reads
+  them with `await task` and `@<sid> result`.
+  The lock governs aterm's fleet port and nothing else. ssh and Screen Sharing reach
+  this account whole, as does any process running as it, which can write the level
+  file; a fabric bridge this Mac's person configured carries what it carries. At
+  `write`, a member can type into a shell here, and that shell can do whatever this
+  account can. It is a policy for cooperating Macs and agents, not a sandbox.
+  For agents: a Mac's fleet access is its person's decision. Lower it freely; raise
+  it only when that Mac's person says so (a worker another Mac started here is
+  refused a raise). A refused act is recorded and the work goes elsewhere.
 
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,
-  `fleet-issuer-book`, `fleet-off`; and in `aterm.toml`:
+  `fleet-issuer-book`, `fleet-off`, `fleet-access`; and in `aterm.toml`:
     [fleet]
     listen = "0.0.0.0:7100"
     allow = "facts"                # "facts" | "content" | "drive"
@@ -3859,6 +4053,13 @@ WINDOW WAKE-UP ON SPAWN
   windowless Mac, `aterm node serve` checks whether a GUI login owns the console: if logged
   out, it answers `ERR logged out`; if logged in, it opens an aterm window in the background
   and forwards the spawn once the window's relay socket answers.
+
+FLEET ACCESS
+  The node job enforces this Mac's fleet access (`aterm help fleet`) as a window does: it
+  reads `<state>/fleet-access` for each drive connection and judges its first line before
+  it serves or routes it, so below Full Access a `spawn` is refused and no window is
+  opened for it. A window judges every line again when it reaches it. With no aterm
+  window open there is no menu-bar lock: `aterm fleet access` is the control.
 
 COMMANDS
   status  show whether `systems.alab.aterm-node` is installed, running and holding the lock
@@ -4444,7 +4645,7 @@ fn rust_page() -> String {
          \x20 * Through atpkg's `targo` shim a build's intermediates land in a `*.noindex` folder,\n\
          \x20   which Spotlight skips: the shared cache, or `<target>/.ubd/build.noindex` under a target\n\
          \x20   you chose and for `targo trust`. A build that bypasses the shim names its target\n\
-         \x20   `*.noindex` (`target/.ubd/check.noindex`); `aterm doctor --read-only` shows what\n\
+         \x20   `*.noindex` beneath `.ubd` (`target/.ubd/check.noindex`); `aterm doctor --read-only` shows what\n\
          \x20   Spotlight indexes.\n\
          \x20 * Never build in a checkout another session is working in — `git worktree add` your own.\n\
          \x20 * Never rebuild a toolchain from source to answer a rustup error: `aterm pkg doctor`,\n\
@@ -5187,7 +5388,9 @@ THE HALT (`hold=1`)
   * `origin=remote` — held by another Mac over the fleet (the survey's `held_from=`
     names its node): its own `hold <sid> off` or the person's Take Over then Hand Back
     lifts it. It also ends here once that Mac may drive this one no more (`aterm help
-    fleet`): `aterm fleet allow content` here ends every grant. `aterm fleet peers rm <its node>`
+    fleet`): `aterm fleet allow content` here ends every grant, and `aterm fleet access
+    read` here (Read Only) lifts every remote hold once it has stood for 2 seconds.
+    `aterm fleet peers rm <its node>`
     here also removes grants naming that node, but another member's book can restore
     a valid signed entry admitted by the `"*"` grant. Removing a peer from one book,
     including the issuer's, does not revoke membership in every book. Under the
@@ -5206,6 +5409,8 @@ A PERSON — HALT, READ AND ANSWER AS YOURSELF
   aterm fabric inbox --cap-file <cap> [--peek]
   aterm fabric post --cap-file <cap> to=@<sid>@<node> kind=answer re=<off> <text>
   aterm link notify --fleet <F> --broker <ep> --cap-file <cap> --on ask:h-<you> --exec <cmd>
+  One notifier runs per state dir and takes every selector (`--on ask:h-<you>,need`); a second
+  one started beside it is refused unless it has its own `--state <dir>`.
   A cap is its holder: every `--cap-file` is a regular file of yours at 0600 or tighter
   (`--out` writes it so; `mint-for` to stdout leaves the file to you). A wider one, a
   symlink or a FIFO is refused at once, naming the file and the `chmod` where one closes it.
@@ -5300,11 +5505,16 @@ THE SESSION LOG ON THE BUS
                                 brief folds it (a new failure, or a question asked while a
                                 failure stands); a need that stays standing runs nothing
                                 again; `$ATERM_NOTIFY_NEED` names the word (`aterm link
-                                notify --help` lists the words and their families)
+                                notify --help` lists the words and their families);
+                                one notifier per state dir takes `ask:` and `need` alike
   aterm ctl @self post to=@<sid>@<node> kind=note re=<off> '<text>'
                                 answer what you read by mail (`re=` the bus offset you
                                 read); no bus record writes into a session's log (a remote
-                                answer is mail, never a mark)
+                                answer is mail, never a mark). Mail to a session on
+                                another Mac needs that Mac's fleet access at Read and
+                                Write (`aterm fleet access write` there, its person's to
+                                run): a Read Only Mac, the default, refuses it with `ERR
+                                denied access=read needs=write: …`
 
 ON BY DEFAULT (one machine)
   aterm's converge pass, run by an aterm window at launch and every 30 minutes, turns the
@@ -5474,1144 +5684,5 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `aterm help <topic> <section>` opens a section of a page that has them (`sys`, `agent`, and
-    /// `instructions`, its other name), refuses a word that names none with the page's list, and
-    /// refuses any second word on a page that has no sections, or on an unknown topic as that topic.
-    #[test]
-    fn a_section_word_opens_that_section_or_is_refused() {
-        let (page, code) = render(Some("sys"), Some("wait"), None);
-        assert_eq!(code, 0);
-        assert!(page.starts_with("aterm help sys wait — "), "{page}");
-        let (msg, code) = render(Some("sys"), Some("bogus"), None);
-        assert_eq!(code, 2);
-        assert!(msg.contains("aterm help sys: no section 'bogus'"), "{msg}");
-        let (page, code) = render(Some("instructions"), Some("restart"), None);
-        assert_eq!(code, 0);
-        assert!(page.starts_with("aterm help agent restart — "), "{page}");
-        let (msg, code) = render(Some("agent"), Some("bogus"), None);
-        assert_eq!(code, 2);
-        assert!(
-            msg.contains("aterm help agent: no section 'bogus'"),
-            "{msg}"
-        );
-        let (msg, code) = render(Some("telemetry"), Some("rows"), None);
-        assert_eq!(code, 2);
-        assert!(msg.contains("no sections"), "{msg}");
-        let (msg, code) = render(Some("bogus"), Some("x"), None);
-        assert_eq!(code, 2);
-        assert!(msg.contains("unknown topic 'bogus'"), "{msg}");
-    }
-
-    /// `aterm help themes` (and the colour words) is the theme page, and its
-    /// key list is the parser's table: every key and alias the parser reads is
-    /// on it, each with its type, and only the required keys say so.
-    #[test]
-    fn the_themes_page_lists_every_key_the_parser_reads() {
-        use aterm_types::scheme::THEME_KEYS;
-        let (page, code) = render(Some("theme"), None, None);
-        assert_eq!(code, 0);
-        for alias in ["themes", "colors", "colours", "color-scheme"] {
-            assert_eq!(
-                render(Some(alias), None, None),
-                (page.clone(), 0),
-                "{alias}"
-            );
-        }
-        // The list is the run of key lines under THE FORMAT, grouped under a
-        // `  <group>:` line wherever the table's group changes.
-        let list: Vec<&str> = page
-            .lines()
-            .skip_while(|line| *line != "THE FORMAT")
-            .skip_while(|line| !line.ends_with(':') || line.starts_with("    "))
-            .skip(1)
-            .take_while(|line| line.starts_with("    ") || line.ends_with(':'))
-            .collect();
-        let keys: Vec<&str> = list
-            .iter()
-            .copied()
-            .filter(|line| line.starts_with("    "))
-            .collect();
-        assert_eq!(keys.len(), THEME_KEYS.len(), "{keys:#?}");
-        let mut groups: Vec<&str> = THEME_KEYS.iter().map(|spec| spec.group.label()).collect();
-        groups.dedup();
-        let headers: Vec<&str> = page
-            .lines()
-            .skip_while(|line| *line != "THE FORMAT")
-            .filter(|line| line.starts_with("  ") && !line.starts_with("    "))
-            .filter_map(|line| line.trim().strip_suffix(':'))
-            .filter(|word| groups.contains(word))
-            .collect();
-        assert_eq!(headers, groups, "one header per group, in table order");
-        for (line, spec) in keys.iter().zip(&THEME_KEYS) {
-            let suffix = if spec.indexed > 0 { "<N>" } else { "" };
-            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
-                assert!(line.contains(&format!("{name}{suffix}")), "{line}");
-            }
-            assert!(line.contains(spec.value.label()), "{line}");
-            assert_eq!(line.ends_with(", required"), spec.required, "{line}");
-        }
-        assert!(
-            page.contains(&format!(
-                "{} KiB",
-                aterm_types::scheme::MAX_USER_THEME_FILE_BYTES / 1024
-            )),
-            "the byte bound is the parser's"
-        );
-    }
-
-    /// Every rostered verb resolves as a help topic.
-    #[test]
-    fn every_front_door_verb_resolves() {
-        for v in crate::Verb::ALL {
-            let (page, code) = render(Some(v.name()), None, None);
-            assert_eq!(code, 0, "`aterm help {}` exits {code}", v.name());
-            assert!(
-                !page.contains("unknown topic"),
-                "`aterm help {}` 404s",
-                v.name()
-            );
-            assert!(page.len() > 200, "`aterm help {}` is a stub", v.name());
-        }
-        for (name, _) in crate::DIAG_COMMANDS {
-            let (page, code) = render(Some(name), None, None);
-            assert_eq!(code, 0, "`aterm help {name}` exits {code}");
-            assert!(!page.contains("unknown topic"), "`aterm help {name}` 404s");
-            assert!(page.contains(name), "`aterm help {name}` never says {name}");
-        }
-    }
-
-    /// Every `aterm ctl` verb `page` teaches is one the server's table or the client serves.
-    fn teaches_only_served_verbs(name: &str, page: &str) {
-        for (command, verb) in aterm_primer::taught_ctl_verbs(page) {
-            assert!(
-                aterm_types::control_verbs::spec(&verb).is_some()
-                    || aterm_ctl::CLIENT_HELP_VERBS.contains(&verb.as_str()),
-                "`aterm help {name}` teaches `aterm ctl {command}` (`{verb}`), which \
-                 nothing serves"
-            );
-        }
-    }
-
-    /// `aterm help introspection` lists every verb of the protocol table by its summary, in
-    /// table order, and every line of it fits the entry wrap.
-    #[test]
-    fn the_introspection_page_lists_every_verb_within_the_wrap() {
-        let page = introspection_page();
-        let mut rest = page.as_str();
-        for line in aterm_types::control_verbs::catalog_lines_wrapped() {
-            let at = rest
-                .find(&format!("\n{line}\n"))
-                .unwrap_or_else(|| panic!("the page lost (or reordered) {line}"));
-            rest = &rest[at + line.len() + 1..];
-        }
-        let wrap = aterm_types::control_verbs::ENTRY_WRAP_COLUMNS;
-        for line in page.lines() {
-            assert!(
-                line.chars().count() <= wrap,
-                "{} columns: {line}",
-                line.chars().count()
-            );
-        }
-    }
-
-    /// Every topic renders, ends its last line and teaches only `aterm ctl` verbs something
-    /// serves, and the toolchain words an agent types land on the rust page: `render` reads only
-    /// the page a word opens, and the rust page measures the toolchain each time it is made, so
-    /// it is made once.
-    #[test]
-    fn every_topic_renders() {
-        for name in topic_names() {
-            let (page, code) = render(Some(name), None, None);
-            assert_eq!(code, 0, "topic {name} should render 0");
-            assert!(!page.trim().is_empty(), "topic {name} rendered empty");
-            assert!(
-                page.ends_with('\n'),
-                "topic {name} ends {:?}",
-                page.lines().last()
-            );
-            teaches_only_served_verbs(name, &page);
-            if name == "rust" {
-                assert!(page.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"));
-            }
-        }
-        for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
-            assert_eq!(
-                page_of(alias),
-                "rust",
-                "`aterm help {alias}` must land on the rust page"
-            );
-        }
-    }
-
-    /// The `trust version` row reads Trust's own version off verbatim `-vV`
-    /// texts: the `trust:` line, never the `rustc` release.
-    #[test]
-    fn trust_version_row_says_trusts_own_version_and_what_the_rustc_line_means() {
-        let trust = "rustc 1.99.0-dev (3a3e781fe 2026-09-14)\nbinary: rustc\n\
-                     commit-hash: 3a3e781fe082b74d3c4de0ade65b1de3cbee7255\ncommit-date: 2026-09-14\n\
-                     host: x86_64-unknown-linux-gnu\nrelease: 1.99.0-dev\ntrust: 0.1.0\nLLVM version: 22.1.2\n";
-        let row = trust_version_row(Some(trust.to_string()));
-        assert!(row.starts_with("0.1.0 "), "{row}");
-        let stock =
-            "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nrelease: 1.96.0\n";
-        let row = trust_version_row(Some(stock.to_string()));
-        assert!(row.starts_with("NONE "), "{row}");
-        assert!(!row.contains("0.1.0"), "{row}");
-        // An empty value is not a version.
-        let empty = "rustc 1.99.0-dev (x 2026-01-01)\nrelease: 1.99.0-dev\ntrust:\n";
-        assert!(trust_version_row(Some(empty.to_string())).starts_with("NONE"));
-    }
-
-    /// `aterm help rust` names the tree's lock and its build, what took its place, and a `targo`
-    /// shim that runs another build than the run compiles with; with no lock it says none binds
-    /// the tree. NEGATIVE CONTROLS: a run whose locked build is refused, and a shim laid for the
-    /// build the run resolved, state no mismatch.
-    #[test]
-    #[cfg(unix)]
-    fn trust_lock_rows_name_the_lock_and_a_shim_that_runs_another_build() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("aterm-cli-lock-rows-")
-            .tempdir()
-            .expect("scratch");
-        let prefix = scratch.path().join("pkg");
-        let runnable = |bin: &Path| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::create_dir_all(bin).expect("bin");
-            let targo = bin.join("targo");
-            std::fs::write(&targo, "#!/bin/sh\n").expect("targo");
-            std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        };
-        let tools =
-            |stage2_dir: PathBuf, lock_override: Option<&str>| atpkg::toolchain::Toolchain {
-                targo: stage2_dir.join("targo"),
-                trustdoc: stage2_dir.join("trustdoc"),
-                stage2_dir,
-                tippy: None,
-                trustfmt: None,
-                borrowed: Vec::new(),
-                refused: None,
-                store_bin: None,
-                demoted: None,
-                lock: None,
-                lock_refusal: None,
-                lock_override: lock_override.map(str::to_string),
-            };
-        let own = scratch.path().join("s/bin");
-        runnable(&own);
-        let none = trust_lock_rows(None, &tools(own.clone(), None), &prefix);
-        assert!(none.contains("none above this directory"), "{none}");
-
-        let found = atpkg::trust_lock::Found {
-            path: PathBuf::from("/c/trust.lock"),
-            lock: Ok(atpkg::trust_lock::TrustLock {
-                build: 83,
-                tree_root: "d".repeat(64),
-                compiler_commit: "a".repeat(40),
-                receipt: "SEED-MINT sha256:00".to_string(),
-                stock_toolchain: "1.99.1".to_string(),
-            }),
-        };
-        let laid = |build: u64| {
-            std::fs::create_dir_all(prefix.join("bin")).expect("bin");
-            let target = atpkg::trust_lock::build_dir(&prefix, build).join("bin/targo");
-            std::fs::write(
-                prefix.join("bin/targo"),
-                format!(
-                    "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
-                    target.display()
-                ),
-            )
-            .expect("shim");
-        };
-        laid(16387);
-        let rows = trust_lock_rows(
-            Some(&found),
-            &tools(
-                own.clone(),
-                Some("TRUST_STAGE2_BIN=/s/bin overrides /c/trust.lock"),
-            ),
-            &prefix,
-        );
-        assert!(
-            rows.starts_with(
-                "  trust.lock       /c/trust.lock: Trust build 83 (tree root dddddddddddd"
-            ),
-            "{rows}"
-        );
-        assert!(rows.contains("TRUST_STAGE2_BIN=/s/bin overrides"), "{rows}");
-        assert!(rows.contains("plain `targo` resolves 16387"), "{rows}");
-
-        // A run whose locked build is refused compiles with nothing: no shim differs from it.
-        let resolved = atpkg::trust_lock::build_dir(&prefix, 83).join("bin");
-        let refused = atpkg::toolchain::Toolchain {
-            lock_refusal: Some(
-                "/c/trust.lock names Trust build 83, which this Mac's store does not hold"
-                    .to_string(),
-            ),
-            ..tools(resolved.clone(), None)
-        };
-        let rows = trust_lock_rows(Some(&found), &refused, &prefix);
-        assert!(!rows.contains("plain `targo`"), "{rows}");
-        assert_eq!(rows.lines().count(), 1, "{rows}");
-
-        laid(83);
-        runnable(&resolved);
-        let rows = trust_lock_rows(Some(&found), &tools(resolved, None), &prefix);
-        assert!(!rows.contains("plain `targo`"), "{rows}");
-        assert_eq!(rows.lines().count(), 1, "{rows}");
-    }
-
-    /// The `rust-toolchain` row never says a Trust pin drives a stock `cargo` while
-    /// `RUSTUP_TOOLCHAIN` (which rustup ranks above the pin) names another toolchain,
-    /// and never says nothing selects stock Rust where no pin exists.
-    #[test]
-    fn rust_toolchain_row_says_when_rustup_toolchain_overrides_the_pin() {
-        let pinned = rust_toolchain_row(Some("trust"), None);
-        assert!(pinned.contains("this project pins Trust"), "{pinned}");
-        // Unset, empty and the pin's own name are no override.
-        for env in [Some(""), Some("trust")] {
-            assert_eq!(rust_toolchain_row(Some("trust"), env), pinned, "{env:?}");
-        }
-        // Negative control: the environment outranks the pin, and the row says
-        // so.
-        let overridden = rust_toolchain_row(Some("trust"), Some("stable"));
-        assert!(
-            overridden.contains("RUSTUP_TOOLCHAIN=stable overrides it")
-                && overridden.contains("runs stable"),
-            "{overridden}"
-        );
-        assert!(!overridden.contains("drives"), "{overridden}");
-        let unpinned = rust_toolchain_row(None, Some("stable"));
-        assert!(
-            unpinned.contains("no channel pinned") && unpinned.contains("what rustup or"),
-            "{unpinned}"
-        );
-        assert!(
-            !unpinned.contains("nothing selects stock Rust"),
-            "{unpinned}"
-        );
-    }
-
-    /// The `targo here` row names the trustc beside targo when nothing moves it,
-    /// the mover when one does, and says so when that targo has no trustc.
-    #[test]
-    fn targo_here_names_the_compiler_or_what_moved_it() {
-        let hold = path_scratch("targo-here");
-        let root = hold.path();
-        std::fs::write(root.join("trustc"), "").expect("write");
-        let row = targo_here_row(Some(root), &[]);
-        assert!(
-            row.starts_with(&format!("{}", root.join("trustc").display())),
-            "{row}"
-        );
-        assert!(row.contains("the trustc beside targo"), "{row}");
-        assert!(
-            row.contains("a rust-toolchain.toml pin does not move it"),
-            "{row}"
-        );
-        let moved = targo_here_row(
-            Some(root),
-            &[atpkg::toolchain::rustc_movers::Mover {
-                what: "$RUSTC".to_string(),
-                value: "/s/rustc".to_string(),
-                base: root.to_path_buf(),
-            }],
-        );
-        assert!(
-            moved.starts_with("NOT trustc: $RUSTC = /s/rustc"),
-            "{moved}"
-        );
-        let bare = root.join("bare");
-        std::fs::create_dir_all(&bare).expect("mkdir");
-        assert!(targo_here_row(Some(&bare), &[]).contains("holds no `trustc`"));
-        assert!(targo_here_row(None, &[]).starts_with("unknown"));
-    }
-
-    /// The probe helper is bounded: `sleep 120` against a 200 ms limit returns
-    /// `None` well within the 60 s check.
-    #[test]
-    fn bounded_first_line_kills_a_wedged_probe() {
-        let (wedge, wedge_args): (&str, &[&str]) = if cfg!(windows) {
-            ("ping", &["-n", "120", "127.0.0.1"])
-        } else {
-            ("sleep", &["120"])
-        };
-        let (echo, echo_args): (&str, &[&str]) = if cfg!(windows) {
-            ("cmd", &["/d", "/c", "echo", "hello"])
-        } else {
-            ("echo", &["hello"])
-        };
-        let t0 = std::time::Instant::now();
-        let got = bounded_first_line(wedge, wedge_args, std::time::Duration::from_millis(200));
-        assert!(
-            got.is_none(),
-            "a wedged probe must answer None, got {got:?}"
-        );
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(60),
-            "the bound did not hold: {:?}",
-            t0.elapsed()
-        );
-        assert_eq!(
-            bounded_first_line(echo, echo_args, std::time::Duration::from_secs(60)).as_deref(),
-            Some("hello")
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            bounded_first_line(
-                "/bin/sh",
-                &[
-                    "-c",
-                    "printf 'first-line\\n'; dd if=/dev/zero bs=1024 count=256 2>/dev/null"
-                ],
-                std::time::Duration::from_secs(60),
-            )
-            .as_deref(),
-            Some("first-line"),
-            "probe output larger than the OS pipe buffer must drain concurrently without deadlocking"
-        );
-    }
-
-    /// A portable scratch directory for the toolchain and PATH-resolution tests,
-    /// unique per test and process, removed on drop.
-    fn path_scratch(tag: &str) -> aterm_tempfile::TempDir {
-        aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-cli-help-rust-{tag}-"))
-            .tempdir()
-            .expect("scratch dir")
-    }
-
-    /// An executable file that is only READ by the test (PATH resolution, the exec bit,
-    /// a shim's text): written and `chmod`ed, never run.
-    #[cfg(unix)]
-    fn put_exec(path: &Path, body: &[u8]) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
-        std::fs::write(path, body).expect("write");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-
-    /// An executable file the page under test will RUN (a version probe): [`put_exec`],
-    /// then its first exec paid here (see [`run_once`]).
-    #[cfg(unix)]
-    fn write_exec(path: &Path, body: &[u8]) {
-        put_exec(path, body);
-        run_once(path);
-    }
-
-    /// Run `path` once, unbounded, output discarded.
-    #[cfg(unix)]
-    fn run_once(path: &Path) {
-        let _ = aterm_spec::wait::past_text_busy(|| {
-            aterm_uds::spawnfd::command(path)
-                .arg("--version")
-                .stdin(aterm_uds::spawnfd::Stdio::null())
-                .stdout(aterm_uds::spawnfd::Stdio::null())
-                .stderr(aterm_uds::spawnfd::Stdio::null())
-                .status()
-        });
-    }
-
-    /// The shim shape this page reads matches atpkg's: each shim (plain,
-    /// env-exporting, and with a single quote in the target) is rendered by
-    /// atpkg's writer and read back by [`sh_exec_target`].
-    #[test]
-    fn the_shim_shape_matches_atpkg() {
-        #[cfg(unix)]
-        {
-            let env = atpkg::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()])
-                .expect("a plain NAME=VALUE is admitted");
-            for target in [
-                "/prefix/store/trust/8595/bin/targo",
-                "/Users//x/Library/Application Support/aterm/pkg/store/trust/8595/bin/trustc",
-                "/odd/it's/bin/tippy",
-            ] {
-                for env in [&atpkg::shim_env::ShimEnv::NONE, &env] {
-                    let shim = atpkg::platform::shim_executable_to_env(
-                        Path::new("/prefix/bin/tool"),
-                        Path::new(target),
-                        env,
-                    )
-                    .expect("renders");
-                    let body = String::from_utf8(shim.body).expect("a shim is UTF-8");
-                    assert_eq!(
-                        sh_exec_target(&body).as_deref(),
-                        Some(Path::new(target)),
-                        "atpkg's shim was not read back to its target:\n{body}"
-                    );
-                }
-            }
-        }
-        #[cfg(windows)]
-        {
-            let shim = atpkg::platform::shim_executable_to_env(
-                Path::new(r"C:\prefix\bin\targo.cmd"),
-                Path::new(r"C:\prefix\store\trust\8595\bin\targo.exe"),
-                &atpkg::shim_env::ShimEnv::NONE,
-            )
-            .expect("renders");
-            let body = String::from_utf8(shim.body).expect("a shim is UTF-8");
-            assert_eq!(sh_exec_target(&body), None, "{body}");
-        }
-        assert_eq!(sh_exec_target("#!/bin/sh\necho gone >&2\nexit 127\n"), None);
-        assert_eq!(sh_exec_target("\u{7f}ELF"), None);
-        let guard = "[ ! -h '/r/bin/t' ] && [ -f '/r/bin/t' ] && [ -x '/r/bin/t' ] && [ -f \
-                     '/s/bin/t' ] && [ ! -h '/r/.atpkg-root' ] && [ -f '/r/.atpkg-root' ] && \
-                     exec '/r/bin/t' \"$@\"";
-        assert_eq!(
-            sh_guard_line(guard),
-            Some(ShimGuard {
-                root: PathBuf::from("/r/bin/t"),
-                store: PathBuf::from("/s/bin/t"),
-                marker: PathBuf::from("/r/.atpkg-root"),
-            })
-        );
-        for other in [
-            guard.replacen("[ -f '/r/bin/t' ]", "[ -f '/x/bin/t' ]", 1),
-            guard.replacen("[ -x '/r/bin/t' ]", "[ -x '/x/bin/t' ]", 1),
-            guard.replacen("exec '/r/bin/t'", "exec '/x/bin/t'", 1),
-            guard.replacen("[ -f '/r/.atpkg-root' ]", "[ -f '/x/.atpkg-root' ]", 1),
-            guard.replacen(" \"$@\"", "", 1),
-            guard.replacen("[ ! -h '/r/bin/t' ]", "[ -h '/r/bin/t' ]", 1),
-            String::from(
-                "[ ! -h '/r/bin/t' ] && [ '/r/bin/t' -ef '/s/bin/t' ] && exec '/r/bin/t' \"$@\"",
-            ),
-        ] {
-            assert_eq!(sh_guard_line(&other), None, "{other}");
-        }
-        let late = format!("#!/bin/sh\nexec '/s/bin/t' \"$@\"\n{guard}\n");
-        assert_eq!(
-            sh_shim_script(&late),
-            Some(ShimScript {
-                guards: Vec::new(),
-                target: PathBuf::from("/s/bin/t"),
-            })
-        );
-        assert_eq!(
-            sh_quoted_word("'it'\\''s a pkg' rest"),
-            Some(("it's a pkg".to_string(), " rest"))
-        );
-        assert_eq!(sh_quoted_word("unquoted"), None);
-        assert_eq!(sh_quoted_word("'unterminated"), None);
-    }
-
-    /// A routed shim runs from where its guard sends the shell.
-    #[cfg(unix)]
-    #[test]
-    fn routed_shims_resolve_to_where_the_shell_execs() {
-        let hold = path_scratch("routed");
-        let scratch = std::fs::canonicalize(hold.path()).expect("scratch");
-        let prefix = scratch.join("it's a pkg");
-        let layout = atpkg::Layout {
-            prefix: prefix.clone(),
-        };
-        let build = layout.build_dir("trust", 8595);
-        let bin = build.join("bin");
-        write_exec(&bin.join("targo"), b"#!/bin/sh\nprintf '%s\\n' \"$0\"\n");
-        write_exec(
-            &bin.join("trustc"),
-            b"frontend 8595 / code signature: trustc",
-        );
-        write_exec(
-            &bin.join("rustc"),
-            b"frontend 8595 / code signature: rustc_",
-        );
-        write_exec(&bin.join("tippy"), b"tippy 8595");
-        std::fs::create_dir_all(build.join("lib/rustlib/aarch64-apple-darwin/lib")).expect("lib");
-        std::fs::write(build.join("lib/librustc_driver-5cfd.dylib"), b"driver").expect("dylib");
-        assert!(
-            atpkg::compat::needs_root(&build)
-                .expect("the fixture build reads")
-                .is_some(),
-            "the fixture is not shaped like 8595"
-        );
-        assert_eq!(
-            atpkg::compat::ensure_root(&layout, &build, atpkg::seam::Depth::Deep).expect("laid"),
-            atpkg::compat::Ensured::Built
-        );
-        let root_bin = atpkg::compat::root_dir(&layout, 8595).join("bin");
-        let (store_targo, root_targo) = (bin.join("targo"), root_bin.join("targo"));
-        let marker = atpkg::compat::root_marker(&atpkg::compat::root_dir(&layout, 8595));
-        run_once(&root_targo);
-
-        let shims = prefix.join("bin");
-        let shim = shims.join("targo");
-        let body = atpkg::platform::shim_executable_to_env(
-            &shim,
-            &store_targo,
-            &atpkg::shim_env::ShimEnv::NONE,
-        )
-        .expect("renders")
-        .body;
-        write_exec(&shim, &body);
-        let body = String::from_utf8(body).expect("a shim is UTF-8");
-        assert_eq!(
-            sh_shim_script(&body),
-            Some(ShimScript {
-                guards: vec![ShimGuard {
-                    root: root_targo.clone(),
-                    store: store_targo.clone(),
-                    marker: marker.clone(),
-                }],
-                target: store_targo.clone(),
-            }),
-            "atpkg's routed shim was not read back:\n{body}"
-        );
-        let path_env = std::env::join_paths([&shims]).expect("join");
-        let shell_execs = || {
-            let run = aterm_spec::wait::past_text_busy(|| {
-                aterm_uds::spawnfd::command(&shim).env_clear().output()
-            })
-            .expect("run the shim");
-            assert!(run.status.success(), "{run:?}");
-            PathBuf::from(String::from_utf8_lossy(&run.stdout).trim_end())
-        };
-
-        let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
-        assert_eq!(
-            got.shims,
-            vec![ShimHop {
-                execs: root_targo.clone(),
-                route: Some(Route::Taken {
-                    store: store_targo.clone()
-                }),
-            }]
-        );
-        assert_eq!(shell_execs(), root_targo, "the shell disagrees");
-        assert_eq!(got.real_dir(), Some(root_bin.clone()));
-        assert!(is_toolchain_bin(&root_bin) && is_toolchain_bin(&bin));
-
-        let marker_body = std::fs::read(&marker).expect("the marker reads");
-        let root_body = std::fs::read(&root_targo).expect("the root file reads");
-        let restore = || {
-            let _ = std::fs::remove_file(&root_targo);
-            write_exec(&root_targo, &root_body);
-            let _ = std::fs::remove_file(&marker);
-            std::fs::write(&marker, &marker_body).expect("marker");
-        };
-        let refusals: [(&str, &dyn Fn(), Refusal); 4] = [
-            (
-                "unmarked",
-                &|| std::fs::remove_file(&marker).expect("unlink"),
-                Refusal::Unmarked,
-            ),
-            (
-                "not executable",
-                &|| {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&root_targo, std::fs::Permissions::from_mode(0o644))
-                        .expect("chmod");
-                },
-                Refusal::NotExecutable,
-            ),
-            (
-                "symlink",
-                &|| {
-                    std::fs::remove_file(&root_targo).expect("unlink");
-                    std::os::unix::fs::symlink(&store_targo, &root_targo).expect("symlink");
-                },
-                Refusal::Symlink,
-            ),
-            (
-                "missing",
-                &|| std::fs::remove_file(&root_targo).expect("unlink"),
-                Refusal::Missing,
-            ),
-        ];
-        for (tag, plant, why) in refusals {
-            restore();
-            plant();
-            let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
-            assert_eq!(
-                got.shims,
-                vec![ShimHop {
-                    execs: store_targo.clone(),
-                    route: Some(Route::Refused {
-                        root: root_targo.clone(),
-                        why
-                    }),
-                }],
-                "{tag}"
-            );
-            assert_eq!(shell_execs(), store_targo, "{tag}: the shell disagrees");
-            assert_eq!(got.real_dir(), Some(bin.clone()), "{tag}");
-        }
-        drop(hold);
-    }
-
-    /// `targo on PATH` resolves as the shell does: the first executable entry
-    /// wins, a reroute directory is skipped, and an atpkg shim is followed to
-    /// the canonical file it execs.
-    #[cfg(unix)]
-    #[test]
-    fn resolve_on_path_takes_the_first_executable_and_follows_the_shim() {
-        let hold = path_scratch("resolve");
-        let root = hold.path();
-        let reroute = root.join("reroute");
-        let plain = root.join("plain");
-        let shims = root.join("shims");
-        let store = root.join("store/trust/8595/bin");
-        put_exec(&reroute.join("targo"), b"#!/bin/sh\nexit 9\n");
-        std::fs::write(reroute.join(REROUTE_DIR_MARKER), "marker\n").expect("marker");
-        std::fs::create_dir_all(&plain).expect("mkdir");
-        std::fs::write(plain.join("targo"), "not executable").expect("write");
-        let real = store.join("targo");
-        put_exec(&real, b"\x7fELF not a script");
-        put_exec(
-            &shims.join("targo"),
-            atpkg::platform::shim_executable_to_env(
-                &shims.join("targo"),
-                &real,
-                &atpkg::shim_env::ShimEnv::NONE,
-            )
-            .expect("renders")
-            .body
-            .as_slice(),
-        );
-        let path_env = std::env::join_paths([&reroute, &plain, &shims]).expect("join");
-        let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
-        assert_eq!(got.found, shims.join("targo"));
-        assert_eq!(
-            got.shims,
-            vec![ShimHop {
-                execs: real.clone(),
-                route: None
-            }]
-        );
-        let canonical_store = std::fs::canonicalize(&store).expect("store exists");
-        assert_eq!(got.real, Some(canonical_store.join("targo")));
-        assert_eq!(got.real_dir(), Some(canonical_store));
-        let described = describe_on_path(&got);
-        assert!(described.contains("a shim that execs"), "{described}");
-
-        let plain_only = std::env::join_paths([&store]).expect("join");
-        let got = resolve_on_path("targo", &plain_only).expect("the store file itself");
-        assert!(got.shims.is_empty());
-        assert!(resolve_on_path("trustc", &plain_only).is_none());
-
-        put_exec(
-            &root.join("dangling/targo"),
-            b"#!/bin/sh\nexec '/nonexistent/aterm-cli-test/targo' \"$@\"\n",
-        );
-        let dangling = std::env::join_paths([root.join("dangling")]).expect("join");
-        let got = resolve_on_path("targo", &dangling).expect("the shim is on PATH");
-        assert_eq!(got.real, None);
-        assert_eq!(got.real_dir(), None);
-        assert!(describe_on_path(&got).contains("does NOT resolve"));
-    }
-
-    /// The build a version line names stops at the first `)`; a line with no
-    /// parenthesis is compared whole.
-    #[test]
-    fn build_of_stops_at_the_commit_parenthesis() {
-        assert_eq!(
-            build_of("targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)"),
-            "targo 1.99.0-dev (43f8b339f 2026-09-12)"
-        );
-        assert_eq!(
-            build_of("targo 1.99.0-dev (43f8b339f 2026-09-12)"),
-            "targo 1.99.0-dev (43f8b339f 2026-09-12)"
-        );
-        assert_eq!(build_of(" targo 0.1.0 "), "targo 0.1.0");
-    }
-
-    /// [`compare_toolchains`] over five shapes: one directory; one build in two toolchain
-    /// directories; a matching line from a non-toolchain directory; two builds; and a probe that
-    /// did not answer.
-    #[test]
-    fn compare_toolchains_classifies_the_five_shapes() {
-        fn side<'a>(dir: &'a str, ver: Option<&'a str>, toolchain_bin: bool) -> Side<'a> {
-            Side {
-                dir: Path::new(dir),
-                ver,
-                toolchain_bin,
-            }
-        }
-        let store = "/p/store/trust/8595/bin";
-        let view = "/p/rustup/trust/bin";
-        let tree = "/h/trust/build/aarch64-apple-darwin/stage2/bin";
-        let script = "/h/fake/script-old";
-        let new = "targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)";
-        let old = "targo 1.99.0-dev (07ec014cb 2026-08-10)";
-        let cmp = |g: Side<'_>, p: Side<'_>| compare_toolchains(&g, &p);
-        assert_eq!(
-            cmp(side(store, Some(new), true), side(store, Some(new), true)),
-            Agreement::Same
-        );
-        assert_eq!(
-            cmp(side(store, None, true), side(store, Some(new), true)),
-            Agreement::Same
-        );
-        assert_eq!(
-            cmp(
-                side(view, Some(new), true),
-                side(store, Some("targo 1.99.0-dev (43f8b339f 2026-09-12)"), true)
-            ),
-            Agreement::SameBuild
-        );
-        assert_eq!(
-            cmp(side(tree, Some(old), true), side(script, Some(old), false)),
-            Agreement::SameLine
-        );
-        assert_eq!(
-            cmp(side(script, Some(old), false), side(tree, Some(old), true)),
-            Agreement::SameLine
-        );
-        assert_eq!(
-            cmp(side(tree, Some(old), true), side(store, Some(new), true)),
-            Agreement::OtherBuild
-        );
-        assert_eq!(
-            cmp(side(store, Some(old), true), side(store, Some(new), true)),
-            Agreement::OtherBuild
-        );
-        assert_eq!(
-            cmp(side(tree, None, true), side(store, Some(new), true)),
-            Agreement::OtherDir
-        );
-        assert_eq!(
-            cmp(side(tree, Some(old), true), side(store, None, true)),
-            Agreement::OtherDir
-        );
-    }
-
-    /// `is_toolchain_bin` separates ONE BUILD from a matching line: a `trustc` with a
-    /// `lib/rustlib` sysroot above it, and nothing less.
-    #[cfg(unix)]
-    #[test]
-    fn a_toolchain_bin_needs_trustc_and_a_sysroot() {
-        let hold = path_scratch("toolchain-bin");
-        let root = hold.path();
-        let bin = root.join("tc/bin");
-        put_exec(&bin.join("targo"), b"#!/bin/sh\n");
-        assert!(!is_toolchain_bin(&bin), "no trustc");
-        put_exec(&bin.join("trustc"), b"#!/bin/sh\n");
-        assert!(!is_toolchain_bin(&bin), "no lib/rustlib");
-        std::fs::create_dir_all(root.join("tc/lib/rustlib")).expect("sysroot");
-        assert!(is_toolchain_bin(&bin));
-    }
-
-    /// Before `trust` lands, PATH's `targo` is atpkg's stub, which the page names and never runs.
-    #[cfg(unix)]
-    #[test]
-    fn page_never_runs_a_pending_targo() {
-        const CHILD: &str = "ATERM_TEST_HELP_RUST_PENDING_CHILD";
-        if let Some(out) = std::env::var_os(CHILD) {
-            let (page, code) = render(Some("rust"), None, None);
-            assert_eq!(code, 0);
-            std::fs::write(out, page).expect("write the page");
-            return;
-        }
-        let hold = path_scratch("pending");
-        let root = std::fs::canonicalize(hold.path()).expect("scratch");
-        let home = root.join("home");
-        let stubs = root.join("stubs");
-        std::fs::create_dir_all(&home).expect("home");
-        let ran = root.join("targo-ran");
-        put_exec(
-            &stubs.join("targo"),
-            format!(
-                "#!/bin/sh\n# atpkg pending-program stub v1\n: > '{}'\nexit 127\n",
-                ran.display()
-            )
-            .as_bytes(),
-        );
-        let name = format!(
-            "{}::page_never_runs_a_pending_targo",
-            module_path!().split_once("::").map_or("", |(_, rest)| rest)
-        );
-        let out = root.join("page.txt");
-        let run = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
-            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env_clear()
-            .env(CHILD, &out)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", root.join("xdg"))
-            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
-            .current_dir(&root)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .expect("re-exec the test binary");
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(run.status.success(), "the re-exec failed:\n{text}");
-        assert!(
-            text.contains("1 passed"),
-            "the re-exec ran no test:\n{text}"
-        );
-        let page = std::fs::read_to_string(&out).expect("the child wrote the page");
-        assert!(!ran.exists(), "the pending stub was run:\n{page}");
-        for row in [
-            "  targo            ",
-            "  targo fmt        ",
-            "  targo tippy      ",
-        ] {
-            assert!(
-                page.lines()
-                    .any(|l| l.starts_with(row) && l.contains("pending stub")),
-                "{row:?} names the stub:\n{page}"
-            );
-        }
-        drop(hold);
-    }
-
-    /// `aterm help privacy` is the permissions page, which opens with a table of at most ten
-    /// lines (a header, and per permission what it reads now and its one fix) before DETAILS.
-    /// A test binary reads no state; the table shows the states it is given (the control).
-    #[test]
-    fn help_privacy_is_the_permissions_page_and_it_opens_with_the_live_table() {
-        let (page, code) = render(Some("privacy"), None, None);
-        assert_eq!(code, 0, "{page}");
-        assert_eq!(page, render(Some("permissions"), None, None).0);
-        assert!(page.starts_with("permissions — "), "{page}");
-        let head = &page[..page.find("\nDETAILS\n").expect("a DETAILS heading")];
-        let table: Vec<&str> = head
-            .lines()
-            .skip_while(|l| !l.starts_with("  PERMISSION"))
-            .take_while(|l| l.starts_with("  ") && !l.starts_with("  (`"))
-            .collect();
-        assert!(table.len() <= 10, "{table:#?}");
-        let rows = |name: &str| {
-            table
-                .iter()
-                .filter(|l| l.starts_with(&format!("  {name}")))
-                .count()
-        };
-        for name in ["Full Disk Access", "Developer Tools", "Debugger access"] {
-            assert_eq!(rows(name), 1, "{name}: {table:#?}");
-        }
-        assert_eq!(
-            table
-                .iter()
-                .filter(|l| l.trim_start().starts_with("fix: "))
-                .count(),
-            3
-        );
-        assert_eq!(
-            table.iter().filter(|l| l.contains("not read")).count(),
-            3,
-            "{table:#?}"
-        );
-        assert!(page.contains("WHAT TO DO, IN ORDER"), "the details stay");
-
-        let live = permissions_table(["granted", "off", "asks"], None);
-        let line = |name: &str| {
-            live.lines()
-                .find(|l| l.starts_with(&format!("  {name}")))
-                .unwrap()
-        };
-        assert!(line("Full Disk Access").contains(" granted "), "{live}");
-        assert!(line("Developer Tools").contains(" off "), "{live}");
-        assert!(line("Debugger access").contains(" asks "), "{live}");
-        assert!(live.lines().all(|l| l.chars().count() <= 100), "{live}");
-        assert!(!live.contains("This shell runs under"), "{live}");
-        let terminal = permissions_table(
-            ["not aterm's", "on", "asks"],
-            Some(&elsewhere_note("Terminal")),
-        );
-        assert!(
-            terminal.contains("macOS grants Full Disk Access here to Terminal, not aterm"),
-            "{terminal}"
-        );
-        assert!(terminal.lines().count() <= 10, "{terminal}");
-        let unbundled = permissions_table(["not read"; 3], Some(NO_BUNDLE_NOTE));
-        assert!(
-            unbundled
-                .lines()
-                .any(|l| l == format!("  {NO_BUNDLE_NOTE}")),
-            "{unbundled}"
-        );
-        for table in [terminal, unbundled] {
-            assert!(table.lines().all(|l| l.chars().count() <= 100), "{table}");
-        }
-    }
-
-    /// The app macOS holds responsible for this process is another app's unless its bundle id
-    /// reads as aterm's own: one that cannot be read, or an aterm whose own id cannot be, is
-    /// still another app's.
-    #[test]
-    fn the_responsible_app_is_another_apps_unless_its_bundle_id_reads_as_aterms_own() {
-        let aterm = Some("com.aterm.aterm");
-        assert!(!runs_elsewhere(aterm, aterm));
-        assert!(runs_elsewhere(aterm, Some("com.apple.Terminal")));
-        assert!(runs_elsewhere(aterm, None));
-        assert!(runs_elsewhere(None, Some("com.apple.Terminal")));
-        assert!(runs_elsewhere(None, None));
-    }
-
-    /// Each state a probe reads has its own word in the NOW column, and Full Disk Access under
-    /// another app reads `not aterm's`.
-    #[test]
-    fn each_permission_state_reads_as_its_own_word() {
-        use aterm_containment::consent::{DebuggerMode, DevToolListing, FdaState};
-        assert_eq!(
-            permission_words(
-                Some(FdaState::Granted),
-                DevToolListing::On,
-                DebuggerMode::Enabled
-            ),
-            ["granted", "on", "allowed"]
-        );
-        assert_eq!(
-            permission_words(None, DevToolListing::Absent, DebuggerMode::Disabled),
-            ["not aterm's", "not listed", "asks"]
-        );
-        assert_eq!(
-            permission_words(
-                Some(FdaState::Denied),
-                DevToolListing::Off,
-                DebuggerMode::Unrecognized
-            ),
-            ["off", "off", "unknown"]
-        );
-        assert_eq!(
-            permission_words(
-                Some(FdaState::Unknown),
-                DevToolListing::Unknown,
-                DebuggerMode::Unknown
-            ),
-            ["unknown"; 3]
-        );
-    }
-
-    /// The topic index lists every verb and every page that is no verb's exactly once, each
-    /// row naming a page `aterm help` opens and fitting 100 columns; it is the front page outside
-    /// a session and `aterm help topics` (or `index`).
-    #[test]
-    fn the_index_lists_every_verb_and_topic_once_within_100_columns() {
-        let (index, code) = render(Some("topics"), None, None);
-        assert_eq!(code, 0);
-        assert_eq!(render(None, None, None), (index.clone(), 0));
-        assert_eq!(render(Some("index"), None, None), (index.clone(), 0));
-        for line in index.lines() {
-            assert!(
-                line.chars().count() <= 100,
-                "{} columns: {line}",
-                line.chars().count()
-            );
-        }
-        let rows: Vec<&str> = index
-            .lines()
-            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        let mut listed: Vec<&str> = crate::Verb::ALL.iter().map(|v| v.name()).collect();
-        for t in TOPICS {
-            if !listed.contains(&t.name) {
-                listed.push(t.name);
-            }
-        }
-        for name in listed.into_iter().chain(std::iter::once("help")) {
-            let times = rows.iter().filter(|row| **row == name).count();
-            assert_eq!(times, 1, "`{name}` is listed {times} times: {index}");
-        }
-        for name in rows.iter().filter(|name| **name != "help") {
-            let (page, code) = render(Some(name), None, None);
-            assert_eq!(code, 0, "`aterm help {name}` exits {code}");
-            assert!(
-                page.ends_with('\n'),
-                "`aterm help {name}` ends {:?}",
-                page.lines().last()
-            );
-        }
-    }
-
-    /// Where Trust's row says the index publishes no build for this target, every act the
-    /// page names is the local link, never the install that answers "unavailable".
-    #[test]
-    fn an_unserved_trust_is_sent_to_the_local_link_not_the_install() {
-        for line in [
-            rustup_unlinked_row(false, true),
-            trust_install_act(true).to_string(),
-        ] {
-            assert!(
-                line.contains("`aterm pkg link trust <sysroot>")
-                    && line.contains("docs/LINUX-LOCAL-TOOLCHAIN.md")
-                    && !line.contains("pkg install"),
-                "{line}"
-            );
-        }
-        assert_eq!(trust_install_act(false), "`aterm pkg install trust`");
-    }
-    #[test]
-    fn unknown_topic_is_a_usage_error_listing_topics() {
-        let (msg, code) = render(Some("nonesuch"), None, None);
-        assert_eq!(code, 2);
-        assert!(msg.contains("unknown topic") && msg.contains("trust"));
-        assert!(msg.ends_with('\n'), "{msg:?}");
-    }
-
-    /// `aterm help fabric` answers to the words an agent types when it has mail.
-    #[test]
-    fn fabric_topic_answers_to_its_aliases() {
-        let (page, code) = render(Some("fabric"), None, None);
-        assert_eq!(code, 0);
-        for name in [
-            "inbox",
-            "post",
-            "mail",
-            "topic",
-            "say",
-            "broadcast",
-            "messaging",
-        ] {
-            assert_eq!(
-                render(Some(name), None, None),
-                (page.clone(), 0),
-                "`aterm help {name}`"
-            );
-        }
-    }
-
-    /// `aterm help secrets` answers to the words someone types for the
-    /// credentials vault.
-    #[test]
-    fn the_secrets_page_answers_to_its_words() {
-        let (page, code) = render(Some("secrets"), None, None);
-        assert_eq!(code, 0);
-        for name in ["secret", "vault", "credentials"] {
-            assert_eq!(
-                render(Some(name), None, None),
-                (page.clone(), 0),
-                "`aterm help {name}`"
-            );
-        }
-    }
-
-    /// `aterm help workers`, where the brief's WORKERS line leads, answers to
-    /// the words a model types for it.
-    #[test]
-    fn the_workers_page_answers_to_its_words() {
-        let (page, code) = render(Some("workers"), None, None);
-        assert_eq!(code, 0);
-        for name in ["worker", "survey", "result", "subagent", "subagents"] {
-            assert_eq!(
-                render(Some(name), None, None),
-                (page.clone(), 0),
-                "`aterm help {name}`"
-            );
-        }
-    }
-
-    /// `aterm help needs`, where the ❯ item points, answers to the words someone
-    /// types for a need, stepping in and desktop notices.
-    #[test]
-    fn the_needs_page_answers_to_its_words() {
-        let (page, code) = render(Some("needs"), None, None);
-        assert_eq!(code, 0);
-        for name in ["need", "take-over", "takeover", "hand-back", "notify"] {
-            assert_eq!(
-                render(Some(name), None, None),
-                (page.clone(), 0),
-                "`aterm help {name}`"
-            );
-        }
-    }
-}
+#[path = "manual_tests.rs"]
+mod tests;

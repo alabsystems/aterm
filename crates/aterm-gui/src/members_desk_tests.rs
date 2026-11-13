@@ -657,7 +657,7 @@ fn the_undo_row_offers_undo_until_this_mac_signed() {
 }
 
 /// A member the current Commons epochs leave out of control keeps its desk: the lane's read is
-/// [`Local::of`]'s, which its membership log seat alone makes (owner, 2026-11-02), so `aterm ctl
+/// [`Local::of`]'s, which its membership log seat alone makes, so `aterm ctl
 /// members requests` answers, and an asking Mac is greeted by a member that can allow rather than
 /// told this Mac is no member. `left` reads it as a member still, so a read that found no desk
 /// for a moment (a vault pass that held its state past the read's deadline) never drops its desk.

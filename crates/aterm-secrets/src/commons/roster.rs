@@ -409,7 +409,7 @@ impl Access {
                         self.head,
                         self.basis,
                         self.log_heads_digest,
-                        (lock, &crate::fsx::Glance::new()),
+                        crate::client::Under::of(lock, &crate::client::Moment::new(paths)),
                     )
                 }) {
                     Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy => return Err(busy),
@@ -458,7 +458,7 @@ impl Access {
         journal: &Journal,
         look: &crate::client::VaultLook<'_>,
     ) -> crate::Result<bool> {
-        let (Some(paths), Some((lock, glance))) = (&self.log_paths, look.held()) else {
+        let (Some(paths), Some(under)) = (&self.log_paths, look.held()) else {
             return self.is_current_observed(journal);
         };
         if look.paths() != paths {
@@ -472,7 +472,7 @@ impl Access {
                 self.head,
                 self.basis,
                 self.log_heads_digest,
-                (lock, glance),
+                under,
             ) {
                 Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy => return Err(busy),
                 observed => observed.unwrap_or(false),
@@ -499,7 +499,7 @@ impl Access {
                         self.head,
                         self.basis,
                         self.log_heads_digest,
-                        (lock, &crate::fsx::Glance::new()),
+                        crate::client::Under::of(lock, &crate::client::Moment::new(paths)),
                     )?
                 {
                     return Err(Error::new(
@@ -571,9 +571,7 @@ impl Access {
             )));
         }
         let trusted = match look.and_then(|look| look.held_at(paths)) {
-            Some((lock, glance)) => {
-                crate::client::trusted_commons_log_under(paths, self.trust, lock, glance)
-            }
+            Some(under) => crate::client::trusted_commons_log_under(paths, self.trust, under),
             None => crate::client::trusted_commons_log_now(paths, self.trust),
         };
         let log = match trusted {
@@ -1084,7 +1082,11 @@ impl Historical {
                 let lock = observation
                     .state_lock()
                     .ok_or_else(|| Error::new("historical key observation is unavailable"))?;
-                if !self.log_key_is_current(journal, paths, (lock, &crate::fsx::Glance::new()))? {
+                if !self.log_key_is_current(
+                    journal,
+                    paths,
+                    crate::client::Under::of(lock, &crate::client::Moment::new(paths)),
+                )? {
                     return Err(Error::new(
                         "historical key observation is no longer current",
                     ));
@@ -1113,7 +1115,7 @@ impl Historical {
         &self,
         journal: &Journal,
         paths: &crate::client::Paths,
-        under: (&crate::client::StateLock, &crate::fsx::Glance),
+        under: crate::client::Under<'_>,
     ) -> Result<bool> {
         Ok(journal.trust() == self.trust
             && log_observation_is_current(
@@ -1128,6 +1130,9 @@ impl Historical {
     }
 }
 
+/// Whether a log-backed access opened for `trust` and `recipient`, holding `head` and `basis` and
+/// remembering the state digest `remembered`, is current under `under`: judged once for those in
+/// the moment a look stands for ([`crate::client::Under::currency`]), and otherwise now.
 fn log_observation_is_current(
     paths: &crate::client::Paths,
     trust: Trust,
@@ -1135,25 +1140,47 @@ fn log_observation_is_current(
     head: [u8; 32],
     basis: [u8; 32],
     remembered: Option<[u8; 32]>,
-    (lock, glance): (&crate::client::StateLock, &crate::fsx::Glance),
+    under: crate::client::Under<'_>,
 ) -> Result<bool> {
-    // One look at the vault's files for the whole check, `glance` (the caller's, or the look's
-    // of a moment the check stands for: [`crate::fsx::Glance`]): the identity's, the log memo's
-    // stamps and the state digest name many of the same files.
+    let currency = crate::client::Currency {
+        trust,
+        recipient,
+        head,
+        basis,
+        remembered,
+    };
+    under.currency(paths, currency, || judge_currency(paths, currency, under))
+}
+
+/// [`log_observation_is_current`], judged now.
+fn judge_currency(
+    paths: &crate::client::Paths,
+    currency: crate::client::Currency,
+    under: crate::client::Under<'_>,
+) -> Result<bool> {
+    let crate::client::Currency {
+        trust,
+        recipient,
+        head,
+        basis,
+        remembered,
+    } = currency;
+    // One look at the vault's files for the whole check, `under`'s glance (the caller's, or the
+    // look's of a moment the check stands for: [`crate::fsx::Glance`]): the identity's, the log
+    // memo's stamps and the state digest name many of the same files.
     // The recipient alone answers a quiet check, kept while the identity file stands; the
     // identity itself is read only to judge the log afresh.
-    let Some(local) = crate::client::identity_recipient(paths, Some(glance))? else {
+    let Some(local) = crate::client::identity_recipient(paths, Some(under.glance()))? else {
         return Ok(false);
     };
     if recipient.is_some_and(|expected| expected != local) {
         return Ok(false);
     }
-    let Some((log, heads_digest)) =
-        crate::client::trusted_commons_log_under(paths, trust, lock, glance)?
+    let Some((log, heads_digest)) = crate::client::trusted_commons_log_under(paths, trust, under)?
     else {
         return Ok(false);
     };
-    if remembered == Some(commons_log_state_digest(paths, heads_digest, Some(glance))?) {
+    if remembered == Some(commons_log_state_digest(paths, heads_digest, Some(under))?) {
         return Ok(true);
     }
     let Some(identity) = crate::client::read_identity(paths)? else {
@@ -1163,26 +1190,42 @@ fn log_observation_is_current(
         return Ok(false);
     }
     Ok(
-        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock, glance)?
+        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, under)?
             .is_some_and(|fresh| fresh.head == head && fresh.basis == basis),
     )
 }
 
-/// The digest of the state a Commons log observation stands on, each file's `lstat` `glance`'s
-/// where the caller's check looks through one ([`crate::fsx::Glance`]).
+/// The digest of the state a Commons log observation stands on, judged under `under` where the
+/// caller's check judges under one: each file's `lstat` its glance's ([`crate::fsx::Glance`]),
+/// and once for each log's heads in the moment a look stands for
+/// ([`crate::client::Under::log_state`]).
 fn commons_log_state_digest(
     paths: &crate::client::Paths,
     heads_digest: [u8; 32],
-    glance: Option<&crate::fsx::Glance>,
+    under: Option<crate::client::Under<'_>>,
 ) -> Result<[u8; 32]> {
+    let derive = || log_state_digest(paths, heads_digest, under);
+    match under {
+        Some(under) => under.log_state(paths, heads_digest, derive),
+        None => derive(),
+    }
+}
+
+/// [`commons_log_state_digest`], derived now.
+fn log_state_digest(
+    paths: &crate::client::Paths,
+    heads_digest: [u8; 32],
+    under: Option<crate::client::Under<'_>>,
+) -> Result<[u8; 32]> {
+    let glance = under.map(crate::client::Under::glance);
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
     // Each file's digest is kept while the file stands ([`crate::fsx::private_digest`]); the
     // state's is of what it holds but when the vault last heard this Mac and the receipts of its
-    // rounds ([`crate::client::state_standing_in`]), which no access is judged by and which a
-    // round of the vault's subscriber rewrites about every 25 s, each rewrite judging every
-    // remembered access afresh (2026-11-09).
-    let state = crate::client::state_standing_in(paths, glance)?;
+    // rounds ([`crate::client::state_standing_in`]), which no access is judged by and for each
+    // of which the vault's subscriber rewrites the file about once a minute; a round rewrote it about every 25 s when this was measured, each
+    // rewrite judging every remembered access afresh (2026-11-09).
+    let state = crate::client::state_standing_in(paths, under)?;
     let source = crate::fsx::public_digest(
         &paths.dir.join("source.toml"),
         crate::client::MAX_STATE,
@@ -1234,15 +1277,15 @@ fn commons_log_state_digest(
 }
 
 /// Observe current Commons membership and network key from the peer-synced membership log (`F18`),
-/// the state it stands on as the caller's check looked at it (`glance`, [`crate::fsx::Glance`]).
+/// under `under`'s observation of the vault's state lock, the state it stands on as the caller's
+/// check looked at it (`under`'s glance, [`crate::fsx::Glance`]).
 pub(super) fn current_from_loaded_log(
     paths: &crate::client::Paths,
     trust: Trust,
     identity: &Identity,
     log: &crate::membership_log::Log,
     heads_digest: [u8; 32],
-    lock: &crate::client::StateLock,
-    glance: &crate::fsx::Glance,
+    under: crate::client::Under<'_>,
 ) -> Result<Option<Access>> {
     type AccessCacheKey = (Trust, [u8; 32], [u8; 32]);
     type AccessCacheVal = Option<(
@@ -1259,7 +1302,7 @@ pub(super) fn current_from_loaded_log(
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-    let state_digest = commons_log_state_digest(paths, heads_digest, Some(glance))?;
+    let state_digest = commons_log_state_digest(paths, heads_digest, Some(under))?;
     let cache_key = (trust, identity.recipient().0, state_digest);
     if let Ok(cache) = ACCESS_CACHE.lock()
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
@@ -1282,7 +1325,10 @@ pub(super) fn current_from_loaded_log(
             },
         ));
     }
-    if crate::client::local_recipient_denial_held(paths, lock)? {
+    // A miss judges the access afresh (the denial below reads without stamping first), so nothing
+    // derived from it is kept for a look ([`crate::fsx::fresh_looks`]).
+    crate::fsx::look_afresh();
+    if crate::client::local_recipient_denial_held(paths, under.lock())? {
         if let Ok(mut cache) = ACCESS_CACHE.lock() {
             if cache.len() >= 16 {
                 cache.pop_front();
@@ -1307,7 +1353,7 @@ pub(super) fn current_from_loaded_log(
         }
         return Ok(None);
     };
-    let roster = crate::client::local_swarm_roster_for_log_held(paths, log, lock)?;
+    let roster = crate::client::local_swarm_roster_for_log_held(paths, log, under.lock())?;
     let membership = log.membership();
     let mut by_recipient: std::collections::BTreeMap<
         crate::age::Recipient,

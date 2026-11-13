@@ -15,14 +15,16 @@ use super::guard::row_guard;
 /// The rule id of an answered question (the ledger's, the journal's).
 pub const RULE_ANSWER_RECOMMENDED: &str = "answer-recommended@v1";
 
-/// The `long-term` policy text ([`QuestionPriority::LongTerm`]) for a question's free-text row.
+/// The `long-term` policy text ([`super::approval::PriorityWord::LongTerm`]) for a question's
+/// free-text row.
 pub const LONG_TERM_TEXT: &str = "Decide yourself: choose the option that best serves long term \
                                   correctness and total value even at the cost of short term \
                                   deliverables. Say which you chose and why in one line and \
                                   continue without asking again. (Answered by the aterm harness \
                                   by policy. The user was not asked.)";
 
-/// The `short-term` policy text ([`QuestionPriority::ShortTerm`]) for a question's free-text row.
+/// The `short-term` policy text ([`super::approval::PriorityWord::ShortTerm`]) for a question's
+/// free-text row.
 pub const SHORT_TERM_TEXT: &str = "Decide yourself: choose the option that gets the current \
                                    deliverable done soonest at acceptable risk. Say which you \
                                    chose and why in one line and continue without asking again. \
@@ -1552,9 +1554,7 @@ fn stay_on_model(dialog: &QuestionDialog) -> Option<TextChosen> {
         target: AnswerTarget::Option(stay.n),
         typed: false,
         subject: format!("{} → {}", question.text, stay.label),
-        unproven: "a security alert's model switch: stayed on the current model (owner ruling, \
-                   2026-10-16)"
-            .to_string(),
+        unproven: "a security alert's model switch: stayed on the current model".to_string(),
     })
 }
 

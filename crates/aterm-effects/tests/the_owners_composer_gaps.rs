@@ -819,7 +819,7 @@ fn band_rode(s: &Sim, row: u16, col: u16, before: u64) -> bool {
     let before = s.t0 + Duration::from_millis(before);
     s.glow
         .v2_ribbon()
-        .expect("rainbow kitty")
+        .expect("rainbow")
         .cohorts()
         .iter()
         .any(|c| c.row == row && (c.col0..c.col1).contains(&col) && c.born < before)
@@ -970,7 +970,7 @@ fn laid_after(s: &Sim, row: u16, col: u16, at: u64) -> bool {
     let born = s.t0 + Duration::from_millis(at);
     s.glow
         .v2_ribbon()
-        .expect("rainbow kitty")
+        .expect("rainbow")
         .cells()
         .iter()
         .any(|c| c.row == row && c.col == col && c.typing && !c.leaving() && c.born >= born)

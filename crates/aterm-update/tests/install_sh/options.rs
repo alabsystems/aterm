@@ -449,3 +449,42 @@ fn the_config_path_is_atpkgs() {
     );
     assert_eq!(recs[set].out, "/x/aterm/aterm.toml");
 }
+
+#[test]
+fn the_cli_support_plan_names_overrides_and_respects_path_ownership() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let mut calls = Vec::new();
+    for platform in ["Darwin", "Linux"] {
+        for verdict in ["absent", "foreign another-command"] {
+            let call = lib.call(
+                format!(
+                    "( uname() {{ echo {platform}; }}; bin_aterm_verdict() {{ echo {}; }}; \
+                     XDG_DATA_HOME='/custom data' XDG_CONFIG_HOME='/custom config' \
+                     ATERM_MAN_DIR='/custom man' bin_aterm_plan /bin/aterm /store )",
+                    q(verdict)
+                ),
+                &[],
+            );
+            calls.push((platform, verdict, call));
+        }
+    }
+    let records = lib.run(&scratch);
+    for (platform, verdict, call) in calls {
+        let plan = &records[call];
+        assert_eq!(plan.rc, 0, "{}", plan.err);
+        assert!(plan.out.contains("/custom man"));
+        for destination in [
+            "/custom data/bash-completion/completions",
+            "/custom data/zsh/site-functions",
+            "/custom config/fish/completions",
+        ] {
+            assert_eq!(plan.out.contains(destination), verdict == "absent");
+        }
+        assert_eq!(
+            plan.out.contains("/custom data/applications/aterm.desktop"),
+            platform == "Linux"
+        );
+    }
+    assert!(tree(&scratch.join("home")).is_empty());
+}

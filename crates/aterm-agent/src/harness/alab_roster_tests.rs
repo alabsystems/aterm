@@ -97,7 +97,12 @@ fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_opera
             &lab,
             Cli::Claude,
             &existing,
-            &observe::places(Cli::Claude, &existing, None)
+            &observe::sweep::places_of(
+                Cli::Claude,
+                &existing,
+                None,
+                &observe::sweep::OnToken::none()
+            )
         ),
         [(lab.accounts[0].pk.clone(), "borrow")]
     );
@@ -126,7 +131,12 @@ fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_opera
                 &lab,
                 Cli::Claude,
                 &existing,
-                &observe::places(Cli::Claude, &existing, None)
+                &observe::sweep::places_of(
+                    Cli::Claude,
+                    &existing,
+                    None,
+                    &observe::sweep::OnToken::none()
+                )
             )
             .is_empty()
         );
@@ -1245,7 +1255,7 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     };
     let mut pool = row(
         "claude-bbbbbb",
-        Some(Path::new("/scratch/b")),
+        Some(Path::new(at!("/scratch/b"))),
         "bobby",
         Cli::Claude,
     );
@@ -1378,15 +1388,15 @@ fn the_labs_mailbox_decides_the_route_first() {
 /// Mac that lists no account is held by the login found there, a default row whose place holds
 /// another account reports that one and not its own, and only a place nothing was read of is
 /// held by its row.
-/// NEGATIVE CONTROL: with `holdings` taking each place's row and never `place.login.seen` (the
+/// NEGATIVE CONTROL: with `holdings` taking each place's row and never `place.seen` (the
 /// loop over `roster.rows` it replaced), the stale default row reports its own account
 /// (`left: [("ac-0000000000000bob", "borrow")] right: [("ac-0000000000000uni", "fill")]`) and
 /// the Mac with no roster reports nothing (`left: [] right: [("ac-0000000000000uni", "fill")]`).
 #[test]
 fn holdings_follow_the_login_each_place_holds() {
-    use crate::harness::accounts::{AuthRoute, ProcessLogin};
     use crate::harness::journal::ObservedSrc;
-    use crate::harness::observe::{Login, Observation, Observed, Place};
+    use crate::harness::observe::sweep::Place;
+    use crate::harness::observe::{Observation, Observed};
     let keyed = |local: &str, preferred: &[(&str, Option<u64>)]| LabAccount {
         pk: format!("ac-{local:0>16}"),
         ..account(local, Cli::Claude, &format!("claude-{local}"), preferred)
@@ -1402,25 +1412,21 @@ fn holdings_follow_the_login_each_place_holds() {
     };
     fn default_home<'a>(row: Option<&'a Row>, seen: Option<&str>) -> Place<'a> {
         Place {
+            cli: Cli::Claude.into(),
             row,
-            login: Login {
-                who: ProcessLogin {
-                    login: None,
-                    default_home: true,
-                    route: AuthRoute::Stored,
-                },
-                seen: seen.map_or(Observation::Unread, |local| {
-                    Observation::Seen(Observed {
-                        cli: crate::harness::journal::ObservedCli::Pool(Cli::Claude),
-                        region: None,
-                        email: email(local),
-                        key: None,
-                        src: ObservedSrc::Profile,
-                        path: PathBuf::from("/scratch/home/.claude.json"),
-                        mtime: None,
-                    })
-                }),
-            },
+            seen: seen.map_or(Observation::Unread, |local| {
+                Observation::Seen(Observed {
+                    cli: crate::harness::journal::ObservedCli::Pool(Cli::Claude),
+                    region: None,
+                    email: email(local),
+                    key: None,
+                    src: ObservedSrc::Profile,
+                    path: PathBuf::from("/scratch/home/.claude.json"),
+                    mtime: None,
+                })
+            }),
+            fallback: PathBuf::from("/scratch/home/.claude.json"),
+            src: ObservedSrc::Profile,
         }
     }
     let uni = [("ac-0000000000000uni".to_owned(), "fill")];
@@ -1509,7 +1515,7 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
         &lab,
         Cli::Claude,
         &roster,
-        &observe::places(Cli::Claude, &roster, None),
+        &observe::sweep::places_of(Cli::Claude, &roster, None, &observe::sweep::OnToken::none()),
     );
     assert_eq!(
         held,
@@ -1528,7 +1534,12 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
             &unbound,
             Cli::Claude,
             &roster,
-            &observe::places(Cli::Claude, &roster, None)
+            &observe::sweep::places_of(
+                Cli::Claude,
+                &roster,
+                None,
+                &observe::sweep::OnToken::none()
+            )
         )
         .is_empty()
     );

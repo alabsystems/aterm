@@ -18,7 +18,13 @@ use super::{Paths, StateLock, StateObservation};
 use crate::fsx;
 #[cfg(test)]
 use crate::swarm_roster::SwarmRoster;
-use std::{os::unix::fs::MetadataExt as _, path::PathBuf, sync::Mutex};
+use std::{
+    cell::{Cell, Ref, RefCell},
+    collections::VecDeque,
+    os::unix::fs::MetadataExt as _,
+    path::PathBuf,
+    sync::Mutex,
+};
 
 /// How many answers a memo keeps: a process reads one vault folder (a keyed read, a few logs of
 /// it). This crate's own test process (`cfg(test)`), whose tests each read their own folders at
@@ -62,7 +68,7 @@ pub fn swarm_denial_snapshot_now(paths: &Paths) -> crate::Result<super::SwarmDen
 }
 
 /// What [`swarm_denial_snapshot_now`] and [`VaultLook::swarm_denied_nodes`] keep.
-static DENIAL: Memo<super::SwarmDenialSnapshot> = Memo::new(inputs);
+static DENIAL: Memo<super::SwarmDenialSnapshot> = Memo::of(Set::Vault, false);
 
 /// [`observe_commons`](super::observe_commons), read again only when one of the files it reads
 /// ([`observation_inputs`]) was added, removed or changed, or the directory's identity or access
@@ -75,7 +81,7 @@ static DENIAL: Memo<super::SwarmDenialSnapshot> = Memo::new(inputs);
 /// # Errors
 /// As [`observe_commons`](super::observe_commons).
 pub(crate) fn observe_commons_now(paths: &Paths) -> crate::Result<crate::commons::Observation> {
-    static MEMO: Memo<crate::commons::Observation> = Memo::new(observation_inputs);
+    static MEMO: Memo<crate::commons::Observation> = Memo::of(Set::Observation, false);
     MEMO.read(paths, super::observe_commons)
 }
 
@@ -87,8 +93,11 @@ pub(crate) fn observe_commons_now(paths: &Paths) -> crate::Result<crate::commons
 /// (`Bootstrap::revalidate_custody`), 24 times a round on each side of a loopback pair, and each
 /// check read and verified the vault, its log and this Mac's denial again: 14% of a quiet round's
 /// CPU (2026-11-08), and nearly half its reads of the vault, which on a fleet node holds a
-/// megabyte or more. A table-repair replica judges by it, at each round's start, the bootstrap it
-/// keeps from round to round (`Bootstrap::stands`), where each round's open read the vault afresh.
+/// megabyte or more. A table-repair replica judges by it the bootstrap it keeps from round to
+/// round, where each round's open read the vault afresh: through its round's opening batch's look
+/// (`Bootstrap::stands_in`, [`VaultLook::observe_commons`]), or, where that try does not take it
+/// (no try, its admission refused, or the bootstrap fallen through its look), on its own calls
+/// after the try (`Bootstrap::stands`, in `Replica::bootstrap`).
 ///
 /// # Errors
 /// As [`observe_commons`](super::observe_commons).
@@ -97,7 +106,7 @@ pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commo
 }
 
 /// What [`observe_commons_quiet`] and [`VaultLook::observe_commons`] keep.
-static OBSERVATION: Memo<crate::commons::Observation> = Memo::keyed(observation_inputs, true);
+static OBSERVATION: Memo<crate::commons::Observation> = Memo::of(Set::Observation, true);
 
 /// [`local_recipient_denied`](super::steward::local_recipient_denied) of a fresh read, read again
 /// only when one of the files it reads ([`observation_inputs`]) moved; quiet, as
@@ -106,11 +115,11 @@ static OBSERVATION: Memo<crate::commons::Observation> = Memo::keyed(observation_
 /// own denial under its access (`Bootstrap::access_in_observed_with`), 18 times a round on each
 /// side of a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's
 /// CPU (2026-11-08) and a third of its reads of the vault. That access asks it under its caller's
-/// shared observation of the state lock, `lock` (the access's own, or that of the look a session's
-/// admission takes: [`VaultLook`]), which the memo takes for its own as
-/// [`trusted_commons_log_under`] does, and looks up what it kept through that caller's `glance`,
-/// as that log's memo does next ([`fsx::Glance`]); a miss reads and stamps afresh, and keeps its
-/// answer under those stamps. The swarm's checks of this Mac
+/// shared observation of the state lock, `under`'s (the access's own, or that of the look a
+/// session's admission takes: [`VaultLook`]), which the memo takes for its own as
+/// [`trusted_commons_log_under`] does, and looks up what it kept through that caller's look at
+/// each file, as that log's memo does next (`under`'s [`fsx::Glance`]); a miss reads and stamps
+/// afresh, and keeps its answer under those stamps. The swarm's checks of this Mac
 /// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)), but for its
 /// LAN presence ([`swarm_member_heard_now`]), read afresh, so one that cannot read a file it was
 /// settled on takes this Mac as denied. This one, like every
@@ -121,13 +130,9 @@ static OBSERVATION: Memo<crate::commons::Observation> = Memo::keyed(observation_
 ///
 /// # Errors
 /// As [`local_recipient_denied`](super::steward::local_recipient_denied).
-pub(crate) fn local_recipient_denied_under(
-    paths: &Paths,
-    lock: &StateLock,
-    glance: &fsx::Glance,
-) -> crate::Result<bool> {
-    static MEMO: Memo<bool> = Memo::keyed(observation_inputs, true);
-    MEMO.read_keyed_under(paths, &(), lock, glance, |paths| {
+pub(crate) fn local_recipient_denied_under(paths: &Paths, under: Under<'_>) -> crate::Result<bool> {
+    static MEMO: Memo<bool> = Memo::of(Set::Observation, true);
+    MEMO.read_under(paths, &(), under, |paths| {
         super::steward::local_recipient_denied(&super::Reads::new(paths))
     })
 }
@@ -141,9 +146,10 @@ pub(crate) fn local_recipient_denied_under(
 /// `_alab._tcp` advert at each tick of the node's watch: each ask read the vault's status, its
 /// envelope again for the signer's chain and its denial evidence again, about a millisecond of
 /// CPU on a vault the owner's size (measured on Linux arm64), of files the vault's subscriber
-/// rewrites about twice a minute; and kept with `heard` under `state.toml`'s metadata, the
-/// judgement was read again at each of those rewrites, which move `heard` alone: the held vault
-/// twice, 2.38 MB, every 25 s on a Linux arm64 node (2026-11-09).
+/// then rewrote about twice a minute; and kept with `heard` under `state.toml`'s metadata, the
+/// judgement was read again at each of those rewrites, which moved `heard` alone: the held vault
+/// twice, 2.38 MB, every 25 s on a Linux arm64 node (2026-11-09). The subscriber now moves
+/// `heard` about once a minute and leaves a held vault that holds its bytes as it is.
 ///
 /// Quiet, as [`local_swarm_roster_for_log_now`]: while a writer holds the vault's state lock the
 /// fresh read meets it and this Mac is out, as before. What it keeps is a judgement of files that
@@ -170,7 +176,7 @@ pub(crate) fn local_recipient_denied_under(
 /// # Errors
 /// As [`swarm_member_heard`](super::steward::swarm_member_heard).
 pub fn swarm_member_heard_now(paths: &Paths) -> crate::Result<Option<u64>> {
-    static MEMO: Memo<bool, bool> = Memo::keyed(observation_inputs, true);
+    static MEMO: Memo<bool, bool> = Memo::of(Set::Observation, true);
     let member = MEMO.read_keyed(
         paths,
         &super::steward::alab_standing_for_tests(paths),
@@ -237,7 +243,7 @@ pub fn local_swarm_roster_for_log_now(
 /// What [`local_swarm_roster_for_log_now`] and [`VaultLook::local_swarm_roster_for_log`] keep, each
 /// for the log it was read for ([`log_key`]).
 static LOG_ROSTERS: Memo<Option<crate::swarm_roster::SwarmRoster>, LogKey> =
-    Memo::keyed(inputs, true);
+    Memo::of(Set::Vault, true);
 
 /// A log as [`LOG_ROSTERS`] tells it from another: by its heads, which name every record it
 /// holds, and its budgets.
@@ -266,7 +272,7 @@ pub fn acknowledged_commons_log_now(
 /// What [`acknowledged_commons_log_now`], [`trusted_commons_log_under`] and
 /// [`VaultLook::acknowledged_commons_log`] keep.
 static ACKNOWLEDGED: Memo<super::CommonsLog, crate::commons::journal::Trust> =
-    Memo::keyed(inputs, true);
+    Memo::of(Set::Vault, true);
 
 /// [`trusted_commons_log`](super::trusted_commons_log) through
 /// [`acknowledged_commons_log_now`]. A Commons repair round checks its roster access, the log
@@ -283,18 +289,18 @@ pub fn trusted_commons_log_now(
     acknowledged_commons_log_now(paths, trust).map(super::CommonsLog::trusted)
 }
 
-/// [`trusted_commons_log_now`] for a caller that holds `lock`: a roster access check
+/// [`trusted_commons_log_now`] for a caller that holds `under`'s lock: a roster access check
 /// (`commons::roster::log_observation_is_current`) and a table session's access
 /// (`Bootstrap::access_in_observed_with`), each under its caller's shared observation of the
 /// vault's state lock (the check's own, or a table session look's: [`VaultLook`]), ask it at
 /// nearly every step of a repair round, and each ask opened, observed and closed that
 /// lock again: with this Mac's own denial check under the same access
 /// ([`local_recipient_denied_under`]), 7.8% of a sustained quiet round's samples over a long log
-/// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation that guards the
-/// lock at the vault's path as `glance` saw that path ([`StateLock::observes_in`]), it is the
-/// observation the memo would take, so what it kept is given without another. A writer's own
-/// take, or a lock that guards another file, is [`trusted_commons_log_now`]'s call. It looks up
-/// what it kept through the caller's check's look, `glance` ([`fsx::Glance`]); a miss reads as
+/// and 10.4% over a short one (2026-11-08). While that lock is a shared observation that guards
+/// the lock at the vault's path as `under`'s glance saw that path ([`StateLock::observes_in`]), it
+/// is the observation the memo would take, so what it kept is given without another. A writer's
+/// own take, or a lock that guards another file, is [`trusted_commons_log_now`]'s call. It looks
+/// up what it kept through the caller's check's look, `under`'s ([`fsx::Glance`]); a miss reads as
 /// [`trusted_commons_log_now`] does, stamping afresh.
 ///
 /// # Errors
@@ -302,11 +308,10 @@ pub fn trusted_commons_log_now(
 pub(crate) fn trusted_commons_log_under(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
-    lock: &StateLock,
-    glance: &fsx::Glance,
+    under: Under<'_>,
 ) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
     ACKNOWLEDGED
-        .read_keyed_under(paths, &trust, lock, glance, |paths| {
+        .read_under(paths, &trust, under, |paths| {
             super::acknowledged_commons_log(paths, trust)
         })
         .map(super::CommonsLog::trusted)
@@ -329,7 +334,7 @@ pub fn swarm_roster_now_until(
 }
 
 /// What [`swarm_roster_now_until`] and [`VaultLook::swarm_roster_until`] keep.
-static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inputs, true);
+static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::of(Set::Vault, true);
 
 #[cfg(any(test, debug_assertions))]
 std::thread_local! {
@@ -360,60 +365,257 @@ pub fn test_looks_observed() -> usize {
     LOOKS_OBSERVED.with(std::cell::Cell::get)
 }
 
+/// What this thread's looks derived of the moments they stand for ([`Moment`]), since this
+/// thread began: each value computed, and each computed while its look already kept a value of
+/// that field. A value served from what the look kept moves neither.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LookDerivations {
+    /// Every value a look computed, kept or not.
+    pub derived: Derivations,
+    /// Every value a look computed again while it kept a value of that field (for a keyed one,
+    /// under any key; for the stamps, under any record bounds): a look that gives what it kept,
+    /// asked for one key of each field, makes none.
+    pub rederived_after_kept: Derivations,
+}
+
+/// One count for each value a look derives ([`LookDerivations`]).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Derivations {
+    /// Judgements of whether the look's observation guards the lock at the vault's path, through
+    /// its glance ([`StateLock::observes_in`], [`VaultLook::held`]).
+    pub lock_judgments: usize,
+    /// Stamps of the files the deny list's, the roster's, the logs' and the records' memos read
+    /// (`Set::Vault`), for an ask through a look that holds the vault.
+    pub vault_stamps: usize,
+    /// Stamps of the files the Commons observation's and this Mac's own denial's memos read
+    /// (`Set::Observation`), for an ask through a look that holds the vault.
+    pub observation_stamps: usize,
+    /// Looks at `state.toml` as a memo stamps it, for an ask through a look that holds the vault
+    /// ([`Under::state_look`]).
+    pub state_looks: usize,
+    /// Digests of the state a Commons log observation stands on, one for each log's heads
+    /// ([`Under::log_state`]).
+    pub log_states: usize,
+    /// Judgements of a log-backed access's currency, one for each access and record bounds
+    /// ([`Under::currency`]).
+    pub currency: usize,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Derivations {
+    const NONE: Self = Self {
+        lock_judgments: 0,
+        vault_stamps: 0,
+        observation_stamps: 0,
+        state_looks: 0,
+        log_states: 0,
+        currency: 0,
+    };
+
+    /// The count of `value`.
+    fn of(&mut self, value: Derived) -> &mut usize {
+        match value {
+            Derived::LockJudgment => &mut self.lock_judgments,
+            Derived::Stamps(Set::Vault) => &mut self.vault_stamps,
+            Derived::Stamps(Set::Observation) => &mut self.observation_stamps,
+            Derived::StateLook => &mut self.state_looks,
+            Derived::LogState => &mut self.log_states,
+            Derived::Currency => &mut self.currency,
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            lock_judgments: self.lock_judgments - before.lock_judgments,
+            vault_stamps: self.vault_stamps - before.vault_stamps,
+            observation_stamps: self.observation_stamps - before.observation_stamps,
+            state_looks: self.state_looks - before.state_looks,
+            log_states: self.log_states - before.log_states,
+            currency: self.currency - before.currency,
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl LookDerivations {
+    /// What was derived after `before`, a reading of this same thread's counts.
+    #[must_use]
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            derived: self.derived.since(before.derived),
+            rederived_after_kept: self.rederived_after_kept.since(before.rederived_after_kept),
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// What this thread's looks derived ([`test_look_derivations`]).
+    static LOOK_DERIVATIONS: std::cell::Cell<LookDerivations> = const {
+        std::cell::Cell::new(LookDerivations {
+            derived: Derivations::NONE,
+            rederived_after_kept: Derivations::NONE,
+        })
+    };
+}
+
+/// What this thread's looks derived of the moments they stand for ([`LookDerivations`]).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_look_derivations() -> LookDerivations {
+    LOOK_DERIVATIONS.with(std::cell::Cell::get)
+}
+
+/// Count one computation of `value` through a look, made while the look kept a value of that
+/// field where `kept` ([`LookDerivations`]).
+#[cfg(any(test, debug_assertions))]
+fn count_derivation(value: Derived, kept: bool) {
+    LOOK_DERIVATIONS.with(|counts| {
+        let mut now = counts.get();
+        *now.derived.of(value) += 1;
+        if kept {
+            *now.rederived_after_kept.of(value) += 1;
+        }
+        counts.set(now);
+    });
+}
+
+/// A value of the moment a look stands for ([`Moment`]), as [`LookDerivations`] counts them.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy)]
+enum Derived {
+    /// Whether the look's observation guards the lock at the vault's path ([`VaultLook::held`]).
+    LockJudgment,
+    /// The stamps of a set of files ([`Under::stamps`]).
+    Stamps(Set),
+    /// `state.toml` as a memo stamps it ([`Under::state_look`]).
+    StateLook,
+    /// The digest of the state a Commons log observation stands on ([`Under::log_state`]).
+    LogState,
+    /// Whether a log-backed access is current ([`Under::currency`]).
+    Currency,
+}
+
 /// One look at this Mac's vault, for reads that stand for one moment of it: a shared observation
 /// of its state lock, held while the look lives ([`super::Observing`]), and one `lstat` of each
-/// file the memos it asks stamp ([`fsx::Glance`]). Each ask gives what its memo kept for the
-/// files as the look first saw them, and one that misses reads and stamps afresh, as the memo's
-/// own call does. While the look observes the lock no writer holds it and none can take it; a
-/// file that changes all the same (a write that takes no lock, a test's own) keeps the stamps the
-/// look first took of it until the look ends, and the next look stamps it afresh. A look taken
-/// while a writer holds the lock, or where the lock cannot be observed, observes nothing, and each
-/// ask is its memo's own call, which meets that writer as it always did. Whether its observation
-/// guards the lock at the vault's path it judges once too, at its first ask, through its glance
-/// ([`StateLock::observes_in`]): no writer takes the lock while the look observes it, and a lock
-/// file renamed or replaced by something that does not hold the lock at the vault's path is seen
-/// at the next look, as any such file is. Drop it before network I/O or any vault mutation: an
-/// exclusive take of the lock on this thread under it would wait for good, and in a build with
-/// debug assertions panics.
+/// file the memos it asks stamp ([`fsx::Glance`], in the look's [`Moment`]). Each ask gives what
+/// its memo kept for the files as the look first saw them, and one that misses reads and stamps
+/// afresh, as the memo's own call does. While the look observes the lock no writer holds it and
+/// none can take it; a file that changes all the same (a write that takes no lock, a test's own)
+/// keeps the stamps the look first took of it until the look ends, and the next look stamps it
+/// afresh. A look taken while a writer holds the lock, or where the lock cannot be observed,
+/// observes nothing, and each ask is its memo's own call, which meets that writer as it always
+/// did. Whether its observation guards the lock at the vault's path it judges once too, at its
+/// first ask, through its glance ([`StateLock::observes_in`]), and once it found that it does it
+/// judges it no more while it lives ([`Self::held`]); one that found it does not judges again at
+/// the next ask, through the same glance: no writer takes the lock while the look observes it,
+/// and a lock file renamed or replaced by something that does not hold the lock at the vault's
+/// path is seen at the next look, as any such file is. Drop it before network I/O or any vault
+/// mutation: an exclusive take of the lock on this thread under it would wait for good, and in a
+/// build with debug assertions panics.
 ///
-/// A Commons peer check takes one for each stage's reads, as its kernel's model reads each view
-/// at its own stage (`aterm-db`'s `peer_check`): the roster and its deny list, every record this
+/// It stamps each set of files its memos read once too ([`Set`], [`Under::stamps`]), at the first
+/// ask of a memo of that set, and gives those stamps to every later ask of one: a file's stamp is
+/// the `lstat` its glance took first, so stamping it again through the same glance gives the same
+/// stamp, and what else the stamps hold (the records' selection, what `state.toml` holds) comes
+/// from caches keyed by what that glance showed. It looks at `state.toml` once the same way
+/// ([`Under::state_look`]), and digests the state each Commons log observation stands on once for
+/// each log ([`Under::log_state`]): the log's heads, what `state.toml` holds, the digest kept for
+/// what the glance showed of `source.toml`, and what it showed of five more files. It judges each
+/// log-backed access's currency once for what the access was opened for and holds
+/// ([`Under::currency`]), and keeps only whether it is current. It keeps what it took only where
+/// taking it looked at nothing afresh ([`fsx::fresh_looks`]); what it took from a fresh read it
+/// takes again at the next ask, as before. While the file at `.lock` is the inode the look holds,
+/// each writer of the files the state lock guards takes it exclusively, so none of them changes
+/// while the look lives, and a cache refilled after it let an entry go reads them unchanged and
+/// gives what it gave. One ask can still be given what an earlier one took where taking it again
+/// would give otherwise: where a cache entry the first took from was let go or replaced since (by
+/// another thread, or past its bound) and taking it again would meet a transient read fault, a file
+/// changed during the look without the state lock (the device age identity and claim, the fold
+/// mark, the Commons claim, the default pin, the control anchor, a mode or owner change, a process
+/// that ignores the lock), or the lock file replaced after the look's first ask, with a writer
+/// under the new lock. Such an ask could refuse before, and gives the look's first answer now, as
+/// an ask with the cache warm already did; the next look judges afresh. A retained subscriber's
+/// look, which lives across a long-running subscriber's checks (`aterm-db`'s
+/// `with_retained_session`), lets go of what it derived at the start of each of its revalidations
+/// (each `ReadValidation::current`, [`Self::forget_derived`]), so each revalidation derives
+/// afresh and takes a value once only within it; the checks its callers make outside a
+/// revalidation (the currency of the store contexts `Contributor::observe` and
+/// `Contributor::check` judge, which `with_retained_store` makes before its
+/// `ReadValidation::current`) are given what the look last derived, as any ask through it may be
+/// given what an earlier one took. A read batch's look keeps what it derived for the whole batch.
+///
+/// A Commons peer check takes one for every stage it reads itself and keeps it from its first
+/// stage to its last (`aterm-db`'s `peer_check`): the roster and its deny list, every record this
 /// Mac holds, the acknowledged log and that log's roster, and the roster of that log with the
-/// peer's evidence. Each of those reads but the records stamped the same files itself
-/// ([`inputs`]), each but the deny list's (a memo that is not quiet) observing the lock first, and
-/// the records were read afresh, with the configuration, the retained history and the records'
-/// selection behind them: the checks took 13.0% of a sustained quiet round's on-CPU samples over
-/// a long log and 10.9% over a short one, their records reads 4.3% and 4.9% (2026-11-08).
+/// peer's evidence, all asked under one observation of the lock and one look at each of their
+/// files. A stage after a look that holds nothing ([`Self::holds_vault`]) takes one of its own,
+/// and the check lets its look go before an enrollment's own judgement, which reads the vault
+/// itself and may open its Commons custody. Its kernel's model reads each view at its own stage,
+/// and the kept look keeps that true: what moves the records the Held stage reads is written only
+/// under the state lock, which no writer takes while a look that holds the vault lives, so such a
+/// writer's removal lands after the stages read through that look and the next check reads it,
+/// and one that lands before that look is taken is read through it; what changes without the lock
+/// is seen no later than the next check: at the next check where a stage's read stands for the
+/// stamps the look first took, as it is at the next look here, and at the stage that reads afresh
+/// on a memo miss, as before; each such read is made no later than its stage.
 ///
 /// A table repair round's local batch takes one for its session's open and the checks it makes at
-/// once after it (`aterm-db`'s `Replica::observe`): the open's custody
+/// once after it (`aterm-db`'s `Replica::admit`): the open's custody
 /// (`Bootstrap::revalidate_custody_in`) and access (`Bootstrap::access_observed_in_look`), the
 /// currency of its peer and of its observation (`Access::is_current_in`), and its peer's roster
-/// ([`Self::swarm_roster_until`]). A read batch's look is the batch's own source read of the
-/// vault ([`super::CommonsSourceRead::into_look`]), which holds the state lock shared from before
-/// the admission until the batch returns, and its session keeps it (`Session::keep_look`), so
-/// every currency, context and peer check the batch makes judges the vault as its admission did:
-/// each writer of the files the state lock guards takes it exclusively, so none of them changes
-/// within the batch, and what changes without it (the device age identity and claim, under the
-/// Commons custody locks; the fold mark, under none; any other file the custody pins, which its
-/// digests judge through the look as it first saw it) is seen at the next admission, as the
-/// admission's look already saw them once. As the batch decodes a record and probes the history
+/// ([`Self::swarm_roster_until`]); a round's opening batch on the bootstrap its replica keeps
+/// judges through it that bootstrap's vault observation and pinned files' digests, too, as it asks
+/// whether the bootstrap still stands (`Bootstrap::stands_in`, `Replica::opening`), and the rest of
+/// it (the vault's folders, its custody locks and its creation claim) on calls of its own as the
+/// batch runs. A read batch's look is the batch's own source read of the vault
+/// ([`super::CommonsSourceRead::into_look`]), which holds the state lock shared from before the
+/// admission until the batch returns, and its session keeps it (`Session::keep_look`). A round on
+/// a stream shares one look among its read admissions with no call on that stream between them
+/// (`aterm-db`'s `GroupLook`): its group's first admission's source read's, which the round keeps
+/// after that batch returns, where the batch succeeded and its glance first saw the control
+/// anchor settled (`GroupLook::keep`), and lends to each read admission after it
+/// (`Session::lend_look`) until the round's next call on its stream, write admission, witness
+/// read or error, or its end. Each of those
+/// followers reads the control journal itself and asks after that read whether the look's
+/// observation still guards the lock at the vault's path ([`Self::guards_source`]) and whether the
+/// look still shows the control anchor as it first saw it (`Bootstrap::anchor_stands_in`), and
+/// where either does not admits on a look of its own. So every currency, context and peer check
+/// the batch makes judges the vault as its admission, or its group's first, did: each writer of
+/// the files the state lock guards takes it exclusively, so none of them changes within the batch
+/// or the group, and a writer that would take it between a group's admissions waits for the
+/// group to end (`GroupLook`'s BC-34a). What changes without it (the device age identity and
+/// claim, under the Commons custody locks; the fold mark, under none; any other file the custody
+/// pins but the control anchor, which its digests judge through the look as it first saw it) is
+/// seen at the next admission outside a group, and within one at the next group's first admission
+/// or sooner at a fresh check, a follower's reuse of a digest judged against the group's first
+/// `lstat` of the file (`GroupLook`'s BC-34b), as the admission's look already saw them once. As
+/// the batch decodes a record and probes the history
 /// it needs, the record's history and its key judge through it too: the lease of the log's
 /// history, its membership check and its read of the log (`Bootstrap::historicals_in`,
 /// `Bootstrap::holds_histories_in`), and the key's check as the batch takes it
 /// (`Historical::with_key_in`); a handoff a basis falls back to opens on its own calls, as it did.
-/// Each store open's and store read batch's source read of the vault is the batch's own, which
-/// the look stands on, its
+/// Each store open's and store read batch's source read of the vault is the batch's own or, for a
+/// follower, its group's first admission's, which the look stands on, its
 /// custody judged through the look (`Bootstrap::local_source_read_in`): the lock file and the
-/// vault's folder are judged as the batch's source read found them. A store read batch's opening and
-/// closing fences (`Session::read_context`), its closing check of the custody
-/// (`Bootstrap::revalidate_custody`) and its closing check of the keys it reused
-/// (`ReadBatch::revalidate`) read afresh. A write batch's look observes the lock beside its
-/// source reads and ends before the batch runs, whose checks each observe the vault again.
+/// vault's folder are judged as that source read found them. A store read batch's opening
+/// fence (`Session::read_context`) and its closing check of the keys it reused
+/// (`ReadBatch::revalidate`) read afresh, on their own calls; its closing (`Session::close_read`)
+/// judges the custody (`Bootstrap::revalidate_custody_in`) and the session's currency
+/// (`Access::is_current_in`) through one look of its own, made after the read, so that look's
+/// first look at each file follows the read; the closing's fence (`Session::fenced`) then asks
+/// afresh, on its own call, under a generation or an access that is not log-backed. A write
+/// batch's look observes the lock beside its source reads and ends before the batch runs, whose
+/// checks each observe the vault again.
 pub struct VaultLook<'a> {
     paths: &'a Paths,
     observation: Option<super::Observing>,
-    glance: fsx::Glance,
+    moment: Moment<'a>,
 }
 
 impl<'a> VaultLook<'a> {
@@ -440,8 +642,35 @@ impl<'a> VaultLook<'a> {
         Self {
             paths,
             observation,
-            glance: fsx::Glance::new(),
+            moment: Moment::new(paths),
         }
+    }
+
+    /// [`Self::new`], its glance begun at `began` ([`fsx::Glance::begun_at`]): a look that began
+    /// as a file it reads changed, which the settled rule judges by when the glance began.
+    #[cfg(test)]
+    pub(crate) fn begun_at(paths: &'a Paths, began: std::time::SystemTime) -> Self {
+        let mut look = Self::new(paths);
+        look.moment = Moment::begun_at(paths, began);
+        look
+    }
+
+    /// Let go of every value this look derived of its moment ([`Moment`]): the stamps it took of
+    /// each memo's files once for every memo of their set, its look at `state.toml`, the digests of
+    /// the state each Commons log observation stands on, and its judgements of each access's
+    /// currency. It keeps its glance, the `lstat` of each file it looked at first, and whether its
+    /// observation guards the lock at the vault's path ([`Self::held`]), which, once found, every
+    /// later judgement through the same glance finds again. A retained table session calls it at
+    /// the start of each of its revalidations (each `ReadValidation::current`, `aterm-db`'s
+    /// `with_retained_session`), whose look lives across many checks: each revalidation then
+    /// derives what it judges afresh through that glance, as it did before the look kept any of
+    /// it, and a value is taken once only within one revalidation. The checks its callers make
+    /// outside a revalidation (the currency of the store contexts `Contributor::observe` and
+    /// `Contributor::check` judge, which `with_retained_store` makes before its
+    /// `ReadValidation::current`) are given what the look last derived, as the look gives any ask
+    /// what an earlier one took ([`VaultLook`]).
+    pub fn forget_derived(&self) {
+        self.moment.forget();
     }
 
     /// The vault this looks at.
@@ -462,25 +691,40 @@ impl<'a> VaultLook<'a> {
 
     /// The shared observation of the state lock this look holds, while it guards the lock at the
     /// vault's path as the look first saw that path ([`StateLock::observes_in`], through its
-    /// glance), and the look at each file it takes: what a read under its caller's observation
-    /// takes ([`trusted_commons_log_under`], [`local_recipient_denied_under`]). `None` where the
-    /// look observes nothing.
-    pub(crate) fn held(&self) -> Option<(&StateLock, &fsx::Glance)> {
-        self.observation
-            .as_ref()
-            .map(super::Observing::lock)
-            .filter(|lock| lock.observes_in(self.paths, Some(&self.glance)))
-            .map(|lock| (lock, &self.glance))
+    /// glance), with the moment the look stands for ([`Under`]): what a read under its caller's
+    /// observation takes ([`trusted_commons_log_under`], [`local_recipient_denied_under`]). `None`
+    /// where the look observes nothing. It judges that path once: once it found its observation
+    /// guards the lock there, every later call through the same glance would find it again (the
+    /// glance gives the `lstat` of the lock's path it took first, and the observation's descriptor
+    /// names the same file while it lives), so it gives the observation without judging again; a
+    /// judgement that found it does not, or whose `lstat` failed, is made again at the next call.
+    pub(crate) fn held(&self) -> Option<Under<'_>> {
+        let lock = self.observation.as_ref()?.lock();
+        self.moment.hold(lock).then_some(Under {
+            lock,
+            moment: &self.moment,
+        })
+    }
+
+    /// Whether this look's observation guards the lock at its vault's path, as [`Self::held`]
+    /// judges it: through the look's glance until it found that it does, and then without judging
+    /// again. `false` for a look that observes nothing (a writer held the lock when it was taken,
+    /// or the lock could not be observed), or whose observation guards no lock at that path as its
+    /// glance saw it.
+    #[must_use]
+    pub fn holds_vault(&self) -> bool {
+        self.held().is_some()
     }
 
     /// [`Self::held`] where this look is at the vault at `paths`; `None` at another vault.
-    pub(crate) fn held_at(&self, paths: &Paths) -> Option<(&StateLock, &fsx::Glance)> {
+    pub(crate) fn held_at(&self, paths: &Paths) -> Option<Under<'_>> {
         self.held().filter(|_| self.paths == paths)
     }
 
     /// [`observe_commons_quiet`] through this look: a table session's check of its custody at its
     /// open, and at each store open and store read batch of a read batch that keeps the look
-    /// (`Bootstrap::revalidate_custody_in`).
+    /// (`Bootstrap::revalidate_custody_in`), and a table-repair round's judgement of the bootstrap
+    /// its replica keeps through its opening batch's look (`Bootstrap::stands_in`).
     ///
     /// # Errors
     /// As [`observe_commons`](super::observe_commons).
@@ -488,18 +732,17 @@ impl<'a> VaultLook<'a> {
         self.ask(&OBSERVATION, &(), super::observe_commons)
     }
 
-    /// `memo`'s answer for `key` through this look: under its observation and its glance
-    /// ([`Memo::read_keyed_under`]), or, where it observes nothing, the memo's own call.
+    /// `memo`'s answer for `key` through this look: under its observation and its moment
+    /// ([`Memo::read_under`]), or, where it observes nothing or its observation guards no lock
+    /// at the vault's path ([`Self::held`]), the memo's own call.
     fn ask<T: Clone, K: Clone + PartialEq>(
         &self,
         memo: &Memo<T, K>,
         key: &K,
         read: impl FnOnce(&Paths) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        match &self.observation {
-            Some(observing) => {
-                memo.read_keyed_under(self.paths, key, observing.lock(), &self.glance, read)
-            }
+        match self.held() {
+            Some(under) => memo.read_under(self.paths, key, under, read),
             None => memo.read_keyed(self.paths, key, read),
         }
     }
@@ -580,6 +823,371 @@ impl<'a> VaultLook<'a> {
     }
 }
 
+/// What one look at the vault ([`VaultLook`]) takes of the moment it stands for: one `lstat` of
+/// each file its checks look at ([`fsx::Glance`]), whether its observation guards the lock at the
+/// vault's path ([`VaultLook::held`]), the stamps of each set of files its memos read
+/// ([`Under::stamps`]), its look at `state.toml` ([`Under::state_look`]), the digest of the state
+/// each Commons log observation stands on ([`Under::log_state`]), and whether each access judged
+/// through it is current ([`Under::currency`]). It lives and dies with its look. A check made on
+/// its own call, under an observation of its own, takes a moment of its own ([`Moment::new`],
+/// through [`Under::of`]), which judges nothing for later asks: each of them is judged where it is
+/// asked, as before.
+pub(crate) struct Moment<'p> {
+    paths: &'p Paths,
+    glance: fsx::Glance,
+    /// Whether the look's observation was judged to guard the lock at the vault's path through
+    /// `glance` ([`Self::hold`]); set only to `true`, and only by its look.
+    held: Cell<bool>,
+    /// Where the look's observation (its [`StateLock`]) stood when its look last gave it out
+    /// ([`VaultLook::held`]): an [`Under`] stands for this moment only beside that very lock
+    /// ([`Self::caching_for`]), whatever other lock a caller puts beside it.
+    lock: Cell<usize>,
+    /// The stamps of [`Set::Vault`]'s files ([`Under::stamps`]) as the look first took them, with
+    /// the record bounds they were taken under; kept only where taking them looked at nothing
+    /// afresh ([`fsx::fresh_looks`]).
+    vault: RefCell<Option<(RecordBounds, InputStamps)>>,
+    /// The stamps of [`Set::Observation`]'s files, kept as `vault`'s are.
+    observation: RefCell<Option<(RecordBounds, InputStamps)>>,
+    /// `state.toml` as a memo stamps it ([`Under::state_look`]), kept as `vault` is.
+    state: Cell<Option<StateLook>>,
+    /// The digest of the state each Commons log observation stands on, by the digest of the log's
+    /// heads ([`Under::log_state`]), kept as `vault` is: [`MAX_LOG_STATES`] of them, the oldest
+    /// let go first.
+    log_states: RefCell<VecDeque<([u8; 32], [u8; 32])>>,
+    /// Whether each log-backed access judged through the look is current, by what it was judged
+    /// for and the record bounds it was judged under ([`Under::currency`]), kept as `vault` is:
+    /// [`MAX_LOG_STATES`] of them, the oldest let go first.
+    currency: RefCell<VecDeque<((Currency, RecordBounds), bool)>>,
+}
+
+/// How many logs' state digests, and how many accesses' currency, a look keeps
+/// ([`Moment::log_states`], [`Moment::currency`]): a check judges one log or two and an access or
+/// two, and one let go is derived again.
+const MAX_LOG_STATES: usize = 8;
+
+/// What a judgement of a log-backed access's currency (`commons::roster`'s
+/// `log_observation_is_current`) is judged for: the trust and recipient it was opened for, the
+/// head and basis it holds, and the digest of the state it remembers. A look keeps a judgement by
+/// these and this thread's record bounds ([`Under::currency`]); it holds no key and no access.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Currency {
+    pub(crate) trust: crate::commons::journal::Trust,
+    pub(crate) recipient: Option<crate::age::Recipient>,
+    pub(crate) head: [u8; 32],
+    pub(crate) basis: [u8; 32],
+    pub(crate) remembered: Option<[u8; 32]>,
+}
+
+impl<'p> Moment<'p> {
+    /// A moment of the vault at `paths` that has looked at nothing and judged nothing yet.
+    pub(crate) fn new(paths: &'p Paths) -> Self {
+        Self::looking(paths, fsx::Glance::new())
+    }
+
+    /// [`Self::new`], its glance begun at `began` ([`fsx::Glance::begun_at`]).
+    #[cfg(test)]
+    fn begun_at(paths: &'p Paths, began: std::time::SystemTime) -> Self {
+        Self::looking(paths, fsx::Glance::begun_at(began))
+    }
+
+    fn looking(paths: &'p Paths, glance: fsx::Glance) -> Self {
+        Self {
+            paths,
+            glance,
+            held: Cell::new(false),
+            lock: Cell::new(0),
+            vault: RefCell::new(None),
+            observation: RefCell::new(None),
+            state: Cell::new(None),
+            log_states: RefCell::new(VecDeque::new()),
+            currency: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    /// Where the stamps of `set`'s files are kept.
+    const fn stamps_of(&self, set: Set) -> &RefCell<Option<(RecordBounds, InputStamps)>> {
+        match set {
+            Set::Vault => &self.vault,
+            Set::Observation => &self.observation,
+        }
+    }
+
+    /// Let go of every value derived of this moment but its glance and its judgement of its
+    /// look's observation ([`VaultLook::forget_derived`]).
+    fn forget(&self) {
+        self.vault.take();
+        self.observation.take();
+        self.state.take();
+        self.log_states.take();
+        self.currency.take();
+    }
+
+    /// Whether `lock`, the observation of this moment's look, guards the lock at the vault's path
+    /// through this moment's glance ([`StateLock::observes_in`]): judged until it does, and then
+    /// never again ([`VaultLook::held`]). It records where `lock` stands, which a borrow of the
+    /// look keeps there while the [`Under`] given with it lives.
+    fn hold(&self, lock: &StateLock) -> bool {
+        if !self.held.get() {
+            #[cfg(any(test, debug_assertions))]
+            count_derivation(Derived::LockJudgment, self.held.get());
+            if !lock.observes_in(self.paths, Some(&self.glance)) {
+                return false;
+            }
+            self.held.set(true);
+        }
+        self.lock.set(address(lock));
+        true
+    }
+
+    /// Whether what this moment judged stands for an ask of the vault at `paths` made under
+    /// `lock`: its look found its observation guards the lock at the vault's path, `lock` is that
+    /// very observation (the same address, as [`std::ptr::eq`] compares), and `paths` are the
+    /// look's.
+    fn caching_for(&self, paths: &Paths, lock: &StateLock) -> bool {
+        self.held.get()
+            && self.lock.get() == address(lock)
+            && (std::ptr::eq(self.paths, paths) || self.paths == paths)
+    }
+}
+
+/// Where `lock` stands in memory: one lock's, while it lives, and no other's.
+fn address(lock: &StateLock) -> usize {
+    std::ptr::from_ref(lock).addr()
+}
+
+/// A shared observation of the vault's state lock and the moment a check judges under it: a
+/// look's own ([`VaultLook::held`]), whose moment stands for every check made through the look,
+/// or a check's own observation with a moment of its own ([`Self::of`]), which judges each ask
+/// where it is asked.
+#[derive(Clone, Copy)]
+pub(crate) struct Under<'m> {
+    lock: &'m StateLock,
+    moment: &'m Moment<'m>,
+}
+
+impl<'m> Under<'m> {
+    /// `lock`, a caller's own observation, with `moment`, one of its own ([`Moment::new`]).
+    pub(crate) const fn of(lock: &'m StateLock, moment: &'m Moment<'m>) -> Self {
+        Self { lock, moment }
+    }
+
+    /// The observation.
+    pub(crate) const fn lock(self) -> &'m StateLock {
+        self.lock
+    }
+
+    /// The moment's look at each file.
+    pub(crate) const fn glance(self) -> &'m fsx::Glance {
+        &self.moment.glance
+    }
+
+    /// Whether the moment's judgement of its look's observation stands for an ask of the vault
+    /// at `paths` under this observation ([`Moment::caching_for`]).
+    fn caching_for(self, paths: &Paths) -> bool {
+        self.moment.caching_for(paths, self.lock)
+    }
+
+    /// The stamps of `set`'s files ([`Set::inputs`]) through the moment's glance, as a memo of
+    /// that set stamps them ([`stamp_memo_inputs_in`], with the records' selection): those the
+    /// moment kept under this thread's record bounds, and otherwise taken now, and kept where
+    /// taking them looked at nothing afresh ([`fsx::fresh_looks`]: every `lstat` a first one of
+    /// the glance, every other input a hit of a cache keyed by what those showed) and none are
+    /// kept yet. [`Set::Observation`]'s are [`Set::Vault`]'s, from the moment where it kept them,
+    /// with the device files' [`device_files`] after them: the files [`observation_inputs`] names
+    /// in its order, so the same stamps the flat ones are. For an ask whose [`Under`] stands for
+    /// its look's moment ([`Self::caching_for`]).
+    fn stamps(self, set: Set) -> Option<Stamps<'m>> {
+        let moment = self.moment;
+        let cell = moment.stamps_of(set);
+        let bounds = record_bounds();
+        let kept = |cell: Ref<'m, Option<(RecordBounds, InputStamps)>>| {
+            Ref::filter_map(cell, |kept| {
+                kept.as_ref()
+                    .filter(|(at, _)| *at == bounds)
+                    .map(|(_, stamps)| stamps)
+            })
+            .ok()
+        };
+        if let Some(stamps) = kept(cell.borrow()) {
+            return Some(Stamps::Kept(stamps));
+        }
+        #[cfg(any(test, debug_assertions))]
+        count_derivation(Derived::Stamps(set), cell.borrow().is_some());
+        let before = fsx::fresh_looks();
+        let stamps = match set {
+            Set::Vault => stamp_memo_inputs_with(
+                moment.paths,
+                set.inputs(),
+                true,
+                Some(&moment.glance),
+                || self.state_look(),
+            ),
+            Set::Observation => self
+                .stamps(Set::Vault)
+                .and_then(|base| with_device_files(&base, moment.paths, &moment.glance)),
+        }?;
+        if fsx::fresh_looks() != before || cell.borrow().is_some() {
+            return Some(Stamps::Taken(stamps));
+        }
+        *cell.borrow_mut() = Some((bounds, stamps));
+        kept(cell.borrow()).map(Stamps::Kept)
+    }
+
+    /// `state.toml` as a memo stamps it ([`state_look`]) through the moment's glance: the look the
+    /// moment kept, and otherwise taken now, and kept where taking it looked at nothing afresh
+    /// ([`fsx::fresh_looks`]: the file's first `lstat` the glance's, and a look kept for that
+    /// stamp). For an ask whose [`Under`] stands for its look's moment ([`Self::caching_for`]).
+    fn state_look(self) -> Option<StateLook> {
+        let moment = self.moment;
+        if let Some(look) = moment.state.get() {
+            return Some(look);
+        }
+        #[cfg(any(test, debug_assertions))]
+        count_derivation(Derived::StateLook, moment.state.get().is_some());
+        let before = fsx::fresh_looks();
+        let look = state_look(moment.paths, Some(&moment.glance))?;
+        if fsx::fresh_looks() == before {
+            moment.state.set(Some(look));
+        }
+        Some(look)
+    }
+
+    /// The digest of the state a Commons log observation of the vault at `paths` whose heads
+    /// digest to `heads` stands on, `derive`d through this observation and its glance
+    /// (`commons_log_state_digest`): where this [`Under`] stands for its look's moment
+    /// ([`Self::caching_for`]), the digest the moment kept for `heads`, and otherwise derived now,
+    /// and kept where deriving it looked at nothing afresh ([`fsx::fresh_looks`]: each file's
+    /// first `lstat` the glance's, each digest one kept for what that `lstat` showed). An error is
+    /// never kept.
+    ///
+    /// # Errors
+    /// As `derive`.
+    pub(crate) fn log_state(
+        self,
+        paths: &Paths,
+        heads: [u8; 32],
+        derive: impl FnOnce() -> crate::Result<[u8; 32]>,
+    ) -> crate::Result<[u8; 32]> {
+        if !self.caching_for(paths) {
+            return derive();
+        }
+        let states = &self.moment.log_states;
+        if let Some(digest) = held(states, &heads) {
+            return Ok(digest);
+        }
+        #[cfg(any(test, debug_assertions))]
+        count_derivation(Derived::LogState, !states.borrow().is_empty());
+        let before = fsx::fresh_looks();
+        let digest = derive()?;
+        if fsx::fresh_looks() == before {
+            keep(states, heads, digest);
+        }
+        Ok(digest)
+    }
+
+    /// Whether a log-backed access judged for `currency` is current, `judge`d through this
+    /// observation and its glance (`commons::roster`'s `log_observation_is_current`): where this
+    /// [`Under`] stands for its look's moment ([`Self::caching_for`]), the judgement the moment
+    /// kept for `currency` under this thread's record bounds, and otherwise judged now, and kept
+    /// where judging it looked at nothing afresh ([`fsx::fresh_looks`]: each file's first `lstat`
+    /// the glance's, each read a hit of a cache keyed by what those showed). An error is never
+    /// kept, nor any key or access: only whether it is current.
+    ///
+    /// # Errors
+    /// As `judge`.
+    pub(crate) fn currency(
+        self,
+        paths: &Paths,
+        currency: Currency,
+        judge: impl FnOnce() -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        if !self.caching_for(paths) {
+            return judge();
+        }
+        let judged = &self.moment.currency;
+        let key = (currency, record_bounds());
+        if let Some(current) = held(judged, &key) {
+            return Ok(current);
+        }
+        #[cfg(any(test, debug_assertions))]
+        count_derivation(Derived::Currency, !judged.borrow().is_empty());
+        let before = fsx::fresh_looks();
+        let current = judge()?;
+        if fsx::fresh_looks() == before {
+            keep(judged, key, current);
+        }
+        Ok(current)
+    }
+}
+
+/// The value `kept` holds for `key`.
+fn held<K: PartialEq, V: Copy>(kept: &RefCell<VecDeque<(K, V)>>, key: &K) -> Option<V> {
+    kept.borrow()
+        .iter()
+        .find(|(at, _)| at == key)
+        .map(|(_, value)| *value)
+}
+
+/// Keep `value` for `key` in `kept` where nothing is kept for it yet (a derivation within the one
+/// that derived `value` may have kept one), the oldest let go past [`MAX_LOG_STATES`].
+fn keep<K: PartialEq, V: Copy>(kept: &RefCell<VecDeque<(K, V)>>, key: K, value: V) {
+    if held(kept, &key).is_some() {
+        return;
+    }
+    let mut kept = kept.borrow_mut();
+    if kept.len() >= MAX_LOG_STATES {
+        kept.pop_front();
+    }
+    kept.push_back((key, value));
+}
+
+/// `base`, the stamps of [`Set::Vault`]'s files through `glance`, with the stamps of the device
+/// files ([`device_files`]) through it after them: the stamps of [`Set::Observation`]'s, as
+/// [`stamp_memo_inputs_in`] takes them (`None` where an `lstat` fails, as there).
+fn with_device_files(
+    base: &InputStamps,
+    paths: &Paths,
+    glance: &fsx::Glance,
+) -> Option<InputStamps> {
+    let device = device_files(paths)
+        .iter()
+        .map(|path| match fsx::lstat_in(Some(glance), path) {
+            Ok(meta) => Some(meta.as_ref().map(Stamp::of)),
+            Err(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(InputStamps {
+        stamps: FileStamps {
+            directory: base.stamps.directory,
+            files: base.stamps.files.iter().copied().chain(device).collect(),
+        },
+        records: base.records.clone(),
+        state: base.state,
+    })
+}
+
+/// A memo's stamps of its inputs through a look ([`Memo::stamps_in`]): those its moment kept, or
+/// those taken for this ask.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one lives on the stack for one ask; boxing the taken stamps would allocate for every ask a look does not keep, which stamps taken by value never did"
+)]
+enum Stamps<'m> {
+    Kept(Ref<'m, InputStamps>),
+    Taken(InputStamps),
+}
+
+impl std::ops::Deref for Stamps<'_> {
+    type Target = InputStamps;
+
+    fn deref(&self) -> &InputStamps {
+        match self {
+            Self::Kept(stamps) => stamps,
+            Self::Taken(stamps) => stamps,
+        }
+    }
+}
+
 /// Every record this Mac holds ([`load_records`](super::load_records)) from the memo a look's
 /// records ask ([`VaultLook::records`]), as that memo's own call: read again when a file it stamps
 /// moved, and afresh while a writer holds the vault. A Commons frontier pass read them afresh
@@ -593,7 +1201,7 @@ pub fn records_now(paths: &Paths) -> crate::Result<crate::membership_log::Store>
 }
 
 /// What [`VaultLook::records`] and [`records_now`] keep.
-static RECORDS: Memo<crate::membership_log::Store> = Memo::keyed(inputs, true);
+static RECORDS: Memo<crate::membership_log::Store> = Memo::of(Set::Vault, true);
 
 /// The files [`swarm_denied_nodes`](super::swarm_denied_nodes) and
 /// [`swarm_roster_until`](super::swarm_roster_until) take their answer from: the configured source
@@ -626,9 +1234,35 @@ pub(super) fn inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
 /// [`inputs`], and the Commons device files that denial check reads to bind this Mac's own node.
 pub(super) fn observation_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
     let mut files = inputs(paths)?;
-    let device = paths.dir.join("commons");
-    files.extend([device.join("device.age"), device.join("device.claim")]);
+    files.extend(device_files(paths));
     Some(files)
+}
+
+/// The Commons device files [`observation_inputs`] adds to [`inputs`], in its order: this Mac's
+/// device age identity and the claim it is held to.
+fn device_files(paths: &Paths) -> [PathBuf; 2] {
+    let device = paths.dir.join("commons");
+    [device.join("device.age"), device.join("device.claim")]
+}
+
+/// The two sets of files the vault's memos stamp ([`Memo::of`]), which a look stamps once each for
+/// every memo it asks ([`Under::stamps`]).
+#[derive(Clone, Copy)]
+enum Set {
+    /// [`inputs`]: the deny list's, the roster's, the logs' and the records'.
+    Vault,
+    /// [`observation_inputs`]: the Commons observation's and this Mac's own denial's.
+    Observation,
+}
+
+impl Set {
+    /// The files this set names.
+    const fn inputs(self) -> fn(&Paths) -> Option<Vec<PathBuf>> {
+        match self {
+            Self::Vault => inputs,
+            Self::Observation => observation_inputs,
+        }
+    }
 }
 
 /// The files the members desk reads this Mac's membership from ([`desk_files`]), stamped as the
@@ -638,10 +1272,11 @@ pub(super) fn observation_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
 /// [`undo_offers`]'s rows) need not read them again while they stand as they were. Equal only to
 /// the stamps of the same files unchanged, and the same state but for when the vault last heard
 /// this Mac and the receipts of its last rounds, which no part of the desk's answer is read from:
-/// a round of the vault's subscriber rewrites `state.toml` about every 25 s (Linux arm64,
-/// 2026-11-09), and each rewrite read the desk again: 26 MB on that member's automatic admission,
-/// 14.4 MB and 10 ms of CPU on a fixture member whose envelope is 1.2 MB, where taking these
-/// stamps reads 1.3 KB in 30 µs.
+/// the vault's subscriber rewrites `state.toml` for each of those about once a minute (a round
+/// rewrote it about every 25 s when this was measured, Linux arm64, 2026-11-09), and each
+/// rewrite read the desk again: 26 MB on that member's automatic admission, 14.4 MB and 10 ms of
+/// CPU on a fixture member whose envelope is 1.2 MB, where taking these stamps reads 1.3 KB in
+/// 30 µs.
 ///
 /// [`Local::of`]: crate::members::desk::Local::of
 /// [`undo_offers`]: super::undo_offers
@@ -704,6 +1339,7 @@ pub(super) fn desk_files(paths: &Paths) -> Option<Vec<PathBuf>> {
     files.push(paths.dir.join(crate::members::lab_lan::FILE));
     let mut folders = vec![control];
     while let Some(folder) = folders.pop() {
+        fsx::look_afresh();
         let entries = match std::fs::read_dir(&folder) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -768,6 +1404,7 @@ struct DirectoryStamp {
 
 /// The vault directory and each of a set of files as they stood ([`stamp_files`]).
 #[derive(PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct FileStamps {
     directory: Option<DirectoryStamp>,
     files: Vec<Option<Stamp>>,
@@ -775,6 +1412,7 @@ pub(super) struct FileStamps {
 
 /// [`FileStamps`] of a memo's inputs, with the membership records' selection ([`stamp_inputs`]).
 #[derive(PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct InputStamps {
     stamps: FileStamps,
     /// Every file the selection of the membership records' data is judged by, which each read
@@ -851,15 +1489,28 @@ fn stamp_inputs_in(
 /// [`stamp_inputs_in`] as a memo stamps its inputs ([`Memo::stamps`]): `state.toml`, where they
 /// name it, by what it holds but `heard` and the rounds' receipts ([`state_look`]), which no
 /// memo's answer is read from (a memo that gives `heard`, [`swarm_member_heard_now`], reads it
-/// apart), and every other file by its metadata. A round of the vault's subscriber rewrites
-/// `state.toml` about every 25 s for those fields alone (Linux arm64, 2026-11-09), and each
-/// rewrite read every memo here again: on a fleet node, the deny list its watch asks every two
-/// seconds read the held vault five times over, and its LAN presence twice.
+/// apart), and every other file by its metadata. The vault's subscriber rewrites `state.toml`
+/// for each of those fields alone about once a minute (a round rewrote it about every 25 s when
+/// this was measured, Linux arm64, 2026-11-09), and each rewrite read every memo here again: on a
+/// fleet node, the deny list its watch asks every two seconds read the held vault five times
+/// over, and its LAN presence twice.
 fn stamp_memo_inputs_in(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
     records: bool,
     glance: Option<&fsx::Glance>,
+) -> Option<InputStamps> {
+    stamp_memo_inputs_with(paths, inputs, records, glance, || state_look(paths, glance))
+}
+
+/// [`stamp_memo_inputs_in`], `state.toml`'s look `state`'s where the inputs name it: a look's own
+/// ([`Under::state_look`]), or [`state_look`] through `glance`.
+fn stamp_memo_inputs_with(
+    paths: &Paths,
+    inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    records: bool,
+    glance: Option<&fsx::Glance>,
+    state: impl FnOnce() -> Option<StateLook>,
 ) -> Option<InputStamps> {
     let mut files = inputs(paths)?;
     let state_file = paths.state_file();
@@ -869,7 +1520,7 @@ fn stamp_memo_inputs_in(
         stamps: stamp_paths_in(paths, &files, glance)?,
         records: records_standing(paths, records, glance)?,
         state: if files.len() < named {
-            Some(state_look(paths, glance)?.standing)
+            Some(state()?.standing)
         } else {
             None
         },
@@ -939,19 +1590,30 @@ fn stamp_paths_in(
     Some(FileStamps { directory, files })
 }
 
-/// [`state_standing`](super::state_standing) at `paths`, its `lstat` `glance`'s where the caller
-/// looks through one: what the file read to while it shows the stamp it shows now
-/// ([`state_look`]), and a fresh read otherwise.
+/// [`state_standing`](super::state_standing) at `paths`, its `lstat` the glance's of `under`
+/// where the caller looks through one: what the file read to while it shows the stamp it shows
+/// now ([`state_look_in`]), and a fresh read otherwise.
 ///
 /// # Errors
 /// `state.toml` cannot be read.
 pub(crate) fn state_standing_in(
     paths: &Paths,
-    glance: Option<&fsx::Glance>,
+    under: Option<Under<'_>>,
 ) -> crate::Result<Option<[u8; 32]>> {
-    match state_look(paths, glance) {
-        Some(look) => Ok(look.standing),
-        None => Ok(super::state_standing_heard(paths)?.map(|(standing, _)| standing)),
+    if let Some(look) = state_look_in(paths, under) {
+        return Ok(look.standing);
+    }
+    fsx::look_afresh();
+    Ok(super::state_standing_heard(paths)?.map(|(standing, _)| standing))
+}
+
+/// `state.toml` at `paths` as a memo stamps it ([`state_look`]), under `under` where the caller
+/// judges under one: its look's own where it stands for its look's moment
+/// ([`Under::state_look`]), and otherwise taken through its glance, or afresh with none.
+fn state_look_in(paths: &Paths, under: Option<Under<'_>>) -> Option<StateLook> {
+    match under {
+        Some(under) if under.caching_for(paths) => under.state_look(),
+        Some(_) | None => state_look(paths, under.map(Under::glance)),
     }
 }
 
@@ -1050,6 +1712,9 @@ fn record_bounds() -> RecordBounds {
 struct Memo<T, K = ()> {
     /// The files the read takes its answer from.
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    /// The set `inputs` is, where it is one ([`Memo::of`]), whose stamps a look takes once for
+    /// every memo of that set it asks ([`Memo::stamps_in`]).
+    set: Option<Set>,
     /// Whether the read opens the membership records, whose selection is stamped beside
     /// `inputs` ([`stamp_inputs`]): every memo's but [`config_now`]'s.
     records: bool,
@@ -1067,6 +1732,7 @@ struct Memo<T, K = ()> {
 }
 
 impl<T: Clone> Memo<T> {
+    #[cfg(test)]
     const fn new(inputs: fn(&Paths) -> Option<Vec<PathBuf>>) -> Self {
         Self::keyed(inputs, false)
     }
@@ -1081,25 +1747,34 @@ impl<T: Clone> Memo<T> {
 }
 
 impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
-    /// A memo of a read whose answer depends on `inputs` and on a key its caller names (the
-    /// membership log a roster is read for); `quiet` as [`Memo::quiet`] says.
-    const fn keyed(inputs: fn(&Paths) -> Option<Vec<PathBuf>>, quiet: bool) -> Self {
-        Self::reading(inputs, true, quiet)
+    /// A memo of a read whose answer depends on the files of `set` and on a key its caller names
+    /// (the membership log a roster is read for); `quiet` as [`Memo::quiet`] says.
+    const fn of(set: Set, quiet: bool) -> Self {
+        Self::reading(set.inputs(), Some(set), true, quiet)
     }
 
-    /// [`Memo::keyed`] for a read that opens no membership record, so its records' selection is
-    /// not stamped: a record that arrives reads nothing again.
+    /// [`Memo::of`] for files of no set: a test's own.
+    #[cfg(test)]
+    const fn keyed(inputs: fn(&Paths) -> Option<Vec<PathBuf>>, quiet: bool) -> Self {
+        Self::reading(inputs, None, true, quiet)
+    }
+
+    /// A memo of a read that depends on `inputs` (files of no set) and opens no membership
+    /// record, so its records' selection is not stamped: a record that arrives reads nothing
+    /// again; `quiet` as [`Memo::quiet`] says.
     const fn unrecorded(inputs: fn(&Paths) -> Option<Vec<PathBuf>>, quiet: bool) -> Self {
-        Self::reading(inputs, false, quiet)
+        Self::reading(inputs, None, false, quiet)
     }
 
     const fn reading(
         inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+        set: Option<Set>,
         records: bool,
         quiet: bool,
     ) -> Self {
         Self {
             inputs,
+            set,
             records,
             quiet,
             held: Mutex::new(Vec::new()),
@@ -1112,6 +1787,17 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
     /// The stamps of this memo's inputs now ([`stamp_memo_inputs_in`]).
     fn stamps(&self, paths: &Paths, glance: Option<&fsx::Glance>) -> Option<InputStamps> {
         stamp_memo_inputs_in(paths, self.inputs, self.records, glance)
+    }
+
+    /// The stamps of this memo's inputs through `under`'s glance: where the memo's inputs are a
+    /// set and `under` stands for its look's moment ([`Under::caching_for`]), those the look
+    /// takes once for every memo of that set ([`Under::stamps`]), and otherwise taken for this ask
+    /// ([`Self::stamps`]).
+    fn stamps_in<'m>(&self, paths: &Paths, under: Under<'m>) -> Option<Stamps<'m>> {
+        match self.set {
+            Some(set) if under.caching_for(paths) => under.stamps(set),
+            Some(_) | None => self.stamps(paths, Some(under.glance())).map(Stamps::Taken),
+        }
     }
 
     /// The answer kept for `paths` and `key` under exactly `stamps`, read under this thread's
@@ -1132,27 +1818,30 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
             .map(|held| held.answer.clone())
     }
 
-    /// [`Memo::read_keyed`] for a caller that holds `lock`. While that is a shared observation of
-    /// the state lock that guards the lock at the vault's path as `glance` saw it
-    /// ([`StateLock::observes_in`]), no writer holds that lock and none can write until the caller drops it: a quiet memo takes it
-    /// for the one `read_keyed` takes before its stamps, and any memo gives what it kept under the
-    /// stamps of `glance`, the look of the caller's check, which stamps each file once for every
-    /// memo the check asks ([`fsx::Glance`]). Anything else, a miss included, is `read_keyed`'s,
-    /// which stamps afresh.
-    fn read_keyed_under(
+    /// [`Memo::read_keyed`] for a caller that holds `under`'s lock. While that is a shared
+    /// observation of the state lock that guards the lock at the vault's path as `under`'s glance
+    /// saw it ([`StateLock::observes_in`]: judged here, or, for a look's own, once for the look,
+    /// [`VaultLook::held`]), no writer holds that lock and none can write until the caller drops
+    /// it: a quiet memo takes it for the one `read_keyed` takes before its stamps, and any memo
+    /// gives what it kept under the stamps of that glance, the look of the caller's check, which
+    /// stamps each file once for every memo the check asks ([`fsx::Glance`]), and, through a
+    /// look's own, each set of files once for every memo of that set ([`Self::stamps_in`]).
+    /// Anything else, a miss included, is `read_keyed`'s, which stamps afresh, and so looks
+    /// afresh ([`fsx::look_afresh`]).
+    fn read_under(
         &self,
         paths: &Paths,
         key: &K,
-        lock: &StateLock,
-        glance: &fsx::Glance,
+        under: Under<'_>,
         read: impl FnOnce(&Paths) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        if lock.observes_in(paths, Some(glance))
-            && let Some(stamps) = self.stamps(paths, Some(glance))
+        if (under.caching_for(paths) || under.lock().observes_in(paths, Some(under.glance())))
+            && let Some(stamps) = self.stamps_in(paths, under)
             && let Some(answer) = self.kept(paths, key, &stamps)
         {
             return Ok(answer);
         }
+        fsx::look_afresh();
         self.read_keyed(paths, key, read)
     }
 
@@ -1272,916 +1961,5 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fsx;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-
-    /// A test's wait for what must happen: a hang detector, not a latency budget.
-    const HANG: Duration = Duration::from_secs(60);
-
-    fn signed_denial(home: &std::path::Path, label: &str, denied: &str) -> Paths {
-        let paths = Paths::for_home(home);
-        let source = home.join("fixture.vault");
-        crate::client::create(&paths, source.to_str().unwrap(), None, Some(label)).unwrap();
-        let admin = crate::client::admin_open(&paths).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.set_entry(
-            &crate::text::Audience::Everyone,
-            crate::client::SWARM_ROSTER_ENTRY,
-            format!("deny_nodes = [\"{denied}\"]\n").as_bytes(),
-        )
-        .unwrap();
-        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
-        paths
-    }
-
-    #[test]
-    fn a_typed_denial_memo_recovers_after_busy_and_failed_reads() {
-        use crate::client::{self, SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why};
-        struct FailedReads(PathBuf);
-        impl Drop for FailedReads {
-            fn drop(&mut self) {
-                fsx::fail_reads(&self.0, 0);
-            }
-        }
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = signed_denial(root.path(), "m60", "m99");
-        // Keep this fault-injected observation independent of the process-wide memo's
-        // bounded eviction as other tests read their own vault folders concurrently.
-        let memo = Memo::<Snapshot>::new(inputs);
-        let now = || memo.read(&paths, client::swarm_denial_snapshot);
-        let expected = Snapshot::Available(vec!["m99".to_owned()]);
-        assert_eq!(now().unwrap(), expected);
-        let failed = FailedReads(paths.cache_file());
-        fsx::fail_reads(&failed.0, usize::MAX);
-        assert!(
-            client::swarm_denial_snapshot(&paths).is_err(),
-            "the read fault is active"
-        );
-        assert_eq!(
-            now().unwrap().into_nodes(),
-            Some(vec!["m99".to_owned()]),
-            "the listener projection preserves the typed memo's settled read"
-        );
-        drop(failed);
-
-        let original = client::load_state(&paths).unwrap();
-        let mut revoked = original.clone();
-        revoked.membership = client::Stored::Revoked;
-        client::save_state(&paths, &revoked).unwrap();
-        assert_eq!(now().unwrap(), Snapshot::Unavailable(Why::Revoked));
-        assert_eq!(now().unwrap().into_nodes(), None);
-        client::save_state(&paths, &original).unwrap();
-        assert_eq!(now().unwrap(), expected);
-
-        // A state rewritten with what it held but the time it asked the vault (which no deny
-        // list is read from) moves the memo's stamps, as a round that heard nothing new does not.
-        let mut asked = original.clone();
-        let writer = StateLock::take(&paths).unwrap();
-        asked.requested += 1;
-        client::save_state(&paths, &asked).unwrap();
-        assert_eq!(now().unwrap(), Snapshot::Unavailable(Why::WriterBusy));
-        drop(writer);
-        assert_eq!(
-            now().unwrap(),
-            expected,
-            "a busy observation is not kept after its writer leaves"
-        );
-
-        let failed = FailedReads(paths.cache_file());
-        fsx::fail_reads(&failed.0, usize::MAX);
-        asked.requested += 1;
-        client::save_state(&paths, &asked).unwrap();
-        assert!(now().is_err());
-        drop(failed);
-        assert_eq!(
-            now().unwrap(),
-            expected,
-            "an I/O failure does not poison the memo until another write"
-        );
-    }
-
-    #[test]
-    fn typed_denial_memo_keeps_vaults_separate_and_refuses_an_unapplied_source() {
-        use crate::client::{self, SwarmDenialSnapshot as Snapshot};
-        let root = aterm_tempfile::tempdir().unwrap();
-        let one = signed_denial(&root.path().join("one"), "m60", "m99");
-        let two = signed_denial(&root.path().join("two"), "m61", "m98");
-        let first = Snapshot::Available(vec!["m99".to_owned()]);
-        let second = Snapshot::Available(vec!["m98".to_owned()]);
-        assert_eq!(swarm_denial_snapshot_now(&one).unwrap(), first);
-        assert_eq!(swarm_denial_snapshot_now(&two).unwrap(), second);
-        let original = client::config(&one).unwrap().unwrap();
-        client::save_config(&one, &client::config(&two).unwrap().unwrap()).unwrap();
-        assert!(
-            !matches!(swarm_denial_snapshot_now(&one), Ok(Snapshot::Available(_))),
-            "a replacement source cannot inherit the old source's verified list"
-        );
-        assert!(!matches!(swarm_denied_nodes_now(&one), Ok(Some(_))));
-        assert_eq!(swarm_denial_snapshot_now(&two).unwrap(), second);
-        client::save_config(&one, &original).unwrap();
-        assert_eq!(swarm_denial_snapshot_now(&one).unwrap(), first);
-    }
-
-    /// A reader standing in for the vault's: the lines of the vault folder's `records`.
-    fn lines(paths: &Paths, reads: &AtomicUsize) -> crate::Result<Option<Vec<String>>> {
-        reads.fetch_add(1, Ordering::SeqCst);
-        let text = std::fs::read_to_string(paths.records_data_file()?)?;
-        Ok(Some(text.lines().map(str::to_owned).collect()))
-    }
-
-    fn vault(home: &std::path::Path) -> Paths {
-        let paths = Paths::for_home(home);
-        fsx::ensure_private_dir(&paths.dir).unwrap();
-        fsx::write_atomic(&paths.records_file(), b"m60\n", 0o600).unwrap();
-        paths
-    }
-
-    /// A memo gives what it kept only under the record bounds it was read under
-    /// (`record_bounds`): under a test's own budgets or byte bound (`RecordBudgets::within`,
-    /// `RecordBudgets::within_bytes`) the same files recover to other records, so a read under
-    /// other bounds reads again.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-09): with `Memo::kept` not matching the bounds, the read under
-    /// smaller budgets is given the answer kept under the production ones (`read again under
-    /// other budgets`); with `record_bounds` leaving out the byte bound, so is the read under a
-    /// smaller one (`read again under another byte bound`).
-    #[test]
-    fn a_memo_reads_again_under_other_record_budgets() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(root.path());
-        let memo = Memo::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let read = || memo.read(&paths, |p| lines(p, &reads)).unwrap();
-        assert_eq!(read(), Some(vec!["m60".to_owned()]));
-        assert_eq!(read(), Some(vec!["m60".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "read once");
-        let small = crate::membership_log::RecordBudgets {
-            weighed: 2,
-            keyed: 2,
-            held: 4,
-        };
-        small.within(|| {
-            read();
-            read();
-        });
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            2,
-            "read again under other budgets"
-        );
-        read();
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            3,
-            "and again under the production ones"
-        );
-        crate::membership_log::RecordBudgets::within_bytes(1 << 20, || {
-            read();
-            read();
-        });
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            4,
-            "read again under another byte bound"
-        );
-    }
-
-    /// An exclusive take of the state lock on a thread under its own look ([`VaultLook`]), one of
-    /// its own or one standing on a Commons source read
-    /// ([`super::super::CommonsSourceRead::into_look`]), panics at once in a build with debug
-    /// assertions rather than wait on the look's observation for good, which flock(2) would.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-09): with `Observing::new` registering no lock file in
-    /// `OBSERVING`, the take waits on the look's observation and the hang detector fails "the
-    /// take refuses at once"; with `VaultLook::standing_on` keeping no observation, the read's
-    /// lock is let go, and the take under a source read's look succeeds ("the take under a look
-    /// that observes the lock panics").
-    #[test]
-    fn a_take_of_the_state_lock_under_a_look_panics_rather_than_wait_on_it() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(root.path());
-        drop(StateLock::take(&paths).unwrap());
-        for on_source_read in [false, true] {
-            let (done, finished) = std::sync::mpsc::channel();
-            let looking = paths.clone();
-            std::thread::spawn(move || {
-                let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let look = if on_source_read {
-                        super::super::try_commons_source_read(&looking)
-                            .unwrap()
-                            .expect("no writer holds the vault")
-                            .into_look(&looking)
-                    } else {
-                        VaultLook::new(&looking)
-                    };
-                    let observed = look.observation.is_some();
-                    let _held = StateLock::take(&looking);
-                    observed
-                }));
-                let _ = done.send(taken.map_err(|panic| panic.downcast_ref::<String>().cloned()));
-            });
-            let outcome = finished
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .expect("the take refuses at once rather than wait on its own look");
-            let message = outcome
-                .expect_err("the take under a look that observes the lock panics")
-                .expect("a panic message");
-            assert!(
-                message.contains("under this thread's own observation"),
-                "{on_source_read}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(root.path());
-        let data = crate::records_storage::write_path(&paths.records_file(), true)
-            .unwrap()
-            .to_path_buf();
-        let memo = Memo::new(inputs);
-        let reads = AtomicUsize::new(0);
-        assert_eq!(
-            memo.read(&paths, |p| lines(p, &reads)).unwrap(),
-            Some(vec!["m60".to_owned()])
-        );
-        let directory = fsx::stamp(&paths.records_file());
-        std::fs::write(&data, b"m61-longer\n").unwrap();
-        assert_eq!(fsx::stamp(&paths.records_file()), directory);
-        assert_eq!(
-            memo.read(&paths, |p| lines(p, &reads)).unwrap(),
-            Some(vec!["m61-longer".to_owned()])
-        );
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        std::fs::rename(&data, paths.records_file().join("saved-current")).unwrap();
-        assert!(memo.read(&paths, |p| lines(p, &reads)).is_err());
-    }
-
-    /// A pinned layout standing as it was is read once, and read again by a reader that holds
-    /// fewer records than the layout pins, which the selection refuses (`check_capacity`).
-    /// NEGATIVE CONTROL: with the capacity left out of a layout's judgement
-    /// (`records_storage::Judged`), the memo answers the records it read under the larger one.
-    #[test]
-    fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
-        fn budget(held: usize) -> crate::membership_log::RecordBudgets {
-            crate::membership_log::RecordBudgets {
-                weighed: 16,
-                keyed: 128,
-                held,
-            }
-        }
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(root.path());
-        let memo = Memo::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let expected = Some(vec!["m60".to_owned()]);
-        budget(64).within(|| {
-            drop(crate::records_storage::write_path(&paths.records_file(), true).unwrap());
-            assert_eq!(memo.read(&paths, |p| lines(p, &reads)).unwrap(), expected);
-            assert_eq!(memo.read(&paths, |p| lines(p, &reads)).unwrap(), expected);
-        });
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            1,
-            "a standing layout is read once"
-        );
-        assert!(
-            budget(32)
-                .within(|| memo.read(&paths, |p| lines(p, &reads)))
-                .is_err(),
-            "a reader holding fewer records than the layout pins reads it again and refuses it"
-        );
-    }
-
-    /// Records the selection refuses stamp nothing, as the selection reads nothing from them: a
-    /// pinned layout whose header is not one, and a records entry left a directory with no pin (an
-    /// unfinished transition). So no read keeps an answer by them, and nothing takes their stamps
-    /// for settled (`client::MembersAsked::still_asking`). Records it reads through are stamped,
-    /// a plain records file with a preparation's intent beside it too. NEGATIVE CONTROLS: a pinned
-    /// layout stood without its judgement (`records_storage::Judgements::layout`) stamps the header
-    /// that is not one; every shape stood as a plain records file stamps the directory with no pin;
-    /// with a plain file only where no intent stands beside it (eb0e73e0f1), a file with an intent
-    /// beside it is unjudged.
-    #[test]
-    fn records_the_selection_refuses_are_unjudged() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(root.path());
-        assert!(
-            stamp_inputs(&paths, inputs).is_some(),
-            "a records file is judged"
-        );
-        let intent = crate::records_storage::intent_path(&paths.records_file()).unwrap();
-        fsx::write_atomic(&intent, b"a preparation cut short\n", 0o600).unwrap();
-        assert!(
-            crate::records_storage::data_path(&paths.records_file()).is_ok(),
-            "the selection reads a records file through an intent beside it"
-        );
-        assert!(
-            stamp_inputs(&paths, inputs).is_some(),
-            "a records file with an intent beside it is judged"
-        );
-        std::fs::remove_file(&intent).unwrap();
-        drop(crate::records_storage::write_path(&paths.records_file(), true).unwrap());
-        assert!(
-            stamp_inputs(&paths, inputs).is_some(),
-            "a pinned layout is judged"
-        );
-        fsx::write_atomic(
-            &paths.records_file().join("layout"),
-            b"not a layout\n",
-            0o600,
-        )
-        .unwrap();
-        assert!(
-            stamp_inputs(&paths, inputs).is_none(),
-            "a layout whose header is not one is unjudged"
-        );
-        let unfinished = Paths::for_home(&root.path().join("unfinished"));
-        fsx::ensure_private_dir(&unfinished.dir).unwrap();
-        std::fs::create_dir(unfinished.records_file()).unwrap();
-        assert!(
-            stamp_inputs(&unfinished, inputs).is_none(),
-            "an entry left a directory with no pin is unjudged"
-        );
-    }
-
-    /// A signed vault's warm deny list has the same directory refusal as a fresh read, and
-    /// recovers when the original directory returns. Negative control on 02da6d5d7c: the fresh
-    /// read refused the symlink but the memo returned its earlier list, failing this test.
-    #[test]
-    fn a_warm_deny_list_refuses_a_symlinked_vault_directory() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(&root.path().join("member"));
-        let source = root.path().join("roster.vault");
-        crate::client::create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
-        let admin = crate::client::admin_open(&paths).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.set_entry(
-            &crate::text::Audience::Everyone,
-            crate::client::SWARM_ROSTER_ENTRY,
-            b"deny_nodes = [\"m99\"]\n",
-        )
-        .unwrap();
-        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
-        crate::client::sync(&paths, None).unwrap();
-        let expected = Some(vec!["m99".to_owned()]);
-        assert_eq!(crate::client::swarm_denied_nodes(&paths).unwrap(), expected);
-        assert_eq!(
-            crate::client::swarm_denied_nodes_now(&paths).unwrap(),
-            expected
-        );
-
-        // All leaf files remain the same inodes with the same bytes and metadata.
-        // Only the directory through which the read reaches them has changed.
-        let held = paths.dir.with_extension("held");
-        std::fs::rename(&paths.dir, &held).unwrap();
-        std::os::unix::fs::symlink(&held, &paths.dir).unwrap();
-        assert!(crate::client::swarm_denied_nodes(&paths).is_err());
-        assert!(
-            crate::client::swarm_denied_nodes_now(&paths).is_err(),
-            "a cached membership answer must preserve the fresh reader's refusal"
-        );
-        std::fs::rename(&paths.dir, paths.dir.with_extension("held-link")).unwrap();
-        std::fs::rename(&held, &paths.dir).unwrap();
-        assert_eq!(
-            crate::client::swarm_denied_nodes_now(&paths).unwrap(),
-            expected
-        );
-    }
-
-    /// A temporary failure to read the signed envelope is not a settled answer. Clearing
-    /// that failure changes no input metadata, so the same memo must read the deny list again.
-    #[test]
-    fn a_failed_cache_read_does_not_poison_the_memo_until_a_vault_write() {
-        struct FailedReads(PathBuf);
-        impl Drop for FailedReads {
-            fn drop(&mut self) {
-                fsx::fail_reads(&self.0, 0);
-            }
-        }
-
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(&root.path().join("member"));
-        let source = root.path().join("roster.vault");
-        crate::client::create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
-        let admin = crate::client::admin_open(&paths).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.set_entry(
-            &crate::text::Audience::Everyone,
-            crate::client::SWARM_ROSTER_ENTRY,
-            b"deny_nodes = [\"m99\"]\n",
-        )
-        .unwrap();
-        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
-        crate::client::sync(&paths, None).unwrap();
-        let expected = Some(vec!["m99".to_owned()]);
-        assert_eq!(crate::client::swarm_denied_nodes(&paths).unwrap(), expected);
-
-        let before = stamp_inputs(&paths, inputs).unwrap();
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let failure = FailedReads(paths.cache_file());
-        // Keep failing until explicitly cleared, independently of how many reads the
-        // authorization path makes. The guard also clears the fault on an assertion panic.
-        fsx::fail_reads(&failure.0, usize::MAX);
-        let failed = memo.read(&paths, crate::client::swarm_denied_nodes);
-        drop(failure);
-        assert!(
-            stamp_inputs(&paths, inputs).unwrap() == before,
-            "clearing a read fault must not change the memo's input metadata"
-        );
-        assert_eq!(crate::client::swarm_denied_nodes(&paths).unwrap(), expected);
-        assert_eq!(
-            memo.read(&paths, crate::client::swarm_denied_nodes)
-                .unwrap(),
-            expected,
-            "a transient read failure must not remain cached after the read recovers"
-        );
-        assert!(
-            failed.is_err(),
-            "the unread envelope must remain an I/O error"
-        );
-    }
-
-    /// The roster memo must also recover after a cache read fails, without waiting for a
-    /// vault write to change its input stamps.
-    #[test]
-    fn a_failed_cache_read_does_not_poison_the_roster_memo_until_a_vault_write() {
-        struct FailedReads(PathBuf);
-        impl Drop for FailedReads {
-            fn drop(&mut self) {
-                fsx::fail_reads(&self.0, 0);
-            }
-        }
-
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(&root.path().join("member"));
-        let source = root.path().join("roster.vault");
-        crate::client::create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
-        let admin = crate::client::admin_open(&paths).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.set_entry(
-            &crate::text::Audience::Everyone,
-            crate::client::SWARM_ROSTER_ENTRY,
-            b"deny_nodes = [\"m99\"]\n",
-        )
-        .unwrap();
-        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
-        crate::client::sync(&paths, None).unwrap();
-        let expected = crate::client::swarm_roster_until(
-            &paths,
-            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-        )
-        .unwrap();
-        assert_eq!(expected.as_ref().unwrap().deny_nodes, ["m99"]);
-
-        let before = stamp_inputs(&paths, inputs).unwrap();
-        let memo = Memo::<Option<SwarmRoster>>::new(inputs);
-        let failure = FailedReads(paths.cache_file());
-        // The read fault lasts until explicitly cleared; no implementation read count
-        // decides when the actual signed roster becomes available again.
-        fsx::fail_reads(&failure.0, usize::MAX);
-        let failed = memo.read(&paths, |paths| {
-            crate::client::swarm_roster_until(
-                paths,
-                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-            )
-        });
-        drop(failure);
-        assert!(
-            stamp_inputs(&paths, inputs).unwrap() == before,
-            "clearing a read fault must not change the memo's input metadata"
-        );
-        assert_eq!(
-            crate::client::swarm_roster_until(
-                &paths,
-                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
-            )
-            .unwrap(),
-            expected
-        );
-        assert_eq!(
-            memo.read(&paths, |paths| crate::client::swarm_roster_until(
-                paths,
-                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
-            ))
-            .unwrap(),
-            expected,
-            "a transient read failure must not remain cached after the roster recovers"
-        );
-        assert!(
-            failed.is_err(),
-            "the unread roster envelope must remain an I/O error"
-        );
-    }
-
-    /// Two reads of unchanged inputs read once; a rewritten input, and another input appearing
-    /// beside it, are each read again at the next call, and the answer is the new list. Files in
-    /// the vault folder the read never opens (the vault server's `served/`, `commons/`, a job's
-    /// log), which change every few seconds on a live Mac, read nothing again.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-01): with the stamp comparison dropped so the memo always reads
-    /// (`held.stamps == stamps` replaced by `false` in `kept`), the second unchanged read reads
-    /// again (`left: 2, right: 1`); with it dropped so the memo never reads again (`true`), the
-    /// rewritten records' answer is the old list (`left: Some(["m60"]), right: Some(["m60",
-    /// "m61"])`); with every entry directly in the vault folder stamped (the shape before), a
-    /// write to `served/` reads again (`left: 4, right: 3`).
-    #[test]
-    fn a_deny_list_is_read_again_only_when_one_of_its_inputs_changed() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let now = || memo.read(&paths, |p| lines(p, &reads)).unwrap();
-
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-
-        fsx::write_atomic(&paths.records_file(), b"m60\nm61\n", 0o600).unwrap();
-        assert_eq!(now(), Some(vec!["m60".to_owned(), "m61".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-
-        fsx::write_atomic(&paths.identity_file(), b"new input", 0o600).unwrap();
-        assert_eq!(now(), Some(vec!["m60".to_owned(), "m61".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-
-        for dir in [paths.served(), paths.dir.join("commons")] {
-            fsx::ensure_private_dir(&dir).unwrap();
-            fsx::write_atomic(&dir.join("heard"), b"heard", 0o600).unwrap();
-        }
-        fsx::write_atomic(
-            &paths.dir.join("systems.alab.aterm-secrets.log"),
-            b"line",
-            0o600,
-        )
-        .unwrap();
-        assert_eq!(now(), Some(vec!["m60".to_owned(), "m61".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-    }
-
-    /// What `state.toml` holds can come back where its metadata cannot, and a memo stamps it by
-    /// what it holds but `heard` and the rounds' receipts (`stamp_memo_inputs_in`): a state that
-    /// moved from A to B between a read's stamps and its read, which then read B, and back to A
-    /// after it, would have B's answer given under A's stamps. The answer of a read the state
-    /// moved under is not kept, so the next call under A reads A.
-    ///
-    /// NEGATIVE CONTROL (2026-11-09): with every settled answer kept whatever the state's
-    /// standing after the read (`unmoved` always true), the call under A is given B's answer
-    /// (`left: 4, right: 3`).
-    #[test]
-    fn an_answer_read_after_the_state_moved_is_not_kept_under_its_old_standing() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        let state = |seq: u64| {
-            let text = format!("membership = \"in\"\nseq = {seq}\n");
-            fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600).unwrap();
-        };
-        let seq = |paths: &Paths| crate::client::load_state(paths).map(|state| state.seq);
-        state(3);
-        let memo = Memo::<u64>::new(inputs);
-        let moved = memo.read(&paths, |paths| {
-            state(4);
-            seq(paths)
-        });
-        assert_eq!(moved.unwrap(), 4);
-        state(3);
-        assert_eq!(memo.read(&paths, seq).unwrap(), 3);
-    }
-
-    /// Callers that miss together after a change wait for one read and take its answer: while
-    /// the first caller's read is held open, seven more ask, and once it returns every one of
-    /// them has the list and the folder was read once.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-01): with the second look in `held` after `refresh` dropped,
-    /// each waiting caller reads in turn once the first returns (`left: 8, right: 1`); with
-    /// `refresh` not taken at all, the first of the seven reads beside the first caller and the
-    /// rest take its answer without queueing, so this fails at its one-minute hang detector
-    /// ("the other callers never queued").
-    #[test]
-    fn callers_that_miss_together_wait_for_one_read() {
-        const CALLERS: usize = 8;
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let answers = std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                memo.read(&paths, |p| {
-                    reads.fetch_add(1, Ordering::SeqCst);
-                    let started = Instant::now();
-                    // Every caller, this one included, has missed and come to `refresh`.
-                    while memo.waiting.load(Ordering::SeqCst) < CALLERS {
-                        assert!(started.elapsed() < HANG, "the other callers never queued");
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    let text = std::fs::read_to_string(p.records_file()).unwrap();
-                    Ok(Some(text.lines().map(str::to_owned).collect()))
-                })
-            });
-            let started = Instant::now();
-            while reads.load(Ordering::SeqCst) == 0 {
-                assert!(started.elapsed() < HANG, "the first caller never read");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let others: Vec<_> = (1..CALLERS)
-                .map(|_| scope.spawn(|| memo.read(&paths, |p| lines(p, &reads))))
-                .collect();
-            std::iter::once(first)
-                .chain(others)
-                .map(|caller| caller.join().unwrap().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert!(
-            answers
-                .iter()
-                .all(|answer| *answer == Some(vec!["m60".to_owned()]))
-        );
-    }
-
-    /// A read made while a writer holds the vault's state lock (mid-apply), and a failed read,
-    /// are never kept: the next call on the same folder reads again, and the next settled answer
-    /// is kept.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with every `Ok` answer kept (`settled` always true), the
-    /// call after the mid-apply one is answered from the memo and never reads (`assertion failed:
-    /// failed.is_err()`).
-    #[test]
-    fn a_mid_apply_answer_is_read_again_at_the_next_call() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let reads = AtomicUsize::new(0);
-
-        let writer = StateLock::take(&paths).unwrap();
-        let mid_apply = memo.read(&paths, |_| {
-            reads.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
-        });
-        assert_eq!(mid_apply.unwrap(), None);
-        drop(writer);
-        let failed = memo.read(&paths, |_| {
-            reads.fetch_add(1, Ordering::SeqCst);
-            Err(crate::Error::new("torn read"))
-        });
-        assert!(failed.is_err());
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-
-        let now = || memo.read(&paths, |p| lines(p, &reads)).unwrap();
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-    }
-
-    /// An `Ok(None)` read while no writer held the state lock is what the inputs say (this Mac
-    /// removed in the log, an envelope that does not verify), and is kept until they change:
-    /// with no lock file yet, and again once one appears and nobody holds it.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with only `Ok(Some(_))` kept (the shape before), every call
-    /// on that Mac reads again (`left: 2, right: 1`).
-    /// A lock an older build left wide is narrowed by the memo before it observes it, so the
-    /// first read after an upgrade settles and is kept: a reader that does not narrow it itself
-    /// reads once.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with the memo's `StateLock::narrow_owned` call removed (the
-    /// observation alone, as before), the wide lock fails the observation, no answer settles and
-    /// every call reads again (`left: 2, right: 1`, `a read past a wide lock is kept`).
-    #[test]
-    fn a_read_past_a_wide_lock_narrows_it_and_is_kept() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        drop(StateLock::take(&paths).unwrap());
-        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o644))
-            .unwrap();
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let now = || memo.read(&paths, |p| lines(p, &reads)).unwrap();
-
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(now(), Some(vec!["m60".to_owned()]));
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            1,
-            "a read past a wide lock is kept"
-        );
-        assert_eq!(
-            std::fs::metadata(paths.lock_file()).unwrap().mode() & 0o7777,
-            0o600
-        );
-    }
-
-    #[test]
-    fn a_settled_answer_that_is_not_a_list_is_kept_until_the_inputs_change() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        let memo = Memo::<Option<Vec<String>>>::new(inputs);
-        let reads = AtomicUsize::new(0);
-        let none = || {
-            memo.read(&paths, |_| {
-                reads.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            })
-            .unwrap()
-        };
-
-        assert_eq!(none(), None);
-        assert_eq!(none(), None);
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-
-        drop(StateLock::take(&paths).unwrap());
-        assert_eq!(none(), None);
-        assert_eq!(none(), None);
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-    }
-
-    /// A quiet memo asked under its caller's shared observation of the state lock gives what it
-    /// kept without observing the lock again, and reads a changed file as `read_keyed` does.
-    ///
-    /// NEGATIVE CONTROL (2026-11-08): with `read_keyed_under` making `read_keyed`'s call (the
-    /// shape before), each kept answer observes the lock again (`left: 2, right: 0`).
-    #[test]
-    fn a_quiet_memo_under_its_callers_observation_takes_none_of_its_own() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        drop(StateLock::take(&paths).unwrap());
-        let memo = Memo::<Option<Vec<String>>>::keyed(inputs, true);
-        let reads = AtomicUsize::new(0);
-        assert_eq!(
-            memo.read_keyed(&paths, &(), |p| lines(p, &reads)).unwrap(),
-            Some(vec!["m60".to_owned()])
-        );
-        let lock = StateLock::observe(&paths).unwrap().expect("no writer");
-        let under = || {
-            memo.read_keyed_under(&paths, &(), &lock, &fsx::Glance::new(), |p| {
-                lines(p, &reads)
-            })
-        };
-
-        let observations = super::super::lock_observations_of(&paths);
-        assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
-        assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
-        assert_eq!(super::super::lock_observations_of(&paths) - observations, 0);
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "read once");
-
-        fsx::write_atomic(&paths.records_file(), b"m61-longer\n", 0o600).unwrap();
-        assert_eq!(under().unwrap(), Some(vec!["m61-longer".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "a changed file is read");
-    }
-
-    /// Only a shared observation that still guards the lock at the vault's path stands in for the
-    /// memo's own: under a writer's own exclusive take, and under an observation of a lock file
-    /// another was renamed over while a writer holds the new one, the memo reads afresh, as
-    /// `read_keyed` meets that writer, and keeps nothing.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-08, run again on `StateLock::observes_in` 2026-11-10): with
-    /// `StateLock::observes_in` taking any lock (no `shared`), the writer's own check is given the
-    /// answer kept from before its take (`left: 1, right: 3`, `a writer's own take reads afresh`);
-    /// with it taking a shared one without its guard check (`StateLock::guards_in`), the
-    /// observation of the lock renamed away is given the answer kept under the new lock while its
-    /// writer holds it (`left: 4, right: 5`, `a lock renamed away guards nothing`).
-    #[test]
-    fn a_writers_take_or_a_lock_renamed_away_is_no_observation_for_a_memo() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        drop(StateLock::take(&paths).unwrap());
-        let memo = Memo::<Option<Vec<String>>>::keyed(inputs, true);
-        let reads = AtomicUsize::new(0);
-        let kept = || memo.read_keyed(&paths, &(), |p| lines(p, &reads)).unwrap();
-        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-
-        {
-            let writer = StateLock::take(&paths).unwrap();
-            for _ in 0..2 {
-                assert_eq!(
-                    memo.read_keyed_under(&paths, &(), &writer, &fsx::Glance::new(), |p| lines(
-                        p, &reads
-                    ))
-                    .unwrap(),
-                    Some(vec!["m60".to_owned()])
-                );
-            }
-            assert_eq!(
-                reads.load(Ordering::SeqCst),
-                3,
-                "a writer's own take reads afresh"
-            );
-        }
-
-        let renamed_away = StateLock::observe(&paths).unwrap().expect("no writer");
-        fsx::write_atomic(&paths.lock_file(), b"", 0o600).unwrap();
-        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
-        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
-        assert_eq!(reads.load(Ordering::SeqCst), 4, "kept under the new lock");
-        let _writer = StateLock::take(&paths).unwrap();
-        assert_eq!(
-            memo.read_keyed_under(&paths, &(), &renamed_away, &fsx::Glance::new(), |p| lines(
-                p, &reads
-            ))
-            .unwrap(),
-            Some(vec!["m60".to_owned()])
-        );
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            5,
-            "a lock renamed away guards nothing"
-        );
-    }
-
-    /// An observation takes the descriptor an earlier one left idle instead of opening the lock
-    /// file again, and holds no lock once it drops: a writer takes the lock at once.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-08): with `StateLock::open_observed` opening every time (the
-    /// shape before), each observation opens the lock (`left: 2, right: 0`, `observed on the
-    /// idle descriptor`); with the drop putting the descriptor back before its unlock, a writer
-    /// finds the lock held (`a writer takes the lock an observation left`).
-    #[test]
-    fn an_observation_takes_the_descriptor_an_earlier_one_left_unlocked() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        drop(StateLock::take(&paths).unwrap());
-        drop(StateLock::observe(&paths).unwrap().expect("no writer"));
-        let opens = super::super::lock_opens_of(&paths);
-        for _ in 0..2 {
-            let lock = StateLock::observe(&paths).unwrap().expect("no writer");
-            assert!(lock.observes(&paths));
-        }
-        assert_eq!(
-            super::super::lock_opens_of(&paths) - opens,
-            0,
-            "observed on the idle descriptor"
-        );
-        assert!(
-            StateLock::try_take(&paths).unwrap().is_some(),
-            "a writer takes the lock an observation left"
-        );
-    }
-
-    /// An idle descriptor is judged as a file just opened is: a lock given a mode others can read
-    /// or a second link is refused, a lock file another was renamed over is observed by its new
-    /// file, and a vault folder made a symlink to itself moved aside is refused, each as a fresh
-    /// open finds it.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-08): with `open_observed` taking an idle descriptor without
-    /// comparing it with the file at the lock's path, the observation after a lock file was
-    /// renamed over judges the old one and refuses it (`has 0 hard links`); without judging the
-    /// folder, the symlinked folder is observed (`a symlinked folder is refused`).
-    #[test]
-    fn an_idle_descriptor_is_judged_as_a_file_just_opened() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = vault(home.path());
-        drop(StateLock::take(&paths).unwrap());
-        let idle = || drop(StateLock::observe(&paths).unwrap().expect("no writer"));
-
-        idle();
-        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o644))
-            .unwrap();
-        assert!(
-            StateLock::observe(&paths).is_err(),
-            "a wide lock is refused"
-        );
-        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
-
-        idle();
-        let second = home.path().join("second-link");
-        std::fs::hard_link(paths.lock_file(), &second).unwrap();
-        assert!(
-            StateLock::observe(&paths).is_err(),
-            "a linked lock is refused"
-        );
-        std::fs::remove_file(&second).unwrap();
-
-        idle();
-        fsx::write_atomic(&paths.lock_file(), b"", 0o600).unwrap();
-        let renamed_over = StateLock::observe(&paths).unwrap();
-        assert!(
-            renamed_over.is_some_and(|lock| lock.observes(&paths)),
-            "a lock file renamed over is observed by its new file"
-        );
-
-        idle();
-        let aside = home.path().join("vault-aside");
-        std::fs::rename(&paths.dir, &aside).unwrap();
-        std::os::unix::fs::symlink(&aside, &paths.dir).unwrap();
-        assert!(
-            StateLock::observe(&paths).is_err(),
-            "a symlinked folder is refused"
-        );
-        std::fs::remove_file(&paths.dir).unwrap();
-        std::fs::rename(&aside, &paths.dir).unwrap();
-
-        idle();
-        std::fs::rename(&paths.dir, &aside).unwrap();
-        assert!(
-            StateLock::observe(&paths).unwrap().is_none(),
-            "a missing folder is no observation"
-        );
-    }
-}
+#[path = "vault_memo_tests.rs"]
+mod tests;

@@ -431,13 +431,10 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
         chain: None,
         ..floor.clone()
     });
-    let (envelope, pinned, _) = envelope::verify_for_reader(
-        held_vault.bytes(),
-        &config.name,
-        &pin,
-        &config.followed,
-        unchained.as_ref(),
-    )?;
+    // The held vault's own parse and signature fact, kept with its exact bytes
+    // (`chain_cache`): the name, pin and floor are judged on every call.
+    let (envelope, pinned, _) =
+        held_vault.verify_for_reader(&config.name, &pin, &config.followed, unchained.as_ref())?;
     if envelope.seq != state.seq || Some(envelope.digest()) != state.digest {
         return Err(Error::new("cached admin vault is not the applied version"));
     }
@@ -459,14 +456,8 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
     if envelope::signer_public(&opened.seed)? != envelope.signer {
         return Err(Error::new("cached admin custody differs from its signer"));
     }
-    if super::admin_removed_in_log_with_lock(
-        paths,
-        &config,
-        &envelope,
-        &identity,
-        &opened.doc,
-        lock,
-    ) {
+    if super::admin_removed_in_log_with_lock(paths, &config, envelope, &identity, &opened.doc, lock)
+    {
         return Err(Error::new("this device cannot open cached admin custody"));
     }
     let served_machines = opened
@@ -486,7 +477,7 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
     } = admin_base(
         paths,
         &config,
-        &envelope,
+        envelope,
         &handoff,
         &identity,
         &opened,
@@ -523,207 +514,5 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commons::binding::Pending;
-
-    /// A vault `create` made at a path, with Commons control, and the pin a machine joins by.
-    fn founded(root: &Path) -> (Paths, String) {
-        let paths = Paths::for_home(&root.join("m1"));
-        let source = root.join("vault");
-        let created = create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
-        (paths, format!("{}#{}", source.display(), created.signer))
-    }
-
-    /// `owner` lets `host` in as an open admission, as `aterm secrets password open` records one
-    /// ([`admin_publish_opened`]), and `host` joins. Returns the new machine's paths.
-    fn admitted_open(root: &Path, owner: &Paths, pinned: &str, host: &str) -> Paths {
-        let machine = Paths::for_home(&root.join(host));
-        let recipient = machine_identity(&machine).unwrap().recipient().to_bech32();
-        let admin = admin_cached(owner).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.add_machine(host, &recipient).unwrap();
-        publish_as(
-            owner,
-            &admin,
-            &doc,
-            false,
-            &[(recipient, AdmissionMethod::Open)],
-            false,
-        )
-        .unwrap();
-        join(
-            &machine,
-            &JoinOptions {
-                source: pinned.into(),
-                host: Some(host.into()),
-                interactive: false,
-                wait: Duration::ZERO,
-                confirm: &|_| false,
-                password: JoinPassword::Given(None),
-                fetched: None,
-                requested: &|| {},
-                say: &|_| {},
-            },
-        )
-        .unwrap();
-        machine
-    }
-
-    /// `owner` publishes its vault with `hosts` as the control entry's audience.
-    fn share(owner: &Paths, hosts: &[&str]) {
-        let admin = admin_cached(owner).unwrap();
-        let mut doc = admin.doc.clone();
-        let audience = doc.commons_audience().unwrap().clone();
-        let value = doc
-            .entries()
-            .into_iter()
-            .find(|e| e.name == ENTRY)
-            .unwrap()
-            .value;
-        doc.unset_entry(&audience, ENTRY).unwrap();
-        let hosts = hosts.iter().map(|h| (*h).into()).collect();
-        doc.set_entry(&Audience::Hosts(hosts), ENTRY, value.as_slice())
-            .unwrap();
-        admin_publish(owner, &admin, &doc).unwrap();
-    }
-
-    fn in_audience(owner: &Paths, host: &str) -> bool {
-        matches!(
-            admin_cached(owner).unwrap().published_doc.commons_audience(),
-            Some(Audience::Hosts(hosts)) if hosts.iter().any(|h| h == host)
-        )
-    }
-
-    /// A possession proof from `peer` for `owner`'s root, as the LAN handshake makes one.
-    fn possession(owner: &Bootstrap, peer: &Bootstrap) -> Possession {
-        let request = peer.request().unwrap();
-        let trust = owner.trust();
-        let (mut pending, challenge) =
-            Pending::issue(&request, trust.network, trust.authority).unwrap();
-        let answer = peer.device().answer(&request, &challenge).unwrap();
-        pending.verify(&answer).unwrap()
-    }
-
-    /// `owner`'s cached admin enrolls `proof` into its own control journal.
-    fn enroll(owner: &Paths, proof: Possession) -> crate::Result<Node> {
-        let bootstrap = Bootstrap::required(owner)?;
-        let mut journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())?;
-        admin_cached(owner)?.enroll_commons_member(&bootstrap, &mut journal, proof)
-    }
-
-    #[test]
-    fn an_open_admission_shares_the_root_and_enrolls_while_in_the_audience() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let (owner, pinned) = founded(root.path());
-        let m2 = admitted_open(root.path(), &owner, &pinned, "m2");
-        let admin = admin_cached(&owner).unwrap();
-        assert_eq!(
-            admin.commons_admission("m2").unwrap().method,
-            AdmissionMethod::Open
-        );
-        assert!(
-            in_audience(&owner, "m2"),
-            "an open approval shares the control entry in its own publication"
-        );
-        let peer = Bootstrap::required(&m2).unwrap();
-        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
-        // An explicit exclusion between the challenge and the enrollment still refuses.
-        share(&owner, &["m1"]);
-        let refused = enroll(&owner, proof).unwrap_err().to_string();
-        assert!(refused.contains("eligible recipient"), "{refused}");
-        // Shared again, the same open decision enrolls it.
-        share(&owner, &["m1", "m2"]);
-        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
-        enroll(&owner, proof).unwrap();
-        let owner_root = Bootstrap::required(&owner).unwrap();
-        let journal = Journal::open_existing(owner_root.journal_dir(), owner_root.trust()).unwrap();
-        let access = owner_root.access_in(&journal).unwrap().unwrap();
-        assert!(
-            access
-                .members()
-                .iter()
-                .any(|m| m.binding().recipient() == machine_identity(&m2).unwrap().recipient())
-        );
-    }
-
-    #[test]
-    fn a_removed_open_member_put_back_by_a_plain_edit_cannot_enroll() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let (owner, pinned) = founded(root.path());
-        let m2 = admitted_open(root.path(), &owner, &pinned, "m2");
-        let peer = Bootstrap::required(&m2).unwrap();
-        let recipient = machine_identity(&m2).unwrap().recipient().to_bech32();
-        admin_revoke(&owner, &admin_open(&owner).unwrap(), "m2", false).unwrap();
-        // Put back by an edit that records no decision, inside the audience.
-        let admin = admin_cached(&owner).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.add_machine("m2", &recipient).unwrap();
-        admin_publish(&owner, &admin, &doc).unwrap();
-        share(&owner, &["m1", "m2"]);
-        assert!(
-            admin_cached(&owner)
-                .unwrap()
-                .commons_admission("m2")
-                .is_none(),
-            "removal forgets the open decision"
-        );
-        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
-        let refused = enroll(&owner, proof).unwrap_err().to_string();
-        assert!(refused.contains("admission evidence"), "{refused}");
-    }
-
-    #[test]
-    fn sequential_approvals_rehome_one_control_audience() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(&root.path().join("m1"));
-        create(
-            &paths,
-            root.path().join("vault").to_str().unwrap(),
-            None,
-            Some("m1"),
-        )
-        .unwrap();
-        let mut doc = admin_cached(&paths).unwrap().doc.clone();
-        let initial = doc.lockers().len();
-        for n in 2..=30 {
-            let recipient = Identity::from_secret_bytes([n; 32]).recipient().to_bech32();
-            doc.add_machine(&format!("m{n}"), &recipient).unwrap();
-            doc = include_approved(&doc, &[(recipient, AdmissionMethod::Manual)])
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                doc.lockers().len(),
-                initial,
-                "approval {n} left an empty old audience"
-            );
-        }
-    }
-
-    #[test]
-    fn cached_admin_requires_applied_membership_and_exact_snapshot() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(&root.path().join("m1"));
-        let source = root.path().join("vault");
-        create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
-        let original = load_state(&paths).unwrap();
-        std::fs::remove_file(source).unwrap();
-        assert!(admin_cached(&paths).is_ok(), "no source fetch is necessary");
-        for mutation in 0..5 {
-            let mut state = original.clone();
-            match mutation {
-                0 => state.failed = true,
-                1 => state.membership = Stored::Revoked,
-                2 => state.source_identity = None,
-                3 => state.seq += 1,
-                4 => state.digest = Some([17; 32]),
-                _ => unreachable!(),
-            }
-            save_state(&paths, &state).unwrap();
-            assert!(
-                admin_cached(&paths).is_err(),
-                "accepted state mutation {mutation}"
-            );
-        }
-    }
-}
+#[path = "enrollment_tests.rs"]
+mod tests;

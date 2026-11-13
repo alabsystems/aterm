@@ -23,5 +23,6 @@ mod models_recipient_reservation;
 mod models_reservation_closure;
 mod models_self_claim_fact;
 mod models_sources;
+mod models_upgrade_quiet;
 mod models_usage_wall;
 mod models_wakes;

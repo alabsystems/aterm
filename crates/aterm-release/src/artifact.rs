@@ -45,8 +45,10 @@ pub struct SliceRecord {
     pub secs: u64,
     #[serde(default)]
     pub peak_bytes: Option<u64>,
-    /// Reaped build-child CPU, including descendants it waited for; absent in
-    /// older records or on hosts without resource accounting, never inferred.
+    /// Sampled CPU of the build child's descendant tree
+    /// ([`crate::buildplan::SliceBuild::cpu_ns`]), a lower bound; records written before
+    /// sampled accounting held the reaped child's CPU. Absent in older records, on hosts
+    /// without resource accounting, or where the sampling's last read missed, never inferred.
     #[serde(default)]
     pub cpu_ns: Option<u64>,
     /// The units Cargo found fresh and built, and the bytes the built ones wrote
@@ -562,19 +564,10 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
 /// # Errors
 /// Either compiler cannot be asked for its commit.
 pub fn compilers() -> Result<Compilers, String> {
-    let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-    let trustc_bin = stage2.join("trustc");
-    let out = aterm_uds::spawnfd::command(&trustc_bin)
-        .arg("-vV")
-        .output()
-        .map_err(|e| format!("ask {} -vV: {e}", trustc_bin.display()))?;
-    let trustc = crate::buildplan::commit_hash_of(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| {
-            format!(
-                "{} -vV names no commit-hash — a build no other build can be told from",
-                trustc_bin.display()
-            )
-        })?;
+    let trustc = crate::buildplan::commit_hash_of(&crate::buildplan::trust_rustc_version()?)
+        .ok_or(
+            "the Trust trustc's -vV names no commit-hash — a build no other build can be told from",
+        )?;
     Ok(Compilers {
         trustc,
         rustc: crate::buildplan::stable_rustc_commit()?,

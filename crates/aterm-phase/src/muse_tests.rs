@@ -1738,7 +1738,7 @@ fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
     assert_eq!(
         usage_card_weekly(&rows),
         Some(UsageCardWeekly {
-            text: "weekly 71% used".to_owned(),
+            text: "weekly 29% left".to_owned(),
             reset: Some("Oct 25 at 5:00 PM".to_owned()),
         })
     );
@@ -4083,4 +4083,31 @@ fn saved_login_and_model_failed_auth_notices_are_sign_in_walls() {
         "◆ model failed after 1 attempts: transport error: connection reset",
     );
     assert_eq!(wall(&mismatched), None, "singular count requires attempt:");
+}
+
+/// Muse Code's words for a login that is gone are read wherever they stand in a line, and its
+/// payment, onboarding and Keychain-refusal words are not a sign-out.
+/// NEGATIVE CONTROL: with `says_signed_out` listing `muse.wall.denied`, the Keychain refusal
+/// reads as a sign-out: `` assertion failed: !says_signed_out(denied) ``.
+#[test]
+fn says_signed_out_reads_login_words_alone() {
+    for said in [
+        "not logged in: run `muse login` first",
+        "Error: your saved login is no longer valid. Log in again or use a different account.",
+        "rpc error -32001: STILL UNAUTHORIZED after a token refresh; run `muse login` again",
+        "No Meta credentials were found in the store",
+        "Your saved Meta credentials are invalid (expired)",
+    ] {
+        assert!(says_signed_out(said), "{said}");
+    }
+    let denied = "macOS denied Muse Code access to your saved Meta credentials";
+    assert!(!says_signed_out(denied));
+    for other in [
+        "Model API requires a payment method on your account — add one at https://dev.meta.ai, then log in again.",
+        "macOS Keychain access was canceled",
+        "usage refresh is rate limited; try again in 42s",
+        "",
+    ] {
+        assert!(!says_signed_out(other), "{other}");
+    }
 }

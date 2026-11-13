@@ -6,7 +6,7 @@
 This directory is its own workspace (no patch table, the `libc-oracle`
 layout): `conformance/` compares this crate (`under-test/` names it) with
 the registry windows-sys 0.52.0, the crate it replaces for ring 0.17.14 on
-aarch64 Windows (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step
+aarch64 Windows (windows-bindings step
 1). It was run on 2026-10-15, on both Windows triples aterm builds,
 `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, under rustup's stable
 1.96 (Trust ships no Windows std; nothing was linked or run). `targo

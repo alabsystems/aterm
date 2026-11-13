@@ -1,1825 +1,1778 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Complete-entry decisions for the landing's own CHANGELOG merges.
-//!
-//! `merge_entries` reads strict original base/branch/main sections before Git's union driver
-//! combines their lines. It preserves byte-exact entry bodies and main's released text; unknown
-//! Markdown structure, competing replacements and divergent released-tail edits require an
-//! explicit resolution. Git integration checks exact authored additions/restorations in history.
-//! The semantic result is judged normally, never an independence exception for composition.
-//!
-//! The older `rehome` path remains for already-committed hand merges and one-sided changes.
-//! It uses added-line and historical word reporting to relocate entries a release cut stranded,
-//! suppress surplus copies and join added duplicate subsections. Its whitespace-normalised
-//! identity is not used to grant authority to the owned three-way entry merge.
+//! Entry-wise three-way merge of the hand-written changelog.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The changelog, at the checkout's root.
 pub(super) const PATH: &str = "CHANGELOG.md";
-/// The heading of the section a change is written under until a release ships it.
-const UNRELEASED: &str = "## [Unreleased]";
-/// Keep a Changelog's subsection order, which a subsection [`rehome`] adds follows.
-const KINDS: [&str; 6] = [
-    "Added",
-    "Changed",
-    "Deprecated",
-    "Removed",
-    "Fixed",
-    "Security",
-];
+const UNRELEASED: &str = "Unreleased";
 
-/// An intentionally strict view for three-way merging. Entry identity includes every byte of
-/// its body; the whitespace-normalised reporting helpers below cannot grant merge authority.
-struct MergeSection<'a> {
-    prefix: &'a str,
-    released: &'a str,
-    entries: BTreeMap<&'a str, Vec<&'a str>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Conflict {
+    pub(super) reason: String,
+    pub(super) entries: Vec<String>,
 }
 
-impl<'a> MergeSection<'a> {
-    fn parse(text: &'a str) -> Result<Self, &'static str> {
-        if text.contains('\r') || !text.ends_with('\n') {
-            return Err("CHANGELOG needs LF lines and a final newline for entry merging");
-        }
-        let marker = "## [Unreleased]\n";
-        let start = text.find(marker).ok_or("missing Unreleased heading")?;
-        if start != 0 && !text[..start].ends_with('\n') {
-            return Err("Unreleased heading is not at the margin");
-        }
-        if text[start + marker.len()..].contains(marker) {
-            return Err("repeated Unreleased heading");
-        }
-        let body_start = start + marker.len();
-        if text[..start].lines().any(|line| {
-            line.contains("```")
-                || (line.contains("<!--") && !line.starts_with("<!-- SPDX-License-Identifier:"))
-        }) {
-            return Err("ambiguous markup before Unreleased");
-        }
-        let rest = &text[body_start..];
-        let end = rest
-            .find("\n## ")
-            .map_or(text.len(), |at| body_start + at + 1);
-        let mut entries = BTreeMap::<&str, Vec<&str>>::new();
-        let mut kind = None;
-        let mut entry_start = None;
-        let mut offset = body_start;
-        fn finish<'a>(
-            text: &'a str,
-            entries: &mut BTreeMap<&'a str, Vec<&'a str>>,
-            until: usize,
-            kind: Option<&'a str>,
-            begin: &mut Option<usize>,
-        ) {
-            if let Some(begin) = begin.take() {
-                // Structural blank separators are not part of an entry. Interior whitespace,
-                // including indentation and spaces in code, remains byte-exact.
-                let body = text[begin..until].trim_end_matches('\n');
-                entries
-                    .get_mut(kind.expect("entry has a subsection"))
-                    .expect("known kind")
-                    .push(body);
-            }
-        }
-        for line in text[body_start..end].split_inclusive('\n') {
-            let content = line.strip_suffix('\n').expect("LF line");
-            if let Some(name) = content.strip_prefix("### ") {
-                finish(text, &mut entries, offset, kind, &mut entry_start);
-                if !KINDS.contains(&name) || entries.contains_key(name) {
-                    return Err("unknown or repeated Unreleased subsection");
-                }
-                entries.insert(name, Vec::new());
-                kind = Some(name);
-            } else if content.starts_with("- ") {
-                finish(text, &mut entries, offset, kind, &mut entry_start);
-                if kind.is_none() {
-                    return Err("entry outside a known subsection");
-                }
-                entry_start = Some(offset);
-            } else if !content.is_empty()
-                && (entry_start.is_none()
-                    || !content.starts_with("  ")
-                    || content.contains("```")
-                    || content.contains("<!--"))
-            {
-                return Err("ambiguous Unreleased prose or entry boundary");
-            }
-            offset += line.len();
-        }
-        finish(text, &mut entries, end, kind, &mut entry_start);
-        for bodies in entries.values() {
-            if bodies.iter().copied().collect::<BTreeSet<_>>().len() != bodies.len() {
-                return Err("repeated entry in one subsection");
-            }
-        }
-        Ok(Self {
-            prefix: &text[..body_start],
-            released: &text[end..],
+impl Conflict {
+    fn new(reason: impl Into<String>, entries: impl IntoIterator<Item = String>) -> Self {
+        let mut entries: Vec<String> = entries.into_iter().collect();
+        entries.sort();
+        entries.dedup();
+        Self {
+            reason: reason.into(),
             entries,
-        })
+        }
     }
 }
 
-/// Merge complete entries before git's union driver can lose their boundaries. A release main
-/// already cut stays byte-for-byte main's. Competing edits without exact correspondence stop.
-pub(super) fn merge_entries(base: &str, branch: &str, main: &str) -> Result<String, &'static str> {
-    if branch == base || branch == main {
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)?;
+        if !self.entries.is_empty() {
+            write!(f, ": ")?;
+            for (n, entry) in self.entries.iter().enumerate() {
+                if n > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "\"{entry}\"")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Conflict {}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Location {
+    section: String,
+    kind: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Entry {
+    text: String,
+    title: String,
+    location: Location,
+}
+
+#[derive(Clone, Debug)]
+struct Section {
+    key: String,
+    header: String,
+    raw: String,
+    entries: Vec<usize>,
+    kinds: Vec<Option<String>>,
+    structured: bool,
+    mergeable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Document {
+    prefix: String,
+    sections: Vec<Section>,
+    entries: Vec<Entry>,
+}
+
+impl Document {
+    fn section(&self, key: &str) -> Option<&Section> {
+        self.sections.iter().find(|section| section.key == key)
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .map(|section| section.key.clone())
+            .collect()
+    }
+}
+
+/// Titles whose presence, words, location, or relative order differs between two changelogs.
+/// This is intentionally linearithmic in file size; a multiple-base diagnostic must not compare
+/// every historical entry with every other one.
+pub(super) fn differing_titles(a: &str, b: &str) -> Result<Vec<String>, Conflict> {
+    let a = parse(a, "first merge base")?;
+    let b = parse(b, "second merge base")?;
+    let mut counts = BTreeMap::<(Location, String), (isize, String)>::new();
+    for entry in &a.entries {
+        let row = counts
+            .entry((entry.location.clone(), entry.text.clone()))
+            .or_insert((0, entry.title.clone()));
+        row.0 += 1;
+    }
+    for entry in &b.entries {
+        let row = counts
+            .entry((entry.location.clone(), entry.text.clone()))
+            .or_insert((0, entry.title.clone()));
+        row.0 -= 1;
+    }
+    let mut different: BTreeSet<String> = counts
+        .values()
+        .filter(|(count, _)| *count != 0)
+        .map(|(_, title)| title.clone())
+        .collect();
+
+    fn sequences(document: &Document) -> BTreeMap<Location, Vec<(&str, &str)>> {
+        let mut by_location = BTreeMap::<Location, Vec<(&str, &str)>>::new();
+        for entry in &document.entries {
+            by_location
+                .entry(entry.location.clone())
+                .or_default()
+                .push((&entry.text, &entry.title));
+        }
+        by_location
+    }
+    let a_sequences = sequences(&a);
+    let b_sequences = sequences(&b);
+    for location in a_sequences
+        .keys()
+        .chain(b_sequences.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let left = a_sequences.get(location).map(Vec::as_slice).unwrap_or(&[]);
+        let right = b_sequences.get(location).map(Vec::as_slice).unwrap_or(&[]);
+        if left
+            .iter()
+            .map(|(text, _)| text)
+            .eq(right.iter().map(|(text, _)| text))
+        {
+            continue;
+        }
+        different.extend(left.iter().map(|(_, title)| (*title).to_owned()));
+        different.extend(right.iter().map(|(_, title)| (*title).to_owned()));
+    }
+    Ok(different.into_iter().collect())
+}
+
+/// One exact entry at its semantic location. Landing history uses this identity to distinguish
+/// an unchanged base entry from the same bytes a person explicitly removed and restored.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ExactEntry {
+    location: Location,
+    text: String,
+    title: String,
+}
+
+impl ExactEntry {
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+}
+
+/// Exact entries `from` holds and `to` does not, counting duplicate copies independently.
+fn exact_removed(from: &str, to: &str) -> Result<Vec<ExactEntry>, Conflict> {
+    let from = parse(from, "the history source")?;
+    let to = parse(to, "the history endpoint")?;
+    let mut held = BTreeMap::<(Location, String), usize>::new();
+    for entry in &to.entries {
+        *held
+            .entry((entry.location.clone(), entry.text.clone()))
+            .or_default() += 1;
+    }
+    let mut removed = Vec::new();
+    for entry in from.entries {
+        let key = (entry.location.clone(), entry.text.clone());
+        if held.get_mut(&key).is_some_and(|count| {
+            if *count == 0 {
+                false
+            } else {
+                *count -= 1;
+                true
+            }
+        }) {
+            continue;
+        }
+        removed.push(ExactEntry {
+            location: entry.location,
+            text: entry.text,
+            title: entry.title,
+        });
+    }
+    Ok(removed)
+}
+
+/// Base entries a side removed, moved or rewrote.
+pub(super) fn removed_entries(base: &str, side: &str) -> Result<Vec<ExactEntry>, Conflict> {
+    exact_removed(base, side)
+}
+
+/// Entries a side added, moved or rewrote relative to the base.
+pub(super) fn added_entries(base: &str, side: &str) -> Result<Vec<ExactEntry>, Conflict> {
+    exact_removed(side, base)
+}
+
+/// Whether `text` holds this exact complete entry in the same section and subsection.
+pub(super) fn holds_entry(text: &str, wanted: &ExactEntry) -> Result<bool, Conflict> {
+    let document = parse(text, "the history endpoint")?;
+    Ok(document
+        .entries
+        .iter()
+        .any(|entry| entry.location == wanted.location && entry.text == wanted.text))
+}
+
+/// Merge `tip` and `main` from `base` by complete entry.
+///
+/// A tip that left the file byte-identical to `base` brings no entry to place, so the result is
+/// main's bytes, whatever main did to its own entries since (a rewrite of several entries in one
+/// subsection, a release cut): classifying main there could refuse only main's landed history,
+/// which no change on the branch can resolve. Main left unchanged gets no such shortcut: the
+/// tip's edits are what this merge judges by entry.
+pub(super) fn merge(base: &str, tip: &str, main: &str) -> Result<String, Conflict> {
+    if tip == base {
         return Ok(main.to_owned());
     }
-    if main == base {
-        return Ok(branch.to_owned());
-    }
-    let (base, branch, main) = (
-        MergeSection::parse(base)?,
-        MergeSection::parse(branch)?,
-        MergeSection::parse(main)?,
-    );
-    if branch.prefix != base.prefix
-        || main.prefix != base.prefix
-        || branch.released != base.released
-    {
-        return Err(
-            "divergent changelog structure or released-entry edits need explicit resolution",
-        );
-    }
-    let mut result = main.prefix.to_owned();
-    let newly_released = main.released.strip_suffix(base.released)
-        .ok_or("main changed existing released text while the branch changed Unreleased; resolve explicitly")?;
-    result.push('\n');
-    for kind in KINDS {
-        let empty = Vec::new();
-        let old = base.entries.get(kind).unwrap_or(&empty);
-        let ours = branch.entries.get(kind).unwrap_or(&empty);
-        let theirs = main.entries.get(kind).unwrap_or(&empty);
-        let ours_added: Vec<_> = ours.iter().filter(|entry| !old.contains(entry)).collect();
-        let theirs_added: Vec<_> = theirs.iter().filter(|entry| !old.contains(entry)).collect();
-        for entry in old {
-            let shipped = released_contains(newly_released, kind, entry)?;
-            if !ours.contains(entry)
-                && !theirs.contains(entry)
-                && !shipped
-                && ours_added != theirs_added
-            {
-                return Err("both sides replaced an entry without an unambiguous successor");
-            }
-        }
-        let mut bodies: Vec<&str> = theirs
-            .iter()
-            .copied()
-            .filter(|entry| !old.contains(entry) || ours.contains(entry))
-            .collect();
-        for entry in ours_added {
-            if format!("\n{}", base.released).contains(&format!("\n{entry}\n")) {
-                return Err(
-                    "branch entry bytes already occur in an existing release; resolve the intended duplication explicitly",
-                );
-            }
-            if !bodies.contains(entry) && !released_contains(newly_released, kind, entry)? {
-                bodies.push(entry);
-            }
-        }
-        if !bodies.is_empty() {
-            result.push_str(&format!("### {kind}\n\n"));
-            for body in bodies {
-                result.push_str(body);
-                result.push_str("\n\n");
-            }
-        }
-    }
-    result.push_str(main.released);
-    Ok(result)
-}
+    let base = parse(base, "merge base")?;
+    let tip = parse(tip, "branch tip")?;
+    let main = parse(main, "main")?;
+    let tip_view = classify(&base, &tip, "branch tip")?;
+    let main_view = classify(&base, &main, "main")?;
 
-/// Base entries removed or replaced on the branch. Git checks these against explicit authored
-/// restorations on main before applying a deletion to main's otherwise unchanged entry.
-pub(super) fn removed_entries(
-    base: &str,
-    branch: &str,
-) -> Result<Vec<(String, String)>, &'static str> {
-    let (base, branch) = (MergeSection::parse(base)?, MergeSection::parse(branch)?);
-    Ok(base
-        .entries
+    let base_keys: BTreeSet<String> = base.keys().into_iter().collect();
+    let frozen: BTreeSet<String> = main
+        .sections
         .iter()
-        .flat_map(|(kind, entries)| {
-            entries
+        .filter(|section| {
+            section.mergeable && section.key != UNRELEASED && !base_keys.contains(&section.key)
+        })
+        .map(|section| section.key.clone())
+        .collect();
+
+    // A release section created on main is immutable input to this landing: the cutter already
+    // decided its exact bytes. If the branch independently created the same version, equality is
+    // the only proof that taking main does not discard branch work.
+    for key in &frozen {
+        let Some(tip_section) = tip.section(key) else {
+            continue;
+        };
+        let main_section = main.section(key).expect("frozen main section");
+        if tip_section.raw != main_section.raw {
+            let names = tip_section
+                .entries
                 .iter()
-                .filter(|entry| {
-                    !branch
+                .map(|&entry| tip.entries[entry].title.clone())
+                .chain(
+                    main_section
                         .entries
-                        .get(kind)
-                        .is_some_and(|entries| entries.contains(entry))
-                })
-                .map(|entry| ((*kind).to_owned(), (*entry).to_owned()))
-        })
-        .collect())
-}
-
-pub(super) fn added_entries(
-    base: &str,
-    branch: &str,
-) -> Result<Vec<(String, String)>, &'static str> {
-    removed_entries(branch, base)
-}
-
-pub(super) fn holds_entry(text: &str, kind: &str, body: &str) -> Result<bool, &'static str> {
-    Ok(MergeSection::parse(text)?
-        .entries
-        .get(kind)
-        .is_some_and(|entries| entries.contains(&body)))
-}
-
-fn released_contains(mut tail: &str, kind: &str, entry: &str) -> Result<bool, &'static str> {
-    while !tail.is_empty() {
-        let (_, body) = tail.split_once('\n').ok_or("incomplete release heading")?;
-        if !tail.starts_with("## ") {
-            return Err("ambiguous release boundary");
-        }
-        let section = format!("## [Unreleased]\n{body}");
-        let parsed = MergeSection::parse(&section)?;
-        if parsed
-            .entries
-            .get(kind)
-            .is_some_and(|entries| entries.contains(&entry))
-        {
-            return Ok(true);
-        }
-        // Continue on the original bytes, not a normalised or reconstructed release body.
-        let consumed = section.len() - parsed.released.len() - "## [Unreleased]\n".len();
-        tail = &body[consumed..];
-    }
-    Ok(false)
-}
-
-#[cfg(test)]
-mod entry_merge_tests {
-    use super::merge_entries;
-
-    fn log(entries: &str) -> String {
-        format!(
-            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n{entries}## [1.0.0]\n\n### Fixed\n\n- Shipped.\n"
-        )
-    }
-
-    #[test]
-    fn complete_entries_replace_without_stranding_the_old_multiline_tail() {
-        let old = "- Old.\n  Shared tail.\n\n";
-        let new = "- New.\n  Shared tail.\n\n";
-        assert_eq!(
-            merge_entries(&log(old), &log(new), &log(&format!("- Main.\n\n{old}"))),
-            Ok(log(&format!("- Main.\n\n{new}")))
-        );
-    }
-
-    #[test]
-    fn competing_rewrite_and_delete_refuse_without_title_matching() {
-        assert!(
-            merge_entries(&log("- Base.\n\n"), &log("- One.\n\n"), &log("- Two.\n\n")).is_err()
-        );
-        assert!(merge_entries(&log("- Base.\n\n"), &log(""), &log("- Two.\n\n")).is_err());
-    }
-
-    #[test]
-    fn byte_significant_code_whitespace_is_not_duplicate_identity() {
-        let base = log("");
-        assert_eq!(
-            merge_entries(&base, &log("- `a  b`.\n\n"), &log("- `a b`.\n\n")),
-            Ok(log("- `a b`.\n\n- `a  b`.\n\n"))
-        );
-    }
-
-    #[test]
-    fn main_release_cut_keeps_shipped_bytes_and_branch_replacement_unreleased() {
-        let base = log("- Old.\n\n");
-        let main = base.replace("### Changed\n", "## [2.0.0]\n\n### Changed\n");
-        let merged = merge_entries(&base, &log("- New.\n\n"), &main).expect("release cut");
-        assert_eq!(
-            merged,
-            main.replace(
-                "## [Unreleased]\n\n",
-                "## [Unreleased]\n\n### Changed\n\n- New.\n\n"
-            )
-        );
-    }
-
-    #[test]
-    fn an_identical_addition_main_already_shipped_is_not_added_again() {
-        let base = log("");
-        let branch = log("- Same complete entry.\n\n");
-        let main = branch.replace("### Changed\n", "## [2.0.0]\n\n### Changed\n");
-        assert_eq!(merge_entries(&base, &branch, &main), Ok(main));
-    }
-
-    #[test]
-    fn copying_an_existing_released_entry_requires_explicit_resolution() {
-        assert!(merge_entries(&log(""), &log("- Shipped.\n\n"), &log("- Main.\n\n")).is_err());
-    }
-
-    #[test]
-    fn unsupported_markup_refuses_instead_of_truncating() {
-        let base = log("- Base.\n\n");
-        assert!(
-            merge_entries(
-                &base,
-                &log("- Branch.\n\n```\n### Fixed\n```\n\n"),
-                &log("- Main.\n\n")
-            )
-            .is_err()
-        );
-    }
-}
-
-/// The 0-based new-side lines of `diff` (one file's `git diff`) that a change adds without
-/// replacing a non-blank line of the old side. A change is a run of `-` and `+` lines between
-/// context lines and hunk edges, so a hunk git joined across unchanged lines
-/// (`diff.interHunkContext`) reads as the changes it holds, and its context is never added.
-pub(super) fn added_lines(diff: &str) -> BTreeSet<usize> {
-    let mut added = BTreeSet::new();
-    // The open change's added lines, and whether it removes a non-blank old line.
-    let mut change: (Vec<usize>, bool) = (Vec::new(), false);
-    let mut close = |change: &mut (Vec<usize>, bool)| {
-        let (lines, rewrites) = std::mem::take(change);
-        if !rewrites {
-            added.extend(lines);
-        }
-    };
-    // The next new-side line, inside a hunk.
-    let mut next: Option<usize> = None;
-    for line in diff.lines() {
-        if let Some(header) = line.strip_prefix("@@ ") {
-            close(&mut change);
-            next = new_start(header);
-            continue;
-        }
-        let Some(at) = next.as_mut() else {
-            continue;
-        };
-        match line.as_bytes().first() {
-            Some(b'+') => {
-                change.0.push(*at);
-                *at += 1;
-            }
-            Some(b'-') => change.1 |= !line[1..].trim().is_empty(),
-            Some(b'\\') => {}
-            // A context line (`diff.suppressBlankEmpty` writes a blank one empty).
-            Some(b' ') | None => {
-                close(&mut change);
-                *at += 1;
-            }
-            Some(_) => {
-                close(&mut change);
-                next = None;
-            }
+                        .iter()
+                        .map(|&entry| main.entries[entry].title.clone()),
+                );
+            return Err(Conflict::new(
+                format!(
+                    "main cut [{key}] differently from the branch's independently created section"
+                ),
+                names,
+            ));
         }
     }
-    close(&mut change);
-    added
-}
-
-/// The 0-based first new-side line a hunk header (`-a[,b] +c[,d] @@ …`, after its `@@ `) names.
-fn new_start(header: &str) -> Option<usize> {
-    let new = header.split_whitespace().nth(1)?.strip_prefix('+')?;
-    let start = new.split_once(',').map_or(new, |(start, _)| start);
-    Some(start.parse::<usize>().ok()?.saturating_sub(1))
-}
-
-/// A changelog whose added entries left its released versions.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct Rehomed {
-    /// The changelog, the entries moved and dropped.
-    pub(super) text: String,
-    /// Each entry moved under `## [Unreleased]`, by its title ([`title`]), in file order.
-    pub(super) moved: Vec<String>,
-    /// Each entry dropped as a surplus copy, by its title.
-    pub(super) dropped: Vec<String>,
-    /// Each entry dropped as words no commit of the branch wrote and main no longer holds, which
-    /// a merge brought back, by its title.
-    pub(super) revived: Vec<String>,
-    /// Each `### <kind>` the landing added under `## [Unreleased]` beside another of its kind,
-    /// with how many of its subsections joined that one ([`joinable`]), in file order.
-    pub(super) joined: Vec<(String, usize)>,
-}
-
-/// One entry of a changelog: a top-level `- ` line and its indented lines.
-struct Entry<'a> {
-    /// The release heading it sits under, trimmed, or `None` under `## [Unreleased]`.
-    release: Option<&'a str>,
-    /// The `### ` subsection it sits in.
-    kind: Option<&'a str>,
-    /// Its lines, 0-based.
-    lines: std::ops::Range<usize>,
-    /// Whether the next non-blank line after it is another entry, a heading or the file's end.
-    ends_clearly: bool,
-}
-
-/// `lines`' entries, and the `### ` headings under released versions.
-fn scan<'a>(lines: &[&'a str]) -> (Vec<Entry<'a>>, BTreeSet<usize>) {
-    let (mut entries, mut released_kinds) = (Vec::new(), BTreeSet::new());
-    let mut release = None;
-    let mut kind = None;
-    let mut at = 0;
-    while at < lines.len() {
-        let line = lines[at];
-        if line.starts_with("## ") {
-            release = (!is_unreleased(line)).then(|| line.trim());
-            kind = None;
-        } else if let Some(heading) = line.strip_prefix("### ") {
-            kind = Some(heading.trim());
-            if release.is_some() {
-                released_kinds.insert(at);
-            }
-        } else if is_entry(line) {
-            let end = entry_end(lines, at);
-            let ends_clearly = lines[end..]
-                .iter()
-                .find(|next| !next.trim().is_empty())
-                .is_none_or(|next| is_entry(next) || is_heading(next));
-            entries.push(Entry {
-                release,
-                kind,
-                lines: at..end,
-                ends_clearly,
-            });
-            at = end;
-            continue;
-        }
-        at += 1;
-    }
-    (entries, released_kinds)
-}
-
-/// An entry's words, as census's `changelog-repeat` compares two.
-fn words(lines: &[&str]) -> String {
-    lines
-        .iter()
-        .flat_map(|line| line.split_whitespace())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// A changelog's release headings, each trimmed: a release is its whole heading, its date
-/// included, so one pulled and cut again under its number (a re-spin) is another release.
-fn releases(changelog: &str) -> BTreeSet<String> {
-    changelog
-        .split('\n')
-        .filter(|line| line.starts_with("## ") && !is_unreleased(line))
-        .map(|line| line.trim().to_owned())
-        .collect()
-}
-
-/// What one changelog holds of the entries a walk wants ([`placed`]).
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct Placed {
-    /// Each wanted entry it holds, by its words: whether a copy sits under `## [Unreleased]`.
-    entries: BTreeMap<String, bool>,
-    /// Its release headings ([`releases`]).
-    releases: BTreeSet<String>,
-}
-
-/// What `changelog` holds of the entries whose words are `wanted` ([`Placed`]). An entry's first
-/// words are read before all of them, so a changelog of thousands of entries costs little more
-/// than its scan.
-pub(super) fn placed(changelog: &str, wanted: &BTreeSet<String>) -> Placed {
-    let leads: BTreeSet<String> = wanted.iter().map(|said| lead(said.split(' '))).collect();
-    let lines: Vec<&str> = changelog.split('\n').collect();
-    let mut entries = BTreeMap::new();
-    for entry in scan(&lines).0 {
-        let entry_lines = &lines[entry.lines];
-        if !leads.contains(&lead(entry_lines.iter().flat_map(|l| l.split_whitespace()))) {
-            continue;
-        }
-        let said = words(entry_lines);
-        if wanted.contains(&said) {
-            *entries.entry(said).or_insert(false) |= entry.release.is_none();
-        }
-    }
-    Placed {
-        entries,
-        releases: releases(changelog),
-    }
-}
-
-/// An entry's first three words, joined as [`words`] joins them.
-fn lead<'a>(words: impl Iterator<Item = &'a str>) -> String {
-    words.take(3).collect::<Vec<_>>().join(" ")
-}
-
-/// Where a branch's commits wrote an entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Wrote {
-    /// Only under released versions.
-    Released,
-    /// Under `## [Unreleased]`, with the release headings the changelog held at every such write
-    /// ([`releases`]): no release cut since can have shipped it.
-    Unreleased(BTreeSet<String>),
-}
-
-/// The entries a branch's commits wrote, by their words ([`Wrote`]).
-pub(super) type Written = BTreeMap<String, Wrote>;
-
-/// Add to `written` what one commit wrote, from what its changelog holds (`after`) and its
-/// parents' do (`before`): each entry none of its parents holds, a merge's own resolution
-/// included, and each it holds under `## [Unreleased]` that none of its parents does (one it moved
-/// up from a release). A move down writes nothing: a release cut moves every entry below its new
-/// heading, in main's own commit, in a merge of it, or in a replay of it on the branch (a squash,
-/// a rebase), and which release a stranded entry sits under is read against the releases it was
-/// written beside instead. What `written` ends with does not depend on the order commits come in.
-pub(super) fn wrote(written: &mut Written, after: &Placed, before: &[&Placed]) {
-    for (said, &unreleased) in &after.entries {
-        let mut held = before.iter().filter_map(|parent| parent.entries.get(said));
-        let known = if unreleased {
-            held.any(|&up| up)
-        } else {
-            held.next().is_some()
-        };
-        if known {
-            continue;
-        }
-        let wrote = written.entry(said.clone()).or_insert(Wrote::Released);
-        if unreleased {
-            *wrote = Wrote::Unreleased(match wrote {
-                Wrote::Unreleased(beside) => {
-                    beside.intersection(&after.releases).cloned().collect()
-                }
-                Wrote::Released => after.releases.clone(),
-            });
-        }
-    }
-}
-
-/// How many times `changelog` holds each entry, by its words.
-fn copies(changelog: &str) -> BTreeMap<String, usize> {
-    let lines: Vec<&str> = changelog.split('\n').collect();
-    let mut copies = BTreeMap::new();
-    for entry in scan(&lines).0 {
-        *copies.entry(words(&lines[entry.lines])).or_insert(0) += 1;
-    }
-    copies
-}
-
-/// The words of each entry `text` adds beside `main` that [`rehome`] settles by who wrote it: one
-/// wholly in `added` that ends clearly, whose words `main` does not hold. A walk of the branch's
-/// commits needs to place only these ([`placed`]).
-pub(super) fn in_question(text: &str, added: &BTreeSet<usize>, main: &str) -> BTreeSet<String> {
-    let lines: Vec<&str> = text.split('\n').collect();
-    if text.contains('\r') || !lines.iter().any(|line| is_unreleased(line)) {
-        return BTreeSet::new();
-    }
-    let in_main = copies(main);
-    settled(&scan(&lines).0, added)
-        .map(|entry| words(&lines[entry.lines.clone()]))
-        .filter(|said| !in_main.contains_key(said))
-        .collect()
-}
-
-/// The entries a landing settles: each wholly in `added` that ends clearly.
-fn settled<'e, 'a>(
-    entries: &'e [Entry<'a>],
-    added: &'e BTreeSet<usize>,
-) -> impl Iterator<Item = &'e Entry<'a>> {
-    entries
-        .iter()
-        .filter(|entry| entry.ends_clearly && entry.lines.clone().all(|n| added.contains(&n)))
-}
-
-/// `text` (the landing's changelog) with the entries it adds beside `main`'s changelog (wholly in
-/// `added`, 0-based lines) settled by where their words came from (`written`, the branch's own
-/// commits): a surplus copy (one `text` holds more often than `main` does, another copy staying)
-/// and words neither `main` nor the branch wrote are dropped, and one the branch wrote under
-/// `## [Unreleased]` that sits under a release heading `main` holds and the changelog did not when
-/// the branch wrote it ([`Wrote::Unreleased`]) moves to the top of its `### <kind>` there; and a
-/// `### <kind>` subsection the landing adds whole under `## [Unreleased]` beside another of its
-/// kind joins that one ([`joinable`]). `None` where none is, or where `text` has no
-/// `## [Unreleased]` or holds a carriage return. A `### <kind>` heading under a released version
-/// that the same lines added, left with no entry, goes with them.
-pub(super) fn rehome(
-    text: &str,
-    added: &BTreeSet<usize>,
-    main: &str,
-    written: &Written,
-) -> Option<Rehomed> {
-    if text.contains('\r') {
-        return None;
-    }
-    let lines: Vec<&str> = text.split('\n').collect();
-    if !lines.iter().any(|line| is_unreleased(line)) {
-        return None;
-    }
-    let (entries, released_kinds) = scan(&lines);
-    let in_main = copies(main);
-    let main_releases = releases(main);
-    let mut left = BTreeMap::new();
-    for entry in &entries {
-        *left
-            .entry(words(&lines[entry.lines.clone()]))
-            .or_insert(0_usize) += 1;
-    }
-    let joins = joinable(&lines, added, main);
-    let mut moved: Vec<(Option<&str>, std::ops::Range<usize>)> = Vec::new();
-    let (mut dropped, mut revived) = (Vec::new(), Vec::new());
-    for entry in settled(&entries, added) {
-        let said = words(&lines[entry.lines.clone()]);
-        let theirs = in_main.get(&said).copied().unwrap_or(0);
-        let ours = left.get_mut(&said).expect("every entry is counted");
-        if *ours > theirs.max(1) {
-            *ours -= 1;
-            dropped.push(entry.lines.clone());
-        } else if theirs > 0 {
-            // Main holds these words: an entry moved or reordered, not one the cut stranded.
-        } else {
-            match (written.get(&said), entry.release) {
-                // The branch wrote it under `[Unreleased]`, and it sits under a release main cut
-                // after that: a release that cannot have shipped it.
-                (Some(Wrote::Unreleased(beside)), Some(release))
-                    if main_releases.contains(release) && !beside.contains(release) =>
-                {
-                    moved.push((entry.kind, entry.lines.clone()));
-                }
-                (Some(_), _) => {}
-                // No commit of the branch wrote these words and main no longer holds them: main
-                // rewrote or removed them, and a merge (git's union driver keeps both sides of a
-                // hunk) brought them back.
-                (None, _) => revived.push(entry.lines.clone()),
-            }
-        }
-    }
-    if moved.is_empty() && dropped.is_empty() && revived.is_empty() && joins.is_empty() {
-        return None;
-    }
-    let mut gone: BTreeSet<usize> = moved
-        .iter()
-        .map(|(_, entry)| entry)
-        .chain(&dropped)
-        .chain(&revived)
-        .flat_map(Clone::clone)
-        .collect();
-    for &heading in &released_kinds {
-        if added.contains(&heading) && emptied(&lines, heading, &gone) {
-            gone.insert(heading);
-        }
-    }
-    // A joined subsection gives up its heading and the lines the landing adds; the ones no other
-    // rule took join the subsection of their kind, a removal inside them leaving one blank line
-    // as below.
-    let mut join_blocks: Vec<(&str, bool, Vec<String>)> = Vec::new();
-    for join in &joins {
-        let mut block: Vec<String> = Vec::new();
-        let mut after_gone = false;
-        for n in join.body.clone() {
-            if gone.contains(&n) {
-                after_gone = true;
-                continue;
-            }
-            if after_gone
-                && lines[n].trim().is_empty()
-                && block.last().is_none_or(|l| l.trim().is_empty())
-            {
-                continue;
-            }
-            after_gone = false;
-            block.push(lines[n].to_owned());
-        }
-        gone.extend(join.remove.iter().copied());
-        join_blocks.push((join.kind, join.above, block));
-    }
-    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
-    let mut after_gone = false;
-    for (n, line) in lines.iter().enumerate() {
-        if gone.contains(&n) {
-            after_gone = true;
-            continue;
-        }
-        // A removal leaves one blank line where the entry had one on each side.
-        if after_gone && line.trim().is_empty() && kept.last().is_none_or(|l| l.trim().is_empty()) {
-            continue;
-        }
-        after_gone = false;
-        kept.push((*line).to_owned());
-    }
-    let mut kinds: Vec<Option<&str>> = Vec::new();
-    for (kind, _) in &moved {
-        if !kinds.contains(kind) {
-            kinds.push(*kind);
-        }
-    }
-    for kind in kinds {
-        let mut block: Vec<String> = Vec::new();
-        for (_, entry) in moved.iter().filter(|(k, _)| *k == kind) {
-            block.extend(lines[entry.clone()].iter().map(|l| (*l).to_owned()));
-            block.push(String::new());
-        }
-        place(&mut kept, kind, block);
-    }
-    let mut joined: Vec<(String, usize)> = Vec::new();
-    for (kind, _, _) in &join_blocks {
-        match joined.iter_mut().find(|(k, _)| k == kind) {
-            Some((_, count)) => *count += 1,
-            None => joined.push(((*kind).to_owned(), 1)),
-        }
-    }
-    for (kind, _) in &joined {
-        let run = |above: bool| {
-            let mut run: Vec<String> = Vec::new();
-            for (_, _, block) in join_blocks
-                .iter()
-                .filter(|(k, a, _)| k == kind && *a == above)
-            {
-                let block = trimmed(block);
-                if !block.is_empty() {
-                    if !run.is_empty() {
-                        run.push(String::new());
-                    }
-                    run.extend_from_slice(block);
-                }
-            }
-            run
-        };
-        join_into(&mut kept, kind, run(true), run(false));
-    }
-    let titled = |entry: &std::ops::Range<usize>| title(&lines[entry.clone()]);
-    Some(Rehomed {
-        text: kept.join("\n"),
-        moved: moved.iter().map(|(_, entry)| titled(entry)).collect(),
-        dropped: dropped.iter().map(titled).collect(),
-        revived: revived.iter().map(titled).collect(),
-        joined,
-    })
-}
-
-/// A `### <kind>` subsection the landing adds whole, which joins another of its kind.
-struct Join<'a> {
-    /// Its kind, trimmed.
-    kind: &'a str,
-    /// The lines it gives up, 0-based: its heading and the lines the landing adds after it.
-    remove: BTreeSet<usize>,
-    /// The lines after its heading, 0-based.
-    body: std::ops::Range<usize>,
-    /// Whether it sits above the subsection it joins.
-    above: bool,
-}
-
-/// The `### <kind>` subsections under `## [Unreleased]` the landing adds whole (the heading and
-/// every non-blank line up to the next heading in `added`, read as [`slid_up`] places it) where
-/// the section holds another of the kind and more `### <kind>` headings than `main`'s
-/// `## [Unreleased]` holds, at least one for each that joins, in file order: each joins the first
-/// subsection of its kind the landing does not add whole (main's), else the first. A kind main's
-/// own lines repeat stays as main holds it. None where the section holds an HTML comment or a
-/// code fence at the margin: a `### ` line in one is not a heading.
-fn joinable<'a>(lines: &[&'a str], added: &BTreeSet<usize>, main: &str) -> Vec<Join<'a>> {
-    let Some((unreleased, end)) = unreleased_span(lines) else {
-        return Vec::new();
-    };
-    if lines[unreleased + 1..end].iter().any(|line| {
-        line.trim_start().starts_with("<!--") || line.starts_with("```") || line.starts_with("~~~")
+    if let Some(tip_section) = tip.sections.iter().find(|section| {
+        section.mergeable
+            && section.key != UNRELEASED
+            && !base_keys.contains(&section.key)
+            && !frozen.contains(&section.key)
     }) {
-        return Vec::new();
-    }
-    let main_lines: Vec<&str> = main.split('\n').collect();
-    let main_kinds: Vec<&str> = unreleased_span(&main_lines).map_or_else(Vec::new, |(u, e)| {
-        main_lines[u + 1..e]
+        let names = tip_section
+            .entries
             .iter()
-            .filter_map(|line| line.strip_prefix("### ").map(str::trim))
-            .collect()
-    });
-    let added = slid_up(lines, added, unreleased + 1, end);
-    let headings: Vec<usize> = (unreleased + 1..end)
-        .filter(|&n| lines[n].starts_with("### "))
-        .collect();
-    // Each subsection: its kind, its lines, and whether the landing adds it whole.
-    let subsections: Vec<(&str, std::ops::Range<usize>, bool)> = headings
-        .iter()
-        .enumerate()
-        .map(|(i, &heading)| {
-            let body_end = headings.get(i + 1).copied().unwrap_or(end);
-            let whole = (heading..body_end)
-                .all(|n| added.contains(&n) || lines[n].trim().is_empty())
-                && added.contains(&heading);
-            (
-                lines[heading]["### ".len()..].trim(),
-                heading..body_end,
-                whole,
-            )
-        })
-        .collect();
-    let mut joins = Vec::new();
-    let mut seen: Vec<&str> = Vec::new();
-    for (kind, _, _) in &subsections {
-        if seen.contains(kind) {
+            .map(|&entry| tip.entries[entry].title.clone())
+            .chain(frozen.iter().flat_map(|key| {
+                let section = main.section(key).expect("frozen main section");
+                section
+                    .entries
+                    .iter()
+                    .map(|&entry| main.entries[entry].title.clone())
+            }));
+        return Err(Conflict::new(
+            format!(
+                "the branch independently created release [{}]; main's release cut is authoritative",
+                tip_section.key
+            ),
+            names,
+        ));
+    }
+
+    let mut frozen_base = BTreeSet::new();
+    let mut cut_rewrites = Vec::new();
+    for (id, old) in base.entries.iter().enumerate() {
+        let Some(main_side) = main_view.states[id].exact() else {
+            continue;
+        };
+        let cut = &main.entries[main_side];
+        if !frozen.contains(&cut.location.section) {
             continue;
         }
-        seen.push(kind);
-        let of_kind: Vec<usize> = (0..subsections.len())
-            .filter(|&j| subsections[j].0 == *kind)
-            .collect();
-        let Some(target) = of_kind
-            .iter()
-            .copied()
-            .find(|&j| !subsections[j].2)
-            .or_else(|| of_kind.first().copied())
+        match tip_view.states[id] {
+            SideState::Exact(side) if tip.entries[side].location == old.location => {}
+            SideState::Exact(side) => {
+                return Err(Conflict::new(
+                    format!(
+                        "main cut [{}] while the branch moved an entry",
+                        cut.location.section
+                    ),
+                    [old.title.clone(), tip.entries[side].title.clone()],
+                ));
+            }
+            SideState::Rewrite(side) if tip.entries[side].location.section == UNRELEASED => {
+                // Main's release is immutable, but the branch's reviewed replacement has not
+                // shipped. Keep it as a new Unreleased entry: the old entry's subsection and
+                // ordering lineage moved into the frozen release with that old entry.
+                cut_rewrites.push((id, side));
+            }
+            SideState::Rewrite(side) => {
+                return Err(Conflict::new(
+                    format!(
+                        "main cut [{}] while the branch rewrote an entry into another release",
+                        cut.location.section
+                    ),
+                    [old.title.clone(), tip.entries[side].title.clone()],
+                ));
+            }
+            // A removal cannot rewrite history. Main's exact release wins and no copy remains
+            // under Unreleased.
+            SideState::Absent => {}
+        }
+        frozen_base.insert(id);
+    }
+
+    let mut result = Vec::<ResultEntry>::new();
+    let mut base_to_node = vec![None; base.entries.len()];
+    for (id, old) in base.entries.iter().enumerate() {
+        if frozen_base.contains(&id) {
+            continue;
+        }
+        let Some((text, title, location)) =
+            merge_old(old, tip_view.states[id], &tip, main_view.states[id], &main)?
         else {
             continue;
         };
-        let joining: Vec<usize> = of_kind
-            .iter()
-            .copied()
-            .filter(|&j| j != target && subsections[j].2)
-            .collect();
-        let theirs = main_kinds.iter().filter(|k| *k == kind).count();
-        if joining.is_empty() || of_kind.len() < theirs + joining.len() {
+        let node = result.len();
+        base_to_node[id] = Some(node);
+        result.push(ResultEntry {
+            text,
+            title,
+            location,
+            base: Some(old.location.clone()),
+            tip: tip_view.states[id].side(),
+            main: main_view.states[id].side(),
+        });
+    }
+    for (id, side) in cut_rewrites {
+        let entry = &tip.entries[side];
+        debug_assert!(frozen_base.contains(&id));
+        result.push(ResultEntry {
+            text: entry.text.clone(),
+            title: entry.title.clone(),
+            location: entry.location.clone(),
+            base: None,
+            tip: Some(side),
+            main: None,
+        });
+    }
+
+    let tip_identities = addition_identities(&tip, &tip_view.additions, "branch tip")?;
+    let main_identities = addition_identities(&main, &main_view.additions, "main")?;
+    for (identity, &tip_side) in &tip_identities {
+        let Some(&main_side) = main_identities.get(identity) else {
+            continue;
+        };
+        if tip.entries[tip_side].text != main.entries[main_side].text {
+            return Err(Conflict::new(
+                "the branch and main added the same titled entry differently",
+                [tip.entries[tip_side].title.clone()],
+            ));
+        }
+    }
+
+    let mut same_addition = BTreeMap::<(Location, String), usize>::new();
+    for &side in &main_view.additions {
+        let entry = &main.entries[side];
+        if frozen.contains(&entry.location.section) {
             continue;
         }
-        for j in joining {
-            let range = subsections[j].1.clone();
-            joins.push(Join {
-                kind,
-                remove: range.clone().filter(|n| added.contains(n)).collect(),
-                body: range.start + 1..range.end,
-                above: j < target,
+        let node = result.len();
+        same_addition.insert((entry.location.clone(), entry.text.clone()), node);
+        result.push(ResultEntry::addition(entry, None, Some(side)));
+    }
+    let shipped_additions: Vec<&Entry> = main
+        .entries
+        .iter()
+        .filter(|entry| frozen.contains(&entry.location.section))
+        .collect();
+    let already_released: Vec<&Entry> = base
+        .entries
+        .iter()
+        .filter(|entry| entry.location.section != UNRELEASED)
+        .collect();
+    for &side in &tip_view.additions {
+        let entry = &tip.entries[side];
+        if frozen.contains(&entry.location.section) {
+            continue;
+        }
+        if let Some(released) = already_released.iter().find(|released| {
+            released.location.kind == entry.location.kind && released.text == entry.text
+        }) {
+            return Err(Conflict::new(
+                "the branch copied an already released entry into Unreleased",
+                [entry.title.clone(), released.title.clone()],
+            ));
+        }
+        if shipped_additions.iter().any(|shipped| {
+            shipped.location.kind == entry.location.kind && shipped.text == entry.text
+        }) {
+            // Both sides independently wrote the same complete entry, and main already shipped
+            // it in the release it cut. Publishing a second Unreleased copy would be a defect.
+            continue;
+        }
+        if let Some(shipped) = shipped_additions.iter().find(|shipped| {
+            shipped.location.kind == entry.location.kind
+                && entry_identity(&shipped.text).is_some()
+                && entry_identity(&shipped.text) == entry_identity(&entry.text)
+        }) {
+            return Err(Conflict::new(
+                "the branch and main wrote one titled entry differently before main released it",
+                [entry.title.clone(), shipped.title.clone()],
+            ));
+        }
+        let key = (entry.location.clone(), entry.text.clone());
+        if let Some(&node) = same_addition.get(&key) {
+            result[node].tip = Some(side);
+        } else {
+            let node = result.len();
+            same_addition.insert(key, node);
+            result.push(ResultEntry::addition(entry, Some(side), None));
+        }
+    }
+
+    let present = section_presence(&base, &tip, &main, &frozen, &result)?;
+    let order = section_order(&base, &tip, &main, &present)?;
+    let headers = section_headers(&base, &tip, &main, &frozen, &present)?;
+
+    let mut tip_to_node = vec![None; tip.entries.len()];
+    let mut main_to_node = vec![None; main.entries.len()];
+    for (node, entry) in result.iter().enumerate() {
+        if let Some(side) = entry.tip {
+            tip_to_node[side] = Some(node);
+        }
+        if let Some(side) = entry.main {
+            main_to_node[side] = Some(node);
+        }
+    }
+
+    let mut out = scalar(
+        &base.prefix,
+        &tip.prefix,
+        &main.prefix,
+        "both sides changed text before the first changelog section",
+        Vec::new(),
+    )?;
+    for (position, key) in order.iter().enumerate() {
+        let last = position + 1 == order.len();
+        let base_section = base.section(key);
+        let tip_section = tip.section(key);
+        let main_section = main.section(key);
+        if frozen.contains(key) {
+            out.push_str(&main_section.expect("frozen main section").raw);
+            continue;
+        }
+        let all_same = base_section
+            .zip(tip_section)
+            .zip(main_section)
+            .is_some_and(|((base, tip), main)| base.raw == tip.raw && base.raw == main.raw);
+        if all_same {
+            out.push_str(&main_section.expect("same section").raw);
+            continue;
+        }
+        if [base_section, tip_section, main_section]
+            .into_iter()
+            .flatten()
+            .any(|section| !section.mergeable)
+        {
+            let raw = merge_optional_raw(base_section, tip_section, main_section, key)?;
+            out.push_str(&raw);
+            continue;
+        }
+        let relevant: Vec<&Section> = [base_section, tip_section, main_section]
+            .into_iter()
+            .flatten()
+            .collect();
+        if relevant.iter().any(|section| !section.structured) {
+            let names = [
+                base_section.map(|section| (section, base.entries.as_slice())),
+                tip_section.map(|section| (section, tip.entries.as_slice())),
+                main_section.map(|section| (section, main.entries.as_slice())),
+            ]
+            .into_iter()
+            .flatten()
+            .flat_map(|(section, entries)| {
+                section
+                    .entries
+                    .iter()
+                    .map(|&entry| entries[entry].title.clone())
+            });
+            return Err(Conflict::new(
+                format!("[{key}] has non-entry text whose placement is ambiguous"),
+                names,
+            ));
+        }
+        let kinds = kind_order(key, &base, &tip, &main, &result)?;
+        let mut groups = Vec::new();
+        for kind in kinds {
+            let location = Location {
+                section: key.clone(),
+                kind: kind.clone(),
+            };
+            let nodes: Vec<usize> = result
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.location == location)
+                .map(|(node, _)| node)
+                .collect();
+            if nodes.is_empty() {
+                continue;
+            }
+            let nodes = entry_order(
+                &location,
+                &nodes,
+                &base,
+                &tip,
+                &main,
+                &base_to_node,
+                &tip_to_node,
+                &main_to_node,
+                &result,
+            )?;
+            groups.push((kind, nodes));
+        }
+        let header = headers.get(key).expect("present header");
+        // All entry and ordering decisions above still run. When the branch left this
+        // section alone and the result is exactly main's structure, keep main's separators
+        // too: inserting blank lines would manufacture an unrelated branch edit.
+        let unchanged_tip = base_section
+            .zip(tip_section)
+            .is_some_and(|(base, tip)| base.raw == tip.raw);
+        if let Some(section) = main_section.filter(|section| {
+            unchanged_tip
+                && section_result_matches(section, &main.entries, header, &groups, &result)
+        }) {
+            out.push_str(&section.raw);
+        } else {
+            out.push_str(&render(header, &groups, &result, last));
+        }
+    }
+    Ok(out)
+}
+
+fn parse(text: &str, which: &str) -> Result<Document, Conflict> {
+    if text.contains('\r') {
+        return Err(Conflict::new(
+            format!("{which}'s {PATH} contains a carriage return"),
+            Vec::new(),
+        ));
+    }
+    let mut headings = Vec::<(usize, String, String, bool)>::new();
+    let mut offset = 0;
+    for raw in text.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        if line.starts_with("## ") {
+            let mergeable = bracket_key(line);
+            let key = mergeable.clone().unwrap_or_else(|| format!("plain:{line}"));
+            headings.push((offset, key, line.to_owned(), mergeable.is_some()));
+        }
+        offset += raw.len();
+    }
+    if headings.is_empty() {
+        return Err(Conflict::new(
+            format!("{which}'s {PATH} has no level-two section"),
+            Vec::new(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (_, key, _, _) in &headings {
+        if !seen.insert(key.clone()) {
+            return Err(Conflict::new(
+                format!("{which}'s {PATH} repeats section {key}"),
+                Vec::new(),
+            ));
+        }
+    }
+
+    let prefix = text[..headings[0].0].to_owned();
+    let mut sections = Vec::new();
+    let mut entries = Vec::new();
+    for (n, (start, key, header, mergeable)) in headings.iter().enumerate() {
+        let end = headings.get(n + 1).map_or(text.len(), |next| next.0);
+        let raw = text[*start..end].to_owned();
+        let (local, kinds, structured) = if *mergeable {
+            parse_body(&raw)
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        let mut indices = Vec::new();
+        for (kind, entry_text) in local {
+            let id = entries.len();
+            indices.push(id);
+            entries.push(Entry {
+                title: entry_title(&entry_text),
+                text: entry_text,
+                location: Location {
+                    section: key.clone(),
+                    kind,
+                },
             });
         }
+        sections.push(Section {
+            key: key.clone(),
+            header: header.clone(),
+            raw,
+            entries: indices,
+            kinds,
+            structured,
+            mergeable: *mergeable,
+        });
     }
-    joins.sort_by_key(|join| join.body.start);
-    joins
+    Ok(Document {
+        prefix,
+        sections,
+        entries,
+    })
 }
 
-/// The span of `lines`' `## [Unreleased]` section: its heading's line and the line after its
-/// last (the next `## ` heading, or the end).
-fn unreleased_span(lines: &[&str]) -> Option<(usize, usize)> {
-    let unreleased = lines.iter().position(|line| is_unreleased(line))?;
-    let end = (unreleased + 1..lines.len())
-        .find(|&n| lines[n].starts_with("## "))
-        .unwrap_or(lines.len());
-    Some((unreleased, end))
+fn bracket_key(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("## [")?;
+    let (key, tail) = rest.split_once(']')?;
+    if key.is_empty() || !(tail.is_empty() || tail.starts_with([' ', '\t', '-'])) {
+        return None;
+    }
+    Some(key.to_owned())
 }
 
-/// `added` with each run of its consecutive lines inside `from..to` moved up while the line above
-/// the run is the same as its last line. Git's diff places an added run at one of the equal
-/// places where the lines around it repeat, which leave the same text; this takes the earliest,
-/// so a subsection added directly above one of its kind reads as added whole whichever of the
-/// two identical headings the diff gave it.
-fn slid_up(lines: &[&str], added: &BTreeSet<usize>, from: usize, to: usize) -> BTreeSet<usize> {
-    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
-    for &n in added {
-        match runs.last_mut() {
-            Some(run) if run.end == n => run.end += 1,
-            _ => runs.push(n..n + 1),
-        }
-    }
-    let mut slid = BTreeSet::new();
-    for run in runs {
-        let (mut start, mut end) = (run.start, run.end);
-        if start >= from && end <= to {
-            while start > from && !slid.contains(&(start - 1)) && lines[start - 1] == lines[end - 1]
-            {
-                start -= 1;
-                end -= 1;
+type ParsedBody = (Vec<(Option<String>, String)>, Vec<Option<String>>, bool);
+
+fn kind_heading(line: &str) -> Option<&str> {
+    line.strip_prefix("### ")
+        .map(|heading| heading.trim().trim_end_matches('#').trim())
+}
+
+fn parse_body(raw: &str) -> ParsedBody {
+    let body = raw.split_once('\n').map_or("", |(_, body)| body);
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut entries = Vec::new();
+    let mut kinds = Vec::new();
+    let mut kind = None::<String>;
+    let mut structured = true;
+    let mut at = 0;
+    while at < lines.len() {
+        let line = lines[at];
+        if let Some(heading) = kind_heading(line) {
+            kind = Some(heading.to_owned());
+            if !kinds.contains(&kind) {
+                kinds.push(kind.clone());
             }
-        }
-        slid.extend(start..end);
-    }
-    slid
-}
-
-/// `lines` without its leading and trailing blank lines.
-fn trimmed(lines: &[String]) -> &[String] {
-    let mut lines = lines;
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines = &lines[1..];
-    }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines = &lines[..lines.len() - 1];
-    }
-    lines
-}
-
-/// Join `top` (the lines of subsections that sat above it) and `bottom` (of ones below) into the
-/// first `### <kind>` subsection under `kept`'s `## [Unreleased]`: `top` at the top of its lines,
-/// `bottom` after its last, each with one blank line around it. Its own lines stay as they are.
-fn join_into(kept: &mut Vec<String>, kind: &str, top: Vec<String>, bottom: Vec<String>) {
-    // The subsection's heading and the line after its last (the next heading, or the end).
-    let bounds = |kept: &[String]| {
-        let unreleased = kept.iter().position(|line| is_unreleased(line))?;
-        let end = (unreleased + 1..kept.len())
-            .find(|&n| kept[n].starts_with("## "))
-            .unwrap_or(kept.len());
-        let heading = (unreleased + 1..end).find(|&n| {
-            kept[n]
-                .strip_prefix("### ")
-                .is_some_and(|h| h.trim() == kind)
-        })?;
-        let next = (heading + 1..end)
-            .find(|&n| kept[n].starts_with("### "))
-            .unwrap_or(end);
-        Some((heading, next))
-    };
-    if !top.is_empty() {
-        let Some((heading, next)) = bounds(kept) else {
-            return;
-        };
-        let mut at = heading + 1;
-        while at < next && kept[at].trim().is_empty() {
             at += 1;
+            continue;
         }
-        let mut insert = Vec::new();
-        if at == heading + 1 {
-            insert.push(String::new());
+        if is_entry(line) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind.clone());
+            }
+            let start = at;
+            let mut end = at + 1;
+            at += 1;
+            while at < lines.len()
+                && (lines[at].trim().is_empty() || lines[at].starts_with(char::is_whitespace))
+            {
+                if !lines[at].trim().is_empty() {
+                    end = at + 1;
+                }
+                at += 1;
+            }
+            entries.push((kind.clone(), lines[start..end].join("\n")));
+            continue;
         }
-        insert.extend(top);
-        insert.push(String::new());
-        kept.splice(at..at, insert);
+        if !line.trim().is_empty() {
+            structured = false;
+        }
+        at += 1;
     }
-    if !bottom.is_empty() {
-        let Some((heading, next)) = bounds(kept) else {
-            return;
-        };
-        let mut last = next;
-        while last > heading + 1 && kept[last - 1].trim().is_empty() {
-            last -= 1;
-        }
-        let mut insert = vec![String::new()];
-        insert.extend(bottom);
-        if !(last < kept.len() && kept[last].trim().is_empty()) {
-            insert.push(String::new());
-        }
-        kept.splice(last..last, insert);
-    }
-}
-
-fn is_unreleased(line: &str) -> bool {
-    line.trim_end() == UNRELEASED
+    (entries, kinds, structured)
 }
 
 fn is_entry(line: &str) -> bool {
     line.starts_with("- ") || line.starts_with("* ")
 }
 
-fn is_heading(line: &str) -> bool {
-    line.starts_with("## ") || line.starts_with("### ")
-}
-
-/// Where the entry starting at `start` ends: past its last non-blank line before the first later
-/// line that is neither blank nor indented (another entry, a heading), so an entry's indented
-/// paragraphs and the blank lines between them are its own, as census's `changelog-repeat` reads
-/// one.
-fn entry_end(lines: &[&str], start: usize) -> usize {
-    let mut end = start + 1;
-    let mut at = start + 1;
-    while at < lines.len()
-        && (lines[at].trim().is_empty() || lines[at].starts_with(char::is_whitespace))
-    {
-        at += 1;
-        if !lines[at - 1].trim().is_empty() {
-            end = at;
-        }
-    }
-    end
-}
-
-/// Whether the subsection headed at `heading` loses its last entry to `gone`: it holds a line in
-/// `gone`, and nothing but blank lines once `gone` goes.
-fn emptied(lines: &[&str], heading: usize, gone: &BTreeSet<usize>) -> bool {
-    let (mut lost, mut left) = (false, false);
-    for (n, line) in lines
-        .iter()
-        .enumerate()
-        .skip(heading + 1)
-        .take_while(|(_, line)| !is_heading(line))
-    {
-        if gone.contains(&n) {
-            lost = true;
-        } else if !line.trim().is_empty() {
-            left = true;
-        }
-    }
-    lost && !left
-}
-
-/// Put `block` (entries, each followed by a blank line) at the top of `kind` under
-/// `## [Unreleased]`, adding that subsection where the section has none.
-fn place(kept: &mut Vec<String>, kind: Option<&str>, mut block: Vec<String>) {
-    let Some(unreleased) = kept.iter().position(|line| is_unreleased(line)) else {
-        return;
-    };
-    let end = kept
-        .iter()
-        .enumerate()
-        .skip(unreleased + 1)
-        .find(|(_, line)| line.starts_with("## "))
-        .map_or(kept.len(), |(n, _)| n);
-    let below_blanks = |from: usize| {
-        let mut at = from;
-        while at < end && kept[at].trim().is_empty() {
-            at += 1;
-        }
-        at
-    };
-    let at = match kind {
-        None => below_blanks(unreleased + 1),
-        Some(kind) => {
-            let own = (unreleased + 1..end).find(|&n| {
-                kept[n]
-                    .strip_prefix("### ")
-                    .is_some_and(|h| h.trim() == kind)
-            });
-            match own {
-                Some(heading) => below_blanks(heading + 1),
-                None => {
-                    let rank = |name: &str| KINDS.iter().position(|k| *k == name);
-                    let later = rank(kind).and_then(|mine| {
-                        (unreleased + 1..end).find(|&n| {
-                            kept[n]
-                                .strip_prefix("### ")
-                                .and_then(|h| rank(h.trim()))
-                                .is_some_and(|theirs| theirs > mine)
-                        })
-                    });
-                    let mut heading = vec![format!("### {kind}"), String::new()];
-                    heading.append(&mut block);
-                    block = heading;
-                    match later {
-                        Some(n) => n,
-                        None => {
-                            if end > 0 && !kept[end - 1].trim().is_empty() {
-                                block.insert(0, String::new());
-                            }
-                            end
-                        }
-                    }
-                }
-            }
-        }
-    };
-    kept.splice(at..at, block);
-}
-
-/// An entry's title: its bold lead (`- **…**`, which may wrap), else its first words.
-fn title(entry: &[&str]) -> String {
-    let words = entry
-        .iter()
-        .flat_map(|line| line.split_whitespace())
+fn entry_title(text: &str) -> String {
+    let words = text
+        .lines()
+        .flat_map(str::split_whitespace)
         .skip(1)
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(lead) = words.strip_prefix("**")
-        && let Some((bold, _)) = lead.split_once("**")
-    {
-        return bold.to_owned();
-    }
-    words.chars().take(72).collect()
+    entry_identity_from_words(&words).unwrap_or_else(|| words.chars().take(72).collect())
 }
 
-/// What the landing did, in a clause: the entries it moved and the ones it dropped, each by its
-/// title, and the subsections it joined, by their kind.
-pub(super) fn said(rehomed: &Rehomed) -> String {
-    let quoted = |titles: &[String]| {
-        titles
+fn entry_identity(text: &str) -> Option<String> {
+    let words = text
+        .lines()
+        .flat_map(str::split_whitespace)
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    entry_identity_from_words(&words)
+}
+
+fn entry_identity_from_words(words: &str) -> Option<String> {
+    let lead = words.strip_prefix("**")?;
+    let (bold, _) = lead.split_once("**")?;
+    (!bold.is_empty()).then(|| bold.to_owned())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SideState {
+    Exact(usize),
+    Rewrite(usize),
+    Absent,
+}
+
+impl SideState {
+    fn side(self) -> Option<usize> {
+        match self {
+            Self::Exact(side) | Self::Rewrite(side) => Some(side),
+            Self::Absent => None,
+        }
+    }
+
+    fn exact(self) -> Option<usize> {
+        match self {
+            Self::Exact(side) => Some(side),
+            Self::Rewrite(_) | Self::Absent => None,
+        }
+    }
+}
+
+struct SideView {
+    states: Vec<SideState>,
+    additions: Vec<usize>,
+}
+
+fn addition_identities(
+    document: &Document,
+    additions: &[usize],
+    which: &str,
+) -> Result<BTreeMap<(Location, String), usize>, Conflict> {
+    let mut identities = BTreeMap::new();
+    for &side in additions {
+        let entry = &document.entries[side];
+        let Some(identity) = entry_identity(&entry.text) else {
+            continue;
+        };
+        let key = (entry.location.clone(), identity);
+        if let Some(previous) = identities.insert(key, side) {
+            return Err(Conflict::new(
+                format!("{which} repeats one newly added titled entry"),
+                [
+                    document.entries[previous].title.clone(),
+                    entry.title.clone(),
+                ],
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+fn classify(base: &Document, side: &Document, which: &str) -> Result<SideView, Conflict> {
+    let mut states = vec![SideState::Absent; base.entries.len()];
+    let mut used = vec![false; side.entries.len()];
+    let mut base_by_text = BTreeMap::<&str, Vec<usize>>::new();
+    let mut side_by_text = BTreeMap::<&str, Vec<usize>>::new();
+    for (id, entry) in base.entries.iter().enumerate() {
+        base_by_text.entry(&entry.text).or_default().push(id);
+    }
+    for (id, entry) in side.entries.iter().enumerate() {
+        side_by_text.entry(&entry.text).or_default().push(id);
+    }
+    for (text, base_ids) in base_by_text {
+        let mut side_ids = side_by_text.remove(text).unwrap_or_default();
+        // Match copies in their old semantic location first, then match remaining copies by file
+        // order. The latter is sufficient for a move and keeps duplicate accounting bounded.
+        for &base_id in &base_ids {
+            if let Some(at) = side_ids.iter().position(|&side_id| {
+                side.entries[side_id].location == base.entries[base_id].location
+            }) {
+                let side_id = side_ids.remove(at);
+                used[side_id] = true;
+                states[base_id] = SideState::Exact(side_id);
+            }
+        }
+        let unmatched: Vec<usize> = base_ids
+            .into_iter()
+            .filter(|&id| matches!(states[id], SideState::Absent))
+            .collect();
+        for (base_id, side_id) in unmatched.into_iter().zip(side_ids) {
+            used[side_id] = true;
+            states[base_id] = SideState::Exact(side_id);
+        }
+    }
+
+    // A bold lead is the stable identity used by the hand-written notes and their integrity
+    // guard. It can therefore prove a rewrite even when that rewrite also moves subsection.
+    let identities: BTreeSet<String> = base
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| matches!(states[*id], SideState::Absent))
+        .filter_map(|(_, entry)| entry_identity(&entry.text))
+        .chain(
+            side.entries
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !used[*id])
+                .filter_map(|(_, entry)| entry_identity(&entry.text)),
+        )
+        .collect();
+    for identity in identities {
+        let old: Vec<usize> = base
+            .entries
             .iter()
-            .map(|title| format!("\"{title}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let one = |titles: &[String]| titles.len() == 1;
-    let mut parts = Vec::new();
-    if !rehomed.moved.is_empty() {
-        let moved = &rehomed.moved;
-        parts.push(format!(
-            "moved {} {} this branch adds from under a release cut after {} written to \
-             [Unreleased]: {}",
-            moved.len(),
-            if one(moved) {
-                "CHANGELOG entry"
-            } else {
-                "CHANGELOG entries"
-            },
-            if one(moved) { "it was" } else { "they were" },
-            quoted(moved)
-        ));
-    }
-    if !rehomed.dropped.is_empty() {
-        let dropped = &rehomed.dropped;
-        parts.push(format!(
-            "dropped {} of {} the changelog holds elsewhere from under a release cut: {}",
-            if one(dropped) {
-                "a copy".to_owned()
-            } else {
-                format!("{} copies", dropped.len())
-            },
-            if one(dropped) { "an entry" } else { "entries" },
-            quoted(dropped)
-        ));
-    }
-    if !rehomed.revived.is_empty() {
-        let revived = &rehomed.revived;
-        parts.push(format!(
-            "dropped {} no commit of this branch wrote and main no longer holds, which a merge \
-             brought back: {}",
-            if one(revived) {
-                "an entry's words".to_owned()
-            } else {
-                format!("{} entries' words", revived.len())
-            },
-            quoted(revived)
-        ));
-    }
-    if !rehomed.joined.is_empty() {
-        let joined = rehomed
-            .joined
-            .iter()
-            .map(|(kind, count)| match count {
-                1 => format!("a `### {kind}` subsection"),
-                _ => format!("{count} `### {kind}` subsections"),
+            .enumerate()
+            .filter(|(id, entry)| {
+                matches!(states[*id], SideState::Absent)
+                    && entry_identity(&entry.text).as_deref() == Some(identity.as_str())
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!(
-            "joined {joined} this branch adds under [Unreleased] beside another of its kind into \
-             that one"
+            .map(|(id, _)| id)
+            .collect();
+        let new: Vec<usize> = side
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(id, entry)| {
+                !used[*id] && entry_identity(&entry.text).as_deref() == Some(identity.as_str())
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if old.is_empty() || new.is_empty() {
+            continue;
+        }
+        if let ([old], [new]) = (old.as_slice(), new.as_slice()) {
+            states[*old] = SideState::Rewrite(*new);
+            used[*new] = true;
+            continue;
+        }
+        return Err(Conflict::new(
+            format!("{which} has ambiguous copies of the titled entry {identity:?}"),
+            old.iter()
+                .map(|&id| base.entries[id].title.clone())
+                .chain(new.iter().map(|&id| side.entries[id].title.clone())),
         ));
     }
-    parts.join("; ")
+
+    let mut locations = BTreeSet::new();
+    for (id, entry) in base.entries.iter().enumerate() {
+        if matches!(states[id], SideState::Absent) {
+            locations.insert(entry.location.clone());
+        }
+    }
+    for (id, entry) in side.entries.iter().enumerate() {
+        if !used[id] {
+            locations.insert(entry.location.clone());
+        }
+    }
+    for location in locations {
+        let old: Vec<usize> = base
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(id, entry)| {
+                matches!(states[*id], SideState::Absent) && entry.location == location
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let new: Vec<usize> = side
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(id, entry)| !used[*id] && entry.location == location)
+            .map(|(id, _)| id)
+            .collect();
+        match (old.as_slice(), new.as_slice()) {
+            ([old], [new]) => {
+                states[*old] = SideState::Rewrite(*new);
+                used[*new] = true;
+            }
+            ([], _) | (_, []) => {}
+            _ => {
+                let names = old
+                    .iter()
+                    .map(|&id| base.entries[id].title.clone())
+                    .chain(new.iter().map(|&id| side.entries[id].title.clone()));
+                return Err(Conflict::new(
+                    format!(
+                        "{which} has an ambiguous multi-entry replacement in [{}]{}",
+                        location.section,
+                        location
+                            .kind
+                            .as_ref()
+                            .map_or_else(String::new, |kind| format!(" / ### {kind}"))
+                    ),
+                    names,
+                ));
+            }
+        }
+    }
+    let additions = used
+        .iter()
+        .enumerate()
+        .filter_map(|(id, used)| (!used).then_some(id))
+        .collect();
+    Ok(SideView { states, additions })
+}
+
+#[derive(Clone, Debug)]
+struct ResultEntry {
+    text: String,
+    title: String,
+    location: Location,
+    base: Option<Location>,
+    tip: Option<usize>,
+    main: Option<usize>,
+}
+
+impl ResultEntry {
+    fn addition(entry: &Entry, tip: Option<usize>, main: Option<usize>) -> Self {
+        Self {
+            text: entry.text.clone(),
+            title: entry.title.clone(),
+            location: entry.location.clone(),
+            base: None,
+            tip,
+            main,
+        }
+    }
+}
+
+fn merge_old(
+    old: &Entry,
+    tip_state: SideState,
+    tip: &Document,
+    main_state: SideState,
+    main: &Document,
+) -> Result<Option<(String, String, Location)>, Conflict> {
+    let tip_entry = tip_state.side().map(|side| &tip.entries[side]);
+    let main_entry = main_state.side().map(|side| &main.entries[side]);
+    let tip_moved = tip_entry.is_some_and(|entry| entry.location != old.location);
+    let main_moved = main_entry.is_some_and(|entry| entry.location != old.location);
+    match (tip_state, main_state) {
+        (SideState::Absent, SideState::Absent) => return Ok(None),
+        (SideState::Absent, SideState::Exact(_)) if !main_moved => return Ok(None),
+        (SideState::Exact(_), SideState::Absent) if !tip_moved => return Ok(None),
+        (SideState::Absent, SideState::Exact(_) | SideState::Rewrite(_))
+        | (SideState::Exact(_) | SideState::Rewrite(_), SideState::Absent) => {
+            let changed = tip_entry.or(main_entry).expect("one side holds the entry");
+            return Err(Conflict::new(
+                "one side removed an entry while the other rewrote or moved it",
+                [old.title.clone(), changed.title.clone()],
+            ));
+        }
+        _ => {}
+    }
+    let tip_entry = tip_entry.expect("present tip entry");
+    let main_entry = main_entry.expect("present main entry");
+    let tip_rewrite = matches!(tip_state, SideState::Rewrite(_));
+    let main_rewrite = matches!(main_state, SideState::Rewrite(_));
+    let chosen = match (tip_rewrite, main_rewrite) {
+        (false, false) => old,
+        (true, false) => tip_entry,
+        (false, true) => main_entry,
+        (true, true) if tip_entry.text == main_entry.text => tip_entry,
+        (true, true) => {
+            return Err(Conflict::new(
+                "the branch and main rewrote one entry differently",
+                [
+                    old.title.clone(),
+                    tip_entry.title.clone(),
+                    main_entry.title.clone(),
+                ],
+            ));
+        }
+    };
+    let location = scalar(
+        &old.location,
+        &tip_entry.location,
+        &main_entry.location,
+        "the branch and main moved one entry differently",
+        [old.title.clone()],
+    )?;
+    Ok(Some((chosen.text.clone(), chosen.title.clone(), location)))
+}
+
+fn scalar<T: Clone + PartialEq>(
+    base: &T,
+    tip: &T,
+    main: &T,
+    reason: &str,
+    entries: impl IntoIterator<Item = String>,
+) -> Result<T, Conflict> {
+    if tip == main {
+        Ok(tip.clone())
+    } else if tip == base {
+        Ok(main.clone())
+    } else if main == base {
+        Ok(tip.clone())
+    } else {
+        Err(Conflict::new(reason, entries))
+    }
+}
+
+fn section_presence(
+    base: &Document,
+    tip: &Document,
+    main: &Document,
+    frozen: &BTreeSet<String>,
+    result: &[ResultEntry],
+) -> Result<BTreeSet<String>, Conflict> {
+    let keys: BTreeSet<String> = base
+        .keys()
+        .into_iter()
+        .chain(tip.keys())
+        .chain(main.keys())
+        .collect();
+    let mut present = BTreeSet::new();
+    for key in keys {
+        let held = if frozen.contains(&key) {
+            true
+        } else {
+            scalar(
+                &base.section(&key).is_some(),
+                &tip.section(&key).is_some(),
+                &main.section(&key).is_some(),
+                &format!("the branch and main changed section [{key}] incompatibly"),
+                Vec::new(),
+            )?
+        };
+        if held {
+            present.insert(key);
+        }
+    }
+    for entry in result {
+        if !present.contains(&entry.location.section) {
+            return Err(Conflict::new(
+                format!(
+                    "an entry remains while section [{}] was removed",
+                    entry.location.section
+                ),
+                [entry.title.clone()],
+            ));
+        }
+    }
+    Ok(present)
+}
+
+fn section_headers(
+    base: &Document,
+    tip: &Document,
+    main: &Document,
+    frozen: &BTreeSet<String>,
+    present: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, Conflict> {
+    let mut headers = BTreeMap::new();
+    for key in present {
+        if frozen.contains(key) {
+            headers.insert(
+                key.clone(),
+                main.section(key)
+                    .expect("frozen main section")
+                    .header
+                    .clone(),
+            );
+            continue;
+        }
+        let b = base.section(key).map(|section| section.header.as_str());
+        let t = tip.section(key).map(|section| section.header.as_str());
+        let m = main.section(key).map(|section| section.header.as_str());
+        let header = match (b, t, m) {
+            (Some(b), Some(t), Some(m)) => scalar(
+                &b,
+                &t,
+                &m,
+                &format!("the branch and main renamed section [{key}] differently"),
+                Vec::new(),
+            )?
+            .to_owned(),
+            (None, Some(t), None) => t.to_owned(),
+            (None, None, Some(m)) => m.to_owned(),
+            (None, Some(t), Some(m)) if t == m => t.to_owned(),
+            (Some(_), Some(t), None) => t.to_owned(),
+            (Some(_), None, Some(m)) => m.to_owned(),
+            _ => {
+                return Err(Conflict::new(
+                    format!("section [{key}] has no unambiguous heading"),
+                    Vec::new(),
+                ));
+            }
+        };
+        headers.insert(key.clone(), header);
+    }
+    Ok(headers)
+}
+
+fn merge_optional_raw(
+    base: Option<&Section>,
+    tip: Option<&Section>,
+    main: Option<&Section>,
+    key: &str,
+) -> Result<String, Conflict> {
+    match (base, tip, main) {
+        (Some(base), Some(tip), Some(main)) => scalar(
+            &base.raw,
+            &tip.raw,
+            &main.raw,
+            &format!("both sides changed plain section {key}"),
+            Vec::new(),
+        ),
+        (None, Some(tip), None) => Ok(tip.raw.clone()),
+        (None, None, Some(main)) => Ok(main.raw.clone()),
+        (None, Some(tip), Some(main)) if tip.raw == main.raw => Ok(tip.raw.clone()),
+        (Some(_), Some(tip), None) => Ok(tip.raw.clone()),
+        (Some(_), None, Some(main)) => Ok(main.raw.clone()),
+        _ => Err(Conflict::new(
+            format!("plain section {key} has no unambiguous contents"),
+            Vec::new(),
+        )),
+    }
+}
+
+fn section_order(
+    base: &Document,
+    tip: &Document,
+    main: &Document,
+    present: &BTreeSet<String>,
+) -> Result<Vec<String>, Conflict> {
+    let base_order: Vec<String> = base
+        .keys()
+        .into_iter()
+        .filter(|key| present.contains(key))
+        .collect();
+    let base_set: BTreeSet<String> = base_order.iter().cloned().collect();
+    let old_order = |document: &Document| {
+        document
+            .keys()
+            .into_iter()
+            .filter(|key| present.contains(key) && base_set.contains(key))
+            .collect::<Vec<_>>()
+    };
+    let tip_old = old_order(tip);
+    let main_old = old_order(main);
+    let order = changed_order(
+        &base_order,
+        &tip_old,
+        &main_old,
+        "the branch and main reordered changelog sections differently",
+        base_order.iter().map(|key| format!("## [{key}]")),
+    )?;
+    let old_positions: BTreeMap<String, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(position, key)| (key.clone(), position))
+        .collect();
+    let tip_sequence: Vec<String> = tip
+        .keys()
+        .into_iter()
+        .filter(|key| present.contains(key))
+        .collect();
+    let main_sequence: Vec<String> = main
+        .keys()
+        .into_iter()
+        .filter(|key| present.contains(key))
+        .collect();
+    let new: Vec<String> = present
+        .iter()
+        .filter(|key| !base_set.contains(*key))
+        .cloned()
+        .collect();
+    let gap_for = |sequence: &[String], key: &str| -> Result<usize, Conflict> {
+        let at = sequence
+            .iter()
+            .position(|held| held == key)
+            .expect("new section has a side source");
+        let previous = sequence[..at]
+            .iter()
+            .rev()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        let next = sequence[at + 1..]
+            .iter()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        match (previous, next) {
+            (Some(previous), Some(next)) if previous < next => Ok(next),
+            (Some(_), Some(_)) => Err(Conflict::new(
+                "a new changelog section's anchors were reversed by the other side's reorder",
+                [format!("## [{key}]")],
+            )),
+            (Some(previous), None) => Ok(previous + 1),
+            (None, Some(next)) => Ok(next),
+            (None, None) => Ok(order.len()),
+        }
+    };
+    let mut gaps = BTreeMap::<String, usize>::new();
+    for key in &new {
+        let tip_gap = tip_sequence
+            .contains(key)
+            .then(|| gap_for(&tip_sequence, key))
+            .transpose()?;
+        let main_gap = main_sequence
+            .contains(key)
+            .then(|| gap_for(&main_sequence, key))
+            .transpose()?;
+        let gap = match (tip_gap, main_gap) {
+            (Some(tip), Some(main)) if tip != main => {
+                return Err(Conflict::new(
+                    "the branch and main placed the same new changelog section differently",
+                    [format!("## [{key}]")],
+                ));
+            }
+            (Some(gap), _) | (_, Some(gap)) => gap,
+            (None, None) => unreachable!("new section has a side source"),
+        };
+        gaps.insert(key.clone(), gap);
+    }
+
+    let mut by_gap = BTreeMap::<usize, Vec<String>>::new();
+    for key in new {
+        by_gap.entry(gaps[&key]).or_default().push(key);
+    }
+    let mut ordered_new = BTreeMap::<usize, Vec<String>>::new();
+    for (gap, keys) in by_gap {
+        let key_set: BTreeSet<String> = keys.iter().cloned().collect();
+        let mut edges: BTreeMap<String, BTreeSet<String>> = keys
+            .iter()
+            .map(|key| (key.clone(), BTreeSet::new()))
+            .collect();
+        let mut indegree: BTreeMap<String, usize> =
+            keys.iter().map(|key| (key.clone(), 0)).collect();
+        for sequence in [&tip_sequence, &main_sequence] {
+            let sequence: Vec<&String> = sequence
+                .iter()
+                .filter(|key| key_set.contains(*key) && gaps[*key] == gap)
+                .collect();
+            for pair in sequence.windows(2) {
+                if edges
+                    .get_mut(pair[0])
+                    .expect("section edge")
+                    .insert((*pair[1]).clone())
+                {
+                    *indegree.get_mut(pair[1]).expect("section indegree") += 1;
+                }
+            }
+        }
+        let mut remaining = key_set;
+        let mut merged = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .filter(|key| indegree[*key] == 0)
+                .min_by_key(|key| {
+                    let main_at = main_sequence.iter().position(|held| held == *key);
+                    let tip_at = tip_sequence.iter().position(|held| held == *key);
+                    (
+                        if main_at.is_some() { 0_u8 } else { 1_u8 },
+                        main_at.or(tip_at).unwrap_or(usize::MAX),
+                        (*key).clone(),
+                    )
+                })
+                .cloned();
+            let Some(next) = next else {
+                return Err(Conflict::new(
+                    "the branch and main ordered new changelog sections incompatibly",
+                    remaining.iter().map(|key| format!("## [{key}]")),
+                ));
+            };
+            remaining.remove(&next);
+            for successor in &edges[&next] {
+                *indegree.get_mut(successor).expect("section indegree") -= 1;
+            }
+            merged.push(next);
+        }
+        ordered_new.insert(gap, merged);
+    }
+
+    let mut merged = Vec::with_capacity(present.len());
+    for gap in 0..=order.len() {
+        merged.extend(ordered_new.remove(&gap).unwrap_or_default());
+        if let Some(key) = order.get(gap) {
+            merged.push(key.clone());
+        }
+    }
+    debug_assert!(ordered_new.is_empty());
+    Ok(merged)
+}
+
+fn merge_new_around_old<T: Clone + Ord>(
+    old: &[T],
+    tip: &[T],
+    main: &[T],
+    new: &BTreeSet<T>,
+    noun: &str,
+    name: impl Fn(&T) -> String,
+) -> Result<Vec<T>, Conflict> {
+    let old_positions: BTreeMap<T, usize> = old
+        .iter()
+        .enumerate()
+        .map(|(position, value)| (value.clone(), position))
+        .collect();
+    let gap_for = |sequence: &[T], value: &T| -> Result<usize, Conflict> {
+        let at = sequence
+            .iter()
+            .position(|held| held == value)
+            .expect("new value has a side source");
+        let previous = sequence[..at]
+            .iter()
+            .rev()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        let next = sequence[at + 1..]
+            .iter()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        match (previous, next) {
+            (Some(previous), Some(next)) if previous < next => Ok(next),
+            (Some(_), Some(_)) => Err(Conflict::new(
+                format!("a new {noun}'s anchors were reversed by the other side's reorder"),
+                [name(value)],
+            )),
+            (Some(previous), None) => Ok(previous + 1),
+            (None, Some(next)) => Ok(next),
+            (None, None) => Ok(old.len()),
+        }
+    };
+    let mut gaps = BTreeMap::<T, usize>::new();
+    for value in new {
+        let tip_gap = tip
+            .contains(value)
+            .then(|| gap_for(tip, value))
+            .transpose()?;
+        let main_gap = main
+            .contains(value)
+            .then(|| gap_for(main, value))
+            .transpose()?;
+        let gap = match (tip_gap, main_gap) {
+            (Some(tip), Some(main)) if tip != main => {
+                return Err(Conflict::new(
+                    format!("the branch and main placed the same new {noun} differently"),
+                    [name(value)],
+                ));
+            }
+            (Some(gap), _) | (_, Some(gap)) => gap,
+            (None, None) => unreachable!("new value has a side source"),
+        };
+        gaps.insert(value.clone(), gap);
+    }
+
+    let mut by_gap = BTreeMap::<usize, Vec<T>>::new();
+    for value in new {
+        by_gap.entry(gaps[value]).or_default().push(value.clone());
+    }
+    let mut ordered_new = BTreeMap::<usize, Vec<T>>::new();
+    for (gap, values) in by_gap {
+        let value_set: BTreeSet<T> = values.iter().cloned().collect();
+        let mut edges: BTreeMap<T, BTreeSet<T>> = values
+            .iter()
+            .map(|value| (value.clone(), BTreeSet::new()))
+            .collect();
+        let mut indegree: BTreeMap<T, usize> =
+            values.iter().map(|value| (value.clone(), 0)).collect();
+        for sequence in [tip, main] {
+            let sequence: Vec<&T> = sequence
+                .iter()
+                .filter(|value| value_set.contains(*value) && gaps[*value] == gap)
+                .collect();
+            for pair in sequence.windows(2) {
+                if edges
+                    .get_mut(pair[0])
+                    .expect("new-value edge")
+                    .insert((*pair[1]).clone())
+                {
+                    *indegree.get_mut(pair[1]).expect("new-value indegree") += 1;
+                }
+            }
+        }
+        let mut remaining = value_set;
+        let mut merged = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .filter(|value| indegree[*value] == 0)
+                .min_by_key(|value| {
+                    let main_at = main.iter().position(|held| held == *value);
+                    let tip_at = tip.iter().position(|held| held == *value);
+                    (
+                        if main_at.is_some() { 0_u8 } else { 1_u8 },
+                        main_at.or(tip_at).unwrap_or(usize::MAX),
+                        (*value).clone(),
+                    )
+                })
+                .cloned();
+            let Some(next) = next else {
+                return Err(Conflict::new(
+                    format!("the branch and main ordered new {noun}s incompatibly"),
+                    remaining.iter().map(&name),
+                ));
+            };
+            remaining.remove(&next);
+            for successor in &edges[&next] {
+                *indegree.get_mut(successor).expect("new-value indegree") -= 1;
+            }
+            merged.push(next);
+        }
+        ordered_new.insert(gap, merged);
+    }
+
+    let mut merged = Vec::with_capacity(old.len() + new.len());
+    for gap in 0..=old.len() {
+        merged.extend(ordered_new.remove(&gap).unwrap_or_default());
+        if let Some(value) = old.get(gap) {
+            merged.push(value.clone());
+        }
+    }
+    debug_assert!(ordered_new.is_empty());
+    Ok(merged)
+}
+
+fn kind_order(
+    section: &str,
+    base: &Document,
+    tip: &Document,
+    main: &Document,
+    result: &[ResultEntry],
+) -> Result<Vec<Option<String>>, Conflict> {
+    let wanted: BTreeSet<Option<String>> = result
+        .iter()
+        .filter(|entry| entry.location.section == section)
+        .map(|entry| entry.location.kind.clone())
+        .collect();
+    // A kind is inherited only while a base-derived entry still occupies that same location.
+    // If its last old entry was removed and only a concurrent addition keeps the heading alive,
+    // the heading is new for ordering and takes its anchors from the side that added the entry.
+    let inherited: BTreeSet<Option<String>> = result
+        .iter()
+        .filter(|entry| entry.location.section == section)
+        .filter(|entry| entry.base.as_ref() == Some(&entry.location))
+        .map(|entry| entry.location.kind.clone())
+        .collect();
+    let sequence = |document: &Document| {
+        document.section(section).map_or_else(Vec::new, |section| {
+            section
+                .kinds
+                .iter()
+                .filter(|kind| wanted.contains(*kind))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    };
+    let b: Vec<Option<String>> = sequence(base)
+        .into_iter()
+        .filter(|kind| inherited.contains(kind))
+        .collect();
+    let t = sequence(tip);
+    let m = sequence(main);
+    let tip_old: Vec<Option<String>> = t
+        .iter()
+        .filter(|kind| inherited.contains(*kind))
+        .cloned()
+        .collect();
+    let main_old: Vec<Option<String>> = m
+        .iter()
+        .filter(|kind| inherited.contains(*kind))
+        .cloned()
+        .collect();
+    let order = changed_order(
+        &b,
+        &tip_old,
+        &main_old,
+        &format!("the branch and main reordered subsections in [{section}] differently"),
+        b.iter().map(|kind| {
+            kind.as_ref().map_or_else(
+                || "entries without a subsection".to_owned(),
+                |k| format!("### {k}"),
+            )
+        }),
+    )?;
+    let new: BTreeSet<Option<String>> = wanted.difference(&inherited).cloned().collect();
+    merge_new_around_old(
+        &order,
+        &t,
+        &m,
+        &new,
+        &format!("subsection in [{section}]"),
+        |kind| {
+            kind.as_ref().map_or_else(
+                || "entries without a subsection".to_owned(),
+                |kind| format!("### {kind}"),
+            )
+        },
+    )
+}
+
+fn changed_order<T: Clone + Eq>(
+    base: &[T],
+    tip: &[T],
+    main: &[T],
+    reason: &str,
+    names: impl IntoIterator<Item = String>,
+) -> Result<Vec<T>, Conflict> {
+    if tip == main {
+        Ok(tip.to_vec())
+    } else if tip == base {
+        Ok(main.to_vec())
+    } else if main == base {
+        Ok(tip.to_vec())
+    } else {
+        Err(Conflict::new(reason, names))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry_order(
+    location: &Location,
+    nodes: &[usize],
+    base: &Document,
+    tip: &Document,
+    main: &Document,
+    base_to_node: &[Option<usize>],
+    tip_to_node: &[Option<usize>],
+    main_to_node: &[Option<usize>],
+    result: &[ResultEntry],
+) -> Result<Vec<usize>, Conflict> {
+    let wanted: BTreeSet<usize> = nodes.iter().copied().collect();
+    let inherited: Vec<usize> = base
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.location == *location)
+        .filter_map(|(id, _)| base_to_node[id])
+        .filter(|node| wanted.contains(node))
+        .collect();
+    let inherited_set: BTreeSet<usize> = inherited.iter().copied().collect();
+    let side_sequence = |document: &Document, mapping: &[Option<usize>]| {
+        document
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.location == *location)
+            .filter_map(|(id, _)| mapping[id])
+            .filter(|node| wanted.contains(node))
+            .collect::<Vec<_>>()
+    };
+    let tip_sequence = side_sequence(tip, tip_to_node);
+    let main_sequence = side_sequence(main, main_to_node);
+    let tip_old: Vec<usize> = tip_sequence
+        .iter()
+        .copied()
+        .filter(|node| inherited_set.contains(node))
+        .collect();
+    let main_old: Vec<usize> = main_sequence
+        .iter()
+        .copied()
+        .filter(|node| inherited_set.contains(node))
+        .collect();
+    let old = changed_order(
+        &inherited,
+        &tip_old,
+        &main_old,
+        &format!(
+            "the branch and main reordered entries in [{}]{} differently",
+            location.section,
+            location
+                .kind
+                .as_ref()
+                .map_or_else(String::new, |kind| format!(" / ### {kind}"))
+        ),
+        inherited.iter().map(|node| result[*node].title.clone()),
+    )?;
+
+    let old_positions: BTreeMap<usize, usize> = old
+        .iter()
+        .enumerate()
+        .map(|(position, node)| (*node, position))
+        .collect();
+    let gap_for = |sequence: &[usize], node: usize| -> Result<(usize, usize), Conflict> {
+        let side_at = sequence
+            .iter()
+            .position(|held| *held == node)
+            .expect("result addition has a side source");
+        let previous = sequence[..side_at]
+            .iter()
+            .rev()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        let next = sequence[side_at + 1..]
+            .iter()
+            .find_map(|candidate| old_positions.get(candidate).copied());
+        let gap = match (previous, next) {
+            (Some(previous), Some(next)) if previous < next => next,
+            (Some(_), Some(_)) => {
+                return Err(Conflict::new(
+                    "an added entry's anchors were reversed by the other side's reorder",
+                    [result[node].title.clone()],
+                ));
+            }
+            (Some(previous), None) => previous + 1,
+            (None, Some(next)) => next,
+            (None, None) => old.len(),
+        };
+        Ok((gap, side_at))
+    };
+
+    let additions: Vec<usize> = nodes
+        .iter()
+        .copied()
+        .filter(|node| !inherited_set.contains(node))
+        .collect();
+    let mut gaps = BTreeMap::<usize, usize>::new();
+    for &node in &additions {
+        let tip_place = tip_sequence
+            .contains(&node)
+            .then(|| gap_for(&tip_sequence, node))
+            .transpose()?;
+        let main_place = main_sequence
+            .contains(&node)
+            .then(|| gap_for(&main_sequence, node))
+            .transpose()?;
+        let gap = match (tip_place, main_place) {
+            (Some((tip_gap, _)), Some((main_gap, _))) if tip_gap != main_gap => {
+                return Err(Conflict::new(
+                    "the branch and main placed the same added entry at different anchors",
+                    [result[node].title.clone()],
+                ));
+            }
+            (Some((gap, _)), _) | (_, Some((gap, _))) => gap,
+            (None, None) => unreachable!("result addition has a side source"),
+        };
+        gaps.insert(node, gap);
+    }
+
+    let mut by_gap = BTreeMap::<usize, Vec<usize>>::new();
+    for node in additions {
+        by_gap.entry(gaps[&node]).or_default().push(node);
+    }
+
+    let mut ordered_additions = BTreeMap::<usize, Vec<usize>>::new();
+    for (gap, additions) in by_gap {
+        let additions_set: BTreeSet<usize> = additions.iter().copied().collect();
+        let mut edges: BTreeMap<usize, BTreeSet<usize>> = additions
+            .iter()
+            .map(|&node| (node, BTreeSet::new()))
+            .collect();
+        let mut indegree: BTreeMap<usize, usize> =
+            additions.iter().map(|&node| (node, 0)).collect();
+        for sequence in [&tip_sequence, &main_sequence] {
+            let sequence: Vec<usize> = sequence
+                .iter()
+                .copied()
+                .filter(|node| additions_set.contains(node) && gaps[node] == gap)
+                .collect();
+            for pair in sequence.windows(2) {
+                if edges
+                    .get_mut(&pair[0])
+                    .expect("addition edge")
+                    .insert(pair[1])
+                {
+                    *indegree.get_mut(&pair[1]).expect("addition indegree") += 1;
+                }
+            }
+        }
+
+        let mut remaining = additions_set;
+        let mut ordered = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .copied()
+                .filter(|node| indegree[node] == 0)
+                .min_by_key(|node| {
+                    let main_at = main_sequence.iter().position(|held| held == node);
+                    let tip_at = tip_sequence.iter().position(|held| held == node);
+                    (
+                        if main_at.is_some() { 0_u8 } else { 1_u8 },
+                        main_at.or(tip_at).unwrap_or(usize::MAX),
+                        *node,
+                    )
+                });
+            let Some(next) = next else {
+                return Err(Conflict::new(
+                    "the branch and main ordered added entries incompatibly",
+                    remaining.iter().map(|node| result[*node].title.clone()),
+                ));
+            };
+            remaining.remove(&next);
+            ordered.push(next);
+            for successor in &edges[&next] {
+                *indegree.get_mut(successor).expect("successor indegree") -= 1;
+            }
+        }
+        ordered_additions.insert(gap, ordered);
+    }
+
+    for &node in nodes {
+        debug_assert!(inherited_set.contains(&node) || gaps.contains_key(&node));
+    }
+    let mut merged = Vec::with_capacity(nodes.len());
+    for gap in 0..=old.len() {
+        merged.extend(ordered_additions.remove(&gap).unwrap_or_default());
+        if let Some(&node) = old.get(gap) {
+            merged.push(node);
+        }
+    }
+    debug_assert!(ordered_additions.is_empty());
+    Ok(merged)
+}
+
+fn section_result_matches(
+    section: &Section,
+    entries: &[Entry],
+    header: &str,
+    groups: &[(Option<String>, Vec<usize>)],
+    result: &[ResultEntry],
+) -> bool {
+    section.header == header
+        && section.kinds.iter().eq(groups.iter().map(|(kind, _)| kind))
+        && section
+            .raw
+            .lines()
+            .filter_map(kind_heading)
+            .eq(groups.iter().filter_map(|(kind, _)| kind.as_deref()))
+        && section
+            .entries
+            .iter()
+            .map(|&node| (&entries[node].location.kind, &entries[node].text))
+            .eq(groups.iter().flat_map(|(kind, nodes)| {
+                nodes.iter().map(move |&node| (kind, &result[node].text))
+            }))
+}
+
+fn render(
+    header: &str,
+    groups: &[(Option<String>, Vec<usize>)],
+    result: &[ResultEntry],
+    last: bool,
+) -> String {
+    let mut out = header.to_owned();
+    for (kind, nodes) in groups {
+        out.push_str("\n\n");
+        if let Some(kind) = kind {
+            out.push_str("### ");
+            out.push_str(kind);
+            out.push_str("\n\n");
+        }
+        for (n, node) in nodes.iter().enumerate() {
+            if n > 0 {
+                out.push_str("\n\n");
+            }
+            out.push_str(result[*node].text.trim_end_matches('\n'));
+        }
+    }
+    out.push('\n');
+    if !last {
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const MAIN: &str = "# Changelog
-
-Write each change under `## [Unreleased]`.
-
-## [Unreleased]
-
-## [0.2.0] - 2026-11-08
-
-### Changed
-
-- **Main's change.** Shipped in 0.2.0.
-
-### Fixed
-
-- **Main's fix.** Shipped in 0.2.0,
-  over two lines.
-
-## [0.1.0] - 2026-11-01
-
-### Fixed
-
-- **The first fix.** Shipped in 0.1.0.
-";
-
-    /// What a branch wrote under `[Unreleased]`: `entries`.
-    fn wrote_unreleased(entries: &[&str]) -> Written {
-        entries
-            .iter()
-            .map(|entry| {
-                let said = words(&entry.split('\n').collect::<Vec<_>>());
-                (said, Wrote::Unreleased(BTreeSet::new()))
-            })
-            .collect()
-    }
-
-    /// `text` with `entry` inserted before the line `before`: the text, and the inserted lines.
-    fn insert(text: &str, before: &str, entry: &str) -> (String, BTreeSet<usize>) {
-        let at = text.find(before).expect("the anchor");
-        let first = text[..at].matches('\n').count();
-        let count = entry.matches('\n').count();
-        (
-            format!("{}{entry}{}", &text[..at], &text[at..]),
-            (first..first + count).collect(),
-        )
-    }
-
-    /// THE RULE: an entry a branch wrote into `[Unreleased]` that the merge put under a release
-    /// cut meanwhile goes back to the top of its kind there, and the released section is left as
-    /// the release shipped it. CONTROLS: nothing moves where the entry is under `[Unreleased]`
-    /// already, where every line is added but main holds each entry (main's own changelog), where
-    /// main holds the entry's words (an entry moved or reordered among the releases), where the
-    /// branch wrote it under the release (a restored or backfilled entry), where it wrote it
-    /// under `[Unreleased]` after that release was cut (and moved it there), or where main names
-    /// no such release (a cut of the branch's own); and words no commit of the branch wrote,
-    /// which main does not hold, go (a merge brought them back).
-    #[test]
-    fn an_added_entry_under_a_released_version_moves_to_the_top_of_its_kind_unreleased() {
-        let entry = "- **The branch's fix.** Written before the cut,\n  landed after it.\n\n";
-        let branch = wrote_unreleased(&[entry]);
-        let (merged, added) = insert(MAIN, "- **Main's fix.**", entry);
-        let rehomed = rehome(&merged, &added, MAIN, &branch).expect("the stranded entry moves");
-        assert_eq!(
-            (rehomed.moved, rehomed.dropped),
-            (vec!["The branch's fix.".to_owned()], Vec::new())
-        );
-        assert_eq!(
-            rehomed.text,
-            MAIN.replace(
-                "## [Unreleased]\n\n## [0.2.0]",
-                "## [Unreleased]\n\n### Fixed\n\n- **The branch's fix.** Written before the \
-                 cut,\n  landed after it.\n\n## [0.2.0]"
-            )
-        );
-        let in_place = rehomed.text.clone();
-        let placed: BTreeSet<usize> = (6..10).collect();
-        assert_eq!(
-            rehome(&in_place, &placed, MAIN, &branch),
-            None,
-            "already under [Unreleased]"
-        );
-        let every: BTreeSet<usize> = (0..MAIN.lines().count()).collect();
-        assert_eq!(
-            rehome(MAIN, &every, MAIN, &Written::new()),
-            None,
-            "main's own entries"
-        );
-        assert_eq!(
-            rehome(&merged, &added, &merged, &branch),
-            None,
-            "main holds it"
-        );
-        let as_written = |wrote: Wrote| -> Written {
-            branch
-                .keys()
-                .map(|said| (said.clone(), wrote.clone()))
-                .collect()
-        };
-        assert_eq!(
-            rehome(&merged, &added, MAIN, &as_written(Wrote::Released)),
-            None,
-            "the branch wrote it under the release"
-        );
-        let beside = Wrote::Unreleased(BTreeSet::from(["## [0.2.0] - 2026-11-08".to_owned()]));
-        assert_eq!(
-            rehome(&merged, &added, MAIN, &as_written(beside)),
-            None,
-            "the branch wrote it after 0.2.0 was cut and moved it there"
-        );
-        let uncut = MAIN.replace("## [0.2.0] - 2026-11-08\n\n", "");
-        assert_eq!(
-            rehome(&merged, &added, &uncut, &branch),
-            None,
-            "a release main does not name"
-        );
-        let revived = rehome(&merged, &added, MAIN, &Written::new()).expect("words main removed");
-        assert_eq!(
-            (revived.moved, revived.revived, revived.text),
-            (
-                Vec::new(),
-                vec!["The branch's fix.".to_owned()],
-                MAIN.to_owned()
-            ),
-            "no commit of the branch wrote it and main does not hold it: a merge brought it back"
-        );
-    }
-
-    /// An entry joins an `[Unreleased]` subsection of its kind at its top; a kind the section
-    /// lacks is added in Keep a Changelog's order (Changed before Fixed); several entries keep
-    /// their order; and a `### <kind>` heading the branch added with them, left empty, goes too.
-    #[test]
-    fn moved_entries_join_their_kind_in_order_and_take_an_emptied_added_heading_with_them() {
-        let main = MAIN.replace(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n### Fixed\n\n- **A fix after the cut.** Unreleased.\n\n",
-        );
-        let (merged, mut added) = insert(
-            &main,
-            "- **Main's change.**",
-            "- **First change.** One.\n\n- **Second change.** Two.\n\n",
-        );
-        let (merged, more) = insert(
-            &merged,
-            "## [0.1.0]",
-            "### Removed\n\n- **A removal.** Gone.\n\n",
-        );
-        // The second insertion shifts nothing before it.
-        added.extend(more);
-        let branch = wrote_unreleased(&[
-            "- **First change.** One.",
-            "- **Second change.** Two.",
-            "- **A removal.** Gone.",
-        ]);
-        let rehomed = rehome(&merged, &added, &main, &branch).expect("three entries move");
-        assert_eq!(
-            rehomed.moved,
-            ["First change.", "Second change.", "A removal."]
-        );
-        let unreleased = rehomed
-            .text
-            .split("## [0.2.0]")
-            .next()
-            .expect("the head")
-            .split("\n## [Unreleased]")
-            .nth(1)
-            .expect("the section")
-            .to_owned();
-        assert_eq!(
-            unreleased,
-            "\n\n### Changed\n\n- **First change.** One.\n\n- **Second change.** Two.\n\n\
-             ### Removed\n\n- **A removal.** Gone.\n\n### Fixed\n\n- **A fix after the cut.** \
-             Unreleased.\n\n"
-        );
-        assert!(
-            rehomed
-                .text
-                .contains("over two lines.\n\n## [0.1.0] - 2026-11-01\n\n### Fixed\n"),
-            "the emptied `### Removed` the branch added goes:\n{}",
-            rehomed.text
-        );
-        assert_eq!(
-            rehomed.text.matches("\n\n\n").count(),
-            0,
-            "no doubled blank line:\n{}",
-            rehomed.text
-        );
-    }
-
-    /// A HUNK THAT REWRITES ONE OF MAIN'S LINES IS AN EDIT, NOT AN ADDITION: a fix to a released
-    /// entry's words stays in its release. CONTROL: the same lines from a pure insertion, and one
-    /// whose only removed line is blank (git's union merge can drop the blank line between two
-    /// entries), are added.
-    #[test]
-    fn only_lines_a_hunk_adds_without_rewriting_a_line_of_mains_are_added() {
-        let edit = "diff --git a/CHANGELOG.md b/CHANGELOG.md\n--- a/CHANGELOG.md\n+++ \
-                    b/CHANGELOG.md\n@@ -11 +11 @@ ### Changed\n-- **Main's chnage.** Shipped.\n+- \
-                    **Main's change.** Shipped.\n";
-        assert_eq!(added_lines(edit), BTreeSet::new());
-        let insertion = "--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -14,0 +15,3 @@ ### \
-                         Fixed\n+- **New.** One\n+  two.\n+\n";
-        assert_eq!(added_lines(insertion), (14..17).collect());
-        let blank_dropped = "@@ -14 +14,3 @@\n-\n+\n+- **New.** One.\n+\n@@ -30,0 +31 @@\n+x\n";
-        assert_eq!(added_lines(blank_dropped), BTreeSet::from([13, 14, 15, 30]));
-        let deleted_only = "@@ -3,2 +2,0 @@\n-a\n-b\n";
-        assert_eq!(added_lines(deleted_only), BTreeSet::new());
-    }
-
-    /// A HUNK GIT JOINED ACROSS UNCHANGED LINES (`diff.interHunkContext`) READS AS THE CHANGES IT
-    /// HOLDS: its context lines (blank ones written empty under `diff.suppressBlankEmpty`
-    /// included) are never added, and each change is judged alone, so a rewrite beside an
-    /// insertion keeps only the insertion's lines.
-    #[test]
-    fn a_joined_hunk_adds_only_its_own_insertions() {
-        let joined = "@@ -10,3 +10,7 @@\n+- **N1.** One.\n+\n - **A.** Main's.\n \n+- **N2.** \
-                      Two.\n+\n";
-        assert_eq!(added_lines(joined), BTreeSet::from([9, 10, 13, 14]));
-        assert_eq!(
-            added_lines(&joined.replace("\n \n", "\n\n")),
-            BTreeSet::from([9, 10, 13, 14])
-        );
-        let beside = "@@ -5,2 +5,3 @@\n-old\n+new\n ctx\n+add\n";
-        assert_eq!(added_lines(beside), BTreeSet::from([6]));
-    }
-
-    /// A STRANDED COPY OF AN ENTRY THE FILE HOLDS ELSEWHERE IS DROPPED, NOT MOVED: a branch
-    /// that once merged main's unreleased entry, merged across the cut that left main's copy
-    /// under `[Unreleased]`, holds a second copy under the release (2026-11-08, measured on a
-    /// real merge), and moving it would only make `[Unreleased]` say it twice. CONTROL: a new
-    /// entry beside it moves, and a title whose bold lead wraps onto its next line is whole.
-    #[test]
-    fn a_stranded_copy_of_an_entry_held_elsewhere_is_dropped_and_a_wrapped_title_is_whole() {
-        let main = MAIN.replace(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n### Fixed\n\n- **Main's late fix.** Not in 0.2.0.\n\n",
-        );
-        let (merged, added) = insert(
-            &main,
-            "- **Main's fix.**",
-            "- **Main's late fix.** Not in 0.2.0.\n\n- **A new fix whose title\n  wraps.** \
-             Its words.\n\n",
-        );
-        let branch = wrote_unreleased(&["- **A new fix whose title
-  wraps.** Its words."]);
-        let rehomed = rehome(&merged, &added, &main, &branch).expect("one moves, one drops");
-        assert_eq!(rehomed.moved, ["A new fix whose title wraps."]);
-        assert_eq!(rehomed.dropped, ["Main's late fix."]);
-        assert_eq!(
-            rehomed.text,
-            main.replace(
-                "### Fixed\n\n- **Main's late fix.**",
-                "### Fixed\n\n- **A new fix whose title\n  wraps.** Its words.\n\n- **Main's \
-                 late fix.**"
-            )
-        );
-        assert_eq!(
-            said(&rehomed),
-            "moved 1 CHANGELOG entry this branch adds from under a release cut after it was \
-             written to [Unreleased]: \"A new fix whose title wraps.\"; dropped a copy of an \
-             entry the changelog holds elsewhere from under a release cut: \"Main's late fix.\""
-        );
-    }
-
-    /// An entry of two paragraphs moves whole: its indented second paragraph is its own.
-    /// CONTROL: the entry after it, main's, stays where it is.
-    #[test]
-    fn an_entry_of_two_paragraphs_moves_whole() {
-        let entry = "- **Two paragraphs.** The first.\n\n  The second.\n\n";
-        let (merged, added) = insert(MAIN, "- **Main's fix.**", entry);
-        let rehomed =
-            rehome(&merged, &added, MAIN, &wrote_unreleased(&[entry])).expect("the entry moves");
-        assert_eq!(rehomed.moved, ["Two paragraphs."]);
-        assert_eq!(
-            rehomed.text,
-            MAIN.replace(
-                "## [Unreleased]\n\n## [0.2.0]",
-                &format!("## [Unreleased]\n\n### Fixed\n\n{entry}## [0.2.0]")
-            )
-        );
-    }
-
-    /// An entry whose next non-blank line starts at the margin but opens nothing (a code fence,
-    /// straight after it or after a blank line) has no clear end, so it stays; and an empty
-    /// `### <kind>` the branch added under `[Unreleased]` stays while a stranded entry moves.
-    /// CONTROL: the same entry with an indented fence moves.
-    #[test]
-    fn an_entry_without_a_clear_end_stays_and_an_unreleased_heading_is_never_swept() {
-        let branch = wrote_unreleased(&["- **Code.** Run:"]);
-        for fenced in [
-            "- **Code.** Run:\n```\nx\n```\n\n",
-            "- **Code.** Run:\n\n```\nx\n```\n\n",
-        ] {
-            let (merged, added) = insert(MAIN, "- **Main's fix.**", fenced);
-            assert_eq!(rehome(&merged, &added, MAIN, &branch), None, "{fenced:?}");
-        }
-        let indented = "- **Code.** Run:\n  ```\n  x\n  ```\n\n";
-        let (merged, added) = insert(MAIN, "- **Main's fix.**", indented);
-        let (merged, more) = insert(&merged, "## [0.2.0]", "### Security\n\n");
-        let added: BTreeSet<usize> = added.iter().map(|n| n + 2).chain(more).collect();
-        let indented_branch = wrote_unreleased(&[indented]);
-        let rehomed =
-            rehome(&merged, &added, MAIN, &indented_branch).expect("the indented one moves");
-        assert_eq!(rehomed.moved, ["Code."]);
-        assert!(
-            rehomed.text.contains("### Security\n\n## [0.2.0]"),
-            "{}",
-            rehomed.text
-        );
-    }
-
-    #[test]
-    fn a_changelog_with_no_unreleased_section_is_left_alone() {
-        let text = "# Changelog\n\n## [0.1.0]\n\n- **Fix.** One.\n";
-        assert_eq!(rehome(text, &(0..6).collect(), "", &Written::new()), None);
-    }
-
-    /// A changelog whose `## [Unreleased]` body is `unreleased`, above one release.
-    fn changelog(unreleased: &str) -> String {
-        format!(
-            "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [0.1.0] - 2026-11-01\n\n### \
-             Fixed\n\n- **The first fix.** Shipped.\n"
-        )
-    }
-
-    /// `text`'s 0-based lines that `main` lacks, as a diff of the two would add them: here,
-    /// one run of lines inserted after `main`'s own.
-    fn appended(text: &str, main: &str) -> BTreeSet<usize> {
-        let (ours, theirs): (Vec<&str>, Vec<&str>) =
-            (text.split('\n').collect(), main.split('\n').collect());
-        let lead = ours.iter().zip(&theirs).take_while(|(a, b)| a == b).count();
-        let tail = ours[lead..]
-            .iter()
-            .rev()
-            .zip(theirs[lead..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        (lead..ours.len() - tail).collect()
-    }
-
-    /// A `### <kind>` SUBSECTION THE LANDING ADDS BESIDE MAIN'S OF ITS KIND JOINS IT, over
-    /// 7d1464cf8bb's shape as a real `git merge --no-ff` under the union driver writes it
-    /// (2026-11-10): the branch put `### Fixed` first and reworded the entry under
-    /// `### Changed`; main wrote a new entry above that one; the merge kept main's side whole
-    /// and added the branch's `### Changed` below it. The added subsection's entry follows main's
-    /// last, its heading goes, and main's lines stay as they are; running it again changes
-    /// nothing. The mirror (the added one above main's) puts its entries at the top of main's,
-    /// and a surplus copy inside an added subsection goes with one blank line left. CONTROLS: a
-    /// kind main's own lines say twice stays; a subsection the landing adds only in part (main's
-    /// entry inside it) stays; a section holding an HTML comment is left alone; an added bare
-    /// `### <kind>` under a release, with nothing to join or settle, is `None`.
-    /// NEGATIVE CONTROL (2026-11-10): without the join, `rehome` returns `None` here; joining
-    /// into the first of the kind fails the mirror, a join block kept without the blank-line
-    /// collapse doubles the blank where the copy sat, and no early `None` fails the bare heading.
-    #[test]
-    fn a_kind_the_landing_adds_a_second_time_joins_mains() {
-        let old = "- **Old words.** Said once.\n\n";
-        let mains = "- **Main's change.** Written meanwhile.\n\n";
-        let fixed = "### Fixed\n\n- **First fix.** One.\n\n";
-        let new = "- **New words.** Said better.\n\n";
-        let main = changelog(&format!("### Changed\n\n{mains}{old}{fixed}"));
-        let union = changelog(&format!(
-            "### Changed\n\n{mains}{old}{fixed}### Changed\n\n{new}"
-        ));
-        let added = appended(&union, &main);
-        let branch = wrote_unreleased(&[new]);
-        let rehomed = rehome(&union, &added, &main, &branch).expect("the kinds join");
-        assert_eq!(rehomed.joined, [("Changed".to_owned(), 1)]);
-        assert_eq!(
-            rehomed.text,
-            changelog(&format!("### Changed\n\n{mains}{old}{new}{fixed}"))
-        );
-        assert_eq!(
-            said(&rehomed),
-            "joined a `### Changed` subsection this branch adds under [Unreleased] beside another \
-             of its kind into that one"
-        );
-        let mirror_main = changelog(&format!("{fixed}### Changed\n\n{mains}{old}"));
-        let mirror = changelog(&format!(
-            "### Changed\n\n{new}{fixed}### Changed\n\n{mains}{old}"
-        ));
-        let mirrored = rehome(
-            &mirror,
-            &appended(&mirror, &mirror_main),
-            &mirror_main,
-            &branch,
-        )
-        .expect("the mirror joins");
-        assert_eq!(mirrored.joined, [("Changed".to_owned(), 1)]);
-        assert_eq!(
-            mirrored.text,
-            changelog(&format!("{fixed}### Changed\n\n{new}{mains}{old}"))
-        );
-        let next = "- **Next words.** Said last.\n\n";
-        let copied = changelog(&format!(
-            "### Changed\n\n{mains}{old}{fixed}### Changed\n\n{new}{mains}{next}"
-        ));
-        let both = wrote_unreleased(&[new, next]);
-        let rehomed_copy = rehome(&copied, &appended(&copied, &main), &main, &both)
-            .expect("the copy goes and the kinds join");
-        assert_eq!(rehomed_copy.dropped, ["Main's change."]);
-        assert_eq!(
-            rehomed_copy.text,
-            changelog(&format!("### Changed\n\n{mains}{old}{new}{next}{fixed}"))
-        );
-        let (bare, bare_added) = insert(
-            &main,
-            "### Fixed\n\n- **The first fix.**",
-            "### Security\n\n",
-        );
-        assert_eq!(
-            rehome(&bare, &bare_added, &main, &branch),
-            None,
-            "an added bare heading under a release"
-        );
-        let settled = appended(&rehomed.text, &main);
-        assert_eq!(
-            rehome(&rehomed.text, &settled, &main, &branch),
-            None,
-            "settled"
-        );
-        assert_eq!(
-            rehome(&union, &BTreeSet::new(), &union, &branch),
-            None,
-            "main's own lines say `### Changed` twice"
-        );
-        // The branch adds a `### Changed` heading above main's entry and its own entry below it.
-        let partly_main = changelog(&format!("### Changed\n\n{old}{fixed}{mains}"));
-        let (step, mut partly_added) =
-            insert(&partly_main, "- **Main's change.**", "### Changed\n\n");
-        let (partly, more) = insert(&step, "## [0.1.0]", new);
-        partly_added.extend(more);
-        assert_eq!(
-            rehome(&partly, &partly_added, &partly_main, &branch),
-            None,
-            "the second `### Changed` holds main's entry"
-        );
-        let commented = union.replace(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n<!-- note -->\n\n",
-        );
-        let commented_main = main.replace(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n<!-- note -->\n\n",
-        );
-        assert_eq!(
-            rehome(
-                &commented,
-                &appended(&commented, &commented_main),
-                &commented_main,
-                &branch
-            ),
-            None,
-            "an HTML comment in the section"
-        );
-    }
-
-    /// WHICH LINES A JOIN TAKES: only its heading and the lines the landing adds, so a blank line
-    /// main holds after it (a compact section's, or the file's last line) stays; a subsection
-    /// added directly above one of its kind joins whichever identical heading git's diff gave it;
-    /// two of one kind join and are counted; a bare heading the branch added under a release stays
-    /// beside a join. CONTROL: a branch that reorders a kind main's own lines repeat adds no
-    /// heading main lacks, and the kind stays as it holds it.
-    /// NEGATIVE CONTROL (2026-11-10): removing the joined subsection's whole range loses the
-    /// blank lines and final newline; without the slide the adjacent subsection never joins;
-    /// without the heading count main's repeat is joined; an `emptied` that needs no lost line
-    /// removes the bare heading.
-    #[test]
-    fn a_join_takes_only_the_lines_the_landing_adds() {
-        let new = "- **New words.** N.";
-        let branch = wrote_unreleased(&[new, "- **B2.** Two.", "- **E5.** e5."]);
-        // A compact section: no blank line before the added heading, main's blank line after it.
-        let main = "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **M.** m.\n\n### Fixed\n\n- \
-                    **F1.** one.\n- **F2.** two.\n\n## [0.1.0] - 2026-11-01\n";
-        let (compact, added) = insert(main, "\n## [0.1.0]", &format!("### Changed\n\n{new}\n"));
-        let rehomed = rehome(&compact, &added, main, &branch).expect("the kinds join");
-        assert_eq!(
-            rehomed.text,
-            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **M.** m.\n\n- **New words.** \
-             N.\n\n### Fixed\n\n- **F1.** one.\n- **F2.** two.\n\n## [0.1.0] - 2026-11-01\n"
-        );
-        // `## [Unreleased]` the file's last section: its final newline stays.
-        let last = "# Changelog\n\n## [Unreleased]\n### Changed\n- **M.** m.\n### Fixed\n- **F.** \
-                    f.\n";
-        let at_end = format!("{last}### Changed\n{new}\n");
-        let added: BTreeSet<usize> = [7, 8].into();
-        let rehomed = rehome(&at_end, &added, last, &branch).expect("the kinds join");
-        assert_eq!(
-            rehomed.text,
-            "# Changelog\n\n## [Unreleased]\n### Changed\n- **M.** m.\n\n- **New words.** \
-             N.\n\n### Fixed\n- **F.** f.\n"
-        );
-        // Directly above main's `### Changed`, as git's diff gives it: the added run starts at
-        // the entry and takes the lower heading.
-        let e1 = "- **E1.** e1.\n\n";
-        let e2 = "- **E2.** e2.\n\n";
-        let e5 = "- **E5.** e5.\n\n";
-        let main = changelog(&format!("### Fixed\n\n{e1}### Changed\n\n{e2}"));
-        let (adjacent, added) = insert(&main, "- **E2.**", &format!("{e5}### Changed\n\n"));
-        let rehomed = rehome(&adjacent, &added, &main, &branch).expect("the adjacent one joins");
-        assert_eq!(
-            rehomed.text,
-            changelog(&format!("### Fixed\n\n{e1}### Changed\n\n{e5}{e2}"))
-        );
-        assert_eq!(
-            rehome(
-                &rehomed.text,
-                &appended(&rehomed.text, &main),
-                &main,
-                &branch
-            ),
-            None,
-            "settled"
-        );
-        // Two `### Changed` the landing adds, and a bare `### Security` under the release.
-        let m1 = "- **M1.** Main.\n\n";
-        let f1 = "- **F1.** Fix.\n\n";
-        let main = changelog(&format!("### Changed\n\n{m1}### Fixed\n\n{f1}"));
-        let (step, mut added) = insert(&main, "### Fixed", "### Changed\n\n- **B1.** One.\n\n");
-        let (step, more) = insert(&step, "## [0.1.0]", "### Changed\n\n- **B2.** Two.\n\n");
-        added.extend(more);
-        let at = step.matches('\n').count() - 3;
-        let (twice, more) = insert(
-            &step,
-            "### Fixed\n\n- **The first fix.**",
-            "### Security\n\n",
-        );
-        let more: Vec<usize> = more.into_iter().collect();
-        assert_eq!(more[0], at, "the heading sits under the release");
-        added.extend(more);
-        let branch = wrote_unreleased(&["- **B1.** One.", "- **B2.** Two."]);
-        let rehomed = rehome(&twice, &added, &main, &branch).expect("both join");
-        assert_eq!(rehomed.joined, [("Changed".to_owned(), 2)]);
-        assert_eq!(
-            said(&rehomed),
-            "joined 2 `### Changed` subsections this branch adds under [Unreleased] beside \
-             another of its kind into that one"
-        );
-        assert_eq!(
-            rehomed.text,
-            changelog(&format!(
-                "### Changed\n\n{m1}- **B1.** One.\n\n- **B2.** Two.\n\n### Fixed\n\n{f1}"
-            ))
-            .replace(
-                "### Fixed\n\n- **The first fix.**",
-                "### Security\n\n### Fixed\n\n- **The first fix.**"
-            )
-        );
-        // A branch that reorders main's own repeat: `### Fixed` twice before and after.
-        let a1 = "- **A1.** a1.\n\n";
-        let b1 = "- **B1.** b1.\n\n";
-        let c1 = "- **C1.** c1.\n\n";
-        let main = changelog(&format!(
-            "### Fixed\n\n{a1}### Changed\n\n{c1}### Fixed\n\n{b1}"
-        ));
-        let reordered = changelog(&format!(
-            "### Changed\n\n{c1}### Fixed\n\n{b1}### Fixed\n\n{a1}"
-        ));
-        // The diff deletes main's first `### Fixed` (a removal of non-blank lines adds nothing)
-        // and adds the last one.
-        let start = reordered
-            .split('\n')
-            .position(|l| l == "- **A1.** a1.")
-            .expect("A1")
-            - 2;
-        let added: BTreeSet<usize> = (start..start + 4).collect();
-        assert_eq!(
-            rehome(&reordered, &added, &main, &branch),
-            None,
-            "main's own repeat"
-        );
-    }
-
-    /// WHAT A COMMIT WROTE is each entry it holds that none of its parents does, a merge's own
-    /// resolution (words in neither parent) included, with the release headings its changelog
-    /// holds where it wrote it under `[Unreleased]`: one a commit moves down (a cut, merged or
-    /// replayed) is not written, one moved up from a release is written under `[Unreleased]`, and
-    /// a release beside every write under `[Unreleased]` is kept, in whichever order the writes
-    /// come.
-    /// NEGATIVE CONTROL (2026-11-08): with a later write replacing an earlier one, the write under
-    /// a release replaces the write under `[Unreleased]`.
-    #[test]
-    fn a_commit_writes_the_entries_none_of_its_parents_holds() {
-        let wanted: BTreeSet<String> = [
-            "- **New.** One.",
-            "- **Resolved.** In the merge.",
-            "- **Mine.** Two.",
-        ]
-        .map(str::to_owned)
-        .into();
-        let placed = |changelog: &str| placed(changelog, &wanted);
-        let main = placed(MAIN);
-        let both: BTreeSet<String> = ["## [0.1.0] - 2026-11-01", "## [0.2.0] - 2026-11-08"]
-            .map(str::to_owned)
-            .into();
-        let mut written = Written::new();
-        let (with_new, _) = insert(MAIN, "- **Main's fix.**", "- **New.** One.\n\n");
-        wrote(&mut written, &placed(&with_new), &[&main]);
-        let (resolved, _) = insert(MAIN, "## [0.2.0]", "- **Resolved.** In the merge.\n\n");
-        wrote(
-            &mut written,
-            &placed(&resolved),
-            &[&main, &placed(&with_new)],
-        );
-        assert_eq!(
-            written,
-            Written::from([
-                ("- **New.** One.".to_owned(), Wrote::Released),
-                (
-                    "- **Resolved.** In the merge.".to_owned(),
-                    Wrote::Unreleased(both.clone())
-                ),
-            ])
-        );
-
-        let mine = "- **Mine.** Two.";
-        let early = MAIN.replace("## [0.2.0] - 2026-11-08\n\n", "");
-        let (unreleased_early, _) = insert(&early, "### Changed", "- **Mine.** Two.\n\n");
-        let cut = unreleased_early.replace(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n## [0.2.0] - 2026-11-08\n\n",
-        );
-        let (unreleased_late, _) = insert(MAIN, "## [0.2.0]", "- **Mine.** Two.\n\n");
-        let (released, _) = insert(MAIN, "- **Main's fix.**", "- **Mine.** Two.\n\n");
-        let [early, unreleased_early, cut, unreleased_late, released] =
-            [early, unreleased_early, cut, unreleased_late, released].map(|t| placed(&t));
-        let only_early = Wrote::Unreleased(BTreeSet::from(["## [0.1.0] - 2026-11-01".to_owned()]));
-        let mut written = Written::new();
-        wrote(&mut written, &unreleased_early, &[&early]);
-        assert_eq!(written.get(mine), Some(&only_early), "written before 0.2.0");
-        wrote(&mut written, &cut, &[&unreleased_early]);
-        assert_eq!(written.get(mine), Some(&only_early), "a cut writes nothing");
-        wrote(&mut written, &released, &[&main]);
-        assert_eq!(
-            written.get(mine),
-            Some(&only_early),
-            "nor does a write under a release"
-        );
-        wrote(&mut written, &unreleased_late, &[&main]);
-        assert_eq!(written.get(mine), Some(&only_early), "beside every write");
-        let mut reversed = Written::new();
-        wrote(&mut reversed, &released, &[&main]);
-        assert_eq!(reversed.get(mine), Some(&Wrote::Released));
-        wrote(&mut reversed, &unreleased_late, &[&main]);
-        wrote(&mut reversed, &unreleased_early, &[&early]);
-        assert_eq!(reversed, written, "in either order");
-        let mut moved_up = Written::new();
-        wrote(&mut moved_up, &released, &[&main]);
-        wrote(&mut moved_up, &unreleased_late, &[&released]);
-        assert_eq!(
-            moved_up.get(mine),
-            Some(&Wrote::Unreleased(both.clone())),
-            "a move up writes it under [Unreleased]"
-        );
-    }
-
-    /// AN ENTRY IN QUESTION is one the landing adds whole and ending clearly whose words main does
-    /// not hold, and only those are placed, a rewrapped copy by its words: main's entry moved, an
-    /// entry with no clear end, and one the walk does not want are not.
-    /// NEGATIVE CONTROL (2026-11-08): with an entry's first words read from its first line alone,
-    /// the rewrapped entry is not placed.
-    #[test]
-    fn only_the_entries_in_question_are_placed() {
-        let (text, unreleased) = insert(
-            MAIN,
-            "## [0.2.0]",
-            "- **Main's change.** Shipped in 0.2.0.\n\n- **Mine.**\n  Two.\n\n",
-        );
-        let (text, fenced) = insert(&text, "## [0.1.0]", "- **Fenced.** Three.\n```\n\n");
-        let added: BTreeSet<usize> = unreleased.into_iter().chain(fenced).collect();
-        let mine = "- **Mine.** Two.".to_owned();
-        assert_eq!(
-            in_question(&text, &added, MAIN),
-            BTreeSet::from([mine.clone()])
-        );
-        let mains = "- **Main's fix.** Shipped in 0.2.0, over two lines.".to_owned();
-        assert_eq!(
-            placed(&text, &BTreeSet::from([mine.clone(), mains.clone()])).entries,
-            BTreeMap::from([(mine, true), (mains, false)])
-        );
-    }
-}
+#[path = "land_changelog_tests.rs"]
+mod tests;

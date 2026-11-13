@@ -3663,8 +3663,19 @@ fn feed_both(app: &mut (App, WindowId, u64), bare: &mut (App, WindowId, u64), by
 #[test]
 fn the_chips_write_no_rule_glyph() {
     let t0 = Instant::now();
-    let (mut app, wid, session, host) = settled_glass(120, t0);
-    let (mut bare, bare_wid, bare_session) = bare_glass(120);
+    // Leave a long rule alongside the continuation title, so its arc remains a real control.
+    const COLS: u16 = 160;
+    let (mut app, wid, session, host) = settled_glass(COLS, t0);
+    let (mut bare, bare_wid, bare_session) = bare_glass(COLS);
+    let continuation = app.continuation_words(session).into_owned();
+    assert!(!continuation.is_empty(), "CONTROL: a continuation title");
+    assert!(
+        glass_text(&app, wid, strip_rows(&app, wid) + 22, 0..usize::from(COLS))
+            .contains(&continuation),
+        "the status whose cells the write budget includes is on the glass"
+    );
+    // The eight chip cells, their two outer blanks, and the shown title with its two-cell gap.
+    let payload = "∞ yolo".chars().count() + 2 + continuation.chars().count() + 2;
     let line = painted(&app, wid).ink.len();
     assert!(
         line > 40,
@@ -3690,12 +3701,11 @@ fn the_chips_write_no_rule_glyph() {
         let floor = crate::work_counts::take_footer_cells_written();
         let _ = pass_cost(&mut app, wid);
         let cells = crate::work_counts::take_footer_cells_written();
-        // The chips are `∞ ● yolo`, eight cells, and the blank on each side of them.
-        let chips = cells.checked_sub(floor + line + arc);
-        assert!(
-            chips.is_some_and(|c| (1..=10).contains(&c)),
+        assert_eq!(
+            cells.checked_sub(floor + line + arc),
+            Some(payload),
             "pass {i}: {cells} cells written, the bare footer's {floor}, the line's {line} and \
-             the arc's {arc}"
+             the arc's {arc}, leaving only the chips and displayed title's {payload}"
         );
         assert_eq!(
             app.windows[&wid]
@@ -3706,7 +3716,7 @@ fn the_chips_write_no_rule_glyph() {
         );
     }
     let rule_row = strip_rows(&app, wid) + 22;
-    let glyphs = glass_text(&app, wid, rule_row, 0..120)
+    let glyphs = glass_text(&app, wid, rule_row, 0..usize::from(COLS))
         .chars()
         .filter(|c| *c == '\u{2500}')
         .count();

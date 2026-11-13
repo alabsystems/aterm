@@ -1881,7 +1881,7 @@ pub(crate) fn need_head(ask: &crate::needs::HarnessAsk) -> String {
 /// THE LANDING (§10.3.3, item 8): the host opens Settings ▸ Harness with this action ([`App::open_harness_settings`]), its value a [`HarnessFocus`]'s words, and the page's list lands on that row (drawn selected) or card.
 pub(crate) const HARNESS_LAND: &str = "harness/land";
 
-/// WHERE SETTINGS ▸ HARNESS LANDS as it opens (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top (View ▸ Coding Agent Harness…, the palette), a session's row (the Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘ off` chip: the switch that turned it off is there).
+/// WHERE SETTINGS ▸ HARNESS LANDS as it opens (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top (View ▸ Coding Agent Harness…, the palette), a session's row (the landing action naming it), or SUPERVISION (an `⊘ off` chip: the switch that turned it off is there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HarnessFocus {
     /// The page's top.
@@ -2055,7 +2055,7 @@ pub(crate) fn parse_every_action(action: &str) -> Option<EveryPress> {
             (!minutes_str.is_empty() && minutes_str.bytes().all(|b| b.is_ascii_digit()))
                 .then_some(())?;
             let minutes: u32 = minutes_str.parse().ok()?;
-            crate::autopilot_menu::LAND_IN_MINUTES
+            crate::autopilot_timers::LAND_IN_MINUTES
                 .contains(&minutes)
                 .then_some(EveryPress::Timer(TimerChoice::In(minutes)))
         }
@@ -2737,7 +2737,12 @@ impl App {
                 )
             };
             let set_by = word.and_then(|_| {
-                crate::autopilot::SetByWords::of(set_by, true, |sid| self.autopilot_setter_tab(sid))
+                crate::autopilot::SetByWords::of(
+                    set_by,
+                    true,
+                    |sid| self.autopilot_setter_tab(sid),
+                    |head| self.fleet_node_name(head),
+                )
             });
             let resolved = self.harness_session_name(handle.local_id, person, &handle.title);
             let (need, receipt, token) = {
@@ -2836,7 +2841,7 @@ impl App {
             .collect()
     }
 
-    /// A SESSION'S NAME as Settings ▸ Harness and its Autopilot menu give it: the person's name for its tab (`person`, the `title` its metadata carries), else THE TAB'S NAME AS THE STRIP RESOLVES IT, from the terminal it shows: the store's copy of the title (`stored`) is written only as the front tab's window title is published, so it is stale for a background tab, a pane the keyboard is not in, with Settings in front, and on a headless aterm.
+    /// A SESSION'S NAME as Settings ▸ Harness and a fact menu's header give it: the person's name for its tab (`person`, the `title` its metadata carries), else THE TAB'S NAME AS THE STRIP RESOLVES IT, from the terminal it shows: the store's copy of the title (`stored`) is written only as the front tab's window title is published, so it is stale for a background tab, a pane the keyboard is not in, with Settings in front, and on a headless aterm.
     pub(crate) fn harness_session_name(
         &self,
         local_id: u64,

@@ -57,6 +57,7 @@ fn fixture() -> LabState {
         reachability: Reachability::Reachable,
         instances: None,
         samples: Vec::new(),
+        lease_ms: None,
     });
     LabState {
         network: Arc::new(network),

@@ -13,7 +13,7 @@ use crate::row::{self, Digest, Fig, Kind, Line, Meter, Outcome, Row, Stop, parse
 use crate::sink::Sink;
 use crate::summary;
 
-fn facts() -> HostFacts {
+pub(crate) fn facts() -> HostFacts {
     HostFacts {
         host: "m14".to_owned(),
         model: "Mac16,6".to_owned(),
@@ -25,7 +25,7 @@ fn facts() -> HostFacts {
     }
 }
 
-fn row(at_ms: u64, kind: Kind, wall: u64) -> Row {
+pub(crate) fn row(at_ms: u64, kind: Kind, wall: u64) -> Row {
     Row {
         at_ms,
         kind: kind.clone(),
@@ -310,6 +310,97 @@ fn rotation_keeps_the_log_bounded_and_the_newest_rows() {
     assert!(ats[0] > 1, "the oldest rows were rotated away");
 }
 
+/// An append whose write fails and cannot be cut back says so ([`log::left_lines`]): what it
+/// wrote stays, so its writer asks the log before it writes those lines again. NEGATIVE CONTROL:
+/// the same failed write, cut back, leaves none of its bytes and says it left none.
+#[test]
+fn an_append_that_could_not_be_cut_back_says_it_may_have_left_its_lines() {
+    use std::sync::atomic::AtomicU64;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let lines = [
+        row(2, Kind::Command, 2).line(),
+        row(3, Kind::Command, 3).line(),
+    ];
+    for uncut in [false, true] {
+        let dir = tmp.path().join(format!("telemetry-{uncut}"));
+        let first = row(1, Kind::Command, 1).line();
+        Log::new(dir.clone(), Limits::DEFAULT, facts())
+            .append(std::slice::from_ref(&first))
+            .expect("the first row");
+        let before = std::fs::metadata(file_path(&dir, 0))
+            .expect("written")
+            .len();
+        let left = std::sync::Arc::new(AtomicU64::new(lines[0].len() as u64));
+        let mut log = Log::new(dir.clone(), Limits::DEFAULT, facts()).cut_after(left);
+        if uncut {
+            log = log.never_cut_back();
+        }
+        let (e, _) = log.append_saying(0, &lines).expect_err("the disk filled");
+        assert_eq!(log::left_lines(&e), uncut, "{e}");
+        let after = std::fs::metadata(file_path(&dir, 0)).expect("kept").len();
+        let read = log::read(&dir, 4, None).expect("read");
+        if uncut {
+            assert_eq!(
+                after,
+                before + lines[0].len() as u64,
+                "the first line stays"
+            );
+            assert_eq!(log.holds(&lines).expect("read"), [true, false]);
+        } else {
+            assert_eq!(after, before, "cut back");
+            assert_eq!(read.rows.len(), 1);
+        }
+    }
+}
+
+/// A writer that lost its record of an append asks the log which of its lines it holds: one in
+/// the newest file and one rotated up to the oldest count, and so does one its file holds but for
+/// its final line feed, as the reader reads it; one rotated away or never written does not.
+/// NEGATIVE CONTROL: a log whose lock another writer holds past the wait answers no reading.
+#[test]
+fn the_log_says_which_of_a_writers_lines_it_holds() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let limits = Limits {
+        file_bytes: 2_000,
+        files: 3,
+    };
+    let log = log_in(tmp.path(), limits);
+    let line = |at| row(at, Kind::Command, at).line();
+    for at in 1..=100 {
+        log.append(&[line(at)]).expect("append");
+    }
+    let oldest = log::read(log.dir(), limits.files, None).expect("read").rows[0].at_ms;
+    assert!(oldest > 1, "rotated away below {oldest}");
+    assert_eq!(
+        log.holds(&[line(100), line(oldest), line(oldest - 1), line(101)])
+            .expect("read"),
+        [true, true, false, false]
+    );
+    let cut = line(102);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(file_path(log.dir(), 0))
+        .expect("the newest file")
+        .write_all(cut.strip_suffix('\n').expect("a line").as_bytes())
+        .expect("written");
+    assert_eq!(log.holds(std::slice::from_ref(&cut)).expect("read"), [true]);
+    assert_eq!(log.holds(&[]).expect("nothing asked"), Vec::<bool>::new());
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(log.dir().join(".lock"))
+        .expect("the lock file");
+    aterm_uds::file_lock::lock_exclusive_until(
+        &held,
+        std::time::Instant::now() + Duration::from_secs(60),
+        "the test holds the telemetry lock",
+    )
+    .expect("held");
+    let waiting = log_in(tmp.path(), limits).waiting(Duration::from_millis(20));
+    assert!(waiting.holds(&[line(100)]).is_err(), "no reading");
+}
+
 #[test]
 fn a_crash_mid_write_costs_one_torn_line_and_the_next_row_is_whole() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -409,35 +500,40 @@ fn a_batch_cut_short_after_its_gap_line_never_has_the_line_said_twice() {
 
 /// A gap line cut only of its line feed would read as whole: the write is cut back, so the line
 /// the append reports unwritten is not in the log, and its rows are said once, by the next.
+/// Where the cut back fails too (TM-1 review), the line stays, taken as said: the next says only
+/// the row behind it. NEGATIVE CONTROL (by hand: the window's writer not taking the line it may
+/// have written as said): the two rows said again by the next line.
 #[test]
 fn a_gap_line_cut_before_its_line_feed_is_not_said_twice() {
     use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
     const HANG: Duration = Duration::from_secs(60);
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("telemetry");
-    let left = std::sync::Arc::new(AtomicU64::new(u64::MAX));
-    let log = Log::new(dir.clone(), Limits::DEFAULT, facts()).cut_after(left.clone());
-    let sink = Sink::start(log).expect("start");
-    sink.emit(row(1, Kind::Spawn, 1));
-    assert!(sink.flush(HANG), "the writer answers");
-    sink.counts().dropped.fetch_add(2, SeqCst);
-    let gap = row::gap_line(crate::now_ms(), 2).len() as u64;
-    left.store(gap - 1, SeqCst);
-    sink.emit(row(2, Kind::Spawn, 2));
-    assert!(sink.flush(HANG), "the writer answers");
-    left.store(u64::MAX, SeqCst);
-    sink.emit(row(3, Kind::Spawn, 3));
-    assert!(sink.flush(HANG), "the writer answers");
-    let read = log::read(&dir, 4, None).expect("read");
-    assert_eq!(
-        read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
-        vec![1, 3]
-    );
-    assert_eq!(
-        (read.dropped, read.torn),
-        (3, 0),
-        "the two and the row behind the cut line, each said once"
-    );
+    for uncut in [false, true] {
+        let dir = tmp.path().join(format!("telemetry-{uncut}"));
+        let left = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        let log = Log::new(dir.clone(), Limits::DEFAULT, facts()).cut_after(left.clone());
+        let sink = Sink::start(if uncut { log.never_cut_back() } else { log }).expect("start");
+        sink.emit(row(1, Kind::Spawn, 1));
+        assert!(sink.flush(HANG), "the writer answers");
+        sink.counts().dropped.fetch_add(2, SeqCst);
+        let gap = row::gap_line(crate::now_ms(), 2).len() as u64;
+        left.store(gap - 1, SeqCst);
+        sink.emit(row(2, Kind::Spawn, 2));
+        assert!(sink.flush(HANG), "the writer answers");
+        left.store(u64::MAX, SeqCst);
+        sink.emit(row(3, Kind::Spawn, 3));
+        assert!(sink.flush(HANG), "the writer answers");
+        let read = log::read(&dir, 4, None).expect("read");
+        assert_eq!(
+            read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            (read.dropped, read.torn),
+            (3, 0),
+            "the two and the row behind the cut line, each said once (uncut: {uncut})"
+        );
+    }
 }
 
 #[test]

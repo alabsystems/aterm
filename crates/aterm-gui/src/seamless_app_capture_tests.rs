@@ -11,7 +11,8 @@ use aterm_window::dpi::PhysicalSize;
 
 use super::ladder_tests::{assert_only_over_cap_links_dropped, hostile_walk_step, xorshift};
 use super::tests::{
-    ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env, run_in_children,
+    ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, pipe_pair, restore_env,
+    run_in_children,
 };
 use super::*;
 use crate::WindowId;
@@ -60,15 +61,15 @@ struct DeskPtys {
     // The stubs borrow these masters and have no live shell/reader that owns
     // them. Close both ends on unwind, before releasing the shared PTY lease.
     pairs: Vec<(u64, OwnedFd, OwnedFd)>,
-    _lease: aterm_pty::test_budget::Lease,
 }
 
 impl Default for DeskPtys {
     fn default() -> Self {
-        Self {
-            pairs: Vec::new(),
-            _lease: aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease"),
-        }
+        assert!(
+            crate::test_alone::in_child(),
+            "the parent admits the dense fixture before starting its isolated child"
+        );
+        Self { pairs: Vec::new() }
     }
 }
 

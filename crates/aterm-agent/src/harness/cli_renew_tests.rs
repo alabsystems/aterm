@@ -3,6 +3,16 @@
 
 //! Tests for `aterm harness accounts renew` and `adopt-default`.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use std::cell::RefCell;
 
 use super::*;
@@ -523,6 +533,7 @@ fn renewal_ready_opener_runs_the_selected_headless_route() {
     assert!(logins_of(&env).get("main").is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn renewal_manual_routes_do_not_require_an_unavailable_opener() {
     for ssh in [false, true] {
@@ -622,6 +633,7 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkpoint() {
     for change in ["identity", "removed", "unreadable", "missing", "binding"] {
@@ -697,6 +709,7 @@ fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkp
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity() {
     for reported in ["canonical@example.test", "alias@example.test"] {
@@ -741,6 +754,7 @@ fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding() {
     let (_tmp, env) = renew_env("renew-happy");
@@ -849,6 +863,7 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     for (switch, off) in [
@@ -899,6 +914,7 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_staging_home_is_never_a_rows_login_directory() {
     let (_tmp, env) = renew_env("renew-names");
@@ -937,6 +953,7 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     assert!(err.contains("already held files"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
@@ -970,6 +987,7 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
     assert!(report.contains("last renewal: wrong account"), "{report}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
     for (flow, cached) in [
@@ -1106,6 +1124,7 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
     no_address(&env, &[&out, &err]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstructed() {
     let (_tmp, env) = renew_env("renew-checkpoint-obstructed");
@@ -1139,6 +1158,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     no_address(&env, &[&out, &err]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
@@ -1199,6 +1219,7 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     no_address(&env, &[&out, &err]);
 }
 
+#[cfg(unix)]
 #[test]
 fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     let (_tmp, env) = renew_env("renew-ssh");
@@ -1248,6 +1269,7 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
 
 /// `--due` runs what a session here needs now, never a row nobody here runs on: a row with an email
 /// and no login, and nothing walled or due, is not due.
+#[cfg(unix)]
 #[test]
 fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     let (_tmp, env) = renew_env("renew-due-unneeded");
@@ -1270,6 +1292,7 @@ fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     assert!(host.flows.borrow().is_empty(), "no sign-in started");
 }
 
+#[cfg(unix)]
 #[test]
 fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let (_tmp, env) = renew_env("renew-due");
@@ -1289,7 +1312,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert_eq!(code, exit(0));
     assert_eq!(
         out, "nothing is due on this machine\n",
-        "a due login no session here ran on this week is not renewed (DESIGN-alab-one-mesh-2026-11-05.md §4.15 rule 4)"
+        "a due login no session here ran on this week is not renewed (docs/DESIGN-claude-accounts-v2-2026-10-15.md, 'No central provider polling', rule 4)"
     );
     assert!(host.flows.borrow().is_empty());
     env.accounts_store()
@@ -1513,6 +1536,7 @@ fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (_tmp, env) = renew_env("renew-verbs");
@@ -1558,6 +1582,7 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
 /// A row's page stopped its sign-in: no later automatic run passes that, so the report names the
 /// person's own sign-in instead of leaving the row to aterm, in the verb such a row takes.
 /// NEGATIVE CONTROL: the same row with `Failed` is left to aterm, naming no step.
+#[cfg(unix)]
 #[test]
 fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     let (_tmp, env) = renew_env("renew-blocked");
@@ -1709,6 +1734,7 @@ fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
 /// An agent's terminal opens no browser on this Mac: a row with no headless route is left to a
 /// person, and a headless run that failed gets no second, interactive one. CONTROL: a person at
 /// the same terminal gets both.
+#[cfg(unix)]
 #[test]
 fn an_agents_terminal_opens_no_browser_for_a_row() {
     for (agent, code, flows) in [(false, 0, 1), (true, 1, 0)] {
@@ -1732,6 +1758,7 @@ fn an_agents_terminal_opens_no_browser_for_a_row() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
     let (_tmp, env) = renew_env("renew-attempt");
@@ -1825,6 +1852,7 @@ fn login_and_renew_each_refuse_the_other_ones_rows() {
     no_address(&env, &[&err]);
 }
 
+#[cfg(unix)]
 #[test]
 fn adopt_default_lists_this_machines_own_login_once() {
     let tmp = tmp_dir("adopt");
@@ -2219,40 +2247,46 @@ fn a_hosted_code_file_with_no_valid_code_ends_the_capture() {
 #[test]
 fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
     use std::io::Write as _;
-    let tmp = aterm_tempfile::tempdir().unwrap();
-    let gate = tmp.path().join("gate");
-    let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
-    // SAFETY: c names a new FIFO in this test's private temporary directory.
-    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    let mut release = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&gate)
-        .unwrap();
-    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-    cmd.arg("-c").arg("printf 'opener-outcome=1\\nphase=failed\\nmet=bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7");
-    cmd.env("GATE", &gate);
-    let (done, result) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let answer = capture_unattended_renewal(cmd, std::time::Duration::from_secs(3600));
-        let _ = done.send(answer);
-    });
-    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-    let returned = answer.is_ok();
-    // Release our own blocked child cooperatively even on the old implementation.
-    writeln!(release, "finish").unwrap();
-    let answer =
-        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
-    worker.join().unwrap();
-    assert!(
-        returned,
-        "terminal opener failure held its capture until the provider budget"
-    );
-    let failure = answer.expect_err("a stopped capture is not a provider exit code");
-    assert_eq!(
-        failure.met.unwrap().word,
-        crate::harness::open_url::MetWord::BotCheck
-    );
+    // The second is an opener that failed having met nothing it names (ATERM-KI-1105-14).
+    for (met, word) in [
+        (
+            "bot-check claude.ai",
+            Some(crate::harness::open_url::MetWord::BotCheck),
+        ),
+        ("", None),
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let gate = tmp.path().join("gate");
+        let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: c names a new FIFO in this test's private temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let mut release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .unwrap();
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+        cmd.arg("-c").arg(format!("printf 'opener-outcome=1\\nphase=failed\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7"));
+        cmd.env("GATE", &gate);
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let answer = capture_unattended_renewal(cmd, std::time::Duration::from_secs(3600));
+            let _ = done.send(answer);
+        });
+        let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let returned = answer.is_ok();
+        // Release our own blocked child cooperatively even on the old implementation.
+        writeln!(release, "finish").unwrap();
+        let answer =
+            answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+        worker.join().unwrap();
+        assert!(
+            returned,
+            "terminal opener failure (met={met}) held its capture until the provider budget"
+        );
+        let failure = answer.expect_err("a stopped capture is not a provider exit code");
+        assert_eq!(failure.met.map(|met| met.word), word);
+    }
 }
 
 #[cfg(unix)]
@@ -2735,6 +2769,7 @@ fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identit
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn closing_automatic_work_between_provider_and_status_defers_without_adoption() {
     for close_at_status in [false, true] {

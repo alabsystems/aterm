@@ -120,8 +120,8 @@ fn baseline_notes(repo: &Path, bare: &Path) -> Result<String, String> {
         .into_iter()
         .filter(|entry| entry.starts_with(crate::changelog::HARNESS_ENTRY_HEAD))
         .collect();
-    let (start, end) =
-        crate::changelog::section_span(&text, "Unreleased").ok_or("missing Unreleased section")?;
+    let (start, end) = aterm_census::changelog::section_span(&text, "Unreleased")
+        .ok_or("missing Unreleased section")?;
     if entries.len() > 1
         || entries.len() == 1
             && !text.lines().take(end).skip(start + 1).any(|line| {
@@ -175,6 +175,7 @@ fn fixture_gates(root: &Path, tip: &str) -> Vec<Refusal> {
             &root.join("source.git"),
         )),
     )
+    .found
 }
 
 fn orphan_only(found: &[Refusal]) -> bool {
@@ -493,7 +494,7 @@ fn real_backend_commit_gate_prefix() {
         let work = sample == "warm" || before;
         let gates = |real: &mut Real| {
             let origin = crate::github_remote::claim_fixture(&repo, &root.join("source.git"));
-            real.commit_gates_from_origin(&c, dry, Ok(origin))
+            real.commit_gates_from_origin(&c, dry, Ok(origin)).found
         };
         let early = (!work).then(|| gates(&mut real));
         let early_available = early
@@ -516,7 +517,7 @@ fn real_backend_commit_gate_prefix() {
                 panic!("the planted census control passed");
             };
             assert!(
-                !found.could_not_run && found.why.contains("build-path-value"),
+                matches!(found, crate::release::InputFinding::Failed(why) if why.contains("build-path-value")),
                 "{found:?}"
             );
         }
@@ -558,7 +559,7 @@ fn real_backend_commit_gate_prefix() {
         }
         let input = input.map(|r| match r {
             Ok(note) => aterm_json::json!({"outcome": "ok", "note": note}),
-            Err(f) => aterm_json::json!({"outcome": "refused", "why": f.why}),
+            Err(f) => aterm_json::json!({"outcome": "refused", "why": f.why()}),
         });
         rows.push(aterm_json::json!({ "dry": dry, "execution_s": started.elapsed().as_secs_f64(), "launch_to_gate_findings_s": gate_findings_s, "launch_to_verdict_s": invocation_start.elapsed().as_secs_f64(), "froze": work && !dry, "input": input, "findings": found.iter().map(|f| &f.why).collect::<Vec<_>>(), "qualify_code": qualify_code }));
     }

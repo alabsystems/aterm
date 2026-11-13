@@ -2419,7 +2419,7 @@ fn an_upstream_cargo_gets_the_build_cache_only_where_its_release_reads_it() {
     let always = |_: &[String], tool: Tool| Some(decided(tool));
     let trust = || trust_at("cargo", Picked::Unsaid).identity;
     assert_eq!(on(release("1.97.1"), &always), decided(Tool::Cargo));
-    assert_eq!(on(trust(), &always), decided(Tool::Targo));
+    assert_eq!(on(trust(), &always), decided(Tool::CargoCompat));
     let verified_lane = |_: &[String], tool: Tool| (tool == Tool::Cargo).then(|| decided(tool));
     assert_eq!(on(trust(), &verified_lane), typed);
     assert_eq!(on(release("1.85.0"), &always), typed);
@@ -2428,4 +2428,80 @@ fn an_upstream_cargo_gets_the_build_cache_only_where_its_release_reads_it() {
     };
     assert_eq!(on(unknown, &always), typed);
     assert_eq!(on(release("1.97.1"), &|_, _| None), typed);
+}
+
+#[test]
+fn trust_cargo_reads_twins_before_any_placement_decision() {
+    let machine = Machine {
+        passthrough: false,
+        announced: false,
+        announce: &|| true,
+        strict: &|| false,
+        upstream: &|| Some(PathBuf::from(UP)),
+        branded: &|_, _| Install::Absent,
+        pin: &|| None,
+        resolve: &|_, toolchain| {
+            assert_eq!(toolchain, Some("trust"));
+            trust_at("cargo", Picked::Unsaid)
+        },
+        trust_checkout: &|| None,
+    };
+    for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_HOME"] {
+        let twin = name.replacen("CARGO_", "TARGO_", 1);
+        for cargo in [None, Some("from-cargo"), Some("")] {
+            let lookup = |key: &str| {
+                if key == name {
+                    cargo.map(std::ffi::OsString::from)
+                } else {
+                    (key == twin).then(|| std::ffi::OsString::from("from-twin"))
+                }
+            };
+            let placement_machine = crate::build_cache::Machine {
+                home: None,
+                root: None,
+                cwd: None,
+                env: &lookup,
+                read: &|_| Ok(None),
+                writable: &|_| None,
+            };
+            let calls = std::cell::Cell::new(0);
+            let decide = |_: &[String], tool| {
+                calls.set(calls.get() + 1);
+                assert_eq!(
+                    crate::build_cache::cargo_var(name, tool, &placement_machine),
+                    Some(cargo.unwrap_or("from-twin").into()),
+                    "{name} must be read on the first decision too"
+                );
+                None
+            };
+            let typed = args(&["+trust", "build"]);
+            assert_eq!(
+                upstream_cargo_args(Path::new(UP), typed.clone(), &machine, &decide),
+                typed
+            );
+            assert_eq!(calls.get(), 1);
+        }
+    }
+    let older = Machine {
+        resolve: &|_, _| {
+            let mut resolved = trust_at("cargo", Picked::Unsaid);
+            let Identity::Known(vv) = &mut resolved.identity else {
+                unreachable!()
+            };
+            vv.release = "1.85.0".into();
+            resolved
+        },
+        ..machine
+    };
+    let identity = (older.resolve)(Path::new(UP), None).identity;
+    assert_eq!(
+        upstream_cargo_tool(&identity),
+        crate::build_cache::Tool::CargoCompat
+    );
+    assert_eq!(
+        upstream_cargo_args(Path::new(UP), args(&["build"]), &older, &|_, _| panic!(
+            "old release cannot receive build-dir placement"
+        )),
+        args(&["build"])
+    );
 }

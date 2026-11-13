@@ -9,7 +9,7 @@
 //! tables and saves it.
 
 use super::{
-    event::{Event, Kind, MAX_EVENT, Pk, Window, Word},
+    event::{Event, Kind, MAX_EVENT, Pk, SIGNIN_IN, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window, Word},
     place::{Holding, Why},
     relay::{Entry, Heard, Rk},
     spool::{KEEP_S, MAX_SPOOL},
@@ -55,16 +55,22 @@ pub(crate) const MAX_KNOWN: usize = 3 * MAX_ACCOUNTS;
 pub(crate) const BOOK: &str = "book.json";
 const MAX_BOOK: u64 = 8 * 1024 * 1024;
 
-/// A `use` row's sign-in state.
+/// This Mac's sign-in word for an account: what its `use` row states.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SignIn {
-    /// `in`, `out`, `ended`, `wrong` or `failed`.
+    /// One of [`SIGNIN_WORDS`]. `unknown` is a word withdrawn at `t`: the book keeps it so an
+    /// older event never restores what was withdrawn, and no row or reader is given it.
     pub state: &'static str,
     pub t: u64,
     pub cli: String,
 }
 
-const SIGNIN_STATES: [&str; 5] = ["in", "out", "ended", "wrong", "failed"];
+impl SignIn {
+    /// The word a row or a reader is given: none once it was withdrawn.
+    pub(crate) fn stated(&self) -> Option<&Self> {
+        (self.state != SIGNIN_UNKNOWN).then_some(self)
+    }
+}
 
 /// What a row last said and when, so an unchanged row is never written again within a week.
 #[derive(Clone, Debug, PartialEq)]
@@ -125,15 +131,15 @@ impl Facts {
             self.first = e.t;
         }
         self.used = self.used.max(e.t);
-        let signin = |state: &'static str, held: &mut Option<SignIn>| {
-            if held.as_ref().is_none_or(|s| s.t <= e.t) {
-                *held = Some(SignIn {
-                    state,
-                    t: e.t,
-                    cli: e.cli.as_str().to_owned(),
-                });
-            }
-        };
+        if let Some(state) = e.signin()
+            && self.signin.as_ref().is_none_or(|s| s.t <= e.t)
+        {
+            self.signin = Some(SignIn {
+                state,
+                t: e.t,
+                cli: e.cli.as_str().to_owned(),
+            });
+        }
         match e.kind {
             Kind::SessionStart => {
                 self.last_start = self.last_start.max(e.t);
@@ -145,17 +151,6 @@ impl Facts {
                 }
             }
             Kind::SessionEnd => self.last_end = self.last_end.max(e.t),
-            Kind::SignedIn | Kind::Renewed => signin("in", &mut self.signin),
-            Kind::SignedOut | Kind::Displaced => signin("out", &mut self.signin),
-            Kind::LoginEnded => signin("ended", &mut self.signin),
-            // A tab's observation that contradicts its belief (`x` names the tab) says nothing of
-            // the observed account's sign-in; a capture's wrong account does.
-            Kind::WrongAccount if e.tab.is_none() => signin("wrong", &mut self.signin),
-            // A sighting is no sign-in word: a profile keeps naming its account after the
-            // credential is revoked or expires, so a file read after a login ended would say
-            // `in` over the newer truth. Where a tab runs an account now is the `seen` events'
-            // own view (`command::views`, `seen_on`).
-            Kind::SignInFailed => signin("failed", &mut self.signin),
             Kind::Quota => {
                 if let (Some(w), Some(_)) = (e.window, e.pct_x10)
                     && self.quota.get(&w).is_none_or(|held| held.t <= e.t)
@@ -214,7 +209,7 @@ impl Facts {
             "sessions_7d".into(),
             Value::from(self.sessions_7d(now) as u64),
         );
-        if let Some(s) = &self.signin {
+        if let Some(s) = self.signin.as_ref().and_then(SignIn::stated) {
             base.insert(
                 "signin".into(),
                 json!({"state": s.state, "t": s.t, "cli": s.cli}),
@@ -344,7 +339,11 @@ impl Book {
                     (
                         *pk,
                         AccountFacts {
-                            signin: facts.signin.as_ref().map(|s| (s.state, s.t)),
+                            signin: facts
+                                .signin
+                                .as_ref()
+                                .and_then(SignIn::stated)
+                                .map(|s| (s.state, s.t)),
                             last_start: when(facts.last_start),
                             last_end: when(facts.last_end),
                             sessions_7d: u32::try_from(facts.sessions_7d(now)).unwrap_or(u32::MAX),
@@ -627,9 +626,9 @@ impl Book {
     /// Whether this Mac's journal saw `account` run or sign in here: a session start or a sign-in
     /// on its row. Until then a holding of it is [`Why::Probation`].
     fn proven(&self, account: &Pk) -> bool {
-        self.accounts
-            .get(account)
-            .is_some_and(|f| f.last_start > 0 || f.signin.as_ref().is_some_and(|s| s.state == "in"))
+        self.accounts.get(account).is_some_and(|f| {
+            f.last_start > 0 || f.signin.as_ref().is_some_and(|s| s.state == SIGNIN_IN)
+        })
     }
 
     /// Take the harness's `holdings` at `now` (design §4.17 `place`): a new account, or one whose
@@ -1075,7 +1074,7 @@ impl Book {
             facts.signin = f.get("signin").and_then(|s| {
                 let word = s.get("state")?.as_str()?;
                 Some(SignIn {
-                    state: SIGNIN_STATES.into_iter().find(|w| *w == word)?,
+                    state: SIGNIN_WORDS.into_iter().find(|w| *w == word)?,
                     t: s.get("t")?.as_u64()?,
                     cli: s.get("cli")?.as_str()?.to_owned(),
                 })

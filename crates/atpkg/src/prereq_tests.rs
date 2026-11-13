@@ -1,0 +1,1975 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use std::os::unix::fs::PermissionsExt as _;
+
+fn scratch(name: &str) -> crate::testdir::Dir {
+    crate::testdir::dir(&format!("atpkg-prereq-{name}-"))
+}
+
+fn script(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn project_compiler_configuration_keeps_its_callers_directory() {
+    const CHILD: &str = "ATERM_CC_PROJECT_DIRECTORY_CHILD";
+    if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+        let bin = root.join("bin");
+        let host = CcHost {
+            inherit_environment: true,
+            sdkroot_override: Some("project-sdk".into()),
+            bound: FIRST_COMPILE_BOUND,
+            ..plain_host(&root)
+        };
+        assert_eq!(
+            probe_with(Some(bin.as_os_str()), &host),
+            CcVerdict::Ready {
+                driver: bin.join("cc")
+            }
+        );
+        let isolated = CcHost {
+            inherit_environment: false,
+            ..host
+        };
+        assert!(matches!(
+            probe_with(Some(bin.as_os_str()), &isolated),
+            CcVerdict::Broken { .. }
+        ));
+        assert!(!root.join("probe.c").exists());
+        assert!(!root.join("probe.out").exists());
+        assert!(leftovers(&root.join("tmp")).is_empty());
+        std::fs::write(root.join("checked"), b"yes").unwrap();
+        return;
+    }
+    let root = scratch("project-directory");
+    let sdk = root.join("project-sdk");
+    std::fs::create_dir_all(&sdk).unwrap();
+    std::fs::write(sdk.join("usable"), b"yes").unwrap();
+    script(
+        &root.join("bin/cc"),
+        "[ \"$1\" = --version ] && exit 0\n[ -f \"$SDKROOT/usable\" ] || { echo 'relative SDK unavailable' >&2; exit 23; }\nprintf x > \"$2\"; /bin/chmod +x \"$2\"",
+    );
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "prereq::tests::project_compiler_configuration_keeps_its_callers_directory",
+        "--nocapture",
+    ])
+    .env(CHILD, root.as_path())
+    .current_dir(root.as_path());
+    let out = aterm_uds::deadline::output_within(&mut cmd, FIRST_COMPILE_BOUND).unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(root.join("checked")).unwrap(), b"yes");
+}
+
+#[test]
+fn a_signalled_probe_is_unknown_in_discovery_and_compilation() {
+    let root = scratch("signalled-compiler");
+    let host = plain_host(&root);
+    for (name, body, interrupted) in [
+        ("killed", "kill -KILL $$", true),
+        ("refused", "echo refused >&2; exit 23", false),
+    ] {
+        let cc = root.join(name).join("cc");
+        script(&cc, body);
+        for verdict in [
+            ask(&cc, &cc, CcQuery::Version, &host),
+            ask(&cc, &cc, CcQuery::Find, &host),
+            build_probe(&cc, cc.clone(), None, &host),
+        ] {
+            assert_eq!(verdict.blocks_builds(), !interrupted, "{verdict:?}");
+            if interrupted {
+                assert!(matches!(verdict, CcVerdict::Unproven { .. }), "{verdict:?}");
+            } else {
+                assert!(matches!(verdict, CcVerdict::Broken { .. }), "{verdict:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_killed_compile_does_not_retry_with_an_sdk() {
+    let root = scratch("killed-compiler-sdk");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    script(&cc, "echo attempt >> \"$0.attempts\"; kill -KILL $$");
+    let developer = root.join("developer");
+    std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+    let host = CcHost {
+        shim_dir: Some(bin),
+        default_developer_dir: developer,
+        ..plain_host(&root)
+    };
+    assert!(matches!(
+        build_probe(&cc, cc.clone(), None, &host),
+        CcVerdict::Unproven { .. }
+    ));
+    assert_eq!(
+        std::fs::read(cc.with_file_name("cc.attempts")).unwrap(),
+        b"attempt\n"
+    );
+}
+
+/// The bound for a probe whose script must answer: a just-written file's first exec
+/// waits on the system's code assessment, which a loaded machine stretches past
+/// [`PROBE_TIMEOUT`]. These cases test reading the answer, not the bound.
+const ANSWER: Duration = Duration::from_secs(120);
+
+/// No shim directory: every `cc` is a plain compiler; the build probe works under
+/// `<root>/tmp`.
+fn plain_host(root: &Path) -> CcHost {
+    let tmp_root = root.join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    CcHost {
+        shim_dir: None,
+        xcode_select_link: root.join("no-link"),
+        default_developer_dir: root.join("no-developer-dir"),
+        xcode_developer_dir: None,
+        developer_dir_override: None,
+        sdkroot_override: None,
+        deployment_target_override: None,
+        inherit_environment: false,
+        bound: ANSWER,
+        tmp_root,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_sdk_retry_cannot_accept_an_unremovable_failed_attempts_output() {
+    struct Unflag(PathBuf);
+    impl Drop for Unflag {
+        fn drop(&mut self) {
+            let _ = crate::platform::set_file_flags(&self.0, 0);
+        }
+    }
+    let root = scratch("sdk-fresh-output");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    let developer = root.join("developer");
+    std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+    script(
+        &cc,
+        "if [ -n \"$SDKROOT\" ]; then\n  if [ -f \"$0.write-fallback\" ]; then printf fresh > \"$2\"; /bin/chmod +x \"$2\"; fi\n  exit 0\nfi\nprintf stale > \"$2\"\n/bin/chmod +x \"$2\"\n/usr/bin/chflags uchg \"$2\" || exit 2\nexit 1",
+    );
+    let alias = root.join("bin-alias");
+    std::fs::create_dir(&alias).unwrap();
+    std::os::unix::fs::symlink(&cc, alias.join("cc")).unwrap();
+    let cc = alias.join("cc");
+    let host = CcHost {
+        shim_dir: Some(bin),
+        default_developer_dir: developer,
+        ..plain_host(&root)
+    };
+    for emits in [false, true] {
+        let dir = root.join(if emits { "fresh" } else { "stale" });
+        std::fs::create_dir_all(&dir).unwrap();
+        let failed_output = dir.join("probe.out");
+        let _unflag = Unflag(failed_output.clone());
+        if emits {
+            std::fs::write(cc.with_file_name("cc.write-fallback"), b"yes").unwrap();
+        }
+        let verdict = build_probe_in(&cc, cc.clone(), None, &host, &dir);
+        assert!(
+            std::fs::remove_file(&failed_output)
+                .is_err_and(|error| { error.kind() == std::io::ErrorKind::PermissionDenied }),
+            "the immutable fixture blocks unlink"
+        );
+        if emits {
+            assert_eq!(verdict, CcVerdict::Ready { driver: cc.clone() });
+        } else {
+            assert!(matches!(verdict, CcVerdict::Broken { .. }), "{verdict:?}");
+        }
+    }
+}
+
+#[test]
+fn an_sdk_retry_refuses_an_existing_output_namespace() {
+    let root = scratch("occupied-sdk-output");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    script(&cc, "if [ -n \"$SDKROOT\" ]; then exit 0; fi; exit 1");
+    let developer = root.join("developer");
+    std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+    let host = CcHost {
+        shim_dir: Some(bin),
+        default_developer_dir: developer,
+        ..plain_host(&root)
+    };
+    let dir = root.join("probe");
+    let occupied = dir.join("sdk-fallback/probe.out");
+    std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+    std::fs::write(&occupied, b"old executable").unwrap();
+    std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        build_probe_in(&cc, cc.clone(), None, &host, &dir),
+        CcVerdict::Unproven { .. }
+    ));
+    assert_eq!(std::fs::read(&occupied).unwrap(), b"old executable");
+}
+
+#[test]
+fn empty_executable_files_are_missing_compilers_in_path_and_developer_discovery() {
+    let root = scratch("empty-compiler");
+    let empty = root.join("empty");
+    let apple = root.join("usr-bin");
+    let developer = root.join("developer");
+    for file in [empty.join("cc"), developer.join("usr/bin/clang")] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, []).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let host = plain_host(&root);
+    assert!(matches!(
+        locate_without_setup_shim(Some(empty.as_os_str()), &host, &[]),
+        Err(CcVerdict::NoDriver)
+    ));
+    script(&apple.join("cc"), "exit 1");
+    let path = std::env::join_paths([&empty, &apple]).unwrap();
+    assert!(matches!(
+        locate_without_setup_shim(Some(&path), &host, &[]),
+        Ok(Located::Plain(cc)) if cc == apple.join("cc")
+    ));
+    let host = CcHost {
+        shim_dir: Some(apple.clone()),
+        default_developer_dir: developer.clone(),
+        ..host
+    };
+    assert!(matches!(
+        locate_without_setup_shim(Some(&path), &host, &[]),
+        Err(CcVerdict::NoDeveloperDir)
+    ));
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    assert!(matches!(
+        locate_without_setup_shim(Some(&path), &host, &[]),
+        Ok(Located::Shim(cc)) if cc == apple.join("cc")
+    ));
+}
+
+#[test]
+fn setup_shim_does_not_turn_missing_tools_into_a_broken_compiler() {
+    let root = scratch("setup-shim");
+    let setup = root.join("clt-shim");
+    let inherited = root.join("old-home/clt-shim");
+    let setup_alias = root.join("setup-alias");
+    let inherited_alias = root.join("inherited-alias");
+    let apple = root.join("usr-bin");
+    let apple_alias = root.join("apple-alias");
+    let setup_file = root.join("setup-file");
+    let inherited_file = root.join("inherited-file");
+    let apple_file = root.join("apple-file");
+    // These must never run: discovery alone can tell the tools are missing.
+    script(&setup.join("cc"), "exit 69");
+    script(&inherited.join("cc"), "exit 69");
+    script(&apple.join("cc"), "exit 1");
+    std::os::unix::fs::symlink(&setup, &setup_alias).unwrap();
+    std::os::unix::fs::symlink("old-home/clt-shim", &inherited_alias).unwrap();
+    std::os::unix::fs::symlink(&apple, &apple_alias).unwrap();
+    for (dir, target) in [
+        (&setup_file, &setup),
+        (&inherited_file, &inherited),
+        (&apple_file, &apple),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::os::unix::fs::symlink(target.join("cc"), dir.join("cc")).unwrap();
+    }
+    let host = CcHost {
+        shim_dir: Some(apple.clone()),
+        ..plain_host(&root)
+    };
+    for (setup_entry, inherited_entry, apple_entry) in [
+        (&setup, &inherited, &apple),
+        (&setup_alias, &inherited_alias, &apple_alias),
+        (&setup_file, &inherited_file, &apple_file),
+    ] {
+        let path = std::env::join_paths([inherited_entry, setup_entry, apple_entry]).unwrap();
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[Some(&setup), Some(&inherited)]),
+            Err(CcVerdict::NoDeveloperDir)
+        ));
+        // An unmarked PATH compiler retains priority, including its failures and aliases.
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[Some(&setup)]),
+            Ok(Located::Plain(cc)) if cc == inherited_entry.join("cc")
+        ));
+    }
+}
+
+/// A fake `cc` that answers `--version` and, asked `-o <out> <src>`, builds: it writes
+/// `<out>` as a runnable script that would leave `<ran>` behind if anything ran it.
+fn building_cc(path: &Path, ran: &Path) {
+    script(
+        path,
+        &format!(
+            "case \"$1\" in --version) echo 'cc version 1';; -o) printf '#!/bin/sh\\ntouch {}\\n' > \"$2\"; /bin/chmod +x \"$2\";; esac",
+            ran.display()
+        ),
+    );
+}
+
+/// The build probe's leftovers under `tmp_root`: none, on every path.
+fn leftovers(tmp_root: &Path) -> Vec<String> {
+    std::fs::read_dir(tmp_root)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("atpkg-cc-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// No `cc` is NoDriver, one that answers is Ready, one that refuses is Broken with its
+/// first stderr line; NoDriver and Broken block builds.
+#[test]
+fn a_plain_cc_is_asked_its_version_on_the_path_it_is_handed() {
+    let root = scratch("plain");
+    let host = plain_host(&root);
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(
+        probe_with(Some(empty.as_os_str()), &host),
+        CcVerdict::NoDriver
+    );
+    assert_eq!(probe_with(None, &host), CcVerdict::NoDriver);
+    assert!(CcVerdict::NoDriver.blocks_builds());
+
+    let good = root.join("good");
+    building_cc(&good.join("cc"), &root.join("program-ran"));
+    let path = std::env::join_paths([empty.clone(), good.clone()]).unwrap();
+    assert_eq!(
+        probe_with(Some(&path), &host),
+        CcVerdict::Ready {
+            driver: good.join("cc")
+        }
+    );
+
+    let bad = root.join("bad");
+    script(
+        &bad.join("cc"),
+        "echo '' >&2; echo 'cc: no libc headers' >&2; exit 1",
+    );
+    let verdict = probe_with(Some(bad.as_os_str()), &host);
+    assert_eq!(
+        verdict,
+        CcVerdict::Broken {
+            driver: bad.join("cc"),
+            why: "cc: no libc headers".into()
+        }
+    );
+    assert!(verdict.blocks_builds());
+    let odd = root.join("odd");
+    std::fs::create_dir_all(odd.join("cc")).unwrap();
+    assert_eq!(
+        probe_with(Some(odd.as_os_str()), &host),
+        CcVerdict::NoDriver
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_version_banner_cannot_rename_the_compiler() {
+    let root = scratch("version-banner");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    script(
+        &cc,
+        "[ \"$1\" = --version ] && { echo /not-the-compiler; exit 0; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+    );
+    assert_eq!(
+        probe_with(Some(bin.as_os_str()), &plain_host(&root)),
+        CcVerdict::Ready { driver: cc }
+    );
+}
+
+#[test]
+fn compiler_discovery_requires_one_absolute_native_path() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let root = scratch("discovery-output");
+    let bin = root.join("bin");
+    let answer = root.join("answer");
+    let compiled = root.join("compiled");
+    script(
+        &bin.join("cc"),
+        &format!(
+            "echo compiled >> '{}'\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+            compiled.display()
+        ),
+    );
+    script(
+        &bin.join("xcrun"),
+        &format!("/bin/cat '{}'", answer.display()),
+    );
+    let developer = root.join("developer");
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    let host = CcHost {
+        shim_dir: Some(bin.clone()),
+        default_developer_dir: developer,
+        ..plain_host(&root)
+    };
+    let oversized = vec![b'/'; aterm_uds::deadline::OUTPUT_KEEP + 1];
+    for invalid in [
+        b"".as_slice(),
+        b"relative/cc\n",
+        b"/one\n/two\n",
+        b"/cc\0\n",
+        oversized.as_slice(),
+    ] {
+        std::fs::write(&answer, invalid).unwrap();
+        assert!(
+            matches!(
+                probe_with(Some(bin.as_os_str()), &host),
+                CcVerdict::Unproven { .. }
+            ),
+            "invalid discovery output length: {}",
+            invalid.len()
+        );
+        assert!(!compiled.exists(), "unproven discovery starts no build");
+    }
+    for (index, name) in [b"compiler \xc2\xa0".as_slice(), b"compiler-\xff "]
+        .into_iter()
+        .enumerate()
+    {
+        let path = root.join(std::ffi::OsString::from_vec(name.to_vec()));
+        if path.to_str().is_some() {
+            script(&path, "exit 0");
+        }
+        let mut bytes = path.as_os_str().as_encoded_bytes().to_vec();
+        bytes.extend_from_slice(b"\r\n");
+        std::fs::write(&answer, bytes).unwrap();
+        let cache = CcCache {
+            file: root.join(format!("state/cc-{index}")),
+            receipt: root.join("no-receipt"),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
+                CcVerdict::Ready {
+                    driver: path.clone()
+                }
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(compiled).unwrap().lines().count(),
+        3
+    );
+}
+
+/// The shim never runs without a compiler behind it: with no clang in the developer
+/// directory nothing is spawned; with one, `xcrun --find cc` answers first and the shim
+/// is only asked to build the probe. The verdict names what `xcrun` resolved.
+#[test]
+fn the_install_shim_runs_only_behind_a_resolved_compiler() {
+    let root = scratch("shim");
+    let shim = root.join("usr-bin");
+    let ran = root.join("ran");
+    let xcrun_ran = root.join("xcrun-ran");
+    script(
+        &shim.join("cc"),
+        &format!(
+            "echo \"$*\" > '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
+            ran.display()
+        ),
+    );
+    let clang_dir = root.join("CommandLineTools");
+    script(
+        &shim.join("xcrun"),
+        &format!(
+            "echo \"$*\" > '{}'; echo '{}/usr/bin/cc'",
+            xcrun_ran.display(),
+            clang_dir.display()
+        ),
+    );
+    let tmp_root = root.join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let host = CcHost {
+        shim_dir: Some(shim.clone()),
+        xcode_select_link: root.join("xcode_select_link"),
+        default_developer_dir: clang_dir.clone(),
+        xcode_developer_dir: None,
+        developer_dir_override: None,
+        sdkroot_override: None,
+        deployment_target_override: None,
+        inherit_environment: true,
+        bound: ANSWER,
+        tmp_root: tmp_root.clone(),
+    };
+    let alias = root.join("alias-bin");
+    std::fs::create_dir(&alias).unwrap();
+    std::os::unix::fs::symlink(shim.join("cc"), alias.join("cc")).unwrap();
+    assert_eq!(
+        probe_with(Some(alias.as_os_str()), &host),
+        CcVerdict::NoDeveloperDir
+    );
+    assert!(!ran.exists(), "the shim was spawned");
+    assert!(!xcrun_ran.exists(), "xcrun was spawned");
+
+    let clang = clang_dir.join("usr/bin/clang");
+    std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+    script(&shim.join("clang"), "exit 1");
+    std::os::unix::fs::symlink(shim.join("clang"), &clang).unwrap();
+    assert_eq!(
+        probe_with(Some(alias.as_os_str()), &host),
+        CcVerdict::NoDeveloperDir
+    );
+    assert!(!ran.exists(), "a developer alias admitted the install shim");
+    assert!(!xcrun_ran.exists(), "a developer alias admitted xcrun");
+    let standalone = root.join("standalone-tools");
+    script(&standalone.join("usr/bin/clang"), "exit 0");
+    let fallback = CcHost {
+        xcode_developer_dir: Some(clang_dir.clone()),
+        default_developer_dir: standalone.clone(),
+        ..host.clone()
+    };
+    assert_eq!(fallback.developer_dir().unwrap(), standalone);
+    std::fs::remove_file(&clang).unwrap();
+
+    script(&clang_dir.join("usr/bin/clang"), "exit 0");
+    assert_eq!(
+        probe_with(Some(alias.as_os_str()), &host),
+        CcVerdict::Ready {
+            driver: clang_dir.join("usr/bin/cc")
+        }
+    );
+    assert_eq!(
+        std::fs::read_to_string(&xcrun_ran).unwrap().trim(),
+        "--find cc"
+    );
+    let argv = std::fs::read_to_string(&ran).unwrap();
+    let argv: Vec<&str> = argv.split_whitespace().collect();
+    assert!(
+        argv.len() == 3
+            && argv[0] == "-o"
+            && argv[1].ends_with("/probe.out")
+            && argv[2].ends_with("/probe.c"),
+        "the shim is only ever asked to build the probe: {argv:?}"
+    );
+    assert!(
+        leftovers(&tmp_root).is_empty(),
+        "{:?}",
+        leftovers(&tmp_root)
+    );
+    std::fs::remove_file(&ran).unwrap();
+
+    let xcode = root.join("Xcode.app/Contents/Developer");
+    std::fs::create_dir_all(&xcode).unwrap();
+    std::os::unix::fs::symlink(xcode.strip_prefix(&root).unwrap(), &host.xcode_select_link)
+        .unwrap();
+    assert_eq!(
+        probe_with(Some(shim.as_os_str()), &host),
+        CcVerdict::NoDeveloperDir
+    );
+    assert!(!ran.exists(), "the shim was spawned");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [`installed_with`] is the probe's read-only half: `Some(false)` exactly where the probe
+/// stops at NoDriver or NoDeveloperDir, `Some(true)` where it would ask a compiler, and
+/// it spawns nothing on either path.
+#[test]
+fn installed_is_false_exactly_where_the_probe_finds_nothing_to_ask() {
+    let root = scratch("installed");
+    let ran = root.join("ran");
+    let plain = plain_host(&root);
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(installed_with(Some(empty.as_os_str()), &plain), Some(false));
+    assert_eq!(installed_with(None, &plain), Some(false));
+    let good = root.join("good");
+    script(&good.join("cc"), &format!("touch '{}'", ran.display()));
+    assert_eq!(installed_with(Some(good.as_os_str()), &plain), Some(true));
+
+    let shim = root.join("usr-bin");
+    script(&shim.join("cc"), &format!("touch '{}'", ran.display()));
+    let developer = root.join("CommandLineTools");
+    let host = CcHost {
+        shim_dir: Some(shim.clone()),
+        default_developer_dir: developer.clone(),
+        ..plain_host(&root)
+    };
+    assert_eq!(installed_with(Some(shim.as_os_str()), &host), Some(false));
+    assert_eq!(
+        probe_with(Some(shim.as_os_str()), &host),
+        CcVerdict::NoDeveloperDir
+    );
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    assert_eq!(installed_with(Some(shim.as_os_str()), &host), Some(true));
+    assert!(!ran.exists(), "nothing was spawned");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn changing_developer_compiler_execute_permissions_retires_a_cached_success() {
+    let mut observations = Vec::new();
+    for index in 0..2 {
+        let root = scratch("clang-mode");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        let developer = root.join("developer");
+        let paths = clang_paths(&developer);
+        for clang in &paths {
+            script(clang, "exit 0");
+        }
+        let changed = &paths[index];
+        script(
+            &cc,
+            &format!(
+                "case \"$1\" in -o) if [ ! -x '{}' ]; then echo 'compiler is not executable' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+                changed.display()
+            ),
+        );
+        script(&bin.join("xcrun"), &format!("echo '{}'", cc.display()));
+        let host = CcHost {
+            shim_dir: Some(bin.clone()),
+            default_developer_dir: developer,
+            inherit_environment: false,
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready { .. }
+        ));
+        let before = std::fs::metadata(changed).unwrap();
+        std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let after = std::fs::metadata(changed).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.len(), after.len());
+        let cached = probe_cached(path, &host, Some(&cache));
+        let direct = probe_with(path, &host);
+        observations.push((index, direct, cached));
+        std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(probe_with(path, &host), CcVerdict::Ready { .. }));
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready { .. }
+        ));
+    }
+    assert!(
+        observations.iter().all(
+            |(_, direct, cached)| matches!(direct, CcVerdict::Broken { .. }) && direct == cached
+        ),
+        "{observations:#?}"
+    );
+}
+
+#[test]
+fn unreadable_optional_clang_identity_cannot_reuse_an_absence_fact() {
+    let mut observations = Vec::new();
+    for shim in [false, true] {
+        let root = scratch("optional-clang");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        let developer = root.join("developer");
+        let paths = clang_paths(&developer);
+        let fault = &paths[usize::from(shim)];
+        if shim {
+            script(&paths[0], "exit 0");
+        }
+        script(
+            &cc,
+            &format!(
+                "case \"$1\" in --version) echo cc;; -o) if [ -L '{}' ]; then echo 'compiler state unread' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+                fault.display()
+            ),
+        );
+        script(&bin.join("xcrun"), &format!("echo '{}'", cc.display()));
+        let host = CcHost {
+            shim_dir: shim.then_some(bin.clone()),
+            default_developer_dir: developer,
+            inherit_environment: false,
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready { .. }
+        ));
+        std::fs::create_dir_all(fault.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(fault, fault).unwrap();
+        let cached = probe_cached(path, &host, Some(&cache));
+        let direct = probe_with(path, &host);
+        observations.push((shim, direct, cached));
+        std::fs::remove_file(fault).unwrap();
+        assert!(matches!(probe_with(path, &host), CcVerdict::Ready { .. }));
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready { .. }
+        ));
+    }
+    assert!(
+        observations.iter().all(
+            |(_, direct, cached)| matches!(direct, CcVerdict::Broken { .. }) && cached == direct
+        ),
+        "{observations:#?}"
+    );
+}
+
+#[test]
+fn an_unreadable_fallback_sdk_is_unproven_and_cannot_reuse_absence() {
+    let root = scratch("unread-sdk");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    let developer = root.join("developer");
+    let sdk = developer.join("SDKs/MacOSX.sdk");
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    script(&bin.join("xcrun"), &format!("echo '{}'", cc.display()));
+    script(
+        &cc,
+        "case \"$1\" in --version) echo cc;; -o) if [ -f \"$0.refuse\" ] && [ -z \"$SDKROOT\" ]; then echo 'SDK needed' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+    );
+    let host = CcHost {
+        shim_dir: Some(bin.clone()),
+        default_developer_dir: developer,
+        inherit_environment: false,
+        ..plain_host(&root)
+    };
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = Some(bin.as_os_str());
+    assert!(matches!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::Ready { .. }
+    ));
+    std::fs::write(cc.with_file_name("cc.refuse"), b"yes").unwrap();
+    assert!(matches!(probe_with(path, &host), CcVerdict::Broken { .. }));
+    std::fs::create_dir_all(sdk.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&sdk, &sdk).unwrap();
+    assert_ne!(
+        std::fs::metadata(&sdk).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let direct = probe_with(path, &host);
+    let cached = probe_cached(path, &host, Some(&cache));
+    assert!(
+        matches!(direct, CcVerdict::Unproven { .. })
+            && matches!(cached, CcVerdict::Unproven { .. }),
+        "direct={direct:?}, cached={cached:?}"
+    );
+    std::fs::remove_file(&sdk).unwrap();
+    std::fs::create_dir(&sdk).unwrap();
+    assert!(matches!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::Ready { .. }
+    ));
+}
+
+#[test]
+fn unreadable_discovery_is_unknown_and_can_recover_without_installing() {
+    let mut observations = Vec::new();
+    for kind in ["path", "clang", "xcode", "selection"] {
+        let root = scratch("unread-discovery");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        let ran = root.join("program-ran");
+        building_cc(&cc, &ran);
+        script(&bin.join("xcrun"), &format!("echo '{}'", cc.display()));
+        let developer = root.join("developer");
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        let fault = root.join("unread");
+        std::os::unix::fs::symlink(&fault, &fault).unwrap();
+        let mut host = CcHost {
+            default_developer_dir: developer.clone(),
+            ..plain_host(&root)
+        };
+        let path = if kind == "path" {
+            fault.clone()
+        } else {
+            host.shim_dir = Some(bin.clone());
+            match kind {
+                "clang" => host.default_developer_dir = fault.clone(),
+                "xcode" => host.xcode_developer_dir = Some(fault.clone()),
+                "selection" => host.xcode_select_link = fault.join("selection"),
+                _ => unreachable!(),
+            }
+            bin.clone()
+        };
+        observations.push((
+            kind,
+            probe_with(Some(path.as_os_str()), &host),
+            installed_with(Some(path.as_os_str()), &host),
+        ));
+
+        std::fs::remove_file(&fault).unwrap();
+        if kind == "selection" {
+            std::fs::create_dir(&fault).unwrap();
+            std::os::unix::fs::symlink(&developer, fault.join("selection")).unwrap();
+        } else {
+            std::os::unix::fs::symlink(if kind == "path" { &bin } else { &developer }, &fault)
+                .unwrap();
+        }
+        assert_eq!(
+            installed_with(Some(path.as_os_str()), &host),
+            Some(true),
+            "{kind}"
+        );
+        assert!(
+            matches!(
+                probe_with(Some(path.as_os_str()), &host),
+                CcVerdict::Ready { .. }
+            ),
+            "{kind}"
+        );
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        assert!(matches!(
+            probe_cached(Some(path.as_os_str()), &host, Some(&cache)),
+            CcVerdict::Ready { .. }
+        ));
+        assert!(cache.file.is_file(), "{kind}: the success was kept");
+        if kind == "selection" {
+            std::fs::remove_dir_all(&fault).unwrap();
+        } else {
+            std::fs::remove_file(&fault).unwrap();
+        }
+        std::os::unix::fs::symlink(&fault, &fault).unwrap();
+        assert!(
+            matches!(
+                probe_cached(Some(path.as_os_str()), &host, Some(&cache)),
+                CcVerdict::Unproven { .. }
+            ),
+            "{kind}: a warm cache cannot hide unread discovery"
+        );
+        assert!(!ran.exists(), "the probe's program is never executed");
+    }
+    assert!(
+        observations.iter().all(|(_, verdict, installed)| {
+            matches!(verdict, CcVerdict::Unproven { .. })
+                && !verdict.blocks_builds()
+                && installed.is_none()
+        }),
+        "{observations:#?}"
+    );
+}
+
+/// A compiler that answers `--version` but cannot build is Broken, with its first stderr
+/// line.
+#[test]
+fn a_compiler_that_cannot_build_a_program_is_broken_not_ready() {
+    let root = scratch("nolibc");
+    let host = plain_host(&root);
+    let dir = root.join("gcc");
+    script(
+        &dir.join("cc"),
+        "case \"$1\" in --version) echo 'cc (GCC) 13';; *) echo \"probe.c:1:10: fatal error: stdio.h: No such file or directory\" >&2; exit 1;; esac",
+    );
+    let verdict = probe_with(Some(dir.as_os_str()), &host);
+    assert_eq!(
+        verdict,
+        CcVerdict::Broken {
+            driver: dir.join("cc"),
+            why: "probe.c:1:10: fatal error: stdio.h: No such file or directory".into()
+        }
+    );
+    assert!(verdict.blocks_builds());
+    assert!(leftovers(&host.tmp_root).is_empty());
+
+    let liar = root.join("liar");
+    script(
+        &liar.join("cc"),
+        "case \"$1\" in --version) echo 'cc 1';; *) exit 0;; esac",
+    );
+    assert!(matches!(
+        probe_with(Some(liar.as_os_str()), &host),
+        CcVerdict::Broken { driver, .. } if driver == liar.join("cc")
+    ));
+    script(
+        &liar.join("cc"),
+        "case \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod 600 \"$2\";; esac",
+    );
+    assert!(matches!(
+        probe_with(Some(liar.as_os_str()), &host),
+        CcVerdict::Broken { driver, .. } if driver == liar.join("cc")
+    ));
+    building_cc(&liar.join("cc"), &root.join("program-ran"));
+    assert!(matches!(
+        probe_with(Some(liar.as_os_str()), &host),
+        CcVerdict::Ready { .. }
+    ));
+    assert!(!root.join("program-ran").exists());
+    assert!(leftovers(&host.tmp_root).is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// On macOS the install is `base.clt`, one password prompt in a terminal, never Apple's
+/// desktop dialog (design init-system A15).
+#[test]
+fn the_macos_install_is_base_clt() {
+    if cfg!(target_os = "macos") {
+        assert_eq!(act(), "aterm init --only base.clt");
+    }
+}
+
+/// A missing toolchain is told to install one; a refusing compiler on macOS is told to fix
+/// what it reports, never the install.
+#[test]
+fn a_refusing_compiler_is_not_told_to_install_what_it_is() {
+    for missing in [CcVerdict::NoDriver, CcVerdict::NoDeveloperDir] {
+        assert_eq!(missing.fix(), Some(act()), "{missing:?}");
+    }
+    let broken = CcVerdict::Broken {
+        driver: PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/cc"),
+        why: "Agreeing to the Xcode/iOS license requires admin privileges".into(),
+    };
+    let line = broken.line();
+    assert!(line.contains("license requires admin privileges"), "{line}");
+    if cfg!(target_os = "macos") {
+        assert_eq!(broken.fix(), None);
+        assert!(!line.contains(act()), "{line}");
+    } else {
+        assert_eq!(broken.fix(), Some(act()));
+    }
+    for unknown in [
+        CcVerdict::Unanswered {
+            driver: PathBuf::from("/usr/bin/cc"),
+            bound: PROBE_TIMEOUT,
+        },
+        CcVerdict::NotProbed,
+    ] {
+        assert_eq!(unknown.fix(), None, "{unknown:?}");
+    }
+}
+
+/// A building compiler is Ready; its program never runs and the probe directory is gone.
+#[test]
+fn a_building_compiler_is_ready_and_its_program_never_runs() {
+    let root = scratch("builds");
+    let host = plain_host(&root);
+    let dir = root.join("cc-dir");
+    let program_ran = root.join("program-ran");
+    building_cc(&dir.join("cc"), &program_ran);
+    assert_eq!(
+        probe_with(Some(dir.as_os_str()), &host),
+        CcVerdict::Ready {
+            driver: dir.join("cc")
+        }
+    );
+    assert!(!program_ran.exists(), "the probe's program was executed");
+    assert!(
+        leftovers(&host.tmp_root).is_empty(),
+        "{:?}",
+        leftovers(&host.tmp_root)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A temp root the probe cannot use is Unproven and blocks nothing.
+#[test]
+fn an_unusable_temp_root_is_unproven_not_broken() {
+    let root = scratch("notmp");
+    let host = CcHost {
+        tmp_root: root.join("no-such-dir"),
+        ..plain_host(&root)
+    };
+    let dir = root.join("cc-dir");
+    building_cc(&dir.join("cc"), &root.join("program-ran"));
+    let verdict = probe_with(Some(dir.as_os_str()), &host);
+    assert!(
+        matches!(&verdict, CcVerdict::Unproven { driver, .. } if *driver == dir.join("cc")),
+        "{verdict:?}"
+    );
+    assert!(!verdict.blocks_builds());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn unreadable_output_metadata_is_unproven_and_a_fresh_attempt_can_recover() {
+    let root = scratch("unread-output");
+    let host = plain_host(&root);
+    let cc = root.join("bin/cc");
+    let disrupt = cc.with_file_name("cc.disrupt");
+    script(
+        &cc,
+        "printf x > \"$2\"; /bin/chmod +x \"$2\"\nif [ -f \"$0.disrupt\" ]; then\nprobe_dir=$(/bin/pwd)\n/bin/mv \"$probe_dir\" \"$probe_dir.saved\" || exit 2\n/bin/ln -s \"$probe_dir\" \"$probe_dir\"\nfi",
+    );
+    std::fs::write(&disrupt, b"disrupt").unwrap();
+    let dir = root.join("first");
+    std::fs::create_dir(&dir).unwrap();
+    let verdict = build_probe_in(&cc, cc.clone(), None, &host, &dir);
+    assert!(root.join("first.saved/probe.out").is_file());
+    let error = std::fs::symlink_metadata(dir.join("probe.out")).unwrap_err();
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        matches!(&verdict, CcVerdict::Unproven { .. }),
+        "{verdict:?}"
+    );
+    assert!(!verdict.blocks_builds());
+
+    std::fs::remove_file(disrupt).unwrap();
+    let next = root.join("next");
+    std::fs::create_dir(&next).unwrap();
+    assert_eq!(
+        build_probe_in(&cc, cc.clone(), None, &host, &next),
+        CcVerdict::Ready { driver: cc }
+    );
+}
+
+#[test]
+fn a_compiler_launch_refusal_is_unproven_and_repair_can_be_kept() {
+    for phase in ["version", "compile"] {
+        let root = scratch("launch-refused");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        std::fs::create_dir_all(&bin).unwrap();
+        let broken = format!("#!{}\n", root.join("missing-interpreter").display());
+        if phase == "compile" {
+            script(
+                &cc,
+                "if [ \"$1\" = --version ]; then /bin/mv \"$0.next\" \"$0\"; echo cc; exit 0; fi\nexit 9",
+            );
+            std::fs::write(bin.join("cc.next"), &broken).unwrap();
+            std::fs::set_permissions(bin.join("cc.next"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        } else {
+            std::fs::write(&cc, &broken).unwrap();
+            std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let host = plain_host(&root);
+        let path = Some(bin.as_os_str());
+        let refused = probe_with(path, &host);
+        assert!(
+            matches!(&refused, CcVerdict::Unproven { why, .. } if why.contains("could not start")),
+            "{phase}: {refused:?}"
+        );
+        script(
+            &cc,
+            "echo asked >> \"${0%/bin/cc}/asked\"\nif [ \"$1\" = --version ]; then echo cc; else printf x > \"$2\"; /bin/chmod +x \"$2\"; fi",
+        );
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let ready = CcVerdict::Ready { driver: cc };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(
+            std::fs::read_to_string(root.join("asked"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn compiler_paths_and_output_require_the_probing_users_execute_access() {
+    let root = scratch("output-execute-access");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    script(
+        &cc,
+        "echo asked >> \"$0.asked\"\ncase \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod \"$(/bin/cat \"$0.mode\")\" \"$2\";; esac",
+    );
+    let mode = bin.join("cc.mode");
+    std::fs::write(&mode, b"001").unwrap();
+    let host = plain_host(&root);
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = Some(bin.as_os_str());
+    let identity = crate::probe_cache::identity(&cc).unwrap();
+    let first = probe_cached(path, &host, Some(&cache));
+    // SAFETY: geteuid has no arguments and retains no memory. Root may execute any file
+    // with an execute bit; an ordinary owner cannot borrow the others' execute bit.
+    let root_user = unsafe { libc::geteuid() == 0 };
+    if root_user {
+        assert!(matches!(first, CcVerdict::Ready { .. }), "{first:?}");
+    } else {
+        assert!(matches!(first, CcVerdict::Broken { .. }), "{first:?}");
+        assert!(
+            !cache.file.exists(),
+            "an unusable output supplied a cached success"
+        );
+    }
+    std::fs::write(&mode, b"755").unwrap();
+    assert_eq!(crate::probe_cache::identity(&cc).unwrap(), identity);
+    let ready = CcVerdict::Ready { driver: cc.clone() };
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    let runs = || {
+        std::fs::read_to_string(bin.join("cc.asked"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    assert_eq!(runs(), if root_user { 2 } else { 4 });
+    let before = runs();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o001)).unwrap();
+    let discovered = probe_with(path, &host);
+    if root_user {
+        assert_eq!(discovered, ready);
+    } else {
+        assert_eq!(discovered, CcVerdict::NoDriver);
+        assert_eq!(
+            runs(),
+            before,
+            "a compiler this user cannot execute was launched"
+        );
+    }
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs() - before, if root_user { 4 } else { 2 });
+}
+
+/// A compiler that hangs is unknown, not broken, and the probe returns inside its
+/// bound. The compiler is a
+/// driver that forks the real work, as `cc` forks `cc1`: the bound's kill ends the
+/// driver and leaves its ten-minute `sleep` holding the probe's pipes. The probe's
+/// return is held to a minute's hang detector, never a latency budget: a probe that
+/// ignores its bound, or drains those pipes after the kill, waits out all ten.
+#[test]
+fn a_wedged_compiler_is_unanswered_not_broken() {
+    let root = scratch("wedged");
+    let dir = root.join("slow");
+    let pid_file = root.join("worker.pid");
+    script(
+        &dir.join("cc"),
+        &format!("sleep 600 & echo $! > '{}'; wait", pid_file.display()),
+    );
+    let bound = Duration::from_millis(500);
+    let host = CcHost {
+        bound,
+        ..plain_host(&root)
+    };
+    let started = std::time::Instant::now();
+    let verdict = probe_with(Some(dir.as_os_str()), &host);
+    let took = started.elapsed();
+    if let Some(pid) = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+    {
+        // SAFETY: kill(2) of the background `sleep` this test's driver started.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        took < aterm_spec::wait::MUST_HAPPEN,
+        "not the ten-minute hang: {took:?}"
+    );
+    assert_eq!(
+        verdict,
+        CcVerdict::Unanswered {
+            driver: dir.join("cc"),
+            bound,
+        }
+    );
+    assert!(!verdict.blocks_builds());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A receipt changed during a probe invalidates both its success and its failure. Restoring
+/// the exact old receipt must not retrieve a success made against the new toolchain.
+#[test]
+fn a_receipt_changed_during_the_probe_leaves_no_stale_verdict() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for phase in ["version", "compile"] {
+        let root = scratch("changing-receipt");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        script(
+            &cc,
+            "set -e\nroot=${0%/bin/cc}\necho asked >> \"$root/asked\"\nchange_receipt() { /bin/mv \"$root/receipt\" \"$root/receipt.saved\"; /bin/mv \"$root/receipt.next\" \"$root/receipt\"; /bin/rm \"$root/change\"; }\ncase \"$1\" in\n--version) if [ -f \"$root/change\" ] && [ \"$(/bin/cat \"$root/change\")\" = version ]; then change_receipt; fi; echo cc;;\n-o) if [ \"$(/bin/cat \"$root/receipt\")\" != new ]; then if [ -f \"$root/change\" ]; then change_receipt; fi; echo 'old tools cannot link' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";;\nesac",
+        );
+        let host = CcHost {
+            inherit_environment: false,
+            ..plain_host(&root)
+        };
+        let receipt = root.join("receipt");
+        let next = root.join("receipt.next");
+        let saved = root.join("receipt.saved");
+        std::fs::write(&receipt, b"old").unwrap();
+        std::fs::write(&next, b"new").unwrap();
+        std::fs::write(root.join("change"), phase.as_bytes()).unwrap();
+        let before = std::fs::metadata(&receipt).unwrap();
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: receipt.clone(),
+        };
+        let path = Some(bin.as_os_str());
+        let changed = probe_cached(path, &host, Some(&cache));
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"new");
+        let current = probe_with(path, &host);
+        assert!(matches!(current, CcVerdict::Ready { .. }), "{current:?}");
+        std::fs::rename(&receipt, &next).unwrap();
+        std::fs::rename(&saved, &receipt).unwrap();
+        let restored = std::fs::metadata(&receipt).unwrap();
+        assert_eq!(
+            (
+                restored.dev(),
+                restored.ino(),
+                restored.len(),
+                restored.modified().unwrap()
+            ),
+            (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.modified().unwrap()
+            ),
+        );
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"old");
+        let direct = probe_with(path, &host);
+        let cached = probe_cached(path, &host, Some(&cache));
+        assert!(
+            matches!(changed, CcVerdict::Unproven { .. })
+                && matches!(&direct, CcVerdict::Broken { why, .. } if why == "old tools cannot link")
+                && matches!(&cached, CcVerdict::Broken { why, .. } if why == "old tools cannot link"),
+            "{phase}: changed: {changed:?}; current: {current:?}; direct: {direct:?}; cached: {cached:?}"
+        );
+        assert!(!cache.file.exists(), "no failed or unstable fact was kept");
+        let runs = || {
+            std::fs::read_to_string(root.join("asked"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        assert_eq!(runs(), 8);
+
+        std::fs::rename(&receipt, &saved).unwrap();
+        std::fs::rename(&next, &receipt).unwrap();
+        let ready = CcVerdict::Ready { driver: cc };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 10);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 10, "the stable success remains warm");
+    }
+}
+
+/// A `Ready` verdict is kept under what it depends on: a probe with the same key spawns
+/// nothing (the compiler is never asked again), and a changed Command Line Tools receipt
+/// probes again, including replacement and in-place edits preserving the old timestamp.
+/// An unread or oversized receipt cannot supply a kept success.
+#[test]
+fn a_kept_cc_verdict_spawns_nothing_until_the_receipt_changes() {
+    let root = scratch("kept");
+    let bin = root.join("bin");
+    let asked = root.join("asked");
+    script(
+        &bin.join("cc"),
+        &format!(
+            "echo \"$1\" >> '{}'; case \"$1\" in --version) echo 'cc version 1';; -o) printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+            asked.display()
+        ),
+    );
+    let host = plain_host(&root);
+    let receipt = root.join("receipt");
+    std::fs::write(&receipt, "1").unwrap();
+    let cache = CcCache {
+        file: root.join("state").join("cc"),
+        receipt: receipt.clone(),
+    };
+    let path = Some(bin.as_os_str());
+    let runs = || std::fs::read_to_string(&asked).map_or(0, |text| text.lines().count());
+    let ready = CcVerdict::Ready {
+        driver: bin.join("cc"),
+    };
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 2, "asked its version, then built the probe");
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 2, "the same key ran the compiler again");
+    let fresh = |why: &str| {
+        let before = runs();
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), before + 2, "{why}");
+    };
+    let modified = std::fs::metadata(&receipt).unwrap().modified().unwrap();
+    let replacement = root.join("replacement-receipt");
+    std::fs::write(&replacement, "2").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&replacement, &receipt).unwrap();
+    assert_eq!(
+        std::fs::metadata(&receipt).unwrap().modified().unwrap(),
+        modified
+    );
+    fresh("a replaced receipt kept its old timestamp and verdict");
+    std::fs::write(&receipt, "3").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&receipt)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fresh("an in-place receipt edit kept its old timestamp and verdict");
+    std::fs::File::options()
+        .write(true)
+        .open(&receipt)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400))
+        .unwrap();
+    fresh("a changed receipt left the old verdict standing");
+    let before = runs();
+    assert_eq!(probe_cached(path, &host, None), ready);
+    assert_eq!(runs(), before + 2, "no cache: the compiler is asked");
+    std::fs::remove_file(&receipt).unwrap();
+    std::os::unix::fs::symlink("missing-receipt-target", &receipt).unwrap();
+    for _ in 0..2 {
+        fresh("an unread receipt cannot retain a success");
+    }
+    std::fs::remove_file(&receipt).unwrap();
+    std::fs::write(&receipt, vec![0; 64 * 1024 + 1]).unwrap();
+    for _ in 0..2 {
+        fresh("an oversized receipt cannot retain a success");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn inherited_compiler_configuration_cannot_retain_a_cached_fact() {
+    const CHILD: &str = "ATERM_CC_CACHE_ENVIRONMENT_CHILD";
+    if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+        let bin = root.join("bin");
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let mut host = plain_host(&root);
+        host.inherit_environment = true;
+        let verdict = probe_cached(Some(bin.as_os_str()), &host, Some(&cache));
+        let result = match verdict {
+            CcVerdict::Ready { .. } => "ready",
+            CcVerdict::Broken { why, .. } if why == "project headers refused" => "refused",
+            other => panic!("unexpected compiler verdict: {other:?}"),
+        };
+        std::fs::write(root.join("result"), result).unwrap();
+        return;
+    }
+    let root = scratch("changed-compiler-environment");
+    let bin = root.join("bin");
+    let asked = root.join("asked");
+    let headers = root.join("headers");
+    std::fs::create_dir(&headers).unwrap();
+    script(
+        &bin.join("cc"),
+        &format!(
+            "echo asked >> '{}'\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\nif [ \"$(/bin/cat \"$CPATH/fixture.h\")\" = reject ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+            asked.display()
+        ),
+    );
+    for (header, expected, calls) in [
+        ("accept", "ready", 2),
+        ("reject", "refused", 4),
+        ("accept", "ready", 6),
+    ] {
+        std::fs::write(headers.join("fixture.h"), header).unwrap();
+        let result = root.join("result");
+        let _ = std::fs::remove_file(&result);
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "prereq::tests::inherited_compiler_configuration_cannot_retain_a_cached_fact",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(CHILD, root.as_path())
+        .env("CPATH", &headers);
+        let output = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&result).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_to_string(&asked).unwrap().lines().count(),
+            calls
+        );
+    }
+    assert!(
+        !root.join("state/cc").exists(),
+        "inherited configuration retains no fact"
+    );
+}
+
+#[test]
+fn a_system_probe_does_not_inherit_a_projects_compiler_environment() {
+    const CHILD: &str = "ATERM_CC_ENVIRONMENT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let witness = aterm_tempfile::tempdir().unwrap();
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "prereq::tests::a_system_probe_does_not_inherit_a_projects_compiler_environment",
+            "--nocapture",
+        ])
+        .env(CHILD, witness.path())
+        .env("CPATH", "project header configuration");
+        let output = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            output.status.success() && witness.path().join("checked").is_file(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = scratch("compiler-environment");
+    let bin = root.join("bin");
+    script(
+        &bin.join("cc"),
+        "[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$CPATH\" ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+    );
+    let mut host = plain_host(&root);
+    host.inherit_environment = true;
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = Some(bin.as_os_str());
+    let refused = |verdict| matches!(verdict, CcVerdict::Broken { why, .. } if why == "project headers refused");
+    assert!(refused(probe_cached(path, &host, Some(&cache))));
+    host.inherit_environment = false;
+    assert_eq!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::Ready {
+            driver: bin.join("cc")
+        }
+    );
+    host.inherit_environment = true;
+    assert!(
+        refused(probe_cached(path, &host, Some(&cache))),
+        "a system-only fact must not stand for the project's build"
+    );
+    std::fs::write(
+        PathBuf::from(std::env::var_os(CHILD).unwrap()).join("checked"),
+        b"yes",
+    )
+    .unwrap();
+}
+
+#[test]
+fn distinct_native_paths_cannot_reuse_a_cached_compiler_success() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = scratch("native-path-cache");
+    let bin = root.join("bin");
+    let asked = root.join("asked");
+    script(
+        &bin.join("cc"),
+        &format!(
+            "echo asked >> '{}'\ncase \"$1\" in --version) echo cc;; -o) case \"$PATH\" in *$(printf '\\201')) echo 'PATH configuration refused' >&2; exit 1;; esac; printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+            asked.display()
+        ),
+    );
+    let host = CcHost {
+        inherit_environment: false,
+        ..plain_host(&root)
+    };
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = |byte| {
+        let mut bytes = bin.as_os_str().as_encoded_bytes().to_vec();
+        bytes.extend_from_slice(b":/not-a-directory-");
+        bytes.push(byte);
+        std::ffi::OsString::from_vec(bytes)
+    };
+    let first = path(0x80);
+    let changed = path(0x81);
+    assert_eq!(first.to_string_lossy(), changed.to_string_lossy());
+    let ready = CcVerdict::Ready {
+        driver: bin.join("cc"),
+    };
+    for _ in 0..2 {
+        assert_eq!(probe_cached(Some(&first), &host, Some(&cache)), ready);
+    }
+    assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 2);
+    assert!(matches!(
+        probe_with(Some(&changed), &host),
+        CcVerdict::Broken { why, .. } if why == "PATH configuration refused"
+    ));
+    assert!(matches!(
+        probe_cached(Some(&changed), &host, Some(&cache)),
+        CcVerdict::Broken { why, .. } if why == "PATH configuration refused"
+    ));
+    assert_eq!(probe_cached(Some(&first), &host, Some(&cache)), ready);
+    assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 6);
+}
+
+#[test]
+fn a_changed_deployment_target_cannot_reuse_a_cached_success() {
+    let root = scratch("deployment-target");
+    let bin = root.join("bin");
+    let asked = root.join("asked");
+    script(
+        &bin.join("cc"),
+        &format!(
+            "echo asked >> '{}'\ncase \"$1\" in\n--version) echo cc;;\n-o) if [ \"$MACOSX_DEPLOYMENT_TARGET\" = unavailable ]; then echo 'build target unavailable' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";;\nesac",
+            asked.display()
+        ),
+    );
+    let mut host = plain_host(&root);
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = Some(bin.as_os_str());
+    let runs = || std::fs::read_to_string(&asked).unwrap().lines().count();
+    let ready = CcVerdict::Ready {
+        driver: bin.join("cc"),
+    };
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 2);
+    host.deployment_target_override = Some("unavailable".into());
+    assert!(matches!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::Broken { why, .. } if why == "build target unavailable"
+    ));
+    assert_eq!(
+        runs(),
+        4,
+        "a changed build target must ask the compiler again"
+    );
+    host.deployment_target_override = Some("11.0".into());
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 6);
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 6, "an unchanged target retains its successful fact");
+}
+
+#[test]
+fn a_changed_explicit_sdk_or_developer_directory_cannot_reuse_a_cached_success() {
+    for select_developer in [false, true] {
+        let root = scratch("mutable-sdk");
+        let bin = root.join("bin");
+        let developer = root.join("external developer");
+        let sdk = developer.join("SDKs/MacOSX.sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        let usable = sdk.join("usable");
+        std::fs::write(&usable, "headers and libraries").unwrap();
+        script(
+            &bin.join("cc"),
+            "sdk=${SDKROOT:-$DEVELOPER_DIR/SDKs/MacOSX.sdk}\ncase \"$1\" in --version) echo cc;; -o) if [ -f \"$sdk/usable\" ]; then printf x > \"$2\"; /bin/chmod +x \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
+        );
+        let host = CcHost {
+            sdkroot_override: (!select_developer).then_some(sdk),
+            developer_dir_override: select_developer.then_some(developer),
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        assert_eq!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready {
+                driver: bin.join("cc")
+            }
+        );
+        std::fs::remove_file(&usable).unwrap();
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Broken { why, .. } if why == "SDK no longer usable"
+        ));
+    }
+}
+
+#[test]
+fn verdicts_kept_before_the_current_output_policy_are_not_reused() {
+    let root = scratch("old-output-policy");
+    let bin = root.join("bin");
+    let cc = bin.join("cc");
+    let asked = root.join("asked");
+    script(
+        &cc,
+        &format!(
+            "echo \"$1\" >> '{}'; case \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod 600 \"$2\";; esac",
+            asked.display()
+        ),
+    );
+    let host = plain_host(&root);
+    let cache = CcCache {
+        file: root.join("state").join("cc"),
+        receipt: root.join("absent-receipt"),
+    };
+    let developer = host.developer_dir().unwrap();
+    let clang = clang_paths(&developer)
+        .iter()
+        .map(|path| crate::probe_cache::identity(path).unwrap_or_else(|| "absent".to_owned()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let old_parts = [
+        Some("plain".to_owned()),
+        crate::probe_cache::identity(&cc),
+        Some(developer.display().to_string()),
+        Some(clang),
+        Some("no receipt".to_owned()),
+        Some("no sdk".to_owned()),
+        Some(bin.display().to_string()),
+    ];
+    let mut old_keys: Vec<_> = [None, Some("executable-link-v1")]
+        .into_iter()
+        .map(|domain| {
+            crate::probe_cache::key(
+                domain
+                    .into_iter()
+                    .map(|domain| Some(domain.to_owned()))
+                    .chain(old_parts.iter().cloned()),
+            )
+            .unwrap()
+        })
+        .collect();
+    // A preceding path-only cached value cannot supply a compiler identity fact.
+    let current = cc_key(
+        &Located::Plain(cc.clone()),
+        Some(bin.as_os_str()),
+        &host,
+        &cache,
+    )
+    .unwrap();
+    old_keys.push(current.replacen("fresh-executable-link-v15", "fresh-executable-link-v14", 1));
+    // The old receipt reader also called an unread receipt absent. Retire that fact
+    // even if the receipt really is absent now and all other inputs still match.
+    old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));
+    for (epoch, old_key) in old_keys.into_iter().enumerate() {
+        assert_ne!(
+            old_key, current,
+            "the legacy fixture must not seed the current policy"
+        );
+        crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
+        for calls in [2, 4] {
+            assert!(matches!(
+                probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
+                CcVerdict::Broken { .. }
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&asked).unwrap().lines().count(),
+                epoch * 4 + calls
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_developer_override_controls_discovery_and_always_probes_the_compiler() {
+    let root = scratch("developer-override");
+    let shim = root.join("usr-bin");
+    let first = root.join("first");
+    let second = root.join("second");
+    let asked = root.join("asked");
+    for developer in [&first, &second] {
+        script(&developer.join("usr/bin/clang"), "exit 0");
+    }
+    script(&shim.join("xcrun"), "echo \"$DEVELOPER_DIR/usr/bin/cc\"");
+    script(
+        &shim.join("cc"),
+        &format!(
+            "echo \"$DEVELOPER_DIR\" >> '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
+            asked.display()
+        ),
+    );
+    let mut host = CcHost {
+        shim_dir: Some(shim.clone()),
+        ..plain_host(&root)
+    };
+    let cache = CcCache {
+        file: root.join("state/cc"),
+        receipt: root.join("no-receipt"),
+    };
+    let path = Some(shim.as_os_str());
+    assert_eq!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::NoDeveloperDir
+    );
+    for (index, developer) in [&first, &second].into_iter().enumerate() {
+        host.developer_dir_override = Some(developer.clone());
+        let ready = CcVerdict::Ready {
+            driver: developer.join("usr/bin/cc"),
+        };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        let calls = std::fs::read_to_string(&asked).unwrap();
+        assert_eq!(calls.lines().count(), (index + 1) * 2);
+        assert_eq!(calls.lines().last(), developer.to_str());
+    }
+    host.developer_dir_override = Some(root.join("clt-shim/developer"));
+    assert_eq!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::NoDeveloperDir
+    );
+}
+
+#[test]
+fn xcode_bundle_overrides_resolve_the_compiler_and_its_sdk() {
+    let root = scratch("bundle-override");
+    let bundle = root.join("Alternate.app");
+    let developer = bundle.join("Contents/Developer");
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    let sdk = developer.join("SDKs/MacOSX.sdk");
+    std::fs::create_dir_all(&sdk).unwrap();
+    std::fs::write(sdk.join("usable"), b"yes").unwrap();
+    let shim = root.join("shim");
+    script(
+        &shim.join("xcrun"),
+        "d=$DEVELOPER_DIR; [ -d \"$d/Contents/Developer\" ] && d=$d/Contents/Developer; printf '%s/usr/bin/clang\\n' \"$d\"",
+    );
+    script(
+        &shim.join("cc"),
+        "[ -f \"$SDKROOT/usable\" ] || exit 23; printf x > \"$2\"; /bin/chmod +x \"$2\"",
+    );
+    let mut host = CcHost {
+        shim_dir: Some(shim.clone()),
+        developer_dir_override: Some(bundle),
+        ..plain_host(&root)
+    };
+    let path = Some(shim.as_os_str());
+    assert_eq!(installed_with(path, &host), Some(true));
+    assert_eq!(
+        probe_with(path, &host),
+        CcVerdict::Ready {
+            driver: developer.join("usr/bin/clang")
+        }
+    );
+    host.developer_dir_override = None;
+    std::os::unix::fs::symlink(
+        developer.parent().unwrap().parent().unwrap(),
+        &host.xcode_select_link,
+    )
+    .unwrap();
+    assert_eq!(installed_with(path, &host), Some(true));
+
+    let unread = root.join("unread-bundle");
+    std::fs::create_dir(&unread).unwrap();
+    std::os::unix::fs::symlink("Contents", unread.join("Contents")).unwrap();
+    host.developer_dir_override = Some(unread);
+    assert_eq!(installed_with(path, &host), None);
+    assert!(matches!(
+        probe_with(path, &host),
+        CcVerdict::Unproven { .. }
+    ));
+}
+
+#[test]
+fn a_setup_developer_override_is_not_reintroduced_after_discovering_real_tools() {
+    let root = scratch("installed-after-start");
+    let shim = root.join("usr-bin");
+    let developer = root.join("real-developer");
+    script(&developer.join("usr/bin/clang"), "exit 0");
+    script(
+        &shim.join("xcrun"),
+        &format!(
+            "[ -n \"$DEVELOPER_DIR\" ] && {{ echo 'setup override reached xcrun' >&2; exit 1; }}\necho '{}/usr/bin/cc'",
+            developer.display()
+        ),
+    );
+    script(
+        &shim.join("cc"),
+        "[ -n \"$DEVELOPER_DIR\" ] && { echo 'setup override reached compiler' >&2; exit 1; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+    );
+    let host = CcHost {
+        shim_dir: Some(shim.clone()),
+        default_developer_dir: developer.clone(),
+        developer_dir_override: Some(root.join("clt-shim/developer")),
+        ..plain_host(&root)
+    };
+    let path = Some(shim.as_os_str());
+    assert_eq!(installed_with(path, &host), Some(true));
+    assert_eq!(
+        probe_with(path, &host),
+        CcVerdict::Ready {
+            driver: developer.join("usr/bin/cc")
+        }
+    );
+}
+
+#[test]
+fn a_changed_discovery_program_retires_a_cached_compiler_success() {
+    for fault in ["permissions", "missing", "loop", "replacement"] {
+        let root = scratch("discovery-program-cache");
+        let bin = root.join("bin");
+        let xcrun = bin.join("xcrun");
+        let developer = root.join("developer");
+        let driver = developer.join("usr/bin/cc");
+        let compiled = root.join("compiled");
+        script(&driver, "exit 0");
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        script(&xcrun, &format!("echo '{}'", driver.display()));
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo build >> '{}'\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+                compiled.display()
+            ),
+        );
+        let host = CcHost {
+            shim_dir: Some(bin.clone()),
+            default_developer_dir: developer,
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        let ready = CcVerdict::Ready {
+            driver: driver.clone(),
+        };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(
+            std::fs::read_to_string(&compiled).unwrap().lines().count(),
+            1
+        );
+        match fault {
+            "permissions" => {
+                std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o600)).unwrap()
+            }
+            "missing" => std::fs::remove_file(&xcrun).unwrap(),
+            "loop" => {
+                std::fs::remove_file(&xcrun).unwrap();
+                std::os::unix::fs::symlink("xcrun", &xcrun).unwrap();
+            }
+            "replacement" => script(&xcrun, "echo 'discovery refused' >&2; exit 7"),
+            _ => unreachable!(),
+        }
+        let fresh = probe_with(path, &host);
+        assert!(matches!(
+            fresh,
+            CcVerdict::Unproven { .. } | CcVerdict::Broken { .. }
+        ));
+        assert_eq!(probe_cached(path, &host, Some(&cache)), fresh, "{fault}");
+        assert_eq!(
+            std::fs::read_to_string(&compiled).unwrap().lines().count(),
+            1
+        );
+        if fault != "missing" {
+            std::fs::remove_file(&xcrun).unwrap();
+        }
+        script(
+            &xcrun,
+            &format!("# repaired discovery\necho '{}'", driver.display()),
+        );
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(
+            std::fs::read_to_string(&compiled).unwrap().lines().count(),
+            2
+        );
+    }
+}
+
+/// An Xcode update replaces the automatically discovered compiler while the
+/// Command Line Tools receipt stays: the kept verdict retires and the shim is asked again,
+/// so a `cc` the update left refusing (a license not yet agreed to) is seen. NEGATIVE
+/// CONTROL: with the same compiler in place the kept verdict answers and nothing spawns.
+#[test]
+fn an_automatic_xcode_is_discovered_and_its_update_retires_the_cache() {
+    let root = scratch("kept-xcode");
+    let shim = root.join("usr-bin");
+    let asked = root.join("asked");
+    let xcode = root.join("Xcode.app/Contents/Developer");
+    let clang = xcode.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
+    script(&clang, "exit 0");
+    let compiler = xcode.join("usr/bin/cc");
+    script(&compiler, "exit 0");
+    let mutate = root.join("mutate-compiler");
+    script(
+        &shim.join("xcrun"),
+        &format!("echo '{}/usr/bin/cc'", xcode.display()),
+    );
+    script(
+        &shim.join("cc"),
+        &format!(
+            "echo \"$1\" >> '{}'; [ -x '{}' ] || {{ echo 'selected compiler is not executable' >&2; exit 1; }}; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; if [ -f '{}' ]; then /bin/chmod 644 '{}'; fi; }}",
+            asked.display(),
+            compiler.display(),
+            mutate.display(),
+            compiler.display()
+        ),
+    );
+    let host = CcHost {
+        shim_dir: Some(shim.clone()),
+        xcode_select_link: root.join("xcode_select_link"),
+        xcode_developer_dir: Some(xcode.clone()),
+        ..plain_host(&root)
+    };
+    let receipt = root.join("receipt");
+    std::fs::write(&receipt, "1").unwrap();
+    let cache = CcCache {
+        file: root.join("state").join("cc"),
+        receipt,
+    };
+    let path = Some(shim.as_os_str());
+    let without_xcode = CcHost {
+        xcode_developer_dir: None,
+        ..host.clone()
+    };
+    assert_eq!(probe_with(path, &without_xcode), CcVerdict::NoDeveloperDir);
+    let runs = || std::fs::read_to_string(&asked).map_or(0, |text| text.lines().count());
+    let ready = CcVerdict::Ready {
+        driver: xcode.join("usr/bin/cc"),
+    };
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 1, "the shim built the probe");
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 1, "the same Xcode asked the shim again");
+    std::fs::remove_file(&clang).unwrap();
+    script(&clang, "echo updated; exit 0");
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 2, "an updated Xcode kept the old verdict");
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        matches!(probe_cached(path, &host, Some(&cache)), CcVerdict::Broken { why, .. }
+            if why == "selected compiler is not executable"),
+        "an independently changed discovered compiler retained its successful verdict"
+    );
+    assert_eq!(runs(), 3);
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&cache.receipt, "2").unwrap();
+    std::fs::write(&mutate, "yes").unwrap();
+    assert!(matches!(
+        probe_cached(path, &host, Some(&cache)),
+        CcVerdict::Unproven { .. }
+    ));
+    assert_eq!(runs(), 4, "an in-flight replacement was not retained");
+    std::fs::remove_file(&mutate).unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+    assert_eq!(runs(), 5, "the repaired compiler remains warm");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -13,9 +13,11 @@ description = "TLA+ specification coverage tracking for aterm verification"
 autotests = false
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # The authoring macros (`ty_model!`, `#[model]`, `#[liveness]`), a proc macro. Behind
 # `anchors` so `-p aterm-spec`'s lib closure holds no proc macro and Trust's
-# loader admits it (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md); the
+# loader admits it (docs/TRUST-LANE.md (PM-1)); the
 # workspace row turns `anchors` on, so every consumer keeps them.
 aterm-spec-macros = { workspace = true, optional = true }
 # The anchor half (the registry, the anchor records, the entered-anchor record),

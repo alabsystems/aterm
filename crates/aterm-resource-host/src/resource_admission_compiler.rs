@@ -73,7 +73,11 @@ impl Selection {
     }
 }
 
-pub(super) fn select(request: &Submission, resolved: &Path) -> io::Result<Option<Selection>> {
+pub(super) fn select(
+    request: &Submission,
+    resolved: &Path,
+    execute: &recipe::ExecuteProbe<'_>,
+) -> io::Result<Option<Selection>> {
     no_loader_overrides(&request.env)?;
     no_cli_overrides(&request.argv[1..])?;
     let deadline = native_inputs::deadline(Instant::now());
@@ -130,7 +134,7 @@ pub(super) fn select(request: &Submission, resolved: &Path) -> io::Result<Option
         .map(|found| found.lock)
         .transpose()
         .map_err(|e| refused(&e))?;
-    let selected = match project_compiler::select(
+    let selected = match project_compiler::select_with_lease(
         &inputs,
         lock.as_ref(),
         None,
@@ -139,7 +143,16 @@ pub(super) fn select(request: &Submission, resolved: &Path) -> io::Result<Option
             lease_wait: Duration::ZERO,
         },
         &|build, _| atpkg::cli::signed_tree_root_at(&layout, "trust", build),
-        &|program, at| probe(program, at.unwrap_or(deadline), &inputs, request),
+        &|program, at, lease| {
+            probe(
+                program,
+                at.unwrap_or(deadline),
+                &inputs,
+                request,
+                lease,
+                execute,
+            )
+        },
     ) {
         Ok(selected) => selected,
         Err(project_compiler::Error::Busy(_)) => return Ok(None),
@@ -165,26 +178,35 @@ fn probe(
     deadline: Instant,
     inputs: &Inputs,
     request: &Submission,
+    lease: &atpkg::lease::Lease,
+    execute: &recipe::ExecuteProbe<'_>,
 ) -> Result<String, String> {
     let mut command = spawnfd::command(program);
     command
         .arg("-vV")
         .env_clear()
-        .envs(request.env.iter().map(|(k, v)| {
-            (
-                std::ffi::OsStr::from_bytes(k),
-                std::ffi::OsStr::from_bytes(v),
-            )
-        }))
+        .envs(
+            request
+                .env
+                .iter()
+                .filter(|(key, value)| !recipe::stale_fd_var(key, value))
+                .map(|(k, v)| {
+                    (
+                        std::ffi::OsStr::from_bytes(k),
+                        std::ffi::OsStr::from_bytes(v),
+                    )
+                }),
+        )
         .current_dir(&inputs.repo)
         .stderr(spawnfd::Stdio::null());
+    let guard = aterm_uds::kept_out(|| lease.try_clone_descriptor())
+        .map_err(|error| format!("retain selected compiler version probe: {error}"))?;
+    command
+        .inherit_guards(vec![guard])
+        .map_err(|error| format!("map selected compiler version probe guard: {error}"))?;
     let output =
-        aterm_uds::deadline::output_until_complete_stdout_with_limit(&mut command, deadline, 16384)
-            .map_err(|e| format!("probe selected project compiler: {e}"))?;
-    if !output.status.success() {
-        return Err("selected compiler version probe failed".into());
-    }
-    String::from_utf8(output.stdout).map_err(|_| "selected compiler version is not UTF-8".into())
+        execute(command, deadline).map_err(|e| format!("probe selected project compiler: {e}"))?;
+    String::from_utf8(output).map_err(|_| "selected compiler version is not UTF-8".into())
 }
 
 /// A signed executable does not qualify code introduced by its caller's loader.
@@ -239,50 +261,5 @@ pub(super) fn paired_environment(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn selected_sdk_precedes_global_tools_and_pairs_both_compilers() {
-        let mut environment = vec![
-            ("PATH".into(), "/global/bin:/usr/bin".into()),
-            ("KEEP".into(), "value".into()),
-        ];
-        paired_environment(Path::new("/signed/project/sdk"), &mut environment).unwrap();
-        for (key, value) in [
-            ("RUSTC", "/signed/project/sdk/bin/trustc"),
-            ("RUSTDOC", "/signed/project/sdk/bin/trustdoc"),
-            ("PATH", "/signed/project/sdk/bin:/global/bin:/usr/bin"),
-            ("KEEP", "value"),
-        ] {
-            assert_eq!(
-                environment
-                    .iter()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, v)| v.as_os_str()),
-                Some(std::ffi::OsStr::new(value))
-            );
-        }
-    }
-    #[test]
-    fn caller_loader_code_is_not_a_signed_native_recipe() {
-        for argument in [
-            "--config",
-            "--config=build.rustc=foreign",
-            "-C",
-            "-C/foreign",
-        ] {
-            assert!(no_cli_overrides(&[argument.as_bytes().to_vec()]).is_err());
-        }
-        assert!(no_cli_overrides(&[b"--unverified".to_vec(), b"check".to_vec()]).is_ok());
-        for key in [
-            b"LD_PRELOAD".as_slice(),
-            b"LD_LIBRARY_PATH",
-            b"DYLD_INSERT_LIBRARIES",
-            b"DYLD_LIBRARY_PATH",
-        ] {
-            assert!(no_loader_overrides(&[(key.to_vec(), b"/foreign/code".to_vec())]).is_err());
-            assert!(no_loader_overrides(&[(key.to_vec(), Vec::new())]).is_err());
-        }
-        assert!(no_loader_overrides(&[(b"ORDINARY_PATH".to_vec(), b"/ordinary".to_vec())]).is_ok());
-    }
-}
+#[path = "resource_admission_compiler_tests.rs"]
+mod tests;

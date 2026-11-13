@@ -9,10 +9,9 @@ use std::fmt;
 /// can name).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Why {
-    /// The OS has no source for it (the thermal level on Windows; purgeable space off macOS).
+    /// The OS has no source for it (the load average on Windows; purgeable space off macOS).
     Unsupported,
-    /// The OS has a public source this build does not read (Windows' GPU engine counters, which
-    /// cost more per read than the whole sampler; macOS's thermal notify level).
+    /// The OS has a public source this build does not read (macOS's thermal notify level).
     NotRead,
     /// The OS can, with a feature that is switched off here: the name is the feature
     /// (`not_enabled:psi`, `not_enabled:zswap`).
@@ -109,31 +108,40 @@ pub struct Caps {
     /// Commit charge and limit (Windows exact; Linux `Committed_AS` against an advisory
     /// `CommitLimit`; macOS has none).
     pub commit: Cap,
-    /// Compressed memory (macOS's compressor, Linux zswap).
+    /// Compressed memory (macOS's compressor, Linux zswap, Windows' compression store).
     pub compressor: Cap,
     /// Swap in use and allocated.
     pub swap: Cap,
-    /// The GPU's device-wide use.
+    /// The GPU's device-wide use (Windows: the busiest hardware adapter's busiest engine, from
+    /// the `GPU Engine` counters).
     pub gpu_device: Cap,
-    /// GPU use per process.
+    /// GPU use per process (Windows: each `GPU Engine` instance's running time, every user's).
     pub gpu_per_proc: Cap,
     /// CPU time of other users' processes.
     pub proc_cpu_others: Cap,
     /// Memory of other users' processes.
     pub proc_memory_others: Cap,
-    /// The throttle level (`none`, `light`, `heavy`, `severe`).
+    /// The throttle level (`none`, `light`, `heavy`, `severe`); `estimate` on Windows, where it
+    /// is a banding of the thermal zones' passive limit and a machine without a zone has none.
     pub throttle: Cap,
     /// A volume's size and free space.
     pub volume: Cap,
     /// The kernel's resource coalitions, every user's ([`crate::coalitions`]): `yes` on macOS once
     /// [`crate::coalitions::self_check`] passes.
     pub coalitions: Cap,
+    /// Rows this OS's readers add to the table above, each `(name, cap, what it measures)`, in
+    /// the order they print: Windows' rows for the readers the table has no column for (physical
+    /// memory, paging, whose a process is, its I/O and state, a process tree's memory, the
+    /// machine's words, the network links, the TCP counts, device throughput, load). Empty on
+    /// macOS and Linux, whose report is the table above.
+    pub more: Vec<(&'static str, Cap, &'static str)>,
     /// What capacity figures are computed against.
     pub capacity: CapSource,
 }
 
 impl Caps {
-    /// Every row as `(name, word)`, in the order the struct declares them: `("per_core", "yes")`,
+    /// Every row as `(name, word)`, in the order the struct declares them ([`Caps::more`]'s
+    /// before `capacity`): `("per_core", "yes")`,
     /// `("pressure", "unavailable(not_enabled:psi)")`.
     #[must_use]
     pub fn rows(&self) -> Vec<(&'static str, String)> {
@@ -149,7 +157,7 @@ impl Caps {
     pub fn described_rows(&self) -> Vec<(&'static str, String, &'static str)> {
         let cap =
             |name: &'static str, c: Cap, meaning: &'static str| (name, c.to_string(), meaning);
-        vec![
+        let mut rows = vec![
             (
                 "os",
                 self.os.to_owned(),
@@ -180,7 +188,7 @@ impl Caps {
             cap(
                 "compressor",
                 self.compressor,
-                "compressed memory (macOS's compressor, zswap)",
+                "compressed memory (macOS's compressor, zswap, Windows' compression store)",
             ),
             cap("swap", self.swap, "swap in use and allocated"),
             cap("gpu_device", self.gpu_device, "the GPU's device-wide use"),
@@ -202,12 +210,18 @@ impl Caps {
                 self.coalitions,
                 "every user's resource coalitions (why's split)",
             ),
-            (
-                "capacity",
-                self.capacity.word().to_owned(),
-                "what capacity is counted against: host or cgroup_limit",
-            ),
-        ]
+        ];
+        rows.extend(
+            self.more
+                .iter()
+                .map(|&(name, c, meaning)| cap(name, c, meaning)),
+        );
+        rows.push((
+            "capacity",
+            self.capacity.word().to_owned(),
+            "what capacity is counted against: host or cgroup_limit",
+        ));
+        rows
     }
 
     /// Every row unavailable as [`Why::Unsupported`]: a platform with no readers here.
@@ -232,6 +246,7 @@ impl Caps {
             throttle: no,
             volume: no,
             coalitions: no,
+            more: Vec::new(),
             capacity: CapSource::Host,
         }
     }

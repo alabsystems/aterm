@@ -266,11 +266,13 @@ fn confirming_or_forgiving_a_trial_never_waits_forever_on_a_held_apply_lock() {
     let worker_staging = s.clone();
     let worker_installed = installed.clone();
     let worker = std::thread::spawn(move || {
-        let confirmed = confirm_boot_health_at(
+        let confirmed = confirm_boot_health_verdict_at(
             &worker_staging,
             11,
             Some("abc"),
             crate::TrialWitness::Window,
+            true,
+            ProbeClock::now(),
             || {
                 Some(bundle::Bundle {
                     exe: worker_installed.join("Contents/MacOS/aterm"),
@@ -294,7 +296,15 @@ fn confirming_or_forgiving_a_trial_never_waits_forever_on_a_held_apply_lock() {
     worker.join().unwrap();
     let confirmed = before_release
         .expect("confirm and forgive must return while another process holds the apply lock");
-    assert!(!confirmed, "a timed-out confirmation is retried later");
+    assert!(
+        matches!(&confirmed, crate::BootHealthVerdict::Unanswered { why } if why.contains("health lock")),
+        "a timed-out confirmation could not be asked, and is asked again: {confirmed:?}"
+    );
+    assert_eq!(
+        trial_refusal_count(&s),
+        0,
+        "a lock that timed out refused no proof"
+    );
     assert_eq!(
         sentinel.read_state(),
         Some((11, 1)),
@@ -924,17 +934,26 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     let standing = "a quiet moment is awaited; retried at 12:00";
     Health::record_apply_refusal(&s.health(), 10, standing);
     let status_before = std::fs::read_to_string(&s.status).ok();
-    assert!(
-        confirm_boot_health_at(
-            &s,
-            11,
-            Some("abc"),
-            Headless,
-            bundle_at(&installed),
-            Duration::from_millis(100),
-        ),
-        "nothing for the headless instance to retry"
+    let waiting = confirm_boot_health_verdict_at(
+        &s,
+        11,
+        Some("abc"),
+        Headless,
+        true,
+        ProbeClock::now(),
+        bundle_at(&installed),
+        Duration::from_millis(100),
     );
+    assert!(
+        matches!(
+            &waiting,
+            crate::BootHealthVerdict::Pending { why, retry_after: Some(after) }
+                if why.contains("no window of it has confirmed it")
+                    && *after <= HEADLESS_WINDOW_WAIT_RECHECK
+        ),
+        "the headless instance holds by name and asks again within the hour: {waiting:?}"
+    );
+    assert_eq!(trial_refusal_count(&s), 0, "a wait refuses no proof");
     assert_eq!(
         sentinel.read_state(),
         Some((11, 1)),
@@ -995,51 +1014,1214 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     let _ = std::fs::remove_dir_all(&lane.root);
 }
 
+fn span_ms() -> u64 {
+    u64::try_from(crate::TRIAL_SETTLE_REFUSAL_SPAN.as_millis()).unwrap()
+}
+
+/// A reading of the awake clock at `ms`, on today's wall clock.
+fn awake(ms: u64) -> ProbeClock {
+    ProbeClock {
+        awake_ms: Some(ms),
+        wall_secs: unix_now_secs(),
+    }
+}
+
+/// One checkpoint ask about build 11 at `now`, whose proof answers `proof`.
+fn ask_at(
+    s: &Staging,
+    installed: &Path,
+    witness: crate::TrialWitness,
+    now: ProbeClock,
+    proof: Result<(), &str>,
+) -> crate::BootHealthVerdict {
+    let proof = proof.map_err(|why| ProofRefusal::from(why.to_string()));
+    confirm_boot_health_verdict_at_with_proof(
+        s,
+        11,
+        witness,
+        true,
+        now,
+        bundle_at(installed),
+        std::time::Duration::from_millis(100),
+        move |_| proof,
+    )
+}
+
+fn is_pending(verdict: &crate::BootHealthVerdict) -> bool {
+    matches!(verdict, crate::BootHealthVerdict::Pending { .. })
+}
+
+fn is_settled_unproven(verdict: &crate::BootHealthVerdict) -> bool {
+    matches!(
+        verdict,
+        crate::BootHealthVerdict::SettledUnproven { build: 11, .. }
+    )
+}
+
+/// Whether `rollback` is on disk and keyed to no process: what an unproven settle leaves, so
+/// that no later launch's release of an ended window's predecessor removes it.
+fn left_in_place(s: &Staging, rollback: &Path) -> bool {
+    let unkeyed = KeptPredecessor::read(s).is_none();
+    // What the next launch's checkpoint runs, with nothing running from the bundle.
+    release_kept_predecessor(s, std::time::Duration::from_millis(100), |_| Some(false));
+    unkeyed && read_id(rollback) == "OLD"
+}
+
+/// A `predecessor.kept` an earlier window left: its holder has ended.
+fn keep_for_an_ended_window(s: &Staging, rollback: &Path) {
+    KeptPredecessor {
+        holder: TrialLauncher {
+            pid: std::process::id(),
+            started: (1, 0),
+        },
+        bundle: rollback.to_path_buf(),
+    }
+    .record(s)
+    .unwrap();
+}
+
 #[test]
-fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window() {
+fn a_window_confirmation_the_proof_refuses_is_retried_until_its_bound_then_settled() {
+    use crate::BootHealthVerdict::{Pending, SettledUnproven};
     use crate::TrialWitness::Window;
-    use std::time::Duration;
     let s = scratch("boot-window-proof-refused");
     let installed = s.root.join("Applications").join("aterm.app");
-    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
     let sentinel = boot_sentinel(&s);
     count_trial_launch(&s, &sentinel, 11, None, true, Window).unwrap();
     backdate(&s);
-    let confirm = |reason: &'static str| {
-        confirm_boot_health_at_with_proof(
-            &s,
-            11,
-            Window,
-            bundle_at(&installed),
-            Duration::from_millis(100),
-            move |_| {
-                if reason.is_empty() {
-                    Ok(())
-                } else {
-                    Err(reason.to_string())
-                }
-            },
-        )
-    };
-    let said = |reason: &str| {
+    keep_for_an_ended_window(&s, &rollback);
+    Health::record_apply_failure(&s.health(), 10, 11, "an earlier apply failed");
+    let before = Health::read(&s.health());
+    let said = |words: &str| {
         crate::log_capture::take()
             .iter()
-            .filter(|(_, line)| line.contains(reason))
+            .filter(|(_, line)| line.contains(words))
             .count()
     };
     let _ = crate::log_capture::take();
-    for reason in ["rollback refused", "receipt missing"] {
-        for _ in 0..3 {
-            assert!(!confirm(reason), "a refused proof is retried");
-        }
-        assert_eq!(said(reason), 1, "said once, not once per try");
-        let report = window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial is reported");
-        assert!(report.contains(reason), "{report}");
+    let start = 1_000_000;
+    let mut asked = 0;
+    for at in [0, 300, 900] {
+        let verdict = ask_at(
+            &s,
+            &installed,
+            Window,
+            awake(start + at),
+            Err("rollback refused"),
+        );
+        asked += 1;
+        assert!(
+            matches!(&verdict, Pending { why, retry_after: None } if why.contains("rollback refused")),
+            "a refused proof below the bound is retried: {verdict:?}"
+        );
+        assert_eq!(trial_refusal_count(&s), asked);
     }
-    assert!(confirm(""), "a passing proof confirms the trial");
-    assert_eq!(sentinel.read_state(), None);
+    assert_eq!(said("stays armed"), 1, "said once, not once per try");
+    let report = window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial is reported");
+    assert!(
+        report.contains("rollback refused") && report.contains(&trial_bound_words()),
+        "the report names the reason and the bound: {report}"
+    );
+    let refusal = refused_trial_refusal(&s, 11);
+    assert!(
+        crate::is_boot_health_confirmation_wait(&refusal, 11)
+            && refusal.contains("rollback refused")
+            && refusal.contains(&trial_bound_words()),
+        "an apply's refusal names the reason and the bound: {refusal}"
+    );
+    assert!(
+        matches!(
+            settle_trials_under_apply_lock(&s, &installed, 11, None),
+            Err(ApplyOutcome::Deferred(why)) if why == refusal
+        ),
+        "and that is what an apply is refused with"
+    );
+    assert_eq!(
+        sentinel.read_state(),
+        Some((11, 1)),
+        "three refusals in a second settle nothing"
+    );
+
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + span_ms() + 1000),
+        Err("rollback refused"),
+    );
+    let SettledUnproven { build: 11, why } = &verdict else {
+        panic!("the bound settles the trial: {verdict:?}");
+    };
+    assert!(
+        why.contains("unproven at its window checkpoint") && why.contains("rollback refused"),
+        "{why}"
+    );
+    assert!(verdict.opens_gate());
+    assert_eq!(verdict.settled_build(), Some(11));
+    assert_eq!(sentinel.read_state(), None, "the trial is disarmed");
+    assert!(FailedMark::read(&s.trial()).is_none(), "with its identity");
+    assert_eq!(read_id(&installed), "NEW", "the build stays: no revert");
+    assert_eq!(read_id(&rollback), "OLD");
+    assert!(
+        why.contains(&format!(
+            "the previous build stays at {} until the next update replaces it",
+            rollback.display()
+        )),
+        "{why}"
+    );
+    assert!(
+        left_in_place(&s, &rollback),
+        "and so it does: keyed to no window, an earlier window's record cleared, so a \
+         relaunch's release removes nothing"
+    );
+    let status = std::fs::read_to_string(&s.status).unwrap_or_default();
+    assert!(status.contains("update trial unproven"), "{status}");
+    let after = Health::read(&s.health());
+    assert!(
+        after.trial_proof_failure.is_empty()
+            && after.trial_proof_failure_at.is_empty()
+            && after.trial_proof_failure_build == 0,
+        "the refusal no longer stands"
+    );
+    assert_eq!(
+        (
+            after.apply_failures,
+            after.apply_failures_for_target,
+            after.last_apply_error.as_str()
+        ),
+        (
+            before.apply_failures,
+            before.apply_failures_for_target,
+            before.last_apply_error.as_str()
+        ),
+        "an unproven settle is no apply success: the failure ledger is as it was"
+    );
+    assert_eq!(trial_refusal_count(&s), 0, "the streak ends with the trial");
     assert_eq!(window_trial_wait_at(&s, 11, unix_now_secs()), None);
+    assert!(
+        settle_trials_under_apply_lock(&s, &installed, 11, None).is_ok(),
+        "updates are re-enabled"
+    );
     let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_burst_of_refusals_is_not_a_lasting_one() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-refusal-burst");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    for ask in 0..10 {
+        let verdict = ask_at(
+            &s,
+            &installed,
+            Window,
+            awake(1_000_000 + ask * 30_000),
+            Err("rollback refused"),
+        );
+        assert!(is_pending(&verdict), "ask {ask}: {verdict:?}");
+    }
+    assert_eq!(
+        trial_refusal_count(&s),
+        10,
+        "ten refusals in under five minutes"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    assert!(FailedMark::read(&s.trial()).is_some());
+    assert_eq!(read_id(&installed), "NEW");
+    assert_eq!(read_id(&rollback), "OLD");
+    assert!(KeptPredecessor::read(&s).is_none(), "nothing moved");
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_refusal_streak_restarts_with_another_trial_and_spans_only_awake_time() {
+    let s = scratch("boot-refusal-streak");
+    let other = scratch("boot-refusal-streak-other");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let wall = |secs: u64| ProbeClock {
+        awake_ms: None,
+        wall_secs: secs,
+    };
+
+    assert_eq!(count_trial_refusal(&s, 11, awake(1_000)), (1, 0));
+    assert_eq!(count_trial_refusal(&s, 11, awake(2_000)), (2, 1_000));
+    assert_eq!(
+        count_trial_refusal(&other, 11, awake(2_500)),
+        (1, 0),
+        "another staging root counts apart"
+    );
+    assert_eq!(trial_refusal_count(&s), 2);
+
+    let asleep = ProbeClock {
+        awake_ms: Some(3_000),
+        wall_secs: unix_now_secs() + 24 * 60 * 60,
+    };
+    assert_eq!(
+        count_trial_refusal(&s, 11, asleep),
+        (3, 2_000),
+        "a day of sleep on the wall clock spans nothing on the awake one"
+    );
+
+    interrupt_trial_refusals(&s);
+    assert_eq!(
+        count_trial_refusal(&s, 11, awake(9_000)),
+        (4, 2_000),
+        "the gap across an ask that ran no proof spans nothing"
+    );
+    assert_eq!(
+        count_trial_refusal(&s, 11, awake(9_500)),
+        (5, 2_500),
+        "and the next gap spans again"
+    );
+
+    FailedMark::record_required(&s.trial(), 11, &"cd".repeat(32), Some(&installed)).unwrap();
+    assert_eq!(
+        count_trial_refusal(&s, 11, awake(10_000)),
+        (1, 0),
+        "another artifact's trial starts its own streak"
+    );
+    assert_eq!(count_trial_refusal(&s, 11, awake(11_000)), (2, 1_000));
+    assert_eq!(
+        count_trial_refusal(&s, 11, awake(10)),
+        (1, 0),
+        "an awake clock that reads below the last refusal restarted"
+    );
+    assert_eq!(count_trial_refusal(&s, 11, awake(510)), (2, 500));
+    // No awake clock: the wall clock, which a sleep and a forward step both age, spans
+    // nothing, in either direction.
+    assert_eq!(
+        count_trial_refusal(&s, 11, wall(500)),
+        (3, 500),
+        "a refusal with no awake reading is counted and spans nothing"
+    );
+    assert_eq!(
+        count_trial_refusal(&s, 11, wall(500 + 24 * 60 * 60)),
+        (4, 500),
+        "a day on the wall clock alone spans nothing"
+    );
+    assert_eq!(
+        count_trial_refusal(&s, 11, awake(99_000_000)),
+        (5, 500),
+        "nor does the gap back to an awake reading"
+    );
+    assert_eq!(
+        count_trial_refusal(&s, 12, awake(30)),
+        (1, 0),
+        "another build's trial starts its own streak"
+    );
+    forget_trial_refusals(&s);
+    assert_eq!(trial_refusal_count(&s), 0);
+    assert_eq!(trial_refusal_count(&other), 1);
+    forget_trial_refusals(&other);
+    let _ = std::fs::remove_dir_all(&s.root);
+    let _ = std::fs::remove_dir_all(&other.root);
+}
+
+#[test]
+fn without_an_awake_clock_no_refusal_settles_the_trial() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-refusal-wall-clock");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let wall = unix_now_secs();
+    // Two refusals, then a closed lid (or a clock stepped forward) and refusals for a day.
+    for after_secs in [0, 1, 1_900, 3_800, 24 * 60 * 60] {
+        let now = ProbeClock {
+            awake_ms: None,
+            wall_secs: wall + after_secs,
+        };
+        let verdict = ask_at(&s, &installed, Window, now, Err("rollback refused"));
+        assert!(
+            is_pending(&verdict),
+            "wall time is no awake time, +{after_secs} s: {verdict:?}"
+        );
+    }
+    assert_eq!(trial_refusal_count(&s), 5, "each was counted");
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    assert_eq!(read_id(&rollback), "OLD");
+    forget_trial_refusals(&s);
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_refusal_spans_the_bound_only_while_it_lasts() {
+    use crate::BootHealthVerdict::{Pending, Unanswered};
+    use crate::TrialWitness::{Headless, Window};
+    use std::os::unix::fs::PermissionsExt;
+    let minute = 60_000;
+    let start = 1_000_000;
+
+    // A proof that passed between two refusals: the refusal did not last.
+    let s = scratch("boot-refusal-then-pass");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    for at in [0, 1_000] {
+        let verdict = ask_at(
+            &s,
+            &installed,
+            Window,
+            awake(start + at),
+            Err("mid-rewrite"),
+        );
+        assert!(is_pending(&verdict), "{verdict:?}");
+    }
+    let lock = |mode: u32| {
+        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    lock(0o500);
+    let passed = ask_at(&s, &installed, Window, awake(start + 2_000), Ok(()));
+    lock(0o700);
+    assert!(
+        matches!(&passed, Pending { why, .. } if why.contains("the recovery proof passed")),
+        "{passed:?}"
+    );
+    assert_eq!(
+        trial_refusal_count(&s),
+        0,
+        "a proof that passed ends the streak"
+    );
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + span_ms() + minute),
+        Err("one slow verifier"),
+    );
+    assert!(
+        is_pending(&verdict),
+        "one refusal half an hour after a pass settles nothing: {verdict:?}"
+    );
+    assert_eq!(trial_refusal_count(&s), 1);
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    forget_trial_refusals(&s);
+    let _ = std::fs::remove_dir_all(&s.root);
+
+    // Asks that ran no proof between refusals: their time spans nothing.
+    let s = scratch("boot-refusal-then-lock");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    for at in [0, 1_000] {
+        let verdict = ask_at(&s, &installed, Window, awake(start + at), Err("refused"));
+        assert!(is_pending(&verdict), "{verdict:?}");
+    }
+    let holder = FileLock::acquire(&s.apply_lock).unwrap();
+    let unanswered = confirm_boot_health_verdict_at_with_proof(
+        &s,
+        11,
+        Window,
+        true,
+        awake(start + 10 * minute),
+        bundle_at(&installed),
+        std::time::Duration::ZERO,
+        |_| panic!("no proof runs without the apply lock"),
+    );
+    drop(holder);
+    assert!(matches!(unanswered, Unanswered { .. }), "{unanswered:?}");
+    assert_eq!(trial_refusal_count(&s), 2, "the count is kept");
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + span_ms() + minute),
+        Err("refused"),
+    );
+    assert!(
+        is_pending(&verdict),
+        "three refusals, but only a second of refusal is known to have lasted: {verdict:?}"
+    );
+    assert_eq!(trial_refusal_count(&s), 3);
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + 2 * span_ms()),
+        Err("refused"),
+    );
+    assert!(
+        is_pending(&verdict),
+        "a minute short of the span from the refusal after the unanswered ask: {verdict:?}"
+    );
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + 2 * span_ms() + minute),
+        Err("refused"),
+    );
+    assert!(
+        is_settled_unproven(&verdict),
+        "refusals that lasted the span since then settle it: {verdict:?}"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+
+    // A headless instance's refusals, then a window launches the trial: after its wait the
+    // instance starts a fresh streak.
+    let s = scratch("boot-refusal-then-window-wait");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    for at in [0, 1_000] {
+        let verdict = ask_at(&s, &installed, Headless, awake(start + at), Err("refused"));
+        assert!(is_pending(&verdict), "{verdict:?}");
+    }
+    assert_eq!(trial_refusal_count(&s), 2);
+    count_trial_launch(&s, &boot_sentinel(&s), 11, None, true, Window).unwrap();
+    let waiting = ask_at(
+        &s,
+        &installed,
+        Headless,
+        awake(start + 2_000),
+        Err("no proof runs while a window is awaited"),
+    );
+    assert!(
+        matches!(
+            &waiting,
+            Pending {
+                retry_after: Some(_),
+                ..
+            }
+        ),
+        "{waiting:?}"
+    );
+    assert_eq!(
+        trial_refusal_count(&s),
+        0,
+        "the wait for a window ends the instance's streak"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_refusal_the_launch_count_reverts_is_never_settled_at_the_bound() {
+    use crate::BootHealthVerdict::Pending;
+    use crate::TrialWitness::Window;
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    type Identity = Result<(u64, String), String>;
+    let digest = "ab".repeat(32);
+    let start = 1_000_000;
+    // The installed bundle no longer verifies (a broken seal, a resource lost in the swap);
+    // `predecessor` is what the retained one reads as.
+    let asks = |label: &str, predecessor: Identity| {
+        let s = scratch(label);
+        let installed = s.root.join("Applications").join("aterm.app");
+        let rollback = arm_window_trial(&s, &installed, 11, &digest);
+        receipt_for(&s, 11, &digest);
+        let verdicts: Vec<_> = (0..40)
+            .map(|ask| {
+                let sealed = installed.clone();
+                let predecessor = predecessor.clone();
+                let identity = move |path: &Path| -> Identity {
+                    if path == sealed.as_path() {
+                        Err("bundle policy: a sealed resource is missing or invalid".to_string())
+                    } else {
+                        predecessor.clone()
+                    }
+                };
+                confirm_boot_health_verdict_at_with_proof(
+                    &s,
+                    11,
+                    Window,
+                    true,
+                    awake(start + ask * 60_000),
+                    bundle_at(&installed),
+                    std::time::Duration::from_millis(100),
+                    |root| prove_current_trial(&s, root, 11, Some(COMMIT), &identity).map(|_| ()),
+                )
+            })
+            .collect();
+        (s, installed, rollback, verdicts)
+    };
+
+    let (s, installed, rollback, verdicts) =
+        asks("boot-installed-unproven", Ok((10, COMMIT.to_string())));
+    for verdict in &verdicts {
+        assert!(
+            matches!(
+                verdict,
+                Pending { why, retry_after: None }
+                    if why.contains("installed trial is not verified")
+                        && why.contains(&format!("launch {MAX_BOOT_ATTEMPTS} reverts"))
+                        && !why.contains(&trial_bound_words())
+            ),
+            "forty refusals over forty awake minutes leave it to the launch count: {verdict:?}"
+        );
+    }
+    assert_eq!(trial_refusal_count(&s), 0, "none counts toward the bound");
+    assert_eq!(
+        boot_sentinel(&s).read_state(),
+        Some((11, 0)),
+        "the trial stays armed, so the launch that reaches the count still reverts"
+    );
+    assert!(FailedMark::read(&s.trial()).is_some());
+    assert_eq!(read_id(&installed), "NEW");
+    assert_eq!(read_id(&rollback), "OLD");
+    for words in [
+        window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial is reported"),
+        refused_trial_refusal(&s, 11),
+    ] {
+        assert!(
+            words.contains("reverts to the previous build")
+                && !words.contains(&trial_bound_words()),
+            "what is said names the launch count, not a settle that will not come: {words}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&s.root);
+
+    // Control: with no predecessor to revert to, the launch count would disarm it too, so
+    // the bound settles it.
+    let (s, installed, _rollback, verdicts) = asks(
+        "boot-installed-unproven-no-revert",
+        Err(
+            "bundle policy: codesign --verify failed: code failed to satisfy specified code \
+             requirement(s)"
+                .to_string(),
+        ),
+    );
+    assert!(
+        verdicts.iter().any(is_settled_unproven),
+        "PRECONDITION: the stand-in predecessor reads as no revert; verdicts: {verdicts:?}"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), None);
+    assert_eq!(read_id(&installed), "NEW");
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_trial_whose_identity_is_lost_is_settled_at_its_bound_with_its_predecessor_in_place() {
+    use crate::TrialWitness::{Headless, Window};
+    let start = 1_000_000;
+    // `trial.toml` is gone (the audit's state): the proof can never pass, and the streak and
+    // the settle are keyed by no digest.
+    let settle = |label: &str, witness, lane_blocked: bool, identity_lost: bool| {
+        let s = scratch(label);
+        let installed = s.root.join("Applications").join("aterm.app");
+        let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+        if identity_lost {
+            FailedMark::clear(&s.trial());
+            assert_eq!(trial_digest(&s, 11), "", "PRECONDITION: no identity reads");
+        }
+        if lane_blocked {
+            // A folder where the record would go: it cannot be written.
+            std::fs::create_dir_all(window_unproven_path(&s).join("in the way")).unwrap();
+        }
+        for at in [0, 1_000] {
+            let verdict = ask_at(
+                &s,
+                &installed,
+                witness,
+                awake(start + at),
+                Err("installed trial has no exact trial identity"),
+            );
+            assert!(is_pending(&verdict), "{label}: {verdict:?}");
+        }
+        assert_eq!(
+            trial_refusal_count(&s),
+            2,
+            "{label}: the streak is kept between asks"
+        );
+        let verdict = ask_at(
+            &s,
+            &installed,
+            witness,
+            awake(start + span_ms()),
+            Err("installed trial has no exact trial identity"),
+        );
+        assert!(is_settled_unproven(&verdict), "{label}: {verdict:?}");
+        assert_eq!(boot_sentinel(&s).read_state(), None, "{label}");
+        assert_eq!(read_id(&installed), "NEW", "{label}: no revert");
+        assert!(
+            WindowUnproven::read(&s).is_none(),
+            "{label}: no window lane is recorded"
+        );
+        assert!(
+            left_in_place(&s, &rollback),
+            "{label}: nothing proved the build, so its predecessor is never removed"
+        );
+        let crate::BootHealthVerdict::SettledUnproven { why, .. } = verdict else {
+            unreachable!("asserted above");
+        };
+        assert!(
+            why.contains("until the next update replaces it"),
+            "{label}: {why}"
+        );
+        let _ = std::fs::remove_dir_all(&s.root);
+    };
+    settle("boot-lost-identity-window", Window, false, true);
+    settle("boot-lost-identity-headless", Headless, false, true);
+    settle("boot-unrecordable-window-lane", Headless, true, false);
+}
+
+#[test]
+fn only_a_checkpoint_ask_releases_an_ended_windows_predecessor() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-precheckpoint-release");
+    let installed = s.root.join("Applications").join("aterm.app");
+    make_app(&installed, "CURRENT");
+    let rollback = rollback_path(&installed);
+    make_app(&rollback, "OLD");
+    keep_for_an_ended_window(&s, &rollback);
+    let ask = |checkpoint: bool| {
+        confirm_boot_health_in(
+            &s,
+            11,
+            None,
+            Window,
+            checkpoint,
+            bundle_at(&installed),
+            |_| Some(false),
+        )
+    };
+
+    // Held throughout the first ask: one before the checkpoint takes no lock.
+    let holder = FileLock::acquire(&s.apply_lock).unwrap();
+    let asked = std::time::Instant::now();
+    assert_eq!(ask(false), crate::BootHealthVerdict::NO_TRIAL);
+    assert!(
+        asked.elapsed() < APPLY_LOCK_WAIT,
+        "it did not wait on the apply lock"
+    );
+    drop(holder);
+    assert_eq!(ask(false), crate::BootHealthVerdict::NO_TRIAL);
+    assert_eq!(
+        read_id(&rollback),
+        "OLD",
+        "an ask before the checkpoint removes nothing"
+    );
+    assert!(
+        KeptPredecessor::read(&s).is_some(),
+        "and leaves the record as it was"
+    );
+
+    assert_eq!(ask(true), crate::BootHealthVerdict::NO_TRIAL);
+    assert!(
+        !rollback.exists() && KeptPredecessor::read(&s).is_none(),
+        "the checkpoint's ask releases it"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_lock_or_an_unresolved_install_counts_no_refusal() {
+    use crate::BootHealthVerdict::Unanswered;
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-refusal-unanswered");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let start = 1_000_000;
+    let holder = FileLock::acquire(&s.apply_lock).unwrap();
+    for ask in 0..10 {
+        let verdict = confirm_boot_health_verdict_at_with_proof(
+            &s,
+            11,
+            Window,
+            true,
+            awake(start + ask * (span_ms() / 9 + 60_000)),
+            bundle_at(&installed),
+            std::time::Duration::ZERO,
+            |_| panic!("no proof runs without the apply lock"),
+        );
+        assert!(
+            matches!(&verdict, Unanswered { why } if why.contains("health lock")),
+            "ask {ask}: {verdict:?}"
+        );
+    }
+    drop(holder);
+    for ask in 0..2 {
+        let verdict = confirm_boot_health_verdict_at_with_proof(
+            &s,
+            11,
+            Window,
+            true,
+            awake(start + 2 * span_ms() + ask),
+            || None,
+            std::time::Duration::from_millis(100),
+            |_| panic!("no proof runs for an install that does not resolve"),
+        );
+        assert!(matches!(verdict, Unanswered { .. }), "{verdict:?}");
+    }
+    assert_eq!(
+        trial_refusal_count(&s),
+        0,
+        "twelve asks over an hour that could not be answered refused nothing"
+    );
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + 3 * span_ms()),
+        Err("rollback refused"),
+    );
+    assert!(is_pending(&verdict), "the first refusal: {verdict:?}");
+    assert_eq!(trial_refusal_count(&s), 1);
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    forget_trial_refusals(&s);
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_panicking_proof_is_a_counted_refusal() {
+    use crate::BootHealthVerdict::Pending;
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-refusal-panic");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let verdict = confirm_boot_health_verdict_at_with_proof(
+        &s,
+        11,
+        Window,
+        true,
+        awake(1_000_000),
+        bundle_at(&installed),
+        std::time::Duration::from_millis(100),
+        |_| panic!("the verifier fell over"),
+    );
+    assert!(
+        matches!(&verdict, Pending { why, .. } if why.contains("the recovery proof panicked")),
+        "{verdict:?}"
+    );
+    assert_eq!(trial_refusal_count(&s), 1);
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    assert!(
+        FileLock::acquire(&s.apply_lock).is_ok(),
+        "the apply lock is released"
+    );
+    forget_trial_refusals(&s);
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn an_unreadable_sentinel_whose_proof_is_refused_is_settled_at_its_bound() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-unreadable-sentinel-bound");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    corrupt_sentinel(&s);
+    let start = 1_000_000;
+    for at in [0, 1_000] {
+        let verdict = ask_at(&s, &installed, Window, awake(start + at), Err("no receipt"));
+        assert!(is_pending(&verdict), "{verdict:?}");
+        assert!(
+            boot_sentinel(&s).unreadable(),
+            "the marker is left as it was"
+        );
+    }
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + span_ms()),
+        Err("no receipt"),
+    );
+    assert!(is_settled_unproven(&verdict), "{verdict:?}");
+    assert!(
+        !s.root.join("boot.sentinel").exists(),
+        "the unreadable marker is removed"
+    );
+    assert!(FailedMark::read(&s.trial()).is_none());
+    assert!(left_in_place(&s, &rollback), "the predecessor stays");
+    assert_eq!(read_id(&installed), "NEW");
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_sentinel_that_cannot_be_removed_at_the_bound_stays_pending_and_is_said_once() {
+    use crate::BootHealthVerdict::Pending;
+    use crate::TrialWitness::Window;
+    use std::os::unix::fs::PermissionsExt;
+    let s = scratch("boot-sentinel-stuck");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let start = 1_000_000;
+    for at in [0, 1_000] {
+        let verdict = ask_at(&s, &installed, Window, awake(start + at), Err("no receipt"));
+        assert!(is_pending(&verdict), "{verdict:?}");
+    }
+    let _ = crate::log_capture::take();
+    // A folder that admits no removal, as a locked flag or a read-only volume refuses one.
+    let lock = |mode: u32| {
+        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    lock(0o500);
+    let stuck = [span_ms(), span_ms() + 1_000]
+        .map(|at| ask_at(&s, &installed, Window, awake(start + at), Err("no receipt")));
+    let armed_while_stuck = boot_sentinel(&s).read_state();
+    lock(0o700);
+    for verdict in &stuck {
+        assert!(
+            matches!(verdict, Pending { why, .. } if why.contains("could not be removed")),
+            "a sentinel that cannot be removed leaves the trial armed and named: {verdict:?}"
+        );
+    }
+    assert_eq!(armed_while_stuck, Some((11, 0)));
+    assert_eq!(
+        crate::log_capture::take()
+            .iter()
+            .filter(|(_, line)| line.contains("could not be removed"))
+            .count(),
+        1,
+        "said once, not once per ask"
+    );
+    assert_eq!(read_id(&installed), "NEW");
+    assert_eq!(read_id(&rollback), "OLD");
+    assert!(FailedMark::read(&s.trial()).is_some(), "nothing else moved");
+    assert!(KeptPredecessor::read(&s).is_none());
+
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Window,
+        awake(start + span_ms() + 1_001),
+        Err("no receipt"),
+    );
+    assert!(
+        is_settled_unproven(&verdict),
+        "once it can be removed the next ask settles, with no new span: {verdict:?}"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), None);
+    assert!(left_in_place(&s, &rollback));
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_headless_settle_at_the_bound_keeps_the_window_lane_open() {
+    use crate::TrialWitness::{Headless, Window};
+    use std::time::Duration;
+    let s = scratch("boot-headless-bound");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let digest = "ab".repeat(32);
+    let rollback = arm_window_trial(&s, &installed, 11, &digest);
+    receipt_for(&s, 11, &digest);
+    let sentinel = boot_sentinel(&s);
+    count_trial_launch(&s, &sentinel, 11, None, false, Headless).unwrap();
+    let start = 1_000_000;
+    for at in [0, 1_000] {
+        let verdict = ask_at(&s, &installed, Headless, awake(start + at), Err("refused"));
+        assert!(is_pending(&verdict), "{verdict:?}");
+    }
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Headless,
+        awake(start + span_ms()),
+        Err("refused"),
+    );
+    assert!(
+        matches!(
+            &verdict,
+            crate::BootHealthVerdict::SettledUnproven { build: 11, why }
+                if why.contains("unproven at its headless checkpoint")
+        ),
+        "{verdict:?}"
+    );
+    assert_eq!(sentinel.read_state(), None, "later updates are not held");
+    assert_eq!(read_id(&rollback), "OLD", "the predecessor stays");
+    let record = WindowUnproven::read(&s).expect("the windows are unproven");
+    assert_eq!(
+        (
+            record.build,
+            record.digest.as_str(),
+            record.install_root.as_path()
+        ),
+        (11, digest.as_str(), installed.as_path())
+    );
+    assert!(
+        KeptPredecessor::read(&s).is_none(),
+        "it is the windows' revert, not this instance's bundle"
+    );
+
+    let outcome = check_boot_health_with_lock_wait(
+        &s,
+        11,
+        None,
+        RollbackHandoff::NONE,
+        true,
+        Window,
+        Duration::from_millis(100),
+        bundle_at(&installed),
+    );
+    assert!(
+        matches!(outcome, Some(ApplyOutcome::NotApplicable)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        sentinel.read_state(),
+        Some((11, 1)),
+        "a window launch puts it back on trial, counted"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn a_relaunch_starts_no_inherited_streak_and_the_third_launch_still_reverts() {
+    use crate::TrialWitness::Headless;
+    let s = scratch("boot-relaunch-streak");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let sentinel = boot_sentinel(&s);
+    let start = 1_000_000;
+    for at in [0, span_ms() + 1_000] {
+        let verdict = ask_at(&s, &installed, Headless, awake(start + at), Err("refused"));
+        assert!(
+            is_pending(&verdict),
+            "two refusals are below the bound: {verdict:?}"
+        );
+    }
+    assert_eq!(trial_refusal_count(&s), 2);
+
+    // A relaunch is another process: its memory holds no streak, whatever the ledger says.
+    forget_trial_refusals(&s);
+    assert!(
+        !Health::read(&s.health()).trial_proof_failure.is_empty(),
+        "PRECONDITION: the ledger still says the refusal"
+    );
+    let verdict = ask_at(
+        &s,
+        &installed,
+        Headless,
+        awake(start + 3 * span_ms()),
+        Err("refused"),
+    );
+    assert!(
+        is_pending(&verdict),
+        "what an earlier process counted settles nothing in this one: {verdict:?}"
+    );
+    assert_eq!(trial_refusal_count(&s), 1);
+    assert_eq!(read_id(&installed), "NEW");
+
+    // The launch-counted revert is untouched by any of it.
+    for _ in 1..MAX_BOOT_ATTEMPTS {
+        sentinel.observe_launch(11).unwrap();
+    }
+    backdate(&s);
+    let outcome = recover_boot_trial_at(&s, 11, Headless, bundle_at(&installed), |_| {
+        Ok(TrialRevert::To(VerifiedRollback {
+            path: rollback.clone(),
+            build: 10,
+        }))
+    });
+    assert!(
+        matches!(outcome, ApplyOutcome::ReExecFailed(_)),
+        "the launch that reaches the count reverts; this fixture has no executable: {outcome:?}"
+    );
+    assert_eq!(read_id(&installed), "OLD");
+    assert_eq!(sentinel.read_state(), None);
+    forget_trial_refusals(&s);
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn before_the_checkpoint_only_an_unarmed_build_is_confirmed() {
+    use crate::BootHealthVerdict::{Pending, Unanswered};
+    const NO_TRIAL: crate::BootHealthVerdict = crate::BootHealthVerdict::NO_TRIAL;
+    use crate::TrialWitness::{Headless, Window};
+    let ask = |s: &Staging, build: u64, witness, installed: Option<&Path>| {
+        let installed = installed.map(Path::to_path_buf);
+        confirm_boot_health_verdict_at_with_proof(
+            s,
+            build,
+            witness,
+            false,
+            ProbeClock::now(),
+            move || {
+                installed.map(|installed| bundle::Bundle {
+                    exe: installed.join("Contents/MacOS/aterm"),
+                    app_root: installed,
+                })
+            },
+            std::time::Duration::ZERO,
+            |_| panic!("no proof runs before a checkpoint"),
+        )
+    };
+    let none = scratch("boot-precheckpoint-none");
+    let installed = none.root.join("Applications").join("aterm.app");
+    make_app(&installed, "CURRENT");
+    assert_eq!(
+        ask(&none, 11, Window, Some(&installed)),
+        NO_TRIAL,
+        "a process that owes no trial is confirmed without drawing"
+    );
+    assert_eq!(ask(&none, 11, Window, None), NO_TRIAL);
+
+    let s = scratch("boot-precheckpoint-armed");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let other = s.root.join("Other").join("aterm.app");
+    make_app(&other, "OTHER");
+    // Held throughout: an ask before the checkpoint takes no lock.
+    let holder = FileLock::acquire(&s.apply_lock).unwrap();
+    let window = ask(&s, 11, Window, Some(&installed));
+    assert!(
+        matches!(&window, Pending { why, retry_after: None } if why.contains("window's first frame")),
+        "{window:?}"
+    );
+    let headless = ask(&s, 11, Headless, Some(&installed));
+    assert!(
+        matches!(&headless, Pending { why, .. } if why.contains("instance's control socket")),
+        "{headless:?}"
+    );
+    assert_eq!(
+        ask(&s, 12, Window, Some(&installed)),
+        NO_TRIAL,
+        "another build's trial is not this process's"
+    );
+    assert_eq!(
+        ask(&s, 11, Window, Some(&other)),
+        NO_TRIAL,
+        "nor another install's"
+    );
+    let unresolved = ask(&s, 11, Window, None);
+    assert!(matches!(unresolved, Unanswered { .. }), "{unresolved:?}");
+    drop(holder);
+    assert_eq!(
+        boot_sentinel(&s).read_state(),
+        Some((11, 0)),
+        "nothing is disarmed"
+    );
+    assert!(FailedMark::read(&s.trial()).is_some());
+    assert_eq!(read_id(&rollback), "OLD");
+    assert!(!s.health().exists(), "nothing is written");
+    assert!(!s.status.exists());
+    assert_eq!(trial_refusal_count(&s), 0, "nothing is counted");
+    let _ = std::fs::remove_dir_all(&none.root);
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+#[test]
+fn the_checkpoint_settle_follows_the_trial_model() {
+    use crate::TrialWitness::Window;
+    let model = aterm_models_update::native_update_trial_settle_model();
+    let constant = |name: &str| {
+        model
+            .consts
+            .iter()
+            .find(|(constant, _)| *constant == name)
+            .map(|(_, value)| *value)
+            .expect("the model declares it")
+    };
+    assert_eq!(
+        constant("SettleAfter"),
+        i64::from(crate::TRIAL_SETTLE_AFTER_REFUSALS)
+    );
+    assert_eq!(constant("MaxLaunch"), i64::from(MAX_BOOT_ATTEMPTS));
+
+    // Every state the committed model reaches.
+    let mut reached = vec![model.init_state()];
+    let mut next = 0;
+    while next < reached.len() {
+        let state = reached[next].clone();
+        next += 1;
+        for action in &model.actions {
+            for successor in model.successors(action.name, &state) {
+                if !reached.contains(&successor) {
+                    reached.push(successor);
+                }
+            }
+        }
+    }
+    let start = 1_000_000;
+    // The code's view of a model state: an armed trial, a streak of `refusals` whose refusal
+    // has lasted the span by the next ask when `spanned`.
+    let realize = |state: &aterm_spec::interp::State| {
+        let s = scratch("boot-settle-model");
+        let installed = s.root.join("Applications").join("aterm.app");
+        arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+        let refusals = u32::try_from(state["refusals"]).unwrap();
+        if refusals > 0 {
+            seed_trial_refusals(&s, 11, refusals, 1, awake(start + 1));
+        }
+        let now = awake(
+            start
+                + if state["spanned"] == 1 {
+                    span_ms() + 1_000
+                } else {
+                    1_000
+                },
+        );
+        (s, installed, now)
+    };
+    let project = |s: &Staging, installed: &Path| {
+        (
+            i64::from(trial_armed_for(s, 11)),
+            i64::from(rollback_path(installed).exists()),
+            i64::from(read_id(installed) != "NEW"),
+        )
+    };
+    let of =
+        |state: &aterm_spec::interp::State| (state["armed"], state["rollback"], state["reverted"]);
+    let mut asked = 0;
+    for state in reached.iter().filter(|state| state["armed"] == 1) {
+        let refuse = model.action_enabled("Refuse", state);
+        let settle = model.action_enabled("Settle", state);
+        assert!(
+            refuse != settle,
+            "a refused proof is retried or settled, never both or neither: {state:?}"
+        );
+        let (s, installed, now) = realize(state);
+        assert_eq!(project(&s, &installed), of(state), "{state:?}");
+        let verdict = ask_at(&s, &installed, Window, now, Err("refused"));
+        assert_eq!(is_pending(&verdict), refuse, "{state:?}: {verdict:?}");
+        assert_eq!(
+            is_settled_unproven(&verdict),
+            settle,
+            "{state:?}: {verdict:?}"
+        );
+        let action = if refuse { "Refuse" } else { "Settle" };
+        let successors = model.successors(action, state);
+        assert_eq!(successors.len(), 1, "{action} from {state:?}");
+        assert_eq!(
+            project(&s, &installed),
+            of(&successors[0]),
+            "{action} from {state:?}"
+        );
+        if refuse {
+            assert_eq!(
+                i64::from(trial_refusal_count(&s)).min(constant("SettleAfter") - 1),
+                successors[0]["refusals"],
+                "the streak after Refuse from {state:?}"
+            );
+        } else {
+            assert_eq!(successors[0]["settled"], 2);
+            assert_eq!(trial_refusal_count(&s), 0);
+        }
+        forget_trial_refusals(&s);
+        let _ = std::fs::remove_dir_all(&s.root);
+
+        let (s, installed, now) = realize(state);
+        let verdict = ask_at(&s, &installed, Window, now, Ok(()));
+        assert_eq!(
+            verdict,
+            crate::BootHealthVerdict::Confirmed { settled: Some(11) },
+            "{state:?}"
+        );
+        let proved = model.successors("Prove", state);
+        assert_eq!(proved.len(), 1);
+        assert_eq!(
+            project(&s, &installed),
+            of(&proved[0]),
+            "Prove from {state:?}"
+        );
+        assert_eq!(trial_refusal_count(&s), 0);
+        let _ = std::fs::remove_dir_all(&s.root);
+        asked += 1;
+    }
+    assert!(asked >= 5, "the walk reached {asked} armed states");
+
+    // Negative controls: a settle before the span, and a settle that reverts.
+    let early = aterm_spec::interp::with_buggy(&model, 2);
+    let mut state = early.init_state();
+    for action in ["Refuse", "Refuse", "Settle"] {
+        assert!(early.fire(action, &mut state), "{action} at {state:?}");
+    }
+    assert!(!early.check_invariant("SettledOnlyPastSpan", &state));
+    let reverting = aterm_spec::interp::with_buggy(&model, 3);
+    let mut state = reverting.init_state();
+    for action in ["Refuse", "Elapse", "Refuse", "Settle"] {
+        assert!(reverting.fire(action, &mut state), "{action} at {state:?}");
+    }
+    assert!(!reverting.check_invariant("UnprovenSettleKeepsTheBuild", &state));
+    assert!(!reverting.check_invariant("RevertOnlyByLaunches", &state));
 }
 
 fn receipt_for(s: &Staging, build: u64, digest: &str) {
@@ -1153,14 +2335,17 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
         "a crash loop reverts"
     );
 
-    assert!(confirm_boot_health_at_with_proof(
-        &s,
-        11,
-        Headless,
-        bundle_at(&installed),
-        Duration::from_millis(100),
-        proven,
-    ));
+    assert!(
+        !confirm_boot_health_at_with_proof(
+            &s,
+            11,
+            Headless,
+            bundle_at(&installed),
+            Duration::from_millis(100),
+            proven,
+        ),
+        "a headless ask waits for the window, by name"
+    );
     assert_eq!(sentinel.read_state(), Some((11, MAX_BOOT_ATTEMPTS)));
     assert!(rollback.exists());
 
@@ -1456,6 +2641,108 @@ fn arm_window_trial(s: &Staging, installed: &Path, build: u64, digest: &str) -> 
     FailedMark::record_required(&s.trial(), build, digest, Some(installed)).unwrap();
     boot_sentinel(s).arm(build).unwrap();
     rollback
+}
+
+#[test]
+fn a_boot_health_verdict_distinguishes_a_settlement_from_nothing_owed_and_from_no_answer() {
+    use crate::BootHealthVerdict::{Confirmed, Pending, Unanswered};
+    const NO_TRIAL: crate::BootHealthVerdict = crate::BootHealthVerdict::NO_TRIAL;
+    use crate::TrialWitness::{Headless, Window};
+
+    let wait = std::time::Duration::from_millis(100);
+    let ask =
+        |s: &Staging, witness, installed: Option<&Path>, prove: fn(&Path) -> Result<(), String>| {
+            let prove = move |root: &Path| prove(root).map_err(ProofRefusal::from);
+            let installed = installed.map(Path::to_path_buf);
+            confirm_boot_health_verdict_at_with_proof(
+                s,
+                11,
+                witness,
+                true,
+                ProbeClock::now(),
+                move || {
+                    installed.map(|installed| bundle::Bundle {
+                        exe: installed.join("Contents/MacOS/aterm"),
+                        app_root: installed,
+                    })
+                },
+                wait,
+                prove,
+            )
+        };
+    let no_trial = scratch("boot-result-none");
+    assert_eq!(
+        confirm_boot_health_verdict_at_with_proof(
+            &no_trial,
+            11,
+            Window,
+            true,
+            ProbeClock::now(),
+            || panic!("no trial resolves no installed bundle"),
+            wait,
+            |_| panic!("no trial runs no proof"),
+        ),
+        NO_TRIAL
+    );
+
+    let foreign = scratch("boot-result-foreign");
+    let owner = foreign.root.join("Applications/aterm.app");
+    let other = foreign.root.join("Other/aterm.app");
+    arm_window_trial(&foreign, &owner, 11, &"ab".repeat(32));
+    make_app(&other, "OTHER");
+    assert_eq!(
+        ask(&foreign, Window, Some(&other), |_| panic!(
+            "a foreign trial runs no proof"
+        )),
+        NO_TRIAL,
+        "another install's trial is nothing this process owes"
+    );
+    assert!(trial_armed_for(&foreign, 11), "and it stays its owner's");
+
+    let unresolved = scratch("boot-result-retry");
+    let installed = unresolved.root.join("Applications/aterm.app");
+    arm_window_trial(&unresolved, &installed, 11, &"ab".repeat(32));
+    let unanswered = ask(&unresolved, Window, None, |_| {
+        panic!("an unresolved install runs no proof")
+    });
+    assert!(
+        matches!(&unanswered, Unanswered { why } if why == UNRESOLVED_INSTALL),
+        "{unanswered:?}"
+    );
+    assert_eq!(trial_refusal_count(&unresolved), 0);
+
+    let window_owned = scratch("boot-result-window-owned");
+    let installed = window_owned.root.join("Applications/aterm.app");
+    arm_window_trial(&window_owned, &installed, 11, &"ab".repeat(32));
+    record_window_launch(&window_owned, 11);
+    let waiting = ask(&window_owned, Headless, Some(&installed), |_| {
+        panic!("a headless witness runs no proof for a window-owned trial")
+    });
+    assert!(
+        matches!(
+            &waiting,
+            Pending {
+                retry_after: Some(_),
+                ..
+            }
+        ),
+        "{waiting:?}"
+    );
+
+    let settled = scratch("boot-result-settled");
+    let installed = settled.root.join("Applications/aterm.app");
+    arm_window_trial(&settled, &installed, 11, &"ab".repeat(32));
+    let verdict = ask(&settled, Window, Some(&installed), |_| Ok(()));
+    assert_eq!(verdict, Confirmed { settled: Some(11) });
+    assert_eq!(verdict.settled_build(), Some(11));
+    assert!(verdict.opens_gate() && NO_TRIAL.opens_gate());
+    assert_eq!(NO_TRIAL.settled_build(), None);
+    assert!(!waiting.opens_gate() && !unanswered.opens_gate());
+    assert!(!trial_armed_for(&settled, 11));
+
+    for staging in [no_trial, foreign, unresolved, window_owned, settled] {
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
 }
 
 #[test]
@@ -1805,7 +3092,9 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     let confirm = |fixed: Identity| {
         let verify = verifier(&installed, fixed);
         confirm_boot_health_at_with_proof(&s, 11, Window, bundle_at(&installed), wait, |root| {
-            prove_current_trial(&s, root, 11, Some(COMMIT), &verify).map(|_| ())
+            prove_current_trial(&s, root, 11, Some(COMMIT), &verify)
+                .map(|_| ())
+                .map_err(|refusal| refusal.why)
         })
     };
     assert!(
@@ -1842,7 +3131,10 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
             Window,
             wait,
             bundle_at(&installed),
-            |root| prove_current_trial(&s, root, 11, Some(COMMIT), &verify),
+            |root| {
+                prove_current_trial(&s, root, 11, Some(COMMIT), &verify)
+                    .map_err(|refusal| refusal.why)
+            },
         )
     };
     let outcome = launch(crash_cut_new());
@@ -1948,10 +3240,10 @@ fn an_unreadable_sentinel_is_settled_only_for_its_own_trial_after_its_proof() {
     assert!(report.contains("the receipt does not match"), "{report}");
 
     assert!(
-        confirm_boot_health_at_with_proof(&s, 11, Headless, bundle_at(&installed), wait, |_| {
+        !confirm_boot_health_at_with_proof(&s, 11, Headless, bundle_at(&installed), wait, |_| {
             Err("a headless start never proves a window's trial".into())
         }),
-        "a headless start of a window's trial has nothing to retry"
+        "a headless start of a window's trial waits for the window and runs no proof"
     );
     assert!(untouched(&s), "and leaves the trial for a window");
 

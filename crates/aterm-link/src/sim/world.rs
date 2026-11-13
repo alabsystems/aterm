@@ -4305,9 +4305,10 @@ fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
 /// Worlds that may run at once in this process: one per two cores, at most six. Each world's
 /// state dirs are real folders whose every write is a create and a rename, and past six worlds
 /// at once those metadata calls queue in the kernel: on 18 cores the lib's tests at nine took
-/// 224 CPU-s for 25 s, at six 170 CPU-s for 27 s, the same instructions either way.
+/// 224 CPU-s for 25 s, at six 170 CPU-s for 27 s, the same instructions either way. Every test
+/// thread's worlds share these slots, so they count the whole binary's grant.
 static WORLD_SLOTS: LazyLock<(Mutex<usize>, Condvar)> = LazyLock::new(|| {
-    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let cores = aterm_cores::binary_parallelism().map_or(4, std::num::NonZeroUsize::get);
     (Mutex::new((cores / 2).clamp(1, 6)), Condvar::new())
 });
 

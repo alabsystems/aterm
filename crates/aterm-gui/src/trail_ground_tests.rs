@@ -23,8 +23,7 @@ fn fixture_font() -> std::path::PathBuf {
 }
 
 /// The config every run admits, before its theme line.
-const BASE: &str =
-    "trail_sounds = false\ncursor_trail_style = \"rainbow kitty\"\nmotion = \"full\"\n";
+const BASE: &str = "trail_sounds = false\ncursor_trail_style = \"rainbow\"\nmotion = \"full\"\n";
 
 /// Default Light's page, `(fg, bg)`: the live page of every rig on it.
 const DEFAULT_LIGHT: (u32, u32) = (0x002B_2D33, 0x00F6_F7F9);

@@ -1536,8 +1536,28 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
 fn every_continuation_aterm_types_is_its_own_words() {
     let v = |s: &str| upgrade::Version::parse(s).expect("a version");
     let mut texts = vec![
-        upgrade::continue_prompt(&v("2.1.305"), &v("2.1.310"), None),
-        upgrade::continue_prompt(&v("2.1.310"), &v("2.1.310"), Some("opus")),
+        upgrade::continue_prompt(&v("2.1.305"), &v("2.1.310"), None, upgrade::Ended::Nothing),
+        upgrade::continue_prompt(
+            &v("2.1.310"),
+            &v("2.1.310"),
+            Some("opus"),
+            upgrade::Ended::Nothing,
+        ),
+        upgrade::continue_prompt(
+            &v("2.1.305"),
+            &v("2.1.310"),
+            None,
+            upgrade::Ended::Waits(&["aterm ctl await task @s-1 since=0".to_string()]),
+        ),
+        upgrade::continue_prompt(
+            &v("2.1.305"),
+            &v("2.1.310"),
+            None,
+            upgrade::Ended::Work {
+                told_s: 3_600,
+                list: "pid 7 (zsh, 2h): targo --unverified test",
+            },
+        ),
     ];
     texts.extend(
         [
@@ -1979,12 +1999,12 @@ fn a_relaunch_line_carries_the_launchs_own_model_and_adds_none() {
 #[test]
 fn a_pill_names_its_mode_flag() {
     use super::super::lights::Mode;
-    assert_eq!(mode_flag(Mode::Manual), "default");
-    assert_eq!(mode_flag(Mode::Auto), "auto");
-    assert_eq!(mode_flag(Mode::Bypass), "bypassPermissions");
-    assert_eq!(mode_flag(Mode::AcceptEdits), "acceptEdits");
-    assert_eq!(mode_flag(Mode::DontAsk), "dontAsk");
-    assert_eq!(mode_flag(Mode::Plan), "plan");
+    assert_eq!(Mode::setting(Mode::Manual), "default");
+    assert_eq!(Mode::setting(Mode::Auto), "auto");
+    assert_eq!(Mode::setting(Mode::Bypass), "bypassPermissions");
+    assert_eq!(Mode::setting(Mode::AcceptEdits), "acceptEdits");
+    assert_eq!(Mode::setting(Mode::DontAsk), "dontAsk");
+    assert_eq!(Mode::setting(Mode::Plan), "plan");
 }
 
 #[test]
@@ -2329,20 +2349,19 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
     assert!(carried_quietly(&cause, false) && carried_quietly(&cause, true));
     assert!(!starts_afresh(&cause));
     assert!(ends_at_once(&cause));
-    // `model:` and `model-back:` are causes an older build's record may carry: unknown here.
-    for cause in [
-        "account",
-        "accounts",
-        "",
-        CAUSE_FRESH,
-        "model:opus",
-        "model-back:",
-    ] {
+    for cause in ["account", "accounts", "", CAUSE_FRESH] {
         assert!(!relaunch_cause(cause), "{cause:?}");
         assert!(!carried_quietly(cause, false), "{cause:?}");
     }
-    for cause in ["model:opus", "model-back:"] {
-        assert!(!ends_its_agent(cause), "{cause:?}");
+    // A Fable limit's move onto Opus and its return relaunch with their own continuation, which
+    // says why: relaunch causes that ended their agent, never carried quietly.
+    for cause in [
+        "model:claude-opus-5-5",
+        "model-back:",
+        "model-back:claude-fable-5-2",
+    ] {
+        assert!(relaunch_cause(cause) && ends_its_agent(cause), "{cause:?}");
+        assert!(!carried_quietly(cause, false), "{cause:?}");
     }
     assert!(
         !carried_quietly(CAUSE_MEMORY, true),
@@ -4617,6 +4636,7 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
         &from,
         &to,
         Some("claude-opus-5-5"),
+        upgrade::Ended::Nothing,
     ));
     let held_check =
         crate::supervise::policy::go_ahead::unless_held(&done_check_words(0), true).into_owned();
@@ -5927,7 +5947,7 @@ fn budget_stages(stored: bool) -> (Vec<u8>, usize) {
 
 /// [`budget_stages`], a served line unsetting `served_unset`.
 fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<u8>, usize) {
-    let aterm = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let aterm = Path::new(at!("/Applications/aterm.app/Contents/MacOS/aterm"));
     let build = Path::new("/s/store/claude/7/bin/claude");
     let tap = super::super::tap::settings_value(aterm).expect("a tap value");
     let serve = TokenServe {

@@ -25,6 +25,15 @@ impl Owner {
                         "original workload deadline expired before suspended birth",
                     ));
                 }
+                if let Some(preflight) = pending.preflight.as_mut() {
+                    if !matches!(custody, Custody::Fixed(_)) {
+                        return Err(refused("native preflight requires original fixed custody"));
+                    }
+                    let mut command = preflight.take_command()?;
+                    stdio(&pending.submission.fds, &mut command)?;
+                    // No job locator is exported to this internal query.
+                    return Ok((command, context(&pending.submission.request.binding)?));
+                }
                 let recipe = pending
                     .recipe
                     .as_ref()
@@ -84,12 +93,7 @@ impl Owner {
                         crate::runtime::inspector_program()?,
                     );
                 }
-                let mut secret = [0; 32];
-                aterm_uds::rand::fill(&mut secret)?;
-                let delegation = aterm_types::resource_subgroup::JobContext {
-                    job: pending.submission.request.binding.clone(),
-                    capability: aterm_types::resource_subgroup::Capability::from_bytes(secret),
-                };
+                let delegation = context(&pending.submission.request.binding)?;
                 command.env("ATERM_RESOURCE_JOB_V3", delegation.encode()?);
                 if let Some(root) = pending.bootstrap_graph.as_mut() {
                     // Capture the actual original locator together with all
@@ -122,21 +126,16 @@ impl Owner {
                     pending.resolver = Some(preparation);
                     command = prelude;
                 }
-                command
-                    .stdin(spawnfd::Stdio::from(
-                        pending.submission.fds.stdin.try_clone()?,
-                    ))
-                    .stdout(spawnfd::Stdio::from(
-                        pending.submission.fds.stdout.try_clone()?,
-                    ))
-                    .stderr(spawnfd::Stdio::from(
-                        pending.submission.fds.stderr.try_clone()?,
-                    ));
+                stdio(&pending.submission.fds, &mut command)?;
                 Ok((command, delegation))
             })();
         let (mut command, delegation) = match result {
             Ok(command) => command,
-            Err(_) => {
+            Err(error) => {
+                if pending.preflight.is_some() {
+                    self.journal
+                        .record_fault("preflight-launch-prepare", &error);
+                }
                 // No ARM was attempted; keep the exact custody for its normal
                 // no-launch completion rather than inventing a birth receipt.
                 let refusal = failure::stage_refusal(
@@ -258,7 +257,9 @@ impl Owner {
         };
         // Check the SAME start stored in the original owner, after all paid
         // preparation/durable writes; an earlier now() is not this deadline.
-        let deadline_supported = (workload.is_none() && pending.bootstrap_graph.is_none())
+        let deadline_supported = (workload.is_none()
+            && pending.bootstrap_graph.is_none()
+            && pending.preflight.is_none())
             || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
                 && timeout.is_some_and(|timeout| started.checked_add(timeout).is_some());
         let mut job = Job {
@@ -303,6 +304,7 @@ impl Owner {
             closed: None,
             runtime_inputs: runtime_inputs::State::default(),
             bootstrap_graph: pending.bootstrap_graph,
+            preflight: pending.preflight,
             settlement_at: None,
         };
         if prepared.is_ok()
@@ -335,7 +337,7 @@ impl Owner {
             // The first hold is the trusted prelude, not the selected resolver.
             // Its owned preparation performs the two-stop transition; only a
             // positively validated selected image may receive final GO/Started.
-            if job.resolver.is_some() || job.bootstrap_graph.is_some() {
+            if job.resolver.is_some() || job.bootstrap_graph.is_some() || job.preflight.is_some() {
                 self.jobs.insert((binding.session, binding.attempt), job);
                 return;
             }
@@ -392,6 +394,29 @@ impl Owner {
         }
         self.jobs.insert((binding.session, binding.attempt), job);
     }
+}
+
+fn context(binding: &Binding) -> io::Result<aterm_types::resource_subgroup::JobContext> {
+    let mut secret = [0; 32];
+    aterm_uds::rand::fill(&mut secret)?;
+    Ok(aterm_types::resource_subgroup::JobContext {
+        job: binding.clone(),
+        capability: aterm_types::resource_subgroup::Capability::from_bytes(secret),
+    })
+}
+
+fn stdio(fds: &PendingIo, command: &mut spawnfd::Command) -> io::Result<()> {
+    let (stdin, (stdout, stderr)) = aterm_uds::kept_out(|| -> io::Result<_> {
+        Ok((
+            fds.stdin.try_clone()?,
+            (fds.stdout.try_clone()?, fds.stderr.try_clone()?),
+        ))
+    })?;
+    command
+        .stdin(spawnfd::Stdio::from(stdin))
+        .stdout(spawnfd::Stdio::from(stdout))
+        .stderr(spawnfd::Stdio::from(stderr));
+    Ok(())
 }
 
 /// Time-only observation. The SAME stored start/remaining pair must represent

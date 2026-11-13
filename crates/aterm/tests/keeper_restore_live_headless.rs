@@ -19,6 +19,107 @@ use crate::live_ctl::{Ctl, fields};
 /// The window's journal off: the negative control's seam (`keeper_link::journal_refusal`).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 
+#[test]
+fn keeper_runner_death_actor() {
+    let Some(root) = std::env::var_os("ATERM_KEEPER_DEATH_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the shared std-typed launch helper closes non-stdio descriptors before spawn"
+    )]
+    let mut cmd = std::process::Command::new(launch_isolation::aterm_executable());
+    launch_isolation::apply(&mut cmd, &root);
+    if std::env::var_os("ATERM_KEEPER_DEATH_PLAIN").is_none() {
+        crate::keeper_world::tether_keeper(&mut cmd);
+    }
+    let log = std::fs::File::create(root.join("keeper.log")).unwrap();
+    cmd.args([
+        "keeper",
+        "serve",
+        "--identity",
+        "uid",
+        "--no-relaunch",
+        "--sock",
+    ])
+    .arg(root.join("run/keeper.sock"))
+    .stdin(std::process::Stdio::null())
+    .stdout(log.try_clone().unwrap())
+    .stderr(log);
+    let mut child = cmd.spawn().unwrap();
+    assert!(
+        aterm_spec::wait::within(HANG, GAP, || {
+            std::fs::read_to_string(root.join("keeper.log"))
+                .ok()?
+                .contains("serving on")
+                .then_some(())
+        })
+        .is_some()
+    );
+    std::fs::write(root.join("keeper.pid"), child.id().to_string()).unwrap();
+    let _ = child.wait();
+}
+
+/// Drop is insufficient when libtest is killed. The positive control uses the same tether
+/// as keeper(); the untethered control remains live after its parent is reaped.
+#[test]
+fn a_killed_test_runner_leaves_no_foreground_keeper() {
+    for plain in [true, false] {
+        let world = world_saying("death", "");
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "keeper_restore_live_headless::keeper_runner_death_actor",
+            "--nocapture",
+        ])
+        .env("ATERM_KEEPER_DEATH_ROOT", &world.0)
+        .env("CARGO_BIN_EXE_aterm", launch_isolation::aterm_executable())
+        .stdout(aterm_uds::spawnfd::Stdio::null());
+        if plain {
+            cmd.env("ATERM_KEEPER_DEATH_PLAIN", "1");
+        }
+        let mut runner = cmd.spawn().unwrap();
+        let pid = aterm_spec::wait::within(HANG, GAP, || {
+            std::fs::read_to_string(world.0.join("keeper.pid"))
+                .ok()?
+                .parse::<i32>()
+                .ok()
+        })
+        .expect("keeper reports running before the runner is killed");
+        runner.kill().unwrap();
+        assert!(!runner.wait().unwrap().success());
+        let ended = || {
+            matches!(
+                aterm_uds::process::process_presence(pid),
+                aterm_uds::process::ProcessPresence::Exited
+                    | aterm_uds::process::ProcessPresence::Absent
+            )
+        };
+        if plain {
+            let alive = !ended();
+            // The negative control is our live, handshaken child, never a discovered keeper.
+            // SAFETY: this positive pid is the live keeper our actor just handshook.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            assert!(alive, "the untethered keeper demonstrates the old orphan");
+        } else {
+            let gone = aterm_spec::wait::within(HANG, GAP, || ended().then_some(()));
+            if gone.is_none() {
+                // SAFETY: cleanup addresses only the keeper our actor handshook.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(
+                gone.is_some(),
+                "the fixture's keeper outlived its killed test runner"
+            );
+        }
+    }
+}
+
 /// The window's keyframes held after the first, so a crash leaves a tail to replay
 /// (`crash_restore::HOLD_KEYFRAMES_SEAM`).
 const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";

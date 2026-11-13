@@ -67,16 +67,5 @@ fn matches_hint(email: &str, hint: &str) -> bool {
     }
 }
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn recovery_hint_does_not_select_another_domain_or_prefix() {
-        assert!(super::matches_hint("alex@gmail.com", "a********@gmail.com"));
-        assert!(!super::matches_hint("bob@gmail.com", "a********@gmail.com"));
-        assert!(!super::matches_hint(
-            "alex@other.test",
-            "a********@gmail.com"
-        ));
-        assert!(super::matches_hint("alex@gmail.com", "alex@gmail.com"));
-        assert!(!super::matches_hint("alex2@gmail.com", "alex@gmail.com"));
-    }
-}
+#[path = "mail_recovery_tests.rs"]
+mod tests;

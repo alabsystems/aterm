@@ -158,8 +158,8 @@ fn exe(path: &Path, body: &str) {
     set_exec(path);
 }
 
-/// THE TWIN TAPS A CLAUDE CODE STARTED IN AN ATERM TAB FROM ITS START (owner ruling R-12: "THE
-/// HARNESS MUST DO THIS STOP ASKING THE USER"): inside a tab, the value aterm printed rides as
+/// THE TWIN TAPS A CLAUDE CODE STARTED IN AN ATERM TAB FROM ITS START (docs/OWNER_RULINGS.md,
+/// 2026-10-24): inside a tab, the value aterm printed rides as
 /// `--settings <value>` ahead of exactly the arguments the twin would run without it (the `--yolo`
 /// default's flag among them where it applies), one argument whatever it holds, and aterm was
 /// asked with exactly those arguments; outside a tab, under `--no-harness`, where aterm printed

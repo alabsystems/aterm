@@ -28,6 +28,7 @@ use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
 use crate::supervise::policy::turn_end::RestartClaim;
 use crate::supervise::policy::turn_end::TurnEndReading;
+use crate::supervise::policy::turn_end::{FABLE_FALLBACK, LaunchModel};
 pub use crate::supervise::policy::turn_end::{Restart, RestartAsk};
 #[path = "relaunch_checked.rs"]
 mod checked;
@@ -1402,19 +1403,7 @@ fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
 pub(crate) fn screen_mode(rows: &[String]) -> Option<String> {
     super::lights::read_screen(rows, None)
         .and_then(|shown| shown.mode)
-        .map(|mode| mode_flag(mode).to_string())
-}
-
-const fn mode_flag(mode: super::lights::Mode) -> &'static str {
-    use super::lights::Mode;
-    match mode {
-        Mode::Bypass => "bypassPermissions",
-        Mode::Auto => "auto",
-        Mode::AcceptEdits => "acceptEdits",
-        Mode::DontAsk => "dontAsk",
-        Mode::Plan => "plan",
-        Mode::Manual => "default",
-    }
+        .map(|mode| mode.setting().to_string())
 }
 
 /// `flags` (the launch's, from [`upgrade::rewrite_argv`], resume pair last) resumed in permission
@@ -2289,6 +2278,8 @@ pub(super) struct PromptLook<'a> {
     /// The grace the record gives a person's keys over the line ([`St::line_grace_s`],
     /// [`line_grace`]).
     pub(super) line_grace_s: Option<u32>,
+    /// Input accepted by the explicit act whose line is owed.
+    pub(super) line_input: Option<&'a super::restart_stamp::Input>,
 }
 
 impl<'a> PromptLook<'a> {
@@ -2301,6 +2292,7 @@ impl<'a> PromptLook<'a> {
             ended_at_s,
             held_since_s,
             line_grace_s: st.line_grace_s,
+            line_input: st.line_input.as_ref(),
         }
     }
 }
@@ -2366,6 +2358,7 @@ fn type_relaunch_line_admitted_with(
         ended_at_s,
         held_since_s,
         line_grace_s,
+        line_input,
     } = look;
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
@@ -2377,10 +2370,23 @@ fn type_relaunch_line_admitted_with(
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
     let checked_status = super::upgrade_drive::status_line(c, tab);
+    let ours = super::upgrade_drive::hand_name();
+    let accepted_input = line_input.is_some_and(|input| {
+        super::restart_stamp::input_host().as_deref() == Some(input.host.as_str())
+            && checked_status
+                .as_deref()
+                .and_then(super::native_restart::human_seq)
+                == Some(input.seq)
+    }) && (native.is_some() || super::upgrade_drive::turn_takes_human(c));
+    let accepted_seq = line_input.filter(|_| accepted_input).map(|input| input.seq);
     if let Some(held) = line_held_by_status(
         checked_status.as_deref(),
-        line_grace(opts.human_grace_s, ended_at_s, line_grace_s),
-        &super::upgrade_drive::hand_name(),
+        if accepted_input {
+            0
+        } else {
+            line_grace(opts.human_grace_s, ended_at_s, line_grace_s)
+        },
+        &ours,
     ) {
         return Err(held);
     }
@@ -2398,7 +2404,16 @@ fn type_relaunch_line_admitted_with(
     if mark.is_none()
         && let Some(scr) = screen(c, tab)
     {
-        *mark = first_mark(c, tab, &scr, ended_at_s, held_since_s)?;
+        if accepted_seq.is_some() && scr.human_seq != accepted_seq {
+            return Err(RelaunchLineError::Wait("held"));
+        }
+        *mark = first_mark(
+            c,
+            tab,
+            &scr,
+            ended_at_s,
+            if accepted_input { 0 } else { held_since_s },
+        )?;
     }
     let healed = native
         .is_none()
@@ -2412,6 +2427,7 @@ fn type_relaunch_line_admitted_with(
         mark,
         &mut tab_probe,
         opts.timings.fence_every,
+        accepted_seq,
         native,
     );
     if typed.is_err() && healed.is_some() {
@@ -2475,6 +2491,7 @@ fn type_at_prompt(
     mark: &mut Option<PromptMark>,
     tab_probe: &mut impl FnMut(&mut Client, u32, &str) -> bool,
     fence_every: Duration,
+    accepted_input: Option<u64>,
     native: Option<(
         &super::native_act::Binding,
         super::native_act::ImagePhase,
@@ -2483,6 +2500,9 @@ fn type_at_prompt(
 ) -> Result<(), RelaunchLineError> {
     if let Some((binding, phase, human_seq)) = native {
         let scr = screen(c, tab);
+        if accepted_input.is_some() && scr.as_ref().and_then(|s| s.human_seq) != accepted_input {
+            return Err(RelaunchLineError::Wait("held"));
+        }
         at_mark(mark, scr.as_ref())?;
         if !tab_probe(c, shell, tab) {
             return Err(RelaunchLineError::Wait("tab-ownership-changed"));
@@ -2510,7 +2530,10 @@ fn type_at_prompt(
             else {
                 break;
             };
-            match turn_fenced(c, tab, line, Some(&generation), human) {
+            if accepted_input.is_some() && accepted_input != human {
+                return Err(RelaunchLineError::Wait("held"));
+            }
+            match turn_fenced(c, tab, line, Some(&generation), accepted_input.or(human)) {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) => pause(fence_every),
                 Err(Typed::Yielded) => return Err(RelaunchLineError::Wait("yield")),
@@ -2526,10 +2549,14 @@ fn type_at_prompt(
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
-    let typed = if bash {
+    let human = last.and_then(|s| s.human_seq);
+    if accepted_input.is_some() && accepted_input != human {
+        return Err(RelaunchLineError::Wait("held"));
+    }
+    let typed = if bash && accepted_input.is_none() {
         type_line(c, tab, line)
     } else {
-        turn_fenced(c, tab, line, None, last.and_then(|s| s.human_seq))
+        turn_fenced(c, tab, line, None, accepted_input.or(human))
     };
     match typed {
         Ok(()) => Ok(()),
@@ -3329,6 +3356,14 @@ fn resumes_quietly(st: &St) -> bool {
     carried_quietly(&st.cause, st.quiet)
 }
 
+/// Whether the upgrade's restart ended background work of the agent's own that its continuation
+/// must say ([`upgrade::Ended`]): waits to start again, or work that ended at its deadline. That
+/// line is owed whatever else holds of the conversation (a finished task, a defended reply, a
+/// message that reached it first), or the waits are lost with nobody told.
+fn owes_ended(st: &St) -> bool {
+    !relaunch_cause(&st.cause) && (!st.ended_waits.is_empty() || st.ended_work.is_some())
+}
+
 fn looks_back(st: &St) -> bool {
     resumes_quietly(st) || !st.look_word.is_empty()
 }
@@ -3587,7 +3622,8 @@ fn carry_on_once(
     let Some(current) = continuation_session(&records, new.pid, key) else {
         return said(r, "wait:conversation-changed");
     };
-    if resumes_quietly(st) {
+    let owes_ended = owes_ended(st);
+    if !owes_ended && resumes_quietly(st) {
         return done_quietly(opts, r, st, key, &current.version, new.pid);
     }
     // NOTHING IS TYPED OVER UNSENT INPUT, AND THE CARRY-ON IS NOT GIVEN UP FOR IT: a person's draft
@@ -3624,7 +3660,7 @@ fn carry_on_once(
         Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
     };
     let written = WhereWritten::new(opts, &records, key, &ours);
-    if settled {
+    if settled && !owes_ended {
         match nothing_owed(opts, &written, tab, st) {
             Ok(Some((word, why))) => {
                 return done_with_nothing(opts, r, st, key, word, why, &latest.version, new.pid);
@@ -3637,7 +3673,7 @@ fn carry_on_once(
     // Land finished stopped at `nothing_owed` above, a reply that defends its work stops here for
     // the loop's land check at this point, and every later turn end is its loop's.
     let under_land = settled && carries_under_land(opts, c, tab);
-    if under_land && written.defended() == Some(true) {
+    if under_land && !owes_ended && written.defended() == Some(true) {
         return done_with_nothing(
             opts,
             r,
@@ -3660,9 +3696,22 @@ fn carry_on_once(
     let text = if relaunch_cause(&st.cause) {
         Some(resumed_prompt(&latest.version, &st.cause))
     } else {
+        let work = st.ended_work.clone().unwrap_or_default();
+        let ended = if !st.ended_waits.is_empty() {
+            upgrade::Ended::Waits(&st.ended_waits)
+        } else if st.ended_work.is_some() {
+            upgrade::Ended::Work {
+                told_s: now_s().saturating_sub(st.told_at),
+                list: &work,
+            }
+        } else {
+            upgrade::Ended::Nothing
+        };
         from.as_ref()
             .zip(to.as_ref())
-            .map(|(f, t)| upgrade::continue_prompt(f, t, before.as_deref()))
+            .map(|(f, t)| upgrade::continue_prompt(f, t, before.as_deref(), ended))
+            // What the restart ended is said even where a version it would name was not read.
+            .or_else(|| owes_ended.then(|| upgrade::ended_prompt(ended)))
     };
     let typed = settled
         && match text {
@@ -3685,6 +3734,12 @@ fn carry_on_once(
                 };
                 match typed {
                     Continued::Typed => true,
+                    // A REFUSAL NEVER CLOSES A ROUND THAT OWES WHAT IT ENDED: the line that
+                    // carries the waits' commands, or names the work, stays owed for the next
+                    // step as an unsettled carry does, or the waits are lost with nobody told.
+                    Continued::Not if owes_ended && !c.reply_unread() => {
+                        return said(r, "wait:unsettled");
+                    }
                     Continued::Not => false,
                     Continued::Stands(word) => return said(r, word),
                     Continued::Unanswered
@@ -3717,6 +3772,9 @@ fn carry_on_once(
     st.resumed_on.clone_from(&latest.version);
     st.resumed_pid = new.pid;
     st.confirm_by = now_s().saturating_add(confirm_within.as_secs());
+    // The line that carries them is typed: nothing of what the restart ended is owed now.
+    st.ended_waits.clear();
+    st.ended_work = None;
     save(opts, key, st);
     let r = said(r, continued_word(said_done));
     ledger(
@@ -3978,7 +4036,100 @@ pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64)
 /// How long a quiet restart's look stays open ([`restore_look`]).
 pub(super) const RESTORE_LOOK: Duration = Duration::from_secs(15);
 
-const RESTORE_TYPE_WITHIN_S: u64 = STALE_S;
+/// How long past [`RESTORE_LOOK`] a look whose resumed build warned holds its conversation for
+/// its line ([`LookAt::Owes`]): the life of the record that owes it.
+pub(super) const RESTORE_TYPE_WITHIN_S: u64 = STALE_S;
+
+/// What a finished restart's look is at one moment, by its own clock alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LookAt {
+    /// Inside its window with nothing warned: nothing is said of it yet.
+    Open,
+    /// Its resumed build warned and its line is still to type, [`RESTORE_TYPE_WITHIN_S`] past
+    /// the window at most.
+    Owes,
+    /// Its clock passed with nothing warned: it is closed wherever it is next seen, and holds
+    /// nothing meanwhile.
+    Over,
+    /// Its resumed build warned and the bound its line holds the conversation for passed: it
+    /// holds nothing, and the next step that sees it either types the line, where it may
+    /// ([`look_types`]), or records it lost.
+    Lapsed,
+}
+
+impl LookAt {
+    /// Whether the look still holds its conversation: an owed continuation, the next build's move.
+    #[must_use]
+    pub(super) const fn holds(self) -> bool {
+        matches!(self, Self::Open | Self::Owes)
+    }
+}
+
+/// The look that closes by `confirm_by`, at `now`, of a resumed build that `warned` or not.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeProgress",
+        action = "LookClosesAtAPoint",
+        project = "aterm_agent::harness::upgrade_drive::progress_projection"
+    )
+)]
+pub(super) const fn look_at(confirm_by: u64, now: u64, warned: bool) -> LookAt {
+    if warned {
+        if now < confirm_by.saturating_add(RESTORE_TYPE_WITHIN_S) {
+            LookAt::Owes
+        } else {
+            LookAt::Lapsed
+        }
+    } else if now < confirm_by {
+        LookAt::Open
+    } else {
+        LookAt::Over
+    }
+}
+
+/// Whether a step may type the line a warned look owes: only one taken at an idle point, never a
+/// break of the agent's own background work (`background`). The bound the line holds the
+/// conversation for is no bound on typing it: an idle point that comes late still types it.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeProgress",
+        action = "LineTypedAtIdle",
+        project = "aterm_agent::harness::upgrade_drive::progress_projection"
+    )
+)]
+pub(super) const fn look_types(at: LookAt, background: bool) -> bool {
+    matches!(at, LookAt::Owes | LookAt::Lapsed) && !background
+}
+
+/// Whether `st`'s look still holds its conversation at `now`: open inside its window, or owing a
+/// line its resumed build's warning asks for. A look past its clock holds nothing, whoever has
+/// yet to close it: neither an owed continuation nor the next build's move waits on it.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeProgress",
+        action = "NextTargetTaken",
+        project = "aterm_agent::harness::upgrade_drive::progress_projection"
+    )
+)]
+pub(super) fn look_holds(opts: &Opts, key: &str, st: &St, now: u64) -> bool {
+    if !st.confirming() {
+        return false;
+    }
+    if now < st.confirm_by {
+        return true;
+    }
+    if !looks_back(st) || !look_at(st.confirm_by, now, true).holds() {
+        return false;
+    }
+    let warned = look_warned(&st.agent_records(&opts.home), key, st);
+    look_at(st.confirm_by, now, warned).holds()
+}
 
 fn told_nothing(
     opts: &Opts,
@@ -4001,7 +4152,12 @@ const RESTORE_LOST: &str =
 
 /// The one look after a quiet restart or a carry-on that typed nothing, open [`RESTORE_LOOK`]: if
 /// the resumed agent warned that something did not come back, a tasked agent is told to restore
-/// what it relies on. A look whose resumed agent is gone closes at once.
+/// what it relies on. A look whose resumed agent is gone closes at once. The look ends on its own
+/// clock ([`look_at`]): any step that sees it past that closes it, a break's included, and only
+/// the line is kept for where typing is allowed ([`look_types`]). With no `tab` it is a sweep's:
+/// its step types the line into a tab whose own Autopilot is on, never at a break and never under
+/// a press (whose lane restarts the agent), and past the line's bound a step that does not type
+/// it records it lost.
 pub(super) fn restore_look(
     opts: &Opts,
     r: &Report,
@@ -4042,14 +4198,35 @@ pub(super) fn restore_look(
         save(opts, key, st);
         return Some(said(r.clone(), word));
     }
+    let at = look_at(st.confirm_by, now, true);
+    let late = at == LookAt::Lapsed;
     let quiet = match told_nothing(opts, &records, key, st) {
         Ok(quiet) => quiet,
+        Err(_) if late => {
+            return Some(restore_lost(
+                opts,
+                r,
+                st,
+                key,
+                "its ledger could not be read in time to say so at",
+            ));
+        }
         Err(_) => return Some(said(r.clone(), WAIT_LEDGER_EVIDENCE)),
     };
-    let late = now >= st.confirm_by.saturating_add(RESTORE_TYPE_WITHIN_S);
     let Some(tab) = tab else {
-        if late {
-            return Some(restore_lost(
+        let tab = st.tab.clone();
+        let mut typed = None;
+        if quiet.is_none()
+            && look_types(at, opts.background)
+            && opts.press.is_none()
+            && super::tap::is_tab_id(&tab)
+            && let Ok(mut c) = connect(opts, &tab)
+            && autopilot_on(&mut c, &tab)
+        {
+            typed = restore_line(opts, r, st, key, &records, &mut c, &tab, &mut tab_probe).ok();
+        }
+        if typed.is_none() && late {
+            typed = Some(restore_lost(
                 opts,
                 r,
                 st,
@@ -4057,15 +4234,7 @@ pub(super) fn restore_look(
                 quiet.unwrap_or("no idle point came to say so at"),
             ));
         }
-        let tab = st.tab.clone();
-        if quiet.is_some() || !super::tap::is_tab_id(&tab) {
-            return None;
-        }
-        let mut c = connect(opts, &tab).ok()?;
-        if !autopilot_on(&mut c, &tab) {
-            return None;
-        }
-        return restore_line(opts, r, st, key, &records, &mut c, &tab, &mut tab_probe).ok();
+        return typed;
     };
     if let Some(why) = quiet {
         return Some(restore_lost(opts, r, st, key, why));
@@ -4235,6 +4404,12 @@ pub(super) const CAUSE_ASKED: &str = "asked";
 
 /// The [`St::cause`] of a relaunch after aterm itself ended while the agent ran and the next launch reopened its tab ([`after_host_ended`]).
 pub(super) const CAUSE_HOST: &str = "host";
+/// The [`St::cause`] of a Fable session's move onto [`FABLE_FALLBACK`] at Fable's own limit,
+/// `model:` then the model ([`Restart::Model`]).
+pub(super) const CAUSE_MODEL: &str = "model:";
+/// The [`St::cause`] of that move's return at the limit's reset, `model-back:` then the `--model`
+/// put back, empty where the launch named none ([`Restart::ModelBack`]).
+pub(super) const CAUSE_MODEL_BACK: &str = "model-back:";
 
 /// The [`St::cause`] of a restart under another of the owner's accounts, `account:` then the label ([`Restart::Account`]) and nothing else of the account.
 pub(super) const CAUSE_ACCOUNT: &str = "account:";
@@ -4442,6 +4617,8 @@ pub(super) fn its_own(why: &Restart, ask: &RestartAsk, st: &St) -> bool {
     let of_cause = match why {
         Restart::Memory => cause == CAUSE_MEMORY,
         Restart::InputLost { .. } => cause == CAUSE_INPUT_LOST,
+        Restart::Model { to } => cause.strip_prefix(CAUSE_MODEL) == Some(to.as_str()),
+        Restart::ModelBack { .. } => cause.starts_with(CAUSE_MODEL_BACK),
         Restart::Account { .. } => false,
         Restart::Route { to } => cause.strip_prefix(CAUSE_ROUTE) == Some(to.word()),
         Restart::Permission { .. } => clicked(cause),
@@ -4474,6 +4651,8 @@ pub(super) fn restart_cause(why: &Restart) -> String {
     match why {
         Restart::Memory => CAUSE_MEMORY.to_string(),
         Restart::InputLost { .. } => CAUSE_INPUT_LOST.to_string(),
+        Restart::Model { to } => format!("{CAUSE_MODEL}{to}"),
+        Restart::ModelBack { to } => format!("{CAUSE_MODEL_BACK}{}", to.as_deref().unwrap_or("")),
         Restart::Account { to, .. } => format!("{CAUSE_ACCOUNT}{to}"),
         Restart::Route { to } => format!("{CAUSE_ROUTE}{}", to.word()),
         Restart::Permission { .. } => CAUSE_PERMISSION.to_string(),
@@ -4488,6 +4667,8 @@ pub(super) fn relaunch_cause(cause: &str) -> bool {
         || cause == CAUSE_STALL
         || cause == CAUSE_ASKED
         || cause == CAUSE_HOST
+        || cause.starts_with(CAUSE_MODEL)
+        || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
 }
 
@@ -4497,9 +4678,14 @@ pub(super) fn ends_its_agent(cause: &str) -> bool {
         || cause == CAUSE_UPGRADE_FRESH
         || cause == CAUSE_MEMORY
         || cause == CAUSE_INPUT_LOST
+        || cause.starts_with(CAUSE_MODEL)
+        || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
         || clicked(cause)
 }
+
+/// What a model move's continuation says of its reach ([`CAUSE_MODEL`], [`CAUSE_MODEL_BACK`]).
+const MODEL_SESSION_ONLY: &str = "for this session only: your default model is unchanged";
 
 /// The continuation typed to a relaunched agent once it holds its conversation.
 #[must_use]
@@ -4534,6 +4720,22 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
         format!(
             "Restarted: someone asked aterm to restart {agent} (`aterm ctl restart`), so this \
              session was ended and restarted"
+        )
+    } else if let Some(model) = cause.strip_prefix(CAUSE_MODEL) {
+        format!(
+            "Relaunched on {}: Fable reached its own usage limit, so this session was restarted \
+             on the same account with that model until the limit resets ({MODEL_SESSION_ONLY})",
+            one_line(model)
+        )
+    } else if let Some(model) = cause.strip_prefix(CAUSE_MODEL_BACK) {
+        let model = if model.is_empty() {
+            "the model it was launched with".to_string()
+        } else {
+            one_line(model)
+        };
+        format!(
+            "Relaunched on {model}: the Fable usage limit that moved this session to Opus has \
+             reset, so it was restarted back on it ({MODEL_SESSION_ONLY})"
         )
     } else {
         format!("Relaunched: {agent} exited without anyone asking, and this session was restarted")
@@ -5341,6 +5543,10 @@ fn restart_locked(
         return said(r, "refused:self");
     }
     let mut cause = restart_cause(why);
+    let moved_argv = match model_move_argv(why, &snap) {
+        Ok(argv) => argv,
+        Err(refused) => return said(r, refused),
+    };
     let resume = records.transcript_exists(&session) != Some(false);
     let (argv, exe, mode) = match clicked {
         Some((to, _)) => match click_build(&snap.program) {
@@ -5348,7 +5554,7 @@ fn restart_locked(
             Err(why) => return said(r, format!("wait:{why}")),
         },
         None => (
-            snap.argv.clone(),
+            moved_argv.unwrap_or_else(|| snap.argv.clone()),
             snap.program.clone(),
             resume_mode(
                 &records,
@@ -5435,7 +5641,16 @@ fn restart_locked(
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
     if opts.dry_run {
-        return said(r, "would-restart");
+        return said(
+            r,
+            match why {
+                Restart::Model { to } => format!("would-restart:model={to}"),
+                Restart::ModelBack { to } => {
+                    format!("would-restart:model={}", to.as_deref().unwrap_or("-"))
+                }
+                _ => "would-restart".to_string(),
+            },
+        );
     }
     if let Some(wait) = fence.broken() {
         return said(r, wait);
@@ -5496,22 +5711,11 @@ fn restart_locked(
             break 'signal Some(said(r.clone(), "wait:claim-unwritten"));
         }
         super::upgrade_drive::note_moved_writes(opts, &snap, &session, &sf.cwd);
-        let checked = authorizer
-            .filter(|_| super::native_restart::coordinated(&st))
-            .and_then(|host| {
-                checked_human
-                    .and_then(|seq| {
-                        CheckedSource::new(
-                            why,
-                            ask,
-                            &snap,
-                            seq,
-                            CheckedRelaunchStep::Prepare,
-                            &session,
-                        )
-                    })
-                    .map(|source| (source, host))
-            });
+        let checked = checked_human
+            .and_then(|seq| {
+                CheckedSource::new(why, ask, &snap, seq, CheckedRelaunchStep::Prepare, &session)
+            })
+            .zip(authorizer.filter(|_| super::native_restart::coordinated(&st)));
         let admission = if authorizer.is_some() {
             super::native_restart::begin_relaunch(
                 opts,
@@ -5777,6 +5981,8 @@ pub(super) const fn serve_for(why: &Restart) -> Serve {
         } => Serve::Never,
         Restart::Memory
         | Restart::InputLost { .. }
+        | Restart::Model { .. }
+        | Restart::ModelBack { .. }
         | Restart::Account { .. }
         | Restart::Permission { .. } => Serve::Judge,
     }
@@ -6081,18 +6287,89 @@ fn retry_checked_relaunch(
 /// waiting risks; the work's processes still hold it, as every restart's do ([`live_background`]).
 /// Every other restart waits for the work to end, as the upgrade's automatic restart does
 /// ([`super::upgrade_drive`]'s `turn_over_shown`): a lost line's restart, for a process that runs
-/// on and whose line the loop holds meanwhile (`custody::Rest::working`); and an account move, a
-/// move a later turn's end makes as well, where the work it would end costs the session more than
-/// the wait. A click is none of
+/// on and whose line the loop holds meanwhile (`custody::Rest::working`); a Fable session's move
+/// onto Opus, or back at its limit's reset, and an account move, each a move a later turn's end
+/// makes as well, where the work it would end costs the session more than the wait. A click is
+/// none of
 /// these: [`at_rest_for`] reads a press's gate for it instead.
 const fn over_own_work(why: &Restart) -> bool {
     match why {
         Restart::Memory => true,
         Restart::InputLost { .. }
+        | Restart::Model { .. }
+        | Restart::ModelBack { .. }
         | Restart::Account { .. }
         | Restart::Route { .. }
         | Restart::Permission { .. } => false,
     }
+}
+
+/// THE LINE A MODEL MOVE RELAUNCHES `snap` ON (owner, 2026-11-11: "no, keep the same account and
+/// switch from fable to opus."): `Ok(None)` for every other restart, whose line is the process's
+/// own argv. A move onto [`FABLE_FALLBACK`] is made only of a Claude Code whose argv names no
+/// `--model` or names Fable, and puts `--model <to>` on it in the place of any `--model` it had
+/// ([`model_argv`]); its return only of one whose argv names exactly [`FABLE_FALLBACK`], the move's
+/// own (another program started in the tab, or a person's own `--model`, is never moved back), and
+/// puts the launch's own `--model` back, or none. Anything else is `Err` with the refusal's word.
+pub(super) fn model_move_argv(
+    why: &Restart,
+    snap: &Snapshot,
+) -> Result<Option<Vec<String>>, &'static str> {
+    match why {
+        Restart::Model { to } => {
+            if !matches!(snap.run, AgentRun::Claude) || to != FABLE_FALLBACK {
+                return Err(REFUSED_MODEL_MOVE);
+            }
+            if !LaunchModel::of_argv(&snap.argv).admits_fallback() {
+                return Err(REFUSED_LAUNCH_MODEL);
+            }
+            Ok(Some(model_argv(&snap.argv, Some(to))))
+        }
+        Restart::ModelBack { to } => {
+            if !matches!(snap.run, AgentRun::Claude)
+                || upgrade::launch_model(&snap.argv).as_deref() != Some(FABLE_FALLBACK)
+            {
+                return Err(REFUSED_NOT_ON_FALLBACK);
+            }
+            Ok(Some(model_argv(&snap.argv, to.as_deref())))
+        }
+        Restart::Memory
+        | Restart::InputLost { .. }
+        | Restart::Account { .. }
+        | Restart::Route { .. }
+        | Restart::Permission { .. } => Ok(None),
+    }
+}
+
+/// A model move asked of a program other than Claude Code, or onto a model other than
+/// [`FABLE_FALLBACK`] ([`model_move_argv`]).
+pub(super) const REFUSED_MODEL_MOVE: &str = "refused:model-move";
+/// A move onto [`FABLE_FALLBACK`] asked of a launch that names another model than Fable.
+pub(super) const REFUSED_LAUNCH_MODEL: &str = "refused:launch-model";
+/// A return asked of a process whose argv does not run [`FABLE_FALLBACK`].
+pub(super) const REFUSED_NOT_ON_FALLBACK: &str = "refused:not-on-fallback";
+
+/// `argv` (`argv[0]` first) with every `--model` span out, in either spelling, and `--model
+/// <model>` right after `argv[0]` where `model` names one. Every other word keeps its place, a `--`
+/// tail with it.
+#[must_use]
+pub(super) fn model_argv(argv: &[String], model: Option<&str>) -> Vec<String> {
+    let Some((program, flags)) = argv.split_first() else {
+        return Vec::new();
+    };
+    std::iter::once(program.clone())
+        .chain(
+            model
+                .into_iter()
+                .flat_map(|m| ["--model".to_string(), m.to_string()]),
+        )
+        .chain(
+            upgrade::parse_flag_spans(flags)
+                .into_iter()
+                .filter(|(name, _)| *name != Some("--model"))
+                .flat_map(|(_, tokens)| tokens),
+        )
+        .collect()
 }
 
 /// What a relaunch needs, read while the agent runs (argv, parent and start time go with the process).
@@ -6257,29 +6534,8 @@ fn bound_start_seconds(
 }
 
 #[cfg(test)]
-mod snapshot_start_tests {
-    use super::bound_start_seconds;
-
-    #[test]
-    fn seconds_require_the_snapshots_current_kernel_start() {
-        for current in [None, Some("replacement-process")] {
-            assert_eq!(
-                bound_start_seconds("recorded-process", current, || {
-                    panic!("a different process must not supply its birth")
-                }),
-                None
-            );
-        }
-        assert_eq!(
-            bound_start_seconds("recorded-process", Some("recorded-process"), || Some(42)),
-            Some(42)
-        );
-        assert_eq!(
-            bound_start_seconds("recorded-process", Some("recorded-process"), || None),
-            None
-        );
-    }
-}
+#[path = "relaunch_snapshot_start_tests.rs"]
+mod snapshot_start_tests;
 
 /// The agent a [`Snapshot`] is of, with the run only that agent's relaunch reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6436,7 +6692,9 @@ const TAP_ROOM_MODE: &str = "acceptEdits";
 /// [`plan`] builds: the shell's dialect, atpkg's heal hook under `user_home`, a `cd` unless the
 /// shell is read standing in the agent's directory, its program, argv, conversation, home and
 /// login, and room besides for a `--permission-mode` of [`TAP_ROOM_MODE`], which only the
-/// conversation's records say. `false` where no such line can be built at all.
+/// conversation's records say, and, for a launch Fable's own limit may move onto
+/// [`FABLE_FALLBACK`], for the `--model` that move names ([`model_argv`]). `false` where no such
+/// line can be built at all.
 #[must_use]
 pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
     let (Some(dialect), Some(session)) = (
@@ -6465,12 +6723,19 @@ pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
             &snap.cwd,
         ))
     .then_some(snap.cwd.as_str());
+    let moved;
+    let argv = if LaunchModel::of_argv(&snap.argv).admits_fallback() {
+        moved = model_argv(&snap.argv, Some(FABLE_FALLBACK));
+        &moved
+    } else {
+        &snap.argv
+    };
     line_tap_kept(
         dialect,
         heal.as_deref(),
         cd,
         &snap.program,
-        &snap.argv,
+        argv,
         Some(session),
         Some(TAP_ROOM_MODE),
         &required_env(
@@ -7216,6 +7481,22 @@ pub(super) fn cannot_step(cause: ExitCause, why: &str) -> String {
     }
 }
 
+/// Read the accepted input from the standing stamp of this exit before consuming it.
+pub(super) fn restart_input(
+    opts: &Opts,
+    snap: &Snapshot,
+    cause: ExitCause,
+) -> Option<super::restart_stamp::Input> {
+    let wanted = match cause {
+        ExitCause::Stall => super::restart_stamp::Cause::Stall,
+        ExitCause::Asked => super::restart_stamp::Cause::Asked,
+        ExitCause::Exit | ExitCause::Carried | ExitCause::HostEnded => return None,
+    };
+    let stamp =
+        super::restart_stamp::standing(&opts.state, &snap.tab, snap.pid, &snap.start, now_s())?;
+    (stamp.cause == wanted).then_some(stamp.input).flatten()
+}
+
 /// Consume the explicit restart's stamp once the relaunch of the exit it named has filed its record (under the caller's sweep lock).
 pub(super) fn consume_stamp(opts: &Opts, snap: &Snapshot, cause: ExitCause) {
     if opts.dry_run || !matches!(cause, ExitCause::Stall | ExitCause::Asked) {
@@ -7744,6 +8025,7 @@ fn launch_after_exit(
         .and_then(|command| command.account_intent.clone());
     st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
+    st.line_input = restart_input(opts, snap, cause);
     if st.exited_at == 0 && st.agent_exit() == AgentExit::Gone {
         // The process that ran as `snap.pid` is gone, by its kernel start: a live pid here
         // is another process (pids are reused, as after a reboot), never a guard to wait on.
@@ -8139,18 +8421,40 @@ pub fn restarted(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> bool {
     restart_record(opts, agent, pid).is_some()
 }
 
-/// How long a person's keys hold the relaunch line of the restart [`restarted`] finds for the
-/// agent `pid` of tab `opts.only_sid`: its record's own ([`line_grace`]), or the whole grace when
-/// no record is found.
+/// How long a person's keys hold the relaunch line owed for agent `pid` in `opts.only_sid`:
+/// an accepted unchanged input counter exempts earlier keys; otherwise its record's own grace
+/// ([`line_grace`]), or the whole grace when no record is found.
 #[must_use]
 pub fn carry_line_grace(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> u32 {
-    restart_record(opts, agent, pid).map_or(opts.human_grace_s, |(_, st)| {
+    let record = restart_record(opts, agent, pid).or_else(|| {
+        opts.only_sid.as_deref().zip(pid).and_then(|(tab, pid)| {
+            record_where(opts, |st| {
+                st.agent == agent
+                    && st.tab == tab
+                    && st.pid == pid
+                    && matches!(st.cause.as_str(), CAUSE_ASKED | CAUSE_STALL)
+                    && st.in_flight()
+            })
+        })
+    });
+    record.map_or(opts.human_grace_s, |(_, st)| {
+        if st.line_input.as_ref().is_some_and(|input| {
+            super::restart_stamp::input_host().as_deref() == Some(input.host.as_str())
+                && connect(opts, &st.tab)
+                    .ok()
+                    .and_then(|mut client| super::upgrade_drive::status_line(&mut client, &st.tab))
+                    .as_deref()
+                    .and_then(super::native_restart::human_seq)
+                    == Some(input.seq)
+        }) {
+            return 0;
+        }
         line_grace(opts.human_grace_s, end_asked_at(&st), st.line_grace_s)
     })
 }
 
 /// Whether the agent `pid`'s own background work holds its restart in place: a shell of its job
-/// still runs, or the process table reads empty, so none can be ruled out. [`restart_as`]'s
+/// still runs, or its processes do not read ([`live_background`]), so none can be ruled out. [`restart_as`]'s
 /// signal refuses the restart then (`wait:changed`), and an account move asks this first, so it
 /// takes no row from another session for a relaunch this would refuse.
 #[must_use]
@@ -8479,9 +8783,13 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
             return None;
         }
         // A look is its resumed agent's: once that agent is gone, whatever runs next in the tab
-        // is owed nothing of it, and a sweep's confirmations close it ([`restore_look`]).
+        // is owed nothing of it, and a sweep's confirmations close it ([`restore_look`]). It is
+        // owed only while its own clock runs ([`look_holds`]): past that the next step closes it,
+        // and nothing waits for an idle point to do so.
         let due = matches!(st.phase, upgrade::Phase::Relaunched { .. })
-            || (st.confirming() && st.resumed_pid != 0 && alive(st.resumed_pid));
+            || (st.resumed_pid != 0
+                && alive(st.resumed_pid)
+                && look_holds(opts, &session, &st, now_s()));
         let its = only.is_none_or(|agent| st.agent == agent);
         (st.tab == tab && due && its).then_some((session, st))
     })
@@ -9696,3 +10004,7 @@ impl Relaunches {
 #[cfg(test)]
 #[path = "relaunch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "relaunch_fable_tests.rs"]
+mod fable_tests;

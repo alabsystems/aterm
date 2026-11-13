@@ -121,7 +121,8 @@ pub struct Deny {
     home: PathBuf,
     roots: Vec<PathBuf>,
     other_homes: Option<PathBuf>,
-    library: PathBuf,
+    /// `$HOME/Library`; `None` on Windows, where no such folder is protected.
+    library: Option<PathBuf>,
     allow: Vec<PathBuf>,
     opt_in: Vec<PathBuf>,
     fold_case: bool,
@@ -132,19 +133,34 @@ impl Deny {
     #[must_use]
     pub fn for_home(home: &Path, overrides: &[String], opt_in: &[PathBuf]) -> Self {
         let home = canonical(home).unwrap_or_else(|| home.to_path_buf());
-        let roots = aterm_containment::consent::tcc_prompting_roots(&home, overrides)
+        let roots = Self::named_roots(&home, overrides, cfg!(windows))
             .into_iter()
             .filter_map(|r| canonical(&r))
             .collect();
         Self {
             other_homes: aterm_containment::consent::other_homes_root(&home),
-            library: home.join("Library"),
+            library: (!cfg!(windows)).then(|| home.join("Library")),
             allow: LIBRARY_ALLOW.iter().map(|a| home.join(a)).collect(),
             opt_in: opt_in.iter().filter_map(|p| canonical(p)).collect(),
             roots,
             home,
-            fold_case: cfg!(target_vendor = "apple"),
+            fold_case: cfg!(any(target_vendor = "apple", windows)),
         }
+    }
+
+    /// The roots [`Self::for_home`] denies by name, before they are made canonical. Off Windows:
+    /// every path whose `stat` can prompt, and the configured roots. On Windows (`windows`) no
+    /// folder prompts, so only the roots the configuration names are denied, and every one of
+    /// them is: one that a Mac protects by default (`~/Documents`) as much as any other.
+    pub(crate) fn named_roots(home: &Path, overrides: &[String], windows: bool) -> Vec<PathBuf> {
+        if !windows {
+            return aterm_containment::consent::tcc_prompting_roots(home, overrides);
+        }
+        if overrides.is_empty() {
+            // `protected_roots_in` reads no overrides as the built-in list.
+            return Vec::new();
+        }
+        aterm_containment::consent::protected_roots_in(Some(home), overrides)
     }
 
     /// [`Self::for_home`] with the case rule named, for a test of the other platform's rule.
@@ -169,7 +185,7 @@ impl Deny {
         &self.roots
     }
 
-    /// Whether path comparisons ignore ASCII case (macOS, as APFS does).
+    /// Whether path comparisons ignore ASCII case (macOS, as APFS does; Windows, as NTFS does).
     #[inline]
     #[must_use]
     pub const fn fold_case(&self) -> bool {
@@ -215,7 +231,10 @@ impl Deny {
         {
             return Some(Refusal::Protected);
         }
-        if self.under(path, &self.library) && !self.allow.iter().any(|a| self.under(path, a)) {
+        if let Some(library) = self.library.as_deref()
+            && self.under(path, library)
+            && !self.allow.iter().any(|a| self.under(path, a))
+        {
             return Some(Refusal::Protected);
         }
         None
@@ -227,7 +246,7 @@ impl Deny {
         let fc = self.fold_case;
         let path_forms = forms(path, fc);
         let mut guarded: Vec<&Path> = self.roots.iter().map(PathBuf::as_path).collect();
-        guarded.push(&self.library);
+        guarded.extend(self.library.as_deref());
         guarded.push(&self.home);
         if let Some(other) = self.other_homes.as_deref() {
             guarded.push(other);
@@ -242,10 +261,60 @@ impl Deny {
     }
 }
 
-/// `path` read the way the kernel names it.
+/// `path` read the way the kernel names it. On Windows that is the plain drive spelling
+/// (`C:\a\b`, the letter upper-case) of a drive or verbatim-drive path, or `\\server\share\a` of a
+/// UNC one; every other spelling (drive-relative, a device or a volume-GUID path) is `None`.
 #[must_use]
 pub fn canonical(path: &Path) -> Option<PathBuf> {
-    canonical_for(path, cfg!(target_vendor = "apple"))
+    #[cfg(windows)]
+    {
+        canonical_windows(path)
+    }
+    #[cfg(not(windows))]
+    {
+        canonical_for(path, cfg!(target_vendor = "apple"))
+    }
+}
+
+/// [`canonical`]'s Windows reading.
+#[cfg(windows)]
+fn canonical_windows(path: &Path) -> Option<PathBuf> {
+    use std::path::Prefix;
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return None;
+    };
+    let mut out = match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let letter = char::from(letter.to_ascii_uppercase());
+            if !letter.is_ascii_alphabetic() {
+                return None;
+            }
+            PathBuf::from(format!(r"{letter}:\"))
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            let mut unc = std::ffi::OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            unc.push(r"\");
+            PathBuf::from(unc)
+        }
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => return None,
+    };
+    if !matches!(parts.next(), Some(Component::RootDir)) {
+        return None;
+    }
+    for c in parts {
+        match c {
+            Component::RootDir | Component::CurDir => {}
+            Component::Prefix(_) | Component::ParentDir => return None,
+            // A verbatim spelling keeps `.` and `..` as names, which no directory holds.
+            Component::Normal(name) if name == "." || name == ".." => return None,
+            Component::Normal(name) => out.push(name),
+        }
+    }
+    Some(out)
 }
 
 /// [`canonical`] with the platform named.
@@ -315,6 +384,23 @@ pub fn is_mount_point(dir: &Path, mounts: &Table, fold: bool) -> bool {
         mount_forms(m, fold)
             .iter()
             .any(|o| dirs.iter().any(|d| same(d, o, fold)))
+    })
+}
+
+/// The mount of `mounts` at exactly `dir` whose volume a walk may enter at its root: one the
+/// table names there and calls local, fixed and not automounted. `None` when the table names no
+/// such mount at `dir`, or is incomplete (it cannot vouch for what it did not read).
+#[cfg(windows)]
+pub(crate) fn safe_mount_at<'a>(dir: &Path, mounts: &'a Table, fold: bool) -> Option<&'a Mount> {
+    if !mounts.complete {
+        return None;
+    }
+    let dirs = forms(dir, fold);
+    mounts.mounts.iter().find(|m| {
+        unsafe_mount(m).is_none()
+            && mount_forms(m, fold)
+                .iter()
+                .any(|o| dirs.iter().any(|d| same(d, o, fold)))
     })
 }
 

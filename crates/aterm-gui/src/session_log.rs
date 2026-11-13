@@ -772,7 +772,7 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
         ExitActor::Harness => Actor::Harness,
         #[cfg(any(unix, test))]
         ExitActor::Bridge => Actor::Bridge,
-        ExitActor::Fleet(token) => match Actor::from_word(token) {
+        ExitActor::Fleet { token, .. } => match Actor::from_word(token) {
             fleet @ Actor::Fleet(_) => fleet,
             _ => Actor::Nobody,
         },
@@ -3272,7 +3272,7 @@ pub(crate) mod keys;
 pub(crate) use keys::{FrameKeys, KeyClass, KeyFrame};
 #[path = "session_log_tab.rs"]
 mod tab;
-pub(crate) use tab::{TabClose, TabPlace, TreeSpent};
+pub(crate) use tab::{TabAsked, TabClose, TabPlace, TreeSpent};
 
 #[path = "session_log_carry.rs"]
 mod carry;

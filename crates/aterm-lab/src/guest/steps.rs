@@ -38,13 +38,19 @@
 //!   It prints `repaired <epoch ms> standing=<enrolled|enrolled-now> rounds=<n> control=<records
 //!   HOME took> rows=<table operations HOME took> keys=<historical keys HOME took>`, counts only.
 
+#[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// The Commons verbs (`enrol`, `genesis`, `repair`) run on the Unix-only custody and LAN modules.
+#[cfg(unix)]
 use aterm_db::control::{Endpoint, Repair, Report, Side};
+#[cfg(unix)]
 use aterm_net::lan::{Connection, Scope};
+#[cfg(unix)]
 use aterm_secrets::client::Paths;
+#[cfg(unix)]
 use aterm_secrets::commons::bootstrap::Bootstrap;
 
 /// The hang detector on each wait a step needs to end: a browse's group gone after its kill, a
@@ -119,24 +125,28 @@ pub(crate) fn dns_sd(args: &[String]) -> Result<(), String> {
 const ANSWER_POLL: Duration = Duration::from_millis(100);
 
 /// One `dns-sd ARGS...` under `script -q -t 0` into `file` (removed first), in a session of its
-/// own so [`end`] kills its whole group.
+/// own so [`end`] kills its whole group. Both are macOS's commands: off Unix there is no session
+/// to start, and the spawn finds no `/usr/bin/script`.
 fn listen(file: &Path, args: &[String]) -> std::io::Result<aterm_uds::spawnfd::Child> {
     let _ = std::fs::remove_file(file);
-    aterm_uds::spawnfd::command("/usr/bin/script")
+    let mut script = aterm_uds::spawnfd::command("/usr/bin/script");
+    script
         .args(["-q", "-t", "0"])
         .arg(file)
         .arg("/usr/bin/dns-sd")
         .args(args)
-        .setsid(true)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    #[cfg(unix)]
+    script.setsid(true);
+    script.spawn()
 }
 
-/// Each of `running`'s process groups killed, and each child reaped.
+/// Each of `running`'s process groups killed (a Unix session's), and each child reaped.
 fn end(running: Vec<aterm_uds::spawnfd::Child>) {
     for mut child in running {
+        #[cfg(unix)]
         if let Ok(group) = i32::try_from(child.id()) {
             let _ = aterm_uds::process::kill_group_until_empty(group);
         }
@@ -151,11 +161,14 @@ pub(crate) fn transcript(dir: &Path, service: &str) -> PathBuf {
 
 pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -227,6 +240,7 @@ fn epoch_secs(at: SystemTime) -> String {
 /// # Errors
 /// A missing or stray word; HOME is no pending Commons member (no control entry yet, or it is
 /// enrolled already); AUTHORITY is not enrolled itself; or the exchange left HOME pending.
+#[cfg(unix)]
 pub(crate) fn enrol(args: &[String], out: &mut dyn std::io::Write) -> Result<(), String> {
     let [home, authority] = args else {
         return Err("enrol HOME AUTHORITY".to_owned());
@@ -251,6 +265,7 @@ pub(crate) fn enrol(args: &[String], out: &mut dyn std::io::Write) -> Result<(),
 ///
 /// # Errors
 /// A missing or extra word, or the genesis could not be signed or seeded.
+#[cfg(unix)]
 pub(crate) fn genesis(args: &[String], out: &mut dyn std::io::Write) -> Result<(), String> {
     let [home, file] = args else {
         return Err("genesis HOME OUT".to_owned());
@@ -272,6 +287,7 @@ pub(crate) fn genesis(args: &[String], out: &mut dyn std::io::Write) -> Result<(
 }
 
 /// The Commons bootstrap under `paths`, its custody's lock within [`HANG`].
+#[cfg(unix)]
 fn bootstrap(paths: &Paths) -> Result<Bootstrap, String> {
     Bootstrap::required_until(paths, Instant::now() + HANG)
         .map_err(|e| format!("{}: its Commons bootstrap: {e}", paths.home.display()))
@@ -279,6 +295,7 @@ fn bootstrap(paths: &Paths) -> Result<Bootstrap, String> {
 
 /// The enrolled endpoint of the custody under `home`, or `None` while it is pending. Its Commons
 /// config (`home/commons.toml`) is never written, so sharing reads as on.
+#[cfg(unix)]
 fn endpoint(home: &Path) -> Result<Option<Endpoint>, String> {
     let paths = Paths::for_home(home);
     let b = bootstrap(&paths)?;
@@ -292,15 +309,18 @@ fn endpoint(home: &Path) -> Result<Option<Endpoint>, String> {
 }
 
 /// One exchange: `initiator` dials `responder` on a loopback port of this process.
+#[cfg(unix)]
 fn exchange(initiator: &Endpoint, responder: &Endpoint) -> Result<(), String> {
     let (mut mine, mut theirs) = (Repair::default(), Repair::default());
     round(initiator, responder, &mut mine, &mut theirs).map(|_| ())
 }
 
 /// The most rounds one `repair` runs: a fresh registry is its catalog and a few batches of 16.
+#[cfg(unix)]
 pub(crate) const MOST_ROUNDS: usize = 32;
 
 /// What HOME took over a `repair`'s rounds, summed from its side's reports.
+#[cfg(unix)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Took {
     /// Control (membership) records acknowledged into HOME's history.
@@ -311,6 +331,7 @@ pub(crate) struct Took {
     pub keys: usize,
 }
 
+#[cfg(unix)]
 impl Took {
     /// One round's reports added in: the control exchange's, and its table round's where it
     /// completed one.
@@ -327,6 +348,7 @@ impl Took {
 ///
 /// # Errors
 /// A missing or stray word, or ROUNDS outside 1 to [`MOST_ROUNDS`].
+#[cfg(unix)]
 fn repair_words(args: &[String]) -> Result<(&Path, &Path, usize, Option<&Path>), String> {
     let usage = || format!("repair HOME PEER ROUNDS [AUTHORITY] (ROUNDS 1 to {MOST_ROUNDS})");
     let (home, peer, rounds, authority) = match args {
@@ -347,6 +369,7 @@ fn repair_words(args: &[String]) -> Result<(&Path, &Path, usize, Option<&Path>),
 /// # Errors
 /// Its words ([`repair_words`]); HOME pending with no AUTHORITY, or its enrolment failed; PEER is
 /// not enrolled; or a round failed, its table round included (its words, never a value).
+#[cfg(unix)]
 pub(crate) fn repair(args: &[String], out: &mut dyn std::io::Write) -> Result<(), String> {
     let (home, peer, rounds, authority) = repair_words(args)?;
     let standing = if endpoint(home)?.is_some() {
@@ -389,6 +412,7 @@ pub(crate) fn repair(args: &[String], out: &mut dyn std::io::Write) -> Result<()
 
 /// One round on a fresh loopback connection of this process: `initiator` dials `responder`,
 /// each side's `Repair` carried in; the initiator's report.
+#[cfg(unix)]
 fn round(
     initiator: &Endpoint,
     responder: &Endpoint,
@@ -431,178 +455,5 @@ fn round(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(words: &[&str]) -> Vec<String> {
-        words.iter().map(|w| (*w).to_owned()).collect()
-    }
-
-    /// A scratch directory under the test's temp dir, removed when dropped.
-    struct Scratch(aterm_tempfile::TempDir);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let dir = aterm_tempfile::Builder::new()
-                .prefix(&format!("guest-{tag}-"))
-                .suffix(".noindex")
-                .tempdir()
-                .expect("scratch dir");
-            std::fs::create_dir_all(dir.path().join("seed")).unwrap();
-            std::fs::create_dir_all(dir.path().join("joiner")).unwrap();
-            Scratch(dir)
-        }
-    }
-
-    /// Each file reads as the joiner holds it: the seed's bytes, other bytes, or none; its time is
-    /// the joiner's file's own, and no value reaches the output.
-    #[test]
-    fn arrivals_say_when_each_file_landed_and_whether_it_is_the_seeds() {
-        let s = Scratch::new("arrivals");
-        let (seed, joiner) = (s.0.path().join("seed"), s.0.path().join("joiner"));
-        std::fs::write(seed.join("gh_access_token"), "nux-synthetic-github-1").unwrap();
-        std::fs::write(joiner.join("gh_access_token"), "nux-synthetic-github-1").unwrap();
-        std::fs::write(seed.join("ai-accounts.csv"), "claude,a@example.invalid\n").unwrap();
-        std::fs::write(joiner.join("ai-accounts.csv"), "claude,b@example.invalid\n").unwrap();
-        std::fs::write(seed.join("gh_access_token_alabsystems"), "nux-synthetic-p").unwrap();
-        let mut out = Vec::new();
-        arrivals(
-            &args(&[
-                seed.to_str().unwrap(),
-                joiner.to_str().unwrap(),
-                "gh_access_token",
-                "gh_access_token_alabsystems",
-                "ai-accounts.csv",
-            ]),
-            &mut out,
-        )
-        .unwrap();
-        let text = String::from_utf8(out).unwrap();
-        let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split(' ').collect()).collect();
-        assert_eq!(lines.len(), 3, "{text}");
-        assert_eq!((lines[0][0], lines[0][2]), ("gh_access_token", "same"));
-        assert_eq!(
-            lines[1],
-            ["gh_access_token_alabsystems", "none", "absent"],
-            "{text}"
-        );
-        assert_eq!((lines[2][0], lines[2][2]), ("ai-accounts.csv", "differs"));
-        let landed = std::fs::metadata(joiner.join("gh_access_token"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        assert_eq!(lines[0][1], epoch_secs(landed));
-        assert!(
-            !text.contains("synthetic") && !text.contains("example"),
-            "no value is printed: {text}"
-        );
-        assert!(arrivals(&args(&["/s", "/j"]), &mut Vec::new()).is_err());
-    }
-
-    #[test]
-    fn a_files_time_is_epoch_seconds_to_the_nanosecond() {
-        let at = UNIX_EPOCH + Duration::new(1_761_650_000, 5_000_000);
-        assert_eq!(epoch_secs(at), "1761650000.005000000");
-    }
-
-    /// The enrolment names a home and its authority, and nothing else.
-    #[test]
-    fn enrol_names_a_home_and_its_authority() {
-        assert!(enrol(&args(&["/m"]), &mut Vec::new()).is_err());
-        assert!(enrol(&args(&["/m", "/s", "/x"]), &mut Vec::new()).is_err());
-    }
-
-    /// A genesis names a home and the new file it writes, and nothing else.
-    #[test]
-    fn a_genesis_names_a_home_and_its_file() {
-        assert!(genesis(&args(&["/s"]), &mut Vec::new()).is_err());
-        assert!(genesis(&args(&["/s", "/g", "/x"]), &mut Vec::new()).is_err());
-    }
-
-    /// A repair names two homes and its rounds, and an authority only when it names one; its
-    /// rounds are bounded before anything opens a custody.
-    #[test]
-    fn a_repair_names_two_homes_its_rounds_and_maybe_an_authority() {
-        let three = args(&["/j", "/s", "8"]);
-        let (home, peer, rounds, authority) = repair_words(&three).unwrap();
-        assert_eq!(
-            (home, peer, rounds, authority),
-            (Path::new("/j"), Path::new("/s"), 8, None)
-        );
-        let four = args(&["/j", "/s", "8", "/a"]);
-        let (.., authority) = repair_words(&four).unwrap();
-        assert_eq!(authority, Some(Path::new("/a")));
-        for words in [
-            &["/j", "/s"][..],
-            &["/j", "/s", "0"],
-            &["/j", "/s", "33"],
-            &["/j", "/s", "many"],
-            &["/j", "/s", "8", "/a", "/x"],
-        ] {
-            assert!(repair_words(&args(words)).is_err(), "{words:?}");
-        }
-        assert!(repair(&args(&["/j"]), &mut Vec::new()).is_err());
-    }
-
-    /// What a repair took is HOME's own counts: control records, table operations with their
-    /// conflicts, and historical keys; a round with no completed table round adds control alone.
-    #[test]
-    fn a_repair_sums_what_its_home_took() {
-        let mut took = Took::default();
-        let table = aterm_db::replica::Report {
-            received: 16,
-            conflicts_received: 1,
-            keys_received: 2,
-            sent: 99,
-            ..aterm_db::replica::Report::default()
-        };
-        took.add(
-            Report {
-                sent: 7,
-                received: 3,
-                deferred: 0,
-            },
-            Some(table),
-        );
-        took.add(
-            Report {
-                sent: 0,
-                received: 1,
-                deferred: 4,
-            },
-            None,
-        );
-        assert_eq!(
-            took,
-            Took {
-                control: 4,
-                rows: 17,
-                keys: 2
-            }
-        );
-    }
-
-    /// The browse's words are read before anything runs, and each transcript has its own file.
-    #[test]
-    fn a_browse_names_its_seconds_its_folder_and_at_least_one_service() {
-        assert!(browse(&args(&["3"])).is_err());
-        assert!(browse(&args(&["3", "/n"])).is_err());
-        assert!(browse(&args(&["three", "/n", "_alab._tcp"])).is_err());
-        assert!(dns_sd(&args(&["2", "/n/out.txt"])).is_err());
-        assert!(
-            dns_sd(&args(&[
-                "two",
-                "/n/out.txt",
-                "-L",
-                "x",
-                "_alab._tcp",
-                "local."
-            ]))
-            .is_err()
-        );
-        assert_eq!(
-            transcript(Path::new("/n"), "_alab-vault._tcp"),
-            PathBuf::from("/n/heard_alab-vault._tcp.txt")
-        );
-    }
-}
+#[path = "steps_tests.rs"]
+mod tests;

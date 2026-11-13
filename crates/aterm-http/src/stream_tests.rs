@@ -210,6 +210,13 @@ fn a_local_name_linux_cannot_resolve_names_what_it_lacks() {
 /// NEGATIVE CONTROL: give each address the whole of what is left and the first takes it.
 #[test]
 fn each_address_gets_its_share_of_the_deadline_and_the_last_the_rest() {
+    let original = Instant::now();
+    let expired = Deadline::after(HANG_DETECTOR).until(original);
+    assert!(
+        expired.remaining().is_none(),
+        "request construction cannot renew the original bound"
+    );
+    assert!(expired.connect_phase(HANG_DETECTOR).remaining().is_none());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let live = listener.local_addr().expect("addr");
     // TEST-NET-1: never dialled, a stale answer's stand-in.

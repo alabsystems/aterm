@@ -247,10 +247,7 @@ fn headless_host_actor_if_requested() {
     assert!(
         matches!(
             admit_cohort_job(&test_build(), &world, &selected, &mut |_| {}),
-            Admission::Stopped(Error::Stopped {
-                signal: None,
-                short: Some(_)
-            })
+            Admission::Refused(_)
         ),
         "a host cannot force a third job through memory pressure"
     );

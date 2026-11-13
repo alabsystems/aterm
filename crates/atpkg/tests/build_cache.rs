@@ -308,6 +308,7 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
     std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
     let ws = home.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
+    write(&ws.join("Cargo.toml"), "[workspace]\nmembers = []\n");
     let config = atpkg::build_cache::config_value(&atpkg::build_cache::cache_root(&home)).unwrap();
     let command = |release: &str, args: &[&str], env: &[(&str, &str)]| {
         let bin = root.join(format!("bin-{release}"));
@@ -366,18 +367,659 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         format!("+1.97.1\n--config\n{config}\ntest\n")
     );
     assert_eq!(run("1.97.1", &["metadata"], &[]), "metadata\n");
+    let target = root.join("outside-home-target");
     assert_eq!(
-        run("1.97.1", &["build"], &[("CARGO_TARGET_DIR", "/t")]),
-        "--config\nbuild.build-dir='/t/build.noindex'\nbuild\n"
+        run(
+            "1.97.1",
+            &["build"],
+            &[("CARGO_TARGET_DIR", target.to_str().unwrap())]
+        ),
+        format!(
+            "--config\nbuild.build-dir='{}/.ubd/build.noindex'\nbuild\n",
+            target.display()
+        )
     );
+    assert!(target.join(".ubd/build.noindex").is_dir());
     assert_eq!(
         run("1.97.1", &["build"], &[("CARGO_BUILD_BUILD_DIR", "/b")]),
         "build\n"
     );
     assert_eq!(run("1.85.0", &["build"], &[]), "build\n");
-    assert_eq!(run("trust", &["check"], &[]), "check\n");
+    assert_eq!(
+        run("trust", &["check"], &[]),
+        format!("--config\n{config}\ncheck\n")
+    );
     assert_eq!(
         run("trust", &["build", "--unverified"], &[]),
         format!("--config\n{config}\nbuild\n--unverified\n")
     );
+    for var in ["TARGO_TARGET_DIR", "TARGO_BUILD_TARGET_DIR"] {
+        let target = home.join(format!("managed-{var}"));
+        assert_eq!(
+            run(
+                "trust",
+                &["+trust", "build"],
+                &[(var, target.to_str().unwrap())]
+            ),
+            format!(
+                "+trust\n--config\nbuild.build-dir='{}/.ubd/build.noindex'\nbuild\n",
+                target.display()
+            ),
+            "{var}"
+        );
+        assert!(
+            atpkg::build_cache::registered::roots(&home)
+                .iter()
+                .any(|r| r.root == target)
+        );
+        assert_eq!(
+            run("1.97.1", &["build"], &[(var, target.to_str().unwrap())]),
+            format!("--config\n{config}\nbuild\n"),
+            "stock Cargo ignores {var}"
+        );
+    }
+    // A directory-neutral CLI file preserves explicit custody without changing forwarded argv.
+    write(&ws.join("settings.toml"), "[build]\njobs = 2\n");
+    let neutral_args = [
+        "+trust",
+        "--config",
+        "settings.toml",
+        "build",
+        "--target-dir",
+        "configured.noindex",
+    ];
+    assert_eq!(
+        run("trust", &neutral_args, &[]),
+        format!("{}\n", neutral_args.join("\n"))
+    );
+    assert!(
+        atpkg::build_cache::registered::roots(&home)
+            .iter()
+            .any(|r| r.root == ws.join("configured.noindex"))
+    );
+    for (value, leaf) in [
+        (r#"env.ATPKG_NEUTRAL = 'a\b'"#, "inline-literal.noindex"),
+        (
+            r#"env.ATPKG_NEUTRAL = 'target-dir build-dir include'"#,
+            "inline-data.noindex",
+        ),
+    ] {
+        let args = ["+trust", "--config", value, "build", "--target-dir", leaf];
+        assert_eq!(run("trust", &args, &[]), format!("{}\n", args.join("\n")));
+        assert!(
+            atpkg::build_cache::registered::roots(&home)
+                .iter()
+                .any(|r| r.root == ws.join(leaf))
+        );
+    }
+    // Explicit command/environment targets outrank a config target. The original config
+    // still reaches Cargo unchanged; the front records only the selected output.
+    write(
+        &ws.join("target-settings.toml"),
+        "build.target-dir = 'unused-config-output'\n",
+    );
+    for (value, leaf) in [
+        ("target-settings.toml", "override-file.noindex"),
+        (
+            r#"build."target\u002ddir"='unused-config-output'"#,
+            "override-inline.noindex",
+        ),
+    ] {
+        let args = ["+trust", "--config", value, "build", "--target-dir", leaf];
+        assert_eq!(run("trust", &args, &[]), format!("{}\n", args.join("\n")));
+        assert!(
+            atpkg::build_cache::registered::roots(&home)
+                .iter()
+                .any(|r| r.root == ws.join(leaf))
+        );
+    }
+    let env_target = ws.join("override-env.noindex");
+    let args = ["+trust", "--config", "target-settings.toml", "build"];
+    assert_eq!(
+        run(
+            "trust",
+            &args,
+            &[("CARGO_TARGET_DIR", env_target.to_str().unwrap())]
+        ),
+        format!("{}\n", args.join("\n"))
+    );
+    assert!(
+        atpkg::build_cache::registered::roots(&home)
+            .iter()
+            .any(|r| r.root == env_target)
+    );
+    assert!(!ws.join("unused-config-output").exists());
+    assert!(!home.join("unused-config-output").exists());
+    let lower = ws.join("lower-priority.noindex");
+    assert_eq!(
+        run(
+            "trust",
+            &args,
+            &[("CARGO_BUILD_TARGET_DIR", lower.to_str().unwrap())]
+        ),
+        format!("{}\n", args.join("\n"))
+    );
+    assert!(!lower.exists());
+    assert!(!ws.join("unused-config-output").exists());
+    assert!(
+        atpkg::build_cache::registered::roots(&home)
+            .iter()
+            .any(|root| root.root == home.join("unused-config-output"))
+    );
+    for configs in [
+        vec![
+            "target-settings.toml",
+            "build.target-dir='last-config.noindex'",
+        ],
+        vec![
+            "build.target-dir='first-config.noindex'",
+            "target-settings.toml",
+        ],
+    ] {
+        let file_wins = configs.last() == Some(&"target-settings.toml");
+        let mut args = vec!["build"];
+        for config in configs {
+            args.extend(["--config", config]);
+        }
+        assert_eq!(run("trust", &args, &[]), format!("{}\n", args.join("\n")));
+        let expected = if file_wins {
+            home.join("unused-config-output")
+        } else {
+            ws.join("last-config.noindex")
+        };
+        assert!(
+            atpkg::build_cache::registered::roots(&home)
+                .iter()
+                .any(|root| root.root == expected)
+        );
+        assert!(!ws.join("first-config.noindex").exists());
+    }
+    for release in ["trust", "1.97.1"] {
+        let child = format!("layers/include-{release}.toml");
+        let settings = format!("include-{release}.toml");
+        let leaf = format!("included-{release}.noindex");
+        write(&ws.join(&child), &format!("build.target-dir='{leaf}'"));
+        write(&ws.join(&settings), &format!("include=['{child}']"));
+        for config in [settings.as_str(), &format!("include=['{child}']")] {
+            let args = ["build", "--config", config];
+            if release == "trust" {
+                assert_eq!(run(release, &args, &[]), format!("{}\n", args.join("\n")));
+                assert!(
+                    atpkg::build_cache::registered::roots(&home)
+                        .iter()
+                        .any(|root| root.root == ws.join(&leaf))
+                );
+            } else {
+                let refused = command(release, &args, &[]).output().unwrap();
+                assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+                assert!(
+                    refused.stdout.is_empty(),
+                    "unknown upstream include capability starts no build"
+                );
+                assert!(!ws.join(&leaf).exists());
+            }
+        }
+        assert!(!home.join(&leaf).exists());
+        let cycle = format!("cycle-{release}.toml");
+        write(&ws.join(&cycle), &format!("include=['{cycle}']"));
+        let target = format!("refused-cycle-{release}.noindex");
+        let refused = command(
+            release,
+            &["build", "--config", &cycle, "--target-dir", &target],
+            &[],
+        )
+        .output()
+        .unwrap();
+        assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+        assert!(refused.stdout.is_empty());
+        assert!(!ws.join(target).exists());
+    }
+    // Directory-changing calls retain the original argv and register the effective package,
+    // while a query owns nothing. The public boundary only prints argv; custody is real.
+    let moved = ws.join("moved");
+    write(&moved.join("Cargo.toml"), "[workspace]\nmembers = []\n");
+    let directory_args = [
+        "+trust",
+        "-Zunstable-options",
+        "-C",
+        "moved",
+        "build",
+        "--target-dir",
+        "fresh.noindex",
+    ];
+    assert_eq!(
+        run("trust", &directory_args, &[]),
+        format!("{}\n", directory_args.join("\n"))
+    );
+    assert!(
+        atpkg::build_cache::registered::roots(&home)
+            .iter()
+            .any(|r| r.root == moved.join("fresh.noindex"))
+    );
+    assert!(!ws.join("fresh.noindex").exists());
+    let query_args = [
+        "+trust",
+        "-Zunstable-options",
+        "-C",
+        "moved",
+        "help",
+        "--target-dir",
+        "query.noindex",
+    ];
+    assert_eq!(
+        run("trust", &query_args, &[]),
+        format!("{}\n", query_args.join("\n"))
+    );
+    assert!(!moved.join("query.noindex").exists());
+    for release in ["trust", "1.97.1"] {
+        let target = format!("escaped-{release}.noindex");
+        let args = [
+            "build",
+            "--target-dir",
+            target.as_str(),
+            "--config",
+            r#"http.user-agent = "aterm\u0020test""#,
+            "--config",
+            r#"build."target\u002ddir" = "elsewhere""#,
+        ];
+        assert_eq!(run(release, &args, &[]), format!("{}\n", args.join("\n")));
+        assert!(
+            atpkg::build_cache::registered::roots(&home)
+                .iter()
+                .any(|root| root.root == ws.join(&target)),
+            "{release}: the actual escaped-value call owns its explicit output"
+        );
+        for (suffix, config) in [
+            ("key", r#"build."target\u002ddir" = true"#),
+            ("invalid", r#"http.user-agent = "bad\qescape""#),
+        ] {
+            let target = format!("refused-{release}-{suffix}.noindex");
+            let refused = command(
+                release,
+                &["build", "--target-dir", &target, "--config", config],
+                &[],
+            )
+            .output()
+            .unwrap();
+            assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+            assert!(
+                refused.stdout.is_empty(),
+                "a refused config starts no build"
+            );
+            assert!(
+                !ws.join(target).exists(),
+                "a refused config prepares no output"
+            );
+        }
+    }
+    write(
+        &ws.join("includes/root.toml"),
+        "include = ['nested/one.toml']\n",
+    );
+    write(
+        &ws.join("includes/nested/one.toml"),
+        "include = ['../leaf.toml']\n",
+    );
+    write(&ws.join("includes/leaf.toml"), "[build]\njobs = 2\n");
+    for release in ["trust", "1.97.1"] {
+        for (suffix, config) in [
+            ("file", "includes/root.toml"),
+            ("inline", "include=['includes/root.toml']"),
+        ] {
+            let target = format!("included-{release}-{suffix}.noindex");
+            let args = ["build", "--target-dir", &target, "--config", config];
+            if release != "trust" {
+                let refused = command(release, &args, &[]).output().unwrap();
+                assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+                assert!(refused.stdout.is_empty());
+                continue;
+            }
+            assert_eq!(run(release, &args, &[]), format!("{}\n", args.join("\n")));
+            assert!(
+                atpkg::build_cache::registered::roots(&home)
+                    .iter()
+                    .any(|entry| entry.root == ws.join(&target))
+            );
+        }
+    }
+    for release in ["trust", "1.97.1"] {
+        for (suffix, config) in [
+            ("file", "includes/root.toml"),
+            ("inline", "include=['includes/root.toml']"),
+        ] {
+            let chosen = format!("graph-target-{release}-{suffix}.noindex");
+            write(
+                &ws.join("includes/nested/one.toml"),
+                &format!("include = ['../leaf.toml']\nbuild.target-dir = '{chosen}'\n"),
+            );
+            let expected = ws.join("includes").join(&chosen);
+            assert!(!expected.exists());
+            let args = ["build", "--config", config];
+            if release != "trust" {
+                let refused = command(release, &args, &[]).output().unwrap();
+                assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+                assert!(refused.stdout.is_empty());
+                continue;
+            }
+            assert_eq!(run(release, &args, &[]), format!("{}\n", args.join("\n")));
+            assert!(
+                atpkg::build_cache::registered::roots(&home)
+                    .iter()
+                    .any(|entry| entry.root == expected)
+            );
+            assert!(
+                !ws.join(chosen).exists(),
+                "target keeps the included file's definition base"
+            );
+        }
+    }
+    for release in ["trust", "1.97.1"] {
+        for form in ["file", "inline", "environment"] {
+            let target = format!("paired-target-{release}-{form}.noindex");
+            let build = format!("paired-build-{release}-{form}.noindex");
+            write(
+                &ws.join("outputs/settings.toml"),
+                "include=['nested/layout.toml']",
+            );
+            write(
+                &ws.join("outputs/nested/layout.toml"),
+                &format!("build.build-dir='{build}'"),
+            );
+            let mut args = vec!["build", "--target-dir", &target];
+            if form != "environment" {
+                args.extend([
+                    "--config",
+                    if form == "file" {
+                        "outputs/settings.toml"
+                    } else {
+                        "include=['outputs/nested/layout.toml']"
+                    },
+                ]);
+            }
+            let environment = if form == "environment" {
+                vec![("CARGO_BUILD_BUILD_DIR", build.as_str())]
+            } else {
+                vec![]
+            };
+            let expected_build = if form == "environment" {
+                ws.join(&build)
+            } else {
+                ws.join("outputs").join(&build)
+            };
+            if release == "trust" {
+                assert_eq!(
+                    run(release, &args, &environment),
+                    format!("{}\n", args.join("\n"))
+                );
+                let recorded = atpkg::build_cache::registered::roots(&home);
+                for output in [ws.join(&target), expected_build] {
+                    assert!(output.is_dir());
+                    assert!(recorded.iter().any(|entry| entry.root == output));
+                }
+            } else {
+                let refused = command(release, &args, &environment).output().unwrap();
+                assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+                assert!(refused.stdout.is_empty());
+                assert!(!ws.join(&target).exists() && !expected_build.exists());
+            }
+        }
+    }
+    let blocked_build = ws.join("caller-intermediates");
+    write(&blocked_build.join("keep"), "caller data");
+    let refused = command(
+        "trust",
+        &[
+            "build",
+            "--target-dir",
+            "blocked-pair.noindex",
+            "--config",
+            "build.build-dir='caller-intermediates'",
+        ],
+        &[],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+    assert!(
+        refused.stdout.is_empty(),
+        "no producer starts on partial admission"
+    );
+    assert_eq!(
+        std::fs::read_to_string(blocked_build.join("keep")).unwrap(),
+        "caller data"
+    );
+    assert!(
+        !atpkg::build_cache::registered::roots(&home)
+            .iter()
+            .any(|entry| entry.root == blocked_build)
+    );
+    write(&ws.join("includes/literal[one].toml"), "build.jobs = 2\n");
+    for (suffix, leaf) in [
+        ("output", "[build]\nbuild-dir = false\n"),
+        ("cycle", "include = ['root.toml']\n"),
+        ("brackets", "include = ['literal[one].toml']\n"),
+        (
+            "glob",
+            "include = [{ path = 'absent*.toml', optional = true }]\n",
+        ),
+        (
+            "braces",
+            "include = [{ path = 'absent{one}.toml', optional = true }]\n",
+        ),
+    ] {
+        write(&ws.join("includes/leaf.toml"), leaf);
+        for release in ["trust", "1.97.1"] {
+            let target = format!("refused-include-{release}-{suffix}.noindex");
+            let refused = command(
+                release,
+                &[
+                    "build",
+                    "--target-dir",
+                    &target,
+                    "--config",
+                    "includes/root.toml",
+                ],
+                &[],
+            )
+            .output()
+            .unwrap();
+            assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+            assert!(refused.stdout.is_empty());
+            assert!(!ws.join(&target).exists());
+            assert!(
+                atpkg::build_cache::registered::roots(&home)
+                    .iter()
+                    .all(|entry| entry.root != ws.join(&target)),
+                "a refused include graph grants no custody"
+            );
+        }
+    }
+    let package_home = root.join("package-home");
+    write(
+        &package_home.join("config.toml"),
+        &format!("[build]\ntarget-dir = '{}'\n", target.display()),
+    );
+    let homed = [("TARGO_HOME", package_home.to_str().unwrap())];
+    let refused = command("trust", &["check"], &homed).output().unwrap();
+    assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+    assert!(
+        refused.stdout.is_empty(),
+        "unresolved package-home config starts no build"
+    );
+    assert_eq!(
+        run("1.97.1", &["check"], &homed),
+        format!("--config\n{config}\ncheck\n")
+    );
+}
+
+/// PUBLIC BOUNDARY: these stock/Trust-identifying scripts only expose which argv the real
+/// reroute execs. They never compile Rust; this suite itself runs under Trust.
+#[test]
+fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    for branded in [false, true] {
+        for shape in [
+            "safe",
+            "outside-target",
+            "parent-link",
+            "parent-writable",
+            "override",
+            "unsupported",
+            "query",
+            "plus-toolchain",
+            "passthrough",
+        ] {
+            if branded && matches!(shape, "unsupported" | "plus-toolchain" | "passthrough") {
+                continue;
+            }
+            let temp = aterm_tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let home = root.join("home");
+            let source = home.join("Library/ForeignSource");
+            std::fs::create_dir_all(&source).unwrap();
+            write(&source.join("Cargo.toml"), "[workspace]\nmembers = []\n");
+            let target = if shape == "outside-target" {
+                root.join("target")
+            } else {
+                home.join("target")
+            };
+            let outside = root.join("retained");
+            std::fs::create_dir(&outside).unwrap();
+            write(&outside.join("keep"), "retained output");
+            let quiet = target.join(".ubd");
+            let build = quiet.join("build.noindex");
+            if matches!(
+                shape,
+                "parent-link"
+                    | "parent-writable"
+                    | "override"
+                    | "unsupported"
+                    | "query"
+                    | "passthrough"
+            ) {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&target)
+                    .unwrap();
+                if shape == "parent-writable" {
+                    std::fs::create_dir(&quiet).unwrap();
+                    std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o777))
+                        .unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&outside, &quiet).unwrap();
+                }
+            }
+            let bin = root.join("bin");
+            let release = if shape == "unsupported" {
+                "1.85.0"
+            } else {
+                "1.97.1"
+            };
+            fake_cargo(&bin, release);
+            if branded {
+                let layout = atpkg::store::Layout {
+                    prefix: atpkg::store::default_prefix(&home),
+                };
+                let owned = layout.build_dir("trust", 1);
+                std::fs::create_dir_all(owned.join("bin")).unwrap();
+                let tool = fake_cargo(&root.join("managed-bin"), "trust");
+                std::fs::copy(&tool, owned.join("bin/targo")).unwrap();
+                atpkg::store::mark_build_ready(&owned).unwrap();
+                atpkg::activate::install_shims(
+                    &layout,
+                    &owned,
+                    &["targo".into()],
+                    atpkg::activate::Aliases::Alab,
+                )
+                .unwrap();
+                atpkg::activate::activate_build(&layout, &owned).unwrap();
+            }
+            let mut args = Vec::new();
+            if branded {
+                args.push("--unverified".to_owned());
+            }
+            if shape == "plus-toolchain" {
+                args.push("+1.97.1".to_owned());
+            }
+            args.extend([
+                if shape == "query" {
+                    "metadata"
+                } else {
+                    "build"
+                }
+                .to_owned(),
+                "--manifest-path".into(),
+                source.join("Cargo.toml").display().to_string(),
+                "--target-dir".into(),
+                target.display().to_string(),
+            ]);
+            if shape == "override" {
+                args.push("--config=build.build-dir='caller-layout'".into());
+            }
+            let pid_to = root.join("compiler-pid");
+            let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
+            command
+                .args(["__reroute", "cargo"])
+                .args(&args)
+                .env_clear()
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("ATPKG_TEST_PID_TO", &pid_to)
+                .env(atpkg::build_admit::LEDGER_ENV, root.join("memory-ledger"))
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::piped())
+                .current_dir(&source);
+            if shape == "passthrough" {
+                command.env(atpkg::reroute::PASSTHROUGH_ENV, "1");
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let output = child.wait_with_output().unwrap();
+            let admitted = !matches!(shape, "parent-link" | "parent-writable");
+            assert_eq!(
+                output.status.success(),
+                admitted,
+                "{branded} {shape}: {output:?}"
+            );
+            if admitted {
+                assert_eq!(
+                    std::fs::read_to_string(&pid_to).unwrap().trim(),
+                    pid.to_string()
+                );
+            } else {
+                assert_eq!(output.status.code(), Some(75));
+                assert!(
+                    !pid_to.exists(),
+                    "unsafe automatic placement reached the tool"
+                );
+            }
+            assert!(!root.join("memory-ledger").exists());
+            assert!(atpkg::build_cache::registered::roots(&home).is_empty());
+            assert_eq!(
+                std::fs::read(outside.join("keep")).unwrap(),
+                b"retained output"
+            );
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+            if matches!(shape, "safe" | "outside-target" | "plus-toolchain") {
+                assert!(build.is_dir());
+                assert_eq!(
+                    std::fs::metadata(&quiet).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(&build).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            } else {
+                assert!(!build.exists());
+            }
+            if shape == "parent-writable" {
+                assert_eq!(
+                    std::fs::metadata(&quiet).unwrap().permissions().mode() & 0o777,
+                    0o777
+                );
+            }
+        }
+    }
 }

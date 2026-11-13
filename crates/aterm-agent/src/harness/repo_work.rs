@@ -45,9 +45,10 @@ pub struct RepoWork {
     pub untracked: usize,
     /// Stash entries.
     pub stashes: usize,
-    /// Commits on `HEAD` no remote-tracking ref contains.
+    /// Commits on `HEAD` no remote-tracking ref or verified Cargo source baseline contains.
     pub unpushed: usize,
-    /// Commits on `HEAD` the remote's default branch ([`Self::main_ref`]) does not contain.
+    /// Commits on `HEAD` beyond a verified Cargo source baseline that the remote's default
+    /// branch ([`Self::main_ref`]) does not contain.
     pub unlanded: usize,
     /// The remote default branch [`Self::unlanded`] counts against.
     pub main_ref: String,
@@ -1153,7 +1154,7 @@ fn repo_reads(
     reads: &Reads<'_>,
 ) -> Option<RepoRead> {
     let (top, root) = (top.to_string(), root.to_path_buf());
-    let (status, excludes) = work_status(&root, table, reads)?;
+    let (mut status, excludes) = work_status(&root, table, reads)?;
     // The branch and the stash list are read lossily, alike: a branch name or
     // stash message in bytes that are no UTF-8 still names its branch, so a
     // stash written on this branch is counted and one written on another is
@@ -1190,29 +1191,39 @@ fn repo_reads(
         ],
         reads,
     );
-    // A remote configured but never fetched from or pushed to has no tracking ref, and every
-    // commit on `HEAD` is one it lacks.
+    // An ordinary remote configured but never fetched from or pushed to has no tracking ref.
+    // Cargo snapshots instead prove their source through their local database's pinned ref.
     let configured = git_count(&root, &["remote"], reads);
     let remote = [&remotes, &configured]
         .iter()
         .any(|r| r.as_deref().is_some_and(|r| !r.trim().is_empty()));
+    let source = remote
+        .then(|| cargo_source_baseline(&root, table, reads))
+        .flatten();
+    if source.is_some() {
+        // Cargo's empty completion marker is regenerated metadata, not an authored file.
+        // A tracked marker, a nonempty one, and every other path remain ordinary work.
+        status = status
+            .split_inclusive('\0')
+            .filter(|entry| entry.trim_end_matches('\0') != "?? .cargo-ok")
+            .collect();
+    }
     let pushed = remote.then(|| {
-        git_count(
-            &root,
-            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
-            reads,
-        )
-        .and_then(|n| crate::parse_uint(n.trim()))
+        let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
+        if let Some(source) = source.as_deref() {
+            args.push(source);
+        }
+        git_count(&root, &args, reads).and_then(|n| crate::parse_uint(n.trim()))
     });
     let unpushed = pushed.flatten().unwrap_or(0);
     let main = main_ref(&root, reads);
     let landed = main.as_ref().map(|full| {
-        git_count(
-            &root,
-            &["rev-list", "--count", &format!("{full}..HEAD")],
-            reads,
-        )
-        .and_then(|n| crate::parse_uint(n.trim()))
+        let range = format!("{full}..HEAD");
+        let mut args = vec!["rev-list", "--count", range.as_str()];
+        if let Some(source) = source.as_deref() {
+            args.extend(["--not", source]);
+        }
+        git_count(&root, &args, reads).and_then(|n| crate::parse_uint(n.trim()))
     });
     let (unlanded, main_ref) = match (&main, landed) {
         (Some(full), Some(Some(n))) => (
@@ -1307,6 +1318,102 @@ fn repo_reads(
             }
         });
     Some(RepoRead::Found(work))
+}
+
+/// The fetched source of a Cargo-managed `git/checkouts/<package>/<short-sha>` snapshot.
+/// Cargo records it under `refs/commit/<sha>` in its configured local `git/db/<package>`
+/// origin, without remote-tracking refs in the checkout. That source history and the empty
+/// completion marker are not session work; edits, stashes and commits beyond it still are.
+fn cargo_source_baseline(
+    root: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+    reads: &Reads<'_>,
+) -> Option<String> {
+    let package = root.parent()?;
+    let checkouts = package.parent()?;
+    if checkouts.file_name()? != "checkouts" || checkouts.parent()?.file_name()? != "git" {
+        return None;
+    }
+    let short = root.file_name()?.to_str()?;
+    if !(7..=40).contains(&short.len()) || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let marker = std::fs::symlink_metadata(root.join(".cargo-ok")).ok()?;
+    if !marker.is_file() || marker.len() != 0 {
+        return None;
+    }
+    let raw = git_offline(root, &["remote", "get-url", "origin"], reads, None)?;
+    let raw = raw.trim_end_matches(['\n', '\r']);
+    let database = if let Some(encoded) = raw.strip_prefix("file://") {
+        // No authority, query, fragment, malformed escape or lossy path can prove a local DB.
+        if !encoded.starts_with('/') || encoded.starts_with("//") || encoded.contains(['?', '#']) {
+            return None;
+        }
+        let mut bytes = encoded.bytes();
+        let mut decoded = Vec::with_capacity(encoded.len());
+        while let Some(byte) = bytes.next() {
+            let byte = if byte == b'%' {
+                let (a, b) = (bytes.next()?, bytes.next()?);
+                if !a.is_ascii_hexdigit() || !b.is_ascii_hexdigit() {
+                    return None;
+                }
+                u8::try_from((char::from(a).to_digit(16)? << 4) | char::from(b).to_digit(16)?)
+                    .ok()?
+            } else {
+                byte
+            };
+            decoded.push(byte);
+        }
+        let decoded = String::from_utf8(decoded).ok()?;
+        if decoded.contains('\0') {
+            return None;
+        }
+        #[cfg(windows)]
+        let decoded = if matches!(decoded.as_bytes(), [b'/', drive, b':', ..] if drive.is_ascii_alphabetic())
+        {
+            decoded[1..].to_string()
+        } else {
+            decoded
+        };
+        PathBuf::from(decoded)
+    } else {
+        PathBuf::from(raw)
+    };
+    if !database.is_absolute()
+        || database.file_name()? != package.file_name()?
+        || database.parent()?.file_name()? != "db"
+        || database.parent()?.parent()?.file_name()? != "git"
+    {
+        return None;
+    }
+    let database = unattended_dir(&database, Some(reads.home), table)?;
+    let source = git_offline(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{short}^{{commit}}"),
+        ],
+        reads,
+        None,
+    )?;
+    let source = source.trim();
+    if !is_head(source) {
+        return None;
+    }
+    let pinned = git_offline(
+        &database,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/commit/{source}^{{commit}}"),
+        ],
+        reads,
+        None,
+    )?;
+    (pinned.trim() == source).then(|| source.to_string())
 }
 
 /// Whether the repository at `root` is on a branch with no commit yet: `HEAD` names a
@@ -1507,12 +1614,7 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
             meta.ctime_nsec()
         )
     };
-    let digest = |bytes: &[u8]| {
-        aterm_digest::Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
+    let digest = |bytes: &[u8]| aterm_uds::rand::hex_encode(&aterm_digest::Sha256::digest(bytes));
     let source = match source {
         Some(source) => source.to_path_buf(),
         None => {
@@ -1548,11 +1650,7 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
     content.update(meta.mtime().to_be_bytes());
     content.update(meta.mtime_nsec().to_be_bytes());
     content.update(&bytes);
-    let state: String = content
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let state = aterm_uds::rand::hex_encode(&content.finalize());
     let folder = private_index_folder()?;
     match aterm_uds::private_file::check_private_dir(&folder) {
         Ok(()) => {}
@@ -3247,124 +3345,13 @@ fn git_to_run(
 /// [`private_index`]'s seams for this thread's reads (tests): what runs between a copy's
 /// handing out and its status, and whether the last [`work_status`] was answered by a copy.
 #[cfg(all(test, unix))]
-pub(crate) mod index_seam {
-    use std::cell::{Cell, RefCell};
-    use std::path::Path;
-
-    /// What runs with a copy's path before its status.
-    type Hook = Box<dyn FnMut(&Path)>;
-
-    std::thread_local! {
-        static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
-        static ANSWERED: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    /// Until the guard it returns drops, `hook` runs with each copy's path before its status.
-    pub(crate) fn set_before_status(hook: impl FnMut(&Path) + 'static) -> Reset {
-        BEFORE.with(|b| *b.borrow_mut() = Some(Box::new(hook)));
-        Reset(())
-    }
-
-    /// Whether the last [`super::work_status`] on this thread was answered by a copy (`None`:
-    /// none has asked since the thread began).
-    pub(crate) fn copy_answered() -> Option<bool> {
-        ANSWERED.with(Cell::get)
-    }
-
-    /// No hook again once dropped.
-    pub(crate) struct Reset(());
-
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            BEFORE.with(|b| *b.borrow_mut() = None);
-        }
-    }
-
-    /// Run this thread's hook, if one is set, with the copy at `path`.
-    pub(super) fn before_status(path: &Path) {
-        let hook = BEFORE.with(|b| b.borrow_mut().take());
-        if let Some(mut hook) = hook {
-            hook(path);
-            BEFORE.with(|b| {
-                b.borrow_mut().get_or_insert(hook);
-            });
-        }
-    }
-
-    /// Note whether a copy answered this [`super::work_status`].
-    pub(super) fn answered(by_copy: bool) {
-        ANSWERED.with(|a| a.set(Some(by_copy)));
-    }
-}
+#[path = "repo_work_index_seam_tests.rs"]
+pub(crate) mod index_seam;
 
 /// A starved `git` for this thread's probes (tests).
 #[cfg(test)]
-pub(crate) mod read_stall {
-    use std::cell::Cell;
-    use std::time::Duration;
-
-    std::thread_local! {
-        static SKIP: Cell<u32> = const { Cell::new(0) };
-        static NEXT: Cell<u64> = const { Cell::new(0) };
-        static EVERY: Cell<u64> = const { Cell::new(0) };
-        static SPENT: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// The next read this thread starts is starved `ms` (0: none).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn set(ms: u64) {
-        set_after(0, ms);
-    }
-
-    /// Starve the read after `skip` reads, clearing the time already spent.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn set_after(skip: u32, ms: u64) {
-        SKIP.with(|k| k.set(skip));
-        NEXT.with(|n| n.set(ms));
-        EVERY.with(|e| e.set(0));
-        SPENT.with(|s| s.set(0));
-    }
-
-    /// Whether the read [`set_after`] named is still to come: a probe that returned with it pending
-    /// never reached it, so a probe told to starve any later read is this same uncut one.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn pending() -> bool {
-        NEXT.with(Cell::get) != 0
-    }
-
-    /// Starve every read this thread starts `ms`, clearing the time already spent.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn every(ms: u64) {
-        set_after(0, 0);
-        EVERY.with(|e| e.set(ms));
-    }
-
-    /// The time this thread's reads have lost so far: how far the probe's clock
-    /// runs ahead of the machine's, which every deadline is set on
-    /// ([`super::Reads::ended`]).
-    pub(super) fn lost() -> Duration {
-        Duration::from_millis(SPENT.with(Cell::get))
-    }
-
-    /// The time this thread's reads have lost so far, the read starting now included.
-    pub(super) fn spent() -> Duration {
-        let skipped = SKIP.with(|k| {
-            let left = k.get();
-            k.set(left.saturating_sub(1));
-            left > 0
-        });
-        let next = if skipped {
-            0
-        } else {
-            NEXT.with(|n| n.replace(0))
-        };
-        let next = next.saturating_add(EVERY.with(Cell::get));
-        SPENT.with(|s| {
-            s.set(s.get().saturating_add(next));
-            Duration::from_millis(s.get())
-        })
-    }
-}
+#[path = "repo_work_read_stall_tests.rs"]
+pub(crate) mod read_stall;
 
 /// This thread's reads answered from memory (tests), for a sweep that probes one repository it
 /// leaves as it is: while a [`read_memo::Memo`] is held, a read made again in the same folder with
@@ -3375,187 +3362,8 @@ pub(crate) mod read_stall {
 /// [`Reads::refused`]) and everything after it ([`Reads::ended`], the exit and the diagnostics)
 /// runs as for a read that starts its `git`.
 #[cfg(test)]
-pub(crate) mod read_memo {
-    use std::cell::{Cell, RefCell};
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::process::Output;
-
-    /// What a read's `git` is: its folder, arguments, global and offline settings, home,
-    /// `XDG_CONFIG_HOME`, the bytes fed to its standard input and the index it reads in place of
-    /// the repository's.
-    pub(super) type Key = (
-        PathBuf,
-        Vec<String>,
-        bool,
-        bool,
-        PathBuf,
-        Option<PathBuf>,
-        Option<Vec<u8>>,
-        Option<PathBuf>,
-    );
-
-    /// How a read meets this thread's memo.
-    pub(super) enum Read {
-        /// No [`Memo`] is held: the read starts its `git`.
-        Off,
-        /// A [`Memo`] is held but could not read back what the read feeds its `git`: the read
-        /// starts its `git`, is counted in [`Memo::missed`] and is not kept.
-        Unnamed,
-        /// A [`Memo`] is held and the read is this key.
-        Named(Key),
-    }
-
-    std::thread_local! {
-        static MEMORY: RefCell<Option<HashMap<Key, Output>>> = const { RefCell::new(None) };
-        static MISSED: Cell<u32> = const { Cell::new(0) };
-        static CHECKING: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Held, this thread's reads are memoized, from an empty memo; dropped, none is.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) struct Memo(());
-
-    /// Memoize this thread's reads until the [`Memo`] is dropped.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn on() -> Memo {
-        assert!(
-            MEMORY.with(|m| m.borrow().is_none()),
-            "a memo is already held on this thread"
-        );
-        MEMORY.with(|m| *m.borrow_mut() = Some(HashMap::new()));
-        MISSED.with(|s| s.set(0));
-        CHECKING.with(|c| c.set(false));
-        Memo(())
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    impl Memo {
-        /// The reads that came to this memo while it was held and that it could not answer, each
-        /// of which started its `git` (a read cut or refused before its start never comes to it).
-        pub(crate) fn missed(&self) -> u32 {
-            MISSED.with(Cell::get)
-        }
-
-        /// `run`'s value, with each read this memo answers during it also starting its `git`
-        /// again, whose output (exit status, standard output and standard error) must equal the
-        /// answer: a read whose answer differs, or whose `git` gives no output to compare,
-        /// panics naming its key.
-        pub(crate) fn checking<T>(&self, run: impl FnOnce() -> T) -> T {
-            struct Done;
-            impl Drop for Done {
-                fn drop(&mut self) {
-                    CHECKING.with(|c| c.set(false));
-                }
-            }
-            CHECKING.with(|c| c.set(true));
-            let _done = Done;
-            run()
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    impl Drop for Memo {
-        fn drop(&mut self) {
-            MEMORY.with(|m| *m.borrow_mut() = None);
-            CHECKING.with(|c| c.set(false));
-        }
-    }
-
-    /// How a read of `args` in `dir`, fed `feed` where given, meets this thread's memo.
-    pub(super) fn read(
-        dir: &Path,
-        args: &[&str],
-        reads: &super::Reads<'_>,
-        global: bool,
-        offline: bool,
-        feed: Option<&std::fs::File>,
-        index: Option<&Path>,
-    ) -> Read {
-        if MEMORY.with(|m| m.borrow().is_none()) {
-            return Read::Off;
-        }
-        let fed = match feed.map(fed) {
-            None => None,
-            Some(Some(bytes)) => Some(bytes),
-            Some(None) => return Read::Unnamed,
-        };
-        Read::Named((
-            dir.to_path_buf(),
-            args.iter().map(|a| (*a).to_string()).collect(),
-            global,
-            offline,
-            reads.home.to_path_buf(),
-            reads.xdg.map(Path::to_path_buf),
-            fed,
-            index.map(Path::to_path_buf),
-        ))
-    }
-
-    /// The whole of `file` from its start, read without moving its offset, so the `git` it feeds
-    /// still reads all of it; `None` where it cannot be read.
-    #[cfg(unix)]
-    pub(super) fn fed(file: &std::fs::File) -> Option<Vec<u8>> {
-        use std::os::unix::fs::FileExt as _;
-        let mut body = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            let at = u64::try_from(body.len()).ok()?;
-            let n = file.read_at(&mut chunk, at).ok()?;
-            if n == 0 {
-                return Some(body);
-            }
-            body.extend_from_slice(chunk.get(..n)?);
-        }
-    }
-
-    /// No read back here: a fed read is [`Read::Unnamed`].
-    #[cfg(not(unix))]
-    pub(super) fn fed(_: &std::fs::File) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// What the read gave before, where the memo holds it (each such answer checked against a
-    /// fresh `run` under [`Memo::checking`], and otherwise given without calling `run`); else
-    /// `run`'s output, which a [`Read::Named`] read keeps for the next read with the same key
-    /// where its `git` exited (one a signal ended is not kept).
-    pub(super) fn through<E: std::fmt::Debug>(
-        read: Read,
-        run: impl FnOnce() -> Result<Output, E>,
-    ) -> Result<Output, E> {
-        let key = match read {
-            Read::Off => return run(),
-            Read::Unnamed => {
-                MISSED.with(|s| s.set(s.get().saturating_add(1)));
-                return run();
-            }
-            Read::Named(key) => key,
-        };
-        let known = MEMORY.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned()));
-        if let Some(known) = known {
-            if CHECKING.with(Cell::get) {
-                match run() {
-                    Ok(again) => assert_eq!(
-                        again, known,
-                        "the memo's answer to {key:?} is what its git gives again"
-                    ),
-                    Err(e) => panic!("the memo's answer to {key:?}: its git gave no output: {e:?}"),
-                }
-            }
-            return Ok(known);
-        }
-        MISSED.with(|s| s.set(s.get().saturating_add(1)));
-        let output = run()?;
-        if output.status.code().is_some() {
-            MEMORY.with(|m| {
-                if let Some(m) = m.borrow_mut().as_mut() {
-                    m.insert(key, output.clone());
-                }
-            });
-        }
-        Ok(output)
-    }
-}
+#[path = "repo_work_read_memo_tests.rs"]
+pub(crate) mod read_memo;
 
 #[path = "repo_work_record.rs"]
 mod record;

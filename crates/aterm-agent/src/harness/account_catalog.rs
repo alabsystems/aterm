@@ -83,7 +83,57 @@ fn read_with(reader: Option<&Reader>, home: Option<&Path>) -> Option<Result<Cata
     (!absent).then(|| reader(home))?.transpose()
 }
 
+/// What this Mac holds, as a catalog row's `local` reads it: its roster, where one was read, and
+/// the address its default home's login file names now (`own`), which counts as this Mac's own
+/// login where no row lists it (`docs/DESIGN-account-discovery-2026-11-09.md`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Here<'a> {
+    pub roster: Option<&'a Roster>,
+    pub own: Option<&'a str>,
+}
+
 impl Catalog {
+    /// What `account` is on this Mac, as a person reads it: the roster row it is ([`Self::local_label`]),
+    /// else `this Mac's own login` where the default home's login names it, by the same unique
+    /// identity rule. `None` where this Mac holds it nowhere it can see.
+    pub(crate) fn local_words(&self, account: &Account, here: Here<'_>) -> Option<String> {
+        if let Some(label) = here
+            .roster
+            .and_then(|roster| self.local_label(account, roster))
+        {
+            return Some(label.to_owned());
+        }
+        let own = here.own?;
+        let listed = here
+            .roster
+            .is_some_and(|roster| roster.rows.iter().any(|row| row.matches_email(own)));
+        let unique = self.history_complete
+            && !account.conflicted
+            && !account.stopped
+            && account.indicates_account()
+            && account.cli() == Some(Cli::Claude)
+            && account.realm.is_none()
+            && account
+                .email
+                .as_deref()
+                .is_some_and(|email| accounts::email_matches(email, own))
+            && self
+                .rows
+                .iter()
+                .filter(|other| {
+                    other.indicates_account()
+                        && other.cli() == account.cli()
+                        && other.realm == account.realm
+                        && other
+                            .email
+                            .as_deref()
+                            .is_some_and(|other| accounts::email_matches(other, own))
+                })
+                .count()
+                == 1;
+        (unique && !listed).then(|| "this Mac's own login".to_owned())
+    }
+
     pub(crate) fn local_label<'a>(&self, account: &Account, roster: &'a Roster) -> Option<&'a str> {
         if !self.history_complete || !account.indicates_account() || account.cli().is_none() {
             return None;
@@ -175,24 +225,16 @@ impl Account {
     }
 }
 
-pub(crate) fn report(
-    catalog: &Result<Catalog, String>,
-    cli: Cli,
-    roster: Option<&Roster>,
-) -> Value {
-    report_rows(catalog, Some(cli), roster)
+pub(crate) fn report(catalog: &Result<Catalog, String>, cli: Cli, here: Here<'_>) -> Value {
+    report_rows(catalog, Some(cli), here)
 }
 
 /// The shared application includes every provider, including those with no local adapter.
 pub(crate) fn report_all(catalog: &Result<Catalog, String>) -> Value {
-    report_rows(catalog, None, None)
+    report_rows(catalog, None, Here::default())
 }
 
-fn report_rows(
-    catalog: &Result<Catalog, String>,
-    cli: Option<Cli>,
-    roster: Option<&Roster>,
-) -> Value {
+fn report_rows(catalog: &Result<Catalog, String>, cli: Option<Cli>, here: Here<'_>) -> Value {
     match catalog {
         Err(why) => json!({"state":"unavailable", "reason":why}),
         Ok(catalog) => json!({
@@ -204,7 +246,7 @@ fn report_rows(
                 "provider":row.provider, "method":row.method, "email":row.email,
                 "realm":row.realm, "secret_reference":row.secret_reference,
                 "native_capability":super::native_keys::capability(&row.provider,row.method.as_deref(),row.secret_reference),
-                "state":row.state(), "local_label":roster.and_then(|roster| catalog.local_label(row, roster)),
+                "state":row.state(), "local_label":catalog.local_words(row, here),
                 "preparation_reason":(row.state() == "unsupported-preparation").then_some(NAMED_BROWSER_UNSUPPORTED),
                 "login_authority":"none", "auth_details_pending":row.import.is_some(),
                 "origin":if row.import.is_some() { "import-candidate" } else { "proposal" },
@@ -219,31 +261,24 @@ fn report_rows(
     }
 }
 
-pub(crate) fn text(catalog: &Result<Catalog, String>, cli: Cli, roster: Option<&Roster>) -> String {
-    text_rows(catalog, Some(cli), roster)
+pub(crate) fn text(catalog: &Result<Catalog, String>, cli: Cli, here: Here<'_>) -> String {
+    text_rows(catalog, Some(cli), here)
 }
 
 pub(crate) fn text_all(catalog: &Result<Catalog, String>) -> String {
-    text_rows(catalog, None, None)
+    text_rows(catalog, None, Here::default())
 }
 
 /// A report's part of the catalog: the rows this Mac runs, each whose source is in question, and a
 /// count of the others, which `accounts table` lists. On a sheet of 83 rows, 80 of them other
 /// Macs', the listing made up most of the report and came after the answer.
-pub(crate) fn text_here(
-    catalog: &Result<Catalog, String>,
-    cli: Cli,
-    roster: Option<&Roster>,
-) -> String {
+pub(crate) fn text_here(catalog: &Result<Catalog, String>, cli: Cli, here: Here<'_>) -> String {
     let Ok(rows) = catalog else {
-        return text_rows(catalog, Some(cli), roster);
+        return text_rows(catalog, Some(cli), here);
     };
     let of_cli = rows.rows.iter().filter(|row| row.belongs_to(cli));
-    let (shown, others): (Vec<_>, Vec<_>) = of_cli.partition(|row| {
-        row.stopped
-            || row.conflicted
-            || roster.is_some_and(|roster| rows.local_label(row, roster).is_some())
-    });
+    let (shown, others): (Vec<_>, Vec<_>) = of_cli
+        .partition(|row| row.stopped || row.conflicted || rows.local_words(row, here).is_some());
     let mut out = header(rows);
     if !others.is_empty() {
         out.push_str(&format!(
@@ -254,7 +289,7 @@ pub(crate) fn text_here(
     }
     out.push('\n');
     for row in shown {
-        out.push_str(&row_line(rows, row, roster));
+        out.push_str(&row_line(rows, row, here));
     }
     out
 }
@@ -275,8 +310,8 @@ fn header(catalog: &Catalog) -> String {
     )
 }
 
-fn row_line(catalog: &Catalog, row: &Account, roster: Option<&Roster>) -> String {
-    let local = roster.and_then(|roster| catalog.local_label(row, roster));
+fn row_line(catalog: &Catalog, row: &Account, here: Here<'_>) -> String {
+    let local = catalog.local_words(row, here);
     format!(
         "  {}{} [{}]: {} {}; local {}\n",
         row.label,
@@ -287,15 +322,11 @@ fn row_line(catalog: &Catalog, row: &Account, roster: Option<&Roster>) -> String
         row.key,
         row.provider,
         row.state_words(),
-        local.unwrap_or("not configured")
+        local.as_deref().unwrap_or("not listed here")
     )
 }
 
-fn text_rows(
-    catalog: &Result<Catalog, String>,
-    cli: Option<Cli>,
-    roster: Option<&Roster>,
-) -> String {
+fn text_rows(catalog: &Result<Catalog, String>, cli: Option<Cli>, here: Here<'_>) -> String {
     match catalog {
         Err(why) => format!("Commons account catalog unavailable: {why}\n"),
         Ok(catalog) => {
@@ -306,7 +337,7 @@ fn text_rows(
                 .iter()
                 .filter(|row| cli.is_none_or(|cli| row.belongs_to(cli)))
             {
-                out.push_str(&row_line(catalog, row, roster));
+                out.push_str(&row_line(catalog, row, here));
             }
             out
         }
@@ -314,241 +345,5 @@ fn text_rows(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A HOME WITH NO SECRETS DIRECTORY KEEPS NO CATALOG, SO NO REPORT CALLS ONE UNAVAILABLE:
-    /// `read_with` gives `None` there, not the reader's error. CONTROL: once the directory is
-    /// there, the reader's error stands (a catalog set up and not read is unavailable), and with
-    /// no home known there is none either.
-    #[cfg(unix)]
-    #[test]
-    fn a_home_with_no_secrets_directory_keeps_no_catalog() {
-        let tmp = aterm_tempfile::tempdir().expect("a scratch home");
-        let home = tmp.path();
-        let reader: &Reader = &|_: &Path| Err("proposals: unreadable".to_owned());
-        assert_eq!(read_with(Some(reader), Some(home)), None);
-        let undeclared: &Reader = &|_: &Path| Ok(None);
-        let dir = aterm_secrets::client::Paths::for_home(home).dir;
-        std::fs::create_dir_all(&dir).expect("the secrets directory");
-        assert_eq!(
-            read_with(Some(reader), Some(home)),
-            Some(Err("proposals: unreadable".to_owned())),
-            "CONTROL: a catalog set up and not read is unavailable"
-        );
-        assert_eq!(
-            read_with(Some(undeclared), Some(home)),
-            None,
-            "a catalog table nobody declared is no failure to read one"
-        );
-        assert_eq!(read_with(Some(reader), None), None, "CONTROL: no home");
-    }
-
-    pub(super) fn account() -> Account {
-        Account {
-            key: "account-one".into(),
-            operation: "operation-one".into(),
-            label: "Shared one".into(),
-            provider: "anthropic".into(),
-            method: Some("oauth".into()),
-            email: Some("one@example.test".into()),
-            realm: None,
-            secret_reference: true,
-            required_browser: false,
-            conflicted: false,
-            stopped: false,
-            import: None,
-            import_link: None,
-        }
-    }
-
-    #[test]
-    fn a_shared_description_never_grants_login_authority() {
-        let catalog = Ok(Catalog {
-            table: "shared-table".into(),
-            history_complete: true,
-            rows: vec![account()],
-            ..Default::default()
-        });
-        let value = report(&catalog, Cli::Claude, Some(&Roster::default()));
-        assert_eq!(value["accounts"][0]["key"].as_str(), Some("account-one"));
-        assert_eq!(value["accounts"][0]["local_label"], Value::Null);
-        assert_eq!(
-            value["accounts"][0]["login_authority"].as_str(),
-            Some("none")
-        );
-        assert!(value["accounts"][0]["secret_reference"].as_bool().unwrap());
-        assert_eq!(Roster::default().rows.len(), 0);
-    }
-
-    #[test]
-    fn an_unsupported_profile_is_explicit_without_granting_authority() {
-        let mut row = account();
-        row.required_browser = true;
-        let catalog = Ok(Catalog {
-            rows: vec![row],
-            history_complete: true,
-            ..Default::default()
-        });
-        let report = report_all(&catalog);
-        assert_eq!(
-            report["accounts"][0]["state"].as_str(),
-            Some("unsupported-preparation")
-        );
-        assert_eq!(
-            report["accounts"][0]["preparation_reason"].as_str(),
-            Some(NAMED_BROWSER_UNSUPPORTED)
-        );
-        assert_eq!(
-            report["accounts"][0]["login_authority"].as_str(),
-            Some("none")
-        );
-        assert!(text_all(&catalog).contains(NAMED_BROWSER_UNSUPPORTED));
-    }
-
-    /// A REPORT LISTS THIS MAC'S ROWS AND COUNTS THE REST, and keeps a row whose source is in
-    /// question, which no count would show. CONTROLS: `text`, the `accounts table` listing, still
-    /// has every row, and another CLI's row is neither listed nor counted.
-    #[test]
-    fn a_report_lists_this_macs_rows_and_counts_the_rest() {
-        let with = |label: &str, provider: &str| Account {
-            label: label.into(),
-            provider: provider.into(),
-            email: Some(format!("{label}@example.test")),
-            ..account()
-        };
-        let mut questioned = with("questioned", "anthropic");
-        questioned.conflicted = true;
-        let catalog = Ok(Catalog {
-            table: "table".into(),
-            history_complete: true,
-            rows: vec![
-                with("mine", "anthropic"),
-                with("theirs", "anthropic"),
-                with("further", "anthropic"),
-                questioned,
-                with("codexrow", "openai"),
-            ],
-            ..Default::default()
-        });
-        let roster = Roster {
-            rows: vec![accounts::Row {
-                label: "local".into(),
-                email: Some("mine@example.test".into()),
-                ..Default::default()
-            }],
-        };
-        let here = text_here(&catalog, Cli::Claude, Some(&roster));
-        assert!(
-            here.contains("2 of its 4 rows are not on this Mac"),
-            "{here}"
-        );
-        assert!(here.contains("<mine@example.test>"), "{here}");
-        assert!(here.contains("local local"), "{here}");
-        assert!(here.contains("<questioned@example.test>"), "{here}");
-        assert!(
-            !here.contains("theirs@") && !here.contains("further@"),
-            "{here}"
-        );
-        assert!(!here.contains("codexrow@"), "{here}");
-        let all = text(&catalog, Cli::Claude, Some(&roster));
-        for label in ["mine", "theirs", "further", "questioned"] {
-            assert!(all.contains(&format!("<{label}@example.test>")), "{all}");
-        }
-        assert!(
-            text_here(&catalog, Cli::Claude, None).contains("3 of its 4 rows"),
-            "with no roster only the questioned row stays"
-        );
-        let unavailable = Err("unreadable".to_owned());
-        assert_eq!(
-            text_here(&unavailable, Cli::Claude, None),
-            text(&unavailable, Cli::Claude, None)
-        );
-    }
-
-    #[test]
-    fn only_a_unique_matching_local_identity_supplies_display_facts() {
-        let mut roster = Roster {
-            rows: vec![accounts::Row {
-                label: "local".into(),
-                email: account().email,
-                ..Default::default()
-            }],
-        };
-        assert_eq!(account().local_label(&roster), Some("local"));
-        roster.rows.push(roster.rows[0].clone());
-        assert_eq!(account().local_label(&roster), None);
-        roster.rows.pop();
-        let mut changed = account();
-        changed.conflicted = true;
-        assert_eq!(changed.local_label(&roster), None);
-        changed.conflicted = false;
-        changed.realm = Some("mainland-cn".into());
-        assert_eq!(changed.local_label(&roster), None);
-        roster.rows[0].held_by = Some("other-mac".into());
-        assert_eq!(account().local_label(&roster), None);
-        roster.rows[0].held_by = None;
-        roster.rows[0].email = None;
-        roster.rows[0].identity_email = account().email;
-        assert_eq!(account().local_label(&roster), Some("local"));
-    }
-
-    #[test]
-    fn incomplete_or_duplicate_shared_identity_withholds_local_status() {
-        let roster = Roster {
-            rows: vec![accounts::Row {
-                label: "local".into(),
-                email: account().email,
-                ..Default::default()
-            }],
-        };
-        let mut catalog = Catalog {
-            table: "table".into(),
-            history_complete: true,
-            rows: vec![account()],
-            ..Default::default()
-        };
-        assert_eq!(
-            catalog.local_label(&catalog.rows[0], &roster),
-            Some("local")
-        );
-        catalog.history_complete = false;
-        assert_eq!(catalog.local_label(&catalog.rows[0], &roster), None);
-        catalog.history_complete = true;
-        let mut duplicate = account();
-        duplicate.key = "another".into();
-        duplicate.provider = "claude".into();
-        catalog.rows.push(duplicate);
-        assert_eq!(catalog.local_label(&catalog.rows[0], &roster), None);
-    }
-
-    #[test]
-    fn imported_markers_remain_distinct_and_authentication_is_unspecified() {
-        let mut row = account();
-        row.provider = "google".into();
-        row.method = None;
-        row.import = Some(ImportOrigin {
-            table: "imports".into(),
-            source: "source-one".into(),
-            record: 9,
-            provider_column: Some(4),
-            presence: Some(false),
-            machine_hint: Some("m3.2".into()),
-            unclassified_columns: vec![7],
-        });
-        let catalog = Ok(Catalog {
-            rows: vec![row],
-            history_complete: true,
-            ..Default::default()
-        });
-        let report = report_all(&catalog);
-        assert_eq!(report["accounts"].as_array().unwrap().len(), 1);
-        let row = &report["accounts"][0];
-        assert_eq!(row["provider"].as_str(), Some("google"));
-        assert_eq!(row["state"].as_str(), Some("not-indicated"));
-        assert_eq!(row["method"], Value::Null);
-        assert_eq!(row["import"]["presence_marker"].as_bool(), Some(false));
-        assert_eq!(row["import"]["record"].as_u64(), Some(9));
-        assert_eq!(row["login_authority"].as_str(), Some("none"));
-    }
-}
+#[path = "account_catalog_tests.rs"]
+mod tests;

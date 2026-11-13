@@ -155,6 +155,8 @@ pub(crate) const TITLE: &str = "Rename This Mac";
 /// Save (Return), or Retry Sync for pending publication, and Cancel (Escape).
 pub(crate) const BUTTONS: [&str; 2] = ["Save", "Cancel"];
 
+pub(crate) const AUTHORIZE_NAMING: &str = "Authorize Naming\u{2026}";
+
 #[derive(Debug)]
 pub(crate) struct PanelRead {
     preview: RenamePreview,
@@ -173,6 +175,27 @@ pub(crate) enum Snapshot {
 }
 
 impl Snapshot {
+    /// The separate permission option belongs only to the saved choice, never a draft.
+    pub(crate) fn authorization_unknown(&self, held: &Held) -> bool {
+        let Self::Read(read) = self else {
+            return false;
+        };
+        held.read
+            && !held.waits
+            && read.preview.name().name() == held.name
+            && read.preview.name().num.is_some()
+            && read.preview.name().class == aterm_types::machine_name::Class::Chosen
+            && read
+                .naming
+                .as_ref()
+                .is_some_and(NamingStatus::authorization_unknown)
+    }
+
+    fn authorize_saved(&self, held: &Held, number: &Field, nick: &Field) -> Option<RenameTo> {
+        (self.authorization_unknown(held) && number.typed().is_none() && nick.typed().is_none())
+            .then_some(RenameTo::Authorize)
+    }
+
     pub(crate) fn named(preview: RenamePreview, naming: NamingStatus) -> Self {
         Self::Read(Box::new(PanelRead {
             preview,
@@ -273,21 +296,37 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
     })
 }
 
-/// The line for the fields `number` and `nick` judged against `held` over `snapshot`: a field's
-/// refusal, the number's verdict as [`RenamePreview::judge`] gives it, and that another Mac
-/// carries the name too (information only: two Macs may share one, §5.4). Before the read
-/// lands, when it failed, and for a number whose vault labels it could not read, Rename stays
-/// available, since the set checks the number itself, and the line names nothing of the window's
-/// view, which the read may outdate.
+/// Judge the fields `number` and `nick` against `held` and `snapshot`: field refusals,
+/// the number's verdict from [`RenamePreview::judge`], and a requested nickname already held
+/// by another node. An unread snapshot leaves Save available; the canonical writer rechecks
+/// both fields. The text uses no window state that the snapshot may have outdated.
 pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field) -> Line {
+    // Keep the observed names visible while an edit is incomplete or refused. Only a
+    // valid edit changes the generated preview; invalid text keeps the saved target.
+    let present =
+        |text: String, renames, expected: Option<&aterm_types::machine_name::GeneratedNames>| {
+            let text = match snapshot {
+                Snapshot::Read(read) if let Some(status) = &read.naming => {
+                    let names = match expected {
+                        Some(expected) => status.text_for(Some(expected), &held.name),
+                        None => status.text(&held.name),
+                    };
+                    let draft = if snapshot.authorization_unknown(held)
+                        && (number.typed().is_some() || nick.typed().is_some())
+                    {
+                        "\nSave or revert your edits before authorizing naming."
+                    } else {
+                        ""
+                    };
+                    format!("{names}{draft}\n\n{text}")
+                }
+                _ => text,
+            };
+            Line { text, renames }
+        };
     let to = match request(snapshot, held, number, nick) {
         Ok(to) => to,
-        Err(why) => {
-            return Line {
-                text: why,
-                renames: false,
-            };
-        }
+        Err(why) => return present(why, false, None),
     };
     let preview = match snapshot {
         Snapshot::Read(read) => Some(&read.preview),
@@ -317,13 +356,14 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
     if let Some(nick) = requested_nick
         && preview.is_some_and(|preview| preview.shared(nick))
     {
-        return Line {
-            text: format!(
+        return present(
+            format!(
                 "The name {} is already used by another machine.",
                 nick.as_str()
             ),
-            renames: false,
-        };
+            false,
+            expected.as_ref(),
+        );
     }
     let (text, renames) = match to {
         RenameTo::Keep => (
@@ -409,17 +449,7 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
             true,
         ),
     };
-    let text = match snapshot {
-        Snapshot::Read(read) if let Some(status) = &read.naming => {
-            let names = match expected.as_ref() {
-                Some(expected) => status.text_for(Some(expected), &held.name),
-                None => status.text(&held.name),
-            };
-            format!("{names}\n\n{text}")
-        }
-        _ => text,
-    };
-    Line { text, renames }
+    present(text, renames, expected.as_ref())
 }
 
 pub(crate) fn request(
@@ -481,6 +511,24 @@ fn keep_discovery(
     true
 }
 
+fn keep_diagnostics(
+    slot: &mut Option<(u64, Snapshot)>,
+    press: u64,
+    status: Result<NamingStatus, String>,
+) -> bool {
+    let Some((at, Snapshot::Read(read))) = slot else {
+        return false;
+    };
+    if *at != press {
+        return false;
+    }
+    let Some(naming) = &mut read.naming else {
+        return false;
+    };
+    naming.diagnosed(status);
+    true
+}
+
 /// End press `press` in `slot`: a later press's snapshot stays.
 fn close(slot: &mut Option<(u64, Snapshot)>, press: u64) {
     if slot.as_ref().is_some_and(|(at, _)| *at == press) {
@@ -488,7 +536,7 @@ fn close(slot: &mut Option<(u64, Snapshot)>, press: u64) {
     }
 }
 
-pub(crate) use macos::{Answer, ask, begin, deliver, deliver_discovery, end};
+pub(crate) use macos::{Answer, ask, begin, deliver, deliver_diagnostics, deliver_discovery, end};
 
 #[cfg(test)]
 mod tests;
@@ -498,7 +546,7 @@ mod macos {
 
     use aterm_objc::{CGPoint, CGRect, CGSize, Id, Obj, class, sel};
 
-    use super::{BUTTONS, Field, Held, Line, Snapshot, close, keep_read, line};
+    use super::{BUTTONS, Field, Held, Line, NamingStatus, Snapshot, close, keep_read, line};
     use crate::appkit::{self, MainThread};
     use crate::machine_title::MachineView;
 
@@ -543,6 +591,7 @@ mod macos {
         nick_label: Obj,
         line_height: Cell<f64>,
         rename: Obj,
+        authorize: Obj,
     }
 
     impl Open {
@@ -619,6 +668,12 @@ mod macos {
         }
     }
 
+    pub(crate) fn deliver_diagnostics(press: u64, status: Result<NamingStatus, String>) {
+        if SNAPSHOT.with_borrow_mut(|slot| super::keep_diagnostics(slot, press, status)) {
+            refresh();
+        }
+    }
+
     /// The name press `press`'s fields are judged against: its read's once that has landed, else
     /// the window's `view`.
     fn held_for(press: u64, view: &MachineView) -> Held {
@@ -687,14 +742,35 @@ mod macos {
             let Some(button) = appkit::nsstring(primary) else {
                 return;
             };
+            let (authorization_unknown, authorize_saved) =
+                SNAPSHOT.with_borrow(|held| match held {
+                    Some((at, snapshot)) if *at == open.press => (
+                        snapshot.authorization_unknown(&open.held),
+                        snapshot
+                            .authorize_saved(&open.held, &number, &nick)
+                            .is_some(),
+                    ),
+                    _ => (false, false),
+                });
             // SAFETY: `-setStringValue:` is `-(void)(NSString *)` and copies its argument;
             // `-setTitle:` copies its NSString and `-setEnabled:` is `-(void)(BOOL)`; all on live views the alert holds, on the main
             // thread.
             unsafe {
+                let visibility_changed =
+                    appkit::send_bool(open.authorize.id(), sel!(isHidden)) == authorization_unknown;
                 appkit::send_v_id(open.line.id(), sel!(setStringValue:), words.id());
                 appkit::send_v_bool(open.rename.id(), sel!(setEnabled:), renames);
                 appkit::send_v_id(open.rename.id(), sel!(setTitle:), button.id());
+                appkit::send_v_bool(
+                    open.authorize.id(),
+                    sel!(setHidden:),
+                    !authorization_unknown,
+                );
+                appkit::send_v_bool(open.authorize.id(), sel!(setEnabled:), authorize_saved);
                 fit_status(open);
+                if visibility_changed {
+                    appkit::send_v(open.alert.id(), sel!(layout));
+                }
             }
         });
     }
@@ -721,6 +797,20 @@ mod macos {
             }
             let document = (measured.ceil() + 4.0).max(LINE_MIN);
             let shown = document.min(LINE_MAX);
+            let clip = appkit::send_id(open.scroll.id(), sel!(contentView));
+            let flipped = appkit::send_bool(open.line.id(), sel!(isFlipped));
+            let from_top = if clip.is_null() {
+                0.0
+            } else {
+                let visible = appkit::send_rect(clip, sel!(bounds));
+                if flipped {
+                    visible.origin.y
+                } else {
+                    appkit::send_rect(open.line.id(), sel!(bounds)).size.height
+                        - visible.origin.y
+                        - visible.size.height
+                }
+            };
             appkit::send_v_rect(
                 open.line.id(),
                 sel!(setFrame:),
@@ -731,13 +821,12 @@ mod macos {
                 sel!(setFrame:),
                 rect(0.0, 0.0, WIDTH, shown),
             );
-            let clip = appkit::send_id(open.scroll.id(), sel!(contentView));
             if !clip.is_null() {
-                let y = if appkit::send_bool(open.line.id(), sel!(isFlipped)) {
-                    0.0
-                } else {
-                    (document - shown).max(0.0)
-                };
+                // Keep the same distance from the document's top as late facts or edits
+                // change its height. A newly opened, unscrollable document starts at its top.
+                let extent = (document - shown).max(0.0);
+                let offset = from_top.max(0.0).min(extent);
+                let y = if flipped { offset } else { extent - offset };
                 appkit::send_v_point(clip, sel!(scrollToPoint:), CGPoint { x: 0.0, y });
                 appkit::send_v_id(open.scroll.id(), sel!(reflectScrolledClipView:), clip);
             }
@@ -872,11 +961,12 @@ mod macos {
         let number = Field::open(number, held.number_text());
         let nick = Field::open(nick, &held.word);
         let [rename, cancel] = BUTTONS;
-        let (Some(title), Some(body), Some(rename), Some(cancel)) = (
+        let (Some(title), Some(body), Some(rename), Some(cancel), Some(authorize)) = (
             appkit::nsstring(title),
             appkit::nsstring(body),
             appkit::nsstring(rename),
             appkit::nsstring(cancel),
+            appkit::nsstring(super::AUTHORIZE_NAMING),
         ) else {
             // Foundation refused a string, so no alert can be built.
             return None;
@@ -975,6 +1065,13 @@ mod macos {
                 sel!(addButtonWithTitle:),
                 cancel.id(),
             ));
+            let authorize = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                authorize.id(),
+            ))?;
+            appkit::send_v_bool(authorize.id(), sel!(setHidden:), true);
+            appkit::send_v_bool(authorize.id(), sel!(setEnabled:), false);
             appkit::send_v(alert.id(), sel!(layout));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
             if let Some(panel) = &panel {
@@ -1000,6 +1097,7 @@ mod macos {
                     nick_label: nick_label.clone_retained(),
                     line_height: Cell::new(LINE_MIN),
                     rename: accept.clone_retained(),
+                    authorize: authorize.clone_retained(),
                 }));
                 Opened
             });
@@ -1024,6 +1122,27 @@ mod macos {
                 appkit::send_v_id(field.id(), sel!(setDelegate:), Id::NIL);
             }
             drop(target);
+            // The third button is permission-only. Read its eligibility again, and
+            // return no typed fields or captured name across the authorization tab.
+            if response == crate::appkit::consts::NS_ALERT_FIRST_BUTTON_RETURN + 2 {
+                let requested = OPEN.with_borrow(|open| {
+                    let open = open.as_ref()?;
+                    let (number, nick) = open.fields();
+                    SNAPSHOT.with_borrow(|snapshot| match snapshot {
+                        Some((at, snapshot)) if *at == open.press => {
+                            snapshot.authorize_saved(&open.held, &number, &nick)
+                        }
+                        _ => None,
+                    })
+                });
+                return Some(
+                    requested.map_or(Answer::Cancel, |requested| Answer::Rename {
+                        number: None,
+                        nick: None,
+                        requested: Ok(requested),
+                    }),
+                );
+            }
             // Rename stands for what the fields hold as the alert ends; with no Rename button
             // added (`accept` nil) nothing was open, and nothing could have pressed it.
             let renamed = (response == crate::appkit::consts::NS_ALERT_FIRST_BUTTON_RETURN)

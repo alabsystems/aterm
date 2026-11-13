@@ -45,7 +45,7 @@ fn click_fact(app: &mut App, wid: WindowId, fact: Fact) {
 }
 
 /// Name the program of `session`'s foreground group, `PGID`: only Claude Code's model and
-/// effort a click switches (`crate::claude_facts`' `App::model_switch`).
+/// effort a click opens a card for (`crate::claude_facts`' `App::session_picks`).
 fn set_program(app: &App, session: u64, program: &str) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -142,8 +142,12 @@ fn the_spans_land_on_the_written_tail_edit() {
     assert_eq!(app.windows[&wid].claude_lights.fact_hits.len(), SET.len());
 }
 
+/// THE BRANCH TAKES NO CLICK, AND ITS STUB'S CLICK SHOWS IT: a click on `⎇ main` hides nothing,
+/// opens nothing and reaches no program, and the pointer on it is the arrow over an unlit fact;
+/// hidden behind its greyed `off`, it lights under the pointer in the glass's one hover and a
+/// click shows it again.
 #[test]
-fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
+fn a_click_on_the_branch_does_nothing_and_a_click_on_its_stub_brings_it_back() {
     let (mut app, wid, session, mut reader) = app();
     publish_facts(&app, session);
     draw_bottom(&app, session, PLAN, Some(244));
@@ -158,7 +162,23 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     );
 
     click_fact(&mut app, wid, Fact::Branch);
-    assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
+    assert_eq!(app.fact_mask(session), FactMask::default(), "hides nothing");
+    assert!(app.autopilot_menu.is_none(), "opens nothing");
+    assert!(
+        !app.windows[&wid].hover_pointer,
+        "the arrow: nothing to click"
+    );
+    frame(&mut app, wid);
+    let shown = fact_hit(&app, wid, Fact::Branch);
+    assert!(
+        app.windows[&wid].input_scratch.cells[row][shown.cols.0..shown.cols.1]
+            .iter()
+            .all(|c| c.underline == UnderlineStyle::None),
+        "and no hover paint under the pointer"
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
+    // Hidden, as a program whose own line prints it starts with it.
+    app.set_fact_mask(session, mask(&[FactKind::Branch]));
     frame(&mut app, wid);
     let text = row_text(&app, wid, row);
     assert!(text.contains("\u{2387} main off"), "{text:?}");
@@ -177,11 +197,20 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
         app.windows[&wid].input_scratch.cells[row][fact_hit(&app, wid, Fact::Path).cols.1 - 1];
     assert!(!value.bold, "a value is terminal text, regular");
     assert_ne!(value.fg, rule_cell.fg, "CONTROL: and lifted from the gray");
+    let (x, y) = px_of(&app, wid, (row, stub.cols.0));
+    app.on_cursor_moved(wid, x, y);
+    assert!(
+        app.windows[&wid].hover_pointer,
+        "a hand: the stub's click shows"
+    );
+    frame(&mut app, wid);
     let lit = o(&app);
+    let lit_ink = lit_ink(&app, wid);
+    assert_ne!(lit_ink, quiet_ink(&app, wid), "CONTROL: lit is not quiet");
     assert_eq!(
-        (lit.fg, lit.underline),
-        (value.fg, UnderlineStyle::Single),
-        "the hovered stub is lit"
+        (lit.fg, lit.underline, lit.underline_color, lit.bold),
+        (lit_ink, UnderlineStyle::Single, Some(lit_ink), false),
+        "the hovered stub wears the one hover"
     );
     let (x, y) = px_of(&app, wid, (row, 2));
     app.on_cursor_moved(wid, x, y);
@@ -247,8 +276,9 @@ fn plan_with_indicator(app: &App, session: u64) -> String {
     format!("{PLAN}{}{end}", " ".repeat(pad))
 }
 
+/// THE CONTEXT TAKES NO CLICK, AND ITS STUB'S CLICK SHOWS IT, as the branch.
 #[test]
-fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() {
+fn a_click_on_the_context_does_nothing_and_a_click_on_its_stub_brings_it_back() {
     let (mut app, wid, session, mut reader) = wide_app();
     publish_with_context(&app, session);
     let mode = plan_with_indicator(&app, session);
@@ -280,7 +310,13 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
     );
 
     click_fact(&mut app, wid, Fact::Context);
-    assert_eq!(app.fact_mask(session), mask(&[FactKind::Context]));
+    assert_eq!(app.fact_mask(session), FactMask::default(), "hides nothing");
+    assert!(app.autopilot_menu.is_none(), "opens nothing");
+    assert!(
+        !app.windows[&wid].hover_pointer,
+        "the arrow: nothing to click"
+    );
+    app.set_fact_mask(session, mask(&[FactKind::Context]));
     let (x, y) = px_of(&app, wid, (row, 2));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
@@ -309,8 +345,11 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
     assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
 }
 
+/// A CLICK HIDES NO FACT OF A CLAUDE CODE SESSION, AND EACH STUB SHOWS ITS OWN: the model and
+/// the effort open their cards, the folder and the branch take no click, and a click on a
+/// hidden fact's stub shows that fact alone.
 #[test]
-fn each_fact_hides_alone_and_each_stub_shows_its_own() {
+fn a_click_hides_no_fact_and_each_stub_shows_its_own() {
     let (mut app, wid, session, _reader) = app();
     publish_facts(&app, session);
     set_program(&app, session, "claude");
@@ -319,20 +358,31 @@ fn each_fact_hides_alone_and_each_stub_shows_its_own() {
     let row = footer_row(&app, wid);
     for fact in [Fact::Model, Fact::Effort] {
         click_fact(&mut app, wid, fact);
+        assert_eq!(
+            app.autopilot_menu.as_ref().map(|m| m.owner),
+            Some(crate::autopilot_menu::MenuOwner::Fact(fact)),
+            "{fact:?}: a click opens its card"
+        );
         app.close_autopilot_menu();
         assert_eq!(
             app.fact_mask(session),
             FactMask::default(),
-            "{fact:?}: a click switches the model, it hides nothing"
+            "{fact:?}: and hides nothing"
         );
     }
     frame(&mut app, wid);
     assert!(row_text(&app, wid, row).contains("\u{25C6} Opus 5.5 xhigh"));
-    click_fact(&mut app, wid, Fact::Path);
+    for fact in [Fact::Path, Fact::Branch] {
+        click_fact(&mut app, wid, fact);
+        assert_eq!(
+            (app.fact_mask(session), app.autopilot_menu.is_none()),
+            (FactMask::default(), true),
+            "{fact:?}: a click does nothing"
+        );
+    }
+    app.set_fact_mask(session, mask(&[FactKind::Path, FactKind::Branch]));
     frame(&mut app, wid);
     assert!(row_text(&app, wid, row).contains("\u{2302} ~/aterm off"));
-    click_fact(&mut app, wid, Fact::Branch);
-    frame(&mut app, wid);
     assert_eq!(
         (
             fact_hit(&app, wid, Fact::Path).restores,
@@ -348,16 +398,17 @@ fn each_fact_hides_alone_and_each_stub_shows_its_own() {
 
 /// WHERE NOTHING TYPES `/model`, A CLICK HIDES THE MODEL AND ITS EFFORT: aterm types into Claude
 /// Code alone, so another program's model and effort keep the click that hides them, their
-/// titles say so, their menus offer no switch, and nothing reaches the program. Control: the
-/// same pane named Claude Code switches and hides nothing.
+/// titles say so, their cards offer no choice and no slider, and nothing reaches the program.
+/// Control: the same pane named Claude Code opens the model's choices and hides nothing.
 #[test]
-fn a_model_click_hides_it_where_no_claude_code_takes_the_switch() {
+fn a_model_click_hides_it_where_no_claude_code_takes_the_choice() {
     let (mut app, wid, session, mut reader) = app();
     publish_facts(&app, session);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
-    assert_eq!(app.model_switch(session), None);
-    assert_eq!(app.switch_plan(session), None);
+    assert!(!app.session_picks(session));
+    assert_eq!(app.model_picks(session), None);
+    assert_eq!(app.effort_stops(session), None);
     assert_eq!(app.fact_title(session, Fact::Model).1, "click: hide");
     click_fact(&mut app, wid, Fact::Model);
     assert_eq!(app.fact_mask(session), mask(&[FactKind::Model]));
@@ -367,32 +418,100 @@ fn a_model_click_hides_it_where_no_claude_code_takes_the_switch() {
         mask(&[FactKind::Model, FactKind::Effort])
     );
     assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
+    assert!(app.autopilot_menu.is_none(), "no card opened");
     app.set_fact_mask(session, FactMask::default());
+    frame(&mut app, wid);
+    let hit = fact_hit(&app, wid, Fact::Model);
+    app.open_fact_menu(
+        wid,
+        session,
+        Fact::Model,
+        (hit.frame_row, hit.cols.0),
+        false,
+    );
+    let offers: Vec<String> = app
+        .autopilot_menu
+        .as_ref()
+        .expect("the model's card")
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            crate::autopilot_menu::MenuRow::Item { act, .. } => Some(act.key()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offers,
+        ["fact-menu/model/hide/model"],
+        "its card hides and shows, and offers no model"
+    );
+    app.close_autopilot_menu();
     set_program(&app, session, "claude");
     frame(&mut app, wid);
-    assert!(
-        app.model_switch(session).is_some(),
-        "control: Claude Code switches"
-    );
+    assert!(app.session_picks(session), "control: Claude Code");
     assert_eq!(
         app.fact_title(session, Fact::Model).1,
-        "click: back to the default model at auto effort"
+        "click: choose model"
     );
+    click_fact(&mut app, wid, Fact::Model);
+    assert_eq!(
+        app.fact_mask(session),
+        FactMask::default(),
+        "nothing hidden"
+    );
+    let offers: Vec<String> = app
+        .autopilot_menu
+        .as_ref()
+        .expect("control: the click opens the model's card")
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            crate::autopilot_menu::MenuRow::Item { act, .. } => Some(act.key()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offers,
+        [
+            "fact-menu/model/set-model/fable",
+            "fact-menu/model/set-model/opus"
+        ]
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "the click typed nothing");
 }
 
+/// THE POINTER IS A HAND ONLY OVER A FACT A CLICK ACTS ON: over the model (its click hides it
+/// here, opens its card in Claude Code) the hand; over the folder, whose click does nothing, the
+/// arrow, though the pointer still reads its title; off the facts, the arrow and no reading.
 #[test]
-fn the_pointer_is_a_hand_over_a_fact_and_not_off_it() {
+fn the_pointer_is_a_hand_over_a_fact_a_click_acts_on_and_not_off_it() {
     let (mut app, wid, session, _reader) = app();
     publish_facts(&app, session);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
-    let path = fact_hit(&app, wid, Fact::Path);
-    let (x, y) = px_of(&app, wid, (path.frame_row, path.cols.0 + 2));
+    let model = fact_hit(&app, wid, Fact::Model);
+    let (x, y) = px_of(&app, wid, (model.frame_row, model.cols.0 + 2));
     app.on_cursor_moved(wid, x, y);
     assert!(app.windows[&wid].hover_pointer, "a hand");
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Path)))
+        Some((session, Target::Fact(Fact::Model)))
+    );
+    let path = fact_hit(&app, wid, Fact::Path);
+    let (x, y) = px_of(&app, wid, (path.frame_row, path.cols.0 + 2));
+    app.on_cursor_moved(wid, x, y);
+    assert!(!app.windows[&wid].hover_pointer, "the arrow: no click here");
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Path))),
+        "its title is still read"
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .lit_fact(session, FactMask::default()),
+        None,
+        "and nothing lights"
     );
     let (x, y) = px_of(&app, wid, (path.frame_row, 2));
     app.on_cursor_moved(wid, x, y);
@@ -412,8 +531,8 @@ fn hovering_a_fact_moves_no_fact() {
         row_text(&app, wid, row),
         app.windows[&wid].claude_lights.fact_hits.clone(),
     );
-    let branch = fact_hit(&app, wid, Fact::Branch);
-    let (x, y) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    let model = fact_hit(&app, wid, Fact::Model);
+    let (x, y) = px_of(&app, wid, (model.frame_row, model.cols.0));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
     let after = (
@@ -421,15 +540,48 @@ fn hovering_a_fact_moves_no_fact() {
         app.windows[&wid].claude_lights.fact_hits.clone(),
     );
     assert_eq!(after, before, "no fact moved");
-    let lit = |fact| {
-        let hit = fact_hit(&app, wid, fact);
+    // Lit: every cell of the fact's hit, its blanks too, under one line in the lit ink, each
+    // glyph in that ink whatever it rests in, and no weight changed.
+    let ink = lit_ink(&app, wid);
+    let lit = |app: &App, fact| {
+        let hit = fact_hit(app, wid, fact);
         app.windows[&wid].input_scratch.cells[row][hit.cols.0..hit.cols.1]
             .iter()
-            .filter(|c| c.ch != ' ')
-            .all(|c| c.underline == UnderlineStyle::Single)
+            .all(|c| {
+                (c.underline, c.underline_color) == (UnderlineStyle::Single, Some(ink))
+                    && (c.ch == ' ' || c.fg == ink)
+                    && !c.bold
+            })
     };
-    assert!(lit(Fact::Branch), "the hovered fact is lit");
-    assert!(!lit(Fact::Path) && !lit(Fact::Model), "no other");
+    let plain = |app: &App, fact| {
+        let hit = fact_hit(app, wid, fact);
+        app.windows[&wid].input_scratch.cells[row][hit.cols.0..hit.cols.1]
+            .iter()
+            .all(|c| c.underline == UnderlineStyle::None)
+    };
+    assert!(lit(&app, Fact::Model), "the hovered fact is lit");
+    assert!(
+        plain(&app, Fact::Path) && plain(&app, Fact::Branch),
+        "no other"
+    );
+    // The branch has nothing to click: under the pointer it lights nothing, and neither does
+    // any other fact.
+    let branch = fact_hit(&app, wid, Fact::Branch);
+    let (x, y) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    app.on_cursor_moved(wid, x, y);
+    frame(&mut app, wid);
+    assert!(
+        plain(&app, Fact::Branch) && plain(&app, Fact::Model) && plain(&app, Fact::Path),
+        "a fact with no click takes no hover paint"
+    );
+    assert_eq!(
+        (
+            row_text(&app, wid, row),
+            app.windows[&wid].claude_lights.fact_hits.clone()
+        ),
+        before,
+        "and moves nothing"
+    );
 
     let _host = host(&mut app);
     draw_claude(&app, session, PLAN);
@@ -441,14 +593,17 @@ fn hovering_a_fact_moves_no_fact() {
     frame(&mut app, wid);
     assert_eq!(app.windows[&wid].claude_lights.fact_hits, hits);
     let text = row_text(&app, wid, row);
-    assert!(text.contains("click: hide"), "the title: {text:?}");
+    assert!(
+        text.contains("\u{2387} main \u{b7} right-click: copy") && !text.contains("click: hide"),
+        "the title names no click: {text:?}"
+    );
     let path = fact_hit(&app, wid, Fact::Path);
     let (x, y) = px_of(&app, wid, (path.frame_row, path.cols.0));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
     let text = row_text(&app, wid, row);
     assert!(
-        text.contains("/Users//someone/aterm \u{b7} click: hide"),
+        text.contains("/Users//someone/aterm \u{b7} right-click: copy, new tab"),
         "{text:?}"
     );
 }
@@ -475,7 +630,7 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
                 subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                     email: Some("owner@example.com".into()),
                     plan: Some("Max 20x".into()),
-                    weekly: Some("weekly 63% used".into()),
+                    weekly: Some("weekly 37% left".into()),
                     ..Default::default()
                 }),
                 quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
@@ -489,7 +644,7 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let account = fact_hit(&app, wid, Fact::Account);
     assert_eq!(
         glyphs(&app, wid, &account),
-        "\u{2386}main63%\u{b7}\u{21ba}Sat10:00\u{b7}\u{2573}~Thu12Nov04:00",
+        "\u{2386}main37%left\u{b7}\u{21ba}Sat10:00\u{b7}\u{2573}~Thu12Nov04:00",
         "one fact from the mark to the verdict's last word"
     );
     assert_eq!(
@@ -593,7 +748,7 @@ fn hovering_the_account_beside_a_wall_lights_both_its_spans() {
                 account: Some("main".into()),
                 subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                     plan: Some("Max 20x".into()),
-                    weekly: Some("weekly 63% used".into()),
+                    weekly: Some("weekly 37% left".into()),
                     ..Default::default()
                 }),
                 quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
@@ -632,7 +787,7 @@ fn hovering_the_account_beside_a_wall_lights_both_its_spans() {
     };
     assert_eq!(glyphs(&app, wid, &wall), "\u{29D7}until3pm");
     assert!(
-        glyphs(&app, wid, &unit).starts_with("\u{2386}main63%"),
+        glyphs(&app, wid, &unit).starts_with("\u{2386}main37%left"),
         "{}",
         glyphs(&app, wid, &unit)
     );
@@ -719,8 +874,8 @@ fn a_fact_under_a_band_is_no_target() {
         .as_bytes(),
     );
     frame(&mut app, wid);
-    let branch = fact_hit(&app, wid, Fact::Branch);
-    let (x, y) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    let model = fact_hit(&app, wid, Fact::Model);
+    let (x, y) = px_of(&app, wid, (model.frame_row, model.cols.0));
     app.on_cursor_moved(wid, x, y);
     assert!(
         app.claude_glass_at(wid, x, y).is_some(),
@@ -728,12 +883,12 @@ fn a_fact_under_a_band_is_no_target() {
     );
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch)))
+        Some((session, Target::Fact(Fact::Model)))
     );
     assert!(
         app.windows[&wid]
             .claude_lights
-            .fact_reading(session, Fact::Branch)
+            .fact_reading(session, Fact::Model)
             .is_some()
     );
     assert!(app.windows[&wid].hover_pointer);
@@ -753,8 +908,8 @@ fn a_fact_under_a_band_is_no_target() {
     ));
     app.splice_paste_banner(wid);
     app.refresh_glass_cursor_for_frame(wid);
-    let branch = fact_hit(&app, wid, Fact::Branch);
-    assert!(app.chrome_owns_terminal_row(wid, branch.term_row));
+    let model = fact_hit(&app, wid, Fact::Model);
+    assert!(app.chrome_owns_terminal_row(wid, model.term_row));
     assert!(app.autopilot_menu.is_none());
     #[cfg(target_os = "macos")]
     {
@@ -766,11 +921,11 @@ fn a_fact_under_a_band_is_no_target() {
     assert_eq!(
         app.windows[&wid]
             .claude_lights
-            .fact_reading(session, Fact::Branch),
+            .fact_reading(session, Fact::Model),
         None
     );
     assert!(!app.windows[&wid].hover_pointer);
-    assert!(!app.press_visible_claude_fact(wid, session, Fact::Branch, FactMask::default()));
+    assert!(!app.press_visible_claude_fact(wid, session, Fact::Model, FactMask::default()));
     assert_eq!(app.fact_mask(session), FactMask::default());
 
     app.paste_banner = None;
@@ -778,12 +933,12 @@ fn a_fact_under_a_band_is_no_target() {
     app.refresh_glass_cursor_for_frame(wid);
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch)))
+        Some((session, Target::Fact(Fact::Model)))
     );
     assert!(
         app.windows[&wid]
             .claude_lights
-            .fact_reading(session, Fact::Branch)
+            .fact_reading(session, Fact::Model)
             .is_some()
     );
     assert!(app.windows[&wid].hover_pointer);
@@ -825,7 +980,7 @@ fn a_fact_under_a_band_is_no_target() {
     assert_eq!(
         app.windows[&wid]
             .claude_lights
-            .fact_reading(session, Fact::Branch),
+            .fact_reading(session, Fact::Model),
         None
     );
     assert!(!app.windows[&wid].hover_pointer);
@@ -834,12 +989,12 @@ fn a_fact_under_a_band_is_no_target() {
     app.refresh_glass_cursor_for_frame(wid);
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch)))
+        Some((session, Target::Fact(Fact::Model)))
     );
     assert!(
         app.windows[&wid]
             .claude_lights
-            .fact_reading(session, Fact::Branch)
+            .fact_reading(session, Fact::Model)
             .is_some()
     );
     assert!(app.windows[&wid].hover_pointer);
@@ -885,12 +1040,7 @@ fn the_hidden_state_is_the_sessions_in_every_view_of_it() {
             .map(|h| glyphs(app, wid, h))
             .collect::<Vec<_>>()
     };
-    press_at(
-        &mut app,
-        wid,
-        (both[1].frame_row, both[1].cols.0),
-        MouseButton::Left,
-    );
+    app.set_fact_mask(session, mask(&[FactKind::Branch]));
     frame(&mut app, wid);
     assert_eq!(
         off(&app),
@@ -978,7 +1128,7 @@ fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
 /// RETURN ON A SELECTED FACT IS ITS CLICK.
 #[cfg(target_os = "macos")]
 #[test]
-fn return_on_a_selected_fact_is_its_click() {
+fn return_on_a_selected_fact_activates_it() {
     use aterm_window::keyboard::{KeyCode, NamedKey};
     let (mut app, wid, session, mut reader) = app();
     publish_facts(&app, session);
@@ -1010,9 +1160,25 @@ fn return_on_a_selected_fact_is_its_click() {
             .fact_reading(session, Fact::Branch),
         None
     );
+    // The keyboard's selection lights the branch, which the pointer does not: it is how the
+    // keyboard says where it is.
     select(&mut app, Fact::Branch);
+    let hit = fact_hit(&app, wid, Fact::Branch);
+    assert!(
+        app.windows[&wid].input_scratch.cells[hit.frame_row][hit.cols.0..hit.cols.1]
+            .iter()
+            .all(|c| c.underline == UnderlineStyle::Single),
+        "the selected branch wears the one hover"
+    );
+    // Return on it opens its card, the one thing it has: its click does nothing.
     tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
-    assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
+    assert_eq!(app.fact_mask(session), FactMask::default(), "hides nothing");
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| m.owner),
+        Some(crate::autopilot_menu::MenuOwner::Fact(Fact::Branch)),
+        "Return on the branch opens its card"
+    );
+    app.close_autopilot_menu();
     assert_eq!(app.windows[&wid].claude_lights.selected, None);
     assert_eq!(
         app.windows[&wid]
@@ -1020,9 +1186,14 @@ fn return_on_a_selected_fact_is_its_click() {
             .fact_reading(session, Fact::Branch),
         None
     );
+    // Return on a fact a click acts on is that click: here, no Claude Code, the model's hides it.
     frame(&mut app, wid);
-    assert!(row_text(&app, wid, footer_row(&app, wid)).contains("\u{2387} main off"));
-    select(&mut app, Fact::Branch);
+    select(&mut app, Fact::Model);
+    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+    assert_eq!(app.fact_mask(session), mask(&[FactKind::Model]));
+    assert_eq!(app.windows[&wid].claude_lights.selected, None);
+    frame(&mut app, wid);
+    select(&mut app, Fact::Model);
     tap(&mut app, wid, NamedKey::Space, KeyCode::Space, " ");
     assert_eq!(app.fact_mask(session), FactMask::default());
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
@@ -1054,7 +1225,7 @@ fn facts_are_buttons_named_in_words() {
         named(HarnessChip::Model),
         (
             "Model: Opus 5.5".to_owned(),
-            Some("Activate to switch back to the default model at auto effort.".to_owned())
+            Some("Activate to choose the model.".to_owned())
         )
     );
     assert_eq!(named(HarnessChip::Effort).0, "Effort: xhigh");
@@ -1078,7 +1249,12 @@ fn facts_are_buttons_named_in_words() {
             session
         )
     );
-    click_fact(&mut app, wid, Fact::Branch);
+    assert_eq!(
+        named(HarnessChip::Branch).1.as_deref(),
+        Some("Activate for its menu: copy it."),
+        "a press on the branch opens its card: it hides nothing"
+    );
+    app.set_fact_mask(session, mask(&[FactKind::Branch]));
     frame(&mut app, wid);
     let nodes = app.claude_chips_a11y(wid);
     let stub = nodes
@@ -1114,11 +1290,25 @@ fn a_reader_press_is_the_click() {
     publish_facts(&app, session);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
+    // The branch has nothing to click: a reader's press opens its card, which a reader reaches
+    // no other way.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Branch);
-    assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
+    assert_eq!(app.fact_mask(session), FactMask::default(), "hides nothing");
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| m.owner),
+        Some(crate::autopilot_menu::MenuOwner::Fact(Fact::Branch))
+    );
+    app.close_autopilot_menu();
+    // A press on a stub shows its fact, and on a fact a click acts on is that click.
+    app.set_fact_mask(session, mask(&[FactKind::Branch]));
     frame(&mut app, wid);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Branch);
     assert_eq!(app.fact_mask(session), FactMask::default());
+    frame(&mut app, wid);
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Model);
+    assert_eq!(app.fact_mask(session), mask(&[FactKind::Model]));
+    app.set_fact_mask(session, FactMask::default());
+    frame(&mut app, wid);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Usage);
     assert_eq!(app.fact_mask(session), FactMask::default());
     assert!(pty(&mut reader, 0).is_empty());
@@ -1131,13 +1321,13 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
 
-    let branch = fact_hit(&app, wid, Fact::Branch);
-    let (bx, by) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    let model = fact_hit(&app, wid, Fact::Model);
+    let (bx, by) = px_of(&app, wid, (model.frame_row, model.cols.0));
     app.on_cursor_moved(wid, bx, by);
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch))),
-        "hovering uncovered Branch fact lights its hover"
+        Some((session, Target::Fact(Fact::Model))),
+        "hovering uncovered Model fact lights its hover"
     );
 
     // Open a stats lens card covering the whole window: it must evict the hovered fact
@@ -1175,7 +1365,7 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
     app.refresh_glass_cursor_for_frame(wid);
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch))),
+        Some((session, Target::Fact(Fact::Model))),
         "shrinking stats lens away from pointer restores hover even while lens remains open"
     );
     assert!(
@@ -1198,11 +1388,11 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
     app.refresh_glass_cursor_for_frame(wid);
     assert_eq!(
         app.windows[&wid].claude_lights.hover,
-        Some((session, Target::Fact(Fact::Branch))),
-        "closing stats lens restores hover on uncovered Branch fact without pointer motion"
+        Some((session, Target::Fact(Fact::Model))),
+        "closing stats lens restores hover on uncovered Model fact without pointer motion"
     );
     assert!(
         app.windows[&wid].hover_pointer,
-        "closing stats lens restores hand cursor on uncovered Branch fact"
+        "closing stats lens restores hand cursor on uncovered Model fact"
     );
 }

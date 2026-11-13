@@ -13,7 +13,8 @@
 //!   ([`super::relay::believed`]), so a relay carries it past the weeks that held it, and the
 //!   `since` of every live claims-ring claim ([`Seen::claim`]).
 //! - **Signed in** is, per (account, Mac), the latest sign-in word of that Mac's `use` row and its
-//!   in-window sign-in events: `in`, `out`, `ended`, `wrong` or `failed`.
+//!   in-window sign-in events ([`Event::signin`]): `in`, `out`, `ended`, `wrong` or `failed`, and
+//!   none once the Mac withdrew its word.
 //! - **Quota** groups a window's readings by their reset (the window's identity: one window's
 //!   readings name one reset, within each reading's resolution), drops a group a later group's
 //!   reset puts a whole window earlier, takes the most used of the overlapping groups left and of
@@ -25,7 +26,7 @@
 
 use super::{
     EV, PLACE, RELAY, SUM, USE,
-    event::{Event, Kind, Pk, Res, Window},
+    event::{Event, Kind, Pk, Res, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window},
     place::{self, Places},
     relay::{Heard, Rk},
 };
@@ -46,24 +47,7 @@ pub struct SignedIn {
 
 /// The sign-in word a `use` row's `signin.state` holds, as a static word.
 fn state_word(word: &str) -> Option<&'static str> {
-    ["in", "out", "ended", "wrong", "failed"]
-        .into_iter()
-        .find(|state| *state == word)
-}
-
-/// The sign-in word an event states, where it states one. A `seen` states none: a profile file
-/// names its account long after the login ended, so a sighting never says `in` over an
-/// `ended`; and a `wrong-account` that names a tab is a belief corrected, not a sign-in word.
-const fn event_state(event: &Event) -> Option<&'static str> {
-    match event.kind {
-        Kind::WrongAccount if event.tab.is_some() => None,
-        Kind::SignedIn | Kind::Renewed => Some("in"),
-        Kind::SignedOut | Kind::Displaced => Some("out"),
-        Kind::LoginEnded => Some("ended"),
-        Kind::WrongAccount => Some("wrong"),
-        Kind::SignInFailed => Some("failed"),
-        _ => None,
-    }
+    SIGNIN_WORDS.into_iter().find(|state| *state == word)
 }
 
 /// One quota reading of one window, by the Mac that made it.
@@ -229,17 +213,7 @@ impl Seen {
             let uuid = hex::encode_lower(&row.machine);
             if let Some(account) = account {
                 heard.read_use(account, row.machine, row.rank.0, &row.value);
-                if let Some(signin) = row.value.get("signin") {
-                    let state = signin
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .and_then(state_word);
-                    let t = signin.get("t").and_then(Value::as_u64).unwrap_or(0);
-                    let cli = signin.get("cli").and_then(Value::as_str).unwrap_or("");
-                    if let Some(state) = state {
-                        seen.sign(account.as_str(), &uuid, state, t, cli);
-                    }
-                }
+                seen.sign_use(account.as_str(), &uuid, &row.value);
             }
             seen.fold_use(pk.as_str(), &uuid, &row.value);
         }
@@ -266,7 +240,56 @@ impl Seen {
             .into_values()
             .map(|row| (hex::encode_lower(&row.machine), row.value))
             .collect();
+        seen.drop_withdrawn();
         seen.sort_events();
+        seen
+    }
+
+    /// The sign-in word a `use` row of `uuid`'s states of `account` (`signin {state, t, cli}`),
+    /// folded as an event's is: the row is that Mac's own fold, so it stands over an event of
+    /// the same second.
+    fn sign_use(&mut self, account: &str, uuid: &str, row: &Value) {
+        let Some(signin) = row.get("signin") else {
+            return;
+        };
+        let state = signin
+            .get("state")
+            .and_then(Value::as_str)
+            .and_then(state_word);
+        let t = signin.get("t").and_then(Value::as_u64).unwrap_or(0);
+        let cli = signin.get("cli").and_then(Value::as_str).unwrap_or("");
+        if let Some(state) = state {
+            self.sign(account, uuid, state, t, cli);
+        }
+    }
+
+    /// A withdrawn word stood only so that no older event or row restored it: no reader is
+    /// given it, and a Mac with no word left says nothing of the account.
+    fn drop_withdrawn(&mut self) {
+        self.signins.retain(|_, by_mac| {
+            by_mac.retain(|_, held| held.state != SIGNIN_UNKNOWN);
+            !by_mac.is_empty()
+        });
+    }
+
+    /// Test seam: what a peer reads of the sign-in words of the Mac `uuid` from what that Mac
+    /// publishes, its `events` in the order an `ev` batch holds them and then its `use` rows
+    /// (each an account's key and its row), folded by the code [`Self::of`] folds a window with.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn of_published(
+        uuid: &str,
+        events: &[Event],
+        uses: &[(Pk, Value)],
+        now: u64,
+    ) -> Self {
+        let mut seen = Self::empty(now);
+        for event in events {
+            seen.fold_event(uuid, event);
+        }
+        for (account, row) in uses {
+            seen.sign_use(account.as_str(), uuid, row);
+        }
+        seen.drop_withdrawn();
         seen
     }
 
@@ -391,7 +414,7 @@ impl Seen {
         let Some(account) = event.account else {
             return;
         };
-        if let Some(state) = event_state(event) {
+        if let Some(state) = event.signin() {
             self.sign(account.as_str(), uuid, state, event.t, event.cli.as_str());
         }
         // A workspace's figures are its sub-account's (§4.13's derivation, no lookup).

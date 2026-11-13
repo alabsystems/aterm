@@ -185,6 +185,8 @@ fn pause_progress(value: &mut AccountProgress, off: bool, current_work: bool) {
     }
     value.eligible = None;
     value.next_at = None;
+    // The stay word belongs to the decision this pause retires.
+    value.stay = None;
     for detail in &mut value.details {
         if !detail.starts_with(EXECUTION_HISTORY_PREFIX)
             && !detail.starts_with(RECOVERY_HISTORY_PREFIX)
@@ -212,6 +214,7 @@ fn retire_judgment(value: &mut AccountProgress, point: AccountPoint, finding: &s
     value.wall = wall_name(point).map(str::to_owned);
     value.eligible = None;
     value.next_at = None;
+    value.stay = None;
     for detail in &mut value.details {
         if !detail.starts_with(RECOVERY_HISTORY_PREFIX) {
             *detail = format!("{RECOVERY_HISTORY_PREFIX}{detail}");
@@ -343,7 +346,7 @@ fn same_progress_process(
         && conversation == asked_conversation
 }
 
-fn reason(word: &str) -> String {
+pub(crate) fn reason(word: &str) -> String {
     match word {
         "off" => "Automatic account rotation is off",
         "no-roster" => "No account roster is available",
@@ -577,6 +580,7 @@ impl WorkerIdle {
             value.details.push("Usage check requested".into());
         }
         let stay = with_kept_of(&self.kept, |k| k.account.stay.or(k.account.held));
+        value.stay = stay.map(str::to_owned);
         if let Some(why) = stay.filter(|why| *why != "off") {
             value.details.push(reason(why));
         }
@@ -606,9 +610,25 @@ impl WorkerIdle {
         };
         bound.value.observed_at = seat.now;
         bound.state = Some(seat.state.clone());
+        // What this process's own login file says it runs on: the account the card names, on a
+        // Mac that lists no account as on one that lists several
+        // (`docs/DESIGN-account-discovery-2026-11-09.md`).
+        let env = (self.hooks.acts.account_env)(&bound.snapshot);
+        let seen_in = |roster: &accounts::Roster, who: &accounts::ProcessLogin| {
+            env.as_deref().map_or(Observation::Unread, |env| {
+                login_seen(env, &seat.home, who.route, roster)
+            })
+        };
         let roster = match roster_read(&seat) {
             Ok(roster) => roster,
             Err(why) => {
+                if why == RosterUnread::Nothing {
+                    // No row to judge it against, but the login file still names the account.
+                    let none = accounts::Roster::default();
+                    bound.value.known = Some(0);
+                    bound.value.account = exec_login(&self.hooks, &bound.snapshot)
+                        .and_then(|who| seen_in(&none, &who).email().map(str::to_owned));
+                }
                 return unconfirmed(
                     bound,
                     match why {
@@ -625,8 +645,12 @@ impl WorkerIdle {
         let Some(who) = exec_login(&self.hooks, &bound.snapshot) else {
             return unconfirmed(bound, "This process's account identity is unavailable");
         };
-        let me = who.me(&roster);
-        bound.value.account = me.label().map(str::to_owned);
+        let seen = seen_in(&roster, &who);
+        let me = accounts::observed_me(&roster, &who, &seen);
+        bound.value.account = me
+            .label()
+            .map(str::to_owned)
+            .or_else(|| seen.email().map(str::to_owned));
         let store = seat.bounded_claude_store();
         let records = match store.read_account_records(seat.roster.as_deref(), seat.now) {
             Ok(records) if records.roster == roster && records.notes.is_empty() => records,
@@ -987,6 +1011,7 @@ impl HostHandle {
                 .filter(|why| *why != "off" && !execution_active && decision.is_some())
             {
                 value.phase = ProgressPhase::Waiting;
+                value.stay = Some(held.to_owned());
                 value.details.insert(0, reason(held));
             }
         }
@@ -1275,102 +1300,5 @@ impl crate::App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn authentication_and_context_failures_do_not_become_quota_exhaustion() {
-        assert!(
-            wall_name(AccountPoint::Wall {
-                kind: aterm_phase::WallKind::UsageWeekly
-            })
-            .is_some()
-        );
-        for kind in [
-            aterm_phase::WallKind::Auth,
-            aterm_phase::WallKind::Context,
-            aterm_phase::WallKind::Memory,
-            aterm_phase::WallKind::Overloaded,
-        ] {
-            let point = AccountPoint::Wall { kind };
-            assert_eq!(wall_name(point), None);
-            assert_eq!(progress_phase(None, point), ProgressPhase::Waiting);
-        }
-    }
-
-    #[test]
-    fn a_plan_to_move_is_not_a_report_that_a_move_started() {
-        assert_eq!(
-            progress_phase(
-                Some(&AccountAdvice::Move {
-                    to: "other".into(),
-                    yields: None
-                }),
-                AccountPoint::TurnEnd
-            ),
-            ProgressPhase::Ready
-        );
-        assert_eq!(
-            progress_phase(
-                Some(&AccountAdvice::Probe { otherwise: None }),
-                AccountPoint::TurnEnd
-            ),
-            ProgressPhase::Watching
-        );
-        assert_eq!(
-            progress_phase(
-                Some(&AccountAdvice::Again {
-                    until: Instant::now(),
-                    why: AskAgain::Unwritten,
-                }),
-                AccountPoint::TurnEnd
-            ),
-            ProgressPhase::Waiting,
-            "the host's own ask again is a wait"
-        );
-        assert_eq!(
-            progress_phase(None, AccountPoint::LoginEnded),
-            ProgressPhase::Waiting
-        );
-        assert_eq!(
-            progress_phase(None, AccountPoint::TurnEnd),
-            ProgressPhase::Watching
-        );
-    }
-
-    #[test]
-    fn a_progress_observation_cannot_cross_a_process_or_conversation() {
-        assert!(same_progress_process(
-            42,
-            Some(100),
-            Some("session"),
-            42,
-            Some(100),
-            Some("session")
-        ));
-        for (pid, born, session) in [
-            (43, Some(100), Some("session")),
-            (42, Some(101), Some("session")),
-            (42, None, Some("session")),
-            (42, Some(100), Some("other")),
-            (42, Some(100), None),
-        ] {
-            assert!(!same_progress_process(
-                42,
-                Some(100),
-                Some("session"),
-                pid,
-                born,
-                session
-            ));
-        }
-        assert!(!same_progress_process(
-            42,
-            None,
-            Some("session"),
-            42,
-            None,
-            Some("session")
-        ));
-    }
-}
+#[path = "progress_tests.rs"]
+mod tests;

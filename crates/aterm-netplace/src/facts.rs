@@ -37,9 +37,19 @@ pub trait Sense: Send {
 
     /// Told once each time the keeper's lock is found held, before the candidate waits for it.
     fn lock_held(&self) {}
+
+    /// The system's announcements of a sleep's wake and a wall-clock step, which the keeper
+    /// hears as an input change ([`crate::watch::wall`]); none for a sense that reads no system
+    /// (a test's, the scripted facts).
+    #[cfg(unix)]
+    fn wall(&self) -> Option<Arc<aterm_uds::wall_watch::WallWatch>> {
+        None
+    }
 }
 
-/// A keeper's non-owning notification handle. Stopping never manufactures changed facts.
+/// A keeper's non-owning notification handle: [`StopWake::ring`] wakes a wait for its stop,
+/// which never manufactures changed facts; [`StopWake::nudge`] tells the wait that a file the
+/// place is made from changed, which it answers as a change.
 #[derive(Debug)]
 pub struct StopWake(WakeTarget);
 
@@ -65,6 +75,28 @@ impl StopWake {
             WakeTarget::Scripted(sense) => {
                 if let Some(sense) = sense.upgrade() {
                     let _held = sense.facts.lock().unwrap_or_else(PoisonError::into_inner);
+                    sense.wake.notify_all();
+                }
+            }
+        }
+    }
+
+    /// A file the place is made from changed (the keeper's watch of its files heard it). The
+    /// change is LATCHED, not only signalled: one told while the keeper reads, before it waits
+    /// again, ends that next wait at once, so a write between the keeper's read and its sleep is
+    /// never slept through (ATERM-KI-1105-20).
+    pub(crate) fn nudge(&self) {
+        match &self.0 {
+            WakeTarget::Live(path) => {
+                if let Some(path) = path.upgrade() {
+                    let _held = path.reading.lock().unwrap_or_else(PoisonError::into_inner);
+                    path.tell();
+                }
+            }
+            WakeTarget::Scripted(sense) => {
+                if let Some(sense) = sense.upgrade() {
+                    let mut held = sense.facts.lock().unwrap_or_else(PoisonError::into_inner);
+                    held.1 += 1;
                     sense.wake.notify_all();
                 }
             }
@@ -586,10 +618,25 @@ fn thread_script() -> Option<Script> {
 fn seam_file() -> Option<Script> {
     #[cfg(all(debug_assertions, not(test)))]
     {
-        let file = std::env::var_os(SEAM)?;
-        aterm_uds::atomic_file::read_regular_text(std::path::Path::new(&file), 1024 * 1024)
+        let file = seam_path()?;
+        aterm_uds::atomic_file::read_regular_text(&file, 1024 * 1024)
             .ok()
             .map(|text| parse_script(&text))
+    }
+    #[cfg(not(all(debug_assertions, not(test))))]
+    {
+        None
+    }
+}
+
+/// The file [`SEAM`] names, in a debug build outside this crate's tests: the keeper and the
+/// window's follower watch it beside the place's folder, so a lab's rewrite of it is a change
+/// they hear rather than one they look for. `None` in a release build, or with no variable.
+#[must_use]
+pub fn seam_path() -> Option<std::path::PathBuf> {
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        std::env::var_os(SEAM).map(std::path::PathBuf::from)
     }
     #[cfg(not(all(debug_assertions, not(test))))]
     {
@@ -699,16 +746,19 @@ impl PathState {
             .unwrap_or_else(PoisonError::into_inner);
     }
 
-    /// A reading changed: tell a waiter on the condition variable or on the route socket. The
-    /// bell coalesces readings while `changed` is set. Its nonblocking I/O also protects the
-    /// monitor's queue when a wait consumes the flag before a notification is written.
-    #[cfg(any(target_os = "macos", all(test, unix)))]
+    /// A reading changed, or a watched file did ([`StopWake::nudge`]): tell a waiter on the
+    /// condition variable or on the route socket. The bell coalesces readings while `changed` is
+    /// set. Its nonblocking I/O also protects the monitor's queue when a wait consumes the flag
+    /// before a notification is written.
     fn tell(&self) {
         let told = self.changed.swap(true, Ordering::SeqCst);
         self.wake.notify_all();
+        #[cfg(unix)]
         if !told && let Some(bell) = &self.bell {
             bell.ring();
         }
+        #[cfg(not(unix))]
+        let _ = told;
     }
 
     /// The bell's end a wait polls, where this platform rings one.
@@ -952,6 +1002,14 @@ impl Sense for Live {
         }
     }
 
+    #[cfg(unix)]
+    fn wall(&self) -> Option<Arc<aterm_uds::wall_watch::WallWatch>> {
+        if scripted().is_some() {
+            return None;
+        }
+        aterm_uds::wall_watch::WallWatch::start().map(Arc::new)
+    }
+
     fn stop_wake(&self) -> std::io::Result<StopWake> {
         #[cfg(unix)]
         if self.path.bell.is_none() {
@@ -996,6 +1054,10 @@ pub struct Scripted {
     wake: Condvar,
     waits: std::sync::atomic::AtomicUsize,
     lock_waits: std::sync::atomic::AtomicUsize,
+    /// How many times the facts were read: a keeper's looks.
+    looks: std::sync::atomic::AtomicUsize,
+    /// The longest each wait was asked to last, the newest last.
+    asked: Mutex<Vec<Duration>>,
 }
 
 impl Scripted {
@@ -1007,7 +1069,25 @@ impl Scripted {
             wake: Condvar::new(),
             waits: std::sync::atomic::AtomicUsize::new(0),
             lock_waits: std::sync::atomic::AtomicUsize::new(0),
+            looks: std::sync::atomic::AtomicUsize::new(0),
+            asked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// How many times the facts were read: a reader's looks, each a keeper step.
+    #[must_use]
+    pub fn looks(&self) -> usize {
+        self.looks.load(Ordering::SeqCst)
+    }
+
+    /// How long each wait so far was asked to last at most, oldest first: what a test of a
+    /// keeper at rest holds to its rest, not a timer.
+    #[must_use]
+    pub fn asked(&self) -> Vec<Duration> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// How many times a candidate over these facts found the keeper's lock held and waited.
@@ -1036,6 +1116,7 @@ impl Sense for Arc<Scripted> {
         Ok(StopWake(WakeTarget::Scripted(Arc::downgrade(self))))
     }
     fn facts(&self) -> Facts {
+        self.looks.fetch_add(1, Ordering::SeqCst);
         self.facts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1044,6 +1125,10 @@ impl Sense for Arc<Scripted> {
     }
 
     fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(most);
         let held = self.facts.lock().unwrap_or_else(PoisonError::into_inner);
         self.waits.fetch_add(1, Ordering::SeqCst);
         let (mut held, _) = self

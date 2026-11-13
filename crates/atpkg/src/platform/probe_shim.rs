@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 const MAX_DEPTH: usize = 8;
 const PARENT: &str = "__atpkg_probe_parent";
 
-/// The already verified current image that implements `aterm_uds::tether::VERB`.
-/// Production callers obtain its executable from `aterm_uds::tether::executable`;
+/// The prepared helper code that implements `aterm_uds::tether::VERB`.
+/// Production callers obtain its executable from `aterm_uds::tether::prepared_executable`;
 /// inert controls supply an owned data file instead. This renderer never starts it.
 #[derive(Clone, Debug)]
 pub struct ProbeForwarder {
-    /// The verified current image, never a newly copied executable.
+    /// The prepared helper, which may be a retained code-matched copy. Its file
+    /// identity is not the original frontend's loaded-image identity.
     pub executable: PathBuf,
     /// The process that will directly spawn the outer probe shell, not that shell's `$$`.
     pub parent_pid: u32,

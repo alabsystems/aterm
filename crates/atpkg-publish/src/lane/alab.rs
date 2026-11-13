@@ -914,6 +914,10 @@ fn engine_ledger(ctx: &Ctx, engine: &Slug, work: &Path) -> CachedLedger {
             )
         })
         .and_then(|_| {
+            owner_written(&dir)
+                .map_err(|e| format!("could not clear the write bits of {}: {e}", ctx.shown(&dir)))
+        })
+        .and_then(|()| {
             ctx.hosts
                 .staging
                 .fetch_main(engine, &dir, ENGINE_MAIN)
@@ -1744,6 +1748,17 @@ const VERSION_PRINT_BOUND: std::time::Duration = std::time::Duration::from_secs(
 /// [`VERSION_PRINT_BOUND`].
 #[must_use]
 pub fn installed_pin_commit(ctx: &Ctx, program: &str, build: Build) -> Option<PinCommit> {
+    installed_pin_commit_with(ctx, program, build, |cmd| {
+        aterm_uds::deadline::output_within(cmd, VERSION_PRINT_BOUND).ok()
+    })
+}
+
+fn installed_pin_commit_with(
+    ctx: &Ctx,
+    program: &str,
+    build: Build,
+    observe: impl FnOnce(&mut aterm_uds::spawnfd::Command) -> Option<std::process::Output>,
+) -> Option<PinCommit> {
     let trustc = ctx
         .pkg_prefix
         .join("store")
@@ -1752,7 +1767,7 @@ pub fn installed_pin_commit(ctx: &Ctx, program: &str, build: Build) -> Option<Pi
         .join("bin/trustc");
     let mut cmd = aterm_uds::spawnfd::command(&trustc);
     cmd.arg("-vV");
-    let out = aterm_uds::deadline::output_within(&mut cmd, VERSION_PRINT_BOUND).ok()?;
+    let out = observe(&mut cmd)?;
     out.status
         .success()
         .then(|| parse_vv(&String::from_utf8_lossy(&out.stdout)))
@@ -1789,6 +1804,21 @@ pub fn parse_vv(text: &str) -> Option<PinCommit> {
         commit: commit[..9].to_string(),
         date,
     })
+}
+
+/// Clears the group and world write bits a umask such as 002 leaves on `repo` and its config:
+/// agh reads a repository's config only where no one else could have written it, and this
+/// repository is the run's own.
+fn owner_written(repo: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    for path in [repo.to_path_buf(), repo.join("config")] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = repo;
+    Ok(())
 }
 
 #[cfg(test)]

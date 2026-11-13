@@ -1059,7 +1059,7 @@ fn published_reads_need_no_writer() {
         ..Setup::PLAN
     });
     published_answers(&w);
-    // The fail-closed gate stays (owner ruling 2026-10-26 (b)): an unvouched fine-grained
+    // The fail-closed gate stays: an unvouched fine-grained
     // writer's draft-inclusive reads are refused, never answered as a published-only listing.
     match w.host.releases(&slug()) {
         Err(HostError::Refused(_)) => {}

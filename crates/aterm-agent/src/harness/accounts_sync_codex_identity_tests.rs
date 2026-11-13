@@ -928,8 +928,9 @@ fn sync_words(world: &World) -> (ExitCode, String, String) {
 
 /// FOLLOWING THE DEFAULT LOGIN READS NO SOURCE: on a Mac with nothing to read a sync still moves the
 /// login to the row that holds its address, which is what it came to do, and says what stands where
-/// it cannot, then fails as such a sync does. The step it names works: a row of that address takes
-/// the login. CONTROL: a login on its row's address is a plain nothing to read.
+/// it cannot, then fails as such a sync does. The addressed row's step renews its mismatched login;
+/// a row of the default login's address takes it. CONTROL: a login on its row's address is a plain
+/// nothing to read.
 #[test]
 fn a_sync_with_no_source_still_follows_the_default_login() {
     let world = World::new("codex-default-no-source-");
@@ -949,7 +950,7 @@ fn a_sync_with_no_source_still_follows_the_default_login() {
         "{out}"
     );
     assert!(
-        out.contains("`aterm harness accounts login a --cli codex`"),
+        out.contains("`aterm harness accounts renew a --cli codex`"),
         "{out}"
     );
     assert_eq!(world.rows(), before, "nothing holds that address");

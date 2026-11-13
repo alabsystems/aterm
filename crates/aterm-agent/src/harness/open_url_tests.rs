@@ -5674,14 +5674,16 @@ fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
     }
 }
 
-/// A Claude sign-in waits on Cloudflare's bot check without charging its reads to the step cap.
-/// A failed central handoff has its own outcome, never a fabricated provider block. CONTROLS: a
-/// check that clears after three reads, or after more reads than the drive's steps, reaches the
-/// callback; a page that only loads, or loads on another host between two reads of a check,
-/// counts its steps and ends `stall`.
+/// A Claude sign-in waits on Cloudflare's bot check without charging its reads to the step cap,
+/// and one that does not clear ends there, as a page stop on this machine's own record
+/// ([`Met::stopped`], which holds the row out of the background): nothing is asked of another
+/// Mac, and no browser opens anywhere. CONTROLS: a check that clears after three reads, or
+/// after more reads than the drive's steps, reaches the callback; a page that only loads, or
+/// loads on another host between two reads of a check, counts its steps and ends `stall`,
+/// which is no page stop.
 #[test]
-fn a_claude_bot_check_waits_and_a_failed_central_handoff_is_distinct() {
-    use super::super::headless_oauth::{BOT_CHECK_UNCLEARED, CHALLENGE_FAILED};
+fn a_claude_bot_check_waits_and_one_that_stands_ends_as_a_page_stop() {
+    use super::super::headless_oauth::{BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED};
     let at = |state: &str, url: &str| aterm_json::json!({"state": state, "url": url});
     let short = Duration::from_millis(500);
     let tick = Duration::from_millis(20);
@@ -5702,13 +5704,14 @@ fn a_claude_bot_check_waits_and_a_failed_central_handoff_is_distinct() {
         ("reloading", Box::new(reloading)),
     ] {
         let (res, delivered, _, met) = drive_bot_check(state, short, tick);
-        assert_eq!(res, Err(CHALLENGE_FAILED), "{what}");
+        assert_eq!(res, Err(BOT_CHECK_UNCLEARED), "{what}");
         assert!(delivered.is_empty(), "{what}");
         assert_eq!(
             met,
-            Some(Met::new(MetWord::ChallengeFailed, None)),
+            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
             "{what}"
         );
+        assert!(met.is_some_and(|met| met.stopped()), "{what}");
     }
 
     let clears = move |n: usize| {
@@ -5745,9 +5748,10 @@ fn a_claude_bot_check_waits_and_a_failed_central_handoff_is_distinct() {
     let blocked = move |_: usize| at("block_page", "https://claude.ai/login");
     let (res, _, reads, met) =
         drive_bot_check(blocked, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
-    assert_eq!(res, Err(CHALLENGE_FAILED));
+    assert_eq!(res, Err(BLOCK_PAGE_MET));
     assert_eq!(reads, 1, "a block page ends the drive at once");
-    assert_eq!(met, Some(Met::new(MetWord::ChallengeFailed, None)));
+    assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
+    assert!(met.is_some_and(|met| met.stopped()));
 
     let loading = move |_: usize| at("loading", "https://claude.com/cai/oauth/authorize?x=1");
     let elsewhere = move |n: usize| {
@@ -5776,23 +5780,6 @@ fn a_claude_bot_check_waits_and_a_failed_central_handoff_is_distinct() {
             Some(Met::new(MetWord::Stall, Some("claude.com"))),
             "{what}"
         );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_claude_bot_check_or_block_page_can_finish_through_the_central_challenge() {
-    for state in ["bot_check", "block_page"] {
-        let _central = super::super::challenge_relay::set_central_result_for_tests(Ok(
-            BOT_CALLBACK.to_owned(),
-        ));
-        let page =
-            move |_: usize| aterm_json::json!({"state":state,"url":"https://claude.ai/login"});
-        let (result, delivered, _, met) =
-            drive_bot_check(page, Duration::from_millis(500), Duration::from_millis(20));
-        assert_eq!(result, Ok(()), "{state}");
-        assert_eq!(delivered, [BOT_CALLBACK.to_owned()], "{state}");
-        assert_eq!(met, None, "{state}");
     }
 }
 
@@ -5936,7 +5923,7 @@ fn opener_outcome_phases_preserve_diagnostics_and_only_explicit_ends_are_termina
         write_outcome(&path, &met);
         assert_eq!(
             read_terminal_outcome(&path),
-            Some(TerminalOutcome::Failed(met))
+            Some(TerminalOutcome::Failed(Some(met)))
         );
     }
     for bad in [
@@ -5974,41 +5961,31 @@ fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success()
         assert_eq!(read_outcome(&path), Some(met.clone()));
         assert_eq!(
             read_terminal_outcome(&path),
-            (code != 0).then(|| TerminalOutcome::Failed(met.clone()))
+            (code != 0).then(|| TerminalOutcome::Failed(Some(met.clone())))
         );
     }
 }
 
+/// An account service that could not admit work is a deferral, not a failed login and not a
+/// page stop: its outcome file says so, and no profile fallback starts.
 #[cfg(unix)]
 #[test]
-fn unavailable_issuer_is_typed_deferred_without_callback_or_profile_fallback() {
-    for state in ["bot_check", "block_page"] {
-        let _central = super::super::challenge_relay::set_central_result_for_tests(Err(
-            super::super::challenge_relay::RequestError::Unavailable,
-        ));
-        let (result, delivered, _, met) = drive_bot_check(
-            move |_| aterm_json::json!({"state":state,"url":"https://claude.ai/login"}),
-            Duration::ZERO,
-            Duration::ZERO,
-        );
-        assert!(result.is_err());
-        assert!(delivered.is_empty());
-        let met = met.unwrap();
-        assert!(met.is_service_unavailable());
-        assert!(!met.stopped());
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let path = tmp.path().join("outcome");
-        write_outcome(&path, &met);
-        assert_eq!(read_outcome(&path), Some(met.clone()));
-        assert_eq!(
-            read_terminal_outcome(&path),
-            Some(TerminalOutcome::Deferred(met.clone()))
-        );
-        let result = profile_fallback_outcome(Some(&path), Some(&met), || {
-            panic!("unavailable issuer cannot start a profile fallback")
-        });
-        assert_eq!(result.0, 1);
-    }
+fn an_unavailable_service_is_typed_deferred_without_a_profile_fallback() {
+    let met = Met::new(MetWord::ServiceUnavailable, None);
+    assert!(met.is_service_unavailable());
+    assert!(!met.stopped());
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    write_outcome(&path, &met);
+    assert_eq!(read_outcome(&path), Some(met.clone()));
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalOutcome::Deferred(met.clone()))
+    );
+    let result = profile_fallback_outcome(Some(&path), Some(&met), || {
+        panic!("an unavailable service cannot start a profile fallback")
+    });
+    assert_eq!(result.0, 1);
 }
 
 #[cfg(unix)]
@@ -6026,6 +6003,128 @@ fn deferred_opener_records_require_the_exact_service_cause_and_closed_grammar() 
         std::fs::write(&path, record).unwrap();
         assert_eq!(read_outcome(&path), None);
         assert_eq!(read_terminal_outcome(&path), None);
+    }
+}
+
+/// A FAILING OPENER'S EXIT IS TERMINAL EVEN WHERE IT MET NOTHING (ATERM-KI-1105-14): with no
+/// record, it publishes a failure with an empty `met=`; a diagnostic it recorded is kept and made
+/// terminal; a terminal record already there is left. CONTROL: once a callback was handed to the
+/// CLI, nothing is published.
+#[cfg(unix)]
+#[test]
+fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    publish_failed_exit(&path, false);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "opener-outcome=1\nphase=failed\nmet=\n"
+    );
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalOutcome::Failed(None))
+    );
+    assert_eq!(read_outcome(&path), None);
+
+    let met = Met::new(MetWord::BotCheck, Some("claude.ai"));
+    write_outcome_phase(&path, &met, OutcomePhase::Continuing);
+    publish_failed_exit(&path, false);
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalOutcome::Failed(Some(met.clone())))
+    );
+    let stall = Met::new(MetWord::Stall, None);
+    write_outcome(&path, &stall);
+    publish_failed_exit(&path, false);
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalOutcome::Failed(Some(stall)))
+    );
+    let unavailable = Met::new(MetWord::ServiceUnavailable, None);
+    write_outcome(&path, &unavailable);
+    publish_failed_exit(&path, false);
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalOutcome::Deferred(unavailable))
+    );
+
+    let offered = tmp.path().join("offered");
+    publish_failed_exit(&offered, true);
+    assert!(!offered.exists(), "a callback the CLI may hold is its own");
+    write_outcome_phase(&offered, &met, OutcomePhase::Continuing);
+    publish_failed_exit(&offered, true);
+    assert_eq!(read_terminal_outcome(&offered), None);
+    assert_eq!(read_outcome(&offered), Some(met));
+}
+
+/// ONLY A FAILURE MAY RECORD THAT IT MET NOTHING: an empty `met=` is read under `phase=failed`
+/// alone, and the record's grammar stays closed around it.
+#[cfg(unix)]
+#[test]
+fn only_a_failure_may_record_that_it_met_nothing() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    for (record, terminal) in [
+        (
+            "opener-outcome=1\nphase=failed\nmet=\n",
+            Some(TerminalOutcome::Failed(None)),
+        ),
+        ("opener-outcome=1\nphase=continuing\nmet=\n", None),
+        ("opener-outcome=1\nphase=deferred\nmet=\n", None),
+        ("opener-outcome=1\nphase=failed\nmet= \n", None),
+        ("opener-outcome=1\nphase=failed\nmet=\nmet=\n", None),
+        ("opener-outcome=1\nphase=failed\nmet=", None),
+        ("opener-outcome=1\nphase=failed\n", None),
+    ] {
+        std::fs::write(&path, record).unwrap();
+        assert_eq!(read_terminal_outcome(&path), terminal, "{record:?}");
+        assert_eq!(read_outcome(&path), None, "{record:?}");
+    }
+}
+
+/// A CALLBACK HANDED TO THE CLI IS NOTED even where its delivery fails, so a failing opener leaves
+/// that sign-in to the CLI. CONTROL: a flow that fails before reaching its callback notes none.
+#[test]
+fn a_callback_handed_to_the_cli_is_noted_even_where_its_delivery_fails() {
+    use super::super::headless_oauth::take_callback_offered;
+    let authorize = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=dot";
+    let flow = MailboxFlow::new(authorize).unwrap();
+    let callback = "http://127.0.0.1:9123/callback?code=c&state=dot";
+    let _ = take_callback_offered();
+    for (start, offered) in [
+        (
+            HttpResponse {
+                status: 500,
+                location: None,
+                body: String::new(),
+            },
+            false,
+        ),
+        (
+            HttpResponse {
+                status: 302,
+                location: Some(callback.to_owned()),
+                body: String::new(),
+            },
+            true,
+        ),
+    ] {
+        let mut start = Some(start);
+        let result = follow_until_page_or_callback(
+            &flow,
+            &mut |_, url, _, _| match url {
+                "https://claude.ai/start" => Ok(start.take().expect("one start")),
+                url if url == callback => Err("the callback connection was reset"),
+                other => panic!("wrong OAuth endpoint: {other}"),
+            },
+            "GET",
+            "https://claude.ai/start",
+            &mut BTreeMap::new(),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(take_callback_offered(), offered);
+        assert!(!take_callback_offered(), "it is taken once");
     }
 }
 

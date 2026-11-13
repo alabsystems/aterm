@@ -31,6 +31,8 @@ fn memory_entry_evidence(at_ms: u64, dt_ms: u64, wait: Wait) -> step::Evidence {
         refused: false,
         cpu_unread: false,
         cpu_ns: Some(0),
+        reaped_cpu_ns: 0,
+        tree_work: false,
         calls: Some(0),
         churn: false,
         churn_work: false,
@@ -378,6 +380,54 @@ fn admission_keeps_kernel_and_other_unproven_dependencies_visible() {
     assert_eq!(classify(&ages, &elsewhere, true).name, WaitName::Kernel);
 }
 
+/// A leaf parked in an aterm `await` is legitimate alone, but excuses only itself: a sibling leaf
+/// whose wait is unproven caps the job, and an uninterruptible kernel wait of either names kernel.
+/// NEGATIVE CONTROL: the same leaf with no parked await reads by its descriptors (unnamed, capped).
+#[test]
+fn a_parked_await_excuses_only_its_own_leaf_and_yields_to_the_kernel() {
+    let mut parked = proc_with(10, "aterm", Vec::new());
+    parked.aterm_wait = true;
+    let bare = proc_with(10, "aterm", Vec::new());
+    let other = proc_with(11, "worker", Vec::new());
+    let classify = |leaf: &JobProc, ages: &HashMap<u32, u64>, both: bool| {
+        let by = HashMap::from([(10, leaf), (11, &other)]);
+        let elsewhere = HashMap::new();
+        let scene = Scene {
+            procs: &by,
+            lanes: LanesSeen::default(),
+            d_age: ages,
+            elsewhere: &elsewhere,
+            program_check: true,
+        };
+        let leaves = if both {
+            vec![(10, "aterm".into()), (11, "worker".into())]
+        } else {
+            vec![(10, "aterm".into())]
+        };
+        let w = name_job(&scene, &JobFacts::default(), &leaves, (1, "zsh"));
+        (w.name, w.standing)
+    };
+    let mut ages = HashMap::new();
+    assert_eq!(
+        classify(&parked, &ages, false),
+        (WaitName::AtermWait, Standing::Legit)
+    );
+    assert_eq!(
+        classify(&bare, &ages, false),
+        (WaitName::Unnamed, Standing::Capped)
+    );
+    assert_eq!(
+        classify(&parked, &ages, true),
+        (WaitName::AtermWait, Standing::Capped),
+        "a parked leaf cannot hide a sibling whose wait is unproven"
+    );
+    ages.insert(10, KERNEL_WAIT_MS);
+    assert_eq!(classify(&parked, &ages, false).0, WaitName::Kernel);
+    ages.clear();
+    ages.insert(11, KERNEL_WAIT_MS);
+    assert_eq!(classify(&parked, &ages, true).0, WaitName::Kernel);
+}
+
 #[test]
 fn a_pipe_retains_its_peer_and_follows_native_admission_standing() {
     let end = |fd, handle, peer, write_end, status| Fd {
@@ -618,6 +668,53 @@ fn a_pipe_counts_as_its_writer_and_a_full_one_as_its_reader() {
     );
 }
 
+/// A pipe with two writers counts as the one that progresses, whichever pid is lower, and names
+/// it. NEGATIVE CONTROL: with neither progressing it counts as the first, capped.
+#[test]
+fn a_pipe_with_two_writers_counts_as_the_one_that_progresses() {
+    let end = |fd, handle, peer, write, status| Fd {
+        fd,
+        kind: FdKind::Pipe {
+            handle,
+            peer,
+            status: Some(status),
+            queued: Some(0),
+            write_end: Some(write),
+        },
+    };
+    let reader = proc_with(40, "cat", vec![end(0, 0xC1, 0xC2, false, 0x8)]);
+    let idle = proc_with(41, "ssh", vec![end(1, 0xC2, 0xC1, true, 0)]);
+    let busy = proc_with(42, "trustc", vec![end(1, 0xC2, 0xC1, true, 0)]);
+    let by = HashMap::from([(40, &reader), (41, &idle), (42, &busy)]);
+    let classify = |elsewhere: &HashMap<u32, Standing>| {
+        let d_age = HashMap::new();
+        let scene = Scene {
+            procs: &by,
+            lanes: LanesSeen::default(),
+            d_age: &d_age,
+            elsewhere,
+            program_check: true,
+        };
+        let w = name_job(
+            &scene,
+            &JobFacts::default(),
+            &[(40, "cat".into())],
+            (1, "zsh"),
+        );
+        (w.name, w.peer, w.standing)
+    };
+    let working = HashMap::from([(41, Standing::Capped), (42, Standing::Legit)]);
+    assert_eq!(
+        classify(&working),
+        (WaitName::Pipe, Some(42), Standing::Legit)
+    );
+    let idle_both = HashMap::from([(41, Standing::Capped), (42, Standing::Capped)]);
+    assert_eq!(
+        classify(&idle_both),
+        (WaitName::Pipe, Some(41), Standing::Capped)
+    );
+}
+
 #[test]
 fn the_consumers_pipe_is_serving_and_a_long_d_state_is_kernel() {
     let on = LanesSeen::default();
@@ -784,4 +881,138 @@ fn a_command_line_runs_exec_only_as_a_command_word() {
     ] {
         assert_eq!(runs_exec(line), runs, "{line}");
     }
+}
+
+/// One tick of a tab whose shell (100) has the agent call `leader` (400, a session leader with no
+/// terminal) under it, read as `facts`, at `at_ms` with the probe's clock 4 ms on; `exits` are the
+/// host's watched leaders' ends.
+fn call_tick(at_ms: u64, leader: Option<JobProc>, exits: Vec<LeaderExit>) -> JobTick {
+    let shell = SweepProc {
+        pid: 100,
+        ppid: 1,
+        pgid: 100,
+        uid: Some(501),
+        name: "zsh".to_owned(),
+        state: ProcState::Sleeping,
+        session_leader: Some(true),
+        has_tty: Some(true),
+        exec: Some(true),
+    };
+    let mut sweep = vec![shell];
+    let mut procs = vec![JobProc {
+        pid: 100,
+        ppid: 1,
+        pgid: 100,
+        sid: Some(100),
+        start: Some(1),
+        uid: Some(501),
+        name: "zsh".to_owned(),
+        state: ProcState::Sleeping,
+        ..JobProc::default()
+    }];
+    if let Some(p) = leader {
+        sweep.push(SweepProc {
+            pid: p.pid,
+            ppid: 100,
+            pgid: p.pid,
+            uid: Some(501),
+            name: p.name.clone(),
+            state: ProcState::Sleeping,
+            session_leader: Some(true),
+            has_tty: Some(false),
+            exec: Some(true),
+        });
+        procs.push(p);
+    }
+    JobTick {
+        at_ms,
+        read_ms: at_ms + 4,
+        probe_ms: at_ms + 4,
+        self_uid: Some(501),
+        sweep,
+        procs,
+        tabs: vec![JobTab {
+            key: 1,
+            shell_pid: 100,
+            ..JobTab::default()
+        }],
+        exits,
+        ..JobTick::default()
+    }
+}
+
+/// The call's leader as a pass reads it: started `start`, `age_ms` old as the probe began.
+fn leader(start: u64, age_ms: Option<u64>) -> JobProc {
+    JobProc {
+        pid: 400,
+        ppid: 100,
+        pgid: 400,
+        sid: Some(400),
+        start: Some(start),
+        age_ms,
+        uid: Some(501),
+        name: "zsh".to_owned(),
+        state: ProcState::Sleeping,
+        ..JobProc::default()
+    }
+}
+
+/// AN AGENT CALL CARRIES ITS LEADER'S OWN START (TM-1 §5): the probe's clock of the first pass that
+/// read the leader under the call's start less the age it read, here 600 ms before the pass that
+/// first tracked the call, whatever later passes read. NEGATIVE CONTROLS: a call whose leader's age
+/// no pass read carries none, and an age read of another process under the leader's pid (a start
+/// other than the call's, read by the pass that finds the call gone) is not the call's.
+#[test]
+fn an_agent_call_carries_its_leaders_start_from_its_age_at_a_pass() {
+    // The call the first pass tracked (start 77), once it ended: its leader's start and exit.
+    let ends = |first_age: Option<u64>, second: JobProc| {
+        let mut jobs = Jobs::new();
+        let exit = LeaderExit {
+            pid: 400,
+            start: Some(77),
+            end: ExitOf::Code(0),
+            at_ms: 13_000,
+        };
+        let mut ended = Vec::new();
+        for tick in [
+            call_tick(10_000, Some(leader(77, first_age)), Vec::new()),
+            call_tick(12_000, Some(second), Vec::new()),
+            call_tick(14_000, None, vec![exit]),
+        ] {
+            let _ = jobs.absorb(&tick);
+            ended.extend(jobs.take_ended());
+        }
+        let call = ended
+            .iter()
+            .find(|e| e.kind == JobKind::AgentCall && e.opened_ms == 10_000)
+            .unwrap_or_else(|| panic!("the call ended: {ended:?}"));
+        (call.leader_born_ms, call.leader_exited_ms)
+    };
+    assert_eq!(
+        ends(Some(604), leader(77, Some(2_604))),
+        (Some(9_400), Some(13_000)),
+        "the first pass's reading: 10 004 less 604"
+    );
+    assert_eq!(
+        ends(None, leader(77, Some(2_604))),
+        (Some(9_400), Some(13_000)),
+        "the first pass that read its age: 12 004 less 2 604"
+    );
+    assert_eq!(
+        ends(None, leader(77, None)),
+        (None, Some(13_000)),
+        "no age read"
+    );
+    assert_eq!(
+        ends(None, leader(78, Some(5))).0,
+        None,
+        "another process's age"
+    );
+    // TM-1 review: a leader older than the pass's clock (started before the reader whose passes
+    // read it) has no start on that clock, never the clock's zero.
+    assert_eq!(
+        ends(Some(600_000), leader(77, Some(602_000))),
+        (None, Some(13_000)),
+        "older than the pass's clock"
+    );
 }

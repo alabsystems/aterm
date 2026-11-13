@@ -29,6 +29,23 @@ fn scratch(label: &str) -> crate::testdir::Dir {
     crate::testdir::dir(&format!("atpkg-upstream-identity-{label}-"))
 }
 
+#[test]
+fn cache_publication_preserves_an_occupied_sibling() {
+    let dir = scratch("occupied-sibling");
+    let cache = dir.join(CACHE_FILE);
+    let occupied = dir.join(format!(".{CACHE_FILE}.{}-0.tmp", std::process::id()));
+    std::fs::write(&occupied, "another writer's bytes").unwrap();
+    cache_put(&cache, KIND_WHICH, "tool", &["/a/tool"], MAX_WHICH);
+    assert_eq!(
+        std::fs::read_to_string(&occupied).unwrap(),
+        "another writer's bytes"
+    );
+    assert_eq!(
+        cache_get(&cache, KIND_WHICH, "tool"),
+        Some(vec!["/a/tool".to_string()])
+    );
+}
+
 /// A fake that answers `-vV` with `vv` and prints its arguments otherwise.
 #[cfg(unix)]
 fn fake_vv(vv: &str) -> String {

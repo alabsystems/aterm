@@ -21,8 +21,7 @@ license = "Apache-2.0 AND (MIT OR Apache-2.0)"
 # this crate's `__rt` module. Nothing third-party, on any target. A proc
 # macro, so behind `export`: a crate that only reads `descriptor::*`
 # (aterm-verify) or the panic hook (aterm-gpu-web) keeps it out of its normal
-# closure, which Trust's loader refuses (PM-1,
-# docs/PLAN-pm1-proc-macro-reach-2026-10-16.md).
+# closure, which Trust's loader refuses (docs/TRUST-LANE.md (PM-1)).
 aterm-wasm-abi-macros = { workspace = true, optional = true }
 
 [features]

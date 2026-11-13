@@ -262,6 +262,32 @@ fn zsh_s_own_answer_decides_once_a_zshenv_file_exists() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_uninspectable_zshenv_is_unknown_rather_than_an_absent_startup_file() {
+    let scratch = crate::testdir::dir("atpkg-zdotdir-inventory-error-");
+    let home = scratch.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let file = home.join(".zshenv");
+    assert!(!zshenv_files(&home).contains(&file));
+
+    // An ancestor cycle makes lstat fail even though the startup path is not absent.
+    // This exercises a real discovery failure without depending on the runner's UID.
+    std::fs::remove_dir(&home).unwrap();
+    std::os::unix::fs::symlink("home", &home).unwrap();
+    let error = std::fs::symlink_metadata(&file).unwrap_err();
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    let files = zshenv_files(&home);
+    assert!(files.contains(&file), "discovery hid {error}: {files:?}");
+    let answer = resolve(&home, None, &files, never);
+    assert!(matches!(answer, ZshDir::Unknown(_)), "{answer:?}");
+    assert_eq!(
+        resolve(&home, Some(home.clone()), &files, never),
+        ZshDir::Home,
+        "an admitted environment answer still needs no startup-file inspection"
+    );
+}
+
 /// A zshenv file that resolves under a folder macOS guards with a consent dialog is not run
 /// (no atpkg pass opens one), so the folder is unknown; the control, a zshenv linked from an
 /// ordinary folder, is asked.

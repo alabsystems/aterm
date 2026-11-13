@@ -36,10 +36,20 @@ pub const SYNOPSIS: &str = "pack-bottle <program> (--archive <path> | --install-
      [--triple T] [--strip-components K] [--dep-bottle PATH]… [--donor-root DIR]… \
      [--merge-from PKG] [--key PATH] [--out DIR] [--unsigned | --upload]";
 
-/// Self-relocating `bin/git` wrapper written when `libexec/git-core/git` is staged.
+/// Self-relocating `bin/git` wrapper written when `libexec/git-core/git` is staged. It locates
+/// itself with shell builtins alone (parameter expansion, `cd -P`, `pwd -P`), so it runs under
+/// any PATH its caller gives it, an empty or unset one included: Git's PATH is the caller's tool
+/// PATH, which need not hold `dirname` or any other system utility. It finds its root from the
+/// folder `$0` names, so it is run by its own path (atpkg's PATH shim execs it so) or through a
+/// symlinked directory, never through a symlink to the file itself, whose folder is not `bin/`.
 const GIT_WRAPPER: &str = "#!/bin/sh\n\
-__atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
-__atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
+case $0 in\n\
+  */*) __atpkg_bin_dir=${0%/*} ;;\n\
+  *) __atpkg_bin_dir=. ;;\n\
+esac\n\
+__atpkg_bin_dir=$(CDPATH='' cd -P -- \"${__atpkg_bin_dir:-/}\" && pwd -P) || exit 1\n\
+__atpkg_root=${__atpkg_bin_dir%/*}\n\
+__atpkg_root=${__atpkg_root:-/}\n\
 export ATERM_GIT_ROOT=\"$__atpkg_root\"\n\
 export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
 if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
@@ -800,8 +810,8 @@ pub fn install_git_wrapper(program: &str, stage: &Path) -> Result<bool> {
 
 /// Removes `git-credential-osxkeychain` from a staged git bottle. A bottle's binaries are signed
 /// ad hoc, so each build's helper has an identity of its own that no keychain item's access list
-/// names: a lookup raises macOS's consent dialog and git waits on it, which the owner ruled must
-/// not happen (2026-11-03; `docs/DESIGN-init-system-2026-10-20.md` §1.18). Git asked for a helper
+/// names: a lookup raises macOS's consent dialog and git waits on it, which must
+/// not happen (`docs/DESIGN-init-system-2026-10-20.md` §1.18). Git asked for a helper
 /// it lacks says so and goes on.
 ///
 /// # Errors

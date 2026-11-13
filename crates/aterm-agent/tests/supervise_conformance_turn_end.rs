@@ -126,6 +126,7 @@ fn reading(
     let wall = (st["wall"] > 0 && st["box_up"] == 0).then_some(REFUSED);
     let pending_input = unanswered && phase == Phase::Idle;
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase,
         authoritative: true,
         survey: false,

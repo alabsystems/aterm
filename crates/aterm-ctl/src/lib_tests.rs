@@ -1102,8 +1102,9 @@ fn a_workers_task_follows_only_the_servers_go() {
 /// A WORKER ON THIS MAC IS RECORDED FROM ITS ANSWER, NOT FROM ITS PRINT: a spawn whose answer
 /// cannot be printed (stdout closed: `aterm ctl spawn agent=claude - < task | head -0`, here
 /// this thread's stdout seam) started its worker all the same, so the board holds it (its
-/// aterm's socket lies in the socket folder the spawn reads), in the folder its head resolved; the closed stdout is the call's own error alone, which exits 0
-/// (`exit_for`). The answer is printed once, after the board's record.
+/// aterm's socket lies in the socket folder the spawn reads), in the folder its head resolved;
+/// the closed stdout is the call's own error alone, which exits 0 (`exit_for`). The answer is
+/// printed once, after the board's record: as it prints, the board holds the worker.
 /// NEGATIVE CONTROL: the same spawn with stdout open records the same row, and prints `OK` once.
 #[cfg(unix)]
 #[test]
@@ -1152,7 +1153,17 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
             pwd: Some(Path::new("/Users//me/work")),
             task,
         };
-        let (ended, printed) = stdout_lines_of(closed, || {
+        let at_print = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let watch = {
+            let (at_print, dir) = (at_print.clone(), dir.clone());
+            move |line: &str| {
+                at_print.borrow_mut().push((
+                    line.to_owned(),
+                    board::Board::at(&dir).row("s-0e1").is_some(),
+                ));
+            }
+        };
+        let (ended, printed) = stdout_lines_watched(closed, watch, || {
             spawn_worker_here(
                 &targets,
                 worker,
@@ -1160,6 +1171,11 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
                 Some(std::time::Duration::from_secs(60)),
             )
         });
+        assert_eq!(
+            *at_print.borrow(),
+            [("OK s-0e1 task_rev=1".to_owned(), true)],
+            "printed after the board's record (closed stdout: {closed})"
+        );
         if closed {
             let e = ended.expect_err("stdout closed");
             assert!(is_stdout_closed(&e), "{e}");
@@ -2170,6 +2186,93 @@ fn an_empty_selector_never_reaches_the_socket_and_a_named_one_does() {
         );
     }
     let code = run(&["@.", "task"]).expect("the named selector is sent");
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    assert_eq!(srv.join().expect("server"), "@. task\n");
+}
+
+/// A body announced on the request line has no client path: `paste-bin 5` and `feed-bin 5`
+/// (a counted body, which comes from stdin) and a `len=` among a `post`'s leading options are
+/// refused, and the server's verb table and post scanner, not a list here, say which. A `len=`
+/// word in a post's text (after `--`, or after the first word that is not an option), an inline
+/// `paste`, and a counted verb with nothing inline (the stdin frame) are not.
+#[test]
+fn a_body_announced_on_the_line_is_refused_by_the_verb_table() {
+    let args = |a: &[&str]| strings(a);
+    for (verb, a, refused) in [
+        ("paste-bin", &["262144"][..], true),
+        ("feed-bin", &["5"][..], true),
+        ("feed-bin", &["5", "id=k"][..], true),
+        ("post", &["kind=note", "len=5", "--", "hi"][..], true),
+        (
+            "post",
+            &["to=@s-x", "kind=note", "len=5", "the", "text"][..],
+            true,
+        ),
+        ("post", &["len=5"][..], true),
+        ("paste-bin", &[][..], false),
+        ("feed-bin", &[][..], false),
+        ("post", &["kind=note", "--", "len=5"][..], false),
+        (
+            "post",
+            &["to=@s-x", "kind=note", "retry", "with", "len=5"][..],
+            false,
+        ),
+        ("post", &["kind=note", "see", "len=5", "--", "x"][..], false),
+        ("paste", &["262144"][..], false),
+        ("send", &["len=5"][..], false),
+    ] {
+        let refusal = inline_body_refusal(verb, &args(a));
+        assert_eq!(refusal.is_some(), refused, "{verb} {a:?}");
+        if let Some(e) = refusal {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{verb} {a:?}");
+            assert!(e.to_string().starts_with(verb), "{verb} {a:?}: {e}");
+        }
+    }
+}
+
+/// The same refusal in a whole run: `aterm ctl --sock <s> @. post kind=note len=5 -- hi` used to
+/// send its line and leave the server waiting for 5 bytes until the exchange's deadline; it now
+/// exits on the usage error without dialling, while `@. task` (the negative control) reaches the
+/// very socket with its line intact. Only the `post` form runs here: a counted form the refusal
+/// missed would read this binary's stdin, and the table above covers those.
+#[cfg(unix)]
+#[test]
+fn an_inline_body_length_never_reaches_the_socket_and_a_plain_request_does() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    let scratch = test_scratch_dir("inlinebody");
+    let sock = scratch.path().join("s.sock");
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
+        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut line = String::new();
+        r.read_line(&mut line).expect("request");
+        let mut w = conn;
+        w.write_all(b"OK task rev=0 state=- from=- since_ms=0 result_bytes=0 why=- result_path=- agent=- attention=-\n")
+            .expect("reply");
+        w.flush().expect("flush");
+        line
+    });
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let run = |argv: &[&str]| {
+        let mut full = vec!["--sock", path.as_str()];
+        full.extend_from_slice(argv);
+        real_main(
+            strings(&full).into_iter().map(Into::into).collect(),
+            LocalVerbs::NONE,
+        )
+    };
+    let e = run(&["@.", "post", "kind=note", "len=5", "--", "hi"])
+        .expect_err("an inline body is a usage error");
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    let code = run(&["@.", "task"]).expect("the plain request is sent");
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     assert_eq!(srv.join().expect("server"), "@. task\n");
 }

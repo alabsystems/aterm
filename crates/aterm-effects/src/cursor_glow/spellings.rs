@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Canonical `cursor_trail_style` table and alias resolution.
+//! The `cursor_trail_style` table, and the spellings retired from it.
 
 use super::GlowStyle;
 
 /// One canonical `cursor_trail_style`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrailStyleRow {
-    /// Canonical lower-case spelling saved by Settings and returned by [`canonical`].
+    /// The lower-case spelling aterm.toml holds, returned by [`canonical`].
     pub name: &'static str,
     /// The engine style it draws, or `None` for `off`.
     pub style: Option<GlowStyle>,
@@ -35,36 +35,12 @@ const fn row_of(
 
 /// Canonical trail styles in Settings Cursor Styles display order.
 pub const TRAIL_STYLES: &[TrailStyleRow] = &[
-    row_of("off", None, "Off", "No trail; the cursor stays plain"),
+    row_of("off", None, "Off", "No trail behind the cursor"),
     row_of(
-        "rainbow kitty pet",
+        "rainbow",
         Some(GlowStyle::RainbowKitty),
         "Rainbow kitty",
-        "A rainbow ribbon with a cat that walks beside your cursor",
-    ),
-    row_of(
-        "rainbow kitty underline",
-        Some(GlowStyle::RainbowKitty),
-        "Rainbow underline",
-        "A thin rainbow line under what you type, with the walking cat; keeps text clearest",
-    ),
-    row_of(
-        "rainbow dog pet",
-        Some(GlowStyle::RainbowKitty),
-        "Rainbow dog",
-        "The rainbow ribbon with a dog that walks beside your cursor",
-    ),
-    row_of(
-        "rainbow kitty flying",
-        Some(GlowStyle::RainbowKitty),
-        "Flying kitty",
-        "The rainbow ribbon; a kitty flies in at its head once your typing gathers speed",
-    ),
-    row_of(
-        "rainbow kitty flat",
-        Some(GlowStyle::RainbowKitty),
-        "Flat rainbow",
-        "The rainbow kitty with an even ribbon, the same height end to end",
+        "A thin rainbow line under what you type; keeps text clearest",
     ),
     row_of(
         "phaser",
@@ -122,46 +98,96 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
     ),
 ];
 
-/// Accepted aliases mapped in one step to a [`TRAIL_STYLES`] canonical name.
-pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
-    ("classic wake", "classic"),
-    ("classic mono", "classic"),
-    ("classic lumen", "classic"),
-    ("mono classic", "classic"),
-    ("nyan rainbow", "rainbow kitty flying"),
-    ("nyan", "rainbow kitty flying"),
-    ("rainbow", "rainbow kitty flying"),
-    ("flying kitty", "rainbow kitty flying"),
-    ("kitty flying", "rainbow kitty flying"),
-    ("kitty", "rainbow kitty pet"),
-    ("kitty pet", "rainbow kitty pet"),
-    ("pet kitty", "rainbow kitty pet"),
-    ("rainbow dog", "rainbow dog pet"),
-    ("dog pet", "rainbow dog pet"),
-    ("pet dog", "rainbow dog pet"),
-    ("rainbow puppy pet", "rainbow dog pet"),
-    ("rainbow underline", "rainbow kitty underline"),
-    ("underline rainbow", "rainbow kitty underline"),
-    ("nyan underline", "rainbow kitty underline"),
-    ("rainbow kitty", "rainbow kitty pet"),
-    ("rainbow kitty tall", "rainbow kitty pet"),
-    ("rainbow tall", "rainbow kitty pet"),
-    ("tall rainbow", "rainbow kitty pet"),
-    ("nyan tall", "rainbow kitty pet"),
-    ("rainbow flat", "rainbow kitty flat"),
-    ("flat rainbow", "rainbow kitty flat"),
-    ("nyan flat", "rainbow kitty flat"),
-    ("sparkles", "sparkle"),
-    ("phaser-sparkle", "sparkle"),
-    ("rainbow-sparkle", "sparkle"),
-    ("ember", "fire"),
-    ("embers", "fire"),
-    ("ocean", "water"),
-    ("wave", "water"),
-    ("lightning", "laser"),
-    ("lightbeam", "beam"),
-    ("light-beam", "beam"),
+/// The spellings of `classic` that draw its theme-following face
+/// ([`GlowStyle::style_names_classic_mono`]). They name a face of one row, so they are spellings
+/// of that row and not retired names.
+pub const CLASSIC_MONO_SPELLINGS: &[&str] = &["classic mono", "classic lumen", "mono classic"];
+
+/// One `cursor_trail_style` spelling this build no longer accepts, with what it became: the
+/// style that draws it now and, for a spelling that also named an animal, the `cursor_pet`
+/// ([`crate::cursor_pet`]) that keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredTrailStyle {
+    /// The retired lower-case spelling.
+    pub old: &'static str,
+    /// The [`TRAIL_STYLES`] name it became.
+    pub style: &'static str,
+    /// The `cursor_pet` it named, where it named one.
+    pub pet: Option<&'static str>,
+}
+
+#[inline]
+const fn was(
+    old: &'static str,
+    style: &'static str,
+    pet: Option<&'static str>,
+) -> RetiredTrailStyle {
+    RetiredTrailStyle { old, style, pet }
+}
+
+/// Every retired `cursor_trail_style` spelling. A host rewrites a stored one once
+/// ([`retired`]) and refuses it afterwards; nothing else reads this table, so no retired
+/// spelling resolves to a style.
+///
+/// The five rainbow rows became the one `rainbow` theme, and the animal each named became the
+/// `cursor_pet` setting: the tall, underline and flat ribbons kept the cat, the dog row the dog.
+/// The flying row had no walker (a head flew in at speed): it became the flying cat, a pet of
+/// its own. A row that named no animal drew none, so its file keeps `cursor_pet = "off"`.
+pub const RETIRED_TRAIL_STYLES: &[RetiredTrailStyle] = &[
+    was("rainbow kitty pet", "rainbow", Some("cat")),
+    was("rainbow kitty", "rainbow", Some("cat")),
+    was("rainbow kitty tall", "rainbow", Some("cat")),
+    was("rainbow tall", "rainbow", Some("cat")),
+    was("tall rainbow", "rainbow", Some("cat")),
+    was("nyan tall", "rainbow", Some("cat")),
+    was("kitty", "rainbow", Some("cat")),
+    was("kitty pet", "rainbow", Some("cat")),
+    was("pet kitty", "rainbow", Some("cat")),
+    was("rainbow kitty underline", "rainbow", Some("cat")),
+    was("rainbow underline", "rainbow", Some("cat")),
+    was("underline rainbow", "rainbow", Some("cat")),
+    was("nyan underline", "rainbow", Some("cat")),
+    was("rainbow dog pet", "rainbow", Some("dog")),
+    was("rainbow dog", "rainbow", Some("dog")),
+    was("dog pet", "rainbow", Some("dog")),
+    was("pet dog", "rainbow", Some("dog")),
+    was("rainbow puppy pet", "rainbow", Some("dog")),
+    was("rainbow kitty flying", "rainbow", Some("flying cat")),
+    was("flying kitty", "rainbow", Some("flying cat")),
+    was("kitty flying", "rainbow", Some("flying cat")),
+    was("nyan rainbow", "rainbow", Some("flying cat")),
+    was("nyan", "rainbow", Some("flying cat")),
+    was("rainbow kitty flat", "rainbow", Some("cat")),
+    was("rainbow flat", "rainbow", Some("cat")),
+    was("flat rainbow", "rainbow", Some("cat")),
+    was("nyan flat", "rainbow", Some("cat")),
+    was("classic wake", "classic", None),
+    was("sparkles", "sparkle", None),
+    was("phaser-sparkle", "sparkle", None),
+    was("rainbow-sparkle", "sparkle", None),
+    was("ember", "fire", None),
+    was("embers", "fire", None),
+    was("ocean", "water", None),
+    was("wave", "water", None),
+    was("lightning", "laser", None),
+    was("lightbeam", "beam", None),
+    was("light-beam", "beam", None),
 ];
+
+/// The retired spelling `raw` is (trimmed, ASCII case-insensitive), with what it became.
+#[inline]
+#[must_use]
+pub const fn retired(raw: &str) -> Option<&'static RetiredTrailStyle> {
+    let raw = trim_whitespace_bytes(raw);
+    let mut i = 0;
+    while i < RETIRED_TRAIL_STYLES.len() {
+        if eq_ascii_ci(raw, RETIRED_TRAIL_STYLES[i].old) {
+            return Some(&RETIRED_TRAIL_STYLES[i]);
+        }
+        i += 1;
+    }
+    None
+}
 
 #[inline]
 const fn row_names<const N: usize>() -> [&'static str; N] {
@@ -256,7 +282,8 @@ pub(crate) const fn eq_ascii_ci(bytes: &[u8], target: &str) -> bool {
     true
 }
 
-/// Resolves `raw` (trimmed, ASCII case-insensitive) to its canonical [`TRAIL_STYLES`] name.
+/// Resolves `raw` (trimmed, ASCII case-insensitive) to its [`TRAIL_STYLES`] name. A retired
+/// spelling ([`retired`]) resolves to none.
 #[inline]
 #[must_use]
 pub const fn canonical(raw: &str) -> Option<&'static str> {
@@ -265,32 +292,6 @@ pub const fn canonical(raw: &str) -> Option<&'static str> {
         None => None,
     }
 }
-
-#[inline]
-const fn alias_row_indices<const N: usize>() -> [usize; N] {
-    let mut out = [0; N];
-    let mut ai = 0;
-    while ai < N {
-        let (_, target) = TRAIL_STYLE_ALIASES[ai];
-        let mut ri = 0;
-        let mut found = None;
-        while ri < TRAIL_STYLES.len() {
-            if eq_ascii_ci(target.as_bytes(), TRAIL_STYLES[ri].name) {
-                found = Some(ri);
-                break;
-            }
-            ri += 1;
-        }
-        out[ai] = match found {
-            Some(ri) => ri,
-            None => panic!("alias target not in TRAIL_STYLES"),
-        };
-        ai += 1;
-    }
-    out
-}
-
-const TRAIL_STYLE_ALIAS_ROWS: [usize; TRAIL_STYLE_ALIASES.len()] = alias_row_indices();
 
 /// The [`TRAIL_STYLES`] row a spelling resolves to.
 #[inline]
@@ -307,13 +308,12 @@ pub const fn row(raw: &str) -> Option<&'static TrailStyleRow> {
         }
         i += 1;
     }
-    let mut ai = 0;
-    while ai < TRAIL_STYLE_ALIASES.len() {
-        let (alias, _) = TRAIL_STYLE_ALIASES[ai];
-        if eq_ascii_ci(raw, alias) {
-            return Some(&TRAIL_STYLES[TRAIL_STYLE_ALIAS_ROWS[ai]]);
+    let mut mi = 0;
+    while mi < CLASSIC_MONO_SPELLINGS.len() {
+        if eq_ascii_ci(raw, CLASSIC_MONO_SPELLINGS[mi]) {
+            return row("classic");
         }
-        ai += 1;
+        mi += 1;
     }
     None
 }

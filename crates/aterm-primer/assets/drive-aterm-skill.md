@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine) over its control socket, or drive and read one on another fleet Mac that lets this one drive it. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v19 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v20 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -13,7 +13,13 @@ command in your own shell, not in a session.
 Another Mac: `aterm ctl survey --fleet` reads it. Drive it with `aterm ctl --host <h>` and a
 worker's verbs, each session by its sid, only once its person ran
 `aterm fleet allow drive --from <this Mac>` or `--all` (as `aterm fleet sync`'s first join
-does; `aterm help workers`, ON ANOTHER MAC).
+does; `aterm help workers`, ON ANOTHER MAC), and only as far as that Mac's fleet access admits:
+its survey header says `access=read` (Read Only, every Mac's default: reads alone),
+`access=write` (also turn, key, send, post, hold, close) or `access=full` (also spawn). An act
+above it answers `ERR denied access=<level> needs=<level>: …`. A Mac's fleet access is its
+person's decision (`aterm fleet access`, or the lock in its menu bar): lower it freely, raise
+it only when that Mac's person says so, and when an act is refused, record it and take the
+work elsewhere.
 
 ## Peers are often other agents
 
@@ -119,7 +125,9 @@ cat script.py | aterm ctl "@$SID" paste --stdin                  # with paste se
 ## One turn
 
 On a fleet peer that grants this node drive access, `aterm ctl --host <host> spawn
-cwd=/absolute` opens a background plain shell without an AI worker or task body. Keep the
+cwd=/absolute 'why=<one line saying what it is for>'` opens a background plain shell without an
+AI worker or task body, parked under that Mac's Workers tab; without `why=` (at most 200
+characters) it is refused, since the line is all a person there has to review it by. Keep the
 returned full SID. Only its creating node, before any human adoption, may read its retained
 `blocks [n] [--json]` and `blocktext <id> [trim]`, or wait with `await idle <ms>|block
 timeout=<ms>` (idle duration and explicit timeout at most 22000; zero timeout checks once

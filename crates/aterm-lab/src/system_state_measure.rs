@@ -176,6 +176,8 @@ pub struct TextFit {
     pub clip_truncated: bool,
     pub required: f64,
     pub available: f64,
+    /// Conservative painted-word bounds in logical points, when the audit supplies them.
+    pub word_band: Option<(f64, f64)>,
     /// The words as painted.
     pub painted: String,
 }
@@ -320,6 +322,11 @@ pub fn parse_layout(text: &str) -> Result<Layout, String> {
                 clip_truncated: field(&f, "clip-truncated") == Some("true"),
                 required: number("required"),
                 available: number("available"),
+                word_band: field(&f, "word-band").and_then(|value| {
+                    let (top, bottom) = value.split_once(',')?;
+                    let (top, bottom) = (top.parse::<f64>().ok()?, bottom.parse::<f64>().ok()?);
+                    (top.is_finite() && bottom.is_finite() && bottom > top).then_some((top, bottom))
+                }),
                 painted: field(&f, "painted").unwrap_or_default().to_string(),
             });
         }
@@ -637,7 +644,7 @@ pub fn solid_ink(px: &[Rgb], ground: Rgb) -> Option<Rgb> {
 
 /// Text against its background: each visible node whose words a `paint-text` line audits, its
 /// background the most common colour of its undimmed part ([`Node::undimmed`]) and its ink
-/// [`solid_ink`]. Words a scroll edge cuts ([`scroll_cut`], which [`clip_check`] judges) or a
+/// [`solid_ink`]. Words a scroll edge cuts ([`text_scroll_cut`], which [`clip_check`] judges) or a
 /// list fades out ([`Node::faded`]) are passed over.
 fn text_check(frame: &Image, layout: &Layout) -> Check {
     let mut check = Check::new("text");
@@ -652,11 +659,15 @@ fn text_check(frame: &Image, layout: &Layout) -> Check {
         if fit.painted.trim().is_empty() {
             continue;
         }
+        if !text_visible(node, fit) {
+            check.skip("hidden");
+            continue;
+        }
         if node.disabled {
             check.skip("disabled");
             continue;
         }
-        if scroll_cut(node) {
+        if text_scroll_cut(node, fit) {
             check.skip("cut");
             continue;
         }
@@ -801,6 +812,28 @@ fn scroll_cut(node: &Node) -> bool {
     !shown.is_empty() && (shown.h < node.rect.h * SCROLL_KEEP || shown.w + 0.5 < node.rect.w)
 }
 
+fn text_visible(node: &Node, fit: &TextFit) -> bool {
+    node.visible
+        && !node.rect.intersect(node.clip).is_empty()
+        && fit
+            .word_band
+            .is_none_or(|(top, bottom)| bottom > node.clip.y && top < node.clip.bottom())
+}
+
+/// Painted words can fit even when a scroll edge removes their line box's padding.
+/// Without bounded word geometry, retain the line-box judgement.
+fn text_scroll_cut(node: &Node, fit: &TextFit) -> bool {
+    let Some((top, bottom)) = fit.word_band else {
+        return scroll_cut(node);
+    };
+    let shown = node.rect.intersect(node.clip);
+    // Audit coordinates are rounded to tenths of a point.
+    !shown.is_empty()
+        && (top + 0.1 < node.clip.y
+            || bottom > node.clip.bottom() + 0.1
+            || shown.w + 0.5 < node.rect.w)
+}
+
 /// Whether the edge that cuts the node is only its list's faded bottom edge: its whole width
 /// shown, its bottom cut where its list fades its rows out.
 fn cut_into_fade(node: &Node) -> bool {
@@ -813,7 +846,7 @@ fn cut_into_fade(node: &Node) -> bool {
 
 /// No clipped or ellipsised text: every visible node's words that were ellipsised, need more
 /// room than they have, or are cut by a clip edge (the audit's own judgement) or a scroll edge
-/// ([`scroll_cut`]). Words scrolled wholly out of view are `hidden`, and words a list's faded
+/// ([`text_scroll_cut`]). Words scrolled wholly out of view are `hidden`, and words a list's faded
 /// bottom edge cuts are `faded` ([`cut_into_fade`]), not failed.
 fn clip_check(layout: &Layout) -> Check {
     let mut check = Check::new("clip");
@@ -827,7 +860,7 @@ fn clip_check(layout: &Layout) -> Check {
         if fit.painted.trim().is_empty() {
             continue;
         }
-        if !node.visible || node.rect.intersect(node.clip).is_empty() {
+        if !text_visible(node, fit) {
             check.skip("hidden");
             continue;
         }
@@ -843,10 +876,10 @@ fn clip_check(layout: &Layout) -> Check {
                 "{:?} ellipsised: needs {:.1} pt, has {:.1}",
                 fit.painted, fit.required, fit.available
             ))
-        } else if scroll_cut(node) && cut_into_fade(node) {
+        } else if text_scroll_cut(node, fit) && cut_into_fade(node) {
             check.skip("faded");
             continue;
-        } else if scroll_cut(node) {
+        } else if text_scroll_cut(node, fit) {
             Some(format!("{:?} cut by a scroll edge ({place})", fit.painted))
         } else {
             None

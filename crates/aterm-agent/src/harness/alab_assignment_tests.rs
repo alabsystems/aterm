@@ -60,7 +60,7 @@ fn row(label: &str, dirless: bool, class: Class) -> Row {
     Row {
         label: label.to_owned(),
         class,
-        dir: (!dirless).then(|| format!("/scratch/{label}")),
+        dir: (!dirless).then(|| crate::harness::host_path::abs(&format!("/scratch/{label}"))),
         email: Some(email("x")),
         ..Row::default()
     }

@@ -148,7 +148,7 @@ fn an_agent_never_starts_a_clis_own_sign_in() {
     assert!(runner.calls().is_empty(), "nothing ran under an agent");
 }
 
-/// UNDER AN AGENT ATERM'S OWN SIGN-INS RUN (owner ruling R-13): accounts v2's renewal of a
+/// UNDER AN AGENT ATERM'S OWN SIGN-INS RUN: accounts v2's renewal of a
 /// Claude row with an email and a route, and a pool's renewal of its next row, are aterm's, so
 /// each runs under every agent's marker, with stdin closed (never on the terminal, where a
 /// renewal may open a browser for a person); what only a person gives, the email Claude's

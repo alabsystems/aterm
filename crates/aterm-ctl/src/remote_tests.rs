@@ -295,23 +295,41 @@ fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
 
 #[test]
 fn a_plain_fleet_shell_has_one_explicit_folder_and_no_task_channel() {
+    let owned = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     assert_eq!(
-        shell_spawn_head(&["cwd=/private/tmp".to_owned()]).unwrap(),
-        "spawn cwd=/private/tmp"
+        shell_spawn_head(&owned(&["cwd=/private/tmp", "why=look"])).unwrap(),
+        "spawn cwd=/private/tmp why=look"
     );
     assert_eq!(
-        shell_spawn_head(&["cwd=/a folder".to_owned(), "raise=false".to_owned()]).unwrap(),
-        "spawn cwd=\"/a folder\" raise=false"
+        shell_spawn_head(&owned(&[
+            "cwd=/a folder",
+            "why=read its notes",
+            "raise=false"
+        ]))
+        .unwrap(),
+        "spawn cwd=\"/a folder\" why=\"read its notes\" raise=false"
     );
     assert_eq!(
-        shell_spawn_head(&["cwd=~/My Project".to_owned()]).unwrap(),
-        "spawn cwd=\"~/My Project\"",
+        shell_spawn_head(&owned(&["cwd=~/My Project", "why=look"])).unwrap(),
+        "spawn cwd=\"~/My Project\" why=look",
         "a folder of that Mac's home, which it resolves"
     );
     assert_eq!(
-        shell_spawn_head(&words("cwd=~ raise=false")).unwrap(),
-        "spawn cwd=~ raise=false"
+        shell_spawn_head(&words("cwd=~ why=look raise=false")).unwrap(),
+        "spawn cwd=~ why=look raise=false"
     );
+    // The one form with no brief says what it is for (the requests design §5): none, nothing, a
+    // second line or 201 characters is refused here, before any Mac is dialed.
+    let missing = shell_spawn_head(&words("cwd=/private/tmp")).expect_err("no why=");
+    assert!(missing.to_string().contains("names no why="), "{missing}");
+    for bad in [
+        owned(&["cwd=/tmp", "why="]),
+        owned(&["cwd=/tmp", "why=a\nb"]),
+        vec!["cwd=/tmp".to_owned(), format!("why={}", "w".repeat(201))],
+        owned(&["cwd=/tmp", "why=a", "why=b"]),
+    ] {
+        assert!(shell_spawn_head(&bad).is_err(), "{bad:?}");
+    }
     for (bad, why) in [
         ("cwd=~bob/x", "another account's home"),
         ("cwd=~/../x", "may leave the home"),
@@ -349,6 +367,28 @@ fn a_plain_fleet_shell_has_one_explicit_folder_and_no_task_channel() {
         ("cwd=/tmp window=0", "window=0"),
     ] {
         let refusal = shell_spawn_head(&words(bad)).expect_err(bad).to_string();
+        assert!(refusal.contains(&format!("`{word}`")), "{bad}: {refusal}");
+    }
+}
+
+/// A plain fleet shell joins a request the driven Mac named (`req=<id>`): one id of the shape it
+/// mints. NEGATIVE CONTROLS: an id it never mints and a second `req=` are refused here, naming
+/// the word, before any Mac is dialed.
+#[test]
+fn a_plain_fleet_shell_takes_one_req_of_request_id_shape() {
+    let id = "r-20261109-1411-87be5228-01";
+    assert_eq!(
+        shell_spawn_head(&words(&format!("cwd=/tmp why=look req={id}"))).unwrap(),
+        format!("spawn cwd=/tmp why=look req={id}")
+    );
+    for (bad, word) in [
+        ("cwd=/tmp why=look req=r-1".to_owned(), "req=r-1".to_owned()),
+        (
+            format!("cwd=/tmp why=look req={id} req={id}"),
+            format!("req={id}"),
+        ),
+    ] {
+        let refusal = shell_spawn_head(&words(&bad)).expect_err(&bad).to_string();
         assert!(refusal.contains(&format!("`{word}`")), "{bad}: {refusal}");
     }
 }
@@ -584,12 +624,12 @@ fn a_plain_shell_spawn_retries_only_a_complete_predispatch_busy_reply() {
         CASE.store(case, Ordering::SeqCst);
         CALLS.store(0, Ordering::SeqCst);
         SEEN.lock().unwrap().clear();
-        let result = run("lab-mini", &words("spawn cwd=/tmp"), None, &local);
+        let result = run("lab-mini", &words("spawn cwd=/tmp why=look"), None, &local);
         let expected = if case == 0 { 2 } else { 1 };
         assert_eq!(CALLS.load(Ordering::SeqCst), expected, "case {case}");
         assert_eq!(
             SEEN.lock().unwrap().as_slice(),
-            vec!["spawn cwd=/tmp"; expected],
+            vec!["spawn cwd=/tmp why=look"; expected],
             "case {case}: only the complete Busy response permits another spawn"
         );
         assert_eq!(
@@ -799,7 +839,7 @@ fn spawn_rows(log: &std::path::Path) -> Vec<aterm_telemetry::Row> {
 /// stdout seam) started its worker all the same, so the sender's `kind=spawn` row says `ok` and
 /// the worker's sid on the Mac its dial proved, and the board holds the worker; the closed stdout
 /// is the call's own error alone, which exits 0 (`exit_for`). The answer is printed once, after
-/// both.
+/// both: as it prints, the log holds the row and the board the worker.
 /// NEGATIVE CONTROL: the same spawn with stdout open writes the same row and board row, and
 /// prints `OK` once.
 #[test]
@@ -822,14 +862,25 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
     for closed in [true, false] {
         let (tmp, _here, board) = scratch_board("unprinted");
         let log = aterm_telemetry::log::dir_in(tmp.path());
-        let (ended, printed) = crate::stdout_lines_of(closed, || {
-            spawn_worker(
-                fleet_worker("lab-mini", &args),
-                OWN,
-                drive,
-                Some(log.clone()),
-            )
+        let at_print = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let watch = {
+            let (at_print, log, board) = (at_print.clone(), log.clone(), board.dir().to_owned());
+            move |line: &str| {
+                at_print.borrow_mut().push((
+                    line.to_owned(),
+                    spawn_rows(&log).len(),
+                    crate::board::Board::at(&board).row("s-0e1").is_some(),
+                ));
+            }
+        };
+        let (ended, printed) = crate::stdout_lines_watched(closed, watch, || {
+            spawn_worker(fleet_worker("lab-mini", &args), OWN, drive)
         });
+        assert_eq!(
+            *at_print.borrow(),
+            [("OK s-0e1 task_rev=1".to_owned(), 1, true)],
+            "printed after the row and the board's record (closed stdout: {closed})"
+        );
         if closed {
             let e = ended.expect_err("stdout closed");
             assert!(crate::is_stdout_closed(&e), "{e}");
@@ -879,7 +930,7 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
 /// A FLEET SPAWN WHOSE DIAL FAILED WRITES ITS SENDER'S ROW (Continuum TM-1): no grant, no route,
 /// so nothing was sent: the row says `refused`, names no worker and names the Mac it was for as
 /// the spawn named it, since no dial proved its node. The board records nothing, nothing is
-/// printed, and the call is the dial's refusal.
+/// printed to stdout or told through `stderr_line`, and the call is the dial's refusal.
 #[test]
 fn a_fleet_spawn_whose_dial_failed_writes_a_refused_row_for_the_mac_it_named() {
     fn ungranted(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
@@ -892,17 +943,18 @@ fn a_fleet_spawn_whose_dial_failed_writes_a_refused_row_for_the_mac_it_named() {
     let (tmp, _here, board) = scratch_board("undialled");
     let log = aterm_telemetry::log::dir_in(tmp.path());
     let args = words("agent=claude cwd=/w -");
-    let (ended, printed) = crate::stdout_lines_of(false, || {
-        spawn_worker(
-            fleet_worker("lab-mini", &args),
-            OWN,
-            ungranted,
-            Some(log.clone()),
-        )
+    let ((ended, printed), told) = crate::stderr_lines_of(|| {
+        crate::stdout_lines_of(false, || {
+            spawn_worker(fleet_worker("lab-mini", &args), OWN, ungranted)
+        })
     });
     let refusal = ended.expect_err("the dial failed");
     assert!(refusal.to_string().contains("serves no drive"), "{refusal}");
     assert!(printed.is_empty(), "no answer came: {printed:?}");
+    assert!(
+        told.is_empty(),
+        "the refusal is the call's, told once by its caller: {told:?}"
+    );
     let rows = spawn_rows(&log);
     assert_eq!(
         rows.iter()
@@ -1332,6 +1384,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
 fn any_fleet(ask: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
     assert_eq!(ask.host, None, "every member is read");
     let peer = |n: u8, drive: bool, week: u8| survey::PeerSurvey {
+        authenticated: None,
         reason: None,
         label: format!("m{n}.local"),
         answer: Ok(vec![
@@ -1581,6 +1634,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
             peers: vec![
                 // An unproven member's word for where a sid runs is never taken.
                 survey::PeerSurvey {
+                    authenticated: None,
                     reason: None,
                     label: "m-unproven".into(),
                     answer: Ok(vec![
@@ -1594,6 +1648,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                 },
                 // An entry with no node (a peer named by hand) cannot be driven.
                 survey::PeerSurvey {
+                    authenticated: None,
                     reason: None,
                     label: "m-by-hand at 192.168.1.9".into(),
                     answer: Ok(vec![
@@ -1606,6 +1661,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                     addr: Some("192.168.1.9".into()),
                 },
                 survey::PeerSurvey {
+                    authenticated: None,
                     reason: None,
                     label: "m4.local at 192.168.1.4".into(),
                     answer: Ok(vec![
@@ -1743,6 +1799,7 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
         Ok(survey::FleetRead {
             peers: vec![
                 survey::PeerSurvey {
+                    authenticated: None,
                     reason: None,
                     label: "m-a".into(),
                     answer: Ok(vec![
@@ -1757,6 +1814,7 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
                     addr: None,
                 },
                 survey::PeerSurvey {
+                    authenticated: None,
                     reason: None,
                     label: "m-b".into(),
                     answer: Ok(vec![

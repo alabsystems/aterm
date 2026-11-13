@@ -191,7 +191,7 @@ fn uncheered(app: &App, session: u64) -> Option<u32> {
 fn with_the_pet(app: &mut App, t: &mut Instant) {
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();

@@ -13,7 +13,8 @@ fn the_real_lint_stage_installs_pool_flags_without_an_outer_wrapper() {
         need: aterm_capacity::Need,
         mode: aterm_capacity::Admit,
     ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
-        assert_eq!(need.mem, TIPPY_CLAIM_FLOOR);
+        assert_eq!(need.mem, aterm_capacity::cold_claim(Some(128 << 30)));
+        assert!(need.alone, "a lint never measured here asks to run alone");
         assert_eq!(mode, aterm_capacity::Admit::Wait);
         LEDGER.with(|path| {
             aterm_capacity::admit_with(
@@ -53,8 +54,8 @@ fn the_real_lint_stage_installs_pool_flags_without_an_outer_wrapper() {
         .into_iter()
         .find(|s| s.id == crate::plan::StageId::Tippy)
         .unwrap();
-    // Force the stage estimate light; the enforceable whole-stage floor still bounds Tippy while
-    // its observation belongs to the pooled width.
+    // Force the stage estimate light; the lint was never measured here, so it still claims the
+    // cold figure and runs alone, while its observation belongs to the pooled width.
     spec.mem = 0;
     let quiet = crate::Quiet::of(&ctx, std::slice::from_ref(&spec), crate::LIVE.admit_quiet);
     let early = crate::EarlyClaims::default();
@@ -550,6 +551,10 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
         if mode == "probe" {
             args.extend(["--print", "file-names"].map(OsString::from));
         }
+        if mode == "version" {
+            // Cargo's own first call: no crate name, and nothing compiled.
+            args = vec![compiler.into(), "-vV".into()];
+        }
         assert_eq!(
             entry_on(
                 &args,
@@ -569,10 +574,12 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
         package: "fixture".into(),
         kind: "fixture lib".into(),
     };
-    for mode in ["unit", "probe", "missing", "invalid", "record", "fail"] {
+    for mode in [
+        "unit", "probe", "version", "missing", "invalid", "record", "fail",
+    ] {
         let book = dir.path().join(format!("{mode}.json"));
         let pending = dir.path().join(format!("{mode}.pending.json"));
-        if matches!(mode, "unit" | "probe" | "missing" | "invalid") {
+        if matches!(mode, "unit" | "probe" | "version" | "missing" | "invalid") {
             let mut records = crate::memory::Records::default();
             records.push(
                 crate::shape::compiler_unit_key(crate::shape::UNIT_STAGE, "/fixture", &unit),
@@ -618,6 +625,8 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
             String::from_utf8_lossy(&output.stderr)
         );
         let log = String::from_utf8_lossy(&output.stderr);
+        // NEGATIVE CONTROL: `-vV` read as an unidentified compiler claimed the whole cold
+        // envelope for a version string, and was refused on a Mac that can never have it.
         assert_eq!(
             log.contains("compiler width now 1"),
             matches!(mode, "unit" | "missing" | "invalid"),
@@ -653,6 +662,47 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
     }
 }
 
+/// A whole-workspace release's unmeasured unit asks for the stage's plan (32.8 GiB on
+/// 2026-11-12) and the driver's 2 GiB beside it. A 32 GiB Mac can never have that, and the
+/// wrapper refused the unit, so the release could not compile its tests there. The unit now
+/// runs alone on such a Mac and is admitted once nothing else holds memory; where the claim
+/// can fit, it is asked for as before.
+#[test]
+fn a_unit_claim_this_mac_can_never_hold_runs_alone_instead_of_being_refused() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let unit = |bytes: u64| {
+        aterm_capacity::Need::new("verify TestCompile unit compiler unit run fixture lib")
+            .mem(bytes)
+            .covers()
+            .margin(DRIVER_CLAIM)
+    };
+    let plan = (32 << 30) + (800 << 20);
+    let small = aterm_capacity::Reading::of_gib(32, 18, 12);
+    assert!(
+        aterm_capacity::never(&unit(plan), &small).is_some(),
+        "NEGATIVE CONTROL: as it was asked, this Mac can never admit the claim"
+    );
+    let fitted = unit_need(unit(plan), &small);
+    assert!(fitted.alone);
+    assert_eq!(aterm_capacity::never(&fitted, &small), None);
+    let claim = aterm_capacity::admit::try_admit_with(
+        &aterm_capacity::Ledger::at(dir.path().join("small")),
+        &aterm_capacity::Fixed::new(small.clone()),
+        fitted,
+    )
+    .unwrap()
+    .expect("admitted alone: no other claim holds memory");
+    assert!(claim.alone().is_some());
+    assert!(
+        !unit_need(unit(3 << 30), &small).alone,
+        "a claim that fits beside the driver is asked for as it is"
+    );
+    assert!(
+        !unit_need(unit(plan), &aterm_capacity::Reading::of_gib(128, 76, 18)).alone,
+        "a Mac that can hold the plan admits it beside the other units"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {
@@ -676,7 +726,7 @@ fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {
     LEDGER.with(|path| path.replace(Some(dir.path().join("ledger"))));
     let path = dir.path().join("book.json");
     let scope = crate::Scope::crate_only("aterm-gui");
-    let ctx = crate::Ctx::new(
+    let mut ctx = crate::Ctx::new(
         dir.path().to_owned(),
         scope.clone(),
         crate::EnvSnapshot::default(),
@@ -701,9 +751,16 @@ fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {
         kind: "aterm_gui test".into(),
     };
 
-    let cold_test = claim(&ctx, &test_compile, admit).unwrap().unwrap();
-    assert_eq!(cold_test.claim.record().need.mem, 50 << 30);
-    drop(cold_test);
+    for jobs in ["1", "3", "14"] {
+        ctx.env.cargo_build_jobs = Some(jobs.into());
+        let cold_test = claim(&ctx, &test_compile, admit).unwrap().unwrap();
+        assert_eq!(
+            cold_test.claim.record().need.mem,
+            50 << 30,
+            "NEGATIVE CONTROL: compiler width {jobs} cannot lower a cold full-stage claim"
+        );
+        drop(cold_test);
+    }
     let test_book = unit_book(&path, crate::plan::StageId::TestCompile);
     let mut valid = crate::memory::Records::default();
     valid.push(
@@ -777,12 +834,12 @@ fn an_obsolete_tippy_unit_book_cannot_replace_the_whole_stage_claim() {
         .find(|spec| spec.id == crate::plan::StageId::Tippy)
         .unwrap();
     let mut larger = spec.clone();
-    larger.mem = TIPPY_CLAIM_FLOOR + (1 << 30);
+    larger.mem = 29 << 30;
     let larger_claim = claim(&ctx, &larger, admit).unwrap().unwrap();
     assert_eq!(
         larger_claim.claim.record().need.mem,
         larger.mem,
-        "a learned whole-stage need above the floor must win"
+        "the planned whole-stage need is what the lint claims"
     );
     drop(larger_claim);
     let early = crate::EarlyClaims::for_run(&ctx, std::slice::from_ref(&spec), admit).unwrap();
@@ -794,11 +851,11 @@ fn an_obsolete_tippy_unit_book_cannot_replace_the_whole_stage_claim() {
             .expect("Tippy is pre-admitted");
         let record = claim.claim.record();
         assert_eq!(record.need.what, format!("verify {}", spec.title));
-        assert_eq!(record.need.mem, TIPPY_CLAIM_FLOOR);
-        assert_ne!(
-            record.need.mem,
-            16 << 30,
-            "NEGATIVE CONTROL: the old cold claim did not bound the measured 22.3 GiB learner"
+        assert_eq!(record.need.mem, spec.mem);
+        assert!(
+            record.need.alone && record.held.is_some_and(|held| held.alone),
+            "NEGATIVE CONTROL: a lint never measured here has no figure that bounds it (a 16 GiB \
+             cold claim met a 22.3 GiB compile), so it holds the machine's memory alone"
         );
         assert_eq!(record.need.rank, aterm_capacity::Rank::Release);
         assert!(record.need.covers);
@@ -844,4 +901,120 @@ fn an_obsolete_tippy_unit_book_cannot_replace_the_whole_stage_claim() {
     })
     .join()
     .unwrap();
+}
+
+fn lint_need(bytes: u64, how: crate::memory::How) -> crate::memory::StageNeed {
+    crate::memory::StageNeed { bytes, how }
+}
+
+fn learned(peak: u64) -> crate::memory::Learned {
+    crate::memory::Learned {
+        peak,
+        runs: 1,
+        wider: None,
+    }
+}
+
+/// The pooled lint's claim is evidence, not a constant: a peak this machine kept sizes it, on a
+/// Mac of any size, and it runs beside other claims; with none kept it asks for the machine's
+/// memory alone. NEGATIVE CONTROL: the 28 GiB floor this replaced waited without end on a
+/// 32 GiB Mac whose available memory never passed 23 GiB (2026-11-11, twelve hours).
+#[test]
+fn the_pooled_lint_claims_its_measured_peak_or_the_machine_alone() {
+    const GIB: u64 = 1 << 30;
+    let small = (Some(32 * GIB), 29 * GIB);
+    let measured = lint_claim(
+        12 * GIB,
+        &lint_need(12 * GIB, crate::memory::How::Learned(learned(10 * GIB))),
+        small.0,
+        small.1,
+    );
+    assert_eq!(
+        measured,
+        LintClaim {
+            bytes: 12 * GIB,
+            alone: false,
+            measured: true
+        }
+    );
+    let elsewhere = lint_claim(
+        12 * GIB,
+        &lint_need(12 * GIB, crate::memory::How::Elsewhere(learned(10 * GIB))),
+        small.0,
+        small.1,
+    );
+    assert!(elsewhere.measured && !elsewhere.alone);
+    let cold = lint_claim(
+        16 * GIB,
+        &lint_need(16 * GIB, crate::memory::How::Cold),
+        small.0,
+        small.1,
+    );
+    assert_eq!(
+        cold,
+        LintClaim {
+            bytes: 16 * GIB,
+            alone: true,
+            measured: false
+        }
+    );
+    let unplanned = lint_claim(
+        0,
+        &lint_need(0, crate::memory::How::Light),
+        small.0,
+        small.1,
+    );
+    assert_eq!(
+        (unplanned.bytes, unplanned.alone),
+        (aterm_capacity::cold_claim(small.0), true)
+    );
+    let beyond = lint_claim(
+        30 * GIB,
+        &lint_need(30 * GIB, crate::memory::How::Learned(learned(25 * GIB))),
+        small.0,
+        small.1,
+    );
+    assert!(
+        beyond.measured && beyond.alone,
+        "a measured peak beyond what can ever be available runs alone"
+    );
+    let large = lint_claim(
+        30 * GIB,
+        &lint_need(30 * GIB, crate::memory::How::Learned(learned(25 * GIB))),
+        Some(128 * GIB),
+        120 * GIB,
+    );
+    assert!(large.measured && !large.alone);
+}
+
+/// The waits end. A measured lint short only of memory no claim holds is admitted alone by the
+/// ledger's ALONE rule, and an unmeasured one once no claim holds memory, on a Mac whose
+/// available memory stays below either. NEGATIVE CONTROL: the same need with the margin the
+/// floor carried is refused that admission and waits.
+#[test]
+fn the_pooled_lint_is_admitted_on_a_mac_that_never_has_its_claim_free() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(32, 18, 12));
+    let ask = |name: &str, need: aterm_capacity::Need| {
+        aterm_capacity::admit::try_admit_with(
+            &aterm_capacity::Ledger::at(dir.path().join(name)),
+            &machine,
+            need,
+        )
+        .unwrap()
+    };
+    let lint = |bytes: u64| {
+        aterm_capacity::Need::new("verify tippy lint (--workspace)")
+            .rank(aterm_capacity::Rank::Release)
+            .mem(bytes)
+            .covers()
+    };
+    let measured = ask("measured", lint(22 << 30)).expect("admitted alone by shortage");
+    assert!(measured.alone().is_some());
+    let cold = ask("cold", lint(16 << 30).alone()).expect("admitted alone by asking");
+    assert!(cold.alone().is_some());
+    assert!(
+        ask("floor", lint(28 << 30).margin(1)).is_none(),
+        "NEGATIVE CONTROL: the margined floor is never admitted here"
+    );
 }

@@ -33,6 +33,7 @@ use aterm_json::Value;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::collections::BTreeMap;
 
+pub use crate::documents::log::Hlc;
 pub(crate) use edit::edit as edit_grid;
 pub(crate) use edit::show as show_grid;
 pub use edit::{Edited, GridSecrets, Opener, amacs, in_editor_tab, open_secrets};
@@ -233,82 +234,8 @@ pub fn secret_digest(
 }
 
 #[cfg(test)]
-mod secret_digest_tests {
-    use super::*;
-    use crate::database::{Candidate, Cell as Stored};
-    use crate::typed::{
-        Column, Derive, Kind, Ty, Writers,
-        secret::{Cell, Secret},
-    };
-
-    const COLLECTION: Collection = Collection {
-        name: "mailbox",
-        version: 1,
-        kind: Kind::Cells,
-        writers: Writers::Owner,
-        prefix: "mb",
-        derive: Derive::Random,
-        columns: &[
-            Column::new("row", Ty::Enum(&["live", "ended"])),
-            Column::new("password", Ty::Secret).null(),
-        ],
-        unique: &[],
-        max_row: 1024,
-    };
-
-    fn cells(password: &str, epoch: Digest, key: [u8; 32]) -> Cells {
-        let token = Secret::new(password.into())
-            .seal(
-                &key,
-                &epoch,
-                Cell {
-                    table: "alab/registry",
-                    collection: "mailbox",
-                    row: "mb-test",
-                    column: "password",
-                },
-            )
-            .unwrap();
-        BTreeMap::from([(
-            ("mailbox".into(), "mb-test.password".into()),
-            Stored {
-                stopped: false,
-                candidates: vec![Candidate {
-                    operation: [1; 32],
-                    value: cell::CellValue::owner(1, Value::String(token)).encode(),
-                }],
-            },
-        )])
-    }
-
-    #[test]
-    fn digest_compares_logical_values_and_names_its_epoch() {
-        let epoch = [2; 32];
-        let key = [3; 32];
-        let digest = |cells: &Cells, epoch: &Digest, key: &[u8; 32]| {
-            secret_digest("alab/registry", &COLLECTION, cells, epoch, key, |_| {
-                Ok(zeroize::Zeroizing::new([3; 32]))
-            })
-            .unwrap()
-        };
-        let first = cells("fixture-one", epoch, key);
-        let resealed = cells("fixture-one", epoch, key);
-        assert_ne!(first, resealed);
-        let one = digest(&first, &epoch, &key);
-        assert_eq!(one, digest(&resealed, &epoch, &key));
-        assert_ne!(
-            one.digest,
-            digest(&cells("fixture-two", epoch, key), &epoch, &key).digest
-        );
-        let rotated = digest(&first, &[4; 32], &[5; 32]);
-        assert_ne!(one.digest, rotated.digest);
-        assert_ne!(one.epoch, rotated.epoch);
-        assert_eq!(one.compare(&rotated), DigestComparison::DifferentEpoch);
-        assert_eq!((one.rows, one.with_secret), (1, 1));
-        assert!(one.to_string().starts_with(&format!("epoch={}", one.epoch)));
-        assert!(!one.to_string().contains("fixture-one"));
-    }
-}
+#[path = "att_secret_digest_tests.rs"]
+mod secret_digest_tests;
 
 /// A typed catalog table this build compiles.
 #[derive(Clone, Copy, Debug)]
@@ -751,6 +678,15 @@ pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
     Ok(records)
 }
 
+/// What [`Handle::save`] came to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Saved {
+    /// Written: the plan read from the text, and what the write did.
+    Written { plan: Box<Plan>, applied: Applied },
+    /// Nothing written: where and why, never a value.
+    Problems(Vec<grid::Problem>),
+}
+
 /// What a grid save wrote.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Applied {
@@ -843,8 +779,10 @@ pub struct Entry {
     pub actor: Actor,
     /// The writer's Commons machine, from the binding in the roster the record names.
     pub machine: Option<[u8; 16]>,
-    /// The writer's clock claim, never an ordering input.
+    /// The signed writer clock claim, retained separately from the derived causal order.
     pub authored_ms: u64,
+    /// Read-time clock derived from the authenticated causal graph, including hidden parents.
+    pub hlc: Hlc,
     pub request: Option<[u8; 16]>,
     pub reverts: Option<Digest>,
     pub changes: Vec<Change>,
@@ -1104,31 +1042,31 @@ impl Handle {
         })
     }
 
-    /// Every eligible operation, oldest claim first, with its writer's machine resolved through
-    /// the roster the record names, so a removed Mac's edits stay attributable.
+    /// Every eligible edit in derived causal-clock order, with concurrent edits ordered by
+    /// clock then digest. The writer's machine is resolved through the record's roster.
     ///
     /// # Errors
-    /// As [`Self::view`].
+    /// As [`Self::view`]; also refuses incomplete causal clocks or a logical counter overflow.
     pub fn history(&self) -> Result<Vec<Entry>> {
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
                 let resolve = owned::commons::historical(session);
-                let mut entries: Vec<Entry> = log
-                    .into_eligible()
-                    .filter_map(|(operation, command)| {
+                let entries: Vec<Entry> = log
+                    .into_causal_history()?
+                    .filter_map(|(operation, command, hlc)| {
                         Some(Entry {
                             operation: operation.header.id,
                             actor: operation.header.actor,
                             machine: resolve(&operation.roster, &operation.header.actor),
                             authored_ms: operation.authored_ms,
+                            hlc,
                             request: operation.request,
                             reverts: operation.reverts,
                             changes: command.into_changes()?,
                         })
                     })
                     .collect();
-                entries.sort_unstable_by_key(|e| (e.authored_ms, e.operation));
                 Ok(entries)
             })
         })
@@ -1422,6 +1360,37 @@ impl Handle {
                 Ok((planned, applied))
             },
         )
+    }
+
+    /// Write the cells a grid's text changed against the export `base` it was laid out from: the
+    /// one save path of `aterm db table apply` and the Tables page. The text is read as the grid
+    /// reads it ([`grid::plan`], a new row keyed by [`Compiled::born`]), then written by
+    /// [`Self::apply`]. Cells the save cannot take, a refusal of the table's rules among them,
+    /// come back as problems, and then nothing is written.
+    ///
+    /// # Errors
+    /// As [`Self::view`] and [`Self::apply`].
+    pub fn save(
+        &self,
+        collection: &'static Collection,
+        base: &grid::Base,
+        text: &str,
+    ) -> Result<Saved> {
+        let compiled = self.compiled;
+        let view = self.view()?;
+        let birth = |c: &Collection, values: &_| compiled.born(c, values, &view.cells);
+        let plan = match grid::plan(compiled.table, collection, base, text, &birth) {
+            Ok(plan) => plan,
+            Err(found) => return Ok(Saved::Problems(found)),
+        };
+        let applied = self.apply(collection, &plan)?;
+        if let Some(refused) = &applied.refused {
+            return Ok(Saved::Problems(vec![edit::refused_problem(&plan, refused)]));
+        }
+        Ok(Saved::Written {
+            plan: Box::new(plan),
+            applied,
+        })
     }
 
     /// Append the exact compensation of `operation` while every key it wrote still holds it as

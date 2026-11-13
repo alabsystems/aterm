@@ -191,7 +191,7 @@ fn a_registry_label_waits_for_its_local_writer() {
     {
         let book = member::hold_book(&lab.places.state).unwrap();
         book.write_key(&[0x44; 24]).unwrap();
-        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).unwrap().as_ref()).unwrap();
     }
     let Err(drive) = drive_fleet_in(&lab.places, "m42", Duration::ZERO) else {
         panic!("an expired drive cannot resolve the label");
@@ -522,6 +522,7 @@ impl Lab {
         )
         .unwrap();
 
+        crate::fleet_vault::take_fixture(&places.state, Some(&paths)).unwrap();
         let admitted = Self::snapshot_of(&paths);
 
         // m8: roster deny.
@@ -1448,7 +1449,7 @@ fn a_join_elsewhere_admits_no_node_by_the_book_until_the_vault_joineds_log_is_he
     for id in lab.members() {
         assert_eq!(
             drives_here(&lab.places, id.node()),
-            None,
+            Some(false),
             "{} drives this Mac by the book and its grant",
             id.node()
         );
@@ -1481,7 +1482,7 @@ fn after_a_move_to_another_vault_no_mac_of_the_vault_left_drives_by_its_grants()
     {
         let book = member::hold_book(&lab.places.state).unwrap();
         book.write_key(&[0x44; 24]).unwrap();
-        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).unwrap().as_ref()).unwrap();
     }
     assert_eq!(
         crate::fleet_vault::tenure(&lab.places.state, Some(&lab.paths)),
@@ -1585,7 +1586,7 @@ fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before()
     {
         let book = member::hold_book(&lab.places.state).unwrap();
         book.write_key(&[0x44; 24]).unwrap();
-        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).unwrap().as_ref()).unwrap();
     }
     let (other, source) = other_vault(&lab);
     join_other(&lab, &source);
@@ -1622,7 +1623,7 @@ fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before()
     crate::test_config::write(&lab.places.config, "[fleet]\nallow = \"content\"\n").unwrap();
     {
         let book = member::hold_book(&lab.places.state).unwrap();
-        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).unwrap().as_ref()).unwrap();
     }
     assert_eq!(
         (driving(&lab.places), drives_here(&lab.places, m31.node())),

@@ -28,6 +28,8 @@ path = "src/lib.rs"
 # C dependency family.
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 # SHA-256 of the frames the zstd CLI wrote (tests/cli_frames.rs) and of what
 # the recorded frames decode to (tests/cli_decode.rs, tests/sweep.rs). Those
 # recorded answers are the decoder's oracle.

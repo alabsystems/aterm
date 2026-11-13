@@ -42,6 +42,7 @@ mod supervise_conformance_condition_resume;
 mod supervise_conformance_credits_hold;
 mod supervise_conformance_cruise;
 mod supervise_conformance_land;
+mod supervise_conformance_model_switch;
 mod supervise_conformance_outage_wait;
 mod supervise_conformance_turn_end;
 mod supervise_conformance_usage_wall;

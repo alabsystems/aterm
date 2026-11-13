@@ -370,6 +370,7 @@ fn a_required_native_tls_answer_waits_for_its_inflight_writer() {
                         proceed.send(()).unwrap();
                     }
                 },
+                Arc::new(|| Ok(())),
             )
         });
         let mut bytes = Vec::new();
@@ -437,7 +438,7 @@ fn a_pinned_tls_stream_relays_a_control_exchange_end_to_end() {
         )
         .unwrap();
         let t = accept(tcp, scfg).unwrap();
-        relay_answers(t, svc_a, ()).unwrap();
+        relay_answers(t, svc_a, (), Arc::new(|| Ok(()))).unwrap();
     });
 
     let ccfg = client_config(pin);
@@ -489,7 +490,7 @@ fn relay_streams_a_large_payload_under_send_side_backpressure_without_truncating
         )
         .unwrap();
         let t = accept(tcp, scfg).unwrap();
-        relay_answers(t, svc_a, ()).unwrap();
+        relay_answers(t, svc_a, (), Arc::new(|| Ok(()))).unwrap();
     });
 
     let ccfg = client_config(pin);
@@ -571,7 +572,7 @@ fn an_answer_says_nothing_of_the_end_while_its_guard_is_held() {
             entered: entered_tx,
             gate,
         };
-        answer(t, guard, |stream| {
+        answer(t, guard, &|| Ok(()), |stream| {
             let mut asked = [0u8; 5];
             stream.read_exact(&mut asked)?;
             stream.write_all(b"pong\n")
@@ -609,6 +610,134 @@ fn an_answer_says_nothing_of_the_end_while_its_guard_is_held() {
 }
 
 #[test]
+fn custody_revocation_blocks_content_before_tls_writes_it() {
+    let _serial = serialize_loopback();
+    for revoke in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            let transport = accept(tcp, config).unwrap();
+            let current = std::sync::atomic::AtomicBool::new(true);
+            answer(
+                transport,
+                (),
+                &|| {
+                    if current.load(std::sync::atomic::Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "custody changed",
+                        ))
+                    }
+                },
+                |stream| {
+                    let mut request = [0; 1];
+                    stream.read_exact(&mut request)?;
+                    current.store(!revoke, std::sync::atomic::Ordering::Release);
+                    stream.write_all(b"content")
+                },
+            )
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut client = connect(
+            tcp,
+            test_server_name(),
+            client_config(cert_fingerprint(TEST_CERT_DER)),
+        )
+        .unwrap();
+        client.stream().write_all(b"?").unwrap();
+        client.stream().flush().unwrap();
+        let mut content = Vec::new();
+        let read = client.stream().read_to_end(&mut content);
+        let served = server.join().unwrap();
+        if revoke {
+            assert!(content.is_empty());
+            assert_eq!(served.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        } else {
+            read.unwrap();
+            served.unwrap();
+            assert_eq!(content, b"content");
+        }
+    }
+}
+
+#[test]
+fn custody_revocation_blocks_a_relays_prepared_content() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serial = serialize_loopback();
+    for revoke in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let current = Arc::new(AtomicBool::new(true));
+        let changed = Arc::clone(&current);
+        let (local, mut service) = CtlStream::pair().unwrap();
+        let prepared = std::thread::spawn(move || {
+            let mut request = [0; 1];
+            service.read_exact(&mut request).unwrap();
+            changed.store(!revoke, Ordering::Release);
+            let _ = service.write_all(b"content").and_then(|()| service.flush());
+        });
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
+            let transport = accept(tcp, config).unwrap();
+            relay_answers(
+                transport,
+                local,
+                (),
+                Arc::new(move || {
+                    if current.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "custody changed",
+                        ))
+                    }
+                }),
+            )
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut client = connect(
+            tcp,
+            test_server_name(),
+            client_config(cert_fingerprint(TEST_CERT_DER)),
+        )
+        .unwrap();
+        client.stream().write_all(b"?").unwrap();
+        client.stream().flush().unwrap();
+        let mut content = Vec::new();
+        let read = client.stream().read_to_end(&mut content);
+        prepared.join().unwrap();
+        let served = server.join().unwrap();
+        if revoke {
+            assert!(content.is_empty());
+            assert_eq!(served.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        } else {
+            read.unwrap();
+            served.unwrap();
+            assert_eq!(content, b"content");
+        }
+    }
+}
+
+#[test]
 fn an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held() {
     use std::sync::mpsc;
     let _serial = serialize_loopback();
@@ -642,7 +771,7 @@ fn an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held() {
             entered: entered_tx,
             gate,
         };
-        let _ = relayed_tx.send(relay_answers(t, svc_a, guard));
+        let _ = relayed_tx.send(relay_answers(t, svc_a, guard, Arc::new(|| Ok(()))));
     });
 
     let tcp = TcpStream::connect(addr).unwrap();
@@ -717,7 +846,12 @@ fn a_cut_answering_relay_ends_though_neither_end_reads() {
         .unwrap();
         line_tx.send(tcp.try_clone().unwrap()).unwrap();
         let t = accept(tcp, scfg).unwrap();
-        let _ = relayed_tx.send(relay_answers(t, svc_a, SaysDropped(dropped_tx)));
+        let _ = relayed_tx.send(relay_answers(
+            t,
+            svc_a,
+            SaysDropped(dropped_tx),
+            Arc::new(|| Ok(())),
+        ));
     });
 
     let tcp = TcpStream::connect(addr).unwrap();
@@ -779,7 +913,12 @@ fn an_answering_relay_ends_though_a_copy_of_its_hung_up_local_end_lives_on() {
         )
         .unwrap();
         let t = accept(tcp, scfg).unwrap();
-        let _ = relayed_tx.send(relay_answers(t, svc_a, SaysDropped(dropped_tx)));
+        let _ = relayed_tx.send(relay_answers(
+            t,
+            svc_a,
+            SaysDropped(dropped_tx),
+            Arc::new(|| Ok(())),
+        ));
     });
 
     let tcp = TcpStream::connect(addr).unwrap();
@@ -862,7 +1001,7 @@ fn an_answering_relay_whose_peer_fails_holds_its_guard_through_the_line() {
         )
         .unwrap();
         let t = accept(tcp, scfg).unwrap();
-        let _ = relayed_tx.send(relay_answers(t, svc_a, guard));
+        let _ = relayed_tx.send(relay_answers(t, svc_a, guard, Arc::new(|| Ok(()))));
     });
     let (asked_tx, asked) = mpsc::channel();
     let serving = std::thread::spawn(move || {
@@ -969,7 +1108,7 @@ fn relay_early_request_close_delivers_guarded_reply_but_not_late_ack() {
         )
         .unwrap();
         let transport = accept(tcp, scfg).unwrap();
-        relay_answers(transport, svc_a, ()).unwrap();
+        relay_answers(transport, svc_a, (), Arc::new(|| Ok(()))).unwrap();
     });
 
     let tcp = TcpStream::connect(addr).unwrap();
@@ -1125,7 +1264,7 @@ fn relay_round_trips_guarded_artifact_ack_before_request_half_close() {
             }
         };
 
-        relay_answers(transport, svc_a, ()).unwrap();
+        relay_answers(transport, svc_a, (), Arc::new(|| Ok(()))).unwrap();
         buffered_bytes
     });
 
@@ -1265,7 +1404,8 @@ fn relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down() {
     }
 
     let (local_relay, mut local_app) = CtlStream::pair().unwrap();
-    let relayed = std::thread::spawn(move || relay_answers(transport, local_relay, ()));
+    let relayed =
+        std::thread::spawn(move || relay_answers(transport, local_relay, (), Arc::new(|| Ok(()))));
     local_app
         .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
         .unwrap();

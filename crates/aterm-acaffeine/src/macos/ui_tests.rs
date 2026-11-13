@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_objc::Encode;
+use aterm_objc::{Bool, Encode};
 
 use super::*;
 
@@ -20,53 +20,24 @@ fn plain(startup: Startup) -> menu::Shown<'static> {
     }
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
-    CGRect {
-        origin: CGPoint { x, y },
-        size: CGSize {
-            width: w,
-            height: h,
-        },
-    }
-}
-
 #[test]
 fn the_image_is_the_icons_size() {
     assert_eq!(f64::from(POINTS), icon::SIZE_POINTS);
 }
 
 #[test]
-fn the_icons_pngs_decode_to_a_bitmap_per_scale() {
-    use aterm_objc::send::send_isize;
+fn each_face_is_a_template_image_with_a_bitmap_per_scale() {
+    use aterm_objc::send::{send_bool, send_usize};
     for lit in [false, true] {
-        for scale in SCALES {
-            let px = POINTS * scale;
-            let rep = bitmap(&icon::png(lit, px)).expect("decodes");
-            // SAFETY: `-pixelsWide` and `-pixelsHigh` are `q16@0:8` on the live bitmap.
-            let (w, h) = unsafe {
-                (
-                    send_isize(rep.id(), sel!(pixelsWide)),
-                    send_isize(rep.id(), sel!(pixelsHigh)),
-                )
-            };
-            let px = isize::try_from(px).expect("px");
-            assert_eq!((w, h), (px, px), "lit={lit} scale={scale}");
-        }
+        let image = template_image(lit).expect("an image");
+        // SAFETY: `-isTemplate` is `B16@0:8`, `-representations` `@16@0:8` (+0, read inside
+        // this pool) and `-count` `Q16@0:8`, on the live image and without side effects.
+        autoreleasepool(|_| unsafe {
+            assert!(send_bool(image.id(), sel!(isTemplate)), "lit={lit}");
+            let reps = send_id(image.id(), sel!(representations));
+            assert_eq!(send_usize(reps, sel!(count)), SCALES.len(), "lit={lit}");
+        });
     }
-    assert!(bitmap(&[]).is_none());
-    assert!(bitmap(b"not a png").is_none());
-}
-
-#[test]
-fn the_menu_drops_from_the_buttons_bottom_left_corner() {
-    let flipped = popup_point(rect(0.0, 0.0, 24.0, 22.0), true);
-    assert_eq!((flipped.x, flipped.y), (0.0, 22.0 + POPUP_GAP));
-    let unflipped = popup_point(rect(0.0, 0.0, 24.0, 22.0), false);
-    assert_eq!((unflipped.x, unflipped.y), (0.0, -POPUP_GAP));
-    let moved = popup_point(rect(5.0, 2.0, 24.0, 22.0), true);
-    assert_eq!((moved.x, moved.y), (5.0, 24.0 + POPUP_GAP));
-    let moved = popup_point(rect(5.0, 2.0, 24.0, 22.0), false);
-    assert_eq!((moved.x, moved.y), (5.0, 2.0 - POPUP_GAP));
 }
 
 #[test]
@@ -188,7 +159,6 @@ fn every_send_here_has_the_prototype_the_runtime_reports() {
         usize::ENCODING,
         f64::ENCODING,
     );
-    let (pt, sz, rc) = (CGPoint::ENCODING, CGSize::ENCODING, CGRect::ENCODING);
     let rows: &[(&'static std::ffi::CStr, Sel, bool, String)] = &[
         (c"NSStatusBar", sel!(systemStatusBar), true, types(id, &[])),
         (
@@ -212,60 +182,15 @@ fn every_send_here_has_the_prototype_the_runtime_reports() {
         ),
         (
             c"NSStatusBarButton",
-            sel!(setTarget:),
-            false,
-            types(v, &[id]),
-        ),
-        (
-            c"NSStatusBarButton",
-            sel!(setAction:),
-            false,
-            types(v, &[sel_]),
-        ),
-        (
-            c"NSStatusBarButton",
-            sel!(sendActionOn:),
-            false,
-            types(q, &[uq]),
-        ),
-        (
-            c"NSStatusBarButton",
             sel!(setAccessibilityLabel:),
             false,
             types(v, &[id]),
         ),
         (
             c"NSStatusBarButton",
-            sel!(setAccessibilityCustomActions:),
-            false,
-            types(v, &[id]),
-        ),
-        (
-            c"NSAccessibilityCustomAction",
-            sel!(initWithName:target:selector:),
-            false,
-            types(id, &[id, id, sel_]),
-        ),
-        (c"NSArray", sel!(arrayWithObject:), true, types(id, &[id])),
-        (
-            c"NSStatusBarButton",
             sel!(setImage:),
             false,
             types(v, &[id]),
-        ),
-        (
-            c"NSStatusBarButton",
-            sel!(highlight:),
-            false,
-            types(v, &[b]),
-        ),
-        (c"NSStatusBarButton", sel!(bounds), false, types(rc, &[])),
-        (c"NSStatusBarButton", sel!(isFlipped), false, types(b, &[])),
-        (
-            c"NSMenu",
-            sel!(popUpMenuPositioningItem:atLocation:inView:),
-            false,
-            types(b, &[id, pt, id]),
         ),
         (c"NSMenu", sel!(init), false, types(id, &[])),
         (c"NSMenu", sel!(setAutoenablesItems:), false, types(v, &[b])),
@@ -282,28 +207,6 @@ fn every_send_here_has_the_prototype_the_runtime_reports() {
         (c"NSMenuItem", sel!(setTitle:), false, types(v, &[id])),
         (c"NSMenuItem", sel!(setTag:), false, types(v, &[q])),
         (c"NSMenuItem", sel!(setState:), false, types(v, &[q])),
-        (c"NSImage", sel!(initWithSize:), false, types(id, &[sz])),
-        (c"NSImage", sel!(addRepresentation:), false, types(v, &[id])),
-        (c"NSImage", sel!(setTemplate:), false, types(v, &[b])),
-        (
-            c"NSImage",
-            sel!(setAccessibilityDescription:),
-            false,
-            types(v, &[id]),
-        ),
-        (
-            c"NSBitmapImageRep",
-            sel!(imageRepWithData:),
-            true,
-            types(id, &[id]),
-        ),
-        (c"NSBitmapImageRep", sel!(setSize:), false, types(v, &[sz])),
-        (
-            c"NSData",
-            sel!(initWithBytes:length:),
-            false,
-            types(id, &["r^v", uq]),
-        ),
     ];
     for (cls, sel, class_method, want) in rows {
         assert_eq!(

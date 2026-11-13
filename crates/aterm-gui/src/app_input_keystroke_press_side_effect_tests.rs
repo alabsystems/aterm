@@ -43,9 +43,8 @@ fn fx_celebration_enter_uses_the_committed_input_path() {
         ),
     ] {
         let mut app = App::headless_for_test();
-        app.config =
-            aterm_toml::from_str("cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"")
-                .expect("valid fixture");
+        app.config = aterm_toml::from_str("cursor_trail = true\ncursor_trail_style = \"rainbow\"")
+            .expect("valid fixture");
         let wid = WindowId(0);
         app.fx_control(crate::FxCtlOp::Celebrate {
             sig: song_signature('C'),
@@ -204,7 +203,7 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let glow_cfg = app.glow_config();
         assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
         let seed = Instant::now();
@@ -350,7 +349,7 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let glow_cfg = app.glow_config();
         let now = Instant::now();
         let mut glow_out = Vec::new();
@@ -449,7 +448,7 @@ fn failed_queued_key_write_revokes_its_press_credit() {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
             app.config.cursor_trail = Some(true);
-            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            app.config.cursor_trail_style = Some("rainbow".to_string());
             let glow_cfg = app.glow_config();
             let session = app.front_terminal(wid).unwrap().session;
             app.cursor_frame(wid, CursorFxInputs::sample_for_test(Instant::now()))

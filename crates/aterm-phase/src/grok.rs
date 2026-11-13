@@ -34,7 +34,8 @@
 //! server's, Grove's or a deployment key's texts are none of them. No signed-in account has drawn
 //! any of them on a screen yet, so where they sit on one is not measured. The reader therefore
 //! claims nothing it has not seen: a wall is read only off a row that OPENS with one of those
-//! texts in the screen's live zone, never off prose that quotes one. Its composer's box is measured
+//! texts in the screen's live zone, never off prose that quotes one, and never off a row a later
+//! turn superseded (a sent message or a `Worked for` row under it). Its composer's box is measured
 //! (1.0.70's idle, busy and draft frames in `fixtures/`): the rounded box whose first inner row
 //! opens with `│ ❯`, the model's name in its bottom edge, a draft past one row growing it upward
 //! ([`composer_rows`]). Only its rows are read, never its words: the empty composer can offer a
@@ -63,7 +64,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 19, "0.19");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 20, "0.20");
 
 /// How many of the screen's last worded rows a wall row may stand in ([`live_from`]): the
 /// notice a turn ended on, with room for a composer and key rows under it.
@@ -621,19 +622,41 @@ fn plan_prompt(rows: &[String], top: usize, bottom: usize) -> PromptV2 {
     }
 }
 
+/// Whether `row` says a turn came after whatever stands over it: a sent message (`❯` opening the
+/// row, as 1.0.70 draws each prompt over its turn; the composer's own caret row stands inside its
+/// box's `│`), or a turn that worked (`Worked for 0.3s`, the row 1.0.70 draws under it; a turn a
+/// 401 or a 429 ended draws none, measured).
+fn later_turn(row: &str) -> bool {
+    let text = crate::text::trim(row);
+    text.starts_with("❯ ")
+        || text
+            .strip_prefix(crate::anchor!("grok.turn.worked"))
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Where the last turn's rows start for a wall reading: past the last row that says a turn came
+/// after what stands over it ([`later_turn`]), so a wall row an earlier turn ended on and a later
+/// one superseded (measured on 1.0.70's `resume-last` frame, a 401's failure over a later
+/// prompt's reply and its `Worked for` row) is no wall of the screen's.
+fn last_turn_from(rows: &[String]) -> usize {
+    rows.iter()
+        .rposition(|r| later_turn(r))
+        .map_or(0, |at| at + 1)
+}
+
 /// The wall `rows` show: the sign-in screen ([`sign_in_row`], [`WallKind::Auth`]), or a row in the
-/// live zone that opens with a limit text (its window, `LIMIT_OPENERS`) or says an ended login's
-/// (`login_ended`, [`WallKind::Auth`]). Where no such row stands in the live zone, a limit upsell's
-/// `Try Again` row (`is_try_again`) is a usage limit that names no window
-/// ([`WallKind::UsageSession`]): the title above it, which names it, is out of the zone. A
-/// passing throttle (`The service is busy. …`) is none, and so is any row whose words only quote
-/// one.
+/// live zone of the last turn ([`live_from`], [`last_turn_from`]) that opens with a limit text
+/// (its window, `LIMIT_OPENERS`) or says an ended login's (`login_ended`, [`WallKind::Auth`]).
+/// Where no such row stands there, a limit upsell's `Try Again` row (`is_try_again`) is a usage
+/// limit that names no window ([`WallKind::UsageSession`]): the title above it, which names it, is
+/// out of the zone. A passing throttle (`The service is busy. …`) is none, and so is any row whose
+/// words only quote one.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     if let Some(at) = sign_in_row(rows) {
         return Some(Wall::sign_in(rows, at));
     }
-    let from = live_from(rows);
+    let from = live_from(rows).max(last_turn_from(rows));
     let at_row = |at: usize, kind: WallKind| Wall {
         kind,
         message: opening(&rows[at]).to_string(),

@@ -469,8 +469,8 @@ fn unknown_keyring_evidence_needs_no_action_but_a_definite_login_end_does() {
     assert_eq!(row.fix.as_deref(), Some("aterm ai login agy"));
 }
 
-/// THE HEALTH LINE NAMES WHAT ATERM FIXES ITSELF AND ONLY A PERSON'S SIGN-IN NEEDS YOU (owner
-/// ruling R-13): a not-installed CLI and a Claude row accounts v2 renews unattended (it has an
+/// THE HEALTH LINE NAMES WHAT ATERM FIXES ITSELF AND ONLY A PERSON'S SIGN-IN NEEDS YOU:
+/// a not-installed CLI and a Claude row accounts v2 renews unattended (it has an
 /// email and a route) are aterm's fixes, which `aterm ai doctor` makes itself; a CLI's own
 /// sign-in (Codex with no roster) is a person's, started by its own command and on the one
 /// `NEEDS YOU:` line. NEGATIVE: no line ever says "ask a person"; with every fix aterm's there is

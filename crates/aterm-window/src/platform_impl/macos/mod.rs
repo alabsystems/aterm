@@ -23,6 +23,7 @@ mod key_origin;
 mod menu;
 mod monitor;
 mod observer;
+mod terminate;
 mod view;
 mod wake_queue;
 mod window;
@@ -37,6 +38,8 @@ pub(crate) use self::event_loop::{
 };
 pub(crate) use self::key_origin::{set_window_input_classifier, window_event_origin};
 pub(crate) use self::monitor::MonitorHandle;
+pub(crate) use self::terminate::{exit_ends_in_appkit, refuse as refuse_deferred_termination};
+pub use self::terminate::{ReplyWait, TerminateAnswer};
 pub(crate) use self::window::WindowId;
 pub(crate) use self::window_delegate::PlatformSpecificWindowAttributes;
 use crate::event::DeviceId as RootDeviceId;

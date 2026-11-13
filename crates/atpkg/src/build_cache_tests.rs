@@ -376,6 +376,20 @@ fn cleanup_reports_prune_decline_and_no_staged_parts_without_an_intent() {
 }
 
 impl Fixture {
+    #[cfg(target_os = "macos")]
+    fn render_shim(
+        &self,
+        shim: &Path,
+        target: &Path,
+        env: &crate::shim_env::ShimEnv,
+        speaks_hop: bool,
+    ) -> std::io::Result<crate::lay::Executable> {
+        let embedder = crate::stub::Embedder::offering(&self.root.join("no-offered-helper"), &[]);
+        crate::platform::shim_executable_to_env_using(shim, target, env, &embedder, &mut |_| {
+            Ok(speaks_hop)
+        })
+    }
+
     fn new(label: &str) -> Self {
         // Ordinary placement needs an ordinary workspace even when TMPDIR is a .noindex lane.
         // The shared-root temporary-directory policy keeps this private scratch under .ubd.
@@ -479,6 +493,9 @@ impl From<bool> for Want<'_> {
     }
 }
 
+/// The shells a shim's block runs under here, each in the C locale [`sh`] leaves it and again
+/// in a UTF-8 one where this system has one, as a person's shell runs it: a pattern such as `?`
+/// matches one byte in the first and one character in the second.
 #[cfg(unix)]
 fn shells() -> Vec<Vec<&'static str>> {
     let mut out = vec![vec!["/bin/sh"]];
@@ -495,13 +512,31 @@ fn shells() -> Vec<Vec<&'static str>> {
             out.push(v);
         }
     }
+    let utf8 = [
+        ("LC_ALL=en_US.UTF-8", "/usr/share/locale/en_US.UTF-8"),
+        ("LC_ALL=C.UTF-8", "/usr/lib/locale/C.utf8"),
+    ]
+    .into_iter()
+    .find(|(_, installed)| Path::new(installed).is_dir());
+    if let Some((locale, _)) = utf8 {
+        let wide: Vec<Vec<&str>> = out
+            .iter()
+            .map(|shell| {
+                ["/usr/bin/env", locale]
+                    .into_iter()
+                    .chain(shell.iter().copied())
+                    .collect()
+            })
+            .collect();
+        out.extend(wide);
+    }
     out
 }
 
 fn block(tool: Tool) -> String {
     let name = match tool {
         Tool::Tippy => "targo-tippy",
-        Tool::Targo | Tool::Cargo => "targo",
+        Tool::Targo | Tool::Cargo | Tool::CargoCompat => "targo",
     };
     shim_block(name).unwrap()
 }
@@ -819,6 +854,27 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     let f = Fixture::new("build-cache-rules");
     let ws = f.dir("home/ws");
     let home = f.home.display().to_string();
+    for verb in BUILD_VERBS {
+        let args = ["--unverified", *verb];
+        let want = if matches!(*verb, "tippy" | "clippy") {
+            Want::CacheHanded
+        } else {
+            Want::Cache
+        };
+        check_tool(&f, Tool::Targo, &ws, &[], &args, want);
+        if aterm_toolchain::build_cache::builtin_command(verb, Tool::Targo) {
+            for query in ["--help", "-h", "-qh"] {
+                check(&f, &ws, &[], &["--unverified", verb, query], false);
+            }
+        }
+    }
+    check(
+        &f,
+        &f.dir("home/ending-newline\n"),
+        &[],
+        &["--unverified", "build"],
+        true,
+    );
 
     for args in [
         &["--unverified", "build"][..],
@@ -834,10 +890,89 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &["--unverified", "build", "--config", "build.jobs=2"],
         &["--unverified", "build", "--config=build.jobs=2"],
         &["--unverified", "build", "--manifest-path", "sub/Cargo.toml"],
+        // `-m` is `--manifest-path` in each spelling clap reads.
+        &["--unverified", "build", "-m", "sub/Cargo.toml"],
+        &["--unverified", "build", "-msub/Cargo.toml"],
+        &["--unverified", "build", "-m=sub/Cargo.toml"],
+        &["--unverified", "build", "-qm", "sub/Cargo.toml"],
+        // NEGATIVE CONTROL: in `-pm` the `m` is `-p`'s value, so the next word is no manifest.
+        &["--unverified", "build", "-pm", "/elsewhere/Cargo.toml"],
+        // A trailing verb's program words are the program's, from its first word that is no
+        // option (`short_manifest_scope`), an option's value being none; `-j` takes even a word
+        // that starts with `-` (`-j -1`), so the word after that one is the program's.
+        &["--unverified", "run", "demo", "-m", "/elsewhere/Cargo.toml"],
+        &[
+            "--unverified",
+            "run",
+            "-q",
+            "--profile",
+            "dev",
+            "demo",
+            "-m",
+        ],
+        &["--unverified", "run", "-p", "x", "-m", "sub/Cargo.toml"],
+        &["--unverified", "run", "-j", "-m", "/elsewhere/Cargo.toml"],
+        &["--unverified", "rustc", "x", "-m=/elsewhere/Cargo.toml"],
+        &["--unverified", "rustdoc", "x", "-qm/elsewhere/Cargo.toml"],
+        // A lone `-` is a word that is no option, as clap reads it.
+        &["--unverified", "run", "-", "-m", "/elsewhere/Cargo.toml"],
+        &["--unverified", "rustc", "-", "-qm/elsewhere/Cargo.toml"],
+        // A cluster's `-Z` before the verb takes the next word, as `-Z` does: the verb follows.
+        &["-qZ", "unstable-options", "--unverified", "build"],
+        // The lane's consent is any `--unverified` before `--`, as Targo reads it, a program's
+        // one-letter flag before it included (which takes no word that starts with `-`).
+        &["run", "demo", "-x", "--unverified"],
+        &["run", "demo", "-j", "--unverified"],
+        // A character that is no ASCII letter takes no value, so the next word starts the
+        // program, in every shell and locale.
+        &[
+            "--unverified",
+            "run",
+            "-é",
+            "x",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        // A value clap needs is no word that starts with `-` either: `-vZ --unverified build` is
+        // the lane's build, whose missing `-Z` value Targo refuses itself.
+        &["-vZ", "--unverified", "build"],
+        // A digit takes no value: `-1` is `--jobs`'s, which takes any word, so the program
+        // starts after it.
+        &[
+            "--unverified",
+            "run",
+            "--jobs",
+            "-1",
+            "demo",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "run",
+            "-1",
+            "demo",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "run",
+            "--jobs",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        // Every building verb takes the lane, `package` too.
+        &["--unverified", "package"],
+        &["--unverified", "package", "-p", "x"],
     ] {
         check(&f, &ws, &[], args, true);
     }
-    for args in [&["--unverified", "tippy", "--all-targets"][..], &["clippy"]] {
+    for args in [
+        &["--unverified", "tippy", "--all-targets"][..],
+        &["clippy"],
+        &["-vZ", "unstable-options", "clippy"],
+    ] {
         check(&f, &ws, &[], args, Want::CacheHanded);
     }
     let in_home = format!("{home}/ws/Cargo.toml");
@@ -860,13 +995,6 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &["--unverified", "verify"],
         &["--unverified", "build", "--target-dir"],
         &["--unverified", "build", "--target-dir="],
-        &["--unverified", "build", "--target-dir", "x.noindex"],
-        &[
-            "--unverified",
-            "build",
-            "--target-dir",
-            "/t/lane.noindex/sub",
-        ],
         &["--unverified", "build", "--target-dir", "o'x"],
         &["--unverified", "build", "--target-dir", "x{y}"],
         &["--config", "build.target-dir='x'", "--unverified", "build"],
@@ -893,8 +1021,173 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
             "{{project_name}}/Cargo.toml",
         ],
         &["--unverified", "build", "--manifest-path=a}b/Cargo.toml"],
+        // The same manifests spelled `-m`, alone or in a cluster.
+        &["--unverified", "build", "-m", "/elsewhere/Cargo.toml"],
+        &["--unverified", "build", "-m/elsewhere/Cargo.toml"],
+        &["--unverified", "build", "-m=../x/Cargo.toml"],
+        &["--unverified", "build", "-m=/elsewhere/Cargo.toml"],
+        &[
+            "--unverified",
+            "build",
+            "-qm",
+            "{{project_name}}/Cargo.toml",
+        ],
+        &["--unverified", "test", "-vrm", "/elsewhere/Cargo.toml"],
+        &["--unverified", "build", "-m"],
+        &["--unverified", "build", "-m="],
+        // Before a trailing verb's program, the cluster is Targo's, after a short option's
+        // value too (`-p x`, `-Z x`); `-m` with no value is refused.
+        &["--unverified", "run", "-m", "/elsewhere/Cargo.toml", "demo"],
+        &["--unverified", "r", "-qm=/elsewhere/Cargo.toml"],
+        &[
+            "--unverified",
+            "run",
+            "-p",
+            "x",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &["--unverified", "run", "-p", "x", "-m"],
+        &[
+            "--unverified",
+            "run",
+            "-Z",
+            "unstable-options",
+            "-m",
+            "/elsewhere/Cargo.toml",
+            "demo",
+        ],
+        // An optional value (`-p`) takes no word that starts with `-`, so the `-m` is read, and a
+        // character that is no ASCII letter takes none, in every shell and locale.
+        &["--unverified", "build", "-p", "-m", "/elsewhere/Cargo.toml"],
+        &["--unverified", "build", "-é", "-m", "/elsewhere/Cargo.toml"],
+        // A `-C` among Targo's own words leaves the call as typed, after the verb too.
+        &["--unverified", "build", "-p", "x", "-C", "elsewhere"],
+        // A short option's value left to the next word is that word where clap takes it.
+        &[
+            "-vZ",
+            "unstable-options",
+            "--unverified",
+            "build",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        // `update`'s `-b` takes no value, so in `-bm` the `m` is `-m`.
+        &["--unverified", "build", "-bm", "/elsewhere/Cargo.toml"],
+        // After a trailing verb, a long option takes the word clap gives it, so the `-m` after
+        // `--package demo` or `--color always` is Targo's; an optional value takes no `-m`.
+        &[
+            "--unverified",
+            "run",
+            "--package",
+            "demo",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "run",
+            "--color",
+            "always",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "rustc",
+            "--print",
+            "cfg",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "run",
+            "--package",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        &[
+            "--unverified",
+            "run",
+            "--jobs",
+            "4",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
+        // Another directory in a cluster, its value in the word or the next one (a verb that
+        // builds, which only the cluster's `-C` stops).
+        &["-qC/elsewhere", "--unverified", "build"],
+        &["-vC", "build", "--unverified", "build"],
+        // After a name a user alias may take, a builtin alias's too, a `--target-dir` may be its
+        // program's (`xtask = "run -p xtask --"`), where a build directory under it would be no
+        // target's: as typed.
+        &["--unverified", "b", "--target-dir", "out"],
+        &["--unverified", "r", "--target-dir=out"],
+        // `--jobs` takes any word, so the `-m` after a `--` it takes is Targo's.
+        &[
+            "--unverified",
+            "run",
+            "--jobs",
+            "--",
+            "-m",
+            "/elsewhere/Cargo.toml",
+        ],
     ] {
         check(&f, &ws, &[], args, false);
+    }
+    // A trailing verb's program words are the program's, every option among them: the call is
+    // placed as one with none.
+    for args in [
+        &["--unverified", "run", "demo", "-m", "-C"][..],
+        &["--unverified", "run", "serve", "--target-dir", "out"],
+        &["--unverified", "run", "serve", "--config", "app.toml"],
+        &[
+            "--unverified",
+            "run",
+            "serve",
+            "--manifest-path",
+            "/elsewhere/Cargo.toml",
+        ],
+        &["--unverified", "rustc", "-", "-C", "x"],
+        // `--jobs` takes any word: the word after it starts the program.
+        &["--unverified", "run", "--jobs", "--target-dir", "out"],
+    ] {
+        check(&f, &ws, &[], args, true);
+    }
+    let ws_out = format!("{}/out/.ubd/build.noindex", ws.display());
+    check(
+        &f,
+        &ws,
+        &[],
+        &["--unverified", "run", "--jobs", "--", "--target-dir", "out"],
+        Want::Target(&ws_out),
+    );
+    check(
+        &f,
+        &ws,
+        &[],
+        &["--unverified", "test", "--jobs", "-Cx"],
+        true,
+    );
+    // A `--profile` before the verb takes its value in every reader that finds the verb
+    // (`VERB_VALUED`), both halves of the rule among them: the call is placed, its words as typed.
+    let profiled = strings(&["--unverified", "--profile", "dev", "test"]);
+    let want: Vec<String> = ["--config".to_owned(), f.value()]
+        .into_iter()
+        .chain(profiled.iter().cloned())
+        .collect();
+    check_exact(Tool::Targo, &f.home, &ws, &HashMap::new(), &profiled, &want);
+    for target in ["x.noindex", "/t/lane.noindex/sub"] {
+        let absolute = ws.join(target);
+        let directory = target_build_path(&absolute).display().to_string();
+        check(
+            &f,
+            &ws,
+            &[],
+            &["--unverified", "build", "--target-dir", target],
+            Want::Target(&directory),
+        );
     }
     let cached = format!("{}/x/Cargo.toml", cache_root(&f.home).display());
     check(
@@ -913,6 +1206,13 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
             "build",
             &format!("--manifest-path={cached}"),
         ],
+        false,
+    );
+    check(
+        &f,
+        &ws,
+        &[],
+        &["--unverified", "build", &format!("-qm{cached}")],
         false,
     );
 
@@ -939,7 +1239,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     ] {
         check_tool(&f, Tool::Tippy, &ws, &[], args, Want::CacheHanded);
     }
-    let ws_t = format!("{}/t/build.noindex", ws.display());
+    let ws_t = format!("{}/t/.ubd/build.noindex", ws.display());
     check_tool(
         &f,
         Tool::Tippy,
@@ -954,14 +1254,71 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &ws,
         &[("CARGO_TARGET_DIR", "/t")],
         &[],
-        Want::TargetHanded("/t/build.noindex"),
+        Want::TargetHanded("/t/.ubd/build.noindex"),
     );
     check_tool(&f, Tool::Tippy, &f.dir("elsewhere/lint"), &[], &[], false);
+    // The lint's `-m` is Targo's from its first word, the verb its name stands for.
+    check_tool(
+        &f,
+        Tool::Tippy,
+        &ws,
+        &[],
+        &["-qm", "sub/Cargo.toml"],
+        Want::CacheHanded,
+    );
+    check_tool(
+        &f,
+        Tool::Tippy,
+        &ws,
+        &[],
+        &["-qm", "/elsewhere/Cargo.toml"],
+        false,
+    );
 
     let build = &["--unverified", "build"][..];
     let trust = &["trust", "check", "--lib"][..];
-    let x = Want::Target("/x/build.noindex");
-    for var in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+    let x = Want::Target("/x/.ubd/build.noindex");
+    for target in ["custom/", "custom///", "custom//./", "./custom"] {
+        let trailing = format!("{}/{target}/.ubd/build.noindex", ws.display());
+        check(
+            &f,
+            &ws,
+            &[],
+            &["--unverified", "build", "--target-dir", target],
+            Want::Target(&trailing),
+        );
+        check(
+            &f,
+            &ws,
+            &[("CARGO_TARGET_DIR", target)],
+            build,
+            Want::Target(&trailing),
+        );
+    }
+    for target in ["/x/", "/x///", "/x//./", "/./x"] {
+        let directory = format!("{target}/.ubd/build.noindex");
+        check(
+            &f,
+            &ws,
+            &[],
+            &["--unverified", "build", "--target-dir", target],
+            Want::Target(&directory),
+        );
+        check(
+            &f,
+            &ws,
+            &[("CARGO_TARGET_DIR", target)],
+            build,
+            Want::Target(&directory),
+        );
+    }
+    // Targo reads each `TARGO_` twin where its `CARGO_` spelling is unset.
+    for var in [
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "TARGO_TARGET_DIR",
+        "TARGO_BUILD_TARGET_DIR",
+    ] {
         check(&f, &ws, &[(var, "/x")], build, x);
         check(&f, &ws, &[(var, "/x")], &["clean"], x);
         check(
@@ -969,16 +1326,64 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
             &ws,
             &[(var, "/x")],
             trust,
-            Want::Trust("/x/build.noindex"),
+            Want::Trust("/x/.ubd/build.noindex"),
         );
         check(&f, &ws, &[(var, "")], build, false);
-        check(&f, &ws, &[(var, "/x/lane.noindex")], build, false);
+        check(
+            &f,
+            &ws,
+            &[(var, "/x/lane.noindex")],
+            build,
+            Want::Target("/x/lane.noindex/.ubd/build.noindex"),
+        );
     }
-    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "/x")], build, false);
-    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "")], build, false);
-    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "/x")], trust, false);
+    check_tool(
+        &f,
+        Tool::Tippy,
+        &ws,
+        &[("TARGO_TARGET_DIR", "/t")],
+        &[],
+        Want::TargetHanded("/t/.ubd/build.noindex"),
+    );
+    // Each twin in Targo's order, and a `CARGO_` spelling set, even empty, hides its twin.
+    for (env, want) in [
+        (
+            &[("CARGO_TARGET_DIR", "/x"), ("TARGO_TARGET_DIR", "/b")][..],
+            x,
+        ),
+        (
+            &[("TARGO_TARGET_DIR", "/x"), ("CARGO_BUILD_TARGET_DIR", "/b")],
+            x,
+        ),
+        (
+            &[
+                ("CARGO_BUILD_TARGET_DIR", "/x"),
+                ("TARGO_BUILD_TARGET_DIR", "/b"),
+            ],
+            x,
+        ),
+        (
+            &[("CARGO_TARGET_DIR", ""), ("TARGO_TARGET_DIR", "/x")],
+            Want::Typed,
+        ),
+        (
+            &[
+                ("CARGO_BUILD_TARGET_DIR", ""),
+                ("TARGO_BUILD_TARGET_DIR", "/x"),
+            ],
+            Want::Typed,
+        ),
+    ] {
+        check(&f, &ws, env, build, want);
+    }
+    for var in ["CARGO_BUILD_BUILD_DIR", "TARGO_BUILD_BUILD_DIR"] {
+        check(&f, &ws, &[(var, "/x")], build, false);
+        check(&f, &ws, &[(var, "")], build, false);
+        check(&f, &ws, &[(var, "/x")], trust, false);
+        check_tool(&f, Tool::Tippy, &ws, &[(var, "/x")], &[], false);
+    }
 
-    let lane = format!("{}/target/lane/build.noindex", ws.display());
+    let lane = format!("{}/target/lane/.ubd/build.noindex", ws.display());
     check(
         &f,
         &ws,
@@ -1016,11 +1421,11 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     );
     check(&f, &ws, &[("CARGO_TARGET_DIR", "o'q")], build, false);
 
-    let default = Want::Trust("{workspace-root}/target/build.noindex");
+    let default = Want::Trust("{workspace-root}/target/.ubd/build.noindex");
     check(&f, &ws, &[], trust, default);
     check(&f, &ws, &[], &["trust", "test", "-p", "x"], default);
     check(&f, &f.dir("elsewhere/trusted"), &[], trust, false);
-    check(&f, &f.dir("home/lab.noindex/ws"), &[], trust, false);
+    check(&f, &f.dir("home/lab.noindex/ws"), &[], trust, default);
     check(&f, &f.dir("home/lab.noindex/ws"), &[], build, true);
 
     f.file(
@@ -1028,7 +1433,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         "[build]\ntarget-dir = \"out\"\n",
     );
     let chosen = f.dir("home/chosen");
-    check(&f, &chosen, &[], build, false);
+    check(&f, &chosen, &[], build, true);
     check(&f, &chosen, &[], trust, false);
     check(&f, &chosen, &[("CARGO_TARGET_DIR", "/x")], build, x);
     f.file(
@@ -1045,7 +1450,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         "home/inline/.cargo/config.toml",
         "build = { rustflags = [\"#\"], target-dir = \"x\" }\n",
     );
-    check(&f, &f.dir("home/inline"), &[], build, false);
+    check(&f, &f.dir("home/inline"), &[], build, true);
     f.file("home/legacy/.cargo/config", "build.build-dir = 'b'");
     check(&f, &f.dir("home/legacy"), &[], build, false);
     f.file("home/up/.cargo/config.toml", "[build]\nbuild-dir = \"b\"\n");
@@ -1055,11 +1460,34 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     check(&f, &up, &[("CARGO_TARGET_DIR", "/x")], trust, false);
     f.file("cargohome/config.toml", "[build]\ntarget-dir = \"t\"\n");
     let cargo_home = f.root.join("cargohome").display().to_string();
-    check(&f, &ws, &[("CARGO_HOME", &cargo_home)], build, false);
+    check(&f, &ws, &[("CARGO_HOME", &cargo_home)], build, true);
+    // `TARGO_HOME` is a home too where `CARGO_HOME` is unset (Trust's main reads it, against the
+    // working directory), beside `~/.cargo` (the store's Targo reads that); a set `CARGO_HOME`,
+    // even empty, hides it. A build directory it names leaves the call as typed.
+    f.file("targohome/config.toml", "[build]\nbuild-dir = \"b\"\n");
+    let targo_home = f.root.join("targohome").display().to_string();
+    let bare_home = f.root.join("barehome").display().to_string();
+    check(&f, &ws, &[("TARGO_HOME", &targo_home)], build, false);
+    check(&f, &ws, &[("TARGO_HOME", "../../targohome")], build, false);
+    check(
+        &f,
+        &ws,
+        &[("CARGO_HOME", &bare_home), ("TARGO_HOME", &targo_home)],
+        build,
+        true,
+    );
+    check(
+        &f,
+        &ws,
+        &[("CARGO_HOME", ""), ("TARGO_HOME", &targo_home)],
+        build,
+        true,
+    );
+    check(&f, &ws, &[("TARGO_HOME", "")], build, true);
     f.file("home/.cargo/config.toml", "[net]\noffline = true\n");
     check(&f, &ws, &[], build, true);
     f.file("home/.cargo/config.toml", "build.target-dir = \"t\"\n");
-    check(&f, &ws, &[], build, false);
+    check(&f, &ws, &[], build, true);
     std::fs::remove_file(f.root.join("home/.cargo/config.toml")).unwrap();
 
     f.file(
@@ -1067,14 +1495,31 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         "alias.ship = \"run --profile gate -p aterm-release --\"\n[build]\njobs = 2\n\
          [alias]\n# lint = \"tippy\"\ntip = \"tippy\"\nverify = \"run -q -p aterm-verify --\"\n\
          lab = [\"run\", \"-q\", \"-p\", \"aterm-lab\", \"--\"]\ntree2 = \"tree -d\"\n\
-         1b = \"build\"\n[env]\nfake = \"build\"\n",
+         1b = \"build\"\npk = \"package --no-verify\"\n[env]\nfake = \"build\"\n",
     );
     let aliased = f.dir("home/aliased/sub");
     // An alias to the lint, too: cargo hands it on without the `--config`, which is its whole
     // placement (the limit `loses_config` names). No alias's name exports, a digit-led one
-    // included: cargo runs `1b` itself and would hand the variable to its build scripts.
-    for verb in ["verify", "lab", "ship", "tip", "1b"] {
+    // included: cargo runs `1b` itself and would hand the variable to its build scripts. An alias
+    // to any building verb builds, `package` too.
+    for verb in ["verify", "lab", "ship", "tip", "1b", "pk"] {
         check(&f, &aliased, &[], &["--unverified", verb, "x"], true);
+    }
+    // An alias's words may be its program's (`lab` ends in `--`), so a cluster among them names
+    // no manifest of Targo's, as before `-m` was read.
+    for args in [
+        &["--unverified", "lab", "linux", "exec", "uname", "-m"][..],
+        &["--unverified", "verify", "-m", "/elsewhere/Cargo.toml"],
+    ] {
+        check(&f, &aliased, &[], args, true);
+    }
+    // Nor is a `--target-dir` among them Targo's: one placed under it would hold no target's
+    // build, so the call is left as typed.
+    for args in [
+        &["--unverified", "verify", "dist", "--target-dir", "out"][..],
+        &["--unverified", "lab", "--target-dir=out"],
+    ] {
+        check(&f, &aliased, &[], args, false);
     }
     for args in [
         &["--unverified", "tree2"][..],
@@ -1108,6 +1553,98 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         true,
     );
     check(&f, &ws, &[], &["--unverified", "xt"], false);
+    // Both halves read an `[alias]` table as spelled so; one spaced as `[ alias ]` leaves an
+    // alias's call as typed in both.
+    f.file(
+        "home/spaced/.cargo/config.toml",
+        "[ alias ]\nxb = \"build\"\n",
+    );
+    check(
+        &f,
+        &f.dir("home/spaced"),
+        &[],
+        &["--unverified", "xb"],
+        false,
+    );
+    f.file("home/plain/.cargo/config.toml", "[alias]\nxb = \"build\"\n");
+    check(&f, &f.dir("home/plain"), &[], &["--unverified", "xb"], true);
+    // A config that spells `include` names what the files it includes say, which the block
+    // cannot read, and so may a `--config` that spells one: both halves leave the call as typed.
+    f.file(
+        "home/included/.cargo/config.toml",
+        "include = [\"more.toml\"]\n",
+    );
+    check(
+        &f,
+        &f.dir("home/included"),
+        &[],
+        &["--unverified", "build"],
+        false,
+    );
+    for args in [
+        &["--unverified", "build", "--config", "include=['more.toml']"][..],
+        &["--config=include=['more.toml']", "--unverified", "build"],
+        // A backslash may spell any key through a quoted key's escape.
+        &[
+            "--unverified",
+            "build",
+            "--config",
+            "build.\"target\x5cu002ddir\"=\"out\"",
+        ],
+        // An empty first word is the verb, one no name matches, which Targo runs as no command.
+        &["--unverified", "", "build"],
+        &["--unverified", "", "--target-dir", "out", "build"],
+    ] {
+        check(&f, &ws, &[], args, false);
+    }
+    // Nor does a line no alias's key spells give an empty verb a definition.
+    f.file("home/keyless/.cargo/config.toml", "alias. = \"build\"\n");
+    check(
+        &f,
+        &f.dir("home/keyless"),
+        &[],
+        &["--unverified", "", "build"],
+        false,
+    );
+    // A manifest spelled with a `.` part or an empty one is left as typed by both halves,
+    // wherever it lies (one half reads parts, the other text); HOME itself is under HOME, and the
+    // cache root is no package's.
+    let parent = f.home.parent().unwrap().display().to_string();
+    let leaf = f.home.file_name().unwrap().to_str().unwrap().to_owned();
+    let cache = cache_root(&f.home).display().to_string();
+    let cached = cache.strip_prefix(&format!("{home}/")).unwrap().to_owned();
+    for manifest in [
+        format!("{home}/./ws/Cargo.toml"),
+        format!("{home}//ws/Cargo.toml"),
+        format!("{parent}//{leaf}/ws/Cargo.toml"),
+        format!("{home}/ws/."),
+        format!("{home}/./{cached}/x/Cargo.toml"),
+        cache.clone(),
+    ] {
+        let args = ["--unverified", "build", "--manifest-path", &manifest];
+        check(&f, &ws, &[], &args, false);
+    }
+    check(
+        &f,
+        &ws,
+        &[],
+        &["--unverified", "build", "--manifest-path", &home],
+        true,
+    );
+    check(
+        &f,
+        &ws,
+        &[("TARGO_HOME", &cargo_home2)],
+        &["--unverified", "xt"],
+        true,
+    );
+    check(
+        &f,
+        &ws,
+        &[("CARGO_HOME", &bare_home), ("TARGO_HOME", &cargo_home2)],
+        &["--unverified", "xt"],
+        false,
+    );
 
     check(&f, &f.dir("elsewhere/ws"), &[], build, false);
     check(&f, &f.home, &[], build, false);
@@ -1119,7 +1656,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let own = Want::Target("{workspace-root}/target/build.noindex");
+        let own = Want::Target("{workspace-root}/target/.ubd/build.noindex");
         let caches = f.home.join("Library/Caches");
         std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o555)).unwrap();
         check(&f, &ws, &[], build, own);
@@ -1127,7 +1664,94 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         check(&f, &ws, &[], build, true);
         std::fs::remove_dir(&caches).unwrap();
         check(&f, &ws, &[], build, own);
-        check(&f, &f.dir("home/lab.noindex/ws"), &[], build, false);
+        check(&f, &f.dir("home/lab.noindex/ws"), &[], build, own);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_shim_uses_the_physical_directory_when_a_shell_preserves_a_case_alias() {
+    let f = Fixture::new("build-cache-case-alias");
+    let ws = f.dir("home/case-probe");
+    let alias = ws.with_file_name("CASE-PROBE");
+    if alias.canonicalize().ok().as_ref() != Some(&ws) {
+        return; // This filesystem treats the two names as different directories.
+    }
+    let alias = alias.to_str().unwrap();
+    let mut forms = shells();
+    if Path::new("/bin/zsh").is_file() {
+        forms.push(vec!["/bin/zsh", "-f"]);
+    }
+    for tool in [Tool::Targo, Tool::Tippy] {
+        let args = strings(&["--unverified", "build"]);
+        for shell in &forms {
+            let output = aterm_uds::spawnfd::command(shell[0]).args(&shell[1..]).arg("-c")
+                .arg(format!("printf '%s\\n' \"$PWD\"\n{}[ -z \"${{CARGO_BUILD_BUILD_DIR+1}}\" ] || printf 'env=%s\\n' \"$CARGO_BUILD_BUILD_DIR\"\nprintf '%s\\n' \"$@\"", block(tool)))
+                .arg("sh").args(&args).current_dir(&ws).env_clear()
+                .env("PATH", "/usr/bin:/bin").env("HOME", &f.home).env("PWD", alias).output().unwrap();
+            assert!(
+                output.status.success() && output.stderr.is_empty(),
+                "{output:?}"
+            );
+            let output = String::from_utf8(output.stdout).unwrap();
+            let mut lines = output.lines();
+            // Some shells normalize PWD at startup; compare the environment their front inherits.
+            let inherited = lines.next().unwrap();
+            let actual = lines.map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                rust(
+                    &f.home,
+                    &ws,
+                    &HashMap::from([("PWD", inherited.to_owned())]),
+                    &args,
+                    tool
+                ),
+                "{shell:?} {tool:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_physical_directory_stops_a_producer_and_keeps_queries_unplaced() {
+    let f = Fixture::new("build-cache-missing-cwd");
+    for shell in shells() {
+        for query in [None, Some("--help"), Some("metadata"), Some("fmt")] {
+            let directory = f.dir("home/missing-cwd");
+            let words = match query {
+                None => vec!["--unverified", "build"],
+                Some("--help") => vec!["--unverified", "build", "--help"],
+                Some(verb) => vec!["--unverified", verb],
+            };
+            let output = aterm_uds::spawnfd::command(shell[0])
+                .args(&shell[1..])
+                .arg("-c")
+                .arg(format!(
+                    "/bin/rmdir \"$PWD\" || exit 1\n{}printf '%s\\n' after-block",
+                    block(Tool::Targo)
+                ))
+                .arg("sh")
+                .args(words)
+                .current_dir(&directory)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &f.home)
+                .env("PWD", &directory)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if query.is_some() { 0 } else { 75 }),
+                "{shell:?}: {output:?}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).contains("after-block"),
+                query.is_some()
+            );
+            assert!(!directory.exists());
+        }
     }
 }
 
@@ -1174,6 +1798,17 @@ fn a_placed_build_keeps_every_word_as_typed() {
         "--unverified build --profile=gate",
         "--unverified run -p x -- test",
         "--unverified xt",
+        // A value clap needs is no word that starts with `-`, before the verb too.
+        "-Z -Z unstable-options --unverified test",
+        // A character that is no ASCII letter takes no value, so the verb after it is found, in
+        // every shell and locale.
+        "--unverified -é test",
+        "--unverified -1 test",
+        // `-r` in a cluster takes no value; a letter that takes one ends the run.
+        "--unverified build -qr",
+        "--unverified b -rv",
+        "--unverified build -rm sub/Cargo.toml",
+        "--unverified build -pr",
     ] {
         let want: Vec<String> = ["--config".to_owned(), f.value()]
             .into_iter()
@@ -1186,6 +1821,45 @@ fn a_placed_build_keeps_every_word_as_typed() {
             &HashMap::new(),
             &words(typed),
             &want,
+        );
+    }
+    // A user alias named `b` or `t`, in a config however it spells the table or the key, or in
+    // the environment (either spelling), takes the name from Targo's builtin alias, and its
+    // words are its own: the call is placed, with no test graph, as with none.
+    let aliased = f.dir("home/aliased-bt");
+    f.file(
+        "home/aliased-bt/.cargo/config.toml",
+        "alias.b = \"build --release\"\n[ alias ]\n\"t\" = \"run -q --\"\n",
+    );
+    let placed = |typed: &str| -> Vec<String> {
+        ["--config".to_owned(), f.value()]
+            .into_iter()
+            .chain(words(typed))
+            .collect()
+    };
+    for typed in ["--unverified t foo", "--unverified b -p x"] {
+        check_exact(
+            Tool::Targo,
+            &f.home,
+            &aliased,
+            &HashMap::new(),
+            &words(typed),
+            &placed(typed),
+        );
+    }
+    for (var, typed) in [
+        ("CARGO_ALIAS_B", "--unverified b -p x"),
+        ("TARGO_ALIAS_T", "--unverified t --lib"),
+        ("CARGO_ALIAS_T", "--unverified t"),
+    ] {
+        let env: HashMap<&str, String> = [(var, "check".to_owned())].into_iter().collect();
+        check_exact(
+            Tool::Targo,
+            &f.home,
+            &ws,
+            &env,
+            &words(typed),
+            &placed(typed),
         );
     }
 }
@@ -1452,11 +2126,45 @@ fn an_upstream_cargo_keeps_its_toolchain_first() {
     );
     assert_eq!(run(&["install", "x"]), strings(&["install", "x"]));
     assert_eq!(run(&["trust", "check"]), strings(&["trust", "check"]));
-    let t = format!("build.build-dir='{}/t/build.noindex'", ws.display());
+    // The typed target keeps its spelling, under the working directory and over the leaf, each
+    // joined by this platform's rule (a Windows `\\?\` path reads a `/` as a name's letter).
+    let t = format!(
+        "build.build-dir='{}'",
+        target_build_path(&ws.join("t")).display()
+    );
     assert_eq!(
         run(&["+1.97.1", "build", "--target-dir", "t"]),
         strings(&["+1.97.1", "--config", &t, "build", "--target-dir", "t"])
     );
+}
+
+#[test]
+fn trust_cargo_uses_target_twins_without_a_lane_and_keeps_the_toolchain_first() {
+    let f = Fixture::new("cargo-compat-twins");
+    let ws = f.dir("home/ws");
+    let target = f.dir("caller-target");
+    let directory = target_build_path(&target);
+    let config = format!("build.build-dir='{}'", directory.display());
+    for var in ["TARGO_TARGET_DIR", "TARGO_BUILD_TARGET_DIR"] {
+        let env = HashMap::from([(var, target.display().to_string())]);
+        let typed = strings(&["+trust", "build"]);
+        assert_eq!(
+            rust(&f.home, &ws, &env, &typed, Tool::CargoCompat),
+            strings(&["+trust", "--config", &config, "build"]),
+            "{var}"
+        );
+        assert_eq!(
+            rust(
+                &f.home,
+                &ws,
+                &env,
+                &strings(&["+trust", "metadata"]),
+                Tool::CargoCompat
+            ),
+            strings(&["+trust", "metadata"]),
+            "a query stays unplaced"
+        );
+    }
 }
 
 #[test]
@@ -1598,7 +2306,7 @@ fn the_rendered_shim_hands_targo_the_config() {
     assert_eq!(
         run(&["--unverified", "build", "--target-dir", "t"]),
         format!(
-            "--config build.build-dir='{}/t/build.noindex' --unverified build --target-dir t\n",
+            "--config build.build-dir='{}/t/.ubd/build.noindex' --unverified build --target-dir t\n",
             ws.display()
         )
     );
@@ -1706,19 +2414,19 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
             &driver,
             &["--unverified", "tippy", "--target-dir", "custom"][..],
             vec![],
-            format!("{}/custom/build.noindex", ws.display()),
+            format!("{}/custom/.ubd/build.noindex", ws.display()),
         ),
         (
             &driver,
             &["--unverified", "tippy"][..],
             vec![("CARGO_TARGET_DIR", "custom")],
-            format!("{}/custom/build.noindex", ws.display()),
+            format!("{}/custom/.ubd/build.noindex", ws.display()),
         ),
         (
             &driver,
             &["trust", "check"][..],
             vec![],
-            "{workspace-root}/target/build.noindex".into(),
+            "{workspace-root}/target/.ubd/build.noindex".into(),
         ),
         (
             &driver,
@@ -1742,7 +2450,7 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
             &driver,
             &["--unverified", "tippy", "--target-dir", "chosen.noindex"][..],
             vec![],
-            "unset".into(),
+            format!("{}/chosen.noindex/.ubd/build.noindex", ws.display()),
         ),
         (&driver, &["metadata"][..], vec![], "unset".into()),
     ] {
@@ -1765,6 +2473,30 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
         output.contains("outer-dir=unset\n") && output.contains("inner-dir=unset\n"),
         "{output}"
     );
+}
+
+#[cfg(target_os = "macos")]
+fn render_with_test_hop_probe(
+    fixture: &Fixture,
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> crate::lay::Executable {
+    let embedder = crate::stub::Embedder::offering(&fixture.root.join("no-offered-helper"), &[]);
+    crate::platform::shim_executable_to_env_using(shim, target, env, &embedder, &mut |helper| {
+        let mut command = aterm_uds::spawnfd::command(helper);
+        command.args([crate::build_admit::VERB, "--capabilities"]);
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("{}\n", crate::build_admit::HOP_CAPABILITY).as_bytes()
+        );
+        Ok(true)
+    })
+    .unwrap()
 }
 
 /// THE RENDERED HOP (BUILD-ADMIT): a macOS `targo` shim laid beside an atpkg runs its front once
@@ -1797,9 +2529,7 @@ fn the_rendered_hop_hands_its_front_the_placed_call() {
     std::fs::write(&shim, format!("# atpkg cache helper {marker}\n")).unwrap();
     let target = bin.join("targo");
     let none = crate::shim_env::ShimEnv::NONE;
-    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
-        .unwrap()
-        .body;
+    let body = render_with_test_hop_probe(&f, &shim, &target, &none).body;
     let body = String::from_utf8(body).unwrap();
     std::fs::write(&shim, &body).unwrap();
     assert_eq!(
@@ -1864,7 +2594,7 @@ fn the_rendered_hop_hands_its_front_the_placed_call() {
         front(
             "env",
             &["trust", "check"],
-            "{workspace-root}/target/build.noindex"
+            "{workspace-root}/target/.ubd/build.noindex"
         )
     );
     let outside = f.dir("elsewhere");
@@ -1873,9 +2603,7 @@ fn the_rendered_hop_hands_its_front_the_placed_call() {
         front("-", &["--unverified", "test"], "unset")
     );
     let plain = f.dir("plain/bin").join("targo");
-    let body = crate::platform::shim_executable_to_env(&plain, &target, &none)
-        .unwrap()
-        .body;
+    let body = render_with_test_hop_probe(&f, &plain, &target, &none).body;
     assert!(!String::from_utf8(body).unwrap().contains("__build_admit"));
 }
 
@@ -1883,8 +2611,8 @@ fn the_rendered_hop_hands_its_front_the_placed_call() {
 /// hands its helper (`$0` and every word, as exec'd), in each placement, reads through
 /// [`aterm_uds::build_front::front`] as the store's `targo` on the typed words, which every
 /// reader names a front by while it waits. NEGATIVE CONTROL: the helper's own capability
-/// question, which the renderer asked of it, and the same helper's registration call, which a
-/// shim laid for an older helper makes, read as no front.
+/// question and registration call read as no front. The first exec uses the test hang detector;
+/// production probe failures and cache isolation have separate controlled tests.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_rendered_hops_front_is_named_by_its_target() {
@@ -1919,9 +2647,7 @@ fn the_rendered_hops_front_is_named_by_its_target() {
             .map(|w| OsString::from(String::from_utf8(w.to_vec()).unwrap()))
             .collect()
     };
-    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
-        .unwrap()
-        .body;
+    let body = render_with_test_hop_probe(&f, &shim, &target, &none).body;
     let asked = argv();
     assert_eq!(
         asked[1..],
@@ -1983,13 +2709,39 @@ fn the_rendered_hops_front_is_named_by_its_target() {
     assert!(aterm_uds::build_front::front(&registration).is_none());
 }
 
+/// An unavailable capability answer cannot select the older registration form.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unavailable_helper_query_does_not_render_a_legacy_shim() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-unknown-helper");
+    let helper = f.dir("pkg").join("atpkg");
+    std::fs::write(&helper, b"helper identity").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim = f.dir("prefix/bin").join("targo");
+    let marker = aterm_json::to_string(helper.to_string_lossy().as_ref()).unwrap();
+    let original = format!("# atpkg cache helper {marker}\n");
+    std::fs::write(&shim, &original).unwrap();
+    let embedder = crate::stub::Embedder::offering(&f.root.join("no-offered-helper"), &[]);
+    let error = crate::platform::shim_executable_to_env_using(
+        &shim,
+        &f.root.join("store/targo"),
+        &crate::shim_env::ShimEnv::NONE,
+        &embedder,
+        &mut |_| Err(std::io::ErrorKind::TimedOut.into()),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(std::fs::read_to_string(&shim).unwrap(), original);
+}
+
 /// A HELPER THAT DOES NOT SPEAK THE HOP KEEPS THE REGISTRATION CALL'S FORM: a macOS `targo` shim
 /// whose standing helper advertises the registration capability and the older hop-v1, but
 /// refuses the newer front, is laid with the registration call ahead of its block and no hop.
 /// Its default call runs the target with its words once registration succeeds. NEGATIVE CONTROL:
 /// the hop rendered for that helper anyway, as the renderer laid it before it asked, ends at exit
-/// 2 and never runs the target; and (by hand: `helper_speaks_hop` answering yes for every helper)
-/// the laid shim carries the hop and the test fails.
+/// 2 and never runs the target. Choosing the hop despite the supplied unsupported capability
+/// makes the laid shim fail this test.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_helper_that_does_not_speak_the_hop_keeps_the_registration_call() {
@@ -2012,15 +2764,12 @@ fn a_helper_that_does_not_speak_the_hop_keeps_the_registration_call() {
     )
     .unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(!crate::build_cache::registered::helper_speaks_hop(&helper));
     let shim = f.dir("prefix/bin").join("targo");
     let marker = aterm_json::to_string(helper.to_string_lossy().as_ref()).unwrap();
     std::fs::write(&shim, format!("# atpkg cache helper {marker}\n")).unwrap();
     let target = bin.join("targo");
     let none = crate::shim_env::ShimEnv::NONE;
-    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
-        .unwrap()
-        .body;
+    let body = f.render_shim(&shim, &target, &none, false).unwrap().body;
     let body = String::from_utf8(body).unwrap();
     assert!(
         body.contains(crate::build_cache::registered::REGISTER_VERB),

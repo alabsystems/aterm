@@ -14,6 +14,11 @@ use std::{
 pub type VersionProbe<'a> =
     dyn Fn(&Path, Option<Instant>) -> std::result::Result<String, String> + 'a;
 
+/// A version caller that must carry the original selection lease into an
+/// independently owned probe process. The lease is borrowed only for the call.
+pub type RetainedVersionProbe<'a> = dyn Fn(&Path, Option<Instant>, &crate::lease::Lease) -> std::result::Result<String, String>
+    + 'a;
+
 /// Captured explicit selection inputs, never populated from ambient environment here.
 pub struct Inputs {
     /// Canonical managed store selected by the caller.
@@ -224,6 +229,28 @@ pub fn select(
     signed_root: &dyn Fn(u64, Option<Instant>) -> std::result::Result<String, String>,
     probe: &VersionProbe<'_>,
 ) -> Result<Selected> {
+    select_with_lease(
+        inputs,
+        lock,
+        explicit,
+        options,
+        signed_root,
+        &|path, deadline, _| probe(path, deadline),
+    )
+}
+
+/// Select like [`select`], passing the same original selection lease to every
+/// actual signed payload or compatible-image version callback.
+/// # Errors
+/// The same refusals as [`select`]. No callback runs without the original lease.
+pub fn select_with_lease(
+    inputs: &Inputs,
+    lock: Option<&trust_lock::TrustLock>,
+    explicit: Option<&Path>,
+    options: Options,
+    signed_root: &dyn Fn(u64, Option<Instant>) -> std::result::Result<String, String>,
+    probe: &RetainedVersionProbe<'_>,
+) -> Result<Selected> {
     options.check()?;
     if let Some((key, _)) = inputs.overrides.first() {
         return Err(Error::refused(format!(
@@ -264,8 +291,9 @@ pub fn select(
     if !crate::store::build_is_complete(&trust_lock::build_dir(&inputs.prefix, build)) {
         return Err(Error::refused("selected Trust build is incomplete"));
     }
+    let guarded_probe = |path: &Path, deadline| probe(path, deadline, &lease);
     let (tree_root, payload_compiler) =
-        authenticated_payload(&payload, lock, build, signed_root, probe, options)?;
+        authenticated_payload(&payload, lock, build, signed_root, &guarded_probe, options)?;
     let execution = execution_root(&payload, &layout, build)?;
     options.check()?;
     if let Some(explicit) = explicit {
@@ -287,7 +315,13 @@ pub fn select(
             "Cargo configuration overrides the selected project compiler",
         ));
     }
-    let compiler = paired_compiler(payload_compiler, &payload, &execution, probe, options)?;
+    let compiler = paired_compiler(
+        payload_compiler,
+        &payload,
+        &execution,
+        &guarded_probe,
+        options,
+    )?;
     options.check()?;
     let selected = Selected {
         payload,

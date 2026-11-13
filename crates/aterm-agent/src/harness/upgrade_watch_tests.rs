@@ -131,6 +131,7 @@ fn walk(w: &Writer, tag: &str) -> Result<usize, String> {
         name: "zsh".to_string(),
         age_s: 4 * 86_400,
         command: String::new(),
+        ..upgrade::Held::default()
     }];
     type Act = Box<dyn Fn(&mut St, u64)>;
     let wait = |word: &'static str| -> Act {

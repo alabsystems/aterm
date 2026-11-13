@@ -19,7 +19,10 @@ fn measure(state: &State, scenario: i64, store: &Store, session: &Session<'_>) -
         "complete",
         i64::from(store.liability_evidence(session).is_ok()),
     );
-    next.insert("forked", store.index.project().quarantined.len() as i64);
+    next.insert(
+        "forked",
+        store.index().unwrap().project().quarantined.len() as i64,
+    );
     next
 }
 
@@ -61,7 +64,8 @@ fn closure_transition(state: &State, action: &str) -> State {
             // Removing only the directly dependent branch launders this fork.
             let mut old = Index::new(4);
             let id = session.authenticate(f.scope, &free).unwrap().header().id;
-            old.insert(store.index.get(&id).unwrap().clone()).unwrap();
+            old.insert(store.index().unwrap().get(&id).unwrap().clone())
+                .unwrap();
             assert_eq!(old.project().ordered, [id]);
         }
         drop(store);
@@ -94,7 +98,7 @@ fn closure_transition(state: &State, action: &str) -> State {
         store.ingest(&session, &wire).unwrap();
         // Old actual-dot-only detection allowed the selected first record.
         let mut old = Index::new(2);
-        old.insert(store.index.get(&first.id).unwrap().clone())
+        old.insert(store.index().unwrap().get(&first.id).unwrap().clone())
             .unwrap();
         assert_eq!(old.project().ordered, [first.id]);
         drop(store);
@@ -126,7 +130,7 @@ fn closure_transition(state: &State, action: &str) -> State {
     };
     // Each digest exists and every causal parent is present. Existence alone
     // was the old, insufficient liability check for both invalid cases.
-    assert!(store.index.project().pending.is_empty());
+    assert!(store.index().unwrap().project().pending.is_empty());
     for fact in &facts {
         if let Fact::Cutoff {
             through: Some(frontier),

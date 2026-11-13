@@ -19,6 +19,73 @@ fn stamped() -> Stamp {
     }
 }
 
+#[test]
+fn windows_numeric_identity_uses_the_build_and_preserves_the_public_string() {
+    let stamp = Stamp {
+        app_version: "1.20261110.999999999",
+        build_number: "65535",
+        ..stamped()
+    };
+    assert_eq!(stamp.windows_numeric_version(), Ok([1, 0, 0, 65535]));
+    let read = decode(leak(encode(&stamp).unwrap()), Stamp::UNSTAMPED).unwrap();
+    assert_eq!(read.app_version, "1.20261110.999999999");
+    assert_eq!(read.build_number, "65535");
+    let next = Stamp {
+        build_number: "65536",
+        ..stamp
+    };
+    assert_eq!(next.windows_numeric_version(), Ok([1, 0, 1, 0]));
+    assert!(next.windows_numeric_version().unwrap() > stamp.windows_numeric_version().unwrap());
+    assert!(stamp.windows_numeric_version().unwrap() > [0, 65535, 65535, 0]);
+}
+
+#[test]
+fn windows_numeric_identity_refuses_lossy_or_malformed_builds() {
+    let maximum = Stamp {
+        build_number: "281474976710655",
+        ..stamped()
+    };
+    assert_eq!(
+        maximum.windows_numeric_version(),
+        Ok([1, 65535, 65535, 65535])
+    );
+    for build_number in [
+        "",
+        "+1",
+        "-1",
+        "1x",
+        "281474976710656",
+        "18446744073709551616",
+    ] {
+        assert!(
+            Stamp {
+                build_number,
+                ..maximum
+            }
+            .windows_numeric_version()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn development_tag_selection_uses_product_admission() {
+    let args = describe_release_args("v0.197.0\nv1.20240229.1\nv1.20260231.1\nv1.20261110.0\nv0.197.1\nv1.20261110.1000000000\nv1.20261110.1-rc1\n").unwrap();
+    assert_eq!(
+        args,
+        [
+            "describe",
+            "--tags",
+            "--abbrev=0",
+            "--match",
+            "v0.197.0",
+            "--match",
+            "v1.20240229.1"
+        ]
+    );
+    assert!(describe_release_args("v1.20261110.0\nv1.20260231.1\n").is_none());
+}
+
 fn leak(record: [u8; LEN]) -> &'static [u8; LEN] {
     Box::leak(Box::new(record))
 }

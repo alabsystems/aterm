@@ -113,7 +113,7 @@ fn sample_facts(
     accounts: Vec<SurveyAccountFact>,
 ) -> SwarmSurveyFacts {
     SwarmSurveyFacts {
-        release_lines: Vec::new(),
+        operation_lines: Vec::new(),
         node: Some(node.to_owned()),
         label: Some(label.to_owned()),
         roster_unread: false,
@@ -242,6 +242,7 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
                     vec![SurveyAccountFact {
                         pool: "claude".to_owned(),
                         id: "c01".to_owned(),
+                        email: None,
                         condition: "rate_limited".to_owned(),
                         enrolled: true,
                         usage_5h_pct: Some(100),
@@ -586,6 +587,7 @@ fn census_clock_future_sources_do_not_outrank_a_known_contact() {
                 vec![SurveyAccountFact {
                     pool: "claude".to_owned(),
                     id: "c01".to_owned(),
+                    email: None,
                     condition: "rate_limited".to_owned(),
                     enrolled: true,
                     usage_5h_pct: Some(100),
@@ -720,6 +722,7 @@ fn reported(pool: &str, id: &str, condition: &str, walled_until: Option<i64>) ->
     SurveyAccountFact {
         pool: pool.to_owned(),
         id: id.to_owned(),
+        email: None,
         condition: condition.to_owned(),
         enrolled: condition != "not-enrolled",
         usage_5h_pct: None,
@@ -969,6 +972,7 @@ fn wall_report(node: &str, label: &str, received_at: u64) -> HeartbeatInput {
             vec![SurveyAccountFact {
                 pool: "claude".to_owned(),
                 id: "c01".to_owned(),
+                email: None,
                 condition: "rate_limited".to_owned(),
                 enrolled: true,
                 usage_5h_pct: Some(100),
@@ -1472,6 +1476,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
         vec![SurveyAccountFact {
             pool: "claude".to_owned(),
             id: "c01".to_owned(),
+            email: None,
             condition: "rate_limited".to_owned(),
             enrolled: true,
             usage_5h_pct: Some(100),
@@ -1484,7 +1489,13 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
             token: None,
         }],
     );
-    let payload = denied_facts.to_survey_reply(1, Some("m9.local"), now_s * 1_000, 1, false);
+    let payload = denied_facts.to_survey_reply(
+        1,
+        Some("m9.local"),
+        now_s * 1_000,
+        1,
+        (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+    );
     store_pushed_facts(&state, denied_id.node(), &payload).unwrap();
     let facts_path = state
         .join(aterm_net::fleet_member::SWARM_FACTS_DIR)
@@ -1539,7 +1550,13 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
         "a denied label's heartbeat must not mark pool accounts walled"
     );
 
-    aterm_net::fleet_member::prune_pushed_facts(&state, &[], &[denied_id.node().to_owned()], None);
+    aterm_net::fleet_member::prune_pushed_facts(
+        &state,
+        &[],
+        &[denied_id.node().to_owned()],
+        None,
+        &|| true,
+    );
     assert!(
         read_pushed_facts(&state).is_empty(),
         "prune_pushed_facts must remove denied node facts from swarm-facts/"
@@ -1623,6 +1640,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
         vec![SurveyAccountFact {
             pool: "claude".to_owned(),
             id: "c01".to_owned(),
+            email: None,
             condition: "rate_limited".to_owned(),
             enrolled: true,
             usage_5h_pct: Some(100),
@@ -1635,13 +1653,25 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
             token: None,
         }],
     );
-    let payload = denied_facts.to_survey_reply(1, Some("m8.local"), now_s * 1_000, 1, false);
+    let payload = denied_facts.to_survey_reply(
+        1,
+        Some("m8.local"),
+        now_s * 1_000,
+        1,
+        (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+    );
     store_pushed_facts(&state, denied_id.node(), &payload).unwrap();
     assert_eq!(read_pushed_facts(&state).len(), 1);
 
     // Prune pushed facts using only the 64-hex `node_key` in `denied_nodes`.
     let peers = aterm_net::fleet_member::read_peers(&state).unwrap();
-    aterm_net::fleet_member::prune_pushed_facts(&state, &peers, &[denied_id.key().hex()], None);
+    aterm_net::fleet_member::prune_pushed_facts(
+        &state,
+        &peers,
+        &[denied_id.key().hex()],
+        None,
+        &|| true,
+    );
     assert!(
         read_pushed_facts(&state).is_empty(),
         "prune_pushed_facts must remove peer facts when peer's 64-hex node_key is in denied_nodes"
@@ -2011,6 +2041,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                     vec![SurveyAccountFact {
                         pool: "claude".to_owned(),
                         id: "c01".to_owned(),
+                        email: None,
                         condition: crate::harness::accounts::Condition::Limited { until: 0 }
                             .as_str()
                             .to_owned(),
@@ -2041,6 +2072,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                         SurveyAccountFact {
                             pool: "codex".to_owned(),
                             id: "x01".to_owned(),
+                            email: None,
                             condition: "limited".to_owned(),
                             enrolled: true,
                             usage_5h_pct: Some(100),
@@ -2055,6 +2087,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                         SurveyAccountFact {
                             pool: "claude".to_owned(),
                             id: "c02".to_owned(),
+                            email: None,
                             condition: "limited".to_owned(),
                             enrolled: false,
                             usage_5h_pct: None,

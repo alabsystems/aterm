@@ -249,6 +249,7 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::CodexAlabProof
         | StageId::LinuxLane => true,
         StageId::Test
+        | StageId::ReleasedShim
         | StageId::Formatting
         | StageId::Census
         | StageId::ExportScan
@@ -267,8 +268,8 @@ pub fn metered(spec: &StageSpec) -> bool {
 }
 
 /// Whether stage `id` runs test binaries through [`crate::testrun::run_tests`], whose dispatch
-/// claims the memory its plan's binaries hold at once, from each one's history, once it knows
-/// which run (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.4): the stage claims nothing of
+/// claims each binary's recorded peak for that binary's lifetime, once it knows which run
+/// (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.4): the stage claims nothing of
 /// its own ([`How::Dispatched`]) and keeps no peak.
 #[must_use]
 pub const fn dispatched(id: StageId) -> bool {
@@ -1396,6 +1397,10 @@ pub struct Book {
     /// ([`aterm_capacity::Reading::reachable`]): the run's memory budget ([`Book::budget`]).
     /// `None` where physical memory is unread.
     pub reachable: Option<u64>,
+    /// Memory available when the run began, capped by [`Book::reachable`]: the ceiling under
+    /// which the test-compile shaper must make every call fit. This is only a planning ceiling;
+    /// every call still takes normal live admission before it starts.
+    shape_budget: Option<u64>,
     /// Held while a stage reads, adds to and writes the file: the run's stages end on threads of
     /// their own.
     lock: Mutex<()>,
@@ -1409,12 +1414,18 @@ impl Book {
     pub fn live() -> Book {
         use aterm_capacity::Machine as _;
         let reading = aterm_capacity::Live.read(None);
+        let reachable = reading.reachable();
+        let shape_budget = match (reading.available, reachable) {
+            (Some(available), Some(reachable)) => Some(available.min(reachable)),
+            (available, reachable) => available.or(reachable),
+        };
         let state = aterm_types::dirs::account_state_dir();
         Book::at(
             state.as_ref().map(|d| d.join(RECORD)),
             reading.physical,
-            reading.reachable(),
+            reachable,
         )
+        .with_shape_budget(shape_budget)
         .with_plain(state.map(|d| d.join(PLAIN_RECORD)))
     }
 
@@ -1427,8 +1438,18 @@ impl Book {
             plain: None,
             physical,
             reachable,
+            shape_budget: reachable,
             lock: Mutex::new(()),
         }
+    }
+
+    /// This book plans shaped test-compile calls below `budget`. Live admission remains the
+    /// authority for whether each call can start.
+    #[must_use]
+    pub(crate) fn with_shape_budget(mut self, budget: Option<u64>) -> Book {
+        let ceiling = self.budget();
+        self.shape_budget = budget.map(|budget| budget.min(ceiling));
+        self
     }
 
     /// This book reading the plain builds' record at `plain` too ([`Book::plain`]).
@@ -1444,6 +1465,13 @@ impl Book {
     #[must_use]
     pub fn budget(&self) -> u64 {
         self.reachable.unwrap_or(u64::MAX)
+    }
+
+    /// The per-call ceiling for adaptive test-compile shaping, captured from available memory
+    /// when this book was made and capped by [`Book::budget`].
+    #[must_use]
+    pub fn shape_budget(&self) -> u64 {
+        self.shape_budget.unwrap_or_else(|| self.budget())
     }
 
     /// The peaks kept now.
@@ -1471,10 +1499,11 @@ impl Book {
         )
     }
 
-    /// Keep each unit's peak in `peaks`, read in a run in `checkout`, under its unit's key
+    /// Keep each named unit's peak in `peaks`, read in a run in `checkout`, under its unit's key
     /// ([`crate::shape::unit_key`]), unless it was light beside the heaviest that key kept in two
-    /// weeks ([`Records::keep_unless_light`]): the units a heavy test compile's planner sums. The
-    /// units kept, heaviest first; none with no file.
+    /// weeks ([`Records::keep_unless_light`]). The caller raises every identified light compiler
+    /// to [`UNIT_FLOOR`], so the shaper can require complete history rather than silently omit an
+    /// unknown unit. The units kept, heaviest first; none with no file.
     ///
     /// # Errors
     /// The file could not be written ([`Records::update`]).

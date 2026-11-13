@@ -712,13 +712,16 @@ pub struct Image {
 pub struct Process {
     /// A canonical pid above one.
     pub pid: u32,
-    /// Kernel birth: epoch microseconds on Darwin, boot clock ticks on Linux.
+    /// Kernel birth: epoch microseconds on Darwin and Windows (its creation `FILETIME`), boot
+    /// clock ticks on Linux.
     pub birth: u64,
-    /// Its actual parent.
+    /// Its actual parent: on Windows the pid it was created by, 0 where a younger process holds
+    /// that pid now.
     pub parent: u32,
-    /// Its process group.
+    /// Its process group; 0 on Windows, which keeps none, so no leader check passes there.
     pub group: u32,
-    /// Its kernel session.
+    /// Its kernel session (`getsid`); 0 on Windows, which keeps no terminal session, as
+    /// `aterm_sysprobe`'s sweep reads it there.
     pub session: u32,
     /// Its mapped image.
     pub image: Image,
@@ -740,12 +743,33 @@ impl Image {
                 inode: metadata.ino(),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            windows_image(path)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = path;
             None
         }
     }
+}
+
+/// [`Image::at`] on Windows, which keeps no execute bit: the regular file `path` names, by its
+/// canonical path (UTF-8, or none) and its volume serial and file index
+/// ([`super::agent_image::FileId`]), which every path to it shares.
+#[cfg(windows)]
+fn windows_image(path: &std::path::Path) -> Option<Image> {
+    let path = std::fs::canonicalize(path).ok()?;
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let id = super::agent_image::FileId::of(&path)?;
+    Some(Image {
+        path: path.to_str()?.as_bytes().to_vec(),
+        device: id.dev,
+        inode: id.ino,
+    })
 }
 
 impl Process {
@@ -789,7 +813,35 @@ impl Process {
                 },
             })
         }
-        #[cfg(not(unix))]
+        // One sweep of the kernel's table names the parent, its row tied to this process by the
+        // creation time read before and after it, so a pid handed to a younger process between
+        // the reads refuses. Windows lets no one write or delete a mapped image and names it by
+        // its current path, so the file opened there is the one the process maps.
+        #[cfg(windows)]
+        {
+            let signed = i32::try_from(pid).ok().filter(|p| *p > 1)?;
+            let created = aterm_uds::process::read_creation_filetime(signed)?;
+            let birth = aterm_uds::process::read_birth(signed)?;
+            let row = aterm_sysprobe::processes()?
+                .procs
+                .into_iter()
+                .find(|row| row.pid == pid && row.start == Some(created))?;
+            let image = windows_image(&aterm_sysprobe::process_path(pid)?)?;
+            if aterm_uds::process::read_creation_filetime(signed)? != created
+                || aterm_uds::process::read_birth(signed)? != birth
+            {
+                return None;
+            }
+            Some(Self {
+                pid,
+                birth: birth.0,
+                parent: row.ppid,
+                group: 0,
+                session: 0,
+                image,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
             None
@@ -2232,8 +2284,9 @@ pub fn commit<S: std::io::Read + std::io::Write>(
     }
 }
 
-/// The transaction clock shared across exec on one host. This is CLOCK_MONOTONIC, not wall
-/// time, an Instant encoding, a process-relative timer or a claim's metadata clock.
+/// The transaction clock shared across exec on one host. This is CLOCK_MONOTONIC (on Windows the
+/// performance counter, one count since boot for every process), not wall time, an Instant
+/// encoding, a process-relative timer or a claim's metadata clock.
 #[must_use]
 pub fn monotonic_us() -> Option<u64> {
     #[cfg(unix)]
@@ -2250,677 +2303,48 @@ pub fn monotonic_us() -> Option<u64> {
             .checked_mul(1_000_000)?
             .checked_add(u64::try_from(value.tv_nsec).ok()? / 1000)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn QueryPerformanceCounter(count: *mut i64) -> i32;
+            fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+        }
+        let (mut count, mut frequency) = (0_i64, 0_i64);
+        // SAFETY: the call writes one i64 through a pointer to a live local and reads nothing.
+        if unsafe { QueryPerformanceFrequency(&raw mut frequency) } == 0 {
+            return None;
+        }
+        // SAFETY: as above.
+        if unsafe { QueryPerformanceCounter(&raw mut count) } == 0 {
+            return None;
+        }
+        let frequency = u128::try_from(frequency).ok().filter(|hz| *hz > 0)?;
+        u64::try_from(u128::try_from(count).ok()? * 1_000_000 / frequency).ok()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
 }
 
-#[cfg(test)]
+// A restart plan carries a Unix image path, which only a Unix host observes ([`Image::at`],
+// [`Process::observe`] name a Windows path on Windows); its wire refuses any other.
+#[cfg(all(test, unix))]
 #[path = "native_asked_relaunch_wire_tests.rs"]
 mod asked_relaunch_wire_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "native_asked_upgrade_wire_tests.rs"]
 mod asked_upgrade_wire_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_rejection_is_an_explicit_canonical_wire_requirement() {
-        let legacy = fixture();
-        let legacy_wire = legacy.encode().unwrap();
-        assert!(!legacy_wire.contains("reject="));
-        assert_eq!(Request::parse(&legacy_wire), Some(legacy.clone()));
-        let Request::Prepare(mut marked) = legacy else {
-            unreachable!()
-        };
-        let domain = "ab".repeat(32);
-        marked.rejection_domain = Some(domain.clone());
-        let marked = Request::Prepare(marked);
-        let wire = marked.encode().unwrap();
-        assert!(wire.contains(&format!(" reject={domain}")));
-        assert_eq!(Request::parse(&wire), Some(marked));
-        assert_eq!(
-            Request::parse(&wire.replace(&format!("reject={domain}"), "reject=unknown")),
-            None
-        );
-        assert_eq!(Request::parse(&(wire + &format!(" reject={domain}"))), None);
-        assert_eq!(
-            Request::parse("rejection-domain"),
-            Some(Request::RejectionDomain)
-        );
-        assert_eq!(
-            Reply::parse(&format!(
-                "OK native-act state=rejection-domain domain={domain}\n"
-            )),
-            Some(Reply::RejectionDomain(domain))
-        );
-        assert_eq!(
-            Reply::parse("OK native-act state=rejection-domain domain=bad\n"),
-            None
-        );
-    }
-
-    pub(super) fn fixture() -> Request {
-        let image = Image {
-            path: b"/private/image \xff".to_vec(),
-            device: 7,
-            inode: 19,
-        };
-        Request::prepare(Prepare {
-            receipt_mode: None,
-            rejection_domain: None,
-            asked: None,
-            id: "12".repeat(16),
-            host_epoch: "34".repeat(16),
-            holder: "grok-alab@4242".into(),
-            revision: 2,
-            expected_human_seq: None,
-            deadline_us: 91,
-            duty: Scope::Upgrade,
-            plan: NativePlan::OwnImage {
-                child: Process {
-                    pid: 100,
-                    birth: 2,
-                    parent: 4242,
-                    group: 100,
-                    session: 1,
-                    image: image.clone(),
-                },
-                target: image,
-                version: "0.1.0+g123".into(),
-            },
-            boot: None,
-            custody: None,
-        })
-    }
-
-    #[test]
-    fn unadmitted_and_lapsed_replies_name_exactly_one_lower_hex_operation_id() {
-        let id = "ab".repeat(16);
-        for (state, expected) in [
-            ("unadmitted", Reply::Unadmitted(id.clone())),
-            ("lapsed", Reply::Lapsed(id.clone())),
-        ] {
-            let reply = |id: &str| {
-                if state == "lapsed" {
-                    lapsed_reply(id)
-                } else {
-                    unadmitted_reply(id)
-                }
-            };
-            let line = reply(&id).expect("a canonical id");
-            assert_eq!(line, format!("OK native-act state={state} id={id}\n"));
-            assert_eq!(Reply::parse(&line), Some(expected));
-            for bad in [
-                format!("OK native-act state={state}\n"),
-                format!("OK native-act state={state} id=\n"),
-                format!("OK native-act state={state} id={}\n", "AB".repeat(16)),
-                format!("OK native-act state={state} id={}\n", "ab".repeat(15)),
-                format!(
-                    "OK native-act state={state} id={id} cap={}\n",
-                    "cd".repeat(32)
-                ),
-                format!("OK native-act state={state} {id}\n"),
-            ] {
-                assert_eq!(Reply::parse(&bad), None, "{bad}");
-            }
-            assert_eq!(reply(&"AB".repeat(16)), None);
-            assert_eq!(reply("ab"), None);
-        }
-    }
-
-    #[test]
-    fn stamps_are_optional_canonical_words_that_change_only_a_stamped_spelling() {
-        let Request::Prepare(unstamped) = fixture() else {
-            unreachable!()
-        };
-        let legacy = Request::Prepare(unstamped.clone()).encode().unwrap();
-        assert!(!legacy.contains(" boot=") && !legacy.contains(" custody="));
-        let boot = BootStamp {
-            host: format!("darwin:{}", "1f".repeat(16)),
-            boot: "2e".repeat(16),
-        };
-        let custody = "3d".repeat(32);
-        let mut stamped = (*unstamped).clone();
-        stamped.boot = Some(boot.clone());
-        stamped.custody = Some(custody.clone());
-        let wire = Request::prepare(stamped.clone()).encode().unwrap();
-        assert_eq!(
-            wire,
-            format!(
-                "{legacy} boot={}:{} custody={custody}",
-                boot.host, boot.boot
-            )
-        );
-        assert_eq!(
-            Request::parse(&wire),
-            Some(Request::prepare(stamped.clone()))
-        );
-        let mut boot_only = stamped.clone();
-        boot_only.custody = None;
-        assert_eq!(
-            Request::parse(&wire.replace(&format!(" custody={custody}"), "")),
-            Some(Request::prepare(boot_only))
-        );
-        for bad in [
-            format!("{legacy} boot={}", boot.host),
-            format!("{legacy} boot={}", boot.boot),
-            format!("{legacy} boot=darwin:{}:{}", "1F".repeat(16), boot.boot),
-            format!("{legacy} boot={}:{}", boot.host, "2e".repeat(15)),
-            format!("{legacy} boot=:{}:{}", "1f".repeat(16), boot.boot),
-            format!("{legacy} custody={}", "3d".repeat(31)),
-            format!("{legacy} custody={}", "3D".repeat(32)),
-            format!("{wire} custody={custody}"),
-        ] {
-            assert_eq!(Request::parse(&bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn native_wire_preserves_unix_bytes_and_one_original_deadline() {
-        let request = fixture();
-        let wire = request.encode().expect("canonical plan");
-        assert_eq!(Request::parse(&wire), Some(request));
-        assert!(wire.contains("deadline-us=91"));
-        assert!(wire.is_ascii());
-        assert_eq!(
-            Request::parse(&wire.replace("deadline-us=91", "deadline-us=091")),
-            None
-        );
-        assert_eq!(Request::parse(&(wire.clone() + " deadline-us=92")), None);
-        assert_eq!(Request::parse(&(wire + " unrecognized=1")), None);
-    }
-
-    #[test]
-    fn recipient_writer_discovery_is_explicit_and_strict() {
-        assert_eq!(
-            Request::parse("recipient-writer-support"),
-            Some(Request::RecipientWriterSupport)
-        );
-        assert_eq!(
-            Request::RecipientWriterSupport.encode().as_deref(),
-            Some("recipient-writer-support")
-        );
-        for support in [
-            RecipientWriterSupport::Unavailable,
-            RecipientWriterSupport::BoundRecipientsV1,
-        ] {
-            let line = format!(
-                "OK native-act state=recipient-writer-support writer={}\n",
-                support.word()
-            );
-            assert_eq!(
-                Reply::parse(&line),
-                Some(Reply::RecipientWriterSupport(support))
-            );
-        }
-        for malformed in [
-            "recipient-writer-support writer=none",
-            "recipient-writer-support writer=bound-recipients-v1",
-            "recipient-writer-support extra=1",
-        ] {
-            assert_eq!(Request::parse(malformed), None);
-        }
-        for malformed in [
-            "OK native-act state=recipient-writer-support",
-            "OK native-act state=recipient-writer-support writer=recipients5",
-            "OK native-act state=recipient-writer-support writer=bound-recipients5",
-            "OK native-act state=recipient-writer-support writer=true",
-            "OK native-act state=recipient-writer-support writer=unknown",
-            "OK native-act state=recipient-writer-support writer=none writer=bound-recipients-v1",
-            "OK native-act state=recipient-writer-support writer=bound-recipients-v1 native-act=1",
-            "OK native-act state=recipient-writer-support ATermNativeRecipientRecovery=bound-recipients5",
-            "OK native-act state=info writer=bound-recipients5",
-        ] {
-            assert_eq!(Reply::parse(malformed), None, "{malformed}");
-        }
-    }
-
-    #[test]
-    fn initial_cancel_is_discovered_separately_and_echoes_the_exact_original_plan() {
-        assert_eq!(
-            Request::parse("cancel-support"),
-            Some(Request::CancelSupport)
-        );
-        assert_eq!(
-            Request::CancelSupport.encode().as_deref(),
-            Some("cancel-support")
-        );
-        assert_eq!(
-            Reply::parse("OK native-act state=cancel-support cancel-prepare=1\n"),
-            Some(Reply::CancelSupport)
-        );
-        for malformed in [
-            "OK native-act state=cancel-support",
-            "OK native-act state=cancel-support cancel-prepare=2",
-            "OK native-act state=cancel-support cancel-prepare=1 native-act=1",
-        ] {
-            assert_eq!(Reply::parse(malformed), None);
-        }
-        let Request::Prepare(original) = fixture() else {
-            unreachable!()
-        };
-        let actor = Process {
-            pid: 4242,
-            birth: 17,
-            parent: 1,
-            group: 4242,
-            session: 1,
-            image: Image {
-                path: b"/original-supervisor".to_vec(),
-                device: 7,
-                inode: 11,
-            },
-        };
-        let cancel = Request::cancel_prepare((*original).clone(), actor);
-        let Request::CancelPrepare(expected) = cancel.clone() else {
-            unreachable!()
-        };
-        let wire = cancel.encode().unwrap();
-        assert!(wire.starts_with("cancel-prepare "));
-        assert_eq!(Request::parse(&wire), Some(cancel));
-        assert_eq!(
-            Request::parse(wire.split(" actor-pid=").next().unwrap()),
-            None
-        );
-        let receipt = format!(
-            "OK native-act state=cancelled request={}\n",
-            aterm_codec::hex::encode_lower(wire.as_bytes())
-        );
-        assert_eq!(
-            Reply::parse(&receipt),
-            Some(Reply::Cancelled(expected.clone()))
-        );
-        assert_eq!(
-            Reply::parse(&(receipt.trim_end().to_string() + " extra=1")),
-            None
-        );
-        let changed = wire.replace("deadline-us=91", "deadline-us=092");
-        assert_eq!(
-            Reply::parse(&format!(
-                "OK native-act state=cancelled request={}",
-                aterm_codec::hex::encode_lower(changed.as_bytes())
-            )),
-            None
-        );
-        assert_eq!(Request::parse(&(wire + " epoch=00")), None);
-        let mut different = expected.clone();
-        different.prepare.deadline_us += 1;
-        assert_ne!(Reply::Cancelled(different), Reply::Cancelled(expected));
-    }
-
-    #[test]
-    fn constructor_discovery_is_closed_canonical_and_separate_from_info() {
-        assert_eq!(
-            Request::Constructors.encode().as_deref(),
-            Some("constructors")
-        );
-        assert_eq!(Request::parse("constructors"), Some(Request::Constructors));
-        for (words, expected) in [
-            ("-", Vec::new()),
-            ("own-image", vec![Constructor::OwnImage]),
-            ("private-restart", vec![Constructor::PrivateRestart]),
-            ("cold-restart", vec![Constructor::ColdRestart]),
-            ("asked-upgrade", vec![Constructor::AskedUpgrade]),
-            ("asked-relaunch", vec![Constructor::AskedRelaunch]),
-            (
-                "own-image,private-restart",
-                vec![Constructor::OwnImage, Constructor::PrivateRestart],
-            ),
-            (
-                "own-image,private-restart,cold-restart",
-                vec![
-                    Constructor::OwnImage,
-                    Constructor::PrivateRestart,
-                    Constructor::ColdRestart,
-                ],
-            ),
-            (
-                "own-image,private-restart,cold-restart,asked-upgrade,asked-relaunch",
-                Constructor::ALL.to_vec(),
-            ),
-        ] {
-            assert_eq!(
-                Reply::parse(&format!("OK native-act state=constructors plans={words}")),
-                Some(Reply::Constructors(expected))
-            );
-        }
-        for words in [
-            "",
-            "own-image,own-image",
-            "private-restart,own-image",
-            "cold-restart,own-image",
-            "own-image,cold-restart,private-restart",
-            "cold-restart,cold-restart",
-            "cold-restart,unknown",
-            "unknown",
-            "own-image,unknown",
-            "- extra=1",
-        ] {
-            assert_eq!(
-                Reply::parse(&format!("OK native-act state=constructors plans={words}")),
-                None
-            );
-        }
-        assert_eq!(Request::parse("constructors plans=own-image"), None);
-        let info = format!(
-            "OK native-act state=info epoch={} native-act=1 handoff=blocked clock=monotonic-us own-image=grok-alab:upgrade",
-            "34".repeat(16)
-        );
-        assert!(matches!(Reply::parse(&info), Some(Reply::Info { .. })));
-        assert_eq!(Reply::parse(&(info + " plans=own-image")), None);
-    }
-
-    #[test]
-    fn typing_duties_invalid_capabilities_and_noncanonical_paths_cannot_enter_native_wire() {
-        let Request::Prepare(mut request) = fixture() else {
-            unreachable!()
-        };
-        for duty in [
-            Scope::TurnEnd,
-            Scope::Approvals,
-            Scope::Questions,
-            Scope::Walls,
-        ] {
-            request.duty = duty;
-            assert!(Request::Prepare(request.clone()).encode().is_none());
-        }
-        request.duty = Scope::Upgrade;
-        let NativePlan::OwnImage { target, .. } = &mut request.plan else {
-            unreachable!()
-        };
-        target.path = b"relative".to_vec();
-        assert!(Request::Prepare(request).encode().is_none());
-        let binding = Binding {
-            id: "ab".repeat(16),
-            capability: "cd".repeat(32),
-        };
-        for request in [
-            Request::Query(binding.clone()),
-            Request::Recover(binding.clone()),
-            Request::Abort(binding.clone()),
-            Request::Commit(binding.clone(), ImagePhase::Forward, "0.1.0".into()),
-        ] {
-            assert_eq!(Request::parse(&request.encode().unwrap()), Some(request));
-        }
-        assert!(
-            Request::Query(Binding {
-                capability: "C".repeat(64),
-                ..binding
-            })
-            .encode()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn final_commit_transport_failure_is_unknown_and_never_rollback_safe() {
-        struct Closed;
-        impl std::io::Read for Closed {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-        impl std::io::Write for Closed {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut client = crate::RelayClient::new(Closed);
-        let binding = Binding {
-            id: "ab".repeat(16),
-            capability: "cd".repeat(32),
-        };
-        assert_eq!(
-            commit(
-                &mut client,
-                "session",
-                &binding,
-                ImagePhase::Forward,
-                "0.1.0"
-            ),
-            Decision::Unknown
-        );
-        assert_eq!(Reply::parse("OK native-act state=committed extra=1"), None);
-        assert_eq!(
-            Reply::parse("OK native-act state=rollback-safe"),
-            Some(Reply::Decision(Decision::ProvenNotCommittedRollbackSafe))
-        );
-        assert!(!format!("{binding:?}").contains(&binding.capability));
-    }
-}
+#[path = "native_act_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod cold_wire_tests {
-    use super::*;
-
-    #[test]
-    fn cold_facts_keep_credentials_local_and_preserve_known_empty() {
-        let intent = ColdIntent {
-            login: None,
-            home: None,
-            auth_observed: false,
-            route: crate::harness::accounts::AuthRoute::Stored,
-            conversation: None,
-            profile: None,
-            mode: super::super::accounts::Mode::Wall,
-            billing: ColdBilling::Keep,
-        };
-        assert!(
-            ColdEnvironmentFacts::observe(
-                &["HOME=/one".into(), "HOME=/two".into()],
-                &intent,
-                std::path::Path::new("/fixture")
-            )
-            .is_none()
-        );
-        let empty =
-            ColdEnvironmentFacts::observe(&[], &intent, std::path::Path::new("/fixture")).unwrap();
-        assert!(empty.default_home && empty.route == super::super::accounts::AuthRoute::Stored);
-        assert_eq!(empty.selection, super::super::profile::Selection::Standard);
-        assert_eq!(
-            super::super::profile::Selection::of_exec_env(&[]),
-            super::super::profile::Selection::Unknown
-        );
-        let secret = "synthetic-credential-never-on-wire";
-        let facts = ColdEnvironmentFacts::observe(
-            &[format!("ANTHROPIC_API_KEY={secret}")],
-            &intent,
-            std::path::Path::new("/fixture"),
-        )
-        .unwrap();
-        assert_eq!(facts.route, super::super::accounts::AuthRoute::Outside);
-        let encoded = facts.encode().unwrap();
-        assert!(!encoded.contains(secret));
-        assert!(!format!("{facts:?}").contains(secret));
-        assert_eq!(ColdEnvironmentFacts::parse(&encoded), Some(facts));
-        let encoded = intent.encode().unwrap();
-        assert_eq!(ColdIntent::parse(&encoded), Some(intent));
-    }
-
-    /// A COLD RECORD OF v0.157.0 AND OLDER STILL READS: an intent or facts in flight across the
-    /// update that brought the token route carry `stored_login`, which reads as the route
-    /// (`true` stored, `false` outside), as `ClaudeAuthRestore` reads it; what they encode again
-    /// carries `route` alone. CONTROLS: both fields, or neither, is no record.
-    #[test]
-    fn a_cold_record_of_an_older_build_reads_its_stored_login_as_the_route() {
-        use super::super::accounts::AuthRoute;
-        let facts = |route: &str| {
-            format!(
-                r#"{{"login":null,"default_home":true,{route}"home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}}"#
-            )
-        };
-        for (old, route) in [("true", AuthRoute::Stored), ("false", AuthRoute::Outside)] {
-            let read = ColdEnvironmentFacts::parse(&facts(&format!(r#""stored_login":{old},"#)))
-                .unwrap_or_else(|| panic!("stored_login {old} reads"));
-            assert_eq!(read.route, route);
-            let again = read.encode().unwrap();
-            assert!(!again.contains("stored_login"), "{again}");
-            assert_eq!(ColdEnvironmentFacts::parse(&again), Some(read));
-        }
-        assert!(ColdEnvironmentFacts::parse(&facts("")).is_none());
-        assert!(
-            ColdEnvironmentFacts::parse(&facts(r#""route":"stored","stored_login":true,"#))
-                .is_none()
-        );
-        let intent = |route: &str| {
-            format!(
-                r#"{{"login":null,"home":null,"auth_observed":true,{route}"conversation":null,"profile":null,"mode":"wall","billing":"Keep"}}"#
-            )
-        };
-        let current = ColdIntent {
-            login: None,
-            home: None,
-            auth_observed: true,
-            route: AuthRoute::Stored,
-            conversation: None,
-            profile: None,
-            mode: super::super::accounts::Mode::Wall,
-            billing: ColdBilling::Keep,
-        }
-        .encode()
-        .unwrap();
-        assert_eq!(
-            current,
-            intent(r#""route":"stored","#),
-            "the wire as written"
-        );
-        for (old, route) in [("true", AuthRoute::Stored), ("false", AuthRoute::Outside)] {
-            let legacy = intent(&format!(r#""stored_login":{old},"#));
-            let read =
-                ColdIntent::parse(&legacy).unwrap_or_else(|| panic!("stored_login {old} reads"));
-            assert_eq!(read.route, route);
-            assert!(!read.encode().unwrap().contains("stored_login"));
-            assert_eq!(read.encode_for_launcher(), Some(legacy));
-        }
-        let mut token = ColdIntent::parse(&current).unwrap();
-        token.route = AuthRoute::VaultToken {
-            entry: super::super::accounts::TokenEntry::parse(
-                "aterm-claude-token-ac-0123456789abcdef",
-            )
-            .unwrap(),
-        };
-        assert!(token.encode_legacy().is_none());
-        assert_eq!(token.encode_for_launcher(), token.encode());
-        assert!(ColdIntent::parse(&intent("")).is_none());
-        assert!(ColdIntent::parse(&intent(r#""route":"outside","stored_login":false,"#)).is_none());
-    }
-
-    #[test]
-    fn cold_facts_refuse_unknown_duplicate_and_oversize_authority_fields() {
-        let text = r#"{"login":null,"default_home":true,"route":"stored","home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}"#;
-        assert!(ColdEnvironmentFacts::parse(text).is_some());
-        assert!(
-            ColdEnvironmentFacts::parse(&text.replacen("{", "{\"config\":\"/other\",", 1))
-                .is_none()
-        );
-        assert!(
-            ColdEnvironmentFacts::parse(
-                &text.replace("\"default_home\":true", "\"default_home\":false")
-            )
-            .is_none()
-        );
-        assert!(
-            ColdEnvironmentFacts::parse(&text.replacen("{", "{\"login\":\"other\",", 1)).is_none()
-        );
-        assert!(
-            ColdEnvironmentFacts::parse(&text.replace("Standard", "future-selector")).is_none()
-        );
-        assert!(
-            ColdEnvironmentFacts::parse(&text.replace(
-                "\"home\":null",
-                &format!("\"home\":\"{}\"", "x".repeat(MAX_PATH + 1))
-            ))
-            .is_none()
-        );
-    }
-}
+#[path = "native_act_cold_wire_tests.rs"]
+mod cold_wire_tests;
 
 #[cfg(test)]
-mod cold_completion_receipt_tests {
-    use super::*;
-    #[test]
-    fn completed_cold_intent_survives_with_or_without_a_future_observation() {
-        let process = |pid| Process {
-            pid,
-            birth: u64::from(pid) * 10,
-            parent: 22,
-            group: pid,
-            session: 22,
-            image: Image {
-                path: b"/private/vendor".to_vec(),
-                device: 7,
-                inode: 8,
-            },
-        };
-        let saved = super::super::native_observe::SavedObservation {
-            registration: super::super::native_observe::Registration {
-                id: "1".repeat(32),
-                host_epoch: "2".repeat(32),
-                vendor: process(33),
-                shell: process(22),
-            },
-            binding: super::super::native_observe::ObservationBinding {
-                id: "1".repeat(32),
-                host_epoch: "2".repeat(32),
-                capability: "3".repeat(64),
-            },
-        };
-        for intent in [
-            super::super::accounts_pool::ExecutionIntent::external(),
-            super::super::accounts_pool::ExecutionIntent::Stored {
-                namespace: "4".repeat(64),
-                login: Some("/private/login".into()),
-                owner: Some("work".into()),
-                generation: "5".repeat(64),
-            },
-        ] {
-            let text = aterm_json::to_string(&intent.to_value()).unwrap();
-            let account = aterm_codec::hex::encode_lower(text.as_bytes());
-            let observation = aterm_codec::hex::encode_lower(saved.encode().unwrap().as_bytes());
-            let plain = format!(
-                "OK native-act state=committed claim=builtin revision=- account-intent={account}"
-            );
-            for with_watch in [false, true] {
-                let wire = if with_watch {
-                    format!("{plain} observation={observation}")
-                } else {
-                    plain.clone()
-                };
-                assert_eq!(
-                    Reply::parse(&wire),
-                    Some(Reply::ColdRestartCommitted {
-                        claim: ClaimOutcome::Builtin,
-                        observation: with_watch.then(|| Box::new(saved.clone())),
-                        intent: Box::new(intent.clone())
-                    })
-                );
-                for tail in [
-                    " extra=1",
-                    &format!(" account-intent={account}"),
-                    &format!(" observation={observation} observation={observation}"),
-                ] {
-                    assert!(Reply::parse(&(wire.clone() + tail)).is_none());
-                }
-            }
-            let old = format!(
-                "OK native-act state=committed claim=builtin revision=- observation={observation}"
-            );
-            assert_eq!(
-                Reply::parse(&old),
-                Some(Reply::RestartCommitted(Box::new(saved.clone())))
-            );
-            assert!(Reply::parse(&(old + &format!(" account-intent={account}"))).is_none());
-            assert!(Reply::parse(&plain.replace("claim=builtin", "claim=lost")).is_none());
-            let noncanonical = aterm_codec::hex::encode_lower(format!(" {text}").as_bytes());
-            assert!(Reply::parse(&plain.replace(&account, &noncanonical)).is_none());
-            assert!(Reply::parse(&plain.replace(&account, "7b7d")).is_none());
-        }
-    }
-}
+#[path = "native_act_cold_completion_receipt_tests.rs"]
+mod cold_completion_receipt_tests;

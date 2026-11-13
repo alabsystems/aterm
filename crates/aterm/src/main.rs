@@ -21,13 +21,14 @@ use aterm_mesh_core_islands_p1 as _;
 
 mod lab_window;
 
+#[cfg(all(debug_assertions, target_os = "macos"))]
+mod source_image_fixture;
+
 #[cfg(target_os = "macos")]
 mod compact_zone;
 #[cfg(target_os = "macos")]
 mod input_attachments;
-#[cfg(target_os = "macos")]
-mod input_coordinator;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod machine_status;
 #[cfg(test)]
 mod macho_order;
@@ -37,6 +38,10 @@ mod release_probe;
 mod service_repair;
 #[cfg(unix)]
 mod service_repair_remote;
+#[cfg(target_os = "macos")]
+mod setup_resume;
+#[cfg(target_os = "macos")]
+mod setup_take_up;
 #[cfg(target_os = "macos")]
 mod subscriber_scheduling;
 #[cfg(target_os = "macos")]
@@ -512,10 +517,16 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
                 }) as aterm_gui::NodeMaintenance
             })
         };
+        // The job's Commons runtime is a static nothing drops: it stops, and closes the
+        // network history, in the job's quit step, which a terminating signal runs (launchd's
+        // SIGTERM, the job's usual end) and so does the serve loop's return below.
+        aterm_gui::install_host_quit(node_commons_stop_at_quit);
         #[cfg(target_os = "macos")]
-        return input_attachments::node_serve(startup);
+        let code = input_attachments::node_serve(startup);
         #[cfg(not(target_os = "macos"))]
-        return aterm_gui::run_node_serve_owning(startup);
+        let code = aterm_gui::run_node_serve_owning(startup);
+        node_commons_stop_at_quit();
+        return code;
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -552,7 +563,7 @@ const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
     #[cfg(not(unix))]
     fleet_survey: None,
     #[cfg(unix)]
-    fleet_drive: Some(aterm_agent::drive_fleet),
+    fleet_drive: Some(aterm_agent::drive_fleet_from_shell),
     #[cfg(not(unix))]
     fleet_drive: None,
     #[cfg(unix)]
@@ -727,8 +738,8 @@ pub(crate) fn main() -> ExitCode {
         }
     };
     #[cfg(target_os = "macos")]
-    subscriber_scheduling::enter(&mut argv);
-    // The watch-only replacement above does no state, key, network or window work.
+    subscriber_scheduling::enter(&argv);
+    // The watch-only thread policy above does no state, key, network or window work.
     // Window lifetime custody precedes the remaining helper entries that may fork or spawn.
     // This original opaque description remains live through the whole GUI run.
     let lab_window_guard = match lab_window::enter(&mut argv) {
@@ -765,7 +776,15 @@ fn front_door_main(
     if let Some(code) = atpkg::build_admit::hold::entry() {
         return code;
     }
+    if let Err(error) = agh::git::HelperHost::Subcommand.record() {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
     if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(code) = source_image_fixture::entry(&argv) {
         return code;
     }
     #[cfg(unix)]
@@ -1019,6 +1038,13 @@ fn front_door_main(
         return lan_verb::run(rest.get(1..).unwrap_or(&[]));
     }
 
+    // The login job that resumes an unfinished setup run with no window: hidden, off the roster,
+    // and read before anything answers its leading `--version` (`setup_resume::ENTRY`).
+    #[cfg(target_os = "macos")]
+    if setup_resume::is_entry(&rest) {
+        return setup_resume::run();
+    }
+
     #[cfg(unix)]
     if first == "hook" && rest.get(1).is_some_and(|a| a == "run") {
         return dispatch_link(
@@ -1062,7 +1088,14 @@ fn front_door_main(
             aterm_cli::Verb::Pkg => package_entry(forwarded),
             aterm_cli::Verb::Agh => agh::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
-            aterm_cli::Verb::Name => aterm_agent::name_cli::main_entry(forwarded),
+            aterm_cli::Verb::Name => {
+                #[cfg(unix)]
+                let sync = converge::sync_saved_name;
+                #[cfg(not(unix))]
+                let sync =
+                    || Err("saved system-name synchronization is supported on macOS only".into());
+                aterm_agent::name_cli::main_entry(forwarded, sync)
+            }
             #[cfg(unix)]
             aterm_cli::Verb::Node => dispatch_node(&forwarded),
             #[cfg(not(unix))]
@@ -1135,11 +1168,11 @@ fn front_door_main(
                 eprintln!("aterm init: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             aterm_cli::Verb::Status => machine_status::main_entry(&forwarded),
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             aterm_cli::Verb::Status => {
-                eprintln!("aterm status: not available on this platform (Unix only)");
+                eprintln!("aterm status: not available on this platform (Unix and Windows only)");
                 ExitCode::from(2)
             }
             #[cfg(unix)]
@@ -1775,6 +1808,8 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let maintenance = input_maintenance;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let network_source = None;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    aterm_gui::install_host_quit(commons_stop_at_quit);
     #[expect(
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
@@ -1897,6 +1932,41 @@ fn spawn_acaffeine_watch() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
     std::sync::OnceLock::new();
+
+/// How long an ending process waits for its Commons runtime's owner thread to stop
+/// (`aterm_db::runtime::Runtime::shutdown`). Past it the process exits anyway and the network
+/// history stays open, as after a kill.
+#[cfg(unix)]
+const COMMONS_STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The node job's quit step (`aterm_gui::install_host_quit`): its Commons runtime stops, which
+/// writes the network history's pending transitions and closes it. Bounded by
+/// [`COMMONS_STOP_WITHIN`]; a second call finds the runtime stopped.
+#[cfg(unix)]
+fn node_commons_stop_at_quit() {
+    if let Some(runtime) = NODE_COMMONS.get()
+        && !runtime.shutdown(COMMONS_STOP_WITHIN)
+    {
+        aterm_log::warn!(
+            "Commons node runtime still stopping after {COMMONS_STOP_WITHIN:?}: the network history stays open"
+        );
+    }
+}
+
+/// The window's quit step (`aterm_gui::install_host_quit`), run by the window's quit and by a
+/// terminating signal it armed for: its Commons runtime is a static nothing drops, so it stops
+/// here, which writes the network history's pending transitions and closes it. Bounded by
+/// [`COMMONS_STOP_WITHIN`]; a second call finds the runtime stopped.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn commons_stop_at_quit() {
+    if let Some(runtime) = COMMONS_RUNTIME.get()
+        && !runtime.shutdown(COMMONS_STOP_WITHIN)
+    {
+        aterm_log::warn!(
+            "Commons runtime still stopping after {COMMONS_STOP_WITHIN:?}: the network history stays open"
+        );
+    }
+}
 
 /// What the node job's background Commons runtime observes (`aterm node serve`, which keeps its
 /// runtime to itself and serves the census): the presence its account claims lapse by.
@@ -2243,6 +2313,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
         ask_access: person_asked_for_access,
         tools_installed: command_line_tools_installed,
         fda_granted: verified_full_disk_access_granted,
+        fda_off: full_disk_access_reads_off,
         join_phrase: join_alab_with_phrase,
     });
     aterm_gui::register_resource_runner();
@@ -2250,17 +2321,16 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
 }
 
 /// What keeps a launch from first-run setup, which belongs to a window started by the person at
-/// this Mac: a private state root (a laboratory's) or CI, a scope outside the person's, or a
-/// remote session.
+/// this Mac: a private state root (a laboratory's) or CI, a scope outside the person's, or an
+/// ssh login. A window whose screen is away as it starts (another login at it, or nobody) keeps
+/// its setup, which waits for the screen ([`wait_for_the_screen`]).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DoctorStartupEnv {
     isolated: bool,
     outside_person_scope: bool,
-    /// Started outside the console owner's own graphic session: from an ssh login, in a session
-    /// without the window server, or with another login (or nobody) at this Mac's screen
-    /// (`aterm_machines::console::remote`). The person is not at this Mac, so setup waits for a
-    /// window started at it.
+    /// Started from an ssh login, whose markers it inherited: the person who started it is not
+    /// at this Mac, so setup waits for a window started at it.
     remote: bool,
 }
 
@@ -2269,25 +2339,61 @@ fn doctor_startup_env() -> DoctorStartupEnv {
     doctor_startup_env_from(
         |key| std::env::var_os(key),
         aterm_cli::macos_doctor::lasting_scope_refusal(),
-        aterm_machines::console::remote_here,
     )
 }
 
-/// [`doctor_startup_env`] from the environment variable reader `var`, the process's lasting
-/// scope refusal (`aterm_cli::macos_doctor::lasting_scope_refusal`) and its console session
-/// reading (`aterm_machines::console::remote_here`, asked only when no ssh marker answers),
-/// which a test feeds from scratch account paths and a fixed answer.
+/// [`doctor_startup_env`] from the environment variable reader `var` and the process's lasting
+/// scope refusal (`aterm_cli::macos_doctor::lasting_scope_refusal`), which a test feeds from
+/// scratch account paths.
 #[cfg(target_os = "macos")]
 fn doctor_startup_env_from(
     var: impl Fn(&str) -> Option<OsString>,
     lasting_scope_refusal: Option<String>,
-    away_from_console: impl FnOnce() -> bool,
 ) -> DoctorStartupEnv {
     DoctorStartupEnv {
         isolated: var("ATERM_STATE_HOME").is_some() || var("CI").is_some(),
         outside_person_scope: lasting_scope_refusal.is_some(),
-        remote: var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some() || away_from_console(),
+        remote: var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some(),
     }
+}
+
+/// How long a window whose screen is away waits before it reads the console again by itself.
+#[cfg(target_os = "macos")]
+const SCREEN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait until this login holds the Mac's screen (`away` reads `false`,
+/// `aterm_machines::console::remote_here`): a window started while another login holds it, or
+/// nobody does, starts its setup once the person is back, never not at all. Each look waits
+/// [`SCREEN_WAIT`] by `wait`, which a wake (the console's return among them) ends early; one
+/// journal line says it waits. The login job runs the stages that need nobody meanwhile.
+#[cfg(target_os = "macos")]
+fn wait_for_the_screen(mut away: impl FnMut() -> bool, mut wait: impl FnMut(std::time::Duration)) {
+    let mut said = false;
+    while away() {
+        if !std::mem::replace(&mut said, true) {
+            aterm_log::info!(
+                "first-run setup: waits for this login at the Mac's screen before its startup"
+            );
+        }
+        wait(SCREEN_WAIT);
+    }
+}
+
+/// A window's first-run start: it waits for this login at the Mac's screen
+/// ([`wait_for_the_screen`] by `away` and `wait`), and only then holds the window lock by `hold`
+/// (from there this process runs setup and the login job stands down to it) and runs `start`,
+/// whose return lets the hold go, so the job goes on with the stages that need nobody for as long
+/// as the screen is away, and with a run reopened once this start's run returned.
+#[cfg(target_os = "macos")]
+fn start_at_the_screen<H>(
+    away: impl FnMut() -> bool,
+    wait: impl FnMut(std::time::Duration),
+    hold: impl FnOnce() -> H,
+    start: impl FnOnce(),
+) {
+    wait_for_the_screen(away, wait);
+    let _held = hold();
+    start();
 }
 
 /// A new GUI window has its own setup surface even when it inherits markers from the shell that
@@ -2327,20 +2433,100 @@ fn first_run_start(
         .then_some(apply_first_run_doctor as fn() -> bool)
 }
 
-/// A window's first-run setup, a launch's and an update successor's alike.
+/// A window's first-run setup, a launch's and an update successor's alike. Once the launch's
+/// startup is done, the same thread takes up, for the window's life, a run another process admits
+/// or reopens while no setup runs here ([`setup_take_up`]), so its person stages never wait for a
+/// launch the person need not make.
 #[cfg(target_os = "macos")]
 fn apply_first_run_doctor() -> bool {
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
         .spawn(|| {
-            // A plan aterm chose by itself on an earlier launch widens through the watch, which
-            // looks as soon as the startup is done ([`AlabWatch`]).
-            run_startup_setup(None);
+            resume_at_the_screen();
+            setup_take_up::take_up_with(&mut LiveTakeUp::default());
         }) {
         Ok(_) => true,
         Err(why) => {
             aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
             false
+        }
+    }
+}
+
+/// Start or resume setup as a launch does, once the screen is this login's (holding the window
+/// lock while it prepares, so the login job gives way), returning once that startup ended.
+#[cfg(target_os = "macos")]
+fn resume_at_the_screen() {
+    start_at_the_screen(
+        aterm_machines::console::remote_here,
+        wait_for_setup_wake,
+        hold_setup_window,
+        // A plan aterm chose by itself on an earlier launch widens through the watch,
+        // which looks as soon as the startup is done ([`AlabWatch`]).
+        || run_startup_setup(None),
+    );
+}
+
+/// The window's live [`setup_take_up::TakeUp`]: the setup records' watch (started again once
+/// one goes, and none meanwhile but the take-up's timer, or a setup wake), this process's
+/// startups and run workers, and a launch's own resume.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LiveTakeUp {
+    watch: Option<aterm_cli::macos_doctor::SetupRecordsWatch>,
+    said: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl setup_take_up::TakeUp for LiveTakeUp {
+    fn arm(&mut self) -> bool {
+        if self.watch.is_none() {
+            match aterm_cli::macos_doctor::SetupRecordsWatch::start() {
+                Ok(watch) => self.watch = Some(watch),
+                Err(why) => self.say(format!(
+                    "first-run setup: this window hears no change of the setup records ({why}); \
+                     it looks on its timer"
+                )),
+            }
+        }
+        self.watch.is_some()
+    }
+    fn wait(&mut self, within: std::time::Duration) {
+        let ended = match &self.watch {
+            Some(watch) => watch.wait(within).err(),
+            None => {
+                wait_for_setup_wake(within);
+                None
+            }
+        };
+        if let Some(why) = ended {
+            self.watch = None;
+            self.say(format!(
+                "first-run setup: the setup records' watch ended ({why}); a new one starts"
+            ));
+        }
+    }
+    fn setup_here(&mut self) -> bool {
+        STARTUP_RUNS.load(std::sync::atomic::Ordering::Acquire) != 0
+            || HEAL_STARTING.load(std::sync::atomic::Ordering::Acquire)
+            || SETUP_RUN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+    }
+    fn resumable(&mut self) -> Result<Option<u64>, String> {
+        aterm_cli::macos_doctor::initial_setup_resumable()
+    }
+    fn resume(&mut self) {
+        resume_at_the_screen();
+    }
+    fn now(&mut self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn say(&mut self, line: String) {
+        if self.said.as_deref() != Some(line.as_str()) {
+            aterm_log::info!("{line}");
+            self.said = Some(line);
         }
     }
 }
@@ -3362,6 +3548,11 @@ trait SetupStartup {
         Ok(false)
     }
 
+    /// The capture that binds this review failed and the review ends unbound: a fresh one binds
+    /// the records, at once (`run_repaired_startups`, which starts none once a Stop covered this
+    /// one).
+    fn bind_afresh(&mut self) {}
+
     /// Number the admission the startup sends now (`SETUP_SENT`), so a Stop pressed after it
     /// covers the run it admits (`StartupSent`).
     fn send(&mut self) {}
@@ -3429,7 +3620,8 @@ struct LiveSetupStartup<F> {
     sent: StartupSent,
     /// Setup changes heard before the operation whose failure may need a retry.
     retry_seen: u64,
-    /// This bound review repaired corrupt records and retired without adopting them.
+    /// This review retired without adopting the records (it repaired corrupt ones, or its capture
+    /// failed): a fresh review binds them.
     recovered: bool,
 }
 
@@ -3527,6 +3719,10 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
                 aterm_cli::macos_doctor::bring_forward_restored_setup_observing(published)
             })
             .map(|outcome| !matches!(outcome, aterm_cli::macos_doctor::BroughtForward::Busy))
+    }
+
+    fn bind_afresh(&mut self) {
+        self.recovered = true;
     }
 
     fn send(&mut self) {
@@ -3677,72 +3873,8 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod startup_answer_tests {
-    use super::*;
-    use aterm_types::macos_setup::Plan;
-
-    fn answered(
-        chosen: bool,
-        vault_typed: bool,
-    ) -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
-        let plan = Plan::default();
-        let mut host = LiveSetupStartup {
-            offer: move |plan, _| aterm_gui::SetupAnswer {
-                chosen,
-                vault_typed,
-                ..aterm_gui::WorkstationSetupDecision::Begin(plan).into()
-            },
-            receipt: None,
-            authorization: None,
-            last_failure: None,
-            observation: None,
-            offered: Some((plan.clone(), true)),
-            chosen: false,
-            vault_typed: false,
-            sent: StartupSent::default(),
-            retry_seen: SETUP_WAKES.count(),
-            recovered: false,
-        };
-        assert_eq!(
-            host.offer(plan.clone()),
-            aterm_gui::WorkstationSetupDecision::Begin(plan)
-        );
-        host
-    }
-
-    #[test]
-    fn a_same_plan_startup_choice_is_not_a_provisional_automatic_answer() {
-        assert_eq!(
-            answered(false, false).answer_kind(&Plan::default()),
-            StartupAnswerKind::Automatic
-        );
-        assert_eq!(
-            answered(true, false).answer_kind(&Plan::default()),
-            StartupAnswerKind::Person
-        );
-    }
-
-    /// The page's answer with no press, of a plan aterm did not choose by itself (the plan a
-    /// set-aside or a Restore's bring-forward left for the offer), chooses nothing: it is the
-    /// offered admission, never a person's, so a set-aside's note stays.
-    #[test]
-    fn an_unpressed_answer_of_a_persons_plan_is_the_offered_admission() {
-        let mut host = answered(false, false);
-        host.offered = Some((Plan::default(), false));
-        assert_eq!(
-            host.answer_kind(&Plan::default()),
-            StartupAnswerKind::Offered
-        );
-    }
-
-    #[test]
-    fn a_startup_join_uses_the_explicit_admission_path() {
-        assert_eq!(
-            answered(true, true).answer_kind(&Plan::default()),
-            StartupAnswerKind::Join
-        );
-    }
-}
+#[path = "main_startup_answer_tests.rs"]
+mod startup_answer_tests;
 
 #[cfg(target_os = "macos")]
 use aterm_cli::macos_doctor::setup_is_newer;
@@ -3900,12 +4032,27 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
     if host.stopped() {
         return Ok(PreparedSetup::Unavailable);
     }
-    // The review is bound once: a capture that failed ends this attempt, never to bind a later
-    // run's revision (a manual repair's) as this launch's own. A saved setup that stays
-    // unreadable starts a fresh attempt from the page's read (`heal_unread_setup`).
-    let revision = host
-        .bind_authorization()
-        .inspect_err(|why| host.report_rejection(why))?;
+    // The review is bound once: a capture that failed ends this review, never to bind a later
+    // run's revision (a manual repair's) as this one's own, and never this launch's setup: after
+    // the startup's pause a fresh review binds what the records hold then (`bind_afresh`), unless
+    // a Stop covered this one meanwhile. A newer aterm's records end it as they are.
+    let revision = match host.bind_authorization() {
+        Ok(revision) => revision,
+        Err(why) => {
+            if setup_is_newer(&why) {
+                host.report_rejection(&why);
+                return Err(why);
+            }
+            host.report_failure(&why);
+            if !host.stopped() {
+                host.backoff();
+            }
+            if !host.stopped() {
+                host.bind_afresh();
+            }
+            return Ok(PreparedSetup::Unavailable);
+        }
+    };
     // Capture holds no automatic claim: a Stop and a later manual admission
     // may both have completed while it read. This older coordinator cannot
     // resume that newer run using the Stop-covered admission it sent.
@@ -4160,9 +4307,7 @@ fn run_prepared_setup(
         }
         PreparedSetup::Finished => {
             aterm_gui::publish_initial_setup_status(initial_setup_status());
-            // No apply pass ends in this launch to refresh the checklist. Read it now through
-            // the ordinary observer, keeping its selected account and network scope.
-            request_observation(None, aterm_types::macos_setup::Subject::all(), false);
+            look_at_finished_setup();
             // A finished setup runs no Secrets stage: while the plan in force keeps the vault in
             // sync ([`vault_sync_kept`]), the mend keeps a vault subscriber whose plist runs a copy
             // that is gone, or that this window owes the Mac.
@@ -4173,9 +4318,10 @@ fn run_prepared_setup(
             // hold up the watch for the ALab vault that starts once this returns.
             (setup_io().start_follow_up)();
         }
-        // No run here, now or later in this process (an update's successor that withholds the
-        // review, a Stop, a newer choice): the window lane is this launch's converge pass beside
-        // the subscriber's, each item keeping its own off switch.
+        // No run from this review (an update's successor that withholds it, a Stop, a newer
+        // choice, a capture that met the records being written, which asks a fresh review of its
+        // own): the window lane is this launch's converge pass beside the subscriber's, each item
+        // keeping its own off switch.
         PreparedSetup::Unavailable => (setup_io().converge_lane)(),
     }
 }
@@ -4232,7 +4378,7 @@ fn while_vault_sync_kept_with(
 /// no slot. Each finite attempt acquires both leases before capturing the grant and time;
 /// the existing keeper retains contention and failed starts without another app launch.
 #[cfg(target_os = "macos")]
-fn finish_withheld_preferences() -> aterm_secrets::converge::Last {
+fn finish_withheld_preferences() -> withheld_preferences::Attempted {
     publish_withheld_attempt(
         finish_withheld_preferences_with(
             aterm_cli::macos_doctor::try_finish_withheld_preferences_unless_stopped,
@@ -4253,20 +4399,31 @@ fn publish_withheld_attempt<S>(
         Option<aterm_cli::macos_doctor::InitialSetupObservation>,
     ),
     failed: impl FnOnce(String, Option<aterm_cli::macos_doctor::InitialSetupObservation>),
-) -> aterm_secrets::converge::Last {
-    use aterm_cli::macos_doctor::WithheldFollowUp;
+) -> withheld_preferences::Attempted {
+    use aterm_cli::macos_doctor::{FollowedUp, WithheldFollowUp};
     use aterm_secrets::converge::Last;
+    use withheld_preferences::Attempted;
     let WithheldFollowUp::Finished(finished) = finished else {
-        return Last::Held;
+        return Attempted::plain(Last::Held);
     };
-    let (observed, reservation) = *finished;
-    let last = match &observed.result {
-        Ok(Some(report)) if report.needs_attention() => Last::Unfinished,
-        Ok(_) => Last::Ended,
-        Err(_) => Last::Failed,
+    let FollowedUp {
+        observed,
+        reservation,
+        put_off_for,
+    } = *finished;
+    let attempted = match &observed.result {
+        Ok(Some(report)) if report.needs_attention() => Attempted::plain(Last::Unfinished),
+        // Only changes put off for their own pause are left (`DEFERRED`): the request stays
+        // unfinished, and its keeper tries again once the first of them comes due.
+        Ok(Some(report)) if !report.complete() => Attempted {
+            last: Last::Unfinished,
+            put_off_for,
+        },
+        Ok(_) => Attempted::plain(Last::Ended),
+        Err(_) => Attempted::plain(Last::Failed),
     };
     report_withheld_preferences((observed, reservation), restored, failed);
-    last
+    attempted
 }
 
 /// Keep the follow-up's setup slot until its result has been published: a later choice cannot
@@ -4360,29 +4517,86 @@ fn run_first_run_doctor(
     // the loop before each pass once its revision reads current, never here:
     // a startup run that waited for the slot while a person's choice admitted
     // a newer run must not take that run's place for a Stop (`register`).
+    // This process runs the run's passes now: the login job stands down to it until the worker
+    // returns, and takes up a run reopened after that.
+    let _window = hold_setup_window();
     with_setup_watch(
         true,
         || {
             with_setup_run(revision, || {
-                run_setup_retry(
-                    &mut LiveSetupRetry {
-                        revision,
-                        password,
-                        last_failure: None,
-                        success_reported: false,
-                        wakes_seen: SETUP_WAKES.marks(),
-                        park_due_seen: SetupRetryDeadlines::default(),
-                        park_before_pass: None,
-                        accounts_said: None,
-                    },
+                supervise_setup_retry(
+                    &mut LiveSetupRetry::new(revision, password, SetupOwner::Window),
                     claim,
                     busy,
                     revision,
+                    restart_setup_worker,
                 );
             })
         },
         maintain_setup_watch,
     );
+}
+
+/// The login job's worker of admitted run `revision` ([`setup_resume`]): the run's own loop,
+/// owned by the job ([`SetupOwner::Job`]), until the run finishes, a newer one replaces it, a
+/// window that runs setup opens, or an update replaced the job's build. It holds no typed
+/// password and keeps no ALab watch. Whether it ran a pass.
+#[cfg(target_os = "macos")]
+fn run_setup_job(revision: u64) -> bool {
+    let busy = wait_for_initial_setup_slot();
+    with_setup_run(revision, || {
+        let mut host = LiveSetupRetry::new(revision, None, SetupOwner::Job);
+        supervise_setup_retry(&mut host, None, busy, revision, restart_setup_worker);
+        host.passes > 0
+    })
+}
+
+/// Wait `pause`, or less on a setup wake, as the login job does between its looks.
+#[cfg(target_os = "macos")]
+fn wait_for_setup_wake(pause: std::time::Duration) {
+    let mut seen = SETUP_WAKES.count();
+    SETUP_WAKES.back_off(&mut seen, pause);
+}
+
+/// Note that this window runs setup while the returned hold lives
+/// (`aterm_cli::macos_doctor::hold_initial_setup_window`), so the login job runs no pass
+/// meanwhile. A hold that cannot be taken leaves the claim to keep their passes apart.
+#[cfg(target_os = "macos")]
+fn hold_setup_window() -> Option<aterm_cli::macos_doctor::SetupWindowHold> {
+    aterm_cli::macos_doctor::hold_initial_setup_window()
+        .inspect_err(|why| {
+            aterm_log::info!("first-run setup: the login job cannot see this window: {why}");
+        })
+        .ok()
+}
+
+/// Keep the login job with the run before a window's pass
+/// (`aterm_cli::macos_doctor::keep_initial_setup_resume`), so a quit, a crash or a logout of this
+/// window leaves the run to the job: one journal line each time what launchd says of it changes.
+#[cfg(target_os = "macos")]
+fn keep_setup_resume(said: &mut Option<String>) {
+    use aterm_cli::macos_doctor::SetupResume;
+    let line = match aterm_cli::macos_doctor::keep_initial_setup_resume() {
+        Ok(SetupResume::Ended) => "first-run setup: no run owes a pass; no login job".to_owned(),
+        Ok(SetupResume::Running) => "first-run setup: launchd runs the login job".to_owned(),
+        Ok(SetupResume::Started) => {
+            "first-run setup: the login job was handed to launchd to start again".to_owned()
+        }
+        Ok(SetupResume::Loaded) => {
+            "first-run setup: the login job was handed to launchd".to_owned()
+        }
+        Ok(SetupResume::Renewed) => "first-run setup: the login job ran a build an update \
+                                      replaced; it was handed to launchd to start again on this one"
+            .to_owned(),
+        Err(why) => format!(
+            "first-run setup: the login job is not kept ({why}); a run this window leaves waits \
+             for the next window"
+        ),
+    };
+    if said.as_deref() != Some(line.as_str()) {
+        aterm_log::info!("{line}");
+        *said = Some(line);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4415,21 +4629,33 @@ trait SetupRetryHost {
     fn register(&mut self);
     fn apply(&mut self) -> Result<PassNext, String>;
     /// Wait a minute before the next pass, or less once a wake ends it (never a window's focus
-    /// gain). `true` when a person pressed Check again or the pending preferences' console
-    /// returned meanwhile: the run's tries start afresh.
+    /// gain): after a pass that had nothing to do, or before one the slot, the claim or a read
+    /// kept from running. `true` when a person pressed Check again or the pending preferences'
+    /// console returned meanwhile: the run's pace starts afresh ([`Self::settled`]).
     fn backoff(&mut self) -> bool;
-    /// Wait until something a parked run waits on may have moved: a person's
-    /// grant, Check again, a new plan, Stop, System State coming to the front, a
-    /// vault approval, a local fact the park is marked on, a try that came due, or,
-    /// while an Accounts or Permissions stage is left, a window gaining focus. No pass
-    /// runs meanwhile, however long that takes. `true` when what ended it starts the
-    /// run's tries afresh: a fact the park is marked on changed, or a person pressed
-    /// Check again. Any other end leaves spent tries spent ([`idle_after`]).
+    /// A pass left a step to try again by itself ([`PassNext::Retry`]): one more such pass in a
+    /// row of this run, kept on disk with its time (`aterm_cli::macos_doctor::PassRetry`), so the
+    /// next [`Self::park`] ends by itself at the end of the pause that follows it, a minute after
+    /// the first and longer after each pause that ran out, up to an hour (a pass a wake brought
+    /// early starts the same pause again), and a relaunch or a reboot goes on from it.
+    fn retried(&mut self);
+    /// A pass left nothing to try again by itself, or a wait ended in a way that asks for a pass
+    /// now (a person's Check again, a fact the run waits on, the console's return): the run's
+    /// pace starts afresh.
+    fn settled(&mut self);
+    /// Wait until something the run waits on may have moved: a person's grant, Check again, a
+    /// new plan, Stop, System State coming to the front, a vault approval, a local fact the
+    /// park is marked on, a try that came due (a step's own pause, a parked stage's, or the
+    /// run's own pause after a pass that left a step to retry, [`Self::retried`]), or, while an
+    /// Accounts or Permissions stage is left, a window gaining focus. No pass runs meanwhile,
+    /// however long that takes. `true` when what ended it asks for a pass now: a fact the park
+    /// is marked on changed, or a person pressed Check again ([`Self::settled`]).
     fn park(&mut self) -> bool;
-    /// Whether this run still retries by itself what a pass of it fails: `true` before a pass the
-    /// loop runs again should it fail, `false` before a park. While it is `true` a failure is the
-    /// page's alone; the menu line and the tab's attention say it once it is `false` (System
-    /// State design §3.5, §3.6).
+    /// Whether this run's worker goes on by itself: `true` from its first pass for as long as it
+    /// runs, whatever a pass of it leaves, since every wait it makes ends by itself or on a
+    /// wake; `false` once it leaves ([`StandDown`]). While it is `true` a failure is the page's
+    /// alone, calm, never the menu line's or the tab's attention (System State design §3.5,
+    /// §3.6).
     fn retrying(&mut self, retrying: bool);
     fn failure(&mut self, why: &str);
     fn completed(&mut self);
@@ -4442,32 +4668,12 @@ trait SetupRetryHost {
 enum PassNext {
     /// Nothing is left for this pass to do.
     Done,
-    /// Something changes by itself (a service starting, the network): try again.
+    /// Something changes by itself (a service starting, the network): try again, after the
+    /// run's own pause ([`SetupRetryHost::retried`]), however many passes in a row it takes.
     Retry,
-    /// Only a person moves what is left: no pass changes it until they do.
+    /// What is left waits on a person, or on a pause of its own: no pass changes it until one
+    /// of them moves or comes due.
     Park,
-}
-
-/// Passes in a row that only retried before the loop parks instead: what a pass
-/// retries changes by itself within minutes, and a run that never settles must
-/// not wake every minute for the life of the app.
-#[cfg(any(target_os = "macos", test))]
-const SETUP_RETRY_LIMIT: u32 = 10;
-
-/// How the retry loop idles after a pass, and its new count of passes in a row
-/// that only retried. Once that count is spent the loop parks and the count stays
-/// spent, whatever wakes the park, so a pass a wake runs then says the run no
-/// longer retries (System State design §3.6): only a pass that leaves nothing to
-/// retry, a wait that starts the tries afresh ([`SetupRetryHost::park`],
-/// [`SetupRetryHost::backoff`]), a new run or a new launch counts from nothing again.
-#[cfg(any(target_os = "macos", test))]
-fn idle_after(next: PassNext, retries: u32) -> (PassNext, u32) {
-    match next {
-        PassNext::Retry if retries + 1 < SETUP_RETRY_LIMIT => (PassNext::Retry, retries + 1),
-        PassNext::Retry => (PassNext::Park, retries),
-        PassNext::Park => (PassNext::Park, 0),
-        PassNext::Done => (PassNext::Retry, 0),
-    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4476,25 +4682,23 @@ fn release_setup_pass<C, B>(claim: &mut Option<C>, busy: &mut Option<B>) {
     drop(busy.take());
 }
 
-/// Give the slot and the claim back and wait before trying a pass again. Nothing the run failed
-/// counts as retried meanwhile: what it waits on (a claim another process holds, a failing read)
-/// may last, and its failure must reach the menu line (System State design §3.6). A person's
-/// Check again or a useful console return meanwhile starts the run's tries afresh (`retries`).
+/// Give the slot and the claim back and wait before trying a pass again: what kept it from
+/// running (a claim another process holds, a failing read) may last, and the run goes on by
+/// itself meanwhile, so its failure stays the page's (System State design §3.6). A person's
+/// Check again or a useful console return meanwhile starts the run's pace afresh.
 #[cfg(any(target_os = "macos", test))]
 fn back_off_before_a_pass<H: SetupRetryHost>(
     host: &mut H,
     claim: &mut Option<H::Claim>,
     busy: &mut Option<H::Busy>,
-    retries: &mut u32,
 ) {
-    host.retrying(false);
     release_setup_pass(claim, busy);
     if host.backoff() {
-        *retries = 0;
+        host.settled();
     }
 }
 
-/// The retry loop's host, which says the run no longer retries anything once
+/// The retry loop's host, which says the run no longer goes on by itself once
 /// the loop is left: by a return, or by a panic in a pass unwinding through it.
 #[cfg(any(target_os = "macos", test))]
 struct StandDown<'h, H: SetupRetryHost>(&'h mut H);
@@ -4511,6 +4715,11 @@ impl<H: SetupRetryHost> Drop for StandDown<'_, H> {
 /// the claim, as a person's restart takes them: this worker never waits for the
 /// slot while it holds the claim, so a choice made meanwhile is never refused
 /// for it. A claim held elsewhere gives the slot back and backs off.
+///
+/// It never gives up on the run: a pass that leaves a step to retry is followed by a park that
+/// ends by itself on the run's own growing pause, kept on disk ([`SetupRetryHost::retried`]),
+/// however many passes in a row that takes; a pass that leaves only what a person or a step's
+/// own pause moves parks on those. No count turns a retry into a hold only a press lifts.
 #[cfg(any(target_os = "macos", test))]
 fn run_setup_retry<H: SetupRetryHost>(
     host: &mut H,
@@ -4522,7 +4731,7 @@ fn run_setup_retry<H: SetupRetryHost>(
     let host = &mut *stand_down.0;
     let mut busy = Some(busy);
     let mut claim = claim;
-    let mut retries = 0;
+    host.retrying(true);
     loop {
         match host.finished() {
             Ok(true) => {
@@ -4532,7 +4741,7 @@ fn run_setup_retry<H: SetupRetryHost>(
             Ok(false) => {}
             Err(why) => {
                 host.failure(&why);
-                back_off_before_a_pass(host, &mut claim, &mut busy, &mut retries);
+                back_off_before_a_pass(host, &mut claim, &mut busy);
                 continue;
             }
         }
@@ -4541,7 +4750,7 @@ fn run_setup_retry<H: SetupRetryHost>(
             Ok(_) => {}
             Err(why) => {
                 host.failure(&why);
-                back_off_before_a_pass(host, &mut claim, &mut busy, &mut retries);
+                back_off_before_a_pass(host, &mut claim, &mut busy);
                 continue;
             }
         }
@@ -4555,12 +4764,12 @@ fn run_setup_retry<H: SetupRetryHost>(
             match host.claim() {
                 Ok(Some(acquired)) => claim = Some(acquired),
                 Ok(None) => {
-                    back_off_before_a_pass(host, &mut claim, &mut busy, &mut retries);
+                    back_off_before_a_pass(host, &mut claim, &mut busy);
                     continue;
                 }
                 Err(why) => {
                     host.failure(&why);
-                    back_off_before_a_pass(host, &mut claim, &mut busy, &mut retries);
+                    back_off_before_a_pass(host, &mut claim, &mut busy);
                     continue;
                 }
             }
@@ -4569,15 +4778,12 @@ fn run_setup_retry<H: SetupRetryHost>(
                 Ok(_) => {}
                 Err(why) => {
                     host.failure(&why);
-                    back_off_before_a_pass(host, &mut claim, &mut busy, &mut retries);
+                    back_off_before_a_pass(host, &mut claim, &mut busy);
                     continue;
                 }
             }
         }
         host.register();
-        // A failure is retried unless this pass is the last of a run that
-        // only retried: the rule `idle_after` parks by.
-        host.retrying(idle_after(PassNext::Retry, retries).0 == PassNext::Retry);
         let next = host.apply().unwrap_or_else(|why| {
             host.failure(&why);
             PassNext::Retry
@@ -4591,18 +4797,77 @@ fn run_setup_retry<H: SetupRetryHost>(
             Err(why) => host.failure(&why),
         }
         release_setup_pass(&mut claim, &mut busy);
-        let (idle, count) = idle_after(next, retries);
-        retries = count;
-        let fresh = if idle == PassNext::Park {
-            host.retrying(false);
-            host.park()
-        } else {
-            host.backoff()
+        let fresh = match next {
+            PassNext::Retry => {
+                host.retried();
+                host.park()
+            }
+            PassNext::Park => {
+                host.settled();
+                host.park()
+            }
+            PassNext::Done => {
+                host.settled();
+                host.backoff()
+            }
         };
         if fresh {
-            retries = 0;
+            host.settled();
         }
     }
+}
+
+/// [`run_setup_retry`], started again whenever a pass panics: the unwind gives back the slot and
+/// the claim and says the run no longer retries ([`StandDown`]), and the ledger counts the stage
+/// it cut off as a crash (`aterm_cli::macos_doctor` `ledger::Begun`), so a stage that keeps
+/// panicking parks on its own pause rather than running again at once. The panicked pass counts
+/// on the run's durable pace as one more that left a step to retry ([`SetupRetryHost::retried`]),
+/// so the pause grows with each panic in a row, starts afresh once a pass settles, and a relaunch
+/// reads the same deadline; `restart` waits it out and takes the slot again, and the loop then
+/// starts with no claim, as a worker that waited for one does. The worker ends only as the loop
+/// does: the run finished, or a newer one replaced it.
+#[cfg(any(target_os = "macos", test))]
+fn supervise_setup_retry<H: SetupRetryHost>(
+    host: &mut H,
+    claim: Option<H::Claim>,
+    busy: H::Busy,
+    revision: u64,
+    mut restart: impl FnMut(&mut H) -> H::Busy,
+) {
+    let mut claim = claim;
+    let mut busy = busy;
+    loop {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_setup_retry(&mut *host, claim, busy, revision);
+        }));
+        if ran.is_ok() {
+            return;
+        }
+        host.retried();
+        claim = None;
+        busy = restart(host);
+    }
+}
+
+/// The live [`supervise_setup_retry`] restart: one journal line, the run's own pause as its
+/// durable pace now says (`aterm_cli::macos_doctor::PassRetry`), or less on a wake, then the
+/// slot.
+#[cfg(target_os = "macos")]
+fn restart_setup_worker(host: &mut LiveSetupRetry) -> InitialSetupBusy {
+    let now = unix_seconds();
+    let pause = std::time::Duration::from_secs(
+        host.pace
+            .pending(now)
+            .map_or(0, |due| due.saturating_sub(now)),
+    );
+    aterm_log::info!(
+        "first-run setup: a pass of run {} panicked; its worker starts again in {}s",
+        host.revision,
+        pause.as_secs()
+    );
+    let mut seen = SETUP_WAKES.count();
+    SETUP_WAKES.back_off(&mut seen, pause);
+    host.busy()
 }
 
 /// How long a parked run waits before it reads its mark again by itself: until its next retry
@@ -4698,32 +4963,95 @@ fn wait_for_setup_park_change_since<M: PartialEq>(
     )
 }
 
+/// The last due deadline a parked worker woke for, per source of its tries: the Secrets
+/// vault's, the Mac settings', and a parked stage's (`InitialSetupParkMark::retry_due`,
+/// `mac_settings_retry_due`, `stage_retry_due`, in that order).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Default)]
-struct SetupRetryDeadlines {
-    secrets: Option<u64>,
-    mac_settings: Option<u64>,
-}
+struct SetupRetryDeadlines([Option<u64>; 3]);
 
 #[cfg(any(target_os = "macos", test))]
 impl SetupRetryDeadlines {
-    fn unseen(self, secrets: Option<u64>, mac_settings: Option<u64>) -> bool {
-        secrets.is_some_and(|due| Some(due) != self.secrets)
-            || mac_settings.is_some_and(|due| Some(due) != self.mac_settings)
+    /// Whether a source has a due deadline this worker has not woken for.
+    fn unseen(self, dues: [Option<u64>; 3]) -> bool {
+        dues.iter()
+            .zip(self.0)
+            .any(|(due, seen)| due.is_some_and(|due| Some(due) != seen))
     }
 
-    fn consume(&mut self, secrets: Option<u64>, mac_settings: Option<u64>) {
-        if secrets.is_some() {
-            self.secrets = secrets;
+    /// The worker woke for `dues`: each is spent, even should it be absent for a while.
+    fn consume(&mut self, dues: [Option<u64>; 3]) {
+        for (seen, due) in self.0.iter_mut().zip(dues) {
+            if due.is_some() {
+                *seen = due;
+            }
         }
-        if mac_settings.is_some() {
-            self.mac_settings = mac_settings;
-        }
+    }
+}
+
+/// What times a parked worker by itself: each source's due deadline it last woke for
+/// ([`SetupRetryDeadlines`]) and the end of the run's own pace after a pass that left a step to
+/// retry (`pace_due`, seconds since the epoch; `aterm_cli::macos_doctor::PassRetry::pending`).
+/// One rule for a window's worker and the login job's alike.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Default)]
+struct ParkClock {
+    due_seen: SetupRetryDeadlines,
+    pace_due: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ParkClock {
+    /// The deadline the park's timer runs to: the mark's next one still ahead (`next_due`) or
+    /// the pace's end, whichever comes first; none with neither, and the park then waits for a
+    /// wake alone.
+    fn next(self, next_due: Option<u64>) -> Option<u64> {
+        next_due.into_iter().chain(self.pace_due).min()
+    }
+
+    /// Whether a reading of the mark at `now`, whose sources' due deadlines are `dues`, asks for
+    /// a pass now: one of them is due and the worker has not woken for it, or the pace ended.
+    fn ready(self, dues: [Option<u64>; 3], now: u64) -> bool {
+        self.due_seen.unseen(dues) || self.pace_due.is_some_and(|due| now >= due)
+    }
+}
+
+/// A park's due deadlines, one per source ([`SetupRetryDeadlines`]).
+#[cfg(target_os = "macos")]
+fn park_dues(mark: &aterm_cli::macos_doctor::InitialSetupParkMark) -> [Option<u64>; 3] {
+    [
+        mark.retry_due(),
+        mark.mac_settings_retry_due(),
+        mark.stage_retry_due(),
+    ]
+}
+
+/// Whose worker a run's loop is.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupOwner {
+    /// A window's, or a terminal session's: every stage of the plan, a person's among them.
+    Window,
+    /// The login job's ([`setup_resume`]), with no window and no person: the stages that run
+    /// unattended alone (`aterm_cli::macos_doctor::run_background_setup_pass`); it stands down
+    /// once a window runs setup.
+    Job,
+}
+
+#[cfg(target_os = "macos")]
+impl SetupOwner {
+    /// Whether this worker gives way: the login job's, once a window runs setup or an update
+    /// replaced the job's build (`setup_resume::replaced`), which launchd then starts again on
+    /// the new one. A lock that cannot be read gives way to nothing, as the claim keeps their
+    /// passes apart.
+    fn gives_way(self) -> bool {
+        self == Self::Job && job_gives_way()
     }
 }
 
 #[cfg(target_os = "macos")]
 struct LiveSetupRetry {
+    owner: SetupOwner,
     revision: u64,
     password: Option<aterm_secrets::SecretBytes>,
     last_failure: Option<String>,
@@ -4731,6 +5059,10 @@ struct LiveSetupRetry {
     /// The last wakes this worker answered: set when a pass begins, so a wake
     /// during it is not lost, and by each backoff that a wake ended.
     wakes_seen: WakeMarks,
+    /// The run's own pace between passes that left a step to retry, as on disk
+    /// (`aterm_cli::macos_doctor::PassRetry`): read when the worker starts, so a relaunch
+    /// goes on from it.
+    pace: aterm_cli::macos_doctor::PassRetry,
     /// Each source's last consumed deadline: an unchanged due attempt cannot
     /// wake every park, nor hide a newly due attempt from another source.
     park_due_seen: SetupRetryDeadlines,
@@ -4739,6 +5071,10 @@ struct LiveSetupRetry {
     park_before_pass: Option<aterm_cli::macos_doctor::InitialSetupParkMark>,
     /// The last accounts resync line this worker logged (`accounts_resynced`).
     accounts_said: Option<String>,
+    /// The last line a window's worker logged of the login job ([`keep_setup_resume`]).
+    resume_said: Option<String>,
+    /// The passes this worker ran ([`run_setup_job`] says whether it ran one).
+    passes: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -4749,8 +5085,10 @@ impl SetupRetryHost for LiveSetupRetry {
     fn revision(&mut self) -> Result<u64, String> {
         aterm_cli::macos_doctor::initial_setup_revision()
     }
+    /// The run finished, or (the login job's worker) a window runs setup now: either way this
+    /// worker has nothing more to do.
     fn finished(&mut self) -> Result<bool, String> {
-        aterm_cli::macos_doctor::initial_setup_finished()
+        Ok(aterm_cli::macos_doctor::initial_setup_finished()? || self.owner.gives_way())
     }
     fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
         (setup_io().claim_automatic)()
@@ -4767,46 +5105,14 @@ impl SetupRetryHost for LiveSetupRetry {
         start_stop_worker();
     }
     fn apply(&mut self) -> Result<PassNext, String> {
-        clear_initial_setup_rows();
-        self.wakes_seen = SETUP_WAKES.marks();
-        let observed = with_setup_pass_mark(
-            &mut self.park_before_pass,
-            aterm_cli::macos_doctor::initial_setup_park_mark,
-            || {
-                with_setup_activity(|| {
-                    aterm_cli::macos_doctor::run_initial_setup_pass(
-                        self.revision,
-                        &mut self.password,
-                        SETUP_HOOKS,
-                    )
-                })
-            },
-        );
-        let Some((report, next)) = observed
-            .result
-            .inspect_err(|why| initial_setup_error(why.clone(), observed.observation.clone()))?
-        else {
+        self.passes = self.passes.saturating_add(1);
+        let pass = match self.owner {
+            SetupOwner::Window => self.window_pass()?,
+            SetupOwner::Job => self.job_pass()?,
+        };
+        let Some((report, next)) = pass else {
             return Ok(PassNext::Done);
         };
-        if let Ok(env) = aterm_agent::harness::cli::Env::from_process()
-            && let (Some(home), Some(roster_path)) = (env.home.as_deref(), env.accounts_roster())
-        {
-            // A pass syncs only what changed (and writes only what differs), and hands the rows
-            // it leaves with no login made here to the automatic sign-in ladder, never to a
-            // person, where this instance keeps its account's own fleet accounts.
-            aterm_agent::harness::accounts_sync::log_sign_ins_to(|line| {
-                aterm_log::info!("harness: accounts: {line}");
-            });
-            let resync = aterm_agent::harness::accounts_sync::resync_for_setup(
-                home,
-                &env.state,
-                &roster_path,
-                env.now,
-                aterm_types::dirs::not_own_account().is_none(),
-            );
-            self.accounts_resynced(&resync);
-        }
-        remember_initial_setup_rows(&report, None, observed.observation);
         if report.needs_attention() {
             report_first_run_doctor_attention(&mut self.last_failure, &report);
         } else if !self.success_reported {
@@ -4820,13 +5126,25 @@ impl SetupRetryHost for LiveSetupRetry {
         })
     }
     fn backoff(&mut self) -> bool {
-        maintain_setup_watch(WatchMaintenance::Spawn);
+        if self.owner == SetupOwner::Window {
+            maintain_setup_watch(WatchMaintenance::Spawn);
+        }
         // A wake (Check again, Stop, a new plan, a person's grant) ends it early,
         // once: a read or a claim that keeps failing waits a minute each time. A
         // window gaining focus does not: it is no reason to try again sooner.
         let seen = self.wakes_seen;
         SETUP_WAKES.back_off_run(&mut self.wakes_seen, std::time::Duration::from_secs(60));
         self.wakes_seen.refreshed_since(seen)
+    }
+    fn retried(&mut self) {
+        self.pace = self.pace.after_another(unix_seconds());
+        self.keep_pace();
+    }
+    fn settled(&mut self) {
+        if self.pace != aterm_cli::macos_doctor::PassRetry::default() {
+            self.pace = aterm_cli::macos_doctor::PassRetry::default();
+            self.keep_pace();
+        }
     }
     fn park(&mut self) -> bool {
         // Local vault facts, interfaces for pending Secrets or Repositories, the
@@ -4835,10 +5153,15 @@ impl SetupRetryHost for LiveSetupRetry {
         // only when one may have moved, a retry falls due or a wake comes: a run
         // left waiting on a person alone has no timer. A window gaining focus ends
         // the park only while it waits on what a person does in System Settings or
-        // macOS (an Accounts or Permissions stage left).
+        // macOS (an Accounts or Permissions stage left). After a pass that left a step to
+        // retry, the run's own pause ends it too.
         use aterm_cli::macos_doctor::{ParkWatch, Watches};
+        let owner = self.owner;
         let seen = self.wakes_seen;
-        let due_seen = self.park_due_seen;
+        let clock = ParkClock {
+            due_seen: self.park_due_seen,
+            pace_due: self.pace.pending(unix_seconds()),
+        };
         let before_pass = self.park_before_pass.take();
         let mut previous = None;
         let focus = std::cell::Cell::new(false);
@@ -4852,7 +5175,11 @@ impl SetupRetryHost for LiveSetupRetry {
                 facts.set(SETUP_WAKES.marks().facts);
                 let mut mark = read_setup_park_mark_with(
                     aterm_cli::macos_doctor::initial_setup_park_mark,
-                    || maintain_setup_watch(WatchMaintenance::Spawn),
+                    || {
+                        if owner == SetupOwner::Window {
+                            maintain_setup_watch(WatchMaintenance::Spawn);
+                        }
+                    },
                 );
                 if let Some(known) = &previous {
                     mark.retain_known_from(known);
@@ -4879,12 +5206,15 @@ impl SetupRetryHost for LiveSetupRetry {
                     }
                     watching = Some((watches, started));
                 }
-                // A watch that stopped hearing its fact gives the park its timer back.
-                let watched = watching.as_ref().is_some_and(|(on, started)| {
-                    on.none() || started.as_ref().is_some_and(ParkWatch::whole)
-                }) && !setup_watch_owed();
+                // A watch that stopped hearing its fact gives the park its timer back. The login
+                // job's park reads each minute whatever it watches, as a window that opens ends it.
+                let watched = owner == SetupOwner::Window
+                    && watching.as_ref().is_some_and(|(on, started)| {
+                        on.none() || started.as_ref().is_some_and(ParkWatch::whole)
+                    })
+                    && !setup_watch_owed();
                 limit.set(park_wait_limit(
-                    mark.next_due(),
+                    clock.next(mark.next_due()),
                     unix_seconds(),
                     watched,
                     mark.waits_on_lan_broker(),
@@ -4892,17 +5222,16 @@ impl SetupRetryHost for LiveSetupRetry {
                 previous = Some(mark.clone());
                 mark
             },
-            |mark| due_seen.unseen(mark.retry_due(), mark.mac_settings_retry_due()),
+            |mark| clock.ready(park_dues(mark), unix_seconds()),
             aterm_cli::macos_doctor::InitialSetupParkMark::facts_changed_since,
-            || !SETUP_WAKES.marks().ends_run_wait(seen, focus.get()),
+            || !SETUP_WAKES.marks().ends_run_wait(seen, focus.get()) && !owner.gives_way(),
             || {
                 SETUP_WAKES.wait_for_park(seen, facts.get(), focus.get(), limit.get());
             },
         );
-        self.park_due_seen
-            .consume(mark.retry_due(), mark.mac_settings_retry_due());
+        self.park_due_seen.consume(park_dues(&mark));
         // A fact the park is marked on, a useful console return, or a person's Check again
-        // starts the run's tries afresh; a due try or any other wake does not.
+        // starts the run's pace afresh; a due try or any other wake does not.
         before_pass
             .as_ref()
             .is_some_and(|before| mark.facts_changed_since(before))
@@ -4915,6 +5244,11 @@ impl SetupRetryHost for LiveSetupRetry {
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
     fn completed(&mut self) {
+        // The login job's worker leaves the vault's mend and the converge lane to the next
+        // window, whose launch starts both.
+        if self.owner == SetupOwner::Job {
+            return;
+        }
         // While the plan in force keeps the vault in sync ([`vault_sync_kept`]), the mend keeps a
         // stale or owed subscriber (started once per process: a run admitted at launch started
         // it already), and System State's Secrets rows show the rest.
@@ -4927,6 +5261,114 @@ impl SetupRetryHost for LiveSetupRetry {
 
 #[cfg(target_os = "macos")]
 impl LiveSetupRetry {
+    /// `owner`'s worker of run `revision`, going on from the pace the run's last worker kept.
+    fn new(revision: u64, password: Option<aterm_secrets::SecretBytes>, owner: SetupOwner) -> Self {
+        Self {
+            owner,
+            revision,
+            password,
+            last_failure: None,
+            success_reported: false,
+            wakes_seen: SETUP_WAKES.marks(),
+            pace: aterm_cli::macos_doctor::initial_setup_pass_retry(
+                aterm_cli::macos_doctor::PassWorker::Run,
+                revision,
+            ),
+            park_due_seen: SetupRetryDeadlines::default(),
+            park_before_pass: None,
+            accounts_said: None,
+            resume_said: None,
+            passes: 0,
+        }
+    }
+
+    /// A window's pass: every stage, its rows and accounts for the page.
+    fn window_pass(
+        &mut self,
+    ) -> Result<
+        Option<(
+            aterm_cli::macos_doctor::Report,
+            aterm_cli::macos_doctor::SetupNext,
+        )>,
+        String,
+    > {
+        keep_setup_resume(&mut self.resume_said);
+        clear_initial_setup_rows();
+        self.wakes_seen = SETUP_WAKES.marks();
+        let observed = with_setup_pass_mark(
+            &mut self.park_before_pass,
+            aterm_cli::macos_doctor::initial_setup_park_mark,
+            || {
+                with_setup_activity(|| {
+                    aterm_cli::macos_doctor::run_initial_setup_pass(
+                        self.revision,
+                        &mut self.password,
+                        SETUP_HOOKS,
+                    )
+                })
+            },
+        );
+        let Some((report, next)) = observed
+            .result
+            .inspect_err(|why| initial_setup_error(why.clone(), observed.observation.clone()))?
+        else {
+            return Ok(None);
+        };
+        if let Ok(env) = aterm_agent::harness::cli::Env::from_process()
+            && let (Some(home), Some(roster_path)) = (env.home.as_deref(), env.accounts_roster())
+        {
+            // A pass syncs only what changed (and writes only what differs), and hands the rows
+            // it leaves with no login made here to the automatic sign-in ladder, never to a
+            // person, where this instance keeps its account's own fleet accounts.
+            aterm_agent::harness::accounts_sync::log_sign_ins_to(|line| {
+                aterm_log::info!("harness: accounts: {line}");
+            });
+            let resync = aterm_agent::harness::accounts_sync::resync_for_setup(
+                home,
+                &env.state,
+                &roster_path,
+                env.now,
+                aterm_types::dirs::not_own_account().is_none(),
+            );
+            self.accounts_resynced(&resync);
+        }
+        remember_initial_setup_rows(&report, None, observed.observation);
+        Ok(Some((report, next)))
+    }
+
+    /// The login job's pass: the stages that run unattended, with no page to read its rows and
+    /// nobody to stop it but a Stop saved to the records, which the pass reads between stages.
+    fn job_pass(
+        &mut self,
+    ) -> Result<
+        Option<(
+            aterm_cli::macos_doctor::Report,
+            aterm_cli::macos_doctor::SetupNext,
+        )>,
+        String,
+    > {
+        self.wakes_seen = SETUP_WAKES.marks();
+        let revision = self.revision;
+        with_setup_pass_mark(
+            &mut self.park_before_pass,
+            aterm_cli::macos_doctor::initial_setup_park_mark,
+            || aterm_cli::macos_doctor::run_background_setup_pass(revision, JOB_HOOKS),
+        )
+        .result
+    }
+
+    /// Keep the run's pace on disk, for the next worker of this run: a record that cannot be
+    /// written leaves this worker's own pace as it is, and the next goes from the last it read.
+    fn keep_pace(&self) {
+        if let Err(why) = aterm_cli::macos_doctor::note_initial_setup_pass_retry(
+            aterm_cli::macos_doctor::PassWorker::Run,
+            self.revision,
+            self.pace,
+        ) {
+            aterm_log::info!("setup: the retry pause is not kept on disk: {why}");
+        }
+    }
+
     /// One `aterm.log` line for a pass's accounts resync that changed something or failed,
     /// unless it is the line this worker logged last; a pass that found nothing new says nothing.
     fn accounts_resynced(&mut self, resync: &aterm_agent::harness::accounts_sync::Resync) {
@@ -4984,1514 +5426,19 @@ fn set_setup_retrying(revision: u64, retrying: bool) {
 mod watch_spawn_recovery_tests;
 
 #[cfg(test)]
-mod alab_watch_tests {
-    use super::{
-        ALAB_LOOK_FIRST, ALAB_LOOK_LONGEST, AlabWait, AlabWatch, alab_look_after,
-        widen_on_alab_signal,
-    };
-    use std::collections::VecDeque;
-    use std::time::Duration;
-
-    #[test]
-    fn membership_wait_arms_before_its_level_read_and_retains_a_healthy_listener() {
-        use super::{AlabMembershipWait, SetupWakes};
-        use std::cell::Cell;
-        let wakes = SetupWakes::new();
-        let mut waiting = AlabMembershipWait::new(wakes.marks());
-        let armed = Cell::new(false);
-        assert!(waiting.wait(
-            &wakes,
-            Duration::from_secs(60),
-            || {
-                assert!(armed.get(), "a commit before arming must not be lost");
-                true
-            },
-            || {
-                armed.set(true);
-                Some(())
-            },
-            |()| true,
-        ));
-        assert!(!waiting.wait(
-            &wakes,
-            Duration::ZERO,
-            || false,
-            || panic!("a healthy membership listener must not be restarted"),
-            |()| true,
-        ));
-    }
-
-    #[test]
-    fn a_lost_membership_listener_does_not_spin_on_its_own_notification() {
-        use super::{AlabMembershipWait, SetupWakes};
-        use std::cell::Cell;
-        let wakes = SetupWakes::new();
-        let mut waiting = AlabMembershipWait::new(wakes.marks());
-        let starts = Cell::new(0);
-        for _ in 0..2 {
-            assert!(!waiting.wait(
-                &wakes,
-                Duration::ZERO,
-                || false,
-                || {
-                    starts.set(starts.get() + 1);
-                    wakes.raise_facts();
-                    Some(false)
-                },
-                |whole| *whole,
-            ));
-        }
-        assert_eq!(
-            starts.get(),
-            2,
-            "a failed listener may recover on its retry"
-        );
-    }
-
-    #[test]
-    fn a_committed_membership_widens_without_a_network_event_or_timer_expiring() {
-        use super::{AlabMembershipWait, SetupWakes};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct Watch<'a> {
-            wakes: &'a SetupWakes,
-            member: &'a AtomicBool,
-            waiting: AlabMembershipWait<()>,
-            read: std::sync::mpsc::Sender<()>,
-            runs: u32,
-        }
-        impl AlabWatch for Watch<'_> {
-            fn widens(&mut self) -> Result<bool, String> {
-                Ok(self.runs == 0)
-            }
-            fn wait(&mut self, why: AlabWait, _limit: Duration) {
-                assert_eq!(why, AlabWait::Signal);
-                assert!(self.waiting.wait(
-                    self.wakes,
-                    Duration::from_secs(60), // A hang detector, not a latency target.
-                    || {
-                        let member = self.member.load(Ordering::SeqCst);
-                        assert!(!member);
-                        self.read.send(()).unwrap();
-                        member
-                    },
-                    || Some(()),
-                    |()| true,
-                ));
-            }
-            fn heard(&mut self) -> Result<bool, String> {
-                Ok(self.member.load(Ordering::SeqCst))
-            }
-            fn look(&mut self) -> Result<Option<u64>, String> {
-                assert!(self.member.load(Ordering::SeqCst));
-                Ok(Some(9))
-            }
-            fn run(&mut self) {
-                self.runs += 1;
-            }
-        }
-
-        let wakes = SetupWakes::new();
-        let member = AtomicBool::new(false);
-        let (read, reading) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let committed = &member;
-            let events = &wakes;
-            scope.spawn(move || {
-                reading.recv_timeout(Duration::from_secs(60)).unwrap();
-                committed.store(true, Ordering::SeqCst);
-                events.raise_facts();
-            });
-            let mut watch = Watch {
-                wakes: &wakes,
-                member: &member,
-                waiting: AlabMembershipWait::new(wakes.marks()),
-                read,
-                runs: 0,
-            };
-            widen_on_alab_signal(&mut watch);
-            assert_eq!(watch.runs, 1);
-            assert_eq!(wakes.marks().all, 0, "no focus, access or Check wake");
-        });
-    }
-
-    /// A watch whose answers come from a script; the last `widens` answer sticks.
-    #[derive(Default)]
-    struct Scripted {
-        widens: VecDeque<Option<bool>>,
-        /// Whether each look hears the signal; once they run out, every look hears it.
-        heard: VecDeque<bool>,
-        looks: VecDeque<Result<Option<u64>, String>>,
-        waits: Vec<(AlabWait, Duration)>,
-        runs: u32,
-    }
-
-    impl AlabWatch for Scripted {
-        fn widens(&mut self) -> Result<bool, String> {
-            if self.widens.len() > 1 {
-                self.widens.pop_front().unwrap()
-            } else {
-                self.widens.front().copied().unwrap_or(Some(false))
-            }
-            .ok_or_else(|| "a pass is saving the records".to_string())
-        }
-        fn wait(&mut self, why: AlabWait, limit: Duration) {
-            self.waits.push((why, limit));
-        }
-        fn heard(&mut self) -> Result<bool, String> {
-            Ok(self.heard.pop_front().unwrap_or(true))
-        }
-        fn look(&mut self) -> Result<Option<u64>, String> {
-            self.looks.pop_front().expect("a look the script answers")
-        }
-        fn run(&mut self) {
-            self.runs += 1;
-        }
-    }
-
-    #[test]
-    fn a_watch_looks_again_more_slowly_and_runs_the_widened_plan_once() {
-        let mut watch = Scripted {
-            widens: [Some(true)].into(),
-            looks: [
-                Ok(None),
-                Err("a profile pass is running".into()),
-                Ok(None),
-                Ok(Some(9)),
-            ]
-            .into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut watch);
-        let minute = Duration::from_secs(60);
-        assert_eq!(
-            watch.waits,
-            [
-                (AlabWait::Retry, ALAB_LOOK_FIRST),
-                (AlabWait::Retry, minute),
-                (AlabWait::Retry, 2 * minute),
-            ],
-            "the first look goes at once, then each waits longer"
-        );
-        assert_eq!(watch.runs, 1);
-        assert!(watch.looks.is_empty());
-    }
-
-    /// The plan widens to the groups the ALab signal adds the moment a look hears it, the first
-    /// look at once as the watch starts, with nothing asked (design §6.1); a look that hears
-    /// nothing yet waits for the next.
-    #[test]
-    fn a_watch_widens_at_once_when_a_look_hears_the_signal() {
-        let mut later = Scripted {
-            widens: [Some(true)].into(),
-            heard: [false].into(),
-            looks: [Ok(Some(3))].into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut later);
-        assert_eq!(later.waits, [(AlabWait::Signal, ALAB_LOOK_FIRST)]);
-        assert_eq!(later.runs, 1);
-        let mut first = Scripted {
-            widens: [Some(true)].into(),
-            looks: [Ok(Some(3))].into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut first);
-        assert!(first.waits.is_empty(), "the first look went at once");
-        assert_eq!(first.runs, 1, "widened and run with nothing asked");
-    }
-
-    #[test]
-    fn a_watch_ends_once_the_plan_is_no_longer_aterms_to_widen() {
-        let mut watch = Scripted {
-            widens: [Some(true), Some(true), Some(false)].into(),
-            looks: [Ok(None), Ok(None)].into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut watch);
-        assert_eq!(watch.waits.len(), 1);
-        assert_eq!(watch.runs, 0);
-        let mut unread = Scripted {
-            widens: [None, Some(true), None, Some(false)].into(),
-            looks: [Ok(None)].into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut unread);
-        assert_eq!(
-            unread.waits.len(),
-            2,
-            "records that cannot be read keep the watch"
-        );
-        assert!(
-            unread.looks.is_empty(),
-            "and take no look while they cannot"
-        );
-        let mut found_later = Scripted {
-            widens: [None, None, Some(true)].into(),
-            looks: [Ok(Some(4))].into(),
-            ..Scripted::default()
-        };
-        widen_on_alab_signal(&mut found_later);
-        assert_eq!(found_later.runs, 1);
-        assert!(found_later.looks.is_empty());
-        let mut idle = Scripted::default();
-        widen_on_alab_signal(&mut idle);
-        assert!(idle.waits.is_empty(), "nothing to widen, nothing to watch");
-    }
-
-    #[test]
-    fn a_watch_waits_at_most_half_an_hour_between_looks() {
-        assert_eq!(alab_look_after(0), ALAB_LOOK_FIRST);
-        assert_eq!(alab_look_after(5), Duration::from_secs(16 * 60));
-        assert_eq!(alab_look_after(6), ALAB_LOOK_LONGEST);
-        assert_eq!(alab_look_after(u32::MAX), ALAB_LOOK_LONGEST);
-    }
-
-    #[cfg(target_os = "macos")]
-    mod recovery {
-        use super::*;
-        use aterm_cli::macos_doctor::ProvisionalSetupWatchTest;
-        use aterm_types::macos_setup::Selection;
-
-        #[derive(Clone, Copy)]
-        enum Replacement {
-            Stop,
-            OldStop(u64),
-            Person,
-        }
-
-        struct RealWatch<'a> {
-            setup: ProvisionalSetupWatchTest<'a>,
-            faults: VecDeque<Option<(usize, bool)>>,
-            replacement: Option<Replacement>,
-            failed_read: bool,
-            reads: usize,
-            waits: usize,
-            looks: usize,
-            recovered: Vec<u64>,
-        }
-
-        impl<'a> RealWatch<'a> {
-            fn new(root: &'a std::path::Path) -> Self {
-                Self {
-                    setup: ProvisionalSetupWatchTest::new(root).unwrap(),
-                    faults: VecDeque::new(),
-                    replacement: None,
-                    failed_read: false,
-                    reads: 0,
-                    waits: 0,
-                    looks: 0,
-                    recovered: Vec::new(),
-                }
-            }
-        }
-
-        impl AlabWatch for RealWatch<'_> {
-            fn widens(&mut self) -> Result<bool, String> {
-                self.reads += 1;
-                if std::mem::take(&mut self.failed_read) {
-                    assert_eq!(self.looks, 0, "a failed read authorizes no probe or write");
-                    let before = self.setup.snapshot().unwrap();
-                    let eligible = self.setup.widens_after_failed_read();
-                    let repaired = self.setup.snapshot().unwrap();
-                    assert_eq!(repaired.observation, before.observation);
-                    assert_eq!(repaired.permissions_allowed, before.permissions_allowed);
-                    eligible
-                } else {
-                    self.setup.widens()
-                }
-            }
-
-            fn wait(&mut self, _why: AlabWait, limit: Duration) {
-                assert!(!limit.is_zero());
-                self.waits += 1;
-            }
-
-            fn heard(&mut self) -> Result<bool, String> {
-                Ok(true)
-            }
-
-            fn look(&mut self) -> Result<Option<u64>, String> {
-                self.looks += 1;
-                assert!(
-                    self.looks <= 3,
-                    "the watch must converge without a retry spin"
-                );
-                let upgraded = self.setup.upgrade(self.faults.pop_front().flatten());
-                if let Some(replacement) = self.replacement.take() {
-                    assert!(upgraded.is_err());
-                    assert_eq!(
-                        self.setup.snapshot().unwrap().plan.selection,
-                        Selection::all()
-                    );
-                    match replacement {
-                        Replacement::Stop => self.setup.stop().unwrap(),
-                        Replacement::OldStop(revision) => {
-                            self.setup.stop_revision(revision).unwrap()
-                        }
-                        Replacement::Person => self.setup.choose().unwrap(),
-                    }
-                }
-                upgraded
-            }
-
-            fn run(&mut self) {
-                self.recovered.push(self.setup.recover().unwrap());
-                let resumed = self.setup.snapshot().unwrap();
-                assert_eq!(resumed.plan.selection, Selection::all());
-                assert!(!resumed.finished, "the widened stages are still owed");
-                assert!(resumed.run_allowed, "recovery confirms real admission");
-                assert_eq!(resumed.revision, *self.recovered.last().unwrap());
-            }
-        }
-
-        #[test]
-        fn watch_recovery_starts_after_a_real_upgrade_publication_reports_failure() {
-            for fault in [(1, false), (3, true)] {
-                let root = aterm_tempfile::tempdir().unwrap();
-                let mut watch = RealWatch::new(root.path());
-                let original = watch.setup.snapshot().unwrap().revision;
-                watch.faults.push_back(Some(fault));
-                widen_on_alab_signal(&mut watch);
-                assert_eq!(
-                    watch.recovered.len(),
-                    1,
-                    "save {fault:?}: the published full run needs startup recovery in this process"
-                );
-                assert_eq!(
-                    watch.looks, 2,
-                    "retry only the owned admission after its failed publication"
-                );
-                assert_eq!(watch.waits, 1, "the first look goes at once");
-                assert_eq!(watch.recovered[0], original + 1);
-            }
-        }
-
-        #[test]
-        fn watch_recovery_ignores_a_delayed_stop_of_its_completed_predecessor() {
-            for fault in [(1, false), (3, false), (3, true)] {
-                let root = aterm_tempfile::tempdir().unwrap();
-                let mut watch = RealWatch::new(root.path());
-                let original = watch.setup.snapshot().unwrap().revision;
-                watch.faults.push_back(Some(fault));
-                watch.replacement = Some(Replacement::OldStop(original));
-                widen_on_alab_signal(&mut watch);
-                assert_eq!(watch.recovered, vec![original + 1], "save {fault:?}");
-                assert_eq!(watch.looks, 2, "the same owned admission must recover");
-                assert_eq!(watch.waits, 1, "the first look goes at once");
-            }
-        }
-
-        #[test]
-        fn watch_recovery_retries_a_repaired_eligibility_read_without_granting_authority() {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let mut watch = RealWatch::new(root.path());
-            watch.failed_read = true;
-            widen_on_alab_signal(&mut watch);
-            assert_eq!(
-                watch.recovered.len(),
-                1,
-                "a transient record read must not end the only in-process ALab watch"
-            );
-            assert!(watch.reads >= 2);
-            assert_eq!(watch.looks, 1, "probe only after eligibility is readable");
-            assert!(watch.waits >= 1);
-        }
-
-        #[test]
-        fn watch_recovery_keeps_prepublication_retries_and_authoritative_replacements() {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let mut watch = RealWatch::new(root.path());
-            watch.faults.push_back(Some((0, false)));
-            widen_on_alab_signal(&mut watch);
-            assert_eq!(watch.recovered.len(), 1);
-            assert_eq!(
-                watch.looks, 2,
-                "an unpublished failure may try the upgrade again"
-            );
-
-            for replacement in [Replacement::Stop, Replacement::Person] {
-                let root = aterm_tempfile::tempdir().unwrap();
-                let mut watch = RealWatch::new(root.path());
-                watch.faults.push_back(Some((1, false)));
-                watch.replacement = Some(replacement);
-                widen_on_alab_signal(&mut watch);
-                match replacement {
-                    Replacement::Stop => {
-                        assert!(watch.recovered.is_empty(), "an explicit Stop holds setup");
-                        assert_eq!(
-                            watch.looks, 2,
-                            "the retained ticket confirms its retirement"
-                        );
-                    }
-                    Replacement::Person => {
-                        assert!(watch.recovered.is_empty(), "the person's plan stays chosen");
-                        assert_eq!(
-                            watch.looks, 2,
-                            "the retained ticket retires without upgrading the person's plan"
-                        );
-                        let chosen = watch.setup.snapshot().unwrap();
-                        assert!(!chosen.provisional);
-                        assert_ne!(chosen.plan.selection, Selection::all());
-                    }
-                    Replacement::OldStop(_) => unreachable!(),
-                }
-                assert!(!watch.setup.widens().unwrap());
-            }
-        }
-    }
-}
+#[path = "main_alab_watch_tests.rs"]
+mod alab_watch_tests;
 
 #[cfg(test)]
-mod setup_retry_tests {
-    use super::{
-        PassNext, SETUP_RETRY_LIMIT, SetupRetryHost, SetupWakes, begin_check_again, idle_after,
-        run_setup_retry, wake_setup_for_console_with,
-    };
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    struct State {
-        claimed: bool,
-        busy: bool,
-        finished: bool,
-        revision: u64,
-        applied: Vec<u64>,
-        /// The revisions registered for a Stop, pass by pass.
-        registered: Vec<u64>,
-        drops: Vec<&'static str>,
-    }
-
-    struct Lease {
-        kind: &'static str,
-        state: Rc<RefCell<State>>,
-    }
-
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            let mut state = self.state.borrow_mut();
-            state.drops.push(self.kind);
-            if self.kind == "claim" {
-                state.claimed = false;
-            } else {
-                assert!(
-                    !state.claimed,
-                    "release the claim before publishing an idle UI"
-                );
-                state.busy = false;
-            }
-        }
-    }
-
-    struct Fake {
-        state: Rc<RefCell<State>>,
-        initial_error: bool,
-        finished_error: bool,
-        restart_during_backoff: bool,
-        restart_during_claim: bool,
-        finished_during_busy: bool,
-        completions: usize,
-        backoffs: usize,
-        failures: usize,
-        /// What each scripted pass leaves.
-        pass: PassNext,
-        parks: usize,
-        /// Claims to find held elsewhere (a person's restart) before one is had.
-        claims_held: usize,
-        /// Backoffs before the worker must have ended; with
-        /// `restart_during_backoff`, the last one replaces its revision.
-        backoff_limit: usize,
-        /// What the loop said, pass by pass, of retrying a failure.
-        retrying: Vec<bool>,
-        /// What it last said of retrying as each backoff began.
-        retrying_at_backoff: Vec<Option<bool>>,
-        /// The pass panics.
-        panic_in_apply: bool,
-    }
-
-    fn fixture() -> (Fake, Lease, Lease) {
-        let state = Rc::new(RefCell::new(State {
-            claimed: true,
-            busy: true,
-            finished: false,
-            revision: 1,
-            applied: Vec::new(),
-            registered: Vec::new(),
-            drops: Vec::new(),
-        }));
-        (
-            Fake {
-                state: Rc::clone(&state),
-                initial_error: false,
-                finished_error: false,
-                restart_during_backoff: false,
-                restart_during_claim: false,
-                finished_during_busy: false,
-                completions: 0,
-                backoffs: 0,
-                failures: 0,
-                pass: PassNext::Retry,
-                parks: 0,
-                claims_held: 0,
-                backoff_limit: 1,
-                retrying: Vec::new(),
-                retrying_at_backoff: Vec::new(),
-                panic_in_apply: false,
-            },
-            Lease {
-                kind: "claim",
-                state: Rc::clone(&state),
-            },
-            Lease {
-                kind: "busy",
-                state,
-            },
-        )
-    }
-
-    impl SetupRetryHost for Fake {
-        type Claim = Lease;
-        type Busy = Lease;
-
-        fn revision(&mut self) -> Result<u64, String> {
-            if std::mem::take(&mut self.initial_error) {
-                Err("the initial revision could not be read".into())
-            } else {
-                Ok(self.state.borrow().revision)
-            }
-        }
-        fn finished(&mut self) -> Result<bool, String> {
-            if std::mem::take(&mut self.finished_error) {
-                Err("a temporary completion read failure".into())
-            } else {
-                Ok(self.state.borrow().finished)
-            }
-        }
-        fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
-            let mut state = self.state.borrow_mut();
-            assert!(
-                state.busy && !state.claimed,
-                "the slot comes before the claim"
-            );
-            if self.claims_held > 0 {
-                self.claims_held -= 1;
-                return Ok(None);
-            }
-            state.claimed = true;
-            if self.restart_during_claim {
-                state.revision += 1;
-            }
-            Ok(Some(Lease {
-                kind: "claim",
-                state: Rc::clone(&self.state),
-            }))
-        }
-        fn busy(&mut self) -> Self::Busy {
-            let mut state = self.state.borrow_mut();
-            assert!(
-                !state.claimed && !state.busy,
-                "never wait for the slot while holding the claim"
-            );
-            state.busy = true;
-            if self.finished_during_busy {
-                state.finished = true;
-            }
-            Lease {
-                kind: "busy",
-                state: Rc::clone(&self.state),
-            }
-        }
-        fn register(&mut self) {
-            let mut state = self.state.borrow_mut();
-            assert!(state.claimed && state.busy, "registered holding both");
-            let revision = state.revision;
-            state.registered.push(revision);
-        }
-        fn apply(&mut self) -> Result<PassNext, String> {
-            assert!(!self.panic_in_apply, "a pass panics");
-            let mut state = self.state.borrow_mut();
-            assert!(state.claimed && state.busy);
-            let revision = state.revision;
-            assert_eq!(
-                state.registered.last(),
-                Some(&revision),
-                "a pass runs as the registered run"
-            );
-            state.applied.push(revision);
-            Ok(self.pass)
-        }
-        fn park(&mut self) -> bool {
-            let mut state = self.state.borrow_mut();
-            assert!(
-                !state.claimed && !state.busy,
-                "a parked run must leave the form usable"
-            );
-            self.parks += 1;
-            assert_eq!(
-                self.parks, 1,
-                "a stale worker must end without parking again"
-            );
-            if self.restart_during_backoff {
-                state.revision += 1;
-            }
-            false
-        }
-        fn backoff(&mut self) -> bool {
-            let mut state = self.state.borrow_mut();
-            assert!(
-                !state.claimed && !state.busy,
-                "idle retries must leave the form usable"
-            );
-            self.backoffs += 1;
-            self.retrying_at_backoff.push(self.retrying.last().copied());
-            assert!(
-                self.backoffs <= self.backoff_limit,
-                "a stale worker must end without another retry"
-            );
-            if self.restart_during_backoff && self.backoffs == self.backoff_limit {
-                state.revision += 1;
-            }
-            false
-        }
-        fn retrying(&mut self, retrying: bool) {
-            self.retrying.push(retrying);
-        }
-        fn failure(&mut self, _: &str) {
-            self.failures += 1;
-        }
-        fn completed(&mut self) {
-            assert!(
-                self.finished_during_busy,
-                "other scripted runs remain pending until replaced"
-            );
-            self.completions += 1;
-        }
-    }
-
-    #[test]
-    fn a_stop_or_restore_committed_while_acquiring_busy_prevents_a_stale_retry() {
-        let (mut host, claim, busy) = fixture();
-        host.finished_error = true;
-        host.finished_during_busy = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert!(
-            state.applied.is_empty(),
-            "recheck completion after acquiring busy"
-        );
-        assert_eq!(host.completions, 1);
-        assert_eq!(host.backoffs, 1);
-        assert_eq!(state.drops, ["claim", "busy", "busy"]);
-        assert!(!state.claimed && !state.busy);
-    }
-
-    #[test]
-    fn pending_setup_releases_claim_and_busy_before_a_same_plan_rerun_retires_it() {
-        let (mut host, claim, busy) = fixture();
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert_eq!(state.applied, [1]);
-        assert_eq!(state.drops, ["claim", "busy"]);
-        assert!(!state.claimed && !state.busy);
-        assert_eq!(host.backoffs, 1);
-    }
-
-    #[test]
-    fn a_pass_waiting_on_a_person_parks_instead_of_retrying_every_minute() {
-        let (mut host, claim, busy) = fixture();
-        host.pass = PassNext::Park;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert_eq!(state.applied, [1]);
-        assert_eq!((host.parks, host.backoffs), (1, 0));
-        assert!(!state.claimed && !state.busy);
-    }
-
-    /// Every pass the loop would run again on failure says the run retries; the last pass of a
-    /// run that only retried, and the park, say it no longer does. A pass that waits on a person
-    /// parks at once.
-    #[test]
-    fn a_run_says_it_retries_a_failure_until_it_parks() {
-        let passes = SETUP_RETRY_LIMIT as usize;
-        let (mut host, claim, busy) = fixture();
-        // No backoff replaces the revision; the park does, which ends the worker.
-        host.backoff_limit = passes;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        assert_eq!(host.state.borrow().applied.len(), passes);
-        assert_eq!((host.backoffs, host.parks), (passes - 1, 1));
-        let mut said = vec![true; passes - 1];
-        said.extend([false, false, false]);
-        assert_eq!(
-            host.retrying, said,
-            "retried, the last pass, the park, the end"
-        );
-
-        let (mut host, claim, busy) = fixture();
-        host.pass = PassNext::Park;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        assert_eq!(
-            host.retrying,
-            [true, false, false],
-            "a person's step parks at once"
-        );
-    }
-
-    /// A panicking pass unwinds through `StandDown`, which says the run no longer retries; a
-    /// plain reset after the loop would never run on that path.
-    #[test]
-    fn a_pass_that_panics_leaves_nothing_counted_as_retried() {
-        let (mut host, claim, busy) = fixture();
-        host.panic_in_apply = true;
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_setup_retry(&mut host, Some(claim), busy, 1);
-        }));
-        assert!(unwound.is_err(), "PRECONDITION: the pass panicked");
-        assert_eq!(host.retrying, [true, false], "the unwind stands it down");
-        let state = host.state.borrow();
-        assert!(
-            !state.claimed && !state.busy,
-            "the claim and the slot go too"
-        );
-    }
-
-    /// Each backoff while another process holds the claim begins with the retry flag down; the
-    /// backoff after a pass keeps it up.
-    #[test]
-    fn a_run_waiting_for_a_claim_held_elsewhere_retries_nothing_meanwhile() {
-        let (mut host, claim, busy) = fixture();
-        host.claims_held = 2;
-        host.backoff_limit = 4;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        assert_eq!(host.state.borrow().applied, [1, 1]);
-        assert_eq!(
-            host.retrying_at_backoff,
-            [Some(true), Some(false), Some(false), Some(true)],
-            "after the pass, the held claim twice, after the next pass"
-        );
-    }
-
-    #[test]
-    fn retries_that_never_settle_end_in_a_park_that_keeps_them_spent() {
-        let mut retries = 0;
-        for pass in 1..SETUP_RETRY_LIMIT {
-            let (idle, count) = idle_after(PassNext::Retry, retries);
-            assert_eq!(idle, PassNext::Retry, "pass {pass} backs off");
-            retries = count;
-        }
-        let spent = (PassNext::Park, SETUP_RETRY_LIMIT - 1);
-        assert_eq!(idle_after(PassNext::Retry, retries), spent);
-        assert_eq!(
-            idle_after(PassNext::Retry, spent.1),
-            spent,
-            "a pass a wake runs once the tries are spent parks again at once"
-        );
-        // A pass that leaves nothing to retry ends the row of passes that only retried.
-        assert_eq!(idle_after(PassNext::Park, 3), (PassNext::Park, 0));
-        assert_eq!(idle_after(PassNext::Done, 3), (PassNext::Retry, 0));
-    }
-
-    /// A transient failure that never clears (GitHub not answering on this network): after ten
-    /// passes the run parks and says it no longer retries. A wake that changed nothing (an
-    /// access step, a try that came due, a focus gain while Permissions is left) runs one pass,
-    /// which still says so, and parks again with no backoff: no wake buys ten more passes a
-    /// minute apart, and what the run says never flaps back to retrying. A park that starts the
-    /// tries afresh (a fact it is marked on changed, or Check again) gives the run its ten
-    /// tries again, once, and so does Check again during a backoff, with nothing said twice.
-    #[test]
-    fn a_wake_that_changed_nothing_never_rearms_spent_tries() {
-        struct Spent {
-            revision: u64,
-            passes: usize,
-            parks: usize,
-            backoffs: usize,
-            /// The park, and the backoff, that start the tries afresh, if one does.
-            fresh_at: (Option<usize>, Option<usize>),
-            retrying: Vec<bool>,
-        }
-        impl SetupRetryHost for Spent {
-            type Claim = ();
-            type Busy = ();
-            fn revision(&mut self) -> Result<u64, String> {
-                Ok(self.revision)
-            }
-            fn finished(&mut self) -> Result<bool, String> {
-                Ok(false)
-            }
-            fn claim(&mut self) -> Result<Option<()>, String> {
-                Ok(Some(()))
-            }
-            fn busy(&mut self) {}
-            fn register(&mut self) {}
-            fn apply(&mut self) -> Result<PassNext, String> {
-                self.passes += 1;
-                Ok(PassNext::Retry)
-            }
-            fn backoff(&mut self) -> bool {
-                self.backoffs += 1;
-                self.fresh_at.1 == Some(self.backoffs)
-            }
-            fn park(&mut self) -> bool {
-                // Two wakes end parks, then a new plan ends this run.
-                self.parks += 1;
-                if self.parks == 3 {
-                    self.revision += 1;
-                }
-                self.fresh_at.0 == Some(self.parks)
-            }
-            fn retrying(&mut self, retrying: bool) {
-                if self.retrying.last() != Some(&retrying) {
-                    self.retrying.push(retrying);
-                }
-            }
-            fn failure(&mut self, _: &str) {}
-            fn completed(&mut self) {}
-        }
-        let limit = SETUP_RETRY_LIMIT as usize;
-        let run = |fresh_at| {
-            let mut host = Spent {
-                revision: 1,
-                passes: 0,
-                parks: 0,
-                backoffs: 0,
-                fresh_at,
-                retrying: Vec::new(),
-            };
-            run_setup_retry(&mut host, Some(()), (), 1);
-            (host.passes, host.backoffs, host.retrying)
-        };
-        assert_eq!(
-            run((None, None)),
-            (limit + 2, limit - 1, vec![true, false]),
-            "a wake that changed nothing re-armed the spent failure as retrying"
-        );
-        assert_eq!(
-            run((Some(1), None)),
-            (
-                2 * limit + 1,
-                2 * (limit - 1),
-                vec![true, false, true, false]
-            ),
-            "a fresh park gives the run its ten tries again, once"
-        );
-        assert_eq!(
-            run((None, Some(5))),
-            (5 + limit + 2, 5 + limit - 1, vec![true, false]),
-            "Check again during a backoff counts the tries from nothing"
-        );
-    }
-
-    /// A window's focus gain ends a run's wait only where the run waits on what a person does in
-    /// System Settings or macOS (an Accounts or Permissions stage left); the startup's waits hear
-    /// every one. Any other wake ends a run's wait; Check again and a useful native input
-    /// start its tries afresh.
-    #[test]
-    fn a_focus_gain_ends_only_a_run_wait_that_listens_for_it() {
-        use std::time::Duration;
-        let wakes = SetupWakes::new();
-        let seen = wakes.marks();
-        wakes.raise_focus();
-        assert!(
-            !wakes.wait_for_run(seen, false, Duration::ZERO),
-            "a park on a transient failure sleeps on"
-        );
-        assert!(
-            wakes.wait_for_run(seen, true, Duration::ZERO),
-            "a park on an Accounts or Permissions stage wakes"
-        );
-        let mut backoff = seen;
-        assert!(
-            !wakes.back_off_run(&mut backoff, Duration::ZERO),
-            "a backoff between two tries waits its minute"
-        );
-        assert_eq!(wakes.count(), seen.all + 1, "the startup hears it");
-        assert!(!wakes.marks().checked_since(seen));
-        wakes.raise();
-        assert!(wakes.wait_for_run(seen, false, Duration::ZERO));
-        assert!(!wakes.marks().checked_since(seen), "no press");
-        wakes.raise_check();
-        assert!(wakes.marks().checked_since(seen));
-    }
-
-    #[test]
-    fn a_current_console_return_refreshes_retry_without_becoming_check_again() {
-        use std::time::Duration;
-        let wakes = SetupWakes::new();
-        let seen = wakes.marks();
-        wake_setup_for_console_with(
-            || Ok(Some(17)),
-            |revision| {
-                assert_eq!(revision, 17);
-                false
-            },
-            || wakes.raise_input(),
-        )
-        .unwrap();
-        assert!(wakes.wait_for_run(seen, false, Duration::ZERO));
-        assert!(wakes.marks().refreshed_since(seen));
-        assert!(
-            !wakes.marks().checked_since(seen),
-            "a local input grants no ledger override"
-        );
-        let mut consumed = seen;
-        assert!(wakes.back_off_run(&mut consumed, Duration::ZERO));
-        assert!(consumed.refreshed_since(seen));
-        assert!(!wakes.back_off_run(&mut consumed, Duration::ZERO));
-        assert!(
-            !wakes.marks().refreshed_since(consumed),
-            "one recovery, not a retry loop"
-        );
-        let current = wakes.marks();
-        for (revision, stopped) in [(None, false), (Some(18), true)] {
-            wake_setup_for_console_with(
-                || Ok(revision),
-                |read| {
-                    assert_eq!(Some(read), revision);
-                    stopped
-                },
-                || panic!("Off, withdrawn, or stopped preferences wake no run"),
-            )
-            .unwrap();
-        }
-        assert!(
-            wake_setup_for_console_with(
-                || Err("records unread".into()),
-                |_| panic!("unknown revision"),
-                || panic!("unread scope")
-            )
-            .is_err()
-        );
-        assert_eq!(wakes.marks(), current);
-    }
-
-    #[test]
-    fn a_membership_fact_wakes_the_provisional_profile_without_a_network_change() {
-        use std::time::Duration;
-        let wakes = SetupWakes::new();
-        let mut seen = wakes.marks();
-        // Another process may commit authenticated membership on the same LAN. Its state-file
-        // notification is a local fact, not a route or window-focus change.
-        wakes.raise_facts();
-        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
-        assert!(!wakes.back_off_alab(&mut seen, Duration::ZERO));
-    }
-
-    /// A membership fact ends the profile's local wait, without ending an ordinary retry
-    /// backoff. Window focus alone supplies no membership evidence.
-    #[test]
-    fn membership_facts_wake_scope_reads_but_not_retry_backoffs() {
-        use std::time::Duration;
-        let wakes = SetupWakes::new();
-        let mut seen = wakes.marks();
-        wakes.raise_focus();
-        assert!(
-            !wakes.back_off_alab(&mut seen, Duration::ZERO),
-            "a focus gain that does not count: no look"
-        );
-        assert_eq!(seen, wakes.marks(), "taken as heard");
-        wakes.raise_facts();
-        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
-        wakes.raise();
-        assert!(wakes.back_off_alab(&mut seen, Duration::ZERO));
-        assert!(
-            !wakes.back_off_alab(&mut seen, Duration::ZERO),
-            "each wake once"
-        );
-        let mut run = wakes.marks();
-        wakes.raise_facts();
-        assert!(
-            !wakes.back_off_run(&mut run, Duration::ZERO),
-            "a local membership hint does not shorten a retry"
-        );
-    }
-
-    /// A park whose facts are all watched has a timer only for a retry ahead, never a zero one;
-    /// a park waiting on a person alone has none. A watch that could not start leaves the park
-    /// reading its facts once a minute.
-    #[test]
-    fn a_park_on_a_person_alone_has_no_timer() {
-        use super::park_wait_limit;
-        use std::time::Duration;
-        assert_eq!(park_wait_limit(None, 100, true, false), None);
-        assert_eq!(
-            park_wait_limit(Some(130), 100, true, false),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            park_wait_limit(Some(100), 100, true, false),
-            Some(Duration::from_secs(1)),
-            "a retry the clock calls due now waits a second, never spins"
-        );
-        assert_eq!(
-            park_wait_limit(None, 100, false, false),
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(
-            park_wait_limit(Some(110), 100, false, false),
-            Some(Duration::from_secs(10))
-        );
-    }
-
-    #[test]
-    fn a_park_observes_broker_readiness_without_a_focus_or_file_wake() {
-        use std::cell::Cell;
-        use std::time::Duration;
-        let broker_ready = Cell::new(false);
-        let limit = Cell::new(None);
-        let looks = Cell::new(0);
-        let ready = super::wait_for_setup_park_change_since(
-            Some(&false),
-            || {
-                limit.set(super::park_wait_limit(None, 100, true, !broker_ready.get()));
-                broker_ready.get()
-            },
-            |_| false,
-            |now, before| now != before,
-            || true,
-            || {
-                assert_eq!(
-                    looks.replace(1),
-                    0,
-                    "unchanged conditions run no setup effects"
-                );
-                assert_eq!(
-                    limit.get(),
-                    Some(Duration::from_secs(1)),
-                    "healthy file watches cannot hide local readiness"
-                );
-                // The keyboard rests while System State remains behind the terminal.
-                // No focus, file or network wake is delivered.
-                broker_ready.set(true);
-            },
-        );
-        assert!(ready);
-        assert_eq!(looks.get(), 1);
-        assert_eq!(
-            super::park_wait_limit(None, 100, true, false),
-            None,
-            "a ready broker needs no readiness polling"
-        );
-    }
-
-    /// A watched fact moving ends a park's wait, with or without a timer, and no other wait: a
-    /// run backing off a failure and the startup's waits sleep on.
-    #[test]
-    fn a_watched_fact_ends_only_a_parks_wait() {
-        use std::time::Duration;
-        static WAKES: SetupWakes = SetupWakes::new();
-        let seen = WAKES.marks();
-        WAKES.raise_facts();
-        assert!(!WAKES.wait_for_run(seen, true, Duration::ZERO));
-        let mut backoff = seen;
-        assert!(!WAKES.back_off_run(&mut backoff, Duration::ZERO));
-        assert!(
-            !WAKES.wait(seen.all, Duration::ZERO),
-            "the startup hears no fact"
-        );
-        assert!(WAKES.wait_for_park(seen, seen.facts, false, Some(Duration::ZERO)));
-        let looked = WAKES.marks();
-        assert!(
-            !WAKES.wait_for_park(seen, looked.facts, false, Some(Duration::ZERO)),
-            "a fact already looked at ends no later wait"
-        );
-        let (told, heard) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            told.send(WAKES.wait_for_park(seen, looked.facts, false, None))
-                .unwrap();
-        });
-        WAKES.raise_facts();
-        assert_eq!(
-            heard.recv_timeout(Duration::from_secs(60)),
-            Ok(true),
-            "a park with no timer wakes on a watched fact"
-        );
-    }
-
-    /// A wake lock a panicking holder poisoned still counts and still waits: a park with no
-    /// timer sleeps until a fact moves, never returning at once to read its mark again in a spin.
-    #[test]
-    fn a_poisoned_wake_lock_still_waits_for_a_fact() {
-        use std::time::Duration;
-        static WAKES: SetupWakes = SetupWakes::new();
-        let _ = std::thread::spawn(|| {
-            let _held = WAKES.count.lock();
-            panic!("a holder panics");
-        })
-        .join();
-        assert!(WAKES.count.is_poisoned());
-        let seen = WAKES.marks();
-        let (told, heard) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            told.send(WAKES.wait_for_park(seen, seen.facts, false, None))
-                .unwrap();
-        });
-        WAKES.raise_facts();
-        assert_eq!(heard.recv_timeout(Duration::from_secs(60)), Ok(true));
-        assert_ne!(WAKES.marks().facts, seen.facts, "the fact was counted");
-    }
-
-    #[derive(Clone, Copy)]
-    enum RouteChange {
-        WhileParked,
-        DuringLastPass,
-        None,
-    }
-
-    fn retry_with_route_change(pending_secrets: bool, change: RouteChange) {
-        use super::{wait_for_setup_park_change_since, with_setup_pass_mark};
-        use std::cell::Cell;
-
-        struct Routed {
-            inner: Fake,
-            pending_secrets: bool,
-            change: RouteChange,
-            network: Cell<u8>,
-            before_pass: Option<(u64, Option<u8>)>,
-            waits: usize,
-        }
-
-        impl SetupRetryHost for Routed {
-            type Claim = Lease;
-            type Busy = Lease;
-
-            fn revision(&mut self) -> Result<u64, String> {
-                self.inner.revision()
-            }
-            fn finished(&mut self) -> Result<bool, String> {
-                self.inner.finished()
-            }
-            fn claim(&mut self) -> Result<Option<Lease>, String> {
-                self.inner.claim()
-            }
-            fn busy(&mut self) -> Lease {
-                self.inner.busy()
-            }
-            fn register(&mut self) {
-                self.inner.register();
-            }
-            fn apply(&mut self) -> Result<PassNext, String> {
-                let result = with_setup_pass_mark(
-                    &mut self.before_pass,
-                    || (1, self.pending_secrets.then(|| self.network.get())),
-                    || {
-                        let result = self.inner.apply();
-                        if matches!(self.change, RouteChange::DuringLastPass)
-                            && self.inner.state.borrow().applied.len() == SETUP_RETRY_LIMIT as usize
-                        {
-                            self.network.set(2);
-                        }
-                        result
-                    },
-                );
-                if self.inner.parks != 0 {
-                    // The route or explicit wake let the next pass finish.
-                    self.inner.state.borrow_mut().finished = true;
-                }
-                result
-            }
-            fn backoff(&mut self) -> bool {
-                self.inner.backoff()
-            }
-            fn park(&mut self) -> bool {
-                self.inner.park();
-                let state = Rc::clone(&self.inner.state);
-                let wakes = Cell::new(0);
-                wait_for_setup_park_change_since(
-                    self.before_pass.take().as_ref(),
-                    // Membership remains Unconfigured. Pending network work
-                    // adds a route to the CLI's opaque park mark.
-                    || (1, self.pending_secrets.then(|| self.network.get())),
-                    |_| false,
-                    |current, before| current != before,
-                    || wakes.get() == 0,
-                    || {
-                        self.waits += 1;
-                        assert!(
-                            !matches!(self.change, RouteChange::DuringLastPass),
-                            "the fact changed inside the last pass; do not wait for another change"
-                        );
-                        assert!(self.waits <= 3, "the wake must end this wait");
-                        let mut state = state.borrow_mut();
-                        assert!(!state.claimed && !state.busy);
-                        assert_eq!(state.applied.len(), SETUP_RETRY_LIMIT as usize);
-                        if matches!(self.change, RouteChange::None) {
-                            // An unchanged failure stays parked. Stop ends the
-                            // inert run without another setup attempt.
-                            state.finished = true;
-                            wakes.set(1);
-                        } else if self.waits == 2 {
-                            self.network.set(2);
-                        } else if self.waits == 3 {
-                            // A permissions-only run ignores that route. Its
-                            // unchanged mark waits until an explicit wake.
-                            assert!(!self.pending_secrets);
-                            wakes.set(1);
-                        }
-                    },
-                );
-                false
-            }
-            fn retrying(&mut self, retrying: bool) {
-                self.inner.retrying(retrying);
-            }
-            fn failure(&mut self, why: &str) {
-                self.inner.failure(why);
-            }
-            fn completed(&mut self) {
-                self.inner.completions += 1;
-            }
-        }
-
-        let (mut inner, claim, busy) = fixture();
-        inner.backoff_limit = SETUP_RETRY_LIMIT as usize;
-        let mut host = Routed {
-            inner,
-            pending_secrets,
-            change,
-            network: Cell::new(1),
-            before_pass: None,
-            waits: 0,
-        };
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let (waits, extra_pass) = match change {
-            RouteChange::WhileParked => (if pending_secrets { 2 } else { 3 }, 1),
-            RouteChange::DuringLastPass => (0, 1),
-            RouteChange::None => (1, 0),
-        };
-        assert_eq!(host.waits, waits);
-        assert_eq!(host.inner.parks, 1);
-        assert_eq!(host.inner.backoffs, SETUP_RETRY_LIMIT as usize - 1);
-        assert_eq!(
-            host.inner.state.borrow().applied.len(),
-            SETUP_RETRY_LIMIT as usize + extra_pass
-        );
-        assert_eq!(host.inner.completions, 1);
-    }
-
-    #[test]
-    fn a_route_change_wakes_a_bounded_retry_run_without_another_pass_while_parked() {
-        for pending_secrets in [true, false] {
-            retry_with_route_change(pending_secrets, RouteChange::WhileParked);
-        }
-    }
-
-    #[test]
-    fn late_setup_facts_changed_inside_the_last_pass_wake_before_waiting() {
-        retry_with_route_change(true, RouteChange::DuringLastPass);
-    }
-
-    #[test]
-    fn late_setup_facts_unchanged_still_park_at_the_ten_pass_limit() {
-        retry_with_route_change(true, RouteChange::None);
-    }
-
-    #[test]
-    fn a_parked_retry_deadline_wakes_once_and_an_advanced_deadline_wakes_again() {
-        use super::{SetupRetryDeadlines, wait_for_setup_park_change};
-        use std::cell::Cell;
-
-        let mut seen = SetupRetryDeadlines::default();
-        let first = wait_for_setup_park_change(
-            || (Some(100), None),
-            |mark| seen.unseen(mark.0, mark.1),
-            || true,
-            || panic!("an already-due attempt must wake at park entry"),
-        );
-        seen.consume(first.0, first.1);
-
-        let waits = Cell::new(0);
-        wait_for_setup_park_change(
-            || (Some(100), None),
-            |mark| seen.unseen(mark.0, mark.1),
-            || waits.get() < 2,
-            || waits.set(waits.get() + 1),
-        );
-        assert_eq!(waits.get(), 2, "the same stale due token stays parked");
-
-        let next = wait_for_setup_park_change(
-            || (Some(100), Some(600)),
-            |mark| seen.unseen(mark.0, mark.1),
-            || true,
-            || panic!("a stale Secrets token must not hide a new Mac settings deadline"),
-        );
-        seen.consume(next.0, next.1);
-        seen.consume(Some(100), None);
-        assert!(
-            !seen.unseen(Some(100), Some(600)),
-            "spent once, even if absent briefly"
-        );
-
-        let later = wait_for_setup_park_change(
-            || (Some(200), Some(600)),
-            |mark| seen.unseen(mark.0, mark.1),
-            || true,
-            || panic!("the next Secrets attempt owns its own new deadline"),
-        );
-        seen.consume(later.0, later.1);
-        assert!(!seen.unseen(Some(200), Some(600)));
-        assert!(seen.unseen(Some(200), Some(1_200)));
-    }
-
-    #[test]
-    fn a_same_network_retry_wakes_when_due_while_a_held_attempt_has_no_timer() {
-        use super::wait_for_setup_park_change;
-        use std::cell::Cell;
-
-        for timed in [true, false] {
-            let waits = Cell::new(0);
-            let mark = wait_for_setup_park_change(
-                || (1, (timed && waits.get() >= 2).then_some(100)),
-                |mark| mark.1.is_some(),
-                || waits.get() < 3,
-                || waits.set(waits.get() + 1),
-            );
-            assert_eq!(waits.get(), if timed { 2 } else { 3 });
-            assert_eq!(mark.1, timed.then_some(100));
-        }
-    }
-
-    #[test]
-    fn a_revision_changed_during_reacquisition_prevents_any_apply() {
-        let (mut host, claim, busy) = fixture();
-        host.finished_error = true;
-        host.restart_during_claim = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert!(state.applied.is_empty());
-        assert_eq!(state.drops, ["claim", "busy", "claim", "busy"]);
-        assert!(!state.claimed && !state.busy);
-        assert_eq!(host.failures, 1);
-    }
-
-    #[test]
-    fn a_revision_read_error_releases_resources_before_retrying_the_admitted_run() {
-        let (mut host, claim, busy) = fixture();
-        host.initial_error = true;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert!(state.applied.is_empty());
-        assert_eq!(state.drops, ["claim", "busy"]);
-        assert!(!state.claimed && !state.busy);
-        assert_eq!(host.failures, 1);
-        assert_eq!(host.backoffs, 1);
-    }
-
-    #[test]
-    fn authorization_fence_does_not_adopt_a_run_replaced_before_retry_entry() {
-        let (mut host, claim, busy) = fixture();
-        host.state.borrow_mut().revision = 2;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        assert!(
-            host.state.borrow().applied.is_empty(),
-            "a late baseline read must not adopt revision 2 with revision 1's password"
-        );
-    }
-
-    #[test]
-    fn the_slot_comes_before_the_claim_and_a_held_claim_gives_the_slot_back() {
-        // The worker holds the slot but not the claim, which a person's
-        // restart holds: that restart claims while holding the slot, so the
-        // worker must give the slot back rather than keep it and wait.
-        let (mut host, claim, busy) = fixture();
-        drop(claim);
-        host.state.borrow_mut().drops.clear();
-        host.claims_held = 1;
-        host.backoff_limit = 2;
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, None, busy, 1);
-        let state = host.state.borrow();
-        assert_eq!(state.applied, [1]);
-        assert_eq!(state.drops, ["busy", "claim", "busy"]);
-        assert!(!state.claimed && !state.busy);
-        assert_eq!(host.backoffs, 2);
-    }
-
-    #[test]
-    fn a_run_registers_for_stop_only_once_its_revision_is_current() {
-        // The startup's run waited for the slot while a person's choice
-        // admitted revision 2 and registered it: the stale run ends without
-        // taking revision 2's place, so a Stop still stops revision 2.
-        let (mut host, claim, busy) = fixture();
-        drop(claim);
-        host.state.borrow_mut().revision = 2;
-        run_setup_retry(&mut host, None, busy, 1);
-        let state = host.state.borrow();
-        assert!(
-            state.registered.is_empty(),
-            "a replaced run never registers"
-        );
-        assert!(state.applied.is_empty());
-        drop(state);
-        // The current run registers before each pass, holding the slot and
-        // the claim.
-        let (mut host, claim, busy) = fixture();
-        host.restart_during_backoff = true;
-        run_setup_retry(&mut host, Some(claim), busy, 1);
-        let state = host.state.borrow();
-        assert_eq!(state.registered, [1]);
-        assert_eq!(state.applied, [1]);
-    }
-
-    #[test]
-    fn a_backoff_returns_early_once_per_wake() {
-        let wakes = SetupWakes::new();
-        let mut seen = wakes.count();
-        // A wake during the pass (Check again, a reading that found a fix)
-        // ends the first backoff at once; the one-minute limit is a hang
-        // detector, never reached.
-        wakes.raise();
-        assert!(wakes.back_off(&mut seen, std::time::Duration::from_secs(60)));
-        // With no new wake the next backoff waits its whole limit, so a read
-        // or claim that keeps failing never spins the loop.
-        assert!(!wakes.back_off(&mut seen, std::time::Duration::from_millis(1)));
-        wakes.raise();
-        assert!(wakes.back_off(&mut seen, std::time::Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn check_again_says_its_reading_and_its_check_apart() {
-        let order = RefCell::new(Vec::new());
-        // A pass holds the setup slot: the forced reading was queued, but the
-        // check was refused. Check again started; nothing is labelled a check.
-        let started = begin_check_again(
-            || {
-                order.borrow_mut().push("observe");
-                true
-            },
-            || order.borrow_mut().push("wake"),
-            || false,
-        );
-        assert_eq!(*order.borrow(), ["observe", "wake"]);
-        assert_eq!(
-            started,
-            aterm_gui::CheckStarted {
-                reading: true,
-                check: false
-            }
-        );
-        let started = begin_check_again(|| false, || {}, || true);
-        assert_eq!(
-            started,
-            aterm_gui::CheckStarted {
-                reading: false,
-                check: true
-            }
-        );
-    }
-}
+#[path = "main_setup_retry_tests.rs"]
+mod setup_retry_tests;
 
 #[cfg(target_os = "macos")]
 fn report_first_run_doctor_failure(last_failure: &mut Option<String>, text: &str) {
     if last_failure.as_deref() == Some(text) {
         return;
     }
-    aterm_log::warn!("first-run macOS doctor: {text}; automatic setup retries while aterm is open");
+    aterm_log::warn!("first-run macOS doctor: {text}; automatic setup tries it again by itself");
     *last_failure = Some(text.to_string());
 }
 
@@ -6700,8 +5647,6 @@ struct SetupActivity {
     readback_subjects: Vec<aterm_types::macos_setup::Subject>,
     /// Captured before this job reads its execution target, never rebased by START.
     readback_owner: Option<SetupReadbackScope>,
-    /// Scoped stage rows still owing a current fact when their owner ends.
-    readback_missing: Vec<aterm_types::macos_setup::Subject>,
     /// The one keeper's actual activation/read-failure batch. It has separate
     /// custody from a setup stage that may still be finishing its own lease.
     input_readback: bool,
@@ -6720,6 +5665,7 @@ struct SetupReadback {
     choices: u64,
     started: u64,
     subjects: Vec<aterm_types::macos_setup::Subject>,
+    history_ticket: Option<SetupHistoryTicket>,
 }
 
 #[cfg(target_os = "macos")]
@@ -6773,7 +5719,6 @@ static SETUP_ACTIVITY: std::sync::Mutex<SetupActivity> = std::sync::Mutex::new(S
     readback: None,
     readback_subjects: Vec::new(),
     readback_owner: None,
-    readback_missing: Vec::new(),
     input_readback: false,
 });
 
@@ -7322,7 +6267,35 @@ fn wait_while_queued(let_go: impl Fn() -> bool) -> bool {
 const SETUP_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
     stop: setup_stop_requested,
     stage: setup_stage,
+    gives_way: || false,
 };
+
+/// The login job's pass hooks: no page reads its stages, and it gives way at each stage boundary
+/// once a window runs setup or an update replaced its build ([`job_gives_way`]), ending the pass
+/// with what it left to try again, so the window's pass goes on from there with no wait for the
+/// job's whole pass.
+#[cfg(target_os = "macos")]
+const JOB_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
+    gives_way: job_gives_way,
+    ..aterm_cli::macos_doctor::SetupHooks::NONE
+};
+
+/// Whether the login job gives way: a window runs setup now, or an update replaced the job's
+/// build. A window lock that cannot be read gives way to nothing, as the claim keeps their passes
+/// apart.
+#[cfg(target_os = "macos")]
+fn job_gives_way() -> bool {
+    setup_resume::replaced()
+        || aterm_cli::macos_doctor::initial_setup_window_open().unwrap_or(false)
+}
+
+/// A private row's reading kept for the next launch, with the journal as its read started
+/// ([`SetupIo::remember`]).
+#[cfg(target_os = "macos")]
+type KeptReading = (
+    aterm_types::macos_setup::Observation,
+    aterm_cli::macos_doctor::Fence,
+);
 
 /// What System State's worker does outside this process: the doctor's records
 /// and readings of the Mac. A test of this binary puts its own in [`SETUP_IO`],
@@ -7334,6 +6307,8 @@ struct SetupIo {
     /// Whether this process may never change the person's profile
     /// (`aterm_cli::macos_doctor::lasting_scope_refusal`).
     scope_refused: fn() -> bool,
+    /// Optional display-only storage, resolved on the existing reading worker.
+    history_store: fn() -> Option<aterm_cli::macos_doctor::SetupHistoryStore>,
     /// Read rows for a plan under their current observation admission, the network's too when
     /// asked (`aterm_cli::macos_doctor::observe_initial_setup`). Plan mode alone permits no
     /// hidden query of another app's data.
@@ -7343,6 +6318,10 @@ struct SetupIo {
         bool,
         aterm_cli::macos_doctor::ObservationRead,
     ) -> Vec<aterm_types::macos_setup::Observation>,
+    /// The wall clock a reading is stamped with as it starts, in Unix seconds
+    /// (`aterm_time::unix_secs`; 0 where it cannot be read, which dates the reading as old as
+    /// can be, never as new).
+    now_secs: fn() -> u64,
     /// Save a person's Stop of a run, durably, on the Stop's worker
     /// (`aterm_cli::macos_doctor::request_initial_setup_stop`).
     save_stop: fn(u64) -> Result<(), String>,
@@ -7388,6 +6367,10 @@ struct SetupIo {
     /// Check again's look for the ALab vault, on the reading's worker
     /// (`aterm_cli::macos_doctor::look_for_the_vault_again`).
     look_again: fn(),
+    /// A person's Check again lifts every stage the run's ledger parked and starts the run's
+    /// other tries afresh (`aterm_cli::macos_doctor::retry_parked_setup_stages`); nothing
+    /// automatic calls it.
+    lift_parks: fn() -> Result<(), String>,
     /// Run the startup again on a thread of its own, as a launch runs it ([`start_startup_again`]).
     start_startup: fn() -> bool,
     /// Continue startup on a worker that has released its previous operation's leases.
@@ -7402,13 +6385,27 @@ struct SetupIo {
     /// One coherent current, admitted and unheld unfinished Repositories scope.
     pending_repositories:
         fn() -> Result<Option<aterm_cli::macos_doctor::InitialSetupAdmission>, String>,
+    /// Keep this process's latest readings of the rows read privately, those read back as
+    /// wanted, each with the journal as its read started, for the next launch
+    /// (`aterm_cli::macos_doctor::remember_private_read_back`, which keeps only those its fence
+    /// still holds for).
+    remember: fn(&[KeptReading]) -> Result<(), String>,
+    /// What a previous launch kept of them, each with its fence, where it still holds: the same
+    /// run revision, and no change journaled since its read started
+    /// (`aterm_cli::macos_doctor::remembered_private_read_back`).
+    remembered: fn() -> Vec<KeptReading>,
+    /// The change journal as a read starts, which fences what it reads for the next launch
+    /// (`aterm_cli::macos_doctor::journal_fence`); `None` where it cannot be read.
+    fence: fn() -> Option<aterm_cli::macos_doctor::Fence>,
 }
 
 #[cfg(target_os = "macos")]
 impl SetupIo {
     const LIVE: Self = Self {
         scope_refused: || aterm_cli::macos_doctor::lasting_scope_refusal().is_some(),
+        history_store: aterm_cli::macos_doctor::SetupHistoryStore::for_person,
         read: aterm_cli::macos_doctor::observe_initial_setup,
+        now_secs: || aterm_time::unix_secs().unwrap_or(0),
         save_stop: aterm_cli::macos_doctor::request_initial_setup_stop,
         claim_automatic: aterm_cli::macos_doctor::claim_automatic_setup,
         claim_rerun: aterm_cli::macos_doctor::claim_initial_setup_rerun,
@@ -7421,6 +6418,7 @@ impl SetupIo {
         start_follow_up: start_withheld_follow_up,
         bring_forward: aterm_cli::macos_doctor::bring_forward_restored_setup,
         look_again: aterm_cli::macos_doctor::look_for_the_vault_again,
+        lift_parks: aterm_cli::macos_doctor::retry_parked_setup_stages,
         start_startup: start_startup_again,
         start_startup_inline: || run_startup_setup(None),
         records_held: aterm_cli::macos_doctor::setup_records_held,
@@ -7431,6 +6429,9 @@ impl SetupIo {
                 .flatten()
         },
         pending_repositories: aterm_cli::macos_doctor::initial_setup_pending_repositories,
+        remember: aterm_cli::macos_doctor::remember_private_read_back,
+        remembered: aterm_cli::macos_doctor::remembered_private_read_back,
+        fence: aterm_cli::macos_doctor::journal_fence,
     };
 }
 
@@ -7478,7 +6479,7 @@ fn wake_setup_on_focus() {
 /// limit) before the wake, so the pass it wakes runs them (design §6.5).
 #[cfg(target_os = "macos")]
 fn wake_setup_for_check() {
-    if let Err(why) = aterm_cli::macos_doctor::retry_parked_setup_stages() {
+    if let Err(why) = (setup_io().lift_parks)() {
         aterm_log::warn!("Check again could not lift the parked setup stages: {why}");
     }
     SETUP_WAKES.raise_check();
@@ -7576,6 +6577,17 @@ fn verified_full_disk_access_granted() {
     );
 }
 
+/// The window found a verified Full Disk Access grant reading off
+/// ([`aterm_gui::InitialSetupHandlers::fda_off`]): a reading from before it says nothing now, so
+/// the Access rows are read again at once, on the observer's worker (their reads need no page in
+/// front), and `setup=` and the page say what they read rather than the grant the earlier reading
+/// saw (System State design §3.5).
+#[cfg(target_os = "macos")]
+fn full_disk_access_reads_off() {
+    use aterm_types::macos_setup::{Access, Subject};
+    request_observation(None, Access::ALL.map(Subject::Access).to_vec(), false);
+}
+
 #[cfg(target_os = "macos")]
 fn access_fact_observed(
     access: aterm_types::macos_setup::Access,
@@ -7605,13 +6617,15 @@ fn setup_stop_requested(revision: u64) -> bool {
         || stop_saves().requested == Some(revision)
 }
 
-/// A stage of the running pass started or ended: its rows paint busy while it
-/// runs, and they are read again once it ends.
+/// A stage of the running pass started or ended: its rows paint busy while it runs, what it
+/// read of them is their reading as it ends ([`record_setup_stage`]), and the rows it read
+/// nothing of are read again once it ends.
 #[cfg(target_os = "macos")]
 fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
     let missing = record_setup_stage(event);
     aterm_gui::publish_initial_setup_status(initial_setup_status());
     if !event.running {
+        remember_private_readings();
         request_observation(None, missing, false);
     }
     if ends_secrets_stage(&event) {
@@ -7619,45 +6633,43 @@ fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
     }
 }
 
-/// The small input worker publishes already-paid observations and reserves its owned
-/// rows for an ordinary read if their scoped pass ends without a current fact.
-/// It never requests whole-page status, healing or another setup lane.
-#[cfg(target_os = "macos")]
-fn setup_readback_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
-    let missing = record_setup_stage(event);
-    if let Ok(mut activity) = SETUP_ACTIVITY.lock()
-        && activity
-            .readback_owner
-            .is_some_and(|owner| owner.revision == Some(event.revision))
-    {
-        for subject in missing {
-            if !activity.readback_missing.contains(&subject) {
-                activity.readback_missing.push(subject);
-            }
-        }
-    }
-    publish_setup_readings();
-}
-
+/// Record a stage's start or end. A start retires its rows' readings; an end takes each dated
+/// reading the stage's own run made of one of its rows (`event.readback`) as that row's reading
+/// now, while the run's revision is current and not stopped, the person's choice is the one its
+/// run started under and nothing touched the row since the stage started, with the journal as
+/// the stage ends ([`ObservedRows::fences`], what fences the reading for the next launch) and as
+/// of its end ([`ObservedRows::read_epochs`]: a stage that could change the row starting after
+/// it retires it). An undated one reads nothing. The rows of `event` it took no reading of.
 #[cfg(target_os = "macos")]
 fn record_setup_stage(
     event: aterm_cli::macos_doctor::StageEvent<'_>,
 ) -> Vec<aterm_types::macos_setup::Subject> {
-    let workstation = event
+    // A stage whose own run reads its rows natively (the Mac settings, the sign-outs, Spotlight).
+    let native = event
         .settings
         .iter()
-        .any(|setting| setting.is_workstation());
+        .any(|setting| aterm_types::macos_setup::Subject::Setting(*setting).reads_privately());
     let current = !event.running
         && setup_run() == Some(event.revision)
         && !setup_stop_requested(event.revision);
+    // The journal as the stage ends, after its own changes, read before either lock.
+    let fence = (!event.running).then(|| (setup_io().fence)()).flatten();
+    // The display history a native stage's read-back keeps ([`SetupReadback::history_ticket`]).
+    let stage_history = if event.running && native {
+        begin_setup_history(None, None)
+    } else {
+        None
+    };
     let mut accepted = Vec::new();
+    let mut history_ticket = None;
+    let read_at = aterm_time::unix_millis().unwrap_or(0);
     if let Ok(mut activity) = SETUP_ACTIVITY.lock()
         && let Ok(mut rows) = OBSERVED_ROWS.lock()
     {
         if event.running {
             activity.mark(event.settings, event.subjects, true);
             retire_observed_rows(&mut rows, event.subjects);
-            if workstation {
+            if native {
                 activity.readback = activity.readback_owner.and_then(|owner| {
                     (owner.revision == Some(event.revision))
                         .then_some(owner.choices)
@@ -7667,17 +6679,19 @@ fn record_setup_stage(
                             choices,
                             started: activity.epoch,
                             subjects: event.subjects.to_vec(),
+                            history_ticket: stage_history.clone(),
                         })
                 });
             }
         } else {
-            let frame = workstation.then(|| activity.readback.take()).flatten();
+            let frame = native.then(|| activity.readback.take()).flatten();
             let readback: Vec<_> = event
                 .readback
                 .observations()
                 .iter()
                 .filter(|seen| {
                     current
+                        && seen.read_at().is_some()
                         && event.subjects.contains(&seen.subject)
                         && !(activity.input_readback
                             && seen.subject
@@ -7698,12 +6712,24 @@ fn record_setup_stage(
             // Validate before our own end event advances the touched fence.
             activity.mark(event.settings, event.subjects, false);
             for seen in readback {
-                accepted.push(seen.subject);
-                activity.readback_subjects.push(seen.subject);
+                let subject = seen.subject;
+                accepted.push(subject);
+                activity.readback_subjects.push(subject);
+                if retain_completed_read(&mut rows, &seen, read_at) {
+                    history_ticket = frame
+                        .as_ref()
+                        .and_then(|frame| frame.history_ticket.clone());
+                }
                 replace_observed_row(&mut rows, seen);
+                rows.fence(subject, fence);
+                match rows.read_epochs.iter_mut().find(|(row, _)| *row == subject) {
+                    Some(kept) => kept.1 = activity.epoch,
+                    None => rows.read_epochs.push((subject, activity.epoch)),
+                }
             }
         }
     }
+    persist_setup_history(history_ticket);
     event
         .subjects
         .iter()
@@ -7775,29 +6801,17 @@ fn capture_setup_readback_scope(revision: Option<u64>) -> SetupReadbackScope {
 }
 
 #[cfg(target_os = "macos")]
-struct SetupReadbackOwner {
-    scope: SetupReadbackScope,
-    previous: Option<SetupReadbackScope>,
-    previous_missing: Vec<aterm_types::macos_setup::Subject>,
-}
+struct SetupReadbackOwner(Option<SetupReadbackScope>);
 
 #[cfg(target_os = "macos")]
 impl SetupReadbackOwner {
     fn begin(scope: SetupReadbackScope) -> Self {
-        let (previous, previous_missing) = SETUP_ACTIVITY
-            .lock()
-            .map(|mut activity| {
-                (
-                    activity.readback_owner.replace(scope),
-                    std::mem::take(&mut activity.readback_missing),
-                )
-            })
-            .unwrap_or_default();
-        Self {
-            scope,
-            previous,
-            previous_missing,
-        }
+        Self(
+            SETUP_ACTIVITY
+                .lock()
+                .ok()
+                .and_then(|mut activity| activity.readback_owner.replace(scope)),
+        )
     }
 }
 
@@ -7805,53 +6819,14 @@ impl SetupReadbackOwner {
 impl Drop for SetupReadbackOwner {
     fn drop(&mut self) {
         end_setup_activity();
-        let missing: Vec<_> = if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
+        if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
             activity.readback = None;
-            activity.readback_owner = self.previous;
-            let missing = std::mem::replace(
-                &mut activity.readback_missing,
-                std::mem::take(&mut self.previous_missing),
-            );
-            // The scoped worker owns no final whole-page refresh.
+            activity.readback_owner = self.0;
+            // What the pass read is spent with it: no later pass is spared a read by it.
             activity.readback_subjects.clear();
-            if let Ok(rows) = OBSERVED_ROWS.lock()
-                && self.scope.choices == Some(rows.choices)
-            {
-                // Any current fact, including an accepted Unknown or a competing
-                // observer's result, already paid for this row's native read.
-                missing
-                    .into_iter()
-                    .filter(|subject| !rows.rows.iter().any(|row| row.subject == *subject))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        // The scoped pass has returned and released its profile lease. Stop may read
-        // durable records, so sample it outside the observation mutexes, only for debt.
-        let current = !missing.is_empty()
-            && self.scope.revision.is_some_and(|revision| {
-                setup_run() == Some(revision) && !setup_stop_requested(revision)
-            });
-        publish_setup_readings();
-        if current && let Some(choices) = self.scope.choices {
-            queue_observation(ObserveRequest {
-                plan: None,
-                choices,
-                subjects: missing,
-                forced: false,
-                pending_repositories: false,
-            });
         }
+        publish_setup_readings();
     }
-}
-
-#[cfg(target_os = "macos")]
-fn with_setup_readback<T>(scope: SetupReadbackScope, pass: impl FnOnce() -> T) -> T {
-    let _owner = SetupReadbackOwner::begin(scope);
-    pass()
 }
 
 /// One queued read of System State rows.
@@ -7894,9 +6869,22 @@ struct ObserveQueue {
     next: Option<ObserveRequest>,
     /// Latest explicit Check. Its scope never transfers to another plan.
     check: Option<ObserveRequest>,
-    /// Only a worker that never started owes a dispatch retry.
-    retry: Option<aterm_secrets::converge::RunnerRetry>,
+    /// Workers whose thread could not start, in a row, and when the last of them failed
+    /// (milliseconds on [`observation_millis`]'s clock): the next start waits on
+    /// [`OBSERVE_AGAIN`] after them. Only a worker that never started owes a dispatch retry.
+    misses: u32,
+    missed_at: u64,
 }
+
+/// When a setup reader whose thread could not start is started again
+/// ([`dispatch_observation_with`]): five seconds after the first failed start, doubling, never more
+/// than five minutes apart. A launch reads afresh, so the schedule lives with the process.
+#[cfg(target_os = "macos")]
+const OBSERVE_AGAIN: aterm_types::retry_schedule::Backoff =
+    aterm_types::retry_schedule::Backoff::new(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(5 * 60),
+    );
 
 #[cfg(target_os = "macos")]
 impl ObserveQueue {
@@ -7975,6 +6963,13 @@ impl ObserveQueue {
             )
             .collect()
     }
+
+    /// Whether a start that failed holds the next one at `now` (milliseconds on
+    /// [`observation_millis`]'s clock), its pause on [`OBSERVE_AGAIN`] not yet passed.
+    fn start_held(&self, now: u64) -> bool {
+        let pause = u64::try_from(OBSERVE_AGAIN.after(self.misses).as_millis()).unwrap_or(u64::MAX);
+        self.misses > 0 && now < self.missed_at.saturating_add(pause)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7984,7 +6979,8 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
     current: None,
     next: None,
     check: None,
-    retry: None,
+    misses: 0,
+    missed_at: 0,
 });
 
 /// The latest reading of each row, keyed by row, with the generation the page
@@ -7993,6 +6989,9 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
 struct ObservedRows {
     rows: Vec<aterm_types::macos_setup::Observation>,
     last_known: Vec<aterm_types::macos_setup::Observation>,
+    retained_reads: Vec<aterm_cli::macos_doctor::LastRead>,
+    history_restored: Vec<aterm_types::macos_setup::Subject>,
+    history_epoch: u64,
     unconfirmed: Vec<aterm_types::macos_setup::Subject>,
     generation: u64,
     caps_live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>,
@@ -8007,12 +7006,43 @@ struct ObservedRows {
     choices: u64,
     /// How many access steps the current revision had recorded at the last reading.
     access_steps: usize,
+    /// The [`SetupActivity`] epoch each kept row's read started in: what tells a reading from
+    /// before a stage that could change its row from one after it.
+    read_epochs: Vec<(aterm_types::macos_setup::Subject, u64)>,
+    /// This process looked once for what a previous launch kept of the private rows
+    /// ([`SetupIo::remembered`]): it seeds only rows this process has no reading of.
+    remembered_looked: bool,
+    /// The change journal as each kept row's read started ([`SetupIo::fence`]): what that
+    /// reading is kept for the next launch under, and only while nothing was journaled since. A
+    /// row with none (its journal unread) is not kept.
+    fences: Vec<(
+        aterm_types::macos_setup::Subject,
+        aterm_cli::macos_doctor::Fence,
+    )>,
+}
+
+#[cfg(target_os = "macos")]
+impl ObservedRows {
+    /// `subject`'s reading is fenced by `fence` from now, or by none.
+    fn fence(
+        &mut self,
+        subject: aterm_types::macos_setup::Subject,
+        fence: Option<aterm_cli::macos_doctor::Fence>,
+    ) {
+        self.fences.retain(|(row, _)| *row != subject);
+        if let Some(fence) = fence {
+            self.fences.push((subject, fence));
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(ObservedRows {
     rows: Vec::new(),
     last_known: Vec::new(),
+    retained_reads: Vec::new(),
+    history_restored: Vec::new(),
+    history_epoch: 0,
     unconfirmed: Vec::new(),
     generation: 0,
     caps_live: None,
@@ -8020,14 +7050,214 @@ static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(Obs
     plan: None,
     choices: 0,
     access_steps: 0,
+    read_epochs: Vec::new(),
+    remembered_looked: false,
+    fences: Vec::new(),
 });
+
+/// Held while [`remember_private_readings`] takes its snapshot and hands it on, so writers take
+/// turns and the last one writes the latest snapshot. Taken before [`SETUP_ACTIVITY`] and
+/// [`OBSERVED_ROWS`], never under them.
+#[cfg(target_os = "macos")]
+static REMEMBER_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Keep this process's latest readings of the rows read privately for the next launch
+/// ([`SetupIo::remember`]): each kept, dated reading of such a row that reads it as wanted, no
+/// stage running on its row and none run since its read started, with the journal as that read
+/// started ([`ObservedRows::fences`]), which the record keeps it under only while no aterm process
+/// journaled a change since. Run after a stage ends and whenever the readings change. A row that
+/// reads otherwise drops out, so the next launch never carries it as wanted.
+#[cfg(target_os = "macos")]
+fn remember_private_readings() {
+    let Ok(_turn) = REMEMBER_TURN.lock() else {
+        return;
+    };
+    let snapshot: Vec<_> = {
+        let Ok(activity) = SETUP_ACTIVITY.lock() else {
+            return;
+        };
+        let Ok(rows) = OBSERVED_ROWS.lock() else {
+            return;
+        };
+        // Before this process looked for what the last launch kept, a snapshot with no dated
+        // private reading of its own would only erase that record before its look.
+        if !rows.remembered_looked
+            && !rows
+                .rows
+                .iter()
+                .any(|seen| seen.subject.reads_privately() && seen.read_at().is_some())
+        {
+            return;
+        }
+        rows.rows
+            .iter()
+            .filter(|seen| seen.subject.reads_privately() && seen.read_back_settled())
+            .filter(|seen| {
+                let read_in = rows
+                    .read_epochs
+                    .iter()
+                    .find(|(row, _)| *row == seen.subject)
+                    .map_or(0, |(_, epoch)| *epoch);
+                !activity.subjects.contains(&seen.subject)
+                    && activity
+                        .touched
+                        .iter()
+                        .all(|(row, epoch)| *row != seen.subject || *epoch <= read_in)
+            })
+            .filter_map(|seen| {
+                rows.fences
+                    .iter()
+                    .find(|(row, _)| *row == seen.subject)
+                    .map(|(_, fence)| (seen.clone(), *fence))
+            })
+            .collect()
+    };
+    if let Err(why) = (setup_io().remember)(&snapshot) {
+        aterm_log::warn!("System State could not keep its last read-back: {why}");
+    }
+}
+
+/// A generation captured before an actual native read, never before an effect gate.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct SetupHistoryTicket {
+    store: aterm_cli::macos_doctor::SetupHistoryStore,
+    basis: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn begin_setup_history(
+    plan: Option<&aterm_types::macos_setup::Plan>,
+    choices: Option<u64>,
+) -> Option<SetupHistoryTicket> {
+    let store = (setup_io().history_store)()?;
+    let history = store.begin()?;
+    let changed = if let Ok(mut rows) = OBSERVED_ROWS.lock() {
+        if choices.is_some_and(|choices| choices != rows.choices) {
+            return None;
+        }
+        let source = plan
+            .map(|plan| plan.vault_url.trim())
+            .or_else(|| rows.plan.as_ref().map(|plan| plan.vault_url.trim()))
+            .map(str::to_owned);
+        let mut changed = false;
+        for read in &history.rows {
+            if rows.history_restored.contains(&read.subject)
+                || (read.subject.uses_vault_source()
+                    && source.as_deref() != Some(history.vault_source.as_str()))
+            {
+                continue;
+            }
+            rows.history_restored.push(read.subject);
+            if rows.rows.iter().any(|row| row.subject == read.subject) {
+                continue;
+            }
+            if !rows
+                .last_known
+                .iter()
+                .any(|row| row.subject == read.subject)
+            {
+                rows.last_known.push(read.observation());
+                rows.retained_reads.push(read.clone());
+                changed = true;
+            }
+            if read.subject.uses_vault_source() && rows.vault_url.is_none() {
+                rows.vault_url = source.clone();
+            }
+        }
+        if changed {
+            rows.generation += 1;
+        }
+        changed
+    } else {
+        false
+    };
+    if changed {
+        publish_setup_readings();
+    }
+    Some(SetupHistoryTicket {
+        store,
+        basis: history.generation,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn retain_completed_read(
+    rows: &mut ObservedRows,
+    seen: &aterm_types::macos_setup::Observation,
+    at: u64,
+) -> bool {
+    // A real accepted attempt (Unknown included) has already considered this subject in
+    // this process. Disk history cannot later repopulate a deliberately retired context.
+    if !rows.history_restored.contains(&seen.subject) {
+        rows.history_restored.push(seen.subject);
+    }
+    let Some(read) = aterm_cli::macos_doctor::LastRead::capture(seen, at) else {
+        return false;
+    };
+    if let Some(old) = rows
+        .retained_reads
+        .iter_mut()
+        .find(|old| old.subject == read.subject)
+    {
+        *old = read;
+    } else {
+        rows.retained_reads.push(read);
+    }
+    rows.history_epoch += 1;
+    true
+}
+
+/// A stale callback or another process's saved generation skips the optional write.
+/// No cache mutex is held while acquiring the file lock or performing file I/O.
+#[cfg(target_os = "macos")]
+fn persist_setup_history(ticket: Option<SetupHistoryTicket>) {
+    let Some(ticket) = ticket else {
+        return;
+    };
+    let snapshot = OBSERVED_ROWS.lock().ok().map(|rows| {
+        (
+            rows.history_epoch,
+            rows.generation,
+            rows.choices,
+            rows.vault_url.clone(),
+            rows.retained_reads.clone(),
+        )
+    });
+    let Some((epoch, generation, choices, source, reads)) = snapshot else {
+        return;
+    };
+    if reads.is_empty() {
+        return;
+    }
+    ticket.store.save(
+        ticket.basis,
+        source.as_deref().unwrap_or(""),
+        &reads,
+        || {
+            OBSERVED_ROWS.lock().is_ok_and(|rows| {
+                rows.history_epoch == epoch
+                    && rows.generation == generation
+                    && rows.choices == choices
+                    && rows.vault_url == source
+            })
+        },
+    );
+}
 
 #[cfg(target_os = "macos")]
 fn retire_observed_rows(
     rows: &mut ObservedRows,
     subjects: &[aterm_types::macos_setup::Subject],
 ) -> bool {
-    retire_observed_rows_with_history(rows, subjects, false)
+    retire_observed_rows_with_history(rows, subjects, RetiredHistory::Discard)
+}
+
+#[cfg(target_os = "macos")]
+enum RetiredHistory {
+    Discard,
+    Capture,
+    Preserve,
 }
 
 #[cfg(target_os = "macos")]
@@ -8040,6 +7270,7 @@ fn remember_observed_values(
     for row in rows.rows.iter().filter(|row| {
         subjects.contains(&row.subject)
             && !rows.unconfirmed.contains(&row.subject)
+            && row.read_at().is_some_and(|at| at != 0)
             && !matches!(row.standing, Standing::Unknown | Standing::Failed)
     }) {
         match rows
@@ -8065,15 +7296,22 @@ fn remember_observed_values(
 fn retire_observed_rows_with_history(
     rows: &mut ObservedRows,
     subjects: &[aterm_types::macos_setup::Subject],
-    keep_history: bool,
+    history: RetiredHistory,
 ) -> bool {
-    let mut history_changed = if keep_history {
-        remember_observed_values(rows, subjects)
-    } else {
-        let before = rows.last_known.len();
-        rows.last_known
-            .retain(|row| !subjects.contains(&row.subject));
-        before != rows.last_known.len()
+    let mut history_changed = match history {
+        RetiredHistory::Capture => remember_observed_values(rows, subjects),
+        RetiredHistory::Preserve => false,
+        RetiredHistory::Discard => {
+            for subject in subjects {
+                if !rows.history_restored.contains(subject) {
+                    rows.history_restored.push(*subject);
+                }
+            }
+            let before = rows.last_known.len();
+            rows.last_known
+                .retain(|row| !subjects.contains(&row.subject));
+            before != rows.last_known.len()
+        }
     };
     let unconfirmed = rows.unconfirmed.len();
     rows.unconfirmed
@@ -8123,6 +7361,8 @@ fn invalidate_setup_observations(subjects: &[aterm_types::macos_setup::Subject])
     };
     if changed {
         publish_setup_readings();
+        // A retired private reading leaves what the next launch keeps with it.
+        remember_private_readings();
     }
 }
 
@@ -8231,7 +7471,8 @@ fn replace_caps_live(
 }
 
 /// Queue a read-only reading of `subjects` on its own worker, never the setup
-/// slot. Requests made while one runs coalesce by ordinary refresh or explicit Check.
+/// slot, retiring their readings first: something may have changed them. Requests made while
+/// one runs coalesce by ordinary refresh or explicit Check.
 #[cfg(target_os = "macos")]
 fn request_observation(
     plan: Option<aterm_types::macos_setup::Plan>,
@@ -8248,7 +7489,7 @@ fn request_observation(
             && let Ok(mut rows) = OBSERVED_ROWS.lock()
         {
             activity.touch(&subjects);
-            retire_observed_rows_with_history(&mut rows, &subjects, true)
+            retire_observed_rows_with_history(&mut rows, &subjects, RetiredHistory::Capture)
         } else {
             false
         };
@@ -8267,6 +7508,18 @@ fn request_observation(
     })
 }
 
+/// A finished setup's first look at this launch: no apply pass ends in it to refresh the
+/// checklist, so it reads every row now through the ordinary observer, keeping its selected
+/// account and network scope, as a refresh, since nothing is known to have changed: a private
+/// row it may not read keeps what the last launch read of it ([`observe_rows`]).
+#[cfg(target_os = "macos")]
+fn look_at_finished_setup() -> bool {
+    refresh_observation(aterm_types::macos_setup::Subject::all())
+}
+
+/// Queue a reading of `subjects` that nothing is known to have changed (a pass's last refresh,
+/// a launch's first look): their readings stand until it reads them, and a private row it may
+/// not read keeps its still-valid one ([`observe_rows`]).
 #[cfg(target_os = "macos")]
 fn refresh_observation(subjects: Vec<aterm_types::macos_setup::Subject>) -> bool {
     if subjects.is_empty() {
@@ -8327,7 +7580,8 @@ fn observation_millis() -> u64 {
 }
 
 /// The existing window keeper retries only retained, never-started work. An idle
-/// or running queue takes no clock reading and starts nothing.
+/// or running queue takes no clock reading and starts nothing, and publishes the readings only
+/// while the window is owed them ([`dispatch_observation_publishing`]).
 #[cfg(target_os = "macos")]
 fn maintain_observation_dispatch() {
     dispatch_observation_with(None, observation_millis, start_observation);
@@ -8347,26 +7601,48 @@ fn dispatch_observation_with(
     now: impl FnOnce() -> u64,
     spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
 ) -> bool {
+    dispatch_observation_publishing(
+        request,
+        aterm_gui::initial_setup_readings_undelivered,
+        publish_setup_readings,
+        now,
+        spawn,
+    )
+}
+
+/// Enqueue `request`, if any, and start the reader a pending batch owes, saying each outcome
+/// with `publish` from this thread. A dispatch with no request (the keeper's round,
+/// [`maintain_observation_dispatch`]) that finds the queue idle or its reader running changed
+/// nothing the readings show: it publishes only while `undelivered`, the window's loop having
+/// taken no readings yet or dropped a publication since the last it took
+/// ([`aterm_gui::initial_setup_readings_undelivered`]). A dispatch that finds a pending batch
+/// and no reader running publishes once, whether that reader's start is held, made or refused.
+#[cfg(target_os = "macos")]
+fn dispatch_observation_publishing(
+    request: Option<ObserveRequest>,
+    undelivered: impl FnOnce() -> bool,
+    publish: impl Fn(),
+    now: impl FnOnce() -> u64,
+    spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
+) -> bool {
     let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
         return false;
     };
+    let enqueued = request.is_some();
     if let Some(request) = request {
         queue.enqueue(request);
     }
     if queue.running || (queue.next.is_none() && queue.check.is_none()) {
         drop(queue);
-        publish_setup_readings();
+        if enqueued || undelivered() {
+            publish();
+        }
         return true;
     }
     let now = now();
-    if queue
-        .retry
-        .as_ref()
-        .and_then(|retry| retry.remaining(now))
-        .is_some_and(|left| !left.is_zero())
-    {
+    if queue.start_held(now) {
         drop(queue);
-        publish_setup_readings();
+        publish();
         return true;
     }
     queue.running = true;
@@ -8378,7 +7654,7 @@ fn dispatch_observation_with(
                 let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
                     return;
                 };
-                queue.retry = None;
+                queue.misses = 0;
                 let batch = queue.take_pending();
                 if batch.iter().all(Option::is_none) {
                     queue.running = false;
@@ -8407,17 +7683,15 @@ fn dispatch_observation_with(
     }));
     queue.running = spawned.is_ok();
     if let Err(why) = spawned {
-        queue
-            .retry
-            .get_or_insert_default()
-            .reaped(aterm_secrets::converge::Last::Failed, now);
+        queue.misses = queue.misses.saturating_add(1);
+        queue.missed_at = now;
         drop(queue);
-        publish_setup_readings();
+        publish();
         aterm_log::warn!("System State could not read its rows: {why}");
         return false;
     }
     drop(queue);
-    publish_setup_readings();
+    publish();
     true
 }
 
@@ -8500,7 +7774,14 @@ fn observe_rows(request: ObserveRequest) {
         // Before the read: a token that arrives during it moves the mark past this one.
         token_mark_moved(|| true);
     }
+    let history_ticket = begin_setup_history(Some(&plan), Some(choices));
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
+    // The journal as the read starts: a change any aterm process journals after it keeps what
+    // this read finds out of the next launch's record ([`ObservedRows::fences`]).
+    let fence = (setup_io().fence)();
+    // Every reading is dated from before its read starts, so its age is never told as less than
+    // it is (design §3.5).
+    let read_at = (setup_io().now_secs)();
     let admission = if forced {
         aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
     } else {
@@ -8537,6 +7818,23 @@ fn observe_rows(request: ObserveRequest) {
                 })
                 .collect()
         });
+    let read: Vec<Observation> = read.into_iter().map(|seen| seen.stamped(read_at)).collect();
+    // A private row this process has no reading of, read withheld: what a previous launch kept
+    // of it, looked for once (design §3.5), so a relaunch nobody watches does not leave a
+    // finished Mac's rows unread.
+    let remembered = if read
+        .iter()
+        .any(|seen| seen.is_withheld() && seen.subject.reads_privately())
+        && OBSERVED_ROWS
+            .lock()
+            .is_ok_and(|mut rows| !std::mem::replace(&mut rows.remembered_looked, true))
+    {
+        (setup_io().remembered)()
+    } else {
+        Vec::new()
+    };
+    // Display history dates its values in milliseconds; `read_at` above stamps readings in seconds.
+    let history_at = aterm_time::unix_millis().unwrap_or(0);
     // A child's status supplies no readiness. Only a fresh native reading for the same
     // still-pending plan/revision can settle its park, even when the displayed row was
     // already ready or had no previous reading. This never lifts a stage's ledger hold.
@@ -8560,7 +7858,7 @@ fn observe_rows(request: ObserveRequest) {
         .map_or(0, |(revision, dir)| {
             aterm_types::macos_setup::access_record::read(&dir, revision).len()
         });
-    let (changed, wake) = {
+    let (changed, wake, retained) = {
         // Hold activity through publication, in Restore's lock order, so a reader checked just
         // before a change cannot slip its old rows back after that change retired them.
         let Ok(activity) = SETUP_ACTIVITY.lock() else {
@@ -8592,19 +7890,19 @@ fn observe_rows(request: ObserveRequest) {
             rows.rows.retain(|row| !row.subject.uses_vault_source());
             rows.last_known
                 .retain(|row| !row.subject.uses_vault_source());
+            rows.retained_reads
+                .retain(|row| !row.subject.uses_vault_source());
             rows.unconfirmed
                 .retain(|subject| !subject.uses_vault_source());
             rows.vault_url = Some(source.to_owned());
         }
         rows.plan = Some(plan);
+        let mut retained = false;
         // A row a person fixed, or an access step the window recorded, is what a
         // parked run waits for.
         let mut wake = rows.access_steps != access_steps;
         rows.access_steps = access_steps;
         // A reading taken while its own stage or Restore ran may be half of a change.
-        // Admission skips carry no new evidence, including on the launch's first
-        // read. Keep an existing reading, or leave the subject pending until its
-        // reader is admitted when the page is shown.
         let current_subject = |subject: &Subject| {
             !activity.subjects.contains(subject)
                 && !(activity.input_readback && *subject == Subject::Setting(Setting::CapsLock))
@@ -8617,20 +7915,53 @@ fn observe_rows(request: ObserveRequest) {
             .into_iter()
             .filter(|seen| current_subject(&seen.subject))
         {
-            let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
-            if seen.standing == Standing::Unknown {
-                if !was_unconfirmed {
-                    rows.unconfirmed.push(seen.subject);
+            // A withheld read ran no reader, so it supplies no evidence either way: the row's
+            // unconfirmed mark and its display history stay as they were. An attempted read that
+            // said nothing marks it.
+            if !seen.is_withheld() {
+                retained |= retain_completed_read(&mut rows, &seen, history_at);
+                let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
+                if seen.standing == Standing::Unknown {
+                    if !was_unconfirmed {
+                        rows.unconfirmed.push(seen.subject);
+                        changed = true;
+                    }
+                } else if was_unconfirmed {
+                    rows.unconfirmed.retain(|subject| *subject != seen.subject);
                     changed = true;
                 }
-            } else if was_unconfirmed {
-                rows.unconfirmed.retain(|subject| *subject != seen.subject);
-                changed = true;
             }
+            let subject = seen.subject;
             wake |= repository_ready_can_wake
-                && seen.subject == repositories
+                && subject == repositories
                 && seen.standing == Standing::InPlace;
-            match rows.rows.iter_mut().find(|row| row.subject == seen.subject) {
+            // A withheld read read nothing: the row's earlier reading stands, with its own time,
+            // which says how old it is, unless a stage that could change the row ran since that
+            // reading started (or nothing says when it started), which leaves the row unread.
+            let kept_from = rows
+                .read_epochs
+                .iter()
+                .find(|(row, _)| *row == subject)
+                .map_or(0, |(_, epoch)| *epoch);
+            let changed_since = activity
+                .touched
+                .iter()
+                .any(|(row, epoch)| *row == subject && *epoch > kept_from);
+            // What a previous launch kept stands for a withheld row this process has no
+            // reading of, while no stage of this process touched the row: one that did may have
+            // changed it after that reading.
+            let (seen, fence) = match remembered.iter().find(|(kept, _)| kept.subject == subject) {
+                Some((kept, kept_fence))
+                    if seen.is_withheld()
+                        && !rows.rows.iter().any(|row| row.subject == subject)
+                        && !activity.touched.iter().any(|(row, _)| *row == subject) =>
+                {
+                    (kept.clone(), Some(*kept_fence))
+                }
+                _ => (seen, fence),
+            };
+            match rows.rows.iter_mut().find(|row| row.subject == subject) {
+                Some(_) if seen.is_withheld() && !changed_since => continue,
                 Some(row) if *row == seen => {}
                 Some(row) => {
                     wake |= !row.standing.settled() && seen.standing.settled();
@@ -8642,13 +7973,22 @@ fn observe_rows(request: ObserveRequest) {
                     changed = true;
                 }
             }
+            match rows.read_epochs.iter_mut().find(|(row, _)| *row == subject) {
+                Some(kept) => kept.1 = started,
+                None => rows.read_epochs.push((subject, started)),
+            }
+            rows.fence(subject, fence);
         }
         if changed {
             rows.generation += 1;
         }
-        (changed, wake)
+        (changed, wake, retained)
     };
+    if retained {
+        persist_setup_history(history_ticket);
+    }
     if changed {
+        remember_private_readings();
         aterm_gui::publish_initial_setup_status(initial_setup_status());
     }
     if wake {
@@ -9118,6 +8458,8 @@ struct SetupChoice {
     replaced: Option<u64>,
     /// [`ObservedRows::choices`] once this choice was made.
     choices: u64,
+    /// This exact automatic admission kept display history before any effect.
+    keeps_workstation_history: bool,
 }
 
 /// What a person's choice changes the moment it is made, before its admission
@@ -9133,26 +8475,64 @@ fn begin_setup_choice(
     plan: &aterm_types::macos_setup::Plan,
     replacing: bool,
     generation: u64,
+    keep_history: bool,
 ) -> SetupChoice {
     let replaced = if replacing {
         SETUP_RUN.lock().ok().and_then(|mut run| run.take())
     } else {
         None
     };
-    let choices = OBSERVED_ROWS.lock().map_or(0, |mut rows| {
-        rows.last_known.clear();
-        rows.unconfirmed.clear();
-        rows.choices += 1;
-        rows.plan = Some(plan.clone());
-        rows.choices
-    });
-    invalidate_workstation_observations();
+    let subjects: Vec<_> = aterm_types::macos_setup::Setting::ALL
+        .into_iter()
+        .filter(|setting| setting.is_workstation())
+        .map(aterm_types::macos_setup::Subject::Setting)
+        .collect();
+    // This is still a new admission: old workstation readings lose current authority. Only an
+    // automatic retry of this exact plan can carry useful workstation display history to it.
+    let mut activity = SETUP_ACTIVITY.lock().ok();
+    let (choices, changed, keeps_workstation_history) =
+        OBSERVED_ROWS.lock().map_or((0, false, false), |mut rows| {
+            let keep_history = keep_history
+                && rows.plan.as_ref() == Some(plan)
+                && rows
+                    .vault_url
+                    .as_deref()
+                    .is_none_or(|source| source == plan.vault_url.as_str());
+            if keep_history {
+                rows.last_known
+                    .retain(|row| subjects.contains(&row.subject));
+            } else {
+                rows.last_known.clear();
+            }
+            rows.choices += 1;
+            rows.plan = Some(plan.clone());
+            let changed = activity.as_mut().is_some_and(|activity| {
+                activity.touch(&subjects);
+                retire_observed_rows_with_history(
+                    &mut rows,
+                    &subjects,
+                    if keep_history {
+                        RetiredHistory::Capture
+                    } else {
+                        RetiredHistory::Discard
+                    },
+                )
+            });
+            rows.unconfirmed.clear();
+            (rows.choices, changed, keep_history)
+        });
+    drop(activity);
+    if changed {
+        publish_setup_readings();
+        remember_private_readings();
+    }
     SetupChoice {
         plan: plan.clone(),
         generation,
         sent: send_admission(),
         replaced,
         choices,
+        keeps_workstation_history,
     }
 }
 
@@ -9175,19 +8555,47 @@ fn forget_setup_choice(choice: &SetupChoice) {
             stop_setup_run(run);
         }
     }
-    let restored = if let Ok(mut rows) = OBSERVED_ROWS.lock()
+    let subjects: Vec<_> = aterm_types::macos_setup::Setting::ALL
+        .into_iter()
+        .filter(|setting| setting.is_workstation())
+        .map(aterm_types::macos_setup::Subject::Setting)
+        .collect();
+    let restored = if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+        && let Ok(mut rows) = OBSERVED_ROWS.lock()
         && rows.choices == choice.choices
     {
-        rows.last_known.clear();
-        rows.unconfirmed.clear();
+        let keep_history = choice.keeps_workstation_history
+            && rows.plan.as_ref() == Some(&choice.plan)
+            && rows
+                .vault_url
+                .as_deref()
+                .is_none_or(|source| source == choice.plan.vault_url.as_str());
+        if keep_history {
+            rows.last_known
+                .retain(|row| subjects.contains(&row.subject));
+        } else {
+            rows.last_known.clear();
+        }
         rows.choices += 1;
         rows.plan = None;
+        activity.touch(&subjects);
+        retire_observed_rows_with_history(
+            &mut rows,
+            &subjects,
+            if keep_history {
+                RetiredHistory::Preserve
+            } else {
+                RetiredHistory::Discard
+            },
+        );
+        rows.unconfirmed.clear();
         true
     } else {
         false
     };
     if restored {
-        invalidate_workstation_observations();
+        publish_setup_readings();
+        remember_private_readings();
     }
     // Startup may already have answered the choice's earlier claim-wait wake.
     // A terminal refusal releases it only after both rollback locks are gone.
@@ -9702,9 +9110,9 @@ fn remember_initial_setup_rows(
     if let Some(refused) = report.journal_refused() {
         aterm_gui::note_journal_refused(refused);
     }
-    // A row a person changed after setup had it as wanted is theirs: no automatic pass rewrites
-    // it, and the exceptions digest keeps the fact until a check reads nothing out of place or a
-    // Restore puts the originals back.
+    // A row that changed after setup had it as wanted is left as it is: no automatic pass
+    // rewrites it, and the exceptions digest keeps the fact until a check reads nothing out of
+    // place or a Restore puts the originals back.
     let changed = report.changed_since();
     if !changed.is_empty() {
         aterm_gui::note_setup_changed_since(&changed.join(", "));
@@ -9967,6 +9375,11 @@ fn restart_initial_setup(
     if (setup_io().scope_refused)() {
         return false;
     }
+    let keep_history = receipt.admission() == aterm_gui::InitialSetupAdmission::Automatic
+        && !receipt.chosen()
+        && receipt.changed() == Some(aterm_types::macos_setup::Selection::none())
+        && !vault_typed
+        && password.is_none();
     let generation = SETUP_APPLY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
     // This launch's startup holds the automatic claim, or is asking for it:
     // the choice waits for it, counted from now, so the startup never shows
@@ -9975,7 +9388,7 @@ fn restart_initial_setup(
     if take_initial_setup_slot_now() {
         // No pass runs: a run, if any, is parked or backing off, and this
         // choice replaces it once admitted.
-        let choice = begin_setup_choice(&plan, true, generation);
+        let choice = begin_setup_choice(&plan, true, generation, keep_history);
         let refused = choice.clone();
         let under_way = UnderWay::new(choice.sent);
         let started = spawn_holding_initial_setup_slot("aterm-setup-apply", move |busy| {
@@ -9999,7 +9412,7 @@ fn restart_initial_setup(
     // its next step and this plan starts as the next run; a run sent before this choice that has
     // not registered yet (this launch's startup's, waiting for the slot) stops as it registers.
     // A later change overtakes this one; its dropped receipt keeps the page's input.
-    let choice = begin_setup_choice(&plan, false, generation);
+    let choice = begin_setup_choice(&plan, false, generation, keep_history);
     let refused = choice.clone();
     stop_runs_sent_through(choice.sent - 1);
     let under_way = UnderWay::new(choice.sent);
@@ -10327,386 +9740,17 @@ impl Drop for LiveSetupRestart {
 }
 
 #[cfg(all(test, unix))]
-mod setup_restart_tests {
-    use super::{SetupRestartHost, run_setup_restart};
-    use aterm_types::macos_setup::{Plan, Selection};
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-    use std::rc::Rc;
-
-    #[derive(Default)]
-    struct State {
-        alive: Vec<&'static str>,
-        drops: Vec<&'static str>,
-        accepted: usize,
-        refused: usize,
-    }
-
-    struct Lease {
-        name: &'static str,
-        state: Rc<RefCell<State>>,
-    }
-
-    impl Lease {
-        fn new(name: &'static str, state: &Rc<RefCell<State>>) -> Self {
-            state.borrow_mut().alive.push(name);
-            Self {
-                name,
-                state: Rc::clone(state),
-            }
-        }
-    }
-
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            let mut state = self.state.borrow_mut();
-            state.alive.retain(|name| *name != self.name);
-            state.drops.push(self.name);
-        }
-    }
-
-    struct Password {
-        secret: aterm_secrets::SecretBytes,
-        _lease: Lease,
-    }
-
-    struct Receipt {
-        lease: Lease,
-        accepted: bool,
-    }
-
-    impl Drop for Receipt {
-        fn drop(&mut self) {
-            if !self.accepted {
-                self.lease.state.borrow_mut().refused += 1;
-            }
-        }
-    }
-
-    struct Host {
-        state: Rc<RefCell<State>>,
-        outcomes: VecDeque<Admission>,
-        pending: bool,
-        plans: Vec<Plan>,
-        claims: usize,
-        /// Who holds the claim at each look before it is free.
-        held: VecDeque<Holder>,
-        /// The last look found this process's startup coordinator holding it.
-        startup_holding: bool,
-        awaits: usize,
-        /// The waits for another setup begun, and how many go by before a later choice
-        /// overtakes this one (`None`: none does).
-        queues: usize,
-        overtaken_after: Option<usize>,
-        backoffs: usize,
-        dispatches: Vec<u64>,
-        failures: Vec<String>,
-        /// The slot came back: the plan was not admitted.
-        slot_back: bool,
-    }
-
-    #[derive(Clone, Copy)]
-    enum Holder {
-        /// This process's startup coordinator ([`super::StartupClaim`]).
-        Startup,
-        /// Another aterm process, or `aterm doctor`.
-        Elsewhere,
-    }
-
-    enum Admission {
-        Pending(&'static str),
-        Rejected(&'static str),
-        Admitted(u64),
-        Superseded,
-        /// Another setup held the records past the choice's wait.
-        Busy,
-    }
-
-    const BUSY: &str = "another setup holds the records";
-
-    impl SetupRestartHost for Host {
-        type Claim = Lease;
-        type Busy = Lease;
-        type Password = Password;
-        type Receipt = Receipt;
-
-        fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
-            self.claims += 1;
-            assert!(
-                !self.state.borrow().alive.contains(&"claim"),
-                "retain the original automatic claim"
-            );
-            if let Some(holder) = self.held.pop_front() {
-                self.startup_holding = matches!(holder, Holder::Startup);
-                return Ok(None);
-            }
-            Ok(Some(Lease::new("claim", &self.state)))
-        }
-
-        fn startup_holds_claim(&self) -> bool {
-            self.startup_holding
-        }
-
-        fn await_claim(&mut self) {
-            // The choice keeps its slot, receipt and password while it waits.
-            assert_eq!(self.state.borrow().alive.len(), 3);
-            self.awaits += 1;
-        }
-
-        fn persist(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
-            assert_eq!(self.state.borrow().alive.len(), 4);
-            self.plans.push(plan.clone());
-            let outcome = self
-                .outcomes
-                .pop_front()
-                .expect("scripted admission attempt");
-            self.pending = matches!(outcome, Admission::Pending(_));
-            match outcome {
-                Admission::Pending(why) | Admission::Rejected(why) => Err(why.into()),
-                Admission::Busy => Err(BUSY.into()),
-                Admission::Admitted(revision) => Ok(Some(revision)),
-                Admission::Superseded => Ok(None),
-            }
-        }
-
-        fn pending(&self) -> bool {
-            self.pending
-        }
-
-        fn backoff(&mut self) {
-            assert!(self.pending);
-            assert_eq!(self.state.borrow().alive.len(), 4);
-            assert_eq!(self.state.borrow().accepted, 0);
-            assert_eq!(self.state.borrow().refused, 0);
-            self.backoffs += 1;
-        }
-
-        fn admitted(
-            &mut self,
-            revision: u64,
-            claim: Self::Claim,
-            busy: Self::Busy,
-            password: Self::Password,
-            mut receipt: Self::Receipt,
-        ) {
-            assert_eq!(self.state.borrow().alive.len(), 4);
-            assert_eq!(password.secret.as_slice(), b"retained password");
-            self.dispatches.push(revision);
-            receipt.accepted = true;
-            self.state.borrow_mut().accepted += 1;
-            drop(claim);
-            drop(busy);
-            drop(password);
-            drop(receipt);
-        }
-
-        fn failure(&mut self, why: &str) {
-            self.failures.push(why.into());
-        }
-
-        fn held_elsewhere(&self, why: &str) -> bool {
-            why == BUSY
-        }
-
-        fn queue(&mut self) -> bool {
-            // The choice keeps its slot, receipt and password while it waits.
-            assert!(self.state.borrow().alive.len() >= 3);
-            assert_eq!(self.state.borrow().refused, 0);
-            self.queues += 1;
-            self.overtaken_after
-                .is_none_or(|after| self.queues <= after)
-        }
-    }
-
-    fn run(plan: &Plan, outcomes: Vec<Admission>) -> Host {
-        let host = run_held(plan, Vec::new(), outcomes);
-        assert_eq!(host.state.borrow().drops[0], "claim");
-        host
-    }
-
-    /// [`run`] where the claim is held by `held`, look by look, before it is free.
-    fn run_held(plan: &Plan, held: Vec<Holder>, outcomes: Vec<Admission>) -> Host {
-        run_overtaken(plan, held, outcomes, None)
-    }
-
-    /// [`run_held`], where a later choice overtakes this one after `overtaken_after` waits for
-    /// another setup.
-    fn run_overtaken(
-        plan: &Plan,
-        held: Vec<Holder>,
-        outcomes: Vec<Admission>,
-        overtaken_after: Option<usize>,
-    ) -> Host {
-        let state = Rc::new(RefCell::new(State::default()));
-        let password = Password {
-            secret: aterm_secrets::SecretBytes::from(b"retained password".as_slice()),
-            _lease: Lease::new("password", &state),
-        };
-        let receipt = Receipt {
-            lease: Lease::new("receipt", &state),
-            accepted: false,
-        };
-        let busy = Lease::new("busy", &state);
-        let mut host = Host {
-            state,
-            outcomes: outcomes.into(),
-            pending: false,
-            plans: Vec::new(),
-            claims: 0,
-            held: held.into(),
-            startup_holding: false,
-            awaits: 0,
-            queues: 0,
-            overtaken_after,
-            backoffs: 0,
-            dispatches: Vec::new(),
-            failures: Vec::new(),
-            slot_back: false,
-        };
-        let slot = run_setup_restart(&mut host, plan, password, receipt, busy);
-        // A refusal's receipt is dropped before its slot comes back.
-        assert_eq!(slot.is_some(), host.state.borrow().alive == ["busy"]);
-        host.slot_back = slot.is_some();
-        drop(slot);
-        assert!(host.state.borrow().alive.is_empty());
-        host
-    }
-
-    /// A choice that meets another setup is never dropped (System State design §3.3). This
-    /// process's startup coordinator, holding the claim while it reads the plan in force, lets
-    /// go by itself: the choice waits for it. Another process's setup, or `aterm doctor`,
-    /// holding the claim or the records past the choice's wait: the choice waits for it too,
-    /// keeping its slot, receipt and password, says so, and is applied once it finishes, with
-    /// no failure. A later choice overtaking it lets it go, with no failure either.
-    #[test]
-    fn a_choice_waits_for_another_setup_and_is_applied_when_it_finishes() {
-        let host = run_held(
-            &Plan::default(),
-            vec![Holder::Startup, Holder::Startup],
-            vec![Admission::Admitted(5)],
-        );
-        assert_eq!(host.claims, 3);
-        assert_eq!((host.awaits, host.queues), (2, 0));
-        assert_eq!(host.dispatches, [5]);
-        assert!(host.failures.is_empty());
-        assert_eq!(host.state.borrow().accepted, 1);
-        assert!(!host.slot_back);
-
-        let host = run_held(
-            &Plan::default(),
-            vec![Holder::Elsewhere, Holder::Elsewhere],
-            vec![Admission::Admitted(6)],
-        );
-        assert_eq!((host.claims, host.awaits, host.queues), (3, 0, 2));
-        assert_eq!(host.dispatches, [6]);
-        assert!(host.failures.is_empty());
-        assert_eq!(host.state.borrow().accepted, 1);
-        assert!(!host.slot_back);
-
-        let plan = Plan::default();
-        let host = run(&plan, vec![Admission::Busy, Admission::Admitted(7)]);
-        assert_eq!((host.claims, host.queues, host.backoffs), (1, 1, 0));
-        assert_eq!(host.plans, vec![plan.clone(); 2]);
-        assert_eq!(host.dispatches, [7]);
-        assert!(host.failures.is_empty());
-        assert_eq!(host.state.borrow().accepted, 1);
-
-        for (held, outcomes) in [
-            (vec![Holder::Elsewhere, Holder::Elsewhere], Vec::new()),
-            (Vec::new(), vec![Admission::Busy, Admission::Busy]),
-        ] {
-            let host = run_overtaken(&plan, held, outcomes, Some(1));
-            assert_eq!(host.queues, 2);
-            assert!(host.dispatches.is_empty());
-            assert!(host.failures.is_empty(), "a choice let go fails nothing");
-            assert_eq!(host.state.borrow().refused, 1);
-            assert!(host.slot_back, "a choice let go gives its slot back");
-        }
-    }
-
-    #[test]
-    fn manual_final_admission_retains_the_original_choice_until_confirmation() {
-        let plan = Plan {
-            vault_url: "https://vault.example/reviewed".into(),
-            ..Plan::default()
-        };
-        let host = run(
-            &plan,
-            vec![
-                Admission::Pending("published final admission could not flush"),
-                Admission::Pending("the same final admission is still unconfirmed"),
-                Admission::Admitted(8),
-            ],
-        );
-        assert_eq!(host.dispatches, [8]);
-        assert_eq!(host.plans, vec![plan; 3]);
-        assert_eq!(host.claims, 1);
-        assert_eq!(host.backoffs, 2);
-        assert_eq!(host.failures.len(), 2);
-        assert_eq!(host.state.borrow().accepted, 1);
-        assert!(!host.slot_back);
-        assert_eq!(host.state.borrow().refused, 0);
-    }
-
-    #[test]
-    fn rejected_manual_admission_does_not_accept_an_older_same_plan() {
-        let host = run(
-            &Plan::default(),
-            vec![Admission::Rejected("pre-final write refused")],
-        );
-        assert!(host.dispatches.is_empty());
-        assert_eq!(host.plans.len(), 1);
-        assert_eq!(host.backoffs, 0);
-        assert_eq!(host.state.borrow().accepted, 0);
-        assert_eq!(host.state.borrow().refused, 1);
-        assert!(host.slot_back);
-    }
-
-    #[test]
-    fn a_superseded_manual_attempt_never_dispatches_or_accepts_its_receipt() {
-        for pending in [false, true] {
-            let mut outcomes = Vec::new();
-            if pending {
-                outcomes.push(Admission::Pending("the final admission needs confirmation"));
-            }
-            outcomes.push(Admission::Superseded);
-            let host = run(&Plan::default(), outcomes);
-            assert!(host.dispatches.is_empty());
-            assert_eq!(host.plans.len(), 1 + usize::from(pending));
-            assert_eq!(host.failures.len(), usize::from(pending));
-            assert_eq!(host.backoffs, usize::from(pending));
-            assert_eq!(host.state.borrow().accepted, 0);
-            assert_eq!(host.state.borrow().refused, 1);
-            assert!(host.slot_back);
-        }
-    }
-
-    #[test]
-    fn a_confirmed_empty_manual_plan_acknowledges_its_exact_revision() {
-        let plan = Plan {
-            selection: Selection::none(),
-            ..Plan::default()
-        };
-        let host = run(
-            &plan,
-            vec![
-                Admission::Pending("empty admission was published before its flush failed"),
-                Admission::Admitted(12),
-            ],
-        );
-        assert_eq!(host.dispatches, [12]);
-        assert_eq!(host.plans, [plan.clone(), plan]);
-        assert_eq!(host.backoffs, 1);
-        assert_eq!(host.state.borrow().accepted, 1);
-        assert!(!host.slot_back);
-        assert_eq!(host.state.borrow().refused, 0);
-    }
-}
+#[path = "main_setup_restart_tests.rs"]
+mod setup_restart_tests;
 
 #[cfg(target_os = "macos")]
-fn check_initial_setup(plan: aterm_types::macos_setup::Plan) -> aterm_gui::CheckStarted {
-    // Check again reads every row, GitHub repositories included, and lets a run
-    // parked on a person look again, its tries afresh (System State design §3.5).
+fn check_initial_setup(
+    plan: aterm_types::macos_setup::Plan,
+    by: aterm_gui::CheckBy,
+) -> aterm_gui::CheckStarted {
+    // Check again reads every row, GitHub repositories included; a press also lets a run
+    // parked on a person look again, its parked stages lifted and its tries afresh (System
+    // State design §3.5). The page's own reading wakes no run: the worker's own pauses do.
     let reading = plan.clone();
     begin_check_again(
         move || {
@@ -10720,7 +9764,11 @@ fn check_initial_setup(plan: aterm_types::macos_setup::Plan) -> aterm_gui::Check
                 true,
             )
         },
-        wake_setup_for_check,
+        move || {
+            if by == aterm_gui::CheckBy::Press {
+                wake_setup_for_check();
+            }
+        },
         move || {
             spawn_initial_setup_operation("aterm-setup-check", move |_busy| {
                 let observed = aterm_cli::macos_doctor::check_initial_setup_observed(&plan);
@@ -10929,4776 +9977,7 @@ fn start_startup_again() -> bool {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod initial_setup_result_tests {
-    #[path = "withheld_restore_result_tests.rs"]
-    mod withheld_restore_result_tests;
-
-    #[path = "withheld_stop_tests.rs"]
-    mod withheld_stop_tests;
-
-    #[path = "startup_retry_wake_tests.rs"]
-    mod startup_retry_wake_tests;
-
-    #[path = "admission_stop_handoff_tests.rs"]
-    mod admission_stop_handoff_tests;
-
-    #[path = "watch_stop_handoff_tests.rs"]
-    mod watch_stop_handoff_tests;
-
-    #[path = "startup_recovery_tests.rs"]
-    mod startup_recovery_tests;
-
-    #[path = "startup_cancel_watch_tests.rs"]
-    mod startup_cancel_watch_tests;
-
-    #[path = "startup_repair_debt_tests.rs"]
-    mod startup_repair_debt_tests;
-
-    #[path = "queued_press_tests.rs"]
-    mod queued_press_tests;
-
-    #[path = "progress_publication_tests.rs"]
-    mod progress_publication_tests;
-
-    #[path = "restore_retry_tests.rs"]
-    mod restore_retry_tests;
-
-    #[path = "bind_stop_tests.rs"]
-    mod bind_stop_tests;
-
-    #[path = "startup_stop_retry_tests.rs"]
-    mod startup_stop_retry_tests;
-
-    #[path = "startup_newer_tests.rs"]
-    mod startup_newer_tests;
-
-    use super::*;
-    use aterm_cli::macos_doctor::{
-        InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,
-        initial_setup_snapshot_at,
-    };
-    use aterm_types::macos_setup::Plan;
-    use std::path::Path;
-
-    fn publish_decision(root: &Path, state: &str) {
-        let next = root.join("decision.next");
-        std::fs::write(
-            &next,
-            format!(r#"{{"profile":"macos-workstation-v1","state":"{state}"}}"#),
-        )
-        .unwrap();
-        std::fs::rename(next, root.join("first-run.json")).unwrap();
-    }
-
-    fn snapshot(root: &Path) -> InitialSetupSnapshot {
-        initial_setup_snapshot_at(root, Plan::default()).unwrap()
-    }
-
-    /// A Stop pressed in this launch for the run in force holds every widen in it, even one the
-    /// Stop came too late for (it came during the run's last stage, which finished, so the
-    /// records keep no Stop and still widen): a person who pressed Stop gets no more automatic
-    /// setup this launch (design §3.5). A later run, which the Stop did not stop, may be
-    /// widened.
-    #[test]
-    fn a_stop_in_this_launch_widens_nothing_of_the_run_it_stopped() {
-        let _globals = globals();
-        reset_worker_state();
-        assert_eq!(
-            widens_here_with(|| Ok(true), || Ok(7)),
-            Ok(true),
-            "control: no Stop"
-        );
-        // What `stop_setup_run(7)` leaves in memory; the durable request it saves is spent.
-        *SETUP_STOP.lock().unwrap() = Some(7);
-        let held = widens_here_with(|| Ok(true), || Ok(7));
-        let later = widens_here_with(|| Ok(true), || Ok(8));
-        let narrow = widens_here_with(|| Ok(false), || panic!("not read"));
-        reset_worker_state();
-        assert_eq!(held, Ok(false), "no widen of the run the person stopped");
-        assert_eq!(later, Ok(true), "a later run is not the one stopped");
-        assert_eq!(narrow, Ok(false), "records that no longer widen");
-    }
-
-    /// A stand-in for the watch's upgrade: each persist answers as scripted, with whether the
-    /// attempt is still held after it.
-    struct ScriptedUpgrade {
-        pending: bool,
-        answers: VecDeque<(
-            Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>,
-            bool,
-        )>,
-        persisted: u32,
-        forgot: u32,
-    }
-
-    impl ScriptedUpgrade {
-        fn new(
-            answers: impl IntoIterator<
-                Item = (
-                    Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>,
-                    bool,
-                ),
-            >,
-        ) -> Self {
-            Self {
-                pending: false,
-                answers: answers.into_iter().collect(),
-                persisted: 0,
-                forgot: 0,
-            }
-        }
-    }
-
-    impl WatchUpgrade for ScriptedUpgrade {
-        fn pending(&self) -> bool {
-            self.pending
-        }
-        fn widens_from(&self) -> Option<u64> {
-            self.pending.then_some(7)
-        }
-        fn revision(&self) -> Result<u64, String> {
-            Ok(7)
-        }
-        fn persist(&mut self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
-            self.persisted += 1;
-            let (answer, pending) = self.answers.pop_front().expect("a scripted answer");
-            self.pending = pending;
-            answer
-        }
-        fn published(&self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
-            Ok(None)
-        }
-        fn forget(&mut self) {
-            self.forgot += 1;
-            self.pending = false;
-        }
-    }
-
-    const WIDENED: aterm_cli::macos_doctor::SetupUpgrade =
-        aterm_cli::macos_doctor::SetupUpgrade { from: 7, to: 8 };
-
-    /// One look of a watch that heard the ALab signal. The watch keeps `widened` from look to
-    /// look.
-    fn look_once(
-        widened: &mut Widened,
-        upgrade: &mut ScriptedUpgrade,
-        queue: impl FnMut(&Widened) -> bool,
-    ) -> Result<Option<u64>, String> {
-        look_settling_with(widened, upgrade, queue)
-    }
-
-    /// Every look of a heard widen ends its upgrade but one still pending: saved, the widened
-    /// plan's revision; nothing written (a Stop retired it, the records changed, a write failed
-    /// for good), the upgrade let go so no later look retries it; a write that failed with its
-    /// attempt held, finished by the next look.
-    #[test]
-    fn every_look_of_a_heard_widen_saves_keeps_or_lets_go_its_upgrade() {
-        let _globals = globals();
-        reset_worker_state();
-        let no_wait = |_: &Widened| -> bool { panic!("nothing waits for another setup") };
-
-        let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
-        let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
-        assert_eq!((looked, upgrade.pending), (Ok(Some(8)), false));
-
-        for (why, answer_now, looked_now) in [
-            ("nothing changed", Ok(None), Ok(None)),
-            (
-                "a write that failed for good",
-                Err("disk".to_string()),
-                Err("disk".to_string()),
-            ),
-        ] {
-            let mut upgrade = ScriptedUpgrade::new([(answer_now, false)]);
-            let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
-            assert_eq!((looked, upgrade.pending), (looked_now, false), "{why}");
-        }
-
-        // A write that failed, its attempt held: the next look finishes it.
-        let mut upgrade =
-            ScriptedUpgrade::new([(Err("disk".to_string()), true), (Ok(Some(WIDENED)), false)]);
-        let mut widened = Widened::default();
-        let looked = look_once(&mut widened, &mut upgrade, no_wait);
-        assert_eq!(looked, Err("disk".to_string()));
-        assert!(upgrade.pending, "kept while pending");
-        let looked = look_once(&mut widened, &mut upgrade, no_wait);
-        assert_eq!((looked, upgrade.pending), (Ok(Some(8)), false));
-
-        // This launch's Stop of the run the widen would replace (one spent on a finished run
-        // included): the look retires the upgrade unwritten.
-        *SETUP_STOP.lock().unwrap() = Some(7);
-        let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
-        let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
-        reset_worker_state();
-        assert_eq!(looked, Ok(None));
-        assert_eq!(upgrade.persisted, 0, "nothing reached the records");
-    }
-
-    /// The upgrade finds another setup holding the records past its wait: it waits on, shown
-    /// waiting, as a choice does, and is admitted once that setup lets go; one a Stop or a later
-    /// choice lets go meanwhile is retired unwritten.
-    #[test]
-    fn a_widen_another_setup_holds_waits_until_admitted_or_let_go() {
-        let _globals = globals();
-        reset_worker_state();
-        let busy = || (Err(aterm_cli::macos_doctor::SETUP_BUSY.to_string()), true);
-        let mut upgrade = ScriptedUpgrade::new([busy(), busy(), (Ok(Some(WIDENED)), false)]);
-        let mut waits = 0;
-        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| {
-            waits += 1;
-            true
-        });
-        assert_eq!((looked, waits), (Ok(Some(8)), 2));
-
-        let mut upgrade = ScriptedUpgrade::new([busy()]);
-        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| false);
-        reset_worker_state();
-        assert_eq!(looked, Ok(None));
-        assert_eq!(
-            (upgrade.forgot, upgrade.pending),
-            (1, false),
-            "retired unwritten"
-        );
-    }
-
-    /// A widen whose upgrade meets a newer aterm's records (written by the setup it waited for)
-    /// ends with that one look, even where the upgrade would keep its attempt, so the page shows
-    /// the newer aterm's setup with no run going and no later look retries it
-    /// (`a_held_widen_apply_meeting_a_newer_aterms_records_ends` in aterm-cli is the real
-    /// upgrade's side).
-    #[test]
-    fn a_widen_meeting_a_newer_aterms_records_is_let_go() {
-        let _globals = globals();
-        reset_worker_state();
-        // As the real upgrade's look of those records says it.
-        let newer = (Err(InitialSetupSnapshotError::Newer.to_string()), true);
-        let mut upgrade = ScriptedUpgrade::new([newer]);
-        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| {
-            panic!("nothing waits for another setup")
-        });
-        assert!(looked.is_err_and(|why| setup_is_newer(&why)));
-        assert_eq!(
-            (upgrade.pending, upgrade.forgot),
-            (false, 1),
-            "the attempt ends"
-        );
-    }
-
-    /// An older aterm's Cancel of the review that offered what a Restore brought forward, read
-    /// from its records: the status the page reads says so as for any Cancel, every group at
-    /// Leave as is, aterm's own permissions held; Set up now then applies the plan the review
-    /// showed (design §3.3).
-    #[test]
-    fn an_older_cancel_of_a_restore_brought_forward_reads_as_any_cancel() {
-        use aterm_cli::macos_doctor::InitialSetupAdmissionStopTest;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let restored = InitialSetupAdmissionStopTest::restored_before_run(root.path()).unwrap();
-        assert!(
-            restored.bring_forward().unwrap().is_some(),
-            "brought forward"
-        );
-        let review = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
-        let reviewed = review.plan();
-        review.older_cancel().unwrap();
-        let status = initial_setup_status_with(
-            Ok(review.snapshot().unwrap()),
-            false,
-            &InitialSetupRows::default(),
-        );
-        assert!(
-            status.cancelled,
-            "the page's Cancel line, beside Set up now"
-        );
-        assert!(status.finished && !status.provisional);
-        assert!(
-            status.plan.unwrap().selection.is_empty(),
-            "every group at Leave as is"
-        );
-        assert!(
-            !status.permissions.unwrap().allowed,
-            "aterm's permission steps held"
-        );
-
-        assert!(
-            review.set_up_now().unwrap().is_some(),
-            "Set up now is admitted"
-        );
-        assert_eq!(review.saved_plan().unwrap(), Some(reviewed.clone()));
-        let status = initial_setup_status_with(
-            Ok(review.snapshot().unwrap()),
-            false,
-            &InitialSetupRows::default(),
-        );
-        assert!(!status.cancelled);
-        assert_eq!(status.plan, Some(reviewed));
-        // Resuming the selected Permissions stage starts its automatic steps.
-        assert!(status.permissions.unwrap().allowed);
-    }
-
-    #[test]
-    fn clt_install_status_distinguishes_the_run_from_carried_permission_approval_and_stop() {
-        use aterm_cli::macos_doctor::ProvisionalSetupWatchTest;
-
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut setup = ProvisionalSetupWatchTest::new(root.path()).unwrap();
-        setup.person_asks_for_access().unwrap();
-        let before = setup.snapshot().unwrap();
-        let approval = before.access_revision;
-        let run = setup.upgrade(None).unwrap().unwrap();
-        let current = setup.snapshot().unwrap();
-        assert_eq!(current.revision, run);
-        assert!(run > before.revision);
-        assert_eq!(current.access_revision, approval);
-        assert!(
-            current
-                .plan
-                .selection
-                .contains(aterm_types::macos_setup::Setting::Repositories)
-        );
-        assert!(current.permissions_allowed);
-        assert!(current.run_allowed);
-        let status = initial_setup_status_with(Ok(current), false, &InitialSetupRows::default());
-        assert_eq!(status.permissions.unwrap().revision, approval);
-        assert_eq!(
-            status.run,
-            Some(aterm_gui::InitialSetupRunPolicy {
-                revision: run,
-                allowed: true
-            })
-        );
-        assert!(!status.finished);
-
-        setup.stop().unwrap();
-        let stopped = setup.snapshot().unwrap();
-        assert_eq!((stopped.revision, stopped.access_revision), (run, approval));
-        assert!(!stopped.permissions_allowed);
-        assert!(!stopped.run_allowed);
-        let status = initial_setup_status_with(Ok(stopped), false, &InitialSetupRows::default());
-        assert_eq!(status.permissions.unwrap().revision, approval);
-        assert!(!status.permissions.unwrap().allowed);
-        assert_eq!(
-            status.run,
-            Some(aterm_gui::InitialSetupRunPolicy {
-                revision: run,
-                allowed: false
-            })
-        );
-        assert!(status.finished);
-    }
-
-    fn cached(observation: Option<InitialSetupObservation>, checked: bool) -> InitialSetupRows {
-        let row = aterm_gui::SetupStatusRow {
-            name: "Earlier result".into(),
-            status: "blocked".into(),
-            detail: "approval code OLD42".into(),
-        };
-        if checked {
-            InitialSetupRows {
-                observation,
-                check: Some(aterm_gui::SetupCheck {
-                    plan: Plan::default(),
-                    rows: vec![row],
-                }),
-                ..InitialSetupRows::default()
-            }
-        } else {
-            InitialSetupRows {
-                observation,
-                rows: vec![row],
-                ..InitialSetupRows::default()
-            }
-        }
-    }
-
-    fn has_old_result(status: &aterm_gui::SetupStatus) -> bool {
-        status
-            .rows
-            .iter()
-            .chain(status.check.iter().flat_map(|check| check.rows.iter()))
-            .any(|row| row.detail.contains("OLD42"))
-    }
-
-    #[test]
-    fn cached_setup_results_follow_the_exact_record_publication() {
-        for checked in [false, true] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            publish_decision(root.path(), "pending");
-            let origin = snapshot(root.path());
-            let last = cached(Some(origin.observation.clone()), checked);
-            let status = initial_setup_status_with(Ok(snapshot(root.path())), false, &last);
-            assert!(
-                has_old_result(&status),
-                "an unchanged poll keeps its result"
-            );
-
-            publish_decision(root.path(), "restored");
-            let stopped = snapshot(root.path());
-            assert_eq!(stopped.revision, origin.revision);
-            let status = initial_setup_status_with(Ok(stopped), false, &last);
-            assert!(!has_old_result(&status));
-            assert!(status.finished);
-            assert!(!status.permissions.unwrap().allowed);
-
-            // A delayed publisher must retain its original context, even if a
-            // newer state is already visible when it finishes publishing.
-            let delayed = cached(Some(origin.observation), checked);
-            assert!(!has_old_result(&initial_setup_status_with(
-                Ok(snapshot(root.path())),
-                false,
-                &delayed,
-            )));
-        }
-    }
-
-    #[test]
-    fn a_stale_snapshot_cannot_evict_a_newer_setup_result() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        publish_decision(root.path(), "pending");
-        let old = snapshot(root.path());
-        publish_decision(root.path(), "restored");
-        let current = snapshot(root.path());
-        let last = cached(Some(current.observation), false);
-
-        // The slow reader collected the old state before the worker published
-        // this result. It can filter that result, but must not delete it.
-        assert!(!has_old_result(&initial_setup_status_with(
-            Ok(old),
-            false,
-            &last,
-        )));
-        assert!(has_old_result(&initial_setup_status_with(
-            Ok(snapshot(root.path())),
-            false,
-            &last,
-        )));
-    }
-
-    #[test]
-    fn unknown_setup_state_never_borrows_an_old_results_context() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        publish_decision(root.path(), "pending");
-        let last = cached(Some(snapshot(root.path()).observation), true);
-        for error in [
-            InitialSetupSnapshotError::Updating,
-            InitialSetupSnapshotError::Read("current records cannot be read".into()),
-        ] {
-            let changing = matches!(error, InitialSetupSnapshotError::Updating);
-            let status = initial_setup_status_with(Err(error), true, &last);
-            assert_eq!(status.changing, changing, "only a read that met a write");
-            assert!(!has_old_result(&status));
-            assert!(status.permissions.is_none());
-            assert!(status.busy);
-            assert_eq!(status.rows.len(), 1);
-        }
-        let unbound = cached(None, false);
-        let status = initial_setup_status_with(Ok(snapshot(root.path())), false, &unbound);
-        assert!(!has_old_result(&status));
-        assert!(!status.changing, "a read that met no write");
-    }
-
-    /// A Restore reaches the page as what it did to each System State row: one calm line in
-    /// the page's own row names, never a preference key, a process or a row per login reload.
-    /// A reader that did not relaunch leaves the rows it reads to the next login, which the
-    /// login sentence says (`aterm doctor --restore` keeps its `Reload` line); a setting it
-    /// could not put back stays a failure, named as Restore's and its row's.
-    #[test]
-    fn a_restore_reaches_the_page_in_row_names_not_preference_keys() {
-        use aterm_cli::macos_doctor::{Action, LOGIN, Report, RestoreRows, Row};
-        use aterm_types::macos_setup::{PutBack, RestoreOutcome};
-        const KEY: &str = "-g com.apple.keyboard.modifiermapping.1452-834-0";
-        let report = |outcome: RestoreOutcome| Report {
-            action: Action::Restore,
-            rows: vec![
-                Row {
-                    name: KEY.into(),
-                    status: "restored".into(),
-                    detail: "original value restored".into(),
-                    elapsed_ms: None,
-                },
-                Row {
-                    name: "Caps Lock key".into(),
-                    status: LOGIN.into(),
-                    detail: "log out and back in to load the saved mappings".into(),
-                    elapsed_ms: None,
-                },
-                Row {
-                    name: "Reload Dock".into(),
-                    status: "error".into(),
-                    detail: "Dock did not come back".into(),
-                    elapsed_ms: None,
-                },
-            ],
-            manual_steps: Vec::new(),
-            backup: std::path::PathBuf::from("original-preferences.json"),
-            restore: Some(RestoreRows { outcome }),
-            page: None,
-        };
-        let back = initial_setup_report_rows(&report(RestoreOutcome::of([
-            (Some(Setting::CapsLock), PutBack::AtLogin),
-            (Some(Setting::Dock), PutBack::AtLogin),
-        ])));
-        assert_eq!(
-            back.iter()
-                .map(|row| (row.name.as_str(), row.status.as_str()))
-                .collect::<Vec<_>>(),
-            [("Restore previous settings", "restored")]
-        );
-        assert_eq!(
-            back[0].detail,
-            "Restore previous settings finished. Caps Lock key and Dock come back at your next \
-             login."
-        );
-        let failed = initial_setup_report_rows(&report(RestoreOutcome::of([(
-            Some(Setting::CapsLock),
-            PutBack::Failed,
-        )])));
-        assert_eq!(
-            failed
-                .iter()
-                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
-                .collect::<Vec<_>>(),
-            [(
-                "Restore: Caps Lock key",
-                "failed",
-                "Caps Lock key could not be put back as it was."
-            )]
-        );
-        for row in back.iter().chain(&failed) {
-            for engine in ["com.apple", "Reload", "did not come back"] {
-                assert!(
-                    !row.name.contains(engine) && !row.detail.contains(engine),
-                    "{row:?}"
-                );
-            }
-        }
-    }
-
-    /// A Check reaches the page through its page as a pass does (design §3.6): a stage it could
-    /// not confirm under its rows, with none of the stage's words, which `aterm doctor` keeps;
-    /// and a change the journal could not log is no row of the page's at all.
-    #[test]
-    fn a_check_reaches_the_page_in_row_names_and_the_journal_row_never_does() {
-        use aterm_cli::macos_doctor::{Action, JOURNAL_ROW, PassPage, Report, Row};
-        let row = |name: &str, status: &str, detail: &str| Row {
-            name: name.into(),
-            status: status.into(),
-            detail: detail.into(),
-            elapsed_ms: None,
-        };
-        let report = Report {
-            action: Action::Check,
-            rows: vec![row(
-                "Spotlight and Rust documentation",
-                "unverified",
-                "rustup: /usr/bin/env exited 1",
-            )],
-            manual_steps: Vec::new(),
-            backup: std::path::PathBuf::from("original-preferences.json"),
-            restore: None,
-            page: Some(PassPage {
-                readback: aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                outcome: aterm_types::macos_setup::PassOutcome::default(),
-                rows: vec![row("Rust in Spotlight", "unverified", "")],
-            }),
-        };
-        let said: Vec<(String, String, String)> = initial_setup_report_rows(&report)
-            .into_iter()
-            .map(|row| (row.name, row.status, row.detail))
-            .collect();
-        assert_eq!(
-            said,
-            [(
-                "Check: Rust in Spotlight".to_owned(),
-                "unverified".to_owned(),
-                String::new()
-            )]
-        );
-        let journal = Report {
-            action: Action::Apply,
-            rows: vec![
-                row("Dock", "ok", "set"),
-                row(JOURNAL_ROW, "error", "doctor.dock: disk full"),
-            ],
-            page: None,
-            ..report
-        };
-        assert_eq!(journal.journal_refused(), Some("doctor.dock: disk full"));
-        assert!(
-            initial_setup_report_rows(&journal)
-                .iter()
-                .all(|row| row.name != JOURNAL_ROW),
-            "the exceptions digest says it"
-        );
-    }
-
-    /// A setup pass reaches the page in row names too (design §3.6): a change that did not take
-    /// is a failure of its row, and what its rollback put back is one calm line in a Restore's
-    /// words. `aterm doctor`'s rows, which name each key, stay in the terminal; the pass's
-    /// other rows reach the page as they are.
-    #[test]
-    fn a_pass_reaches_the_page_in_row_names_not_preference_keys() {
-        use aterm_cli::macos_doctor::{Action, PassPage, Report, Row};
-        use aterm_types::macos_setup::{PassOutcome, PutBack, RestoreOutcome, Unfinished};
-        let row = |name: &str, status: &str, detail: &str| Row {
-            name: name.into(),
-            status: status.into(),
-            detail: detail.into(),
-            elapsed_ms: None,
-        };
-        let repositories = row("GitHub repositories", "ok", "all 3 cloned");
-        let report = Report {
-            action: Action::Apply,
-            rows: vec![
-                row(
-                    "Dock: com.apple.dock show-recents",
-                    "error",
-                    "absent → false",
-                ),
-                row(
-                    "Preference rollback",
-                    "restored",
-                    "rolled back com.apple.dock show-recents",
-                ),
-                repositories.clone(),
-            ],
-            manual_steps: Vec::new(),
-            backup: std::path::PathBuf::from("original-preferences.json"),
-            restore: None,
-            page: Some(PassPage {
-                readback: aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                outcome: PassOutcome {
-                    rolled_back: Some(RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)])),
-                    unfinished: vec![(Setting::Dock, Unfinished::Failed)],
-                },
-                rows: vec![repositories],
-            }),
-        };
-        let rows = initial_setup_report_rows(&report);
-        assert_eq!(
-            rows.iter()
-                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                ("Dock", "error", "The change did not take."),
-                (
-                    "Undo",
-                    "restored",
-                    "aterm put back what it could not finish. Dock is as it was."
-                ),
-                ("GitHub repositories", "ok", "all 3 cloned"),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_blocked_restore_remains_visible_as_a_bound_operation_failure() {
-        use aterm_cli::macos_doctor::{Action, Report, Row};
-        const WHY: &str = "The original Widgets value could not be read; it was left unchanged.";
-        for action in [Action::Apply, Action::Check, Action::Restore] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            publish_decision(root.path(), "restored");
-            let current = snapshot(root.path());
-            let report = Report {
-                action,
-                rows: vec![Row {
-                    name: "Widgets".into(),
-                    status: "blocked".into(),
-                    detail: WHY.into(),
-                    elapsed_ms: None,
-                }],
-                manual_steps: Vec::new(),
-                backup: root.path().join("original-preferences.json"),
-                restore: None,
-                page: None,
-            };
-            let rows = initial_setup_report_rows(&report);
-            let last = if action == Action::Check {
-                InitialSetupRows {
-                    observation: Some(current.observation),
-                    check: Some(aterm_gui::SetupCheck {
-                        plan: current.plan,
-                        rows,
-                    }),
-                    ..InitialSetupRows::default()
-                }
-            } else {
-                InitialSetupRows {
-                    observation: Some(current.observation),
-                    rows,
-                    ..InitialSetupRows::default()
-                }
-            };
-            let status = initial_setup_status_with(Ok(snapshot(root.path())), false, &last);
-            let row = status
-                .rows
-                .iter()
-                .chain(status.check.iter().flat_map(|check| check.rows.iter()))
-                .find(|row| row.detail == WHY)
-                .expect("the result belongs to the unchanged publication");
-            let expected = match action {
-                Action::Apply => ("Widgets", "blocked"),
-                Action::Check => ("Check: Widgets", "blocked"),
-                Action::Restore => ("Restore: Widgets", "failed"),
-            };
-            assert_eq!((row.name.as_str(), row.status.as_str()), expected);
-            assert_eq!(
-                report.rows[0].status, "blocked",
-                "CLI semantics stay intact"
-            );
-            assert!(report.needs_attention());
-
-            publish_decision(root.path(), "cancelled");
-            let next = initial_setup_status_with(Ok(snapshot(root.path())), false, &last);
-            assert!(
-                next.rows.iter().all(|row| row.detail != WHY)
-                    && next
-                        .check
-                        .as_ref()
-                        .is_none_or(|check| check.rows.iter().all(|row| row.detail != WHY)),
-                "an older Restore result cannot follow a newer publication"
-            );
-        }
-    }
-
-    use aterm_types::macos_setup::{Group, Observation, Setting, Subject};
-    use std::collections::VecDeque;
-    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-    use std::time::{Duration, Instant};
-
-    /// The tests below share the worker's process-wide state: its registration,
-    /// its readings, the setup slot and [`SETUP_IO`].
-    static SETUP_GLOBALS: Mutex<()> = Mutex::new(());
-
-    fn globals() -> MutexGuard<'static, ()> {
-        SETUP_GLOBALS.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// A wait for something that must happen: a hang detector, not a budget.
-    const HANG: Duration = Duration::from_secs(60);
-
-    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + HANG;
-        while !done() {
-            assert!(Instant::now() < deadline, "{what} never happened");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// What the worker asked of the outside under [`TestIo`], and how it answers.
-    struct Script {
-        /// Readings started: their plan, their rows, and whether they used the
-        /// network.
-        reads: Vec<(Plan, Vec<Subject>, bool)>,
-        /// Whether each read carries a person's explicit Check intent.
-        read_checks: Vec<bool>,
-        /// Replies bound to each reading when it starts, before a held read
-        /// can be overtaken by a choice.
-        readings: VecDeque<Vec<Observation>>,
-        /// Readings wait while this is set.
-        hold: bool,
-        /// The next held reading unwinds after releasing the script lock.
-        panic_read: bool,
-        /// Stop saves begun: the run each names and the thread it ran on.
-        stop_attempts: Vec<(u64, std::thread::ThreadId)>,
-        /// Stop saves that landed.
-        stops: Vec<u64>,
-        /// Stop saves wait while this is set, as a loaded disk holds them.
-        stop_hold: bool,
-        /// Stop saves that fail before one lands.
-        stop_failures: usize,
-        /// An optional actual scratch Stop writer for admission handoff tests.
-        stop_root: Option<std::path::PathBuf>,
-        /// A person's choice asks for the claim only once this is clear.
-        claim_hold: bool,
-        /// Admissions of a person's choice begun.
-        persists: usize,
-        /// Admissions wait while this is set.
-        persist_hold: bool,
-        /// Each admission first finds this Mac's setup records held by another setup, as the
-        /// profile lock's wait does ([`aterm_cli::macos_doctor::InitialSetupRestart::noting_wait`]).
-        persist_finds_lock_held: bool,
-        /// What each admission does in turn: admits its choice as this
-        /// revision, or refuses it (`None`, and when none is left).
-        admits: VecDeque<Option<u64>>,
-        /// A run that registers while a choice is being refused.
-        registers: Option<u64>,
-        /// The runs admitted choices started.
-        runs: Vec<u64>,
-        /// The revision in force: the last one admitted.
-        revision: u64,
-        /// The startup's read of the plan in force waits while this is set.
-        initial_hold: bool,
-        /// The startup is reading the plan in force, holding its claim.
-        startup_reading: bool,
-        /// Offers the startup showed.
-        offers: usize,
-        /// The real request sent its answer, before the startup reads it.
-        startup_answer_delivered: bool,
-        /// Hold the offer after delivery, before it returns to the coordinator.
-        startup_answer_hold: bool,
-        /// What each write of the page's answer does in turn: admits it as
-        /// this revision (`Ok(Some)`), finds it retired (`Ok(None)`), or
-        /// fails while the startup keeps its claim (`Err`).
-        authorizations: VecDeque<Result<Option<u64>, String>>,
-        /// Writes of the page's answer begun.
-        authorizing: usize,
-        /// Those writes wait while this is set.
-        authorize_hold: bool,
-        /// The startup's waits before it writes its answer again, holding
-        /// its claim, begun.
-        retry_waits: usize,
-        /// The startup's waits holding no claim last while this is set, as
-        /// a minute does.
-        startup_backoff_hold: bool,
-        /// What the startup reported failing.
-        startup_failures: Vec<String>,
-        /// Follow-ups with Full Disk Access a recorded grant started.
-        follow_ups: usize,
-        /// Starts of the vault subscriber's mend asked for.
-        mends: usize,
-        /// Starts of the converge pass's window lane asked for.
-        converge_lanes: usize,
-        /// Converge passes the Secrets stage's end started.
-        setup_converges: usize,
-        /// What bringing a restored setup forward found.
-        brought_forward: aterm_cli::macos_doctor::BroughtForward,
-        /// Check again's looks at the LAN.
-        vault_looks: usize,
-        /// Startups run again in this process.
-        startups: usize,
-        /// Whether each requested startup worker was accepted by the spawner.
-        startup_spawns: VecDeque<bool>,
-        /// Startup continuations on a released Restore worker.
-        startups_inline: usize,
-        /// The answers, one an ask, to whether another setup holds the records (none: no).
-        records_held: VecDeque<bool>,
-        /// The widened mark ([`SETUP_WIDENED`]) as each run started.
-        widened: Vec<u64>,
-        /// The vault's materialization mark ([`SetupIo::vault_mark`]).
-        vault_mark: Option<aterm_secrets::client::MaterializationMark>,
-        pending_repositories:
-            VecDeque<Result<Option<aterm_cli::macos_doctor::InitialSetupAdmission>, String>>,
-        retire_repository_choice_after_guard: bool,
-    }
-
-    impl Script {
-        const NEW: Self = Self {
-            reads: Vec::new(),
-            read_checks: Vec::new(),
-            readings: VecDeque::new(),
-            hold: false,
-            panic_read: false,
-            stop_attempts: Vec::new(),
-            stops: Vec::new(),
-            stop_hold: false,
-            stop_failures: 0,
-            stop_root: None,
-            claim_hold: false,
-            persists: 0,
-            persist_hold: false,
-            persist_finds_lock_held: false,
-            admits: VecDeque::new(),
-            registers: None,
-            runs: Vec::new(),
-            revision: 1,
-            initial_hold: false,
-            startup_reading: false,
-            offers: 0,
-            startup_answer_delivered: false,
-            startup_answer_hold: false,
-            authorizations: VecDeque::new(),
-            authorizing: 0,
-            authorize_hold: false,
-            retry_waits: 0,
-            startup_backoff_hold: false,
-            startup_failures: Vec::new(),
-            follow_ups: 0,
-            mends: 0,
-            converge_lanes: 0,
-            setup_converges: 0,
-            brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
-            vault_looks: 0,
-            startups: 0,
-            startup_spawns: VecDeque::new(),
-            startups_inline: 0,
-            records_held: VecDeque::new(),
-            widened: Vec::new(),
-            vault_mark: None,
-            pending_repositories: VecDeque::new(),
-            retire_repository_choice_after_guard: false,
-        };
-    }
-
-    static SCRIPT: Mutex<Script> = Mutex::new(Script::NEW);
-    static SCRIPT_MOVED: Condvar = Condvar::new();
-
-    fn script() -> MutexGuard<'static, Script> {
-        SCRIPT.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Change the script and wake whatever waits on it.
-    fn change(edit: impl FnOnce(&mut Script)) {
-        edit(&mut script());
-        SCRIPT_MOVED.notify_all();
-    }
-
-    /// Wait while `held` says so (a hang detector bounds it).
-    fn wait_while(
-        mut script: MutexGuard<'static, Script>,
-        held: impl Fn(&Script) -> bool,
-    ) -> MutexGuard<'static, Script> {
-        let deadline = Instant::now() + HANG;
-        while held(&script) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            script = SCRIPT_MOVED
-                .wait_timeout(script, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-        script
-    }
-
-    fn release_readings() {
-        change(|script| script.hold = false);
-    }
-
-    fn observe_idle() -> bool {
-        OBSERVE_QUEUE.lock().is_ok_and(|queue| !queue.running)
-    }
-
-    /// No Stop waits for the Stop's worker, nor is being saved.
-    fn stop_worker_idle() -> bool {
-        let saves = stop_saves();
-        saves.saving.is_none() && saves.wanted.is_none()
-    }
-
-    fn reset_worker_state() {
-        set_setup_run(None);
-        *SETUP_STOP.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        // The worker, once started, lives on for the next test.
-        let mut saves = stop_saves();
-        *saves = StopSaves {
-            worker: saves.worker,
-            ..StopSaves::default()
-        };
-        drop(saves);
-        {
-            let mut rows = OBSERVED_ROWS.lock().unwrap_or_else(PoisonError::into_inner);
-            rows.plan = None;
-            rows.last_known.clear();
-            rows.unconfirmed.clear();
-        }
-        {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.active.clear();
-            queue.current = None;
-        }
-        *GITHUB_TOKEN_MARK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-    }
-
-    /// The folder [`TestIo`]'s claims are taken in.
-    static CLAIM_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-
-    /// The worker's outside, scripted for a test that holds [`globals`]: it
-    /// reads no row of the Mac and writes nothing to the person's state root.
-    /// Its automatic claim is the real lock, in a scratch folder. Dropped, it
-    /// waits for the readings, the choice and the Stop the test started to end
-    /// before the live [`SetupIo`] is back. It holds [`TEST_IO`] for its whole
-    /// life, so no two run at once and one's drop puts back no [`SETUP_IO`]
-    /// another test still scripts.
-    struct TestIo {
-        _claims: aterm_tempfile::TempDir,
-        _serial: MutexGuard<'static, ()>,
-    }
-
-    /// Serialises every [`TestIo`]. Taken inside [`globals`], which every
-    /// test that installs one holds first.
-    static TEST_IO: Mutex<()> = Mutex::new(());
-
-    impl TestIo {
-        fn install() -> Self {
-            let serial = TEST_IO.lock().unwrap_or_else(PoisonError::into_inner);
-            let claims = aterm_tempfile::tempdir().unwrap();
-            *CLAIM_ROOT.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(claims.path().to_owned());
-            *script() = Script::NEW;
-            *SETUP_IO.write().unwrap_or_else(PoisonError::into_inner) = SetupIo {
-                scope_refused: || false,
-                read: Self::read,
-                save_stop: Self::save_stop,
-                claim_automatic: Self::claim,
-                claim_rerun: Self::claim_rerun,
-                persist: Self::persist,
-                run: Self::run,
-                mend_subscriber: || change(|script| script.mends += 1),
-                converge_lane: || change(|script| script.converge_lanes += 1),
-                converge_setup: || change(|script| script.setup_converges += 1),
-                put_back: |_| Ok(false),
-                start_follow_up: || change(|script| script.follow_ups += 1),
-                bring_forward: || Ok(script().brought_forward),
-                look_again: || change(|script| script.vault_looks += 1),
-                start_startup: || {
-                    let mut script = script();
-                    script.startups += 1;
-                    script.startup_spawns.pop_front().unwrap_or(true)
-                },
-                start_startup_inline: || change(|script| script.startups_inline += 1),
-                records_held: || script().records_held.pop_front().unwrap_or(false),
-                vault_mark: || script().vault_mark,
-                pending_repositories: || {
-                    let (answer, retire) = {
-                        let mut script = script();
-                        let answer = script.pending_repositories.pop_front().unwrap_or(Ok(None));
-                        let retire = script.pending_repositories.is_empty()
-                            && std::mem::take(&mut script.retire_repository_choice_after_guard);
-                        (answer, retire)
-                    };
-                    if retire {
-                        OBSERVED_ROWS.lock().unwrap().choices += 1;
-                    }
-                    answer
-                },
-            };
-            reset_worker_state();
-            Self {
-                _claims: claims,
-                _serial: serial,
-            }
-        }
-
-        fn read(
-            plan: &Plan,
-            subjects: &[Subject],
-            network: bool,
-            admission: aterm_cli::macos_doctor::ObservationRead,
-        ) -> Vec<Observation> {
-            let mut script = script();
-            script
-                .reads
-                .push((plan.clone(), subjects.to_vec(), network));
-            script.read_checks.push(matches!(
-                admission,
-                aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
-            ));
-            let reading = script.readings.pop_front().unwrap_or_default();
-            let panics = std::mem::take(&mut script.panic_read);
-            SCRIPT_MOVED.notify_all();
-            drop(wait_while(script, |script| script.hold));
-            assert!(!panics, "injected reader unwind");
-            reading
-        }
-
-        fn save_stop(revision: u64) -> Result<(), String> {
-            let mut script = script();
-            script
-                .stop_attempts
-                .push((revision, std::thread::current().id()));
-            SCRIPT_MOVED.notify_all();
-            let mut script = wait_while(script, |script| script.stop_hold);
-            if script.stop_failures > 0 {
-                script.stop_failures -= 1;
-                return Err("the disk is full".into());
-            }
-            let root = script.stop_root.clone();
-            drop(script);
-            if let Some(root) = root {
-                aterm_cli::macos_doctor::ProvisionalSetupWatchTest::at(&root)
-                    .stop_revision(revision)?;
-            }
-            let mut script = self::script();
-            script.stops.push(revision);
-            SCRIPT_MOVED.notify_all();
-            Ok(())
-        }
-
-        fn claim() -> Result<Option<aterm_cli::macos_doctor::AutomaticSetupClaim>, String> {
-            let root = CLAIM_ROOT
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-                .expect("TestIo's claim folder");
-            aterm_cli::macos_doctor::claim_initial_setup_rerun_at(&root)
-        }
-
-        fn claim_rerun() -> Result<Option<aterm_cli::macos_doctor::AutomaticSetupClaim>, String> {
-            drop(wait_while(script(), |script| script.claim_hold));
-            Self::claim()
-        }
-
-        fn persist(
-            restart: &mut aterm_cli::macos_doctor::InitialSetupRestart,
-            _: &Plan,
-            _: bool,
-        ) -> aterm_cli::macos_doctor::InitialSetupObserved<Option<u64>> {
-            if script().persist_finds_lock_held {
-                restart.finds_lock_held_for_test();
-            }
-            let mut script = script();
-            script.persists += 1;
-            SCRIPT_MOVED.notify_all();
-            let mut script = wait_while(script, |script| script.persist_hold);
-            let admitted = script.admits.pop_front().flatten();
-            let registers = script.registers;
-            if let Some(revision) = admitted {
-                script.revision = revision;
-            }
-            drop(script);
-            let result = match admitted {
-                Some(revision) => Ok(Some(revision)),
-                None => {
-                    if let Some(revision) = registers {
-                        set_setup_run(Some(revision));
-                    }
-                    Err("the plan could not be saved".into())
-                }
-            };
-            aterm_cli::macos_doctor::InitialSetupObserved {
-                result,
-                observation: None,
-            }
-        }
-
-        fn run(
-            claim: Option<aterm_cli::macos_doctor::AutomaticSetupClaim>,
-            revision: u64,
-            _: Option<aterm_secrets::SecretBytes>,
-            busy: InitialSetupBusy,
-        ) {
-            change(|script| {
-                script.runs.push(revision);
-                script
-                    .widened
-                    .push(SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire));
-            });
-            drop(claim);
-            drop(busy);
-        }
-    }
-
-    impl Drop for TestIo {
-        fn drop(&mut self) {
-            change(|script| {
-                script.hold = false;
-                script.stop_hold = false;
-                script.claim_hold = false;
-                script.persist_hold = false;
-                script.initial_hold = false;
-                script.authorize_hold = false;
-                script.startup_backoff_hold = false;
-                script.startup_answer_hold = false;
-            });
-            let deadline = Instant::now() + HANG;
-            while !(observe_idle()
-                && stop_worker_idle()
-                && !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire))
-                && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            *SETUP_IO.write().unwrap_or_else(PoisonError::into_inner) = SetupIo::LIVE;
-            reset_worker_state();
-        }
-    }
-
-    /// Every group set up but Workspace and Messages & FaceTime, the two whose
-    /// readings use the network and the person's own account state.
-    fn left_as_is() -> Plan {
-        let mut plan = Plan::default();
-        for setting in [
-            Setting::Spotlight,
-            Setting::Secrets,
-            Setting::Repositories,
-            Setting::Messages,
-            Setting::FaceTime,
-        ] {
-            plan.selection.set(setting, false);
-        }
-        plan
-    }
-
-    /// A [`TestIo`] holds [`TEST_IO`] for its whole life, so a second one waits
-    /// for the first before replacing [`SETUP_IO`].
-    #[test]
-    fn a_test_io_holds_its_tests_lock_while_it_lives() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        assert!(
-            TEST_IO.try_lock().is_err(),
-            "a TestIo another test can replace while this one lives"
-        );
-    }
-
-    /// The window recording Full Disk Access granted starts the follow-up that puts back what
-    /// waited for it, once per grant; no other step the window records (handed, declined, nor
-    /// any other access granted) starts one.
-    #[test]
-    fn recording_full_disk_access_granted_starts_the_follow_up_once() {
-        use aterm_types::macos_setup::{Access, AccessOutcome};
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Keep a known plan whose personal/network groups are left as is: the
-        // recovery fact requests Access rows alone and grants no broader read.
-        OBSERVED_ROWS.lock().unwrap().plan = Some(left_as_is());
-        for access in Access::ALL {
-            for outcome in [
-                AccessOutcome::Handed,
-                AccessOutcome::Declined,
-                AccessOutcome::Granted,
-            ] {
-                if (access, outcome) != (Access::FullDiskAccess, AccessOutcome::Granted) {
-                    access_step_recorded(1, access, outcome);
-                }
-            }
-        }
-        assert_eq!(script().follow_ups, 0);
-        access_step_recorded(1, Access::FullDiskAccess, AccessOutcome::Granted);
-        assert_eq!(script().follow_ups, 1);
-        access_step_recorded(1, Access::FullDiskAccess, AccessOutcome::Declined);
-        assert_eq!(script().follow_ups, 1);
-        // The same verified fact without an access revision has the same
-        // read/wake/recovery effects, without inventing a recorded revision.
-        let before = SETUP_WAKES.count();
-        verified_full_disk_access_granted();
-        assert_eq!(script().follow_ups, 2);
-        assert!(SETUP_WAKES.count() > before);
-        wait_until("the Access rows' readings", observe_idle);
-        let reads = script().reads.clone();
-        assert!(!reads.is_empty());
-        assert!(reads.iter().all(|(_, subjects, network)| {
-            *subjects == Access::ALL.map(Subject::Access) && !network
-        }));
-    }
-
-    /// A Restore that left aterm's own permissions with no admitted run to carry them (one that
-    /// let the launch's offer go unanswered) is offered again in this launch; so is one whose
-    /// bring-forward met the profile lock busy, which the startup waits for. A Restore whose run
-    /// carries them starts nothing.
-    #[test]
-    fn a_restore_that_left_no_run_for_the_permissions_is_offered_again_in_this_launch() {
-        use aterm_cli::macos_doctor::BroughtForward;
-        let _globals = globals();
-        let _io = TestIo::install();
-        offer_again_after_restore();
-        assert_eq!(script().startups, 0, "nothing brought forward");
-        change(|script| script.brought_forward = BroughtForward::Run(3));
-        offer_again_after_restore();
-        assert_eq!(script().startups, 1);
-        change(|script| script.brought_forward = BroughtForward::Busy);
-        offer_again_after_restore();
-        assert_eq!(script().startups, 2, "the startup waits for the lock");
-    }
-
-    /// A launch whose setup has finished starts the follow-up with Full Disk Access on a thread
-    /// of its own: its wait for a profile lock another pass holds never holds up what the
-    /// startup does next (the watch for the ALab vault).
-    #[test]
-    fn a_finished_launch_starts_its_follow_up_beside_the_startup() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
-        assert_eq!(script().follow_ups, 1);
-        assert_eq!(script().mends, 1, "the vault subscriber's mend");
-        assert_eq!(
-            script().converge_lanes,
-            1,
-            "the converge pass's window lane"
-        );
-    }
-
-    /// A hidden launch and a page refresh both skip private readers without publishing
-    /// failure-shaped Unknown rows. A subsequent admitted read can still replace the row.
-    #[test]
-    fn skipped_private_checks_preserve_evidence_until_an_admitted_read() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        let plan = Plan::default();
-        let dock = Subject::Setting(Setting::Dock);
-        let ready = Observation {
-            standing: Standing::InPlace,
-            now: Some("verified".into()),
-            ..Observation::unknown(dock)
-        };
-        for forced in [false, true] {
-            for previous in [None, Some(ready.clone())] {
-                {
-                    let mut rows = OBSERVED_ROWS.lock().unwrap();
-                    rows.plan = Some(plan.clone());
-                    rows.rows = previous.clone().into_iter().collect();
-                }
-                change(|script| {
-                    script.readings.push_back(Vec::new());
-                });
-                let choices = OBSERVED_ROWS.lock().unwrap().choices;
-                let request = || ObserveRequest {
-                    plan: Some(plan.clone()),
-                    choices,
-                    subjects: vec![dock],
-                    forced,
-                    pending_repositories: false,
-                };
-                observe_rows(request());
-                assert_eq!(
-                    OBSERVED_ROWS.lock().unwrap().rows,
-                    previous.into_iter().collect::<Vec<_>>()
-                );
-                change(|script| script.readings.push_back(vec![ready.clone()]));
-                observe_rows(request());
-                assert_eq!(OBSERVED_ROWS.lock().unwrap().rows, vec![ready.clone()]);
-                change(|script| {
-                    script.readings.push_back(vec![Observation::unknown(dock)]);
-                });
-                observe_rows(request());
-                assert_eq!(
-                    OBSERVED_ROWS.lock().unwrap().rows,
-                    vec![Observation::unknown(dock)],
-                    "an attempted read still replaces previous evidence"
-                );
-            }
-        }
-    }
-
-    /// A completed run starts no apply pass to refresh its readings. Its launch still reads
-    /// the current checklist without opening the page, replaying settings, or widening the
-    /// scope of an ordinary refresh. An unread answer remains unread after publication.
-    #[test]
-    fn a_finished_launch_reads_its_current_checklist_without_replaying_setup() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        for (plan, unread) in [
-            (Plan::default(), false),
-            (Plan::default(), true),
-            (
-                Plan::from(aterm_types::macos_setup::Selection::none()),
-                false,
-            ),
-        ] {
-            let _io = TestIo::install();
-            let subjects: Vec<_> = Subject::all()
-                .into_iter()
-                .filter(|subject| {
-                    *subject != Subject::Setting(Setting::Repositories)
-                        || plan.selection.contains(Setting::Repositories)
-                })
-                .filter(|subject| {
-                    subject.setting().group() != Group::Accounts
-                        || plan.selection.contains(subject.setting())
-                })
-                .collect();
-            let readings: Vec<_> = subjects
-                .iter()
-                .map(|subject| {
-                    if unread && *subject == Subject::Setting(Setting::Dock) {
-                        Observation::unknown(*subject)
-                    } else {
-                        Observation {
-                            standing: Standing::InPlace,
-                            now: Some("verified current state".into()),
-                            ..Observation::unknown(*subject)
-                        }
-                    }
-                })
-                .collect();
-            {
-                let mut observed = OBSERVED_ROWS.lock().unwrap();
-                observed.plan = Some(plan.clone());
-                observed.rows.clear();
-                observed.vault_url = None;
-            }
-            change(|script| {
-                script.hold = true;
-                script.readings.push_back(readings.clone());
-            });
-
-            run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
-
-            assert!(
-                OBSERVE_QUEUE.lock().unwrap().running,
-                "a finished launch must refresh its checklist without a page or apply pass"
-            );
-            wait_until("the completed launch's reading starts", || {
-                script().reads.len() == 1
-            });
-            {
-                let script = script();
-                assert_eq!(
-                    script.reads,
-                    [(
-                        plan.clone(),
-                        subjects,
-                        plan.selection.contains(Setting::Repositories)
-                    )]
-                );
-                assert!(
-                    script.runs.is_empty(),
-                    "completed settings are not replayed"
-                );
-                assert_eq!(script.persists, 0, "no new plan is admitted");
-                assert_eq!(script.offers, 0);
-                assert!(script.stops.is_empty());
-                assert_eq!(
-                    script.read_checks,
-                    [false],
-                    "a completed launch is no explicit Check"
-                );
-            }
-            release_readings();
-            wait_until("the completed launch's reading is published", observe_idle);
-            let mut status = aterm_gui::SetupStatus::default();
-            add_setup_readings(&mut status);
-            assert_eq!(status.observed, readings);
-        }
-    }
-
-    /// A launch that resumes an admitted run starts the vault subscriber's mend and the converge
-    /// pass's window lane before the run: the run may wait on a person past its done Secrets
-    /// stage for as long as they take, which would leave a subscriber whose program is gone dead
-    /// meanwhile, and the Mac with no window pass for the process's life.
-    /// NEGATIVE CONTROL: a resumed run that starts no lane fails here.
-    #[test]
-    fn a_launch_resuming_a_run_starts_the_vault_mend_and_the_converge_lane() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let claim = StartupClaim::claim().unwrap().unwrap();
-        run_prepared_setup(
-            PreparedSetup::Authorized { claim, revision: 8 },
-            None,
-            StartupSent::default(),
-        );
-        assert_eq!(script().runs, [8]);
-        assert_eq!(script().mends, 1);
-        assert_eq!(
-            script().converge_lanes,
-            1,
-            "the converge pass's window lane"
-        );
-        clear_setup_run(8);
-    }
-
-    /// A launch whose setup runs nothing still starts the converge pass's window lane, since no
-    /// run's end starts it later in this process: one unavailable (an update's successor that
-    /// withholds its offer, a Stop).
-    /// NEGATIVE CONTROL: an unavailable launch that starts no lane fails here.
-    #[test]
-    fn a_launch_with_no_run_still_starts_the_converge_lane() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        run_prepared_setup(PreparedSetup::Unavailable, None, StartupSent::default());
-        assert_eq!(script().converge_lanes, 1, "unavailable");
-        assert!(script().runs.is_empty());
-    }
-
-    /// The converge pass runs as the Secrets stage ends: not as it starts, and not at another
-    /// stage's end.
-    /// NEGATIVE CONTROL: a check that ignores `running` starts a pass as the stage starts too.
-    #[test]
-    fn the_secrets_stage_starts_a_converge_pass_as_it_ends() {
-        use aterm_cli::macos_doctor::StageEvent;
-        use aterm_types::macos_setup::Setting;
-        let event = |settings: &[Setting], running| {
-            ends_secrets_stage(&StageEvent {
-                revision: 1,
-                settings,
-                subjects: &[],
-                running,
-                readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-            })
-        };
-        assert!(event(&[Setting::Secrets], false), "the Secrets stage ended");
-        assert!(!event(&[Setting::Secrets], true), "it started");
-        assert!(
-            !event(&[Setting::Repositories], false),
-            "another stage ended"
-        );
-        assert!(!event(&[], false), "a stage with nothing selected");
-    }
-
-    #[test]
-    fn converge_completion_reads_only_current_pending_repositories_and_requires_fresh_readiness() {
-        use aterm_cli::macos_doctor::InitialSetupAdmission;
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let mut plan = left_as_is();
-        plan.selection.set(Setting::Repositories, true);
-        let admitted = InitialSetupAdmission {
-            plan: plan.clone(),
-            revision: 9,
-            completed: false,
-        };
-        let current = || Ok(Some(admitted.clone()));
-        for (name, before, after, standing, previous, stopped, reads, wakes) in [
-            (
-                "first-ready-row",
-                current(),
-                current(),
-                Standing::InPlace,
-                false,
-                false,
-                1,
-                true,
-            ),
-            (
-                "already-ready-row",
-                current(),
-                current(),
-                Standing::InPlace,
-                true,
-                false,
-                1,
-                true,
-            ),
-            (
-                "still-waiting",
-                current(),
-                current(),
-                Standing::Waiting,
-                false,
-                false,
-                1,
-                false,
-            ),
-            (
-                "no-pending-run",
-                Ok(None),
-                current(),
-                Standing::InPlace,
-                false,
-                false,
-                0,
-                false,
-            ),
-            (
-                "completed-before-read",
-                Ok(Some(InitialSetupAdmission {
-                    completed: true,
-                    ..admitted.clone()
-                })),
-                current(),
-                Standing::InPlace,
-                false,
-                false,
-                0,
-                false,
-            ),
-            (
-                "unread-scope",
-                Err("records held".into()),
-                current(),
-                Standing::InPlace,
-                false,
-                false,
-                0,
-                false,
-            ),
-            (
-                "immediate-stop",
-                current(),
-                current(),
-                Standing::InPlace,
-                false,
-                true,
-                0,
-                false,
-            ),
-            (
-                "retired-during-read",
-                current(),
-                Ok(None),
-                Standing::InPlace,
-                false,
-                false,
-                1,
-                false,
-            ),
-            (
-                "new-revision",
-                current(),
-                Ok(Some(InitialSetupAdmission {
-                    revision: 10,
-                    ..admitted.clone()
-                })),
-                Standing::InPlace,
-                false,
-                false,
-                1,
-                false,
-            ),
-            (
-                "new-source",
-                current(),
-                Ok(Some(InitialSetupAdmission {
-                    plan: left_as_is(),
-                    ..admitted.clone()
-                })),
-                Standing::InPlace,
-                false,
-                false,
-                1,
-                false,
-            ),
-        ] {
-            let _io = TestIo::install();
-            let row = Observation {
-                standing,
-                ..Observation::unknown(Subject::Setting(Setting::Repositories))
-            };
-            {
-                let mut observed = OBSERVED_ROWS.lock().unwrap();
-                observed.plan = Some(plan.clone());
-                observed.vault_url = Some(plan.vault_url.trim().to_owned());
-                observed.rows = if previous {
-                    vec![row.clone()]
-                } else {
-                    Vec::new()
-                };
-            }
-            change(|script| {
-                script.pending_repositories = [before, after].into();
-                script.readings = [vec![row]].into();
-            });
-            if stopped {
-                *SETUP_STOP.lock().unwrap() = Some(admitted.revision);
-            }
-            let seen = SETUP_WAKES.marks();
-            let choices = OBSERVED_ROWS.lock().unwrap().choices;
-            observe_rows(ObserveRequest {
-                plan: None,
-                choices,
-                subjects: vec![Subject::Setting(Setting::Repositories)],
-                forced: false,
-                pending_repositories: true,
-            });
-            assert_eq!(script().reads.len(), reads, "{name}");
-            assert_eq!(SETUP_WAKES.marks().all != seen.all, wakes, "{name}");
-            assert!(!SETUP_WAKES.marks().checked_since(seen), "{name}");
-            assert!(!SETUP_WAKES.marks().refreshed_since(seen), "{name}");
-            assert!(script().read_checks.iter().all(|check| !check), "{name}");
-            assert!(
-                script().runs.is_empty(),
-                "an observation owns no effects: {name}"
-            );
-            if reads > 0 && !wakes && standing == Standing::InPlace {
-                assert!(
-                    OBSERVED_ROWS.lock().unwrap().rows.is_empty(),
-                    "retired reading: {name}"
-                );
-            }
-        }
-        let _io = TestIo::install();
-        change(|script| script.pending_repositories = [current()].into());
-        let choices = {
-            let mut rows = OBSERVED_ROWS.lock().unwrap();
-            rows.rows.clear();
-            rows.plan = Some(left_as_is());
-            rows.choices += 1;
-            rows.choices
-        };
-        let seen = SETUP_WAKES.marks();
-        observe_rows(ObserveRequest {
-            plan: None,
-            choices: choices - 1,
-            subjects: vec![Subject::Setting(Setting::Repositories)],
-            forced: false,
-            pending_repositories: true,
-        });
-        assert!(
-            script().reads.is_empty(),
-            "a newer choice retires the queued pending scope"
-        );
-        assert_eq!(SETUP_WAKES.marks(), seen);
-    }
-
-    #[test]
-    fn a_choice_retired_after_the_completion_guard_keeps_the_pending_only_requeue() {
-        use aterm_cli::macos_doctor::InitialSetupAdmission;
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        let mut plan = left_as_is();
-        plan.selection.set(Setting::Repositories, true);
-        let admitted = InitialSetupAdmission {
-            plan: plan.clone(),
-            revision: 9,
-            completed: false,
-        };
-        change(|script| {
-            script.pending_repositories = [Ok(Some(admitted.clone())), Ok(Some(admitted))].into();
-            script.retire_repository_choice_after_guard = true;
-            script.readings = [vec![Observation {
-                standing: Standing::InPlace,
-                ..Observation::unknown(Subject::Setting(Setting::Repositories))
-            }]]
-            .into();
-        });
-        let choices = {
-            let mut rows = OBSERVED_ROWS.lock().unwrap();
-            rows.plan = Some(plan);
-            rows.rows.clear();
-            rows.choices
-        };
-        let seen = SETUP_WAKES.marks();
-        observe_rows(ObserveRequest {
-            plan: None,
-            choices,
-            subjects: vec![Subject::Setting(Setting::Repositories)],
-            forced: false,
-            pending_repositories: true,
-        });
-        wait_until("the retired completion requeue ends", observe_idle);
-        assert_eq!(
-            script().reads.len(),
-            1,
-            "the next request must still require a current pending scope"
-        );
-        assert!(OBSERVED_ROWS.lock().unwrap().rows.is_empty());
-        assert_eq!(SETUP_WAKES.marks(), seen);
-        assert_eq!(script().read_checks, [false]);
-    }
-
-    #[test]
-    fn pending_repository_refresh_cannot_widen_or_retire_an_ordinary_observation() {
-        let mut queue = ObserveQueue {
-            running: false,
-            active: Vec::new(),
-            current: None,
-            next: None,
-            check: None,
-            retry: None,
-        };
-        let pending = || ObserveRequest {
-            plan: None,
-            choices: 7,
-            subjects: vec![Subject::Setting(Setting::Repositories)],
-            forced: false,
-            pending_repositories: true,
-        };
-        queue.enqueue(pending());
-        queue.enqueue(ObserveRequest {
-            subjects: vec![Subject::Setting(Setting::Dock)],
-            pending_repositories: false,
-            ..pending()
-        });
-        let ordinary = queue.next.take().unwrap();
-        assert!(!ordinary.pending_repositories && !ordinary.forced);
-        assert!(ordinary.subjects.contains(&Subject::Setting(Setting::Dock)));
-        queue.enqueue(ordinary);
-        queue.enqueue(pending());
-        assert!(!queue.next.as_ref().unwrap().pending_repositories);
-        queue.enqueue(ObserveRequest {
-            forced: true,
-            pending_repositories: false,
-            ..pending()
-        });
-        let check = queue.check.take().unwrap();
-        assert!(check.forced && !check.pending_repositories);
-        assert!(check.subjects.contains(&Subject::Setting(Setting::Dock)));
-    }
-
-    /// Check again looks for the ALab vault before it reads the Secrets vault row, so the row
-    /// reads what the vault answers now; a reading nobody forced, or a Check of other rows, never
-    /// looks.
-    #[test]
-    fn check_again_looks_for_the_vault_before_it_reads_the_secrets_row() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let secrets = vec![Subject::Setting(Setting::Secrets)];
-        for (forced, subjects, looks) in [
-            (false, secrets.clone(), 0),
-            (true, vec![Subject::Setting(Setting::Dock)], 0),
-            (true, secrets, 1),
-        ] {
-            let choices = OBSERVED_ROWS.lock().unwrap().choices;
-            observe_rows(ObserveRequest {
-                plan: Some(left_as_is()),
-                choices,
-                subjects,
-                forced,
-                pending_repositories: false,
-            });
-            assert_eq!(std::mem::take(&mut script().vault_looks), looks, "{forced}");
-            assert_eq!(std::mem::take(&mut script().read_checks), [forced]);
-        }
-    }
-
-    #[test]
-    fn vault_sync_guard_preserves_a_local_late_stop_and_refuses_unreadable_state() {
-        use aterm_cli::macos_doctor::{
-            InitialSetupAdmissionStopTest, with_initial_setup_vault_sync_at,
-        };
-        use std::cell::Cell;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut setup = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
-        let revision = setup.complete_vault_setup().unwrap();
-        change(|script| script.stop_root = Some(root.path().to_owned()));
-        register_admitted_run(revision, send_admission(), false, None);
-        with_setup_run(revision, || {});
-        let effects = Cell::new(0);
-        let mend = || {
-            while_vault_sync_kept_with(&mut || effects.set(effects.get() + 1), |work| {
-                with_initial_setup_vault_sync_at(root.path(), work)
-            })
-        };
-        assert!(mend());
-        assert_eq!(effects.get(), 1);
-
-        assert!(stop_initial_setup());
-        wait_until("the completed run's late Stop is saved", stop_worker_idle);
-        assert!(setup.snapshot().unwrap().finished);
-        assert_eq!(
-            with_initial_setup_vault_sync_at(root.path(), |_| true).unwrap(),
-            Some(true),
-            "the completed backend run spends the Stop; this process still holds it locally"
-        );
-        assert!(!mend());
-        assert_eq!(effects.get(), 1, "no mend effect crosses the local Stop");
-
-        let sent = send_admission();
-        let next = setup.choose().unwrap();
-        assert!(next > revision);
-        register_admitted_run(next, sent, false, None);
-        with_setup_run(next, || {});
-        assert!(mend(), "a new accepted choice admits its own effects");
-        assert_eq!(effects.get(), 2);
-
-        let path = root.path().join("initial-setup.json");
-        let saved = std::fs::read(&path).unwrap();
-        std::fs::write(&path, b"{\"profile\":").unwrap();
-        assert!(!mend(), "an unreadable run certifies no mend authority");
-        assert_eq!(effects.get(), 2);
-        std::fs::write(&path, saved).unwrap();
-        assert!(mend(), "a repaired record is read again on the next turn");
-        assert_eq!(effects.get(), 3);
-        assert!(script().runs.is_empty(), "the guard starts no setup stage");
-    }
-
-    #[test]
-    fn stop_hands_its_save_to_a_worker_and_a_quit_waits_for_it() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        // No run is registered here: nothing stops, and nothing is saved.
-        assert!(!stop_initial_setup());
-        assert!(settle_setup_stop(Duration::ZERO));
-        assert!(script().stop_attempts.is_empty());
-        // Run 41 is going, and the disk is slow. Stop returns while its save
-        // waits: it never runs on the thread that asked, the UI's.
-        change(|script| script.stop_hold = true);
-        set_setup_run(Some(41));
-        assert!(stop_initial_setup());
-        // The pass in this process stops at its next boundary from memory.
-        assert!(setup_stop_requested(41));
-        wait_until("the Stop's worker begins its save", || {
-            !script().stop_attempts.is_empty()
-        });
-        let (revision, thread) = script().stop_attempts[0];
-        assert_eq!(revision, 41);
-        assert_ne!(thread, std::thread::current().id());
-        // Stop pressed again: the save in flight is not begun again.
-        assert!(stop_initial_setup());
-        // A quit waits for the save.
-        assert!(
-            !settle_setup_stop(Duration::ZERO),
-            "the save is still going"
-        );
-        let quit = std::thread::spawn(|| settle_setup_stop(HANG));
-        change(|script| script.stop_hold = false);
-        assert!(quit.join().unwrap());
-        assert_eq!(script().stops, [41]);
-        // A saved Stop is saved once per run.
-        assert!(stop_initial_setup());
-        assert!(settle_setup_stop(HANG));
-        assert_eq!(script().stop_attempts.len(), 1);
-    }
-
-    #[test]
-    fn a_stop_whose_save_failed_is_saved_on_the_next_ask_or_at_quit() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| script.stop_failures = 1);
-        set_setup_run(Some(41));
-        assert!(stop_initial_setup());
-        wait_until("the failed save ends", stop_worker_idle);
-        assert_eq!(script().stop_attempts.len(), 1);
-        assert!(script().stops.is_empty());
-        // Stop pressed again: the save is made again.
-        assert!(stop_initial_setup());
-        wait_until("the second save ends", stop_worker_idle);
-        assert_eq!(script().stops, [41]);
-        assert_eq!(script().stop_attempts.len(), 2);
-        // A save that fails just before a quit is made again by the quit.
-        change(|script| script.stop_failures = 1);
-        set_setup_run(Some(42));
-        assert!(stop_initial_setup());
-        wait_until("the failed save ends", stop_worker_idle);
-        assert_eq!(script().stops, [41]);
-        assert!(settle_setup_stop(HANG));
-        assert_eq!(script().stops, [41, 42]);
-    }
-
-    #[test]
-    fn a_choice_made_while_a_replacing_one_is_admitted_stops_the_run_given_back() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Run 7 is parked. The person's first choice takes the free slot and
-        // drops run 7's registration; its admission is slow, and refuses it.
-        set_setup_run(Some(7));
-        change(|script| {
-            script.persist_hold = true;
-            script.admits = [None, Some(9)].into();
-        });
-        let (receipt, first) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        wait_until("the first choice's admission begins", || {
-            script().persists == 1
-        });
-        // The person chooses again meanwhile: no run is registered, so the
-        // second choice stops nothing yet, and waits for the slot.
-        let (receipt, second) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(Plan::default(), false, None, receipt));
-        assert!(!setup_stop_requested(7));
-        // The first is refused: run 7 is given back, stopped before the slot
-        // is free for it to take a step, and the second choice runs next.
-        change(|script| script.persist_hold = false);
-        assert_eq!(first.recv_timeout(HANG), Ok(false));
-        assert_eq!(second.recv_timeout(HANG), Ok(true));
-        assert!(setup_stop_requested(7));
-        assert_eq!(setup_run(), Some(9));
-        // The admitted choice runs once its receipt is accepted.
-        wait_until("run 9 starts", || !script().runs.is_empty());
-        assert_eq!(script().runs, [9]);
-        wait_until("run 7's Stop is saved", stop_worker_idle);
-        assert_eq!(script().stops, [7]);
-    }
-
-    /// This launch's startup as `prepare_setup` drives it, on the live claim
-    /// ([`StartupClaim`]), the live count of choices waiting for it
-    /// ([`choice_awaits_claim`]) and the live numbering of what it sends
-    /// ([`StartupSent`]); its reads and writes are [`TestIo`]'s script.
-    struct Startup {
-        /// Its offer waits for the page's answer until it is withdrawn
-        /// ([`startup_offer_withdrawn`]); otherwise nobody answers it.
-        awaits_answer: bool,
-        /// The page's answer, when the page answers at once.
-        answer: Option<Plan>,
-        sent: StartupSent,
-    }
-
-    impl SetupStartup for Startup {
-        type Claim = StartupClaim;
-
-        fn send(&mut self) {
-            self.sent.send();
-        }
-        fn answered(&mut self) {
-            self.sent.answered();
-        }
-        fn bind_authorization(&mut self) -> Result<u64, String> {
-            Ok(1)
-        }
-        fn revision(&mut self) -> Result<u64, String> {
-            Ok(script().revision)
-        }
-        fn claim(&mut self) -> Result<Option<StartupClaim>, String> {
-            StartupClaim::claim()
-        }
-        fn finished(&mut self) -> Result<bool, String> {
-            Ok(false)
-        }
-        fn choice_awaits_claim(&mut self) -> bool {
-            choice_awaits_claim()
-        }
-        fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
-            Ok(None)
-        }
-        fn initial(&mut self) -> Result<Plan, String> {
-            change(|script| script.startup_reading = true);
-            let mut script = wait_while(script(), |script| script.initial_hold);
-            script.startup_reading = false;
-            Ok(Plan::default())
-        }
-        fn offer(&mut self, initial: Plan) -> aterm_gui::WorkstationSetupDecision {
-            change(|script| script.offers += 1);
-            if let Some(answer) = self.answer.take() {
-                if script().startup_answer_hold {
-                    return aterm_gui::drive_initial_setup_answer_for_test(
-                        initial,
-                        self.sent.handoff(),
-                        |deliver| {
-                            assert!(deliver(
-                                aterm_gui::WorkstationSetupDecision::Begin(answer).into()
-                            ));
-                            change(|script| script.startup_answer_delivered = true);
-                            drop(wait_while(script(), |script| script.startup_answer_hold));
-                        },
-                    )
-                    .decision;
-                }
-                return aterm_gui::WorkstationSetupDecision::Begin(answer);
-            }
-            if self.awaits_answer {
-                wait_until("the offer is withdrawn for the choice", || {
-                    startup_offer_withdrawn(|| false)
-                });
-            }
-            aterm_gui::WorkstationSetupDecision::Unavailable
-        }
-        fn authorize(&mut self, _: &Plan) -> Result<Option<u64>, String> {
-            change(|script| script.authorizing += 1);
-            let mut script = wait_while(script(), |script| script.authorize_hold);
-            let written = script
-                .authorizations
-                .pop_front()
-                .expect("a write of the answer was scripted");
-            if let Ok(Some(revision)) = written {
-                script.revision = revision;
-            }
-            written
-        }
-        fn authorization_pending(&self) -> bool {
-            true
-        }
-        fn stopped(&self) -> bool {
-            stop_covers(self.sent.sent)
-        }
-        fn wait_holding_claim(&mut self) -> bool {
-            change(|script| script.retry_waits += 1);
-            // Twice the hang detector: a choice that had to wait it out
-            // fails the test before the wait ends.
-            let mut seen = SETUP_WAKES.count();
-            wait_before_admission_retry(self.sent.sent, &mut seen, HANG * 2, |seen, limit| {
-                if !choice_awaits_claim() {
-                    SETUP_WAKES.back_off(seen, limit);
-                }
-            });
-            choice_awaits_claim()
-        }
-        fn backoff(&mut self) {
-            drop(wait_while(script(), |script| script.startup_backoff_hold));
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        fn report_failure(&mut self, why: &str) {
-            change(|script| script.startup_failures.push(why.to_owned()));
-        }
-    }
-
-    /// The startup, on its own thread: what it prepared, and, as the window's
-    /// worker does next, that run, started ([`run_prepared_setup`]).
-    fn startup_with(
-        awaits_answer: bool,
-        answer: Option<Plan>,
-    ) -> std::thread::JoinHandle<&'static str> {
-        std::thread::spawn(move || {
-            let mut host = Startup {
-                awaits_answer,
-                answer,
-                sent: StartupSent::default(),
-            };
-            let prepared = prepare_setup(&mut host);
-            let outcome = match &prepared {
-                Ok(PreparedSetup::Authorized { .. }) => "authorized",
-                Ok(PreparedSetup::Finished) => "finished",
-                Ok(PreparedSetup::Unavailable) => "unavailable",
-                Err(_) => "failed",
-            };
-            if let Ok(prepared) = prepared {
-                run_prepared_setup(prepared, None, host.sent);
-            }
-            outcome
-        })
-    }
-
-    fn startup(awaits_answer: bool) -> std::thread::JoinHandle<&'static str> {
-        startup_with(awaits_answer, None)
-    }
-
-    #[test]
-    fn a_choice_made_while_the_startup_reads_the_plan_waits_for_its_claim_and_no_offer_shows() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| {
-            script.initial_hold = true;
-            script.claim_hold = true;
-            script.admits = [Some(9)].into();
-        });
-        let startup = startup(false);
-        wait_until("the startup reads the plan in force", || {
-            script().startup_reading
-        });
-        assert!(startup_holds_claim());
-        // The person chooses meanwhile. The choice waits for the startup's
-        // claim, counted from the moment it is made, before its worker asks.
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert!(choice_awaits_claim());
-        // The startup lets its claim go rather than offer over the choice;
-        // the choice is admitted, and the startup's run is superseded.
-        change(|script| {
-            script.initial_hold = false;
-            script.claim_hold = false;
-        });
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        assert_eq!(startup.join().unwrap(), "unavailable");
-        assert_eq!(script().offers, 0, "no offer is shown over the choice");
-        // The admitted choice runs once its receipt is accepted.
-        wait_until("run 9 starts", || !script().runs.is_empty());
-        assert_eq!(script().runs, [9]);
-        assert!(!choice_awaits_claim() && !startup_holds_claim());
-    }
-
-    #[test]
-    fn an_offer_waiting_for_its_answer_is_withdrawn_for_a_choice_made_meanwhile() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| script.admits = [Some(9)].into());
-        let startup = startup(true);
-        wait_until("the startup offers its plan", || script().offers == 1);
-        // The offer has not reached the page yet when the person chooses.
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        assert_eq!(startup.join().unwrap(), "unavailable");
-        assert_eq!(script().offers, 1, "the offer is not shown again");
-        // The admitted choice runs once its receipt is accepted.
-        wait_until("run 9 starts", || !script().runs.is_empty());
-        assert_eq!(script().runs, [9]);
-        assert!(script().startup_failures.is_empty());
-    }
-
-    /// A choice waits for at most one read or one write of the startup's (design §3.3): one made
-    /// while the startup waits to write its failed answer again gets the claim at once.
-    #[test]
-    fn a_choice_made_while_the_startup_waits_to_write_its_answer_again_gets_the_claim_at_once() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| {
-            script.authorizations = [
-                Err("another doctor profile pass is running".into()),
-                Ok(None),
-            ]
-            .into();
-            script.startup_backoff_hold = true;
-            script.admits = [Some(9)].into();
-        });
-        let startup = startup_with(false, Some(Plan::default()));
-        wait_until("the startup waits to write its answer again", || {
-            script().retry_waits == 1
-        });
-        assert!(startup_holds_claim());
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        // Admitted while the startup's wait (a minute) has not run out.
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        assert_eq!(script().authorizing, 1, "the answer was not written first");
-        wait_until("run 9 starts", || !script().runs.is_empty());
-        // The startup's wait ends: it takes the claim again, and finds its
-        // answer retired by the choice's admission.
-        change(|script| script.startup_backoff_hold = false);
-        assert_eq!(startup.join().unwrap(), "unavailable");
-        assert_eq!(script().authorizing, 2);
-        assert_eq!(script().runs, [9]);
-        assert_eq!(
-            script().startup_failures,
-            ["another doctor profile pass is running"]
-        );
-    }
-
-    /// A Stop pressed while a choice that replaces a parked run is being admitted holds for the
-    /// run the choice admits, or for the run a refusal gives back; a quit meanwhile waits until
-    /// that Stop is saved.
-    #[test]
-    fn a_stop_pressed_while_a_choice_is_admitted_holds_for_its_run_and_a_quit_waits_for_it() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        for admitted in [Some(9), None] {
-            wait_until("the slot is free", || {
-                !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
-            });
-            reset_worker_state();
-            set_setup_run(Some(7));
-            change(|script| {
-                script.persist_hold = true;
-                script.admits = [admitted].into();
-                script.persists = 0;
-                script.stop_attempts.clear();
-                script.stops.clear();
-                script.runs.clear();
-            });
-            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-            assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-            wait_until("the choice's admission begins", || script().persists == 1);
-            // Stop: the choice took run 7's registration, so nothing stops now.
-            assert!(!stop_initial_setup());
-            assert!(script().stop_attempts.is_empty());
-            // A quit now waits for what the Stop owes.
-            assert!(
-                !settle_setup_stop(Duration::ZERO),
-                "a quit waits for the admission the Stop covers"
-            );
-            let quit = std::thread::spawn(|| settle_setup_stop(HANG));
-            change(|script| script.persist_hold = false);
-            assert_eq!(answer.recv_timeout(HANG), Ok(admitted.is_some()));
-            assert!(quit.join().unwrap(), "the quit saw the Stop saved");
-            let stopped = admitted.unwrap_or(7);
-            assert_eq!(setup_run(), Some(stopped));
-            assert!(setup_stop_requested(stopped));
-            assert_eq!(script().stops, [stopped]);
-            if admitted.is_some() {
-                wait_until("run 9 starts, to stop at its first boundary", || {
-                    !script().runs.is_empty()
-                });
-                assert_eq!(script().runs, [9]);
-            }
-        }
-    }
-
-    /// The same while a pass runs: the choice stops run 7 and waits for the slot; its own run
-    /// starts stopped as it registers, and a quit before then waits for its Stop.
-    #[test]
-    fn a_stop_pressed_while_a_choice_waits_for_the_pass_ahead_holds_for_its_run() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        set_setup_run(Some(7));
-        assert!(take_initial_setup_slot_now(), "run 7's pass holds the slot");
-        change(|script| script.admits = [Some(9)].into());
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert!(setup_stop_requested(7), "the choice stops the pass ahead");
-        assert!(stop_initial_setup(), "Stop: run 7 is the run going");
-        // The Stop's worker saves the newest Stop handed to it: run 9's,
-        // handed before it takes run 7's, would stand for both.
-        wait_until("run 7's Stop is saved", || script().stops == [7]);
-        assert!(!settle_setup_stop(Duration::ZERO));
-        let quit = std::thread::spawn(|| settle_setup_stop(HANG));
-        // Run 7's stage ends: it lets the slot go.
-        clear_setup_run(7);
-        INITIAL_SETUP_BUSY.store(false, std::sync::atomic::Ordering::Release);
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        assert!(quit.join().unwrap());
-        assert!(setup_stop_requested(9), "run 9 starts stopped");
-        assert_eq!(script().stops, [7, 9]);
-    }
-
-    /// Stop pressed while the startup writes the page's answer: its run starts stopped as it
-    /// registers, and a quit made meanwhile waits for that.
-    #[test]
-    fn a_stop_pressed_while_the_startups_answer_is_admitted_holds_for_its_run() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| {
-            script.authorizations = [Ok(Some(8))].into();
-            script.authorize_hold = true;
-        });
-        let startup = startup_with(false, Some(Plan::default()));
-        wait_until("the startup writes the page's answer", || {
-            script().authorizing == 1
-        });
-        assert!(!stop_initial_setup(), "no run is registered yet");
-        assert!(!settle_setup_stop(Duration::ZERO));
-        let quit = std::thread::spawn(|| settle_setup_stop(HANG));
-        change(|script| script.authorize_hold = false);
-        assert!(quit.join().unwrap());
-        assert_eq!(startup.join().unwrap(), "authorized");
-        assert!(setup_stop_requested(8), "run 8 starts stopped");
-        assert_eq!(script().stops, [8]);
-        assert_eq!(script().runs, [8]);
-    }
-
-    /// A Stop that holds the run a watch widened, asked for the plan it widened or pressed since
-    /// the watch looked, marks that run for its pass to put back the plan it widened (System
-    /// State design §3.5). A run a later choice overtook, a choice's own run, and a widened run
-    /// nobody stopped are not marked.
-    #[test]
-    fn only_a_widened_run_a_stop_holds_puts_back_its_plan() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let held = |stop_before: bool, stop_after: bool, overtaken: bool, widened: bool| {
-            wait_until("no Stop is owed", stop_worker_idle);
-            reset_worker_state();
-            set_setup_run(Some(7));
-            if stop_before {
-                assert!(stop_initial_setup());
-            }
-            let look = send_admission();
-            if stop_after {
-                assert!(stop_initial_setup());
-            }
-            let held = register_admitted_run(8, look, overtaken, widened.then_some(7));
-            assert_eq!(
-                setup_stop_requested(8),
-                stop_before && widened || stop_after || overtaken,
-                "the run is stopped as it registers"
-            );
-            held
-        };
-        assert!(
-            held(true, false, false, true),
-            "a Stop of the plan it widened"
-        );
-        assert!(
-            held(false, true, false, true),
-            "a Stop since the watch looked"
-        );
-        assert!(
-            !held(false, true, true, true),
-            "a later choice replaces the plan"
-        );
-        assert!(!held(false, true, false, false), "a choice's own run");
-        assert!(!held(false, false, false, true), "nobody stopped it");
-        wait_until("no Stop is owed", stop_worker_idle);
-        reset_worker_state();
-    }
-
-    /// A run aterm widened says so on the page while it goes (System State design §3.5), and no
-    /// longer once its worker has ended: a later worker the slot keeps busy, which the page
-    /// counts as a run (a put-back once Full Disk Access is granted), never shows the note
-    /// again.
-    #[test]
-    fn the_widened_note_goes_when_its_run_ends() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let claim = StartupClaim::claim().unwrap().unwrap();
-        let sent = StartupSent {
-            widened_from: Some(7),
-            ..StartupSent::default()
-        };
-        run_prepared_setup(PreparedSetup::Authorized { claim, revision: 8 }, None, sent);
-        assert_eq!(script().runs, [8]);
-        assert_eq!(script().widened, [8], "said while the run goes");
-        assert_eq!(
-            SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "the run ended"
-        );
-        assert!(!initial_setup_status().widened);
-        clear_setup_run(8);
-    }
-
-    /// A saved setup aterm could not read just now is one calm line, no failure (System State
-    /// design §3.6): aterm reads it again by itself.
-    #[test]
-    fn a_saved_setup_unread_just_now_is_one_calm_line() {
-        let status = initial_setup_status_with(
-            Err(InitialSetupSnapshotError::Read(
-                "automatic-plan.json: Permission denied".into(),
-            )),
-            false,
-            &InitialSetupRows::default(),
-        );
-        assert!(status.plan.is_none());
-        assert_eq!(
-            status.rows,
-            [aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)]
-        );
-        assert!(status.rows.iter().all(|row| row.status != "failed"));
-    }
-
-    /// A newer aterm's saved setup is one calm line that says so, no failure, and no read again
-    /// by itself: this aterm leaves that setup as it is.
-    #[test]
-    fn a_newer_aterms_saved_setup_is_one_calm_line_read_no_more() {
-        let status = initial_setup_status_with(
-            Err(InitialSetupSnapshotError::Newer),
-            false,
-            &InitialSetupRows::default(),
-        );
-        assert!(status.plan.is_none() && status.permissions.is_none());
-        assert_eq!(
-            status.rows,
-            [aterm_gui::calm_setup_row(aterm_gui::NEWER_SETUP_NOTE)]
-        );
-        assert!(aterm_cli::macos_doctor::setup_is_newer(
-            &InitialSetupSnapshotError::Newer.to_string()
-        ));
-    }
-
-    /// A Join refused because aterm cannot read this Mac's vault settings is one calm line that
-    /// says so, never a failure with Set up now: pressing it again meets the same settings. Any
-    /// other setup error, and a Check's, is still the failure it was.
-    #[test]
-    fn a_join_refused_for_unread_vault_settings_is_one_calm_line() {
-        let refused = "cannot read which vault this Mac is in: source.toml: Permission denied";
-        assert_eq!(
-            setup_error_row(refused, false),
-            aterm_gui::calm_setup_row(aterm_gui::VAULT_UNREAD_NOTE)
-        );
-        assert_eq!(setup_error_row(refused, true).status, "failed");
-        let other = setup_error_row("the plan could not be saved", false);
-        assert_eq!(
-            (other.name.as_str(), other.status.as_str()),
-            (aterm_gui::SETUP_ROW, "failed")
-        );
-    }
-
-    /// The launch's Join that aterm admitted without the Join is said in one calm line while
-    /// the Secrets row still reads that aterm cannot read this Mac's vault settings, and only
-    /// then: once they read, the row says how the vault stands, and the typed vault is the
-    /// person's to Join.
-    #[test]
-    fn a_startup_join_left_unjoined_is_said_while_the_vault_settings_stay_unread() {
-        use aterm_types::macos_setup::{Observation, Setting, Subject};
-        let secrets = |note: Option<&str>| Observation {
-            note: note.map(str::to_owned),
-            ..Observation::unknown(Subject::Setting(Setting::Secrets))
-        };
-        let status = |observed: Vec<Observation>| aterm_gui::SetupStatus {
-            plan: Some(Plan::default()),
-            observed,
-            ..aterm_gui::SetupStatus::default()
-        };
-        let unread = aterm_cli::macos_doctor::VAULT_SETTINGS_UNREAD;
-        let mut said = status(vec![secrets(Some(unread))]);
-        add_vault_not_joined(&mut said, true);
-        assert_eq!(
-            said.rows,
-            [aterm_gui::calm_setup_row(aterm_gui::VAULT_NOT_JOINED_NOTE)]
-        );
-        for (not_joined, observed) in [
-            (false, vec![secrets(Some(unread))]),
-            (true, vec![secrets(None)]),
-            (true, Vec::new()),
-        ] {
-            let mut quiet = status(observed);
-            add_vault_not_joined(&mut quiet, not_joined);
-            assert!(quiet.rows.is_empty());
-        }
-    }
-
-    /// A step of the launch's setup that failed is tried again by itself: the page says so in
-    /// one calm line with every failure kept off the menu line and the tab (System State design
-    /// §3.5, §3.6); ten minutes on, once, the exceptions digest says setup has not started, and
-    /// the entry goes once the startup goes on.
-    #[test]
-    fn a_startup_that_tries_again_is_calm_and_told_to_the_digest_ten_minutes_on() {
-        let start = Instant::now();
-        let mut retry = StartupRetry::NONE;
-        assert!(!retry.failed(start));
-        assert!(retry.retrying());
-        assert!(!retry.failed(start + Duration::from_secs(9 * 60)));
-        assert!(retry.failed(start + STARTUP_STUCK_AFTER));
-        assert!(!retry.failed(start + STARTUP_STUCK_AFTER * 2), "once");
-        assert!(retry.went_on(), "its entry goes");
-        assert_eq!(retry, StartupRetry::NONE);
-        assert!(!retry.went_on());
-        assert!(
-            !retry.failed(start + STARTUP_STUCK_AFTER * 3),
-            "counted anew"
-        );
-
-        let mut status = aterm_gui::SetupStatus {
-            plan: Some(Plan::default()),
-            ..aterm_gui::SetupStatus::default()
-        };
-        add_startup_retry(&mut status, false);
-        assert!(!status.retrying && status.rows.is_empty());
-        add_startup_retry(&mut status, true);
-        assert!(status.retrying);
-        assert_eq!(
-            status.rows,
-            [aterm_gui::calm_setup_row(aterm_gui::STARTUP_RETRY_NOTE)]
-        );
-        // A saved setup it cannot read says so in its own line alone.
-        let mut unread = initial_setup_status_with(
-            Err(InitialSetupSnapshotError::Read("unread".into())),
-            false,
-            &InitialSetupRows::default(),
-        );
-        add_startup_retry(&mut unread, true);
-        assert_eq!(
-            unread.rows,
-            [aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)]
-        );
-    }
-
-    /// A Restore that failed as a whole says why in the page's words: one that cannot read the
-    /// settings aterm saved before setup changed them names where to learn why, since pressing
-    /// it again reads the same record.
-    #[test]
-    fn a_whole_restore_failure_says_why_in_the_pages_words() {
-        let unread = restore_failed_row(&format!(
-            "{}: backup: expected value",
-            aterm_cli::macos_doctor::BACKUP_UNREAD
-        ));
-        assert_eq!(unread.detail, aterm_gui::RESTORE_BACKUP_UNREAD_NOTE);
-        assert_eq!(unread.status, "failed");
-        let other = restore_failed_row("state.json: No space left on device");
-        assert_eq!(other.detail, aterm_gui::RESTORE_FAILED_NOTE);
-        assert_eq!(unread.name, other.name);
-    }
-
-    #[test]
-    fn a_startup_answer_handoff_keeps_its_stop_owed_before_the_worker_reads_the_answer() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        change(|script| {
-            script.authorizations = [Ok(Some(8))].into();
-            script.startup_answer_hold = true;
-        });
-        let startup = startup_with(false, Some(Plan::default()));
-        wait_until("the request delivers the page's answer", || {
-            script().startup_answer_delivered
-        });
-        assert!(!stop_initial_setup(), "no run is registered yet");
-        let settled_before_return = settle_setup_stop(Duration::ZERO);
-        let quit = std::thread::spawn(|| settle_setup_stop(HANG));
-        change(|script| script.startup_answer_hold = false);
-        assert_eq!(startup.join().unwrap(), "authorized");
-        assert!(quit.join().unwrap());
-        wait_until("run 8's Stop is saved", || script().stops == [8]);
-        assert!(setup_stop_requested(8));
-        assert_eq!(script().runs, [8]);
-        assert!(
-            !settled_before_return,
-            "the quit must wait for a delivered answer before the worker reads it"
-        );
-    }
-
-    #[test]
-    fn an_unanswered_startup_answer_handoff_leaves_nothing_for_a_quit_to_wait_for() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let mut sent = StartupSent::default();
-        sent.send();
-        let answer = aterm_gui::drive_initial_setup_answer_for_test(
-            Plan::default(),
-            sent.handoff(),
-            |deliver| {
-                assert!(!stop_initial_setup());
-                assert!(settle_setup_stop(Duration::ZERO));
-                assert!(deliver(
-                    aterm_gui::WorkstationSetupDecision::Unavailable.into()
-                ));
-            },
-        );
-        assert_eq!(
-            answer.decision,
-            aterm_gui::WorkstationSetupDecision::Unavailable
-        );
-        assert!(settle_setup_stop(Duration::ZERO));
-        assert!(script().stop_attempts.is_empty());
-    }
-
-    /// A Stop covers only what was sent before it: pressed before the startup offers or before a
-    /// choice is made, it stops neither's run, and a quit owes nothing for them.
-    #[test]
-    fn a_stop_pressed_before_a_plan_is_sent_never_stops_its_run() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        assert!(!stop_initial_setup());
-        change(|script| script.authorizations = [Ok(Some(8))].into());
-        assert_eq!(
-            startup_with(false, Some(Plan::default())).join().unwrap(),
-            "authorized"
-        );
-        assert_eq!(script().runs, [8]);
-        assert!(!setup_stop_requested(8));
-        clear_setup_run(8);
-        assert!(stop_initial_setup());
-        wait_until("completed run 8's Stop is saved", stop_worker_idle);
-        assert_eq!(script().stops, [8]);
-        change(|script| script.admits = [Some(9)].into());
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        wait_until("run 9 starts", || script().runs.len() == 2);
-        assert!(!setup_stop_requested(9));
-        assert!(settle_setup_stop(Duration::ZERO), "nothing is owed");
-        assert_eq!(script().stops, [8], "the earlier Stop never names run 9");
-    }
-
-    /// While the GitHub repositories need a person, System State's look for a renewed token
-    /// reads that row alone, and only once the vault's mark moved since the row was last read:
-    /// an unchanged mark, or one that cannot be read, reads nothing and asks nothing of GitHub
-    /// (design §3.6).
-    #[test]
-    fn a_look_for_a_renewed_token_reads_github_alone_once_its_mark_moved() {
-        use aterm_secrets::client::MaterializationMark;
-        let _globals = globals();
-        let _io = TestIo::install();
-        let mark =
-            |byte: u8| MaterializationMark::from_cache_key(&format!("{byte:02x}").repeat(32));
-        script().vault_mark = mark(1);
-        let plan = Plan::default();
-        // The page's reading of every row reads GitHub too, and keeps the vault's mark.
-        assert!(observe_initial_setup(plan.clone()));
-        wait_until("the page's reading ends", || {
-            script().reads.len() == 1 && observe_idle()
-        });
-        assert!(
-            !read_github_again_if_its_token_moved(plan.clone()),
-            "an unchanged mark"
-        );
-        script().vault_mark = None;
-        assert!(
-            !read_github_again_if_its_token_moved(plan.clone()),
-            "a mark that cannot be read"
-        );
-        // A token renewed in the vault reached this Mac.
-        script().vault_mark = mark(2);
-        assert!(read_github_again_if_its_token_moved(plan.clone()));
-        wait_until("the row's reading ends", || {
-            script().reads.len() == 2 && observe_idle()
-        });
-        assert!(
-            !read_github_again_if_its_token_moved(plan.clone()),
-            "once per move"
-        );
-        let reads = std::mem::take(&mut script().reads);
-        assert_eq!(reads.len(), 2, "{reads:?}");
-        assert_eq!(
-            reads[1],
-            (plan, vec![Subject::Setting(Setting::Repositories)], true),
-            "GitHub repositories alone, over the network"
-        );
-    }
-
-    #[test]
-    fn a_token_look_retries_a_refused_observation_start() {
-        use aterm_secrets::client::MaterializationMark;
-        let _globals = globals();
-        let _io = TestIo::install();
-        let _queue = ObserverDispatchReset;
-        let mark =
-            |byte: u8| MaterializationMark::from_cache_key(&format!("{byte:02x}").repeat(32));
-        script().vault_mark = mark(1);
-        let plan = Plan::default();
-        assert!(observe_initial_setup(plan.clone()));
-        wait_until("the original token's reading ends", || {
-            script().reads.len() == 1 && observe_idle()
-        });
-
-        script().vault_mark = mark(2);
-        let choices = OBSERVED_ROWS.lock().unwrap().choices;
-        let refused =
-            read_github_again_if_its_token_moved_with(plan.clone(), |plan, subjects, forced| {
-                dispatch_observation_with(
-                    Some(ObserveRequest {
-                        plan,
-                        choices,
-                        subjects,
-                        forced,
-                        pending_repositories: false,
-                    }),
-                    || 0,
-                    |_| {
-                        Err(std::io::Error::other(
-                            "injected token observation spawn refusal",
-                        ))
-                    },
-                )
-            });
-        assert!(!refused);
-        assert!(observe_idle());
-        assert_eq!(script().reads.len(), 1, "no worker read the renewed token");
-
-        let accepted =
-            read_github_again_if_its_token_moved_with(plan.clone(), |plan, subjects, forced| {
-                dispatch_observation_with(
-                    Some(ObserveRequest {
-                        plan,
-                        choices,
-                        subjects,
-                        forced,
-                        pending_repositories: false,
-                    }),
-                    || 0,
-                    |_| panic!("another request must not bypass the failed-start backoff"),
-                )
-            });
-        let mut worker = None;
-        let (release, held) = std::sync::mpsc::sync_channel(1);
-        assert!(dispatch_observation_with(
-            None,
-            || aterm_secrets::converge::FIRST_RETRY_MS,
-            |job| {
-                worker = Some(std::thread::spawn(move || {
-                    held.recv_timeout(HANG).unwrap();
-                    job();
-                }));
-                Ok(())
-            },
-        ));
-        // An accepted reading still waiting to run owns this mark. Another
-        // look must not enqueue a duplicate before the worker samples it.
-        let repeated = read_github_again_if_its_token_moved(plan.clone());
-        if let Some(worker) = worker {
-            release.send(()).unwrap();
-            worker.join().unwrap();
-        }
-        assert!(
-            accepted,
-            "the same renewed token still needs its refused reading"
-        );
-        assert!(
-            !repeated,
-            "the accepted observation already owns this token move"
-        );
-        assert!(observe_idle());
-        assert_eq!(
-            script().reads,
-            [
-                (plan.clone(), Subject::all(), true),
-                (
-                    plan.clone(),
-                    vec![Subject::Setting(Setting::Repositories)],
-                    true
-                ),
-            ],
-            "the recovered observation reads only the requested source and row"
-        );
-        assert!(!read_github_again_if_its_token_moved(plan));
-        assert_eq!(
-            script().reads.len(),
-            2,
-            "one accepted reading per token move"
-        );
-    }
-
-    #[test]
-    fn a_choice_outranks_every_reading_queued_or_in_flight_when_it_is_made() {
-        let _globals = globals();
-        for refresh in 0..3 {
-            let _io = TestIo::install();
-            // The page is shown with every group set up: its reading reads GitHub
-            // over the network, and Messages and FaceTime. Check again queues its
-            // broader read behind that one before the person's newer choice.
-            let shown = Plan::default();
-            script().hold = true;
-            assert!(observe_initial_setup(shown.clone()));
-            wait_until("the page's reading starts", || script().reads.len() == 1);
-            assert!(request_observation(
-                Some(shown.clone()),
-                Subject::all(),
-                true
-            ));
-            // Meanwhile the person leaves Workspace and Messages & FaceTime as is.
-            let left = left_as_is();
-            script().admits = [Some(9)].into();
-            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-            assert!(restart_initial_setup(left.clone(), false, None, receipt));
-            assert_eq!(answer.recv_timeout(HANG), Ok(true));
-            assert_eq!(setup_run(), Some(9));
-            match refresh {
-                0 => {}
-                1 => assert!(observe_initial_setup(left.clone())),
-                _ => assert!(request_observation(None, Subject::all(), false)),
-            }
-            // The readings end, and then a stage's end asks for one naming no plan.
-            release_readings();
-            wait_until("the queued reading ends", || {
-                script().reads.len() == 2 && observe_idle()
-            });
-            assert!(request_observation(None, Subject::all(), false));
-            wait_until("the stage's reading ends", || {
-                script().reads.len() == 3 && observe_idle()
-            });
-            let reads = std::mem::take(&mut script().reads);
-            // Only the reading in flight when the person chose was taken for the
-            // page's plan. Neither it nor the page's queued one put that plan back.
-            assert_eq!((&reads[0].0, reads[0].2), (&shown, true));
-            for (plan, subjects, network) in &reads[1..] {
-                assert_eq!(plan, &left);
-                assert!(!network, "GitHub is never read for a group left as is");
-                assert!(
-                    !subjects.iter().any(|subject| matches!(
-                        subject,
-                        Subject::Setting(setting) if setting.group() == Group::Accounts
-                    )),
-                    "nor is the person's account state"
-                );
-            }
-            assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(left));
-        }
-    }
-
-    /// Restore the queue even when an original-behavior assertion fails, so
-    /// TestIo's teardown never waits for a worker that failed to start or died.
-    struct ObserverDispatchReset;
-
-    impl Drop for ObserverDispatchReset {
-        fn drop(&mut self) {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.running = false;
-            queue.active.clear();
-            queue.current = None;
-            queue.next = None;
-            queue.check = None;
-            queue.retry = None;
-        }
-    }
-
-    #[test]
-    fn observer_dispatch_does_not_acknowledge_work_to_a_failed_start() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let _queue = ObserverDispatchReset;
-        let mut plan = left_as_is();
-        plan.vault_url = "https://example.invalid/forced-current".into();
-        let expected = plan.clone();
-        let request = ObserveRequest {
-            plan: Some(plan),
-            choices: OBSERVED_ROWS.lock().unwrap().choices,
-            subjects: vec![Subject::Setting(Setting::Repositories)],
-            forced: true,
-            pending_repositories: false,
-        };
-        let mut second = None;
-        let started = dispatch_observation_with(
-            Some(ObserveRequest {
-                plan: Some(left_as_is()),
-                choices: request.choices,
-                subjects: vec![Subject::Setting(Setting::Dock)],
-                forced: false,
-                pending_repositories: false,
-            }),
-            || 0,
-            |_| {
-                let (reached, wait) = std::sync::mpsc::sync_channel(1);
-                second = Some(std::thread::spawn(move || {
-                    // Coordinate without a timing assertion: if admission is
-                    // unlocked, force the second call to finish before the
-                    // failed spawn returns. If locked, signal before waiting
-                    // for the first caller to release its failed admission.
-                    let unlocked = match OBSERVE_QUEUE.try_lock() {
-                        Ok(queue) => {
-                            drop(queue);
-                            true
-                        }
-                        Err(std::sync::TryLockError::WouldBlock) => false,
-                        Err(std::sync::TryLockError::Poisoned(_)) => panic!("queue poisoned"),
-                    };
-                    if !unlocked {
-                        reached.send(()).unwrap();
-                    }
-                    let mut worker = None;
-                    let accepted = dispatch_observation_with(
-                        Some(request),
-                        || 0,
-                        |job| {
-                            worker = Some(std::thread::spawn(job));
-                            Ok(())
-                        },
-                    );
-                    if unlocked {
-                        reached.send(()).unwrap();
-                    }
-                    (accepted, worker)
-                }));
-                wait.recv_timeout(HANG).unwrap();
-                Err(std::io::Error::other("injected worker spawn refusal"))
-            },
-        );
-        assert!(!started, "the failed caller reports refusal");
-        let (accepted, mut worker) = second.take().unwrap().join().unwrap();
-        assert!(accepted);
-        assert!(
-            worker.is_none(),
-            "a new arrival retains the failed-start backoff"
-        );
-        assert!(script().reads.is_empty(), "neither request started");
-        assert!(dispatch_observation_with(
-            None,
-            || 0,
-            |_| panic!("the keeper pulse must preserve the failed-start backoff"),
-        ));
-        assert!(dispatch_observation_with(
-            None,
-            || aterm_secrets::converge::FIRST_RETRY_MS,
-            |job| {
-                worker = Some(std::thread::spawn(job));
-                Ok(())
-            },
-        ));
-        let ran = worker.is_some();
-        if let Some(worker) = worker {
-            worker.join().unwrap();
-        }
-        assert!(
-            ran,
-            "accepted work must have a worker after the failed start"
-        );
-        let script = script();
-        assert_eq!(
-            script.reads.len(),
-            2,
-            "the refused start must retain its original request"
-        );
-        assert_eq!(script.reads[0].0, left_as_is());
-        assert_eq!(script.reads[0].1, [Subject::Setting(Setting::Dock)]);
-        assert!(
-            !script.reads[0].2,
-            "the ordinary request gains no Check scope"
-        );
-        assert_eq!(script.reads[1].0, expected);
-        assert_eq!(script.reads[1].1, [Subject::Setting(Setting::Repositories)]);
-        assert!(
-            script.reads[1].2,
-            "the accepted Check retains its forced scope"
-        );
-        assert!(observe_idle());
-        assert!(dispatch_observation_with(
-            None,
-            || panic!("an idle pulse reads no clock"),
-            |_| panic!("completed observations are never replayed"),
-        ));
-    }
-
-    #[test]
-    fn observer_dispatch_retires_an_unwound_read_and_drains_the_next_check_once() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        for panics in [false, true] {
-            let _io = TestIo::install();
-            let _queue = ObserverDispatchReset;
-            let preference = Subject::Setting(Setting::Dock);
-            let personal = Subject::Setting(Setting::Messages);
-            let independent = Subject::Setting(Setting::Spotlight);
-            let repositories = Subject::Setting(Setting::Repositories);
-            let seen = |subject, standing| Observation {
-                standing,
-                ..Observation::unknown(subject)
-            };
-            let old = seen(preference, Standing::InPlace);
-            let private = seen(personal, Standing::InPlace);
-            let kept = seen(independent, Standing::NeedsYou);
-            let fresh = seen(repositories, Standing::InPlace);
-            let choices = {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.rows = vec![old.clone(), private.clone(), kept.clone()];
-                rows.choices
-            };
-            change(|script| {
-                script.hold = true;
-                script.panic_read = panics;
-                script.readings = [vec![old], vec![fresh.clone()]].into();
-            });
-            let mut worker = None;
-            assert!(queue_observation_with(
-                ObserveRequest {
-                    plan: Some(left_as_is()),
-                    choices,
-                    subjects: vec![preference, personal, repositories],
-                    forced: false,
-                    pending_repositories: false,
-                },
-                |job| {
-                    worker = Some(std::thread::spawn(job));
-                    Ok(())
-                },
-            ));
-            wait_until("the observer reads its first batch", || {
-                script().reads.len() == 1
-            });
-            let mut next = left_as_is();
-            next.vault_url = "https://example.invalid/next-check".into();
-            assert!(queue_observation_with(
-                ObserveRequest {
-                    plan: Some(next.clone()),
-                    choices,
-                    subjects: vec![repositories],
-                    forced: true,
-                    pending_repositories: false,
-                },
-                |_| panic!("the current worker owns the queued Check"),
-            ));
-            release_readings();
-            let finished = worker.take().unwrap().join();
-            assert!(
-                finished.is_ok(),
-                "one read cannot strand the accepted Check"
-            );
-            assert!(observe_idle());
-            let rows = OBSERVED_ROWS.lock().unwrap();
-            let current = rows
-                .rows
-                .iter()
-                .find(|row| row.subject == preference)
-                .unwrap();
-            assert_eq!(
-                current.standing,
-                if panics {
-                    Standing::Unknown
-                } else {
-                    Standing::InPlace
-                }
-            );
-            if panics {
-                // The words the page shows under the row, which say to Check again.
-                assert!(
-                    current
-                        .note
-                        .as_ref()
-                        .is_some_and(|note| note.contains("Check again"))
-                );
-            }
-            assert!(
-                rows.rows.contains(&private),
-                "filtered-out personal rows stay untouched"
-            );
-            assert!(rows.rows.contains(&kept));
-            assert!(rows.rows.contains(&fresh));
-            assert_eq!(rows.plan, Some(next.clone()));
-            drop(rows);
-            let script = script();
-            assert_eq!(script.reads.len(), 2, "the unwound batch is never retried");
-            assert_eq!(script.reads[0].1, [preference]);
-            assert_eq!(script.reads[1].0, next);
-            assert_eq!(script.reads[1].1, [repositories]);
-            assert!(script.reads[1].2, "the queued Check keeps its own scope");
-        }
-    }
-
-    #[test]
-    fn queued_observation_intents_keep_a_draft_check_across_a_focus_refresh() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        let _busy = take_initial_setup_slot().unwrap();
-        let mut shown = left_as_is();
-        shown.vault_url = "https://example.invalid/accepted-a".into();
-        let mut checked = shown.clone();
-        checked.vault_url = "https://example.invalid/draft-b".into();
-        let vault = Subject::Setting(Setting::Secrets);
-        let accepted = Observation {
-            standing: Standing::InPlace,
-            now: Some("Synced".into()),
-            ..Observation::unknown(vault)
-        };
-        let draft = Observation {
-            standing: Standing::NeedsYou,
-            ..Observation::unknown(vault)
-        };
-        change(|script| script.readings = [vec![accepted.clone()]].into());
-        assert!(observe_initial_setup(shown.clone()));
-        wait_until("the first accepted presentation is read", || {
-            script().reads.len() == 1 && observe_idle()
-        });
-        let before = setup_readings();
-        assert!(before.observed.contains(&accepted));
-        change(|script| {
-            script.reads.clear();
-            script.hold = true;
-            script.readings = [vec![accepted.clone()]].into();
-        });
-        assert!(observe_initial_setup(shown.clone()));
-        wait_until("the returning page's fresh reading starts", || {
-            script().reads.len() == 1
-        });
-        let while_reading = setup_readings();
-        release_readings();
-        wait_until("the returning page's reading finishes", observe_idle);
-        assert_eq!(
-            while_reading.observed, before.observed,
-            "a same-plan focus refresh keeps the shown values until their replacement arrives"
-        );
-        assert_eq!(while_reading.observed_vault_url, before.observed_vault_url);
-        assert!(
-            while_reading
-                .observing
-                .contains(&(vault, Some(shown.vault_url.clone()), false))
-        );
-        change(|script| {
-            script.reads.clear();
-            script.hold = true;
-            script.readings = [vec![accepted.clone()]].into();
-        });
-        assert!(check_initial_setup(shown.clone()).reading);
-        wait_until("the same-source Check starts", || script().reads.len() == 1);
-        let checking = setup_readings();
-        release_readings();
-        wait_until("the same-source Check finishes", observe_idle);
-        assert!(
-            !checking.observed.iter().any(|row| row.subject == vault),
-            "Check still retires current authority"
-        );
-        assert!(
-            checking.last_known.contains(&accepted),
-            "the useful value remains presentation history"
-        );
-        assert!(
-            checking
-                .observing
-                .contains(&(vault, Some(shown.vault_url.clone()), false))
-        );
-        change(|script| {
-            script.reads.clear();
-            script.hold = true;
-            script.readings = [vec![accepted.clone()], vec![accepted], vec![draft.clone()]].into();
-        });
-        assert!(observe_initial_setup(shown.clone()));
-        wait_until("the accepted source's first reading starts", || {
-            script().reads.len() == 1
-        });
-
-        // The actual Check producer acknowledges its forced reading even
-        // while another pass owns the separate check worker's slot.
-        let started = check_initial_setup(checked.clone());
-        assert!(started.reading);
-        assert!(!started.check);
-        // The Host also asks for the reviewed plan's ordinary fallback, then
-        // a genuine focus return asks for the accepted source once more.
-        assert!(observe_initial_setup(checked.clone()));
-        assert!(observe_initial_setup(shown.clone()));
-        let queued = setup_readings();
-        // Keep the second source's actual reader held after A finishes, so
-        // the completed source cannot hide inside a whole-batch progress bit.
-        SETUP_IO.write().unwrap().read = |plan, subjects, network, admission| {
-            if plan.vault_url.ends_with("/draft-b") {
-                change(|script| script.hold = true);
-            }
-            TestIo::read(plan, subjects, network, admission)
-        };
-        release_readings();
-        wait_until("the explicit other-source Check starts", || {
-            script().reads.len() == 3
-        });
-        let only_b = setup_readings();
-        release_readings();
-        wait_until("the accepted observation work finishes", observe_idle);
-        assert!(
-            queued
-                .observing
-                .contains(&(vault, Some(shown.vault_url.clone()), false))
-        );
-        assert!(
-            queued
-                .observing
-                .contains(&(vault, Some(checked.vault_url.clone()), true))
-        );
-        assert_eq!(
-            only_b
-                .observing
-                .iter()
-                .filter(|(subject, _, _)| *subject == vault)
-                .cloned()
-                .collect::<Vec<_>>(),
-            [(vault, Some(checked.vault_url.clone()), false)],
-            "completed A is no longer checking while B remains held"
-        );
-
-        let reads = std::mem::take(&mut script().reads);
-        assert_eq!(reads.len(), 3, "both pending intents must be read");
-        assert_eq!((&reads[0].0, reads[0].2), (&shown, false));
-        assert_eq!((&reads[1].0, reads[1].2), (&shown, false));
-        assert_eq!((&reads[2].0, reads[2].2), (&checked, true));
-        for personal in [Setting::Messages, Setting::FaceTime] {
-            assert!(!reads[1].1.contains(&Subject::Setting(personal)));
-            assert!(reads[2].1.contains(&Subject::Setting(personal)));
-        }
-        let rows = OBSERVED_ROWS.lock().unwrap();
-        assert_eq!(rows.plan.as_ref(), Some(&checked));
-        assert_eq!(rows.vault_url.as_deref(), Some(checked.vault_url.as_str()));
-        assert!(rows.rows.contains(&draft));
-    }
-
-    #[test]
-    fn queued_observation_intents_keep_only_the_latest_check_until_a_new_choice() {
-        let _globals = globals();
-        for new_choice in [false, true] {
-            let _io = TestIo::install();
-            let busy = take_initial_setup_slot().unwrap();
-            let mut shown = left_as_is();
-            shown.vault_url = "https://example.invalid/accepted-a".into();
-            let mut checked = shown.clone();
-            checked.vault_url = "https://example.invalid/draft-b".into();
-            change(|script| script.hold = true);
-            assert!(observe_initial_setup(shown.clone()));
-            wait_until("the old source reading starts", || {
-                script().reads.len() == 1
-            });
-            for source in ["draft-b", "draft-c"] {
-                checked.vault_url = format!("https://example.invalid/{source}");
-                assert_eq!(
-                    check_initial_setup(checked.clone()),
-                    aterm_gui::CheckStarted {
-                        reading: true,
-                        check: false,
-                    }
-                );
-                assert!(observe_initial_setup(checked.clone()));
-                assert!(observe_initial_setup(shown.clone()));
-            }
-            let mut chosen = shown.clone();
-            chosen.vault_url = "https://example.invalid/new-choice".into();
-            drop(busy);
-            if new_choice {
-                script().admits = [Some(9)].into();
-                let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-                assert!(restart_initial_setup(chosen.clone(), false, None, receipt));
-                assert_eq!(answer.recv_timeout(HANG), Ok(true));
-                wait_until("the new choice's inert run finishes", || {
-                    !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
-                });
-                assert!(observe_initial_setup(chosen.clone()));
-            }
-            release_readings();
-            wait_until("the latest pending reads finish", observe_idle);
-            let reads = std::mem::take(&mut script().reads);
-            if new_choice {
-                assert_eq!(reads.len(), 2);
-                assert_eq!((&reads[1].0, reads[1].2), (&chosen, false));
-                assert!(!reads[1].1.contains(&Subject::Setting(Setting::Messages)));
-                assert!(!reads[1].1.contains(&Subject::Setting(Setting::FaceTime)));
-                assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(chosen));
-            } else {
-                assert_eq!(reads.len(), 3);
-                assert_eq!((&reads[1].0, reads[1].2), (&shown, false));
-                assert_eq!((&reads[2].0, reads[2].2), (&checked, true));
-                assert!(reads[2].1.contains(&Subject::Setting(Setting::Messages)));
-                assert!(reads[2].1.contains(&Subject::Setting(Setting::FaceTime)));
-                assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(checked));
-            }
-        }
-    }
-
-    #[test]
-    fn a_queued_checks_scope_belongs_to_its_reviewed_plan() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        struct QueueLease;
-        impl Drop for QueueLease {
-            fn drop(&mut self) {
-                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-                queue.running = false;
-                queue.active.clear();
-                queue.current = None;
-                queue.next = None;
-                queue.check = None;
-            }
-        }
-        OBSERVE_QUEUE.lock().unwrap().running = true;
-        let _queue = QueueLease;
-        for edited in [false, true] {
-            let checked = left_as_is();
-            let mut reviewed = checked.clone();
-            if edited {
-                reviewed.vault_url = "http://another-vault.local:7484/v1/team".into();
-            }
-            assert!(request_observation(
-                Some(checked.clone()),
-                Subject::all(),
-                true
-            ));
-            assert!(observe_initial_setup(reviewed.clone()));
-            let pending = OBSERVE_QUEUE.lock().unwrap().take_pending();
-            for request in pending.into_iter().flatten() {
-                observe_rows(request);
-            }
-            let reads = std::mem::take(&mut script().reads);
-            assert_eq!(reads.len(), 1 + usize::from(edited));
-            if edited {
-                assert_eq!((&reads[0].0, reads[0].2), (&reviewed, false));
-                assert!(
-                    reads[0].1.iter().all(|subject| !matches!(
-                        subject,
-                        Subject::Setting(setting) if setting.group() == Group::Accounts
-                    )),
-                    "account reads cannot transfer to the ordinary plan"
-                );
-            }
-            let forced = reads.last().unwrap();
-            assert_eq!((&forced.0, forced.2), (&checked, true));
-            assert!(forced.1.contains(&Subject::Setting(Setting::Messages)));
-            assert!(forced.1.contains(&Subject::Setting(Setting::FaceTime)));
-            // A fresh Check of that exact edited plan still reads all rows,
-            // even when an ordinary stage refresh coalesces behind it.
-            assert!(request_observation(
-                Some(reviewed.clone()),
-                Subject::all(),
-                true
-            ));
-            assert!(request_observation(None, Subject::all(), false));
-            let pending = OBSERVE_QUEUE.lock().unwrap().take_pending();
-            for request in pending.into_iter().flatten() {
-                observe_rows(request);
-            }
-            let reads = std::mem::take(&mut script().reads);
-            assert_eq!(reads.len(), 1);
-            assert_eq!(reads[0].0, reviewed);
-            assert!(reads[0].2);
-            assert!(reads[0].1.contains(&Subject::Setting(Setting::Messages)));
-            assert!(reads[0].1.contains(&Subject::Setting(Setting::FaceTime)));
-        }
-    }
-
-    #[test]
-    fn a_late_old_check_cannot_relabel_a_newer_queued_read() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        struct QueueLease;
-        impl Drop for QueueLease {
-            fn drop(&mut self) {
-                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-                queue.running = false;
-                queue.active.clear();
-                queue.current = None;
-                queue.next = None;
-                queue.check = None;
-            }
-        }
-        OBSERVE_QUEUE.lock().unwrap().running = true;
-        let _queue = QueueLease;
-        for check in [false, true] {
-            // Capture Check A before a newer choice, then let it acquire the
-            // queue only after the new choice's own read is already waiting.
-            let old = ObserveRequest {
-                plan: Some(left_as_is()),
-                choices: OBSERVED_ROWS.lock().unwrap().choices,
-                subjects: Subject::all(),
-                forced: true,
-                pending_repositories: false,
-            };
-            let mut reviewed = left_as_is();
-            reviewed.vault_url = "http://newer-vault.local:7484/v1/team".into();
-            let generation = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-            let _choice = begin_setup_choice(&reviewed, false, generation);
-            assert!(request_observation(
-                Some(reviewed.clone()),
-                Subject::all(),
-                check
-            ));
-            assert!(queue_observation(old));
-            let pending = OBSERVE_QUEUE.lock().unwrap().take_pending();
-            for request in pending.into_iter().flatten() {
-                observe_rows(request);
-            }
-            let reads = std::mem::take(&mut script().reads);
-            assert_eq!(reads.len(), 1);
-            assert_eq!(reads[0].0, reviewed);
-            assert_eq!(reads[0].2, check);
-            assert_eq!(
-                reads[0].1.contains(&Subject::Setting(Setting::Messages)),
-                check
-            );
-            assert_eq!(
-                reads[0].1.contains(&Subject::Setting(Setting::FaceTime)),
-                check
-            );
-        }
-    }
-
-    #[test]
-    fn an_in_flight_observation_cannot_publish_after_a_new_choice() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Park only the queue's dispatcher: this reader still runs the real
-        // observation entry, and a replacement read can be inspected before
-        // it runs. Release the queue before TestIo waits for its workers.
-        struct QueueLease;
-        impl Drop for QueueLease {
-            fn drop(&mut self) {
-                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-                queue.running = false;
-                queue.active.clear();
-                queue.current = None;
-                queue.next = None;
-                queue.check = None;
-            }
-        }
-        {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap();
-            assert!(!queue.running);
-            assert!(queue.next.is_none() && queue.check.is_none());
-            queue.running = true;
-        }
-        let _queue = QueueLease;
-        let secrets = Subject::Setting(Setting::Secrets);
-        let repositories = Subject::Setting(Setting::Repositories);
-        let reading = |subject, standing, note: &str| Observation {
-            subject,
-            standing,
-            now: None,
-            after_login: None,
-            wanted: subject.wanted().to_owned(),
-            note: Some(note.to_owned()),
-            detail: None,
-        };
-        let shown = Plan::default();
-        let subjects = Subject::all();
-        let choices = {
-            let mut rows = OBSERVED_ROWS.lock().unwrap();
-            rows.plan = Some(shown.clone());
-            rows.rows = vec![
-                reading(secrets, Standing::Waiting, "earlier vault reading"),
-                reading(
-                    repositories,
-                    Standing::Waiting,
-                    "earlier repository reading",
-                ),
-            ];
-            rows.access_steps = 7;
-            rows.choices
-        };
-        let current = reading(
-            secrets,
-            Standing::Waiting,
-            "the newly selected vault did not answer",
-        );
-        change(|script| {
-            script.hold = true;
-            script.readings = [
-                vec![
-                    reading(
-                        secrets,
-                        Standing::NeedsYou,
-                        "approval for the old vault: OLD42",
-                    ),
-                    reading(
-                        repositories,
-                        Standing::InPlace,
-                        "old vault credentials worked",
-                    ),
-                ],
-                vec![current.clone()],
-            ]
-            .into();
-        });
-        // On failure, release and join the reader before QueueLease and
-        // TestIo drop; no delayed worker may outlive its inert I/O.
-        struct Reader(Option<std::thread::JoinHandle<()>>);
-        impl Drop for Reader {
-            fn drop(&mut self) {
-                release_readings();
-                if let Some(reader) = self.0.take() {
-                    let _ = reader.join();
-                }
-            }
-        }
-        let requested = subjects.clone();
-        let mut reader = Reader(Some(std::thread::spawn(move || {
-            observe_rows(ObserveRequest {
-                plan: Some(shown),
-                choices,
-                subjects: requested,
-                forced: true,
-                pending_repositories: false,
-            });
-        })));
-        wait_until("the old Check's reading starts", || {
-            script().reads.len() == 1
-        });
-        let mut chosen = Plan {
-            vault_url: "http://new-vault.local:7484/v1/team".into(),
-            ..Plan::default()
-        };
-        for setting in [Setting::Repositories, Setting::Messages, Setting::FaceTime] {
-            chosen.selection.set(setting, false);
-        }
-        script().admits = [Some(9)].into();
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(chosen.clone(), true, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        wait_until("the new plan's inert run ends", || {
-            !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
-        });
-        let before = {
-            let rows = OBSERVED_ROWS.lock().unwrap();
-            (rows.rows.clone(), rows.generation, rows.access_steps)
-        };
-        let wakes = SETUP_WAKES.count();
-        release_readings();
-        reader.0.take().unwrap().join().unwrap();
-        {
-            let rows = OBSERVED_ROWS.lock().unwrap();
-            assert_eq!(rows.plan, Some(chosen.clone()));
-            assert_eq!(
-                rows.rows, before.0,
-                "the old vault cannot publish under the new plan"
-            );
-            assert_eq!(rows.generation, before.1);
-            assert_eq!(rows.access_steps, before.2);
-        }
-        assert_eq!(
-            SETUP_WAKES.count(),
-            wakes,
-            "an old result cannot wake the new run"
-        );
-        let next = OBSERVE_QUEUE
-            .lock()
-            .unwrap()
-            .next
-            .take()
-            .expect("a fresh reading is queued");
-        assert_eq!(next.subjects, subjects);
-        assert!(
-            !next.forced,
-            "a superseded Check cannot force old personal reads"
-        );
-        observe_rows(next);
-        let reads = &script().reads;
-        assert_eq!(reads.len(), 2);
-        assert_eq!(reads[1].0, chosen);
-        assert!(!reads[1].2, "the new plan leaves repositories unmanaged");
-        assert!(!reads[1].1.iter().any(|subject| matches!(
-            subject,
-            Subject::Setting(Setting::Messages | Setting::FaceTime)
-        )));
-        assert_eq!(OBSERVED_ROWS.lock().unwrap().rows[0], current);
-    }
-
-    #[test]
-    fn an_interrupted_pass_retires_held_readings_before_releasing_its_leases() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        for panics in [false, true] {
-            let _io = TestIo::install();
-            struct QueueLease;
-            impl Drop for QueueLease {
-                fn drop(&mut self) {
-                    let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-                    queue.running = false;
-                    queue.active.clear();
-                    queue.current = None;
-                    queue.next = None;
-                    queue.check = None;
-                }
-            }
-            OBSERVE_QUEUE.lock().unwrap().running = true;
-            let _queue = QueueLease;
-            struct Reader(Option<std::thread::JoinHandle<()>>);
-            impl Drop for Reader {
-                fn drop(&mut self) {
-                    release_readings();
-                    if let Some(reader) = self.0.take() {
-                        let _ = reader.join();
-                    }
-                }
-            }
-            // This drops after the pass helper, before the real claim and busy
-            // slot. Record the boundary without panicking during the unwind.
-            struct Boundary<'a>(&'a mut Option<(bool, bool, bool)>);
-            impl Drop for Boundary<'_> {
-                fn drop(&mut self) {
-                    *self.0 = Some((
-                        SETUP_ACTIVITY.lock().unwrap().subjects.is_empty(),
-                        OBSERVE_QUEUE.lock().unwrap().next.is_some(),
-                        INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire),
-                    ));
-                }
-            }
-            let preference = Subject::Setting(Setting::Dock);
-            let independent = Subject::Setting(Setting::Spotlight);
-            let seen = |subject, standing| Observation {
-                standing,
-                ..Observation::unknown(subject)
-            };
-            let failed = seen(preference, Standing::Failed);
-            let unaffected = seen(independent, Standing::NeedsYou);
-            let fresh = seen(preference, Standing::Differs);
-            let plan = left_as_is();
-            let choices = {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(plan.clone());
-                rows.vault_url = Some(plan.vault_url.clone());
-                rows.rows = vec![failed.clone(), Observation::unknown(independent)];
-                rows.choices
-            };
-            observe_rows(ObserveRequest {
-                plan: Some(plan.clone()),
-                choices,
-                subjects: Vec::new(),
-                forced: false,
-                pending_repositories: false,
-            });
-            change(|script| {
-                script.reads.clear();
-                script.hold = true;
-                script.readings = [
-                    vec![seen(preference, Standing::InPlace), unaffected.clone()],
-                    vec![fresh.clone()],
-                ]
-                .into();
-            });
-            let mut reader = Reader(None);
-            let mut boundary = None;
-            let mut wakes = 0;
-            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                assert!(take_initial_setup_slot_now());
-                let _busy = InitialSetupBusy { observation: None };
-                let _claim = TestIo::claim().unwrap().unwrap();
-                let _boundary = Boundary(&mut boundary);
-                with_setup_activity(|| {
-                    setup_stage(aterm_cli::macos_doctor::StageEvent {
-                        revision: 1,
-                        settings: &[Setting::Dock],
-                        subjects: &[preference],
-                        running: true,
-                        readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                    });
-                    reader.0 = Some(std::thread::spawn(move || {
-                        observe_rows(ObserveRequest {
-                            plan: Some(plan),
-                            choices,
-                            subjects: vec![preference, independent],
-                            forced: false,
-                            pending_repositories: false,
-                        });
-                    }));
-                    wait_until("the mid-stage reading starts", || script().reads.len() == 1);
-                    wakes = SETUP_WAKES.count();
-                    assert!(!panics, "injected setup stage panic");
-                    Err::<(), _>("injected progress save error")
-                })
-            }));
-            assert_eq!(unwound.is_err(), panics);
-            if let Ok(result) = unwound {
-                assert_eq!(result, Err("injected progress save error"));
-            }
-            assert_eq!(
-                boundary,
-                Some((true, true, true)),
-                "cleanup and refresh precede the release of the setup slot"
-            );
-            assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
-            assert!(TestIo::claim().unwrap().is_some(), "the claim was released");
-            release_readings();
-            reader.0.take().unwrap().join().unwrap();
-            {
-                let rows = OBSERVED_ROWS.lock().unwrap();
-                assert!(
-                    !rows.rows.iter().any(|row| row.subject == preference),
-                    "the old stage fact was retired"
-                );
-                assert!(rows.rows.contains(&unaffected));
-            }
-            assert_eq!(SETUP_WAKES.count(), wakes, "no false recovery wake");
-            let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
-            assert!(!refresh.forced);
-            assert_eq!(refresh.subjects, Subject::all());
-            observe_rows(refresh);
-            assert!(OBSERVED_ROWS.lock().unwrap().rows.contains(&fresh));
-            assert_eq!(script().reads.len(), 2);
-        }
-    }
-
-    #[test]
-    fn an_unwound_worker_retires_only_its_own_registration() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        for panics in [false, true] {
-            for replacement in [None, Some(42)] {
-                set_setup_run(Some(41));
-                let result = std::panic::catch_unwind(|| {
-                    with_setup_run(41, || {
-                        if let Some(replacement) = replacement {
-                            set_setup_run(Some(replacement));
-                        }
-                        assert!(!panics, "injected setup worker panic");
-                    });
-                });
-                assert_eq!(result.is_err(), panics);
-                assert_eq!(setup_run(), replacement);
-            }
-        }
-    }
-
-    #[test]
-    fn preference_readings_retire_cached_and_held_reads() {
-        use aterm_types::macos_setup::Standing;
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Keep the automatic refresh queued until the old read has returned.
-        struct QueueLease;
-        impl Drop for QueueLease {
-            fn drop(&mut self) {
-                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
-                queue.running = false;
-                queue.active.clear();
-                queue.current = None;
-                queue.next = None;
-                queue.check = None;
-            }
-        }
-        OBSERVE_QUEUE.lock().unwrap().running = true;
-        let _queue = QueueLease;
-        struct Reader(Option<std::thread::JoinHandle<()>>);
-        impl Drop for Reader {
-            fn drop(&mut self) {
-                release_readings();
-                if let Some(reader) = self.0.take() {
-                    let _ = reader.join();
-                }
-            }
-        }
-        let independent = Subject::Setting(Setting::Secrets);
-        let seen = |subject, standing| Observation {
-            standing,
-            ..Observation::unknown(subject)
-        };
-        let plan = Plan::default();
-        for (follow_up, failed) in [(false, false), (false, true), (true, false), (true, true)] {
-            let preference = Subject::Setting(if follow_up {
-                Setting::Widgets
-            } else {
-                Setting::CapsLock
-            });
-            let old = seen(
-                preference,
-                if follow_up && !failed {
-                    Standing::Differs
-                } else {
-                    Standing::InPlace
-                },
-            );
-            let vault = seen(independent, Standing::NeedsYou);
-            let restored = seen(
-                preference,
-                if follow_up && !failed {
-                    Standing::InPlace
-                } else {
-                    Standing::Differs
-                },
-            );
-            let choices = {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(plan.clone());
-                rows.vault_url = Some(plan.vault_url.clone());
-                rows.rows = vec![old.clone(), vault.clone()];
-                rows.choices
-            };
-            change(|script| {
-                script.reads.clear();
-                script.hold = true;
-                script.readings = [vec![old, vault.clone()], vec![restored.clone()]].into();
-            });
-            let reading_plan = plan.clone();
-            let mut reader = Reader(Some(std::thread::spawn(move || {
-                observe_rows(ObserveRequest {
-                    plan: Some(reading_plan),
-                    choices,
-                    subjects: vec![preference, independent],
-                    forced: false,
-                    pending_repositories: false,
-                });
-            })));
-            wait_until("the preference read starts", || script().reads.len() == 1);
-            let mut during = Vec::new();
-            let mut effect = || {
-                during = OBSERVED_ROWS.lock().unwrap().rows.clone();
-                if failed {
-                    Err("partial preference change")
-                } else {
-                    Ok(())
-                }
-            };
-            let result = if follow_up {
-                finish_withheld_preferences_with(|reserve, _stopped| {
-                    let _reserved = reserve();
-                    effect()
-                })
-            } else {
-                with_restore_readings(effect)
-            };
-            assert_eq!(result.is_err(), failed);
-            release_readings();
-            reader.0.take().unwrap().join().unwrap();
-            let (retained, source) = {
-                let rows = OBSERVED_ROWS.lock().unwrap();
-                (rows.rows.clone(), rows.vault_url.clone())
-            };
-            assert!(
-                !retained.iter().any(|row| row.subject == preference),
-                "an old preference read must not publish after a change (follow-up: {follow_up})"
-            );
-            assert!(retained.contains(&vault));
-            assert_eq!(source.as_ref(), Some(&plan.vault_url));
-            assert!(
-                !during.iter().any(|row| row.subject == preference),
-                "the changing preference is unread while reserved (follow-up: {follow_up})"
-            );
-            assert!(during.contains(&vault));
-            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
-            let fresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
-            assert!(!fresh.forced);
-            assert!(fresh.plan.is_none(), "refresh uses the plan in force");
-            assert!(fresh.subjects.contains(&preference));
-            if follow_up {
-                assert_eq!(fresh.subjects, [Subject::Setting(Setting::Widgets)]);
-            } else {
-                assert!(
-                    fresh
-                        .subjects
-                        .iter()
-                        .all(|subject| matches!(subject.group(), Group::Input | Group::Desktop))
-                );
-            }
-            observe_rows(fresh);
-            let rows = OBSERVED_ROWS.lock().unwrap();
-            assert!(rows.rows.contains(&restored));
-            assert!(rows.rows.contains(&vault));
-            assert_eq!(script().reads.len(), 2);
-        }
-
-        // The same canonical native producer used by the owned pass supplies
-        // the sidecar. No fabricated observation can enter the stage hook.
-        use aterm_cli::macos_doctor::{
-            InitialSetupAdmissionStopTest, StageEvent, run_workstation_readback,
-        };
-        use aterm_machines::init::{WorkstationGroup, prepare_workstation_selected};
-        let native = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
-        let caps = Subject::Setting(Setting::CapsLock);
-        let mut selection = aterm_types::macos_setup::Selection::none();
-        selection.set(Setting::CapsLock, true);
-        let prepared =
-            prepare_workstation_selected(&native, WorkstationGroup::All, selection).unwrap();
-        let (_, readback) = run_workstation_readback(
-            prepared,
-            &native,
-            WorkstationGroup::All,
-            aterm_machines::model::Mode::Apply,
-        )
-        .unwrap();
-        assert!(readback.observations().iter().any(|row| {
-            row.subject == caps
-                && row.standing == Standing::InPlace
-                && row.now.as_deref() == Some("Control")
-        }));
-        use aterm_machines::port::System as _;
-        let aterm_machines::init::KeyboardAttachmentActivation::Verified(live_receipt) =
-            aterm_machines::init::activate_keyboard_attachments(
-                &native,
-                &[41, 42],
-                &|_| false,
-                &|| true,
-                &|| panic!("the actual completed mapping needs no native mutation"),
-            )
-            .unwrap()
-        else {
-            panic!("the canonical final probe must cover both native services");
-        };
-        let live_mapping = live_receipt
-            .live_mapping(&native.keyboard_service_observations().unwrap())
-            .unwrap();
-        let paid_commands = native.calls();
-        // An attempted old Unknown is no newer evidence than an old row.
-        // Exercise both publication while the real stage is active and after
-        // its canonical native readback has supplied the completed fact.
-        for during_stage in [true, false] {
-            set_setup_run(Some(1));
-            let choices = {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(plan.clone());
-                rows.rows = vec![Observation::unknown(caps)];
-                rows.last_known.clear();
-                rows.unconfirmed.clear();
-                rows.choices
-            };
-            OBSERVE_QUEUE.lock().unwrap().next = None;
-            change(|script| {
-                script.reads.clear();
-                script.hold = true;
-                script.readings = [vec![Observation::unknown(caps)]].into();
-            });
-            let reading_plan = plan.clone();
-            let mut old = Reader(Some(std::thread::spawn(move || {
-                observe_rows(ObserveRequest {
-                    plan: Some(reading_plan),
-                    choices,
-                    subjects: vec![caps],
-                    forced: false,
-                    pending_repositories: false,
-                })
-            })));
-            wait_until("the attempted old Unknown sample starts", || {
-                script().reads.len() == 1
-            });
-            with_setup_readback(capture_setup_readback_scope(Some(1)), || {
-                setup_readback_stage(StageEvent {
-                    revision: 1,
-                    settings: &[Setting::CapsLock],
-                    subjects: &[caps],
-                    running: true,
-                    readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                });
-                if during_stage {
-                    release_readings();
-                    old.0.take().unwrap().join().unwrap();
-                }
-                setup_readback_stage(StageEvent {
-                    revision: 1,
-                    settings: &[Setting::CapsLock],
-                    subjects: &[caps],
-                    running: false,
-                    readback: &readback,
-                });
-            });
-            release_readings();
-            if let Some(reader) = old.0.take() {
-                reader.join().unwrap();
-            }
-            let shown = setup_readings();
-            assert!(
-                shown
-                    .observed
-                    .iter()
-                    .any(|seen| seen.subject == caps && seen.standing == Standing::InPlace)
-            );
-            assert!(
-                !shown.unconfirmed_observations.contains(&caps),
-                "a stale Unknown cannot downgrade the paid result (during stage: {during_stage})"
-            );
-            assert_eq!(
-                native.calls(),
-                paid_commands,
-                "transporting the fact adds no HID reads"
-            );
-        }
-        for withdrawal in [
-            "none",
-            "input",
-            "choice",
-            "restore",
-            "revision",
-            "run",
-            "scope",
-            "refresh",
-            "forced",
-            "invalidated",
-            "failed",
-            "stop",
-        ] {
-            *SETUP_STOP.lock().unwrap() = None;
-            set_setup_run(Some(1));
-            let vault = seen(independent, Standing::NeedsYou);
-            {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(plan.clone());
-                rows.rows = vec![Observation::unknown(caps), vault.clone()];
-                rows.caps_live = None;
-            }
-            let live_scope = capture_caps_live_scope().unwrap();
-            assert!(replace_caps_live(live_scope, Some((1, live_mapping))));
-            assert_eq!(setup_readings().caps_live, Some(live_mapping));
-            let generation = setup_readings().observed_generation;
-            publish_caps_live(Some(live_scope), Some((1, live_mapping)));
-            assert_eq!(
-                setup_readings().observed_generation,
-                generation,
-                "an unchanged healthy diagnostic owes no publication"
-            );
-            assert!(
-                setup_readings()
-                    .observed
-                    .iter()
-                    .any(|row| row.subject == caps && row.standing == Standing::Unknown)
-            );
-            OBSERVE_QUEUE.lock().unwrap().next = None;
-            let stage_subject = if withdrawal == "scope" {
-                Subject::Setting(Setting::Dock)
-            } else {
-                caps
-            };
-            let stage_setting = if withdrawal == "scope" {
-                Setting::Dock
-            } else {
-                Setting::CapsLock
-            };
-            with_setup_activity(|| {
-                setup_stage(StageEvent {
-                    revision: 1,
-                    settings: &[stage_setting],
-                    subjects: &[stage_subject],
-                    running: true,
-                    readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                });
-                assert_eq!(setup_readings().caps_live.is_some(), withdrawal == "scope");
-                assert!(
-                    !OBSERVED_ROWS
-                        .lock()
-                        .unwrap()
-                        .rows
-                        .iter()
-                        .any(|row| row.subject == stage_subject)
-                );
-                match withdrawal {
-                    "input" => invalidate_input_observations(),
-                    "choice" => {
-                        let _ = begin_setup_choice(&plan, false, 0);
-                    }
-                    "stop" => stop_setup_run(1),
-                    "restore" => {
-                        drop(PreferenceReadings::begin(vec![caps]));
-                    }
-                    "run" => set_setup_run(Some(2)),
-                    _ => {}
-                }
-                setup_stage(StageEvent {
-                    revision: if withdrawal == "revision" { 2 } else { 1 },
-                    settings: &[stage_setting],
-                    subjects: &[stage_subject],
-                    running: false,
-                    readback: &readback,
-                });
-            });
-            let ready = OBSERVED_ROWS.lock().unwrap().rows.iter().any(|row| {
-                row.subject == caps
-                    && row.standing == Standing::InPlace
-                    && row.now.as_deref() == Some("Control")
-            });
-            assert!(
-                !replace_caps_live(live_scope, Some((1, live_mapping))),
-                "an old live sample cannot cross its setting's stage/choice/Stop fence"
-            );
-            let admitted = matches!(
-                withdrawal,
-                "none" | "refresh" | "forced" | "invalidated" | "failed"
-            );
-            assert_eq!(ready, admitted, "{withdrawal}");
-            assert!(OBSERVED_ROWS.lock().unwrap().rows.contains(&vault));
-            let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
-            assert_eq!(refresh.subjects.contains(&caps), !admitted, "{withdrawal}");
-            assert_eq!(
-                native.calls(),
-                paid_commands,
-                "transporting readback starts no HID reads"
-            );
-            if matches!(withdrawal, "refresh" | "forced" | "invalidated" | "failed") {
-                // A hidden redundant refresh is not an attempted read. A real
-                // invalidation, failed read or forced Check still retires it.
-                let forced = withdrawal == "forced";
-                let attempted = matches!(withdrawal, "forced" | "failed");
-                if withdrawal == "invalidated" {
-                    invalidate_input_observations();
-                }
-                change(|script| {
-                    script.readings.push_back(if attempted {
-                        vec![Observation::unknown(caps)]
-                    } else {
-                        Vec::new()
-                    });
-                });
-                let choices = OBSERVED_ROWS.lock().unwrap().choices;
-                observe_rows(ObserveRequest {
-                    plan: Some(plan.clone()),
-                    choices,
-                    subjects: vec![caps],
-                    forced,
-                    pending_repositories: false,
-                });
-                let rows = OBSERVED_ROWS.lock().unwrap();
-                assert_eq!(
-                    rows.rows
-                        .iter()
-                        .any(|row| row.subject == caps && row.standing == Standing::InPlace),
-                    withdrawal == "refresh"
-                );
-            }
-        }
-        set_setup_run(None);
-        wait_until("the injected Stop is saved", stop_worker_idle);
-        reset_worker_state();
-
-        // A scoped pass can finish without changing the already-correct native maps,
-        // while a concurrent invalidation fences its paid readback out of the cache.
-        for completion in [
-            "paid",
-            "fenced",
-            "observed",
-            "unknown",
-            "nested",
-            "panic",
-            "panic-nested",
-            "revision",
-            "run",
-            "choice",
-            "stop",
-        ] {
-            *SETUP_STOP.lock().unwrap() = None;
-            set_setup_run(Some(1));
-            {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(Plan::from(selection));
-                rows.rows = vec![Observation::unknown(caps)];
-            }
-            OBSERVE_QUEUE.lock().unwrap().next = None;
-            change(|script| script.reads.clear());
-            let interrupted = std::panic::catch_unwind(|| {
-                with_setup_readback(capture_setup_readback_scope(Some(1)), || {
-                    setup_readback_stage(StageEvent {
-                        revision: if completion == "revision" { 2 } else { 1 },
-                        settings: &[Setting::CapsLock],
-                        subjects: &[caps],
-                        running: true,
-                        readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
-                    });
-                    if completion == "panic-nested" {
-                        with_setup_readback(capture_setup_readback_scope(Some(1)), || {});
-                        assert!(OBSERVE_QUEUE.lock().unwrap().next.is_none());
-                    }
-                    assert!(
-                        !matches!(completion, "panic" | "panic-nested"),
-                        "injected scoped stage unwind before END"
-                    );
-                    if completion != "paid" {
-                        invalidate_input_observations();
-                    }
-                    setup_readback_stage(StageEvent {
-                        revision: if completion == "revision" { 2 } else { 1 },
-                        settings: &[Setting::CapsLock],
-                        subjects: &[caps],
-                        running: false,
-                        readback: &readback,
-                    });
-                    match completion {
-                        "observed" | "unknown" => {
-                            change(|script| {
-                                script.panic_read = completion == "unknown";
-                                script.readings = [readback.observations().to_vec()].into();
-                            });
-                            let choices = OBSERVED_ROWS.lock().unwrap().choices;
-                            observe_rows(ObserveRequest {
-                                plan: Some(Plan::from(selection)),
-                                choices,
-                                subjects: vec![caps],
-                                forced: false,
-                                pending_repositories: false,
-                            });
-                            change(|script| script.panic_read = false);
-                        }
-                        "nested" => {
-                            with_setup_readback(capture_setup_readback_scope(Some(1)), || {});
-                            assert!(OBSERVE_QUEUE.lock().unwrap().next.is_none());
-                        }
-                        "run" => set_setup_run(Some(2)),
-                        "choice" => {
-                            let _ = begin_setup_choice(&plan, false, 0);
-                        }
-                        "stop" => stop_setup_run(1),
-                        _ => {}
-                    }
-                });
-            });
-            assert_eq!(
-                interrupted.is_err(),
-                matches!(completion, "panic" | "panic-nested")
-            );
-            assert!(native.keyboard_changes().is_empty());
-            assert_eq!(native.calls(), paid_commands);
-            let ready = setup_readings()
-                .observed
-                .iter()
-                .any(|row| row.subject == caps && row.standing == Standing::InPlace);
-            assert_eq!(ready, matches!(completion, "paid" | "observed"));
-            assert_eq!(
-                script().reads.len(),
-                usize::from(matches!(completion, "observed" | "unknown"))
-            );
-            if completion == "unknown" {
-                assert!(
-                    setup_readings()
-                        .observed
-                        .iter()
-                        .any(|row| { row.subject == caps && row.standing == Standing::Unknown })
-                );
-            }
-            let queued = OBSERVE_QUEUE.lock().unwrap().next.take();
-            assert_eq!(
-                queued.is_some(),
-                matches!(completion, "fenced" | "nested" | "panic" | "panic-nested"),
-                "scoped no-op completion {completion}"
-            );
-            if let Some(queued) = queued {
-                assert_eq!(queued.subjects, [caps]);
-                assert!(!queued.forced && !queued.pending_repositories);
-            }
-        }
-        set_setup_run(None);
-        wait_until("the scoped Stop is saved", stop_worker_idle);
-        reset_worker_state();
-
-        // The ordinary scoped coordinator uses the same observation boundary,
-        // without the full window setup/status or an ordinary native reread.
-        use super::input_coordinator::fixture::{Event, Native};
-        use aterm_cli::macos_doctor::InitialSetupAdmissionFault;
-        struct ScopedWorker {
-            root: std::path::PathBuf,
-            revision: u64,
-            native: std::sync::Arc<Native>,
-            worker: Option<std::thread::JoinHandle<()>>,
-        }
-        impl Drop for ScopedWorker {
-            fn drop(&mut self) {
-                let _ = InitialSetupAdmissionStopTest::startup(&self.root)
-                    .and_then(|setup| setup.stop_revision(self.revision));
-                self.native.wake();
-                if let Some(worker) = self.worker.take() {
-                    let _ = worker.join();
-                }
-            }
-        }
-        for (attached, old_choice) in [(true, false), (false, false), (true, true)] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let input_plan = Plan::from(selection);
-            let mut setup = InitialSetupAdmissionStopTest::startup(root.path())
-                .unwrap()
-                .with_plan(input_plan.clone());
-            let revision = setup
-                .persist(InitialSetupAdmissionFault::None)
-                .unwrap()
-                .unwrap();
-            {
-                let mut rows = OBSERVED_ROWS.lock().unwrap();
-                rows.plan = Some(input_plan);
-                rows.rows.clear();
-            }
-            OBSERVE_QUEUE.lock().unwrap().next = None;
-            change(|script| script.reads.clear());
-            let captured = capture_setup_readback_scope(Some(revision));
-            if old_choice {
-                let _ = begin_setup_choice(&plan, false, 0);
-            }
-            let (native, events) = Native::new(root.path().to_owned());
-            native
-                .attached
-                .store(attached, std::sync::atomic::Ordering::Release);
-            let worker = if old_choice {
-                native.start_with(revision, Some(captured))
-            } else {
-                native.start_observing(revision)
-            }
-            .unwrap()
-            .unwrap();
-            let mut owned = ScopedWorker {
-                root: root.path().to_owned(),
-                revision,
-                native,
-                worker: Some(worker),
-            };
-            let event = events.recv_timeout(HANG).unwrap();
-            let ready = setup_readings().observed.iter().any(|row| {
-                row.subject == caps
-                    && row.standing == Standing::InPlace
-                    && row.now.as_deref() == Some("Control")
-            });
-            let rereads = script().reads.len();
-            let queued = OBSERVE_QUEUE.lock().unwrap().next.is_some();
-            if matches!(event, Event::Waiting) {
-                setup.stop_revision(revision).unwrap();
-                owned.native.wake();
-                loop {
-                    if matches!(events.recv_timeout(HANG).unwrap(), Event::Finished) {
-                        break;
-                    }
-                }
-            }
-            owned.worker.take().unwrap().join().unwrap();
-            drop(owned);
-            if attached && !old_choice {
-                let actor = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
-                let (activation, retired) =
-                    super::input_attachments::activate_observing(|invalidate| {
-                        aterm_machines::init::activate_keyboard_attachments(
-                            &actor,
-                            &[41, 42],
-                            &|_| false,
-                            &|| true,
-                            invalidate,
-                        )
-                    });
-                assert!(matches!(
-                    activation.unwrap(),
-                    aterm_machines::init::KeyboardAttachmentActivation::Verified(_)
-                ));
-                assert!(!retired, "a real no-op does not queue a success refresh");
-                assert!(
-                    setup_readings()
-                        .observed
-                        .iter()
-                        .any(|row| row.subject == caps && row.standing == Standing::InPlace)
-                );
-                assert!(actor.keyboard_changes().is_empty());
-                use aterm_machines::model::PValue;
-                use aterm_machines::port::{Cmd, Ran, System};
-                let census = actor
-                    .run(&aterm_machines::facts::hidutil_keyboards())
-                    .unwrap()
-                    .out();
-                let original = actor
-                    .run(&Cmd::new("/usr/bin/hidutil").arg("dump"))
-                    .unwrap()
-                    .out();
-                let defaults = actor
-                    .run(&Cmd::new("/usr/bin/defaults").arg("-g"))
-                    .unwrap()
-                    .out();
-                let mut unmapped = aterm_machines::plist::parse(original.as_bytes()).unwrap();
-                fn without_user_mapping(value: &mut PValue) {
-                    match value {
-                        PValue::Dict(fields) => {
-                            for (name, value) in fields {
-                                if name == "UserKeyMapping" {
-                                    *value = PValue::Array(Vec::new());
-                                } else {
-                                    without_user_mapping(value);
-                                }
-                            }
-                        }
-                        PValue::Array(values) => values.iter_mut().for_each(without_user_mapping),
-                        _ => {}
-                    }
-                }
-                without_user_mapping(&mut unmapped);
-                let unmapped = aterm_machines::plist::document(&unmapped);
-                actor.simulate(move |_, command| {
-                    let first = command.args.first().and_then(|arg| arg.to_str());
-                    match command.program.file_name().and_then(|name| name.to_str()) {
-                        Some("hidutil") if first == Some("list") => Some(Ran::ok(&census)),
-                        Some("hidutil") if first == Some("property") => Some(Ran::ok("RegistryID Key Value\n29 UserKeyMapping (null)\n2a UserKeyMapping (null)\n")),
-                        Some("hidutil") if first == Some("dump") => Some(Ran::ok(&unmapped)),
-                        Some("defaults") => Some(Ran::ok(&defaults)),
-                        _ => None,
-                    }
-                });
-                let current = setup_readings()
-                    .observed
-                    .into_iter()
-                    .find(|row| row.subject == caps)
-                    .unwrap();
-                let choices = OBSERVED_ROWS.lock().unwrap().choices;
-                let (entered, entering) = std::sync::mpsc::sync_channel(1);
-                let (release, released) = std::sync::mpsc::sync_channel(1);
-                type ActivationReply = (
-                    Result<aterm_machines::init::KeyboardAttachmentActivation, String>,
-                    bool,
-                    usize,
-                );
-                struct Effect {
-                    release: Option<std::sync::mpsc::SyncSender<()>>,
-                    worker: Option<std::thread::JoinHandle<ActivationReply>>,
-                }
-                impl Drop for Effect {
-                    fn drop(&mut self) {
-                        if let Some(release) = self.release.take() {
-                            let _ = release.send(());
-                        }
-                        if let Some(worker) = self.worker.take() {
-                            let _ = worker.join();
-                        }
-                    }
-                }
-                let mut effect = Effect {
-                    release: Some(release),
-                    worker: Some(std::thread::spawn(move || {
-                        let (result, retired) =
-                            super::input_attachments::activate_observing(|invalidate| {
-                                aterm_machines::init::activate_keyboard_attachments(
-                                    &actor,
-                                    &[41, 42],
-                                    &|_| false,
-                                    &|| true,
-                                    &|| {
-                                        invalidate();
-                                        entered.send(()).unwrap();
-                                        released
-                                            .recv_timeout(HANG)
-                                            .expect("effect was not released");
-                                    },
-                                )
-                            });
-                        (result, retired, actor.keyboard_changes().len())
-                    })),
-                };
-                entering.recv_timeout(HANG).unwrap();
-                change(|script| script.readings.push_back(vec![current.clone()]));
-                observe_rows(ObserveRequest {
-                    plan: Some(Plan::from(selection)),
-                    choices,
-                    subjects: vec![caps],
-                    forced: false,
-                    pending_repositories: false,
-                });
-                let mid_write = setup_readings();
-                change(|script| {
-                    script.hold = true;
-                    script.readings.push_back(vec![current]);
-                });
-                let mut late_reader = Reader(Some(std::thread::spawn(move || {
-                    observe_rows(ObserveRequest {
-                        plan: Some(Plan::from(selection)),
-                        choices,
-                        subjects: vec![caps],
-                        forced: false,
-                        pending_repositories: false,
-                    });
-                })));
-                wait_until("the reading begins inside the activation lease", || {
-                    script().reads.len() == 2
-                });
-                effect.release.take().unwrap().send(()).unwrap();
-                let (failed, retired, writes) = effect.worker.take().unwrap().join().unwrap();
-                release_readings();
-                late_reader.0.take().unwrap().join().unwrap();
-                assert!(
-                    matches!(
-                        failed.unwrap(),
-                        aterm_machines::init::KeyboardAttachmentActivation::Unfinished
-                    ) && retired
-                );
-                assert_eq!(
-                    writes, 2,
-                    "the actual setter wrote both services before failed readback"
-                );
-                assert!(mid_write.running.contains(&Setting::CapsLock));
-                assert!(!mid_write.observed.iter().any(|row| row.subject == caps));
-                assert!(
-                    !setup_readings()
-                        .observed
-                        .iter()
-                        .any(|row| row.subject == caps),
-                    "a reader begun mid-write cannot republish after the lease ends"
-                );
-                assert!(setup_readings().running.is_empty());
-            }
-            assert_eq!(
-                ready,
-                attached && !old_choice,
-                "scoped pass attached={attached}, oldchoice={old_choice}"
-            );
-            assert_eq!(
-                rereads, 0,
-                "the owned scoped pass did not start an observer"
-            );
-            assert!(!queued, "the scoped hook owes no whole-page refresh");
-            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
-        }
-    }
-
-    #[test]
-    fn preference_readings_unwind_without_leaving_activity_or_busy() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        for follow_up in [false, true] {
-            OBSERVE_QUEUE.lock().unwrap().running = true;
-            let result = std::panic::catch_unwind(|| {
-                if follow_up {
-                    finish_withheld_preferences_with(|reserve, _stopped| {
-                        let _reserved = reserve();
-                        panic!("injected follow-up panic");
-                    });
-                } else {
-                    assert!(take_initial_setup_slot_now());
-                    let _busy = InitialSetupBusy { observation: None };
-                    with_restore_readings(|| panic!("injected restore panic"));
-                }
-            });
-            assert!(result.is_err());
-            assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
-            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
-            let fresh = {
-                let mut queue = OBSERVE_QUEUE.lock().unwrap();
-                queue.running = false;
-                queue.next.take()
-            };
-            assert!(
-                fresh.is_some(),
-                "an unwound preference change is read again"
-            );
-        }
-    }
-
-    #[test]
-    fn a_follow_up_that_never_reserves_leaves_its_readings_alone() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        let widgets = Observation::unknown(Subject::Setting(Setting::Widgets));
-        let source = "https://example.invalid/current-vault".to_owned();
-        {
-            let mut rows = OBSERVED_ROWS.lock().unwrap();
-            rows.rows = vec![widgets.clone()];
-            rows.vault_url = Some(source.clone());
-        }
-        let epoch = SETUP_ACTIVITY.lock().unwrap().epoch;
-        let generation = OBSERVED_ROWS.lock().unwrap().generation;
-        // The CLI calls reserve only once it has found owed work and Full
-        // Disk Access. Both earlier exits take this same unreserved path.
-        assert_eq!(finish_withheld_preferences_with(|_, _| None::<()>), None);
-        assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(SETUP_ACTIVITY.lock().unwrap().epoch, epoch);
-        let rows = OBSERVED_ROWS.lock().unwrap();
-        assert_eq!(rows.rows, [widgets]);
-        assert_eq!(rows.vault_url, Some(source));
-        assert_eq!(rows.generation, generation);
-        assert!(script().reads.is_empty());
-        let queue = OBSERVE_QUEUE.lock().unwrap();
-        assert!(!queue.running && queue.next.is_none() && queue.check.is_none());
-    }
-
-    #[test]
-    fn a_partial_observation_of_another_vault_retires_both_source_rows() {
-        use aterm_types::macos_setup::{Access, Standing};
-
-        let _globals = globals();
-        let _io = TestIo::install();
-        let caps = Subject::Setting(Setting::CapsLock);
-        let secrets = Subject::Setting(Setting::Secrets);
-        let repositories = Subject::Setting(Setting::Repositories);
-        let access = Subject::Access(Access::FullDiskAccess);
-        let reading = |subject, standing, note: &str| Observation {
-            subject,
-            standing,
-            now: None,
-            after_login: None,
-            wanted: subject.wanted().to_owned(),
-            note: Some(note.to_owned()),
-            detail: None,
-        };
-        let old = Plan::default();
-        let kept = reading(caps, Standing::InPlace, "independent keyboard reading");
-        let choices = {
-            let mut rows = OBSERVED_ROWS.lock().unwrap();
-            rows.rows = vec![
-                kept.clone(),
-                reading(secrets, Standing::NeedsYou, "old source approval OLD42"),
-                reading(
-                    repositories,
-                    Standing::Failed,
-                    "old source authentication failure",
-                ),
-            ];
-            rows.plan = Some(old.clone());
-            rows.vault_url = Some(old.vault_url);
-            rows.choices
-        };
-        let current = Plan {
-            vault_url: "  http://current-vault.local:7484/v1/team  ".into(),
-            ..Plan::default()
-        };
-        change(|script| {
-            script.readings = [
-                vec![reading(
-                    access,
-                    Standing::Differs,
-                    "access reading for current plan",
-                )],
-                vec![reading(
-                    repositories,
-                    Standing::Waiting,
-                    "current repository reading",
-                )],
-            ]
-            .into();
-        });
-        observe_rows(ObserveRequest {
-            plan: Some(current.clone()),
-            choices,
-            subjects: vec![access],
-            forced: false,
-            pending_repositories: false,
-        });
-        {
-            let rows = OBSERVED_ROWS.lock().unwrap();
-            assert_eq!(rows.vault_url.as_deref(), Some(current.vault_url.trim()));
-            assert!(rows.rows.contains(&kept));
-            assert!(rows.rows.iter().any(|row| row.subject == access));
-            assert!(!rows.rows.iter().any(|row| row.subject.uses_vault_source()));
-        }
-        // A later partial repository read cannot relabel the old Secrets
-        // code as belonging to the current source.
-        observe_rows(ObserveRequest {
-            plan: None,
-            choices,
-            subjects: vec![repositories],
-            forced: false,
-            pending_repositories: false,
-        });
-        let rows = OBSERVED_ROWS.lock().unwrap();
-        assert!(rows.rows.contains(&kept));
-        assert!(rows.rows.iter().any(|row| row.subject == repositories));
-        assert!(!rows.rows.iter().any(|row| row.subject == secrets));
-        assert!(!rows.rows.iter().any(|row| {
-            row.note
-                .as_deref()
-                .is_some_and(|note| note.contains("OLD42"))
-        }));
-    }
-
-    #[test]
-    fn a_refused_choice_gives_stop_back_the_run_it_unregistered() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Run 7 is parked, so the person's choice takes the free slot and
-        // drops run 7's registration; then it is refused (another aterm or
-        // `aterm doctor` holds the claim, or the plan could not be saved).
-        set_setup_run(Some(7));
-        let choices = OBSERVED_ROWS.lock().unwrap().choices;
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(false));
-        wait_until("the refused choice is let go", || {
-            OBSERVED_ROWS.lock().unwrap().choices == choices + 2
-        });
-        // Run 7 is the run a Stop stops again: pressed now, it stops run 7.
-        assert_eq!(setup_run(), Some(7));
-        assert!(stop_initial_setup());
-        assert!(setup_stop_requested(7));
-        wait_until("run 7's Stop is saved", stop_worker_idle);
-        assert_eq!(script().stops, [7]);
-        // Readings go back to the plan in force.
-        assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, None);
-
-        // A run that registered while the choice was refused keeps its place.
-        reset_worker_state();
-        set_setup_run(Some(7));
-        script().registers = Some(8);
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        let choices = OBSERVED_ROWS.lock().unwrap().choices;
-        assert!(restart_initial_setup(left_as_is(), false, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(false));
-        wait_until("the refused choice is let go", || {
-            OBSERVED_ROWS.lock().unwrap().choices == choices + 2
-        });
-        assert_eq!(setup_run(), Some(8));
-    }
-
-    /// The window's wiring (`wire_window`) registers the access-record watcher (System State
-    /// design §6): a line written to the record wakes a run parked on the Permissions stage and
-    /// queues a reading of every Access row. A reading already running stands in, so this test
-    /// reads no grant of this Mac; the record is a scratch folder's.
-    #[test]
-    fn an_access_step_on_record_wakes_the_run_and_reads_the_access_rows() {
-        use aterm_types::macos_setup::{Access, AccessOutcome, Subject, access_record};
-        let _globals = SETUP_GLOBALS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap();
-            assert!(!queue.running, "no reading runs in this test binary");
-            queue.running = true;
-            queue.next = None;
-            queue.check = None;
-        }
-        // The wiring `run_window` does before the GUI starts, as a headless
-        // window's (no LAN agent retirement): the watcher must be part of it.
-        let _ = wire_window(&[OsString::from("--headless")]);
-        let woken = SETUP_WAKES.count();
-        let state = aterm_tempfile::tempdir().unwrap();
-        access_record::append(
-            state.path(),
-            7,
-            Access::FullDiskAccess,
-            AccessOutcome::Granted,
-        )
-        .unwrap();
-        let queued = {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap();
-            queue.running = false;
-            queue.next.take()
-        };
-        assert!(SETUP_WAKES.count() > woken, "a parked run is woken");
-        let queued = queued.expect("a reading of the Access rows is asked for");
-        assert_eq!(queued.plan, None, "the page's plan is kept");
-        assert_eq!(queued.subjects, Access::ALL.map(Subject::Access).to_vec());
-        assert!(!queued.forced);
-    }
-
-    #[test]
-    fn a_timed_out_dialog_waiter_wakes_setup_after_the_last_guard_ends() {
-        use aterm_types::macos_setup::MacosDialog;
-        use std::cell::Cell;
-        use std::time::Duration;
-
-        let _globals = globals();
-        let _ = wire_window(&[OsString::from("--headless")]);
-        for released_before_park in [true, false] {
-            let first = MacosDialog::up();
-            let last = MacosDialog::up();
-            let seen = SETUP_WAKES.count();
-            assert!(MacosDialog::when_none_up(Duration::from_nanos(1)).is_none());
-            drop(first);
-            assert_eq!(SETUP_WAKES.count(), seen, "one dialog remains up");
-
-            let mut last = Some(last);
-            if released_before_park {
-                drop(last.take());
-            }
-            let waits = Cell::new(0);
-            wait_for_setup_park_change(
-                || (),
-                |_| false,
-                || SETUP_WAKES.count() == seen,
-                || {
-                    assert!(
-                        !released_before_park && waits.get() == 0,
-                        "a released dialog must wake this wait without a focus or grant change"
-                    );
-                    waits.set(waits.get() + 1);
-                    drop(last.take());
-                },
-            );
-            assert_eq!(waits.get(), usize::from(!released_before_park));
-            assert_eq!(SETUP_WAKES.count(), seen + 1);
-        }
-    }
-
-    #[test]
-    fn dialog_ownership_without_a_blocking_waiter_leaves_setup_parked() {
-        use aterm_types::macos_setup::MacosDialog;
-        use std::cell::Cell;
-        use std::time::Duration;
-
-        let _globals = globals();
-        let _ = wire_window(&[OsString::from("--headless")]);
-        let seen = SETUP_WAKES.count();
-        let own = MacosDialog::when_none_up(Duration::from_nanos(1)).unwrap();
-        assert!(MacosDialog::when_none_up(Duration::ZERO).is_none());
-        drop(own);
-        assert_eq!(SETUP_WAKES.count(), seen);
-
-        // Neither a successful stage's own dialog nor an immediate UI slot
-        // probe moves an unanswered Accessibility row. It still needs a person.
-        let waits = Cell::new(0);
-        wait_for_setup_park_change(
-            || (),
-            |_| false,
-            || waits.get() < 2,
-            || {
-                assert_eq!(SETUP_WAKES.count(), seen);
-                waits.set(waits.get() + 1);
-            },
-        );
-        assert_eq!(waits.get(), 2);
-    }
-
-    #[test]
-    fn a_choice_that_holds_the_slot_leaves_stop_to_the_run_it_admits() {
-        let _globals = globals();
-        let _io = TestIo::install();
-        // Run 7 is parked. A choice made while a pass runs stops that pass.
-        set_setup_run(Some(7));
-        // No later choice overtakes these two.
-        let generation = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-        let running = begin_setup_choice(&Plan::default(), false, generation);
-        assert_eq!((setup_run(), running.replaced), (Some(7), None));
-        // A choice that took the slot replaces run 7 once admitted. Until its own run registers
-        // there is nothing for a Stop to take; a Stop pressed meanwhile stops that run as it
-        // registers, or run 7 as a refusal gives it back.
-        let holding = begin_setup_choice(&Plan::default(), true, generation);
-        assert_eq!((setup_run(), holding.replaced), (None, Some(7)));
-        // Refusing the earlier choice keeps the later one's plan; refusing the choice that holds
-        // the slot gives run 7 back.
-        forget_setup_choice(&running);
-        assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(Plan::default()));
-        forget_setup_choice(&holding);
-        assert_eq!(setup_run(), Some(7));
-        assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, None);
-    }
-}
+mod initial_setup_result_tests;
 
 fn spawn_handoff_argv(request: &aterm_cli::WindowRequest) -> Vec<OsString> {
     let mut argv = vec![OsString::from(aterm_cli::Verb::NewWindow.name())];
@@ -16160,8 +10439,16 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         for line in UPDATE_HELP_LINUX {
             println!("{line}");
         }
+        #[cfg(windows)]
+        for line in UPDATE_HELP_WINDOWS {
+            println!("{line}");
+        }
         println!("`aterm help update` has the rest.");
         return ExitCode::SUCCESS;
+    }
+    #[cfg(windows)]
+    if let Some(code) = windows_update_verb(rest, build) {
+        return code;
     }
     #[cfg(target_os = "linux")]
     if let Some(sub) = first
@@ -16261,7 +10548,8 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         lane.as_ref(),
         now,
         aterm_update_core::settings::update_auto_apply(),
-        aterm_update::automatic(),
+        // Off only where a read said so: one with no answer says nothing of the setting.
+        aterm_update::automatic_at_launch() != Some(false),
         &DevCopy::of_this_copy(checking),
         &update_log_hint(),
     );
@@ -16288,6 +10576,8 @@ const fn no_ledger_fails(checking: bool) -> bool {
 
 const UPDATE_USAGE: &str = if cfg!(target_os = "linux") {
     "usage: aterm update [status|check] [-v] | identity | enable | apply | rollback"
+} else if cfg!(windows) {
+    "usage: aterm update [status|check] [-v] | apply [--restart] | identity"
 } else {
     "usage: aterm update [status|check] [-v] | identity"
 };
@@ -16308,6 +10598,106 @@ const UPDATE_HELP_LINUX: &[&str] = &[
     "  rollback   go back to the previous executable",
     "An update replaces only the executable on disk; running sessions keep running.",
 ];
+
+/// The Windows delivery's own words, under [`UPDATE_HELP`] on Windows alone.
+#[cfg(windows)]
+const UPDATE_HELP_WINDOWS: &[&str] = &[
+    "  apply      install the staged build over this copy; nothing is stopped, open",
+    "             windows keep running until they are restarted",
+    "  --restart  with apply: save the open windows, install, and start aterm again",
+    "On Windows nothing is downloaded: status and check read the build that",
+    "`aterm-winship update` staged on this machine.",
+];
+
+/// `aterm update status|check|apply` on Windows, where the update is a build staged on this
+/// machine (`aterm_update::windows`): `None` for a word that is not one of those three.
+#[cfg(windows)]
+fn windows_update_verb(rest: &[OsString], build: u64) -> Option<ExitCode> {
+    use aterm_update::windows as staged;
+    let mut sub: Option<String> = None;
+    let mut restart = false;
+    let mut stray: Option<String> = None;
+    for arg in rest.iter().map(|a| a.to_string_lossy()) {
+        match arg.as_ref() {
+            "-v" | "--verbose" => {}
+            "--restart" => restart = true,
+            word if sub.is_none() && !word.starts_with('-') => sub = Some(word.to_string()),
+            other => {
+                stray.get_or_insert_with(|| other.to_string());
+            }
+        }
+    }
+    let sub = sub.as_deref().unwrap_or("status");
+    if !matches!(sub, "status" | "check" | "apply") {
+        return None;
+    }
+    if let Some(stray) = stray {
+        eprintln!("aterm update: unknown argument {stray:?} ({UPDATE_USAGE})");
+        return Some(ExitCode::from(2));
+    }
+    if restart && sub != "apply" {
+        eprintln!("aterm update: --restart goes with apply ({UPDATE_USAGE})");
+        return Some(ExitCode::from(2));
+    }
+    let running = staged::Running {
+        version: aterm_stamp::app_version(),
+        commit: aterm_stamp::current().git_commit,
+        build_number: build,
+    };
+    let here = staged::here(running);
+    if sub == "apply" {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                eprintln!("aterm update: cannot locate this executable ({error})");
+                return Some(ExitCode::FAILURE);
+            }
+        };
+        let mode = if restart {
+            staged::ApplyMode::Restart
+        } else {
+            staged::ApplyMode::Staged
+        };
+        return Some(
+            match staged::apply(&here.standing, &exe, mode, staged::InstallerOutput::Inherit) {
+                Ok(applied) => {
+                    let (name, dest) = (applied.staged.name(), applied.dest.display());
+                    if restart {
+                        // `install.ps1 -Restart` hands the work to a detached helper and
+                        // returns: the install and the relaunch follow this line.
+                        println!(
+                            "aterm update: the installer took {name} \u{2014} it saves the open \
+                             windows, installs into {dest} and starts aterm again"
+                        );
+                    } else {
+                        println!(
+                            "aterm update: installed {name} into {dest} \u{2014} open windows \
+                             keep running build {build} until they are restarted; new windows \
+                             and shells use the new build"
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(why) => {
+                    eprintln!("aterm update: {why}");
+                    ExitCode::FAILURE
+                }
+            },
+        );
+    }
+    let lines = staged::status_lines(running, &here);
+    aterm_log::info!("aterm update: {}", lines.join(" | "));
+    for line in lines {
+        println!("{line}");
+    }
+    Some(
+        if sub == "check" && matches!(here.standing, staged::Standing::Unreadable(_)) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
+}
 
 /// A word of ours in the wrong place: `identity` with more after it, or on Linux a delivery
 /// word after a flag (that route takes the word only first).
@@ -16943,7 +11333,7 @@ mod host_startup;
 #[path = "doctor.rs"]
 mod doctor;
 
-/// Compiler-provenance probe: `build.rs` `include!`s it to stamp [`COMPILED`]'s values; this
+/// Compiler-provenance probe: `build.rs` mounts it by `#[path]` to stamp [`COMPILED`]'s values; this
 /// test-only mount runs the same code against real `-vV` fixtures.
 #[cfg(test)]
 mod compiler_probe;
@@ -16952,3055 +11342,9 @@ mod compiler_probe;
 mod startup_scope_tests;
 
 #[cfg(test)]
-mod tests {
-    /// The command exits with the package pass's own status whatever the follow-up's, a panic
-    /// included, and the follow-up runs after the pass, only for a person's pass whose words
-    /// setup follows ([`atpkg::cli::pass_finishes_setup`] holds the grammar) and that ended
-    /// settled ([`atpkg::cli::pass_ended_settled`] holds what each exit means): a success, or a
-    /// whole update's 2 that found nothing installable here, never a usage error's 2.
-    #[test]
-    fn a_package_pass_keeps_its_status_and_setup_follows_only_a_persons_settled_pass() {
-        use std::cell::RefCell;
-        use std::ffi::OsString;
-        use std::process::ExitCode;
-        let ok = (ExitCode::SUCCESS, true);
-        let nothing_here = (ExitCode::from(2), true);
-        for (words, person, (package_code, settled), follows) in [
-            (&["install", "trust"][..], true, ok, true),
-            (&["update"], true, ok, true),
-            (&["update"], true, nothing_here, true),
-            (
-                &["update", "--bogus"],
-                true,
-                (ExitCode::from(2), false),
-                false,
-            ),
-            (&["update"], true, (ExitCode::from(2), false), false),
-            (&["update"], true, (ExitCode::FAILURE, false), false),
-            (&["update"], true, (ExitCode::from(75), false), false),
-            (&["update"], false, ok, false),
-            (&["update"], false, nothing_here, false),
-            (
-                &["update", "claude", "--wait-lock", "1800"],
-                true,
-                ok,
-                false,
-            ),
-            (&["install", "--help"], true, ok, false),
-            (&["install", "clt"], true, ok, false),
-            (
-                &["install", "claude", atpkg::cli::NO_INIT_FLAG],
-                true,
-                ok,
-                false,
-            ),
-        ] {
-            for setup_code in [
-                Some(ExitCode::SUCCESS),
-                Some(ExitCode::from(75)),
-                Some(ExitCode::from(77)),
-                Some(ExitCode::from(69)),
-                Some(ExitCode::FAILURE),
-                None,
-            ] {
-                let events = RefCell::new(Vec::new());
-                let prepares = person
-                    && atpkg::cli::pass_finishes_setup(
-                        &words.iter().map(OsString::from).collect::<Vec<_>>(),
-                    );
-                let code = super::package_entry_with(
-                    words.iter().map(OsString::from).collect(),
-                    person,
-                    |forwarded| {
-                        assert_eq!(
-                            forwarded,
-                            std::iter::once(OsString::from("pkg"))
-                                .chain(words.iter().map(OsString::from))
-                                .collect::<Vec<_>>()
-                        );
-                        events.borrow_mut().push("prepare");
-                        None
-                    },
-                    |args| {
-                        assert_eq!(args, words.iter().map(OsString::from).collect::<Vec<_>>());
-                        events.borrow_mut().push("packages");
-                        (package_code, settled)
-                    },
-                    || {
-                        assert_eq!(*events.borrow(), ["prepare", "packages"]);
-                        events.borrow_mut().push("setup");
-                        setup_code.unwrap_or_else(|| panic!("setup panicked"))
-                    },
-                );
-                let want: &[&str] = if follows {
-                    &["prepare", "packages", "setup"]
-                } else if prepares {
-                    &["prepare", "packages"]
-                } else {
-                    &["packages"]
-                };
-                assert_eq!(events.borrow().as_slice(), want, "{words:?}");
-                assert_eq!(code, package_code, "{words:?} then {setup_code:?}");
-            }
-        }
-        let events = RefCell::new(Vec::new());
-        let words = vec![
-            OsString::from("update"),
-            OsString::from("--aterm-front-door-routing-probe"),
-        ];
-        let code = super::package_entry_with(
-            words.clone(),
-            true,
-            |forwarded| {
-                assert_eq!(
-                    forwarded,
-                    [vec![OsString::from("pkg")], words.clone()].concat()
-                );
-                events.borrow_mut().push("prepare");
-                None
-            },
-            |args| {
-                assert_eq!(*events.borrow(), ["prepare"]);
-                events.borrow_mut().push("parser");
-                let code = atpkg::cli::main_entry(args);
-                (code, atpkg::cli::pass_ended_settled(code))
-            },
-            || panic!("a rejected package operand cannot enter setup"),
-        );
-        assert_eq!(code, ExitCode::from(2));
-        assert_eq!(*events.borrow(), ["prepare", "parser"]);
-        let code = super::package_entry_with(
-            words,
-            true,
-            |_| Some(ExitCode::from(2)),
-            |_| panic!("the original must not run a handed-off pass again"),
-            || panic!("the original must not enter setup after handoff"),
-        );
-        assert_eq!(code, ExitCode::from(2));
-    }
-
-    /// The follow-up's person ([`super::a_person_at_their_own_account_from`]): typed at a
-    /// terminal, not root, in their own login's home, and not under CI, whatever `CI` says.
-    #[test]
-    fn setup_follows_no_pass_under_ci_root_or_another_home() {
-        use std::ffi::OsString;
-        fn env(ci: Option<&'static str>) -> impl Fn(&str) -> Option<OsString> {
-            move |name| ci.filter(|_| name == "CI").map(OsString::from)
-        }
-        for (typed, uid, live, ci, person) in [
-            (true, 501, true, None, true),
-            (true, 501, true, Some("true"), false),
-            (true, 501, true, Some(""), false),
-            (false, 501, true, None, false),
-            (true, 0, true, None, false),
-            (true, 501, false, None, false),
-        ] {
-            assert_eq!(
-                super::a_person_at_their_own_account_from(typed, uid, live, env(ci)),
-                person,
-                "typed {typed}, uid {uid}, live {live}, CI {ci:?}"
-            );
-        }
-    }
-
-    mod setup_startup {
-        use super::super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
-        use aterm_gui::WorkstationSetupDecision::{self, Begin, Unavailable};
-        use aterm_types::macos_setup::{Plan, Selection, Setting};
-        use std::cell::{Cell, RefCell};
-        use std::collections::VecDeque;
-        use std::rc::Rc;
-
-        fn plan(selection: Selection) -> Plan {
-            Plan {
-                selection,
-                ..Plan::default()
-            }
-        }
-
-        struct Claim(Rc<Cell<usize>>);
-
-        impl Drop for Claim {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() - 1);
-            }
-        }
-
-        #[derive(Default)]
-        struct Host {
-            revisions: VecDeque<Result<u64, &'static str>>,
-            claims: VecDeque<Result<bool, &'static str>>,
-            finished: VecDeque<Result<bool, &'static str>>,
-            known_admissions: VecDeque<Result<Option<SetupAdmission>, &'static str>>,
-            offers: VecDeque<WorkstationSetupDecision>,
-            initial: VecDeque<Result<Plan, &'static str>>,
-            authorizations: VecDeque<Result<(), &'static str>>,
-            admissions: VecDeque<Option<u64>>,
-            offered: Vec<Plan>,
-            authorized: Vec<Plan>,
-            active: Rc<Cell<usize>>,
-            held_during_backoff: Vec<usize>,
-            failures: Vec<String>,
-            bind_calls: usize,
-            claim_calls: usize,
-            offer_calls: usize,
-            invalid_plan: bool,
-            pending_authorization: bool,
-            terminal_authorization_error: bool,
-            /// Whether a person's choice waits for the claim, look by look.
-            choice_awaits: VecDeque<bool>,
-            /// Waits before a retried write of the page's answer, each holding
-            /// the claim.
-            retry_waits: usize,
-        }
-
-        impl SetupStartup for Host {
-            type Claim = Claim;
-
-            fn choice_awaits_claim(&mut self) -> bool {
-                self.choice_awaits.pop_front().unwrap_or(false)
-            }
-
-            fn bind_authorization(&mut self) -> Result<u64, String> {
-                self.bind_calls += 1;
-                assert_eq!(self.bind_calls, 1, "capture the startup review once");
-                self.revision()
-            }
-
-            fn revision(&mut self) -> Result<u64, String> {
-                self.revisions
-                    .pop_front()
-                    .unwrap_or(Ok(0))
-                    .map_err(str::to_owned)
-            }
-
-            fn claim(&mut self) -> Result<Option<Claim>, String> {
-                self.claim_calls += 1;
-                assert_eq!(self.active.get(), 0, "never claim over our existing lease");
-                self.claims
-                    .pop_front()
-                    .expect("unexpected claim attempt")
-                    .map(|acquired| {
-                        acquired.then(|| {
-                            self.active.set(1);
-                            Claim(Rc::clone(&self.active))
-                        })
-                    })
-                    .map_err(str::to_owned)
-            }
-
-            fn finished(&mut self) -> Result<bool, String> {
-                self.finished
-                    .pop_front()
-                    .expect("unexpected marker read")
-                    .map_err(str::to_owned)
-            }
-
-            fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
-                assert_eq!(self.active.get(), 1, "admission is read under our claim");
-                self.known_admissions
-                    .pop_front()
-                    .unwrap_or(Ok(None))
-                    .map_err(str::to_owned)
-            }
-
-            fn initial(&mut self) -> Result<Plan, String> {
-                self.initial
-                    .pop_front()
-                    .unwrap_or(Ok(Plan::default()))
-                    .map_err(str::to_owned)
-            }
-
-            fn offer(&mut self, initial: Plan) -> WorkstationSetupDecision {
-                self.offer_calls += 1;
-                self.offered.push(initial);
-                assert_eq!(self.active.get(), 1, "offer requires an exclusive claim");
-                self.offers.pop_front().expect("unexpected offer")
-            }
-
-            fn authorize(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
-                assert_eq!(self.active.get(), 1, "authorization keeps the setup claim");
-                self.authorized.push(plan.clone());
-                let result = self.authorizations.pop_front().unwrap_or(Ok(()));
-                self.pending_authorization = result.is_err() && !self.terminal_authorization_error;
-                result.map_err(str::to_owned)?;
-                Ok(self.admissions.pop_front().unwrap_or(Some(1)))
-            }
-
-            fn authorization_pending(&self) -> bool {
-                self.pending_authorization
-            }
-
-            fn validate(&mut self, _: &Plan) -> Result<(), String> {
-                if self.invalid_plan {
-                    Err("the selected vault URL is invalid".into())
-                } else {
-                    Ok(())
-                }
-            }
-
-            fn wait_holding_claim(&mut self) -> bool {
-                assert_eq!(self.active.get(), 1, "this wait holds the claim");
-                self.retry_waits += 1;
-                self.choice_awaits_claim()
-            }
-
-            fn backoff(&mut self) {
-                self.held_during_backoff.push(self.active.get());
-            }
-
-            fn report_failure(&mut self, why: &str) {
-                self.failures.push(why.to_owned());
-            }
-        }
-
-        /// The person closes the page that showed the offer (Cmd-W): the page lets it go
-        /// unanswered, and the startup, holding nothing while it waits, offers it again; the
-        /// page that shows it next, quietly behind the person's tab, answers it at once, so
-        /// setup goes on with nothing asked (design §6.1).
-        /// NEGATIVE CONTROL: a startup that ends at the first let-go admits nothing here.
-        #[test]
-        fn an_offer_its_page_let_go_is_offered_again_and_admitted() {
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(false)].into(),
-                offers: [Unavailable, Begin(Plan::default())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(result, PreparedSetup::Authorized { .. }));
-            assert_eq!((host.claim_calls, host.offer_calls), (2, 2));
-            assert_eq!(
-                host.held_during_backoff,
-                [0],
-                "no claim held between offers"
-            );
-            assert_eq!(host.authorized, [Plan::default()]);
-            assert!(host.failures.is_empty());
-            drop(result);
-        }
-
-        #[test]
-        fn a_window_retries_initial_claim_errors_before_its_first_offer() {
-            let mut host = Host {
-                claims: [Err("temporary state I/O"), Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(result, PreparedSetup::Authorized { .. }));
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.offer_calls, 1);
-            assert_eq!(host.held_during_backoff, [0]);
-            assert_eq!(host.failures, ["temporary state I/O"]);
-            assert_eq!(host.active.get(), 1, "worker inherits the live claim");
-            drop(result);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn a_choice_made_while_the_plan_is_read_gets_the_claim_before_any_offer() {
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false), Ok(false)].into(),
-                choice_awaits: [true, false].into(),
-                offers: [Begin(Plan::default())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(result, PreparedSetup::Authorized { .. }));
-            // It let the claim go before it waited, and offered only once no
-            // choice waited for it.
-            assert_eq!(host.held_during_backoff, [0]);
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.offer_calls, 1);
-        }
-
-        fn assert_pre_offer_failure_releases_claim(initial_read: bool) {
-            let selected = plan(Selection::from_bits(1).unwrap());
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: if initial_read {
-                    [Ok(false), Ok(false), Ok(false)].into()
-                } else {
-                    [
-                        Err("pre-offer completion read failed"),
-                        Ok(false),
-                        Ok(false),
-                    ]
-                    .into()
-                },
-                initial: if initial_read {
-                    [Err("pre-offer plan read failed"), Ok(selected.clone())].into()
-                } else {
-                    [Ok(selected.clone())].into()
-                },
-                offers: [Begin(selected.clone())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(result, PreparedSetup::Authorized { .. }));
-            assert_eq!(
-                host.held_during_backoff,
-                [0],
-                "before a decision, manual repair must be able to claim setup"
-            );
-            assert_eq!(host.claim_calls, 2, "reload only under a fresh claim");
-            assert_eq!(host.offered.as_slice(), std::slice::from_ref(&selected));
-            assert_eq!(host.authorized, [selected]);
-            assert_eq!(host.active.get(), 1, "the admitted worker keeps its claim");
-            drop(result);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn pre_offer_failure_releases_claim_after_a_plan_read_error() {
-            assert_pre_offer_failure_releases_claim(true);
-        }
-
-        #[test]
-        fn pre_offer_failure_releases_claim_after_a_completion_read_error() {
-            assert_pre_offer_failure_releases_claim(false);
-        }
-
-        #[test]
-        fn a_new_manual_run_during_startup_backoff_prevents_another_offer() {
-            for unavailable_offer in [false, true] {
-                let mut host = Host {
-                    revisions: [Ok(7), Ok(7), Ok(8)].into(),
-                    claims: [Ok(true), Ok(true)].into(),
-                    finished: [Ok(false), Ok(false)].into(),
-                    initial: if unavailable_offer {
-                        [Ok(Plan::default())].into()
-                    } else {
-                        [Err("initial source unreadable")].into()
-                    },
-                    offers: if unavailable_offer {
-                        [Unavailable].into()
-                    } else {
-                        VecDeque::new()
-                    },
-                    ..Host::default()
-                };
-                assert!(matches!(
-                    prepare_setup(&mut host).unwrap(),
-                    PreparedSetup::Unavailable
-                ));
-                assert_eq!(host.held_during_backoff, [0]);
-                assert_eq!(host.claim_calls, 2);
-                assert_eq!(host.offer_calls, usize::from(unavailable_offer));
-                assert!(
-                    host.authorized.is_empty(),
-                    "never replace the manual worker's password"
-                );
-                assert!(host.revisions.is_empty());
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        /// A startup that resumes a run an earlier process admitted (Quit & Reopen's relaunch
-        /// mid-setup) offers nothing, for review or otherwise, and writes no admission: the run
-        /// goes on under its own revision, with aterm's own permissions in its plan or not.
-        #[test]
-        fn an_admitted_pending_run_resumes_without_another_offer() {
-            let mut selected = Plan {
-                selection: Selection::from_bits(1 << 10).unwrap(),
-                vault_url: "http://saved.local/v1/team".into(),
-            };
-            selected.selection.set(Setting::Permissions, true);
-            let mut unpermitted = selected.clone();
-            unpermitted.selection.set(Setting::Permissions, false);
-            for plan in [selected.clone(), unpermitted] {
-                let admitted = SetupAdmission {
-                    plan: plan.clone(),
-                    revision: 7,
-                    completed: false,
-                };
-                let mut host = Host {
-                    revisions: [Ok(7), Ok(7)].into(),
-                    claims: [Ok(true)].into(),
-                    finished: [Ok(false), Ok(false)].into(),
-                    known_admissions: [Ok(Some(admitted))].into(),
-                    initial: [Ok(plan.clone())].into(),
-                    offers: [Begin(plan.clone())].into(),
-                    ..Host::default()
-                };
-                let result = prepare_setup(&mut host).unwrap();
-                assert_eq!(
-                    host.offer_calls, 0,
-                    "an admitted choice needs no second review"
-                );
-                assert!(
-                    host.authorized.is_empty(),
-                    "keep the live worker's admitted revision"
-                );
-                assert!(matches!(
-                    result,
-                    PreparedSetup::Authorized { revision: 7, .. }
-                ));
-                assert_eq!(host.initial, [Ok(plan)]);
-                assert_eq!(host.active.get(), 1);
-                drop(result);
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        #[test]
-        fn startup_admission_read_errors_never_fall_through_to_an_offer() {
-            let mut host = Host {
-                revisions: [Ok(7), Ok(7), Ok(7)].into(),
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false), Ok(false)].into(),
-                known_admissions: [
-                    Err("admission snapshot changed"),
-                    Ok(Some(SetupAdmission {
-                        plan: Plan::default(),
-                        revision: 7,
-                        completed: false,
-                    })),
-                ]
-                .into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(
-                result,
-                PreparedSetup::Authorized { revision: 7, .. }
-            ));
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.held_during_backoff, [0]);
-            drop(result);
-            assert_eq!(host.offer_calls, 0);
-            assert!(host.authorized.is_empty());
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn startup_admission_confirmation_cannot_adopt_a_newer_run() {
-            for (revision, completed) in [(8, false), (8, true), (7, true)] {
-                let mut host = Host {
-                    revisions: [Ok(7), Ok(7)].into(),
-                    claims: [Ok(true)].into(),
-                    finished: [Ok(false)].into(),
-                    known_admissions: [Ok(Some(SetupAdmission {
-                        plan: Plan::default(),
-                        revision,
-                        completed,
-                    }))]
-                    .into(),
-                    ..Host::default()
-                };
-                let result = prepare_setup(&mut host).unwrap();
-                if revision == 7 {
-                    assert!(matches!(result, PreparedSetup::Finished));
-                } else {
-                    assert!(matches!(result, PreparedSetup::Unavailable));
-                }
-                assert_eq!(host.offer_calls, 0);
-                assert!(host.authorized.is_empty());
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        struct AuthorizationTicket {
-            publication: u64,
-            target: Option<u64>,
-            pending: bool,
-        }
-
-        impl AuthorizationTicket {
-            fn bind(publication: u64) -> Self {
-                Self {
-                    publication,
-                    target: None,
-                    pending: true,
-                }
-            }
-        }
-
-        #[derive(Default)]
-        struct ReviewState {
-            publication: u64,
-            revision: u64,
-            finished: bool,
-            binds: usize,
-            claims: usize,
-            offers: usize,
-            writes: usize,
-            accepted: usize,
-            backoffs: usize,
-            failures: usize,
-        }
-
-        struct ReviewHost {
-            state: Rc<RefCell<ReviewState>>,
-            active: Rc<Cell<usize>>,
-            authorization: Option<AuthorizationTicket>,
-            selected: Plan,
-            replace_during_offer: bool,
-            fail_publication: bool,
-            fail_confirmations: usize,
-        }
-
-        impl SetupStartup for ReviewHost {
-            type Claim = Claim;
-
-            fn bind_authorization(&mut self) -> Result<u64, String> {
-                let mut state = self.state.borrow_mut();
-                state.binds += 1;
-                assert_eq!(state.binds, 1);
-                self.authorization = Some(AuthorizationTicket::bind(state.publication));
-                Ok(state.revision)
-            }
-
-            fn revision(&mut self) -> Result<u64, String> {
-                Ok(self.state.borrow().revision)
-            }
-
-            fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
-                assert_eq!(self.active.get(), 0);
-                self.active.set(1);
-                self.state.borrow_mut().claims += 1;
-                Ok(Some(Claim(Rc::clone(&self.active))))
-            }
-
-            fn finished(&mut self) -> Result<bool, String> {
-                assert_eq!(
-                    self.state.borrow().offers,
-                    0,
-                    "no Plan-only completion shortcut"
-                );
-                Ok(self.state.borrow().finished)
-            }
-
-            fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
-                assert_eq!(self.state.borrow().offers, 0);
-                Ok(None)
-            }
-
-            fn initial(&mut self) -> Result<Plan, String> {
-                Ok(self.selected.clone())
-            }
-
-            fn offer(&mut self, selected: Plan) -> WorkstationSetupDecision {
-                let mut state = self.state.borrow_mut();
-                state.offers += 1;
-                if self.replace_during_offer {
-                    state.revision += 1;
-                    state.publication += 1;
-                }
-                Begin(selected)
-            }
-
-            fn authorize(&mut self, selected: &Plan) -> Result<Option<u64>, String> {
-                assert_eq!(selected, &self.selected);
-                assert_eq!(self.active.get(), 1);
-                let ticket = self.authorization.as_mut().expect("carry the bound review");
-                let mut state = self.state.borrow_mut();
-                if ticket.publication != state.publication {
-                    ticket.pending = false;
-                    return Ok(None);
-                }
-                if ticket.target.is_none() {
-                    if state.finished {
-                        ticket.pending = false;
-                        return Ok(None);
-                    }
-                    state.revision += 1;
-                    state.publication += 1;
-                    state.writes += 1;
-                    ticket.publication = state.publication;
-                    ticket.target = Some(state.revision);
-                    state.finished = selected.selection.is_empty();
-                    if std::mem::take(&mut self.fail_publication) {
-                        return Err("owned admission published before its flush failed".into());
-                    }
-                } else if self.fail_confirmations > 0 {
-                    self.fail_confirmations -= 1;
-                    return Err("owned admission observation is not durable yet".into());
-                }
-                ticket.pending = false;
-                state.accepted += 1;
-                Ok(ticket.target)
-            }
-
-            fn authorization_pending(&self) -> bool {
-                self.authorization
-                    .as_ref()
-                    .is_some_and(|ticket| ticket.pending)
-            }
-
-            fn wait_holding_claim(&mut self) -> bool {
-                assert_eq!(self.active.get(), 1);
-                let mut state = self.state.borrow_mut();
-                assert_eq!(state.accepted, 0);
-                state.backoffs += 1;
-                false
-            }
-
-            fn backoff(&mut self) {
-                unreachable!("no choice waits for this claim");
-            }
-
-            fn report_failure(&mut self, _: &str) {
-                self.state.borrow_mut().failures += 1;
-            }
-        }
-
-        fn review_host(selected: Plan) -> ReviewHost {
-            ReviewHost {
-                state: Rc::new(RefCell::new(ReviewState::default())),
-                active: Rc::new(Cell::new(0)),
-                authorization: None,
-                selected,
-                replace_during_offer: false,
-                fail_publication: false,
-                fail_confirmations: 0,
-            }
-        }
-
-        #[test]
-        fn a_changed_offer_is_rejected_without_acknowledging_or_reauthorizing_it() {
-            for changed in [false, true] {
-                let mut host = review_host(Plan::default());
-                host.replace_during_offer = changed;
-                let prepared = prepare_setup(&mut host).unwrap();
-                assert_eq!(matches!(prepared, PreparedSetup::Unavailable), changed);
-                assert_eq!(
-                    matches!(prepared, PreparedSetup::Authorized { .. }),
-                    !changed
-                );
-                let state = host.state.borrow();
-                assert_eq!(state.binds, 1);
-                assert_eq!(state.claims, 1);
-                assert_eq!(state.offers, 1);
-                assert_eq!(state.writes, usize::from(!changed));
-                assert_eq!(state.accepted, usize::from(!changed));
-                assert_eq!(state.backoffs, 0);
-                drop(state);
-                drop(prepared);
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        #[test]
-        fn an_owned_empty_admission_is_confirmed_without_a_later_completion_shortcut() {
-            let mut host = review_host(plan(Selection::none()));
-            host.fail_publication = true;
-            host.fail_confirmations = 1;
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Finished
-            ));
-            let state = host.state.borrow();
-            assert_eq!(state.binds, 1);
-            assert_eq!(state.claims, 1);
-            assert_eq!(state.offers, 1);
-            assert_eq!(state.writes, 1);
-            assert_eq!(state.revision, 1);
-            assert_eq!(state.accepted, 1);
-            assert_eq!(state.backoffs, 2);
-            assert_eq!(state.failures, 2);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn an_unadmitted_pending_run_remains_reviewable_through_same_revision_recovery() {
-            let selected = plan(Selection::from_bits(1).unwrap());
-            for recover_read in [false, true] {
-                let mut host = Host {
-                    revisions: [Ok(7), Ok(7), Ok(7)].into(),
-                    claims: [Ok(true), Ok(true)].into(),
-                    finished: [Ok(false), Ok(false), Ok(false)].into(),
-                    initial: if recover_read {
-                        [Err("temporary source read"), Ok(selected.clone())].into()
-                    } else {
-                        [Ok(selected.clone())].into()
-                    },
-                    offers: [Begin(selected.clone())].into(),
-                    admissions: [Some(8)].into(),
-                    ..Host::default()
-                };
-                let result = prepare_setup(&mut host).unwrap();
-                assert!(matches!(
-                    result,
-                    PreparedSetup::Authorized { revision: 8, .. }
-                ));
-                assert_eq!(host.offered.as_slice(), std::slice::from_ref(&selected));
-                assert_eq!(host.authorized.as_slice(), std::slice::from_ref(&selected));
-                assert_eq!(host.claim_calls, if recover_read { 2 } else { 1 });
-                assert_eq!(
-                    host.held_during_backoff,
-                    if recover_read { vec![0] } else { Vec::new() }
-                );
-                drop(result);
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        #[test]
-        fn an_unreadable_startup_identity_cannot_be_adopted_after_a_manual_repair() {
-            let mut host = Host {
-                revisions: [Err("startup identity unreadable"), Ok(8)].into(),
-                ..Host::default()
-            };
-            assert_eq!(
-                prepare_setup(&mut host).err().as_deref(),
-                Some("startup identity unreadable")
-            );
-            assert_eq!(host.revisions, [Ok(8)]);
-            assert_eq!(host.claim_calls, 0);
-            assert_eq!(host.offer_calls, 0);
-            assert!(host.held_during_backoff.is_empty());
-            assert_eq!(host.failures.len(), 1);
-        }
-
-        #[test]
-        fn authorization_fence_returns_invalid_review_without_retry_or_authorization() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                invalid_plan: true,
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Unavailable
-            ));
-            assert!(host.authorized.is_empty());
-            assert!(host.held_during_backoff.is_empty());
-            assert_eq!(host.active.get(), 0);
-            assert_eq!(host.failures, ["the selected vault URL is invalid"]);
-        }
-
-        #[test]
-        fn authorization_fence_hands_off_the_committed_revision_before_any_later_read() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false), Err("completion read failed"), Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                admissions: [Some(7)].into(),
-                ..Host::default()
-            };
-            let prepared = prepare_setup(&mut host).unwrap();
-            assert!(matches!(
-                prepared,
-                PreparedSetup::Authorized { revision: 7, .. }
-            ));
-            assert_eq!(host.authorized, [Plan::default()]);
-            assert!(host.held_during_backoff.is_empty());
-            assert!(host.failures.is_empty());
-            assert_eq!(host.finished, [Err("completion read failed"), Ok(false)]);
-            drop(prepared);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn a_waiting_window_retries_a_failed_marker_read_then_takes_over() {
-            let mut host = Host {
-                claims: [Ok(false), Ok(true)].into(),
-                finished: [
-                    Err("temporary marker read"),
-                    Ok(false),
-                    Ok(false),
-                    Ok(false),
-                    Ok(false),
-                ]
-                .into(),
-                offers: [Begin(Plan::default())].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Authorized { .. }
-            ));
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.offer_calls, 1);
-            assert_eq!(host.held_during_backoff, [0, 0]);
-            assert_eq!(host.failures, ["temporary marker read"]);
-        }
-
-        #[test]
-        fn begin_keeps_its_claim_and_decision_while_its_owned_write_recovers() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                authorizations: [Err("owned authorization write failed"), Ok(())].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Authorized { .. }
-            ));
-            assert_eq!(host.offer_calls, 1, "never repeat an accepted offer");
-            assert_eq!(host.claim_calls, 1);
-            // It holds the claim through one wait, which a person's choice
-            // would end at once (no choice came), and through no other.
-            assert_eq!(host.retry_waits, 1);
-            assert!(host.held_during_backoff.is_empty());
-            assert_eq!(host.failures, ["owned authorization write failed"]);
-        }
-
-        #[test]
-        fn a_choice_made_while_the_answer_is_retried_ends_the_wait_and_gets_the_claim() {
-            // The answer's write failed and waits to retry; a choice made meanwhile ends the
-            // wait and holds the claim until the answer takes it again for its next try.
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                authorizations: [Err("owned authorization write failed"), Ok(())].into(),
-                choice_awaits: [false, true].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert!(matches!(result, PreparedSetup::Authorized { .. }));
-            assert_eq!(host.retry_waits, 1);
-            assert_eq!(host.held_during_backoff, [0]);
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.authorized.len(), 2);
-            assert_eq!(
-                host.active.get(),
-                1,
-                "the run inherits the claim taken again"
-            );
-            drop(result);
-            // The choice's run holds the claim and finishes setup: the
-            // answer is not written again.
-            let mut host = Host {
-                claims: [Ok(true), Ok(false)].into(),
-                finished: [Ok(false), Ok(true)].into(),
-                offers: [Begin(Plan::default())].into(),
-                authorizations: [Err("owned authorization write failed")].into(),
-                choice_awaits: [false, true].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Finished
-            ));
-            assert_eq!(host.authorized.len(), 1);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn an_unbound_authorization_failure_releases_the_choice_without_retry() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Begin(Plan::default())].into(),
-                authorizations: [Err("the failed publication could not be pinned")].into(),
-                terminal_authorization_error: true,
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Unavailable
-            ));
-            assert_eq!(host.claim_calls, 1);
-            assert_eq!(host.offer_calls, 1);
-            assert_eq!(host.authorized, [Plan::default()]);
-            assert_eq!(
-                host.failures,
-                ["the failed publication could not be pinned"]
-            );
-            assert!(host.held_during_backoff.is_empty());
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn an_unavailable_window_releases_its_claim_before_waiting_and_reoffering() {
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(false), Ok(false), Ok(false)].into(),
-                offers: [Unavailable, Begin(Plan::default())].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Authorized { .. }
-            ));
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.offer_calls, 2);
-            assert_eq!(host.held_during_backoff, [0]);
-            assert!(host.failures.is_empty());
-        }
-
-        #[test]
-        fn a_finished_setup_stops_later_offers() {
-            for mut host in [
-                Host {
-                    claims: [Ok(false)].into(),
-                    finished: [Ok(true)].into(),
-                    ..Host::default()
-                },
-                Host {
-                    claims: [Ok(true)].into(),
-                    finished: [Ok(true)].into(),
-                    ..Host::default()
-                },
-                Host {
-                    claims: [Ok(true), Ok(false)].into(),
-                    finished: [Ok(false), Ok(true)].into(),
-                    offers: [Unavailable].into(),
-                    ..Host::default()
-                },
-            ] {
-                assert!(matches!(
-                    prepare_setup(&mut host).unwrap(),
-                    PreparedSetup::Finished
-                ));
-                assert!(
-                    host.offers.is_empty(),
-                    "no duplicate offer after completion"
-                );
-                assert_eq!(host.active.get(), 0);
-            }
-        }
-
-        #[test]
-        fn checklist_choice_is_loaded_once_and_persisted_before_engine_authorization() {
-            let saved = plan(Selection::from_bits(1).unwrap());
-            let selected = plan(Selection::from_bits(2).unwrap());
-            let mut host = Host {
-                claims: [Ok(true), Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(false), Ok(false)].into(),
-                initial: [Err("selection read failed"), Ok(saved.clone())].into(),
-                offers: [Begin(selected.clone())].into(),
-                authorizations: [Err("authorization write failed"), Ok(())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            let PreparedSetup::Authorized { claim, .. } = &result else {
-                panic!("the worker must inherit the authorized run")
-            };
-            assert!(
-                Rc::ptr_eq(&claim.0, &host.active),
-                "the worker inherits this setup's live lease"
-            );
-            assert_eq!(host.offered, [saved]);
-            assert_eq!(host.authorized, [selected.clone(), selected]);
-            assert_eq!(host.claim_calls, 2);
-            assert_eq!(host.held_during_backoff, [0]);
-            assert_eq!(host.retry_waits, 1);
-            drop(result);
-            assert_eq!(host.active.get(), 0);
-        }
-
-        #[test]
-        fn an_empty_checklist_finishes_without_entering_the_engine() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false), Ok(false), Ok(true)].into(),
-                offers: [Begin(plan(Selection::none()))].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Finished
-            ));
-            assert_eq!(host.authorized, [plan(Selection::none())]);
-            assert_eq!(host.active.get(), 0);
-        }
-    }
-
-    #[test]
-    fn setup_windows_keep_scope_ssh_and_command_guards() {
-        let window = [OsString::from("--window")];
-        assert!(first_run_window_eligible(
-            &window,
-            DoctorStartupEnv::default()
-        ));
-        assert!(
-            first_run_window_eligible(&[], DoctorStartupEnv::default()),
-            "Dock and updater launches have a GUI offer surface"
-        );
-        for env in [
-            DoctorStartupEnv {
-                isolated: true,
-                ..DoctorStartupEnv::default()
-            },
-            DoctorStartupEnv {
-                outside_person_scope: true,
-                ..DoctorStartupEnv::default()
-            },
-            // A window started over ssh, or outside the console's graphic session, leaves
-            // setup to one started at this Mac.
-            DoctorStartupEnv {
-                remote: true,
-                ..DoctorStartupEnv::default()
-            },
-        ] {
-            assert!(!first_run_window_eligible(&window, env));
-        }
-        for args in [
-            vec![
-                OsString::from("--control-sock"),
-                OsString::from("/tmp/private"),
-            ],
-            vec![OsString::from("-e"), OsString::from("zsh")],
-            vec![OsString::from("--headless")],
-        ] {
-            assert!(!first_run_window_eligible(
-                &args,
-                DoctorStartupEnv::default()
-            ));
-        }
-    }
-
-    #[test]
-    fn setup_relaunch_hint_preserves_private_flags_before_its_carried_command() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for args in [
-            osv(&["--control-sock", "/tmp/test.sock"]),
-            osv(&["--control-sock", "/tmp/test.sock", "-e", "zsh"]),
-            osv(&["--headless", "-e", "zsh"]),
-        ] {
-            assert!(
-                !first_run_window_eligible(
-                    first_run_window_args(&args, true),
-                    DoctorStartupEnv::default(),
-                ),
-                "a relaunch hint must preserve {args:?}",
-            );
-        }
-        let ordinary = osv(&["--window", "-d", "/tmp"]);
-        assert!(first_run_window_eligible(
-            first_run_window_args(&ordinary, true),
-            DoctorStartupEnv::default(),
-        ));
-        let carried = osv(&["--window", "-d", "/tmp", "-e", "zsh", "--control-sock"]);
-        assert_eq!(first_run_window_args(&carried, true), ordinary.as_slice());
-        assert!(!first_run_window_eligible(
-            first_run_window_args(&carried, false),
-            DoctorStartupEnv::default(),
-        ));
-    }
-
-    #[test]
-    fn ordinary_window_options_keep_the_unified_setup_offer() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for args in [
-            osv(&["--gpu"]),
-            osv(&["--cpu"]),
-            osv(&["--font-px", "24", "--font", "Menlo", "--scale", "2"]),
-            osv(&["--columns", "120", "--lines", "40", "-d", "/tmp"]),
-            osv(&[
-                "--shell",
-                "zsh",
-                "--shell-integration",
-                "--no-shell-integration",
-            ]),
-        ] {
-            assert!(
-                first_run_window_eligible(&args, DoctorStartupEnv::default()),
-                "ordinary window options must retain the setup surface: {args:?}",
-            );
-        }
-        for args in [
-            osv(&["--gpu", "-e", "zsh"]),
-            osv(&["--cpu", "--headless"]),
-            osv(&["--font", "Menlo", "--control-sock", "/tmp/private"]),
-            osv(&["--columns", "120", "--diagnose"]),
-            osv(&["--gpu", "--containment", "user"]),
-            osv(&["--gpu", "--bogus"]),
-            osv(&["--font-px"]),
-        ] {
-            assert!(
-                !first_run_window_eligible(&args, DoctorStartupEnv::default()),
-                "ordinary options cannot erase a scope/command refusal: {args:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn an_update_successor_of_a_shell_started_window_is_still_a_window() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for argv in [
-            osv(&["--window"]),
-            osv(&[]),
-            osv(&["--window", "--window", "-d", "/tmp"]),
-        ] {
-            let successor = aterm_update::window_successor_args(argv.clone().into_iter());
-            assert!(
-                is_windowish(&successor, false, true),
-                "{argv:?} -> {successor:?} must route to the window with a TTY on stdin"
-            );
-        }
-        assert!(!is_windowish(
-            &aterm_update::reexec_forwarded_args(osv(&["--window"]).into_iter()),
-            false,
-            true
-        ));
-        for argv in [
-            osv(&["new-window"]),
-            osv(&["new-window", "-d", "/tmp"]),
-            osv(&["new-tab"]),
-            osv(&["split-pane", "-H"]),
-        ] {
-            let running =
-                aterm_update::running_window_successor_args(argv.clone().into_iter(), None);
-            let mode_args = strip_mode_flags(&running);
-            assert!(
-                is_windowish(&running, false, true)
-                    && mode_args.first().is_none_or(|first| {
-                        aterm_cli::Verb::from_operand(&first.to_string_lossy()).is_none()
-                    }),
-                "{argv:?} -> {running:?}: the window parser gets {mode_args:?}"
-            );
-            let boot = aterm_update::window_successor_args(argv.clone().into_iter());
-            assert!(
-                boot.first()
-                    .is_some_and(
-                        |first| aterm_cli::Verb::from_operand(&first.to_string_lossy()).is_some()
-                    ),
-                "{argv:?} -> {boot:?}: the boot swap's re-exec is routed as the verb"
-            );
-        }
-        assert!(is_windowish(&osv(&[]), false, false), "no TTY: the window");
-        assert!(!is_windowish(&osv(&[]), false, true), "a TTY: the session");
-        assert!(
-            !is_windowish(&osv(&["--window"]), true, false),
-            "--session wins"
-        );
-    }
-
-    use super::*;
-
-    /// Windows has no updater, so `aterm update status` and `check` land on this line: the
-    /// state, then the one lane that updates a Windows copy (the words `aterm help update`
-    /// prints), never an app bundle.
-    #[cfg(windows)]
-    #[test]
-    fn windows_update_line_names_the_lane_that_updates_it() {
-        let line = update_unreadable_line("0.94.0");
-        assert!(line.starts_with("aterm 0.94.0 "), "{line}");
-        assert!(line.contains(aterm_cli::WINDOWS_UPDATE_LANE), "{line}");
-        assert!(!line.contains("aterm.app"), "{line}");
-        assert!(!line.contains("macOS"), "{line}");
-    }
-
-    fn flapped_cast() -> String {
-        let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
-        for r in 0..8 {
-            frame.push_str(&format!("\\u001b[{};1HA{r}", r + 1));
-        }
-        frame.push_str("\\u001b[6;3H");
-        format!(
-            "{{\"version\": 2, \"width\": 20, \"height\": 8}}\n\
-             [0.100000, \"o\", \"{frame}\"]\n\
-             [1.000000, \"r\", \"20x7\"]\n\
-             [1.000300, \"o\", \"\\u001b[?1000h\"]\n\
-             [1.000700, \"r\", \"20x8\"]\n\
-             [1.005000, \"o\", \"\\u001b[3;1H\\u001b[KB2\\u001b[6;3H\"]\n"
-        )
-    }
-
-    #[test]
-    fn ctl_cast_drift_computes_the_report_client_side() {
-        let cast = flapped_cast();
-        let screen: Vec<String> = ["A1", "A2", "B2", "A4", "A5", "A6", "A7", ""]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let job = aterm_ctl::CastDriftJob {
-            cast: &cast,
-            screen: Some(&screen),
-            cursor: Some((5, 2)),
-            alt: Some(true),
-            args: "",
-            cut: aterm_ctl::DriftCut::Quiescent,
-            until: None,
-            peer: aterm_ctl::DriftPeer::PreUndo,
-        };
-        let report = ctl_cast_drift(&job).expect("a report");
-        let head = report.lines().next().unwrap();
-        for key in [
-            "verdict=desync",
-            "fidelity=pass",
-            "culprit=1.000000",
-            "cut=quiescent",
-            "dropped=-",
-            "undo=off",
-            "computed=client",
-        ] {
-            assert!(head.split_whitespace().any(|t| t == key), "{key} in {head}");
-        }
-        assert!(report.contains("\nrow 7 live= expected=A7\n"), "{report}");
-        let offline = ctl_cast_drift(&aterm_ctl::CastDriftJob {
-            screen: None,
-            cursor: None,
-            alt: None,
-            cut: aterm_ctl::DriftCut::File,
-            peer: aterm_ctl::DriftPeer::Unknown,
-            ..job
-        })
-        .expect("a report");
-        assert!(
-            offline.starts_with("OK 9 verdict=desync fidelity=- against=replay"),
-            "{offline}"
-        );
-        let early = ctl_cast_drift(&aterm_ctl::CastDriftJob {
-            screen: None,
-            cut: aterm_ctl::DriftCut::File,
-            until: Some(0.5),
-            peer: aterm_ctl::DriftPeer::Unknown,
-            ..job
-        })
-        .expect("a report");
-        assert!(early.starts_with("OK 0 verdict=clean"), "{early}");
-        let bad = ctl_cast_drift(&aterm_ctl::CastDriftJob {
-            args: "count=2",
-            ..job
-        })
-        .expect_err("usage");
-        assert!(bad.starts_with("ERR usage: cast drift"), "{bad}");
-        let broken = ctl_cast_drift(&aterm_ctl::CastDriftJob {
-            cast: "not a cast",
-            ..job
-        })
-        .expect_err("unparseable");
-        assert!(broken.contains("line 1"), "{broken}");
-    }
-
-    #[test]
-    fn a_quiet_flap_on_an_aterm_before_the_undo_is_named_client_side() {
-        let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
-        for r in 0..8 {
-            frame.push_str(&format!("\\u001b[{};1HL{r}", r + 1));
-        }
-        frame.push_str("\\u001b[6;3H");
-        let cast = format!(
-            "{{\"version\": 2, \"width\": 20, \"height\": 8}}\n\
-             [0.100000, \"o\", \"{frame}\"]\n\
-             [1.000000, \"r\", \"20x7\"]\n\
-             [1.000700, \"r\", \"20x8\"]\n\
-             [1.005000, \"o\", \"\\u001b[3;1H\\u001b[KB2\\u001b[6;3H\"]\n"
-        );
-        let old: Vec<String> = ["L1", "L2", "B2", "L4", "L5", "L6", "L7", ""]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let job = aterm_ctl::CastDriftJob {
-            cast: &cast,
-            screen: Some(&old),
-            cursor: Some((5, 2)),
-            alt: Some(true),
-            args: "",
-            cut: aterm_ctl::DriftCut::Quiescent,
-            until: None,
-            peer: aterm_ctl::DriftPeer::PreUndo,
-        };
-        for peer in [aterm_ctl::DriftPeer::PreUndo, aterm_ctl::DriftPeer::Unknown] {
-            let report =
-                ctl_cast_drift(&aterm_ctl::CastDriftJob { peer, ..job }).expect("a report");
-            let head = report.lines().next().unwrap();
-            for key in [
-                "verdict=desync",
-                "fidelity=pass",
-                "culprit=1.000000",
-                "undo=off",
-                "computed=client",
-            ] {
-                assert!(
-                    head.split_whitespace().any(|t| t == key),
-                    "{peer:?}: {key} in {head}"
-                );
-            }
-            assert!(report.contains("\nrow 0 live=L1 expected=L0\n"), "{report}");
-        }
-        let new: Vec<String> = ["L0", "L1", "B2", "L3", "L4", "L5", "L6", "L7"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let report = ctl_cast_drift(&aterm_ctl::CastDriftJob {
-            screen: Some(&new),
-            cut: aterm_ctl::DriftCut::File,
-            peer: aterm_ctl::DriftPeer::Unknown,
-            ..job
-        })
-        .expect("a report");
-        let head = report.lines().next().unwrap();
-        assert!(head.contains(" verdict=clean fidelity=pass "), "{head}");
-        assert!(!head.contains(" undo=off"), "{head}");
-    }
-
-    fn update_status() -> aterm_update::UpdateStatus {
-        aterm_update::UpdateStatus {
-            linux: None,
-            enabled: true,
-            installable: true,
-            current_build: 100,
-            staged_build: None,
-            staged_version: None,
-            staged_commit: None,
-            staged_dmg_sha256: None,
-            changelog: None,
-            outcome: "up to date (latest release build 100) \u{b7} checks every 30 min".into(),
-            updated_at: "2026-09-23T12:00:00Z".into(),
-            failing_checks: 0,
-            failing_kind: String::new(),
-            failing_applies: 0,
-            failing_since: String::new(),
-            failing_persistent: false,
-            failing_checks_kind: String::new(),
-            channel_unreadable: false,
-        }
-    }
-
-    #[test]
-    fn a_missing_ledger_fails_check_everywhere_and_status_only_on_a_mac() {
-        assert!(
-            no_ledger_fails(true),
-            "check cannot do its job without a ledger"
-        );
-        assert_eq!(no_ledger_fails(false), cfg!(target_os = "macos"));
-    }
-
-    #[test]
-    fn the_update_line_claims_up_to_date_only_over_a_completed_check() {
-        let checked =
-            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
-        let now = checked + 12 * 60;
-        let say = |st: &aterm_update::UpdateStatus,
-                   lane: Option<&aterm_update::ApplyLaneReport>| {
-            update_summary("0.91.0", 100, st, lane, now, true, true, &DevCopy::No, "").0
-        };
-        let up_to_date = |line: &str| line.contains("is up to date");
-        assert!(up_to_date(&say(&update_status(), None)));
-        let mut never = update_status();
-        never.updated_at = String::new();
-        assert!(!up_to_date(&say(&never, None)), "never checked");
-
-        let mut waiting = update_status();
-        waiting.linux = Some(aterm_update::LinuxUpdateStatus {
-            installed_build: 101,
-            installed_version: "0.92.0".into(),
-            staged_build: None,
-            staged_version: None,
-            staged_commit: None,
-            trial_phase: Some("Installed".into()),
-            trial_starts: 0,
-            trial_healthy: false,
-            refused_newer: false,
-        });
-        assert!(!up_to_date(&say(&waiting, None)), "an unfinished install");
-        waiting.linux.as_mut().expect("linux").trial_healthy = true;
-        assert!(up_to_date(&say(&waiting, None)), "a confirmed install");
-        let native = waiting.linux.as_mut().expect("linux");
-        native.trial_phase = None;
-        native.refused_newer = true;
-        assert!(
-            !up_to_date(&say(&waiting, None)),
-            "a rolled-back newer build"
-        );
-
-        let mut staged = update_status();
-        staged.staged_build = Some(101);
-        staged.staged_version = Some("0.92.0".into());
-        staged.failing_applies = 3;
-        let tried = |target: u64, failures: u32| aterm_update::ApplyLaneReport {
-            last_failure_target_build: target,
-            failures_for_target: failures,
-            ..Default::default()
-        };
-        let failed = |line: &str| line.contains("didn\u{2019}t install");
-        assert!(
-            failed(&say(&staged, Some(&tried(101, 2)))),
-            "this build's failures"
-        );
-        for lane in [tried(99, 3), tried(0, 0)] {
-            assert!(!failed(&say(&staged, Some(&lane))), "{lane:?}");
-        }
-    }
-
-    #[test]
-    fn a_staged_updates_standing_refusal_reaches_the_nonverbose_summary() {
-        let checked =
-            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
-        let mut staged = update_status();
-        staged.staged_build = Some(101);
-        staged.staged_version = Some("0.92.0".into());
-        let reason = "the Mac setup offer is still open";
-        let mut lane = aterm_update::ApplyLaneReport {
-            last_refusal: reason.into(),
-            ..Default::default()
-        };
-        let summary = |st: &aterm_update::UpdateStatus,
-                       lane: Option<&aterm_update::ApplyLaneReport>,
-                       automatic| {
-            update_summary(
-                "0.91.0",
-                100,
-                st,
-                lane,
-                checked + 60,
-                automatic,
-                true,
-                &DevCopy::No,
-                "log detail",
-            )
-        };
-        for automatic in [true, false] {
-            assert_eq!(
-                summary(&staged, Some(&lane), automatic).1.as_deref(),
-                Some(reason),
-                "a standing refusal matters with either installation preference"
-            );
-        }
-        lane.last_failure_target_build = 101;
-        lane.failures_for_target = 2;
-        assert_eq!(
-            summary(&staged, Some(&lane), true).1.as_deref(),
-            Some(reason),
-            "the standing cause remains visible after an earlier failed attempt"
-        );
-        lane.last_refusal = " \n\t".into();
-        assert_eq!(
-            summary(&staged, Some(&lane), true).1.as_deref(),
-            Some("log detail"),
-            "an empty refusal does not replace failure diagnostics"
-        );
-        lane.failures_for_target = 0;
-        assert!(summary(&staged, Some(&lane), true).1.is_none());
-        assert!(summary(&staged, None, true).1.is_none());
-        lane.last_refusal = reason.into();
-        staged.staged_build = Some(100);
-        assert!(summary(&staged, Some(&lane), true).1.is_none());
-        staged.staged_build = None;
-        assert!(summary(&staged, Some(&lane), true).1.is_none());
-    }
-
-    #[test]
-    fn downloaded_update_summaries_distinguish_candidate_and_running_identity() {
-        for linux in [false, true] {
-            for next in [Some("0.92.0"), Some("0.91.0"), None] {
-                for automatic in [false, true] {
-                    for lane in [
-                        aterm_update::ApplyLaneReport::default(),
-                        aterm_update::ApplyLaneReport {
-                            last_refusal: "waiting for work to retire".into(),
-                            ..Default::default()
-                        },
-                        aterm_update::ApplyLaneReport {
-                            last_failure_target_build: 101,
-                            failures_for_target: 1,
-                            ..Default::default()
-                        },
-                    ] {
-                        let mut status = update_status();
-                        status.staged_build = Some(101);
-                        status.staged_version = next.map(str::to_owned);
-                        if linux {
-                            status.linux = Some(aterm_update::LinuxUpdateStatus {
-                                installed_build: 100,
-                                installed_version: "0.91.0".into(),
-                                staged_build: Some(101),
-                                staged_version: next.map(str::to_owned),
-                                staged_commit: None,
-                                trial_phase: None,
-                                trial_starts: 0,
-                                trial_healthy: true,
-                                refused_newer: false,
-                            });
-                        }
-                        let line = update_summary(
-                            "0.91.0",
-                            100,
-                            &status,
-                            Some(&lane),
-                            0,
-                            automatic,
-                            true,
-                            &DevCopy::No,
-                            "details",
-                        )
-                        .0;
-                        let (candidate, running) = if next == Some("0.91.0") {
-                            ("101", "100")
-                        } else {
-                            (next.unwrap_or("101"), "0.91.0")
-                        };
-                        assert!(
-                            line.contains(candidate),
-                            "missing candidate {candidate}: {line}"
-                        );
-                        assert!(
-                            line.contains(running),
-                            "missing running identity {running}: {line}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn scratch_layout(label: &str) -> (aterm_tempfile::TempDir, atpkg::store::Layout) {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-session-lane-{label}-"))
-            .suffix(".noindex")
-            .tempdir()
-            .expect("scratch prefix");
-        let prefix = dir.path().to_path_buf();
-        (dir, atpkg::store::Layout { prefix })
-    }
-
-    #[test]
-    fn the_session_pass_is_due_on_the_machine_rule_and_claimed_once() {
-        let (_dir, layout) = scratch_layout("pass");
-        let now = 1_790_000_000_i64;
-        assert!(
-            session_pass_due(&layout, now),
-            "never checked: the first tab"
-        );
-        assert!(
-            !session_pass_due(&layout, now + 1),
-            "the second tab, a second later: claimed"
-        );
-        assert!(
-            session_pass_due(&layout, now + 5 * 60),
-            "still never checked, five minutes on: the next tab tries again"
-        );
-        std::fs::write(
-            layout.status(),
-            "schema = 1\nupdated_at = \"2026-09-21T13:00:00Z\"\n\
-             last_success_at = \"2026-09-21T13:00:00Z\"\n",
-        )
-        .unwrap();
-        let success =
-            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-21T13:00:00Z").expect("stamp");
-        assert!(!session_pass_due(&layout, success + 3600));
-        let walk = i64::try_from(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS).unwrap();
-        assert!(!session_pass_due(&layout, success + walk - 1));
-        assert!(session_pass_due(&layout, success + walk), "six hours on");
-        std::fs::write(
-            layout.status(),
-            "schema = 1\nupdated_at = \"2026-09-21T14:00:00Z\"\n\
-             last_success_at = \"2026-09-21T13:00:00Z\"\n",
-        )
-        .unwrap();
-        let claim = i64::try_from(aterm_update_core::pkg_check::PASS_SPACING_SECS).unwrap();
-        assert!(
-            session_pass_due(&layout, success + walk + claim),
-            "six hours on, past the last claim: owed"
-        );
-        std::fs::write(
-            layout.status(),
-            "schema = 1\nupdated_at = \"2026-09-22T13:30:00Z\"\n\
-             last_success_at = \"2026-09-21T13:00:00Z\"\nlast_pass = \"failed\"\n\
-             last_pass_at = \"2026-09-22T13:30:00Z\"\n",
-        )
-        .unwrap();
-        let attempt =
-            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-22T13:30:00Z").expect("stamp");
-        assert!(!session_pass_due(&layout, attempt + 60));
-        assert!(!session_pass_due(&layout, attempt + 5 * 60));
-        assert!(
-            session_pass_due(&layout, attempt + walk),
-            "the negative control: six hours after it, it is owed again"
-        );
-        std::fs::write(
-            layout.status(),
-            "schema = 1\nupdated_at = \"2026-09-22T13:30:00Z\"\n\
-             last_success_at = \"2026-09-21T13:00:00Z\"\nlast_pass = \"ok\"\n\
-             last_pass_at = \"2026-09-21T13:00:00Z\"\n",
-        )
-        .unwrap();
-        assert!(session_pass_due(&layout, attempt + 5 * 60));
-    }
-
-    #[test]
-    fn a_failing_or_running_pass_is_not_respawned_by_every_tab() {
-        let (_dir, layout) = scratch_layout("failing");
-        let attempt =
-            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-22T13:00:00Z").expect("stamp");
-        std::fs::write(
-            layout.status(),
-            "schema = 1\nupdated_at = \"2026-09-22T13:00:00Z\"\n\
-             outcome = \"update failed: index unreachable\"\nlast_pass = \"failed\"\n\
-             last_pass_at = \"2026-09-22T13:00:00Z\"\n",
-        )
-        .unwrap();
-        for minutes in [5, 10, 60, 120, 359] {
-            assert!(
-                !session_pass_due(&layout, attempt + minutes * 60),
-                "a tab {minutes} min after the failed pass"
-            );
-        }
-        assert!(
-            session_pass_due(&layout, attempt + 6 * 3600),
-            "the negative control: six hours on, one tab tries again"
-        );
-        let (_fresh_dir, fresh) = scratch_layout("running");
-        let now = attempt + 7 * 3600;
-        std::fs::write(
-            fresh.progress_file(),
-            format!(
-                "{{\"v\":{},\"pid\":{},\"heartbeat_unix\":{now}}}",
-                atpkg::progress::PROGRESS_VERSION,
-                std::process::id()
-            ),
-        )
-        .unwrap();
-        assert!(
-            !session_pass_due(&fresh, now),
-            "never checked, but installing"
-        );
-        std::fs::remove_file(fresh.progress_file()).unwrap();
-        assert!(
-            session_pass_due(&fresh, now),
-            "the negative control: nothing running"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_detached_pass_is_neither_our_child_nor_in_our_process_group() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("aterm-detached-pass-")
-            .suffix(".noindex")
-            .tempdir_in("/tmp")
-            .expect("scratch dir");
-        let dir = scratch.path();
-        let pid_file = dir.join("pid");
-        let env_file = dir.join("env");
-        let script = format!(
-            "echo \"$ATPKG_SPAWNER_PID\" > '{1}' && echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}' \
-             && exec sleep 30",
-            pid_file.display(),
-            env_file.display()
-        );
-        let args = [std::ffi::OsString::from("-c"), script.into()];
-        atpkg::platform::spawn_detached(
-            std::ffi::OsStr::new("/bin/sh"),
-            &args,
-            Some(("ATPKG_SPAWNER_PID", atpkg::cli::SPAWNER_DETACHED)),
-        )
-        .expect("spawn");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let pid: libc::pid_t = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file) {
-                break text.trim().parse().expect("a pid");
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pass never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        let mut status = 0;
-        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        let pgid = unsafe { libc::getpgid(pid) };
-        let ours = unsafe { libc::getpgid(0) };
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        if reaped == 0 {
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-        }
-        let env = std::fs::read_to_string(&env_file).unwrap_or_default();
-        assert_eq!(
-            env.trim(),
-            atpkg::cli::SPAWNER_DETACHED,
-            "the pass is told it was detached on purpose"
-        );
-        assert_eq!(
-            (reaped, errno),
-            (-1, Some(libc::ECHILD)),
-            "the detached pass is still this process's child"
-        );
-        assert_ne!(
-            pgid, ours,
-            "the detached pass shares the session's process group"
-        );
-    }
-
-    static NO_REROUTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn a_plain_launch_carries_its_directory_or_declines_to_route() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        assert_eq!(plain_launch_dir(&osv(&["--window"])), Ok(None));
-        let cwd = std::env::current_dir().expect("a working directory");
-        for spelling in [
-            osv(&["--window", "-d", "."]),
-            osv(&["--working-directory", "."]),
-        ] {
-            let found = plain_launch_dir(&spelling).expect("resolvable");
-            assert_eq!(
-                found.as_deref().map(std::path::Path::new),
-                Some(cwd.as_path()),
-                "{spelling:?}"
-            );
-        }
-        assert_eq!(
-            plain_launch_dir(&osv(&["-d", "definitely-not-here-9f3a"])),
-            Err(())
-        );
-    }
-
-    #[test]
-    fn a_child_command_payload_is_never_routed_by_policy() {
-        let _env_lock = NO_REROUTE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        aterm_log::env::unset(atpkg::reroute::PASSTHROUGH_ENV);
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let env = aterm_cli::LaunchEnv::default();
-        for argv in [
-            osv(&["-e", "vim"]),
-            osv(&["--window", "-e", "vim"]),
-            osv(&["--command", "vim"]),
-            osv(&["--", "sh", "-c", "echo hi"]),
-            osv(&["--window", "-d", ".", "-e", "vim"]),
-        ] {
-            assert_eq!(
-                plain_launch_request(&argv, env),
-                None,
-                "{argv:?} carries a payload a forwarded tab cannot run"
-            );
-        }
-        let dash_e = osv(&["-e", "vim"]);
-        assert_eq!(payload_boundary(&dash_e), 0);
-        assert!(
-            plain_launch_request(&dash_e[..0], env).is_some(),
-            "the pre-boundary scan of `-e vim` is an empty, maximally eligible argv — \
-             the gate must never be handed it"
-        );
-        assert!(plain_launch_request(&osv(&[]), env).is_some());
-        assert!(plain_launch_request(&osv(&["--window"]), env).is_some());
-    }
-
-    #[test]
-    fn the_gui_alias_routes_the_windowing_verbs_and_nothing_else() {
-        for verb in aterm_cli::Verb::ALL {
-            let expected = if verb.is_windowing() {
-                AliasRoute::AliasWindowVerb
-            } else {
-                AliasRoute::AliasWindow
-            };
-            assert_eq!(
-                alias_route("aterm-gui", verb.name()),
-                expected,
-                "aterm-gui {}",
-                verb.name()
-            );
-        }
-        for operand in ["", "--window", "-d", "--headless", "--diagnose"] {
-            assert_eq!(
-                alias_route("aterm-gui", operand),
-                AliasRoute::AliasWindow,
-                "aterm-gui {operand:?}"
-            );
-        }
-        assert_eq!(alias_route("aterm-ctl", "new-tab"), AliasRoute::Ctl);
-        assert_eq!(alias_route("atpkg", "new-tab"), AliasRoute::Pkg);
-        assert_eq!(alias_route("agh", "release"), AliasRoute::Agh);
-        assert_eq!(alias_route("aterm-fleet", ""), AliasRoute::Fleet);
-        assert_eq!(alias_route("aterm-drive", ""), AliasRoute::Drive);
-        assert_eq!(
-            alias_route("aterm-askpass", "Password:"),
-            AliasRoute::Askpass
-        );
-        assert_eq!(
-            alias_route("aterm-machines-askpass", "admin@lab-07.local's password: "),
-            AliasRoute::MachinesAskpass
-        );
-        assert_eq!(alias_route("aterm-link", ""), AliasRoute::Link);
-        assert_eq!(alias_route("aterm-link", "serve"), AliasRoute::Link);
-        assert_eq!(
-            alias_route("aterm-open-url", "https://claude.ai/x"),
-            AliasRoute::OpenUrl
-        );
-        for operand in ["", ".git/COMMIT_EDITMSG", "+3", "new-window", "edit"] {
-            assert_eq!(
-                alias_route("amacs", operand),
-                AliasRoute::Amacs,
-                "{operand:?}"
-            );
-        }
-        for name in ["aterm", "aterm-cli", "my-renamed-aterm"] {
-            assert_eq!(
-                alias_route(name, "new-window"),
-                AliasRoute::FrontDoor,
-                "{name}"
-            );
-            assert_eq!(alias_route(name, ""), AliasRoute::FrontDoor, "{name}");
-        }
-    }
-
-    #[test]
-    fn the_windowed_target_name_is_the_gui_alias() {
-        for verb in aterm_cli::Verb::ALL {
-            assert_eq!(
-                alias_route("aterm-windowed", verb.name()),
-                alias_route("aterm-gui", verb.name()),
-                "aterm-windowed {}",
-                verb.name()
-            );
-        }
-        assert_eq!(
-            alias_route("aterm-windowed", "new-window"),
-            AliasRoute::AliasWindowVerb
-        );
-        for operand in ["", "--window", "-d", "--headless", "--diagnose"] {
-            assert_eq!(
-                alias_route("aterm-windowed", operand),
-                AliasRoute::AliasWindow,
-                "aterm-windowed {operand:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_console_window_launch_goes_to_the_sibling_unless_a_harness_reads_it() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let window = if cfg!(windows) {
-            WindowHost::WindowedSibling
-        } else {
-            WindowHost::ThisProcess
-        };
-        assert_eq!(window_host_for(&osv(&[])), window, "the no-TTY launch");
-        assert_eq!(window_host_for(&osv(&["--window"])), window);
-        assert_eq!(
-            window_host_for(&osv(&["--window", "-d", ".", "--hold"])),
-            window
-        );
-        for flag in [
-            "--help",
-            "--version",
-            "--list-fonts",
-            "--install-context-menu",
-        ] {
-            assert_eq!(
-                window_host_for(&osv(&["--window", flag])),
-                window,
-                "{flag} is answered by the parser run before the handoff"
-            );
-        }
-        for flag in ["--headless", "--diagnose"] {
-            assert_eq!(
-                window_host_for(&osv(&["--window", flag])),
-                WindowHost::ThisProcess,
-                "{flag}: a harness reads this process's output"
-            );
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn network_publication_cache_never_renews_stalled_or_busy_evidence() {
-        use aterm_db::network_state::Publication;
-        use aterm_types::network_state::{NetworkObservation, Visibility};
-        use std::{
-            sync::{Arc, Mutex},
-            time::{Duration, Instant},
-        };
-
-        for prefetch in [false, true] {
-            let at = Instant::now();
-            let publisher = Arc::new(Mutex::new(Some(Publication::new(
-                NetworkObservation {
-                    observed_at_ms: 100_000,
-                    visibility: Visibility::Active,
-                    ..NetworkObservation::default()
-                },
-                at,
-            ))));
-            let clock = Arc::new(Mutex::new((at, Some(100_000))));
-            let reader = publisher.clone();
-            let timer = clock.clone();
-            let read = super::network_state_source_with_readers(
-                move || reader.try_lock().ok().and_then(|state| state.clone()),
-                || None,
-                None,
-                move || *timer.lock().unwrap(),
-            );
-            if prefetch {
-                assert_eq!(
-                    read(aterm_gui::NetworkRead::WithServices)
-                        .unwrap()
-                        .network
-                        .visibility,
-                    Visibility::Active
-                );
-            }
-            *clock.lock().unwrap() = (at + Duration::from_secs(20), Some(120_000));
-            assert_eq!(
-                read(aterm_gui::NetworkRead::WithServices)
-                    .unwrap()
-                    .network
-                    .visibility,
-                Visibility::Unavailable
-            );
-            let mut held = publisher.lock().unwrap();
-            *clock.lock().unwrap() = (at + Duration::from_secs(21), Some(113_000));
-            let during = read(aterm_gui::NetworkRead::WithServices).unwrap();
-            assert_eq!(during.network.visibility, Visibility::Unavailable);
-            assert_eq!(during.network.observed_at_ms, 100_000);
-            *held = Some(Publication::new(
-                NetworkObservation {
-                    observed_at_ms: 113_000,
-                    visibility: Visibility::Active,
-                    ..NetworkObservation::default()
-                },
-                at + Duration::from_secs(21),
-            ));
-            drop(held);
-            assert_eq!(
-                read(aterm_gui::NetworkRead::WithServices)
-                    .unwrap()
-                    .network
-                    .visibility,
-                Visibility::Active
-            );
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn service_observations_survive_an_absent_network_runtime() {
-        use aterm_types::network_state::{
-            HistoryState, ServiceAvailability, ServiceStates, Visibility,
-        };
-        use std::sync::{Arc, Mutex};
-
-        let mut services = ServiceStates::default();
-        services.secrets.availability = ServiceAvailability::Cached;
-        services.secrets.observed_at_ms = 1000;
-        let at = std::time::Instant::now();
-        let services = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
-            services, at,
-        )));
-        let publisher = services.clone();
-        let read = super::network_state_source_with_readers(
-            || None,
-            move || Some(publisher.lock().unwrap().clone()),
-            None,
-            move || (at, Some(2000)),
-        );
-        let first = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(first.network.visibility, Visibility::Unavailable);
-        assert_eq!(first.network.history, HistoryState::Unavailable);
-        assert_eq!(
-            first.services.secrets.availability,
-            ServiceAvailability::Cached
-        );
-        assert!(Arc::ptr_eq(
-            &first,
-            &read(aterm_gui::NetworkRead::WithServices).unwrap()
-        ));
-
-        let mut changed = first.services.clone();
-        changed.secrets.availability = ServiceAvailability::Unavailable;
-        *services.lock().unwrap() = aterm_db::service_state::Publication::new(changed, at);
-        let second = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert!(second.revision > first.revision);
-        assert_eq!(
-            second.services.secrets.availability,
-            ServiceAvailability::Unavailable
-        );
-        assert_eq!(
-            first.services.secrets.availability,
-            ServiceAvailability::Cached
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_busy_service_publisher_cannot_stall_the_network_ui_reader() {
-        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
-        use std::sync::{Arc, Mutex, mpsc};
-
-        for prefetch in [false, true] {
-            let mut initial = ServiceStates::default();
-            initial.secrets.availability = ServiceAvailability::Cached;
-            initial.secrets.observed_at_ms = 1000;
-            let at = std::time::Instant::now();
-            let services = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
-                initial, at,
-            )));
-            let reader = services.clone();
-            let read = super::network_state_source_with_readers(
-                || None,
-                move || reader.try_lock().ok().map(|state| state.clone()),
-                None,
-                move || (at, Some(2000)),
-            );
-            let first = prefetch.then(|| read(aterm_gui::NetworkRead::WithServices).unwrap());
-            let mut publisher = services.lock().unwrap();
-            let mut changed = ServiceStates::default();
-            changed.secrets.availability = ServiceAvailability::Unavailable;
-            changed.secrets.observed_at_ms = 2000;
-            *publisher = aterm_db::service_state::Publication::new(changed, at);
-            let concurrent = read.clone();
-            let (send, receive) = mpsc::channel();
-            let task = std::thread::spawn(move || {
-                send.send(concurrent(aterm_gui::NetworkRead::WithServices))
-                    .unwrap()
-            });
-            let result = receive.recv_timeout(std::time::Duration::from_secs(60));
-            drop(publisher);
-            task.join().unwrap();
-            let during = result
-                .expect("a publishing worker must not stall the UI reader")
-                .expect("only the producer is busy, not the composition reader");
-            if let Some(first) = first {
-                assert!(Arc::ptr_eq(&first, &during));
-                assert_eq!(during.services.secrets.observed_at_ms, 1000);
-            } else {
-                assert_eq!(during.services.secrets.observed_at_ms, 0);
-                assert_eq!(
-                    during.services.secrets.availability,
-                    ServiceAvailability::Unknown
-                );
-            }
-            let after = read(aterm_gui::NetworkRead::WithServices).unwrap();
-            assert_eq!(after.services.secrets.observed_at_ms, 2000);
-            assert_eq!(
-                after.services.secrets.availability,
-                ServiceAvailability::Unavailable
-            );
-            assert!(after.revision > during.revision);
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_busy_composition_reader_returns_no_sample_instead_of_startup_state() {
-        use aterm_types::network_state::{
-            HistoryState, NetworkObservation, ServiceAvailability, ServiceStates, Visibility,
-        };
-        use std::{
-            sync::{
-                Arc, Mutex,
-                atomic::{AtomicUsize, Ordering},
-                mpsc,
-            },
-            time::{Duration, Instant},
-        };
-
-        let at = Instant::now();
-        let network = aterm_db::network_state::Publication::new(
-            NetworkObservation {
-                observed_at_ms: 100_000,
-                visibility: Visibility::Active,
-                history: HistoryState::Ready,
-                detail: "authenticated observer".into(),
-                ..Default::default()
-            },
-            at,
-        );
-        let mut services = ServiceStates::default();
-        services.secrets.availability = ServiceAvailability::Cached;
-        services.secrets.observed_at_ms = 100_000;
-        services.secrets.revision = Some("retained revision".into());
-        services.secrets.refresh_failed = true;
-        let services = aterm_db::service_state::Publication::new(services, at);
-        let clock = Arc::new(Mutex::new((at, Some(100_000))));
-        let timer = clock.clone();
-        let (entered, entering) = mpsc::channel();
-        let (resume, resumed) = mpsc::channel();
-        let resumed = Mutex::new(resumed);
-        let reads = AtomicUsize::new(0);
-        let read = super::network_state_source_with_readers(
-            move || {
-                if reads.fetch_add(1, Ordering::Relaxed) == 1 {
-                    entered.send(()).unwrap();
-                    resumed
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(60))
-                        .unwrap();
-                }
-                Some(network.clone())
-            },
-            move || Some(services.clone()),
-            None,
-            move || *timer.lock().unwrap(),
-        );
-        let first = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(first.network.history, HistoryState::Ready);
-        assert_eq!(
-            first.services.secrets.availability,
-            ServiceAvailability::Cached
-        );
-        let background = read.clone();
-        let background =
-            std::thread::spawn(move || background(aterm_gui::NetworkRead::WithServices));
-        entering.recv_timeout(Duration::from_secs(60)).unwrap();
-        let foreground = read.clone();
-        let (finished, result) = mpsc::channel();
-        let foreground = std::thread::spawn(move || {
-            finished
-                .send(foreground(aterm_gui::NetworkRead::WithServices))
-                .unwrap()
-        });
-        let busy = result.recv_timeout(Duration::from_secs(60));
-        resume.send(()).unwrap();
-        let resumed = background.join().unwrap().unwrap();
-        foreground.join().unwrap();
-        // The old WouldBlock => startup fallback policy returns Some here, erasing
-        // an already observed history and failed-refresh warning at the consumer.
-        assert!(
-            busy.expect("the composition reader must not block drawing")
-                .is_none()
-        );
-        assert!(Arc::ptr_eq(&first, &resumed));
-        assert!(Arc::ptr_eq(
-            &first,
-            &read(aterm_gui::NetworkRead::WithServices).unwrap()
-        ));
-
-        // Recovery still uses the producer's original monotonic sample: even a
-        // wall-clock rollback that remains after observed_at cannot extend it.
-        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(100_001));
-        let expired = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(expired.network.visibility, Visibility::Unavailable);
-        assert_eq!(expired.network.history, HistoryState::Ready);
-        assert_eq!(expired.network.observed_at_ms, 100_000);
-        assert_eq!(
-            expired.services.secrets.availability,
-            ServiceAvailability::Unknown
-        );
-        assert_eq!(expired.services.secrets.observed_at_ms, 100_000);
-        assert_eq!(
-            expired.services.secrets.revision,
-            first.services.secrets.revision
-        );
-        assert!(expired.services.secrets.refresh_failed);
-        assert!(expired.revision > first.revision);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn service_publication_cache_expires_without_network_and_never_renews_on_rollback() {
-        use aterm_types::network_state::{ServiceAvailability, ServiceStates, Visibility};
-        use std::{
-            sync::{Arc, Mutex},
-            time::{Duration, Instant},
-        };
-        let at = Instant::now();
-        let mut states = ServiceStates::default();
-        states.secrets.availability = ServiceAvailability::Cached;
-        states.secrets.observed_at_ms = 100_000;
-        states.secrets.revision = Some("retained revision".into());
-        let publisher = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
-            states.clone(),
-            at,
-        )));
-        let clock = Arc::new(Mutex::new((at, Some(100_000))));
-        let source = publisher.clone();
-        let timer = clock.clone();
-        let read = super::network_state_source_with_readers(
-            || None,
-            move || source.try_lock().ok().map(|state| state.clone()),
-            None,
-            move || *timer.lock().unwrap(),
-        );
-        assert_eq!(
-            read(aterm_gui::NetworkRead::WithServices)
-                .unwrap()
-                .services
-                .secrets
-                .availability,
-            ServiceAvailability::Cached
-        );
-        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_001));
-        assert_eq!(
-            read(aterm_gui::NetworkRead::WithServices)
-                .unwrap()
-                .services
-                .secrets
-                .availability,
-            ServiceAvailability::Unknown
-        );
-        let mut held = publisher.lock().unwrap();
-        *clock.lock().unwrap() = (at + Duration::from_secs(62), Some(130_000));
-        let stale = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(stale.network.visibility, Visibility::Unavailable);
-        assert_eq!(
-            stale.services.secrets.availability,
-            ServiceAvailability::Unknown
-        );
-        assert_eq!(stale.services.secrets.observed_at_ms, 100_000);
-        assert_eq!(stale.services.secrets.revision, states.secrets.revision);
-        drop(held);
-        assert_eq!(
-            read(aterm_gui::NetworkRead::WithServices)
-                .unwrap()
-                .services
-                .secrets
-                .availability,
-            ServiceAvailability::Unknown
-        );
-        held = publisher.lock().unwrap();
-        states.secrets.observed_at_ms = 130_000;
-        *held = aterm_db::service_state::Publication::new(states, at + Duration::from_secs(62));
-        drop(held);
-        let restored = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(
-            restored.services.secrets.availability,
-            ServiceAvailability::Cached
-        );
-        assert!(restored.revision > stale.revision);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn first_service_read_after_a_stall_and_rollback_is_not_fresh() {
-        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
-        use std::time::{Duration, Instant};
-        let at = Instant::now();
-        let mut states = ServiceStates::default();
-        states.accounts.availability = ServiceAvailability::Current;
-        states.accounts.observed_at_ms = 100_000;
-        let publication = aterm_db::service_state::Publication::new(states, at);
-        let read = super::network_state_source_with_readers(
-            || None,
-            move || Some(publication.clone()),
-            None,
-            move || (at + Duration::from_secs(120), Some(110_000)),
-        );
-        assert_eq!(
-            read(aterm_gui::NetworkRead::WithServices)
-                .unwrap()
-                .services
-                .accounts
-                .availability,
-            ServiceAvailability::Unknown
-        );
-        assert_eq!(
-            read(aterm_gui::NetworkRead::WithServices)
-                .unwrap()
-                .services
-                .accounts
-                .observed_at_ms,
-            100_000
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_missing_service_observer_does_not_hide_network_observations() {
-        use aterm_types::network_state::{ServiceAvailability, Visibility};
-        use std::{
-            sync::{
-                Arc, OnceLock,
-                atomic::{AtomicUsize, Ordering},
-            },
-            time::{Duration, Instant},
-        };
-
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let paths = aterm_secrets::client::Paths::for_home(&scratch.path().join("home"));
-        let config = scratch.path().join("aterm.toml");
-        aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
-        let published = Arc::new(OnceLock::<aterm_db::service_state::Runtime>::new());
-        let publisher = published.clone();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let tried = attempts.clone();
-        let mut startup = super::host_startup::Constructor::new(move || {
-            if tried.fetch_add(1, Ordering::SeqCst) == 0 {
-                return false;
-            }
-            let runtime =
-                aterm_db::service_state::Runtime::start(paths.clone(), config.clone()).unwrap();
-            assert!(publisher.set(runtime).is_ok());
-            true
-        });
-        let now = Instant::now();
-        let due = startup.maintain_at(now).unwrap();
-        let network = aterm_db::network_state::ObservationHandle::default();
-        let services = published.clone();
-        let read = super::network_state_source_from(
-            move || Some(network.clone()),
-            move || {
-                services
-                    .get()
-                    .map(aterm_db::service_state::Runtime::observation)
-            },
-            None,
-        );
-        let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(snapshot.network.visibility, Visibility::Checking);
-        assert_eq!(
-            snapshot.services.accounts.availability,
-            ServiceAvailability::Unknown
-        );
-        assert_eq!(
-            snapshot.services.secrets.availability,
-            ServiceAvailability::Unknown
-        );
-        let _ = read(aterm_gui::NetworkRead::Network);
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "readers never run constructors"
-        );
-        startup.maintain_at(due - Duration::from_nanos(1));
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "failed starts keep their backoff"
-        );
-        assert_eq!(startup.maintain_at(due), None);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        // The same held source discovers the real owner, even while sharing is off. Ordinary
-        // WithServices demand supplies its first paid metadata sample; painting starts nothing.
-        let healthy = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the recovered service owner's first metadata publication",
-            || {
-                let snapshot = read(aterm_gui::NetworkRead::WithServices)?;
-                (snapshot.services.accounts.observed_at_ms != 0
-                    && snapshot.services.secrets.observed_at_ms != 0)
-                    .then_some(snapshot)
-            },
-        );
-        assert_eq!(healthy.network.visibility, Visibility::Checking);
-        assert!(healthy.revision > snapshot.revision);
-        assert_eq!(startup.maintain_at(due + Duration::from_secs(120)), None);
-        let _ = read(aterm_gui::NetworkRead::Network);
-        let _ = read(aterm_gui::NetworkRead::WithServices);
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "a published owner is not restarted"
-        );
-        drop(read);
-        drop(published);
-    }
-
-    /// Only a reader that draws the services reads them, since a services read asks their
-    /// observer for its next sample; a network reader gets their last sample, which ages as it
-    /// would, keeping what it last observed.
-    /// NEGATIVE CONTROL: a composition that reads the services whatever was asked counts a
-    /// services read for each network read.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_network_read_reads_no_services_and_ages_their_last_sample() {
-        use aterm_gui::NetworkRead::{Network, WithServices};
-        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
-        use std::sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        };
-        use std::time::Duration;
-
-        let at = std::time::Instant::now();
-        let mut states = ServiceStates::default();
-        states.secrets.availability = ServiceAvailability::Cached;
-        states.secrets.observed_at_ms = 100_000;
-        let publication = aterm_db::service_state::Publication::new(states, at);
-        let reads = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&reads);
-        let clock = Arc::new(Mutex::new((at, Some(100_000))));
-        let timer = Arc::clone(&clock);
-        let read = super::network_state_source_with_readers(
-            || None,
-            move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Some(publication.clone())
-            },
-            None,
-            move || *timer.lock().unwrap(),
-        );
-        let read_with = |kind| read(kind).unwrap();
-        assert_eq!(
-            read_with(Network).services.secrets.availability,
-            ServiceAvailability::Unknown,
-            "nothing read the services yet"
-        );
-        assert_eq!(reads.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            read_with(WithServices).services.secrets.availability,
-            ServiceAvailability::Cached
-        );
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            read_with(Network).services.secrets.availability,
-            ServiceAvailability::Cached,
-            "the last sample, still current"
-        );
-        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_000));
-        let aged = read_with(Network).services.secrets.clone();
-        assert_eq!(aged.availability, ServiceAvailability::Unknown);
-        assert_eq!(aged.observed_at_ms, 100_000);
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn an_absent_network_runtime_retains_history_but_never_current_reachability() {
-        use aterm_types::network_state::{
-            HistoryState, MachineIdentity, NetworkObservation, PeerObservation, Reachability,
-            Visibility,
-        };
-        use std::sync::Arc;
-
-        let retained = NetworkObservation {
-            history: HistoryState::Ready,
-            visibility: Visibility::Active,
-            observer: Some(MachineIdentity {
-                machine_id: [3; 16],
-                incarnation: [4; 16],
-                label: None,
-            }),
-            observed_at_ms: 2000,
-            unverified_endpoints: 3,
-            peers: vec![PeerObservation {
-                slot: 7,
-                identity: MachineIdentity {
-                    machine_id: [1; 16],
-                    incarnation: [2; 16],
-                    label: Some("saved machine".into()),
-                },
-                first_seen_ms: 1000,
-                last_seen_ms: 2000,
-                last_checked_ms: Some(2000),
-                last_repair: None,
-                last_authenticated_endpoint: None,
-                reachability: Reachability::Reachable,
-                instances: Some(2),
-                samples: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let read = super::network_state_source_from(|| None, || None, Some(retained.clone()));
-        let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
-        assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
-        assert!(snapshot.network.observer.is_none());
-        assert_eq!(snapshot.network.history, HistoryState::Ready);
-        assert_eq!(snapshot.network.observed_at_ms, 2000);
-        assert_eq!(snapshot.network.unverified_endpoints, 0);
-        let peer = &snapshot.network.peers[0];
-        assert_eq!(peer.slot, 7);
-        assert_eq!(peer.identity, retained.peers[0].identity);
-        assert_eq!((peer.first_seen_ms, peer.last_seen_ms), (1000, 2000));
-        assert_eq!(peer.reachability, Reachability::Unknown);
-        assert_eq!(peer.last_checked_ms, None);
-        assert!(Arc::ptr_eq(
-            &snapshot,
-            &read(aterm_gui::NetworkRead::WithServices).unwrap()
-        ));
-        assert_eq!(retained.peers[0].reachability, Reachability::Reachable);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn only_an_ordinary_window_autostarts_acaffeine() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for args in [
-            osv(&[]),
-            osv(&["--window"]),
-            osv(&["-d", "."]),
-            osv(&["--no-control-sock"]),
-            osv(&["--window", "--control-sock", "off"]),
-            osv(&["--control-sock", "OFF"]),
-            osv(&["--control-sock", "0"]),
-            osv(&["--control-sock", ""]),
-        ] {
-            assert!(ordinary_window(&args), "{args:?}");
-        }
-        for args in [
-            osv(&["--headless"]),
-            osv(&["--diagnose"]),
-            osv(&["--control-sock", "/tmp/private.sock"]),
-            osv(&["--control-sock"]),
-            osv(&["--control-sock", "off", "--headless"]),
-            osv(&["--control-sock", "--headless"]),
-            osv(&["-e", "sh", "--control-sock", "/tmp/private.sock"]),
-        ] {
-            assert!(!ordinary_window(&args), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn a_spawn_is_handed_to_the_sibling_as_new_window_never_as_a_plain_launch() {
-        assert_eq!(
-            alias_route("aterm-gui", "new-window"),
-            AliasRoute::AliasWindowVerb
-        );
-        for intent in [
-            aterm_cli::LaunchIntent::NewTab,
-            aterm_cli::LaunchIntent::NewWindow,
-            aterm_cli::LaunchIntent::SplitPane,
-            aterm_cli::LaunchIntent::Plain,
-        ] {
-            for dir in [None, Some(String::from(r"C:\work dir"))] {
-                let request = aterm_cli::WindowRequest {
-                    intent,
-                    dir: dir.clone(),
-                    split: aterm_cli::SplitOrientation::Horizontal,
-                };
-                let argv = spawn_handoff_argv(&request);
-                let (verb, rest) = argv.split_first().expect("the verb leads");
-                let verb_str = verb.to_string_lossy();
-                assert_eq!(verb_str, "new-window", "{intent:?}");
-                assert_eq!(
-                    alias_route("aterm-gui", &verb_str),
-                    AliasRoute::AliasWindowVerb
-                );
-                let reparsed =
-                    aterm_cli::parse_window_request("new-window", rest, |raw| Ok(raw.to_owned()))
-                        .expect("the sibling's grammar accepts the handoff");
-                assert_eq!(reparsed.intent, aterm_cli::LaunchIntent::NewWindow);
-                assert_eq!(reparsed.dir, dir, "{intent:?}: the directory travels");
-                assert_eq!(
-                    aterm_cli::route_launch(
-                        reparsed.intent,
-                        aterm_cli::WindowingBehavior::Attach,
-                        true
-                    ),
-                    aterm_cli::WindowRoute::Spawn,
-                    "attach with an instance up still spawns"
-                );
-                assert!(
-                    !aterm_cli::plain_launch_is_policy_eligible(
-                        &argv,
-                        aterm_cli::LaunchEnv::default()
-                    ),
-                    "the handoff is never a plain launch the policy could forward"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_bare_launch_inside_a_tab_opens_a_tab_and_anything_else_nests() {
-        assert!(nests_inside_aterm(true, false, true, true));
-        assert!(
-            !nests_inside_aterm(false, false, true, true),
-            "flags, a -e payload or a typo go to the session parser"
-        );
-        assert!(
-            !nests_inside_aterm(true, true, true, true),
-            "aterm-cli nests on purpose"
-        );
-        assert!(
-            !nests_inside_aterm(true, false, false, true),
-            "not inside aterm at all"
-        );
-        assert!(
-            !nests_inside_aterm(true, false, true, false),
-            "a piped launch is a harness and gets what it asked for"
-        );
-    }
-
-    /// Which windowed image the console image hands a window to, against a real folder: the
-    /// shipped name in an install folder, only as a file; in a build tree (cargo's `.fingerprint`
-    /// beside the exe) the target name, never the `aterm-gui.exe` there (crate aterm-gui's thin
-    /// dev bin).
-    #[cfg(windows)]
-    #[test]
-    fn the_windowed_sibling_is_the_shipped_image_or_a_build_trees_own() {
-        let scratch = scratch_dir("windowed-sibling");
-        let dir = scratch.path();
-        let exe = dir.join("aterm.exe");
-        let found = || aterm_gui::windowed_front_door_beside(&exe);
-        assert_eq!(found(), None);
-        std::fs::create_dir_all(dir.join("aterm-gui.exe")).expect("a decoy directory");
-        assert_eq!(found(), None, "a directory of that name is not an image");
-        std::fs::remove_dir(dir.join("aterm-gui.exe")).expect("drop the decoy");
-        std::fs::write(dir.join("aterm-gui.exe"), b"").expect("the shipped name");
-        assert_eq!(found(), Some(dir.join("aterm-gui.exe")));
-        std::fs::create_dir_all(dir.join(".fingerprint")).expect("a build tree");
-        assert_eq!(
-            found(),
-            None,
-            "a build tree's aterm-gui.exe is the thin dev bin, never the sibling"
-        );
-        std::fs::write(dir.join("aterm-windowed.exe"), b"").expect("the target name");
-        assert_eq!(found(), Some(dir.join("aterm-windowed.exe")));
-    }
-
-    /// A build tree's windowed image stands for this build only when it is as new as this one,
-    /// give or take the two bins' link spread (measured 6 ms, either order): `cargo run -p aterm`
-    /// relinks the console image alone.
-    #[cfg(windows)]
-    #[test]
-    fn a_build_trees_windowed_image_older_than_this_one_is_not_used() {
-        use std::time::{Duration, SystemTime};
-        let now = SystemTime::now();
-        let before = |secs: u64| now - Duration::from_secs(secs);
-        assert!(
-            !windowed_sibling::is_stale(now, now),
-            "same instant: one build"
-        );
-        assert!(
-            !windowed_sibling::is_stale(now - Duration::from_millis(6), now),
-            "the measured link spread of one build"
-        );
-        assert!(
-            !windowed_sibling::is_stale(now + Duration::from_secs(30), now),
-            "newer than this image"
-        );
-        assert!(
-            !windowed_sibling::is_stale(before(60), now),
-            "within a minute"
-        );
-        assert!(
-            windowed_sibling::is_stale(before(61), now),
-            "past the spread"
-        );
-        assert!(
-            windowed_sibling::is_stale(before(4 * 24 * 3600), now),
-            "an earlier build's"
-        );
-    }
-
-    /// After the call no std handle is inheritable, or a capturing shell's
-    /// `$o = & aterm --window` would hang until the window closed.
-    #[cfg(windows)]
-    #[test]
-    fn the_std_handles_are_not_inheritable_once_the_sibling_is_about_to_start() {
-        windowed_sibling::stop_inheriting_std_handles();
-        assert!(
-            !windowed_sibling::a_std_handle_is_inheritable(),
-            "a std handle would still be carried into the detached window"
-        );
-    }
-
-    /// `RegisterApplicationRestart` fires after a Restart-Manager reboot and (`dwFlags = 0`)
-    /// after a crash or hang, and its command line comes back through this router.
-    #[cfg(windows)]
-    #[test]
-    fn the_os_restart_command_line_is_the_one_verb_policy_never_forwards() {
-        let line = aterm_gui::OS_RESTART_COMMAND_LINE;
-        let verb = aterm_cli::Verb::from_operand(line)
-            .unwrap_or_else(|| panic!("{line:?} must be a routed front-door verb"));
-        assert!(verb.is_windowing(), "{line:?}");
-        for behavior in [
-            aterm_cli::WindowingBehavior::NewWindow,
-            aterm_cli::WindowingBehavior::Attach,
-        ] {
-            for reachable in [true, false] {
-                assert_eq!(
-                    aterm_cli::route_launch(
-                        aterm_cli::LaunchIntent::NewWindow,
-                        behavior,
-                        reachable
-                    ),
-                    aterm_cli::WindowRoute::Spawn,
-                    "an OS relaunch must come back as a WINDOW under {behavior:?}"
-                );
-            }
-        }
-        assert_eq!(verb, aterm_cli::Verb::NewWindow);
-        assert_eq!(
-            alias_route("aterm-gui", line),
-            AliasRoute::AliasWindowVerb,
-            "the relaunched image is current_exe(), normally aterm-gui.exe"
-        );
-    }
-
-    #[test]
-    fn the_mode_flags_are_stripped_before_the_window_but_never_inside_a_payload() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        assert_eq!(strip_mode_flags(&osv(&["--window"])), osv(&[]));
-        assert_eq!(
-            strip_mode_flags(&osv(&["--window", "-d", "/tmp"])),
-            osv(&["-d", "/tmp"])
-        );
-        assert_eq!(strip_mode_flags(&osv(&["--session"])), osv(&[]));
-        assert_eq!(
-            strip_mode_flags(&osv(&["--window", "-e", "sh", "--window"])),
-            osv(&["-e", "sh", "--window"])
-        );
-        assert_eq!(payload_boundary(&osv(&["-d", "/tmp"])), 2);
-        assert_eq!(payload_boundary(&osv(&["--window", "--", "x"])), 1);
-        assert_eq!(
-            strip_flags(&osv(&["--window", "--session"]), &["--window"]),
-            osv(&["--session"])
-        );
-    }
-
-    #[test]
-    fn no_reroute_is_stripped_before_dispatch_and_sets_the_marker() {
-        let _env_lock = NO_REROUTE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let env = atpkg::reroute::PASSTHROUGH_ENV;
-        let engaged = || atpkg::reroute::engaged(std::env::var(env).ok().as_deref());
-        aterm_log::env::unset(env);
-        aterm_log::env::set(env, "1");
-        assert_eq!(take_no_reroute(&osv(&["--window"])), osv(&["--window"]));
-        assert!(
-            !engaged(),
-            "no flag, no escape — whatever the environment carried"
-        );
-        assert_eq!(
-            take_no_reroute(&osv(&["-e", "sh", "--no-reroute"])),
-            osv(&["-e", "sh", "--no-reroute"])
-        );
-        assert!(!engaged(), "a payload token must not engage the escape");
-        assert_eq!(
-            take_no_reroute(&osv(&["--window", "--no-reroute", "-d", "/tmp"])),
-            osv(&["--window", "-d", "/tmp"])
-        );
-        assert!(engaged(), "the flag must establish {env}=1");
-        assert_eq!(
-            plain_launch_request(
-                &osv(&["--window", "--no-reroute"]),
-                aterm_cli::LaunchEnv::default()
-            ),
-            None,
-            "a --no-reroute launch fails closed to a local spawn"
-        );
-        let announced = atpkg::reroute::ANNOUNCED_ENV;
-        for flags in [&["--window"][..], &["--window", "--no-reroute"][..]] {
-            aterm_log::env::set(announced, "1");
-            let _ = take_no_reroute(&osv(flags));
-            assert!(
-                std::env::var_os(announced).is_none(),
-                "{flags:?}: an inherited {announced} would silence the session's signposts"
-            );
-        }
-        aterm_log::env::unset(env);
-    }
-
-    fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
-        aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-front-door-{tag}-"))
-            .suffix(".noindex")
-            .tempdir()
-            .expect("scratch dir")
-    }
-
-    #[test]
-    fn the_agents_dir_is_handed_on_every_lane_regardless_of_the_reroute_switch() {
-        let _env_lock = NO_REROUTE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let scratch = scratch_dir("agents-handoff");
-        let layout = atpkg::store::Layout {
-            prefix: scratch.path().join("pkg"),
-        };
-        assert_eq!(agents_dir_handoff(None), None, "no layout, nothing handed");
-        assert!(
-            !layout.agents_dir().exists(),
-            "a fresh prefix has no agents/"
-        );
-        let handed = agents_dir_handoff(Some(&layout)).expect("created, hence handed");
-        assert_eq!(handed, layout.agents_dir().to_str().unwrap());
-        assert!(std::path::Path::new(&handed).is_absolute());
-        assert!(
-            std::fs::symlink_metadata(&handed).unwrap().is_dir(),
-            "a real directory"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&handed).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "a $HOME prefix's directory is private");
-        }
-        assert_eq!(
-            agents_dir_handoff(Some(&layout)).as_deref(),
-            Some(handed.as_str()),
-            "a second call is a no-op with the same answer"
-        );
-        let env = atpkg::reroute::PASSTHROUGH_ENV;
-        let before = std::env::var_os(env);
-        for value in ["1", "yes"] {
-            aterm_log::env::set(env, value);
-            assert!(atpkg::reroute::engaged(std::env::var(env).ok().as_deref()));
-            assert_eq!(
-                agents_dir_handoff(Some(&layout)).as_deref(),
-                Some(handed.as_str()),
-                "{env}={value} must not drop the managed agents dir"
-            );
-        }
-        match before {
-            Some(v) => aterm_log::env::set(env, v),
-            None => aterm_log::env::unset(env),
-        }
-        let var = atpkg::reroute::AGENTS_DIR_ENV;
-        assert_eq!(var, "ATERM_AGENTS_DIR", "the contract's spelling");
-        hand_agents_dir(Some(&layout));
-        assert_eq!(std::env::var(var).ok().as_deref(), Some(handed.as_str()));
-        hand_agents_dir(None);
-        assert_eq!(
-            std::env::var_os(var),
-            None,
-            "no layout ⇒ not set, not empty"
-        );
-    }
-
-    /// A prefix that refuses the `mkdir`, or a symlink at `agents/`, hands nothing (said on
-    /// stderr), creates nothing, and `hand_agents_dir` removes an inherited value.
-    #[cfg(unix)]
-    #[test]
-    fn a_refused_agents_dir_hands_nothing_and_clears_an_inherited_stray() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _env_lock = NO_REROUTE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let scratch_dir = scratch_dir("agents-refused");
-        let scratch = scratch_dir.path();
-        let var = atpkg::reroute::AGENTS_DIR_ENV;
-        let real = scratch.join("real-agents");
-        std::fs::create_dir_all(&real).unwrap();
-        let linked = atpkg::store::Layout {
-            prefix: scratch.join("linked"),
-        };
-        std::fs::create_dir_all(&linked.prefix).unwrap();
-        std::os::unix::fs::symlink(&real, linked.agents_dir()).unwrap();
-        assert!(linked.agents_dir().is_dir(), "the link resolves");
-        assert_eq!(agents_dir_handoff(Some(&linked)), None);
-        assert!(
-            std::fs::symlink_metadata(linked.agents_dir())
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "left alone"
-        );
-        let filed = atpkg::store::Layout {
-            prefix: scratch.join("filed"),
-        };
-        std::fs::create_dir_all(&filed.prefix).unwrap();
-        std::fs::write(filed.agents_dir(), b"not a dir").unwrap();
-        assert_eq!(agents_dir_handoff(Some(&filed)), None);
-        aterm_log::env::set(var, real.to_str().unwrap());
-        hand_agents_dir(Some(&linked));
-        assert_eq!(
-            std::env::var_os(var),
-            None,
-            "an inherited stray must not survive a refusal"
-        );
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        if unsafe { libc::getuid() } == 0 {
-            aterm_spec::host::could_not_run(
-                "running as root, where a read-only prefix refuses nothing: the refusal leg cannot run",
-            );
-        }
-        let layout = atpkg::store::Layout {
-            prefix: scratch.join("pkg"),
-        };
-        std::fs::create_dir_all(&layout.prefix).unwrap();
-        struct RestorePerms(std::path::PathBuf);
-        impl Drop for RestorePerms {
-            fn drop(&mut self) {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        let _restore = RestorePerms(layout.prefix.clone());
-        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert_eq!(agents_dir_handoff(Some(&layout)), None);
-        assert!(!layout.agents_dir().exists(), "nothing created");
-        aterm_log::env::set(var, real.to_str().unwrap());
-        hand_agents_dir(Some(&layout));
-        assert_eq!(std::env::var_os(var), None);
-        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
-        hand_agents_dir(Some(&layout));
-        assert_eq!(
-            std::env::var(var).ok().as_deref(),
-            layout.agents_dir().to_str()
-        );
-        assert_eq!(
-            std::fs::metadata(layout.agents_dir())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o700
-        );
-        aterm_log::env::unset(var);
-    }
-
-    #[test]
-    fn front_door_verbs_and_completion_flags_have_no_duplicates() {
-        let verbs = super::front_door_verbs();
-        let mut seen_verbs = std::collections::BTreeSet::new();
-        for &verb in &verbs {
-            assert!(
-                seen_verbs.insert(verb),
-                "duplicate front-door completion verb: {verb:?}"
-            );
-        }
-        assert!(seen_verbs.contains("help"));
-        for verb in aterm_cli::Verb::ALL {
-            assert!(seen_verbs.contains(verb.name()), "missing {}", verb.name());
-        }
-        for &(name, _) in aterm_cli::DIAG_COMMANDS {
-            assert!(seen_verbs.contains(name), "missing diag {name}");
-        }
-
-        let mut seen_flags = std::collections::BTreeSet::new();
-        for &(flag, desc) in super::COMPLETION_FLAGS {
-            assert!(flag.starts_with("--"), "flag {flag:?} must start with --");
-            assert!(!desc.is_empty(), "flag {flag:?} must carry a description");
-            assert!(
-                seen_flags.insert(flag),
-                "duplicate front-door completion flag: {flag:?}"
-            );
-        }
-
-        for (shell, wiring) in [
-            ("bash", "complete -F _aterm aterm\n"),
-            ("zsh", "#compdef aterm\n"),
-            ("fish", "complete -c aterm -f\n"),
-        ] {
-            let script =
-                aterm_ctl::front_door_completion_script(shell, &verbs, super::COMPLETION_FLAGS)
-                    .unwrap_or_else(|| panic!("{shell} script"));
-            if shell == "zsh" {
-                assert!(script.starts_with(wiring), "zsh must start with {wiring:?}");
-            } else {
-                assert!(script.contains(wiring), "{shell} missing {wiring:?}");
-            }
-            for &verb in &verbs {
-                assert!(script.contains(verb), "{shell} missing verb {verb:?}");
-            }
-            for &(flag, _) in super::COMPLETION_FLAGS {
-                let want = if shell == "fish" {
-                    flag.trim_start_matches('-')
-                } else {
-                    flag
-                };
-                assert!(script.contains(want), "{shell} missing flag {want:?}");
-            }
-        }
-        assert!(
-            aterm_ctl::front_door_completion_script("tcsh", &verbs, super::COMPLETION_FLAGS)
-                .is_none()
-        );
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod open_probe_alias_boundary_tests {
-    use super::{AliasRoute, alias_route};
-
-    #[test]
-    fn a_window_alias_serves_its_open_probe_child_at_the_front_door() {
-        let verb = aterm_containment::consent::OPEN_PROBE_VERB;
-        assert_eq!(alias_route("aterm-gui", ""), AliasRoute::AliasWindow);
-        assert_eq!(
-            alias_route("aterm-windowed", "new-window"),
-            AliasRoute::AliasWindowVerb
-        );
-        assert_eq!(alias_route("aterm-ctl", "status"), AliasRoute::Ctl);
-        assert_eq!(alias_route("aterm-askpass", verb), AliasRoute::Askpass);
-        let observed: Vec<_> = [
-            "aterm",
-            "aterm-cli",
-            "aterm-gui",
-            "aterm-windowed",
-            "renamed-copy",
-        ]
-        .into_iter()
-        .map(|name| (name, alias_route(name, verb)))
-        .collect();
-        assert!(
-            observed
-                .iter()
-                .all(|(_, route)| *route == AliasRoute::FrontDoor),
-            "a window alias must route its probe child before window mode: {observed:?}"
-        );
-    }
-}
+#[path = "main_open_probe_alias_boundary_tests.rs"]
+mod open_probe_alias_boundary_tests;

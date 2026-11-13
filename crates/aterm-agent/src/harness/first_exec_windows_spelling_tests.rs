@@ -25,7 +25,8 @@ fn ordinary_windows_native_spellings_keep_the_command_and_physical_hold_together
             Path::new(physical),
             "the hold stays physical"
         );
-        for word in [ProbeWord::Version, ProbeWord::Help] {
+        {
+            let word = ProbeWord::Help;
             let mut command = admitted.command();
             command.arg(word.word());
             assert_eq!(

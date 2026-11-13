@@ -15,29 +15,8 @@ use std::fmt;
 use std::ops::Index;
 
 #[cfg(test)]
-mod iteration_counter {
-    use std::cell::Cell;
-
-    thread_local! {
-        static RUN_ITERATIONS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn count_run_iteration() {
-        RUN_ITERATIONS.with(|counter| counter.set(counter.get() + 1));
-    }
-
-    pub(super) fn reset_run_iterations() {
-        RUN_ITERATIONS.with(|counter| counter.set(0));
-    }
-
-    pub(super) fn take_run_iterations() -> usize {
-        RUN_ITERATIONS.with(|counter| {
-            let value = counter.get();
-            counter.set(0);
-            value
-        })
-    }
-}
+#[path = "lib_iteration_counter_tests.rs"]
+mod iteration_counter;
 
 #[cfg(test)]
 use iteration_counter::{count_run_iteration, reset_run_iterations, take_run_iterations};

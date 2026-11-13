@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A person's click on a Claude Code tab's off permission chip (`○ yolo`), as the window holds
-//! it (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, §3): the App's table of standing asks, one a
-//! tab ([`Clicks`]), and the lane that looks at each on its own thread through the harness's one
-//! look ([`harness::look`]), paced as the ⬆️ press lane is. Nothing is typed and nothing is on
-//! disk while an ask stands; the restart it makes is the harness's.
+//! A person's click on a Claude Code tab's permission chip (`yolo`), as the window holds it
+//! (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, §3): the App's table of standing asks, one a tab
+//! ([`Clicks`]), the lane that looks at each on its own thread through the harness's one look
+//! ([`harness::look`]), paced as the ⬆️ press lane is, and the read of the settings' default mode
+//! a click on the on chip is decided by ([`Defaults`]). Nothing is typed and nothing is on disk
+//! while an ask stands; the restart it makes is the harness's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::permission_click::{self as harness, Click, End, Look, Wait};
+use aterm_agent::supervise::policy::claude_settings::{PermissionDefault, Resolved};
 
 use crate::App;
 
@@ -558,17 +560,74 @@ fn clicker_at(home: PathBuf, state: PathBuf, sock: Option<String>) -> Clicker {
     })
 }
 
-/// The App's clicks: the table and what looks at it.
+/// What reads the default permission mode of a tab's Claude Code settings, by the tab's sid
+/// ([`App::permission_default`]).
+#[derive(Clone)]
+pub(crate) struct Defaults(Arc<dyn Fn(&str) -> PermissionDefault + Send + Sync>);
+
+impl Defaults {
+    /// Wrap a read.
+    pub(crate) fn new(f: impl Fn(&str) -> PermissionDefault + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+/// With no agent to read, the default is not told: a click on the on chip still stands its
+/// restart, and its box says the mode could not be read.
+impl Default for Defaults {
+    fn default() -> Self {
+        Self::new(|_| PermissionDefault {
+            mode: Resolved::Unread("its agent is not read".to_string()),
+            bypass_disabled: None,
+        })
+    }
+}
+
+impl std::fmt::Debug for Defaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Defaults")
+    }
+}
+
+/// Production [`Defaults`]: the settings chain of the agent the host's relaunch snapshot names
+/// for the tab, read under that agent's own environment, line and directory
+/// ([`crate::harness_netprobe::permission_default_of_agent`]). A tab with no snapshot (an agent
+/// started under Off) is not read.
+pub(crate) fn live_defaults() -> Defaults {
+    Defaults::new(|tab| match crate::harness_host::published_snapshot(tab) {
+        Some(snap) => {
+            crate::harness_netprobe::permission_default_of_agent(snap.pid, &snap.argv, &snap.cwd)
+        }
+        None => PermissionDefault {
+            mode: Resolved::Unread("its agent is not read".to_string()),
+            bypass_disabled: None,
+        },
+    })
+}
+
+/// The App's clicks: the table, what looks at it, and what reads the settings' default.
 #[derive(Debug, Default)]
 pub(crate) struct ClickView {
     pub(crate) clicks: Clicks,
     clicker: Clicker,
+    defaults: Defaults,
 }
 
 impl ClickView {
-    /// A view over `clicks`, the table the host's workers share, looked at through `clicker`.
-    pub(crate) const fn with(clicks: Clicks, clicker: Clicker) -> Self {
-        Self { clicks, clicker }
+    /// A view over `clicks`, the table the host's workers share, looked at through `clicker`,
+    /// the settings' default read through `defaults`.
+    pub(crate) const fn with(clicks: Clicks, clicker: Clicker, defaults: Defaults) -> Self {
+        Self {
+            clicks,
+            clicker,
+            defaults,
+        }
+    }
+
+    /// What reads the settings' default from here on, as a test scripts it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_defaults(&mut self, defaults: Defaults) {
+        self.defaults = defaults;
     }
 
     /// What looks at a click from here on, as a test scripts it.
@@ -608,6 +667,12 @@ fn run_click_lane(
 }
 
 impl App {
+    /// The default permission mode of tab `tab`'s Claude Code settings, read now: a few small
+    /// files, fenced and bounded as every read of the chain is.
+    pub(crate) fn permission_default(&self, tab: &str) -> PermissionDefault {
+        (self.permission_clicks.defaults.0)(tab)
+    }
+
     /// Whether the host relaunches tab `tab`'s agent when it ends ([`harness::look`]'s
     /// `relaunch_due`).
     fn click_relaunch_due(&self, tab: &str) -> bool {
@@ -677,159 +742,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aterm_agent::supervise::policy::turn_end::PermissionTo;
-
-    fn click(tab: &str) -> Click {
-        Click {
-            tab: tab.to_owned(),
-            conversation: "c-1".to_owned(),
-            to: PermissionTo::Bypass,
-            at: 1,
-        }
-    }
-
-    /// A TAKE-BACK PAST THE FENCE LANDS UNLESS THE SIGNAL WENT (design §2: a click on `◐` "takes
-    /// it back, until the signal goes"): once the lane's look read the ask standing, before the
-    /// hand, a click on it still offered as one to take back marks it, the window draws and holds
-    /// it no more, the fence's read just before the signal finds it gone, and the look's answer
-    /// that it waits ends it rather than leaving it to signal at the next rest. NEGATIVE CONTROLS:
-    /// a signal already past the fence's last read keeps the ask, and nothing takes it back after;
-    /// with no look under way the first click takes it back at once, and a look for it moves
-    /// nothing.
-    #[test]
-    fn a_take_back_past_the_fence_lands_unless_the_signal_went() {
-        let clicks = Clicks::default();
-        let now = Instant::now();
-        let id = clicks.stand(click("s-a"), false);
-        assert!(clicks.stands("s-a", id), "the look's read before the hand");
-        assert_eq!(
-            clicks.shown("s-a"),
-            Some(ClickShown {
-                when: Some("when it can")
-            }),
-            "past the fence, unsignalled: still offered to take back"
-        );
-        assert!(
-            clicks.take_back("s-a").is_some(),
-            "taken back past the fence"
-        );
-        assert_eq!(clicks.shown("s-a"), None, "drawn as taken back");
-        assert!(clicks.get("s-a").is_none());
-        assert!(!clicks.holds("s-a", now), "it holds nothing");
-        assert!(
-            !clicks.stands("s-a", id),
-            "the read before the signal finds it gone"
-        );
-        assert_eq!(
-            clicks.note("s-a", id, &Look::Waits(Wait::Other("changed".into())), now),
-            Noted::Changed
-        );
-        assert!(
-            clicks.lane_next("s-a").is_none(),
-            "the look's wait ended it, and its lane with it"
-        );
-
-        let id = clicks.stand(click("s-c"), false);
-        assert!(clicks.stands("s-c", id));
-        assert!(
-            clicks.take_back("s-c").is_some(),
-            "after the fence's last read"
-        );
-        assert_eq!(
-            clicks.note("s-c", id, &Look::InFlight("signalled".into()), now),
-            Noted::Changed
-        );
-        assert!(
-            clicks.get("s-c").is_some_and(|s| s.signalled),
-            "control: the signal went first"
-        );
-        assert!(clicks.take_back("s-c").is_none(), "control: signalled");
-
-        let id = clicks.stand(click("s-b"), false);
-        assert!(clicks.take_back("s-b").is_some(), "no look under way");
-        assert!(!clicks.stands("s-b", id));
-        assert_eq!(
-            clicks.note("s-b", id, &Look::InFlight("x".into()), now),
-            Noted::Stale,
-            "a look for an ask taken back moves nothing"
-        );
-    }
-
-    /// ONE RESTART A CLICK (the model's `OneRestartPerClick`): once its restart was signalled, a
-    /// later look that waits (its record superseded by another restart's, which it waits behind)
-    /// and then reaches the restart again reads the fence false, so it ends with nothing signalled
-    /// a second time. NEGATIVE CONTROL: an ask not yet signalled reads it standing after a wait.
-    #[test]
-    fn a_signalled_click_never_passes_the_fence_again() {
-        let clicks = Clicks::default();
-        let now = Instant::now();
-        let id = clicks.stand(click("s-a"), false);
-        assert!(clicks.stands("s-a", id));
-        assert_eq!(
-            clicks.note("s-a", id, &Look::InFlight("signalled".into()), now),
-            Noted::Changed
-        );
-        assert_eq!(
-            clicks.note("s-a", id, &Look::Waits(Wait::Restart), now),
-            Noted::Changed
-        );
-        assert!(
-            !clicks.stands("s-a", id),
-            "signalled once: no second signal"
-        );
-        let id = clicks.stand(click("s-b"), false);
-        assert!(clicks.stands("s-b", id));
-        clicks.note("s-b", id, &Look::Waits(Wait::Turn), now);
-        assert!(clicks.stands("s-b", id), "control: not signalled yet");
-    }
-
-    /// THE HOLD (design Appendix, "Hold"): it starts at the first rest asked, a box or a held tab
-    /// starts it again, a draft does not, a turn clears it while it has time left (so a later
-    /// rest starts it again) and leaves it out once it ran out, and a wall lets it go while it
-    /// stands, the turn after it holding again. NEGATIVE CONTROL: a click taken back holds nothing.
-    #[test]
-    fn a_standing_click_holds_the_loops_act_for_its_own_bound() {
-        let clicks = Clicks::default();
-        let id = clicks.stand(click("s-h"), false);
-        let now = Instant::now();
-        assert!(clicks.holds("s-h", now), "from the first rest");
-        clicks.run_hold_out("s-h");
-        assert!(!clicks.holds("s-h", Instant::now()), "its bound");
-        let id2 = clicks.stand(click("s-h"), false);
-        assert!(id2 > id, "a new ask");
-        assert!(clicks.holds("s-h", Instant::now()));
-        clicks.run_hold_out("s-h");
-        clicks.note("s-h", id2, &Look::Waits(Wait::Box), Instant::now());
-        assert!(clicks.holds("s-h", Instant::now()), "a box starts it again");
-        clicks.run_hold_out("s-h");
-        clicks.note("s-h", id2, &Look::Waits(Wait::Draft), Instant::now());
-        assert!(!clicks.holds("s-h", Instant::now()), "a draft does not");
-        let gen3 = clicks.stand(click("s-h"), false);
-        let rest = Instant::now();
-        assert!(clicks.holds("s-h", rest));
-        clicks.note("s-h", gen3, &Look::Waits(Wait::Turn), rest);
-        assert!(
-            clicks.holds("s-h", rest + CLICK_HOLD * 2),
-            "a turn with time left cleared it: a later rest starts it again"
-        );
-        clicks.note("s-h", gen3, &Look::Waits(Wait::Held), Instant::now());
-        clicks.run_hold_out("s-h");
-        clicks.note("s-h", gen3, &Look::Waits(Wait::Turn), Instant::now());
-        assert!(!clicks.holds("s-h", Instant::now()), "run out, out");
-        clicks.note("s-h", gen3, &Look::Waits(Wait::Box), Instant::now());
-        assert!(!clicks.holds("s-h", Instant::now()), "and out for this ask");
-        let gen4 = clicks.stand(click("s-h"), false);
-        clicks.note("s-h", gen4, &Look::Waits(Wait::Limit), Instant::now());
-        assert!(!clicks.holds("s-h", Instant::now()), "a wall's own wait");
-        clicks.note("s-h", gen4, &Look::Waits(Wait::Turn), Instant::now());
-        assert!(
-            clicks.holds("s-h", Instant::now()),
-            "the turn after the wall: the next rest holds again"
-        );
-        clicks.stand(click("s-h"), false);
-        assert!(clicks.take_back("s-h").is_some());
-        assert!(!clicks.holds("s-h", Instant::now()), "nothing stands");
-    }
-}
+#[path = "permission_click_tests.rs"]
+mod tests;

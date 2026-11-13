@@ -152,9 +152,10 @@ fn typed_frames(
 ) -> Vec<Kept> {
     let mut r = Replay::sized_at(style, look, TrailColor::Automatic, ROWS, gallery_row_px());
     if !enabled {
+        let spec = crate::trail_letters_read::Spec::of(style);
         r.fx.set_cursor_glow(
             false,
-            style,
+            spec.trail,
             TrailColor::Automatic,
             None,
             260,
@@ -164,6 +165,9 @@ fn typed_frames(
             true,
             look.cursor,
         );
+        if spec.tall {
+            r.fx.set_ribbon_shape(true, spec.flat);
+        }
     }
     r.post = true;
     controls(&mut r.fx);

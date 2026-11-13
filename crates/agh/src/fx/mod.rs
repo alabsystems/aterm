@@ -33,6 +33,11 @@ impl NativeRequestStart {
     pub(crate) fn remaining(&self, within: Duration) -> Duration {
         within.saturating_sub(self.0.elapsed())
     }
+
+    /// Read an enclosing absolute bound through the same native effect clock.
+    pub(crate) fn remaining_until(&self, until: std::time::Instant) -> Duration {
+        self.remaining(until.saturating_duration_since(self.0))
+    }
 }
 
 use aterm_types::{MutexExt, http_retry::Retry};

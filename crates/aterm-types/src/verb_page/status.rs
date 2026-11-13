@@ -7,7 +7,7 @@
 //! them); each group's section says what its fields mean.
 
 use super::{Page, Section, para, row};
-use crate::no_checked_record;
+use crate::{no_checked_record, setup_state};
 
 /// The `status` entry.
 pub(crate) const PAGE: Page = Page {
@@ -61,8 +61,8 @@ pub(crate) const PAGE: Page = Page {
             "host",
             "integration input input_bytes input_wait_ms fg_footprint_mb disk disk_free_mb \
          disk_room_mb disk_age_ms job job_quiet_ms program_check program_check_stranded left \
-         syspolicyd syspolicyd_workers syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms service_mem \
-         service_mem_top occupancy occupancy_hold ready slots idle_ready_min waits waits_ready",
+         syspolicyd syspolicyd_workers syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms \
+         syspolicyd_age_ms service_mem service_mem_top occupancy occupancy_hold ready slots idle_ready_min waits waits_ready",
         ),
         row(
             "harness",
@@ -150,18 +150,10 @@ pub(crate) const PAGE: Page = Page {
         Section {
             name: "setup",
             about: "setup=: this Mac's first-run setup, as its worker last published it",
-            rows: &[row(
-                "setup=<done[;asking:<row,…>][;offered:<row,…>]|unknown:<row,…>|\
-                 pending[:<row,…>][;needs:<row,…>][;unknown:<row,…>]|->",
-                "this Mac's first-run setup, read from the last status its worker published: no \
-                 probe, nothing changed; `done` leaves nothing for anyone to do now, `;asking:` \
-                 names what a parked run still asks for again by itself (an absent vault), \
-                 `;offered:` the macOS grants on offer, which nothing waits for; `unknown:` names \
-                 rows without a usable cached reading, not a failed mapping or an effect still to \
-                 run; `;needs:` the known pending rows that wait on a person's press; rows `fda`, \
-                 `devtools`, `debugger`, `lan`, `ax`, `vault`, `repos`, … (`setup status` is the \
-                 same state with its rows' standings)",
-            )],
+            rows: &[para(concat!(
+                setup_state!(),
+                " (`setup status` is the same state with its rows' standings)"
+            ))],
         },
         Section {
             name: "net",
@@ -267,7 +259,7 @@ pub(crate) const PAGE: Page = Page {
                      program_check=<n>:<oldest_ms>|0|- \
                      program_check_stranded=<n>:<oldest_ms>|0|- left=<n>:<oldest_ms>|0:-|- \
                      syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= \
-                     syspolicyd_pid= syspolicyd_up_ms= \
+                     syspolicyd_pid= syspolicyd_up_ms= syspolicyd_age_ms= \
                      service_mem=<-|ok|large|huge> service_mem_top=<name>:<MiB>|- \
                      occupancy=<off|observe|prompt> \
                      occupancy_hold=<declared|undeclared|none> ready= slots= idle_ready_min= \
@@ -292,7 +284,13 @@ pub(crate) const PAGE: Page = Page {
                      `syspolicyd_full_ms=` how long it has read full; `syspolicyd_pid=` the \
                      `syspolicyd` the stuck check's last look read and `syspolicyd_up_ms=` how \
                      long it has run, `-` before a look reads one and once none runs (a look \
-                     that reads nothing keeps the pid, with no age)",
+                     that reads nothing keeps the pid, with no age); `syspolicyd_age_ms=` how long \
+                     ago the last look was taken, `-` before one. A look is taken a minute after \
+                     the window starts, each minute while the pool reads full, each minute while a \
+                     program of this user waits at the check, and when `status` finds the last a \
+                     minute old or more (that ask reads the last; the next reads the new one); at \
+                     rest the last stands, so a reading a minute old or more is that look's, \
+                     and asking again reads a fresh one",
                 ),
                 row(
                     "service_mem=",

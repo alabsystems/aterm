@@ -25,6 +25,32 @@ pub(crate) const fn default_cursor_trail_style() -> &'static str {
     }
 }
 
+/// The pet an aterm.toml that names none keeps: the cat where decorative effects are on by
+/// default, none where they are off (Windows).
+pub(crate) const fn default_cursor_pet() -> &'static str {
+    if DEFAULT_DECORATIVE_EFFECTS {
+        crate::prefs::DEFAULT_CURSOR_PET
+    } else {
+        "off"
+    }
+}
+
+/// The pet an aterm.toml keeps from its `cursor_pet` (`pet`) and the retired `cursor_trail`
+/// master (`master`), trimmed. The master off drew no cursor decoration, so it keeps no pet;
+/// the master on drew the default style and its cat on every platform, so it keeps the cat
+/// where the platform's own default is none (Windows), as [`drawn_cursor_trail_style`] keeps
+/// the style. The cursor style does not enter into it.
+pub(crate) fn drawn_cursor_pet(master: Option<bool>, pet: Option<&str>) -> &str {
+    if master == Some(false) {
+        return "off";
+    }
+    match pet {
+        Some(pet) => pet.trim(),
+        None if master == Some(true) => crate::prefs::DEFAULT_CURSOR_PET,
+        None => default_cursor_pet(),
+    }
+}
+
 /// `toml` with the cursor trail drawn on every platform: where decorative
 /// effects are off by default (Windows), the default style and its momentum
 /// glow go ahead of it unless it names them.
@@ -107,6 +133,9 @@ pub(crate) struct Config {
     pub(crate) cursor_trail: Option<bool>,
     pub(crate) cursor_momentum_glow: Option<bool>,
     pub(crate) cursor_trail_style: Option<String>,
+    /// The pet beside the cursor (`off`, `cat`, `dog`): its own setting, kept beside every
+    /// cursor style and the plain cursor.
+    pub(crate) cursor_pet: Option<String>,
     pub(crate) trail_sounds: Option<bool>,
     pub(crate) trail_sound_volume: Option<f32>,
     pub(crate) trail_sound_bed: Option<bool>,
@@ -620,6 +649,7 @@ pub(crate) fn path_feed_read_count() -> usize {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrailStyleCache {
     resolved_style_raw: Box<str>,
+    resolved_pet_raw: Box<str>,
     resolved_presentation: ResolvedTrailPresentation,
 }
 
@@ -1462,21 +1492,22 @@ impl TrailStyleCache {
         std::sync::Arc::new(Self::default())
     }
 
-    /// Resolve `raw` once for one config generation.
-    pub(crate) fn for_style(raw: &str) -> Self {
+    /// Resolve the style `raw` and the pet `pet` once for one config generation.
+    pub(crate) fn for_style(raw: &str, pet: &str) -> Self {
         Self {
             resolved_style_raw: raw.trim().into(),
-            resolved_presentation: resolve_trail_presentation(raw),
+            resolved_pet_raw: pet.trim().into(),
+            resolved_presentation: resolve_trail_presentation(raw, pet),
         }
     }
 
     /// Cached answer, with a dynamic fallback for test/preview code that mutates `Config` without publishing a new asset generation.
-    pub(crate) fn presentation_for(&self, raw: &str) -> ResolvedTrailPresentation {
-        let raw = raw.trim();
-        if raw == self.resolved_style_raw.as_ref() {
+    pub(crate) fn presentation_for(&self, raw: &str, pet: &str) -> ResolvedTrailPresentation {
+        let (raw, pet) = (raw.trim(), pet.trim());
+        if raw == self.resolved_style_raw.as_ref() && pet == self.resolved_pet_raw.as_ref() {
             self.resolved_presentation
         } else {
-            resolve_trail_presentation(raw)
+            resolve_trail_presentation(raw, pet)
         }
     }
 }
@@ -1489,7 +1520,7 @@ pub(crate) struct ResolvedTrailStyle {
     pub(crate) unknown: bool,
 }
 
-/// All string-keyed presentation decisions for one resolved trail style, resolved once per config generation so rendering reads only `Copy` fields.
+/// All string-keyed presentation decisions for one resolved trail style and the pet beside it, resolved once per config generation so rendering reads only `Copy` fields.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedTrailPresentation {
     pub(crate) style: ResolvedTrailStyle,
@@ -1497,7 +1528,12 @@ pub(crate) struct ResolvedTrailPresentation {
     pub(crate) ribbon_tall: bool,
     pub(crate) ribbon_flat: bool,
     pub(crate) classic_mono: bool,
+    /// The animal the `cursor_pet` setting keeps walking beside the cursor, whatever the style
+    /// is; `None` for `off` and for a flier.
     pub(crate) pet_species: Option<aterm_effects::kitty_pet::PetSpecies>,
+    /// The `cursor_pet` setting names a flier (`flying cat`): no walker, and the rainbow's
+    /// momentum flies the head in.
+    pub(crate) pet_flies: bool,
     pub(crate) comet: bool,
 }
 
@@ -1512,10 +1548,11 @@ impl Default for ResolvedTrailPresentation {
                 unknown: false,
             },
             beam: aterm_effects::cursor_glow::style_has_beam_of(style, raw),
-            ribbon_tall: true,
+            ribbon_tall: false,
             ribbon_flat: false,
             classic_mono: false,
-            pet_species: Some(aterm_effects::kitty_pet::PetSpecies::Cat),
+            pet_species: aterm_effects::cursor_pet::species(crate::prefs::DEFAULT_CURSOR_PET),
+            pet_flies: aterm_effects::cursor_pet::flies(crate::prefs::DEFAULT_CURSOR_PET),
             comet: false,
         }
     }
@@ -1525,6 +1562,7 @@ impl Default for TrailStyleCache {
     fn default() -> Self {
         Self {
             resolved_style_raw: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.into(),
+            resolved_pet_raw: crate::prefs::DEFAULT_CURSOR_PET.into(),
             resolved_presentation: ResolvedTrailPresentation::default(),
         }
     }
@@ -1668,8 +1706,6 @@ pub(crate) struct ClaudeFooterConfig {
     pub(crate) card: Option<bool>,
     pub(crate) acts: Option<bool>,
     pub(crate) agents: Option<bool>,
-    pub(crate) switch_model: Option<String>,
-    pub(crate) switch_effort: Option<String>,
 }
 
 /// The `[render]` table.
@@ -2143,42 +2179,8 @@ impl FleetConfig {
 }
 
 #[cfg(test)]
-mod fleet_watch_tests {
-    use super::Config;
-
-    #[test]
-    fn a_member_reads_automatically_unless_watch_or_swarm_is_off() {
-        for (text, reads) in [
-            ("", true),
-            ("[fleet]\n", true),
-            ("[fleet]\nwatch = true\n", true),
-            ("[fleet]\nwatch = false\n", false),
-            ("[swarm]\nenabled = false\n", false),
-            ("[swarm]\nenabled = false\n[fleet]\nwatch = true\n", false),
-        ] {
-            let config = aterm_toml::from_str::<Config>(text).expect("valid configuration");
-            for minted in [false, true] {
-                let book = crate::fleet_glance::BookFacts {
-                    in_fleet: true,
-                    minted,
-                    ..crate::fleet_glance::BookFacts::default()
-                };
-                assert_eq!(
-                    crate::fleet_glance::should_poll(
-                        &book,
-                        config.fleet_watch_enabled(),
-                        None,
-                        1_000,
-                        false,
-                        crate::fleet_glance::POLL_EVERY,
-                    ),
-                    reads,
-                    "minted={minted} {text:?}"
-                );
-            }
-        }
-    }
-}
+#[path = "app_config_fleet_watch_tests.rs"]
+mod fleet_watch_tests;
 
 /// The `[update]` table.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
@@ -2741,6 +2743,11 @@ impl Config {
         drawn_cursor_trail_style(self.cursor_trail, self.cursor_trail_style.as_deref())
     }
 
+    /// The pet this config keeps beside the cursor, as aterm.toml spells it ([`drawn_cursor_pet`]).
+    pub(crate) fn cursor_pet_raw(&self) -> &str {
+        drawn_cursor_pet(self.cursor_trail, self.cursor_pet.as_deref())
+    }
+
     /// Trail brightness for the resolved style, clamped 0.0..=1.0.
     pub(crate) fn cursor_trail_intensity_for(
         &self,
@@ -2887,7 +2894,7 @@ impl Config {
 
     /// This config's trail presentation, resolved once per generation.
     pub(crate) fn resolve_trail_style_cache(&self) -> TrailStyleCache {
-        TrailStyleCache::for_style(self.cursor_trail_style_raw())
+        TrailStyleCache::for_style(self.cursor_trail_style_raw(), self.cursor_pet_raw())
     }
 
     #[cfg(test)]
@@ -3436,22 +3443,6 @@ impl Config {
             .as_ref()
             .and_then(|c| c.agents)
             .unwrap_or(true)
-    }
-
-    /// The `[claude_footer] switch_model` word: `None` where it is unwritten, empty or `auto`
-    /// (`crate::claude_facts::SwitchTarget::of` reads it).
-    pub(crate) fn claude_footer_switch_model(&self) -> Option<&str> {
-        Self::switch_word(self.claude_footer.as_ref()?.switch_model.as_deref())
-    }
-
-    /// The `[claude_footer] switch_effort` word, as [`Self::claude_footer_switch_model`].
-    pub(crate) fn claude_footer_switch_effort(&self) -> Option<&str> {
-        Self::switch_word(self.claude_footer.as_ref()?.switch_effort.as_deref())
-    }
-
-    fn switch_word(word: Option<&str>) -> Option<&str> {
-        word.map(str::trim)
-            .filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("auto"))
     }
 
     /// `[harness.<agent>] enabled` as the supervisor's reader took it.
@@ -4075,32 +4066,48 @@ impl Config {
         }
     }
 
-    /// Warning when `cursor_trail_style` is an unrecognized spelling (it falls back to [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`]).
+    /// Warning when `cursor_trail_style` is not a style (it falls back to [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`]). A retired name is refused by what it became: it was typed after the file's one-time migration ([`crate::prefs::migrate_cursor_settings`]), and no style resolves from it.
     pub(crate) fn cursor_trail_style_warning(&self) -> Option<String> {
         let raw = self.cursor_trail_style.as_deref().map(str::trim)?;
         if !resolve_trail_style(raw).unknown {
             return None;
         }
+        if let Some(was) = aterm_effects::cursor_glow::spellings::retired(raw) {
+            return Some(format!(
+                "cursor_trail_style: {raw:?} is no longer a style (falling back to {default:?}); \
+                 set {now}",
+                default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+                now = crate::prefs::retired_cursor_name_now(
+                    crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                    was
+                ),
+            ));
+        }
         Some(format!(
             "cursor_trail_style: unknown style {raw:?}{suggestion} (falling back to \
-             {default:?}; expected one of {options}, or a documented alias like \
-             nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean)",
+             {default:?}; expected one of {options})",
             default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
             options = crate::prefs::CURSOR_TRAIL_STYLES.join("|"),
             suggestion = crate::native_config_language::nearest_enum_value(
                 raw,
-                &crate::prefs::CURSOR_TRAIL_STYLES
-                    .iter()
-                    .copied()
-                    .chain(
-                        crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
-                            .iter()
-                            .map(|&(alias, _)| alias),
-                    )
-                    .collect::<Vec<_>>(),
+                crate::prefs::CURSOR_TRAIL_STYLES,
             )
             .and_then(crate::prefs::cursor_trail_style_canonical)
             .map_or_else(String::new, |near| format!(" — did you mean {near:?}?")),
+        ))
+    }
+
+    /// Warning when `cursor_pet` names no pet (it falls back to [`default_cursor_pet`]).
+    pub(crate) fn cursor_pet_warning(&self) -> Option<String> {
+        let raw = self.cursor_pet.as_deref().map(str::trim)?;
+        if !resolve_cursor_pet(raw).unknown {
+            return None;
+        }
+        Some(format!(
+            "cursor_pet: unknown pet {raw:?} (falling back to {default:?}; expected one of \
+             {options})",
+            default = default_cursor_pet(),
+            options = crate::prefs::CURSOR_PETS.join("|"),
         ))
     }
 
@@ -4519,54 +4526,8 @@ pub(crate) fn titlebar_band_decision(
 }
 
 #[cfg(test)]
-mod titlebar_band_acceptance_tests {
-    use super::{TITLEBAR_BAND_SANITY_CAP_PTS, accept_titlebar_band_pts, titlebar_band_decision};
-
-    #[test]
-    fn a_titlebar_band_sample_is_accepted_only_when_windowed_decorated_and_sane() {
-        let inflated = TITLEBAR_BAND_SANITY_CAP_PTS + 1.0;
-        for (label, sample, fullscreen, decorated, prev, expected) in [
-            ("fullscreen 38", 38.0, true, true, 55.0, 0.0),
-            ("fullscreen 0", 0.0, true, true, 55.0, 0.0),
-            ("fullscreen 900", 900.0, true, true, 55.0, 0.0),
-            ("windowed 0", 0.0, false, true, 55.0, 55.0),
-            ("windowed -3", -3.0, false, true, 55.0, 55.0),
-            ("windowed past the cap", inflated, false, true, 55.0, 55.0),
-            ("windowed 700", 700.0, false, true, 55.0, 55.0),
-            ("windowed 38", 38.0, false, true, 55.0, 38.0),
-            ("windowed 62, no prev", 62.0, false, true, 0.0, 62.0),
-            ("undecorated 0", 0.0, false, false, 55.0, 0.0),
-            ("undecorated -1", -1.0, false, false, 55.0, 0.0),
-        ] {
-            assert_eq!(
-                accept_titlebar_band_pts(sample, fullscreen, decorated, prev),
-                expected,
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn band_memory_survives_a_fullscreen_stay_and_restores_on_exit_artifact() {
-        let (applied, memory) = titlebar_band_decision(55.0, false, true, 0.0);
-        assert_eq!((applied, memory), (55.0, 55.0));
-
-        let (applied, memory) = titlebar_band_decision(700.0, true, true, memory);
-        assert_eq!((applied, memory), (0.0, 55.0));
-
-        let (applied, memory) = titlebar_band_decision(0.0, true, true, memory);
-        assert_eq!((applied, memory), (0.0, 55.0));
-
-        let (applied, memory) = titlebar_band_decision(0.0, false, true, memory);
-        assert_eq!((applied, memory), (55.0, 55.0));
-
-        assert_eq!(
-            titlebar_band_decision(0.0, false, false, 55.0),
-            (0.0, 55.0),
-            "undecorated applies 0 and keeps the memory slot"
-        );
-    }
-}
+#[path = "app_config_titlebar_band_acceptance_tests.rs"]
+mod titlebar_band_acceptance_tests;
 
 fn warn_background_opacity_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -5082,117 +5043,12 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
 }
 
 #[cfg(test)]
-mod portable_wallpaper_tests {
-    use super::{decode_wallpaper_bytes, decode_wallpaper_portable, wallpaper_image_filter};
-
-    const QUADRANTS: &[u8] = include_bytes!("../../aterm-jpeg/tests/fixtures/b420.jpg");
-    const PROGRESSIVE: &[u8] = include_bytes!("../../aterm-jpeg/tests/fixtures/p420.jpg");
-
-    fn dominant(rgba: &[u8], width: usize, x: usize, y: usize) -> char {
-        let i = (y * width + x) * 4;
-        let (r, g, b) = (rgba[i], rgba[i + 1], rgba[i + 2]);
-        if r > g && r > b {
-            'r'
-        } else if g > r && g > b {
-            'g'
-        } else {
-            'b'
-        }
-    }
-
-    #[test]
-    fn wallpaper_decodes_a_jpeg_on_every_platform() {
-        for bytes in [QUADRANTS, PROGRESSIVE] {
-            for (path, decoded) in [
-                (
-                    "portable",
-                    decode_wallpaper_portable(bytes).ok_or("refused"),
-                ),
-                (
-                    "platform",
-                    decode_wallpaper_bytes(bytes).map_err(|_| "refused"),
-                ),
-            ] {
-                let (rgba, width, height) = decoded.unwrap_or_else(|e| panic!("{path}: {e}"));
-                assert_eq!((width, height), (33, 21), "{path}");
-                assert_eq!(rgba.len(), 33 * 21 * 4, "{path}");
-                assert_eq!(dominant(&rgba, width, 4, 4), 'r', "{path}: top left");
-                assert_eq!(dominant(&rgba, width, 28, 4), 'g', "{path}: top right");
-                assert_eq!(dominant(&rgba, width, 4, 17), 'b', "{path}: bottom left");
-            }
-        }
-        assert!(decode_wallpaper_portable(b"GIF89a....").is_none());
-        assert!(decode_wallpaper_bytes(b"not an image").is_err());
-    }
-
-    #[test]
-    fn the_image_picker_row_lists_what_the_decoder_reads() {
-        let (name, patterns) = wallpaper_image_filter(&[]);
-        assert_eq!(name, "Images");
-        assert_eq!(patterns, "*.png;*.jpg;*.jpeg;*.jpe;*.jfif");
-        let platform = ["bmp", "JPG", "heic", "bmp"].map(str::to_string);
-        let (_, patterns) = wallpaper_image_filter(&platform);
-        assert_eq!(patterns, "*.png;*.jpg;*.jpeg;*.jpe;*.jfif;*.bmp;*.heic");
-    }
-}
+#[path = "app_config_portable_wallpaper_tests.rs"]
+mod portable_wallpaper_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod appkit_wallpaper_tests {
-    use super::decode_wallpaper_appkit;
-
-    fn two_by_two_bmp() -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"BM");
-        v.extend_from_slice(&70_u32.to_le_bytes());
-        v.extend_from_slice(&0_u32.to_le_bytes());
-        v.extend_from_slice(&54_u32.to_le_bytes());
-        v.extend_from_slice(&40_u32.to_le_bytes());
-        v.extend_from_slice(&2_i32.to_le_bytes());
-        v.extend_from_slice(&2_i32.to_le_bytes());
-        v.extend_from_slice(&1_u16.to_le_bytes());
-        v.extend_from_slice(&24_u16.to_le_bytes());
-        v.extend_from_slice(&0_u32.to_le_bytes());
-        v.extend_from_slice(&16_u32.to_le_bytes());
-        v.extend_from_slice(&2835_i32.to_le_bytes());
-        v.extend_from_slice(&2835_i32.to_le_bytes());
-        v.extend_from_slice(&0_u32.to_le_bytes());
-        v.extend_from_slice(&0_u32.to_le_bytes());
-        v.extend_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
-        v.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
-        v
-    }
-
-    fn dominant(px: &[u8]) -> (usize, u8) {
-        let (mut best, mut best_v) = (0, px[0]);
-        for (i, &v) in px.iter().take(3).enumerate() {
-            if v > best_v {
-                best = i;
-                best_v = v;
-            }
-        }
-        (best, px[3])
-    }
-
-    #[test]
-    fn appkit_decodes_a_bmp_with_the_right_geometry_and_channel_order() {
-        let (rgba, w, h) =
-            decode_wallpaper_appkit(&two_by_two_bmp()).expect("AppKit decoded the BMP");
-        assert_eq!((w, h), (2, 2));
-        assert_eq!(rgba.len(), 2 * 2 * 4);
-        let px = |i: usize| &rgba[i * 4..i * 4 + 4];
-        assert_eq!(dominant(px(0)).0, 0, "top-left is red");
-        assert_eq!(dominant(px(1)).0, 1, "top-right is green");
-        assert_eq!(dominant(px(2)).0, 2, "bottom-left is blue");
-        for i in 0..4 {
-            assert_eq!(px(i)[3], 255, "pixel {i} lost its alpha");
-        }
-        let white = px(3);
-        assert!(
-            white[0] > 200 && white[1] > 200 && white[2] > 200,
-            "bottom-right should be near-white, got {white:?}"
-        );
-    }
-}
+#[path = "app_config_appkit_wallpaper_tests.rs"]
+mod appkit_wallpaper_tests;
 
 pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -5456,7 +5312,8 @@ pub(crate) fn launch_config_notice(
         ),
         LaunchConfigProblem::Invalid(error) => format!(
             "aterm.toml is not a valid configuration ({error}) — the window's settings except \
-             [harness] are at their defaults. Fix {} and it loads on the next change.",
+             [harness] and [update]'s two switches are at their defaults. Fix {} and it loads on \
+             the next change.",
             path.display()
         ),
     }
@@ -5485,36 +5342,271 @@ pub(crate) fn agents_auto_prime_setting() -> bool {
     }
 }
 
-/// Read source and application policy from one persisted config observation.
+/// Read source and application policy from one persisted config observation, or, where the config's
+/// readers refuse the file, from its text ([`update_check_settings_of_refused`]). A file with no text
+/// to read (none, a dangling link, a folder, oversized, unreadable for a reason that stands) reads as
+/// the defaults, as every other reader of `[update]` takes it. `None` where the text may hide a
+/// person's `auto_apply = false` and this cannot read it ([`update_check_settings_from_text`]), and
+/// where the read hit a fault that can pass ([`aterm_update_core::settings::read_error_is_passing`]):
+/// that look holds, and the next asks again.
 pub(crate) fn update_check_settings_setting() -> Option<aterm_update::CheckSettings> {
-    let config = if let Some(path) = config_path() {
-        match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
-            Ok(observation) => return update_check_settings_from_text(&observation.text),
-            Err(_) => match std::fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
-                _ => return None,
-            },
-        }
-    } else {
-        Config::default()
+    let Some(path) = config_path() else {
+        return Some(check_settings_of(None, None, None));
     };
-    Some(update_check_settings(&config))
+    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+        Ok(observation) => update_check_settings_from_text(&observation.text),
+        Err(_) => {
+            update_check_settings_of_read(aterm_update_core::settings::read_config_text(&path))
+        }
+    }
 }
 
+/// The policy in what a read of a file the config's readers refused found
+/// ([`update_check_settings_setting`]).
+fn update_check_settings_of_read(
+    read: std::io::Result<Option<String>>,
+) -> Option<aterm_update::CheckSettings> {
+    match read {
+        Ok(Some(text)) => update_check_settings_of_refused(&text),
+        Err(error) if aterm_update_core::settings::read_error_is_passing(&error) => None,
+        Ok(None) | Err(_) => Some(check_settings_of(None, None, None)),
+    }
+}
+
+/// The policy in the text of a file the config's readers refused, one another user owns or can
+/// write ([`aterm_types::dirs::aterm_config_refusal`]). Such a file gains no authority here: it can
+/// hold an update back with `auto_apply = false`, as the boot apply already reads it, and a source
+/// it names is not followed. Without this a file that says nothing of updates, mode 0664 say, stopped
+/// a Mac with no window from checking or installing for good.
+fn update_check_settings_of_refused(text: &str) -> Option<aterm_update::CheckSettings> {
+    let settings = update_check_settings_from_text(text)?;
+    Some(check_settings_of(None, None, Some(settings.auto_apply)))
+}
+
+/// One `[update]` key of a parsed `aterm.toml`. A file whose `update` is not a table has none.
+fn update_key<'a>(file: &'a aterm_toml::Table, key: &str) -> Option<&'a aterm_toml::Value> {
+    file.get("update").and_then(|update| update.get(key))
+}
+
+/// What the text of an `aterm.toml` that did not load says of `[update]`'s two switches, each read
+/// alone: `font_px = "12"` is no permission to install over a readable `auto_apply = false`, and no
+/// reason to go on holding one a person has since taken out. It names no source: a refused file has
+/// no such authority, and a window has never followed one from a file that did not load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpdateSwitches {
+    enabled: UpdateSwitch,
+    auto_apply: UpdateSwitch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UpdateSwitch {
+    /// The text cannot say: `enabled` in text that is not TOML, with no line naming it and `update`
+    /// not set off itself.
+    #[default]
+    Unread,
+    /// The file leaves it unset, which is on.
+    Unset,
+    Set(bool),
+}
+
+impl UpdateSwitch {
+    fn of(file: &aterm_toml::Table, key: &str) -> Self {
+        aterm_update_core::settings::update_switch_in(file, key).map_or(Self::Unset, Self::Set)
+    }
+
+    /// Onto a switch a running window holds: one the text cannot say stays as it stands.
+    const fn apply_to(self, switch: &mut Option<bool>) {
+        match self {
+            Self::Unread => {}
+            Self::Unset => *switch = None,
+            Self::Set(on) => *switch = Some(on),
+        }
+    }
+}
+
+impl UpdateSwitches {
+    /// Text that is not TOML reads each as the boot's and the node job's readers do: off where it names
+    /// the key with any value but `true` (under `[update]` for `enabled`, a key of many tables) or sets
+    /// `update` off itself, and otherwise `auto_apply` on, with `enabled` left as it stands.
+    pub(crate) fn of_text(text: &str) -> Self {
+        aterm_toml::from_str::<aterm_toml::Table>(text).map_or_else(
+            |_| Self {
+                enabled: if aterm_update_core::settings::broken_text_names_update_enabled(text) {
+                    UpdateSwitch::Set(false)
+                } else {
+                    UpdateSwitch::Unread
+                },
+                auto_apply: if aterm_update_core::settings::broken_text_names_auto_apply(text) {
+                    UpdateSwitch::Set(false)
+                } else {
+                    UpdateSwitch::Unset
+                },
+            },
+            |file| Self {
+                enabled: UpdateSwitch::of(&file, "enabled"),
+                auto_apply: UpdateSwitch::of(&file, "auto_apply"),
+            },
+        )
+    }
+
+    /// The text a launch's config service stands on when the file did not load: `[update]` with each
+    /// switch the file turns off, so the window's config and Settings read them as the file does.
+    /// Nothing saves it: a write checks the disk's bytes against it first and finds the broken file.
+    pub(crate) fn stand_in_text(self) -> String {
+        let off = |switch: UpdateSwitch, key: &str| {
+            (switch == UpdateSwitch::Set(false)).then(|| format!("{key} = false\n"))
+        };
+        let lines: String = [
+            off(self.enabled, "enabled"),
+            off(self.auto_apply, "auto_apply"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if lines.is_empty() {
+            lines
+        } else {
+            format!("[update]\n{lines}")
+        }
+    }
+
+    /// Only what this text turns off, which is all a refused read may do to a text that loaded
+    /// ([`UpdateSwitchOrigin::Admitted`]).
+    pub(crate) fn offs_only(self) -> Self {
+        let off = |switch| {
+            if switch == UpdateSwitch::Set(false) {
+                switch
+            } else {
+                UpdateSwitch::Unread
+            }
+        };
+        Self {
+            enabled: off(self.enabled),
+            auto_apply: off(self.auto_apply),
+        }
+    }
+
+    /// A launch fault's `auto_apply = false` going: it was never the file's, so no text keeps it.
+    pub(crate) fn fault_off_ends() -> Self {
+        Self {
+            auto_apply: UpdateSwitch::Unset,
+            ..Self::default()
+        }
+    }
+
+    /// Onto the `[update]` a running window holds, whose other keys stay as they stand.
+    pub(crate) fn apply_to(self, update: &mut Option<UpdateConfig>) {
+        let mut next = update.take().unwrap_or_default();
+        self.enabled.apply_to(&mut next.enabled);
+        self.auto_apply.apply_to(&mut next.auto_apply);
+        *update = (next != UpdateConfig::default()).then_some(next);
+    }
+}
+
+/// Where a running window's `[update]` switches came from, which decides what a read of a file the
+/// config watcher's admission refuses may do to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpdateSwitchOrigin {
+    /// A text that loaded. A refused read can only add an off to it, since that may be a person's
+    /// `false`, and later end an off it added. A `false` a good read gave stays out of its reach
+    /// (`App::take_refused_update_text`).
+    Admitted,
+    /// A launch's `auto_apply = false`, standing for a read fault that can pass, not for the file.
+    /// The first text the file gives ends it.
+    FaultHold,
+    /// The last text this window took did not load: a launch on such a file, a read since, or a
+    /// reload the config refused. It has no better claim than the next refused read, so a text two
+    /// refused reads in a row agree on replaces it, a read that caught a save half way moves nothing,
+    /// and a line added or removed in a file that stays refused is seen. A text that loads ends this
+    /// origin even if it caught such a save (a prefix before a stray byte, a gap read as missing): its
+    /// switches then stand until the next text that loads.
+    RefusedRead,
+}
+
+/// What a launch whose file did not load stands on.
+pub(crate) struct UpdateStandIn {
+    pub(crate) text: String,
+    pub(crate) origin: UpdateSwitchOrigin,
+}
+
+/// [`UpdateSwitches::stand_in_text`] for the file at `path`.
+pub(crate) fn update_switches_stand_in(path: Option<&std::path::Path>) -> UpdateStandIn {
+    update_switches_stand_in_of(
+        path.map_or(Ok(None), aterm_update_core::settings::read_config_text),
+    )
+}
+
+/// The stand-in for what a read of the file found. A fault that can pass reads as `auto_apply = false`,
+/// since a person's `false` may be behind it and the boot's own read held for it. The config watcher
+/// asks again every half second: a read it admits replaces this, and for a file it refuses it sends
+/// [`refused_read_text`].
+fn update_switches_stand_in_of(read: std::io::Result<Option<String>>) -> UpdateStandIn {
+    match read {
+        Ok(Some(text)) => UpdateStandIn {
+            text: UpdateSwitches::of_text(&text).stand_in_text(),
+            origin: UpdateSwitchOrigin::RefusedRead,
+        },
+        Err(error) if aterm_update_core::settings::read_error_is_passing(&error) => UpdateStandIn {
+            text: UpdateSwitches {
+                auto_apply: UpdateSwitch::Set(false),
+                ..UpdateSwitches::default()
+            }
+            .stand_in_text(),
+            origin: UpdateSwitchOrigin::FaultHold,
+        },
+        Ok(None) | Err(_) => UpdateStandIn {
+            text: String::new(),
+            origin: UpdateSwitchOrigin::RefusedRead,
+        },
+    }
+}
+
+/// The text a read of a file the config watcher's admission refuses gives a window
+/// ([`UpdateSwitchOrigin`]): mode 0664, a stray byte, or anything else that never posts an
+/// observation, so nothing else would read it for this process's life. `None` while a fault
+/// that can pass lasts, which leaves the switches as they stand. A file that is gone and a fault that
+/// stands read as no text, which is on, as the boot's read takes them.
+pub(crate) fn refused_read_text(read: std::io::Result<Option<String>>) -> Option<String> {
+    match read {
+        Ok(Some(text)) => Some(text),
+        Err(error) if aterm_update_core::settings::read_error_is_passing(&error) => None,
+        Ok(None) | Err(_) => Some(String::new()),
+    }
+}
+
+/// The three `[update]` keys the check and the apply read. Every other key of `aterm.toml`, in that
+/// table or out of it, is its own reader's to judge, and a window on the same file goes on updating.
+/// A wrong type in `owner` or `repo` reads as unset, as shipped builds ignore both
+/// ([`aterm_update::Source::resolve`]), and text that is not TOML reads as the defaults. `None` only
+/// where the text says something of `auto_apply` that is neither `true` nor `false` itself
+/// ([`aterm_update_core::settings::update_switch_in`]) or is not TOML and names it or sets `update` off
+/// itself, since that may be a person's `false`.
 fn update_check_settings_from_text(text: &str) -> Option<aterm_update::CheckSettings> {
-    aterm_toml::from_str::<Config>(text)
-        .ok()
-        .map(|config| update_check_settings(&config))
+    let Ok(file) = aterm_toml::from_str::<aterm_toml::Table>(text) else {
+        return (!aterm_update_core::settings::broken_text_names_auto_apply(text))
+            .then(|| check_settings_of(None, None, None));
+    };
+    let auto_apply = aterm_update_core::settings::update_switch_in(&file, "auto_apply");
+    if auto_apply == Some(false)
+        && update_key(&file, "auto_apply").and_then(aterm_toml::Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    Some(check_settings_of(
+        update_key(&file, "owner").and_then(aterm_toml::Value::as_str),
+        update_key(&file, "repo").and_then(aterm_toml::Value::as_str),
+        auto_apply,
+    ))
 }
 
-pub(crate) fn update_check_settings(config: &Config) -> aterm_update::CheckSettings {
-    let update = config.update.as_ref();
+fn check_settings_of(
+    owner: Option<&str>,
+    repo: Option<&str>,
+    auto_apply: Option<bool>,
+) -> aterm_update::CheckSettings {
     aterm_update::CheckSettings {
-        source: aterm_update::Source::resolve(
-            update.and_then(|u| u.owner.as_deref()),
-            update.and_then(|u| u.repo.as_deref()),
-        ),
-        auto_apply: update.and_then(|u| u.auto_apply).unwrap_or(true),
+        source: aterm_update::Source::resolve(owner, repo),
+        auto_apply: auto_apply.unwrap_or(true),
     }
 }
 
@@ -5967,37 +6059,57 @@ pub(crate) fn resolve_trail_style(raw: &str) -> ResolvedTrailStyle {
     }
 }
 
+/// One raw `cursor_pet` value as rendering, validation and Settings read it: an unknown value
+/// keeps the default pet, as an unknown style keeps the default style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedCursorPet {
+    pub(crate) canonical: &'static str,
+    pub(crate) species: Option<aterm_effects::kitty_pet::PetSpecies>,
+    /// The row is a flier: its head flies in, and nothing walks.
+    pub(crate) flies: bool,
+    pub(crate) unknown: bool,
+}
+
+/// Resolve one raw pet.
+pub(crate) fn resolve_cursor_pet(raw: &str) -> ResolvedCursorPet {
+    let (row, unknown) = match aterm_effects::cursor_pet::row(raw) {
+        Some(row) => (Some(row), false),
+        None => (aterm_effects::cursor_pet::row(default_cursor_pet()), true),
+    };
+    ResolvedCursorPet {
+        canonical: row.map_or("off", |row| row.name),
+        species: row.and_then(|row| row.species),
+        flies: row.is_some_and(|row| row.flies),
+        unknown,
+    }
+}
+
 /// Resolve every string-keyed trail presentation fork in one pass, per config generation.
-pub(crate) fn resolve_trail_presentation(raw: &str) -> ResolvedTrailPresentation {
-    resolve_trail_presentation_from_style(raw, resolve_trail_style(raw))
+pub(crate) fn resolve_trail_presentation(raw: &str, pet: &str) -> ResolvedTrailPresentation {
+    resolve_trail_presentation_from_style(raw, resolve_trail_style(raw), pet)
 }
 
 /// Presentation half for preview surfaces that already hold a synthetic resolution.
 pub(crate) fn resolve_trail_presentation_from_style(
     raw: &str,
     style: ResolvedTrailStyle,
+    pet: &str,
 ) -> ResolvedTrailPresentation {
     use aterm_effects::cursor_glow::{GlowStyle, style_has_beam_of};
 
     let token = style.canonical.unwrap_or(raw.trim());
     let glow_style = style.style.unwrap_or(GlowStyle::Lumen);
-    let pet_species = (style.style == Some(GlowStyle::RainbowKitty)
-        && GlowStyle::style_names_any_pet(token))
-    .then(|| {
-        if GlowStyle::style_names_dog_pet(token) {
-            aterm_effects::kitty_pet::PetSpecies::Dog
-        } else {
-            aterm_effects::kitty_pet::PetSpecies::Cat
-        }
-    });
+    let shape = aterm_effects::cursor_fx::GlowSpelling::parse(token);
+    let pet = resolve_cursor_pet(pet);
     ResolvedTrailPresentation {
         style,
         beam: style_has_beam_of(glow_style, token),
-        ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
-        ribbon_flat: GlowStyle::style_names_flat_ribbon(token),
+        ribbon_tall: shape.ribbon_tall,
+        ribbon_flat: shape.ribbon_flat,
         classic_mono: style.style == Some(GlowStyle::Classic)
             && GlowStyle::style_names_classic_mono(raw.trim()),
-        pet_species,
+        pet_species: pet.species,
+        pet_flies: pet.flies,
         comet: style.style == Some(GlowStyle::Comet),
     }
 }
@@ -7656,6 +7768,7 @@ impl App {
             return;
         }
         self.apply_prepared_config_generation_unfenced(generation);
+        self.take_newer_refused_update_text();
     }
 
     /// Admit a deferred generation after a reconciliation worker sampled the same baseline, which clears the write fence.
@@ -7666,6 +7779,7 @@ impl App {
         debug_assert!(!self.native_config_inflight);
         debug_assert!(self.native_config_service.reconciliation_required());
         self.apply_prepared_config_generation_unfenced(generation);
+        self.take_newer_refused_update_text();
     }
 
     fn apply_prepared_config_generation_unfenced(
@@ -7711,6 +7825,10 @@ impl App {
                 return;
             }
         };
+        // This generation's file sets the update switches, even one equal to what stands (the early
+        // return below), and any later refused read can only add an off to what it says.
+        self.update_switch_origin = UpdateSwitchOrigin::Admitted;
+        self.admitted_update_under_refused_off = None;
         self.prepared_sparkle = prepared_sparkle;
         let typography =
             config.resolved_typography(self.os_appearance, &config_snapshot.assets.themes);
@@ -7900,6 +8018,9 @@ impl App {
                 .any(|w| w.starts_with(crate::native_font_catalog::FAMILY_REFUSED));
         warns.extend_shown_in_settings(ConfigFamily::Fonts, font_prepare_warnings.drain(..));
         if let Some(w) = config.cursor_trail_style_warning() {
+            warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
+        }
+        if let Some(w) = config.cursor_pet_warning() {
             warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
         }
         if let Some(reason) = config_snapshot.assets.kitty_sprite.diagnostic() {
@@ -8329,3383 +8450,56 @@ impl App {
 }
 
 #[cfg(test)]
-mod reload_render_transaction_tests {
-    use super::{Config, FontConfig, ReloadRenderSnapshot, RenderKnobs};
-
-    /// The rollback writer ([`ReloadRenderSnapshot::rollback`]) reinstalls the colours it
-    /// captured, so a window's light latch, keyed by the configured scheme, sees the scheme
-    /// change on the frame after a candidate's colours and again on the frame after the
-    /// rollback, which re-enters at once (`docs/design/PRISM-GLASS.md` §15.2 1.3).
-    #[cfg(unix)]
-    #[test]
-    fn a_rollback_writes_the_scheme_back_and_raises_scheme_changed() {
-        use crate::trail_rig::TrailRig;
-        use std::time::{Duration, Instant};
-        let font = aterm_tempfile::manifest_dir()
-            .join("../aterm-render/tests/fixtures/jetbrains-mono.ttf");
-        let mut rig = TrailRig::new(&font).expect("the rig");
-        let t0 = rig.t0();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        rig.configure(
-            "trail_sounds = false\ncursor_trail_style = \"rainbow kitty\"\nmotion = \"full\"\n\
-             theme = \"Default Light\"\n",
-            t0,
-        )
-        .expect("the config admits");
-        rig.grid(8, 40, t0).expect("the grid");
-        rig.pty(b"\x1b[4;1H$ ", t0);
-        let latch = |rig: &mut TrailRig, now: Instant| {
-            rig.frame(now).expect("a presented frame");
-            rig.with_app(now, |app, wid| app.windows[&wid].trail_ground.last())
-        };
-        assert!(latch(&mut rig, at(1)).on, "Default Light admits");
-        let previous = rig.with_app(at(50), |app, _| {
-            let previous = ReloadRenderSnapshot::capture(app);
-            // A candidate's colours, installed before its rebuild fails.
-            app.config.theme = Some("Dracula".to_string());
-            app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
-            previous
-        });
-        let candidate = latch(&mut rig, at(66));
-        assert!(
-            candidate.scheme_changed && !candidate.on && candidate.fell,
-            "{candidate:?}"
-        );
-        rig.with_app(at(100), |app, _| previous.rollback(app));
-        let back = latch(&mut rig, at(116));
-        assert!(back.scheme_changed && back.on, "{back:?}");
-        let steady = latch(&mut rig, at(150));
-        assert!(steady.on && !steady.scheme_changed, "{steady:?}");
-    }
-
-    #[test]
-    fn failed_backend_rebuild_rolls_back_complete_render_slice_only() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let old_config = app.config.clone();
-        let old_default_font_size = app.default_font_size;
-        let old_font_size = app.font_size;
-        let old_font_px = app.font_px;
-        let old_theme = app.theme;
-        let old_family = app.font_family.clone();
-        let old_shaping = app.text_shaping.clone();
-        let old_blending = app.text_blending;
-        let old_thicken = app.font_thicken;
-        let old_stem_gamma = app.stem_gamma;
-        let old_variations = app.font_variations.clone();
-        let old_dark_nudge = app.font_weight_dark_nudge;
-        let old_knobs = app.render_knobs;
-        let old_font_config = app.font_config.clone();
-        let old_typography = app.typography.clone();
-        let old_size_scale = app.font_size_scale_milli;
-        let old_metrics = app.windows[&wid].metrics;
-        let previous = ReloadRenderSnapshot::capture(&app);
-
-        let candidate: Config = aterm_toml::from_str(
-            r##"
-font_px = 23.0
-theme = "Dracula"
-foreground = "#f0f1f2"
-background = "#101112"
-cursor_color = "#aabbcc"
-selection_color = "#334455"
-palette = ["#010203", "#040506"]
-font_family = "Menlo"
-font_family_bold = "Menlo Bold"
-font_family_italic = "Menlo Italic"
-font_family_bold_italic = "Menlo Bold Italic"
-font_synthetic_style = false
-fallback_fonts = ["Menlo"]
-symbol_font = "Menlo"
-emoji_font = "Menlo"
-ligatures = false
-merged_ligatures = true
-font_features = ["ss01"]
-text_blending = "linear"
-font_thicken = true
-font_variation = ["wght=550"]
-font_weight = 600
-font_weight_dark_nudge = 40.0
-stem_gamma = 0.7
-line_height = 1.4
-font_size_scale = 1.1
-adjust_baseline = 3
-adjust_underline_position = 2
-adjust_underline_thickness = 1
-underline_skip_descenders = false
-minimum_contrast = 7.0
-selection_foreground = "#eeeeee"
-selection_inactive = true
-cursor_break_ligatures = true
-background_opacity = 0.8
-background_material = "hud"
-window_padding = 31.0
-window_padding_top = 7.0
-copy_on_select = true
-"##,
-        )
-        .expect("candidate config");
-        app.config = candidate.clone();
-        app.default_font_size = 23.0;
-        app.font_size = 23.0;
-        app.font_px = 23.0;
-        app.theme = candidate.theme_for(app.os_appearance);
-        app.font_family = Some("Menlo".to_string());
-        app.text_shaping = candidate.text_shaping();
-        app.text_blending = candidate.text_blending_or_default();
-        app.font_thicken = candidate.font_thicken_or_default();
-        app.stem_gamma = candidate.stem_gamma_or_default();
-        let (variations, _) = candidate.font_variation_requests();
-        app.font_variations = variations;
-        app.font_weight_dark_nudge = candidate.font_weight_dark_nudge_or_default();
-        app.render_knobs = RenderKnobs::from_config(
-            &candidate,
-            &candidate.resolved_colors(app.os_appearance, &app.config_assets.themes, None),
-        );
-        app.font_config = FontConfig::from_config(&candidate).0;
-        app.typography = crate::resolved_typography::ResolvedTypography {
-            id: "Dracula".to_string(),
-            applied: aterm_types::scheme::parse_theme_str(
-                "fg = #ffffff\nbg = #000000\nline_height = 1.5\n",
-            )
-            .expect("a typography theme")
-            .typography,
-            ..crate::resolved_typography::ResolvedTypography::none(app.os_appearance)
-        };
-        app.font_size_scale_milli = candidate.font_size_scale_milli_or_default();
-        assert_ne!(
-            app.typography, old_typography,
-            "candidate typography is live"
-        );
-        app.refresh_all_window_metrics();
-        assert_ne!(app.windows[&wid].metrics, old_metrics, "candidate is live");
-
-        assert!(
-            !app.finish_reload_render_transaction_with(previous, |candidate_app| {
-                assert_eq!(candidate_app.font_px, 23.0, "failure sees candidate");
-                assert_eq!(candidate_app.render_knobs.line_height, 1.4);
-                false
-            })
-        );
-
-        let mut expected = old_config.clone();
-        expected.copy_on_select = Some(true);
-        assert!(
-            app.config == expected,
-            "config authority rolls back the render slice only"
-        );
-        assert_eq!(app.default_font_size, old_default_font_size);
-        assert_eq!(app.font_size, old_font_size);
-        assert_eq!(app.font_px, old_font_px);
-        assert_eq!(app.theme, old_theme);
-        assert_eq!(app.font_family, old_family);
-        assert_eq!(app.text_shaping, old_shaping);
-        assert_eq!(app.text_blending, old_blending);
-        assert_eq!(app.font_thicken, old_thicken);
-        assert_eq!(app.stem_gamma, old_stem_gamma);
-        assert_eq!(app.font_variations, old_variations);
-        assert_eq!(app.font_weight_dark_nudge, old_dark_nudge);
-        assert_eq!(app.render_knobs, old_knobs);
-        assert_eq!(app.font_config, old_font_config);
-        assert_eq!(app.typography, old_typography);
-        assert_eq!(app.font_size_scale_milli, old_size_scale);
-        assert_eq!(app.windows[&wid].metrics, old_metrics);
-    }
-
-    #[test]
-    fn a_same_cell_box_face_rebuild_repaints_the_cpu_window() {
-        use aterm_render::DamageOutcome;
-
-        fn present_cpu(
-            app: &mut crate::App,
-            input: &aterm_render::RenderInput,
-        ) -> (Vec<u32>, DamageOutcome) {
-            let crate::App {
-                backend, windows, ..
-            } = app;
-            let crate::Backend::Cpu(renderer) = backend.ready_mut() else {
-                panic!("headless test backend is CPU")
-            };
-            let ws = windows
-                .get_mut(&crate::WindowId(0))
-                .expect("headless fixture window");
-            let _ = renderer.render_input_cached(&mut ws.cpu_cache, input);
-            (
-                ws.cpu_cache.presented_pixels().to_vec(),
-                ws.cpu_cache.last_damage(),
-            )
-        }
-
-        let mut app = crate::App::headless_for_test();
-        let mut term = aterm_core::terminal::Terminal::new(3, 8);
-        term.process(b"\x1b[?25lABC");
-        let input = term.cell_frame(3, 8);
-        let _ = present_cpu(&mut app, &input);
-        assert_eq!(
-            present_cpu(&mut app, &input).1,
-            DamageOutcome::GateHit,
-            "negative control: an identical frame really is cached"
-        );
-        let cell = app.backend.cell_size();
-
-        let mut prepared = aterm_render::Renderer::from_system(app.font_px, app.theme)
-            .expect("system font for the prepared generation");
-        let _ = prepared.set_font_variations(&[(u32::from_be_bytes(*b"wght"), 800.0)], 0.0);
-        let _ = prepared.seal_admitted_font_sources();
-        let chrome = crate::tray_raster::prepare_chrome_fonts(None, None, None);
-        assert!(app.rebuild_backend_with_prepared(Some((prepared, chrome))));
-        assert_eq!(
-            app.backend.cell_size(),
-            cell,
-            "the case needs an unchanged cell box"
-        );
-
-        let (pixels, damage) = present_cpu(&mut app, &input);
-        assert_eq!(damage, DamageOutcome::Full, "the face rebuild repaints");
-        let crate::Backend::Cpu(renderer) = app.backend.ready_mut() else {
-            panic!("headless test backend is CPU")
-        };
-        assert!(
-            pixels == renderer.render_input(&input).pixels,
-            "the window shows what the new face renders"
-        );
-    }
-}
+#[path = "app_config_reload_render_transaction_tests.rs"]
+mod reload_render_transaction_tests;
 
 #[cfg(test)]
-mod config_policy_tests {
-
-    use super::Config;
-
-    fn cfg(source: &str) -> Config {
-        aterm_toml::from_str(source).expect("valid config")
-    }
-
-    #[test]
-    fn a_config_that_still_sets_smart_title_keys_loads_with_every_other_setting() {
-        const RETIRED: &[(&str, &str)] = &[
-            ("descriptive_titles", "true"),
-            ("title_summary_provider", "\"ollama\""),
-            ("title_summary_model", "\"qwen3.5:4b-q4_K_M\""),
-            (
-                "title_summary_endpoint",
-                "\"http://127.0.0.1:11434/api/chat\"",
-            ),
-            ("title_summary_token_file", "\"/tmp/aterm-summary-token\""),
-            ("title_summary_timeout_seconds", "42"),
-            ("title_summary_proxy_mode", "\"direct\""),
-            ("title_summary_ca_file", "\"/tmp/private-model-ca.pem\""),
-            ("title_summary_interval_seconds", "15"),
-            ("title_summary_context_lines", "24"),
-            ("title_summary_include_output", "false"),
-            ("title_summary_allow_remote", "true"),
-            ("tab_title_format", "\"description\""),
-            ("window_title_format", "\"description-title\""),
-        ];
-        let others = concat!(
-            "theme = \"Nord\"\n",
-            "font_px = 17.0\n",
-            "scrollback_lines = 4321\n",
-            "tab_status_badge = false\n",
-            "[harness]\n",
-            "limit_reset = true\n",
-        );
-        let retired: String = RETIRED
-            .iter()
-            .map(|(key, value)| format!("{key} = {value}\n"))
-            .collect();
-        let source = format!("{retired}{others}");
-
-        let loaded = Config::parse(&source).expect("retired keys never fail the file");
-        let baseline = Config::parse(others).expect("the other settings parse alone");
-        assert!(
-            loaded == baseline,
-            "every other setting loads exactly as it would without the retired keys"
-        );
-        assert!(
-            loaded != Config::stand_in(&source),
-            "the file is not replaced by the stand-in defaults"
-        );
-        assert_eq!(loaded.theme.as_deref(), Some("Nord"));
-        assert_eq!(loaded.font_px, Some(17.0));
-        assert_eq!(loaded.scrollback_lines, Some(4321));
-        assert_eq!(loaded.tab_status_badge, Some(false));
-
-        let warnings = crate::native_config_language::key_warnings(&source);
-        assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
-        assert_eq!(
-            warnings.retired.len(),
-            RETIRED.len(),
-            "{:?}",
-            warnings.retired
-        );
-        for ((line, (key, _)), number) in warnings.retired.iter().zip(RETIRED).zip(1..) {
-            assert_eq!(
-                line,
-                &format!(
-                    "line {number}: {key} does nothing: Smart Titles was removed; safe to delete"
-                )
-            );
-        }
-        assert!(
-            super::unaccepted_value_notices(&source, &[]).is_empty(),
-            "a retired key's value is never reported as a value its reader rejects"
-        );
-    }
-
-    #[test]
-    fn a_config_that_still_sets_the_deck_style_loads_and_is_told_once() {
-        let others = "[sys]\nstats_bars = \"deck\"\nstats_deck_size = \"full\"\n";
-        let source = "[sys]\nstats_bars = \"deck\"\nstats_deck_style = \"merged\"\nstats_deck_size = \"full\"\n";
-        let loaded = Config::parse(source).expect("a retired key never fails the file");
-        let baseline = Config::parse(others).expect("the other settings parse alone");
-        assert!(
-            loaded == baseline,
-            "every other setting loads as without it"
-        );
-        assert_eq!(
-            loaded.stats_deck_size_or_default(),
-            crate::stats_plan::DeckSizePref::Full,
-            "the size setting beside it stands"
-        );
-        let warnings = crate::native_config_language::key_warnings(source);
-        assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
-        assert_eq!(
-            warnings.retired,
-            [
-                "line 3: sys.stats_deck_style does nothing: Merged top deck was removed; safe to delete"
-            ],
-        );
-        assert!(
-            super::unaccepted_value_notices(source, &[]).is_empty(),
-            "a retired key's value is never a value its reader rejects"
-        );
-    }
-
-    /// A `desktop_alerts` line left in a person's file, whatever its value (a word no `bool`
-    /// reads included), loads with every other setting, is told once that the key does nothing,
-    /// and `--validate-config` passes with that one warning; `settings set` and `unset` answer
-    /// the same sentence.
-    #[test]
-    fn a_config_that_still_sets_desktop_alerts_loads_and_is_told_once() {
-        use crate::native_config_language::compatibility_only_message;
-        let others = "font_px = 17.0\n";
-        let told = format!("line 1: {}", compatibility_only_message("desktop_alerts"));
-        for value in ["true", "false", "\"on\""] {
-            let source = format!("desktop_alerts = {value}\n{others}");
-            let loaded = Config::parse(&source).expect("a retired key never fails the file");
-            let baseline = Config::parse(others).expect("the other settings parse alone");
-            assert!(
-                loaded == baseline,
-                "{source:?}: every other setting loads as without it"
-            );
-            let warnings = crate::native_config_language::key_warnings(&source);
-            assert!(
-                warnings.ignored.is_empty(),
-                "{source:?}: {:?}",
-                warnings.ignored
-            );
-            assert_eq!(warnings.retired, std::slice::from_ref(&told), "{source:?}");
-            assert_eq!(
-                crate::diagnostics::validate_config_text(&source),
-                Ok(vec![told.clone()]),
-                "{source:?}: the file validates, with the one warning"
-            );
-            assert!(
-                super::unaccepted_value_notices(&source, &[]).is_empty(),
-                "{source:?}: a retired key's value is never a value its reader rejects"
-            );
-        }
-        assert_eq!(
-            crate::native_config_language::control_settings_refusal("desktop_alerts"),
-            compatibility_only_message("desktop_alerts"),
-        );
-        assert!(told.contains("was removed"), "{told}");
-    }
-
-    #[test]
-    fn tab_status_policy_clamps_both_ends() {
-        assert_eq!(
-            cfg("tab_status_quiet_after_ms = 0").tab_status_quiet_after_ms_or_default(),
-            500
-        );
-        assert_eq!(
-            cfg("tab_status_quiet_after_ms = 999999").tab_status_quiet_after_ms_or_default(),
-            120_000
-        );
-        assert_eq!(
-            cfg("tab_status_dwell_ms = 0").tab_status_dwell_ms_or_default(),
-            0
-        );
-        assert_eq!(
-            cfg("tab_status_dwell_ms = 999999").tab_status_dwell_ms_or_default(),
-            10_000
-        );
-    }
-
-    #[test]
-    fn the_observation_interval_tracks_dwell_between_a_floor_and_the_budget() {
-        let ms = |toml: &str| cfg(toml).tab_status_observe_interval().as_millis();
-        assert_eq!(
-            Config::default().tab_status_observe_interval().as_millis(),
-            250
-        );
-        assert_eq!(ms("tab_status_dwell_ms = 0"), 50, "floored, never zero");
-        assert_eq!(ms("tab_status_dwell_ms = 100"), 100, "tracks a short dwell");
-        assert_eq!(
-            ms("tab_status_dwell_ms = 9000"),
-            250,
-            "capped at the budget"
-        );
-        for dwell in [0_u64, 1, 100, 750, 5_000, 10_000, 999_999] {
-            let config = cfg(&format!("tab_status_dwell_ms = {dwell}"));
-            let interval = config.tab_status_observe_interval().as_millis();
-            let resolved = u128::from(config.tab_status_dwell_ms_or_default());
-            assert!(
-                interval <= resolved.max(50),
-                "interval {interval} outruns dwell {resolved}"
-            );
-        }
-    }
-}
+#[path = "app_config_config_policy_tests.rs"]
+mod config_policy_tests;
 
 #[cfg(test)]
-mod cfg_engine_tests {
-    use super::{
-        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
-        ThemeCatalog, ThemeCatalogLimits, ThemeEntryStatus, ThemeScanCaps,
-    };
-    #[cfg(unix)]
-    use super::{ThemeCatalogWatchError, read_bounded_theme_file};
-    use aterm_core::config::BiDiMode;
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn shell_override_resolver_keeps_launch_precedence_for_new_sessions() {
-        assert_eq!(
-            super::resolve_shell_override_with(None, Some("/bin/zsh")),
-            Some("/bin/zsh".to_string())
-        );
-        assert_eq!(
-            super::resolve_shell_override_with(
-                Some("/opt/homebrew/bin/fish".to_string()),
-                Some("/bin/zsh")
-            ),
-            Some("/opt/homebrew/bin/fish".to_string())
-        );
-        assert_eq!(
-            super::resolve_shell_override_with(Some(String::new()), Some("/bin/zsh")),
-            Some("/bin/zsh".to_string()),
-            "an empty environment value does not mask the config"
-        );
-    }
-
-    fn kitty_fixture(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "aterm-nyan-asset-{}-{}-{name}.png",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn config_with_kitty(path: &std::path::Path) -> Config {
-        cfg(&format!(
-            "theme = \"Nord\"\ncursor_nyan_sprite = {:?}\n",
-            path.to_string_lossy()
-        ))
-    }
-
-    fn theme_fixture_dir(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-theme-catalog-{}-{}-{name}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn write_theme(path: &std::path::Path, foreground: &str, background: &str) {
-        std::fs::write(
-            path,
-            format!("foreground = {foreground}\nbackground = {background}\n"),
-        )
-        .unwrap();
-    }
-
-    const SMALL_FILE_CAP: ThemeScanCaps = ThemeScanCaps {
-        files: 4,
-        ..ThemeScanCaps::PRODUCTION
-    };
-
-    const _: () = assert!(
-        ThemeScanCaps::PRODUCTION.files < ThemeScanCaps::PRODUCTION.candidates
-            && ThemeScanCaps::PRODUCTION.candidates <= ThemeScanCaps::PRODUCTION.entries
-    );
-
-    fn discover_capped(dir: &std::path::Path, caps: ThemeScanCaps) -> ThemeCatalog {
-        ThemeCatalog::discover_in_capped(dir, false, caps).unwrap_or_default()
-    }
-
-    #[test]
-    fn theme_catalog_is_sorted_bounded_safe_and_parse_validated() {
-        let dir = theme_fixture_dir("bounded");
-        let cap = SMALL_FILE_CAP.files;
-        for index in (0..(cap + 2)).rev() {
-            write_theme(
-                &dir.join(format!("Theme-{index:03}.conf")),
-                "#ddeeff",
-                "#102030",
-            );
-        }
-        let catalog = discover_capped(&dir, SMALL_FILE_CAP);
-        let names = catalog.ready_names().collect::<Vec<_>>();
-        assert_eq!(names.len(), cap);
-        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(names[0], "Theme-000");
-        assert_eq!(names[cap - 1], format!("Theme-{:03}", cap - 1));
-        assert!(catalog.truncated());
-        assert_ne!(catalog.fingerprint(), 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_meta_shows_name_and_keys_on_the_stem() {
-        use aterm_types::Appearance;
-        use aterm_types::scheme::{AppearanceSource, ThemeWarning};
-        let dir = theme_fixture_dir("meta");
-        std::fs::write(
-            dir.join("studio.conf"),
-            "name = Studio Night\ndescription = deep navy\nauthor = Jo\n\
-             foreground = #c0caf5\nbackground = #1a1b26\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("paper.conf"),
-            "foreground = #202020\nbackground = #fafafa\ncolor7 = #fafafa\n",
-        )
-        .unwrap();
-        let catalog = ThemeCatalog::discover_in(&dir);
-        assert_eq!(
-            catalog.ready_names().collect::<Vec<_>>(),
-            ["paper", "studio"]
-        );
-
-        let studio = catalog.meta("STUDIO").expect("the stem is the id");
-        assert_eq!(studio.display_name, "Studio Night");
-        assert_eq!(studio.description.as_deref(), Some("deep navy"));
-        assert_eq!(studio.author.as_deref(), Some("Jo"));
-        assert_eq!(studio.appearance, Appearance::Dark);
-        assert_eq!(studio.appearance_source, AppearanceSource::Measured);
-        assert!(studio.warnings.is_empty(), "{:?}", studio.warnings);
-        assert!(catalog.resolve("studio").is_ok());
-        assert!(catalog.resolve("Studio Night").is_err());
-        assert_eq!(catalog.meta("Studio Night"), None);
-
-        let paper = catalog.meta("paper").expect("paper loaded");
-        assert_eq!(paper.display_name, "paper");
-        assert_eq!(paper.appearance, Appearance::Light);
-        assert_eq!(
-            catalog.resolve("paper").unwrap().appearance,
-            Appearance::Light
-        );
-        assert_eq!(
-            paper.warnings,
-            vec![ThemeWarning::AnsiMatchesBackground { slot: 7 }]
-        );
-        assert_eq!(
-            catalog
-                .ready_themes()
-                .map(|(id, meta)| (id, meta.display_name.as_str()))
-                .collect::<Vec<_>>(),
-            [("paper", "paper"), ("studio", "Studio Night")]
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_builtin_meta_matches_the_classifier() {
-        use super::measured_appearance;
-        let catalog = ThemeCatalog::empty();
-        for theme in aterm_types::scheme::builtin_theme_list() {
-            let scheme = aterm_types::scheme::builtin(theme.name).expect("listed");
-            assert_eq!(
-                measured_appearance(scheme.background),
-                theme.appearance,
-                "{}",
-                theme.name
-            );
-            let meta = catalog.meta(theme.name).expect("a built-in has meta");
-            assert_eq!(meta.display_name, theme.name);
-            assert_eq!(meta.pair.as_deref(), theme.pair);
-            assert_eq!(meta.description.as_deref(), Some(theme.description));
-        }
-        assert_eq!(catalog.meta("no such theme"), None);
-    }
-
-    #[test]
-    fn theme_catalog_lists_a_file_shadowing_a_builtin() {
-        for (file, row, builtin) in [
-            ("Nord", "Nord", "Nord"),
-            ("nord", "nord", "Nord"),
-            ("default", "default", "Default"),
-        ] {
-            let dir = theme_fixture_dir("shadow");
-            write_theme(&dir.join(format!("{file}.conf")), "#010203", "#fefdfc");
-            write_theme(&dir.join("Work.conf"), "#ddeeff", "#102030");
-            let catalog = ThemeCatalog::discover_in(&dir);
-            let listing = catalog.listing().collect::<Vec<_>>();
-            assert!(
-                listing.contains(&(row, ThemeEntryStatus::Shadowed(builtin))),
-                "{file}: {listing:?}"
-            );
-            assert!(listing.contains(&("Work", ThemeEntryStatus::Ready)));
-            assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
-            assert_eq!(
-                catalog.resolve(file).unwrap(),
-                aterm_types::scheme::builtin(builtin).unwrap(),
-                "the built-in still wins for {file}"
-            );
-            assert!(
-                ThemeEntryStatus::Shadowed(builtin)
-                    .reason()
-                    .is_some_and(|reason| reason.contains(builtin))
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn theme_catalog_keeps_a_row_per_case_variant_shadowing_a_builtin() {
-        let dir = theme_fixture_dir("shadow-twins");
-        write_theme(&dir.join("Nord.conf"), "#010203", "#fefdfc");
-        write_theme(&dir.join("nord.conf"), "#030201", "#fcfdfe");
-        let files = std::fs::read_dir(&dir).unwrap().count();
-        let catalog = ThemeCatalog::discover_in(&dir);
-        let listing = catalog.listing().collect::<Vec<_>>();
-        assert_eq!(listing.len(), files, "{listing:?}");
-        assert!(
-            listing
-                .iter()
-                .all(|(_, status)| *status == ThemeEntryStatus::Shadowed("Nord")),
-            "{listing:?}"
-        );
-        assert_eq!(
-            catalog.resolve("Nord").unwrap(),
-            aterm_types::scheme::builtin("Nord").unwrap()
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_caps_files_after_the_name_filters() {
-        let dir = theme_fixture_dir("cap-after-filter");
-        let cap = SMALL_FILE_CAP.files;
-        write_theme(&dir.join("Nord.conf"), "#010203", "#fefdfc");
-        write_theme(&dir.join("Dracula.conf"), "#010203", "#fefdfc");
-        for index in 0..cap {
-            write_theme(
-                &dir.join(format!("Theme-{index:03}.conf")),
-                "#ddeeff",
-                "#102030",
-            );
-        }
-        let catalog = discover_capped(&dir, SMALL_FILE_CAP);
-        assert_eq!(catalog.ready_names().count(), cap);
-        assert!(!catalog.truncated());
-        assert_eq!(
-            catalog.limits(),
-            ThemeCatalogLimits {
-                seen: cap + 2,
-                kept: cap,
-            }
-        );
-        assert_eq!(
-            catalog
-                .listing()
-                .filter(|(_, status)| matches!(status, ThemeEntryStatus::Shadowed(_)))
-                .count(),
-            2
-        );
-
-        write_theme(&dir.join("Theme-999.conf"), "#ddeeff", "#102030");
-        let over = discover_capped(&dir, SMALL_FILE_CAP);
-        assert_eq!(over.ready_names().count(), cap);
-        assert!(over.truncated());
-        assert!(over.resolve("Theme-999").is_err());
-        assert_eq!(over.limits().kept, cap);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_past_the_entry_cap_keeps_a_prefix() {
-        let caps = ThemeScanCaps {
-            entries: 8,
-            ..ThemeScanCaps::PRODUCTION
-        };
-        let dir = theme_fixture_dir("entry-cap");
-        for index in 0..=caps.entries {
-            std::fs::write(
-                dir.join(format!("Theme-{index:04}.conf")),
-                "foreground = #ddeeff\nbackground = #102030\n",
-            )
-            .unwrap();
-        }
-        let catalog = discover_capped(&dir, caps);
-        assert!(catalog.truncated());
-        let ready = catalog.ready_names().collect::<Vec<_>>();
-        assert_eq!(ready.len(), caps.entries);
-        assert!(catalog.resolve(ready[0]).is_ok());
-        assert_eq!(catalog.limits().seen, caps.entries);
-        let live = ThemeCatalog::discover_in_capped(&dir, true, caps)
-            .expect("a truncated scan is not a failure");
-        assert_eq!(live.ready_names().count(), caps.entries);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn theme_catalog_lists_a_non_utf8_file_name() {
-        use std::os::unix::ffi::OsStrExt;
-        let dir = theme_fixture_dir("non-utf8");
-        let path = dir.join(std::ffi::OsStr::from_bytes(b"Caf\xff.conf"));
-        write_theme(&path, "#ddeeff", "#102030");
-        let catalog = ThemeCatalog::discover_in(&dir);
-        let listing = catalog.listing().collect::<Vec<_>>();
-        assert_eq!(listing, [("Caf\u{FFFD}", ThemeEntryStatus::Unreadable)]);
-        assert!(catalog.ready_names().next().is_none());
-        assert!(catalog.resolve("Caf\u{FFFD}").is_err());
-        assert_eq!(catalog.limits().kept, 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_hides_unsafe_malformed_oversized_and_symlink_entries() {
-        let dir = theme_fixture_dir("invalid");
-        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
-        write_theme(&dir.join("dark:Trap.conf"), "#ffffff", "#000000");
-        write_theme(&dir.join(" Bad.conf"), "#ffffff", "#000000");
-        std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
-        let oversized = std::fs::File::create(dir.join("Huge.conf")).unwrap();
-        oversized
-            .set_len((MAX_USER_THEME_FILE_BYTES + 1) as u64)
-            .unwrap();
-        drop(oversized);
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("Work.conf"), dir.join("Alias.conf")).unwrap();
-            let fifo = dir.join("Pipe.conf");
-            let fifo_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-            // SAFETY: `fifo_path` is a valid NUL-terminated path and the return value is checked before the no-follow/nonblocking open is tested.
-            assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
-        }
-
-        let catalog = ThemeCatalog::discover_in(&dir);
-        assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
-        for invalid in ["dark:Trap", " Bad", "Broken", "Huge"] {
-            assert!(
-                catalog.resolve(invalid).is_err(),
-                "{invalid} must fail closed"
-            );
-        }
-        #[cfg(unix)]
-        {
-            assert!(catalog.resolve("Alias").is_err());
-            let alias = catalog.listing().find(|(name, _)| *name == "Alias");
-            assert!(
-                matches!(alias, Some((_, ThemeEntryStatus::Invalid(why))) if why.contains("symlink")),
-                "{alias:?}"
-            );
-            assert!(
-                ThemeCatalog::try_discover_in(&dir).is_ok(),
-                "a linked theme never blocks a live reload"
-            );
-            assert!(
-                read_bounded_theme_file(&dir.join("Alias.conf")).is_err(),
-                "the handle-level open must reject a symlink even if it is swapped in after scanning"
-            );
-            assert!(
-                read_bounded_theme_file(&dir.join("Pipe.conf")).is_err(),
-                "the nonblocking handle-level open must reject a FIFO without waiting for a writer"
-            );
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_theme_file_swap_retains_valid_catalog_until_recovery() {
-        use std::os::unix::fs::symlink;
-
-        let dir = theme_fixture_dir("live-file-swap");
-        let work = dir.join("Work.conf");
-        write_theme(&work, "#123456", "#abcdef");
-        let active = ThemeCatalog::try_discover_in(&dir).expect("initial valid catalog");
-        assert!(active.resolve("Work").is_ok());
-
-        let rejected = ThemeCatalog::try_discover_in_after_scan(&dir, || {
-            std::fs::remove_file(&work).unwrap();
-            symlink(dir.join("missing.conf"), &work).unwrap();
-        });
-        assert_eq!(rejected, Err(ThemeCatalogWatchError::FileUnavailable));
-
-        std::fs::remove_file(&work).unwrap();
-        write_theme(&work, "#fedcba", "#101820");
-        let recovered = ThemeCatalog::try_discover_in(&dir).expect("recovered catalog");
-        assert!(recovered.resolve("Work").is_ok());
-        assert_ne!(recovered, active);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn theme_catalog_has_one_case_insensitive_identity_and_rejects_collisions() {
-        let dir = theme_fixture_dir("case-identity");
-        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
-        let catalog = ThemeCatalog::discover_in(&dir);
-        assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
-        assert_eq!(catalog.resolve("work"), catalog.resolve("WORK"));
-
-        let collided = ThemeCatalog::from_schemes([
-            (
-                "Work".to_string(),
-                aterm_types::scheme::builtin("Dracula").unwrap(),
-            ),
-            (
-                "work".to_string(),
-                aterm_types::scheme::builtin("GitHub Light").unwrap(),
-            ),
-        ]);
-        assert!(collided.ready_names().next().is_none());
-        let upper = collided.resolve("Work").unwrap_err();
-        let lower = collided.resolve("work").unwrap_err();
-        assert_eq!(upper, lower);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn one_theme_catalog_drives_identical_preview_renderer_and_engine_colors() {
-        let dir = theme_fixture_dir("projection");
-        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
-        let catalog = ThemeCatalog::discover_in(&dir);
-        let config = cfg("theme = \"work\"");
-        let scheme = catalog.resolve("Work").unwrap();
-        assert_eq!(catalog.resolve("work").unwrap(), scheme);
-        let renderer = config.theme_for_with_assets(aterm_types::Appearance::Dark, &catalog);
-        let engine =
-            config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &catalog);
-        assert_eq!(renderer.fg, scheme.to_theme_parts().fg);
-        assert_eq!(renderer.bg, scheme.to_theme_parts().bg);
-        assert_eq!(engine.default_foreground, scheme.foreground);
-        assert_eq!(engine.default_background, scheme.background);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn kitty_asset_resolves_once_to_shared_rgba_with_stable_identity() {
-        let path = kitty_fixture("ready");
-        let rgba = [
-            0xff, 0x10, 0x20, 0xff, 0x20, 0xff, 0x30, 0x80, 0x10, 0x20, 0xff, 0x40, 0xff, 0xff,
-            0xff, 0xff,
-        ];
-        let png = crate::app_introspect::encode_rgba8_png(&rgba, 2, 2).unwrap();
-        std::fs::write(&path, png).unwrap();
-        let config = config_with_kitty(&path);
-        let first = config.resolve_asset_catalog();
-        let second = config.resolve_asset_catalog();
-        let (
-            KittySpriteAsset::Ready {
-                source_id,
-                w,
-                h,
-                rgba: resolved,
-                fp,
-            },
-            KittySpriteAsset::Ready { fp: second_fp, .. },
-        ) = (&first.kitty_sprite, &second.kitty_sprite)
-        else {
-            panic!("valid PNG must resolve Ready");
-        };
-        assert_eq!(source_id.as_ref(), path.to_string_lossy());
-        assert_eq!((*w, *h), (2, 2));
-        assert_eq!(resolved.as_ref(), rgba);
-        assert_ne!(*fp, 0);
-        assert_eq!(fp, second_fp, "same source bytes have stable identity");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn kitty_asset_hostile_sources_fail_closed() {
-        let invalid = |path: &std::path::Path, case: &str| {
-            assert!(
-                matches!(
-                    config_with_kitty(path).resolve_asset_catalog().kitty_sprite,
-                    KittySpriteAsset::Invalid { .. }
-                ),
-                "{case}"
-            );
-        };
-        invalid(&kitty_fixture("missing"), "missing");
-
-        let oversized = kitty_fixture("encoded-limit");
-        std::fs::File::create(&oversized)
-            .unwrap()
-            .set_len((MAX_KITTY_SPRITE_FILE_BYTES as u64) + 1)
-            .unwrap();
-        invalid(&oversized, "encoded bytes past the cap");
-
-        let wide = kitty_fixture("dimension-limit");
-        let width = super::MAX_KITTY_SPRITE_DIMENSION + 1;
-        let png = crate::app_introspect::encode_rgba8_png(&vec![0x7f; width * 4], width as u32, 1)
-            .unwrap();
-        std::fs::write(&wide, png).unwrap();
-        invalid(&wide, "dimension past the cap");
-        let fixtures = vec![oversized, wide];
-
-        #[cfg(unix)]
-        let fixtures = {
-            use std::os::unix::ffi::OsStrExt as _;
-            let fifo = kitty_fixture("writerless-fifo");
-            let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
-            // SAFETY: `fifo_c` is a live NUL-terminated pathname and mkfifo retains no pointer. `kitty_fixture` gives this test a unique final component.
-            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-            invalid(&fifo, "writerless FIFO");
-            let target = kitty_fixture("symlink-target");
-            let linked = kitty_fixture("symlink-final");
-            std::fs::write(&target, b"not consulted").expect("write symlink target");
-            std::os::unix::fs::symlink(&target, &linked).expect("create final symlink");
-            invalid(&linked, "final-component symlink");
-            let mut fixtures = fixtures;
-            fixtures.extend([fifo, linked, target]);
-            fixtures
-        };
-        for path in fixtures {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    fn write_toy_pack(label: &str, words: &[&str], burst: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-toy-pack-test-{}-{serial}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create toy-pack fixture directory");
-        let path = dir.join("pack.toml");
-        let words = words
-            .iter()
-            .map(|word| super::toml_basic_string(word))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let source = format!(
-            "schema = 1\n\
-             [pack]\n\
-             id = \"community.test.{label}\"\n\
-             name = \"{label}\"\n\
-             version = 1\n\
-             authors = [\"aterm tests\"]\n\
-             license = \"Apache-2.0\"\n\
-             [[toy]]\n\
-             id = \"recipe\"\n\
-             lang = \"en\"\n\
-             words = [{words}]\n\
-             burst = {{ kind = \"{burst}\" }}\n"
-        );
-        std::fs::write(&path, source).expect("write toy-pack fixture");
-        path
-    }
-
-    fn config_with_toy_packs(paths: &[std::path::PathBuf], tail: &str) -> Config {
-        let paths = paths
-            .iter()
-            .map(|path| super::toml_basic_string(&path.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        cfg(&format!("[sparkle_words]\ntoy_packs = [{paths}]\n{tail}"))
-    }
-
-    #[test]
-    fn w6_font_config_warns_and_skips_unresolvable() {
-        let fixture =
-            aterm_tempfile::manifest_dir().join("../aterm-render/assets/DejaVuSansMono.ttf");
-        let fixture = fixture.to_str().expect("a UTF-8 font path");
-        let toml = format!(
-            "font_family_bold = \"definitely-not-a-real-font-xyzzy\"\n\
-             font_synthetic_style = false\n\
-             fallback_fonts = [{}, \"also-not-a-real-font-xyzzy\"]\n",
-            super::toml_basic_string(fixture)
-        );
-        let (fc, warns) = super::FontConfig::from_config(&cfg(&toml));
-        assert_eq!(fc.styled_paths[0], None, "bogus bold family skipped");
-        assert!(!fc.synthetic_style);
-        assert_eq!(fc.fallback_fonts, vec![fixture.to_string()]);
-        assert_eq!(
-            warns.len(),
-            2,
-            "one warning per unresolvable entry: {warns:?}"
-        );
-        assert!(warns[0].contains("font_family_bold"));
-        assert!(warns[1].contains("fallback_fonts"));
-    }
-
-    #[test]
-    fn w6_rejected_oversized_face_preserves_last_working_font() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-font-config-oversized-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("oversized.ttf");
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(aterm_render::font_file::MAX_FONT_FILE_BYTES as u64 + 1)
-            .unwrap();
-        let config = cfg(&format!(
-            "font_family_bold = {}\n",
-            super::toml_basic_string(&path.to_string_lossy())
-        ));
-        let (mut next, warnings) = super::FontConfig::from_config(&config);
-        let mut working = super::FontConfig::default();
-        working.styled_paths[0] = Some(aterm_render::FaceRef::new("/admitted/working-bold.ttf", 0));
-        next.preserve_rejected_from(&config, &working);
-
-        assert_eq!(next.styled_paths[0], working.styled_paths[0]);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("font_family_bold"), "{warnings:?}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn w6_writerless_fifo_is_diagnosed_without_entering_live_font_config() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let root =
-            std::env::temp_dir().join(format!("aterm-font-config-fifo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("face.fifo");
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: the CString is live for the call and the private fixture path does not alias another test's FIFO.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let config = cfg(&format!(
-            "font_family_italic = {}\n",
-            super::toml_basic_string(&path.to_string_lossy())
-        ));
-        let (resolved, warnings) = super::FontConfig::from_config(&config);
-        assert!(resolved.styled_paths[1].is_none());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("font_family_italic"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_ignored_font_px_is_a_load_notice() {
-        let with = |font_px: Option<f32>| Config {
-            font_px,
-            ..Config::default()
-        };
-        let validate_flags = |config: &Config| {
-            crate::diagnostics::config_semantic_warnings(config)
-                .iter()
-                .any(|w| w.key == "font_px")
-        };
-        for fine in [
-            None,
-            Some(14.0),
-            Some(crate::FONT_PX_MIN),
-            Some(crate::FONT_PX_MAX),
-        ] {
-            assert_eq!(super::font_px_load_notice(&with(fine)), None, "{fine:?}");
-            assert!(!validate_flags(&with(fine)), "{fine:?}");
-        }
-        for bad in [0.0, 500.0, -5.0, f32::NAN, f32::INFINITY] {
-            assert!(
-                super::font_px_load_notice(&with(Some(bad))).is_some(),
-                "{bad}"
-            );
-            assert!(validate_flags(&with(Some(bad))), "{bad}");
-            assert_eq!(
-                super::resolve_font_px_with(None, Some(bad)),
-                crate::FONT_PX,
-                "{bad}: the banner's claim is the resolver's behaviour"
-            );
-        }
-    }
-
-    #[test]
-    fn restart_notices_flags_columns_lines_and_gpu_only() {
-        use super::restart_notices;
-        let a = cfg("columns = 100\nlines = 40\ngpu = true");
-        assert!(restart_notices(&a, &a).is_empty());
-        let hot = cfg("columns = 100\nlines = 40\ngpu = true\nfont_px = 18");
-        assert!(restart_notices(&a, &hot).is_empty());
-        let cols = cfg("columns = 120\nlines = 40\ngpu = true");
-        assert_eq!(restart_notices(&a, &cols).len(), 1);
-        let rows = cfg("columns = 100\nlines = 50\ngpu = true");
-        assert_eq!(restart_notices(&a, &rows).len(), 1);
-        let both = cfg("columns = 120\nlines = 50\ngpu = true");
-        assert_eq!(restart_notices(&a, &both).len(), 1);
-        let cleared = cfg("lines = 40\ngpu = true");
-        assert_eq!(restart_notices(&a, &cleared).len(), 1);
-        let gpu_flipped = cfg("columns = 100\nlines = 40\ngpu = false");
-        assert_eq!(restart_notices(&a, &gpu_flipped).len(), 1);
-        let gpu_cleared = cfg("columns = 100\nlines = 40");
-        assert_eq!(restart_notices(&a, &gpu_cleared).len(), 1);
-        let dims_and_gpu = cfg("columns = 120\nlines = 40\ngpu = false");
-        assert_eq!(restart_notices(&a, &dims_and_gpu).len(), 2);
-    }
-
-    #[test]
-    fn engine_keys_resolve_onto_terminal_config() {
-        use aterm_core::config::TerminalConfig;
-        use aterm_core::terminal::CursorStyle;
-        type Check = fn(&TerminalConfig) -> bool;
-        let cases: [(&str, Check); 10] = [
-            ("cursor_style = \" BAR \"", |t| {
-                t.cursor_style == CursorStyle::BlinkingBar
-            }),
-            ("cursor_style = \"Beam\"\ncursor_blink = false", |t| {
-                t.cursor_style == CursorStyle::SteadyBar
-            }),
-            ("bidi = \"disabled\"", |t| t.bidi.mode == BiDiMode::Disabled),
-            ("bidi = \" Explicit \"", |t| {
-                t.bidi.mode == BiDiMode::Explicit
-            }),
-            ("bidi = \" ON \"", |t| t.bidi.mode == BiDiMode::Implicit),
-            ("ambiguous_width = \" wide \"", |t| t.ambiguous_width_double),
-            ("ambiguous_width = \" DOUBLE \"", |t| {
-                t.ambiguous_width_double
-            }),
-            ("ambiguous_width = \" NARROW \"", |t| {
-                !t.ambiguous_width_double
-            }),
-            ("bold_is_bright = false", |t| !t.bold_is_bright),
-            ("faint_opacity = 0.25", |t| t.faint_opacity == 0.25),
-        ];
-        for (source, check) in cases {
-            let tc = cfg(source).applied_terminal_config();
-            assert!(check(&tc), "{source}");
-        }
-        assert_eq!(
-            cfg("font_px = 14.0\nline_height = 1.2").applied_terminal_config(),
-            Config::default().applied_terminal_config()
-        );
-    }
-
-    #[test]
-    fn font_features_parse_onto_primary_face() {
-        let s = cfg("font_features = [\"ss01\", \"-calt\", \"+zero\"]").text_shaping();
-        assert_eq!(s.font_features.len(), 1, "one primary-face feature set");
-        let set = &s.font_features[0];
-        assert_eq!(set.font_id, 0);
-        let tags: Vec<(&[u8], u32)> = set.features.iter().map(|f| (&f.tag[..], f.value)).collect();
-        assert_eq!(
-            tags,
-            vec![(&b"ss01"[..], 1), (&b"calt"[..], 0), (&b"zero"[..], 1)]
-        );
-        let grouped = cfg("font_features = [\"+ss01 +zero\"]").text_shaping();
-        assert_eq!(grouped.font_features[0].features.len(), 2);
-        let empty = cfg("font_features = [\"\", \"+\", \"-\"]").text_shaping();
-        assert!(empty.font_features.is_empty(), "{:?}", empty.font_features);
-    }
-
-    #[test]
-    fn security_flags_are_opt_in_and_fail_closed() {
-        let flags = |source: &str| {
-            let tc = cfg(source).applied_terminal_config();
-            [
-                tc.allow_osc52_query,
-                tc.allow_window_ops,
-                tc.allow_notifications,
-                tc.allow_palette_reconfigure,
-            ]
-        };
-        assert_eq!(
-            flags("scrollback_lines = 5000"),
-            [false, false, false, true],
-            "palette sets are allowed by default"
-        );
-        assert_eq!(
-            flags(
-                "allow_osc52_query = true\nallow_window_ops = true\n\
-                 allow_notifications = true\nallow_palette_reconfigure = true"
-            ),
-            [true; 4]
-        );
-    }
-
-    #[test]
-    fn palette_sets_refused_only_when_the_owner_says_false() {
-        assert!(
-            !cfg("allow_palette_reconfigure = false")
-                .applied_terminal_config()
-                .allow_palette_reconfigure
-        );
-        assert!(
-            cfg("allow_palette_reconfigure = true")
-                .applied_terminal_config()
-                .allow_palette_reconfigure
-        );
-        assert!(!aterm_core::config::TerminalConfig::default().allow_palette_reconfigure);
-    }
-
-    #[test]
-    fn sparkle_absent_table_decorates_the_alt_screen_and_master_off_disables() {
-        let deco = Config::default()
-            .sparkle_deco_config()
-            .expect("an absent table resolves the defaults");
-        assert!(!deco.suppress_in_alt_screen);
-        assert!(
-            cfg("[sparkle_words]\nsuppress_in_alt_screen = true")
-                .sparkle_deco_config()
-                .unwrap()
-                .suppress_in_alt_screen
-        );
-        assert!(
-            cfg("[sparkle_words]\nenabled = false")
-                .sparkle_deco_config()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn sparkle_style_tokens_resolve_trimmed_any_case_with_fallback() {
-        use crate::word_decorations::{FelineStyle, ProfanityStyle};
-        for (style, expected) in [
-            (" Nova ", ProfanityStyle::Nova),
-            (" SPARKLE ", ProfanityStyle::Sparkle),
-            ("rainbow", ProfanityStyle::Rainbow),
-            ("comet", ProfanityStyle::Rainbow),
-        ] {
-            let deco = cfg(&format!("[sparkle_words.profanity]\nstyle = \"{style}\""))
-                .sparkle_deco_config()
-                .unwrap();
-            assert_eq!(deco.profanity_style, expected, "{style:?}");
-        }
-        for (style, expected) in [(" Paw ", FelineStyle::Paw), ("lion", FelineStyle::Cat)] {
-            let deco = cfg(&format!("[sparkle_words.feline]\nstyle = \"{style}\""))
-                .sparkle_deco_config()
-                .unwrap();
-            assert_eq!(deco.feline_style, expected, "{style:?}");
-        }
-        let deco = cfg("[sparkle_words.profanity]\nsupernova_chance = 250")
-            .sparkle_deco_config()
-            .unwrap();
-        assert_eq!(deco.supernova_chance, 100);
-    }
-
-    #[test]
-    fn sparkle_custom_specs_resolve_and_survive_ink_off() {
-        let toml = concat!(
-            "[sparkle_words.ink]\nenabled = false\n",
-            "[[sparkle_words.custom]]\nwords = [\"Ultrathink\", \"猫神\"]\n",
-            "ink = { colorway = \"rainbow\" }\n",
-        );
-        let c = cfg(toml);
-        let deco = c.sparkle_deco_config().expect("resolves");
-        assert!(deco.spec_table.has_custom(), "custom specs registered");
-        assert!(
-            deco.spec_table
-                .override_for(aterm_lexicon::form_hash("ultrathink"))
-                .is_some(),
-            "keyed by the FOLDED surface hash"
-        );
-        assert!(
-            deco.spec_table
-                .override_for(aterm_lexicon::form_hash("猫神"))
-                .is_some(),
-            "CJK surfaces keyed RAW"
-        );
-        assert!(
-            !deco.ink_enabled && deco.emphasis,
-            "emphasis scans with ink off when custom specs exist (v3 §6 gate)"
-        );
-        let deco = cfg("[sparkle_words.ink]\nenabled = false")
-            .sparkle_deco_config()
-            .unwrap();
-        assert!(!deco.emphasis, "no customs: the ink AND-gate stands");
-        let over = c.sparkle_override_toml().expect("custom words synthesize");
-        assert!(over.contains("forms = [\"Ultrathink\"]"), "{over}");
-        assert!(over.contains("cjk = true"), "{over}");
-        assert!(over.contains("forms = [\"猫神\"]"), "{over}");
-    }
-
-    #[test]
-    fn sparkle_words_product_toggle_suppresses_all_non_feline_effects() {
-        let c = cfg(concat!(
-            "[sparkle_words.profanity]\nenabled = false\n",
-            "[sparkle_words.emphasis]\nenabled = true\nextra_words = [\"wow\"]\n",
-            "[[sparkle_words.custom]]\nwords = [\"ultrathink\"]\n",
-            "burst = { kind = \"starburst\", chance = 100 }\n",
-        ));
-        let deco = c
-            .sparkle_deco_config()
-            .expect("keyword kitties remain independently enabled");
-        assert!(!deco.profanity, "built-in sparkle words are off");
-        assert!(!deco.emphasis, "emphasis cannot bypass the product switch");
-        assert!(
-            !deco.canine,
-            "every non-feline class shares the product switch"
-        );
-        assert!(deco.feline, "keyword kitties remain independently on");
-        assert!(
-            !deco.spec_table.has_custom(),
-            "custom and Toy Pack effects cannot bypass the product switch"
-        );
-
-        assert!(
-            cfg("[sparkle_words.profanity]\nenabled = false\n\
-                 [sparkle_words.feline]\nenabled = false")
-            .sparkle_deco_config()
-            .is_none(),
-            "turning both top-level toys off produces no decoration engine"
-        );
-    }
-
-    #[test]
-    fn toy_packs_load_skip_invalid_and_apply_documented_precedence() {
-        use aterm_effects::spec::BurstKind;
-
-        let first = write_toy_pack("first", &["packshared", "firsttoy"], "sparkle");
-        let invalid_dir =
-            std::env::temp_dir().join(format!("aterm-toy-pack-invalid-{}", std::process::id()));
-        std::fs::create_dir_all(&invalid_dir).expect("create invalid fixture directory");
-        let invalid = invalid_dir.join("pack.toml");
-        std::fs::write(&invalid, "schema = 99\n").expect("write invalid fixture");
-        let later = write_toy_pack("later", &["packshared", "latertoy"], "glow");
-        let paths = [first.clone(), invalid.clone(), later.clone()];
-
-        let imported = config_with_toy_packs(&paths, "");
-        let (deco, override_toml) = imported.sparkle_runtime_parts().expect("sparkle resolves");
-        assert!(
-            deco.profanity && deco.feline,
-            "an invalid pack disables nothing"
-        );
-        let shared = deco
-            .spec_table
-            .override_for(aterm_lexicon::form_hash("packshared"))
-            .and_then(|spec| spec.burst)
-            .expect("shared imported recipe");
-        assert_eq!(shared.kind, BurstKind::Glow, "later valid pack wins");
-        let lexicon =
-            aterm_lexicon::Lexicon::with_languages_and_override(&["en"], override_toml.as_deref())
-                .expect("compiled pack lexicon parses");
-        assert_eq!(
-            lexicon
-                .scan(
-                    "firsttoy packshared latertoy",
-                    &aterm_lexicon::ScanOptions::default()
-                )
-                .len(),
-            3,
-            "both valid packs reach the production scanner"
-        );
-
-        let inline = config_with_toy_packs(
-            &paths,
-            "[[sparkle_words.custom]]\n\
-             words = [\"packshared\"]\n\
-             burst = { kind = \"nova\", chance = 100 }\n",
-        );
-        let (deco, _) = inline.sparkle_runtime_parts().expect("inline resolves");
-        let shared = deco
-            .spec_table
-            .override_for(aterm_lexicon::form_hash("packshared"))
-            .and_then(|spec| spec.burst)
-            .expect("inline shared recipe");
-        assert_eq!(
-            shared.kind,
-            BurstKind::Nova,
-            "inline custom is the final, most-local override"
-        );
-
-        for path in [first, invalid, later] {
-            let _ = std::fs::remove_dir_all(path.parent().expect("fixture parent"));
-        }
-    }
-
-    #[test]
-    fn render_recompute_uses_only_the_prepared_sparkle_generation() {
-        let pack = write_toy_pack("render-no-host-io", &["preparedword"], "glow");
-        let config = config_with_toy_packs(std::slice::from_ref(&pack), "");
-        let prepared = config.prepare_sparkle_runtime();
-
-        std::fs::remove_file(&pack).expect("remove admitted Toy Pack source");
-        super::reset_sparkle_host_prepare_count();
-        let mut app = crate::App::headless_for_test();
-        app.config = config;
-        app.prepared_sparkle = prepared;
-        app.sparkle_dirty = true;
-        super::reset_sparkle_host_prepare_count();
-
-        app.recompute_sparkle();
-        assert_eq!(
-            super::sparkle_host_prepare_count(),
-            0,
-            "render-time recompute must not open/compile any configured feed"
-        );
-        assert!(
-            app.sparkle.as_ref().is_some_and(|resolved| resolved
-                .cfg
-                .spec_table
-                .override_for(aterm_lexicon::form_hash("preparedword"))
-                .is_some()),
-            "the immutable prepared Toy Pack remains active after its source disappears"
-        );
-        let _ = std::fs::remove_dir_all(pack.parent().expect("fixture parent"));
-    }
-
-    #[test]
-    fn prepared_config_apply_does_not_refingerprint_path_feeds() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-prepared-apply-no-io-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        crate::test_scratch::write_config(&path, "# comment-only generation\n");
-        let observation =
-            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
-                .unwrap();
-        let config = Config::default();
-        let assets = config.resolve_asset_catalog();
-        let feeds = config.path_feed_fingerprints();
-        let sparkle = config.prepare_sparkle_runtime();
-        let mut app = crate::App::headless_for_test();
-        super::reset_path_feed_fingerprint_count();
-
-        app.apply_prepared_config_generation(
-            crate::native_font_catalog::PreparedConfigGeneration {
-                observation,
-                config,
-                values: std::collections::BTreeMap::new(),
-                disk_faults: std::sync::Arc::default(),
-                assets,
-                path_feed_fps: feeds,
-                sparkle,
-                fonts: None,
-                warnings: Vec::new(),
-                font_refusals: Vec::new(),
-                reason: crate::app_colorscheme::ThemeChange::ConfigReload,
-            },
-        );
-        assert_eq!(
-            super::path_feed_fingerprint_count(),
-            0,
-            "the event-loop reducer must consume the worker's immutable fingerprint"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn apply_config_text(app: &mut crate::App, dir: &std::path::Path, text: &str) {
-        let path = dir.join("aterm.toml");
-        crate::test_scratch::write_config(&path, text);
-        let observation =
-            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
-                .expect("observe");
-        let config: Config = aterm_toml::from_str(text).expect("valid toml");
-        let assets = config.resolve_asset_catalog();
-        let path_feed_fps = config.path_feed_fingerprints();
-        let sparkle = config.prepare_sparkle_runtime();
-        app.apply_prepared_config_generation(
-            crate::native_font_catalog::PreparedConfigGeneration {
-                observation,
-                config,
-                values: std::collections::BTreeMap::new(),
-                disk_faults: std::sync::Arc::default(),
-                assets,
-                path_feed_fps,
-                sparkle,
-                fonts: None,
-                warnings: Vec::new(),
-                font_refusals: Vec::new(),
-                reason: crate::app_colorscheme::ThemeChange::ConfigReload,
-            },
-        );
-    }
-
-    #[test]
-    fn a_misspelled_key_added_by_a_live_edit_still_warns_through_the_dedupe() {
-        let dir = std::env::temp_dir().join(format!("aterm-typo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let mut app = crate::App::headless_for_test();
-
-        apply_config_text(&mut app, &dir, "windw_padding = 20\n");
-        let ignored = app
-            .messages
-            .live_by_key(crate::message_reporters::ConfigFamily::IgnoredKeys.key())
-            .expect("a misspelled key must warn even when the parse dedupes");
-        assert!(
-            ignored
-                .msg
-                .detail
-                .iter()
-                .any(|l| l.contains("windw_padding")),
-            "the row names the key that was ignored: {:?}",
-            ignored.msg
-        );
-
-        let mut chord = crate::message_reporters::ConfigWarnings::default();
-        chord.push(
-            crate::message_reporters::ConfigFamily::Keybindings,
-            "config keybindings: skipping \"ctrl+x\": unknown action \"foo\"".into(),
-        );
-        for msg in chord.into_messages() {
-            app.post_message(msg);
-        }
-
-        apply_config_text(&mut app, &dir, "# fixed\n");
-        assert!(
-            app.messages
-                .live_by_key(crate::message_reporters::ConfigFamily::IgnoredKeys.key())
-                .is_none(),
-            "removing the bad key clears its row"
-        );
-        assert!(
-            app.messages
-                .live_by_key(crate::message_reporters::ConfigFamily::Keybindings.key())
-                .is_some(),
-            "a comment-only save leaves the chord's still-true row standing"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_theme_that_does_not_load_is_a_live_row_until_its_file_arrives() {
-        const NAME: &str = "Aterm Test Theme 7F1C";
-        let dir = std::env::temp_dir().join(format!("aterm-theme-miss-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let mut app = crate::App::headless_for_test();
-        apply_config_text(&mut app, &dir, &format!("theme = {NAME:?}\n"));
-        let key = crate::message_reporters::ConfigFamily::UnacceptedValues.key();
-        let row = app
-            .messages
-            .live_by_key(key)
-            .expect("a theme that does not load is a live row");
-        assert!(
-            row.msg.detail.iter().any(|line| line.contains(NAME)),
-            "{:?}",
-            row.msg
-        );
-
-        app.reload_theme_catalog(ThemeCatalog::from_schemes([(
-            NAME.to_string(),
-            aterm_types::ColorScheme::default(),
-        )]));
-        assert!(
-            app.messages.live_by_key(key).is_none(),
-            "the theme file arriving takes the row down"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn malformed_external_lexicon_does_not_drop_valid_toy_pack_layer() {
-        let pack = write_toy_pack("lexicon-isolation", &["packstillworks"], "glow");
-        let external = pack
-            .parent()
-            .expect("fixture parent")
-            .join("broken-lexicon.toml");
-        std::fs::write(&external, "[[entry]\nclass = \"emphasis\"")
-            .expect("write malformed external lexicon");
-        let tail = format!(
-            "lexicon = {}\n",
-            super::toml_basic_string(&external.to_string_lossy())
-        );
-        let config = config_with_toy_packs(std::slice::from_ref(&pack), &tail);
-        let (deco, override_toml) = config.sparkle_runtime_parts().expect("sparkle resolves");
-
-        assert!(
-            deco.spec_table
-                .override_for(aterm_lexicon::form_hash("packstillworks"))
-                .is_some(),
-            "the compiled Toy Pack spec survives the rejected user layer"
-        );
-        let lexicon =
-            aterm_lexicon::Lexicon::with_languages_and_override(&["en"], override_toml.as_deref())
-                .expect("generated layers remain independently valid");
-        assert_eq!(
-            lexicon
-                .scan("packstillworks", &aterm_lexicon::ScanOptions::default())
-                .len(),
-            1,
-            "the Toy Pack trigger still reaches the production scanner"
-        );
-
-        std::fs::remove_dir_all(pack.parent().expect("fixture parent"))
-            .expect("remove isolation fixtures");
-    }
-
-    #[test]
-    fn external_lexicon_cap_is_exact_and_enforced_by_the_runtime_loader() {
-        let path = kitty_fixture("lexicon-cap");
-        let prefix = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"boundedword\"]\n#";
-        let mut exact = prefix.to_string();
-        exact.push_str(
-            &"x".repeat(aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES - prefix.len()),
-        );
-        std::fs::write(&path, &exact).expect("write exact-limit lexicon");
-        let config = cfg(&format!(
-            "[sparkle_words]\nlexicon = {}\n",
-            super::toml_basic_string(&path.to_string_lossy())
-        ));
-        assert!(
-            config
-                .sparkle_override_toml()
-                .is_some_and(|source| source.contains("boundedword")),
-            "a regular lexicon exactly at the cap is admitted"
-        );
-
-        exact.push('x');
-        std::fs::write(&path, exact).expect("write over-limit lexicon");
-        assert!(
-            config.sparkle_override_toml().is_none(),
-            "the same lexicon one byte over the cap is skipped"
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn toy_pack_path_count_is_bounded() {
-        let active = write_toy_pack("active", &["activepackword"], "glow");
-        let overflow = write_toy_pack("overflow", &["overflowpackword"], "nova");
-        let mut paths = vec![active.clone(); super::MAX_ACTIVE_TOY_PACKS];
-        paths.push(overflow.clone());
-        let config = config_with_toy_packs(&paths, "");
-        let (deco, override_toml) = config.sparkle_runtime_parts().expect("sparkle resolves");
-        assert!(
-            deco.spec_table
-                .override_for(aterm_lexicon::form_hash("activepackword"))
-                .is_some(),
-            "accepted paths load"
-        );
-        assert!(
-            deco.spec_table
-                .override_for(aterm_lexicon::form_hash("overflowpackword"))
-                .is_none(),
-            "paths beyond the hard cap are inactive"
-        );
-        assert!(
-            !override_toml
-                .as_deref()
-                .unwrap_or_default()
-                .contains("overflowpackword"),
-            "capped paths do not leak into the scanner document"
-        );
-        for path in [active, overflow] {
-            let _ = std::fs::remove_dir_all(path.parent().expect("fixture parent"));
-        }
-    }
-
-    #[test]
-    fn sparkle_ink_round_trip_and_clamps() {
-        let deco = cfg(
-            "[sparkle_words.ink]\nenabled = true\nstrength = 0.4\nsweep_ms = 1000\nloop = true",
-        )
-        .sparkle_deco_config()
-        .expect("ink table keeps the feature on");
-        assert!(deco.ink_enabled);
-        assert_eq!(deco.ink_strength, 0.4);
-        assert_eq!(deco.ink_sweep_ms, 1000);
-        assert!(deco.ink_loop);
-        let deco = cfg("[sparkle_words.ink]\nstrength = 3.0\nsweep_ms = 50")
-            .sparkle_deco_config()
-            .unwrap();
-        assert_eq!(deco.ink_strength, 1.0, "strength clamps to 0.0..=1.0");
-        assert_eq!(deco.ink_sweep_ms, 350, "sweep_ms clamps to 350..=6000");
-        let deco = cfg("[sparkle_words.ink]\nsweep_ms = 99999")
-            .sparkle_deco_config()
-            .unwrap();
-        assert_eq!(deco.ink_sweep_ms, 6000);
-        let deco = cfg("[sparkle_words.ink]\nloop = true\nsweep_ms = 400")
-            .sparkle_deco_config()
-            .unwrap();
-        assert_eq!(
-            deco.ink_sweep_ms, 600,
-            "looping shimmer floors sweep at 600"
-        );
-        let deco = cfg("[sparkle_words.emphasis]\nenabled = false")
-            .sparkle_deco_config()
-            .unwrap();
-        assert!(!deco.emphasis && deco.ink_enabled);
-    }
-
-    #[test]
-    fn prepared_emphasis_capability_matches_scannable_unoverridden_runtime_words() {
-        let capability = |source: &str| {
-            cfg(source)
-                .prepare_sparkle_runtime()
-                .consumer_capabilities()
-                .emphasis_class_default
-        };
-        assert!(capability(
-            "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\n"
-        ));
-        for source in [
-            "[sparkle_words.emphasis]\nextra_words = []\n",
-            "[sparkle_words.emphasis]\nextra_words = [\"   \"]\n",
-            "[sparkle_words.emphasis]\nextra_words = [\"two words\"]\n",
-            "[sparkle_words.emphasis]\nextra_words = [\"kitty\"]\n",
-            "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\nignore_words = [\"MEGATHINK\"]\n",
-            concat!(
-                "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\n",
-                "[[sparkle_words.custom]]\nwords = [\"megathink\"]\n",
-                "graphic = { collection = \"cats\" }\n",
-            ),
-        ] {
-            assert!(
-                !capability(source),
-                "no class-default emphasis match should survive: {source}"
-            );
-        }
-
-        let dir =
-            std::env::temp_dir().join(format!("aterm-emphasis-capability-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let lexicon = dir.join("lexicon.toml");
-        std::fs::write(
-            &lexicon,
-            concat!(
-                "[[entry]]\nclass = \"emphasis\"\nlang = \"en\"\n",
-                "mode = \"forms\"\nforms = [\"fromfile\"]\n",
-                "[[entry]]\nclass = \"emphasis\"\nlang = \"zh\"\n",
-                "mode = \"forms\"\ncjk = true\nforms = [\"超\"]\n",
-            ),
-        )
-        .unwrap();
-        let path = super::toml_basic_string(&lexicon.to_string_lossy());
-        assert!(capability(&format!("[sparkle_words]\nlexicon = {path}\n")));
-        assert!(
-            !capability(&format!(
-                "[sparkle_words]\nlexicon = {path}\n\
-                 [[sparkle_words.custom]]\nwords = [\"fromfile\"]\n\
-                 graphic = {{ collection = \"cats\" }}\n\
-                 [sparkle_words.emphasis]\nignore_words = [\"超\"]\n"
-            )),
-            "custom ownership plus ignore removes every external default consumer"
-        );
-
-        std::fs::write(
-            &lexicon,
-            concat!(
-                "[[entry]]\nclass = \"emphasis\"\nlang = \"zh\"\n",
-                "mode = \"forms\"\ncjk = true\nforms = [\"超\"]\n",
-            ),
-        )
-        .unwrap();
-        assert!(!capability(&format!("[sparkle_words]\nlexicon = {path}\n")));
-        assert!(capability(&format!(
-            "[sparkle_words]\nlexicon = {path}\n\
-             [sparkle_words.feline]\ncjk_single_char = true\n"
-        )));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
+#[path = "app_config_cfg_engine_tests.rs"]
+mod cfg_engine_tests;
 
 #[cfg(test)]
-mod w5_knob_tests {
-    use super::{Config, KnobChange, RenderKnobs, ThemeCatalog};
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    fn knobs_of(c: &Config) -> RenderKnobs {
-        RenderKnobs::from_config(
-            c,
-            &c.resolved_colors(
-                aterm_types::Appearance::Dark,
-                &ThemeCatalog::default(),
-                None,
-            ),
-        )
-    }
-
-    #[test]
-    fn new_keys_parse_and_clamp() {
-        let read = |key: &str, c: &Config| -> f64 {
-            match key {
-                "stem_gamma" => f64::from(c.stem_gamma_or_default()),
-                "trail_sound_volume" => f64::from(c.trail_sound_volume()),
-                "line_height" => f64::from(c.line_height_or_default()),
-                "minimum_contrast" => f64::from(c.minimum_contrast_or_default()),
-                "adjust_baseline" => f64::from(c.adjust_baseline_or_default()),
-                "adjust_underline_position" => f64::from(c.adjust_underline_position_or_default()),
-                "adjust_underline_thickness" => {
-                    f64::from(c.adjust_underline_thickness_or_default())
-                }
-                "faint_opacity" => f64::from(c.faint_opacity_or_default()),
-                "background_opacity" => f64::from(c.background_opacity_or_default()),
-                other => panic!("no reader for {other}"),
-            }
-        };
-        for (key, value, want) in [
-            ("stem_gamma", "99.0", 3.0_f32),
-            ("trail_sound_volume", "2.0", 1.0),
-            ("trail_sound_volume", "nan", 0.0),
-            ("line_height", "9.0", 2.0),
-            ("line_height", "0.1", 0.8),
-            ("line_height", "nan", super::DEFAULT_LINE_HEIGHT),
-            ("minimum_contrast", "99.0", 21.0),
-            ("adjust_baseline", "400", 32.0),
-            ("adjust_underline_position", "400", 32.0),
-            ("adjust_underline_thickness", "-400", -32.0),
-            ("faint_opacity", "7.0", 1.0),
-            ("background_opacity", "-3.0", 0.0),
-        ] {
-            assert_eq!(
-                read(key, &cfg(&format!("{key} = {value}"))),
-                f64::from(want),
-                "{key} = {value}"
-            );
-        }
-        assert_eq!(
-            cfg("background_material = \"HUD\"").background_material_or_default(),
-            super::BackgroundMaterial::Hud,
-            "case-insensitive"
-        );
-        assert_eq!(
-            cfg("background_material = \"under_window\"").background_material_or_default(),
-            super::BackgroundMaterial::UnderWindow,
-            "alias"
-        );
-        assert_eq!(
-            cfg("background_material = \"bogus\"").background_material_or_default(),
-            super::BackgroundMaterial::None,
-            "unknown → none"
-        );
-        use aterm_render::TextBlending;
-        for (source, expected) in [
-            ("text_blending = \"linear\"", TextBlending::Linear),
-            (
-                "text_blending = \"Linear_Corrected\"",
-                TextBlending::LinearCorrected,
-            ),
-            ("text_blending = \"gamma\"", TextBlending::LinearCorrected),
-        ] {
-            assert_eq!(cfg(source).text_blending_or_default(), expected, "{source}");
-        }
-        assert!(
-            !Config::default().trail_sound_bed_or_default(),
-            "ambient bed defaults off so typing notes carry no continuous drone"
-        );
-        assert!(cfg("trail_sound_bed = true").trail_sound_bed_or_default());
-        assert!(!cfg("trail_sound_bed = false").trail_sound_bed_or_default());
-    }
-
-    #[test]
-    fn ligature_keys_map_to_shaping_modes() {
-        use aterm_types::text_shaping::LigatureMode;
-        assert_eq!(
-            cfg("cursor_break_ligatures = true")
-                .text_shaping()
-                .ligature_mode,
-            LigatureMode::CursorDisabled
-        );
-        assert_eq!(
-            cfg("cursor_break_ligatures = false")
-                .text_shaping()
-                .ligature_mode,
-            LigatureMode::Enabled
-        );
-        assert_eq!(
-            cfg("ligatures = false\ncursor_break_ligatures = true")
-                .text_shaping()
-                .ligature_mode,
-            LigatureMode::Disabled,
-            "ligatures=false wins"
-        );
-        let merged = cfg("merged_ligatures = true\nligatures = false").text_shaping();
-        assert!(merged.admit_collapsed);
-        assert_eq!(merged.ligature_mode, LigatureMode::Disabled);
-    }
-
-    #[test]
-    fn new_keys_round_trip_through_prefs_writer() {
-        use crate::prefs::{
-            EDIT_ADJUST_BASELINE, EDIT_BOLD_IS_BRIGHT, EDIT_CURSOR_BREAK_LIGATURES,
-            EDIT_FAINT_OPACITY, EDIT_LINE_HEIGHT, EDIT_MINIMUM_CONTRAST, EDIT_SELECTION_FOREGROUND,
-            EDIT_SELECTION_INACTIVE, apply_prefs_edits,
-        };
-        let out = apply_prefs_edits(
-            "",
-            &[
-                (EDIT_LINE_HEIGHT, Some("1.35".to_string())),
-                (EDIT_MINIMUM_CONTRAST, Some("4.5".to_string())),
-                (EDIT_SELECTION_FOREGROUND, Some("#aabbcc".to_string())),
-                (EDIT_SELECTION_INACTIVE, Some("true".to_string())),
-                (EDIT_CURSOR_BREAK_LIGATURES, Some("true".to_string())),
-                (EDIT_BOLD_IS_BRIGHT, Some("false".to_string())),
-                (EDIT_FAINT_OPACITY, Some("0.4".to_string())),
-                (EDIT_ADJUST_BASELINE, Some("-2".to_string())),
-            ],
-        )
-        .expect("writes typed values");
-        let c: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
-        assert_eq!(c.line_height_or_default(), 1.35);
-        assert_eq!(c.minimum_contrast_or_default(), 4.5);
-        assert_eq!(knobs_of(&c).selection_fg, Some(0x00AA_BBCC));
-        assert!(c.selection_inactive_or_default());
-        assert_eq!(c.cursor_break_ligatures, Some(true));
-        assert_eq!(c.bold_is_bright, Some(false));
-        assert_eq!(c.faint_opacity_or_default(), 0.4);
-        assert_eq!(c.adjust_baseline_or_default(), -2);
-    }
-
-    #[test]
-    fn each_knob_key_diffs_to_exactly_one_change() {
-        let base = RenderKnobs::default();
-        assert!(base.diff(&base).is_empty(), "no change → no calls");
-
-        let cases: [(&str, KnobChange); 9] = [
-            ("line_height = 1.5", KnobChange::LineHeight(1.5)),
-            ("minimum_contrast = 4.5", KnobChange::MinimumContrast(4.5)),
-            (
-                "selection_foreground = \"#010203\"",
-                KnobChange::SelectionFg(Some(0x0001_0203)),
-            ),
-            (
-                "selection_inactive = true",
-                KnobChange::SelectionInactive(true),
-            ),
-            ("adjust_baseline = 2", KnobChange::AdjustBaseline(2)),
-            (
-                "adjust_underline_position = 2",
-                KnobChange::AdjustUnderline(2, 0),
-            ),
-            (
-                "adjust_underline_thickness = 1",
-                KnobChange::AdjustUnderline(0, 1),
-            ),
-            (
-                "underline_skip_descenders = false",
-                KnobChange::UnderlineSkipDescenders(false),
-            ),
-            (
-                "background_material = \"hud\"",
-                KnobChange::BackgroundMaterial(super::BackgroundMaterial::Hud),
-            ),
-        ];
-        for (toml, expected) in cases {
-            let knobs = knobs_of(&cfg(toml));
-            let changes = base.diff(&knobs);
-            assert_eq!(
-                changes,
-                vec![expected],
-                "{toml:?} must diff to exactly one renderer call"
-            );
-        }
-        let all = knobs_of(&cfg(
-            "line_height = 1.5\nminimum_contrast = 4.5\nadjust_baseline = 2",
-        ));
-        assert_eq!(all.diff(&base).len(), 3, "one change per reverted key");
-    }
-
-    #[test]
-    fn translucency_couples_opacity_to_the_contrast_floor() {
-        let base = RenderKnobs::default();
-        let glass = knobs_of(&cfg("background_opacity = 0.6"));
-        let changes = base.diff(&glass);
-        assert!(
-            changes.contains(&KnobChange::BackgroundOpacity(0.6)),
-            "opacity change must fire: {changes:?}"
-        );
-        assert!(
-            changes.contains(&KnobChange::MinimumContrast(4.5)),
-            "glass must auto-engage the WCAG-AA floor: {changes:?}"
-        );
-        assert_eq!(changes.len(), 2, "exactly the opacity + the auto-floor");
-
-        let glass_hi = knobs_of(&cfg("background_opacity = 0.6\nminimum_contrast = 7.0"));
-        let hi_base = knobs_of(&cfg("minimum_contrast = 7.0"));
-        assert_eq!(
-            hi_base.diff(&glass_hi),
-            vec![KnobChange::BackgroundOpacity(0.6)],
-            "an already-legible floor is not disturbed by engaging glass"
-        );
-
-        assert_eq!(
-            glass.diff(&base).len(),
-            2,
-            "revert drops opacity + auto-floor"
-        );
-    }
-}
+#[path = "app_config_w5_knob_tests.rs"]
+mod w5_knob_tests;
 
 #[cfg(test)]
-mod vibrancy_contrast_guarantee {
-    use super::Config;
-    use aterm_render::vibrancy::{CONTRAST_FLOOR, effective_minimum_contrast};
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn effective_minimum_contrast_is_the_renderers_law() {
-        let opacities: Vec<f32> = (0..=20).map(|i| i as f32 / 20.0).collect();
-        let contrasts = [1.0_f32, 2.0, 3.0, 4.5, 4.6, 7.0, 21.0];
-        for &o in &opacities {
-            for &c in &contrasts {
-                let config = cfg(&format!("background_opacity = {o}\nminimum_contrast = {c}"));
-                let base = config.minimum_contrast_or_default();
-                let opacity = config.background_opacity_or_default();
-                assert_eq!(
-                    config.effective_minimum_contrast().to_bits(),
-                    effective_minimum_contrast(base, opacity).to_bits(),
-                    "opacity={o} contrast={c}"
-                );
-            }
-        }
-
-        let default_glass = cfg("background_opacity = 0.5");
-        assert_eq!(default_glass.minimum_contrast_or_default(), 1.0);
-        assert_eq!(default_glass.effective_minimum_contrast(), CONTRAST_FLOOR);
-    }
-
-    #[test]
-    fn an_unset_minimum_contrast_floors_theme_pairs_on_windows_only() {
-        let unset = cfg("");
-        assert_eq!(unset.effective_minimum_contrast(), 1.0);
-        assert_eq!(
-            unset.applied_terminal_config().indexed_minimum_contrast,
-            if cfg!(windows) { 4.5 } else { 1.0 }
-        );
-        for set in ["minimum_contrast = 1.0", "minimum_contrast = 7.0"] {
-            let config = cfg(set);
-            assert_eq!(
-                config.applied_terminal_config().indexed_minimum_contrast,
-                1.0,
-                "{set}"
-            );
-        }
-    }
-}
+#[path = "app_config_vibrancy_contrast_guarantee_tests.rs"]
+mod vibrancy_contrast_guarantee;
 
 #[cfg(test)]
-mod config_token_tests {
-    use super::{
-        Config, RightClickGesture, TabBandHeight, TabMenuChord, WindowColorspace, WindowTheme,
-    };
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn enum_keys_parse_trimmed_any_case_with_aliases_and_fall_back() {
-        let theme = |t: &str| cfg(t).window_theme_or_default();
-        assert_eq!(theme("window_theme = \" Dark \""), WindowTheme::Dark);
-        assert_eq!(theme("window_theme = \"LIGHT\""), WindowTheme::Light);
-        assert_eq!(theme("window_theme = \"midnight\""), WindowTheme::Auto);
-        assert_eq!(theme(""), WindowTheme::Auto);
-
-        let band = |t: &str| cfg(t).tab_band_height_or_default();
-        let standard = "tab_band_height = \"  STANDARD \"";
-        assert_eq!(band(standard), TabBandHeight::Standard);
-        assert_eq!(
-            band("tab_band_height = \"compact\""),
-            TabBandHeight::Compact
-        );
-        let unknown = "tab_band_height = \"huge\"";
-        assert_eq!(band(unknown), TabBandHeight::PLATFORM_DEFAULT);
-
-        let click = |t: &str| cfg(t).right_click_or_default();
-        let copy_paste = "right_click = \" Copy-Paste \"";
-        assert_eq!(click(copy_paste), RightClickGesture::CopyPaste);
-        assert_eq!(
-            click("right_click = \"menu\""),
-            RightClickGesture::PLATFORM_DEFAULT
-        );
-        assert_eq!(click(""), RightClickGesture::PLATFORM_DEFAULT);
-
-        let space = |t: &str| cfg(t).window_colorspace_or_default();
-        let p3 = "window_colorspace = \" DisplayP3 \"";
-        assert_eq!(space(p3), WindowColorspace::DisplayP3);
-        assert_eq!(
-            space("window_colorspace = \"P3\""),
-            WindowColorspace::DisplayP3
-        );
-        let rec2020 = "window_colorspace = \"rec2020\"";
-        assert_eq!(space(rec2020), WindowColorspace::Srgb);
-        assert_eq!(space(""), WindowColorspace::Srgb);
-
-        for (source, chord, menu_key, shift_f10) in [
-            ("", TabMenuChord::MenuKey, true, false),
-            (
-                "tab_menu_chord = \"nope\"",
-                TabMenuChord::MenuKey,
-                true,
-                false,
-            ),
-            (
-                "tab_menu_chord = \" Menu-Key \"",
-                TabMenuChord::MenuKey,
-                true,
-                false,
-            ),
-            ("tab_menu_chord = \"BOTH\"", TabMenuChord::On, true, true),
-            ("tab_menu_chord = \"off\"", TabMenuChord::Off, false, false),
-        ] {
-            let got = cfg(source).tab_menu_chord_or_default();
-            assert_eq!(got, chord, "{source}");
-            assert_eq!(
-                (got.claims_menu_key(), got.claims_shift_f10()),
-                (menu_key, shift_f10),
-                "{source}"
-            );
-        }
-    }
-}
+#[path = "app_config_config_token_tests.rs"]
+mod config_token_tests;
 
 #[cfg(test)]
-mod decorative_effect_default_tests {
-    use super::{Config, DEFAULT_DECORATIVE_EFFECTS, default_cursor_trail_style};
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn the_trail_master_is_platform_split_and_its_two_neighbours_are_not() {
-        let fresh = Config::default();
-        assert_eq!(
-            fresh.cursor_trail_drawn(),
-            DEFAULT_DECORATIVE_EFFECTS,
-            "a fresh Windows config stands no resident cat on live output; \
-             elsewhere the delight stays on"
-        );
-        assert_eq!(
-            fresh.cursor_momentum_glow_or_default(),
-            DEFAULT_DECORATIVE_EFFECTS
-        );
-        assert_eq!(
-            cfg("font_px = 14.0").cursor_trail_drawn(),
-            DEFAULT_DECORATIVE_EFFECTS
-        );
-        assert!(fresh.cursor_trail_bloom_or_default());
-        assert!(fresh.sparkle_words_enabled_or_default());
-        assert!(cfg("cursor_trail_style = \"comet\"").cursor_trail_drawn());
-        assert!(!cfg("cursor_trail_style = \"off\"").cursor_trail_drawn());
-        assert!(!cfg("cursor_trail_bloom = false").cursor_trail_bloom_or_default());
-        assert!(!cfg("[sparkle_words]\nenabled = false").sparkle_words_enabled_or_default());
-    }
-
-    #[test]
-    fn the_retired_cursor_master_folds_into_its_successors() {
-        let mut naive_disagrees = false;
-        for master in [None, Some(true), Some(false)] {
-            for style in [None, Some("off"), Some("fire")] {
-                for glow in [None, Some(true), Some(false)] {
-                    let mut toml = String::new();
-                    if let Some(m) = master {
-                        toml.push_str(&format!("cursor_trail = {m}\n"));
-                    }
-                    if let Some(s) = style {
-                        toml.push_str(&format!("cursor_trail_style = \"{s}\"\n"));
-                    }
-                    if let Some(g) = glow {
-                        toml.push_str(&format!("cursor_momentum_glow = {g}\n"));
-                    }
-                    let c = cfg(&toml);
-                    let on = master.unwrap_or(DEFAULT_DECORATIVE_EFFECTS);
-                    let old_style = style.unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE);
-                    let old_drawn = on && old_style != "off";
-                    let old_glow = on && glow.unwrap_or(true);
-                    let (want_drawn, want_glow) = if master.is_some() || DEFAULT_DECORATIVE_EFFECTS
-                    {
-                        (old_drawn, old_glow)
-                    } else {
-                        (style.is_some_and(|s| s != "off"), glow.unwrap_or(false))
-                    };
-                    assert_eq!(c.cursor_trail_drawn(), want_drawn, "{toml}");
-                    assert_eq!(c.cursor_momentum_glow_or_default(), want_glow, "{toml}");
-                    let naive_drawn = style.unwrap_or(default_cursor_trail_style()).ne("off");
-                    naive_disagrees |= naive_drawn != want_drawn;
-                }
-            }
-        }
-        assert!(
-            naive_disagrees,
-            "the matrix catches a fold that ignores the old switch"
-        );
-    }
-}
+#[path = "app_config_decorative_effect_default_tests.rs"]
+mod decorative_effect_default_tests;
 
 #[cfg(test)]
-mod output_streak_cfg_tests {
-
-    use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
-    use aterm_effects::output_streak::{MAX_COMETS, TAIL_MAX, TAIL_MIN};
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn output_streak_keys_resolve_clamp_and_fail_toward_less_effect() {
-        assert_eq!(
-            cfg("[output_streak]\ntail = 12").output_streak_enabled_or_default(),
-            DEFAULT_DECORATIVE_EFFECTS
-        );
-        assert!(!cfg("[output_streak]\nenabled = false").output_streak_enabled_or_default());
-
-        type Read = fn(&Config) -> f64;
-        let intensity: Read = |c| f64::from(c.output_streak_intensity_or_default());
-        let tail: Read = |c| f64::from(c.output_streak_tail_or_default());
-        let streaks: Read = |c| f64::from(c.output_streak_max_streaks_or_default());
-        let idle: Read = |c| f64::from(c.output_streak_idle_secs_or_default());
-        for (key, read, value, expected) in [
-            ("intensity", intensity, "4.0", 1.0),
-            ("intensity", intensity, "-2.0", 0.0),
-            ("intensity", intensity, "nan", 0.0),
-            ("tail", tail, "4000", f64::from(TAIL_MAX)),
-            ("tail", tail, "0", f64::from(TAIL_MIN)),
-            ("max_streaks", streaks, "99", MAX_COMETS as f64),
-            ("max_streaks", streaks, "0", 1.0),
-            ("idle_secs", idle, "9000.0", 120.0),
-            ("idle_secs", idle, "0.0", 2.0),
-            ("idle_secs", idle, "nan", 2.0),
-        ] {
-            assert_eq!(
-                read(&cfg(&format!("[output_streak]\n{key} = {value}"))),
-                expected,
-                "{key} = {value}"
-            );
-        }
-    }
-
-    /// `idle_rest_secs`: unset never rests ([`DEFAULT_IDLE_REST_SECS`]); a value is clamped into
-    /// 2..=3600 s; zero, a negative, NaN or an infinity never rests (today's behaviour), never at
-    /// once.
-    #[test]
-    fn idle_rest_resolves_clamps_and_fails_toward_never() {
-        use std::time::{Duration, Instant};
-        assert_eq!(Config::default().idle_rest_or_default(), None);
-        for (value, expected) in [
-            ("45", Some(Duration::from_secs(45))),
-            ("2.5", Some(Duration::from_millis(2500))),
-            ("1", Some(Duration::from_secs(2))),
-            ("0.01", Some(Duration::from_secs(2))),
-            ("1e9", Some(Duration::from_secs(3600))),
-            ("0", None),
-            ("-1", None),
-            ("nan", None),
-            ("inf", None),
-            ("-inf", None),
-        ] {
-            assert_eq!(
-                cfg(&format!("idle_rest_secs = {value}")).idle_rest_or_default(),
-                expected,
-                "idle_rest_secs = {value}"
-            );
-        }
-        // A reload to `0` wakes a window that rested under the old setting.
-        let t0 = Instant::now();
-        let mut rest = crate::window_rest::Rest::new(t0);
-        let later = t0 + Duration::from_secs(60);
-        assert!(rest.settle(later, cfg("idle_rest_secs = 30").idle_rest_or_default()));
-        assert!(rest.resting());
-        assert!(rest.settle(later, cfg("idle_rest_secs = 0").idle_rest_or_default()));
-        assert!(!rest.resting());
-    }
-
-    #[test]
-    fn the_streak_warning_names_only_the_silently_unreachable_pip() {
-        assert!(Config::default().output_streak_warning().is_none());
-        assert!(
-            cfg("[output_streak]\ntail = 4000\nmax_streaks = 99\nidle_secs = 9000.0")
-                .output_streak_warning()
-                .is_none(),
-            "a documented clamp is not a warning in this repo"
-        );
-        assert!(
-            cfg("[output_streak]\nenabled = true\nsound = true")
-                .output_streak_warning()
-                .is_none()
-        );
-        let warning = cfg("[output_streak]\nenabled = false\nsound = true")
-            .output_streak_warning()
-            .expect("an unreachable pip is worth saying out loud");
-        assert!(
-            warning.contains("output_streak.sound"),
-            "the message names the key: {warning}"
-        );
-    }
-
-    #[test]
-    fn the_harness_words_name_every_limit_and_only_limits() {
-        let read = super::HarnessPolicy::read;
-        let words = |text: &str| read(text).words();
-        let automatic = words("");
-        for neutral in [
-            "[harness]\naccounts = \"early\"\n",
-            "[harness]\nanswer_text = \"ask me\"\n",
-            "[harness]\nquestion_priority = \"long-term\"\n",
-            "[harness]\nlimit_reset = true\n",
-            "[harness]\nlimit_reset = false\n",
-            "[harness]\nusage_tap = true\n",
-            "[harness]\nusage_notes = true\n",
-            "[harness]\nusage_notes = false\n",
-            "[harness]\nusage_credits = true\n",
-            "[harness]\nusage_credits = false\n",
-        ] {
-            assert_eq!(words(neutral), automatic, "{neutral}");
-        }
-        assert_eq!(
-            words("[harness]\nusage_tap = false\n"),
-            "Automatic, limited by 1 setting in aterm.toml",
-            "the tap ships on, so turning it off is a limit"
-        );
-        let safe = words("[harness]\napprove = \"safe\"\n");
-        assert_ne!(safe, automatic);
-        for own_roots in [
-            "[harness]\napprove = \"safe\"\ntrust_roots = []\n",
-            "[harness]\napprove = \"safe\"\ntrust_roots = [\"~/src/app*\"]\n",
-        ] {
-            assert_eq!(words(own_roots), safe, "{own_roots}");
-        }
-        let all = "[harness]\nheadless = false\napprove = \"none\"\ntrust_roots = []\n\
-                   answer_questions = false\nanswer_text = \"ask me\"\n\
-                   dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
-                   continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
-                   probe_api = false\nresume_limits = false\nlimit_wait = false\n\
-                   accounts = \"off\"\n\
-                   compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
-                   human_grace_s = 600\n";
-        for named in [
-            "[harness]\napprove = \"none\"\n",
-            "[harness]\nanswer_questions = false\n",
-            "[harness]\naccounts = \"wall\"\n",
-            all,
-        ] {
-            let said = words(named);
-            assert_ne!(said, automatic, "{named}");
-            for key in aterm_agent::supervise::config::KEYS {
-                assert!(
-                    !key.contains('_') || !said.contains(key),
-                    "{key} is a file's word, not the row's: {said}"
-                );
-            }
-            assert!(!said.contains(": "), "no `key: value`: {said}");
-        }
-        let off = words(&format!("{all}enabled = false\n"));
-        assert_eq!(
-            off,
-            words("[harness]\nenabled = false\n"),
-            "Off outranks every limit"
-        );
-        assert_ne!(off, automatic);
-        assert!(!super::HarnessPolicy::read("").policy.limit_reset);
-        assert!(!super::HarnessPolicy::read("").policy.usage_notes);
-        assert!(!super::HarnessPolicy::read("").policy.usage_credits);
-        assert_eq!(
-            read("[harness.claude]\nenabled = false\n").words(),
-            "Automatic, limited by Supervise Claude Code sessions set to Off"
-        );
-        assert_eq!(
-            read("[harness]\nautopilot = \"land\"\n[harness.codex]\nenabled = false\n").words(),
-            "Automatic, limited by Default autopilot set to Land; Enable codex-alab Autopilot set \
-             to Off"
-        );
-        assert_eq!(
-            read("[harness]\nautopilot = \"off\"\nrelaunch = false\n").words(),
-            "Automatic, limited by Default autopilot set to Off; 1 setting in aterm.toml"
-        );
-        assert_eq!(
-            read("[harness]\nrelaunch = false\n").words(),
-            "Automatic, limited by 1 setting in aterm.toml"
-        );
-        assert_eq!(read("[harness]\nrelaunch = false\n").file_limits(), 1);
-        assert_eq!(read("[harness]\napprove = \"none\"\n").file_limits(), 0);
-    }
-
-    #[test]
-    fn every_harness_rows_limit_is_named_by_its_row() {
-        let read = super::HarnessPolicy::read;
-        let mut limited = Vec::new();
-        for leaf in crate::prefs::NESTED_LEAVES
-            .iter()
-            .filter(|leaf| leaf.key.starts_with("harness."))
-            .filter(|leaf| leaf.key != crate::prefs::EDIT_HARNESS_ENABLED)
-        {
-            let (table, key) = leaf.key.rsplit_once('.').expect("a dotted key");
-            let values: Vec<String> = match leaf.kind {
-                crate::prefs::EditKind::Bool => vec!["false".to_string()],
-                crate::prefs::EditKind::Enum { options } => options
-                    .iter()
-                    .map(|option| format!("\"{option}\""))
-                    .collect(),
-                crate::prefs::EditKind::Text if leaf.key == crate::prefs::EDIT_HARNESS_LAND_AT => {
-                    let policy = read("[harness]\nland_at = \"18:00\"\n");
-                    assert!(
-                        policy.policy.against_default().limits.is_empty(),
-                        "land_at limits nothing: {}",
-                        policy.words()
-                    );
-                    assert_eq!(policy.file_limits(), 0, "land_at is no file limit");
-                    Vec::new()
-                }
-                kind => panic!("{}: a {kind:?} row", leaf.key),
-            };
-            for value in values {
-                let source = format!("[{table}]\n{key} = {value}\n");
-                let policy = read(&source);
-                if policy.policy.against_default().limits.is_empty() {
-                    continue;
-                }
-                let words = policy.words();
-                assert!(words.contains(leaf.label), "{source}: {words}");
-                assert!(!words.contains("aterm.toml"), "{source}: {words}");
-                assert_eq!(policy.file_limits(), 0, "{source}");
-                limited.push(leaf.key);
-            }
-        }
-        for key in [
-            crate::prefs::EDIT_HARNESS_CLAUDE_ENABLED,
-            crate::prefs::EDIT_HARNESS_CODEX_ENABLED,
-            crate::prefs::EDIT_HARNESS_AUTOPILOT,
-            crate::prefs::EDIT_HARNESS_APPROVE,
-            crate::prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
-        ] {
-            assert!(limited.contains(&key), "{key} limits: {limited:?}");
-        }
-        assert_eq!(read("[harness]\nrelaunch = false\n").file_limits(), 1);
-    }
-
-    #[test]
-    fn a_launch_that_could_not_load_the_file_still_reads_its_harness_lines() {
-        let text = "font_px = \n[harness]\ncontinue = false\napprove = \"safe\"\n";
-        assert!(Config::parse(text).is_err(), "the fixture is not a config");
-        let stand_in = Config::stand_in(text);
-        let p = &stand_in.harness.policy;
-        assert!(p.enabled && !p.continue_policy);
-        assert_eq!(p.approve, aterm_agent::supervise::config::Approve::Safe);
-        assert!(!stand_in.harness.notes.is_empty());
-        assert!(
-            stand_in.font_px.is_none(),
-            "every other setting at its default"
-        );
-        assert_eq!(
-            Config::stand_in("font_px = \n").harness.policy,
-            aterm_agent::supervise::SupervisorConfig::default()
-        );
-    }
-
-    #[test]
-    fn the_harness_table_is_the_supervisors_policy() {
-        let cfg = |text: &str| Config::parse(text).expect("valid config");
-        let text = "[harness]\ncontinue = false\n";
-        assert!(cfg(text) != cfg("[harness]\ncontinue = true\n"));
-
-        let bad = "[harness]\ncontinue = \"maybe\"\nheadless = false\ncontine = true\n";
-        let notices = cfg(bad).harness_notices();
-        assert_eq!(notices.len(), 1, "the unknown key is the config language's");
-        assert!(
-            notices[0].starts_with("config harness.continue:") && notices[0].contains("maybe"),
-            "{notices:?}"
-        );
-        let ignored = crate::native_config_language::key_warnings(bad).ignored;
-        assert!(ignored.iter().any(|l| l.contains("contine")), "{ignored:?}");
-
-        let text = "[harness]\napprove = \"everything\"\n";
-        let told = cfg(text).harness_notices();
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert_eq!(
-            super::unaccepted_value_notices(text, &told),
-            Vec::<String>::new()
-        );
-        assert_eq!(super::unaccepted_value_notices(text, &[]).len(), 1);
-
-        let misplaced = cfg("[packages]\nharness.enabled = false\n");
-        assert!(!misplaced.harness.policy.enabled);
-        assert!(
-            misplaced.harness_notices()[0].contains("`packages.harness.enabled`"),
-            "{:?}",
-            misplaced.harness_notices()
-        );
-    }
-
-    /// THE OWNER'S TABLES RIDE THE POLICY: the mode and the tables a window adopts come from one
-    /// parse of one text, and a copy written below another table's header is no table at all
-    /// (NEGATIVE CONTROL: the same rule at the root reads).
-    #[test]
-    fn the_owner_tables_ride_the_harness_policy_from_the_root_alone() {
-        let cfg = |text: &str| Config::parse(text).expect("valid config");
-        let rule = "occupancy_rule]]\nname = \"r\"\nwhen = \"workflow.returned\"\n\
-                    text = \"Re-read the base.\"\n";
-        let root = format!("[harness]\noccupancy = \"prompt\"\n\n[[harness.{rule}");
-        let read = cfg(&root);
-        assert_eq!(read.harness, super::HarnessPolicy::read(&root));
-        assert_eq!(read.harness.owner.rules().len(), 1);
-        assert!(
-            read.harness_notices().is_empty(),
-            "{:?}",
-            read.harness_notices()
-        );
-
-        let misplaced = cfg(&format!("[packages]\n\n[[packages.harness.{rule}"));
-        assert!(
-            misplaced.harness.owner.is_empty(),
-            "{:?}",
-            misplaced.harness.owner
-        );
-        assert_eq!(
-            misplaced.harness.policy.occupancy,
-            aterm_agent::supervise::SupervisorConfig::default().occupancy
-        );
-        let notices = misplaced.harness_notices();
-        assert!(
-            notices.len() == 1
-                && notices[0].contains("`packages.harness.occupancy_rule`")
-                && notices[0].contains("root [harness] table alone")
-                && !notices[0].contains("Re-read"),
-            "{notices:?}"
-        );
-    }
-}
+#[path = "app_config_output_streak_cfg_tests.rs"]
+mod output_streak_cfg_tests;
 
 #[cfg(test)]
-mod tab_band_height_tests {
-    #[cfg(windows)]
-    use super::Config;
-    use super::{TabBandHeight, synthetic_band_head_px};
-
-    #[cfg(windows)]
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[cfg(windows)]
-    fn window_cell(config: &Config) -> ((usize, usize), i32, String) {
-        let face = Config::font_family_admission(config.font_family_request().as_deref())
-            .expect("the family is admitted");
-        let mut r = aterm_render::Renderer::from_system_with_face(
-            face.as_ref(),
-            super::resolve_font_px(config),
-            aterm_render::Theme::default(),
-        )
-        .expect("a face");
-        r.set_line_height(config.line_height_or_default());
-        (
-            r.cell_size(),
-            r.baseline(),
-            r.primary_source_path().unwrap_or_default().to_string(),
-        )
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_defaults_draw_the_judged_9x23_cell() {
-        assert_eq!(crate::FONT_PX, 17.0);
-        assert_eq!(super::DEFAULT_LINE_HEIGHT, 1.1);
-        assert_eq!(
-            window_cell(&Config::default()),
-            (
-                (9, 23),
-                17,
-                aterm_render::bundled::IOSEVKA_SEMIBOLD_ID.to_string()
-            )
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn three_lines_restore_the_cascadia_9x21_cell() {
-        let family = aterm_render::bundled::CASCADIA_FAMILY;
-        if aterm_render::resolve_font_family(family, aterm_render::FaceTarget::REGULAR).is_some() {
-            aterm_spec::host::could_not_run(format!(
-                "{family} is installed on this host, and an installed face wins the name"
-            ));
-        }
-        let old = cfg("font_family = \"Cascadia Mono PL\"\nfont_px = 16\nline_height = 1.0\n");
-        assert_eq!(
-            window_cell(&old),
-            ((9, 21), 15, aterm_render::bundled::CASCADIA_ID.to_string())
-        );
-        let lh = cfg("font_family = \"Cascadia Mono PL\"\nfont_px = 16\n");
-        assert_ne!(window_cell(&lh).0, (9, 21));
-        let px = cfg("font_family = \"Cascadia Mono PL\"\nline_height = 1.0\n");
-        assert_ne!(window_cell(&px).0, (9, 21));
-    }
-
-    #[test]
-    fn synthetic_band_head_law() {
-        let target = TabBandHeight::Standard.target_logical_px();
-        let band = target as usize;
-        let band_150 = (f64::from(target) * 1.5).round() as usize;
-        let cap = 10 * super::SYNTHETIC_BAND_HEAD_CELL_CAP;
-        for (case, (t, pad_top, rows, cell_h, scale), expected) in [
-            ("no strip", (target, 2, 0, 21, 1.0), 0),
-            (
-                "96 dpi totals the target",
-                (target, 2, 1, 21, 1.0),
-                band - 2 - 21,
-            ),
-            (
-                "150% re-derives",
-                (target, 3, 1, 28, 1.5),
-                band_150 - 3 - 28,
-            ),
-            (
-                "one row absorbs the target",
-                (target, 2, 1, band - 2, 1.0),
-                0,
-            ),
-            ("two rows absorb it", (target, 2, 2, 21, 1.0), 0),
-            ("oversized target caps", (4000.0, 0, 1, 10, 1.0), cap),
-            ("+inf target caps", (f32::INFINITY, 0, 1, 10, 1.0), cap),
-            ("NaN target", (f32::NAN, 2, 1, 21, 1.0), 0),
-            ("zero target", (0.0, 2, 1, 21, 1.0), 0),
-            ("negative target", (-32.0, 2, 1, 21, 1.0), 0),
-        ] {
-            assert_eq!(
-                synthetic_band_head_px(t, pad_top, rows, cell_h, scale),
-                expected,
-                "{case}"
-            );
-        }
-        let at_1x = synthetic_band_head_px(32.0, 2, 1, 21, 1.0);
-        assert_ne!(at_1x, 0, "control: a finite positive target has a head");
-        for scale in [f64::NAN, f64::INFINITY, 0.0, -2.0] {
-            assert_eq!(
-                synthetic_band_head_px(32.0, 2, 1, 21, scale),
-                at_1x,
-                "scale {scale}"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_shipped_windows_face_reaches_the_standard_band() {
-        let Some(renderer) =
-            aterm_render::Renderer::from_system(crate::FONT_PX, aterm_render::Theme::default())
-        else {
-            aterm_spec::host::could_not_run("no system monospace font here");
-        };
-        let target = TabBandHeight::Standard.target_logical_px();
-        let pad_logical = Config::default().window_padding_top_or_default();
-        let mut renderer = renderer;
-        renderer.set_line_height(Config::default().line_height_or_default());
-        for scale in [1.0_f64, 1.5] {
-            let px = crate::font_px_for_scale(crate::FONT_PX, scale);
-            renderer.set_px(px);
-            let (_, cell_h) = renderer.cell_size();
-            let pad_top = crate::logical_to_device_px(pad_logical, scale);
-            let head = synthetic_band_head_px(target, pad_top, 1, cell_h, scale);
-            let band = head + pad_top + cell_h;
-            crate::logging::stderr_line!(
-                "C3 band at scale {scale}: font_px={px} cell_h={cell_h} pad_top={pad_top} \
-                 before={} head={head} band={band}",
-                pad_top + cell_h
-            );
-            if head > 0 {
-                assert_eq!(
-                    band,
-                    crate::logical_to_device_px(target, scale),
-                    "the band lands ON the WinUI target at scale {scale}"
-                );
-            } else {
-                assert!(
-                    band >= crate::logical_to_device_px(target, scale),
-                    "a zero head is only correct when the strip already fills the band"
-                );
-            }
-        }
-    }
-}
+#[path = "app_config_tab_band_height_tests.rs"]
+mod tab_band_height_tests;
 
 #[cfg(test)]
-mod window_padding_tests {
-    use super::Config;
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn window_padding_clamps_and_rejects_non_finite() {
-        type Read = fn(&Config) -> f32;
-        let base: Read = Config::window_padding_or_default;
-        let top: Read = Config::window_padding_top_or_default;
-        for (source, read, expected) in [
-            ("window_padding = 20.0", base, 20.0),
-            ("window_padding = -3.0", base, 0.0),
-            ("window_padding = 500.0", base, super::MAX_WINDOW_PADDING_PX),
-            ("window_padding = nan", base, crate::PAD_LOGICAL_PX),
-            ("window_padding_top = 6.0", top, 6.0),
-            ("window_padding = 4.0\nwindow_padding_top = 9.0", top, 4.0),
-            ("window_padding = 1.0", top, 1.0),
-            ("window_padding_top = -2.0", top, 0.0),
-            ("window_padding_top = inf", top, crate::PAD_TOP_LOGICAL_PX),
-        ] {
-            assert_eq!(read(&cfg(source)), expected, "{source}");
-        }
-    }
-}
+#[path = "app_config_window_padding_tests.rs"]
+mod window_padding_tests;
 
 #[cfg(test)]
-mod headless_boot_metrics_tests {
-    #[test]
-    fn asymmetric_vertical_padding_round_trips_resize_with_remainder() {
-        use aterm_window::dpi::PhysicalSize;
-
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.tab_strip_rows = 0;
-        app.backend.set_pad(12);
-        app.backend.set_pad_top(2);
-        app.backend.set_head(5);
-        {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            ws.metrics.pad = 12;
-            ws.metrics.pad_top = 2;
-            ws.metrics.head = 5;
-        }
-        let (cw, ch) = app.win_cell_size(wid);
-        let (rows, cols) = (24usize, 80usize);
-        let exact = PhysicalSize::new((cols * cw + 24) as u32, (rows * ch + 5 + 2 + 12) as u32);
-        assert_eq!(app.grid_dims_for(wid, exact), (24, 80));
-
-        let remainder = ch.saturating_sub(1);
-        let with_remainder = PhysicalSize::new(exact.width, exact.height + remainder as u32);
-        assert_eq!(app.grid_dims_for(wid, with_remainder), (24, 80));
-
-        let old_symmetric_rows =
-            aterm_render::pad_split((exact.height as usize).saturating_sub(5), 12, ch).cells;
-        assert!(
-            old_symmetric_rows < rows,
-            "negative control: conserving 2*pad cannot invert the shorter visible frame"
-        );
-    }
-
-    #[test]
-    fn headless_boot_band_survives_a_delta_config_reload() {
-        let mut app = crate::App::headless_for_test();
-        app.backend.set_pad(12);
-        app.backend.set_head(60);
-        app.seed_headless_boot_metrics();
-        let armed = app.backend.frame_size(24, 80);
-        app.refresh_all_window_metrics();
-        let ws = app.windows.get(&crate::WindowId(0)).expect("window 0");
-        assert_eq!(ws.metrics.head, 60, "the record keeps the sealed band");
-        assert_eq!(ws.metrics.pad, 12, "the record keeps the sealed pad");
-        assert_eq!(
-            ws.metrics.pad_top, 12,
-            "the record keeps the sealed symmetric top origin"
-        );
-        app.apply_window_scale(crate::WindowId(0));
-        assert_eq!(app.backend.head(), 60, "the band survives the reload");
-        assert_eq!(app.backend.pad(), 12, "the boot pad survives the reload");
-        assert_eq!(
-            app.backend.pad_top(),
-            12,
-            "the top origin survives the reload"
-        );
-        assert_eq!(
-            app.backend.frame_size(24, 80),
-            armed,
-            "the first present's frame still matches the armed tap geometry"
-        );
-    }
-}
+#[path = "app_config_headless_boot_metrics_tests.rs"]
+mod headless_boot_metrics_tests;
 
 #[cfg(test)]
-mod split_theme_tests {
-    use super::{Config, ThemeCatalog, theme_misses, theme_selector_notice};
-    use aterm_types::Appearance;
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn theme_name_resolves_per_appearance() {
-        for (source, dark, light) in [
-            (
-                r#"theme = "Tokyo Night""#,
-                Some("Tokyo Night"),
-                Some("Tokyo Night"),
-            ),
-            (
-                r#"theme = "dark:Dracula,light:GitHub Light""#,
-                Some("Dracula"),
-                Some("GitHub Light"),
-            ),
-            (
-                r#"theme = " DARK : Solarized Dark , Light : Solarized Light ""#,
-                Some("Solarized Dark"),
-                Some("Solarized Light"),
-            ),
-        ] {
-            let c = cfg(source);
-            assert_eq!(
-                c.resolve_theme_name(Appearance::Dark).as_deref(),
-                dark,
-                "{source}"
-            );
-            assert_eq!(
-                c.resolve_theme_name(Appearance::Light).as_deref(),
-                light,
-                "{source}"
-            );
-        }
-        let split = cfg(r#"theme = "dark:Dracula,light:GitHub Light""#);
-        assert_eq!(
-            split.theme_for(Appearance::Dark).bg,
-            cfg(r#"theme = "Dracula""#).theme_for(Appearance::Dark).bg
-        );
-        assert_eq!(split.theme_for(Appearance::Light).bg, 0x00FF_FFFF);
-    }
-
-    #[test]
-    fn split_omitted_side_draws_the_named_side() {
-        let c = cfg(r#"theme = "light:GitHub Light""#);
-        for appearance in [Appearance::Dark, Appearance::Light] {
-            assert_eq!(
-                c.resolve_theme_name(appearance).as_deref(),
-                Some("GitHub Light")
-            );
-        }
-        assert_eq!(c.theme_for(Appearance::Dark).bg, 0x00FF_FFFF);
-        assert!(theme_misses(&c, &ThemeCatalog::empty()).is_empty());
-    }
-
-    #[test]
-    fn split_omitted_side_draws_the_builtin_pair() {
-        let c = cfg(r#"theme = "dark:Gruvbox Dark""#);
-        assert_eq!(
-            c.resolve_theme_name(Appearance::Light).as_deref(),
-            Some("Gruvbox Light")
-        );
-        assert_eq!(
-            c.theme_for(Appearance::Light),
-            cfg(r#"theme = "Gruvbox Light""#).theme_for(Appearance::Light)
-        );
-        assert_ne!(
-            c.theme_for(Appearance::Light),
-            c.theme_for(Appearance::Dark)
-        );
-        let user = cfg(r#"theme = "dark:Studio""#);
-        assert_eq!(
-            user.resolve_theme_name(Appearance::Light).as_deref(),
-            Some("Studio")
-        );
-        let notice = theme_selector_notice(Some("dark:Gruvbox Dark,lite:x")).expect("an issue");
-        assert!(
-            notice.ends_with(r#"light mode uses "Gruvbox Light""#),
-            "{notice}"
-        );
-    }
-
-    #[test]
-    fn theme_misses_include_selector_issues() {
-        let themes = ThemeCatalog::empty();
-        let misses = |theme: &str| {
-            theme_misses(
-                &Config {
-                    theme: Some(theme.to_string()),
-                    ..Default::default()
-                },
-                &themes,
-            )
-        };
-        let selector = |theme: &str| theme_selector_notice(Some(theme));
-        let c = cfg(r#"theme = "dark:Nord,dark:Dracula""#);
-        assert_eq!(
-            c.resolve_theme_name(Appearance::Dark).as_deref(),
-            Some("Nord")
-        );
-        assert_eq!(
-            misses("dark:Nord,dark:Dracula"),
-            vec![selector("dark:Nord,dark:Dracula").unwrap()]
-        );
-        assert_eq!(misses("dark:Nord,lite:Dracula").len(), 1);
-        assert_eq!(misses("dark:Nord,light:Nope,light:Dracula").len(), 2);
-        for clean in ["Nord", "dark:Nord,light:GitHub Light", "dark:Nord"] {
-            assert_eq!(selector(clean), None, "{clean:?}");
-            assert!(misses(clean).is_empty(), "{clean:?}");
-        }
-        assert!(theme_selector_notice(None).is_none());
-    }
-
-    #[test]
-    fn applied_terminal_config_tracks_split() {
-        let c = cfg(r#"theme = "dark:Dracula,light:GitHub Light""#);
-        let rgb = |packed: u32| {
-            aterm_types::Rgb::new(
-                ((packed >> 16) & 0xff) as u8,
-                ((packed >> 8) & 0xff) as u8,
-                (packed & 0xff) as u8,
-            )
-        };
-        assert_ne!(
-            c.applied_terminal_config_for(Appearance::Dark)
-                .default_background,
-            c.applied_terminal_config_for(Appearance::Light)
-                .default_background
-        );
-        for side in [Appearance::Dark, Appearance::Light] {
-            let engine = c.applied_terminal_config_for(side);
-            let theme = c.theme_for(side);
-            assert_eq!(engine.default_background, rgb(theme.bg), "{side:?}");
-            assert_eq!(
-                engine.cursor_color,
-                Some(rgb(theme.cursor)),
-                "{side:?}: the OSC 112 reset baseline"
-            );
-            assert_eq!(
-                engine.selection_background,
-                Some(rgb(theme.selection)),
-                "{side:?}: the OSC 117 reset baseline"
-            );
-        }
-    }
-
-    #[test]
-    fn applied_terminal_config_preserves_selected_text_override() {
-        let c = cfg("selection_foreground = \"#123456\"");
-        assert_eq!(
-            c.applied_terminal_config().selection_foreground,
-            Some(aterm_types::Rgb::new(0x12, 0x34, 0x56))
-        );
-    }
-}
+#[path = "app_config_split_theme_tests.rs"]
+mod split_theme_tests;
 
 #[cfg(test)]
-mod reload_dedupe_tests {
-    use super::Config;
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn path_feed_fingerprints_track_referenced_file_content() {
-        let dir = std::env::temp_dir().join(format!("aterm-feed-fp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lex = dir.join("lexicon.toml");
-        std::fs::write(&lex, "one").unwrap();
-        let config = cfg(&format!(
-            "[sparkle_words]\nlexicon = {}\n",
-            super::toml_basic_string(&lex.to_string_lossy())
-        ));
-        let base = config.path_feed_fingerprints();
-        assert_eq!(
-            base,
-            config.path_feed_fingerprints(),
-            "untouched files fingerprint stably"
-        );
-        std::fs::write(&lex, "two").unwrap();
-        let lexed = config.path_feed_fingerprints();
-        assert_ne!(lexed.deco, base.deco, "lexicon content feeds deco");
-        std::fs::remove_file(&lex).unwrap();
-        assert_ne!(
-            config.path_feed_fingerprints().deco,
-            lexed.deco,
-            "a vanished lexicon file reads as changed"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn path_feed_generation_binds_consumer_and_fingerprint_to_one_read() {
-        use std::hash::Hasher as _;
-
-        let dir =
-            std::env::temp_dir().join(format!("aterm-feed-generation-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lexicon = dir.join("lexicon.toml");
-        let v1 = "# generation-v1\n";
-        let v2 = "# generation-v2\n";
-        std::fs::write(&lexicon, v1).unwrap();
-        let lexicon_path = lexicon.to_string_lossy().into_owned();
-        let config = cfg(&format!("[sparkle_words]\nlexicon = {lexicon_path:?}\n"));
-        let model = aterm_models_misc::path_feed_snapshot_model();
-        let mut model_state = model.init_state();
-        let v1_fingerprint = config.path_feed_fingerprints().deco;
-
-        let mut reads = 0;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let (_, admitted) = super::read_and_fingerprint_path_feed_with_reader(
-            &lexicon_path,
-            aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
-            &mut hasher,
-            |admitted_path, max_bytes| {
-                reads += 1;
-                let admitted =
-                    aterm_effects::file_feed::read_bounded_regular_utf8(admitted_path, max_bytes);
-                std::fs::write(&lexicon, v2).unwrap();
-                admitted
-            },
-        );
-        let admitted_fingerprint = hasher.finish();
-        for action in ["Read", "LiveMutate", "Publish"] {
-            assert!(
-                model.fire(action, &mut model_state),
-                "{action}: {model_state:?}"
-            );
-        }
-        assert!(model.check_invariant("PublishedPairComesFromAdmittedRead", &model_state));
-        assert_eq!(model_state["prepared"], 1);
-        assert_eq!(model_state["fingerprint"], 1);
-        assert_eq!(model_state["live"], 2);
-        assert_eq!(reads, 1, "the configured path is opened exactly once");
-        assert_eq!(
-            admitted.as_deref(),
-            Ok(v1),
-            "the consumer holds the admitted v1"
-        );
-        assert_eq!(
-            admitted_fingerprint, v1_fingerprint,
-            "Tier-1 projection: prepared=1 and fingerprint=1 derive from the admitted v1 String"
-        );
-        assert_ne!(
-            admitted_fingerprint,
-            config.path_feed_fingerprints().deco,
-            "Tier-1 negative control: the v1 consumer never carries the live v2 fingerprint"
-        );
-
-        let replacement = config.prepare_path_feed_generation();
-        assert_eq!(
-            replacement.fingerprints,
-            config.path_feed_fingerprints(),
-            "the next generation admits and identifies the replacement bytes"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn disabled_sparkle_performs_no_path_feed_reads() {
-        let dir = std::env::temp_dir().join(format!("aterm-disabled-feed-{}", std::process::id()));
-        let lexicon = dir.join("lexicon.toml");
-        let toy = dir.join("toy.toml");
-        let disabled = cfg(&format!(
-            "[sparkle_words]\nenabled = false\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
-            lexicon.to_string_lossy(),
-            toy.to_string_lossy(),
-        ));
-
-        super::reset_path_feed_read_count();
-        let prepared = disabled.prepare_path_feed_generation();
-        assert_eq!(super::path_feed_read_count(), 0);
-        assert_eq!(prepared.sparkle.consumer_capabilities(), Default::default());
-
-        let enabled = cfg(&format!(
-            "[sparkle_words]\nenabled = true\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
-            lexicon.to_string_lossy(),
-            toy.to_string_lossy(),
-        ));
-        super::reset_path_feed_read_count();
-        let _ = enabled.prepare_path_feed_generation();
-        assert_eq!(
-            super::path_feed_read_count(),
-            2,
-            "negative control: enabling the same two configured feeds admits each once"
-        );
-    }
-
-    #[test]
-    fn the_launch_generation_lands_the_same_kitty_vocabulary_after_the_join() {
-        let config = cfg("[sparkle_words]\nlanguages = [\"en\", \"es\"]\n");
-        let reload = config.prepare_path_feed_generation();
-        let held = super::TRICKS_COMPILE_GATE
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (handed_tx, handed) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = handed_tx.send(config.prepare_launch_path_feed_generation());
-        });
-        let launch = handed
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("the launch generation is handed over while its vocabulary compiles");
-        let mut scratch = String::new();
-        assert_eq!(
-            launch.sparkle.tricks().classify("sit", &mut scratch),
-            None,
-            "handed over before its vocabulary landed: a press reads the empty one"
-        );
-        drop(held);
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the launch generation's kitty vocabulary to land",
-            || launch.sparkle.0.tricks.built.get().map(|_| ()),
-        );
-        assert!(
-            reload
-                .sparkle
-                .tricks()
-                .classify("sit", &mut scratch)
-                .is_some(),
-            "negative control: a compiled vocabulary knows `sit`"
-        );
-        for word in ["sit", "kitty", "please", "siéntate", "sientate", "compile"] {
-            assert_eq!(
-                launch.sparkle.tricks().classify(word, &mut scratch),
-                reload.sparkle.tricks().classify(word, &mut scratch),
-                "{word}"
-            );
-        }
-        assert_eq!(
-            launch.sparkle.tricks().surface_count(),
-            reload.sparkle.tricks().surface_count()
-        );
-    }
-
-    /// A slot shares a table of the same languages while a generation holds it, builds another for
-    /// other languages, and keeps nothing once none does. The slot is this test's own, so no other
-    /// thread's generation can take it.
-    #[test]
-    fn a_vocabulary_slot_shares_what_a_generation_holds_and_keeps_nothing_after() {
-        let slot: super::TableSlot<usize> = std::sync::Mutex::new(None);
-        let (en, es) = (["en".to_string()], ["es".to_string()]);
-        let builds = std::cell::Cell::new(0);
-        let build = || {
-            builds.set(builds.get() + 1);
-            builds.get()
-        };
-        let (first, shared) = super::shared_table(&slot, &en, build);
-        assert!(!shared, "an empty slot shares nothing");
-        let (second, shared) = super::shared_table(&slot, &en, build);
-        assert!(shared, "a held table is shared");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "the second generation holds the first's table"
-        );
-        assert_eq!(builds.get(), 1, "a shared table is not built again");
-
-        let table = std::sync::Arc::downgrade(&first);
-        drop((first, second));
-        assert!(
-            table.upgrade().is_none(),
-            "the slot keeps a table no generation holds"
-        );
-        let (rebuilt, shared) = super::shared_table(&slot, &en, build);
-        assert!(!shared, "a table no generation holds is rebuilt");
-        assert_eq!(builds.get(), 2, "a table no generation holds is rebuilt");
-
-        let (other, shared) = super::shared_table(&slot, &es, build);
-        assert!(!shared, "other languages share nothing");
-        assert!(!std::sync::Arc::ptr_eq(&rebuilt, &other));
-        assert_eq!(builds.get(), 3, "other languages build their own table");
-    }
-
-    /// Each generation logs the lexicon's warnings whether it built the tables or shares them (those
-    /// lines read this generation's `cjk_single_char`), and the real slots keep nothing once no
-    /// generation holds the tables. The language is this test's own, so no other generation can hold
-    /// them; another thread's generation may take the slot between the two here, which only makes
-    /// the second compile, so that the two share is not held here but by
-    /// [`a_vocabulary_slot_shares_what_a_generation_holds_and_keeps_nothing_after`]. The vocabulary's
-    /// own lines are not read here: they come of malformed embedded data alone, which
-    /// `aterm_lexicon`'s suite holds to none, so no language raises one.
-    #[test]
-    fn each_generation_logs_its_vocabulary_warnings_and_no_slot_outlives_them() {
-        let config = cfg("[sparkle_words]\nenabled = true\nlanguages = [\"zz-this-test\"]\n");
-        let lines = || super::CONFLICT_LINES.with(|lines| lines.replace(0));
-        let _ = lines();
-        let first = config.prepare_sparkle_runtime();
-        let logged = lines();
-        assert!(logged >= 1, "an unknown language warns in the lexicon");
-        let second = config.prepare_sparkle_runtime();
-        assert_eq!(
-            lines(),
-            logged,
-            "the second generation logs what the first did"
-        );
-        let tricks = std::sync::Arc::downgrade(&second.0.tricks.built);
-        let lexicon =
-            std::sync::Arc::downgrade(&second.resolved().expect("sparkle is enabled").lexicon);
-        drop((first, second));
-        assert!(
-            tricks.upgrade().is_none() && lexicon.upgrade().is_none(),
-            "a slot keeps a table no generation holds"
-        );
-    }
-
-    #[test]
-    fn an_unlanded_kitty_vocabulary_classifies_nothing() {
-        let unlanded = super::TrickVocabulary {
-            built: std::sync::Arc::default(),
-            lazy_langs: None,
-        };
-        let mut scratch = String::new();
-        assert_eq!(unlanded.get().classify("sit", &mut scratch), None);
-        assert_eq!(unlanded.get().surface_count(), 0);
-        assert!(
-            super::TrickVocabulary::compiled(vec!["en".to_string()])
-                .get()
-                .classify("sit", &mut scratch)
-                .is_some(),
-            "negative control: the compiled vocabulary knows `sit`"
-        );
-    }
-
-    #[test]
-    fn path_feed_fingerprints_enforce_the_loader_specific_caps() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-feed-caps-")
-            .suffix(".noindex")
-            .tempdir()
-            .expect("scratch dir");
-        let lexicon = dir.path().join("lexicon.toml");
-        let toy = dir.path().join("toy.toml");
-        let config = cfg(&format!(
-            "[sparkle_words]\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
-            lexicon.to_string_lossy(),
-            toy.to_string_lossy(),
-        ));
-        let missing = config.path_feed_fingerprints();
-
-        std::fs::write(
-            &lexicon,
-            vec![b'x'; aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES + 1],
-        )
-        .unwrap();
-        std::fs::write(
-            &toy,
-            vec![b'x'; aterm_effects::spec::MAX_TOY_PACK_BYTES + 1],
-        )
-        .unwrap();
-        assert_eq!(
-            config.path_feed_fingerprints(),
-            missing,
-            "oversized inputs are rejected exactly like the loaders, not hashed past their caps"
-        );
-
-        std::fs::write(&lexicon, "# admitted lexicon\n").unwrap();
-        std::fs::write(&toy, "# admitted toy manifest bytes\n").unwrap();
-        let admitted = config.path_feed_fingerprints();
-        assert_ne!(admitted.deco, missing.deco);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn path_feed_fingerprint_and_loaders_refuse_a_writerless_fifo() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-feed-fifo-")
-            .suffix(".noindex")
-            .tempdir()
-            .expect("scratch dir");
-        let path = dir.path().join("feed.fifo");
-        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
-        // SAFETY: `path_c` is a live NUL-terminated pathname and mkfifo retains no pointer. The path is inside a unique tempdir owned by this test.
-        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
-        let config = cfg(&format!(
-            "[sparkle_words]\nlexicon = {0:?}\ntoy_packs = [{0:?}]\n",
-            path.to_string_lossy(),
-        ));
-        let fifo_fingerprint = config.path_feed_fingerprints();
-        let _ = config.sparkle_runtime_parts();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            config.path_feed_fingerprints(),
-            fifo_fingerprint,
-            "a FIFO and a missing file are both rejected admissions"
-        );
-    }
-
-    #[test]
-    fn byte_equal_reload_still_rereads_touched_path_feed_files() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-feed-touch-")
-            .suffix(".noindex")
-            .tempdir()
-            .expect("scratch dir");
-        let lex = dir.path().join("lexicon.toml");
-        std::fs::write(&lex, "# lexicon v1\n").unwrap();
-
-        let mut app = crate::App::headless_for_test();
-        app.config = cfg(&format!(
-            "[sparkle_words]\nlexicon = {}\n",
-            super::toml_basic_string(&lex.to_string_lossy())
-        ));
-        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
-        app.path_feed_fps = app.config.path_feed_fingerprints();
-        app.recompute_sparkle();
-        assert!(!app.sparkle_dirty, "recompute clears the dirty latch");
-
-        let (deco_cfg, lexicon) = {
-            let r = app.sparkle.as_ref().expect("sparkle resolves on defaults");
-            (r.cfg.clone(), r.lexicon.clone())
-        };
-        let wid = crate::WindowId(0);
-        let seed_scan = |app: &mut crate::App| {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            ws.fx.decos_mut().rescan_from_cells(
-                &[],
-                &[],
-                0,
-                0,
-                &lexicon,
-                &deco_cfg,
-                7,
-                std::time::Instant::now(),
-            );
-            assert!(
-                !ws.fx.decos().needs_rescan(7),
-                "probe seeded: scanned at epoch 7"
-            );
-        };
-        seed_scan(&mut app);
-
-        let fresh = app.config.path_feed_fingerprints();
-        app.refresh_path_feeds(fresh);
-        assert!(!app.sparkle_dirty, "nothing changed ⇒ no recompute re-arm");
-        assert!(
-            !app.windows[&wid].fx.decos().needs_rescan(7),
-            "…and no word-deco reset (the settings-commit + watcher dedupe win)"
-        );
-
-        std::fs::write(&lex, "# lexicon v2\n").unwrap();
-        let fresh = app.config.path_feed_fingerprints();
-        app.refresh_path_feeds(fresh);
-        assert!(
-            app.sparkle_dirty,
-            "lexicon content change re-arms the recompute"
-        );
-        assert!(
-            app.windows[&wid].fx.decos().needs_rescan(7),
-            "changed lexicon hard-resets the per-window decorations"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn deco_feed_gate_sees_lexicon_content_behind_an_unrelated_edit() {
-        let old = cfg("font_px = 12.0\n");
-        let new = cfg("font_px = 14.0\n");
-        assert!(
-            !super::deco_feed_changed(&old, &new, 7, 7),
-            "an unrelated edit with unchanged feeds must not wipe decorations"
-        );
-        assert!(
-            super::deco_feed_changed(&old, &new, 8, 7),
-            "a lexicon-file edit behind an unrelated config edit must reset"
-        );
-        let sparkled = cfg("font_px = 12.0\n[sparkle_words]\nenabled = false\n");
-        assert!(
-            super::deco_feed_changed(&old, &sparkled, 7, 7),
-            "a [sparkle_words] table edit resets as before"
-        );
-    }
-}
+#[path = "app_config_reload_dedupe_tests.rs"]
+mod reload_dedupe_tests;
 
 /// The size a headless window was given and the `(rows, cols, chrome rows)` it lays that out as
 /// ([`App::held_inner_px`]): the size stands while that grid does.
@@ -11723,1296 +8517,29 @@ pub(crate) fn tell_least_inner_size(w: &aterm_window::window::Window, least: Phy
 }
 
 #[cfg(test)]
-mod least_window_size_tests {
-    use crate::native_appearance::{
-        AppearancePreferences, current_preferences, install_preferences,
-    };
-    use crate::native_settings::{SettingsRoute, least_view};
-    use aterm_window::dpi::PhysicalSize;
-
-    fn at_text_scale(scale: f32) {
-        install_preferences(AppearancePreferences {
-            text_scale: scale,
-            ..current_preferences()
-        });
-    }
-
-    /// Window `wid` asked for one pixel, past the live-resize throttle: it stands at its least.
-    fn shrink(app: &mut crate::App, wid: crate::WindowId) {
-        app.windows
-            .get_mut(&wid)
-            .expect("the window")
-            .last_resize_at = None;
-        let _ = app.resize_window_to_px(wid, PhysicalSize::new(1, 1));
-    }
-
-    /// The view window `wid` gives a native tab, as wide and as tall.
-    fn view(app: &crate::App, wid: crate::WindowId) -> (f32, f32) {
-        let view = app.native_ui_full_viewport(wid).expect("the window's view");
-        (view.width, view.height)
-    }
-
-    /// A WINDOW HOLDING SETTINGS IS NEVER SMALLER THAN SETTINGS' LEAST VIEW, AT EVERY TEXT SCALE:
-    /// at 1×, 1.25×, 1.5×, 1.75× and 2× text, a headless window holding Settings, asked for one
-    /// pixel as a window manager is asked for less than a window's least, stands at its least,
-    /// whose view holds the least view Settings takes at that scale; a terminal's window keeps
-    /// the 164x98 least at every scale. The least was a fixed 164x98 window: 2× text had a 164x96
-    /// view, where a control and a line of its name shared no screen.
-    #[test]
-    fn a_window_holding_settings_gives_it_its_least_view_at_every_text_scale() {
-        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
-            let mut app = crate::App::headless_for_test();
-            let wid = crate::WindowId(0);
-            at_text_scale(1.0);
-            let terminal = app.least_window_size(wid);
-            at_text_scale(scale);
-            assert_eq!(
-                app.least_window_size(wid),
-                terminal,
-                "{scale}x: a terminal's window keeps its least"
-            );
-            assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-            shrink(&mut app, wid);
-            let (width, height) = view(&app, wid);
-            let (least_w, least_h) = least_view(scale);
-            assert!(
-                width + 0.01 >= least_w && height + 0.01 >= least_h,
-                "{scale}x: a {width}x{height} view under Settings' least {least_w}x{least_h}"
-            );
-        }
-    }
-
-    /// A TEXT SCALE THAT GROWS GROWS A WINDOW HOLDING SETTINGS TO ITS NEW LEAST: a window at its
-    /// least for 1× text holds Settings' least view for 2× once the text goes to 2×, and keeps it
-    /// when asked for less. It kept the view it had, Settings squeezed into the 1× least.
-    #[test]
-    fn a_text_scale_that_grows_grows_a_window_holding_settings_to_its_new_least() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        at_text_scale(1.0);
-        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-        app.follow_least_window_scale();
-        shrink(&mut app, wid);
-        let before = view(&app, wid);
-        let (least_w, least_h) = least_view(2.0);
-        assert!(
-            before.0 < least_w || before.1 < least_h,
-            "precondition: the 1x least {before:?} is under the 2x least view"
-        );
-        at_text_scale(2.0);
-        app.windows
-            .get_mut(&wid)
-            .expect("the window")
-            .last_resize_at = None;
-        app.follow_least_window_scale();
-        let (width, height) = view(&app, wid);
-        assert!(
-            width + 0.01 >= least_w && height + 0.01 >= least_h,
-            "the window grew to {width}x{height}, under the 2x least view {least_w}x{least_h}"
-        );
-        shrink(&mut app, wid);
-        let (width, height) = view(&app, wid);
-        assert!(
-            width + 0.01 >= least_w && height + 0.01 >= least_h,
-            "asked for less, it keeps {width}x{height} over {least_w}x{least_h}"
-        );
-    }
-
-    /// BOTH FORMS OF `resize` HOLD A WINDOW HOLDING SETTINGS TO ITS LEAST, AND SAY SO, AT 1x AND
-    /// 2x TEXT: the grid form asked for a grid under Settings' least view (on both axes, on its
-    /// rows alone, on its columns alone) gives the window the least on each held axis and what
-    /// was asked on the other, and answers with the grid given, `held=least` and the grid asked;
-    /// a grid over the least is given as asked; the pixel form holds and answers the same in
-    /// pixels. The grid form resized the grid and the window as asked (a 164x96 Settings view at
-    /// 1x, 1564x180 at 2x) and answered a bare `OK`, until a page opening grew it back. The grids
-    /// asked are counted in the window's own cells from the least view, since a face's cell size
-    /// moves the least grid: the 9x20 headless cells of a Linux host's face hold the 1x least
-    /// view's 208pt in 11 rows, so a fixed 12-row grid asked as under it was given as asked.
-    #[test]
-    fn both_forms_of_resize_hold_a_window_holding_settings_to_its_least_and_say_so() {
-        use crate::input::{InputEvent, InputOutcome, Source, WindowResize};
-        for scale in [1.0_f32, 2.0] {
-            let mut app = crate::App::headless_for_test();
-            let wid = crate::WindowId(0);
-            at_text_scale(scale);
-            assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-            app.follow_least_window_scale();
-            let (least_w, least_h) = least_view(scale);
-            let holds_least = |app: &crate::App, what: &str| {
-                let (width, height) = view(app, wid);
-                assert!(
-                    width + 0.01 >= least_w && height + 0.01 >= least_h,
-                    "{scale}x {what}: a {width}x{height} view under Settings' least \
-                     {least_w}x{least_h}"
-                );
-            };
-            let grid = |app: &crate::App| (app.windows[&wid].rows, app.windows[&wid].cols);
-            // The fewest rows and columns whose view holds Settings' least view, in this window's
-            // cells: a grid's view is its cells and pads ([`crate::App::native_ui_full_viewport`]).
-            let (cw, ch) = app.win_cell_size(wid);
-            let (pad, device) = (app.win_pad(wid), app.windows[&wid].scale as f32);
-            let fewest = |least: f32, cell: usize, pads: usize| -> u16 {
-                (1..=u16::MAX)
-                    .find(|&n| (usize::from(n) * cell + pads) as f32 / device + 0.01 >= least)
-                    .expect("some grid holds the least view")
-            };
-            let least = (fewest(least_h, ch, pad), fewest(least_w, cw, 2 * pad));
-            assert!(
-                least.0 > 1 && least.1 > 1,
-                "precondition: a {cw}x{ch} cell is under the {least_w}x{least_h} least view"
-            );
-            let (under, roomy) = ((least.0 - 1, least.1 - 1), (2 * least.0, 2 * least.1));
-            for asked in [under, (under.0, roomy.1), (roomy.0, under.1)] {
-                let reply = app.input(
-                    wid,
-                    InputEvent::Resize {
-                        rows: asked.0,
-                        cols: asked.1,
-                        echo_to_window: true,
-                    },
-                    Source::Controller,
-                );
-                holds_least(&app, &format!("resize {} {}", asked.0, asked.1));
-                let given = grid(&app);
-                assert_eq!(
-                    reply,
-                    InputOutcome::Resized(WindowResize::Grid { asked, given }),
-                    "{scale}x: the reply names the grid given"
-                );
-                assert_eq!(
-                    given,
-                    (asked.0.max(least.0), asked.1.max(least.1)),
-                    "{scale}x: {asked:?}, under the least {least:?} on an axis, is held to it there \
-                     and given as asked on the other"
-                );
-            }
-            let roomy = (grid(&app).0 + 3, grid(&app).1 + 5);
-            let reply = app.input(
-                wid,
-                InputEvent::Resize {
-                    rows: roomy.0,
-                    cols: roomy.1,
-                    echo_to_window: true,
-                },
-                Source::Controller,
-            );
-            assert_eq!(
-                reply,
-                InputOutcome::Resized(WindowResize::Grid {
-                    asked: roomy,
-                    given: roomy
-                }),
-                "{scale}x: a grid over the least is given as asked"
-            );
-            assert_eq!(grid(&app), roomy);
-            app.windows
-                .get_mut(&wid)
-                .expect("the window")
-                .last_resize_at = None;
-            let reply = app.input(
-                wid,
-                InputEvent::ResizeWindowPx {
-                    width: 200,
-                    height: 150,
-                },
-                Source::Controller,
-            );
-            let least = app.least_window_size(wid);
-            assert_eq!(
-                reply,
-                InputOutcome::Resized(WindowResize::Px {
-                    asked: (200, 150),
-                    given: (least.width.max(200), least.height.max(150)),
-                }),
-                "{scale}x: the pixel form names the size it gave"
-            );
-            holds_least(&app, "resize px 200 150");
-        }
-        at_text_scale(1.0);
-    }
-
-    /// A FONT CHANGE KEEPS A HEADLESS WINDOW'S SIZE, AS A PLATFORM WINDOW KEEPS ITS INNER SIZE:
-    /// the window re-grids inside the pixels it held, so a page lays out at the size a person's
-    /// window keeps through the change, and a window holding Settings still holds its least. It
-    /// kept its grid instead, its frame growing with the font, and Settings laid out in a window
-    /// no person has (a Text & Fonts press's status bar stood mid-page in it).
-    #[test]
-    fn a_font_change_keeps_a_headless_windows_size() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let frame = |app: &crate::App| {
-            let ws = &app.windows[&wid];
-            app.window_frame_px_for(wid, ws.rows, ws.cols)
-        };
-        let grid = |app: &crate::App| (app.windows[&wid].rows, app.windows[&wid].cols);
-        let (before, grid_before) = (frame(&app), grid(&app));
-        let base = app.font_size;
-        app.set_font_size(base + 8.0);
-        let (cw, ch) = app.win_cell_size(wid);
-        let after = frame(&app);
-        assert!(
-            grid(&app).0 < grid_before.0 && grid(&app).1 < grid_before.1,
-            "bigger cells, fewer of them: {grid_before:?} -> {:?}",
-            grid(&app)
-        );
-        assert!(
-            after.width <= before.width
-                && before.width - after.width < cw as u32
-                && after.height <= before.height
-                && before.height - after.height < ch as u32,
-            "the window keeps its {before:?} (its frame {after:?} the whole cells inside it)"
-        );
-        app.set_font_size(base);
-        assert_eq!(grid(&app), grid_before, "zoomed back into the same pixels");
-        assert_eq!(frame(&app), before);
-
-        at_text_scale(1.0);
-        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-        shrink(&mut app, wid);
-        app.set_font_size(base + 8.0);
-        let (width, height) = view(&app, wid);
-        let (least_w, least_h) = least_view(1.0);
-        assert!(
-            width + 0.01 >= least_w && height + 0.01 >= least_h,
-            "after the font change, a {width}x{height} view under Settings' least \
-             {least_w}x{least_h}"
-        );
-    }
-
-    /// A terminal's window takes the grid it is asked for: the least that holds Settings holds
-    /// nothing else.
-    #[test]
-    fn a_terminals_window_takes_the_grid_it_is_asked_for() {
-        use crate::input::{InputEvent, InputOutcome, Source, WindowResize};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        at_text_scale(2.0);
-        let reply = app.input(
-            wid,
-            InputEvent::Resize {
-                rows: 6,
-                cols: 20,
-                echo_to_window: true,
-            },
-            Source::Controller,
-        );
-        at_text_scale(1.0);
-        assert_eq!(
-            reply,
-            InputOutcome::Resized(WindowResize::Grid {
-                asked: (6, 20),
-                given: (6, 20)
-            })
-        );
-        assert_eq!((app.windows[&wid].rows, app.windows[&wid].cols), (6, 20));
-    }
-
-    #[test]
-    fn min_size_sits_on_the_whole_cell_frame_lattice() {
-        let app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let min = app.least_window_size(wid);
-        let (cw, ch) = app.win_cell_size(wid);
-        let pad = app.win_pad(wid);
-        let base_h =
-            app.win_head(wid) + app.win_pad_top(wid) + pad + usize::from(app.tab_strip_rows) * ch;
-
-        assert_eq!(
-            (min.width as usize - 2 * pad) % cw,
-            0,
-            "min width must be an exact whole-cell frame"
-        );
-        assert_eq!(
-            (min.height as usize - base_h) % ch,
-            0,
-            "min height must be an exact whole-cell frame"
-        );
-        assert!(min.width >= 164, "min width keeps the 164 logical floor");
-        assert!(min.height >= 98, "min height keeps the 98 logical floor");
-        assert!((min.width as usize) < 164 + cw + 2 * pad + cw);
-        assert!((min.height as usize) < 98 + ch + base_h + ch);
-    }
-}
+#[path = "app_config_least_window_size_tests.rs"]
+mod least_window_size_tests;
 
 #[cfg(test)]
-mod theme_live_tests {
-    #[test]
-    fn apply_theme_live_recolours_backend_and_drops_caches() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-
-        let mut term = aterm_core::terminal::Terminal::new(2, 2);
-        term.process(b"\x1b[?25l");
-        let input = term.cell_frame(2, 2);
-        let render = |backend: &mut crate::Backend| match backend {
-            crate::Backend::Cpu(r) => r.render_input(&input),
-            crate::Backend::Gpu(_) => unreachable!("headless test backend is CPU"),
-        };
-        let before = render(app.backend.ready_mut());
-
-        app.windows.get_mut(&wid).unwrap().last_strip_fp = Some((
-            0xFEED,
-            80,
-            false,
-            None,
-            false,
-            None,
-            crate::tab_bar::VersionSlotCols::NONE,
-            false,
-            crate::tab_bar::CaptionSlot::NONE,
-            None,
-        ));
-
-        let new_theme =
-            aterm_render::Theme::from(&aterm_types::scheme::builtin("Dracula").unwrap());
-        assert_ne!(
-            app.theme.bg, new_theme.bg,
-            "test needs a real colour change"
-        );
-
-        app.apply_theme_live(new_theme);
-
-        assert_eq!(app.theme.bg, new_theme.bg);
-        assert_eq!(app.theme.fg, new_theme.fg);
-        assert!(app.windows[&wid].last_strip_fp.is_none(), "strip cache");
-        assert!(app.windows[&wid].last_present.is_none(), "RepaintKey gate");
-        let got = render(app.backend.ready_mut());
-        assert_ne!(got.pixels, before.pixels, "the idle grid recoloured");
-        let mut fresh = aterm_render::Renderer::from_system(crate::FONT_PX, new_theme)
-            .expect("system font for test renderer");
-        fresh.set_line_height(super::Config::default().line_height_or_default());
-        assert_eq!(got.pixels, fresh.render_input(&input).pixels);
-    }
-}
+#[path = "app_config_theme_live_tests.rs"]
+mod theme_live_tests;
 
 #[cfg(test)]
-mod matrix_rain_cfg_tests {
-
-    use super::{Config, PRIVACY_WARMUP_HOLD_MS_MAX, PrivacyWarmup};
-    use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue};
-
-    const BG: u32 = 0x0011_1318;
-    const FG: u32 = 0x00D0_D0D0;
-    const CURSOR: u32 = 0x0050_FA7B;
-
-    fn rain(toml: &str) -> Option<RainConfig> {
-        let cfg = aterm_toml::from_str::<Config>(toml).expect("valid toml");
-        cfg.matrix_rain_enabled()
-            .then(|| cfg.matrix_rain_params(BG, FG, CURSOR))
-    }
-
-    #[test]
-    fn rain_is_off_by_default_and_params_ignore_the_enabled_bit() {
-        assert!(!Config::default().matrix_rain_enabled());
-        assert!(rain("[matrix_rain]\nfps = 42").is_none());
-        assert!(rain("[matrix_rain]\nenabled = false\nfps = 42").is_none());
-        let params = |toml: &str| {
-            aterm_toml::from_str::<Config>(toml)
-                .unwrap()
-                .matrix_rain_params(BG, FG, CURSOR)
-        };
-        let disabled = params("[matrix_rain]\nenabled = false\nfps = 24");
-        assert_eq!(disabled, params("[matrix_rain]\nenabled = true\nfps = 24"));
-        assert_eq!(disabled.fps, 24, "knobs still resolve while disabled");
-    }
-
-    #[test]
-    fn packages_retired_switch_note_and_retired_keys_load() {
-        let note = |text: &str| {
-            aterm_toml::from_str::<Config>(text)
-                .unwrap()
-                .packages_retired_switch_note()
-        };
-        assert_eq!(
-            note("[packages]\nauto_update = false"),
-            Some(atpkg::config::auto_update_note(false, None))
-        );
-        assert_eq!(
-            note("[packages]\nenabled = true\nauto_update = false"),
-            Some(atpkg::config::auto_update_note(false, Some(true)))
-        );
-        for text in [
-            "[packages]\nenabled = false\nauto_update = false",
-            "[packages]\nauto_update = true",
-            "[packages]\nenabled = false",
-            "",
-        ] {
-            assert_eq!(note(text), None, "{text:?}");
-        }
-        let retired = "[packages]\nchannel = 7\ninclude = \"x\"\n[packages.links]\nay = \"~/ay\"\n";
-        assert!(aterm_toml::from_str::<Config>(retired).is_ok());
-    }
-
-    #[test]
-    fn packages_defaults_agree_across_the_two_config_readers() {
-        for text in [
-            "",
-            "[packages]\n",
-            "[packages]\nenabled = false\n",
-            "[packages]\nauto_update = false\n",
-            "[packages]\nenabled = true\nauto_update = false\n",
-            "[packages]\nauto_update = true\n",
-            "[packages]\nauto_install = false\n",
-            "[packages]\nseed_install = false\n",
-            "[packages]\nseed_install = false\nauto_install = true\n",
-            "[packages]\nseed_install = true\nauto_install = false\n",
-        ] {
-            let gui = aterm_toml::from_str::<Config>(text).unwrap();
-            let pkg = atpkg::config::parse_packages(text);
-            assert_eq!(gui.packages_enabled(), pkg.enabled(), "enabled: {text:?}");
-            assert_eq!(
-                gui.packages_auto_install(),
-                pkg.auto_install(),
-                "auto_install: {text:?}"
-            );
-        }
-        for text in [
-            "",
-            "[reroute]\nannounce = true\n",
-            "[reroute]\nannounce = false\n",
-            "[reroute]\nstrict = true\n",
-            "[reroute]\nannounce = false\nstrict = false\n",
-        ] {
-            let gui = aterm_toml::from_str::<Config>(text).unwrap();
-            assert_eq!(
-                gui.reroute
-                    .as_ref()
-                    .and_then(|r| r.announce)
-                    .unwrap_or(true),
-                atpkg::config::parse_reroute(text).announce(),
-                "reroute.announce: {text:?}"
-            );
-            assert_eq!(
-                gui.reroute.as_ref().and_then(|r| r.strict).unwrap_or(false),
-                atpkg::config::parse_reroute(text).strict(),
-                "reroute.strict: {text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn update_enabled_agrees_with_the_updaters_own_reader() {
-        for text in [
-            "",
-            "[update]\n",
-            "[update]\nenabled = true\n",
-            "[update]\nenabled = false\n",
-        ] {
-            let gui = aterm_toml::from_str::<Config>(text).unwrap();
-            assert_eq!(
-                gui.update.as_ref().and_then(|u| u.enabled).unwrap_or(true),
-                aterm_update_core::settings::parse_update_enabled(text),
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn machine_defaults_agree_across_the_two_config_readers() {
-        let gui = Config::default();
-        let pkg = atpkg::config::MachineConfig::default();
-        assert_eq!(gui.machine_universal_control(), pkg.universal_control());
-        assert_eq!(gui.machine_rosetta(), pkg.rosetta());
-        for text in [
-            "[machine]\nuniversal_control = \"leave\"\n",
-            "[machine]\nuniversal_control = \"off\"\n",
-            "[machine]\nuniversal_control = \"\"\n",
-            "[machine]\nrosetta = false\n",
-            "[machine]\nrosetta = true\n",
-            "[machine]\nuniversal_control = \"leave\"\nrosetta = false\n",
-            "[machine]\n",
-            "",
-        ] {
-            let gui = aterm_toml::from_str::<Config>(text).unwrap();
-            let pkg = atpkg::config::parse_machine(text);
-            assert_eq!(
-                gui.machine_universal_control(),
-                pkg.universal_control(),
-                "{text:?}"
-            );
-            assert_eq!(gui.machine_rosetta(), pkg.rosetta(), "{text:?}");
-        }
-        let bogus =
-            aterm_toml::from_str::<Config>("[machine]\nuniversal_control = \"bogus\"\n").unwrap();
-        assert_eq!(
-            bogus.machine_universal_control(),
-            atpkg::config::UniversalControlPolicy::Leave,
-            "an unknown spelling is the inert reading, never a write on the machine"
-        );
-    }
-
-    #[test]
-    fn privacy_absent_section_offers_warmup_and_observes_as_sentinel() {
-        use crate::consent_observer::ObserverMode;
-        let c = Config::default();
-        assert!(c.privacy_probe_gate().permits());
-        assert_eq!(c.privacy_warmup(), PrivacyWarmup::Automatic);
-        let mode = |text: &str| {
-            aterm_toml::from_str::<Config>(text)
-                .expect("parses")
-                .privacy_observer_mode()
-        };
-        assert_eq!(mode(""), ObserverMode::Sentinel, "no [privacy] table");
-        assert_eq!(mode("[privacy]\n"), ObserverMode::Sentinel, "key absent");
-        assert_eq!(mode("[privacy]\nobserver = false\n"), ObserverMode::Off);
-    }
-
-    #[test]
-    fn the_default_warmup_omits_app_data_but_an_explicit_list_may_include_it() {
-        let absent = Config::default();
-        let defaults = absent.privacy_warmup_folders();
-        assert_eq!(defaults, vec!["documents", "desktop", "downloads"]);
-        let explicit = aterm_toml::from_str::<Config>(
-            "[privacy]\nwarmup_folders = [\"documents\", \"app-data\"]\n",
-        )
-        .expect("explicit list parses");
-        assert_eq!(
-            explicit.privacy_warmup_folders(),
-            vec!["documents".to_string(), "app-data".to_string()]
-        );
-    }
-
-    const ABS_TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
-
-    #[test]
-    fn privacy_explicit_values_win_over_the_defaults() {
-        let c = aterm_toml::from_str::<Config>(&format!(
-            concat!(
-                "[privacy]\n",
-                "enabled = false\n",
-                "check = false\n",
-                "notice = false\n",
-                "report_attribution = false\n",
-                "warmup = \"never\"\n",
-                "observer = true\n",
-                "protected_roots = [\"{}/aterm-privacy-explicit\"]\n",
-                "auto_accept = true\n",
-            ),
-            ABS_TMP
-        ))
-        .expect("explicit table parses");
-        assert!(
-            !c.privacy_probe_gate().permits(),
-            "either bit off ⇒ the gate refuses before any syscall"
-        );
-        assert_eq!(c.privacy_warmup(), PrivacyWarmup::Never);
-        assert_eq!(
-            c.privacy_observer_mode(),
-            crate::consent_observer::ObserverMode::Full,
-            "the full stream is opt-in from config, and config alone"
-        );
-        assert_eq!(
-            c.privacy_protected_roots(),
-            vec![std::path::PathBuf::from(format!(
-                "{ABS_TMP}/aterm-privacy-explicit"
-            ))],
-            "an absolute override replaces the containment set verbatim"
-        );
-        assert_eq!(
-            c.privacy.as_ref().and_then(|p| p.auto_accept),
-            Some(true),
-            "the reserved key round-trips so --validate-config can refuse it"
-        );
-
-        let over = aterm_toml::from_str::<Config>("[privacy]\nwarmup_hold_ms = 3600000\n")
-            .expect("parses");
-        assert_eq!(
-            over.privacy_warmup_hold_ms(),
-            PRIVACY_WARMUP_HOLD_MS_MAX,
-            "an hour-long hold is clamped, not honored"
-        );
-        let typo = aterm_toml::from_str::<Config>("[privacy]\nwarmup = \"first-launch\"\n")
-            .expect("an unknown spelling must NOT fail the whole file");
-        assert_eq!(
-            typo.privacy_warmup(),
-            PrivacyWarmup::default(),
-            "unknown spellings fall back; the validator names them"
-        );
-        assert_eq!(
-            PrivacyWarmup::parse("Automatic"),
-            Some(PrivacyWarmup::Automatic)
-        );
-        assert!(PrivacyWarmup::OnRequest.offered() && PrivacyWarmup::Automatic.offered());
-        assert!(!PrivacyWarmup::Never.offered());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn privacy_empty_protected_roots_resolve_to_the_containment_private_set() {
-        let expected: Vec<std::path::PathBuf> = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .map(|home| {
-                aterm_containment::sbpl::PRIVATE_SUBDIRS
-                    .iter()
-                    .map(|sub| home.join(sub))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let explicit_empty =
-            aterm_toml::from_str::<Config>("[privacy]\nprotected_roots = []\n").expect("parses");
-        assert_eq!(explicit_empty.privacy_protected_roots(), expected);
-        assert_eq!(
-            Config::default().privacy_protected_roots(),
-            expected,
-            "an absent key resolves the same way an empty one does"
-        );
-        assert!(
-            !expected.is_empty(),
-            "this test is only meaningful with a $HOME; the resolver returns \
-             empty for 'cannot answer', never for 'nothing is protected'"
-        );
-    }
-
-    #[test]
-    fn privacy_protected_root_overrides_expand_tilde_and_drop_relatives() {
-        let c = aterm_toml::from_str::<Config>(&format!(
-            "[privacy]\nprotected_roots = [\"~/src\", \"relative/path\", \"{ABS_TMP}/absolute\"]\n"
-        ))
-        .expect("parses");
-        let roots = c.privacy_protected_roots();
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let mut expected = Vec::new();
-        if let Some(home) = home {
-            expected.push(home.join("src"));
-        }
-        expected.push(std::path::PathBuf::from(format!("{ABS_TMP}/absolute")));
-        assert_eq!(
-            roots, expected,
-            "the relative entry is dropped, not guessed"
-        );
-    }
-
-    #[test]
-    fn clamps_hold_at_both_edges() {
-        let lo = rain(concat!(
-            "[matrix_rain]\nenabled = true\n",
-            "fps = 1\ndensity = 0\nspeed = 0\ntrail = 0\n",
-            "alpha = 0\nhead_alpha = 0\nmutation_ms = 1\nidle_secs = 0\n"
-        ))
-        .unwrap();
-        assert!(
-            lo.fps > 1
-                && lo.density > 0
-                && lo.speed > 0
-                && lo.trail > 0
-                && lo.mutation_ms > 1
-                && lo.idle_secs > 0
-        );
-        assert_eq!(lo.alpha_override, Some(RAIN_ALPHA_FLOOR));
-        let hi = rain(concat!(
-            "[matrix_rain]\nenabled = true\n",
-            "fps = 240\nalpha = 255\nhead_alpha = 255\n"
-        ))
-        .unwrap();
-        assert!(hi.fps <= 60);
-        assert_eq!(hi.alpha_override, Some(RAIN_ALPHA_CAP), "READABLE ceiling");
-        assert_eq!(hi.head_alpha_override, Some(RAIN_ALPHA_CAP));
-    }
-
-    #[test]
-    fn head_alpha_floors_at_body_alpha() {
-        let c = rain("[matrix_rain]\nenabled = true\nalpha = 120\nhead_alpha = 20").unwrap();
-        assert_eq!(c.alpha_override, Some(120));
-        assert_eq!(c.head_alpha_override, Some(120));
-        let c = rain("[matrix_rain]\nenabled = true\nhead_alpha = 5").unwrap();
-        assert_eq!(c.alpha_override, None);
-        assert_eq!(c.head_alpha_override, Some(RAIN_ALPHA_FLOOR));
-    }
-
-    #[test]
-    fn hue_parses_and_bad_hex_fails_closed() {
-        let hue = |h: &str| {
-            rain(&format!("[matrix_rain]\nenabled = true\nhue = \"{h}\""))
-                .expect("hue never aborts the resolve")
-                .hue
-        };
-        assert_eq!(hue("matrix"), RainHue::Matrix);
-        assert_eq!(hue("theme"), RainHue::Theme);
-        assert_eq!(hue("THEME"), RainHue::Theme, "case-insensitive");
-        assert_eq!(hue("#28D75F"), RainHue::Custom(0x0028_D75F));
-        assert_eq!(
-            hue("#a0b1c2"),
-            RainHue::Custom(0x00A0_B1C2),
-            "lowercase hex"
-        );
-        for bad in ["#28D75", "#28D75F0", "#GGGGGG", "chartreuse", "", "#"] {
-            assert_eq!(hue(bad), RainHue::Matrix, "{bad:?} must fail closed");
-        }
-    }
-}
+#[path = "app_config_matrix_rain_cfg_tests.rs"]
+mod matrix_rain_cfg_tests;
 
 #[cfg(test)]
-mod matrix_rain_app_tests {
-
-    use super::Config;
-    use crate::keybinding::Action;
-
-    fn cfg(toml: &str) -> Config {
-        aterm_toml::from_str(toml).expect("valid toml")
-    }
-
-    #[test]
-    fn toggle_dispatch_flips_front_session_override() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.recompute_matrix_rain();
-        assert!(!app.session_rain_enabled(0), "default config: off");
-        assert!(
-            app.windows.values().all(|ws| ws.fx.rain().is_none()),
-            "no engine is constructed while rain is off"
-        );
-
-        app.dispatch_action(wid, Action::ToggleMatrixRain);
-        assert_eq!(app.pool.rain_override(0), Some(true));
-        assert!(app.session_rain_enabled(0), "override forces rain on");
-        assert!(app.rain_dirty, "toggle marks the resolve stale");
-        app.recompute_matrix_rain();
-        assert!(
-            app.rain.is_some(),
-            "params available for the forced-on field"
-        );
-
-        app.config = cfg("[matrix_rain]\nenabled = false");
-        app.rain_dirty = true;
-        app.recompute_matrix_rain();
-        assert!(
-            app.session_rain_enabled(0),
-            "session override survives (and outranks) a config reload"
-        );
-
-        let rc = crate::rain_config_for_window(app.rain.unwrap(), wid);
-        app.windows.get_mut(&wid).unwrap().fx.build_rain(rc);
-        app.dispatch_action(wid, Action::ToggleMatrixRain);
-        assert_eq!(app.pool.rain_override(0), Some(false));
-        assert!(!app.session_rain_enabled(0));
-        assert!(
-            app.windows[&wid].fx.rain().is_some(),
-            "the engine survives the off flip and drains via the suspend path"
-        );
-
-        app.config = cfg("[matrix_rain]\nenabled = true");
-        app.rain_dirty = true;
-        app.recompute_matrix_rain();
-        assert!(
-            !app.session_rain_enabled(0),
-            "session off-override outranks an enabled config"
-        );
-        assert_eq!(app.pool.rain_override(999), None, "unknown session: none");
-    }
-
-    #[test]
-    fn rain_control_verb_reads_and_writes_front_session() {
-        let mut app = crate::App::headless_for_test();
-        assert_eq!(
-            app.rain_control(crate::RainCtlOp::Status).as_deref(),
-            Ok(
-                "config_enabled=false session_override=none effective=false \
-                 engine=none active=false scope=window focused=true animating=true"
-            ),
-            "status is a pure read"
-        );
-        assert_eq!(
-            app.rain_control(crate::RainCtlOp::On).as_deref(),
-            Ok("config_enabled=false session_override=on effective=true \
-                 engine=none active=false scope=window focused=true animating=true"),
-        );
-        assert_eq!(
-            app.rain_control(crate::RainCtlOp::Toggle).as_deref(),
-            Ok("config_enabled=false session_override=off effective=false \
-                 engine=none active=false scope=window focused=true animating=true"),
-        );
-        app.config = cfg("[matrix_rain]\nenabled = true");
-        app.rain_dirty = true;
-        assert_eq!(
-            app.rain_control(crate::RainCtlOp::Status).as_deref(),
-            Ok("config_enabled=true session_override=off effective=false \
-                 engine=none active=false scope=window focused=true animating=true"),
-            "the off override keeps winning over the enabled config"
-        );
-    }
-
-    #[test]
-    fn fx_control_verb_arms_once_and_reports() {
-        let mut app = crate::App::headless_for_test();
-        app.config = cfg("cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"");
-        let status = app
-            .fx_control(crate::FxCtlOp::Status)
-            .expect("status reads");
-        assert!(
-            status.starts_with(
-                "armed=none sig=00000000 bars=0 live=false bar=none drive=0.00 cooldown_ms=0 style="
-            ),
-            "{status}"
-        );
-        assert!(
-            status.ends_with("style=rainbow-kitty"),
-            "positive fixture must enable the real style"
-        );
-        let sig = aterm_effects::kitty_sing::song_signature('C');
-        let arm = app.fx_control(crate::FxCtlOp::Celebrate {
-            sig,
-            bars: 2,
-            on: aterm_effects::kitty_sing::CelebrateOn::Green,
-        });
-        let line = arm.expect("the first arm is admitted");
-        assert!(
-            line.starts_with(&format!(
-                "armed=green sig={sig:08x} bars=2 live=false bar=none drive=0.00 cooldown_ms="
-            )),
-            "{line}"
-        );
-        let again = app.fx_control(crate::FxCtlOp::Celebrate {
-            sig,
-            bars: 1,
-            on: aterm_effects::kitty_sing::CelebrateOn::Enter,
-        });
-        assert!(again.is_err(), "one arm at a time");
-        let status = app
-            .fx_control(crate::FxCtlOp::Status)
-            .expect("status reads");
-        assert!(
-            status.starts_with("armed=green"),
-            "status is a pure read: {status}"
-        );
-    }
-
-    #[test]
-    fn fx_control_refuses_inactive_visual_policies_without_spending_an_arm() {
-        use aterm_effects::kitty_sing::CelebrateOn;
-        for (config, on) in [
-            "cursor_trail = false\ncursor_trail_style = \"rainbow kitty pet\"",
-            "cursor_trail = true\ncursor_trail_style = \"laser\"",
-            "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"\nserious_mode = true",
-        ]
-        .into_iter()
-        .flat_map(|c| [CelebrateOn::Green, CelebrateOn::Done].map(|on| (c, on)))
-        {
-            let mut app = crate::App::headless_for_test();
-            app.config = cfg(config);
-            app.apply_serious_mode(app.config.serious_mode_or_default());
-            let arm = app.fx_control(crate::FxCtlOp::Celebrate {
-                sig: aterm_effects::kitty_sing::song_signature('C'),
-                bars: 2,
-                on,
-            });
-            assert!(arm.is_err(), "{config} {on:?}: {arm:?}");
-            let status = app
-                .fx_control(crate::FxCtlOp::Status)
-                .expect("status still reads");
-            assert!(
-                status.starts_with(
-                    "armed=none sig=00000000 bars=0 live=false bar=none drive=0.00 cooldown_ms=0 "
-                ),
-                "refusal spends no arm or cooldown: {status}"
-            );
-        }
-    }
-
-    #[test]
-    fn zero_seed_derives_stable_per_window() {
-        let base = crate::matrix_rain::RainConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        for raw in [0, 1, 2, 0x5048_4F53_5048_4F52, u64::MAX] {
-            let wid = crate::WindowId(raw);
-            let a = crate::rain_config_for_window(base, wid);
-            let b = crate::rain_config_for_window(base, wid);
-            assert_ne!(a.seed, 0, "the sentinel resolves to a real seed ({wid:?})");
-            assert_eq!(
-                a.seed, b.seed,
-                "stable for the window's whole life ({wid:?})"
-            );
-        }
-        let pinned = crate::matrix_rain::RainConfig { seed: 7, ..base };
-        assert_eq!(
-            crate::rain_config_for_window(pinned, crate::WindowId(3)).seed,
-            7,
-            "a configured seed is reproducible verbatim"
-        );
-    }
-}
+#[path = "app_config_matrix_rain_app_tests.rs"]
+mod matrix_rain_app_tests;
 
 #[cfg(test)]
-mod agents_auto_prime_tests {
-    use super::agents_auto_prime_from_text;
-
-    #[test]
-    fn the_knob_reads_without_a_full_config_load() {
-        assert!(agents_auto_prime_from_text(""), "empty file: default");
-        assert!(
-            agents_auto_prime_from_text("tab_status = false"),
-            "unrelated key: default"
-        );
-        assert!(!agents_auto_prime_from_text("agents_auto_prime = false"));
-        assert!(agents_auto_prime_from_text("agents_auto_prime = true"));
-        assert!(agents_auto_prime_from_text("agents_auto_prime = "));
-        assert!(agents_auto_prime_from_text("agents_auto_prime = \"no\""));
-    }
-}
+#[path = "app_config_agents_auto_prime_tests.rs"]
+mod agents_auto_prime_tests;
 
 #[cfg(test)]
-mod update_check_settings_tests {
-    #[test]
-    fn persisted_check_settings_bind_source_and_manual_policy_in_one_parse() {
-        let defaults = super::update_check_settings_from_text("").unwrap();
-        assert!(defaults.auto_apply);
-        assert_eq!(defaults.source, aterm_update::Source::resolve(None, None));
-        let manual = super::update_check_settings_from_text(
-            "[update]\nowner = \"private-org\"\nrepo = \"fork\"\nauto_apply = false\n",
-        )
-        .unwrap();
-        assert!(!manual.auto_apply);
-        assert_eq!(
-            manual.source,
-            aterm_update::Source::resolve(Some("private-org"), Some("fork"))
-        );
-        assert!(
-            super::update_check_settings_from_text("[update]\nauto_apply = invalid").is_none(),
-            "malformed existing policy must not fall back to automatic"
-        );
-    }
-}
+#[path = "app_config_update_check_settings_tests.rs"]
+mod update_check_settings_tests;
 
 #[cfg(test)]
-mod trail_style_resolution_tests {
-    use super::*;
-    use aterm_effects::cursor_glow::{GlowConfig, GlowStyle};
-
-    fn glow(raw: &str, enabled: bool) -> GlowConfig {
-        resolve_cursor_glow(
-            CursorGlowInputs {
-                enabled,
-                color: None,
-                accent: None,
-                duration_ms: 260,
-                length: 24,
-                intensity: 0.7,
-                radius: 0.6,
-                ring: true,
-            },
-            resolve_trail_presentation(raw),
-            0x00FF_FFFF,
-            true,
-            0x00C8_D3F5,
-            0x001A_1B26,
-            0.5,
-        )
-    }
-
-    fn warning_for(raw: &str) -> Option<String> {
-        Config {
-            cursor_trail_style: Some(raw.to_string()),
-            ..Config::default()
-        }
-        .cursor_trail_style_warning()
-    }
-
-    #[test]
-    fn the_default_glow_config_is_the_shipped_resolve() {
-        // A window whose trail is drawn by default: where decorative effects are off by default
-        // (Windows) a window with no config draws none, and it takes the drawn default by name,
-        // as `trail_drawn` writes it.
-        let drawn = || {
-            let mut app = crate::App::headless_for_test();
-            if !DEFAULT_DECORATIVE_EFFECTS {
-                app.config.cursor_trail_style =
-                    Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string());
-            }
-            app
-        };
-        let app = drawn();
-        assert_eq!(
-            app.glow_config(),
-            GlowConfig::default(),
-            "a test's ..Default::default() takes what a window with no config resolves"
-        );
-        let mut tinted = drawn();
-        tinted.config.cursor_trail_color = Some("#d03a8c".to_string());
-        assert_ne!(
-            tinted.glow_config(),
-            GlowConfig::default(),
-            "control: a set trail colour resolves away from the default"
-        );
-    }
-
-    #[test]
-    fn classic_receives_the_shipped_knobs() {
-        let mut app = crate::App::headless_for_test();
-        app.config.cursor_trail_style = Some("classic".to_string());
-        let cfg = app.glow_config();
-        assert_eq!(
-            (
-                cfg.style,
-                cfg.enabled,
-                cfg.duration,
-                cfg.length,
-                cfg.intensity,
-                cfg.radius,
-                cfg.ring,
-                cfg.beam,
-                cfg.classic_mono,
-                cfg.head_dx,
-            ),
-            (
-                GlowStyle::Classic,
-                true,
-                std::time::Duration::from_millis(260),
-                24,
-                aterm_effects::cursor_fx::CLASSIC_DEFAULT_INTENSITY,
-                0.6,
-                true,
-                true,
-                false,
-                0.5,
-            ),
-            "the window hands Classic other knobs than the dark wake is pinned on"
-        );
-        assert_eq!(
-            aterm_effects::cursor_fx::CLASSIC_DEFAULT_INTENSITY,
-            0.7,
-            "Classic's unset brightness is the v0.28 release's"
-        );
-        app.config.cursor_trail_length = Some(18);
-        assert_eq!(
-            app.glow_config().length,
-            18,
-            "control: a set length is read"
-        );
-        app.config.cursor_trail_intensity = Some(1.0);
-        assert_eq!(
-            app.glow_config().intensity,
-            1.0,
-            "control: a set brightness is read"
-        );
-        app.config.cursor_trail_intensity = None;
-        app.config.cursor_trail_color = Some("#d03a8c".to_string());
-        assert_eq!(
-            app.glow_config().intensity,
-            1.0,
-            "control: Classic's one-colour face (a trail colour) draws at full brightness"
-        );
-        app.config.cursor_trail_color = None;
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        assert_eq!(
-            app.glow_config().intensity,
-            1.0,
-            "control: another style's unset brightness is full"
-        );
-    }
-
-    #[test]
-    fn native_ribbon_resolution_keeps_tall_default_and_explicit_underline() {
-        for (style, expected_tall) in [
-            ("rainbow kitty", true),
-            (crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE, true),
-            ("rainbow kitty flying", true),
-            ("rainbow kitty tall", true),
-            ("rainbow kitty underline", false),
-        ] {
-            assert_eq!(
-                glow(style, true).ribbon_tall,
-                expected_tall,
-                "native ribbon resolver returned the wrong geometry for {style:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn immutable_catalog_caches_the_complete_trail_presentation() {
-        let config = Config {
-            cursor_trail_style: Some("rainbow kitty underline".to_string()),
-            ..Config::default()
-        };
-        let catalog = config.resolve_trail_style_cache();
-        let cached = catalog.presentation_for(config.cursor_trail_style_raw());
-        assert_eq!(cached.style.style, Some(GlowStyle::RainbowKitty));
-        assert!(!cached.ribbon_tall);
-        assert_eq!(
-            cached.pet_species,
-            Some(aterm_effects::kitty_pet::PetSpecies::Cat)
-        );
-
-        let fallback = catalog.presentation_for("rainbow dog pet");
-        assert!(fallback.ribbon_tall);
-        assert_eq!(
-            fallback.pet_species,
-            Some(aterm_effects::kitty_pet::PetSpecies::Dog)
-        );
-        assert_eq!(
-            catalog
-                .presentation_for(config.cursor_trail_style_raw())
-                .pet_species,
-            cached.pet_species
-        );
-    }
-
-    fn engine_is_v2_for(raw: &str) -> bool {
-        use aterm_effects::cursor_glow::{CursorGlow, Geom};
-        let cfg = glow(raw, true);
-        let mut engine = CursorGlow::default();
-        let mut out = Vec::new();
-        engine.tick(
-            Some((2, 4)),
-            std::time::Instant::now(),
-            &cfg,
-            Geom {
-                cw: 8,
-                ch: 16,
-                rows: 24,
-                cols: 80,
-                origin_x: 0,
-                origin_y: 0,
-                win_w: 640,
-                win_h: 384,
-                head: 0,
-            },
-            &mut out,
-        );
-        engine.v2_status().is_some()
-    }
-
-    #[test]
-    fn every_rainbow_kitty_spelling_is_v2() {
-        use aterm_effects::trail_sound::SoundVoice;
-        let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
-        assert_eq!(
-            ResolvedTrailPresentation::default(),
-            resolve_trail_presentation(default),
-            "`Default` must be the resolver's answer for the default spelling"
-        );
-        let auto = Config::default();
-        let marimba = Config {
-            trail_sound_style: Some("marimba".to_string()),
-            ..Config::default()
-        };
-        let spellings = crate::prefs::CURSOR_TRAIL_STYLES.iter().copied().chain(
-            crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
-                .iter()
-                .map(|&(alias, _)| alias),
-        );
-        for raw in spellings {
-            let p = resolve_trail_presentation(raw);
-            assert!(!p.style.unknown, "{raw:?} is a documented spelling");
-            let is_kitty = p.style.style == Some(GlowStyle::RainbowKitty);
-            assert_eq!(
-                engine_is_v2_for(raw),
-                is_kitty,
-                "{raw:?}: the engine owns the frame as v2 iff the spelling is the rainbow kitty"
-            );
-            assert_eq!(
-                auto.trail_sound_voice_for(p),
-                if is_kitty {
-                    SoundVoice::RainbowKittyV2
-                } else {
-                    SoundVoice::Style
-                },
-                "{raw:?}: `auto` is the music box iff the spelling is the rainbow kitty"
-            );
-            assert_eq!(
-                marimba.trail_sound_voice_for(p),
-                SoundVoice::Marimba,
-                "{raw:?}: an explicit instrument is the user's"
-            );
-        }
-        let fallback = resolve_trail_presentation(default);
-        for v1 in [
-            "rainbow kitty v1",
-            "RAINBOW KITTY V1 pet",
-            "v2",
-            "",
-            "phasr",
-            "rainbow kity tall",
-        ] {
-            let p = resolve_trail_presentation(v1);
-            assert!(p.style.unknown, "{v1:?} names no style and says so");
-            assert_eq!(
-                ResolvedTrailStyle {
-                    unknown: false,
-                    ..p.style
-                },
-                fallback.style,
-                "{v1:?} falls back to the default"
-            );
-            assert!(
-                engine_is_v2_for(v1),
-                "{v1:?} draws the default, which is v2"
-            );
-            assert_eq!(auto.trail_sound_voice_for(p), SoundVoice::RainbowKittyV2);
-            assert_eq!(effective_trail_style_token(v1), default, "{v1:?}");
-            assert_eq!(
-                glow(v1, true).ribbon_tall,
-                glow(default, true).ribbon_tall,
-                "{v1:?}"
-            );
-            assert!(warning_for(v1).is_some(), "{v1:?} must warn");
-        }
-        let config = Config {
-            cursor_trail_style: Some("rainbow kitty v1".to_string()),
-            ..Config::default()
-        };
-        let cached = config
-            .resolve_trail_style_cache()
-            .presentation_for(config.cursor_trail_style_raw());
-        assert!(cached.style.unknown);
-        assert_eq!(cached.style.style, Some(GlowStyle::RainbowKitty));
-        assert_eq!(
-            config.trail_sound_voice_for(cached),
-            SoundVoice::RainbowKittyV2
-        );
-    }
-
-    #[test]
-    fn off_and_the_master_switch_still_disable_the_trail() {
-        for spelling in ["off", "OFF", "  off  "] {
-            assert_eq!(resolve_trail_style(spelling).style, None);
-            assert!(!resolve_trail_style(spelling).unknown);
-            assert!(!glow(spelling, true).enabled, "{spelling:?}");
-            assert!(
-                warning_for(spelling).is_none(),
-                "{spelling:?} is not a typo"
-            );
-        }
-        assert!(
-            !glow(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE, false).enabled,
-            "`cursor_trail = false` owns the whole effect"
-        );
-        for &s in crate::prefs::CURSOR_TRAIL_STYLES {
-            assert_eq!(
-                resolve_trail_style(s).style.is_none(),
-                s == "off",
-                "style {s:?}"
-            );
-        }
-        for &(alias, _) in crate::prefs::CURSOR_TRAIL_STYLE_ALIASES {
-            assert!(
-                resolve_trail_style(alias).style.is_some(),
-                "alias {alias:?} must not disable the trail"
-            );
-        }
-    }
-
-    #[test]
-    fn the_bloom_radius_is_per_style_with_the_knob_as_the_override() {
-        fn radius(style: Option<&str>, knob: Option<f32>) -> f32 {
-            let config = Config {
-                cursor_trail_style: style.map(str::to_string),
-                cursor_trail_bloom_radius: knob,
-                ..Config::default()
-            };
-            let catalog = config.resolve_trail_style_cache();
-            config.cursor_trail_bloom_radius_or_default(
-                catalog.presentation_for(config.cursor_trail_style_raw()),
-            )
-        }
-        let kitty = radius(Some("rainbow kitty"), None);
-        assert!(kitty < radius(Some("laser"), None));
-        assert_eq!(radius(Some("rainbow kitty pet"), None), kitty);
-        assert_eq!(
-            radius(None, None),
-            radius(Some(default_cursor_trail_style()), None)
-        );
-        assert_eq!(radius(Some("rainbow kitty"), Some(3.0)), 3.0);
-        assert_eq!(radius(Some("laser"), Some(3.0)), 3.0);
-    }
-}
+#[path = "app_config_trail_style_resolution_tests.rs"]
+mod trail_style_resolution_tests;

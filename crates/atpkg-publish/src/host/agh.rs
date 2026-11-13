@@ -81,6 +81,7 @@ impl AghHost {
             .fx(Arc::new(agh::Fx::live()))
             .retry(RetryPolicy::STANDARD)
             .caller(CALLER)
+            .core_reserve(0)
             .journal(dirs.clone())
             .rate_book(agh::rate::RateBook::at(dirs.rate()))
             .build();
@@ -130,6 +131,17 @@ impl AghHost {
         self.github.redactor().apply(text)
     }
 
+    /// `e`'s why, redacted, with its next step when that step is the error's own. An error that
+    /// set none carries its kind's generic one, which names agh's JSON fields; only a step of the
+    /// error's own (the chmod that clears a refused write bit, the grant a write lacks) is worth
+    /// the line.
+    fn with_own_next(&self, e: &agh::Error) -> String {
+        if e.next == e.kind.next_action() {
+            return self.redacted(&e.why);
+        }
+        self.redacted(&format!("{}; next: {}", e.why, e.next))
+    }
+
     fn host_error(&self, e: &agh::Error) -> HostError {
         if e.sub == Sub::Policy(RefusalCode::WriterAbsent) {
             return HostError::Unreachable(self.redacted(&format!(
@@ -137,7 +149,7 @@ impl AghHost {
                 self.home.owner()
             )));
         }
-        let why = self.redacted(&e.why);
+        let why = self.with_own_next(e);
         match e.kind {
             Kind::NotFound => HostError::NotFound,
             Kind::Unauthenticated
@@ -159,20 +171,16 @@ impl AghHost {
     }
 
     /// The error map of a write (design §10.3's table): `host_error`, with an open intent named
-    /// as such, and the next step kept where it is the one that unblocks a lane (a guard that
-    /// failed, a grant that is missing). A missing writer refuses the write by its owner.
+    /// as such, and a guard that failed or a grant that is missing refused whatever its kind,
+    /// since its next step is the one that unblocks a lane. A missing writer refuses the write by
+    /// its owner.
     fn write_error(&self, e: &agh::Error) -> HostError {
         match &e.sub {
             Sub::IntentOpen { intent } => {
                 return HostError::Unreachable(Self::outcome_unknown(intent));
             }
             Sub::GuardFailed { .. } | Sub::Policy(RefusalCode::NotGranted) => {
-                // A guard that set no next of its own carries its kind's generic one, which
-                // names agh's JSON fields; only a step of the error's own is worth the line.
-                if e.next == e.kind.next_action() {
-                    return HostError::Refused(self.redacted(&e.why));
-                }
-                return HostError::Refused(self.redacted(&format!("{}; next: {}", e.why, e.next)));
+                return HostError::Refused(self.with_own_next(e));
             }
             Sub::Policy(RefusalCode::WriterAbsent) => {
                 return HostError::Refused(self.redacted(&format!(
@@ -717,19 +725,28 @@ impl ReleaseHost for AghHost {
         Ok(())
     }
 
-    /// `GET /repos/{o}/{r}/git/ref/heads/main` for main's sha, then agh's isolated
-    /// `GitOp::FetchMain` of `+refs/heads/main:{into}` into `dir`, then `into` held to that sha
-    /// (`rev-parse --verify`), as `RestHost` does: on a mismatch `into` is deleted and the fetch
-    /// is `Unreachable`, so only the API names the main of record.
+    /// Read main through authenticated Git, then fetch and bind the record ref to
+    /// that observation. A concurrent move is refused and removes the record ref;
+    /// REST replicas and core quota never decide which commit main names.
     fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
         let s = self.own_or_refuse(slug)?;
         let named = self.named(&s)?;
-        let main = self.github.refs(&s).get("refs/heads/main").map_err(|e| {
-            HostError::Unreachable(
-                self.redacted(&format!("read {s}'s main from the host API: {}", e.why)),
+        let main = self
+            .github
+            .run_git(
+                &GitRun::ls_remote(&s, Some("refs/heads/main"))
+                    .with_named(named.clone())
+                    .with_budget(LANE_GIT_BUDGET),
             )
-        })?;
-        let expected = main.object.sha;
+            .map_err(|e| {
+                HostError::Unreachable(
+                    self.redacted(&format!("read {s}'s main through Git: {}", e.why)),
+                )
+            })?;
+        let expected = agh::git::advertised_refs(&main.stdout, Some("refs/heads/main"))
+            .map_err(|e| self.host_error(&e))?
+            .remove("refs/heads/main")
+            .ok_or_else(|| HostError::Unreachable("Git advertised no main branch".into()))?;
         self.github
             .run_git(
                 &GitRun::fetch_main(&s, dir, into)
@@ -746,7 +763,7 @@ impl ReleaseHost for AghHost {
         let checked = match fetched {
             Ok(actual) if actual.trim() == expected => return Ok(()),
             Ok(actual) => format!(
-                "fetched {s}'s main ({}) differs from the host API ({expected}); main moved or \
+                "fetched {s}'s main ({}) differs from the Git observation ({expected}); main moved or \
                  git transported another main",
                 actual.trim()
             ),

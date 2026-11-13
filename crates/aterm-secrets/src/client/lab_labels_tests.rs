@@ -73,7 +73,7 @@ fn seats() -> Vec<(String, String)> {
 
 /// Every number admission keeps off a newcomer is held from this Mac's rename, with what holds
 /// it; this Mac's own row and seats hold nothing; the policy holds no number (no label is
-/// reserved, owner ruling 2026-11-09: not `m3`, not a steward's, not a server's); and the
+/// reserved: not `m3`, not a steward's, not a server's); and the
 /// policy's servers are the numbers they are dialed by, a bare label or a URL's `m<N>.local`.
 ///
 /// NEGATIVE CONTROL: hold `m3` by default or hold the policy's stewards or servers (the

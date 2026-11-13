@@ -3,6 +3,32 @@
 
 use super::*;
 
+#[test]
+fn quota_rows_survive_fleet_parsing_and_both_renderers() {
+    let data = r#"{"as":"dev","caller":"cli:api","counted":12}"#;
+    let survey = parse_reply(&[
+        "instance host=peer pid=1 sessions=0 level=facts".into(),
+        "github_rate hour=123 status=recorded attempts=12 groups=1 cut=0".into(),
+        format!(
+            "github_rate hour=123 data={}",
+            aterm_codec::pct::encode(data)
+        ),
+    ])
+    .unwrap();
+    assert_eq!(survey.github_rate.len(), 2);
+    let replies = vec![HostReply {
+        label: "peer".into(),
+        remote: true,
+        unproven: false,
+        node: None,
+        answer: Ok(survey),
+        reason: None,
+    }];
+    assert!(render_json(&replies).contains("\"github_rate\":["));
+    assert!(render_full(&replies, None).contains(data));
+    assert!(render_full(&replies, None).contains("status=recorded"));
+}
+
 fn render_text(replies: &[HostReply], budget: usize, own: Option<&str>) -> String {
     render_within(&blocks_of(replies, own), budget, budget).text
 }
@@ -785,6 +811,19 @@ fn sessions_are_ordered_by_what_needs_reading() {
         class_of(&row(&[("agent", "idle"), ("agent_ms", "60000")])),
         Class::Done
     );
+    for task in ["working", "open"] {
+        assert_eq!(
+            class_of(&row(&[
+                ("agent", "idle"),
+                ("agent_ms", "60000"),
+                ("task", task),
+                ("task_ms", "60000"),
+                ("bg", "1")
+            ])),
+            Class::Agent,
+            "an idle agent whose task is {task} has not finished it"
+        );
+    }
     assert_eq!(
         class_of(&row(&[("agent", "idle"), ("agent_ms", "99999999")])),
         Class::Agent
@@ -1895,9 +1934,12 @@ fn the_plans_windows_read_as_what_is_used() {
         render_text(&[reply(4, vec![row])], DEFAULT_BUDGET, None)
     };
     let both = text("7", "1");
-    assert!(both.contains(" ctx_left=64% 5h=7% 7d=1%"), "{both}");
+    assert!(
+        both.contains(" ctx_left=64% 5h_left=93% 7d_left=99%"),
+        "{both}"
+    );
     let weekly = text("-", "12");
-    assert!(weekly.contains(" ctx_left=64% 7d=12%"), "{weekly}");
+    assert!(weekly.contains(" ctx_left=64% 7d_left=88%"), "{weekly}");
     assert!(!weekly.contains("5h="), "{weekly}");
 }
 
@@ -1940,6 +1982,7 @@ fn one_machine_reads_in_full() {
 #[test]
 fn one_cause_that_refused_every_peer_is_said_once() {
     let peer = |fault: PeerFault| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m7".to_owned(),
         answer: Err("no route to 10.0.0.7".to_owned()),
@@ -1968,6 +2011,7 @@ fn one_cause_that_refused_every_peer_is_said_once() {
         assert_eq!(note(none), None, "{none:?}");
     }
     let answered = PeerSurvey {
+        authenticated: None,
         answer: Ok(vec!["instance pid=1".to_owned()]),
         ..peer(Other)
     };
@@ -1983,6 +2027,7 @@ fn one_cause_that_refused_every_peer_is_said_once() {
 #[test]
 fn a_fleet_reads_no_route_is_judged_on_the_link() {
     let refused = |addr: &str| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: format!("m at {addr}"),
         answer: Err("no route".to_owned()),
@@ -2025,6 +2070,7 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
         "a network members were once on: their own"
     );
     let unplaced = PeerSurvey {
+        authenticated: None,
         addr: None,
         ..refused("0.0.0.0")
     };
@@ -2035,14 +2081,16 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
     );
 }
 
-/// Away from the ALab LAN (a phone hotspot), a fleet read no dialled peer answered says where this
-/// Mac is, whether every dial found no route or timed out (no note before); a sandbox that refused every connect is still the sandbox, a read a peer answered
-/// takes no note, and on the ALab LAN the no-route note stands.
+/// Away from the ALab LAN (a phone hotspot), explicit route failures may say where this Mac was
+/// observed. Unknown failures retain no inferred network cause; a sandbox that refused every
+/// connect is still the sandbox, a read a peer answered takes no note, and on the ALab LAN the
+/// no-route note stands.
 /// NEGATIVE CONTROL: returning `fleet_note`'s note whatever the place prints the every-peer note
 /// for the hotspot's no-route read, and this test fails at "no-route away".
 #[test]
 fn a_fleet_read_from_another_network_says_where_this_mac_is() {
     let peer = |fault: PeerFault| PeerSurvey {
+        authenticated: None,
         reason: None,
         label: "m7".to_owned(),
         answer: Err("timed out".to_owned()),
@@ -2061,7 +2109,7 @@ fn a_fleet_read_from_another_network_says_where_this_mac_is() {
     let away = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000);
     let said = aterm_netplace::words::survey_note(&away, &words);
     assert!(said.is_some());
-    use PeerFault::{NoRoute, NotPermitted, Other};
+    use PeerFault::{NoNetwork, NoRoute, NotPermitted, Other};
     let note = |faults: &[PeerFault], place: &aterm_netplace::Place| {
         fleet_note_at(
             &faults.iter().map(|f| peer(*f)).collect::<Vec<_>>(),
@@ -2070,12 +2118,18 @@ fn a_fleet_read_from_another_network_says_where_this_mac_is() {
         )
     };
     assert_eq!(note(&[NoRoute, NoRoute], &away), said, "no-route away");
-    assert_eq!(note(&[Other, Other], &away), said, "timeouts away");
+    assert_eq!(
+        note(&[NoRoute, NoNetwork], &away),
+        said,
+        "known network failures away"
+    );
+    assert_eq!(note(&[Other, Other], &away), None, "unknown failures away");
     assert_eq!(
         note(&[NotPermitted, NotPermitted], &away).as_deref(),
         Some(SANDBOX_NOTE)
     );
     let answered = PeerSurvey {
+        authenticated: None,
         answer: Ok(vec!["instance pid=1".to_owned()]),
         ..peer(Other)
     };
@@ -2089,6 +2143,70 @@ fn a_fleet_read_from_another_network_says_where_this_mac_is() {
         Some(NO_ROUTE_NOTE)
     );
     assert_eq!(note(&[Other, Other], &home), None);
+}
+
+/// A remembered away network cannot override an actual refusal, protocol error or unknown
+/// failure. Treating every unsuccessful dial as evidence of that network fails these controls.
+#[test]
+fn observed_fleet_failures_keep_their_cause_over_remembered_network_place() {
+    fn utc(_: i64) -> Option<i64> {
+        Some(0)
+    }
+    let words = aterm_netplace::words::Words {
+        now_ms: 1_800_000_060_000,
+        zone: &utc,
+    };
+    let away = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000);
+    assert!(aterm_netplace::words::survey_note(&away, &words).is_some());
+    for (fault, reason, error) in [
+        (
+            PeerFault::Other,
+            "connect",
+            "local transport refused its caller",
+        ),
+        (
+            PeerFault::HostAnswered,
+            "handshake",
+            "peer refused authentication",
+        ),
+        (
+            PeerFault::HostAnswered,
+            "reply",
+            "reply could not be decoded",
+        ),
+        (PeerFault::Unserved, "handshake", "handshake timed out"),
+        (
+            PeerFault::Other,
+            "connect",
+            "connection failed for an unknown cause",
+        ),
+    ] {
+        let peer = PeerSurvey {
+            authenticated: None,
+            label: "m3".into(),
+            answer: Err(error.into()),
+            fault,
+            unproven: false,
+            node: None,
+            addr: Some("192.168.1.121".into()),
+            reason: Some(reason),
+        };
+        assert_eq!(
+            fleet_note_at(std::slice::from_ref(&peer), Some(&away), &words),
+            None
+        );
+        let reply = peer_reply(peer.clone());
+        let json: aterm_json::Value =
+            aterm_json::from_str(&render_json(std::slice::from_ref(&reply))).unwrap();
+        assert_eq!(json[0]["error"].as_str(), Some(error));
+        assert_eq!(json[0]["reason"].as_str(), Some(reason));
+        assert!(render_full(&[reply], None).contains(error));
+        let no_route = PeerSurvey {
+            fault: PeerFault::NoRoute,
+            ..peer.clone()
+        };
+        assert_eq!(fleet_note_at(&[no_route, peer], Some(&away), &words), None);
+    }
 }
 
 #[test]
@@ -2192,6 +2310,7 @@ const STUB_NOTE: &str = "stub-note-0d6b: the read's closing line";
 fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(FleetRead {
         peers: vec![PeerSurvey {
+            authenticated: None,
             reason: None,
             label: "lab-01".to_owned(),
             answer: Ok(peer_lines(1, "content", 12, 4)),
@@ -2289,6 +2408,7 @@ fn the_fleet_clients_closing_line_ends_the_read_within_its_budget() {
 fn silent_peer(fault: PeerFault) -> FleetRead {
     FleetRead {
         peers: vec![PeerSurvey {
+            authenticated: None,
             reason: None,
             label: "lab-01".to_owned(),
             answer: Err("stub-silent-7a2f".to_owned()),
@@ -2442,6 +2562,7 @@ fn an_unanswered_peer_row_names_the_node_it_was_asked_for() {
 #[test]
 fn survey_error_row_carries_reason() {
     let peer = |answer: Result<Vec<String>, String>, reason| PeerSurvey {
+        authenticated: None,
         label: "m119".to_owned(),
         answer,
         fault: PeerFault::HostAnswered,
@@ -2818,12 +2939,12 @@ fn an_unseen_rows_old_figures_say_how_old_they_are() {
     };
     // 1793130000 is the reply's own clock.
     let old = with(&[("condition", "unseen"), ("read_at", "1793100000")]);
-    assert!(old.contains("main 7d 1% read 8h ago"), "{old}");
+    assert!(old.contains("main 7d 99% left read 8h ago"), "{old}");
     let unknown = with(&[("condition", "unseen")]);
-    assert!(unknown.contains("main 7d 1% unseen"), "{unknown}");
+    assert!(unknown.contains("main 7d 99% left unseen"), "{unknown}");
     let fresh = with(&[("condition", "usable"), ("read_at", "1793129900")]);
     assert!(
-        fresh.contains("main 7d 1%") && !fresh.contains("read "),
+        fresh.contains("main 7d 99% left") && !fresh.contains("read "),
         "{fresh}"
     );
 }
@@ -2845,7 +2966,7 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
         ]),
         account_row(&[
             ("pool", "claude"),
-            ("id", "work-2"),
+            ("id", "w2"),
             ("condition", "limited"),
             ("enrolled", "1"),
             ("walled_until", "1793140800"),
@@ -2867,7 +2988,7 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
         ]),
         account_row(&[
             ("pool", "codex"),
-            ("id", "codex-1"),
+            ("id", "x1"),
             ("condition", "not-enrolled"),
             ("enrolled", "0"),
         ]),
@@ -2880,8 +3001,8 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
     let text = render_full(std::slice::from_ref(&reply), None);
     assert!(
         text.contains(
-            "trust=screen\n  accounts: claude main 7d 42% 5h 10%, work-2 walled 3h, b unseen, c wall \
-             ended \u{b7} codex codex-1 not enrolled\n"
+            "trust=screen\n  accounts: claude main 7d 58% left 5h 90% left, w2 walled 3h, b unseen, c wall \
+             ended \u{b7} codex x1 not enrolled\n"
         ),
         "{text}"
     );
@@ -2897,7 +3018,7 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
     assert_eq!(grok.answer.as_ref().unwrap().unread, ["grok"]);
     let text = render_full(std::slice::from_ref(&grok), None);
     assert!(
-        text.contains("\n  accounts: claude main 7d 42% 5h 10% \u{b7} grok unread\n"),
+        text.contains("\n  accounts: claude main 7d 58% left 5h 90% left \u{b7} grok unread\n"),
         "a pool it could not read comes last: {text}"
     );
     assert!(
@@ -3033,16 +3154,28 @@ fn an_instances_home_and_checkouts_print_under_its_header() {
     assert!(!text.contains(&format!("r{CHECKOUTS_SHOWN:02}")), "{text}");
 }
 
-/// A peer's label that is an email is masked, and any other that is no plain word shows as `?`.
+/// AN ACCOUNT IS SHOWN BY ITS ADDRESS (owner, 2026-11-09: "show the email"): a row that sends
+/// `email=` is named by it, one from an older member that sends none by its label, and a session's
+/// `account` is shown whole on every view. A peer's name that is neither a plain word nor an
+/// address still shows as `?`, so no control byte reaches the screen.
+/// NEGATIVE CONTROL: with `account_said` reading `id=` alone, the first row reads `claude m22 7d
+/// 5%`; with `masked_label` back, it reads `ab…@… 7d 5%` and `example` is nowhere on screen.
 #[test]
-fn a_peers_account_label_is_never_an_email_on_screen() {
+fn a_peers_account_is_shown_by_its_address_and_a_control_byte_never() {
     let rows = vec![
         account_row(&[
             ("pool", "claude"),
-            ("id", "abcdef@example.com"),
+            ("id", "m22"),
+            ("email", "abcdef@example.com"),
             ("condition", "usable"),
             ("enrolled", "1"),
             ("pct7", "5"),
+        ]),
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "work-2"),
+            ("condition", "usable"),
+            ("enrolled", "1"),
         ]),
         account_row(&[
             ("pool", "claude"),
@@ -3051,7 +3184,7 @@ fn a_peers_account_label_is_never_an_email_on_screen() {
             ("enrolled", "1"),
         ]),
     ];
-    let mut reply = accounts_reply(true, " accounts=2", rows);
+    let mut reply = accounts_reply(true, " accounts=3", rows);
     let session = Fields::of(
         "session local=1 sid=s-a1 state=running program=claude program_kind=agent agent=busy \
          account=abcdef%40example.com",
@@ -3065,28 +3198,21 @@ fn a_peers_account_label_is_never_an_email_on_screen() {
     let replies = [reply];
     let text = render_full(&replies, None);
     assert!(
-        text.contains("  accounts: claude ab\u{2026}@\u{2026} 7d 5%, ? unseen\n"),
+        text.contains(
+            "  accounts: claude abcdef@example.com 7d 95% left, work-2 usable, ? unseen\n"
+        ),
         "{text}"
     );
+    assert!(!text.contains('\u{1b}'), "{text}");
     let json = render_json(&replies);
-    assert!(json.contains("\"id\":\"ab\u{2026}@\u{2026}\""), "{json}");
+    assert!(json.contains("\"id\":\"m22\""), "{json}");
+    assert!(json.contains("\"email\":\"abcdef@example.com\""), "{json}");
     assert!(
-        json.contains("\"account\":\"ab\u{2026}@\u{2026}\""),
+        json.contains("\"account\":\"abcdef@example.com\""),
         "{json}"
     );
     let sid = render_sid(&replies, "s-a1", None).expect("its session");
-    assert!(sid.contains("  account: ab\u{2026}@\u{2026}\n"), "{sid}");
-    for shown in [text, json, sid] {
-        assert!(!shown.contains("example"), "{shown}");
-    }
-}
-
-#[test]
-fn an_email_label_is_masked_and_any_other_kept() {
-    assert_eq!(masked_label("main"), "main");
-    assert_eq!(masked_label("abcdef@example.com"), "ab\u{2026}@\u{2026}");
-    assert_eq!(masked_label("a@example.com"), "a\u{2026}@\u{2026}");
-    assert_eq!(masked_label("@example.com"), "\u{2026}@\u{2026}");
+    assert!(sid.contains("  account: abcdef@example.com\n"), "{sid}");
 }
 
 /// A BUILD'S FRONT WAITING FOR MEMORY READS AS THE BUILD IT WILL RUN: a session whose program is
@@ -3216,4 +3342,58 @@ fn survey_json_carries_every_name_and_the_text_a_summary() {
         !plain.lines().any(|l| l.trim_start().starts_with("work:")),
         "CONTROL: a row with no work fields: {plain}"
     );
+}
+
+#[test]
+fn session_line_shows_request_from_and_why_beside_typed_by() {
+    let fleet = "m114 (node 87be5228) over the fleet";
+    let why = "Run trust-ir borrowed-storage qualification on m72: m114 lacks memory for the native build";
+    let line = |request: &[(&'static str, &'static str)]| {
+        let mut row = vec![
+            ("local", "1"),
+            ("sid", "s-00000000000000000001"),
+            ("program", "zsh"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+            ("typed_by", fleet),
+            ("typed_ms", "60000"),
+            ("cwd", "$HOME/trust-ir-next-consumer-m72-20261109"),
+        ];
+        row.extend_from_slice(request);
+        let text = render_text(&[reply(1, vec![wire_row(&row)])], DEFAULT_BUDGET, None);
+        assert_line_caps(&text);
+        text.lines()
+            .find(|line| line.starts_with("s-00000000000000000001"))
+            .unwrap_or_else(|| panic!("{text}"))
+            .to_owned()
+    };
+    let named = line(&[
+        ("request", "r-20261109-1411-87be5228-01"),
+        ("request_from", "m114"),
+        ("request_why", why),
+    ]);
+    // The first read says whose the tab is and what it is for, beside the drive's credit.
+    assert!(
+        named.contains(" request from m114 \"Run trust-ir"),
+        "{named}"
+    );
+    assert!(named.contains(" typed by "), "{named}");
+    assert!(named.chars().count() <= LINE_CHARS, "{named}");
+    // At facts the why is only `1`: the line names the requester alone.
+    let facts = line(&[
+        ("request", "r-20261109-1411-87be5228-01"),
+        ("request_from", "m114"),
+        ("request_why", "1"),
+    ]);
+    assert!(
+        facts.contains(" request from m114") && !facts.contains('"'),
+        "{facts}"
+    );
+    // NEGATIVE: a person's tab names no request.
+    let person = line(&[
+        ("request", "-"),
+        ("request_from", "-"),
+        ("request_why", "-"),
+    ]);
+    assert!(!person.contains(" request"), "{person}");
 }

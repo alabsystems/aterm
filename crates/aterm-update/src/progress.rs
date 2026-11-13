@@ -39,10 +39,66 @@ pub enum Progress {
     Withheld { detail: String },
 }
 
+/// A progress event with the checker generation that produced it, when any.
+#[derive(Clone, Debug)]
+pub struct ProgressReport {
+    /// The reported step.
+    pub progress: Progress,
+    /// The background checker that produced this event; manual checks have none.
+    pub checker_generation: Option<u64>,
+}
+
+impl ProgressReport {
+    /// Whether this event still belongs to the current checker when the host consumes it.
+    #[must_use]
+    pub fn is_current_for(&self, watch: &crate::checker_watch::CheckerWatch) -> bool {
+        self.checker_generation
+            .is_none_or(|generation| generation != 0 && watch.is_current(generation))
+    }
+}
+
 /// The host's observer: called on the updater's worker threads, must not block.
-pub type ProgressNotify = Box<dyn Fn(Progress) + Send + Sync>;
+pub type ProgressNotify = Box<dyn Fn(ProgressReport) + Send + Sync>;
 
 static OBSERVER: OnceLock<ProgressNotify> = OnceLock::new();
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy)]
+struct CheckerReporter {
+    watch: &'static crate::checker_watch::CheckerWatch,
+    generation: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+std::thread_local! {
+    static CHECKER_REPORTER: std::cell::Cell<Option<CheckerReporter>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bind reports on this thread to one checker; download pollers capture the same owner.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn checker_scope(
+    watch: &'static crate::checker_watch::CheckerWatch,
+    generation: u64,
+) -> CheckerScope {
+    CheckerScope {
+        previous: CHECKER_REPORTER.replace(Some(CheckerReporter { watch, generation })),
+        thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) struct CheckerScope {
+    previous: Option<CheckerReporter>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for CheckerScope {
+    fn drop(&mut self) {
+        CHECKER_REPORTER.set(self.previous);
+    }
+}
 
 /// Whether one check began downloading its release's container. Each check owns its own, so a
 /// check (or a test of the binary) that ends meanwhile cannot take it, and every check reports
@@ -69,16 +125,23 @@ pub fn set_progress_observer(observer: ProgressNotify) {
     let _ = OBSERVER.set(observer);
 }
 
-/// Report one step: download and verify steps re-stamp the heartbeat of a check in flight, and the
-/// host's observer, if installed, gets every step (a terminal session has none).
-#[cfg(any(target_os = "macos", test))]
+/// Report one step for this thread's checker and notify the host's observer, if installed.
+#[cfg(target_os = "macos")]
 pub(crate) fn report(p: Progress) {
-    if matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. }) {
-        crate::checker_watch::WATCH.beat_progress();
-    }
+    report_for(CHECKER_REPORTER.get(), p);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn report_for(checker: Option<CheckerReporter>, p: Progress) -> bool {
+    let stamped = matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. })
+        && checker.is_some_and(|owner| owner.watch.beat_progress(owner.generation));
     if let Some(cb) = OBSERVER.get() {
-        cb(p);
+        cb(ProgressReport {
+            progress: p,
+            checker_generation: checker.map(|owner| owner.generation),
+        });
     }
+    stamped
 }
 
 /// Watch the growing `dest` (the curl sink) at 10 Hz while `url` downloads, reporting
@@ -87,11 +150,15 @@ pub(crate) fn report(p: Progress) {
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn watch_download(dest: &Path, version: &str, url: &str) -> DownloadWatch {
+    let checker = CHECKER_REPORTER.get();
+    let sink = Arc::new(move |p| {
+        report_for(checker, p);
+    });
     if OBSERVER.get().is_none() {
-        return watch_with(dest, version, || None, Arc::new(report));
+        return watch_with(dest, version, || None, sink);
     }
     let url = url.to_string();
-    watch_with(dest, version, move || asset_size(&url), Arc::new(report))
+    watch_with(dest, version, move || asset_size(&url), sink)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -169,131 +236,5 @@ impl Drop for DownloadWatch {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_download_with_no_observer_still_restamps_the_checking_heartbeat() {
-        use crate::checker_watch::{CheckerPhase, WATCH};
-        assert!(
-            OBSERVER.get().is_none(),
-            "PRECONDITION: the session's shape"
-        );
-        let dir = crate::scratch_dir("update-beat");
-        let part = dir.join("aterm.zip.part");
-        let generation = WATCH.register(1_000);
-        assert!(WATCH.beat(generation, CheckerPhase::Checking));
-        let stamped = WATCH.snapshot().unwrap().at_secs;
-        let watch = watch_download(&part, "0.1.0", "https://example.invalid/aterm.zip");
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut bytes = 0;
-        let moved = loop {
-            let beat = WATCH.snapshot().unwrap();
-            if beat.generation == generation && beat.at_secs > stamped {
-                break true;
-            }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            bytes += 4096;
-            std::fs::write(&part, vec![0u8; bytes]).unwrap();
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        drop(watch);
-        let _ = WATCH.supersede(generation);
-        assert!(
-            moved,
-            "the bytes a session downloads must keep its checker's heartbeat fresh"
-        );
-    }
-
-    type Seen = Arc<std::sync::Mutex<Vec<Progress>>>;
-    type Sink = Arc<dyn Fn(Progress) + Send + Sync>;
-
-    fn recorder() -> (Seen, Sink) {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let into = Arc::clone(&seen);
-        (seen, Arc::new(move |p| into.lock().unwrap().push(p)))
-    }
-
-    fn wait_for(seen: &std::sync::Mutex<Vec<Progress>>, want: &Progress) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if seen.lock().unwrap().contains(want) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        seen.lock().unwrap().contains(want)
-    }
-
-    #[test]
-    fn the_probed_size_rides_every_report_once_it_lands() {
-        let dir = crate::scratch_dir("update-size");
-        let part = dir.join("aterm.zip.part");
-        let (seen, sink) = recorder();
-        let w = watch_with(&part, "0.95.0", || Some(74_000_000), sink);
-        let first = Progress::Downloading {
-            version: "0.95.0".into(),
-            bytes_done: 0,
-            bytes_total: 0,
-        };
-        assert_eq!(seen.lock().unwrap().first(), Some(&first), "at once");
-        assert!(wait_for(
-            &seen,
-            &Progress::Downloading {
-                version: "0.95.0".into(),
-                bytes_done: 0,
-                bytes_total: 74_000_000,
-            }
-        ));
-        std::fs::write(&part, vec![0u8; 4096]).unwrap();
-        assert!(wait_for(
-            &seen,
-            &Progress::Downloading {
-                version: "0.95.0".into(),
-                bytes_done: 4096,
-                bytes_total: 74_000_000,
-            }
-        ));
-        drop(w);
-    }
-
-    #[test]
-    fn a_silent_or_slow_size_probe_leaves_the_total_unknown() {
-        let dir = crate::scratch_dir("update-slow");
-        let part = dir.join("aterm.zip.part");
-        std::fs::write(&part, vec![0u8; 100]).unwrap();
-        let (seen, sink) = recorder();
-        let w = watch_with(&part, "0.95.0", || None, sink);
-        assert!(wait_for(
-            &seen,
-            &Progress::Downloading {
-                version: "0.95.0".into(),
-                bytes_done: 100,
-                bytes_total: 0,
-            }
-        ));
-        drop(w);
-        let (_, sink) = recorder();
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        let answered = Arc::new(AtomicBool::new(false));
-        let probe_answered = Arc::clone(&answered);
-        let slow = watch_with(
-            &part,
-            "0.95.0",
-            move || {
-                let _ = gate.recv_timeout(Duration::from_secs(120));
-                probe_answered.store(true, Ordering::Release);
-                Some(1)
-            },
-            sink,
-        );
-        drop(slow);
-        assert!(
-            !answered.load(Ordering::Acquire),
-            "the download's end never waits for the probe"
-        );
-        let _ = release.send(());
-    }
-}
+#[path = "progress_tests.rs"]
+mod tests;

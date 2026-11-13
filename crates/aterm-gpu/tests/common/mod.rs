@@ -302,6 +302,23 @@ pub fn assert_byte_exact(
 /// waived run allows.
 const WAIVED_LSB: i32 = 1;
 
+/// How far a GPU may put a TRANSLUCENT source-over (`One`, `OneMinusSrcAlpha`
+/// on a Unorm8 target, 0 < a < 255) from the CPU's byte, on every GPU.
+///
+/// The CPU's `over_premul` is `c + ⌊(d·(255−a) + 127)/255⌋`, the exact value
+/// `c + d·(255−a)/255` correctly rounded (255 is odd, so no exact value is a
+/// tie). No API makes the blend unit do that: D3D11 lets the float-to-Unorm
+/// store miss by `D3D11_FLOAT32_TO_INTEGER_TOLERANCE_IN_ULP` (0.6), and leaves
+/// the blend's own precision to the hardware, so an exact value whose fraction
+/// lies near a half may store as either neighbour. "No ties" is not "no near
+/// ties": the nearest an exact value comes to a half is 1/510. What a
+/// conforming unit does keep is the floor or the ceiling of the exact value,
+/// hence one LSB. A store (a = 255) and an add (a = 0) have integral exact
+/// values and stay byte-exact. Measured on an AMD Radeon 780M (D3D11): misses
+/// only where the fraction was within 0.2 of a half, the worst 0.62 LSB off
+/// the exact value.
+pub const SOURCE_OVER_LSB: i32 = 1;
+
 /// Where a one-LSB source-over miss is waived, as the report line names it:
 /// x86_64 macOS and Windows by host, Mesa's software rasterizer by adapter.
 fn waived_on(adapter: &str) -> Option<&'static str> {

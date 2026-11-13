@@ -121,6 +121,13 @@ fn dead_link_target_recognition_preserves_engine_quirks() {
         ("[x](contrib)", 0, 0),
         ("[x](absent/../contrib/README.md)", 1, 0),
         ("[x](contrib/README.md/../README.md)", 1, 0),
+        // pathlib drops each "." of the link text before any stat: the engine
+        // reads `contrib/README.md/.` as the exported file, not ENOTDIR.
+        ("[x](contrib/README.md/.)", 0, 0),
+        ("[x](contrib/README.md/./)", 0, 0),
+        ("[x](/contrib/README.md/.)", 0, 0),
+        ("[x](contrib/./README.md)", 0, 0),
+        ("[x](docs/x.md/.)", 1, 0),
         ("[x](../outside)", 1, 0),
         ("[x](a\0b.md)", 1, 0),
         (
@@ -177,6 +184,8 @@ fn dead_links_resolve_exported_symlinks_and_exempt_gitlinks() {
         ("/outside", 1, 0),
         ("alias", 1, 0), // The loop path itself exists in dev's captured tree.
         ("../module/x.md", 0, 0),
+        // A symlink's target is the kernel's: "." after a file is ENOTDIR.
+        ("README.md/.", 1, 0),
     ] {
         let _ = std::fs::remove_file(&alias);
         std::os::unix::fs::symlink(target, &alias).unwrap();

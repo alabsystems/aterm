@@ -10,6 +10,10 @@ use super::super::{
 use super::*;
 use std::sync::Arc;
 
+#[path = "source/local.rs"]
+mod local;
+pub use local::{CatalogAbsenceRead, CatalogAbsenceRevision, LocalSourceRead, LocalSourceRevision};
+
 /// The exact native source of a local projection. This is an equality token,
 /// never authority: each use reopens and authenticates its source. An inventory
 /// alone misses a changed local actor, membership, or table generation.
@@ -40,9 +44,55 @@ impl std::fmt::Debug for SourceRevision {
 
 /// A complete native registry projection paired with its exact source revision.
 /// This value retains no lock or authority; persistence must admit it again.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceRead {
     revision: SourceRevision,
+}
+
+/// Equality token for the complete local source, including both enrollments.
+/// An ordinary informational source revision cannot substitute for this token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionRevision {
+    source: SourceRead,
+    custody: application::ProjectionCustody,
+}
+
+/// A complete local projection observed while both physical replicas were held.
+/// It retains evidence, not locks or authority; persistence must admit it again.
+#[derive(Clone, Debug)]
+pub struct ProjectionRead {
+    revision: ProjectionRevision,
+}
+
+impl ProjectionRead {
+    #[must_use]
+    pub fn source(&self) -> &SourceRead {
+        &self.revision.source
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &ProjectionRevision {
+        &self.revision
+    }
+
+    #[must_use]
+    pub fn table(&self) -> Digest {
+        self.source().table()
+    }
+
+    fn read(
+        session: &Session<'_>,
+        scope: Scope,
+        view: &View,
+        custody: application::ProjectionCustody,
+    ) -> Result<Self> {
+        Ok(Self {
+            revision: ProjectionRevision {
+                source: SourceRead::read(session, scope, view)?,
+                custody,
+            },
+        })
+    }
 }
 
 impl SourceRead {
@@ -53,7 +103,8 @@ impl SourceRead {
         &self.revision.projection
     }
 
-    /// The comparison token for a later retained admission.
+    /// The logical source comparison token. Retained admission uses the full
+    /// [`ProjectionRead::revision`], which also identifies physical custody.
     #[must_use]
     pub fn revision(&self) -> &SourceRevision {
         &self.revision
@@ -122,127 +173,50 @@ impl SourceRead {
 }
 
 impl Registry {
-    /// Observe a complete projection and its revision together, without taking
-    /// a control or table writer or initializing missing custody. A reader may
-    /// capture this token, but only a current writer can later admit it.
-    ///
-    /// `None` means no Commons on a new installation or no declaration.
-    /// Excluded or incomplete sources are errors, never evidence of absence.
+    /// Observe complete primary/recovery evidence under the same retained
+    /// context used by projection admission. Missing catalog or application
+    /// custody is unavailable, never evidence of native absence.
     ///
     /// # Errors
-    /// Excluded source, invalid or unestablished custody, unreadable policy, unavailable storage,
-    /// an incompatible descriptor, partial history, or a changed generation.
-    pub fn observe_source(&self, config: &Path) -> Result<Option<SourceRead>> {
+    /// Changed, incomplete, excluded, conflicting or unavailable local source.
+    pub fn observe_projection(&self, config: &Path) -> Result<ProjectionRead> {
+        application::with_retained_store(
+            &self.paths,
+            &self.paths,
+            crate::admission::deadline(),
+            |session, catalog| projection_descriptor(config, session, catalog),
+            |session, store, scope, compiled, custody, _, validate| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let view = View::read(compiled.table, session, &log);
+                let read = ProjectionRead::read(session, scope, &view, custody)?;
+                include_source(config, session.paths(), session.trust(), scope)?;
+                (validate.current)()?;
+                Ok(read)
+            },
+        )
+    }
+
+    /// The native cache's observation. `None` on an installation that never
+    /// configured a Commons, read at once without waiting on or creating
+    /// custody; an initially busy vault refuses immediately. Otherwise
+    /// [`Self::observe_projection`]: a missing catalog or registry inside an
+    /// established vault stays unavailable, never absence.
+    ///
+    /// # Errors
+    /// Excluded source, a busy or unavailable vault, or any refusal of
+    /// [`Self::observe_projection`].
+    pub fn observe_installed_projection(&self, config: &Path) -> Result<Option<ProjectionRead>> {
         let policy = crate::catalog::policy::Policy::read(config)?;
         if !policy.enabled {
             return Err(Error::new("native registry source is excluded"));
         }
-        let deadline = crate::admission::deadline();
-        application::observe_existing_session(&self.paths, deadline, |session| {
-            let directory = crate::catalog::Directory::new(session.paths(), session.trust());
-            let catalog = directory.observe_with_policy(session, &Default::default())?;
-            let compiled =
-                crate::att::current_in(&catalog, session.trust(), &crate::att::REGISTRY.chain());
-            let descriptor = compiled.descriptor(session.trust())?;
-            if !policy.includes(
-                directory.catalog_scope().digest(),
-                descriptor.scope.digest(),
-            ) {
-                return Err(Error::new("native registry source is excluded"));
-            }
-            if !catalog.entries.contains_key(&descriptor.scope.digest()) {
-                return Ok(None);
-            }
-            application::observe_declared_in_session(
-                session,
-                descriptor,
-                deadline,
-                |session, store, scope| {
-                    let log = Log::read_with(session, store, scope, decode)?;
-                    let view = View::read(compiled.table, session, &log);
-                    let source = SourceRead::read(session, scope, &view)?;
-                    include_source(config, session.paths(), session.trust(), scope)?;
-                    Ok(source)
-                },
-            )
-        })
-        .map(Option::flatten)
+        if application::never_configured(&self.paths, crate::admission::deadline())? {
+            return Ok(None);
+        }
+        self.observe_projection(config).map(Some)
     }
 
-    /// Derive a complete current source under retained vault, lineage control,
-    /// and table locks, and keep them through `persist`. With `expected`, a
-    /// changed source refuses before calling it; without one this captures a
-    /// first observation. No declaration or application is created.
-    ///
-    /// A caller may persist a bounded local receipt here. Acquire its local
-    /// account writer first. Do not reenter Commons, acquire another account
-    /// writer, mutate vault state or use the network inside `persist`; replay
-    /// images and dispatch only after this function returns. The configuration
-    /// policy is freshly observed just before the callback, not locked against
-    /// an external editor; delivery must independently check its current policy.
-    ///
-    /// # Errors
-    /// Missing, partial, excluded, changed or incompatible source; unavailable
-    /// custody or a non-writer identity; expired local admission; or `persist`.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::spec_unmodeled(
-            machine = "DbNativeSource",
-            action = "Scenario",
-            reason = "The environment selects the captured revision, local policy and persistence outcome."
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DbNativeSource",
-            action = "Admit",
-            project = "aterm_db::alab::store::source::tests::transition"
-        )
-    )]
-    pub fn with_admitted_source<T>(
-        &self,
-        config: &Path,
-        expected: Option<&SourceRevision>,
-        persist: impl FnOnce(&SourceRead) -> Result<T>,
-    ) -> Result<T> {
-        let deadline = crate::admission::deadline();
-        application::with_admitted_store(
-            &self.paths,
-            |session| {
-                let directory = crate::catalog::Directory::new(session.paths(), session.trust());
-                let catalog = directory.snapshot_existing(session)?;
-                let compiled = crate::att::current_in(
-                    &catalog,
-                    session.trust(),
-                    &crate::att::REGISTRY.chain(),
-                );
-                let descriptor = compiled.descriptor(session.trust())?;
-                include_source(config, session.paths(), session.trust(), descriptor.scope)?;
-                Ok((descriptor, compiled))
-            },
-            deadline,
-            |session, store, scope, compiled| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(compiled.table, session, &log);
-                let source = SourceRead::read(session, scope, &view)?;
-                #[cfg(test)]
-                let check_revision = MUTANT.get() != 1;
-                #[cfg(not(test))]
-                let check_revision = true;
-                if check_revision && expected.is_some_and(|expected| expected != &source.revision) {
-                    return Err(Error::new("native registry source changed after capture"));
-                }
-                include_source(config, session.paths(), session.trust(), scope)?;
-                if std::time::Instant::now() >= deadline {
-                    return Err(Error::new("native registry source admission expired"));
-                }
-                persist(&source)
-            },
-        )
-    }
-
-    /// Admit a primary native projection and ordinary vault candidates under
+    /// Admit a complete local projection and ordinary vault candidates under
     /// one retained local context. Current Readers and Writers may project;
     /// this grants no shared-table, provider or budget mutation capability.
     ///
@@ -253,7 +227,8 @@ impl Registry {
     /// the callback and release before this function returns; replay follows.
     ///
     /// `entry_vault` must be the current generation or a retained ancestor.
-    /// Missing or recovery-only native custody is unavailable, not absent.
+    /// Both physical replicas are examined, including recovery-only data.
+    /// Missing or unavailable native custody is not an absence witness.
     ///
     /// # Errors
     /// Stale or denied membership, changed/partial/excluded source, missing or
@@ -279,8 +254,8 @@ impl Registry {
         config: &Path,
         entry_vault: &Paths,
         vault_config: &aterm_secrets::client::Config,
-        expected: Option<&SourceRevision>,
-        persist: impl FnOnce(&SourceRead, &aterm_secrets::client::EntryReader<'_>) -> Result<T>,
+        expected: Option<&ProjectionRevision>,
+        persist: impl FnOnce(&ProjectionRead, &aterm_secrets::client::EntryReader<'_>) -> Result<T>,
     ) -> Result<T> {
         #[cfg(test)]
         if PROJECTION_MUTANT.get() == 3 {
@@ -291,17 +266,11 @@ impl Registry {
             &self.paths,
             entry_vault,
             deadline,
-            |session, catalog| {
-                let compiled =
-                    crate::att::current_in(catalog, session.trust(), &crate::att::REGISTRY.chain());
-                let descriptor = compiled.descriptor(session.trust())?;
-                include_source(config, session.paths(), session.trust(), descriptor.scope)?;
-                Ok((descriptor, compiled))
-            },
-            |session, store, scope, compiled, look, validate| {
+            |session, catalog| projection_descriptor(config, session, catalog),
+            |session, store, scope, compiled, custody, look, validate| {
                 let log = Log::read_with(session, store, scope, decode)?;
                 let view = View::read(compiled.table, session, &log);
-                let source = SourceRead::read(session, scope, &view)?;
+                let source = ProjectionRead::read(session, scope, &view, custody)?;
                 #[cfg(test)]
                 let compare = PROJECTION_MUTANT.get() != 1;
                 #[cfg(not(test))]
@@ -338,6 +307,17 @@ impl Registry {
     }
 }
 
+fn projection_descriptor(
+    config: &Path,
+    session: &Session<'_>,
+    catalog: &crate::catalog::Snapshot,
+) -> Result<(Descriptor, &'static Compiled)> {
+    let compiled = crate::att::current_in(catalog, session.trust(), &crate::att::REGISTRY.chain());
+    let descriptor = compiled.descriptor(session.trust())?;
+    include_source(config, session.paths(), session.trust(), descriptor.scope)?;
+    Ok((descriptor, compiled))
+}
+
 /// Check before opening the table (which may recover an interrupted append),
 /// and again after projection immediately before local persistence.
 fn include_source(
@@ -350,11 +330,7 @@ fn include_source(
     let catalog = crate::catalog::Directory::new(paths, trust)
         .catalog_scope()
         .digest();
-    #[cfg(test)]
-    let check_policy = MUTANT.get() != 2;
-    #[cfg(not(test))]
-    let check_policy = true;
-    if check_policy && !policy.includes(catalog, scope.digest()) {
+    if !policy.includes(catalog, scope.digest()) {
         return Err(Error::new("native registry source is excluded"));
     }
     Ok(())
@@ -362,7 +338,6 @@ fn include_source(
 
 #[cfg(test)]
 thread_local! {
-    static MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static PROJECTION_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 

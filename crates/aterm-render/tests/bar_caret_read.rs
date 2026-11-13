@@ -225,5 +225,8 @@ fn a_bar_caret_reads_against_its_cell_on_the_dark_page() {
 
 #[test]
 fn a_bar_caret_reads_against_its_cell_on_paper() {
-    bars_read_on(GITHUB_LIGHT, (&["flat rainbow", "comet"], Scene::Typing));
+    bars_read_on(
+        GITHUB_LIGHT,
+        (&["flat rainbow + cat", "comet"], Scene::Typing),
+    );
 }

@@ -11,6 +11,11 @@ use std::time::Duration;
 
 use crate::checks::{CHECKS, Check, DEV, RELEASE, RELEASE_BUNDLE, RELEASE_TREE, Word, lookup};
 
+/// `--input-drift`: a development test run brackets each test binary's executable and declared
+/// runtime inputs, and a successful binary whose inputs changed while it ran makes the test check
+/// NOT RUN, as a release's always does. `verify land` passes it to every judgment.
+pub const INPUT_DRIFT: &str = "--input-drift";
+
 /// What the command line asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Args {
@@ -38,7 +43,7 @@ pub struct Args {
     pub all: bool,
     pub base: Option<String>,
     pub app: Option<PathBuf>,
-    /// `--fix`: `fmt` rewrites what it finds.
+    /// `--fix`: `fmt` or `census` rewrites what it finds.
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks, in the order given; empty is
     /// every cell but this machine's own.
@@ -54,8 +59,9 @@ pub struct Args {
     pub as_release: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
     /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
-    /// at once, saying what it lacks. Neither lifts the run's own memory budget
-    /// ([`crate::sched::memory_holders`]).
+    /// at once, saying what it lacks. AppKit correctness drivers run under the load found and
+    /// report it; measurement stages still require qualified timing admission. Neither lifts the
+    /// run's own memory budget ([`crate::sched::memory_holders`]).
     pub admit: aterm_capacity::Admit,
     /// `--test-threads`: the most libtest threads any test binary runs on.
     pub test_threads: Option<NonZeroU32>,
@@ -68,15 +74,19 @@ pub struct Args {
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
-    /// `--passed-binaries <path>`: with `test`, the versioned content proofs of
+    /// `--passed-binaries <path>`: with `release` and `test`, the versioned content proofs of
     /// prior successful test binaries; only a complete matching proof is carried
     /// ([`crate::testrun::carry`]).
     pub passed_binaries: Option<PathBuf>,
     /// `--passed-lint-packages <path>`: prior successful per-package lint content proofs.
     pub passed_lint_packages: Option<PathBuf>,
-    /// `--carry-context <sha256>`: a test run's frozen caller context, or a release lint's
-    /// verifier, seal and toolchain context. It is part of every item content key.
+    /// `--passed-appkit-groups <path>`: prior successful AppKit executable-group proofs.
+    pub passed_appkit_groups: Option<PathBuf>,
+    /// `--carry-context <sha256>`: a release's frozen verifier, seal and toolchain context for
+    /// its test, lint or AppKit run. It is part of every item content key.
     pub carry_context: Option<String>,
+    /// [`INPUT_DRIFT`]: a development test run's input-drift bracket.
+    pub input_drift: bool,
     /// `--events <path>`: the file each `check-finished`, `test-binary-finished` and
     /// `lint-package-finished` line is appended to whole, apart from the output its children share
     /// ([`crate::event_log`]): what a release's cutter keeps its records from, and `verify land`
@@ -221,7 +231,11 @@ where
             "--passed-lint-packages" => {
                 a.passed_lint_packages = Some(PathBuf::from(value("--passed-lint-packages")?));
             }
+            "--passed-appkit-groups" => {
+                a.passed_appkit_groups = Some(PathBuf::from(value("--passed-appkit-groups")?));
+            }
             "--carry-context" => a.carry_context = Some(value("--carry-context")?),
+            INPUT_DRIFT => a.input_drift = true,
             "--events" => a.events = Some(PathBuf::from(value("--events")?)),
             p if p.starts_with("-p") && p.len() > 2 => a.packages.push(p[2..].to_string()),
             f if f.starts_with('-') => return usage(format!("unknown flag `{f}`")),
@@ -271,8 +285,11 @@ where
     // The fix rewrites sources in place, so no other check may be reading
     // them: a compile beside it would judge half-written files. A release
     // judges the tree as it is, so never rewrites it.
-    if a.fix && (a.release || a.checks != [Check::Fmt]) {
-        return usage("--fix rewrites sources; run it alone: verify fmt --fix".to_string());
+    if a.fix && (a.release || (a.checks != [Check::Fmt] && a.checks != [Check::Census])) {
+        return usage(
+            "--fix rewrites sources; run it alone: verify fmt --fix, or verify census --fix"
+                .to_string(),
+        );
     }
     if !a.cells.is_empty() {
         if !a.checks.contains(&Check::Cells) {
@@ -341,10 +358,18 @@ where
             );
         }
     }
-    if a.passed_binaries.is_some() && !a.checks.contains(&Check::Test) {
+    if a.passed_binaries.is_some() && !(a.release && a.checks.contains(&Check::Test)) {
         return usage(
-            "--passed-binaries carries complete test proofs; run it with the test check".into(),
+            "--passed-binaries carries complete test proofs into a release's test run; run it \
+             with `release` and its test check"
+                .into(),
         );
+    }
+    if a.input_drift && (a.release || !a.checks.contains(&Check::Test)) {
+        return usage(format!(
+            "{INPUT_DRIFT} brackets a development test run's inputs (a release's always are); \
+             run it with the test check and without `release`"
+        ));
     }
     if a.passed_lint_packages.is_some() && !(a.release && a.checks.contains(&Check::Lint)) {
         return usage(
@@ -353,10 +378,22 @@ where
                 .into(),
         );
     }
+    if a.passed_appkit_groups.is_some() && !(a.release && a.checks.contains(&Check::Appkit)) {
+        return usage(
+            "--passed-appkit-groups carries exact executable proofs into a release's AppKit run; \
+             run it with `release` and its appkit check"
+                .into(),
+        );
+    }
     if let Some(context) = &a.carry_context {
-        if !(a.checks.contains(&Check::Test) || (a.release && a.checks.contains(&Check::Lint))) {
+        if !(a.release
+            && a.checks
+                .iter()
+                .any(|check| matches!(check, Check::Test | Check::Lint | Check::Appkit)))
+        {
             return usage(
-                "--carry-context salts test or release lint evidence; run it with one of those checks"
+                "--carry-context salts release test, lint or AppKit evidence; run it with \
+                 `release` and one of those checks"
                     .into(),
             );
         }
@@ -364,7 +401,9 @@ where
             return usage("--carry-context takes exactly 64 lowercase hex digits".into());
         }
     }
-    if (a.passed_binaries.is_some() || a.passed_lint_packages.is_some())
+    if (a.passed_binaries.is_some()
+        || a.passed_lint_packages.is_some()
+        || a.passed_appkit_groups.is_some())
         && a.carry_context.is_none()
     {
         return usage("prior content proofs require --carry-context <64 lowercase hex>".into());
@@ -471,13 +510,15 @@ Run aterm's checks in place, alone or in any combination.
   verify lint test -p aterm-grid  two checks on one crate
   verify test --all               every crate's tests (+ wasm-smoke)
   verify fmt --fix                rewrite what fmt finds unformatted
+  verify census --fix             move test modules a release build reads out of line
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
   verify watch                    idle-capacity main samples; journaled verdicts, no gate
   verify land                     merge main, judge the cone since it, push; compose a
                                   moved main or re-judge its delta (`verify land --help`)
-  verify release --bundle --app <APP>
-                                  its bundle half, after the build and the tree
+  verify release --bundle [--app <APP>]
+                                  its bundle CLI half: appkit needs no app;
+                                  measure needs one after the build and tree
   verify list                     every check: sets, needs, what it runs
   verify perf [LANE...]           the performance lanes (`verify perf --list`)
   verify soak [--ledger PATH]     the crash restore's soak (keeper P4): this
@@ -503,7 +544,8 @@ Run aterm's checks in place, alone or in any combination.
                                   session's worker row out of the run's set
 
 Sets:
-  dev      fmt census export-scan lint test doc (the default); its lint brings cells,
+  dev      released-shim fmt census export-scan lint test doc (the default);
+           released-shim builds only when bootstrap inputs change; its lint brings cells,
            one cell per other OS that builds a selected crate, and one of
            this OS for a lint with debug assertions off, which shipped code
            calling a debug-only seam fails
@@ -523,17 +565,18 @@ Options:
       --base <ref>        the cone's base (origin/main, else main; no fetch);
                           cannot combine with -p or --all, which replace the cone
       --app <APP>         the release bundle `measure` judges
-      --fix               with fmt alone: rewrite the files it finds unformatted
+      --fix               with fmt alone: rewrite the files it finds unformatted;
+                          with census alone: move the test modules it finds out of line
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --compile-only      with test/checkers/measure: compile tests or measuring benches without executing them
       --as-release        with test or doc and --all: as release runs them, with
-                          ATERM_SPEC_CHECKERS=1, ATERM_RELEASE_RUN=1, a disposable HOME
+                          ATERM_SPEC_CHECKERS=1, a disposable HOME
                           holding release history, and test owes the golden frame
                           test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
       --tree              with release: its complete tree sweep (unless --fail-fast)
-      --bundle            with release: only its bundle half (--app)
+      --bundle            with release: only its bundle half (--app only with measure)
       --checks <a,b,..>   with release: only these of its checks (a resume),
                           each as the release runs it
       --fail-fast         end the run at its first failure:
@@ -548,8 +591,10 @@ Options:
                           held through the last (default wait, saying why
                           once a minute; next in line, it holds back claimed
                           work after {reserve} and starts whatever the load
-                          after {start}); now starts at once, saying what
-                          it lacks, and a starved take is refused; the
+                          after {start}); now starts AppKit correctness
+                          drivers under the load found and reports it,
+                          while a measurement without timing qualification
+                          and a starved take are refused; the
                           Linux lane's lab is given it too. Under either,
                           the run's stages start only while the memory
                           they claim fits together in what can ever be
@@ -572,7 +617,7 @@ Options:
                           <target>/verify/.ubd/logs.noindex/runs.noindex; retention
                           targets 20 while preserving all running logs)
       --passed-binaries <path>
-                          with the test check: binaries that passed
+                          with release and test: binaries that passed
                           before, as schema-1 content proofs; only a prior ok
                           whose executable and complete runtime-input key match
                           is carried, not run again
@@ -580,9 +625,16 @@ Options:
                           with release and lint: prior schema-1 per-package lint
                           proofs; only a prior ok with the same complete compiler
                           input key is carried
+      --passed-appkit-groups <path>
+                          with release and appkit: prior schema-1 executable-group
+                          proofs; each current group is built and carried only when
+                          its exact executable-byte key still matches
       --carry-context <sha256>
-                          frozen caller context for test or release lint;
+                          a release's frozen context for test, lint or appkit;
                           required with prior content proofs
+      --input-drift       with test, outside release: a successful test binary
+                          whose executable or declared runtime inputs changed
+                          while it ran makes the test check NOT RUN
       --events <path>     append each check-finished and test-binary-finished
                           line there too, whole
   -h, --help
@@ -595,433 +647,9 @@ whose HEAD moved to another commit mid-run is exit 3: its checks read both trees
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn background_is_only_a_repeatable_tree_sample() {
-        let parse = |args: &[&str]| super::parse(args.iter().copied());
-        assert!(
-            parse(&["release", "--tree", "--background"])
-                .unwrap()
-                .background
-        );
-        for args in [
-            vec!["test", "--background"],
-            vec!["release", "--background"],
-            vec!["release", "--bundle", "--app", "app", "--background"],
-        ] {
-            assert!(parse(&args).is_err());
-        }
-    }
-    use super::*;
-
-    fn ok(args: &[&str]) -> Args {
-        parse(args.iter().copied()).unwrap_or_else(|e| panic!("{args:?}: {}", e.message()))
-    }
-
-    /// The bare command is the dev set on the cone; checks and sets combine
-    /// in one order without repeats.
-    #[test]
-    fn checks_and_sets_combine_in_one_order_and_the_default_is_dev() {
-        let a = ok(&[]);
-        assert_eq!(a.checks, DEV);
-        assert!(!a.all && a.packages.is_empty() && !a.release && a.narrows());
-        assert_eq!(ok(&["dev"]).checks, DEV);
-        assert_eq!(
-            ok(&["test", "lint", "test", "fmt"]).checks,
-            [Check::Fmt, Check::Lint, Check::Test]
-        );
-        let a = ok(&["dev", "forge"]);
-        assert_eq!(a.checks.len(), DEV.len() + 1);
-        assert!(a.checks.contains(&Check::Forge));
-        assert!(!ok(&["fmt", "census"]).narrows());
-    }
-
-    /// Only a run whose lint, test, doc or checkers builds its `-p` with this host's cargo asks
-    /// whether the host's graph holds each spec. CONTROL: `export-scan` and `cells` read `-p`
-    /// too ([`Args::narrows`]), and are not asked.
-    #[test]
-    fn only_a_check_that_builds_its_selection_here_hands_cargo_its_specs() {
-        let p = "windows-sys@0.61.2";
-        for (args, here) in [
-            (vec!["-p", p], true),
-            (vec!["lint", "-p", p], true),
-            (vec!["test", "-p", p], true),
-            (vec!["doc", "-p", p], true),
-            (vec!["checkers", "-p", p], true),
-            (vec!["export-scan", "-p", p], false),
-            (vec!["cells", "-p", p], false),
-            (vec!["fmt", "census", "-p", p], false),
-            (vec!["lint"], false),
-            (vec!["lint", "--all"], false),
-        ] {
-            let a = ok(&args);
-            assert_eq!(a.builds_packages_here(), here, "{args:?}");
-        }
-        assert!(ok(&["export-scan", "-p", p]).narrows());
-        assert!(ok(&["cells", "-p", p]).narrows());
-    }
-
-    #[test]
-    fn release_implies_the_whole_workspace_and_needs_its_bundle() {
-        let a = ok(&["release", "--app", "/x/aterm.app"]);
-        assert!(a.release && a.all);
-        assert_eq!(
-            a.checks,
-            CHECKS
-                .iter()
-                .map(|s| s.check)
-                .filter(|c| RELEASE.contains(c))
-                .collect::<Vec<_>>()
-        );
-        assert!(parse(["release"]).is_err(), "release needs its bundle");
-        assert!(parse(["release", "--app", "a", "-p", "x"]).is_err());
-        assert!(parse(["release", "cells", "--app", "a", "--cell", "win"]).is_err());
-        assert!(
-            parse(["release", "--checks=test", "--base", "previous-hop"]).is_err(),
-            "a release never narrows its tree to the fix hop's cone"
-        );
-    }
-
-    /// Binary proofs go only with a test check and a frozen context, including development
-    /// rejudges. Release-only lint proofs remain separate; another check cannot take binaries.
-    #[test]
-    fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
-        assert_eq!(
-            ok(&["release", "--tree", "--events", "/l/06-verify.events"])
-                .events
-                .as_deref(),
-            Some(std::path::Path::new("/l/06-verify.events"))
-        );
-        let a = ok(&[
-            "release",
-            "--checks=test",
-            "--passed-binaries",
-            "/l/06-verify.passed-binaries",
-            "--carry-context",
-            &"ab".repeat(32),
-        ]);
-        assert_eq!(a.checks, [Check::Test]);
-        assert_eq!(
-            a.passed_binaries.as_deref(),
-            Some(std::path::Path::new("/l/06-verify.passed-binaries"))
-        );
-        assert!(
-            ok(&[
-                "release",
-                "--passed-binaries",
-                "/p",
-                "--carry-context",
-                &"ab".repeat(32),
-                "--app",
-                "/a",
-            ])
-            .checks
-            .contains(&Check::Test)
-        );
-        for selection in [vec!["test", "--all"], vec!["--base", "previous-main"]] {
-            let context = "ab".repeat(32);
-            let mut args = selection;
-            args.extend(["--passed-binaries", "/p", "--carry-context", &context]);
-            let parsed = ok(&args);
-            assert!(!parsed.release && !parsed.as_release);
-            assert!(parsed.checks.contains(&Check::Test));
-            assert_eq!(parsed.carry_context.as_deref(), Some(context.as_str()));
-        }
-        for args in [
-            &[
-                "release",
-                "--checks",
-                "fmt",
-                "--passed-binaries",
-                "/p",
-                "--carry-context",
-                "abababababababababababababababababababababababababababababababab",
-            ][..],
-            &[
-                "release",
-                "--bundle",
-                "--passed-binaries",
-                "/p",
-                "--carry-context",
-                "abababababababababababababababababababababababababababababababab",
-                "--app",
-                "/a",
-            ],
-            &[
-                "fmt",
-                "--passed-binaries",
-                "/p",
-                "--carry-context",
-                "abababababababababababababababababababababababababababababababab",
-            ],
-        ] {
-            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
-        }
-        assert!(
-            parse(["release", "--checks=test", "--passed-binaries", "/p",]).is_err(),
-            "proofs without their frozen context are not reusable"
-        );
-        assert!(
-            parse(["release", "--checks=test", "--carry-context", "AA"]).is_err(),
-            "the salt is one canonical SHA-256"
-        );
-        assert_eq!(
-            ok(&["--base", "abc", "--events", "/e"]).events.as_deref(),
-            Some(std::path::Path::new("/e")),
-            "a dev run keeps its events (verify land's judgment)"
-        );
-    }
-
-    /// Lint package proofs have their own release-only wire and share the frozen item context.
-    /// Negative controls: a dev lint, another release check, and proofs without context are
-    /// refused before a file is read.
-    #[test]
-    fn a_release_resume_accepts_lint_package_proofs_only_for_lint() {
-        let context = "cd".repeat(32);
-        let parsed = ok(&[
-            "release",
-            "--checks=lint",
-            "--passed-lint-packages",
-            "/l/lint.jsonl",
-            "--carry-context",
-            &context,
-        ]);
-        assert_eq!(parsed.checks, [Check::Lint]);
-        assert_eq!(
-            parsed.passed_lint_packages.as_deref(),
-            Some(std::path::Path::new("/l/lint.jsonl"))
-        );
-        assert!(
-            parse([
-                "lint",
-                "--all",
-                "--passed-lint-packages",
-                "/p",
-                "--carry-context",
-                &context,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse([
-                "release",
-                "--checks=fmt",
-                "--passed-lint-packages",
-                "/p",
-                "--carry-context",
-                &context,
-            ])
-            .is_err()
-        );
-        assert!(parse(["release", "--checks=lint", "--passed-lint-packages", "/p",]).is_err());
-    }
-
-    /// `release --tree` and `release --bundle --app A` run its halves, both its whole set, and
-    /// `--checks` some of its checks; each is a release (whole workspace, its halt), `--app` goes
-    /// exactly with `measure`. Controls: each flag without `release`, a listed check outside the
-    /// release or its half, an unknown one, and `--app` beside no `measure`, are usage errors.
-    #[test]
-    fn release_narrows_to_its_halves_and_to_the_checks_listed() {
-        let in_order = |set: &[Check]| -> Vec<Check> {
-            CHECKS
-                .iter()
-                .map(|s| s.check)
-                .filter(|c| set.contains(c))
-                .collect()
-        };
-        let tree = ok(&["release", "--tree"]);
-        assert!(tree.release && tree.all && tree.app.is_none());
-        assert_eq!(tree.checks, in_order(&RELEASE_TREE));
-        let bundle = ok(&["release", "--bundle", "--app", "a"]);
-        assert!(bundle.release && bundle.all);
-        assert_eq!(bundle.checks, in_order(&RELEASE_BUNDLE));
-        assert_eq!(
-            ok(&["release", "--tree", "--bundle", "--app", "a"]).checks,
-            ok(&["release", "--app", "a"]).checks
-        );
-        let resume = ok(&["release", "--checks", "spec,test", "--checks=fmt"]);
-        assert!(resume.release && resume.all);
-        assert_eq!(resume.checks, [Check::Fmt, Check::Test, Check::Spec]);
-        assert_eq!(
-            ok(&["release", "--bundle", "--checks", "appkit"]).checks,
-            [Check::Appkit],
-            "appkit reads no bundle"
-        );
-        assert_eq!(
-            ok(&["release", "--checks", "measure", "--app", "a"]).checks,
-            [Check::Measure]
-        );
-        // Help and list are Ok before any refusal, as they were.
-        assert!(ok(&["release", "--tree", "--help"]).help);
-        assert_eq!(ok(&["release", "--tree", "--help"]).checks, tree.checks);
-        assert!(ok(&["list", "--tree"]).list);
-        for args in [
-            &["--tree"][..],
-            &["lint", "--bundle"],
-            &["test", "--checks", "test"],
-            &["release", "--checks", "cells"],
-            &["release", "--tree", "--checks", "appkit"],
-            &["release", "--checks", "tset"],
-            &["release", "--checks", "test,"],
-            &["release", "--tree", "--app", "a"],
-            &["release", "--checks", "lint", "--app", "a"],
-            &["release", "--bundle"],
-            &["release", "--checks", "fmt", "--fix"],
-        ] {
-            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn contradictions_and_unknowns_are_usage_errors() {
-        for args in [
-            &["-p", "x", "--all"][..],
-            &["--base", "main", "--all"],
-            &["lnit"],
-            &["--full"],
-            &["-p"],
-            &["-p="],
-            &["-p=--all"],
-            &["-p", "--all"],
-            &["--test-threads", "0"],
-            &["--test-cores", "0"],
-            &["--test-seed", "-1"],
-            &["--test-seed", "not-a-seed"],
-            &["--test-jobs", "2"],
-            &["--timeout", "45m"],
-            &["--admit", "later"],
-            &["list", "fmt"],
-            // --fix rewrites sources, so it runs alone, and only with fmt.
-            &["lint", "--fix"],
-            &["--fix"],
-            &["fmt", "lint", "--fix"],
-            &["release", "--app", "a", "--fix"],
-            // --cell narrows `cells` to cells forge knows.
-            &["lint", "--cell", "win"],
-            &["cells", "--cell", "plan9"],
-        ] {
-            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
-        }
-        assert!(ok(&["fmt", "--fix"]).fix);
-        assert_eq!(
-            ok(&["cells", "--cell", "win", "--cell=linux"]).cells,
-            ["win", "linux"]
-        );
-    }
-
-    #[test]
-    fn values_parse_into_their_types() {
-        let a = ok(&[
-            "lint",
-            "-p",
-            "a",
-            "--package",
-            "b",
-            "--scope=c",
-            "-pd",
-            "-p=e",
-        ]);
-        assert_eq!(a.packages, ["a", "b", "c", "d", "e"]);
-        let a = ok(&[
-            "test",
-            "--test-threads=3",
-            "--test-cores=10",
-            "--test-seed=17",
-            "--timeout",
-            "off",
-            "--log",
-            "/tmp/x.log",
-            "--no-windows",
-            "--base",
-            "main",
-        ]);
-        assert_eq!(a.test_threads.map(NonZeroU32::get), Some(3));
-        assert_eq!(a.test_cores.map(NonZeroU32::get), Some(10));
-        assert_eq!(a.test_seed, Some(17));
-        assert_eq!(a.timeout, Some(None));
-        assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
-        assert!(a.no_windows);
-        assert!(!a.fail_fast, "test failures keep their whole sweep");
-        assert!(ok(&["test", "--fail-fast"]).fail_fast);
-        assert_eq!(a.base.as_deref(), Some("main"));
-        assert_eq!(a.admit, aterm_capacity::Admit::Wait, "wait by default");
-        assert_eq!(
-            ok(&["measure", "--admit", "now"]).admit,
-            aterm_capacity::Admit::Now
-        );
-        assert_eq!(
-            ok(&["measure", "--admit=wait"]).admit,
-            aterm_capacity::Admit::Wait
-        );
-        assert!(parse(["measure", "--admit", "soon"]).is_err());
-        assert_eq!(
-            ok(&["--timeout", "90"]).timeout,
-            Some(Some(Duration::from_secs(90)))
-        );
-        assert_eq!(ok(&["test"]).admit, atpkg::admit_disk::Admit::Wait);
-        assert_eq!(
-            ok(&["test", "--admit", "now"]).admit,
-            atpkg::admit_disk::Admit::Now
-        );
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod cursor_pacing_tests {
-    #[test]
-    fn compilation_only_cannot_replace_test_execution_or_release_qualification() {
-        assert!(
-            super::parse(["test", "--all", "--compile-only"])
-                .unwrap()
-                .compile_only
-        );
-        for checks in [vec!["checkers"], vec!["test", "checkers"]] {
-            let mut args = checks;
-            args.extend(["--all", "--compile-only"]);
-            assert!(super::parse(args).unwrap().compile_only);
-        }
-        for args in [
-            vec!["release", "--app", "/test.app", "--compile-only"],
-            vec!["test", "lint", "--compile-only"],
-            vec!["--compile-only"],
-        ] {
-            assert!(super::parse(args).is_err());
-        }
-        for args in [
-            vec!["test", "--all", "--compile-only", "--as-release"],
-            vec!["test", "--all", "--as-release"],
-            vec!["doc", "--all", "--as-release"],
-        ] {
-            assert!(super::parse(args).unwrap().as_release);
-        }
-        for args in [
-            vec!["test", "--as-release"],
-            vec!["--all", "--as-release"],
-            vec!["lint", "--all", "--as-release"],
-            vec!["test", "--compile-only", "--as-release"],
-            vec![
-                "test",
-                "checkers",
-                "--all",
-                "--compile-only",
-                "--as-release",
-            ],
-            vec!["release", "--app", "/test.app", "--as-release"],
-        ] {
-            assert!(super::parse(args).is_err());
-        }
-    }
-
-    #[test]
-    fn focused_measurement_cannot_replace_release_qualification() {
-        let good = super::parse(["measure", "--app", "/test.app", "--cursor-pacing"]).unwrap();
-        assert!(good.cursor_pacing);
-        for bad in [
-            vec!["release", "--app", "/test.app", "--cursor-pacing"],
-            vec!["test", "--app", "/test.app", "--cursor-pacing"],
-            vec!["measure", "--cursor-pacing"],
-        ] {
-            assert!(super::parse(bad).is_err());
-        }
-    }
-}
+#[path = "cli_cursor_pacing_tests.rs"]
+mod cursor_pacing_tests;

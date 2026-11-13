@@ -31,6 +31,7 @@ use aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S;
 use aterm_session::sink::InputEpoch;
 
 use super::AosWindow;
+use crate::app_input::paste_order::WrittenEpoch;
 
 /// How long a held key waits for its program's own echo before the recording stops for it.
 pub(crate) const ECHO_PROOF_BOUND: Duration = Duration::from_secs(1);
@@ -62,7 +63,7 @@ thread_local! {
 }
 
 /// One held key.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EchoKey {
     /// One past its last cell, counted from the hold's start.
     end: u16,
@@ -70,9 +71,10 @@ struct EchoKey {
     seq: u64,
     /// Its press.
     at: Instant,
-    /// The session's input epoch once its bytes were written: a run continues only where no other
-    /// input reached the program since.
-    epoch: InputEpoch,
+    /// The session's input epoch once its bytes were written, as the route that wrote them notes
+    /// it ([`note_written`]), or `None` until a route hands it one: a run continues only where no
+    /// other input reached the program since ([`follows`]).
+    epoch: Option<WrittenEpoch>,
     /// Whether no other input reached the session between the key before it and its press (for a
     /// hold's first key, whether it continues the last proven run): a key is released on the run's
     /// corroboration only when it and every key before it back to the run do.
@@ -128,8 +130,17 @@ pub(crate) struct EchoRun {
     end: u16,
     coord_gen: u64,
     alt: bool,
-    epoch: InputEpoch,
+    /// Its last key's ([`EchoKey::epoch`]).
+    epoch: Option<WrittenEpoch>,
     tail: Vec<char>,
+}
+
+/// Whether a press whose epoch is `press` ([`Press::epoch`]) follows the write `written` notes
+/// with no other input between: the write's route noted the epoch it ended at, and the press saw
+/// that same epoch. A write not noted by the press, or a press with input still queued, follows
+/// nothing.
+fn follows(written: Option<&WrittenEpoch>, press: Option<InputEpoch>) -> bool {
+    press.is_some_and(|press| written.and_then(WrittenEpoch::get) == Some(press))
 }
 
 impl std::fmt::Debug for EchoRun {
@@ -211,8 +222,10 @@ pub(crate) struct Press {
     pub(crate) alt: bool,
     pub(crate) display_offset: usize,
     pub(crate) print_seq: u64,
-    /// The session's input epoch before the key's bytes are written.
-    pub(crate) epoch: InputEpoch,
+    /// The session's input epoch before the key's bytes are written, or `None` while the
+    /// session's ordered writer holds input it has not written, which the epoch does not count
+    /// yet.
+    pub(crate) epoch: Option<InputEpoch>,
     pub(crate) at: Instant,
     /// What the live screen showed where the key's echo would land.
     pub(crate) row: PressRow,
@@ -423,14 +436,14 @@ pub(crate) fn admit_key(
             {
                 return refused;
             }
-            let joins = h.keys.last().is_some_and(|k| k.epoch == press.epoch);
+            let joins = follows(h.keys.last().and_then(|k| k.epoch.as_ref()), press.epoch);
             h.own_glyph |= own_glyph;
             h.cells.extend_from_slice(&typed);
             h.keys.push(EchoKey {
                 end,
                 seq: press.print_seq,
                 at: press.at,
-                epoch: press.epoch,
+                epoch: None,
                 joins,
             });
         }
@@ -446,7 +459,7 @@ pub(crate) fn admit_key(
                         && r.end == start
                         && r.coord_gen == press.coord_gen
                         && r.alt == press.alt
-                        && r.epoch == press.epoch =>
+                        && follows(r.epoch.as_ref(), press.epoch) =>
                 {
                     r.tail
                 }
@@ -463,7 +476,7 @@ pub(crate) fn admit_key(
                     end,
                     seq: press.print_seq,
                     at: press.at,
-                    epoch: press.epoch,
+                    epoch: None,
                     joins: !run.is_empty(),
                 }],
                 run,
@@ -521,16 +534,20 @@ fn join_blind(
     KeyRoute::Hold
 }
 
-/// Notes the session's input epoch once the newest held key's bytes were written (a blind hold's
-/// keys never continue a run, so it notes nothing).
-pub(crate) fn note_written(aos: &mut AosWindow, epoch: InputEpoch) {
+/// Hands the newest held key `written`, where the route that writes its bytes notes the session's
+/// input epoch once they were written: inline as the UI thread's write returns, queued as the
+/// ordered writer's does, whenever that is. A key continues the one before it, or a hold the run
+/// it ended, only where that note was made by the next press and that press saw the same epoch
+/// ([`follows`]), so a write that has not landed by the next press continues nothing. A blind
+/// hold's keys never continue a run, so it takes none.
+pub(crate) fn note_written(aos: &mut AosWindow, written: WrittenEpoch) {
     if let Some(key) = aos
         .hold
         .as_mut()
         .filter(|h| h.blind == 0)
         .and_then(|h| h.keys.last_mut())
     {
-        key.epoch = epoch;
+        key.epoch = Some(written);
     }
 }
 
@@ -761,7 +778,7 @@ fn release(ws: &mut crate::WindowState, n: usize, now: Instant) {
         return;
     };
     let n = n.min(hold.keys.len());
-    let Some(last) = n.checked_sub(1).and_then(|i| hold.keys.get(i)).copied() else {
+    let Some(last) = n.checked_sub(1).and_then(|i| hold.keys.get(i)).cloned() else {
         return;
     };
     let end = usize::from(last.end);

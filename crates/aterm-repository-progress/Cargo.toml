@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-repository-progress"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Repository acquisition observations shared by setup and System State"
+
+[dependencies]
+aterm-types = { workspace = true }
+aterm-uds = { workspace = true }
+aterm-json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

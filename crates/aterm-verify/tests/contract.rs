@@ -15,10 +15,10 @@
 #[cfg(unix)]
 mod common;
 
-mod appkit_prebuild;
 mod compile_wrapper;
 mod conformance_end_by_proof;
 mod conformance_test_dispatch;
 mod gate_contract;
 mod profile_reuse;
+mod remote_cli;
 mod tether_entry;

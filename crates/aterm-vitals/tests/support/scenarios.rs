@@ -254,9 +254,10 @@ pub fn check(s: &Scenario, t: &Trace) -> Vec<String> {
                 r.consumer,
                 Consumer::AgentFg | Consumer::AgentBg | Consumer::Agent
             )
-            && r.verdict == Verdict::Quiet
+            && matches!(r.verdict, Verdict::Quiet | Verdict::Stuck)
             && r.phi_milli.is_some_and(|p| p >= PHI_STUCK_MILLI)
-            && wire.ends_with(" verdict=quiet no_progress=1")
+            && (wire.ends_with(" verdict=quiet no_progress=1")
+                || wire.ends_with(" verdict=stuck no_progress=1"))
     };
     if let Some((rel, r)) = t
         .ticks
@@ -1505,6 +1506,66 @@ pub fn all() -> Vec<Scenario> {
                 FirstAt(Quiet, 416_000),
                 NoProgressFrom(PHI8),
                 At(H26, Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "aterm_await.setsid",
+            row: "D2's shape, its process an `aterm ctl await` aterm's server holds parked: asleep \
+                  with no CPU for an hour, it waits on what it asked aterm for (aterm-wait, \
+                  fine, never no_progress)",
+            stretch_milli: 1000,
+            setup: |w| {
+                let mut ctl = sleeper(CHILD, "aterm");
+                ctl.aterm_wait = true;
+                w.call(
+                    1,
+                    AGENT,
+                    CALL,
+                    ctl,
+                    Some(hint(CALL, Consumer::AgentBg, Some("bplle5dxj"), None)),
+                );
+            },
+            each: nothing,
+            id: "a400",
+            until_ms: 3 * M20,
+            expect: &[
+                At(M1, Fine),
+                WaitAt(M1, WaitName::AtermWait),
+                At(3 * M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+                NoProgressNever,
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "aterm_await_let_go.setsid",
+            row: "D2's shape, its `aterm ctl await` parked for 20 min, then no longer held by \
+                  aterm's server while the same process sleeps on: from then it reads as D2 does \
+                  (quiet, then no_progress from φ 8)",
+            stretch_milli: 1000,
+            setup: |w| {
+                let mut ctl = sleeper(CHILD, "aterm");
+                ctl.aterm_wait = true;
+                w.call(
+                    1,
+                    AGENT,
+                    CALL,
+                    ctl,
+                    Some(hint(CALL, Consumer::AgentBg, Some("bplle5dxj"), None)),
+                );
+            },
+            each: |w, rel| w.p(CHILD).aterm_wait = rel < M20,
+            id: "a400",
+            until_ms: 3 * M20,
+            expect: &[
+                At(M20 - TICK_MS, Fine),
+                WaitAt(M20 - TICK_MS, WaitName::AtermWait),
+                WaitAt(M20 + M1, WaitName::Unnamed),
+                NoProgressFrom(M20 + TICK_MS + PHI8),
+                At(3 * M20, Quiet),
                 Never(Stuck),
             ],
             model: true,

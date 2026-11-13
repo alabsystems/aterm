@@ -132,8 +132,7 @@ fn the_nearest_ai_cli_above_is_the_asker() {
         ),
         (10, 1, "/bin/zsh", argv(&["-zsh"])),
     ]);
-    let none = || None;
-    let (id, level) = asker(&tree, &none).agent().expect("an asker");
+    let (id, level) = asker(&tree).agent().expect("an asker");
     assert_eq!((id, level), ("claude", Level::Yolo));
     let node = Tree(vec![
         (40, 30, "/bin/zsh", argv(&["zsh"])),
@@ -144,12 +143,12 @@ fn the_nearest_ai_cli_above_is_the_asker() {
             argv(&["/usr/local/lib/node_modules/muse/bin/muse", "--yolo"]),
         ),
     ]);
-    assert_eq!(asker(&node, &none).agent(), Some(("muse", Level::Yolo)));
+    assert_eq!(asker(&node).agent(), Some(("muse", Level::Yolo)));
     let person = Tree(vec![
         (40, 10, "/bin/zsh", argv(&["zsh"])),
         (10, 1, "/sbin/launchd", argv(&["launchd"])),
     ]);
-    assert_eq!(asker(&person, &none), Asker::Person);
+    assert_eq!(asker(&person), Asker::Person);
 }
 
 #[test]
@@ -182,14 +181,14 @@ fn permission_looking_argument_data_never_raises_the_inherited_level() {
 #[test]
 fn a_versioned_muse_executable_keeps_its_permission_custody() {
     let known = Tree(vec![(40, 1, "/x/muse", argv(&["muse", "--yolo"]))]);
-    assert_eq!(asker(&known, &|| None).agent(), Some(("muse", Level::Yolo)));
+    assert_eq!(asker(&known).agent(), Some(("muse", Level::Yolo)));
     let build = Tree(vec![(
         40,
         1,
         "/x/muse-bin-1.4.10-R6427.1",
         argv(&["muse-bin-1.4.10-R6427.1", "--yolo"]),
     )]);
-    assert_eq!(asker(&build, &|| None).agent(), Some(("muse", Level::Yolo)));
+    assert_eq!(asker(&build).agent(), Some(("muse", Level::Yolo)));
 }
 
 #[test]
@@ -200,30 +199,27 @@ fn a_codex_old_keeps_codexs_permission_custody() {
         (40, 30, "/bin/zsh", argv(&["zsh", "-c", "aterm ai review"])),
         (30, 1, store, argv(&["codex-old", "-s", "read-only"])),
     ]);
-    assert_eq!(
-        asker(&read_only, &|| None).agent(),
-        Some(("codex", Level::Plan))
-    );
+    assert_eq!(asker(&read_only).agent(), Some(("codex", Level::Plan)));
     let lookalike = Tree(vec![(
         40,
         1,
         "/x/codex-older",
         argv(&["codex-older", "-s", "read-only"]),
     )]);
-    assert_eq!(asker(&lookalike, &|| None), Asker::Person);
+    assert_eq!(asker(&lookalike), Asker::Person);
 }
 
 #[test]
 fn a_script_runtime_keeps_its_agents_script_and_permission_arguments() {
     let direct = Tree(vec![(40, 1, "/x/agy", argv(&["agy", "--mode", "plan"]))]);
-    assert_eq!(asker(&direct, &|| None).agent(), Some(("agy", Level::Plan)));
+    assert_eq!(asker(&direct).agent(), Some(("agy", Level::Plan)));
     let node = Tree(vec![(
         40,
         1,
         "/usr/bin/node",
         argv(&["node", "/x/agy", "--mode", "plan"]),
     )]);
-    assert_eq!(asker(&node, &|| None).agent(), Some(("agy", Level::Plan)));
+    assert_eq!(asker(&node).agent(), Some(("agy", Level::Plan)));
 }
 
 #[test]
@@ -502,7 +498,7 @@ fn an_incomplete_walk_and_an_unresolved_runtime_are_unknown() {
             panic!("no walk was started")
         }
     }
-    assert_eq!(asker(&MissingFirst, &|| None), Asker::Unknown);
+    assert_eq!(asker(&MissingFirst), Asker::Unknown);
     for (exec, words, parent) in [
         ("/usr/bin/node", argv(&["node", "-e", "anything"]), 1),
         ("/usr/bin/node", argv(&["node", "/x/unknown-script"]), 1),
@@ -510,7 +506,7 @@ fn an_incomplete_walk_and_an_unresolved_runtime_are_unknown() {
         ("/x/codex", argv(&["codex"]), 1),
     ] {
         let tree = Tree(vec![(40, parent, exec, words)]);
-        assert_eq!(asker(&tree, &|| None), Asker::Unknown, "{exec}");
+        assert_eq!(asker(&tree), Asker::Unknown, "{exec}");
     }
 }
 

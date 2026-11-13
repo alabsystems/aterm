@@ -6,8 +6,8 @@
 //! no trust: its bytes are hashed as they arrive and land only when they match, and a peer that
 //! sends other bytes is passed over while the release host's download goes on.
 //!
-//! Sharing is on by default (owner ruling 2026-10-27: "everything must be ON BY DEFAULT in
-//! atpkg!!!"). A download races this machine's fleet members ([`set_fleet`]) unless a person
+//! Sharing is on by default (docs/OWNER_RULINGS.md, 2026-10-27).
+//! A download races this machine's fleet members ([`set_fleet`]) unless a person
 //! writes `[packages] peers` ([`unit_peers`]; `peers = []` takes from none), each peer held to
 //! a pace ([`Pace`]) so a stalled or trickling one never holds a download. The process that
 //! runs the fleet listener serves this store's kept units to those members ([`share`]), and
@@ -1121,7 +1121,7 @@ pub struct Share<'a> {
 }
 
 /// Serve this store's kept units until `how.stop` is set: the default-on server of the
-/// process that runs the fleet listener (owner ruling 2026-10-27). While the person's off
+/// process that runs the fleet listener. While the person's off
 /// stands ([`turn_off`]) nothing listens. Otherwise `how.listen` is bound, again every
 /// [`BIND_RETRY`] while another server holds it, `units/` is made and the bound address is
 /// recorded ([`serving`]) until it closes; the store keeps each unit it installs while that

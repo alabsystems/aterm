@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::harness::accounts::{
-    Account, Row, SESSION_LIMIT, SOURCE_TAP, SessionRow, WEEK_LIMIT, Wall,
+    Account, Row, SESSION_LIMIT, SOURCE_TAP, SessionRow, SignInStep, WEEK_LIMIT, Wall,
 };
 
 const ANN: &str = "ac-0123456789abcdef";
@@ -222,61 +222,73 @@ fn scoped_keyers_restore_the_previous_lookup_after_nesting_and_unwind() {
 }
 
 /// `observe` keys each ledger row by its account's learned key and maps its kind (design §8):
-/// a rotation is a switch naming the account rotated to, a failed sign-in row (an automatic one's,
-/// a driven renewal's or Grok's, each written by its writer's own function) is `sign-in-failed` with how
-/// it ended as one word and never its reason line, one that signed its row in is nothing (its
-/// `renewed` row notes it), and so is a step of one (a shared adoption or preparation begun, a
-/// person's browser window ending), an auth word is `signed-out` or `auth`, a sample is nothing;
-/// no note carries a word that is not one of the module's constants.
-/// NEGATIVE CONTROL: with `of_ledger` leaving `to` unset, the switch names no account:
-/// `` left: None right: Some(ac-fedcba9876543210) ``.
+/// a rotation is a switch naming the account rotated to, an auth word is `signed-out`, a sample
+/// is nothing; a sign-in row is the step its writer states, never its reason line: only one that
+/// failed (an automatic one's, a driven renewal's, Grok's, each `why` made by its writer's own
+/// function) is `sign-in-failed`, with how it ended as one closed word where its writer's form
+/// says; one that began, one that bound a login (its `renewed` row notes it), a person's browser
+/// window ending and a row that states no step (as rows written before the step were) are no
+/// note; no note carries a word that is not one of the module's constants.
+/// NEGATIVE CONTROLS: with `of_ledger` leaving `to` unset, the switch names no account:
+/// `` left: None right: Some(ac-fedcba9876543210) ``; with `Kind::SignIn` mapped to
+/// `sign-in-failed` whatever its step (as before the audit of 2026-11-09), the begun, window and
+/// signed-in rows are failures too and the kinds differ.
 #[test]
 fn observe_keys_ledger_rows_and_maps_their_kinds() {
     let state = keyed();
     let mut events = vec![
         Event::new(100, Kind::Rotate, "ann").with_to("bob"),
-        Event::new(101, Kind::SignIn, "ann").because("auto failed: ann@example.invalid https://x"),
+        Event::sign_in(101, "ann", SignInStep::Failed)
+            .because("auto failed: ann@example.invalid https://x"),
+        Event::sign_in(101, "ann", SignInStep::Begun).because("shared adoption begun"),
+        Event::sign_in(101, "ann", SignInStep::Window).because("x window closed session-kept"),
+        Event::sign_in(101, "ann", SignInStep::SignedIn).because("auto signed-in: device"),
+        Event::new(101, Kind::SignIn, "ann").because("auto failed: device"),
         Event::new(102, Kind::Auth, "bob").because("signed-out"),
         Event::new(103, Kind::Sample, "ann"),
         Event::new(104, Kind::Rotate, "unkeyed"),
-        Event::new(105, Kind::SignIn, "bob").because("auto signed-in: mailbox"),
-        Event::new(106, Kind::SignIn, "bob").because("auto no-route: profile(none)"),
-        Event::new(107, Kind::SignIn, "ann").because("a reason no ladder wrote"),
-        Event::new(108, Kind::SignIn, "ann")
+        Event::sign_in(105, "bob", SignInStep::SignedIn).because("auto signed-in: mailbox"),
+        Event::sign_in(106, "bob", SignInStep::Failed).because("auto no-route: profile(none)"),
+        Event::sign_in(107, "ann", SignInStep::Failed).because("a reason no ladder wrote"),
+        Event::sign_in(108, "ann", SignInStep::Begun)
             .because(crate::harness::accounts::SHARED_ADOPTION_BEGUN),
-        Event::new(109, Kind::SignIn, "ann")
+        Event::sign_in(109, "ann", SignInStep::Begun)
             .because(crate::harness::accounts::SHARED_PREPARATION_BEGUN),
-        Event::new(110, Kind::SignIn, "bob").because(&crate::harness::browser_window::ledger_why(
-            "claude.ai",
-            crate::harness::browser_window::WindowEnd::Done,
-            "session-kept",
-        )),
-        Event::new(111, Kind::SignIn, "bob").because(&renewal(
+        Event::sign_in(110, "bob", SignInStep::Window).because(
+            &crate::harness::browser_window::ledger_why(
+                "claude.ai",
+                crate::harness::browser_window::WindowEnd::Done,
+                "session-kept",
+            ),
+        ),
+        Event::sign_in(111, "bob", SignInStep::Failed).because(&renewal(
             crate::harness::login_drive::Outcome::BotCheck(String::new()),
             Some("claude.ai"),
             crate::ai::connector::Flow::Browser,
         )),
-        Event::new(112, Kind::SignIn, "ann").because(&renewal(
+        Event::sign_in(112, "ann", SignInStep::Failed).because(&renewal(
             crate::harness::login_drive::Outcome::Hung,
             None,
             crate::ai::connector::Flow::Device,
         )),
-        Event::new(113, Kind::SignIn, "bob").because(&grok(Some("accounts.x.ai"), "signed-in")),
-        Event::new(114, Kind::SignIn, "bob")
+        Event::sign_in(113, "bob", SignInStep::SignedIn)
+            .because(&grok(Some("accounts.x.ai"), "signed-in")),
+        Event::sign_in(114, "bob", SignInStep::SignedIn)
             .because(&grok(Some("accounts.x.ai"), "signed-in-elsewhere")),
-        Event::new(115, Kind::SignIn, "ann").because(&grok(None, "stopped")),
-        Event::new(116, Kind::SignIn, "ann").because(&grok(Some("accounts.x.ai"), "bot-check")),
+        Event::sign_in(115, "ann", SignInStep::Failed).because(&grok(None, "stopped")),
+        Event::sign_in(116, "ann", SignInStep::Failed)
+            .because(&grok(Some("accounts.x.ai"), "bot-check")),
         // A page host that is the automatic form's word is still read as a renewal's.
-        Event::new(117, Kind::SignIn, "ann").because(&renewal(
+        Event::sign_in(117, "ann", SignInStep::Failed).because(&renewal(
             crate::harness::login_drive::Outcome::OffPin,
             Some("auto"),
             crate::ai::connector::Flow::Browser,
         )),
     ];
-    let notes = observe(Cli::Claude, &state, &state, &mut events, 200);
+    let notes = observe(Cli::Claude, &state, &mut state.clone(), &mut events, 200);
     assert_eq!(events[0].pk.as_deref(), Some(ANN));
-    assert_eq!(events[2].pk.as_deref(), Some(BOB));
-    assert_eq!(events[4].pk, None, "an unkeyed account is not noted");
+    assert_eq!(events[6].pk.as_deref(), Some(BOB));
+    assert_eq!(events[8].pk, None, "an unkeyed account is not noted");
     let kinds: Vec<&str> = notes.iter().map(|n| n.kind).collect();
     assert_eq!(
         kinds,
@@ -318,6 +330,244 @@ fn observe_keys_ledger_rows_and_maps_their_kinds() {
         assert!(note.why.is_none_or(|w| WHYS.contains(&w)));
         assert_eq!(note.cli, "claude");
     }
+}
+
+/// A sign-in row's step survives the ledger, and only on a sign-in row.
+/// NEGATIVE CONTROL: with `to_json_line` not writing `step`, the row reads back with none:
+/// `` left: None right: Some(Begun) ``.
+#[test]
+fn a_sign_in_rows_step_round_trips_the_ledger() {
+    for step in [
+        SignInStep::Begun,
+        SignInStep::Window,
+        SignInStep::SignedIn,
+        SignInStep::Failed,
+    ] {
+        let row = Event::sign_in(7, "ann", step).because("shared adoption begun");
+        let back = Event::of_json_line(&row.to_json_line()).unwrap();
+        assert_eq!(back.step, Some(step));
+        assert_eq!(back, row);
+    }
+    let mut other = Event::new(7, Kind::Rotate, "ann");
+    other.step = Some(SignInStep::Failed);
+    let back = Event::of_json_line(&other.to_json_line()).unwrap();
+    assert_eq!(back.step, None, "no other kind states a step");
+    let legacy = Event::of_json_line(r#"{"t":7,"kind":"sign-in","account":"ann","why":"x"}"#);
+    assert_eq!(legacy.unwrap().step, None);
+}
+
+/// A told note's kind, reason and time.
+type ToldNote = (&'static str, Option<&'static str>, u64);
+
+/// The kinds and reasons of the notes `observe` tells a journal that keeps them, with the state
+/// `after` holding `auth` for ann and the journal last told `said`.
+fn told_of(
+    auth: Auth,
+    said: Option<Told>,
+    mut events: Vec<Event>,
+    now: i64,
+) -> (Vec<ToldNote>, Option<Told>) {
+    let mut after = keyed();
+    after.accounts.get_mut("ann").unwrap().auth = auth;
+    // Bob's word is settled, so only ann's notes are read.
+    after.told.extend(said.map(|said| (ANN.to_owned(), said)));
+    let before = after.clone();
+    let (notes, published) = capture(|| {
+        let notes = observe(Cli::Claude, &before, &mut after, &mut events, now);
+        publish(&notes);
+        notes
+    });
+    assert_eq!(notes, published);
+    let ann = Key::new(ANN);
+    let told = notes
+        .iter()
+        .filter(|note| note.account == ann)
+        .map(|note| (note.kind, note.why, note.t))
+        .collect();
+    (told, after.told.get(ANN).copied())
+}
+
+const fn said(word: SignWord, t: u64) -> Option<Told> {
+    Some(Told { word, t })
+}
+
+/// THE AUDIT'S FIRST FINDING: a sign-in that succeeded is told as `renewed`, and the attempt row
+/// its transaction writes after it, in the same second, is no word at all, so no fold ends on
+/// `failed`; neither is a sign-in that only began, nor a browser window's end.
+/// NEGATIVE CONTROL: with `SignInStep::SignedIn` mapped to `sign-in-failed` (every sign-in row
+/// a failure, as before), the working login is given an `error` for a sign-in that succeeded:
+/// `` left: [("renewed", None, 100), ("error", Some("sign-in-failed"), 100)] ``.
+#[test]
+fn a_sign_in_that_succeeded_is_never_told_as_a_failure() {
+    let rows = vec![
+        Event::sign_in(90, "ann", SignInStep::Begun).because("shared preparation begun"),
+        Event::new(100, Kind::Auth, "ann").because("ok"),
+        Event::new(100, Kind::Renewed, "ann"),
+        Event::sign_in(100, "ann", SignInStep::SignedIn).because("auto signed-in: device"),
+        Event::sign_in(100, "ann", SignInStep::Window).because("x window closed no-session"),
+    ];
+    let (told, cursor) = told_of(Auth::Ok, said(SignWord::Out, 50), rows, 100);
+    assert_eq!(told, [("renewed", None, 100)]);
+    assert_eq!(cursor, said(SignWord::In, 100));
+}
+
+/// A row's word is told only where the store holds it. A sign-in that failed, or answered
+/// another account, on a login that still works here leaves the fleet's word `in` and is an
+/// `error` saying which; on a login that is signed out it is the account's word. A login wall
+/// the store refused (it holds a later word) is not told.
+/// NEGATIVE CONTROL: with `settle` telling every row's word (`holds` always true), the working
+/// login is published as failed: `` left: [("sign-in-failed", None, 201)] right: [("error",
+/// Some("sign-in-failed"), 200)] ``.
+#[test]
+fn a_rows_word_is_told_only_where_the_store_holds_it() {
+    let failed = || vec![Event::sign_in(200, "ann", SignInStep::Failed)];
+    let wrong = || vec![Event::new(200, Kind::WrongAccount, "ann")];
+    let held = said(SignWord::In, 100);
+    let (told, cursor) = told_of(Auth::Ok, held, failed(), 200);
+    assert_eq!(told, [("error", Some("sign-in-failed"), 200)]);
+    assert_eq!(cursor, held, "the fleet's word stands");
+    let (told, _) = told_of(Auth::Ok, held, wrong(), 200);
+    assert_eq!(told, [("error", Some("wrong-account"), 200)]);
+    let (told, _) = told_of(
+        Auth::Ok,
+        held,
+        vec![Event::new(90, Kind::LoginEnded, "ann")],
+        200,
+    );
+    assert_eq!(told, [], "a wall older than the word the store holds");
+    let out = said(SignWord::Out, 100);
+    let (told, cursor) = told_of(Auth::SignedOut, out, failed(), 200);
+    assert_eq!(told, [("sign-in-failed", None, 200)]);
+    assert_eq!(cursor, said(SignWord::Failed, 200));
+    let (told, cursor) = told_of(Auth::SignedOut, out, wrong(), 200);
+    assert_eq!(told, [("wrong-account", None, 200)]);
+    assert_eq!(cursor, said(SignWord::Wrong, 200));
+    // A login wall: the auth word and the wall are one transaction, told once, as the wall.
+    let wall = vec![
+        Event::new(200, Kind::Auth, "ann").because("signed-out"),
+        Event::new(200, Kind::LoginEnded, "ann"),
+    ];
+    let (told, cursor) = told_of(Auth::SignedOut, held, wall, 200);
+    assert_eq!(told, [("login-ended", None, 200)]);
+    assert_eq!(cursor, said(SignWord::Ended, 200));
+}
+
+/// THE AUDIT'S SECOND FINDING: a word no ledger row states is told from the state. A login that
+/// reads working again (a served turn proves it, with no auth row) is `signed-in`; one found
+/// signed out is `signed-out`; a word this Mac held before it kept a record of what it told is
+/// stated once as `auth` saying `ok`; a word the store no longer holds, or an account it no
+/// longer has a row of, is withdrawn with `auth` saying `unseen`; and a word the journal already
+/// holds is not told again.
+/// NEGATIVE CONTROL: with `settle`'s closing comparison skipped (`agreed` always true), the heal
+/// is not heard: `` left: [] right: [("signed-in", None, 300)] ``.
+#[test]
+fn a_word_no_row_states_is_told_from_the_state() {
+    let none = Vec::new;
+    let (told, cursor) = told_of(Auth::Ok, said(SignWord::Failed, 100), none(), 300);
+    assert_eq!(told, [("signed-in", None, 300)]);
+    assert_eq!(cursor, said(SignWord::In, 300));
+    let (told, _) = told_of(Auth::SignedOut, said(SignWord::In, 100), none(), 300);
+    assert_eq!(told, [("signed-out", None, 300)]);
+    let (told, cursor) = told_of(Auth::Ok, None, none(), 300);
+    assert_eq!(told, [("auth", Some("ok"), 300)]);
+    assert_eq!(cursor, said(SignWord::In, 300));
+    let (told, cursor) = told_of(Auth::Unseen, said(SignWord::In, 100), none(), 300);
+    assert_eq!(told, [("auth", Some("unseen"), 300)]);
+    assert_eq!(cursor, said(SignWord::Unknown, 300));
+    for (auth, held) in [
+        (Auth::Ok, said(SignWord::In, 100)),
+        (Auth::SignedOut, said(SignWord::Ended, 100)),
+        (Auth::Unseen, said(SignWord::Failed, 100)),
+        (Auth::Unseen, None),
+    ] {
+        let (told, cursor) = told_of(auth, held, none(), 300);
+        assert_eq!(told, [], "{auth:?} is what {held:?} says");
+        assert_eq!(cursor, held);
+    }
+    // No row of the account any more: the Mac's word is withdrawn, and that is kept as told.
+    let mut after = keyed();
+    after.told.insert(
+        "ac-00000000000000aa".into(),
+        Told {
+            word: SignWord::In,
+            t: 100,
+        },
+    );
+    let before = after.clone();
+    let (notes, _) = capture(|| observe(Cli::Claude, &before, &mut after, &mut [], 300));
+    assert_eq!(notes.len(), 1);
+    assert_eq!((notes[0].kind, notes[0].why), ("auth", Some("unseen")));
+    assert_eq!(notes[0].account, Key::new("ac-00000000000000aa"));
+    assert_eq!(
+        after.told["ac-00000000000000aa"].word,
+        SignWord::Unknown,
+        "kept, so a later word of it is told after this one"
+    );
+}
+
+/// Each word of an account is told under a later second than the one before it, whatever the
+/// clock or a row's own time says, so every fold takes the last one told as the newest and none
+/// has to break a tie; and what was told is saved with the state.
+/// NEGATIVE CONTROL: with `stamp` returning `natural`, the word told after a clock step back
+/// carries the older time and loses every fold: `` left: [("signed-out", None, 400)] right:
+/// [("signed-out", None, 501)] ``.
+#[test]
+fn a_later_word_is_told_under_a_later_time() {
+    let held = said(SignWord::In, 500);
+    let row = vec![Event::new(400, Kind::Auth, "ann").because("signed-out")];
+    let (told, cursor) = told_of(Auth::SignedOut, held, row, 400);
+    assert_eq!(told, [("signed-out", None, 501)]);
+    assert_eq!(cursor, said(SignWord::Out, 501));
+    let (told, _) = told_of(Auth::SignedOut, held, Vec::new(), 400);
+    assert_eq!(told, [("signed-out", None, 501)]);
+    let again = vec![Event::new(400, Kind::Renewed, "ann")];
+    let (told, cursor) = told_of(Auth::Ok, held, again, 400);
+    assert_eq!(told, [("renewed", None, 500)], "the same word, no earlier");
+    assert_eq!(cursor, held);
+    let mut state = keyed();
+    state.told.insert(ANN.into(), held.unwrap());
+    let back = State::from_json(&state.to_json(), 600).unwrap();
+    assert_eq!(back.told, state.told);
+    assert_eq!(back, state);
+    assert_ne!(back, keyed(), "what was told is part of the state");
+}
+
+/// A process whose notes go nowhere records nothing as told, so the next one that keeps notes
+/// tells the journal what it left; and a captured scope ends with the thread as it was.
+/// NEGATIVE CONTROL: with `telling` always true, the sinkless transaction records the word as
+/// told though nothing took it: `` left: {"ac-0123456789abcdef": Told { word: In, t: 300 }}
+/// right: {} ``.
+#[test]
+fn a_process_with_no_journal_records_nothing_as_told() {
+    let mut after = keyed();
+    after.accounts.get_mut("ann").unwrap().auth = Auth::Ok;
+    let before = after.clone();
+    let notes = observe(Cli::Claude, &before, &mut after, &mut [], 300);
+    assert_eq!(notes, []);
+    assert_eq!(after.told, BTreeMap::new());
+    assert_eq!(after, before);
+    let ((), outer) = capture(|| {
+        let ((), inner) = capture(|| {
+            note(&Note::new(
+                1,
+                "switch",
+                Key::new(ANN).unwrap(),
+                Cli::Claude,
+                "cli-output",
+            ))
+        });
+        assert_eq!(inner.len(), 1);
+        note(&Note::new(
+            2,
+            "switch",
+            Key::new(BOB).unwrap(),
+            Cli::Claude,
+            "cli-output",
+        ));
+    });
+    assert_eq!(outer.len(), 1, "a nested scope's notes are its own");
+    assert_eq!(outer[0].t, 2);
+    assert!(!telling());
 }
 
 fn fig(pct_x10: u32, reset: i64, at: i64) -> WindowFig {
@@ -369,7 +619,7 @@ fn observe_notes_sessions_readings_and_walls_from_the_diff() {
             cleared: false,
         },
     );
-    let notes = observe(Cli::Claude, &before, &after, &mut [], 40);
+    let notes = observe(Cli::Claude, &before, &mut after.clone(), &mut [], 40);
     let summary: Vec<(&str, &str)> = notes
         .iter()
         .map(|n| (n.kind, n.account.as_ref().map_or("", Key::as_str)))
@@ -533,7 +783,7 @@ fn a_provider_read_is_a_probe_of_its_account_saying_why() {
     let keyed = keyed();
     let mut claims = vec![Event::new(300, Kind::Probe, "ann")];
     assert!(
-        observe(Cli::Claude, &keyed, &keyed, &mut claims, 400).is_empty(),
+        observe(Cli::Claude, &keyed, &mut keyed.clone(), &mut claims, 400).is_empty(),
         "a probe claim is no read"
     );
 }
@@ -588,7 +838,7 @@ fn a_workspace_reading_names_its_sub_account_and_another_macs_is_left() {
         .unwrap()
         .windows
         .insert(SESSION_LIMIT.into(), elsewhere);
-    let notes = observe(Cli::Codex, &before, &after, &mut [], 40);
+    let notes = observe(Cli::Codex, &before, &mut after.clone(), &mut [], 40);
     let ann: Vec<&Note> = notes
         .iter()
         .filter(|n| n.account == Key::new(ANN))

@@ -217,6 +217,28 @@ pub fn read(path: &Path, now: Clocks) -> Option<Saved> {
     decode(&read_text(path)?, now)
 }
 
+/// [`read`] for a system that stamps no boot ([`crate::instance::boot_id`] is `None`: Windows),
+/// where a file's `ends` may be on the clock of a boot that has ended. `ends` counts only while
+/// the wall clock at `now` still puts it within [`DRIFT_SECS`] of the saved `deadline`, the same
+/// end as the save read it on the wall clock; otherwise (a restart started the boot clock again,
+/// or the date was changed) the file is read on its wall-clock `deadline`, never more than its
+/// span away, as a file of another boot is ([`take`]). A timed file with `ends` and no
+/// `deadline` (written by hand) is no mode.
+#[must_use]
+pub fn read_unstamped(path: &Path, now: Clocks) -> Option<Saved> {
+    decode_unstamped(&read_text(path)?, now)
+}
+
+/// [`read_unstamped`] of `text`. PURE.
+#[must_use]
+pub fn decode_unstamped(text: &str, now: Clocks) -> Option<Saved> {
+    let agrees = fields(text).is_some_and(|fields| {
+        matches!((fields.ends, fields.deadline), (Some(ends), Some(wall))
+            if now.wall_at(ends).abs_diff(wall) <= DRIFT_SECS)
+    });
+    parse(text, now, |_| agrees).map(|(saved, _)| saved)
+}
+
 /// The text of the regular state file at `path`, as [`read`] reads it.
 fn read_text(path: &Path) -> Option<String> {
     use std::io::Read as _;

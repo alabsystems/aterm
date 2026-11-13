@@ -85,8 +85,13 @@ fn a_held_lock_costs_one_row_that_the_next_gap_line_says() {
 fn a_kept_row_is_said_lost_only_once_its_writer_gives_it_up() {
     let (_tmp, dir, held) = held_log();
     let lost = Lost::new();
-    let kept = |at| write_kept_with(dir.clone(), &host(), &[row(at).line()], &lost);
-    assert!(!kept(1), "refused by the held lock");
+    let kept =
+        |at| write_kept_with(dir.clone(), &host(), &[row(at).line()], &lost) == Kept::Written;
+    assert_eq!(
+        write_kept_with(dir.clone(), &host(), &[row(1).line()], &lost),
+        Kept::Refused,
+        "refused by the held lock, none of it left"
+    );
     assert_eq!(lost.lost(), 0, "a kept row is not counted");
     assert!(
         !write(dir.clone(), &host(), &row(2), &Lost::new()),
@@ -113,6 +118,145 @@ fn a_kept_row_is_said_lost_only_once_its_writer_gives_it_up() {
     );
     assert!(kept(4));
     assert_eq!(crate::log::read(&dir, 4, None).expect("read").dropped, 3);
+}
+
+/// AN APPEND ITS LOG COULD NOT CUT BACK IS NOT TAKEN AS REFUSED (TM-1 review): where a
+/// failed write's cut back fails too ([`crate::Log::never_cut_back`]), the log may hold what
+/// it wrote. Rows so left answer [`Kept::Unsure`], which their writer settles by asking the
+/// log, and [`write`] counts no row so left as lost; a gap line so left is taken as said, its
+/// records not left again nor the caller's own unrecorded rows it said given back, and the
+/// rows after it, never written, are refused. Every loss is said once. NEGATIVE CONTROL: the
+/// same writes, cut back, answer [`Kept::Refused`], count the row lost, and leave the gap's
+/// records and the caller's rows to say again.
+#[test]
+fn an_append_its_log_could_not_cut_back_is_unsure_and_its_gap_said_once() {
+    use std::sync::{Arc, atomic::AtomicU64};
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let lines = [row(2).line(), row(3).line()];
+    for uncut in [false, true] {
+        let dir = tmp.path().join(format!("telemetry-{uncut}"));
+        let log = |room: usize| {
+            let log = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host())
+                .waiting(LOCK_WAIT)
+                .cut_after(Arc::new(AtomicU64::new(room as u64)));
+            if uncut { log.never_cut_back() } else { log }
+        };
+        assert_eq!(
+            write_kept_with(dir.clone(), &host(), &[row(1).line()], &Lost::new()),
+            Kept::Written
+        );
+        let lost = Lost::new();
+        assert_eq!(
+            kept(append_to(&log(lines[0].len()), &lines, &lost)),
+            if uncut { Kept::Unsure } else { Kept::Refused },
+            "two rows, the disk full after the first"
+        );
+        let holds = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host())
+            .holds(&lines)
+            .expect("read");
+        assert_eq!(holds, [uncut, false]);
+        let wrote_it = wrote(append_to(&log(4), &[row(4).line()], &lost), &lost);
+        assert!(!wrote_it);
+        assert_eq!(
+            lost.lost(),
+            u64::from(!uncut),
+            "a row the log may hold is not lost"
+        );
+
+        let dir = tmp.path().join(format!("gap-{uncut}"));
+        assert_eq!(
+            write_kept_with(dir.clone(), &host(), &[row(1).line()], &Lost::new()),
+            Kept::Written
+        );
+        crate::log::mark_lost(&dir, "w", None, 3).expect("a loss record");
+        // Two rows of the writer's own it could leave no record of, its gap line's to say.
+        let lost = Lost::new();
+        lost.unmarked.store(2, std::sync::atomic::Ordering::Release);
+        let gap = crate::row::gap_line(crate::now_ms(), 5);
+        assert!(gap.ends_with('\n'), "{gap:?}");
+        let log = |room: usize| {
+            let log = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host())
+                .waiting(LOCK_WAIT)
+                .cut_after(Arc::new(AtomicU64::new(room as u64)));
+            if uncut { log.never_cut_back() } else { log }
+        };
+        assert_eq!(
+            kept(append_to(&log(gap.len() - 1), &[row(5).line()], &lost)),
+            Kept::Refused,
+            "the gap line cut of its line feed: the row never written"
+        );
+        assert_eq!(
+            write_kept_with(dir.clone(), &host(), &[row(6).line()], &lost),
+            Kept::Written
+        );
+        let read = crate::log::read(&dir, 4, None).expect("read");
+        assert_eq!(
+            read.dropped, 5,
+            "the 3 recorded rows and the writer's 2, said once (uncut: {uncut})"
+        );
+        assert_eq!(
+            read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            [1, 6]
+        );
+    }
+}
+
+/// A TORN LINE'S MEND THAT FAILS WRITES NONE OF ITS APPEND (TM-1 review): an append to a log
+/// whose last line is torn (a crash's, or a write that could not be cut back) first ends that
+/// line, and where that line feed's write fails and cannot be cut back either, none of the
+/// rows or the gap line was written: [`write`] counts the row lost, and the gap's records are
+/// left again, said once by the next write. NEGATIVE CONTROL (by hand: the mend's error
+/// passed on as one that may have left the lines): the row counted nowhere, and the records
+/// taken and never said.
+#[test]
+fn a_torn_lines_mend_that_fails_writes_none_of_its_append() {
+    use std::sync::{Arc, atomic::AtomicU64};
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    for gap in [false, true] {
+        let dir = tmp.path().join(format!("torn-{gap}"));
+        assert_eq!(
+            write_kept_with(dir.clone(), &host(), &[row(1).line()], &Lost::new()),
+            Kept::Written
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(crate::log::file_path(&dir, 0))
+            .expect("the log's file");
+        std::io::Write::write_all(&mut file, b"kind=task torn").expect("a torn tail");
+        drop(file);
+        let log = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host())
+            .waiting(LOCK_WAIT)
+            .cut_after(Arc::new(AtomicU64::new(0)))
+            .never_cut_back();
+        let lost = Lost::new();
+        if gap {
+            crate::log::mark_lost(&dir, "w", None, 3).expect("a loss record");
+            assert_eq!(
+                kept(append_to(&log, &[row(5).line()], &lost)),
+                Kept::Refused
+            );
+        } else {
+            assert!(!wrote(append_to(&log, &[row(5).line()], &lost), &lost));
+            assert_eq!(lost.lost(), 1, "the row, never written, counted lost");
+        }
+        let holds = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host())
+            .holds(&[row(5).line()])
+            .expect("read");
+        assert_eq!(holds, [false]);
+        assert_eq!(
+            write_kept_with(dir.clone(), &host(), &[row(6).line()], &lost),
+            Kept::Written
+        );
+        let read = crate::log::read(&dir, 4, None).expect("read");
+        assert_eq!(
+            (
+                read.dropped,
+                read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>()
+            ),
+            (if gap { 3 } else { 1 }, vec![1, 6]),
+            "each loss said once (gap: {gap})"
+        );
+    }
 }
 
 /// The log in a scratch folder, its lock held by the test until the guard drops.

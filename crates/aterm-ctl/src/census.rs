@@ -170,6 +170,9 @@ pub(crate) struct Listed {
 pub(crate) trait Kernel {
     /// This user's processes, or `None` when the process table cannot be read.
     fn listed(&self) -> Option<Vec<Listed>>;
+    /// `parent`'s child processes, read for it alone; `None` when they cannot be read, or the
+    /// list may be cut.
+    fn children(&self, parent: u32) -> Option<Vec<u32>>;
     /// `pid`'s executable image ([`image_of`]).
     fn exe(&self, pid: u32) -> Option<Image>;
     /// Whether `pid`'s one thread has run ([`aterm_uds::process::thread_ran`]).
@@ -230,6 +233,25 @@ impl Kernel for LiveKernel {
             }
         };
         Some(read_then_aged(pids, read, unix_now))
+    }
+
+    /// libproc's `proc_listchildpids` ([`aterm_sysprobe::jobs::child_pids`]): one call that walks
+    /// the process list alone, never waiting on a process mid-exec as a `KERN_PROC_ALL` read does.
+    #[cfg(target_os = "macos")]
+    fn children(&self, parent: u32) -> Option<Vec<u32>> {
+        aterm_sysprobe::jobs::child_pids(parent)
+    }
+
+    /// The rows of [`Self::listed`] whose parent is `parent`: `/proc` has no wait to outlast.
+    #[cfg(not(target_os = "macos"))]
+    fn children(&self, parent: u32) -> Option<Vec<u32>> {
+        Some(
+            self.listed()?
+                .into_iter()
+                .filter(|row| row.ppid == Some(parent))
+                .map(|row| row.pid)
+                .collect(),
+        )
     }
 
     fn exe(&self, pid: u32) -> Option<Image> {
@@ -471,58 +493,41 @@ pub struct Child {
     pub words: Option<Vec<String>>,
 }
 
-/// This user's processes and their parents, as the census lists them, read once: no `ps`, and
-/// no process's arguments.
-pub struct Listing(Vec<Listed>);
-
-impl Listing {
-    /// The process table, now.
-    ///
-    /// # Errors
-    /// The table cannot be read (and off macOS and Linux, always).
-    pub fn read() -> Result<Self, String> {
-        #[cfg(unix)]
-        {
-            LiveKernel
-                .listed()
-                .map(Self)
-                .ok_or_else(|| "the process table could not be read".to_string())
-        }
-        #[cfg(not(unix))]
-        {
-            Err("macOS and Linux only".to_string())
-        }
+/// The aterm processes whose parent is `parent` ([`Child`]), in the kernel's order: its children
+/// read for it alone ([`Kernel::children`]), never out of a read of the whole process table, which
+/// the kernel can hold past its bound while another process is mid-exec (a busy machine's build
+/// starts hundreds) and so reads as no children at all.
+///
+/// # Errors
+/// Its children cannot be read (and off macOS and Linux, always).
+pub fn aterm_children(parent: u32) -> Result<Vec<Child>, String> {
+    #[cfg(unix)]
+    {
+        children_of(&LiveKernel, parent)
+            .ok_or_else(|| format!("the children of {parent} could not be read"))
     }
-
-    /// The aterm processes whose parent is `parent` ([`Child`]), in table order.
-    #[must_use]
-    pub fn aterm_children(&self, parent: u32) -> Vec<Child> {
-        #[cfg(unix)]
-        {
-            children_in(&LiveKernel, &self.0, parent)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = parent;
-            Vec::new()
-        }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Err("macOS and Linux only".to_string())
     }
 }
 
-/// The rows of `listed` whose parent is `parent` (no child of pid 0 or of launchd) that `k`
-/// proves aterm ([`aterm_words`]), in table order.
-pub(crate) fn children_in(k: &impl Kernel, listed: &[Listed], parent: u32) -> Vec<Child> {
-    listed
-        .iter()
-        .filter(|row| parent > 1 && row.ppid == Some(parent))
-        .filter_map(|row| {
-            let (_, words) = aterm_words(k, row.pid)?;
-            Some(Child {
-                pid: row.pid,
-                words,
+/// `parent`'s children ([`Kernel::children`]) that `k` proves aterm ([`aterm_words`]), in the
+/// kernel's order; none for pid 0 or launchd. `None` when its children cannot be read.
+pub(crate) fn children_of(k: &impl Kernel, parent: u32) -> Option<Vec<Child>> {
+    if parent <= 1 {
+        return Some(Vec::new());
+    }
+    Some(
+        k.children(parent)?
+            .into_iter()
+            .filter_map(|pid| {
+                let (_, words) = aterm_words(k, pid)?;
+                Some(Child { pid, words })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// The file name of `path`, when it is UTF-8.

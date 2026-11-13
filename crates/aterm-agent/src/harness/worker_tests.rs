@@ -1191,7 +1191,7 @@ fn codex_twin(dir: &Path, name: &str, exe: &Path) -> PathBuf {
 /// starter's own image; it carries the starter's `CODEX_HOME` (an empty one is unset, a
 /// relative one refused; with none, another `HOME`'s `.codex`) and the flags that move its
 /// config, say how it reaches its provider or say what it may do unasked (its parent's permissions,
-/// owner ruling 2026-11-02, here bypass, above the floor), never its model or folders (by flag or
+/// here bypass, above the floor), never its model or folders (by flag or
 /// `-c`); a vendor Codex image of the same name, which never carries itself, is no starter (the
 /// line is then the managed twin's, else the word's, the twin's at the floor); a starter no
 /// relaunch could resume (`exec`, `--remote`) lends only the posture its root names, here none,

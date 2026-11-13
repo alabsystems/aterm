@@ -512,6 +512,32 @@ pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
+/// Read an authenticated native advertisement with exact ref selection.
+pub(crate) fn repo_refs(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if inv.global.anonymous || inv.global.as_profile.is_some() {
+        return Err(inv.usage("repo refs uses the configured owner identity; anonymous reads use --anonymous repo public-refs"));
+    }
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let reference = inv.flag("--ref");
+    if reference.is_some_and(|name| !name.starts_with("refs/") || !crate::path::ref_name_ok(name)) {
+        return Err(inv.usage("--ref requires an exact full Git ref"));
+    }
+    let out = gh.run_git(&GitRun::ls_remote(&slug, reference).with_named(named))?;
+    let items = crate::git::advertised_refs(&out.stdout, reference)?
+        .into_iter()
+        .map(|(name, oid)| aterm_json::json!({"ref":name,"oid":oid}))
+        .collect();
+    Ok(Outcome {
+        answer: Answer::Items {
+            noun: super::verbs::Noun::Raw,
+            items,
+            completeness: super::Completeness::Complete,
+        },
+        receipt: Receipt::for_repo(inv, &gh, &slug),
+    })
+}
+
 /// Read the public smart-HTTP advertisement without a credential or REST lookup.
 pub(crate) fn repo_public_refs(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     if !inv.global.anonymous || inv.global.as_profile.is_some() {

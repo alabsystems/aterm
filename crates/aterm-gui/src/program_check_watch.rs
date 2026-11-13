@@ -2,10 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! Background watcher for macOS `syspolicyd` worker pool saturation and its dev stand-ins.
+//!
+//! A look runs one setuid `ps` of the daemon's pool, so the watch looks only while there is
+//! something to judge ([`Cadence`]): once a tick after the window starts (the first answer, which
+//! ends a stuck alert a restart cleared), every tick while the pool reads full (the stuck verdict
+//! times the full run from its first full reading, and only a look sees it end), and at a ring
+//! ([`want`]): the jobs pass rings each pass while a program of this user waits at the check
+//! ([`last_read_for`]), and an ask for the board (`status`, `program-check`) rings when its last
+//! look is a tick old or more ([`ask`]). A ring never brings looks closer than a tick apart. At
+//! rest (the pool below its limit and nothing waiting) the thread parks with no timeout: a full
+//! pool strands only a program that starts, and such a start is a held row in the jobs pass.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use aterm_uds::program_check::Look;
 use aterm_vitals::program_check::{Daemon, Judge, Reading, State};
@@ -27,6 +37,9 @@ pub(crate) struct Board {
     told_unstuck: bool,
     /// `(workers, limit)` reported at the stuck edge and repeated while stuck.
     told_stuck: Option<(u64, Option<u64>)>,
+    /// When the last look was taken, whatever it read, on [`now_ms`]'s clock: what an ask
+    /// judges stale ([`stale`]).
+    looked_ms: Option<u64>,
 }
 
 impl Board {
@@ -39,6 +52,7 @@ impl Board {
             seen: None,
             told_unstuck: false,
             told_stuck: None,
+            looked_ms: None,
         }
     }
 }
@@ -121,6 +135,7 @@ fn now_ms() -> u64 {
 /// Folds `look` at `at_ms` into `board` and returns any [`HostNote`] owed to the window.
 pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote> {
     let was_stuck = matches!(board.judge.state(), State::Stuck { .. });
+    board.looked_ms = Some(at_ms);
     let now = match look {
         Look::Read(reading) => {
             board.last = Some(reading);
@@ -267,9 +282,12 @@ pub(crate) fn cmd(rest: &str) -> String {
         WATCHING.load(Ordering::SeqCst),
         ours,
     ) {
-        Ok(Ask::Pool(full)) => FULL_STAND_IN.store(full, Ordering::SeqCst),
+        Ok(Ask::Pool(full)) => {
+            FULL_STAND_IN.store(full, Ordering::SeqCst);
+            want();
+        }
         Ok(Ask::Held(pid)) => HELD_STAND_IN.store(pid.unwrap_or(0), Ordering::SeqCst),
-        Ok(Ask::Read) => {}
+        Ok(Ask::Read) => ask(),
         Err(refusal) => return format!("ERR {refusal}\n"),
     }
     let reading = if FULL_STAND_IN.load(Ordering::SeqCst) {
@@ -307,15 +325,19 @@ pub(crate) fn starts_held(board: &Mutex<Board>) -> bool {
     )
 }
 
-/// Formats the `syspolicyd=*` fields for `status`.
+/// Formats the `syspolicyd=*` fields for `status`: the board as the last look left it, and a
+/// ring for a fresh look when that look is a tick old or more ([`ask`]), so a caller that asks
+/// again reads one.
 pub(crate) fn status_fields() -> String {
+    ask();
     let b = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
     fields(&b, now_ms(), aterm_sysprobe::jobs::now_us())
 }
 
 /// `status`'s `syspolicyd=*` fields from `b` at `now_ms` ([`now_ms`]'s clock) and `wall_us`
 /// (µs since the epoch). The daemon's age is `-` while the last look read nothing, since no
-/// look says it still runs.
+/// look says it still runs. `syspolicyd_age_ms=` is how long ago the last look was taken
+/// (`-` before one): at rest the board is that look's, however old.
 fn fields(b: &Board, now_ms: u64, wall_us: u64) -> String {
     let state = b.judge.state();
     let workers = b.last.map_or_else(
@@ -338,9 +360,13 @@ fn fields(b: &Board, now_ms: u64, wall_us: u64) -> String {
         .filter(|_| b.read_ms.is_some())
         .and_then(|d| wall_us.checked_sub(d.started_us()))
         .map_or_else(|| "-".to_owned(), |up| (up / 1000).to_string());
+    let age_ms = b.looked_ms.map_or_else(
+        || "-".to_owned(),
+        |at| now_ms.saturating_sub(at).to_string(),
+    );
     format!(
         "syspolicyd={} syspolicyd_workers={workers} syspolicyd_full_ms={full_ms} \
-         syspolicyd_pid={pid} syspolicyd_up_ms={up_ms}",
+         syspolicyd_pid={pid} syspolicyd_up_ms={up_ms} syspolicyd_age_ms={age_ms}",
         state.as_str()
     )
 }
@@ -376,12 +402,216 @@ fn check_of(b: &Board, now_ms: u64) -> Option<RunningCheck> {
     })
 }
 
-/// [`check_of`] the process-wide board now.
-pub(crate) fn last_read() -> Option<RunningCheck> {
-    check_of(
-        &BOARD.lock().unwrap_or_else(PoisonError::into_inner),
-        now_ms(),
-    )
+/// The check `b`'s last look read, whatever its age: what stands while nothing waits at the
+/// check, for a pass with no held row to judge (its daemon and whether its pool read full).
+fn standing_of(b: &Board, now_ms: u64) -> Option<RunningCheck> {
+    b.read_ms?;
+    let r = b.last?;
+    Some(RunningCheck {
+        daemon: r.daemon,
+        pool_full: r.full(),
+        awake_ms: b
+            .seen
+            .filter(|(d, _)| *d == r.daemon)
+            .map_or(0, |(_, since)| now_ms.saturating_sub(since)),
+    })
+}
+
+/// The process-wide board for the jobs pass, which says whether a program of this user waits at
+/// the check (`waiting`): while one does, the watch is rung ([`want`]) and only a fresh look is
+/// handed ([`check_of`]), since its rows are judged against it; while none does, the look that
+/// stands ([`standing_of`]), against which nothing is judged.
+pub(crate) fn last_read_for(waiting: bool) -> Option<RunningCheck> {
+    read_for(&BOARD, &BELL, now_ms(), waiting)
+}
+
+/// [`last_read_for`] over `board` and `bell` at `now_ms`.
+fn read_for(board: &Mutex<Board>, bell: &Bell, now_ms: u64, waiting: bool) -> Option<RunningCheck> {
+    if waiting {
+        bell.ring();
+    }
+    let b = board.lock().unwrap_or_else(PoisonError::into_inner);
+    if waiting {
+        check_of(&b, now_ms)
+    } else {
+        standing_of(&b, now_ms)
+    }
+}
+
+/// Whether `b`'s last look is a tick old or more at `now_ms`, or none was taken: an ask then
+/// rings for a fresh one ([`ask`]).
+fn stale(b: &Board, now_ms: u64) -> bool {
+    b.looked_ms
+        .is_none_or(|at| u128::from(now_ms.saturating_sub(at)) >= every().as_millis())
+}
+
+/// An ask for the board (`status`, `program-check`): rings the watch when its last look is stale
+/// ([`stale`]).
+fn ask() {
+    ask_on(&BOARD, &BELL, now_ms());
+}
+
+/// [`ask`] over `board` and `bell` at `now_ms`.
+fn ask_on(board: &Mutex<Board>, bell: &Bell, now_ms: u64) {
+    let stale = stale(
+        &board.lock().unwrap_or_else(PoisonError::into_inner),
+        now_ms,
+    );
+    if stale {
+        bell.ring();
+    }
+}
+
+/// Rings the watch for a look ([`Cadence::rung`]): at once when its last look is a tick old or
+/// more, else a tick after that look.
+pub(crate) fn want() {
+    BELL.ring();
+}
+
+/// When the watch looks, on [`now_ms`]'s clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cadence {
+    /// The next look; `None` at rest, where only a ring brings one.
+    next_ms: Option<u64>,
+    /// When the last look was taken.
+    last_ms: Option<u64>,
+}
+
+impl Cadence {
+    /// A watch started at `at_ms`: its first look a tick later.
+    pub(crate) fn started(at_ms: u64) -> Self {
+        Self {
+            next_ms: Some(at_ms.saturating_add(tick_ms())),
+            last_ms: None,
+        }
+    }
+
+    /// A ring at `now_ms`: a look at once when the last is a tick old or more (or none was
+    /// taken), else a tick after the last, and never later than a look already due.
+    pub(crate) fn rung(&mut self, now_ms: u64) {
+        let at = self
+            .last_ms
+            .map_or(now_ms, |last| last.saturating_add(tick_ms()).max(now_ms));
+        self.next_ms = Some(self.next_ms.map_or(at, |next| next.min(at)));
+    }
+
+    /// A look taken at `at_ms` left the judge at `state`: the next a tick later while the pool
+    /// reads full or stuck, else none until a ring.
+    pub(crate) fn looked(&mut self, at_ms: u64, state: State) {
+        self.last_ms = Some(at_ms);
+        self.next_ms = matches!(state, State::Full { .. } | State::Stuck { .. })
+            .then(|| at_ms.saturating_add(tick_ms()));
+    }
+
+    /// How long from `now_ms` until the next look: `Some(0)` when due, `None` at rest.
+    pub(crate) fn wait_ms(&self, now_ms: u64) -> Option<u64> {
+        self.next_ms.map(|next| next.saturating_sub(now_ms))
+    }
+}
+
+/// [`every`] in ms.
+fn tick_ms() -> u64 {
+    u64::try_from(every().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What rings the watch from its park ([`want`]).
+pub(crate) struct Bell {
+    rung: Mutex<bool>,
+    cv: Condvar,
+    /// How many times it was rung, for a test.
+    #[cfg(test)]
+    rings: std::sync::atomic::AtomicUsize,
+}
+
+impl Bell {
+    /// A bell nobody has rung.
+    pub(crate) const fn new() -> Self {
+        Self {
+            rung: Mutex::new(false),
+            cv: Condvar::new(),
+            #[cfg(test)]
+            rings: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Ring it: the parked watch folds the ring into its cadence.
+    pub(crate) fn ring(&self) {
+        #[cfg(test)]
+        self.rings.fetch_add(1, Ordering::SeqCst);
+        *self.rung.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.cv.notify_all();
+    }
+
+    /// Parks until `cadence` has a look due on `clock`, folding each ring in; with none due
+    /// and none rung, the park has no timeout.
+    pub(crate) fn until_due(&self, cadence: &mut Cadence, clock: &impl Fn() -> u64) {
+        let mut rung = self.rung.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let now = clock();
+            if std::mem::take(&mut *rung) {
+                cadence.rung(now);
+            }
+            rung = match cadence.wait_ms(now) {
+                Some(0) => return,
+                Some(ms) => {
+                    self.cv
+                        .wait_timeout(rung, Duration::from_millis(ms))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+                None => self.cv.wait(rung).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+    }
+}
+
+/// The process-wide watch's bell.
+static BELL: Bell = Bell::new();
+
+/// The watch over `board`: parks on `bell` until its [`Cadence`] has a look due on `clock`, takes
+/// `look`, folds it in ([`step`]) and hands `note` what the window is owed, forever.
+pub(crate) fn watch(
+    board: &Mutex<Board>,
+    bell: &Bell,
+    clock: impl Fn() -> u64,
+    mut look: impl FnMut() -> Look,
+    note: &(dyn Fn(HostNote) + Send + Sync),
+) {
+    let mut cadence = Cadence::started(clock());
+    loop {
+        bell.until_due(&mut cadence, &clock);
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let look = look();
+            let at = clock();
+            let owed = step(
+                &mut board.lock().unwrap_or_else(PoisonError::into_inner),
+                at,
+                look,
+            );
+            (at, owed)
+        }));
+        let at = match read {
+            Ok((at, owed)) => {
+                if let Some(owed) = owed {
+                    note(owed);
+                }
+                at
+            }
+            Err(_) => {
+                aterm_log::warn!(
+                    "program check: a read stopped after an internal panic; the next is taken \
+                     at its time"
+                );
+                clock()
+            }
+        };
+        let state = board
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .judge
+            .state();
+        cadence.looked(at, state);
+    }
 }
 
 /// Uses the production disk tick regardless of `ATERM_DEV_FAST_TIMERS` to avoid `ps` storms.
@@ -389,7 +619,8 @@ const fn every() -> std::time::Duration {
     crate::harness_host::DISK_TICK
 }
 
-/// Starts the background `syspolicyd` watcher thread on macOS.
+/// Starts the background `syspolicyd` watcher thread on macOS ([`watch`] over the process-wide
+/// board and bell).
 pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
     if !cfg!(target_os = "macos") {
         return;
@@ -400,28 +631,18 @@ pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
             crate::harness_host::THREAD_PREFIX
         ))
         .spawn(move || {
-            loop {
-                std::thread::sleep(every());
-                let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let look = stood_in(
+            watch(
+                &BOARD,
+                &BELL,
+                now_ms,
+                || {
+                    stood_in(
                         aterm_uds::program_check::look(aterm_uds::program_check::PS_HANG),
                         FULL_STAND_IN.load(Ordering::SeqCst),
-                    );
-                    step(
-                        &mut BOARD.lock().unwrap_or_else(PoisonError::into_inner),
-                        now_ms(),
-                        look,
                     )
-                }));
-                match read {
-                    Ok(Some(owed)) => note(owed),
-                    Ok(None) => {}
-                    Err(_) => aterm_log::warn!(
-                        "program check: a read stopped after an internal panic; the next is \
-                         taken at its time"
-                    ),
-                }
-            }
+                },
+                &*note,
+            );
         });
     match spawned {
         Ok(_) => WATCHING.store(true, Ordering::SeqCst),
@@ -430,385 +651,5 @@ pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aterm_vitals::program_check::STUCK_AFTER_MS;
-
-    const D: Daemon = Daemon {
-        pid: 690,
-        start_s: 1_791_000_000,
-        start_us: 1,
-    };
-    const MIN: u64 = 60_000;
-
-    fn on(daemon: Daemon, workers: u64, at_limit: bool) -> Look {
-        Look::Read(Reading {
-            daemon,
-            workers,
-            at_limit,
-            limit: Some(90),
-        })
-    }
-
-    fn reading(workers: u64, at_limit: bool) -> Look {
-        on(D, workers, at_limit)
-    }
-
-    fn word(note: Option<&HostNote>) -> &'static str {
-        match note {
-            None => "-",
-            Some(HostNote::ProgramCheckStuck { .. }) => "stuck",
-            Some(HostNote::ProgramCheckUnstuck) => "unstuck",
-            Some(_) => "other",
-        }
-    }
-
-    fn words(looks: &[(u64, Look)]) -> Vec<&'static str> {
-        let mut board = Board::default();
-        looks
-            .iter()
-            .map(|(at, look)| word(step(&mut board, *at, *look).as_ref()))
-            .collect()
-    }
-
-    #[test]
-    fn the_window_hears_the_first_answer_the_stuck_edge_and_the_end() {
-        let mut board = Board::default();
-        let notes: Vec<Option<HostNote>> = [
-            (0, reading(6, false)),
-            (MIN, reading(6, false)),
-            (2 * MIN, reading(95, true)),
-            (2 * MIN + STUCK_AFTER_MS, reading(95, true)),
-            (3 * MIN + STUCK_AFTER_MS, reading(95, true)),
-            (4 * MIN + STUCK_AFTER_MS, Look::Unread),
-            (5 * MIN + STUCK_AFTER_MS, reading(4, false)),
-            (6 * MIN + STUCK_AFTER_MS, reading(4, false)),
-        ]
-        .into_iter()
-        .map(|(at, look)| step(&mut board, at, look))
-        .collect();
-        let said: Vec<&str> = notes.iter().map(Option::as_ref).map(word).collect();
-        assert_eq!(
-            said,
-            [
-                "unstuck", "-", "-", "stuck", "stuck", "stuck", "unstuck", "-"
-            ]
-        );
-        for told in &notes[3..6] {
-            assert_eq!(
-                *told,
-                Some(HostNote::ProgramCheckStuck {
-                    workers: 95,
-                    limit: Some(90),
-                })
-            );
-        }
-        assert_eq!(
-            words(&[
-                (0, reading(95, true)),
-                (STUCK_AFTER_MS - 1, reading(95, true)),
-                (STUCK_AFTER_MS, reading(5, false)),
-            ]),
-            ["-", "-", "unstuck"]
-        );
-    }
-
-    /// Replacing or stopping a stuck daemon clears the alert.
-    #[test]
-    fn the_alert_ends_when_the_stuck_daemon_does() {
-        let again = Daemon {
-            pid: 489,
-            start_s: 1_792_597_850,
-            start_us: 7,
-        };
-        assert_eq!(
-            words(&[
-                (0, reading(95, true)),
-                (STUCK_AFTER_MS, reading(95, true)),
-                (STUCK_AFTER_MS + MIN, on(again, 95, true)),
-                (2 * STUCK_AFTER_MS + MIN, on(again, 95, true)),
-                (2 * STUCK_AFTER_MS + 2 * MIN, Look::NoneRunning),
-                (2 * STUCK_AFTER_MS + 3 * MIN, Look::NoneRunning),
-            ]),
-            ["-", "stuck", "unstuck", "stuck", "unstuck", "-"]
-        );
-    }
-
-    #[test]
-    fn the_status_fields_say_dash_until_read() {
-        let b = Board::default();
-        assert_eq!(b.judge.state().as_str(), "-");
-        let s = status_fields();
-        assert!(s.starts_with("syspolicyd="), "{s}");
-        assert!(s.contains(" syspolicyd_workers="), "{s}");
-        assert!(s.contains(" syspolicyd_full_ms="), "{s}");
-    }
-
-    /// `status` names the daemon the last look read and how long it has run, by the wall clock
-    /// its start is on; `-` before a read, once none runs, or with the clock before its start.
-    /// A look that reads nothing keeps the pid and gives no age, since no look says it still runs.
-    #[test]
-    fn status_names_the_syspolicyd_the_last_look_read_and_how_long_it_has_run() {
-        let half_hour = D.started_us() + 1_800_000_000;
-        let mut b = Board::default();
-        let unread = fields(&b, 0, half_hour);
-        assert!(
-            unread.ends_with(" syspolicyd_pid=- syspolicyd_up_ms=-"),
-            "{unread}"
-        );
-        step(&mut b, MIN, reading(6, false));
-        assert_eq!(
-            fields(&b, MIN, half_hour),
-            "syspolicyd=ok syspolicyd_workers=6/90 syspolicyd_full_ms=- syspolicyd_pid=690 \
-             syspolicyd_up_ms=1800000"
-        );
-        let early = fields(&b, MIN, D.started_us() - 1);
-        assert!(
-            early.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=-"),
-            "CONTROL: a clock before the start reads no age: {early}"
-        );
-        step(&mut b, 2 * MIN, Look::Unread);
-        let kept = fields(&b, 2 * MIN, half_hour);
-        assert!(
-            kept.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=-"),
-            "a look that read nothing leaves the last daemon named, and no age, since no look \
-             says it still runs: {kept}"
-        );
-        step(&mut b, 3 * MIN, reading(6, false));
-        let again = fields(&b, 3 * MIN, half_hour);
-        assert!(
-            again.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=1800000"),
-            "CONTROL: the next look that reads it gives its age again: {again}"
-        );
-        step(&mut b, 4 * MIN, Look::NoneRunning);
-        let gone = fields(&b, 4 * MIN, half_hour);
-        assert!(
-            gone.ends_with(" syspolicyd_pid=- syspolicyd_up_ms=-"),
-            "CONTROL: none running names none: {gone}"
-        );
-    }
-
-    /// The stranded judge gets the board only while its last look read a daemon, at most two
-    /// looks (two `DISK_TICK`s, 120 s) ago, with how long the looks have read that daemon on a
-    /// clock that stops while the Mac sleeps: from the first look that read it, which a look that
-    /// reads nothing keeps and one that finds none running, or another daemon, starts over.
-    #[test]
-    fn the_stranded_judge_reads_the_board_only_while_its_last_look_read_it() {
-        let mut b = Board::default();
-        assert_eq!(check_of(&b, 0), None, "nothing read");
-        let at = 5 * MIN;
-        step(&mut b, at, reading(6, false));
-        let answering = |awake_ms| {
-            Some(RunningCheck {
-                daemon: D,
-                pool_full: false,
-                awake_ms,
-            })
-        };
-        assert_eq!(check_of(&b, at), answering(0));
-        assert_eq!(
-            check_of(&b, at + 120_000),
-            answering(120_000),
-            "two looks old"
-        );
-        assert_eq!(check_of(&b, at + 120_001), None, "older than two looks");
-        step(&mut b, at + MIN, Look::Unread);
-        assert_eq!(check_of(&b, at + MIN), None, "the last look read nothing");
-        let said = fields(&b, at + MIN, D.started_us());
-        assert!(
-            said.contains(" syspolicyd_workers=6/90 "),
-            "CONTROL: status still says the last reading: {said}"
-        );
-        step(&mut b, at + 2 * MIN, stood_in(reading(2, false), true));
-        assert_eq!(
-            check_of(&b, at + 2 * MIN),
-            Some(RunningCheck {
-                daemon: D,
-                pool_full: true,
-                awake_ms: 2 * MIN,
-            }),
-            "the full stand-in reads full, the daemon read awake since the first look, a look \
-             that read nothing between"
-        );
-        step(&mut b, at + 3 * MIN, Look::NoneRunning);
-        assert_eq!(check_of(&b, at + 3 * MIN), None, "none running");
-        step(&mut b, at + 4 * MIN, reading(6, false));
-        step(&mut b, at + 5 * MIN, reading(6, false));
-        assert_eq!(
-            check_of(&b, at + 5 * MIN + 120_000),
-            Some(RunningCheck {
-                daemon: D,
-                pool_full: false,
-                awake_ms: MIN + 120_000,
-            }),
-            "each look that reads it moves the read time on, and one after none ran reads it \
-             from that look"
-        );
-        let again = Daemon {
-            pid: 11291,
-            start_s: D.start_s + 3_600,
-            start_us: 0,
-        };
-        step(&mut b, at + 6 * MIN, on(again, 6, false));
-        assert_eq!(
-            check_of(&b, at + 7 * MIN).map(|c| (c.daemon.pid, c.awake_ms)),
-            Some((11291, MIN)),
-            "CONTROL: another daemon is read awake from its own first look"
-        );
-    }
-
-    /// The `full` stand-in drives a healthy reading to stuck, and `live` clears it.
-    #[test]
-    fn the_full_stand_in_drives_the_alert_and_live_ends_it() {
-        let healthy = reading(2, false);
-        assert_eq!(
-            stood_in(healthy, true),
-            on(D, 90, true),
-            "the daemon kept, the flag set, its threads raised to the limit"
-        );
-        assert_eq!(stood_in(reading(95, true), true), reading(95, true));
-        assert_eq!(
-            stood_in(healthy, false),
-            healthy,
-            "CONTROL: live reads as read"
-        );
-        let no_limit = Look::Read(Reading {
-            daemon: D,
-            workers: 3,
-            at_limit: false,
-            limit: None,
-        });
-        assert_eq!(
-            stood_in(no_limit, true),
-            Look::Read(Reading {
-                daemon: D,
-                workers: 3,
-                at_limit: true,
-                limit: None,
-            })
-        );
-        assert_eq!(stood_in(Look::NoneRunning, true), Look::NoneRunning);
-        assert_eq!(stood_in(Look::Unread, true), Look::Unread);
-        assert_eq!(
-            words(&[
-                (0, stood_in(healthy, false)),
-                (MIN, stood_in(healthy, true)),
-                (MIN + STUCK_AFTER_MS, stood_in(healthy, true)),
-                (2 * MIN + STUCK_AFTER_MS, stood_in(healthy, false)),
-            ]),
-            ["unstuck", "-", "stuck", "unstuck"]
-        );
-    }
-
-    /// STARTS ARE HELD ONLY WHILE THE CHECK READS FULL OR STUCK ([`starts_held`]): a board that
-    /// `program-check full`'s stand-in drives to full, and on to stuck, holds them. NEGATIVE
-    /// CONTROL: a board nothing has read, and one a live reading left answering, hold none.
-    #[test]
-    fn starts_held_reads_full_and_stuck_only() {
-        let board = Mutex::new(Board::new());
-        assert!(!starts_held(&board), "CONTROL: unread holds nothing");
-        let healthy = reading(2, false);
-        let at = |ms: u64, full: bool| {
-            step(
-                &mut board.lock().unwrap_or_else(PoisonError::into_inner),
-                ms,
-                stood_in(healthy, full),
-            );
-        };
-        at(0, false);
-        assert!(!starts_held(&board), "CONTROL: answering holds nothing");
-        at(MIN, true);
-        assert!(starts_held(&board), "full");
-        at(MIN + STUCK_AFTER_MS, true);
-        assert!(
-            matches!(board.lock().unwrap().judge.state(), State::Stuck { .. })
-                && starts_held(&board),
-            "stuck"
-        );
-        at(2 * MIN + STUCK_AFTER_MS, false);
-        assert!(!starts_held(&board), "live again: answering");
-    }
-
-    /// A held stand-in holds its tests' lock for its whole life, so a second test's stand-in
-    /// waits for it rather than replacing its pid, and its drop empties no other test's. (The
-    /// pid is no process's, so no other test's `held_now` reads it.)
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_held_stand_in_keeps_its_tests_lock_while_it_lives() {
-        let held = HeldStandIn::of(u32::MAX);
-        assert!(
-            STAND_IN_TESTS.try_lock().is_err(),
-            "a stand-in another test can replace while this one lives"
-        );
-        assert_eq!(held_stand_in(), Some(u32::MAX));
-        drop(held);
-    }
-
-    #[test]
-    fn the_verb_reads_bare_and_stands_in_only_where_a_look_reads() {
-        let any = |_| true;
-        assert_eq!(parse("", false, false, any), Ok(Ask::Read));
-        assert_eq!(parse("  ", true, true, any), Ok(Ask::Read));
-        assert_eq!(parse("full", true, true, any), Ok(Ask::Pool(true)));
-        assert_eq!(parse(" live ", true, true, any), Ok(Ask::Pool(false)));
-        assert_eq!(parse("stuck", true, true, any), Err(USAGE));
-        assert_eq!(parse("full live", true, true, any), Err(USAGE));
-        assert!(parse("full", false, true, any).is_err_and(|e| e.contains("development build")));
-        assert!(parse("live", true, false, any).is_err_and(|e| e.contains("runs no stuck check")));
-    }
-
-    /// `held_now` holds no program the kernel reads as past its start (this process, which runs
-    /// this test) and none left unread (pid 0, which is never read; pid 1, launchd, root's).
-    #[test]
-    fn held_now_holds_no_program_the_kernel_reads_started_or_cannot_read() {
-        assert!(
-            !held_now(std::process::id()),
-            "this test runs, so it is past its start"
-        );
-        for unread in [0, 1] {
-            assert!(
-                !held_now(unread),
-                "pid {unread}: no process of this user's, so unread and not held"
-            );
-        }
-    }
-
-    /// The held stand-in needs a development build and a pid of a live process of this user
-    /// (the only kind a start is read for, so any other would count nowhere); `held -` needs no
-    /// pid. This process is one of this user's; pid 1 (launchd, root's) is not.
-    #[test]
-    fn the_held_stand_in_needs_a_development_build_and_a_pid() {
-        let any = |_| true;
-        let only = |mine: u32| move |pid| pid == mine;
-        assert_eq!(
-            parse("held 25311", true, true, only(25311)),
-            Ok(Ask::Held(Some(25311)))
-        );
-        assert_eq!(
-            parse(" held  - ", true, true, |_| false),
-            Ok(Ask::Held(None))
-        );
-        for refused in ["held", "held gh", "held 0", "held -1", "held 7 8"] {
-            assert_eq!(parse(refused, true, true, any), Err(USAGE), "{refused:?}");
-        }
-        assert!(
-            parse("held 25311", false, true, any).is_err_and(|e| e.contains("development build"))
-        );
-        assert!(
-            parse("held -", true, false, any).is_err_and(|e| e.contains("runs no stuck check"))
-        );
-        assert_eq!(
-            parse("held 25311", true, true, only(7)),
-            Err(NOT_OURS),
-            "a pid no live process of this user holds"
-        );
-        #[cfg(target_vendor = "apple")]
-        {
-            assert!(ours(std::process::id()), "this process is this user's");
-            assert!(
-                aterm_uds::peer::our_uid() == 0 || !ours(1),
-                "launchd is root's"
-            );
-        }
-    }
-}
+#[path = "program_check_watch_tests.rs"]
+mod tests;

@@ -530,7 +530,7 @@ fn retained_quota_preserves_its_times_and_becomes_unknown_after_reset_or_refill(
         },
     );
     let view = project(&records, 200_000);
-    assert!(fact(&view, "5-hour quota").contains("42.5%"));
+    assert!(fact(&view, "5-hour quota").contains("57.5% left"));
     assert_eq!(
         fact(&view, "5-hour quota observed"),
         recorded_time(Some(100))
@@ -593,7 +593,7 @@ fn a_five_hour_window_claude_code_does_not_report_is_said_so() {
         )
     );
     assert!(!quota.contains('%'), "{quota}");
-    assert_eq!(fact(&view, "Weekly quota"), "1% used (retained)");
+    assert_eq!(fact(&view, "Weekly quota"), "99% left (retained)");
 
     let mut carried = records();
     let both = accounts::TapRead {
@@ -606,7 +606,7 @@ fn a_five_hour_window_claude_code_does_not_report_is_said_so() {
     };
     accounts::note_reading(&mut carried.state, "one", &both, AT);
     let view = project(&carried, now_ms);
-    assert!(fact(&view, "5-hour quota").contains("42.5%"));
+    assert!(fact(&view, "5-hour quota").contains("57.5% left"));
 
     let mut panel = records();
     accounts::note_sample(
@@ -651,7 +651,7 @@ fn a_five_hour_window_claude_code_does_not_report_is_said_so() {
         "the week-only reading was booked over the held window"
     );
     let view = project(&held, now_ms);
-    assert!(fact(&view, "5-hour quota").contains("42.5%"));
+    assert!(fact(&view, "5-hour quota").contains("57.5% left"));
     assert_eq!(fact(&view, "5-hour quota source"), "Usage tap");
 }
 
@@ -807,7 +807,7 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
     );
     assert_eq!(
         fact(&view, "Lab 5h quota"),
-        "5h 42% used, reset unknown, read on m17, about 1 min ago (its clock) (statusline)"
+        "5h 58% left, reset unknown, read on m17, about 1 min ago (its clock) (statusline)"
     );
     let later = project_journal(&records, &seen, 3_800_000);
     assert_eq!(
@@ -816,7 +816,7 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
     );
     assert_eq!(
         fact(&later, "Lab 5h quota"),
-        "5h 42% used, reset unknown, read on m17, about 1 h ago (its clock) (statusline)"
+        "5h 58% left, reset unknown, read on m17, about 1 h ago (its clock) (statusline)"
     );
     records.roster.rows[0].identity_email = Some("owner-b@example.test".into());
     records.raw_roster = records.roster.clone();
@@ -890,8 +890,8 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
     };
     let original = seen.clone();
     let before = project_journal(&records, &seen, 299_000);
-    assert!(fact(&before, "5-hour quota").contains("100%"));
-    assert!(fact(&before, "Lab 5h quota").contains("100% used"));
+    assert!(fact(&before, "5-hour quota").contains("0% left"));
+    assert!(fact(&before, "Lab 5h quota").contains("0% left"));
     assert!(fact(&before, "Lab 5h quota").contains("at its limit"));
     assert!(
         fact(&before, "Lab credits quota")
@@ -906,12 +906,12 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
         assert!(!expired.contains('%') && !expired.contains("at its limit"));
         assert!(expired.contains("read on m17, about 1 min ago (its clock) (statusline)"));
         let future = fact(&view, "Lab 7d quota");
-        assert!(future.contains("100% used") && future.contains("at its limit until"));
+        assert!(future.contains("0% left") && future.contains("at its limit until"));
         let unknown_wall = fact(&view, "Lab credits quota");
-        assert!(unknown_wall.contains("100% used, reset unknown"));
+        assert!(unknown_wall.contains("0% left, reset unknown"));
         assert!(unknown_wall.contains("at its limit"));
         let unknown_reset = fact(&view, "Lab day quota");
-        assert!(unknown_reset.contains("100% used, reset unknown"));
+        assert!(unknown_reset.contains("0% left, reset unknown"));
         assert!(!unknown_reset.contains("at its limit"));
     }
     let later = project_journal(&records, &seen, 360_000);
@@ -935,7 +935,10 @@ fn a_rows_vault_token_and_its_offer_join_the_rows_facts() {
     assert_eq!(unread, view, "no read, nothing said");
 
     let mut none = view.clone();
-    with_tokens(&mut none, Some(&Tokens::default()));
+    with_tokens(&mut none, Some(&Tokens::read(Vec::new())));
+    let mut no_vault = view.clone();
+    with_tokens(&mut no_vault, Some(&Tokens::no_vault()));
+    assert_eq!(no_vault, view, "a Mac with no vault, nothing said");
     assert_eq!(none, view, "a read naming no row's account, nothing said");
 
     let offer = TokenOffer {
@@ -946,14 +949,16 @@ fn a_rows_vault_token_and_its_offer_join_the_rows_facts() {
     let mut read = view;
     with_tokens(
         &mut read,
-        Some(&Tokens(vec![TokenFact {
+        Some(&Tokens::read(vec![TokenFact {
             key: JOURNAL_ACCOUNT.into(),
-            label: Some("one".into()),
-            email: "one@example.test".into(),
-            state: "none".into(),
             words: "none".into(),
             phrase: Some("token: none".into()),
             offer: Some(offer.clone()),
+            ..TokenFact::for_test(
+                Some("one"),
+                "one@example.test",
+                aterm_agent::harness::token_state::TokenState::None,
+            )
         }])),
     );
     assert_eq!(fact(&read, "Vault token"), "none");

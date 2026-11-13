@@ -452,3 +452,41 @@ fn a_foreground_change_owes_the_journal_a_capture() {
     );
     kill_all(&[group, shell.1], &[shell.0]);
 }
+
+#[test]
+fn an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_capture() {
+    let mut app = App::headless_for_test();
+    let _ = app.crash_journal.take_dirty();
+    let t0 = std::time::Instant::now();
+    assert!(
+        app.diskwalk.facts_now(t0, false, true),
+        "the first service reads the facts"
+    );
+    for wake in [
+        crate::Wake::DiskWalk,
+        crate::Wake::Vitals,
+        crate::Wake::SiblingScan(Vec::new()),
+        crate::Wake::FleetRead,
+    ] {
+        let said = format!("{wake:?}");
+        app.note_wake_activity(&wake);
+        assert!(
+            !app.crash_journal.take_dirty(),
+            "{said} refreshes an observation no restore image reads"
+        );
+        assert_eq!(
+            app.diskwalk.facts_deadline(true),
+            None,
+            "{said} moves no pane: the disk walker is owed no read"
+        );
+    }
+    app.note_wake_activity(&crate::Wake::MetaChanged { session: 1 });
+    assert!(
+        app.crash_journal.take_dirty(),
+        "NEGATIVE CONTROL: a session's title or cwd may have moved: a capture is owed"
+    );
+    assert!(
+        app.diskwalk.facts_deadline(true).is_some(),
+        "a session's cwd may have moved: the disk walker is owed a read of the panes' facts"
+    );
+}

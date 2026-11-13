@@ -97,6 +97,20 @@ fn window_presented(
     }
 }
 
+/// Tag `win` with the colour space of `surf`'s chain as its owner does: the
+/// frontend at attach (`aterm-gui`'s `resolve_surface_colorspace`, which
+/// Windows keeps: scRGB on an f16 chain, else sRGB) and the renderer's HDR
+/// reconcile after each remake of its own. A test that attaches or remakes a
+/// chain itself tags it, or the presented-frame tap refuses the f16 frame as
+/// an sRGB one.
+fn tag_as_its_owner_does(win: &mut WindowGpu, surf: &GpuSurface) {
+    win.set_capture_color_space(if surf.is_hdr() {
+        crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb
+    } else {
+        crate::video_tap::CaptureColorSpace::Srgb
+    });
+}
+
 /// A frame that failed after its blit pass, as one whose tap read-back or
 /// present failed leaves it: the chain's frame waited for, buffer 0 bound to
 /// the context as its render target, and no present, the one thing that
@@ -279,6 +293,7 @@ fn an_hdr_remake_keeps_the_window_on_the_gpu() {
             gpu.device_loss_reason()
         );
         assert!(!gpu.device_lost(), "hdr_glow {hdr_glow}: no loss latched");
+        tag_as_its_owner_does(&mut on_glass, &surf);
         let output_hdr = surf.d3d11.as_ref().is_some_and(|dw| dw.output_hdr());
         assert_eq!(
             surf.is_hdr(),
@@ -427,6 +442,14 @@ fn hdr_glow_attaches_f16_only_on_an_hdr_output() {
         surf.is_hdr()
     );
     let mut on_glass = WindowGpu::new();
+    if surf.is_hdr() {
+        let refused = gpu.presented_snapshot_begin(&mut on_glass, &surf);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("mismatch")),
+            "CONTROL: an f16 chain left tagged sRGB is no snapshot: {refused:?}"
+        );
+    }
+    tag_as_its_owner_does(&mut on_glass, &surf);
     let (_, input, _) = fixtures(&gpu, false).swap_remove(0);
     let got = window_presented(&mut gpu, &mut on_glass, &mut surf, &input, false);
     assert_eq!((got.width, got.height), (fw, fh));

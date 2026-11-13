@@ -293,6 +293,29 @@ fn names_macos_already_reads_ask_for_nothing() {
         read_primary_name(&scratch.state).expect("reads"),
         Some("m59".to_owned())
     );
+    let saved = file::read(&scratch.state).unwrap();
+    let fake = FakeNames::new(
+        names([Some("m59 Heron (2)"), Some("m59-heron"), Some("m59-heron")]),
+        &nothing,
+    );
+    for _ in 0..2 {
+        let policy = Policy::read(&scratch.config, num(59)).unwrap();
+        assert!(matches!(
+            publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
+            Err(Pending::SystemNames(_))
+        ));
+    }
+    assert_eq!(*fake.log.borrow(), ["read", "read"], "no alias setter");
+    assert_eq!(file::read(&scratch.state).unwrap(), saved);
+    assert!(matches!(
+        publication(
+            &scratch.state,
+            &scratch.config,
+            saved.as_ref().unwrap(),
+            Some(&fake.names.borrow())
+        ),
+        Ok(Publication::Owed(_))
+    ));
 }
 
 #[test]

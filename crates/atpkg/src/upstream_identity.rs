@@ -701,18 +701,7 @@ fn cache_put(file: &Path, kind: &str, key: &str, values: &[&str], keep: usize) {
     }
     let mut body = lines.join("\n");
     body.push('\n');
-    let Some(dir) = file.parent() else {
-        return;
-    };
-    static CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{CACHE_FILE}.{}-{seq}.tmp", std::process::id()));
-    let written = crate::platform::open_create_new_write(&tmp, 0o644)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, file));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = aterm_uds::atomic_file::write_flushed(file, body.as_bytes(), 0o644, None);
 }
 
 /// Returns the nearest ancestor directory with `x.py` and `compiler_dist_channel=trust`.

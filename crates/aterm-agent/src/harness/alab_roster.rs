@@ -28,7 +28,7 @@
 //!   [`mailbox_labels`]: the labels (each lab label, and the legacy label a renamed row's
 //!   label-keyed sign-in secrets still name) the mailbox config maps to addresses.
 //! - [`holdings`]: what this Mac runs that it does not prefer, from what its login places hold
-//!   ([`observe::places`]), which the journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
+//!   ([`observe::sweep::places_of`]), which the journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
 //!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
 
 use super::account_sync_error::SyncError;
@@ -1483,7 +1483,7 @@ pub(super) fn migrate_held(
 }
 
 /// What this Mac runs of `cli` that it does not prefer, from its login `places`
-/// ([`observe::places`] of `roster`) and the lab: the account each place's login is
+/// ([`observe::sweep::places_of`] of `roster`) and the lab: the account each place's login is
 /// ([`accounts::reconcile`]), where the lab knows it as one account this Mac has no preference
 /// for, by account key, with the reason the journal's `place` row gives it (design §0, §4.17):
 /// `borrow` where another Mac prefers the account, else `fill` where it may be signed in (the
@@ -1503,14 +1503,14 @@ pub fn holdings(
     lab: &Lab,
     cli: Cli,
     roster: &Roster,
-    places: &[observe::Place<'_>],
+    places: &[observe::sweep::Place<'_>],
 ) -> Vec<(String, &'static str)> {
     let Some(me) = lab.me.as_ref() else {
         return Vec::new();
     };
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for place in places {
-        let held = match (place.login.reconciled(roster), place.login.seen.email()) {
+        let held = match (place.reconciled(roster), place.seen.email()) {
             (Reconciled::Agrees(row) | Reconciled::Other(row), _) => lab.account_of(cli, row),
             // No row answers, the believed row names no address to answer by, or several rows
             // answer: the observed address is the account's own.

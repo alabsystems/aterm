@@ -238,7 +238,7 @@ fn file_digest(mut file: std::fs::File) -> Option<Digest> {
     file.read_to_end(&mut bytes).ok()?;
     const CHUNK: usize = 4 << 20;
     let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
-    let width = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let width = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
     let per = chunks.len().div_ceil(width.max(1)).max(1);
     let digests: Vec<Digest> = if SERIAL.get() {
         chunks.iter().map(|chunk| digest(&[chunk])).collect()
@@ -316,7 +316,7 @@ impl Snapshot {
             }
         }
         paths.sort();
-        let width = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let width = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
         let per = paths.len().div_ceil(width.max(1)).max(1);
         let read: Vec<SnapFile> = threads(|scope| {
             let running: Vec<_> = paths
@@ -612,79 +612,8 @@ pub(crate) fn threads<'env, T>(f: impl for<'scope> FnOnce(Threads<'scope, 'env>)
 }
 
 #[cfg(test)]
-mod worker_tests {
-    use super::*;
-
-    #[test]
-    fn serial_fingerprinting_keeps_the_parallel_code_identity() {
-        use std::io::Write as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("code");
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(&vec![1; 4 << 20]).unwrap();
-        file.write_all(&vec![2; 4 << 20]).unwrap();
-        file.write_all(&[3]).unwrap();
-        drop(file);
-        let read = || file_digest(std::fs::File::open(&path).unwrap()).unwrap();
-        let parallel = read();
-        assert_eq!(without_parallel_workers(read), parallel);
-    }
-
-    #[test]
-    fn one_worker_keeps_nested_jobs_inline_and_preserves_joins() {
-        let answer = on_one_worker(|| {
-            let owner = std::thread::current().id();
-            threads(|scope| {
-                let jobs: Vec<_> = (0..3)
-                    .map(|i| {
-                        scope.spawn(move || {
-                            assert_eq!(std::thread::current().id(), owner);
-                            threads(|nested| {
-                                nested
-                                    .spawn(move || {
-                                        assert_eq!(std::thread::current().id(), owner);
-                                        i + 1
-                                    })
-                                    .join()
-                                    .unwrap()
-                            })
-                        })
-                    })
-                    .collect();
-                assert!(scope.spawn(|| panic!("joined control")).join().is_err());
-                jobs.into_iter()
-                    .map(|job| job.join().unwrap())
-                    .collect::<Vec<_>>()
-            })
-        })
-        .unwrap();
-        assert_eq!(answer, [1, 2, 3]);
-        let caller = std::thread::current().id();
-        let parallel = threads(|scope| scope.spawn(|| std::thread::current().id()).join().unwrap());
-        assert_ne!(parallel, caller, "the ordinary path still starts workers");
-        without_parallel_workers(|| {
-            let inline =
-                threads(|scope| scope.spawn(|| std::thread::current().id()).join().unwrap());
-            assert_eq!(inline, caller);
-        });
-        assert!(!SERIAL.get(), "the caller's policy was restored");
-    }
-
-    #[test]
-    fn an_unjoined_panic_is_preserved_in_both_execution_modes() {
-        for serial in [false, true] {
-            let work = || threads(|scope| drop(scope.spawn(|| panic!("unjoined control"))));
-            let result = std::panic::catch_unwind(|| {
-                if serial {
-                    without_parallel_workers(work)
-                } else {
-                    work()
-                }
-            });
-            assert!(result.is_err());
-        }
-    }
-}
+#[path = "memo_worker_tests.rs"]
+mod worker_tests;
 
 /// Runs `f`, inside a unit, with its reads answering none of the unit's questions: for a
 /// corpus-wide fact the unit then asks about by its own recorded question (which files are test
@@ -1576,7 +1505,7 @@ impl Run {
         // A unit can ask of every file of the checkout (`conflict-marker` reads each): its
         // questions are asked again on every core.
         let asked: Vec<(&(Op, Vec<u8>), &Digest)> = trace.tree.iter().collect();
-        let width = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let width = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
         let per = asked.len().div_ceil(width).max(256);
         let wrong = threads(|scope| {
             let running: Vec<_> = asked

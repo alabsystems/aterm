@@ -1797,6 +1797,7 @@ pub(crate) fn caps() -> crate::Caps {
         } else {
             Cap::No(Why::Unsupported)
         },
+        more: Vec::new(),
         capacity: crate::CapSource::Host,
     }
 }

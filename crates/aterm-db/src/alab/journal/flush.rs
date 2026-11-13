@@ -116,16 +116,13 @@ pub(crate) fn pass_with(
     pass_started(paths, spool, presence, holdings, off, now, Instant::now())
 }
 
-/// [`pass_with`] with local custody admission's hang detector running from `started`.
-pub(super) fn pass_started(
-    paths: &Paths,
-    spool: &Spool,
-    presence: &dyn Fn() -> Presence,
-    holdings: &dyn Fn() -> Option<Vec<Holding>>,
-    off: bool,
-    now: u64,
-    started: Instant,
-) -> Result<Flushed> {
+/// The local half of a pass, which reads no table: what the spool took in since the last pass is
+/// merged into the outbox and folded into the book, both saved, and the spool taken again.
+/// Returns the book and the outbox.
+///
+/// # Errors
+/// The spool, outbox or book cannot be read or written.
+pub(super) fn take_in(spool: &Spool, off: bool, now: u64) -> Result<(Book, Vec<Event>)> {
     let absorbed = spool.absorb()?;
     let mut book = Book::load(spool);
     let held = spool.outbox()?;
@@ -139,7 +136,7 @@ pub(super) fn pass_started(
     } else {
         (held, absorbed)
     };
-    let (mut outbox, fresh) = book::merge(held, &absorbed, now);
+    let (outbox, fresh) = book::merge(held, &absorbed, now);
     // An off pass records that it takes the spool before it does, so a crash between the two
     // leaves the mark; an on pass clears it only once the file it dropped is replaced, so a crash
     // there drops what was noted since (never publishes what was taken while off).
@@ -159,6 +156,20 @@ pub(super) fn pass_started(
         book.took_off = false;
         book.save(spool)?;
     }
+    Ok((book, outbox))
+}
+
+/// [`pass_with`] with local custody admission's hang detector running from `started`.
+pub(super) fn pass_started(
+    paths: &Paths,
+    spool: &Spool,
+    presence: &dyn Fn() -> Presence,
+    holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    off: bool,
+    now: u64,
+    started: Instant,
+) -> Result<Flushed> {
+    let (mut book, mut outbox) = take_in(spool, off, now)?;
     let period = now / WEEK;
     // Without a table read: nothing can be due while a hold stands (the pace line, a kept
     // append's retry), nor unless the week is new, a sharp event or a batch waits, or the routine

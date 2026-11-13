@@ -21,6 +21,9 @@ use std::{
 
 const ACTOR: &str = "ATPKG_RETAINED_OPERATION_CASE";
 
+#[path = "build_admit_returning_tests.rs"]
+mod returning_tests;
+
 struct Guard(Arc<AtomicUsize>);
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -751,6 +754,16 @@ fn retained_actor() {
     };
     with_world(|world, seat| {
         match case.as_str() {
+            "return-producer" => returning_tests::successful_producer(world, seat),
+            "return-failure" => returning_tests::failed_result_cannot_be_rewritten(world, seat),
+            "return-launch" => {
+                returning_tests::launch_error_keeps_original_until_completion(world, seat)
+            }
+            "return-member" => returning_tests::surviving_member_prevents_return(world, seat),
+            "return-foreign" => returning_tests::foreign_completion_retains_resources(world, seat),
+            "return-observer" => {
+                returning_tests::settlement_observer_failure_refuses_return(world, seat)
+            }
             "refusal" => preflight_and_launch_failure(world, seat),
             "unwind" => installed_before_dispatch_unwind(world, seat),
             "wait" => wait_and_settlement_failures(world, seat),
@@ -794,6 +807,36 @@ fn actor(case: &str) {
 #[test]
 fn retained_preflight_returns_resources_and_launch_failure_keeps_its_ticket() {
     actor("refusal");
+}
+
+#[test]
+fn returning_completion_hands_the_original_producer_to_its_postchecks() {
+    actor("return-producer");
+}
+
+#[test]
+fn returning_completion_refuses_a_different_successful_jobs_status() {
+    actor("return-failure");
+}
+
+#[test]
+fn returning_launch_failure_keeps_the_exact_bundle_in_its_completion() {
+    actor("return-launch");
+}
+
+#[test]
+fn returning_root_exit_keeps_the_original_bundle_until_its_member_settles() {
+    actor("return-member");
+}
+
+#[test]
+fn returning_foreign_completion_refuses_lookup_and_cannot_unlock_original_resources() {
+    actor("return-foreign");
+}
+
+#[test]
+fn returning_settlement_observer_failure_keeps_the_failed_bundle_until_drop() {
+    actor("return-observer");
 }
 #[test]
 fn retained_resources_are_installed_before_dispatch_unwinds() {

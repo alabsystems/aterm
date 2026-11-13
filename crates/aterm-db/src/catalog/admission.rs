@@ -49,6 +49,37 @@ impl Directory {
                 "primary catalog observation has another custody",
             ));
         }
+        self.project_strict_store(session, catalog, self.retained()?)
+    }
+
+    /// Project complete evidence while the owned view retains both local regions.
+    /// An absent catalog is unavailable, never an authenticated empty catalog.
+    pub(crate) fn snapshot_from_owned(
+        &self,
+        catalog: &crate::table::store::OwnedTable<'_, '_, '_, '_>,
+    ) -> Result<Snapshot> {
+        if self.is_recovery() || catalog.scope() != self.catalog_scope() || !catalog.is_at(self)? {
+            return Err(Error::new("local catalog observation has another custody"));
+        }
+        catalog.check()?;
+        let session = catalog.session();
+        let store = catalog.require_store()?;
+        // With no recovery root, the exact-primary contract is the whole view.
+        let snapshot = if catalog.only_primary() && !self.recovery().root.try_exists()? {
+            self.snapshot_from_primary(session, store)?
+        } else {
+            self.project_strict_store(session, store, self.retained_local()?)?
+        };
+        catalog.check()?;
+        Ok(snapshot)
+    }
+
+    fn project_strict_store(
+        &self,
+        session: &Session<'_>,
+        catalog: &Store,
+        (retained, count): (BTreeSet<Digest>, usize),
+    ) -> Result<Snapshot> {
         let (mut records, evidence) = catalog.catalog_and_evidence(session)?;
         // catalog_and_evidence moves eligible application records out of the
         // metadata entries. Their None is consumption, not missing ciphertext.
@@ -80,7 +111,6 @@ impl Directory {
             // A demoted writer's declarations still describe retained tables.
             // Preserve discovery's historical access to those slots; a hidden
             // declaration for an unretained slot cannot authorize a fallback.
-            let (retained, _) = self.retained()?;
             for item in evidence {
                 if item.catalog_eligible || item.cutoff {
                     continue;
@@ -103,7 +133,7 @@ impl Directory {
         if MUTANT.get() == 2 {
             return Err(Error::new("injected complete catalog refusal"));
         }
-        self.project(session, records, &Policy::default())
+        self.project_retained(session, records, &Policy::default(), &retained, count)
     }
 }
 

@@ -36,8 +36,10 @@ fn path() -> &'static Path {
     GIT.get_or_init(|| {
         let on_path = std::env::var_os("PATH")
             .and_then(|path| {
+                // Windows names the program `git.exe`; a bare `git` there is
+                // no file, and a caller that resolves the path would miss it.
                 std::env::split_paths(&path)
-                    .map(|dir| dir.join("git"))
+                    .map(|dir| dir.join(if cfg!(windows) { "git.exe" } else { "git" }))
                     .find(|candidate| candidate.is_file())
             })
             .unwrap_or_else(|| PathBuf::from("git"));

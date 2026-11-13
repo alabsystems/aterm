@@ -368,6 +368,89 @@ fn readiness_proof_fires_only_when_drained() {
 }
 
 #[test]
+fn pending_proof_records_changed_gates_and_preserves_reader_ownership() {
+    use crate::handoff_progress::Phase;
+    let mut app = App::headless_for_test();
+    let (mut proof, _commit, readers) = arm_incoming_proof(&mut app, "progress-gates");
+    let control = crate::control::ControlPreparation::default();
+    app.handoff_control_preparation = Some(control.clone());
+    app.pending_restore = Some(crate::restore::RestoreManifest::new(Vec::new()));
+    app.headless = false;
+    app.first_present_done = false;
+    let mut records = Vec::new();
+    let mut observe = |record| records.push(record);
+    app.maybe_signal_handoff_ready_with(&mut observe);
+    app.maybe_signal_handoff_ready_with(&mut observe);
+    control.finish(true);
+    app.maybe_signal_handoff_ready_with(&mut observe);
+    app.pending_restore = None;
+    app.maybe_signal_handoff_ready_with(&mut observe);
+    assert!(app.handoff_ready.is_some());
+    assert!(!readers.is_released());
+    app.first_present_done = true;
+    app.maybe_signal_handoff_ready_with(&mut observe);
+    assert!(app.handoff_ready.is_none());
+    assert!(!readers.is_released(), "proof is not Commit");
+    let finished_count = records.len();
+    app.maybe_signal_handoff_ready_with(&mut |record| records.push(record));
+    assert_eq!(
+        records.len(),
+        finished_count,
+        "a completed handoff retires diagnostics"
+    );
+    assert_eq!(
+        records.iter().filter(|r| r.phase == Phase::Waiting).count(),
+        4,
+        "an unchanged visit emits nothing; each gate release emits a changed snapshot"
+    );
+    let evidence = |records: &[crate::handoff_progress::Record]| {
+        records
+            .iter()
+            .any(|r| r.control_pending && r.restore_pending && r.first_present_pending)
+            && records
+                .iter()
+                .any(|r| !r.control_pending && r.restore_pending)
+            && records
+                .iter()
+                .any(|r| !r.restore_pending && r.first_present_pending)
+            && records.iter().any(|r| r.phase == Phase::Written)
+    };
+    assert!(evidence(&records));
+    let lost: Vec<_> = records
+        .iter()
+        .copied()
+        .filter(|r| !r.control_pending)
+        .collect();
+    assert!(
+        !evidence(&lost),
+        "negative control: dropping the held control transition loses evidence"
+    );
+    let mut wire = Vec::new();
+    std::io::Read::read_to_end(&mut proof, &mut wire).unwrap();
+    assert_eq!(wire.len(), crate::seamless::READY_WIRE_LEN);
+
+    let mut ordinary = App::headless_for_test();
+    ordinary.maybe_signal_handoff_ready_with(&mut |_| {
+        panic!("ordinary launch emitted handoff progress")
+    });
+
+    let mut refused = App::headless_for_test();
+    let (_proof, _commit, readers) = arm_incoming_proof(&mut refused, "progress-refusal");
+    let control = crate::control::ControlPreparation::default();
+    control.finish(false);
+    refused.handoff_control_preparation = Some(control);
+    let mut records = Vec::new();
+    refused.maybe_signal_handoff_ready_with(&mut |record| records.push(record));
+    assert!(records[0].control_failed);
+    assert_eq!(records.last().unwrap().phase, Phase::Rejected);
+    assert!(refused.handoff_ready.is_none());
+    assert!(!readers.is_released());
+    let count = records.len();
+    refused.maybe_signal_handoff_ready_with(&mut |record| records.push(record));
+    assert_eq!(records.len(), count);
+}
+
+#[test]
 fn a_failed_capture_barrier_does_not_withdraw_handoff_readiness() {
     use super::handoff_paint_proven as proven;
     let mut app = App::headless_for_test();
@@ -1708,6 +1791,21 @@ fn a_grant_a_young_process_read_off_is_read_again_once_settled() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
+    let fda_reads_off = || {
+        use aterm_types::macos_setup::{
+            Access, Observation, Plan, Read, Selection, Standing, Subject,
+        };
+        crate::SetupStatus {
+            observed_vault_url: Some(Plan::default().vault_url),
+            plan: Some(Plan::from(Selection::all())),
+            observed: vec![Observation {
+                standing: Standing::NeedsYou,
+                read: Read::At(1_700_000_000),
+                ..Observation::unknown(Subject::Access(Access::FullDiskAccess))
+            }],
+            ..crate::SetupStatus::default()
+        }
+    };
     let this_build = super::build_info::build_number().parse::<u64>().ok();
     let other_build = Some(this_build.map_or(1, |build| build.wrapping_add(1)));
     for (held, verified_build) in [
@@ -1759,8 +1857,10 @@ fn a_grant_a_young_process_read_off_is_read_again_once_settled() {
             app.consent_card_host.kept_need.is_some(),
             "still off: a need, as any regression is (kept here: no event loop)"
         );
-        // What the need's decision does with no event loop to post it: the regression.
+        // What the need's decision does with no event loop to post it: the regression, and the
+        // fresh reading it asks for, which reads the grant off.
         app.note_fda_regression(true);
+        app.publish_system_state(fda_reads_off());
         app.settle_access_steps(at);
         let updated = verified_build != this_build;
         assert_eq!(

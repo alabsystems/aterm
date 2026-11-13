@@ -54,11 +54,14 @@ impl Replay {
             true,
             cursor,
         );
-        let pet = aterm_effects::cursor_glow::GlowStyle::style_names_any_pet(style);
+        // The pet is its own setting: these scenes keep it beside the rainbow and judge the
+        // other styles without one, as they were recorded.
+        let pet = style == "rainbow";
         fx.set_cursor_pet(pet, 0x5EED);
         fx.set_letter_guard_reuse(reuse);
-        // The render suite's bundled last-resort face, so the fold below reads the same
-        // rasters on every machine; it draws the Latin, Cyrillic and Greek letters typed here.
+        // The render suite's bundled last-resort face, so every machine reads one face's
+        // outlines (its host rasterizes them: CoreText on macOS, the hinted portable
+        // rasterizer elsewhere); it draws the Latin, Cyrillic and Greek letters typed here.
         let rend = aterm_render::Renderer::from_bytes(
             include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf"),
             22.0,
@@ -199,7 +202,7 @@ const DIM_PAPER: (u32, u32, u32) = (0x0065_7B83, 0x00FD_F6E3, 0x0058_6E75);
 fn a_frame_whose_lights_did_not_move_judges_no_cell() {
     let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[5H$ ".to_vec()))];
     ev.extend(typed("echo hello world", 1_000, 50));
-    for style in ["rainbow kitty pet", "phaser", "laser"] {
+    for style in ["rainbow", "phaser", "laser"] {
         for look in [DARK, LIGHT] {
             let mut kept = Replay::new(style, look, true);
             let (frames, work) = run(&mut kept, &ev, 3_000);
@@ -234,6 +237,172 @@ fn a_frame_whose_lights_did_not_move_judges_no_cell() {
     }
 }
 
+/// A test's control that changes what the guard makes of a frame: the whole reading keeping no
+/// bar (`set_letter_guard_whole(false)`), or `letter_bar` keeping a letter at AA or over its share
+/// (`with_share_over_aa`) or AA only from 4.5 itself (`with_aa_unrounded`).
+#[derive(Clone, Copy, Debug)]
+enum Seam {
+    WholeOff,
+    ShareOverAa,
+    AaUnrounded,
+}
+
+/// [`run`]'s frames, every one from `switch` ms on drawn with `seam` switched on.
+fn run_switched(
+    r: &mut Replay,
+    events: &[(u64, Ev)],
+    tail: u64,
+    (switch, seam): (u64, Seam),
+) -> Vec<Frame> {
+    let mut timeline: Vec<(u64, u8, usize)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, (at, _))| (*at, 0, i))
+        .collect();
+    let end = events.last().map_or(0, |e| e.0) + tail;
+    let mut f = FRAME_MS;
+    while f <= end {
+        timeline.push((f, 1, 0));
+        f += FRAME_MS;
+    }
+    timeline.sort_unstable();
+    let mut frames = Vec::new();
+    for (at, kind, i) in timeline {
+        r.to(at);
+        if kind == 1 {
+            frames.push(if at < switch {
+                r.present()
+            } else {
+                match seam {
+                    Seam::WholeOff => {
+                        r.fx.cursor_mut().glow.set_letter_guard_whole(false);
+                        r.present()
+                    }
+                    Seam::ShareOverAa => {
+                        aterm_effects::cursor_glow::with_share_over_aa(|| r.present())
+                    }
+                    Seam::AaUnrounded => {
+                        aterm_effects::cursor_glow::with_aa_unrounded(|| r.present())
+                    }
+                }
+            });
+            continue;
+        }
+        match events[i].1.clone() {
+            Ev::Key(c) => r.key(c),
+            Ev::Out(bytes) => r.out(&bytes),
+        }
+    }
+    frames
+}
+
+/// A grey on white that reads AA, under the floor.
+const GREY: (u32, u32, u32) = (0x0076_7676, 0x00FF_FFFF, 0x0009_69DA);
+/// A rose on white that reads 4.5553, some of whose letters read by their rasters at AA as the
+/// judges read it and under 4.5 itself (`with_aa_unrounded` changes Comet's and Phaser's streams
+/// over them typing).
+const ROSE: (u32, u32, u32) = (0x00D8_3270, 0x00FF_FFFF, 0x0009_69DA);
+
+/// A CONTROL SWITCHED BETWEEN TWO FRAMES TAKES BACK NOTHING JUDGED UNDER THE OTHER. The guard takes
+/// a frame's streams back whole, and a cell's verdict, by keys that hold everything they depend on,
+/// the tests' controls that change a verdict among them (`LetterGuard::seams`: the whole reading's
+/// bar and `letter_bar`'s two). Switched on mid-typing, where the guard takes verdicts back, and
+/// while the caret rests, where it takes whole frames back, the guard that keeps frames and
+/// verdicts publishes what one judging every cell afresh does under the same switch, and each
+/// switch changes what is published on some ground, so what was taken back had a stale read to
+/// take. The rest leg switches at 3500 ms: after the typing the guard takes no frame back whole
+/// before 3408 ms, so a switch at 2600 ms reached no frame it would take back, and the first frame
+/// a switch at 3500 ms draws (3504 ms) is one it takes back whole unswitched for Phaser, Laser and
+/// Fire. There `with_share_over_aa` changes what the guard would take back whole on Solarized
+/// Dark, which pins the frame memo's word; `with_aa_unrounded` and the whole reading's switch
+/// change no stream at rest in these scenes, so the memo's bits for those two are pinned by
+/// none.
+/// NEGATIVE CONTROLS (2026-11-11): `letter_bar`'s two switches left out of the seams word, as they
+/// were, fired "phaser on ffffff, ShareOverAa from 1400 ms: the kept guard's streams, of 297
+/// frames" (left 4, right 0); `with_aa_unrounded`'s alone left out fired that for AaUnrounded
+/// (left 4); the word left out of a verdict's key, as it was (the room and luma switches alone),
+/// fired the ShareOverAa line (left 4); the two left out of the frame memo's word alone (each
+/// verdict's key keeping them), with the rest leg at 2600 ms, fired nothing, and at 3500 ms fired
+/// "phaser on 002b36, ShareOverAa from 3500 ms: the kept guard's streams, of 297 frames" (left 1,
+/// right 0). The whole reading's switch changes Fire's dim streams, but no scene of ten styles on
+/// six grounds, switched at four times, took a verdict back across it, so its place in the key is
+/// pinned by none.
+#[test]
+fn a_control_switched_between_two_frames_takes_back_nothing_judged_under_the_other() {
+    let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[5H$ ".to_vec()))];
+    ev.extend(typed("echo hello world", 1_000, 50));
+    let tail = 3_000;
+    let scenes: Vec<(&str, (u32, u32, u32))> = ["phaser", "comet", "laser", "fire"]
+        .into_iter()
+        .flat_map(|style| [DIM, GREY, ROSE].map(|look| (style, look)))
+        .collect();
+    let plain: Vec<Vec<Frame>> = scenes
+        .iter()
+        .map(|&(style, look)| run(&mut Replay::new(style, look, false), &ev, tail).0)
+        .collect();
+    // Whether the guard, unswitched, takes the first frame drawn from `at` back whole.
+    let kept_whole: Vec<Vec<bool>> = scenes
+        .iter()
+        .map(|&(style, look)| {
+            let (_, work) = run(&mut Replay::new(style, look, true), &ev, tail);
+            work.iter().map(|w| w.2 > 0).collect()
+        })
+        .collect();
+    let first_kept = |s: usize, at: u64| kept_whole[s][at.div_ceil(FRAME_MS) as usize - 1];
+    // Mid-typing, where verdicts are taken back, and at rest, where whole frames are.
+    const REST: u64 = 3_500;
+    for seam in [Seam::WholeOff, Seam::ShareOverAa, Seam::AaUnrounded] {
+        let (mut bites, mut at_rest, mut rest_bites) = (0, 0, 0);
+        for (switch, (s, (&(style, look), plain))) in [1_400, REST]
+            .into_iter()
+            .flat_map(|at| scenes.iter().zip(&plain).enumerate().map(move |s| (at, s)))
+        {
+            let kept = run_switched(
+                &mut Replay::new(style, look, true),
+                &ev,
+                tail,
+                (switch, seam),
+            );
+            let afresh = run_switched(
+                &mut Replay::new(style, look, false),
+                &ev,
+                tail,
+                (switch, seam),
+            );
+            let moved = kept.iter().zip(&afresh).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                moved,
+                0,
+                "{style} on {:06x}, {seam:?} from {switch} ms: the kept guard's streams, of {} \
+                 frames",
+                look.1,
+                kept.len()
+            );
+            bites += usize::from(afresh != *plain);
+            if switch == REST && first_kept(s, REST) {
+                at_rest += 1;
+                rest_bites += usize::from(afresh != *plain);
+            }
+        }
+        assert!(
+            bites > 0,
+            "premise: {seam:?} changed no stream it was switched on for"
+        );
+        assert!(
+            at_rest > 0,
+            "premise: no scene's guard takes the first frame from {REST} ms back whole"
+        );
+        // The frame memo's word, pinned where a switch changes what a guard takes back whole.
+        if matches!(seam, Seam::ShareOverAa) {
+            assert!(
+                rest_bites > 0,
+                "premise: {seam:?} switched at rest changed no stream of the {at_rest} scenes \
+                 whose first frame from {REST} ms the guard takes back whole"
+            );
+        }
+    }
+}
+
 /// `text` typed after a prompt, as the randomized scene below types it.
 fn typed_on_a_prompt(text: &str, every: u64) -> Vec<(u64, Ev)> {
     let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[4H$ ".to_vec()))];
@@ -246,26 +415,30 @@ fn typed_on_a_prompt(text: &str, every: u64) -> Vec<(u64, Ev)> {
 /// neighbour's feather, the flames' and night grounds. So what the next frame takes back is the
 /// weighing and not the lowered share, and a guard that keeps verdicts publishes what one judging
 /// afresh does however the frames before it went. A sweep of 300 seeded scenes found 6 that moved
-/// when the lowered share was kept, too few for a seed to find; these are three of them.
+/// when the lowered share was kept; the Solarized Dark scene is one of them. The two paper scenes
+/// were seeded again (2026-11-11, after-land M-M2) once the guard's later rounds left the first
+/// two still under that fault: a sweep of 300 scenes a style on Solarized Light moved 3 of
+/// Comet's and 57 of Aurora's, and these are two of those. Each scene's premise is that it moves
+/// under that fault (`set_letter_guard_lowered_kept`), so a scene the guard's later rounds leave
+/// still fails as a premise rather than passing.
 ///
 /// NEGATIVE CONTROL (2026-11-05): `verify_cuts` writing its lowered share back over the kept
 /// verdict, as it did from 39ba2aa319, fired "the kept guard's streams, of 67 frames" (left 5,
 /// right 0) on the first scene; in the sweep the second moved 9 of 112 frames and the third 3 of
-/// 238. What the fix adds was measured over 600 seeded scenes' 99,164 frames, the kept replays
-/// alone, two runs a side: 77,657 -> 77,758 verification passes, 5,435 -> 5,555 cells lowered,
-/// 247.30 G and 247.19 G -> 247.42 G and 247.38 G instructions in the test build.
+/// 238. Again (2026-11-11): the first fired "phaser on 002b36, "cmqλuж" every 33 ms: the kept
+/// guard's streams, of 67 frames" (left 5, right 0); replayed apart, the second moved 4 of 153
+/// frames and the third 9 of 103, where the scenes they replace moved 0 of 112 and 0 of 238. The
+/// premise's control (2026-11-11): the paper Comet scene put back to the one M-M2 found vacuous
+/// fired "premise: comet on fdf6e3, "wncf   d mxo" every 35 ms: with the lowered share kept, none
+/// of 112 frames moved". What the fix adds was measured over 600 seeded scenes' 99,164 frames, the kept replays alone,
+/// two runs a side: 77,657 -> 77,758 verification passes, 5,435 -> 5,555 cells lowered, 247.30 G
+/// and 247.19 G -> 247.42 G and 247.38 G instructions in the test build.
 #[test]
 fn a_share_lowered_on_its_frame_is_that_frame_s_alone() {
     let scenes = [
         ("phaser", DIM, "cmqλuж", 33, 312),
-        ("comet", DIM_PAPER, "wncf   d mxo", 35, 817),
-        (
-            "aurora",
-            DIM_PAPER,
-            "fжzhwoßékfßi cném жzn  sqsyo",
-            67,
-            1_397,
-        ),
+        ("comet", DIM_PAPER, " xtzwßfmftbgnж", 88, 715),
+        ("aurora", DIM_PAPER, "  ibqw", 107, 513),
     ];
     for (style, look, text, every, tail) in scenes {
         let ev = typed_on_a_prompt(text, every);
@@ -276,6 +449,25 @@ fn a_share_lowered_on_its_frame_is_that_frame_s_alone() {
             moved,
             0,
             "{style} on {:06x}, {text:?} every {every} ms: the kept guard's streams, of {} frames",
+            look.1,
+            frames.len()
+        );
+        let mut stale = Replay::new(style, look, true);
+        stale
+            .fx
+            .cursor_mut()
+            .glow
+            .set_letter_guard_lowered_kept(true);
+        let (kept_lowered, _) = run(&mut stale, &ev, tail);
+        let bites = kept_lowered
+            .iter()
+            .zip(&afresh)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            bites > 0,
+            "premise: {style} on {:06x}, {text:?} every {every} ms: with the lowered share kept, \
+             none of {} frames moved",
             look.1,
             frames.len()
         );
@@ -308,7 +500,7 @@ fn a_pass_that_lowers_no_share_is_the_last() {
     fold.extend(typed("echo hello world", 1_000, 50));
     for (style, scene, ev) in [
         ("fire", "typing", &typing),
-        ("rainbow kitty pet", "typing", &typing),
+        ("rainbow", "typing", &typing),
         ("comet", "typing", &typing),
         ("fire", "the fold's scene", &fold),
     ] {
@@ -343,14 +535,7 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
         z ^ (z >> 31)
     };
     let styles = [
-        "rainbow kitty pet",
-        "rainbow kitty",
-        "phaser",
-        "comet",
-        "fire",
-        "laser",
-        "sparkle",
-        "aurora",
+        "rainbow", "phaser", "comet", "fire", "laser", "sparkle", "aurora",
     ];
     let looks = [DARK, LIGHT, DIM];
     let scenes = 6;
@@ -394,7 +579,7 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 /// guard's cuts; this test, run on that branch's tip before it merged 1.9 (0088eabcf0), folded to
 /// `0xc907_d12e_9b56_8217`, and so did the merged tree: 1.9 still leaves the guard as its parent
 /// had it. Review 9's trail/rev9fix floats Comet's dark dust only into a row blank across on the
-/// page's own ground (the owner's ruling); merged onto main 227b056193 it folded to
+/// page's own ground; merged onto main 227b056193 it folded to
 /// `0x0664_f9bc_280d_ea74`. Folded style by style there and on that main, 22 of the
 /// 24 styles and grounds fold alike, and the two that differ are Comet on the dark and dim
 /// grounds, where the dust is drawn. trail/composed round 3 keeps Sparkle's paper marks off the
@@ -444,8 +629,12 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 /// a level in hand (`letter_bar`, c5f12a057c), where it kept 97% of its reading: such a letter on
 /// Solarized Dark now takes no light that lowers it. Folded style by style there and on its parent
 /// fac1b631f5, the 16 dark and light streams fold alike and the eight dim ones differ; the round's
-/// later commits move none of the 24: the value below.
-const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x9969_6521_89e5_f31b;
+/// later commits move none of the 24: `0x9969_6521_89e5_f31b`. CT-08 makes the rainbow one
+/// theme, the underline, with the pet its own setting: the two tall-ribbon rows that fold named
+/// (`rainbow kitty pet` and its alias `rainbow kitty`, one stream folded twice) are now the one
+/// `rainbow` row beside the cat, so the fold reads 21 streams where it read 24 (the other
+/// styles' 18 were not folded apart for this change): the value below.
+const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x41b2_2e84_a662_fb06;
 
 /// FNV-1a over `words`, from `h`.
 fn fold_words(h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
@@ -471,14 +660,7 @@ fn guarded_fold(guard: bool) -> u64 {
     )];
     ev.extend(typed("echo hello world", 1_000, 50));
     let styles = [
-        "rainbow kitty pet",
-        "rainbow kitty",
-        "phaser",
-        "comet",
-        "fire",
-        "laser",
-        "sparkle",
-        "aurora",
+        "rainbow", "phaser", "comet", "fire", "laser", "sparkle", "aurora",
     ];
     let mut h = aterm_hash::FNV64_OFFSET;
     for style in styles {
@@ -501,10 +683,12 @@ fn guarded_fold(guard: bool) -> u64 {
 
 /// The guard's output on main is its parent's (§15.2 1.9 "One owner"): with no light-owned range
 /// noted, as on every frame of these grounds, the streams every frame publishes fold to the
-/// constant captured at the parent on `GOLDEN_TRACE_TARGET` (whose system libm computes the glow's
-/// `exp` and `ln`; off it, another target's libm folds deterministically to its own digest). The
-/// negative control, the guard off, folds otherwise on every target, so the fold weighed the
-/// guard's cuts.
+/// constant captured at the parent on `GOLDEN_TRACE_TARGET`. Off it, three of the fold's inputs
+/// may differ, so another target may fold to a digest of its own, the same on every run: the face's
+/// rasters (CoreText on macOS, the hinted portable rasterizer elsewhere), the default palette
+/// (Windows' slot 4, the `blue` of the line beside the typed one, is `#2973D0`, not `#3B8EEA`) and
+/// the system libm that computes the glow's `exp` and `ln`. The negative control, the guard off,
+/// folds otherwise on every target, so the fold weighed the guard's cuts.
 #[test]
 fn the_guarded_streams_fold_as_at_the_parent() {
     use aterm_effects::aos_momentum::{corpus::GOLDEN_TRACE_TARGET, target_name};

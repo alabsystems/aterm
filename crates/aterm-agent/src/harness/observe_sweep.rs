@@ -48,7 +48,33 @@ pub struct Place<'a> {
     pub src: ObservedSrc,
 }
 
-impl Place<'_> {
+impl<'a> Place<'a> {
+    /// The login a process started on this place runs on, as its environment makes the roster
+    /// believe it ([`ProcessLogin`]): the row's own directory, the default home for a row with
+    /// none, on the row's vault token where the place was read as one.
+    #[must_use]
+    pub fn who(&self) -> ProcessLogin {
+        let route = match (self.src, self.row.and_then(TokenEntry::of_row)) {
+            (ObservedSrc::VaultToken, Some(entry)) => AuthRoute::VaultToken { entry },
+            _ => AuthRoute::Stored,
+        };
+        ProcessLogin {
+            login: self
+                .row
+                .and_then(|row| row.dir.clone())
+                .filter(|dir| !dir.is_empty()),
+            default_home: true,
+            route,
+        }
+    }
+
+    /// The account this place's login runs on ([`accounts::reconcile`]): the row the file's
+    /// address answers to, the account no row lists, or the belief where nothing was read.
+    #[must_use]
+    pub fn reconciled(&self, roster: &'a Roster) -> accounts::Reconciled<'a> {
+        accounts::reconcile(roster, &self.who(), &self.seen)
+    }
+
     /// The file the place was read from, else the place itself.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -199,6 +225,38 @@ pub fn pool_places<'a>(cli: Cli, roster: &'a Roster, user_home: &Path) -> Vec<Pl
             })
         })
         .collect()
+}
+
+/// Every login place `roster` names for the pooled CLI `cli` on this Mac, each as its observer
+/// reads it now: [`claude_places`] (rows `on_token` names read as their token's account) or
+/// [`pool_places`]. With no `user_home` nothing can be read: each row's place is unread, which
+/// leaves it to its row, the belief, and no default home is listed.
+#[must_use]
+pub fn places_of<'a>(
+    cli: Cli,
+    roster: &'a Roster,
+    user_home: Option<&Path>,
+    on_token: &OnToken,
+) -> Vec<Place<'a>> {
+    match (cli, user_home) {
+        (Cli::Claude, Some(home)) => claude_places(roster, home, on_token),
+        (_, Some(home)) => pool_places(cli, roster, home),
+        (_, None) => roster
+            .rows
+            .iter()
+            .map(|row| Place {
+                cli: cli.into(),
+                row: Some(row),
+                seen: Observation::Unread,
+                fallback: row.dir.as_deref().map(PathBuf::from).unwrap_or_default(),
+                src: match cli {
+                    Cli::Claude => ObservedSrc::Profile,
+                    Cli::Agy => ObservedSrc::CliLog,
+                    Cli::Codex | Cli::Grok | Cli::Kimi => ObservedSrc::AuthFile,
+                },
+            })
+            .collect(),
+    }
 }
 
 /// Muse Code's one login place on this Mac, as its observer reads it now ([`super::muse`]): Muse

@@ -131,8 +131,7 @@ fn stdin_next(req: &AddRequest) -> String {
 }
 
 /// `agh auth add NAME (--file PATH | --stdin) --tier T [--owner O]… [--write [--drafts]]
-/// [--legacy-loose]`: an agent provisions as a person does, with or without a terminal (owner
-/// ruling 2026-10-26).
+/// [--legacy-loose]`: an agent provisions as a person does, with or without a terminal.
 ///
 /// # Errors
 ///
@@ -436,7 +435,7 @@ fn is_login(login: &str) -> bool {
 
 /// `agh auth import NAME --from-gh [--user LOGIN] --tier T [--owner O]… [--write [--drafts]]`:
 /// a profile from gh's stored login, provisioned as `auth add --stdin` provisions one, with
-/// or without a terminal (owner ruling 2026-10-26). It reads no stdin, so `--stdin`'s
+/// or without a terminal. It reads no stdin, so `--stdin`'s
 /// terminal check does not apply. Its answer is `auth add`'s. Its row declares neither
 /// `--file` nor `--stdin`, so the parser refuses either as an unknown flag before this runs.
 ///

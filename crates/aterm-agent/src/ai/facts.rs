@@ -482,10 +482,11 @@ pub struct CliAccounts {
     pub launch_step: Option<String>,
     /// What ends that refusal, where there is one ([`LaunchEnd`]).
     pub launch_end: Option<LaunchEnd>,
-    /// The row on this machine's own login, where a launch is refused because that login names
-    /// another account than the row's, and the step that ends it
-    /// ([`crate::harness::accounts_pool::IdentityRefusal::DefaultMoved`]). A launch refused for
-    /// anything else (a pin, a wall) beside such a login leaves this `None`: that step ends nothing.
+    /// The row on this machine's own login, where that login names another account than the row's,
+    /// and the step that ends it, whether or not it is why this launch is refused
+    /// ([`crate::harness::accounts_pool::IdentityRefusal::DefaultMoved`]): another row may take the
+    /// launch while this row stays refused, which the report says too. Why a launch is refused is
+    /// [`Self::launch_end`].
     pub default_moved: Option<(String, crate::harness::accounts_step::Step)>,
     /// The label the owner's pin (`aterm harness accounts use <label>`) holds every launch to,
     /// where a pin stands.
@@ -552,9 +553,30 @@ impl CliAccounts {
         if crate::ai::login::default_home_sign_in(self) {
             return None;
         }
+        if self.moved_refuses_launch() {
+            return self.moved_sign_in();
+        }
         self.next
             .as_deref()
             .map(|label| (label, cli.sign_in_verb(true)))
+            .or_else(|| self.moved_sign_in())
+    }
+
+    /// Whether what this machine's own login names is why a launch is refused now
+    /// ([`LaunchEnd::DefaultMoved`]).
+    #[must_use]
+    pub fn moved_refuses_launch(&self) -> bool {
+        matches!(self.launch_end, Some(LaunchEnd::DefaultMoved(_)))
+    }
+
+    /// The row and verb of [`Self::default_moved`]'s step where a pool sign-in is that step.
+    fn moved_sign_in(&self) -> Option<(&str, &'static str)> {
+        use crate::harness::accounts_step::Step;
+        match &self.default_moved {
+            Some((_, Step::Renew(_, row))) => Some((row.as_str(), "renew")),
+            Some((_, Step::Login(_, row))) => Some((row.as_str(), "login")),
+            _ => None,
+        }
     }
 }
 
@@ -1554,11 +1576,17 @@ fn pool_for_with(
         (Ok(_), Some(why)) => Err(crate::harness::accounts_pool::LaunchRefused::Identity(why)),
         (launch, _) => launch,
     };
-    // Only where it is why this launch is refused: a step for it ends nothing of a pin or a wall.
-    let default_moved = match &launch {
+    let default_moved = match &default_identity_refused {
+        Some(crate::harness::accounts_pool::IdentityRefusal::DefaultMoved {
+            row, step, ..
+        }) => Some((row.clone(), step.clone())),
+        _ => None,
+    };
+    // Only where it is why this launch is refused: its step ends nothing of a pin or a wall.
+    let moved_refusal = match &launch {
         Err(crate::harness::accounts_pool::LaunchRefused::Identity(
-            crate::harness::accounts_pool::IdentityRefusal::DefaultMoved { row, step, .. },
-        )) => Some((row.clone(), step.clone())),
+            crate::harness::accounts_pool::IdentityRefusal::DefaultMoved { step, .. },
+        )) => Some(step.clone()),
         _ => None,
     };
     let launch_refused = launch.as_ref().err().map(ToString::to_string);
@@ -1625,7 +1653,7 @@ fn pool_for_with(
     // anything else by the pool's records as they change (a lease, a warm set, a wall).
     let launch_end = launch.as_ref().err().map(|_| {
         use crate::harness::codex_alab::DefaultRow;
-        if let Some((_, step)) = default_moved.as_ref().filter(|_| launch_step.is_none()) {
+        if let Some(step) = moved_refusal.as_ref().filter(|_| launch_step.is_none()) {
             return LaunchEnd::DefaultMoved(step.clone());
         }
         let pinned = state

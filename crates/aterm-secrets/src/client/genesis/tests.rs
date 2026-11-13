@@ -484,6 +484,26 @@ fn every_current_member_is_in_after_genesis_v2() {
         "an unreadable stream is not a new private realm"
     );
     fsx::write_atomic(&data, &held, 0o600).unwrap();
+    // A last record cut short is what this Mac's own writer leaves where an append died: the
+    // file holds the records before it, read as strictly as ever.
+    // NEGATIVE CONTROL (2026-11-11): read with `decode_records`, the cut tail refuses the
+    // realm's own records (`the records before a cut`).
+    assert!(private_realm(&served.paths, &cfg).unwrap());
+    for cut in [1, 40, held.len() - 1] {
+        fsx::write_atomic(&data, &[&held[..], &held[..cut]].concat(), 0o600).unwrap();
+        assert!(
+            private_realm(&served.paths, &cfg).expect("the records before a cut"),
+            "cut at {cut}"
+        );
+    }
+    let mut forged = held.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    fsx::write_atomic(&data, &forged, 0o600).unwrap();
+    assert!(
+        private_realm(&served.paths, &cfg).is_err(),
+        "a whole record that fails its signature is still refused"
+    );
+    fsx::write_atomic(&data, &held, 0o600).unwrap();
     let kept = data.with_extension("genesis-kept");
     std::fs::rename(&data, &kept).unwrap();
     std::os::unix::fs::symlink(&kept, &data).unwrap();

@@ -299,11 +299,14 @@ fn the_last_sleep_is_a_span_only_where_the_wake_follows_it() {
     );
 }
 
-/// Off macOS no reader runs, and each says so.
+/// Off macOS no lid, display or sleep reader runs, and each says so; the power source has a
+/// reader on Windows (`win_power_tests.rs` reads it) and none on Linux.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn off_macos_every_situation_reader_says_it_has_none() {
-    assert!(!LID_READER && !POWER_READER && !DISPLAY_READER && !SLEEP_READER);
+    const { assert!(!LID_READER && !DISPLAY_READER && !SLEEP_READER) };
+    assert_eq!(POWER_READER, cfg!(windows));
+    #[cfg(not(windows))]
     assert_eq!(PowerWatch::new().read(T0), None);
     assert_eq!(Watch::start().heard(), Heard::default());
     assert_eq!(awake(), None);

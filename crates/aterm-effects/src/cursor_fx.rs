@@ -778,9 +778,10 @@ pub struct GlowSpelling {
     pub style: Option<GlowStyle>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
-    /// The full-height ribbon body.
+    /// The full-height ribbon body: `false` for the `rainbow` theme, whose shape is the
+    /// underline, and unread by every other style.
     pub ribbon_tall: bool,
-    /// The explicit flat ribbon body.
+    /// The flat ribbon body, which no built-in theme picks.
     pub ribbon_flat: bool,
     /// The classic wake's theme-following face (`classic mono`).
     pub classic_mono: bool,
@@ -803,24 +804,9 @@ impl GlowSpelling {
                 Some(style)
             },
             beam: crate::cursor_glow::style_has_beam_of(style, token),
-            ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
-            ribbon_flat: GlowStyle::style_names_flat_ribbon(token),
+            ribbon_tall: !matches!(style, GlowStyle::RainbowKitty),
+            ribbon_flat: false,
             classic_mono: GlowStyle::style_names_classic_mono(raw),
-        }
-    }
-
-    /// The companion a page's raw spelling names.
-    #[inline]
-    #[must_use]
-    pub const fn pet_of(raw: &str) -> Option<crate::kitty_pet::PetSpecies> {
-        if GlowStyle::style_names_any_pet(raw) {
-            Some(if GlowStyle::style_names_dog_pet(raw) {
-                crate::kitty_pet::PetSpecies::Dog
-            } else {
-                crate::kitty_pet::PetSpecies::Cat
-            })
-        } else {
-            None
         }
     }
 }

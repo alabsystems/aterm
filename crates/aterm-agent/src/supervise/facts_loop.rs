@@ -40,6 +40,24 @@ pub(super) struct FactsWatch {
     /// door's under `prompt`, and never a line `observe` only would have typed. The pace the
     /// stuck line keeps ([`Session::stuck_books`], [`Session::break_lined`]).
     pub(super) lined_ms: Option<i64>,
+    /// How many calls at no progress the session had been told
+    /// ([`FactsState::no_progress_told`]) when the agent last ran a turn of its own
+    /// ([`Self::agent_worked`]): one told since closes the quiet period to every other.
+    worked_told: u64,
+}
+
+impl FactsWatch {
+    /// The agent ran a turn of its own: a new quiet period begins, in which one call at no
+    /// progress may be told.
+    pub(super) fn agent_worked(&mut self) {
+        self.worked_told = self.state.no_progress_told();
+    }
+
+    /// Whether a fact of `kind` may be told in this quiet period: a call at no progress only where
+    /// none was told since the agent's last turn of its own, every other kind always.
+    fn quiet_admits(&self, kind: FactKind) -> bool {
+        kind != FactKind::NoProgress || self.state.no_progress_told() == self.worked_told
+    }
 }
 
 /// What the stuck line came to at a break, as its `FACT` line says it.
@@ -68,7 +86,33 @@ impl<C: Ctl> Session<'_, C> {
         let reading = host.facts();
         let now_ms = self.now_unix_ms();
         self.facts.state.observe(reading.as_ref(), now_ms);
-        self.facts.state.pending(reading.as_ref(), now_ms)
+        let seq = self.last.as_ref().map_or(0, |s| s.seq);
+        self.fact_withheld(reading.as_ref(), now_ms, FactDoor::TurnEnd, seq);
+        let watch = &self.facts;
+        watch
+            .state
+            .pending_of(reading.as_ref(), now_ms, |kind| watch.quiet_admits(kind))
+    }
+
+    /// Books, once an episode, a call at no progress withheld because another call of the agent's
+    /// stands, whose end wakes it ([`FactsState::withheld`]): a skipped row of the fact's own
+    /// kind, the journal's record of what was not typed.
+    fn fact_withheld(
+        &mut self,
+        reading: Option<&super::super::facts::FactsReading>,
+        now_ms: i64,
+        door: FactDoor,
+        seq: u64,
+    ) {
+        if let Some(key) = self.facts.state.withheld(reading, now_ms) {
+            self.ledger_row(
+                key.kind.rule(),
+                Outcome::Skipped,
+                "",
+                &door::fact_outcome_reason(key, door, Told::Skipped("other-wait")),
+                seq,
+            );
+        }
     }
 
     /// Returns the untold overlap that `action` may carry ([`FactKind::Overlap`]), if any, asked
@@ -140,9 +184,6 @@ impl<C: Ctl> Session<'_, C> {
             let at_ms = self.now_unix_ms();
             self.facts.state.told(fact.key, at_ms);
             self.turn_end.fact_rode(fact);
-            if let Some(host) = self.stall_host.clone() {
-                host.inform(&templates::stuck_line(&fact.text));
-            }
         }
         review.note(&format!(
             "FACT seq={seq} kind={} episode={:016x} door={} {}",
@@ -205,7 +246,11 @@ impl<C: Ctl> Session<'_, C> {
         let reading = host.facts();
         let now_ms = self.now_unix_ms();
         self.facts.state.observe(reading.as_ref(), now_ms);
-        let Some(fact) = self.facts.state.pending_at_break(reading.as_ref(), now_ms) else {
+        self.fact_withheld(reading.as_ref(), now_ms, FactDoor::Break, screen.seq);
+        let watch = &self.facts;
+        let Some(fact) = watch.state.pending_of(reading.as_ref(), now_ms, |kind| {
+            kind.rides_breaks() && watch.quiet_admits(kind)
+        }) else {
             return Ok(false);
         };
         let now = at + waited;
@@ -349,7 +394,6 @@ impl<C: Ctl> Session<'_, C> {
             self.break_lined(clock_ms);
             self.hold_line(seq, Some(cfg), review);
             host.break_taken();
-            host.inform(&line);
             self.facts.said = Some((fact.key, StuckSaid::Typed));
         }
         review.note(&format!(

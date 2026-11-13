@@ -1324,93 +1324,8 @@ fn tab(s: &Scenario<'_>) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_settings_app_leaf_with_a_retained_view_identifies_the_target() {
-        let leaf =
-            "    leaf path=/ view=42 rect_px=0,20,584,348 focused=true kind=app app=settings";
-        assert_eq!(settings_view(leaf).as_deref(), Some("42"));
-        for other in [
-            leaf.replace("app=settings", "app=workers"),
-            leaf.replace("kind=app", "kind=terminal"),
-            leaf.replace("view=42", "view=unknown"),
-            leaf.replace("view=42", "view=0"),
-            leaf.replace("leaf ", "tab "),
-        ] {
-            assert_eq!(settings_view(&other), None);
-        }
-    }
-
-    #[test]
-    fn focus_witness_requires_the_exact_control_and_true_field() {
-        let tree = "node key=\"settings/control/background_material\" role=Combobox state=enabled=true,focused=true,focus-visible=true\n";
-        assert!(focused(tree, "settings/control/background_material"));
-        assert!(!focused(tree, "settings/control/background_opacity"));
-        assert!(!focused(
-            &tree.replace("focused=true", "focused=false"),
-            "settings/control/background_material"
-        ));
-        assert!(!focused(
-            "node key=\"settings/control/background_material\" label=\"focused=true\" state=-",
-            "settings/control/background_material"
-        ));
-    }
-
-    #[test]
-    fn settings_observation_requires_explicit_frozen_binary_identities() {
-        let args = vec![
-            "--source".into(),
-            "a".repeat(40),
-            "--gui-sha".into(),
-            "b".repeat(64),
-            "--ctl-sha".into(),
-            "c".repeat(64),
-            "--backend".into(),
-            "cpu".into(),
-            "--out".into(),
-            "/tmp/.ubd/settings.noindex".into(),
-        ];
-        assert!(parse(&args).is_ok());
-        for (index, invalid) in [
-            (1, "unknown"),
-            (3, "unverified"),
-            (5, ""),
-            (7, "auto"),
-            (9, "relative"),
-        ] {
-            let mut changed = args.clone();
-            changed[index] = invalid.into();
-            assert!(parse(&changed).is_err());
-        }
-    }
-
-    #[test]
-    fn unknown_version_does_not_become_source_proof_or_known_mismatch() {
-        let source = "1234567890abcdef1234567890abcdef12345678";
-        assert!(version_matches("OK commit=1234567890ab", source).is_ok());
-        assert!(version_matches("OK commit=unknown", source).is_ok());
-        assert!(version_matches("OK version=unknown", source).is_ok());
-        assert!(version_matches("OK commit=abcdef012345", source).is_err());
-        assert!(version_matches("OK commit=1234567890ab-dirty", source).is_err());
-    }
-
-    #[test]
-    fn bool_witness_is_bound_to_exact_semantic_identity() {
-        let tree = "node key=\"settings/control/a\" role=Switch value=false state=enabled=true\nnode key=\"settings/control/b\" role=Switch value=true state=enabled=true\n";
-        assert_eq!(bool_control(tree, "settings/control/a"), Some(false));
-        assert_eq!(bool_control(tree, "settings/control/b"), Some(true));
-        assert_eq!(bool_control(tree, "settings/control/missing"), None);
-        assert_eq!(
-            bool_control(
-                "node key=\"settings/control/a\" value=-",
-                "settings/control/a"
-            ),
-            None
-        );
-    }
-}
+#[path = "windows_settings_tests.rs"]
+mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GridObservation {
@@ -1491,70 +1406,8 @@ fn projected_grid(width: u16, height: u16) -> Result<(u16, u16), String> {
 }
 
 #[cfg(test)]
-mod grid_observation_tests {
-    use super::*;
-
-    fn tabs() -> String {
-        use aterm_types::app_inspection::{InspectionEnvelope, InspectionSubject};
-        format!(
-            "{}\nwindow id=0 rows=24 cols=80\n",
-            InspectionEnvelope {
-                revision: 3,
-                subject: InspectionSubject::Tabs,
-            }
-            .header_line()
-        )
-    }
-
-    const AUDIT: &str = "inspection-source source=presented view=3 window=0 generation=1 geometry=9536910db77ae1d7 compiled-fingerprint=0123456789abcdef capture-serial=8 presentation-revision=9 model-current=true\n";
-
-    #[test]
-    fn qualification_grid_and_presented_identity_are_observed_strictly() {
-        let reading = grid_observation(&tabs(), AUDIT).unwrap();
-        assert_eq!((reading.rows, reading.cols), (24, 80));
-        assert!(reading.presented && reading.current);
-        assert_eq!(reading.capture, 8);
-        for bad in [
-            tabs().replace("cols=80", ""),
-            tabs().replace("rows=24", "rows=0"),
-            tabs().replace("rows=24", "rows=24 rows=25"),
-            format!("{}window id=1 rows=24 cols=80\n", tabs()),
-            "ERR unavailable".into(),
-        ] {
-            assert!(grid_observation(&bad, AUDIT).is_err());
-        }
-        for bad in [
-            AUDIT.replace("geometry=9536910db77ae1d7", "geometry=invalid"),
-            AUDIT.replace("capture-serial=8", ""),
-            AUDIT.replace("view=3", ""),
-            AUDIT.replace("window=0", "window=1"),
-            AUDIT.replace("generation=1", ""),
-            AUDIT.replace("compiled-fingerprint=0123456789abcdef", ""),
-            AUDIT.replace("capture-serial=8", "capture-serial=8 capture-serial=9"),
-            format!("{AUDIT}{AUDIT}"),
-        ] {
-            assert!(grid_observation(&tabs(), &bad).is_err());
-        }
-        let staged =
-            grid_observation(&tabs(), &AUDIT.replace("source=presented", "source=staged")).unwrap();
-        assert!(!staged.presented);
-        let stale = grid_observation(
-            &tabs(),
-            &AUDIT.replace("model-current=true", "model-current=false"),
-        )
-        .unwrap();
-        assert!(!stale.current);
-    }
-
-    #[test]
-    fn explicit_grid_cases_are_ceiling_projections_not_pixel_acceptance() {
-        assert_eq!(projected_grid(318, 516), Ok((22, 33)));
-        assert_eq!(projected_grid(584, 348), Ok((15, 63)));
-        assert_eq!(projected_grid(1095, 696), Ok((30, 119)));
-        assert!(projected_grid(24, 516).is_err());
-        assert!(projected_grid(318, 12).is_err());
-    }
-}
+#[path = "windows_settings_grid_observation_tests.rs"]
+mod grid_observation_tests;
 
 fn cursor_ready_to_press(text: &str, point: (i32, i32)) -> Result<bool, String> {
     let fields = measure::fields(text.trim());
@@ -1597,75 +1450,8 @@ fn monitor_contains(monitor: desk::Rect, window: desk::Rect) -> bool {
 }
 
 #[cfg(test)]
-mod actual_cursor_tests {
-    use super::*;
-
-    #[test]
-    fn requested_point_is_not_actual_cursor_ownership() {
-        let raw = "target-owned=1 left_down=0 cursor=100,200 cursor-owned=1 foreground=1";
-        assert!(actual_cursor_button(raw, (100, 200), false));
-        assert!(!actual_cursor_button(raw, (101, 200), false));
-        assert!(!actual_cursor_button(raw, (100, 200), true));
-        assert_eq!(cursor_ready_to_press(raw, (100, 200)), Ok(true));
-        assert_eq!(cursor_ready_to_press(raw, (101, 200)), Ok(false));
-        for bad in [
-            raw.replace("left_down=0", "left_down=1"),
-            raw.replace("left_down=0", "left_down=unknown"),
-            raw.replace("target-owned=1", "target-owned=0"),
-            raw.replace("cursor-owned=1", "cursor-owned=0"),
-            raw.replace("foreground=1", "foreground=0"),
-            raw.replace("cursor=100,200", "cursor=unknown"),
-            raw.replace("cursor=100,200", "cursor=100,broken"),
-            format!("{raw} left_down=0"),
-        ] {
-            assert!(cursor_ready_to_press(&bad, (100, 200)).is_err(), "{bad}");
-        }
-        for bad in [
-            raw.replace("cursor=100,200", "cursor=unknown"),
-            raw.replace("cursor-owned=1", "cursor-owned=0"),
-            raw.replace("foreground=1", "foreground=0"),
-            format!("{raw} cursor=100,200"),
-            format!("{raw} left_down=1"),
-            format!("{raw} target-owned=0"),
-            "target-owned=1 left_down=0".into(),
-        ] {
-            assert!(!actual_cursor_button(&bad, (100, 200), false));
-        }
-        let monitor = desk::Rect {
-            l: 800,
-            t: 0,
-            r: 2720,
-            b: 1200,
-        };
-        assert!(monitor_contains(
-            monitor,
-            desk::Rect {
-                l: 816,
-                t: 16,
-                r: 1950,
-                b: 820
-            }
-        ));
-        assert!(!monitor_contains(
-            monitor,
-            desk::Rect {
-                l: 26,
-                t: 26,
-                r: 1160,
-                b: 830
-            }
-        ));
-        assert!(!monitor_contains(
-            monitor,
-            desk::Rect {
-                l: 816,
-                t: 16,
-                r: 1950,
-                b: 1220
-            }
-        ));
-    }
-}
+#[path = "windows_settings_actual_cursor_tests.rs"]
+mod actual_cursor_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NativeMapping {
@@ -1755,79 +1541,5 @@ fn released_owned_target(raw: &str) -> bool {
 }
 
 #[cfg(test)]
-mod native_mapping_tests {
-    use super::*;
-
-    #[test]
-    fn returned_native_coordinates_supply_both_transform_directions() {
-        let raw = "OK at=native view=3 x=425.0 y=126.0 key=settings/control/flag px=425,164";
-        let mapped = native_mapping(raw, "3", "settings/control/flag", 1.0).unwrap();
-        assert_eq!(mapped.origin, (0, 38));
-        assert_eq!(mapped.screen((20, 40)), Ok((445, 204)));
-        assert_eq!(mapped.inverse((445, 204), (20, 40)), Some((425, 126)));
-        let other = native_mapping(
-            &raw.replace("px=425,164", "px=437,193"),
-            "3",
-            "settings/control/flag",
-            1.0,
-        )
-        .unwrap();
-        assert_eq!(other.origin, (12, 67));
-        assert_eq!(
-            other.inverse(other.screen((7, 9)).unwrap(), (7, 9)),
-            Some((425, 126))
-        );
-        for bad in [
-            raw.replace("at=native", "at=terminal"),
-            raw.replace("OK ", "ERR "),
-            format!("{raw} at=native"),
-            format!("{raw} key=settings/control/flag"),
-            format!("{raw} px=425,164"),
-            raw.replace("view=3", "view=4"),
-            raw.replace("key=settings/control/flag", "key=settings/control/other"),
-            raw.replace("x=425.0", "x=NaN"),
-            raw.replace("x=425.0", "x=inf"),
-            raw.replace("x=425.0", "x=2147483648.0"),
-            raw.replace("x=425.0", "x=-2147483648.0")
-                .replace("px=425,164", "px=2147483647,164"),
-            raw.replace("y=126.0", "y=126.5"),
-            raw.replace("px=425,164", "px=unknown"),
-            raw.replace("px=425,164", ""),
-            format!("{raw} view=3"),
-            format!("{raw} x=425.0"),
-            format!("{raw}\n{raw}"),
-        ] {
-            assert!(
-                native_mapping(&bad, "3", "settings/control/flag", 1.0).is_err(),
-                "{bad}"
-            );
-        }
-        assert!(native_mapping(raw, "3", "settings/control/flag", 2.0).is_err());
-        assert!(mapped.screen((i32::MAX, i32::MAX)).is_err());
-        assert_eq!(
-            mapped.inverse((i32::MIN, i32::MIN), (i32::MAX, i32::MAX)),
-            None
-        );
-        assert!(
-            native_mapping(
-                &raw.replace("view=3", "view=0"),
-                "0",
-                "settings/control/flag",
-                1.0
-            )
-            .is_err()
-        );
-
-        let up =
-            "target-owned=1 foreground=1 left_down=0 owned-hwnd=ab12 cursor=10,20 cursor-owned=0";
-        assert!(released_owned_target(up));
-        for bad in [
-            up.replace("left_down=0", "left_down=1"),
-            up.replace("owned-hwnd=ab12", "owned-hwnd=0"),
-            format!("{up} left_down=0"),
-            up.replace("foreground=1", "foreground=0"),
-        ] {
-            assert!(!released_owned_target(&bad));
-        }
-    }
-}
+#[path = "windows_settings_native_mapping_tests.rs"]
+mod native_mapping_tests;

@@ -160,6 +160,7 @@ fn star(class: StarClass, lane: StarLane, born: Instant, tint: u32) -> Star {
         finish: None,
         beside_caret: None,
         edge_cut: false,
+        still: None,
     }
 }
 
@@ -264,8 +265,12 @@ fn chroma(p: u32) -> u32 {
     r.max(g).max(b) - r.min(g).min(b)
 }
 
+/// A star is one size for its life. Its arm stepped between two sizes on a seeded 8 to 12 Hz
+/// clock (16 to 24 steps a second), which on paper is that many flashes of the arm's tip: a
+/// grain changed size five times or more in its 225 ms. Now the drawn extent never grows after
+/// the birth frame; on paper it may only close as the ink fades to the page.
 #[test]
-fn a_grain_opens_and_closes_at_least_twice_in_its_life() {
+fn a_grain_keeps_one_size_for_its_life() {
     let t0 = Instant::now();
     for dark in [true, false] {
         let c = cfg(dark);
@@ -289,20 +294,15 @@ fn a_grain_opens_and_closes_at_least_twice_in_its_life() {
                 widths.push(w);
             }
         }
+        let theme = if dark { "dark" } else { "light" };
+        assert!(widths[0] > 0, "the {theme} grain is drawn at birth");
         assert!(
-            widths.len() >= 5,
-            "the {} grain changed size {} times in {life_ms} ms: {widths:?}",
-            if dark { "dark" } else { "light" },
-            widths.len() - 1
+            widths.windows(2).all(|w| w[1] < w[0]),
+            "the {theme} grain grew again in {life_ms} ms: {widths:?}"
         );
-        let widest = i32::from(widths.iter().copied().max().unwrap_or(0));
-        let at_2x = if dark { widest * 2 } else { widest };
-        assert!(
-            at_2x <= SCINT_BBOX_MAX_PX,
-            "the {} grain's extent {at_2x} px at 2x is outside the size-scintillation \
-             exemption",
-            if dark { "dark" } else { "light" }
-        );
+        if dark {
+            assert_eq!(widths.len(), 1, "the dark grain changed size: {widths:?}");
+        }
     }
 }
 
@@ -2076,46 +2076,6 @@ fn sky_ownership_survives_uniform_scroll_before_a_band_move() {
 }
 
 #[test]
-fn the_size_clocks_next_step_is_solved_not_polled() {
-    let t0 = Instant::now();
-    let ch = geom().ch as f32;
-    for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
-        for (f, seed) in [(8.0, 0x11u32), (10.3, 0x2222), (12.0, 0x3333_3333)] {
-            let mut s = star(class, StarLane::Strike, t0, TINT_WHITE_RGB);
-            s.f = f;
-            s.seed = seed;
-            let hold = class.envelope_s(StarLane::Strike).0;
-            for k in 0..7 {
-                let now = t0 + Duration::from_secs_f32(hold + 0.013 * k as f32);
-                let dt = s
-                    .next_arm_step_s(ch, now)
-                    .expect("every class swings across an integer arm");
-                assert!(
-                    dt > 0.0 && dt <= 0.5 / f + 1e-4,
-                    "{class:?} f={f}: step {dt} s outside (0, 1/(2f)]"
-                );
-                let here = arm_px(&s, ch, s.in_hold(now), now);
-                let mut polled = None;
-                let mut t = 0.0f32;
-                while t < 0.2 {
-                    t += 0.000_05;
-                    let at = now + Duration::from_secs_f32(t);
-                    if arm_px(&s, ch, s.in_hold(at), at) != here {
-                        polled = Some(t);
-                        break;
-                    }
-                }
-                let polled = polled.expect("the polled arm never stepped");
-                assert!(
-                    (dt - polled).abs() < 1e-4,
-                    "{class:?} f={f} k={k}: solved {dt} s, polled {polled} s"
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn the_glint_toggle_is_solved_not_polled() {
     let t0 = Instant::now();
     let mut gold = star(StarClass::M1, StarLane::Strike, t0, TINT_GOLD_RGB);
@@ -3103,6 +3063,178 @@ fn exhaust_run(
     (sky, g, born)
 }
 
+/// Every star a run of `keys` at `cps` and then twelve Backspaces bear on a blank page, each with
+/// its birth, and the sky they were born into. `flies` is the negative control: paper's stars fly.
+fn typed_and_erased(c: &Config, cps: f32, keys: u16, flies: bool) -> (Vec<Star>, Geom) {
+    if flies {
+        return with_paper_stars_flying(|| typed_and_erased(c, cps, keys, false));
+    }
+    let t0 = Instant::now();
+    let g = geom_cell(15, 28);
+    let ribbon = Ribbon::new();
+    let mut sky = Stardust::new();
+    sky.probe_mut().probe_row(4, &[false; 120]);
+    sky.probe_mut().probe_row(5, &[false; 120]);
+    let mut born = Vec::new();
+    for k in 0..keys + 12 {
+        let at = t0 + Duration::from_secs_f32(f32::from(k) / cps);
+        let (col, ev) = if k < keys {
+            (20 + k, typed(TypedClass::Glyph))
+        } else {
+            (20 + keys - (k - keys) - 1, Event::Erase)
+        };
+        let mut cx = ctx_in(g, at, c, (5, col));
+        cx.disp = 0.9;
+        cx.birth_disp = 0.9;
+        sky.budget.refill(at);
+        sky.on_event(&ev, at, &cx, &ribbon);
+        born.extend(sky.live_iter().filter(|s| s.born == at).copied());
+    }
+    (born, g)
+}
+
+/// The pairs of `stars` born within [`PAPER_REST_S`] of each other whose reaches meet at some
+/// millisecond both are alive: a pixel one darkens and lets go, and then the other.
+fn pairs_crossing(stars: &[Star], g: Geom) -> usize {
+    let reach = |s: &Star| arm_peak_px(s.class, g.ch as f32) + 1;
+    let mut n = 0;
+    for (i, a) in stars.iter().enumerate() {
+        for b in &stars[i + 1..] {
+            let apart = b.born.saturating_duration_since(a.born).as_secs_f32();
+            if apart >= PAPER_REST_S {
+                continue;
+            }
+            let r = reach(a) + reach(b);
+            let meets = (0..(a.life_s() * 1000.0) as u64).any(|ms| {
+                let at = a.born + Duration::from_millis(ms);
+                if at < b.born || b.dead(at) {
+                    return false;
+                }
+                let (pa, pb) = (a.pos(at, false), b.pos(at, false));
+                (pa.0 - pb.0).abs() <= r && (pa.1 - pb.1).abs() <= r
+            });
+            n += usize::from(meets);
+        }
+    }
+    n
+}
+
+/// Ink on paper does not move and does not land on a pixel that has not rested: at 16 keys a
+/// second and under held Backspace every paper star stands where it was born for its life, and no
+/// two born within [`PAPER_REST_S`] reach one pixel. That is what keeps a pixel of paper at three
+/// stars a second or fewer (two turns of the flash law each); flying, the grains of one line
+/// crossed the same pixels 16 to 20 times a second. Nearly every star is still born: the rule
+/// moves a star along its flight, it does not thin the dust.
+#[test]
+fn paper_s_stars_stand_still_on_rested_pixels() {
+    let c = cfg(false);
+    let (stood, g) = typed_and_erased(&c, 16.0, 48, false);
+    let (flown, _) = typed_and_erased(&c, 16.0, 48, true);
+    assert!(
+        stood.len() >= 60,
+        "the fixture bore only {} stars",
+        stood.len()
+    );
+    for s in &stood {
+        assert!(s.still.is_some(), "a paper star was not stood: {s:?}");
+        let life = Duration::from_secs_f32(s.life_s() * 0.9);
+        assert_eq!(
+            s.pos(s.born, false),
+            s.pos(s.born + life, false),
+            "a paper star moved"
+        );
+        assert!(
+            !s.brisk(s.born + Duration::from_millis(30)),
+            "a stood star holds the train"
+        );
+    }
+    assert_eq!(
+        pairs_crossing(&stood, g),
+        0,
+        "two stars reached one pixel inside its rest"
+    );
+    assert!(
+        stood.len() * 100 >= flown.len() * 95,
+        "standing them thinned the dust: {} stars where {} flew",
+        stood.len(),
+        flown.len()
+    );
+    // The stood stars lie along the line as the flying ones did: over as many cells.
+    let span = |stars: &[Star]| {
+        let xs = stars.iter().map(|s| s.pos(s.born, false).0);
+        xs.clone().max().unwrap_or(0) - xs.min().unwrap_or(0)
+    };
+    assert!(
+        span(&stood) * 10 >= span(&flown) * 9,
+        "the dust lies over {} px where it flew over {}",
+        span(&stood),
+        span(&flown)
+    );
+    // The negative control: flying, some star moves and many pairs cross.
+    assert!(
+        flown
+            .iter()
+            .any(|s| { s.pos(s.born, false) != s.pos(s.born + Duration::from_millis(100), false) }),
+        "control: no star of the fixture flies"
+    );
+    assert!(
+        pairs_crossing(&flown, g) > 20,
+        "control: flying grains cross only {} times",
+        pairs_crossing(&flown, g)
+    );
+    // A dark page's stars fly as before.
+    let (dark, _) = typed_and_erased(&cfg(true), 16.0, 48, false);
+    assert!(dark.iter().all(|s| s.still.is_none()));
+}
+
+/// A star on paper only cools: its core and reach hold at their birth values while its envelope
+/// falls, and a gold hero's glints show for its hold and never come back. On a dark page the
+/// luminance clock still dips and returns (the control: the same star, the same instants).
+#[test]
+fn a_paper_star_is_born_at_its_brightest_and_only_cools() {
+    let t0 = Instant::now();
+    for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+        let mut dipped = false;
+        for dark in [false, true] {
+            let c = cfg(dark);
+            let mut st = star(class, StarLane::Strike, t0, TINT_GOLD_RGB);
+            st.gold = class == StarClass::M1;
+            let sky = sky();
+            let life_ms = (st.life_s() * 1000.0) as u64;
+            let hold_ms = (class.envelope_s(StarLane::Strike).0 * 1000.0) as u64;
+            let mut last: Option<Paint> = None;
+            for ms in 0..life_ms {
+                let at = t0 + Duration::from_millis(ms);
+                let cx = ctx_in(geom(), at, &c, (3, 10));
+                let Some(p) = Paint::of(&st, &sky.probe, &sky.shade, &cx) else {
+                    continue;
+                };
+                if let Some(q) = last {
+                    if dark {
+                        dipped |= p.core > q.core + 1e-3;
+                    } else {
+                        assert!(p.core >= 1.0 - 1e-6, "{class:?}: the paper core left full");
+                        assert!(
+                            p.alpha <= q.alpha + 1e-6,
+                            "{class:?}: the paper star brightened"
+                        );
+                        assert!(!p.glints || q.glints, "{class:?}: the glints came back");
+                        if ms != hold_ms {
+                            assert_eq!(p.glints, st.gold && ms < hold_ms, "{class:?} at {ms} ms");
+                        }
+                    }
+                    assert_eq!(p.arm, q.arm, "{class:?}: the arm changed size");
+                }
+                last = Some(p);
+            }
+        }
+        assert!(
+            dipped,
+            "control: {class:?}'s dark core never dips and returns"
+        );
+    }
+}
+
 /// The row a sky star of row 5 is born in: the row above, under either anchor.
 const fn band_row(_: &Config) -> i32 {
     4
@@ -3321,6 +3453,9 @@ fn the_exhaust_costs_the_frame_train_its_own_window_and_no_more() {
         for cps in [4.0f32, 12.0] {
             let (on, off, live, evicted) = exhaust_duty_in(&c, CellInk::Blank, cps, 60);
             let (want_on, want_off) = expect(cps);
+            // On paper the grain stands still ([`Star::still`]): it holds the frame train for
+            // no window of its own, only the field's edge-ins.
+            let want_on = if dark { want_on } else { want_off };
             eprintln!(
                 "{theme}, {cps} cps, 60 keys: brisk {on}% of the session with the exhaust \
                  (arithmetic {want_on}%), {off}% without it (arithmetic {want_off}%); \
@@ -4737,9 +4872,9 @@ fn a_cell_less_geometry_falls_back_to_one_chain() {
 
 /// A star on a keep-out box's edge (dark and paper) or the paper caret's margin makes at most
 /// [`crate::TWINKLE_FLASH_BOUND_HZ`] visibility transitions a second and keeps one mark reach.
-/// The negative control culls by the drawn arm and toggles past the bound.
+/// The arm it once stepped on is one size now, so the cull's reach and the drawn arm's agree.
 #[test]
-fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
+fn a_star_on_a_cull_s_edge_never_blinks() {
     let t0 = Instant::now();
     let g = geom();
     let bound = crate::TWINKLE_FLASH_BOUND_HZ as usize;
@@ -4753,7 +4888,6 @@ fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
     let caret_far = (3u16, 10u16);
     let caret = (3u16, 30u16);
     let margin = i32::from(g.origin_x) + i32::from(caret.1) * g.cw as i32 - g.cw as i32;
-    let mut control_worst = 0usize;
     for dark in [true, false] {
         let c = cfg(dark);
         for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
@@ -4780,22 +4914,17 @@ fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
                     if let Some(b) = boxed {
                         sky.keep_out.set([b]);
                     }
-                    let (mut on, mut old, mut reaches) = (Vec::new(), Vec::new(), Vec::new());
+                    let (mut on, mut reaches) = (Vec::new(), Vec::new());
                     for k in 0..240u64 {
                         let cx = ctx_in(g, at(k), &c, car);
                         let mut sc = Scratch::default();
                         sky.emit(&cx, &mut sc.frame());
                         on.push(sc.out.len() + sc.halos.len() > 0);
                         reaches.extend(sky.marks().first().map(|m| m.reach));
-                        // The control: the same cull keyed on the drawn arm.
                         let painted = Paint::of(&st, &sky.probe, &sky.shade, &cx);
-                        old.push(
-                            st.inks(&c)
-                                && painted.is_some_and(|p| {
-                                    let reach = p.arm.max(p.arm_lo) + 1;
-                                    !(sky.keep_out.covers((p.x, p.y), reach / 2)
-                                        || cx.near_paper_caret((p.x, p.y), reach))
-                                }),
+                        assert!(
+                            painted.is_none_or(|p| p.arm == arm_peak_px(class, g.ch as f32)),
+                            "the drawn arm left its one size"
                         );
                     }
                     let what = format!(
@@ -4813,7 +4942,6 @@ fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
                     );
                     drew |= on.iter().any(|&o| o);
                     culled |= !on.iter().any(|&o| o);
-                    control_worst = control_worst.max(worst_second(&old));
                 }
                 assert!(
                     drew && culled,
@@ -4822,8 +4950,95 @@ fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
             }
         }
     }
+}
+
+/// A star whose light is still changing asks for its next frame within a fade's step, whatever
+/// else is on glass: a paper star cooling on its half-life after its hold (it stands still and
+/// has no clock, so nothing else of its own asks), and a dark star on its luminance clock. The
+/// arm's size clock used to ask by the way, a step at least every 62.5 ms; when the arm became
+/// one size, a star past its hold asked for nothing before its death, so with the ribbon and
+/// the pet at rest a paper star held its last strength and then was gone.
+///
+/// Controls: inside its hold a star draws one thing and asks only for the hold's end; a paper
+/// field star whose row is being typed on is held whole and asks for nothing sooner than the
+/// field's own hold, and asks again once that has run out.
+#[test]
+fn a_star_that_is_still_changing_asks_for_its_next_frame() {
+    let t0 = Instant::now();
+    let step = Duration::from_micros(62_500);
+    let wait = |sky: &Stardust, now: Instant| {
+        sky.next_change_deadline(now)
+            .expect("a live star has a next change")
+            .saturating_duration_since(now)
+    };
+    let mut held = 0;
+    for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+        for lane in [StarLane::Strike, StarLane::Exhaust] {
+            let (hold, _) = class.envelope_s(lane);
+            let life = class.life_s(lane);
+            for dark in [false, true] {
+                let mut st = star(class, lane, t0, TINT_WHITE_RGB);
+                if !dark {
+                    st.still = Some((0, 0));
+                }
+                let mut sky = sky();
+                sky.sow(st);
+                for k in 0..20 {
+                    let age = hold + (life - hold) * (k as f32 + 0.5) / 20.0;
+                    if life - age <= step.as_secs_f32() {
+                        continue;
+                    }
+                    let now = t0 + Duration::from_secs_f32(age);
+                    assert!(!sky.brisk(now), "the fixture's star holds the train itself");
+                    let w = wait(&sky, now);
+                    assert!(
+                        w <= step,
+                        "dark={dark} {class:?}/{lane:?}: {:.0} ms into a life of {:.0} the \
+                         cooling star asks for its next frame in {w:?}",
+                        age * 1000.0,
+                        life * 1000.0
+                    );
+                }
+                let now = t0 + Duration::from_millis(1);
+                if hold - 0.001 > step.as_secs_f32() {
+                    held += 1;
+                    let w = wait(&sky, now).as_secs_f32();
+                    assert!(
+                        (w - (hold - 0.001)).abs() < 0.002,
+                        "control, dark={dark} {class:?}/{lane:?}: in its hold the star asks \
+                         for a frame in {w} s, not at the hold's end ({hold} s)"
+                    );
+                }
+            }
+        }
+    }
     assert!(
-        control_worst > bound,
-        "control: culled by the drawn arm, the worst placement toggles only {control_worst} times in a second"
+        held > 0,
+        "control: no class holds longer than a fade's step"
+    );
+    // A paper field star: whole while its row is typed on, cooling once the row is left.
+    let (class_hold, _) = StarClass::M3.envelope_s(StarLane::Field);
+    let age = Duration::from_secs_f32(class_hold.max(EDGE_IN_S) + 0.05);
+    let now = t0 + age;
+    let mut st = star(StarClass::M3, StarLane::Field, t0, TINT_WHITE_RGB);
+    st.still = Some((0, 0));
+    st.lit = now;
+    let mut typed_on = sky();
+    typed_on.sow(st);
+    let w = wait(&typed_on, now);
+    assert!(
+        w > step,
+        "control: a paper field star held whole by its row's last key asks for a frame in {w:?}"
+    );
+    st.lit = t0;
+    st.born = t0;
+    let left = t0 + Duration::from_secs_f32(FIELD_HOLD_MS / 1000.0 + 0.02);
+    let mut cooling = sky();
+    cooling.sow(st);
+    assert!(!cooling.brisk(left));
+    let w = wait(&cooling, left);
+    assert!(
+        w <= step,
+        "a paper field star cooling after its row's last key asks for a frame in {w:?}"
     );
 }

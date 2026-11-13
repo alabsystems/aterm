@@ -73,6 +73,7 @@ fn changing_member(
                         || Ok(old.clone()),
                         unix_ms_now().unwrap(),
                         (&[], Some(&log)),
+                        &|| true,
                     )
                     .map(|_| ())
                 })

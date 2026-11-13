@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use aterm_phase::wall::WallKind;
 use aterm_phase::{LoginScreen, Program};
 
-use super::super::background::BackgroundCall;
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
@@ -297,24 +296,6 @@ impl Exception {
         }
     }
 
-    /// The background call that makes no progress.
-    #[must_use]
-    pub fn no_progress(call: &BackgroundCall) -> Self {
-        Self {
-            kind: ExceptionKind::Stalled,
-            when: Urgency::Later,
-            why: call.why(),
-            action: format!(
-                "Tell the agent in the tab that pid {} makes no progress",
-                call.pid
-            ),
-            clears: "the screen moving on, or the agent working",
-            escalated: false,
-            notice: None,
-            held: None,
-        }
-    }
-
     /// The background work that does not end.
     #[must_use]
     pub fn stalled_on_work() -> Self {
@@ -561,7 +542,7 @@ pub const FUTILE_AFTER_TRIES: usize = 3;
 pub const CONTEXT_EXHAUSTED_AFTER: usize = 3;
 /// And how long past the reset.
 pub const FUTILE_AFTER: Duration = Duration::from_secs(60 * 60);
-/// How long a bucket no reset ends stands before it is an exception.
+/// How long a bucket no reset ends stands, its fallback not made, before it is an exception.
 pub const BUCKET_STUCK_AFTER: Duration = Duration::from_secs(60 * 60);
 
 const ACCOUNT_LIMITS: &[(&str, &str, &str)] = &[
@@ -627,6 +608,9 @@ pub fn account_limit_text(message: &str) -> (&'static str, &'static str) {
         .unwrap_or(&ACCOUNT_LIMITS[ACCOUNT_LIMITS.len() - 1]);
     (row.1, row.2)
 }
+
+/// The `/model` alias of [`super::turn_end::FABLE_FALLBACK`], as the picker a person opens names it.
+const MODEL_FALLBACK_ALIAS: &str = "opus";
 
 fn title(alias: &str) -> String {
     let mut c = alias.chars();
@@ -1126,6 +1110,7 @@ pub fn exception_for(
         });
     }
     match kind {
+        WallKind::ModelBucket { .. } if state.bucket_left(reading) => None,
         WallKind::Auth if attempts > 0 || !cfg.retry_api_errors => {
             let (why, action, clears) = login_text(reading.program, &reading.wall_message);
             Some(Exception {
@@ -1154,18 +1139,35 @@ pub fn exception_for(
         }
         WallKind::ModelBucket { .. }
             if reading.reset_at.is_none()
+                && state.model_switch().is_none()
                 && state
                     .wall_since(kind)
                     .is_some_and(|s| now.saturating_duration_since(s) >= BUCKET_STUCK_AFTER) =>
         {
-            let name = bucket_model(&reading.wall_message)
+            let from = bucket_model(&reading.wall_message);
+            let name = from
                 .as_deref()
                 .map_or_else(|| "The model".to_string(), title);
+            let fallback = super::turn_end::fallback_for(reading, from.as_deref())
+                .map(|_| title(MODEL_FALLBACK_ALIAS));
+            let can_switch = cfg.relaunch && reading.restartable && !state.fallback_refused();
+            let (why, action) = match (fallback, can_switch) {
+                (Some(to), true) => (
+                    format!(
+                        "{name} has no reset time, and this tab's running jobs keep it from switching to {to}."
+                    ),
+                    format!("Run /model in this tab and pick {to}."),
+                ),
+                _ => (
+                    format!("{name} has no reset time, so this limit does not end by itself."),
+                    "Run /model in this tab and pick another model.".to_string(),
+                ),
+            };
             Some(Exception {
                 kind: ExceptionKind::Bucket,
                 when: Urgency::Later,
-                why: format!("{name} has no reset time, so this limit does not end by itself."),
-                action: "Run /model in this tab and pick another model.".to_string(),
+                why,
+                action,
                 clears: "the agent working",
                 escalated: false,
                 notice: None,

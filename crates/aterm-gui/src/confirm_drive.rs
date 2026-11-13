@@ -444,6 +444,11 @@ mod macos {
             values: Vec<String>,
             /// The native status document fits its measured text and remains scrollable if capped.
             status_readable: Option<bool>,
+            /// The observed distance scrolled from the status document's top.
+            status_offset: Option<f64>,
+            authorization: Option<bool>,
+            primary_trailing: Option<f64>,
+            cancel_trailing: Option<f64>,
         }
 
         /// One step the helper takes once the alert is up.
@@ -453,10 +458,22 @@ mod macos {
             Type(usize, String),
             /// Hand the alert the read.
             Deliver,
+            /// Hand the alert local facts before any OS query finishes.
+            DeliverLocal,
+            /// Finish the separate OS observation, or report an unavailable reader.
+            Diagnostics(Result<(), String>),
+            /// Replace only the inert permission query while keeping OS values unchanged.
+            Permission(Result<bool, String>),
+            AuthorizationButton(Option<bool>),
+            AuthorizeNaming,
             /// Deliver only optional fleet status, retaining edits and first responder.
             Discover(Result<bool, String>),
             /// The status text contains this phrase.
             Status(&'static str),
+            /// Scroll the actual native status document this far down from its top.
+            ScrollStatus(f64),
+            /// The observed native status scroll has kept this offset.
+            StatusOffset(f64),
             /// The Number and Nickname fields hold these.
             Fields(String, String),
             /// The field at this index is being edited, the caret in it.
@@ -474,6 +491,7 @@ mod macos {
             state: PathBuf,
             config: PathBuf,
             values: [Option<String>; 3],
+            authorization: Result<bool, String>,
         }
 
         impl publish::SystemNames for NamingCase {
@@ -481,7 +499,7 @@ mod macos {
                 self.values.clone()
             }
             fn authorization(&self, _: &Path, _: &Path) -> Result<bool, String> {
-                Ok(false) // Display-only old permission: the driver never launches authorization.
+                self.authorization.clone() // Inert: the driver never launches authorization.
             }
             fn apply(
                 &self,
@@ -494,6 +512,14 @@ mod macos {
         }
 
         impl NamingCase {
+            fn local_snapshot(&self, preview: &RenamePreview) -> Snapshot {
+                Snapshot::named(
+                    preview.clone(),
+                    NamingStatus::read_local(&self.state, &self.config, preview.name())
+                        .with_fleet_membership(InFleet::Out),
+                )
+            }
+
             fn snapshot(&self, preview: &RenamePreview) -> Snapshot {
                 Snapshot::named(
                     preview.clone(),
@@ -539,6 +565,7 @@ mod macos {
                 state: state.clone(),
                 config: config.clone(),
                 values: std::array::from_fn(|_| Some("m6".to_owned())),
+                authorization: Ok(false),
             };
             let policy = publish::Policy::read(&config, number)?;
             if !matches!(
@@ -684,7 +711,11 @@ mod macos {
                 Vec<Step>,
                 Answer,
             );
-            let rounds: [Round<'_>; 11] = [
+            let unknown = NamingCase {
+                authorization: Err("the existing naming permission could not be read".into()),
+                ..pending.clone()
+            };
+            let rounds: [Round<'_>; 14] = [
                 (
                     "a number the vault holds",
                     &preview,
@@ -851,6 +882,17 @@ mod macos {
                     vec![
                         Step::Deliver,
                         Step::Expect(None, None, true),
+                        Step::Type(0, s("m")),
+                        Step::Expect(typed("m"), None, false),
+                        Step::Status("actual m85 Dog"),
+                        Step::Status("expected m85-dog.local"),
+                        Step::Editing(0),
+                        Step::Type(0, s("85")),
+                        Step::Type(1, s("@")),
+                        Step::Expect(None, typed("@"), false),
+                        Step::Status("actual m85 Dog"),
+                        Step::Status("expected m85-dog.local"),
+                        Step::Editing(1),
                         Step::Type(1, s("研究室研究室研究室研究室研究室研究室研究室")),
                         Step::Expect(
                             None,
@@ -878,6 +920,7 @@ mod macos {
                         Step::Deliver,
                         Step::Status("discovering"),
                         Step::Type(0, s("86")),
+                        Step::Status("ID: expected m86 · saved m85"),
                         Step::Type(1, s("Blue Heron")),
                         Step::Editing(1),
                         Step::Discover(Ok(true)),
@@ -888,9 +931,91 @@ mod macos {
                         Step::Status("discovery unavailable"),
                         Step::Fields(s("86"), s("Blue Heron")),
                         Step::Editing(1),
+                        Step::Type(1, s("研究室研究室研究室研究室研究室研究室研究室")),
+                        Step::Type(0, "not a number ".repeat(128)),
+                        Step::ScrollStatus(32.0),
+                        Step::Discover(Ok(true)),
+                        Step::StatusOffset(32.0),
+                        Step::Diagnostics(Ok(())),
+                        Step::StatusOffset(32.0),
                         Step::Keys(&[ESCAPE]),
                     ],
                     Answer::Cancel,
+                ),
+                (
+                    "OS diagnostics preserve fleet status edits and focus",
+                    &named_preview,
+                    Some(&synchronized),
+                    "Save",
+                    view("m85", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::DeliverLocal,
+                        Step::Status("reading current name"),
+                        Step::Type(0, s("86")),
+                        Step::Type(1, s("Blue Heron")),
+                        Step::Discover(Ok(true)),
+                        Step::Diagnostics(Ok(())),
+                        Step::Status("actual m85 Dog"),
+                        Step::Status("Available fleets: ALab"),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Diagnostics(Err("fixture reader unavailable".into())),
+                        Step::Status("macOS names could not be read"),
+                        Step::Status("Available fleets: ALab"),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Keys(&[ESCAPE]),
+                    ],
+                    Answer::Cancel,
+                ),
+                (
+                    "unread permission tries existing authorization on Return",
+                    &named_preview,
+                    Some(&unknown),
+                    "Retry Sync",
+                    view("m85", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::Deliver,
+                        Step::Expect(None, None, true),
+                        Step::AuthorizationButton(Some(true)),
+                        Step::Keys(&[RETURN]),
+                    ],
+                    rename(
+                        None,
+                        None,
+                        sheet::RenameTo::Synchronize(Number::new(85).unwrap()),
+                    ),
+                ),
+                (
+                    "separate authorization carries no draft and follows late permission",
+                    &named_preview,
+                    Some(&unknown),
+                    "Retry Sync",
+                    view("m85", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::Deliver,
+                        Step::AuthorizationButton(Some(true)),
+                        Step::Type(0, s("86")),
+                        Step::Type(1, s("Blue Heron")),
+                        Step::AuthorizationButton(Some(false)),
+                        Step::Editing(1),
+                        Step::Permission(Ok(true)),
+                        Step::AuthorizationButton(None),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Permission(Err("unread permission".into())),
+                        Step::AuthorizationButton(Some(false)),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Type(0, s("85")),
+                        Step::Type(1, named_preview.name().display_nick()),
+                        Step::AuthorizationButton(Some(true)),
+                        Step::AuthorizeNaming,
+                    ],
+                    rename(None, None, sheet::RenameTo::Authorize),
                 ),
             ];
             for (index, (name, preview, naming, primary, view, (number, nick), steps, want)) in
@@ -982,6 +1107,7 @@ mod macos {
             }
             let mut findings = Vec::new();
             let mut delivered = false;
+            let mut action_anchors: Option<(f64, f64)> = None;
             for step in steps {
                 match step.clone() {
                     Step::Type(field, text) => {
@@ -989,10 +1115,17 @@ mod macos {
                             findings.push(format!("field {field} took no typing"));
                         }
                     }
-                    Step::Deliver => {
+                    Step::Deliver | Step::DeliverLocal => {
+                        let local = matches!(step, Step::DeliverLocal);
                         let snapshot = naming.map_or_else(
                             || Snapshot::read(preview.clone()),
-                            |naming| naming.snapshot(preview),
+                            |naming| {
+                                if local {
+                                    naming.local_snapshot(preview)
+                                } else {
+                                    naming.snapshot(preview)
+                                }
+                            },
                         );
                         let photograph = snapshot_path.is_some();
                         let captured = aterm_objc::run_on_main(move |_| {
@@ -1044,6 +1177,80 @@ mod macos {
                             sheet::deliver_discovery(press, available)
                         });
                     }
+                    Step::Diagnostics(result) => {
+                        let status = result.and_then(|()| {
+                            let naming = naming.ok_or("missing OS observation fixture")?;
+                            Ok(NamingStatus::read(
+                                &naming.state,
+                                &naming.config,
+                                preview.name(),
+                                naming,
+                            ))
+                        });
+                        aterm_objc::run_on_main(move |_| sheet::deliver_diagnostics(press, status));
+                    }
+                    Step::Permission(permission) => {
+                        let status = naming
+                            .ok_or("missing OS observation fixture".to_owned())
+                            .map(|naming| {
+                                let mut naming = naming.clone();
+                                naming.authorization = permission;
+                                NamingStatus::read(
+                                    &naming.state,
+                                    &naming.config,
+                                    preview.name(),
+                                    &naming,
+                                )
+                            });
+                        aterm_objc::run_on_main(move |_| sheet::deliver_diagnostics(press, status));
+                    }
+                    Step::AuthorizationButton(want) => {
+                        let seen =
+                            aterm_objc::run_on_main(|_| look(windowed, None)).unwrap_or_default();
+                        let actual = seen.authorization;
+                        if actual != want {
+                            findings.push(format!(
+                                "naming authorization button was {actual:?}, not {want:?}"
+                            ));
+                        }
+                        match (seen.primary_trailing, seen.cancel_trailing) {
+                            (Some(primary), Some(cancel)) => {
+                                if let Some((before_primary, before_cancel)) = action_anchors
+                                    && ((primary - before_primary).abs() > 0.5
+                                        || (cancel - before_cancel).abs() > 0.5)
+                                {
+                                    findings.push("the primary and Cancel moved away from their right anchors".into());
+                                }
+                                action_anchors = Some((primary, cancel));
+                            }
+                            _ => {
+                                findings.push("the primary and Cancel could not be measured".into())
+                            }
+                        }
+                    }
+                    Step::AuthorizeNaming => {
+                        let clicked = aterm_objc::run_on_main(move |_| {
+                            let mut authorize = None;
+                            look_with_status(windowed, None, &mut None, &mut authorize)?;
+                            let authorize = authorize?;
+                            // SAFETY: borrowed live NSButton, found and used in this main-thread call.
+                            unsafe {
+                                if appkit::send_bool(authorize, sel!(isHidden))
+                                    || !appkit::send_bool(authorize, sel!(isEnabled))
+                                {
+                                    return None;
+                                }
+                                appkit::send_v_id(authorize, sel!(performClick:), Id::NIL);
+                            }
+                            Some(())
+                        });
+                        if clicked.is_none() {
+                            findings.push(
+                                "the separate naming authorization button could not be pressed"
+                                    .into(),
+                            );
+                        }
+                    }
                     Step::Status(phrase) => {
                         let seen =
                             aterm_objc::run_on_main(|_| look(windowed, None)).unwrap_or_default();
@@ -1051,6 +1258,62 @@ mod macos {
                             findings.push(format!(
                                 "status did not contain {phrase:?}: {:?}",
                                 seen.texts
+                            ));
+                        }
+                    }
+                    Step::ScrollStatus(offset) => {
+                        let scrolled = aterm_objc::run_on_main(move |_| {
+                            let mut status = None;
+                            look_with_status(windowed, None, &mut status, &mut None)
+                                .ok_or("no modal alert")?;
+                            let status = status.ok_or("no naming status document")?;
+                            // SAFETY: the main-thread walk found this live status document in
+                            // the still-open modal alert. Its enclosing scroll owns its clip.
+                            unsafe {
+                                let scroll = appkit::send_id(status, sel!(enclosingScrollView));
+                                let clip = appkit::send_id(scroll, sel!(contentView));
+                                if clip.is_null() {
+                                    return Err("no naming status clip".to_owned());
+                                }
+                                let document = appkit::send_rect(status, sel!(bounds)).size.height;
+                                let visible = appkit::send_rect(clip, sel!(bounds)).size.height;
+                                let extent = document - visible;
+                                if extent < offset {
+                                    let text = appkit::nsstring_to_rust(appkit::send_id(
+                                        status,
+                                        sel!(stringValue),
+                                    ));
+                                    return Err(format!(
+                                        "document {document}pt, viewport {visible}pt, {} status bytes",
+                                        text.len()
+                                    ));
+                                }
+                                let y = if appkit::send_bool(status, sel!(isFlipped)) {
+                                    offset
+                                } else {
+                                    extent - offset
+                                };
+                                appkit::send_v_point(
+                                    clip,
+                                    sel!(scrollToPoint:),
+                                    aterm_objc::CGPoint { x: 0.0, y },
+                                );
+                                appkit::send_v_id(scroll, sel!(reflectScrolledClipView:), clip);
+                                Ok(())
+                            }
+                        });
+                        if let Err(why) = scrolled {
+                            findings.push(format!(
+                                "status could not scroll down {offset} points: {why}"
+                            ));
+                        }
+                    }
+                    Step::StatusOffset(want) => {
+                        let actual = aterm_objc::run_on_main(|_| look(windowed, None))
+                            .and_then(|seen| seen.status_offset);
+                        if !actual.is_some_and(|actual| (actual - want).abs() < 0.5) {
+                            findings.push(format!(
+                                "status scroll was {actual:?}, not {want} points from its top"
                             ));
                         }
                     }
@@ -1111,7 +1374,10 @@ mod macos {
                         }
                         let mut buttons = seen.buttons.clone();
                         buttons.sort_unstable();
-                        let mut expected = ["Cancel", if delivered { primary } else { "Save" }];
+                        let mut expected = vec!["Cancel", if delivered { primary } else { "Save" }];
+                        if snapshot.authorization_unknown(&held) {
+                            expected.push(sheet::AUTHORIZE_NAMING);
+                        }
                         expected.sort_unstable();
                         if buttons != expected {
                             findings.push(format!("its buttons were {:?}", seen.buttons));
@@ -1246,7 +1512,17 @@ mod macos {
         /// The modal alert's texts, buttons, Rename's availability and editable fields, and the
         /// editable field at index `field`, if asked; `None` while no modal window is up. Main
         /// thread only.
-        fn look(_windowed: Windowed, field: Option<(usize, &mut Option<Id>)>) -> Option<Look> {
+        fn look(windowed: Windowed, field: Option<(usize, &mut Option<Id>)>) -> Option<Look> {
+            look_with_status(windowed, field, &mut None, &mut None)
+        }
+
+        /// Inspect the alert and borrow its status view only within this main-thread call.
+        fn look_with_status(
+            _windowed: Windowed,
+            field: Option<(usize, &mut Option<Id>)>,
+            status: &mut Option<Id>,
+            authorize: &mut Option<Id>,
+        ) -> Option<Look> {
             // SAFETY: on the main thread (every caller is a `run_on_main` closure). The getters
             // are +0: `-modalWindow` (nil with no modal loop) and `-contentView`.
             unsafe {
@@ -1261,6 +1537,8 @@ mod macos {
                     appkit::send_id(window, sel!(contentView)),
                     &mut look,
                     &mut editable,
+                    status,
+                    authorize,
                 );
                 look.fields = editable.len();
                 look.values = editable
@@ -1280,7 +1558,13 @@ mod macos {
         ///
         /// # Safety
         /// On the main thread; `view` is nil or a live `NSView`.
-        unsafe fn walk(view: Id, look: &mut Look, editable: &mut Vec<Id>) {
+        unsafe fn walk(
+            view: Id,
+            look: &mut Look,
+            editable: &mut Vec<Id>,
+            status: &mut Option<Id>,
+            authorize: &mut Option<Id>,
+        ) {
             if view.is_null() {
                 return;
             }
@@ -1292,11 +1576,35 @@ mod macos {
             unsafe {
                 if appkit::send_bool_cls(view, sel!(isKindOfClass:), class(c"NSButton")) {
                     let title = appkit::nsstring_to_rust(appkit::send_id(view, sel!(title)));
+                    if title == sheet::AUTHORIZE_NAMING {
+                        *authorize = Some(view);
+                    }
+                    if appkit::send_bool(view, sel!(isHidden)) {
+                        return;
+                    }
+                    if title == sheet::AUTHORIZE_NAMING {
+                        look.authorization = Some(appkit::send_bool(view, sel!(isEnabled)));
+                    }
                     if title == sheet::BUTTONS[0]
                         || title == "Retry Sync"
                         || title == "Authorize & Sync"
                     {
                         look.renames = Some(appkit::send_bool(view, sel!(isEnabled)));
+                    }
+                    let parent = appkit::send_id(view, sel!(superview));
+                    if !parent.is_null() {
+                        let frame = appkit::send_rect(view, sel!(frame));
+                        let bounds = appkit::send_rect(parent, sel!(bounds));
+                        let trailing =
+                            bounds.origin.x + bounds.size.width - frame.origin.x - frame.size.width;
+                        if title == sheet::BUTTONS[1] {
+                            look.cancel_trailing = Some(trailing);
+                        } else if title == sheet::BUTTONS[0]
+                            || title == "Retry Sync"
+                            || title == "Authorize & Sync"
+                        {
+                            look.primary_trailing = Some(trailing);
+                        }
                     }
                     look.buttons.push(title);
                 } else if appkit::send_bool_cls(view, sel!(isKindOfClass:), class(c"NSTextField")) {
@@ -1305,6 +1613,7 @@ mod macos {
                     }
                     let text = appkit::nsstring_to_rust(appkit::send_id(view, sel!(stringValue)));
                     if text.starts_with("ID: ") {
+                        *status = Some(view);
                         let frame = appkit::send_rect(view, sel!(frame));
                         let cell = appkit::send_id(view, sel!(cell));
                         let scroll = appkit::send_id(view, sel!(enclosingScrollView));
@@ -1322,6 +1631,17 @@ mod macos {
                                     },
                                 );
                                 let clip = appkit::send_id(scroll, sel!(contentView));
+                                if !clip.is_null() {
+                                    let visible = appkit::send_rect(clip, sel!(bounds));
+                                    look.status_offset =
+                                        Some(if appkit::send_bool(view, sel!(isFlipped)) {
+                                            visible.origin.y
+                                        } else {
+                                            frame.size.height
+                                                - visible.origin.y
+                                                - visible.size.height
+                                        });
+                                }
                                 !clip.is_null()
                                     && need.height <= frame.size.height + 0.5
                                     && (frame.size.height
@@ -1345,6 +1665,8 @@ mod macos {
                         appkit::send_id_usize(subviews, sel!(objectAtIndex:), i),
                         look,
                         editable,
+                        status,
+                        authorize,
                     );
                 }
             }

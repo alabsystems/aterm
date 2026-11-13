@@ -40,6 +40,10 @@ fn ended_as(app: &App, key: &str) -> Option<aterm_messages::Retired> {
         .and_then(|r| r.retired().cloned())
 }
 
+/// When this file's readings were read: every row the window publishes was stamped as its read
+/// started (design §3.5).
+const READ_AT: u64 = 1_700_000_000;
+
 fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observation {
     Observation {
         subject,
@@ -49,6 +53,7 @@ fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observa
         wanted: subject.wanted().to_string(),
         note: note.map(str::to_string),
         detail: None,
+        read: aterm_types::macos_setup::Read::At(READ_AT),
     }
 }
 
@@ -88,7 +93,7 @@ fn fully_observed_setup(selection: Selection, changes: Vec<Observation>) -> Setu
 #[test]
 fn background_workstation_scope_comes_from_selected_current_verified_rows() {
     let scope = |status: &SetupStatus| {
-        let fields = super::background_setup_fields(status, false);
+        let fields = super::background_setup_fields(status, READ_AT, false);
         let bits = fields
             .split_ascii_whitespace()
             .find_map(|word| word.strip_prefix("verified="))
@@ -99,7 +104,7 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
     };
     // This real producer case legitimately says done while every private group is off.
     let cancelled = crate::system_state::fixture_status("older-cancel").unwrap();
-    assert_eq!(setup_field(&cancelled), "done");
+    assert_eq!(setup_field(&cancelled, READ_AT), "done");
     assert!(
         scope(&cancelled).is_empty(),
         "an opt-out proves no private preference"
@@ -120,7 +125,7 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
             )],
         )
     };
-    assert_eq!(setup_field(&off_unknown), "done");
+    assert_eq!(setup_field(&off_unknown, READ_AT), "done");
     assert!(scope(&off_unknown).is_empty());
 
     let caps = Subject::Setting(Setting::CapsLock);
@@ -128,13 +133,13 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
     let mut partial = Selection::none();
     partial.set(Setting::CapsLock, true);
     let partial_status = status(partial, vec![observed(caps, Standing::InPlace, None)]);
-    assert_eq!(setup_field(&partial_status), "done");
+    assert_eq!(setup_field(&partial_status, READ_AT), "done");
     assert_eq!(scope(&partial_status), partial);
 
     let full = fully_observed_setup(Selection::all(), Vec::new());
-    assert_eq!(scope(&full), Selection::all().workstation());
-    let cached = background_setup_fields(&full, false);
-    let pending = background_setup_fields(&full, true);
+    assert_eq!(scope(&full), private_settings());
+    let cached = background_setup_fields(&full, READ_AT, false);
+    let pending = background_setup_fields(&full, READ_AT, true);
     assert_eq!(
         cached.split(" busy=").next(),
         pending.split(" busy=").next(),
@@ -146,17 +151,18 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
         vec![observed(
             dock,
             Standing::Differs,
-            Some(aterm_types::macos_setup::CHANGED_BY_YOU),
+            Some(aterm_types::macos_setup::CHANGED_SINCE),
         )],
     );
     assert_eq!(
-        setup_field(&personal),
-        "done",
-        "a personal choice is settled for its own plan"
+        setup_field(&personal, READ_AT),
+        "done;changed:dock",
+        "a row changed since aterm set it is settled for its plan, and named changed, never \
+         as anyone's"
     );
     assert!(
-        !scope(&personal).contains(Setting::Dock),
-        "it does not verify an explicit requested default"
+        scope(&personal).contains(Setting::Dock),
+        "a row changed since aterm set it is settled: setup leaves it (H29)"
     );
     for standing in [Standing::Unknown, Standing::Differs] {
         let deferred = fully_observed_setup(Selection::all(), vec![observed(dock, standing, None)]);
@@ -173,23 +179,31 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
             None,
         )],
     );
-    assert_eq!(setup_field(&after_login), "done");
+    assert_eq!(setup_field(&after_login, READ_AT), "done;at-login:trackpad");
     assert!(
-        !scope(&after_login).contains(Setting::TrackpadScrolling),
-        "a saved-only value awaiting login is not a verified current preference"
+        scope(&after_login).contains(Setting::TrackpadScrolling),
+        "a value set for the next login is set, and named so (H29)"
     );
-    for (mut mixed, not_verified) in [
-        (personal, Setting::Dock),
-        (after_login, Setting::TrackpadScrolling),
+    // A row read that said nothing beside them is unread, and leaves what was read back of the
+    // others verified: the row changed since aterm set it and the value set for the next login
+    // among them.
+    for (mut mixed, said, theirs) in [
+        (personal, "unread:widgets;changed:dock", Setting::Dock),
+        (
+            after_login,
+            "unread:widgets;at-login:trackpad",
+            Setting::TrackpadScrolling,
+        ),
     ] {
         *mixed
             .observed
             .iter_mut()
             .find(|row| row.subject == Subject::Setting(Setting::Widgets))
             .unwrap() = observed(Subject::Setting(Setting::Widgets), Standing::Unknown, None);
-        assert_eq!(setup_field(&mixed), "unknown:widgets");
+        assert_eq!(setup_field(&mixed, READ_AT), said);
         assert!(scope(&mixed).contains(Setting::CapsLock));
-        assert!(!scope(&mixed).contains(not_verified));
+        assert!(scope(&mixed).contains(theirs));
+        assert!(!scope(&mixed).contains(Setting::Widgets));
     }
     let not_needed = fully_observed_setup(
         Selection::all(),
@@ -228,7 +242,11 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     let accessibility = Subject::Access(Access::Accessibility);
     let vault = Subject::Setting(Setting::Secrets);
     let dock = Subject::Setting(Setting::Dock);
-    assert_eq!(setup_field(&SetupStatus::default()), "-", "no worker spoke");
+    assert_eq!(
+        setup_field(&SetupStatus::default(), READ_AT),
+        "-",
+        "no worker spoke"
+    );
     let mut permissions_and_vault = Selection::none();
     permissions_and_vault.set(Setting::Permissions, true);
     permissions_and_vault.set(Setting::Secrets, true);
@@ -247,7 +265,7 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     // `;needs:` names only the rows that wait on a press: Developer Tools waits and the vault
     // failed, so neither is one.
     assert_eq!(
-        setup_field(&pending),
+        setup_field(&pending, READ_AT),
         "pending:fda,devtools,vault;needs:fda"
     );
     let finished = SetupStatus {
@@ -261,18 +279,18 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
                 observed(
                     dock,
                     Standing::Differs,
-                    Some(aterm_types::macos_setup::CHANGED_BY_YOU),
+                    Some(aterm_types::macos_setup::CHANGED_SINCE),
                 ),
             ],
         )
     };
-    assert_eq!(setup_field(&finished), "done");
+    assert_eq!(setup_field(&finished, READ_AT), "done;changed:dock");
     let running = fully_observed_setup(
         permissions_and_vault,
         vec![observed(dock, Standing::Differs, None)],
     );
     assert_eq!(
-        setup_field(&running),
+        setup_field(&running, READ_AT),
         "pending:dock",
         "still to set while the run goes"
     );
@@ -289,7 +307,7 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
         finished: true,
         ..fully_observed_setup(selection, Vec::new())
     };
-    assert_eq!(setup_field(&complete()), "done");
+    assert_eq!(setup_field(&complete(), READ_AT), "done");
     for note in [None, Some("The permission reading did not finish")] {
         let mut unread = complete();
         *unread
@@ -297,7 +315,9 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
             .iter_mut()
             .find(|row| row.subject == fda)
             .unwrap() = observed(fda, Standing::Unknown, note);
-        assert_eq!(setup_field(&unread), "unknown:fda", "{note:?}");
+        // A read that ran and said nothing is unread, never a wait nothing ends (the review
+        // found it published `pending:fda`, so `aterm init --check` waited on it for good).
+        assert_eq!(setup_field(&unread, READ_AT), "unread:fda", "{note:?}");
         for active in 0..4 {
             let mut active_unread = unread.clone();
             match active {
@@ -306,12 +326,13 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
                 2 => active_unread.queued = true,
                 _ => active_unread.running = vec![Setting::Repositories],
             }
-            assert_eq!(setup_field(&active_unread), "pending;unknown:fda");
+            assert_eq!(setup_field(&active_unread, READ_AT), "pending;unread:fda");
         }
     }
+    // No reading of it yet: a read still to come.
     let mut absent = complete();
     absent.observed.retain(|row| row.subject != fda);
-    assert_eq!(setup_field(&absent), "unknown:fda");
+    assert_eq!(setup_field(&absent, READ_AT), "pending:fda");
 
     let mut missing = complete();
     let row = missing
@@ -322,13 +343,13 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
     row.standing = Standing::Differs;
     row.now = Some("0 of 53".into());
     row.wanted = "All 53".into();
-    assert_eq!(setup_field(&missing), "pending:repos");
+    assert_eq!(setup_field(&missing, READ_AT), "pending:repos");
     *missing
         .observed
         .iter_mut()
         .find(|row| row.subject == fda)
         .unwrap() = observed(fda, Standing::Unknown, None);
-    assert_eq!(setup_field(&missing), "pending:repos;unknown:fda");
+    assert_eq!(setup_field(&missing, READ_AT), "pending:repos;unread:fda");
 
     let mut caps = Selection::none();
     caps.set(Setting::CapsLock, true);
@@ -350,7 +371,7 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
         explicit_other: 0,
         held: 0,
     });
-    assert_eq!(setup_field(&live), "unknown:capslock");
+    assert_eq!(setup_field(&live, READ_AT), "unread:capslock");
     assert_eq!(
         crate::system_state::headline(
             &live,
@@ -359,7 +380,7 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
         ),
         headline
     );
-    let diagnostic = background_setup_fields(&live, false);
+    let diagnostic = background_setup_fields(&live, READ_AT, false);
     assert!(
         diagnostic
             .split_whitespace()
@@ -371,25 +392,25 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
             .any(|part| part == "verified=0")
     );
     live.caps_live.as_mut().unwrap().held = 1;
-    let mixed = background_setup_fields(&live, false);
+    let mixed = background_setup_fields(&live, READ_AT, false);
     assert!(
         mixed
             .split_whitespace()
             .any(|part| part == "caps_live=mixed:control=2,other=0,held=1")
     );
-    assert_eq!(setup_field(&live), "unknown:capslock");
+    assert_eq!(setup_field(&live, READ_AT), "unread:capslock");
 }
 
 #[test]
 fn setup_field_settles_an_idle_terminal_plan_with_no_managed_work() {
     let cancelled = crate::system_state::fixture_status("older-cancel").unwrap();
     assert!(cancelled.cancelled && cancelled.plan.as_ref().unwrap().selection.is_empty());
-    assert_eq!(setup_field(&cancelled), "done");
+    assert_eq!(setup_field(&cancelled, READ_AT), "done");
     let completed = SetupStatus {
         finished: true,
         ..fully_observed_setup(Selection::none(), Vec::new())
     };
-    assert_eq!(setup_field(&completed), "done");
+    assert_eq!(setup_field(&completed, READ_AT), "done");
 
     // A grant offered under the preceding plan is not managed after Permissions is off.
     let no_grants = SetupStatus {
@@ -403,34 +424,34 @@ fn setup_field_settles_an_idle_terminal_plan_with_no_managed_work() {
             )],
         )
     };
-    assert_eq!(setup_field(&no_grants), "done");
+    assert_eq!(setup_field(&no_grants, READ_AT), "done");
     let busy = SetupStatus {
         busy: true,
         ..completed.clone()
     };
-    assert_eq!(setup_field(&busy), "pending");
+    assert_eq!(setup_field(&busy, READ_AT), "pending");
     let changing = SetupStatus {
         changing: true,
         ..completed.clone()
     };
-    assert_eq!(setup_field(&changing), "pending");
+    assert_eq!(setup_field(&changing, READ_AT), "pending");
     let mut failed = completed.clone();
     failed.rows.push(crate::system_state::SetupStatusRow {
         name: crate::system_state::SETUP_ROW.into(),
         status: "error".into(),
         detail: "The setup records could not be read".into(),
     });
-    assert_eq!(setup_field(&failed), "pending");
+    assert_eq!(setup_field(&failed, READ_AT), "pending");
     let unread = SetupStatus {
         plan: None,
         ..completed
     };
-    assert!(!setup_field(&unread).starts_with("done"));
+    assert!(!setup_field(&unread, READ_AT).starts_with("done"));
 }
 
 /// A run parked to ask again by itself reads `done`, nothing being left for anyone to do now,
 /// and names what it still asks for (`;asking:`), so `done` is never read as a finished record;
-/// grants still on offer remain pending personal steps.
+/// a grant on offer is said `;offered:`, neither done nor a person's step (H30).
 #[test]
 fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
     use aterm_types::macos_setup::{ACCESS_OFFERED, SECRETS_VAULT_ROW};
@@ -447,23 +468,54 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
             vec![offer.clone(), observed(vault, Standing::InPlace, None)],
         )
     };
-    assert_eq!(setup_field(&finished), "pending:debugger;needs:debugger");
+    assert_eq!(setup_field(&finished, READ_AT), "done;offered:debugger");
     let no_offer = SetupStatus {
         finished: true,
         ..fully_observed_setup(selection, vec![observed(vault, Standing::InPlace, None)])
     };
-    assert_eq!(setup_field(&no_offer), "done", "CONTROL: nothing on offer");
-    // A vault that did not answer (`unreached`), or none on this network (`waiting`), on a Mac
-    // off the ALab LAN: the headline counts it settled and the run asks again by itself.
-    for parked_as in ["unreached", "waiting"] {
-        let mut parked = crate::system_state::fixture_status("non-alab").unwrap();
+    assert_eq!(
+        setup_field(&no_offer, READ_AT),
+        "done",
+        "CONTROL: nothing on offer"
+    );
+    // A vault that answered none is there (`absent`): the headline counts it settled and the
+    // run asks again by itself, so `setup=` is done, naming what it asks for. A vault that did
+    // not answer (`unreached`, every Mac off the ALab LAN) is no reading of none, nor of one:
+    // `macos_doctor` reads its row asked again by itself, so `setup=` heads it `asking:`, never
+    // done and never pending on a step no answer may end. A typed join's wait for it is pending.
+    for (fixture, parked_as, field) in [
+        ("non-alab-absent", "absent", "done;asking:vault"),
+        ("non-alab", "unreached", "asking:vault"),
+    ] {
+        let mut parked = crate::system_state::fixture_status(fixture).unwrap();
         assert!(!parked.finished);
+        let heard = parked
+            .observed
+            .iter()
+            .find(|seen| seen.subject == vault)
+            .and_then(|seen| seen.note.clone())
+            .unwrap();
+        // Read just now: a fixture's readings are undated.
+        for seen in &mut parked.observed {
+            seen.read = aterm_types::macos_setup::Read::At(READ_AT);
+        }
         parked.rows = vec![crate::system_state::SetupStatusRow {
             name: SECRETS_VAULT_ROW.to_owned(),
             status: parked_as.to_owned(),
-            detail: "The ALab vault did not answer on this network".to_owned(),
+            detail: heard.clone(),
         }];
-        assert_eq!(setup_field(&parked), "done;asking:vault", "{parked_as}");
+        assert_eq!(setup_field(&parked, READ_AT), field, "{parked_as}");
+        if parked_as == "unreached" {
+            // A join the person typed a password for waits for that vault: pending on it.
+            let mut typed = parked.clone();
+            for seen in &mut typed.observed {
+                if seen.subject == vault {
+                    seen.standing = Standing::Waiting;
+                    Setting::Secrets.wanted().clone_into(&mut seen.wanted);
+                }
+            }
+            assert_eq!(setup_field(&typed, READ_AT), "pending:vault");
+        }
         let offered = parked
             .observed
             .iter_mut()
@@ -471,16 +523,16 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
             .unwrap();
         *offered = offer.clone();
         assert_eq!(
-            setup_field(&parked),
-            "pending:debugger;needs:debugger",
+            setup_field(&parked, READ_AT),
+            format!("{field};offered:debugger"),
             "{parked_as}"
         );
     }
 }
 
 /// The menu line says only rows the approved plan manages that need a person or failed: one is
-/// named, several are counted; a regressed Full Disk Access grant counts once, as needing a
-/// person; the Secrets row's approval code rides along.
+/// named, several are counted; a Full Disk Access grant counts as its reading says; the Secrets
+/// row's approval code rides along.
 #[test]
 fn the_menu_line_names_what_needs_a_person() {
     let dock = Subject::Setting(Setting::Dock);
@@ -489,7 +541,7 @@ fn the_menu_line_names_what_needs_a_person() {
     let secrets = Subject::Setting(Setting::Secrets);
     let all = Selection::all();
 
-    assert_eq!(menu_line(&SetupStatus::default(), false), None);
+    assert_eq!(menu_line(&SetupStatus::default()), None);
     let settled = status(
         all,
         vec![
@@ -498,13 +550,10 @@ fn the_menu_line_names_what_needs_a_person() {
             observed(secrets, Standing::Waiting, None),
         ],
     );
-    assert_eq!(menu_line(&settled, false), None, "nothing needs a person");
+    assert_eq!(menu_line(&settled), None, "nothing needs a person");
 
     let one = status(all, vec![observed(dock, Standing::NeedsYou, None)]);
-    assert_eq!(
-        menu_line(&one, false),
-        line("System State: Needs you: Dock", None)
-    );
+    assert_eq!(menu_line(&one), line("System State: Needs you: Dock", None));
     let two = status(
         all,
         vec![
@@ -512,16 +561,10 @@ fn the_menu_line_names_what_needs_a_person() {
             observed(fda, Standing::NeedsYou, None),
         ],
     );
-    assert_eq!(
-        menu_line(&two, false),
-        line("System State: 2 need you", None)
-    );
+    assert_eq!(menu_line(&two), line("System State: 2 need you", None));
     // A failure is said as one: it may retry by itself and need no one.
     let failed = status(all, vec![observed(dock, Standing::Failed, None)]);
-    assert_eq!(
-        menu_line(&failed, false),
-        line("System State: Dock failed", None)
-    );
+    assert_eq!(menu_line(&failed), line("System State: Dock failed", None));
     let mixed = status(
         all,
         vec![
@@ -530,7 +573,7 @@ fn the_menu_line_names_what_needs_a_person() {
         ],
     );
     assert_eq!(
-        menu_line(&mixed, false),
+        menu_line(&mixed),
         line("System State: 1 needs you, 1 failed", None)
     );
     let both_failed = status(
@@ -541,22 +584,17 @@ fn the_menu_line_names_what_needs_a_person() {
         ],
     );
     assert_eq!(
-        menu_line(&both_failed, false),
+        menu_line(&both_failed),
         line("System State: 2 failed", None)
-    );
-    assert_eq!(
-        menu_line(&both_failed, true),
-        line("System State: 1 needs you, 1 failed", None),
-        "a regressed grant needs a person, failed or not"
     );
 
     let mut unmanaged = Selection::all();
     unmanaged.set(Setting::Dock, false);
     assert_eq!(
-        menu_line(
-            &status(unmanaged, vec![observed(dock, Standing::Failed, None)]),
-            false
-        ),
+        menu_line(&status(
+            unmanaged,
+            vec![observed(dock, Standing::Failed, None)]
+        )),
         None,
         "a row the plan does not manage"
     );
@@ -564,51 +602,40 @@ fn the_menu_line_names_what_needs_a_person() {
     no_signouts.set(Setting::Messages, false);
     no_signouts.set(Setting::FaceTime, false);
     assert_eq!(
-        menu_line(
-            &status(
-                no_signouts,
-                vec![observed(accessibility, Standing::NeedsYou, None)]
-            ),
-            false
-        ),
+        menu_line(&status(
+            no_signouts,
+            vec![observed(accessibility, Standing::NeedsYou, None)]
+        )),
         None,
         "Accessibility is needed only for a sign-out"
     );
     assert_eq!(
-        menu_line(
-            &status(all, vec![observed(accessibility, Standing::NeedsYou, None)]),
-            false
-        ),
+        menu_line(&status(
+            all,
+            vec![observed(accessibility, Standing::NeedsYou, None)]
+        )),
         line("System State: Needs you: Accessibility", None)
     );
 
     assert_eq!(
-        menu_line(&SetupStatus::default(), true),
+        menu_line(&status(all, vec![observed(fda, Standing::NeedsYou, None)])),
         line("System State: Needs you: Full Disk Access", None),
-        "a regressed grant shows with no plan"
-    );
-    assert_eq!(
-        menu_line(
-            &status(all, vec![observed(fda, Standing::NeedsYou, None)]),
-            true
-        ),
-        line("System State: Needs you: Full Disk Access", None),
-        "counted once"
+        "a grant whose reading needs a person"
     );
 
     let code = "Approve 4F7-2KQ on an admin Mac";
     assert_eq!(
-        menu_line(
-            &status(all, vec![observed(secrets, Standing::NeedsYou, Some(code))]),
-            false
-        ),
+        menu_line(&status(
+            all,
+            vec![observed(secrets, Standing::NeedsYou, Some(code))]
+        )),
         line("System State: Needs you: Secrets vault", Some(code))
     );
     assert_eq!(
-        menu_line(
-            &status(all, vec![observed(secrets, Standing::Failed, Some(code))]),
-            false
-        )
+        menu_line(&status(
+            all,
+            vec![observed(secrets, Standing::Failed, Some(code))]
+        ))
         .and_then(|line| line.note),
         None,
         "only a join that waits on a person carries its code"
@@ -636,82 +663,69 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
     };
     let not_joined = || vec![observed(secrets, Standing::Differs, None)];
     assert_eq!(
-        menu_line(
-            &ran(all, not_joined(), vec![step("Secrets vault", "error")]),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            not_joined(),
+            vec![step("Secrets vault", "error")]
+        )),
         line("System State: Secrets vault failed", None)
     );
     assert_eq!(
-        menu_line(
-            &ran(
-                all,
-                vec![observed(secrets, Standing::Failed, None)],
-                vec![step("Secrets vault", "failed")]
-            ),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            vec![observed(secrets, Standing::Failed, None)],
+            vec![step("Secrets vault", "failed")]
+        )),
         line("System State: Secrets vault failed", None),
         "counted once with its row"
     );
     assert_eq!(
-        menu_line(
-            &ran(
-                all,
-                vec![observed(dock, Standing::Failed, None)],
-                vec![step("Secrets vault", "error")]
-            ),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            vec![observed(dock, Standing::Failed, None)],
+            vec![step("Secrets vault", "error")]
+        )),
         line("System State: 2 failed", None)
     );
     assert_eq!(
-        menu_line(
-            &ran(
-                all,
-                vec![observed(fda, Standing::NeedsYou, None)],
-                vec![step("Selected Mac settings", "error")]
-            ),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            vec![observed(fda, Standing::NeedsYou, None)],
+            vec![step("Selected Mac settings", "error")]
+        )),
         line("System State: 1 needs you, 1 failed", None)
     );
     assert_eq!(
-        menu_line(
-            &ran(
-                all,
-                Vec::new(),
-                vec![step(
-                    "Caps Lock acts as Control now on keyboard 05ac-0342",
-                    "error"
-                )]
-            ),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            Vec::new(),
+            vec![step(
+                "Caps Lock acts as Control now on keyboard 05ac-0342",
+                "error"
+            )]
+        )),
         line("System State: 1 step failed", None),
         "a step no row names is counted, not named"
     );
     assert_eq!(
-        menu_line(
-            &ran(
-                all,
-                Vec::new(),
-                vec![
-                    step("Selected Mac settings", "error"),
-                    step("aterm permissions", "error")
-                ]
-            ),
-            false
-        ),
+        menu_line(&ran(
+            all,
+            Vec::new(),
+            vec![
+                step("Selected Mac settings", "error"),
+                step("aterm permissions", "error")
+            ]
+        )),
         line("System State: 2 failed", None)
     );
     let mut left = all;
     left.set(Setting::Secrets, false);
     assert_eq!(
-        menu_line(
-            &ran(left, not_joined(), vec![step("Secrets vault", "error")]),
-            false
-        ),
+        menu_line(&ran(
+            left,
+            not_joined(),
+            vec![step("Secrets vault", "error")]
+        )),
         None,
         "the vault is left as is"
     );
@@ -724,10 +738,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         "ok",
     ] {
         assert_eq!(
-            menu_line(
-                &ran(all, not_joined(), vec![step("Secrets vault", quiet)]),
-                false
-            ),
+            menu_line(&ran(all, not_joined(), vec![step("Secrets vault", quiet)])),
             None,
             "{quiet}"
         );
@@ -771,12 +782,12 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
         ),
     ] {
         assert_eq!(
-            menu_line(&ran(observed.clone(), rows.clone(), true), false),
+            menu_line(&ran(observed.clone(), rows.clone(), true)),
             None,
             "{said}: retried"
         );
         assert_eq!(
-            menu_line(&ran(observed, rows, false), false),
+            menu_line(&ran(observed, rows, false)),
             line(said, None),
             "no longer retried"
         );
@@ -787,17 +798,12 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
     ];
     let failed = vec![step("Secrets vault", "error")];
     assert_eq!(
-        menu_line(&ran(person.clone(), failed.clone(), true), false),
+        menu_line(&ran(person.clone(), failed.clone(), true)),
         line("System State: Needs you: Full Disk Access", None)
     );
     assert_eq!(
-        menu_line(&ran(person, failed.clone(), false), false),
+        menu_line(&ran(person, failed.clone(), false)),
         line("System State: 1 needs you, 2 failed", None)
-    );
-    assert_eq!(
-        menu_line(&ran(Vec::new(), failed, true), true),
-        line("System State: Needs you: Full Disk Access", None),
-        "a grant that reads off"
     );
 }
 
@@ -1712,14 +1718,17 @@ fn the_markers_are_bound_to_the_approved_revision() {
     assert!(marks.fda.starts_with("r12"), "{}", marks.fda);
 }
 
-/// A regressed grant lights the menu line (and ends it when it is settled); the
-/// retired digest keys end once, withdrawn: nothing read their causes end.
+/// A regressed grant lights the menu line once the fresh reading it asks for reads the grant off
+/// (and ends it when that reading settles), so the line says what `setup=` says; the retired
+/// digest keys end once, withdrawn: nothing read their causes end. Negative control: the
+/// regression alone, with no reading of the grant, lights nothing.
 #[test]
 fn a_regressed_grant_lights_the_menu_line() {
     use aterm_messages::exceptions::{Entry, Family};
     use aterm_messages::need::{Reason, Then, Why};
     let mut app = App::headless_for_test();
     let now = Instant::now();
+    let fda = Subject::Access(Access::FullDiskAccess);
     // What an older aterm left in the digest.
     app.except(&Entry::new(
         Family::Privacy,
@@ -1744,9 +1753,23 @@ fn a_regressed_grant_lights_the_menu_line() {
     app.settle_access_steps(now);
     assert_eq!(
         app.system_state_menu_line(),
+        None,
+        "the control: no reading of the grant yet, so the line waits as `setup=` does"
+    );
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(fda, Standing::NeedsYou, None)],
+    ));
+    app.settle_access_steps(now);
+    assert_eq!(
+        app.system_state_menu_line(),
         line("System State: Needs you: Full Disk Access", None)
     );
     app.note_fda_regression(false);
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(fda, Standing::InPlace, None)],
+    ));
     app.settle_access_steps(now);
     assert_eq!(app.system_state_menu_line(), None);
     for key in RETIRED_KEYS {
@@ -1795,13 +1818,25 @@ fn an_older_fleet_no_route_entry_is_withdrawn() {
     );
 }
 
-/// A grant an update left off says so under the menu line while it reads off, and the note ends
-/// with the regression. Negative control: the same regression with no update says nothing more.
+/// A grant an update left off says so under the menu line while its reading needs the person, and
+/// the note ends with the regression. Negative controls: the same regression with no update says
+/// nothing more, and the update's note never goes under a line about another row.
 #[test]
 fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     use super::FDA_AFTER_UPDATE;
     let now = Instant::now();
+    let off = || {
+        status(
+            Selection::all(),
+            vec![observed(
+                Subject::Access(Access::FullDiskAccess),
+                Standing::NeedsYou,
+                None,
+            )],
+        )
+    };
     let mut app = App::headless_for_test();
+    app.publish_system_state(off());
     app.note_fda_regression(true);
     app.settle_access_steps(now);
     assert_eq!(
@@ -1812,8 +1847,31 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
 
     let mut app = App::headless_for_test();
     app.note_fda_off_after_update();
+    app.note_fda_regression(true);
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Dock),
+            Standing::NeedsYou,
+            None,
+        )],
+    ));
     app.settle_access_steps(now);
-    assert_eq!(app.system_state_menu_line(), None, "not regressed: no line");
+    assert_eq!(
+        app.system_state_menu_line(),
+        line("System State: Needs you: Dock", None),
+        "the control: a line about another row carries no update note"
+    );
+
+    let mut app = App::headless_for_test();
+    app.publish_system_state(off());
+    app.note_fda_off_after_update();
+    app.settle_access_steps(now);
+    assert_eq!(
+        app.system_state_menu_line(),
+        line("System State: Needs you: Full Disk Access", None),
+        "not regressed: no note"
+    );
     app.note_fda_regression(true);
     app.settle_access_steps(now);
     assert_eq!(
@@ -4681,9 +4739,10 @@ fn a_walking_folder_pass_retires_on_a_revoked_permission_status() {
 /// checker's case): an older aterm asked again after a verified grant read off
 /// (`asked_at` after `verified_at`) and the person answered Not now. Revision 1
 /// spends that Not now and retires the marker; the next launch under the same
-/// revision 1, whose row still says "You chose Not now", finds the grant
-/// regressed but leaves the menu line dark. Revision 2 (Permissions turned off
-/// and on again) asks again, and the line names Full Disk Access.
+/// revision 1, whose row still says "You chose Not now" (the worker's reading honors
+/// it), finds the grant regressed but leaves the menu line dark. Revision 2
+/// (Permissions turned off and on again) asks again, its reading needs the person,
+/// and the line names Full Disk Access: the line follows the reading, as `setup=` does.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
@@ -4718,9 +4777,21 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
         app
     };
     let names_fda = line("System State: Needs you: Full Disk Access", None);
+    let fda = Subject::Access(Access::FullDiskAccess);
+    // The worker's fresh reading in revision 1: the person's Not now, honored.
+    let as_chosen = || {
+        status(
+            Selection::all(),
+            vec![Observation {
+                detail: Some("You chose Not now. Setting Permissions up again asks again.".into()),
+                ..observed(fda, Standing::NotNeeded, None)
+            }],
+        )
+    };
     set_front(true);
     test_arms::forget_fda_declines();
     let mut app = launch(1);
+    app.publish_system_state(as_chosen());
     assert_ne!(
         app.system_state_menu_line(),
         names_fda,
@@ -4738,11 +4809,12 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
         "spent in revision 1"
     );
 
-    let app = launch(1);
+    let mut app = launch(1);
     assert!(
         app.access_steps.fda_regressed(),
         "PRECONDITION: the grant reads regressed"
     );
+    app.publish_system_state(as_chosen());
     assert_ne!(
         app.system_state_menu_line(),
         names_fda,
@@ -4751,6 +4823,10 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
 
     let mut app = launch(2);
     app.consent_card_config = None;
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(fda, Standing::NeedsYou, None)],
+    ));
     assert_eq!(
         app.system_state_menu_line(),
         names_fda,
@@ -5365,4 +5441,455 @@ fn a_switch_toggled_twice_brings_the_page_once() {
         assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off}: one page");
         assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
     }
+}
+
+/// A finished Mac whose private rows were withheld in this process (System State never in
+/// front with a person) publishes them `unread:`, neither `pending` (a wait that never ends by
+/// itself) nor `done` (design §3.5). A wait elsewhere still leads, and names them after it.
+#[test]
+fn setup_field_names_withheld_rows_unread_not_pending() {
+    let private: Vec<Subject> = Setting::ALL
+        .into_iter()
+        .filter(|setting| setting.is_workstation() || *setting == Setting::Spotlight)
+        .map(Subject::Setting)
+        .collect();
+    let withheld: Vec<Observation> = private.iter().copied().map(Observation::withheld).collect();
+    let status = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::all(), withheld.clone())
+    };
+    assert_eq!(
+        setup_field(&status, READ_AT),
+        "unread:capslock,scrolling,trackpad,desktop,widgets,dock,messages,facetime,spotlight"
+    );
+    assert!(
+        super::background_setup_fields(&status, READ_AT, false)
+            .contains(" verified=0 verified_at=-"),
+        "a row nothing read verifies nothing"
+    );
+    let mut waiting = withheld;
+    waiting.push(observed(
+        Subject::Setting(Setting::Repositories),
+        Standing::Waiting,
+        None,
+    ));
+    let status = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::all(), waiting)
+    };
+    assert_eq!(
+        setup_field(&status, READ_AT),
+        "pending:repos;unread:capslock,scrolling,trackpad,desktop,widgets,dock,messages,\
+         facetime,spotlight"
+    );
+    // Control: a read that ran and found nothing it could read is no withheld row (the page
+    // says it could not read them), and no wait either: no read of them is under way, so it is
+    // unread too, never `pending` (a wait nothing ends).
+    let failed = private
+        .iter()
+        .map(|subject| observed(*subject, Standing::Unknown, Some("Could not read")))
+        .collect();
+    let status = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::all(), failed)
+    };
+    let rows = crate::system_state::rows(&status, Selection::all());
+    let headline = crate::system_state::headline(&status, &rows, status.plan.as_ref());
+    assert!(headline.text.starts_with("Could not read"), "{headline:?}");
+    assert_eq!(
+        setup_field(&status, READ_AT),
+        "unread:capslock,scrolling,trackpad,desktop,widgets,dock,messages,facetime,spotlight"
+    );
+}
+
+/// The background evidence says when its oldest verified row was read, and a row with no read
+/// behind it verifies nothing (design §3.5).
+#[test]
+fn background_evidence_says_when_it_was_read() {
+    let full = fully_observed_setup(Selection::all(), Vec::new());
+    assert_eq!(
+        evidence(&super::background_setup_fields(&full, READ_AT, false)),
+        format!(
+            "setup=done verified={} verified_at={READ_AT}",
+            private_settings().bits()
+        )
+    );
+    let caps = Subject::Setting(Setting::CapsLock);
+    let older = Observation {
+        read: aterm_types::macos_setup::Read::At(READ_AT - 90),
+        ..observed(caps, Standing::InPlace, None)
+    };
+    let mixed = fully_observed_setup(Selection::all(), vec![older]);
+    assert!(
+        evidence(&super::background_setup_fields(&mixed, READ_AT, false))
+            .ends_with(&format!(" verified_at={}", READ_AT - 90)),
+        "the oldest reading dates the evidence"
+    );
+    let undated = Observation {
+        read: aterm_types::macos_setup::Read::Unstamped,
+        ..observed(caps, Standing::InPlace, None)
+    };
+    let undated = fully_observed_setup(Selection::all(), vec![undated]);
+    let fields = super::background_setup_fields(&undated, READ_AT, false);
+    let bits: u16 = fields
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("verified="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !Selection::from_bits(bits)
+            .unwrap()
+            .contains(Setting::CapsLock),
+        "an undated row verifies nothing: {fields}"
+    );
+}
+
+/// A verified Full Disk Access grant that reads off asks the worker for a fresh reading of the
+/// Access rows through its `fda_off` handler alone, so `setup=` stops relaying the grant the
+/// earlier reading saw (design §3.5). Every other handler stays unasked.
+#[test]
+fn a_full_disk_access_regression_asks_for_a_fresh_reading() {
+    use std::cell::Cell;
+    thread_local! {
+        static ASKED: Cell<u32> = const { Cell::new(0) };
+        static OFF: Cell<u32> = const { Cell::new(0) };
+    }
+    fn ask() {
+        ASKED.with(|asked| asked.set(asked.get() + 1));
+    }
+    fn off() {
+        OFF.with(|asked| asked.set(asked.get() + 1));
+    }
+    let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+        observe: |_| {
+            ask();
+            true
+        },
+        check: |_, _| {
+            ask();
+            crate::CheckStarted::default()
+        },
+        ask_access: || {
+            ask();
+            true
+        },
+        tools_installed: ask,
+        fda_granted: ask,
+        fda_off: off,
+        ..crate::InitialSetupHandlers::inert_for_test()
+    });
+    app.note_fda_regression(true);
+    assert_eq!(
+        OFF.with(Cell::get),
+        1,
+        "a grant that reads off is read again"
+    );
+    assert_eq!(ASKED.with(Cell::get), 0, "through fda_off alone");
+    app.note_fda_regression(true);
+    assert_eq!(
+        OFF.with(Cell::get),
+        1,
+        "a grant still off asks nothing more"
+    );
+    app.note_fda_regression(false);
+    app.note_fda_regression(true);
+    assert_eq!(OFF.with(Cell::get), 2, "a fresh regression asks again");
+    assert_eq!(ASKED.with(Cell::get), 0);
+}
+
+/// A status that leads with neither a named wait nor a finished setup (a run still going) still
+/// names its unread rows after its bare `pending`, so the unread rows are never dropped from the
+/// field (design §3.5). Negative control: with every row read the field is a bare `pending`.
+#[test]
+fn a_running_setup_still_names_its_unread_rows() {
+    let dock = Subject::Setting(Setting::Dock);
+    let running = |observed: Vec<Observation>| SetupStatus {
+        busy: true,
+        ..fully_observed_setup(Selection::all(), observed)
+    };
+    let field = setup_field(&running(vec![Observation::withheld(dock)]), READ_AT);
+    assert_eq!(field, "pending;unread:dock");
+    assert_eq!(
+        setup_field(&running(Vec::new()), READ_AT),
+        "pending",
+        "the control: nothing unread"
+    );
+}
+
+/// What `setup status`' `verified=` holds in `fields` (`background_setup_fields`).
+/// `setup=`, `verified=` and `verified_at=` of the background evidence `fields`, before its
+/// generation count and the `rows=` each row's word is said in.
+fn evidence(fields: &str) -> &str {
+    fields
+        .split_once(" observed_generation=")
+        .map_or(fields, |(evidence, _)| evidence)
+}
+
+fn verified_bits(fields: &str) -> Selection {
+    let bits: u16 = fields
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("verified="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    Selection::from_bits(bits).unwrap()
+}
+
+/// The private rows a full plan manages, each a setting read only while System State is in
+/// front with a person, in page order.
+fn private_settings() -> Selection {
+    let mut private = Selection::none();
+    for setting in Setting::ALL {
+        if Subject::Setting(setting).reads_privately() {
+            private.set(setting, true);
+        }
+    }
+    private
+}
+
+/// H30: a grant on offer (nobody asked for macOS's grants, or developer mode left to the person
+/// once setup's one Mac password does not turn it on) is offered, never waited on: `setup=` says it
+/// `;offered:` beside whatever leads, never as `pending:`/`needs:`, so a finished Mac with Full
+/// Disk Access on offer reads `done`, as its headline (`aterm is set up`) does. NEGATIVE CONTROL: a
+/// grant a person's press asked for, which reads Needs you, is a pending press (`needs:`).
+#[test]
+fn a_grant_on_offer_is_said_offered_never_a_pending_press() {
+    use aterm_types::macos_setup::{ACCESS_OFFERED, DEBUGGER_NOT_ASKED};
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let debugger = Subject::Access(Access::Debugger);
+    let dock = Subject::Setting(Setting::Dock);
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Secrets, true);
+    selection.set(Setting::Dock, true);
+    let with = |changes: Vec<Observation>| SetupStatus {
+        finished: true,
+        ..fully_observed_setup(selection, changes)
+    };
+    let offered = || {
+        vec![
+            observed(fda, Standing::NotNeeded, Some(ACCESS_OFFERED)),
+            observed(debugger, Standing::NotNeeded, Some(DEBUGGER_NOT_ASKED)),
+        ]
+    };
+    let finished = with(offered());
+    assert_eq!(setup_field(&finished, READ_AT), "done;offered:fda,debugger");
+    let rows = crate::system_state::rows(&finished, selection);
+    let headline = crate::system_state::headline(&finished, &rows, finished.plan.as_ref());
+    assert!(headline.set_up, "{headline:?}");
+    assert_eq!(headline.text, crate::system_state::ATERM_SET_UP);
+    // Developer mode left to the person is on offer as theirs, on the page as in `setup=`.
+    let left_to_you = with(vec![observed(
+        debugger,
+        Standing::NotNeeded,
+        Some(DEBUGGER_NOT_ASKED),
+    )]);
+    assert_eq!(setup_field(&left_to_you, READ_AT), "done;offered:debugger");
+    let rows = crate::system_state::rows(&left_to_you, selection);
+    let headline = crate::system_state::headline(&left_to_you, &rows, left_to_you.plan.as_ref());
+    assert_eq!(headline.text, crate::system_state::ATERM_SET_UP);
+    let row = rows.iter().find(|row| row.subject == debugger).unwrap();
+    assert_eq!(
+        row.value,
+        crate::system_state::RowValue::Muted(crate::system_state::OFFERED_WORD.to_owned())
+    );
+    // Beside a row asked again by itself (the ALab vault off its LAN), what is on offer is no
+    // more set up than without it: the headline says the rest of aterm is set up, never that
+    // the rest is, and `setup=` still names it `;offered:`.
+    let vault = Subject::Setting(Setting::Secrets);
+    let mut asked = offered();
+    asked.push(observed(vault, Standing::Asking, None));
+    let asking = with(asked);
+    assert_eq!(
+        setup_field(&asking, READ_AT),
+        "asking:vault;offered:fda,debugger"
+    );
+    let rows = crate::system_state::rows(&asking, selection);
+    let headline = crate::system_state::headline(&asking, &rows, asking.plan.as_ref());
+    assert!(!headline.set_up, "{headline:?}");
+    assert_eq!(headline.asking, [vault]);
+    assert_eq!(
+        headline.text,
+        format!(
+            "{}: {}; {}",
+            vault.name(),
+            crate::system_state::ASKS_AGAIN,
+            crate::system_state::REST_OF_ATERM_SET_UP
+        )
+    );
+    let mut running = offered();
+    running.push(observed(dock, Standing::Differs, None));
+    assert_eq!(
+        setup_field(&with(running), READ_AT),
+        "pending:dock;offered:fda,debugger",
+        "what is on offer rides beside a step still to make"
+    );
+    assert_eq!(
+        setup_field(
+            &with(vec![observed(fda, Standing::NeedsYou, None)]),
+            READ_AT
+        ),
+        "pending:fda;needs:fda",
+        "CONTROL: a grant asked of a person is their press"
+    );
+}
+
+/// H29: a row set for macOS to take up in full at the next login is set, and a row changed
+/// since aterm set it is settled, left as it is (design §6.6): each verifies its row and
+/// `setup=` names it (`;at-login:`, `;changed:`), so `setup=`, `verified=` and the relay agree,
+/// and the headline says what the next login brings and names the changed row, never saying the
+/// Mac is set up (H19), nor, beside a row asked again by itself, that the rest is. NEGATIVE
+/// CONTROL: a row that differs with no record that it changed since aterm set it is a change
+/// still to make, and verifies nothing.
+#[test]
+fn a_row_set_for_the_next_login_or_changed_since_is_verified_and_named() {
+    let trackpad = Subject::Setting(Setting::TrackpadScrolling);
+    let dock = Subject::Setting(Setting::Dock);
+    let status = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(
+            Selection::all(),
+            vec![
+                observed(trackpad, Standing::AtLogin, None),
+                observed(
+                    dock,
+                    Standing::Differs,
+                    Some(aterm_types::macos_setup::CHANGED_SINCE),
+                ),
+            ],
+        )
+    };
+    let fields = super::background_setup_fields(&status, READ_AT, false);
+    assert_eq!(
+        evidence(&fields),
+        format!(
+            "setup=done;at-login:trackpad;changed:dock verified={} verified_at={READ_AT}",
+            private_settings().bits()
+        )
+    );
+    assert!(
+        fields.contains(",trackpad:at-login,") && fields.contains(",dock:differs,"),
+        "rows= says what each verified row reads: {fields}"
+    );
+    let rows = crate::system_state::rows(&status, Selection::all());
+    let headline = crate::system_state::headline(&status, &rows, status.plan.as_ref());
+    assert!(headline.set_up, "{headline:?}");
+    assert_eq!(
+        headline.text,
+        format!(
+            "{}; {}; Dock {}",
+            crate::system_state::SETUP_FINISHED,
+            crate::system_state::AT_NEXT_LOGIN_ONE,
+            crate::system_state::CHANGED_SINCE_WORDS
+        )
+    );
+    // Schema 6 in one reply: beside a row asked again by itself (the ALab vault off its LAN),
+    // which heads `setup=` as `asking:`, the changed row is named `;changed:` as after `done`, and
+    // the headline says the rest of setup finished, never that the rest is set up.
+    let vault = Subject::Setting(Setting::Secrets);
+    let asking = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(
+            Selection::all(),
+            vec![
+                observed(trackpad, Standing::AtLogin, None),
+                observed(
+                    dock,
+                    Standing::Differs,
+                    Some(aterm_types::macos_setup::CHANGED_SINCE),
+                ),
+                observed(vault, Standing::Asking, None),
+            ],
+        )
+    };
+    assert_eq!(
+        evidence(&super::background_setup_fields(&asking, READ_AT, false)),
+        format!(
+            "setup=asking:vault;at-login:trackpad;changed:dock verified={} verified_at={READ_AT}",
+            private_settings().bits()
+        )
+    );
+    let rows = crate::system_state::rows(&asking, Selection::all());
+    let headline = crate::system_state::headline(&asking, &rows, asking.plan.as_ref());
+    assert!(!headline.set_up, "{headline:?}");
+    assert_eq!(headline.asking, [vault]);
+    assert_eq!(
+        headline.text,
+        format!(
+            "{}: {}; {}; {}; Dock {}",
+            vault.name(),
+            crate::system_state::ASKS_AGAIN,
+            crate::system_state::REST_FINISHED,
+            crate::system_state::AT_NEXT_LOGIN_ONE,
+            crate::system_state::CHANGED_SINCE_WORDS
+        )
+    );
+    let drift = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(
+            Selection::all(),
+            vec![observed(dock, Standing::Differs, None)],
+        )
+    };
+    let fields = super::background_setup_fields(&drift, READ_AT, false);
+    assert!(
+        fields.starts_with("setup=pending:dock "),
+        "CONTROL: {fields}"
+    );
+    assert!(
+        !verified_bits(&fields).contains(Setting::Dock),
+        "CONTROL: {fields}"
+    );
+}
+
+/// The 10-minute standing (design §3.5): a private row read back as wanted longer ago than a
+/// reading stands is set up as last read, said `read-back:` with that reading still verifying
+/// the row and dating `verified_at`, so a reader says how old it is and never calls it now; a
+/// row nothing read at all is `unread:`, neither. NEGATIVE CONTROL: the same reading inside its
+/// age is `done`.
+#[test]
+fn a_private_row_read_back_past_its_standing_is_read_back_neither_done_nor_unread() {
+    use aterm_types::macos_setup::READING_STANDS_SECS;
+    let full = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::all(), Vec::new())
+    };
+    let old = READ_AT + READING_STANDS_SECS + 1;
+    let all_private =
+        "capslock,scrolling,trackpad,desktop,widgets,dock,messages,facetime,spotlight";
+    assert_eq!(
+        evidence(&super::background_setup_fields(&full, old, false)),
+        format!(
+            "setup=read-back:{all_private} verified={} verified_at={READ_AT}",
+            private_settings().bits()
+        )
+    );
+    let dock = Subject::Setting(Setting::Dock);
+    let one_unread = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::all(), vec![Observation::withheld(dock)])
+    };
+    let fields = super::background_setup_fields(&one_unread, old, false);
+    assert!(
+        fields.starts_with(
+            "setup=unread:dock;read-back:capslock,scrolling,trackpad,desktop,widgets,messages,\
+             facetime,spotlight "
+        ),
+        "{fields}"
+    );
+    assert!(!verified_bits(&fields).contains(Setting::Dock), "{fields}");
+    assert_eq!(
+        evidence(&super::background_setup_fields(
+            &full,
+            READ_AT + READING_STANDS_SECS,
+            false
+        )),
+        format!(
+            "setup=done verified={} verified_at={READ_AT}",
+            private_settings().bits()
+        ),
+        "CONTROL: still young"
+    );
 }

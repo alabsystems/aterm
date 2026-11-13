@@ -22,10 +22,57 @@ const TEST_UNIT_RECORD: &str = "test-compile-unit-memory.json";
 /// floor's peak margin is exactly 2 GiB; keep this named for release's leading-claim detector.
 pub const DRIVER_CLAIM: u64 = 2 << 30;
 
-/// The smallest enforceable whole-stage Tippy claim. Branded Tippy owns its compiler wrapper,
-/// so the verifier cannot split this envelope into compiler-unit claims. The largest retained
-/// peak before this bound was introduced was 24.636 GiB.
-pub const TIPPY_CLAIM_FLOOR: u64 = 28 << 30;
+/// HOW THE POOLED LINT'S WHOLE-STAGE MEMORY IS CLAIMED ([`lint_claim`]). Branded Tippy owns its
+/// compiler wrapper, so the verifier cannot split the stage into compiler-unit claims: one claim
+/// bounds the whole compile, sized by what this machine measured and never by a figure another
+/// machine needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LintClaim {
+    /// The bytes claimed.
+    pub bytes: u64,
+    /// Whether it asks for the machine's memory alone ([`aterm_capacity::Need::alone`]).
+    pub alone: bool,
+    /// Whether a kept peak of this very stage sized it ([`LintClaim::measured`]).
+    pub measured: bool,
+}
+
+/// What the pooled lint claims for a stage planned at `planned` bytes, by `need` (what its kept
+/// records say: [`crate::memory::need`]), on a machine of `physical` bytes whose memory can
+/// reach `budget` ([`crate::memory::Book::budget`]).
+///
+/// MEASURED: a peak this stage and selection kept, here or in another checkout of this machine,
+/// and a fifth more ([`aterm_capacity::peak_claim`]). It is admitted beside the claims ahead of
+/// it while it fits, waits for those that hold memory while it does not, and where what it is
+/// short of is memory no claim holds (a person's apps, on a Mac that never has that much free)
+/// it is admitted alone, as the ledger's ALONE rule says: every wait ends. One at or beyond what
+/// can ever be available asks to run alone.
+///
+/// UNMEASURED: nothing bounds a compile never measured here (a cold figure of 16 GiB met a
+/// 22.3 GiB compile on 2026-11-10), and a constant sized on one machine either starves a
+/// smaller one or under-reserves a larger. So it asks for the machine's memory alone: it runs
+/// once no other claim holds memory, no memory claim is admitted beside it, and the peak that
+/// run keeps makes the next one measured.
+#[must_use]
+pub fn lint_claim(
+    planned: u64,
+    need: &crate::memory::StageNeed,
+    physical: Option<u64>,
+    budget: u64,
+) -> LintClaim {
+    let measured = matches!(
+        need.how,
+        crate::memory::How::Learned(_) | crate::memory::How::Elsewhere(_)
+    ) && need.bytes > 0;
+    let bytes = match planned.max(need.bytes) {
+        0 => aterm_capacity::cold_claim(physical),
+        bytes => bytes,
+    };
+    LintClaim {
+        bytes,
+        alone: !measured || bytes >= budget,
+        measured,
+    }
+}
 
 const UNIT_ENVIRONMENT: [&str; 8] = [
     UNIT_BOOK,
@@ -259,22 +306,35 @@ pub(crate) fn claim(
         aterm_capacity::Rank::Ordinary
     };
     if spec.id == crate::plan::StageId::Tippy {
-        let bytes = spec.mem.max(TIPPY_CLAIM_FLOOR);
+        let need = book.need(
+            spec,
+            &<crate::memory::Key as crate::memory::StageKey>::of_stage(spec, ctx),
+            jobs_for(ctx, spec.id),
+        );
+        let lint = lint_claim(spec.mem, &need, book.physical, book.budget());
+        let asked = aterm_capacity::Need::new(format!("verify {}", spec.title))
+            .rank(rank)
+            .mem(lint.bytes)
+            .covers()
+            .ends_when_stuck(crate::STUCK_ENDS);
         let claim = wait(
-            aterm_capacity::Need::new(format!("verify {}", spec.title))
-                .rank(rank)
-                .mem(bytes)
-                .covers()
-                .ends_when_stuck(crate::STUCK_ENDS)
-                .margin(1),
+            if lint.alone { asked.alone() } else { asked },
             aterm_capacity::Admit::Wait,
         )
         .map_err(|e| e.to_string())?;
         return Ok(Some(crate::ResourceClaim {
             claim: std::sync::Arc::new(claim),
             said: format!(
-                "memory: claimed {} for the full compile; branded Tippy owns its compiler wrapper",
-                aterm_capacity::size(bytes)
+                "memory: claimed {} for the full compile{}; branded Tippy owns its compiler wrapper",
+                aterm_capacity::size(lint.bytes),
+                match (lint.measured, lint.alone) {
+                    (true, false) => " (its measured peak and a fifth more)",
+                    (true, true) => {
+                        " (its measured peak and a fifth more: all this machine can have, so it \
+                         runs alone)"
+                    }
+                    (false, _) => " (never measured here, so it runs alone and keeps its peak)",
+                }
             ),
             units: None,
         }));
@@ -306,13 +366,22 @@ pub(crate) fn claim(
     } else {
         format!("verify {}", spec.title)
     };
+    let asked = aterm_capacity::Need::new(what)
+        .rank(rank)
+        .mem(bytes)
+        .covers()
+        .ends_when_stuck(crate::STUCK_ENDS);
+    // The measured driver keeps a margin so the ledger never admits it ALONE: its units claim
+    // their own envelopes beside it, and a claim held alone admits none. The unmeasured compile
+    // has no unit claims (its wrapper only records) and no figure that bounds it, so it asks for
+    // the machine's memory alone, as the unmeasured lint does ([`lint_claim`]): a wait for free
+    // memory a smaller Mac never has would not end.
     let claim = wait(
-        aterm_capacity::Need::new(what)
-            .rank(rank)
-            .mem(bytes)
-            .covers()
-            .ends_when_stuck(crate::STUCK_ENDS)
-            .margin(1),
+        if measured {
+            asked.margin(1)
+        } else {
+            asked.alone()
+        },
         aterm_capacity::Admit::Wait,
     )
     .map_err(|e| e.to_string())?;
@@ -552,9 +621,7 @@ fn wrapper(
     for name in UNIT_ENVIRONMENT {
         command.env_remove(name);
     }
-    let query = args
-        .iter()
-        .any(|arg| arg.to_string_lossy().starts_with("--print"));
+    let query = is_query(args);
     let unit = (!query)
         .then(|| {
             crate::memory::unit_of(
@@ -587,9 +654,7 @@ fn wrapper(
             || "unidentified compiler".to_owned(),
             |unit| format!("{} {}", unit.package, unit.kind),
         );
-        let held = admit_unit(
-            ledger,
-            machine,
+        let need = unit_need(
             aterm_capacity::Need::new(format!("{label}{name}"))
                 .mem(bytes)
                 .covers()
@@ -597,7 +662,10 @@ fn wrapper(
                 // Leave the driver's envelope spare explicitly on each such decision.
                 .margin(DRIVER_CLAIM)
                 .ends_when_stuck(crate::STUCK_ENDS),
-        )?;
+            &machine.read(None),
+        );
+        let alone = need.alone;
+        let held = admit_unit(ledger, machine, need)?;
         let width = ledger
             .list()
             .map_err(|e| e.to_string())?
@@ -605,8 +673,13 @@ fn wrapper(
             .filter(|row| row.held.is_some() && row.need.what.starts_with(&label))
             .count();
         eprintln!(
-            "compiler width now {width}: admitted {name} with {} (ceiling {})",
+            "compiler width now {width}: admitted {name} with {}{} (ceiling {})",
             aterm_capacity::size(bytes),
+            if alone {
+                " alone (more than this machine can have beside the driver)"
+            } else {
+                ""
+            },
             std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| "pool".to_owned())
         );
         command.env(aterm_capacity::COVER_ENV, held.record().cover_marker());
@@ -637,6 +710,35 @@ fn wrapper(
         .code()
         .and_then(|c| u8::try_from(c).ok())
         .unwrap_or(1))
+}
+
+/// Whether a compiler call only answers a question. rustc answers `-vV`, `-V`, `--version` and
+/// `--print` without compiling, whatever else its arguments say; Cargo asks `-vV` through the
+/// wrapper whenever its cached answer no longer matches (a rebuilt verifier is a new wrapper
+/// path). Such a call is no unit: it claims no memory and keeps no peak.
+fn is_query(args: &[OsString]) -> bool {
+    args.iter().skip(1).any(|arg| {
+        let arg = arg.to_string_lossy();
+        matches!(&*arg, "-vV" | "-V" | "--version") || arg.starts_with("--print")
+    })
+}
+
+/// The need a unit asks the ledger for on the machine `reading` reads. A claim that machine can
+/// never hold beside the driver ([`aterm_capacity::never`]) is no evidence the unit cannot
+/// compile there: an unmeasured unit's claim is the stage's whole plan, a figure about no
+/// machine, and a measured one's is its peak and a fifth more. Refused, the unit could never
+/// run and so never be measured. It asks to run ALONE instead, as the unmeasured compile and
+/// lint do ([`claim`]): it starts once no other claim holds memory, every other unit waits
+/// while it runs, and its kept peak is what the next run claims.
+fn unit_need(
+    need: aterm_capacity::Need,
+    reading: &aterm_capacity::Reading,
+) -> aterm_capacity::Need {
+    if aterm_capacity::never(&need, reading).is_some() {
+        need.alone()
+    } else {
+        need
+    }
 }
 
 fn units_from_environment() -> Result<Units, String> {
@@ -703,6 +805,7 @@ fn admit_unit(
     machine: &dyn aterm_capacity::Machine,
     need: aterm_capacity::Need,
 ) -> Result<aterm_capacity::Claim, String> {
+    let mut observation = crate::resource_waits::UnitTrace::new(&need.what, ledger.dir());
     if let Some(why) = aterm_capacity::never(&need, &machine.read(None)) {
         return Err(format!("{why:?}"));
     }
@@ -721,12 +824,16 @@ fn admit_unit(
         // Two consecutive looks are the ledger's evidence for a stuck holder. Giving
         // up the queue position must not reset that evidence before its second look.
         let polled = match waiter.poll(machine) {
-            aterm_capacity::Polled::Waiting(waiter, _) => waiter.poll(machine),
+            aterm_capacity::Polled::Waiting(waiter, short) => {
+                observation.observe(&short);
+                waiter.poll(machine)
+            }
             result => result,
         };
         match polled {
             aterm_capacity::Polled::Admitted(claim) => return Ok(claim),
             aterm_capacity::Polled::Waiting(waiter, short) => {
+                observation.observe(&short);
                 let text = format!("{}: {short}", need.what);
                 let stuck = waiter.stuck().cloned();
                 drop(waiter);

@@ -42,7 +42,7 @@ pub mod machine_type;
 mod macos;
 pub mod neural_engine;
 pub mod notify;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod nvml;
 pub mod paths;
 #[cfg(windows)]
@@ -63,8 +63,12 @@ pub mod timeline;
 pub mod volumes;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win;
+pub mod win_gpu;
+pub mod win_net;
 #[cfg(windows)]
 mod win_paths;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod win_pdh;
 pub mod windows;
 
 pub use procs::{
@@ -78,7 +82,7 @@ pub use machine::{
     LinkCounters, LinkKind, LinkReading, MAX_GPU_CLIENTS, MAX_LINKS, MachineWords, MemoryDetail,
     Probe, TcpCounts, TcpSummary, Throttle, ThrottleLevel, VmCounters, VolumeReading,
     WorkqueueLimits, capacity, caps, counts_toward_machine, cpu_layout, creator_of, gpu,
-    gpu_clients, gpu_driver, layout_by_rank, level_names, load_average, machine_words,
+    gpu_clients, gpu_driver, gpu_if_read, layout_by_rank, level_names, load_average, machine_words,
     memory_detail, net_links, net_links_into, open_socket_count, tcp_after_publish, tcp_counts,
     tcp_counts_into, tcp_summary, tcp_summary_into, volume, withdrawn_cores, workqueue_limits,
 };
@@ -403,14 +407,18 @@ impl GroupMemory {
     }
 }
 
-/// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude Code's Bun process and the children it forks into its own group.
+/// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude Code's Bun process and the children it forks into its own group. Windows has no process group, so there it is the memory of `pid`'s PROCESS TREE: the private commit of `pid`, of each live process whose chain of live parents reaches it, and of each orphan started in one of that tree's consoles since `pid` was (Windows gives a process whose parent exited no new parent, which is how Git Bash leaves every script it runs; [`windows::tree_adopting`]), from one sweep ([`windows::tree_memory`]), with `pid` as the group's id. A pid Windows handed to a newer process is never read as a child (the sweep checks each parent's creation time). Not counted: an orphan with no console, or one whose console's creator has exited too, so the figure is a floor.
 #[must_use]
 pub fn group_memory(pid: u32) -> Option<GroupMemory> {
     #[cfg(target_os = "macos")]
     {
         macos::group_memory(pid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::group_memory(pid)
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         let _ = pid;
         None
@@ -436,7 +444,9 @@ pub struct MemberUsage {
     pub runnable_ns: u64,
     /// Bytes it read from storage and wrote to storage (macOS
     /// `ri_diskio_bytesread + ri_diskio_byteswritten`, saturating). Not its logical writes: a
-    /// `write(2)` runs on its CPU time, which counts it already.
+    /// `write(2)` runs on its CPU time, which counts it already. On Windows the bytes it moved
+    /// through any handle ([`ProcessReading::io_read`] plus [`ProcessReading::io_written`]): the
+    /// process record there counts no storage bytes apart.
     pub io_bytes: u64,
     /// Its physical footprint now, bytes (`ri_phys_footprint`): the memory it holds, the pages
     /// the kernel compressed or swapped out included, so the memory it would have resident again.
@@ -449,16 +459,40 @@ pub struct MemberUsage {
 /// What each member of process group `pgid` has used ([`MemberUsage`]), read now: the first
 /// [`MAX_GROUP_PIDS`] members the kernel lists, less those it will not answer for (another
 /// user's), an unreaped zombie's final figures included. `None` for pgid 0 or past `i32::MAX`,
-/// when the listing fails, and off macOS.
+/// when the listing fails, and on Linux. On Windows `pgid` is a pid and the members are its
+/// process tree ([`windows::tree_usage`]: the pid, its live descendants and the orphans in its
+/// consoles as [`group_memory`] counts them, from one sweep, each with its CPU time, the bytes
+/// it moved through any handle, its private commit and that commit's peak);
+/// `None` when the pid is not running.
 #[must_use]
 pub fn group_usage(pgid: u32) -> Option<Vec<MemberUsage>> {
     #[cfg(target_os = "macos")]
     {
         macos::group_usage(pgid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::group_usage(pgid)
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         let _ = pgid;
+        None
+    }
+}
+
+/// The Windows session this process runs in (`ProcessIdToSessionId`): what a sweep row's
+/// [`ProcessReading::uid`] is compared with there, so a process of the same session is this
+/// person's and one of session 0 a service's ([`windows::session_class`]). `None` off Windows,
+/// where a process's owner is its uid.
+#[must_use]
+pub fn own_session() -> Option<u32> {
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::own_session()
+    }
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
+    {
         None
     }
 }
@@ -478,35 +512,44 @@ pub fn hid_idle() -> Option<std::time::Duration> {
     }
 }
 
-/// The machine's model identifier (macOS `hw.model`: `Mac16,6`), `None` where unread, and off
-/// macOS.
+/// The machine's model identifier (macOS `hw.model`: `Mac16,6`; Windows the firmware's product
+/// name as the registry keeps it, `SystemProductName`), `None` where unread, and on Linux.
 #[must_use]
 pub fn machine_model() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         macos::machine_model()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::machine_model()
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         None
     }
 }
 
-/// The running OS's build (macOS `kern.osversion`: `25B78`), which every update of the OS changes,
-/// a beta's included, `None` where unread, and off macOS.
+/// The running OS's build (macOS `kern.osversion`: `25B78`; Windows the build number and its
+/// update revision, `26200.7171`), which every update of the OS changes, a beta's included,
+/// `None` where unread, and on Linux.
 #[must_use]
 pub fn os_build() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         macos::os_build()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::os_build()
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         None
     }
 }
 
-/// The machine's physical memory in MiB (`hw.memsize` on macOS, `MemTotal` in `/proc/meminfo` on Linux), `None` where unknown.
+/// The machine's physical memory in MiB (`hw.memsize` on macOS, `MemTotal` in `/proc/meminfo` on Linux, `GlobalMemoryStatusEx`'s `ullTotalPhys` on Windows), `None` where unknown.
 #[must_use]
 pub fn physical_memory_mib() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -519,26 +562,38 @@ pub fn physical_memory_mib() -> Option<u64> {
         let total_kib = linux::mem_total_kib(&text)?;
         (total_kib >= 1024).then_some(total_kib / 1024)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::physical_memory_mib()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         None
     }
 }
 
-/// The kernel's memory pressure level now (`kern.memorystatus_vm_pressure_level`, one `sysctl`), `None` where unknown (every platform but macOS).
+/// The kernel's memory pressure level now (`kern.memorystatus_vm_pressure_level`, one `sysctl`), `None` where unknown (Linux). On Windows the level [`memory_detail`] reads: `warn` once the commit charge is at 90 % of its limit or the low-memory notification is set, else `normal`; Windows names no `critical`.
 #[must_use]
 pub fn memory_pressure() -> Option<MemoryLevel> {
     #[cfg(target_os = "macos")]
     {
         macos::memory_pressure()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::memory_detail().and_then(|m| m.pressure)
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         None
     }
 }
 
-/// KiB swapped in plus out since boot (`HOST_VM_INFO64` swapins plus swapouts times `vm.pagesize` on macOS, `/proc/vmstat` `pswpin` plus `pswpout` times the page size on Linux): the counter whose rate the memory ceiling reads (`warn` plus a thrash).
+/// KiB swapped in plus out since boot (`HOST_VM_INFO64` swapins plus swapouts times `vm.pagesize` on macOS, `/proc/vmstat` `pswpin` plus `pswpout` times the page size on Linux): the counter whose rate the memory ceiling reads (`warn` plus a thrash). Windows keeps no such count for a reader without privilege, so there it is the page files' pages in use, in KiB: a level, whose rise is what was paged out less what was let go, so a [`SwapMeter`] over it reads the page files' growth (never more than was written) and 0 while they shrink.
 #[must_use]
 pub fn swapped_kib() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -560,7 +615,15 @@ pub fn swapped_kib() -> Option<u64> {
         let pages = linux::swap_pages(&text)?;
         Some(pages.saturating_mul(page_kib))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        win::swapped_kib()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         None
     }
@@ -713,5 +776,7 @@ pub const fn pressure_of(level: i64) -> Option<MemoryLevel> {
 mod linux_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, windows, target_pointer_width = "64"))]
+mod win_live_tests;
 #[cfg(test)]
 mod windows_tests;

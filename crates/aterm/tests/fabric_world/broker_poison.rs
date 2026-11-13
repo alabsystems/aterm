@@ -118,6 +118,16 @@ impl Supervised {
             "a clean stop exits 0: {ended}\n{}",
             read(&self.err)
         );
+        // `fabric=connected` and the presence row outlive the fault-free broker: aterm keeps
+        // the bridge's last report, and the reopened log keeps the row. A bridge slow to read
+        // its streams' end (a loaded machine) then meets the next post on its dead connection,
+        // takes the link down, and `--wait` is refused at once (`ERR fabric stalled`). So the
+        // faulted broker starts only once the bridge has read the link down; with nothing
+        // listening, its redial cannot attach, and the next `connected` is its attach to it.
+        until("the bridge to read the fault-free broker's end", || {
+            let fs = w.verb("fabric status").header().to_string();
+            (kv(&fs, "state") != Some("connected")).then_some(())
+        });
         let broker = self.start(w);
         assert_eq!(
             self.identity(1),

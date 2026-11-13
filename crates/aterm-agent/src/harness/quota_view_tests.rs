@@ -319,7 +319,7 @@ fn labels(view: &QuotaView) -> (Vec<&str>, Vec<&str>) {
 /// THE NAMED THREE FOLLOW ROSTER ORDER: `Class::Preferred` rows first, then file order; one to
 /// three rows are all named; past three, the first three are named and the rest fold, in that
 /// order; with no roster row the one login is named `this login`. The glass names each account
-/// by its email (owner ruling 2026-11-09), its roster label only where its row has none: the
+/// by its email, its roster label only where its row has none: the
 /// row, the title, the spoken words and the fallback say the email, and the row's narrowest
 /// rung its local part. Negative controls: ordering by file order alone names the pool row `r0`
 /// among six; naming by the roster label leaves the emails unsaid.
@@ -418,57 +418,9 @@ fn a_long_email_gives_way_to_its_local_part_before_it_is_cut() {
     assert_eq!(short("a-long-account-label"), "a-long-acco\u{2026}");
 }
 
-/// THE ACCOUNTS CARD NAMES EACH ITEM BY ITS EMAIL (§1.4, §2.5): a wide card's item and its
-/// spoken words say the email, a row with none its roster label, and the narrowest form the
-/// email's local part; the item keeps the label as its key. Negative control: the card naming
-/// `m22` where the row has an email.
-#[test]
-fn the_accounts_card_names_each_item_by_its_email() {
-    let mut fx = Fx::new(&[("m22", Class::Preferred), ("m20", Class::Preferred)]);
-    fx.now = T5;
-    fx.roster.rows[0].email = Some("owner@example.com".into());
-    fx.read("m22", None, Some((630, SAT7)), T5);
-    fx.read("m20", None, Some((300, SAT7)), T5);
-    fx.state.active = Some("m22".into());
-    let out = fx.outlook();
-    let item = |room: usize, key: &str| {
-        out.card_rows("m22", None, true, room, None)
-            .into_iter()
-            .find_map(|r| match r {
-                outlook::CardRow::Account {
-                    label,
-                    text,
-                    spoken,
-                    ..
-                } if label == key => Some((text, spoken)),
-                _ => None,
-            })
-            .expect("the item")
-    };
-    let (text, spoken) = item(120, "m22");
-    assert!(text.starts_with("owner@example.com"), "{text}");
-    assert!(
-        spoken.starts_with("owner@example.com, this tab"),
-        "{spoken}"
-    );
-    let (text, spoken) = item(120, "m20");
-    assert!(text.starts_with("m20"), "{text}");
-    assert!(spoken.starts_with("m20"), "{spoken}");
-    let narrowest = (8..120)
-        .map(|room| item(room, "m22").0)
-        .find(|text| !text.contains('\u{2026}'))
-        .expect("a form that fits");
-    assert!(narrowest.starts_with("owner "), "{narrowest}");
-    for room in [30, 60, 120] {
-        let (text, _) = item(room, "m22");
-        assert!(!text.starts_with("m22"), "NEGATIVE CONTROL: {room}: {text}");
-    }
-}
-
 /// THIS TAB AND THE CARRIER ARE ALWAYS NAMED: among six preferred rows, one outside the first
-/// three takes the place of the last named row that is neither, the named stay in roster order,
-/// and the card's lanes are the same accounts. Negative control: naming the first three alone
-/// folds the carrier ranked fifth (`r4`).
+/// three takes the place of the last named row that is neither, and the named stay in roster
+/// order. Negative control: naming the first three alone folds the carrier ranked fifth (`r4`).
 #[test]
 fn this_tab_and_the_carrier_are_always_named() {
     let names = ["r0", "r1", "r2", "r3", "r4", "r5"];
@@ -496,8 +448,6 @@ fn this_tab_and_the_carrier_are_always_named() {
         );
         assert!(view.named.iter().any(|n| n.this_tab && n.label == tab));
         assert!(view.named.iter().any(|n| n.carrier && n.label == carrier));
-        let lanes: Vec<&str> = view.lanes.iter().map(|l| l.label.as_str()).collect();
-        assert_eq!(lanes, named, "the card's lanes are the named three");
     }
 }
 
@@ -807,21 +757,21 @@ fn past_cells_hold_the_last_reading_and_never_interpolate() {
     assert_eq!(
         past(&chart, 12),
         [
-            r(2),
-            r(2),
-            r(2),
-            r(2),
-            r(2),
-            r(5),
-            r(5),
-            r(5),
-            r(5),
-            r(5),
-            r(5),
-            r(5)
+            r(7),
+            r(7),
+            r(7),
+            r(7),
+            r(7),
+            r(4),
+            r(4),
+            r(4),
+            r(4),
+            r(4),
+            r(4),
+            r(4)
         ]
     );
-    assert_eq!(past(&chart, 3), [r(2), r(5), r(5)]);
+    assert_eq!(past(&chart, 3), [r(7), r(4), r(4)]);
     assert_eq!(chart.span_of(12, 0), Some((T5 - D, T5 - D + 2 * H)));
     assert_eq!(chart.span_of(12, 11), Some((T5 - 2 * H, T5)));
     assert_eq!(chart.span_of(12, 12), None, "the now cell has no time");
@@ -846,7 +796,7 @@ fn past_cells_hold_the_last_reading_and_never_interpolate() {
     let p = past(&chart, 12);
     assert_eq!(
         p[8..],
-        [r(7), Cell::Reset, Cell::Blank, r(1)],
+        [r(2), Cell::Reset, Cell::Blank, r(8)],
         "the reset at −6 h, nothing known until the new week's first reading"
     );
 }
@@ -855,7 +805,7 @@ fn past_cells_hold_the_last_reading_and_never_interpolate() {
 /// first at −5 h, every cell that ends before it is; and across an epoch (a used limit reset at
 /// −15 h restarted the window) the cells between it and the new window's first reading are
 /// blank, the epoch's cell `↺`. Negative control: carrying a reading across the epoch (no
-/// later-window check) draws 50% in the cell after it.
+/// later-window check) draws 50% in the cell after it. A level is what is left ([`level`]): 40% used is level 6.
 #[test]
 fn cells_before_the_first_reading_are_blank() {
     let mut chart = flat(400);
@@ -868,7 +818,7 @@ fn cells_before_the_first_reading_are_blank() {
     chart.past = vec![read(T5 - 5 * H, 400)];
     let p = past(&chart);
     assert!(p[..9].iter().all(|c| *c == Cell::Blank), "{p:?}");
-    assert!(p[9..].iter().all(|c| *c == Cell::Read(3)), "{p:?}");
+    assert!(p[9..].iter().all(|c| *c == Cell::Read(6)), "{p:?}");
     chart.past = vec![
         read(T5 - 20 * H, 500),
         Read {
@@ -880,26 +830,32 @@ fn cells_before_the_first_reading_are_blank() {
     assert_eq!(
         p[2..7],
         [
-            Cell::Read(4),
-            Cell::Read(4),
+            Cell::Read(5),
+            Cell::Read(5),
             Cell::Reset,
             Cell::Blank,
-            Cell::Read(1)
+            Cell::Read(8)
         ]
     );
 }
 
-/// SIXTY-THREE AND NINETY-EIGHT ARE DIFFERENT LEVELS: in eighths 63% is level 5 and 98% level 7
-/// (level 8 is kept for a full cell), each with its glyph: `▅` read, `🭸` and `🭶` projected; in
-/// case (b) the last past cell is `▅` and the curve's cell before `↺` is `🭶`. Every glyph is the
-/// design's code point. Negative control: quarters (`clamp(round(x·4/100), 1, 3)`) put both on
-/// one level.
+/// SIXTY-THREE AND NINETY-EIGHT ARE DIFFERENT LEVELS: the chart draws what is left, so in
+/// eighths 63% used is level 4 and 98% level 2 (level 1, the floor, is kept for a week used
+/// up), each with its glyph: `▄` read, `🭹` and `🭻` projected; in case (b) the last past cell is
+/// `▄` and the curve's cell before `↺` is `🭻`. Every glyph is the design's code point. Negative
+/// controls: quarters (`clamp(round(x·4/100), 1, 3)`) put both on one level; the level of the
+/// use itself (`level` without its `9 −`) draws 63% as `▅` and a chart that fills as the figure
+/// beside it falls.
 #[test]
 fn sixty_three_and_ninety_eight_are_different_levels() {
-    assert_eq!((level(630), level(980)), (5, 7));
-    assert_eq!(Cell::Read(5).glyph(), '\u{2585}');
-    assert_eq!(Cell::Ahead(5).glyph(), '\u{1fb78}');
-    assert_eq!(Cell::Ahead(7).glyph(), '\u{1fb76}');
+    assert_eq!((level(630), level(980)), (4, 2));
+    assert!(
+        level(100) > level(630),
+        "less used stands higher: it drains"
+    );
+    assert_eq!(Cell::Read(4).glyph(), '\u{2584}');
+    assert_eq!(Cell::Ahead(4).glyph(), '\u{1fb79}');
+    assert_eq!(Cell::Ahead(2).glyph(), '\u{1fb7b}');
     let read: String = (1..=8).map(|l| Cell::Read(l).glyph()).collect();
     assert_eq!(
         read,
@@ -924,21 +880,26 @@ fn sixty_three_and_ninety_eight_are_different_levels() {
     assert_eq!(marks, "\u{2595}\u{2573}\u{2192}\u{21ba}$\u{2504}");
     let view = case_b().outlook().quota("main", None, true);
     let c = cells(&view.chart, 12);
-    assert_eq!(c[11], Cell::Read(5), "63% now");
+    assert_eq!(c[11], Cell::Read(4), "63% used now");
     let at_reset = c.iter().position(|c| *c == Cell::Reset).unwrap();
-    assert_eq!(c[at_reset - 1], Cell::Ahead(7), "about 98% at the reset");
+    assert_eq!(
+        c[at_reset - 1],
+        Cell::Ahead(2),
+        "about 98% used at the reset"
+    );
 }
 
-/// NO CELL IS FULL WITHOUT A READ 100 OR A PROJECTED FILL: level 8 is 1000 tenths and nothing
-/// else; a lead of 99% over a replay of 40% (case (a)) shifts the first run up to its reset, yet
-/// the curve stays short of a fill there (the tail says `~99%`) and no cell before it reaches
-/// level 8, since a shift is clamped under a fill; a wall read at 97% draws level 7. Negative
-/// control: an unclamped shift (`v + shift` capped only at 1000) fills the curve at main's
-/// reset.
+/// NO CELL IS EMPTY WITHOUT A READ 100 OR A PROJECTED FILL: level 1, the floor, is 1000 tenths
+/// used and nothing else; a lead of 99% over a replay of 40% (case (a)) shifts the first run up
+/// to its reset, yet the curve stays short of a fill there (the tail says `~1% left`) and no
+/// cell before it reaches the floor, since a shift is clamped under a fill; a wall read at 97%
+/// draws level 2. Negative control: an unclamped shift (`v + shift` capped only at 1000) fills
+/// the curve at main's reset.
 #[test]
-fn no_cell_is_full_without_a_read_100_or_a_projected_fill() {
+fn no_cell_is_empty_without_a_read_100_or_a_projected_fill() {
     for x10 in 0..=1000u16 {
-        assert_eq!(level(x10) == 8, x10 == 1000, "{x10}");
+        assert_eq!(level(x10) == 1, x10 == 1000, "{x10}");
+        assert!((1..=8).contains(&level(x10)), "{x10}");
     }
     let view = case_a()
         .outlook()
@@ -954,106 +915,22 @@ fn no_cell_is_full_without_a_read_100_or_a_projected_fill() {
         assert!(
             c[..reset]
                 .iter()
-                .all(|c| !matches!(c, Cell::Read(8) | Cell::Ahead(8))),
+                .all(|c| !matches!(c, Cell::Read(1) | Cell::Ahead(1))),
             "{per_day}: {c:?}"
         );
     }
     let wall = walled().outlook().quota("main", None, true);
-    assert!(cells(&wall.chart, 12).contains(&Cell::Read(7)));
-    assert!(!cells(&wall.chart, 12).contains(&Cell::Read(8)));
-}
-
-/// A BURN-UP DRAWS READS AS AREA AND THE REPLAY AS LINE: case (b)'s lane, on the work row's
-/// clock, holds main's last day as read (solid steps under the lane's ceiling, `▁…▅`), `▕` now,
-/// the projected one-eighth line from the replay's fills (`▁ 🭻…🭸`), then `↺` in the cell its
-/// reset falls in, its last; a walled account's lane is out ([`Cell::Out`]) to its reset. No
-/// cell of either reaches the top quarter of its cell. Negative control: a lane that draws its
-/// past with `Cell::Ahead` fails it; one on the chart's eighths ([`level`]) draws `🭶` before
-/// main's reset.
-#[test]
-fn a_burn_up_draws_reads_as_area_and_the_replay_as_line() {
-    let view = case_b().outlook().quota("main", None, true);
-    let lane = &view.lanes[0];
-    assert_eq!((lane.label.as_str(), lane.renews), ("main", SAT7));
-    assert_eq!(lane.start, SAT7 - 7 * D);
-    let mut c = Vec::new();
-    lane.cells(6, T5, &mut c);
-    let now = c.iter().position(|c| *c == Cell::Now).unwrap();
-    assert_eq!(now, 6, "the work row's day before now, 4 h a cell");
-    assert!(
-        c[..now].iter().all(|c| matches!(c, Cell::Read(_))),
-        "read from a day ago: {c:?}"
-    );
-    assert!(c[now - 1] == Cell::Read(lane_level(630)));
-    let ahead = &c[now + 1..c.len() - 1];
-    assert_eq!(
-        ahead.len(),
-        10,
-        "41 h to the reset: ten cells of line, then the reset's"
-    );
-    assert!(ahead.iter().all(|c| matches!(c, Cell::Ahead(_))), "{c:?}");
-    assert_eq!(c.last(), Some(&Cell::Reset));
-    for cell in &c[..now] {
-        let g = cell.glyph();
-        assert!(g == ' ' || ('\u{2581}'..='\u{2585}').contains(&g), "{c:?}");
-    }
-    for cell in ahead {
-        let g = cell.glyph();
-        assert!(
-            g == '\u{2581}' || ('\u{1fb78}'..='\u{1fb7b}').contains(&g),
-            "{c:?}"
-        );
-    }
-
-    let wall = walled().outlook().quota("main", None, true);
-    let lane = &wall.lanes[0];
-    lane.cells(6, T5, &mut c);
-    let now = c.iter().position(|c| *c == Cell::Now).unwrap();
-    assert!(c[now + 1..c.len() - 1].iter().all(|c| *c == Cell::Out));
-    assert_eq!(Cell::Out.role(), Role::Warn);
-}
-
-/// A LANE KEEPS THE TOP QUARTER OF ITS CELL CLEAR: a lane sits right under its item's words, so
-/// its levels ([`lane_level`]) top out at [`LANE_TOP`], the cell's sixth eighth: a full week read
-/// is `▆` and the line `🭷` at most, which only out ([`Cell::Out`]) reaches, so out stands one
-/// step above every projected level as well as in the warn ink. 63% and 98% stay apart (levels
-/// 3 and 5). Negative control: the chart's eighths ([`level`]) put 98% on `🭶` and a full read on
-/// `█`, both in the top quarter.
-#[test]
-fn a_lane_keeps_the_top_quarter_of_its_cell_clear() {
-    assert_eq!((lane_level(630), lane_level(980)), (3, 5));
-    assert_eq!(
-        (lane_level(0), lane_level(999), lane_level(1000)),
-        (1, 5, LANE_TOP)
-    );
-    let top = ['\u{2594}', '\u{1fb76}', '\u{2587}', '\u{2588}'];
-    for x10 in 0..=1000u16 {
-        let l = lane_level(x10);
-        assert!((1..=LANE_TOP).contains(&l), "{x10}");
-        assert_eq!(
-            l == LANE_TOP,
-            x10 >= 1000,
-            "{x10}: the ceiling is out alone"
-        );
-        for cell in [Cell::Read(l), Cell::Ahead(l)] {
-            assert!(!top.contains(&cell.glyph()), "{x10}: {cell:?}");
-        }
-    }
-    assert_eq!(Cell::Out.glyph(), '\u{1fb77}');
-    assert_eq!(Cell::Read(LANE_TOP).glyph(), '\u{2586}');
+    assert!(cells(&wall.chart, 12).contains(&Cell::Read(2)));
+    assert!(!cells(&wall.chart, 12).contains(&Cell::Read(1)));
 }
 
 /// A RESET PAST A WEEK IS NEVER SAID OR DRAWN: a stored reading keeps the vendor's `resets_at`
 /// as sent, so a week read with one 30 days ahead, or at `i64::MAX`, on a clock east of UTC, is
-/// no week's reset: the tab says no `↺`, its lane draws nothing ahead, and no word adds the
-/// local offset to it. A lane holds the work row's span, a day of cells before `▕` and a week
-/// after, with `↺` only where its reset falls inside them, whatever it is built with. Negative
-/// controls: `reset_ahead` filtering only `> as_of` says `↺` for the reset 30 days on and
-/// overflows adding the offset to `i64::MAX`; `Burn::cells` drawn to its reset unbounded runs
-/// past the chart's end on `renews = i64::MAX`.
+/// no week's reset: the tab says no `↺`, and no word adds the local offset to it. Negative
+/// control: `reset_ahead` filtering only `> as_of` says `↺` for the reset 30 days on and
+/// overflows adding the offset to `i64::MAX`.
 #[test]
-fn a_reset_past_a_week_is_never_said_or_drawn() {
-    let mut c = Vec::new();
+fn a_reset_past_a_week_is_never_said() {
     for reset in [T5 + 30 * D, i64::MAX] {
         let mut fx = Fx::new(&[("main", Class::Preferred)]);
         fx.now = T5;
@@ -1067,44 +944,9 @@ fn a_reset_past_a_week_is_never_said_or_drawn() {
             "{reset}"
         );
         assert_eq!(view.tail.own, None, "{reset}");
-        let lane = &view.lanes[0];
-        assert!(lane.renews <= T5 && lane.ahead.is_empty(), "{reset}");
-        lane.cells(12, T5, &mut c);
-        assert_eq!(c.last(), Some(&Cell::Now), "{reset}");
         for words in every_word(&view) {
             assert!(!words.contains(RESET_MARK), "{reset}: {words}");
         }
-    }
-    let lane = |start: i64, renews: i64| Burn {
-        label: "main".into(),
-        name: "main".into(),
-        start,
-        renews,
-        read: Vec::new(),
-        ahead: Vec::new(),
-        out_at: None,
-    };
-    for per_day in PER_DAY {
-        let k = usize::from(per_day);
-        lane(i64::MAX - 7 * D, i64::MAX).cells(per_day, T5, &mut c);
-        assert_eq!(
-            c.len(),
-            k + 1 + 7 * k,
-            "{per_day}: a day, now, then a week of line"
-        );
-        assert!(
-            !c.contains(&Cell::Reset),
-            "{per_day}: its reset is past the edge"
-        );
-        lane(i64::MIN, T5 + D).cells(per_day, T5, &mut c);
-        assert_eq!(
-            c.len(),
-            k + 1 + k + 1,
-            "{per_day}: the work row's day of past"
-        );
-        lane(T5, T5 + 7 * D - H).cells(per_day, T5, &mut c);
-        assert_eq!(c.len(), k + 1 + 7 * k, "{per_day}: a week to its reset");
-        assert_eq!(c.last(), Some(&Cell::Reset), "{per_day}");
     }
 }
 
@@ -1155,7 +997,7 @@ fn midnights_begin_each_local_day() {
 }
 
 /// THE ROW FIGURE, THE CURVE AND THE TAIL AGREE: the lead's figure, the last past cell, the curve
-/// at `▕` and, at this tab's reset, the curve and the tail's `~N%` tell one figure, both from the
+/// at `▕` and, at this tab's reset, the curve and the tail's `~N% left` tell one figure, both from the
 /// series' own reading and from a newer one the footer holds (70% over the replay's 63%, or a
 /// bound of 45% over case (a)'s 40%). Negative control: dropping the shift leaves the curve at
 /// `▕` at the replay's 63% under a lead of 70%.
@@ -1189,7 +1031,7 @@ fn the_row_figure_the_curve_and_the_tail_agree() {
         assert_eq!(own.by_reset, Some(((at_reset + 5) / 10).min(99)));
         let tail = line.text_of(&line.tail);
         assert!(
-            tail.starts_with(&format!("~{}% by", own.by_reset.unwrap())),
+            tail.starts_with(&format!("~{}% left at", 100 - own.by_reset.unwrap())),
             "{tail}"
         );
     }
@@ -1198,33 +1040,46 @@ fn the_row_figure_the_curve_and_the_tail_agree() {
 // ---------------------------------------------------------------------------------------------
 // Words (§2.3, §2.6)
 
-/// NO GLASS WORD NAMES 5H, 7D OR LEFT: across every scenario, the row at every room, the title,
-/// the spoken words and the fallback say use (`used`, `≥`, `out`), never `% left`, and never name
-/// the 5-hour or 7-day window by its short word (a 5-hour stop's title says `a 5-hour limit`).
-/// Negative control: a phrase 2 in the words the outlook's verdict had before the glass (case
-/// (a)'s `continuous 7d`, deleted with them in 2026-11-07's review fixes) fails it.
+/// EVERY GLASS PERCENTAGE SAYS WHICH WAY IT RUNS (owner, 2026-11-09: "left everywhere"): across
+/// every scenario, in the row at every room, the title, the spoken words, the fallback and every
+/// chart column's title, a percentage is what is left and says so (`37% left`, `≤30% left`,
+/// `~1% left`, `37 percent left`), but a pace, which is a rate of use and says that (`21% used a
+/// day`). None names the 5-hour or 7-day window by its short word (a 5-hour stop's title says
+/// `a 5-hour limit`). Negative controls: [`Figure::words`] without its word (the glass before
+/// this rule) says a bare `main 63%`; a phrase 2 in the words the outlook's verdict had before
+/// the glass (case (a)'s `continuous 7d`) names a window.
 #[test]
-fn no_glass_word_names_5h_7d_or_left() {
+fn every_glass_percentage_says_which_way_it_runs() {
     for (name, view) in scenarios() {
         for words in every_word(&view) {
             let bad = words
                 .split(|c: char| !c.is_alphanumeric())
-                .find(|w| ["5h", "7d", "left", "weekly"].contains(w));
+                .find(|w| ["5h", "7d", "weekly"].contains(w));
             assert_eq!(bad, None, "{name}: {words}");
+            for sign in ["%", " percent"] {
+                for (at, _) in words.match_indices(sign) {
+                    let after = &words[at + sign.len()..];
+                    assert!(
+                        after.starts_with(" left") || after.starts_with(" used a day"),
+                        "{name}: a bare percentage in {words:?}"
+                    );
+                }
+            }
         }
     }
 }
 
-/// NO INFERRED 100: a wall says `out` and no figure, though its reading said 97%, and the
-/// footer's own figure of 97% (a reading, never `out`) does not override a wall standing now;
-/// a curve that reaches 99.5% or more by the reset, short of a fill, says `~99%`; an unread
-/// account the worst case assumes full is `?`, and no word of any scenario says `100`, a chart
-/// column's title included. Negative controls: the tail rounded half up without the cap
-/// (`(x10 + 5) / 10`) says `~100%` for case (b) under a lead of 64%; `own` taken over the row's
-/// figure whatever it is says `main 97%` on a walled tab; a hand-off's title saying the fill it
-/// leaves by `whole_spoken` (as S5b did) says `the work moves from alt2 (100%) to main`.
+/// NO INFERRED ZERO LEFT: a wall says `out` and no figure, though its reading said 97% used, and
+/// the footer's own figure of 97% (a reading, never `out`) does not override a wall standing
+/// now; a curve that reaches 99.5% used or more by the reset, short of a fill, says `~1% left`;
+/// an unread account the worst case assumes full is `?`, and no word of any scenario says `0%
+/// left`, a chart column's title included. Negative controls: the tail rounded half up without
+/// the cap (`(x10 + 5) / 10`) says `~0% left` for case (b) under a lead of 64%; `own` taken over
+/// the row's figure whatever it is says `main 3% left` on a walled tab; a hand-off's title
+/// saying what the fill it leaves has left by [`crate::harness::left::exact`] says `the work
+/// moves from alt2 (0% left) to main`.
 #[test]
-fn no_inferred_100() {
+fn no_inferred_zero_left() {
     let wall = walled().outlook().quota("main", None, true);
     assert_eq!(wall.tab().unwrap().figure, Figure::Out);
     let line = laid(&wall, 166).unwrap();
@@ -1235,7 +1090,10 @@ fn no_inferred_100() {
     assert_eq!(footer.tab().unwrap().figure, Figure::Out);
     assert!(footer.title.contains("out now"), "{}", footer.title);
     for words in words_now(&footer) {
-        assert!(!words.contains("97"), "{words}");
+        assert!(
+            !words.contains("3% left") && !words.contains("97"),
+            "{words}"
+        );
     }
     let high = case_b()
         .outlook()
@@ -1244,6 +1102,11 @@ fn no_inferred_100() {
     let curve = high.chart.runs[0].at(reset).unwrap();
     assert!((995..1000).contains(&curve), "{curve}");
     assert_eq!(high.tail.own.as_ref().unwrap().by_reset, Some(99));
+    assert!(
+        high.title.contains("~1% left at its reset"),
+        "{}",
+        high.title
+    );
     let worst = worst_case().outlook().quota("me", None, true);
     let pool = worst.named.iter().find(|n| n.label == "pool1").unwrap();
     assert_eq!(pool.figure, Figure::Unread);
@@ -1252,18 +1115,20 @@ fn no_inferred_100() {
         .chain([("high", high), ("wall", wall)])
     {
         for words in every_word(&view) {
-            assert!(
-                !words.contains("100%") && !words.contains("100 percent"),
-                "{name}: {words}"
-            );
+            for zero in ["0% left", "0 percent left"] {
+                let inferred = words
+                    .match_indices(zero)
+                    .any(|(at, _)| !words[..at].ends_with(|c: char| c.is_ascii_digit()));
+                assert!(!inferred, "{name}: {words}");
+            }
         }
     }
 }
 
 /// THE SPOKEN ROW HAS NO DRAWING GLYPH: across every scenario, the words a reader hears carry no
 /// box drawing or block (U+2500–259F), braille (U+2800–28FF) or legacy computing (U+1FB00–1FBFF)
-/// glyph, and none of the row's marks (`→ ↺ ⧗ ≥ ~ $ ?`): instants are said in words, a lower
-/// bound `at least`. Negative control: speaking the tail's phrase 2 (`╳ ~Thu 12 Nov 04:00`)
+/// glyph, and none of the row's marks (`→ ↺ ⧗ ≤ ≥ ~ $ ?`): instants are said in words, a
+/// bound `at most`. Negative control: speaking the tail's phrase 2 (`╳ ~Thu 12 Nov 04:00`)
 /// fails it.
 #[test]
 fn the_spoken_row_has_no_drawing_glyph() {
@@ -1273,7 +1138,7 @@ fn the_spoken_row_has_no_drawing_glyph() {
             ('\u{2500}'..='\u{259f}').contains(c)
                 || ('\u{2800}'..='\u{28ff}').contains(c)
                 || ('\u{1fb00}'..='\u{1fbff}').contains(c)
-                || "\u{2192}\u{21ba}\u{29d7}\u{2265}~$?\u{2026}".contains(*c)
+                || "\u{2192}\u{21ba}\u{29d7}\u{2264}\u{2265}~$?\u{2026}".contains(*c)
         });
         assert_eq!(bad, None, "{name}: {}", view.spoken);
     }
@@ -1715,7 +1580,7 @@ fn a_refused_pace_says_its_short_words_on_the_carriers_tab() {
 /// no step and the future is `┄` until a replay reads the reading, and the tail is empty. With no
 /// `own` the pane is case (d), the first reading's wait. A refusal of another kind is said as
 /// before (`a_refused_pace_says_its_short_words_on_the_carriers_tab`). NEGATIVE CONTROL (run
-/// once, restored): `Words::outdated` always false says `no reading` after `main 63% used`, as
+/// once, restored): `Words::outdated` always false says `no reading` after `main 37% left`, as
 /// the first `lab claude --own` run's first minute showed (§7 step 4).
 #[test]
 fn a_reading_the_replay_has_not_seen_is_not_refused() {
@@ -1733,7 +1598,7 @@ fn a_reading_the_replay_has_not_seen_is_not_refused() {
     for room in [166, 96, 66, 24] {
         let line = laid(&view, room).unwrap_or_else(|| panic!("a rung fits {room}"));
         let text = line.text();
-        assert!(text.starts_with("main 63%"), "at {room}: {text}");
+        assert!(text.starts_with("main 37% left"), "at {room}: {text}");
         assert!(!text.contains(&refused.short()), "at {room}: {text}");
     }
     assert!(!view.title.contains(&refused.words()), "{}", view.title);
@@ -1793,9 +1658,9 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
 /// never finer, and a name laid as its email's local part is never laid whole in a narrower room;
 /// (5) no rung is finer than 12 cells a day. Each case is laid with its rows named by their roster
 /// labels and again by emails (§2.5). The design's mocks hold their rungs at
-/// 166, 96 and 66 cells in each case's own test (`case_a_lays_r1_r3_r6`, `case_b_lays_r2_r5_r7`,
+/// 166, 96 and 66 cells in each case's own test (`case_a_lays_r1_r3_r6`, `case_b_lays_r2_r6_r8`,
 /// `case_c_lays_r2_r5_r7`, `case_d_lays_its_words_full_then_short`). Negative control: a T2 that
-/// keeps phrase 1 over phrase 2 drops case (b)'s stop from 77 cells down (invariant 2).
+/// keeps phrase 1 over phrase 2 drops case (b)'s stop from 82 cells down (invariant 2).
 #[test]
 fn the_quota_ladder_keeps_its_invariants() {
     for (name, view) in scenarios().into_iter().chain(emailed_scenarios()) {
@@ -1822,7 +1687,6 @@ fn the_quota_ladder_keeps_its_invariants() {
                 assert!(name_forms(tab).contains(&lead), "{name} at {room}: {lead}");
             } else {
                 let mut body = lead.as_str();
-                body = body.strip_suffix(" used").unwrap_or(body);
                 if let Some((head, n)) = body.rsplit_once(" +")
                     && n.chars().all(|c| c.is_ascii_digit())
                 {
@@ -1878,17 +1742,17 @@ fn the_quota_ladder_keeps_its_invariants() {
     }
 }
 
-/// CASE (C) LAYS R2, R5 AND R7 (§1.3 (c), §2.4) at 166, 96 and 66 cells, R2 by one cell: its 30
-/// lead cells, 65 chart cells at 8 a day and 36 tail cells take 135 with the two gaps, and R1's
-/// 97 chart cells take 167. R2's T0 says phrase 1 in its short words, because main is full
-/// before its reset (§2.3): the rotation leaves it at its low mark ~Fri 08:00, comes back to it
-/// once alt1 is low too and alt2 is out (~Sat 02:00), and it fills ~Sat 04:00, so no run of main
-/// holds its reset. Every account is out once the three weeks' 25 + 20 + 10 points are
-/// spent at 36% a day, 36 h 40 min from now (Sat 05:40), said `~Sat 05:00` at the hour's grain
-/// of a start a day or more ahead (§3.2). Negative controls: R2 laid with T1, as R3 is, says
-/// `↺ Sat 10:00 · ╳ ~Sat 05:00` at 166 cells under the same lead at 8 cells a day; phrase 1 read
-/// off main's curve where the work first leaves it (97.5%) says the design's first mock's
-/// `~98% by ↺ Sat 10:00`.
+/// CASE (C) LAYS R2, R5 AND R7 (§1.3 (c), §2.4) at 166, 96 and 66 cells: R2's 45 lead cells
+/// (`main 25% left · alt1 20% left · alt2 10% left`), 65 chart cells at 8 a day and 36 tail cells
+/// take 150 with the two gaps, and R1's 97 chart cells take 182. R2's T0 says phrase 1 in its
+/// short words, because main is out before its reset (§2.3): the rotation leaves it at its low
+/// mark ~Fri 08:00, comes back to it once alt1 is low too and alt2 is out (~Sat 02:00), and it
+/// fills ~Sat 04:00, so no run of main holds its reset. Every account is out once the three
+/// weeks' 25 + 20 + 10 points left are spent at 36% used a day, 36 h 40 min from now (Sat
+/// 05:40), said `~Sat 05:00` at the hour's grain of a start a day or more ahead (§3.2).
+/// Negative controls: R2 laid with T1, as R3 is, says `↺ Sat 10:00 · ╳ ~Sat 05:00` at 166 cells
+/// under the same lead at 8 cells a day; phrase 1 read off main's curve where the work first
+/// leaves it (97.5% used) says the design's first mock's `~2% left at ↺ Sat 10:00`.
 #[test]
 fn case_c_lays_r2_r5_r7() {
     let view = case_c().outlook().quota("main", None, true);
@@ -1897,12 +1761,12 @@ fn case_c_lays_r2_r5_r7() {
     let rungs = [
         (
             166,
-            "main 75% \u{b7} alt1 80% \u{b7} alt2 90%",
+            "main 25% left \u{b7} alt1 20% left \u{b7} alt2 10% left",
             8,
             format!("{reset} \u{b7} {stop}\u{2013}Sat 10:00"),
         ),
-        (96, "main 75% +2", 6, format!("{reset} \u{b7} {stop}")),
-        (66, "main 75% +2", 4, stop.to_owned()),
+        (96, "main 25% left +2", 6, format!("{reset} \u{b7} {stop}")),
+        (66, "main 25% left +2", 4, stop.to_owned()),
     ];
     for (room, lead, per_day, tail) in rungs {
         let line = laid(&view, room).unwrap();
@@ -1916,8 +1780,8 @@ fn case_c_lays_r2_r5_r7() {
             "at {room}"
         );
     }
-    assert_eq!(laid(&view, 166).unwrap().cells.len(), 135);
-    assert_eq!(laid(&view, 167).unwrap().per_day, 12);
+    assert_eq!(laid(&view, 181).unwrap().cells.len(), 150);
+    assert_eq!(laid(&view, 182).unwrap().per_day, 12);
     let main: Vec<_> = view
         .chart
         .runs
@@ -1968,61 +1832,56 @@ fn lays_the_mocks(view: &QuotaView, mocks: &[Mock]) {
 }
 
 /// CASE (A) LAYS R1, R3 AND R6 (§1.3 (a), §2.4) at 166, 96 and 66 cells, each row cell for cell
-/// as the design draws it: R1, the widest rung, takes 133 cells; at 96, R3 takes 93 and R2's
-/// T0 would take 101; at 66, R6 takes 56 and R5's 6 cells a day would take 72 (with no phrase 2,
-/// R6's T1 and R7's T2 say the same `↺ Sat 10:00`). Read on this Mac at 30% a day ago, 35% at
-/// Thu 05:00 and 40% now, main runs at 10% a day: the past is `▂` (30%) until the cell that ends
-/// at Thu 05:00, then `▃` (35% and 40%). The fill is held in tenths, rounded down, so where it
-/// meets a half level on a cell's end (Fri 02:00 and Sat 08:00 at 8 cells a day, each of the next
-/// week's steps at 12) the cell keeps the level below. Main's week holds 40 + 41 h × 10/24 =
-/// 57.08% at its reset Sat 10:00, said `~57%`; its next week, from 0 then, holds 52.9% at the
-/// chart's end, and nothing stops. Negative controls, each of which the ladder's checks of lead,
-/// chart grain and tail at the three widths pass: a rung that must leave a cell spare (`<` for
-/// `<=` in [`QuotaView::lay`]) lays R2 at 133 cells; the eighths truncated ([`level`] without its
-/// half) draw R1's past `▂▂▂▂▂▂▂▂▂▂▂▃`.
+/// as the design draws it: R1, the widest rung, takes 138 cells; at 96, R3 takes 93 and R2's
+/// T0 would take 106; at 66, R6 takes 61 and R5's 6 cells a day would take 77 (with no phrase 2,
+/// R6's T1 and R7's T2 say the same `↺ Sat 10:00`). The chart drains as a battery does: read on
+/// this Mac at 30% used a day ago, 35% at Thu 05:00 and 40% now, main has `▇` (70% left) until
+/// the cell that ends at Thu 05:00, then `▆` (65% and 60%), and runs at 10% used a day. The fill
+/// is held in tenths, rounded down, so where it meets a half level on a cell's end the cell keeps
+/// the level the use rounds to. Main's week holds 40 + 41 h × 10/24 = 57.08% used at its reset
+/// Sat 10:00, said `~43% left`; its next week, from a full `▔` then, holds 52.9% used at the
+/// chart's end, and nothing stops. With one account the lead says its word at every rung
+/// (`main 60% left`), which only the room for the chart and the tail narrows. Negative controls,
+/// each of which the ladder's checks of lead, chart grain and tail at the three widths pass: a
+/// rung that must leave a cell spare (`<` for `<=` in [`QuotaView::lay`]) lays R2 at 138 cells;
+/// the eighths truncated ([`level`] without its half) draw R1's past with one `▇` more.
 #[test]
 fn case_a_lays_r1_r3_r6() {
     let view = case_a().outlook().quota("main", None, true);
     let mocks: [Mock; 3] = [
         (
             166,
-            "main 40% used",
+            "main 60% left",
             12,
-            "~57% by ↺ Sat 10:00",
-            "main 40% used  ▂▂▂▂▂▃▃▃▃▃▃▃▕🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭸↺▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁\
-             🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹  ~57% by ↺ Sat 10:00",
+            "~43% left at ↺ Sat 10:00",
+            "main 60% left  ▇▇▇▇▇▆▆▆▆▆▆▆▕🭷🭷🭷🭷🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭹↺▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸  ~43% left at ↺ Sat 10:00",
         ),
         (
             96,
-            "main 40% used",
+            "main 60% left",
             8,
             "↺ Sat 10:00",
-            "main 40% used  ▂▂▂▃▃▃▃▃▕🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹↺▁▁▁▁▁▁▁▁▁▁▁▁▁▁🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻\
-             🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹  ↺ Sat 10:00",
+            "main 60% left  ▇▇▇▆▆▆▆▆▕🭷🭷🭷🭸🭸🭸🭸🭸🭸🭸🭸🭸🭸↺▔▔▔▔▔▔▔▔▔▔▔▔▔▔🭶🭶🭶🭶🭶🭶🭶🭶🭶🭶🭷🭷🭷🭷🭷🭷🭷🭷🭷🭷🭸🭸🭸🭸🭸🭸🭸🭸  ↺ Sat 10:00",
         ),
         (
             66,
-            "main 40%",
+            "main 60% left",
             4,
             "↺ Sat 10:00",
-            "main 40%  ▂▃▃▃▕🭺🭹🭹🭹🭹🭹↺▁▁▁▁▁▁▁🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭹🭹🭹🭹  ↺ Sat 10:00",
+            "main 60% left  ▇▆▆▆▕🭷🭸🭸🭸🭸🭸↺▔▔▔▔▔▔▔🭶🭶🭶🭶🭶🭷🭷🭷🭷🭷🭸🭸🭸🭸  ↺ Sat 10:00",
         ),
     ];
     lays_the_mocks(&view, &mocks);
-    let (r1, r2, r3, r5, r6) = (
-        ("main 40% used", 12, "~57% by ↺ Sat 10:00"),
-        ("main 40% used", 8, "~57% by ↺ Sat 10:00"),
-        ("main 40% used", 8, "↺ Sat 10:00"),
-        ("main 40%", 6, "↺ Sat 10:00"),
-        ("main 40%", 4, "↺ Sat 10:00"),
-    );
-    for (room, (lead, k, tail)) in [
-        (133, r1),
-        (132, r2),
-        (101, r2),
-        (100, r3),
-        (72, r5),
-        (71, r6),
+    let lead = "main 60% left";
+    let full = "~43% left at \u{21ba} Sat 10:00";
+    let short = "\u{21ba} Sat 10:00";
+    for (room, k, tail) in [
+        (138, 12, full),
+        (137, 8, full),
+        (106, 8, full),
+        (105, 8, short),
+        (77, 6, short),
+        (76, 4, short),
     ] {
         assert_eq!(
             rung_at(&view, room),
@@ -2061,52 +1920,53 @@ fn case_a_lays_r1_r3_r6() {
     assert!(view.chart.stops.is_empty() && view.tail.verdict.is_none());
 }
 
-/// CASE (B) LAYS R2, R5 AND R7 (§1.3 (b), §2.4) at 166, 96 and 66 cells, each row cell for cell
-/// as the design draws it, with the midnights' ticks under R2's: R2 takes 140 cells and R1's 12
-/// a day would take 172; R5 takes 94 and R4's full lead 99; R7 takes 64 and R6's T1 78. Read on
-/// this Mac at 42% a day ago, 50% from Wed 23:00 and 63% now, main runs at 21% a day (8.75
-/// tenths an hour; the replay takes each instant to the second up). Its week reaches its low
-/// mark (98%, from 97.5% half up) at Sat 08:26, which moves nothing with no other account, and
-/// holds 98.875% at its reset Sat 10:00, said `~99%` (whole percent half up, at most 99: §2.1,
-/// §2.3). Its next week, from 0 then, reaches its low mark at Thu 12 Nov 01:26 and is out at
-/// 04:17, 4 d 18 h 17 min after the reset, said `~Thu 12 Nov 04:00` at the hour's grain of a
-/// start a day or more ahead (§3.2), until its reset Sat 14 Nov 10:00, past the chart's end. At 8
-/// cells a day the fill lands 43 min before the end of its 3-hour cell, which the stop covers
-/// less than half of, so the cell is the line at a projected fill, `▔` (§2.2), and the 4 cells
-/// after it are `╳`. [`QuotaView::sample`], which other crates' tests draw, says the same words.
-/// Negative controls, each of which the ladder's checks of lead, chart grain and tail at the
-/// three widths pass: a rung that must leave a cell spare (`<` for `<=` in [`QuotaView::lay`])
-/// lays R2 at 172 cells; the eighths truncated ([`level`] without its half) draw R2's future
-/// `🭸🭸🭸🭸🭷…`; the sample's first words (`~98%`, `~Thu 12 Nov 05:00`) fail its pin.
+/// CASE (B) LAYS R2, R6 AND R8 (§1.3 (b), §2.4) at 166, 96 and 66 cells, each row cell for cell
+/// as the design draws it, with the midnights' ticks under R2's: R2 takes 144 cells and R1's 12
+/// a day would take 176; R6 takes 83 and R5's 6 a day 99; R8 takes 61 and R7's 4 a day 69. With
+/// one account the lead says `main 37% left` at every rung. Read on this Mac at 42% used a day
+/// ago, 50% from Wed 23:00 and 63% now, main has 58%, 50% and 37% left, and runs at 21% used a
+/// day (8.75 tenths an hour; the replay takes each instant to the second up). Its week reaches
+/// its low mark (98% used, from 97.5% half up) at Sat 08:26, which moves nothing with no other
+/// account, and holds 98.875% used at its reset Sat 10:00, said `~1% left` (100 less the whole
+/// percent used, half up, at least 1: §2.1, §2.3). Its next week, from full then, reaches its
+/// low mark at Thu 12 Nov 01:26 and is out at 04:17, 4 d 18 h 17 min after the reset, said `~Thu
+/// 12 Nov 04:00` at the hour's grain of a start a day or more ahead (§3.2), until its reset Sat
+/// 14 Nov 10:00, past the chart's end. At 8 cells a day the fill lands 43 min before the end of
+/// its 3-hour cell, which the stop covers less than half of, so the cell is the line at a
+/// projected fill, `▁` (§2.2), and the 4 cells after it are `╳`. [`QuotaView::sample`], which
+/// other crates' tests draw, says the same words. Negative controls, each of which the ladder's
+/// checks of lead, chart grain and tail at the three widths pass: a rung that must leave a cell
+/// spare (`<` for `<=` in [`QuotaView::lay`]) lays R2 at 176 cells; the eighths truncated
+/// ([`level`] without its half) draw R2's future a step higher; the sample's first words
+/// (`~2% left`, `~Thu 12 Nov 05:00`) fail its pin.
 #[test]
-fn case_b_lays_r2_r5_r7() {
+fn case_b_lays_r2_r6_r8() {
     let view = case_b().outlook().quota("main", None, true);
-    let full = "~99% by ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00";
-    let short = "↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00";
-    let stop = "╳ ~Thu 12 Nov 04:00";
+    let full =
+        "~1% left at \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00";
+    let short = "\u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00";
+    let stop = "\u{2573} ~Thu 12 Nov 04:00";
     let mocks: [Mock; 3] = [
         (
             166,
-            "main 63% used",
+            "main 37% left",
             8,
-            full,
-            "main 63% used  ▃▄▄▄▄▄▄▅▕🭸🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶🭶🭶↺▁▁▁▁▁▁🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭸🭸🭸🭸\
-             🭷🭷🭷🭷🭷🭶🭶🭶🭶🭶🭶🭶▔╳╳╳╳  ~99% by ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00",
+            "~1% left at ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00",
+            "main 37% left  ▆▅▅▅▅▅▅▄▕🭹🭹🭺🭺🭺🭺🭻🭻🭻🭻🭻🭻🭻↺▔▔▔▔▔▔🭶🭶🭶🭶🭶🭷🭷🭷🭷🭷🭸🭸🭸🭸🭸🭹🭹🭹🭹🭺🭺🭺🭺🭺🭻🭻🭻🭻🭻🭻🭻▁╳╳╳╳  ~1% left at ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00",
         ),
         (
             96,
-            "main 63%",
-            6,
-            short,
-            "main 63%  ▃▄▄▄▄▅▕🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶↺▁▁▁▁🭻🭻🭻🭻🭺🭺🭺🭹🭹🭹🭹🭸🭸🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶▔╳╳╳  \
-             ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00",
+            "main 37% left",
+            4,
+            "↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00",
+            "main 37% left  ▅▅▅▄▕🭹🭺🭺🭻🭻🭻↺▔▔▔🭶🭶🭷🭷🭷🭸🭸🭹🭹🭺🭺🭺🭻🭻🭻▁╳╳  ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00",
         ),
         (
             66,
-            "main 63%",
-            4,
-            stop,
-            "main 63%  ▄▄▄▅▕🭸🭷🭷🭶🭶🭶↺▁▁▁🭻🭻🭺🭺🭺🭹🭹🭸🭸🭷🭷🭷🭶🭶🭶▔╳╳  ╳ ~Thu 12 Nov 04:00",
+            "main 37% left",
+            3,
+            "╳ ~Thu 12 Nov 04:00",
+            "main 37% left  ▅▅▄▕🭺🭺🭻🭻🭻↺▔🭶🭶🭷🭷🭸🭸🭹🭺🭺🭻🭻🭻╳╳  ╳ ~Thu 12 Nov 04:00",
         ),
     ];
     lays_the_mocks(&view, &mocks);
@@ -2118,22 +1978,30 @@ fn case_b_lays_r2_r5_r7() {
     let utc = Offsets::fixed(0);
     assert_eq!(
         view.column_title(8, 1, &utc).as_deref(),
-        Some("Wed 4 Nov 20:00–23:00 · main 50% (read on this Mac)")
+        Some("Wed 4 Nov 20:00\u{2013}23:00 \u{b7} main 50% left (read on this Mac)")
     );
     assert_eq!(
         view.column_title(8, 9 + 39, &utc).as_deref(),
-        Some("~Tue 10 Nov 14:00–17:00 · main ~69% (projected)")
+        Some("~Tue 10 Nov 14:00\u{2013}17:00 \u{b7} main ~31% left (projected)")
     );
-    let s = |lead: &str, k: u8, tail: &str| (lead.to_owned(), k, tail.to_owned());
-    for (room, rung) in [
-        (172, s("main 63% used", 12, full)),
-        (171, s("main 63% used", 8, full)),
-        (99, s("main 63% used", 6, short)),
-        (98, s("main 63%", 6, short)),
-        (78, s("main 63%", 4, short)),
-        (77, s("main 63%", 4, stop)),
+    let lead = "main 37% left";
+    for (room, k, tail) in [
+        (176, 12, full),
+        (175, 8, full),
+        (144, 8, full),
+        (143, 8, short),
+        (99, 6, short),
+        (98, 4, short),
+        (83, 4, short),
+        (82, 4, stop),
+        (69, 4, stop),
+        (68, 3, stop),
     ] {
-        assert_eq!(rung_at(&view, room), rung, "at {room}");
+        assert_eq!(
+            rung_at(&view, room),
+            (lead.to_owned(), k, tail.to_owned()),
+            "at {room}"
+        );
     }
     // `x10` tenths at 21% a day, to the second up.
     let at_pace = |x10: i64| (x10 * D + 209) / 210;
@@ -2275,7 +2143,6 @@ fn a_paused_recovery_shows_no_forecast() {
             assert_eq!(own.by_reset, None);
             assert!(!view.title.contains("pace") && !view.title.contains(" out ~"));
             assert!(!view.spoken.contains("Next 7 days"), "{}", view.spoken);
-            assert!(view.lanes.iter().all(|l| l.ahead.is_empty()));
         }
         facts.account_progress_busy = false;
         for phase in [ProgressPhase::Unknown, ProgressPhase::Disabled] {
@@ -2325,7 +2192,7 @@ fn a_chart_column_names_its_instant() {
             .map(|(.., t)| t.as_str())
             .collect::<Vec<_>>()
     };
-    // Case (b) at 12 a day: the oldest past cell, Wed 4 Nov 17:00–19:00, holds 42%.
+    // Case (b) at 12 a day: the oldest past cell, Wed 4 Nov 17:00–19:00, holds 42% used.
     let past: Vec<_> = seen
         .iter()
         .filter(|(n, p, c, _)| *n == "b" && *p == 12 && matches!(c, Cell::Read(_)))
@@ -2333,7 +2200,7 @@ fn a_chart_column_names_its_instant() {
         .collect();
     assert_eq!(
         past[0],
-        "Wed 4 Nov 17:00\u{2013}19:00 \u{b7} main 42% (read on this Mac)"
+        "Wed 4 Nov 17:00\u{2013}19:00 \u{b7} main 58% left (read on this Mac)"
     );
     assert_eq!(
         at("b", 12, Cell::Reset),
@@ -2346,12 +2213,18 @@ fn a_chart_column_names_its_instant() {
             && t.starts_with("from ~Thu 12 Nov ")),
         "{gaps:?}"
     );
-    // Case (c): the hand-offs, each with the account the work leaves and its fill.
+    // Case (c): the hand-offs, each with the account the work leaves and what it has left.
     let moves = at("c", 12, Cell::Handoff);
     assert!(moves.len() >= 2, "{moves:?}");
-    assert!(moves[0].contains("the work moves from main (") && moves[0].ends_with(") to alt1"));
-    assert!(moves[1].contains("the work moves from alt1 (") && moves[1].ends_with(") to alt2"));
-    // A move off an account the projection fills says `out`, never 100% (§2.1); the move at
+    assert!(
+        moves[0].contains("the work moves from main (2% left) to alt1"),
+        "{moves:?}"
+    );
+    assert!(
+        moves[1].contains("the work moves from alt1 (2% left) to alt2"),
+        "{moves:?}"
+    );
+    // A move off an account the projection fills says `out`, never `0% left` (§2.1); the move at
     // main's reset, where the wall lifts, says that reset exactly (§2.3), as the gap does.
     assert!(moves.iter().any(|t| t.contains(" (out) to ")), "{moves:?}");
     assert!(
@@ -2372,7 +2245,7 @@ fn a_chart_column_names_its_instant() {
     assert!(
         ahead
             .iter()
-            .all(|t| t.starts_with('~') && t.ends_with("(projected)")),
+            .all(|t| t.starts_with('~') && t.ends_with("% left (projected)")),
         "{ahead:?}"
     );
 }
@@ -2448,9 +2321,9 @@ fn a_scenes_tap_words_are_the_taps_own_for_its_case() {
     assert_eq!(
         said,
         [
-            ("a", "week 40% used \u{b7} resets Sat 10:00".to_owned()),
-            ("b", "week 63% used \u{b7} resets Sat 10:00".to_owned()),
-            ("c", "week 75% used \u{b7} resets Sat 10:00".to_owned()),
+            ("a", "week 60% left \u{b7} resets Sat 10:00".to_owned()),
+            ("b", "week 37% left \u{b7} resets Sat 10:00".to_owned()),
+            ("c", "week 25% left \u{b7} resets Sat 10:00".to_owned()),
             ("d", NO_WEEK.to_owned()),
         ]
     );
@@ -2464,5 +2337,5 @@ fn a_scenes_tap_words_are_the_taps_own_for_its_case() {
     let mut moved = case_b();
     moved.read("main", None, Some((640, SAT7)), T5);
     let view = moved.outlook().quota("main", None, true);
-    assert_eq!(tap_words(&view), "week 64% used \u{b7} resets Sat 10:00");
+    assert_eq!(tap_words(&view), "week 36% left \u{b7} resets Sat 10:00");
 }

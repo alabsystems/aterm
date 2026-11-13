@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
+#![cfg_attr(
+    all(anchor_rules, unix, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 
 //! The single PTY spawn and IO seam.
 

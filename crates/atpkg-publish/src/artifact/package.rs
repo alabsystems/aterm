@@ -42,8 +42,10 @@ pub struct Package {
     pub version: String,
     /// The source commit (40 hex).
     pub source: String,
-    /// The `<count>` of the version.
-    pub count: u64,
+    /// A development version's history count. Regular releases bind to committed VERSION.
+    pub count: Option<u64>,
+    /// Upstream baseline recorded independently of a regular product version.
+    pub baseline: Option<String>,
     /// The compiler it was built with.
     pub compiler: CompilerRecord,
     /// The upstream base its record names (`atpkg::alab::upstream_of`): none for a package from before the field, or one whose field is malformed.
@@ -168,7 +170,8 @@ pub fn dev_version(version: &str) -> Option<(u64, &str)> {
 /// and any other forbids, and its `upstream.release`, which must be that baseline's tag when
 /// the record has one. One package names one baseline.
 fn baseline_agrees(version: &str, build: &aterm_json::Value, bj: &str) -> Result<()> {
-    let named = atpkg::alab::AlabVersion::parse(version).and_then(|v| v.baseline_text);
+    let parsed = atpkg::alab::AlabVersion::parse(version);
+    let named = parsed.and_then(|v| v.baseline_text);
     let recorded = build
         .get("baseline")
         .map(|value| value.as_str().filter(|s| !s.is_empty()))
@@ -176,6 +179,20 @@ fn baseline_agrees(version: &str, build: &aterm_json::Value, bj: &str) -> Result
             text.ok_or_else(|| Error::refused(format!("{bj}'s `baseline` is not a version string")))
         })
         .transpose()?;
+    // Regular releases keep provenance in the build record, independently of numbering.
+    let named = if parsed.is_some_and(|v| v.dev.is_none()) && named.is_none() {
+        let baseline = recorded.ok_or_else(|| {
+            Error::refused("a regular release requires a recorded upstream baseline")
+        })?;
+        atpkg::alab::AlabVersion::parse(baseline)
+            .filter(|v| v.dev.is_none() && v.baseline.is_none())
+            .ok_or_else(|| {
+                Error::refused("a regular release's baseline must be MAJOR.MINOR.PATCH")
+            })?;
+        Some(baseline)
+    } else {
+        named
+    };
     match (named, recorded) {
         (None, None) => Ok(()),
         (Some(named), None) => Err(Error::refused(format!(
@@ -212,7 +229,9 @@ fn is_commit(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Read and check the package at `dir` for `program` on `triple`: an ALab package by the client's marker whose entrypoint is `bin/<tool>`, both records for `triple` and naming one dev-form version whose sha is the recorded source commit's, and a full compiler record.
+/// Read and check an ALab package's executable layout, target, matching product
+/// versions, explicit regular-release update owner (or development source suffix),
+/// upstream baseline and complete compiler record. Source ancestry is checked separately.
 /// # Errors
 /// A refusal naming the first thing that does not hold.
 pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
@@ -261,19 +280,28 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
             "{bj}'s source `{source}` is not a full commit sha"
         )));
     }
-    let Some((count, sha9)) = dev_version(&version) else {
+    let count = if let Some((count, sha9)) = dev_version(&version) {
+        if !source.starts_with(sha9) {
+            return Err(Error::refused(format!(
+                "version {version} names commit {sha9}, but {bj} records source {source}"
+            )));
+        }
+        Some(count)
+    } else if atpkg::alab::AlabVersion::parse(&version)
+        .is_some_and(|v| v.dev.is_none() && v.baseline.is_none())
+    {
+        if build.get("updater").and_then(aterm_json::Value::as_str) != Some("atpkg") {
+            return Err(Error::refused(format!(
+                "regular release version {version} must explicitly name updater `atpkg`"
+            )));
+        }
+        None
+    } else {
         return Err(Error::refused(format!(
-            "version {version} is not MAJOR.MINOR.0-dev.<count>+g<sha9> (or codex-alab's \
-             compound MAJOR.MINOR.0-dev.<count>+codex.<A.B.C>.g<sha9>): a bare stable version \
-             arms the vendor's own updater, and the dev form is what keeps it off"
+            "version {version} is not MAJOR.MINOR.0-dev.<count>+g<sha9> or a regular release"
         )));
     };
     baseline_agrees(&version, &build, bj)?;
-    if !source.starts_with(sha9) {
-        return Err(Error::refused(format!(
-            "version {version} names commit {sha9}, but {bj} records source {source}"
-        )));
-    }
     let c = build
         .get("compiler")
         .ok_or_else(|| Error::refused(format!("{bj} records no compiler")))?;
@@ -290,6 +318,10 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
         version,
         source,
         count,
+        baseline: build
+            .get("baseline")
+            .and_then(aterm_json::Value::as_str)
+            .map(str::to_owned),
         compiler,
         upstream,
     })
@@ -429,7 +461,10 @@ pub fn check_on_main(
     Ok(())
 }
 
-/// The package's source commit is on `main` of `owner/repo` as `host` serves it, and `repo_dir`'s `origin` is `owner/repo` ([`check_on_main`]), and the version's `<count>` is that commit's `git rev-list --count`.
+/// Bind the package to a freshly observed remote main and immutable source objects.
+/// Development counts must match history; regular versions and baselines must match
+/// committed VERSION and the source ledger. Ambient Git redirects and replacements
+/// cannot substitute these objects; concurrent releases use independent fetch refs.
 /// # Errors
 /// A refusal naming what does not hold.
 pub fn check_source(
@@ -439,20 +474,78 @@ pub fn check_source(
     repo: &str,
     pkg: &Package,
 ) -> Result<()> {
-    check_on_main(
-        host,
-        repo_dir,
-        owner,
-        repo,
-        "the package's source",
-        &pkg.source,
-    )?;
-    let count = crate::git::rev_count(repo_dir, &pkg.source)?;
-    if count != pkg.count {
-        return Err(Error::refused(format!(
-            "version {} says <count> {}, but {} is commit {count} of its history",
-            pkg.version, pkg.count, pkg.source
-        )));
+    let (source, main) = crate::git::main_of_record(host, repo_dir, &Slug::new(owner, repo))?;
+    source.query(&["merge-base", "--is-ancestor", &pkg.source, &main])
+        .map_err(|_| Error::refused(format!("the package's source {} is not on {owner}/{repo} main as the host serves it ({main})", pkg.source)))?;
+    match pkg.count {
+        Some(expected) => {
+            if source
+                .query(&["rev-parse", "--is-shallow-repository"])?
+                .trim()
+                != "false"
+            {
+                return Err(Error::refused(
+                    "development history counts require a full source clone",
+                ));
+            }
+            let count: u64 = source
+                .query(&["rev-list", "--count", &pkg.source])?
+                .trim()
+                .parse()
+                .map_err(|_| Error::refused("source history count is not a number"))?;
+            if count != expected {
+                return Err(Error::refused(format!(
+                    "version {} says <count> {expected}, but {} is commit {count} of its history",
+                    pkg.version, pkg.source
+                )));
+            }
+        }
+        None => {
+            for path in ["VERSION", "alab/versions.toml"] {
+                if !source
+                    .query(&["ls-tree", &pkg.source, "--", path])?
+                    .starts_with("100644 blob ")
+                {
+                    return Err(Error::refused(format!(
+                        "source {path} must be a committed regular file"
+                    )));
+                }
+            }
+            let object = format!("{}:VERSION", pkg.source);
+            let version = source.query(&["cat-file", "blob", &object])?;
+            if version.trim() != pkg.version {
+                return Err(Error::refused(format!(
+                    "release version {} differs from source VERSION {}",
+                    pkg.version,
+                    version.trim()
+                )));
+            }
+            let object = format!("{}:alab/versions.toml", pkg.source);
+            let text = source.query(&["cat-file", "blob", &object])?;
+            let ledger: aterm_toml::Value = aterm_toml::from_str(&text)
+                .map_err(|error| Error::refused(format!("source release ledger: {error}")))?;
+            let rows = ledger
+                .get("release")
+                .and_then(aterm_toml::Value::as_array)
+                .ok_or_else(|| Error::refused("source records no release ledger"))?;
+            let matching: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    row.get("version").and_then(aterm_toml::Value::as_str)
+                        == Some(pkg.version.as_str())
+                })
+                .collect();
+            if matching.len() != 1
+                || matching[0]
+                    .get("baseline")
+                    .and_then(aterm_toml::Value::as_str)
+                    != pkg.baseline.as_deref()
+            {
+                return Err(Error::refused(
+                    "regular release baseline differs from its committed ledger",
+                ));
+            }
+        }
     }
     Ok(())
 }

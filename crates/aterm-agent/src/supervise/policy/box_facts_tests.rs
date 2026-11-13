@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::*;
+use crate::supervise::policy::PriorityWord;
 use crate::supervise::policy::claude_settings::AskKind;
 use crate::supervise::policy::probe::LiveProbe;
 use crate::supervise::run::WorkerSource;
@@ -48,8 +49,8 @@ fn every_fact() -> BoxFacts {
         screen_rows: 40,
         question: Some(QuestionFacts {
             answer: true,
-            priority: QuestionPriority::LongTerm,
-            own: Some(QuestionPriority::ShortTerm),
+            priority: QuestionPriority::Word(PriorityWord::LongTerm),
+            own: Some(QuestionPriority::Word(PriorityWord::ShortTerm)),
             fell_back: true,
             person: true,
         }),
@@ -214,8 +215,14 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert!(!ctx.limit_reset, "passed over at this mount");
     assert!(!ctx.usage_credits, "no fact turns it on");
     assert!(ctx.answer_questions, "the session's word answers");
-    assert_eq!(ctx.question_priority, QuestionPriority::LongTerm);
-    assert_eq!(ctx.question_own, Some(QuestionPriority::ShortTerm));
+    assert_eq!(
+        ctx.question_priority,
+        QuestionPriority::Word(PriorityWord::LongTerm)
+    );
+    assert_eq!(
+        ctx.question_own,
+        Some(QuestionPriority::Word(PriorityWord::ShortTerm))
+    );
     assert!(ctx.question_fell_back);
     assert!(ctx.question_person);
     assert_eq!(ctx.python_allow, vec!["x*.py".to_string()]);

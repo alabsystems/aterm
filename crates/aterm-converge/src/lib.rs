@@ -20,8 +20,8 @@ pub use model::{
     Remedy, Report, ReportMode, Requires, SCHEMA, StoodAside, millis,
 };
 pub use scope::{
-    NOT_AT_CONSOLE, Scope, held_back, left_as_is, left_to_another, not_own_account, select,
-    selects, standing_aside,
+    NOT_AT_CONSOLE, Scope, held_back, left_as_is, left_to_another, not_own_account, put_off,
+    select, selects, standing_aside,
 };
 use std::sync::Arc;
 

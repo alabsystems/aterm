@@ -213,6 +213,8 @@ mod linux_xwire;
 mod local_signins;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod machine_labels;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod tables_page;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod local_signins {
     pub fn cmd(_: &[String]) -> crate::Res {
@@ -410,6 +412,8 @@ mod trail_contrast;
 #[cfg(target_os = "macos")]
 mod trail_diff;
 #[cfg(target_os = "macos")]
+mod trail_film;
+#[cfg(target_os = "macos")]
 mod trail_gallery;
 #[cfg(target_os = "macos")]
 mod trail_hue;
@@ -417,6 +421,8 @@ mod trail_hue;
 mod trail_keys;
 #[cfg(target_os = "macos")]
 mod trail_replay;
+#[cfg(target_os = "macos")]
+mod trail_scenes;
 #[cfg(target_os = "macos")]
 mod tripwire;
 #[cfg(target_os = "macos")]
@@ -559,11 +565,13 @@ usage: targo --unverified lab <command> [tag] [args]
   kimi [tag] [-e K=V]... [--no-wait] [-- kimi args]
                                  launch Kimi Code in tab 1 with a scratch HOME and KIMI_CODE_HOME whose config.toml names
                                  one openai-type provider at the stub's Chat Completions routes and the lab's fake key
-  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
-                                 the accounts outlook's footer at three widths and Accounts card at 60 and 44 cells, one
+  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJKLM] [--look day|night|both] [--scale 1|2|both]
+                                 the accounts outlook's footer at three widths and Account card at 60 and 44 cells, one
                                  headless instance per scene, look and scale, seeded with synthetic identities only; I, J
                                  and K: line E's quota row over the fixture's usage-tap statusLine, under Cruise; the card
-                                 of A, B, C and J (case (c), Cruise: hand-offs, gap and out lines beside the ticks)
+                                 of A, B, C, E, H and J (case (c), Cruise: the one whose Forecast row holds a projection),
+                                 and of L (a login outside the pool, at home on another Mac) and M (a pool account with a
+                                 vault token), each with a pool file and a scratch vault served on loopback
   outlook-perf --main ATERM --out DIR [--aterm ATERM] [--pairs N]
                                  the outlook against another build on scene A: paired typing and idle takes, and the
                                  resolver's own read and replay cost
@@ -871,6 +879,9 @@ Outside any lab (no jail, no stub):
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
                                  a passing run's record goes to docs/measured/)
+  tables-page [--out DIR] [ATERM]
+                                 the Tables page on a private instance with a scratch registry: frames of
+                                 its read, a conflict, staged edits and their write (debug lab image)
   machine-labels                  two private members: rename onto a sheet number, merge its rows, and check fleet,
                                  membership, --host and survey (debug lab image; no system-name writes)
   swarm rotate [--aterm PATH] [--keep]
@@ -976,6 +987,12 @@ Outside any lab (no jail, no stub):
   trail-hue <path>... [--min-px N] [--max N] [--list all|hits]
                                  the hue rulings: Fire's pixels never green, Sparkle's in the gold family, each gallery
                                  frame read against its clean twin (`--help` for details)
+  trail-film <out_dir> [style] [--theme NAME,...|both] [--caret NAME,...|both] [--scene NAME,...|--all-scenes]
+             [--no-replay] [--report-only] | --list
+                                 a cursor trail judged in motion: each scene replayed with no window, every 16 ms frame
+                                 kept, and read against three laws: no pixel flashes over 3 times a second (WCAG 2.3.1),
+                                 letters 4.5:1 and the caret 3:1, the pet off letters and caret with no blink and no
+                                 pose under 100 ms (`--help` for details)
   trail-diff [--base REF|merge-base] [--control same|plant|dark-arm] [--keep] [--jobs N] [SCRIPT.trail|DIR]...
                                  Prism Glass's dark proof: build aterm-gui's trail_dump here and in a worktree of the base
                                  (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
@@ -1024,7 +1041,7 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
-                   [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--window-only
+                   [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only
                     |--capacity-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --terminals-only:
@@ -1032,7 +1049,9 @@ Outside any lab (no jail, no stub):
                                  (a stalled call's no-progress fact riding one continuation), about 7 min, not yet in
                                  the default run; --upgrade-only: one live handoff;
                                  --raw-upgrade-only: started through the produced primary with its managed entry
-                                 absent, automatic crash repair, then a live handoff; --window-only: the window
+                                 absent, automatic crash repair, then a live handoff; --restart-only: an explicit restart
+                                 after recent person input, preserving its conversation and selected executable;
+                                 --window-only: the window
                                  pass, four tabs' chip lines, pads, state lines, hovers, This Mac and menu rows, judged by
                                  what the package's build tells, then END's idle window with Settings ▸ Harness open and
                                  shut; the default run leaves it out; --capacity-only: the full proof's last leg alone,
@@ -1270,6 +1289,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "fleet-sim" => fleet_sim::cmd(args),
         #[cfg(debug_assertions)]
         "machine-labels" => machine_labels::cmd(args),
+        #[cfg(debug_assertions)]
+        "tables-page" => tables_page::cmd(args),
         "service-acceptance" => service_acceptance::cmd(args),
         "artifact-serve" => artifact_serve::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),
@@ -1362,6 +1383,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-census" => trail_census::cmd_trail_census(args),
         "trail-companion" => trail_companion::cmd_trail_companion(args),
         "trail-hue" => trail_hue::cmd_trail_hue(args),
+        "trail-film" => trail_film::cmd_trail_film(args),
         "trail-keys" => trail_keys::cmd_trail_keys(args),
         "trail-replay" => trail_replay::cmd(args),
         "first-key" => first_key::cmd_first_key(args),
@@ -1557,6 +1579,7 @@ fn main() -> std::process::ExitCode {
                                 | "trail-census"
                                 | "trail-companion"
                                 | "trail-hue"
+                                | "trail-film"
                                 | "abrew-admission"
                                 | "build-admit"
                                 | "recording-cpu"
@@ -1668,27 +1691,5 @@ impl AsRef<std::path::Path> for TestScratch {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_verb_with_no_help_of_its_own_answers_help_with_its_usage() {
-        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
-        let refused = Fail::usage("instance: unexpected '--help'");
-        let usage = help_instead("instance", &words(&["--help"]), &refused).expect("its usage");
-        assert!(usage.starts_with("  instance [--window]"), "{usage}");
-        assert!(usage.contains("[-- PROGRAM ARGS]") && usage.contains("--scene band-icons"));
-        assert!(!usage.contains("abrew-admission"), "{usage}");
-        assert!(help_instead("instance", &words(&["-h", "--keep"]), &refused).is_some());
-        for (rest, fail) in [
-            (words(&["--", "/bin/sh", "--help"]), Fail::usage("x")),
-            (words(&["--keep"]), Fail::usage("x")),
-            (words(&["--help"]), Fail::die("x")),
-        ] {
-            assert_eq!(help_instead("instance", &rest, &fail), None, "{rest:?}");
-        }
-        let send = verb_usage("send").expect("turn|send|enter|key");
-        assert!(send.starts_with("  turn|send|enter|key"), "{send}");
-        assert_eq!(verb_usage("no-such-verb"), None);
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;

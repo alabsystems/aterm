@@ -14,8 +14,9 @@ use crate::devtools_helper::{
     test_arms,
 };
 use crate::permission_walk::{
-    GRANT_POLL, REOPEN_MARKER, Started, Subject, UNREAD_WAIT, Walk, WalkLane, WalkReach,
-    leave_reopen_in, take_reopen_in,
+    AutomationAsked, GRANT_POLL, KeptPage, START_KEYS_QUIET, START_PRESENT_WITHIN, Started,
+    Subject, UNREAD_WAIT, WALK_AGAIN, Walk, WalkLane, WalkReach, automation_asked_in,
+    keep_automation_ask_in, keep_pages_in, left_pages_in,
 };
 use aterm_containment::DevToolGrant;
 use aterm_containment::consent::FdaState;
@@ -37,7 +38,15 @@ thread_local! {
     static SETTINGS_ASKS: Cell<bool> = const { Cell::new(false) };
     /// Whether a quit nobody cancelled is asked of this process (Quit & Reopen's).
     static QUIT_ASKED: Cell<bool> = const { Cell::new(false) };
+    /// Whether the person quit System Settings, as the panel's arm reads it running.
+    static SETTINGS_QUIT: Cell<bool> = const { Cell::new(false) };
+    /// The walk record's clock, in unix seconds: it outlives each App a test makes, as the
+    /// Mac's does.
+    static CLOCK: Cell<u64> = const { Cell::new(CLOCK_AT) };
 }
+
+/// The unix second [`CLOCK`] starts at.
+const CLOCK_AT: u64 = 1_800_000_000;
 
 fn bump(cell: &'static std::thread::LocalKey<Cell<u32>>) {
     cell.with(|n| n.set(n.get() + 1));
@@ -54,8 +63,8 @@ fn panel_counts() -> (u32, u32, u32) {
 
 /// A panel whose show, turn and close are counted; System Settings runs but is not in front, so
 /// the panel reads no list of its own (the tests post each reading), shows a window over its
-/// main one while [`SETTINGS_ASKS`] says so, and reads a quit asked of this process while
-/// [`QUIT_ASKED`] does, as the walk's reach does.
+/// main one while [`SETTINGS_ASKS`] says so, runs until [`SETTINGS_QUIT`] says it quit, and
+/// reads a quit asked of this process while [`QUIT_ASKED`] does, as the walk's reach does.
 fn counting_arm() -> DevToolsHelperArm {
     let mut arm = test_arms::asking(
         test_arms::counted(
@@ -70,15 +79,16 @@ fn counting_arm() -> DevToolsHelperArm {
         || SETTINGS_ASKS.with(Cell::get),
     );
     arm.quit_asked = || QUIT_ASKED.with(Cell::get);
+    arm.settings_running = || !SETTINGS_QUIT.with(Cell::get);
     arm
 }
 
 /// The walk's reach: Accessibility's grant as the test sets it, an Automation ask that is
 /// counted and stays out until the test answers it, the Accessibility page's Not now kept in
 /// [`AX_DECLINED`] (held for its span, its reads counted), a quit asked while [`QUIT_ASKED`]
-/// says so, and the Quit & Reopen marker left in and taken from the real `<state>` folder
-/// [`STATE`] names, as the live arms keep it, for [`BUNDLE`] on [`THIS_MAC`] at the clock's
-/// second (none while no folder is named).
+/// says so, and the walk record kept in and read from the real `<state>` folder [`STATE`]
+/// names, as the live arms keep it, for [`BUNDLE`] on [`THIS_MAC`] (none while no folder is
+/// named), by [`CLOCK`].
 fn walk_reach() -> WalkReach {
     WalkReach {
         ax_trusted: || AX_TRUSTED.with(Cell::get),
@@ -96,26 +106,49 @@ fn walk_reach() -> WalkReach {
             AX_DECLINED.with(|key| *key.borrow_mut() = Some(noted.to_owned()))
         },
         quit_asked: || QUIT_ASKED.with(Cell::get),
-        leave_reopen: |pages| {
-            if let (Some(state), Some(at)) = (state(), aterm_time::unix_secs()) {
-                leave_reopen_in(
+        keep_pages: |revision, pages| {
+            if let Some(state) = state() {
+                keep_pages_in(
                     &state,
-                    at,
-                    pages,
                     std::path::Path::new(BUNDLE),
                     THIS_MAC.with(Cell::get),
+                    revision,
+                    pages,
                 )
-                .expect("the reopen marker");
+                .expect("the walk record");
             }
         },
-        take_reopen: || {
-            take_reopen_in(
+        left_pages: |revision| {
+            state().map_or_else(Vec::new, |state| {
+                left_pages_in(
+                    &state,
+                    std::path::Path::new(BUNDLE),
+                    THIS_MAC.with(Cell::get),
+                    revision,
+                )
+            })
+        },
+        keep_automation_ask: |revision, asked| {
+            if let Some(state) = state() {
+                keep_automation_ask_in(
+                    &state,
+                    std::path::Path::new(BUNDLE),
+                    THIS_MAC.with(Cell::get),
+                    revision,
+                    asked,
+                )
+                .expect("the walk record");
+            }
+        },
+        automation_asked: |revision| {
+            automation_asked_in(
                 &state()?,
-                aterm_time::unix_secs()?,
-                Some(std::path::Path::new(BUNDLE)),
-                Some(THIS_MAC.with(Cell::get)),
+                std::path::Path::new(BUNDLE),
+                THIS_MAC.with(Cell::get),
+                revision,
             )
         },
+        unix_now: || Some(CLOCK.with(Cell::get)),
     }
 }
 
@@ -175,6 +208,7 @@ fn walk_app_with_parts(
     AUTOMATION_OUT.with(|out| out.set(false));
     SETTINGS_ASKS.with(|asks| asks.set(false));
     QUIT_ASKED.with(|asked| asked.set(false));
+    SETTINGS_QUIT.with(|quit| quit.set(false));
     RECORDS.with(|records| records.borrow_mut().clear());
     let mut app = new_mac(devtools, fda);
     // A walk page is a person's stage: its time and its grant reads count while they are at the
@@ -1436,6 +1470,7 @@ fn a_verb_that_joins_the_first_launch_walk_leaves_its_not_now_going_on() {
     app.permission_walk.start(
         Walk::new(vec![Subject::FullDiskAccess, Subject::DeveloperTools], t0).expect("two pages"),
         "first launch",
+        app.access_revision(),
     );
     app.drive_permission_walk(t0);
     assert_eq!(
@@ -1738,31 +1773,77 @@ const MAC_A: &str = "1D683F62-5C4B-4E3A-9F21-7B8C6D5E4A30";
 /// The pages of a first launch's walk.
 const LEFT: [Subject; 2] = [Subject::FullDiskAccess, Subject::DeveloperTools];
 
-/// A walk under way when System Settings' Quit & Reopen ends the process leaves its pages, from
-/// the one it is at on, in `<state>`'s reopen marker for the aterm that opens again: at Full
-/// Disk Access's done words, which wait under macOS's sheet
-/// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1), both;
-/// once it turned to Developer Tools, that page alone. NEGATIVE CONTROL: a person's
-/// quit (or a logout's) leaves nothing, and neither does a Quit & Reopen with no walk under way.
-#[test]
-fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
+/// Point [`STATE`] at a scratch `<state>`: the walk record lives there, as the live arms keep
+/// it, and outlives each App a test makes, as a relaunch's `<state>` does.
+fn scratch_state() -> aterm_tempfile::TempDir {
     let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
     STATE.with(|cell| *cell.borrow_mut() = Some(dir.path().to_path_buf()));
-    let marker = dir.path().join(REOPEN_MARKER);
-    let taken = || {
-        take_reopen_in(
-            dir.path(),
-            aterm_time::unix_secs().expect("the clock"),
-            Some(std::path::Path::new(BUNDLE)),
-            Some(MAC_A),
-        )
-    };
+    dir
+}
+
+/// The pages the walk record in `state` keeps for the tests' aterm under revision 1, with the
+/// walks in a row that left each unanswered.
+fn kept_tries(state: &std::path::Path) -> Vec<(Subject, u32)> {
+    left_pages_in(state, std::path::Path::new(BUNDLE), MAC_A, 1)
+        .into_iter()
+        .map(|page| (page.subject, page.tries))
+        .collect()
+}
+
+/// [`kept_tries`]' pages alone.
+fn kept_pages(state: &std::path::Path) -> Vec<Subject> {
+    kept_tries(state)
+        .into_iter()
+        .map(|(subject, _)| subject)
+        .collect()
+}
+
+/// Keep `pages`, none left unanswered, in `state`'s walk record for the tests' aterm under
+/// revision 1.
+fn keep_fresh(state: &std::path::Path, pages: &[Subject]) {
+    let pages: Vec<KeptPage> = pages.iter().copied().map(KeptPage::new).collect();
+    keep_pages_in(state, std::path::Path::new(BUNDLE), MAC_A, 1, &pages).expect("a line");
+}
+
+/// The subjects of the walk under way.
+fn walking(app: &App) -> Option<Vec<Subject>> {
+    app.permission_walk
+        .walk()
+        .map(|walk| walk.subjects().to_vec())
+}
+
+/// A later process on a Mac whose Full Disk Access page came up before (`App::fresh_mac` reads
+/// it), started cold or as an update's successor.
+fn later_process(cold: bool) -> App {
+    let mut app = walk_app_with_fda(
+        test_arms::opening(),
+        test_arms::fda_marking(|key| Some((key.to_owned(), 1)), |_| {}),
+    );
+    if cold {
+        app.devtools_helper.note_cold_start();
+    } else {
+        app.permission_walk.note_successor();
+    }
+    app
+}
+
+/// The walk record follows the walk under way from page to page, so whatever ends the process
+/// leaves the pages it has still to show, the one it is at first: both at Full Disk Access's
+/// done words, which wait under macOS's Quit & Reopen sheet
+/// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1), Developer
+/// Tools alone once the panel turned to it; the close box, the person's answer, takes its line
+/// away. NEGATIVE CONTROL: a walk while no revision stands keeps nothing, and leaves the line
+/// an earlier walk kept.
+#[test]
+fn the_walk_record_follows_the_walk_from_page_to_page() {
+    let dir = scratch_state();
     let t0 = Instant::now();
     let mut app = walk_app();
     assert_eq!(
         app.start_permission_walk(&[], "first launch", t0),
         walking_over(&LEFT)
     );
+    assert_eq!(kept_pages(dir.path()), LEFT, "as it starts");
     let granted = t0 + GRANT_POLL;
     grant_fda(&mut app);
     SETTINGS_ASKS.with(|asks| asks.set(true));
@@ -1773,11 +1854,7 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
         Some((Page::FullDiskAccess, Some((1, 2)))),
         "the done words wait under the sheet"
     );
-
-    app.leave_walk_at_quit(false);
-    assert!(!marker.exists(), "a person's quit leaves nothing");
-    app.leave_walk_at_quit(true);
-    assert_eq!(taken(), Some(LEFT.to_vec()), "Quit & Reopen at the sheet");
+    assert_eq!(kept_pages(dir.path()), LEFT, "at the sheet");
 
     SETTINGS_ASKS.with(|asks| asks.set(false));
     app.tick_consent_lanes(granted + DONE_FOR + GRANT_POLL);
@@ -1785,17 +1862,628 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
         page_and_step(&app),
         Some((Page::DeveloperTools, Some((2, 2))))
     );
-    app.leave_walk_at_quit(true);
     assert_eq!(
-        taken(),
-        Some(vec![Subject::DeveloperTools]),
-        "Quit & Reopen at Developer Tools"
+        kept_pages(dir.path()),
+        [Subject::DeveloperTools],
+        "at Developer Tools"
     );
+    app.devtools_helper.press_for_test(PanelEvent::CloseBox);
+    app.tick_consent_lanes(granted + DONE_FOR + GRANT_POLL * 2);
+    assert!(!app.permission_walk.active(), "the close box ends it");
+    assert!(kept_pages(dir.path()).is_empty(), "and its line goes");
 
-    let idle = walk_app();
-    idle.leave_walk_at_quit(true);
-    assert!(!marker.exists(), "no walk under way");
+    keep_fresh(dir.path(), &LEFT);
+    let mut unapproved = walk_app();
+    unapproved.observe_initial_setup_permissions(None);
+    assert_eq!(unapproved.access_revision(), None);
+    assert_eq!(
+        unapproved.start_permission_walk(&[], "a test", t0),
+        walking_over(&LEFT)
+    );
+    unapproved
+        .devtools_helper
+        .press_for_test(PanelEvent::CloseBox);
+    unapproved.tick_consent_lanes(t0 + GRANT_POLL);
+    assert!(!unapproved.permission_walk.active());
+    assert_eq!(kept_pages(dir.path()), LEFT, "no revision: nothing kept");
     STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// An update's Commit ends the predecessor mid-walk with nothing of the quit path run
+/// (`seamless::commit_and_exit`, `clean_exit_now`): its first walk, which started by itself,
+/// kept the pages it had still to show as it started, so the successor
+/// (`WalkLane::note_successor`), on a Mac whose Full Disk Access page came up before
+/// (`App::fresh_mac` false), walks on from them by itself, its Full Disk Access page step 1 of 2
+/// again. A crash, a logout or a person's quit and the cold launch after it do the same.
+/// NEGATIVE CONTROLS: a predecessor whose walk ended by the close box, or that walked nothing,
+/// leaves the successor nothing to walk; a successor that reads each kept page's grant on
+/// starts none, and the line goes.
+#[test]
+fn an_update_commit_mid_walk_leaves_the_successor_its_pages() {
+    fn predecessor(t0: Instant) -> App {
+        let mut app = walk_app();
+        app.devtools_helper.note_cold_start();
+        app.tick_permission_walk(t0);
+        assert_eq!(
+            walking(&app),
+            Some(LEFT.to_vec()),
+            "the first walk starts by itself"
+        );
+        assert_eq!(
+            page_and_step(&app),
+            Some((Page::FullDiskAccess, Some((1, 2))))
+        );
+        app
+    }
+    let dir = scratch_state();
+    let t0 = Instant::now();
+    let t1 = t0 + START_KEYS_QUIET;
+    for cold in [false, true] {
+        drop(predecessor(t0));
+        assert_eq!(kept_pages(dir.path()), LEFT, "kept as it started");
+        let mut app = later_process(cold);
+        let fda_opens = test_arms::fda_counts().0;
+        app.tick_permission_walk(t1);
+        assert_eq!(walking(&app), Some(LEFT.to_vec()), "cold {cold}: walks on");
+        assert_eq!(
+            test_arms::fda_counts().0,
+            fda_opens + 1,
+            "its page comes up again"
+        );
+        assert_eq!(
+            page_and_step(&app),
+            Some((Page::FullDiskAccess, Some((1, 2))))
+        );
+        app.devtools_helper.press_for_test(PanelEvent::CloseBox);
+        app.tick_consent_lanes(t1 + GRANT_POLL);
+        assert!(!app.permission_walk.active(), "the close box ends it");
+        assert!(kept_pages(dir.path()).is_empty(), "the line goes");
+        let mut after = later_process(cold);
+        after.tick_permission_walk(t1);
+        assert!(
+            !after.permission_walk.active(),
+            "cold {cold}: nothing to walk on from after the close box"
+        );
+    }
+
+    let mut idle = walk_app();
+    idle.tick_permission_walk(t0);
+    assert!(!idle.permission_walk.active(), "a lane that starts none");
+    drop(idle);
+    let mut app = later_process(false);
+    app.tick_permission_walk(t1);
+    assert!(!app.permission_walk.active(), "nothing was walked");
+
+    drop(predecessor(t0));
+    let mut app = later_process(false);
+    grant_fda(&mut app);
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+        t1,
+    );
+    app.tick_permission_walk(t1);
+    assert!(!app.permission_walk.active(), "every kept page reads held");
+    assert!(kept_pages(dir.path()).is_empty(), "so the line goes");
+    STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// An install of Apple's tools under way outside this launch's own tab (Apple's installer
+/// window, aterm's root half, another installer; or an earlier aterm's tab adopted) holds the
+/// walk that would start by itself: Full Disk Access switched on brings macOS's Quit & Reopen,
+/// whose quit hangs an adopted tab up mid-install, so its next try would ask for the password
+/// again, and System Settings in front takes the keyboard from the installer (the review found
+/// the first walk opened its Full Disk Access page beside it). NEGATIVE CONTROL: once the window
+/// reads no installer up, the first walk starts, its Full Disk Access page first.
+#[test]
+fn no_walk_starts_by_itself_while_an_install_of_the_tools_runs() {
+    use crate::clt_install::Reading;
+    let t0 = Instant::now();
+    for (n, up) in [
+        Reading {
+            apple_window: true,
+            ..Reading::default()
+        },
+        Reading {
+            placeholder: true,
+            install_process: true,
+            ..Reading::default()
+        },
+        Reading {
+            placeholder: true,
+            live_run: true,
+            ..Reading::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _dir = scratch_state();
+        let mut app = walk_app();
+        app.devtools_helper.note_cold_start();
+        app.workstation_setup.developer_tools_seen = Some(up);
+        let fda_opens = test_arms::fda_counts().0;
+        app.tick_permission_walk(t0);
+        assert!(
+            !app.permission_walk.active(),
+            "{n}: no walk beside the install"
+        );
+        assert_eq!(
+            test_arms::fda_counts().0,
+            fda_opens,
+            "{n}: no Full Disk Access page beside it"
+        );
+        app.workstation_setup.developer_tools_seen = Some(Reading::default());
+        app.tick_permission_walk(t0 + START_KEYS_QUIET);
+        assert_eq!(
+            walking(&app),
+            Some(LEFT.to_vec()),
+            "{n}: its end lets the walk go"
+        );
+        assert_eq!(test_arms::fda_counts().0, fda_opens + 1, "{n}");
+        STATE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// While a quit is asked of this process (its barriers still running) the walk page's ten
+/// minutes stand still, as while the person is away: a going process lapses no page, so the
+/// walk record keeps it for the process after this one. NEGATIVE CONTROL: with no quit asked
+/// the same twenty minutes lapse the page: the record keeps the page after it, for the next walk
+/// to take up, and the page that lapsed leaves it, the person's to give from System State.
+#[test]
+fn a_quit_asked_of_this_process_stands_the_walks_page_time() {
+    for quit in [true, false] {
+        let dir = scratch_state();
+        let t0 = Instant::now();
+        let mut app = walk_app();
+        assert_eq!(
+            app.start_permission_walk(&[], "a test", t0),
+            walking_over(&LEFT)
+        );
+        QUIT_ASKED.with(|asked| asked.set(quit));
+        let step = Duration::from_secs(30);
+        let mut now = t0 + step;
+        while now < t0 + PANEL_FOR * 2 {
+            app.tick_consent_lanes(now);
+            now += step;
+        }
+        if quit {
+            assert!(
+                app.permission_walk.active(),
+                "a going process lapses no page"
+            );
+            assert_eq!(
+                page_and_step(&app),
+                Some((Page::FullDiskAccess, Some((1, 2))))
+            );
+            assert_eq!(kept_pages(dir.path()), LEFT);
+        } else {
+            assert!(!app.permission_walk.active(), "the page lapsed");
+            assert_eq!(
+                kept_tries(dir.path()),
+                [(Subject::DeveloperTools, 0)],
+                "the page after it stays kept as it was, the one the person left goes"
+            );
+        }
+        QUIT_ASKED.with(|asked| asked.set(false));
+        STATE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// The person quits System Settings under the walk's page: once its grace is past the panel reads
+/// it gone (`Closed::SettingsGone`) and the walk hears it, by `shown` plus a minute at most.
+fn quit_settings(app: &mut App, shown: Instant) {
+    SETTINGS_QUIT.with(|quit| quit.set(true));
+    let mut now = shown;
+    while app.permission_walk.active() && now < shown + Duration::from_secs(60) {
+        now += crate::devtools_helper::PANEL_TICK;
+        app.tick_consent_lanes(now);
+    }
+    SETTINGS_QUIT.with(|quit| quit.set(false));
+}
+
+/// A day, in seconds: [`WALK_AGAIN`]'s first pause.
+const DAY: u64 = 86_400;
+
+/// System Settings quit under the walk's page is the person leaving it: the walk ends, as by the
+/// close box, its pages leave the walk record, and no later process brings them up by itself,
+/// whatever time passes (the review found such pages came back a day on, then every two, four,
+/// up to thirty days, for good: a nag). They stay the person's to give from System State.
+/// NEGATIVE CONTROL: a walk that stops because aterm could not show its page (its panel gone)
+/// keeps its pages, each counting that walk, so they come back by themselves on
+/// [`WALK_AGAIN`]'s schedule.
+#[test]
+fn a_walk_the_person_left_by_quitting_system_settings_never_comes_back_by_itself() {
+    use Subject::{DeveloperTools, FullDiskAccess};
+    assert_eq!(WALK_AGAIN.after(1), Duration::from_secs(DAY));
+    let dir = scratch_state();
+    CLOCK.with(|clock| clock.set(CLOCK_AT));
+    let t0 = Instant::now();
+    let mut first = walk_app();
+    first.devtools_helper.note_cold_start();
+    first.tick_permission_walk(t0);
+    assert_eq!(walking(&first), Some(LEFT.to_vec()), "the first walk");
+    quit_settings(&mut first, t0);
+    assert!(!first.permission_walk.active(), "it ends");
+    assert!(kept_pages(dir.path()).is_empty(), "its line goes");
+    first.tick_permission_walk(t0 + Duration::from_secs(120));
+    assert!(!first.permission_walk.active(), "not again in its process");
+    drop(first);
+    for days in [1, 3, 400] {
+        CLOCK.with(|clock| clock.set(CLOCK_AT + days * DAY));
+        let mut later = later_process(true);
+        later.tick_permission_walk(t0);
+        assert!(
+            !later.permission_walk.active(),
+            "{days} days on, nothing comes back by itself"
+        );
+    }
+
+    CLOCK.with(|clock| clock.set(CLOCK_AT));
+    let mut failed = walk_app();
+    failed.devtools_helper.note_cold_start();
+    failed.tick_permission_walk(t0);
+    assert_eq!(walking(&failed), Some(LEFT.to_vec()));
+    failed.permission_walk.stop("its panel is gone");
+    assert_eq!(
+        kept_tries(dir.path()),
+        [(FullDiskAccess, 1), (DeveloperTools, 1)],
+        "aterm could not show it: kept for its time"
+    );
+    drop(failed);
+    CLOCK.with(|clock| clock.set(CLOCK_AT + DAY));
+    let mut due = later_process(true);
+    due.tick_permission_walk(t0);
+    assert_eq!(walking(&due), Some(LEFT.to_vec()), "a day on, it walks on");
+    STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The setup run's last status, its plan signing out of Messages (`messages`) or out of nothing,
+/// that reads Accessibility off and Messages signed in.
+fn sign_outs(messages: bool) -> SetupStatus {
+    use aterm_types::macos_setup::Subject as Row;
+    let mut selection = Selection::none();
+    selection.set(Setting::Messages, messages);
+    let mut grant = observed(Row::Access(Access::Accessibility), Standing::NeedsYou, None);
+    grant.now = Some("Off".to_owned());
+    let mut signed_in = observed(Row::Setting(Setting::Messages), Standing::Waiting, None);
+    signed_in.now = Some("Signed in".to_owned());
+    status(selection, vec![grant, signed_in])
+}
+
+/// An Accessibility page the walk record keeps comes back only while the setup run still offers
+/// it: before the run's status is in, the look waits, keeping every page (unread is no answer);
+/// once the run reads the sign-outs needing it, the walk walks on over it, and a kept page whose
+/// grant reads held leaves the record as the walk starts. NEGATIVE CONTROL: a run whose plan
+/// signs out of nothing does not want it, so no walk brings it up and it leaves the record.
+#[test]
+fn a_kept_accessibility_page_waits_for_the_runs_reading_and_leaves_once_unwanted() {
+    use Subject::{Accessibility, FullDiskAccess};
+    /// A later process whose Full Disk Access and Developer Tools read on.
+    fn only_accessibility_missing() -> App {
+        let mut app = later_process(true);
+        grant_fda(&mut app);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            Instant::now(),
+        );
+        app
+    }
+    let dir = scratch_state();
+    CLOCK.with(|clock| clock.set(CLOCK_AT));
+    let t0 = Instant::now();
+    keep_fresh(dir.path(), &[FullDiskAccess, Accessibility]);
+    let mut app = only_accessibility_missing();
+    app.tick_permission_walk(t0);
+    assert!(!app.permission_walk.active(), "the run's reading is not in");
+    assert_eq!(
+        kept_pages(dir.path()),
+        [FullDiskAccess, Accessibility],
+        "kept, unread"
+    );
+    app.publish_system_state(sign_outs(true));
+    app.tick_permission_walk(t0 + GRANT_POLL);
+    assert_eq!(
+        walking(&app),
+        Some(vec![Accessibility]),
+        "the run offers it: walks on"
+    );
+    assert_eq!(
+        kept_pages(dir.path()),
+        [Accessibility],
+        "Full Disk Access reads held: it leaves"
+    );
+    drop(app);
+
+    keep_fresh(dir.path(), &[Accessibility]);
+    let mut unwanted = only_accessibility_missing();
+    unwanted.publish_system_state(sign_outs(false));
+    unwanted.tick_permission_walk(t0);
+    assert!(!unwanted.permission_walk.active(), "no sign-out needs it");
+    assert!(kept_pages(dir.path()).is_empty(), "so it leaves the record");
+    STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// A person's press on another row, its grant read on so it starts no walk of its own, gives the
+/// walk way: the walk's unanswered pages stay in the walk record with no walk counted against
+/// them, for the walk that starts by itself at the next quiet moment. A press is no answer to a
+/// page it never saw. NEGATIVE CONTROL: the close box, the person's answer, takes them away.
+#[test]
+fn a_press_on_another_row_leaves_the_walks_pages_kept() {
+    let dir = scratch_state();
+    let t0 = Instant::now();
+    for answer in [false, true] {
+        let mut app = walk_app_with_arm(test_arms::opening(), counting_arm_in_front());
+        assert_eq!(
+            app.start_permission_walk(&[], "first launch", t0),
+            walking_over(&LEFT)
+        );
+        if answer {
+            app.devtools_helper.press_for_test(PanelEvent::CloseBox);
+            app.tick_consent_lanes(t0 + GRANT_POLL);
+            assert!(kept_pages(dir.path()).is_empty(), "the close box");
+            continue;
+        }
+        AX_TRUSTED.with(|trusted| trusted.set(true));
+        let _ = app.open_access_from_system_state(Access::Accessibility, true);
+        assert!(!app.permission_walk.active(), "the walk gave way");
+        assert_eq!(
+            kept_tries(dir.path()),
+            [(Subject::FullDiskAccess, 0), (Subject::DeveloperTools, 0)],
+            "its pages stay, none counted"
+        );
+    }
+    STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The setup run's reading that the sign-outs need Accessibility (a plan that signs out of
+/// Messages, the grant off) starts a walk over Accessibility alone by itself in a later process
+/// on a Mac whose first walk is past (`App::fresh_mac` reads a page brought up here before),
+/// with no System State tab open: the run's last status says it (`App::system_state_offers`).
+/// Once the access record holds its page handed under the revision, no later process brings it
+/// up by itself again under it (no walk record is kept here: no `<state>` is named, so the
+/// handed line alone decides), and a new revision offers it again. NEGATIVE CONTROLS: a plan
+/// that signs out of nothing, or the grant read on, starts no walk.
+#[test]
+fn accessibility_owed_by_the_run_is_offered_once_in_a_later_process() {
+    /// A later process whose Full Disk Access and Developer Tools read on, whose access record
+    /// is [`RECORDS`] (kept across Apps, as `<state>` is), and whose setup run published
+    /// `sign_outs(messages)`.
+    fn signing_out(messages: bool) -> App {
+        let records = records();
+        let mut app = later_process(true);
+        RECORDS.with(|kept| *kept.borrow_mut() = records);
+        app.access_steps.set_reach(StepsReach {
+            handed: |revision, access| {
+                RECORDS.with(|records| {
+                    records
+                        .borrow()
+                        .contains(&(revision, access, AccessOutcome::Handed))
+                })
+            },
+            recorded: |_, _| Some(AccessOutcome::Handed),
+            frontmost: front,
+            open_pane: crate::system_state_access::live_open_access_pane,
+            ..stepping()
+        });
+        grant_fda(&mut app);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            Instant::now(),
+        );
+        app.publish_system_state(sign_outs(messages));
+        app
+    }
+    let t0 = Instant::now();
+    RECORDS.with(|records| records.borrow_mut().clear());
+    let mut app = signing_out(true);
+    app.tick_permission_walk(t0);
+    assert_eq!(
+        walking(&app),
+        Some(vec![Subject::Accessibility]),
+        "the sign-outs' page, by itself"
+    );
+    assert_eq!(
+        page_and_step(&app).map(|(page, _)| page),
+        Some(Page::Accessibility)
+    );
+    assert!(
+        records().contains(&(1, Access::Accessibility, AccessOutcome::Handed)),
+        "{:?}",
+        records()
+    );
+    drop(app);
+
+    let mut again = signing_out(true);
+    again.tick_permission_walk(t0);
+    assert!(
+        !again.permission_walk.active(),
+        "handed under this revision: no later process brings it up by itself"
+    );
+    approve(&mut again, 2);
+    again.tick_permission_walk(t0 + GRANT_POLL);
+    assert_eq!(
+        walking(&again),
+        Some(vec![Subject::Accessibility]),
+        "a new revision offers it again"
+    );
+    drop(again);
+
+    RECORDS.with(|records| records.borrow_mut().clear());
+    let mut nothing = signing_out(false);
+    nothing.tick_permission_walk(t0);
+    assert!(!nothing.permission_walk.active(), "no sign-out needs it");
+    let mut on = signing_out(true);
+    AX_TRUSTED.with(|trusted| trusted.set(true));
+    on.tick_permission_walk(t0);
+    assert!(!on.permission_walk.active(), "the grant reads on");
+}
+
+/// A plan that signs out of an account, on a Mac whose Accessibility already reads on, has
+/// macOS's Automation question asked by the window at a cold process's first look, with no
+/// sign-out row yet (the sign-outs come last) and ahead of any walk's pages
+/// (`App::look_for_automation_ask`): early and batched. The walk record keeps the ask, so a
+/// relaunch under the same revision asks nothing, and it is asked again only on `WALK_AGAIN`'s
+/// pause, and only while a sign-out still reads the answer missing. The question never goes up
+/// with nobody at the Mac: screen away, or nothing touched within `START_PRESENT_WITHIN`, asks
+/// nothing. Before, the window asked only once a sign-out row waited, late and alone, with no
+/// presence check, and its mark lived in the process alone. NEGATIVE CONTROLS: a plan that signs
+/// out of nothing asks nothing, and a new revision asks again.
+#[test]
+fn macos_automation_question_is_asked_early_with_a_person_there_and_kept_in_the_walk_record() {
+    use aterm_types::macos_setup::StageRow;
+    /// A later process whose Full Disk Access, Developer Tools and Accessibility read on, whose
+    /// plan signs out of Messages (`messages`), and whose setup run's rows say `words`, if any.
+    fn ready(messages: bool, words: Option<&str>) -> App {
+        let mut app = later_process(true);
+        grant_fda(&mut app);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            Instant::now(),
+        );
+        AX_TRUSTED.with(|trusted| trusted.set(true));
+        let mut status = sign_outs(messages);
+        status.rows = words
+            .map(|words| {
+                vec![crate::SetupStatusRow {
+                    name: "Messages signed out (alice)".into(),
+                    status: "waiting".into(),
+                    detail: words.into(),
+                }]
+            })
+            .unwrap_or_default();
+        app.publish_system_state(status);
+        app
+    }
+    let dir = scratch_state();
+    let unanswered = format!(
+        "macOS has had no answer yet to whether aterm may control System Events, which the \
+         sign-out's clicks go through; {}, and aterm looks again by itself",
+        StageRow::AUTOMATION_UNANSWERED
+    );
+    let t0 = Instant::now();
+    let kept = || {
+        automation_asked_in(
+            dir.path(),
+            std::path::Path::new(BUNDLE),
+            THIS_MAC.with(Cell::get),
+            1,
+        )
+    };
+
+    // Nobody there: the screen away, or nothing touched within the walk's own bound (the last
+    // key longer ago than it, though within a longer one), asks nothing.
+    let asks = AUTOMATION_ASKS.with(Cell::get);
+    let mut away = ready(true, None);
+    away.screen_away = || true;
+    away.tick_permission_walk(t0);
+    let mut idle = ready(true, None);
+    idle.user_input_recent = |within| within > START_PRESENT_WITHIN;
+    idle.user_input_readable = || true;
+    idle.tick_permission_walk(t0);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks,
+        "behind a lock, or with nobody touching the Mac, nothing is asked"
+    );
+    assert_eq!(kept(), None, "and nothing is kept");
+    drop((away, idle));
+
+    // An install of Apple's tools under way outside this launch's tab (Apple's installer window,
+    // aterm's root half run elsewhere) holds the question as it holds a walk that would start by
+    // itself: macOS's alert in front would take the keyboard from that install's prompt or
+    // window. With none up, the next look asks (below).
+    let mut installing = ready(true, None);
+    installing.workstation_setup.developer_tools_seen = Some(crate::clt_install::Reading {
+        apple_window: true,
+        ..crate::clt_install::Reading::default()
+    });
+    installing.tick_permission_walk(t0);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks,
+        "nothing asked beside an install of the tools"
+    );
+    assert_eq!(kept(), None, "and nothing kept");
+    drop(installing);
+
+    // A person there, no sign-out row yet: the first look asks, and the record keeps it.
+    let mut app = ready(true, None);
+    app.tick_permission_walk(t0);
+    assert!(
+        !app.permission_walk.active(),
+        "no walk: every grant reads on"
+    );
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 1,
+        "the window asks first"
+    );
+    let first = AutomationAsked {
+        tries: 1,
+        at: CLOCK_AT,
+    };
+    assert_eq!(kept(), Some(first), "the walk record keeps the ask");
+    AUTOMATION_OUT.with(|out| out.set(false));
+    app.tick_permission_walk(t0 + GRANT_POLL);
+    drop(app);
+
+    // A relaunch under the same revision, the sign-out still unanswered: nothing before the pause.
+    let mut relaunch = ready(true, Some(&unanswered));
+    relaunch.tick_permission_walk(t0);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 1,
+        "a relaunch asks no sooner than the process that asked"
+    );
+    // The pause over, and the answer still missing: asked again, once.
+    CLOCK.with(|clock| clock.set(first.due_by(CLOCK_AT)));
+    relaunch.tick_permission_walk(t0 + GRANT_POLL);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 2,
+        "asked again on the walk's pause"
+    );
+    assert_eq!(kept().map(|asked| asked.tries), Some(2));
+    AUTOMATION_OUT.with(|out| out.set(false));
+    relaunch.tick_permission_walk(t0 + 2 * GRANT_POLL);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 2,
+        "and not again before its next pause"
+    );
+    drop(relaunch);
+
+    // The pause over but the sign-out answered (its row no longer waits on it): nothing.
+    let later = kept().unwrap();
+    CLOCK.with(|clock| clock.set(later.due_by(later.at)));
+    let mut answered = ready(true, None);
+    answered.tick_permission_walk(t0);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 2,
+        "an answer is not asked again"
+    );
+    // A new revision asks again by itself.
+    approve(&mut answered, 2);
+    answered.tick_permission_walk(t0 + GRANT_POLL);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks + 3,
+        "a new revision asks again"
+    );
+    drop(answered);
+
+    // NEGATIVE CONTROL: a plan that signs out of nothing asks nothing.
+    AUTOMATION_OUT.with(|out| out.set(false));
+    let asks = AUTOMATION_ASKS.with(Cell::get);
+    let mut nothing = ready(false, Some(&unanswered));
+    nothing.tick_permission_walk(t0);
+    assert_eq!(
+        AUTOMATION_ASKS.with(Cell::get),
+        asks,
+        "none planned, nothing asked"
+    );
+    CLOCK.with(|clock| clock.set(CLOCK_AT));
 }
 
 /// The walk turns one panel from page to page under one generation, so a Developer Tools list

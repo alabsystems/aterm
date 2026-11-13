@@ -663,6 +663,7 @@ pub(super) fn after_exit_onto(
             prior.retried_by(&mut st);
         }
     }
+    st.line_input = super::super::relaunch::restart_input(opts, snap, cause);
     save(opts, &session_key, &st);
     super::super::relaunch::consume_stamp(opts, snap, cause);
     ledger(

@@ -162,16 +162,16 @@ fn a_checked_readings_leg_is_its_remote_and_main_ref() {
 /// A LANDING MERGE'S TRAILERS ARE ITS STATED RECEIPT, FROM A REAL TEMPORARY REPOSITORY (design
 /// B10): a commit on `origin/main` carrying the trailers `verify land` writes records their
 /// judgment on the receipt (the last judged tree, the re-judges, the commit composed onto, the
-/// reds inherited, the seconds summed), and its journal line carries it as `stated=` and reads
-/// back whole. NEGATIVE CONTROLS: a plain commit on main and one whose receipt is malformed
-/// record [`Statement::Missing`] and still have a receipt; the same trailers on a branch pushed
-/// where no main is read record nothing read.
+/// reds inherited, the seconds summed, an interrupted judgment counted in both), and its journal
+/// line carries it as `stated=` and reads back whole. NEGATIVE CONTROLS: a plain commit on main
+/// and one whose receipt is malformed record [`Statement::Missing`] and still have a receipt; the
+/// same trailers on a branch pushed where no main is read record nothing read.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_landing_merges_trailers_are_its_stated_receipt_and_any_other_commit_states_none() {
     use crate::harness::repo_work::tests::{repo, scratch_git};
     use crate::harness::repo_work::{PROBE_LIMIT, probe};
-    use aterm_types::land_trailer::{Checked, Row, Stated};
+    use aterm_types::land_trailer::{Checked, Interrupted, Row, Stated};
 
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let receipt_of = |work: &std::path::Path| {
@@ -203,6 +203,13 @@ fn a_landing_merges_trailers_are_its_stated_receipt_and_any_other_commit_states_
                 secs: 300,
             },
         ],
+        interrupted: vec![Interrupted {
+            tree: id('c'),
+            base: id('f'),
+            tip: id('d'),
+            secs: 60,
+        }],
+        rechecked: Vec::new(),
         composed_onto: Some(id('e')),
         inherited: vec!["-p other --lib -- flaky_case".into()],
     };
@@ -225,16 +232,16 @@ fn a_landing_merges_trailers_are_its_stated_receipt_and_any_other_commit_states_
         landed.statement,
         Statement::Stated(Judgment {
             tree: "cccccccccccc".into(),
-            rejudges: 1,
+            rejudges: 2,
             onto: "eeeeeeeeeeee".into(),
             inherited: 1,
-            secs: 1500,
+            secs: 1560,
         }),
         "{landed:?}"
     );
     let line = landed.line(2);
     assert!(
-        line.contains(" branch=main stated=cccccccccccc/1/eeeeeeeeeeee/1/1500"),
+        line.contains(" branch=main stated=cccccccccccc/2/eeeeeeeeeeee/1/1560"),
         "{line}"
     );
     assert_eq!(LandReceipt::of_line(&line, 3), Some((2, landed)));
@@ -613,5 +620,82 @@ fn the_receipt_says_whether_the_land_check_was_answered() {
         LandReceipt::of_line(&older, 9),
         Some((7, unchecked)),
         "a build before the check wrote no check= and answered none"
+    );
+}
+
+/// A RECHECK IS SEEN THROUGH `onto` AND `secs` ALONE (`docs/DESIGN-landing-economy.md` §2.1): a
+/// landing whose last judgment is a recheck states the recheck's tip as `onto` and adds its
+/// seconds, with the tree, re-judges and inherited items of the judgment it extends, so the
+/// journal's `stated=` word keeps its shape. NEGATIVE CONTROL: a full judgment after the recheck
+/// landed as judged, so `onto` is empty again.
+#[test]
+fn a_recheck_states_its_tip_as_onto_and_no_rejudge() {
+    use aterm_types::land_trailer::{Checked, Rechecked, Row, Stated};
+    let id = |c: char| c.to_string().repeat(40);
+    let rows = |checks: &[&str]| {
+        checks
+            .iter()
+            .map(|check| Row {
+                check: (*check).into(),
+                word: "ok".into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let judged = |tree: char, base: char| Checked {
+        tree: id(tree),
+        rows: rows(&["fmt", "test"]),
+        base: id(base),
+        secs: 1200,
+    };
+    let stated = Stated {
+        checked: vec![judged('a', 'b')],
+        rechecked: vec![Rechecked {
+            tree: id('c'),
+            rows: rows(&["fmt", "census", "export-scan"]),
+            base: id('d'),
+            onto: id('d'),
+            secs: 90,
+            after: 1,
+        }],
+        inherited: vec!["-p other --lib -- flaky_case".into()],
+        ..Stated::default()
+    };
+    assert_eq!(
+        Statement::of_trailers(&stated.trailers()),
+        Statement::Stated(Judgment {
+            tree: "aaaaaaaaaaaa".into(),
+            rejudges: 0,
+            onto: "dddddddddddd".into(),
+            inherited: 1,
+            secs: 1290,
+        })
+    );
+    let without = Stated {
+        rechecked: Vec::new(),
+        ..stated.clone()
+    };
+    assert_eq!(
+        Statement::of_trailers(&without.trailers()),
+        Statement::Stated(Judgment {
+            tree: "aaaaaaaaaaaa".into(),
+            rejudges: 0,
+            onto: String::new(),
+            inherited: 1,
+            secs: 1200,
+        })
+    );
+    let rejudged = Stated {
+        checked: vec![judged('a', 'b'), judged('e', 'f')],
+        ..stated
+    };
+    assert_eq!(
+        Statement::of_trailers(&rejudged.trailers()),
+        Statement::Stated(Judgment {
+            tree: "eeeeeeeeeeee".into(),
+            rejudges: 1,
+            onto: String::new(),
+            inherited: 1,
+            secs: 2490,
+        })
     );
 }

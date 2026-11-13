@@ -78,8 +78,7 @@ fn land_c_journal() -> Vec<(i64, String)> {
 const MAIN_LINE: &str = "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: \
      land.\" description=\"Not landed yet. 1 untracked file. Landing since 11:42, 1 nudge. Last: \
      nudged at 11:46.\" title=\"autopilot: land — not landed yet: 1 untracked file · landing \
-     since 11:42, 1 nudge · last: ⤓ nudged 11:46, ⤓ landing 11:42 · click: off · right-click: \
-     more\"";
+     since 11:42, 1 nudge · last: ⤓ nudged 11:46, ⤓ landing 11:42 · click: off\"";
 
 /// The same chip as §14.3 words it once 3a says the hold: description and title led by the stop
 /// ([`stop_heads`]), the hold's words after it.
@@ -89,13 +88,13 @@ fn said_line() -> String {
         "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\" \
          description=\"{spoken} Not landed yet. 1 untracked file. Landing since 11:42, 1 nudge.\" \
          title=\"{titled} · not landed yet: 1 untracked file · landing since 11:42, 1 nudge · \
-         click: off · right-click: more\""
+         click: off\""
     )
 }
 
-/// A footerless program's line in front (Kimi Code draws no footer): no chip and no title.
+/// A footerless program's line in front (Grok Build draws no footer): no chip and no title.
 const FOOTLESS: &str =
-    "window=2 program=kimi face=- drawn=- why=no-footer spoken=- description=- title=-";
+    "window=2 program=grok face=- drawn=- why=no-footer spoken=- description=- title=-";
 
 /// The hover past the hold, as `b42ae72fc3` drew it and as §14.3 words it.
 const MAIN_HOVER: &str = "driven by aterm (land: not landed yet, 1 untracked file)";
@@ -229,27 +228,27 @@ fn a_held_chip_in_front_must_say_stopped_typing() {
     );
 }
 
-/// Where no chip is drawn (a composer with no footer, as Kimi Code's) the hover says it, every
+/// Where no chip is drawn (a composer with no footer, as Grok Build's) the hover says it, every
 /// read of it past the settle.
 #[test]
 fn where_no_chip_is_drawn_the_hover_says_it() {
     let main = held(Chain::LandC, FOOTLESS, MAIN_HOVER);
-    let v = said(&main, &cx(Chain::LandC, "kimi"), stall(&main));
+    let v = said(&main, &cx(Chain::LandC, "grok"), stall(&main));
     assert!(matches!(v, Verdict::Fail(_)), "{v:?}");
     assert!(
         v.why().contains("the hover \"driven by aterm (land: not"),
         "{v:?}"
     );
     let ok = held(Chain::LandC, FOOTLESS, &said_hover());
-    let v = said(&ok, &cx(Chain::LandC, "kimi"), stall(&ok));
+    let v = said(&ok, &cx(Chain::LandC, "grok"), stall(&ok));
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
     let mut stale = held(Chain::LandC, FOOTLESS, &said_hover());
     stale.window.hover.push(j(HELD_AT + 30_000, MAIN_HOVER));
-    let v = said(&stale, &cx(Chain::LandC, "kimi"), stall(&stale));
+    let v = said(&stale, &cx(Chain::LandC, "grok"), stall(&stale));
     assert!(matches!(v, Verdict::Fail(_)), "the words went stale: {v:?}");
     let mut early = held(Chain::LandC, FOOTLESS, MAIN_HOVER);
     early.window.hover.push(j(HELD_AT + 5_000, &said_hover()));
-    let v = said(&early, &cx(Chain::LandC, "kimi"), stall(&early));
+    let v = said(&early, &cx(Chain::LandC, "grok"), stall(&early));
     assert!(
         matches!(v, Verdict::Pass(_)),
         "the read before the settle is not judged: {v:?}"
@@ -257,7 +256,7 @@ fn where_no_chip_is_drawn_the_hover_says_it() {
     let mut unhovered = held(Chain::LandC, FOOTLESS, &said_hover());
     unhovered.window.hover_reads.clear();
     unhovered.window.hover.truncate(1);
-    let v = said(&unhovered, &cx(Chain::LandC, "kimi"), stall(&unhovered));
+    let v = said(&unhovered, &cx(Chain::LandC, "grok"), stall(&unhovered));
     assert!(matches!(v, Verdict::Unobserved(_)), "{v:?}");
 }
 
@@ -653,7 +652,7 @@ fn lifted_held(line: &str, requests: Option<usize>) -> Seen {
 #[test]
 fn a_lift_with_no_new_reply_fails_the_hold() {
     let footless = lifted_held(FOOTLESS, Some(0));
-    let v = stands(&footless, &cx(Chain::LandC, "kimi"), stall(&footless));
+    let v = stands(&footless, &cx(Chain::LandC, "grok"), stall(&footless));
     assert!(matches!(v, Verdict::Fail(_)), "{v:?}");
     assert!(
         v.why()
@@ -834,7 +833,7 @@ fn an_undrawn_chip_is_unread_never_judged_on_the_hover() {
         );
     }
     let s = held(Chain::LandC, FOOTLESS, &said_hover());
-    let v = said(&s, &cx(Chain::LandC, "kimi"), stall(&s));
+    let v = said(&s, &cx(Chain::LandC, "grok"), stall(&s));
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
 }
 

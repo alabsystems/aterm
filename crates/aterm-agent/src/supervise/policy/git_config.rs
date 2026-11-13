@@ -60,7 +60,10 @@ pub(crate) fn git_reads(
                 seg[run.at..].join(" ")
             ));
         };
-        let relative = target.filter(|t| !t.starts_with(['/', '~']));
+        // On Windows a drive path (`C:/…`) is rooted too: bash there looks it up in no `CDPATH`.
+        let relative = target.filter(|t| {
+            !t.starts_with(['/', '~']) && !(cfg!(windows) && super::approval::rooted(t))
+        });
         if looped && let Some(t) = relative {
             return Err(format!("a git read on a line whose loop repeats `cd {t}`"));
         }
@@ -459,10 +462,43 @@ impl WorkerEnv {
             }
             let candidate = entry.join(name);
             if is_executable(&candidate) {
+                self.xcrun_picks_none(&candidate, worker_writes)?;
                 return Ok(candidate);
             }
         }
         Err("a git read with no git on the worker's PATH".to_string())
+    }
+
+    /// `Err` when `git` is macOS's `/usr/bin/git`, an xcrun shim that runs the git the
+    /// developer directory holds, and the worker's `DEVELOPER_DIR` or `SDKROOT` names one
+    /// that is relative or the worker writes without approval: MEASURED 2026-11-05 on macOS
+    /// 27.0.1, `DEVELOPER_DIR=<dir> /usr/bin/git` runs `<dir>/usr/bin/xcrun` (as
+    /// `/usr/bin/strings` does); `SDKROOT=<dir>` opens `<dir>/SDKSettings.plist` (REASONED: a
+    /// crafted SDK may name its own tools). Checked before the probe runs that git, whatever order
+    /// the policy's checks run in (the shell startup's `$DEVELOPER_DIR` and `$SDKROOT` entries,
+    /// `shell_startup::READER_ENV`, already hold a git line for a person whatever their value).
+    fn xcrun_picks_none(
+        &self,
+        git: &Path,
+        worker_writes: &dyn Fn(&Path) -> bool,
+    ) -> Result<(), String> {
+        if !cfg!(target_os = "macos") || git != Path::new("/usr/bin/git") {
+            return Ok(());
+        }
+        for key in ["DEVELOPER_DIR", "SDKROOT"] {
+            let Some(dir) = self.var(key).filter(|d| !d.is_empty()).map(Path::new) else {
+                continue;
+            };
+            if !dir.is_absolute() || worker_writes(dir) {
+                return Err(format!(
+                    "a git read whose git is the xcrun shim /usr/bin/git and whose worker \
+                     `{key}` is `{}` (a directory the worker writes without approval, or that \
+                     the command's own directory decides: an xcrun put there would run)",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// What a git command run in `dir` by the worker would load.
@@ -501,6 +537,29 @@ impl WorkerEnv {
         relevant: fn(&str) -> bool,
         subject: &str,
     ) -> Result<(), String> {
+        for (source, key, value) in self.settings_vars(launch, subject)? {
+            if relevant(&key) && self.var(&key) != Some(value.as_str()) {
+                return Err(format!(
+                    "{subject} whose Bash tool gets `{key}` from Claude Code's settings \
+                     ({source}), not the environment this check reads"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each variable the `env` of Claude Code's settings for `launch` gives the Bash tool, as
+    /// (its settings file, its name, its value).
+    ///
+    /// # Errors
+    ///
+    /// A settings file that cannot be read, so its `env` is unknown to `subject`.
+    pub fn settings_vars(
+        &self,
+        launch: &Path,
+        subject: &str,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let mut out = Vec::new();
         for (source, settings) in super::claude_settings::parsed(self, launch) {
             let unread = |why: &str| {
                 format!(
@@ -518,15 +577,10 @@ impl WorkerEnv {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
-                if relevant(key) && self.var(key) != Some(value.as_str()) {
-                    return Err(format!(
-                        "{subject} whose Bash tool gets `{key}` from Claude Code's settings \
-                         ({source}), not the environment this check reads"
-                    ));
-                }
+                out.push((source.clone(), key.to_string(), value));
             }
         }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -570,9 +624,14 @@ fn index_entry(entry: &[u8]) -> Option<(bool, bool, &[u8])> {
     ))
 }
 
-fn git_relevant(key: &str) -> bool {
-    matches!(key, "PATH" | "HOME" | "XDG_CONFIG_HOME")
-        || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
+/// Whether the variable `key` changes which git the worker runs or what that git loads, so a
+/// value the probe does not run with (Claude Code's settings', a `.zshenv`'s) makes a git read
+/// unreadable.
+pub(crate) fn git_relevant(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH" | "HOME" | "XDG_CONFIG_HOME" | "DEVELOPER_DIR" | "SDKROOT"
+    ) || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
 }
 
 struct Probe<'a> {
@@ -783,7 +842,7 @@ impl Probe<'_> {
                 aterm_uds::deadline::OUTPUT_KEEP,
                 move |value| {
                     field += 1;
-                    if field % 3 != 0
+                    if !field.is_multiple_of(3)
                         || matches!(value, b"unspecified" | b"unset" | b"set" | b"")
                         || seen.iter().any(|d| d == value)
                     {

@@ -11,7 +11,8 @@ use super::{Page, Section, para, row};
 pub(crate) const PAGE: Page = Page {
     usage: &[
         row(
-            "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>]",
+            "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
+             [why=<one line>] [req=<id>]",
             "a new tab (or, with split=, a pane of the focused one), addressable at once",
         ),
         row(
@@ -52,6 +53,20 @@ pub(crate) const PAGE: Page = Page {
         ),
         row("theme=<name>", "a session theme, as `theme session` sets"),
         row(
+            "why=<one line>",
+            "what it is for: visible text, at most 200 characters and 256 bytes encoded (a space or \
+             a non-ASCII byte takes 3), no quote; its tab's open keeps it whole as `why_text=` \
+             (`log kinds=tab`); a fleet drive's plain shell must give one",
+        ),
+        row(
+            "req=<id>",
+            "join the request an earlier spawn's reply named (`req=r-<yyyymmdd>-<hhmm>-<head>-<n>`): \
+             one of the same requester's that has not concluded, so its tabs are one request \
+             (`ERR spawn req=<id>: <why>` otherwise, `<why>` `this caller makes no request` from \
+             a caller that makes none: a person's shell, a client in no tab); not on the \
+             connected form",
+        ),
+        row(
             "agent=<word>",
             "the worker's agent; `grok` is refused for now (`help spawn worker`)",
         ),
@@ -71,16 +86,26 @@ pub(crate) const PAGE: Page = Page {
         ),
     ],
     reply: &[
-        row("OK <sid>", "the new session's sid"),
+        row(
+            "OK <sid> [req=<id>]",
+            "the new session's sid (always the first word), and the request it is part of where \
+             one was made: a spawn over \
+             a fleet drive, or from a tab where an agent runs, opens a request in this Mac's \
+             `requests/` journal (`req=` joins one), which records who asked, why (`why=`, else \
+             a worker's brief's first line, else the asking tab's goal or asked line, recorded as \
+             a fallback) and its tabs, and which that requester's later `turn`, `send`, `key` and \
+             `close` on those tabs attach to",
+        ),
         row(
             "GO <n>",
-            "a worker spawn: send the <n> task bytes now; then `OK <sid>`",
+            "a worker spawn: send the <n> task bytes now; then `OK <sid> [req=<id>]`",
         ),
         row(
             "ERR …",
             "ERR no such window <id>, ERR no such folder <path>, ERR no access to folder <path>, \
              ERR theme \"<name>\": <why>, ERR unsupervised: <switch>, ERR spawn agent=<word>: \
-             <why>, ERR spawn program=<p>: <why>, ERR denied: … (fleet), ERR usage: spawn …",
+             <why>, ERR spawn program=<p>: <why>, ERR spawn req=<id>: <why>, ERR request store: \
+             <why>, ERR denied: … (fleet), ERR usage: spawn …",
         ),
         para(
             "A worker's progress is its task: `task`, `await task @<sid>`, then `result` \
@@ -268,16 +293,23 @@ pub(crate) const PAGE: Page = Page {
                      `model=`, `autopilot=`, an absolute `cwd=` or `'cwd=~/<path>'` (a folder in \
                      the driven Mac's home, resolved there and refused where it leaves the home, \
                      lies in a folder macOS guards, or is not there; quoted, since bash turns an \
-                     unquoted `cwd=~/…` into this Mac's own home before aterm sees it), `from=` \
-                     and `raise=false` alone, and each `ERR denied:` names the word it refused. \
-                     `aterm ctl … spawn agent=… label=<word>` keeps the label on this Mac's \
-                     `board` and never sends it.",
+                     unquoted `cwd=~/…` into this Mac's own home before aterm sees it), `from=`, \
+                     `why=<one line>`, `req=<id>` and `raise=false` alone, and each `ERR denied:` names the \
+                     word it refused. `aterm ctl … spawn agent=… label=<word>` keeps the label on \
+                     this Mac's `board` and never sends it.",
                 ),
                 para(
-                    "There, `aterm ctl --host <h> spawn cwd=/absolute|'cwd=~/<path>'` opens a \
-                     background plain shell with no task or AI requirement. It requires the named \
-                     folder, clears the host's global `-e` command, and accepts only `cwd=` and \
-                     optional `raise=false`; no stdin frame, command, model or implicit folder. \
+                    "There, `aterm ctl --host <h> spawn cwd=/absolute|'cwd=~/<path>' 'why=<one \
+                     line>'` opens a background plain shell with no task or AI requirement. It \
+                     requires the named folder and a `why=` of at most 200 characters saying what \
+                     it is for (refused without one: the driven Mac's tab open keeps it as \
+                     `why_text=` for whoever reviews what was asked of it), clears the host's \
+                     global `-e` command, and accepts only `cwd=`, `why=` and optional `req=` and \
+                     `raise=false`; no stdin frame, command, model or implicit folder. Either form \
+                     opens parked under the driven Mac's Workers tab, a child of no tab there, and \
+                     never raises its window; it and each line typed into it are logged \
+                     `by=fleet:<node>:<sid>`, the session on the driving Mac that asked (`-` \
+                     where none), and its open keeps that session's program, model and account. \
                      The creating node can close this shell while no person has adopted it and no \
                      foreground job runs. On its own untouched shell it may also read `blocks [n] \
                      [--json]`, `blocktext <id> [trim]`, and `await idle <0..22000>|block \

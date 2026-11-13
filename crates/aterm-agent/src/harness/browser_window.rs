@@ -1185,14 +1185,6 @@ pub fn ledger_why(site: &str, end: WindowEnd, session: &str) -> String {
     format!("{site} window {} {session}", end.word())
 }
 
-/// Whether `why` has [`ledger_why`]'s shape.
-#[must_use]
-pub fn is_ledger_why(why: &str) -> bool {
-    let words: Vec<&str> = why.split(' ').collect();
-    matches!(words.as_slice(), [site, "window", end, session]
-        if !site.is_empty() && !end.is_empty() && !session.is_empty())
-}
-
 #[cfg(unix)]
 fn exit_end(status: std::process::ExitStatus) -> WindowEnd {
     use std::os::unix::process::ExitStatusExt as _;

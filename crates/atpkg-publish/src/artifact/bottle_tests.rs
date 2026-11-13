@@ -921,3 +921,114 @@ fn relinking_preserves_an_unrelated_occupied_legacy_name() {
         |_, primary, aliases| relink_group(primary, aliases).map_err(|error| error.to_string()),
     );
 }
+
+/// The wrapper `install_git_wrapper` wrote before it located itself with builtins alone, byte for
+/// byte: it ran `dirname` through the caller's PATH. Kept as the negative control for the test
+/// below.
+#[cfg(unix)]
+const DIRNAME_GIT_WRAPPER: &str = "#!/bin/sh\n\
+__atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
+__atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
+export ATERM_GIT_ROOT=\"$__atpkg_root\"\n\
+export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
+if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
+  export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\
+fi\n\
+exec \"$__atpkg_root/libexec/git-core/git\" \"$@\"\n";
+
+#[cfg(unix)]
+#[test]
+fn git_wrapper_locates_itself_under_an_empty_or_unset_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    // A space in the root, and a symlinked directory in front of `bin/`, as a store link has.
+    let root = dir.path().join("git store").join("2026110303");
+    let core = root.join("libexec/git-core");
+    std::fs::create_dir_all(&core).expect("mkdir");
+    let stand_in = core.join("git");
+    std::fs::write(
+        &stand_in,
+        "#!/bin/sh\nprintf 'exec=%s root=%s args=%s\\n' \"${GIT_EXEC_PATH:-}\" \"${ATERM_GIT_ROOT:-}\" \"$*\"\n",
+    )
+    .expect("write stand-in");
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(install_git_wrapper("git", &root).expect("wrapper"));
+    let link = dir.path().join("linked bin");
+    std::os::unix::fs::symlink(root.join("bin"), &link).expect("symlink");
+
+    let real = std::fs::canonicalize(&root).expect("canonical root");
+    let expected = |args: &str| {
+        format!(
+            "exec={}/libexec/git-core root={} args={args}\n",
+            real.display(),
+            real.display()
+        )
+    };
+    // How each run is started: by the wrapper's path, through a symlinked bin/, by `sh bin/git`
+    // or `sh ./bin/git` from the root so `$0` is relative, or by `sh git` in bin/ so `$0` holds
+    // no slash; each with PATH empty and with PATH unset.
+    const LAUNCHES: [&str; 5] = ["absolute", "symlinked bin", "bin/git", "./bin/git", "git"];
+    let run = |launch: &str, unset: bool| {
+        let mut command = match launch {
+            "absolute" => aterm_uds::spawnfd::command(root.join("bin/git")),
+            "symlinked bin" => aterm_uds::spawnfd::command(link.join("git")),
+            relative => {
+                let mut c = aterm_uds::spawnfd::command("/bin/sh");
+                let cwd = if relative.contains('/') {
+                    root.clone()
+                } else {
+                    root.join("bin")
+                };
+                c.arg(relative).current_dir(cwd);
+                c
+            }
+        };
+        command
+            .args(["status", "two words"])
+            .env_remove("GIT_EXEC_PATH");
+        if unset {
+            command.env_remove("PATH");
+        } else {
+            command.env("PATH", "");
+        }
+        aterm_spec::wait::past_text_busy(|| {
+            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).map_err(
+                |e| match e {
+                    aterm_uds::deadline::RunError::Spawn(e) => e,
+                    other => std::io::Error::other(other),
+                },
+            )
+        })
+        .expect("run wrapper")
+    };
+    for name in LAUNCHES {
+        for unset in [false, true] {
+            let out = run(name, unset);
+            assert!(
+                out.status.success(),
+                "{name} unset={unset}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                expected("status two words"),
+                "{name} unset={unset}"
+            );
+        }
+    }
+
+    // Negative control: the dirname wrapper, run each of the same ways, cannot find itself under
+    // an empty PATH.
+    let wrapper = root.join("bin/git");
+    std::fs::remove_file(&wrapper).expect("rm wrapper");
+    std::fs::write(&wrapper, DIRNAME_GIT_WRAPPER).expect("write old wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    for name in LAUNCHES {
+        let out = run(name, false);
+        assert!(
+            !out.status.success() && out.stdout.is_empty(),
+            "{name}: the dirname wrapper must fail under an empty PATH: {out:?}"
+        );
+    }
+}

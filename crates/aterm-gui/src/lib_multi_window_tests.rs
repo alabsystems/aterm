@@ -2747,7 +2747,7 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
     };
     let run = |app: &mut App, cell: (u16, u16), rows: u16, cols: u16| {
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.cursor_trail_style = Some("rainbow".to_string());
         let glow_cfg = app.glow_config();
         let (mut glow_out, mut trail_out) = (Vec::new(), Vec::new());
         let seed = Instant::now();
@@ -3684,7 +3684,7 @@ fn on_focus_loss_embers_the_rainbow_ribbon_instead_of_cutting_it() {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     let peak = |app: &App| -> u8 {

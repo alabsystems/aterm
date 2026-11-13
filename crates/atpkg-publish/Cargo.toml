@@ -22,6 +22,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 aterm-capacity = { workspace = true }
 aterm-sysprobe = { workspace = true }
@@ -33,7 +35,7 @@ libc = { workspace = true }
 # a copy. Pack-time relocation and the LINEAGE stamp are producer-only (artifact::).
 atpkg = { workspace = true }
 # The release host over agh (host::agh::AghHost), reads and writes, chosen per builder by --host
-# (docs/PLAN-agh-m2-2026-10-20.md §16.1); and agh's CLI, which "atpkg-publish agh" forwards to for
+# (docs/DESIGN-agh-2026-10-19.md §16); and agh's CLI, which "atpkg-publish agh" forwards to for
 # the lanes' git credential helper.
 agh = { workspace = true }
 # The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for

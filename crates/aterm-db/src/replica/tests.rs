@@ -20,10 +20,17 @@ use std::{
 
 mod clock;
 mod compatibility;
+mod inventory;
 mod policy;
 mod recovery;
 pub(crate) mod witness;
-pub(super) use policy::session_boundary;
+pub(super) use policy::{session_boundary, table_admission};
+
+/// The read admissions through a round group on this thread so far (`GroupLook`): (own, lent,
+/// reopened), as `Grouped` names them.
+fn grouped() -> (u32, u32, u32) {
+    GROUPED.with(std::cell::Cell::get)
+}
 
 #[test]
 fn a_received_batch_keeps_its_first_local_refusal_and_durable_receipts() {
@@ -2497,7 +2504,8 @@ fn application_delivery_reads_beside_an_unrelated_source_control_writer() {
     let source = p.lab.bootstrap(0);
     let held = Journal::open_existing(source.journal_dir(), source.trust()).unwrap();
     let outgoing = a.round(b.actor).expect("observing a round needs no writer");
-    let incoming = b.round(a.actor).unwrap();
+    // A Round is not Send (its type borrows a round group, `GroupLook`, which is not Sync), so
+    // the responder's is opened on its own thread, beside the same held writer.
     let (mut left, mut right) = UnixStream::pair().unwrap();
     for stream in [&left, &right] {
         stream
@@ -2509,7 +2517,12 @@ fn application_delivery_reads_beside_an_unrelated_source_control_writer() {
     }
     thread::scope(|threads| {
         let receiver = threads.spawn(|| {
-            incoming.exchange(&mut right, a.actor, Side::Responder, &mut Repair::default())
+            b.round(a.actor).unwrap().exchange(
+                &mut right,
+                a.actor,
+                Side::Responder,
+                &mut Repair::default(),
+            )
         });
         let sent = outgoing
             .exchange(&mut left, b.actor, Side::Initiator, &mut Repair::default())

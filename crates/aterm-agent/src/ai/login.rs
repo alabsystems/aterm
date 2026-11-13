@@ -413,18 +413,13 @@ pub fn pool_target(
         ));
     }
     // A launch refused for what this machine's own login names is ended by the one step its
-    // refusal names: this sign-in where that is the row's, and otherwise that step.
-    if let Some((label, step)) = &pool.default_moved {
-        return match step {
-            Step::Login(_, row) => Ok((row.as_str(), cli.sign_in_verb(false))),
-            step => Err(format!(
-                "this machine's own login names another account than `{label}`'s, and no sign-in \
-                 here makes it `{label}`'s: `{step}`"
-            )),
-        };
-    }
+    // refusal names: this sign-in where that is the row's, and otherwise that step. Where another
+    // row takes the launch, a row a sign-in is due for comes first, and then that one step.
     if let Some(target) = pool.sign_in_target(cli) {
         return Ok(target);
+    }
+    if let Some((label, step)) = &pool.default_moved {
+        return Err(moved_step_words(label, step));
     }
     if pool.unread
         && let Some(label) = &pool.default_label
@@ -490,6 +485,22 @@ pub fn pool_target(
             Step::Add { cli, email: None }
         )
     })
+}
+
+/// Why the pool's sign-in does not end this machine's own login naming another account than
+/// `label`'s, and the `step` that does ([`crate::harness::accounts_pool::DefaultMovedEnd`]).
+fn moved_step_words(label: &str, step: &Step) -> String {
+    let lead = format!("this machine's own login names another account than `{label}`'s");
+    match step {
+        Step::VendorLogin(_) => format!(
+            "{lead}; on this Codex build aterm's own sign-in binds no row to it, and Codex's own \
+             in its default home, `{step}`, signs that login in as `{label}`"
+        ),
+        Step::Report(_) => {
+            format!("{lead}, and another Mac keeps `{label}` and signs it in: `{step}` says which")
+        }
+        step => format!("{lead}, and no sign-in here makes it `{label}`'s: `{step}` does"),
+    }
 }
 
 /// A CLI with its own accounts pool signs in through it, for the pool's next row (a row with an
@@ -817,7 +828,7 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
             && (f.hidden_store || default_row.is_none())
             && let Some(expected) = &health_observation
         {
-            let _ = h.store.note_if_current_scope(
+            let noted = h.store.note_if_current_scope(
                 c.id,
                 f.record_scope,
                 expected,
@@ -825,6 +836,17 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
                 outcome,
                 now,
             );
+            // A login no roster row lists has no record in the accounts store: what this
+            // status read learned of its account goes to the journal under the account's key.
+            if noted.is_ok_and(|noted| noted)
+                && !f.hidden_store
+                && let Some(cli) = Cli::parse(c.id)
+                && let Ok(home) = &f.home
+            {
+                crate::harness::journal::publish(
+                    &crate::harness::accounts_sync::unlisted_login_notes(cli, home, outcome, now),
+                );
+            }
         }
     };
     match read_status(status, &ran) {

@@ -3,12 +3,12 @@
 
 //! Tier-1 conformance for `ReleaseQualify` (`aterm_models_release::release_qualify_model`).
 //!
-//! Drives the release's steps 4 to 8 against the fake world ([`super::World`]), the qualify
-//! graph's branches running at once on their own threads, and replays what the run said — each
-//! `qualify-branch` event and each step's `release-stage` outcome — as the model's actions: every
-//! one must be admitted, in the order the run said it, and the model's records and verdicts must
-//! match the world's. The negative controls replay the defects the model's laws exist for and
-//! must be refused.
+//! Drives the release's steps 4 to 8 against the fake world ([`super::World`]). AppKit's
+//! synchronous gate must pass before the qualify graph starts; then the graph's branches run at
+//! once on their own threads. The replay maps each `qualify-branch` event and each step's
+//! `release-stage` outcome to the model's actions: every one must be admitted, in the order the
+//! run said it, and the model's records and verdicts must match the world's. The negative
+//! controls replay the defects the model's laws exist for and must be refused.
 
 use super::{BTreeSet, Branch, Half, World, bump, mac};
 
@@ -92,8 +92,34 @@ fn camel(branch: &str) -> &'static str {
     }
 }
 
+/// Whether a run that needed AppKit put that synchronous gate before the full disk admission,
+/// every modeled branch and the bundle invocation. `None` means AppKit's standing record made an
+/// invocation unnecessary.
+fn appkit_precedes_graph(calls: &[String]) -> Option<bool> {
+    let appkit = calls.iter().position(|call| call == "verify appkit")?;
+    Some(calls.iter().enumerate().all(|(at, call)| {
+        let after_gate = call.starts_with("disk-claim")
+            || matches!(
+                call.as_str(),
+                "reserve"
+                    | "build"
+                    | "verify --tree"
+                    | "stage --dry-run"
+                    | "stage"
+                    | "verify --bundle"
+            );
+        !after_gate || appkit < at
+    }))
+}
+
 /// Replay `w`'s last run from its step 4 on.
 fn replay(w: &World) -> Replay {
+    assert_ne!(
+        appkit_precedes_graph(&w.calls),
+        Some(false),
+        "AppKit's synchronous gate must precede the modeled graph: {:?}",
+        w.calls
+    );
     let events: Vec<aterm_json::Value> = w
         .out
         .iter()
@@ -209,6 +235,7 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
         (
             "tree red after private export validation",
             |w| {
+                w.verify_half = Some(Half::Tree);
                 w.verify_outcomes.insert("test", "FAIL");
                 w.verify_code = 1;
                 w.export_pushes = true;
@@ -234,6 +261,9 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
             "bundle could not run",
             |w| {
                 w.verify_half = Some(Half::Bundle);
+                // This case is the late, bundle-dependent measure run. AppKit has the same
+                // canonical half, but its explicit pass lets the synchronous gate finish first.
+                w.verify_outcomes.insert("appkit", "ok");
                 w.verify_passes = false;
                 w.verify_code = 3;
             },
@@ -336,6 +366,45 @@ fn the_model_refuses_the_defects_the_graph_must_not_have() {
     r.refuses("QualifyPass");
 }
 
+/// The conformance boundary begins only after AppKit passes. The old bundle-step ordering is the
+/// negative control: it puts slice work before the windowed gate and must not satisfy the order.
+#[test]
+fn appkit_is_a_synchronous_gate_before_the_modelled_graph() {
+    let calls = |calls: &[&str]| {
+        calls
+            .iter()
+            .map(|call| (*call).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        appkit_precedes_graph(&calls(&[
+            "verify appkit",
+            "disk-claim 30",
+            "reserve",
+            "build",
+            "verify --tree",
+            "stage --dry-run",
+            "verify --bundle",
+        ])),
+        Some(true)
+    );
+    assert_eq!(
+        appkit_precedes_graph(&calls(&[
+            "disk-claim 30",
+            "reserve",
+            "build",
+            "verify appkit",
+        ])),
+        Some(false),
+        "negative control: the former step-5 order reached AppKit after slice work"
+    );
+    assert_eq!(
+        appkit_precedes_graph(&calls(&["build", "verify --tree"])),
+        None,
+        "a standing AppKit record needs no invocation"
+    );
+}
+
 /// The product survives an executing-test red only when it had already started. The control
 /// replays the previous unconditional stop and must lose that product.
 #[test]
@@ -343,6 +412,7 @@ fn a_test_red_keeps_a_started_build_and_the_model_agrees() {
     for keep in [false, true] {
         let mut w = World::new();
         w.verify_outcomes.insert("test", "FAIL");
+        w.verify_half = Some(Half::Tree);
         w.verify_code = 1;
         w.after_tree = true;
         w.keep_build_on_test_red = keep;

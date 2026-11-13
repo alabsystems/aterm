@@ -195,47 +195,8 @@ pub fn step(label: &str, msg: &str) {
 }
 
 #[cfg(test)]
-mod grid_label_tests {
-    use super::*;
-
-    #[test]
-    fn long_labels_wrap_above_values_without_overwriting_the_column() {
-        for width in [20, 40, 80] {
-            for label in [
-                "release.openssl",
-                "release.source-signing",
-                "a long label with spaces",
-            ] {
-                let rendered = grid_block_at(width, label, "ready for use");
-                let lines: Vec<_> = rendered.lines().collect();
-                let first_value = lines
-                    .iter()
-                    .position(|row| row.starts_with(&" ".repeat(VALUE_COL)))
-                    .unwrap();
-                assert!(first_value > 0);
-                assert_eq!(
-                    lines[..first_value]
-                        .iter()
-                        .map(|row| row.trim())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    label
-                );
-                assert!(
-                    lines
-                        .iter()
-                        .all(|row| row.chars().count() <= width
-                            || row.split_whitespace().count() == 1)
-                );
-            }
-        }
-        assert_eq!(
-            grid_block_at(80, "short", "value"),
-            format!("  {:<LABEL_MAX$} value", "short")
-        );
-        assert!(grid_block_at(80, "release.source-signing", " ").is_empty());
-    }
-}
+#[path = "publish_grid_label_tests.rs"]
+mod grid_label_tests;
 
 /// "4m12s" / "38s" — whole-cut timing for the DONE line.
 pub fn fmt_elapsed(start: Instant) -> String {
@@ -1947,8 +1908,15 @@ pub struct JournalHeader {
 impl JournalHeader {
     /// Read the header.
     pub fn read(path: &Path) -> Result<Option<Self>> {
+        Ok(Self::read_classified(path)?)
+    }
+
+    /// [`JournalHeader::read`], telling a read that failed from a file that is no cut journal.
+    pub fn read_classified(path: &Path) -> std::result::Result<Option<Self>, JournalUnread> {
         match read_journal_text(path)? {
-            Some(text) => Self::parse(&text, path).map(Some),
+            Some(text) => Self::parse(&text, path)
+                .map(Some)
+                .map_err(JournalUnread::Invalid),
             None => Ok(None),
         }
     }
@@ -2006,11 +1974,58 @@ impl JournalHeader {
     }
 }
 
-fn read_journal_text(path: &Path) -> Result<Option<String>> {
+/// Why a journal file that is there was not read.
+#[derive(Debug)]
+pub enum JournalUnread {
+    /// The read of a regular file failed (I/O, permissions), or the path could not be looked
+    /// at; a retry may get through.
+    Read(Error),
+    /// The path holds no journal this cutter reads: no regular file (a directory, a FIFO, a
+    /// symbolic link, which no journal read follows), not UTF-8, larger than any journal, or text
+    /// that does not parse or validate. Every retry reads the same.
+    Invalid(Error),
+}
+
+impl From<JournalUnread> for Error {
+    fn from(unread: JournalUnread) -> Self {
+        match unread {
+            JournalUnread::Read(error) | JournalUnread::Invalid(error) => error,
+        }
+    }
+}
+
+/// A journal file's text, `None` when there is none. The read refuses what is no regular file
+/// without blocking on it (a FIFO opens non-blocking) and follows no symbolic link; a failed read
+/// is told apart by what the path holds, looked at without following a link: anything but a
+/// regular file is [`JournalUnread::Invalid`], as every retry finds it the same.
+fn read_journal_text(path: &Path) -> std::result::Result<Option<String>, JournalUnread> {
     match crate::durable::read_regular_text(path, 4 * 1024 * 1024) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::new(format!("read {}: {e}", path.display()))),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::FileTooLarge => Err(
+                JournalUnread::Invalid(Error::new(format!("read {}: {e}", path.display()))),
+            ),
+            _ => match std::fs::symlink_metadata(path).map(|meta| meta.file_type()) {
+                Ok(kind) if !kind.is_file() => {
+                    let what = if kind.is_dir() {
+                        "a directory"
+                    } else if kind.is_symlink() {
+                        "a symbolic link, which no journal read follows"
+                    } else {
+                        "a FIFO, socket or device"
+                    };
+                    Err(JournalUnread::Invalid(Error::new(format!(
+                        "{} is {what}, not a regular file",
+                        path.display()
+                    ))))
+                }
+                _ => Err(JournalUnread::Read(Error::new(format!(
+                    "read {}: {e}",
+                    path.display()
+                )))),
+            },
+        },
     }
 }
 
@@ -2045,6 +2060,12 @@ pub struct Journal {
     pub release_intent: bool,
     #[serde(default)]
     pub upload_intents: Vec<String>,
+    /// A private draft's journal only: the release its withdrawal issues a DELETE for, journaled
+    /// before the DELETE goes out, so a retry reads that release's absence (a 404 by its id that
+    /// the releases listing agrees with) as the withdrawal's own ([`draft::discard`]). A cut
+    /// journal names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_intent: Option<u64>,
     #[serde(default)]
     pub done: Vec<String>,
 }
@@ -2052,10 +2073,15 @@ pub struct Journal {
 impl Journal {
     /// Read this cutter's journal.
     pub fn load(path: &Path) -> Result<Option<Journal>> {
-        let Some(text) = read_journal_text(path)? else {
-            return Ok(None);
-        };
-        let header = JournalHeader::parse(&text, path)?;
+        read_journal_text(path)?
+            .map(|text| Self::from_text(&text, path))
+            .transpose()
+    }
+
+    /// Parse `text`, read from `path`, as this cutter's journal: a journal of another format, or
+    /// one that does not parse or validate, is refused.
+    fn from_text(text: &str, path: &Path) -> Result<Journal> {
+        let header = JournalHeader::parse(text, path)?;
         if header.format != JOURNAL_FORMAT {
             return Err(Error::new(format!(
                 "{} is a format-{} cut journal (v{} build {}, claim {}) and this cutter reads \
@@ -2068,7 +2094,7 @@ impl Journal {
                 header.commit,
             )));
         }
-        Self::parse_loaded(&text, path).map(Some)
+        Self::parse_loaded(text, path)
     }
 
     fn parse_loaded(text: &str, path: &Path) -> Result<Journal> {
@@ -2262,6 +2288,18 @@ impl Journal {
         if self.release_id.is_some() && !self.release_intent {
             return Err(Error::new(
                 "release journal carries an immutable release ID without its durable release intent",
+            ));
+        }
+        if let Some(id) = self.delete_intent
+            && (id == 0
+                || !self.release_intent
+                || self.release_id.is_some_and(|bound| bound != id)
+                || !self.done.is_empty())
+        {
+            return Err(Error::new(
+                "release journal carries a delete intent that is not its own private draft's: \
+                 zero, with no release intent, another release than the one it binds, or in a \
+                 cut journal",
             ));
         }
         let mut intents = std::collections::BTreeSet::new();
@@ -3260,6 +3298,16 @@ pub fn release_objects_by_tag(slug: &str, tag: &str) -> Result<Vec<ReleaseObject
         .into_iter()
         .filter(|release| release.tag == tag)
         .collect())
+}
+
+/// Whether `slug`'s releases listing, drafts included, holds release `id`, under any tag.
+pub(crate) fn release_listed(slug: &str, id: u64) -> Result<bool> {
+    let listing = release_listing(slug)?;
+    Ok(
+        parse_release_object_identity_rows(&release_identity_rows(&listing))?
+            .iter()
+            .any(|release| release.id == id),
+    )
 }
 
 pub fn unique_release_object_by_tag(
@@ -5650,6 +5698,7 @@ fn recover_published_cut(
         release_id: Some(release_object.id),
         release_intent: true,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: ["lock", "sign", "selfcheck", "tag"]
             .into_iter()
             .map(str::to_string)
@@ -6527,6 +6576,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             release_id: None,
             release_intent: false,
             upload_intents: Vec::new(),
+            delete_intent: None,
             done: vec![],
         };
         j.save(&journal_path)?;
@@ -6558,20 +6608,16 @@ fn discard_on_lost_race(
     if !lost {
         return error;
     }
-    let left = discard_signed(
+    let fate = discard_signed(
         dist,
         version,
         build,
         crate::release::SignedDiscard::LostReservation,
-    );
+    )
+    .fate();
     Error::new(format!(
-        "{error}. The copy signed, notarized and packaged privately as build {build} was \
-         discarded{}; nothing of it was made public",
-        if left.is_empty() {
-            String::new()
-        } else {
-            format!(" (still there: {})", left.join("; "))
-        }
+        "{error}. The copy signed, notarized and packaged privately as build {build} {fate}; \
+         nothing of it was made public"
     ))
 }
 
@@ -8099,29 +8145,34 @@ pub(crate) fn signed_copy_stands(
 
 /// Discard build `build`'s privately signed copy of `version` from `dist/`: its record, its
 /// staging directory, both containers, their stable twins and sidecars, and its provenance.
-/// Cancellation retains a journaled draft and its bytes; only a lost reservation invalidates
-/// that copy. Returns what could not be removed (the next cut's staging prunes a staging
+/// Cancellation retains a draft journaled for this version and build, and its bytes; a journal of
+/// another build owns none of this build's preparation. Only a lost reservation invalidates a
+/// journaled copy: its draft is withdrawn while release.toml still reserves that build
+/// ([`draft::discard`]), so a release dropping a reservation discards before it journals another
+/// or forgets the journal. A draft that discard holds keeps everything (`Held`, with what a
+/// person does); else what could not be removed (the next cut's staging prunes a staging
 /// directory a live process held).
 pub(crate) fn discard_signed(
     dist: &Path,
     version: &str,
     build: u64,
     reason: crate::release::SignedDiscard,
-) -> Vec<String> {
-    let mut left = Vec::new();
+) -> crate::release::Discarded {
+    use crate::release::Discarded;
     let retain = match reason {
-        crate::release::SignedDiscard::CancelPreparation => draft::has_journal(dist),
+        crate::release::SignedDiscard::CancelPreparation => {
+            draft::has_journal_for(dist, version, build).map_err(draft::Kept::Failed)
+        }
         crate::release::SignedDiscard::LostReservation => {
             draft::discard(dist, version, build).map(|()| false)
         }
     };
+    let mut left = Vec::new();
     match retain {
-        Ok(true) => return left,
+        Ok(true) => return Discarded::Except(left),
         Ok(false) => {}
-        Err(error) => {
-            left.push(error.to_string());
-            return left;
-        }
+        Err(draft::Kept::Failed(error)) => return Discarded::Except(vec![error.to_string()]),
+        Err(draft::Kept::Held { why, remedy }) => return Discarded::Held { why, remedy },
     }
     if let Err(error) = forget_signed_record(dist, build) {
         left.push(error.to_string());
@@ -8155,16 +8206,66 @@ pub(crate) fn discard_signed(
             Err(e) => left.push(format!("remove {}: {e}", path.display())),
         }
     }
-    left
+    Discarded::Except(left)
 }
 
-/// The private draft `cut --sign` journaled in `dist` for `version`: its release id, or why the
-/// journal cannot be read.
+/// `repo`'s private-draft journal, `dist/draft-state.toml`: what `cut --sign` writes and the
+/// engine's `--draft-state` reads.
+pub(crate) fn draft_journal_path(repo: &Path) -> PathBuf {
+    repo.join("dist").join(draft::JOURNAL)
+}
+
+/// The engine's `sign-release` arguments that attach `version`'s source attestation pair to the
+/// release it belongs on. Only `--keep-draft --draft-state <journal>` reaches a draft: the engine
+/// reads the journal's release id (waiting while it names none), version, create intent and
+/// commit (whose parent must be the published source; it reads no build), attaches and verifies
+/// the pair on that draft and never publishes it. `draft_state` is a journal that binds the draft:
+/// the private draft's `cut --sign` journaled ([`draft_journal_path`]), or a claimed cut's own.
+/// Without it the engine takes the tag's release, creating one or publishing a draft it finds,
+/// so the plain form is for a published release alone.
+pub(crate) fn sign_release_args(
+    repo: &Path,
+    version: &str,
+    draft_state: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "sign-release".to_string(),
+        "aterm".to_string(),
+        "--tag".to_string(),
+        format!("v{version}"),
+    ];
+    if let Some(journal) = draft_state {
+        args.extend([
+            "--keep-draft".to_string(),
+            "--draft-state".to_string(),
+            journal.display().to_string(),
+            "--repo-path".to_string(),
+            repo.display().to_string(),
+        ]);
+    }
+    args
+}
+
+/// [`sign_release_args`] as the command a person runs.
+pub(crate) fn sign_release_command(
+    repo: &Path,
+    version: &str,
+    draft_state: Option<&Path>,
+) -> String {
+    format!(
+        "pub {}",
+        sign_release_args(repo, version, draft_state).join(" ")
+    )
+}
+
+/// The private draft `cut --sign` journaled in `dist` for build `build` of `version`: its
+/// release id, or why the journal cannot be read.
 pub(crate) fn journaled_draft(
     dist: &Path,
     version: &str,
+    build: u64,
 ) -> std::result::Result<Option<u64>, String> {
-    draft::journaled_release(dist, version).map_err(|e| e.to_string())
+    draft::journaled_release(dist, version, build).map_err(|e| e.to_string())
 }
 
 /// The self-check of a copy `cut --sign` signed and the claim adopted: the manifest's `team` is
@@ -8959,6 +9060,58 @@ fn prove_roster_on_disk_at(
     Ok(())
 }
 
+/// The source signing that attaches the pair to the cut's draft `release_id` without publishing
+/// it: the `--keep-draft` form whose `--draft-state` is the cut's own journal, which the bind
+/// wrote with that release id, the create intent and the claim commit (a child of the published
+/// source), all the engine reads. Unlike the private draft's journal, which a person may have
+/// removed or another build's sign rewritten, it names no other draft, and the engine never
+/// waits on it for an id. When it does not bind the release (it was edited or lost since), no
+/// form is named (`Err`, saying what proceeds instead): the engine would wait on a journal naming
+/// no release, and the plain form would publish the draft. This cut then finishes only once that
+/// journal binds the release again; else `recover` withdraws it, which, with no cut journal,
+/// deletes the draft only while it holds nothing but this version's cut assets
+/// ([`withdraw_unpublished_release`]), so a draft carrying any of the source pair is deleted by
+/// hand first and recover told `--no-draft-was-posted`.
+fn keep_draft_form(ctx: &CutCtx, release_id: u64) -> std::result::Result<String, String> {
+    let what = match Journal::load(&ctx.journal_path) {
+        Ok(Some(journal))
+            if journal.release_id == Some(release_id)
+                && journal.release_intent
+                && journal.version == ctx.version
+                && journal.commit == ctx.commit =>
+        {
+            return Ok(sign_release_command(
+                &ctx.repo,
+                &ctx.version,
+                Some(&ctx.journal_path),
+            ));
+        }
+        Ok(Some(journal)) => format!(
+            "it journals v{} at {} with release {:?} and create intent {}",
+            journal.version,
+            journal.commit.get(..12).unwrap_or(&journal.commit),
+            journal.release_id,
+            journal.release_intent
+        ),
+        Ok(None) => "it is gone".to_string(),
+        Err(error) => format!("it cannot be read: {error}"),
+    };
+    let journal = ctx.journal_path.display();
+    Err(format!(
+        "no form reaches this draft while the cut's journal {journal} does not bind release \
+         {release_id} ({what}): the `--keep-draft` form reads that journal and waits while it \
+         names no release, and the plain form would publish the draft. This cut finishes only \
+         once {journal} binds release {release_id} again; else withdraw it: with nothing at \
+         {journal}, `{SHIP_COMMAND} recover v{version} {commit} --old-publisher-stopped` deletes \
+         the draft while it holds nothing but this version's cut assets; one carrying any of the \
+         source pair it refuses, keeping the lease, so delete that draft first (`{delete}`) and \
+         give recover `--no-draft-was-posted`",
+        version = ctx.version,
+        commit = ctx.commit,
+        delete = draft::delete_command(&ctx.slug, release_id),
+    ))
+}
+
 fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
     let observed = unique_release_object_by_tag(slug, &ctx.tag)?;
     let mut adopted = false;
@@ -9233,10 +9386,26 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
                 )?;
                 let missing = channel::source_attestation_findings(&release);
                 if !missing.is_empty() {
+                    // The form follows what the release is: the plain form finishes a draft by
+                    // publishing it, so a draft is named only the `--keep-draft` form reading the
+                    // cut's own journal, which binds exactly this draft; the private draft's
+                    // journal may be gone or another build's by now. The finding stands whatever
+                    // the journal read says.
+                    let form = if expect_draft {
+                        keep_draft_form(ctx, release_id)
+                    } else {
+                        Ok(sign_release_command(&ctx.repo, &ctx.version, None))
+                    };
+                    let remedy = match form {
+                        Ok(form) => {
+                            format!("finish the source signing ({form}), then resume the cut")
+                        }
+                        Err(none) => none,
+                    };
                     return Err(Error::new(format!(
                         "release ID {release_id} lacks a unique signed source manifest: {}; \
-                         finish pub sign-release aterm, then resume the cut",
-                        missing.join("; ")
+                         {remedy}",
+                        channel::attestation_words(slug, &missing),
                     )));
                 }
                 ensure_ctx_release_lease(ctx)?;
@@ -9810,119 +9979,8 @@ fn payload_pool<T: Sync>(files: &[T], upload: &(impl Fn(&T) -> Result<()> + Sync
 }
 
 #[cfg(test)]
-mod upload_pool_tests {
-    use super::*;
-    use std::sync::{Condvar, Mutex, atomic::AtomicUsize, mpsc};
-    use std::time::Duration;
-
-    #[test]
-    fn upload_rate_counts_only_confirmed_payload_over_request_wall() {
-        let success = upload_observation("asset.zip", 1024, 2.0, true);
-        assert_eq!(success["confirmed_bytes"].as_u64(), Some(1024));
-        assert_eq!(success["bytes_per_request_second"].as_f64(), Some(512.0));
-        for (wall, succeeded) in [(2.0, false), (0.0, true)] {
-            let event = upload_observation("asset.zip", 1024, wall, succeeded);
-            assert!(event["bytes_per_request_second"].is_null());
-            if !succeeded {
-                assert!(event["confirmed_bytes"].is_null());
-            }
-        }
-    }
-
-    /// NEGATIVE CONTROL: losing the caller's thread-local route would let a
-    /// request worker use production GitHub instead of the injected fixture.
-    #[test]
-    fn upload_pool_inherits_the_test_github_route() {
-        let _route = crate::github::Fixture {
-            origins: aterm_update_core::github_rest::Origins::github(),
-            token: Some("fixture-token".into()),
-            spawn: None,
-        }
-        .enter();
-        upload_pool(&[0, 1], 2, &|_| {
-            assert_eq!(
-                crate::github::Fixture::current().unwrap().token.as_deref(),
-                Some("fixture-token")
-            );
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    /// NEGATIVE CONTROL: a serial dispatcher cannot enter all four callbacks
-    /// while their completion gate is closed; an unbounded one exceeds four.
-    #[test]
-    fn upload_pool_overlaps_and_bounds_requests() {
-        let gate = (Mutex::new(false), Condvar::new());
-        let active = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                upload_pool(&[0; 12], 4, &|_| {
-                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(count, Ordering::SeqCst);
-                    tx.send(()).unwrap();
-                    let (lock, ready) = &gate;
-                    drop(
-                        ready
-                            .wait_while(lock.lock().unwrap(), |open| !*open)
-                            .unwrap(),
-                    );
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            });
-            let entered = (0..4).all(|_| rx.recv_timeout(Duration::from_secs(60)).is_ok());
-            *gate.0.lock().unwrap() = true;
-            gate.1.notify_all();
-            worker.join().unwrap().unwrap();
-            assert!(entered, "four requests must enter before any finishes");
-        });
-        assert_eq!(peak.load(Ordering::SeqCst), 4);
-    }
-
-    /// NEGATIVE CONTROL: continuing dispatch after a refusal reaches item 1.
-    #[test]
-    fn upload_pool_refuses_without_dispatching_more() {
-        let seen = Mutex::new(Vec::new());
-        let error = upload_pool(&[0, 1, 2], 1, &|index| {
-            seen.lock().unwrap().push(*index);
-            Err(Error::new("upload refused"))
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("upload refused"));
-        assert_eq!(*seen.lock().unwrap(), [0]);
-    }
-
-    /// NEGATIVE CONTROL: returning on the first error without joining loses
-    /// the other request's completion, including its intent settlement.
-    #[test]
-    fn upload_pool_joins_in_flight_requests_before_refusing() {
-        let entered = (Mutex::new(0), Condvar::new());
-        let finished = AtomicUsize::new(0);
-        let error = upload_pool(&[0, 1], 2, &|index| {
-            let mut count = entered.0.lock().unwrap();
-            *count += 1;
-            entered.1.notify_all();
-            let (count, _) = entered
-                .1
-                .wait_timeout_while(count, Duration::from_secs(60), |count| *count < 2)
-                .unwrap();
-            assert_eq!(*count, 2, "both requests must start");
-            drop(count);
-            if *index == 0 {
-                Err(Error::new("refused"))
-            } else {
-                finished.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .unwrap_err();
-        assert_eq!(error.to_string(), "refused");
-        assert_eq!(finished.load(Ordering::SeqCst), 1);
-    }
-}
+#[path = "publish_upload_pool_tests.rs"]
+mod upload_pool_tests;
 
 pub(crate) fn upload_channel_asset(
     ctx: &std::sync::Mutex<&mut CutCtx>,
@@ -10117,93 +10175,8 @@ fn prove_asset_files(
 }
 
 #[cfg(test)]
-mod asset_batch_tests {
-    use super::*;
-
-    fn fixture(run: impl FnOnce(&[PathBuf], &str, u64)) {
-        let fake = agh_fake::FakeGithub::start();
-        let slug = "cut-fixture/aterm";
-        let token = agh_fake::token("cut-assets");
-        fake.add_token(&token, "cut-reader");
-        fake.add_repo(slug, agh_fake::RepoSpec::public());
-        let release = fake.add_release(
-            slug,
-            agh_fake::ReleaseSpec::published("v0.183.0", "2026-11-08T00:00:00Z"),
-        );
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let files: Vec<_> = (0..10)
-            .map(|n| {
-                let name = format!("asset-{n}");
-                fake.add_asset(
-                    release,
-                    agh_fake::AssetSpec::uploaded(&name, b"correct bytes"),
-                );
-                let file = dir.path().join(name);
-                fs::write(&file, b"correct bytes").unwrap();
-                file
-            })
-            .collect();
-        let ports = fake.ports();
-        let _route = crate::github::Fixture {
-            origins: aterm_update_core::github_rest::Origins::loopback(
-                ports.api,
-                ports.uploads,
-                ports.web,
-                ports.cdn,
-            ),
-            token: Some(token),
-            spawn: None,
-        }
-        .enter();
-        run(&files, slug, release);
-    }
-
-    /// NEGATIVE CONTROL: a same-sized wrong byte must fail even though the
-    /// complete immutable-ID inventory remains identical.
-    #[test]
-    fn batched_asset_proof_still_checks_every_byte() {
-        fixture(|files, slug, release| {
-            let before = release_asset_inventory_for_release_id(slug, release).unwrap();
-            prove_asset_files(files, &before, slug, release).unwrap();
-            fs::write(&files[7], b"corrupt bytes").unwrap();
-            let error = prove_asset_files(files, &before, slug, release).unwrap_err();
-            assert!(error.to_string().contains("bytes differ"), "{error}");
-            assert_eq!(
-                before,
-                release_asset_inventory_for_release_id(slug, release).unwrap()
-            );
-        });
-    }
-
-    #[test]
-    #[ignore = "explicit loopback before/after asset-proof measurement"]
-    fn cut_asset_proof_abba() {
-        fixture(|files, slug, release| {
-            for (take, batch) in [false, true, true, false].into_iter().enumerate() {
-                let label = format!("asset proof take {take} batch={batch}");
-                let _timer = crate::cut_timing::Timer::new(&label);
-                let before = release_asset_inventory_for_release_id(slug, release).unwrap();
-                if batch {
-                    prove_asset_files(files, &before, slug, release).unwrap();
-                } else {
-                    for file in files {
-                        verify_release_asset_id_matches_local(
-                            slug,
-                            release,
-                            file.file_name().unwrap().to_str().unwrap(),
-                            file,
-                        )
-                        .unwrap();
-                    }
-                }
-                assert_eq!(
-                    before,
-                    release_asset_inventory_for_release_id(slug, release).unwrap()
-                );
-            }
-        });
-    }
-}
+#[path = "publish_asset_batch_tests.rs"]
+mod asset_batch_tests;
 
 fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
     let live = release_object_by_id(slug, release_id)?;
@@ -10290,1960 +10263,37 @@ pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Resu
 }
 
 #[cfg(test)]
-mod release_body_post_tests {
-
-    use super::*;
-
-    fn notes_file(label: &str, contents: &str) -> (aterm_tempfile::TempDir, PathBuf) {
-        let dir = crate::test_scratch_dir(label);
-        let path = dir.path().join("notes-0.87.0.md");
-        fs::write(&path, contents).expect("write release-notes fixture");
-        (dir, path)
-    }
-
-    #[test]
-    fn an_oversized_notes_file_on_disk_is_bounded_at_the_post() {
-        let oversized =
-            "### Section\n\n- an entry — with em dashes — long enough to matter\n\n".repeat(4000);
-        assert!(
-            changelog::github_length(&oversized) > changelog::GITHUB_RELEASE_BODY_LIMIT,
-            "fixture must actually overflow: {} UTF-16 units",
-            changelog::github_length(&oversized)
-        );
-        let (_dir, path) = notes_file("oversized", &oversized);
-        let posted = release_body_for_post("draft", &path).expect("read notes");
-        assert!(
-            changelog::github_length(&posted) <= changelog::GITHUB_RELEASE_BODY_LIMIT,
-            "the POST would carry {} UTF-16 units ({} bytes), over the {} GitHub takes",
-            changelog::github_length(&posted),
-            posted.len(),
-            changelog::GITHUB_RELEASE_BODY_LIMIT
-        );
-        let payload = release_create_payload("v0.87.0", "aterm 0.87.0", &posted).unwrap();
-        let request: aterm_json::Value =
-            aterm_json::from_str(std::str::from_utf8(&payload).unwrap()).unwrap();
-        assert_eq!(
-            request.get("body").and_then(aterm_json::Value::as_str),
-            Some(&*posted)
-        );
-        assert_eq!(
-            request.get("draft").and_then(aterm_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            fs::read_to_string(&path).expect("re-read fixture").len(),
-            oversized.len()
-        );
-    }
-
-    #[test]
-    fn a_422_post_failure_judges_body_length_in_utf16_characters_not_utf8_bytes() {
-        let out = RunOut {
-            status: CURL_EXIT_HTTP_ERROR,
-            stdout: br#"{"message":"Validation Failed"}"#.to_vec(),
-            stderr: b"curl: (22) The requested URL returned error: 422\n".to_vec(),
-        };
-        let within = ReleaseBody("—".repeat(changelog::GITHUB_RELEASE_BODY_LIMIT));
-        assert!(
-            within.len() > changelog::GITHUB_RELEASE_BODY_LIMIT,
-            "UTF-8 bytes ({}) exceed the UTF-16 limit ({})",
-            within.len(),
-            changelog::GITHUB_RELEASE_BODY_LIMIT
-        );
-        let detail = release_body_post_failure_detail(&out, &within);
-        assert!(detail.contains("WITHIN it"), "{detail}");
-        assert!(!detail.contains("OVER IT"), "{detail}");
-
-        let over = ReleaseBody("—".repeat(changelog::GITHUB_RELEASE_BODY_LIMIT + 1));
-        let detail = release_body_post_failure_detail(&out, &over);
-        assert!(detail.contains("OVER IT"), "{detail}");
-    }
-}
+#[path = "publish_release_body_post_tests.rs"]
+mod release_body_post_tests;
 
 #[cfg(test)]
-mod transport_body_tests {
-
-    use super::*;
-
-    fn prepared(body: impl FnOnce() -> Result<OneShotPost>) -> Vec<String> {
-        let _github = crate::github::Fixture {
-            origins: aterm_update_core::github_rest::Origins::loopback(1, 2, 3, 4),
-            token: Some("ghs_fixtureOneShot0123".to_string()),
-            spawn: None,
-        }
-        .enter();
-        body().expect("prepared").argv()
-    }
-
-    #[test]
-    fn an_asset_upload_streams_off_disk_and_never_buffers() {
-        let dir = crate::test_scratch_dir("oneshot");
-        let dmg = dir.path().join("aterm-0.33.0.dmg");
-        fs::write(&dmg, b"dmg").expect("the asset");
-        let args = prepared(|| {
-            OneShotPost::prepare_binary("repos/o/r/releases/1/assets?name=aterm-0.33.0.dmg", &dmg)
-        });
-        assert!(
-            args.iter().any(|a| a == "--upload-file"),
-            "the asset leg must stream: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "--data-binary"),
-            "a gigabyte payload must never be buffered: {args:?}"
-        );
-        let request = args.iter().position(|a| a == "-X").unwrap();
-        assert_eq!(args[request + 1], "POST");
-        let flag = args.iter().position(|a| a == "--upload-file").unwrap();
-        assert_eq!(args[flag + 1], dmg.to_str().unwrap());
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("http://127.0.0.1:2/repos/o/r/releases/1/assets?name=aterm-0.33.0.dmg"),
-            "the uploads origin"
-        );
-        let args = prepared(|| OneShotPost::prepare_json("repos/o/r/releases", b"{}"));
-        let flag = args.iter().position(|a| a == "--data-binary").unwrap();
-        assert!(args[flag + 1].starts_with('@'), "{args:?}");
-        assert!(!args.iter().any(|a| a == "--upload-file"));
-        assert!(args.iter().any(|a| a == "--fail-with-body"), "{args:?}");
-        assert!(args.windows(2).any(|w| w == ["-H", "@-"]), "{args:?}");
-        assert!(
-            !args.iter().any(|a| a.contains("ghs_fixtureOneShot0123")),
-            "{args:?}"
-        );
-        assert_eq!(args.first().map(String::as_str), Some("/usr/bin/curl"));
-    }
-
-    fn out(status: i32, stderr: &str) -> RunOut {
-        RunOut {
-            status,
-            stdout: Vec::new(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn only_a_local_curl_refusal_counts_as_never_sent() {
-        assert!(
-            transport_never_started(&out(2, "curl: option --data-binary: out of memory")),
-            "curl exit 2 is argument/init failure, strictly before connect"
-        );
-        for (status, why) in [
-            (0, "success"),
-            (22, "HTTP error returned"),
-            (28, "timeout — the request may have been delivered"),
-            (56, "recv failure — likewise"),
-            (7, "connect failed, but after the attempt began"),
-            (-1, "killed; unknowable"),
-        ] {
-            assert!(
-                !transport_never_started(&out(status, why)),
-                "exit {status} ({why}) must NOT license a retry"
-            );
-        }
-    }
-
-    #[test]
-    fn a_four_hundred_is_a_refusal_and_everything_else_is_unknown() {
-        let out = |status: i32, stderr: &str| RunOut {
-            status,
-            stdout: Vec::new(),
-            stderr: stderr.as_bytes().to_vec(),
-        };
-        let refused = out(22, "curl: (22) The requested URL returned error: 422\n");
-        assert!(
-            server_refused_without_creating(&refused),
-            "an answered 422 created nothing"
-        );
-        assert!(
-            server_refused_without_creating(&out(
-                22,
-                "curl: (22) The requested URL returned error: 404\n"
-            )),
-            "so did an answered 404"
-        );
-        for unknown in [
-            out(22, "curl: (22) The requested URL returned error: 500\n"),
-            out(22, "curl: (22) The requested URL returned error: 502\n"),
-            out(28, "curl: (28) Operation timed out\n"),
-            out(56, "curl: (56) Recv failure: Connection reset by peer\n"),
-            out(
-                22,
-                "curl: (22) some future wording this code has never seen\n",
-            ),
-            out(2, "curl: (2) failed to initialise\n"),
-        ] {
-            assert!(
-                !server_refused_without_creating(&unknown),
-                "{:?} must read as UNKNOWN, not as a refusal",
-                unknown.stderr_utf8().trim()
-            );
-        }
-        assert_eq!(
-            http_status_from_curl_failure("curl: (22) The requested URL returned error: 422\n"),
-            Some(422)
-        );
-        assert_eq!(http_status_from_curl_failure("no status here"), None);
-    }
-
-    #[test]
-    fn a_retracted_intent_makes_the_next_attempt_postable_again() {
-        assert_eq!(
-            durable_post_decision(true, false),
-            DurablePostDecision::AwaitVisibility,
-            "the wedge this fixes"
-        );
-        assert_eq!(
-            durable_post_decision(false, false),
-            DurablePostDecision::PersistIntentThenPost,
-            "after retraction the asset is uploadable again"
-        );
-        assert_eq!(
-            durable_post_decision(false, true),
-            DurablePostDecision::ConvergeVisible,
-            "and a visible object still converges rather than reposting"
-        );
-    }
-}
+#[path = "publish_transport_body_tests.rs"]
+mod transport_body_tests;
 
 #[cfg(test)]
-mod roster_wiring_tests {
-
-    use super::*;
-
-    /// NEGATIVE CONTROL: a real upload cannot lose either guard, and the owned
-    /// snapshot must release the journal lock before a remote check can start.
-    #[test]
-    fn upload_authority_is_owned_without_holding_the_journal_lock() {
-        let mut cut = ctx(None);
-        assert!(release_session(&cut).is_err());
-        cut.lease = Some(ReleaseLeaseGuard {
-            owner: "a".repeat(40),
-        });
-        assert!(release_session(&cut).is_err());
-        cut.fence = Some(PublisherFenceGuard {
-            owner: "a".repeat(40),
-            token: "b".repeat(40),
-        });
-        let mutex = std::sync::Mutex::new(&mut cut);
-        let snapshot = upload_release_session(&mutex).unwrap();
-        assert!(
-            mutex.try_lock().is_ok(),
-            "remote checks must not retain the journal lock"
-        );
-        let (lease, fence) = snapshot.guards.unwrap();
-        assert_eq!(lease.owner(), "a".repeat(40));
-        assert_eq!(fence.token(), "b".repeat(40));
-    }
-
-    #[test]
-    fn a_recovery_verifies_under_the_release_key_and_signs_under_its_own() {
-        let mut ctx = ctx(Some("m3"));
-        ctx.signature_pubkey = Some("Kb-this-machine".to_string());
-        assert_eq!(
-            ctx.verification_pubkey(),
-            Some("Kb-this-machine"),
-            "an ordinary cut verifies under the key it signs with"
-        );
-
-        ctx.verify_pubkey = Some("Ka-dead-publisher".to_string());
-        assert_eq!(
-            ctx.verification_pubkey(),
-            Some("Ka-dead-publisher"),
-            "publish must prove the key that actually signed the artifacts"
-        );
-        assert_eq!(
-            ctx.signature_pubkey.as_deref(),
-            Some("Kb-this-machine"),
-            "…while the local signing-configuration guards keep comparing this \
-             machine's own key, or they would reject their own recovery"
-        );
-    }
-
-    fn ctx(machine_id: Option<&str>) -> CutCtx {
-        CutCtx {
-            credentials: None,
-            apple: sign::AppleTier::Inactive,
-            repo: PathBuf::from("/nonexistent/repo"),
-            tree: PathBuf::from("/nonexistent/repo"),
-            dist: PathBuf::from("/nonexistent/repo/dist"),
-            journal_path: PathBuf::from("/nonexistent/repo/dist/cut-state.toml"),
-            slug: "owner/repo".to_string(),
-            version: "0.5.0".to_string(),
-            tag: "v0.5.0".to_string(),
-            build: 500,
-            commit: "a".repeat(40),
-            min_build: None,
-            artifact: Some("aa".repeat(32)),
-            macho_sha256: Some("bb".repeat(32)),
-            linux: None,
-            manifest_signed: true,
-            signature_required: true,
-            signature_pubkey: None,
-            verify_pubkey: None,
-            signature_machine_id: machine_id.map(str::to_string),
-            attribution: None,
-            roster: None,
-            release_id: None,
-            release_intent: false,
-            upload_intents: Vec::new(),
-            kind: CutKind::Real,
-            lease: None,
-            fence: None,
-            journal: None,
-            adopted: false,
-            notes_section: "0.5.0".to_string(),
-        }
-    }
-
-    #[cfg(unix)]
-    struct CurrentRosterCut {
-        home: aterm_tempfile::TempDir,
-        cut: CutCtx,
-        master_key: Vec<u8>,
-        master: String,
-        signer: String,
-        canonical: PathBuf,
-    }
-
-    #[cfg(unix)]
-    impl CurrentRosterCut {
-        fn new() -> Self {
-            let home = aterm_tempfile::tempdir().unwrap();
-            let (master_key, master) = atpkg_keys::generate().unwrap();
-            let (key, signer) = atpkg_keys::generate().unwrap();
-            let canonical = home.path().join(atpkg_keys::provision::RELEASE_ROSTER_REL);
-            let profile = home.path().join("credentials.toml");
-            let encoded = aterm_codec::base64::encode(&key).unwrap();
-            fs::write(
-                &profile,
-                format!(
-                    "signing_key = \"{encoded}\"\nmachine_roster = \"{}\"\n",
-                    canonical.display()
-                ),
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
-            }
-            let mut cut = ctx(Some("m3"));
-            cut.credentials =
-                Some(sign::ReleaseCredentials::load(&profile, Some(home.path())).unwrap());
-            cut.dist = home.path().join("unchanged");
-            cut.journal_path = cut.dist.join("cut-state.toml");
-            cut.manifest_signed = false;
-            let mut fixture = Self {
-                home,
-                cut,
-                master_key,
-                master,
-                signer,
-                canonical,
-            };
-            fixture.advance(3, false);
-            let observed = fixture.observe(RosterDuty::Sign);
-            fixture.cut.signature_required = observed.policy.required;
-            fixture.cut.signature_pubkey = observed.policy.pubkey.clone();
-            fixture.cut.signature_machine_id = observed.machine_id();
-            fixture.cut.attribution = observed.attribution;
-            fixture.cut.roster = observed.roster;
-            fixture
-        }
-
-        fn advance(&self, generation: u64, revoke_other: bool) {
-            let body = roster::Roster {
-                schema: 1,
-                roster_seq: generation,
-                valid_until: "9999-12-31T00:00:00Z".into(),
-                machines: vec![
-                    roster::Machine {
-                        id: "m3".into(),
-                        pubkey: self.signer.clone(),
-                        added_at: String::new(),
-                        not_after: None,
-                    },
-                    roster::Machine {
-                        id: "m11".into(),
-                        pubkey: aterm_codec::base64::encode(&[0x42; 32]).unwrap(),
-                        added_at: String::new(),
-                        not_after: None,
-                    },
-                ],
-                revoked: if revoke_other {
-                    vec!["m11".into()]
-                } else {
-                    Vec::new()
-                },
-            }
-            .to_toml()
-            .unwrap();
-            let signature = atpkg_keys::sign(&self.master_key, body.as_bytes()).unwrap();
-            crate::provision::publish_proven_pair(&self.canonical, body.as_bytes(), &signature)
-                .unwrap();
-        }
-
-        fn observe(&self, duty: RosterDuty) -> SigningVerdict {
-            signing_verdict(
-                self.cut.credentials.as_ref(),
-                &SigningAnchors {
-                    home: Some(self.home.path()),
-                    master_pubkeys: &[&self.master],
-                    identity_path: None,
-                    now_unix: 1_793_000_000,
-                    duty,
-                },
-            )
-            .unwrap()
-        }
-
-        fn stage(&self, observed: &SigningVerdict, duty: RosterDuty) -> Result<PathBuf> {
-            let inputs = manifest_out::ManifestInputs {
-                version: &self.cut.version,
-                build_number: self.cut.build,
-                commit: &self.cut.commit,
-                dmg_name: "aterm-0.5.0.dmg",
-                dmg_sha256: &"a".repeat(64),
-                zip_name: "aterm-0.5.0-mac.zip",
-                zip_sha256: &"b".repeat(64),
-                repo_slug: "owner/repo",
-                min_os: "11.0",
-                team_id: "",
-                pub_date: "2026-10-26T00:00:00Z",
-                min_build: None,
-                changelog: "fixture",
-            };
-            stage_ctx_signing_inputs(&self.cut, &inputs, |cut| {
-                revalidate_observed_signature_policy(cut, observed, duty)
-            })
-        }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_roster_change_after_staging_refuses_signature_but_a_signed_cut_can_finish() {
-        let fixture = CurrentRosterCut::new();
-        let captured = fixture.observe(RosterDuty::Sign);
-        let manifest = fixture.stage(&captured, RosterDuty::Sign).unwrap();
-        fixture.advance(4, true);
-        let changed = fixture.observe(RosterDuty::Sign);
-        assert!(
-            sign_ctx_manifest(&fixture.cut, &manifest, |cut| {
-                revalidate_observed_signature_policy(cut, &changed, RosterDuty::Sign)
-            })
-            .is_err()
-        );
-        assert!(!manifest.with_extension("toml.sig").exists());
-
-        // A separate cut really signs before gaining the completed-receipt semantics.
-        let mut signed = CurrentRosterCut::new();
-        let current = signed.observe(RosterDuty::Sign);
-        let manifest = signed.stage(&current, RosterDuty::Sign).unwrap();
-        let signature = sign_ctx_manifest(&signed.cut, &manifest, |cut| {
-            revalidate_observed_signature_policy(cut, &current, RosterDuty::Sign)
-        })
-        .unwrap();
-        verify_detached_manifest_signature(
-            signed.cut.signature_pubkey.as_deref().unwrap(),
-            &fs::read(&manifest).unwrap(),
-            &fs::read(&signature).unwrap(),
-        )
-        .unwrap();
-        signed.cut.manifest_signed = true;
-        signed.cut.journal = Some(Journal {
-            format: JOURNAL_FORMAT,
-            version: signed.cut.version.clone(),
-            build_number: signed.cut.build,
-            commit: signed.cut.commit.clone(),
-            min_build: None,
-            artifact: signed.cut.artifact.clone(),
-            macho_sha256: signed.cut.macho_sha256.clone(),
-            linux: None,
-            manifest_signed: true,
-            signature_required: signed.cut.signature_required,
-            signature_pubkey: signed.cut.signature_pubkey.clone(),
-            verify_pubkey: signed.cut.verify_pubkey.clone(),
-            signature_machine_id: signed.cut.signature_machine_id.clone(),
-            release_id: None,
-            release_intent: false,
-            upload_intents: Vec::new(),
-            done: vec!["lock".into()],
-        });
-        signed.cut.mark("sign").unwrap();
-        signed.advance(4, true);
-        let duty = roster_duty(signed.cut.is_done("sign"));
-        assert_eq!(duty, RosterDuty::Finish);
-        let finish = signed.observe(duty);
-        assert!(finish.attribution.is_none());
-        assert!(finish.roster.is_none());
-        revalidate_observed_signature_policy(&signed.cut, &finish, duty).unwrap();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_fresh_roster_for_the_same_signer_refuses_the_captured_context_before_staging() {
-        let mut fixture = CurrentRosterCut::new();
-        let unchanged = fixture.observe(RosterDuty::Sign);
-        let manifest = fixture.stage(&unchanged, RosterDuty::Sign).unwrap();
-        assert_eq!(
-            Manifest::parse(&fs::read_to_string(&manifest).unwrap())
-                .unwrap()
-                .roster_seq,
-            Some(3)
-        );
-        assert_eq!(
-            machines::RosterDocument::read(&fixture.cut.dist.join(roster::ROSTER_ASSET)).unwrap(),
-            fixture.cut.roster.clone().unwrap()
-        );
-        fixture.cut.dist = fixture.home.path().join("changed");
-        fixture.advance(4, true);
-        let fresh = fixture.observe(RosterDuty::Sign);
-        assert_eq!(fresh.policy.required, fixture.cut.signature_required);
-        assert_eq!(fresh.policy.pubkey, fixture.cut.signature_pubkey);
-        assert_eq!(fresh.machine_id(), fixture.cut.signature_machine_id);
-        assert_eq!(fresh.attribution.as_ref().unwrap().roster_seq, 4);
-        assert_eq!(fixture.cut.attribution.as_ref().unwrap().roster_seq, 3);
-        let result = fixture.stage(&fresh, RosterDuty::Sign);
-        if let Ok(path) = result.as_ref() {
-            assert_eq!(
-                Manifest::parse(&fs::read_to_string(path).unwrap())
-                    .unwrap()
-                    .roster_seq,
-                Some(3)
-            );
-            assert_eq!(
-                machines::RosterDocument::read(&fixture.cut.dist.join(roster::ROSTER_ASSET))
-                    .unwrap(),
-                fixture.cut.roster.clone().unwrap()
-            );
-        }
-        assert!(
-            result.is_err(),
-            "fresh authority must not admit a different captured roster"
-        );
-        assert!(!fixture.cut.manifest_path().exists());
-        assert!(!fixture.cut.dist.join(roster::ROSTER_ASSET).exists());
-        assert!(
-            !fixture
-                .cut
-                .manifest_path()
-                .with_extension("toml.sig")
-                .exists()
-        );
-    }
-
-    fn names(paths: &[PathBuf]) -> Vec<String> {
-        paths
-            .iter()
-            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
-            .collect()
-    }
-
-    #[test]
-    fn the_lineage_check_reads_the_roster_this_cut_ships_not_a_dist_leftover() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let mut cut = ctx(Some("m3"));
-        cut.dist = tmp.path().to_path_buf();
-        fs::write(
-            cut.dist.join(roster::ROSTER_ASSET),
-            b"an earlier generation",
-        )
-        .unwrap();
-        cut.roster = Some(machines::RosterDocument {
-            bytes: b"the profile's generation".to_vec(),
-            signature: Vec::new(),
-        });
-        assert_eq!(
-            shipped_roster(&cut).as_deref(),
-            Some(&b"the profile's generation"[..])
-        );
-        cut.roster = None;
-        assert_eq!(
-            shipped_roster(&cut).as_deref(),
-            Some(&b"an earlier generation"[..]),
-            "a recovered cut ships the pair it rebuilt in dist/"
-        );
-        cut.signature_machine_id = None;
-        assert_eq!(
-            shipped_roster(&cut),
-            None,
-            "an unrostered cut ships no roster"
-        );
-    }
-
-    #[test]
-    fn an_attributed_cut_carries_its_roster_through_every_asset_set() {
-        let rostered = ctx(Some("m3"));
-        assert!(rostered.attaches_roster());
-        for (label, set) in [
-            ("channel upload", rostered.channel_asset_paths()),
-            (
-                "channel acceptance",
-                rostered
-                    .channel_asset_names()
-                    .iter()
-                    .map(PathBuf::from)
-                    .collect(),
-            ),
-        ] {
-            let set = names(&set);
-            assert!(
-                set.contains(&roster::ROSTER_ASSET.to_string()),
-                "the {label} set must carry the roster: {set:?}"
-            );
-            assert!(
-                set.contains(&roster::ROSTER_SIG_ASSET.to_string()),
-                "the {label} set must carry the roster signature: {set:?}"
-            );
-            assert!(set.contains(&"aterm-appcast.toml".to_string()), "{set:?}");
-        }
-
-        let plain = ctx(None);
-        assert!(!plain.attaches_roster());
-        let set = names(&plain.channel_asset_paths());
-        assert!(
-            !set.iter().any(|n| n.starts_with("aterm-machines")),
-            "an unattributed cut must publish no roster: {set:?}"
-        );
-    }
-
-    #[test]
-    fn the_pin_expectation_is_the_committed_master_whoever_signs() {
-        let master = aterm_update_core::pins::PAPER_MASTER_PUBKEYS
-            .first()
-            .copied()
-            .expect("precondition: this tree pins a paper master");
-        let one = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
-        let two = "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=";
-        let mut signing_one = ctx(None);
-        signing_one.signature_pubkey = Some(one.to_string());
-        let mut signing_two = ctx(None);
-        signing_two.signature_pubkey = Some(two.to_string());
-        let expected = signing_one.expected_embedded_pin().unwrap();
-        assert_eq!(
-            expected,
-            signing_two.expected_embedded_pin().unwrap(),
-            "the binary embeds the COMMITTED anchor, so the cutting machine cannot move \
-             what the build and the self-check expect of it"
-        );
-        assert_eq!(expected, Some(update_key_fingerprint(master).unwrap()));
-        assert_eq!(
-            expected_embedded_update_pin(&[]).unwrap(),
-            None,
-            "a fork with no master has no anchor to prove"
-        );
-        assert_ne!(
-            expected,
-            Some(update_key_fingerprint(one).unwrap()),
-            "deriving from the signer is the trap; the two must be distinguishable"
-        );
-    }
-
-    #[test]
-    fn the_ratchet_reads_both_generations_out_of_manifest_bytes() {
-        let scratch = crate::test_scratch_dir("ratchet");
-        let dir = scratch.path();
-
-        let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
-            version: "0.5.0",
-            build_number: 500,
-            commit: &"a".repeat(40),
-            dmg_name: "aterm-0.5.0.dmg",
-            dmg_sha256: &"ab".repeat(32),
-            zip_name: "aterm-0.5.0-mac.zip",
-            zip_sha256: &"cd".repeat(32),
-            repo_slug: "owner/repo",
-            min_os: "11.0",
-            team_id: "",
-            pub_date: "2026-08-11T00:00:00Z",
-            min_build: None,
-            changelog: "### Added\n- a thing\n",
-        });
-        let unattributed = manifest.to_toml().unwrap();
-        machines::attribute(
-            &mut manifest,
-            &roster::Attribution {
-                machine_id: "m3".to_string(),
-                pubkey_b64: "k".to_string(),
-                roster_seq: 7,
-            },
-        );
-        let attributed = manifest.to_toml().unwrap();
-
-        let head = |text: &str| verify::Published {
-            release_id: Some(1),
-            release: None,
-            tag: "v0.5.0".to_string(),
-            build: 500,
-            version: "0.5.0".to_string(),
-            asset: manifest_out::MANIFEST_ASSET.to_string(),
-            min_build: None,
-            text: text.to_string(),
-        };
-        assert_eq!(published_roster_seq(None).unwrap(), None);
-        assert_eq!(
-            published_roster_seq(Some(&head(&unattributed))).unwrap(),
-            None,
-            "an unrostered head imposes no floor — the fork state"
-        );
-        assert_eq!(
-            published_roster_seq(Some(&head(&attributed))).unwrap(),
-            Some(7)
-        );
-
-        let mut fresh = ctx(Some("m3"));
-        fresh.attribution = Some(roster::Attribution {
-            machine_id: "m3".to_string(),
-            pubkey_b64: "k".to_string(),
-            roster_seq: 7,
-        });
-        assert_eq!(cut_roster_seq(&fresh).unwrap(), Some(7));
-
-        let mut resumed = ctx(Some("m3"));
-        resumed.dist = dir.to_path_buf();
-        fs::write(dir.join(manifest_out::MANIFEST_ASSET), &attributed).unwrap();
-        assert_eq!(
-            cut_roster_seq(&resumed).unwrap(),
-            Some(7),
-            "a resume past build carries no attribution and must read its own manifest"
-        );
-        assert_eq!(cut_roster_seq(&ctx(None)).unwrap(), None);
-        let mut lost = ctx(Some("m3"));
-        lost.dist = dir.join("gone");
-        assert!(cut_roster_seq(&lost).is_err());
-    }
-
-    #[test]
-    fn recovery_rebuilds_exactly_the_roster_assets_publish_will_demand() {
-        let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
-            version: "0.5.0",
-            build_number: 500,
-            commit: &"a".repeat(40),
-            dmg_name: "aterm-0.5.0.dmg",
-            dmg_sha256: &"ab".repeat(32),
-            zip_name: "aterm-0.5.0-mac.zip",
-            zip_sha256: &"cd".repeat(32),
-            repo_slug: "owner/repo",
-            min_os: "11.0",
-            team_id: "",
-            pub_date: "2026-08-11T00:00:00Z",
-            min_build: None,
-            changelog: "### Added\n- a thing\n",
-        });
-        assert!(recovered_roster_asset_names(&manifest).is_empty());
-        assert!(
-            !names(&ctx(manifest.machine_id.as_deref()).channel_asset_paths())
-                .iter()
-                .any(|name| name.starts_with("aterm-machines"))
-        );
-
-        machines::attribute(
-            &mut manifest,
-            &roster::Attribution {
-                machine_id: "m3".to_string(),
-                pubkey_b64: "k".to_string(),
-                roster_seq: 4,
-            },
-        );
-        let rebuilt: Vec<String> = recovered_roster_asset_names(&manifest)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let demanded = names(&ctx(manifest.machine_id.as_deref()).channel_asset_paths());
-        for name in &rebuilt {
-            assert!(demanded.contains(name), "{name} rebuilt but not demanded");
-        }
-        for name in demanded.iter().filter(|n| n.starts_with("aterm-machines")) {
-            assert!(rebuilt.contains(name), "{name} demanded but never rebuilt");
-        }
-        assert_eq!(rebuilt.len(), 2, "{rebuilt:?}");
-    }
-
-    #[test]
-    fn recovery_refuses_to_overwrite_a_newer_local_roster() {
-        let scratch = crate::test_scratch_dir("downgrad");
-        let dir = scratch.path();
-
-        assert!(refuse_roster_downgrade(dir, 1).is_ok());
-
-        let bytes = aterm_codec::base64::decode_strict(ROSTER_SEQ2.concat().as_bytes()).unwrap();
-        let sig = aterm_codec::base64::decode_strict(ROSTER_SEQ2_SIG.as_bytes()).unwrap();
-        std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
-        std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
-
-        let err = refuse_roster_downgrade(dir, 1).unwrap_err();
-        assert!(err.0.contains("NEWER"), "{}", err.0);
-        assert!(err.0.contains(roster::ROSTER_ASSET), "{}", err.0);
-
-        assert!(refuse_roster_downgrade(dir, 2).is_ok());
-        assert!(refuse_roster_downgrade(dir, 3).is_ok());
-
-        std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), [0u8; 64]).unwrap();
-        assert!(refuse_roster_downgrade(dir, 1).is_ok());
-    }
-
-    #[test]
-    fn an_unattributed_release_keeps_the_policy_key() {
-        let manifest = b"schema = 1\nversion = \"0.20.0\"\nbuild_number = 1786405661\n\
-sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
-        let resolved = published_manifest_signature_pubkey(
-            "unused/slug",
-            0,
-            manifest,
-            Some("cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8="),
-        )
-        .expect("an unattributed manifest resolves without any download");
-        assert_eq!(
-            resolved.as_deref(),
-            Some("cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=")
-        );
-    }
-
-    #[test]
-    fn prove_roster_on_disk_enforces_liveness_non_revocation_pubkey_binding_and_unrostered_cleanliness()
-     {
-        use ring::signature::{Ed25519KeyPair, KeyPair};
-
-        let scratch = crate::test_scratch_dir("prove");
-        let dir = scratch.path();
-
-        let master_kp = Ed25519KeyPair::from_seed_unchecked(&[0x51; 32]).unwrap();
-        let master_pk = aterm_codec::base64::encode(master_kp.public_key().as_ref()).unwrap();
-        let m3_kp = Ed25519KeyPair::from_seed_unchecked(&[0x52; 32]).unwrap();
-        let m3_pk = aterm_codec::base64::encode(m3_kp.public_key().as_ref()).unwrap();
-        let other_kp = Ed25519KeyPair::from_seed_unchecked(&[0x53; 32]).unwrap();
-        let other_pk = aterm_codec::base64::encode(other_kp.public_key().as_ref()).unwrap();
-
-        let write_roster = |revoked: &[&str], pubkey: &str| {
-            let doc = roster::Roster {
-                schema: 1,
-                roster_seq: 6,
-                valid_until: "2027-02-01T00:00:00Z".into(),
-                machines: vec![roster::Machine {
-                    id: "m3".into(),
-                    pubkey: pubkey.to_string(),
-                    added_at: "2026-08-04T00:00:00Z".into(),
-                    not_after: None,
-                }],
-                revoked: revoked.iter().map(|id| (*id).to_string()).collect(),
-            };
-            let bytes = doc.to_toml().unwrap().into_bytes();
-            let sig = master_kp.sign(&bytes).as_ref().to_vec();
-            std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
-            std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
-        };
-
-        let base_manifest = || {
-            manifest_out::build(&manifest_out::ManifestInputs {
-                version: "0.5.0",
-                build_number: 500,
-                commit: &"a".repeat(40),
-                dmg_name: "aterm-0.5.0.dmg",
-                dmg_sha256: &"ab".repeat(32),
-                zip_name: "aterm-0.5.0-mac.zip",
-                zip_sha256: &"cd".repeat(32),
-                repo_slug: "owner/repo",
-                min_os: "11.0",
-                team_id: "",
-                pub_date: "2026-08-11T00:00:00Z",
-                min_build: None,
-                changelog: "### Added\n- a thing\n",
-            })
-        };
-
-        let mut attributed = base_manifest();
-        machines::attribute(
-            &mut attributed,
-            &roster::Attribution {
-                machine_id: "m3".to_string(),
-                pubkey_b64: m3_pk.clone(),
-                roster_seq: 5,
-            },
-        );
-
-        let mut rostered_ctx = ctx(Some("m3"));
-        rostered_ctx.dist = dir.to_path_buf();
-        rostered_ctx.signature_pubkey = Some(m3_pk.clone());
-        let now_ok = 1_790_000_000;
-        let masters = [master_pk.as_str()];
-
-        write_roster(&[], &m3_pk);
-        prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
-            .expect("valid staged roster matching verification pubkey passes");
-
-        write_roster(&["m3"], &m3_pk);
-        let revoked_err = prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
-            .expect_err("staged roster revoking the cut's machine must be refused");
-        assert!(
-            revoked_err.0.contains("does not admit machine"),
-            "{}",
-            revoked_err.0
-        );
-
-        write_roster(&[], &other_pk);
-        let key_err = prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
-            .expect_err("staged roster binding machine to a different pubkey must be refused");
-        assert!(key_err.0.contains("binds machine"), "{}", key_err.0);
-
-        write_roster(&[], &m3_pk);
-        let lapsed_err =
-            prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, 1_900_000_000)
-                .expect_err("lapsed staged roster must be refused");
-        assert!(
-            lapsed_err.0.contains("not a fresh roster"),
-            "{}",
-            lapsed_err.0
-        );
-
-        let unrostered_ctx = ctx(None);
-        prove_roster_on_disk_at(&unrostered_ctx, &base_manifest(), &masters, now_ok)
-            .expect("unattributed manifest on unrostered cut passes");
-        let unrostered_err =
-            prove_roster_on_disk_at(&unrostered_ctx, &attributed, &masters, now_ok)
-                .expect_err("attributed manifest on unrostered cut must be refused");
-        assert!(
-            unrostered_err.0.contains("attaches no machine roster"),
-            "{}",
-            unrostered_err.0
-        );
-    }
-
-    const ROSTER_SEQ2: &[&str] = &[
-        "c2NoZW1hID0gMQpyb3N0ZXJfc2VxID0gMgp2YWxpZF91bnRpbCA9ICI5OTk5LTEyLTMxVDAwOjAwOjAwWiIKcmV2",
-        "b2tlZCA9IFtdCgpbW21hY2hpbmVdXQppZCA9ICJpbmN1bWJlbnQtaGVhZCIKcHVia2V5ID0gImN3NWdJR1lRelg2",
-        "eHJoVFhqWFU5bllmTFdlb0lraVoxeVVYN2Qxd21kejg9IgphZGRlZF9hdCA9ICIyMDI2LTA4LTE1VDIxOjU1OjA0",
-        "WiIKCltbbWFjaGluZV1dCmlkID0gIm0zIgpwdWJrZXkgPSAiWU9IdzBPb2VmUTc5TmRFOHFzUUZvYklNUjdRWENo",
-        "cHJlWUJpMk9mNzRVbz0iCmFkZGVkX2F0ID0gIjIwMjYtMDgtMTVUMjE6NTU6MDRaIgo=",
-    ];
-    const ROSTER_SEQ2_SIG: &str =
-        "vNOvNYPssbUN3F/SmnoPDk6za2BAaewu9Vopl5YU7EDd+KUM0Y84eUryvFE9OWUywT/yggXE92SYQ2Qz7k56DA==";
-}
+#[path = "publish_roster_wiring_tests.rs"]
+mod roster_wiring_tests;
 
 #[cfg(test)]
-mod lean_dmg_ceiling_tests {
-    use super::*;
-
-    const LEAN_0_67_0: u64 = 31_018_076; // the shipped lean image
-    const SEEDED_0_63_0: u64 = 1_067_044_990; // a seeded image
-
-    #[test]
-    fn the_v0_63_0_image_is_refused_and_the_lean_one_passes() {
-        assert!(validate_lean_dmg_size("0.67.0", LEAN_0_67_0).is_ok());
-        assert!(
-            validate_release_asset_download_size(SEEDED_0_63_0).is_ok(),
-            "the client bound alone let v0.63.0 through"
-        );
-        let err = validate_lean_dmg_size("0.95.0", SEEDED_0_63_0)
-            .expect_err("a seeded image must be refused");
-        assert!(err.to_string().contains("aterm-0.95.0.dmg"), "{err}");
-    }
-
-    fn sparse_dmg(label: &str, size: u64) -> (aterm_tempfile::TempDir, PathBuf) {
-        let dir = crate::test_scratch_dir(label);
-        let path = dir.path().join("aterm-test.dmg");
-        let file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .expect("create sparse test DMG");
-        file.set_len(size).expect("set sparse test DMG size");
-        (dir, path)
-    }
-
-    #[test]
-    fn the_boundary_is_inclusive() {
-        assert!(validate_lean_dmg_size("0.64.0", LEAN_DMG_CEILING_BYTES).is_ok());
-        assert!(validate_lean_dmg_size("0.64.0", LEAN_DMG_CEILING_BYTES + 1).is_err());
-        assert!(validate_lean_dmg_size("0.64.0", 0).is_ok());
-        assert!(validate_release_asset_download_size(0).is_err());
-    }
-
-    #[test]
-    fn an_oversized_resumed_dmg_is_refused_from_the_actual_file() {
-        let (_dir, path) = sparse_dmg("resume", LEAN_DMG_CEILING_BYTES + 1);
-        validate_lean_dmg_on_disk(&path, "self-check", Some("abandon"))
-            .expect_err("resume must re-check the current dist DMG");
-    }
-
-    #[test]
-    fn an_oversized_recovered_dmg_is_refused_before_publish() {
-        let dir = crate::test_scratch_dir("recovery");
-        let path = dir.path().join("aterm-recovered.dmg");
-        recover_lean_dmg_to(&path, |destination| {
-            let file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(destination)
-                .map_err(|error| Error::new(format!("create recovered test DMG: {error}")))?;
-            file.set_len(LEAN_DMG_CEILING_BYTES + 1)
-                .map_err(|error| Error::new(format!("size recovered test DMG: {error}")))?;
-            Ok(VerifiedReleaseAsset {
-                id: 7,
-                size: 1,
-                sha256: "00".repeat(32),
-            })
-        })
-        .expect_err("recovery must reject the retained seeded image");
-    }
-
-    #[test]
-    fn the_pointer_probe_preserves_the_client_resolvers_three_arms() {
-        use aterm_update_core::pointer::{Pointer, PointerError};
-        let good =
-            "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml";
-        assert_eq!(
-            pointer_probe_from(
-                "alabsystems/aterm",
-                Ok(Pointer {
-                    tag: "v0.74.0".into(),
-                    location: good.into()
-                })
-            )
-            .unwrap(),
-            PointerProbe::Tag {
-                tag: "v0.74.0".into(),
-                location: good.into()
-            }
-        );
-        assert_eq!(
-            pointer_probe_from(
-                "alabsystems/aterm",
-                Err(PointerError::NoRelease { url: "x".into() })
-            )
-            .unwrap(),
-            PointerProbe::NoRelease
-        );
-        assert!(
-            pointer_probe_from(
-                "alabsystems/aterm",
-                Err(PointerError::Transport("curl: (6) DNS".into()))
-            )
-            .is_err(),
-            "a transport failure is an error, never a verdict"
-        );
-        assert!(pointer_probe_from("alabsystems/aterm", Err(PointerError::UnsafeName)).is_err());
-        for refused in [
-            PointerError::Refused {
-                why: "the redirect's tag is not a release tag this client installs from",
-            },
-            PointerError::Transient {
-                code: 503,
-                url: "x".into(),
-            },
-            PointerError::Unexpected {
-                code: 200,
-                url: "x".into(),
-            },
-        ] {
-            let text = refused.to_string();
-            assert_eq!(
-                pointer_probe_from("alabsystems/aterm", Err(refused)).unwrap(),
-                PointerProbe::Other(text)
-            );
-        }
-        assert_eq!(
-            pointer_probe_from(
-                "alabsystems/aterm",
-                Err(PointerError::OtherTag {
-                    tag: "atpkg-index-30".into(),
-                })
-            )
-            .unwrap(),
-            PointerProbe::NotAnApp {
-                tag: "atpkg-index-30".into()
-            }
-        );
-        for (code, refused) in [
-            (
-                429,
-                PointerError::Transient {
-                    code: 429,
-                    url: "x".into(),
-                },
-            ),
-            (
-                403,
-                PointerError::Unexpected {
-                    code: 403,
-                    url: "x".into(),
-                },
-            ),
-        ] {
-            let reason = refused.to_string();
-            assert_eq!(
-                pointer_probe_from("alabsystems/aterm", Err(refused)).unwrap(),
-                PointerProbe::Refused { code, reason }
-            );
-        }
-    }
-
-    #[test]
-    fn the_cut_asserts_the_manifests_url_bind() {
-        let parse = |url: &str| {
-            Manifest::parse(&format!(
-                "schema = 1\nversion = \"0.74.0\"\nbuild_number = 74\n\
-                 sha256 = \"{}\"\ndmg = \"aterm-0.74.0.dmg\"\n{url}",
-                "ab".repeat(32)
-            ))
-            .unwrap()
-        };
-        let bound = parse(
-            "url = \"https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-0.74.0.dmg\"\n",
-        );
-        assert_manifest_url_binds("alabsystems/aterm", "v0.74.0", &bound).unwrap();
-        for (why, url) in [
-            ("absent", ""),
-            (
-                "another channel",
-                "url = \"https://github.com/private/origin/releases/download/v0.74.0/aterm-0.74.0.dmg\"\n",
-            ),
-            (
-                "another tag",
-                "url = \"https://github.com/alabsystems/aterm/releases/download/v0.73.0/aterm-0.74.0.dmg\"\n",
-            ),
-            (
-                "another container",
-                "url = \"https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm.dmg\"\n",
-            ),
-        ] {
-            assert_manifest_url_binds("alabsystems/aterm", "v0.74.0", &parse(url)).expect_err(why);
-        }
-    }
-}
+#[path = "publish_lean_dmg_ceiling_tests.rs"]
+mod lean_dmg_ceiling_tests;
 
 #[cfg(test)]
-mod anonymous_readability_tests {
-
-    use super::*;
-    use aterm_update_core::{HeadAnswer, HttpError};
-
-    const SLUG: &str = "alabsystems/aterm";
-    const TAG: &str = "v0.92.0";
-
-    fn served() -> std::result::Result<HeadAnswer, HttpError> {
-        Ok(HeadAnswer {
-            code: 302,
-            location: Some(
-                "https://release-assets.githubusercontent.com/github-production-release-asset/x"
-                    .into(),
-            ),
-        })
-    }
-
-    fn status(code: u16) -> std::result::Result<HeadAnswer, HttpError> {
-        Ok(HeadAnswer {
-            code,
-            location: None,
-        })
-    }
-
-    fn names() -> Vec<String> {
-        channel::required_asset_names("0.92.0", true, true)
-    }
-
-    fn run(
-        names: &[String],
-        answer: impl Fn(&str, usize) -> std::result::Result<HeadAnswer, HttpError> + Sync,
-    ) -> (Result<u32>, Vec<String>) {
-        let asked = std::sync::Mutex::new(Vec::new());
-        let out = prove_assets_download_anonymously(SLUG, TAG, names, &|url| {
-            let mut asked = asked.lock().unwrap();
-            asked.push(url.to_string());
-            let nth = asked.iter().filter(|u| *u == url).count();
-            drop(asked);
-            answer(url, nth)
-        });
-        (out, asked.into_inner().unwrap())
-    }
-
-    #[test]
-    fn the_readability_proof_never_asks_the_api_host() {
-        let names = names();
-        let (out, mut asked) = run(&names, |_, _| served());
-        assert_eq!(out.unwrap(), names.len() as u32);
-        let mut want: Vec<String> = names
-            .iter()
-            .map(|n| format!("https://github.com/{SLUG}/releases/download/{TAG}/{n}"))
-            .collect();
-        asked.sort();
-        want.sort();
-        assert_eq!(asked, want, "one HEAD per required asset, nothing else");
-        for url in &asked {
-            assert!(
-                !aterm_update_core::cdn::is_api_host(url) && !url.contains("api.github.com"),
-                "the channel's anonymous proof spent the metered API: {url}"
-            );
-        }
-        let retired = format!(
-            "{}/repos/{SLUG}/releases/tags/{TAG}",
-            aterm_update_core::github_rest::Origins::github().api
-        );
-        assert!(aterm_update_core::cdn::is_api_host(&retired));
-    }
-
-    #[test]
-    fn a_refusal_is_asked_once_and_is_not_called_a_rate_limit() {
-        for code in [403_u16, 429] {
-            let (out, asked) = run(&names()[..1], |_, _| status(code));
-            out.expect_err("a refused channel is not proved readable");
-            assert_eq!(
-                asked.len(),
-                1,
-                "HTTP {code} was asked {} times",
-                asked.len()
-            );
-        }
-    }
-
-    #[test]
-    fn a_404_is_a_final_absence_answer_and_is_never_retried() {
-        let names = names();
-        let (out, asked) = run(&names[..1], |_, _| status(404));
-        let refused = out.expect_err("an absent channel is refused").to_string();
-        assert_eq!(asked.len(), 1);
-        assert!(refused.contains("final absence answer"), "{refused}");
-    }
-
-    /// NEGATIVE CONTROLS: a serial dispatcher cannot open the gate; ignoring
-    /// any one of the four results accepts the corresponding planted absence.
-    #[test]
-    fn concurrent_heads_join_and_refuse_each_missing_asset() {
-        use std::sync::{Condvar, Mutex};
-        let names: Vec<String> = (0..4).map(|n| format!("asset-{n}")).collect();
-        for missing in &names {
-            let entered = (Mutex::new(0), Condvar::new());
-            let finished = std::sync::atomic::AtomicUsize::new(0);
-            let result = prove_assets_download_anonymously(SLUG, TAG, &names, &|url| {
-                let mut count = entered.0.lock().unwrap();
-                *count += 1;
-                entered.1.notify_all();
-                let (count, _) = entered
-                    .1
-                    .wait_timeout_while(count, Duration::from_secs(60), |count| *count < 4)
-                    .unwrap();
-                assert_eq!(*count, 4, "all four HEADs enter before any returns");
-                drop(count);
-                finished.fetch_add(1, Ordering::SeqCst);
-                if url.ends_with(missing) {
-                    status(404)
-                } else {
-                    served()
-                }
-            });
-            assert!(result.unwrap_err().to_string().contains(missing));
-            assert_eq!(finished.load(Ordering::SeqCst), 4);
-        }
-    }
-
-    /// Fixed-service timed model of the production HEAD dispatcher. Both
-    /// schedules ask the same thirteen URLs once. No latency assertion.
-    #[test]
-    #[ignore = "explicit anonymous HEAD scheduling measurement"]
-    fn anonymous_heads_abba() {
-        let mut names = names();
-        names.push(crate::service_qualification::REPORT_ASSET.to_string());
-        let read = |_: &str| {
-            std::thread::sleep(Duration::from_millis(40));
-            served()
-        };
-        for (take, parallel) in [false, true, true, false].into_iter().enumerate() {
-            let start = std::time::Instant::now();
-            let issued = if parallel {
-                prove_assets_download_anonymously(SLUG, TAG, &names, &read).unwrap()
-            } else {
-                names
-                    .iter()
-                    .map(|name| {
-                        prove_assets_download_anonymously(
-                            SLUG,
-                            TAG,
-                            std::slice::from_ref(name),
-                            &read,
-                        )
-                        .unwrap()
-                    })
-                    .sum()
-            };
-            assert_eq!(issued as usize, names.len());
-            println!(
-                "anonymous-heads take={take} parallel={parallel} requests={issued} wall_s={:.6}",
-                start.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    #[test]
-    fn only_a_redirect_into_the_asset_storage_reads_as_downloadable() {
-        let at = |code: u16, location: &str| {
-            classify_asset_head(Ok(HeadAnswer {
-                code,
-                location: Some(location.to_string()),
-            }))
-        };
-        assert_eq!(
-            at(302, "https://release-assets.githubusercontent.com/x"),
-            AssetHead::Downloads
-        );
-        assert_eq!(
-            at(307, "https://objects.githubusercontent.com/x"),
-            AssetHead::Downloads
-        );
-        assert_eq!(
-            at(302, "https://release-objects.githubusercontent.com/x"),
-            AssetHead::Downloads
-        );
-        for (code, location) in [
-            (301, "https://release-assets.githubusercontent.com/x"),
-            (302, "http://release-assets.githubusercontent.com/x"),
-            (
-                302,
-                "https://release-assets.githubusercontent.com.evil.example/x",
-            ),
-            (302, "https://user@release-assets.githubusercontent.com/x"),
-            (302, "https://githubusercontent.com/x"),
-            (302, "https://portal.example/login"),
-        ] {
-            assert!(
-                matches!(at(code, location), AssetHead::Inconclusive(_)),
-                "{code} {location} must not read as downloadable"
-            );
-        }
-        assert!(matches!(
-            classify_asset_head(status(200)),
-            AssetHead::Inconclusive(_)
-        ));
-        assert_eq!(classify_asset_head(status(404)), AssetHead::NotServed);
-        assert_eq!(classify_asset_head(status(403)), AssetHead::Refused(403));
-        assert_eq!(classify_asset_head(status(429)), AssetHead::Refused(429));
-        assert!(matches!(
-            classify_asset_head(Err(HttpError::Transport("curl: (6) DNS".into()))),
-            AssetHead::Inconclusive(_)
-        ));
-    }
-}
+#[path = "publish_anonymous_readability_tests.rs"]
+mod anonymous_readability_tests;
 
 #[cfg(test)]
-mod remedy_tests {
-    use super::*;
-
-    #[test]
-    fn an_in_flight_cut_refuses_a_fresh_cut() {
-        let journal = JournalHeader {
-            format: JOURNAL_FORMAT,
-            version: "0.92.0".into(),
-            build_number: 1_790_200_000,
-            commit: "a".repeat(40),
-            done: vec!["lock".into()],
-        };
-        for kind in [CutKind::Real, CutKind::DryRun] {
-            assert!(fresh_cut_journal_triage(Some(&journal), kind).is_err());
-        }
-    }
-}
+#[path = "publish_remedy_tests.rs"]
+mod remedy_tests;
 
 #[cfg(test)]
-mod artifact_proof_tests {
-
-    use super::*;
-
-    const VERSION: &str = "0.5.0";
-    const BUILD: u64 = 500;
-
-    fn fixture(label: &str) -> (aterm_tempfile::TempDir, CutCtx) {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-artifact-proof-{label}-"))
-            .tempdir()
-            .unwrap();
-        let root = dir.path().to_path_buf();
-        let dist = root.join("dist");
-        let app = bundle::staged_app_path(&dist, BUILD);
-        fs::create_dir_all(app.join("Contents")).unwrap();
-        fs::write(
-            app.join("Contents/Info.plist"),
-            format!(
-                "<plist><dict><key>CFBundleShortVersionString</key><string>{VERSION}</string>\
-                 <key>CFBundleVersion</key><string>{BUILD}</string></dict></plist>"
-            ),
-        )
-        .unwrap();
-        let commit = "a".repeat(40);
-        fs::write(
-            dist.join(format!("aterm-{VERSION}-build.txt")),
-            format!(
-                "version={VERSION}\nbuild={BUILD}\ncommit={}\n",
-                &commit[..12]
-            ),
-        )
-        .unwrap();
-        let dmg = dist.join(channel::dmg_asset_name(VERSION));
-        let zip = dist.join(channel::zip_asset_name(VERSION));
-        fs::write(&dmg, b"the lean dmg bytes").unwrap();
-        fs::write(&zip, b"the updater zip bytes").unwrap();
-        let dmg_sha = dmg::sha256_file(&dmg).unwrap();
-        let zip_sha = dmg::sha256_file(&zip).unwrap();
-        stage_manifest(
-            &dist,
-            &manifest_out::ManifestInputs {
-                version: VERSION,
-                build_number: BUILD,
-                commit: &commit,
-                dmg_name: &channel::dmg_asset_name(VERSION),
-                dmg_sha256: &dmg_sha,
-                zip_name: &channel::zip_asset_name(VERSION),
-                zip_sha256: &zip_sha,
-                repo_slug: "channel/repo",
-                min_os: "11.0",
-                team_id: "",
-                pub_date: "2026-09-23T00:00:00Z",
-                min_build: None,
-                changelog: "- a change",
-            },
-            None,
-            None,
-        )
-        .unwrap();
-        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
-        fs::write(app.join("Contents/MacOS/aterm"), b"test executable").unwrap();
-        crate::service_qualification::fixture(
-            &app,
-            BUILD,
-            &commit,
-            &dist.join(manifest_out::MANIFEST_ASSET),
-        );
-        let ctx = CutCtx {
-            credentials: None,
-            apple: sign::AppleTier::Inactive,
-            repo: root.clone(),
-            tree: root,
-            dist: dist.clone(),
-            journal_path: dist.join("cut-state.toml"),
-            slug: "owner/repo".to_string(),
-            version: VERSION.to_string(),
-            tag: format!("v{VERSION}"),
-            build: BUILD,
-            commit,
-            min_build: None,
-            artifact: Some("aa".repeat(32)),
-            macho_sha256: Some("bb".repeat(32)),
-            manifest_signed: false,
-            signature_required: false,
-            signature_pubkey: None,
-            verify_pubkey: None,
-            signature_machine_id: None,
-            attribution: None,
-            roster: None,
-            release_id: None,
-            release_intent: false,
-            upload_intents: Vec::new(),
-            kind: CutKind::DryRun,
-            lease: None,
-            fence: None,
-            notes_section: VERSION.to_string(),
-            journal: None,
-            adopted: false,
-            linux: None,
-        };
-        (dir, ctx)
-    }
-
-    #[test]
-    fn the_publication_steps_reprove_bytes_and_run_nothing() {
-        let (_fixture, mut ctx) = fixture("bytes");
-        let manifest = prove_artifacts_on_disk(&ctx).expect("the bytes are the manifest's");
-        assert_eq!(manifest.build_number, BUILD);
-        assert!(ctx.stable_dmg_path().is_file() && ctx.dmg_sha256_path().is_file());
-
-        let error = step_selfcheck(&mut ctx)
-            .expect_err("the behavioural pass must run the binary")
-            .to_string();
-        assert!(error.contains("spawn aterm --diagnose"), "{error}");
-    }
-
-    #[test]
-    fn a_byte_that_changes_after_the_selfcheck_is_refused_by_digest() {
-        let (_fixture, ctx) = fixture("dmg-flip");
-        prove_artifacts_on_disk(&ctx).expect("the untouched bytes pass");
-        let mut dmg = fs::read(ctx.dmg_path()).unwrap();
-        dmg[0] ^= 1;
-        fs::write(ctx.dmg_path(), &dmg).unwrap();
-        let error = prove_artifacts_on_disk(&ctx)
-            .expect_err("a flipped DMG byte must be refused")
-            .to_string();
-        assert!(error.contains("DMG sha256"), "{error}");
-
-        let (_fixture, ctx) = fixture("zip-flip");
-        let mut zip = fs::read(ctx.zip_path()).unwrap();
-        zip[0] ^= 1;
-        fs::write(ctx.zip_path(), &zip).unwrap();
-        let error = prove_artifacts_on_disk(&ctx)
-            .expect_err("a flipped zip byte must be refused")
-            .to_string();
-        assert!(error.contains("zip sha256"), "{error}");
-    }
-}
+#[path = "publish_artifact_proof_tests.rs"]
+mod artifact_proof_tests;
 
 #[cfg(test)]
-mod local_probe_tests {
-    use super::{GroupState, LocalProbe};
-    use crate::interrupt::Proc;
-
-    fn proc(pid: i32, pgid: i32, name: &str) -> Proc {
-        Proc {
-            pid,
-            parent: 1,
-            pgid,
-            name: name.to_string(),
-        }
-    }
-
-    /// A group is read from a listing that shows this process: its members by pid and name,
-    /// empty when none is in it, and unknown when the listing lacks this process.
-    #[test]
-    fn a_group_reads_from_a_listing_that_shows_this_process() {
-        let procs = || {
-            vec![
-                proc(40, 40, "zsh"),
-                proc(41, 77, "aterm-release"),
-                proc(42, 77, "curl"),
-                proc(43, 78, "git"),
-            ]
-        };
-        assert_eq!(
-            LocalProbe::group_of(procs(), 77, 40),
-            GroupState::Members(vec![
-                (41, "aterm-release".to_string()),
-                (42, "curl".to_string())
-            ])
-        );
-        assert_eq!(LocalProbe::group_of(procs(), 79, 40), GroupState::Empty);
-        assert!(matches!(
-            LocalProbe::group_of(procs(), 77, 99),
-            GroupState::Unknown(why) if why.contains("did not list this process")
-        ));
-    }
-
-    /// A live process started through a symlink of another name reads by the path it was
-    /// started by, as `current_exe` records a publisher's, not by the image the link resolves
-    /// to, so a live publisher run through such a link is never read as its pid reused.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_process_started_through_a_symlink_reads_by_the_path_it_was_started_by() {
-        use super::{PidState, PublisherProbe as _};
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let link = dir.path().join("cut");
-        std::os::unix::fs::symlink("/bin/sleep", &link).expect("link sleep as cut");
-        let mut child = aterm_uds::spawnfd::command(&link)
-            .arg("600")
-            .spawn()
-            .expect("run sleep through the link");
-        let pid = i32::try_from(child.id()).expect("pid");
-        let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while aterm_uds::process::thread_ran(pid) != Some(true) {
-            if std::time::Instant::now() > bound {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("the linked sleep never ran");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let state = LocalProbe.pid_state(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(
-            state,
-            PidState::Running {
-                exe: Some(link.display().to_string())
-            }
-        );
-    }
-}
+#[path = "publish_local_probe_tests.rs"]
+mod local_probe_tests;
 
 #[cfg(test)]
-mod signed_copy_tests {
-
-    use super::*;
-
-    const VERSION: &str = "0.5.0";
-    const BUILD: u64 = 500;
-
-    fn key() -> SignedKey {
-        SignedKey {
-            artifact: "k".repeat(64),
-            bundle_digest: "d".repeat(64),
-            macho_sha256: "m".repeat(64),
-            version: VERSION.into(),
-            build: BUILD,
-            commit: "c".repeat(40),
-            team: "TEAMID1234".into(),
-            identity: Some("F".repeat(40)),
-            signature_required: true,
-            update_pin: Some("p".repeat(64)),
-        }
-    }
-
-    /// A `dist/` holding a signed copy of build [`BUILD`]: its staged bundle, both containers,
-    /// their twins and sidecars, and its provenance; and the record `cut --sign` keeps of it.
-    fn signed_dist() -> (aterm_tempfile::TempDir, PathBuf, SignedRecord) {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-signed-copy-")
-            .tempdir()
-            .unwrap();
-        let dist = dir.path().join("dist");
-        let app = bundle::staged_app_path(&dist, BUILD);
-        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
-        fs::write(app.join("Contents/MacOS/aterm"), b"signed executable").unwrap();
-        fs::write(app.join("Contents/Info.plist"), b"<plist/>").unwrap();
-        for (name, bytes) in [
-            (channel::dmg_asset_name(VERSION), &b"the notarized dmg"[..]),
-            (channel::zip_asset_name(VERSION), b"the stapled zip"),
-            (channel::provenance_asset_name(VERSION), b"version=0.5.0\n"),
-            (channel::stable_dmg_asset_name(), b"the notarized dmg"),
-            (channel::stable_zip_asset_name(), b"the stapled zip"),
-            (
-                channel::sha256_sidecar_name(&channel::dmg_asset_name(VERSION)),
-                b"sum",
-            ),
-        ] {
-            fs::write(dist.join(name), bytes).unwrap();
-        }
-        let record = SignedRecord {
-            format: SIGNED_FORMAT,
-            key: key(),
-            outputs: signed_outputs(&dist, VERSION, BUILD).unwrap(),
-        };
-        write_signed_record(&dist, &record).unwrap();
-        (dir, dist, record)
-    }
-
-    #[test]
-    fn a_record_adopts_only_its_own_bytes_under_its_own_key() {
-        let (_dir, dist, record) = signed_dist();
-        assert_eq!(
-            read_signed_record(&dist, BUILD).unwrap().as_ref(),
-            Some(&record),
-            "the record reads back as written"
-        );
-        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
-
-        // NEGATIVE CONTROLS: one changed byte of any output, or any field of the key, signs again.
-        let dmg = dist.join(channel::dmg_asset_name(VERSION));
-        fs::write(&dmg, b"the notarized dmG").unwrap();
-        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
-        assert!(why.starts_with("the DMG is "), "{why}");
-        fs::write(&dmg, b"the notarized dmg").unwrap();
-        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
-
-        let exe = bundle::staged_app_path(&dist, BUILD).join("Contents/MacOS/aterm");
-        fs::write(&exe, b"signed executablE").unwrap();
-        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
-        assert!(why.starts_with("the signed bundle is "), "{why}");
-        fs::write(&exe, b"signed executable").unwrap();
-
-        let zip = dist.join(channel::zip_asset_name(VERSION));
-        fs::write(&zip, b"the stapled ziP").unwrap();
-        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
-        assert!(why.starts_with("the zip is "), "{why}");
-        fs::write(&zip, b"the stapled zip").unwrap();
-        let provenance = dist.join(channel::provenance_asset_name(VERSION));
-        fs::write(&provenance, b"version=0.5.1\n").unwrap();
-        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
-        assert!(why.starts_with("the provenance is "), "{why}");
-        fs::write(&provenance, b"version=0.5.0\n").unwrap();
-        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
-        type Size = fn(&mut SignedOutputs);
-        let sizes: [(&str, Size); 2] = [
-            ("the DMG's size", |o| o.dmg_size += 1),
-            ("the zip's size", |o| o.zip_size += 1),
-        ];
-        for (what, change) in sizes {
-            let mut other = record.clone();
-            change(&mut other.outputs);
-            let why = signed_copy_stands(&other, &key(), &dist).unwrap_err();
-            assert!(why.starts_with(&format!("{what} is ")), "{what}: {why}");
-        }
-
-        type Change = fn(&mut SignedKey);
-        let changes: [(&str, Change); 10] = [
-            ("bundle", |k| k.artifact = "a".repeat(64)),
-            ("bundle digest", |k| k.bundle_digest = "e".repeat(64)),
-            ("executable", |k| k.macho_sha256 = "n".repeat(64)),
-            ("version", |k| k.version = "0.5.1".into()),
-            ("build", |k| k.build += 1),
-            ("release commit", |k| k.commit = "b".repeat(40)),
-            ("team", |k| k.team = "OTHERTEAM1".into()),
-            ("Developer ID", |k| k.identity = None),
-            ("manifest signature requirement", |k| {
-                k.signature_required = false
-            }),
-            ("update pin", |k| k.update_pin = None),
-        ];
-        for (field, change) in changes {
-            let mut other = key();
-            change(&mut other);
-            let why = signed_copy_stands(&record, &other, &dist).unwrap_err();
-            assert!(
-                why.contains(&format!("signed as {field} ")),
-                "{field}: {why}"
-            );
-        }
-        let mut old = record.clone();
-        old.format = SIGNED_FORMAT + 1;
-        assert!(signed_copy_stands(&old, &key(), &dist).is_err());
-    }
-
-    /// NEGATIVE CONTROLS: writing signed.toml during preparation makes it adoptable before
-    /// READY; executing the callback then overlaps the bundle's windowed checks.
-    #[test]
-    fn early_packaging_cannot_be_adopted_until_its_local_check_passes() {
-        let (_dir, dist, record) = signed_dist();
-        forget_signed_record(&dist, BUILD).unwrap();
-        finish_private_copy(&dist, &record, true, || {
-            panic!("windowed check before READY")
-        })
-        .unwrap();
-        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-        assert_eq!(
-            prepared_record(&dist, &record.key).unwrap(),
-            Some(record.clone())
-        );
-
-        // An interrupted self-check creates no adoptable record. The same prepared bytes
-        // survive and can be checked on resume without another signing operation.
-        assert!(
-            finish_private_copy(&dist, &record, false, || Err(Error::new("interrupted"))).is_err()
-        );
-        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-        assert_eq!(
-            prepared_record(&dist, &record.key).unwrap(),
-            Some(record.clone())
-        );
-        finish_private_copy(&dist, &record, false, || Ok(())).unwrap();
-        assert_eq!(read_signed_record(&dist, BUILD).unwrap(), Some(record));
-        assert!(!prepared_record_path(&dist, BUILD).exists());
-    }
-
-    /// NEGATIVE CONTROL: skipping the prepared key or output comparison admits different
-    /// bytes after interruption. A changed executable key must refuse, never sign anew.
-    #[test]
-    fn prepared_bytes_refuse_a_changed_executable_and_discard_on_bundle_red() {
-        let (_dir, dist, record) = signed_dist();
-        forget_signed_record(&dist, BUILD).unwrap();
-        finish_private_copy(&dist, &record, true, || panic!("no self-check")).unwrap();
-        let mut changed = record.key.clone();
-        changed.macho_sha256 = "other executable".into();
-        assert!(
-            prepared_record(&dist, &changed)
-                .unwrap_err()
-                .0
-                .contains("executable")
-        );
-        fs::write(
-            bundle::staged_app_path(&dist, BUILD).join("Contents/MacOS/aterm"),
-            b"changed",
-        )
-        .unwrap();
-        assert!(prepared_record(&dist, &record.key).is_err());
-        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-        assert!(
-            discard_signed(
-                &dist,
-                VERSION,
-                BUILD,
-                crate::release::SignedDiscard::CancelPreparation
-            )
-            .is_empty()
-        );
-        assert!(prepared_record(&dist, &record.key).unwrap().is_none());
-        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-    }
-
-    #[test]
-    fn selfcheck_cannot_certify_outputs_that_changed_while_it_ran() {
-        let (_dir, dist, record) = signed_dist();
-        forget_signed_record(&dist, BUILD).unwrap();
-        assert!(
-            finish_private_copy(&dist, &record, false, || {
-                fs::write(
-                    dist.join(channel::dmg_asset_name(VERSION)),
-                    b"different dmg",
-                )
-                .unwrap();
-                Ok(())
-            })
-            .is_err()
-        );
-        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-    }
-
-    /// A RECORD THAT CANNOT BE READ IS NO RECORD OF THESE BYTES: the claim removes it and signs
-    /// again, rather than refusing on every resume. NEGATIVE CONTROL: passing the read's error on
-    /// leaves the cut stuck behind the file.
-    #[test]
-    fn an_unreadable_record_is_removed_and_the_copy_signed_again() {
-        let (_dir, dist, record) = signed_dist();
-        let read = |dist: &Path| read_signed_record(dist, BUILD).transpose().unwrap();
-        assert_eq!(
-            standing_record(read(&dist), &key(), &dist).unwrap(),
-            Some(record)
-        );
-        fs::write(signed_record_path(&dist, BUILD), b"format = \"two\"\n").unwrap();
-        assert_eq!(standing_record(read(&dist), &key(), &dist).unwrap(), None);
-        assert_eq!(
-            read_signed_record(&dist, BUILD),
-            Ok(None),
-            "its record is removed"
-        );
-    }
-
-    /// `CUT --SIGN` RECORDS ONLY THE OUTPUTS IT MADE: a DMG or zip in `dist/` other than the one
-    /// it signed and packaged is never recorded for a claim to adopt. NEGATIVE CONTROL: recording
-    /// what `dist/` holds at the end records the other zip.
-    #[test]
-    fn cut_sign_records_only_the_outputs_it_made() {
-        let (_dir, _dist, record) = signed_dist();
-        let made = SignedCopy {
-            app: PathBuf::new(),
-            dmg: PathBuf::new(),
-            dmg_sha256: record.outputs.dmg_sha256.clone(),
-            zip_sha256: record.outputs.zip_sha256.clone(),
-        };
-        assert!(outputs_as_signed(&record.outputs, &made).is_ok());
-        let other = SignedCopy {
-            zip_sha256: "0".repeat(64),
-            ..made
-        };
-        let why = outputs_as_signed(&record.outputs, &other)
-            .unwrap_err()
-            .to_string();
-        assert!(why.contains("the zip in dist/"), "{why}");
-    }
-
-    /// `CUT --SIGN` STANDS ASIDE ONLY FROM AN UNFINISHED CUT: an earlier release's finished cut
-    /// journal is the next fresh cut's to clear, so a clone signs its next release beside it.
-    /// NEGATIVE CONTROL: refusing beside any journal stops every release after a clone's first.
-    #[test]
-    fn cut_sign_stands_aside_only_from_an_unfinished_cut() {
-        let header = |done: &[&str]| JournalHeader {
-            format: 1,
-            version: VERSION.into(),
-            build_number: BUILD,
-            commit: "c".repeat(40),
-            done: done.iter().map(|s| (*s).to_string()).collect(),
-        };
-        let path = Path::new("dist/cut-state.toml");
-        assert!(sign_beside_journal(None, path).is_ok());
-        assert!(
-            sign_beside_journal(Some(&header(&["claim", "unlock"])), path).is_ok(),
-            "an earlier release's finished cut stands aside"
-        );
-        let why = sign_beside_journal(Some(&header(&["claim"])), path)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            why.contains("--resume") && why.contains("Nothing was signed"),
-            "{why}"
-        );
-    }
-
-    #[test]
-    fn a_discarded_copy_leaves_nothing_of_itself_in_dist() {
-        let (_dir, dist, _) = signed_dist();
-        let kept = dist.join("notes-0.5.0.md");
-        fs::write(&kept, b"notes").unwrap();
-        assert_eq!(
-            discard_signed(
-                &dist,
-                VERSION,
-                BUILD,
-                crate::release::SignedDiscard::LostReservation
-            ),
-            Vec::<String>::new()
-        );
-        assert_eq!(read_signed_record(&dist, BUILD), Ok(None));
-        assert!(!dist.join(bundle::staging_dir_name(BUILD)).exists());
-        for name in [
-            channel::dmg_asset_name(VERSION),
-            channel::zip_asset_name(VERSION),
-            channel::provenance_asset_name(VERSION),
-            channel::stable_dmg_asset_name(),
-            channel::stable_zip_asset_name(),
-            channel::sha256_sidecar_name(&channel::dmg_asset_name(VERSION)),
-        ] {
-            assert!(!dist.join(&name).exists(), "{name} is left");
-        }
-        assert!(kept.exists(), "what is not the copy's stays");
-        assert_eq!(
-            discard_signed(
-                &dist,
-                VERSION,
-                BUILD,
-                crate::release::SignedDiscard::LostReservation
-            ),
-            Vec::<String>::new(),
-            "a second discard finds nothing"
-        );
-    }
-
-    #[test]
-    fn only_a_tail_at_or_past_the_reservation_lost_the_race() {
-        let ledger = "1791500000 0.5.0\n";
-        assert!(lost_the_race(ledger, 1_791_500_000));
-        assert!(lost_the_race(ledger, 1_791_499_999));
-        assert!(!lost_the_race(ledger, 1_791_500_001));
-        assert!(
-            !lost_the_race("not a ledger", 1),
-            "an unread ledger is no lost race"
-        );
-    }
-
-    /// Origin's ledger, as `git show origin/main:RELEASES.ledger` answers it.
-    struct Origin(&'static str);
-
-    impl GitRunner for Origin {
-        fn git(&self, args: &[&str]) -> Result<RunOut> {
-            assert_eq!(args, ["show", "origin/main:RELEASES.ledger"]);
-            Ok(RunOut {
-                status: 0,
-                stdout: self.0.as_bytes().to_vec(),
-                stderr: Vec::new(),
-            })
-        }
-    }
-
-    /// A claim refused because origin's tail reached the reservation discards the copy and
-    /// says so; a claim refused for any other cause keeps it for the next run to adopt.
-    #[test]
-    fn only_a_claim_that_lost_the_race_discards_the_copy() {
-        let (_dir, dist, record) = signed_dist();
-        let kept = discard_on_lost_race(
-            &Origin("499 0.4.0\n"),
-            &dist,
-            VERSION,
-            BUILD,
-            Error::new("the claim's push was refused"),
-        );
-        assert_eq!(kept.to_string(), "the claim's push was refused");
-        assert_eq!(read_signed_record(&dist, BUILD), Ok(Some(record)));
-        assert!(dist.join(channel::dmg_asset_name(VERSION)).exists());
-
-        let lost = discard_on_lost_race(
-            &Origin("500 0.5.0\n"),
-            &dist,
-            VERSION,
-            BUILD,
-            Error::new("origin's ledger reached build 500"),
-        )
-        .to_string();
-        assert!(
-            lost.starts_with(
-                "origin's ledger reached build 500. The copy signed, notarized and \
-                              packaged privately as build 500 was discarded; nothing of it was \
-                              made public"
-            ),
-            "{lost}"
-        );
-        assert_eq!(read_signed_record(&dist, BUILD), Ok(None));
-        assert!(!dist.join(channel::dmg_asset_name(VERSION)).exists());
-        assert!(!dist.join(bundle::staging_dir_name(BUILD)).exists());
-    }
-}
+#[path = "publish_signed_copy_tests.rs"]
+mod signed_copy_tests;

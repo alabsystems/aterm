@@ -2,12 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! One bounded account-menu read, with a latest pending request and owner fencing.
+//!
+//! A read is everything the Account card says that a file, a table or the journal holds
+//! ([`AccountRead`]): this Mac's pool rows, and the card of the account the tab runs on
+//! ([`aterm_agent::harness::account_card::build`]). The two fail apart: a roster that cannot be
+//! read still leaves the card what the pool file, the claims table and the journal say, and the
+//! card's reads never fail the rows. Each read runs on its own short-lived worker thread, so
+//! what is worth keeping between two reads lives in [`State`]'s [`CardMemo`]: the history fold,
+//! kept while the series files and the local day stand, and the pool file and claims table, read
+//! at most once a minute.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::{accounts, footer::FactsOwner};
+use aterm_agent::harness::account_card::{self, AccountCard, History, HistoryIn};
+use aterm_agent::harness::account_history::{self, HistoryWho};
+use aterm_agent::harness::profile::AccountKey;
+use aterm_agent::harness::{accounts, ai_pool, alab_seen, claims, footer::FactsOwner};
 
 use crate::autopilot_menu::MenuOwner;
 use crate::claude_lights::Fact;
@@ -15,7 +27,106 @@ use crate::fact_menu::{AccountMenuRow, SessionWeek};
 use crate::session_timeline::{ForegroundStamp, SessionTimeline};
 use crate::{App, Wake, WindowId};
 
-pub(crate) type ResultRows = Result<(Vec<AccountMenuRow>, bool, Option<String>), String>;
+/// This Mac's pool as the card lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PoolRows {
+    /// One row an account, in roster order.
+    pub(crate) rows: Vec<AccountMenuRow>,
+    /// The shown name of the account this Mac's pool is pinned to (`None`: no committed pin; a
+    /// pin on a row the roster no longer lists is that row's label).
+    pub(crate) pinned: Option<String>,
+    /// The saved manual selection's last observed queue place, without an ETA.
+    pub(crate) queue: Option<String>,
+}
+
+/// One read for the Account card: the pool's rows, or why they could not be read, and the card
+/// of the tab's account, which is built whether or not the rows were.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountRead {
+    pub(crate) pool: Result<PoolRows, String>,
+    /// `None` only where no read was made at all ([`AccountRead::failed`]).
+    pub(crate) card: Option<AccountCard>,
+}
+
+impl AccountRead {
+    /// A read that could not be made at all (no worker, no clock, a reader that stopped): no
+    /// rows for `why`, and no card. It reads nothing, so the window's thread may make it.
+    fn failed(why: impl Into<String>) -> Self {
+        Self {
+            pool: Err(why.into()),
+            card: None,
+        }
+    }
+}
+
+/// How long a read of the pool file and the claims table serves the card's 2-second re-reads:
+/// the table's read waits on the lab's database, and its rows move with claims that last an hour.
+const MACHINES_EVERY_S: i64 = 60;
+
+/// The local days of history a card's read spans: the seven weeks its daily row draws, and the
+/// eight days of its hourly rows inside them.
+const HISTORY_DAYS: i64 = 50;
+
+/// What two reads of one card share.
+#[derive(Default)]
+struct CardMemo {
+    history: Option<HistoryMemo>,
+    machines: Option<MachinesMemo>,
+    /// Which Mac this is, as the last pool read that worked named it, for a read whose pool
+    /// read fails.
+    this_mac: Option<ThisMac>,
+}
+
+/// This Mac as an accounts store names it: what tells its own rows in the pool file, the claims
+/// table and the journal from another Mac's.
+#[derive(Clone)]
+struct ThisMac {
+    cli: accounts::Cli,
+    state_dir: PathBuf,
+    machine: String,
+    swarm_label: Option<String>,
+    swarm_aliases: Vec<String>,
+}
+
+/// The last history fold and what it was folded from.
+struct HistoryMemo {
+    who: HistoryWho,
+    state_dir: PathBuf,
+    machine: String,
+    /// [`account_history::stamp`] at the fold.
+    stamp: u64,
+    /// The local day of the fold: a day's turn moves every day's place.
+    day: i64,
+    history: Arc<History>,
+}
+
+/// The last read of the pool file and the claims table.
+struct MachinesMemo {
+    home: Option<PathBuf>,
+    at: i64,
+    read: Arc<Machines>,
+}
+
+struct Machines {
+    pool: Option<ai_pool::Pool>,
+    claims: Result<Option<(claims::View, claims::Book)>, String>,
+}
+
+/// The local clock's offset from UTC at `t`, seconds east; UTC where the zone cannot be read.
+fn local_tz(t: i64) -> i64 {
+    crate::autopilot_timers::local_offset_at(t).unwrap_or(0)
+}
+
+impl Key {
+    /// `other` is this key but for the session's own week reading: the same tab on the same
+    /// account, read again.
+    fn same_but_week(&self, other: &Key) -> bool {
+        Key {
+            week: other.week.clone(),
+            ..self.clone()
+        } == *other
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Key {
@@ -28,6 +139,9 @@ struct Key {
     cli: accounts::Cli,
     account: Option<String>,
     email: Option<String>,
+    /// The account key the session's profile names: what finds the history of a login no roster
+    /// row lists.
+    profile_key: Option<AccountKey>,
     week: SessionWeek,
     config: Option<PathBuf>,
     state: Option<PathBuf>,
@@ -45,7 +159,7 @@ struct Active {
     generation: u64,
     wid: WindowId,
     input: Input,
-    rows: Option<Arc<ResultRows>>,
+    rows: Option<Arc<AccountRead>>,
     read_at: Option<Instant>,
 }
 
@@ -56,6 +170,8 @@ pub(crate) struct State {
     in_flight: Option<u64>,
     pending: Option<(u64, Input)>,
     deferred_keyboard_selection: bool,
+    /// What one read leaves the next, across the worker threads ([`CardMemo`]).
+    memo: Arc<Mutex<CardMemo>>,
     #[cfg(test)]
     hold_for_test: bool,
 }
@@ -63,7 +179,7 @@ pub(crate) struct State {
 #[derive(Debug)]
 pub(crate) struct Completion {
     generation: u64,
-    rows: ResultRows,
+    rows: AccountRead,
 }
 
 impl State {
@@ -99,13 +215,16 @@ impl State {
         {
             return;
         }
-        let (rows, read_at) =
-            same.map_or((None, None), |active| (active.rows.clone(), active.read_at));
-        if self
+        // A new week reading of the same tab on the same account moves only that account's
+        // figure: the last read stays shown until the read it asks for lands, so the card's
+        // sections, the pool's items and a highlight on one hold their places meanwhile.
+        let kept = self
             .active
             .as_ref()
-            .is_some_and(|active| active.input.key != input.key)
-        {
+            .filter(|active| active.wid == wid && active.input.key.same_but_week(&input.key));
+        let (rows, read_at) =
+            kept.map_or((None, None), |active| (active.rows.clone(), active.read_at));
+        if self.active.is_some() && kept.is_none() {
             self.deferred_keyboard_selection = false;
         }
         self.generation = self.generation.saturating_add(1);
@@ -230,6 +349,13 @@ impl App {
                         .and_then(|s| s.email.clone())
                 })
                 .flatten(),
+            profile_key: (cli == accounts::Cli::Claude)
+                .then(|| {
+                    facts
+                        .and_then(|f| f.subscription.as_ref())
+                        .and_then(|s| s.account)
+                })
+                .flatten(),
             week,
             config,
             state,
@@ -248,7 +374,7 @@ impl App {
         self.dispatch_account_menu_read();
     }
 
-    pub(crate) fn account_menu_rows_cached(&self, session: u64) -> Option<&ResultRows> {
+    pub(crate) fn account_menu_rows_cached(&self, session: u64) -> Option<&AccountRead> {
         let input = self.account_menu_input(session)?;
         self.account_menu_read
             .active
@@ -272,22 +398,23 @@ impl App {
         let Some(proxy) = self.proxy.clone() else {
             self.on_account_menu_read(Completion {
                 generation,
-                rows: Err("background account delivery is unavailable".into()),
+                rows: AccountRead::failed("background account delivery is unavailable"),
             });
             return;
         };
+        let memo = Arc::clone(&self.account_menu_read.memo);
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-account-menu",
             crate::qos::Role::Background,
             move || {
-                let done = complete_read(generation, || read_rows(input));
+                let done = complete_read(generation, || read_account(&input, &memo));
                 let _ = proxy.send_event(Wake::AccountMenuRead(done));
             },
         );
         if let Err(error) = spawned {
             self.on_account_menu_read(Completion {
                 generation,
-                rows: Err(format!("account reader could not start: {error}")),
+                rows: AccountRead::failed(format!("account reader could not start: {error}")),
             });
         }
     }
@@ -351,33 +478,261 @@ impl App {
     }
 }
 
-fn read_rows(input: Input) -> ResultRows {
-    let now = aterm_time::unix_secs()
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or("account clock is unavailable")?;
-    let Key {
-        cli,
-        config,
+fn unix_now() -> Option<i64> {
+    aterm_time::unix_secs().and_then(|value| i64::try_from(value).ok())
+}
+
+/// One read for `input`'s card, on the worker: the pool's rows and the account's card.
+fn read_account(input: &Input, memo: &Mutex<CardMemo>) -> AccountRead {
+    match unix_now() {
+        Some(now) => read_account_at(&input.key, memo, now),
+        None => AccountRead::failed("account clock is unavailable"),
+    }
+}
+
+/// [`read_account`] at `now`: the pool read as before, then the card's own reads (the series,
+/// the pool file, the claims table, the journal), each kept in `memo` while it stands.
+fn read_account_at(key: &Key, memo: &Mutex<CardMemo>, now: i64) -> AccountRead {
+    let places = || -> Result<(PathBuf, PathBuf), String> {
+        let config = key
+            .config
+            .clone()
+            .or_else(aterm_types::dirs::aterm_config_path)
+            .ok_or("account configuration path is unavailable")?;
+        let state_dir = key
+            .state
+            .clone()
+            .or_else(crate::harness_host::harness_state)
+            .ok_or("account state directory is unavailable")?;
+        Ok((config, state_dir))
+    };
+    let places = places();
+    let loaded = places.as_ref().map_err(Clone::clone).and_then(|places| {
+        crate::fact_menu::PoolRead::load(key.cli, (&places.0, &places.1, key.home.as_deref()), now)
+    });
+    let pool = loaded.as_ref().map_err(Clone::clone).map(|read| {
+        read.rows(
+            (key.account.as_deref(), key.email.as_deref()),
+            key.week.clone(),
+            now,
+        )
+    });
+    let state_dir = places.as_ref().ok().map(|places| places.1.as_path());
+    AccountRead {
+        pool,
+        card: Some(card_of(key, loaded.as_ref().ok(), state_dir, memo, now)),
+    }
+}
+
+/// The card of `key`'s account at `now` from what `pool` read (`None`: the pool read failed, and
+/// the card is built over an empty roster, so it names the account by the session's own address
+/// and its Macs by the pool file, the claims table and the journal alone). Which of those Macs
+/// is this one is the store's to say: a read that worked leaves it in `memo`, and a read that
+/// failed takes it from there, else from the store's own state file, so this Mac is never
+/// spoken of as another.
+fn card_of(
+    key: &Key,
+    pool: Option<&crate::fact_menu::PoolRead>,
+    state_dir: Option<&std::path::Path>,
+    memo: &Mutex<CardMemo>,
+    now: i64,
+) -> AccountCard {
+    let this_mac = this_mac_of(key, pool, state_dir, memo, now);
+    let empty = (
+        accounts::Roster::default(),
+        accounts::State {
+            machine: this_mac
+                .as_ref()
+                .map(|mac| mac.machine.clone())
+                .unwrap_or_default(),
+            swarm_label: this_mac.as_ref().and_then(|mac| mac.swarm_label.clone()),
+            swarm_aliases: this_mac.map(|mac| mac.swarm_aliases).unwrap_or_default(),
+            ..accounts::State::default()
+        },
+        std::collections::BTreeSet::new(),
+    );
+    let (roster, state, enrolled) = pool.map_or((&empty.0, &empty.1, &empty.2), |read| {
+        (&read.roster, &read.state, &read.enrolled)
+    });
+    let logins = pool
+        .and_then(|read| read.store.load_logins(now).ok())
+        .map(|(logins, _)| logins)
+        .unwrap_or_default();
+    let session = account_card::Session {
+        label: key.week.label.as_deref().or(key.account.as_deref()),
+        email: key.email.as_deref(),
+        profile_key: key.profile_key,
+    };
+    let who = account_card::who_of(key.cli, roster, state, enrolled, &session);
+    // A history is this Mac's series under its own machine id, which only the store names.
+    let history_of = pool
+        .zip(state_dir)
+        .and_then(|_| account_card::history_who(key.cli, roster, state, &session, &who))
+        .zip(state_dir);
+    let day = (now + local_tz(now)).div_euclid(86_400);
+    let (kept, fresh) = match &history_of {
+        None => (None, None),
+        Some((who, state_dir)) => {
+            let stamp = account_history::stamp(state_dir, &state.machine);
+            let kept = memo
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .history
+                .as_ref()
+                .filter(|kept| {
+                    kept.who == *who
+                        && kept.state_dir == *state_dir
+                        && kept.machine == state.machine
+                        && kept.stamp == stamp
+                        && kept.day == day
+                })
+                .map(|kept| Arc::clone(&kept.history));
+            match kept {
+                Some(kept) => (Some(kept), None),
+                None => {
+                    #[cfg(test)]
+                    crate::work_counts::account_history_folded();
+                    let read = account_history::read(
+                        state_dir,
+                        &state.machine,
+                        who,
+                        HISTORY_DAYS * 86_400,
+                        local_tz,
+                        now,
+                    );
+                    (None, Some((read, stamp)))
+                }
+            }
+        }
+    };
+    let machines = machines_of(key.home.as_deref(), memo, now);
+    let journal = alab_seen::journal();
+    let card = account_card::build(&account_card::Inputs {
+        cli: key.cli,
+        roster,
         state,
-        home,
-        account,
-        email,
-        week,
-        ..
-    } = input.key;
-    let config = config
-        .or_else(aterm_types::dirs::aterm_config_path)
-        .ok_or("account configuration path is unavailable")?;
-    let state_dir = state
-        .or_else(crate::harness_host::harness_state)
-        .ok_or("account state directory is unavailable")?;
-    crate::fact_menu::pool_menu_rows(
-        cli,
-        (&config, &state_dir, home.as_deref()),
-        (account.as_deref(), email.as_deref()),
-        week,
+        enrolled,
+        logins: &logins,
+        session,
+        pool: machines.pool.as_ref(),
+        claims: &machines.claims,
+        journal: &journal,
+        history: match (&kept, &fresh) {
+            (Some(kept), _) => HistoryIn::Kept(Arc::clone(kept)),
+            (None, Some((read, stamp))) => HistoryIn::Read {
+                read,
+                stamp: *stamp,
+            },
+            (None, None) => HistoryIn::NotRead,
+        },
         now,
-    )
+        tz_at: local_tz,
+    });
+    if let (Some((who, state_dir)), Some((_, stamp))) = (history_of, fresh) {
+        memo.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .history = Some(HistoryMemo {
+            who,
+            state_dir: state_dir.to_path_buf(),
+            machine: state.machine.clone(),
+            stamp,
+            day,
+            history: Arc::clone(&card.history),
+        });
+    }
+    card
+}
+
+/// Which Mac this is for `key`'s card: what `pool` read names (kept in `memo` for a later read
+/// that fails), else what `memo` keeps for the same store, else the identity in the store's own
+/// state file read apart from the roster, whose failure is what brought the read here.
+fn this_mac_of(
+    key: &Key,
+    pool: Option<&crate::fact_menu::PoolRead>,
+    state_dir: Option<&std::path::Path>,
+    memo: &Mutex<CardMemo>,
+    now: i64,
+) -> Option<ThisMac> {
+    let state_dir = state_dir?;
+    let of = |state: &accounts::State| ThisMac {
+        cli: key.cli,
+        state_dir: state_dir.to_path_buf(),
+        machine: state.machine.clone(),
+        swarm_label: state.swarm_label.clone(),
+        swarm_aliases: state.swarm_aliases.clone(),
+    };
+    {
+        let mut memo = memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(read) = pool {
+            memo.this_mac = Some(of(&read.state));
+            return memo.this_mac.clone();
+        }
+        if let Some(kept) = memo
+            .this_mac
+            .as_ref()
+            .filter(|kept| kept.cli == key.cli && kept.state_dir == state_dir)
+        {
+            return Some(kept.clone());
+        }
+    }
+    let store = match (key.cli, key.home.as_deref()) {
+        (_, Some(home)) => accounts::Store::at_for(state_dir, key.cli, home),
+        (accounts::Cli::Claude, None) => accounts::Store::at(state_dir),
+        (_, None) => return None,
+    };
+    let (state, _) = store.load(now).ok()?;
+    Some(of(&state))
+}
+
+/// The pool file and the claims table under `home` at `now`: the read `memo` keeps while it is
+/// under [`MACHINES_EVERY_S`] old and the clock has not stepped back, else a new one. With no
+/// home there is no pool file and no table to ask.
+fn machines_of(home: Option<&std::path::Path>, memo: &Mutex<CardMemo>, now: i64) -> Arc<Machines> {
+    let kept = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .machines
+        .as_ref()
+        .filter(|kept| {
+            kept.home.as_deref() == home && (0..MACHINES_EVERY_S).contains(&(now - kept.at))
+        })
+        .map(|kept| Arc::clone(&kept.read));
+    if let Some(kept) = kept {
+        return kept;
+    }
+    #[cfg(test)]
+    crate::work_counts::account_machines_read();
+    let read = Arc::new(Machines {
+        pool: home.and_then(ai_pool::read_under),
+        claims: home.map_or(Ok(None), claims_of),
+    });
+    memo.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .machines = Some(MachinesMemo {
+        home: home.map(std::path::Path::to_path_buf),
+        at: now,
+        read: Arc::clone(&read),
+    });
+    read
+}
+
+/// The claims table under `home` ([`claims::read_book`]). A read that failed on a Mac with no
+/// vault is the table's absence, never a read that failed just now: a Mac in no lab holds no
+/// table, and the card then says it does not read other Macs.
+fn claims_of(home: &std::path::Path) -> Result<Option<(claims::View, claims::Book)>, String> {
+    let read = claims::read_book(home);
+    #[cfg(unix)]
+    if read.is_err()
+        && matches!(
+            aterm_secrets::client::config(&aterm_secrets::client::Paths::for_home(home)),
+            Ok(None)
+        )
+    {
+        return Ok(None);
+    }
+    read
 }
 
 pub(crate) fn queue_status(
@@ -431,9 +786,10 @@ fn queue_status_from(
     ))
 }
 
-fn complete_read(generation: u64, read: impl FnOnce() -> ResultRows) -> Completion {
-    let rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
-        .unwrap_or_else(|_| Err("account reader stopped before completing the read".into()));
+fn complete_read(generation: u64, read: impl FnOnce() -> AccountRead) -> Completion {
+    let rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|_| {
+        AccountRead::failed("account reader stopped before completing the read")
+    });
     Completion { generation, rows }
 }
 
@@ -444,520 +800,65 @@ impl App {
         self.account_menu_read.hold_for_test = true;
     }
 
-    /// Answer the account read in flight with `rows`, as the worker would: whether one was.
-    pub(crate) fn complete_account_menu_read_for_test(
-        &mut self,
-        rows: Result<(Vec<AccountMenuRow>, bool), String>,
-    ) -> bool {
+    /// Answer the account read in flight with `read`, as the worker would: whether one was.
+    pub(crate) fn complete_account_menu_read_for_test(&mut self, read: AccountRead) -> bool {
         let Some(generation) = self.account_menu_read.in_flight else {
             return false;
         };
         self.on_account_menu_read(Completion {
             generation,
-            rows: rows.map(|(rows, unpinned)| (rows, unpinned, None)),
+            rows: read,
         });
         true
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aterm_agent::harness::footer::FooterFacts;
-
-    #[cfg(unix)]
-    fn saved_next_for_projection(store: &accounts::Store, _nonce: u64) -> accounts::NextRequest {
-        store.request_next(100).unwrap()
-    }
-
-    // An unsupported host can still read historical selections. Seed that exact wire through
-    // the real decoder and transaction, without claiming fresh manual admission is supported.
-    #[cfg(not(unix))]
-    fn saved_next_for_projection(store: &accounts::Store, nonce: u64) -> accounts::NextRequest {
-        let mut wire: aterm_json::Value =
-            aterm_json::from_str(&store.load(100).unwrap().0.to_json()).unwrap();
-        wire.as_object_mut().unwrap().insert(
-            "pending_pin".into(),
-            aterm_json::json!({"kind": "next", "nonce": format!("{nonce:032x}")}),
-        );
-        let selection = accounts::State::from_json(&aterm_json::to_string(&wire).unwrap(), 100)
-            .unwrap()
-            .pending_pin
-            .unwrap();
-        let request = selection.next().unwrap().clone();
-        store
-            .transact(100, &mut None, |state| {
-                state.pending_pin = Some(selection.clone());
-                Ok(Vec::new())
-            })
-            .unwrap();
-        request
-    }
-
-    #[test]
-    fn queue_observation_requires_the_current_request_namespace_and_row() {
-        use aterm_agent::harness::accounts_sync::{
-            LoginActivity, LoginActivityBatch, LoginIdentity, QueuedSignin,
-        };
-        let root = aterm_tempfile::tempdir().unwrap();
-        let store = accounts::Store::at(root.path());
-        let request = store.request_pin("work", 100).unwrap();
-        let state = store.load(100).unwrap().0;
-        let row = accounts::Row {
-            label: "work".into(),
-            ..Default::default()
-        };
-        let roster = accounts::Roster {
-            rows: vec![row.clone()],
-        };
-        let queued = QueuedSignin::for_test(
-            request.into(),
-            accounts::SigninPosition {
-                ahead: 0,
-                blocker: accounts::SigninBlocker::UnscheduledSignin,
-            },
-        );
-        let entry = LoginActivity {
-            label: "work".into(),
-            route: None,
-            active: false,
-            observed_at: 100,
-            next_at: None,
-            diagnostic: None,
-            identity: Some(LoginIdentity::for_test(&row)),
-            queued: Some(queued),
-        };
-        let batch = LoginActivityBatch::for_test(
-            [Some((&store, vec![entry.clone()])), None],
-            accounts::Cli::Claude,
-        );
-        let waiting =
-            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &batch).unwrap();
-        assert!(waiting.contains("0 ahead"));
-        let mut changed = roster.clone();
-        changed.rows[0].email = Some("different@example.test".into());
-        assert!(
-            queue_status_from(&store, accounts::Cli::Claude, &changed, &state, &batch).is_none()
-        );
-        assert!(queue_status_from(&store, accounts::Cli::Codex, &roster, &state, &batch).is_none());
-        let mut acquired = entry;
-        acquired.queued = None;
-        acquired.active = true;
-        let acquired = LoginActivityBatch::for_test(
-            [Some((&store, vec![acquired])), None],
-            accounts::Cli::Claude,
-        );
-        assert!(
-            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &acquired).is_none(),
-            "an acquired worker has no waiting place"
-        );
-        let unobserved =
-            LoginActivityBatch::for_test([Some((&store, Vec::new())), None], accounts::Cli::Claude);
-        assert!(
-            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &unobserved)
-                .is_none()
-        );
-        let _newer = store.request_pin("work", 100).unwrap();
-        let replaced = store.load(100).unwrap().0;
-        assert!(
-            queue_status_from(&store, accounts::Cli::Claude, &roster, &replaced, &batch).is_none()
-        );
-    }
-
-    #[test]
-    fn next_queue_observation_never_survives_a_newer_selection() {
-        use aterm_agent::harness::accounts_sync::{LoginActivityBatch, QueuedSignin};
-        let root = aterm_tempfile::tempdir().unwrap();
-        let store = accounts::Store::at(root.path());
-        let request = saved_next_for_projection(&store, 1);
-        let state = store.load(100).unwrap().0;
-        let queued = QueuedSignin::for_test(
-            accounts::PendingSelection::Next(request),
-            accounts::SigninPosition {
-                ahead: 2,
-                blocker: accounts::SigninBlocker::ManualAhead,
-            },
-        );
-        let batch =
-            LoginActivityBatch::for_test([Some((&store, Vec::new())), None], accounts::Cli::Claude)
-                .with_queued_next_for_test(&store, accounts::Cli::Claude, queued);
-        let roster = accounts::Roster { rows: Vec::new() };
-        let waiting =
-            queue_status_from(&store, accounts::Cli::Claude, &roster, &state, &batch).unwrap();
-        assert!(waiting.contains("2 ahead"));
-        let other = accounts::Store::at(&root.path().join("other"));
-        assert!(
-            queue_status_from(&other, accounts::Cli::Claude, &roster, &state, &batch).is_none()
-        );
-        let _newer = saved_next_for_projection(&store, 2);
-        assert!(
-            queue_status_from(
-                &store,
-                accounts::Cli::Claude,
-                &roster,
-                &store.load(100).unwrap().0,
-                &batch
-            )
-            .is_none()
-        );
-        let _account = store.request_pin("work", 100).unwrap();
-        assert!(
-            queue_status_from(
-                &store,
-                accounts::Cli::Claude,
-                &roster,
-                &store.load(100).unwrap().0,
-                &batch
-            )
-            .is_none()
-        );
-    }
-
-    fn rig() -> (App, WindowId, u64) {
-        let mut app = App::headless_for_test();
-        app.account_menu_read.hold_for_test = true;
-        let wid = *app.windows.keys().next().unwrap();
-        let session = app.focused_session_id(wid).unwrap();
-        publish(&app, session, 1, "first", aterm_phase::Program::Claude);
-        (app, wid, session)
-    }
-
-    fn publish(
-        app: &App,
-        session: u64,
-        birth: u64,
-        conversation: &str,
-        program: aterm_phase::Program,
-    ) {
-        let entry = app.pool.get(session).unwrap();
-        let mut timeline = entry.ctx.timeline.lock().unwrap();
-        timeline.note_foreground_group(4242);
-        timeline.set_agent_reader_program_for_test(Some(program));
-        timeline.set_claude_footer(
-            4242,
-            Some(birth),
-            Some(FooterFacts {
-                owner: Some(FactsOwner {
-                    floor: Some(birth),
-                    session_id: conversation.into(),
-                }),
-                account: Some("fixture-account".into()),
-                ..Default::default()
+impl AccountRead {
+    /// A test's read of pool `rows` (none pinned), or the reason there are none, with a card
+    /// that knows no account.
+    pub(crate) fn for_test(rows: Result<Vec<AccountMenuRow>, String>) -> Self {
+        Self {
+            pool: rows.map(|rows| PoolRows {
+                rows,
+                pinned: None,
+                queue: None,
             }),
-        );
-    }
-
-    fn open(app: &mut App, wid: WindowId, session: u64) -> u64 {
-        app.open_fact_menu(wid, session, Fact::Account, (0, 0), true);
-        app.account_menu_read.in_flight.unwrap()
-    }
-
-    #[test]
-    fn opening_and_repainting_coalesce_until_a_controlled_completion() {
-        let (mut app, wid, session) = rig();
-        let generation = open(&mut app, wid, session);
-        assert!(app.account_menu_rows_cached(session).is_none());
-        for _ in 0..8 {
-            app.refresh_fact_menu(session);
-        }
-        assert_eq!(app.account_menu_read.in_flight, Some(generation));
-        assert!(app.account_menu_read.pending.is_none());
-        app.on_account_menu_read(Completion {
-            generation,
-            rows: Err("fixture refusal".into()),
-        });
-        assert!(matches!(
-            app.account_menu_rows_cached(session),
-            Some(Err(_))
-        ));
-        assert!(app.account_menu_read.in_flight.is_none());
-        assert!(app.account_menu_read_deadline().is_some());
-        app.close_fact_menu();
-        assert!(app.account_menu_read_deadline().is_none());
-    }
-
-    #[test]
-    fn a_saved_pick_or_next_discards_ready_and_inflight_queue_notes() {
-        for next in [false, true] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let store = accounts::Store::at(root.path());
-            let _old = store.request_pin("work", 100).unwrap();
-            let before = store.load(100).unwrap().0.pending_pin;
-            let (mut app, wid, session) = rig();
-            let first = open(&mut app, wid, session);
-            app.on_account_menu_read(Completion {
-                generation: first,
-                rows: Ok((Vec::new(), true, Some("old queue observation".into()))),
-            });
-            assert!(matches!(
-                app.account_menu_rows_cached(session),
-                Some(Ok((_, _, Some(_))))
-            ));
-            let due = app.account_menu_read_deadline().unwrap();
-            let input = app.account_menu_input(session).unwrap();
-            app.account_menu_read.request(wid, input, due);
-            app.dispatch_account_menu_read();
-            let old_read = app.account_menu_read.in_flight.unwrap();
-            if next {
-                let _ = saved_next_for_projection(&store, 3);
-            } else {
-                let _ = store.request_pin("work", 100).unwrap();
-            }
-            assert_ne!(store.load(100).unwrap().0.pending_pin, before);
-            app.account_menu_selection_changed();
-            assert!(app.account_menu_rows_cached(session).is_none());
-            app.refresh_fact_menu(session);
-            let replacement = app.account_menu_read.pending.as_ref().unwrap().0;
-            for _ in 0..4 {
-                app.refresh_fact_menu(session);
-            }
-            assert_eq!(
-                app.account_menu_read.pending.as_ref().unwrap().0,
-                replacement
-            );
-            assert_eq!(app.account_menu_read.in_flight, Some(old_read));
-            app.on_account_menu_read(Completion {
-                generation: old_read,
-                rows: Ok((Vec::new(), true, Some("superseded observation".into()))),
-            });
-            assert!(app.account_menu_rows_cached(session).is_none());
-            assert_eq!(app.account_menu_read.in_flight, Some(replacement));
-            app.on_account_menu_read(Completion {
-                generation: replacement,
-                rows: Ok((Vec::new(), true, None)),
-            });
-            assert!(matches!(
-                app.account_menu_rows_cached(session),
-                Some(Ok((_, _, None)))
-            ));
+            card: Some(Self::card_for_test()),
         }
     }
 
-    #[test]
-    fn an_immediate_start_failure_is_visible_after_opening_the_menu() {
-        let (mut app, wid, session) = rig();
-        app.account_menu_read.hold_for_test = false;
-        app.open_fact_menu(wid, session, Fact::Account, (0, 0), true);
-        assert!(matches!(
-            app.account_menu_rows_cached(session),
-            Some(Err(_))
-        ));
-        assert!(app.account_menu_read.in_flight.is_none());
-        assert!(app.account_menu_read_deadline().is_some());
-        assert!(app.autopilot_menu.is_some());
-    }
-
-    #[test]
-    fn a_closed_window_cannot_receive_a_completed_account_read() {
-        let (mut app, wid, session) = rig();
-        let generation = open(&mut app, wid, session);
-        app.windows.remove(&wid);
-        app.on_account_menu_read(Completion {
-            generation,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        assert!(app.account_menu_read.active.is_none());
-        assert!(app.account_menu_read.in_flight.is_none());
-        assert!(app.account_menu_read_deadline().is_none());
-    }
-
-    #[test]
-    fn closing_reopening_and_retargeting_reject_old_completions() {
-        let (mut app, wid, session) = rig();
-        let old = open(&mut app, wid, session);
-        app.close_fact_menu();
-        open(&mut app, wid, session);
-        let new = app.account_menu_read.active.as_ref().unwrap().generation;
-        assert_ne!(old, new);
-        app.on_account_menu_read(Completion {
-            generation: old,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        assert!(app.account_menu_rows_cached(session).is_none());
-        assert_eq!(app.account_menu_read.in_flight, Some(new));
-        app.open_fact_menu(wid, session, Fact::Model, (0, 0), true);
-        app.on_account_menu_read(Completion {
-            generation: new,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        assert_eq!(
-            app.autopilot_menu.as_ref().unwrap().owner,
-            MenuOwner::Fact(Fact::Model)
-        );
-        assert!(app.account_menu_read.active.is_none());
-    }
-
-    #[test]
-    fn changed_process_conversation_and_provider_invalidate_pending_rows() {
-        let (mut app, wid, session) = rig();
-        for (birth, conversation, program) in [
-            (2, "first", aterm_phase::Program::Claude),
-            (2, "second", aterm_phase::Program::Claude),
-            (2, "second", aterm_phase::Program::Codex),
-        ] {
-            let old = open(&mut app, wid, session);
-            publish(&app, session, birth, conversation, program);
-            app.on_account_menu_read(Completion {
-                generation: old,
-                rows: Ok((Vec::new(), true, None)),
-            });
-            assert!(app.account_menu_rows_cached(session).is_none());
-            let current = app.account_menu_read.in_flight.unwrap();
-            assert_ne!(current, old);
-            app.on_account_menu_read(Completion {
-                generation: current,
-                rows: Ok((Vec::new(), false, None)),
-            });
-            assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
-            assert!(matches!(
-                app.account_menu_rows_cached(session),
-                Some(Ok((_, false, _)))
-            ));
+    /// A test's read of pool `rows` (none pinned) with the `card` its worker built.
+    pub(crate) fn with_card_for_test(rows: Vec<AccountMenuRow>, card: AccountCard) -> Self {
+        Self {
+            pool: Ok(PoolRows {
+                rows,
+                pinned: None,
+                queue: None,
+            }),
+            card: Some(card),
         }
     }
 
-    #[test]
-    fn unchanged_owner_gets_periodic_refresh_without_discarding_usable_rows() {
-        let (mut app, wid, session) = rig();
-        let generation = open(&mut app, wid, session);
-        app.on_account_menu_read(Completion {
-            generation,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        let at = app
-            .account_menu_read
-            .active
-            .as_ref()
-            .unwrap()
-            .read_at
-            .unwrap();
-        let input = app.account_menu_input(session).unwrap();
-        app.account_menu_read
-            .request(wid, input.clone(), at + Duration::from_secs(1));
-        assert!(app.account_menu_read.pending.is_none());
-        app.account_menu_read
-            .request(wid, input, at + Duration::from_secs(2));
-        assert!(app.account_menu_read.pending.is_some());
-        assert!(app.account_menu_rows_cached(session).is_some());
-    }
-
-    #[test]
-    fn account_identity_change_hides_old_choices_before_the_new_read_completes() {
-        let (mut app, wid, session) = rig();
-        let old = open(&mut app, wid, session);
-        app.on_account_menu_read(Completion {
-            generation: old,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        {
-            let entry = app.pool.get(session).unwrap();
-            let mut timeline = entry.ctx.timeline.lock().unwrap();
-            let mut facts = timeline.claude_footer().unwrap().clone();
-            facts.account = Some("different-account".into());
-            timeline.set_claude_footer(4242, Some(1), Some(facts));
-        }
-        assert!(app.account_menu_rows_cached(session).is_none());
-        app.refresh_fact_menu(session);
-        assert!(app.account_menu_read.in_flight.is_some());
-        assert!(
-            app.account_menu_read
-                .active
-                .as_ref()
-                .unwrap()
-                .rows
-                .is_none()
-        );
-        assert!(app.account_menu_read_deadline().is_none());
-    }
-
-    #[test]
-    fn reader_panic_completes_the_pending_slot_and_occlusion_disarms_polling() {
-        let (mut app, wid, session) = rig();
-        let generation = open(&mut app, wid, session);
-        app.on_account_menu_read(complete_read(generation, || {
-            panic!("synthetic reader failure")
-        }));
-        assert!(matches!(
-            app.account_menu_rows_cached(session),
-            Some(Err(_))
-        ));
-        assert!(app.account_menu_read.in_flight.is_none());
-        assert!(app.account_menu_read_deadline().is_some());
-        app.windows.get_mut(&wid).unwrap().occluded = true;
-        assert!(app.account_menu_read_deadline().is_none());
-        app.windows.get_mut(&wid).unwrap().occluded = false;
-        assert!(app.account_menu_read_deadline().is_some());
-    }
-
-    #[test]
-    fn first_result_selects_for_keyboard_open_only_and_later_results_preserve_choice() {
-        for keyboard in [false, true] {
-            let (mut app, wid, session) = rig();
-            app.open_fact_menu(wid, session, Fact::Account, (0, 0), keyboard);
-            let generation = app.account_menu_read.in_flight.unwrap();
-            assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
-            app.on_account_menu_read(Completion {
-                generation,
-                rows: Ok((Vec::new(), true, None)),
-            });
-            let menu = app.autopilot_menu.as_mut().unwrap();
-            let first = crate::autopilot_menu::step(&menu.rows, None, true);
-            assert!(first.is_some());
-            assert_eq!(menu.highlight, keyboard.then_some(first).flatten());
-            assert!(!app.account_menu_read.deferred_keyboard_selection);
-            let last = crate::autopilot_menu::step(&menu.rows, None, false);
-            menu.highlight = last;
-            let at = app
-                .account_menu_read
-                .active
-                .as_ref()
-                .unwrap()
-                .read_at
-                .unwrap();
-            let input = app.account_menu_input(session).unwrap();
-            app.account_menu_read
-                .request(wid, input, at + Duration::from_secs(2));
-            app.dispatch_account_menu_read();
-            let generation = app.account_menu_read.in_flight.unwrap();
-            app.on_account_menu_read(Completion {
-                generation,
-                rows: Ok((Vec::new(), true, None)),
-            });
-            assert_eq!(app.autopilot_menu.as_ref().unwrap().highlight, last);
-        }
-    }
-
-    #[test]
-    fn pointer_or_navigation_control_cancels_deferred_keyboard_selection() {
-        for pointer in [false, true] {
-            let (mut app, wid, session) = rig();
-            let generation = open(&mut app, wid, session);
-            if pointer {
-                app.autopilot_menu_motion(wid, 10.0, 20.0);
-            } else {
-                app.autopilot_menu_nav(wid, crate::autopilot_menu::MenuKey::Down);
-            }
-            app.on_account_menu_read(Completion {
-                generation,
-                rows: Ok((Vec::new(), true, None)),
-            });
-            assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_none());
-            assert!(!app.account_menu_read.deferred_keyboard_selection);
-        }
-    }
-
-    #[test]
-    fn inert_key_and_stationary_pointer_do_not_take_keyboard_control() {
-        let (mut app, wid, session) = rig();
-        let generation = open(&mut app, wid, session);
-        app.autopilot_menu_nav(wid, crate::autopilot_menu::MenuKey::Inert);
-        app.autopilot_menu.as_mut().unwrap().rest =
-            crate::autopilot_menu::PointerRest::at_open(Some((10.0, 20.0)));
-        app.autopilot_menu_motion(wid, 10.0, 20.0);
-        app.on_account_menu_read(Completion {
-            generation,
-            rows: Ok((Vec::new(), true, None)),
-        });
-        assert!(app.autopilot_menu.as_ref().unwrap().highlight.is_some());
+    /// A card of no account: an empty roster, no pool file, no claims table, no journal.
+    pub(crate) fn card_for_test() -> AccountCard {
+        account_card::build(&account_card::Inputs {
+            cli: accounts::Cli::Claude,
+            roster: &accounts::Roster::default(),
+            state: &accounts::State::default(),
+            enrolled: &std::collections::BTreeSet::new(),
+            logins: &accounts::Logins::default(),
+            session: account_card::Session::default(),
+            pool: None,
+            claims: &Ok(None),
+            journal: &alab_seen::Journal::Off,
+            history: HistoryIn::NotRead,
+            now: 0,
+            tz_at: |_| 0,
+        })
     }
 }
+
+#[cfg(test)]
+#[path = "account_menu_read_tests.rs"]
+mod tests;

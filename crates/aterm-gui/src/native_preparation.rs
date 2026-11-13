@@ -377,7 +377,7 @@ pub(super) fn finish_preparation(
             op.custody
                 .as_ref()
                 .or(attempt.initial_custody.as_ref())
-                .map(|custody| custody.handoff_guard()),
+                .and_then(|custody| custody.handoff_guard()),
             op.authority.renewal.clone(),
             op.authority.account.clone(),
             op.preparation.account_state,
@@ -610,7 +610,9 @@ pub(super) fn settle_retired(
             op.binding.clone(),
             op.authority.caller.clone(),
             op.phase == Phase::Queued,
-            op.custody.as_ref().map(|custody| custody.handoff_guard()),
+            op.custody
+                .as_ref()
+                .and_then(|custody| custody.handoff_guard()),
         )
     };
     let Ok(_flight) = ReceiptFlight::begin(ctx, &Request::Query(binding)) else {

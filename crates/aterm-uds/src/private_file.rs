@@ -19,6 +19,9 @@ pub enum PrivateFileError {
     Missing,
     /// File or directory is not owned exclusively by the current user or is accessible to others.
     NotPrivate(&'static str),
+    /// File or directory [`read_owned`] or [`read_owned_into`] reads has a group or other write
+    /// bit, which their looser rule still refuses.
+    Writable(Writable),
     /// File or directory is a symbolic link.
     Symlink,
     /// Target is not a regular file, name spans multiple path components, or size exceeds the cap.
@@ -39,6 +42,7 @@ impl fmt::Display for PrivateFileError {
         match self {
             Self::Missing => f.write_str("there is no such file"),
             Self::NotPrivate(why) => write!(f, "not private: {why}"),
+            Self::Writable(writable) => writable.fmt(f),
             Self::Symlink => f.write_str("it or its directory is a symlink"),
             Self::Malformed(why) => f.write_str(why),
             Self::Io(e) => write!(f, "it could not be opened or read: {e}"),
@@ -48,6 +52,51 @@ impl fmt::Display for PrivateFileError {
 
 impl std::error::Error for PrivateFileError {}
 
+/// The group or other write bit [`read_owned`]'s rule refused, on the file or on its directory.
+/// Only the reads under that rule make one, and only for permission bits with a write bit set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Writable {
+    dir: bool,
+    mode: u32,
+}
+
+impl Writable {
+    /// Whether the bit is on the directory rather than on the file in it.
+    #[must_use]
+    pub const fn dir(self) -> bool {
+        self.dir
+    }
+
+    /// The permission bits (`& 0o777`) judged on the open descriptor.
+    #[must_use]
+    pub const fn mode(self) -> u32 {
+        self.mode
+    }
+
+    /// Which write bits are set: `"group-writable"`, `"world-writable"`, or
+    /// `"group- and world-writable"`.
+    #[must_use]
+    pub const fn cause(self) -> &'static str {
+        match (self.mode & 0o020 != 0, self.mode & 0o002 != 0) {
+            (true, true) => "group- and world-writable",
+            (false, true) => "world-writable",
+            _ => "group-writable",
+        }
+    }
+}
+
+impl fmt::Display for Writable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = if self.dir { "the directory" } else { "it" };
+        write!(
+            f,
+            "{what} is {} (mode {:04o}; want no group or other write bit)",
+            self.cause(),
+            self.mode
+        )
+    }
+}
+
 /// Why a file or directory with an access list for other users is not private.
 pub const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
 /// Why a file others may read is not private.
@@ -56,11 +105,6 @@ pub const FILE_OPEN: &str = "it is open to other users (want 0600)";
 pub const DIR_OPEN: &str = "the directory is open to other users (want 0700)";
 /// Why a file with a second hard link is not private: that link is another copy of it.
 pub const ANOTHER_LINK: &str = "it has another link";
-/// Why a file [`read_owned_into`] reads is refused: others may write it.
-const FILE_WRITABLE: &str = "it is open to other users' writes (want no group or other write bit)";
-/// Why a directory [`read_owned_into`] reads in is refused: others may write it.
-const DIR_WRITABLE: &str =
-    "the directory is open to other users' writes (want no group or other write bit)";
 
 /// How [`open_judged`] opens and judges a private file.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,7 +143,9 @@ fn file_verdict(
         Err(NotPrivate::Acl) => Err(PrivateFileError::NotPrivate(ACL_OPEN)),
         Err(NotPrivate::Mode(mode)) => match owned_mode(how, mode) {
             Some(loose) => Ok((file.metadata().map_err(PrivateFileError::Io)?, loose)),
-            None if how == Opening::Owned => Err(PrivateFileError::NotPrivate(FILE_WRITABLE)),
+            None if how == Opening::Owned => {
+                Err(PrivateFileError::Writable(Writable { dir: false, mode }))
+            }
             None => Err(PrivateFileError::NotPrivate(FILE_OPEN)),
         },
     }
@@ -240,7 +286,7 @@ fn one_component_io(name: &str) -> io::Result<()> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirIs {
     /// There is none.
     Missing,
@@ -259,28 +305,69 @@ enum DirIs {
     Acl,
 }
 
+impl DirIs {
+    /// astream-sys's owner-only verdict on a directory, in this module's words: the one
+    /// mapping both of [`dir_is`]'s routes take.
+    fn of(verdict: Result<(), astream_sys::NotPrivate>) -> Self {
+        use astream_sys::NotPrivate;
+        match verdict {
+            Ok(()) => Self::Private,
+            Err(NotPrivate::Mode(mode)) => Self::Open(mode),
+            Err(NotPrivate::Kind(_)) => Self::NotDir,
+            Err(NotPrivate::Owner(_)) => Self::Others,
+            Err(NotPrivate::Acl) => Self::Acl,
+        }
+    }
+}
+
+/// `dir`'s verdict now, by astream-sys's owner-only rule: over the path's attributes
+/// ([`astream_sys::owner_private_dir_by_path`], one `lstatx_np` on macOS arm64, which opens
+/// nothing), and where those cannot decide ([`astream_sys::PathUndecided`]: every path off
+/// macOS arm64, a path that holds a NUL or whose lookup or stat failed other than for a
+/// missing name, an incomplete reading, an object that carries an access list, and this
+/// user's directory without its owner's read or search bit), over the directory opened
+/// ([`dir_is_opened`]). A symlink at its last component is
+/// [`DirIs::Symlink`], never followed (a path that ends in a slash is followed by the lookup
+/// and the open alike). Neither route binds what follows: each file is looked up again by
+/// path ([`open_in`]).
 fn dir_is(dir: &Path) -> io::Result<DirIs> {
-    use astream_sys::NotPrivate;
-    use std::os::unix::fs::MetadataExt as _;
+    use astream_sys::DirByPath;
+    #[cfg(any(test, debug_assertions))]
+    tally::judged(dir);
+    match astream_sys::owner_private_dir_by_path(dir) {
+        DirByPath::Missing => return Ok(DirIs::Missing),
+        DirByPath::Symlink => return Ok(DirIs::Symlink),
+        DirByPath::Judged(verdict) => return Ok(DirIs::of(verdict)),
+        DirByPath::Undecided(_) => {}
+    }
+    #[cfg(any(test, debug_assertions))]
+    tally::opened(dir);
+    dir_is_opened(dir)
+}
+
+/// [`dir_is`] over `dir` opened (`open_nonblocking`, refusing a link at its last component)
+/// and judged on that descriptor (`owner_private_dir`). An open refused otherwise than for a
+/// missing name is judged from `dir`'s `symlink_metadata`: a symlink is [`DirIs::Symlink`],
+/// then the rule's kind and owner clauses (`kind_and_owner_of`) answer for the object, and
+/// where both hold, or the metadata cannot be read, the open's error is the answer.
+fn dir_is_opened(dir: &Path) -> io::Result<DirIs> {
     let opened = match astream_sys::open_nonblocking(dir, astream_sys::Links::Refuse) {
         Ok(opened) => opened,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DirIs::Missing),
         Err(e) => {
             return match std::fs::symlink_metadata(dir) {
                 Ok(meta) if meta.file_type().is_symlink() => Ok(DirIs::Symlink),
-                Ok(meta) if !meta.is_dir() => Ok(DirIs::NotDir),
-                Ok(meta) if meta.uid() != crate::peer::our_uid() => Ok(DirIs::Others),
-                _ => Err(e),
+                Ok(meta) => match astream_sys::kind_and_owner_of(&meta, true) {
+                    Ok(()) => Err(e),
+                    Err(broken) => Ok(DirIs::of(Err(broken))),
+                },
+                Err(_) => Err(e),
             };
         }
     };
-    Ok(match astream_sys::owner_private_dir(&opened)? {
-        Ok(_meta) => DirIs::Private,
-        Err(NotPrivate::Mode(mode)) => DirIs::Open(mode),
-        Err(NotPrivate::Kind(_)) => DirIs::NotDir,
-        Err(NotPrivate::Owner(_)) => DirIs::Others,
-        Err(NotPrivate::Acl) => DirIs::Acl,
-    })
+    Ok(DirIs::of(
+        astream_sys::owner_private_dir(&opened)?.map(drop),
+    ))
 }
 
 /// A directory judged once under [`open_private`]'s directory rules, so that several of its
@@ -393,10 +480,11 @@ pub fn open_private(
     open_judged(dir, name, Opening::Read).map(|(file, meta, _loose)| (file, meta))
 }
 
-/// `name` directly in `dir`, opened as `how` says and judged on the open descriptor
-/// (astream-sys's owner-only rule, never a second `stat` by path), with whether a group or
-/// other read bit was set on the file or its directory (only [`Opening::Owned`] lets one
-/// through).
+/// `name` directly in `dir`, under `dir`'s verdict from [`dir_is`] (taken from the
+/// directory's attributes where they decide it, so the directory is opened only where they
+/// cannot), the file opened as `how` says and judged on its open descriptor (astream-sys's
+/// owner-only rule, never a second `stat` by path), with whether a group or other read bit
+/// was set on the file or its directory (only [`Opening::Owned`] lets one through).
 fn open_judged(
     dir: &Path,
     name: &str,
@@ -446,8 +534,8 @@ fn open_in(
             return Err(match judged {
                 DirIs::Others => PrivateFileError::NotPrivate("the directory is another user's"),
                 DirIs::Acl => PrivateFileError::NotPrivate(ACL_OPEN),
-                DirIs::Open(_) if how == Opening::Owned => {
-                    PrivateFileError::NotPrivate(DIR_WRITABLE)
+                DirIs::Open(mode) if how == Opening::Owned => {
+                    PrivateFileError::Writable(Writable { dir: true, mode })
                 }
                 _ => PrivateFileError::NotPrivate(DIR_OPEN),
             });
@@ -596,7 +684,8 @@ pub struct OwnedRead {
 ///
 /// # Errors
 ///
-/// As [`read_private_into`].
+/// As [`read_private_into`], except that a group or other write bit on the file or its
+/// directory is [`PrivateFileError::Writable`].
 pub fn read_owned_into(
     dir: &Path,
     name: &str,
@@ -1113,10 +1202,13 @@ impl Drop for PrivateLock {
 }
 
 /// What this thread read through this module's reads, by file name, while [`tally::counted`]
-/// runs: the instrument a test uses to hold a path to the bytes it reads.
+/// runs, and which directories it judged, and opened to judge, while [`tally::directories`]
+/// runs: the instruments a test uses to hold a path to the bytes it reads and the
+/// directories `dir_is` opens to judge.
 #[cfg(any(test, debug_assertions))]
 pub mod tally {
     use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
 
     /// What [`counted`] saw of one file name: how many reads, and their bytes in all.
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1161,1124 +1253,55 @@ pub mod tally {
             }
         });
     }
+
+    /// What [`directories`] saw this thread judge: each directory this module judged
+    /// (`dir_is`), and each of those it opened to judge, where the path's attributes could
+    /// not decide, with how many times, in the order first seen.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Directories {
+        /// Each directory judged, and how many times.
+        pub judged: Vec<(PathBuf, usize)>,
+        /// Each directory opened to be judged, and how many times.
+        pub opened: Vec<(PathBuf, usize)>,
+    }
+
+    thread_local! {
+        static DIRECTORIES: RefCell<Option<Directories>> = const { RefCell::new(None) };
+    }
+
+    /// `run`'s result, and each directory this thread judged by path (`dir_is`) while it
+    /// ran. A count running around this one counts none of what this one does; with no count
+    /// running, a judgement records nothing.
+    pub fn directories<R>(run: impl FnOnce() -> R) -> (R, Directories) {
+        let outer = DIRECTORIES.with(|seen| seen.replace(Some(Directories::default())));
+        let ran = run();
+        let seen = DIRECTORIES
+            .with(|seen| seen.replace(outer))
+            .unwrap_or_default();
+        (ran, seen)
+    }
+
+    pub(super) fn judged(dir: &Path) {
+        note(dir, |seen| &mut seen.judged);
+    }
+
+    pub(super) fn opened(dir: &Path) {
+        note(dir, |seen| &mut seen.opened);
+    }
+
+    fn note(dir: &Path, list: impl FnOnce(&mut Directories) -> &mut Vec<(PathBuf, usize)>) {
+        DIRECTORIES.with(|seen| {
+            if let Some(seen) = seen.borrow_mut().as_mut() {
+                let list = list(seen);
+                match list.iter_mut().find(|(at, _)| at == dir) {
+                    Some((_, times)) => *times += 1,
+                    None => list.push((dir.to_path_buf(), 1)),
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
-    use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
-
-    use super::{
-        KeptParse, OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead,
-        check_owned_dir, create_private_dir, ensure_private_dir, judge_private_dir,
-        open_private_rw, read_owned_into, read_private, read_private_into, remove_private,
-        write_private, write_private_new,
-    };
-
-    /// The busy text the lock tests hand [`PrivateLock::take`].
-    const BUSY: &str = "another holder has it";
-
-    /// A waiter for a held lock is told once, sleeps, and takes the lock when its holder lets go:
-    /// the holder is released from the `held` hook's thread only after the waiter said it found
-    /// the lock held, and the waiter's lock then excludes a try.
-    /// NEGATIVE CONTROL: answering the first try's `WouldBlock` as an error (`=> return
-    /// Err(..)`) fails "the waiter takes it once let go"; never calling `held` hangs the
-    /// release, and the one-minute hang detector fails it.
-    #[test]
-    fn a_waiter_takes_a_held_lock_once_it_is_let_go() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let first = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
-        let (told, heard) = std::sync::mpsc::channel();
-        let waiter = {
-            let dir = dir.clone();
-            std::thread::spawn(move || {
-                PrivateLock::wait_for(&dir, ".lock", move || told.send(()).unwrap())
-            })
-        };
-        heard
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the waiter found the lock held");
-        drop(first);
-        let held = waiter
-            .join()
-            .unwrap()
-            .expect("the waiter takes it once let go");
-        assert_eq!(
-            PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY)
-                .err()
-                .map(|e| e.kind()),
-            Some(io::ErrorKind::WouldBlock),
-            "the waiter holds it"
-        );
-        drop(held);
-        let free = PrivateLock::wait_for(&dir, ".lock", || panic!("a free lock is never held"));
-        assert!(free.is_ok());
-    }
-
-    #[test]
-    fn lock_wait_stops_when_hook_or_backoff_exhausts_the_budget() {
-        for release_in_hook in [true, false] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let dir = dir_in(root.path(), "state", 0o700);
-            let first = std::cell::RefCell::new(Some(
-                PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap(),
-            ));
-            let (second, _) = super::open_private(&dir, ".lock").unwrap();
-            let start = Instant::now();
-            let deadline = start + Duration::from_secs(60);
-            let clock = std::cell::Cell::new(start);
-            let pauses = std::cell::Cell::new(0);
-            let refused = crate::file_lock::lock_exclusive_with_clock(
-                &second,
-                Some(deadline),
-                BUSY,
-                || {
-                    if release_in_hook {
-                        drop(first.borrow_mut().take());
-                        clock.set(deadline);
-                    }
-                },
-                || clock.get(),
-                |_| {
-                    pauses.set(pauses.get() + 1);
-                    drop(first.borrow_mut().take());
-                    clock.set(deadline);
-                },
-            )
-            .unwrap_err();
-            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
-            assert_eq!(refused.to_string(), BUSY);
-            assert_eq!(pauses.get(), usize::from(!release_in_hook));
-            assert!(first.borrow().is_none());
-            let _free = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
-        }
-    }
-
-    #[test]
-    fn exclusive_wait_observes_contention_and_acquires_after_release() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let mut first =
-            Some(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
-        let (second, _) = super::open_private(&dir, ".lock").unwrap();
-        let mut told = 0;
-        crate::file_lock::lock_exclusive_until_with(
-            &second,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            BUSY,
-            || {
-                told += 1;
-                drop(first.take());
-            },
-        )
-        .unwrap();
-        assert_eq!(told, 1, "only actual lock contention is waited for");
-        let mut retried = false;
-        let refused = crate::file_lock::lock_exclusive_until_with(
-            &super::open_private(&dir, ".lock").unwrap().0,
-            std::time::Instant::now(),
-            BUSY,
-            || retried = true,
-        )
-        .unwrap_err();
-        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(refused.to_string(), BUSY);
-        assert!(!retried, "an expired deadline does not retry a held lock");
-        second.unlock().unwrap();
-    }
-
-    /// With one lock held, a second take that does not wait is `WouldBlock` with the busy
-    /// text; once the first is dropped, a second take succeeds.
-    #[test]
-    fn private_lock_excludes_a_second_holder() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let held = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap();
-        let refused = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY)
-            .err()
-            .expect("a second holder is refused");
-        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(refused.to_string(), BUSY);
-        drop(held);
-        let _again = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap();
-    }
-
-    /// A symlink at the lock's name is refused, and so is a FIFO, whose open returns at
-    /// once (`O_NONBLOCK`).
-    #[test]
-    fn private_lock_refuses_a_link_and_a_fifo() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "real", b"", 0o600);
-        std::os::unix::fs::symlink(dir.join("real"), dir.join("link.lock")).unwrap();
-        assert!(PrivateLock::take(&dir, "link.lock", std::time::Duration::ZERO, BUSY).is_err());
-        // A dangling link is refused too, and its target is never created.
-        let outside = root.path().join("outside.lock");
-        std::os::unix::fs::symlink(&outside, dir.join("dangling.lock")).unwrap();
-        assert!(PrivateLock::take(&dir, "dangling.lock", std::time::Duration::ZERO, BUSY).is_err());
-        assert!(!outside.exists());
-        let fifo = dir.join("fifo.lock");
-        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: a NUL-terminated path that outlives the call.
-        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
-        let refused = PrivateLock::take(&dir, "fifo.lock", std::time::Duration::ZERO, BUSY)
-            .err()
-            .expect("a FIFO is no lock");
-        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    /// A name of more than one path component is `InvalidInput` before anything is opened:
-    /// no lock file is made below `dir`, beside it, or at an absolute path.
-    #[test]
-    fn private_lock_refuses_a_name_of_more_than_one_component() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let absolute = root.path().join("absolute.lock");
-        let absolute_name = absolute.to_str().unwrap();
-        for name in ["sub/x.lock", "../beside.lock", "..", ".", "", absolute_name] {
-            assert_eq!(
-                PrivateLock::take(&dir, name, std::time::Duration::ZERO, BUSY)
-                    .err()
-                    .expect("refused")
-                    .kind(),
-                std::io::ErrorKind::InvalidInput,
-                "{name:?}"
-            );
-        }
-        assert!(!dir.join("sub").exists());
-        assert!(!root.path().join("beside.lock").exists());
-        assert!(!absolute.exists());
-    }
-
-    /// `take_with` tells its hook each time it finds the lock held, and takes it once the
-    /// holder lets go: here the hook itself drops the first holder. Its busy text is the
-    /// caller's, made at run time.
-    #[test]
-    fn private_lock_take_with_tells_its_hook_and_takes_a_freed_lock() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let mut first =
-            Some(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
-        let mut told = 0;
-        let _second = PrivateLock::take_with(
-            &dir,
-            ".lock",
-            std::time::Duration::from_secs(60),
-            "unused",
-            || {
-                told += 1;
-                drop(first.take());
-            },
-        )
-        .unwrap();
-        assert_eq!(told, 1);
-        let busy = format!("busy in {}", dir.display());
-        let refused =
-            PrivateLock::take_with(&dir, ".lock", std::time::Duration::ZERO, &busy, || {})
-                .err()
-                .expect("held by the second");
-        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(refused.to_string(), busy);
-    }
-
-    /// A free lock is taken whatever the wait, one no clock can represent included.
-    #[test]
-    fn private_lock_takes_a_free_lock_with_any_wait() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let _held = PrivateLock::take(&dir, ".lock", std::time::Duration::MAX, BUSY).unwrap();
-    }
-
-    /// A missing file is created 0600; a 0644 file, or a file in a 0755 directory, is not
-    /// private.
-    #[test]
-    fn open_private_rw_creates_0600_and_refuses_loose() {
-        use std::io::{Seek as _, Write as _};
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let mut file = open_private_rw(&dir, "journal").unwrap();
-        assert_eq!(mode_of(&dir.join("journal")), 0o600);
-        assert_eq!(file.stream_position().unwrap(), 0);
-        file.write_all(b"step").unwrap();
-        drop(file);
-        let again = open_private_rw(&dir, "journal").unwrap();
-        assert_eq!(again.metadata().unwrap().len(), 4);
-        file_in(&dir, "loose", b"x", 0o644);
-        assert!(matches!(
-            open_private_rw(&dir, "loose"),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        let open = dir_in(root.path(), "open", 0o755);
-        assert!(matches!(
-            open_private_rw(&open, "journal"),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        assert!(!open.join("journal").exists());
-        // An existing private file in a directory loosened later is refused too.
-        file_in(&open, "existing", b"x", 0o600);
-        assert!(matches!(
-            open_private_rw(&open, "existing"),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        // A link in the file's place, a dangling one included, is refused, and the
-        // creating open never makes its target.
-        let outside = root.path().join("outside");
-        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
-        assert!(matches!(
-            open_private_rw(&dir, "linked"),
-            Err(PrivateFileError::Symlink)
-        ));
-        assert!(!outside.exists());
-    }
-
-    /// Under a umask that clears an owner bit (`0o277`), the journal file and the lock file
-    /// are still made exactly 0600, so a second open of each, read-write, succeeds; an
-    /// existing file's mode is left as it was. The umask is process-wide, so the body runs
-    /// alone in a child of this test binary, which is waited on by a hang detector.
-    #[test]
-    fn files_made_under_a_narrow_umask_are_exactly_0600() {
-        const NAME: &str = "private_file::tests::files_made_under_a_narrow_umask_are_exactly_0600";
-        const STAGE_ENV: &str = "ATERM_UDS_TEST_NARROW_UMASK";
-        if std::env::var_os(STAGE_ENV).is_some() {
-            // The directory first: under this umask a new one would be 0500.
-            let root = aterm_tempfile::tempdir().unwrap();
-            let dir = dir_in(root.path(), "state", 0o700);
-            // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail;
-            // this child runs this one test, so no other create sees the mask.
-            unsafe { libc::umask(0o277) };
-            drop(open_private_rw(&dir, "journal").unwrap());
-            assert_eq!(mode_of(&dir.join("journal")), 0o600);
-            drop(open_private_rw(&dir, "journal").expect("the second read-write open"));
-            drop(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
-            assert_eq!(mode_of(&dir.join(".lock")), 0o600);
-            drop(
-                PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY)
-                    .expect("the second take"),
-            );
-            // An existing file is opened as it stands: never chmodded.
-            file_in(&dir, "narrow", b"x", 0o400);
-            assert!(open_private_rw(&dir, "narrow").is_err());
-            assert_eq!(mode_of(&dir.join("narrow")), 0o400);
-            println!("STAGED narrow umask ok");
-            return;
-        }
-        let out = crate::deadline::ends_within(
-            crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
-                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-                .env(STAGE_ENV, "1"),
-            crate::deadline::ECHO_HANG,
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("STAGED narrow umask ok"),
-            "{:?}\nstdout: {stdout}\nstderr: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Group and other read bits read, and say so; a write bit on the file or the
-    /// directory, or a symlink, is refused.
-    #[test]
-    fn read_owned_into_accepts_read_bits_only() {
-        use std::os::unix::fs::MetadataExt as _;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut buf = [0u8; 64];
-        let shared = dir_in(root.path(), "shared", 0o755);
-        file_in(&shared, "token", b"legacy", 0o644);
-        let meta = std::fs::metadata(shared.join("token")).unwrap();
-        assert_eq!(
-            read_owned_into(&shared, "token", 64, &mut buf).unwrap(),
-            OwnedRead {
-                len: 6,
-                dev: meta.dev(),
-                ino: meta.ino(),
-                loose: true,
-            }
-        );
-        assert_eq!(&buf[..6], b"legacy");
-        let private = dir_in(root.path(), "private", 0o700);
-        file_in(&private, "token", b"tight", 0o600);
-        let read = read_owned_into(&private, "token", 64, &mut buf).unwrap();
-        assert_eq!((read.len, read.loose), (5, false));
-        // A search bit lets nobody read: neither refused nor loose. A group read bit is.
-        let searchable = dir_in(root.path(), "searchable", 0o711);
-        file_in(&searchable, "token", b"tight", 0o600);
-        let read = read_owned_into(&searchable, "token", 64, &mut buf).unwrap();
-        assert_eq!((read.len, read.loose), (5, false));
-        file_in(&private, "group-read", b"group", 0o640);
-        let read = read_owned_into(&private, "group-read", 64, &mut buf).unwrap();
-        assert_eq!((read.len, read.loose), (5, true));
-        file_in(&shared, "group-write", b"x", 0o664);
-        assert!(matches!(
-            read_owned_into(&shared, "group-write", 64, &mut buf),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        let world = dir_in(root.path(), "world", 0o700);
-        file_in(&world, "token", b"x", 0o600);
-        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o757)).unwrap();
-        assert!(matches!(
-            read_owned_into(&world, "token", 64, &mut buf),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        std::os::unix::fs::symlink(private.join("token"), shared.join("link")).unwrap();
-        assert!(matches!(
-            read_owned_into(&shared, "link", 64, &mut buf),
-            Err(PrivateFileError::Symlink)
-        ));
-        // astream-sys's rule judges an access list before the mode: a loose file that one
-        // opens to others is refused for the list, not read as loose.
-        #[cfg(target_os = "macos")]
-        {
-            let token = shared.join("token");
-            chmod(&[
-                "+a".as_ref(),
-                "everyone allow write".as_ref(),
-                token.as_os_str(),
-            ]);
-            match read_owned_into(&shared, "token", 64, &mut buf) {
-                Err(PrivateFileError::NotPrivate(why)) => {
-                    assert!(why.contains("chmod -N"), "{why}");
-                }
-                other => panic!("an access list that allows others: {other:?}"),
-            }
-        }
-    }
-
-    fn dir_in(root: &Path, name: &str, mode: u32) -> PathBuf {
-        let dir = root.join(name);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-        dir
-    }
-
-    fn file_in(dir: &Path, name: &str, bytes: &[u8], mode: u32) {
-        use std::io::Write as _;
-        let path = dir.join(name);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .unwrap();
-        file.write_all(bytes).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::symlink_metadata(path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777
-    }
-
-    #[test]
-    fn a_private_file_reads_into_the_buffer_with_its_identity() {
-        use std::os::unix::fs::MetadataExt as _;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "token", b"eleven byte", 0o600);
-        let mut buf = [0u8; 64];
-        let read = read_private_into(&dir, "token", 32, &mut buf).unwrap();
-        let meta = std::fs::metadata(dir.join("token")).unwrap();
-        assert_eq!(
-            read,
-            PrivateRead {
-                len: 11,
-                dev: meta.dev(),
-                ino: meta.ino(),
-            }
-        );
-        assert_eq!(&buf[..read.len], b"eleven byte");
-    }
-
-    #[test]
-    fn a_file_past_the_cap_is_malformed() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "token", &[7; 9], 0o600);
-        let mut buf = [0u8; 64];
-        assert!(matches!(
-            read_private_into(&dir, "token", 8, &mut buf),
-            Err(PrivateFileError::Malformed(
-                "longer than such a file can be"
-            ))
-        ));
-        assert!(buf.iter().all(|&b| b == 0), "{buf:?}");
-        let mut short = [0u8; 8];
-        assert!(matches!(
-            read_private_into(&dir, "token", 64, &mut short),
-            Err(PrivateFileError::Malformed(
-                "longer than such a file can be"
-            ))
-        ));
-        assert_eq!(short, [0; 8]);
-        assert_eq!(
-            read_private_into(&dir, "token", 9, &mut buf).unwrap().len,
-            9
-        );
-    }
-
-    #[test]
-    fn a_loose_file_or_directory_is_not_private() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let mut buf = [0u8; 64];
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "token", b"x", 0o644);
-        assert!(matches!(
-            read_private_into(&dir, "token", 64, &mut buf),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-        let loose = dir_in(root.path(), "loose", 0o755);
-        file_in(&loose, "token", b"x", 0o600);
-        assert!(matches!(
-            read_private_into(&loose, "token", 64, &mut buf),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-    }
-
-    /// A [`super::JudgedDir`] reads and opens each file as `read_private` and `open_private`
-    /// do, refusals included, in a private, an open, a linked and a missing directory.
-    #[test]
-    fn a_judged_directory_reads_as_read_private_does() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let state = dir_in(root.path(), "state", 0o700);
-        file_in(&state, "token", b"x", 0o600);
-        file_in(&state, "loose", b"x", 0o644);
-        std::os::unix::fs::symlink(state.join("token"), state.join("link")).unwrap();
-        let open = dir_in(root.path(), "open", 0o755);
-        file_in(&open, "token", b"x", 0o600);
-        let linked = root.path().join("linked");
-        std::os::unix::fs::symlink(&state, &linked).unwrap();
-        file_in(root.path(), "plain", b"x", 0o600);
-        let said = |read: Result<Vec<u8>, PrivateFileError>| match read {
-            Ok(bytes) => format!("{bytes:?}"),
-            Err(e) => format!("{e:?}"),
-        };
-        let mut verdicts = std::collections::BTreeSet::new();
-        let (plain, gone) = (root.path().join("plain"), root.path().join("gone"));
-        for dir in [state, open, linked, plain, gone] {
-            let judged = super::JudgedDir::judge(&dir).unwrap();
-            for name in ["token", "loose", "link", "missing", "sub/token"] {
-                let want = said(read_private(&dir, name, 64));
-                assert_eq!(said(judged.read(name, 64)), want, "{dir:?} {name}");
-                assert_eq!(
-                    judged.open(name).is_ok(),
-                    super::open_private(&dir, name).is_ok(),
-                    "{dir:?} {name}"
-                );
-                verdicts.insert(want);
-            }
-        }
-        // A read, then refusals for a loose file, an open directory, a link, a missing file,
-        // a name of two components and a directory that is a file.
-        assert_eq!(verdicts.len(), 7, "{verdicts:?}");
-    }
-
-    /// A private judgement refuses every directory [`super::check_private_dir`] refuses, as it does.
-    ///
-    /// NEGATIVE CONTROL (2026-11-05): with `check_dir_verdict` gone from `JudgedDir::private`, the
-    /// first directory that is not private is taken (`left: Ok(()), right: Err(..)`).
-    #[test]
-    fn a_private_judgement_refuses_as_check_private_dir_does() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let state = dir_in(root.path(), "state", 0o700);
-        let linked = root.path().join("linked");
-        std::os::unix::fs::symlink(&state, &linked).unwrap();
-        file_in(root.path(), "plain", b"x", 0o600);
-        let said = |answer: io::Result<()>| answer.map_err(|error| error.to_string());
-        assert!(super::JudgedDir::private(&state).is_ok());
-        for dir in [
-            dir_in(root.path(), "open", 0o755),
-            linked,
-            root.path().join("plain"),
-            root.path().join("gone"),
-        ] {
-            let want = said(super::check_private_dir(&dir));
-            assert!(want.is_err(), "{dir:?}");
-            assert_eq!(
-                said(super::JudgedDir::private(&dir).map(drop)),
-                want,
-                "{dir:?}"
-            );
-        }
-    }
-
-    /// A verdict is the directory's when it was judged: opens under it do not judge the
-    /// directory again, and the next verdict sees what changed.
-    #[test]
-    fn a_judged_directory_is_judged_once() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let state = dir_in(root.path(), "state", 0o700);
-        file_in(&state, "token", b"x", 0o600);
-        let judged = super::JudgedDir::judge(&state).unwrap();
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(judged.read("token", 64).unwrap(), b"x");
-        assert!(matches!(
-            super::JudgedDir::judge(&state).unwrap().read("token", 64),
-            Err(PrivateFileError::NotPrivate(super::DIR_OPEN))
-        ));
-    }
-
-    #[test]
-    fn a_name_of_more_than_one_component_is_malformed() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let sub = dir_in(&dir, "sub", 0o700);
-        file_in(&sub, "token", b"x", 0o600);
-        let mut buf = [0u8; 64];
-        for name in ["sub/token", "../state/sub/token", "..", ".", "", "a\0b"] {
-            assert!(
-                matches!(
-                    read_private_into(&dir, name, 64, &mut buf),
-                    Err(PrivateFileError::Malformed(_))
-                ),
-                "{name:?}"
-            );
-        }
-        assert_eq!(
-            read_private_into(&sub, "token", 64, &mut buf).unwrap().len,
-            1
-        );
-    }
-
-    #[test]
-    fn a_name_of_more_than_one_component_is_neither_written_nor_removed() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(root.path(), "beside", b"x", 0o600);
-        for name in ["sub/token", "../token", "..", ".", "", "a\0b"] {
-            assert_eq!(
-                write_private(&dir, name, b"t").unwrap_err().kind(),
-                std::io::ErrorKind::InvalidInput,
-                "{name:?}"
-            );
-        }
-        assert!(!dir.join("sub").exists());
-        assert!(!root.path().join("token").exists());
-        assert_eq!(
-            remove_private(&dir, "../beside").unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
-        assert!(root.path().join("beside").exists());
-        write_private(&dir, "token", b"t").unwrap();
-        assert!(remove_private(&dir, "token").unwrap());
-    }
-
-    #[test]
-    fn a_file_beneath_no_directory_was_never_there() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        file_in(root.path(), "state", b"x", 0o600);
-        let file = root.path().join("state");
-        assert!(!remove_private(&file, "token").unwrap());
-        assert!(!remove_private(&file.join("sub"), "token").unwrap());
-        assert!(!remove_private(&root.path().join("missing"), "token").unwrap());
-        assert!(file.exists());
-    }
-
-    /// NEGATIVE CONTROL: `remove_private` and `check_owned_dir` refuse a symlinked directory
-    /// without unlinking entries inside the symlink target.
-    #[test]
-    fn remove_private_and_check_owned_dir_refuse_symlinked_directory() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let outside = dir_in(root.path(), "outside", 0o700);
-        file_in(&outside, "kept.entry", b"kept", 0o600);
-        let linked = root.path().join("state-link");
-        std::os::unix::fs::symlink(&outside, &linked).unwrap();
-
-        assert_eq!(
-            check_owned_dir(&linked).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            remove_private(&linked, "kept.entry").unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(std::fs::read(outside.join("kept.entry")).unwrap(), b"kept");
-    }
-
-    #[test]
-    fn read_private_with_no_cap_reads_the_file() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "token", b"whole", 0o600);
-        assert_eq!(read_private(&dir, "token", usize::MAX).unwrap(), b"whole");
-    }
-
-    /// On macOS a new directory that inherits its parent's access list is no private one:
-    /// `create_private_dir` refuses it, and accepts it once `chmod -N` removes the list.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn create_private_dir_refuses_an_inherited_access_list() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let parent = dir_in(root.path(), "parent", 0o700);
-        let child = parent.join("child");
-        chmod(&[
-            "+a".as_ref(),
-            "everyone allow list,search,directory_inherit".as_ref(),
-            parent.as_os_str(),
-        ]);
-        assert_eq!(
-            create_private_dir(&child).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        chmod(&["-N".as_ref(), parent.as_os_str(), child.as_os_str()]);
-        create_private_dir(&child).unwrap();
-        assert_eq!(mode_of(&child), 0o700);
-    }
-
-    /// `chmod <args>`, which must succeed.
-    #[cfg(target_os = "macos")]
-    fn chmod(args: &[&std::ffi::OsStr]) {
-        let ran = crate::spawnfd::command("/bin/chmod")
-            .args(args)
-            .status()
-            .expect("run chmod");
-        assert!(ran.success(), "chmod {args:?}");
-    }
-
-    /// On macOS an access list that allows anyone anything makes a 0700 directory no
-    /// private one: `judge_private_dir` and `ensure_private_dir` refuse it, naming
-    /// `chmod -N`, and leave it as it was.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ensure_private_dir_refuses_an_access_list_that_allows_others() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let granted = dir_in(root.path(), "granted", 0o700);
-        chmod(&[
-            "+a".as_ref(),
-            "everyone allow read".as_ref(),
-            granted.as_os_str(),
-        ]);
-        for refusal in [
-            judge_private_dir(&granted).unwrap_err(),
-            ensure_private_dir(&granted).unwrap_err(),
-        ] {
-            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-            assert!(refusal.raw_os_error().is_none(), "{refusal}");
-            assert!(refusal.to_string().contains("chmod -N"), "{refusal}");
-        }
-        assert_eq!(mode_of(&granted), 0o700);
-
-        // Open by its mode bits AND by an access list: refused for the list, its mode
-        // left as it was. astream-sys judges the list before the mode. Were the mode
-        // judged first, `judge_private_dir` would answer `Open(0o755)`, so
-        // `aterm fabric on --dry-run` would promise only a `chmod 700`, and
-        // `ensure_private_dir` would narrow the owner's directory to 0700 before its
-        // second look found the list and refused it: the mode changed for nothing.
-        // Both are caught here, by the `unwrap_err` and by the mode check below.
-        let wide = dir_in(root.path(), "wide", 0o755);
-        chmod(&[
-            "+a".as_ref(),
-            "everyone allow read".as_ref(),
-            wide.as_os_str(),
-        ]);
-        for refusal in [
-            judge_private_dir(&wide).unwrap_err(),
-            ensure_private_dir(&wide).unwrap_err(),
-        ] {
-            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-            assert!(refusal.to_string().contains("chmod -N"), "{refusal}");
-        }
-        assert_eq!(mode_of(&wide), 0o755, "a refused directory is not narrowed");
-
-        let parent = dir_in(root.path(), "parent", 0o700);
-        chmod(&[
-            "+a".as_ref(),
-            "everyone allow list,search,directory_inherit".as_ref(),
-            parent.as_os_str(),
-        ]);
-        let child = parent.join("child");
-        assert_eq!(
-            ensure_private_dir(&child).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-
-        let denied = dir_in(root.path(), "denied", 0o700);
-        chmod(&[
-            "+a".as_ref(),
-            "everyone deny add_file".as_ref(),
-            denied.as_os_str(),
-        ]);
-        assert_eq!(judge_private_dir(&denied).unwrap(), PrivateDir::Private);
-        assert_eq!(ensure_private_dir(&denied).unwrap(), None);
-    }
-
-    #[test]
-    fn judge_private_dir_says_what_ensure_would_do_and_changes_nothing() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let fresh = root.path().join("fresh");
-        assert_eq!(judge_private_dir(&fresh).unwrap(), PrivateDir::Missing);
-        assert!(!fresh.exists());
-        assert_eq!(ensure_private_dir(&fresh).unwrap(), None);
-        assert_eq!(judge_private_dir(&fresh).unwrap(), PrivateDir::Private);
-
-        let open = dir_in(root.path(), "open", 0o755);
-        assert_eq!(judge_private_dir(&open).unwrap(), PrivateDir::Open(0o755));
-        assert_eq!(mode_of(&open), 0o755);
-        assert_eq!(ensure_private_dir(&open).unwrap(), Some(0o755));
-        assert_eq!(mode_of(&open), 0o700);
-
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&fresh, &link).unwrap();
-        let refusal = judge_private_dir(&link).unwrap_err();
-        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(refusal.raw_os_error().is_none(), "{refusal}");
-    }
-
-    #[test]
-    fn ensure_private_dir_refuses_one_its_narrowing_left_open() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let open = dir_in(root.path(), "open", 0o755);
-        // A volume that ignores modes: the chmod succeeds and changes nothing.
-        let refusal =
-            super::ensure_private_dir_by(&open, super::make_0700, |_| Ok(())).unwrap_err();
-        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(refusal.to_string().contains("is not 0700"), "{refusal}");
-        assert_eq!(judge_private_dir(&open).unwrap(), PrivateDir::Open(0o755));
-        assert_eq!(ensure_private_dir(&open).unwrap(), Some(0o755));
-    }
-
-    #[test]
-    fn ensure_private_dir_finds_one_removed_as_it_was_made_private_gone() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let open = dir_in(root.path(), "open", 0o755);
-        for dir in [open, root.path().join("missing")] {
-            let gone = super::ensure_private_dir_by(&dir, super::make_0700, |dir| {
-                std::fs::remove_dir(dir)
-            })
-            .unwrap_err();
-            assert_eq!(gone.kind(), std::io::ErrorKind::NotFound, "{gone}");
-            assert!(gone.to_string().contains("was removed"), "{gone}");
-            assert_eq!(judge_private_dir(&dir).unwrap(), PrivateDir::Missing);
-        }
-    }
-
-    #[test]
-    fn ensure_private_dir_judges_one_another_writer_made_first() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        for (name, mode, was) in [("private", 0o700, None), ("open", 0o755, Some(0o755))] {
-            let dir = root.path().join(name);
-            let made = super::ensure_private_dir_by(
-                &dir,
-                |dir| {
-                    dir_in(root.path(), name, mode);
-                    super::make_0700(dir)
-                },
-                super::narrow_0700,
-            );
-            assert_eq!(made.unwrap(), was, "{name}");
-            assert_eq!(mode_of(&dir), 0o700, "{name}");
-        }
-
-        let gone = root.path().join("gone");
-        let refusal = super::ensure_private_dir_by(
-            &gone,
-            |_| Err(std::io::ErrorKind::AlreadyExists.into()),
-            super::narrow_0700,
-        )
-        .unwrap_err();
-        assert_eq!(refusal.kind(), std::io::ErrorKind::NotFound, "{refusal}");
-        assert!(refusal.to_string().contains("was removed"), "{refusal}");
-
-        let target = dir_in(root.path(), "target", 0o755);
-        let link = root.path().join("link");
-        let refusal = super::ensure_private_dir_by(
-            &link,
-            |dir| {
-                std::os::unix::fs::symlink(&target, dir).unwrap();
-                super::make_0700(dir)
-            },
-            super::narrow_0700,
-        )
-        .unwrap_err();
-        assert_eq!(
-            refusal.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "{refusal}"
-        );
-        assert!(refusal.to_string().contains("is a symlink"), "{refusal}");
-        assert_eq!(mode_of(&target), 0o755);
-    }
-
-    #[test]
-    fn ensure_private_dir_names_the_directory_once_in_a_bare_refusal() {
-        use std::io::ErrorKind;
-        let root = aterm_tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("a-file"), b"x").unwrap();
-        std::os::unix::fs::symlink(root.path().join("nowhere"), root.path().join("dangling"))
-            .unwrap();
-        let unwritable = dir_in(root.path(), "unwritable", 0o500);
-        for (odd, kind) in [
-            ("a-file/state", ErrorKind::NotADirectory),
-            ("dangling/state", ErrorKind::AlreadyExists),
-            ("unwritable/state", ErrorKind::PermissionDenied),
-            // `.` hides `gone` from `Path::parent`: the make finds no parent.
-            ("gone/.", ErrorKind::NotFound),
-        ] {
-            let dir = root.path().join(odd);
-            let refusal = ensure_private_dir(&dir).unwrap_err();
-            assert_eq!(refusal.kind(), kind, "{odd}: {refusal}");
-            let shown = dir.display().to_string();
-            assert_eq!(refusal.to_string().matches(&shown).count(), 1, "{refusal}");
-        }
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[test]
-    fn a_fifo_or_an_access_list_in_the_files_place_is_refused() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "token", b"x", 0o600);
-        let made = crate::spawnfd::command("/usr/bin/mkfifo")
-            .arg("-m")
-            .arg("600")
-            .arg(dir.join("fifo"))
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let at = dir.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(read_private(&at, "fifo", 64).map(|_| ()));
-        });
-        let refused = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("a FIFO is judged without waiting for a writer");
-        assert!(
-            matches!(
-                refused,
-                Err(PrivateFileError::Malformed("not a regular file"))
-            ),
-            "{refused:?}"
-        );
-        assert_eq!(read_private(&dir, "token", 64).unwrap(), b"x");
-
-        #[cfg(target_os = "macos")]
-        {
-            let token = dir.join("token");
-            chmod(&[
-                "+a".as_ref(),
-                "everyone allow read".as_ref(),
-                token.as_os_str(),
-            ]);
-            match read_private(&dir, "token", 64) {
-                Err(PrivateFileError::NotPrivate(why)) => {
-                    assert!(why.contains("chmod -N"), "{why}")
-                }
-                other => panic!("an access list that allows others: {other:?}"),
-            }
-            chmod(&["-N".as_ref(), token.as_os_str()]);
-            assert_eq!(read_private(&dir, "token", 64).unwrap(), b"x");
-        }
-    }
-
-    #[test]
-    fn a_symlink_in_the_files_place_is_refused() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        file_in(&dir, "real", b"x", 0o600);
-        std::os::unix::fs::symlink(dir.join("real"), dir.join("token")).unwrap();
-        let mut buf = [0u8; 64];
-        assert!(matches!(
-            read_private_into(&dir, "token", 64, &mut buf),
-            Err(PrivateFileError::Symlink)
-        ));
-    }
-
-    #[test]
-    fn create_private_dir_makes_or_accepts_and_never_narrows() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let fresh = root.path().join("fresh");
-        create_private_dir(&fresh).unwrap();
-        assert!(std::fs::symlink_metadata(&fresh).unwrap().is_dir());
-        assert_eq!(mode_of(&fresh), 0o700);
-        create_private_dir(&fresh).unwrap();
-
-        let loose = dir_in(root.path(), "loose", 0o755);
-        assert!(create_private_dir(&loose).is_err());
-        assert_eq!(mode_of(&loose), 0o755);
-
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&fresh, &link).unwrap();
-        assert!(create_private_dir(&link).is_err());
-
-        let orphan = root.path().join("absent").join("child");
-        assert_eq!(
-            create_private_dir(&orphan).unwrap_err().kind(),
-            std::io::ErrorKind::NotFound
-        );
-    }
-
-    /// A NAME REPLACED UNDER AN OPEN READ IS NO SECOND LINK: the descriptor of a file an atomic
-    /// write renamed over has no link left, and reads the whole file as it stood at the open.
-    #[test]
-    fn a_file_replaced_after_its_open_reads_as_it_stood_and_a_second_link_stays_refused() {
-        use std::os::unix::fs::MetadataExt as _;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        let open = |how| {
-            let file = match how {
-                super::Opening::ReadWrite => std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(dir.join("book")),
-                _ => astream_sys::open_nonblocking(&dir.join("book"), astream_sys::Links::Refuse),
-            };
-            file.unwrap()
-        };
-        write_private(&dir, "book", b"old").unwrap();
-        let read = open(super::Opening::Read);
-        write_private(&dir, "book", b"new").unwrap();
-        let (file, meta, _) =
-            super::judge_opened(read, super::Opening::Read).expect("a read of the replaced name");
-        assert_eq!(meta.nlink(), 0, "the rename left the open file no link");
-        assert_eq!(super::read_capped(file, 64).unwrap(), b"old");
-        assert_eq!(read_private(&dir, "book", 64).unwrap(), b"new");
-
-        let written = open(super::Opening::ReadWrite);
-        write_private(&dir, "book", b"newer").unwrap();
-        assert!(matches!(
-            super::judge_opened(written, super::Opening::ReadWrite),
-            Err(PrivateFileError::Missing)
-        ));
-
-        std::fs::hard_link(dir.join("book"), dir.join("copy")).unwrap();
-        for how in [super::Opening::Read, super::Opening::ReadWrite] {
-            assert!(matches!(
-                super::judge_opened(open(how), how),
-                Err(PrivateFileError::NotPrivate(super::ANOTHER_LINK))
-            ));
-        }
-        assert!(matches!(
-            read_private(&dir, "book", 64),
-            Err(PrivateFileError::NotPrivate(super::ANOTHER_LINK))
-        ));
-    }
-
-    /// A new private file is made whole, `prepare` seeing it before it has its name, and one that
-    /// is there stays: writing a secret twice can strand nothing it protects.
-    #[test]
-    fn a_new_private_file_never_replaces_one_and_leaves_no_temporary() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = root.path().join("d");
-        create_private_dir(&dir).unwrap();
-        let names = || {
-            let mut names: Vec<_> = std::fs::read_dir(&dir)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().into_string().unwrap())
-                .collect();
-            names.sort();
-            names
-        };
-        let mut prepared = false;
-        assert!(
-            write_private_new(&dir, "key", b"one", |file| {
-                prepared = !dir.join("key").exists()
-                    && file.metadata()?.permissions().mode() & 0o777 == 0o600;
-                Ok(())
-            })
-            .unwrap()
-        );
-        assert!(prepared, "prepare ran on a 0600 file with no name yet");
-        assert_eq!(read_private(&dir, "key", 64).unwrap(), b"one");
-        assert!(!write_private_new(&dir, "key", b"two", |_| Ok(())).unwrap());
-        assert_eq!(read_private(&dir, "key", 64).unwrap(), b"one", "kept");
-        assert_eq!(names(), ["key"], "no temporary left");
-
-        let refused = write_private_new(&dir, "other", b"x", |_| Err(std::io::Error::other("no")))
-            .unwrap_err();
-        assert_eq!(refused.to_string(), "no");
-        assert_eq!(names(), ["key"], "a failed prepare leaves no name");
-        assert_eq!(
-            write_private_new(&dir, "a/b", b"x", |_| Ok(()))
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::InvalidInput
-        );
-    }
-
-    /// Equal bytes reuse their parse even after the file was replaced; a same-length write
-    /// into that file is read and parsed again. A different file evicts the one parse kept.
-    #[test]
-    fn a_kept_parse_of_unchanged_bytes_is_not_parsed_again() {
-        use std::io::Write as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        write_private(&dir, "book", b"first").unwrap();
-        let kept = KeptParse::new(1);
-        let parses = std::cell::Cell::new(0);
-        let parse = |bytes: &[u8]| {
-            parses.set(parses.get() + 1);
-            bytes.to_vec()
-        };
-        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
-        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
-        assert_eq!(parses.get(), 1, "a file nothing changed is parsed once");
-        let original = std::fs::File::open(dir.join("book")).unwrap();
-        let initial = original.metadata().unwrap();
-        write_private(&dir, "book", b"first").unwrap();
-        let replaced = std::fs::metadata(dir.join("book")).unwrap();
-        assert_ne!(
-            (initial.dev(), initial.ino()),
-            (replaced.dev(), replaced.ino()),
-            "the same bytes are in a different file"
-        );
-        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
-        assert_eq!(parses.get(), 1, "equal bytes reuse their parse");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("book"))
-            .unwrap()
-            .write_all(b"again")
-            .unwrap();
-        assert_eq!(
-            std::fs::metadata(dir.join("book")).unwrap().ino(),
-            replaced.ino()
-        );
-        assert_eq!(
-            kept.read(&dir, "book", 64, parse).unwrap(),
-            b"again",
-            "a same-length in-place rewrite is read again"
-        );
-        assert_eq!(parses.get(), 2);
-        write_private(&dir, "other", b"other").unwrap();
-        assert_eq!(kept.read(&dir, "other", 64, parse).unwrap(), b"other");
-        assert_eq!(parses.get(), 3);
-        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"again");
-        assert_eq!(parses.get(), 4, "the evicted file is parsed again");
-    }
-
-    /// A kept parse is handed back only after the file was opened and judged again: once its
-    /// directory is no longer private the read is refused, though the file stands as it was.
-    /// A warm parse also obeys each read's byte cap before invoking the parser.
-    #[test]
-    fn a_kept_parse_is_judged_at_every_read() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let dir = dir_in(root.path(), "state", 0o700);
-        write_private(&dir, "book", b"held").unwrap();
-        let kept = KeptParse::new(4);
-        assert_eq!(
-            kept.read(&dir, "book", 64, <[u8]>::to_vec).unwrap(),
-            b"held"
-        );
-        assert!(matches!(
-            kept.read(&dir, "book", 3, |_| panic!(
-                "an oversized file is not parsed"
-            )),
-            Err(PrivateFileError::Malformed(_))
-        ));
-        assert_eq!(kept.read(&dir, "book", 4, <[u8]>::to_vec).unwrap(), b"held");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(
-            kept.read(&dir, "book", 64, <[u8]>::to_vec),
-            Err(PrivateFileError::NotPrivate(_))
-        ));
-    }
-}
+#[path = "private_file_tests.rs"]
+mod tests;

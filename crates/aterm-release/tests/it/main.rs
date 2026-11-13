@@ -3,10 +3,12 @@
 
 //! The release cutter's integration tests, as one test binary.
 //!
-//! aterm-release is binary-only on purpose (no `lib.rs`: nothing outside the cut tool may link
-//! this code), so the tests mount the pipeline's modules by `#[path]` at the crate root, where
-//! they reach each other through `crate::`. Each mount compiles the cutter and its inline
-//! `#[cfg(test)]` tests, so the mounts live here once and the bin target has `test = false`.
+//! The cutter is binary-only on purpose (nothing outside the cut tool may link its code; the
+//! crate's lib, whose tests run in its own binary, holds only the repair worker a failed cut
+//! opens, src/repair.rs), so the tests mount the pipeline's modules by `#[path]` at the crate
+//! root, where they reach each other through `crate::`. Each mount compiles the cutter and its
+//! inline `#[cfg(test)]` tests, so the mounts live here once and the bin target has `test =
+//! false`.
 //! Every mount is `allow(dead_code)`: a test exercises part of a module, and the binary's own
 //! build holds the dead-code line for src/.
 #![allow(
@@ -236,11 +238,10 @@ mod channel_latest;
 mod claim_landing_model;
 mod durable_post_intent_model;
 mod export_policy;
-#[cfg(unix)]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod frozen_cutter;
 mod handoff_policy_bundle;
 mod hooks;
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod host_git;
 mod journal_prefix_model;
 mod ledger_race;

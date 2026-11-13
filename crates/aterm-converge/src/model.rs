@@ -240,8 +240,13 @@ impl Remedy {
 pub enum StoodAside {
     /// Another run held a lock the change needs (atpkg's exit 75); the line says whose.
     Lock(String),
-    /// A network the change needs is down (atpkg's exit 69).
+    /// A network the change needs is down, or what it needs did not answer there (atpkg's exit
+    /// 69): no answer, which proves nothing about what is there.
     Offline(String),
+    /// What the change needs answered that it is not there: a server at its address holds none,
+    /// or another one answered (exit 69, as [`Self::Offline`]). An answer, unlike
+    /// [`Self::Offline`]'s silence.
+    Absent(String),
     /// Another actor must finish a prerequisite, such as an admin approval or background pass.
     Waiting(String),
     /// The account has not granted permission the change needs (exit 77).
@@ -254,9 +259,11 @@ impl StoodAside {
     #[must_use]
     pub fn why(&self) -> &str {
         match self {
-            Self::Lock(why) | Self::Offline(why) | Self::Waiting(why) | Self::Permission(why) => {
-                why
-            }
+            Self::Lock(why)
+            | Self::Offline(why)
+            | Self::Absent(why)
+            | Self::Waiting(why)
+            | Self::Permission(why) => why,
         }
     }
 
@@ -266,7 +273,7 @@ impl StoodAside {
     pub const fn exit_status(&self) -> u8 {
         match self {
             Self::Lock(_) | Self::Waiting(_) => 75,
-            Self::Offline(_) => 69,
+            Self::Offline(_) | Self::Absent(_) => 69,
             Self::Permission(_) => 77,
         }
     }
@@ -318,6 +325,15 @@ pub struct ItemReport {
     /// Set when the apply stood aside (`Blocked` on lock, network, or permission).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stood_aside: Option<StoodAside>,
+    /// The row whose wait this one carries. The engine sets it where this row did not run
+    /// because a prerequisite it waits for ([`crate::Item::after`]) stood aside: the first row
+    /// of that chain, which stood aside of its own accord, so a caller tells a wait this row
+    /// inherited (and from what) from one its own item read. A caller that knows the source of
+    /// a row's own wait may name that source's row instead (`aterm init` names the row of the
+    /// person's choices in System State for a batch their later hold stopped). `None` for a wait
+    /// nothing names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waits_on: Option<String>,
     /// Whether leaving this row wrong fails a surface under [`ItemReport::fails_surface`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub essential: bool,

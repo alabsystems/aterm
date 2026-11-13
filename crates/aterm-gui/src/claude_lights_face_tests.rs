@@ -100,9 +100,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Letter, Letter),
-            &format!(
-                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
-            ),
+            &format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -114,8 +112,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             (Letter, Letter),
             &format!(
-                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
-                 \u{b7} right-click: more"
+                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now"
             ),
             "autopilot: cruise until 18:00, then land",
             "Autopilot: cruise. Lands at 18:00.",
@@ -129,7 +126,7 @@ fn rows() -> Vec<Row> {
             (Letter, Letter),
             &format!(
                 "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
-                 now \u{b7} right-click: more"
+                 now"
             ),
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
@@ -141,9 +138,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Letter, Letter),
-            &format!(
-                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
-            ),
+            &format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -156,7 +151,7 @@ fn rows() -> Vec<Row> {
             (Letter, Letter),
             &format!(
                 "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
-                 now \u{b7} right-click: more"
+                 now"
             ),
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
@@ -168,9 +163,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Letter, Letter),
-            &format!(
-                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
-            ),
+            &format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -182,8 +175,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             (Letter, Letter),
             &format!(
-                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
-                 \u{b7} right-click: more"
+                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now"
             ),
             "autopilot: cruise until 18:00, then land",
             "Autopilot: cruise. Lands at 18:00.",
@@ -195,7 +187,7 @@ fn rows() -> Vec<Row> {
             "\u{2913}",
             "\u{2913}",
             (Letter, Letter),
-            &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
+            &format!("autopilot: land \u{2014} {land} \u{b7} click: off"),
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -206,7 +198,7 @@ fn rows() -> Vec<Row> {
             "\u{2913}",
             "\u{2913}",
             (Letter, Letter),
-            &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
+            &format!("autopilot: land \u{2014} {land} \u{b7} click: off"),
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -217,10 +209,7 @@ fn rows() -> Vec<Row> {
             "\u{2713} landed",
             "\u{2713}",
             (Letter, Letter),
-            &format!(
-                "autopilot: land, landed 17:42 \u{2014} {landed} \u{b7} click: off \u{b7} \
-                 right-click: more"
-            ),
+            &format!("autopilot: land, landed 17:42 \u{2014} {landed} \u{b7} click: off"),
             "autopilot: land, landed 17:42",
             "Autopilot: land. Landed at 17:42.",
         ),
@@ -232,7 +221,7 @@ fn rows() -> Vec<Row> {
             "\u{2913}",
             (Quiet, Quiet),
             "autopilot: land, quiet \u{2014} a person's own exchange; the harness types nothing \
-             until someone else's turn ends \u{b7} click: off \u{b7} right-click: more",
+             until someone else's turn ends \u{b7} click: off",
             "autopilot: land, quiet",
             "Autopilot: land. Quiet: a person is driving the session.",
         ),
@@ -244,7 +233,7 @@ fn rows() -> Vec<Row> {
             "\u{2715}",
             (Quiet, Quiet),
             "autopilot: land, failed \u{2014} the worker could not finish; the harness types \
-             nothing until someone else's turn \u{b7} click: off \u{b7} right-click: more",
+             nothing until someone else's turn \u{b7} click: off",
             "autopilot: land, failed",
             "Autopilot: land. Failed: the worker could not finish.",
         ),
@@ -255,9 +244,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Letter, Letter),
-            &format!(
-                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
-            ),
+            &format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -268,7 +255,7 @@ fn rows() -> Vec<Row> {
             "\u{25cb}",
             "\u{25cb}",
             (Quiet, Quiet),
-            &format!("autopilot: off \u{2014} {off} \u{b7} click: cruise \u{b7} right-click: more"),
+            &format!("autopilot: off \u{2014} {off} \u{b7} click: cruise"),
             "autopilot: off",
             "Autopilot: off.",
         ),
@@ -279,7 +266,7 @@ fn rows() -> Vec<Row> {
             "\u{2298} off",
             "\u{2298}",
             (Quiet, Quiet),
-            "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
+            "harness off in Settings \u{b7} click: turn the harness on",
             "harness off in Settings",
             "Autopilot: off. The harness is off in Settings.",
         ),
@@ -290,8 +277,7 @@ fn rows() -> Vec<Row> {
             "\u{2298} off",
             "\u{2298}",
             (Quiet, Quiet),
-            "Supervise Claude Code sessions is off \u{b7} click: turn the harness on \u{b7} \
-             right-click: more",
+            "Supervise Claude Code sessions is off \u{b7} click: turn the harness on",
             "Supervise Claude Code sessions is off",
             "Autopilot: off. Supervise Claude Code sessions is off in Settings.",
         ),
@@ -303,7 +289,7 @@ fn rows() -> Vec<Row> {
             "\u{2298}",
             (Quiet, Quiet),
             "no harness: this aterm has no control socket \u{b7} click: open Settings \u{25b8} \
-             Harness \u{b7} right-click: more",
+             Harness",
             "no harness: this aterm has no control socket",
             "Autopilot: off. This aterm has no control socket.",
         ),
@@ -472,7 +458,7 @@ fn the_landed_words_say_what_aterm_checked() {
 /// wider a window than 9a's fixed sentence did beside the same footer: the title says what aterm
 /// checked in brief and leaves the agent's words to the state line, the tips, the record and the
 /// description. NEGATIVE CONTROL (run by hand): a brief that quotes the agent (the build before
-/// the review round) draws `autopilot: land, landed 17:42 · click: off · right-click: more` at
+/// the review round) draws `autopilot: land, landed 17:42 · click: off` at
 /// both widths and fails it.
 #[test]
 fn the_hovered_landed_title_keeps_what_aterm_checked_beside_the_footer() {
@@ -800,10 +786,13 @@ fn each_mode_phrase_holds_no_cut_mark() {
             );
             assert_eq!(short, row.short, "{whole}");
             assert_eq!(short_title(&whole), row.short, "{whole}");
-            assert!(whole.ends_with(" \u{b7} right-click: more"), "{whole}");
             assert!(
-                !short.contains("right-click"),
-                "the short form gives the clicks up: {short}"
+                whole.ends_with(&format!(" \u{b7} click: {}", row.face.click(&row.glass))),
+                "the click ends the title: {whole}"
+            );
+            assert!(
+                !short.contains("click"),
+                "the short form gives the click up: {short}"
             );
             if !trail.is_empty() {
                 let at = whole.find(" \u{b7} last: ").expect("the trail");
@@ -816,7 +805,7 @@ fn each_mode_phrase_holds_no_cut_mark() {
                 assert!(explained <= at, "the explanation leads the trail: {whole}");
                 assert!(whole.contains(&format!(" \u{b7} last: {trail} \u{b7} click: ")));
             }
-            let [no_trail, words, clicks, click] =
+            let [no_trail, no_pause, click] =
                 lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
             let (bare, _) =
                 autopilot_title(row.view, &row.glass, "", Some(TODAY), TitleWords::default());
@@ -826,42 +815,18 @@ fn each_mode_phrase_holds_no_cut_mark() {
                 assert_eq!(no_trail, bare, "the trail given up: {whole}");
                 assert!(no_trail.len() < whole.len());
             }
-            assert_eq!(
-                Some(words.as_str()),
-                bare.strip_suffix(" \u{b7} right-click: more"),
-                "the menu's line given up too: {whole}"
-            );
-            assert!(words.starts_with(row.short) && words.len() > row.short.len());
-            assert!(
-                words.contains(" \u{b7} click: "),
-                "the click stays: {words}"
-            );
-            assert_eq!(short_title(&words), row.short, "{words}");
+            assert_eq!(no_pause, "", "no pause, no form without one: {whole}");
+            assert!(bare.starts_with(row.short) && bare.len() > row.short.len());
             let explained = row
                 .face
                 .explanation(&row.glass, TitleWords::default(), Some(TODAY));
             let click_words = format!(" \u{b7} click: {}", row.face.click(&row.glass));
             match explained {
-                None => assert_eq!(
-                    (clicks.as_str(), click.as_str()),
-                    ("", ""),
-                    "no explanation, nothing to give up: {whole}"
-                ),
+                None => assert_eq!(click, "", "no explanation, nothing to give up: {whole}"),
                 Some(e) => {
                     assert_eq!(click, format!("{}{click_words}", row.short), "{whole}");
                     let cells = |t: &str| t.chars().count();
-                    if cells(&e) + 3 > cells(" \u{b7} right-click: more") {
-                        assert_eq!(
-                            clicks,
-                            format!("{click} \u{b7} right-click: more"),
-                            "{whole}"
-                        );
-                        assert!(cells(&clicks) < cells(&words), "{whole}");
-                        assert!(cells(&click) < cells(&clicks), "{whole}");
-                    } else {
-                        assert_eq!(clicks, "", "no narrower than v1's words: {whole}");
-                        assert!(cells(&click) < cells(&words), "{whole}");
-                    }
+                    assert_eq!(cells(&click) + 3 + cells(&e), cells(&bare), "{whole}");
                     assert!(cells(&click) > cells(row.short), "{whole}");
                     assert!(!click.contains(" \u{2014} "), "{click}");
                     assert_eq!(short_title(&click), row.short, "{click}");
@@ -952,17 +917,12 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
                 .face
                 .explanation(&row.glass, TitleWords::default(), Some(TODAY))
                 .is_some();
-            let both = widths.lean[2] > 0;
             let mut want = vec![TitleFit::Full];
             if !trail.is_empty() {
                 want.push(TitleFit::Lean(0));
             }
-            want.push(TitleFit::Lean(1));
-            if both {
-                want.push(TitleFit::Lean(2));
-            }
             if explained {
-                want.push(TitleFit::Lean(3));
+                want.push(TitleFit::Lean(2));
             }
             want.extend([TitleFit::Short, TitleFit::None]);
             let met = walk(widths);
@@ -988,17 +948,16 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
                     "{what} {trail:?}: {title:?} keeps the click: {drawn:?}"
                 );
                 if title == TitleFit::Lean(2) {
-                    assert!(drawn.ends_with("right-click: more  "), "{drawn:?}");
                     assert!(!drawn.contains(" \u{2014} "), "{drawn:?}");
                 }
             }
             let main = LightsWidth {
-                lean: [widths.lean[0], widths.lean[1], 0, 0],
+                lean: [widths.lean[0], widths.lean[1], 0],
                 ..widths
             };
             let before: Vec<TitleFit> = walk(main).into_iter().map(|(t, _)| t).collect();
             assert!(
-                !before.contains(&TitleFit::Lean(2)) && !before.contains(&TitleFit::Lean(3)),
+                !before.contains(&TitleFit::Lean(2)),
                 "CONTROL {what}: {before:?}"
             );
         }
@@ -1014,9 +973,9 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
     };
     assert_eq!(
         rule(160, widths),
-        "autopilot: land, landed 17:42 \u{b7} click: off \u{b7} right-click: more  "
+        "autopilot: land, landed 17:42 \u{b7} click: off  "
     );
-    assert_eq!(rule(120, widths), rule(160, widths), "both clicks at 120");
+    assert_eq!(rule(120, widths), rule(160, widths), "the click at 120");
     assert_eq!(
         rule(110, widths),
         "autopilot: land, landed 17:42 \u{b7} click: off  ",
@@ -1036,16 +995,13 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
             .min()
     };
     eprintln!(
-        "the landed face: whole from {:?} columns, v1's words from {:?}, both clicks from {:?}, \
-         the click from {:?}, the phrase from {:?}",
+        "the landed face: whole from {:?} columns, the click from {:?}, the phrase from {:?}",
         from(TitleFit::Full),
-        from(TitleFit::Lean(1)),
         from(TitleFit::Lean(2)),
-        from(TitleFit::Lean(3)),
         from(TitleFit::Short)
     );
     let main = LightsWidth {
-        lean: [widths.lean[0], widths.lean[1], 0, 0],
+        lean: [widths.lean[0], widths.lean[1], 0],
         ..widths
     };
     assert_eq!(
@@ -1217,18 +1173,8 @@ fn the_default_glass_is_v1s_chip() {
         assert_eq!(face.tones(), (view.tone(), view.tone()), "{view:?}");
         assert_eq!(face.clock(&rest), None, "{view:?}");
         let (whole, short) = autopilot_title(view, &rest, "", None, TitleWords::default());
-        assert_eq!(
-            whole,
-            format!("{} \u{b7} right-click: more", view.title()),
-            "{view:?}"
-        );
+        assert_eq!(whole, view.title(), "{view:?}: v1's words");
         assert_eq!(short, short_title(&view.title()), "{view:?}");
-        let [_, (head, tail), ..] = lean_titles(&whole);
-        assert_eq!(
-            format!("{head}{tail}"),
-            view.title(),
-            "{view:?}: v1's words"
-        );
         let mut w = WindowLights::default();
         w.note_autopilot(7, view.mode(), view, now);
         let v1 = |word: Option<Autopilot>| word.map_or(0, |w| 1 + w as u64);
@@ -1253,7 +1199,6 @@ fn the_autopilot_title_is_sized_once() {
             whole.starts_with(&view.title()),
             "CONTROL {view:?}: {whole}"
         );
-        assert!(whole.ends_with("right-click: more"), "CONTROL {view:?}");
         assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
         assert_eq!(short, short_title(&view.title()), "CONTROL {view:?}");
     }
@@ -1577,12 +1522,12 @@ fn lands_letters_read_on_every_builtin_theme() {
     );
 }
 
-/// YOLO ON READS AS A VALUE, NEVER LIT; YOLO OFF IS QUIET (the owner, 2026-11-02 and 2026-11-09):
-/// on every built-in theme every cell of `● yolo`, mark and word, wears the glass's value ink, at
-/// 7:1 or more, whatever grey the rule it sits on wears: the ink of any value on the rule, never
-/// Claude's red, the glass's warning ink or the letter's hue Autopilot's glyph wears beside it.
-/// Every cell of `○ yolo` wears the glass's quiet ink, as the other off chips, still at 4.5:1,
-/// and the chip never says another word for the flag
+/// YOLO ON READS AS A VALUE, NEVER LIT; YOLO OFF IS QUIET: on every built-in theme every cell of
+/// `yolo` on wears the glass's value ink, at 7:1 or more, whatever grey the rule it sits on
+/// wears: the ink of any value on the rule, never Claude's red, the glass's warning ink or the
+/// letter's hue Autopilot's glyph wears beside it. Off, every cell of the same word wears the
+/// glass's quiet ink, as the other off chips, still at 4.5:1; the ink alone says the bit, and
+/// the chip never says another word for the flag
 /// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2). NEGATIVE CONTROLS: Claude's rule grey, floored
 /// to read, is not the value ink on some ground, so the rule no longer decides it; on some theme
 /// the letter's hue, the warning ink and the row's ink each differ from the ink the chip wears,
@@ -1605,12 +1550,11 @@ fn yolo_wears_the_value_ink_on_every_builtin_theme() {
         let warn = rgb(at.glass.warn());
         let lit = Inks::of(row, at).ink;
         for (mode, face, ink) in [
-            (Mode::Bypass, "\u{25cf} yolo", at.value()),
-            (Mode::Plan, "\u{25cb} yolo", at.quiet()),
+            (Mode::Bypass, "yolo", at.value()),
+            (Mode::Plan, "yolo", at.quiet()),
         ] {
             let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
             w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(mode);
-            w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
             let block = w.block(7, row, now, at, Keep::Drawn);
             let all = text(&block.lights);
             assert!(!all.contains("lame"), "{name}: {all:?}");
@@ -1681,7 +1625,6 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
         let land = face == ChipFace::Land;
         let click_at = row.whole.rfind(" \u{b7} click: ").expect("a click");
         let (head, clicks) = row.whole.split_at(click_at);
-        let menu_at = clicks.rfind(" \u{b7} right-click: more").expect("the menu");
         for (case, hold, said_need) in [
             ("none", None, None),
             ("a need", None, Some(&need)),
@@ -1727,34 +1670,24 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
             assert_eq!(whole.matches(" \u{b7} click: ").count(), 1, "{whole}");
             assert!(!whole.contains(" \u{b7} last: "), "{whole}");
             assert!(!whole.contains(" \u{b7} pausing until "), "{whole}");
-            let [lean, v1, both, click] =
+            let [lean, no_pause, click] =
                 lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
             assert_eq!(lean, "", "no trail: {whole}");
-            assert_eq!(
-                v1,
-                format!("{head_said}{}", &clicks[..menu_at]),
-                "v1's words keep the hold and the need: {whole}"
+            assert_eq!(no_pause, "", "no pause: {whole}");
+            assert!(
+                whole.starts_with(&head_said),
+                "the whole title keeps the hold and the need: {whole}"
             );
             if whole.contains(" \u{2014} ") {
-                assert_eq!(
-                    click,
-                    format!("{}{}", row.short, &clicks[..menu_at]),
-                    "{whole}"
-                );
-                assert!(
-                    both.is_empty() || both == format!("{}{clicks}", row.short),
-                    "{whole}"
-                );
+                assert_eq!(click, format!("{}{clicks}", row.short), "{whole}");
             } else {
-                assert_eq!((both.as_str(), click.as_str()), ("", ""), "{whole}");
+                assert_eq!(click, "", "{whole}");
             }
-            for form in [&both, &click] {
-                for word in ["needs you", "landing since", "not landed"] {
-                    assert!(
-                        !form.contains(word),
-                        "given up with the explanation: {form}"
-                    );
-                }
+            for word in ["needs you", "landing since", "not landed"] {
+                assert!(
+                    !click.contains(word),
+                    "given up with the explanation: {click}"
+                );
             }
             let description = autopilot_description(face, &row.glass, words, Some(TODAY), None);
             let mut sentences = Vec::new();
@@ -1897,7 +1830,7 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
 }
 
 #[test]
-fn a_held_landing_keeps_the_titles_four_lean_forms() {
+fn a_held_landing_keeps_the_titles_three_lean_forms() {
     use crate::harness_glass::hold_tests::{ask, glass, held};
     let hold = glass(held(), TODAY);
     let need = ask();
@@ -1949,7 +1882,7 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
         "{whole}"
     );
     assert_eq!(whole.matches(" \u{2014} ").count(), 1, "{whole}");
-    let [lean, v1, clicks, click] = lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
+    let [lean, v1, click] = lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
     assert_eq!(
         lean,
         whole.replace(" \u{b7} last: \u{2913} nudged 14:22", ""),
@@ -1959,10 +1892,6 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
         v1,
         format!("autopilot: land \u{2014} {explanation} \u{b7} click: off"),
         "v1's words keep the hold"
-    );
-    assert_eq!(
-        clicks,
-        "autopilot: land \u{b7} click: off \u{b7} right-click: more"
     );
     assert_eq!(click, "autopilot: land \u{b7} click: off");
     let mut app = App::headless_for_test();

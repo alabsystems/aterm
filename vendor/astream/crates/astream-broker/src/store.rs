@@ -3080,8 +3080,8 @@ pub enum Durability {
     /// the sidecar writes go on without that flush, and nothing records that they did.
     /// Off Unix no directory is flushed at all. The records are on stable media, but a
     /// power loss there can take an entry made since the directory was last flushed with
-    /// them: a log created there, or a sidecar replaced. On Unix astream-engine's segment
-    /// log makes the other choice and refuses the open.
+    /// them: a log created there, or a sidecar replaced. On Unix astream-engine's
+    /// FileLog makes the other choice and refuses the open.
     #[default]
     Strict,
     /// `ack` ⟹ the batch is ORDERED on the device (Apple: `F_BARRIERFSYNC`): every write
@@ -9901,30 +9901,62 @@ impl BrokerLog {
         max: usize,
     ) -> TailStep {
         let max_scan = max.max(1);
+        // A pinned snapshot can end below the current retention base. Never move
+        // a cursor that already reached its head backwards while checking held rows.
+        if *cursor >= head {
+            return TailStep::Chunk {
+                records: Vec::new(),
+                scanned_to: *cursor,
+            };
+        }
         #[cfg(feature = "retention")]
         if *cursor < self.base.0 {
-            let mut out = Vec::new();
             let hold_end = self.base.0.min(head);
-            let mut scanned_to = hold_end;
-            for (&off, h) in self.hold.range(*cursor, hold_end) {
-                let is_also = match also_at {
-                    Some(a) => a == off,
-                    None => false,
-                };
-                if !is_also && (is_hidden_record(&h.rec) || !filter.matches_str(&h.rec.subject)) {
-                    continue;
+            // A validated wildcard-free filter names exactly its own subject. The
+            // held subject counts cover every held row, so global absence proves
+            // this interval contains no match without inspecting any entries.
+            // A forced fork row must still be visited even when its subject differs.
+            if also_at.is_none()
+                && literal_prefix(filter) == filter.as_str()
+                && !self.hold.holds_subject(filter.as_str())
+            {
+                *cursor = hold_end;
+            } else {
+                let mut out = Vec::new();
+                let mut scanned_to = *cursor;
+                let mut inspected = 0usize;
+                for (&off, h) in self.hold.range(*cursor, hold_end).take(max_scan) {
+                    inspected = inspected.saturating_add(1);
+                    scanned_to = off.saturating_add(1);
+                    #[cfg(test)]
+                    held_tail_bound_tests::visit();
+                    let is_also = match also_at {
+                        Some(a) => a == off,
+                        None => false,
+                    };
+                    if !is_also && (is_hidden_record(&h.rec) || !filter.matches_str(&h.rec.subject))
+                    {
+                        continue;
+                    }
+                    out.push(Arc::clone(&h.rec));
                 }
-                if out.len() >= max_scan {
-                    scanned_to = off;
-                    break;
+                if inspected != 0 {
+                    // Fewer than the budget means the range was exhausted; pruned
+                    // holes cost no work. A full step stops after its last inspected
+                    // row, without peeking at or skipping an uninspected entry.
+                    if inspected < max_scan {
+                        scanned_to = hold_end;
+                    }
+                    if out.is_empty() {
+                        *cursor = scanned_to;
+                    }
+                    // Yield after held work even when it matched nothing. Spending
+                    // another full budget on the retained suffix would break the bound.
+                    return TailStep::Chunk {
+                        records: out,
+                        scanned_to,
+                    };
                 }
-                out.push(Arc::clone(&h.rec));
-            }
-            if !out.is_empty() {
-                return TailStep::Chunk {
-                    records: out,
-                    scanned_to,
-                };
             }
             if head <= self.base.0 {
                 *cursor = hold_end;
@@ -10367,9 +10399,11 @@ impl BrokerLog {
         } else {
             self.relay_floors.clone()
         };
-        let perms = self.file.os()?.metadata()?.permissions();
+        let src = Arc::clone(self.file.os()?);
+        let perms = src.metadata()?.permissions();
         let copy = crate::compact::KeptCopy::begin(
             &self.path,
+            src,
             &perms,
             drop_count,
             self.durable_len,
@@ -11297,16 +11331,38 @@ impl BrokerLog {
         self.durable_len
     }
 
-    /// Read the durable on-disk bytes (`0..durable_len`) from the backing log file.
+    /// Read the durable on-disk bytes (`0..durable_len`) through the log's own
+    /// descriptor. Returns an empty vector on an I/O or allocation error; use
+    /// [`try_bytes`](Self::try_bytes) to distinguish an error from an empty log.
     ///
-    /// Unlike holding a duplicate `Vec<u8>` mirror in RAM alongside `records`, this reads
-    /// from the OS page cache only when explicitly requested (e.g. inspection/tests),
-    /// halving the steady-state per-record RAM footprint of `BrokerLog`.
+    /// The log keeps no duplicate raw-byte mirror in RAM; this allocates and reads
+    /// only when requested. [`copy_bytes_to`](Self::copy_bytes_to) inspects large
+    /// logs with fixed scratch space instead of collecting them in memory.
     #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
-        let mut buf = self.file.stored(&self.path);
-        buf.truncate(self.durable_len as usize);
-        buf
+        self.try_bytes().unwrap_or_default()
+    }
+
+    /// Read the committed on-disk prefix through the log's own descriptor. A file
+    /// shorter than the committed length returns the bytes still present, as
+    /// [`bytes`](Self::bytes) does. Allocation failures return `OutOfMemory`.
+    ///
+    /// This retains the full-log `Vec` interface with fallible reservation. For
+    /// inspection without an allocation proportional to the log's size, use
+    /// [`copy_bytes_to`](Self::copy_bytes_to).
+    pub fn try_bytes(&self) -> io::Result<Vec<u8>> {
+        self.file.stored(self.durable_len)
+    }
+
+    /// Copy the committed on-disk prefix to `out`, using 64 KiB of scratch space
+    /// and positional reads through the log's own descriptor. Preallocated and
+    /// uncommitted tail bytes are excluded. Returns the bytes copied (fewer where
+    /// the file ends); an I/O error can leave a partial prefix in `out`.
+    ///
+    /// No full-log allocation is made here. The destination controls its own
+    /// buffering; a file or streaming sink can inspect logs larger than RAM.
+    pub fn copy_bytes_to<W: Write>(&self, out: &mut W) -> io::Result<u64> {
+        self.file.copy_stored(self.durable_len, out)
     }
 
     /// Atomic append at the tier's guarantee: rolls a partial frame back on a
@@ -11773,6 +11829,34 @@ pub(crate) fn scan_from(
 
 #[cfg(test)]
 mod tests {
+    /// `bytes` reads the log through its own descriptor, never through a second open of its
+    /// path: on Windows that open succeeds and the open's whole-file exclusive lock
+    /// (`LockFileEx`, `lock_exclusive`) refuses every read through it, this process's own
+    /// second handle included, so `bytes` would read nothing there. The Unix stand-in for
+    /// that lock: once the log is open, its path is made write-only (0o200), which the
+    /// open's own descriptor reads past and a second open for reading does not.
+    #[cfg(unix)]
+    #[test]
+    fn bytes_reads_through_the_logs_own_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_scratch::Scratch::new("bytes-own-descriptor");
+        let path = root.path().join("log");
+        let mut log = super::BrokerLog::open(&path).unwrap();
+        for i in 1..=5u64 {
+            log.publish(1, i, "/a/s/x".into(), format!("b{i}").into_bytes())
+                .unwrap();
+        }
+        let want = std::fs::read(&path).unwrap();
+        assert_eq!(want.len() as u64, log.durable_len());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let got = log.bytes();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            got, want,
+            "the log's bytes, read through its own descriptor"
+        );
+    }
+
     #[test]
     fn checked_ingest_refuses_different_bytes_at_a_retained_key_after_restart() {
         for tier in [super::Durability::Relaxed, super::Durability::Strict] {
@@ -15863,3 +15947,125 @@ mod ordered_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn inspection_apis_exclude_preallocated_and_uncommitted_tail_bytes() {
+        let root = crate::test_scratch::Scratch::new("inspection-committed-prefix");
+        let mut log = BrokerLog::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        log.publish(1, 1, "/inspection".into(), b"committed".to_vec())
+            .unwrap();
+        let expected = log.try_bytes().unwrap();
+        let committed = log.durable_len();
+        assert_eq!(expected.len() as u64, committed);
+        log.file.write_at(b"uncommitted", committed).unwrap();
+        log.file.resize_file(committed + 4096).unwrap();
+        assert!(log.file.len().unwrap() > committed);
+        assert_eq!(log.try_bytes().unwrap(), expected);
+        assert_eq!(log.bytes(), expected);
+        let mut streamed = Vec::new();
+        assert_eq!(log.copy_bytes_to(&mut streamed).unwrap(), committed);
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn inspection_errors_are_reported_while_legacy_bytes_remains_empty() {
+        let root = crate::test_scratch::Scratch::new("inspection-read-error");
+        let path = root.path().join("log");
+        let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+        log.publish(1, 1, "/inspection".into(), b"committed".to_vec())
+            .unwrap();
+        let expected = log.try_bytes().unwrap();
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Keep the original Backing (and its exclusive writer lock) alive while
+        // injecting a descriptor whose metadata works but reads are refused.
+        let original = std::mem::replace(&mut log.file, Backing::from_file(write_only));
+        let direct = log.file.read_some_at(0, &mut [0u8; 1]).unwrap_err();
+        let collected = log.try_bytes().unwrap_err();
+        let mut streamed = Vec::new();
+        let copied = log.copy_bytes_to(&mut streamed).unwrap_err();
+        assert_eq!(collected.kind(), direct.kind());
+        assert_eq!(collected.raw_os_error(), direct.raw_os_error());
+        assert_eq!(copied.kind(), direct.kind());
+        assert_eq!(copied.raw_os_error(), direct.raw_os_error());
+        assert!(streamed.is_empty());
+        assert!(log.bytes().is_empty());
+        // Restore before dropping the journal so its normal close still owns the
+        // original descriptor, lock, and readable committed prefix.
+        log.file = original;
+        assert_eq!(log.try_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn inspection_returns_only_the_surviving_prefix_below_committed_length() {
+        let root = crate::test_scratch::Scratch::new("inspection-short-file");
+        let mut log = BrokerLog::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        log.publish(1, 1, "/inspection".into(), vec![0x71; 2 * 64 * 1024 + 99])
+            .unwrap();
+        let expected = log.try_bytes().unwrap();
+        let committed = log.durable_len();
+        for surviving in [64 * 1024 + 17usize, 7, 0] {
+            log.file.resize_file(surviving as u64).unwrap();
+            assert_eq!(
+                log.durable_len(),
+                committed,
+                "logical prefix stays unchanged"
+            );
+            assert_eq!(log.file.len().unwrap(), surviving as u64);
+            assert_eq!(log.try_bytes().unwrap(), expected[..surviving]);
+            assert_eq!(log.bytes(), expected[..surviving]);
+            let mut streamed = Vec::new();
+            assert_eq!(log.copy_bytes_to(&mut streamed).unwrap(), surviving as u64);
+            assert_eq!(streamed, expected[..surviving]);
+        }
+        // Leave a valid file for the normal close and identity bookkeeping.
+        log.file.write_at(&expected, 0).unwrap();
+        log.file.resize_file(committed).unwrap();
+        assert_eq!(log.try_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn inspection_during_a_simulated_batch_preserves_positional_appends() {
+        let device = crate::SimDevice::new(4096);
+        let mut log = BrokerLog::open_sim(&device, OpenOptions::new(Durability::Relaxed)).unwrap();
+        log.publish(1, 1, "/inspection".into(), b"first".to_vec())
+            .unwrap();
+        let prefix = log.try_bytes().unwrap();
+        log.stage_publish(1, 2, "/inspection".into(), b"second".to_vec())
+            .unwrap();
+        let Begun::Write(mut batch) = log.commit_begin().unwrap() else {
+            panic!("the staged record needs a batch");
+        };
+        let written = batch.run();
+        let mut streamed = Vec::new();
+        assert_eq!(
+            log.copy_bytes_to(&mut streamed).unwrap(),
+            prefix.len() as u64
+        );
+        assert_eq!(streamed, prefix);
+        assert_eq!(log.try_bytes().unwrap(), prefix);
+        log.commit_end(batch, written).unwrap();
+        log.publish(1, 3, "/inspection".into(), b"third".to_vec())
+            .unwrap();
+        assert_eq!(log.head(), Offset(3));
+        for (idx, body) in [b"first".as_slice(), b"second", b"third"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(log.record_arc(idx).unwrap().body, *body);
+        }
+        let mut physical = Vec::new();
+        device.sim().read_log(&mut physical);
+        assert_eq!(log.try_bytes().unwrap(), physical);
+        let mut streamed = Vec::new();
+        log.copy_bytes_to(&mut streamed).unwrap();
+        assert_eq!(streamed, physical);
+    }
+}
+
+#[cfg(all(test, feature = "retention"))]
+#[path = "held_tail_bound_tests.rs"]
+mod held_tail_bound_tests;

@@ -1707,8 +1707,8 @@ pub fn supervisor_land_model() -> Model {
                 rest = 0;
             }
             // A person's own exchange once the session worked (a reply, or a landing): under Land it
-            // interrupts the work, a turn end Land carries on from as from a person's work (owner
-            // ruling 2026-10-27). It is no prompt of aterm's, so it adds nothing to the short
+            // interrupts the work, a turn end Land carries on from as from a person's work.
+            // It is no prompt of aterm's, so it adds nothing to the short
             // streak (v6 §14.17.5.7): the streak stands at the agent's own short answers, and
             // Land's next act waits the back-off they earned, from this point, or none. Nor is it
             // real work or a new check, so the agent's list stands across it, quoted by Land's next
@@ -2174,6 +2174,89 @@ pub fn upgrade_settle_turn_end_model() -> Model {
             }
 
             invariant NeverContinueOverASettlingReady: over == 0;
+        }
+    }
+}
+
+/// Formal model for the turn ends a quiet round's settle holds (`wait:settling` under the quiet
+/// flow): each for at most `Looks` looks counted since the last turn (other bounded waits at the
+/// point included), and at most `Points` of them a round, so a session whose settle cannot run out
+/// loses a bounded time to it, and every look the round can still hold is held. A settle look is
+/// two actions: `HostDecides` sets `owns`, the host's decision for the look, from the host's own
+/// counts, and `HostCounts` books that decision, so every law reads `owns`, the variable the
+/// conformance test binds to the worker. `at` counts this point's looks and `kept` the turn ends
+/// the round held, as they are; `count` and `points` are the host's counts of the same, which only
+/// a mutant lets drift. `held` says the round held this point, `here` counts the point's held looks,
+/// and `dropped` records a look the round could hold (within its point's `Looks`, and the point
+/// held or fewer than `Points` held) that the decision let go. So the laws bound `owns` from above
+/// (`here`, `kept`) and from below (`dropped`). Mutants: `Buggy = 1` drops the round's bound,
+/// `Buggy = 2` keeps the point's count across a turn (the round-wide count that once let a quiet
+/// round hold no turn end after one disturbed point), `Buggy = 3` drops the point's bound,
+/// `Buggy = 4` books a held turn end at each of its held looks rather than once, and `Buggy = 5`
+/// forgets that the point is held, so the round's last turn end loses its second look. `Steps`
+/// bounds the walk's other actions and decisions, and covers every conformance walk
+/// (`the_quiet_settle_conforms_to_its_turn_end_model`), a settle look counted once.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn upgrade_quiet_settle_turn_end_model() -> Model {
+    aterm_spec::ty_model! {
+        UpgradeQuietSettleTurnEnd {
+            const Buggy = 0;
+            const Looks = 2;
+            const Points = 3;
+            const Steps = 12;
+            var at = 0;
+            var count = 0;
+            var kept = 0;
+            var points = 0;
+            var held = 0;
+            var owns = 0;
+            var deciding = 0;
+            var here = 0;
+            var dropped = 0;
+            var steps = 0;
+
+            action HostDecides when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                deciding = 1;
+                owns = if (count <= Looks - 1 || Buggy == 3) && ((if Buggy == 5 { 0 } else { held }) == 1 || points <= Points - 1 || Buggy == 1) { 1 } else { 0 };
+            }
+            action HostCounts when (deciding == 1) {
+                deciding = 0;
+                here = here + owns;
+                held = if owns == 1 { 1 } else { held };
+                kept = if owns == 1 && held == 0 { kept + 1 } else { kept };
+                points = if owns == 1 && (held == 0 || Buggy == 4) { points + 1 } else { points };
+                dropped = if owns == 0 && at <= Looks - 1 && (held == 1 || kept <= Points - 1) { 1 } else { dropped };
+                at = at + 1;
+                count = count + 1;
+            }
+            action OtherWait when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                at = at + 1;
+                count = count + 1;
+            }
+            action TurnRuns when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                at = 0;
+                count = if Buggy == 2 { count } else { 0 };
+                held = 0;
+                here = 0;
+            }
+            action RoundStarts when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                at = 0;
+                count = 0;
+                kept = 0;
+                points = 0;
+                held = 0;
+                here = 0;
+                owns = 0;
+            }
+
+            invariant NeverHoldATurnEndPastItsLooks: here <= Looks;
+            invariant NeverHoldMoreTurnEndsThanARoundsPoints: kept <= Points;
+            invariant NeverLetGoOfALookTheRoundCanHold: dropped == 0;
         }
     }
 }
@@ -3768,6 +3851,146 @@ pub fn supervisor_credits_hold_liveness() -> Liveness {
         weak: vec!["Tick"],
         strong: vec![],
         mutants: vec!["StaleNoticeHolds", "UnboundedHold"],
+    }
+}
+
+/// Formal model for the one model move the harness makes (owner, 2026-11-11: "no, keep the same
+/// account and switch from fable to opus."): a Claude Code session at Fable's own usage limit is
+/// relaunched on Opus, asked for until the host can make it, its continuation first at a named
+/// reset, and its return only at a named reset that was ahead when the move was made. `launch` is
+/// what the session's launch names: none (1), Fable (2), or another model (3), which is never moved.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_model_switch_model() -> Model {
+    aterm_spec::ty_model! {
+        SupervisorModelSwitch {
+            const Buggy = 0;
+            const ResetAt = 2;
+            const Cap = 3;
+            const Guess = 1;
+            const GiveUpAfter = 2;
+            var bucket = 0;
+            var named = 0;
+            var on = 0;
+            var back = 0;
+            var jobs = 0;
+            var clock = 0;
+            var probed = 0;
+            var tries = 0;
+            var flips = 0;
+            var gaveup = 0;
+            var held = 0;
+            var badret = 0;
+            var launch = 0;
+            var foreign = 0;
+
+            action LaunchUnnamed when (launch == 0) {
+                launch = 1;
+            }
+            action LaunchFable when (launch == 0) {
+                launch = 2;
+            }
+            action LaunchOther when (launch == 0) {
+                launch = 3;
+            }
+
+            action JobsStart when (jobs == 0) {
+                jobs = 1;
+            }
+            action JobsEnd when (jobs == 1) {
+                jobs = 0;
+            }
+            action Tick when (bucket == 1 && clock <= Cap - 1) {
+                clock = clock + 1;
+            }
+            action Works when (bucket == 0 && on == 0 && 1 <= flips) {
+                flips = 0;
+            }
+            action BucketHitsNamed when (1 <= launch && bucket == 0 && on == 0 && flips == 0) {
+                bucket = 1;
+                named = 1;
+                back = 0;
+                clock = 0;
+                probed = 0;
+                tries = 0;
+                gaveup = 0;
+            }
+            action BucketHitsUnnamed when (1 <= launch && bucket == 0 && on == 0 && flips == 0) {
+                bucket = 1;
+                named = 0;
+                back = 0;
+                clock = 0;
+                probed = 0;
+                tries = 0;
+                gaveup = 0;
+            }
+            action BucketLifts when (bucket == 1 && named == 1 && ResetAt <= clock) {
+                bucket = 0;
+            }
+
+            action Continue when (bucket == 1 && on == 0 && named == 1 && ResetAt <= clock && probed == 0) {
+                probed = 1;
+            }
+            action AskFallback when (
+                launch <= 2 && bucket == 1 && on == 0 && gaveup == 0 &&
+                (named == 0 || probed == 1 || clock <= ResetAt - 1)
+            ) {
+                tries = if tries <= GiveUpAfter { tries + 1 } else { tries };
+                on = if jobs == 0 { 1 } else { on };
+                probed = if jobs == 0 { 1 } else { probed };
+                back = if jobs == 0 { if named == 1 && clock <= ResetAt - 1 { 1 } else { 0 } } else { back };
+                flips = if jobs == 0 { if flips <= 3 { flips + 1 } else { flips } } else { flips };
+            }
+            action Return when (on == 1 && back == 1 && ResetAt <= clock && jobs == 0) {
+                on = 0;
+                back = 0;
+                flips = if flips <= 3 { flips + 1 } else { flips };
+            }
+
+            action GuessedReturn when (Buggy == 1 && on == 1 && bucket == 1 && back == 0 && Guess <= clock) {
+                on = 0;
+                flips = if flips <= 3 { flips + 1 } else { flips };
+                badret = 1;
+            }
+            action GivesUp when (Buggy == 1 && on == 0 && bucket == 1 && GiveUpAfter <= tries) {
+                gaveup = 1;
+            }
+            action ReturnBlocks when (Buggy == 1 && on == 1 && back == 1 && ResetAt <= clock && jobs == 1) {
+                held = 1;
+            }
+            action MovesAnother when (Buggy == 1 && launch == 3 && bucket == 1 && on == 0 && jobs == 0) {
+                on = 1;
+                foreign = 1;
+            }
+
+            invariant NoReturnWithoutAReset: badret == 0;
+            invariant NoPingPong: flips <= 3;
+            invariant PointsGoOn: held == 0;
+            invariant AsksNeverStop: gaveup == 0;
+            invariant NeverMovesAnotherLaunch: foreign == 0;
+        }
+    }
+}
+
+/// Liveness specification asserting Fable's limit eventually moves a session its launch lets move
+/// onto Opus.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(supervisor_model_switch_model)]
+pub fn supervisor_model_switch_liveness() -> Liveness {
+    use aterm_spec::derive::{eq, int, or_, var};
+    Liveness {
+        name: "TheFallbackIsMade",
+        goal: or_(
+            or_(
+                or_(eq(var("on"), int(1)), eq(var("bucket"), int(0))),
+                eq(var("jobs"), int(1)),
+            ),
+            eq(var("launch"), int(3)),
+        ),
+        weak: vec!["AskFallback", "Continue"],
+        strong: vec![],
+        mutants: vec!["GivesUp"],
     }
 }
 

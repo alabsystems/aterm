@@ -84,6 +84,15 @@ pub use handshake::{
     client_handshake, handshake_clamp_info_len, handshake_version_valid, server_handshake,
 };
 
+#[cfg(feature = "handshake")]
+mod roam;
+#[cfg(feature = "handshake")]
+pub use roam::{
+    client_roam_connect, roam_amp_allows_send, roam_amp_budget_clamp, roam_contig_offset_matches,
+    roam_epoch_advance, RoamCloser, RoamHandle, RoamListener, RoamStream, MAX_ROAM_CHUNK,
+    MAX_ROAM_INFLIGHT_BYTES, ROAM_WIRE_MAGIC, ROAM_WIRE_VERSION,
+};
+
 #[cfg(feature = "identity")]
 mod identity;
 #[cfg(feature = "signature")]

@@ -1882,8 +1882,7 @@ fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words(
             };
             let acts: Vec<&str> = again.iter().map(|o| o.act.as_str()).collect();
             // The person's short exchange after the claim is carried as any reply: Cruise never
-            // parks (owner ruling 2026-10-26), and under Land the session worked before it (owner
-            // ruling 2026-10-27).
+            // parks, and under Land the session worked before it.
             assert!(
                 acts[3] == "wait" && acts[4] == want && acts[5..] == ["wait", "wait", want],
                 "{tag}: the reply answered after the short streak's back-off, by the prompt it \

@@ -54,7 +54,15 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
     )
 }
 
+/// Judged where the anchored source compiles: a machine bound in part by portable code and in
+/// part by `#[cfg(unix)]` code (agh's git grant files, Unix job control, the custody's clients)
+/// reads as unbound in a build that compiles only the first part, so off Unix the closure
+/// builds (each Unix-only item below stays named under its own gate) and runs with `--ignored`.
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "the anchors on Unix-only code are not in this build; run with --ignored to see"
+)]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
     std::hint::black_box((
@@ -99,6 +107,7 @@ fn spec_xref_closure() {
         aterm_db::accounts::proposals::Proposals::create_if_absent as *const (),
         aterm_db::accounts::proposals::Proposals::replace_if_current as *const (),
     ));
+    #[cfg(unix)]
     std::hint::black_box(aterm_secrets::need::credential_request_environment as fn());
     // The machine-number anchors on `settle`, `choose` and `check`, and their waivers' host.
     std::hint::black_box((
@@ -106,6 +115,18 @@ fn spec_xref_closure() {
         aterm_types::machine_name::choose as *const (),
         aterm_types::machine_name::check as *const (),
         aterm_types::machine_name::machine_number_environment as fn(),
+    ));
+    // The `CltEpisode` anchors on the record of setup's password ask, and their waivers' host.
+    std::hint::black_box((
+        aterm_types::clt_mark::claim as *const (),
+        aterm_types::clt_mark::explicit as *const (),
+        aterm_types::clt_mark::hand as *const (),
+        aterm_types::clt_mark::end as *const (),
+        aterm_types::clt_mark::tab_end as *const (),
+        aterm_types::clt_mark::term_end as *const (),
+        aterm_types::clt_mark::lift as *const (),
+        aterm_types::clt_mark::reading as *const (),
+        aterm_types::clt_mark::clt_episode_environment as fn(),
     ));
     // aterm-capacity's `CapacityCohort` waivers' host, beside its cohort ledger's anchors.
     #[cfg(unix)]

@@ -222,19 +222,46 @@ fn original_process_retired(
 ) {
     use aterm_uds::process::ProcessPresence;
 
+    // Read before the identity: `token`, born earlier and still holding its pid after,
+    // held it at this read too.
+    let killed = kill_pending(token.pid);
     let identity = aterm_uds::process::read_identity(token.pid);
     let presence = aterm_uds::process::process_presence(token.pid);
     let retired = identity.is_some_and(|current| current != token)
         || match presence {
             ProcessPresence::Absent => true,
             ProcessPresence::Exited => exited_is_retired,
-            ProcessPresence::Present | ProcessPresence::Unknown => false,
+            ProcessPresence::Present => exited_is_retired && killed && identity == Some(token),
+            ProcessPresence::Unknown => false,
         };
     (retired, presence, identity)
 }
 
+/// Whether `SIGKILL` is pending for `pid`, which then runs none of its code again: Linux
+/// lists a killed process as running until the scheduler runs its exit, which on a loaded
+/// machine is after the stop returns. A group's `SIGKILL` sets the process-wide mask
+/// (`ShdPnd`), which only the reap clears. A thread's own mask (`SigPnd`) proves nothing:
+/// an exec from another thread sets it on the old leader while the process runs on. A
+/// signal the kernel drops sets no bit: one to a namespace's init from inside it, or to a
+/// process already exiting.
+#[cfg(unix)]
+fn kill_pending(pid: i32) -> bool {
+    const SIGKILL: u64 = 1 << (9 - 1);
+    cfg!(any(target_os = "linux", target_os = "android"))
+        && aterm_uds::process::read_proc_text(Path::new(&format!("/proc/{pid}/status"))).is_ok_and(
+            |status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ShdPnd:"))
+                    .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                    .is_some_and(|mask| mask & SIGKILL != 0)
+            },
+        )
+}
+
 /// The owner positively reaps its root and makes every group member unable to run before
-/// return. An orphaned killed descendant may still be a zombie until its adopter reaps it.
+/// return. An orphaned killed descendant may still be a zombie until its adopter reaps it,
+/// or on Linux still be listed with its `SIGKILL` pending ([`kill_pending`]).
 /// NEGATIVE CONTROL: killing only the root leaves the same descendant identity `Present`;
 /// omitting the owning wait leaves the root `Exited`; broad signalling kills the bystander.
 #[cfg(unix)]
@@ -307,7 +334,7 @@ fn explicit_git_stop_retires_wall_and_progress_children_without_touching_a_bysta
         let descendant_after_cleanup = original_process_retired(descendant, true);
         assert!(
             descendant_after_cleanup.0,
-            "fixture descendant ended: {descendant_after_cleanup:?}"
+            "fixture descendant could no longer run: {descendant_after_cleanup:?}"
         );
         assert!(
             root_at_return.0,

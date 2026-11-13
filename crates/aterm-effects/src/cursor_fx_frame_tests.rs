@@ -213,16 +213,8 @@ impl Session {
 #[test]
 fn the_knob_law_is_what_the_frame_reads() {
     let styles = [
-        "lumen",
-        "phaser",
-        "sparkle",
-        "fire",
-        "laser",
-        "beam",
-        "water",
-        "comet",
-        "classic",
-        "rainbow kitty pet",
+        "lumen", "phaser", "sparkle", "fire", "laser", "beam", "water", "comet", "classic",
+        "rainbow",
     ];
     type Turn = fn(&mut GlowKnobs, bool);
     let turns: [(TrailKnob, Turn); 5] = [
@@ -326,16 +318,8 @@ fn jump_frames(raw: &str, length: usize, ground: (u32, u32), rows: u16, cols: u1
 #[test]
 fn the_jump_reach_is_where_trail_length_stops_changing_a_jump() {
     let styles = [
-        "lumen",
-        "phaser",
-        "sparkle",
-        "fire",
-        "laser",
-        "beam",
-        "water",
-        "comet",
-        "classic",
-        "rainbow kitty pet",
+        "lumen", "phaser", "sparkle", "fire", "laser", "beam", "water", "comet", "classic",
+        "rainbow",
     ];
     let aspect = geom().ch as f32 / geom().cw as f32;
     let mut wrong = Vec::new();
@@ -605,16 +589,8 @@ fn sparkle_s_paper_caret_is_gold_deepened_in_its_hue() {
 #[test]
 fn the_unset_trail_colour_is_what_the_frame_draws() {
     let styles = [
-        "lumen",
-        "phaser",
-        "sparkle",
-        "fire",
-        "laser",
-        "beam",
-        "water",
-        "comet",
-        "classic",
-        "rainbow kitty pet",
+        "lumen", "phaser", "sparkle", "fire", "laser", "beam", "water", "comet", "classic",
+        "rainbow",
     ];
     let shapes = [
         CursorStyle::SteadyBlock,

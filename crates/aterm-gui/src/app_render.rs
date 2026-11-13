@@ -19,8 +19,8 @@ use aterm_window::window::Window;
 
 use aterm_effects::companion::{
     CompanionDuty, cursor_cat_color_key, cursor_companion_duty, cursor_companion_on_glass,
-    cursor_companion_presentable, pin_pet_mode_exit, resident_pet_owner_present,
-    shed_companion_alpha, shed_companion_presentable, shed_envelope_transitioning,
+    cursor_companion_presentable, pin_pet_mode_exit, shed_companion_alpha,
+    shed_companion_presentable, shed_envelope_transitioning,
 };
 
 use crate::app_input::{Deliveries, DeliveryTicket};
@@ -409,91 +409,12 @@ fn presented_block_fill(
 }
 
 #[cfg(test)]
-mod window_cursor_fill_tests {
-    use super::{INACTIVE_CURSOR_FILL, presented_block_fill, window_cursor_fill};
-    use aterm_core::terminal::CursorStyle;
-    use aterm_effects::cursor_glow::{BlockFill, BlockFillOwner};
-
-    #[test]
-    fn status_owner_tracks_the_final_single_pane_fill() {
-        assert_eq!(
-            window_cursor_fill(Some(CursorStyle::Bolt), Some(0x00AA_44FF)),
-            Some(0x00AA_44FF),
-            "non-focus shape overrides keep their effect fill"
-        );
-        let owned = BlockFill {
-            owner: BlockFillOwner::Rainbow,
-            fill: 0x0050_FA7B,
-            base: Some(0x0000_00FF),
-        };
-        let focused_fill = window_cursor_fill(None, Some(owned.fill));
-        assert_eq!(
-            presented_block_fill(None, focused_fill, Some(owned)),
-            Some(owned)
-        );
-
-        let inactive_fill = window_cursor_fill(Some(CursorStyle::HollowBlock), Some(owned.fill));
-        assert_eq!(inactive_fill, Some(INACTIVE_CURSOR_FILL));
-        assert_eq!(
-            presented_block_fill(Some(CursorStyle::HollowBlock), inactive_fill, Some(owned)),
-            None,
-            "the host's inactive outline, not the effect, owns the final caret"
-        );
-    }
-}
+#[path = "app_render_window_cursor_fill_tests.rs"]
+mod window_cursor_fill_tests;
 
 #[cfg(test)]
-mod window_renderer_state_binding_tests {
-    use super::*;
-
-    fn renderer_state(app: &App) -> (bool, Option<CursorStyle>, bool) {
-        let Backend::Cpu(renderer) = app.backend.ready() else {
-            panic!("headless test backend is CPU")
-        };
-        (
-            renderer.cursor_blink_phase(),
-            renderer.cursor_style_override(),
-            renderer.selection_inactive(),
-        )
-    }
-
-    #[test]
-    fn opposite_two_window_cursor_state_is_rebound_before_each_encode() {
-        let mut app = App::headless_for_test();
-        let first = WindowId(0);
-        let session = app.next_session_id;
-        let second = app.insert_logical_window(crate::stub_session(session), 24, 80);
-        app.render_knobs.selection_inactive = true;
-        {
-            let first = app.windows.get_mut(&first).unwrap();
-            first.blink_phase = false;
-            first.focused = false;
-        }
-        {
-            let second = app.windows.get_mut(&second).unwrap();
-            second.blink_phase = true;
-            second.focused = true;
-        }
-
-        app.backend.set_cursor_blink_phase(true);
-        app.backend
-            .set_cursor_style_override(Some(CursorStyle::HollowBlock));
-        app.backend.set_selection_inactive(false);
-
-        app.bind_window_renderer_state(first);
-        assert_eq!(
-            renderer_state(&app),
-            (false, None, true),
-            "glass-less A owns its blink/inactive state and clears a stale OS-only style"
-        );
-        app.bind_window_renderer_state(second);
-        assert_eq!(
-            renderer_state(&app),
-            (true, None, false),
-            "B cannot inherit A's blink or inactive-selection state"
-        );
-    }
-}
+#[path = "app_render_window_renderer_state_binding_tests.rs"]
+mod window_renderer_state_binding_tests;
 
 #[cfg(test)]
 #[path = "app_render_canonical_layout_scheduler_tests.rs"]
@@ -508,58 +429,8 @@ fn cpu_surface_transaction<B, E>(
 }
 
 #[cfg(test)]
-mod cpu_surface_transaction_tests {
-    use super::{
-        FailedPresentRoute, cpu_present_needs_full_copy, cpu_surface_transaction,
-        failed_present_route,
-    };
-    use aterm_render::DamageOutcome;
-
-    #[derive(Debug)]
-    struct FakeBuffer;
-
-    #[derive(Debug)]
-    struct FakeSurfaceError;
-
-    #[test]
-    fn acquire_and_commit_failures_are_dropped_not_counted_as_presents() {
-        use crate::metrics::PresentDropReason;
-        let acquire = cpu_surface_transaction(Err::<FakeBuffer, _>(FakeSurfaceError), |_| Ok(11));
-        assert_eq!(acquire, Err(PresentDropReason::CpuAcquire));
-        let commit = cpu_surface_transaction(Ok(FakeBuffer), |_| Err::<u64, _>(FakeSurfaceError));
-        assert_eq!(commit, Err(PresentDropReason::CpuCommit));
-        let ok = cpu_surface_transaction(Ok::<_, FakeSurfaceError>(FakeBuffer), |_| Ok(17));
-        assert_eq!(ok, Ok(17));
-    }
-
-    #[test]
-    fn a_translated_cpu_frame_and_the_one_after_it_copy_in_full() {
-        use DamageOutcome::{Full, GateHit};
-        for (case, want) in [
-            ((false, false, false, GateHit, true), false), // control
-            ((false, true, false, GateHit, true), true),   // sub-row frame
-            ((false, false, true, GateHit, true), true),   // settle frame
-            ((false, false, false, Full, true), true),
-            ((false, false, false, GateHit, false), true), // surface lost the frame
-            ((true, false, false, GateHit, true), true),   // caller-forced
-        ] {
-            let (forced, translated, prev, damage, retained) = case;
-            assert_eq!(
-                cpu_present_needs_full_copy(forced, translated, prev, damage, retained),
-                want,
-                "{case:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn latched_gpu_loss_routes_to_fallback_before_surface_retry() {
-        assert_eq!(
-            failed_present_route(false, true),
-            FailedPresentRoute::RetrySurface
-        );
-    }
-}
+#[path = "app_render_cpu_surface_transaction_tests.rs"]
+mod cpu_surface_transaction_tests;
 
 pub(crate) use aterm_effects::sound_policy::{
     TrailSoundPolicy, drain_curse_bonk_cues, trail_sound_event,
@@ -679,106 +550,8 @@ pub(crate) fn phase_locked_effect_deadline(
 }
 
 #[cfg(test)]
-mod config_asset_publication_tests {
-    use std::sync::Arc;
-
-    use crate::{App, WindowId};
-
-    fn catalog(
-        kitty_sprite: crate::app_config::KittySpriteAsset,
-        themes: Arc<crate::app_config::ThemeCatalog>,
-    ) -> Arc<crate::app_config::ConfigAssetCatalog> {
-        Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_style: crate::app_config::TrailStyleCache::empty(),
-            kitty_sprite,
-            wallpaper: crate::app_config::WallpaperAsset::None,
-            themes,
-            sparkle_spec_consumers: Default::default(),
-        })
-    }
-
-    fn assert_exact_catalog_on_every_window(
-        app: &App,
-        expected: &Arc<crate::app_config::ConfigAssetCatalog>,
-    ) {
-        assert!(Arc::ptr_eq(&app.config_assets, expected));
-        assert!(app.windows.values().all(|window| {
-            window
-                .installed_config_assets
-                .as_ref()
-                .is_some_and(|installed| Arc::ptr_eq(installed, expected))
-        }));
-    }
-
-    #[test]
-    fn authoritative_publication_installs_ready_invalid_and_builtin_before_effect_paths() {
-        let mut app = App::headless_for_test();
-        let sid = app.next_session_id;
-        let _second = app.insert_logical_window(crate::stub_session(sid), 24, 80);
-
-        let rgba: Arc<[u8]> = Arc::from([0x12, 0x34, 0x56, 0xff]);
-        let ready = catalog(
-            crate::app_config::KittySpriteAsset::Ready {
-                source_id: Arc::from("same.png"),
-                w: 1,
-                h: 1,
-                rgba: Arc::clone(&rgba),
-                fp: 11,
-            },
-            crate::app_config::ThemeCatalog::empty(),
-        );
-        assert_eq!(app.publish_config_assets(Arc::clone(&ready)), 2);
-        assert_exact_catalog_on_every_window(&app, &ready);
-        assert!(
-            app.windows
-                .values()
-                .all(|window| { window.fx.decos().kitty_sprite_source_fingerprint() == Some(11) })
-        );
-        assert!(!app.install_window_config_assets(WindowId(0)));
-
-        let themes = crate::app_config::ThemeCatalog::from_schemes([(
-            "Publication Test".to_string(),
-            aterm_types::scheme::builtin("Dracula").expect("builtin theme"),
-        )]);
-        let theme_only = catalog(ready.kitty_sprite.clone(), themes);
-        assert_eq!(app.publish_config_assets(Arc::clone(&theme_only)), 2);
-        assert_exact_catalog_on_every_window(&app, &theme_only);
-
-        let invalid = catalog(
-            crate::app_config::KittySpriteAsset::Invalid {
-                source_id: Arc::from("same.png"),
-                bounded_reason: Arc::from("replacement is invalid"),
-            },
-            crate::app_config::ThemeCatalog::empty(),
-        );
-        assert_eq!(app.publish_config_assets(Arc::clone(&invalid)), 2);
-        assert_exact_catalog_on_every_window(&app, &invalid);
-        assert!(app.windows.values().all(|window| {
-            window
-                .fx
-                .decos()
-                .kitty_sprite_source_fingerprint()
-                .is_none()
-        }));
-
-        let builtin = catalog(
-            crate::app_config::KittySpriteAsset::BuiltIn,
-            crate::app_config::ThemeCatalog::empty(),
-        );
-        assert_eq!(app.publish_config_assets(Arc::clone(&builtin)), 2);
-        assert_exact_catalog_on_every_window(&app, &builtin);
-        assert!(
-            app.windows
-                .values()
-                .all(|window| { window.fx.decos().kitty_sprite_source_fingerprint() == Some(0) })
-        );
-        assert_eq!(
-            app.publish_config_assets(Arc::clone(&builtin)),
-            0,
-            "re-publishing the identical outer Arc is a complete no-op"
-        );
-    }
-}
+#[path = "app_render_config_asset_publication_tests.rs"]
+mod config_asset_publication_tests;
 
 #[cfg(test)]
 #[path = "app_render_trail_present_pacing_tests.rs"]
@@ -1113,11 +886,12 @@ pub(crate) const fn ordinary_kitty_cursor_enabled(
     cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
 }
 
-/// Consume one echo-correlated cursor pulse and forward it only when the rainbow kitty companion's trail owner is enabled.
+/// Consume one echo-correlated cursor pulse of the rainbow trail and forward it to what the `cursor_pet` setting keeps: a walker's singer (`pet_mode`), or a flier's own flight (`flies`). With neither nothing is forwarded, so no head flies in for a pet that is off.
 #[inline]
 pub(crate) fn forward_kitty_cursor_motion(
     cursor_trail_enabled: bool,
     pet_mode: bool,
+    flies: bool,
     style: crate::cursor_glow::GlowStyle,
     pulse: Option<aterm_effects::cursor_glow::CursorCatMotionPulse>,
     cat: &mut crate::kitty_cursor::CursorCat,
@@ -1127,24 +901,24 @@ pub(crate) fn forward_kitty_cursor_motion(
     {
         if pet_mode {
             cat.on_pet_mode_motion_pulse(pulse);
-        } else {
+        } else if flies {
             cat.on_motion_pulse(pulse);
         }
     }
 }
 
-/// Ground an ordinary flying episode as soon as its trail owner goes away (hot reload disabling the master or switching styles), so an invisible sprite's fade/bob state buys no frame cadence.
+/// Ground an ordinary flying episode as soon as its owner goes away (hot reload disabling the master, switching styles, or the pet setting leaving the flier), so an invisible sprite's fade/bob state buys no frame cadence. A walker owns the head only while it sings.
 #[inline]
 pub(crate) fn retire_kitty_cursor_without_owner(
     cursor_trail_enabled: bool,
     pet_mode: bool,
+    flies: bool,
     style: crate::cursor_glow::GlowStyle,
     sing_drive: f32,
     cat: &mut crate::kitty_cursor::CursorCat,
 ) {
-    if !ordinary_kitty_cursor_enabled(cursor_trail_enabled, style)
-        || (pet_mode && sing_drive <= 0.0)
-    {
+    let owned = if pet_mode { sing_drive > 0.0 } else { flies };
+    if !owned || !ordinary_kitty_cursor_enabled(cursor_trail_enabled, style) {
         cat.retire_unowned_cursor_motion();
     }
 }
@@ -1158,6 +932,25 @@ pub(crate) struct CompanionStep {
     pub(crate) riff: Option<(u64, f32, u32)>,
     /// The celebration's outro to sound: its gain and signature.
     pub(crate) outro: Option<(f32, u32)>,
+}
+
+/// What the `cursor_pet` setting keeps, as the cursor cat's head reads it: a walker beside the
+/// cursor (`walks`), whose song is what flies the head, or the flier (`flies`), which earns
+/// its flight by typing. Neither for `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PetKept {
+    pub(crate) walks: bool,
+    pub(crate) flies: bool,
+}
+
+impl PetKept {
+    /// The pet a resolved presentation keeps.
+    pub(crate) const fn of(presentation: &crate::app_config::ResolvedTrailPresentation) -> Self {
+        Self {
+            walks: presentation.pet_species.is_some(),
+            flies: presentation.pet_flies,
+        }
+    }
 }
 
 /// The sound settings a [`step_cursor_companions`] call reads.
@@ -1179,7 +972,7 @@ pub(crate) fn step_cursor_companions(
     allowed: bool,
     glow_cfg: &crate::cursor_glow::GlowConfig,
     cat_owned: bool,
-    pet_mode: bool,
+    pet: PetKept,
     sound: CompanionSound,
 ) -> CompanionStep {
     if !allowed {
@@ -1228,7 +1021,8 @@ pub(crate) fn step_cursor_companions(
     );
     retire_kitty_cursor_without_owner(
         cat_owned && glow_cfg.enabled && allowed,
-        pet_mode,
+        pet.walks,
+        pet.flies,
         glow_cfg.style,
         sing_drive,
         &mut ws.fx.companions_mut().cursor_cat,
@@ -1391,7 +1185,7 @@ impl PetExclusions {
         }
     }
 
-    /// The find bar's bands and the Autopilot menu's card.
+    /// The find bar's bands and a fact menu's card.
     pub(crate) fn overlays(&self) -> &[aterm_effects::pet_world::PetRect] {
         &self.rects[..self.overlays]
     }
@@ -1435,138 +1229,8 @@ const PET_INK_SLOTS: usize = 2;
 const PET_BLANKED_SLOTS: usize = 4;
 
 #[cfg(test)]
-mod pet_console_observation_tests {
-    use super::pet_console_exclusions;
-    use aterm_core::terminal::Terminal;
-    use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
-
-    #[test]
-    fn late_native_overlays_reserve_real_cells_before_pet_planning() {
-        let mut term = Terminal::new(20, 60);
-        term.process(b"\x1b]11;#000000\x07\x1b[6;20H");
-        let input = term.cell_frame(20, 60);
-        let facts = PetWorldFacts::read(&term, 7);
-        let chrome = [PetRect::new(15.0, 30.0, 1.0, 5.0)];
-        let menu = [PetRect::new(10.0, 50.0, 2.0, 6.0)];
-        let exclusions =
-            pet_console_exclusions(&input, true, Some((7, 3, 9, 12)), true, &chrome, &menu, &[]);
-        assert_eq!(exclusions.ink().len(), 2, "the preedit row and the guesses");
-        assert_eq!(
-            exclusions.overlays().len(),
-            3,
-            "two find bands and the menu"
-        );
-        assert_eq!(exclusions.chrome(), &chrome[..]);
-        let mut world = PetWorld::default();
-        assert!(world.observe_with_reserve(
-            &input,
-            &facts,
-            PetPane::full(&input),
-            exclusions.reserve(),
-        ));
-        for (row, col) in [
-            (5.0, 40.0),
-            (7.0, 6.0),
-            (0.0, 40.0),
-            (19.0, 40.0),
-            (15.0, 31.0),
-            (10.0, 52.0),
-        ] {
-            assert!(!world.clear(PetRect::new(row, col, 1.0, 1.0), 0.0));
-        }
-        assert!(world.clear(PetRect::new(12.0, 40.0, 2.0, 6.0), 0.2));
-        for (row, col) in [(5.0, 40.0), (7.0, 6.0), (8.0, 11.0)] {
-            let cell = PetRect::new(row, col, 1.0, 1.0);
-            assert!(
-                world.under_text_clear(cell, 0.0),
-                "typed ink at ({row},{col})"
-            );
-            assert_eq!(world.ink_clearance(cell, 0.0), Some(false), "drawn under");
-        }
-        for (row, col) in [(0.0, 40.0), (19.0, 40.0), (15.0, 31.0), (10.0, 52.0)] {
-            let cell = PetRect::new(row, col, 1.0, 1.0);
-            assert!(
-                !world.under_text_clear(cell, 0.0),
-                "protected at ({row},{col})"
-            );
-        }
-        let none = pet_console_exclusions(&input, false, None, false, &[], &[], &[]);
-        assert!(
-            none.overlays().is_empty()
-                && none.chrome().is_empty()
-                && none.ink().is_empty()
-                && none.blanked().is_empty()
-        );
-
-        let mut term = Terminal::new(10, 40);
-        term.process("line\r\n".repeat(15).as_bytes());
-        term.scroll_display(3);
-        let input = term.cell_frame(10, 40);
-        assert_ne!(input.display_offset, 0);
-        let blank = [PetRect::new(2.0, 0.0, 1.0, 10.0)];
-        let history =
-            pet_console_exclusions(&input, true, Some((3, 4, 4, 5)), false, &[], &[], &blank);
-        assert!(
-            history.overlays().is_empty()
-                && history.chrome().is_empty()
-                && history.ink().is_empty()
-                && history.blanked().is_empty()
-        );
-    }
-
-    /// THE GLASS THE HOST BLANKS IS THE BLANK THE PERSON SEES: the program's letters under a
-    /// blanked span ([`aterm_effects::pet_world::PetReserve::blanked`], the tail of Claude Code's
-    /// mode row the footer rewrites) are no ink to the pet, while its letters past the span and
-    /// the host's words over the row's start ([`aterm_effects::pet_world::PetReserve::protected`])
-    /// stay what they were.
-    #[test]
-    fn blanked_glass_reads_as_the_blank_the_person_sees() {
-        let mut term = Terminal::new(20, 80);
-        let letters = "x".repeat(70);
-        term.process(format!("\x1b]11;#000000\x07\x1b[16;1H{letters}\x1b[3;1H").as_bytes());
-        let input = term.cell_frame(20, 80);
-        let facts = PetWorldFacts::read(&term, 7);
-        let words = [PetRect::new(15.0, 0.0, 1.0, 17.0)];
-        let blank = [PetRect::new(15.0, 17.0, 1.0, 43.0)];
-        let seen = |blanked: &[PetRect]| {
-            let exclusions =
-                pet_console_exclusions(&input, false, None, false, &words, &[], blanked);
-            assert_eq!(exclusions.blanked(), blanked);
-            let mut world = PetWorld::default();
-            assert!(world.observe_with_reserve(
-                &input,
-                &facts,
-                PetPane::full(&input),
-                exclusions.reserve(),
-            ));
-            world
-        };
-        let (world, unblanked) = (seen(&blank), seen(&[]));
-        let tail = PetRect::new(15.0, 30.0, 1.0, 6.0);
-        assert!(world.clear(tail, 0.0), "the blanked tail is free glass");
-        assert!(
-            !unblanked.clear(tail, 0.0) && unblanked.under_text_clear(tail, 0.0),
-            "CONTROL: unblanked, the letters there are ink"
-        );
-        for (what, cell) in [
-            ("the host's words", PetRect::new(15.0, 10.0, 1.0, 1.0)),
-            (
-                "the program's letters past the blank",
-                PetRect::new(15.0, 65.0, 1.0, 1.0),
-            ),
-        ] {
-            assert_eq!(
-                (world.clear(cell, 0.0), world.under_text_clear(cell, 0.0)),
-                (
-                    unblanked.clear(cell, 0.0),
-                    unblanked.under_text_clear(cell, 0.0)
-                ),
-                "{what} read as they did"
-            );
-            assert!(!world.clear(cell, 0.0), "{what} are not free glass");
-        }
-    }
-}
+#[path = "app_render_pet_console_observation_tests.rs"]
+mod pet_console_observation_tests;
 
 #[cfg(test)]
 pub(crate) fn pet_tick_for_test(
@@ -1619,11 +1283,7 @@ pub(crate) fn pet_owner_tick_for_test(
     let tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts::new(
         &facts,
         &host,
-        aterm_effects::companion::GlowOwnership {
-            enabled: true,
-            style: crate::cursor_glow::GlowStyle::RainbowKitty,
-            style_raw_names_pet: true,
-        },
+        aterm_effects::companion::PetOwnership { on: true },
     ));
     ws.fx.companion_mut().tick(tick)
 }
@@ -1679,11 +1339,7 @@ pub(crate) fn pet_prepare_shed_for_test(
     ws.fx.pet_prepare(aterm_effects::companion::PetFacts::new(
         &facts,
         &host,
-        aterm_effects::companion::GlowOwnership {
-            enabled: true,
-            style: crate::cursor_glow::GlowStyle::RainbowKitty,
-            style_raw_names_pet: true,
-        },
+        aterm_effects::companion::PetOwnership { on: true },
     ))
 }
 
@@ -2060,90 +1716,8 @@ pub(crate) fn emit_resident_pet(
 }
 
 #[cfg(test)]
-mod resident_pet_presentation_tests {
-    use aterm_effects::host::CaptureMode;
-    use aterm_effects::kitty_pet::PetSense;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_reduced_motion_resident_keeps_full_body_cursor_home_and_no_frame_debt() {
-        let mut app = crate::App::headless_for_test();
-        let geom = aterm_effects::word_decorations::EffectGeom {
-            cell_w: 10,
-            cell_h: 20,
-            rows: 30,
-            cols: 80,
-        };
-        let ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
-        let start = Instant::now();
-        let mut tick = 0;
-        for caret_col in [12_u16, 60] {
-            let caret = (4, caret_col);
-            let mut previous = None;
-            for _ in 0..3 {
-                let now = start + Duration::from_millis(tick * 16);
-                tick += 1;
-                let pet = crate::app_render::pet_owner_tick_for_test(
-                    ws,
-                    CaptureMode::Present,
-                    PetSense {
-                        caret_drawn: true,
-                        now,
-                        caret: Some(caret),
-                        rows: geom.rows,
-                        cols: geom.cols,
-                        cell_w: geom.cell_w,
-                        cell_h: geom.cell_h,
-                        reduced_motion: true,
-                        output_burst: false,
-                        pointer: None,
-                        wrapped: false,
-                    },
-                );
-                assert!(pet.on_glass);
-                let body = pet.body_px.expect("the static resident is drawn");
-                let cursor_x = i32::from(caret.1) * i32::from(geom.cell_w);
-                assert!(
-                    (body.0 - cursor_x).max(cursor_x - body.1).max(0)
-                        <= 10 * i32::from(geom.cell_w),
-                    "the stationary posture follows the caret"
-                );
-                assert!(
-                    !ws.fx.companion_mut().needs_frames(),
-                    "a retained static body owes no idle animation"
-                );
-                if let Some(previous) = previous {
-                    assert_eq!(pet.fp, previous, "idle frames remain byte-stable");
-                }
-                previous = Some(pet.fp);
-                ws.fx.open_words();
-                let head = ws.fx.companions_mut().cursor_cat.static_frame(now);
-                let fp = super::emit_single_cursor_companion(
-                    ws,
-                    geom,
-                    Some(caret),
-                    &pet,
-                    false,
-                    head,
-                    false,
-                    0,
-                    now,
-                    true,
-                    0x0010_1010,
-                    0x00FF_FFFF,
-                    0x0050_FA7B,
-                );
-                assert_ne!(fp, 0);
-                assert_eq!(
-                    ws.fx.free_sprites().len(),
-                    1,
-                    "the static posture emits only its full body"
-                );
-                assert!(ws.fx.free_sprites()[0].w >= 5 * geom.cell_w);
-            }
-        }
-    }
-}
+#[path = "app_render_resident_pet_presentation_tests.rs"]
+mod resident_pet_presentation_tests;
 
 /// The redraw early-out decision, pure for unit tests.
 #[cfg_attr(
@@ -2376,285 +1950,16 @@ fn recheck_sync_frame_hold(
 mod sync_hold_tests;
 
 #[cfg(test)]
-mod fallback_convergence_tests {
-    use super::fallback_convergence_action;
-
-    #[test]
-    fn fallback_convergence_truth_table() {
-        for (pending, was, want, why) in [
-            (true, false, (true, false), "first pending frame"),
-            (true, true, (true, false), "steady pending frame"),
-            (false, true, (true, true), "landing edge"),
-            (false, false, (false, false), "not converging"),
-        ] {
-            assert_eq!(fallback_convergence_action(pending, was), want, "{why}");
-        }
-    }
-}
+#[path = "app_render_fallback_convergence_tests.rs"]
+mod fallback_convergence_tests;
 
 #[cfg(test)]
-mod gpu_lost_remedy_tests {
-    use super::*;
-
-    /// The present that lands the GPU-lost remedy (`gpu_lost_remedy_floor`, set on Windows)
-    /// resolves its row on the center alone: no window draws the row, so the present asks every
-    /// window for no frame, and it settles nothing, so a strip fall the floor let go waits for
-    /// the loop's own settle rather than re-gridding every window from inside a present.
-    #[test]
-    fn the_present_that_lands_the_gpu_lost_remedy_resolves_its_row_and_asks_no_frame() {
-        use aterm_messages::chrome::CHROME_REGROW_SETTLE;
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.windows
-            .get_mut(&wid)
-            .expect("window 0")
-            .chrome_regrids_for_test = true;
-        let t0 = Instant::now()
-            .checked_sub(CHROME_REGROW_SETTLE * 2)
-            .expect("the clock reads past two floors");
-        app.set_tab_strip_rows(1, t0);
-        app.set_tab_strip_rows(0, t0 + Duration::from_millis(20));
-        assert_eq!(
-            app.tab_strip_rows, 1,
-            "PRECONDITION: the floor held the fall"
-        );
-        let row = app
-            .messages
-            .post(
-                crate::message_reporters::gpu_lost(),
-                app.messages_wall.now(),
-                Instant::now(),
-            )
-            .id;
-        assert!(
-            app.messages.live(row).is_some(),
-            "PRECONDITION: the row is live"
-        );
-        app.gpu_lost_remedy_floor = Some(wid);
-        let asks = crate::redraw_all_requests_on_this_thread();
-        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
-        app.finalize_successful_present(
-            wid,
-            metrics::StartupPresentTiming::collapsed(Instant::now()),
-            0,
-            None,
-            SuccessfulPresentRoute::Terminal,
-            crate::VisibleContentRoute::Terminal { composed: false },
-            HostVisualState::default(),
-            None,
-            &plan,
-        );
-        assert_eq!(app.gpu_lost_remedy_floor, None, "the remedy landed");
-        assert!(app.messages.live(row).is_none(), "its row is resolved");
-        assert_eq!(
-            crate::redraw_all_requests_on_this_thread(),
-            asks,
-            "the present asks every window for no frame"
-        );
-        assert_eq!(
-            app.tab_strip_rows, 1,
-            "the present settles nothing: the fall is the loop's settle's"
-        );
-    }
-}
+#[path = "app_render_gpu_lost_remedy_tests.rs"]
+mod gpu_lost_remedy_tests;
 
 #[cfg(all(test, any(windows, target_os = "linux")))]
-mod strip_band_landing_tests {
-    use super::*;
-    use crate::tab_bar::TabHit;
-
-    fn compose(app: &mut App, wid: WindowId) {
-        let (rows, cols) = {
-            let ws = &app.windows[&wid];
-            (ws.rows, ws.cols)
-        };
-        let terminal = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            let mut term = term_lock(&terminal);
-            term.resize(rows, cols);
-            term.cell_frame_into(&mut ws.input_scratch, usize::from(rows), usize::from(cols));
-        }
-        app.splice_tab_strip(wid);
-    }
-
-    fn present_raster(app: &mut App, wid: WindowId) {
-        let App {
-            windows, backend, ..
-        } = app;
-        let ws = windows.get(&wid).expect("window");
-        let Backend::Cpu(renderer) = backend.ready_mut() else {
-            panic!("headless test backend is CPU")
-        };
-        let _ = renderer.render_input(&ws.input_scratch);
-    }
-
-    fn band_covers(app: &App, wid: WindowId, col: usize) -> bool {
-        let band = &app.windows[&wid].cached_strip_band;
-        let Some(row) = band.first() else {
-            return false;
-        };
-        let Some((_, first)) = row.first() else {
-            return false;
-        };
-        row.iter()
-            .any(|(c, r)| *c == col && Arc::ptr_eq(&r.image, &first.image))
-    }
-
-    fn finalize(app: &mut App, wid: WindowId) {
-        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
-        app.finalize_successful_present(
-            wid,
-            crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
-            0,
-            None,
-            SuccessfulPresentRoute::Terminal,
-            crate::VisibleContentRoute::Terminal { composed: false },
-            HostVisualState::default(),
-            None,
-            &plan,
-        );
-    }
-
-    #[test]
-    fn a_cjk_title_is_a_band_title_on_its_first_frame_and_asks_one_frame_more() {
-        let Some(path) = crate::tray_raster::cjk_chain_face_path_for_test() else {
-            aterm_spec::host::could_not_run("no CJK chain face here");
-        };
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.tab_strip_rows = 1;
-        app.first_present_done = true;
-        let session = crate::stub_session(app.next_session_id);
-        app.push_stub_tab(wid, session);
-        let terminal = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        {
-            let mut term = term_lock(&terminal);
-            term.process("\x1b[2 q\x1b]0;日本語 shell\x07".as_bytes());
-            assert!(
-                !crate::blink_clock_armed(term.cursor_visible(), term.cursor_style(), false),
-                "a steady cursor: the blink clock is not armed"
-            );
-        }
-        let seed = {
-            let App {
-                backend,
-                font_px,
-                theme,
-                ..
-            } = &mut app;
-            let Backend::Cpu(renderer) = backend.ready_mut() else {
-                panic!("headless test backend is CPU")
-            };
-            renderer.set_runtime_font_discovery(false);
-            renderer.set_config_fallback_fonts(&[path.to_string()]);
-            let _ = renderer.seal_admitted_font_sources();
-            renderer
-                .fork_semantic_surface(*font_px, *theme)
-                .expect("a sealed generation forks")
-        };
-        crate::tray_raster::install_dormant_chrome_fonts_for_test(seed);
-        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-        if !crate::tray_raster::strip_band_ui_ready() {
-            crate::tray_raster::clear_ui_fonts_for_test();
-            aterm_spec::host::could_not_run("no system UI face here for the strip band");
-        }
-
-        assert!(
-            !crate::tray_raster::chrome_cascade_reaches_for_test('日'),
-            "CONTROL: nothing has parsed the CJK face before frame 1"
-        );
-        compose(&mut app, wid);
-        let seg = app.windows[&wid]
-            .tab_segments
-            .iter()
-            .find(|s| matches!(s.kind, TabHit::Select(1)))
-            .copied()
-            .expect("the CJK tab's segment");
-        let probe = usize::from(seg.start_col) + 1;
-        let first_key = app.windows[&wid].strip_band_key;
-        assert!(
-            band_covers(&app, wid, probe),
-            "frame 1: the CJK segment is band-covered on its first frame"
-        );
-        present_raster(&mut app, wid);
-        {
-            let key =
-                crate::early_out_tests::frame_key(&mut term_lock(&terminal), false, false, None);
-            app.windows
-                .get_mut(&wid)
-                .expect("window")
-                .stamp_present_decision(key);
-        }
-        assert!(app.windows[&wid].last_present.is_some());
-        finalize(&mut app, wid);
-        assert!(
-            app.windows[&wid].last_present.is_none(),
-            "the follow-up cleared the retained key after the first present"
-        );
-        let mut requests = 0;
-        assert!(app.rearm_for_strip_band_landing(wid, || requests += 1));
-        assert_eq!(
-            requests, 1,
-            "a redraw was requested after the first present"
-        );
-
-        compose(&mut app, wid);
-        let second_key = app.windows[&wid].strip_band_key;
-        assert_eq!(
-            (first_key.0, first_key.1, first_key.2, first_key.3),
-            (second_key.0, second_key.1, second_key.2, second_key.3),
-            "the geometry terms did not move"
-        );
-        assert_ne!(
-            first_key.4, second_key.4,
-            "the landing moved the band key's epoch term"
-        );
-        assert!(
-            band_covers(&app, wid, probe),
-            "frame 2: the CJK segment is band-covered"
-        );
-        let mut requests = 0;
-        assert!(!app.rearm_for_strip_band_landing(wid, || requests += 1));
-        assert_eq!(requests, 0, "a settled band requests no frame");
-        crate::tray_raster::clear_ui_fonts_for_test();
-    }
-
-    #[test]
-    fn no_landing_no_rearm() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let renderer = aterm_render::Renderer::from_bytes(
-            aterm_render::embedded_font(),
-            14.0,
-            aterm_render::Theme::default(),
-        )
-        .expect("embedded renderer");
-        crate::tray_raster::install_dormant_chrome_fonts_for_test(renderer);
-        let mut requests = 0;
-        app.tab_strip_rows = 0;
-        assert!(
-            !app.rearm_for_strip_band_landing(wid, || requests += 1),
-            "no strip: nothing to land"
-        );
-        app.tab_strip_rows = 1;
-        compose(&mut app, wid);
-        assert!(
-            !app.rearm_for_strip_band_landing(wid, || requests += 1),
-            "a settled band's re-read is not a landing"
-        );
-        assert_eq!(requests, 0);
-        crate::tray_raster::clear_ui_fonts_for_test();
-    }
-}
+#[path = "app_render_strip_band_landing_tests.rs"]
+mod strip_band_landing_tests;
 
 /// Coalesce a per-row dirty set into inclusive `(first, last)` runs of consecutive dirty rows.
 pub(crate) fn dirty_row_runs(dirty: &[bool]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -2732,50 +2037,8 @@ fn cpu_damage_rects_into(
 }
 
 #[cfg(test)]
-mod cpu_damage_rect_tests {
-    use super::cpu_damage_rects_into;
-
-    fn tuples(rects: &[crate::present::DamageRect]) -> Vec<(u32, u32, u32, u32)> {
-        rects
-            .iter()
-            .map(|rect| (rect.x, rect.y, rect.width.get(), rect.height.get()))
-            .collect()
-    }
-
-    #[test]
-    fn dirty_damage_geometry_is_exact() {
-        let dirty = [true, true, false, true, false, true, true];
-        let mut rects = Vec::new();
-        assert!(cpu_damage_rects_into(
-            &mut rects,
-            &dirty,
-            3,
-            8,
-            -5,
-            55,
-            |row| (row * 10, (row + 1) * 10)
-        ));
-        assert_eq!(
-            tuples(&rects),
-            vec![(3, 0, 8, 15), (3, 25, 8, 10), (3, 45, 8, 10)],
-            "contiguous rows coalesce and top/bottom cropping stays exact",
-        );
-
-        for (dirty, span) in [([false, false], 8), ([true, true], 0)] {
-            let mut rects = Vec::new();
-            assert!(!cpu_damage_rects_into(
-                &mut rects,
-                &dirty,
-                3,
-                span,
-                0,
-                20,
-                |row| (row * 10, (row + 1) * 10),
-            ));
-            assert_eq!(tuples(&rects), vec![(0, 0, 1, 1)]);
-        }
-    }
-}
+#[path = "app_render_cpu_damage_rect_tests.rs"]
+mod cpu_damage_rect_tests;
 
 /// The `RepaintKey::system_dark` term (and the overlay card raster's geom_key term) from the App-tracked OS appearance (`sync_app_theme_to_appearance`), the one source for every key construction site.
 pub(crate) fn repaint_system_dark(appearance: aterm_types::Appearance) -> bool {
@@ -3938,96 +3201,8 @@ fn clip_selections_off_card(input: &mut RenderInput, card: crate::tab_menu::Menu
 }
 
 #[cfg(test)]
-mod overlay_scrub_selection_tests {
-    use super::*;
-    use aterm_core::selection::{SelectionSide, SelectionType};
-
-    #[test]
-    fn scrub_detects_block_selection_snapped_onto_wide_lead() {
-        let blank = crate::chrome_band::blank_cell(aterm_render::Theme::default());
-        let mut continuation = blank;
-        continuation.wide = true;
-
-        let mut input = RenderInput::empty();
-        input.rows = 1;
-        input.cols = 1;
-        input.cells = vec![vec![blank, continuation]];
-        input
-            .selection
-            .start_selection(0, 1, SelectionSide::Left, SelectionType::Block);
-        input.selection.update_selection(0, 1, SelectionSide::Right);
-        input.selection.complete_selection();
-        assert!(
-            input.selection_contains_cell(0, 0, true, false),
-            "negative-control precondition: wide snapping reaches the visible lead"
-        );
-        assert!(
-            !input.selection_contains_cell(0, 0, false, false),
-            "a scalar-only probe would miss this intersection"
-        );
-
-        scrub_overlay_row_band(&mut input, 0..1, aterm_render::RowBands::new(0, 16));
-
-        assert!(
-            !input.selection.has_selection(),
-            "chrome replacement must scrub the same wide-aware selection the renderer paints"
-        );
-    }
-
-    #[test]
-    fn scrub_still_clears_overlays_when_selection_clip_is_disjoint_from_band() {
-        let blank = crate::chrome_band::blank_cell(aterm_render::Theme::default());
-        let mut input = RenderInput::empty();
-        input.rows = 4;
-        input.cols = 4;
-        input.cells = vec![vec![blank; 4]; 4];
-
-        let mut selection = aterm_core::selection::TextSelection::new();
-        selection.start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
-        selection.update_selection(2, 2, SelectionSide::Right);
-        selection.complete_selection();
-        input.selections.push(aterm_core::render::PaneSelection {
-            selection,
-            clip: aterm_core::render::SelectionClip::new(2, 4, 0, 4),
-            bg: 0x334455,
-            fg: 0xffffff,
-            inactive: false,
-        });
-
-        input.cursor_trail.push(aterm_core::render::TrailCell {
-            row: 0,
-            col: 1,
-            alpha: 255,
-        });
-        input.cursor_glow_add.push(aterm_core::render::GlowQuad {
-            x: 0,
-            y: 0,
-            w: 8,
-            h: 16,
-            color: 0xffffff,
-            alpha: 0,
-            color2: 0xffffff,
-            alpha2: 0,
-            row: 0,
-        });
-        scrub_overlay_row_band(&mut input, 0..1, aterm_render::RowBands::new(0, 16));
-
-        assert_eq!(
-            input.selections.len(),
-            1,
-            "a selection in rows 2..4 is untouched by a top-row chrome band"
-        );
-        assert!(
-            input.cursor_trail.is_empty() && input.cursor_glow_add.is_empty(),
-            "overlay effects in the spliced band must still be scrubbed when selection clips are disjoint"
-        );
-        assert_eq!(
-            input.fx_occluders,
-            [aterm_core::render::PxRect::new(i32::MIN, 0, i32::MAX, 16)],
-            "…and the band occludes every fx layer (the companions, the rain)"
-        );
-    }
-}
+#[path = "app_render_overlay_scrub_selection_tests.rs"]
+mod overlay_scrub_selection_tests;
 
 fn rain_refresh_needed(
     enabled: bool,
@@ -5442,85 +4617,8 @@ pub(crate) fn push_pane_selection(
 }
 
 #[cfg(test)]
-mod selection_projection_tests {
-    use super::*;
-    use aterm_core::selection::{SelectionSide, SelectionType};
-
-    fn selected_pane(rows: usize, cols: usize) -> RenderInput {
-        let mut src = RenderInput::empty();
-        src.rows = rows;
-        src.cols = cols;
-        src.selection
-            .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        src.selection.update_selection(
-            i32::try_from(rows).unwrap() - 1,
-            u16::try_from(cols).unwrap() - 1,
-            SelectionSide::Right,
-        );
-        src.selection.complete_selection();
-        src
-    }
-
-    #[test]
-    fn off_frame_focused_pane_selection_fails_closed() {
-        let src = selected_pane(2, 2);
-        let mut dst = RenderInput::empty();
-        dst.rows = 2;
-        dst.cols = 4;
-        push_pane_selection(&mut dst, &src, 0, 8, 2, 2, true);
-
-        assert_eq!(
-            dst.selection_clip,
-            Some(aterm_core::render::SelectionClip::new(0, 2, 4, 4)),
-            "active but clipped-away selection keeps explicit empty authority"
-        );
-        for row in 0..dst.rows {
-            for col in 0..dst.cols {
-                assert!(
-                    !dst.selection_contains_cell(row, col, false, false),
-                    "off-frame pane selection leaked to frame cell ({row}, {col})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn both_panes_paint_and_the_focused_one_keeps_the_scalar_anchor() {
-        let mut dst = RenderInput::empty();
-        dst.rows = 2;
-        dst.cols = 9;
-        let mut focused = selected_pane(2, 4);
-        focused.selection_bg = 0x0011_2233;
-        push_pane_selection(&mut dst, &focused, 0, 0, 2, 4, true);
-        let mut sibling = selected_pane(2, 4);
-        sibling.selection_bg = 0x0044_5566;
-        push_pane_selection(&mut dst, &sibling, 0, 5, 2, 4, false);
-
-        assert_eq!(
-            dst.selection_bg, 0x0011_2233,
-            "the scalar colour is the FOCUSED pane's, unchanged"
-        );
-        assert_eq!(dst.selections.len(), 2);
-        assert_eq!(
-            (dst.selections[0].bg, dst.selections[1].bg),
-            (0x0011_2233, 0x0044_5566),
-            "each entry carries its OWN live selection colour"
-        );
-        assert_eq!(
-            (dst.selections[0].inactive, dst.selections[1].inactive),
-            (false, true)
-        );
-        for col in 0..dst.cols {
-            let hit = dst.selection_hit(0, col, false, false);
-            let expected = match col {
-                0..=3 => Some(0),
-                4 => None, // the divider column belongs to no pane
-                _ => Some(1),
-            };
-            assert_eq!(hit, expected, "column {col} resolved to the wrong pane");
-        }
-    }
-}
+#[path = "app_render_selection_projection_tests.rs"]
+mod selection_projection_tests;
 
 /// Blit one pane's snapshot `src` (sized to the pane's sub-rect) into the composite `dst` at `(row_off, col_off)`.
 pub(crate) fn blit_pane_into(
@@ -5826,40 +4924,8 @@ fn record_presented_grids(
 }
 
 #[cfg(test)]
-mod presented_grid_record_tests {
-    use super::{HostVisualState, SuccessfulPresentRoute};
-    use crate::WindowId;
-
-    /// A mixed frame after a terminal one clears the record: the leaves the terminal frame staged
-    /// are still there, but the mixed frame did not draw them.
-    #[test]
-    fn a_frame_off_the_terminal_route_clears_the_record() {
-        let wid = WindowId(0);
-        let mut app = crate::scripted_redraw_fixture::scripted_app();
-        app.redraw_window(wid);
-        assert_eq!(
-            app.windows[&wid].presented_grids.len(),
-            1,
-            "the terminal frame drew its grid"
-        );
-        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
-        app.finalize_successful_present(
-            wid,
-            crate::metrics::StartupPresentTiming::collapsed(std::time::Instant::now()),
-            0,
-            None,
-            SuccessfulPresentRoute::Heterogeneous,
-            crate::VisibleContentRoute::Heterogeneous,
-            HostVisualState::default(),
-            None,
-            &plan,
-        );
-        assert!(
-            app.windows[&wid].presented_grids.is_empty(),
-            "a mixed frame names no terminal grid"
-        );
-    }
-}
+#[path = "app_render_presented_grid_record_tests.rs"]
+mod presented_grid_record_tests;
 
 /// Focused terminal coordinate sample owned by the same lock as a capture's cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6212,469 +5278,36 @@ fn field_preedit_display(
 }
 
 #[cfg(test)]
-mod ime_preedit_field_tests {
-    use super::field_preedit_display;
-
-    #[test]
-    fn field_preedit_display_rows() {
-        enum Span {
-            Is(std::ops::Range<usize>),
-            Empty,
-            Unchecked,
-        }
-        let rows = [
-            (
-                "splices at the caret",
-                ("find", 2, "中文", Some("中".len())),
-                ("fi中文nd", 2 + "中".len(), Span::Is(2.."fi中文".len())),
-            ),
-            (
-                "no platform caret",
-                ("ab", 2, "に", None),
-                ("abに", "abに".len(), Span::Unchecked),
-            ),
-            (
-                "interior byte offsets floor to char boundaries",
-                ("中", 1, "日", Some(2)),
-                ("日中", 0, Span::Is(0.."日".len())),
-            ),
-            (
-                "an empty composition is the identity",
-                ("query", 3, "", None),
-                ("query", 3, Span::Empty),
-            ),
-        ];
-        for (label, (text, caret, preedit, preedit_caret), (want_text, want_caret, want_span)) in
-            rows
-        {
-            let (got_text, got_caret, got_span) =
-                field_preedit_display(text, caret, preedit, preedit_caret);
-            assert_eq!(got_text, want_text, "{label}");
-            assert_eq!(got_caret, want_caret, "{label}");
-            match want_span {
-                Span::Is(span) => assert_eq!(got_span, span, "{label}"),
-                Span::Empty => assert!(got_span.is_empty(), "{label}"),
-                Span::Unchecked => {}
-            }
-        }
-    }
-}
+#[path = "app_render_ime_preedit_field_tests.rs"]
+mod ime_preedit_field_tests;
 
 #[allow(
     clippy::items_after_test_module,
     reason = "this module drives the composed present path it is written against; the rest of the file is the App render inherent-impl, not stray items"
 )]
 #[cfg(test)]
-mod ime_candidate_anchor_tests {
-    use crate::{App, WindowId};
-    use std::time::{Duration, Instant};
-
-    fn split_fixture() -> (App, WindowId, usize, usize) {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let _ = app.split_active_stub_tab(wid);
-        let (rows, cols) = {
-            let ws = app.windows.get(&wid).expect("test window");
-            (usize::from(ws.rows), usize::from(ws.cols))
-        };
-        (app, wid, rows, cols)
-    }
-
-    fn present(
-        app: &mut App,
-        wid: WindowId,
-        size: (usize, usize),
-        frame: u64,
-    ) -> Option<(i32, i32, u32, u32)> {
-        let at = Instant::now() + Duration::from_millis(16 * frame);
-        assert!(
-            app.redraw_compose(wid, size.0, size.1, false, false, None, 0, at)
-                .is_some(),
-            "fixture: the composed present path ran"
-        );
-        app.windows[&wid].last_ime_rect
-    }
-
-    #[test]
-    fn a_split_anchors_the_candidate_list_on_the_composition_not_its_start() {
-        let (mut app, wid, rows, cols) = split_fixture();
-        let engine = present(&mut app, wid, (rows, cols), 0)
-            .expect("the engine caret rect is reported on an ordinary frame");
-
-        app.on_ime_preedit(wid, "にほん".to_string(), None);
-        let composing = present(&mut app, wid, (rows, cols), 1).expect("the composing caret rect");
-        assert!(
-            app.windows[&wid].preedit_shown,
-            "fixture: the composed frame really painted the composition"
-        );
-        let cw = i32::try_from(app.win_cell_size(wid).0).expect("cell width");
-        assert_eq!(
-            (composing.0 - engine.0, composing.1),
-            (6 * cw, engine.1),
-            "six columns of kana on the same row: the candidate list follows the \
-             caret, not the column the composition started at"
-        );
-
-        app.on_ime_preedit(wid, String::new(), None);
-        assert_eq!(present(&mut app, wid, (rows, cols), 2), Some(engine));
-    }
-
-    #[test]
-    fn a_hidden_terminal_cursor_still_anchors_the_composition() {
-        let (mut app, wid, rows, cols) = split_fixture();
-        let session = app.windows[&wid].layouts[app.windows[&wid].tabs.active].focus();
-        let term = app
-            .pool
-            .get(session)
-            .expect("focused leaf terminal")
-            .term
-            .clone();
-        crate::term_lock(&term).process(b"\x1b[?25l");
-        assert_eq!(
-            present(&mut app, wid, (rows, cols), 0),
-            None,
-            "control: a hidden cursor with no composition reports nothing"
-        );
-        app.on_ime_preedit(wid, "に".to_string(), None);
-        assert!(
-            present(&mut app, wid, (rows, cols), 1).is_some(),
-            "the composition is on screen, so its caret rectangle must go out"
-        );
-    }
-}
+#[path = "app_render_ime_candidate_anchor_tests.rs"]
+mod ime_candidate_anchor_tests;
 
 #[allow(
     clippy::items_after_test_module,
     reason = "these unit tests sit next to the ghost painter they cover; the rest of the file is the App render inherent-impl, not stray items"
 )]
 #[cfg(test)]
-mod overlay_card_theme_tests {
-    use crate::{App, WindowId};
-
-    #[test]
-    fn overlay_card_tracks_live_background_and_theme_fallback() {
-        let mut app = App::headless_for_test();
-        app.theme.bg = 0x00FF_FFFF; // a light user theme
-        let wid0 = WindowId(0);
-        if let Some(ws) = app.windows.get_mut(&wid0) {
-            ws.input_scratch.default_bg = 0x0012_3456;
-        }
-        assert_eq!(
-            app.overlay_card_theme(wid0).bg,
-            0x0012_3456,
-            "a terminal window's overlay still tracks the live OSC-11 bg"
-        );
-        if let Some(ws) = app.windows.get_mut(&wid0) {
-            ws.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
-        }
-        assert_eq!(app.overlay_card_theme(wid0).bg, 0x00FF_FFFF);
-    }
-}
+#[path = "app_render_overlay_card_theme_tests.rs"]
+mod overlay_card_theme_tests;
 
 #[cfg(test)]
-mod prediction_ghost_tests {
-    use super::{
-        paint_prediction_chain, paint_prediction_ghosts, paint_prediction_overlay,
-        paint_predictions, terminal_blank_cell,
-    };
-    use crate::predict::{GhostCell, Prediction};
-    use aterm_core::terminal::{RenderCell, Terminal};
-    use aterm_render::RenderInput;
-
-    fn blank() -> RenderCell {
-        RenderCell {
-            ch: ' ',
-            fg: [200, 200, 200],
-            bg: [0, 0, 0],
-            wide: false,
-            emoji_presentation: false,
-            text_presentation: false,
-            bold: false,
-            italic: false,
-            underline: aterm_core::terminal::UnderlineStyle::None,
-            strikethrough: false,
-            overline: false,
-            underline_color: None,
-            overline_color: None,
-            script: aterm_core::terminal::Script::Normal,
-        }
-    }
-
-    fn scratch(rows: usize) -> RenderInput {
-        let mut s = RenderInput::empty();
-        s.cells = vec![Vec::new(); rows];
-        s
-    }
-
-    #[test]
-    fn ghost_extends_row_and_dims() {
-        let mut s = scratch(2);
-        let preds = [Prediction::test_at(1, 3, 'x')];
-        assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds, 10, blank()).newest,
-            Some((1, 3))
-        );
-        assert_eq!(s.cells[1].len(), 4, "row extended to hold the ghost");
-        let c = &s.cells[1][3];
-        assert_eq!(c.ch, 'x');
-        assert_eq!(c.fg, [100, 100, 100], "fg dimmed halfway to bg");
-        assert!(!c.bold && !c.wide, "inherited SGR/geometry dropped");
-    }
-
-    #[test]
-    fn ghost_sparse_padding_uses_the_live_terminal_blank_not_last_sgr() {
-        let mut term = Terminal::new(1, 5);
-        term.process(b"\x1b]10;rgb:11/22/33\x07\x1b]11;rgb:44/55/66\x07\x1b[?5h");
-        let live_blank = terminal_blank_cell(&term);
-        assert_eq!(
-            (live_blank.fg, live_blank.bg),
-            ([0x44, 0x55, 0x66], [0x11, 0x22, 0x33]),
-            "DECSCNM-resolved live defaults"
-        );
-        let mut s = scratch(1);
-        let mut styled = blank();
-        styled.ch = '!';
-        styled.bg = [180, 20, 30];
-        styled.bold = true;
-        s.cells[0].push(styled);
-
-        assert!(
-            paint_prediction_ghosts(&mut s, &[Prediction::test_at(0, 3, 'x')], 5, live_blank)
-                .newest
-                .is_some()
-        );
-        assert_eq!(s.cells[0][0], styled, "materialized SGR cell is preserved");
-        assert_eq!(s.cells[0][1..3], [live_blank, live_blank], "implicit tail");
-        assert_eq!(s.cells[0][3].bg, live_blank.bg);
-        assert!(!s.cells[0][3].bold);
-    }
-
-    #[test]
-    fn ghost_clips_to_pane_rect() {
-        let mut s = scratch(2);
-        let preds = [
-            Prediction::test_at(0, 5, 'a'), // at cols → clipped
-            Prediction::test_at(0, 9, 'b'), // past cols → clipped
-            Prediction::test_at(7, 0, 'c'), // past rows → ignored
-        ];
-        assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds, 5, blank()).newest,
-            None,
-            "nothing painted when everything clips"
-        );
-        assert!(s.cells[0].is_empty(), "clipped ghosts never extend the row");
-        let ok = [Prediction::test_at(0, 4, 'd')]; // last in-rect column paints
-        assert_eq!(
-            paint_prediction_ghosts(&mut s, &ok, 5, blank()).newest,
-            Some((0, 4))
-        );
-        assert_eq!(s.cells[0][4].ch, 'd');
-    }
-
-    #[test]
-    fn the_cursor_goes_past_the_newest_painted_guess_never_a_refused_one() {
-        let row = || {
-            let mut lead = blank();
-            lead.ch = '日';
-            let mut continuation = blank();
-            continuation.wide = true;
-            vec![blank(), lead, continuation]
-        };
-        let mut s = scratch(1);
-        s.cells[0] = row();
-        let preds = [
-            Prediction::test_at(0, 0, 'b'),
-            Prediction::test_at(0, 1, 'c'),
-        ];
-        assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds, 5, blank()),
-            super::GhostsPainted {
-                newest: Some((0, 0)),
-                refused: 1,
-            },
-            "the newest PAINTED guess, not the refused newest, which is counted"
-        );
-        assert_eq!(s.cells[0][0].ch, 'b');
-        assert_eq!(s.cells[0][1].ch, '日');
-        assert!(s.cells[0][2].wide, "the glyph keeps its right half");
-
-        let mut s = scratch(1);
-        s.cells[0] = row();
-        assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds[1..], 5, blank()).newest,
-            None,
-            "every guess refused: nothing to draw the cursor past"
-        );
-        assert_eq!(s.cells[0], row(), "and nothing painted");
-    }
-
-    #[test]
-    fn a_frame_that_refused_an_older_guess_shows_no_key_through_the_newest() {
-        let mut predictor = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
-        let now = std::time::Instant::now();
-        for (col, ch) in (0u16..).zip(['a', 'b', 'c', 'd']) {
-            assert!(predictor.predict_char(ch, (0, col), 0, 10, now));
-        }
-        let newest = predictor.shown_through();
-        assert!(newest.is_some(), "fixture: Always shows all four");
-        let wide = || {
-            let mut lead = blank();
-            lead.ch = '日';
-            let mut continuation = blank();
-            continuation.wide = true;
-            vec![blank(), lead, continuation, blank()]
-        };
-        let mut s = scratch(1);
-        s.cells[0] = wide();
-        let painted = paint_prediction_overlay(&mut predictor, &mut s, now, 10, blank());
-        assert_eq!(painted.cursor, Some((0, 4)), "one past the newest painted");
-        assert_eq!(
-            (s.cells[0][0].ch, s.cells[0][1].ch, s.cells[0][3].ch),
-            ('a', '日', 'd'),
-            "fixture: `b` and `c` refused, `a` and `d` painted"
-        );
-        assert_eq!(
-            painted.shown_through, None,
-            "the keys of `b` and `c` are not on glass"
-        );
-        let mut s = scratch(1);
-        s.cells[0] = vec![blank(); 4];
-        let painted = paint_prediction_overlay(&mut predictor, &mut s, now, 10, blank());
-        assert_eq!(painted.shown_through, newest, "every guess painted");
-        assert_eq!(
-            painted.closes_input_through(),
-            None,
-            "`always` shows them with no proof: their keys wait for their echoes"
-        );
-    }
-
-    fn wide_row() -> Vec<RenderCell> {
-        let cell = |ch: char| RenderCell { ch, ..blank() };
-        let mut continuation = blank();
-        continuation.wide = true;
-        vec![cell('a'), cell('b'), cell('日'), continuation]
-    }
-
-    #[test]
-    fn a_state_chain_is_painted_all_or_none() {
-        let mut s = scratch(1);
-        s.cells[0] = wide_row();
-        let refused = [
-            Prediction::test_at(0, 1, 'x'),
-            Prediction::test_at(0, 3, 'y'),
-        ];
-        assert_eq!(
-            paint_prediction_chain(&mut s, &refused, (0, 1), 6, blank()),
-            None
-        );
-        assert_eq!(s.cells[0], wide_row(), "nothing painted");
-        assert_eq!(
-            paint_prediction_chain(&mut s, &[], (0, 3), 6, blank()),
-            None
-        );
-        assert_eq!(
-            paint_prediction_chain(&mut s, &[], (0, 1), 6, blank()),
-            Some((0, 1)),
-            "a pure motion: its cursor, no cell"
-        );
-        assert_eq!(s.cells[0], wide_row());
-        let erase = [Prediction::test_at(0, 1, ' ')];
-        assert_eq!(
-            paint_predictions(&mut s, &erase, Some((0, 1)), 6, blank()),
-            super::OverlayPaint {
-                cursor: Some((0, 1)),
-                whole: true,
-            },
-            "the chain's cursor, on its vacated cell, the chain painted whole"
-        );
-        assert_eq!(s.cells[0][1].ch, ' ', "the vacated cell painted blank");
-        let mut s = scratch(1);
-        s.cells[0] = wide_row();
-        assert_eq!(
-            paint_predictions(&mut s, &erase, None, 6, blank()),
-            super::OverlayPaint {
-                cursor: Some((0, 2)),
-                whole: true,
-            },
-            "the glyph lane: one past the newest painted guess, every guess painted"
-        );
-    }
-
-    #[test]
-    fn a_shift_is_painted_as_the_text_it_moves() {
-        let cell = |ch: char| RenderCell { ch, ..blank() };
-        let mut bold = cell('c');
-        bold.bold = true;
-        bold.fg = [200, 0, 0];
-        let mut s = scratch(1);
-        s.cells[0] = vec![cell('a'), cell('b'), bold, cell('d')];
-        let shift = [
-            Prediction::test_ghost(0, 1, 'x', GhostCell::Typed),
-            Prediction::test_ghost(0, 2, 'b', GhostCell::Moved { from: 1 }),
-            Prediction::test_ghost(0, 3, 'c', GhostCell::Moved { from: 2 }),
-            Prediction::test_ghost(0, 4, 'd', GhostCell::Moved { from: 3 }),
-        ];
-        assert_eq!(
-            paint_predictions(&mut s, &shift, Some((0, 2)), 6, blank()).cursor,
-            Some((0, 2)),
-            "the chain's cursor"
-        );
-        let text: String = s.cells[0].iter().map(|c| c.ch).collect();
-        assert_eq!(text, "axbcd");
-        assert_eq!(s.cells[0][3], bold, "`c` moved, in its own style");
-        assert!(
-            s.cells[0][1].fg != blank().fg && !s.cells[0][1].bold,
-            "the typed glyph: a ghost"
-        );
-
-        let mut s = scratch(1);
-        s.cells[0] = wide_row();
-        let refused = [Prediction::test_ghost(
-            0,
-            1,
-            '日',
-            GhostCell::Moved { from: 2 },
-        )];
-        assert_eq!(
-            paint_predictions(&mut s, &refused, Some((0, 1)), 6, blank()),
-            super::OverlayPaint {
-                cursor: None,
-                whole: false,
-            }
-        );
-        assert_eq!(s.cells[0], wide_row(), "nothing painted");
-    }
-}
+#[path = "app_render_prediction_ghost_tests.rs"]
+mod prediction_ghost_tests;
 
 #[cfg(test)]
 #[path = "app_render_comet_trail_tests.rs"]
 mod comet_trail_tests;
 
 #[cfg(test)]
-mod gpu_backpressure_tests {
-    use super::gpu_backpressure_excess_ns;
-    use std::time::Duration;
-
-    #[test]
-    fn backpressure_charges_only_the_wait_past_one_refresh() {
-        let hz120 = Duration::from_micros(8333);
-        let hz60 = Duration::from_micros(16667);
-        for (wait_ns, fi, want) in [
-            (0, hz120, 0),
-            (1_000_000, hz120, 0),
-            (8_333_000, hz120, 0),
-            (10_333_000, hz120, 2_000_000),
-            (25_000_000, hz120, 16_667_000),
-            (25_000_000, hz60, 8_333_000),
-        ] {
-            assert_eq!(
-                gpu_backpressure_excess_ns(wait_ns, fi),
-                want,
-                "{wait_ns} ns at {fi:?}"
-            );
-        }
-    }
-}
+#[path = "app_render_gpu_backpressure_tests.rs"]
+mod gpu_backpressure_tests;
 
 #[cfg(test)]
 #[path = "app_render_motion_policy_tests.rs"]
@@ -6715,40 +5348,8 @@ fn needs_fresh_witness_read(
 }
 
 #[cfg(test)]
-mod witness_row_capture_tests {
-    use super::{ComposedWitnessRows, captured_witness_neighbor, needs_fresh_witness_read};
-
-    #[test]
-    fn composed_witness_rows_come_from_the_capture_or_a_fresh_read() {
-        let above = ['═', 'A'];
-        let below = [' ', 'B'];
-        let none = ComposedWitnessRows::default();
-        let (a, b) = (Some(&above[..]), Some(&below[..]));
-        assert_eq!(captured_witness_neighbor(4, 5, a, b), a);
-        assert_eq!(captured_witness_neighbor(6, 5, a, b), b);
-        assert_eq!(captured_witness_neighbor(8, 5, a, b), None);
-        assert_eq!(captured_witness_neighbor(4, 5, None, b), None);
-        assert!(!needs_fresh_witness_read(&[4, 5, 6], 5, 4, 4, a, b, &none));
-        assert!(needs_fresh_witness_read(
-            &[4, 5, 6, 7],
-            5,
-            4,
-            4,
-            a,
-            b,
-            &none
-        ));
-        assert!(needs_fresh_witness_read(
-            &[4, 5, 6],
-            5,
-            4,
-            4,
-            None,
-            b,
-            &none
-        ));
-    }
-}
+#[path = "app_render_witness_row_capture_tests.rs"]
+mod witness_row_capture_tests;
 
 /// One frame's terminal-state snapshot for [`App::cursor_frame`].
 pub(crate) struct CursorFxInputs {
@@ -7135,142 +5736,12 @@ impl SinglePaneRowProbeCache {
 }
 
 #[cfg(test)]
-mod single_pane_row_probe_cache_tests {
-    use super::SinglePaneRowProbeCache;
-    use aterm_core::terminal::Terminal;
-
-    fn sample(
-        cache: &mut SinglePaneRowProbeCache,
-        term: &Terminal,
-        row: usize,
-        host_rows: usize,
-        host_cols: usize,
-        v2: bool,
-        probes: &mut [Vec<char>; 3],
-    ) -> (bool, bool, bool) {
-        let [caret, above, below] = probes;
-        cache.sample(term, row, host_rows, host_cols, v2, (caret, above, below))
-    }
-
-    #[test]
-    fn the_row_probe_cache_restores_on_a_hit_and_every_key_term_breaks_reuse() {
-        let mut term = Terminal::new(4, 12);
-        term.process(b"above\r\ncaret\r\nbelow");
-        let mut cache = SinglePaneRowProbeCache::default();
-        let mut probes = [Vec::new(), Vec::new(), Vec::new()];
-        let rows = |probes: &[Vec<char>; 3]| {
-            probes
-                .iter()
-                .map(|p| p.iter().take(5).collect::<String>())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            sample(&mut cache, &term, 1, 4, 12, true, &mut probes),
-            (false, true, true)
-        );
-        assert_eq!(rows(&probes), ["caret", "above", "below"]);
-        for probe in &mut probes {
-            probe.clear();
-            probe.extend(['X'; 12]);
-        }
-        assert_eq!(
-            sample(&mut cache, &term, 1, 4, 12, true, &mut probes),
-            (true, true, true)
-        );
-        assert_eq!(
-            rows(&probes),
-            ["caret", "above", "below"],
-            "restored on a hit"
-        );
-
-        let mut hit = |term: &Terminal, row, host: (usize, usize), v2| {
-            sample(&mut cache, term, row, host.0, host.1, v2, &mut probes).0
-        };
-        assert!(!hit(&term, 2, (4, 12), true), "a different cursor row");
-        assert!(!hit(&term, 2, (4, 13), true), "host geometry");
-        assert!(!hit(&term, 2, (4, 13), false), "neighbor ownership");
-        assert!(hit(&term, 2, (4, 13), false), "control: unchanged");
-        term.process(b"Z");
-        assert!(!hit(&term, 2, (4, 13), false), "new content");
-        term.resize(5, 13);
-        assert!(!hit(&term, 2, (5, 13), false), "a resize");
-        term.process(b"\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
-        assert!(!hit(&term, 1, (5, 13), false));
-        term.scroll_display(1);
-        assert!(term.grid().display_offset() > 0);
-        assert!(!hit(&term, 1, (5, 13), false), "a different viewport");
-        let other = Terminal::new(5, 13);
-        assert!(
-            !hit(&other, 1, (5, 13), false),
-            "another terminal (a tab switch)"
-        );
-    }
-}
+#[path = "app_render_single_pane_row_probe_cache_tests.rs"]
+mod single_pane_row_probe_cache_tests;
 
 #[cfg(test)]
-mod composed_witness_scroll_capture_tests {
-    use super::{ComposedWitnessRows, focused_composed_cursor_fx_sample};
-    use aterm_core::terminal::Terminal;
-
-    fn witness_rows(
-        term: &Terminal,
-        previous: aterm_core::terminal::ContentScrollState,
-        requested: &[u16],
-    ) -> ComposedWitnessRows {
-        focused_composed_cursor_fx_sample(
-            1,
-            term,
-            None,
-            true,
-            true,
-            true,
-            (0, 0),
-            requested,
-            Some(previous),
-            ComposedWitnessRows::default(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .witness_rows
-    }
-
-    fn row_text(term: &Terminal, row: u16) -> Vec<char> {
-        let mut cols = Vec::new();
-        term.row_cols_into(usize::from(row), &mut cols);
-        cols
-    }
-
-    #[test]
-    fn a_whole_grid_scroll_reads_each_witness_row_where_asked_and_where_carried() {
-        let mut term = Terminal::new(10, 20);
-        for i in 0..10 {
-            term.process(format!("line {i}\r\n").as_bytes());
-        }
-        let still = term.content_scroll_state();
-        let rows = witness_rows(&term, still, &[5]);
-        assert_eq!(rows.get(5), Some(&row_text(&term, 5)[..]));
-        assert_eq!(rows.get(2), None, "no scroll: the asked row alone");
-
-        term.process(b"step 1\r\nstep 2\r\nstep 3\r\n");
-        let rows = witness_rows(&term, still, &[5]);
-        assert_eq!(rows.get(5), Some(&row_text(&term, 5)[..]), "where asked");
-        assert_eq!(
-            rows.get(2),
-            Some(&row_text(&term, 2)[..]),
-            "and the scroll's three rows higher"
-        );
-
-        let banded = term.content_scroll_state();
-        term.process(b"\x1b[2;6r\x1b[6;1H\r\n\x1b[r");
-        let rows = witness_rows(&term, banded, &[5]);
-        assert_eq!(
-            (rows.get(5), rows.get(2)),
-            (None, None),
-            "a band move: none"
-        );
-    }
-}
+#[path = "app_render_composed_witness_scroll_capture_tests.rs"]
+mod composed_witness_scroll_capture_tests;
 
 #[allow(
     clippy::too_many_arguments,
@@ -8401,7 +6872,9 @@ impl App {
     /// The immutable config-generation presentation.
     pub(crate) fn trail_presentation(&self) -> crate::app_config::ResolvedTrailPresentation {
         let style_raw = self.config.cursor_trail_style_raw();
-        self.config_assets.trail_style.presentation_for(style_raw)
+        self.config_assets
+            .trail_style
+            .presentation_for(style_raw, self.config.cursor_pet_raw())
     }
 
     pub(crate) fn glow_config_for(
@@ -8442,7 +6915,7 @@ impl App {
         self.trail_presentation().comet
     }
 
-    /// Whether the active trail style draws the full-body pet companion (`"rainbow kitty pet"` or `"rainbow dog pet"`) instead of the flying kitty.
+    /// Whether the `cursor_pet` setting keeps a pet beside the cursor.
     pub(crate) fn trail_is_kitty_pet(&self) -> bool {
         self.trail_presentation().pet_species.is_some()
     }
@@ -8982,6 +7455,7 @@ impl App {
         forward_kitty_cursor_motion(
             glow_cfg.enabled,
             pet_mode,
+            trail_presentation.pet_flies,
             glow_cfg.style,
             step.motion_pulse,
             &mut ws.fx.companions_mut().cursor_cat,
@@ -11928,7 +10402,7 @@ impl App {
             .allows(crate::motion::SeriousEffect::CursorCat);
         let trail_presentation = self.trail_presentation();
         let glow_cfg = self.glow_config_for(trail_presentation);
-        let pet_mode = trail_presentation.pet_species.is_some();
+        let pet = PetKept::of(&trail_presentation);
         let sound = self.companion_sound();
         let Some(ws) = self.windows.get_mut(&id) else {
             return;
@@ -11941,7 +10415,7 @@ impl App {
         if ws.front_terminal().is_none() {
             return;
         }
-        step_cursor_companions(ws, now, allowed, &glow_cfg, false, pet_mode, sound)
+        step_cursor_companions(ws, now, allowed, &glow_cfg, false, pet, sound)
             .sound(&mut self.trail_audio);
     }
 
@@ -12346,14 +10820,11 @@ impl App {
             let load_shed = self.load_shed_active();
             let pet_glow = frame_glow;
             let cursor_fx_live = pet_glow.enabled;
-            let pet_console_owned = resident_pet_owner_present(
-                frame_presentation.pet_species.is_some(),
-                pet_glow.enabled
-                    && self
-                        .serious_mode_policy()
-                        .allows(crate::motion::SeriousEffect::CursorCat),
-                pet_glow.style,
-            );
+            // The pet is the pet setting's, whatever the trail draws.
+            let pet_console_owned = frame_presentation.pet_species.is_some()
+                && self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::CursorCat);
             let rewound = self.pool.is_rewound(front_terminal.session);
             let rewind_fp = if rewound {
                 self.rewind_frame_fp(id, plan)
@@ -12715,7 +11186,7 @@ impl App {
                 cursor_companions_allowed,
                 &glow_cfg,
                 true,
-                pet_mode,
+                PetKept::of(&trail_presentation),
                 companion_sound,
             );
             companion_step.sound(&mut self.trail_audio);
@@ -12738,14 +11209,15 @@ impl App {
             {
                 ws.note_deco_animating(frame_started);
             }
+            // The head is drawn for a collection's hello, for the pet's song, and for the
+            // flight a flier earns by typing (`forward_kitty_cursor_motion`).
             let kitty_enabled = cursor_companion_presentable
-                && cursor_cat_presentation_enabled(
+                && (cursor_cat_presentation_enabled(
                     animate_cat,
                     glow_cfg.enabled && cursor_companions_allowed,
                     glow_cfg.style,
                     cat_frame.collection_hello,
-                )
-                || (cursor_companion_presentable && cat_frame.sing > 0.0);
+                ) || cat_frame.sing > 0.0);
             let flying_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
             let kitty_alpha = if kitty_enabled && !pet_mode {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
@@ -12812,11 +11284,7 @@ impl App {
                             ws.last_cursor_px.0 as f32,
                             ws.last_cursor_px.1 as f32,
                         ))),
-                    aterm_effects::companion::GlowOwnership {
-                        enabled: glow_cfg.enabled,
-                        style: glow_cfg.style,
-                        style_raw_names_pet: pet_mode,
-                    },
+                    aterm_effects::companion::PetOwnership { on: pet_mode },
                 )
                 .with_sing(aterm_effects::host::SingFacts {
                     drive: sing_drive,
@@ -16153,15 +14621,10 @@ impl App {
         let pmode = self.predict_mode();
         let pediting = self.config.predictive_echo_editing_or_default();
         let trail_presentation = self.trail_presentation();
-        let pet_glow = self.glow_config_for(trail_presentation);
-        let pet_console_owned = resident_pet_owner_present(
-            trail_presentation.pet_species.is_some(),
-            pet_glow.enabled
-                && self
-                    .serious_mode_policy()
-                    .allows(crate::motion::SeriousEffect::CursorCat),
-            pet_glow.style,
-        );
+        let pet_console_owned = trail_presentation.pet_species.is_some()
+            && self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::CursorCat);
         let sync_hold_timeout = Duration::from_millis(
             self.session_factory
                 .terminal_config
@@ -16753,7 +15216,7 @@ impl App {
                 cursor_companions_allowed,
                 &glow_cfg,
                 true,
-                pet_mode,
+                PetKept::of(&trail_presentation),
                 companion_sound,
             );
             let sing_drive = companion_step.sing_drive;
@@ -16770,6 +15233,8 @@ impl App {
                 ws.note_deco_animating(now);
             }
             pin_pet_mode_exit(pet_mode, &mut cat_frame);
+            // The head is drawn for a collection's hello, for the pet's song, and for the
+            // flight a flier earns by typing (`forward_kitty_cursor_motion`).
             let kitty_enabled = cursor_companion_presentable
                 && (cursor_cat_presentation_enabled(
                     animate_cat,
@@ -16840,11 +15305,7 @@ impl App {
                         ws.last_cursor_px.0 as f32,
                         ws.last_cursor_px.1 as f32,
                     ))),
-                    aterm_effects::companion::GlowOwnership {
-                        enabled: glow_cfg.enabled,
-                        style: glow_cfg.style,
-                        style_raw_names_pet: pet_mode,
-                    },
+                    aterm_effects::companion::PetOwnership { on: pet_mode },
                 )
                 .with_sing(aterm_effects::host::SingFacts {
                     drive: sing_drive,
@@ -19487,15 +17948,21 @@ pub(crate) mod reflow_gauge {
     }
 }
 
-/// The bound on concurrent off-thread scrollback rewraps, process-wide.
+/// The bound on concurrent off-thread scrollback rewraps, process-wide. In this crate's own test
+/// binary every test thread shares it, so it counts the whole binary's grant
+/// (`aterm_cores::binary_parallelism`); an `aterm` a test boots is that one test's work, and
+/// takes the test's grant.
 pub(crate) fn reflow_worker_ceiling() -> usize {
     static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CEILING.get_or_init(|| {
+        let logical = if cfg!(test) {
+            aterm_cores::binary_parallelism()
+        } else {
+            aterm_cores::available_parallelism()
+        };
         reflow_worker_ceiling_for(
             physical_cpu_count(),
-            std::thread::available_parallelism()
-                .ok()
-                .map(std::num::NonZeroUsize::get),
+            logical.ok().map(std::num::NonZeroUsize::get),
         )
     })
 }
@@ -19538,27 +18005,8 @@ fn physical_cpu_count() -> Option<usize> {
 }
 
 #[cfg(test)]
-mod reflow_ceiling_tests {
-    use super::{REFLOW_WORKER_MAX, reflow_worker_ceiling_for};
-
-    #[test]
-    fn the_ceiling_is_bounded_by_physical_cores_not_hyperthreads() {
-        for (physical, logical, want) in [
-            (Some(4), Some(8), 4),
-            (Some(12), Some(12), REFLOW_WORKER_MAX),
-            (Some(8), Some(2), 2),
-            (None, Some(6), 6),
-            (None, None, REFLOW_WORKER_MAX),
-            (Some(0), Some(8), 8),
-        ] {
-            assert_eq!(
-                reflow_worker_ceiling_for(physical, logical),
-                want,
-                "physical {physical:?}, logical {logical:?}"
-            );
-        }
-    }
-}
+#[path = "app_render_reflow_ceiling_tests.rs"]
+mod reflow_ceiling_tests;
 
 struct ReflowHandoff {
     run: Box<dyn FnOnce() + Send + 'static>,
@@ -19689,131 +18137,8 @@ fn reflow_worker_main() {
     }
 }
 #[cfg(test)]
-mod reflow_pool_tests {
-    use super::{ReflowHandoff, reflow_pool_submit, reflow_worker_ceiling};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::{Duration, Instant};
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_pooled_rewrap_runs_at_user_initiated_not_the_inherited_band() {
-        // SAFETY: `qos_class_self` is libpthread's, part of `libSystem`, linked into every process on this platform. It reads only the calling thread's own requested class and takes no arguments.
-        unsafe extern "C" {
-            fn qos_class_self() -> u32;
-        }
-        const USER_INITIATED_RAW: u32 = 0x19;
-
-        let seen = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
-        let posted = Arc::clone(&seen);
-        let stranded = reflow_pool_submit(ReflowHandoff {
-            run: Box::new(move || {
-                // SAFETY: see the extern above.
-                let class = unsafe { qos_class_self() };
-                let (lock, cv) = &*posted;
-                *lock.lock().unwrap_or_else(|p| p.into_inner()) = Some(class);
-                cv.notify_all();
-            }),
-            inline: Box::new(|| {}),
-            priority: true,
-        });
-        if !stranded.is_empty() {
-            aterm_spec::host::could_not_run("no rewrap worker could start here (threads or fds)");
-        }
-
-        let (lock, cv) = &*seen;
-        let mut class = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        while class.is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "no pooled worker drove the job");
-            let (next, _) = cv
-                .wait_timeout(class, left)
-                .unwrap_or_else(|p| p.into_inner());
-            class = next;
-        }
-        let class = class.expect("the job posted its class");
-        assert_eq!(
-            class, USER_INITIATED_RAW,
-            "an aterm-reflow worker ran at QoS class {class:#x}, not USER_INITIATED \
-             ({USER_INITIATED_RAW:#x}) — a rewrap the human is waiting on, holding \
-             the pool lock, below the class qos.rs gives it"
-        );
-    }
-
-    #[test]
-    fn the_pool_runs_every_job_once_and_never_exceeds_its_ceiling() {
-        const JOBS: usize = 64;
-        let ceiling = reflow_worker_ceiling();
-        let live = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let ran = Arc::new(AtomicUsize::new(0));
-        let stranded_inline = Arc::new(AtomicUsize::new(0));
-        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
-
-        for _ in 0..JOBS {
-            let (live, peak, ran, done) =
-                (live.clone(), peak.clone(), ran.clone(), Arc::clone(&done));
-            let inline_seen = stranded_inline.clone();
-            let run = move || {
-                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(2));
-                live.fetch_sub(1, Ordering::SeqCst);
-                ran.fetch_add(1, Ordering::SeqCst);
-                let (lock, cv) = &*done;
-                *lock.lock().unwrap_or_else(|p| p.into_inner()) += 1;
-                cv.notify_all();
-            };
-            let inline = move || {
-                inline_seen.fetch_add(1, Ordering::SeqCst);
-            };
-            let stranded = reflow_pool_submit(ReflowHandoff {
-                run: Box::new(run),
-                inline: Box::new(inline),
-                priority: false,
-            });
-            for job in stranded {
-                (job.inline)();
-            }
-        }
-
-        let (lock, cv) = &*done;
-        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        let mut seen = lock.lock().unwrap_or_else(|p| p.into_inner());
-        while *seen + stranded_inline.load(Ordering::SeqCst) < JOBS {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "the pool left {} of {JOBS} jobs undriven — a dropped job wedges \
-                 that session's tiered history forever",
-                JOBS - *seen
-            );
-            let (next, _) = cv
-                .wait_timeout(seen, Duration::from_millis(50))
-                .unwrap_or_else(|p| p.into_inner());
-            seen = next;
-        }
-        drop(seen);
-
-        assert_eq!(
-            ran.load(Ordering::SeqCst) + stranded_inline.load(Ordering::SeqCst),
-            JOBS,
-            "every submitted job must be driven exactly once"
-        );
-        let observed = peak.load(Ordering::SeqCst);
-        assert!(
-            observed <= ceiling,
-            "{observed} jobs were in flight at once, above the pool ceiling \
-             {ceiling} — the bound MPT-1 exists to impose is not being imposed"
-        );
-        assert!(
-            observed >= 1 || stranded_inline.load(Ordering::SeqCst) == JOBS,
-            "no job was ever observed in flight and nothing fell back to the \
-             inline arm, so the ceiling assertion above proved nothing"
-        );
-    }
-}
+#[path = "app_render_reflow_pool_tests.rs"]
+mod reflow_pool_tests;
 
 #[cfg(test)]
 pub(crate) fn drive_reflow_job(
@@ -19851,43 +18176,8 @@ pub(crate) fn drive_reflow_job_gauged(
 }
 
 #[cfg(test)]
-mod reflow_worker_tests {
-    use super::drive_reflow_job;
-    use aterm_core::grid::ReflowStep;
-    use aterm_core::terminal::Terminal;
-    use std::sync::atomic::AtomicBool;
-
-    fn term_with_history(rows: u16, cols: u16, lines: usize) -> Terminal {
-        let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
-        let mut t = Terminal::with_scrollback(rows, cols, 8, sb);
-        let fill = "x".repeat((cols as usize).saturating_sub(8));
-        let mut buf = Vec::new();
-        for i in 0..lines {
-            buf.extend_from_slice(format!("L{i}-{fill}\r\n").as_bytes());
-        }
-        t.process(&buf);
-        t
-    }
-
-    #[test]
-    fn cancelled_mid_flight_job_is_dropped_at_the_next_step() {
-        let mut t = term_with_history(24, 80, 800);
-        let before = t.grid().scrollback_lines();
-        assert!(before > 100, "precondition: deep tiered history ({before})");
-
-        let job = t
-            .resize_offloading_scrollback(24, 40)
-            .expect("width change with tiered history detaches a job");
-        let ReflowStep::InProgress(half) = job.reflow_step(5) else {
-            panic!("an 800-line history cannot complete in one 5-line step");
-        };
-        let cancel = AtomicBool::new(true); // Session::drop raced in
-        assert!(
-            drive_reflow_job(half, &cancel, 5).is_none(),
-            "the worker loop must observe the cancel at the next step boundary"
-        );
-    }
-}
+#[path = "app_render_reflow_worker_tests.rs"]
+mod reflow_worker_tests;
 
 #[cfg(test)]
 #[path = "app_render_strip_title_lock_tests.rs"]
@@ -19942,107 +18232,8 @@ mod tone_melody_seam_tests;
 mod key_time_click_tests;
 
 #[cfg(test)]
-mod settled_compose_early_out_tests {
-
-    use crate::{App, WindowId, term_lock};
-    use std::time::{Duration, Instant};
-
-    fn compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
-        app.redraw_compose(wid, 24, 80, false, false, None, 0, now)
-            .is_some()
-    }
-
-    fn settle(app: &mut App, wid: WindowId, now: &mut Instant) {
-        let mut settled = false;
-        for _ in 0..40 {
-            *now += Duration::from_millis(16);
-            if !compose(app, wid, *now) {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "the fixture must reach a settled (skipping) state");
-        *now += Duration::from_millis(16);
-        assert!(!compose(app, wid, *now), "settled stays settled");
-    }
-
-    #[test]
-    fn recovery_edge_buys_one_present_not_a_train() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.windows.get_mut(&wid).expect("window").focused = true;
-        let mut now = Instant::now();
-        settle(&mut app, wid, &mut now);
-        app.windows
-            .get_mut(&wid)
-            .expect("window")
-            .present_retry
-            .recovery_redraw_outstanding = true;
-        now += Duration::from_millis(16);
-        assert!(
-            compose(&mut app, wid, now),
-            "the delivered edge services one recomposed present"
-        );
-        assert!(
-            !app.windows[&wid].present_retry.recovery_redraw_outstanding,
-            "the composed commit acknowledged the delivered edge"
-        );
-        now += Duration::from_millis(16);
-        assert!(
-            !compose(&mut app, wid, now),
-            "and the train ends: the settled compose takes the early-out"
-        );
-    }
-
-    #[test]
-    fn split_settles_and_every_real_change_still_repaints() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.config.cursor_trail = Some(false);
-        app.config.cursor_trail_style = Some("off".into());
-        app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
-            enabled: Some(false),
-            ..Default::default()
-        });
-        app.kitty_cursor_enabled_cache = None;
-        app.recompute_sparkle();
-        let sid = app.split_active_stub_tab(wid);
-        app.windows.get_mut(&wid).expect("window").focused = true;
-        let mut now = Instant::now();
-        settle(&mut app, wid, &mut now);
-
-        let bg = app.pool.get(0).expect("background session").term.clone();
-        term_lock(&bg).process(b"background write");
-        now += Duration::from_millis(16);
-        assert!(
-            compose(&mut app, wid, now),
-            "background PTY damage repaints"
-        );
-        settle(&mut app, wid, &mut now);
-
-        let fg = app.pool.get(sid).expect("focused session").term.clone();
-        term_lock(&fg).process(b"\x1b[C");
-        now += Duration::from_millis(16);
-        assert!(
-            compose(&mut app, wid, now),
-            "a damage-free cursor move repaints"
-        );
-        settle(&mut app, wid, &mut now);
-
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            ws.blink_phase = !ws.blink_phase;
-        }
-        now += Duration::from_millis(16);
-        assert!(compose(&mut app, wid, now), "a blink phase flip repaints");
-        settle(&mut app, wid, &mut now);
-
-        app.config.show_build_badge = Some(true);
-        now += Duration::from_millis(16);
-        assert!(compose(&mut app, wid, now), "a config change repaints");
-        settle(&mut app, wid, &mut now);
-    }
-}
+#[path = "app_render_settled_compose_early_out_tests.rs"]
+mod settled_compose_early_out_tests;
 
 #[cfg(test)]
 #[path = "app_render_strip_lane_oracle_tests.rs"]
@@ -20106,74 +18297,8 @@ fn report_gpu_surface_present(
 }
 
 #[cfg(test)]
-mod acquire_wait_publication_tests {
-    use super::{metrics, report_gpu_surface_present};
-    use aterm_gpu::SurfacePresentFailure;
-
-    #[test]
-    fn surface_results_route_and_publish_only_completed_waits() {
-        use metrics::PresentDropReason as Reason;
-        for (result, wait, want) in [
-            (Err(SurfacePresentFailure::AcquirePending), None, Ok(None)),
-            (Ok(()), Some(80_000), Ok(Some(()))),
-            (
-                Err(SurfacePresentFailure::Timeout),
-                Some(542_000_000),
-                Err(Reason::GpuTimeout),
-            ),
-            (
-                Err(SurfacePresentFailure::Occluded),
-                None,
-                Err(Reason::GpuOccluded),
-            ),
-            (
-                Err(SurfacePresentFailure::Unavailable),
-                None,
-                Err(Reason::GpuUnavailable),
-            ),
-            (
-                Err(SurfacePresentFailure::Validation),
-                None,
-                Err(Reason::GpuValidation),
-            ),
-        ] {
-            let mut samples = Vec::new();
-            assert_eq!(
-                report_gpu_surface_present(result, wait, |ns| samples.push(ns)),
-                want,
-                "{result:?}"
-            );
-            assert_eq!(samples, wait.into_iter().collect::<Vec<_>>(), "{result:?}");
-        }
-
-        let mut app = crate::App::headless_for_test();
-        let id = crate::WindowId(0);
-        for _ in 0..crate::PRESENT_RETRY_CAP {
-            let before = crate::Instant::now();
-            let reason =
-                report_gpu_surface_present(Err(SurfacePresentFailure::Unavailable), None, |_| {
-                    panic!("no completed acquire")
-                })
-                .expect_err("a temporarily unavailable surface");
-            app.handle_failed_present(id, reason, before);
-            let retry = &mut app.windows.get_mut(&id).expect("the window").present_retry;
-            let due = retry.deadline.expect("another attempt without input");
-            assert!(due > before, "the retry is strictly future");
-            assert!(!retry.present_attempt_allowed());
-            assert!(retry.take_due(due));
-            assert!(retry.present_attempt_allowed());
-        }
-        app.handle_failed_present(id, Reason::GpuUnavailable, crate::Instant::now());
-        let retry = &mut app.windows.get_mut(&id).expect("the window").present_retry;
-        assert!(retry.parked, "exhaustion cannot spin");
-        assert!(retry.deadline.is_none());
-        assert!(retry.on_external_stimulus());
-        app.handle_failed_present(id, Reason::GpuValidation, crate::Instant::now());
-        let retry = &app.windows[&id].present_retry;
-        assert!(retry.parked, "validation still waits for external input");
-        assert!(retry.deadline.is_none());
-    }
-}
+#[path = "app_render_acquire_wait_publication_tests.rs"]
+mod acquire_wait_publication_tests;
 
 static STARTUP_RASTER_PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -20208,296 +18333,16 @@ fn note_startup_present_rasters(before: usize, after: usize) {
 mod mixed_ime_tests;
 
 #[cfg(test)]
-mod native_ime_anchor_tests {
-    use super::*;
-    use crate::native_app::{ActionInvocation, AppEvent};
-
-    #[test]
-    fn a_presented_native_field_replaces_the_terminal_ime_anchor_at_its_painted_caret() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
-        app.dispatch_native_event(
-            wid,
-            AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new("settings/search"),
-                value: None,
-            }),
-        )
-        .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let stale = (3, 5, 7, 11);
-        app.windows.get_mut(&wid).unwrap().last_ime_rect = Some(stale);
-        let mut previous_x = None;
-        for caret in [0, 3, 6] {
-            app.on_ime_preedit(wid, "日本語".to_string(), Some((caret, caret)));
-            let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
-            app.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
-            assert!(app.prepare_native_input_scratch_from_plan(wid, &plan));
-            let before = app.windows[&wid].last_ime_rect;
-            app.report_native_ime_cursor_area(wid, &plan);
-            assert_eq!(app.windows[&wid].last_ime_rect, before);
-            let stamp = app.windows[&wid]
-                .native_ui_compiled
-                .as_ref()
-                .map(|frame| frame.stamp);
-            app.first_present_done = true;
-            app.finalize_successful_present(
-                wid,
-                crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
-                0,
-                None,
-                SuccessfulPresentRoute::Native {
-                    view,
-                    presented_stamp: stamp,
-                },
-                crate::VisibleContentRoute::Native { instance, view },
-                HostVisualState::default(),
-                None,
-                &plan,
-            );
-            let (x, y, w, h) = app.windows[&wid].last_ime_rect.expect("native IME anchor");
-            assert_ne!(
-                (x, y, w, h),
-                stale,
-                "the parked terminal cannot own this field"
-            );
-            if let Some(previous_x) = previous_x {
-                assert!(
-                    x > previous_x,
-                    "a middle IME caret moves the candidate anchor"
-                );
-            }
-            previous_x = Some(x);
-
-            let (artifact, lx, ly) = app
-                .retained_native_leaf_at_pointer(wid, f64::from(x), f64::from(y))
-                .expect("anchor lies on the retained native leaf");
-            assert_eq!(artifact.view, view);
-            let caret = artifact.compiled.ime_caret_rect().unwrap();
-            assert!((lx - caret.x).abs() <= 1.0 / artifact.scale as f32);
-            assert!((ly - caret.y).abs() <= 1.0 / artifact.scale as f32);
-        }
-
-        let plan = app.active_visible_leaf_plan(wid).unwrap();
-        app.windows.get_mut(&wid).unwrap().win_px =
-            Some(aterm_window::dpi::PhysicalSize::new(100, 100));
-        let (caret, scale) = {
-            let artifact = app
-                .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
-                .unwrap();
-            (artifact.ime_caret.unwrap(), artifact.scale)
-        };
-        let (frame_x, frame_y) = app.frame_origin(wid);
-        if cfg!(target_os = "linux") {
-            assert_eq!(frame_y, 0, "Linux pins the frame to the window's top");
-            return;
-        }
-        for (top, visible) in [
-            (-1, true),
-            (-(f64::from(caret.height) * scale).ceil() as i32 - 2, false),
-        ] {
-            let window = app.windows.get_mut(&wid).unwrap();
-            let card = window.settings_card.as_mut().unwrap();
-            let caret_x = frame_x + (f64::from(caret.x) * scale).floor() as i64;
-            card.dx = u32::try_from(caret_x.max(20) - caret_x).unwrap();
-            card.dy = u32::try_from(
-                i64::from(top) - frame_y - (f64::from(caret.y) * scale).floor() as i64,
-            )
-            .unwrap();
-            window.last_ime_rect = Some(stale);
-            assert!(
-                app.retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
-                    .is_some(),
-                "the retained leaf still intersects the window"
-            );
-            app.report_native_ime_cursor_area(wid, &plan);
-            if visible {
-                let (x, y, w, h) = app.windows[&wid].last_ime_rect.unwrap();
-                assert_eq!(y, 0);
-                assert!(x >= 0 && x as u32 + w <= 100 && h <= 100);
-                assert!((h as f64) < f64::from(caret.height) * scale + 1.0);
-            } else {
-                assert_eq!(
-                    app.windows[&wid].last_ime_rect,
-                    Some(stale),
-                    "fully cropped caret cannot publish an offscreen anchor"
-                );
-            }
-        }
-    }
-}
+#[path = "app_render_native_ime_anchor_tests.rs"]
+mod native_ime_anchor_tests;
 
 #[cfg(test)]
-pub(crate) mod redraw_hold_hook {
-    use std::cell::RefCell;
-
-    type Hook = Box<dyn FnMut()>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
-    }
-
-    /// Run `hook` after every later terminal hold on this thread.
-    pub(crate) fn install(hook: impl FnMut() + 'static) {
-        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    pub(crate) fn clear() {
-        HOOK.with(|h| *h.borrow_mut() = None);
-    }
-
-    pub(crate) fn after_terminal_hold() {
-        HOOK.with(|h| {
-            if let Some(hook) = h.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-    }
-}
+#[path = "app_render_redraw_hold_hook_tests.rs"]
+pub(crate) mod redraw_hold_hook;
 
 #[cfg(test)]
-mod torn_present_motion_caret_tests {
-    use crate::scripted_redraw_fixture::{feed, scripted_app};
-    use crate::{App, WindowId};
-    use aterm_core::terminal::ClockReading;
-    use std::time::{Duration, Instant};
-
-    const CARET: (u16, u16) = (10, 3);
-    const WRITE_CURSOR: (u16, u16) = (2, 47);
-
-    fn lit_app() -> App {
-        let mut app = scripted_app();
-        app.config.serious_mode = Some(false);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".into());
-        app.config.motion = Some("full".into());
-        app.config.trail_sounds = Some(false);
-        app.kitty_cursor_enabled_cache = None;
-        app.recompute_sparkle();
-        app.windows.get_mut(&WindowId(0)).expect("window").focused = true;
-        app
-    }
-
-    fn feed_at(app: &App, bytes: &[u8], monotonic: Instant) {
-        let term = app
-            .front_terminal(WindowId(0))
-            .expect("front terminal")
-            .term
-            .clone();
-        crate::term_lock(&term).process_at(
-            bytes,
-            ClockReading {
-                monotonic,
-                wall_ms: None,
-            },
-        );
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum Tear {
-        PastTheHoldCap,
-        PastTheTerminalTimeout,
-        Finished,
-    }
-
-    type Facts = (Option<(u16, u16)>, u64, u64);
-
-    fn run(tear: Tear) -> (Facts, Facts) {
-        let wid = WindowId(0);
-        let mut app = lit_app();
-        let t0 = Instant::now();
-        feed_at(
-            &app,
-            format!("\x1b[2J\x1b[{};{}H", CARET.0 + 1, CARET.1 + 1).as_bytes(),
-            t0,
-        );
-        app.redraw_window(wid);
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            let now = Instant::now();
-            ws.fx.cursor_mut().glow.note_typed_cells(now, 1);
-            ws.fx.cursor_mut().trail.note_typed(now);
-        }
-        let facts = |app: &App| -> Facts {
-            let glow = &app.windows[&wid].fx.cursor().glow;
-            (
-                glow.cursor_anchor(),
-                glow.spawns(),
-                glow.admission_tally().licensed,
-            )
-        };
-        let before = facts(&app);
-        let repaint = format!(
-            "\x1b[?2026h\x1b[?25l\x1b[H\x1b[{};1Htranscript row\x1b[{};{}H",
-            WRITE_CURSOR.0 + 1,
-            WRITE_CURSOR.0 + 1,
-            WRITE_CURSOR.1 + 1
-        );
-        match tear {
-            Tear::PastTheHoldCap => {
-                feed(&app, repaint.as_bytes());
-                app.redraw_window(wid); // the rising edge arms the hold
-                assert_eq!(facts(&app), before, "{tear:?}: the held frame runs nothing");
-                std::thread::sleep(super::SYNC_HOLD_CAP + Duration::from_millis(20));
-            }
-            Tear::PastTheTerminalTimeout => {
-                feed_at(&app, repaint.as_bytes(), t0);
-                feed_at(&app, b"x\x08", t0 + Duration::from_millis(1_200));
-            }
-            Tear::Finished => feed(&app, format!("{repaint}\x1b[?2026l").as_bytes()),
-        }
-        {
-            let term = app
-                .front_terminal(wid)
-                .expect("front terminal")
-                .term
-                .clone();
-            let t = crate::term_lock(&term);
-            let c = t.cursor();
-            assert_eq!((c.row, c.col), WRITE_CURSOR, "{tear:?}: the write cursor");
-            assert!(!t.cursor_visible(), "{tear:?}: hidden");
-            match tear {
-                Tear::PastTheHoldCap => assert!(t.modes().synchronized_output()),
-                Tear::PastTheTerminalTimeout => assert!(
-                    !t.modes().synchronized_output(),
-                    "the terminal's timeout cleared the mode"
-                ),
-                Tear::Finished => assert!(!t.sync_frame_unfinished()),
-            }
-        }
-        app.redraw_window(wid);
-        assert!(
-            app.windows[&wid].last_present.is_some(),
-            "{tear:?}: the frame presented"
-        );
-        (before, facts(&app))
-    }
-
-    #[test]
-    fn an_unfinished_frames_hidden_write_cursor_moves_no_engine_through_the_present() {
-        for tear in [
-            Tear::PastTheHoldCap,
-            Tear::PastTheTerminalTimeout,
-            Tear::Finished,
-        ] {
-            let (before, after) = run(tear);
-            assert_eq!(before.0, Some(CARET), "{tear:?}: seeded at the caret");
-            if matches!(tear, Tear::Finished) {
-                assert_eq!(
-                    after.0,
-                    Some(WRITE_CURSOR),
-                    "the hidden caret is the anchor"
-                );
-            } else {
-                assert_eq!(
-                    after, before,
-                    "{tear:?}: the write cursor is no caret (anchor, spawns, licensed)"
-                );
-            }
-        }
-    }
-}
+#[path = "app_render_torn_present_motion_caret_tests.rs"]
+mod torn_present_motion_caret_tests;
 
 #[cfg(test)]
 #[path = "app_render_single_hold_redraw_tests.rs"]
@@ -20512,48 +18357,5 @@ mod prediction_input_tests;
 mod licence_fence_tests;
 
 #[cfg(test)]
-mod rain_latch_without_engine_tests {
-    use crate::WindowId;
-    use crate::scripted_redraw_fixture::{feed, scripted_app};
-
-    #[test]
-    fn a_single_pane_with_no_rain_engine_keeps_the_completion_latch_observing() {
-        let wid = WindowId(0);
-        let mut app = scripted_app();
-        app.config.serious_mode = Some(false);
-        app.config.matrix_rain = Some(crate::app_config::MatrixRainConfig {
-            enabled: Some(true),
-            ..Default::default()
-        });
-        app.recompute_matrix_rain();
-        app.redraw_window(wid);
-        let front = app.front_terminal(wid).expect("front terminal");
-        let (session, term) = (front.session, front.term.clone());
-        assert!(
-            app.windows[&wid].fx.rain().is_some(),
-            "REACH: the rain engine was built"
-        );
-        assert_eq!(
-            app.windows[&wid].fx.rain_latches().last_cmd,
-            Some((session, 0))
-        );
-        assert!(app.set_serious_mode(true));
-        feed(
-            &app,
-            b"\x1b]133;A\x07$ \x1b]133;B\x07false\r\n\x1b]133;C\x07\x1b]133;D;1\x07",
-        );
-        app.redraw_window(wid);
-        assert!(
-            app.windows[&wid].fx.rain().is_none(),
-            "REACH: no rain engine runs under Serious Mode"
-        );
-        let seq = crate::term_lock(&term).completed_command_seq();
-        assert!(seq > 0, "fixture: the shell reported a completion");
-        assert_eq!(
-            app.windows[&wid].fx.rain_latches().last_cmd,
-            Some((session, seq)),
-            "the rain-less frame baselined the completion; before the fix the \
-             engine the lift rebuilds read it as news"
-        );
-    }
-}
+#[path = "app_render_rain_latch_without_engine_tests.rs"]
+mod rain_latch_without_engine_tests;

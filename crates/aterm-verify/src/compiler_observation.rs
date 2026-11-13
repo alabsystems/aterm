@@ -97,7 +97,7 @@ pub(crate) struct Observation {
 #[derive(serde::Deserialize)]
 struct Wire {
     schema: u64,
-    event: String,
+    event: crate::event_log::EventKind,
     stage: String,
     provisional: bool,
     sample_complete: bool,
@@ -119,7 +119,7 @@ impl Observation {
     pub(crate) fn read(json: &str) -> Option<Self> {
         let wire: Wire = aterm_json::from_str(json).ok()?;
         if wire.schema != 1
-            || wire.event != "compile-message-observed"
+            || wire.event != crate::event_log::EventKind::CompileMessageObserved
             || !wire.provisional
             || wire.sample_complete
         {
@@ -146,11 +146,13 @@ impl Observation {
     pub(crate) fn event(&self) -> String {
         let mut value = self.metadata.json();
         let fields = value.as_object_mut().expect("metadata is an object");
-        fields.insert("schema".into(), 1_u64.into());
-        fields.insert("event".into(), "compile-message-observed".into());
         fields.insert("stage".into(), self.stage.clone().into());
         fields.insert("provisional".into(), true.into());
         fields.insert("sample_complete".into(), false.into());
+        let value = crate::event_log::event_value(
+            crate::event_log::EventKind::CompileMessageObserved,
+            value,
+        );
         format!("verify-event: {value}")
     }
 }

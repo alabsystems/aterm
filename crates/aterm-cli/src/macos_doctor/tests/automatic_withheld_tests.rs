@@ -3,7 +3,9 @@
 
 use super::*;
 
-fn spent_init_follow_ups(root: &Path) -> Withholding {
+/// Two follow-up tries of the withheld item that did not take, the second just made: the next
+/// waits out its pause ([`RETRY`]).
+fn paused_init_follow_ups(root: &Path) -> Withholding {
     use aterm_machines::init::Held as _;
 
     let hold = init_hold_at(
@@ -11,6 +13,7 @@ fn spent_init_follow_ups(root: &Path) -> Withholding {
         aterm_machines::init::Pass::Whole { clones: true },
         false,
         Some(&|_| panic!("uncontended init hold")),
+        initial::complete_explicit_workstation_plan_for_test,
     )
     .unwrap();
     hold.withheld(&[WIDGETS.into()]).unwrap();
@@ -45,7 +48,7 @@ fn spent_init_follow_ups(root: &Path) -> Withholding {
         );
         assert!(!doctor.notification_center_cleared());
         if attempt == 1 {
-            doctor.wait(SECOND_TRY_AFTER);
+            doctor.wait(RETRY.after(1));
         }
     }
     let owed = load_withheld(root).unwrap();
@@ -71,9 +74,9 @@ fn automatic_preferences(doctor: &mut Withholding, root: &Path) -> Result<Option
 }
 
 #[test]
-fn automatic_withheld_read_failure_cannot_repeat_a_spent_init_follow_up() {
+fn automatic_withheld_read_failure_cannot_repeat_a_paused_init_follow_up() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let mut doctor = spent_init_follow_ups(root.path());
+    let mut doctor = paused_init_follow_ups(root.path());
     let _profile = HeldLock::take(root.path()).unwrap();
     let path = root.path().join(WITHHELD_RECORD);
     let parked = root.path().join("withheld.saved");
@@ -88,7 +91,7 @@ fn automatic_withheld_read_failure_cannot_repeat_a_spent_init_follow_up() {
     assert_eq!(
         doctor.notification_center_writes(),
         4,
-        "an unreadable retry record cannot authorize a third attempt"
+        "an unreadable retry record cannot authorize a try inside its pause"
     );
     assert!(
         result.is_err(),
@@ -105,11 +108,7 @@ fn automatic_withheld_read_failure_cannot_repeat_a_spent_init_follow_up() {
 
     std::fs::remove_dir(&path).unwrap();
     std::fs::rename(&parked, &path).unwrap();
-    doctor.now = std::fs::metadata(root.path().join("automatic-attempt.json"))
-        .unwrap()
-        .modified()
-        .unwrap()
-        + std::time::Duration::from_secs(60);
+    doctor.now = doctor.now.max(automatic_gate_opens(root.path()));
     let report = automatic_preferences(&mut doctor, root.path())
         .unwrap()
         .unwrap();
@@ -117,15 +116,15 @@ fn automatic_withheld_read_failure_cannot_repeat_a_spent_init_follow_up() {
     assert_eq!(
         doctor.notification_center_writes(),
         4,
-        "repair restores the same spent budget"
+        "repair restores the same pause"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
 #[test]
-fn automatic_withheld_readable_debt_holds_the_same_admitted_run() {
+fn automatic_withheld_readable_debt_puts_off_the_same_admitted_run() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let mut doctor = spent_init_follow_ups(root.path());
+    let mut doctor = paused_init_follow_ups(root.path());
     let _profile = HeldLock::take(root.path()).unwrap();
     let before = std::fs::read(root.path().join(WITHHELD_RECORD)).unwrap();
     let report = automatic_preferences(&mut doctor, root.path())
@@ -133,10 +132,8 @@ fn automatic_withheld_readable_debt_holds_the_same_admitted_run() {
         .unwrap();
     assert!(report.needs_attention());
     let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
-    assert_eq!(
-        (row.status.as_str(), row.detail.as_str()),
-        ("blocked", HELD)
-    );
+    assert_eq!(row.status, DEFERRED, "{}", report.to_text());
+    assert!(row.detail.ends_with(LATER), "{}", row.detail);
     assert_eq!(doctor.notification_center_writes(), 4);
     assert_eq!(
         std::fs::read(root.path().join(WITHHELD_RECORD)).unwrap(),
@@ -151,7 +148,7 @@ fn automatic_withheld_readable_debt_holds_the_same_admitted_run() {
 #[test]
 fn automatic_withheld_without_fda_keeps_contained_writes_off_and_runs_other_preferences() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let mut doctor = spent_init_follow_ups(root.path());
+    let mut doctor = paused_init_follow_ups(root.path());
     let _profile = HeldLock::take(root.path()).unwrap();
     doctor.revoke();
     let path = root.path().join(WITHHELD_RECORD);

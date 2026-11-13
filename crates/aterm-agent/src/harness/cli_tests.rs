@@ -3,6 +3,9 @@
 
 //! Tests for `aterm harness`.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+
 use aterm_phase::Program;
 use aterm_phase::prompt::fixtures::{composer, rows};
 use aterm_tempfile::TempDir as Tmp;
@@ -22,6 +25,9 @@ mod native_preparation;
 #[path = "cli_label_retention_tests.rs"]
 mod label_retention;
 
+// Each of these starts a manual sign-in, whose private FIFO only Unix has
+// (`accounts::manual_signin_capability`).
+#[cfg(unix)]
 #[path = "cli_asked_tests.rs"]
 mod asked;
 
@@ -64,12 +70,16 @@ mod upgrade_policy;
 #[path = "cli_renewal_read_tests.rs"]
 mod renewal_read;
 
+// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
+#[cfg(unix)]
 #[path = "cli_renewal_identity_tests.rs"]
 mod renewal_identity;
 
 #[path = "cli_default_identity_tests.rs"]
 mod default_identity;
 
+// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
+#[cfg(unix)]
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
 
@@ -101,6 +111,7 @@ fn env_at(tmp: &Tmp) -> Env {
         codex_thread: None,
         agy_conversation: None,
         codex_home: None,
+        xdg_config_home: None,
         codex_login: None,
         now: 1_758_412_800,
         sid: "s-test".to_string(),
@@ -262,6 +273,7 @@ fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
     (tmp, env)
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_import_uses_the_source_identity_and_explicit_region() {
     let (_tmp, env) = pending_kimi_env("import-success");
@@ -362,6 +374,7 @@ fn pending_import_refuses_a_real_region_conflict() {
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn kimi_adopts_its_existing_default_login_without_inventing_an_email() {
     let tmp = tmp_dir("kimi-adopt-default");
@@ -2027,10 +2040,16 @@ struct RefreshCtl {
     session_pct: Option<u32>,
     /// The panel's monthly window reads this share used (13 where `None`).
     monthly_pct: Option<u32>,
+    /// The screen a failed read's last look meets: Kimi's own sign-in wall where set.
+    signed_out_screen: bool,
+    /// The tab was awaited gone: nothing is asked of it after.
+    closed: bool,
 }
 
 impl Ctl for RefreshCtl {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        assert!(!self.closed, "the quota tab was used after it closed");
+        self.closed = args.get(1) == Some(&"await") && args.get(2) == Some(&"gone");
         self.calls.push(args.join(" "));
         let step = self.calls.len();
         if self.already_gone && matches!(args.get(1), Some(&"signal")) {
@@ -2049,6 +2068,18 @@ impl Ctl for RefreshCtl {
         }
         if self.fail_at == Some(step) {
             return Err("injected startup failure".to_owned());
+        }
+        if self.signed_out_screen && args.get(1) == Some(&"text") {
+            let rows = aterm_phase::kimi::fixtures::SIGNED_OUT_TURN
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            return Ok(CtlReply {
+                code: 0,
+                stdout: text_json(&rows),
+                stderr: String::new(),
+            });
         }
         if self.timeout_at == Some(step) {
             return Ok(CtlReply {
@@ -2077,7 +2108,6 @@ impl Ctl for RefreshCtl {
                     "   ╰─────────────────────────────────────────────────╯",
                 ]))
             }
-            13 => panic!("the quota tab was used after it closed"),
             _ if args.get(1) == Some(&"await") => format!("OK {} 1", args[2]),
             _ => "OK".to_owned(),
         };
@@ -2192,14 +2222,17 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
         .find(|l| l.starts_with("  kimi-m22: "))
         .expect("the row's line");
     assert!(
-        row.contains(&format!("5h 36% until {}", rfc3339_utc(env.now + 25 * 60))),
+        row.contains(&format!(
+            "5h 64% left until {}",
+            rfc3339_utc(env.now + 25 * 60)
+        )),
         "the figure it read: {row}"
     );
     assert!(
         row.contains("week \u{2013} (not in its newest reading)"),
         "the week its panel did not show, with why, never a bare `?`: {row}"
     );
-    assert!(row.contains("monthly 13% until "), "{row}");
+    assert!(row.contains("monthly 87% left until "), "{row}");
     assert!(!row.contains('?'), "{row}");
 }
 
@@ -2405,10 +2438,118 @@ fn kimi_refresh_closes_its_tab_when_startup_fails() {
     let mut err = Vec::new();
     let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
     assert_eq!(code, ExitCode::from(1));
-    assert_eq!(ctl.calls.len(), 7, "{:?}", ctl.calls);
-    assert_eq!(ctl.calls[5], "@s-quota signal kill");
-    assert_eq!(ctl.calls[6], "@s-quota await gone .* timeout=10000");
+    // The failed read's one look at what the tab drew comes before the tab closes.
+    assert_eq!(ctl.calls.len(), 8, "{:?}", ctl.calls);
+    assert!(ctl.calls[5].starts_with("@s-quota text"), "{:?}", ctl.calls);
+    assert_eq!(ctl.calls[6], "@s-quota signal kill");
+    assert_eq!(ctl.calls[7], "@s-quota await gone .* timeout=10000");
     assert!(String::from_utf8_lossy(&err).contains("injected startup failure"));
+}
+
+fn kimi_ledger(env: &Env) -> Vec<(accounts::Kind, String, String)> {
+    env.accounts_store_for(Cli::Kimi)
+        .unwrap()
+        .tail(64)
+        .unwrap()
+        .into_iter()
+        .map(|event| (event.kind, event.account, event.why))
+        .collect()
+}
+
+/// NO KIMI IS STARTED ON A ROW ON RECORD AS SIGNED OUT: the person's quota read of it is
+/// refused before any tab opens or any provider read is reported, naming the row by its email
+/// and its own sign-in.
+/// CONTROL: the same roster with the row's login on record as working opens its quota tab.
+#[test]
+fn kimi_refresh_starts_no_kimi_on_a_row_on_record_as_signed_out() {
+    for signed_out in [true, false] {
+        let tmp = tmp_dir("kimi-refresh-signed-out");
+        let env = env_at(&tmp);
+        std::fs::write(
+            env.accounts_roster_for(Cli::Kimi).unwrap(),
+            "[[account]]\nlabel = 'kimi-m22'\nclass = 'dedicated'\nemail = 'm22@example.test'\nregion = 'global'\n",
+        )
+        .unwrap();
+        let word = if signed_out {
+            Auth::SignedOut
+        } else {
+            Auth::Ok
+        };
+        env.accounts_store_for(Cli::Kimi)
+            .unwrap()
+            .transact(env.now, &mut None, |state| {
+                Ok(accounts::note_auth(state, "kimi-m22", word, env.now))
+            })
+            .unwrap();
+        let mut ctl = RefreshCtl::default();
+        let mut err = Vec::new();
+        let (code, reads) = crate::harness::provider_read::captured(|| {
+            run_kimi_refresh_with(&mut ctl, &env, true, &mut Vec::new(), &mut err)
+        });
+        let err = String::from_utf8_lossy(&err);
+        if signed_out {
+            assert_eq!(code, ExitCode::from(1));
+            assert!(ctl.calls.is_empty(), "no tab, no kimi: {:?}", ctl.calls);
+            assert!(reads.is_empty(), "no provider read: {reads:?}");
+            assert!(
+                err.contains("m22@example.test is signed out on this Mac"),
+                "named by its email: {err}"
+            );
+            assert!(err.contains("aterm harness accounts"), "its sign-in: {err}");
+        } else {
+            assert_eq!(code, ExitCode::SUCCESS, "CONTROL: {err}");
+            assert!(ctl.calls.iter().any(|call| call.ends_with("exec kimi")));
+        }
+    }
+}
+
+/// A QUOTA TAB THAT MEETS KIMI'S SIGN-IN WALL RECORDS ITS ROW SIGNED OUT: the read fails as
+/// before, and the login's end is on the row's record and ledger once, so the next read starts
+/// no kimi on it.
+/// CONTROL: the same failed read over a screen with no sign-in wall writes nothing.
+#[test]
+fn a_kimi_refresh_that_meets_the_sign_in_wall_records_its_row_signed_out() {
+    for signed_out_screen in [true, false] {
+        let tmp = tmp_dir("kimi-refresh-wall");
+        let env = env_at(&tmp);
+        let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
+        std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+        let mut ctl = RefreshCtl {
+            timeout_at: Some(5),
+            signed_out_screen,
+            ..RefreshCtl::default()
+        };
+        let mut err = Vec::new();
+        let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut Vec::new(), &mut err);
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(
+            ctl.calls.last().unwrap(),
+            "@s-quota await gone .* timeout=10000",
+            "the tab is closed either way"
+        );
+        let store = env.accounts_store_for(Cli::Kimi).unwrap();
+        let auth = store.load(env.now).unwrap().0.account("kimi-m22").auth;
+        let ended = kimi_ledger(&env)
+            .iter()
+            .filter(|(kind, account, _)| {
+                *kind == accounts::Kind::LoginEnded && account == "kimi-m22"
+            })
+            .count();
+        if signed_out_screen {
+            assert_eq!(auth, Auth::SignedOut);
+            assert_eq!(ended, 1, "{:?}", kimi_ledger(&env));
+            assert!(String::from_utf8_lossy(&err).contains("signed out on this Mac (recorded)"));
+            // The next read starts nothing on it.
+            let mut again = RefreshCtl::default();
+            let code =
+                run_kimi_refresh_with(&mut again, &env, true, &mut Vec::new(), &mut Vec::new());
+            assert_eq!(code, ExitCode::from(1));
+            assert!(again.calls.is_empty(), "{:?}", again.calls);
+        } else {
+            assert_ne!(auth, Auth::SignedOut, "CONTROL: no wall, no word");
+            assert_eq!(ended, 0, "CONTROL: {:?}", kimi_ledger(&env));
+        }
+    }
 }
 
 #[test]
@@ -2512,7 +2653,7 @@ fn kimi_refresh_executes_the_enrolled_home_as_an_environment_assignment() {
     shell
         .env("PATH", &bin)
         .arg("-c")
-        .arg(kimi_refresh_command(&env).unwrap().1);
+        .arg(kimi_refresh_command(&env).unwrap().command);
     let output = aterm_uds::deadline::output_within(&mut shell, std::time::Duration::from_secs(60))
         .expect("scratch shell completes");
     assert!(
@@ -5123,6 +5264,7 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
             name: "𝔷".repeat(40),
             age_s: u64::from(u32::MAX),
             command: "𝔷".repeat(HELD_COMMAND_CHARS * 2),
+            ..Held::default()
         })
         .collect();
     for quiet in [false, true] {
@@ -5762,6 +5904,7 @@ struct FakeHost<'a> {
     after_login: Option<&'a dyn Fn()>,
     now: i64,
     unaskable: Option<String>,
+    sign_in_program: Option<PathBuf>,
     asked: std::cell::RefCell<Vec<String>>,
     logins: std::cell::RefCell<Vec<Option<String>>>,
     queued: Option<&'a dyn Fn(accounts::SigninPosition)>,
@@ -5778,6 +5921,7 @@ impl<'a> FakeHost<'a> {
             after_login: None,
             now: 0,
             unaskable: None,
+            sign_in_program: None,
             asked: std::cell::RefCell::new(Vec::new()),
             logins: std::cell::RefCell::new(Vec::new()),
             queued: None,
@@ -5797,6 +5941,10 @@ impl AccountsHost for FakeHost<'_> {
     }
     fn stdin_is_terminal(&self) -> bool {
         self.tty
+    }
+
+    fn sign_in_program(&self, _: Cli) -> Option<PathBuf> {
+        self.sign_in_program.clone()
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
@@ -5853,6 +6001,7 @@ fn acc_quiet(form: AccountsCmd, env: &Env) -> (String, String, String) {
     acc(form, env, &FakeHost::new(&never_asked))
 }
 
+#[cfg(unix)]
 fn on_record(env: &Env, seen: &[(&str, Auth)]) {
     let mut note = None;
     env.accounts_store()
@@ -5865,6 +6014,7 @@ fn on_record(env: &Env, seen: &[(&str, Auth)]) {
         .expect("recorded");
 }
 
+#[cfg(unix)]
 fn add(label: &str, class: Class) -> AccountsCmd {
     AccountsCmd::Add {
         label: label.to_string(),
@@ -6013,6 +6163,7 @@ fn where_no_account_can_take_over_the_report_names_another() {
     assert!(!names_add(&out), "{out}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     let tmp = tmp_dir("accounts-refused");
@@ -6080,6 +6231,7 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     assert!(out.contains("pool-a"), "{out}");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     let tmp = tmp_dir("accounts-add");
@@ -6132,6 +6284,7 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Pool));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
@@ -6205,6 +6358,7 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     assert_eq!(*tty.asked.borrow(), vec![staging]);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     let tmp = tmp_dir("accounts-add-existing");
@@ -6230,6 +6384,7 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     let tmp = tmp_dir("accounts-add-refused");
@@ -6273,8 +6428,9 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
+fn login_runs_only_at_a_terminal_and_fails_elsewhere() {
     let tmp = tmp_dir("accounts-login");
     let env = env_at(&tmp);
     let odd = format!("{}/it's here/", tmp.path().display());
@@ -6285,12 +6441,14 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let login = |label: &str| AccountsCmd::Login {
         label: label.to_string(),
     };
-    let line = "aterm harness accounts login work-2\n";
-
     let piped = FakeHost::new(&never_asked);
-    let (code, out, _) = acc(login("work-2"), &env, &piped);
-    assert_eq!(code, exit(0));
-    assert_eq!(out, line);
+    let (code, out, err) = acc(login("work-2"), &env, &piped);
+    assert_eq!(code, exit(1));
+    assert_eq!(out, "");
+    assert!(
+        err.contains("not run") && err.contains("not a terminal"),
+        "{err}"
+    );
     assert!(piped.logins.borrow().is_empty(), "nothing was run");
     assert!(!Path::new(&odd).exists(), "and nothing was made");
 
@@ -6316,8 +6474,8 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
 
     let before = tty.logins.borrow().len();
     let (code, out, _) = acc(login("main"), &env, &piped);
-    assert_eq!(code, exit(0));
-    assert_eq!(out, "aterm harness accounts login main\n");
+    assert_eq!(code, exit(1));
+    assert_eq!(out, "");
     assert!(piped.logins.borrow().is_empty(), "nothing was run");
     let (code, out, _) = acc(login("nobody"), &env, &tty);
     assert_eq!(code, exit(1));
@@ -6325,6 +6483,52 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     assert_eq!(tty.logins.borrow().len(), before, "neither ran anything");
 }
 
+/// WITH CLAUDE CODE ABSENT THE REPORT AND ITS LOGIN SAY THE INSTALL, AS EVERY OTHER POOL'S DO: the
+/// sign-in starts nothing, the install is named, and no row is next. CONTROL: with its program here
+/// the same login runs.
+#[cfg(unix)]
+#[test]
+fn a_claude_login_with_claude_absent_names_its_install() {
+    let tmp = tmp_dir("accounts-login-absent");
+    let env = env_at(&tmp);
+    let text = accounts::append_row("", "main", Class::Preferred, None)
+        .and_then(|t| {
+            accounts::append_row(
+                &t,
+                "work-2",
+                Class::Preferred,
+                Some(&format!("{}/work-2/", tmp.path().display())),
+            )
+        })
+        .expect("the rows admit");
+    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
+    let login = || AccountsCmd::Login {
+        label: "work-2".to_string(),
+    };
+    let install = Step::install(Cli::Claude).to_string();
+
+    let mut absent = FakeHost::new(&never_asked);
+    absent.tty = true;
+    absent.sign_in_program = Some(PathBuf::from("/nowhere/claude"));
+    let (code, _, err) = acc(login(), &env, &absent);
+    assert_eq!(code, exit(1));
+    assert!(err.contains(&install), "{err}");
+    assert!(absent.logins.borrow().is_empty(), "nothing was run");
+    let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &absent);
+    assert!(report.contains(&install), "{report}");
+    assert!(report.contains("next: none"), "{report}");
+
+    let program = tmp.path().join("claude");
+    std::fs::write(&program, "").expect("a program");
+    let mut here = FakeHost::new(&never_asked);
+    here.tty = true;
+    here.sign_in_program = Some(program);
+    let (code, _, err) = acc(login(), &env, &here);
+    assert_eq!(code, exit(1), "CONTROL: {err}");
+    assert_eq!(here.logins.borrow().len(), 1, "CONTROL: it ran: {err}");
+}
+
+#[cfg(unix)]
 #[test]
 fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     let tmp = tmp_dir("accounts-login-failed");
@@ -6475,6 +6679,7 @@ fn a_roster_write_wakes_a_waiting_host_and_a_refused_one_wakes_nobody() {
     assert_eq!(wake_id(&store), woken, "and that refusal wakes nobody");
 }
 
+#[cfg(unix)]
 #[test]
 fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     let tmp = tmp_dir("accounts-login-records");
@@ -6537,6 +6742,7 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     assert_ne!(wake_id(&store), woken, "a login that works wakes");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let tmp = tmp_dir("accounts-login-signed-out");
@@ -6547,8 +6753,6 @@ fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let login = AccountsCmd::Login {
         label: "work-2".to_string(),
     };
-    #[cfg(unix)]
-    let woken = wake_id(&store);
 
     let signed_out = |_: &str| said(false);
     let mut tty = FakeHost::new(&signed_out);
@@ -6562,13 +6766,25 @@ fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let (state, _) = store.load(env.now).expect("this build's state");
     assert_eq!(state.account("work-2").auth, Auth::Ok);
     assert_eq!(state.account("main").auth, Auth::Ok);
+    // The failed attempt is on the row's ledger once, as an attempt: the flow signed in to a
+    // fresh staging directory, so it is no word on the login the row is bound to.
     let rows = store.tail(20).expect("ledger");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let attempt = rows.last().unwrap();
+    assert_eq!(
+        (attempt.kind, attempt.account.as_str(), attempt.why.as_str()),
+        (accounts::Kind::SignIn, "work-2", "login signed-out")
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| row.kind == accounts::Kind::Auth)
+            .all(|row| row.why == "ok"),
+        "no auth word: {rows:?}"
+    );
     assert_eq!(state.account("work-2").auth_at, Some(env.now));
-    #[cfg(unix)]
-    assert_eq!(wake_id(&store), woken, "nobody is woken");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_login_nobody_could_ask_afterwards_is_not_started() {
     let tmp = tmp_dir("accounts-login-unaskable");
@@ -6791,6 +7007,7 @@ fn terminal_flow_restores_signals_when_its_wait_unwinds() {
     .unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     let tmp = tmp_dir("accounts-login-unanswered");
@@ -6847,6 +7064,7 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     assert_eq!(state.account("work-2").auth, Auth::Ok);
 }
 
+#[cfg(unix)]
 #[test]
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
@@ -7010,6 +7228,7 @@ fn use_records_the_owners_pin_and_claims_no_move() {
     assert_eq!(store.tail(20).expect("ledger").len(), 2, "no pin: no row");
 }
 
+#[cfg(unix)]
 #[test]
 fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     let tmp = tmp_dir("accounts-use-refused");
@@ -8518,7 +8737,11 @@ fn a_survey_says_which_row_a_launch_would_start_on() {
     std::fs::create_dir_all(&agents).expect("mkdir");
     let exe = crate::harness::codex_alab::lay_package(&tmp.path().join("package"), true);
     std::fs::write(
-        agents.join("codex"),
+        agents.join(
+            atpkg::store::ToolName::new("codex")
+                .expect("a tool")
+                .shim_file(),
+        ),
         crate::harness::codex_alab::twin_text(&exe),
     )
     .expect("twin");
@@ -8680,7 +8903,11 @@ fn a_row_no_read_can_show_a_wall_on_takes_no_launch() {
     std::fs::create_dir_all(&agents).expect("mkdir");
     let exe = crate::harness::codex_alab::lay_package(&tmp.path().join("package"), true);
     std::fs::write(
-        agents.join("codex"),
+        agents.join(
+            atpkg::store::ToolName::new("codex")
+                .expect("a tool")
+                .shim_file(),
+        ),
         crate::harness::codex_alab::twin_text(&exe),
     )
     .expect("twin");
@@ -9262,6 +9489,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     assert!(!env.accounts_store().logins_dir().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     let tmp = tmp_dir("accounts-add-inline");
@@ -9318,6 +9546,7 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     let tmp = tmp_dir("accounts-login-clock");
@@ -9523,7 +9752,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
     assert_eq!(
         out,
         format!(
-            "{packaged}this machine's own account (main): credits: in use since {}\n{section}",
+            "{packaged}this machine's own account: credits: in use since {}\n{section}",
             rfc3339_utc(now - 600)
         )
     );
@@ -9542,7 +9771,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
     let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     assert!(
         out.ends_with(&format!(
-            "(main): credits: off (org_level_disabled)  warned: weekly 92% (resets {})\n{section}",
+            "own account: credits: off (org_level_disabled)  warned: weekly 8% left (resets {})\n{section}",
             rfc3339_utc(now + 3 * 86_400)
         )),
         "{out}"
@@ -9565,7 +9794,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
             .to_string()
     };
     assert!(
-        row("main  ").contains("  credits: off (org_level_disabled)  warned: weekly 92% (")
+        row("main  ").contains("  credits: off (org_level_disabled)  warned: weekly 8% left (")
             && row("main  ").ends_with("on: -"),
         "{out}"
     );
@@ -9895,7 +10124,7 @@ fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
         text.contains("\u{2013}/5h"),
         "another account's cached 20% is not shown: {text}"
     );
-    assert!(!text.contains("20%"), "{text}");
+    assert!(!text.contains("80% left"), "{text}");
     assert!(text.contains("the /usage cache was not used"), "{text}");
     assert_eq!(
         account["consulted"],
@@ -10020,7 +10249,7 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     assert_eq!(code, exit(0), "{err}");
     assert!(
         out.contains(&format!(
-            "session 42% until {} \u{b7} week \u{2013} (no reading yet)",
+            "session 58% left until {} \u{b7} week \u{2013} (no reading yet)",
             rfc3339_utc(reset)
         )),
         "the figure it holds, and the reason for the one it does not: {out}"
@@ -10063,7 +10292,7 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &after);
     let own = out
         .lines()
-        .find(|l| l.starts_with("this login ("))
+        .find(|l| l.contains(", read by the usage tap at ") || l.contains(": nothing read of it"))
         .expect("the own login's line");
     assert!(
         own.ends_with(
@@ -10998,12 +11227,14 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
         &env,
     );
     assert!(
-        text.contains("  5h     42.5% used \u{b7} 57.5% left \u{b7} resets 01:25 (in 1h25m)   as of 1m (tap, here)\n"),
+        text.contains(
+            "  5h     57.5% left \u{b7} resets 01:25 (in 1h25m)   as of 1m (tap, here)\n"
+        ),
         "{text}"
     );
     assert!(text.contains("  used   here (1 session)\n"), "{text}");
     let (_, report, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
-    assert!(report.contains("session 42.5% until"), "{report}");
+    assert!(report.contains("session 57.5% left until"), "{report}");
 
     let mut after = env.clone();
     after.now = five_end + 60;
@@ -11241,7 +11472,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
             "limited until",
             "offer: 2 left",
             "credits: in use since",
-            "warned: weekly 80%",
+            "warned: weekly 20% left",
         ] {
             assert!(out.contains(words), "missing {words}: {out}");
         }
@@ -11257,11 +11488,13 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         let (out, row, stats, next) = report(&env);
         if !listed {
             assert!(
-                out.contains("this login (main): nothing read of it by the usage tap yet"),
+                out.contains(&format!(
+                    "ana.{STATS_SENTINEL}@example.com: nothing read of it by the usage tap yet"
+                )) && !out.contains("(main)"),
                 "{out}"
             );
         }
-        for words in ["100%", "limited until", "offer:", "credits:", "warned:"] {
+        for words in [" 0% left", "limited until", "offer:", "credits:", "warned:"] {
             assert!(!out.contains(words), "old account's {words}: {out}");
         }
         assert_eq!(row["key"], Value::from(b.to_string()));
@@ -11275,7 +11508,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
                 Value::from("no-reading")
             );
             // The report's window is the stats' window, the outlook's additive fields aside
-            // (docs/DESIGN-accounts-outlook-2026-10-25.md §9).
+            // (docs/DESIGN-harness-glass-rainbow-2026-11-05.md).
             assert_eq!(
                 figures_of(&row["windows"][i]),
                 figures_of(&stats["windows"][i])
@@ -11296,7 +11529,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         if listed {
             listed_words(&out);
         } else {
-            assert!(out.contains("session 100% until"), "{out}");
+            assert!(out.contains("session 0% left until"), "{out}");
         }
     }
     assert_eq!(
@@ -12563,6 +12796,7 @@ fn accounts_list_is_claudes_report_byte_for_byte_and_another_cli_reads_its_own_r
     assert!(parsed("accounts add a --cli kimi --region eu").is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_root() {
     let tmp = tmp_dir("accounts-cli-kimi");
@@ -12653,11 +12887,23 @@ struct AgyStandIn {
 }
 
 impl super::super::agy_quota_store::Source for AgyStandIn {
-    fn read(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+    fn admit(&self, now: i64) -> Result<super::super::agy_gate::Pass, String> {
+        Ok(super::super::agy_gate::Pass::fixture(now))
+    }
+
+    fn read(
+        &self,
+        _: &super::super::provider_read::Permit,
+        _: super::super::agy_gate::Pass,
+    ) -> Result<String, String> {
         self.doc.map(str::to_owned).map_err(str::to_owned)
     }
 
-    fn default_model(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+    fn default_model(
+        &self,
+        _: &super::super::provider_read::Permit,
+        _: super::super::agy_gate::Pass,
+    ) -> Result<String, String> {
         Ok(self.default.to_owned())
     }
 }
@@ -12784,22 +13030,31 @@ fn harness_agy_pick_reads_the_default_model_under_the_commands_use() {
     assert!(probes.is_empty(), "{probes:?}");
 }
 
-/// A home signed out here answers `agy pick`'s default model locally: the source's `/model` is
-/// never asked and nothing is on record.
+/// A login the gate refuses answers `agy pick` at the gate, whatever reading is kept of it: the
+/// source's `/usage` and `/model` are never asked and nothing is on record.
 #[test]
 fn harness_agy_pick_on_a_signed_out_home_never_asks_the_default_model() {
     struct SignedOut(std::cell::Cell<u32>);
     impl super::super::agy_quota_store::Source for SignedOut {
-        fn signed_out(&self) -> Option<String> {
-            Some(format!(
+        fn admit(&self, _: i64) -> Result<super::super::agy_gate::Pass, String> {
+            Err(format!(
                 "{}: no grant here",
                 super::super::agy_quota_store::SIGNED_OUT
             ))
         }
-        fn read(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+        fn read(
+            &self,
+            _: &super::super::provider_read::Permit,
+            _: super::super::agy_gate::Pass,
+        ) -> Result<String, String> {
+            self.0.set(self.0.get() + 1);
             Err("signed out".to_owned())
         }
-        fn default_model(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+        fn default_model(
+            &self,
+            _: &super::super::provider_read::Permit,
+            _: super::super::agy_gate::Pass,
+        ) -> Result<String, String> {
             self.0.set(self.0.get() + 1);
             Ok("gemini-4-argon-high".to_owned())
         }
@@ -12812,11 +13067,8 @@ fn harness_agy_pick_on_a_signed_out_home_never_asks_the_default_model() {
         agy_go(&env, &AgyWhat::Pick(None), false, &source)
     });
     assert_eq!(code, ExitCode::FAILURE, "{text}");
-    assert!(
-        text.contains("default model is unread: signed-out"),
-        "{text}"
-    );
-    assert_eq!(source.0.get(), 0, "the signed-out home's /model was asked");
+    assert_eq!(text, "agy quota unread: signed-out: no grant here\n");
+    assert_eq!(source.0.get(), 0, "the signed-out home's agy was asked");
     assert!(probes.is_empty(), "{probes:?}");
 }
 
@@ -12922,8 +13174,9 @@ fn a_signed_out_agy_says_so_without_running_it() {
     assert_eq!(
         text,
         format!(
-            "agy quota unread: signed-out: agy is signed out on this machine (no usable \
-             antigravity-oauth-token in {}); `aterm harness agy login <account>` signs it in\n",
+            "agy quota unread: signed-out: agy's login in this home is signed out on this \
+             machine (no usable antigravity-oauth-token in {}); sign in to agy in a tab (a turn \
+             it serves is noted), or `aterm harness agy login <account>`\n",
             profile.join(".gemini").join("antigravity-cli").display()
         )
     );
@@ -12965,18 +13218,28 @@ fn person_agy(
         .copied()
         .chain([("HOME", home.as_str()), ("PATH", "/usr/bin:/bin")])
         .map(|(n, v)| (OsString::from(n), OsString::from(v)));
-    let mut agy = crate::harness::agy_quota_store::Agy::of_person(vars);
+    // The scratch `HOME` is a login directory no account answers to: its grant file alone
+    // admits a read.
+    let mut agy = crate::harness::agy_quota_store::Agy::of_person(vars).gated(Some(
+        crate::harness::agy_gate::Gate::at(
+            &dir.join("gate-state"),
+            &dir.join("gate-home"),
+            None,
+            Some(&profile),
+        ),
+    ));
     agy.program = program.clone().into_os_string();
     agy.budget = crate::harness::agy_quota_store::LAUNCH_READ_BUDGET;
     (agy, profile, program.with_extension("ran"))
 }
 
 /// The negative control of [`a_signed_out_agy_says_so_without_running_it`]: built blind to the
-/// person's environment, as the command's agy once was, the same signed-out profile is not
-/// answered locally and agy runs.
+/// person's environment, as the command's agy once was, the same profile's missing grant file
+/// says nothing, so it cannot be called signed out. It is then only not known signed in, and
+/// the gate still starts no agy to find out.
 #[cfg(unix)]
 #[test]
-fn an_agy_blind_to_the_persons_environment_runs_on_a_signed_out_profile() {
+fn an_agy_blind_to_the_persons_environment_cannot_say_signed_out_and_still_runs_nothing() {
     let (dir, env) = agy_env("agy-signed-out-control");
     let (source, _, ran) =
         crate::harness::agy_quota_store::with_person_env_dropped(|| person_agy(dir.path(), &[SSH]));
@@ -12988,8 +13251,10 @@ fn an_agy_blind_to_the_persons_environment_runs_on_a_signed_out_profile() {
     let mut out = Vec::new();
     let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
     let json = String::from_utf8(out).unwrap();
-    assert_eq!(code, ExitCode::SUCCESS, "{json}");
-    assert!(ran.exists(), "the control must run agy: {json}");
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(code, ExitCode::FAILURE, "{json}");
+    assert_eq!(v["reason"].as_str(), Some("not-signed-in"), "{json}");
+    assert!(!ran.exists(), "agy was run to find out: {json}");
 }
 
 /// The read agy runs on the backend it was checked on: with its grant file in place, the
@@ -13002,10 +13267,7 @@ fn the_persons_agy_reads_on_the_backend_it_was_checked_on() {
     let config = profile.join(".gemini").join("antigravity-cli");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"{}").unwrap();
-    assert_eq!(
-        crate::harness::agy_quota_store::Source::signed_out(&source),
-        None
-    );
+    assert!(crate::harness::agy_quota_store::Source::admit(&source, env.now).is_ok());
     let mut out = Vec::new();
     let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
     let json = String::from_utf8(out).unwrap();
@@ -13036,10 +13298,7 @@ fn a_credential_in_the_persons_environment_is_kept_by_name_alone() {
         None,
         "another credential: no local answer"
     );
-    assert_eq!(
-        crate::harness::agy_quota_store::Source::signed_out(&source),
-        None
-    );
+    assert_eq!(source.proof(), crate::harness::agy_gate::Proof::None);
 }
 
 /// A person's `AGY_CLI_CONFIG_DIR` moves their agy off the default home's config: the command
@@ -13120,6 +13379,7 @@ fn harness_agy_login_fails_closed_without_reading_home_quota() {
 /// sign-in lock, which it holds through the flow, and records its start on the Mac's spacing
 /// clock under the account it names. Cancellation at its actual queue observation
 /// starts nothing; after a queued turn the start uses the refreshed policy clock.
+#[cfg(unix)]
 #[test]
 fn a_persons_named_sign_in_starts_under_the_machines_lock() {
     use crate::harness::sign_in_ladder::{Started, last_started};
@@ -13429,12 +13689,16 @@ mod signin;
 #[path = "cli_identity_tests.rs"]
 mod identity;
 
+// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
+#[cfg(unix)]
 #[path = "cli_plain_login_commit_tests.rs"]
 mod plain_login_commit;
 
 #[path = "cli_adopt_identity_tests.rs"]
 mod adopt_identity;
 
+// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
+#[cfg(unix)]
 #[path = "cli_adopt_source_tests.rs"]
 mod adopt_source;
 #[path = "cli_manual_receipt_tests.rs"]

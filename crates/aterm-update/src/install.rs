@@ -18,6 +18,10 @@ use crate::{ApplyOutcome, bundle, verify};
 /// sentinel still unconfirmed (a crash loop).
 pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 
+/// The longest a headless instance waits before it asks again about a trial a window launched
+/// ([`WindowLaunch::Waiting`]), so its ask at the wait's lapse is not left to another launch.
+const HEADLESS_WINDOW_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// How long a launch waits for the apply lock before starting on the installed build.
 pub(crate) const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -760,24 +764,29 @@ enum WindowLaunch {
     Lapsed,
 }
 
-fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch {
-    let Some(text) = crate::read_ledger_text(&trial_window_launch_path(staging)) else {
-        return WindowLaunch::None;
-    };
+/// When a window last launched `build`'s current trial (unix seconds), as
+/// [`record_window_launch`] keeps it, or `None` where no window launch of this trial is recorded:
+/// the record names another build or other bytes, or no trial is armed for `build`.
+fn window_launch_of_trial_at(staging: &Staging, build: u64) -> Option<u64> {
+    let text = crate::read_ledger_text(&trial_window_launch_path(staging))?;
     let mut fields = text.split_whitespace();
     let (Some(recorded), Some(digest), Some(at)) = (
         fields.next().and_then(crate::parse_uint::<u64>),
         fields.next(),
         fields.next().and_then(crate::parse_uint::<u64>),
     ) else {
-        return WindowLaunch::None;
+        return None;
     };
     let armed = trial_armed_for(staging, build);
     let this_trial = crate::manifest::FailedMark::read(&staging.trial())
         .is_some_and(|trial| trial.matches(build, digest));
-    if recorded != build || !armed || !this_trial {
+    (recorded == build && armed && this_trial).then_some(at)
+}
+
+fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch {
+    let Some(at) = window_launch_of_trial_at(staging, build) else {
         return WindowLaunch::None;
-    }
+    };
     if now
         .checked_sub(at)
         .is_some_and(|age| age < WINDOW_TRIAL_HEADLESS_WAIT.as_secs())
@@ -833,9 +842,10 @@ pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> O
     if trial_armed_for(staging, build) {
         let ledger = crate::health::Health::read(&staging.health());
         if ledger.trial_proof_failure_build == build && !ledger.trial_proof_failure.is_empty() {
+            // The recorded words end with what ends the hold (`refused_confirmation`).
             return Some(format!(
                 "build {build} is on trial after its update; the last confirmation was \
-                 refused (first at {}): {}; a window of this build retries it",
+                 refused (first at {}): {}",
                 ledger.trial_proof_failure_at, ledger.trial_proof_failure
             ));
         }
@@ -1982,12 +1992,34 @@ enum TrialRevert {
     Unavailable(String),
 }
 
+/// Why a trial's recovery proof was refused.
+#[derive(Debug)]
+struct ProofRefusal {
+    why: String,
+    /// The installed bundle is not proven to be the build that is running (it does not
+    /// verify, or seals another build or commit) while its predecessor verifies: the
+    /// launch-counted lane reverts this one at [`MAX_BOOT_ATTEMPTS`]
+    /// ([`check_boot_health_with_proof`]), so the checkpoint's bound must not settle it in
+    /// place first.
+    reverts_at_launch_count: bool,
+}
+
+/// A refusal of the trial's records, or a panic: nothing the launch count would revert.
+impl From<String> for ProofRefusal {
+    fn from(why: String) -> Self {
+        Self {
+            why,
+            reverts_at_launch_count: false,
+        }
+    }
+}
+
 fn ensure_current_trial_receipt(
     staging: &Staging,
     installed: &Path,
     current_build: u64,
     current_commit: Option<&str>,
-) -> Result<TrialRevert, String> {
+) -> Result<TrialRevert, ProofRefusal> {
     prove_current_trial(
         staging,
         installed,
@@ -2003,21 +2035,29 @@ fn prove_current_trial(
     current_build: u64,
     current_commit: Option<&str>,
     identity: &IdentityReader,
-) -> Result<TrialRevert, String> {
+) -> Result<TrialRevert, ProofRefusal> {
     let revert = match fixed_predecessor(installed, current_build, identity) {
         Predecessor::Revertible(rollback) => TrialRevert::To(rollback),
         Predecessor::Unavailable(why) => TrialRevert::Unavailable(why),
-        Predecessor::Unproven(error) => return Err(error),
+        Predecessor::Unproven(error) => return Err(error.into()),
     };
-    let (sealed_build, sealed_commit) =
-        identity(installed).map_err(|error| format!("installed trial is not verified: {error}"))?;
+    // The three refusals below say the installed bundle is not the running build. With a
+    // predecessor that verifies, the launch count reverts to it.
+    let installed_unproven = |why: String| ProofRefusal {
+        why,
+        reverts_at_launch_count: matches!(revert, TrialRevert::To(_)),
+    };
+    let (sealed_build, sealed_commit) = identity(installed)
+        .map_err(|error| installed_unproven(format!("installed trial is not verified: {error}")))?;
     if sealed_build != current_build {
-        return Err(format!(
+        return Err(installed_unproven(format!(
             "canonical installed build {sealed_build} != running trial {current_build}"
-        ));
+        )));
     }
     if !identity_matches_running(sealed_build, &sealed_commit, current_build, current_commit) {
-        return Err("canonical installed commit does not match running binary".to_string());
+        return Err(installed_unproven(
+            "canonical installed commit does not match running binary".to_string(),
+        ));
     }
 
     let trial = crate::manifest::FailedMark::read(&staging.trial())
@@ -2055,7 +2095,11 @@ fn prove_current_trial(
         return Ok(revert);
     }
 
-    Err("installed trial has no exact receipt or authorized recovery record".to_string())
+    Err(
+        "installed trial has no exact receipt or authorized recovery record"
+            .to_string()
+            .into(),
+    )
 }
 
 struct Mounted {
@@ -2232,7 +2276,11 @@ fn sweep_stale_scratch(staging: &Staging) {
 /// lock; `None` when nothing is left to wait for or the lock cannot be taken.
 pub(crate) fn sweep_left_incoming_unless_staging(staging: &Staging) -> Option<std::time::Duration> {
     match FileLock::acquire_within(&staging.stage_lock, std::time::Duration::ZERO) {
-        Ok(_stage_lock) => sweep_left_incoming(staging, std::time::SystemTime::now()),
+        Ok(_stage_lock) => {
+            #[cfg(target_os = "macos")]
+            crate::note_checker_lock_holder(&staging.stage_lock);
+            sweep_left_incoming(staging, std::time::SystemTime::now())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             Some(aterm_uds::deadline::FIRST_EXEC_HANG)
         }
@@ -2829,7 +2877,7 @@ pub(crate) struct PreverifyGuard {
 /// [`verify::APPLY_BUDGET`] for everything the check runs.
 pub(crate) fn enter_preverify(apply_lock: Option<&Path>) -> Result<PreverifyGuard, String> {
     let lock = apply_lock
-        .map(|path| FileLock::acquire_within(path, APPLY_LOCK_WAIT))
+        .map(|path| crate::take_apply_lock(path, APPLY_LOCK_WAIT))
         .transpose()
         .map_err(|error| verify::lock_wait_refusal("pre-verify lock", &error))?;
     Ok(PreverifyGuard {
@@ -2847,8 +2895,47 @@ fn preverify_staged_handoff_candidate_at<R>(
     expected_commit: Option<&str>,
     read_policy: &dyn Fn(&Path) -> R,
 ) -> Result<R, String> {
-    let _preverify = enter_preverify(Some(&staging.apply_lock))?;
+    preverify_staged_handoff_candidate_with_enter(
+        staging,
+        installed,
+        current_build,
+        current_commit,
+        (expected_build, expected_commit),
+        read_policy,
+        || enter_preverify(Some(&staging.apply_lock)),
+    )
+}
+
+fn preverify_staged_handoff_candidate_with_enter<R>(
+    staging: &Staging,
+    installed: Option<&Path>,
+    current_build: u64,
+    current_commit: Option<&str>,
+    expected: (Option<u64>, Option<&str>),
+    read_policy: &dyn Fn(&Path) -> R,
+    enter: impl FnOnce() -> Result<PreverifyGuard, String>,
+) -> Result<R, String> {
+    let (expected_build, expected_commit) = expected;
+    let running_trial_unconfirmed = || {
+        installed.is_some_and(|app_root| {
+            owned_running_trial_unconfirmed(staging, app_root, current_build)
+        })
+    };
+    // Yield without joining the apply-lock queue when the state already says the running image's
+    // health proof has priority. The second read under the lock closes the arm-between-read-and-
+    // lock race.
+    if running_trial_unconfirmed() {
+        return Err(unconfirmed_trial_refusal(current_build));
+    }
+    let _preverify = enter()?;
     let stage_moment = crate::verify::mark_passing;
+    if running_trial_unconfirmed() {
+        // A back-to-back update can be staged before this process's first frame confirms the
+        // build that just landed. Yield the shared lock before signature verification: keeping
+        // it through that bounded-but-expensive read prevents the health worker from disarming
+        // the very trial which makes this preverification provisional.
+        return Err(unconfirmed_trial_refusal(current_build));
+    }
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => ready,
         ReadyState::NotNewer => {
@@ -2950,7 +3037,7 @@ fn publish_verified_stage_within(
             crate::MAX_LEDGER_BYTES
         ));
     }
-    let _publish_lock = FileLock::acquire_within(&staging.apply_lock, lock_wait)
+    let _publish_lock = crate::take_apply_lock(&staging.apply_lock, lock_wait)
         .map_err(|error| verify::lock_wait_refusal("publish lock", &error))?;
     stage_withdrawn(staging, ready)?;
 
@@ -2975,7 +3062,7 @@ pub(crate) fn publish_local_checked(
     if u64::try_from(marker.len()).unwrap_or(u64::MAX) > crate::MAX_LEDGER_BYTES {
         return Err("local ready marker exceeds the ordinary reader bound".into());
     }
-    let _lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+    let _lock = crate::take_apply_lock(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
         .map_err(|e| verify::lock_wait_refusal("publish lock", &e))?;
     installed_current()?;
     let floor = crate::manifest::Floor::read_for_gate(&staging.floor())?;
@@ -3741,10 +3828,34 @@ fn record_activating_status(staging: &Staging, ready: &Ready) {
     );
 }
 
-fn unconfirmed_trial_refusal(armed_build: u64) -> String {
+pub(crate) fn unconfirmed_trial_refusal(armed_build: u64) -> String {
     crate::verify::mark_passing(format!(
         "update trial for build {armed_build} is still unconfirmed"
     ))
+}
+
+/// [`unconfirmed_trial_refusal`] for the running build's own trial, naming the refused proof
+/// that keeps it armed and, in the recorded words, what ends it ([`refused_confirmation`]). A
+/// person's Install gets no shorter bound: one transient refusal would then end the trial.
+fn refused_trial_refusal(staging: &Staging, build: u64) -> String {
+    let ledger = crate::health::Health::read(&staging.health());
+    if ledger.trial_proof_failure_build != build || ledger.trial_proof_failure.is_empty() {
+        return unconfirmed_trial_refusal(build);
+    }
+    crate::verify::mark_passing(format!(
+        "update trial for build {build} is still unconfirmed: its recovery proof is refused \
+         ({})",
+        ledger.trial_proof_failure
+    ))
+}
+
+#[must_use]
+pub(crate) fn owned_running_trial_unconfirmed(
+    staging: &Staging,
+    app_root: &Path,
+    current_build: u64,
+) -> bool {
+    trial_armed_for(staging, current_build) && trial_owned_by(staging, app_root)
 }
 
 fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
@@ -3804,6 +3915,38 @@ pub(crate) const fn boot_image_lane(
             LeftRecord::Ended(_) | LeftRecord::Unusable => BootImageLane::SwapAndExec,
         },
     }
+}
+
+/// The `auto_apply` [`boot_image_lane`] takes. Only a window's kept image reads it, and only with a
+/// stage waiting, before the apply lock and the swap's budget start: a file that does not answer
+/// must hold neither, and a launch with nothing to apply waits on nothing. A stage that lands after
+/// this look reads as off, which leaves it for that window's own lane.
+fn boot_lane_auto_apply(
+    image: crate::ImageReplacement,
+    stage_waits: bool,
+    read: impl FnOnce() -> bool,
+) -> bool {
+    image == crate::ImageReplacement::WindowKeepsImage && stage_waits && read()
+}
+
+/// Read `auto_apply` as [`boot_lane_auto_apply`] says, before the lock, then admit the stage under the
+/// apply lock and put it through the boot's lane.
+fn admit_stage_for_boot_lane(
+    staging: &Staging,
+    installed: &Path,
+    (current_build, current_commit): (u64, Option<&str>),
+    expected: Option<&ExpectedArtifact>,
+    image: crate::ImageReplacement,
+    read_auto_apply: impl FnOnce() -> bool,
+) -> Result<AdmittedStage, ApplyOutcome> {
+    let auto_apply = boot_lane_auto_apply(
+        image,
+        matches!(read_ready(staging, current_build), ReadyState::Newer(_)),
+        read_auto_apply,
+    );
+    let admitted =
+        admit_stage_under_apply_lock(staging, installed, current_build, current_commit, expected)?;
+    boot_lane_under_apply_lock(staging, image, auto_apply, admitted)
 }
 
 /// What a crash-loop revert does once the previous build is back at the install ([`revert_lane`]).
@@ -3959,18 +4102,14 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::NotApplicable;
     };
 
-    let admitted = match admit_stage_under_apply_lock(
+    let admitted = match admit_stage_for_boot_lane(
         &staging,
         &b.app_root,
-        current_build,
-        current_commit,
+        (current_build, current_commit),
         expected_artifact.as_ref(),
+        image,
+        aterm_update_core::settings::update_auto_apply,
     ) {
-        Ok(admitted) => admitted,
-        Err(outcome) => return outcome,
-    };
-    let auto_apply = aterm_update_core::settings::update_auto_apply();
-    let admitted = match boot_lane_under_apply_lock(&staging, image, auto_apply, admitted) {
         Ok(admitted) => admitted,
         Err(outcome) => return outcome,
     };
@@ -4120,19 +4259,33 @@ fn admit_stage_under_apply_lock(
     current_commit: Option<&str>,
     expected: Option<&ExpectedArtifact>,
 ) -> Result<AdmittedStage, ApplyOutcome> {
-    let (lock, budget, ready) = apply_lock_then_ready(
+    admit_stage_with_lock(
         staging,
-        current_build,
+        installed,
+        (current_build, current_commit),
+        expected,
         || {
-            FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
+            crate::take_apply_lock(&staging.apply_lock, APPLY_LOCK_WAIT)
                 .map_err(|e| ApplyOutcome::Deferred(crate::verify::lock_wait_refusal("lock", &e)))
         },
-        || {
-            let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
-            settle_trials_under_apply_lock(staging, installed, current_build, current_commit)?;
-            Ok(budget)
-        },
-    )?;
+    )
+}
+
+/// [`admit_stage_under_apply_lock`] under the apply lock `lock` hands it: one it takes, or one its
+/// caller already holds for a transaction the admission continues
+/// ([`install_over_failed_activation_at`]).
+fn admit_stage_with_lock(
+    staging: &Staging,
+    installed: &Path,
+    (current_build, current_commit): (u64, Option<&str>),
+    expected: Option<&ExpectedArtifact>,
+    lock: impl FnOnce() -> Result<FileLock, ApplyOutcome>,
+) -> Result<AdmittedStage, ApplyOutcome> {
+    let (lock, budget, ready) = apply_lock_then_ready(staging, current_build, lock, || {
+        let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
+        settle_trials_under_apply_lock(staging, installed, current_build, current_commit)?;
+        Ok(budget)
+    })?;
     if let Some(outcome) =
         stage_admission_gates(staging, current_build, &ready, expected, unix_now_secs())
     {
@@ -4366,8 +4519,9 @@ fn boot_lane_under_apply_lock(
             crate::log(&if lane == BootImageLane::LeaveForPress {
                 format!(
                     "boot apply: build {build} left for this window's in-session lane, for a \
-                     press: [update] auto_apply is off, so no window launch installs it \
-                     without one (no swap, no exec before the window)"
+                     press: [update] auto_apply is off, could not be read, or was read before this \
+                     stage landed, so this launch does not install it (no swap, no exec before the \
+                     window)"
                 )
             } else {
                 format!(
@@ -4475,18 +4629,8 @@ const fn boot_health_lane(handoff_target: bool, attempts_after_launch: u32) -> B
 }
 
 #[cfg(test)]
-mod boot_health_lane_tests {
-    use super::{BootHealthLane, boot_health_lane};
-
-    #[test]
-    fn only_a_handoff_targets_first_counted_launch_is_count_only() {
-        assert_eq!(boot_health_lane(true, 0), BootHealthLane::CountOnly);
-        assert_eq!(boot_health_lane(true, 1), BootHealthLane::CountOnly);
-        assert_eq!(boot_health_lane(true, 2), BootHealthLane::FullProof);
-        assert_eq!(boot_health_lane(false, 0), BootHealthLane::FullProof);
-        assert_eq!(boot_health_lane(false, 1), BootHealthLane::FullProof);
-    }
-}
+#[path = "install_boot_health_lane_tests.rs"]
+mod boot_health_lane_tests;
 
 fn check_boot_health(
     staging: &Staging,
@@ -4552,7 +4696,10 @@ pub fn recover_boot_trial(
         current_build,
         witness,
         bundle::resolve_layout,
-        |app_root| ensure_current_trial_receipt(&staging, app_root, current_build, current_commit),
+        |app_root| {
+            ensure_current_trial_receipt(&staging, app_root, current_build, current_commit)
+                .map_err(|refusal| refusal.why)
+        },
     )
 }
 
@@ -4595,7 +4742,10 @@ fn check_boot_health_with_lock_wait(
         witness,
         lock_wait,
         resolve_installed,
-        |app_root| ensure_current_trial_receipt(staging, app_root, current_build, current_commit),
+        |app_root| {
+            ensure_current_trial_receipt(staging, app_root, current_build, current_commit)
+                .map_err(|refusal| refusal.why)
+        },
     )
 }
 
@@ -4619,7 +4769,7 @@ fn check_boot_health_with_proof(
     if !armed_for_this_build(&sentinel) && !retrial {
         return None;
     }
-    let apply_lock = match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
+    let apply_lock = match crate::take_apply_lock(&staging.apply_lock, lock_wait) {
         Ok(lock) => lock,
         Err(error) if retrial => {
             crate::warn(&format!(
@@ -4941,7 +5091,7 @@ pub(crate) fn supersede_installed_activation(
             Settled(refusal)
         }
     })?;
-    let _lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+    let _lock = crate::take_apply_lock(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
         .map_err(|error| ForNow(format!("apply lock: {error}")))?;
     let _budget = verify::ApplyBudget::start(verify::APPLY_BUDGET);
     supersede_activation_locked(
@@ -4954,7 +5104,29 @@ pub(crate) fn supersede_installed_activation(
     )
 }
 
-type SealedIdentityReader = dyn Fn(&Path) -> Result<(u64, String), String>;
+type SealedIdentityReader<'a> = dyn Fn(&Path) -> Result<(u64, String), String> + 'a;
+
+/// Why a staged bundle sealed `(build, commit)` is not the one its marker names `(build, commit)`:
+/// another build, or the marker's build with another commit (or a marker that names no release
+/// commit, which no seal matches).
+fn staged_seal_mismatch(
+    (build, commit): (u64, &str),
+    (marker_build, marker_commit): (u64, Option<&str>),
+) -> String {
+    if marker_build != build {
+        return format!(
+            "the staged bundle is sealed {build}, not the marker's build {marker_build}"
+        );
+    }
+    match canonical_release_commit(marker_commit) {
+        Some(marker_commit) => {
+            format!("the staged bundle is sealed commit {commit}, not the marker's {marker_commit}")
+        }
+        None => format!(
+            "the staged bundle is sealed commit {commit}, and the marker names no release commit"
+        ),
+    }
+}
 
 fn supersede_activation_locked(
     staging: &Staging,
@@ -4962,7 +5134,7 @@ fn supersede_activation_locked(
     (current_build, current_commit): (u64, &str),
     (activation_build, activation_commit): (u64, &str),
     newer_build: u64,
-    identity: &SealedIdentityReader,
+    identity: &SealedIdentityReader<'_>,
 ) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
     let stays =
         |why: String| format!("the installed build {activation_build} stays in place: {why}");
@@ -5011,9 +5183,10 @@ fn supersede_activation_locked(
     match identity(&staging.staged_app) {
         Ok((build, commit))
             if build == newer_build && sealed_commit_matches(ready.commit.as_deref(), &commit) => {}
-        Ok((build, _)) => {
-            return for_now(format!(
-                "the staged bundle is sealed {build}, not the marker's build {newer_build}"
+        Ok((build, commit)) => {
+            return for_now(staged_seal_mismatch(
+                (build, &commit),
+                (newer_build, ready.commit.as_deref()),
             ));
         }
         Err(error) => return for_now(format!("the staged bundle does not verify: {error}")),
@@ -5053,19 +5226,11 @@ fn supersede_activation_locked(
     if !trial_authorizes_candidate(staging, activation_build, &installed_commit) {
         return settled("its trial marker does not name these bytes".to_string());
     }
-    let this = std::process::id();
-    if let Some(live) = read_trial_launchers(staging, activation_build)
-        .into_iter()
-        .find(|recorded| {
-            recorded.witness == crate::TrialWitness::Window
-                && recorded.launcher.pid != this
-                && recorded.launcher.is_alive()
-        })
-    {
+    if let Some(live) = live_window_launch_of(staging, activation_build) {
         return for_now(format!(
             "a window's launch of it (pid {}) is still running, and its switch may still \
              land on it",
-            live.launcher.pid
+            live.pid
         ));
     }
     let fixed = rollback_path(installed);
@@ -5146,6 +5311,545 @@ fn supersede_activation_locked(
     })
 }
 
+/// A live window launch of `build`'s trial other than this process, as the trial's launcher record
+/// knows it: a successor of it still running, whose switch may land on it.
+fn live_window_launch_of(staging: &Staging, build: u64) -> Option<TrialLauncher> {
+    let this = std::process::id();
+    read_trial_launchers(staging, build)
+        .into_iter()
+        .find(|recorded| {
+            recorded.witness == crate::TrialWitness::Window
+                && recorded.launcher.pid != this
+                && recorded.launcher.is_alive()
+        })
+        .map(|recorded| recorded.launcher)
+}
+
+/// A window's booked failure to switch to an activation, as the health ledger keeps it: a window
+/// books each failed switch with the build it runs and the build it aimed at
+/// (`aterm_update::record_apply_failure`; v0.177.0's window does the same).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowApplyFailure {
+    /// The build the window that failed runs.
+    by_build: u64,
+    /// When it booked its last failure (unix seconds), or `None` where that time does not read.
+    at: Option<u64>,
+}
+
+/// The failure a window running an older build booked against `activation`, or `None`.
+fn window_apply_failure_of(staging: &Staging, activation: u64) -> Option<WindowApplyFailure> {
+    let ledger = crate::health::Health::read(&staging.health());
+    (ledger.last_apply_failure_target_build == activation
+        && ledger.apply_failures_for_target > 0
+        && ledger.last_apply_failure_build != 0
+        && ledger.last_apply_failure_build < activation)
+        .then(|| WindowApplyFailure {
+            by_build: ledger.last_apply_failure_build,
+            at: aterm_types::rfc3339::parse_utc(&ledger.last_apply_failure_at)
+                .and_then(|secs| u64::try_from(secs).ok()),
+        })
+}
+
+/// The activation a window failed to switch to and the newer stage that may take its place, read
+/// without the apply lock or a signature check: a boot trial armed for an activation, a window's
+/// failure to switch to it in the ledger, and a ready stage newer than it that names the published
+/// bundle and that neither the quarantine nor the floor holds back. `None` is the usual answer.
+pub(crate) fn failed_activation_waiting() -> Option<(u64, u64)> {
+    if !crate::enabled() {
+        return None;
+    }
+    failed_activation_waiting_at(&Staging::resolve()?)
+}
+
+fn failed_activation_waiting_at(staging: &Staging) -> Option<(u64, u64)> {
+    failed_activation_found(staging).map(|(activation, _, ready)| (activation, ready.build_number))
+}
+
+/// [`failed_activation_waiting_at`] with the failure and the stage it read.
+fn failed_activation_found(staging: &Staging) -> Option<(u64, WindowApplyFailure, Ready)> {
+    let (activation, _) = boot_sentinel(staging).read_state()?;
+    let failure = window_apply_failure_of(staging, activation)?;
+    match read_ready(staging, activation) {
+        ReadyState::Newer(ready) if ready.is_publishable(staging) => {
+            Some((activation, failure, ready))
+        }
+        ReadyState::Newer(_) | ReadyState::NotNewer | ReadyState::Corrupt | ReadyState::Absent => {
+            None
+        }
+    }
+}
+
+/// What the cheap gates of an install over a failed activation passed
+/// ([`failed_activation_gates`]): the activation, the window's failure against it, and the newer
+/// stage, by build and commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FailedActivationGate {
+    activation: u64,
+    failure: WindowApplyFailure,
+    newer: u64,
+    newer_commit: Option<String>,
+}
+
+/// The gates of [`install_over_failed_activation_at`] that small files answer, read with no
+/// signature check, so a refusal here costs a later look as little: the look
+/// ([`failed_activation_found`]: an armed trial, a window's failure against it, a newer
+/// publishable stage), no window launch of the activation after that failure (a switch in flight
+/// that has not reported), no live window launch of it, this process running one of the two
+/// builds by number, and the stage's roster confirmation fresh. The live launch is a fast path:
+/// [`supersede_activation_locked`] waits it out under the lock too, and here it spares the
+/// verification of three bundles while a switch may still land.
+fn failed_activation_gates(
+    staging: &Staging,
+    current_build: u64,
+    now: u64,
+) -> Result<FailedActivationGate, crate::FailedActivationInstall> {
+    use crate::FailedActivationInstall::{Held, NoneFailed};
+    use crate::SupersedeRefusal::{ForNow, Settled};
+    let Some((activation, failure, ready)) = failed_activation_found(staging) else {
+        return Err(NoneFailed);
+    };
+    let stays = |why: String| format!("the installed build {activation} stays in place: {why}");
+    if let Some(launched) = window_launch_of_trial_at(staging, activation)
+        && failure.at.is_none_or(|failed| launched > failed)
+    {
+        return Err(Held(ForNow(stays(format!(
+            "a window launched it at {}, after the last failure the window here booked for \
+             it, so its switch may be in flight",
+            format_rfc3339(launched)
+        )))));
+    }
+    if let Some(live) = live_window_launch_of(staging, activation) {
+        return Err(Held(ForNow(stays(format!(
+            "a window's launch of it (pid {}) is still running, so its switch may be in flight",
+            live.pid
+        )))));
+    }
+    if current_build != activation && current_build != failure.by_build {
+        return Err(Held(Settled(stays(format!(
+            "this process runs build {current_build}, neither it nor the build {} of the window \
+             that failed to switch to it",
+            failure.by_build
+        )))));
+    }
+    if let Some(refusal) =
+        ready.roster_authorization_stale(now, aterm_update_core::pins::roster_tier_armed())
+    {
+        return Err(Held(ForNow(stays(refusal))));
+    }
+    Ok(FailedActivationGate {
+        activation,
+        failure,
+        newer: ready.build_number,
+        newer_commit: ready.commit,
+    })
+}
+
+/// The sealed identities a retire stands on ([`retire_identities`]).
+struct RetireIdentities {
+    /// The activation's sealed commit, at the install path.
+    activation_commit: String,
+    /// The build at the fixed rollback path, which the window that failed runs, and its commit.
+    restored: (u64, String),
+}
+
+/// The bundles an install over the failed activation `gate` stands on, read by `identity`: the
+/// activation at the install path, the build of the window that failed at the fixed rollback path
+/// (one of the two run by this process), and the stage the marker names. Run once before the
+/// apply lock with a reader that verifies, and again under it with one that answers from that
+/// verification for a bundle whose tree has not changed since ([`VerifiedBundles`]).
+///
+/// The install path and the fixed rollback path change only by a transaction or a person, so what
+/// their verification shows (another build, or a verdict on their signatures) is
+/// [`crate::FailedActivationInstall::Refused`]; a verification that did not finish (a passing
+/// refusal) is a hold for now. The stage's refusals all hold for now: the staged lane discards a
+/// stage that fails verification or is sealed other than its marker, and a stage of the same build
+/// downloaded again must not find the pair refused.
+fn retire_identities(
+    staging: &Staging,
+    installed: &Path,
+    (current_build, current_commit): (u64, &str),
+    gate: &FailedActivationGate,
+    identity: &SealedIdentityReader<'_>,
+) -> Result<RetireIdentities, crate::FailedActivationInstall> {
+    use crate::FailedActivationInstall::{Held, Refused};
+    use crate::SupersedeRefusal::ForNow;
+    let activation = gate.activation;
+    let stays = |why: String| format!("the installed build {activation} stays in place: {why}");
+    let unverified = |what: &str, error: String| {
+        let why = stays(format!("{what} does not verify: {error}"));
+        if stage_failure_is_a_verdict(&error) {
+            Refused(why)
+        } else {
+            Held(ForNow(why))
+        }
+    };
+    let activation_commit = match identity(installed) {
+        Ok((build, commit)) if build == activation => commit,
+        Ok((build, _)) => {
+            return Err(Refused(stays(format!(
+                "the bundle at the install path is sealed {build}, not the activation"
+            ))));
+        }
+        Err(error) => return Err(unverified("the installed bundle", error)),
+    };
+    let by_build = gate.failure.by_build;
+    let restored = match identity(&rollback_path(installed)) {
+        Ok((build, commit)) if build == by_build && build < activation => (build, commit),
+        Ok((build, _)) => {
+            return Err(Refused(stays(format!(
+                "the retained predecessor is build {build}, not the build {by_build} of the \
+                 window that failed to switch to it"
+            ))));
+        }
+        Err(error) => return Err(unverified("the retained predecessor", error)),
+    };
+    let runs = |(build, commit): (u64, &str)| {
+        identity_matches_running(build, commit, current_build, Some(current_commit))
+    };
+    if !runs((activation, &activation_commit)) && !runs((restored.0, &restored.1)) {
+        return Err(Refused(stays(format!(
+            "this process runs build {current_build}, neither it nor its retained predecessor"
+        ))));
+    }
+    let newer = gate.newer;
+    match identity(&staging.staged_app) {
+        Ok((build, commit))
+            if build == newer && sealed_commit_matches(gate.newer_commit.as_deref(), &commit) => {}
+        Ok((build, commit)) => {
+            return Err(Held(ForNow(stays(staged_seal_mismatch(
+                (build, &commit),
+                (newer, gate.newer_commit.as_deref()),
+            )))));
+        }
+        Err(error) => {
+            return Err(Held(ForNow(stays(format!(
+                "the staged bundle does not verify: {error}"
+            )))));
+        }
+    }
+    Ok(RetireIdentities {
+        activation_commit,
+        restored,
+    })
+}
+
+/// How many entries a bundle's tree may hold for [`bundle_tree_stamp`] to stamp it; a larger one
+/// is verified each time it is read.
+const MAX_STAMPED_BUNDLE_ENTRIES: usize = 100_000;
+
+/// One entry of a [`BundleTreeStamp`]: its path under the bundle and what `lstat` says of it.
+#[derive(Debug, PartialEq, Eq)]
+struct EntryStamp {
+    path: PathBuf,
+    mode: u32,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+/// One state of a bundle's tree, read without its bytes: the bundle directory's device and inode,
+/// and for each entry under it (no link followed) its path, mode, device, inode, size, and
+/// modification and change times. A write, a replacement, an addition or a removal under the
+/// bundle changes it, since nothing sets a change time back; moving the bundle whole (the
+/// updater's renames and atomic exchanges) does not.
+#[derive(Debug, PartialEq, Eq)]
+struct BundleTreeStamp {
+    root: (u64, u64),
+    entries: Vec<EntryStamp>,
+}
+
+fn bundle_tree_stamp(app: &Path) -> std::io::Result<BundleTreeStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = std::fs::symlink_metadata(app)?;
+    if !root.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the bundle path is not a non-symlink directory",
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut dirs = vec![PathBuf::new()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(app.join(&dir))? {
+            let entry = entry?;
+            let path = dir.join(entry.file_name());
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                dirs.push(path.clone());
+            }
+            entries.push(EntryStamp {
+                path,
+                mode: meta.mode(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                size: meta.size(),
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                ctime: (meta.ctime(), meta.ctime_nsec()),
+            });
+            if entries.len() > MAX_STAMPED_BUNDLE_ENTRIES {
+                return Err(std::io::Error::other(format!(
+                    "the bundle holds more than {MAX_STAMPED_BUNDLE_ENTRIES} entries"
+                )));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(BundleTreeStamp {
+        root: (root.dev(), root.ino()),
+        entries,
+    })
+}
+
+/// Bundle verifications made before the apply lock, each with the stamp of the tree read just
+/// before it, so a read under the lock of a bundle whose tree has not changed since (moved whole or
+/// not) needs no second signature check: its identity, or the verdict its signature got. A
+/// verification that did not finish (a passing refusal) is not kept. A tree written to during or
+/// after its verification has another stamp (each write moves an entry's ctime), so it is verified
+/// again.
+#[derive(Default)]
+struct VerifiedBundles(std::cell::RefCell<Vec<(BundleTreeStamp, SealedIdentity)>>);
+
+impl VerifiedBundles {
+    /// `identity`'s verification of `app`, kept with the stamp of the tree it started on unless it
+    /// did not finish.
+    fn verify(&self, app: &Path, identity: &SealedIdentityReader<'_>) -> SealedIdentity {
+        let before = bundle_tree_stamp(app);
+        let read = identity(app);
+        let finished = read
+            .as_ref()
+            .err()
+            .is_none_or(|error| stage_failure_is_a_verdict(error));
+        if let (Ok(before), true) = (before, finished) {
+            self.0.borrow_mut().push((before, read.clone()));
+        }
+        read
+    }
+
+    /// The verification kept for the tree now at `app`, if one was.
+    fn cached(&self, app: &Path) -> Option<SealedIdentity> {
+        let stamp = bundle_tree_stamp(app).ok()?;
+        self.0
+            .borrow()
+            .iter()
+            .find(|(verified, _)| *verified == stamp)
+            .map(|(_, identity)| identity.clone())
+    }
+
+    /// `app`'s identity: the verification kept for its tree, or [`Self::verify`]'s now.
+    fn read(&self, app: &Path, identity: &SealedIdentityReader<'_>) -> SealedIdentity {
+        self.cached(app)
+            .unwrap_or_else(|| self.verify(app, identity))
+    }
+}
+
+/// A process that is not a window (the node service) takes the install path from an activation
+/// the window here could not switch to, for a strictly newer verified stage. The window's retained
+/// build goes back first ([`supersede_activation_locked`]), then the stage is swapped in over it
+/// with a fresh trial, that build kept at the fixed rollback path: two atomic exchanges under one
+/// hold of the apply lock, the stage prepared at the fixed path as any apply prepares it, and
+/// nothing executed but the candidate's start probe.
+///
+/// The gates small files answer run first and the bundles are verified next, both before the
+/// apply lock ([`failed_activation_gates`], [`retire_identities`]). A hold for now there ends the
+/// look; what the bundles refuse there goes on to the lock, since another process may hold it
+/// part-way through its own transaction, so every [`crate::FailedActivationInstall::Refused`] is
+/// judged under the lock. Under the lock the gates are read again, and each bundle's identity is
+/// answered from that verification where its tree has not changed ([`VerifiedBundles`]), so the
+/// hold is those re-reads, the exchanges and the start probe; a tree not verified before the lock,
+/// or changed since, is verified under it. A launch of the activation that a window starts
+/// meanwhile counts itself under the same lock, waiting [`APPLY_LOCK_WAIT`] for it: one that takes
+/// it after this transaction finds its build no longer armed, and one that does not get it is
+/// refused its count; neither is counted, and either goes on starting, its image from a bundle the
+/// retire removed. A window launch of the activation recorded after the window's last failure, or
+/// still running, holds the retire; one not yet counted is not seen.
+///
+/// What a window that cannot update itself (one that pinned its switch to the retired activation)
+/// does next is read in its code, not tested: v0.177.0's window, as read at its release, retires an
+/// activation stage the install path no longer backs and imports any installed build newer than
+/// it as its activation stage, so it would switch to the build installed here.
+pub(crate) fn install_over_failed_activation(
+    current_build: u64,
+    current_commit: &str,
+) -> crate::FailedActivationInstall {
+    if !crate::enabled() {
+        return crate::FailedActivationInstall::NoneFailed;
+    }
+    let (Some(installed), Some(staging)) = (bundle::resolve(), Staging::resolve()) else {
+        return crate::FailedActivationInstall::NoneFailed;
+    };
+    install_over_failed_activation_at(
+        &staging,
+        &installed.app_root,
+        (current_build, current_commit),
+        &verified_bundle_identity,
+        &SHIPPED_SWAP_SEAMS,
+        BACKGROUND_LOCK_WAIT,
+    )
+}
+
+fn install_over_failed_activation_at(
+    staging: &Staging,
+    installed: &Path,
+    running: (u64, &str),
+    identity: &SealedIdentityReader<'_>,
+    seams: &SwapSeams<'_>,
+    lock_wait: std::time::Duration,
+) -> crate::FailedActivationInstall {
+    use crate::FailedActivationInstall::{Held, Installed, Refused, RetiredOnly};
+    let gate = match failed_activation_gates(staging, running.0, unix_now_secs()) {
+        Ok(gate) => gate,
+        Err(outcome) => return outcome,
+    };
+    let verified = VerifiedBundles::default();
+    {
+        let _budget = verify::ApplyBudget::start(verify::APPLY_BUDGET);
+        let verify = |app: &Path| verified.verify(app, identity);
+        match retire_identities(staging, installed, running, &gate, &verify) {
+            // What the bundles refuse is judged again under the lock, from these verifications:
+            // another process may hold it part-way through a transaction of its own (an exchange
+            // done, its trial not yet disarmed), and only a judgement under it is kept.
+            Ok(_) | Err(Refused(_)) => {}
+            Err(outcome) => return outcome,
+        }
+    }
+    let lock = match crate::take_apply_lock(&staging.apply_lock, lock_wait) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return Held(crate::SupersedeRefusal::ForNow(verify::lock_wait_refusal(
+                "apply lock",
+                &error,
+            )));
+        }
+    };
+    let retire_budget = verify::ApplyBudget::start(verify::APPLY_BUDGET);
+    let cached = |app: &Path| verified.read(app, identity);
+    let (retired, restored_commit) =
+        match retire_failed_activation_locked(staging, installed, running, &gate, &cached) {
+            Ok(retired) => retired,
+            Err(outcome) => return outcome,
+        };
+    drop(retire_budget);
+    if let Some(deferred) = retired.trial_disarm_deferred.clone() {
+        return RetiredOnly {
+            retired,
+            why: deferred,
+        };
+    }
+    // The swap re-reads the stage and the restored build at the install path, as any swap does;
+    // both are the trees verified before the lock, moved whole.
+    let one = |app: &Path| verified.read(app, seams.one);
+    let both = |apps: [&Path; 2]| apps.map(|app| verified.read(app, seams.one));
+    let seams = SwapSeams {
+        one: &one,
+        both: &both,
+        probe: seams.probe,
+    };
+    let restored = (retired.restored_build, Some(restored_commit.as_str()));
+    let swapped = admit_stage_with_lock(staging, installed, restored, None, move || Ok(lock))
+        .and_then(|admitted| {
+            swap_admitted_stage(staging, installed, restored.0, restored.1, admitted, &seams)
+        });
+    match swapped {
+        Ok(SwappedStage {
+            lock,
+            budget,
+            ready,
+            ..
+        }) => {
+            drop(budget);
+            drop(lock);
+            crate::log(&format!(
+                "build {} never committed: the window here (build {}) failed to switch to it, \
+                 so this process retired it and installed build {} over build {}, which stays \
+                 at the fixed rollback path",
+                retired.activation_build,
+                retired.restored_build,
+                ready.build_number,
+                retired.restored_build
+            ));
+            Installed {
+                installed_build: ready.build_number,
+                retired,
+            }
+        }
+        Err(outcome) => {
+            let why = format!(
+                "the staged build {} did not go in: {outcome:?}",
+                retired.newer_build
+            );
+            crate::warn(&format!(
+                "retired build {}'s activation, and build {} is back at the install path, but \
+                 {why}; the staged lane applies it as any stage",
+                retired.activation_build, retired.restored_build
+            ));
+            RetiredOnly { retired, why }
+        }
+    }
+}
+
+/// The retire half of [`install_over_failed_activation_at`], under its apply lock. The gates are
+/// read again and must find what they found before the lock (`gate`): the disk may have moved
+/// while the bundles were verified, and a look that no longer finds the failed activation is
+/// [`crate::FailedActivationInstall::NoneFailed`], one that finds it otherwise a hold for now,
+/// never a verdict a caller keeps. Then the identities, by `identity` (answered from the
+/// verification made before the lock where a tree is unchanged), and
+/// [`supersede_activation_locked`] puts the retained build back; a refusal it settles is one the
+/// verified bundles or the trial they name hold ([`crate::FailedActivationInstall::Refused`]).
+/// Returns what it did and the restored build's sealed commit.
+fn retire_failed_activation_locked(
+    staging: &Staging,
+    installed: &Path,
+    running: (u64, &str),
+    gate: &FailedActivationGate,
+    identity: &SealedIdentityReader<'_>,
+) -> Result<(crate::SupersededActivation, String), crate::FailedActivationInstall> {
+    use crate::FailedActivationInstall::{Held, Refused};
+    use crate::SupersedeRefusal::{ForNow, Settled};
+    let again = failed_activation_gates(staging, running.0, unix_now_secs())?;
+    if again != *gate {
+        return Err(Held(ForNow(format!(
+            "the installed build {} stays in place for now: what the look found changed while \
+             its bundles were verified, and the next look reads it again",
+            gate.activation
+        ))));
+    }
+    let identities = retire_identities(staging, installed, running, gate, identity)?;
+    let (restored_build, restored_commit) = identities.restored;
+    match supersede_activation_locked(
+        staging,
+        installed,
+        (restored_build, &restored_commit),
+        (gate.activation, &identities.activation_commit),
+        gate.newer,
+        identity,
+    ) {
+        Ok(retired) => Ok((retired, restored_commit)),
+        Err(Settled(why)) => Err(Refused(why)),
+        Err(for_now @ ForNow(_)) => Err(Held(for_now)),
+    }
+}
+
+/// Clear the apply failure streak of a build this process has moved past
+/// ([`crate::health::Health::expire_stale_apply_streak`]); an uncommitted handoff candidate has
+/// moved past nothing and clears none. A build whose own boot trial is still armed clears the
+/// escalation streak, as before, so the persistent verdict and the update attention it raises read
+/// as they did, but keeps a window's failed switch to it
+/// ([`crate::health::Health::expire_stale_apply_streak_on_trial`]): the node service runs each
+/// installed build, and [`install_over_failed_activation`] reads that failure.
+pub(crate) fn expire_apply_streak_moved_past(staging: &Staging, current_build: u64) {
+    if crate::is_uncommitted_handoff_candidate() {
+        return;
+    }
+    let health = staging.health();
+    if trial_armed_for(staging, current_build) {
+        crate::health::Health::expire_stale_apply_streak_on_trial(&health, current_build);
+    } else {
+        crate::health::Health::expire_stale_apply_streak(&health, current_build);
+    }
+}
+
 fn trial_armed_for(staging: &Staging, current_build: u64) -> bool {
     let sentinel = boot_sentinel(staging);
     match sentinel.read_state() {
@@ -5158,45 +5862,357 @@ fn trial_armed_for(staging: &Staging, current_build: u64) -> bool {
     }
 }
 
+/// How the bound of a refused boot trial reads in a line.
+fn trial_bound_words() -> String {
+    format!(
+        "{} refusals spanning {} min of awake time",
+        crate::TRIAL_SETTLE_AFTER_REFUSALS,
+        crate::TRIAL_SETTLE_REFUSAL_SPAN.as_secs() / 60
+    )
+}
+
+/// One process's run of refused recovery proofs for one trial. It lives in this process's
+/// memory, never in `health.toml`: a build that relaunches is left wholly to
+/// [`MAX_BOOT_ATTEMPTS`], a restart of the Mac carries no streak, and a ledger that cannot be
+/// written cannot stall it.
+struct TrialRefusals {
+    build: u64,
+    digest: String,
+    count: u32,
+    /// The last counted refusal.
+    last: ProbeClock,
+    /// Awake milliseconds the refusal is known to have lasted: the sum of the gaps between
+    /// one counted refusal and the next, with nothing else answered between them.
+    spanned_ms: u64,
+    /// An ask since `last` ran no proof ([`interrupt_trial_refusals`]): the gap to the next
+    /// refusal spans nothing.
+    interrupted: bool,
+    /// The sentinel refused its removal at the bound and that was said.
+    disarm_said: bool,
+}
+
+/// The streaks, by staging root (one in a running aterm; tests in one binary stay apart).
+static TRIAL_REFUSALS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, TrialRefusals>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Runs `f` on the streaks under their lock, which no caller holds across anything else.
+fn with_trial_refusals<T>(
+    f: impl FnOnce(&mut std::collections::BTreeMap<PathBuf, TrialRefusals>) -> T,
+) -> T {
+    let mut streaks = TRIAL_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut streaks)
+}
+
+/// The canonical digest `build`'s trial is keyed by, or `""` when its identity does not read.
+fn trial_digest(staging: &Staging, build: u64) -> String {
+    crate::manifest::FailedMark::read(&staging.trial())
+        .filter(|trial| trial.build_number == build)
+        .and_then(|trial| canonical_digest(&trial.sha256))
+        .unwrap_or_default()
+}
+
+/// Counts one refused proof of `build`'s trial at `now`: the streak's count, and the awake
+/// milliseconds its refusal is known to have lasted.
+///
+/// The span is a sum of gaps, each from one counted refusal to the next on the awake clock
+/// ([`ProbeClock::awake_ms`]). So nothing but a refusal that lasted spans the bound: a sleep
+/// spans nothing, a reading with no awake clock spans nothing (the wall clock, which a sleep
+/// and a forward step both age, is never used: with no awake clock the streak counts and
+/// never reaches the span), and the gap across an ask that ran no proof
+/// ([`interrupt_trial_refusals`]) spans nothing. The streak restarts at this refusal for
+/// another build or digest and when the awake clock reads below the last refusal.
+fn count_trial_refusal(staging: &Staging, build: u64, now: ProbeClock) -> (u32, u64) {
+    let digest = trial_digest(staging, build);
+    with_trial_refusals(|streaks| {
+        let gap = streaks
+            .get(&staging.root)
+            .filter(|streak| streak.build == build && streak.digest == digest)
+            .and_then(|streak| match (streak.last.awake_ms, now.awake_ms) {
+                (Some(last), Some(awake)) => awake
+                    .checked_sub(last)
+                    .map(|gap| if streak.interrupted { 0 } else { gap }),
+                _ => Some(0),
+            });
+        let Some((gap, streak)) = gap.zip(streaks.get_mut(&staging.root)) else {
+            streaks.insert(
+                staging.root.clone(),
+                TrialRefusals {
+                    build,
+                    digest,
+                    count: 1,
+                    last: now,
+                    spanned_ms: 0,
+                    interrupted: false,
+                    disarm_said: false,
+                },
+            );
+            return (1, 0);
+        };
+        streak.count = streak.count.saturating_add(1);
+        streak.spanned_ms = streak.spanned_ms.saturating_add(gap);
+        streak.last = now;
+        streak.interrupted = false;
+        (streak.count, streak.spanned_ms)
+    })
+}
+
+/// A checkpoint ask ran no proof (the apply lock was held, the install did not resolve): the
+/// streak keeps its count, and the time to its next refusal spans nothing, since nothing
+/// says the refusal lasted through it.
+fn interrupt_trial_refusals(staging: &Staging) {
+    with_trial_refusals(|streaks| {
+        if let Some(streak) = streaks.get_mut(&staging.root) {
+            streak.interrupted = true;
+        }
+    });
+}
+
+fn forget_trial_refusals(staging: &Staging) {
+    with_trial_refusals(|streaks| streaks.remove(&staging.root));
+}
+
+/// The streak's count for `staging`, 0 with none.
+#[cfg(test)]
+fn trial_refusal_count(staging: &Staging) -> u32 {
+    with_trial_refusals(|streaks| streaks.get(&staging.root).map_or(0, |streak| streak.count))
+}
+
+/// Puts a streak of `count` refusals in place for `staging`, as refusals that lasted
+/// `spanned_ms` up to `last` would have left it.
+#[cfg(test)]
+fn seed_trial_refusals(
+    staging: &Staging,
+    build: u64,
+    count: u32,
+    spanned_ms: u64,
+    last: ProbeClock,
+) {
+    let digest = trial_digest(staging, build);
+    with_trial_refusals(|streaks| {
+        streaks.insert(
+            staging.root.clone(),
+            TrialRefusals {
+                build,
+                digest,
+                count,
+                last,
+                spanned_ms,
+                interrupted: false,
+                disarm_said: false,
+            },
+        )
+    });
+}
+
+/// What one run of a trial's recovery proof under the apply lock came to.
+enum TrialProof {
+    /// The proof passed and the sentinel is disarmed.
+    Settled,
+    /// No trial of this build is armed (before the proof, or once it ran).
+    Gone,
+    /// The proof ran and was refused, or panicked.
+    Refused(ProofRefusal),
+    /// The proof passed, but the sentinel could not be removed.
+    DisarmFailed(String),
+}
+
 fn confirm_trial_health_after_proof(
     staging: &Staging,
     current_build: u64,
-    witness: crate::TrialWitness,
-    prove: impl FnOnce() -> Result<(), String>,
-) -> bool {
+    prove: impl FnOnce() -> Result<(), ProofRefusal>,
+) -> TrialProof {
     let sentinel = boot_sentinel(staging);
     if !trial_armed_for(staging, current_build) {
-        return false;
+        return TrialProof::Gone;
     }
-    if let Err(error) = prove() {
-        note_trial_proof_failure(staging, current_build, witness, &error);
-        return false;
+    let proof =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(prove)).unwrap_or_else(|payload| {
+            Err(format!(
+                "the recovery proof panicked: {}",
+                aterm_log::words::Panic::of(payload.as_ref())
+            )
+            .into())
+        });
+    if let Err(error) = proof {
+        return TrialProof::Refused(error);
     }
-    if !trial_armed_for(staging, current_build) || sentinel.confirm().is_err() {
-        return false;
+    if !trial_armed_for(staging, current_build) {
+        return TrialProof::Gone;
+    }
+    if let Err(error) = sentinel.confirm() {
+        return TrialProof::DisarmFailed(error.to_string());
     }
     clear_trial_identity(staging);
     crate::health::Health::record_apply_success(&staging.health());
-    true
+    TrialProof::Settled
 }
 
-fn note_trial_proof_failure(
+/// A proof that ran under the apply lock and was refused: said once per reason, counted, and
+/// at the bound ([`crate::TRIAL_SETTLE_AFTER_REFUSALS`] refusals that lasted
+/// [`crate::TRIAL_SETTLE_REFUSAL_SPAN`] in this process) settled without the proof
+/// ([`settle_trial_at_bound`]). Only this is counted: a lock that timed out and an install
+/// that did not resolve refused nothing.
+///
+/// Unbounded here, on purpose: a refusal that says the installed bundle is not the running
+/// build while its predecessor verifies ([`ProofRefusal::reverts_at_launch_count`]) is never
+/// counted. Settling it would leave a bundle nothing verifies installed and end the revert
+/// the launch count makes for exactly this case, so it stays `Pending`, named, until that
+/// launch.
+///
+/// The words recorded in the ledger say what ends the hold, so every reader of them
+/// ([`window_trial_wait_at`], [`refused_trial_refusal`]) says the bound that applies.
+fn refused_confirmation(
     staging: &Staging,
     build: u64,
     witness: crate::TrialWitness,
-    error: &str,
-) {
+    app_root: &Path,
+    refusal: &ProofRefusal,
+    now: ProbeClock,
+) -> crate::BootHealthVerdict {
     let who = match witness {
         crate::TrialWitness::Window => "a window",
         crate::TrialWitness::Headless => "a headless start",
     };
-    let words = format!(
-        "{who} reached its health checkpoint, but the trial's recovery proof failed: {error}"
-    );
+    let error = refusal.why.as_str();
+    let words = if refusal.reverts_at_launch_count {
+        format!(
+            "{who} reached its health checkpoint, but the installed build is not proven to be \
+             the running one: {error}; the trial stays armed for the launch count, whose \
+             launch {MAX_BOOT_ATTEMPTS} reverts to the previous build"
+        )
+    } else {
+        format!(
+            "{who} reached its health checkpoint, but the trial's recovery proof failed: \
+             {error}; the running build retries it and settles the trial without the proof \
+             after {} in this process",
+            trial_bound_words()
+        )
+    };
     if crate::health::Health::record_trial_proof_failure(&staging.health(), build, &words) {
-        crate::warn(&format!(
-            "build {build}'s boot trial stays armed: {words}; the confirmation is retried"
-        ));
+        crate::warn(&format!("build {build}'s boot trial stays armed: {words}"));
+    }
+    if refusal.reverts_at_launch_count {
+        // No refusal of the records lasted through this ask.
+        forget_trial_refusals(staging);
+        return crate::BootHealthVerdict::Pending {
+            why: words,
+            retry_after: None,
+        };
+    }
+    let (count, span_ms) = count_trial_refusal(staging, build, now);
+    if count < crate::TRIAL_SETTLE_AFTER_REFUSALS
+        || u128::from(span_ms) < crate::TRIAL_SETTLE_REFUSAL_SPAN.as_millis()
+    {
+        return crate::BootHealthVerdict::Pending {
+            why: words,
+            retry_after: None,
+        };
+    }
+    settle_trial_at_bound(staging, build, witness, app_root, count, span_ms, error)
+}
+
+/// Disarms `build`'s trial at its bound, without its recovery proof and without a revert. The
+/// build drew a frame (or bound its socket) and ran [`crate::TRIAL_SETTLE_REFUSAL_SPAN`]
+/// awake in this one process, so it is kept; the receipts, the stage and the apply-failure
+/// counters are left as they were, and no success is recorded. The next apply runs its own
+/// stage, identity and start-probe checks.
+///
+/// The predecessor stays at its rollback path, keyed to no process: nothing proved the build
+/// that replaced it, so it is not [`keep_settled_predecessor`]'s to release when this process
+/// ends. The next apply's swap replaces it ([`prepare_fixed_swap_candidate`]); a headless
+/// settle also leaves the window lane open where the trial's identity reads
+/// ([`rearm_window_unproven_trial`]).
+///
+/// Unbounded here, on purpose: a sentinel the filesystem will not remove (a locked flag, a
+/// read-only volume) stays armed and the answer stays `Pending`, said once and re-asked.
+/// `Sentinel::arm_with` renames over that same file, so no lane could arm an update there
+/// either, and removing the install's protection blind is not this lane's to do.
+fn settle_trial_at_bound(
+    staging: &Staging,
+    build: u64,
+    witness: crate::TrialWitness,
+    app_root: &Path,
+    count: u32,
+    span_ms: u64,
+    why: &str,
+) -> crate::BootHealthVerdict {
+    if !trial_armed_for(staging, build) {
+        forget_trial_refusals(staging);
+        return crate::BootHealthVerdict::NO_TRIAL;
+    }
+    let digest = trial_digest(staging, build);
+    let minutes = span_ms / 60_000;
+    if let Err(error) = boot_sentinel(staging).confirm() {
+        let line = format!(
+            "build {build}'s update trial reached its bound ({count} refusals over {minutes} \
+             min awake: {why}) but its sentinel could not be removed: {error}"
+        );
+        let said = with_trial_refusals(|streaks| {
+            streaks
+                .get_mut(&staging.root)
+                .is_none_or(|streak| std::mem::replace(&mut streak.disarm_said, true))
+        });
+        if !said {
+            crate::warn(&line);
+            crate::status::record(staging, build, &line);
+        }
+        // The streak is kept, so the next ask retries the removal without a new span.
+        return crate::BootHealthVerdict::Pending {
+            why: line,
+            retry_after: None,
+        };
+    }
+    clear_trial_identity(staging);
+    clear_window_unproven(staging);
+    let rollback = rollback_path(app_root);
+    // Without the record the window lane stays shut, and the predecessor stays where it is
+    // all the same.
+    let (checkpoint, window_lane_open) = match witness {
+        crate::TrialWitness::Window => ("window", false),
+        crate::TrialWitness::Headless => (
+            "headless",
+            !digest.is_empty()
+                && WindowUnproven {
+                    build,
+                    digest,
+                    at: unix_now_secs(),
+                    install_root: app_root.to_path_buf(),
+                }
+                .record(staging)
+                .is_ok(),
+        ),
+    };
+    // An earlier settle's record must not release this predecessor.
+    clear_kept_predecessor(staging);
+    reclaim_swapped_out_orphan(staging);
+    crate::health::Health::record_trial_settled_unproven(&staging.health());
+    let line = format!(
+        "settled build {build}'s update trial unproven at its {checkpoint} checkpoint: recovery \
+         proof refused {count}x over {minutes} min awake ({why}); the previous build stays at \
+         {} until {}; updates re-enabled",
+        rollback.display(),
+        if window_lane_open {
+            "a window of this build confirms or reverts it, or the next update replaces it"
+        } else {
+            "the next update replaces it"
+        }
+    );
+    crate::warn(&line);
+    crate::status::record(staging, build, &line);
+    forget_trial_refusals(staging);
+    crate::BootHealthVerdict::SettledUnproven { build, why: line }
+}
+
+/// The answer when a proof passed but its sentinel could not be removed: re-asked, and no
+/// refusal of the proof's, so it is not counted and it ends the streak (a refusal a pass
+/// followed did not last).
+fn disarm_failed(staging: &Staging, error: &str) -> crate::BootHealthVerdict {
+    forget_trial_refusals(staging);
+    crate::BootHealthVerdict::Pending {
+        why: format!("the recovery proof passed, but the sentinel could not be removed: {error}"),
+        retry_after: None,
     }
 }
 
@@ -5204,17 +6220,35 @@ fn confirm_health_under_apply_lock_with_proof(
     staging: &Staging,
     current_build: u64,
     app_root: &Path,
-    prove: impl FnOnce() -> Result<(), String>,
-) -> bool {
-    if !confirm_trial_health_after_proof(staging, current_build, crate::TrialWitness::Window, prove)
-    {
-        return false;
+    now: ProbeClock,
+    prove: impl FnOnce() -> Result<(), ProofRefusal>,
+) -> crate::BootHealthVerdict {
+    match confirm_trial_health_after_proof(staging, current_build, prove) {
+        TrialProof::Settled => {}
+        TrialProof::Gone => {
+            forget_trial_refusals(staging);
+            return crate::BootHealthVerdict::NO_TRIAL;
+        }
+        TrialProof::Refused(refusal) => {
+            return refused_confirmation(
+                staging,
+                current_build,
+                crate::TrialWitness::Window,
+                app_root,
+                &refusal,
+                now,
+            );
+        }
+        TrialProof::DisarmFailed(error) => return disarm_failed(staging, &error),
     }
+    forget_trial_refusals(staging);
     let _ = std::fs::remove_file(trial_window_launch_path(staging));
     clear_window_unproven(staging);
     keep_settled_predecessor(staging, &rollback_path(app_root));
     reclaim_swapped_out_orphan(staging);
-    true
+    crate::BootHealthVerdict::Confirmed {
+        settled: Some(current_build),
+    }
 }
 
 fn reclaim_swapped_out_orphan(staging: &Staging) {
@@ -5311,7 +6345,7 @@ fn release_kept_predecessor(
     if KeptPredecessor::read(staging).is_none_or(|kept| !kept.holder.has_ended()) {
         return;
     }
-    if let Ok(_apply_lock) = FileLock::acquire_within(&staging.apply_lock, lock_wait) {
+    if let Ok(_apply_lock) = crate::take_apply_lock(&staging.apply_lock, lock_wait) {
         release_kept_predecessor_under_apply_lock(staging, runs_from);
     }
 }
@@ -5359,19 +6393,31 @@ fn confirm_headless_keeping_predecessor(
     staging: &Staging,
     current_build: u64,
     app_root: &Path,
-    prove: impl FnOnce() -> Result<(), String>,
-) -> bool {
+    now: ProbeClock,
+    prove: impl FnOnce() -> Result<(), ProofRefusal>,
+) -> crate::BootHealthVerdict {
     let digest = crate::manifest::FailedMark::read(&staging.trial())
         .filter(|trial| trial.build_number == current_build)
         .and_then(|trial| canonical_digest(&trial.sha256));
-    if !confirm_trial_health_after_proof(
-        staging,
-        current_build,
-        crate::TrialWitness::Headless,
-        prove,
-    ) {
-        return false;
+    match confirm_trial_health_after_proof(staging, current_build, prove) {
+        TrialProof::Settled => {}
+        TrialProof::Gone => {
+            forget_trial_refusals(staging);
+            return crate::BootHealthVerdict::NO_TRIAL;
+        }
+        TrialProof::Refused(refusal) => {
+            return refused_confirmation(
+                staging,
+                current_build,
+                crate::TrialWitness::Headless,
+                app_root,
+                &refusal,
+                now,
+            );
+        }
+        TrialProof::DisarmFailed(error) => return disarm_failed(staging, &error),
     }
+    forget_trial_refusals(staging);
     let _ = std::fs::remove_file(trial_window_launch_path(staging));
     let record = digest.map(|digest| WindowUnproven {
         build: current_build,
@@ -5403,7 +6449,9 @@ fn confirm_headless_keeping_predecessor(
         }
     }
     reclaim_swapped_out_orphan(staging);
-    true
+    crate::BootHealthVerdict::Confirmed {
+        settled: Some(current_build),
+    }
 }
 
 #[cfg(test)]
@@ -5411,15 +6459,19 @@ fn confirm_health_under_apply_lock(
     staging: &Staging,
     current_build: u64,
     current_commit: Option<&str>,
-    installed_app: Option<&Path>,
-) -> bool {
-    let Some(app_root) = installed_app else {
-        return false;
-    };
-    confirm_health_under_apply_lock_with_proof(staging, current_build, app_root, || {
-        // The hard health-commit gate, as `confirm_boot_health_at` runs it.
-        ensure_current_trial_receipt(staging, app_root, current_build, current_commit).map(|_| ())
-    })
+    app_root: &Path,
+) -> crate::BootHealthVerdict {
+    confirm_health_under_apply_lock_with_proof(
+        staging,
+        current_build,
+        app_root,
+        ProbeClock::now(),
+        || {
+            // The hard health-commit gate, as `confirm_boot_health_verdict_at` runs it.
+            ensure_current_trial_receipt(staging, app_root, current_build, current_commit)
+                .map(|_| ())
+        },
+    )
 }
 
 /// How many launches the boot sentinel has counted for `build` (0 when it is armed for another
@@ -5837,7 +6889,7 @@ fn trial_give_back_lock(
     {
         return GiveBackLock::NotOurs;
     }
-    match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
+    match crate::take_apply_lock(&staging.apply_lock, lock_wait) {
         Ok(lock) => GiveBackLock::Held(lock),
         Err(error) => {
             crate::warn(&format!(
@@ -5849,29 +6901,81 @@ fn trial_give_back_lock(
     }
 }
 
-/// Confirms the running build reached a healthy checkpoint (window up / first frame): clears the
-/// boot sentinel, keeps the retained rollback bundle for the window that started from it
-/// ([`kept_predecessor_path`]) and GCs the orphaned post-swap copy.
+/// The words for a process whose install does not resolve: nothing can say whose trial it is.
+const UNRESOLVED_INSTALL: &str = "this process does not run from an install it can resolve";
+
+/// Asks whether the running build's boot trial is settled ([`crate::BootHealthVerdict`]).
+///
+/// At a `checkpoint` (a window's first frame, a headless instance's control socket) it runs
+/// the trial's recovery proof under the apply lock: a pass clears the boot sentinel, keeps
+/// the retained rollback bundle for the window that started from it
+/// ([`kept_predecessor_path`]) and GCs the orphaned post-swap copy. A refused proof is
+/// retried, and settled without the proof and without a revert at
+/// [`crate::TRIAL_SETTLE_AFTER_REFUSALS`] refusals spanning
+/// [`crate::TRIAL_SETTLE_REFUSAL_SPAN`] of awake time in this process
+/// ([`refused_confirmation`]). Before a checkpoint it reads only, so a process that owes no
+/// trial is confirmed without drawing.
+///
+/// Unbounded, and named in the answer's words: an armed trial whose window never draws is
+/// never asked at a checkpoint and stays `Pending` (disarming it would end the revert a
+/// build that cannot draw needs; reverting it would revert a possibly healthy build); a
+/// sentinel the filesystem will not remove ([`settle_trial_at_bound`]); a refusal that says
+/// the installed bundle is not the running build while its predecessor verifies, which is
+/// left to the launch count's revert ([`refused_confirmation`]); and a process with no awake
+/// clock, whose refusals span nothing ([`count_trial_refusal`]).
+/// [`WINDOW_TRIAL_HEADLESS_WAIT`] stays on the wall clock.
+///
+/// A checkpoint ask also releases an ended window's kept predecessor, which is no trial
+/// state; an ask before one locks, writes and removes nothing.
 #[must_use]
 pub fn confirm_boot_health(
     current_build: u64,
     current_commit: Option<&str>,
     witness: crate::TrialWitness,
-) -> bool {
+    checkpoint: bool,
+) -> crate::BootHealthVerdict {
     let Some(staging) = Staging::resolve() else {
-        return true;
+        return crate::BootHealthVerdict::NO_TRIAL;
     };
-    release_kept_predecessor(&staging, APPLY_LOCK_WAIT, process_uses);
-    confirm_boot_health_at(
+    confirm_boot_health_in(
         &staging,
         current_build,
         current_commit,
         witness,
+        checkpoint,
         bundle::resolve_layout,
+        process_uses,
+    )
+}
+
+/// [`confirm_boot_health`] in `staging`, with the installed bundle and the process scan as
+/// the seams a test replaces.
+fn confirm_boot_health_in(
+    staging: &Staging,
+    current_build: u64,
+    current_commit: Option<&str>,
+    witness: crate::TrialWitness,
+    checkpoint: bool,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    runs_from: impl Fn(&Path) -> Option<bool>,
+) -> crate::BootHealthVerdict {
+    if checkpoint {
+        release_kept_predecessor(staging, APPLY_LOCK_WAIT, runs_from);
+    }
+    confirm_boot_health_verdict_at(
+        staging,
+        current_build,
+        current_commit,
+        witness,
+        checkpoint,
+        ProbeClock::now(),
+        resolve_installed,
         APPLY_LOCK_WAIT,
     )
 }
 
+/// A checkpoint ask at the current time, as whether it opens the caller's gate.
+#[cfg(test)]
 fn confirm_boot_health_at(
     staging: &Staging,
     current_build: u64,
@@ -5880,10 +6984,39 @@ fn confirm_boot_health_at(
     resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
     lock_wait: std::time::Duration,
 ) -> bool {
-    confirm_boot_health_at_with_proof(
+    confirm_boot_health_verdict_at(
+        staging,
+        current_build,
+        current_commit,
+        witness,
+        true,
+        ProbeClock::now(),
+        resolve_installed,
+        lock_wait,
+    )
+    .opens_gate()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the ask's identity, its checkpoint and clock, and the two seams a test replaces"
+)]
+fn confirm_boot_health_verdict_at(
+    staging: &Staging,
+    current_build: u64,
+    current_commit: Option<&str>,
+    witness: crate::TrialWitness,
+    checkpoint: bool,
+    now: ProbeClock,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    lock_wait: std::time::Duration,
+) -> crate::BootHealthVerdict {
+    confirm_boot_health_verdict_at_with_proof(
         staging,
         current_build,
         witness,
+        checkpoint,
+        now,
         resolve_installed,
         lock_wait,
         |app_root| {
@@ -5893,6 +7026,9 @@ fn confirm_boot_health_at(
     )
 }
 
+/// A checkpoint ask at the current time with `prove` as its proof, as whether it opens the
+/// caller's gate.
+#[cfg(test)]
 fn confirm_boot_health_at_with_proof(
     staging: &Staging,
     current_build: u64,
@@ -5901,35 +7037,109 @@ fn confirm_boot_health_at_with_proof(
     lock_wait: std::time::Duration,
     prove: impl FnOnce(&Path) -> Result<(), String>,
 ) -> bool {
-    // No trial armed for this build: already complete. A different build's marker is
+    confirm_boot_health_verdict_at_with_proof(
+        staging,
+        current_build,
+        witness,
+        true,
+        ProbeClock::now(),
+        resolve_installed,
+        lock_wait,
+        |app_root| prove(app_root).map_err(ProofRefusal::from),
+    )
+    .opens_gate()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the ask's identity, its checkpoint and clock, and the three seams a test replaces"
+)]
+fn confirm_boot_health_verdict_at_with_proof(
+    staging: &Staging,
+    current_build: u64,
+    witness: crate::TrialWitness,
+    checkpoint: bool,
+    now: ProbeClock,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    lock_wait: std::time::Duration,
+    prove: impl FnOnce(&Path) -> Result<(), ProofRefusal>,
+) -> crate::BootHealthVerdict {
+    use crate::BootHealthVerdict as Verdict;
+
+    // No trial armed for this build: nothing is owed. A different build's marker is
     // not ours to retry or mutate. An unreadable marker of this build's trial is
     // still its trial (`trial_armed_for`).
     if !trial_armed_for(staging, current_build) {
-        return true;
+        forget_trial_refusals(staging);
+        return Verdict::NO_TRIAL;
     }
-    let Ok(_apply_lock) = FileLock::acquire_within(&staging.apply_lock, lock_wait) else {
-        crate::warn(&format!(
-            "could not take the apply lock within {}s to confirm build {current_build}'s \
-             boot health (another aterm holds it); the confirmation is retried later",
-            lock_wait.as_secs()
-        ));
-        return false;
+    if !checkpoint {
+        // Read only: no lock, no write, no count. An armed trial this install owns waits for
+        // the checkpoint, however long that takes (unbounded: `confirm_boot_health`).
+        let Some(installed) = resolve_installed() else {
+            return Verdict::Unanswered {
+                why: UNRESOLVED_INSTALL.to_string(),
+            };
+        };
+        if !trial_owned_by(staging, &installed.app_root) {
+            return Verdict::NO_TRIAL;
+        }
+        return Verdict::Pending {
+            why: format!(
+                "build {current_build}'s update trial waits for this {}",
+                match witness {
+                    crate::TrialWitness::Window => "window's first frame",
+                    crate::TrialWitness::Headless => "instance's control socket",
+                }
+            ),
+            retry_after: None,
+        };
+    }
+    let _apply_lock = match crate::take_apply_lock(&staging.apply_lock, lock_wait) {
+        Ok(lock) => lock,
+        Err(error) => {
+            // Every look at a trial asks again, so a holder that stays says this once, not
+            // each look.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::warn(&format!(
+                    "could not take the apply lock within {}s to confirm build \
+                     {current_build}'s boot health (another aterm holds it); the confirmation \
+                     is retried later",
+                    lock_wait.as_secs()
+                ));
+            }
+            // No proof ran: the time to the next refusal spans nothing.
+            interrupt_trial_refusals(staging);
+            return Verdict::Unanswered {
+                why: verify::lock_wait_refusal("health lock", &error),
+            };
+        }
     };
+    if !trial_armed_for(staging, current_build) {
+        forget_trial_refusals(staging);
+        return Verdict::NO_TRIAL;
+    }
     let Some(installed) = resolve_installed() else {
-        return false;
+        interrupt_trial_refusals(staging);
+        return Verdict::Unanswered {
+            why: UNRESOLVED_INSTALL.to_string(),
+        };
     };
     if !trial_owned_by(staging, &installed.app_root) {
-        return true;
+        return Verdict::NO_TRIAL;
     }
     let app_root = installed.app_root.as_path();
     match witness {
-        crate::TrialWitness::Window => {
-            confirm_health_under_apply_lock_with_proof(staging, current_build, app_root, || {
-                prove(app_root)
-            })
-        }
+        crate::TrialWitness::Window => confirm_health_under_apply_lock_with_proof(
+            staging,
+            current_build,
+            app_root,
+            now,
+            || prove(app_root),
+        ),
         crate::TrialWitness::Headless => {
-            match trial_window_launch(staging, current_build, unix_now_secs()) {
+            match trial_window_launch(staging, current_build, now.wall_secs) {
                 WindowLaunch::Waiting { until } => {
                     crate::log(&format!(
                         "build {current_build}'s trial was launched by a window, and a \
@@ -5938,13 +7148,25 @@ fn confirm_boot_health_at_with_proof(
                          until {}",
                         aterm_types::rfc3339::format_rfc3339(until)
                     ));
-                    true
+                    // Asked again at the wait's lapse (on the wall clock, as the wait is),
+                    // when this headless instance may settle it. The trial is a window's
+                    // while the wait lasts: refusals from before it are no streak after it.
+                    forget_trial_refusals(staging);
+                    Verdict::Pending {
+                        why: window_trial_wait_notice(current_build, until),
+                        retry_after: Some(
+                            std::time::Duration::from_secs(until.saturating_sub(now.wall_secs))
+                                .min(HEADLESS_WINDOW_WAIT_RECHECK),
+                        ),
+                    }
                 }
-                WindowLaunch::None | WindowLaunch::Lapsed => {
-                    confirm_headless_keeping_predecessor(staging, current_build, app_root, || {
-                        prove(app_root)
-                    })
-                }
+                WindowLaunch::None | WindowLaunch::Lapsed => confirm_headless_keeping_predecessor(
+                    staging,
+                    current_build,
+                    app_root,
+                    now,
+                    || prove(app_root),
+                ),
             }
         }
     }
@@ -5974,9 +7196,12 @@ fn settle_trials_under_apply_lock(
         {
             escape_wedged_foreign_trial(staging, current_build, armed_build);
         }
-        return Err(ApplyOutcome::Deferred(unconfirmed_trial_refusal(
-            armed_build,
-        )));
+        let refusal = if armed_build == current_build && trial_owned_by(staging, app_root) {
+            refused_trial_refusal(staging, armed_build)
+        } else {
+            unconfirmed_trial_refusal(armed_build)
+        };
+        return Err(ApplyOutcome::Deferred(refusal));
     }
     let _ = foreign_trial_counter(staging).confirm();
     if let ReadyState::Newer(orphaned_ready) = read_ready(staging, current_build)
@@ -6206,7 +7431,7 @@ pub(crate) fn confirm_roster_authorization(
         .and_then(|secs| u64::try_from(secs).ok())
         .ok_or_else(|| format!("the clock could not be read ({confirmed_at:?})"))?;
     let was_waiting = {
-        let _apply_lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+        let _apply_lock = crate::take_apply_lock(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
             .map_err(|error| verify::lock_wait_refusal("confirm lock", &error))?;
         let Some(mut ready) = Ready::read_published_bundle(staging).filter(|still| {
             still.build_number == staged.build_number

@@ -3,6 +3,75 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn a_compiler_that_fails_its_version_print_names_no_pin_commit() {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::sync::Arc;
+
+    use crate::host::{Hosts, fake::FakeHost};
+
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let mut ctx = Ctx::new(
+        tmp.path(),
+        None,
+        None,
+        0,
+        Hosts::single(Arc::new(FakeHost::new())),
+    );
+    ctx.pkg_prefix = tmp.path().join("prefix");
+    let compiler = ctx.pkg_prefix.join("store/trust/8/bin/trustc");
+    for success in [None, Some(false), Some(true)] {
+        let result = installed_pin_commit_with(&ctx, "trust", 8, |cmd| {
+            assert_eq!(cmd.get_program(), compiler.as_os_str());
+            assert_eq!(
+                cmd.get_args().collect::<Vec<_>>(),
+                [std::ffi::OsStr::new("-vV")]
+            );
+            success.map(|success| std::process::Output {
+                status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+                stdout: b"commit-hash: 321aaeda7f00ba\ncommit-date: 2026-09-17\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        });
+        assert_eq!(
+            result,
+            (success == Some(true)).then(|| PinCommit {
+                commit: "321aaeda7".into(),
+                date: Some("2026-09-17".into()),
+            }),
+            "observed success: {success:?}"
+        );
+    }
+}
+
+/// THE RUN'S BARE REPOSITORY IS ONE AGH READS UNDER ANY UMASK: `git init` under umask 002
+/// leaves engine.git 0775 and its config 0664, whose group write bit agh refuses on every
+/// fetch of the engine's main. NEGATIVE CONTROL: without [`owner_written`] the read is
+/// refused as writable.
+#[cfg(unix)]
+#[test]
+fn the_engine_repository_is_one_agh_reads_under_a_group_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let work = aterm_tempfile::Builder::new()
+        .prefix("atpkg-publish-engine-git-")
+        .tempdir()
+        .expect("scratch dir");
+    crate::git::run(work.path(), &["init", "--quiet", "--bare", "engine.git"]).expect("init");
+    let repo = work.path().join("engine.git");
+    for (path, mode) in [(repo.clone(), 0o775), (repo.join("config"), 0o664)] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    owner_written(&repo).expect("the write bits cleared");
+    let read = aterm_uds::private_file::read_owned(&repo, "config", 1 << 16);
+    assert!(read.is_ok(), "{:?}", read.err());
+    let mode = |path: &Path| std::fs::metadata(path).expect("stat").permissions().mode();
+    assert_eq!(
+        (mode(&repo) & 0o7777, mode(&repo.join("config")) & 0o7777),
+        (0o755, 0o644)
+    );
+}
+
 fn ledger(one: &str, two: &str, live: &str, revoked: &str) -> aterm_json::Value {
     aterm_json::from_str::<aterm_json::Value>(&format!(
         "{{\"mappings\":{{\"ay\":{{\"{one}\":{{\"release_rev\":\"d766\"}},\

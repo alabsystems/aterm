@@ -132,6 +132,7 @@ fn standin_halted_run() {
         Seams {
             stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },

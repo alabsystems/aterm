@@ -948,6 +948,64 @@ fn native_only_restore_never_discards_a_seamlessly_adopted_bootstrap() {
     assert!(app.structural_invariants_ok());
 }
 
+/// A private document's Recovery tab in a successor's window 0: the person had no shell there, so
+/// the bootstrap goes. Only an update carries the tab on: a quit or a crash keeps none of it, so a
+/// plain launch later opens a new shell and not this notice alone. CONTROL: any other Recovery tab
+/// is kept by both, since it holds a view that can come back.
+#[cfg(unix)]
+#[test]
+fn a_private_documents_recovery_tab_restores_with_no_shell_and_lasts_only_through_updates() {
+    let mut app = App::headless_for_test();
+    app.handoff_successor = true;
+    let mut row = restore::WindowLayout::lone_workers_list(24, 80);
+    row.stand_in_for_private_documents();
+    app.restore_into_window(WindowId(0), row.clone());
+    let window = &app.windows[&WindowId(0)];
+    assert_eq!(window.tab_set.len(), 1, "only the Recovery tab");
+    assert_eq!(window.tab_set.home(), None, "no list");
+    assert!(window.layouts.is_empty());
+    assert!(app.pool.get(0).is_none(), "the fresh bootstrap retired");
+    let (instance, _) = app
+        .active_native_view(WindowId(0))
+        .expect("the Recovery tab restored");
+    assert_eq!(
+        app.native_runtime.app(instance).expect("its app").kind(),
+        crate::native_app::AppKind::Recovery
+    );
+    assert_eq!(
+        app.capture_handoff_layout().windows[0].restored_tabs,
+        row.restored_tabs,
+        "a later update carries it, whole"
+    );
+    assert!(
+        app.capture_restore_manifest().is_empty(),
+        "a quit or a crash keeps none of it"
+    );
+    assert!(app.structural_invariants_ok());
+
+    let mut app = App::headless_for_test();
+    app.handoff_successor = true;
+    let mut other = row;
+    let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Placeholder(placeholder),
+    } = &mut other.restored_tabs[0].root
+    else {
+        panic!("the stand-in is one Recovery leaf");
+    };
+    placeholder.restore_tag = "some later view".to_string();
+    app.restore_into_window(WindowId(0), other);
+    assert_eq!(
+        app.capture_restore_manifest().windows.len(),
+        1,
+        "CONTROL: another Recovery tab outlives a quit"
+    );
+    assert_eq!(
+        app.capture_handoff_layout().windows[0].restored_tabs.len(),
+        1,
+        "CONTROL: and an update"
+    );
+}
+
 /// A lone Workers list in window 0: the person never had a shell there, so the bootstrap goes and
 /// the list is what stands, with the window's focus.
 #[test]
@@ -1167,6 +1225,7 @@ fn recursive_mixed_restore_keeps_topology_and_substitutes_only_failed_leaf() {
         zoomed: true,
         parked: false,
         ephemeral: false,
+        fleet: false,
     };
     app.restore_into_window(
         wid,
@@ -1250,6 +1309,7 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     zoomed: false,
                     parked: false,
                     ephemeral: false,
+                    fleet: false,
                 },
                 restore::RestoredTab {
                     root: restore::RestoredSplitTree::Split {
@@ -1262,6 +1322,7 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     zoomed: false,
                     parked: false,
                     ephemeral: false,
+                    fleet: false,
                 },
                 restore::RestoredTab {
                     root: restored_terminal(2, "CHARLIE"),
@@ -1269,6 +1330,7 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     zoomed: false,
                     parked: false,
                     ephemeral: false,
+                    fleet: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -1805,6 +1867,7 @@ fn reopening_a_restored_document_focuses_its_leaf_before_revealing_a_line() {
                     zoomed,
                     parked: false,
                     ephemeral: false,
+                    fleet: false,
                 }],
                 ..single_leaf_window(bare_leaf())
             },
@@ -1976,6 +2039,7 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         }],
     }
 }
@@ -2302,6 +2366,7 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         },
         restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
@@ -2309,6 +2374,7 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         },
     ];
     old.restore_into_window(WindowId(0), layout);
@@ -4761,6 +4827,49 @@ fn recovered_shell(owner: u32, local_id: u64) -> crate::spawn::Adopted {
     }
 }
 
+/// With nothing to restore, session 0 is the first adopted shell no quit kept: one the last
+/// window's quit kept past it (the Mac Setup tab's installer, `keeper_link::Claim::kept`) is left
+/// to land as a tab of its own behind the launch's front tab, and a launch whose only adopted
+/// shell is such a one opens its own shell in front of it.
+///
+/// NEGATIVE CONTROL: a crash's orphan alone is session 0, as before.
+#[test]
+fn a_shell_a_quit_kept_never_becomes_session_0() {
+    let kept = |owner: u32, local_id: u64| crate::spawn::Adopted {
+        keeper: Some(
+            crate::keeper_link::Claim::new(u64::from(owner) * 100 + local_id, Some(owner))
+                .keeping(),
+        ),
+        ..handed_off_shell(local_id)
+    };
+    let mut shells = vec![kept(7, 0), recovered_shell(7, 1)];
+    let first = super::take_session0_shell(&mut shells, None).expect("a session 0");
+    assert_eq!(
+        first.local_id, 1,
+        "the crash's orphan, not the kept install"
+    );
+    assert_eq!(
+        shells
+            .iter()
+            .map(|shell| shell.local_id)
+            .collect::<Vec<_>>(),
+        [0],
+        "the kept install waits to land as a tab of its own"
+    );
+    let mut alone = vec![kept(7, 2)];
+    assert!(
+        super::take_session0_shell(&mut alone, None).is_none(),
+        "the launch opens its own shell in front"
+    );
+    assert_eq!(alone.len(), 1, "and the kept install lands behind it");
+    let mut crashed = vec![recovered_shell(7, 3)];
+    assert_eq!(
+        super::take_session0_shell(&mut crashed, None).map(|shell| shell.local_id),
+        Some(3),
+        "CONTROL: a crash's orphan is session 0"
+    );
+}
+
 fn whose(shell: &crate::spawn::Adopted) -> Option<(Option<u32>, u64)> {
     shell
         .keeper
@@ -5447,6 +5556,7 @@ fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
                 zoomed: false,
                 parked: false,
                 ephemeral: false,
+                fleet: false,
             }
         })
         .collect();
@@ -6365,6 +6475,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = timed_session(&app, passed).expect("the spawned shell carries the pair");
@@ -6430,6 +6541,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6449,6 +6561,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6584,6 +6697,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = app
@@ -6627,6 +6741,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         };
         app.restore_closed_tab_into_window(WindowId(0), &record, 1)
             .expect("reopened");
@@ -6700,6 +6815,7 @@ fn a_setter_beside_a_word_this_build_cannot_read_is_not_stored() {
             zoomed: false,
             parked: false,
             ephemeral: false,
+            fleet: false,
         });
         app.restore_into_window(WindowId(0), layout);
         let session = app
@@ -6881,6 +6997,7 @@ fn lineage_tab(local: u64, sid: Option<&str>, lineage: Option<&str>) -> restore:
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     }
 }
 
@@ -6963,6 +7080,7 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
                     zoomed: false,
                     parked: false,
                     ephemeral: false,
+                    fleet: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -8497,6 +8615,7 @@ fn a_parked_tab_comes_back_parked_behind_the_shown_tabs_with_its_list_opened_aga
         zoomed: false,
         parked,
         ephemeral: parked,
+        fleet: false,
     };
     app.restore_into_window(
         wid,
@@ -8626,10 +8745,13 @@ fn a_parked_workers_record_crosses_a_cold_restart() {
 /// A RESTORED WORKER'S TAB KEEPS ITS BITS ONLY WITH A RECORD: a parked tab comes back parked and
 /// marked, one in the strip marked, and a parked tab an older build wrote with no mark comes back
 /// marked, since every parked tab is a worker's. CONTROL: a tab with no record, or one whose
-/// record does not read, comes back a person's: it would have no row to say what it is.
+/// record does not read, comes back a person's: it would have no row to say what it is. A fleet
+/// drive's tab is a request's with no record (a drive's plain shell has none), and comes back
+/// parked, marked and the drive's (the requests design (2026-11-09) §6); in the strip as a person's
+/// it is a person's.
 #[test]
 fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
-    let bits_of = |task: Option<&str>, parked: bool, ephemeral: bool| {
+    let fleet_bits = |task: Option<&str>, parked: bool, ephemeral: bool, fleet: bool| {
         let record = restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
                 restore::TerminalLeafRestore {
@@ -8642,6 +8764,7 @@ fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
             zoomed: false,
             parked,
             ephemeral,
+            fleet,
         };
         let mut app = App::headless_for_test();
         let wid = *app.windows.keys().next().expect("a window");
@@ -8653,7 +8776,12 @@ fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
                 crate::app_restore::LeafIds::Retired,
             )
             .expect("built");
-        (tab.parked, tab.ephemeral)
+        (tab.parked, tab.ephemeral, tab.fleet)
+    };
+    let bits_of = |task: Option<&str>, parked: bool, ephemeral: bool| {
+        let (parked, ephemeral, fleet) = fleet_bits(task, parked, ephemeral, false);
+        assert!(!fleet);
+        (parked, ephemeral)
     };
     let row = Some("rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0");
     assert_eq!(bits_of(row, true, true), (true, true));
@@ -8675,6 +8803,21 @@ fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
             (false, false)
         );
     }
+    assert_eq!(
+        fleet_bits(None, true, true, true),
+        (true, true, true),
+        "a drive's plain shell stays parked"
+    );
+    assert_eq!(
+        fleet_bits(row, true, true, true),
+        (true, true, true),
+        "a drive's worker"
+    );
+    assert_eq!(
+        fleet_bits(None, false, false, true),
+        (false, false, false),
+        "kept as a person's"
+    );
 }
 
 /// A RESTORED WORKER WHOSE AGENT DOES NOT COME BACK READS EXITED, on each path the window sees: no

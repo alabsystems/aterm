@@ -121,7 +121,7 @@ pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
 pub use ink_ledger::letter_bar;
 pub(crate) use ink_ledger::{
-    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret, foot_ring_light,
+    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret, foot_ring,
 };
 #[cfg(any(test, debug_assertions))]
 pub use ink_ledger::{with_aa_unrounded, with_share_over_aa};
@@ -923,6 +923,14 @@ pub struct CursorGlow {
     /// a page shade ([`bed::BedScratch::shade_runs`]).
     #[cfg(any(test, debug_assertions))]
     lit_body_weighed: bool,
+    /// A test's negative control: a rail with no lane past a foot laid as a
+    /// thread on its row's last pixel ([`Self::set_rail_threaded`]).
+    #[cfg(any(test, debug_assertions))]
+    rail_threaded: bool,
+    /// A test's negative control: a deep cell's foot leaving a rail the light
+    /// its glyph's raster reads ([`Self::set_deep_light_rastered`]).
+    #[cfg(any(test, debug_assertions))]
+    deep_light_rastered: bool,
     /// Test-only: a bar caret's rail laid to its cell's far edge, as under a
     /// block, past the bar (the after-land judge's bar low's negative
     /// control, [`bed::BedScratch::bar`]).
@@ -1320,6 +1328,8 @@ pub struct CursorGlow {
     keep_letters_scratch: Vec<(i32, i32, i32, i32)>,
     /// This frame's probed rows' feet, window pixels ([`Self::foot_boxes`]).
     keep_feet_scratch: Vec<(i32, i32, i32, i32)>,
+    /// What lies round each of those feet ([`Self::foot_ink`]), for the ribbon's rail.
+    keep_foot_ink_scratch: Vec<bed::FootInk>,
     /// The grid origin and cell width the last keep-out was laid by, for the
     /// word icons' shade ([`Self::shade_word_icons`]).
     keep_geom: Option<(i32, i32, i32)>,
@@ -2469,6 +2479,24 @@ impl CursorGlow {
     #[inline]
     pub const fn set_lit_body_a_shade(&mut self, on: bool) {
         self.lit_body_weighed = !on;
+    }
+
+    /// A test's negative control: `on`, a rail with no lane past a foot (on a grid's last row)
+    /// is laid as a thread on the row's last pixel, as before the forward round's W9; off (as
+    /// shipped), it keeps its foot band ([`bed::RowFeet::lane`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_rail_threaded(&mut self, on: bool) {
+        self.rail_threaded = on;
+    }
+
+    /// A test's negative control: `on`, a cell the frame lays deep ink in leaves a rail with no
+    /// lane the light its glyph's raster reads, as before the forward round's M-M4; off (as
+    /// shipped), none ([`Self::foot_ink`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_deep_light_rastered(&mut self, on: bool) {
+        self.deep_light_rastered = on;
     }
 
     /// Whether a typed light lives its tuned life whatever the duration

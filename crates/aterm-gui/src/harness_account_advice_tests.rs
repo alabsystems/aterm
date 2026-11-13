@@ -464,9 +464,28 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         (0, 0),
         false,
     );
+    // The card states the pause in its one sentence where it has one, never the finding; the
+    // finding is in the details the card's Copy details item copies. The retired decision's
+    // stay word does not outlive it.
+    assert_eq!(paused.stay, None);
     let menu = &app.autopilot_menu.as_ref().unwrap().rows;
-    assert!(menu.iter().any(|row| matches!(row,
-        crate::autopilot_menu::MenuRow::Note { text, .. } if text == SESSION_AUTOPILOT_OFF_FINDING)));
+    assert!(
+        menu.iter()
+            .all(|row| { row.text() != SESSION_AUTOPILOT_OFF_FINDING })
+    );
+    let report = crate::fact_menu::details_report(
+        &app.fact_menu_facts(local, crate::claude_lights::Fact::Account),
+    );
+    assert!(
+        report
+            .lines()
+            .any(|line| line == SESSION_AUTOPILOT_OFF_FINDING),
+        "{report}"
+    );
+    assert!(
+        report.contains("Automatic switching: Paused for this tab."),
+        "{report}"
+    );
     let lab = app.harness_state().lab;
     let lab = lab
         .sessions

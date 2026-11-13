@@ -22,6 +22,10 @@ fn operation_deadline_expires_at_the_boundary_and_cannot_outlive_cancellation() 
 #[test]
 fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
     const CHILD: &str = "ATERM_OPERATION_CANCEL_TEST_CHILD";
+    // The watcher may cancel as soon as the witness appears. Rename a
+    // complete record into place so cancellation cannot leave an empty PID.
+    const PUBLISH_PID: &str =
+        r#"printf '%s\n' "$$" > "$0.tmp" && /bin/mv "$0.tmp" "$0" && exec "$1" 600"#;
     if std::env::var_os(CHILD).is_some() {
         use std::os::fd::OwnedFd;
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -43,7 +47,7 @@ fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
         let mut cmd = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(
             std::path::Path::new("/bin/sh"),
         ));
-        cmd.args(["-c", "printf '%s\\n' \"$$\" > \"$0\"; exec \"$1\" 600"])
+        cmd.args(["-c", PUBLISH_PID])
             .arg(&witness)
             .arg(aterm_uds::deadline::stand_in(std::path::Path::new(
                 "/bin/sleep",
@@ -84,7 +88,7 @@ fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
             let mut cmd = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(
                 std::path::Path::new("/bin/sh"),
             ));
-            cmd.args(["-c", "printf '%s\\n' \"$$\" > \"$0\"; exec \"$1\" 600"])
+            cmd.args(["-c", PUBLISH_PID])
                 .arg(path)
                 .arg(aterm_uds::deadline::stand_in(std::path::Path::new(
                     "/bin/sleep",

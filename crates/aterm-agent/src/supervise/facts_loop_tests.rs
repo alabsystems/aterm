@@ -17,10 +17,11 @@ fn hung(birth: u64) -> BackgroundCall {
         pid: 27098,
         pgid: 27098,
         birth: Some(birth),
-        exe: PLANT.to_string(),
+        episode: 1,
         task: Some(PLANT.to_string()),
         quiet_ms: 31 * MIN.unsigned_abs(),
         wait: Some(PLANT.to_string()),
+        held_by: None,
     }
 }
 
@@ -312,7 +313,11 @@ impl<'a> Run<'a> {
             }
             let told = asked
                 .iter()
-                .map(|&birth| s.facts.state.is_told(EpisodeKey::no_progress(27098, birth)))
+                .map(|&birth| {
+                    s.facts
+                        .state
+                        .is_told(EpisodeKey::no_progress(27098, birth, 1))
+                })
                 .collect();
             (heard.noted.clone(), told)
         };
@@ -387,7 +392,13 @@ fn a_hung_call_is_told_once_per_episode_across_both_doors() {
         match i {
             3 => *host.facts.lock().expect("facts") = Some(vec![hung(REBORN)]),
             4 => *host.facts.lock().expect("facts") = Some(Vec::new()),
-            5 => *host.facts.lock().expect("facts") = Some(vec![hung(REBORN)]),
+            5 => {
+                let again = BackgroundCall {
+                    episode: 2,
+                    ..hung(REBORN)
+                };
+                *host.facts.lock().expect("facts") = Some(vec![again]);
+            }
             _ => {}
         }
     });
@@ -400,11 +411,11 @@ fn a_hung_call_is_told_once_per_episode_across_both_doors() {
         "{sent:#?}"
     );
     assert!(rode(3, REBORN), "another birth: {sent:#?}");
-    assert!(rode(5, REBORN), "over, then quiet again: {sent:#?}");
+    assert!(rode(5, REBORN), "progress, then a new run: {sent:#?}");
     assert_eq!(
         rider.told,
-        [false, true],
-        "the first ended, the second told"
+        [true, true],
+        "a run told stays told after it ends: it never comes back"
     );
     assert!(rider.facts("break").is_empty(), "{:#?}", rider.ran.noted);
     let informed: Vec<&String> = rider
@@ -413,13 +424,9 @@ fn a_hung_call_is_told_once_per_episode_across_both_doors() {
         .iter()
         .filter(|c| c.starts_with("inform "))
         .collect();
-    assert_eq!(
-        informed,
-        [BORN, REBORN, REBORN]
-            .map(|b| format!("inform {}", stuck(b)))
-            .iter()
-            .collect::<Vec<_>>(),
-        "the person's record of each fact told"
+    assert!(
+        informed.is_empty(),
+        "a fact told the agent is no record for a person: {informed:#?}"
     );
     let words = |rows: &[(String, String, String)]| -> Vec<(String, String)> {
         rows.iter()
@@ -518,7 +525,7 @@ fn the_stuck_fact_goes_after_the_hosts_notice_and_before_the_due_nudge() {
     let calls = &ran.ran.calls;
     let at_call = |c: &str| calls.iter().position(|k| k == c);
     let notice = at_call("at_background").expect("the notice");
-    let line = at_call(&format!("inform {}", stuck(BORN))).expect("the stuck line told");
+    let line = at_call("break_taken").expect("the stuck line's break taken");
     let paced = at_call(&format!("occupancy_pace {NUDGE}")).expect("the nudge's write");
     assert!(notice < line && line < paced, "{calls:#?}");
 }
@@ -1360,3 +1367,86 @@ fn the_overlap_waits_behind_a_hung_calls_fact() {
 
 #[path = "occupancy_wake_ride_tests.rs"]
 mod wake_ride;
+
+/// A second call that is not progressing, in the same group's place.
+fn other_hung() -> BackgroundCall {
+    BackgroundCall {
+        pid: 31008,
+        pgid: 31000,
+        ..hung(BORN)
+    }
+}
+
+/// AT MOST ONE LINE A QUIET PERIOD (rule 3): a call at no progress told at a break closes the
+/// quiet period; a second call at no progress found at the next break, past the line's pace, is
+/// told only once the agent has run a turn of its own since. NEGATIVE CONTROL: with no turn
+/// between, the second call is never typed.
+#[test]
+fn a_second_call_at_no_progress_waits_for_the_agents_own_turn() {
+    let at = |m: i64, step| (m * 60, step);
+    let second = templates::stuck_line(&other_hung().told());
+    for turn in [true, false] {
+        let run = Run::new(
+            "facts-quiet-period",
+            keyed(Occupancy::Off, true),
+            &[at(0, Step::Break), at(25, Step::Break), at(50, Step::Break)],
+        );
+        let ran = run.run(&[BORN], &mut |s, host, i| {
+            if i == 1 {
+                *host.facts.lock().expect("facts") = Some(vec![hung(BORN), other_hung()]);
+            }
+            if i == 2 && turn {
+                took(s);
+            }
+        });
+        assert_eq!(ran.sent[0], [stuck(BORN)], "{:#?}", ran.ran.noted);
+        assert!(
+            ran.sent[1].is_empty(),
+            "one a quiet period: {:#?}",
+            ran.sent
+        );
+        if turn {
+            assert_eq!(
+                ran.sent[2],
+                std::slice::from_ref(&second),
+                "{:#?}",
+                ran.ran.noted
+            );
+        } else {
+            assert!(ran.sent[2].is_empty(), "CONTROL: {:#?}", ran.sent);
+        }
+    }
+}
+
+/// NOTHING IS TYPED WHILE ANOTHER CALL WILL WAKE THE AGENT (rule 4): with another live call of the
+/// agent's standing, a call at no progress is not typed at a break; the ledger books it skipped,
+/// `why=other-wait`, once however many breaks see it. NEGATIVE CONTROL: once it is the only call
+/// left, the next break types it.
+#[test]
+fn a_call_at_no_progress_is_journaled_not_typed_while_another_call_stands() {
+    let at = |m: i64, step| (m * 60, step);
+    let run = Run::new(
+        "facts-other-wait",
+        keyed(Occupancy::Off, true),
+        &[at(0, Step::Break), at(1, Step::Break), at(25, Step::Break)],
+    );
+    *run.host.waiting.lock().expect("waiting") = 1;
+    let ran = run.run(&[BORN], &mut |_, host, i| {
+        if i == 2 {
+            *host.waiting.lock().expect("waiting") = 0;
+        }
+    });
+    assert!(
+        ran.sent[0].is_empty() && ran.sent[1].is_empty(),
+        "{:#?}",
+        ran.sent
+    );
+    let withheld: Vec<_> = ran
+        .rows()
+        .into_iter()
+        .filter(|(_, _, reason)| reason.contains("why=other-wait"))
+        .collect();
+    assert_eq!(withheld.len(), 1, "journaled once: {:#?}", ran.rows());
+    assert_eq!(ran.sent[2], [stuck(BORN)], "CONTROL: {:#?}", ran.ran.noted);
+    assert_eq!(ran.told, [true]);
+}

@@ -118,6 +118,9 @@ mod cold_admission;
 #[path = "accounts_pool_claims_tests.rs"]
 mod claims;
 
+#[path = "accounts_pool_login_seen_tests.rs"]
+mod login_seen;
+
 #[path = "accounts_pool_reconciled_tests.rs"]
 mod reconciled;
 
@@ -650,6 +653,11 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         (Cli::Grok, false),
         (Cli::Kimi, true),
     ] {
+        // A Kimi move's line runs in an overlay home, which aterm makes only where it makes
+        // links.
+        if !crate::harness::accounts_overlay::links_here(cli) {
+            continue;
+        }
         let world = World::new(&format!("early-{}", cli.id()));
         world.two(cli);
         world.on_main(cli, &[]);
@@ -2508,4 +2516,60 @@ fn a_codex_session_on_a_build_that_keeps_no_rows_login_is_not_moved() {
     );
     let held = plan(false, &Point::TurnEnd, true);
     assert!(matches!(held, Advice::Wait { .. }), "{held:?}");
+}
+
+/// A COLD START'S ROW IS THE ACCOUNT ITS LOGIN FILE NAMES, NOT THE ROW WITH NO DIRECTORY BY
+/// ASSUMPTION: a plain start in a home whose `.claude.json` names `work-2`'s address runs on
+/// `work-2`, one whose file names an address no row lists runs on no row (so no cold pick charges,
+/// leases or rotates away from `main`), and only where nothing is read does the belief stand.
+/// Another CLI's login file is not observed, so its row is the belief.
+/// NEGATIVE CONTROL: with `cold_row` returning the belief (`judged_label`) alone, the home that
+/// holds unicorn reads `main`: `left: Some("main") right: Some("work-2")`.
+#[test]
+fn a_cold_start_runs_on_the_row_its_login_file_names() {
+    let home = aterm_tempfile::TempDir::new().expect("tempdir");
+    let roster = Roster {
+        rows: [
+            ("main", None, "bronto@example.test"),
+            ("work-2", Some("/accounts/work-2"), "unicorn@example.test"),
+        ]
+        .map(|(label, dir, email)| Row {
+            label: label.to_owned(),
+            dir: dir.map(str::to_owned),
+            email: Some(email.to_owned()),
+            ..Row::default()
+        })
+        .into(),
+    };
+    let plain = accounts::ProcessLogin::of_env(std::iter::empty::<(&str, &str)>());
+    let row = |cli: Cli, email: Option<&str>| {
+        let profile = home.path().join(".claude.json");
+        match email {
+            Some(email) => std::fs::write(
+                &profile,
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#),
+            )
+            .expect("profile"),
+            None => {
+                let _ = std::fs::remove_file(&profile);
+            }
+        }
+        cold_row(cli, &roster, &plain, &[], home.path()).map(|row| row.label.as_str())
+    };
+    assert_eq!(row(Cli::Claude, Some("bronto@example.test")), Some("main"));
+    assert_eq!(
+        row(Cli::Claude, Some("unicorn@example.test")),
+        Some("work-2")
+    );
+    assert_eq!(row(Cli::Claude, Some("stranger@example.test")), None);
+    assert_eq!(
+        row(Cli::Claude, None),
+        Some("main"),
+        "nothing read: the belief"
+    );
+    assert_eq!(
+        row(Cli::Codex, Some("unicorn@example.test")),
+        Some("main"),
+        "Codex's login file is not Claude Code's"
+    );
 }

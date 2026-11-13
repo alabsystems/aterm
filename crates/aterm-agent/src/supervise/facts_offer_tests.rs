@@ -26,16 +26,18 @@ fn call(pid: u32, min: u64) -> BackgroundCall {
         pid,
         pgid: pid,
         birth: Some(u64::from(pid) * 1_000),
-        exe: "python3".into(),
+        episode: 1,
         task: None,
         quiet_ms: min * 60_000,
         wait: None,
+        held_by: None,
     }
 }
 
 /// A reading taken at `as_of_ms` naming `calls`.
 fn reading(as_of_ms: i64, calls: &[BackgroundCall]) -> FactsReading {
     FactsReading {
+        waiting: 0,
         as_of_ms,
         no_progress: calls.to_vec(),
         held: None,
@@ -276,15 +278,20 @@ fn a_reading_too_old_to_tell_offers_nothing() {
     );
 }
 
-/// A CLOSED RUN IS FORGOTTEN AND THE NEXT ONE OFFERED: a told call that a fresh reading no
-/// longer names (it made progress) is offered again once it stalls again; and an offer whose
-/// call a fresh reading no longer names is dropped, so its next run is any reader's at once.
-/// Kills M11 (no observe).
+/// A CLOSED RUN IS NOT TOLD AGAIN AND THE NEXT ONE IS OFFERED: a told call that a fresh reading
+/// no longer names stays told (a reading that dips is the same run), and its next run (the
+/// engine's next episode, opened by progress) is offered; an offer whose call a fresh reading no
+/// longer names is dropped, so its next run is any reader's at once. Kills M11 (no observe).
 #[test]
-fn a_closed_run_is_forgotten_and_the_next_one_offered() {
+fn a_closed_run_is_not_told_again_and_the_next_one_offered() {
     let a = call(700, 9);
+    let next = BackgroundCall {
+        episode: 2,
+        ..a.clone()
+    };
     let mut acc = SelfClaimFacts::default();
     let stalled = |at| reading(at, std::slice::from_ref(&a));
+    let again = |at| reading(at, std::slice::from_ref(&next));
     assert_eq!(fact(take(&mut acc, &stalled(T0), R1, T0)).key, key(&a));
     assert!(acc.ack(key(&a).id, &CLAIM, T0 + 1).is_some());
     assert_eq!(
@@ -296,17 +303,22 @@ fn a_closed_run_is_forgotten_and_the_next_one_offered() {
         Pick::Why(WHY_NONE)
     );
     assert_eq!(
-        fact(take(&mut acc, &stalled(T0 + 4), R1, T0 + 4)).key,
-        key(&a),
-        "the next run of no progress is told again"
+        take(&mut acc, &stalled(T0 + 4), R1, T0 + 4),
+        Pick::Why(WHY_TOLD),
+        "the same run, named again after a dip, is not told again"
+    );
+    assert_eq!(
+        fact(take(&mut acc, &again(T0 + 4), R1, T0 + 4)).key,
+        key(&next),
+        "the next run of no progress is told"
     );
     assert_eq!(
         take(&mut acc, &reading(T0 + 5, &[]), R2, T0 + 5),
         Pick::Why(WHY_NONE)
     );
     assert_eq!(
-        fact(take(&mut acc, &stalled(T0 + 6), R2, T0 + 6)).key,
-        key(&a),
+        fact(take(&mut acc, &again(T0 + 6), R2, T0 + 6)).key,
+        key(&next),
         "the closed run's offer to R1 was dropped"
     );
 }

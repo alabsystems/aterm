@@ -11,7 +11,7 @@ use std::os::unix::process::ExitStatusExt as _;
 
 #[path = "resource_admission_events.rs"]
 mod events;
-pub(super) use events::Events;
+pub(super) use events::{Events, LocalEvents};
 
 fn ended_cause(started: Instant, ended: Instant, timeout: Option<Duration>) -> CompletionCause {
     if timeout.is_some_and(|limit| ended.saturating_duration_since(started) >= limit) {
@@ -120,6 +120,7 @@ impl Owner {
     pub(super) fn tick_jobs(&mut self) {
         self.tick_resolver_roots();
         self.tick_bootstrap_roots();
+        self.tick_preflight_roots();
         self.tick_bootstrap_queries();
         let fence = &self.fence;
         let journal = &self.journal;
@@ -149,7 +150,7 @@ impl Owner {
             // This is sampled governance over actual owned groups, not a hard
             // kernel quota or evidence of closure. Unknown coverage is never
             // treated as zero. Original custody remains held during cleanup.
-            if (job.launched || job.resolver.is_some() || job.bootstrap_graph.is_some())
+            if (job.launched || job.resolver.is_some() || job.bootstrap_graph.is_some() || job.preflight.is_some())
                 && !job.is_settled()
                 && (!job.reaped || job.members.values().any(|member| member.group().is_some()))
                 && job.memory_at.elapsed() >= Duration::from_millis(100)
@@ -377,43 +378,5 @@ impl Owner {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_sampling_error_names_host_fault_not_a_limit() {
-        let (cause, detail) =
-            memory_fault(Err(io::Error::from_raw_os_error(libc::EACCES)), 1024, None).unwrap();
-        assert_eq!(cause, CompletionCause::HostFault);
-        assert!(detail.contains("PermissionDenied"));
-    }
-
-    #[test]
-    fn measured_memory_limit_and_critical_pressure_keep_their_evidence() {
-        let (cause, detail) = memory_fault(Ok(1025), 1024, None).unwrap();
-        assert_eq!(cause, CompletionCause::ResourceLimit);
-        assert!(detail.contains("1025") && detail.contains("1024"));
-        let (cause, detail) =
-            memory_fault(Ok(512), 1024, Some(aterm_sysprobe::MemoryLevel::Critical)).unwrap();
-        assert_eq!(cause, CompletionCause::ResourceLimit);
-        assert!(detail.contains("critical") && detail.contains("512"));
-        assert!(memory_fault(Ok(1024), 1024, None).is_none());
-    }
-
-    #[test]
-    fn completed_stamp_decides_deadline_independently_of_actor_wake() {
-        let start = Instant::now();
-        let limit = Duration::from_secs(3);
-        for (elapsed, expected) in [
-            (Duration::from_secs(2), CompletionCause::Exited),
-            (limit, CompletionCause::Timeout),
-            (Duration::from_secs(4), CompletionCause::Timeout),
-        ] {
-            assert_eq!(ended_cause(start, start + elapsed, Some(limit)), expected);
-            assert_eq!(
-                ended_cause(start, start + elapsed, None),
-                CompletionCause::Exited
-            );
-        }
-    }
-}
+#[path = "resource_admission_job_tests.rs"]
+mod tests;

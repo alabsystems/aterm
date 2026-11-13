@@ -1247,35 +1247,55 @@ fn could_not_finish_reads_a_head_with_a_reason_and_nothing_else() {
     }
 }
 
-/// A BARE HEAD BEFORE A FINITE AUXILIARY IS PROSE (live 2026-11-04: an agent's bullet `- **NEEDS
+/// A BARE HEAD ITS CLAUSE HAS FOR SUBJECT IS PROSE (live 2026-11-04: an agent's bullet `- **NEEDS
 /// YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …` showed in `aterm
-/// ctl survey` as `claude needs you: can be lost.`). NEEDS YOU there is the subject of its clause
-/// ([`subject_of`]): the row names no need and its prose stays every other reader's. The row
-/// still opens a line of its own ([`apart`]), and the scan for a head past a row's start
-/// ([`mid_head`], from the row's first byte) reads none on it. A question after a bare head (an
-/// auxiliary before a subject, a question mark in its line, on a row wrapped under it too), an
-/// imperative, a noun, and a head past a separator or a qualifier still name their need.
-/// Negative control: on the reader before [`subject_of`] every prose row below named a need
-/// (`can be lost.** A NEEDS YOU line …`), and every need below named the same need.
+/// ctl survey` as `claude needs you: can be lost.`). Before a singular finite (`is`, `has`, …), or
+/// a modal whose verb is `be`, NEEDS YOU is the subject of its clause ([`subject_of`]): the row
+/// names no need and its prose stays every other reader's. The row still opens a line of its own
+/// ([`apart`]), and the scan for a head past a row's start ([`mid_head`], from the row's first
+/// byte) reads none on it. A modal and any other verb is a need (`NEEDS YOU must approve the
+/// deploy`), as are an imperative, a noun, a head past a separator or a qualifier, and a question:
+/// a singular finite before a subject pronoun, or a first sentence that ends on a question mark,
+/// on a row wrapped under the head's too. A question mark in a later sentence, in brackets or in a
+/// URL asks nothing. Under a line that names a head (`… on a line starting`), a row that opens on
+/// one is skipped whatever its words say ([`opens_head`]), its question too.
 #[test]
-fn a_bare_head_before_a_finite_auxiliary_is_prose_not_a_need() {
+fn a_bare_head_its_clause_has_for_subject_is_prose_not_a_need() {
     let incident =
         "- **NEEDS YOU can be lost.** A NEEDS YOU line in a turn that ended on a usage wall …";
     for tail in [
         incident.to_string(),
         format!("Merged and pushed main.\n{incident}\nNothing left: all on origin/main."),
         "NEEDS YOU is now read only past a colon.".to_string(),
+        "NEEDS YOU isn't hidden by a wall.".to_string(),
         "## NEEDS YOU was raised twice by tab 3".to_string(),
-        "**NEEDS YOU** should stay on screen until answered.".to_string(),
-        "NEEDS YOU won't block Land any more.".to_string(),
-        "NEEDS YOU won’t block Land any more.".to_string(),
+        "NEEDS YOU wasn't raised again.".to_string(),
+        "NEEDS YOU has its own row in the survey.".to_string(),
+        "NEEDS YOU hasn't changed since Round 3.".to_string(),
+        "NEEDS YOU does not block.".to_string(),
+        "NEEDS YOU doesn't block Land any more.".to_string(),
+        "NEEDS YOU doesn’t block Land any more.".to_string(),
+        "**NEEDS YOU** should be on screen until answered.".to_string(),
+        "NEEDS YOU can never be lost.".to_string(),
+        "NEEDS YOU will always be shown.".to_string(),
+        "NEEDS YOU can not be answered by the harness.".to_string(),
+        "NEEDS YOU should have been raised once.".to_string(),
         "  - **NEEDS YOU is loud and never blocks.** An agent puts what only a person can give on \
          a line"
             .to_string(),
         "`NEEDS YOU` is the head the harness reads.".to_string(),
         "NEEDS YOU is loud and never blocks\nwhen a wall ends the turn.".to_string(),
-        "Put what only a person can give on a line starting\nNEEDS YOU can the release go out\n\
-         today? and carry on."
+        "NEEDS YOU can\nbe lost when a wall ends the turn.".to_string(),
+        "- **NEEDS YOU can be lost.** What happens when a turn ends on a wall? The line is dropped."
+            .to_string(),
+        "- **NEEDS YOU is loud and never blocks.** Why does it matter?".to_string(),
+        "NEEDS YOU is loud and never blocks. Does Land hold on it? No.".to_string(),
+        "NEEDS YOU can be lost when a turn ends on a\nwall. Why? The wall cuts the line.".to_string(),
+        "NEEDS YOU is never hidden (is it ever hidden? no).".to_string(),
+        "NEEDS YOU is documented at https://example.com/docs?page=needs".to_string(),
+        "- **NEEDS YOU is never hidden.**\n  is that fixed? Yes.".to_string(),
+        "Put what only a person can give on a line starting\nNEEDS YOU is the release key still\n\
+         valid? and carry on."
             .to_string(),
     ] {
         assert!(
@@ -1290,13 +1310,71 @@ fn a_bare_head_before_a_finite_auxiliary_is_prose_not_a_need() {
     let above = "Merged the parser, and a turn that ended on a usage wall and the";
     for row in [
         "NEEDS YOU can be lost.",
-        "NEEDS YOU can the release go out",
+        "NEEDS YOU is the release key still",
         "NEEDS YOU: sign in to GitHub",
     ] {
         assert!(apart(above, row), "{row:?}");
     }
     assert!(!apart(above, "needs you can be lost."));
+    for modal in [
+        "can",
+        "cannot",
+        "can't",
+        "could",
+        "couldn't",
+        "may",
+        "might",
+        "mightn't",
+        "must",
+        "mustn't",
+        "shall",
+        "shan't",
+        "should",
+        "shouldn't",
+        "will",
+        "won't",
+        "would",
+        "wouldn't",
+    ] {
+        let prose = format!("NEEDS YOU {modal} be read past a colon.");
+        assert!(needs_you(&prose).is_empty(), "{prose:?}");
+        let need = format!("NEEDS YOU {modal} approve the deploy");
+        assert_eq!(needs_you(&need), [&need["NEEDS YOU ".len()..]], "{need:?}");
+    }
+    for adverb in [
+        "not", "never", "always", "also", "still", "only", "now", "just",
+    ] {
+        let prose = format!("NEEDS YOU can {adverb} be raised by codex-alab.");
+        assert!(needs_you(&prose).is_empty(), "{prose:?}");
+        let need = format!("NEEDS YOU must {adverb} approve the deploy");
+        assert_eq!(needs_you(&need), [&need["NEEDS YOU ".len()..]], "{need:?}");
+    }
     for (tail, want) in [
+        (
+            "NEEDS YOU must approve the deploy at https://example.com/deploy",
+            "must approve the deploy at https://example.com/deploy",
+        ),
+        (
+            "NEEDS YOU should sign in to GitHub (gh auth login) so I can push.",
+            "should sign in to GitHub (gh auth login) so I can push.",
+        ),
+        (
+            "NEEDS YOU will need to accept the Xcode license.",
+            "will need to accept the Xcode license.",
+        ),
+        (
+            "**NEEDS YOU** must sign the notarization agreement.",
+            "must sign the notarization agreement.",
+        ),
+        (
+            "NEEDS YOU can't push: the token for alabsystems expired",
+            "can't push: the token for alabsystems expired",
+        ),
+        (
+            "NEEDS YOU could the owner rotate the deploy key",
+            "could the owner rotate the deploy key",
+        ),
+        ("NEEDS YOU is: approve the deploy", "is: approve the deploy"),
         (
             "NEEDS YOU can you sign in to GitHub?",
             "can you sign in to GitHub?",
@@ -1306,12 +1384,20 @@ fn a_bare_head_before_a_finite_auxiliary_is_prose_not_a_need() {
             "should I force-push main?",
         ),
         (
-            "NEEDS YOU could you approve the deploy",
-            "could you approve the deploy",
-        ),
-        (
             "NEEDS YOU is the release key still valid? If not, rotate it.",
             "is the release key still valid? If not, rotate it.",
+        ),
+        (
+            "NEEDS YOU is the release key still\nvalid for the notary?",
+            "is the release key still valid for the notary?",
+        ),
+        (
+            "NEEDS YOU will be at the desk for the notary call?",
+            "will be at the desk for the notary call?",
+        ),
+        (
+            "NEEDS YOU is it OK to force-push main",
+            "is it OK to force-push main",
         ),
         (
             "NEEDS YOU can the release go out\ntoday?",
@@ -1331,6 +1417,10 @@ fn a_bare_head_before_a_finite_auxiliary_is_prose_not_a_need() {
         ),
         (
             "NEEDS YOU (owner) is blocked on the notary key",
+            "is blocked on the notary key",
+        ),
+        (
+            "Merged the parser. NEEDS YOU: is blocked on the notary key",
             "is blocked on the notary key",
         ),
         ("NEEDS YOU the release credential", "the release credential"),

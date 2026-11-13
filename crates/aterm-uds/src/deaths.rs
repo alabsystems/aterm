@@ -5,7 +5,7 @@
 //! `ATERM_DEBUG_DEATH_JOURNAL` naming a file, every reap that hands its wait status to [`note`]
 //! (a `spawnfd` child's wait, with or without resource accounting, the process-wide reaper's,
 //! aterm-pty's shell reaps and the PTY keeper's) appends one line to it for a child a signal
-//! ended. A release build never reads the variable and writes nothing.
+//! ended. A release build never reads that variable or writes that journal.
 //!
 //! It is the lab's witness of a helper a jail killed (`aterm-lab local-signins`): the kernel
 //! hands each child's status to its parent's wait however briefly the child lived, so a reap
@@ -13,7 +13,8 @@
 //! privileges: kqueue's `NOTE_TRACK` (follow a process's forks) answers `ENOTSUP`, there is no
 //! subreaper, and a scan of the process table misses a child that lived between two looks. What
 //! it does not see is a death no reap here takes: a child some other program (a shell) reaps,
-//! or an orphan launchd reaps.
+//! or an orphan launchd reaps. When signal provenance is active, each observed signal death
+//! also goes to that recorder, independently of the debug journal variable.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -33,12 +34,13 @@ pub const fn signal_of(raw: i32) -> Option<i32> {
 }
 
 /// Note that this process reaped `pid` with wait status `raw`: one journal line when a signal
-/// ended it and the journal is named, nothing otherwise. A journal it cannot write is no reap's
-/// concern, so it never fails.
+/// ended it and the journal is named. An active signal-origin recorder also receives it.
+/// A journal it cannot write is no reap's concern, so it never fails.
 pub fn note(pid: i32, raw: i32) {
     let Some(signal) = signal_of(raw) else {
         return;
     };
+    crate::signal_origin::child_death(pid, signal);
     if let Some(path) = journal() {
         let _ = append(&path, pid, signal);
     }

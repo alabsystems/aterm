@@ -224,9 +224,10 @@ fn what_runs_under_an_agent_is_named_as_ps_names_it() {
         (me, "aterm_agent".to_string()),
         (gone, "zsh".to_string()),
     ];
-    let before = held_of(me, &procs);
-    let oracle = ps_held_of(me, &procs);
-    let after = held_of(me, &procs);
+    let table: Vec<ProcRow> = vec![(shell.id(), me, "bash".into())];
+    let before = held_of(me, &procs, &table);
+    let oracle = ps_held_of(me, &procs, &table);
+    let after = held_of(me, &procs, &table);
     end(shell);
     assert_eq!(oracle.len(), 2, "{oracle:?}");
     for got in [&before, &after] {
@@ -250,4 +251,62 @@ fn what_runs_under_an_agent_is_named_as_ps_names_it() {
         "the escaped newline read as a space (command_head)"
     );
     assert_eq!(before[1].command, "", "not the agent's own child");
+    assert_eq!(
+        (before[0].seat, before[0].exact),
+        (upgrade::Seat::Top, false),
+        "the agent's child, and a command with an escaped byte is not it byte for byte"
+    );
+    assert_eq!(
+        before[1].seat,
+        upgrade::Seat::Loose,
+        "no shell of the agent's above it"
+    );
+}
+
+/// The restart's last look ([`live_background`]) reads the work under a process from that
+/// process's own children on the live kernel: a bash this test starts is this process's work as
+/// soon as it runs as bash, and a process with no children has none, never the unread word.
+#[test]
+fn the_last_look_names_a_shell_child_from_the_child_list() {
+    let mut shell = Command::new(crate::test_program::kept("/bin/bash"))
+        .args(["--noprofile", "--norc", "-c", "read x"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn bash");
+    let me = std::process::id();
+    let start = Instant::now();
+    while !live_background(me).iter().any(|w| w == "bash") {
+        assert!(
+            start.elapsed() < HANG,
+            "bash under this process: not within {HANG:?}"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+    assert!(
+        live_background(shell.id()).is_empty(),
+        "a shell reading its input runs nothing"
+    );
+    // A move over waits reads the shells it holds the same way ([`Kernel::restart_held`]). Other
+    // tests' children come and go under this process, and one gone between the walk and its own
+    // read makes a read `None`, so the look is asked again until it names bash.
+    let start = Instant::now();
+    while !Live.restart_held(me).is_some_and(|held| {
+        held.iter()
+            .any(|h| h.pid == shell.id() && h.seat == upgrade::Seat::Top)
+    }) {
+        assert!(
+            start.elapsed() < HANG,
+            "bash held at the top under this process: not within {HANG:?}"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+    assert_eq!(
+        Live.restart_held(shell.id()),
+        Some(Vec::new()),
+        "a shell reading its input holds nothing, which is no unread table"
+    );
+    drop(shell.stdin.take());
+    let _ = shell.kill();
+    let _ = shell.wait();
 }

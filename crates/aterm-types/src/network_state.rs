@@ -254,6 +254,13 @@ impl RepairCause {
     }
 }
 
+/// How long a network publication stays current, and the shortest time a contact keeps its
+/// peer Reachable, in milliseconds.
+pub const REACHABLE_MS: u64 = 15_000;
+/// The longest time a contact keeps its peer Reachable, in milliseconds, however slowly its
+/// observer reaches it.
+pub const LEASE_MAX_MS: u64 = 120_000;
+
 /// One retained authenticated machine, in stable first-observed slot order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerObservation {
@@ -273,10 +280,54 @@ pub struct PeerObservation {
     pub last_authenticated_endpoint: Option<AuthenticatedEndpoint>,
     /// Current local evidence, never inferred from replayed contact.
     pub reachability: Reachability,
+    /// How long after its latest contact a Reachable claim holds, in milliseconds, as the
+    /// observer measured this peer's contact period; `None` reads as [`REACHABLE_MS`]
+    /// ([`Self::reachable_for_ms`]). Evidence of the observing process's current lifetime:
+    /// present only on a Reachable peer of a live publication, never stored in history.
+    pub lease_ms: Option<u64>,
     /// Absent until authenticated per-process descriptors exist.
     pub instances: Option<usize>,
     /// Bounded recent history in observation order.
     pub samples: Vec<PresenceSample>,
+}
+
+impl PeerObservation {
+    /// How long after its latest contact this peer's Reachable claim holds: the lease its
+    /// observer measured, within [`REACHABLE_MS`] and [`LEASE_MAX_MS`], else [`REACHABLE_MS`].
+    #[must_use]
+    pub fn reachable_for_ms(&self) -> u64 {
+        self.lease_ms.map_or(REACHABLE_MS, |lease| {
+            lease.clamp(REACHABLE_MS, LEASE_MAX_MS)
+        })
+    }
+
+    /// This peer's reachability at wall time `now_ms`, for a reader holding the observation
+    /// after its producer sampled it. A Reachable claim holds while both its latest contact
+    /// and its latest check are no older than [`Self::reachable_for_ms`]; past that it is
+    /// LastSeen, and with no clock, a missing stamp or one in the future it is Unknown. Any
+    /// other state is retained evidence and reads as it is.
+    #[must_use]
+    pub fn reachability_at(&self, now_ms: Option<u64>) -> Reachability {
+        if self.reachability != Reachability::Reachable {
+            return self.reachability;
+        }
+        let ages = now_ms.and_then(|now| {
+            let checked = self.last_checked_ms?;
+            if self.last_seen_ms == 0 || checked == 0 {
+                return None;
+            }
+            Some((
+                now.checked_sub(self.last_seen_ms)?,
+                now.checked_sub(checked)?,
+            ))
+        });
+        let lease = self.reachable_for_ms();
+        match ages {
+            Some((seen, checked)) if seen <= lease && checked <= lease => Reachability::Reachable,
+            Some(_) => Reachability::LastSeen,
+            None => Reachability::Unknown,
+        }
+    }
 }
 
 /// Network facts owned by the local transport/history producer.

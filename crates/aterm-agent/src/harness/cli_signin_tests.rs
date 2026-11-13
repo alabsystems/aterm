@@ -6,6 +6,16 @@
 //! transcript), a Codex row by its native loopback PKCE sign-in, and the machine's one sign-in at
 //! a time.
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::time::Duration;
@@ -13,6 +23,7 @@ use std::time::Duration;
 use super::*;
 use crate::harness::login_drive::{self, Approval, Approver, Drove, Handoff, Request};
 
+#[cfg(unix)]
 #[test]
 fn adding_a_native_account_requires_receipt_admission_before_any_directory_or_row() {
     use crate::harness::alab_roster::{
@@ -496,6 +507,7 @@ fn a_kimi_row_without_email_renews_through_its_device_flow() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refused() {
     let tmp = tmp_dir("signin-codex");
@@ -543,6 +555,7 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
     let tmp = tmp_dir("codex-browser-unavailable");
@@ -605,6 +618,7 @@ fn a_bounded_background_sign_in_reports_the_machine_held_without_starting() {
     assert_eq!(host.calls.get(), 1, "once it is free the renewal runs");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_a_keyring_store_runs_none()
  {
@@ -668,6 +682,7 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
 /// refusal says why the pool's staged sign-in cannot make it and what signs it in; a row of its
 /// own keeps the refusal that its sign-in would replace this machine's own login. Neither runs a
 /// sign-in or makes a staging home.
+#[cfg(unix)]
 #[test]
 fn under_a_keyring_login_the_default_rows_renewal_refusal_is_its_own() {
     let tmp = tmp_dir("signin-codex-keyring-default");
@@ -755,6 +770,7 @@ fn ledger_accounts_reads_the_named_clis_ledger() {
 /// overlay only on Unix, so the renewal says so, binds nothing and leaves no staging home.
 #[cfg(not(unix))]
 #[test]
+#[ignore = "off Unix `accounts add` takes the manual sign-in queue, which only Unix has"]
 fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
     let (tmp, env) = kimi_env("signin-no-links");
     let home = tmp.path().join("home");
@@ -782,6 +798,7 @@ fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn accounts_cli_all_lists_each_kept_pool_and_none_is_claudes_empty_report() {
     let tmp = tmp_dir("accounts-all");
@@ -846,6 +863,7 @@ impl AccountsHost for PoolHost {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     let tmp = tmp_dir("adopt-codex");
@@ -879,6 +897,7 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_adopt_default_checks_an_explicit_canonical_identity() {
     for alias in ["", " --email alias@example.test"] {
@@ -917,6 +936,7 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
     for configuration in [
@@ -956,6 +976,7 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let (tmp, env) = kimi_env("stats-kimi");
@@ -988,7 +1009,7 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let (code, out, err) = renew("accounts stats --cli codex", &env, &reads);
     assert_eq!(code, exit(0), "{err}");
     assert!(
-        !out.contains("5h 100%"),
+        !out.contains("5h 0% left"),
         "CONTROL: nothing on record: {out}"
     );
     let aged = env.now - 7200;
@@ -1021,7 +1042,7 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     assert_eq!(code, exit(0), "{err}");
     assert!(
         out.contains("main: limited")
-            && out.contains("5h 100%")
+            && out.contains("5h 0% left")
             && out.contains("read 2025-09-20T22:00:00Z")
             && out.contains("codex-one: not-enrolled · login idle · no reading yet"),
         "the reading stands with its age: {out}"
@@ -1576,6 +1597,7 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
 /// `renew`, its report and stats name no sign-in step (aterm signs it in by itself), its
 /// signed-out renewal names `accounts browser` then `renew`, and a stored browser task names
 /// that on Kimi and the login on Grok.
+#[cfg(unix)]
 #[test]
 fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
     let tmp = tmp_dir("grok-next-steps");
@@ -2235,6 +2257,7 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
     assert!(accounts::sign_in_tasks(&roster, &logins).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_order_ready_rows_first()
 {
@@ -2463,6 +2486,7 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     assert!(out.contains("kimi-two: not run yet: "), "{out}");
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_default_completion_preserves_metadata_and_is_idempotent() {
     for inline in [false, true] {
@@ -2637,6 +2661,7 @@ fn codex_default_completion_runs_in_init_and_upkeep_and_obeys_policy() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_default_completion_retains_alias_and_respects_native_auth_lock() {
     let tmp = tmp_dir("codex-complete-alias");
@@ -2815,6 +2840,7 @@ impl AccountsHost for BotChecked {
 /// `kimi-one`'s account to m22 alone, the report says whose it is and the way to borrow it, stops
 /// counting it among the rows on their way so that it offers listing another, and that way still
 /// runs. `CONTROL`: the sheet naming this Mac.
+#[cfg(unix)]
 #[test]
 fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
     let (tmp, env) = kimi_env("other-macs-person");
@@ -2890,6 +2916,7 @@ fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
 /// No report asks anybody to sign in another Mac's account (`ATERM-KI-1105-9`): Grok Build's pool,
 /// whose rows a person signs in, asks for its own and not for one the sheet gives m22, in the
 /// report, its JSON, and the stats. `CONTROL`: the same row while the sheet names this Mac.
+#[cfg(unix)]
 #[test]
 fn no_report_asks_for_a_sign_in_of_another_macs_account() {
     let tmp = tmp_dir("other-macs-report");

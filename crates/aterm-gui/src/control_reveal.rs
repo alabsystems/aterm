@@ -258,15 +258,25 @@ fn session_facts(store: &Store, peer: i32, procs: &dyn Procs) -> Option<(String,
         .agent()
         .reader
         .is_some();
-    let mark = ctx.spawn_mark.read();
     let facts = SessionFacts {
+        agent: fronts_agent || agent_in_tree(shell, procs),
+        ..marks_of(&ctx)
+    };
+    Some((sid, facts))
+}
+
+/// What aterm records of session `ctx` but whether an agent runs in it (`agent` is `false`): who
+/// started it, whether an update carried it, whether the remote hold is on it and whether a
+/// control client other than aterm's own was ever admitted to type into it.
+pub(crate) fn marks_of(ctx: &crate::SessionCtx) -> SessionFacts {
+    let mark = ctx.spawn_mark.read();
+    SessionFacts {
         spawned: mark == SpawnMark::CTL,
         carried: mark == SpawnMark::CARRIED,
         held: ctx.fabric.holds().remote().is_some(),
         driven: ctx.typed.driver_admitted(),
-        agent: fronts_agent || agent_in_tree(shell, procs),
-    };
-    Some((sid, facts))
+        agent: false,
+    }
 }
 
 /// `reveal`'s reply for a peer `peer` (the kernel's, when it named one), asked `remote`ly or not.

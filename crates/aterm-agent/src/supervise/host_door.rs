@@ -270,6 +270,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn can_restart(&self) -> bool {
         false
     }
+    /// WHAT THE AGENT'S OWN LAUNCH SAYS OF ITS MODEL
+    /// ([`crate::supervise::policy::turn_end::LaunchModel`]): the last `--model` of the argv of
+    /// the process the host keeps for the tab, `Unnamed` where it names none, `Unread` where the
+    /// host keeps no such process. Asked only at a Claude Code model's limit, the one fact the
+    /// Fable limit's move onto Opus needs besides the notice.
+    fn launch_model(&self) -> crate::supervise::policy::turn_end::LaunchModel {
+        crate::supervise::policy::turn_end::LaunchModel::Unread
+    }
     fn relaunch_off(&self) -> bool {
         false
     }
@@ -650,6 +658,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
 
     fn account_served(&self) {}
+
+    /// What the session's own point shows of its login
+    /// ([`crate::supervise::policy::turn_end::TurnEndState::login_seen`]), once per turn: the
+    /// host records it on the account the process runs on, for every program with an account
+    /// state, and answers nothing.
+    fn login_seen(&self, seen: crate::supervise::policy::turn_end::LoginSeen) {
+        let _ = seen;
+    }
 
     fn account_answered(&self, bad: AccountBad) {
         let _ = bad;

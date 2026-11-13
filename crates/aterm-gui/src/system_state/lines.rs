@@ -143,7 +143,7 @@ pub(crate) enum Mark {
     Done,
     /// A filled disc with `!` (in the card).
     Failed,
-    /// An em dash: the person turned it off.
+    /// An em dash: left as it is (the person turned it off, or it changed since aterm set it).
     Off,
 }
 
@@ -720,6 +720,10 @@ pub(crate) const LEFT_AS_IS: &str = "Left as is";
 /// and no identity syncs, which is never "done".
 pub(crate) const NO_VAULT_HERE: &str = "Not joined · no vault on this network";
 
+/// The Secrets line where the ALab vault's address did not answer ([`Standing::Asking`]): no
+/// proof of a vault or of none, so it says only that aterm asks again by itself.
+pub(crate) const VAULT_ASKS_AGAIN: &str = "Not joined · aterm asks again by itself";
+
 /// A line's state, for [`line_view`].
 struct LineState {
     mark: Mark,
@@ -847,11 +851,20 @@ fn line_state(
             };
             return with_lead(state);
         }
-        // A Mac in no vault (none answered on its network) syncs nothing: calm, never done.
+        // A Mac in no vault (a server at the ALab vault's address answered with none) syncs
+        // nothing: calm, never done. A look nobody answered is asked again by itself
+        // ([`Standing::Asking`]): calm too, and it claims no vault and none.
         if vault.settled() && vault.value_now() == Some("Not joined") {
             return with_lead(
                 LineState::new(Mark::Off, NO_VAULT_HERE)
                     .word("not joined")
+                    .quiet(),
+            );
+        }
+        if vault.standing == Some(Standing::Asking) {
+            return with_lead(
+                LineState::new(Mark::Off, VAULT_ASKS_AGAIN)
+                    .word("asking")
                     .quiet(),
             );
         }
@@ -955,9 +968,25 @@ fn line_state(
     // but it has established no completed state either. Only settled rows earn the check.
     if managed
         .iter()
-        .any(|row| !row.settled() && !row.changed_by_you)
+        .any(|row| !row.settled() && !row.changed_since)
     {
         return with_lead(LineState::checking(line));
+    }
+    // A row changed since aterm set it is left as it is and is not set up (design §6.6): its
+    // line is no check, and says which, calmly.
+    let changed: Vec<&str> = managed
+        .iter()
+        .filter(|row| row.changed_since)
+        .map(|row| row.subject.name())
+        .collect();
+    if !changed.is_empty() {
+        return with_lead(
+            LineState::new(
+                Mark::Off,
+                format!("{} {}", changed.join(", "), super::CHANGED_SINCE_WORDS),
+            )
+            .quiet(),
+        );
     }
     let pending_grants = managed
         .iter()
@@ -1002,10 +1031,7 @@ pub(crate) fn waiting_for(row: &RowView) -> String {
     }
     use aterm_types::macos_setup::StageRow;
     if note.ends_with(StageRow::PARKED_TAIL) {
-        return "Waiting for aterm's next check".to_owned();
-    }
-    if note.ends_with(StageRow::HELD_TAIL) {
-        return "Waiting for Check again".to_owned();
+        return "Waiting for aterm's next try".to_owned();
     }
     if note.ends_with(StageRow::STILL_RUNNING_TAIL) {
         return "Still running after more than an hour".to_owned();
@@ -1122,7 +1148,8 @@ fn things(n: usize) -> String {
 
 /// THE PROGRESS RULE (§4.5, pure): how many managed rows are done, of those aterm manages, once
 /// anything was read. Done means done: a row in the card, a step that failed, waits for aterm's
-/// next try or could not be confirmed is not, so full progress is every line done.
+/// next try or could not be confirmed is not, nor is one changed since aterm set it, which
+/// setup leaves as it is, so full progress is every line done.
 pub(crate) fn progress(
     app: &SystemStateApp,
     rows: &[RowView],
@@ -1139,7 +1166,7 @@ pub(crate) fn progress(
         .iter()
         .filter(|row| {
             row.managed
-                && (row.settled() || row.changed_by_you)
+                && row.settled()
                 && row.chip != Some(super::Chip::Waiting)
                 && !matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD)
                 && !card.iter().any(|item| item.subject == Some(row.subject))
@@ -1191,6 +1218,7 @@ fn phase_words(app: &SystemStateApp, hero: &Hero, card: &[CardItem]) -> String {
         super::CHECKING => "Checking",
         SETTING_UP => "Setup running",
         READY => "Setup finished",
+        _ if headline.ends_with(CHANGED_SINCE_SETUP) => "Setup finished",
         "Selected setup complete" => "Selected setup finished",
         "Setup incomplete" => "Setup incomplete",
         TRIES_AGAIN => "Waiting to try again",
@@ -1233,7 +1261,7 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
         phase: String::new(),
         headline: detail.text.clone(),
         sub: counts.clone(),
-        stop: status.running(),
+        stop: status.stoppable(),
         start: held,
         done,
         total,
@@ -1308,6 +1336,21 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
         hero.sub = STARTING.to_owned();
         return hero;
     }
+    // Setup finished, every row done but those changed since aterm set it, which it leaves as
+    // they are (init design §6.6): never ready, which would count them set up, and never
+    // incomplete, which would say setup owes them; the hero names them beside the count.
+    let changed: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.managed && row.changed_since)
+        .map(|row| row.subject.name())
+        .collect();
+    if detail.set_up && !changed.is_empty() && done + changed.len() == total {
+        hero.headline = changed_since_hero(changed.len());
+        hero.sub = with_counts(&changed.join(", "));
+        return hero;
+    }
+    // Apple's Command Line Tools missing keep the repositories row off set up
+    // (`ToolsWait::standing`), so the headline is never set up while they are.
     if detail.set_up && done == total && total > 0 {
         let disabled = Setting::ALL
             .into_iter()
@@ -1373,6 +1416,20 @@ pub(crate) const SETTING_UP: &str = "Setting up your Mac";
 
 /// The headline once every line is done.
 pub(crate) const READY: &str = "Your Mac is ready";
+
+/// What the hero's headline ends with once setup finished and rows changed since aterm set them
+/// ([`changed_since_hero`]).
+pub(crate) const CHANGED_SINCE_SETUP: &str = "changed since setup";
+
+/// The hero's headline once setup finished and `n` rows changed since aterm set them: `1 setting
+/// changed since setup`, `2 settings changed since setup`.
+pub(crate) fn changed_since_hero(n: usize) -> String {
+    if n == 1 {
+        format!("1 setting {CHANGED_SINCE_SETUP}")
+    } else {
+        format!("{n} settings {CHANGED_SINCE_SETUP}")
+    }
+}
 
 /// The headline while a step, or a run, waits for aterm to try it again by itself.
 pub(crate) const TRIES_AGAIN: &str = "Setup will try again";

@@ -683,13 +683,27 @@ fn inspect_file(path: &Path) -> Result<Option<Requirements>, Unadmitted> {
 }
 
 /// A refusal of bytes that changed while they were read is no verdict: the change is the answer.
+/// The descriptor's cursor is its holder's and is where it was after: Unix reads at an offset
+/// (`pread`) and never moves it, while Windows' positioned read (`seek_read`) leaves it past the
+/// bytes it read, so off Unix it is put back, and a cursor that cannot be is no verdict.
 fn inspect_open_file(file: &std::fs::File) -> Result<Option<Requirements>, Unadmitted> {
     let before = file.metadata().map_err(Unadmitted::cannot_judge)?;
     if !before.is_file() {
         return Err(Unadmitted::cannot_judge("runtime input is no regular file"));
     }
+    #[cfg(not(unix))]
+    let cursor = {
+        let mut held = file;
+        held.stream_position().map_err(Unadmitted::cannot_judge)?
+    };
     let mut input = Positioned { file, at: 0 };
     let inspected = inspect(&mut input, before.len());
+    #[cfg(not(unix))]
+    {
+        let mut held = file;
+        held.seek(SeekFrom::Start(cursor))
+            .map_err(Unadmitted::cannot_judge)?;
+    }
     let after = file.metadata().map_err(Unadmitted::cannot_judge)?;
     if !crate::stat_digest::StatKey::of(&before).unchanged(&crate::stat_digest::StatKey::of(&after))
     {

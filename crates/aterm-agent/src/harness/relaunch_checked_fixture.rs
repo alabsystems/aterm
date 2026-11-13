@@ -116,6 +116,12 @@ impl Kernel for SourceKernel {
             vec![super::super::upgrade_drive::UNREADABLE_TABLE.into()]
         }
     }
+
+    /// Unread: this fixture's lane is the restart in place, which never moves over an agent's
+    /// waits, and an unread row is never a wait.
+    fn restart_held(&self, _: u32) -> Option<Vec<super::super::upgrade::Held>> {
+        None
+    }
 }
 
 /// A genuine source process and private record namespace, available before GUI Cold setup.

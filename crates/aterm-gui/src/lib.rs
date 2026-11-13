@@ -38,53 +38,8 @@ use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::{CursorIcon, Window, WindowId as WinitWindowId};
 
 #[cfg(test)]
-mod queued_key_present_tests {
-    use super::*;
-
-    #[test]
-    fn a_delayed_key_after_paste_releases_its_echo_at_the_half_refresh_floor() {
-        let mut app = App::headless_for_test();
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
-        let t0 = Instant::now();
-        let full = Duration::from_millis(16);
-        ws.input_hot = true;
-        ws.input_hot_until = Some(t0 + crate::app_input::INPUT_HOT_WINDOW);
-        ws.on_content_presented(t0 + Duration::from_millis(60));
-        assert!(!ws.input_hot);
-        ws.last_present_at = Some(t0 + Duration::from_millis(86));
-        ws.content_pending = true;
-        ws.redraw_pending = true;
-        assert_eq!(ws.content_pace_floor(full), full);
-
-        assert!(ws.queued_key_delivery_releases_pending_frame(
-            t0 + Duration::from_millis(90),
-            t0 + Duration::from_millis(95),
-            full,
-        ));
-        assert_eq!(ws.content_pace_floor(full), full / 2);
-        assert_eq!(ws.input_hot_until, Some(t0 + Duration::from_millis(140)));
-        ws.on_content_presented(t0 + Duration::from_millis(100));
-        assert!(
-            ws.input_hot,
-            "a concurrent output frame cannot spend the key tail"
-        );
-        ws.on_content_presented(t0 + Duration::from_millis(141));
-        assert!(!ws.input_hot, "the write-time priority remains bounded");
-
-        ws.content_pending = false;
-        ws.redraw_pending = false;
-        assert!(!ws.queued_key_delivery_releases_pending_frame(
-            t0 + Duration::from_millis(150),
-            t0 + Duration::from_millis(155),
-            full,
-        ));
-        assert!(!ws.queued_key_delivery_releases_pending_frame(
-            t0 + Duration::from_millis(90),
-            t0 + Duration::from_millis(141),
-            full,
-        ));
-    }
-}
+#[path = "lib_queued_key_present_tests.rs"]
+mod queued_key_present_tests;
 
 #[cfg(test)]
 fn reset_visible_leaf_plan_builds() {
@@ -140,8 +95,10 @@ mod app_palette;
 mod app_presence;
 mod app_rename;
 mod app_render;
+mod app_requests;
 mod app_search;
 mod app_settings;
+mod app_tables;
 mod app_tabs;
 mod app_take_over;
 mod app_update_handoff;
@@ -161,7 +118,9 @@ mod artifact_transaction_conformance;
 mod askpass;
 #[cfg(test)]
 mod atpkg_contention_release_conformance;
+mod auto_naming;
 mod autopilot;
+mod autopilot_activity;
 mod autopilot_menu;
 mod autopilot_timers;
 mod bell_ledger;
@@ -195,11 +154,13 @@ mod native_mail;
 mod native_mail_host;
 mod native_observe;
 mod native_session_policy;
+mod native_tables;
 mod native_usage_retention;
 mod native_workers;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
 mod os_appearance;
+mod parked_awaits;
 #[cfg(all(test, unix))]
 mod precommit_input_conformance;
 mod resolved_colors;
@@ -214,6 +175,7 @@ mod retired_workers;
 mod session_theme;
 #[cfg(all(test, unix))]
 mod settings_draft_carry_conformance;
+mod tables_store;
 #[cfg(all(test, unix))]
 mod typed_rekey_conformance;
 #[cfg(test)]
@@ -295,8 +257,9 @@ pub fn install_session_log() {
 /// Whether a person is at this Mac's screen now, read as System State's person stages read it
 /// (design §6.4): a keyboard, mouse or trackpad used within the last minute
 /// ([`system_state_host::PERSON_PRESENT_WITHIN`]), and this login's screen neither locked nor
-/// switched away for another login. `aterm init` reads it as the Messages and FaceTime
-/// sign-outs start, on every run, a terminal's too. In a window it is the window's own
+/// switched away for another login. `aterm init` with no terminal reads it as it decides
+/// whether to build the Messages and FaceTime sign-outs and whether `--sign-out` runs; each
+/// sign-out reads its own login's session itself before its clicks. In a window it is the window's own
 /// reader ([`App::person_present_within`], as the window last published it on its events and
 /// ticks): where macOS gives no idle time, aterm's own last key, click or scroll instead. A
 /// process with no window has none of those, so there an unreadable idle time reads nobody there.
@@ -371,6 +334,7 @@ mod devtools_helper_drive;
 mod frame_clock_drive;
 mod overview;
 mod overview_fabric;
+mod permission_box;
 mod permission_click;
 mod permission_walk;
 pub(crate) use amacs_files::save_words;
@@ -412,6 +376,17 @@ pub use system_state::{
     clear_setup_set_aside, clear_setup_unfinished, note_journal_refused, note_keep_awake_failing,
     note_setup_changed_since, note_setup_not_started, note_setup_set_aside,
 };
+/// The front door's answer to `setup status` for `status` at `now` (Unix seconds), as the window
+/// gives it: what another crate's test of its readers (`aterm init --check`, `aterm status`)
+/// feeds them, so the writer and the readers are held to one grammar.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn setup_status_answer_for_test(status: &SetupStatus, now: u64) -> String {
+    system_state_access::setup_status_answer(&system_state_access::background_setup_fields(
+        status, now, false,
+    ))
+}
+
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
 /// setup is finished, or a run that just finished. One mend lane per process; each of its reads
@@ -528,16 +503,19 @@ fn mend_secrets_subscriber_once(headless: bool) {
 #[doc(hidden)]
 pub use spawn::OutputWakeWatchProbe;
 pub use system_state_host::{
-    CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, PhraseJoinReceipt, PhraseOutcome,
-    SetupReadings, publish_initial_setup_readings, publish_initial_setup_status,
-    set_initial_setup_handlers, system_state_on_screen,
+    CheckBy, CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, PhraseJoinReceipt,
+    PhraseOutcome, SetupReadings, initial_setup_readings_undelivered,
+    publish_initial_setup_readings, publish_initial_setup_status, set_initial_setup_handlers,
+    system_state_on_screen,
 };
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
     on_window_focus_gained, wake_host_maintenance, window_focus_gains,
 };
 #[cfg(any(test, debug_assertions))]
-pub use workstation_setup::{drive_initial_setup_answer_for_test, gain_window_focus_for_test};
+pub use workstation_setup::{
+    SetupLoopForTest, drive_initial_setup_answer_for_test, gain_window_focus_for_test,
+};
 mod devtools_watch;
 mod harness_policy_cell;
 #[cfg(feature = "bench-support")]
@@ -554,10 +532,6 @@ pub use trail_frame_reads::WindowTrailReads;
 #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
 #[doc(hidden)]
 pub use trail_rig::{TrailFrame, TrailRig};
-/// The yield at the host routes that lay the glow's under stream again (a windowed composed
-/// capture, the heterogeneous route), driven on the trail-diff rig at the glass level.
-#[cfg(all(test, unix))]
-mod glass_yield_host_tests;
 /// The host unreachability pin: no dark ground reaches the light fork through the frame path.
 #[cfg(all(test, unix))]
 mod light_fork_pin_tests;
@@ -699,6 +673,7 @@ mod elevated_caption;
 pub(crate) use aterm_gui_consent::durable;
 mod crash_restore;
 mod keeper_link;
+#[cfg(test)]
 mod selection_custody_conformance;
 
 mod agh_needs;
@@ -720,6 +695,7 @@ mod handoff_carry;
 mod handoff_diet;
 mod handoff_env;
 mod handoff_history;
+mod handoff_progress;
 #[cfg(target_os = "macos")]
 mod handoff_rendezvous;
 #[cfg(target_os = "macos")]
@@ -736,6 +712,7 @@ mod harness_task;
 mod hdr_win;
 mod holder_image;
 mod host_io_prefetch;
+mod host_quit;
 mod host_record;
 mod human_input;
 mod hwkey;
@@ -781,8 +758,12 @@ mod pinned_dir;
 #[cfg(windows)]
 mod platform_win;
 mod present;
+#[cfg(test)]
 mod press_custody_conformance;
 mod relaunch_notice;
+mod requests_footprint;
+mod requests_host;
+mod requests_review;
 mod session_waits;
 mod toolchain_words;
 mod update_words;
@@ -912,6 +893,8 @@ mod settings_theme_demo;
 mod settings_themes_host;
 mod sound_seam;
 mod status_item;
+#[cfg(any(target_os = "macos", test))]
+mod status_lock_icon;
 
 mod tone_status;
 mod trail_audio;
@@ -963,6 +946,7 @@ mod rewind_band;
 mod rewind_verb;
 mod rewind_worker;
 mod route_chrome;
+mod run_end;
 mod scroll_motion;
 mod scrollbar;
 mod seamless;
@@ -1057,6 +1041,11 @@ mod confirm_drive;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use confirm_drive::run_confirm_drive;
+#[cfg(target_os = "macos")]
+mod rename_reentry_drive;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use rename_reentry_drive::run_rename_reentry_drive;
 #[cfg(unix)]
 mod credential_needs_host;
 mod diskwalk_host;
@@ -1418,31 +1407,8 @@ fn roll_stale_blink_forward(deadline: Instant, now: Instant) -> Option<StaleBlin
 }
 
 #[cfg(test)]
-mod blink_roll_tests {
-    use super::*;
-
-    #[test]
-    fn a_stale_deadline_rolls_onto_the_grid_and_a_due_or_future_one_does_not() {
-        let origin = Instant::now();
-        assert_eq!(
-            roll_stale_blink_forward(origin + BLINK_INTERVAL / 3, origin),
-            None
-        );
-        assert_eq!(
-            roll_stale_blink_forward(origin, origin + BLINK_INTERVAL / 2),
-            None
-        );
-        for (late, next, flips) in [
-            (BLINK_INTERVAL, 2, false),
-            (BLINK_INTERVAL * 2 + BLINK_INTERVAL / 2, 3, true),
-        ] {
-            let roll = roll_stale_blink_forward(origin, origin + late).expect("stale");
-            assert_eq!(roll.next, origin + BLINK_INTERVAL * next, "{late:?}");
-            assert!(roll.next > origin + late, "{late:?}");
-            assert_eq!(roll.phase_flips, flips, "{late:?}");
-        }
-    }
-}
+#[path = "lib_blink_roll_tests.rs"]
+mod blink_roll_tests;
 
 const SYNC_RELEASE_GRACE: Duration = Duration::from_millis(50);
 
@@ -2058,44 +2024,8 @@ fn note_term_lock_acquired() {
 }
 
 #[cfg(test)]
-mod wake_census {
-    use std::cell::Cell;
-
-    thread_local! {
-        static POOL_VISITS: Cell<u64> = const { Cell::new(0) };
-        static ADMISSION_WINDOWS: Cell<u64> = const { Cell::new(0) };
-        static AT_ADMISSION: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
-    }
-
-    /// One session yielded by `SessionPool::iter`.
-    pub(crate) fn note_pool_visit() {
-        POOL_VISITS.with(|c| c.set(c.get().wrapping_add(1)));
-    }
-
-    /// One window examined by redraw admission.
-    pub(crate) fn note_admission_window() {
-        ADMISSION_WINDOWS.with(|c| c.set(c.get().wrapping_add(1)));
-    }
-
-    /// Admission starts: record the pool walks and terminal locks so far.
-    pub(crate) fn note_admission_entry() {
-        let locks = super::term_lock_acquisitions_on_this_thread();
-        AT_ADMISSION.with(|c| c.set(Some((pool_visits(), locks))));
-    }
-
-    pub(crate) fn pool_visits() -> u64 {
-        POOL_VISITS.with(Cell::get)
-    }
-
-    pub(crate) fn admission_windows() -> u64 {
-        ADMISSION_WINDOWS.with(Cell::get)
-    }
-
-    /// `(pool visits, terminal locks)` as of the last admission entry, and forget it.
-    pub(crate) fn take_at_admission() -> Option<(u64, u64)> {
-        AT_ADMISSION.with(Cell::take)
-    }
-}
+#[path = "lib_wake_census_tests.rs"]
+mod wake_census;
 
 #[cfg(test)]
 const HELD_SLOTS: usize = 8;
@@ -2167,45 +2097,8 @@ impl Drop for TermHeldMark {
 }
 
 #[cfg(test)]
-mod term_relock_tests {
-    use super::*;
-
-    #[test]
-    fn a_relock_on_the_holding_thread_panics_naming_the_hold() {
-        let term = Arc::new(Mutex::new(Terminal::new(2, 10)));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let t = Arc::clone(&term);
-        std::thread::spawn(move || {
-            let relock = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (term_lock(&t).content_seq(), term_lock(&t).content_seq())
-            }));
-            let message = relock.err().and_then(|e| e.downcast::<String>().ok());
-            let _ = tx.send(message.map(|m| *m));
-        });
-        let message = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the relock neither returned nor panicked")
-            .expect("the relock panics");
-        let site = |after: &str, before: &str| {
-            let rest = message
-                .split_once(after)
-                .map(|(_, r)| r)
-                .unwrap_or_default();
-            let at = rest.split_once(before).map(|(a, _)| a).unwrap_or_default();
-            at.rsplit_once(':').map(|(line, _)| line.to_string())
-        };
-        let relock = site("term_lock at ", " relocks");
-        let hold = site("held since ", ": the lock");
-        assert!(
-            relock.as_deref().is_some_and(|l| l.starts_with(file!())) && relock == hold,
-            "names the hold at the relock's own line: {message}"
-        );
-        let other = Mutex::new(Terminal::new(2, 10));
-        let next = Mutex::new(Terminal::new(2, 10));
-        let _a = term_lock(&other);
-        let _b = term_lock(&next);
-    }
-}
+#[path = "lib_term_relock_tests.rs"]
+mod term_relock_tests;
 
 fn warn_terminal_mutex_poisoned() {
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -2314,64 +2207,8 @@ pub(crate) fn pause_for_handover(
 /// The pauses bounded waiters take ([`pause_for_handover`]), counted per `ui_waiting`, for a test
 /// whose holder hands the lock over only once its waiter is asleep.
 #[cfg(test)]
-pub(crate) mod handover_pauses_for_test {
-    use std::sync::atomic::AtomicU32;
-    use std::sync::{Mutex, PoisonError};
-
-    static WATCHED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-
-    fn address(ui_waiting: &AtomicU32) -> usize {
-        std::ptr::from_ref(ui_waiting).addr()
-    }
-
-    /// Counts the pauses of the waiters on one `ui_waiting` while it lives.
-    #[must_use = "the pauses are counted only while the watch is held"]
-    pub(crate) struct Watch(usize);
-
-    impl Watch {
-        /// How many pauses the waiters on the watched `ui_waiting` have taken.
-        pub(crate) fn pauses(&self) -> usize {
-            WATCHED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .find(|(at, _)| *at == self.0)
-                .map_or(0, |(_, pauses)| *pauses)
-        }
-    }
-
-    impl Drop for Watch {
-        fn drop(&mut self) {
-            WATCHED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .retain(|(at, _)| *at != self.0);
-        }
-    }
-
-    /// Watch `ui_waiting` from now.
-    pub(crate) fn watch(ui_waiting: &AtomicU32) -> Watch {
-        let at = address(ui_waiting);
-        WATCHED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((at, 0));
-        Watch(at)
-    }
-
-    pub(super) fn paused(ui_waiting: &AtomicU32) {
-        let at = address(ui_waiting);
-        for (watched_at, pauses) in WATCHED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter_mut()
-        {
-            if *watched_at == at {
-                *pauses += 1;
-            }
-        }
-    }
-}
+#[path = "lib_handover_pauses_for_test_tests.rs"]
+pub(crate) mod handover_pauses_for_test;
 
 /// The releaser's half of [`term_lock_ui`]'s handoff, called by the PTY reader and the compress
 /// worker between batches: while a waiter is registered it spins until the waiter has the lock or
@@ -2399,150 +2236,8 @@ fn yield_to_ui_waiter_until(
 }
 
 #[cfg(test)]
-mod ui_handoff_tests {
-    use super::*;
-    use std::cell::Cell;
-    use std::sync::atomic::AtomicU32;
-
-    #[test]
-    fn no_waiter_means_no_pause() {
-        let waiting = AtomicU32::new(0);
-        let reads = Cell::new(0u32);
-        for _ in 0..1000 {
-            yield_to_ui_waiter_until(&waiting, UI_HANDOFF_SPIN, || {
-                reads.set(reads.get() + 1);
-                Instant::now()
-            });
-        }
-        assert_eq!(
-            reads.get(),
-            0,
-            "the flood fast path must not read the clock"
-        );
-    }
-
-    #[test]
-    fn a_registered_waiter_is_waited_for_until_it_takes_the_lock() {
-        const CLEARS_ON_READ: u64 = 5;
-        let waiting = AtomicU32::new(1);
-        let base = Instant::now();
-        let reads = Cell::new(0u64);
-        yield_to_ui_waiter_until(&waiting, UI_HANDOFF_SPIN, || {
-            let n = reads.get();
-            reads.set(n + 1);
-            if n == CLEARS_ON_READ {
-                // The waiter has been woken and has taken the lock.
-                waiting.store(0, Ordering::Release);
-            }
-            base + Duration::from_micros(n)
-        });
-        assert_eq!(waiting.load(Ordering::Acquire), 0);
-        assert_eq!(
-            reads.get(),
-            CLEARS_ON_READ + 1,
-            "the releaser must spin up to the clear and return on the very next check: \
-             fewer reads means it re-took the lock underneath the waiter, more means it \
-             kept spinning after the handoff"
-        );
-    }
-
-    #[test]
-    fn a_stuck_waiter_cannot_strand_the_releaser() {
-        let waiting = AtomicU32::new(1);
-        let base = Instant::now();
-        let reads = Cell::new(0u64);
-        yield_to_ui_waiter_until(&waiting, Duration::from_micros(200), || {
-            let n = reads.get();
-            reads.set(n + 1);
-            base + Duration::from_micros(n * 20)
-        });
-        assert_eq!(
-            waiting.load(Ordering::Acquire),
-            1,
-            "the waiter never cleared: the bound is the only thing that ended the spin"
-        );
-        assert_eq!(
-            reads.get(),
-            11,
-            "`t0` plus ten 20 µs steps — the spin ends AT the bound, not before it and \
-             not after it"
-        );
-    }
-
-    /// A bounded read of a busy terminal waits asleep, registered for the hand-over: this holder
-    /// lets go only once its waiter has slept for it, which a waiter that yields between its
-    /// tries never does.
-    #[test]
-    fn a_bounded_read_sleeps_for_the_handover_and_never_yields() {
-        let term = Arc::new(Mutex::new(Terminal::new(2, 10)));
-        let waiting = Arc::new(AtomicU32::new(0));
-        let watch = handover_pauses_for_test::watch(&waiting);
-        let held = term_lock(&term);
-        let (t2, w2) = (term.clone(), waiting.clone());
-        let reader =
-            std::thread::spawn(move || term_lock_ui_within(&t2, &w2, UI_READ_HANDOFF).is_some());
-        let slept = aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO, || {
-            (waiting.load(Ordering::Acquire) > 0 && watch.pauses() > 0).then_some(())
-        });
-        drop(held);
-        yield_to_ui_waiter(&waiting);
-        let read = reader.join().expect("the reader");
-        assert!(
-            slept.is_some(),
-            "timed out waiting for the read to sleep as a registered waiter"
-        );
-        assert!(read, "the read took the handed-over terminal");
-        assert_eq!(
-            waiting.load(Ordering::Acquire),
-            0,
-            "and left no registration"
-        );
-    }
-
-    #[test]
-    fn term_lock_ui_registers_only_while_blocked_and_books_the_wait() {
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        let waiting = Arc::new(AtomicU32::new(0));
-        let site = metrics::TermWaitSite::Press;
-        let before = metrics::METRICS.window.redraw.term_wait[site.index()]
-            .copy_out()
-            .n();
-        {
-            let _g = term_lock_ui(&term, &waiting, site);
-            assert_eq!(waiting.load(Ordering::Acquire), 0);
-        }
-        let held = term_lock(&term);
-        let (t2, w2) = (term.clone(), waiting.clone());
-        let acquirer = std::thread::spawn(move || {
-            let g = term_lock_ui(&t2, &w2, site);
-            let while_held = w2.load(Ordering::Acquire);
-            drop(g);
-            while_held
-        });
-        let t0 = Instant::now();
-        while waiting.load(Ordering::Acquire) == 0 {
-            assert!(
-                t0.elapsed() < Duration::from_secs(60),
-                "acquirer never registered"
-            );
-            aterm_uds::deadline::poll_yield();
-        }
-        drop(held);
-        assert_eq!(
-            acquirer.join().unwrap(),
-            0,
-            "registration must clear on entry"
-        );
-        assert_eq!(waiting.load(Ordering::Acquire), 0);
-        assert!(
-            metrics::METRICS.window.redraw.term_wait[site.index()]
-                .copy_out()
-                .n()
-                >= before + 2,
-            "both acquisitions must book a sample (n counts every acquisition)"
-        );
-    }
-}
+#[path = "lib_ui_handoff_tests.rs"]
+mod ui_handoff_tests;
 
 /// RAII guard over the shared [`Terminal`] lock, returned by [`term_lock`].
 pub(crate) struct TermGuard<'a> {
@@ -2617,72 +2312,8 @@ impl Drop for TermGuard<'_> {
 }
 
 #[cfg(test)]
-mod frame_hold_tests {
-    use super::*;
-    use crate::session_watch::{Subscription, Watchers};
-    use aterm_core::selection::{SelectionSide, SelectionType};
-
-    fn select_to(t: &mut Terminal, end_col: u16) {
-        let sel = t.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, end_col, SelectionSide::Right);
-        sel.complete_selection();
-    }
-
-    #[test]
-    fn a_hold_that_moves_the_frame_rings_its_frame_watchers() {
-        let term = Mutex::new(Terminal::new(4, 12));
-        for i in 0..12 {
-            term_lock(&term).process(format!("line {i}\r\n").as_bytes());
-        }
-        let watchers = Arc::<Watchers>::default();
-        watchers.bind_frame(&term);
-        let other = Subscription::single(&watchers);
-        select_to(&mut term_lock(&term), 3);
-        assert!(
-            !other.wait(Duration::ZERO),
-            "nobody reads the screen: a selection rings nobody"
-        );
-
-        let mut screen = Subscription::new();
-        let flag = screen.watch_frame(&watchers);
-        flag.store(false, Ordering::Release);
-        let rang = || {
-            let woke = screen.wait(Duration::ZERO);
-            assert_eq!(
-                woke,
-                flag.swap(false, Ordering::AcqRel),
-                "a frame ring sets the registration's flag"
-            );
-            woke
-        };
-
-        let seq = term_lock(&term).content_seq();
-        assert!(!rang(), "a read-only hold rings nobody");
-        term_lock(&term).scroll_display(2);
-        assert_ne!(term_lock(&term).grid().display_offset(), 0, "the premise");
-        assert!(!rang(), "a viewport scroll moves no frame");
-        select_to(&mut term_lock(&term), 5);
-        assert_eq!(term_lock(&term).content_seq(), seq, "the premise");
-        assert!(rang(), "a selection rings the screen readers");
-        assert!(!other.wait(Duration::ZERO), "and only them");
-        {
-            let mut t = term_lock(&term);
-            t.holder_rings();
-            t.process(b"more\r\n");
-        }
-        assert!(!rang(), "a holder that rings itself is left to");
-        term_lock(&term).process(b"more\r\n");
-        assert!(rang(), "the same write rings when its holder does not");
-
-        drop(screen);
-        select_to(&mut term_lock(&term), 7);
-        assert!(
-            !other.wait(Duration::ZERO),
-            "the screen reader gone, a selection rings nobody"
-        );
-    }
-}
+#[path = "lib_frame_hold_tests.rs"]
+mod frame_hold_tests;
 
 #[cfg(debug_assertions)]
 pub(crate) mod term_guard {
@@ -2777,74 +2408,8 @@ pub(crate) fn exit_without_process_teardown(code: i32) -> ! {
 }
 
 #[cfg(all(test, unix))]
-mod launch_fatal_exit_tests {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    const ARM: &str = "aterm-launch-fatal-child";
-
-    const HANDLER_RAN: i32 = 86;
-
-    unsafe extern "C" {
-        fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
-    }
-
-    extern "C" fn the_driver_destructors_ran() {
-        // `_exit`, through the crate's one spelling of it: no further handler
-        // or destructor runs, and nothing returns.
-        crate::crash_signal::clean_exit_now(HANDLER_RAN)
-    }
-
-    fn launch_fatal_child_if_asked() {
-        let argv: Vec<String> = std::env::args().collect();
-        if !argv.iter().any(|a| a == ARM) {
-            return;
-        }
-        // SAFETY: registering a C exit handler in a single-threaded `--test-threads=1` child.
-        let armed = unsafe { atexit(the_driver_destructors_ran) };
-        assert_eq!(armed, 0, "atexit accepted the handler");
-        super::fatal_launch_error(
-            true,
-            super::LaunchFatal::Spawn,
-            "spawn failed: child could not exec `/opt/homebrew/bin/fish`",
-        );
-    }
-
-    fn run_child() -> crate::test_alone::Ran {
-        let mut child = crate::test_alone::StandIn::helper(
-            module_path!(),
-            "a_launch_fatal_exits_1_and_runs_no_atexit_handler",
-        );
-        child.command().arg(ARM);
-        child.spawn().selected()
-    }
-
-    #[test]
-    fn a_launch_fatal_exits_1_and_runs_no_atexit_handler() {
-        launch_fatal_child_if_asked();
-        let out = run_child();
-        let (stdout, stderr) = (&out.stdout, &out.stderr);
-        let status = out.status.expect("the stand-in exited");
-        assert_eq!(
-            status.signal(),
-            None,
-            "a handled configuration error must not die on a signal — stderr: {stderr}"
-        );
-        assert_eq!(
-            status.code(),
-            Some(1),
-            "status {HANDLER_RAN} is the armed `atexit` handler run, as exit(3) runs it \
-             — stderr: {stderr}"
-        );
-        assert!(
-            stderr.contains("aterm-gui: spawn failed: child could not exec"),
-            "the one true sentence still reaches stderr — stderr: {stderr}"
-        );
-        assert!(
-            !stdout.contains("test result:"),
-            "the process left INSIDE the fatal, not through a failing harness — stdout: {stdout}"
-        );
-    }
-}
+#[path = "lib_launch_fatal_exit_tests.rs"]
+mod launch_fatal_exit_tests;
 
 #[cfg(windows)]
 fn confirm_multiline_paste_dialog(lines: usize, owner_hwnd: isize) -> bool {
@@ -2877,6 +2442,13 @@ mod win32 {
         fn RegisterApplicationRestart(pwz_commandline: *const u16, dw_flags: u32) -> i32;
         fn LoadLibraryW(name: *const u16) -> isize;
         fn GetProcAddress(module: isize, name: *const u8) -> isize;
+        fn CreateWaitableTimerExW(
+            attributes: *const core::ffi::c_void,
+            name: *const u16,
+            flags: u32,
+            access: u32,
+        ) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
     }
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -2887,13 +2459,74 @@ mod win32 {
         fn timeBeginPeriod(period: u32) -> u32;
     }
 
-    /// Raise the system-timer resolution to 1 ms so event-loop deadlines are not rounded to Windows' ~15.6 ms default grid.
-    pub(super) fn raise_timer_resolution() {
-        // SAFETY: documented `timeBeginPeriod(1)` call with no pointers crossing the FFI boundary.
+    /// What keeps the event loop's deadlines off Windows' 15.6 ms tick.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TimerGrid {
+        /// The loop's own high-resolution waitable timer (`aterm-window`'s
+        /// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803 and later), which fires on
+        /// time whatever the tick is: the tick is left alone.
+        LoopTimer,
+        /// A 1 ms tick this process asks the machine for, where Windows has no such timer and
+        /// the loop waits on a plain millisecond timeout.
+        Period,
+    }
+
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+
+    /// Whether Windows makes the timer the event loop waits on: asked as the loop asks
+    /// (`aterm-window`'s `create_high_resolution_timer`), the handle closed at once.
+    fn high_resolution_timer_available() -> bool {
+        // SAFETY: an unnamed timer with default security; the handle it returns is owned here
+        // and closed before returning.
         unsafe {
-            let _ = timeBeginPeriod(1);
+            let timer = CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            );
+            if timer == 0 {
+                return false;
+            }
+            let _ = CloseHandle(timer);
+            true
         }
     }
+
+    /// The grid for a Windows that does (`true`) or does not make the loop's timer.
+    const fn timer_grid(high_resolution_timer: bool) -> TimerGrid {
+        if high_resolution_timer {
+            TimerGrid::LoopTimer
+        } else {
+            TimerGrid::Period
+        }
+    }
+
+    /// Keep the event loop's deadlines off the 15.6 ms tick at the least cost: nothing where
+    /// the loop has its high-resolution timer, and `timeBeginPeriod(1)` only where it has none.
+    /// A 1 ms period is a request to the whole machine (a thousand timer interrupts a second
+    /// for as long as the process lives, headless ones too), and the loop's timer does not
+    /// need it: measured with no period asked, a 1 ms wait on that timer took 1.55 ms at the
+    /// median and a `std::thread::sleep(1 ms)`, which rides the same kind of timer, 1.55 ms,
+    /// where a plain `MsgWaitForMultipleObjectsEx` timeout took 15.99 ms. The 10 ms `WM_TIMER`
+    /// that pumps the loop inside a window drag came every 15.6 ms with the period and
+    /// without it. A thread's `park_timeout`, `recv_timeout` or `Condvar::wait_timeout` does
+    /// round up to the tick without the period (15.9 ms for 1 ms asked); the waits a key or a
+    /// frame passes through are the loop's and `std::thread::sleep`s.
+    pub(super) fn settle_timer_grid() -> TimerGrid {
+        let grid = timer_grid(high_resolution_timer_available());
+        if grid == TimerGrid::Period {
+            // SAFETY: documented `timeBeginPeriod(1)` call with no pointers crossing the FFI boundary.
+            unsafe {
+                let _ = timeBeginPeriod(1);
+            }
+        }
+        grid
+    }
+
+    #[cfg(test)]
+    mod timer_grid_tests;
 
     /// The process AUMID.
     pub(super) const AUMID: &str = "Aterm.Terminal";
@@ -2970,21 +2603,7 @@ mod win32 {
     }
 
     #[cfg(test)]
-    mod attach_console_tests {
-        #[test]
-        fn attach_reports_no_attach_when_the_parent_supplied_every_handle() {
-            assert!(!super::attach_parent_console());
-            assert!(!super::attached_a_console());
-        }
-
-        #[test]
-        fn an_attached_console_is_released_only_for_a_window() {
-            assert!(super::attached_console_is_released_for(true, false));
-            assert!(!super::attached_console_is_released_for(true, true));
-            assert!(!super::attached_console_is_released_for(false, false));
-            assert!(!super::attached_console_is_released_for(false, true));
-        }
-    }
+    mod attach_console_tests;
 
     /// Whether `current` sits in a cargo profile directory (`target/debug`, `target/release`, `target/<triple>/<profile>`).
     pub(super) fn in_cargo_profile_dir(current: &std::path::Path) -> bool {
@@ -3338,27 +2957,8 @@ fn preedit_fingerprint(preedit: &str, caret: Option<usize>) -> Option<PreeditRep
 }
 
 #[cfg(test)]
-mod preedit_fingerprint_tests {
-    /// NEGATIVE CONTROL: empty preedit is `None` (unconditionally disjoint from every non-empty `Some(...)`),
-    /// and both `text_len` and `caret` (including `None` vs `Some(usize::MAX)`) are stored structurally.
-    #[test]
-    fn empty_is_zero_and_text_and_caret_both_move_it() {
-        assert_eq!(super::preedit_fingerprint("", None), None);
-        assert_eq!(
-            super::preedit_fingerprint("", Some(3)),
-            None,
-            "no text, no overlay"
-        );
-        let a = super::preedit_fingerprint("日本", None);
-        let b = super::preedit_fingerprint("日本語", None);
-        let c = super::preedit_fingerprint("日本", Some(3));
-        let d = super::preedit_fingerprint("日本", Some(usize::MAX));
-        assert_ne!(a, None);
-        assert_ne!(a, b, "text length moves the key");
-        assert_ne!(a, c, "the caret alone moves the key");
-        assert_ne!(a, d, "None and Some(usize::MAX) never alias");
-    }
-}
+#[path = "lib_preedit_fingerprint_tests.rs"]
+mod preedit_fingerprint_tests;
 
 #[derive(Clone, Debug)]
 enum SearchRepeatAction {
@@ -3524,7 +3124,14 @@ enum Wake {
         serial: u64,
         drained: app_account_work::Settlement,
     },
+    /// Account work outlived its bound, or its worker panicked ([`app_account_work`]): what waited on
+    /// it goes on.
+    AccountsOutlived {
+        serial: u64,
+    },
     MailChanged,
+    /// The Tables page's reader answered.
+    TablesChanged,
     #[cfg(all(unix, not(test)))]
     NetworkPlaceChanged,
     #[cfg(target_os = "macos")]
@@ -3549,8 +3156,8 @@ enum Wake {
         )
     )]
     DeveloperToolsLowData(bool),
-    /// Whether setup's one early elevation owes this Mac a root step beside the tools, read off
-    /// the loop at launch ([`clt_install::read_root_steps`]).
+    /// What setup's one early elevation owes this Mac beside the tools, read off the loop at
+    /// launch and after an attempt that did not finish ([`clt_install::read_root_steps`]).
     #[cfg_attr(
         not(target_os = "macos"),
         expect(
@@ -3558,7 +3165,7 @@ enum Wake {
             reason = "only macOS reads the elevation's steps: elsewhere no reader sends it"
         )
     )]
-    RootStepsOwed(bool),
+    RootStepsOwed(clt_install::RootSteps),
     InitialSetupStatus {
         generation: Option<u64>,
         status: system_state::SetupStatus,
@@ -3727,6 +3334,8 @@ enum Wake {
     #[cfg(all(test, unix))]
     ConfigReload,
     ConfigReloadObserved(native_config_service::ConfigDiskObservation),
+    /// The text of a file the config watcher's admission refuses (`App::take_refused_update_text`).
+    RefusedUpdateText(String),
     ConfigWatchStatus(config_watcher::WatchStatusEvent),
     HarnessPolicyObserved(harness_policy_cell::StampedHarnessPolicy),
     ThemeCatalogChanged(Arc<app_config::ThemeCatalog>),
@@ -3777,7 +3386,8 @@ enum Wake {
     NativeUpdateWorkerDrained,
     NativeDocumentQueueSlotAvailable,
     NativeBootHealthConfirmationFinished {
-        confirmed: bool,
+        ticket: app_native::BootHealthConfirmationTicket,
+        result: aterm_update::BootHealthVerdict,
     },
     #[cfg_attr(test, allow(dead_code))]
     NativeActivationSuperseded(Box<app_native::ActivationSupersedeCompletion>),
@@ -3902,6 +3512,9 @@ enum Wake {
         build: u64,
         version: String,
     },
+    /// Windows: what the window says about the build staged on this machine changed.
+    #[cfg(windows)]
+    StagedBuildNotice(aterm_update::windows::Notice),
     SetSettingsField {
         key: String,
         value: Option<String>,
@@ -4006,9 +3619,18 @@ enum Wake {
         theme: Option<String>,
         task: Option<task_launch::TaskOrder>,
         shell: Option<String>,
+        /// Asked over a fleet drive, by this requester: the tab parks under the Workers tab,
+        /// parented to nothing, and its open records the requester's program, model and account
+        /// (ATERM-KI-1109-3).
+        fleet: Option<aterm_types::control_verbs::Requester>,
+        /// The request's `why=` line, which the new tab's open records (`why_text=`).
+        why: Option<String>,
         /// The caller, whom the new tab's open names.
         by: session_store::ExitActor,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+        /// The request the spawn opened or joined, which its answer settles
+        /// ([`tab_spawn::SpawnReply`]).
+        request: Option<requests_host::Pending>,
     },
     SpawnConnectedSession {
         kind: connections::ConnectedSpawnKind,
@@ -4019,6 +3641,8 @@ enum Wake {
         /// The caller, whom the new tab's open names.
         by: session_store::ExitActor,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+        /// As [`Wake::SpawnSession`]'s.
+        request: Option<requests_host::Pending>,
     },
     TabSpawned(Arc<tab_spawn::TabSpawnCompletion>),
     SpareSpawned(Box<spare::SpareSpawned>),
@@ -4031,6 +3655,13 @@ enum Wake {
         by: session_store::ExitActor,
         driver: Option<String>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// `request keep`: keep these sessions' tabs as the person's (Keep as Tab), by `by`; the
+    /// reply is how many were kept ([`requests_review`]).
+    KeepTabs {
+        sessions: Vec<u64>,
+        by: session_store::ExitActor,
+        reply: std::sync::mpsc::Sender<usize>,
     },
     RaiseSession {
         session: u64,
@@ -4164,6 +3795,11 @@ enum Wake {
     StatusMenuOpening {
         painted: Option<Box<status_item::Glance>>,
     },
+    /// This Mac's stored fleet access changed (`aterm_agent::fleet_access::CHANGED`, which
+    /// `aterm fleet access` and another window's lock post): the App reads the file again
+    /// ([`App::reread_fleet_access`]). The notification carries no level.
+    #[cfg(target_os = "macos")]
+    FleetAccessChanged,
     SiblingScan(Vec<status_item::SiblingInstance>),
     /// This machine's name as `machine-name.toml` holds it, from [`machine_title::spawn`]'s
     /// reader: the menu bar's machine title follows it.
@@ -4360,7 +3996,7 @@ enum Wake {
     },
     WallMoved,
 
-    UpdateProgress(aterm_update::Progress),
+    UpdateProgress(aterm_update::ProgressReport),
     UpdateCheckAsked {
         begun: bool,
     },
@@ -4538,25 +4174,8 @@ impl ScrollbackReclaim {
 mod global_cap_tests;
 
 #[cfg(test)]
-mod pressure_shed_tests {
-    use super::pressure_shed_budget;
-
-    #[test]
-    fn pressure_shed_budget_policy() {
-        let mib = 1usize << 20;
-        assert!(pressure_shed_budget(100 * mib, true) < pressure_shed_budget(100 * mib, false));
-        assert_eq!(pressure_shed_budget(2 * mib, true), mib, "floor at 1 MiB");
-        assert_eq!(
-            pressure_shed_budget(0, false),
-            mib,
-            "floor even at a zero budget"
-        );
-        for &b in &[mib, 8 * mib, 512 * mib] {
-            assert!(pressure_shed_budget(b, false) <= b);
-            assert!(pressure_shed_budget(b, true) <= b);
-        }
-    }
-}
+#[path = "lib_pressure_shed_tests.rs"]
+mod pressure_shed_tests;
 
 /// What the control socket's `tab` verb asks the main thread to do to the front window's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5537,33 +5156,8 @@ pub fn driver_display_unavailable() -> Option<String> {
 }
 
 #[cfg(test)]
-mod headless_activation_posture_tests {
-    use super::{AppActivation, LaunchPosture, launch_posture};
-
-    #[test]
-    fn only_a_cold_windowed_launch_asks_to_activate_and_a_successor_waits_for_commit() {
-        let prohibited = LaunchPosture {
-            policy: Some(AppActivation::Prohibited),
-            activate_on_launch: false,
-        };
-        let successor = LaunchPosture {
-            policy: LaunchPosture::WINIT_DEFAULT.policy,
-            activate_on_launch: false,
-        };
-        for (headless, candidate, want) in [
-            (true, false, prohibited),
-            (true, true, prohibited),
-            (false, true, successor),
-            (false, false, LaunchPosture::WINIT_DEFAULT),
-        ] {
-            assert_eq!(
-                launch_posture(headless, candidate),
-                want,
-                "headless={headless} handoff_candidate={candidate}"
-            );
-        }
-    }
-}
+#[path = "lib_headless_activation_posture_tests.rs"]
+mod headless_activation_posture_tests;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 struct PixelBackendRedemptionLegs {
@@ -5649,161 +5243,8 @@ fn pixel_backend_redemption_line(legs: &PixelBackendRedemptionLegs, total_ms: f6
 }
 
 #[cfg(test)]
-mod headless_font_seal_deferral_tests {
-    #[test]
-    fn the_first_pixel_demand_seals_a_deferred_headless_generation_once() {
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        app.deferred_font_seal = true;
-        assert!(
-            !sealed(&app),
-            "precondition: the published generation is raw"
-        );
-
-        app.ensure_pixel_backend();
-        assert!(
-            sealed(&app),
-            "the first pixel demand must settle the cascade"
-        );
-        assert!(!app.deferred_font_seal, "the intent is spent, not standing");
-
-        app.ensure_pixel_backend();
-        assert!(sealed(&app));
-    }
-
-    #[test]
-    fn the_seal_and_its_chrome_resync_are_timed_apart_and_once() {
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        app.deferred_font_seal = true;
-        let epoch = crate::tray_raster::chrome_font_epoch_for_test();
-        let (seal_ms, chrome_sync_ms) = app
-            .redeem_deferred_font_seal()
-            .expect("an owed seal is redeemed, and both halves are timed");
-        assert!(seal_ms.is_finite() && seal_ms >= 0.0, "{seal_ms}");
-        assert!(
-            chrome_sync_ms.is_finite() && chrome_sync_ms >= 0.0,
-            "{chrome_sync_ms}"
-        );
-        assert!(sealed(&app), "the first half sealed the generation");
-        assert_ne!(
-            crate::tray_raster::chrome_font_epoch_for_test(),
-            epoch,
-            "the second half re-synced the chrome faces inside the redemption"
-        );
-        assert_eq!(
-            app.redeem_deferred_font_seal(),
-            None,
-            "a spent debt times nothing"
-        );
-    }
-
-    /// A HEADLESS RUN'S FIRST NATIVE VIEW LAYS OUT IN THE FACES ITS CAPTURE PAINTS WITH: with
-    /// the font seal deferred, opening Settings redeems it and installs the chrome faces before
-    /// the page is laid out, so the layout `inspect` reads before any capture is the one read
-    /// after the capture's pixel demand. NEGATIVE CONTROL: with the faces left to the first
-    /// capture (main before this), the page first laid out in the fallback face's metrics and
-    /// the capture re-laid it out (`All Settings` required 93.6 then 64.2; here the layout
-    /// check fails first, the page's 35 painted nodes 29 after the capture's faces landed).
-    #[test]
-    fn a_headless_runs_first_native_view_lays_out_in_its_painted_faces() {
-        use crate::native_settings::SettingsRoute;
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        app.deferred_font_seal = true;
-        let wid = crate::WindowId(0);
-        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-        let redeemed = !app.deferred_font_seal && sealed(&app);
-        let (_, view) = app.active_native_view(wid).expect("Settings in front");
-        // The layout: every audit line but its raster identities, which name the faces' install.
-        let audit = |app: &super::App| {
-            app.inspect_app(crate::app_control::InspectRequest::View {
-                view,
-                projection: aterm_types::app_inspection::InspectionProjection::Audit,
-            })
-            .expect("the page inspects")
-            .into_iter()
-            .skip(2)
-            .map(|line| {
-                line.split(' ')
-                    .filter(|word| !word.contains("fingerprint="))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect::<Vec<_>>()
-        };
-        let before = audit(&app);
-        app.ensure_pixel_backend();
-        app.sync_chrome_fonts();
-        assert_eq!(
-            audit(&app),
-            before,
-            "the layout read before the first capture is the painted one"
-        );
-        assert!(
-            redeemed,
-            "the first native view redeemed the deferred faces"
-        );
-    }
-
-    #[test]
-    fn a_pixel_demand_with_no_seal_owed_settles_nothing() {
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        assert!(!app.deferred_font_seal, "a test App owes no seal");
-        app.ensure_pixel_backend();
-        assert!(
-            !sealed(&app),
-            "nothing may seal a generation nobody deferred"
-        );
-    }
-
-    #[test]
-    fn a_rebuild_from_admitted_redeems_the_owed_seal_instead_of_failing_soft() {
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        app.deferred_font_seal = true;
-        assert!(
-            app.rebuild_backend(),
-            "the rebuild must settle the generation it needs, not decline it"
-        );
-        assert!(sealed(&app), "and the redemption is what settled it");
-        assert!(!app.deferred_font_seal);
-    }
-
-    #[test]
-    fn a_rebuild_from_an_unsealed_generation_with_no_debt_owed_declines() {
-        let mut app = super::App::headless_for_test();
-        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
-            super::Renderer::from_system(super::FONT_PX, app.theme)
-                .expect("system font for an unsealed generation"),
-        ));
-        assert!(!app.deferred_font_seal);
-        assert!(!app.rebuild_backend(), "nothing owed, nothing sealed");
-    }
-
-    fn sealed(app: &super::App) -> bool {
-        match &app.backend {
-            super::BackendSlot::Ready(backend) => backend.admitted_font_sources_sealed(),
-            super::BackendSlot::Pending(_) => panic!("the test App holds a ready backend"),
-        }
-    }
-}
+#[path = "lib_headless_font_seal_deferral_tests.rs"]
+mod headless_font_seal_deferral_tests;
 
 #[cfg(test)]
 #[path = "lib_headless_gpu_deferral_tests.rs"]
@@ -6246,6 +5687,15 @@ impl Session {
             .is_some_and(|commit| commit.withdraw(&self.ctx.self_id))
     }
 
+    /// This process leaves the session's program to the keeper, which holds its PTY past the
+    /// quit (`App::carry_developer_tools_install_at_exit`): no teardown of this process's hangs
+    /// it up ([`Self::hang_up_and_reap`], its drop), and the quit's `SessionPool::retire_at_quit`
+    /// is told to leave it as it is.
+    fn leave_to_keeper(&self) {
+        self.teardown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     fn hang_up_and_reap(&self, predecessor_owns: bool) {
         if predecessor_owns || self.child_reaped.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -6540,13 +5990,16 @@ impl SessionPool {
     /// was killed at the reaper's kill tick, its history unsaved (ATERM-KI-1104-7). Where the
     /// keeper's RELEASEs were not written in time it may still hold the masters, so the readers
     /// go on reading them, as they did before: a master held open and unread keeps a zsh at its
-    /// prompt from exiting. A session its predecessor still owns is left as it is.
+    /// prompt from exiting. A session its predecessor still owns is left as it is, and so is each
+    /// of `carried`, whose program the quit leaves to the keeper
+    /// (`App::carry_developer_tools_install_at_exit`): neither hung up nor RELEASEd, so the keeper
+    /// still holds its master when the BYE names it ([`keeper_link::bye`]).
     #[cfg(unix)]
-    fn retire_at_quit(&mut self) {
+    fn retire_at_quit(&mut self, carried: &[u64]) {
         let owned: Vec<u64> = self
             .sessions
             .iter()
-            .filter(|(_, pooled)| !pooled.session.predecessor_owns())
+            .filter(|(id, pooled)| !pooled.session.predecessor_owns() && !carried.contains(id))
             .map(|(id, _)| *id)
             .collect();
         for session in owned.iter().filter_map(|id| self.get(*id)) {
@@ -9266,12 +8719,26 @@ fn active_tab_displays_session(
     })
 }
 
+/// Why the automatic intent's current retry deadline exists. A completion may shorten only the
+/// deadline it owns; target equality alone is not authority over a later retry for the same bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AutoApplyDeadlineOwner {
+    #[default]
+    Ordinary,
+    BootHealth,
+    #[cfg(unix)]
+    Preverification {
+        ended_at: Instant,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AutoApplyIntent {
     build: u64,
     dmg_sha256: [u8; 32],
     retry_at: Instant,
     attempts: u8,
+    deadline_owner: AutoApplyDeadlineOwner,
     /// The hold a poll past the ladder named for this intent (`native_update_lane_hold`): it goes
     /// with the intent, so a new arming starts with none.
     held: native_update_lane_hold::NamedHold,
@@ -9386,7 +8853,6 @@ struct AutoApplyStructuralVerdict {
     unmeasured_through: u64,
     unproven_looks: u8,
     unproven_through: u64,
-    held_unmeasured: bool,
 }
 
 /// Offers of different bytes are separate from retrying or resampling the failed artifact.
@@ -9415,6 +8881,11 @@ struct AutoOverlapRetry {
     dmg_sha256: [u8; 32],
     activation: bool,
     cycles: u8,
+    /// The physical lane's failures since its last stand-down, whatever their shape: the rung of
+    /// the epoch the next failure takes (`app_native::PhysicalFailureShape::retry_after`). Shapes
+    /// hold epochs of different lengths, so `cycles` alone cannot say where one ends. The
+    /// activity lane has no epochs and keeps 0.
+    epoch_failures: u8,
     last_attempt: std::time::Instant,
 }
 
@@ -9518,9 +8989,44 @@ const HANDOFF_PREVERIFY_READ_MARGIN: std::time::Duration = aterm_spec::wait::MUS
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(unix)]
+enum HeldPersonApplyGate {
+    /// The candidate's bounded pre-park authentication read.
+    Preverify { until: std::time::Instant },
+    /// This process's own first-frame/headless health proof.
+    BootHealth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 struct HeldPersonApply {
     target_build: u64,
-    until: std::time::Instant,
+    target_dmg_sha256: [u8; 32],
+    gate: HeldPersonApplyGate,
+}
+
+#[cfg(unix)]
+impl HeldPersonApply {
+    #[must_use]
+    const fn preverify(
+        target_build: u64,
+        target_dmg_sha256: [u8; 32],
+        until: std::time::Instant,
+    ) -> Self {
+        Self {
+            target_build,
+            target_dmg_sha256,
+            gate: HeldPersonApplyGate::Preverify { until },
+        }
+    }
+
+    #[must_use]
+    const fn boot_health(target_build: u64, target_dmg_sha256: [u8; 32]) -> Self {
+        Self {
+            target_build,
+            target_dmg_sha256,
+            gate: HeldPersonApplyGate::BootHealth,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -9539,6 +9045,24 @@ struct PreverifyInFlight {
 struct PassingPreverification {
     reason: String,
     ended: std::time::Instant,
+}
+
+/// The exact candidate and bounded window one apply lane has already asked a pre-park read to
+/// answer. A same-build artifact replacement owns a different wait and starts its own read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
+struct PreverifyReadWait {
+    build: u64,
+    dmg_sha256: [u8; 32],
+    until: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl PreverifyReadWait {
+    #[must_use]
+    fn covers(self, build: u64, dmg_sha256: [u8; 32]) -> bool {
+        self.build == build && self.dmg_sha256 == dmg_sha256
+    }
 }
 
 #[cfg(unix)]
@@ -9690,29 +9214,8 @@ const fn os_window_event_kind(event: &WindowEvent) -> Option<crate::metrics::OsW
 }
 
 #[cfg(test)]
-mod os_window_event_kind_tests {
-    use super::os_window_event_kind;
-    use crate::metrics::OsWindowEvent;
-    use aterm_window::event::WindowEvent;
-
-    #[test]
-    fn a_redraw_is_not_counted_and_a_focus_change_counts_as_focus() {
-        assert_eq!(os_window_event_kind(&WindowEvent::RedrawRequested), None);
-        assert_eq!(
-            os_window_event_kind(&WindowEvent::FrameTick {
-                target: std::time::Instant::now(),
-                period: std::time::Duration::from_micros(8_333),
-            }),
-            None,
-            "a display link's tick is the window's own frame, as a redraw is"
-        );
-        // CONTROL: the focus change a pet take refuses on is counted, under its kind.
-        assert_eq!(
-            os_window_event_kind(&WindowEvent::Focused(false)),
-            Some(OsWindowEvent::Focus)
-        );
-    }
-}
+#[path = "lib_os_window_event_kind_tests.rs"]
+mod os_window_event_kind_tests;
 
 const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
 
@@ -9728,43 +9231,8 @@ fn is_focus_replayed_press(event: &WindowEvent) -> bool {
 }
 
 #[cfg(test)]
-mod focus_replayed_press_tests {
-    use super::is_focus_replayed_press;
-    use aterm_window::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
-    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, NamedKey, PhysicalKey, SmolStr};
-
-    fn key(state: ElementState, is_synthetic: bool) -> WindowEvent {
-        WindowEvent::KeyboardInput {
-            device_id: DeviceId::dummy(),
-            event: KeyEvent::synthetic_for_test(
-                PhysicalKey::Code(KeyCode::Enter),
-                Key::Named(NamedKey::Enter),
-                Some(SmolStr::new("\r")),
-                KeyLocation::Standard,
-                state,
-                false,
-            ),
-            is_synthetic,
-        }
-    }
-
-    #[test]
-    fn only_a_press_replayed_on_focus_is_dropped() {
-        for (state, is_synthetic, dropped) in [
-            (ElementState::Pressed, true, true),
-            (ElementState::Pressed, false, false),
-            (ElementState::Released, true, false),
-            (ElementState::Released, false, false),
-        ] {
-            assert_eq!(
-                is_focus_replayed_press(&key(state, is_synthetic)),
-                dropped,
-                "{state:?} is_synthetic={is_synthetic}"
-            );
-        }
-        assert!(!is_focus_replayed_press(&WindowEvent::Focused(true)));
-    }
-}
+#[path = "lib_focus_replayed_press_tests.rs"]
+mod focus_replayed_press_tests;
 
 /// Where `event`, as it arrives from the OS, came from: a key an `hwkey` burst posted, or a key,
 /// modifier change, click or scroll another process posted (`crate::hwkey::classify`), else the
@@ -9794,6 +9262,29 @@ const fn handoff_deferrable_input(event: &WindowEvent) -> bool {
         event,
         WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) | WindowEvent::Ime(_)
     )
+}
+
+impl Wake {
+    /// Whether this wake's handler only refreshes an observation of the world that no restore
+    /// image reads: a surface ready to draw, a vitals reading, the disk board and its looks,
+    /// the menu bar's sibling, machine-name and fleet rows. Such a wake is not activity for the
+    /// crash journal ([`crash_journal::Lane::note_activity`]): it owes no capture and no
+    /// settle, so a window at rest does not build a restore image after each reading. Every
+    /// other wake is activity, the safe side: a capture equal to the last one writes nothing.
+    #[must_use]
+    const fn only_observes(&self) -> bool {
+        match self {
+            Wake::GpuSurfaceReady { .. }
+            | Wake::Vitals
+            | Wake::DiskWalk
+            | Wake::HostNote(harness_host::HostNote::DiskLooked)
+            | Wake::SiblingScan(_)
+            | Wake::FleetRead => true,
+            #[cfg(target_os = "macos")]
+            Wake::MachineName(_) | Wake::MachineNameNotSet(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[must_use]
@@ -10034,6 +9525,7 @@ enum UpdateHandoffStartError {
     #[cfg(unix)]
     HeldForRead {
         target_build: u64,
+        target_dmg_sha256: [u8; 32],
         until: std::time::Instant,
         message: String,
     },
@@ -10066,11 +9558,13 @@ impl UpdateHandoffStartError {
     #[cfg(unix)]
     fn held_for_read(
         target_build: u64,
+        target_dmg_sha256: [u8; 32],
         until: std::time::Instant,
         message: impl Into<String>,
     ) -> Self {
         Self::HeldForRead {
             target_build,
+            target_dmg_sha256,
             until,
             message: message.into(),
         }
@@ -10101,12 +9595,14 @@ impl UpdateHandoffStartError {
         match self {
             Self::HeldForRead {
                 target_build,
+                target_dmg_sha256,
                 until,
                 ..
-            } => Some(HeldPersonApply {
-                target_build: *target_build,
-                until: *until,
-            }),
+            } => Some(HeldPersonApply::preverify(
+                *target_build,
+                *target_dmg_sha256,
+                *until,
+            )),
             _ => None,
         }
     }
@@ -10376,6 +9872,41 @@ const fn should_dispatch_boot_health_confirmation(
     checkpoint && !already_dispatched && retry_due && !incoming_handoff_pending
 }
 
+/// Whether this process reached its health checkpoint: a window's first present, or a headless
+/// instance's service. Only an ask sent with it may run the trial's proof and disarm it. It is
+/// [`should_dispatch_boot_health_confirmation`] with nothing else in the way, so the proved
+/// predicate stays what says a confirmation may disarm.
+#[must_use]
+const fn boot_checkpoint_reached(
+    headless: bool,
+    headless_ready: bool,
+    first_present_done: bool,
+    has_os_window: bool,
+) -> bool {
+    should_dispatch_boot_health_confirmation(
+        headless,
+        headless_ready,
+        first_present_done,
+        false,
+        true,
+        has_os_window,
+        false,
+    )
+}
+
+/// Whether a boot-health ask may be queued: none is in flight, its retry is due, and this is
+/// no uncommitted handoff candidate (its parent may still reject it). An ask does not wait for
+/// the checkpoint ([`boot_checkpoint_reached`]): before it the updater only reads, so a process
+/// that owes no trial is confirmed without drawing a frame.
+#[must_use]
+const fn boot_health_ask_due(
+    already_dispatched: bool,
+    retry_due: bool,
+    incoming_handoff_pending: bool,
+) -> bool {
+    !already_dispatched && retry_due && !incoming_handoff_pending
+}
+
 fn handoff_paint_proven<'a>(
     headless: bool,
     first_present_done: bool,
@@ -10388,6 +9919,55 @@ fn handoff_paint_proven<'a>(
 enum RestorePassSite {
     FirstAttach,
     Park,
+}
+
+/// How long a restore pass queued at the park waits for the first window to reach the glass
+/// before it runs without it, as a headless app's does. A window that never presents (a display
+/// asleep or gone, a GPU that never answers) must not hold the person's session from them, or
+/// an update behind it, with no bound.
+const RESTORE_GLASS_PATIENCE: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    RESTORE_GLASS_PATIENCE.as_secs() < native_update_auto_intent::LANDS_WITHIN.as_secs(),
+    "a restore that waited out its glass runs inside the apply ladder's bound"
+);
+
+/// The park's wait for the first window to reach the glass before a queued restore pass runs
+/// without it ([`RESTORE_GLASS_PATIENCE`]). One wait per queued restore: it starts at the first
+/// park that finds the pass queued with nothing on the glass, the drain's later slices never
+/// start it again, and it ends only when nothing is queued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RestoreGlassWait {
+    since: Option<Instant>,
+    said: bool,
+}
+
+impl RestoreGlassWait {
+    /// One park's look: whether the queued pass has its glass, the first window on it or the
+    /// wait run out.
+    fn look(&mut self, queued: bool, on_glass: bool, now: Instant) -> bool {
+        if !queued {
+            *self = Self::default();
+            return on_glass;
+        }
+        if on_glass {
+            return true;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= RESTORE_GLASS_PATIENCE
+    }
+
+    /// Whether the pass running without glass is still unsaid; it is said once per wait.
+    fn say_once(&mut self) -> bool {
+        !std::mem::replace(&mut self.said, true)
+    }
+
+    /// When the wait runs out, while it is still ahead of `now`.
+    fn deadline(&self, now: Instant) -> Option<Instant> {
+        self.since
+            .map(|since| since + RESTORE_GLASS_PATIENCE)
+            .filter(|deadline| *deadline > now)
+    }
 }
 
 #[must_use]
@@ -10425,11 +10005,37 @@ fn restore_pass_sliced(site: RestorePassSite, carries_shells: bool) -> bool {
 const BOOT_HEALTH_RETRY_MIN: Duration = Duration::from_secs(1);
 const BOOT_HEALTH_RETRY_MAX: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Boot-health asks in a row that nothing answered (the updater could not be asked, the worker
+/// took none, an answer never came) after which the startup gate opens and the apply lane's own
+/// admission, under the apply lock, decides and names what holds it. An answer that the trial
+/// is pending starts the count again: then the updater holds by name, with its own bound.
+const BOOT_HEALTH_UNANSWERED_TRIES: u32 = 5;
+
+/// Whether this process still owes boot-health confirmation work for the image it started.
+///
+/// `InFlight` is deliberately distinct from `Complete`: the confirmation worker can spend its
+/// bounded wait behind another process's apply lock. `Complete` is an answer that opens the
+/// gate (`aterm_update::BootHealthVerdict::opens_gate`): nothing is owed, the trial was
+/// confirmed, or it was settled at its bound. It does not claim that a foreign trial was
+/// settled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BootHealthConfirmation {
-    Pending,
-    InFlight,
-    Confirmed,
+    #[default]
+    Awaiting,
+    InFlight(app_native::BootHealthConfirmationTicket),
+    Complete,
+}
+
+impl BootHealthConfirmation {
+    #[must_use]
+    const fn dispatched(self) -> bool {
+        !matches!(self, Self::Awaiting)
+    }
+
+    #[must_use]
+    const fn complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 #[must_use]
@@ -10491,23 +10097,8 @@ enum ResampleCause {
 }
 
 #[cfg(test)]
-mod resample_cause_tests {
-    use super::{ResampleCause, resample_wants_repair_frame};
-
-    #[test]
-    fn only_a_settings_burst_buys_the_repair_frame() {
-        assert!(
-            !resample_wants_repair_frame(ResampleCause::Poll),
-            "focus-gain must not repaint every window"
-        );
-        assert_eq!(
-            resample_wants_repair_frame(ResampleCause::SettingsBurst),
-            cfg!(windows),
-            "the repair frame exists to undo winit's Win32 non-client re-theme, \
-             and only Windows has one"
-        );
-    }
-}
+#[path = "lib_resample_cause_tests.rs"]
+mod resample_cause_tests;
 
 #[cfg(any(target_os = "macos", windows, test))]
 const fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
@@ -10565,6 +10156,8 @@ struct App {
     harness_screen: harness_screen::HarnessScreen,
     ai_screen: ai_screen::AiScreen,
     package_update_loop_running: bool,
+    /// Automatic checks run here from launch; once a launch read that had no answer answers on, the
+    /// page reads that instead ([`App::update_snapshot`]).
     update_checks_running: bool,
     native_update_reconcile_worker: Option<app_native::NativeUpdateReconcileSender>,
     next_native_update_reconcile_sequence: u64,
@@ -10701,6 +10294,10 @@ struct App {
     next_window_id: u64,
     pending_restore: Option<restore::RestoreManifest>,
     restore_drain: Option<Box<app_restore::RestoreDrain>>,
+    /// The park's queued restore pass waiting for the first window to reach the glass.
+    restore_glass: RestoreGlassWait,
+    /// The clocks of the update lane's own hold backstops (`App::tick_lane_hold_clocks`).
+    lane_hold_clocks: native_update_lane_hold::LaneHoldClocks,
     seamless_adopt: Vec<crate::spawn::Adopted>,
     seamless_held: Vec<crate::seamless::HeldPane>,
     seamless_held_shown: Vec<(u64, u64)>,
@@ -10708,6 +10305,7 @@ struct App {
     slog_mirror_adopting: bool,
     carried_settings_drafts: app_restore::CarriedDraftsLedger,
     handoff_ready: Option<seamless::ReadySignal>,
+    handoff_progress: handoff_progress::Progress,
     #[cfg(unix)]
     handoff_claimed_at: Option<Instant>,
     #[cfg(unix)]
@@ -10867,6 +10465,13 @@ struct App {
     #[cfg(target_os = "macos")]
     machine_writer: Option<machine_title::NameWriter>,
     _status_item: Option<status_item::StatusItemHandle>,
+    /// The menu-bar lock: this Mac's fleet access as stored, and a raise a click asked for that
+    /// has not taken effect yet (`status_item::LockFace`).
+    lock_face: status_item::LockFace,
+    /// When the fleet listener asked to be told this Mac's fleet access again: a drop below
+    /// Read and Write that has not rested yet (`fleet_listen::observe_access`).
+    #[cfg(target_os = "macos")]
+    access_look: Option<Instant>,
     status_fingerprint: Option<u64>,
     status_drawn: Vec<status_item::Glance>,
     status_painted: Option<status_item::Glance>,
@@ -10905,8 +10510,21 @@ struct App {
     handoff_repainted_tabs: usize,
     first_present_done: bool,
     boot_health_confirmation: BootHealthConfirmation,
+    /// Awaiting retry deadline, or the lost-completion watchdog while `InFlight`.
     boot_health_confirmation_retry_at: Option<Instant>,
     boot_health_confirmation_backoff: Duration,
+    /// Why the updater last said the gate stays shut, or why it could not be asked: the words
+    /// the lane's hold is named with.
+    boot_health_hold_reason: Option<String>,
+    /// Asks in a row nothing answered, at most [`BOOT_HEALTH_UNANSWERED_TRIES`].
+    boot_health_unanswered: u32,
+    /// The park has seen this process at its health checkpoint.
+    boot_health_checkpoint_seen: bool,
+    /// The ask last queued was sent with the checkpoint reached.
+    boot_health_asked_at_checkpoint: bool,
+    /// The gate was opened by the answer to an ask from before the checkpoint, so the updater
+    /// is owed one more ask at it ([`App::ask_boot_health_at_checkpoint_if_owed`]).
+    boot_health_checkpoint_ask_owed: bool,
     seamless_position: Option<(i32, i32)>,
     level_up: Option<level_up::LevelUp>,
     update_row_before_install: Option<(aterm_messages::Message, messages_host::UpdateFlow)>,
@@ -11049,7 +10667,7 @@ struct App {
     #[cfg(unix)]
     fork_park_misses: Option<(u64, u8)>,
     #[cfg(unix)]
-    preverify_read_waited: Option<(u64, std::time::Instant)>,
+    preverify_read_waited: Option<PreverifyReadWait>,
     /// The pre-park read the sessionless wait held each kind of attempt for
     /// (`App::sessionless_preverify_wait`): a read's passing end answers only an attempt that
     /// waited for it.
@@ -11088,6 +10706,15 @@ struct App {
     log_closes_deferred: std::collections::BTreeSet<u64>,
     harness: Option<harness_host::HostHandle>,
     harness_policy: harness_policy_cell::HarnessPolicyCell,
+    /// Where the live config's `[update]` switches came from. The config watcher reads it, this
+    /// window moves it.
+    update_switch_origin: app_config::UpdateSwitchOrigin,
+    /// The `[update]` an admitted text gave, while a refused read's off stands on it
+    /// (`App::take_refused_update_text`).
+    admitted_update_under_refused_off: Option<Option<app_config::UpdateConfig>>,
+    /// The last refused read's text, while no read the watcher admits has been heard since
+    /// (`App::hear_refused_update_text`).
+    refused_update_text: Option<String>,
     harness_waits: std::collections::HashMap<String, presence::RetryPlan>,
     harness_wait_epoch: u64,
     need_rechecks: std::collections::HashMap<u64, i64>,
@@ -11101,6 +10728,18 @@ struct App {
     /// [`worker_reaper::LINGER`] after it ([`worker_reaper::Stand::reading`]); a seamless update
     /// carries it in the person-stamps sidecar (`seamless::PersonStamp::JobSeen`, unix).
     worker_job_seen: std::collections::HashMap<u64, std::time::Instant>,
+    /// What a fleet drive's leased plain shell's look reads ([`app_requests::LeaseClock`]).
+    lease: app_requests::LeaseClock,
+    /// When this process began (Unix ms), taken before its control server serves a spawn: the
+    /// requests opened before it are the relaunch sweep's to judge ([`App::look_at_requests`]).
+    requests_born_ms: u64,
+    /// The relaunch sweep ran: the requests' writer thread sets it once it found this window
+    /// alone on its state home and swept.
+    requests_swept: Arc<AtomicBool>,
+    /// Each live tab's next shell block the minute's look at requests reads
+    /// ([`app_requests`], ATERM-KI-1109-3 step 4), by sid: a running block is read again until
+    /// it ends.
+    request_spans: std::collections::HashMap<String, u64>,
     /// What the credit claim last waited on and its record in Messages
     /// (`App::credit_claim_not_ready`), so a look that finds the same wait records nothing.
     claim_not_ready: Option<(String, aterm_messages::MessageId)>,
@@ -11139,6 +10778,9 @@ struct App {
     perf_shed_dwell: std::time::Duration,
     perf_env_at_flip: f32,
     event_loop_failed: bool,
+    /// The run's end, owed once the event loop runs ([`App::end_run`]); `None` once it ran, and in
+    /// an App no `main` built.
+    run_end: Option<run_end::RunEnd>,
 }
 
 impl Drop for App {
@@ -15765,6 +15407,8 @@ impl App {
             next_window_id: 1,
             pending_restore: None,
             restore_drain: None,
+            restore_glass: RestoreGlassWait::default(),
+            lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
             seamless_adopt: Vec::new(),
             seamless_held: Vec::new(),
             seamless_held_shown: Vec::new(),
@@ -15772,6 +15416,7 @@ impl App {
             slog_mirror_adopting: false,
             carried_settings_drafts: app_restore::CarriedDraftsLedger::default(),
             handoff_ready: None,
+            handoff_progress: handoff_progress::Progress::default(),
             #[cfg(unix)]
             handoff_claimed_at: None,
             #[cfg(unix)]
@@ -15883,6 +15528,9 @@ impl App {
             #[cfg(target_os = "macos")]
             machine_writer: None,
             _status_item: None,
+            lock_face: status_item::LockFace::new(aterm_types::fleet_access::FleetAccess::ReadOnly),
+            #[cfg(target_os = "macos")]
+            access_look: None,
             status_fingerprint: None,
             status_drawn: Vec::new(),
             status_painted: None,
@@ -15914,9 +15562,16 @@ impl App {
             handoff_history_loss_said: crate::handoff_history::LossSummary::default(),
             handoff_repainted_tabs: 0,
             first_present_done: false,
-            boot_health_confirmation: BootHealthConfirmation::Confirmed,
+            // Most App tests exercise settled updater policy rather than startup. Tests of the
+            // startup gate opt back into `Awaiting` explicitly.
+            boot_health_confirmation: BootHealthConfirmation::Complete,
             boot_health_confirmation_retry_at: None,
             boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
+            boot_health_hold_reason: None,
+            boot_health_unanswered: 0,
+            boot_health_checkpoint_seen: true,
+            boot_health_asked_at_checkpoint: true,
+            boot_health_checkpoint_ask_owed: false,
             seamless_position: None,
             level_up: None,
             messages: crate::messages_host::new_center(
@@ -16060,6 +15715,9 @@ impl App {
             log_closes_deferred: std::collections::BTreeSet::new(),
             harness: None,
             harness_policy,
+            update_switch_origin: app_config::UpdateSwitchOrigin::Admitted,
+            admitted_update_under_refused_off: None,
+            refused_update_text: None,
             harness_waits: std::collections::HashMap::new(),
             harness_wait_epoch: 0,
             need_rechecks: std::collections::HashMap::new(),
@@ -16067,6 +15725,10 @@ impl App {
             api_outage: std::collections::BTreeMap::new(),
             worker_termed: std::collections::HashMap::new(),
             worker_job_seen: std::collections::HashMap::new(),
+            lease: app_requests::LeaseClock::INERT,
+            requests_born_ms: aterm_time::unix_millis().unwrap_or(0),
+            requests_swept: Arc::default(),
+            request_spans: std::collections::HashMap::new(),
             claim_not_ready: None,
             status_dirty: false,
             harness_glass: std::collections::HashMap::new(),
@@ -16097,6 +15759,7 @@ impl App {
             perf_shed_dwell: crate::app_render::PERF_SHED_DWELL_MIN,
             perf_env_at_flip: 1.0,
             event_loop_failed: false,
+            run_end: None,
         }
     }
 
@@ -16550,7 +16213,6 @@ impl App {
         self.redraw_claude_footer(session);
         self.note_harness_arm(session);
         self.harness_screen_moved();
-        self.refresh_autopilot_menu(session);
         self.journal_owner_words(session);
         self.record_wire_autopilot(session, dropped);
         self.mail_worker_news(session);
@@ -17475,49 +17137,151 @@ impl App {
     }
 
     fn boot_health_guard_open(&self) -> bool {
-        should_dispatch_boot_health_confirmation(
-            self.headless,
-            self.headless_boot_health_checkpoint(),
-            self.first_present_done,
-            self.boot_health_confirmation != BootHealthConfirmation::Pending,
+        boot_health_ask_due(
+            self.boot_health_confirmation.dispatched(),
             true,
-            self.windows.values().any(|ws| ws.os_window.is_some()),
             self.incoming_handoff_pending,
         )
     }
 
+    /// Whether this process is at its health checkpoint now ([`boot_checkpoint_reached`]).
+    #[must_use]
+    pub(crate) fn boot_health_checkpoint_reached(&self) -> bool {
+        boot_checkpoint_reached(
+            self.headless,
+            self.headless_boot_health_checkpoint(),
+            self.first_present_done,
+            self.windows.values().any(|ws| ws.os_window.is_some()),
+        )
+    }
+
+    /// The first park at the checkpoint asks at once, whatever retry an ask from before it
+    /// armed: until now the updater could only say the trial waits for this.
+    fn note_boot_health_checkpoint(&mut self) {
+        if self.boot_health_checkpoint_seen || !self.boot_health_checkpoint_reached() {
+            return;
+        }
+        self.boot_health_checkpoint_seen = true;
+        if self.boot_health_confirmation == BootHealthConfirmation::Awaiting {
+            self.boot_health_confirmation_retry_at = None;
+            self.boot_health_confirmation_backoff = BOOT_HEALTH_RETRY_MIN;
+        }
+    }
+
+    /// The park's boot-health work: expire an ask whose answer never came, note the
+    /// checkpoint, queue the ask that is due, and queue the one ask a gate opened before the
+    /// checkpoint still owes the updater at it.
+    ///
+    /// An ask nothing answered can open the gate here ([`BOOT_HEALTH_UNANSWERED_TRIES`]), after
+    /// this park's look at a person's held Install. That press runs now, as it does when an
+    /// answer opens the gate, and not at the retry this pass has just armed.
+    fn service_boot_health(&mut self, now: Instant) {
+        #[cfg(unix)]
+        let gate_was_shut = !self.native_boot_health_complete();
+        self.expire_boot_health_confirmation(now);
+        self.note_boot_health_checkpoint();
+        if self.boot_health_guard_open()
+            && self
+                .boot_health_confirmation_retry_at
+                .is_none_or(|retry_at| now >= retry_at)
+        {
+            let outcome = self.request_native_boot_health_confirmation();
+            self.note_boot_health_dispatch(outcome, now);
+        }
+        self.ask_boot_health_at_checkpoint_if_owed();
+        #[cfg(unix)]
+        if gate_was_shut && self.native_boot_health_complete() {
+            self.run_held_person_apply(now);
+        }
+    }
+
+    /// Queue the one ask a gate opened before the checkpoint owes the updater at it. An ask
+    /// from before the checkpoint only reads, and the updater releases an ended window's kept
+    /// predecessor at a checkpoint ask alone (`aterm_update::confirm_boot_health_exact`), so a
+    /// process that owes no trial, confirmed before it draws, would never let it. The gate
+    /// stays open: no request is in flight, so the answer is dropped as a retired one.
+    ///
+    /// The worker's queue holds one request: a full one is tried again at a later park. An
+    /// unavailable worker ends the duty, as a busy apply lock ends the release itself.
+    fn ask_boot_health_at_checkpoint_if_owed(&mut self) {
+        if !self.boot_health_checkpoint_ask_owed || !self.boot_health_checkpoint_reached() {
+            return;
+        }
+        match self.request_native_boot_health_confirmation() {
+            app_native::BootHealthDispatch::Queued(_)
+            | app_native::BootHealthDispatch::Unavailable => {
+                self.boot_health_checkpoint_ask_owed = false;
+            }
+            app_native::BootHealthDispatch::Saturated => {}
+        }
+    }
+
     fn boot_health_retry_deadline(&self, now: Instant) -> Option<Instant> {
         let retry_at = self.boot_health_confirmation_retry_at?;
-        self.boot_health_guard_open()
-            .then(|| retry_at.max(now + BOOT_HEALTH_RETRY_MIN))
+        match self.boot_health_confirmation {
+            BootHealthConfirmation::Awaiting => self
+                .boot_health_guard_open()
+                .then_some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN)),
+            BootHealthConfirmation::InFlight(_) => Some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN)),
+            BootHealthConfirmation::Complete => None,
+        }
     }
 
-    /// Arm the next boot-health retry on the doubling backoff.
-    pub(crate) fn arm_boot_health_retry(&mut self, now: Instant) {
-        let wait = self.boot_health_confirmation_backoff;
+    /// Recover an idempotent confirmation whose worker died or whose completion wake was lost.
+    /// The ordinary dispatch path then either queues on the live worker, restarts a disconnected
+    /// one, or applies its bounded saturation backoff. The lost answer is an ask nothing
+    /// answered, counted toward [`BOOT_HEALTH_UNANSWERED_TRIES`].
+    fn expire_boot_health_confirmation(&mut self, now: Instant) {
+        if matches!(
+            self.boot_health_confirmation,
+            BootHealthConfirmation::InFlight(_)
+        ) && self
+            .boot_health_confirmation_retry_at
+            .is_some_and(|retry_at| now >= retry_at)
+        {
+            self.boot_health_confirmation = BootHealthConfirmation::Awaiting;
+            self.boot_health_confirmation_retry_at = Some(now);
+            aterm_log::warn!(
+                "boot-health confirmation completion did not arrive within its bounded worker \
+                 window; retrying idempotently"
+            );
+            self.count_boot_health_unanswered(
+                "the confirmation's answer did not arrive within its bounded worker window",
+                now,
+            );
+        }
+    }
+
+    /// Arm the next boot-health retry: `after` when the updater said when asking again can
+    /// first change its answer, otherwise the doubling backoff (which only then doubles).
+    pub(crate) fn arm_boot_health_retry(&mut self, now: Instant, after: Option<Duration>) {
+        let backoff = self.boot_health_confirmation_backoff;
+        let wait = after.unwrap_or(backoff);
         self.boot_health_confirmation_retry_at = Some(now.checked_add(wait).unwrap_or(now));
-        self.boot_health_confirmation_backoff = wait.saturating_mul(2).min(BOOT_HEALTH_RETRY_MAX);
+        if after.is_none() {
+            self.boot_health_confirmation_backoff =
+                backoff.saturating_mul(2).min(BOOT_HEALTH_RETRY_MAX);
+        }
     }
 
-    fn note_boot_health_dispatch(
-        &mut self,
-        outcome: app_native::NativeUpdateDispatch,
-        now: Instant,
-    ) {
+    fn note_boot_health_dispatch(&mut self, outcome: app_native::BootHealthDispatch, now: Instant) {
         match outcome {
-            app_native::NativeUpdateDispatch::Queued => {
-                self.boot_health_confirmation = BootHealthConfirmation::InFlight;
-                self.boot_health_confirmation_retry_at = None;
+            app_native::BootHealthDispatch::Queued(ticket) => {
+                self.boot_health_confirmation = BootHealthConfirmation::InFlight(ticket);
+                self.boot_health_confirmation_retry_at = Some(
+                    now.checked_add(aterm_update::BOOT_HEALTH_CONFIRMATION_BOUND)
+                        .unwrap_or(now),
+                );
             }
-            app_native::NativeUpdateDispatch::Saturated
-            | app_native::NativeUpdateDispatch::Unavailable => {
-                let why = match outcome {
-                    app_native::NativeUpdateDispatch::Saturated => "queue busy",
-                    _ => "worker unavailable after restart",
-                };
-                aterm_log::debug!("boot-health confirmation {why}; retry on backoff");
-                self.boot_health_confirmation = BootHealthConfirmation::Pending;
-                self.arm_boot_health_retry(now);
+            app_native::BootHealthDispatch::Saturated => {
+                aterm_log::debug!("boot-health confirmation queue busy; retry on backoff");
+                self.note_boot_health_unanswered("the updater's worker queue is full", now);
+            }
+            app_native::BootHealthDispatch::Unavailable => {
+                self.note_boot_health_unanswered("the updater's worker is unavailable", now);
+                aterm_log::warn!(
+                    "boot-health confirmation worker unavailable after restart; retry armed"
+                );
             }
         }
     }
@@ -17688,6 +17452,26 @@ impl App {
             || !self.seamless_adopt.is_empty()
     }
 
+    /// Whether the park runs the queued restore pass now: it has its glass, the first window on
+    /// it or the one wait for it run out ([`RestoreGlassWait`]), which the pass's own slices
+    /// never start again. A pass that runs without glass is said once.
+    fn restore_pass_due_at_park(&mut self, on_glass: bool, now: Instant) -> bool {
+        let queued = self.restore_pass_queued();
+        let due = restore_pass_due(
+            RestorePassSite::Park,
+            self.restore_pass_handoff_lane(),
+            self.restore_glass.look(queued, on_glass, now),
+            queued,
+        );
+        if due && !on_glass && self.restore_glass.say_once() {
+            aterm_log::info!(
+                "restore: no window reached the glass within {}s; the restore pass runs without it",
+                RESTORE_GLASS_PATIENCE.as_secs()
+            );
+        }
+        due
+    }
+
     const fn restore_pass_carries_shells(&self) -> bool {
         self.handoff_successor || self.handoff_ready.is_some() || !self.seamless_adopt.is_empty()
     }
@@ -17719,16 +17503,64 @@ impl App {
         }
         crate::metrics::stamp_claim(crate::metrics::ClaimStamp::RestoreDrained);
         self.request_redraw_all_windows();
-        self.crash_journal.note_activity();
+        self.note_desk_activity();
     }
 
     fn maybe_signal_handoff_ready(&mut self) {
-        if self.handoff_ready.is_none() {
+        self.maybe_signal_handoff_ready_with(&mut handoff_progress::log);
+    }
+
+    fn maybe_signal_handoff_ready_with(&mut self, emit: &mut impl FnMut(handoff_progress::Record)) {
+        use handoff_progress::{Phase, Record};
+        if self.handoff_ready.is_none() || self.handoff_degraded {
+            self.handoff_progress.clear();
             return;
         }
-        if self.handoff_degraded {
-            return;
+        let control = self
+            .handoff_control_preparation
+            .as_ref()
+            .map(control::ControlPreparation::state);
+        let record = Record {
+            phase: Phase::Waiting,
+            control_pending: control == Some(control::ControlPreparationState::Pending),
+            control_failed: control == Some(control::ControlPreparationState::Failed),
+            restore_pending: self.restore_pass_queued(),
+            manifest_windows: self.pending_restore.as_ref().map_or(0, |m| m.windows.len()),
+            pending_adoptions: self.seamless_adopt.len(),
+            first_present_pending: !self.headless && !self.first_present_done,
+            unpainted_windows: self
+                .windows
+                .values()
+                .filter(|ws| !self.headless && ws.os_window.is_some() && !ws.painted_for_handoff())
+                .count(),
+        };
+        self.handoff_progress.note(record, emit);
+        self.signal_handoff_ready_with(record, emit);
+        if self.handoff_degraded || self.handoff_ready.is_none() {
+            self.handoff_progress.note(
+                Record {
+                    phase: if self.handoff_degraded {
+                        Phase::Rejected
+                    } else {
+                        Phase::Written
+                    },
+                    ..record
+                },
+                emit,
+            );
+            self.handoff_progress.clear();
         }
+    }
+
+    fn signal_handoff_ready_with(
+        &mut self,
+        record: handoff_progress::Record,
+        emit: &mut impl FnMut(handoff_progress::Record),
+    ) {
+        #[cfg(unix)]
+        use handoff_progress::{Phase, Record};
+        #[cfg(not(unix))]
+        let _ = (record, emit);
         if let Some(preparation) = &self.handoff_control_preparation {
             match preparation.state() {
                 control::ControlPreparationState::Pending => return,
@@ -17763,6 +17595,14 @@ impl App {
             return;
         };
         #[cfg(unix)]
+        self.handoff_progress.note(
+            Record {
+                phase: Phase::Readers,
+                ..record
+            },
+            emit,
+        );
+        #[cfg(unix)]
         if !self.prepare_incoming_handoff_readers(&reader_gate) {
             self.reject_incoming_handoff_before_proof();
             aterm_log::warn!(
@@ -17777,6 +17617,13 @@ impl App {
         let commit = self.handoff_commit.take();
         #[cfg(unix)]
         {
+            self.handoff_progress.note(
+                Record {
+                    phase: Phase::Proof,
+                    ..record
+                },
+                emit,
+            );
             let adopted = self
                 .pool
                 .iter()
@@ -17820,6 +17667,13 @@ impl App {
             let journal = self
                 .crash_journal
                 .take_over_at_commit(self.config.restore_session_or_default());
+            self.handoff_progress.note(
+                Record {
+                    phase: Phase::CommitWaiter,
+                    ..record
+                },
+                emit,
+            );
             if std::thread::Builder::new()
                 .name("aterm-handoff-commit".to_string())
                 .spawn(move || {
@@ -17866,6 +17720,13 @@ impl App {
                     );
                 }
             }
+            self.handoff_progress.note(
+                Record {
+                    phase: Phase::Write,
+                    ..record
+                },
+                emit,
+            );
             if !ready.signal_proof(proof) {
                 self.handoff_degraded = true;
                 self.stop_prepared_handoff_readers(&reader_gate);
@@ -18191,82 +18052,21 @@ const fn blink_clock_armed(
 }
 
 #[cfg(test)]
-mod blink_clock_law_tests {
-    use super::{CursorStyle, blink_clock_armed, blink_clock_may_run};
-    use std::time::{Duration, Instant};
-
-    /// A resting window runs no blink clock: the caret stays on its visible phase until the
-    /// window wakes. Only a live, focused, awake window may run one.
-    #[test]
-    fn a_resting_window_runs_no_blink_clock() {
-        assert!(blink_clock_may_run(true, true, false));
-        assert!(!blink_clock_may_run(true, true, true), "resting");
-        assert!(
-            !blink_clock_may_run(false, true, false),
-            "headless or no window"
-        );
-        assert!(!blink_clock_may_run(true, false, false), "unfocused");
-    }
-
-    /// The timer's step flips an awake window's due blink and arms the next; a resting window's
-    /// due blink keeps its phase and its deadline, which the about-to-wait fold then clears.
-    #[test]
-    fn a_resting_window_never_flips_its_due_blink() {
-        let mut app = crate::App::headless_for_test();
-        // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
-        app.headless = false;
-        app.config.idle_rest_secs = Some(30.0);
-        let wid = crate::WindowId(0);
-        let t0 = Instant::now();
-        let ws = app.windows.get_mut(&wid).expect("the window");
-        ws.next_blink = Some(t0 + Duration::from_millis(1));
-        assert!(!ws.flip_due_blink(t0), "not yet due");
-        let phase = ws.blink_phase;
-        assert!(ws.flip_due_blink(t0 + Duration::from_millis(1)), "due");
-        assert_eq!(ws.blink_phase, !phase);
-        assert_eq!(
-            ws.next_blink,
-            Some(t0 + Duration::from_millis(1) + super::BLINK_INTERVAL)
-        );
-
-        let rest_at = t0 + Duration::from_secs(31);
-        app.settle_rest(rest_at);
-        let ws = app.windows.get_mut(&wid).expect("the window");
-        assert!(ws.rest.resting());
-        ws.next_blink = Some(rest_at);
-        let phase = ws.blink_phase;
-        assert!(
-            !ws.flip_due_blink(rest_at),
-            "a resting window's blink is due and never flips"
-        );
-        assert_eq!(ws.blink_phase, phase);
-        assert_eq!(ws.next_blink, Some(rest_at));
-    }
-
-    #[test]
-    fn under_the_rainbow_the_blink_clock_is_never_armed() {
-        assert!(!blink_clock_armed(true, CursorStyle::BlinkingBlock, true));
-        assert!(blink_clock_armed(true, CursorStyle::BlinkingBar, true));
-        assert!(blink_clock_armed(
-            true,
-            CursorStyle::BlinkingUnderline,
-            true
-        ));
-    }
-
-    #[test]
-    fn under_a_classic_style_the_blink_clock_follows_the_terminal() {
-        assert!(blink_clock_armed(true, CursorStyle::BlinkingBlock, false));
-        assert!(blink_clock_armed(true, CursorStyle::BlinkingBar, false));
-        assert!(!blink_clock_armed(true, CursorStyle::SteadyBlock, false));
-        assert!(
-            !blink_clock_armed(false, CursorStyle::BlinkingBlock, false),
-            "hidden: no clock"
-        );
-    }
-}
+#[path = "lib_blink_clock_law_tests.rs"]
+mod blink_clock_law_tests;
 
 impl ApplicationHandler<Wake> for App {
+    /// The loop's exit. Inside AppKit's `terminate:` (a quit aterm took up, whose YES AppKit
+    /// hears once this returns, or one AppKit carries out by itself) `run_app` never returns, so
+    /// the run's end runs here, before macOS is told the quit goes on; elsewhere it runs once
+    /// `run_app` has returned (`main_entry`).
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if aterm_window::platform::macos::exit_ends_in_appkit() {
+            self.end_run();
+        }
+    }
+
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
         self.session_factory.loop_idle.turn_began();
         crate::metrics::note_event_wake(match cause {
@@ -18463,9 +18263,11 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let _root = crate::watchdog::enter_about_to_wait();
+        let mut root = crate::watchdog::enter_about_to_wait();
         self.poll_account_drain(el);
         if el.exiting() {
+            // winit beats no `NewEvents` once it is exiting: no park the watchdog may rest at.
+            root.loop_ending();
             return;
         }
         self.settle_update_boundary_latch();
@@ -18490,12 +18292,7 @@ impl ApplicationHandler<Wake> for App {
         if on_glass {
             spawn::release_held_prime();
         }
-        if restore_pass_due(
-            RestorePassSite::Park,
-            self.restore_pass_handoff_lane(),
-            on_glass,
-            self.restore_pass_queued(),
-        ) {
+        if self.restore_pass_due_at_park(on_glass, park_now) {
             self.run_restore_pass(el, RestorePassSite::Park);
             park_now = Instant::now();
         }
@@ -18599,6 +18396,11 @@ impl ApplicationHandler<Wake> for App {
             aterm_update::set_automatic_apply(lands_by_itself);
             self.update_lands_by_itself_reported = lands_by_itself;
         }
+        #[cfg(unix)]
+        {
+            let (lane, staged) = self.window_update_lane();
+            fleet_listen::node_serve::WINDOW_APPLIES.note_lane(lane, staged);
+        }
         #[cfg(target_os = "macos")]
         if !auto_apply_on && self.auto_apply_was_on {
             self.end_launch_record_renewal_for_updates_off();
@@ -18617,6 +18419,7 @@ impl ApplicationHandler<Wake> for App {
             self.poll_launch_record_renewal(park_now);
         }
         self.watch_update_checker();
+        self.retire_overdue_native_update_check(park_now);
         let now = park_now;
         for ws in self.windows.values_mut() {
             if ws.pending_reveal.is_some_and(|d| now < d) {
@@ -18636,14 +18439,7 @@ impl ApplicationHandler<Wake> for App {
         if self.deferred_native_update_reconcile.is_some() {
             self.finish_deferred_native_update_reconcile();
         }
-        if self.boot_health_guard_open()
-            && self
-                .boot_health_confirmation_retry_at
-                .is_none_or(|retry_at| now >= retry_at)
-        {
-            let outcome = self.request_native_boot_health_confirmation();
-            self.note_boot_health_dispatch(outcome, now);
-        }
+        self.service_boot_health(now);
         self.settle_reduced_scroll_motion(now);
         self.service_due_scroll_motion(now);
         let output_hold_due = self.release_output_holds(Instant::now());
@@ -19152,6 +18948,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::UpdateChecker,
             );
         }
+        if let Some(answer_by) = self.native_updater_service.check_answer_by() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                answer_by,
+                metrics::DeadlineOwner::UpdateChecker,
+            );
+        }
         if self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::LevelUp)
@@ -19306,6 +19110,8 @@ impl ApplicationHandler<Wake> for App {
         }
         self.note_person_refusals();
         self.note_rewind_focus();
+        #[cfg(target_os = "macos")]
+        self.tick_lock_face(Instant::now());
         let status_rebuilt = self.take_status_rebuild();
         if status_rebuilt {
             self.refresh_status_item();
@@ -19433,6 +19239,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::SystemVitals,
             );
         }
+        if let Some(facts_wake) = self.diskwalk_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                facts_wake,
+                metrics::DeadlineOwner::DiskFacts,
+            );
+        }
         if let Some(lens_wake) = self.stats_lens_deadline() {
             fold_owned_deadline(
                 &mut deadline,
@@ -19472,6 +19286,15 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 log_wake,
                 metrics::DeadlineOwner::SessionLog,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(lock_wake) = self.lock_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                lock_wake,
+                metrics::DeadlineOwner::FleetAccess,
             );
         }
         if let Some(status_wake) =
@@ -19530,6 +19353,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AccountDrain,
             );
         }
+        if let Some(glass) = self.restore_glass.deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                glass,
+                metrics::DeadlineOwner::RestoreGlass,
+            );
+        }
         match self.arm_loop_deadline(deadline, deadline_owner) {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -19543,6 +19374,9 @@ impl ApplicationHandler<Wake> for App {
         // gateway card that came to the front this turn stops it before its next
         // key (`hwkey::run_burst`). One atomic store.
         self.publish_hwkey_front();
+        if el.exiting() {
+            root.loop_ending();
+        }
     }
 
     fn resumed(&mut self, el: &ActiveEventLoop) {
@@ -19703,6 +19537,20 @@ impl ApplicationHandler<Wake> for App {
 }
 
 impl App {
+    /// A wake is activity unless it [`Wake::only_observes`] ([`Self::note_desk_activity`]).
+    fn note_wake_activity(&mut self, ev: &Wake) {
+        if !ev.only_observes() {
+            self.note_desk_activity();
+        }
+    }
+
+    /// Something that was not a timer woke the loop and may have moved the desk: the crash
+    /// journal owes a capture, and the disk walker a read of the panes' facts.
+    pub(crate) const fn note_desk_activity(&mut self) {
+        self.crash_journal.note_activity();
+        self.diskwalk.note_activity();
+    }
+
     fn on_user_event(&mut self, el: &ActiveEventLoop, ev: Wake) {
         let _root = crate::watchdog::enter(crate::watchdog::Breadcrumb::UserEvent);
         if let Some(id) = ev.local_session()
@@ -19713,14 +19561,7 @@ impl App {
         }
         let ev = crate::control::control_media::take_hop(ev);
         self.wake_census.note(&ev);
-        if !matches!(
-            ev,
-            Wake::GpuSurfaceReady { .. }
-                | Wake::Vitals
-                | Wake::HostNote(harness_host::HostNote::DiskLooked)
-        ) {
-            self.crash_journal.note_activity();
-        }
+        self.note_wake_activity(&ev);
         match update_handoff_wake_class(&ev) {
             UpdateHandoffEventClass::Exempt => {}
             UpdateHandoffEventClass::Tolerated => self.note_update_handoff_tolerated_activity(),
@@ -19740,6 +19581,7 @@ impl App {
             Wake::AccountsDrained { serial, drained } => {
                 self.finish_account_drain(el, serial, drained)
             }
+            Wake::AccountsOutlived { serial } => self.go_on_past_account_work(el, serial),
             Wake::ProgramResolved { session } => {
                 self.session_status.note_program_answered(session);
                 let _ = self.apply_launch_no_harness(session);
@@ -19770,6 +19612,7 @@ impl App {
             }
             Wake::AccountMenuRead(completion) => self.on_account_menu_read(completion),
             Wake::MailChanged => self.on_mail_changed(),
+            Wake::TablesChanged => self.on_tables_changed(),
             #[cfg(all(unix, not(test)))]
             Wake::NetworkPlaceChanged => self.follow_network_place(),
             #[cfg(target_os = "macos")]
@@ -20001,6 +19844,7 @@ impl App {
                 self.render_image(*req);
             }
             Wake::ReadChrome { reply } => {
+                self.reread_fleet_access();
                 let mut lines = self.read_native_chrome();
                 #[cfg(any(test, debug_assertions))]
                 lines.extend(self.stats_lens_chrome_lines());
@@ -20116,7 +19960,7 @@ impl App {
                     app_native::NativeUpdateReconcilePurpose::StageAvailable,
                 );
             }
-            Wake::UpdateCheckerPhase => {}
+            Wake::UpdateCheckerPhase => self.note_update_checker_phase(),
             Wake::ReadDims {
                 session,
                 term,
@@ -20288,9 +20132,11 @@ impl App {
             #[cfg(all(test, unix))]
             Wake::ConfigReload => self.reload_config(),
             Wake::ConfigReloadObserved(observation) => {
+                self.refused_update_text = None;
                 self.note_config_watch_candidate(observation.baseline.clone());
                 self.reload_config_observation(observation);
             }
+            Wake::RefusedUpdateText(text) => self.hear_refused_update_text(text),
             Wake::ConfigWatchStatus(event) => self.apply_config_watch_status(event),
             Wake::HarnessPolicyObserved(policy) => self.adopt_harness_policy(policy),
             Wake::ThemeCatalogChanged(themes) => self.reload_theme_catalog(themes),
@@ -20344,8 +20190,12 @@ impl App {
             Wake::NativeUpdateWorkerDrained => {
                 self.retry_pending_native_update_reconcile();
             }
-            Wake::NativeBootHealthConfirmationFinished { confirmed } => {
-                self.finish_native_boot_health_confirmation(confirmed, Instant::now());
+            Wake::NativeBootHealthConfirmationFinished { ticket, result } => {
+                let _ = self.handle_native_boot_health_confirmation_finished(
+                    ticket,
+                    result,
+                    Instant::now(),
+                );
             }
             Wake::NativeActivationSuperseded(completion) => {
                 self.finish_activation_supersede(*completion);
@@ -20371,7 +20221,7 @@ impl App {
             }
             #[cfg(unix)]
             Wake::ActivateCommittedHandoff { mut expected } => {
-                self.incoming_handoff_pending = false;
+                self.note_incoming_handoff_committed();
                 crate::config_watcher::repost_after_commit();
                 self.settle_harness_reading_at_commit();
                 if let Some(parent) = self
@@ -20568,7 +20418,13 @@ impl App {
             Wake::OwnLaunchRecord(record) => self.note_own_launch_record(record),
             #[cfg(any(target_os = "macos", windows))]
             Wake::ApplyStagedUpdate => {
-                if crate::app_update_screen::debug_seamless_reexec_armed() {
+                #[cfg(windows)]
+                let installing = self.windows_apply_staged_update();
+                #[cfg(not(windows))]
+                let installing = false;
+                if installing {
+                    // Windows: the staged dist's installer is running on its own thread.
+                } else if crate::app_update_screen::debug_seamless_reexec_armed() {
                     let outcome = self.apply_debug_seamless_update();
                     self.react_to_update_apply_outcome("debug control request", outcome, false);
                 } else {
@@ -20615,6 +20471,10 @@ impl App {
                     }
                 }
             }
+            // Windows: the staged build is a local dist; its watch and this window's own
+            // installer say what the window should now show (`update_control`).
+            #[cfg(windows)]
+            Wake::StagedBuildNotice(notice) => self.windows_staged_notice(&notice),
             Wake::PkgSeedStarted { detail, first_run } => {
                 self.note_spare_pass(true);
                 aterm_log::info!(
@@ -20856,13 +20716,8 @@ impl App {
                     self.start_native_packages_refresh();
                 }
             }
-            Wake::UpdateProgress(progress) => {
-                // The download is recorded as the staged entry, not a separate `Downloaded`.
-                if let aterm_update::Progress::Staged { version, build } = &progress {
-                    self.update_verified = Some((*build, Instant::now()));
-                    aterm_log::info!("update downloaded and verified: {version} (build {build})");
-                }
-                self.note_update_progress(&progress);
+            Wake::UpdateProgress(report) => {
+                self.note_update_progress_report(report, &aterm_update::checker_watch::WATCH);
             }
             Wake::UpdateCheckAsked { begun } => self.note_update_check_asked(begun),
             Wake::SpawnSession {
@@ -20873,12 +20728,17 @@ impl App {
                 theme,
                 task,
                 shell,
+                fleet,
+                why: asked,
                 by,
                 reply,
+                request,
             } => {
+                let reply = tab_spawn::SpawnReply::new(reply, request);
                 let why = if task.is_some() { "task" } else { "spawn" };
-                let _act = tab_marks::ActScope::enter(by, why);
-                self.spawn_session_aimed(aim, cwd, split, raise, theme, task, shell, reply);
+                let parked = fleet.is_some();
+                let _act = tab_marks::ActScope::asking(by, why, asked.as_deref(), fleet);
+                self.spawn_session_aimed(aim, cwd, split, raise, theme, task, shell, parked, reply);
             }
             Wake::TabSpawned(done) => self.land_tab_spawn(el, done),
             Wake::SpareSpawned(done) => {
@@ -20908,6 +20768,18 @@ impl App {
             Wake::RaiseSession { session, reply } => {
                 let _ = reply.send(self.raise_session_by_id(session));
             }
+            Wake::KeepTabs {
+                sessions,
+                by,
+                reply,
+            } => {
+                let _act = tab_marks::ActScope::enter(by, "keep");
+                let kept = sessions
+                    .into_iter()
+                    .filter(|session| self.keep_as_tab(*session))
+                    .count();
+                let _ = reply.send(kept);
+            }
             Wake::ConnectionsChanged => self.refresh_connection_surfaces(),
             Wake::SpawnConnectedSession {
                 kind,
@@ -20917,7 +20789,9 @@ impl App {
                 theme,
                 by,
                 reply,
+                request,
             } => {
+                let reply = tab_spawn::SpawnReply::new(reply, request);
                 let _act = tab_marks::ActScope::enter(by, "connect");
                 match self.spawn_theme(theme) {
                     Ok(theme) => self.spawn_connected_session(
@@ -20927,7 +20801,7 @@ impl App {
                         cwd,
                         theme,
                         Box::new(move |app, spawned| {
-                            tab_spawn::answer_ctl_spawn(app, &reply, spawned);
+                            tab_spawn::answer_ctl_spawn(app, reply, spawned);
                         }),
                     ),
                     Err(why) => {
@@ -21257,6 +21131,8 @@ impl App {
                 self.on_status_menu_opening(painted.map(|glance| *glance));
             }
             #[cfg(target_os = "macos")]
+            Wake::FleetAccessChanged => self.reread_fleet_access(),
+            #[cfg(target_os = "macos")]
             Wake::SiblingRaised { pid } => {
                 let _ = self.apprt.activate_instance(pid);
             }
@@ -21361,7 +21237,7 @@ impl App {
             return;
         }
         if let Some(kind) = os_window_event_kind(&event) {
-            self.crash_journal.note_activity();
+            self.note_desk_activity();
             crate::metrics::note_os_window_event(kind);
         }
         match update_handoff_window_event_class(&event) {
@@ -21728,36 +21604,8 @@ fn co_located_atpkg_for(exe: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(test)]
-mod co_located_atpkg_tests {
-    #[test]
-    fn a_window_open_when_its_copy_updated_still_finds_the_package_tool() {
-        let root = aterm_tempfile::TempDir::new().unwrap();
-        let bin = root.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("aterm"), b"the new executable").unwrap();
-        let tool = format!("atpkg{}", std::env::consts::EXE_SUFFIX);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("aterm", bin.join(&tool)).unwrap();
-        #[cfg(not(unix))]
-        std::fs::write(bin.join(&tool), b"atpkg").unwrap();
-        let expected = std::fs::canonicalize(&bin).unwrap().join(&tool);
-        assert_eq!(
-            super::co_located_atpkg_for(&bin.join("aterm")),
-            Some(expected.clone())
-        );
-        assert_eq!(
-            super::co_located_atpkg_for(&bin.join("aterm (deleted)")),
-            Some(expected),
-            "the running executable's name after an update replaced it"
-        );
-        assert_eq!(super::co_located_atpkg_for(&bin.join("aterm (gone)")), None);
-        std::fs::remove_file(bin.join(&tool)).unwrap();
-        assert_eq!(
-            super::co_located_atpkg_for(&bin.join("aterm (deleted)")),
-            None
-        );
-    }
-}
+#[path = "lib_co_located_atpkg_tests.rs"]
+mod co_located_atpkg_tests;
 
 /// One classified read of `<prefix>/progress.json`.
 #[derive(Debug, Clone, PartialEq)]
@@ -22569,75 +22417,8 @@ fn deferred_flip_due_if_watching(
 }
 
 #[cfg(test)]
-mod deferred_flip_park_tests {
-    use super::*;
-    use atpkg::quiet::{Due, DueFlip, RECHECK};
-
-    #[test]
-    fn a_held_flip_wakes_on_two_quiet_looks_or_at_the_ceiling() {
-        let layout = atpkg::store::Layout {
-            prefix: std::path::PathBuf::from("/nonexistent-prefix"),
-        };
-        let look = |why, checked| move |_: &atpkg::store::Layout| Some(DueFlip { why, checked });
-        let mut watch = BumpWatch::default();
-        let t0 = Instant::now();
-        assert!(
-            !deferred_flip_due(&layout, &mut watch, t0, look(Due::Quiet, 1)),
-            "one quiet look"
-        );
-        assert!(
-            !deferred_flip_due(&layout, &mut watch, t0 + Duration::from_secs(5), |_| {
-                panic!("no second look inside the minute")
-            }),
-            "not looked at again inside the minute"
-        );
-        assert!(
-            deferred_flip_due(&layout, &mut watch, t0 + RECHECK, look(Due::Quiet, 1)),
-            "the second quiet look in a row wakes the pass"
-        );
-        for n in 2..5 {
-            assert!(
-                !deferred_flip_due(&layout, &mut watch, t0 + n * RECHECK, look(Due::Quiet, 1)),
-                "look {n}"
-            );
-        }
-        assert!(!deferred_flip_due(
-            &layout,
-            &mut watch,
-            t0 + 5 * RECHECK,
-            look(Due::Ceiling, 1)
-        ));
-        let t1 = t0 + 6 * RECHECK;
-        assert!(!deferred_flip_due(
-            &layout,
-            &mut watch,
-            t1,
-            look(Due::Quiet, 2)
-        ));
-        assert!(!deferred_flip_due(
-            &layout,
-            &mut watch,
-            t1 + RECHECK,
-            |_| None
-        ));
-        assert!(
-            !deferred_flip_due(&layout, &mut watch, t1 + 2 * RECHECK, look(Due::Quiet, 2)),
-            "a busy look between two quiet ones starts the count over"
-        );
-        assert!(deferred_flip_due(
-            &layout,
-            &mut watch,
-            t1 + 3 * RECHECK,
-            look(Due::Quiet, 2)
-        ));
-        let mut fresh = BumpWatch::default();
-        assert!(
-            deferred_flip_due(&layout, &mut fresh, t0, look(Due::Ceiling, 3)),
-            "the ceiling wakes at once"
-        );
-        assert_eq!(ParkEnd::FlipDue.pass_why(PassWhy::Walk), PassWhy::FlipDue);
-    }
-}
+#[path = "lib_deferred_flip_park_tests.rs"]
+mod deferred_flip_park_tests;
 
 fn head_watch_slice(
     heads: &mut atpkg::vendor_direct::watch::HeadWatch,
@@ -23011,109 +22792,8 @@ fn pass_stamps(store: Option<&atpkg::store::Layout>) -> aterm_update_core::pkg_c
 }
 
 #[cfg(test)]
-mod pass_ending_tests {
-    use super::*;
-
-    #[test]
-    fn a_full_pass_notes_its_ending_and_its_unlanded_index_and_a_seed_only_the_ladder() {
-        let at = 1_790_000_000;
-        let mut own = OwnPasses::default();
-        let mut unlanded = None;
-        let settled = note_pass_ending(
-            PassVerb::Update,
-            PassWhy::Published(44),
-            PassEnding::Settled,
-            false,
-            at,
-            &mut own,
-            &mut unlanded,
-        );
-        assert!(!settled);
-        assert_eq!(unlanded, Some(44), "the settled pass's index is noted");
-        assert_eq!((own.ok_at, own.failed_at), (Some(at), None));
-        let mut unlanded = None;
-        assert!(note_pass_ending(
-            PassVerb::Update,
-            PassWhy::Published(45),
-            PassEnding::Failed,
-            false,
-            at + 60,
-            &mut own,
-            &mut unlanded
-        ));
-        assert_eq!(unlanded, Some(45));
-        assert_eq!((own.ok_at, own.failed_at), (Some(at), Some(at + 60)));
-        let mut landed = None;
-        assert!(!note_pass_ending(
-            PassVerb::Update,
-            PassWhy::Published(46),
-            PassEnding::Ok,
-            true,
-            at + 120,
-            &mut OwnPasses::default(),
-            &mut landed
-        ));
-        assert_eq!(landed, None, "an index the pass landed");
-        let (seed_ok, seed_failed) = (
-            note_pass_ending(
-                PassVerb::Seed,
-                PassWhy::LaunchDue,
-                PassEnding::Ok,
-                true,
-                at + 180,
-                &mut own,
-                &mut unlanded,
-            ),
-            note_pass_ending(
-                PassVerb::Seed,
-                PassWhy::LaunchDue,
-                PassEnding::Failed,
-                true,
-                at + 240,
-                &mut own,
-                &mut unlanded,
-            ),
-        );
-        assert_eq!(
-            (seed_ok, seed_failed),
-            (false, true),
-            "a seed moves the ladder"
-        );
-        assert_eq!(
-            (own.ok_at, own.failed_at),
-            (Some(at), Some(at + 60)),
-            "and neither the walk's clock nor the retry's"
-        );
-    }
-
-    #[test]
-    fn exit_2_settles_and_everything_else_is_the_ladders() {
-        let update = PassVerb::Update;
-        assert_eq!(pass_ending(update, Some(0), true), PassEnding::Ok);
-        assert_eq!(pass_ending(update, Some(2), true), PassEnding::Settled);
-        assert_eq!(
-            pass_ending(update, Some(0), false),
-            PassEnding::Failed,
-            "a published index the pass did not land"
-        );
-        assert_eq!(pass_ending(update, Some(1), true), PassEnding::Failed);
-        assert_eq!(
-            pass_ending(
-                update,
-                Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT)),
-                true
-            ),
-            PassEnding::Failed,
-            "offline retries quietly on the ladder"
-        );
-        assert_eq!(pass_ending(update, None, true), PassEnding::Failed);
-        assert_eq!(
-            pass_ending(PassVerb::Seed, Some(2), true),
-            PassEnding::Failed
-        );
-        assert_eq!(pass_ending(PassVerb::Seed, Some(0), true), PassEnding::Ok);
-    }
-}
+#[path = "lib_pass_ending_tests.rs"]
+mod pass_ending_tests;
 
 #[cfg(test)]
 #[path = "lib_full_pass_rule_conformance_tests.rs"]
@@ -24293,92 +23973,8 @@ fn launch_update_park(
 }
 
 #[cfg(test)]
-mod launch_pass_park_tests {
-    use super::*;
-
-    const WALK: i64 = aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS as i64;
-
-    fn store(dir: &std::path::Path, record: &str) -> atpkg::store::Layout {
-        let layout = atpkg::store::Layout {
-            prefix: dir.join("pkg"),
-        };
-        std::fs::create_dir_all(&layout.prefix).unwrap();
-        std::fs::write(layout.status(), record).unwrap();
-        layout
-    }
-
-    #[test]
-    fn the_store_record_decides_on_the_pass_stamps_not_the_last_write() {
-        let success = 1_700_000_000;
-        assert_eq!(launch_update_park(false, None, success), None);
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let none = store(
-            dir.path(),
-            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\n",
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&none), success + 30),
-            None,
-            "a write with no success on record: due"
-        );
-        let checked = store(
-            dir.path(),
-            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\n\
-             last_success_at = \"2023-11-14T22:13:20Z\"\n",
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&checked), success + 30),
-            Some(Duration::from_secs((WALK - 30) as u64))
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&checked), success + WALK),
-            None
-        );
-        let door = store(
-            dir.path(),
-            "schema = 1\nupdated_at = \"2023-11-14T22:13:50Z\"\n\
-             last_success_at = \"2023-11-14T22:13:20Z\"\n",
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&door), success + 60),
-            Some(Duration::from_secs((WALK - 60) as u64)),
-            "a later write is no failed pass"
-        );
-        let failed = store(
-            dir.path(),
-            "schema = 1\nupdated_at = \"2023-11-14T22:13:50Z\"\n\
-             last_success_at = \"2023-11-14T22:13:20Z\"\nlast_pass = \"failed\"\n\
-             last_pass_at = \"2023-11-14T22:13:50Z\"\n",
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&failed), success + 60),
-            None,
-            "the control: a failure after the success is due now"
-        );
-    }
-
-    #[test]
-    fn an_update_successor_runs_its_pass_now_whatever_the_record_says() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let layout = store(
-            dir.path(),
-            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\nenabled = true\n\
-             last_success_at = \"2023-11-14T22:13:20Z\"\n",
-        );
-        assert_eq!(
-            launch_update_park(false, Some(&layout), 1_700_000_030),
-            Some(Duration::from_secs((WALK - 30) as u64)),
-            "an ordinary launch parks for the remainder of the interval"
-        );
-        assert_eq!(
-            launch_update_park(true, Some(&layout), 1_700_000_030),
-            None,
-            "an update's successor updates at once: its predecessor passed on the old build"
-        );
-        assert_eq!(launch_update_park(true, None, 1_700_000_030), None);
-        assert_eq!(launch_update_park(false, None, 1_700_000_030), None);
-    }
-}
+#[path = "lib_launch_pass_park_tests.rs"]
+mod launch_pass_park_tests;
 
 #[cfg(test)]
 #[path = "lib_head_watch_park_tests.rs"]
@@ -24462,107 +24058,8 @@ fn stand_by(switch: &mut LiveSwitch, ready: impl Fn(LoopGate) -> bool) {
 }
 
 #[cfg(test)]
-mod live_switch_tests {
-    use super::{LiveSwitch, LoopGate, ParkEnd, ParkProbes, sleep_interval_watching_bump};
-    use std::time::{Duration, SystemTime};
-
-    fn scratch(label: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-live-switch-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("aterm.toml")
-    }
-
-    #[test]
-    fn a_config_edit_is_seen_by_the_next_read() {
-        let path = scratch("edit");
-        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
-        let mut switch = LiveSwitch::new(Some(path.clone()), LoopGate::On);
-        assert_eq!(switch.poll(), LoopGate::On);
-        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
-        assert_eq!(switch.poll(), LoopGate::Off, "turned off: seen at once");
-        assert_eq!(
-            switch.poll(),
-            LoopGate::Off,
-            "an unchanged file is not re-read"
-        );
-        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
-        assert_eq!(switch.poll(), LoopGate::On);
-        std::fs::write(&path, "[packages]\nenabled = true\nauto_update = false\n").unwrap();
-        assert_eq!(
-            switch.poll(),
-            LoopGate::Off,
-            "the retired auto_update = false is the one switch, off"
-        );
-        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
-        assert_eq!(switch.poll(), LoopGate::On, "back on: resumed");
-        std::fs::write(&path, "[packages]\nenabled = fal").unwrap();
-        assert_eq!(switch.poll(), LoopGate::On);
-        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
-        assert_eq!(switch.poll(), LoopGate::Off);
-        std::fs::write(&path, "[packages\nenabled = true\n").unwrap();
-        assert_eq!(
-            switch.poll(),
-            LoopGate::Off,
-            "an unparsable file changes nothing"
-        );
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(switch.poll(), LoopGate::On);
-        let mut fixed = LiveSwitch::new(None, LoopGate::Off);
-        assert_eq!(fixed.poll(), LoopGate::Off);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn a_park_answers_the_switch_at_a_slice() {
-        let path = scratch("park");
-        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let switch_file = path.clone();
-        std::thread::spawn(move || {
-            super::set_park_slice_for_this_thread(Duration::from_millis(10));
-            let end = sleep_interval_watching_bump(
-                None,
-                &mut (SystemTime::now() + Duration::from_secs(300)),
-                Duration::from_secs(300),
-                &mut super::BumpWatch::default(),
-                ParkProbes::INDEX,
-                None,
-                &mut LiveSwitch::new(Some(switch_file), LoopGate::On),
-            );
-            let _ = done_tx.send(end);
-        });
-        let end = done_rx
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("the park heard the switch, not its deadline");
-        assert_eq!(end, ParkEnd::SwitchedOff);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn the_exclusion_rides_the_same_read() {
-        let path = scratch("exclude");
-        let mut switch = LiveSwitch::new(Some(path.clone()), LoopGate::On);
-        assert!(switch.exclude().is_empty(), "nothing read yet");
-        std::fs::write(&path, "[packages]\nexclude = [\"codex\"]\n").unwrap();
-        assert_eq!(switch.poll(), LoopGate::On);
-        assert_eq!(switch.exclude(), ["codex".to_string()]);
-        std::fs::write(&path, "[packages]\nexclude = [\"claude\", \"codex\"]\n").unwrap();
-        switch.poll();
-        assert_eq!(
-            switch.exclude(),
-            ["claude".to_string(), "codex".to_string()]
-        );
-        std::fs::write(&path, "[packages\nexclude = []\n").unwrap();
-        switch.poll();
-        assert_eq!(switch.exclude().len(), 2, "a torn save keeps the list");
-        std::fs::remove_file(&path).unwrap();
-        switch.poll();
-        assert!(switch.exclude().is_empty(), "gone: the defaults");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-}
+#[path = "lib_live_switch_tests.rs"]
+mod live_switch_tests;
 
 const HEADLESS_PKG_LANE_SEAM: &str = "ATERM_DEBUG_HEADLESS_PKG_LANE";
 
@@ -24644,127 +24141,8 @@ fn home_is_scratch(home: Option<&std::path::Path>, account: Option<&std::path::P
 }
 
 #[cfg(test)]
-mod headless_pkg_lane_tests {
-    #[test]
-    fn a_headless_lane_runs_only_over_a_scratch_home() {
-        use super::home_is_scratch;
-        let dir = aterm_tempfile::TempDir::new().expect("owned homes");
-        let account = dir.path().join("account");
-        let scratch = dir.path().join("scratch");
-        std::fs::create_dir_all(account.join("child")).expect("account");
-        std::fs::create_dir(&scratch).expect("scratch");
-        assert!(home_is_scratch(Some(&scratch), Some(&account)));
-        assert!(!home_is_scratch(Some(&account), Some(&account)));
-        assert!(!home_is_scratch(
-            Some(&account.join("child/..")),
-            Some(&account)
-        ));
-        #[cfg(unix)]
-        {
-            let alias = dir.path().join("account-alias");
-            std::os::unix::fs::symlink(&account, &alias).expect("account alias");
-            assert!(!home_is_scratch(Some(&alias), Some(&account)));
-            assert!(!home_is_scratch(Some(&account), Some(&alias)));
-        }
-        let missing = dir.path().join("missing");
-        assert!(!home_is_scratch(Some(&missing), Some(&account)));
-        assert!(!home_is_scratch(Some(&scratch), Some(&missing)));
-        assert!(!home_is_scratch(Some(&scratch), None));
-        assert!(!home_is_scratch(None, Some(&account)));
-    }
-
-    #[test]
-    fn the_primers_headless_seam_needs_a_scratch_config_folder() {
-        use super::xdg_config_is_scratch as admits;
-        let dir = aterm_tempfile::TempDir::new().expect("owned homes");
-        let root = dir.path().join("users");
-        let account = root.join("account");
-        let beside = dir.path().join("scratch");
-        let inside = account.join("tmp/scratch");
-        for folder in [
-            account.join(".config"),
-            beside.join("home"),
-            beside.join("cfg"),
-            inside.join("home/.config"),
-        ] {
-            std::fs::create_dir_all(folder).expect("folders");
-        }
-        let own = account.join(".config");
-        let home = beside.join("home");
-        assert!(admits(None, Some(&home), Some(&account)), "unset");
-        assert!(admits(
-            Some(&beside.join("cfg")),
-            Some(&home),
-            Some(&account)
-        ));
-        assert!(admits(
-            Some(&inside.join("home/.config")),
-            Some(&inside.join("home")),
-            Some(&account)
-        ));
-        assert!(!admits(Some(&own), Some(&home), Some(&account)));
-        assert!(!admits(
-            Some(&own),
-            Some(&inside.join("home")),
-            Some(&account)
-        ));
-        assert!(
-            !admits(Some(&own), Some(&root), Some(&account)),
-            "a home above the account's holds its files"
-        );
-        #[cfg(unix)]
-        {
-            let alias = dir.path().join("config-alias");
-            std::os::unix::fs::symlink(&own, &alias).expect("config alias");
-            assert!(!admits(Some(&alias), Some(&home), Some(&account)));
-        }
-        assert!(!admits(
-            Some(&beside.join("missing")),
-            Some(&home),
-            Some(&account)
-        ));
-        assert!(!admits(Some(&beside.join("cfg")), Some(&home), None));
-        assert!(!admits(
-            Some(&beside.join("cfg")),
-            Some(&home),
-            Some(&root.join("missing"))
-        ));
-    }
-
-    #[test]
-    fn a_headless_lane_runs_only_over_a_store_inside_its_scratch_home() {
-        use super::store_is_under;
-        let dir = aterm_tempfile::TempDir::new().expect("owned homes");
-        let scratch = dir.path().join("scratch");
-        let real = dir.path().join("LocalAppData");
-        std::fs::create_dir(&scratch).expect("scratch");
-        std::fs::create_dir(&real).expect("the person's own local app data");
-        let pkg = |base: &std::path::Path| base.join("aterm").join("pkg");
-        assert!(store_is_under(
-            &pkg(&scratch.join("AppData").join("Local")),
-            &scratch
-        ));
-        assert!(store_is_under(&scratch, &scratch));
-        assert!(!store_is_under(&pkg(&real), &scratch));
-        assert!(!store_is_under(
-            &pkg(&scratch.join("..").join("LocalAppData")),
-            &scratch
-        ));
-        assert!(!store_is_under(
-            &scratch.join("not-made").join("..").join("..").join("x"),
-            &scratch
-        ));
-        let out = scratch.join("out");
-        #[cfg(windows)]
-        aterm_uds::host::could_not_run_under_redirection_guard(
-            "the test makes a link leading out of the scratch home (a junction, atpkg's link on \
-             Windows) and reads where it leads",
-        );
-        atpkg::platform::atomic_symlink(&real, &out).expect("a link leading out");
-        assert!(!store_is_under(&pkg(&out), &scratch));
-        assert!(!store_is_under(&pkg(&scratch), &dir.path().join("missing")));
-    }
-}
+#[path = "lib_headless_pkg_lane_tests.rs"]
+mod headless_pkg_lane_tests;
 
 fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
     let Some(atpkg) = co_located_atpkg() else {
@@ -25411,20 +24789,8 @@ fn count_linux_window_start_once_open() {
 }
 
 #[cfg(test)]
-mod linux_trial_start_tests {
-    use super::{LinuxTrialStart, linux_trial_start};
-
-    #[test]
-    fn only_a_launch_that_can_open_a_window_is_a_window_start() {
-        assert_eq!(linux_trial_start(false, true), LinuxTrialStart::Window);
-        assert_eq!(linux_trial_start(true, true), LinuxTrialStart::Session);
-        assert_eq!(linux_trial_start(true, false), LinuxTrialStart::Session);
-        assert_eq!(
-            linux_trial_start(false, false),
-            LinuxTrialStart::WindowOnceOpen
-        );
-    }
-}
+#[path = "lib_linux_trial_start_tests.rs"]
+mod linux_trial_start_tests;
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25549,23 +24915,8 @@ fn display_is_reachable_from(read: impl Fn(&str) -> Option<String>) -> bool {
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "ios"))
 ))]
-mod headless_display_probe_tests {
-    #[test]
-    fn any_one_of_the_three_display_variables_counts_as_a_display() {
-        for var in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"] {
-            assert!(
-                super::display_is_reachable_from(|v| (v == var).then(|| ":0".to_string())),
-                "{var} alone must be enough to keep the real backend"
-            );
-        }
-    }
-
-    #[test]
-    fn an_empty_variable_is_not_a_display() {
-        assert!(!super::display_is_reachable_from(|_| Some(String::new())));
-        assert!(!super::display_is_reachable_from(|_| None));
-    }
-}
+#[path = "lib_headless_display_probe_tests.rs"]
+mod headless_display_probe_tests;
 
 impl App {
     /// `appnotice <lane> <text>`, taken and logged: aterm.log names the lane and the text's
@@ -25710,77 +25061,8 @@ fn windowed_front_door(
 }
 
 #[cfg(test)]
-mod windowed_front_door_tests {
-    use super::windowed_front_door;
-    use std::path::{Path, PathBuf};
-
-    fn install() -> PathBuf {
-        PathBuf::from(r"C:\Users\me\AppData\Local\Programs\aterm")
-    }
-
-    fn build_tree() -> PathBuf {
-        PathBuf::from(r"C:\src\aterm\target\debug")
-    }
-
-    #[test]
-    fn an_install_folder_answers_its_aterm_gui() {
-        let dir = install();
-        let gui = dir.join("aterm-gui.exe");
-        let only_gui = |path: &Path| path == gui;
-        for running in ["aterm.exe", "aterm-ctl.exe", "atpkg.exe", "aterm-cli.exe"] {
-            assert_eq!(
-                windowed_front_door(&dir.join(running), only_gui, false),
-                Some(gui.clone()),
-                "{running}"
-            );
-        }
-        assert_eq!(
-            windowed_front_door(&gui, only_gui, false),
-            Some(gui.clone()),
-            "the windowed image names itself"
-        );
-        let shouty = dir.join("ATERM-GUI.EXE");
-        assert_eq!(
-            windowed_front_door(&shouty, |_| false, false),
-            Some(shouty.clone()),
-            "Windows names are case-insensitive"
-        );
-    }
-
-    #[test]
-    fn a_build_tree_answers_its_aterm_windowed_and_never_the_thin_bin() {
-        let dir = build_tree();
-        let windowed = dir.join("aterm-windowed.exe");
-        let thin = dir.join("aterm-gui.exe");
-        let both = |path: &Path| path == windowed || path == thin;
-        for running in ["aterm.exe", "aterm-gui.exe", "aterm-windowed.exe"] {
-            assert_eq!(
-                windowed_front_door(&dir.join(running), both, true),
-                Some(windowed.clone()),
-                "{running}"
-            );
-        }
-        let only_thin = |path: &Path| path == thin;
-        assert_eq!(
-            windowed_front_door(&dir.join("aterm.exe"), only_thin, true),
-            None,
-            "the console image of a build tree without its windowed image"
-        );
-        assert_eq!(
-            windowed_front_door(&thin, only_thin, true),
-            None,
-            "the thin dev bin is not the front door, even for itself"
-        );
-    }
-
-    #[test]
-    fn a_lone_console_image_has_no_windowed_front_door() {
-        assert_eq!(
-            windowed_front_door(&install().join("aterm.exe"), |_| false, false),
-            None
-        );
-    }
-}
+#[path = "lib_windowed_front_door_tests.rs"]
+mod windowed_front_door_tests;
 
 /// The windowed image beside `current` that routes the front door's verbs (Windows).
 #[cfg(windows)]
@@ -25840,97 +25122,8 @@ impl ImageSubsystem {
 use aterm_types::pe_image::{IMAGE_SUBSYSTEM_WINDOWS_GUI, subsystem as pe_subsystem};
 
 #[cfg(test)]
-mod os_restart_tests {
-    use super::{
-        IMAGE_SUBSYSTEM_WINDOWS_GUI, ImageSubsystem, pe_subsystem, registers_for_os_restart,
-    };
-
-    #[test]
-    fn only_a_window_in_the_windowed_image_registers_for_os_restart() {
-        use ImageSubsystem::{NotWindowed, Windowed};
-        assert!(registers_for_os_restart(false, Windowed));
-        assert!(!registers_for_os_restart(true, Windowed), "headless");
-        assert!(
-            !registers_for_os_restart(false, NotWindowed),
-            "the console image"
-        );
-        assert!(!registers_for_os_restart(true, NotWindowed));
-    }
-
-    fn header(nt: usize, subsystem: u16) -> Vec<u8> {
-        let mut head = vec![0u8; nt + 4 + 20 + 70];
-        head[..2].copy_from_slice(b"MZ");
-        head[0x3C..0x40].copy_from_slice(&u32::try_from(nt).expect("small").to_le_bytes());
-        head[nt..nt + 4].copy_from_slice(b"PE\0\0");
-        head[nt + 92..nt + 94].copy_from_slice(&subsystem.to_le_bytes());
-        head
-    }
-
-    #[test]
-    fn the_subsystem_is_read_from_the_pe_header_and_nothing_else_is_one() {
-        assert_eq!(
-            pe_subsystem(&header(0x80, 2)),
-            Some(IMAGE_SUBSYSTEM_WINDOWS_GUI)
-        );
-        assert_eq!(
-            pe_subsystem(&header(0x108, 3)),
-            Some(3),
-            "the console image"
-        );
-        let mut not_mz = header(0x80, 2);
-        not_mz[0] = b'X';
-        assert_eq!(pe_subsystem(&not_mz), None, "no MZ");
-        let mut not_pe = header(0x80, 2);
-        not_pe[0x80] = b'X';
-        assert_eq!(pe_subsystem(&not_pe), None, "no PE signature");
-        let short = header(0x80, 2);
-        assert_eq!(
-            pe_subsystem(&short[..0x80 + 93]),
-            None,
-            "a read that ends inside the field"
-        );
-        let mut far = header(0x80, 2);
-        far[0x3C..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(pe_subsystem(&far), None, "an NT offset past the read");
-        assert_eq!(pe_subsystem(b""), None);
-        assert_eq!(
-            ImageSubsystem::of_head(&header(0x80, 2)),
-            ImageSubsystem::Windowed
-        );
-        assert_eq!(
-            ImageSubsystem::of_head(&header(0x108, 3)),
-            ImageSubsystem::NotWindowed
-        );
-        assert_eq!(ImageSubsystem::of_head(&far), ImageSubsystem::NotWindowed);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_windowed_image_is_told_from_the_console_image_by_its_own_header() {
-        let system = std::env::var_os("SystemRoot")
-            .map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), Into::into);
-        let notepad = system.join("System32").join("notepad.exe");
-        assert_eq!(
-            super::win32::image_subsystem(&notepad),
-            ImageSubsystem::Windowed,
-            "{}",
-            notepad.display()
-        );
-        let exe = std::env::current_exe().expect("this test binary");
-        assert_eq!(
-            super::win32::image_subsystem(&exe),
-            ImageSubsystem::NotWindowed,
-            "{}",
-            exe.display()
-        );
-        assert_eq!(super::win32::running_image(), ImageSubsystem::NotWindowed);
-        assert_eq!(
-            super::win32::image_subsystem(&exe.with_extension("no-such-image")),
-            ImageSubsystem::NotWindowed,
-            "a file that cannot be read"
-        );
-    }
-}
+#[path = "lib_os_restart_tests.rs"]
+mod os_restart_tests;
 
 /// Anchor the shipped one-binary timing boundary before its router.
 pub fn mark_rust_main_start() {
@@ -26076,7 +25269,9 @@ struct WarmPrologue {
     document_write_cap: aterm_cap::Cap<aterm_buffer::BufferWrite>,
 }
 
-/// A windowed font warm requires AppKit's font classes to be registered first.
+/// Which launch a warm serves: a windowed one carries the proof minted before
+/// the warm, whose construction loaded AppKit on the main thread, so the
+/// accessibility warm's AppKit class lookups find their classes.
 #[derive(Clone, Copy)]
 enum WarmLaunch {
     Headless,
@@ -26105,6 +25300,8 @@ enum WarmConfigRuntime {
 
 struct WarmConfig {
     native_config_service: native_config_service::VersionedConfigService,
+    /// Where the launch's `[update]` switches came from ([`app_config::UpdateStandIn::origin`]).
+    update_switch_origin: app_config::UpdateSwitchOrigin,
     startup_config_snapshot: native_config_service::ConfigSnapshot,
     config: app_config::Config,
     tab_strip_rows: u16,
@@ -26137,14 +25334,16 @@ struct WarmConfig {
 fn warm_config(launch: WarmLaunch, zoom: app_config::CarriedZoom) -> WarmConfig {
     let headless = launch.headless();
     let mut launch_harness = None;
+    let mut update_switch_origin = app_config::UpdateSwitchOrigin::Admitted;
     let native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
             crate::logging::stderr_line!("aterm-gui: native config service: {error}");
-            launch_harness = Some(app_config::HarnessPolicy::read_path(
-                app_config::config_path().as_deref(),
-            ));
-            native_config_service::VersionedConfigService::new_runtime(String::new())
-                .expect("empty config is valid TOML")
+            let path = app_config::config_path();
+            launch_harness = Some(app_config::HarnessPolicy::read_path(path.as_deref()));
+            let stand_in = app_config::update_switches_stand_in(path.as_deref());
+            update_switch_origin = stand_in.origin;
+            native_config_service::VersionedConfigService::new_runtime(stand_in.text)
+                .expect("the update switches' stand-in is valid TOML")
         });
     let startup_config_snapshot = native_config_service.snapshot();
     let mut config = (*startup_config_snapshot.config).clone();
@@ -26415,6 +25614,7 @@ fn warm_config(launch: WarmLaunch, zoom: app_config::CarriedZoom) -> WarmConfig 
     };
     WarmConfig {
         native_config_service,
+        update_switch_origin,
         startup_config_snapshot,
         config,
         tab_strip_rows,
@@ -26879,6 +26079,8 @@ pub enum NetworkRead {
     WithServices,
 }
 
+pub use host_quit::install as install_host_quit;
+
 /// A host-owned worker's nonblocking maintenance. A deadline is returned only
 /// while its next start is owed; a live worker wakes the window when it ends.
 pub type HostMaintenance = Box<dyn FnMut() -> Option<Instant> + Send>;
@@ -26901,6 +26103,9 @@ pub fn main_entry_with_network(
         }
     }
     metrics::mark_process_start();
+    // Before the control server can take a fleet drive's spawn: a request this process opens is
+    // never older than it, so its relaunch sweep never judges one of its own.
+    let requests_born_ms = aterm_time::unix_millis().unwrap_or(0);
     #[cfg(target_os = "macos")]
     code_readahead::read_ahead_own_code();
     consent_card::note_process_start();
@@ -26930,7 +26135,7 @@ pub fn main_entry_with_network(
     #[cfg(windows)]
     win32::set_app_user_model_id();
     #[cfg(windows)]
-    win32::raise_timer_resolution();
+    let _ = win32::settle_timer_grid();
     let Cli {
         exec_command,
         cwd,
@@ -27142,9 +26347,12 @@ pub fn main_entry_with_network(
     }
     #[cfg(unix)]
     descriptor_limit::settle_incoming_descriptor_limit(&handoff_env);
-    // Register AppKit's font bridge before a warm worker can create a cached
-    // Core Text font. Loading it after that creation leaves __NSCFType objects
-    // in the cache that NSFont cannot use to create window controls.
+    // Mint the windowed proof before the warm, so AppKit loads here on the main
+    // thread before any warm worker starts: the accessibility warm and the
+    // dial's Launch Services check-in look AppKit classes up by name, which
+    // answer nil until it loads. The workers' fonts need no order of their own:
+    // aterm-render's Core Text layer registers AppKit's font bridge before it
+    // makes its first font.
     #[cfg(target_os = "macos")]
     let windowed = (!headless).then(platform::Windowed::launch);
     #[cfg(target_os = "macos")]
@@ -27518,6 +26726,9 @@ pub fn main_entry_with_network(
         leave_after_warm();
         return;
     }
+    if overlap_admitted {
+        crate::metrics::begin_handoff_diagnostics();
+    }
     #[cfg(unix)]
     let handoff_commit = if let Some(commit) = handoff_commit {
         let Some(watched) = commit.start_watch() else {
@@ -27561,6 +26772,7 @@ pub fn main_entry_with_network(
         config:
             WarmConfig {
                 mut native_config_service,
+                update_switch_origin,
                 startup_config_snapshot,
                 config,
                 tab_strip_rows,
@@ -27981,11 +27193,9 @@ pub fn main_entry_with_network(
             );
         }
     } else {
-        // A windowed instance still dies of the signal, its account claims given up first
-        // (docs/DESIGN-fluid-swarm-2026-10-28.md F19).
-        crate::harness_host::arm_claims_off_as_the_window_dies(
-            crate::harness_host::claims_off_as_the_window_dies,
-        );
+        // A windowed instance still dies of the signal, the setup stages it cuts off noted and
+        // its account claims given up first (docs/DESIGN-fluid-swarm-2026-10-28.md F19).
+        crate::harness_host::arm_claims_off_as_the_window_dies(the_window_dies);
     }
     presence::install_proxy(proxy.clone());
     claude_footer::install_proxy(proxy.clone());
@@ -28053,6 +27263,12 @@ pub fn main_entry_with_network(
                 .create_proxy()
                 .send_event(Wake::DevBuildWrites(writes));
         }
+    }
+    // Windows runs no checker (`aterm_update::enabled`); it announces the build a local build
+    // loop staged, read from one pointer file now and on a slow timer.
+    #[cfg(windows)]
+    if aterm_update::staged_notice_enabled() {
+        crate::update_control::spawn_windows_staged_watch(event_loop.create_proxy());
     }
     if let Some(v) = aterm_types::dev_seam!("ATERM_DEBUG_RELAUNCH_NUDGE") {
         let version = v.to_string_lossy().into_owned();
@@ -28168,7 +27384,10 @@ pub fn main_entry_with_network(
                 bytes_total: 74_000_000,
             }
         };
-        let _ = proxy.send_event(Wake::UpdateProgress(update));
+        let _ = proxy.send_event(Wake::UpdateProgress(aterm_update::ProgressReport {
+            progress: update,
+            checker_generation: None,
+        }));
     }
 
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Services);
@@ -28212,7 +27431,7 @@ pub fn main_entry_with_network(
                     startup_config_snapshot
                         .assets
                         .trail_style
-                        .presentation_for(config.cursor_trail_style_raw()),
+                        .presentation_for(config.cursor_trail_style_raw(), config.cursor_pet_raw()),
                 ),
             );
             g.set_shimmer(
@@ -28333,6 +27552,7 @@ pub fn main_entry_with_network(
                 Arc::clone(&recovery_count_admission),
                 control_handoff,
                 publish_gate,
+                headless,
             );
             if handoff_reader_gate.is_some() {
                 handoff_control_preparation = Some(preparation);
@@ -28456,6 +27676,9 @@ pub fn main_entry_with_network(
         host.defer_adopted_claims(adopted_claim_grace, harness_host::ADOPTED_CLAIM_GRACE);
         host
     });
+    // Which tab is whose request, read off the main thread before the first look at a Workers
+    // row or a lease (ATERM-KI-1109-3).
+    requests_host::load();
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -28557,6 +27780,9 @@ pub fn main_entry_with_network(
     cfg_warns.extend(ConfigFamily::Keybindings, ks_warns);
     app_config::collect_key_notices(&mut cfg_warns, &startup_config_snapshot.text);
     if let Some(w) = config.cursor_trail_style_warning() {
+        cfg_warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
+    }
+    if let Some(w) = config.cursor_pet_warning() {
         cfg_warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
     }
     cfg_warns.extend_shown_in_settings(ConfigFamily::Fonts, font_cfg_warns);
@@ -28673,6 +27899,11 @@ pub fn main_entry_with_network(
     }
     #[cfg(unix)]
     recovery_census::record_cold(launch_arming, keeper_census.0, keeper_census.1);
+    // The last Quit & Reopen helper ran with no journal; what it did reaches this one.
+    #[cfg(target_os = "macos")]
+    if !headless {
+        quit_reopen::journal_last_reopen();
+    }
     if !keeper_recovered_shells.is_empty() {
         message_inbox::queue_message(message_reporters::keeper_recovered_message(
             keeper_recovered_shells.len(),
@@ -28732,6 +27963,7 @@ pub fn main_entry_with_network(
             first_run.filter(|_| first_run_eligible),
             headless,
             developer_tools_shim,
+            successor.incoming_handoff_pending,
         )
         .with_maintenance(if headless { None } else { maintenance }),
         system_state_host: system_state_host::Host::for_launch(headless),
@@ -28939,6 +28171,8 @@ pub fn main_entry_with_network(
         next_window_id: 1,
         pending_restore: restore_manifest,
         restore_drain: None,
+        restore_glass: RestoreGlassWait::default(),
+        lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
         seamless_adopt,
         seamless_held,
         seamless_held_shown: Vec::new(),
@@ -28950,6 +28184,7 @@ pub fn main_entry_with_network(
         #[cfg(unix)]
         handoff_claimed_at: handoff_claimed_at.filter(|_| handoff_ready.is_some()),
         handoff_ready,
+        handoff_progress: handoff_progress::Progress::default(),
         #[cfg(unix)]
         handoff_commit,
         handoff_reader_gate,
@@ -29027,7 +28262,7 @@ pub fn main_entry_with_network(
             let mut lane = permission_walk::WalkLane::new(headless);
             if handed_over || relaunch_of_running || JUST_UPDATED.get().copied().unwrap_or(false) {
                 // An update's successor gives this Mac its first walk too, and walks on from
-                // the pages a Quit & Reopen left as it opened into the update.
+                // the pages its predecessor's walk kept, as every process does.
                 lane.note_successor();
             }
             lane
@@ -29085,6 +28320,9 @@ pub fn main_entry_with_network(
         #[cfg(target_os = "macos")]
         machine_writer: None,
         _status_item: None,
+        lock_face: status_item::LockFace::new(aterm_types::fleet_access::FleetAccess::ReadOnly),
+        #[cfg(target_os = "macos")]
+        access_look: None,
         status_fingerprint: None,
         status_drawn: Vec::new(),
         status_painted: None,
@@ -29119,9 +28357,14 @@ pub fn main_entry_with_network(
         handoff_history_loss_said: crate::handoff_history::LossSummary::default(),
         handoff_repainted_tabs,
         first_present_done: false,
-        boot_health_confirmation: BootHealthConfirmation::Pending,
+        boot_health_confirmation: BootHealthConfirmation::Awaiting,
         boot_health_confirmation_retry_at: None,
         boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
+        boot_health_hold_reason: None,
+        boot_health_unanswered: 0,
+        boot_health_checkpoint_seen: false,
+        boot_health_asked_at_checkpoint: false,
+        boot_health_checkpoint_ask_owed: false,
         level_up: None,
         messages: {
             let now = Instant::now();
@@ -29180,6 +28423,7 @@ pub fn main_entry_with_network(
         permission_clicks: permission_click::ClickView::with(
             permission_clicks,
             permission_click::live_clicker(sock_plan.as_ref().map(|plan| plan.sock_path.clone())),
+            permission_click::live_defaults(),
         ),
         integration_notices: integration_notice::IntegrationNotices::default(),
         update_flow: None,
@@ -29282,6 +28526,9 @@ pub fn main_entry_with_network(
         log_closes_deferred: std::collections::BTreeSet::new(),
         harness: harness.clone(),
         harness_policy: harness_policy_cell::HarnessPolicyCell::new(config.harness.clone()),
+        update_switch_origin,
+        admitted_update_under_refused_off: None,
+        refused_update_text: None,
         harness_waits: std::collections::HashMap::new(),
         harness_wait_epoch: 0,
         need_rechecks: std::collections::HashMap::new(),
@@ -29289,6 +28536,10 @@ pub fn main_entry_with_network(
         api_outage: std::collections::BTreeMap::new(),
         worker_termed: std::collections::HashMap::new(),
         worker_job_seen: std::collections::HashMap::new(),
+        lease: app_requests::LeaseClock::HOST,
+        request_spans: std::collections::HashMap::new(),
+        requests_born_ms,
+        requests_swept: Arc::default(),
         claim_not_ready: None,
         status_dirty: false,
         harness_glass: std::collections::HashMap::new(),
@@ -29319,6 +28570,7 @@ pub fn main_entry_with_network(
         perf_shed_dwell: crate::app_render::PERF_SHED_DWELL_MIN,
         perf_env_at_flip: 1.0,
         event_loop_failed: false,
+        run_end: Some(run_end::RunEnd::new(root_sid)),
     };
     // The launch's first tab was built before the App: its open is written now, the restore's
     // where a manifest is to place it.
@@ -29453,115 +28705,28 @@ pub fn main_entry_with_network(
         }));
     metrics::mark_gui_ready_for_winit();
     crate::qos::set_self(crate::qos::Role::Interactive);
-    let failed_status = event_loop
-        .run_app(&mut app)
-        .err()
-        .map(|error| event_loop_failed(&mut app, &error));
-    #[cfg(all(unix, not(test)))]
-    crate::net_place::stop();
+    let ended = event_loop.run_app(&mut app);
+    // The loop has ended: from here nothing beats the watchdog's rest at `about_to_wait`'s park
+    // awake, so the teardown is judged at `ShutdownWait` from its first step.
     crate::watchdog::beat(crate::watchdog::Breadcrumb::ShutdownWait);
-    // The permission helper's panel is aterm's own window, not winit's, so winit's exit close
-    // leaves it: it goes with the terminal windows, before the shutdown waits (macOS's Quit &
-    // Reopen after a grant ends with it up).
-    #[cfg(target_os = "macos")]
-    crate::devtools_helper::live::close();
-    // A logout, restart or shut down nobody cancelled: this Mac gives up its account claims first,
-    // within `QUIET_WITHIN`, while the system still waits (docs/DESIGN-fluid-swarm-2026-10-28.md
-    // F19).
-    #[cfg(target_os = "macos")]
-    crate::harness_host::claims_off_as_the_system_quits();
-    app.finish_system_state_shutdown();
-    app.shutdown_tab_spawns();
-    app.shutdown_spares();
-    spawn_prep::release_at_exit(std::time::Duration::from_secs(1));
-    if let Some(host) = harness.as_ref() {
-        host.shutdown_and_join();
-    }
-    // THE QUIT CLOSES EVERY TAB, THEN EVERY LIVE SESSION'S LOG, HERE (fix unit Q1), where its
-    // bye stood: on unix `bye_at_quit` closes the logs, gives the bus those closes within the
-    // quit budget, then says `bye quit`; elsewhere they close alone. Either way the journal's
-    // last lines below carry the same records, and a closed log takes no record after its close.
-    app.close_sessions_at_quit();
-    app.write_harness_ab_at_exit();
-    let _ = app.vitals.stop_at_exit(vitals_host::STOP_BOUND);
-    let _ = app.video_abort_app_shutdown();
-    while !app
-        .video_export
-        .wait_idle(std::time::Duration::from_secs(120))
-    {
-        crate::logging::stderr_line!(
-            "aterm-gui: still waiting for the cancelled video export to clean up"
-        );
-    }
-    app.kitty_log.flush_exit();
-    let _ = app.close_messages_at_exit();
-    app.session_log_journal
-        .finish_at_quit(session_log_journal::quit_budget());
-    let mut quit_wrote_its_desk = false;
-    if app.desk.kept() && app.config.restore_session_or_default() {
-        let mut manifest = app
-            .quit_capture
-            .take()
-            .unwrap_or_else(|| app.capture_restore_manifest());
-        let keeps = app.desk.quit_keeps_agents(system_quit::asked());
-        app.quit_agents(&mut manifest, keeps);
-        let run = app.crash_journal.run().map(crash_journal::JournalId::stem);
-        quit_wrote_its_desk = !manifest.is_empty();
-        if quit_wrote_its_desk && let Err(e) = restore::write_quit(&manifest, run.as_deref()) {
-            crate::logging::stderr_line!("aterm-gui: could not persist the session layout: {e}");
-        }
-    }
-    #[cfg(unix)]
-    app.settle_owed_layout_take_back_at_quit(quit_wrote_its_desk);
-    #[cfg(not(unix))]
-    let _ = quit_wrote_its_desk;
-    restore::settle_take();
-    if let Err(error) = app.crash_journal.retire(std::time::Duration::from_secs(2)) {
-        crate::logging::stderr_line!("aterm-gui: crash journal not removed at quit: {error}");
-    }
-    if sock_bound.load(std::sync::atomic::Ordering::SeqCst)
-        && let Some(plan) = &sock_plan
-    {
-        crate::owned_endpoint::release(plan);
-        let dir = control_auth::dir_of_socket(&plan.sock_path);
-        let handles = {
-            app.store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .snapshot()
-        };
-        let sessions =
-            std::iter::once(root_sid.clone()).chain(handles.into_iter().map(|h| h.sid.clone()));
-        proxy::retire_own_sessions(&dir, &plan.sock_path, sessions);
-        let _ = proxy::flush_publications(std::time::Duration::from_secs(1));
-    }
-    #[cfg(unix)]
-    {
-        app.pool.retire_at_quit();
-        let _ = aterm_pty::wait_for_reaps(aterm_pty::REAP_GRACE_WAIT);
-    }
-    #[cfg(windows)]
-    aterm_pty::end_programs_outside_jobs();
-    let parked = app.pool.predecessors_sessions();
-    task_launch::retire_task_files_at_quit(&app.store, &parked);
-    app.forget_retired_workers_at_quit();
-    crash_signal::remove_marker_on_clean_exit();
-    let input_replies = control::input_replies_of(&app.store);
-    if !control::settle_final_replies(std::time::Duration::from_millis(500), &input_replies) {
-        aterm_log::warn!("exiting with a control reply still undelivered after 500 ms");
-    }
-    #[cfg(target_os = "macos")]
-    if app.desk.kept() {
-        app.leave_walk_at_quit(system_quit::reopens());
-        quit_reopen::leave_reopen_at_quit();
-    }
-    #[cfg(unix)]
-    aterm_log::info!("{}", recovery_census::QUIT_LINE);
+    let failed_status = ended.err().map(|error| event_loop_failed(&mut app, &error));
+    // The run's end, unless the loop's exit ran it inside AppKit (`run_end`).
+    app.end_run();
     std::mem::forget(app);
-    keeper_link::bye();
-    let _ = logging::flush_within(logging::LOG_FLUSH_EXIT_WAIT);
     crate::owned_endpoint::die_of_quit_signal();
     std::process::exit(failed_status.unwrap_or(0));
+}
+
+/// What a terminating signal does before it ends a windowed instance
+/// (`harness_host::arm_claims_off_as_the_window_dies`): the setup stages running now are noted as
+/// cut off by no crash, as a quit notes them (`system_state_host::note_setup_cut_off_as_the_window_dies`),
+/// so a logout that ends aterm by its SIGTERM (`launchctl bootout`) counts no begin toward a
+/// stage's park; then the window's account claims are given up.
+#[cfg(unix)]
+fn the_window_dies() {
+    #[cfg(target_os = "macos")]
+    crate::system_state_host::note_setup_cut_off_as_the_window_dies();
+    crate::harness_host::claims_off_as_the_window_dies();
 }
 
 fn event_loop_failed(app: &mut App, error: &aterm_window::error::EventLoopError) -> i32 {
@@ -29754,143 +28919,8 @@ mod session_teardown_identity_tests;
 mod title_drift_tests;
 
 #[cfg(test)]
-mod session_chrome_expiry_conformance_tests {
-    use super::{App, WindowId};
-    use crate::session_chrome::{
-        CACHE_MAX_AGE_MS, EXPIRY_WINDOW_SCAN_BUDGET, TabMenuEntry, menu_shown_at,
-        next_cache_expiry_ms,
-    };
-
-    fn clock_moved(app: &mut App) -> u64 {
-        let expiry = crate::turn_ledger::now_ms() + CACHE_MAX_AGE_MS;
-        app.session_chrome
-            .get_mut(&0)
-            .expect("warmed cache")
-            .expires_ms = Some(expiry);
-        expiry
-    }
-
-    #[test]
-    fn quiet_expiry_recomposes_live_tooltip_at_the_exact_deadline() {
-        let mut app = App::headless_for_test();
-        app.refresh_window_tabs(WindowId(0));
-        let expiry = clock_moved(&mut app);
-        let cached = app.session_chrome.get_mut(&0).expect("warmed cache");
-        cached.ext.tooltip = Some("stale-age-sentinel".to_string());
-        app.windows
-            .get_mut(&WindowId(0))
-            .expect("window")
-            .tab_set
-            .tab_at_mut(0)
-            .expect("tab")
-            .presentation
-            .tooltip = Some("stale-age-sentinel".to_string());
-
-        assert_eq!(
-            app.advance_session_chrome_expiry(expiry - 1),
-            crate::session_chrome::ExpiryProgress::default()
-        );
-        let progress = app.advance_session_chrome_expiry(expiry);
-        assert_eq!(progress.admitted_session, Some(0));
-        assert_eq!(progress.window_scans, 1);
-        assert_eq!(progress.window_refreshes, 1);
-        assert_eq!(progress.completed_session, Some(0));
-        let refreshed = app.session_chrome.get(&0).expect("recomposed cache");
-        assert_ne!(
-            refreshed.ext.tooltip.as_deref(),
-            Some("stale-age-sentinel"),
-            "the due entry was removed before the window recomposed it"
-        );
-        assert_eq!(
-            app.windows[&WindowId(0)].tab_set.tabs()[0]
-                .presentation
-                .tooltip,
-            refreshed.ext.tooltip,
-            "the live tab receives the fresh composition in the expiry turn"
-        );
-        assert_eq!(
-            next_cache_expiry_ms(&app.session_chrome),
-            None,
-            "recomposed with nothing the clock moves (no upgrade): no further wake"
-        );
-    }
-
-    #[test]
-    fn a_quiet_desktops_tabs_arm_no_wake_and_their_menus_age_as_shown() {
-        use std::time::{Duration, Instant};
-        let mut app = App::headless_for_test();
-        app.windows
-            .get_mut(&WindowId(0))
-            .expect("window")
-            .window_on_screen_for_test = true;
-        app.refresh_window_tabs(WindowId(0));
-        let (now, now_ms) = (Instant::now(), crate::turn_ledger::now_ms());
-        assert_eq!(app.session_chrome[&0].expires_ms, None, "nothing to move");
-        assert_eq!(app.session_chrome_wake(now, now_ms), None, "no wake");
-        let menu = app.session_chrome[&0].ext.menu.clone();
-        let started = menu
-            .iter()
-            .find_map(|e| match e {
-                TabMenuEntry::Event { words, at_ms } if words == "started" => Some(*at_ms),
-                _ => None,
-            })
-            .expect("a fresh tab's `started` row, with its stamp");
-        let shown = |at: u64| {
-            menu_shown_at(&menu, at)
-                .into_iter()
-                .find_map(|e| match e {
-                    TabMenuEntry::Header(h) if h.starts_with("started ") => Some(h),
-                    _ => None,
-                })
-                .expect("the row, aged")
-        };
-        assert_eq!(shown(started + 2_000), "started \u{b7} just now");
-        assert_eq!(shown(started + 5 * 60_000), "started \u{b7} 5m ago");
-        let card = app.tab_context_menu_model(WindowId(0), 0);
-        assert!(
-            card.iter()
-                .any(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("started \u{b7} "))),
-            "{card:?}"
-        );
-        assert!(!card.iter().any(|e| matches!(e, TabMenuEntry::Event { .. })));
-        assert_eq!(app.session_chrome[&0].ext.menu, menu, "no recomposition");
-        let expiry = clock_moved(&mut app);
-        assert_eq!(
-            app.session_chrome_wake(now, expiry - 5_000),
-            Some(now + Duration::from_millis(5_000))
-        );
-    }
-
-    #[test]
-    fn real_window_scan_conforms_to_model_and_bulk_mutant_is_rejected() {
-        let model = aterm_models_misc::session_chrome_expiry_model();
-        let mut state = model.init_state();
-        assert!(model.fire("Seed", &mut state));
-        assert!(model.fire("Expire", &mut state));
-        assert!(model.fire("Begin", &mut state));
-
-        let mut app = App::headless_for_test();
-        app.refresh_window_tabs(WindowId(0));
-        let expiry = clock_moved(&mut app);
-        let real = app.advance_session_chrome_expiry(expiry);
-        assert!(model.fire("Scan", &mut state));
-        assert_eq!(
-            i64::try_from(real.window_scans).unwrap(),
-            state["work"],
-            "model work is the real window scan, not merely a selected session"
-        );
-        assert!(real.window_scans <= EXPIRY_WINDOW_SCAN_BUDGET);
-        assert!(real.window_refreshes <= real.window_scans);
-        assert!(model.check_invariant("WorkPerTurnBounded", &state));
-
-        let mut mutant_state = state;
-        mutant_state.insert("work", 3);
-        assert!(
-            !model.check_invariant("WorkPerTurnBounded", &mutant_state),
-            "an unbounded shipping mutant must fail the exact model invariant"
-        );
-    }
-}
+#[path = "lib_session_chrome_expiry_conformance_tests.rs"]
+mod session_chrome_expiry_conformance_tests;
 
 #[cfg(test)]
 #[cfg(unix)]
@@ -29898,187 +28928,12 @@ mod session_chrome_expiry_conformance_tests {
 mod overlap_handoff_tests;
 
 #[cfg(test)]
-mod backend_slot_tests {
-    use super::{App, Backend, BackendSlot, FONT_PX, Renderer, Theme, pad_for_scale, seed_cell_px};
-
-    #[test]
-    fn finalize_backend_joins_once_and_runs_deferred_setup() {
-        let mut app = App::headless_for_test();
-        let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (Backend, bool, Option<String>) {
-            let mut r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
-            r.seal_admitted_font_sources();
-            (Backend::Cpu(r), false, None)
-        });
-        app.backend = BackendSlot::Pending(Some(handle));
-        app.use_gpu = true; // wrong-on-purpose intent seed; the join must correct it
-        app.font_family = Some("Seeded Family".into()); // admitted: the seed survives
-        assert!(app.backend.is_pending());
-
-        app.finalize_backend();
-
-        assert!(!app.backend.is_pending(), "slot Ready after the join");
-        assert!(!app.use_gpu, "the build's ACTUAL outcome replaces the seed");
-        assert_eq!(
-            app.font_family.as_deref(),
-            Some("Seeded Family"),
-            "an ADMITTED family keeps its seed as the live rebuild source"
-        );
-        assert_eq!(
-            app.backend.pad(),
-            pad_for_scale(1.0),
-            "the deferred 1x pad seed was applied at the join"
-        );
-        app.finalize_backend();
-        assert!(!app.backend.is_pending());
-        assert_eq!(app.backend.pad(), pad_for_scale(1.0));
-    }
-
-    #[test]
-    fn finalize_backend_drops_a_font_family_the_worker_rejected() {
-        if !crate::message_inbox::lane_zero_alone() {
-            return;
-        }
-        let mut app = App::headless_for_test();
-        let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (Backend, bool, Option<String>) {
-            let mut r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
-            r.seal_admitted_font_sources();
-            (
-                Backend::Cpu(r),
-                false,
-                Some("font_family \"No Such Family\" is not an admissible font".into()),
-            )
-        });
-        app.backend = BackendSlot::Pending(Some(handle));
-        app.font_family = Some("No Such Family".into());
-        let _ = crate::message_inbox::take_queued();
-        app.finalize_backend();
-        assert_eq!(
-            app.font_family, None,
-            "a rejected family must be dropped at the join — the built-in candidate regime is \
-             what the startup renderer actually uses"
-        );
-        assert!(
-            crate::message_inbox::take_queued().iter().any(|m| {
-                m.message.key.as_deref() == Some(crate::message_reporters::KEY_FONT_FAMILY)
-            }),
-            "the join says the refusal of the build it joined"
-        );
-    }
-
-    #[test]
-    fn a_discarded_warms_font_refusal_never_reaches_the_inbox() {
-        if !crate::message_inbox::lane_zero_alone() {
-            return;
-        }
-        const FAMILY: &str = "Zz No Such Family";
-        assert!(
-            crate::app_config::Config::font_family_admission(Some(FAMILY)).is_err(),
-            "the early warm must have a refusal to leak"
-        );
-        let _ = crate::message_inbox::take_queued();
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let path = dir.path().join("aterm").join("aterm.toml");
-        std::fs::create_dir_all(dir.path().join("aterm")).expect("config dir");
-        crate::test_scratch::write_config(&path, format!("font_family = {FAMILY:?}\n"));
-        crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
-            let read = crate::WarmConfigRead::take(Some(&path));
-            let early = crate::warm_config(
-                crate::WarmLaunch::Headless,
-                crate::app_config::CarriedZoom::default(),
-            );
-            let _ = early.backend_handle.join().expect("the early worker");
-            std::fs::write(&path, "\n").expect("the hold's edit");
-            assert!(crate::warm_config_moved(&read, Some(&path)));
-            let late = crate::warm_config(
-                crate::WarmLaunch::Headless,
-                crate::app_config::CarriedZoom::default(),
-            );
-            let _ = late.backend_handle.join().expect("the re-warm's worker");
-        });
-        let stale: Vec<_> = crate::message_inbox::take_queued()
-            .into_iter()
-            .filter(|m| m.message.key.as_deref() == Some(crate::message_reporters::KEY_FONT_FAMILY))
-            .map(|m| m.message.detail)
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "the discarded warm's refusal reached the inbox: {stale:?}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "published an unsealed font generation")]
-    fn finalize_backend_rejects_unsealed_generation() {
-        let mut app = App::headless_for_test();
-        let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (Backend, bool, Option<String>) {
-            let renderer =
-                Renderer::from_system(FONT_PX, theme).expect("system font for test build");
-            (Backend::Cpu(renderer), false, None)
-        });
-        app.backend = BackendSlot::Pending(Some(handle));
-        app.finalize_backend();
-    }
-
-    #[test]
-    #[should_panic(expected = "before attach_os_window")]
-    fn pending_slot_access_is_fail_loud() {
-        let slot = BackendSlot::Pending(Some(std::thread::spawn(
-            move || -> (Backend, bool, Option<String>) {
-                let mut r = Renderer::from_system(FONT_PX, Theme::default())
-                    .expect("system font for test build");
-                r.seal_admitted_font_sources();
-                (Backend::Cpu(r), false, None)
-            },
-        )));
-        let _ = slot.cell_size();
-    }
-
-    #[test]
-    fn seed_cell_px_is_positive_and_tracks_font_px() {
-        let (w13, h13) = seed_cell_px(13.0);
-        assert!(w13 >= 1);
-        assert!(h13 > w13, "cells are taller than wide");
-        let (w26, h26) = seed_cell_px(26.0);
-        assert!(w26 > w13 && h26 > h13, "seed grows with the font");
-    }
-}
+#[path = "lib_backend_slot_tests.rs"]
+mod backend_slot_tests;
 
 #[cfg(test)]
-mod spawn_lifecycle_tests {
-    use super::App;
-    use crate::session_store::SessionState;
-
-    #[test]
-    fn registered_session_starts_spawning_then_marks_alive_and_stays_addressable() {
-        let app = App::headless_for_test();
-
-        {
-            let g = app.store.read().unwrap();
-            assert_eq!(g.len(), 1, "session 0 is registered");
-            let h = g.by_local(0).expect("session 0 addressable by local id");
-            assert_eq!(h.state, SessionState::Spawning, "registers as Spawning");
-        }
-
-        assert!(
-            app.store.write().unwrap().mark_alive(0),
-            "first readiness performs the transition"
-        );
-        assert!(
-            !app.store.write().unwrap().mark_alive(0),
-            "a duplicate/late readiness is a fail-safe no-op"
-        );
-
-        {
-            let g = app.store.read().unwrap();
-            let h = g.by_local(0).expect("still addressable after transition");
-            assert_eq!(h.state, SessionState::Alive);
-            assert_eq!(g.len(), 1, "no handle churn across the transition");
-        }
-    }
-}
+#[path = "lib_spawn_lifecycle_tests.rs"]
+mod spawn_lifecycle_tests;
 
 #[cfg(test)]
 #[path = "lib_multi_window_tests.rs"]
@@ -30089,645 +28944,8 @@ mod multi_window_tests;
 mod tab_index_tests;
 
 #[cfg(test)]
-pub(crate) mod scripted_redraw_fixture {
-    use super::{App, WindowId};
-
-    /// Render galleries on every test run. An explicit export directory keeps the images;
-    /// otherwise the returned guard removes an isolated temporary directory at test end.
-    pub(crate) fn gallery_directory(
-        variable: &str,
-    ) -> (std::path::PathBuf, Option<aterm_tempfile::TempDir>) {
-        if let Some(path) = std::env::var_os(variable).filter(|path| !path.is_empty()) {
-            let path = std::path::PathBuf::from(path);
-            std::fs::create_dir_all(&path).expect("gallery export directory");
-            (path, None)
-        } else {
-            let scratch = aterm_tempfile::tempdir().expect("isolated gallery directory");
-            (scratch.path().to_path_buf(), Some(scratch))
-        }
-    }
-
-    /// Puts window `wid`, made with no OS window and not yet composed, at display `scale`, as a
-    /// headless `--scale` launch lays it out before its first frame: the launch's scale (which
-    /// [`App::unattached_window_scale`] gives a window made later), the window's own, and its
-    /// metrics at that scale (its font size at `scale`'s device px, its pads and head scaled from
-    /// its own), held at the frame its grid takes there. The grid keeps its rows and columns, so
-    /// the first composition and capture draw its cells at `scale`'s pixels: a render at that
-    /// scale, not a resampling of one. A window already composed is refused: its next composition
-    /// would cross its layout's coordinate boundary, which re-grids its cursor effects and its pet
-    /// as a live change of display scale does and a cold launch never does.
-    pub(crate) fn at_scale(app: &mut App, wid: WindowId, scale: f64) {
-        app.headless_scale = scale;
-        let ws = app.windows.get_mut(&wid).expect("window");
-        assert!(ws.os_window.is_none(), "a window with no OS window");
-        assert!(
-            ws.last_layout_coordinate_space.is_none(),
-            "a window not yet composed, as a cold --scale launch lays out its first frame"
-        );
-        let (from, m, grid) = (ws.scale, ws.metrics, (ws.rows, ws.cols));
-        let size = crate::app_window::font_size_of_device_px(m.font_px, from);
-        let at = |px: usize| super::logical_to_device_px(px as f32 / from as f32, scale);
-        ws.scale = scale;
-        ws.metrics = super::MetricsView::applied(
-            super::font_px_for_scale(size, scale),
-            at(m.pad),
-            at(m.pad_top),
-            at(m.head),
-        );
-        app.apply_window_scale(wid);
-        let px = app.window_frame_px_for(wid, grid.0, grid.1);
-        app.note_headless_px_for(wid, px, grid);
-        let ws = &app.windows[&wid];
-        assert_eq!(
-            (ws.rows, ws.cols),
-            grid,
-            "the grid keeps its cells at {scale}x"
-        );
-    }
-
-    /// One capture of a window ([`Drawn::of`]): its pixels, and the grid, cells and frame its
-    /// metrics laid them out in.
-    pub(crate) struct Drawn {
-        /// The frame's width and height in pixels.
-        pub(crate) size: (usize, usize),
-        /// The frame's RGBA bytes, row by row.
-        pub(crate) rgba: Vec<u8>,
-        grid: (u16, u16),
-        scale: f64,
-        font_px: f32,
-        /// The size of a cell and of the frame, as the window's metrics give them.
-        cell: (usize, usize),
-        frame: (usize, usize),
-        /// The pixel of frame cell (0, 0).
-        origin: (usize, usize),
-        /// The frame cells, `(row, col)`, that hold a letter or a digit.
-        letters: Vec<(usize, usize)>,
-    }
-
-    /// What a glyph inks in its cell ([`Drawn::ink`]), each pixel read by its largest channel's
-    /// distance from the cell's ground (its most common colour), against the farthest pixel's.
-    #[derive(Clone, Copy)]
-    struct Ink {
-        /// The width and height of the box round the pixels at least half as far.
-        size: (usize, usize),
-        /// The pixels at least a quarter as far (the glyph touches them), and of them those under
-        /// three quarters (partial: an antialiased edge's).
-        touched: usize,
-        partial: usize,
-    }
-
-    /// How a fake 2x frame takes each cell from the 1x frame ([`Drawn::with_1x_cells`]).
-    #[derive(Clone, Copy)]
-    enum OneX {
-        /// The 1x cell scaled to the 2x cell, each pixel the 1x pixel its top left corner falls
-        /// in.
-        Nearest,
-        /// The 1x cell scaled to the 2x cell, each pixel blended from the four 1x pixels round its
-        /// centre.
-        Bilinear,
-        /// The 1x cell at its own size at the 2x cell's origin, the rest of the 2x cell the 1x
-        /// cell's ground.
-        Unscaled,
-    }
-
-    impl Drawn {
-        /// `(w, h, rgba)`, the capture of window `wid` just taken, with the layout its metrics
-        /// give it: the frame is the one its grid takes with the shared backend tuned to the
-        /// window, as a redraw tunes it, whatever the capture drew at.
-        pub(crate) fn of(
-            app: &mut App,
-            wid: WindowId,
-            (w, h, rgba): (usize, usize, Vec<u8>),
-        ) -> Self {
-            app.apply_window_scale(wid);
-            let ws = &app.windows[&wid];
-            let frame = app.window_frame_px_for(wid, ws.rows, ws.cols);
-            let letters = ws
-                .input_scratch
-                .cells
-                .iter()
-                .enumerate()
-                .flat_map(|(row, cells)| {
-                    cells
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, cell)| cell.ch.is_alphanumeric())
-                        .map(move |(col, _)| (row, col))
-                })
-                .collect();
-            Drawn {
-                size: (w, h),
-                rgba,
-                grid: (ws.rows, ws.cols),
-                scale: ws.scale,
-                font_px: ws.metrics.font_px,
-                cell: app.win_cell_size(wid),
-                frame: (frame.width as usize, frame.height as usize),
-                origin: (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid)),
-                letters,
-            }
-        }
-
-        /// This frame with each pixel on an even row and column doubled over its 2 × 2 block
-        /// (nearest neighbour), in this frame's layout: a doubling of the frame at half its size,
-        /// as the galleries made their `-2x` crops before they drew at 2x. [`drawn_at_2x`]
-        /// refuses it ([`Not2x::Doubled`]).
-        fn doubled(&self) -> Drawn {
-            let (w, h) = self.size;
-            let mut rgba = self.rgba.clone();
-            for y in 0..h {
-                for x in 0..w {
-                    let at = ((y & !1) * w + (x & !1)) * 4;
-                    rgba.copy_within(at..at + 4, (y * w + x) * 4);
-                }
-            }
-            Drawn {
-                rgba,
-                letters: self.letters.clone(),
-                ..*self
-            }
-        }
-
-        /// This frame with each of its cells drawn from `one`'s same cell as `how` says, the
-        /// pixels outside the cells kept: the 1x glyph rasters drawn in this frame's layout, as a
-        /// renderer that kept them at 2x would draw them. [`drawn_at_2x`] refuses each
-        /// ([`Not2x::Unscaled`], [`Not2x::Resampled`]).
-        fn with_1x_cells(&self, one: &Drawn, how: OneX) -> Drawn {
-            let (rows, cols) = (
-                self.cells().0.min(one.cells().0),
-                self.cells().1.min(one.cells().1),
-            );
-            let ((aw, ah), (bw, bh)) = (one.cell, self.cell);
-            let mut rgba = self.rgba.clone();
-            for row in 0..rows {
-                for col in 0..cols {
-                    let ((ax, _), (ay, _)) = one.cell_rect((row, col));
-                    let ((bx, bx1), (by, by1)) = self.cell_rect((row, col));
-                    let ground = one.ground((row, col));
-                    // Where a 2x pixel's centre falls in the 1x cell: the 1x pixels either side
-                    // of it, and how far it lies from the first.
-                    let around = |d: usize, from: usize, to: usize| {
-                        let at = ((d as f32 + 0.5) * from as f32 / to as f32 - 0.5)
-                            .clamp(0.0, (from - 1) as f32);
-                        let lo = at.floor() as usize;
-                        (lo, (lo + 1).min(from - 1), at - lo as f32)
-                    };
-                    for y in by..by1 {
-                        for x in bx..bx1 {
-                            let (dx, dy) = (x - bx, y - by);
-                            let p = match how {
-                                OneX::Nearest => one.px(ax + dx * aw / bw, ay + dy * ah / bh),
-                                OneX::Unscaled if dx < aw && dy < ah => one.px(ax + dx, ay + dy),
-                                OneX::Unscaled => ground,
-                                OneX::Bilinear => {
-                                    let (x0, x1, fx) = around(dx, aw, bw);
-                                    let (y0, y1, fy) = around(dy, ah, bh);
-                                    let at = |x: usize, y: usize| one.px(ax + x, ay + y);
-                                    let (a, b, c, d) =
-                                        (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-                                    std::array::from_fn(|i| {
-                                        let top =
-                                            f32::from(a[i]) * (1.0 - fx) + f32::from(b[i]) * fx;
-                                        let low =
-                                            f32::from(c[i]) * (1.0 - fx) + f32::from(d[i]) * fx;
-                                        (top * (1.0 - fy) + low * fy).round() as u8
-                                    })
-                                }
-                            };
-                            let at = (y * self.size.0 + x) * 4;
-                            rgba[at..at + 4].copy_from_slice(&p);
-                        }
-                    }
-                }
-            }
-            Drawn {
-                rgba,
-                letters: self.letters.clone(),
-                ..*self
-            }
-        }
-
-        /// The RGBA bytes of the rect `x0..x1` by `y0..y1` of the frame.
-        pub(crate) fn crop(&self, (x0, x1): (usize, usize), (y0, y1): (usize, usize)) -> Vec<u8> {
-            let w = self.size.0;
-            (y0..y1)
-                .flat_map(|y| &self.rgba[(y * w + x0) * 4..(y * w + x1) * 4])
-                .copied()
-                .collect()
-        }
-
-        /// Pixel `(x, y)`'s RGBA.
-        fn px(&self, x: usize, y: usize) -> [u8; 4] {
-            let at = (y * self.size.0 + x) * 4;
-            [
-                self.rgba[at],
-                self.rgba[at + 1],
-                self.rgba[at + 2],
-                self.rgba[at + 3],
-            ]
-        }
-
-        /// The rows and columns of whole cells the frame holds from its origin.
-        fn cells(&self) -> (usize, usize) {
-            let ((w, h), (x, y), (cw, ch)) = (self.size, self.origin, self.cell);
-            (h.saturating_sub(y) / ch, w.saturating_sub(x) / cw)
-        }
-
-        /// The pixels `(x0..x1, y0..y1)` of frame cell `(row, col)`, cut to the frame.
-        fn cell_rect(&self, (row, col): (usize, usize)) -> ((usize, usize), (usize, usize)) {
-            let ((w, h), (cw, ch)) = (self.size, self.cell);
-            let (x0, y0) = (self.origin.0 + col * cw, self.origin.1 + row * ch);
-            ((x0.min(w), (x0 + cw).min(w)), (y0.min(h), (y0 + ch).min(h)))
-        }
-
-        /// Frame cell `at`'s ground: its most common colour.
-        fn ground(&self, at: (usize, usize)) -> [u8; 4] {
-            let ((x0, x1), (y0, y1)) = self.cell_rect(at);
-            let mut pixels: Vec<[u8; 4]> = (y0..y1)
-                .flat_map(|y| (x0..x1).map(move |x| self.px(x, y)))
-                .collect();
-            pixels.sort_unstable();
-            pixels
-                .chunk_by(|a, b| a == b)
-                .max_by_key(|run| run.len())
-                .map_or([0; 4], |run| run[0])
-        }
-
-        /// What frame cell `at`'s glyph inks, or `None` where every pixel is its ground.
-        fn ink(&self, at: (usize, usize)) -> Option<Ink> {
-            let ((x0, x1), (y0, y1)) = self.cell_rect(at);
-            let ground = self.ground(at);
-            let far = |x: usize, y: usize| {
-                let p = self.px(x, y);
-                (0..3)
-                    .map(|i| u32::from(p[i].abs_diff(ground[i])))
-                    .max()
-                    .unwrap_or(0)
-            };
-            let pixels = || (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y)));
-            let top = pixels()
-                .map(|(x, y)| far(x, y))
-                .max()
-                .filter(|&top| top > 0)?;
-            let (mut xs, mut ys) = ((usize::MAX, 0), (usize::MAX, 0));
-            let (mut touched, mut partial) = (0, 0);
-            for (x, y) in pixels() {
-                let d = far(x, y);
-                if 2 * d >= top {
-                    xs = (xs.0.min(x), xs.1.max(x));
-                    ys = (ys.0.min(y), ys.1.max(y));
-                }
-                if 4 * d >= top {
-                    touched += 1;
-                    partial += usize::from(4 * d < 3 * top);
-                }
-            }
-            Some(Ink {
-                size: (xs.1 + 1 - xs.0, ys.1 + 1 - ys.0),
-                touched,
-                partial,
-            })
-        }
-
-        /// Whether frame cell `at` holds a 2 × 2 block of pixels, on an even row and column of
-        /// the frame, that is not one colour. A nearest-neighbour doubling has none: each such
-        /// block is one pixel of the frame it doubles.
-        fn split_at(&self, at: (usize, usize)) -> bool {
-            let ((x0, x1), (y0, y1)) = self.cell_rect(at);
-            (y0.next_multiple_of(2)..y1.saturating_sub(1))
-                .step_by(2)
-                .any(|y| {
-                    (x0.next_multiple_of(2)..x1.saturating_sub(1))
-                        .step_by(2)
-                        .any(|x| {
-                            let p = self.px(x, y);
-                            p != self.px(x + 1, y)
-                                || p != self.px(x, y + 1)
-                                || p != self.px(x + 1, y + 1)
-                        })
-                })
-        }
-    }
-
-    /// What [`drawn_at_2x`] reads of a 2x frame against its 1x frame, over the frame cells that
-    /// hold a letter or a digit.
-    #[derive(Clone, Copy, Debug)]
-    pub(crate) struct At2x {
-        /// The letter and digit cells, and those of them a glyph inks at both scales.
-        letters: usize,
-        inked: usize,
-        /// The letter cells with a 2 × 2 block of pixels, on an even row and column, that is not
-        /// one colour.
-        split: usize,
-        /// The inked cells whose glyph's box at 2x is at least 1.8 times its 1x box across and
-        /// down.
-        grown: usize,
-        /// `(partial, touched)` over the inked cells' glyphs ([`Ink`]), at 1x and at 2x.
-        edges: [(usize, usize); 2],
-    }
-
-    impl At2x {
-        /// The tab-separated names of [`At2x::row`]'s fields.
-        pub(crate) const HEAD: &str = "frame\tletter cells\tinked\tsplit\tgrown\t\
-                                       partial share 1x\tpartial share 2x\t2x over 1x";
-
-        /// This reading of `frame` as a tab-separated row: its counts, and the share of the
-        /// pixels the glyphs touch that are partial at 1x, at 2x, and the second over the first.
-        pub(crate) fn row(&self, frame: &str) -> String {
-            let share = |(partial, touched): (usize, usize)| partial as f64 / touched.max(1) as f64;
-            let [one, two] = self.edges.map(share);
-            format!(
-                "{frame}\t{}\t{}\t{}\t{}\t{one:.4}\t{two:.4}\t{:.3}",
-                self.letters,
-                self.inked,
-                self.split,
-                self.grown,
-                two / one
-            )
-        }
-
-        /// Whether half or more of the letter cells hold no 2 × 2 block, on even pixels, that is
-        /// not one colour ([`Not2x::Doubled`]).
-        pub(crate) const fn doubled(&self) -> bool {
-            2 * self.split <= self.letters
-        }
-
-        /// Whether half or more of the inked letter cells ink a box under 1.8 times their 1x box
-        /// across or down ([`Not2x::Unscaled`]).
-        pub(crate) const fn unscaled(&self) -> bool {
-            2 * self.grown <= self.inked
-        }
-
-        /// Whether the glyphs' partial pixels are not under four fifths of their share at 1x
-        /// ([`Not2x::Resampled`]).
-        pub(crate) const fn resampled(&self) -> bool {
-            let [(p1, t1), (p2, t2)] = self.edges;
-            5 * p2 * t1 >= 4 * p1 * t2
-        }
-    }
-
-    /// Why a frame is not its scene rendered at 2x ([`drawn_at_2x`]).
-    #[derive(Debug)]
-    pub(crate) enum Not2x {
-        /// Its grid, scale, font, frame, cells or letter cells are not the 2x layout of the 1x
-        /// frame's scene.
-        Layout(String),
-        /// Half or more of its letter cells hold no 2 × 2 block, on even pixels, that is not one
-        /// colour: a nearest-neighbour doubling of a frame half its size.
-        Doubled(At2x),
-        /// Half or more of its inked letter cells ink a box under 1.8 times their 1x box across
-        /// or down: glyphs at their 1x size.
-        Unscaled(At2x),
-        /// Its glyphs' partial pixels are not under four fifths of their share at 1x. A render at
-        /// 2x keeps an edge about a pixel across while a glyph's area grows fourfold, so the share
-        /// of its pixels that are partial falls; a resampling of 1x pixels widens each edge with
-        /// the glyph, so the share stays or grows.
-        Resampled(At2x),
-    }
-
-    impl Not2x {
-        /// What [`drawn_at_2x`] read of the frame's pixels, unless its layout refused it first.
-        pub(crate) const fn reading(&self) -> Option<&At2x> {
-            match self {
-                Self::Layout(_) => None,
-                Self::Doubled(at) | Self::Unscaled(at) | Self::Resampled(at) => Some(at),
-            }
-        }
-    }
-
-    impl std::fmt::Display for Not2x {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Layout(why) => f.write_str(why),
-                Self::Doubled(at) => write!(
-                    f,
-                    "{} of its {} letter cells hold a 2 x 2 block of pixels that is not one \
-                     colour: a doubling, not a render",
-                    at.split, at.letters
-                ),
-                Self::Unscaled(at) => write!(
-                    f,
-                    "{} of its {} inked letter cells ink a box at least 1.8 times their 1x box: \
-                     glyphs at their 1x size, not a render",
-                    at.grown, at.inked
-                ),
-                Self::Resampled(at) => {
-                    let [(p1, t1), (p2, t2)] = at.edges;
-                    write!(
-                        f,
-                        "{p2} of the {t2} pixels its glyphs touch are partial, against {p1} of \
-                         {t1} at 1x: not under four fifths of that share, a resampling of 1x \
-                         glyphs, not a render"
-                    )
-                }
-            }
-        }
-    }
-
-    /// Whether `two` is the scene `one` showed rendered again at 2x, each drawn on a window of
-    /// its own (the second put [`at_scale`] 2 before its first frame): what it reads ([`At2x`]),
-    /// or why not ([`Not2x`]). It must have the same grid, at the window's 2x metrics (the font
-    /// size of `one` at twice its device px), in the frame those metrics give that grid, with
-    /// cells at least twice the 1x size less a pixel and the same letter and digit cells. Its
-    /// pixels must be a render's, read cell by cell against `one`'s: more than half of the letter
-    /// cells hold a 2 × 2 block, on even pixels, that is not one colour (a doubling has none),
-    /// more than half of those a glyph inks at both scales ink a box at least 1.8 times the 1x one
-    /// across and down (1x glyph rasters in 2x cells do not), and the share of the pixels the
-    /// glyphs touch that are partial is under four fifths of the 1x share (a resampling of 1x
-    /// glyphs widens each edge with the glyph, so it keeps that share or raises it).
-    pub(crate) fn drawn_at_2x(one: &Drawn, two: &Drawn) -> Result<At2x, Not2x> {
-        let layout = |why: String| Err(Not2x::Layout(why));
-        let size = crate::app_window::font_size_of_device_px(one.font_px, one.scale);
-        let font_px = super::font_px_for_scale(size, 2.0);
-        if two.grid != one.grid {
-            return layout(format!("its grid is {:?}, not {:?}", two.grid, one.grid));
-        }
-        if two.scale != 2.0 || two.font_px != font_px {
-            return layout(format!(
-                "its window is at {}x with a {} px font, not 2x with {font_px} px",
-                two.scale, two.font_px
-            ));
-        }
-        for (what, drawn) in [("1x", one), ("2x", two)] {
-            if drawn.size != drawn.frame {
-                return layout(format!(
-                    "its {what} frame is {:?}, not the {:?} its grid takes",
-                    drawn.size, drawn.frame
-                ));
-            }
-        }
-        if two.cell.0 < 2 * one.cell.0 - 1 || two.cell.1 < 2 * one.cell.1 - 1 {
-            return layout(format!(
-                "its cells are {:?}, under twice the 1x {:?}",
-                two.cell, one.cell
-            ));
-        }
-        if two.letters != one.letters || two.letters.is_empty() {
-            return layout(format!(
-                "its {} letter and digit cells are not the 1x frame's {}",
-                two.letters.len(),
-                one.letters.len()
-            ));
-        }
-        let mut at = At2x {
-            letters: two.letters.len(),
-            inked: 0,
-            split: two
-                .letters
-                .iter()
-                .filter(|&&cell| two.split_at(cell))
-                .count(),
-            grown: 0,
-            edges: [(0, 0); 2],
-        };
-        for &cell in &two.letters {
-            let (Some(a), Some(b)) = (one.ink(cell), two.ink(cell)) else {
-                continue;
-            };
-            at.inked += 1;
-            at.grown += usize::from(5 * b.size.0 >= 9 * a.size.0 && 5 * b.size.1 >= 9 * a.size.1);
-            for (edge, ink) in at.edges.iter_mut().zip([a, b]) {
-                edge.0 += ink.partial;
-                edge.1 += ink.touched;
-            }
-        }
-        if at.doubled() {
-            Err(Not2x::Doubled(at))
-        } else if at.unscaled() {
-            Err(Not2x::Unscaled(at))
-        } else if at.resampled() {
-            Err(Not2x::Resampled(at))
-        } else {
-            Ok(at)
-        }
-    }
-
-    /// CONTROL: the fakes of a scene's 2x frame `two` are each refused by [`drawn_at_2x`] and
-    /// break their own rule, whichever rule it names first: `two` doubled from half its size
-    /// ([`At2x::doubled`]), and `one`'s 1x cells drawn in `two`'s unscaled ([`At2x::unscaled`])
-    /// and resampled to them, nearest and bilinear ([`At2x::resampled`]). A fake that breaks an
-    /// earlier rule as well still counts: whether the nearest fake splits more than half its
-    /// cells depends on how many letters sit in even grid columns (an odd-width 2x cell starts
-    /// on an even pixel only there), not on how it was drawn.
-    pub(crate) fn refuse_fakes(one: &Drawn, two: &Drawn) {
-        let fakes = [
-            (
-                "a doubling of the 2x frame",
-                two.doubled(),
-                "doubled",
-                At2x::doubled as fn(&At2x) -> bool,
-            ),
-            (
-                "the 1x cells unscaled in the 2x cells",
-                two.with_1x_cells(one, OneX::Unscaled),
-                "unscaled",
-                At2x::unscaled,
-            ),
-            (
-                "the 1x cells nearest-resampled to the 2x cells",
-                two.with_1x_cells(one, OneX::Nearest),
-                "resampled",
-                At2x::resampled,
-            ),
-            (
-                "the 1x cells bilinear-resampled to the 2x cells",
-                two.with_1x_cells(one, OneX::Bilinear),
-                "resampled",
-                At2x::resampled,
-            ),
-        ];
-        for (what, fake, rule, breaks) in fakes {
-            let at = match drawn_at_2x(one, &fake) {
-                Ok(at) => panic!("CONTROL: {what} passes as a 2x render ({})", at.row(what)),
-                Err(why) => *why.reading().unwrap_or_else(|| {
-                    panic!("CONTROL: {what} is refused for its layout, not read: {why}")
-                }),
-            };
-            assert!(
-                breaks(&at),
-                "CONTROL: {what} keeps the {rule} rule ({})",
-                at.row(what)
-            );
-        }
-    }
-
-    /// The real redraw path with every decorative effect off, so equal content is equal pixels.
-    pub(crate) fn scripted_app() -> App {
-        scripted_app_with_sink(std::sync::Arc::new(aterm_session::sink::SinkWriter::new(
-            -1,
-        )))
-    }
-
-    /// [`scripted_app`] whose session writes to `sink`, so input through the seam reaches a PTY a test holds.
-    pub(crate) fn scripted_app_with_sink(
-        sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
-    ) -> App {
-        let mut app = App::headless_for_test_with_sink(sink);
-        app.config.serious_mode = Some(true);
-        app.config.cursor_trail = Some(false);
-        app.config.cursor_trail_style = Some("off".into());
-        app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
-            enabled: Some(false),
-            ..Default::default()
-        });
-        app.kitty_cursor_enabled_cache = None;
-        app.recompute_sparkle();
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window");
-        ws.present = Some(crate::PresentTarget::Cpu {
-            surface: crate::present::CpuSurface::Scripted(Default::default()),
-        });
-        app
-    }
-
-    pub(crate) fn surface(app: &mut App) -> &mut crate::present::scripted::ScriptedPresenter {
-        match app
-            .windows
-            .get_mut(&WindowId(0))
-            .and_then(|ws| ws.present.as_mut())
-        {
-            Some(crate::PresentTarget::Cpu { surface }) => {
-                surface.scripted_mut().expect("scripted surface")
-            }
-            _ => panic!("the fixture presents through its scripted CPU surface"),
-        }
-    }
-
-    pub(crate) fn glass(app: &mut App) -> ((usize, usize), Vec<u32>) {
-        let s = surface(app);
-        (s.size(), s.glass().to_vec())
-    }
-
-    /// Run `capture` without the window's surface.
-    pub(crate) fn headless<R>(app: &mut App, capture: impl FnOnce(&mut App) -> R) -> R {
-        let target = app
-            .windows
-            .get_mut(&WindowId(0))
-            .and_then(|ws| ws.present.take());
-        let out = capture(app);
-        if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
-            ws.present = target;
-        }
-        out
-    }
-
-    pub(crate) fn feed(app: &App, bytes: &[u8]) {
-        let term = app
-            .front_terminal(WindowId(0))
-            .expect("front terminal")
-            .term
-            .clone();
-        crate::term_lock(&term).process(bytes);
-    }
-
-    pub(crate) fn has_damage(app: &App) -> bool {
-        let term = app
-            .front_terminal(WindowId(0))
-            .expect("front terminal")
-            .term
-            .clone();
-        crate::term_lock(&term).has_damage()
-    }
-}
+#[path = "lib_scripted_redraw_fixture_tests.rs"]
+pub(crate) mod scripted_redraw_fixture;
 
 #[cfg(test)]
 #[path = "lib_present_retry_tests.rs"]
@@ -30784,422 +29002,16 @@ mod session_pool_tests;
 mod window_routing_conformance;
 
 #[cfg(test)]
-mod pane_tree_conformance {
-    use super::*;
-    use aterm_models_gui::pane_tree_model;
-    use std::collections::BTreeMap;
-
-    fn project(tree: &pane::PaneTree) -> [i64; 2] {
-        let leaf_count = tree.len() as i64;
-        let sessions = tree.sessions();
-        let focused = sessions
-            .iter()
-            .position(|&s| s == tree.focus())
-            .expect("focused session is always a live leaf") as i64;
-        [leaf_count, focused]
-    }
-
-    fn validate_transition(action_name: &str, prev: [i64; 2], next: [i64; 2]) -> (bool, String) {
-        let m = pane_tree_model();
-        let st = |s: [i64; 2]| -> BTreeMap<&'static str, i64> {
-            [("leaf_count", s[0]), ("focused", s[1])]
-                .into_iter()
-                .collect()
-        };
-        aterm_spec::verify::validate_transition_tiered(
-            &m,
-            &[("Cap", 1_000_000)],
-            &st(prev),
-            &st(next),
-            Some(action_name),
-            "PaneTree split/close conformance",
-        )
-    }
-
-    #[test]
-    fn the_real_pane_tree_conforms() {
-        crate::conformance_support::on_conformance_stack("pane_tree", run_conformance);
-    }
-
-    fn run_conformance() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NONCE: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-panetree-conf-{}-{}",
-            std::process::id(),
-            NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mk tempdir");
-
-        let t0 = pane::PaneTree::new(0);
-        let init = pane_tree_model().init_state();
-        let model_init = [init["leaf_count"], init["focused"]];
-        assert_eq!(
-            project(&t0),
-            model_init,
-            "fresh PaneTree projection must equal pane_tree_model().init_state() — got {:?}, model {:?}",
-            project(&t0),
-            model_init
-        );
-        assert_eq!(model_init, [1, 0], "sanity: model init is one focused leaf");
-
-        let mut t = pane::PaneTree::new(0);
-
-        let prev = project(&t);
-        assert!(t.split_focused(pane::SplitDir::Vertical, 1));
-        let next = project(&t);
-        let (ok, out) = validate_transition("Split", prev, next);
-        assert!(
-            ok,
-            "real Split {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let prev = next;
-        assert!(t.split_focused(pane::SplitDir::Horizontal, 2));
-        let next = project(&t);
-        let (ok, out) = validate_transition("Split", prev, next);
-        assert!(
-            ok,
-            "real Split {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        assert!(t.set_focus(0));
-        let prev = project(&t);
-        assert!(matches!(
-            t.close_pane(0),
-            pane::CloseOutcome::Collapsed { .. }
-        ));
-        let next = project(&t);
-        let (ok, out) = validate_transition("Close", prev, next);
-        assert!(
-            ok,
-            "real Close (collapse) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let prev = project(&t);
-        assert!(matches!(
-            t.close_focused(),
-            pane::CloseOutcome::Collapsed { .. }
-        ));
-        let next = project(&t);
-        let (ok, out) = validate_transition("Close", prev, next);
-        assert!(
-            ok,
-            "real Close (focused last) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let (bad_ok, _bad) = validate_transition("Close", [2, 1], [1, 1]);
-        assert!(
-            !bad_ok,
-            "corrupted Close [2,1] -> [1,1] (dangling focus) MUST be ty-REJECTED — \
-             the conformance would be vacuous otherwise"
-        );
-
-        let mut sole = pane::PaneTree::new(0);
-        assert!(matches!(
-            sole.close_pane(0),
-            pane::CloseOutcome::LastPane { .. }
-        ));
-        assert_eq!(project(&sole), [1, 0], "LastPane must not shrink the tree");
-
-        let (noop_ok, _noop) = validate_transition("Close", [2, 1], [2, 1]);
-        assert!(
-            !noop_ok,
-            "a Collapsed Close that keeps its leaf [2,1] -> [2,1] MUST be ty-REJECTED"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::logging::stderr_line!(
-            "pane_tree Tier-1 conformance: real split/close transitions conform AND the \
-             dangling-focus and kept-leaf negative controls were rejected."
-        );
-    }
-}
+#[path = "lib_pane_tree_conformance_tests.rs"]
+mod pane_tree_conformance;
 
 #[cfg(test)]
-mod session_pool_conformance {
-    use super::*;
-    use aterm_models_gui::session_pool_model;
-    use std::collections::BTreeMap;
-
-    fn project(app: &App, sid: u64) -> [i64; 2] {
-        let mut refcount = 0i64;
-        for window in app.windows.values() {
-            for tab in window.tab_set.tabs() {
-                tab.root.visit(&mut |&view| {
-                    if app
-                        .view_store
-                        .get(view)
-                        .copied()
-                        .and_then(crate::tab_model::View::terminal_session)
-                        == Some(sid)
-                    {
-                        refcount += 1;
-                    }
-                });
-            }
-        }
-        let closed = i64::from(app.pool.views(sid).is_none());
-        [refcount, closed]
-    }
-
-    fn validate_transition(action_name: &str, prev: [i64; 2], next: [i64; 2]) -> (bool, String) {
-        let m = session_pool_model();
-        let st = |s: [i64; 2]| -> BTreeMap<&'static str, i64> {
-            [("refcount", s[0]), ("closed", s[1])].into_iter().collect()
-        };
-        aterm_spec::verify::validate_transition_tiered(
-            &m,
-            &[("Cap", 1_000_000)],
-            &st(prev),
-            &st(next),
-            Some(action_name),
-            "SessionPool refcount conformance",
-        )
-    }
-
-    #[test]
-    fn the_real_session_pool_conforms() {
-        crate::conformance_support::on_conformance_stack("session_pool", run_conformance);
-    }
-
-    fn run_conformance() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NONCE: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-sesspool-conf-{}-{}",
-            std::process::id(),
-            NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mk tempdir");
-
-        let app0 = App::headless_for_test();
-        let init = session_pool_model().init_state();
-        let model_init = [init["refcount"], init["closed"]];
-        assert_eq!(
-            project(&app0, 0),
-            model_init,
-            "fresh App pool projection must equal session_pool_model().init_state() — got {:?}, model {:?}",
-            project(&app0, 0),
-            model_init
-        );
-        assert_eq!(
-            model_init,
-            [1, 0],
-            "sanity: model init is one viewer, not closed"
-        );
-        drop(app0);
-
-        let mut app = App::headless_for_test();
-
-        let prev = project(&app, 0);
-        let new_wid = app
-            .open_active_session_in_new_window_logical()
-            .expect("the front window has an active session to open in a new window");
-        assert_ne!(new_wid, WindowId(0));
-        assert!(app.windows.contains_key(&new_wid));
-        let next = project(&app, 0);
-        let (ok, out) = validate_transition("Acquire", prev, next);
-        assert!(
-            ok,
-            "real Acquire {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let _ = app.migrate_active_tab_to_next_window();
-        assert_eq!(
-            project(&app, 0),
-            next,
-            "pure tab migration preserves both shared-session view edges"
-        );
-        assert_eq!(app.windows.len(), 1);
-
-        let prev = next;
-        let to_close = app.exit_session_logical(0);
-        assert_eq!(
-            to_close,
-            vec![WindowId(0)],
-            "the final occurrence is handed to atomic window teardown"
-        );
-        let next = project(&app, 0);
-        let (ok, out) = validate_transition("Release", prev, next);
-        assert!(
-            ok,
-            "real Release (survive) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let prev = next;
-        assert_eq!(
-            app.close_window_logical(WindowId(0)),
-            CloseOutcome::Exit,
-            "closing the last viewer exits the app"
-        );
-        let next = project(&app, 0);
-        let (ok, out) = validate_transition("Release", prev, next);
-        assert!(
-            ok,
-            "real Release (retire) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-        assert_eq!(
-            next,
-            [0, 1],
-            "after the last viewer leaves, session 0 is retired (refcount 0, closed)"
-        );
-
-        let (bad_ok, _bad) = validate_transition("Release", [2, 0], [1, 1]);
-        assert!(
-            !bad_ok,
-            "corrupted Release [2,0] -> [1,1] (retire-while-viewed) MUST be ty-REJECTED — \
-             the conformance would be vacuous otherwise"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::logging::stderr_line!(
-            "session_pool Tier-1 conformance: real open-in-new-window / close-window \
-             attach/detach transitions conform AND the retire-while-viewed negative \
-             control was rejected."
-        );
-    }
-}
+#[path = "lib_session_pool_conformance_tests.rs"]
+mod session_pool_conformance;
 
 #[cfg(test)]
-mod tab_strip_conformance {
-    use super::*;
-    use aterm_models_gui::tab_strip_model;
-    use std::collections::BTreeMap;
-
-    /// `[count, active, seg_count, selected]`.
-    pub(crate) fn project(app: &App, wid: WindowId) -> [i64; 4] {
-        let Some(ws) = app.windows.get(&wid) else {
-            return [0, 0, 0, 0];
-        };
-        let (seg_count, selected) = ws.strip_shadow.get();
-        [
-            ws.tab_set.shown_len() as i64,
-            ws.tab_set.strip_active().unwrap_or(0) as i64,
-            seg_count as i64,
-            selected as i64,
-        ]
-    }
-
-    fn validate_transition(action_name: &str, prev: [i64; 4], next: [i64; 4]) -> (bool, String) {
-        let m = tab_strip_model();
-        let st = |s: [i64; 4]| -> BTreeMap<&'static str, i64> {
-            [
-                ("count", s[0]),
-                ("active", s[1]),
-                ("seg_count", s[2]),
-                ("selected", s[3]),
-            ]
-            .into_iter()
-            .collect()
-        };
-        aterm_spec::verify::validate_transition_tiered(
-            &m,
-            &[("Cap", 1_000_000)],
-            &st(prev),
-            &st(next),
-            Some(action_name),
-            "TabStrip parity conformance",
-        )
-    }
-
-    #[test]
-    fn the_real_tab_strip_conforms() {
-        crate::conformance_support::on_conformance_stack("tab_strip", run_conformance);
-    }
-
-    fn run_conformance() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NONCE: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-tabstrip-conf-{}-{}",
-            std::process::id(),
-            NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mk tempdir");
-
-        let app0 = App::headless_for_test();
-        let init = tab_strip_model().init_state();
-        let model_init = [
-            init["count"],
-            init["active"],
-            init["seg_count"],
-            init["selected"],
-        ];
-        assert_eq!(
-            project(&app0, WindowId(0)),
-            model_init,
-            "fresh window projection must equal tab_strip_model().init_state() — got {:?}, model {:?}",
-            project(&app0, WindowId(0)),
-            model_init
-        );
-        assert_eq!(
-            model_init,
-            [1, 0, 1, 0],
-            "sanity: one tab, selected, strip mirrored"
-        );
-        drop(app0);
-
-        let mut app = App::headless_for_test();
-
-        let prev = project(&app, WindowId(0));
-        let sid1 = app.next_session_id;
-        app.push_stub_tab(WindowId(0), stub_session(sid1));
-        let next = project(&app, WindowId(0));
-        let (ok, out) = validate_transition("NewTab", prev, next);
-        assert!(
-            ok,
-            "real NewTab {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let prev = next;
-        app.cycle_tab(true);
-        let next = project(&app, WindowId(0));
-        let (ok, out) = validate_transition("SelectTab", prev, next);
-        assert!(
-            ok,
-            "real SelectTab {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
-        );
-
-        let sid_b = app.next_session_id;
-        let _b = app.insert_logical_window(stub_session(sid_b), 24, 80);
-        assert_ne!(
-            app.frontmost_window,
-            Some(WindowId(0)),
-            "WindowId(0) is now non-front"
-        );
-        let prev = project(&app, WindowId(0));
-        assert!(
-            !app.close_tab_at(WindowId(0), 1),
-            "closing a non-last tab does not signal window-close"
-        );
-        let next = project(&app, WindowId(0));
-        let (ok, out) = validate_transition("Close", prev, next);
-        assert!(
-            ok,
-            "real Close in a NON-FRONT window {prev:?} -> {next:?} must conform — a stale strip \
-             (seg_count past the new tab count) would FAIL here\n--- ty ---\n{out}"
-        );
-        assert_eq!(
-            next[0], next[2],
-            "after a non-front close, seg_count must mirror the tab count"
-        );
-
-        let (bad_ok, _bad) = validate_transition("Close", [2, 1, 2, 1], [1, 0, 2, 1]);
-        assert!(
-            !bad_ok,
-            "corrupted Close [2,1,2,1] -> [1,0,2,1] (stale strip) MUST be ty-REJECTED — \
-             the conformance would be vacuous otherwise"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::logging::stderr_line!(
-            "tab_strip Tier-1 conformance: real NewTab/SelectTab/Close (incl. a NON-FRONT \
-             close) keep the native strip in lockstep with the tab model AND the stale-strip \
-             negative control was rejected."
-        );
-    }
-}
+#[path = "lib_tab_strip_conformance_tests.rs"]
+mod tab_strip_conformance;
 
 #[cfg(test)]
 mod path_confine_conformance_tests;
@@ -31217,106 +29029,8 @@ mod compose_tests;
 mod tab_strip_math_tests;
 
 #[cfg(test)]
-mod recursion_provision_tests {
-    use crate::spawn::{
-        install_parent_edges, is_valid_session_id, parse_injected_identity,
-        provision_child_identity_env, provision_child_recursion_env,
-    };
-    use aterm_session::{EdgeTable, LaunchNonce, Op, SessionId};
-
-    #[test]
-    fn session_id_shape_validation() {
-        assert!(is_valid_session_id(SessionId::generate().as_str()));
-        assert!(!is_valid_session_id("nope"));
-        assert!(!is_valid_session_id("s-xyz"));
-        assert!(!is_valid_session_id("s-")); // no hex
-        assert!(!is_valid_session_id(&format!("s-{}", "g".repeat(20)))); // non-hex
-        assert!(!is_valid_session_id(&format!("s-{}", "A".repeat(20)))); // not minted
-    }
-
-    #[test]
-    fn adopt_injected_identity_roundtrips_and_fails_closed() {
-        let sid = SessionId::generate();
-        let nonce = LaunchNonce::generate();
-        let got = parse_injected_identity(Some(sid.as_str()), Some(&nonce.to_hex()))
-            .expect("valid pair adopts");
-        assert_eq!(got.0.as_str(), sid.as_str());
-        assert!(got.1.ct_eq(&nonce));
-        assert!(parse_injected_identity(Some(sid.as_str()), None).is_none());
-        assert!(parse_injected_identity(None, Some(&nonce.to_hex())).is_none());
-        assert!(parse_injected_identity(Some("bad"), Some(&nonce.to_hex())).is_none());
-        assert!(parse_injected_identity(Some(sid.as_str()), Some("xyz")).is_none());
-    }
-
-    #[test]
-    fn provision_child_env_is_symmetric_across_all_three_ops() {
-        let parent = SessionId::generate();
-        let mut env = provision_child_identity_env(&parent);
-        let (recursion_env, prov) = provision_child_recursion_env();
-        env.extend(recursion_env);
-        let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
-
-        let (child_sid, child_nonce) = parse_injected_identity(
-            get("ATERM_SESSION_ID").as_deref(),
-            get("ATERM_LAUNCH_NONCE").as_deref(),
-        )
-        .expect("child adopts injected identity");
-        assert!(
-            get("ATERM_EDGE_READ").is_none(),
-            "edge secrets must NOT be in the identity env (F1)"
-        );
-        let mut table = EdgeTable::new();
-        let n = install_parent_edges(
-            &mut table,
-            &child_sid,
-            &child_nonce,
-            get("ATERM_PARENT_SESSION_ID").as_deref(),
-            Some(&prov.read.to_hex()),
-            Some(&prov.write.to_hex()),
-            Some(&prov.signal.to_hex()),
-        );
-        assert_eq!(n, 3, "all three op edges recorded");
-
-        assert_eq!(
-            table.authorize(&prov.read, &child_sid, &child_nonce),
-            Some(Op::ReadScreen)
-        );
-        assert_eq!(
-            table.authorize(&prov.write, &child_sid, &child_nonce),
-            Some(Op::WriteInput)
-        );
-        assert_eq!(
-            table.authorize(&prov.signal, &child_sid, &child_nonce),
-            Some(Op::Signal)
-        );
-
-        let stale = LaunchNonce::generate();
-        assert_eq!(table.authorize(&prov.read, &child_sid, &stale), None);
-        assert_eq!(
-            table.authorize(
-                &aterm_session::EdgeToken::generate(),
-                &child_sid,
-                &child_nonce
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn install_parent_edges_requires_parent_id() {
-        let mut table = EdgeTable::new();
-        let n = install_parent_edges(
-            &mut table,
-            &SessionId::generate(),
-            &LaunchNonce::generate(),
-            None,
-            Some(&aterm_session::EdgeToken::generate().to_hex()),
-            None,
-            None,
-        );
-        assert_eq!(n, 0);
-    }
-}
+#[path = "lib_recursion_provision_tests.rs"]
+mod recursion_provision_tests;
 
 #[cfg(test)]
 #[path = "lib_effect_cadence_tests.rs"]
@@ -31331,412 +29045,24 @@ mod fifo_backlog_tests;
 mod paste_banner_flow_tests;
 
 #[cfg(all(test, unix))]
-mod deferred_paste_owner_tests {
-    use std::sync::Arc;
-
-    use aterm_session::sink::SinkWriter;
-
-    use super::{App, Source, WindowId};
-    use crate::input::PasteFraming;
-
-    fn observer_pipe() -> (i32, Arc<SinkWriter>) {
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "observer pipe");
-        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
-        assert!(flags >= 0);
-        assert_eq!(
-            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        (pipe[0], Arc::new(SinkWriter::new(pipe[1])))
-    }
-
-    fn drain_within(fd: i32, ms: u64) -> Vec<u8> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                out.extend_from_slice(&buf[..n as usize]);
-                continue;
-            }
-            if !out.is_empty() || std::time::Instant::now() >= deadline {
-                return out;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn a_confirmed_paste_reaches_its_owner_after_a_tab_switch_not_the_new_front() {
-        let (owner_rx, owner_sink) = observer_pipe();
-        let (front_rx, front_sink) = observer_pipe();
-        let mut app = App::headless_for_test_with_sink(owner_sink);
-        let wid = WindowId(0);
-        let owner = app
-            .focused_session_id(wid)
-            .expect("front session at gesture");
-
-        let new_id = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session_with_sink(new_id, front_sink));
-        assert_ne!(
-            app.focused_session_id(wid),
-            Some(owner),
-            "the switch really moved the front off the owner"
-        );
-
-        app.deliver_paste_confirmed(
-            wid,
-            Some(owner),
-            "ls\nrm -rf ~".to_string(),
-            Source::Human,
-            PasteFraming::Gesture { bracketed: false },
-        );
-
-        assert_eq!(
-            drain_within(owner_rx, 60_000),
-            b"ls\rrm -rf ~",
-            "the confirmed paste reaches the session that owned the gesture"
-        );
-        assert_eq!(
-            drain_within(front_rx, 0),
-            b"",
-            "the tab that came to the front receives nothing"
-        );
-
-        unsafe {
-            libc::close(owner_rx);
-            libc::close(front_rx);
-        }
-    }
-}
+#[path = "lib_deferred_paste_owner_tests.rs"]
+mod deferred_paste_owner_tests;
 
 #[cfg(test)]
-mod edr_headroom_tests {
-    use super::{EDR_REQUERY_INTERVAL, edr_refresh_due, edr_requery_due};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn requery_recurs_on_a_stationary_window() {
-        let now = Instant::now();
-        assert!(edr_requery_due(None, now, EDR_REQUERY_INTERVAL));
-        assert!(!edr_requery_due(Some(now), now, EDR_REQUERY_INTERVAL));
-        let half = now + EDR_REQUERY_INTERVAL / 2;
-        assert!(!edr_requery_due(Some(now), half, EDR_REQUERY_INTERVAL));
-        let after = now + EDR_REQUERY_INTERVAL + Duration::from_millis(1);
-        assert!(edr_requery_due(Some(now), after, EDR_REQUERY_INTERVAL));
-    }
-
-    #[test]
-    fn an_hdr_surface_stamped_while_8bit_is_due_at_once() {
-        let t = Instant::now();
-        let next_frame = t + Duration::from_millis(16);
-        assert!(
-            edr_refresh_due(
-                Some(true),
-                Some((t, false)),
-                next_frame,
-                EDR_REQUERY_INTERVAL
-            ),
-            "an HDR surface stamped while 8-bit is re-queried at the next redraw"
-        );
-        assert!(
-            !edr_requery_due(Some(t), next_frame, EDR_REQUERY_INTERVAL),
-            "control: the time throttle alone holds that re-query off"
-        );
-    }
-
-    #[test]
-    fn the_gate_is_the_throttle_except_for_an_unseeded_hdr_surface() {
-        let t = Instant::now();
-        let next_frame = t + Duration::from_millis(16);
-        let elapsed = t + EDR_REQUERY_INTERVAL;
-        for hdr in [false, true] {
-            assert!(
-                edr_refresh_due(Some(hdr), None, t, EDR_REQUERY_INTERVAL),
-                "a never-stamped GPU surface (hdr={hdr}) is due"
-            );
-        }
-        for (stamped_hdr, hdr) in [(false, false), (true, true), (true, false)] {
-            let last = Some((t, stamped_hdr));
-            assert!(
-                !edr_refresh_due(Some(hdr), last, next_frame, EDR_REQUERY_INTERVAL),
-                "stamped hdr={stamped_hdr}, now hdr={hdr}: held within the interval"
-            );
-            assert!(
-                edr_refresh_due(Some(hdr), last, elapsed, EDR_REQUERY_INTERVAL),
-                "stamped hdr={stamped_hdr}, now hdr={hdr}: due once the interval elapses"
-            );
-        }
-        for last in [None, Some((t, false)), Some((t, true))] {
-            assert!(
-                !edr_refresh_due(None, last, elapsed, EDR_REQUERY_INTERVAL),
-                "no GPU present, stamp {last:?}: never due"
-            );
-        }
-    }
-}
+#[path = "lib_edr_headroom_tests.rs"]
+mod edr_headroom_tests;
 
 #[cfg(test)]
-mod refresh_rate_reread_tests {
-    use super::{REFRESH_RATE_REREAD_INTERVAL, refresh_rate_read_due};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_same_monitor_move_is_throttled_and_a_monitor_change_or_focus_never_is() {
-        let now = Instant::now();
-        let interval = REFRESH_RATE_REREAD_INTERVAL;
-        let half = now + interval / 2;
-        let after = now + interval + Duration::from_millis(1);
-        for (case, same, forced, last, at, due) in [
-            ("first moved", true, false, None, now, true),
-            ("moved just read", true, false, Some(now), now, false),
-            ("moved half in", true, false, Some(now), half, false),
-            (
-                "moved at the boundary",
-                true,
-                false,
-                Some(now),
-                now + interval,
-                true,
-            ),
-            ("moved past it", true, false, Some(now), after, true),
-            ("other monitor", false, false, Some(now), now, true),
-            ("other monitor half in", false, false, Some(now), half, true),
-            ("other monitor, never read", false, false, None, now, true),
-            ("focused just read", true, true, Some(now), now, true),
-            ("focused half in", true, true, Some(now), half, true),
-        ] {
-            assert_eq!(
-                refresh_rate_read_due(same, forced, last, at, interval),
-                due,
-                "{case}"
-            );
-        }
-    }
-}
+#[path = "lib_refresh_rate_reread_tests.rs"]
+mod refresh_rate_reread_tests;
 
 #[cfg(test)]
-mod ime_cursor_area_tests {
-    use super::{App, WindowId};
-    use aterm_window::dpi::PhysicalSize;
-
-    #[test]
-    fn same_cell_republishes_after_metric_padding_and_frame_origin_changes() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.backend.set_pad(12);
-        app.backend.set_pad_top(2);
-        app.windows.get_mut(&wid).unwrap().metrics.pad = 12;
-        app.windows.get_mut(&wid).unwrap().metrics.pad_top = 2;
-        let cell = (3, 5);
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let initial = app.windows[&wid].last_ime_rect.expect("initial IME rect");
-
-        app.windows.get_mut(&wid).unwrap().metrics.font_px *= 1.5;
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let metric = app.windows[&wid].last_ime_rect.expect("metric IME rect");
-        assert_ne!(
-            metric, initial,
-            "same cell must resize/reposition with DPI metrics"
-        );
-        assert_ne!((metric.2, metric.3), (initial.2, initial.3));
-
-        app.windows.get_mut(&wid).unwrap().metrics.pad_top += 7;
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let padded = app.windows[&wid].last_ime_rect.expect("padded IME rect");
-        assert_eq!(padded.1, metric.1 + 7);
-
-        let (cw, ch) = app.win_cell_size(wid);
-        let (rows, cols, pad, pad_top) = {
-            let ws = &app.windows[&wid];
-            (
-                ws.rows as usize,
-                ws.cols as usize,
-                ws.metrics.pad,
-                ws.metrics.pad_top,
-            )
-        };
-        app.windows.get_mut(&wid).unwrap().win_px = Some(PhysicalSize::new(
-            (cols * cw + 2 * pad + cw.saturating_sub(1).max(2)) as u32,
-            (rows * ch + pad_top + pad + ch.saturating_sub(1).max(2)) as u32,
-        ));
-        let origin = app.frame_origin(wid);
-        assert!(origin.0 > 0, "fixture needs a horizontal frame remainder");
-        if cfg!(target_os = "linux") {
-            // Top-pinned vertical placement: the remainder lands below the
-            // frame, so the IME rect's Y is origin-invariant by construction
-            // and the X axis carries the origin-shift assertion.
-            assert_eq!(origin.1, 0, "Linux pins the frame top");
-        } else {
-            assert!(origin.1 > 0, "fixture needs a vertical frame remainder");
-        }
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let shifted = app.windows[&wid].last_ime_rect.expect("shifted IME rect");
-        assert_eq!(shifted.0, padded.0 + i32::try_from(origin.0).unwrap());
-        assert_eq!(shifted.1, padded.1 + i32::try_from(origin.1).unwrap());
-    }
-
-    #[test]
-    fn re_enabling_ime_forgets_the_rect_memo_so_the_next_frame_re_sends_it() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let cell = (4, 9);
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let parked = app.windows[&wid]
-            .last_ime_rect
-            .expect("caret rect reported");
-
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        assert_eq!(
-            app.windows[&wid].last_ime_rect,
-            Some(parked),
-            "an unmoved caret keeps the memo (that is why it exists)"
-        );
-
-        app.on_ime_enablement_changed(wid);
-        assert_eq!(
-            app.windows[&wid].last_ime_rect, None,
-            "Ime::Disabled must forget the rect"
-        );
-
-        app.on_ime_enablement_changed(wid);
-        assert_eq!(
-            app.windows[&wid].last_ime_rect, None,
-            "Ime::Enabled must forget the rect"
-        );
-        app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        assert_eq!(
-            app.windows[&wid].last_ime_rect,
-            Some(parked),
-            "the re-send resolves to the same rect the caret always had — before \
-             the fix this call short-circuited on the stale memo and the \
-             compositor kept no rectangle at all"
-        );
-    }
-
-    #[test]
-    fn re_enabling_ime_also_ends_an_interrupted_composition() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.on_ime_preedit(wid, "日本".to_string(), Some((3, 3)));
-        assert!(!app.windows[&wid].preedit.is_empty());
-
-        app.on_ime_enablement_changed(wid);
-        assert!(
-            app.windows[&wid].preedit.is_empty(),
-            "a focus cycle mid-compose must not leave the suppress gate stuck on"
-        );
-        assert_eq!(app.windows[&wid].preedit_caret, None);
-    }
-}
+#[path = "lib_ime_cursor_area_tests.rs"]
+mod ime_cursor_area_tests;
 
 #[cfg(test)]
-mod rain_deadline_tests {
-    use aterm_effects::matrix_rain::RainConfig;
-    use std::time::{Duration, Instant};
-
-    use super::{App, WindowId};
-
-    fn rain_cfg() -> RainConfig {
-        RainConfig {
-            enabled: true,
-            output_material: false,
-            seed: 7,
-            ..RainConfig::default()
-        }
-    }
-
-    fn rain_front_scheduler_model() -> aterm_spec::derive::Model {
-        use aterm_spec::ty_model;
-        ty_model! {
-            RainFrontScheduler {
-                const Buggy = 0;
-                var front = 1;  // 1 terminal, 0 native
-                var active = 1; // retained rain engine charge
-                var armed = 0;  // event-loop rain deadline
-                action Schedule {
-                    armed = if active == 1 {
-                        if front == 1 { 1 } else { if Buggy == 1 { 1 } else { 0 } }
-                    } else { 0 };
-                }
-                action EnterNative when (front == 1) {
-                    front = 0;
-                    armed = if Buggy == 1 { armed } else { 0 };
-                }
-                action ReturnTerminal when (front == 0) {
-                    front = 1;
-                    armed = 0;
-                }
-                action Drain when (active == 1) {
-                    active = 0;
-                    armed = 0;
-                }
-                action Restart when (active == 0) {
-                    active = 1;
-                    armed = 0;
-                }
-                invariant BooleanBounds: front <= 1 && active <= 1 && armed <= 1;
-                invariant NativeOwnsNoRainClock: (if front == 0 { armed } else { 0 }) == 0;
-                invariant DrainedOwnsNoRainClock: (if active == 0 { armed } else { 0 }) == 0;
-            }
-        }
-    }
-
-    #[test]
-    fn rain_front_scheduler_model_proves_and_catches_native_wake_regression() {
-        let model = rain_front_scheduler_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-    }
-
-    #[test]
-    fn native_front_freezes_active_rain_and_parks_its_deadline() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let model = rain_front_scheduler_model();
-        let mut state = model.init_state();
-        {
-            let ws = app.windows.get_mut(&wid).expect("headless window");
-            ws.fx.build_rain(rain_cfg());
-            ws.next_rain_tick = Some(deadline);
-            assert!(ws.matrix_rain_frame_period().is_some());
-        }
-        assert!(model.fire("Schedule", &mut state));
-        assert_eq!(state["armed"], 1);
-
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        assert!(model.fire("EnterNative", &mut state));
-
-        let ws = app.windows.get(&wid).expect("headless window");
-        assert!(ws.front_terminal().is_none(), "Settings is native content");
-        assert!(
-            ws.fx.rain().is_some_and(|rain| rain.is_active()),
-            "the terminal rain episode is retained, not destructively reset"
-        );
-        assert_eq!(
-            ws.matrix_rain_frame_period(),
-            None,
-            "invisible rain contributes no about_to_wait cadence"
-        );
-        assert_eq!(
-            ws.next_rain_tick, None,
-            "the terminal-era rain deadline is parked at the native boundary"
-        );
-        assert_eq!(state["front"], 0);
-        assert_eq!(
-            state["active"],
-            i64::from(ws.fx.rain().unwrap().is_active())
-        );
-        assert_eq!(state["armed"], i64::from(ws.next_rain_tick.is_some()));
-        assert!(model.check_invariant("NativeOwnsNoRainClock", &state));
-
-        assert!(model.fire("Schedule", &mut state));
-        assert_eq!(state["armed"], 0);
-        assert_eq!(ws.matrix_rain_frame_period(), None);
-    }
-}
+#[path = "lib_rain_deadline_tests.rs"]
+mod rain_deadline_tests;
 
 #[cfg(test)]
 #[path = "lib_headless_video_tests.rs"]
@@ -31746,8 +29072,8 @@ mod headless_video_tests;
 #[path = "lib_visible_content_route_tests.rs"]
 mod visible_content_route_tests;
 
-/// Run the release tool for `aterm ship …`: `aterm-release` beside this binary, else in the
-/// `target/` of a checkout at or above the current directory.
+/// Run the release tool for `aterm ship …`: `aterm-release` beside this binary, else in
+/// Cargo's selected target directory for a checkout at or above the current directory.
 pub fn run_ship(rest: &[String]) -> i32 {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe()
@@ -31755,12 +29081,22 @@ pub fn run_ship(rest: &[String]) -> i32 {
     {
         candidates.push(dir.join("aterm-release"));
     }
-    if let Ok(mut dir) = std::env::current_dir() {
+    if !candidates.iter().any(|path| path.is_file())
+        && let Ok(mut dir) = std::env::current_dir()
+    {
+        let target_hint = match aterm_toolchain::build_cache::cargo_target_hint(&dir) {
+            Ok(target) => target,
+            Err(error) => {
+                crate::logging::stderr_line!("aterm ship: {error}");
+                return 1;
+            }
+        };
         loop {
             if dir.join("Cargo.toml").is_file() {
-                candidates.push(dir.join("target/gate/aterm-release"));
-                candidates.push(dir.join("target/release/aterm-release"));
-                candidates.push(dir.join("target/debug/aterm-release"));
+                let target = target_hint.clone().unwrap_or_else(|| dir.join("target"));
+                candidates.push(target.join("gate/aterm-release"));
+                candidates.push(target.join("release/aterm-release"));
+                candidates.push(target.join("debug/aterm-release"));
             }
             if !dir.pop() {
                 break;
@@ -31791,204 +29127,16 @@ pub fn run_ship(rest: &[String]) -> i32 {
 mod macos_access_refresh_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod macos_access_lifetime_tests {
-    use super::consent_card::{CardPhase, Marker, Verdict, WATCH_FOR};
-    use super::consent_state::ConsentState;
-    use super::macos_access_refresh_tests::{access_row, grant_recorded, windowed};
-    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
-    use std::time::Instant;
-
-    #[test]
-    fn pending_access_cannot_extend_any_waiting_phase() {
-        let now = Instant::now();
-        for phase in ["due", "watching"] {
-            let mut app = windowed(FdaProbe::pending());
-            assert!(app.consent_card.begin_deciding(now));
-            assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-            if phase == "watching" {
-                app.consent_card.on_raised(now);
-            }
-            app.tick_macos_access_card(now + WATCH_FOR);
-            assert_eq!(app.consent_card.phase(), CardPhase::Settled, "{phase}");
-            assert!(
-                !access_row(&app) && !grant_recorded(&app),
-                "an expired phase cannot offer or confirm"
-            );
-            assert_eq!(
-                app.next_macos_access_card_deadline(now + WATCH_FOR),
-                None,
-                "an expired phase owns no timer"
-            );
-        }
-    }
-
-    #[test]
-    fn timed_out_initial_probe_drops_its_deferred_marker_before_retry() {
-        let now = Instant::now();
-        let mut app = windowed(FdaProbe::pending());
-        assert!(app.consent_card.begin_deciding(now));
-        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(Some(
-            Marker::Opened,
-        )));
-        assert_eq!(
-            app.consent_card_host.pending,
-            Some(crate::consent_card::PendingDecision::launch(Some(
-                Marker::Opened
-            )))
-        );
-        let deadline = app.consent_card.lifecycle_deadline().unwrap();
-        assert!(app.next_macos_access_card_deadline(now).unwrap() <= deadline);
-        app.tick_macos_access_card(deadline);
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Settled,
-            "the retry starts on this wake and settles because this fixture has no worker proxy"
-        );
-        assert_eq!(app.consent_card_host.pending, None);
-        assert!(!access_row(&app) && !grant_recorded(&app));
-        app.consent = ConsentState::with_cached_probe_for_test(FdaProbe {
-            state: FdaState::Granted,
-            label: ProbeLabel::OpenOk,
-        });
-        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(Some(
-            Marker::Opened,
-        )));
-        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert_eq!(app.consent_card_host.pending, None);
-        assert!(!grant_recorded(&app));
-    }
-}
+#[path = "lib_macos_access_lifetime_tests.rs"]
+mod macos_access_lifetime_tests;
 
 #[cfg(test)]
 #[path = "lib_gpu_acquire_wait_tests.rs"]
 mod gpu_acquire_wait_tests;
 
 #[cfg(test)]
-mod first_window_prewarm_tests {
-
-    use super::*;
-    use aterm_render::StyleBits;
-
-    const FONT: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
-
-    fn sealed_backend_at_base() -> Backend {
-        let mut backend = Backend::Cpu(
-            Renderer::from_bytes(FONT, FONT_PX, Theme::default()).expect("fixture font parses"),
-        );
-        backend.seal_admitted_font_sources();
-        backend
-    }
-
-    fn prompt_lookups_added(backend: &mut Backend) -> usize {
-        let Backend::Cpu(r) = backend else {
-            unreachable!("CPU fixture")
-        };
-        let before = r.glyph_cache_len();
-        for ch in ['$', '>', 'a', 'Z', '~'] {
-            let regular = r.glyph_key(ch);
-            let bold = r.glyph_key_styled(ch, StyleBits::BOLD);
-            let _ = r.glyph_image(regular);
-            let _ = r.glyph_image(bold);
-        }
-        r.glyph_cache_len() - before
-    }
-
-    fn active_px(backend: &Backend) -> f32 {
-        let Backend::Cpu(r) = backend else {
-            unreachable!("CPU fixture")
-        };
-        r.px()
-    }
-
-    #[test]
-    fn the_post_seal_warm_is_resident_at_the_first_windows_predicted_px() {
-        let retina = font_px_for_scale(FONT_PX, 2.0);
-        assert_eq!(retina, (FONT_PX * 2.0).round());
-        assert_ne!(
-            retina, FONT_PX,
-            "a 2x target equal to the base would make the precondition below vacuous"
-        );
-
-        let mut base_warm = sealed_backend_at_base();
-        base_warm.prewarm_ascii();
-        base_warm.activate_px(retina);
-        assert!(
-            prompt_lookups_added(&mut base_warm) > 0,
-            "precondition: a base-px warm is invisible at the Retina target"
-        );
-
-        let mut predicted = sealed_backend_at_base();
-        predicted.prewarm_ascii_for_first_window(retina, FONT_PX);
-        assert_eq!(
-            active_px(&predicted),
-            active_px(&sealed_backend_at_base()),
-            "the helper hands the renderer back at the size it was given"
-        );
-        predicted.activate_px(retina);
-        assert_eq!(
-            prompt_lookups_added(&mut predicted),
-            0,
-            "the prompt's regular and BOLD keys at the first window's px must be cache hits"
-        );
-    }
-
-    #[test]
-    fn the_warm_survives_the_joins_re_pin_of_a_non_default_typography() {
-        let retina = font_px_for_scale(FONT_PX, 2.0);
-        let defaults = app_config::GlyphRasterKnobs::from_config(&Config::default());
-        let deltas: [(&str, app_config::GlyphRasterKnobs); 4] = [
-            (
-                "line_height",
-                app_config::GlyphRasterKnobs {
-                    line_height: 1.2,
-                    ..defaults.clone()
-                },
-            ),
-            (
-                "font_thicken",
-                app_config::GlyphRasterKnobs {
-                    font_thicken: true,
-                    ..defaults.clone()
-                },
-            ),
-            (
-                "stem_gamma",
-                app_config::GlyphRasterKnobs {
-                    stem_gamma: 0.85,
-                    ..defaults.clone()
-                },
-            ),
-            (
-                "adjust_baseline",
-                app_config::GlyphRasterKnobs {
-                    adjust_baseline: 2,
-                    ..defaults.clone()
-                },
-            ),
-        ];
-        for (knob, knobs) in &deltas {
-            let mut join_only = sealed_backend_at_base();
-            join_only.prewarm_ascii_for_first_window(retina, FONT_PX);
-            join_only.pin_glyph_raster_knobs(knobs);
-            join_only.activate_px(retina);
-            assert!(
-                prompt_lookups_added(&mut join_only) > 0,
-                "precondition: a {knob} pinned first at the join discards the warm"
-            );
-
-            let mut worker_pinned = sealed_backend_at_base();
-            worker_pinned.pin_glyph_raster_knobs(knobs);
-            worker_pinned.prewarm_ascii_for_first_window(retina, FONT_PX);
-            worker_pinned.pin_glyph_raster_knobs(knobs);
-            worker_pinned.activate_px(retina);
-            assert_eq!(
-                prompt_lookups_added(&mut worker_pinned),
-                0,
-                "{knob}: the join's re-pin of the worker's values must keep the warm"
-            );
-        }
-    }
-}
+#[path = "lib_first_window_prewarm_tests.rs"]
+mod first_window_prewarm_tests;
 
 #[cfg(all(test, unix))]
 #[path = "lib_focus_report_tests.rs"]
@@ -32006,176 +29154,20 @@ pub(crate) fn prime_test_update_root() {
 }
 
 #[cfg(test)]
-pub(crate) mod test_env {
-    use std::ffi::OsStr;
-
-    /// [`aterm_log::env::scoped`], primed, in a test run alone ([`moves_alone`]).
-    #[track_caller]
-    pub(crate) fn scoped<T>(
-        key: impl AsRef<OsStr>,
-        value: impl AsRef<OsStr>,
-        body: impl FnOnce() -> T,
-    ) -> T {
-        moves_alone(key.as_ref());
-        super::prime_test_update_root();
-        aterm_log::env::scoped(key, value, body)
-    }
-
-    /// [`aterm_log::env::scoped_unset`], primed, in a test run alone ([`moves_alone`]).
-    #[track_caller]
-    pub(crate) fn scoped_unset<T>(key: impl AsRef<OsStr>, body: impl FnOnce() -> T) -> T {
-        moves_alone(key.as_ref());
-        super::prime_test_update_root();
-        aterm_log::env::scoped_unset(key, body)
-    }
-
-    /// The lib-test process's environment never moves: a test that moves a variable runs alone
-    /// in a child of the test binary (`if !crate::test_alone::alone() { return; }`). The scope
-    /// holds ENV_LOCK, but only other writers take it: code that reads a state, config or data
-    /// path reads the live environment, and in the lib-test process another test's scope
-    /// starting or ending between two of its reads splits them.
-    #[track_caller]
-    fn moves_alone(key: &OsStr) {
-        assert!(
-            crate::test_alone::in_child(),
-            "{}: a test that moves the environment runs alone in a child (`test_alone::alone`)",
-            key.display()
-        );
-    }
-
-    /// A move of the environment is refused in the lib-test process, before it moves anything,
-    /// and made in a test run alone.
-    #[test]
-    fn the_environment_moves_only_in_a_test_run_alone() {
-        const KEY: &str = "ATERM_TEST_ENV_MOVED_ALONE";
-        if !crate::test_alone::in_child() {
-            let moved = std::panic::catch_unwind(|| scoped(KEY, "moved", || ()));
-            assert!(moved.is_err(), "the lib-test process's environment moved");
-            assert_eq!(std::env::var_os(KEY), None, "the refusal moved it first");
-        }
-        if !crate::test_alone::alone() {
-            return;
-        }
-        assert_eq!(
-            scoped(KEY, "moved", || std::env::var(KEY).ok()),
-            Some("moved".to_owned())
-        );
-    }
-}
+#[path = "lib_test_env_tests.rs"]
+pub(crate) mod test_env;
 
 /// Paths as a test's fixtures spell them on this host: aterm-agent's seam.
 #[cfg(test)]
 pub(crate) use aterm_agent::harness::host_path as test_host;
 
 #[cfg(test)]
-pub(crate) mod test_log {
-    use std::cell::RefCell;
-    use std::sync::{Mutex, OnceLock};
-
-    type Observer = Box<dyn Fn(&aterm_log::Record<'_>)>;
-    thread_local! {
-        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
-    }
-
-    /// One captured record: its level, its target and its rendered message.
-    #[derive(Clone, Debug)]
-    pub(crate) struct Captured {
-        pub(crate) level: aterm_log::Level,
-        pub(crate) target: String,
-        pub(crate) message: String,
-    }
-
-    struct Capture;
-
-    fn captured() -> &'static Mutex<Vec<Captured>> {
-        static CAPTURED: OnceLock<Mutex<Vec<Captured>>> = OnceLock::new();
-        CAPTURED.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    impl aterm_log::Log for Capture {
-        fn enabled(&self, _metadata: &aterm_log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &aterm_log::Record<'_>) {
-            OBSERVER.with(|observer| {
-                if let Some(observe) = observer.borrow().as_ref() {
-                    observe(record);
-                }
-            });
-            captured()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(Captured {
-                    level: record.level(),
-                    target: record.target().to_string(),
-                    message: format!("{}", record.args()),
-                });
-        }
-        fn flush(&self) {}
-    }
-
-    /// Install the capture.
-    pub(crate) fn install() {
-        static LOGGER: Capture = Capture;
-        let _ = aterm_log::set_logger(&LOGGER);
-        aterm_log::set_max_level(aterm_log::LevelFilter::Info);
-    }
-
-    /// Observe this thread's actual logger calls during `run`, restoring any outer observer even if it unwinds.
-    pub(crate) fn observe<R>(
-        observer: impl Fn(&aterm_log::Record<'_>) + 'static,
-        run: impl FnOnce() -> R,
-    ) -> R {
-        struct Restore(Option<Observer>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                OBSERVER.with(|observer| observer.replace(self.0.take()));
-            }
-        }
-        install();
-        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
-        run()
-    }
-
-    /// Every record this thread logs while `run` runs, by its rendered message ([`observe`]).
-    pub(crate) fn logged_while(run: impl FnOnce()) -> Vec<String> {
-        let seen: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::default();
-        let into = std::rc::Rc::clone(&seen);
-        observe(
-            move |record| into.borrow_mut().push(format!("{}", record.args())),
-            run,
-        );
-        seen.take()
-    }
-
-    /// Every record captured so far whose message contains `mark`, oldest first.
-    pub(crate) fn containing(mark: &str) -> Vec<Captured> {
-        captured()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .filter(|record| record.message.contains(mark))
-            .cloned()
-            .collect()
-    }
-}
+#[path = "lib_test_log_tests.rs"]
+pub(crate) mod test_log;
 
 #[cfg(test)]
-mod relaunch_payload_tests {
-    #[test]
-    fn only_an_updates_relaunch_withholds_the_bootstrap_payload() {
-        let payload = Some(vec![std::ffi::OsString::from("./deploy.sh")]);
-        let mut factory = payload.clone();
-        assert_eq!(super::withhold_bootstrap_payload(&mut factory, false), None);
-        assert_eq!(
-            factory, payload,
-            "a person's launch runs it in its first tab"
-        );
-        let withheld = super::withhold_bootstrap_payload(&mut factory, true);
-        assert_eq!(factory, None, "session 0 of a relaunch spawns without it");
-        assert_eq!(withheld, payload, "…and it is kept to be put back");
-    }
-}
+#[path = "lib_relaunch_payload_tests.rs"]
+mod relaunch_payload_tests;
 
 #[cfg(clean_islands)]
 macro_rules! verify_island {

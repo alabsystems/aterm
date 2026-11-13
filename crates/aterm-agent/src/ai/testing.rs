@@ -8,6 +8,22 @@ use std::sync::Mutex;
 
 use super::facts::{Job, Ran, RunFailed, Runner};
 
+/// Synthetic Codex file credentials naming `email`, or no email where it is absent.
+pub(crate) fn codex_auth(email: Option<&str>) -> Vec<u8> {
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "fixture-user",
+            "chatgpt_account_id": "fixture-account"
+        }
+    }));
+    aterm_json::to_vec(&aterm_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"id_token": token, "access_token": token}
+    }))
+    .unwrap()
+}
+
 /// Records an explicit current Codex observation against synthetic file credentials.
 pub(crate) fn current_codex_auth(
     store: &crate::harness::accounts::Store,

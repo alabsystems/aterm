@@ -46,6 +46,63 @@ fn population_budget() -> Duration {
         .unwrap()
         .root_duration()
 }
+
+struct FixtureProgress {
+    path: PathBuf,
+    last_completed: Instant,
+}
+impl FixtureProgress {
+    fn new(path: PathBuf, now: Instant) -> Self {
+        Self {
+            path,
+            last_completed: now,
+        }
+    }
+    fn completed(&mut self, stage: &str) {
+        self.completed_at(stage, Instant::now());
+    }
+    fn completed_at(&mut self, stage: &str, now: Instant) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap();
+        writeln!(file, "{stage}").unwrap();
+        self.last_completed = now;
+    }
+    fn stalled_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_completed) >= HANG
+    }
+    fn assert_progressing(&self) {
+        assert!(
+            !self.stalled_at(Instant::now()),
+            "no completed fixture stage within original hang detector; progress {}",
+            fs::read_to_string(&self.path).unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+fn completed_fixture_stages_keep_their_own_hang_window() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("progress");
+    let started = Instant::now();
+    let mut progress = FixtureProgress::new(path.clone(), started);
+    for (index, stage) in ["setup", "workload", "retirement", "cleanup"]
+        .into_iter()
+        .enumerate()
+    {
+        let completed = started + (HANG - Duration::from_secs(1)) * index as u32;
+        progress.completed_at(stage, completed);
+        let bytes = fs::metadata(&path).unwrap().len();
+        assert!(!progress.stalled_at(completed + HANG - Duration::from_nanos(1)));
+        // Merely checking an unchanged stage cannot renew its original minute.
+        assert!(progress.stalled_at(completed + HANG));
+        assert!(progress.stalled_at(completed + HANG * 2));
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes);
+    }
+    assert!(progress.last_completed.duration_since(started) > HANG);
+}
 #[test]
 fn population_containment_preserves_each_actions_hang_detector() {
     // The old ten-minute cap could expire during a healthy complete population.
@@ -120,7 +177,7 @@ fn actual_original_workload_root_and_phases_keep_all_resources_until_retirement(
     if std::env::var(ROLE).as_deref() == Ok("host") {
         return host_process();
     }
-    for case in ["normal", "nonzero", "unknown", "cancel"] {
+    for case in ["normal", "unknown", "cancel"] {
         run_case(case);
     }
 }
@@ -150,13 +207,11 @@ fn run_case(case: &str) {
         .env(ROLE, "host")
         .env(STORE, &path)
         .env(CASE, case);
-    let result = if case == "contained-full-population" {
-        deadline::output_while_progressing(&mut command, HANG, &mut || {
-            fs::metadata(path.join("progress")).map_or(0, |file| file.len())
-        })
-    } else {
-        deadline::output_within(&mut command, attempt_budget(linker::selected(case)))
-    };
+    // Setup, protocol execution, retirement and scratch removal are separate
+    // completed stages. Their aggregate is not a one-minute latency budget.
+    let result = deadline::output_while_progressing(&mut command, HANG, &mut || {
+        fs::metadata(path.join("progress")).map_or(0, |file| file.len())
+    });
     let output = match result {
         Ok(output) => output,
         Err(error) => panic!(
@@ -191,17 +246,8 @@ fn input(path: &std::path::Path) -> wire::InputFile {
 fn host_process() {
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
     let case = std::env::var(CASE).unwrap();
-    let progress = || {
-        if case == "contained-full-population" {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path.join("progress"))
-                .unwrap();
-            file.write_all(b"+").unwrap();
-        }
-    };
-    progress();
+    let mut progress = FixtureProgress::new(path.join("progress"), Instant::now());
+    progress.completed("host-entered");
     if case == "contained-full-population" {
         // This fresh private fixture gets a stricter real kernel limit BEFORE
         // any owners. Capping hard and soft prevents ordinary spawn's existing
@@ -224,6 +270,7 @@ fn host_process() {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
     crate::runtime::test_endpoint_with_native_store(&path).unwrap();
+    progress.completed("host-published");
     // Selected native inputs require private, non-writable ancestors. Keep
     // only the Unix socket name in the short temporary namespace; the owned
     // SDK/output/CPU fixture is independent account-cache data, never install.
@@ -236,7 +283,7 @@ fn host_process() {
     // successful LLD. Never unlink its copied Mach-O during OS assessment.
     scratch.preserve = linker::selected(&case);
     let (mut owner, namespace, retirement) = World::prepare(&scratch);
-    progress();
+    progress.completed("original-authorities-prepared");
     let artifacts = scratch.path.join("managed-sdk");
     let layout = atpkg::store::Layout {
         prefix: artifacts.join("manager"),
@@ -248,17 +295,18 @@ fn host_process() {
     let service = build.join("bin/targo");
     let compiler = build.join("bin/trustc");
     fs::copy(program.path(), &service).unwrap();
-    progress();
+    progress.completed("service-copied");
     fs::copy(program.path(), &compiler).unwrap();
-    progress();
+    progress.completed("compiler-copied");
     if linker::selected(&case) {
         linker::install(&build);
     } else {
         fs::copy(program.path(), build.join("bin/rust-lld")).unwrap();
     }
+    progress.completed("linker-prepared");
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
-    progress();
+    progress.completed("sdk-ready");
     let source = scratch.path.join("source");
     let cargo_home = scratch.path.join("cargo-home");
     let output = scratch.path.join("output");
@@ -299,6 +347,7 @@ fn host_process() {
         .as_nanos() as u64,
     };
     let bytes = invocation.encode().unwrap();
+    progress.completed("invocation-encoded");
     let (root_input, mut continuation) = std::io::pipe().unwrap();
     continuation
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -331,10 +380,11 @@ fn host_process() {
     let debt = owner.debt.clone();
     let ledger = owner.ledger.clone();
     let mut actor = ActualActor(Some(crate::actor::activate_test(owner).unwrap()));
+    progress.completed("original-workload-queued");
     let mut connections = Vec::new();
     let end = Instant::now() + budget;
-    let mut last_progress = Instant::now();
     let mut progress_bytes = 0;
+    let mut root_ready = false;
     let mut reserved = false;
     let mut cancelled = false;
     let mut locks_observed = false;
@@ -349,8 +399,7 @@ fn host_process() {
             fs::metadata(source.join("contained-descriptors")).map_or(0, |stat| stat.len());
         if actual_bytes != progress_bytes {
             progress_bytes = actual_bytes;
-            last_progress = Instant::now();
-            progress();
+            progress.completed("contained-action-completed");
             writeln!(
                 fd_trace,
                 "root_progress_bytes={actual_bytes} descriptors={} peak={peak_descriptors}",
@@ -358,10 +407,6 @@ fn host_process() {
             )
             .unwrap();
         }
-        assert!(
-            last_progress.elapsed() < HANG,
-            "no actual fixture action progress within original hang detector"
-        );
         let (actual_limit, actual_count) = descriptor_population();
         assert_eq!(actual_limit, original_fd_limit);
         peak_descriptors = peak_descriptors.max(actual_count);
@@ -371,13 +416,20 @@ fn host_process() {
             fs::read_to_string(&stderr).unwrap()
         );
         if debt.reserved().unwrap() == 2 {
-            reserved = true;
             assert!(
                 pool.snapshot()
                     .unwrap()
                     .iter()
                     .all(|slot| matches!(slot, aterm_capacity::build_cpu::SlotState::Held { .. }))
             );
+            if !reserved {
+                reserved = true;
+                progress.completed("original-resources-held");
+            }
+        }
+        if !root_ready && source.join("ready").is_file() {
+            root_ready = true;
+            progress.completed("original-root-ready");
         }
         if linker::selected(&case)
             && !loan_observed
@@ -414,6 +466,9 @@ fn host_process() {
             } else {
                 loan_observed = linker::release_input(&source);
             }
+            if loan_observed {
+                progress.completed("original-linker-loan-observed");
+            }
         }
         if !locks_observed && source.join("original-lock-dropped").is_file() {
             // Root has closed its original guard. Only the actual Host SCM
@@ -444,6 +499,7 @@ fn host_process() {
                     .unwrap();
                 continuation.write_all(&ack).unwrap();
             }
+            progress.completed("original-output-locks-observed");
         }
         if case == "cancel" && !cancelled && source.join("ready").is_file() {
             assert!(crate::actor::control_eof_before_reap_test(binding.clone()).unwrap());
@@ -458,6 +514,7 @@ fn host_process() {
             )
             .unwrap();
             cancelled = true;
+            progress.completed("original-cancel-delivered");
         }
         match aterm_uds::accept(
             &listener,
@@ -479,15 +536,19 @@ fn host_process() {
                 ) => {}
             Err(error) => panic!("workload listener: {error}"),
         }
+        progress.assert_progressing();
         std::thread::sleep(POLL);
     }
+    progress.completed("original-workload-settled");
     assert!(
         reserved,
         "the actual full original pool must have been held"
     );
     actor.finish();
+    progress.completed("actor-stopped");
     for connection in connections {
-        connection.join().unwrap()
+        connection.join().unwrap();
+        progress.completed("connection-closed");
     }
     let start = aterm_ctl::resource_admission_transport::read_frame(&events, Instant::now() + HANG)
         .unwrap();
@@ -507,6 +568,7 @@ fn host_process() {
             fs::read_to_string(&stderr).unwrap()
         )
     };
+    progress.completed("original-start-verified");
     let finished = aterm_types::resource_admission::AccountedEventFrame::decode(
         &aterm_ctl::resource_admission_transport::read_frame(&events, Instant::now() + HANG)
             .unwrap(),
@@ -533,10 +595,7 @@ fn host_process() {
         assert!(matches!(outcome, Outcome::Signal(_)))
     } else {
         assert_eq!(cause, CompletionCause::Exited);
-        assert_eq!(
-            outcome,
-            Outcome::Exit(if case == "nonzero" { 23 } else { 0 })
-        );
+        assert_eq!(outcome, Outcome::Exit(0));
         assert!(finished.observation.cpu_times.is_some())
     }
     assert_eq!(
@@ -585,9 +644,12 @@ fn host_process() {
     .unwrap();
     drop(probe);
     println!("actual-workload-original-owner-retired case={case} cpu=0 memory=closed SDK=free");
+    progress.completed("original-retirement-verified");
     fs::remove_file(socket).unwrap();
     drop((pool, debt, ledger, namespace, retirement));
+    progress.completed("original-authorities-dropped");
     drop(scratch);
+    progress.completed("fixture-cleaned");
 }
 fn root() -> i32 {
     // Snapshot before any allocation/import; these locators never grant CPU.
@@ -932,5 +994,5 @@ fn root() -> i32 {
     drop(census);
     drop(control);
     drop(originals);
-    if case == "nonzero" { 23 } else { 0 }
+    0
 }

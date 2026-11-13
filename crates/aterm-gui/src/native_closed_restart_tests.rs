@@ -47,7 +47,7 @@ pub(super) fn fixture_on(
         shell,
         observation: None,
         launcher: image(20),
-        socket: "/fake-native.sock".into(),
+        socket: crate::test_host::abs("/fake-native.sock"),
         forward: Box::new(restart_command(9)),
         rollback: Some(Box::new(restart_command(2))),
     };
@@ -215,4 +215,76 @@ fn restart_missing_retained_kernel_object_cannot_create_continuation_evidence() 
     );
     assert!(operation.lock().unwrap().closed_restart.is_none());
     assert_eq!(facts.watch_count.load(Ordering::SeqCst), 1);
+}
+
+/// A signalled restart whose source outlives its deadline (a Codex that ignores SIGTERM, or a
+/// member its group keeps) stops holding the update's handoff, and keeps its input position until
+/// the source retires; before the deadline it holds both.
+#[test]
+fn a_signalled_restart_past_its_deadline_lets_the_update_handoff_go_on() {
+    for survivor in [false, true] {
+        let (handle, facts, request, actor) = fixture(8311 + u64::from(survivor));
+        let ctx = &handle.ctx;
+        let deadline_us = request.deadline_us;
+        let binding = admitted_binding(&run(ctx, &facts, Request::prepare(request), actor.clone()));
+        assert_eq!(
+            run(ctx, &facts, Request::Signal(binding.clone()), actor),
+            "OK native-act state=signalled\n"
+        );
+        if survivor {
+            facts.processes.lock().unwrap().remove(&4242);
+            facts
+                .processes
+                .lock()
+                .unwrap()
+                .insert(7000, process(7000, 400, 4242, 400, 90));
+        }
+        let operation = lookup(ctx, &binding).unwrap();
+        let (guard, drain) = {
+            let op = operation.lock().unwrap();
+            let custody = op.custody.as_ref().unwrap();
+            (
+                Arc::downgrade(&custody.handoff_guard().unwrap()),
+                custody.drain(),
+            )
+        };
+        reconcile_extinct_by(ctx, &facts);
+        assert!(
+            guard.upgrade().is_some(),
+            "before its deadline the restart holds the handoff (survivor={survivor})"
+        );
+        // Abandoned before its deadline (its shell gone), so the sweep weighs the release: a
+        // Resume already past its checks may still type, so only the deadline lets it go.
+        facts.processes.lock().unwrap().get_mut(&400).unwrap().birth += 1;
+        reconcile_extinct_by(ctx, &facts);
+        assert!(
+            guard.upgrade().is_some(),
+            "an abandoned restart holds the handoff until its deadline (survivor={survivor})"
+        );
+        facts.processes.lock().unwrap().get_mut(&400).unwrap().birth -= 1;
+        facts.clock.store(deadline_us + 1, Ordering::SeqCst);
+        reconcile_extinct_by(ctx, &facts);
+        assert!(
+            guard.upgrade().is_none(),
+            "past it the handoff goes on (survivor={survivor})"
+        );
+        {
+            let op = operation.lock().unwrap();
+            assert!(!matches!(op.phase, Phase::Completed(_)));
+            assert!(op.custody.is_some());
+        }
+        assert!(
+            !drain.is_drained(),
+            "the input position stays while the source may still write (survivor={survivor})"
+        );
+        facts.processes.lock().unwrap().remove(&4242);
+        facts.processes.lock().unwrap().remove(&7000);
+        facts.foreground.store(400, Ordering::SeqCst);
+        reconcile_extinct_by(ctx, &facts);
+        assert_eq!(
+            operation.lock().unwrap().phase,
+            Phase::Completed(Decision::Retired(Retirement::NotGranted)),
+            "once the source and its group are gone it retires as before (survivor={survivor})"
+        );
+    }
 }

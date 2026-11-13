@@ -1548,11 +1548,15 @@ fn a_remote_mailbox_is_polled_gently_and_a_loopback_one_often() {
             "{imap:?} {http:?}"
         );
     }
-    let relay = MailboxConfig {
-        relay_enabled: true,
-        ..MailboxConfig::default()
-    };
-    assert_eq!(network_poll_interval(&relay, target), REMOTE_POLL);
+    // The fleet's relay is read only on Unix (`MailboxConfig::reads_relay_for`).
+    #[cfg(unix)]
+    {
+        let relay = MailboxConfig {
+            relay_enabled: true,
+            ..MailboxConfig::default()
+        };
+        assert_eq!(network_poll_interval(&relay, target), REMOTE_POLL);
+    }
     assert!(REMOTE_POLL >= Duration::from_secs(2));
     for (imap, http) in [
         (Some("imap://127.0.0.1:1143/INBOX"), None),

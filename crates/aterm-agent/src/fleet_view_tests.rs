@@ -128,12 +128,136 @@ fn book() -> Vec<Peer> {
     )]
 }
 
-/// A table line's cells: the text between runs of two or more spaces.
-fn cells(line: &str) -> Vec<&str> {
-    line.split("  ")
-        .map(str::trim)
-        .filter(|cell| !cell.is_empty())
-        .collect()
+fn survey_fixture() -> (Fleet, Vec<Peer>, aterm_ctl::FleetRead) {
+    let (seats, book) = (seats(), book());
+    let fleet = compose(&Facts {
+        seats: Some(&seats),
+        records: Some((4_169, true)),
+        view: Err("no cached presence".to_owned()),
+        book: &book,
+        now_ms: NOW,
+    });
+    let peer = aterm_ctl::PeerSurvey {
+        authenticated: Some(aterm_ctl::AuthenticatedPeer { node: identity(5).node().to_owned(), key: key(5) }),
+        // A matching name is neither needed nor sufficient: only m5's key is bound here.
+        label: "m1".to_owned(), node: Some(identity(5).node().to_owned()),
+        answer: Ok(vec![
+            format!("instance node={} version=0.197.0 sessions=3 window=1 window_last=- label=m1 ssh_host_key=- home_free_mb=128000 accounts=1", identity(5).node()),
+            "account pool=claude id=fixture condition=usable enrolled=1 pct5=27 pct7=60 week_reset=- walled_until=- last_used=-".to_owned(),
+        ]),
+        fault: aterm_ctl::PeerFault::Other, unproven: false, addr: None, reason: None,
+    };
+    (
+        fleet,
+        book,
+        aterm_ctl::FleetRead {
+            peers: vec![peer],
+            note: None,
+            alone: None,
+        },
+    )
+}
+
+#[test]
+fn proved_surveys_supply_current_metrics_without_relabelling_unknown_seats() {
+    let (fleet, book, read) = survey_fixture();
+    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let json = to_json(&fleet);
+    assert_eq!(json["up"], Value::from(1_u64));
+    assert_eq!(json["unknown"], Value::from(5_u64));
+    let row = &json["seats"][4];
+    assert_eq!(row["build"], Value::from("0.197.0"));
+    assert_eq!(row["build_source"], Value::from("survey"));
+    assert_eq!(row["node"], Value::from(identity(5).node()));
+    assert_eq!(row["observed_at_ms"], Value::from(NOW));
+    assert_eq!(row["home_free_mb"], Value::from(128_000_u64));
+    assert_eq!(row["sessions"], Value::from(3_u64));
+    assert_eq!(row["accounts"][0]["pct5"], Value::from(27_u64));
+    assert_eq!(row["accounts"][0]["pct7"], Value::from(60_u64));
+    assert_eq!(row["needs_update"], Value::from(false));
+    assert_eq!(json["seats"][0]["up"], Value::Null);
+    assert_eq!(json["seats"][0]["sessions"], Value::Null);
+}
+
+#[test]
+fn surveys_require_full_bound_keys_consistent_nodes_and_complete_facts() {
+    for fault in [
+        "unproven",
+        "missing-identity",
+        "wrong-proved-key",
+        "wrong-node",
+        "unsigned",
+        "conflicting-book",
+        "short-key",
+        "ambiguous",
+        "cut",
+    ] {
+        let (mut fleet, mut book, mut read) = survey_fixture();
+        match fault {
+            "unproven" => read.peers[0].unproven = true,
+            "missing-identity" => read.peers[0].authenticated = None,
+            "wrong-proved-key" => read.peers[0].authenticated.as_mut().unwrap().key[31] ^= 1,
+            "wrong-node" => {
+                let lines = read.peers[0].answer.as_mut().unwrap();
+                lines[0] = lines[0].replace(identity(5).node(), identity(4).node());
+            }
+            "unsigned" => book[0].signed = None,
+            "conflicting-book" => book.push(Peer::own(
+                &NodeIdentity::from_seed(identity(5).node(), &[4; 32]).unwrap(),
+                ("other.local", 7100, "0.197.0"),
+                NOW,
+            )),
+            "short-key" => fleet.rows[4].node_key.as_mut().unwrap()[31] ^= 1,
+            "ambiguous" => read.peers.push(read.peers[0].clone()),
+            "cut" => {
+                read.peers[0].answer.as_mut().unwrap().pop();
+            }
+            _ => unreachable!(),
+        }
+        let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+        assert_eq!(fleet.seats.up, Some(0), "{fault}");
+        assert!(fleet.observations.is_empty(), "{fault}");
+        assert!(
+            fleet.rows.iter().all(|row| row.presence.is_none()),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn a_proved_identity_can_answer_a_peer_requested_by_name_only() {
+    let (fleet, book, mut read) = survey_fixture();
+    read.peers[0].node = None;
+    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    assert_eq!(fleet.seats.up, Some(1));
+    assert_eq!(fleet.rows[4].node.as_deref(), Some(identity(5).node()));
+}
+
+#[test]
+fn a_local_network_failure_is_unknown_and_a_missed_peer_has_no_current_metrics() {
+    for (fault, expected) in [
+        (aterm_ctl::PeerFault::NoNetwork, None),
+        (aterm_ctl::PeerFault::NotPermitted, None),
+        (aterm_ctl::PeerFault::NoRoute, Some(false)),
+    ] {
+        let (fleet, book, mut read) = survey_fixture();
+        read.peers[0].answer = Err("unavailable".to_owned());
+        read.peers[0].fault = fault;
+        let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+        let json = to_json(&fleet);
+        let row = &json["seats"][4];
+        assert_eq!(row["up"], expected.map_or(Value::Null, Value::from));
+        assert_eq!(row["build_source"], Value::from("book"));
+        assert_eq!(row["sessions"], Value::Null);
+        assert_eq!(row["accounts"], Value::Null);
+    }
+    let (fleet, book, mut read) = survey_fixture();
+    let lines = read.peers[0].answer.as_mut().unwrap();
+    lines[0] = lines[0].replace(" accounts=1", "");
+    lines.pop();
+    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    assert_eq!(fleet.seats.up, Some(1));
+    assert_eq!(to_json(&fleet)["seats"][4]["accounts"], Value::Null);
 }
 
 /// Up and silent, builds, the members that need an update and tables in step come from the
@@ -159,57 +283,9 @@ fn the_view_names_the_old_builds_and_reads_each_seat_from_presence() {
          slowest 40 s behind · log 4,169 of 16,384"
     );
     assert_eq!(fleet.unserved, None);
-    let text = render(&fleet, Some(NOW));
-    let lines: Vec<Vec<&str>> = text.lines().skip(1).map(cells).collect();
-    let n1 = principal_of(&key(1));
-    let n3 = principal_of(&key(3));
-    let n4 = principal_of(&key(4));
-    let n5 = principal_of(&key(5));
-    assert_eq!(
-        lines,
-        vec![
-            vec!["LABEL", "NAME", "NODE", "UP", "BUILD", "TABLES"],
-            vec![
-                "m1",
-                "m1-mini (this Mac)",
-                &n1,
-                "up",
-                "0.159.0+g4ef9cd6144",
-                "-"
-            ],
-            vec![
-                "m2",
-                "m2-studio",
-                &principal_of(&key(2)),
-                "up",
-                "0.159.0+g4ef9cd6144",
-                "in step"
-            ],
-            vec!["m3", "m3-air", &n3, "up", "0.158.0", "40 s behind"],
-            vec![
-                "m4",
-                "m4-pro",
-                &n4,
-                "silent 3 h",
-                "needs update (0.150.0)",
-                "-"
-            ],
-            vec![
-                "m5",
-                "m5-old",
-                &n5,
-                "silent, never seen up",
-                "needs update (0.147.0)",
-                "-"
-            ],
-            vec!["m6", "m6-new", "-", "silent, never seen up", "-", "-"],
-        ],
-        "{text}"
-    );
     let json = to_json(&fleet);
     assert_eq!(json["up"], Value::from(3_u64));
     assert_eq!(json["seats"][4]["needs_update"], Value::from(true));
-    assert_eq!(json["seats"][2]["behind_ms"], Value::from(40_000_u64));
 
     // Before this Mac's log crossed the legacy bound, an old build can still hold it: only the
     // member that publishes no presence row needs an update.

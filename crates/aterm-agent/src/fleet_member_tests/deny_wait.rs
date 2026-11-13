@@ -9,6 +9,16 @@ fn vault_beside(member: &World) -> Paths {
     let paths = Paths::for_home(home);
     let source = home.join("fixture.vault");
     client::create(&paths, source.to_str().unwrap(), None, Some("m2")).unwrap();
+    if read_key_file(&member.places.state).is_ok() {
+        let book = member::hold_book(&member.places.state).unwrap();
+        crate::fleet_vault::take(
+            &book,
+            crate::fleet_vault::Vault::configured(&paths)
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+    }
     assert_eq!(vault_paths_for(&member.places).unwrap().dir, paths.dir);
     paths
 }

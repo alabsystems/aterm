@@ -3,8 +3,7 @@
 
 //! Conservative dependency-qualified calls for the lazy-init walk.
 
-use super::{DependencyScopes, WordSet, owned_fn, source_crate};
-use std::borrow::Cow;
+use super::{DependencyScopes, WordSet, method_fn, owned_fn, source_crate};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Exports = BTreeMap<String, BTreeSet<String>>;
@@ -54,64 +53,164 @@ impl<'a> CallScope<'a> {
         Self { aliases, exports }
     }
 
-    /// Only a two-segment external free call is narrowed. Everything unproved stays by-name.
-    fn target<'l>(&self, before_open: &'l str) -> Option<Cow<'l, str>> {
-        let before = before_open.trim_end();
-        let name = crate::ident_ending_at(before, before.len())?;
-        let bare = || Cow::Borrowed(name);
-        let Some(prefix) = before[..before.len() - name.len()]
-            .trim_end()
-            .strip_suffix("::")
-        else {
-            return Some(bare());
+    /// Dot dispatch stays in the method domain, including when its receiver type
+    /// is unknown. Unproved associated/module paths retain both domains.
+    fn targets(&self, before_open: &str) -> Vec<String> {
+        let Some(before) = direct_callee(before_open) else {
+            return Vec::new();
+        };
+        let Some(name) = crate::ident_ending_at(before, before.len()) else {
+            return Vec::new();
+        };
+        let head = before[..before.len() - name.len()].trim_end();
+        if head.ends_with('.') && !head.ends_with("..") {
+            return vec![method_fn(name)];
+        }
+        let Some(prefix) = head.strip_suffix("::") else {
+            return vec![name.to_owned()];
         };
         let prefix = prefix.trim_end();
         let Some(alias) = crate::ident_ending_at(prefix, prefix.len()) else {
-            return Some(bare());
+            return vec![name.to_owned(), method_fn(name)];
         };
         let earlier = prefix[..prefix.len() - alias.len()].trim_end();
-        if earlier.ends_with([':', '.', '$']) {
-            return Some(bare());
+        if alias == "Self" && !earlier.ends_with([':', '.', '$']) {
+            return vec![method_fn(name)];
         }
-        let Some(dir) = self.aliases.get(alias) else {
-            return Some(bare());
-        };
-        Some(
-            if self
+        if !earlier.ends_with([':', '.', '$'])
+            && let Some(dir) = self.aliases.get(alias)
+            && self
                 .exports
                 .get(dir)
                 .is_some_and(|names| names.contains(name))
-            {
-                Cow::Owned(owned_fn(dir, name))
-            } else {
-                bare()
-            },
-        )
+        {
+            return vec![owned_fn(dir, name)];
+        }
+        vec![name.to_owned(), method_fn(name)]
+    }
+
+    pub(super) fn dependency(&self, alias: &str) -> Option<&str> {
+        self.aliases.get(alias).map(String::as_str)
     }
 
     pub(super) fn callees(&self, body: &[String]) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        for line in body {
-            self.line_callees(line, &mut out);
-        }
+        self.line_callees(&body.join("\n"), &mut out);
         out
     }
 
-    /// Every `<ident>(` target in one line, added to `out`.
+    /// Direct call targets in lexical code, including multiline path grouping.
     pub(super) fn line_callees(&self, line: &str, out: &mut BTreeSet<String>) {
         for (at, byte) in line.bytes().enumerate() {
-            if byte == b'('
-                && let Some(target) = self.target(&line[..at])
-                && !out.contains(&*target)
-            {
-                out.insert(target.into_owned());
+            if byte == b'(' {
+                let before = &line[..at];
+                // The declaration names an item, not a free-function call from
+                // its body. Real calls later on the same line remain edges.
+                let trimmed = before.trim_end();
+                if crate::ident_ending_at(trimmed, trimmed.len()).is_some_and(|name| {
+                    let head = trimmed[..trimmed.len() - name.len()].trim_end();
+                    crate::ident_ending_at(head, head.len()) == Some("fn")
+                }) {
+                    continue;
+                }
+                out.extend(self.targets(before));
             }
         }
     }
 
-    pub(super) fn reference(&self, text: &str) -> Option<String> {
-        self.target(text).map(Cow::into_owned)
+    pub(super) fn reference(&self, text: &str) -> Vec<String> {
+        self.targets(text)
     }
+}
+
+/// Parentheses are transparent only around a complete direct path. A call's
+/// argument list, tuple, cast, or computed result does not become a path.
+fn direct_callee(text: &str) -> Option<&str> {
+    let text = text.trim_end();
+    if !text.ends_with(')') {
+        return Some(text);
+    }
+    let mut depth = 0usize;
+    let mut opening = None;
+    for (at, byte) in text.bytes().enumerate().rev() {
+        match byte {
+            b')' => depth += 1,
+            b'(' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    opening = Some(at);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let at = opening?;
+    let head = text[..at].trim_end();
+    if callable_head(head) {
+        return None;
+    }
+    let mut inner = text[at + 1..text.len() - 1].trim();
+    while inner.starts_with('(') && inner.ends_with(')') {
+        inner = &inner[1..inner.len() - 1];
+        inner = inner.trim();
+    }
+    let mut rest = inner.strip_prefix("::").unwrap_or(inner).trim_start();
+    loop {
+        let end = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        let name = &rest[..end];
+        if name.is_empty() || name.as_bytes()[0].is_ascii_digit() {
+            return None;
+        }
+        rest = rest[end..].trim_start();
+        if rest.is_empty() {
+            return Some(inner);
+        }
+        rest = rest.strip_prefix("::")?.trim_start();
+    }
+}
+
+/// A preceding callable path or computed value makes this pair an argument
+/// list, rather than transparent grouping. Expression keywords and a labeled
+/// `break` introduce values; unary `!` does not turn either into a macro path.
+fn callable_head(mut head: &str) -> bool {
+    while let Some(prefix) = head.strip_suffix('!') {
+        head = prefix.trim_end();
+    }
+    if head.ends_with([')', ']', '?']) {
+        return true;
+    }
+    // This is only argument-list exclusion, not a new generic-call target.
+    // A comparison `>` alone does not establish a callable prefix.
+    if head.ends_with('>')
+        && head.match_indices('<').any(|(at, _)| {
+            head[..at].trim_end().ends_with("::")
+                && crate::lock_order::matching_angle(&head[at..]) == Some(head.len() - at - 1)
+        })
+    {
+        return true;
+    }
+    let Some(word) = crate::ident_ending_at(head, head.len()) else {
+        return false;
+    };
+    let before = head[..head.len() - word.len()].trim_end();
+    if matches!(
+        word,
+        "return" | "break" | "yield" | "if" | "while" | "match" | "in"
+    ) && !before.ends_with([':', '.', '#'])
+    {
+        return false;
+    }
+    if let Some(before_label) = before.strip_suffix('\'') {
+        let before_label = before_label.trim_end();
+        if crate::ident_ending_at(before_label, before_label.len()) == Some("break") {
+            return false;
+        }
+    }
+    true
 }
 
 fn ident(s: &str) -> bool {
@@ -387,243 +486,5 @@ pub(super) fn known_free_exports(sources: &[(String, String)]) -> Exports {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::run_lazy_init_census;
-
-    const PURE: &str = "pub fn read(_cache: &std::cell::OnceCell<bool>) -> bool { false }\n";
-    const REENTER: &str = "pub fn read(cache: &std::cell::OnceCell<bool>) -> bool {\n    *cache.get_or_init(|| true)\n}\n";
-
-    fn check(
-        label: &str,
-        prelude: &str,
-        expression: &str,
-        provider: &str,
-        extra: &[(&str, &str)],
-        red: bool,
-    ) {
-        let mut files = vec![
-            ("Cargo.toml".into(), "[workspace]\nmembers = [\"crates/aterm-gui\", \"crates/parser-impl\"]\n".into()),
-            ("crates/aterm-gui/Cargo.toml".into(), "[package]\nname = \"aterm-gui\"\n[dependencies]\nparser = { package = \"parser-implementation\", path = \"../parser-impl\" }\n".into()),
-            ("crates/parser-impl/Cargo.toml".into(), "[package]\nname = \"parser-implementation\"\n".into()),
-            ("crates/aterm-gui/src/lib.rs".into(), format!("{prelude}\nstruct Cache {{\n    cache: std::cell::OnceCell<bool>,\n}}\nimpl Cache {{\n    fn read(&self) -> bool {{\n        *self.cache.get_or_init({expression})\n    }}\n}}\n")),
-            ("crates/parser-impl/src/lib.rs".into(), provider.into()),
-        ];
-        files.extend(
-            extra
-                .iter()
-                .map(|(path, body)| ((*path).into(), (*body).into())),
-        );
-        let tree =
-            crate::scan_set::test_fixtures::synth_tree("lazy-qualified-controls", label, &files);
-        let out = run_lazy_init_census(&tree);
-        assert_eq!(out.ok, !red, "{label}: {}", out.log);
-    }
-
-    #[test]
-    fn qualified_calls_preserve_real_and_conservative_reentry() {
-        for (label, prelude, expression) in [
-            ("crate", "", "|| crate::read(self)"),
-            ("self", "", "|| self::read(self)"),
-            ("Self", "", "|| Self::read(self)"),
-            ("unknown", "", "|| unknown::read(self)"),
-            (
-                "module",
-                "mod parser {\n    pub fn read(cache: &super::Cache) -> bool { cache.read() }\n}",
-                "|| parser::read(self)",
-            ),
-            (
-                "import",
-                "use crate::local as parser;\nmod local {\n    pub fn read(cache: &super::Cache) -> bool { cache.read() }\n}",
-                "|| parser::read(self)",
-            ),
-            (
-                "type",
-                "type parser = Local;\nstruct Local;\nimpl Local {\n    fn read(cache: &Cache) -> bool { cache.read() }\n}",
-                "|| parser::read(self)",
-            ),
-            (
-                "fn-generic",
-                "fn forward<parser: Capture>(cache: &Cache) -> bool {\n    parser::read(cache)\n}\ntrait Capture {}",
-                "|| parser::read(self)",
-            ),
-            (
-                "impl-generic",
-                "struct Forward<T>(T);\nimpl<parser: Capture> Forward<parser> {\n    fn call(cache: &Cache) -> bool { parser::read(cache) }\n}\ntrait Capture {}",
-                "|| parser::read(self)",
-            ),
-            (
-                "mixed-local-external",
-                "",
-                "|| { parser::read(&self.cache); self.read() }",
-            ),
-            ("deep-path", "", "|| parser::nested::read(self)"),
-        ] {
-            check(label, prelude, expression, PURE, &[], true);
-        }
-    }
-
-    #[test]
-    fn only_known_public_free_exports_narrow_calls_and_function_references() {
-        for (label, provider, red) in [
-            ("public", PURE, false),
-            ("borrowed-cell", REENTER, true),
-            ("private", "fn read() -> bool { false }\n", true),
-            ("missing", "pub fn other() -> bool { false }\n", true),
-            (
-                "foreign-reexport",
-                "pub use elsewhere::read;\nfn read() -> bool { false }\n",
-                true,
-            ),
-            ("glob-reexport", "pub use elsewhere::*;\n", true),
-        ] {
-            check(
-                label,
-                "",
-                "|| parser::read(&self.cache)",
-                provider,
-                &[],
-                red,
-            );
-        }
-        for (label, provider, red) in [
-            ("reference-pure", "pub fn read() -> bool { false }\n", false),
-            (
-                "reference-reenters",
-                "pub fn read() -> bool {\n    let cache: &std::cell::OnceCell<bool> = unreachable!();\n    *cache.get_or_init(|| true)\n}\n",
-                true,
-            ),
-        ] {
-            check(label, "", "parser::read", provider, &[], red);
-        }
-        for (label, implementation, red) in [
-            ("local-export-pure", PURE, false),
-            ("local-export-borrowed", REENTER, true),
-        ] {
-            check(
-                label,
-                "",
-                "|| parser::read(&self.cache)",
-                "mod parsing;\npub use parsing::read;\n",
-                &[("crates/parser-impl/src/parsing.rs", implementation)],
-                red,
-            );
-        }
-    }
-
-    /// Each way a file shadows an alias, judged by the one-pass [`super::Shadows`] (and, for
-    /// an alias that is not one word, by the full scan it falls back to) exactly as the full
-    /// scan [`super::unshadowed`] judges it.
-    #[test]
-    fn every_shadowing_shape_is_judged_per_alias() {
-        for (text, alias, unshadowed) in [
-            ("fn f() { parser::read(); }\n", "parser", true),
-            ("fn f() { parser :: read(); }\n", "parser", true),
-            ("fn f() { other::read(); }\n", "parser", true),
-            (
-                "// parser\nfn f() { parser::read(); } // parser alone\n",
-                "parser",
-                true,
-            ),
-            ("fn f() { parsers::read(); parser_x(); }\n", "parser", true),
-            ("fn f() { éparser::read(); parseré(); }\n", "parser", true),
-            ("use crate::local as parser;\n", "parser", false),
-            ("fn f() { x::parser::read(); }\n", "parser", false),
-            (
-                "macro_rules! m { () => { $parser::read() }; }\n",
-                "parser",
-                false,
-            ),
-            ("fn f() { parser é::read(); }\n", "parser", false),
-            (
-                "use parser::{self, Read};\nfn f() { parser::read(); }\n",
-                "parser",
-                false,
-            ),
-            (
-                "use parser::{\n    self,\n};\nfn f() { parser::read(); }\n",
-                "parser",
-                false,
-            ),
-            (
-                "use other::{self};\nfn f() { parser::read(); }\n",
-                "parser",
-                true,
-            ),
-            (
-                "use other::*;\nfn f() { parser::read(); }\n",
-                "parser",
-                false,
-            ),
-            (
-                "fn f() { parser::read(); }\nuse other::thing",
-                "parser",
-                false,
-            ),
-            ("fn f() { a-b::read(); }\n", "a-b", true),
-            ("fn f() { let x = a-b; }\n", "a-b", false),
-            ("use a-b::{self};\n", "a-b", false),
-        ] {
-            let code: Vec<&str> = text.lines().map(crate::strip_line_comment).collect();
-            let words = super::WordSet::new([alias].into_iter().filter(|a| super::word(a)));
-            let shadows = super::Shadows::of(&code, &words);
-            assert_eq!(
-                shadows.unshadowed(text, alias),
-                unshadowed,
-                "{alias:?} in {text:?}"
-            );
-            assert_eq!(
-                super::unshadowed(text, alias),
-                unshadowed,
-                "{alias:?} in {text:?}, by the full scan"
-            );
-        }
-    }
-
-    #[test]
-    fn a_renamed_borrowed_cell_cannot_be_proved_pure() {
-        check(
-            "renamed-borrow",
-            "",
-            "|| parser::read(&self.cache)",
-            "pub fn read(borrowed: &std::cell::OnceCell<bool>) -> bool {\n    *borrowed.get_or_init(|| true)\n}\n",
-            &[],
-            true,
-        );
-    }
-
-    #[test]
-    fn a_same_file_helper_cannot_hide_a_borrowed_cell() {
-        check(
-            "helper-borrow",
-            "",
-            "|| parser::read(&self.cache)",
-            "pub fn read(borrowed: &std::cell::OnceCell<bool>) -> bool {\n    fill(borrowed)\n}\nfn fill(borrowed: &std::cell::OnceCell<bool>) -> bool {\n    *borrowed.get_or_init(|| true)\n}\n",
-            &[],
-            true,
-        );
-    }
-
-    #[test]
-    fn a_comment_cannot_prove_a_macro_generated_export() {
-        check(
-            "comment-export",
-            "",
-            "|| parser::read(&self.cache)",
-            "/*\npub fn read() -> bool { false }\n*/\nmake_reader!();\n",
-            &[],
-            true,
-        );
-    }
-
-    #[test]
-    fn a_multiline_string_cannot_prove_a_macro_generated_export() {
-        check(
-            "string-export",
-            "",
-            "|| parser::read(&self.cache)",
-            "const GUIDE: &str = \"\npub fn read() -> bool { false }\n\";\nmake_reader!();\n",
-            &[],
-            true,
-        );
-    }
-}
+#[path = "lazy_init_calls_tests.rs"]
+mod tests;

@@ -165,7 +165,7 @@ pub(crate) fn salvage_region(
         entries: prefix
             .entries
             .into_iter()
-            .map(|entry| (entry.conflict, entry.wire.into_wire()))
+            .map(|entry| (entry.conflict, entry.wire.wire().to_vec()))
             .collect(),
     })
 }
@@ -214,7 +214,7 @@ impl WitnessedPrefix {
                 conflicts.get(&entry.receipt.id).copied() == Some(entry.wire.wire())
             } else {
                 store.records.get(&entry.receipt.id).is_some_and(|stored| {
-                    stored.quarantine.is_none() && stored.wire == entry.wire.wire()
+                    stored.quarantine.is_none() && stored.wire.as_slice() == entry.wire.wire()
                 })
             };
             if !retained {

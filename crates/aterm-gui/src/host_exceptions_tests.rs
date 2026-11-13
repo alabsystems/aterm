@@ -3383,56 +3383,6 @@ fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
     assert!(line.title.starts_with("Muse Code"), "{}", line.title);
 }
 
-/// A stall on a background call that made no progress speaks of that call.
-#[test]
-fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
-    use aterm_agent::supervise::BackgroundCall;
-    let mut app = App::headless_for_test();
-    app.note_harness_host(HostNote::ResumeUnread {
-        sid: "s-1".to_string(),
-        agent: Program::Claude,
-        stall: Some(StallSeen::NoProgress {
-            minutes: 31,
-            pid: 27098,
-        }),
-    });
-    let r = app
-        .messages
-        .log()
-        .records()
-        .find(|r| r.key.as_deref() == Some("harness.host.stalled.s-1"))
-        .expect("the record");
-    let detail = r.detail.join(" ");
-    assert!(r.title.starts_with("Claude has stalled"), "{}", r.title);
-    assert!(
-        detail.contains("pid 27098") && detail.contains("31 min"),
-        "{detail}"
-    );
-    let call = BackgroundCall {
-        pid: 27098,
-        pgid: 27090,
-        birth: None,
-        exe: "aterm_gui-e0964a".to_string(),
-        task: Some("bplle5dxj".to_string()),
-        quiet_ms: 61 * 60_000,
-        wait: None,
-    };
-    let spot = mr::UpgradeSpot {
-        place: "in tab 2".to_string(),
-        nav: None,
-    };
-    let entries = mr::resume_exceptions(&[(
-        "s-2".to_string(),
-        Exception::no_progress(&call),
-        Program::Claude,
-        spot,
-    )]);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].key(), "harness.resume.s-2.stalled");
-    let line = entries[0].message().expect("passes the door");
-    assert_eq!(line.title, "Claude in tab 2 has stalled");
-}
-
 /// A palette set the owner's config refused is one digest line for every tab, naming the setting:
 /// never a live row, and later refusals, a session's own or another's, add nothing.
 #[test]

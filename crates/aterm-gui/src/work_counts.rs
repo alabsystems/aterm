@@ -24,6 +24,8 @@ thread_local! {
     static TIMER_RESOLVES: Cell<usize> = const { Cell::new(0) };
     static ACCOUNT_STORE_READS: Cell<usize> = const { Cell::new(0) };
     static OUTLOOK_FILE_LOOKS: Cell<usize> = const { Cell::new(0) };
+    static ACCOUNT_HISTORY_FOLDS: Cell<usize> = const { Cell::new(0) };
+    static ACCOUNT_MACHINES_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -50,6 +52,24 @@ pub(crate) fn outlook_file_look() {
 }
 pub(crate) fn take_outlook_file_looks() -> usize {
     take(&OUTLOOK_FILE_LOOKS)
+}
+
+/// A fold of an account's series into the Account card's history, on this thread
+/// (`account_menu_read`): a read that kept the last fold books none.
+pub(crate) fn account_history_folded() {
+    bump(&ACCOUNT_HISTORY_FOLDS);
+}
+pub(crate) fn take_account_history_folds() -> usize {
+    take(&ACCOUNT_HISTORY_FOLDS)
+}
+
+/// A read of the pool file and the claims table for the Account card, on this thread
+/// (`account_menu_read`).
+pub(crate) fn account_machines_read() {
+    bump(&ACCOUNT_MACHINES_READS);
+}
+pub(crate) fn take_account_machines_reads() -> usize {
+    take(&ACCOUNT_MACHINES_READS)
 }
 
 pub(crate) fn plan_built() {

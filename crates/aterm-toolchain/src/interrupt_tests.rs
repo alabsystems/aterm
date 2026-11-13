@@ -55,6 +55,7 @@ fn standin_waits_on_a_watch() {
             );
         }
     }
+    aterm_uds::signal_origin::observe(|line| println!("{line}"));
     let watch = Watch::enter();
     std::fs::write(dir.join("waiting"), std::process::id().to_string()).expect("said");
     assert!(
@@ -162,6 +163,12 @@ fn an_interrupt_ends_a_watched_wait() {
         let (status, out, took) = signal(&mut standin, sig);
         assert_eq!(status.code(), Some(3), "{word}: {status} {out}");
         assert!(out.contains(&format!("stopped by {word}")), "{out}");
+        assert!(
+            out.contains(&format!("sender_pid={} ", std::process::id())),
+            "{out}"
+        );
+        assert!(out.contains("executable=Some("), "{out}");
+        assert!(out.contains("argv=Some("), "{out}");
         eprintln!("{word} ended the stand-in's wait in {took:?}");
     }
 }

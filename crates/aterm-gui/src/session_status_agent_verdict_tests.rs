@@ -1603,6 +1603,71 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     assert_eq!(observer.next_wake(), None);
 }
 
+/// Output arriving during a shell confirmation must retain a later identity lookup.
+#[test]
+fn a_frame_during_shell_confirmation_retains_its_name_recheck() {
+    let t0 = Instant::now();
+    let id = 8;
+    let pgid = 43;
+    let first = crate::control::ScreenGen { epoch: 0, seq: 1 };
+    let later = crate::control::ScreenGen { epoch: 0, seq: 2 };
+    let mut observer = StatusObserver::new(StatusPolicy::default(), Duration::ZERO);
+    observer.note_program_request(id, pgid, t0);
+    observer.agent_observe(
+        id,
+        first,
+        Some(vec!["launching".into()]),
+        Cursor::Unknown,
+        Some("sh".into()),
+        pgid,
+        false,
+        "",
+        t0,
+    );
+    let shell_at = t0 + Duration::from_millis(1);
+    observer.agent_observe(
+        id,
+        first,
+        Some(vec!["launching".into()]),
+        Cursor::Unknown,
+        Some("sh".into()),
+        pgid,
+        false,
+        "",
+        shell_at,
+    );
+    let confirm = shell_at + PROGRAM_NAME_CONFIRM;
+    assert_eq!(observer.agents[&id].deferred_name_recheck_at, Some(confirm));
+    observer.note_program_request(id, pgid, confirm);
+    assert!(observer.agents[&id].name_confirmed);
+    observer.agent_observe(
+        id,
+        later,
+        Some(vec!["Claude Code".into()]),
+        Cursor::Unknown,
+        Some("sh".into()),
+        pgid,
+        true,
+        "",
+        confirm,
+    );
+    observer.agent_observe(
+        id,
+        later,
+        Some(vec!["Claude Code".into()]),
+        Cursor::Unknown,
+        Some("sh".into()),
+        pgid,
+        false,
+        "",
+        confirm + Duration::from_millis(1),
+    );
+    let due = confirm + PROGRAM_NAMED_RECHECK_FLOOR;
+    assert_eq!(observer.agents[&id].deferred_name_recheck_at, Some(due));
+    assert!(!observer.program_due(id, false, Some("sh"), later, due - Duration::from_millis(1)));
+    assert!(observer.program_due(id, false, Some("sh"), later, due));
+}
+
 /// Conformance test of named-shell recheck against `ProgramResolutionRetry`.
 #[test]
 fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {

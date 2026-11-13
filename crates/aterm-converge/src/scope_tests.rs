@@ -262,6 +262,33 @@ fn a_held_back_item_is_read_and_blocked_and_never_applied() {
 }
 
 #[test]
+fn an_item_put_off_is_read_and_deferred_and_never_applied() {
+    let would = Placed::new("workstation.dock", Class::Preference, Requires::Account);
+    let applied = Arc::clone(&would.applied);
+    let right = Placed {
+        probes: Mutex::new(vec![ok()]),
+        ..Placed::new("workstation.finder", Class::Preference, Requires::Account)
+    };
+    let items = put_off(
+        vec![Box::new(would), Box::new(right)],
+        "its last try did not take; it is tried again later",
+    );
+    let refreshed = Arc::new(AtomicU32::new(0));
+    let mut journal = Counted::new(&refreshed);
+    let rows = crate::run(&items, Mode::Apply, &mut journal).unwrap();
+    assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
+    assert_eq!(
+        rows[0].why.as_deref(),
+        Some("a; not changed yet: its last try did not take; it is tried again later"),
+        "what it would have changed, and why not now"
+    );
+    assert_eq!(rows[0].stood_aside, None);
+    assert_eq!(rows[1].outcome, Outcome::Ok, "{rows:?}");
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert!(journal.lines.is_empty());
+}
+
+#[test]
 fn an_item_left_as_is_is_read_and_not_applicable_and_never_applied() {
     let would = Placed::new("workstation.widgets", Class::Preference, Requires::Account);
     let applied = Arc::clone(&would.applied);
@@ -633,6 +660,11 @@ fn an_item_another_run_lays_waits_on_nothing() {
     );
     let hb = held_back(mk(), "why");
     assert_eq!(hb[0].activation().map(|a| a.id()), Some("act.dummy".into()));
+    let later = put_off(mk(), "why");
+    assert_eq!(
+        later[0].activation().map(|a| a.id()),
+        Some("act.dummy".into())
+    );
     let lai = left_as_is(mk(), "why");
     assert_eq!(
         lai[0].activation().map(|a| a.id()),

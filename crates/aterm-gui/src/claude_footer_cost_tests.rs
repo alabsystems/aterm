@@ -90,12 +90,12 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     publish(
         &app,
         session,
-        selected("first@example.com", "Max 5x", Some("weekly 71% used")),
+        selected("first@example.com", "Max 5x", Some("weekly 29% left")),
     );
     assert_eq!(cost(&mut app, wid).composed, 1);
     let first = glass_row(&app, wid, rule);
     assert!(
-        first.contains("\u{2386} first@example.com 71%"),
+        first.contains("\u{2386} first@example.com 29% left"),
         "the email names the account: {first:?}"
     );
     assert!(
@@ -111,7 +111,7 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     assert!(second.contains("\u{2386} second@example.com"), "{second:?}");
     assert!(!second.contains("Pro"), "{second:?}");
     assert!(
-        !second.contains("71%"),
+        !second.contains("29% left"),
         "no week told, none shown: {second:?}"
     );
     assert!(!second.contains("first"), "{second:?}");
@@ -129,13 +129,13 @@ fn unicode_account_label_survives_the_native_splice_and_rests_without_allocation
     ] {
         let name = email.rsplit_once('@').map_or(email, |(name, _)| name);
         // The rostered login is named by its profile's email (§2.5), whole.
-        let shown = format!("\u{2386}{email}71%");
+        let shown = format!("\u{2386}{email}29%left");
         let facts = FooterFacts {
             account: Some(name.into()),
             subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                 email: Some(email.into()),
                 plan: Some("Pro".into()),
-                weekly: Some("weekly 71% used".into()),
+                weekly: Some("weekly 29% left".into()),
                 ..Default::default()
             }),
             ..FooterFacts::default()
@@ -459,7 +459,10 @@ fn a_hover_change_composes_once_then_rests() {
     use crate::claude_lights::Fact;
     let (mut app, wid, session) = probe_glass();
     assert_eq!(cost(&mut app, wid), Cost::default(), "CONTROL: at rest");
+    // The branch has nothing to click: the pointer on it lights nothing, so nothing composes.
     app.hover_claude_fact(wid, Some((session, Fact::Branch)));
+    assert_eq!(cost(&mut app, wid).composed, 0, "no click, no paint");
+    app.hover_claude_fact(wid, Some((session, Fact::Model)));
     let first = cost(&mut app, wid);
     assert_eq!(first.composed, 1, "the hover composes once ({first:?})");
     assert_eq!(first.reads, 0, "and reads no pane ({first:?})");
@@ -492,7 +495,7 @@ fn a_hover_change_composes_once_then_rests() {
     );
     let rule = AT_REST.bottom();
     assert!(
-        glass_row(&app, wid, rule).contains("\u{2387} main \u{b7} click: hide"),
+        glass_row(&app, wid, rule).contains("\u{2387} main \u{b7} right-click: copy"),
         "the fact's title: {:?}",
         glass_row(&app, wid, rule)
     );
@@ -732,10 +735,9 @@ fn each_reading_follows_its_rows() {
     app.harness = Some(host.clone());
     let _host = Hosted(host);
     let rule = AT_REST.bottom();
-    for (mode, word, not) in [
-        (PLAN, "\u{25cb} yolo", "\u{25cf} yolo"),
-        (BYPASS, "\u{25cf} yolo", "\u{25cb} yolo"),
-    ] {
+    // The light is one word either way; its ink says the bit.
+    let mut inks = Vec::new();
+    for mode in [PLAN, BYPASS] {
         feed(
             &app,
             session,
@@ -748,11 +750,20 @@ fn each_reading_follows_its_rows() {
         let read = cost(&mut app, wid);
         assert_eq!(read.reads, 1, "{mode}: the pill read anew: {read:?}");
         let glass = glass_row(&app, wid, rule);
-        assert!(
-            glass.contains(word) && !glass.contains(not),
-            "{mode}: the light follows the pill: {glass:?}"
-        );
+        let at = glass
+            .find("yolo")
+            .map(|at| glass[..at].chars().count())
+            .unwrap_or_else(|| panic!("{mode}: the light is drawn: {glass:?}"));
+        let ws = &app.windows[&wid];
+        let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
+        let cell = ws.input_scratch.cells[strip + rule][at];
+        assert_eq!(cell.ch, 'y', "{mode}: the light's first cell: {glass:?}");
+        inks.push(cell.fg);
     }
+    assert_ne!(
+        inks[0], inks[1],
+        "the light follows the pill: quiet off, the value ink on"
+    );
     let banner = aterm_phase::anchor!("launch.banner");
     let card = |model: &str| -> Vec<String> {
         let mut rows = screen(&AT_REST);
@@ -1276,7 +1287,7 @@ fn quota_unit(tenths: u16) -> FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some(format!("weekly {}% used", tenths * 10)),
+            weekly: Some(format!("weekly {}% left", 100 - tenths * 10)),
             ..SubscriptionDisplay::default()
         }),
         quota: Some(view),
@@ -1298,7 +1309,7 @@ fn a_quota_view_at_rest_costs_nothing_and_a_moved_figure_composes_once() {
     let rule = AT_REST.bottom();
     let at_rest = glass_row(&app, wid, rule);
     assert!(
-        at_rest.contains("\u{2386} main 50%") && at_rest.contains("\u{21ba} Sat 10:00"),
+        at_rest.contains("\u{2386} main 50% left") && at_rest.contains("\u{21ba} Sat 10:00"),
         "the unit and its reset are on the rule: {at_rest:?}"
     );
     for i in 0..30 {
@@ -1329,7 +1340,7 @@ fn a_quota_view_at_rest_costs_nothing_and_a_moved_figure_composes_once() {
     );
     let now = glass_row(&app, wid, rule);
     assert_ne!(now, at_rest, "the moved figure is on the glass");
-    assert!(now.contains("\u{2386} main 60%"), "{now:?}");
+    assert!(now.contains("\u{2386} main 40% left"), "{now:?}");
     for i in 0..30 {
         assert_eq!(cost(&mut app, wid), Cost::default(), "moved, frame {i}");
     }
@@ -1357,7 +1368,7 @@ fn a_quota_view_at_rest_costs_nothing_and_a_moved_figure_composes_once() {
     );
     let stopped = glass_row(&app, wid, rule);
     assert!(
-        stopped.contains("\u{2573} ~Wed 22:00") && stopped.contains("\u{2386} main 60%"),
+        stopped.contains("\u{2573} ~Wed 22:00") && stopped.contains("\u{2386} main 40% left"),
         "the stop is on the glass beside the same figure: {stopped:?}"
     );
     for i in 0..30 {

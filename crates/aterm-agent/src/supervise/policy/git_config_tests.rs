@@ -442,7 +442,9 @@ fn large_index(tag: &str, tail: usize) -> Scratch {
     let entries: Vec<String> = (0..10_000)
         .map(|i| format!("100644,{EMPTY_BLOB},d{i:05}/{tail}"))
         .collect();
-    for batch in entries.chunks(2_000) {
+    // Each run's arguments stay well under Windows' 32767-character command line.
+    let per_run = 24_000 / (entries[0].len() + " --cacheinfo ".len());
+    for batch in entries.chunks(per_run) {
         let mut args = vec!["update-index", "--add"];
         for entry in batch {
             args.extend(["--cacheinfo", entry.as_str()]);

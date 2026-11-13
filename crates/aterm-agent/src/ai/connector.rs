@@ -1239,7 +1239,7 @@ pub const MUSE: Connector = Connector {
         var: None,
         default: ".config/muse",
     },
-    stores: &[".auth.json"],
+    stores: &["auth.json"],
     credential_env: &["META_API_KEY"],
     login: Login::Run {
         args: &["login"],

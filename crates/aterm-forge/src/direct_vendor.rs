@@ -121,6 +121,33 @@ pub(crate) fn review(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Optio
     validate(&root, &facts).map(Some)
 }
 
+/// The `[OB-1]` judgments of the pin itself, which need git alone: the gitlink at
+/// `vendor/astream` is merged, the submodule is checked out at it with no tracked modification,
+/// and the pin did not move back from the one `origin/main` had at the merge-base unless a commit
+/// on the branch gives an `astream-pin-rollback:` reason. These are the same checks, in the same
+/// order, as the full attestation's, so `aterm-verify` can make them before anything builds the
+/// submodule. `Ok(None)` when the index records no gitlink at `vendor/astream`; otherwise the
+/// pinned commit.
+///
+/// # Errors
+/// The first judgment that fails, with its repair, or a git read that failed.
+pub fn astream_pin(root: &Path) -> Result<Option<String>, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("workspace root: {e}"))?;
+    let index = index(&root)?;
+    if !index
+        .iter()
+        .any(|e| e.path == SUBMODULE && e.mode == GITLINK_MODE)
+    {
+        return Ok(None);
+    }
+    let commit = gitlink(&index)?;
+    checked_out_at(&checkout(&root), &commit)?;
+    pin_did_not_move_back(&pin_motion(&root, &index), &commit)?;
+    Ok(Some(commit))
+}
+
 fn capture(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Facts, String> {
     let index = index(root)?;
     Ok(Facts {

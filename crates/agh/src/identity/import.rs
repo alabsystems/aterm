@@ -47,7 +47,7 @@ pub struct ImportRequest {
 /// and provision its answer as `auth add --stdin` would, through `add_with`:
 /// `<config>/agh/tokens/NAME.token` (0600), the login bound with `GET /user`, agh.toml
 /// edited. The answer is held in a `Secret` and never printed or shown. It runs with or
-/// without a terminal, as `auth add` does (owner ruling 2026-10-26).
+/// without a terminal, as `auth add` does.
 ///
 /// # Errors
 ///

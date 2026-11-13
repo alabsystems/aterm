@@ -28,6 +28,7 @@ const CONFIG: &str = "database.json";
 /// The namespace of the dataset a fleet key decides.
 pub(crate) const FLEET_NAMESPACE: &str = "alab";
 const IDENTITY: &str = "identity";
+const JOURNAL: &str = "operations.astream";
 /// Most retained journal bytes in one database generation.
 pub(crate) const MAX_JOURNAL: usize = 128 * 1024 * 1024;
 
@@ -186,6 +187,18 @@ fn missing(dir: &Path, name: &str) -> Result<bool> {
         )),
     }
 }
+/// Bootstrap may create keys only where no retained journal needs its original custody.
+/// A directory, symlink, empty journal or unreadable entry is evidence, not an empty store.
+fn require_no_journal(dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir.join(JOURNAL)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(Error::new(
+            "database journal exists without configuration; restore its original configuration before opening",
+        )),
+    }
+}
+
 fn identity(dir: &Path) -> Result<([u8; 32], Actor)> {
     let judged = private_file::JudgedDir::judge(dir)
         .map_err(|_| Error::new("local database identity missing or not private"))?;
@@ -260,6 +273,7 @@ pub fn init(dir: &Path, namespace: &str) -> Result<()> {
     if !missing(dir, CONFIG)? {
         return Err(Error::new("database already initialized"));
     }
+    require_no_journal(dir)?;
     let (seed, actor) = ensure_identity(dir)?;
     let root_seed = zeroize::Zeroizing::new(crypto::random()?);
     let manifest = Manifest::create(&root_seed, namespace)?;
@@ -349,6 +363,7 @@ pub fn ensure_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<()> {
         }
         return Ok(());
     }
+    require_no_journal(dir)?;
     let (seed, actor) = ensure_identity_in(&judged, dir)?;
     Credentials {
         capability: Capability::issue(&keys.manifest, &keys.root_seed, actor)?,
@@ -415,6 +430,7 @@ pub fn join(dir: &Path, invitation: &[u8], trusted_root: [u8; 32]) -> Result<()>
     if !missing(dir, CONFIG)? {
         return Err(Error::new("database already initialized"));
     }
+    require_no_journal(dir)?;
     let v: Value =
         aterm_json::from_slice(invitation).map_err(|_| Error::new("invalid invitation"))?;
     let manifest = Manifest::decode(&unhex(field(&v, "manifest")?, 256)?)?;
@@ -490,7 +506,11 @@ impl Database {
         let lock = lock(dir)?;
         let mut credentials = Credentials::load(dir)?;
         credentials.no_authority |= no_authority;
-        let log = BrokerLog::open_with(dir.join("operations.astream"), Durability::Strict)?;
+        let log = BrokerLog::open_opts(
+            dir.join(JOURNAL),
+            aterm_journal::resident_options(Durability::Strict),
+            || Ok(astream_broker::Prepared::Nothing),
+        )?;
         if log.stats().retained_bytes > MAX_JOURNAL {
             return Err(Error::new("database journal exceeds generation capacity"));
         }
@@ -567,7 +587,7 @@ impl Database {
         let ordered: std::collections::BTreeSet<Digest> =
             projection.ordered.iter().copied().collect();
         self.history
-            .index
+            .index()
             .inventory()
             .filter_map(|id| {
                 let mut value =
@@ -677,7 +697,7 @@ impl Database {
                 // ancestors is withdrawn. Its retry must use that same projection.
                 let eligible = if matches!(&command, Command::Spend { .. }) && !view.authority_fault
                 {
-                    self.history.index.project().ordered.contains(&id)
+                    self.history.index().project().ordered.contains(&id)
                 } else {
                     view.causal.ordered.contains(&id)
                 };
@@ -719,7 +739,7 @@ impl Database {
                 }
             }
             let projection = if control || matches!(&command, Command::Spend { .. }) {
-                self.history.index.project()
+                self.history.index().project()
             } else {
                 view.causal
             };
@@ -734,7 +754,7 @@ impl Database {
             let previous = projection
                 .ordered
                 .iter()
-                .filter_map(|id| self.history.index.get(id))
+                .filter_map(|id| self.history.index().get(id))
                 .filter(|h| h.actor == actor)
                 .max_by_key(|h| h.sequence);
             let sequence = previous
@@ -742,9 +762,9 @@ impl Database {
                 .ok_or_else(|| Error::new("actor sequence exhausted"))?;
             if self
                 .history
-                .index
+                .index()
                 .inventory()
-                .filter_map(|id| self.history.index.get(id))
+                .filter_map(|id| self.history.index().get(id))
                 .any(|h| h.actor == actor && h.sequence >= sequence)
             {
                 return Err(Error::new(
@@ -1052,7 +1072,7 @@ impl Database {
         if let Some(tip) = through
             && !self
                 .history
-                .index
+                .index()
                 .get(&tip)
                 .is_some_and(|h| h.actor == actor)
         {
@@ -1069,50 +1089,5 @@ impl Database {
 }
 
 #[cfg(test)]
-mod replay_tests {
-    use super::*;
-
-    const SECRET: &[u8] = b"1111111111111111111111111111111111111111";
-
-    /// A build before the `no_authority` mark counted a control record against no quota, and the
-    /// journal it left has to open still, or its rows are out of reach, its rekey included.
-    /// NEGATIVE CONTROL: with replay going through `History::insert`, the open fails:
-    /// `` writer's retained history quota is exhausted ``.
-    #[test]
-    fn control_records_an_earlier_build_kept_past_a_quota_do_not_close_the_folder() {
-        let root = crate::tests::tmp();
-        let victim = root.path().join("victim");
-        ensure_fleet(&victim, SECRET).unwrap();
-        test_forget_no_authority(&victim).unwrap();
-        let keys = FleetKeys::derive(SECRET).unwrap();
-        let cap = Capability::control(&keys.manifest, &keys.root_seed).unwrap();
-        let plain = format!(
-            "{{\"v\":1,\"pad\":\"{}\"}}",
-            "x".repeat(crypto::MAX_BODY - 32)
-        );
-        let mut unmarked = Database::open(&victim).unwrap();
-        let mut previous: Option<Digest> = None;
-        for n in 0..(crate::database::MAX_WRITER_BYTES / crypto::MAX_BODY + 2) as u64 {
-            let parents: Vec<Digest> = previous.into_iter().collect();
-            let wire = crypto::seal(
-                &keys.manifest,
-                &keys.key,
-                &keys.root_seed,
-                &cap,
-                crypto::Causal {
-                    sequence: n + 1,
-                    previous,
-                    parents: &parents,
-                },
-                plain.as_bytes(),
-            )
-            .unwrap();
-            previous = Some(aterm_digest::Sha256::digest(&wire));
-            unmarked.ingest(&wire).unwrap();
-        }
-        drop(unmarked);
-
-        ensure_fleet(&victim, SECRET).unwrap();
-        assert!(Database::open(&victim).is_ok());
-    }
-}
+#[path = "local_replay_tests.rs"]
+mod replay_tests;

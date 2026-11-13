@@ -3037,6 +3037,40 @@ fn a_less_variable_assignment_is_a_hazard() {
     }
 }
 
+/// A line that sets a variable which redirects a reader the classifier keeps (BSD grep's
+/// `GREP_OPTIONS`, MEASURED 2026-11-05 on macOS 27.0.1 to read a file it names; the xcrun shim
+/// `/usr/bin/git`'s `DEVELOPER_DIR`, MEASURED the same day to run `<dir>/usr/bin/xcrun`, and its
+/// `SDKROOT`; python's `PYTHONUSERBASE`, and on Windows its `APPDATA`, below which `site` places
+/// the user site whose `usercustomize` it imports, REASONED from `site`'s source) is not
+/// read-only, as one that sets `RIPGREP_CONFIG_PATH` or `PYTHONPATH` is not.
+#[test]
+fn a_reader_redirecting_assignment_is_a_hazard() {
+    for (line, var) in [
+        (
+            "GREP_OPTIONS='-e x /etc/passwd' grep foo README.md",
+            "GREP_OPTIONS",
+        ),
+        ("export GREP_OPTIONS=-r; grep foo .", "GREP_OPTIONS"),
+        ("env GREP_OPTIONS=-r grep foo .", "GREP_OPTIONS"),
+        ("DEVELOPER_DIR=/tmp/x git status", "DEVELOPER_DIR"),
+        ("SDKROOT=/tmp/x git log -1", "SDKROOT"),
+        ("PYTHONUSERBASE=/tmp/x python3 r.py", "PYTHONUSERBASE"),
+        ("APPDATA=. python3 r.py", "APPDATA"),
+    ] {
+        let v = classify_command(line);
+        assert!(!v.read_only, "{line}");
+        assert!(v.reason.contains(var), "{line}: {}", v.reason);
+    }
+    // NEGATIVE CONTROL: a variable no kept reader reads, or one only spelled alike.
+    for line in [
+        "GREP_COLOR='1;32' grep foo README.md",
+        "MY_GREP_OPTIONS=x cat README.md",
+        "LOCALAPPDATA_X=y cat README.md",
+    ] {
+        assert!(ro(line), "{line}: {:?}", classify_command(line));
+    }
+}
+
 /// `rg --hostname-bin` runs a program, so it is refused as `--pre` is.
 #[test]
 fn rg_hostname_bin_runs_a_program() {

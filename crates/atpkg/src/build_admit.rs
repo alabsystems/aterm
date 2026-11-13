@@ -67,11 +67,15 @@ use crate::build_cache::Tool;
 /// <placed>] <target> [args…]` ([`run_hidden`]): what a `targo` shim's hop execs.
 pub const VERB: &str = aterm_uds::build_front::ADMIT_VERB;
 
-/// What `atpkg __build_admit --capabilities` answers, alone on its line: this atpkg's front takes
+/// What `atpkg __build_admit --capabilities` answers without the reader-query selector,
+/// alone on its line: this atpkg's front takes
 /// the shim hop's words (`--shim <tool> <placed>`) and requires managed explicit targets.
 /// Version-one fronts do not promise that ownership check, so a new shim cannot name them
 /// in its hop ([`crate::build_cache::registered::helper_speaks_hop`]).
 pub const HOP_CAPABILITY: &str = "aterm-build-admit-hop-v2";
+
+#[path = "build_admit_reader.rs"]
+pub mod reader;
 
 #[path = "build_admit_controller.rs"]
 mod controller;
@@ -343,7 +347,7 @@ fn value<'a>(inline: Option<&'a str>, it: &mut dyn Iterator<Item = &'a str>) -> 
 #[must_use]
 pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
     let mut it = args.iter().map(String::as_str).peekable();
-    if tool == Tool::Cargo && it.peek().is_some_and(|a| a.starts_with('+')) {
+    if tool.is_cargo() && it.peek().is_some_and(|a| a.starts_with('+')) {
         it.next();
     }
     let mut verb: Option<&str> = (tool == Tool::Tippy).then_some("tippy");
@@ -412,11 +416,11 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
         return None;
     }
     let program = match tool {
-        Tool::Cargo => "cargo",
+        Tool::Cargo | Tool::CargoCompat => "cargo",
         Tool::Targo | Tool::Tippy => "targo",
     };
     let lane = match tool {
-        Tool::Cargo | Tool::Tippy => true,
+        Tool::Cargo | Tool::CargoCompat | Tool::Tippy => true,
         Tool::Targo => trust || unverified || verb == "tippy",
     };
     if !lane {
@@ -613,8 +617,10 @@ pub enum Admission {
     Claimed(Box<Held>),
     /// An interrupt ended its wait: the build does not start.
     Stopped(Error),
-    /// The ledger or claim is unavailable, or a nested build could wait on work waiting for
-    /// its parent's unproven lock. No build started and no claim was forced.
+    /// The ledger or claim is unavailable, a look that could not wait was short
+    /// ([`Error::Refused`]: a host job's one look, or `--admit now` on a cohort-aware ledger), or
+    /// a nested build could wait on work waiting for its parent's unproven lock. No build started
+    /// and no claim was forced.
     Refused(String),
 }
 
@@ -1012,7 +1018,7 @@ fn admit_for(
             #[cfg(unix)]
             cohort,
         })),
-        Err(e @ Error::Stopped { signal: None, .. }) if possible_lock.is_some() => {
+        Err(e @ Error::Refused(_)) if possible_lock.is_some() => {
             let line = format!(
                 "{SAYS}: {what}: an ancestor has a held build-lock file {}, but its ownership is \
                  unproven; admission would wait ({e}) and could cycle; enter the outer build \
@@ -1030,6 +1036,9 @@ fn admit_for(
                 "{SAYS}: {what}: its memory claim was {e}; it did not start"
             ));
             Admission::Stopped(e)
+        }
+        Err(e @ Error::Refused(_)) => {
+            refuse(say, &format!("{what}: its memory claim was refused, {e}"))
         }
         Err(e) => refuse(say, &format!("{what}: its memory claim failed ({e})")),
     }
@@ -1076,10 +1085,7 @@ fn one_look(
         aterm_capacity::Polled::Admitted(claim) => Ok(claim),
         aterm_capacity::Polled::Waiting(waiter, short) => {
             drop(waiter);
-            Err(Error::Stopped {
-                signal: None,
-                short: Some(short),
-            })
+            Err(Error::short_at_once(short))
         }
         aterm_capacity::Polled::Gone(error) => Err(Error::Ledger(error)),
         aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
@@ -1149,10 +1155,7 @@ fn look_in_turn(
         aterm_capacity::Polled::Admitted(claim) => Ok(claim),
         aterm_capacity::Polled::Waiting(waiter, short) => {
             drop(waiter);
-            Err(Error::Stopped {
-                signal: None,
-                short: Some(short),
-            })
+            Err(Error::short_at_once(short))
         }
         // Its claim file was removed between its entry and its look: no look could admit
         // it, as `admit_waiting` ends such a wait.
@@ -1493,6 +1496,11 @@ fn supervise_launch(
             return Err(e);
         }
     };
+    #[cfg(test)]
+    if REAP_AT_LAUNCH.take() {
+        // As a cohort's capture reaps a root that ended before it (`cohort.rs`, `ended`).
+        let _ = reap_accounted(owned.child_mut());
+    }
     let child = owned.child_mut();
     if let Some(terminal) = terminal.as_ref() {
         let handed = if launch_error.is_some() {
@@ -1597,12 +1605,13 @@ fn supervise_launch(
         || terminal.as_ref().is_some_and(|terminal| {
             terminal.cancelled || terminal.live.as_ref().is_some_and(Cancellation::requested)
         });
-    if let (Some(held), Some(meter)) = (held, meter) {
-        let ended = held.let_go();
-        // The root's own peak, from the reap that consumed its exit: no other child's.
+    // Every claim held ends with its row, metered or not (a root its cohort's capture reaped
+    // ran unmetered): its peak the meter's, never below the root's own, from the reap that
+    // consumed its exit (no other child's), or the root's own alone where no meter ran.
+    if let Some(held) = held {
         let own = owned.child_mut().usage().map_or(0, |usage| usage.maxrss);
-        let peak = meter.stop(own);
-        ended.keep(
+        let peak = meter.map_or(own, |meter| meter.stop(own));
+        held.let_go().keep(
             BuildEnd::judged(status.as_ref().ok().copied(), !cancelled && settled),
             peak,
             say,
@@ -1613,6 +1622,21 @@ fn supervise_launch(
         cancelled,
         settlement,
     })
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Whether this thread's next [`supervise_launch`] reaps its root at once, as a cohort's
+    /// capture does a root that ended before it ([`reap_at_launch`]).
+    static REAP_AT_LAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make this thread's next [`supervise_launch`] reap its root as soon as it is launched, with
+/// its accounting, as a cohort's capture reaps a root that ended before it: the root then runs
+/// unmetered, deterministically.
+#[cfg(all(test, unix))]
+pub(crate) fn reap_at_launch() {
+    REAP_AT_LAUNCH.set(true);
 }
 
 /// REAP the owned `child` with its resource accounting (`wait4`), which it keeps
@@ -2201,7 +2225,9 @@ pub fn run_if_claimed(
 /// `atpkg __build_admit [--shim <tool> <placed>] <target> [args…]`: what a `targo` or
 /// `targo-tippy` shim's hop runs once its block has placed the build ([`VERB`]); `atpkg
 /// __build_admit --capabilities` answers [`HOP_CAPABILITY`] and runs nothing, and
-/// `--lock-capabilities` answers [`crate::trust_lock::LOCK_CAPABILITY`]. In the shim's form, a
+/// `--lock-capabilities` answers [`crate::trust_lock::LOCK_CAPABILITY`]. The separate
+/// [`reader::QUERY_ENV`] selector on that same safe capability entry reports the reader schema and namespace
+/// without taking a claim. In the shim's form, a
 /// tree whose `trust.lock` names a build runs that build's tool in place of `target`
 /// ([`crate::trust_lock::shim_target`]; a lock that does not read, or a build this store does not
 /// hold as it names it, is exit 75 with no build started). The shim's form
@@ -2219,6 +2245,9 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     if let [only] = argv
         && only == "--capabilities"
     {
+        if let Some(answer) = reader::selected_answer() {
+            return answer;
+        }
         println!("{HOP_CAPABILITY}");
         return std::process::ExitCode::SUCCESS;
     }
@@ -2477,7 +2506,7 @@ fn holder_arms_within() -> std::time::Duration {
 }
 
 /// HAND `held`'s CLAIM TO A HOLDER ([`hold`]): this executable, as recorded at its `main`'s first
-/// call and unchanged at its path ([`aterm_uds::tether::executable`]), spawned detached with a copy
+/// call and prepared as helper code ([`aterm_uds::tether::prepared_executable`]), spawned detached with a copy
 /// of the claim's descriptor and the arming pipe, and armed: its pid and then its arming byte
 /// read within [`holder_arms_within`]. Its child, which forks the holder away, is reaped. A
 /// holder that did not arm is let go: the pipe closed under it (so a late arming fails and it
@@ -2489,7 +2518,8 @@ fn hand_over(held: &Held) -> Result<(), String> {
     if held.cohort {
         return Err("native cohort custody cannot transfer to an ordinary holder".into());
     }
-    let exe = aterm_uds::tether::executable().ok_or("no unchanged image of this executable")?;
+    let exe = aterm_uds::tether::prepared_executable()?
+        .ok_or("no prepared helper image of this executable")?;
     let me = std::process::id();
     let serial = i32::try_from(me)
         .ok()
@@ -2534,6 +2564,43 @@ fn hand_over(held: &Held) -> Result<(), String> {
         );
     }
     said
+}
+
+/// Transfer a real scratch-ledger claim through the native holder for qualification.
+/// The caller must keep this process alive until its controller has observed custody.
+///
+/// # Errors
+/// The root is not UTF-8, scratch admission fails, or the holder cannot prepare, spawn or arm.
+#[cfg(all(any(test, debug_assertions), target_os = "macos"))]
+pub fn hand_over_for_test(root: &Path) -> Result<PathBuf, String> {
+    let checkout = root.to_str().ok_or("qualification root is not UTF-8")?;
+    let ledger = Ledger::at(root.join("ledger"));
+    let claim = aterm_capacity::admit_with(
+        &ledger,
+        &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(24, 20, 14)),
+        Need::new("native holder qualification")
+            .mem(1 << 30)
+            .covers(),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .map_err(|error| error.to_string())?;
+    let path = claim.path().to_path_buf();
+    let held = Held {
+        claim,
+        key: Key {
+            stage: "native holder qualification".into(),
+            checkout: checkout.to_owned(),
+            crates: None,
+            variant: None,
+        },
+        own: None,
+        cohort: false,
+    };
+    hand_over(&held)?;
+    held.claim.hand_off();
+    Ok(path)
 }
 
 /// Off macOS no holder runs ([`hold`]): the build runs under its front.

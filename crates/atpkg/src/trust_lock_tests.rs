@@ -9,21 +9,29 @@ use super::*;
 const COMMIT: &str = "29ebb403de7a102850d6cb10a62d5cc3baf723ed";
 
 /// A complete store build `build` under `prefix` whose `bin` holds runnable `targo` and
-/// `targo-tippy` stand-ins that print `build`, and its tree's fold.
+/// `targo-tippy` stand-ins that print `build` (named with the platform's executable suffix, as
+/// [`locked_build`] looks for them), and its tree's fold. Off Unix the stand-ins' modes are
+/// declared beside the build, as an install records them ([`crate::store::declared_modes`]).
 fn store_build(prefix: &Path, build: u64) -> String {
-    let bin = build_dir(prefix, build).join("bin");
+    let dir = build_dir(prefix, build);
+    let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(ready_marker(prefix, build), "ok\n").unwrap();
+    let mut modes = crate::tree::DeclaredModes::new();
     for tool in ["targo", "targo-tippy"] {
-        let path = bin.join(tool);
+        let file = aterm_toolchain::tool_file(tool);
+        let path = bin.join(&file);
         std::fs::write(&path, format!("#!/bin/sh\necho {build}\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        modes.insert(format!("bin/{file}").into_bytes(), 0o755);
     }
-    crate::tree::tree_root(&build_dir(prefix, build)).unwrap()
+    crate::store::write_declared_modes(&dir, &modes).unwrap();
+    let modes = crate::store::declared_modes(&dir).unwrap();
+    crate::tree::tree_root_declared(&dir, &modes).unwrap()
 }
 
 fn lock_of(build: u64, tree_root: &str) -> TrustLock {

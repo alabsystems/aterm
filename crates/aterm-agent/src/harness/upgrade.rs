@@ -461,7 +461,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--json-schema", Arity::One, Fate::Refuse),
     ("--max-budget-usd", Arity::One, Fate::Keep),
     ("--mcp-config", Arity::Many, Fate::Keep),
-    // Kept as launched (owner ruling 2026-11-09): a relaunch carries the launch's own `--model`
+    // Kept as launched: a relaunch carries the launch's own `--model`
     // words in their own spelling and adds none, so a session launched without one comes back on
     // the model its settings name.
     ("--model", Arity::One, Fate::Keep),
@@ -538,7 +538,7 @@ const PERMISSION_FLAGS: &[&str] = &[
     "--permission-mode",
 ];
 
-/// The flag a click on the off chip (`○ yolo`) puts on its line ([`PermissionTo::Bypass`]).
+/// The flag a click on the chip while yolo is off puts on its line ([`PermissionTo::Bypass`]).
 pub(super) const BYPASS_FLAG: &str = "--dangerously-skip-permissions";
 
 /// `argv` (`argv[0]` first) as a click on the chip relaunches it
@@ -1566,12 +1566,255 @@ pub const RELAUNCH_RESTORES: &str = "Work this session ran inside its own proces
      you left one, and start again what you still need.";
 
 /// Child process running under the agent that blocks a restart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     pub pid: u32,
     pub name: String,
     pub age_s: u64,
     pub command: String,
+    /// Where it sits under the agent ([`Seat`]); the default fails closed to work ([`own_of`]).
+    pub seat: Seat,
+    /// The names of every process under a [`Seat::Top`], at any depth.
+    pub under: Vec<String>,
+    /// Whether [`Self::command`] is the command the agent typed, byte for byte: read whole from
+    /// the kernel with no escape and no run of blanks a reader folded. Only such a command is
+    /// handed back to start again.
+    pub exact: bool,
+}
+
+/// Where a held process sits under the agent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Seat {
+    /// Under a child of the agent that is no shell, or its place was not read: nothing above it
+    /// names what it runs for.
+    #[default]
+    Loose,
+    /// A direct child of the agent: one background command of its own.
+    Top,
+    /// Under a [`Seat::Top`], which answers for it.
+    Under,
+}
+
+/// The process names held under an agent: its shells, and a keep-awake.
+pub const BACKGROUND: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "tcsh",
+    "caffeinate",
+];
+
+/// The programs a background wait may run under its shell ([`own_of`]): a clock, a control wait
+/// and read-only probes. Any other name under it is work.
+pub const WAIT_PROGRAMS: &[&str] = &[
+    "sleep", "aterm", "grep", "pgrep", "ls", "stat", "cat", "wc", "date",
+];
+
+/// The most waits one continuation carries ([`own_of`]).
+pub const REARM_NAMED: usize = 8;
+
+/// The longest command a continuation carries.
+pub const REARM_COMMAND_CHARS: usize = 400;
+
+/// The most characters of commands one continuation carries.
+pub const REARM_CHARS: usize = 2_000;
+
+const WAIT_GLUE: &[&str] = &["while", "until", "do", "if", "then", "else", "elif", "!"];
+
+const WAIT_ALONE: &[&str] = &[
+    "done", "fi", "true", "false", ":", "[", "[[", "test", "break", "continue",
+];
+
+const WAIT_PROBES: &[&str] = &[
+    "pgrep", "grep", "ls", "stat", "cat", "wc", "date", "echo", "printf",
+];
+
+const CTL_PROBES: &[&str] = &["status", "sys", "survey", "ls", "waits", "result", "inbox"];
+
+/// Whether `words`, what follows `await` in an `aterm ctl` line, wait on something the same line
+/// waits on again after a gap with nothing missed: a state that holds or does not (`sys`, the
+/// session's `wake`), or a worker's task read from a cursor the line names (`task … since=`).
+/// Every other kind answers a change after it is armed (`seq`, `block`, a `task` from now), so
+/// one that happened while nothing waited is lost: work.
+fn await_starts_again(words: &[&str]) -> bool {
+    let mut words = words.iter().filter(|w| !w.starts_with(['@', '-']));
+    match words.next() {
+        Some(&"sys" | &"wake") => true,
+        Some(&"task") => words.any(|w| w.starts_with("since=")),
+        _ => false,
+    }
+}
+
+/// What one simple command of a background command line is to [`wait_command`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Simple {
+    /// It only waits, and the same words wait again with nothing missed: `sleep`, an
+    /// `aterm ctl … await` of a state or from a cursor ([`await_starts_again`]).
+    Wait,
+    /// It reads and changes nothing: the glue of a poll loop and its probes.
+    Probe,
+    /// Anything else.
+    Work,
+}
+
+fn simple_command(words: &[&str]) -> Simple {
+    let assignment = |w: &str| {
+        w.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut words = words;
+    while let Some((w, rest)) = words.split_first()
+        && (WAIT_GLUE.contains(w) || assignment(w))
+    {
+        words = rest;
+    }
+    let Some((&first, rest)) = words.split_first() else {
+        return Simple::Probe;
+    };
+    if WAIT_ALONE.contains(&first) || WAIT_PROBES.contains(&first) {
+        return Simple::Probe;
+    }
+    match first {
+        "sleep" => Simple::Wait,
+        "kill" if rest.first() == Some(&"-0") => Simple::Probe,
+        _ if first == "aterm" || first.ends_with("/aterm") => {
+            let Some((&"ctl", rest)) = rest.split_first() else {
+                return Simple::Work;
+            };
+            // The verb is the first word that is no target (`@self`) and no option.
+            match rest.iter().position(|w| !w.starts_with(['@', '-'])) {
+                Some(at) if rest[at] == "await" && await_starts_again(&rest[at + 1..]) => {
+                    Simple::Wait
+                }
+                Some(at) if CTL_PROBES.contains(&rest[at]) => Simple::Probe,
+                _ => Simple::Work,
+            }
+        }
+        _ => Simple::Work,
+    }
+}
+
+/// Whether `command`, one background command line of an agent's, only waits: every simple
+/// command of it is a wait (`sleep`, an `aterm ctl … await` of a state or from a cursor), the
+/// glue of a poll loop or a read-only probe, at least one is a wait, and nothing in it writes,
+/// substitutes, groups or detaches. A restart ends such a command and loses only the wait, which
+/// the same line starts again with nothing missed. A follow (`tail -f`) is no such wait: started
+/// again it begins at the file's last lines, so what was written while nothing followed is never
+/// read, and what the ended one had read is gone. Anything it cannot read as a wait is work: it
+/// refuses where unsure.
+#[must_use]
+pub fn wait_command(command: &str) -> bool {
+    if command.trim().is_empty()
+        || command.chars().count() > REARM_COMMAND_CHARS
+        || command.contains(|c: char| c.is_control() || matches!(c, '\\' | '`' | '(' | '{'))
+        || command.contains("<<")
+    {
+        return false;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut words = command.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        match word {
+            "2>&1" | ">/dev/null" | "1>/dev/null" | "2>/dev/null" | "</dev/null" => {}
+            ">" | "1>" | "2>" | "<" if words.peek() == Some(&"/dev/null") => {
+                words.next();
+            }
+            _ => kept.push(word),
+        }
+    }
+    let line = kept.join(" ");
+    if line.contains(['<', '>']) {
+        return false;
+    }
+    let line = line.replace("&&", ";").replace("||", ";").replace('|', ";");
+    if line.contains('&') {
+        return false;
+    }
+    let mut waits = false;
+    for simple in line.split(';') {
+        let words: Vec<&str> = simple.split_whitespace().collect();
+        match simple_command(&words) {
+            Simple::Wait => waits = true,
+            Simple::Probe => {}
+            Simple::Work => return false,
+        }
+    }
+    waits
+}
+
+/// Whether every wait in `now`, the commands of the waits running at the last look before a
+/// signal, is one of `carried`, the commands the continuation hands back, each carried command
+/// answering for one running wait: a second wait on the same command line is not carried by the
+/// first, since the continuation names that line once and one start gives one wait back.
+#[must_use]
+pub fn waits_carried(now: &[String], carried: &[String]) -> bool {
+    let mut left: Vec<&String> = carried.iter().collect();
+    now.iter().all(|w| {
+        left.iter()
+            .position(|c| *c == w)
+            .map(|at| left.swap_remove(at))
+            .is_some()
+    })
+}
+
+/// What of an agent's own runs under it, as a restart reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Own {
+    /// Nothing.
+    None,
+    /// Only waits, each named by the exact command that starts it again.
+    Waits(Vec<String>),
+    /// Work, or anything not proved a wait.
+    Work,
+}
+
+/// Classes what runs under an agent: `held` its shells as the process table names them, `screen`
+/// whether its screen names work no process row does, `unreadable` whether the table or any row
+/// of it went unread. A wait is proved or it is work: a top-level shell whose command is exact
+/// and passes [`wait_command`], with nothing under it but [`WAIT_PROGRAMS`] and shells. A shell
+/// with no top above it, work the screen names, an unread table, more than [`REARM_NAMED`] waits
+/// and more than [`REARM_CHARS`] of commands are all work.
+#[must_use]
+pub fn own_of(held: &[Held], screen: bool, unreadable: bool) -> Own {
+    if screen || unreadable {
+        return Own::Work;
+    }
+    let mut waits = Vec::new();
+    for h in held {
+        match h.seat {
+            Seat::Loose => return Own::Work,
+            Seat::Under => {}
+            Seat::Top => {
+                let quiet_under = h.under.iter().all(|n| {
+                    WAIT_PROGRAMS.contains(&n.as_str()) || BACKGROUND.contains(&n.as_str())
+                });
+                if !h.exact || !quiet_under || !wait_command(&h.command) {
+                    return Own::Work;
+                }
+                waits.push(h.command.clone());
+            }
+        }
+    }
+    if waits.is_empty() {
+        // Nothing held, or only shells under tops this list does not name: none proved.
+        return if held.is_empty() {
+            Own::None
+        } else {
+            Own::Work
+        };
+    }
+    if waits.len() > REARM_NAMED
+        || waits.iter().map(|w| w.chars().count()).sum::<usize>() > REARM_CHARS
+    {
+        return Own::Work;
+    }
+    Own::Waits(waits)
 }
 
 pub const HELD_NAMED: usize = 5;
@@ -1738,16 +1981,82 @@ fn path_middle(word: &str) -> Option<String> {
     (elided.chars().count() < word.chars().count()).then_some(elided)
 }
 
-/// Builds the continuation prompt typed once the relaunched process resumes the session.
+/// What of the agent's own a restart ended over ([`own_yields`]), as its continuation says it
+/// ([`continue_prompt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended<'a> {
+    /// Nothing aterm saw running, or work the agent was asked to bring to a stop first.
+    Nothing,
+    /// Only background waits, each by the exact command that starts it again.
+    Waits(&'a [String]),
+    /// Work, at the deadline the agent was told `told_s` ago: `list` names what still ran.
+    Work { told_s: u64, list: &'a str },
+}
+
+/// What a continuation says of what the restart `ended` ([`continue_prompt`]).
+fn ended_says(ended: Ended<'_>) -> String {
+    match ended {
+        Ended::Nothing => format!("{RESTART_WATCHES} {RELAUNCH_RESTORES}"),
+        Ended::Waits(commands) => {
+            // aterm reads a shell under the agent and cannot tell a background command from a
+            // monitor's: the agent is told to start each the way it ran it.
+            let mut said = format!(
+                "The restart ended {} background wait{} of yours and nothing else. Start each \
+                 again now the way you ran it (a background command, or the Monitor tool where \
+                 it was a monitor):",
+                commands.len(),
+                if commands.len() == 1 { "" } else { "s" }
+            );
+            for (i, command) in commands.iter().enumerate() {
+                let _ = write!(said, " ({}) `{command}`", i + 1);
+            }
+            said.push('.');
+            said
+        }
+        Ended::Work { told_s, list } => {
+            let what = if list.is_empty() {
+                "what still ran inside your own process".to_string()
+            } else {
+                format!("what still ran under you: {list}")
+            };
+            format!(
+                "The restart came at the deadline aterm told you {} ago and ended {what}. \
+                 {RELAUNCH_RESTORES}",
+                span(told_s)
+            )
+        }
+    }
+}
+
+/// Builds the continuation prompt typed once the relaunched process resumes the session: where
+/// the restart `ended` background work of the agent's own, it carries each wait's command to
+/// start again, or names the work that ended at its deadline.
 #[must_use]
-pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> String {
+pub fn continue_prompt(
+    from: &Version,
+    to: &Version,
+    ran: Option<&str>,
+    ended: Ended<'_>,
+) -> String {
     let resumed = match ran {
         Some(model) => format!("; it ran {model} before the restart and was resumed"),
         None => " and resumed".to_string(),
     };
+    let restores = ended_says(ended);
     format!(
         "{HARNESS_MARK} Upgraded: this session was restarted on Claude Code {to} (from \
-         {from}){resumed}. {RESTART_WATCHES} {RELAUNCH_RESTORES} {CARRY_ON}"
+         {from}){resumed}. {restores} {CARRY_ON}"
+    )
+}
+
+/// [`continue_prompt`] where a version it would name was not read: what the restart `ended` is
+/// owed its line all the same, so it is said without them.
+#[must_use]
+pub fn ended_prompt(ended: Ended<'_>) -> String {
+    format!(
+        "{HARNESS_MARK} Upgraded: this session was restarted on a newer Claude Code and \
+         resumed. {} {CARRY_ON}",
+        ended_says(ended)
     )
 }
 
@@ -3764,12 +4073,22 @@ pub struct Facts {
     pub own_hold_s: u64,
     /// How many times this round's target was told to the agent ([`Step::Tell`]).
     pub tells: u32,
-    /// How long ago the last tell, about this target or an earlier one, was typed (`u64::MAX`
-    /// when none was): a retarget starts the count again, not the rest.
-    pub told_s: u64,
+    /// Whether all that runs under the agent is background waits, each proved one and named by
+    /// the command that starts it again ([`Own::Waits`]).
+    pub waits_only: bool,
+    /// Whether a deadline stands for this process: a line that reached it named one
+    /// ([`Step::Tell`]), about this target or an earlier one (a retarget never tells it another),
+    /// and no look since has voided it ([`deadline_voids`]).
+    pub deadline_set: bool,
+    /// Whether that deadline has passed.
+    pub work_due: bool,
     /// Whether the session's autopilot carries it on its own (Cruise or Land), so a line the
     /// quiet upgrade types is read by an agent that keeps working, not a person.
     pub may_tell: bool,
+    /// Whether nothing is typed into the session before a move though its autopilot carries it:
+    /// its task finished or landed. No deadline is told there ([`tell_due`]); the round still
+    /// moves over proved waits and past a deadline told before ([`own_yields`]).
+    pub silent: bool,
     pub press: Press,
 }
 
@@ -4148,14 +4467,16 @@ pub const RETRY_S: u64 = MAX_ASKS as u64 * REASK_S;
 
 const _: () = assert!(RETRY_S >= REASK_S);
 
-/// How long the agent's own work holds a quiet round at [`Rung::Land`] before the agent is told.
-pub const OWN_TELL_S: u64 = 2 * DRAIN_S;
+/// How long the agent's real work holds a quiet round before it is told its deadline.
+pub const WORK_TELL_S: u64 = 10 * 60;
 
-/// The most times one target build is told to one session.
-pub const MAX_TELLS: u32 = 3;
+/// How long after that line the restart waits for the work to end by itself.
+pub const WORK_DEADLINE_S: u64 = 2 * DRAIN_S;
 
-/// The least time between two of them.
-pub const RETELL_S: u64 = RETRY_S;
+/// The one line a process is told.
+pub const MAX_TELLS: u32 = 1;
+
+const _: () = assert!(WORK_TELL_S + WORK_DEADLINE_S < RUNG_LAND_S);
 
 pub const RETRY_BACKOFF_MAX_SHIFT: u32 = 2;
 
@@ -4210,7 +4531,8 @@ pub enum Step {
     Fresh,
     Rearm,
     /// The quiet upgrade's one line to an agent whose own work holds the move (the wait word):
-    /// what waits and when it moves ([`tell_prompt`]). It asks nothing and ends nothing.
+    /// what waits, and the deadline after which the restart goes at its first turn end and ends
+    /// what still runs ([`tell_prompt`], [`WORK_DEADLINE_S`]). It asks nothing.
     Tell(&'static str),
 }
 
@@ -4392,7 +4714,7 @@ pub fn quiet_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Option<S
     if f.login {
         return Some(Step::Wait("login"));
     }
-    let wait = if f.background_point {
+    let wait = if f.background_point && own_yields(f).is_none() {
         "background"
     } else {
         match quiet_move(f) {
@@ -4416,8 +4738,47 @@ pub fn quiet_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Option<S
     Some(Step::Wait(wait))
 }
 
+/// Why a quiet round moves over what the agent runs under it ([`own_yields`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Yield {
+    /// Only waits run, each started again from its command after the resume.
+    Waits,
+    /// The deadline the agent was told has passed.
+    Deadline,
+}
+
+/// Whether a quiet round, in a session its autopilot carries, moves over the agent's own
+/// background work: at once where only proved waits run ([`Facts::waits_only`]), and past the
+/// deadline it was told where work does ([`Facts::work_due`]). Where no autopilot carries the
+/// session at this look ([`Facts::may_tell`] clear: the tab's Autopilot off, a guard of its
+/// loop's holding the point for a person or a manager, a lane that reads neither) nothing may be
+/// typed, so neither holds and the hold stays. Real work under a session whose task finished or
+/// landed ([`Facts::silent`]) is told no deadline, so it holds too unless one was told before.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeQuiet",
+        action = "MoveOverOwn",
+        project = "aterm_agent::harness::upgrade_drive::quiet_projection"
+    )
+)]
+pub fn own_yields(f: &Facts) -> Option<Yield> {
+    if !f.quiet || !f.may_tell || f.taskless {
+        return None;
+    }
+    if f.waits_only {
+        Some(Yield::Waits)
+    } else if f.work_due {
+        Some(Yield::Deadline)
+    } else {
+        None
+    }
+}
+
 /// Whether the quiet move may go now: the session at a genuine idle point with nothing of its
-/// own running under it ([`quiet_step`]).
+/// own running under it, or at a point where what runs under it yields ([`own_yields`]): there
+/// only a person, a wall and a running turn hold it ([`quiet_step`]).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -4428,12 +4789,17 @@ pub fn quiet_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Option<S
     )
 )]
 pub fn quiet_move(f: &Facts) -> Gate {
-    restart_gate(f, f.owner_now && status_lags(f))
+    match own_yields(f) {
+        Some(_) => gate(f, status_lags(f)),
+        None => restart_gate(f, f.owner_now && status_lags(f)),
+    }
 }
 
-/// Whether a quiet round is owed its line to the agent ([`Step::Tell`]): still pending at
-/// [`Rung::Land`], its move held by the agent's own work for [`OWN_TELL_S`], in a session its
-/// autopilot carries, told fewer than [`MAX_TELLS`] times and no tell within [`RETELL_S`].
+/// Whether a quiet round is owed its line to the agent ([`Step::Tell`]): still pending, its move
+/// held by the agent's real work for [`WORK_TELL_S`], in a session its autopilot carries and
+/// types into ([`Facts::silent`] clear), and no deadline standing for the process
+/// ([`MAX_TELLS`], [`Facts::deadline_set`]). Waits alone are never told: the round moves over
+/// them ([`own_yields`]).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -4446,12 +4812,37 @@ pub fn quiet_move(f: &Facts) -> Gate {
 pub fn tell_due(phase: &Phase, f: &Facts) -> bool {
     f.quiet
         && f.may_tell
+        && !f.silent
         && !f.taskless
         && *phase == Phase::Pending
-        && rung_in_force(f) == Rung::Land
-        && f.own_hold_s >= OWN_TELL_S
+        && !f.waits_only
+        && !f.deadline_set
+        && f.own_hold_s >= WORK_TELL_S
         && f.tells < MAX_TELLS
-        && f.told_s >= RETELL_S
+}
+
+/// Whether look `f` voids the deadline that stands for the process ([`Facts::deadline_set`]). A
+/// deadline is over one hold by the agent's own work, unbroken as the looks read it: a look that
+/// finds a person ([`person_seen`]) or a wall (a usage limit, the login wall) voids it, because
+/// the time they hold is not the agent's to finish or save its work in and what it starts for
+/// them was named by no line; and so does an idle look with nothing of the agent's own running,
+/// because the work the line named is over and what starts later is other work. The hold starts
+/// again from there ([`Facts::own_hold_s`]), and work that holds the round [`WORK_TELL_S`] more
+/// is told its own deadline. The drive voids before it steps, so the look that voids neither
+/// moves on that deadline nor counts its line.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeQuiet",
+        action = "DeadlineVoids",
+        project = "aterm_agent::harness::upgrade_drive::quiet_projection"
+    )
+)]
+pub fn deadline_voids(f: &Facts) -> bool {
+    let nothing_runs =
+        !f.background_point && f.status == "idle" && f.background.is_empty() && !f.waits_only;
+    f.deadline_set && (f.limited || f.login || person_seen(f) || nothing_runs)
 }
 
 /// Whether a look finds a person at the session: their box, draft or hold, their keys, or a key of
@@ -4610,22 +5001,53 @@ pub fn own_words(draft: &str) -> bool {
         .any(|head| draft.starts_with(&upgrade_compact(head)))
 }
 
-/// The quiet upgrade's line to an agent whose own work has held its move `held_s` ([`Step::Tell`]):
-/// a fact, not a request. With `verb`, it also names the restart the agent may run itself, and
-/// what that ends.
+/// What a tell says of one session ([`tell_prompt`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Telling<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    /// How long the agent's own work has held the move.
+    pub held_s: u64,
+    /// How long from now the restart waits for that work ([`WORK_DEADLINE_S`]).
+    pub deadline_s: u64,
+    /// What runs under the agent, as the process table names it.
+    pub held: &'a [Held],
+    /// Whether the line names the restart the agent may run itself.
+    pub verb: bool,
+}
+
+/// The quiet upgrade's one line to an agent whose own work has held its move ([`Step::Tell`]):
+/// the deadline after which aterm restarts it at its first turn end, and what that ends. It asks
+/// for no answer. With [`Telling::verb`], it also names the restart the agent may run itself.
 #[must_use]
-pub fn tell_prompt(agent: Agent, from: &str, to: &str, held_s: u64, verb: bool) -> String {
+pub fn tell_prompt(agent: Agent, telling: &Telling<'_>) -> String {
+    let Telling {
+        from,
+        to,
+        held_s,
+        deadline_s,
+        held,
+        verb,
+    } = *telling;
     let product = agent.product();
+    let list = held_list(held);
+    let ends = if list.is_empty() {
+        "what still runs inside it then (a workflow, a subagent, a background task) ends"
+            .to_string()
+    } else {
+        format!("what still runs under it then ends: {list}")
+    };
     let line = format!(
-        "{TELL_HEAD}{product} {to} is installed and this session runs {from}; its own running \
-         work has held the move for {}. aterm moves this conversation onto {to} at a turn end with \
-         no shell, workflow or subagent of its own running",
-        span(held_s)
+        "{TELL_HEAD}{product} {to} is installed and this session runs {from}; work of its own \
+         has held the move for {}. aterm restarts this conversation onto {to} at its first turn \
+         end {} from now, and {ends}. Let it finish or save it before then.",
+        span(held_s),
+        span(deadline_s)
     );
     if verb {
-        format!("{line}; `aterm ctl @self restart` moves it sooner and ends any still running.")
+        format!("{line} `aterm ctl @self restart` moves it sooner and ends the same work.")
     } else {
-        format!("{line}.")
+        line
     }
 }
 
@@ -4656,9 +5078,11 @@ pub fn release_prompt(agent: Agent, quiet: bool) -> String {
         project = "aterm_agent::harness::upgrade_drive::progress_projection"
     )
 )]
-/// Downgrades a restart step to `Wait("circuit-breaker")` when the circuit breaker is open.
-pub fn break_step(step: Step) -> Step {
+/// Holds a step to a break of the agent's own background work: a restart there waits
+/// (`background`), unless the quiet round moves over that work at look `f` ([`own_yields`]).
+pub fn break_step(step: Step, f: &Facts) -> Step {
     match step {
+        Step::Terminate if own_yields(f).is_some() => Step::Terminate,
         Step::Announce
         | Step::GiveUp
         | Step::Void(_)

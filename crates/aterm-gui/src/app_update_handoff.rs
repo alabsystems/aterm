@@ -103,84 +103,8 @@ impl App {
 }
 
 #[cfg(test)]
-mod boundary_wait_tests {
-    use super::{
-        BOUNDARY_WAIT_SINCE, MAX_BOUNDARY_WAIT, boundary_wait_decision, end_boundary_wait,
-    };
-    use crate::app_update_handoff_boundary::GuardedItem;
-    use std::time::{Duration, Instant};
-
-    /// While a non-idempotent item holds the guard, the handoff is refused, never cutting it in
-    /// half: as activity within the budget, and for this try at it, which ends the try's wait.
-    #[test]
-    fn the_handoff_follows_a_held_item_for_at_most_the_budget() {
-        end_boundary_wait();
-        let start = Instant::now();
-        let item = Some(GuardedItem::ClonePublishRename);
-        // The item holds the guard; the handoff follows it at first and as the wait grows, up to
-        // just under the budget.
-        let first = boundary_wait_decision(item, start).expect("held");
-        assert!(first.contains("follows it"), "{first}");
-        let near = start + MAX_BOUNDARY_WAIT - Duration::from_millis(1);
-        assert!(boundary_wait_decision(item, near).is_some_and(|why| why.contains("follows it")));
-        // At the budget this try is refused, even though nothing was cut, and its wait ends.
-        let at = start + MAX_BOUNDARY_WAIT;
-        let spent = boundary_wait_decision(item, at).expect("never proceeds over a held item");
-        assert!(spent.contains("next check"), "{spent}");
-        assert_eq!(BOUNDARY_WAIT_SINCE.with(std::cell::Cell::get), None);
-        end_boundary_wait();
-    }
-
-    /// The control: no item holds the guard, so the handoff is never held and nothing waits.
-    #[test]
-    fn a_free_guard_holds_nothing() {
-        end_boundary_wait();
-        assert!(boundary_wait_decision(None, Instant::now()).is_none());
-        assert_eq!(BOUNDARY_WAIT_SINCE.with(std::cell::Cell::get), None);
-    }
-
-    /// One budget for the whole try: an item the start waited on, then another that took the
-    /// guard after the start, hold the handoff at most [`MAX_BOUNDARY_WAIT`] together, across the
-    /// start and the Commit. A free reading between them keeps the try's wait; past the budget the
-    /// Commit is refused for this try, never given a fresh 10 s, and the next check starts afresh.
-    /// Before, the start that reached the budget let the handoff go and the Commit began a new
-    /// budget, so while the item stayed in its section the Commit was never written and the
-    /// design's "at most 10 s across both" did not hold.
-    #[test]
-    fn one_item_holds_the_handoff_at_most_the_budget_across_start_and_commit() {
-        end_boundary_wait();
-        let t0 = Instant::now();
-        let item = Some(GuardedItem::SignOutSequence);
-        assert!(
-            boundary_wait_decision(item, t0).is_some(),
-            "the start follows the item in its section"
-        );
-        // The item lets go: the start goes on, and the try's wait stands.
-        assert!(boundary_wait_decision(None, t0 + Duration::from_secs(4)).is_none());
-        // Another item takes the guard after the start: the Commit follows it within what is
-        // left of the one budget...
-        let commit = boundary_wait_decision(item, t0 + Duration::from_secs(8));
-        assert!(
-            commit
-                .as_deref()
-                .is_some_and(|why| why.contains("follows it")),
-            "{commit:?}"
-        );
-        // ...and past it is refused for this try, not held for a fresh budget.
-        let commit = boundary_wait_decision(item, t0 + MAX_BOUNDARY_WAIT + Duration::from_secs(2));
-        assert!(
-            commit
-                .as_deref()
-                .is_some_and(|why| why.contains("next check")),
-            "the Commit held a fresh budget for an item the try already waited the whole budget \
-             on: {commit:?}"
-        );
-        // The updater's next check is a new try, with a new budget.
-        let next = t0 + MAX_BOUNDARY_WAIT + Duration::from_secs(30);
-        assert!(boundary_wait_decision(item, next).is_some_and(|why| why.contains("follows it")));
-        end_boundary_wait();
-    }
-}
+#[path = "app_update_handoff_boundary_wait_tests.rs"]
+mod boundary_wait_tests;
 
 #[cfg(clean_islands)]
 #[path = "app_update_handoff_island.rs"]
@@ -472,10 +396,6 @@ pub(crate) enum SameImageHandoff {
 
 impl SameImageHandoff {
     #[must_use]
-    #[cfg_attr(
-        not(unix),
-        expect(dead_code, reason = "only the unix handoff lanes ask")
-    )]
     pub(crate) const fn renews_launch_record(self) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -834,6 +754,32 @@ struct HandoffCommitFacts {
     commit_channel: bool,
 }
 
+/// The callback-free Commit edge's second read of the mutable facts that can revoke it.
+///
+/// The broader [`HandoffCommitFacts`] are collected before activation, audit and setup callbacks.
+/// Those callbacks may re-enter the app, and AppKit can begin waiting for a native-termination
+/// reply before its wake reaches the app at all. This pair is therefore read again under the
+/// final claim guards, immediately before the atomic Commit write.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinalHandoffCommitGate {
+    exact_activity: bool,
+    teardown_allows_commit: bool,
+}
+
+#[cfg(unix)]
+impl FinalHandoffCommitGate {
+    #[must_use]
+    const fn admitted(self) -> bool {
+        self.exact_activity && self.teardown_allows_commit
+    }
+
+    fn fold_into(self, facts: &mut HandoffCommitFacts) {
+        facts.exact_activity &= self.exact_activity;
+        facts.teardown_allows_commit &= self.teardown_allows_commit;
+    }
+}
+
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -917,6 +863,25 @@ pub(crate) type AgentCarry = (
     Option<(u32, String)>,
     Option<Box<crate::restore::LostRestore>>,
 );
+
+/// Whether the handoff's deferred `teardown` lets Commit go: no close or native quit is held
+/// behind it, and AppKit waits on no quit's reply (`appkit_awaits_quit_reply`). Commit ends this
+/// process at once, and a quit AppKit waits on is answered only by the event loop's exit, after
+/// the run's end, or by its cancel; so while AppKit waits Commit is refused, the handoff returns,
+/// and its replay answers the quit: a clean quit's replay exits the loop (AppKit hears YES after
+/// the run's end), and a teardown with nothing held cancels the quit pending (AppKit hears NO).
+#[cfg(unix)]
+#[must_use]
+const fn teardown_allows_commit(
+    teardown: &crate::DeferredHandoffTeardown,
+    appkit_awaits_quit_reply: bool,
+) -> bool {
+    !appkit_awaits_quit_reply
+        && matches!(
+            teardown,
+            crate::DeferredHandoffTeardown::None | crate::DeferredHandoffTeardown::CleanQuitReady
+        )
+}
 
 #[cfg(unix)]
 #[must_use]
@@ -1500,6 +1465,33 @@ pub(crate) fn handoff_masters_closed(live: &[(u64, i32, i32)]) -> bool {
 #[cfg(unix)]
 const HANDOFF_MASTER_DEAD: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
+/// The sessions of `live` whose master has hung up: their command exited, whatever their reader
+/// has booked yet.
+#[cfg(unix)]
+pub(crate) fn handoff_dead_masters(live: &[(u64, i32, i32)]) -> Vec<u64> {
+    let mut fds = live
+        .iter()
+        .map(|(_, fd, _)| libc::pollfd {
+            fd: *fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect::<Vec<_>>();
+    if fds.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: initialized stable pollfd slice; timeout 0 is a non-consuming peek.
+    let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+    if polled <= 0 {
+        return Vec::new();
+    }
+    live.iter()
+        .zip(&fds)
+        .filter(|(_, fd)| fd.revents & HANDOFF_MASTER_DEAD != 0)
+        .map(|((session, _, _), _)| *session)
+        .collect()
+}
+
 #[cfg(unix)]
 fn peek_handoff_masters(live: &[(u64, i32, i32)], hit: impl Fn(libc::c_short) -> bool) -> bool {
     let mut fds = live
@@ -1697,6 +1689,8 @@ pub(crate) struct ColdLaneBudget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedFailures {
     pub(crate) cycles: u8,
+    /// `AutoOverlapRetry::epoch_failures`: where the next failure falls in its epoch.
+    pub(crate) epoch_failures: u8,
     pub(crate) since_secs: u64,
     pub(crate) activation: bool,
 }
@@ -1716,6 +1710,7 @@ impl ColdLaneBudget {
         let mut fields = vec![format!("build={build}"), format!("artifact={artifact}")];
         if let Some(failures) = self.failures {
             fields.push(format!("cycles={}", failures.cycles));
+            fields.push(format!("epoch={}", failures.epoch_failures));
             fields.push(format!("since={}", failures.since_secs));
             fields.push(format!("activation={}", u8::from(failures.activation)));
         }
@@ -1759,6 +1754,12 @@ impl ColdLaneBudget {
             (!cycles.is_empty() && cycles.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
             Some(CarriedFailures {
                 cycles: cycles.parse().ok()?,
+                // A parent that wrote no `epoch` ran a build whose epochs were all one length: its
+                // count opens an epoch here, so it costs at most one quick retry.
+                epoch_failures: match field("epoch") {
+                    None => 0,
+                    Some(epoch) => u8::try_from(uint(epoch)?).ok()?,
+                },
                 since_secs: uint(field("since")?)?,
                 activation: flag("activation")?,
             })
@@ -4304,43 +4305,8 @@ fn reserve_child_only_masters(live: &[(u64, i32, i32)]) -> std::io::Result<Child
 }
 
 #[cfg(all(test, unix))]
-pub(crate) mod ledger_writers {
-    use std::sync::{Condvar, Mutex, PoisonError};
-
-    static IN_FLIGHT: Mutex<usize> = Mutex::new(0);
-    static LANDED: Condvar = Condvar::new();
-
-    /// One writer in flight, until it is dropped.
-    pub(crate) struct InFlight(());
-
-    impl InFlight {
-        pub(crate) fn enter() -> Self {
-            *IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-            Self(())
-        }
-    }
-
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
-            *in_flight -= 1;
-            drop(in_flight);
-            LANDED.notify_all();
-        }
-    }
-
-    /// Block until no detached ledger writer is in flight.
-    pub(crate) fn wait_until_landed() {
-        let in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
-        let (_in_flight, waited) = LANDED
-            .wait_timeout_while(in_flight, std::time::Duration::from_secs(60), |n| *n > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            !waited.timed_out(),
-            "a detached update-ledger writer never finished"
-        );
-    }
-}
+#[path = "app_update_handoff_ledger_writers_tests.rs"]
+pub(crate) mod ledger_writers;
 
 /// The dry run's whole window.
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -4501,85 +4467,8 @@ impl HandoffUnavailable {
 }
 
 #[cfg(all(test, unix))]
-pub(crate) mod park_budget_for_test {
-    use std::cell::Cell;
-    use std::sync::{Condvar, Mutex, PoisonError};
-    use std::time::Duration;
-
-    thread_local! {
-        static REAL: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// A test park's deadline unless [`real`] is held: a hang detector.
-    pub(crate) const HANG_DETECTOR: Duration = Duration::from_secs(60);
-
-    /// Holds the real budget on this thread until dropped.
-    #[must_use = "the park runs on the real budget only while the guard is held"]
-    pub(crate) struct Real(());
-
-    impl Drop for Real {
-        fn drop(&mut self) {
-            REAL.with(|real| real.set(false));
-        }
-    }
-
-    pub(crate) fn real() -> Real {
-        REAL.with(|real| real.set(true));
-        Real(())
-    }
-
-    /// The budget the park's deadline is stamped from.
-    pub(crate) fn deadline_budget(budget: Duration) -> Duration {
-        if REAL.with(Cell::get) {
-            budget
-        } else {
-            HANG_DETECTOR
-        }
-    }
-
-    static WATCHED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
-    static GAVE_UP: Condvar = Condvar::new();
-
-    fn address<T>(lock: &Mutex<T>) -> usize {
-        std::ptr::from_ref(lock).addr()
-    }
-
-    /// A bounded take of `lock` ran past its deadline.
-    pub(super) fn gave_up<T>(lock: &Mutex<T>) {
-        let at = address(lock);
-        let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
-        for (watched_at, gave_up) in watched.iter_mut() {
-            if *watched_at == at {
-                *gave_up = true;
-            }
-        }
-        GAVE_UP.notify_all();
-    }
-
-    /// Watch `lock` from now.
-    pub(crate) fn watch<T>(lock: &Mutex<T>) {
-        WATCHED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((address(lock), false));
-    }
-
-    /// Blocks until a bounded take of the [`watch`]ed `lock` has given up, and stops watching it.
-    pub(crate) fn wait_gave_up<T>(lock: &Mutex<T>) {
-        let at = address(lock);
-        let watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut watched, waited) = GAVE_UP
-            .wait_timeout_while(watched, HANG_DETECTOR, |watched| {
-                !watched.contains(&(at, true))
-            })
-            .unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            !waited.timed_out(),
-            "no bounded take of the watched lock gave up"
-        );
-        watched.retain(|(watched_at, _)| *watched_at != at);
-    }
-}
+#[path = "app_update_handoff_park_budget_for_test_tests.rs"]
+pub(crate) mod park_budget_for_test;
 
 impl App {
     /// Whether the overlap handoff can run here.
@@ -4631,6 +4520,24 @@ impl App {
         same_image: Option<SameImageHandoff>,
     ) -> Result<(), crate::UpdateHandoffStartError> {
         if self.account_drain_pending() {
+            #[cfg(unix)]
+            if self.account_drain_holds_a_renewal() {
+                if mode.is_automatic() {
+                    return Err(crate::UpdateHandoffStartError::activity(
+                        crate::native_update_lane_hold::LaneHold::LaunchRecordRenewal,
+                        "a launch-record renewal's handoff waits on account work; the update follows it",
+                    ));
+                }
+                self.press_takes_the_renewal_s_place(
+                    crate::app_account_work::Continuation::Handoff {
+                        mode,
+                        attempt: apply_attempt,
+                        same_image,
+                        next_attempt: self.next_update_handoff_id,
+                    },
+                );
+                return Ok(());
+            }
             return Err(crate::UpdateHandoffStartError::refused(
                 "account work is already draining for a shutdown or update",
             ));
@@ -4651,6 +4558,7 @@ impl App {
             next_attempt: self.next_update_handoff_id,
         }) {
             return if self.account_drain_unavailable() {
+                self.disarm_failed_account_handoff();
                 Err(crate::UpdateHandoffStartError::failed(
                     "account work settlement is unavailable; admission remains closed",
                 ))
@@ -4719,13 +4627,21 @@ impl App {
                 },
             ));
         }
+        // aterm's own password sheet holds the handoff while it stands. One nobody has touched
+        // for its backstop is refused, but only by an update's apply (never a launch-record
+        // renewal's) and only once nothing else checked here holds this attempt, so a `sudo` is
+        // never failed for an attempt that would not go anyway.
         #[cfg(target_os = "macos")]
-        if self.askpass_sheet.is_some() {
-            return Err(crate::UpdateHandoffStartError::activity(
-                crate::native_update_lane_hold::LaneHold::PasswordPrompt,
-                "a sudo password prompt is still open",
-            ));
-        }
+        let refuse_sheet = match self.askpass_sheet_untouched_overdue(std::time::Instant::now()) {
+            None => false,
+            Some(true) if apply_attempt.is_some() => true,
+            Some(_) => {
+                return Err(crate::UpdateHandoffStartError::activity(
+                    crate::native_update_lane_hold::LaneHold::PasswordPrompt,
+                    "a sudo password prompt is still open",
+                ));
+            }
+        };
         if let Some(hold) = self.system_state_handoff_hold() {
             let words = if hold == crate::native_update_lane_hold::LaneHold::DeveloperTools {
                 "a Command Line Tools install's tab is still running"
@@ -4753,6 +4669,19 @@ impl App {
             #[cfg(not(unix))]
             return Err(crate::UpdateHandoffStartError::refused(
                 "a new tab is still starting",
+            ));
+        }
+        // The refusing attempt still holds on the sheet, so the `sudo` that asked settles before
+        // the next attempt parks, never in the middle of a handoff.
+        #[cfg(target_os = "macos")]
+        if refuse_sheet {
+            return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::PasswordPrompt,
+                if self.refuse_untouched_askpass_sheet(std::time::Instant::now()) {
+                    "an untouched sudo password prompt was refused; the next attempt goes on"
+                } else {
+                    "a sudo password prompt is still open"
+                },
             ));
         }
         let build = crate::build_info::build_number()
@@ -4893,6 +4822,7 @@ impl App {
     pub(crate) fn prepare_cold_exec(&mut self, build: u64, same_image: bool, automatic: bool) {
         self.note_update_switch_started(build, same_image, automatic);
         self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
+        let _ = crate::requests_host::flush_within(crate::requests_host::FLUSH_WAIT);
         self.consent_observer.stop();
         if !aterm_pty::wait_for_reaps(COLD_EXEC_REAP_WAIT) {
             aterm_log::warn!(
@@ -5498,7 +5428,12 @@ impl App {
             );
         }
         let policy_unread = apply_attempt.is_some() && same_image.is_none() && !park_policy.known;
-        if let Some(wait) = self.fork_lane_policy_wait(mode, target_build, policy_unread) {
+        let target_dmg_sha256 = apply_attempt
+            .as_ref()
+            .and_then(|attempt| crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256()));
+        if let Some(wait) =
+            self.fork_lane_policy_wait(mode, target_build, target_dmg_sha256, policy_unread)
+        {
             return Err(wait);
         }
         if policy_unread {
@@ -5701,6 +5636,39 @@ impl App {
             ));
         }
         Ok(())
+    }
+
+    /// Book exited each handed session whose master has stood hung up for
+    /// [`PANE_EXITED_BACKSTOP`] of automatic attempts with no exit from its reader, as that exit
+    /// would book it first (`App::exit_session_logical`). It then leaves
+    /// [`Self::handoff_live_sessions`] and its pane travels as a held pane with the screen it
+    /// has; a dead master is never handed over as live, and the reader's exit, when it comes,
+    /// retires it as it would have.
+    #[cfg(unix)]
+    pub(crate) fn book_hung_up_sessions(&mut self, now: std::time::Instant) {
+        let dead = handoff_dead_masters(&self.handoff_live_sessions());
+        let hung_up = &mut self.lane_hold_clocks.hung_up;
+        hung_up.retain(|session, _| dead.contains(session));
+        for session in &dead {
+            hung_up.entry(*session).or_insert(now);
+        }
+        let overdue = hung_up
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= PANE_EXITED_BACKSTOP)
+            .map(|(session, _)| *session)
+            .collect::<Vec<_>>();
+        for session in overdue {
+            aterm_log::info!(
+                "update: session {session}'s command exited at least {}s ago and its reader has \
+                 not retired it; it is booked exited, so its pane travels as a held pane",
+                PANE_EXITED_BACKSTOP.as_secs()
+            );
+            self.store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_state(session, crate::session_store::SessionState::Exited);
+            self.lane_hold_clocks.hung_up.remove(&session);
+        }
     }
 
     /// The sessions an overlap handoff hands over, as `(local_id, master, pid)`.
@@ -7579,10 +7547,8 @@ impl App {
         let pending_hold_serials = pending.hold_serials;
         let pending_carried_claims = pending.carried_claims.clone();
         let arbiter = pending.arbiter.clone();
-        let teardown_allows_commit = matches!(
-            pending.teardown,
-            crate::DeferredHandoffTeardown::None | crate::DeferredHandoffTeardown::CleanQuitReady
-        );
+        let teardown_allows_commit =
+            teardown_allows_commit(&pending.teardown, crate::menu::appkit_awaits_quit_reply());
         let (commit_hold_serials, hold_fence) = match held_fence {
             Some(fence) => (fence.serials(), fence),
             None => self.fence_hold_serials(successor_reads_fabric_carry(
@@ -7692,6 +7658,31 @@ impl App {
             commit_channel,
         };
         Some((facts, native_safety, proof, arbiter, hold_fence))
+    }
+
+    /// Revalidate the handoff facts that callbacks can revoke at the final no-callback edge.
+    ///
+    /// `appkit_awaits_quit_reply` is main-thread-local: after this method returns, no callback
+    /// runs before the Commit write, so AppKit cannot enter `NSTerminateLater` in that interval.
+    #[cfg(unix)]
+    fn final_handoff_commit_gate(&self, attempt_id: u64) -> FinalHandoffCommitGate {
+        let Some(pending) = self
+            .pending_update_handoff
+            .as_ref()
+            .filter(|pending| pending.attempt_id == attempt_id)
+        else {
+            return FinalHandoffCommitGate {
+                exact_activity: false,
+                teardown_allows_commit: false,
+            };
+        };
+        FinalHandoffCommitGate {
+            exact_activity: self.update_handoff_activity_epoch == pending.activity_epoch,
+            teardown_allows_commit: teardown_allows_commit(
+                &pending.teardown,
+                crate::menu::appkit_awaits_quit_reply(),
+            ),
+        }
     }
 
     /// Main-thread completion of the overlap proof.
@@ -8013,6 +8004,7 @@ impl App {
                 .map(|pending| handoff_sinks(&self.pool, &pending.live));
             let replies = crate::control::input_replies_of(&self.store);
             let mut claims_fence_missed = false;
+            let mut final_gate_refused = false;
             let mut write_attempted = false;
             #[cfg(target_os = "macos")]
             let mut cut_off_noted = false;
@@ -8064,31 +8056,52 @@ impl App {
                         cut_off_noted = true;
                     }
                     let clicks = self.permission_clicks.clicks.standing();
-                    let committed = sources.as_deref().and_then(|sources| {
-                        let write = || {
-                            write_attempted = true;
-                            // A standing permission click lives in this process alone: a written
-                            // Commit ends it (design §9 of DESIGN-yolo-binary-2026-11-04); one
-                            // that returns leaves it standing, as the line after it says.
-                            for click in &clicks {
-                                aterm_log::info!(
-                                    "harness @{}: the update's Commit, once written, drops the standing click on {}",
-                                    click.click.tab,
-                                    crate::claude_lights::said_bit(click.from_yolo)
-                                );
-                            }
-                            crate::seamless::commit_and_exit(commit_fd, proof)
-                        };
-                        match self.harness.as_ref() {
-                            Some(host) => host.with_commit_stop_reserved(|stop| {
-                                with_handoff_claims(sources, || stop.write(write))
-                            }),
-                            None => with_handoff_claims(sources, write),
-                        }
+                    // Logging is callback-capable, so say this before the final gate. Once that
+                    // gate is read, only guard-local stop marking and the atomic write may run.
+                    for click in &clicks {
+                        aterm_log::info!(
+                            "harness @{}: the update's Commit, once written, drops the standing click on {}",
+                            click.click.tab,
+                            crate::claude_lights::said_bit(click.from_yolo)
+                        );
+                    }
+                    let final_gate = std::cell::Cell::new(None);
+                    let host = self.harness.clone();
+                    let committed = sources.as_deref().and_then(|sources| match host.as_ref() {
+                        Some(host) => host.with_commit_stop_reserved(|stop| {
+                            with_handoff_claims(sources, || {
+                                let gate = self.final_handoff_commit_gate(attempt_id);
+                                final_gate.set(Some(gate));
+                                gate.admitted().then(|| {
+                                    stop.write(|| {
+                                        write_attempted = true;
+                                        crate::seamless::commit_and_exit(commit_fd, proof)
+                                    })
+                                })
+                            })
+                            .flatten()
+                        }),
+                        None => with_handoff_claims(sources, || {
+                            let gate = self.final_handoff_commit_gate(attempt_id);
+                            final_gate.set(Some(gate));
+                            gate.admitted().then(|| {
+                                write_attempted = true;
+                                crate::seamless::commit_and_exit(commit_fd, proof)
+                            })
+                        })
+                        .flatten(),
                     });
                     if committed.is_none() {
-                        claims_fence_missed = true;
-                        facts.exact_activity = false;
+                        match final_gate.get() {
+                            Some(gate) if !gate.admitted() => {
+                                final_gate_refused = true;
+                                gate.fold_into(&mut facts);
+                            }
+                            _ => {
+                                claims_fence_missed = true;
+                                facts.exact_activity = false;
+                            }
+                        }
                     }
                     committed
                 }
@@ -8152,6 +8165,7 @@ impl App {
             }
             match commit_result {
                 Some(Err(_)) => commit_write_failed = true,
+                None if final_gate_refused => {}
                 None if !claims_fence_missed => facts.egress_settled = false,
                 None => {}
                 Some(Ok(never)) => match never {},
@@ -8395,9 +8409,16 @@ impl App {
         &mut self,
         mode: crate::native_updater_service::ApplyMode,
         target_build: u64,
+        target_dmg_sha256: Option<[u8; 32]>,
         policy_unread: bool,
     ) -> Option<crate::UpdateHandoffStartError> {
-        self.preverify_read_wait(mode, target_build, policy_unread, PreverifyWaiter::ForkPark)
+        self.preverify_read_wait(
+            mode,
+            target_build,
+            target_dmg_sha256,
+            policy_unread,
+            PreverifyWaiter::ForkPark,
+        )
     }
 
     /// The cold lane answers to the pre-park verdict before it writes the quit layout and replaces this process.
@@ -8501,6 +8522,7 @@ impl App {
                 self.preverify_read_wait(
                     mode,
                     attempt.target_build(),
+                    crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256()),
                     true,
                     PreverifyWaiter::ColdRelaunch,
                 )
@@ -8514,22 +8536,34 @@ impl App {
         &mut self,
         mode: crate::native_updater_service::ApplyMode,
         target_build: u64,
+        target_dmg_sha256: Option<[u8; 32]>,
         unread: bool,
         waiter: PreverifyWaiter,
     ) -> Option<crate::UpdateHandoffStartError> {
         if !unread {
             return None;
         }
+        let Some(target_dmg_sha256) = target_dmg_sha256 else {
+            return Some(crate::UpdateHandoffStartError::failed(format!(
+                "build {target_build}'s exact artifact identity is unavailable; its pre-park \
+                 read was not started"
+            )));
+        };
         let now = std::time::Instant::now();
         let until = match self.preverify_read_waited {
-            Some((target, until))
-                if target == target_build && now < until + crate::HANDOFF_PREVERIFY_FRESHNESS =>
+            Some(wait)
+                if wait.covers(target_build, target_dmg_sha256)
+                    && now < wait.until + crate::HANDOFF_PREVERIFY_FRESHNESS =>
             {
-                until
+                wait.until
             }
             _ => {
                 let until = now + crate::HANDOFF_PREVERIFY_READ_CEILING;
-                self.preverify_read_waited = Some((target_build, until));
+                self.preverify_read_waited = Some(crate::PreverifyReadWait {
+                    build: target_build,
+                    dmg_sha256: target_dmg_sha256,
+                    until,
+                });
                 self.spawn_staged_handoff_preverification(target_build);
                 until
             }
@@ -8537,7 +8571,11 @@ impl App {
         let reading = self
             .handoff_preverify_in_flight
             .as_ref()
-            .is_some_and(|read| read.running_for(target_build, now));
+            .is_some_and(|read| {
+                read.running_for(target_build, now)
+                    && crate::app_native::decode_dmg_sha256(&read.artifact)
+                        == Some(target_dmg_sha256)
+            });
         if !reading || now >= until {
             if reading {
                 aterm_log::info!(
@@ -8554,7 +8592,7 @@ impl App {
         Some(if mode.is_automatic() {
             preverify_read_activity(target_build, waiter)
         } else {
-            preverify_read_hold(target_build, waiter, until)
+            preverify_read_hold(target_build, Some(target_dmg_sha256), waiter, until)
         })
     }
 
@@ -8579,18 +8617,65 @@ impl App {
     /// and how it ended.
     #[cfg(unix)]
     pub(crate) fn hold_person_apply(&mut self, held: crate::HeldPersonApply) {
-        aterm_log::info!(
-            "update apply: a person's Install is held for build {}'s pre-park read, at most \
-             {} ms more; its row stays up and it runs as soon as the read ends",
-            held.target_build,
-            held.until
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis()
-        );
+        match held.gate {
+            crate::HeldPersonApplyGate::Preverify { until } => aterm_log::info!(
+                "update apply: a person's Install is held for build {}'s pre-park read, at most \
+                 {} ms more; its row stays up and it runs as soon as the read ends",
+                held.target_build,
+                until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+            ),
+            crate::HeldPersonApplyGate::BootHealth => aterm_log::info!(
+                "update apply: a person's Install is held for build {} until this aterm \
+                 confirms the running build's boot health; its row stays up and the \
+                 confirmation event runs it",
+                held.target_build
+            ),
+        }
         self.begin_update_installing(true);
         let running = self.native_updater_service.snapshot().current_build;
         self.record_update_switch_started(running, false, false);
         self.person_apply_held = Some(held);
+    }
+
+    #[cfg(unix)]
+    fn staged_person_apply_identity(&self) -> Option<(u64, [u8; 32])> {
+        self.native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .and_then(|staged| {
+                crate::app_native::decode_dmg_sha256(&staged.dmg_sha256)
+                    .map(|dmg_sha256| (staged.build, dmg_sha256))
+            })
+    }
+
+    /// A second press joins a held Install only when it names the same exact artifact.
+    #[cfg(unix)]
+    pub(crate) fn held_person_apply_matches_stage(&self) -> bool {
+        self.person_apply_held.is_some_and(|held| {
+            self.staged_person_apply_identity() == Some((held.target_build, held.target_dmg_sha256))
+        })
+    }
+
+    /// End a held press whose exact artifact is no longer staged. A later press then enters the
+    /// ordinary admission path as a new action instead of silently joining obsolete authority.
+    #[cfg(unix)]
+    pub(crate) fn retire_superseded_person_apply(&mut self) {
+        let Some(held) = self.person_apply_held.take() else {
+            return;
+        };
+        let staged = self.staged_person_apply_identity();
+        aterm_log::info!(
+            "update apply: the Install held for build {} and artifact {}… is dropped: the exact \
+             staged artifact is now {staged:?}",
+            held.target_build,
+            aterm_codec::hex::encode_lower(&held.target_dmg_sha256[..6])
+        );
+        self.sessionless_waited.person = None;
+        self.retire_update_installing();
+        self.record_update_switch_stopped(false, HELD_PRESS_SUPERSEDED);
     }
 
     /// The event loop's next look at a held press.
@@ -8600,51 +8685,58 @@ impl App {
         &self,
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
-        self.person_apply_held
-            .map(|held| held.until.min(now + crate::app_native::PREVERIFY_READ_POLL))
+        self.person_apply_held.map(|held| match held.gate {
+            crate::HeldPersonApplyGate::Preverify { until } => {
+                until.min(now + crate::app_native::PREVERIFY_READ_POLL)
+            }
+            crate::HeldPersonApplyGate::BootHealth => self
+                .boot_health_confirmation_retry_at
+                .unwrap_or(now + crate::BOOT_HEALTH_RETRY_MIN),
+        })
     }
 
     /// Execute a held user-initiated update install (`Self::hold_person_apply`).
     #[cfg(unix)]
     pub(crate) fn run_held_person_apply(&mut self, now: std::time::Instant) {
-        use crate::native_app::UpdateOutcome;
         let Some(held) = self.person_apply_held else {
             return;
         };
         let reading = self
             .handoff_preverify_in_flight
             .as_ref()
-            .is_some_and(|read| read.running_for(held.target_build, now));
-        if reading && now < held.until {
+            .is_some_and(|read| {
+                read.running_for(held.target_build, now)
+                    && crate::app_native::decode_dmg_sha256(&read.artifact)
+                        == Some(held.target_dmg_sha256)
+            });
+        match held.gate {
+            crate::HeldPersonApplyGate::Preverify { until } if reading && now < until => return,
+            crate::HeldPersonApplyGate::BootHealth if !self.native_boot_health_complete() => {
+                return;
+            }
+            _ => {}
+        }
+        if !self.held_person_apply_matches_stage() {
+            self.retire_superseded_person_apply();
             return;
         }
         self.person_apply_held = None;
-        let staged = self
-            .native_updater_service
-            .snapshot()
-            .staged
-            .as_ref()
-            .map(|staged| staged.build);
-        if staged != Some(held.target_build) {
-            aterm_log::info!(
-                "update apply: the Install held for build {}'s pre-park read is dropped: the \
-                 staged build is now {staged:?}",
+        match held.gate {
+            crate::HeldPersonApplyGate::Preverify { .. } => aterm_log::info!(
+                "update apply: build {}'s pre-park read {}; the Install a person pressed runs now",
+                held.target_build,
+                if reading {
+                    "outran its window"
+                } else {
+                    "ended"
+                }
+            ),
+            crate::HeldPersonApplyGate::BootHealth => aterm_log::info!(
+                "update apply: the running build's boot-health check finished; the Install a \
+                 person pressed for build {} runs through the durable trial gate now",
                 held.target_build
-            );
-            self.sessionless_waited.person = None;
-            self.retire_update_installing();
-            self.record_update_switch_stopped(false, HELD_PRESS_SUPERSEDED);
-            return;
+            ),
         }
-        aterm_log::info!(
-            "update apply: build {}'s pre-park read {}; the Install a person pressed runs now",
-            held.target_build,
-            if reading {
-                "outran its window"
-            } else {
-                "ended"
-            }
-        );
         let outcome = self.apply_native_update(crate::native_updater_service::ApplyMode::Immediate);
         if self.person_apply_held.is_some() {
             return;
@@ -8652,17 +8744,7 @@ impl App {
         // The press ended, whichever way its run went (a preflight block, the fork lane, the
         // read's answer): the read it waited for answers no later press.
         self.sessionless_waited.person = None;
-        let stopped = match &outcome {
-            UpdateOutcome::Deferred { reason, .. } => Some(reason.clone()),
-            UpdateOutcome::Blocked { reasons } => {
-                Some(reasons.join(crate::native_ui::FACT_SEPARATOR))
-            }
-            UpdateOutcome::Failed { message } | UpdateOutcome::CaptureRefused { message } => {
-                Some(message.clone())
-            }
-            UpdateOutcome::Accepted | UpdateOutcome::InstalledNeedsRelaunch { .. } => None,
-        };
-        if let Some(why) = stopped {
+        if let Some(why) = outcome.why_it_stopped() {
             self.retire_update_installing();
             self.record_update_switch_stopped(false, &why);
         }
@@ -8796,13 +8878,11 @@ impl App {
     /// for it ([`SessionlessWaited`]); an attempt the wait holds waits for the read in flight,
     /// whoever started it. A window an earlier read spent answers nothing here: the attempt gets
     /// a window of its own (the fork lane alone parks past its window). The read an attempt
-    /// waited for ending so ends the wait: the attempt fails, the automatic lane tries again
-    /// later and a person's next press checks again, each reading afresh, so no attempt re-reads
-    /// in a loop and a press is answered only by a read it waited for. A person's press on an
-    /// image a relaunch replaces, with no `--hold` pane a relaunch would close, goes on to the
-    /// cold lane instead, which verifies the stage again and relaunches for them unless it
-    /// refuses for its own reason (open tabs with session restore off;
-    /// [`Self::cold_lane_verdict_gate`]).
+    /// waited for ending so, or outrunning its own ceiling, ends the wait
+    /// ([`Self::sessionless_wait_ended`]), so no attempt re-reads in a loop, a read that never ends
+    /// holds no press and spins no lane, and a press is answered only by a read it waited for. One
+    /// that ended with nothing left to say (its verdict aged) answers nothing, and the attempt reads
+    /// afresh.
     #[cfg(unix)]
     fn sessionless_preverify_wait(
         &mut self,
@@ -8811,6 +8891,7 @@ impl App {
     ) -> Option<crate::UpdateHandoffStartError> {
         let now = std::time::Instant::now();
         let target_build = attempt.target_build();
+        let target_dmg_sha256 = crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256());
         if let Some(known) = self.known_roster_wait(attempt, now) {
             if !known.held
                 && let Some(dmg_sha256) =
@@ -8844,47 +8925,89 @@ impl App {
             });
         if let Some((reason, again)) = passing {
             let started = again
-                && crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256()).is_some_and(
-                    |dmg_sha256| self.start_fresh_preverification(target_build, dmg_sha256),
-                );
-            if !started {
-                *self.sessionless_waited.of(mode) = None;
-                // The admission refuses a relaunch over `--hold` panes before the lane choice.
-                if !mode.is_automatic()
-                    && !self.launch_image_kept
-                    && self.handoff_exited_session_ids().is_empty()
-                {
-                    return None;
-                }
-                return Some(if mode.is_automatic() {
-                    crate::UpdateHandoffStartError::activity(
-                        crate::native_update_lane_hold::LaneHold::PreparkRead,
-                        format!("{reason}; the update is tried again later"),
-                    )
-                } else {
-                    crate::UpdateHandoffStartError::failed(format!(
-                        "{reason}; press again to check again"
-                    ))
+                && target_dmg_sha256.is_some_and(|dmg_sha256| {
+                    self.start_fresh_preverification(target_build, dmg_sha256)
                 });
+            if !started {
+                return self.sessionless_wait_ended(mode, &reason);
             }
             *self.sessionless_waited.of(mode) = self.in_flight_read_deadline();
             let until = now + crate::HANDOFF_PREVERIFY_READ_CEILING;
-            self.preverify_read_waited = Some((target_build, until));
+            let Some(dmg_sha256) = target_dmg_sha256 else {
+                return Some(crate::UpdateHandoffStartError::failed(format!(
+                    "build {target_build}'s exact artifact identity is unavailable; its \
+                     pre-park read was not retained"
+                )));
+            };
+            self.preverify_read_waited = Some(crate::PreverifyReadWait {
+                build: target_build,
+                dmg_sha256,
+                until,
+            });
             return Some(if mode.is_automatic() {
                 preverify_read_activity(target_build, PreverifyWaiter::SessionlessHandoff)
             } else {
-                preverify_read_hold(target_build, PreverifyWaiter::SessionlessHandoff, until)
+                preverify_read_hold(
+                    target_build,
+                    target_dmg_sha256,
+                    PreverifyWaiter::SessionlessHandoff,
+                    until,
+                )
             });
         }
-        if self
-            .preverify_read_waited
-            .is_some_and(|(target, until)| target == target_build && now >= until)
+        let own_still_out = self
+            .handoff_preverify_in_flight
+            .as_ref()
+            .filter(|read| {
+                own_read == Some(read.deadline)
+                    && read.reads(attempt)
+                    && !read.done.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .map(|read| read.deadline);
+        // A read past its own ceiling ends the wait, however long the window it is in has to run.
+        if own_still_out.is_some_and(|ceiling| now >= ceiling) {
+            if self.preverify_read_waited.is_some_and(|wait| {
+                target_dmg_sha256.is_some_and(|dmg_sha256| wait.covers(target_build, dmg_sha256))
+            }) {
+                self.preverify_read_waited = None;
+            }
+            return self.sessionless_wait_ended(
+                mode,
+                &format!(
+                    "build {target_build}'s verification did not end within {} s",
+                    crate::HANDOFF_PREVERIFY_READ_CEILING.as_secs()
+                ),
+            );
+        }
+        if let Some(dmg_sha256) = target_dmg_sha256
+            && self
+                .preverify_read_waited
+                .is_some_and(|wait| wait.covers(target_build, dmg_sha256) && now >= wait.until)
         {
             self.preverify_read_waited = None;
+            if let Some(ceiling) = own_still_out {
+                // A window this read did not start ran out: it has its own ceiling all the same.
+                self.preverify_read_waited = Some(crate::PreverifyReadWait {
+                    build: target_build,
+                    dmg_sha256,
+                    until: ceiling,
+                });
+                return Some(if mode.is_automatic() {
+                    preverify_read_activity(target_build, PreverifyWaiter::SessionlessHandoff)
+                } else {
+                    preverify_read_hold(
+                        target_build,
+                        Some(dmg_sha256),
+                        PreverifyWaiter::SessionlessHandoff,
+                        ceiling,
+                    )
+                });
+            }
         }
         let wait = self.preverify_read_wait(
             mode,
             target_build,
+            target_dmg_sha256,
             true,
             PreverifyWaiter::SessionlessHandoff,
         );
@@ -8892,6 +9015,37 @@ impl App {
             *self.sessionless_waited.of(mode) = self.in_flight_read_deadline();
         }
         wait
+    }
+
+    /// The answer to an attempt whose wait for a read ended with no verdict, for `reason`. No
+    /// verdict is none against the image: the automatic lane defers as a pre-park read's activity
+    /// and tries again later, charging no failure, and a person's press fails so their next press
+    /// checks again, each reading afresh. A person's press on an image a relaunch replaces, with
+    /// no `--hold` pane a relaunch would close, goes on to the cold lane instead, which verifies
+    /// the stage again and relaunches for them unless it refuses for its own reason (open tabs
+    /// with session restore off; [`Self::cold_lane_verdict_gate`]).
+    #[cfg(unix)]
+    fn sessionless_wait_ended(
+        &mut self,
+        mode: crate::native_updater_service::ApplyMode,
+        reason: &str,
+    ) -> Option<crate::UpdateHandoffStartError> {
+        *self.sessionless_waited.of(mode) = None;
+        // The admission refuses a relaunch over `--hold` panes before the lane choice.
+        if !mode.is_automatic()
+            && !self.launch_image_kept
+            && self.handoff_exited_session_ids().is_empty()
+        {
+            return None;
+        }
+        Some(if mode.is_automatic() {
+            crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::PreparkRead,
+                format!("{reason}; the update is tried again later"),
+            )
+        } else {
+            crate::UpdateHandoffStartError::failed(format!("{reason}; press again to check again"))
+        })
     }
 
     /// The deadline (a read's identity) of the pre-park read in flight, if any.
@@ -9182,9 +9336,16 @@ fn preverify_read_activity(
 #[cfg(unix)]
 fn preverify_read_hold(
     target_build: u64,
+    target_dmg_sha256: Option<[u8; 32]>,
     waiter: PreverifyWaiter,
     until: std::time::Instant,
 ) -> crate::UpdateHandoffStartError {
+    let Some(target_dmg_sha256) = target_dmg_sha256 else {
+        return crate::UpdateHandoffStartError::failed(format!(
+            "build {target_build}'s exact artifact identity is unavailable; the Install was not \
+             retained"
+        ));
+    };
     let reason = format!(
         "build {target_build}'s {} is being read before {} {}; this Install runs as soon \
          as the read ends",
@@ -9193,7 +9354,7 @@ fn preverify_read_hold(
         waiter.acts(),
     );
     aterm_log::info!("update apply: {reason}");
-    crate::UpdateHandoffStartError::held_for_read(target_build, until, reason)
+    crate::UpdateHandoffStartError::held_for_read(target_build, target_dmg_sha256, until, reason)
 }
 
 #[cfg(unix)]
@@ -9535,11 +9696,6 @@ pub(crate) fn lane_carry_refusal(
             crate::app_native::SETTINGS_DRAFTS_BLOCK,
             token.carried_settings_drafts()
         )),
-        ApplyLane::Cold if token.failed_checkpoints() > 0 => Some(format!(
-            "{} {} document checkpoint(s) previously failed",
-            crate::app_native::FAILED_CHECKPOINTS_BLOCK,
-            token.failed_checkpoints()
-        )),
         ApplyLane::Seamless
             if token.carried_settings_drafts() > 0 && target_build < running_build =>
         {
@@ -9675,165 +9831,8 @@ fn update_admission_refusal(
 }
 
 #[cfg(all(test, unix))]
-mod admission_refusal_detail_tests {
-    use super::{HandoffUnavailable, update_admission_refusal};
-    use crate::native_update_admission::{
-        AdmissionBlock, AdmissionDecision, AdmissionFacts, classify,
-    };
-
-    fn live_facts() -> AdmissionFacts {
-        AdmissionFacts {
-            staged_verified: true,
-            seamless_capable: false,
-            native_state_certified: true,
-            live_ptys: 3,
-            foreground_jobs: 2,
-            unknown_foregrounds: 0,
-            image_kept: false,
-        }
-    }
-
-    #[test]
-    fn live_session_refusal_retains_exact_handoff_cause_and_remedy() {
-        for unavailable in [
-            HandoffUnavailable::UnownedControlSocket,
-            HandoffUnavailable::Headless,
-        ] {
-            let (cause, remedy) = (unavailable.cause(), unavailable.remedy());
-            for (foreground_jobs, unknown_foregrounds) in [(2, 0), (0, 1), (1, 2), (0, 3)] {
-                let facts = AdmissionFacts {
-                    foreground_jobs,
-                    unknown_foregrounds,
-                    ..live_facts()
-                };
-                let AdmissionDecision::Block(reason) = classify(facts) else {
-                    panic!("live terminals without seamless handoff must block");
-                };
-                let refusal = update_admission_refusal(reason, facts, Some(unavailable), None);
-                assert!(
-                    refusal.is_refused(),
-                    "a refusal cannot increment a failure streak"
-                );
-                let message = refusal.into_message();
-                assert!(message.contains(cause), "{facts:?}: {message}");
-                assert!(message.contains(remedy), "{facts:?}: {message}");
-                assert!(
-                    message.chars().count() <= 400,
-                    "durable health truncates at 400 characters"
-                );
-                assert!(!reason.message(facts).contains(cause));
-            }
-            let kept = AdmissionFacts {
-                live_ptys: 0,
-                foreground_jobs: 0,
-                image_kept: true,
-                ..live_facts()
-            };
-            assert_eq!(
-                classify(kept),
-                AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff)
-            );
-            let refusal = update_admission_refusal(
-                AdmissionBlock::KeptImageWithoutHandoff,
-                kept,
-                Some(unavailable),
-                Some("the sessionless cause"),
-            );
-            assert!(refusal.is_refused());
-            let message = refusal.into_message();
-            assert!(message.contains(cause), "{message}");
-            assert!(!message.contains("terminal tab"), "{message}");
-            assert_eq!(
-                classify(AdmissionFacts {
-                    seamless_capable: true,
-                    ..kept
-                }),
-                AdmissionDecision::Apply(crate::native_update_admission::ApplyLane::Seamless),
-                "a kept image the handoff can carry with no terminal is never refused"
-            );
-        }
-    }
-
-    /// A kept image the sessionless handoff cannot carry names that cause, and the next launch.
-    #[test]
-    fn a_kept_image_without_a_sessionless_handoff_names_its_cause() {
-        let kept = AdmissionFacts {
-            live_ptys: 0,
-            foreground_jobs: 0,
-            image_kept: true,
-            ..live_facts()
-        };
-        let cause = "no open tab is one the new build can restore";
-        let message = update_admission_refusal(
-            AdmissionBlock::KeptImageWithoutHandoff,
-            kept,
-            None,
-            Some(cause),
-        )
-        .into_message();
-        assert_eq!(
-            message,
-            format!("The update waits for the next launch: {cause}")
-        );
-        assert_eq!(
-            update_admission_refusal(AdmissionBlock::KeptImageWithoutHandoff, kept, None, None)
-                .into_message(),
-            AdmissionBlock::KeptImageWithoutHandoff.message(kept),
-        );
-    }
-
-    #[test]
-    fn unrelated_admission_refusals_keep_the_primary_reason() {
-        let base = live_facts();
-        for (facts, expected) in [
-            (
-                AdmissionFacts {
-                    staged_verified: false,
-                    ..base
-                },
-                AdmissionBlock::UnverifiedStage,
-            ),
-            (
-                AdmissionFacts {
-                    native_state_certified: false,
-                    ..base
-                },
-                AdmissionBlock::NativeStateUncertified,
-            ),
-            (
-                AdmissionFacts {
-                    live_ptys: 0,
-                    foreground_jobs: 0,
-                    unknown_foregrounds: 1,
-                    ..base
-                },
-                AdmissionBlock::ForegroundProbeUnknown,
-            ),
-            (
-                AdmissionFacts {
-                    foreground_jobs: 4,
-                    ..base
-                },
-                AdmissionBlock::LivePtysNeedSeamless,
-            ),
-        ] {
-            assert_eq!(classify(facts), AdmissionDecision::Block(expected));
-            let refusal = update_admission_refusal(
-                expected,
-                facts,
-                Some(HandoffUnavailable::Headless),
-                Some("a sessionless cause"),
-            );
-            assert!(refusal.is_refused());
-            assert_eq!(refusal.into_message(), expected.message(facts));
-        }
-        assert_eq!(
-            update_admission_refusal(AdmissionBlock::LivePtysNeedSeamless, base, None, None)
-                .into_message(),
-            AdmissionBlock::LivePtysNeedSeamless.message(base),
-        );
-    }
-}
+#[path = "app_update_handoff_admission_refusal_detail_tests.rs"]
+mod admission_refusal_detail_tests;
 
 #[cfg(unix)]
 #[must_use]
@@ -10307,6 +10306,18 @@ pub(crate) const PRELAUNCH_HOLD_MAX: std::time::Duration = std::time::Duration::
 #[cfg(unix)]
 const _: () = assert!(
     crate::native_update_auto_intent::LANDS_WITHIN.as_secs() + 10 < PRELAUNCH_HOLD_MAX.as_secs()
+);
+
+/// How long a handed session's master may stand hung up (its command exited) with no exit from
+/// its reader before the update lane books it exited itself, so it travels as a held pane: past
+/// the reader's own retirement bound (`crate::spawn::SHELL_RETIRE_HANG`), and before a dialled
+/// successor's hold cap stands it down ([`PRELAUNCH_HOLD_MAX`]).
+pub(crate) const PANE_EXITED_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[cfg(unix)]
+const _: () = assert!(
+    crate::spawn::SHELL_RETIRE_HANG.as_secs() < PANE_EXITED_BACKSTOP.as_secs()
+        && PANE_EXITED_BACKSTOP.as_secs() < PRELAUNCH_HOLD_MAX.as_secs()
 );
 
 #[cfg(unix)]
@@ -11142,267 +11153,56 @@ mod freeze_budget_tests;
 #[path = "app_update_handoff_dry_run_capture_tests.rs"]
 pub(crate) mod dry_run_capture_tests;
 
+/// A quit AppKit waits on outranks an update's Commit, which would end the process with
+/// AppKit's reply unsent: a teardown that lets Commit go (none, or a Quit whose barriers were
+/// ready) holds it while AppKit waits; closes and native quits held behind the handoff hold it
+/// regardless.
+///
+/// NEGATIVE CONTROL: drop `!appkit_awaits_quit_reply` and a `CleanQuitReady` teardown, which a
+/// native quit's saves turn into, commits under a logout AppKit waits on.
 #[cfg(all(test, unix))]
-mod capture_budget_reservation_tests {
-    use super::{MAX_HANDOFF_CAPTURE_BUDGET_BYTES, optional_carry_fits};
-    use crate::seamless::{
-        admit_checkpoint_dimensions, checkpoint_capture_budget_bytes, mandatory_checkpoint_cells,
-        max_handoff_aggregate_grid_cells, max_handoff_history_lines,
-    };
-
-    fn walk_pool(rows: u16, cols: u16, sessions: u64) -> Result<u64, u64> {
-        let carry = max_handoff_history_lines();
-        let mandatory_cells = mandatory_checkpoint_cells(rows, cols);
-        let mandatory_bytes = checkpoint_capture_budget_bytes(rows, cols, 0)
-            .expect("PRECONDITION: the test geometry must be admissible at all");
-        let history_cells = u64::from(cols) * u64::from(carry);
-        let history_bytes = checkpoint_capture_budget_bytes(rows, cols, carry)
-            .expect("PRECONDITION: the test geometry must be admissible with history")
-            - mandatory_bytes;
-
-        let mut cells_reserve = mandatory_cells * sessions;
-        let mut bytes_reserve = mandatory_bytes * sessions;
-        let mut used_cells = 0_u64;
-        let mut used_bytes = 0_u64;
-        let mut carried = 0_u64;
-        for index in 0..sessions {
-            cells_reserve -= mandatory_cells;
-            bytes_reserve -= mandatory_bytes;
-            let cells_fit = optional_carry_fits(
-                used_cells,
-                mandatory_cells,
-                history_cells,
-                cells_reserve,
-                max_handoff_aggregate_grid_cells(),
+#[test]
+fn a_quit_appkit_waits_on_holds_commit() {
+    use crate::DeferredHandoffTeardown as Teardown;
+    for teardown in [Teardown::None, Teardown::CleanQuitReady] {
+        assert!(teardown_allows_commit(&teardown, false), "{teardown:?}");
+        assert!(!teardown_allows_commit(&teardown, true), "{teardown:?}");
+    }
+    for teardown in [
+        Teardown::QuitRequested,
+        Teardown::NativeTerminate {
+            generation: 7,
+            confirmed: true,
+        },
+    ] {
+        for awaits in [false, true] {
+            assert!(
+                !teardown_allows_commit(&teardown, awaits),
+                "{teardown:?} {awaits}"
             );
-            let bytes_fit = optional_carry_fits(
-                used_bytes,
-                mandatory_bytes,
-                history_bytes,
-                bytes_reserve,
-                MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
-            );
-            let history = if cells_fit && bytes_fit { carry } else { 0 };
-            let Ok(per_grid) =
-                admit_checkpoint_dimensions(&mut used_cells, rows, cols, history, true)
-            else {
-                return Err(index);
-            };
-            used_bytes += per_grid * 2;
-            if used_bytes > MAX_HANDOFF_CAPTURE_BUDGET_BYTES {
-                return Err(index);
-            }
-            carried += u64::from(history != 0);
         }
-        Ok(carried)
-    }
-
-    #[test]
-    fn a_heavy_pool_is_admitted_even_when_it_must_drop_history() {
-        for (rows, cols) in [(49_u16, 110_u16), (60, 200)] {
-            for sessions in [12_u64, 24, 64] {
-                let carried = walk_pool(rows, cols, sessions).unwrap_or_else(|index| {
-                    panic!(
-                        "session {index} of {sessions} at {rows}x{cols} was refused; a pool \
-                         whose visible screens fit must never cost the update"
-                    )
-                });
-                assert!(
-                    carried > 0,
-                    "{sessions} panes at {rows}x{cols} carried no scrollback at all — the \
-                     reservation must buy the pool a SMALLER carry, not abolish it"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_pool_is_refused_only_when_its_mandatory_total_does_not_fit() {
-        let (rows, cols) = (60_u16, 200_u16);
-        let fits = max_handoff_aggregate_grid_cells() / mandatory_checkpoint_cells(rows, cols);
-        assert!(
-            walk_pool(rows, cols, fits).is_ok(),
-            "{fits} panes at {rows}x{cols} are exactly what the aggregate holds \
-             visible-only, so every one of them must be admitted"
-        );
-        assert_eq!(
-            walk_pool(rows, cols, fits + 1),
-            Err(fits),
-            "one pane past the visible-only ceiling must be refused, and refused as the \
-             LAST session — never an earlier one that lost its budget to somebody \
-             else's scrollback"
-        );
-    }
-
-    #[test]
-    fn every_full_screen_display_geometry_is_admitted_for_a_pool_of_panes() {
-        use aterm_window::dpi::PhysicalSize;
-
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        {
-            let ws = app.windows.get_mut(&wid).expect("the headless window");
-            ws.metrics.pad = 24;
-            ws.metrics.pad_top = 4;
-            ws.metrics.head = 80;
-        }
-        let mut over_the_old_cap = Vec::new();
-        for (width, height) in [
-            (3024_u32, 1964_u32),
-            (3456, 2234),
-            (5120, 2880),
-            (6016, 3384),
-        ] {
-            for (shape, size) in [
-                ("full screen", PhysicalSize::new(width, height)),
-                ("maximized", PhysicalSize::new(width, height - 74 - 140)),
-            ] {
-                let smallest = crate::FONT_PX_MIN as u32;
-                for font_px in smallest..=48 {
-                    app.windows
-                        .get_mut(&wid)
-                        .expect("the headless window")
-                        .metrics
-                        .font_px = font_px as f32;
-                    let (rows, cols) = app.grid_dims_for(wid, size);
-                    let cells = u64::from(rows) * u64::from(cols);
-                    if cells > 32 * 1024 {
-                        over_the_old_cap.push((width, height, shape, font_px, rows, cols));
-                    }
-                    for panes in 1..=8_u16 {
-                        let pane_cols = (cols / panes).max(1);
-                        let mut used = 0_u64;
-                        for pane in 0..panes {
-                            assert!(
-                                admit_checkpoint_dimensions(&mut used, rows, pane_cols, 0, true)
-                                    .is_ok(),
-                                "{width}x{height} {shape} at font {font_px} px ({rows}x{cols}): \
-                                 pane {pane} of {panes} ({rows}x{pane_cols}) was refused"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            !over_the_old_cap.is_empty(),
-            "PRECONDITION: the table must reach past the old 32 Ki per-grid cap, or it \
-             could not have caught the incident"
-        );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "app_update_handoff_capture_budget_reservation_tests.rs"]
+mod capture_budget_reservation_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_commit_layout_topology_tests.rs"]
 mod commit_layout_topology_tests;
 
 #[cfg(all(test, unix))]
-mod pinnedness_tests {
-    use super::candidate_is_our_child;
-
-    #[test]
-    fn only_a_child_of_ours_pins_its_pid() {
-        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn a child to own a pid");
-        let pid = libc::pid_t::try_from(child.id()).expect("pid fits");
-        assert!(
-            candidate_is_our_child(pid),
-            "a live child of ours pins its number, so -pid still names its group"
-        );
-
-        let own = libc::pid_t::try_from(std::process::id()).expect("pid fits");
-        assert!(
-            !candidate_is_our_child(own),
-            "a process that is not our child must never license a group kill"
-        );
-        assert!(!candidate_is_our_child(1), "launchd is not ours either");
-
-        child.kill().expect("kill the probe child");
-        let status = child.wait().expect("the probe left it waitable");
-        assert!(!status.success(), "it was killed, not exited cleanly");
-    }
-}
+#[path = "app_update_handoff_pinnedness_tests.rs"]
+mod pinnedness_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_candidate_death_evidence_tests.rs"]
 mod candidate_death_evidence_tests;
 
 #[cfg(all(test, unix))]
-mod trial_launch_forgiveness_tests {
-    use super::forgives_the_counted_trial_launch;
-    use crate::ChildDeathEvidence as Death;
-
-    const CURRENT: u64 = 1_787_699_398;
-    const TARGET: u64 = 1_787_699_399;
-
-    fn forgives(death: Death) -> bool {
-        forgives_the_counted_trial_launch(death, CURRENT, TARGET)
-    }
-
-    #[test]
-    fn only_a_death_the_bytes_answer_for_keeps_its_counted_trial_launch() {
-        for (death, keeps_its_count, why) in [
-            (
-                Death::Exited { code: 0 },
-                true,
-                "the image reached an `exit` instruction: it ran, it decided, and \
-                 a launch that ended that way is the sentinel's to keep",
-            ),
-            (
-                Death::Exited { code: 74 },
-                true,
-                "same reading; the code is recorded, not judged",
-            ),
-            (
-                Death::Signalled {
-                    signal: libc::SIGSEGV,
-                },
-                true,
-                "a fault is the image executing itself into a wall",
-            ),
-            (
-                Death::Signalled {
-                    signal: libc::SIGKILL,
-                },
-                false,
-                "THE FIELD CASE: macOS jetsam reclaiming memory says nothing about \
-                 the bytes, so the launch goes back — otherwise three busy \
-                 afternoons revert a healthy build",
-            ),
-            (
-                Death::Unobserved,
-                false,
-                "and an unattributed death least of all: this is the majority \
-                 answer on the shipping lane, and it is retried six times",
-            ),
-        ] {
-            assert_eq!(forgives(death), !keeps_its_count, "{death:?}: {why}");
-        }
-    }
-
-    #[test]
-    fn an_attempt_that_authorizes_no_newer_build_has_no_launch_to_forgive() {
-        for death in [
-            Death::Unobserved,
-            Death::Exited { code: 0 },
-            Death::Signalled {
-                signal: libc::SIGKILL,
-            },
-        ] {
-            assert!(
-                !forgives_the_counted_trial_launch(death, CURRENT, CURRENT),
-                "{death:?}: an installed activation is its own target, and the QA \
-                 seam authorizes none at all"
-            );
-            assert!(
-                !forgives_the_counted_trial_launch(death, CURRENT, CURRENT - 1),
-                "{death:?}: and an older target is never applied"
-            );
-        }
-    }
-}
+#[path = "app_update_handoff_trial_launch_forgiveness_tests.rs"]
+mod trial_launch_forgiveness_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "app_update_handoff_candidate_exit_watch_tests.rs"]
@@ -11433,80 +11233,8 @@ mod font_zoom_carry_tests;
 mod uncarried_messages_tests;
 
 #[cfg(all(test, unix))]
-mod held_capture_bound_tests {
-    use std::sync::Arc;
-
-    fn linked(rows: u16) -> aterm_core::terminal::Terminal {
-        let mut t = aterm_core::terminal::Terminal::new(rows, 200);
-        let url_tail = "a".repeat(2090);
-        for row in 0..rows {
-            let mut line = Vec::new();
-            for link in 0..45 {
-                line.extend_from_slice(
-                    format!("\x1b]8;;https://e/{row}-{link}-{url_tail}\x07X\x1b]8;;\x07")
-                        .as_bytes(),
-                );
-            }
-            if row + 1 < rows {
-                line.extend_from_slice(b"\r\n");
-            }
-            t.process(&line);
-        }
-        t
-    }
-
-    #[test]
-    fn a_held_screen_the_writer_refuses_spends_none_of_the_held_budget() {
-        let grid = |rows| {
-            u64::try_from(
-                linked(rows)
-                    .checkpoint_carry_abandoning_partial(0)
-                    .0
-                    .grid
-                    .len(),
-            )
-            .expect("a length")
-        };
-        assert!(
-            3 * grid(50) <= crate::seamless::MAX_HELD_AGGREGATE_GRID_BYTES
-                && 3 * grid(50) + grid(30) > crate::seamless::MAX_HELD_AGGREGATE_GRID_BYTES,
-            "{} {}",
-            grid(50),
-            grid(30)
-        );
-        let mut app = crate::App::headless_for_test();
-        let mut ids = Vec::new();
-        for rows in [50, 50, 50, 30] {
-            let id = app.next_session_id;
-            let session = crate::ptyless_session(
-                id,
-                aterm_session::SessionId::generate(),
-                linked(rows),
-                Arc::new(crate::SinkWriter::new(-1)),
-            );
-            app.push_stub_tab(crate::WindowId(0), session);
-            ids.push(id);
-        }
-        let (dense, fits) = (&ids[..3], ids[3]);
-        let held = app.capture_held_screens(
-            &[],
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            &mut 0,
-            crate::seamless::WireCaps::current(),
-            aterm_update_core::handoff_policy::CarryCeiling::Full,
-            &mut Vec::new(),
-        );
-        let captured: Vec<u64> = held.iter().map(|screen| screen.local_id).collect();
-        assert!(
-            captured.contains(&fits),
-            "the pane that fits is carried: {captured:?}"
-        );
-        assert!(
-            !captured.iter().any(|id| dense.contains(id)),
-            "screens the writer refuses are not captured: {captured:?}"
-        );
-    }
-}
+#[path = "app_update_handoff_held_capture_bound_tests.rs"]
+mod held_capture_bound_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_parked_commit_tests.rs"]
@@ -11529,149 +11257,20 @@ mod video_park_tests;
 mod launched_lane_grant_tests;
 
 #[cfg(all(test, unix))]
-mod rollback_winsize_tests {
-    use crate::{App, term_lock};
-
-    fn winsize_of(fd: i32) -> (u16, u16) {
-        // SAFETY: `winsize` is a valid zeroed out-parameter filled by `TIOCGWINSZ` on an open PTY fd.
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        // SAFETY: as above; `fd` is open for the whole test.
-        assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) }, 0);
-        (ws.ws_row, ws.ws_col)
-    }
-
-    #[test]
-    fn a_rolled_back_commit_puts_each_parked_ptys_own_size_back() {
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        let mut app = App::headless_for_test();
-        let session = &mut app.pool.sessions.get_mut(&0).expect("session 0").session;
-        session.master = master;
-        let parked = {
-            let t = term_lock(&session.term);
-            (t.rows(), t.cols())
-        };
-        aterm_pty::resize(master, parked.0, parked.1);
-        aterm_pty::resize(master, parked.0 + 6, parked.1 + 20);
-        assert_ne!(winsize_of(slave), parked, "the successor really moved it");
-        app.rollback_overlap(None, &[(0, master, -1)]);
-        assert_eq!(
-            winsize_of(slave),
-            parked,
-            "the program resumes at the size its engine was parked at"
-        );
-        // SAFETY: both fds were opened above and remain exclusively owned here.
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
-    }
-
-    #[test]
-    fn a_rollback_never_waits_on_a_held_engine_and_puts_its_size_back_once_free() {
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        let mut app = App::headless_for_test();
-        let session = &mut app.pool.sessions.get_mut(&0).expect("session 0").session;
-        session.master = master;
-        let term = std::sync::Arc::clone(&session.term);
-        let parked = {
-            let t = term_lock(&term);
-            (t.rows(), t.cols())
-        };
-        aterm_pty::resize(master, parked.0, parked.1);
-        let moved = (parked.0 + 6, parked.1 + 20);
-        aterm_pty::resize(master, moved.0, moved.1);
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let guard = term_lock(&term);
-            held_tx.send(()).expect("the test waits");
-            let waited_out = returned_rx
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .is_err();
-            drop(guard);
-            waited_out
-        });
-        held_rx.recv().expect("the engine is held");
-        app.rollback_overlap(None, &[(0, master, -1)]);
-        let size_while_held = winsize_of(slave);
-        let _ = returned_tx.send(());
-        let waited_out = holder.join().expect("the holder finished");
-        assert!(!waited_out, "the rollback waited for the engine's holder");
-        assert_eq!(
-            size_while_held, moved,
-            "PRECONDITION — the held engine's size is owed, not taken"
-        );
-        assert!(
-            app.deferred_reader_resume_at.is_some(),
-            "the owed size is the event loop's to retry"
-        );
-        app.resume_deferred_readers_nonblocking();
-        assert_eq!(
-            winsize_of(slave),
-            parked,
-            "the program resumes at the size its engine was parked at"
-        );
-        assert!(app.owed_parked_winsizes.is_empty(), "nothing is owed");
-        // SAFETY: both fds were opened above and remain exclusively owned here.
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
-    }
-}
+#[path = "app_update_handoff_rollback_winsize_tests.rs"]
+mod rollback_winsize_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_fork_lane_policy_wait_tests.rs"]
 mod fork_lane_policy_wait_tests;
 
 #[cfg(all(test, unix))]
-mod manifest_over_cap_tests {
-    use super::{PreparationFailure, preparation_failure_of_write};
-    use crate::seamless::WriteOutgoingFailure;
-
-    #[test]
-    fn an_over_cap_manifest_is_filed_on_the_refusal_lane() {
-        let refused = preparation_failure_of_write(WriteOutgoingFailure::ManifestOverCap);
-        assert!(
-            matches!(refused, PreparationFailure::Refused(_)),
-            "a deterministic refusal of the desk's content"
-        );
-        for own in [
-            WriteOutgoingFailure::NoPrivateDir,
-            WriteOutgoingFailure::Inconsistent,
-            WriteOutgoingFailure::Io(std::io::ErrorKind::StorageFull),
-        ] {
-            assert!(
-                matches!(
-                    preparation_failure_of_write(own),
-                    PreparationFailure::Producer(_)
-                ),
-                "{own}: this process's own trouble"
-            );
-        }
-        assert_eq!(
-            crate::app_native::HandoffFailureLane::classify(
-                crate::native_updater_service::ApplyMode::Automatic,
-                crate::UpdateHandoffOutcome::CaptureRefused,
-                crate::ChildDeathEvidence::Unobserved,
-                false,
-            ),
-            crate::app_native::HandoffFailureLane::Refused
-        );
-    }
-}
+#[path = "app_update_handoff_manifest_over_cap_tests.rs"]
+mod manifest_over_cap_tests;
 
 #[cfg(all(test, unix))]
-mod fabric_carry_successor_tests {
-    use super::successor_reads_fabric_carry;
-
-    #[test]
-    fn only_a_successor_at_least_as_new_holds_retirements_back() {
-        assert!(successor_reads_fabric_carry(1_790_700_000, 1_790_607_299));
-        assert!(successor_reads_fabric_carry(1_790_607_299, 1_790_607_299));
-        assert!(!successor_reads_fabric_carry(1_790_585_188, 1_790_607_299));
-    }
-}
+#[path = "app_update_handoff_fabric_carry_successor_tests.rs"]
+mod fabric_carry_successor_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_cold_lane_layout_tests.rs"]
@@ -11682,155 +11281,12 @@ mod cold_lane_layout_tests;
 mod cold_lane_verdict_tests;
 
 #[cfg(all(test, unix))]
-mod fork_lane_child_tests {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    use std::os::unix::process::CommandExt as _;
-
-    fn stand_in(cloexec: bool) -> OwnedFd {
-        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let cmd = if cloexec {
-            libc::F_DUPFD_CLOEXEC
-        } else {
-            libc::F_DUPFD
-        };
-        // SAFETY: F_DUPFD(_CLOEXEC) on a descriptor this test owns.
-        let fd = unsafe { libc::fcntl(null.as_raw_fd(), cmd, 64) };
-        assert!(fd >= 64, "a stand-in at 64 or above: {fd}");
-        // SAFETY: a fresh descriptor this test exclusively owns.
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    }
-
-    fn child_holds(numbers: &[i32], hook: Option<Vec<i32>>) -> String {
-        let probe = numbers
-            .iter()
-            .map(|&fd| {
-                let held = aterm_spec::host::sh_held(fd);
-                format!("{held} && got=\"$got held:{fd}\"; ")
-            })
-            .collect::<String>();
-        let Some(handed) = hook else {
-            let dir = aterm_tempfile::tempdir().expect("a temp dir");
-            let report = dir.path().join("holds");
-            let status = aterm_uds::spawnfd::transparent("/bin/sh")
-                .args([
-                    "-c",
-                    &format!("got=; {probe}exec >\"$1\" </dev/null; printf '%s end\\n' \"$got\""),
-                    "sh",
-                ])
-                .arg(&report)
-                .status()
-                .expect("run the control");
-            assert!(status.success(), "{status}");
-            return std::fs::read_to_string(&report)
-                .expect("the control's report")
-                .trim()
-                .to_string();
-        };
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", &format!("got=; {probe}printf '%s end\\n' \"$got\"")]);
-        let strip = aterm_uds::spawnfd::InheritStrip::prepare();
-        // SAFETY: the hook runs between fork and exec; see the function.
-        unsafe {
-            cmd.pre_exec(move || super::fork_lane_child_holds(strip, &handed));
-        }
-        let out = cmd.output().expect("run the stand-in successor");
-        assert!(out.status.success(), "{out:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    #[test]
-    fn the_fork_lane_successor_holds_what_it_is_handed_and_nothing_else() {
-        let stray = stand_in(false);
-        let handed = stand_in(true);
-        let (s, h) = (stray.as_raw_fd(), handed.as_raw_fd());
-        assert_eq!(
-            child_holds(&[s, h], None),
-            format!("held:{s} end"),
-            "CONTROL: the transparent spawn carries the stray and not the flagged one"
-        );
-        assert_eq!(
-            child_holds(&[s, h], Some(vec![h])),
-            format!("held:{h} end"),
-            "the successor holds the handed descriptor and not the stray"
-        );
-        drop((stray, handed));
-    }
-
-    #[test]
-    fn the_cold_lane_exec_hands_over_nothing_this_process_holds() {
-        const STAGE: &str = "ATERM_TEST_COLD_EXEC_HAND_OVER";
-        if let Ok(stage) = std::env::var(STAGE) {
-            let stray = stand_in(false);
-            let fd = stray.as_raw_fd();
-            let _lifeline = (stage == "hand-over").then(super::cold_exec_hand_over);
-            let error = std::process::Command::new("/bin/sh")
-                .args(["-c", &aterm_spec::host::held_probe(fd)])
-                .exec();
-            panic!("the probe did not replace this helper: {error}");
-        }
-        let probe = |stage: &str| {
-            let mut helper = crate::test_alone::StandIn::this_test();
-            helper.command().env(STAGE, stage);
-            helper
-                .spawn()
-                .selected()
-                .status
-                .and_then(|status| status.code())
-        };
-        assert_eq!(
-            probe("plain"),
-            Some(3),
-            "CONTROL: a plain exec hands the probe the stray"
-        );
-        assert_eq!(
-            probe("hand-over"),
-            Some(0),
-            "the cold lane's exec handed the probe the stray"
-        );
-    }
-}
+#[path = "app_update_handoff_fork_lane_child_tests.rs"]
+mod fork_lane_child_tests;
 
 #[cfg(all(test, unix))]
-mod connection_drop_audit_tests {
-    use crate::session_store::ConnectionCarry;
-
-    fn row(src: &str, op: &str) -> ConnectionCarry {
-        ConnectionCarry {
-            src: src.to_string(),
-            dst: "s-0000000001000007d7d7".to_string(),
-            op: op.to_string(),
-        }
-    }
-
-    #[test]
-    fn the_attempt_carries_what_its_manifest_left_out_to_the_commit_which_audits_it() {
-        crate::test_log::install();
-        let src = "s-0000000001000006c6c6";
-        let arbiter = crate::HandoffAttemptArbiter::new();
-        assert!(arbiter.connections_left_out().is_empty(), "nothing yet");
-        arbiter.set_connections_left_out(Vec::new());
-        assert!(arbiter.connections_left_out().is_empty(), "none left out");
-        let left_out = vec![row(src, "read-screen"), row(src, "signal")];
-        arbiter.set_connections_left_out(left_out.clone());
-        arbiter.set_connections_left_out(vec![row(src, "write-input")]);
-        assert_eq!(
-            arbiter.connections_left_out(),
-            left_out.as_slice(),
-            "one manifest per attempt: the first record stands"
-        );
-        let mark = format!("EDGE: action=drop origin=handoff src={src}");
-        assert!(crate::test_log::containing(&mark).is_empty());
-        crate::App::audit_connections_left_out(arbiter.connections_left_out());
-        let audited = crate::test_log::containing(&mark);
-        assert_eq!(audited.len(), 2, "one drop per row: {audited:?}");
-        assert!(audited.iter().all(|record| record.target == "session_edge"));
-        assert!(
-            audited[0].message.ends_with("op=read-screen"),
-            "{audited:?}"
-        );
-        assert!(audited[1].message.ends_with("op=signal"), "{audited:?}");
-    }
-}
+#[path = "app_update_handoff_connection_drop_audit_tests.rs"]
+mod connection_drop_audit_tests;
 
 #[cfg(all(any(test, debug_assertions), target_os = "macos"))]
 #[aterm_spec_anchor::spec_unmodeled(

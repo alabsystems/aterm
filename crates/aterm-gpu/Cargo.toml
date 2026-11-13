@@ -31,6 +31,8 @@ dev-seams = []
 compute = ["dep:aterm-effects", "aterm-effects/int-bag-mlp"]
 
 [dependencies]
+# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 aterm-core = { path = "../aterm-core", default-features = false }
 # default-features = false: no compiled-in fonts (aterm-render's `embedded-font`
 # default); aterm-gui re-enables them natively through feature unification.

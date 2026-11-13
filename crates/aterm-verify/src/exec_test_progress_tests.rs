@@ -122,6 +122,66 @@ fn a_long_running_case_is_reported_once_without_deciding_or_ending_it() {
     );
 }
 
+#[test]
+fn case_events_keep_terminal_execution_separate_from_binary_elapsed() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("capture");
+    let mut capture = std::fs::File::create(&path).unwrap();
+    let events_path = dir.path().join("events");
+    let events = crate::event_log::EventLog::open(&events_path).unwrap();
+    let mut cases = LiveCases::open(&path, true).unwrap();
+    let watch = crate::exec::CaseWatch {
+        spec: "timed-cases".into(),
+        binary: "timed-fixture".into(),
+        hang_after: crate::exec::TEST_BINARY_HANG,
+        json: true,
+        stop_at_red: true,
+    };
+    // One poll sees the timeout before its timed end. A lookup into the completed timings
+    // would wrongly attach that later duration to the running notification.
+    for event in [
+        aterm_json::json!({"type":"test", "event":"started", "name":"earlier"}),
+        aterm_json::json!({"type":"test", "event":"ok", "name":"earlier", "exec_time":640.0}),
+        aterm_json::json!({"type":"test", "event":"started", "name":"timed"}),
+        aterm_json::json!({"type":"test", "event":"timeout", "name":"timed"}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"timed", "exec_time":0.25, "stdout":refused()}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"timed", "exec_time":99.0, "stdout":PLAIN}),
+        aterm_json::json!({"type":"test", "event":"started", "name":"untimed"}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"untimed", "stdout":refused()}),
+        aterm_json::json!({"type":"test", "event":"started", "name":"zero"}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"zero", "exec_time":0.0, "stdout":refused()}),
+        aterm_json::json!({"type":"test", "event":"started", "name":"invalid"}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"invalid", "exec_time":-1.0, "stdout":refused()}),
+        aterm_json::json!({"type":"test", "event":"started", "name":"red"}),
+        aterm_json::json!({"type":"test", "event":"failed", "name":"red", "exec_time":2.0, "stdout":PLAIN}),
+    ] {
+        writeln!(capture, "{event}").unwrap();
+    }
+    capture.flush().unwrap();
+    crate::exec::observe_reaped(&mut cases, &watch, Some(&events), Duration::from_secs(900));
+    let text = std::fs::read_to_string(events_path).unwrap();
+    let emitted: Vec<aterm_json::Value> = text
+        .lines()
+        .map(|line| aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap())
+        .collect();
+    let expected = [
+        ("timed", None, "RUNNING"),
+        ("timed", Some(0.25), "NOT RUN"),
+        ("untimed", None, "NOT RUN"),
+        ("zero", Some(0.0), "NOT RUN"),
+        ("invalid", None, "NOT RUN"),
+        ("red", Some(2.0), "FAIL"),
+    ];
+    assert_eq!(emitted.len(), expected.len());
+    for (event, (case, execution, outcome)) in emitted.iter().zip(expected) {
+        assert_eq!(event["case"].as_str(), Some(case));
+        assert_eq!(event["case_execution_s"].as_f64(), execution);
+        assert_eq!(event["binary_elapsed_s"].as_f64(), Some(900.0));
+        assert_eq!(event["outcome"].as_str(), Some(outcome));
+        assert_eq!(event["halts"].as_bool(), Some(false));
+    }
+}
+
 fn refused() -> String {
     format!("\nthread 'x' panicked at src/a.rs:1:1:\n{COULD_NOT_RUN_SENTINEL} — no fish\n")
 }
@@ -231,6 +291,7 @@ fn red(case: &str) -> Seen {
     Seen::Red {
         case: case.into(),
         marks: Marks::default(),
+        execution: None,
     }
 }
 
@@ -238,6 +299,7 @@ fn red_with(case: &str, refused: bool, disk: bool) -> Seen {
     Seen::Red {
         case: case.into(),
         marks: Marks { refused, disk },
+        execution: None,
     }
 }
 
@@ -245,6 +307,7 @@ fn spared(case: &str, refused: bool, disk: bool) -> Seen {
     Seen::Spared {
         case: case.into(),
         marks: Marks { refused, disk },
+        execution: None,
     }
 }
 

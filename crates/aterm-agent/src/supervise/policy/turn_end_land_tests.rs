@@ -158,10 +158,13 @@ fn land_reads_the_needs_table_as_labelled() {
 }
 
 /// A NEEDS YOU TOKEN ITS CLAUSE HAS FOR SUBJECT ASKS THE PERSON NOTHING (live 2026-11-04: `- **NEEDS
-/// YOU can be lost.** …`): its `YOU` is the head's name, not the person, so Land reads no `you can`
-/// there ([`needs::token_you`]) and a defense beside it lands. A `you can` that is no token's, and
-/// a question after a bare head, still hold. Negative control: on the reader before the rule each
-/// prose report below held on `you can`.
+/// YOU can be lost.** …`): its `YOU` is the head's name, not the person, so Land reads no phrase
+/// that opens on it (`you can`, `you could`: [`needs::token_you`]) and a defense beside it lands.
+/// Where the token's clause does not have it for subject, the `YOU` is the person's: a bare head
+/// before a modal and a verb but `be` names its need (`NEEDS YOU must log in …`), and past a
+/// row's start, where no closing mark makes the token a head, Land reads a phrase on it
+/// (`… main. NEEDS YOU must approve the deploy …`: `you must`). A `you can` that is no token's,
+/// and a question after a bare head, still hold.
 #[test]
 fn a_needs_you_token_its_clause_has_for_subject_asks_nothing() {
     let defense = "Nothing left: all on origin/main.";
@@ -177,6 +180,23 @@ fn a_needs_you_token_its_clause_has_for_subject_asks_nothing() {
             land_open_words(Some(&reply))
         );
     }
+    for said in [
+        "NEEDS YOU must log in to the Apple Developer portal and accept the new agreement.",
+        "NEEDS YOU should run `gh auth login`, then I can push.",
+        "NEEDS YOU would need to rotate the key.",
+    ] {
+        let reply = format!("Merged and pushed main.\n{said}\n{defense}");
+        assert!(!needs::needs_you(&reply).is_empty(), "{reply:?}");
+        assert!(!clean_defense(Some(&reply)), "{reply:?}");
+    }
+    let token = |said: &str| needs::token_you(said, said.find("YOU").expect("a token"));
+    assert!(token("- **NEEDS YOU can be lost.** A NEEDS YOU line …"));
+    let mid = "Merged and pushed main. NEEDS YOU must approve the deploy at \
+               https://example.com/deploy.";
+    assert!(!token(mid));
+    let reply = format!("{mid}\n{defense}");
+    assert!(needs::needs_you(&reply).is_empty(), "{reply:?}");
+    assert!(!clean_defense(Some(&reply)), "{reply:?}");
     for said in [
         "If you can, rotate the deploy key.",
         "The signing step needs you: you can run it from the Settings page.",

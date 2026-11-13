@@ -417,9 +417,7 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     assert_eq!(
         whole(&g, T0_UNIX),
         (
-            format!(
-                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
-            ),
+            format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
             "autopilot: cruise".to_owned()
         ),
         "no acts: v1's title, and the menu's line"
@@ -435,7 +433,7 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
         whole(&g, T0_UNIX).0,
         format!(
             "autopilot: cruise \u{2014} {cruise} \u{b7} last: ? answered {} 23:58 \
-             \u{b7} click: land \u{b7} right-click: more",
+             \u{b7} click: land",
             Weekday::of_days(today - 1).short()
         ),
         "one act, from yesterday"
@@ -452,8 +450,7 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
         title,
         format!(
             "autopilot: cruise \u{2014} {cruise} \u{b7} last: \u{2713} approved \
-             14:02, \u{21bb} kept going 13:56, ? answered {day} 23:58 \u{b7} click: land \u{b7} \
-             right-click: more"
+             14:02, \u{21bb} kept going 13:56, ? answered {day} 23:58 \u{b7} click: land"
         )
     );
     assert_eq!(short, "autopilot: cruise", "the mode phrase alone");
@@ -742,17 +739,17 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
         whole,
         format!(
             "autopilot: cruise \u{2014} {cruise} \u{b7} pausing until 18:41 after 3 short turns \
-             \u{b7} last: \u{2713} approved 18:35 \u{b7} click: land \u{b7} right-click: more"
+             \u{b7} last: \u{2713} approved 18:35 \u{b7} click: land"
         )
     );
     assert_eq!(short, "autopilot: cruise");
     assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
-    let [lean, v1, clicks, click] = lean_titles(&whole);
+    let [lean, v1, click] = lean_titles(&whole);
     assert_eq!(
         format!("{}{}", lean.0, lean.1),
         format!(
             "autopilot: cruise \u{2014} {cruise} \u{b7} pausing until 18:41 after 3 short turns \
-             \u{b7} click: land \u{b7} right-click: more"
+             \u{b7} click: land"
         ),
         "the first leaner form keeps the pause"
     );
@@ -762,13 +759,9 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
         "v1's words give it up"
     );
     assert_eq!(
-        format!("{}{}", clicks.0, clicks.1),
-        "autopilot: cruise \u{b7} click: land \u{b7} right-click: more",
-        "the clicks give it up with the explanation"
-    );
-    assert_eq!(
         format!("{}{}", click.0, click.1),
-        "autopilot: cruise \u{b7} click: land"
+        "autopilot: cruise \u{b7} click: land",
+        "the click gives it up with the explanation"
     );
     let (bare, _) = autopilot_title(
         AutopilotView::Land,
@@ -781,23 +774,19 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
         bare,
         format!(
             "autopilot: land \u{2014} {land} \u{b7} pausing until 18:41 after 3 short turns \
-             \u{b7} click: off \u{b7} right-click: more"
+             \u{b7} click: off"
         )
     );
-    let [lean, v1, clicks, click] = lean_titles(&bare);
+    let [lean, v1, click] = lean_titles(&bare);
     assert_eq!(lean, ("", ""));
     assert_eq!(
         format!("{}{}", v1.0, v1.1),
         format!("autopilot: land \u{2014} {land} \u{b7} click: off")
     );
     assert_eq!(
-        format!("{}{}", clicks.0, clicks.1),
-        "autopilot: land \u{b7} click: off \u{b7} right-click: more",
-        "the clicks give it up with the explanation"
-    );
-    assert_eq!(
         format!("{}{}", click.0, click.1),
-        "autopilot: land \u{b7} click: off"
+        "autopilot: land \u{b7} click: off",
+        "the click gives it up with the explanation"
     );
     let (plain, _) = autopilot_title(
         AutopilotView::Cruise,
@@ -810,12 +799,9 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
     let [lean, v1, ..] = lean_titles(&plain);
     assert_eq!(
         format!("{}{}", lean.0, lean.1),
-        format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more")
-    );
-    assert_eq!(
-        format!("{}{}", v1.0, v1.1),
         format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land")
     );
+    assert_eq!(v1, ("", ""), "no pause, no form without one");
 }
 
 #[test]

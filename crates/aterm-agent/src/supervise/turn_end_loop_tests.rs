@@ -12701,15 +12701,13 @@ fn the_wait_places_a_reset_across_a_dst_change_with_the_offset_there() {
 }
 
 /// A host that only listens for the canary's ladder, and answers its jobs
-/// reading with `evidence` (`Unknown` by default: no reading), or with `then`
-/// once it was told a call that made no progress. `raised` keeps each
-/// exception it was told, whole.
+/// reading with `evidence` (`Unknown` by default: no reading). `raised` keeps
+/// each exception it was told, whole.
 #[derive(Debug, Default)]
 struct LadderHost {
     told: std::sync::Mutex<Vec<String>>,
     raised: std::sync::Mutex<Vec<crate::supervise::policy::exception::Exception>>,
     evidence: crate::supervise::background::BackgroundEvidence,
-    then: Option<crate::supervise::background::BackgroundEvidence>,
 }
 
 impl IdleHost for LadderHost {
@@ -12734,17 +12732,10 @@ impl IdleHost for LadderHost {
             None => "unread:none".to_string(),
             Some(StallSeen::Unread { .. }) => "unread:some".to_string(),
             Some(StallSeen::OwnWork { .. }) => "own-work:some".to_string(),
-            Some(StallSeen::NoProgress { minutes, pid }) => {
-                format!("no-progress:{pid}:{minutes}")
-            }
         });
     }
     fn background_jobs(&self) -> crate::supervise::background::BackgroundEvidence {
-        let told = self.told.lock().unwrap();
-        match &self.then {
-            Some(then) if told.iter().any(|t| t.starts_with("no-progress:")) => then.clone(),
-            _ => self.evidence.clone(),
-        }
+        self.evidence.clone()
     }
 }
 
@@ -12859,14 +12850,18 @@ fn a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraw
     }
 }
 
+/// THE LADDER LEAVES TO THE JOBS READING WHAT IT NAMES (rules 2 and 6): background work whose
+/// calls the reading names, progressing or waiting on what they declared (`Waiting`), or at no
+/// progress (`NoProgress`, the facts door's to tell the agent), climbs no rung: no journal rung, no
+/// record for the window, no exception. NEGATIVE CONTROL: with no reading (`Unknown`) the ladder
+/// climbs every rung as before.
 #[test]
-fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_exception() {
+fn the_ladder_stands_down_where_the_jobs_reading_names_the_agents_calls() {
     use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
-    let run = |evidence: BackgroundEvidence, then: Option<BackgroundEvidence>| {
-        let (dir, path) = journal_file("stuck-kernel");
+    let run = |evidence: BackgroundEvidence| {
+        let (dir, path) = journal_file("stuck-jobs");
         let host = Arc::new(LadderHost {
             evidence,
-            then,
             ..LadderHost::default()
         });
         let mut m = Mock::new(vec![busy_screen(), memory_scrolled()]);
@@ -12880,21 +12875,21 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.setup.stuck_after = Duration::from_millis(30);
-            s.setup.background_settle = Duration::from_millis(30);
+            s.setup.background_settle = Duration::ZERO;
         });
         let (records, _) = journal_records(&path);
         let _ = std::fs::remove_dir_all(&dir);
-        let kind = |k: &str| -> Vec<String> {
-            records
-                .iter()
-                .filter(|r| r.line.starts_with(k))
-                .map(|r| r.line.clone())
-                .collect()
-        };
+        let rungs: Vec<String> = records
+            .iter()
+            .filter(|r| {
+                ["STUCK", "STALLED", "EXCEPTION"]
+                    .iter()
+                    .any(|k| r.line.starts_with(k))
+            })
+            .map(|r| r.line.clone())
+            .collect();
         (
-            kind("STUCK"),
-            kind("STALLED"),
-            kind("EXCEPTION"),
+            rungs,
             host.told.lock().unwrap().clone(),
             count(&m, "turn"),
             lines,
@@ -12905,90 +12900,26 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
             pid: 27098,
             pgid: 27090,
             birth: None,
-            exe: "aterm_gui-e0964a".to_string(),
+            episode: 1,
             task: Some("bplle5dxj".to_string()),
             quiet_ms: 31 * 60_000 + 59_000,
             wait: None,
+            held_by: None,
         },
     };
-    let (stuck, stalled, exception, told, turns, lines) = run(hung.clone(), None);
-    assert!(
-        stuck.is_empty(),
-        "the kernel explains the screen: no first rung: {stuck:#?}\n{lines:#?}"
-    );
-    assert_eq!(stalled.len(), 1, "rung 2 once: {stalled:#?}\n{lines:#?}");
-    for said in ["bplle5dxj", "pid 27098", "31 min"] {
-        assert!(stalled[0].contains(said), "{said:?} in {}", stalled[0]);
+    for evidence in [BackgroundEvidence::Waiting, hung] {
+        let (rungs, told, turns, lines) = run(evidence.clone());
+        assert!(
+            rungs.is_empty() && told.is_empty(),
+            "{evidence:?}: {rungs:#?} {told:#?}\n{lines:#?}"
+        );
+        assert_eq!(turns, 0, "the ladder types nothing");
     }
+    let (rungs, told, _, lines) = run(BackgroundEvidence::Unknown);
     assert_eq!(
-        exception.len(),
-        1,
-        "rung 3 once: {exception:#?}\n{lines:#?}"
-    );
-    assert!(
-        exception[0].contains("kind=stalled when=later")
-            && exception[0].contains("pid 27098")
-            && exception[0].contains("31 min"),
-        "{}",
-        exception[0]
-    );
-    assert_eq!(
-        told,
-        [
-            "no-progress:27098:31",
-            "exception:stalled",
-            "unread:none",
-            "exception:none"
-        ],
-        "the host hears the call at rung 2, the exception at rung 3, and their end"
-    );
-    assert_eq!(turns, 0, "the ladder types nothing");
-    let other = BackgroundEvidence::NoProgress {
-        worst: BackgroundCall {
-            pid: 31000,
-            pgid: 31000,
-            birth: None,
-            exe: "sleep".to_string(),
-            task: None,
-            quiet_ms: 20 * 60_000,
-            wait: None,
-        },
-    };
-    let (stuck, stalled, exception, told, _, lines) = run(hung, Some(other));
-    assert!(stuck.is_empty(), "{stuck:#?}\n{lines:#?}");
-    assert_eq!(
-        (stalled.len(), exception.len()),
-        (2, 1),
-        "{stalled:#?} {exception:#?}\n{lines:#?}"
-    );
-    assert!(
-        stalled[0].contains("pid 27098") && stalled[1].contains("pid 31000"),
-        "{stalled:#?}"
-    );
-    assert!(exception[0].contains("pid 31000"), "{}", exception[0]);
-    assert_eq!(
-        told,
-        [
-            "no-progress:27098:31",
-            "no-progress:31000:20",
-            "exception:stalled",
-            "unread:none",
-            "exception:none"
-        ],
-        "the second call's record, then its exception"
-    );
-    let (stuck, stalled, exception, told, _, lines) = run(BackgroundEvidence::Unknown, None);
-    assert_eq!(
-        (stuck.len(), stalled.len(), exception.len()),
-        (1, 1, 1),
-        "{stuck:#?} {stalled:#?} {exception:#?}\n{lines:#?}"
-    );
-    assert!(
-        stalled
-            .iter()
-            .chain(&exception)
-            .all(|l| !l.contains("pid 27098")),
-        "{stalled:#?} {exception:#?}"
+        rungs.len(),
+        3,
+        "CONTROL: every rung: {rungs:#?}\n{lines:#?}"
     );
     assert_eq!(
         told,
@@ -12999,84 +12930,6 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
             "exception:none"
         ]
     );
-}
-
-#[test]
-fn a_call_named_after_an_unnamed_rung_is_told_at_once_not_a_pace_later() {
-    use super::super::wall_memory::StuckRung;
-    use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
-    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
-    let hung = BackgroundEvidence::NoProgress {
-        worst: BackgroundCall {
-            pid: 27098,
-            pgid: 27090,
-            birth: None,
-            exe: "aterm_gui-e0964a".to_string(),
-            task: None,
-            quiet_ms: 31 * 60_000,
-            wait: None,
-        },
-    };
-    let scrolled = Screen {
-        rows: memory_scrolled(),
-        ..Screen::default()
-    };
-    let climb = |rung: StuckRung, told: Option<Option<u32>>, evidence: BackgroundEvidence| {
-        let host = Arc::new(LadderHost {
-            evidence,
-            ..LadderHost::default()
-        });
-        let mut m = Mock::new(vec![busy_screen()]);
-        m.title = Some("✳ Claude Code".to_string());
-        let mut s = session(&mut m, None);
-        s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
-            Instant::now(),
-            0,
-        )))));
-        s.setup.stuck_after = Duration::from_secs(120);
-        s.setup.background_settle = Duration::ZERO;
-        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
-        s.stuck_rung = rung;
-        // The screen has stood ten minutes, past every rung's wait: only the pace holds a rung.
-        let since = s.fx.mono();
-        s.fx.sleep(Duration::from_secs(600));
-        let now = s.fx.mono();
-        s.stuck_asked = Some(now);
-        s.stuck_told = told.map(|pgid| (since, pgid));
-        let mut heard = Heard::default();
-        s.stuck_busy_note(&scrolled, Some(since), &mut heard);
-        let rung = s.stuck_rung;
-        drop(s);
-        (rung, heard.noted, host.told.lock().unwrap().clone())
-    };
-    for (name, rung, told) in [
-        ("a STUCK", StuckRung::Said, None),
-        ("a STALLED that named no call", StuckRung::Told, Some(None)),
-    ] {
-        let (now, noted, host) = climb(rung, told, hung.clone());
-        assert_eq!(now, StuckRung::Told, "after {name}: {noted:#?}");
-        assert!(
-            noted.len() == 1 && noted[0].starts_with("STALLED") && noted[0].contains("pid 27098"),
-            "after {name}: {noted:#?}"
-        );
-        assert_eq!(host, ["no-progress:27098:31"], "after {name}");
-    }
-    for (name, rung, told, evidence) in [
-        (
-            "an unnamed rung, no call",
-            StuckRung::Said,
-            None,
-            BackgroundEvidence::Unknown,
-        ),
-        ("a named STALLED", StuckRung::Told, Some(Some(27090)), hung),
-    ] {
-        let (now, noted, host) = climb(rung, told, evidence);
-        assert_eq!(now, rung, "{name} keeps the pace: {noted:#?}");
-        assert!(
-            noted.is_empty() && host.is_empty(),
-            "{name}: {noted:#?} {host:#?}"
-        );
-    }
 }
 
 /// What a canary's looks came to: the rung after each, what the host heard, each note's first
@@ -14644,8 +14497,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
-            // The person's own exchange is Land's to leave where it opens the session (owner
-            // rulings 2026-10-26 and 2026-10-27).
+            // The person's own exchange is Land's to leave where it opens the session.
             autopilot: Autopilot::Land,
             ..owners_policy()
         },
@@ -14707,7 +14559,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
         "an earlier program's act: {lines:#?}"
     );
     // A record without those words (an older build's) after that act was left after work: Land
-    // carries the work on (owner ruling 2026-10-27).
+    // carries the work on.
     let older = body.replace(approvals::LEFT_OPENS, "");
     std::fs::write(&ledger, format!("{earlier}\n{older}")).expect("ledger");
     let (_, lines) = run(&ledger, false);
@@ -14740,7 +14592,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
         "no row: {lines:#?}"
     );
     // CRUISE NEVER PARKS: the same greeting to the person's own message is carried under Cruise,
-    // and no row leaves it to them (owner ruling 2026-10-26).
+    // and no row leaves it to them.
     std::fs::write(&ledger, "").expect("ledger");
     let cruise = SuperviseOpts {
         policy: SupervisorConfig {
@@ -14811,8 +14663,7 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -14935,8 +14786,7 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -15052,8 +14902,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -15152,8 +15001,7 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -15284,8 +15132,7 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -15392,8 +15239,7 @@ fn claude_codes_idle_compaction_is_no_turn() {
             true,
         ),
     ];
-    // The person's own exchange is Land's to leave where it opens the session; Cruise carries it
-    // (owner rulings 2026-10-26 and 2026-10-27).
+    // The person's own exchange is Land's to leave where it opens the session; Cruise carries it.
     let cruise_left = (
         "left, under Cruise",
         run(vec![greeted.clone(), left.clone()]),
@@ -15537,8 +15383,7 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave where it opens the session (owner
-                // rulings 2026-10-26 and 2026-10-27).
+                // The person's own exchange is Land's to leave where it opens the session.
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -15718,6 +15563,8 @@ struct AccountHost {
     /// asks whether the agent resumes ([`IdleHost::agent_resumed`]), as a window's host refreshes
     /// the snapshot it forgot at the last agent's exit; it is named from then on.
     late_agent: std::sync::Mutex<Option<(u32, i64, Option<&'static str>)>>,
+    /// What the loop told of the session's own login ([`IdleHost::login_seen`]), in order.
+    login_facts: std::sync::Mutex<Vec<crate::supervise::policy::turn_end::LoginSeen>>,
 }
 
 impl AccountHost {
@@ -16017,6 +15864,9 @@ impl IdleHost for AccountHost {
     }
     fn account_served(&self) {
         self.said.lock().unwrap().push("served".to_string());
+    }
+    fn login_seen(&self, seen: crate::supervise::policy::turn_end::LoginSeen) {
+        self.login_facts.lock().unwrap().push(seen);
     }
     fn account_answered(&self, bad: AccountBad) {
         self.said.lock().unwrap().push(
@@ -19605,6 +19455,53 @@ fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
     assert!(!decided);
     assert!(asked.is_empty(), "{asked:?}");
     assert_eq!(told, None);
+}
+
+/// THE HOST HEARS WHAT A POINT SHOWS OF THE SESSION'S OWN LOGIN, ONCE A TURN, WITH THE ACCOUNTS
+/// OFF: a sign-in wall is told lost though no account moves, no login is repaired and no roster
+/// row is named, and however many looks the point takes it is told once; the worked point
+/// after it is told served, once.
+/// CONTROL: a point no turn worked to, with no wall, tells nothing.
+#[test]
+fn the_host_is_told_the_logins_own_end_and_return_once_with_accounts_off() {
+    use crate::supervise::policy::turn_end::LoginSeen;
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let host = AccountHost::scripted(&[None], &[]);
+    let mut opts = account_opts(&host);
+    opts.policy.accounts = crate::harness::accounts::Mode::Off;
+    opts.policy.logins = false;
+    let mut m = Mock::new(vec![login.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(ACCOUNT_NOW, PDT);
+    let t = Instant::now();
+    let point = |rows: &[String], seq: u64| Screen {
+        rows: rows.to_vec(),
+        seq,
+        cursor_col: 2,
+        ..Screen::default()
+    };
+    let told = || host.login_facts.lock().unwrap().clone();
+    let fresh = point(&ended("Nothing ran yet."), 100);
+    let mut r = s.turn_end_reading(&fresh, None, &opts);
+    s.fold_point(&mut r, t, fresh.seq, &opts);
+    assert_eq!(told(), [], "CONTROL: no turn worked and no wall");
+    for seq in [102, 103] {
+        let lost = point(&login, seq);
+        let mut r = s.turn_end_reading(&lost, Some(Duration::from_secs(180)), &opts);
+        s.fold_point(&mut r, t, lost.seq, &opts);
+        assert_eq!(told(), [LoginSeen::Lost], "look {seq}");
+    }
+    for seq in [104, 105] {
+        let back = point(&ended("Carried on: stage 3 is done."), seq);
+        let mut r = s.turn_end_reading(&back, Some(Duration::from_secs(240)), &opts);
+        s.fold_point(&mut r, t, back.seq, &opts);
+        assert_eq!(told(), [LoginSeen::Lost, LoginSeen::Served], "look {seq}");
+    }
 }
 
 #[test]
@@ -32775,8 +32672,24 @@ fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
         "HOST seq=2 restart:route-token ask=route-token@{TEST_NOW} claimed=no step=wait:resume"
     ));
     assert_eq!(journaled_open_moves(&unclaimed, Some("@s-1")), (None, None));
-    let no_move = note(&format!(
+    let model = note(&format!(
         "HOST seq=2 restart:model ask=model@{TEST_NOW} claimed={} step=wait:resume",
+        TEST_NOW + 3
+    ));
+    assert_eq!(
+        journaled_open_moves(&model, Some("@s-1")),
+        (
+            Some(RestartRun {
+                kind: Restart::MODEL,
+                at: TEST_NOW,
+                claimed: Some(TEST_NOW + 3),
+            }),
+            None
+        ),
+        "the Fable limit's move onto Opus is a move"
+    );
+    let no_move = note(&format!(
+        "HOST seq=2 restart:memory ask=memory@{TEST_NOW} claimed={} step=wait:resume",
         TEST_NOW + 3
     ));
     assert_eq!(journaled_open_moves(&no_move, Some("@s-1")), (None, None));

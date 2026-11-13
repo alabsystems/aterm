@@ -132,7 +132,9 @@ impl Probe {
     /// Current thermal throttle level, or [`Why`] it is unavailable.
     ///
     /// # Errors
-    /// Returns [`Why`] when the platform or machine provides no reading (always on macOS).
+    /// Returns [`Why`] when the platform or machine provides no reading (always on macOS). On
+    /// Windows the level is the most constrained ACPI thermal zone's passive limit, banded
+    /// ([`crate::win_gpu::throttle_of`]), and [`Why::Absent`] on a machine that lists no zone.
     pub fn throttle(&mut self) -> Result<Throttle, Why> {
         #[cfg(target_os = "linux")]
         {
@@ -142,7 +144,15 @@ impl Probe {
         {
             Err(Why::NotRead)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        {
+            crate::win_pdh::throttle()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            all(windows, target_pointer_width = "64")
+        )))]
         {
             Err(Why::Unsupported)
         }
@@ -263,7 +273,12 @@ pub fn withdrawn_cores() -> Option<Vec<u16>> {
 
 /// `available_parallelism` as a core count, `0` where unknown.
 pub(crate) fn parallelism() -> u16 {
-    std::thread::available_parallelism().map_or(0, |n| u16::try_from(n.get()).unwrap_or(u16::MAX))
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the machine's layout where no probe reads it, not a pool's size"
+    )]
+    let parallelism = std::thread::available_parallelism();
+    parallelism.map_or(0, |n| u16::try_from(n.get()).unwrap_or(u16::MAX))
 }
 
 /// Names for `n` ranked performance levels, fastest first.
@@ -331,7 +346,7 @@ pub(crate) struct Level {
 pub(crate) struct DtCpu {
     /// `logical-cpu-id`.
     pub id: u16,
-    /// `cluster-type`'s letter (`b'P'`, `b'E'`).
+    /// `cluster-type`'s letter (`b'P'`, `b'M'`, `b'E'`).
     pub kind: Option<u8>,
     /// `l2-cache-size`, bytes.
     pub l2: Option<u64>,
@@ -345,10 +360,24 @@ fn level_of(levels: &[Level], cpu: &DtCpu) -> Option<usize> {
             return Some(i);
         }
     }
-    match (levels.len(), cpu.kind) {
-        (1, _) => Some(0),
-        (2, Some(b'P')) => Some(0),
-        (2, Some(b'E')) => Some(1),
+    if levels.len() == 1 {
+        return Some(0);
+    }
+    // Super and Performance can share an L2 size. Match the device-tree class to its
+    // named perflevel rather than assuming that a chip has just two classes.
+    let name = match cpu.kind? {
+        b'E' => "Efficiency",
+        b'M' => "Performance",
+        b'P' if levels.iter().any(|l| l.name.eq_ignore_ascii_case("Super")) => "Super",
+        b'P' => "Performance",
+        _ => return None,
+    };
+    let mut hits = levels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.name.eq_ignore_ascii_case(name));
+    match (hits.next(), hits.next()) {
+        (Some((i, _)), None) => Some(i),
         _ => None,
     }
 }
@@ -633,7 +662,8 @@ pub(crate) fn memory_detail_of(
 pub struct MachineWords {
     /// CPU brand string.
     pub cpu: Option<String>,
-    /// The OS and its version (`macOS 27.0.1`; Linux `PRETTY_NAME`).
+    /// The OS and its version (`macOS 27.0.1`; Linux `PRETTY_NAME`; Windows its product name and
+    /// build, `Windows 11 Home 26200`).
     pub os: Option<String>,
 }
 
@@ -660,7 +690,15 @@ pub fn machine_words() -> MachineWords {
     {
         crate::linux::Root::system().machine_words()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::machine_words()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         MachineWords::default()
     }
@@ -700,22 +738,25 @@ pub struct GpuReading {
     pub renderer_pct: Option<u8>,
     /// "Tiler Utilization %", at most 100.
     pub tiler_pct: Option<u8>,
-    /// "In use system memory", bytes.
+    /// "In use system memory", bytes (Windows: the adapter's `Dedicated Usage` plus its
+    /// `Shared Usage`, what Task Manager calls GPU memory).
     pub in_use_bytes: Option<u64>,
-    /// Driver-allocated system memory in bytes.
+    /// Driver-allocated system memory in bytes (Windows: the adapter's `Total Committed`).
     pub alloc_bytes: Option<u64>,
     /// Cumulative GPU fault recoveries since driver start.
     pub recoveries: Option<u64>,
     /// `gpu-core-count` on the accelerator entry, where present.
     pub cores: Option<u16>,
     /// Accelerator model/class name (macOS); on Linux, NVML's name for an NVIDIA card it read
-    /// (`NVIDIA GB10`), else the DRM driver's name.
+    /// (`NVIDIA GB10`), else the DRM driver's name; on Windows the adapter's description as
+    /// DirectX lists it (`AMD Radeon 780M Graphics`).
     pub name: Option<String>,
     /// Reason [`Self::device_pct`] is `None` (such as [`Why::Asleep`] or [`Why::Unsupported`]).
     pub unread: Option<Why>,
     /// Whether the GPU has no memory of its own and works in the system's, as its reader knows
     /// it: an Apple GPU (macOS), or an NVIDIA card NVML reports no memory of its own for and that
-    /// addresses system memory through ATS (Linux). `false` where the reader cannot tell.
+    /// addresses system memory through ATS (Linux), or an adapter DirectX lists with no dedicated
+    /// video memory (Windows). `false` where the reader cannot tell.
     pub unified: bool,
     /// The GPU's power draw, milliwatts, where its reader reads one (Linux: NVML's board power
     /// for an NVIDIA card), or why it did not this time; `None` where no reader of it exists
@@ -730,6 +771,16 @@ pub(crate) fn percent_of(value: i64) -> Option<u8> {
 }
 
 /// Read device-wide GPU utilization and memory, or `None` if absent or unsupported.
+///
+/// On Windows the figure is a rate over the time since this process's last read (the
+/// `GPU Engine` counters' running time, each engine's processes summed and the adapter's busiest
+/// engine taken, as Task Manager draws it), of the busiest hardware adapter. One query stays
+/// open for the process's life, so a read is one collection (about 2 ms); a read within 50 ms
+/// of the last returns what that one read. The process's first read opens the query (about a
+/// quarter of a second, once: PDH loads its counter names) and takes two collections 50 ms
+/// apart so that it has a figure too. A collection that fails reads nothing and leaves the next
+/// one's window where it was; DirectX's adapter rows, which name the adapter, are a cache
+/// rewritten minutes after boot, and are read again while they name no live adapter.
 #[must_use]
 pub fn gpu() -> Option<GpuReading> {
     #[cfg(target_os = "macos")]
@@ -740,9 +791,34 @@ pub fn gpu() -> Option<GpuReading> {
     {
         crate::linux::Root::system().gpu()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win_pdh::gpu()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         None
+    }
+}
+
+/// [`gpu`] for a reading that carries the GPU beside the figures its caller asked for (a
+/// capacity reading, whose callers mostly want its memory, load or volume): [`gpu`] itself on
+/// macOS and Linux; on Windows [`gpu`] only once this process has read the GPU, and `None`
+/// before, so a one-shot process that never asks for the GPU never pays to open its query
+/// (about a third of a second: PDH loads its counter names, then two collections 50 ms apart).
+#[must_use]
+pub fn gpu_if_read() -> Option<GpuReading> {
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win_pdh::gpu_if_open()
+    }
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
+    {
+        gpu()
     }
 }
 
@@ -755,14 +831,20 @@ pub struct GpuDriver {
     pub version: Option<String>,
 }
 
-/// Read the GPU driver's identity afresh, or `None` where no accelerator entry is found (always off macOS).
+/// Read the GPU driver's identity afresh, or `None` where no accelerator entry is found (always
+/// on Linux). On Windows it is the driver version of the adapter [`gpu`] reports, as DirectX
+/// lists it (`32.0.22029.15003`), with no bundle.
 #[must_use]
 pub fn gpu_driver() -> Option<GpuDriver> {
     #[cfg(target_os = "macos")]
     {
         crate::macos::gpu_driver()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win_pdh::gpu_driver()
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         None
     }
@@ -855,14 +937,23 @@ pub(crate) fn client_of(
 }
 
 /// Read every GPU user client's creator and cumulative GPU time, or `None` where no accelerator
-/// answers (every OS but macOS). Registry reads only: no client is opened and no GPU device made.
+/// answers (always on Linux). Registry reads only: no client is opened and no GPU device made.
+///
+/// On Windows a client is one `GPU Engine` instance (one process on one engine of one adapter,
+/// every user's), its id [`crate::win_gpu::entry_of`], its time the instance's `Running Time`,
+/// and its name the process's from one sweep (empty for a process that is gone); the instances
+/// are those of [`gpu`]'s last collection, at most 50 ms old.
 #[must_use]
 pub fn gpu_clients() -> Option<GpuClients> {
     #[cfg(target_os = "macos")]
     {
         crate::macos::gpu_clients()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win_pdh::gpu_clients()
+    }
+    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
     {
         None
     }
@@ -1084,7 +1175,7 @@ pub struct LinkCounters {
 /// Point-in-time state and cumulative traffic counters for one network interface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkReading {
-    /// Its name (`en0`, `wlan0`).
+    /// Its name (`en0`, `wlan0`; on Windows its alias, `Wi-Fi`, `Ethernet 2`).
     pub name: String,
     /// Its interface index.
     pub index: u32,
@@ -1096,7 +1187,8 @@ pub struct LinkReading {
     pub loopback: bool,
     /// Whether backed by a physical device.
     pub physical: Option<bool>,
-    /// Driver-reported link rate in bits per second, if known.
+    /// Driver-reported link rate in bits per second, if known (Windows: the receive link speed,
+    /// else the transmit one).
     pub rate_bps: Option<u64>,
     /// Received.
     pub rx: LinkCounters,
@@ -1119,10 +1211,12 @@ pub(crate) fn never_the_machines(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// True when `link` is an active physical non-loopback machine interface.
+/// True when `link` is an active physical non-loopback machine interface. The Unix names that
+/// are never the machine's (`utun`, `bridge`, …) are not asked of a Windows link, whose name is
+/// the alias a person may have given it and whose connector bit already says what it is.
 #[must_use]
 pub fn counts_toward_machine(link: &LinkReading) -> bool {
-    if !link.up || link.loopback || never_the_machines(&link.name) {
+    if !link.up || link.loopback || (!cfg!(windows) && never_the_machines(&link.name)) {
         return false;
     }
     match link.physical {
@@ -1162,7 +1256,16 @@ pub fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
     {
         crate::linux::links_under_into(Path::new("/"), scratch)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let _ = scratch;
+        crate::win::net_links()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         let _ = scratch;
         None
@@ -1240,7 +1343,9 @@ pub struct TcpSummary {
     pub counts: TcpCounts,
     /// Only `ESTABLISHED` and `TIME_WAIT` were read, from the kernel's counters: Linux holds no
     /// all-states dump yet, or its self-check retired it. Every other state is unread, not 0, and
-    /// `ESTABLISHED` may hold `CLOSE_WAIT` (`crate::linux::tcp::reading_counts`).
+    /// `ESTABLISHED` may hold `CLOSE_WAIT` (`crate::linux::tcp::reading_counts`). On Windows only
+    /// where the connection tables did not read and the statistics' `ESTABLISHED` count
+    /// (`CLOSE_WAIT` in it) stands alone.
     pub counters_only: bool,
     /// Median kernel smoothed RTT (milliseconds), if any. On macOS, `t_srtt` across established
     /// non-loopback connections. On Linux, `tcpi_rtt` across at most 64 followed connections, each
@@ -1269,7 +1374,9 @@ pub fn tcp_summary() -> Option<TcpSummary> {
 }
 
 /// Read machine-wide TCP state counts and passive smoothed RTT using caller-provided `scratch` storage
-/// (macOS's table; Linux reads its counters and the newest dump, [`crate::linux::tcp::reading`]).
+/// (macOS's table; Linux reads its counters and the newest dump, [`crate::linux::tcp::reading`];
+/// Windows reads both families' connection tables, [`crate::win_net::tcp_summary_of_tables`],
+/// and `GetTcpStatisticsEx` where they do not read, [`crate::win_net::tcp_summary_of`]).
 #[must_use]
 pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     #[cfg(target_os = "macos")]
@@ -1281,7 +1388,16 @@ pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
         let _ = scratch;
         crate::linux::tcp::reading()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let _ = scratch;
+        crate::win::tcp_summary()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         let _ = scratch;
         None

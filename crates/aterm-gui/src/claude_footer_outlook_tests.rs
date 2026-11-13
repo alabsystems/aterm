@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The account unit's inks and the Accounts card's (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+//! The account unit's inks and the Account card's (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
 //! §1.2, §1.4, §4.1): the unit's name, figure, reset, joins and a projected stop's words on the
 //! pane's rule, and the card's drawn rows and warn words, each in the glass's tokens under every
 //! palette, over every built-in scheme.
@@ -49,7 +49,7 @@ fn unit(stop: bool) -> FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some("weekly 63% used".into()),
+            weekly: Some("weekly 37% left".into()),
             ..SubscriptionDisplay::default()
         }),
         quota: Some(view),
@@ -57,8 +57,8 @@ fn unit(stop: bool) -> FooterFacts {
     }
 }
 
-/// A card's drawn row and its stop note, every ink the outlook draws on the card: two read
-/// levels, now's `▕`, the projected line, `→` and a name, `┄`, `╳` and `↺`.
+/// A card's drawn row and a warn note, every ink a card draws a row in: two read levels, a
+/// quiet `▕`, `→` and a name, `┄`, `╳` and `↺`.
 fn card_rows() -> Vec<MenuRow> {
     let cell = |ch: char, ink: PlotInk| PlotCell {
         ch,
@@ -69,12 +69,9 @@ fn card_rows() -> Vec<MenuRow> {
         cell('\u{2583}', PlotInk::Read),
         cell('\u{2585}', PlotInk::Read),
         cell('\u{2595}', PlotInk::Axis),
-        cell('\u{1fb78}', PlotInk::Ahead),
-        cell('\u{1fb76}', PlotInk::Ahead),
         cell('\u{2192}', PlotInk::Mark),
         cell('a', PlotInk::Value),
         cell('\u{2504}', PlotInk::Track),
-        cell('\u{2594}', PlotInk::Ahead),
         cell('\u{2573}', PlotInk::Warn),
         cell('\u{21ba}', PlotInk::Mark),
     ];
@@ -198,7 +195,7 @@ fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
         "{lits} lit, {values} value, {quiets} quiet, {warns} warn cells"
     );
     assert!(days > 0, "Aterm Day's mark was looked at");
-    // CONTROL: the washed-out look the owner ruled against (2026-10-17): the mark mixed toward
+    // CONTROL: the washed-out look that is ruled out: the mark mixed toward
     // Day's ground loses its chroma below the floor.
     assert!(
         washed > 0,
@@ -268,11 +265,10 @@ fn a_glass_card_stands_on_the_panes_ground_and_a_stop_on_a_warn_wash() {
 /// T20 ON THE ACCOUNTS CARD: over every built-in scheme, under every palette and none, with its
 /// own accent and each macOS accent, the card's drawn cells wear the glass's tokens on the
 /// card's ground, the pane's own under a palette (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-/// §1.4, §4.1): a read level its column's mark at 3:1 or more (4.5:1 on paper), the projected
-/// line its column's letter at 4.5:1, `┄` the track at 3:1, `→` and `↺` the lit ink, a stop's
-/// words the warn ink at 4.5:1 and bold, `╳` bold on a wash of a hued warn ink and floored on it
-/// to 4.5:1; on Aterm Day under Cruise and Land the levels and the line keep the vivid law
-/// ([`day_vivid`]). The system accent reads nowhere on the card: every accent paints the same
+/// §1.4, §4.1): a read level its column's mark at 3:1 or more (4.5:1 on paper), `┄` the track
+/// at 3:1, `→` and `↺` the lit ink, a stop's words the warn ink at 4.5:1 and bold, `╳` bold on a
+/// wash of a hued warn ink and floored on it to 4.5:1; on Aterm Day under Cruise and Land the
+/// levels keep the vivid law ([`day_vivid`]). The system accent reads nowhere on the card: every accent paints the same
 /// cells. Negative controls: the accent meter the card wore before (`legible_on(accent,
 /// card_bg)`) is not the column's mark under some accent, and on Day under the graphite accent
 /// it is grey, below the vivid law.
@@ -345,12 +341,6 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                             let floor = if light { NAME_CONTRAST } else { ICON_CONTRAST };
                             (glass.mark(at), floor, false)
                         }
-                        '\u{1fb78}' | '\u{1fb76}' | '\u{2594}' => {
-                            if vivid {
-                                assert!(day_vivid(pack_rgb(cell.fg)), "{what}: the line on Day");
-                            }
-                            (glass.letter(at), NAME_CONTRAST, false)
-                        }
                         '\u{2504}' => (glass.track(), ICON_CONTRAST, false),
                         '\u{2192}' | '\u{21ba}' => (glass.lit(), NAME_CONTRAST, false),
                         '\u{2573}' => {
@@ -402,12 +392,12 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
     install_system_accent(None);
     let schemes = builtin_names().len();
     assert!(
-        checked >= schemes * palettes.len() * accents.len() * 9,
+        checked >= schemes * palettes.len() * accents.len() * 6,
         "{checked} card cells"
     );
     assert!(days > 0, "Aterm Day's levels were looked at");
     // CONTROLS: the accent meter the card wore before S6 is not the glass's mark, and it takes
-    // the washed-out look the owner ruled against (2026-10-17) on Day under a grey accent.
+    // the washed-out look that is ruled out, on Day under a grey accent.
     assert!(accent_meters > 0, "CONTROL: the accent meter is the mark");
     assert!(dull > 0, "CONTROL: the accent meter stays vivid on Day");
 }

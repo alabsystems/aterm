@@ -372,14 +372,16 @@ fn a_warm_look_looks_at_each_file_once_and_opens_none() {
 }
 
 /// A look judges whether its observation guards the lock at the vault's path once, through its
-/// glance ([`client::StateLock::observes_in`]): a warm look's memo asks (`Memo::read_keyed_under`)
-/// and an access's currency checks through it (`VaultLook::held`, then the memo ask under it),
-/// each of which judges it before it reads under the look, take one `lstat` of the lock's path,
-/// the look's, and judge it on their own calls no more than the look's own observation did
+/// glance ([`client::StateLock::observes_in`]): a warm look's memo asks (`Memo::read_under`) and
+/// an access's currency checks through it (`VaultLook::held`, then the memo ask under it), each
+/// of which reads under the look only once the look judged it, take one `lstat` of the lock's
+/// path, the look's, and judge it on their own calls no more than the look's own observation did
 /// (`client::lock_judgements_of`), where the asks' own calls each judge their own.
-/// NEGATIVE CONTROLS (2026-11-10): with `VaultLook::held` judging on its own call
-/// (`StateLock::observes`), or `Memo::read_keyed_under`, a look's asks judge the lock on their own
-/// calls (`a look's own lock judgements`).
+/// NEGATIVE CONTROLS: with `VaultLook::held` judging on its own call (`StateLock::observes`,
+/// 2026-11-10), or with `Memo::read_under`'s whole guard judging on its own call
+/// (`under.lock().observes(paths)` in place of `under.caching_for(paths) ||
+/// under.lock().observes_in(paths, Some(under.glance()))`, 2026-11-11: `left: 5, right: 1`), a
+/// look's asks judge the lock on their own calls (`a look's own lock judgements`).
 #[test]
 fn a_look_judges_the_lock_it_observes_once() {
     let vault = Vault::new();
@@ -447,7 +449,7 @@ fn a_look_reads_the_records_as_they_stand_when_it_looks() {
 /// A look taken while a writer holds the state lock observes nothing, and reads the records
 /// afresh, never what its memo kept from before that writer: a writer mid-apply meets the read,
 /// as it did before the look.
-/// NEGATIVE CONTROL (2026-11-08): with the records' memo not quiet (`Memo::keyed(inputs,
+/// NEGATIVE CONTROL (2026-11-08): with the records' memo not quiet (`Memo::of(Set::Vault,
 /// false)`), the look under the writer gives what it kept and opens nothing (`a look under a
 /// writer reads the records afresh`).
 #[test]
@@ -524,7 +526,7 @@ fn an_ask_for_the_records_outside_a_look_asks_their_memo() {
 }
 
 /// What a table session's open and the checks a local batch makes at once after it ask
-/// (`aterm-db`'s `Replica::observe`), through `look`: the custody, the access, the access's
+/// (`aterm-db`'s `Replica::admit`), through `look`: the custody, the access, the access's
 /// currency twice, and the peer's roster. The access it opened, and each check's answer.
 fn a_session_through(vault: &Vault, look: &client::VaultLook<'_>) -> SessionJudged {
     let custody = vault.bootstrap.revalidate_custody_in(look);
@@ -674,6 +676,336 @@ fn a_session_look_observes_once_and_judges_as_its_own_calls() {
             }),
             looked,
             "the next look looks again"
+        );
+    });
+}
+
+/// What a warm table session's open and checks through `look` ([`a_session_through`]), and two
+/// more checks of the currency of the access it opened, derived of the moment `look` stands for,
+/// with what they answered.
+fn derived_through(
+    vault: &Vault,
+    look: &client::VaultLook<'_>,
+) -> (client::LookDerivations, SessionJudged) {
+    let before = client::test_look_derivations();
+    let judged = a_session_through(vault, look);
+    let access = judged
+        .access
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .expect("CONTROL: the look opens an access");
+    for _ in 0..2 {
+        assert!(access.is_current_in(&vault.journal, look));
+    }
+    (client::test_look_derivations().since(before), judged)
+}
+
+/// A look judges whether its observation guards the lock at the vault's path once
+/// (`VaultLook::held`): a warm table session's open and checks through it, and two more checks
+/// of its access's currency, judge it once through the look's glance
+/// (`client::test_look_derivations`) and never again after they found it held, and answer as the
+/// asks' own calls do, through a look of its own and through one standing on a source read; the
+/// next look judges it again.
+/// NEGATIVE CONTROLS (2026-11-11): with `Moment::hold` judging whether or not its look found the
+/// lock held, a look judges it 8 times (`left: 8, right: 1`, `a look's lock judgments`); with
+/// `Moment::hold` setting `held` before it judges, `a_source_read_look_judges_as_a_look_of_its_own`
+/// and `a_session_look_with_no_observation_judges_as_its_own_calls` open an access under the
+/// writer (`a source read look at a lock put away`, `a look at a lock put away`).
+#[test]
+fn a_look_judges_its_lock_once() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.checks, Some((true, Ok(true)))));
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let source_read = || {
+            client::try_commons_source_read(&vault.paths)
+                .unwrap()
+                .expect("no writer holds the vault")
+        };
+        for which in ["its own", "a source read's", "the next one"] {
+            let look = if which == "a source read's" {
+                source_read().into_look(&vault.paths)
+            } else {
+                client::VaultLook::new(&vault.paths)
+            };
+            let (derived, judged) = derived_through(&vault, &look);
+            assert_eq!(
+                derived.derived.lock_judgments, 1,
+                "a look's lock judgments ({which})"
+            );
+            assert_eq!(
+                derived.rederived_after_kept.lock_judgments, 0,
+                "a look's lock judged again ({which})"
+            );
+            assert_eq!(
+                judged.verdict(),
+                own.verdict(),
+                "a look judging its lock once ({which})"
+            );
+        }
+    });
+}
+
+/// A look stamps each set of files its memos read once (`Under::stamps`): a warm table session's
+/// open and checks through it, and two more checks of its access's currency, stamp the vault's
+/// files (`Set::Vault`) once and the Commons observation's (`Set::Observation`) once through the
+/// look's glance (`client::test_look_derivations`), never again after they kept them, and answer
+/// as the asks' own calls do; the next look stamps them again.
+/// NEGATIVE CONTROLS (2026-11-11): with `Under::stamps` keeping nothing, a look stamps the vault's
+/// files 8 times and the observation's twice (`left: (8, 2), right: (1, 1)`, `a look stamps each
+/// set once`); with the stamps kept past their look (in a thread's own static), a look after the
+/// first stamps nothing (`left: (0, 0), right: (1, 1)`, the same).
+#[test]
+fn a_look_stamps_each_input_set_once() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.checks, Some((true, Ok(true)))));
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        for which in ["a look", "the next look"] {
+            let (derived, judged) = derived_through(&vault, &client::VaultLook::new(&vault.paths));
+            assert_eq!(
+                (
+                    derived.derived.vault_stamps,
+                    derived.derived.observation_stamps
+                ),
+                (1, 1),
+                "{which} stamps each set once"
+            );
+            assert_eq!(
+                (
+                    derived.rederived_after_kept.vault_stamps,
+                    derived.rederived_after_kept.observation_stamps
+                ),
+                (0, 0),
+                "{which} stamps a set again"
+            );
+            assert_eq!(
+                judged.verdict(),
+                own.verdict(),
+                "{which} stamping each set once"
+            );
+        }
+    });
+}
+
+/// A look that lets go of what it derived (`VaultLook::forget_derived`, as a retained table
+/// session's checks do before each) derives it again at its next check through its glance, and
+/// keeps its judgement of its lock: a warm table session's open and checks through a look, then
+/// the same again after it forgot, stamp each set of files, look at the state and digest the log's
+/// state once more and judge the lock no more, and answer as the asks' own calls do.
+/// NEGATIVE CONTROLS (2026-11-11): with `VaultLook::forget_derived` letting go of nothing, the
+/// check after it derives nothing (every count 0, `a second check after the look forgot derives
+/// it again`); with it keeping the state's look and the log's state digest, the check after it
+/// derives neither (`state_looks: 0, log_states: 0`, the same); with it keeping the currency's
+/// judgements, the check after it judges none (`currency: 0`, the same).
+#[test]
+fn a_look_that_forgets_what_it_derived_derives_it_again() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let look = client::VaultLook::new(&vault.paths);
+        derived_through(&vault, &look);
+        for check in ["a second check", "a third check"] {
+            look.forget_derived();
+            let (derived, judged) = derived_through(&vault, &look);
+            assert_eq!(
+                derived.derived,
+                client::Derivations {
+                    lock_judgments: 0,
+                    vault_stamps: 1,
+                    observation_stamps: 1,
+                    state_looks: 1,
+                    log_states: 1,
+                    currency: 1,
+                },
+                "{check} after the look forgot derives it again"
+            );
+            assert_eq!(
+                derived.rederived_after_kept,
+                client::Derivations::default(),
+                "{check} derives each value once"
+            );
+            assert_eq!(judged.verdict(), own.verdict(), "{check}");
+        }
+    });
+}
+
+/// A look digests the state a Commons log observation stands on once for each log
+/// (`Under::log_state`) and looks at `state.toml` once (`Under::state_look`): a warm table
+/// session's open and checks through it, and two more checks of its access's currency, derive the
+/// log's state digest once and the state's look once (`client::test_look_derivations`), never
+/// again after they kept them, and answer as the asks' own calls do; the next look derives them
+/// again.
+/// NEGATIVE CONTROLS (2026-11-11): with `Under::log_state` keeping nothing, a look digests the
+/// log's state 5 times (`left: (5, 1), right: (1, 1)`, `a look digests its log state and looks at
+/// its state once`); with `Under::state_look` keeping nothing, it looks at the state twice (`left:
+/// (1, 2)`, the same).
+#[test]
+fn a_look_digests_its_log_state_once() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.checks, Some((true, Ok(true)))));
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        for which in ["a look", "the next look"] {
+            let (derived, judged) = derived_through(&vault, &client::VaultLook::new(&vault.paths));
+            assert_eq!(
+                (derived.derived.log_states, derived.derived.state_looks),
+                (1, 1),
+                "{which} digests its log state and looks at its state once"
+            );
+            assert_eq!(
+                (
+                    derived.rederived_after_kept.log_states,
+                    derived.rederived_after_kept.state_looks
+                ),
+                (0, 0),
+                "{which} derives its log state again"
+            );
+            assert_eq!(
+                judged.verdict(),
+                own.verdict(),
+                "{which} digesting its log state once"
+            );
+        }
+    });
+}
+
+/// A value derived from a file the look found unsettled is not kept (`fsx::fresh_looks`):
+/// `source.toml` rewritten with the same bytes a second before a look began (within the settled
+/// bound, `fsx::SETTLED`) is read afresh by each digest of the log's state through the look, and
+/// the look keeps no digest, so each derives it again; through a look begun past the settled
+/// bound, the first digest reads the rewritten file, whose digest the read keeps, and keeps
+/// nothing, the second is given the file's kept digest and keeps the log's, and the third derives
+/// nothing.
+/// NEGATIVE CONTROL (2026-11-11): with `Under::log_state` keeping whether or not it looked afresh,
+/// the unsettled look's first digest is kept and the second reads nothing (`left: (0, 0), right:
+/// (1, 1)`, `an unsettled file feeds no kept derivation (unsettled, call 1)`).
+#[test]
+fn an_unsettled_file_feeds_no_kept_derivation() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let vault = Vault::new();
+    let home = vault.paths.home.clone();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let (_, heads) = client::trusted_commons_log(&vault.paths, vault.bootstrap.trust())
+            .unwrap()
+            .unwrap();
+        let source = vault.paths.dir.join("source.toml");
+        let mode = std::fs::symlink_metadata(&source)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        crate::fsx::write_atomic(&source, &std::fs::read(&source).unwrap(), mode).unwrap();
+        let rewritten = std::fs::symlink_metadata(&source).unwrap();
+        let at = |secs: i64, nanos: i64| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_nanos(
+                    u64::try_from(secs * 1_000_000_000 + nanos).unwrap(),
+                )
+        };
+        let changed = at(rewritten.mtime(), rewritten.mtime_nsec())
+            .max(at(rewritten.ctime(), rewritten.ctime_nsec()));
+        for (which, began, per_call) in [
+            ("unsettled", 1, [(1, 1), (1, 1), (1, 1)]),
+            ("settled", 3, [(1, 1), (0, 1), (0, 0)]),
+        ] {
+            let look = client::VaultLook::begun_at(
+                &vault.paths,
+                changed + std::time::Duration::from_secs(began),
+            );
+            let under = look.held().expect("CONTROL: a look holding the vault");
+            for (call, (reads, derived)) in per_call.into_iter().enumerate() {
+                let read = crate::fsx::reads_under(&home);
+                let before = client::test_look_derivations();
+                commons_log_state_digest(&vault.paths, heads, Some(under)).unwrap();
+                let read = read_since(&crate::fsx::reads_under(&home), &read);
+                assert_eq!(
+                    (
+                        read.get(&source).copied().unwrap_or(0),
+                        client::test_look_derivations()
+                            .since(before)
+                            .derived
+                            .log_states
+                    ),
+                    (reads, derived),
+                    "an unsettled file feeds no kept derivation ({which}, call {call})"
+                );
+            }
+        }
+    });
+}
+
+/// A look judges each access's currency once (`Under::currency`): a warm table session's open and
+/// checks through it, and two more checks of its access's currency, judge the currency of the
+/// access it opened once (`client::test_look_derivations`), never again after they kept it, and
+/// answer as the asks' own calls do; the next look judges it again.
+/// NEGATIVE CONTROL (2026-11-11): with `Under::currency` keeping nothing, a look judges it 4 times
+/// (`left: 4, right: 1`, `a look judges its access's currency once`).
+#[test]
+fn a_look_judges_each_access_currency_once() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.checks, Some((true, Ok(true)))));
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        for which in ["a look", "the next look"] {
+            let (derived, judged) = derived_through(&vault, &client::VaultLook::new(&vault.paths));
+            assert_eq!(
+                derived.derived.currency, 1,
+                "{which} judges its access's currency once"
+            );
+            assert_eq!(
+                derived.rederived_after_kept.currency, 0,
+                "{which} judges its access's currency again"
+            );
+            assert_eq!(
+                judged.verdict(),
+                own.verdict(),
+                "{which} judging its access's currency once"
+            );
+        }
+    });
+}
+
+/// A look's judgement of an access's currency lives and dies with the look: after a warm table
+/// session's look, a look finds a warm access current, and once this Mac's identity was put in
+/// another's place the next look finds it no longer current, as the access's own call does.
+/// NEGATIVE CONTROL (2026-11-11): with the judgements kept past their look (in a thread's own
+/// static), the next look finds the access current (`the next look judges currency afresh`);
+/// without the warm session first, the first look's judgement read afresh and was not kept, and the
+/// control did not fail.
+#[test]
+fn the_next_look_judges_currency_afresh() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let other = aterm_tempfile::tempdir().unwrap();
+    let other = client::Paths::for_home(other.path());
+    client::machine_identity(&other).unwrap();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        assert!(
+            access.is_current_in(&vault.journal, &client::VaultLook::new(&vault.paths)),
+            "CONTROL: a warm access is current through a look"
+        );
+        crate::fsx::write_atomic(
+            &vault.paths.dir.join("identity"),
+            &std::fs::read(other.dir.join("identity")).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        assert!(
+            !access.is_current(&vault.journal),
+            "CONTROL: its own call sees another identity"
+        );
+        assert!(
+            !access.is_current_in(&vault.journal, &client::VaultLook::new(&vault.paths)),
+            "the next look judges currency afresh"
         );
     });
 }
@@ -1120,6 +1452,96 @@ fn a_session_look_judges_its_custody_as_it_first_saw_it() {
             "the bootstrap's own call sees a replaced pin"
         );
     });
+}
+
+/// A look confirms the control anchor it judged custody through (`Bootstrap::anchor_stands_in`),
+/// as `aterm-db`'s round group asks after a follower's own control journal read: after the look's
+/// custody check, the anchor stands while nothing changed, and not once a byte-identical copy was
+/// renamed over it, which the next look's own custody check confirms. It does not stand through a
+/// look at another vault, though that look's glance looked at this vault's anchor too, through a
+/// look taken while a writer held the lock (which holds nothing, asked with no custody check
+/// before it), or through a look begun a second after the anchor's change, whose first look at it
+/// had not settled. Whether the look first saw it settled (`Bootstrap::anchor_settled_in`) answers
+/// by that first look alone: the renamed anchor's still did.
+/// NEGATIVE CONTROLS (2026-11-11): with `Bootstrap::anchor_stands_in` judging through
+/// `VaultLook::held` whatever vault the look is at, the look at another vault confirms this one's
+/// anchor (`a look at another vault`); with it asking whether the look holds the vault and not
+/// `Glance::first_stands`, the renamed anchor stands (`a byte-identical anchor renamed over`).
+#[test]
+fn a_look_confirms_the_control_anchor_it_judged_custody_through() {
+    let vault = Vault::new();
+    let other = Vault::new();
+    let anchor = vault.bootstrap.journal_dir().join("control.anchor");
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let writing = writer(&vault.paths).unwrap();
+        let busy = client::VaultLook::new(&vault.paths);
+        assert!(
+            !vault.bootstrap.anchor_stands_in(&busy),
+            "a look that holds nothing"
+        );
+        drop((busy, writing));
+
+        let look = client::VaultLook::new(&vault.paths);
+        vault.bootstrap.revalidate_custody_in(&look).unwrap();
+        assert!(
+            vault.bootstrap.anchor_settled_in(&look),
+            "CONTROL: the look first saw the anchor settled"
+        );
+        assert!(vault.bootstrap.anchor_stands_in(&look), "nothing changed");
+
+        let elsewhere = client::VaultLook::new(&other.paths);
+        other.bootstrap.revalidate_custody_in(&elsewhere).unwrap();
+        elsewhere
+            .held()
+            .expect("CONTROL: the other look holds its vault")
+            .glance()
+            .symlink_metadata(&anchor)
+            .unwrap()
+            .expect("CONTROL: the other look looked at this vault's anchor");
+        assert!(
+            !vault.bootstrap.anchor_settled_in(&elsewhere),
+            "a look at another vault first saw no anchor of this one"
+        );
+        assert!(
+            !vault.bootstrap.anchor_stands_in(&elsewhere),
+            "a look at another vault"
+        );
+
+        let copy = anchor.with_extension("copy");
+        std::fs::copy(&anchor, &copy).unwrap();
+        std::fs::rename(&copy, &anchor).unwrap();
+        assert!(
+            vault.bootstrap.anchor_settled_in(&look),
+            "CONTROL: whether the look first saw it settled looks at nothing"
+        );
+        assert!(
+            !vault.bootstrap.anchor_stands_in(&look),
+            "a byte-identical anchor renamed over"
+        );
+        drop(look);
+        let next = client::VaultLook::new(&vault.paths);
+        vault.bootstrap.revalidate_custody_in(&next).unwrap();
+        assert!(
+            vault.bootstrap.anchor_stands_in(&next),
+            "CONTROL: the next look's custody check confirms the copy"
+        );
+    });
+    let seen = crate::fsx::seen_if_present(&anchor).unwrap().unwrap();
+    let changed = std::time::UNIX_EPOCH
+        + std::time::Duration::from_nanos(
+            u64::try_from(seen.stamp.mtime_ns.max(seen.stamp.ctime_ns)).unwrap(),
+        );
+    let early =
+        client::VaultLook::begun_at(&vault.paths, changed + std::time::Duration::from_secs(1));
+    vault.bootstrap.revalidate_custody_in(&early).unwrap();
+    assert!(
+        !vault.bootstrap.anchor_settled_in(&early),
+        "a look begun as the anchor changed first saw it unsettled"
+    );
+    assert!(
+        !vault.bootstrap.anchor_stands_in(&early),
+        "an anchor that had not settled when the look began"
+    );
 }
 
 /// A source read through a look (`Bootstrap::local_source_read_in`) is the look's own where it

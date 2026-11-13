@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A failed revision read cannot spend a withheld item's retry budget again.
+//! A failed revision read cannot cut short a withheld item's retry pause.
 
 use super::*;
 
@@ -33,10 +33,11 @@ fn failed_follow_up(doctor: &mut Withholding, root: &Path) {
     assert_eq!(Withholding::withheld(root), [WIDGETS]);
 }
 
-fn spent_follow_ups(root: &Path) -> (Withholding, u64) {
+/// Two follow-up tries that did not take, the second just made, so the next waits out its pause.
+fn paused_follow_ups(root: &Path) -> (Withholding, u64) {
     let (mut doctor, revision) = admitted_withheld_widgets(root);
     failed_follow_up(&mut doctor, root);
-    doctor.wait(SECOND_TRY_AFTER);
+    doctor.wait(RETRY.after(1));
     failed_follow_up(&mut doctor, root);
     let owed = load_withheld(root).unwrap();
     assert_eq!(owed.failed.len(), 1);
@@ -45,9 +46,9 @@ fn spent_follow_ups(root: &Path) -> (Withholding, u64) {
 }
 
 #[test]
-fn withheld_revision_a_read_failure_cannot_repeat_a_spent_same_run_follow_up() {
+fn withheld_revision_a_read_failure_cannot_repeat_a_paused_same_run_follow_up() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let (mut doctor, revision) = spent_follow_ups(root.path());
+    let (mut doctor, revision) = paused_follow_ups(root.path());
     let path = root.path().join(WITHHELD_RECORD);
     let before = std::fs::read(&path).unwrap();
     let events = doctor.host.events.len();
@@ -68,7 +69,7 @@ fn withheld_revision_a_read_failure_cannot_repeat_a_spent_same_run_follow_up() {
     assert_eq!(
         doctor.notification_center_writes(),
         4,
-        "a failed read did not prove a new run and must not allow a third try"
+        "a failed read did not prove a new run and must not cut the pause short"
     );
     assert!(result.is_err(), "the revision read must remain unreadable");
     assert!(doctor.host.events[events..].is_empty());
@@ -79,19 +80,19 @@ fn withheld_revision_a_read_failure_cannot_repeat_a_spent_same_run_follow_up() {
     assert_eq!(
         doctor.notification_center_writes(),
         4,
-        "still held after recovery"
+        "still in its pause after recovery"
     );
 }
 
 #[test]
-fn withheld_revision_a_confirmed_new_run_reopens_the_follow_up_budget() {
+fn withheld_revision_a_confirmed_new_run_starts_the_follow_ups_tries_afresh() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let (mut doctor, revision) = spent_follow_ups(root.path());
+    let (mut doctor, revision) = paused_follow_ups(root.path());
     let events = doctor.host.events.len();
     doctor.follow_up(root.path()).unwrap().unwrap();
     assert!(
         doctor.host.events[events..].is_empty(),
-        "the same run is held"
+        "the same run waits out its pause"
     );
 
     initial::request_stop_at(root.path(), revision).unwrap();

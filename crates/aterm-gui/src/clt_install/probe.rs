@@ -73,22 +73,58 @@ pub(super) fn apple_installer_pid() -> Option<u32> {
 /// This Mac's [`super::Reading`] now: the placeholder there or not as one `lstat` finds it,
 /// which follows no link, as `aterm init` reads it, each process's executable as the kernel
 /// names it, and the stamp a live run of the root half wrote, matched with its process's start
-/// as the kernel recorded it.
+/// as the kernel recorded it, with that run's parents as the same look at the process table
+/// found them ([`run_chain`]).
 #[cfg(target_os = "macos")]
 pub(super) fn installing_now() -> super::Reading {
     let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
     let placeholder = placeholder_at(path);
+    let records = aterm_sysprobe::kproc::records();
     let mut reading = reading_from(
         placeholder,
-        processes().map(|rows| rows.map(|(_, exe)| exe)),
+        records
+            .as_deref()
+            .map(|records| exes(records).into_iter().map(|(_, exe)| exe)),
     );
+    // The one pid the reader asks the kernel about is the stamp's own run.
+    let run = std::cell::Cell::new(None);
     reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
-        aterm_types::macos_setup::placeholder_held_by_a_live_run(
-            &stamp,
-            aterm_sysprobe::kproc::live_start_s,
-        )
+        aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, |pid| {
+            run.set(Some(pid));
+            aterm_sysprobe::kproc::live_start_s(pid)
+        })
     });
+    if reading.live_run
+        && let (Some(pid), Some(records)) = (run.get(), records.as_deref())
+    {
+        let parents: Vec<(u32, u32)> = records
+            .iter()
+            .map(|record| (record.pid, record.ppid))
+            .collect();
+        reading.run_chain = run_chain(pid, &parents);
+    }
     reading
+}
+
+/// `pid` and its parents, nearest first, by `parents` (each process's pid and its parent's), as
+/// many as [`super::RUN_CHAIN`] holds: the chain ends at a process the table does not list, and
+/// at launchd (`1`) or the kernel (`0`), which start no tab's program. The places past its end
+/// hold `0`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn run_chain(pid: u32, parents: &[(u32, u32)]) -> [u32; super::RUN_CHAIN] {
+    let mut chain = [0; super::RUN_CHAIN];
+    let mut at = pid;
+    for slot in &mut chain {
+        if at <= 1 {
+            break;
+        }
+        *slot = at;
+        let Some(&(_, parent)) = parents.iter().find(|(child, _)| *child == at) else {
+            break;
+        };
+        at = parent;
+    }
+    chain
 }
 
 /// Whether the placeholder exists without following links; an unread path is unknown.
@@ -134,244 +170,28 @@ pub(super) fn installing_now() -> super::Reading {
     super::Reading::default()
 }
 
-/// Every process running now, by its pid, with the executable the kernel names for it (`None`
+/// Every process running now, by its pid, with the executable the kernel names for it
+/// ([`exes`]).
+#[cfg(target_os = "macos")]
+fn processes() -> Option<Vec<(u32, Option<std::path::PathBuf>)>> {
+    Some(exes(&aterm_sysprobe::kproc::records()?))
+}
+
+/// Each of `records` that runs, by its pid, with the executable the kernel names for it (`None`
 /// where it names none); one that exited before its executable was read is left out.
 #[cfg(target_os = "macos")]
-fn processes() -> Option<impl Iterator<Item = (u32, Option<std::path::PathBuf>)>> {
-    Some(
-        aterm_sysprobe::kproc::records()?
-            .into_iter()
-            .filter(|record| record.pid > 0 && !record.zombie)
-            .filter_map(|record| match aterm_uds::holders::exe_of(record.pid) {
-                aterm_uds::holders::Exe::At(path) => Some((record.pid, Some(path))),
-                aterm_uds::holders::Exe::Unnamed => Some((record.pid, None)),
-                aterm_uds::holders::Exe::Exited => None,
-            }),
-    )
+fn exes(records: &[aterm_sysprobe::kproc::Record]) -> Vec<(u32, Option<std::path::PathBuf>)> {
+    records
+        .iter()
+        .filter(|record| record.pid > 0 && !record.zombie)
+        .filter_map(|record| match aterm_uds::holders::exe_of(record.pid) {
+            aterm_uds::holders::Exe::At(path) => Some((record.pid, Some(path))),
+            aterm_uds::holders::Exe::Unnamed => Some((record.pid, None)),
+            aterm_uds::holders::Exe::Exited => None,
+        })
+        .collect()
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_unread_table_is_no_idle_table_and_live_evidence_still_counts() {
-        use super::super::{Activity, Reading};
-        for placeholder in [false, true] {
-            let unread = reading_from(Some(placeholder), None::<std::iter::Empty<Option<&Path>>>);
-            assert_eq!(super::super::activity(unread), Activity::Unread);
-            let empty = reading_from(Some(placeholder), Some(std::iter::empty::<Option<&Path>>()));
-            assert_eq!(super::super::activity(empty), Activity::Idle);
-            assert_eq!(
-                super::super::activity(Reading {
-                    live_run: true,
-                    ..unread
-                }),
-                if placeholder {
-                    Activity::Installing
-                } else {
-                    Activity::Unread
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn a_failed_placeholder_stat_is_unread_not_absent() {
-        use super::super::Activity;
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let absent = dir.path().join("absent");
-        assert_eq!(placeholder_at(&absent), Some(false));
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&absent, &link).unwrap();
-        assert_eq!(placeholder_at(&link), Some(true));
-        let parent = dir.path().join("parent");
-        std::fs::write(&parent, b"a file, not a directory").unwrap();
-        assert_eq!(placeholder_at(&parent), Some(true));
-        let unread = placeholder_at(&parent.join("placeholder"));
-        assert_eq!(unread, None);
-        let reading = reading_from(unread, Some(std::iter::empty::<Option<&Path>>()));
-        assert_eq!(super::super::activity(reading), Activity::Unread);
-        let window = reading_from(unread, Some([Some(INSTALLER)]));
-        assert_eq!(super::super::activity(window), Activity::AppleWindow);
-    }
-
-    /// [`super::super::activity`] over `paths`, each a running process's executable, beside the
-    /// placeholder when `placeholder`.
-    fn activity(
-        placeholder: bool,
-        paths: impl IntoIterator<Item = impl AsRef<Path>>,
-    ) -> super::super::Activity {
-        super::super::activity(reading_from(
-            Some(placeholder),
-            Some(paths.into_iter().map(Some)),
-        ))
-    }
-
-    const INSTALLER: &str = "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
-
-    /// The page reads an install, and Apple's window with or without the placeholder, exactly
-    /// where `aterm init` and the root half do (`aterm_machines::items::developer::holder`): the
-    /// one rule ([`aterm_types::macos_setup::tools_held_by`]) over the same processes, a process
-    /// the kernel names no executable for among them, then a placeholder a live run's stamp names
-    /// ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`], the one reader all share:
-    /// a run between its steps, or waiting on Apple's installer window, with no installer process
-    /// running) ahead of the window. An install outranks the window beside it; the window with no
-    /// placeholder still asks the person to finish there, and a command-line installer with no
-    /// placeholder installs nothing of theirs.
-    #[test]
-    fn the_page_reads_an_install_where_init_and_the_root_half_do() {
-        use super::super::Activity;
-        use aterm_types::macos_setup::ToolsInstaller;
-        for placeholder in [false, true] {
-            for live_run in [false, true] {
-                for paths in [
-                    &[][..],
-                    &[None],
-                    &[Some("/usr/sbin/softwareupdate")],
-                    &[None, Some("/usr/sbin/softwareupdate")],
-                    &[Some("/usr/sbin/installer")],
-                    &[Some(INSTALLER)],
-                    &[None, Some(INSTALLER)],
-                    &[Some("/bin/zsh"), Some("/usr/sbin/installer")],
-                    &[Some("/tmp/softwareupdate"), Some(INSTALLER)],
-                    &[Some(INSTALLER), Some("/usr/sbin/softwareupdate")],
-                ] {
-                    let mut reading = reading_from(Some(placeholder), Some(paths.iter().copied()));
-                    reading.live_run = live_run;
-                    let held = aterm_types::macos_setup::tools_held_by(
-                        placeholder,
-                        paths.iter().copied(),
-                        is_install_process,
-                    );
-                    let holder = match held {
-                        Some(ToolsInstaller::CommandLine) => Activity::Installing,
-                        _ if placeholder && live_run => Activity::Installing,
-                        Some(ToolsInstaller::AppleWindow) => Activity::AppleWindow,
-                        None => Activity::Idle,
-                    };
-                    assert_eq!(
-                        super::super::activity(reading),
-                        holder,
-                        "{placeholder} {live_run} {paths:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The page reads a run's stamp as `aterm init` does: a regular file of the placeholder's
-    /// owner that no group or other may write, no longer than a stamp, never through a link;
-    /// an empty placeholder (Apple's own) has none.
-    #[test]
-    fn the_page_reads_a_runs_stamp_as_init_does() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("placeholder");
-        let stamp = aterm_types::macos_setup::placeholder_stamp(4242, 1000);
-        std::fs::write(&path, &stamp).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let me = path.metadata().unwrap().uid();
-        assert_eq!(stamp_of(&path, me).as_deref(), Some(stamp.as_bytes()));
-        assert_eq!(stamp_of(&path, me.wrapping_add(1)), None, "another owner's");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert_eq!(stamp_of(&path, me), None, "one anyone may write");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert_eq!(stamp_of(&link, me), None, "never through a link");
-        std::fs::write(&path, b"").unwrap();
-        assert_eq!(stamp_of(&path, me), None, "Apple's own, empty");
-        std::fs::write(
-            &path,
-            vec![b'a'; aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX + 1],
-        )
-        .unwrap();
-        assert_eq!(stamp_of(&path, me), None, "longer than a stamp");
-    }
-
-    #[test]
-    fn a_leftover_placeholder_without_a_live_installer_is_not_an_install() {
-        let idle = super::super::Activity::Idle;
-        assert_eq!(activity(true, std::iter::empty::<&str>()), idle);
-        assert_eq!(
-            activity(
-                true,
-                [
-                    "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"
-                ]
-            ),
-            idle
-        );
-        assert_eq!(activity(true, ["/tmp/softwareupdate"]), idle);
-    }
-
-    /// The card's Go to installer finds Apple's installer window alone, by the pid of the first
-    /// process whose executable is that app's own, as the page reads the window: never one of the
-    /// command-line installers, a program merely named like the app, the app's path when it is
-    /// not absolute, or a process the kernel names no executable for.
-    #[test]
-    fn go_to_installer_finds_apples_installer_window_alone() {
-        let others = [
-            (11, Some("/usr/sbin/softwareupdate")),
-            (12, Some("/usr/sbin/installer")),
-            (13, Some("/tmp/Install Command Line Developer Tools")),
-            (
-                14,
-                Some(
-                    "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
-                ),
-            ),
-            (15, None),
-        ];
-        assert_eq!(apple_window_pid(others), None);
-        let open = others
-            .into_iter()
-            .chain([(16, Some(INSTALLER)), (17, Some(INSTALLER))]);
-        assert_eq!(apple_window_pid(open), Some(16), "the first window's");
-    }
-
-    /// Only the tools' command-line installers' live evidence beside the placeholder makes the
-    /// wait calm, at any age. Apple's installer window, beside the placeholder it made as it
-    /// opened (pressed or not, minutes or days ago: nothing this Mac shows tells which) or with
-    /// none, is where the person finishes. Another program named like an installer is none.
-    #[test]
-    fn only_the_tools_installers_live_evidence_makes_the_wait_calm() {
-        use super::super::Activity::{AppleWindow, Idle, Installing};
-        assert_eq!(activity(true, ["/usr/sbin/softwareupdate"]), Installing);
-        assert_eq!(activity(true, ["/usr/sbin/installer"]), Installing);
-        assert_eq!(activity(false, ["/usr/sbin/installer"]), Idle);
-        assert_eq!(activity(true, ["/usr/local/bin/installer"]), Idle);
-        assert_eq!(activity(true, ["/tmp/installer"]), Idle);
-        assert_eq!(activity(true, ["usr/sbin/installer"]), Idle);
-        assert_eq!(activity(true, ["/usr/local/bin/softwareupdate"]), Idle);
-        assert_eq!(
-            activity(true, [INSTALLER]),
-            AppleWindow,
-            "beside the placeholder it made, at any age"
-        );
-        assert_eq!(
-            activity(true, [INSTALLER, "/usr/sbin/softwareupdate"]),
-            Installing,
-            "an install under way beside the window"
-        );
-        assert_eq!(activity(false, [INSTALLER]), AppleWindow);
-        assert_eq!(activity(false, ["/usr/sbin/softwareupdate"]), Idle);
-        assert_eq!(
-            activity(
-                false,
-                ["/tmp/Install Command Line Developer Tools.app/Contents/MacOS/unrelated"]
-            ),
-            Idle
-        );
-        assert_eq!(
-            activity(
-                false,
-                [
-                    "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools"
-                ]
-            ),
-            Idle
-        );
-    }
-}
+#[path = "probe_tests.rs"]
+mod tests;

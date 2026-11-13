@@ -4601,6 +4601,7 @@ fn a_packages_line_names_its_fix_once() {
             remedy: aterm_converge::Remedy::Repair,
         }),
         stood_aside: None,
+        waits_on: None,
         essential: false,
         elapsed_ms: None,
     };

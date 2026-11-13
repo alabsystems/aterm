@@ -475,39 +475,8 @@ const fn attributes(_: &Path, _: bool) -> Option<(u64, u64)> {
 /// [`attributes`] reads of a path, `None` as an unanswered `statx` (`ENOSYS`). Test builds on
 /// Linux's glibc alone.
 #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
-pub(crate) mod seams {
-    use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
-
-    type Read = Option<(u64, u64)>;
-
-    thread_local! {
-        static ATTRIBUTES: RefCell<Vec<(PathBuf, Read)>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Read `path`'s attributes as `read` on this thread (`None`: `statx` unanswered).
-    pub(crate) fn attributes_of(path: &Path, read: Read) {
-        ATTRIBUTES.with(|a| a.borrow_mut().push((path.to_path_buf(), read)));
-    }
-
-    /// The `(stx_attributes, stx_attributes_mask)` of `STATX_ATTR_IMMUTABLE` set.
-    pub(crate) const IMMUTABLE: (u64, u64) = (super::ATTR_IMMUTABLE, super::ATTR_IMMUTABLE);
-
-    /// Forget every stand-in of this thread.
-    pub(crate) fn clear() {
-        ATTRIBUTES.with(|a| a.borrow_mut().clear());
-    }
-
-    pub(super) fn attributes(path: &Path) -> Option<Read> {
-        ATTRIBUTES.with(|a| {
-            a.borrow()
-                .iter()
-                .rev()
-                .find(|(p, _)| p == path)
-                .map(|(_, read)| *read)
-        })
-    }
-}
+#[path = "unix_seams_tests.rs"]
+pub(crate) mod seams;
 
 /// Whether a directory's metadata says it is private-write-safe.
 #[must_use]
@@ -714,10 +683,29 @@ pub fn install_shim_to_env(
 }
 
 /// The shim [`install_shim_to_env`] lays, rendered but not written.
+///
+/// # Errors
+/// A selected helper cannot be inspected or queried, or changes during its capability query.
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,
     env: &crate::shim_env::ShimEnv,
+) -> io::Result<crate::lay::Executable> {
+    shim_executable_to_env_using(
+        shim,
+        target,
+        env,
+        &crate::stub::Embedder::this_process(),
+        &mut crate::build_cache::registered::helper_speaks_hop,
+    )
+}
+
+pub(crate) fn shim_executable_to_env_using(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    embedder: &crate::stub::Embedder,
+    capability: &mut impl FnMut(&Path) -> io::Result<bool>,
 ) -> io::Result<crate::lay::Executable> {
     let route = crate::compat::route_for_shim(shim, target);
     let mut body = super::sh_shim_content_routed(target, env, route.as_deref());
@@ -728,11 +716,9 @@ pub fn shim_executable_to_env(
         let standing = crate::metadata_io::read_bounded_regular_utf8(shim, 64 << 10)
             .ok()
             .and_then(|text| crate::build_cache::registered::shim_helper(&text));
-        let helper = crate::stub::Embedder::this_process()
-            .embed(standing.as_deref())
-            .or(standing);
+        let helper = embedder.embed(standing.as_deref()).or(standing);
         if let Some(helper) = helper.as_deref()
-            && !crate::build_cache::registered::helper_speaks_hop(helper)
+            && !capability(helper)?
         {
             let call = crate::build_cache::registered::shim_call(helper, tool);
             body = body.replacen(
@@ -740,31 +726,78 @@ pub fn shim_executable_to_env(
                 &format!("{call}# aterm: build intermediates out of Spotlight\n"),
                 1,
             );
-        } else if let Some(helper) = helper
-            && let Some(block) = crate::build_cache::shim_block(tool)
-            && let Some(at) = body.find(&block)
-        {
-            let target_q = super::sh_shim_quote(target);
-            let routed = route.as_deref().and_then(|route| {
-                let root = super::sh_shim_quote(route);
-                let exec = format!("exec {root} \"$@\"");
-                let line = body
-                    .lines()
-                    .find(|l| l.starts_with("[ ") && l.ends_with(&exec))?;
-                Some((line[..line.len() - exec.len()].to_owned(), root))
-            });
-            let hop = crate::build_cache::registered::shim_hop(
-                &helper,
-                tool,
-                &target_q,
-                routed
-                    .as_ref()
-                    .map(|(tests, root)| (tests.as_str(), root.as_str())),
-            );
-            body.insert_str(at + block.len(), &hop);
+        } else if let Some(helper) = helper {
+            let _ = insert_build_hop(&mut body, tool, target, &helper, route.as_deref());
         }
     }
     Ok(crate::lay::Executable::new(shim, body))
+}
+
+fn insert_build_hop(
+    body: &mut String,
+    tool: &str,
+    target: &Path,
+    helper: &Path,
+    route: Option<&Path>,
+) -> Option<()> {
+    let block = crate::build_cache::shim_block(tool)?;
+    let at = body.find(&block)?;
+    let target_q = super::sh_shim_quote(target);
+    let routed = route.and_then(|route| {
+        let root = super::sh_shim_quote(route);
+        let exec = format!("exec {root} \"$@\"");
+        let line = body
+            .lines()
+            .find(|line| line.starts_with("[ ") && line.ends_with(&exec))?;
+        Some((line[..line.len() - exec.len()].to_owned(), root))
+    });
+    let hop = crate::build_cache::registered::shim_hop(
+        helper,
+        tool,
+        &target_q,
+        routed
+            .as_ref()
+            .map(|(tests, root)| (tests.as_str(), root.as_str())),
+    );
+    body.insert_str(at + block.len(), &hop);
+    Some(())
+}
+
+/// Render the complete maintained shim with this explicit helper and no capability probe.
+/// The caller compares bytes; a backend hint alone never selects the actual route.
+/// # Errors
+/// The target or its maintained placement block does not support a build hop.
+#[cfg(target_os = "macos")]
+pub(crate) fn canonical_build_hop_shim(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    helper: &Path,
+) -> io::Result<crate::lay::Executable> {
+    let route = crate::compat::route_for_shim(shim, target);
+    let mut body = super::sh_shim_content_routed(target, env, route.as_deref());
+    let tool = target
+        .file_name()
+        .and_then(|word| word.to_str())
+        .filter(|tool| matches!(*tool, "targo" | "targo-tippy"))
+        .ok_or_else(|| io::Error::other("unsupported managed build-hop target"))?;
+    insert_build_hop(&mut body, tool, target, helper, route.as_deref())
+        .ok_or_else(|| io::Error::other("maintained build placement block unavailable"))?;
+    Ok(crate::lay::Executable::new(shim, body))
+}
+
+/// Render the production build hop for an isolated native integration fixture.
+/// This performs no capability query or filesystem write.
+/// # Errors
+/// The target or maintained placement does not support a build hop.
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+pub fn build_hop_fixture(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    helper: &Path,
+) -> io::Result<crate::lay::Executable> {
+    canonical_build_hop_shim(shim, target, env, helper)
 }
 
 /// The `agents/` twin's shim.
@@ -1065,258 +1098,13 @@ mod forwarding_tests;
 /// The reading [`may_take_name`] makes off macOS, held to what Linux's `may_delete` refuses, on
 /// every Unix this crate's tests run on.
 #[cfg(test)]
-mod take_name_tests {
-    use super::{ATTR_APPEND, ATTR_IMMUTABLE, binds, sticky_keeps};
-
-    /// AN IMMUTABLE OR APPEND-ONLY INODE KEEPS ITS NAME, as far as its filesystem reports the
-    /// attribute: either bit set and reported binds; a bit the mask does not report, or another
-    /// attribute (compressed 0x4, nodump 0x40), does not. NEGATIVE CONTROLS: the same bits with no
-    /// mask, and no bits with the whole mask.
-    #[test]
-    fn an_immutable_or_append_only_inode_keeps_its_name() {
-        let all = u64::MAX;
-        assert!(binds((ATTR_IMMUTABLE, all)));
-        assert!(binds((ATTR_APPEND, all)));
-        assert!(binds((ATTR_IMMUTABLE | 0x4, ATTR_IMMUTABLE)));
-        assert!(!binds((ATTR_IMMUTABLE | ATTR_APPEND, 0)), "not reported");
-        assert!(
-            !binds((ATTR_IMMUTABLE, ATTR_APPEND)),
-            "another bit reported"
-        );
-        assert!(!binds((0x4 | 0x40, all)), "other attributes");
-        assert!(!binds((0, all)));
-    }
-
-    /// A STICKY FOLDER KEEPS ANOTHER'S NAME: in a sticky folder the caller may take an entry's
-    /// name only when the folder or the entry is theirs, or they are root. NEGATIVE CONTROL: the
-    /// same folder without the sticky bit keeps nothing.
-    #[test]
-    fn a_sticky_folder_keeps_the_name_of_an_entry_neither_it_nor_the_entry_is_the_callers() {
-        let (me, them, other) = (501, 502, 503);
-        assert!(sticky_keeps(0o1777, them, other, me));
-        assert!(!sticky_keeps(0o1777, me, other, me), "the folder is mine");
-        assert!(!sticky_keeps(0o1777, them, me, me), "the entry is mine");
-        assert!(!sticky_keeps(0o1777, them, other, 0), "root");
-        assert!(!sticky_keeps(0o0777, them, other, me), "not sticky");
-    }
-}
+#[path = "unix_take_name_tests.rs"]
+mod take_name_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_required_setting_write_waits_for_its_scheduled_child() {
-        let mut child =
-            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
-        child.args(["-c", "printf ready"]);
-        assert_eq!(
-            required_write_after(&mut child, std::time::Duration::from_secs(6)),
-            Some(b"ready".to_vec())
-        );
-
-        let root = crate::testdir::dir("expired-setting-write-");
-        let marker = root.join("must-not-run");
-        let mut late =
-            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
-        late.args(["-c", "printf late > \"$1\"", "fixture"])
-            .arg(&marker);
-        assert_eq!(
-            required_write_after(&mut late, std::time::Duration::from_secs(61)),
-            None
-        );
-        assert!(!marker.exists());
-
-        let mut refused =
-            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
-        refused.args(["-c", "printf refused; exit 7"]);
-        assert_eq!(
-            required_write_after(&mut refused, std::time::Duration::from_secs(6)),
-            None
-        );
-    }
-
-    #[test]
-    fn the_rosetta_probe_reads_a_file_and_never_guesses_an_unsearchable_one() {
-        let root = crate::testdir::dir("atpkg-rosetta-probe-");
-        let runtime = root.join("oah").join("libRosettaRuntime");
-        assert_eq!(rosetta_present(&runtime), Ok(false), "no parent");
-        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        assert_eq!(rosetta_present(&runtime), Ok(false), "nothing there");
-        fs::create_dir(&runtime).unwrap();
-        assert_eq!(rosetta_present(&runtime), Ok(false), "a directory");
-        fs::remove_dir(&runtime).unwrap();
-        fs::write(&runtime, b"\xcf\xfa\xed\xfe").unwrap();
-        assert_eq!(rosetta_present(&runtime), Ok(true));
-        let under_a_file = runtime.join("libRosettaRuntime");
-        assert_eq!(rosetta_present(&under_a_file), Ok(false), "ENOTDIR");
-        let oah = runtime.parent().unwrap();
-        fs::set_permissions(oah, Permissions::from_mode(0o000)).unwrap();
-        if our_uid() != 0 {
-            assert!(rosetta_present(&runtime).is_err(), "EACCES is no answer");
-        }
-        fs::set_permissions(oah, Permissions::from_mode(0o700)).unwrap();
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
-        let root = crate::testdir::dir("atpkg-shared-dir-");
-        let dir = root.join("prefix");
-        let stamp = |p: &Path| {
-            let m = fs::symlink_metadata(p).unwrap();
-            (
-                m.mode() & 0o7777,
-                m.ctime(),
-                m.ctime_nsec(),
-                m.mtime(),
-                m.mtime_nsec(),
-            )
-        };
-        ensure_shared_dir(&dir).unwrap();
-        let first = stamp(&dir);
-        assert_eq!(first.0, 0o755, "created shared: {:o}", first.0);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        ensure_shared_dir(&dir).unwrap();
-        assert_eq!(
-            stamp(&dir),
-            first,
-            "an unchanged 0755 directory was written"
-        );
-        for drifted in [0o700, 0o775, 0o1755] {
-            fs::set_permissions(&dir, Permissions::from_mode(drifted)).unwrap();
-            ensure_shared_dir(&dir).unwrap();
-            assert_eq!(stamp(&dir).0, 0o755, "{drifted:o} not forced to 0755");
-        }
-        let link = root.join("link");
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
-        fs::set_permissions(&dir, Permissions::from_mode(0o700)).unwrap();
-        let refused = ensure_shared_dir(&link);
-        let named = stamp(&dir).0;
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(
-            refused.map_err(|e| e.kind()),
-            Err(io::ErrorKind::PermissionDenied)
-        );
-        assert_eq!(named, 0o700, "the refused link's target was chmodded");
-    }
-
-    #[test]
-    fn the_account_home_resolves_on_the_machine_running_this_test() {
-        let account = account_home().expect(
-            "getpwuid_r must resolve this account's home; a None here disables the \
-             [machine] doctor everywhere",
-        );
-        assert!(
-            account.is_absolute(),
-            "a passwd home is an absolute path: {}",
-            account.display()
-        );
-        assert!(
-            !account.as_os_str().is_empty(),
-            "an empty pw_dir is not a home"
-        );
-        assert!(
-            account.is_dir(),
-            "the account home must exist: {}",
-            account.display()
-        );
-        assert_eq!(account_home(), Some(account));
-    }
-}
+#[path = "unix_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod shim_link_tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-
-    #[test]
-    fn relative_links_keep_their_parent_and_final_alias_even_when_dangling() {
-        let root = crate::testdir::dir("atpkg-relative-shim-");
-        let bin = root.join("bin");
-        let store_bin = root.join("store/trust/1/bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&store_bin).unwrap();
-        let program = store_bin.join("targo");
-        fs::write(&program, b"program").unwrap();
-        symlink("targo", store_bin.join("cargo")).unwrap();
-        let shim = bin.join("cargo");
-        let raw = Path::new("../store/trust/1/bin/cargo");
-        symlink(raw, &shim).unwrap();
-        let expected = bin.join(raw);
-        let read = read_shim(&shim);
-        assert_eq!(read.target.as_ref(), Some(&expected));
-        assert_eq!(resolve_shim(&shim), Some(expected.clone()));
-        assert!(expected.is_absolute());
-        assert_eq!(expected.file_name().unwrap(), "cargo");
-        assert_eq!(
-            expected.canonicalize().unwrap(),
-            program.canonicalize().unwrap()
-        );
-        assert_eq!(read.env, crate::shim_env::ShimEnv::NONE);
-        assert_eq!(read.body, None);
-
-        // Relative caller paths use the same native link-parent rule, without
-        // changing this test process's working directory.
-        let cwd = std::env::current_dir().unwrap();
-        let mut relative = PathBuf::new();
-        for part in cwd.components() {
-            if matches!(part, std::path::Component::Normal(_)) {
-                relative.push("..");
-            }
-        }
-        relative.push(shim.strip_prefix("/").unwrap());
-        assert_eq!(
-            resolve_shim(&relative).unwrap().canonicalize().unwrap(),
-            program.canonicalize().unwrap()
-        );
-
-        fs::remove_file(&program).unwrap();
-        assert_eq!(resolve_shim(&shim), Some(expected.clone()));
-        assert_eq!(read_shim(&shim).target, Some(expected));
-        assert!(!shim.exists());
-        assert_eq!(resolve_shim(&bin.join("missing")), None);
-    }
-
-    #[test]
-    fn link_dot_parent_uses_native_directory_resolution() {
-        let root = crate::testdir::dir("atpkg-shim-native-parent-");
-        let bin = root.join("bin");
-        let foreign = root.join("foreign");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(foreign.join("nested")).unwrap();
-        fs::write(bin.join("tool"), b"lexical wrong target").unwrap();
-        fs::write(foreign.join("tool"), b"native target").unwrap();
-        symlink(foreign.join("nested"), bin.join("slot")).unwrap();
-        let shim = bin.join("shim");
-        symlink("slot/../tool", &shim).unwrap();
-        let target = resolve_shim(&shim).unwrap();
-        assert_eq!(target, bin.join("slot/../tool"));
-        assert_eq!(fs::read(&target).unwrap(), b"native target");
-        assert_ne!(
-            target.canonicalize().unwrap(),
-            bin.join("tool").canonicalize().unwrap()
-        );
-        assert_eq!(read_shim(&shim).target, Some(target));
-    }
-
-    #[test]
-    fn absolute_links_and_relative_script_execs_keep_their_spelling() {
-        let root = crate::testdir::dir("atpkg-shim-spelling-");
-        let target = root.join("absent-alias");
-        let link = root.join("link");
-        symlink(&target, &link).unwrap();
-        assert_eq!(resolve_shim(&link), Some(target.clone()));
-        assert_eq!(read_shim(&link).target, Some(target));
-        let script = root.join("script");
-        fs::write(&script, b"#!/bin/sh\nexec '../relative-tool' \"$@\"\n").unwrap();
-        assert_eq!(
-            resolve_shim(&script),
-            Some(PathBuf::from("../relative-tool"))
-        );
-        assert_eq!(
-            read_shim(&script).target,
-            Some(PathBuf::from("../relative-tool"))
-        );
-    }
-}
+#[path = "unix_shim_link_tests.rs"]
+mod shim_link_tests;

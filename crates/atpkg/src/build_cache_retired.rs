@@ -34,6 +34,12 @@ use std::time::{Duration, SystemTime};
 #[path = "build_cache_retired_pending.rs"]
 mod pending;
 
+#[path = "build_cache_retired_registry.rs"]
+mod registry;
+
+#[path = "build_cache_retired_history.rs"]
+mod history;
+
 /// Nothing in a leftover was written for this long before it goes.
 pub const UNWRITTEN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -109,9 +115,29 @@ pub trait Git {
         let _ = alt;
         self.run(dir, args)
     }
+
+    /// A local original-object history read with complete bounded output and input. `objects`
+    /// replaces object lookup with an independently bound witness, never an added alternate.
+    /// An implementation without this contract cannot authorize private-store cleanup.
+    fn read_history(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+        deadline: std::time::Instant,
+    ) -> Answer {
+        let _ = (dir, args, input, objects, deadline);
+        Answer {
+            code: None,
+            out: String::new(),
+            err: "bounded original Git history reads are unavailable".to_owned(),
+        }
+    }
 }
 
-/// `git` on `PATH`.
+/// `git` on `PATH`, with lazy fetching disabled. A Git that cannot take the explicit
+/// no-fetch option refuses the read, so it cannot authorize snapshot retirement.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitCli;
 
@@ -130,10 +156,12 @@ impl Git for GitCli {
 
     fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
         let mut cmd = aterm_uds::spawnfd::command("git");
-        cmd.arg("-C")
+        cmd.arg("--no-lazy-fetch")
+            .arg("-C")
             .arg(git_path(dir))
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(aterm_uds::spawnfd::Stdio::null());
         if let Some(alt) = alt {
@@ -150,6 +178,76 @@ impl Git for GitCli {
                 code: None,
                 out: String::new(),
                 err: format!("git did not start: {e}"),
+            },
+        }
+    }
+
+    fn read_history(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+        deadline: std::time::Instant,
+    ) -> Answer {
+        let mut cmd = aterm_uds::spawnfd::command("git");
+        for (name, _) in std::env::vars_os() {
+            if name
+                .as_encoded_bytes()
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+            {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.arg("--no-lazy-fetch")
+            .arg("--no-pager")
+            .arg("--no-optional-locks")
+            .arg("--no-replace-objects")
+            .args(["-c", "protocol.allow=never", "-c", "core.commitGraph=false"])
+            .args(["-c", "pack.useBitmaps=false", "-c", "gc.auto=0"])
+            .arg("-C")
+            .arg(git_path(dir))
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(objects) = objects {
+            cmd.env("GIT_OBJECT_DIRECTORY", git_path(objects));
+        }
+        let result = aterm_uds::deadline::output_with_input_until(
+            &mut cmd,
+            aterm_uds::secret::Secret::new(input),
+            deadline,
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        );
+        match result {
+            Ok(output) => match (
+                String::from_utf8(output.stdout),
+                String::from_utf8(output.stderr),
+            ) {
+                (Ok(out), Ok(err)) => Answer {
+                    code: output.status.code(),
+                    out,
+                    err,
+                },
+                _ => Answer {
+                    code: None,
+                    out: String::new(),
+                    err: "Git history metadata is not complete UTF-8".to_owned(),
+                },
+            },
+            Err(error) => Answer {
+                code: None,
+                out: String::new(),
+                err: format!("Git history read did not complete: {error}"),
             },
         }
     }
@@ -517,6 +615,7 @@ fn judge_snapshot(
             }
         }
         in_main(git, checkout, &removal.head)?;
+        history::clear(git, checkout, wt, Some(&removal.entry))?;
         return Ok(
             "the exact snapshot's interrupted removal, bound by its durable receipt".to_owned(),
         );
@@ -525,6 +624,7 @@ fn judge_snapshot(
         let Some(gone) = half_removed(checkout, wt) else {
             return Err(unlisted(checkout));
         };
+        history::clear(git, checkout, wt, None)?;
         if let Some(why) = now
             .checked_sub(UNWRITTEN)
             .and_then(|since| written_words(wt, since, now, Times::NotFolders))
@@ -559,6 +659,8 @@ fn judge_snapshot(
             if changed.len() > 1 { ", …" } else { "" }
         ));
     }
+    let own = gitfile_text(&wt.join(".git")).and_then(|text| own_entry(checkout, wt, &text));
+    history::clear(git, checkout, wt, own.as_deref())?;
     if let Some(why) = now
         .checked_sub(UNWRITTEN)
         .and_then(|since| written_words(wt, since, now, Times::All))
@@ -907,6 +1009,7 @@ fn remove_snapshot(
             return Err("snapshot Git binding changed during admission".to_owned());
         }
     }
+    history::clear(git, checkout, wt, own.as_deref())?;
     let took = super::remove::tree(&gitfile);
     if !took.whole() {
         let why = super::remove::named(&gitfile, 1)
@@ -939,6 +1042,8 @@ fn remove_snapshot(
         } else if let Some(removal) = &recovery
             && let Err(reason) = pending::revalidate(checkout, wt, removal)
         {
+            Some(reason)
+        } else if let Err(reason) = history::clear(git, checkout, wt, Some(entry)) {
             Some(reason)
         } else if left.whole() {
             let wt_arg = git_path(wt).to_string_lossy();

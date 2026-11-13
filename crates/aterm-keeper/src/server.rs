@@ -19,8 +19,8 @@ use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, PeerCheck};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
 use crate::wire::{
-    Birth, CAP_JOURNAL, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef, MasterHeader,
-    PROTO, RefuseCode,
+    Birth, CAP_JOURNAL, CAP_KEEPS, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef,
+    MasterHeader, PROTO, RefuseCode,
 };
 
 /// Mechanism used to relaunch the terminal application.
@@ -653,8 +653,8 @@ impl Server {
                 let birth = born(pid);
                 self.core.pending(id, pid, now, birth)
             }
-            Frame::Bye => {
-                self.core.bye(id);
+            Frame::Bye { keep } => {
+                self.core.bye_keeping(id, &keep);
                 Vec::new()
             }
             Frame::Adopt => self.core.adopt(id, &mut env),
@@ -762,7 +762,7 @@ impl Server {
                         offers,
                         version: self.version.clone(),
                         identity: Some(self.identity.policy()),
-                        caps: Some(CAP_JOURNAL | CAP_SYNC),
+                        caps: Some(CAP_JOURNAL | CAP_SYNC | CAP_KEEPS),
                     };
                     self.send(conn, &frame, None);
                 }
@@ -811,6 +811,12 @@ impl Server {
                 return;
             }
         };
+        // How the record outlived its window, to a window that reads it.
+        let reads_kept = self
+            .core
+            .peers()
+            .get(&conn)
+            .is_some_and(|p| p.caps & CAP_KEEPS != 0);
         let frame = Frame::Offer {
             header: rec.header,
             tag: rec.tag,
@@ -819,6 +825,7 @@ impl Server {
                 attempts: j.attempts,
                 companions: u8::from(region.is_some()),
             }),
+            kept: reads_kept.then_some(rec.kept),
         };
         self.send(conn, &frame, Some(&master));
         if let Some((c, fd)) = region {

@@ -333,11 +333,14 @@ impl crate::App {
         }
     }
 
-    /// Whether `SameImageHandoff::RenewLaunchRecord` is granted now: this process measured its own record stale, is no renewal's successor, and its renewal is armed (the poll's call, before it moves to `InFlight`).
+    /// Whether `SameImageHandoff::RenewLaunchRecord` is granted now: this process measured its own record stale, is no renewal's successor, and its renewal is armed (the poll's call, before it moves to `InFlight`) or waits on account work with no end named (the call that wait continues into; a handoff really in flight is refused before this is asked).
     pub(crate) fn launch_record_renewal_authorizes(&self) -> bool {
         self.own_launch_record == Some(OwnLaunchRecord::Stale)
             && self.launch_record_renewal.renewed_from.is_none()
-            && matches!(self.launch_record_renewal.state, RenewalState::Armed { .. })
+            && matches!(
+                self.launch_record_renewal.state,
+                RenewalState::Armed { .. } | RenewalState::InFlight { ending: None, .. }
+            )
     }
 
     /// `OwnLaunchRecord::Stale`, as measured (`App::note_own_launch_record`): arms the renewal, or settles it at once when nothing will renew the record here.
@@ -495,6 +498,44 @@ impl crate::App {
         k < ATTEMPTS
     }
 
+    /// A renewal that waited on account work and was then refused: booked as a direct look's refusal
+    /// is ([`Self::book_renewal_not_started`]), so what the person's desk held is a wait and never a
+    /// spent attempt. The wait booked this attempt before anything started, so it goes back first.
+    pub(crate) fn renewal_refused_after_accounts(
+        &mut self,
+        error: &crate::UpdateHandoffStartError,
+    ) {
+        let RenewalState::InFlight { armed_at, ending } = self.launch_record_renewal.state else {
+            return;
+        };
+        if let Some(end) = ending {
+            self.record_update_switch_stopped(true, &error.to_string());
+            self.settle_launch_record_renewal(end.settles());
+            return;
+        }
+        let k = self.launch_record_renewal.attempts;
+        self.launch_record_renewal.attempts = k.saturating_sub(1);
+        self.book_renewal_not_started(armed_at, k, Instant::now(), error);
+    }
+
+    /// A renewal attempt that waited on account work and then did not start: no handoff returns it ([`Self::reduce_returned_launch_record_renewal`]), so it is booked here the same way.
+    pub(crate) fn renewal_did_not_start_after_accounts(&mut self, detail: &str) {
+        let RenewalState::InFlight { ending, .. } = self.launch_record_renewal.state else {
+            return;
+        };
+        if let Some(end) = ending {
+            self.settle_launch_record_renewal(end.settles());
+            return;
+        }
+        let k = self.launch_record_renewal.attempts;
+        aterm_log::info!(
+            "launch record: renewal attempt {k} of {ATTEMPTS} did not start after account work: \
+             {detail}"
+        );
+        self.launch_record_renewal
+            .rearm_after_attempt(Instant::now());
+    }
+
     /// Ends the renewal and books what `outcome` says, once: the entry whose step is the person's when no renewal runs or none worked, or a ripening claim of it when an update's handoff will renew the record (it shows only if that update never lands).
     pub(crate) fn settle_launch_record_renewal(&mut self, outcome: RenewalDecision) {
         let pid = std::process::id();
@@ -590,207 +631,5 @@ impl crate::App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every fact for a renewal, the installed bundle observed as this build.
-    fn renews() -> RenewalFacts {
-        RenewalFacts {
-            renewed_from: None,
-            auto_apply: true,
-            handoff_unavailable: false,
-            clean_commit: true,
-            update_pending: false,
-            installed_build: Some(107),
-            current_build: 107,
-            update_work: false,
-            attempts: 0,
-        }
-    }
-
-    /// A renewal the sessionless handoff cannot carry for a cause the desk holds waits for the
-    /// desk, uncounted, as one that unsaved work holds does: three such refusals never spend the
-    /// renewal. REVIEW FINDING (2026-11-03): every other cause (a launched-lane guard, which
-    /// nothing at the desk clears) was a wait too, so a renewal it refused retried every minute
-    /// for the life of the process, each look retiring the warm spare shell; it is counted now,
-    /// and settles after its attempts as the same cause with a terminal tab open does.
-    #[test]
-    fn a_desk_the_handoff_cannot_carry_never_spends_an_attempt() {
-        for desk in [
-            "no window is open to hand over",
-            "no open tab is one the new build can restore",
-        ] {
-            assert_eq!(
-                not_started(false, Some(desk)),
-                NotStarted::PersonState,
-                "{desk}"
-            );
-            assert_eq!(
-                not_started(true, Some(desk)),
-                NotStarted::Deferred,
-                "{desk}"
-            );
-        }
-        for lane in [
-            "this platform has no LaunchServices launcher",
-            "this process does not run from a .app bundle",
-            "the rendezvous path does not fit sun_path on this machine",
-            "the authorized target build is older than this build",
-            "the launch environment needs a removal a merge cannot express",
-            "the new build failed its pre-park verification",
-        ] {
-            assert_eq!(
-                not_started(false, Some(lane)),
-                NotStarted::Counted,
-                "a cause no desk clears: {lane}"
-            );
-        }
-        assert_eq!(not_started(true, None), NotStarted::Deferred);
-        assert_eq!(
-            not_started(false, None),
-            NotStarted::Counted,
-            "CONTROL: any other refusal spends one"
-        );
-
-        // The booking reads the cause the admission left beside the error.
-        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-        let mut app = crate::App::headless_for_test();
-        let now = Instant::now();
-        let refused = crate::UpdateHandoffStartError::refused(
-            "The update waits for the next launch: no window is open to hand over",
-        );
-        app.sessionless_handoff_refused = Some("no window is open to hand over");
-        app.book_renewal_not_started(now, 1, now, &refused);
-        assert_eq!(app.launch_record_renewal.attempts, 0, "the desk spent none");
-        assert!(
-            matches!(
-                app.launch_record_renewal.state,
-                RenewalState::Armed { retry_at, .. } if retry_at == now + PERSON_STATE_REPOLL
-            ),
-            "it looks again when the desk may have changed"
-        );
-        app.sessionless_handoff_refused = Some("this process does not run from a .app bundle");
-        app.book_renewal_not_started(now, 1, now, &refused);
-        assert_eq!(
-            app.launch_record_renewal.attempts, 1,
-            "CONTROL: a cause no desk clears spends one"
-        );
-    }
-
-    #[test]
-    fn a_stale_record_renews_only_when_nothing_else_will() {
-        use BookCause::{NoRenewal as Off, Spent, StillStale};
-        use RenewalDecision::{Book, LeaveToUpdate, Renew, Wait};
-        let base = renews();
-        let against = RenewalFacts {
-            renewed_from: None,
-            auto_apply: false,
-            handoff_unavailable: true,
-            clean_commit: false,
-            update_pending: true,
-            installed_build: Some(106),
-            current_build: 107,
-            update_work: true,
-            attempts: ATTEMPTS,
-        };
-        let rows = [
-            (base, Renew),
-            (
-                RenewalFacts {
-                    renewed_from: Some(47362),
-                    ..base
-                },
-                Book(StillStale { from: 47362 }),
-            ),
-            (
-                RenewalFacts {
-                    auto_apply: false,
-                    ..base
-                },
-                Book(Off(NoRenewal::UpdatesOff)),
-            ),
-            (
-                RenewalFacts {
-                    handoff_unavailable: true,
-                    ..base
-                },
-                Book(Off(NoRenewal::HandoffUnavailable)),
-            ),
-            (
-                RenewalFacts {
-                    clean_commit: false,
-                    ..base
-                },
-                Book(Off(NoRenewal::Unstamped)),
-            ),
-            (
-                RenewalFacts {
-                    update_pending: true,
-                    ..base
-                },
-                LeaveToUpdate,
-            ),
-            (
-                RenewalFacts {
-                    installed_build: Some(106),
-                    ..base
-                },
-                Book(Off(NoRenewal::InstalledIsAnotherBuild)),
-            ),
-            (
-                RenewalFacts {
-                    update_work: true,
-                    ..base
-                },
-                Wait(RenewalWait::Work),
-            ),
-            (
-                RenewalFacts {
-                    attempts: ATTEMPTS,
-                    ..base
-                },
-                Book(Spent { attempts: ATTEMPTS }),
-            ),
-            (
-                RenewalFacts {
-                    renewed_from: Some(47362),
-                    ..against
-                },
-                Book(StillStale { from: 47362 }),
-            ),
-            (
-                RenewalFacts {
-                    update_pending: true,
-                    installed_build: Some(108),
-                    ..base
-                },
-                LeaveToUpdate,
-            ),
-            (
-                RenewalFacts {
-                    update_work: true,
-                    attempts: ATTEMPTS,
-                    ..base
-                },
-                Wait(RenewalWait::Work),
-            ),
-            (
-                RenewalFacts {
-                    installed_build: None,
-                    ..base
-                },
-                Renew,
-            ),
-            (
-                RenewalFacts {
-                    attempts: ATTEMPTS - 1,
-                    ..base
-                },
-                Renew,
-            ),
-        ];
-        for (facts, decision) in rows {
-            assert_eq!(decide(facts), decision, "{facts:?}");
-        }
-    }
-}
+#[path = "launch_record_renewal_tests.rs"]
+mod tests;

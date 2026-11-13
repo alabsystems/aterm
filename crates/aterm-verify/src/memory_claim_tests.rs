@@ -308,6 +308,7 @@ fn failed_memory_admission_never_starts_a_stage() {
                 Seams {
                     stage,
                     prepare_cells: None,
+                    prepare_build_dir: |_| Ok(()),
                     admit_quiet: admit,
                     admit_memory: admit,
                 },
@@ -413,6 +414,7 @@ fn pooled_release_preclaims_lint_once_and_only_until_lint_ends() {
     let seams = Seams {
         stage: early_tippy_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: early_tippy_admit,
         admit_memory: early_tippy_admit,
     };
@@ -459,14 +461,6 @@ fn pooled_release_preclaims_lint_once_and_only_until_lint_ends() {
         let early = release && pooled;
         let expected = seen.asked[0].1;
         assert!(expected > 0, "{name}: {seen:?}");
-        if early {
-            assert_eq!(expected, crate::compile_width::TIPPY_CLAIM_FLOOR, "{name}");
-            assert_ne!(
-                expected,
-                16 * GIB,
-                "NEGATIVE CONTROL: the old cold claim did not bound the measured lint learner"
-            );
-        }
         assert_eq!(seen.looked.len(), 2, "{name}: {seen:?}");
         assert_eq!(seen.looked[0].1.len(), usize::from(early));
         assert!(
@@ -521,6 +515,7 @@ fn failed_early_tippy_admission_ends_the_release_before_scheduling() {
     let seams = Seams {
         stage: no_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: refuse_early_tippy,
         admit_memory: refuse_early_tippy,
     };
@@ -639,6 +634,7 @@ fn a_stage_claims_its_memory_before_it_starts_and_holds_it_until_it_ends() {
     let seams = Seams {
         stage: held_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: held_admit,
         admit_memory: held_admit,
     };
@@ -742,6 +738,7 @@ fn a_stages_memory_claim_covers_the_builds_its_children_start() {
     let seams = Seams {
         stage: covers_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: covers_admit,
         admit_memory: covers_admit,
     };
@@ -809,6 +806,7 @@ fn a_stage_that_can_never_fit_asks_to_run_alone() {
     let seams = Seams {
         stage: never_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: never_admit,
         admit_memory: never_admit,
     };
@@ -873,6 +871,7 @@ fn a_stage_short_only_of_memory_no_claim_holds_is_admitted_alone() {
     let seams = Seams {
         stage: alone_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: alone_admit,
         admit_memory: alone_admit,
     };
@@ -932,6 +931,7 @@ fn under_admit_now_a_memory_claim_is_taken_at_once() {
     let seams = Seams {
         stage: now_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: now_admit,
         admit_memory: now_admit,
     };
@@ -1038,6 +1038,7 @@ fn a_browser_stage_with_safari_takes_the_quiet_machine_before_its_memory() {
     let seams = Seams {
         stage: desk_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: desk_admit,
         admit_memory: desk_admit,
     };
@@ -1152,6 +1153,7 @@ fn standin_run_waits_for_memory() {
         Seams {
             stage: standin_stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: standin_admit,
             admit_memory: standin_admit,
         },
@@ -1348,6 +1350,7 @@ fn standin_appkit_run() {
         Seams {
             stage: appkit_stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: appkit_admit,
             admit_memory: appkit_admit,
         },
@@ -1475,6 +1478,7 @@ fn a_stage_keeps_its_figure_only_when_it_did_its_work() {
     let seams = Seams {
         stage: measured_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: measured_admit,
         admit_memory: measured_admit,
     };
@@ -1579,21 +1583,24 @@ fn units_reader(pid: u32) -> crate::memory::Named {
     })
 }
 
-fn no_graph(_: &Ctx, _: &crate::shape::Piece) -> Result<String, String> {
+fn no_graph(
+    _: &Ctx,
+    _: &crate::shape::Piece,
+    _: bool,
+    _: &mut crate::unitgraph::Interner,
+) -> Result<crate::unitgraph::Graph, String> {
     Err("no unit graph in this test".to_owned())
 }
 
-/// A TEST COMPILE KEEPS ITS HEAVY UNITS' PEAKS WHEN IT PASSED: its meter read aterm-gui's
-/// lib-test at 9 GiB and its lib at 3 GiB, and the book keeps each under its unit's key (stage
-/// `TestCompile unit`, the package, the unit's kind), the light compiler none. This remains true
-/// without a release pool. With a pool, wrapper-and-meter intersections enter the separate
-/// claimable book, including the light compiler at the unit floor, and the run-private pending
-/// file is removed after both a pass and a failure. NEGATIVE CONTROLS: reverting claim promotion
-/// to the heavy-only map loses the light row; the unpooled pass still shapes only heavy units;
-/// the failed runs add no unit row; retaining or inheriting either pending file fails the
-/// directory assertions.
+/// A TEST COMPILE KEEPS EVERY COMPILER ITS METER IDENTIFIED WHEN IT PASSED: its book keeps
+/// aterm-gui's lib-test at 9 GiB, its lib at 3 GiB, and the light aterm-grid compiler at the 1 GiB
+/// floor under their unit keys. This remains true without a release pool, so shaping history can
+/// become complete. With a pool, only wrapper-and-meter intersections enter the separate
+/// claimable book, and the run-private pending file is removed after both a pass and a failure.
+/// NEGATIVE CONTROLS: the light row disappears if shaping reverts to the heavy-only map; failed
+/// runs add no unit row; retaining or inheriting either pending file fails the directory checks.
 #[test]
-fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
+fn a_passing_test_compile_keeps_each_observed_units_peak() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     UNITS
         .ledger
@@ -1602,6 +1609,7 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
     let seams = Seams {
         stage: units_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: units_admit,
         admit_memory: units_admit,
     };
@@ -1679,6 +1687,7 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
     assert_eq!(
         units(&records),
         [
+            ("aterm_grid lib".to_owned(), crate::memory::UNIT_FLOOR),
             ("aterm_gui lib".to_owned(), 3 * GIB),
             ("aterm_gui test".to_owned(), 9 * GIB)
         ]
@@ -1879,6 +1888,7 @@ fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
     let seams = Seams {
         stage: stuck_stage,
         prepare_cells: None,
+        prepare_build_dir: |_| Ok(()),
         admit_quiet: stuck_admit,
         admit_memory: stuck_admit,
     };

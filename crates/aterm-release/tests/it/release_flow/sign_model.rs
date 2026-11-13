@@ -163,12 +163,13 @@ fn agrees(r: &Replay, w: &World, case: &str) {
 
 /// Every run's step 7 and 8 is a path of the model: both sides passing in either order and
 /// together, a source red that stops the sign, a sign red before the source's push (nothing
-/// public) and after it (the source finishes), a sign that could not run and its resume (the
-/// sign alone), and a claim that lost the ledger's race.
+/// public) and after it (the source finishes; with a private draft, red, and the resume signs
+/// alone and attests the draft it makes), a sign that could not run and its resume (the sign
+/// alone), and a claim that lost the ledger's race.
 #[test]
 fn every_sign_beside_publish_run_the_release_makes_is_a_path_of_the_model() {
     type Setup = fn(&mut World);
-    let cases: [(&str, Setup, Option<Setup>); 8] = [
+    let cases: [(&str, Setup, Option<Setup>); 9] = [
         ("source first", |_| {}, None),
         ("sign first", |w| w.sides = SideOrder::SignFirst, None),
         ("both at once", |w| w.sides = SideOrder::Overlap, None),
@@ -185,6 +186,15 @@ fn every_sign_beside_publish_run_the_release_makes_is_a_path_of_the_model() {
             "sign red after the push",
             |w| {
                 w.sides = SideOrder::PushThenSign;
+                w.sign_code = 1;
+            },
+            Some(|w| w.sign_code = 0),
+        ),
+        (
+            "sign red after the push, private draft",
+            |w| {
+                w.sides = SideOrder::PushThenSign;
+                w.stage_private_draft = true;
                 w.sign_code = 1;
             },
             Some(|w| w.sign_code = 0),

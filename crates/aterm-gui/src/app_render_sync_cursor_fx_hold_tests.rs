@@ -10,7 +10,7 @@ fn synchronized_hold_preserves_license_and_anchors_until_glass_release() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.config.trail_sounds = Some(false);
     app.windows.get_mut(&wid).expect("window").focused = true;
@@ -91,7 +91,7 @@ fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.config.cursor_trail_style = Some("rainbow".into());
         app.config.motion = Some("full".into());
         app.config.trail_sounds = Some(false);
         app.windows.get_mut(&wid).expect("window").focused = true;
@@ -191,7 +191,7 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.config.trail_sounds = Some(true);
     app.trail_audio = TrailAudio::capturing_for_test();

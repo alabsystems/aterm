@@ -223,12 +223,332 @@ fn the_budget_is_a_sliding_window_over_the_stamps_it_persisted() {
     n.charge(1_100).expect("charge");
     assert!(!n.has_room(1_200), "two in the window is the limit of 2");
     assert!(n.has_room(61_050), "the 1_000 stamp has left the window");
+    drop(n);
     let mut back = Notifier::new(cfg(&dir)).expect("reopen");
     assert!(
         !back.has_room(1_200),
         "a restart does not hand the budget back"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ONE NOTIFIER PER STORE ([`Store::hold`]): while one notifier holds a state dir, a second
+/// one's start on it is refused, naming the holder's pid, and writes nothing; once the first
+/// lets go, a start takes it.
+#[test]
+fn a_second_notifier_on_the_same_store_is_refused_at_its_start() {
+    let dir = scratch("one-notifier");
+    let mut first = Notifier::new(cfg(&dir)).expect("open");
+    first.charge(1_000).expect("charge");
+    let journal = std::fs::read(first.store.root.join(journal::FILE)).expect("the journal");
+    let second = Notifier::new(cfg(&dir));
+    let refusal = second
+        .err()
+        .expect("a second notifier on the same store is refused");
+    assert_eq!(refusal.kind(), io::ErrorKind::WouldBlock, "{refusal}");
+    let said = refusal.to_string();
+    assert!(
+        said.contains("held by another `aterm link notify`")
+            && said.contains(&format!("(pid {})", std::process::id())),
+        "the refusal names the holder: {said}"
+    );
+    assert_eq!(
+        std::fs::read(first.store.root.join(journal::FILE)).expect("the journal"),
+        journal,
+        "the refused start wrote nothing"
+    );
+    drop(first);
+    let back = Notifier::new(cfg(&dir)).expect("once the first lets go, a start takes it");
+    assert_eq!(back.stamps, [1_000]);
+}
+
+/// How a test takes a running notifier's store from under it.
+#[derive(Clone, Copy, Debug)]
+enum Under {
+    /// `notify/` removed whole, as by hand.
+    Removed,
+    /// `notify/lock` removed, its journal left in place.
+    LockRemoved,
+}
+
+/// What [`under_a_running_notifier`] saw.
+struct Lost {
+    /// The first notifier's write after its store was taken from under it, before a second one.
+    alone: io::Result<()>,
+    /// What [`StoreLock::moved`] answered once a second notifier took the new store.
+    moved: io::Result<Option<Moved>>,
+    /// The first one's write after the second wrote the new store.
+    beside: io::Result<()>,
+    /// Whether that write changed the new store's journal.
+    wrote: bool,
+    /// The first one's reader connecting again then, taking up its log's store ([`reader_store`]).
+    read: io::Result<()>,
+    /// Whether that reader wrote the new store's `log` file.
+    logged: bool,
+    /// The stamps a start after both let go reads.
+    stamps: Vec<u64>,
+}
+
+/// A notifier writes its store, the store is taken from under it (`under`), it writes, a second
+/// notifier takes the new store and writes it, and the first writes again and its reader
+/// connects again; `by_file` is the mutant that holds the store by its lock's file only
+/// ([`Hold::check`]).
+fn under_a_running_notifier(tag: &str, under: Under, by_file: bool) -> Lost {
+    let dir = scratch(tag);
+    let mut c = cfg(&dir);
+    c.limit = 8;
+    let mut first = Notifier::new(c.clone()).expect("open");
+    first
+        .hold
+        .by_file
+        .store(by_file, std::sync::atomic::Ordering::Relaxed);
+    first.charge(1_000).expect("charge");
+    match under {
+        Under::Removed => std::fs::remove_dir_all(&first.store.root).expect("remove notify/"),
+        Under::LockRemoved => {
+            std::fs::remove_file(first.store.root.join(LOCK)).expect("remove notify/lock");
+        }
+    }
+    let alone = first.charge(2_000);
+    let mut second =
+        Notifier::new(c.clone()).expect("the path taken from under the first is a new store");
+    second
+        .charge(5_000)
+        .expect("the second writes the new store");
+    let journal_path = second.store.root.join(journal::FILE);
+    let journal = std::fs::read(&journal_path).expect("the new store's journal");
+    let moved = first.hold.lock.moved();
+    let beside = first.charge(3_000);
+    let wrote = std::fs::read(&journal_path).expect("the new store's journal") != journal;
+    let log = ReadLog {
+        id: Some(astream_broker::LogIdentity {
+            id: [7; 16],
+            generation: 0,
+        }),
+        lineage: None,
+        ordered: false,
+    };
+    let read = reader_store(&first.hold, &log).map(drop);
+    let logged = second.store.root.join("log").exists();
+    drop(second);
+    drop(first);
+    let stamps = Notifier::new(c).expect("once both let go").stamps;
+    Lost {
+        alone,
+        moved,
+        beside,
+        wrote,
+        read,
+        logged,
+        stamps,
+    }
+}
+
+/// THE STORE BY ITS PATH ([`Hold::check`]): a notifier whose `notify/` (or whose `notify/lock`)
+/// is removed under it stops at its next write, naming the store, and never writes again, its
+/// readers' connects included ([`reader_store`], whose [`Store::for_log`] writes the `log`
+/// file), so a second notifier takes the new store and nothing of the first's reaches it.
+/// NEGATIVE CONTROL: the store held by its lock's file only (`by_file`) takes every write: its
+/// reader writes the second's `log` file, and beside the lock removed its writes go into the
+/// journal the second one now writes (whose steps then interleave out of order). With
+/// `notify/` removed the notifier's own writes go to descriptors no path names, so there the
+/// `alone`, `beside` and `read` refusals and the `log` file are what tell the check from none.
+#[test]
+fn a_notifier_whose_store_is_removed_under_it_stops_at_its_next_write() {
+    for under in [Under::Removed, Under::LockRemoved] {
+        let lost = under_a_running_notifier("lock-path", under, false);
+        let alone = lost
+            .alone
+            .expect_err("the next write after the removal stops");
+        assert_eq!(alone.kind(), io::ErrorKind::NotFound, "{under:?}: {alone}");
+        assert!(
+            alone
+                .to_string()
+                .contains("was removed or replaced under this notifier"),
+            "{under:?}: the refusal names the store: {alone}"
+        );
+        assert!(
+            matches!(lost.moved, Ok(Some(Moved::Replaced(_)))),
+            "{under:?}: the new store's lock is not the one it holds: {:?}",
+            lost.moved
+        );
+        let beside = lost.beside.expect_err("it never writes again");
+        assert_eq!(beside.to_string(), alone.to_string(), "{under:?}");
+        assert!(!lost.wrote, "{under:?}: the first wrote the second's store");
+        let read = lost.read.expect_err("its reader writes nothing either");
+        assert_eq!(read.to_string(), alone.to_string(), "{under:?}");
+        assert!(
+            !lost.logged,
+            "{under:?}: its reader wrote the second's `log`"
+        );
+        assert!(
+            !lost.stamps.contains(&2_000) && !lost.stamps.contains(&3_000),
+            "{under:?}: the new store holds the first's writes: {:?}",
+            lost.stamps
+        );
+        assert!(lost.stamps.contains(&5_000), "{under:?}: {:?}", lost.stamps);
+
+        let mutant = under_a_running_notifier("lock-file", under, true);
+        assert!(
+            mutant.alone.is_ok() && mutant.beside.is_ok() && mutant.read.is_ok(),
+            "CONTROL {under:?}: held by its file only, every write is taken"
+        );
+        assert!(
+            mutant.logged,
+            "CONTROL {under:?}: the first's reader writes the second's store"
+        );
+        if matches!(under, Under::LockRemoved) {
+            assert!(
+                mutant.wrote && mutant.stamps.contains(&2_000),
+                "CONTROL: two notifiers write one journal: {:?}",
+                mutant.stamps
+            );
+        }
+    }
+}
+
+/// A [`Hold::check`] whose `lstat` does not answer (here `ELOOP`, a path that loops) records
+/// nothing: the errno is passed up as a write the state dir refused, retried later, and the
+/// next check that reads the path names the lock again. NEGATIVE CONTROL: the path moved is
+/// recorded, and every check after answers it.
+#[test]
+fn a_store_check_that_cannot_read_its_path_records_no_loss() {
+    let dir = scratch("lock-errno");
+    let store = Store::open(&dir).expect("open");
+    let lock = store.hold().expect("hold");
+    let probe = store.root.join("loop");
+    std::os::unix::fs::symlink("loop", &probe).expect("a link to itself");
+    let hold = Hold::new(
+        store.root.clone(),
+        StoreLock {
+            file: lock.file.try_clone().expect("dup"),
+            path: probe.join(LOCK),
+            id: lock.id,
+        },
+    );
+    let errno = hold.check().expect_err("the path does not read");
+    assert!(errno.raw_os_error().is_some(), "an lstat errno: {errno}");
+    assert!(
+        hold.lost().is_none(),
+        "a read that did not answer is no loss"
+    );
+    let hold = Hold::new(store.root.clone(), lock);
+    hold.check().expect("the path names the lock it took");
+    std::fs::remove_file(store.root.join(LOCK)).expect("remove notify/lock");
+    let gone = hold.check().expect_err("CONTROL: the lock removed");
+    assert_eq!(gone.kind(), io::ErrorKind::NotFound, "{gone}");
+    std::fs::write(store.root.join(LOCK), b"").expect("a new lock file");
+    let again = hold.check().expect_err("CONTROL: recorded");
+    assert_eq!(again.to_string(), gone.to_string());
+}
+
+/// [`Store::hold`] holds a lock its path names; a path replaced after the take is told by
+/// [`StoreLock::moved`]. NEGATIVE CONTROL: the same file back at its path is held again.
+#[test]
+fn a_held_lock_is_the_file_its_path_names() {
+    let dir = scratch("lock-held-at");
+    let store = Store::open(&dir).expect("open");
+    let lock = store.hold().expect("hold");
+    assert_eq!(
+        lock.moved().expect("lstat"),
+        None,
+        "the path names the lock"
+    );
+    let aside = store.root.join("lock.aside");
+    std::fs::rename(store.root.join(LOCK), &aside).expect("move the lock aside");
+    assert_eq!(lock.moved().expect("lstat"), Some(Moved::Removed));
+    std::fs::write(store.root.join(LOCK), b"").expect("a new lock file");
+    assert!(
+        matches!(lock.moved(), Ok(Some(Moved::Replaced(_)))),
+        "another file at the path"
+    );
+    std::fs::rename(&aside, store.root.join(LOCK)).expect("move it back");
+    assert_eq!(
+        lock.moved().expect("lstat"),
+        None,
+        "CONTROL: the same file back"
+    );
+}
+
+/// [`Store::hold`] takes [`LOCK`] again where its path was replaced between the open and the
+/// `flock(2)` ([`BEFORE_TAKE`]), and holds the file its path names; replaced under each of
+/// [`HOLD_TRIES`] takes, it refuses by name. NEGATIVE CONTROL: with no replacement the first
+/// take is held, and the take count shows the retries ran.
+#[test]
+fn a_lock_replaced_under_its_take_is_taken_again() {
+    let run = |replace: usize| {
+        let dir = scratch("lock-take");
+        let store = Store::open(&dir).expect("open");
+        let takes = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let seen = std::rc::Rc::clone(&takes);
+        BEFORE_TAKE.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |path: &Path| {
+                seen.set(seen.get() + 1);
+                if seen.get() <= replace {
+                    let fresh = path.with_extension("fresh");
+                    std::fs::write(&fresh, b"").expect("a new lock file");
+                    std::fs::rename(&fresh, path).expect("replace the lock");
+                }
+            }));
+        });
+        let held = store.hold();
+        BEFORE_TAKE.with(|seam| *seam.borrow_mut() = None);
+        (held, takes.get(), dir)
+    };
+    let (held, takes, _dir) = run(0);
+    assert_eq!(held.expect("CONTROL: held").moved().expect("lstat"), None);
+    assert_eq!(takes, 1, "CONTROL: one take");
+    for replace in 1..HOLD_TRIES {
+        let (held, takes, _dir) = run(replace);
+        let lock = held.expect("taken again");
+        assert_eq!(
+            lock.moved().expect("lstat"),
+            None,
+            "{replace}: held by its path"
+        );
+        assert_eq!(takes, replace + 1, "{replace}");
+    }
+    let (held, takes, _dir) = run(HOLD_TRIES);
+    let Err(refused) = held else {
+        panic!("replaced under every take, it was held");
+    };
+    assert_eq!(refused.kind(), io::ErrorKind::Other, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("between the open and the take"),
+        "{refused}"
+    );
+    assert_eq!(takes, HOLD_TRIES);
+}
+
+/// A file system that takes no lock ([`Store::judge_take`]) is refused, never taken as a take:
+/// the journal's one writer rests on the lock. NEGATIVE CONTROL: a take is taken, and another
+/// errno is passed up as it is.
+#[test]
+fn a_store_whose_file_system_takes_no_lock_is_refused() {
+    let store = Store {
+        root: PathBuf::from("/nowhere/notify"),
+    };
+    let unsupported = store
+        .judge_take(Err(std::fs::TryLockError::Error(io::Error::from(
+            io::ErrorKind::Unsupported,
+        ))))
+        .expect_err("no lock is no store");
+    assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
+    assert!(
+        unsupported
+            .to_string()
+            .contains("--state on a volume that locks"),
+        "{unsupported}"
+    );
+    store.judge_take(Ok(())).expect("CONTROL: a take");
+    let other = store
+        .judge_take(Err(std::fs::TryLockError::Error(
+            io::Error::from_raw_os_error(libc::EIO),
+        )))
+        .expect_err("CONTROL: another errno");
+    assert_eq!(other.raw_os_error(), Some(libc::EIO));
 }
 
 fn appending(dir: &str, limit: u32, exec: &str) -> (Notifier, PathBuf) {
@@ -308,6 +628,7 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7], "a clear re-arms it");
 
+    drop(n);
     let (mut back, _) = appending(&dir, 100, "");
     feed(
         &mut back,
@@ -345,6 +666,7 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     feed(&mut n, 1, "s-one", "v=1 t=1 attention=first");
     feed(&mut n, 2, "s-two", "v=1 t=2 attention=second");
     assert_eq!(n.verdict(2), Some("dropped"));
+    drop(n);
     let (mut room, _) = appending(&dir, 10, "");
     feed(&mut room, 3, "s-two", "v=1 t=3 inc=2 attention=second");
     assert_eq!(
@@ -355,6 +677,7 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     feed(&mut room, 4, "s-two", "v=1 t=4 inc=3 attention=second");
     assert_eq!(fired_offsets(&fired), [1, 3], "and, told, stands");
 
+    drop(room);
     let (mut broken, _) = appending(
         &dir,
         10,
@@ -387,10 +710,9 @@ fn the_journal_keeps_one_verdict_per_offset_and_is_bounded() {
     n.record(5, "5 fired on=attention rc=0 dup=0".into());
     assert_eq!(n.verdict(5), Some("fired"), "the firing line is replaced");
     assert_eq!(n.journal.len(), 1);
-    assert_eq!(
-        Notifier::new(cfg(&dir)).expect("reopen").verdict(5),
-        Some("fired")
-    );
+    drop(n);
+    let mut n = Notifier::new(cfg(&dir)).expect("reopen");
+    assert_eq!(n.verdict(5), Some("fired"));
     n.journal.extend(
         (100..99 + JOURNAL_KEEP as u64).map(|off| format!("{off} fired on=attention rc=0 dup=0")),
     );
@@ -582,11 +904,11 @@ fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
         broker_a.log_identity().to_string(),
         "the root is the first log's"
     );
-    assert!(root
-        .join("logs")
-        .join(broker_b.log_identity().to_string())
-        .join("cur/attention")
-        .exists());
+    assert!(Store {
+        root: root.join("logs").join(broker_b.log_identity().to_string()),
+    }
+    .cursor("attention")
+    .is_some());
     server_a.shutdown();
     server_b.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -861,6 +1183,58 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A READER'S START AT THE HEAD IS ON THE MEDIA BEFORE IT READS A RECORD: the notifier writes
+/// a [`Notice::Start`] as the selector's cursor, ordered, and answers once it is written, so a
+/// reader that reads on only after that answer has a restart re-read from that head, never
+/// from a later one; a refused write is answered with its error (the reader connects again
+/// after its backoff) and owes nothing. The NEGATIVE CONTROL is the start handed over as a
+/// checkpoint: under the same refusal it is owed, not written, and nothing tells the reader,
+/// which would read on past a start a kill then loses.
+#[test]
+fn a_readers_start_at_the_head_is_written_before_it_reads() {
+    let key = Sel::Attention.key();
+    let dir = scratch("start");
+    let (mut n, _) = appending(&dir, 100, "");
+    n.take(Notice::Log(0, strict_log())).expect("log");
+    let on_media = |n: &Notifier| {
+        Store {
+            root: n.log_store.root.clone(),
+        }
+        .read_cursor(&key)
+    };
+    let start = |n: &mut Notifier, head| {
+        let (done, wrote) = mpsc::sync_channel(1);
+        n.take(Notice::Start(0, head, done)).expect("take");
+        wrote.try_recv().expect("answered at once")
+    };
+    REFUSE.with(|r| *r.borrow_mut() = vec![("cur/attention", 0, libc::ENOSPC)]);
+    assert_eq!(
+        start(&mut n, 9).map_err(|e| e.raw_os_error()),
+        Err(Some(libc::ENOSPC)),
+        "a refused start is answered with its error"
+    );
+    assert_eq!(
+        (on_media(&n), n.lag.contains_key(&key)),
+        (None, false),
+        "and owes nothing"
+    );
+    start(&mut n, 9).expect("the start written");
+    assert_eq!(on_media(&n), Some(9), "on the media before the answer");
+
+    let dir = scratch("start-ctl");
+    let (mut n, _) = appending(&dir, 100, "");
+    n.take(Notice::Log(0, strict_log())).expect("log");
+    REFUSE.with(|r| *r.borrow_mut() = vec![("cur/attention", 0, libc::ENOSPC)]);
+    n.take(Notice::Checkpoint(0, 9)).expect("taken");
+    assert_eq!(
+        (on_media(&n), n.lag.get(&key).map(|lag| lag.want)),
+        (None, Some(9)),
+        "NEGATIVE CONTROL: a start handed over as a checkpoint is only owed, and the reader \
+         is not told"
+    );
+    REFUSE.with(std::cell::RefCell::take);
+}
+
 #[test]
 fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
     let presence = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
@@ -1102,7 +1476,9 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
     };
     /// A case's name, its `firing` flush, what it judges before the recording starts, the
     /// pages it records, and what each page asks for before its command: the general law
-    /// is one full flush, last.
+    /// is one full flush, last. The journal's one step (its `firing` line and the stamp it
+    /// spends) is that flush, where the log's store is the root's; in a log's own store the
+    /// line's step is ordered ahead of the stamp's, whose flush it is.
     type Case = (
         &'static str,
         Flush,
@@ -1116,28 +1492,28 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
             D,
             Vec::new(),
             vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
-            &[O, O, D],
+            &[D],
         ),
         (
             "NEGATIVE CONTROL: an ordered `firing` line",
             O,
             Vec::new(),
             vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
-            &[O, O, O],
+            &[O],
         ),
         (
             "a raise that replaces another token, its cursor owed",
             D,
             vec![row(1, "s-a", "help-1"), row(2, "s-q", "-")],
             vec![row(3, "s-a", "help-2")],
-            &[O, O, O, O, O, O, D],
+            &[O, D],
         ),
         (
             "a log's own store, under logs/",
             D,
             Vec::new(),
-            vec![row(1, "s-a", "help-a")],
-            &[O, O, O, D],
+            vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
+            &[O, D],
         ),
     ];
     for (at, (case, firing, setup, pages, asks)) in cases.into_iter().enumerate() {
@@ -1202,6 +1578,11 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
                 !after.is_empty() && durable(after) == 0,
                 "{case}, page {page}: its `fired` line, standing value and cursor ordered \
                  after its command, none in full: {after:?}"
+            );
+            assert_eq!(
+                after.first(),
+                Some(&O),
+                "{case}, page {page}: its `fired` line one ordered append: {after:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1332,8 +1713,11 @@ fn a_standing_value_never_reaches_the_media_ahead_of_its_selectors_cursor() {
         [1],
         "a crash that loses the owed cursor re-reads from 3, and pages nothing again"
     );
-    std::fs::write(Path::new(&dir).join("notify/cur").join(&key), "2\n")
-        .expect("CONTROL: the cursor as it stood before the clear");
+    Store {
+        root: Path::new(&dir).join("notify"),
+    }
+    .put_cursor_at(&key, 2)
+    .expect("CONTROL: the cursor as it stood before the clear");
     assert_eq!(
         replay(2),
         [1, 2],
@@ -1341,6 +1725,62 @@ fn a_standing_value_never_reaches_the_media_ahead_of_its_selectors_cursor() {
          it judged under the standing value"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE NOTIFIER'S STANDING CHANGE AND ITS CURSOR REACH THE MEDIA TOGETHER: the bytes
+/// [`Notifier::put_standing`] appends for a clear (record 3 clears the value record 1 raised),
+/// cut at every byte, read with the clear only where the selector's cursor is at the clearing
+/// record or past it: the production write, not a hand-built step. The NEGATIVE CONTROL writes
+/// the change and its cursor as two steps in one append (`Notifier::standing_split`), with the
+/// same flushes, and a cut between them reads the clear with the cursor behind it.
+#[test]
+fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
+    let key = Sel::Attention.key();
+    let raise = b"v=1 t=1 attention=help".to_vec();
+    for mutant in [false, true] {
+        let dir = scratch(&format!("standing-cut-{mutant}"));
+        let (mut n, _) = appending(&dir, 100, "");
+        n.cursor_every = Duration::MAX;
+        n.standing_split = mutant;
+        n.take(Notice::Log(0, strict_log())).expect("log");
+        for (off, body) in [(1, raise.clone()), (2, raise.clone())] {
+            n.take(Notice::Record(0, off, presence_of("s-a"), body))
+                .expect("a record");
+        }
+        let path = n.log_store.root.join(journal::FILE);
+        let before = std::fs::metadata(&path).expect("the journal").len();
+        n.take(Notice::Record(
+            0,
+            3,
+            presence_of("s-a"),
+            b"v=1 t=1 attention=-".to_vec(),
+        ))
+        .expect("the clear");
+        let bytes = std::fs::read(&path).expect("the journal");
+        let (mut apart, mut cleared_seen) = (0, false);
+        for cut in usize::try_from(before).expect("small")..=bytes.len() {
+            let held = journal::read(&bytes[..cut]).index;
+            let cleared = !held.standing.iter().any(|(s, _)| *s == presence_of("s-a"));
+            cleared_seen |= cleared;
+            apart += usize::from(cleared && held.cursors.get(&key).is_none_or(|&c| c < 3));
+        }
+        assert!(
+            cleared_seen,
+            "PRECONDITION ({mutant}): the clear reached the journal"
+        );
+        if mutant {
+            assert!(
+                apart > 0,
+                "NEGATIVE CONTROL: two steps in one append leave a cut with the clear ahead of \
+                 its cursor"
+            );
+        } else {
+            assert_eq!(
+                apart, 0,
+                "no cut reads the clear with its selector's cursor behind it"
+            );
+        }
+    }
 }
 
 /// The cursor writes ([`PUT_NAMES`]) a `need` follower makes over a fleet's busy faces: one
@@ -1871,8 +2311,20 @@ fn a_drops_count_never_reaches_the_store_ahead_of_its_line_and_no_cursor_passes_
 /// journal's verdicts, the suppressed count and the stamps spent, as the store holds them.
 type Left = (Vec<u64>, Vec<(u64, String)>, u64, usize);
 
+/// Every kill point of a run, in the two layouts a store has: the root's log, whose verdict
+/// and what it spends or counts are one step of one journal, so no kill falls between them and
+/// a run with no restore loses nothing; and a log's own store under `logs/`, whose verdicts go
+/// to its own journal ahead of the stamps and the count in the root's, where a kill between a
+/// page's `firing` line and its stamp, or a drop's line and its count, is what the restore
+/// finishes (the NEGATIVE CONTROL: without it, those kills under-spend or under-count).
 #[test]
 fn a_kill_between_a_verdict_and_its_count_neither_charges_nor_counts_a_record_twice() {
+    for own_store in [false, true] {
+        kill_sweep(own_store);
+    }
+}
+
+fn kill_sweep(own_store: bool) {
     let key = Sel::Attention.key();
     let raise = |sid: &str| {
         (
@@ -1896,10 +2348,24 @@ fn a_kill_between_a_verdict_and_its_count_neither_charges_nor_counts_a_record_tw
     .map(|((subject, body), off)| (off, subject, body))
     .collect();
     let open = |dir: &str| {
+        if own_store {
+            let _ = Store::open(dir)
+                .expect("open")
+                .for_log(
+                    Some(astream_broker::LogIdentity {
+                        id: [8; 16],
+                        generation: 0,
+                    }),
+                    None,
+                )
+                .expect("the root's store claimed by another log");
+        }
         let (mut n, fired) = appending(dir, 3, "");
         n.cfg.window_ms = 3_600_000;
         n.cursor_every = Duration::MAX;
         n.take(Notice::Log(0, strict_log())).expect("log");
+        n.scope_to(&strict_log())
+            .expect("the log's store taken up, so a restart's restore is the test's to skip");
         (n, fired)
     };
     let feed = |n: &mut Notifier| -> io::Result<()> {
@@ -1925,7 +2391,7 @@ fn a_kill_between_a_verdict_and_its_count_neither_charges_nor_counts_a_record_tw
         )
     };
 
-    let dir = scratch("kill-sweep");
+    let dir = scratch(&format!("kill-sweep-{own_store}"));
     let (mut n, fired) = open(&dir);
     PUT_FAULT.with(|left| left.set(Some(u32::MAX)));
     feed(&mut n).expect("the run no kill stops");
@@ -1953,7 +2419,7 @@ fn a_kill_between_a_verdict_and_its_count_neither_charges_nor_counts_a_record_tw
     let mut unrestored = Vec::new();
     for kill in 0..writes {
         for restore in [true, false] {
-            let dir = scratch(&format!("kill-sweep-{kill}-{restore}"));
+            let dir = scratch(&format!("kill-sweep-{own_store}-{kill}-{restore}"));
             let (mut n, _) = open(&dir);
             PUT_FAULT.with(|left| left.set(Some(kill)));
             let _ = feed(&mut n);
@@ -1981,13 +2447,22 @@ fn a_kill_between_a_verdict_and_its_count_neither_charges_nor_counts_a_record_tw
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-    assert_eq!(
-        unrestored.len(),
-        5,
-        "NEGATIVE CONTROL: with no restore, a kill between each page's `firing` line and its \
-         stamps (3) or each drop's line and its count (2) under-spends or under-counts: \
-         {unrestored:?}"
-    );
+    if own_store {
+        assert_eq!(
+            unrestored.len(),
+            5,
+            "NEGATIVE CONTROL: in a log's own store, with no restore, a kill between each \
+             page's `firing` line and its stamp (3) or each drop's line and its count (2) \
+             under-spends or under-counts: {unrestored:?}"
+        );
+    } else {
+        assert_eq!(
+            unrestored,
+            Vec::<u32>::new(),
+            "in the root's store a verdict and what it spends or counts are one step: no kill \
+             falls between them"
+        );
+    }
 }
 
 #[test]
@@ -2015,9 +2490,9 @@ fn the_flush_tally_tells_every_flush_a_carried_generation_asks_for() {
     assert_eq!(two.cursor("attention"), Some(5), "PRECONDITION: carried");
     assert_eq!(
         noted.iter().filter(|f| f.is_durable()).count(),
-        3,
-        "the carried store's `cur/` and its root, then `logs/` once it is renamed in, each \
-         flushed in full: {noted:?}"
+        2,
+        "the carried store's root, then `logs/` once it is renamed in, each flushed in full: \
+         {noted:?}"
     );
     assert_eq!(
         noted,
@@ -2325,6 +2800,7 @@ fn pump(
                     Notice::Record(..) => "record",
                     Notice::Warm(..) => "warm",
                     Notice::Checkpoint(..) => "checkpoint",
+                    Notice::Start(..) => "start",
                     Notice::Log(..) => "log",
                     Notice::Durable(..) => "durable",
                 };
@@ -2374,8 +2850,8 @@ fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
         n.wait_durable = wait;
         let (tx, rx) = notice_handoff();
         let follower = {
-            let root = n.store.root.clone();
-            std::thread::spawn(move || reader(0, &Sel::Attention, &c, &root, &tx))
+            let hold = std::sync::Arc::clone(&n.hold);
+            std::thread::spawn(move || reader(0, &Sel::Attention, &c, &hold, &tx))
         };
         pump(&mut n, &rx, "the reader's subscription", |_| {
             broker.stats().parked_tails == 1
@@ -2843,8 +3319,8 @@ fn a_following_need_reader_folds_below_its_cursor_before_it_judges() {
     let mut n = Notifier::new(c.clone()).expect("reopen");
     let (tx, rx) = notice_handoff();
     let follower = {
-        let root = n.store.root.clone();
-        std::thread::spawn(move || reader(0, &Sel::Need(None), &c, &root, &tx))
+        let hold = std::sync::Arc::clone(&n.hold);
+        std::thread::spawn(move || reader(0, &Sel::Need(None), &c, &hold, &tx))
     };
     pump(&mut n, &rx, "the reader's subscription", |_| {
         broker.stats().parked_tails == 1
@@ -3938,8 +4414,8 @@ fn a_notifier_started_over_a_standing_need_pages_only_what_rises_past_its_cursor
     let mut n = Notifier::new(c.clone()).expect("open");
     let (tx, rx) = notice_handoff();
     let follower = {
-        let root = n.store.root.clone();
-        std::thread::spawn(move || reader(0, &Sel::Need(None), &c, &root, &tx))
+        let hold = std::sync::Arc::clone(&n.hold);
+        std::thread::spawn(move || reader(0, &Sel::Need(None), &c, &hold, &tx))
     };
     pump(&mut n, &rx, "the reader's subscription", |_| {
         broker.stats().parked_tails == 1
@@ -4151,14 +4627,19 @@ fn a_nodes_will_keeps_its_sessions_needs_and_a_reattach_pages_nothing_again() {
 #[test]
 fn an_old_stores_word_stands_as_the_folds_pair_and_a_new_rise_still_pages() {
     let dir = scratch("need-old-store");
+    let notify = Path::new(&dir).join("notify");
+    std::fs::create_dir_all(&notify).expect("the store");
+    std::fs::write(notify.join("standing"), format!("{NEED_FACE} failure\n"))
+        .expect("an old store's one word");
     let (mut n, fired) = appending(&dir, 100, "");
+    assert_eq!(
+        n.standing,
+        [(NEED_FACE.to_string(), "failure".to_string())],
+        "PRECONDITION: the old store's line file migrated"
+    );
     let sel = Sel::Need(None);
     n.cfg.on = vec![sel.clone()];
     let key = sel.key();
-    n.standing = vec![(NEED_FACE.to_string(), "failure".to_string())];
-    n.log_store
-        .set_standing(&n.standing)
-        .expect("an old store's one word");
     let mut s = Needs::open();
     let cmd = s.cmd_open();
     s.cmd_close(cmd, aterm_slog::RunOut::Fail);
@@ -4900,12 +5381,15 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     assert_eq!(carried.cursor("attention"), Some(2));
     assert_eq!(carried.cursor("ask-to.h-alice"), Some(6));
     assert_eq!(carried.cursor("ask-to.h-bob"), Some(4));
+    std::fs::create_dir_all(carried.root.join("cur")).unwrap();
+    std::fs::write(carried.root.join("cur/attention.migrated"), "3\n").unwrap();
     std::os::unix::fs::symlink(
-        carried.root.join("cur/attention"),
+        carried.root.join("cur/attention.migrated"),
         carried.root.join("cur/halt"),
     )
     .unwrap();
-    assert_eq!(carried.cursor("halt"), None);
+    assert_eq!(carried.cursor("halt"), None, "a link is no cursor");
+    std::fs::remove_dir_all(carried.root.join("cur")).unwrap();
     assert_eq!(carried.journal(), ["1 fired rc=0"]);
     assert_eq!(carried.standing(), from.standing());
     let empty = Store {
@@ -4929,19 +5413,126 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
         );
     }
     from.set_cursor("attention", 2).unwrap();
-    for name in ["journal", "standing"] {
-        let path = from.root.join(name);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        let to = logs.join(format!("unreadable-{name}"));
-        let result = from.carry(&from, &to, 6);
-        refused.push(result.is_err() && !to.exists() && path.is_dir());
-        std::fs::remove_dir(&path).unwrap();
-        from.write(name, "", Flush::Ordered).unwrap();
-    }
+    let path = from.root.join(JOURNAL_FILE);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let to = logs.join("unreadable-journal");
+    let result = from.carry(&from, &to, 6);
+    refused.push(result.is_err() && !to.exists() && path.is_dir());
+    std::fs::remove_dir(&path).unwrap();
+    from.set_journal(&[], Flush::Ordered).unwrap();
+    let steps: Vec<journal::Step> = (1..=3)
+        .map(|off| journal::Step {
+            verdict: Some(format!("{off} fired rc=0")),
+            ..journal::Step::default()
+        })
+        .collect();
+    let (mut damaged, _) = journal::encode_from(0, &steps).unwrap();
+    let (first, _) = journal::encode_from(0, &steps[..1]).unwrap();
+    damaged[first.len() + 20] ^= 0x55;
+    let path = from.root.join(JOURNAL_FILE);
+    std::fs::write(&path, &damaged).unwrap();
+    let to = logs.join("faulted-journal");
+    let result = from.carry(&from, &to, 6);
+    refused.push(
+        result.is_err()
+            && !to.exists()
+            && std::fs::read(&path).is_ok_and(|got| got == damaged)
+            && !from.root.join(journal::FAULT).exists(),
+    );
     assert!(
         refused.into_iter().all(|held| held),
         "CARRY_PUBLISHED_INCOMPLETE_EVIDENCE"
+    );
+}
+
+/// AN OLD STORE'S UNREADABLE LINE FILE FAILS NO CARRY: a predecessor `logs/<old>/` store of a
+/// build before the journal, whose `rate` is not text, whose `suppressed` is not a regular file
+/// and whose `standing` is not text, is carried as a load would read it, each of those as empty
+/// and its readable `journal` below the fork, and the source is left as it was: nothing set
+/// aside, no journal written. A strict read would refuse the carry, and the switch to the new
+/// log, at every retry.
+#[test]
+fn a_carry_reads_an_old_stores_unreadable_line_files_as_empty_and_leaves_them() {
+    let dir = crate::test_scratch_dir("carry-lenient");
+    let from = Store {
+        root: dir.path().join("from"),
+    };
+    std::fs::create_dir_all(from.root.join("cur")).unwrap();
+    std::fs::write(from.root.join("cur/attention"), "9\n").unwrap();
+    std::fs::write(
+        from.root.join("journal"),
+        "1 fired on=attention rc=0 dup=0\n7 fired on=attention rc=0 dup=0\n",
+    )
+    .unwrap();
+    std::fs::write(from.root.join("rate"), b"\xff\xfe not text").unwrap();
+    std::fs::create_dir(from.root.join("suppressed")).unwrap();
+    std::fs::write(from.root.join("standing"), b"\xff not text").unwrap();
+    let names = |root: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names(&from.root);
+    let to = dir.path().join("logs").join("next");
+    from.carry(&from, &to, 6)
+        .expect("an unreadable line file is read as empty");
+    let carried = Store { root: to };
+    assert_eq!(carried.cursor("attention"), Some(6));
+    assert_eq!(carried.journal(), ["1 fired on=attention rc=0 dup=0"]);
+    assert_eq!(carried.standing(), Vec::<(String, String)>::new());
+    assert_eq!(names(&from.root), before, "the source is left as it was");
+    assert_eq!(
+        std::fs::read(from.root.join("rate")).unwrap(),
+        b"\xff\xfe not text"
+    );
+    assert!(from.root.join("suppressed").is_dir());
+}
+
+/// A line-format `standing` file that does not read says no standing values: the journal's
+/// stand, so a carry from that store, and a load of it, keep what the journal holds (a load
+/// sets the file aside). NEGATIVE CONTROL: a `standing` file that reads replaces them.
+#[test]
+fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
+    let dir = crate::test_scratch_dir("carry-standing");
+    let from = Store {
+        root: dir.path().join("from"),
+    };
+    std::fs::create_dir_all(from.root.join("cur")).unwrap();
+    from.set_cursor("attention", 9).unwrap();
+    let rows = vec![("/f/f1/pub/n-a/s-one/presence".to_owned(), "key".to_owned())];
+    from.set_standing(&rows).unwrap();
+    std::fs::create_dir(from.root.join(journal::STANDING)).unwrap();
+    assert_eq!(from.standing(), rows);
+    let to = dir.path().join("logs").join("next");
+    from.carry(&from, &to, 6).expect("carry");
+    assert_eq!(Store { root: to }.standing(), rows, "the carry keeps them");
+    assert!(from.root.join(journal::STANDING).is_dir(), "left as it was");
+    assert_eq!(
+        from.verdicts().unwrap().standing,
+        rows,
+        "the load keeps them"
+    );
+    assert!(
+        !from.root.join(journal::STANDING).exists()
+            && from
+                .root
+                .join(format!("{}{}", journal::STANDING, journal::SET_ASIDE))
+                .is_dir(),
+        "the load sets it aside"
+    );
+    std::fs::write(
+        from.root.join(journal::STANDING),
+        "/f/f1/pub/n-a/s-two/presence other\n",
+    )
+    .unwrap();
+    assert_ne!(
+        from.standing(),
+        rows,
+        "CONTROL: one that reads replaces them"
     );
 }
 
@@ -4985,4 +5576,422 @@ fn a_carry_retires_only_its_exclusively_owned_stage() {
         })
         .collect();
     assert_eq!(stages, [foreign], "only the pre-existing owner remains");
+}
+
+/// One `halt` page's flushes, as `aterm_durable` was asked for them: before its command (its
+/// `firing` step), then after it (its `fired` step). A `halt` page leaves nothing standing and is
+/// judged here with no cursor written, so these are the journal's and the stamps' alone.
+fn halt_page_flushes(n: &mut Notifier, off: u64) -> [Vec<Flush>; 2] {
+    let (before, recording) = flushes_by_command();
+    n.on_record(
+        &Sel::Halt,
+        off,
+        "/f/f1/fleet/h-andrew/halt",
+        b"v=1 t=1 state=on reason=stop",
+    )
+    .expect("a page");
+    AT_EXEC.with(|seam| seam.borrow_mut().take());
+    let mut before = before.take();
+    assert_eq!(before.len(), 1, "PRECONDITION: its command ran once");
+    [before.pop().unwrap_or_default(), recording.take()]
+}
+
+/// A PAGE'S JOURNAL AND STAMP WRITES COST ITS ONE FULL FLUSH AND AT MOST TWO BARRIERS: in the
+/// root's store its `firing` step (the line and the stamp it spends) appended and flushed in
+/// full, its `fired` step appended and ordered; in a log's own store the line's step ordered
+/// ahead of the stamp's, whose flush is the full one; and where a step falls past the journal's
+/// bound, that step a rewrite (the replace ordered, its directory flushed as the step would
+/// have been). The NEGATIVE CONTROL is a journal rewritten whole at every write, as the line
+/// files were: past the two barriers.
+#[test]
+fn a_pages_journal_and_stamp_writes_cost_one_full_flush_and_at_most_two_barriers() {
+    use Flush::{Durable as D, Ordered as O};
+    /// A case: its name, whether it reads a log's own store, how far past its steps the
+    /// journal's bound is set before the page (none, or 0 for its `firing` step and 1 for its
+    /// `fired` step to fall past it), and what the page asks for before and after its command.
+    type Case = (&'static str, bool, Option<u64>, [&'static [Flush]; 2]);
+    let cases: [Case; 4] = [
+        ("the root's store", false, None, [&[D], &[O]]),
+        ("a log's own store", true, None, [&[O, D], &[O]]),
+        (
+            "a `firing` step past the bound",
+            false,
+            Some(0),
+            [&[O, D], &[O]],
+        ),
+        (
+            "a `fired` step past the bound",
+            false,
+            Some(1),
+            [&[D], &[O, O]],
+        ),
+    ];
+    for mutant in [false, true] {
+        for (at, (case, own_store, bound, asks)) in cases.iter().enumerate() {
+            let dir = scratch(&format!("page-cost-{mutant}-{at}"));
+            if *own_store {
+                let _ = Store::open(&dir)
+                    .expect("open")
+                    .for_log(
+                        Some(astream_broker::LogIdentity {
+                            id: [8; 16],
+                            generation: 0,
+                        }),
+                        None,
+                    )
+                    .expect("the root's store claimed by another log");
+            }
+            let (mut n, _) = appending(&dir, 100, "");
+            n.cfg.on = vec![Sel::Halt];
+            n.scope_to(&strict_log()).expect("the log's store");
+            halt_page_flushes(&mut n, 1);
+            let file = n.log_file.as_mut().unwrap_or(&mut n.root_file);
+            if let Some(past) = bound {
+                file.bound.steps = file.steps + past;
+                file.bound.bytes = 0;
+            }
+            file.rewrite_always = mutant;
+            n.root_file.rewrite_always = mutant;
+            let got = halt_page_flushes(&mut n, 2);
+            let all: Vec<Flush> = got.iter().flatten().copied().collect();
+            let barriers = all.iter().filter(|f| f.is_ordered()).count();
+            if mutant {
+                assert!(
+                    barriers > 2,
+                    "NEGATIVE CONTROL, {case}: a journal rewritten whole at every write costs \
+                     past two barriers: {got:?}"
+                );
+            } else {
+                assert_eq!(
+                    [got[0].as_slice(), got[1].as_slice()],
+                    *asks,
+                    "{case}: before its command, then after it"
+                );
+                assert_eq!(
+                    (
+                        all.iter().filter(|f| f.is_durable()).count(),
+                        got[0].last(),
+                        barriers <= 2
+                    ),
+                    (1, Some(&D), true),
+                    "{case}: one full flush, the last before its command, and at most two \
+                     barriers: {got:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// The bytes this thread's notify stores wrote while `run` ran ([`BYTES_NOTED`]).
+fn bytes_of(run: impl FnOnce()) -> u64 {
+    let from = BYTES_NOTED.with(std::cell::Cell::get);
+    run();
+    BYTES_NOTED.with(std::cell::Cell::get) - from
+}
+
+/// The bytes each record a drop flood drops may cost, amortized: its own step (about 160 bytes
+/// with its frame and its count) and its share of the rewrites the journal's bound brings.
+const DROP_BYTES_MAX: u64 = 512;
+
+/// A DROP FLOOD WRITES BYTES IN PROPORTION TO ITS DROPS: 1,000 records past `--rate`, into an
+/// empty journal and into a full one ([`JOURNAL_KEEP`] verdicts), each write at most
+/// [`DROP_BYTES_MAX`] a drop, where the line files rewrote the whole journal and the count at
+/// every drop (the NEGATIVE CONTROL, a journal rewritten whole at every write: past the bound
+/// by far). The tally a fabric bench reads says the bytes too ([`FLUSH_TALLY`]'s `bytes=`).
+#[test]
+fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
+    const DROPS: u64 = 1_000;
+    let bound = DROPS * DROP_BYTES_MAX;
+    for mutant in [false, true] {
+        for full in [false, true] {
+            if mutant && full {
+                continue;
+            }
+            let dir = scratch(&format!("drop-flood-{mutant}-{full}"));
+            let (mut n, fired) = appending(&dir, 1, "");
+            feed(&mut n, 1, "s-0", "v=1 t=1 attention=paged");
+            if full {
+                let mut off = 2;
+                while n.root_file.steps + 100 < n.root_file.bound.steps {
+                    feed(
+                        &mut n,
+                        off,
+                        &format!("s-{off}"),
+                        "v=1 t=1 attention=filling",
+                    );
+                    off += 1;
+                }
+                assert_eq!(
+                    n.journal.len(),
+                    JOURNAL_KEEP,
+                    "PRECONDITION: a full journal, 100 steps short of its bound"
+                );
+            }
+            n.root_file.rewrite_always = mutant;
+            let (dropped, steps) = (n.counts.dropped, n.root_file.steps);
+            let wrote = bytes_of(|| {
+                for off in 100_000..100_000 + DROPS {
+                    feed(&mut n, off, &format!("s-{off}"), "v=1 t=1 attention=flood");
+                }
+            });
+            assert_eq!(
+                (fired_offsets(&fired), n.counts.dropped - dropped),
+                (vec![1], DROPS),
+                "PRECONDITION: a budget of 1 pages the first record and drops the flood"
+            );
+            eprintln!(
+                "drop flood (full={full}, whole rewrite at every write={mutant}): {DROPS} drops \
+                 wrote {wrote} bytes, {} a drop",
+                wrote / DROPS
+            );
+            assert!(
+                !full || n.root_file.steps < steps + DROPS,
+                "PRECONDITION: the full journal's flood passed its bound and was rewritten"
+            );
+            if mutant {
+                assert!(
+                    wrote > 10 * bound,
+                    "NEGATIVE CONTROL: rewritten whole at every drop, {DROPS} drops write \
+                     {wrote} bytes, within ten times the bound {bound}"
+                );
+            } else {
+                assert!(
+                    wrote <= bound,
+                    "{DROPS} drops (full={full}) wrote {wrote} bytes, past {bound}"
+                );
+                let tally = n.store.root.join(FLUSH_TALLY);
+                n.flush_tally = Some((tally.clone(), (u64::MAX, u64::MAX, u64::MAX)));
+                n.tell();
+                let text = std::fs::read_to_string(&tally).expect("the tally");
+                assert!(
+                    text.split_whitespace()
+                        .filter_map(|w| w.strip_prefix("bytes="))
+                        .any(|b| b.parse::<u64>().is_ok_and(|b| b >= wrote)),
+                    "the tally tells the bytes: {text}"
+                );
+                let (held, cfg) = ((n.journal.clone(), n.suppressed), n.cfg.clone());
+                drop(n);
+                let back = Notifier::new(cfg).expect("reopen");
+                assert_eq!(
+                    (back.journal.clone(), back.suppressed),
+                    held,
+                    "the journal reads back as the notifier holds it (full={full})"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// The bytes each session whose needs a flood drops may cost, amortized (about 370 measured):
+/// its `dropped` steps (about 170 bytes each with its frame and its count), its standing
+/// change's step with its selector's cursor in it, and its share of the rewrites
+/// the journal's bound brings.
+const NEED_DROP_BYTES_MAX: u64 = 512;
+
+/// A FLOOD OF DISTINCT NEED DROPS WRITES BYTES IN PROPORTION TO ITS DROPS (ATERM-KI-1111-11):
+/// 500 sessions each raise a failure past `--rate`, so each drop owes its pair, a change of the
+/// standing values, and the flood writes at most [`NEED_DROP_BYTES_MAX`] a session, where the line
+/// file replaced every value standing at every change (the NEGATIVE CONTROL, each change
+/// replacing the line-format `standing` file whole, the write a build before the steps made:
+/// past the bound by far). Reopened, the store holds the values as the notifier does, each drop
+/// owed (the mutant's line file migrated at the open).
+#[test]
+fn a_flood_of_distinct_need_drops_writes_bytes_in_proportion_to_its_drops() {
+    const SESSIONS: u64 = 500;
+    let bound = SESSIONS * NEED_DROP_BYTES_MAX;
+    for mutant in [false, true] {
+        let dir = scratch(&format!("need-drop-flood-{mutant}"));
+        let (mut n, fired) = appending(&dir, 1, "");
+        let sel = Sel::Need(None);
+        n.cfg.on = vec![sel.clone()];
+        n.cfg.window_ms = 3_600_000;
+        n.standing_whole = mutant;
+        let face = |i: u64| format!("/f/f1/pub/n-a/s-{i}/ev");
+        let mut off = 0;
+        let mut first = Needs::open();
+        let cmd = first.cmd_open();
+        first.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        feed_need(&mut n, &sel, &mut off, &face(0), first.bodies());
+        let (dropped, changes) = (n.counts.dropped, n.standing.len());
+        let wrote = bytes_of(|| {
+            for i in 1..=SESSIONS {
+                let mut s = Needs::open();
+                let cmd = s.cmd_open();
+                s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+                feed_need(&mut n, &sel, &mut off, &face(i), s.bodies());
+            }
+        });
+        let drops = n.counts.dropped - dropped;
+        assert_eq!(
+            (fired_offsets(&fired).len(), n.standing.len() - changes),
+            (1, usize::try_from(SESSIONS).expect("small")),
+            "PRECONDITION: a budget of 1 pages the first failure, and each other session's \
+             needs are dropped and owed on its own face"
+        );
+        assert!(drops >= SESSIONS, "PRECONDITION: {drops} drops");
+        eprintln!(
+            "need drop flood (the line file replaced at every change={mutant}): {SESSIONS} sessions, \
+             {drops} drops, wrote {wrote} bytes, {} a session",
+            wrote / SESSIONS
+        );
+        if mutant {
+            assert!(
+                wrote > 10 * bound,
+                "NEGATIVE CONTROL: the line file replaced at every change, {SESSIONS} drops \
+                 write {wrote} bytes, within ten times the bound {bound}"
+            );
+        } else {
+            assert!(
+                wrote <= bound,
+                "{SESSIONS} distinct need drops wrote {wrote} bytes, past {bound}"
+            );
+        }
+        let (standing, cfg) = (n.standing.clone(), n.cfg.clone());
+        drop(n);
+        let back = Notifier::new(cfg).expect("reopen");
+        assert_eq!(
+            back.standing, standing,
+            "the standing values read back as the notifier holds them (mutant={mutant})"
+        );
+        assert!(
+            (1..=SESSIONS).all(|i| back.entries_of(&face(i)).iter().all(|e| e.owed)),
+            "each dropped need is owed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A frozen line-format store (`journal`, `rate`, `suppressed`, `standing`, as a build before the
+/// journal wrote them, `tests/fixtures/notify-line-format/`) migrates at the notifier's open:
+/// its verdicts, stamps and count read as they were, and its pending page (`5 firing`, whose
+/// command a kill cut) runs again with `ATERM_NOTIFY_DUP=1`, while a page it holds `fired` is
+/// skipped.
+#[test]
+fn a_frozen_line_format_journal_migrates_and_its_pending_page_runs_again() {
+    let dir = scratch("frozen");
+    journal::tests::lay_frozen_store(&Path::new(&dir).join("notify"));
+    let (mut n, fired) = appending(&dir, 2, "");
+    assert_eq!(
+        Vec::from(n.journal.clone()),
+        journal::tests::frozen_lines(),
+        "the verdicts migrated"
+    );
+    assert_eq!(
+        (n.stamps.clone(), n.suppressed, n.suppressed_mark),
+        (
+            journal::tests::FROZEN_STAMPS.to_vec(),
+            journal::tests::FROZEN_SUPPRESSED.0,
+            journal::tests::FROZEN_SUPPRESSED.1
+        ),
+        "the stamps and the count migrated"
+    );
+    feed(&mut n, 1, "s-a", "v=1 t=9 inc=2 attention=again");
+    feed(&mut n, 5, "s-e", "v=1 t=9 attention=pending");
+    assert_eq!(
+        fired_offsets(&fired),
+        [5],
+        "the pending page ran again, the fired one not"
+    );
+    assert_eq!(
+        (n.counts.dup, n.counts.skipped, n.verdict(5)),
+        (1, 1, Some("fired")),
+        "as a duplicate"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ordered flushes each session whose needs a flood drops may ask for (measured: 5, its
+/// two `dropped` steps, the standing change's step that carries its selector's cursor at the
+/// record, and the cursor's checkpoint past each record that wrote a verdict, a step each),
+/// where the cursor written as a file of its own, `cur/<key>` replaced and its directory
+/// ordered (two flushes) ahead of the change and at each checkpoint, asked for 9.
+const NEED_DROP_FLUSHES_MAX: usize = 5;
+
+/// A DISTINCT NEED DROP'S CURSOR IS A STEP OF THE CHANGE IT ORDERS (ATERM-KI-1111-11): 100
+/// sessions each raise a failure past `--rate`, each read through the follower's path
+/// ([`Notifier::take`], so each record's verdict moves its selector's cursor), and each
+/// session asks for at most [`NEED_DROP_FLUSHES_MAX`] ordered flushes and no full one. The
+/// NEGATIVE CONTROL writes the cursor as a file of its own ahead of the standing change and at
+/// each checkpoint (`Notifier::cursor_file`, the write a build before the cursor steps made),
+/// and asks for more. Reopened, the store holds the cursor the notifier wrote.
+#[test]
+fn a_distinct_need_drops_cursor_is_a_step_of_the_change_it_orders() {
+    const SESSIONS: u64 = 100;
+    let mut measured = Vec::new();
+    for mutant in [false, true] {
+        let dir = scratch(&format!("need-drop-flushes-{mutant}"));
+        let (mut n, fired) = appending(&dir, 1, "");
+        let sel = Sel::Need(None);
+        n.cfg.on = vec![sel.clone()];
+        n.cfg.window_ms = 3_600_000;
+        n.cursor_every = Duration::MAX;
+        n.cursor_file = mutant;
+        n.take(Notice::Log(0, strict_log())).expect("log");
+        let face = |i: u64| format!("/f/f1/pub/n-a/s-{i}/ev");
+        let mut off = 0;
+        let mut feed = |n: &mut Notifier, i: u64| {
+            let mut s = Needs::open();
+            let cmd = s.cmd_open();
+            s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+            for body in s.bodies() {
+                off += 1;
+                n.take(Notice::Record(0, off, face(i), body.into_bytes()))
+                    .expect("a record");
+            }
+        };
+        feed(&mut n, 0);
+        let (dropped, standing) = (n.counts.dropped, n.standing.len());
+        let recording = aterm_durable::seam::Recording::start();
+        for i in 1..=SESSIONS {
+            feed(&mut n, i);
+        }
+        let flushes = recording.take();
+        assert_eq!(
+            (
+                fired_offsets(&fired).len(),
+                n.standing.len() - standing,
+                n.counts.dropped - dropped >= SESSIONS
+            ),
+            (1, usize::try_from(SESSIONS).expect("small"), true),
+            "PRECONDITION ({mutant}): a budget of 1 pages the first failure, and each other \
+             session's needs are dropped and owed on its own face"
+        );
+        let full = flushes.iter().filter(|f| f.is_durable()).count();
+        let per = (flushes.len() - full) / usize::try_from(SESSIONS).expect("small");
+        eprintln!(
+            "distinct need drops (the cursor as a file={mutant}): {SESSIONS} sessions ask for \
+             {} ordered flushes and {full} full ones, {per} ordered a session",
+            flushes.len() - full
+        );
+        measured.push(per);
+        assert_eq!(full, 0, "({mutant}) no drop asks for a full flush");
+        if !mutant {
+            let cursor = n.cursor(&sel.key());
+            assert!(
+                cursor.is_some_and(|c| c > 1),
+                "PRECONDITION: a cursor: {cursor:?}"
+            );
+            let cfg = n.cfg.clone();
+            drop(n);
+            assert_eq!(
+                Notifier::new(cfg).expect("reopen").cursor(&sel.key()),
+                cursor,
+                "the cursor reads back as the notifier wrote it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        measured[0] <= NEED_DROP_FLUSHES_MAX,
+        "{} ordered flushes a session, past {NEED_DROP_FLUSHES_MAX}",
+        measured[0]
+    );
+    assert!(
+        measured[1] > NEED_DROP_FLUSHES_MAX,
+        "NEGATIVE CONTROL: the cursor as a file asks for {} ordered flushes a session, within \
+         {NEED_DROP_FLUSHES_MAX}",
+        measured[1]
+    );
 }

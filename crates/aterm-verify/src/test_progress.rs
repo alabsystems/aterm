@@ -49,7 +49,7 @@ pub(crate) struct End {
 #[derive(serde::Deserialize)]
 struct EndWire {
     schema: u64,
-    event: String,
+    event: crate::event_log::EventKind,
     provisional: bool,
     sample_complete: bool,
     check: String,
@@ -60,11 +60,44 @@ struct EndWire {
     seconds: f64,
 }
 
+#[derive(serde::Deserialize)]
+struct StartWire {
+    schema: u64,
+    event: crate::event_log::EventKind,
+    provisional: bool,
+    sample_complete: bool,
+    check: String,
+    test_run: u64,
+    phase_sequence: u32,
+    #[serde(rename = "phase")]
+    _phase: Phase,
+    scope_exit: aterm_json::Value,
+    seconds: aterm_json::Value,
+}
+
+/// Validate a producer's START observation, without inferring activity or an END.
+pub(crate) fn supported_start(json: &str) -> bool {
+    let Ok(wire) = aterm_json::from_str::<StartWire>(json) else {
+        return false;
+    };
+    wire.schema == 1
+        && wire.event == crate::event_log::EventKind::TestPhaseStarted
+        && wire.provisional
+        && !wire.sample_complete
+        && [Check::Test, Check::Checkers]
+            .into_iter()
+            .any(|check| check.name() == wire.check)
+        && wire.test_run != 0
+        && wire.phase_sequence != 0
+        && wire.scope_exit.is_null()
+        && wire.seconds.is_null()
+}
+
 impl End {
     pub(crate) fn read(json: &str) -> Option<Self> {
         let wire: EndWire = aterm_json::from_str(json).ok()?;
         if wire.schema != 1
-            || wire.event != "test-phase-ended"
+            || wire.event != crate::event_log::EventKind::TestPhaseEnded
             || !wire.provisional
             || wire.sample_complete
             || wire.test_run == 0
@@ -124,28 +157,42 @@ impl<'a> Progress<'a> {
         self.leave(ScopeExit::Advanced);
         self.sequence += 1;
         self.current = Some((phase, Instant::now()));
-        self.emit(phase, "test-phase-started", None, None);
+        self.emit(
+            phase,
+            crate::event_log::EventKind::TestPhaseStarted,
+            None,
+            None,
+        );
     }
 
     fn leave(&mut self, reason: ScopeExit) {
         if let Some((phase, began)) = self.current.take() {
             self.emit(
                 phase,
-                "test-phase-ended",
+                crate::event_log::EventKind::TestPhaseEnded,
                 Some(reason),
                 Some(began.elapsed().as_secs_f64()),
             );
         }
     }
 
-    fn emit(&self, phase: Phase, event: &str, reason: Option<ScopeExit>, seconds: Option<f64>) {
+    fn emit(
+        &self,
+        phase: Phase,
+        event: crate::event_log::EventKind,
+        reason: Option<ScopeExit>,
+        seconds: Option<f64>,
+    ) {
         // Fixed vocabulary only: no recorded argv, environment, paths or child output.
-        let value = aterm_json::json!({
-            "schema": 1, "event": event, "check": self.check.name(),
-            "test_run": self.run, "phase_sequence": self.sequence, "phase": phase,
-            "scope_exit": reason, "seconds": seconds,
-            "provisional": true, "sample_complete": false,
-        });
+        let value = crate::event_log::event_value(
+            event,
+            aterm_json::json!({
+                  "check": self.check.name(),
+                "test_run": self.run, "phase_sequence": self.sequence, "phase": phase,
+                "scope_exit": reason, "seconds": seconds,
+                "provisional": true, "sample_complete": false,
+            }),
+        );
         let line = format!("verify-event: {value}");
         crate::event_log::emit_progress_batch(self.events, std::slice::from_ref(&line));
     }

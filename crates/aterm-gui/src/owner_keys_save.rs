@@ -218,50 +218,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 /// THE NEGATIVE CONTROLS' FAULT POINTS.
 #[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::Cell;
-
-    /// A planted defect.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Fault {
-        /// [`super::Provenance`] takes a control client's save for a person's.
-        SaveIgnoresSource,
-        /// [`super::Provenance`] takes a buffer a control client, an accessibility client or
-        /// another process's input edited, or a recovered draft, for one a person typed.
-        SaveIgnoresEdits,
-        /// A save queued behind one in flight forgets the control client that asked for it.
-        QueueDropsSource,
-        /// [`super::is_in_force`] tells a file a save would make, while the aterm.toml in force
-        /// is missing, from that file by its name alone.
-        CreateIgnoresFolder,
-        /// [`super::is_in_force`] compares files alone, never the path in force.
-        PathIgnored,
-        /// A discard of a buffer an unvouched edit reached keeps its undo history.
-        DiscardKeepsHistory,
-    }
-
-    thread_local! {
-        static ARMED: Cell<Option<Fault>> = const { Cell::new(None) };
-    }
-
-    /// Run `f` with `fault` armed on this thread, disarmed after it even on unwind.
-    pub(crate) fn with<T>(fault: Fault, f: impl FnOnce() -> T) -> T {
-        struct Disarm;
-        impl Drop for Disarm {
-            fn drop(&mut self) {
-                ARMED.with(|a| a.set(None));
-            }
-        }
-        ARMED.with(|a| a.set(Some(fault)));
-        let _disarm = Disarm;
-        f()
-    }
-
-    /// Whether `fault` is armed on this thread.
-    pub(crate) fn armed(fault: Fault) -> bool {
-        ARMED.with(|a| a.get() == Some(fault))
-    }
-}
+#[path = "owner_keys_save_fault_tests.rs"]
+pub(crate) mod fault;
 
 #[cfg(not(test))]
 pub(crate) mod fault {
@@ -284,32 +242,8 @@ pub(crate) mod fault {
 
 /// The aterm.toml in force where the config service bound none: a test's own scratch path.
 #[cfg(test)]
-pub(crate) mod unbound {
-    use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
-
-    thread_local! {
-        static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    }
-
-    /// Run `f` with `path` as the fallback on this thread, cleared after it even on unwind.
-    pub(crate) fn with<T>(path: &Path, f: impl FnOnce() -> T) -> T {
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                PATH.with(|p| p.replace(None));
-            }
-        }
-        PATH.with(|p| p.replace(Some(path.to_path_buf())));
-        let _clear = Clear;
-        f()
-    }
-
-    /// The fallback this thread's test named, if any.
-    pub(crate) fn path() -> Option<PathBuf> {
-        PATH.with(|p| p.borrow().clone())
-    }
-}
+#[path = "owner_keys_save_unbound_tests.rs"]
+pub(crate) mod unbound;
 
 /// The aterm.toml in force where the config service bound none: the path the window loads by.
 #[cfg(not(test))]

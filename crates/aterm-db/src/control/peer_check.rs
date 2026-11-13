@@ -13,12 +13,31 @@
 //! this check, and every grant takes one by value, so a grant without a fresh check does not
 //! compile.
 //!
-//! Each stage the check reads itself reads through a look of its own at the vault ([`VaultLook`]):
-//! one observation of its state lock and one look at each file for the stage's reads, which ask
-//! memos of the same files. An enrollment's Acknowledged stage runs its caller's judgement
-//! instead ([`Judged::Enrollment`]), which reads the vault itself when the stage runs. The model
-//! reads each view at its own stage, and so does the check: a look is never carried into the next
-//! stage, so a stage reads a removal made durable before it.
+//! Every stage the check reads itself reads through one look at the vault ([`VaultLook`]): one
+//! shared observation of its state lock, held from the first stage that reads to the last, and one
+//! look at each file for every memo those stages ask, which read the same files. A stage after a
+//! look that holds nothing (a writer held the lock when it was taken, or its lock could not be
+//! observed or found at the vault's path: [`VaultLook::holds_vault`]) takes a look of its own. An
+//! enrollment's Acknowledged stage runs its caller's judgement instead ([`Judged::Enrollment`]),
+//! which reads the vault itself when the stage runs and may open its Commons custody, so the check
+//! lets its look go first. Nothing else a stage does while the look lives takes the state lock
+//! exclusively or does network I/O: an exclusive take on this thread under it would wait for good
+//! (a build with debug assertions panics).
+//!
+//! The model reads each view at its own stage, and the kept look keeps that true. What moves the
+//! Held stage's view, every record this Mac holds, is written only under the state lock. A look
+//! that holds the vault keeps every writer out from the stage that took it to the last stage the
+//! check reads through it (an enrollment's Held): a removal such a writer makes lands after those
+//! reads, as in a run of the model whose reads all come before the change, and the next check, the
+//! next grant's, reads it, while the model's bound of one grant per check in flight once every
+//! record held removes the peer allows this check's; one that lands before that look is taken is
+//! read through it, as before. A look that holds nothing keeps no writer out, and the one stage
+//! read through it meets such a writer as each stage did when it took a look of its own. A change
+//! made without the lock (a mode or owner change, a process that ignores the lock, `.lock` replaced
+//! with a writer under the new file) is seen no later than the next check: at the next check where
+//! a stage's read stands for the stamps the look first took, and at the stage that reads afresh on
+//! a memo miss, as before; each such read still happens no later than its stage, as it did within a
+//! stage when each stage took a look of its own.
 
 use super::{
     Custody, Error, Request, Result, Trust, denied_or_last, failure, held_records, local_failure,
@@ -26,7 +45,7 @@ use super::{
 };
 use aterm_db_core::peer_check::{self as kernel, Read, Stage};
 use aterm_secrets::{
-    client::VaultLook,
+    client::{Paths, VaultLook},
     commons::binding::Binding,
     membership_log::{Body, EpochAudience, Log},
     swarm_roster::SwarmRoster,
@@ -141,6 +160,8 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
     let mut why = None;
     let mut roster = None;
     let mut acknowledged = None;
+    // The look every stage reads through ([`through`]), let go when the check returns.
+    let mut kept: Option<VaultLook<'_>> = None;
     loop {
         let read = match (stage, custody) {
             (Stage::Pass, _) => {
@@ -152,8 +173,8 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
             }
             (_, Custody::None) => break,
             (Stage::Roster, Custody::Journal(paths) | Custody::Log(paths)) => {
-                let look = VaultLook::new(paths);
-                match roster_to_check(code, roster_or_last_in(&look), denied_or_last(&look)) {
+                let look = through(&mut kept, paths);
+                match roster_to_check(code, roster_or_last_in(look), denied_or_last(look)) {
                     Ok(None) => Reading {
                         outcome: Read::Absent,
                         why: None,
@@ -172,29 +193,38 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
                 }
             }
             (Stage::Held, Custody::Journal(paths) | Custody::Log(paths)) => {
-                held(&VaultLook::new(paths), trust, judged)
+                held(through(&mut kept, paths), trust, judged)
             }
             (Stage::Acknowledged, Custody::Journal(paths) | Custody::Log(paths)) => match judged {
                 Judged::Peer { request, .. } => {
-                    let (read, log) =
-                        acknowledged_log(&VaultLook::new(paths), trust, request, roster.as_ref());
+                    let (read, log) = acknowledged_log(
+                        through(&mut kept, paths),
+                        trust,
+                        request,
+                        roster.as_ref(),
+                    );
                     acknowledged = log;
                     read
                 }
                 Judged::Enrollment {
                     acknowledged: judge,
                     ..
-                } => match judge() {
-                    Ok(()) => Reading::clear(),
-                    Err(error) => Reading::of(Read::Out, error),
-                },
+                } => {
+                    // The judgement may open this Mac's Commons custody: no observation of the
+                    // state lock may stand over it.
+                    kept = None;
+                    match judge() {
+                        Ok(()) => Reading::clear(),
+                        Err(error) => Reading::of(Read::Out, error),
+                    }
+                }
             },
             (Stage::Combined, Custody::Journal(paths) | Custody::Log(paths)) => match judged {
                 Judged::Peer {
                     request,
                     log: Some(peer_log),
                 } => combined(
-                    &VaultLook::new(paths),
+                    through(&mut kept, paths),
                     request,
                     peer_log,
                     acknowledged.take(),
@@ -212,11 +242,30 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
         if read.why.is_some() {
             why = read.why;
         }
+        #[cfg(test)]
+        if let Custody::Journal(paths) | Custody::Log(paths) = custody {
+            tape::between(paths);
+        }
         stage = next(code, stage, read.outcome, witness);
     }
     #[cfg(test)]
     tape::note(tape::Step::Refuse);
     Err(why.unwrap_or_else(|| Error::new("Commons peer check refused the peer")))
+}
+
+/// The look a check's next stage reads through: the one `kept` holds while it holds the vault
+/// ([`VaultLook::holds_vault`]), and otherwise a new one in its place, the old one's observation
+/// let go before the new one observes.
+fn through<'k, 'p>(kept: &'k mut Option<VaultLook<'p>>, paths: &'p Paths) -> &'k VaultLook<'p> {
+    if !kept.as_ref().is_some_and(VaultLook::holds_vault) {
+        *kept = None;
+    }
+    kept.get_or_insert_with(|| {
+        let look = VaultLook::new(paths);
+        #[cfg(test)]
+        tape::look_taken(paths);
+        look
+    })
 }
 
 #[cfg(test)]
@@ -431,90 +480,9 @@ fn denied_by(
 /// whether it passed, and each pass spent. A conformance test replays it through the island's
 /// step (`peer_check_island.rs`) to hold real sessions to the model's event order.
 #[cfg(test)]
-pub(crate) mod tape {
-    /// One event of the tape, its kernel values as codes (the kernel's enums carry no `Debug`).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Step {
-        /// A check began at this custody code, with or without a peer log to combine.
-        Begin(u8, bool),
-        /// A stage (its code) read, classified to this outcome code.
-        Read(u8, u8),
-        /// The check passed: it minted a pass.
-        Pass,
-        /// The check refused.
-        Refuse,
-        /// A grant spent a pass.
-        Grant,
-    }
-
-    thread_local! {
-        static TAPE: std::cell::RefCell<Option<Vec<Step>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn note(step: Step) {
-        TAPE.with(|tape| {
-            if let Some(tape) = tape.borrow_mut().as_mut() {
-                tape.push(step);
-            }
-        });
-    }
-
-    /// Run `run` with this thread's checks and grants taped, and the tape.
-    pub(crate) fn recorded<T>(run: impl FnOnce() -> T) -> (T, Vec<Step>) {
-        struct Restore(Option<Vec<Step>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                TAPE.with(|tape| *tape.borrow_mut() = self.0.take());
-            }
-        }
-        let restore = Restore(TAPE.with(|tape| tape.replace(Some(Vec::new()))));
-        let out = run();
-        let steps = TAPE.with(|tape| tape.replace(None)).unwrap_or_default();
-        drop(restore);
-        (out, steps)
-    }
-}
+#[path = "peer_check_tape_tests.rs"]
+pub(crate) mod tape;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aterm_secrets::client::CommonsLog;
-
-    /// The stage a log endpoint's check reaches after its acknowledged log classified to `log`.
-    fn after(log: CommonsLog) -> Stage {
-        let read =
-            acknowledged_reading(Ok(log)).map_or_else(|reading| reading.outcome, |_| Read::Clear);
-        next(kernel::Custody::Log, Stage::Acknowledged, read, false)
-    }
-
-    /// PF4: an acknowledged log of another vault lineage, or of another root, refuses the peer at
-    /// a log endpoint, where a store with no log or no Commons epoch, which has nothing to judge
-    /// by, leaves the verdict to the records held ([`Stage::Held`]) and passes. Before PF4
-    /// `trusted_commons_log` answered `Ok(None)` for all four, so the check could not refuse the
-    /// first two without refusing the last two.
-    ///
-    /// NEGATIVE CONTROL (in the test): read as one with no Commons epoch
-    /// ([`super::super::mutants::Mutant::LineageIsNoJudgement`], as the `Ok(None)` reading did),
-    /// a log of another lineage passes the peer.
-    #[test]
-    fn an_acknowledged_log_of_another_lineage_refuses_where_one_with_nothing_to_judge_passes() {
-        use super::super::mutants::{Mutant, with};
-        for (log, stage, why) in [
-            (CommonsLog::NoLog, Stage::Pass, "no log"),
-            (CommonsLog::NoCommonsEpochs, Stage::Pass, "no Commons epoch"),
-            (CommonsLog::OtherLineage, Stage::Refuse, "another lineage"),
-            (CommonsLog::OtherRoot, Stage::Refuse, "another root"),
-        ] {
-            let reached = after(log);
-            assert!(reached == stage, "{why}: stage {}", reached as u8);
-        }
-        let reached = with(Mutant::LineageIsNoJudgement, || {
-            after(CommonsLog::OtherLineage)
-        });
-        assert!(
-            reached == Stage::Pass,
-            "NEGATIVE CONTROL: another lineage read as nothing to judge passes the peer: stage {}",
-            reached as u8
-        );
-    }
-}
+#[path = "peer_check_tests.rs"]
+mod tests;

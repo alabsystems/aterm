@@ -34,8 +34,27 @@ fn planned(index: usize, charge: u32, peak: u64, wall: f64) -> Planned {
     }
 }
 
-/// A fitting short job uses the gap before a whole-share job without moving that job's start.
-/// The control changes only its measured duration: a job longer than the gap stays behind it.
+/// Observe actual start order through the production dispatcher.
+fn dispatch_order(mut plan: Plan) -> Plan {
+    let mut dispatcher = Dispatcher::new(&plan, None);
+    let mut running = BinaryHeap::new();
+    let mut now = Duration::ZERO;
+    plan.order.clear();
+    loop {
+        while let Some(b) = dispatcher.next(0.0) {
+            running.push(Reverse((now + b.predicted.unwrap_or(plan.target), b.index)));
+            plan.order.push(b);
+        }
+        let Some(Reverse((end, index))) = running.pop() else {
+            return plan;
+        };
+        now = end;
+        dispatcher.finish(index).unwrap();
+    }
+}
+
+/// Spare slots take fitting work even when its duration is longer than the head's reservation.
+/// Memory admission still refuses work that cannot fit.
 #[test]
 fn measured_short_work_fills_a_gap_without_delaying_its_head() {
     let original = |short_wall| Plan {
@@ -48,8 +67,8 @@ fn measured_short_work_fills_a_gap_without_delaying_its_head() {
         ],
     };
     let base = original(8.0);
-    assert_eq!(schedule(&base).end, secs(27.0));
-    let filled = fill_gaps(base.clone());
+    assert_eq!(schedule(&base).end, secs(19.0));
+    let filled = dispatch_order(base.clone());
     assert_eq!(
         filled.order.iter().map(|b| b.index).collect::<Vec<_>>(),
         [0, 2, 1]
@@ -66,7 +85,7 @@ fn measured_short_work_fills_a_gap_without_delaying_its_head() {
     );
     assert_eq!(
         learned.order.iter().map(|b| b.index).collect::<Vec<_>>(),
-        [0, 2, 1]
+        [0, 1, 2]
     );
     assert_eq!(
         schedule(&filled),
@@ -80,10 +99,24 @@ fn measured_short_work_fills_a_gap_without_delaying_its_head() {
         assert_eq!(at(&filled, b.index), *b);
     }
     let too_long = original(11.0);
-    assert_eq!(fill_gaps(too_long.clone()), too_long);
+    assert_eq!(
+        dispatch_order(too_long)
+            .order
+            .iter()
+            .map(|b| b.index)
+            .collect::<Vec<_>>(),
+        [0, 2, 1]
+    );
     let mut unknown = original(8.0);
     unknown.order[2].predicted = None;
-    assert_eq!(fill_gaps(unknown.clone()), unknown);
+    assert_eq!(
+        dispatch_order(unknown)
+            .order
+            .iter()
+            .map(|b| b.index)
+            .collect::<Vec<_>>(),
+        [0, 2, 1]
+    );
     // Runtime memory admission still refuses the fitting short job until room exists.
     let mut memory_plan = filled.clone();
     memory_plan.share = 5;
@@ -106,11 +139,10 @@ fn at(p: &Plan, index: usize) -> Planned {
         .unwrap_or_else(|| panic!("binary {index} is not in {p:?}"))
 }
 
-/// THE ORDER: binaries with no history first in cargo's order, then the ones whose last run
-/// failed, then the rest, each of those groups longest predicted first. NEGATIVE CONTROL: the
-/// same binary passing last time sits by its length among the rest.
+/// THE ORDER: unrecorded work first in Cargo order, then descending recorded duration.
+/// NEGATIVE CONTROL: changing only a short binary's failure status cannot displace a long one.
 #[test]
-fn unseen_binaries_start_first_then_the_failed_then_the_longest() {
+fn unseen_binaries_start_first_then_recorded_duration_regardless_of_failure() {
     let short = seen(2.0, 2.0, 1, 1);
     let long = seen(30.0, 30.0, 1, 1);
     let failed = Seen {
@@ -126,7 +158,7 @@ fn unseen_binaries_start_first_then_the_failed_then_the_longest() {
             GIB,
         )
     };
-    assert_eq!(order(&plan_of(failed)), [1, 4, 3, 2, 0]);
+    assert_eq!(order(&plan_of(failed)), [1, 4, 2, 3, 0]);
     assert_eq!(
         order(&plan_of(Seen {
             failed: false,
@@ -283,16 +315,25 @@ fn a_binarys_threads_scale_its_wall() {
 }
 
 /// THE CHARGE: a binary is charged its width, or the cores it used, whichever is more, up to the
-/// share: tests that spawn processes use more than their threads. NEGATIVE CONTROL: the same
-/// binary using one core per thread is charged its width.
+/// share: tests that spawn processes use more than their threads. A thread that needs more than a
+/// core is charged whole cores, so the grant each thread gets of its charge (`⌊c / w⌋`) is the
+/// pool it needs: 1.6 cores per thread at width 4 is charged 8, two a thread, never 7, which
+/// would grant one. NEGATIVE CONTROL: the same binary using one core per thread is charged its
+/// width, and one whose threads wait (0.6) is charged what they use, not whole cores.
 #[test]
 fn a_binary_that_used_more_than_its_threads_is_charged_what_it_used() {
     let spawns = Seen {
         per_thread: 2.5,
         ..seen(10.0, 100.0, 4, 50)
     };
-    assert_eq!(spawns.charge_at(4, 16), 10);
+    assert_eq!(spawns.charge_at(4, 16), 12, "three whole cores a thread");
     assert_eq!(spawns.charge_at(4, 8), 8, "never more than the share");
+    let pool = Seen {
+        per_thread: 1.6,
+        ..spawns
+    };
+    assert_eq!(pool.charge_at(4, 16), 8);
+    assert_eq!(crate::exec::test_thread_cores(4, pool.charge_at(4, 16)), 2);
     assert_eq!(
         Seen {
             per_thread: 1.0,
@@ -300,6 +341,15 @@ fn a_binary_that_used_more_than_its_threads_is_charged_what_it_used() {
         }
         .charge_at(4, 16),
         4
+    );
+    assert_eq!(
+        Seen {
+            per_thread: 0.6,
+            ..spawns
+        }
+        .charge_at(4, 16),
+        3,
+        "CONTROL: waiting threads are charged what they use"
     );
 }
 
@@ -365,9 +415,10 @@ fn a_binary_that_uses_more_than_its_threads_runs_no_wider_than_the_share_holds()
 /// of the share and its peak in what they leave of the memory, and, beside a running binary, only
 /// while the live rate and its charge stay within the share and one core; an ending binary gives
 /// both back once; a halt starts nothing more. NEGATIVE CONTROLS: a second finish of one binary is
-/// refused, and the third binary, which fits, waits behind the head, which does not.
+/// refused; the fitting fourth binary starts while the third is blocked, unless its live rate
+/// would exceed the backstop.
 #[test]
-fn the_dispatcher_starts_the_head_only_while_its_charge_fits() {
+fn the_dispatcher_admits_only_fitting_binaries_and_fills_spare_capacity() {
     let p = Plan {
         share: 8,
         target: secs(10.0),
@@ -387,20 +438,33 @@ fn the_dispatcher_starts_the_head_only_while_its_charge_fits() {
     assert_eq!(d.finish(0), Err("that binary is not running"));
     assert_eq!(d.held(), 4);
     assert_eq!(
-        d.next(0.0),
+        d.next(9.0),
         None,
-        "6 cores do not fit in 4, and 3 waits behind"
+        "6 cores do not fit in 4, and the live rate prevents the fitting peer"
     );
+    let mut rate_control = d.clone();
+    rate_control.finish(1).unwrap();
+    assert_eq!(rate_control.next(0.0).map(|b| b.index), Some(2));
+    assert_eq!(
+        d.next(0.0).map(|b| b.index),
+        Some(3),
+        "the fitting peer uses the idle slot"
+    );
+    assert_eq!(d.finish(3), Ok(()));
     assert_eq!(d.finish(1), Ok(()));
     assert_eq!(d.next(0.0).map(|b| b.index), Some(2));
     assert_eq!(
-        d.next(8.5),
+        rate_control.next(8.5),
         None,
         "8.5 live cores and 1 more pass 8 and one"
     );
-    assert_eq!(d.next(8.0).map(|b| b.index), Some(3));
+    assert_eq!(
+        rate_control.next(8.0).map(|b| b.index),
+        Some(3),
+        "the exact live-rate backstop admits the peer"
+    );
     assert!(!d.waiting());
-    assert_eq!(d.phase(3), Some(Phase::Running));
+    assert_eq!(d.phase(3), Some(Phase::Done));
     let mut halted = Dispatcher::new(&p, None);
     halted.halt();
     assert_eq!(halted.next(0.0), None);
@@ -494,6 +558,7 @@ fn a_planted_long_binary_starts_first_from_recorded_history() {
                 name,
                 Sample {
                     partition: None,
+                    exe_sha256: None,
                     at_ms: 1,
                     outcome: "ok".into(),
                     wall_ms,
@@ -501,6 +566,7 @@ fn a_planted_long_binary_starts_first_from_recorded_history() {
                     starved_ms: Some(0),
                     peak_bytes: Some(1),
                     width: 1,
+                    cores: None,
                     tests: Some(1),
                 },
             );
@@ -517,4 +583,82 @@ fn a_planted_long_binary_starts_first_from_recorded_history() {
     assert_eq!(first(&history(1000)), 1);
     assert_eq!(first(&history(1)), 2);
     assert_eq!(first(&History::default()), 0);
+}
+
+/// Memory breaks duration ties, and a failed short record cannot displace a longer one.
+/// An external refusal of a large reservation leaves a smaller peer admissible and the
+/// refused binary queued, with no charge retained for it.
+#[test]
+fn duration_then_memory_orders_work_and_unavailable_reservations_leave_no_hole() {
+    let small = seen(20.0, 20.0, 1, 1);
+    let large = Seen {
+        peak: 10 * GIB,
+        ..small
+    };
+    let short = Seen {
+        failed: true,
+        ..seen(1.0, 1.0, 1, 1)
+    };
+    let p = plan(&[Some(small), Some(short), Some(large)], 4, None, GIB);
+    assert_eq!(
+        p.order.iter().map(|b| b.index).collect::<Vec<_>>(),
+        [2, 0, 1]
+    );
+    let mut d = Dispatcher::new(&p, None);
+    assert_eq!(
+        d.next_with(0.0, &mut |b| b.peak < GIB).map(|b| b.index),
+        Some(0)
+    );
+    assert_eq!(d.phase(2), Some(Phase::Queued));
+    assert_eq!((d.held(), d.held_bytes()), (1, 0));
+    assert_eq!(
+        d.next_with(0.0, &mut |b| b.peak < GIB).map(|b| b.index),
+        Some(1)
+    );
+    assert_eq!(d.next_with(0.0, &mut |_| false), None);
+    assert_eq!(d.next(0.0).map(|b| b.index), Some(2));
+}
+
+#[test]
+fn rejection_observations_preserve_start_order_and_charges() {
+    let plan = Plan {
+        share: 4,
+        target: secs(10.0),
+        order: vec![
+            planned(0, 3, 3 * GIB, 10.0),
+            planned(1, 2, GIB, 10.0),
+            planned(2, 1, 3 * GIB, 10.0),
+            planned(3, 1, GIB, 10.0),
+        ],
+    };
+    let mut plain = Dispatcher::new(&plan, Some(4 * GIB));
+    let mut observed = Dispatcher::new(&plan, Some(4 * GIB));
+    assert_eq!(
+        plain.next(0.0),
+        observed.next_with_observed(0.0, &mut |_| true, &mut |_, _| panic!("first binary fits"))
+    );
+    let mut rejected = Vec::new();
+    let next = observed.next_with_observed(0.0, &mut |_| true, &mut |b, resources| {
+        rejected.push((b.index, resources))
+    });
+    assert_eq!(next, plain.next(0.0));
+    assert_eq!(next.unwrap().index, 3);
+    assert_eq!(
+        rejected.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        (observed.held(), observed.held_bytes()),
+        (plain.held(), plain.held_bytes())
+    );
+    assert!(rejected[0].1.held + plan.order[1].charge > rejected[0].1.share);
+    assert!(rejected[1].1.held_bytes + plan.order[2].peak > rejected[1].1.memory.unwrap());
+    for index in [0, 3] {
+        plain.finish(index).unwrap();
+        observed.finish(index).unwrap();
+    }
+    assert_eq!(
+        plain.next(0.0),
+        observed.next_with_observed(0.0, &mut |_| true, &mut |_, _| {})
+    );
 }

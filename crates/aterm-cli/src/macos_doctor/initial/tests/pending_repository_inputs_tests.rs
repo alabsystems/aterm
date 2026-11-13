@@ -50,9 +50,11 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
                 Ran::ok("protocol=https\nhost=github.com\nusername=tester\npassword=inert_repository_tools_token\n")
             } else if command.contains(" config --null --show-origin --get-regexp ") {
                 Ran::ok("")
-            } else if command.ends_with(" rev-parse --is-inside-work-tree --show-prefix --show-toplevel") {
+            } else if command.ends_with(
+                " rev-parse --is-inside-work-tree --show-prefix --show-toplevel --git-path index",
+            ) {
                 if sys.stat(&read_git).is_ok() {
-                    Ran::ok(&format!("true\n\n{}\n", read_checkout.display()))
+                    Ran::ok(&format!("true\n\n{}\n.git/index\n", read_checkout.display()))
                 } else {
                     Ran::exit(128, "not a Git repository")
                 }
@@ -99,6 +101,7 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         // directory. No vault, private inventory, credential, helper, Git or route changes.
         let (sys, _) = host.native_repositories.as_ref().unwrap();
         sys.stat_of(git_dir.to_str().unwrap(), stat(true, 0));
+        sys.file(git_dir.join("index").to_str().unwrap(), b"DIRC");
         let current = host.current_repositories(None).unwrap();
         assert!(rows_ready(&current), "{current:?}");
         assert!(

@@ -131,6 +131,14 @@ impl HeldBuild {
 /// # Errors
 /// Configuration, signed index/package, recipe, installed tree or lease admission fails.
 pub fn configured_build(want: Prerequisite, build: u64, who: &str) -> Result<HeldBuild, String> {
+    HeldBuild::new(want, configured_tool(want, build, who)?)
+}
+
+/// Authenticate and retain an exact installed executable without creating a command namespace.
+///
+/// # Errors
+/// Configuration, signed package, installed tree or original lease admission fails.
+pub fn configured_tool(want: Prerequisite, build: u64, who: &str) -> Result<HeldTool, String> {
     let config = crate::config::cached();
     if config.unreadable {
         return Err("the package configuration is unreadable".into());
@@ -149,13 +157,12 @@ pub fn configured_build(want: Prerequisite, build: u64, who: &str) -> Result<Hel
     .map_err(|error| error.to_string())?;
     let session = session.with_description(who);
     let tool = session.acquire_build(want, build)?;
-    let held = HeldBuild::new(want, tool)?;
     crate::source::advance_floors(
         &layout,
         session.index.index_build,
         session.index.roster_seq(),
     );
-    Ok(held)
+    Ok(tool)
 }
 
 impl Session<'_> {

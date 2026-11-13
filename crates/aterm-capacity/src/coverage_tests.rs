@@ -493,6 +493,86 @@ fn a_disk_claim_covers_only_the_run_its_marker_names() {
     assert_eq!(crate::DISK_COVER_ENV, "ATERM_DISK_COVERED");
 }
 
+/// A machine that answers as `inner` and counts its whole readings; its volume is the trait's
+/// default, a whole reading's.
+struct Counting<'a> {
+    inner: &'a Fixed,
+    reads: std::cell::Cell<u32>,
+}
+
+impl crate::Machine for Counting<'_> {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        self.reads.set(self.reads.get() + 1);
+        crate::Machine::read(self.inner, path)
+    }
+
+    fn procs(&self) -> Option<Procs> {
+        crate::Machine::procs(self.inner)
+    }
+}
+
+/// [`Counting`], its volume read by itself, as [`crate::Live`] reads it.
+struct Alone<'a>(Counting<'a>);
+
+impl crate::Machine for Alone<'_> {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        crate::Machine::read(&self.0, path)
+    }
+
+    fn procs(&self) -> Option<Procs> {
+        crate::Machine::procs(&self.0)
+    }
+
+    fn volume(&self, path: &Path) -> Option<crate::Volume> {
+        crate::Machine::read(self.0.inner, Some(path)).volume
+    }
+}
+
+/// WHERE A RUN'S WRITES LAND IS READ ALONE: deciding a disk cover asks the machine for the volume
+/// ([`crate::Machine::volume`]), never for a whole reading, so on Windows it opens no GPU query
+/// (about a third of a second a process). NEGATIVE CONTROL: a machine that overrides nothing
+/// answers the same volume through the trait's default, a whole reading.
+#[test]
+fn a_disk_cover_reads_the_volume_alone() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let me = std::process::id();
+    let mut room = Reading::of_gib(48, 40, 14);
+    room.volume = Some(crate::Volume {
+        mount: std::path::PathBuf::from("/vol"),
+        total: 400 * GIB,
+        free: 300 * GIB,
+        floor: 10 * GIB,
+        room: 2 * GIB,
+    });
+    let fixed = Fixed::new(room);
+    let release = admit_with(
+        &ledger,
+        &fixed,
+        Need::new("release").disk(39 * GIB, "/vol"),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_: &str| {},
+    )
+    .expect("admitted");
+    let marker = release.record().cover_marker();
+    let by = |m: &dyn crate::Machine| {
+        crate::covering_disk(&ledger, m, me, &marker, Path::new("/vol/w"))
+            .expect("read")
+            .map(|r| r.need.what)
+    };
+    let counting = || Counting {
+        inner: &fixed,
+        reads: std::cell::Cell::new(0),
+    };
+    let alone = Alone(counting());
+    assert_eq!(by(&alone), Some("release".to_owned()));
+    assert_eq!(alone.0.reads.get(), 0, "no whole reading");
+    let whole = counting();
+    assert_eq!(by(&whole), Some("release".to_owned()));
+    assert_eq!(whole.reads.get(), 1, "the default reads the whole machine");
+    drop(release);
+}
 /// A DISK CLAIM THAT WAITS COVERS NOTHING: its holder's run, marked with it while it waits for
 /// room, claims for itself. NEGATIVE CONTROL: once room comes and the claim is held, the same
 /// marker covers.

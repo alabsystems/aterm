@@ -111,12 +111,12 @@ pub(in crate::harness) fn captured_workflow(logins: &Logins, label: &str) -> Opt
 #[doc(hidden)]
 pub fn account_workflow_scope_environment() {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn begin_workflow_projection_for_test(raw: &Roster, logins: &mut Logins) {
     workflow_scope::begin(Some(raw), logins);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn finish_workflow_projection_for_test(
     before: &Logins,
     raw: &Roster,
@@ -268,6 +268,15 @@ pub const LATE_WALL_S: [i64; 2] = [10 * 60, 30 * 60];
 
 /// A wall that names no reset stands this long from the observation.
 pub const NO_RESET_WALL_S: [i64; 3] = [30 * 60, 2 * 3600, 6 * 3600];
+
+/// How long a weekly-limit handoff leaves a candidate row unread after this many of its provider
+/// reads of the row in a row answered no figure ([`Unanswered`]). Its client asks every few seconds
+/// while the wall stands, so without this a read that fails would be made again at each ask.
+pub const UNANSWERED_S: [i64; 4] = [60, 5 * 60, 30 * 60, 2 * 3600];
+
+/// A read that answers no figure this long after its row's run's newest begins a new run: a
+/// failure at a later wall does not take up the waits an earlier wall's run had climbed to.
+pub const UNANSWERED_RUN_S: i64 = 6 * 3600;
 
 /// A wall seen again more than this long after it stopped standing is a new wall.
 pub const WALL_EPISODE_S: i64 = 6 * 3600;
@@ -568,7 +577,7 @@ pub struct Vendor {
 
 impl Row {
     /// What the glass names this row by (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-    /// §2.5, owner ruling 2026-11-09): its email, else the provider email it expects, else its
+    /// §2.5): its email, else the provider email it expects, else its
     /// roster label. Display only: the label stays the row's key in state, login directories and
     /// series files, and nothing that leaves this machine carries the email.
     #[must_use]
@@ -1688,7 +1697,9 @@ pub(super) fn names_another_login(name: &str, value: &str) -> bool {
             && !lab_route(name, value))
 }
 
-/// Returns the vendor profile store's `configs` directory for a process with environment `env`.
+/// Returns the vendor profile store's `configs` directory for a process with environment `env`:
+/// its `ANTHROPIC_CONFIG_DIR`, else `XDG_CONFIG_HOME/anthropic`, else `.config/anthropic` under the
+/// home `os.homedir()` reads ([`HOMEDIR_ENV`]: `USERPROFILE` on Windows, where `HOME` is not it).
 #[must_use]
 pub fn profile_configs_dir<'a>(
     env: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -1698,7 +1709,7 @@ pub fn profile_configs_dir<'a>(
         let slot = match name {
             "ANTHROPIC_CONFIG_DIR" => &mut named,
             "XDG_CONFIG_HOME" => &mut xdg,
-            "HOME" => &mut home,
+            HOMEDIR_ENV => &mut home,
             _ => continue,
         };
         if !value.trim().is_empty() {
@@ -3173,7 +3184,7 @@ impl AttemptOutcome {
     /// renewal's `<host> <flow> <outcome>` ([`super::login_drive::Drove::attempt_of`]; its host
     /// may be `auto`), or Grok's sign-in's `<host> device <outcome>; <rungs>`
     /// ([`super::grok_signin::attempt_of`]); `None` for any other reason, a step
-    /// ([`sign_in_step`]) among them.
+    /// (none of a step).
     #[must_use]
     pub fn of_sign_in(why: &str) -> Option<Self> {
         why.strip_prefix(AUTO_SIGN_IN)
@@ -3189,18 +3200,6 @@ pub const SHARED_ADOPTION_BEGUN: &str = "shared adoption begun";
 
 /// The `why` of the [`Kind::SignIn`] event that begins a shared preparation.
 pub const SHARED_PREPARATION_BEGUN: &str = "shared preparation begun";
-
-/// Whether a [`Kind::SignIn`] event's `why` records a step of a sign-in and not how one ended: a
-/// shared adoption or preparation begun ([`SHARED_ADOPTION_BEGUN`],
-/// [`SHARED_PREPARATION_BEGUN`]), or a person's browser window ending
-/// ([`super::browser_window::ledger_why`]), which says how the window ended and not whether a
-/// login was bound.
-#[must_use]
-pub fn sign_in_step(why: &str) -> bool {
-    why == SHARED_ADOPTION_BEGUN
-        || why == SHARED_PREPARATION_BEGUN
-        || super::browser_window::is_ledger_why(why)
-}
 
 /// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
 /// that never holds a URL, code, password or email), and since when that has been so.
@@ -4453,7 +4452,7 @@ pub fn renewal_due(
 /// used login's directory the sync found gone, `DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4)
 /// or a forecast end a renewal or a notice set. A lapse its credential file alone shows
 /// ([`lapsed_here`]) is on no record: the upkeep reads that file for every row on its timer, and
-/// the owner's rule for one-mesh AC1 is that the upkeep starts no renewal or sign-in on its own
+/// the rule for one-mesh AC1 is that the upkeep starts no renewal or sign-in on its own
 /// for a lapsed file login (sign-ins are local, never by a process that polls, and never raise a
 /// prompt). So a lapse adds no renewal and takes none away; the test
 /// `the_upkeep_starts_nothing_for_a_lapsed_login` (`accounts_no_sweep_tests.rs`) holds it.
@@ -4636,7 +4635,12 @@ pub fn note_sign_in_attempt(
         }
         return Vec::new();
     }
-    let mut event = Event::new(at, Kind::SignIn, label);
+    let step = if outcome.failing() {
+        SignInStep::Failed
+    } else {
+        SignInStep::SignedIn
+    };
+    let mut event = Event::sign_in(at, label, step);
     event.why = one_line(
         &format!("{AUTO_SIGN_IN} {}: {routes}", outcome.as_str()),
         LEDGER_WHY_MAX,
@@ -5464,6 +5468,13 @@ pub(crate) fn fill_observations(into: &mut Account, from: Account) {
     fill(&mut into.cleared_at, from.cleared_at);
     fill(&mut into.room_at, from.room_at);
     fill(&mut into.ran_at, from.ran_at);
+    // A run only where no figure `into` now holds is as new as its newest failure, which
+    // [`note_sample`] would have ended it at.
+    if into.unanswered.is_none() {
+        into.unanswered = from
+            .unanswered
+            .filter(|run| into.sample.as_ref().is_none_or(|sample| sample.at < run.at));
+    }
     fill(&mut into.credits, from.credits);
     fill(&mut into.credits_day, from.credits_day);
     fill(&mut into.warned_session, from.warned_session);
@@ -5510,6 +5521,27 @@ impl Wall {
                 .at
                 .saturating_add(rung(&NO_RESET_WALL_S, self.attempts)),
         })
+    }
+}
+
+/// Machine-local: a weekly-limit handoff's provider reads of a row, the walled session's own login
+/// or a candidate to move it to, that answered no figure since the row's last figure
+/// ([`note_unanswered`]). A figure noted of the row at or after the newest of them ends the run
+/// ([`note_sample`]), as does a sign-in or another credential published for it
+/// (`Store::finalize_auth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unanswered {
+    /// When the newest of them was made.
+    pub at: i64,
+    /// How many in a row.
+    pub attempts: u32,
+}
+
+impl Unanswered {
+    /// Until when a handoff leaves the row unread ([`UNANSWERED_S`]).
+    #[must_use]
+    pub fn stands_until(self) -> i64 {
+        self.at.saturating_add(rung(&UNANSWERED_S, self.attempts))
     }
 }
 
@@ -5966,6 +5998,9 @@ pub struct Account {
     /// Machine-local: when a session was last read running on it ([`note_session`],
     /// [`reset_allowed`]).
     pub ran_at: Option<i64>,
+    /// Machine-local: the weekly-limit handoff's reads of it that answered no figure since its
+    /// last figure ([`Unanswered`], [`Self::unanswered_until`]).
+    pub unanswered: Option<Unanswered>,
     /// Observation: the newest word on its usage credits ([`Credits`]).
     pub credits: Option<Credits>,
     /// Machine-local: the local day the last credits episode that raised the day's line began on.
@@ -6012,6 +6047,7 @@ impl PartialEq for Account {
             && self.cleared_at == other.cleared_at
             && self.room_at == other.room_at
             && self.ran_at == other.ran_at
+            && self.unanswered == other.unanswered
             && self.credits == other.credits
             && self.credits_day == other.credits_day
             && self.warned_session == other.warned_session
@@ -6091,6 +6127,15 @@ impl Account {
         if !matches!(self.auth_projection, AuthProjection::Legacy) {
             self.auth_projection = AuthProjection::Unknown;
         }
+    }
+
+    /// The login word `state.json` holds for this account: [`Self::auth`], and
+    /// [`Auth::Unseen`] once that word was retired with the login it was read of. It is the
+    /// sign-in state the lab journal is told ([`super::journal::observe`]), a function of the
+    /// stored record alone, where [`Self::current_auth`] also asks a runtime snapshot.
+    #[must_use]
+    pub fn auth_on_record(&self) -> Auth {
+        self.managed_auth()
     }
 
     /// The retained auth word only while its local credential context still applies.
@@ -6191,6 +6236,16 @@ impl Account {
                 sample.week(now),
             ),
         }
+    }
+
+    /// Until when a weekly-limit handoff leaves this row unread as a candidate at `now`: its last
+    /// candidate reads of it answered no figure and their wait has not passed
+    /// ([`Unanswered::stands_until`]).
+    #[must_use]
+    pub fn unanswered_until(&self, now: i64) -> Option<i64> {
+        self.unanswered
+            .map(Unanswered::stands_until)
+            .filter(|until| *until > now)
     }
 
     /// Returns the latest timestamp until which a standing wall blocks this account at `now`.
@@ -6790,6 +6845,12 @@ pub struct State {
     /// any label takes its walls, readings and last session again ([`super::journal::learn_with`])
     /// rather than starting blind. The snapshot's byte budget bounds publication.
     pub forgotten: BTreeMap<String, Account>,
+    /// Machine-local: the sign-in word this Mac's lab journal was last told of each account, by
+    /// the account's lab key (`ac-<16hex>`), and the time it was told under
+    /// ([`super::journal::observe`]). A transaction tells the journal whatever the store holds
+    /// that this does not say, so a word no ledger row stated, one a build before this record
+    /// told wrongly and one lost before it was published are all told by the next transaction.
+    pub told: BTreeMap<String, super::journal::Told>,
 }
 
 impl Eq for State {}
@@ -6829,6 +6890,7 @@ impl PartialEq for State {
             claimed_at,
             clock,
             forgotten,
+            told,
         } = self;
         *schema == other.schema
             && *machine == other.machine
@@ -6856,6 +6918,7 @@ impl PartialEq for State {
             && *claimed_at == other.claimed_at
             && *clock == other.clock
             && *forgotten == other.forgotten
+            && *told == other.told
     }
 }
 
@@ -6891,6 +6954,7 @@ impl Default for State {
             claimed_at: BTreeMap::new(),
             clock: None,
             forgotten: BTreeMap::new(),
+            told: BTreeMap::new(),
         }
     }
 }
@@ -7144,6 +7208,12 @@ fn account_json(a: &Account) -> Value {
     o.insert("cleared_at".to_owned(), Value::from(a.cleared_at));
     o.insert("room_at".to_owned(), Value::from(a.room_at));
     o.insert("ran_at".to_owned(), Value::from(a.ran_at));
+    if let Some(unanswered) = a.unanswered {
+        let mut u = Map::new();
+        u.insert("at".to_owned(), Value::from(unanswered.at));
+        u.insert("attempts".to_owned(), Value::from(unanswered.attempts));
+        o.insert("unanswered".to_owned(), Value::Object(u));
+    }
     o.insert(
         "credits".to_owned(),
         a.credits.as_ref().map_or(Value::Null, credits_json),
@@ -7368,6 +7438,12 @@ fn account_of(v: &Value, now: i64) -> Account {
         cleared_at: stamp(v.get("cleared_at"), now),
         room_at: stamp(v.get("room_at"), now),
         ran_at: stamp(v.get("ran_at"), now),
+        unanswered: v.get("unanswered").and_then(|u| {
+            Some(Unanswered {
+                at: stamp(u.get("at"), cap)?,
+                attempts: count(u.get("attempts")).filter(|n| *n > 0)?,
+            })
+        }),
         credits: v.get("credits").and_then(|c| credits_of(c, cap)),
         credits_day: int(v.get("credits_day")),
         warned_session: v.get("warned_session").and_then(|w| window_of(w, cap)),
@@ -7631,6 +7707,20 @@ impl State {
                     self.forgotten
                         .iter()
                         .map(|(pk, a)| (pk.clone(), account_json(a)))
+                        .collect(),
+                ),
+            );
+        }
+        if !self.told.is_empty() {
+            o.insert(
+                "told".to_owned(),
+                Value::Object(
+                    self.told
+                        .iter()
+                        .map(|(pk, told)| {
+                            let said = aterm_json::json!({"word": told.word.as_str(), "t": told.t});
+                            (pk.clone(), said)
+                        })
                         .collect(),
                 ),
             );
@@ -7921,6 +8011,18 @@ impl State {
                 (pk.clone(), account)
             })
             .collect();
+        let told = doc
+            .get("told")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(pk, _)| super::journal::Key::new(pk).is_some())
+            .filter_map(|(pk, said)| {
+                let word = super::journal::SignWord::parse(said.get("word")?.as_str()?)?;
+                let t = said.get("t")?.as_u64()?;
+                Some((pk.clone(), super::journal::Told { word, t }))
+            })
+            .collect();
         Ok(State {
             schema: SCHEMA,
             machine: doc
@@ -7964,6 +8066,7 @@ impl State {
             claimed_at,
             clock,
             forgotten,
+            told,
         })
     }
 
@@ -9451,9 +9554,11 @@ pub enum Kind {
     Reset,
     /// Another account signed in to the home ([`note_reading`]).
     Epoch,
-    /// A sign-in that bound no login, `accounts browser`'s window included: its `why` names the
-    /// page's host, the flow (`device`, `browser`, `window`) and how it ended, never a URL, code
-    /// or email.
+    /// A step of a sign-in apart from the login it binds ([`Kind::Renewed`], [`Kind::SignedIn`]):
+    /// one that began, one that ended with no login bound, the route an automatic one took, or
+    /// `accounts browser`'s window. The row states which in [`Event::step`] ([`SignInStep`]); its
+    /// `why` names the page's host, the flow (`device`, `browser`, `window`) and how it ended for
+    /// a person to read, never a URL, code or email, and no reader takes the step from it.
     SignIn,
     /// The vendor's own sign-in on the default login (Claude Code's `/login`) replaced the
     /// account the row held there, which leaves the row no login on this machine
@@ -9528,6 +9633,40 @@ impl Kind {
     }
 }
 
+/// How the sign-in a [`Kind::SignIn`] row is about stands ([`Event::step`]). The row states it,
+/// so what the lab journal says of the account ([`super::journal::observe`]) is the writer's own
+/// word and never a reading of the row's reason text: a row that states none says nothing there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignInStep {
+    /// An attempt began; how it ends is another row's to say.
+    Begun,
+    /// A person's browser window ended (`accounts browser`): no login of the row's CLI was tried.
+    Window,
+    /// It bound a login, which the [`Kind::Renewed`] row of its transaction records.
+    SignedIn,
+    /// It ended with no login bound.
+    Failed,
+}
+
+impl SignInStep {
+    /// The word `ledger.jsonl` holds.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begun => "begun",
+            Self::Window => "window",
+            Self::SignedIn => "signed-in",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        [Self::Begun, Self::Window, Self::SignedIn, Self::Failed]
+            .into_iter()
+            .find(|step| step.as_str() == word)
+    }
+}
+
 /// Single append-only event row in `ledger.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -9548,6 +9687,9 @@ pub struct Event {
     pub pk: Option<String>,
     /// Captured sign-in workflow custody; an explicit legacy zero is never retargeted.
     pub workflow: Option<WorkflowToken>,
+    /// On a [`Kind::SignIn`] row, how its sign-in stands ([`Event::sign_in`]); a row written
+    /// before rows stated it holds none.
+    pub step: Option<SignInStep>,
 }
 
 impl Event {
@@ -9563,6 +9705,17 @@ impl Event {
             why: String::new(),
             pk: None,
             workflow: None,
+            step: None,
+        }
+    }
+
+    /// A [`Kind::SignIn`] row at `t` for `account` whose sign-in stands at `step`: the one way
+    /// such a row is made, so each says whether it began, failed or bound a login.
+    #[must_use]
+    pub fn sign_in(t: i64, account: &str, step: SignInStep) -> Event {
+        Event {
+            step: Some(step),
+            ..Event::new(t, Kind::SignIn, account)
         }
     }
 
@@ -9650,6 +9803,9 @@ impl Event {
         if let Some(token) = self.workflow {
             o.insert("workflow".into(), Value::from(token.value()));
         }
+        if let Some(step) = self.step.filter(|_| self.kind == Kind::SignIn) {
+            o.insert("step".into(), Value::from(step.as_str()));
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -9676,6 +9832,10 @@ impl Event {
                 None => None,
                 Some(value) => Some(WorkflowToken::from_value(value.as_u64()?)),
             },
+            step: doc
+                .get("step")
+                .and_then(Value::as_str)
+                .and_then(SignInStep::parse),
         })
     }
 }
@@ -9824,6 +9984,29 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
     out
 }
 
+/// Records that a weekly-limit handoff's provider read of `account`, begun at `now`, answered no
+/// figure: one more in its run ([`Unanswered`]), or the first of a new one where the run's newest
+/// is [`UNANSWERED_RUN_S`] old. A figure noted of the row at or after `now` (another writer's,
+/// while this read was failing) stands instead. No event: the read is on the journal as its probe.
+pub fn note_unanswered(state: &mut State, account: &str, now: i64) {
+    let Some(record) = account_mut(state, account) else {
+        return;
+    };
+    if record
+        .sample
+        .as_ref()
+        .is_some_and(|sample| sample.at >= now)
+    {
+        return;
+    }
+    let attempts = record
+        .unanswered
+        .filter(|run| now.saturating_sub(run.at) < UNANSWERED_RUN_S)
+        .map_or(0, |run| run.attempts)
+        .saturating_add(1);
+    record.unanswered = Some(Unanswered { at: now, attempts });
+}
+
 /// Records a settled `/usage` panel [`Sample`] for `account` at `now`.
 pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -> Vec<Event> {
     let by = state.machine.clone();
@@ -9844,6 +10027,12 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
     let Some(record) = account_mut(state, account) else {
         return Vec::new();
     };
+    if record
+        .unanswered
+        .is_some_and(|unanswered| unanswered.at <= sample.at)
+    {
+        record.unanswered = None;
+    }
     if record
         .sample
         .as_ref()
@@ -10065,6 +10254,7 @@ pub fn note_reading_held(
             cleared_at: _,
             room_at: _,
             ran_at,
+            unanswered: _,
             credits: _,
             credits_day,
             warned_session: _,
@@ -11975,6 +12165,16 @@ impl Store {
             if word != Auth::Unseen
                 && let Some(account) = account_mut(state, label)
             {
+                // Reads that answered no figure were of the credential this replaces, or came
+                // before the sign-in that just proved it; the next read is the new login's first.
+                if !same_context
+                    || matches!(
+                        intent.kind,
+                        PendingAuthKind::CheckedSignIn | PendingAuthKind::SignedBack
+                    )
+                {
+                    account.unanswered = None;
+                }
                 account.auth_context = Some(intent.context.clone());
                 account.renewal_metadata = renewal_metadata;
                 account.served_metadata = served_metadata;
@@ -14804,7 +15004,9 @@ mod renewal_policy_tests;
 #[path = "accounts_renewal_commit_tests.rs"]
 mod renewal_commit_tests;
 
-#[cfg(test)]
+// Each selects a row that needs a manual sign-in, which only Unix queues
+// (`manual_signin_capability`).
+#[cfg(all(test, unix))]
 #[path = "accounts_selection_commit_tests.rs"]
 mod selection_commit_tests;
 

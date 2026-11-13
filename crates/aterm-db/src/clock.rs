@@ -66,6 +66,10 @@ pub const MAX_READINGS: usize = aterm_secrets::commons::roster::MAX_MEMBERS;
 const ENTRY_LEN: usize = 16 + 8 + 8 + 8 + 1;
 const STATE_MAX: usize = STATE_MAGIC.len() + 2 + 1 + MAX_READINGS * ENTRY_LEN;
 
+pub(crate) fn claim_metadata() -> (&'static str, usize) {
+    (STATE_NAME, STATE_MAX)
+}
+
 /// The clock mark of wall time `wall_ms`: its one spelling.
 #[must_use]
 pub fn mark(wall_ms: u64) -> Digest {

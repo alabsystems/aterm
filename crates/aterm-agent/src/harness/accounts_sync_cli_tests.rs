@@ -4604,9 +4604,9 @@ fn keep_a_row_with_no_login(bed: &Bed, cli: Cli) {
         bed.roster(cli),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"other\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             label = \"other\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"other@example.test\"\n{region}",
-            dir.display()
+            crate::harness::host_path::toml(&dir)
         ),
     )
     .unwrap();

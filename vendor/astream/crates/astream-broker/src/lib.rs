@@ -135,7 +135,11 @@ pub mod health;
 #[cfg(feature = "retention")]
 mod held;
 mod last_view;
-pub use last_view::{LastStep, LastView, LastViewError, LastViewGarbage};
+pub use last_view::{
+    last_view_available_advance, last_view_not_above_pub, last_view_not_before_avail,
+    last_view_prune_clamp, last_view_prune_within_quantum, last_view_window_admits_code, LastStep,
+    LastView, LastViewError, LastViewGarbage,
+};
 mod dedup;
 pub mod logid;
 #[cfg(feature = "relay")]
@@ -223,6 +227,13 @@ pub use astream_aead::{
 /// identity without depending on `astream-aead` directly.
 #[cfg(feature = "identity")]
 pub use astream_aead::{IdentityKeypair, ID_PUB_LEN};
+/// Zero-gap AEAD-over-UDP roaming transport types (`AROM` v1), re-exported so
+/// callers of [`Broker::serve_udp_roaming`] / [`Client::connect_udp_roaming`] can
+/// migrate live sessions without depending on `astream-aead` directly.
+#[cfg(feature = "handshake")]
+pub use astream_aead::{
+    RoamCloser, RoamHandle, RoamListener, RoamStream, ROAM_WIRE_MAGIC, ROAM_WIRE_VERSION,
+};
 #[cfg(feature = "retention")]
 pub use broker::RETENTION_INTERVAL;
 pub use escalation::{

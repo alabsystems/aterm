@@ -27,6 +27,22 @@ pub fn encode_into(out: &mut String, s: &str) {
     }
 }
 
+/// The bytes [`encode`] makes of `s`: one for an ASCII-graphic byte other than `%`, three for
+/// every other byte.
+#[must_use]
+#[inline]
+pub fn encoded_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_graphic() && b != b'%' {
+                1
+            } else {
+                3
+            }
+        })
+        .sum()
+}
+
 /// [`encode`]'s narrow sibling for one word of an argv carried as a line of space-separated words ([`join_words`]).
 #[must_use]
 pub fn encode_word(s: &str) -> String {

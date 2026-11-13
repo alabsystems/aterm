@@ -158,7 +158,7 @@ fn receipt_io_holds_no_native_locks_and_the_terminal_seal_fences_execute() {
     let guard = {
         let operation = lookup(&ctx, &binding).unwrap();
         let op = operation.lock().unwrap();
-        Arc::downgrade(&op.custody.as_ref().unwrap().handoff_guard())
+        Arc::downgrade(&op.custody.as_ref().unwrap().handoff_guard().unwrap())
     };
     let (entered, waiting) = mpsc::sync_channel(1);
     let proceed = Arc::new((Mutex::new(false), std::sync::Condvar::new()));

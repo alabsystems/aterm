@@ -1928,7 +1928,7 @@ fn pet_scene(rig: &mut Rig, seed: u64) -> Run {
         |p| {
             p.set_cursor_glow(
                 true,
-                "rainbow kitty",
+                "rainbow",
                 aterm_effects::cursor_fx::TrailColor::Automatic,
                 None,
                 400,
@@ -1958,7 +1958,7 @@ const ICON_EVERY: usize = 3;
 const ICON_PROSE: &[u8] = b"the cat naps; a kitty purrs by the cat flap ";
 
 /// The word icons' shade ([`CursorGlow::shade_word_icons`]) under the
-/// ribbon: the pipeline types feline words under the rainbow kitty, the word
+/// ribbon: the pipeline types feline words under the rainbow, the word
 /// pass draws their icons on the typed row, and each frame the shade lifts
 /// the ribbon's light off them, its ramps cut in place.
 fn icons_scene(rig: &mut Rig) -> Run {
@@ -1969,7 +1969,7 @@ fn icons_scene(rig: &mut Rig) -> Run {
         |p| {
             p.set_cursor_glow(
                 true,
-                "rainbow kitty",
+                "rainbow",
                 aterm_effects::cursor_fx::TrailColor::Automatic,
                 None,
                 400,

@@ -182,6 +182,9 @@ pub(crate) struct Member {
     pub(crate) addr: Option<String>,
     /// It lets this Mac drive it (`drive=1` in its instance facts).
     pub(crate) drive: bool,
+    /// Its fleet access (`access=` in its instance facts; an aterm older than the lock sends
+    /// none and enforces none, which reads as full): what a driver it lets in may do there.
+    pub(crate) access: aterm_types::fleet_access::FleetAccess,
     /// Its clock when it answered (`at_ms=`).
     pub(crate) at_ms: Option<u64>,
     /// Its account rows, `None` where its aterm says nothing of them (one older than the field).
@@ -361,8 +364,15 @@ impl Member {
         self.host.as_deref().unwrap_or(&self.label)
     }
 
-    /// Whether a spawn may go to it at all: it proved its node, and it lets this Mac drive it.
+    /// Whether a spawn may go to it at all: it proved its node, it lets this Mac drive it, and
+    /// its fleet access is Full Access, the only level that admits a spawn.
     fn drivable(&self) -> bool {
+        self.granted() && self.access == aterm_types::fleet_access::FleetAccess::Full
+    }
+
+    /// Whether it proved its node and its grants let this Mac drive it, whatever its fleet access
+    /// admits of a drive.
+    fn granted(&self) -> bool {
         self.proven && self.node.is_some() && self.drive
     }
 
@@ -517,6 +527,7 @@ pub(crate) fn members_of(peers: &[PeerSurvey]) -> Vec<Member> {
                 host: header.get("host").map(str::to_owned),
                 addr: peer.addr.clone(),
                 drive: header.get("drive") == Some("1"),
+                access: aterm_types::fleet_access::FleetAccess::of_header(header.get("access")),
                 at_ms: header.number("at_ms"),
                 accounts: survey
                     .accounts
@@ -560,7 +571,10 @@ pub(crate) struct Counts {
     pub(crate) unproven: usize,
     /// Of those that proved their node, the ones that do not let this Mac drive them.
     pub(crate) ungranted: usize,
-    /// Of those, the ones that proved their node and let this Mac drive them.
+    /// Of those that proved their node and let this Mac drive them, the ones whose fleet access
+    /// is below Full Access, so they take no spawn until their person raises it.
+    pub(crate) locked: usize,
+    /// Of those, the ones that proved their node, let this Mac drive them and are at Full Access.
     pub(crate) drivable: usize,
     /// Of those, the ones that lack a checkout the spawn needs.
     pub(crate) no_repo: usize,
@@ -663,6 +677,7 @@ pub(crate) fn pick<'a>(
                 nodeless: of_members(&|m| m.node.is_none()),
                 unproven: of_members(&|m| m.node.is_some() && !m.proven),
                 ungranted: of_members(&|m| m.node.is_some() && m.proven && !m.drive),
+                locked: of_members(&|m| m.granted() && !m.drivable()),
                 drivable: drivable.len(),
                 no_repo: short(Short::Repo),
                 no_room: short(Short::Room),
@@ -725,7 +740,7 @@ pub(crate) fn why(program: &str, needs: &[Need], chosen: &Chosen<'_>) -> String 
         ("5h", row.five_hour),
     ] {
         if let Some(pct) = pct {
-            figures.push_str(&format!(" {window} {pct}%"));
+            figures.push_str(&format!(" {window} {}% left", survey::left_pct(pct)));
         }
     }
     if figures.is_empty() {
@@ -750,7 +765,7 @@ pub(crate) fn why(program: &str, needs: &[Need], chosen: &Chosen<'_>) -> String 
     };
     format!(
         "{program} account {}{figures}, {busy}{has}; the best of {} that can take it",
-        aterm_codec::tty::one_line(&survey::masked_label(&row.label), 32),
+        aterm_codec::tty::one_line(&row.label, 32),
         chosen.able
     )
 }
@@ -846,6 +861,13 @@ fn undriven(counts: &Counts) -> String {
         why.push(format!(
             "{} with no grant: `aterm fleet allow drive --from <this Mac>` there",
             counts.ungranted
+        ));
+    }
+    if counts.locked > 0 {
+        why.push(format!(
+            "{} locked: its person raises it at its menu-bar lock or with `aterm fleet access \
+             full` there",
+            counts.locked
         ));
     }
     if counts.unproven > 0 {

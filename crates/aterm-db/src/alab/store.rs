@@ -30,7 +30,10 @@ use std::{collections::BTreeSet, path::Path};
 
 #[path = "source.rs"]
 mod source;
-pub use source::{SourceRead, SourceRevision};
+pub use source::{
+    CatalogAbsenceRead, CatalogAbsenceRevision, LocalSourceRead, LocalSourceRevision,
+    ProjectionRead, ProjectionRevision, SourceRead, SourceRevision,
+};
 
 /// The SHA-256 fingerprint of the registry operations a [`LabView`] was projected from
 /// (`replica::InventorySummary`'s encoding), so a cache can tell whether anything arrived.

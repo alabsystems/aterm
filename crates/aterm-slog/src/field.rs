@@ -231,6 +231,7 @@ keys! {
     Tokens "tokens" Wire Cap::Sample,
     Account "account" Host Cap::Text(64),
     TitleFp "title_fp" Content Cap::Id,
+    WhyText "why_text" Host Cap::Text(aterm_types::control_verbs::REQUEST_WHY_BYTES),
 }
 
 impl Key {
@@ -252,18 +253,10 @@ impl Key {
     }
 }
 
-/// The bytes `s` takes percent-encoded (`aterm_codec::pct::encode`'s rule: a byte that is not ASCII-graphic, and `%`, takes three).
+/// The bytes `s` takes percent-encoded (`aterm_codec::pct::encoded_len`, [`aterm_codec::pct::encode`]'s rule: a byte that is not ASCII-graphic, and `%`, takes three).
 #[must_use]
 pub fn encoded_len(s: &str) -> usize {
-    s.bytes()
-        .map(|b| {
-            if b.is_ascii_graphic() && b != b'%' {
-                1
-            } else {
-                3
-            }
-        })
-        .sum()
+    aterm_codec::pct::encoded_len(s)
 }
 
 /// The longest prefix of `s`, cut at a character boundary, whose percent-encoding fits in `cap` bytes.

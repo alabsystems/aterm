@@ -905,6 +905,9 @@ impl FleetError {
 /// `e` again: its OS error where it carries one, else its kind and text.
 #[cfg(unix)]
 pub(crate) fn copied_io(e: &io::Error) -> io::Error {
+    if let Some(why) = aterm_uds::lan::Unavailable::of(e) {
+        return aterm_uds::lan::LanError::Unavailable(why.clone()).into_io();
+    }
     e.raw_os_error().map_or_else(
         || io::Error::new(e.kind(), e.to_string()),
         io::Error::from_raw_os_error,
@@ -1224,6 +1227,9 @@ pub fn is_denied_key(key: &NodeKey, denied_nodes: &[String]) -> bool {
 /// unknown, and reaches only the desk.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Denied {
+    /// Local authority to use this fleet was withdrawn. Refuse every peer, including keys
+    /// previously seated, and end existing neighbour links rather than suspend judgment.
+    pub withdrawn: bool,
     /// Node ids, as [`is_denied_node`] matches them.
     pub nodes: Vec<String>,
     /// Node keys.
@@ -1244,7 +1250,7 @@ pub enum Seat {
     /// nor its key.
     Member,
     /// The log took it out (its Mac removed, its member bound another key since, or two members
-    /// claim it), or the roster denies its node or key.
+    /// claim it), the roster denies its node or key, or local fleet authority was withdrawn.
     Out,
     /// No record the verdict was read from binds it: a seat with no `Node` record yet, one whose
     /// record has not arrived, or no member at all. It reaches only the desk.
@@ -1265,6 +1271,7 @@ impl Denied {
     pub fn under(nodes: Option<&[String]>, log: Option<&crate::fleet_member::MemberKeys>) -> Self {
         match nodes {
             Some(nodes) if !log.is_some_and(|log| log.unread().is_some()) => Self {
+                withdrawn: false,
                 nodes: nodes.to_vec(),
                 keys: log
                     .map(crate::fleet_member::MemberKeys::out)
@@ -1278,12 +1285,15 @@ impl Denied {
         }
     }
 
-    /// Where the key `proof` proved stands for [`ALPN_MESH`]: nothing is judged while unread;
+    /// Where the key `proof` proved stands for [`ALPN_MESH`]: withdrawn authority takes every
+    /// key out; otherwise nothing is judged while unread;
     /// out where this verdict refuses it ([`Self::refuses`]: a roster-denied node or key, or a key
     /// the log took out); a member's where the log seats a member under it; else unknown.
     #[must_use]
     pub fn seat(&self, proof: &NodeProof) -> Seat {
-        if self.unread {
+        if self.withdrawn {
+            Seat::Out
+        } else if self.unread {
             Seat::Unread
         } else if self.refuses(Some(proof)) {
             Seat::Out
@@ -1313,18 +1323,29 @@ impl Denied {
         }
     }
 
+    /// Local authority to serve or dial this fleet is gone. Unlike an unread verdict, this
+    /// withdraws existing admissions too, even if a retained membership list seats the peer.
+    #[must_use]
+    pub fn withdrawn() -> Self {
+        Self {
+            withdrawn: true,
+            ..Self::default()
+        }
+    }
+
     /// Whether it refuses no one: it names no one, and a list was read.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.unread && self.nodes.is_empty() && self.keys.is_empty()
+        !self.withdrawn && !self.unread && self.nodes.is_empty() && self.keys.is_empty()
     }
 
-    /// Whether it refuses a dialer that proved `peer`: every one while `unread`; while it names
+    /// Whether it refuses a dialer that proved `peer`: every one while withdrawn or `unread`; while it names
     /// anyone, both a named node id or key and an unproved peer (`None`) are refused, so a removed
     /// machine cannot pass by stripping its node key.
     #[must_use]
     pub fn refuses(&self, peer: Option<&NodeProof>) -> bool {
-        self.unread
+        self.withdrawn
+            || self.unread
             || (!self.is_empty()
                 && peer.is_none_or(|proof| {
                     is_denied_node(&proof.node, &self.nodes)
@@ -2121,6 +2142,12 @@ impl From<crate::fleet_member::PrivateFileError> for KeyFileError {
         match error {
             E::Missing => Self::Missing,
             E::NotPrivate(why) => Self::NotPrivate(why),
+            // Only an owned read refuses so; under the strict read the key file takes, a write
+            // bit is one more bit open to other users.
+            E::Writable(writable) if writable.dir() => {
+                Self::NotPrivate(aterm_uds::private_file::DIR_OPEN)
+            }
+            E::Writable(_) => Self::NotPrivate(aterm_uds::private_file::FILE_OPEN),
             E::Symlink => Self::Symlink,
             E::Malformed("longer than such a file can be") => {
                 Self::Malformed("longer than one secret")
@@ -2223,14 +2250,21 @@ impl Served {
     /// Relay the connection to `local` via [`tls::relay_answers`], releasing the listener hold
     /// before EOF.
     /// # Errors
-    /// As [`tls::relay_answers`], or if native locality evidence changed.
+    /// As [`tls::relay_answers`], or if native locality or live fleet admission changed.
     pub fn relay_answers(self, local: aterm_uds::CtlStream) -> io::Result<()> {
         self.admission.recheck()?;
         self.release
             .tenure
             .relays_to(aterm_uds::kept_out(|| local.try_clone())?);
-        let result = tls::relay_answers(self.transport, local, self.release);
-        self.admission.recheck()?;
+        let admission = Arc::new(self.admission);
+        let current = Arc::clone(&admission);
+        let result = tls::relay_answers(
+            self.transport,
+            local,
+            self.release,
+            Arc::new(move || current.recheck()),
+        );
+        admission.recheck()?;
         result
     }
 
@@ -2267,17 +2301,22 @@ impl Served {
     /// Serve a direct response via `write` ([`tls::answer`]), flushing and releasing the listener
     /// hold before EOF.
     /// # Errors
-    /// `write`'s own, the flush's, or changed native locality evidence.
+    /// `write`'s own, the flush's, or changed native locality or live fleet admission.
     pub fn answer<T>(
         self,
         write: impl FnOnce(&mut tls::Answering<'_, ServerConnection>) -> io::Result<T>,
     ) -> io::Result<T> {
         self.admission.recheck()?;
-        tls::answer(self.transport, self.release, |stream| {
-            let result = write(stream);
-            self.admission.recheck()?;
-            result
-        })
+        tls::answer(
+            self.transport,
+            self.release,
+            &|| self.admission.recheck(),
+            |stream| {
+                let result = write(stream);
+                self.admission.recheck()?;
+                result
+            },
+        )
     }
 }
 
@@ -2290,6 +2329,7 @@ enum Locality {
 
 #[derive(Default)]
 struct Admission {
+    current: Option<(DenyFn, Option<NodeProof>)>,
     #[cfg(unix)]
     proof: Option<crate::lan::Proof>,
 }
@@ -2307,11 +2347,22 @@ impl Admission {
             #[cfg(unix)]
             Locality::Link(scope) => {
                 let proof = crate::lan::Connection::admit_proof(tcp, scope, witness)?;
-                Ok(Self { proof: Some(proof) })
+                Ok(Self {
+                    proof: Some(proof),
+                    ..Self::default()
+                })
             }
         }
     }
     fn recheck(&self) -> io::Result<()> {
+        if let Some((current, peer)) = &self.current
+            && current().refuses(peer.as_ref())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fleet admission changed",
+            ));
+        }
         #[cfg(unix)]
         if let Some(proof) = &self.proof {
             proof.recheck()?;
@@ -2694,7 +2745,8 @@ pub fn serve_lan_within<H, E>(
 // (`listener_proves`), so a socket whose peer gave up, or that proves nothing,
 // costs its worker no lookup.
 type OfferFn = Arc<dyn Fn() -> (FleetScope, &'static [FleetOp]) + Send + Sync>;
-/// A verdict read fresh for each connection: what a listener refuses ([`Denied::under`]), and
+/// A verdict read fresh for connections, re-proofs and response I/O: what a listener refuses
+/// ([`Denied::under`]), and
 /// what a dialer that meets the mesh judges a listener by ([`NodeIdentity::dialing_mesh`]).
 pub type DenyFn = Arc<dyn Fn() -> Arc<Denied> + Send + Sync>;
 
@@ -2964,13 +3016,14 @@ fn serve_seated<H, E>(
                         drop(release);
                         FleetEvent::Closed { peer, error: None }
                     }
-                    Ok((Handshook::Proved(accepted), admission, scope)) => {
+                    Ok((Handshook::Proved(accepted), mut admission, scope)) => {
                         let Accepted {
                             transport,
                             op,
                             peer: proof,
                             mesh,
                         } = *accepted;
+                        admission.current = Some((Arc::clone(&deny), proof.clone()));
                         // A dialer the mesh proved is a member's node-proven answer (§11 B6).
                         #[cfg(unix)]
                         if mesh

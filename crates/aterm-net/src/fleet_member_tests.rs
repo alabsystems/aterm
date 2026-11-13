@@ -617,6 +617,73 @@ fn a_code_that_is_not_whole_is_refused_by_what_is_wrong() {
     }
 }
 
+/// A level is chosen for one fleet: the write of another fleet's key removes the stored fleet
+/// access first, whatever this machine held before, and the key held written again, or the same
+/// fleet's rotated secret, keeps it.
+#[test]
+fn another_fleets_key_removes_the_stored_fleet_access_and_the_same_fleets_keeps_it() {
+    let level = aterm_types::fleet_access::FILE;
+    let stored = |state: &State| state.dir().join(level).exists();
+    let raise = |state: &State| write_private(state.dir(), level, b"level=full\n").unwrap();
+
+    // No key held (a join after a leave, an init): a level stored meanwhile goes.
+    let state = State::new("key-relocks");
+    ensure_private_dir(state.dir()).unwrap();
+    raise(&state);
+    write_key(state.dir(), &[5; SECRET_LEN]).unwrap();
+    assert!(
+        !stored(&state),
+        "no fleet was held: the new one starts locked"
+    );
+
+    // CONTROL: the key held, written again, is the same fleet's.
+    raise(&state);
+    write_key(state.dir(), &[5; SECRET_LEN]).unwrap();
+    assert!(stored(&state), "the fleet held keeps its level");
+
+    // The same fleet's rotated secret keeps it too, and names another key.
+    hold_book(state.dir())
+        .unwrap()
+        .write_rotated_key(&[6; SECRET_LEN])
+        .unwrap();
+    assert!(stored(&state), "a rotation is the same Macs");
+    assert_eq!(read_key_file(state.dir()).unwrap(), secret(6));
+
+    // Another fleet's key in place of one held.
+    write_key(state.dir(), &[7; SECRET_LEN]).unwrap();
+    assert!(!stored(&state), "another fleet starts locked");
+    assert_eq!(read_key_file(state.dir()).unwrap(), secret(7));
+
+    // A key file this machine could not read names no fleet it holds.
+    raise(&state);
+    std::fs::write(state.dir().join(KEY_FILE), "not a key\n").unwrap();
+    write_key(state.dir(), &[7; SECRET_LEN]).unwrap();
+    assert!(!stored(&state), "an unreadable key held no fleet");
+
+    // A secret that is no fleet's removes nothing.
+    raise(&state);
+    assert!(write_key(state.dir(), &[1; 8]).is_err());
+    assert!(stored(&state));
+}
+
+/// A raise's hold is the book's lock: it waits out a writer of the book, and is refused once
+/// its wait is over. CONTROL: with the lock free it runs.
+#[test]
+fn a_raise_of_fleet_access_is_made_under_the_books_lock() {
+    let state = State::new("access-held");
+    ensure_private_dir(state.dir()).unwrap();
+    assert_eq!(
+        access_held(state.dir(), Some(Duration::ZERO), || 7),
+        Ok(7),
+        "control"
+    );
+    let book = hold_book(state.dir()).unwrap();
+    let refused = access_held(state.dir(), Some(Duration::ZERO), || 7);
+    assert!(matches!(refused, Err(Unwritten::Lock(_))), "{refused:?}");
+    drop(book);
+    assert_eq!(access_held(state.dir(), None, || 8), Ok(8));
+}
+
 #[test]
 fn the_key_and_the_node_id_are_written_as_their_readers_read_them() {
     let state = State::new("key");
@@ -2244,6 +2311,7 @@ impl Issuing {
                                 move || Ok(issuer),
                                 1_760_000_000_000,
                                 (&[], log.as_ref()),
+                                &|| true,
                             )
                             .map(|_| ())
                         })
@@ -2521,6 +2589,76 @@ struct Duplex {
     output: Vec<u8>,
 }
 
+#[test]
+fn custody_revoked_after_parsing_cannot_register_or_store_facts() {
+    for revoke in [false, true] {
+        let state = State::new("custody-commit");
+        write_key(state.dir(), &[5; SECRET_LEN]).unwrap();
+        let who = identity(&node_of(0xcd), 4);
+        let proof = proof(who.node(), who.key());
+        let current = std::cell::Cell::new(true);
+        let reg = Registration {
+            node: who.node().to_owned(),
+            host: "127.0.0.1".into(),
+            port: 7100,
+            version: "0.149.0".into(),
+            key: None,
+            signed: None,
+        }
+        .signed_by(&who, 1);
+        let mut stream = Duplex {
+            input: io::Cursor::new(reg.line().into_bytes()),
+            output: Vec::new(),
+        };
+        let result = serve_join_with_denied(
+            &mut stream,
+            (Ipv4Addr::LOCALHOST.into(), Some(&proof)),
+            (state.dir(), &secret(5)),
+            || {
+                current.set(!revoke);
+                Ok(issuer(0x11))
+            },
+            7,
+            (&[], None),
+            &|| current.get(),
+        );
+        assert_eq!(result.is_ok_and(|result| result.is_ok()), !revoke);
+        assert_eq!(read_peers(state.dir()).unwrap().len(), usize::from(!revoke));
+
+        current.set(true);
+        let payload = format!("OK 1\nnode={}\n", who.node());
+        let mut stream = Duplex {
+            input: io::Cursor::new(payload.into_bytes()),
+            output: Vec::new(),
+        };
+        let result = serve_facts_with_denied(
+            &mut stream,
+            Some(&proof),
+            state.dir(),
+            (&[], None),
+            |_| {
+                current.set(!revoke);
+                Ok(Some(who.node().to_owned()))
+            },
+            &|| current.get(),
+        );
+        assert_eq!(result.is_ok_and(|result| result.is_ok()), !revoke);
+        assert_eq!(read_pushed_facts(state.dir()).len(), usize::from(!revoke));
+    }
+}
+
+#[test]
+fn custody_revocation_preserves_facts_from_stale_cleanup() {
+    let state = State::new("custody-prune");
+    let who = identity(&node_of(0xcd), 4);
+    store_pushed_facts_with_key(state.dir(), who.node(), Some(who.key()), "cached facts\n")
+        .unwrap();
+    prune_pushed_facts(state.dir(), &[], &[who.key().hex()], None, &|| false);
+    assert_eq!(read_pushed_facts(state.dir()).len(), 1);
+    prune_pushed_facts(state.dir(), &[], &[who.key().hex()], None, &|| true);
+    assert!(read_pushed_facts(state.dir()).is_empty());
+}
+
 impl std::io::Read for Duplex {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.input.read(buf)
@@ -2634,6 +2772,7 @@ fn a_join_is_judged_by_the_log_whatever_secret_it_holds() {
             || Ok(issuer(0x11)),
             7,
             (&[], log),
+            &|| true,
         )
         .expect("the stream reads and writes");
         (outcome, String::from_utf8(stream.output).unwrap())
@@ -2706,6 +2845,7 @@ fn join_here(
         || Ok(issuer(0x12)),
         7,
         (&[], log),
+        &|| true,
     )
     .expect("the stream reads and writes")
 }
@@ -7261,6 +7401,32 @@ fn a_listener_that_hangs_up_in_the_handshake_is_said_to() {
 }
 
 #[test]
+fn an_unavailable_broker_is_not_evidence_of_a_peer_dial() {
+    use aterm_uds::lan::{LanError, Unavailable};
+    let at = SocketAddr::from(([192, 168, 1, 23], 7100));
+    for held in [
+        Unavailable::NotInstalled,
+        Unavailable::Outdated { ours: 2, theirs: 1 },
+        Unavailable::Refused("code requirement".to_owned()),
+        Unavailable::Unchecked("check pending".to_owned()),
+    ] {
+        let why = Unreached::Connect(at, LanError::Unavailable(held).into_io());
+        assert!(!why.dialled(), "{why:?}");
+        assert_eq!(why.reason(), "lan-broker");
+        let copied = why.copied();
+        assert!(!copied.dialled(), "{copied:?}");
+        assert_eq!(copied.reason(), "lan-broker");
+        assert_eq!(copied.to_string(), why.to_string());
+        assert!(!why.no_route() && !why.no_network() && !why.at_capacity());
+        // An earlier address's retryable result cannot lend a peer attempt to this local failure.
+        assert!(!super::PassFailure::exhausted(why, true).retryable);
+    }
+    let ordinary = Unreached::Connect(at, io::ErrorKind::NotConnected.into());
+    assert!(ordinary.dialled());
+    assert_eq!(ordinary.reason(), "connect");
+}
+
+#[test]
 fn a_connect_failure_is_read_by_its_kind() {
     let at = SocketAddr::from(([192, 168, 1, 23], 7100));
     let connect = |errno| Unreached::Connect(at, io::Error::from_raw_os_error(errno));
@@ -10952,6 +11118,7 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         state.dir(),
         (&[], None),
         |_| Ok(Some(proof.node.clone())),
+        &|| true,
     )
     .unwrap();
     assert_eq!(res.unwrap_err(), "invalid facts head");
@@ -10966,6 +11133,7 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         state.dir(),
         (&[], None),
         |_| Ok(Some(proof.node.clone())),
+        &|| true,
     )
     .unwrap();
     assert_eq!(res.unwrap_err(), "truncated facts push");
@@ -10980,6 +11148,7 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         state.dir(),
         (&[], None),
         |_| Ok(Some(proof.node.clone())),
+        &|| true,
     )
     .unwrap();
     assert_eq!(res.unwrap(), proof.node);
@@ -11121,7 +11290,7 @@ fn store_pushed_facts_never_acknowledges_an_unbound_publication() {
     std::fs::create_dir(dir.join(format!("{node}.key"))).unwrap();
 
     let result = store_pushed_facts_with_key(state.dir(), &node, Some(key), "new survey facts\n");
-    prune_pushed_facts(state.dir(), &[], &[key.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[key.hex()], None, &|| true);
     let after = read_pushed_facts(state.dir());
     match result {
         Ok(()) => assert!(
@@ -11161,26 +11330,26 @@ fn pushed_facts_records_keep_payload_binding_and_legacy_fallback_distinct() {
         read_pushed_facts(state.dir()),
         [(node.clone(), "new\nwire\0bytes\n".to_owned())]
     );
-    prune_pushed_facts(state.dir(), &[], &[old.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[old.hex()], None, &|| true);
     assert_eq!(
         read_pushed_facts(state.dir()),
         [(node.clone(), "new\nwire\0bytes\n".to_owned())]
     );
-    prune_pushed_facts(state.dir(), &[], &[new.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[new.hex()], None, &|| true);
     assert!(read_pushed_facts(state.dir()).is_empty());
 
     // A current unproved publication inherits no proved legacy sidecar. The established
     // keyring, when present, still decides its standing.
     legacy_pushed_facts(state.dir(), &node, Some(old), "legacy again\n");
     store_pushed_facts(state.dir(), &node, "unproved current\n").unwrap();
-    prune_pushed_facts(state.dir(), &[], &[old.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[old.hex()], None, &|| true);
     assert_eq!(
         read_pushed_facts(state.dir()),
         [(node.clone(), "unproved current\n".to_owned())]
     );
     write_book(state.dir(), &[keyed(0x33, new, [10, 0, 0, 1], 7100)]);
     assert!(read_admitted_pushed_facts(state.dir(), &[], &[new.hex()], None).is_empty());
-    prune_pushed_facts(state.dir(), &[], &[new.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[new.hex()], None, &|| true);
     assert!(read_pushed_facts(state.dir()).is_empty());
 }
 
@@ -11329,7 +11498,7 @@ fn pushed_facts_pruning_judges_each_record_by_its_key_line_alone() {
         "past the cap"
     );
     assert_eq!(read_pushed_facts_of(state.dir(), "own"), None, "no node id");
-    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None, &|| true);
     let mut left: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
@@ -11404,12 +11573,12 @@ fn pushed_facts_write_failure_keeps_the_previous_record_and_a_later_writer_wins(
     release_tx.send(()).unwrap();
     assert!(first.join().unwrap().is_err());
     second.join().unwrap().unwrap();
-    prune_pushed_facts(state.dir(), &[], &[old.hex(), failed.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[old.hex(), failed.hex()], None, &|| true);
     assert_eq!(
         read_pushed_facts(state.dir()),
         [(node.clone(), "winner\n".to_owned())]
     );
-    prune_pushed_facts(state.dir(), &[], &[winner.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[winner.hex()], None, &|| true);
     assert!(read_pushed_facts(state.dir()).is_empty());
 }
 
@@ -11511,7 +11680,7 @@ fn pushed_facts_under_an_unread_log_are_neither_admitted_nor_pruned() {
     let key = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
     store_pushed_facts_with_key(state.dir(), &node, Some(key), "kept\n").unwrap();
     let unread = MemberKeys::unreadable("this Mac's membership log cannot be read now");
-    prune_pushed_facts(state.dir(), &[], &[], Some(&unread));
+    prune_pushed_facts(state.dir(), &[], &[], Some(&unread), &|| true);
     assert_eq!(
         read_pushed_facts(state.dir()),
         [(node.clone(), "kept\n".to_owned())]
@@ -11553,7 +11722,8 @@ fn an_unread_log_pushes_survey_facts_to_no_one() {
             (&secret(9), Some(&me)),
             (&[], Some(&unread)),
             "OK 0\n",
-            HANG
+            HANG,
+            &|| true,
         ),
         Err(why.to_owned())
     );
@@ -11716,11 +11886,15 @@ fn prune_pushed_facts_evicts_log_removed_peer_via_recorded_key_sidecar_without_p
     for proof in [&good_proof, &revoked_proof] {
         let payload = format!("OK 2\naterm 0.147.0\nsurvey facts node={}\n", proof.node);
         let mut cursor = io::Cursor::new(payload.into_bytes());
-        let res =
-            serve_facts_with_denied(&mut cursor, Some(proof), state.dir(), (&[], None), |_| {
-                Ok(Some(proof.node.clone()))
-            })
-            .expect("io");
+        let res = serve_facts_with_denied(
+            &mut cursor,
+            Some(proof),
+            state.dir(),
+            (&[], None),
+            |_| Ok(Some(proof.node.clone())),
+            &|| true,
+        )
+        .expect("io");
         assert_eq!(res, Ok(proof.node.clone()));
     }
     assert_eq!(read_pushed_facts(state.dir()).len(), 2);
@@ -11731,7 +11905,7 @@ fn prune_pushed_facts_evicts_log_removed_peer_via_recorded_key_sidecar_without_p
         (good.key(), Standing::Member),
         (revoked.key(), Standing::Out("removed".to_owned())),
     ]);
-    prune_pushed_facts(state.dir(), &[], &[], Some(&log));
+    prune_pushed_facts(state.dir(), &[], &[], Some(&log), &|| true);
     let remaining = read_pushed_facts(state.dir());
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].0, good.node());
@@ -11798,7 +11972,7 @@ fn prune_pushed_facts_uses_only_private_bounded_key_sidecars() {
             "missing" => {}
             _ => unreachable!(),
         }
-        prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+        prune_pushed_facts(state.dir(), &[], &[denied.hex()], None, &|| true);
         assert_eq!(
             dir.join(format!("{node}.txt")).exists(),
             kind != "private",
@@ -11858,7 +12032,7 @@ fn prune_pushed_facts_never_reads_a_fifo_key_sidecar() {
             }
         }
     });
-    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None, &|| true);
     reading.store(false, Ordering::Release);
     writer.join().unwrap();
     assert!(
@@ -12060,6 +12234,7 @@ fn serve_join_book_and_facts_enforce_denied_keys_and_proof_bindings() {
             || Ok(issuer(0x11)),
             1_760_000_000_000,
             (denied, log),
+            &|| true,
         )
         .expect("stream io")
     };
@@ -12188,6 +12363,7 @@ fn serve_join_book_and_facts_enforce_denied_keys_and_proof_bindings() {
         state.dir(),
         (&denied_old_key, Some(&log_admits_new)),
         |_| Ok(Some(new.node().to_owned())),
+        &|| true,
     )
     .unwrap();
     assert_eq!(served_facts, Ok(new.node().to_owned()));
@@ -12430,6 +12606,7 @@ fn unsigned_wire_parsers_reject_signed_numbers_and_ports() {
         state.dir(),
         (&[], None),
         |_| Ok(Some(proof.node.clone())),
+        &|| true,
     )
     .unwrap();
     assert_eq!(res.unwrap_err(), "invalid facts head");
@@ -12677,6 +12854,9 @@ mod book_fallback;
 #[path = "fleet_member_tests/heartbeat_reads.rs"]
 mod heartbeat_reads;
 
+#[path = "fleet_member_tests/quiet_writes.rs"]
+mod quiet_writes;
+
 /// Every failure names its kind as one token of [`REASONS`], and every token but the reader's
 /// own `gone` names some failure; two failures of one kind at two addresses share the token
 /// though their words differ, which is what lets a reader group by it.
@@ -12703,6 +12883,14 @@ fn reasons_typed_by_producer() {
         (connect(at, io::ErrorKind::HostUnreachable), "no-route"),
         (connect(at, io::ErrorKind::NetworkUnreachable), "no-route"),
         (connect(at, io::ErrorKind::PermissionDenied), "refused-here"),
+        (
+            Unreached::Connect(
+                at,
+                aterm_uds::lan::LanError::Unavailable(aterm_uds::lan::Unavailable::NotInstalled)
+                    .into_io(),
+            ),
+            "lan-broker",
+        ),
         (connect(at, io::ErrorKind::ConnectionReset), "reset"),
         (connect(at, io::ErrorKind::ConnectionAborted), "reset"),
         (connect(at, io::ErrorKind::AddrNotAvailable), "connect"),
@@ -12841,7 +13029,13 @@ fn header_only_pushed_facts_admission_and_batched_slice_pruning_match_full_admis
     // cached facts in a single pass, after which `all_pushed_facts_admitted` is true again.
     let slice_a = std::slice::from_ref(&p1);
     let slice_b = std::slice::from_ref(&p2);
-    prune_pushed_facts_peer_slices(state.dir(), &[slice_a, slice_b], &[], Some(&held_out));
+    prune_pushed_facts_peer_slices(
+        state.dir(),
+        &[slice_a, slice_b],
+        &[],
+        Some(&held_out),
+        &|| true,
+    );
     assert!(all_pushed_facts_admitted(
         state.dir(),
         &peers,

@@ -949,7 +949,7 @@ impl StatusRow {
             .find_map(|t| t.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
     }
 
-    /// A quoted `key="…"` value (`style="rainbow kitty"`).
+    /// A quoted `key="…"` value (`style="rainbow"`).
     #[must_use]
     pub fn quoted(&self, key: &str) -> Option<&str> {
         let needle = format!("{key}=\"");

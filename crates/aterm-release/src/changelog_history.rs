@@ -20,14 +20,14 @@ const BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Audit every reachable changelog parent edge. Peers merge main into their
 /// branch before landing, so the final first-parent spine can omit a rewrite.
 /// Raw Git diffs name the exact before/after blobs. Each distinct blob is read
-/// once, in bounded batches, and reduced to candidate-entry membership bits.
+/// once, in bounded batches, and reduced to candidate-entry copy counts.
 ///
-/// A snapshot holds an entry it carries in any section (after a recut's roll, any but
-/// the next release's Unreleased), so a removal is the entry leaving the changelog:
-/// deleted or rewritten, not moved under another heading.
+/// Count copies in every section (after a recut's roll, any but the next release's
+/// Unreleased). Moving a copy preserves its count. Rewriting one still removes a
+/// copy even when an older misplaced copy survives elsewhere in the file.
 ///
 /// A merge that adds an entry against one parent resurrects it only when its copy
-/// comes from a line that never saw the removal: a parent that holds the entry and
+/// comes from a line that never saw the removal: a parent that holds those copies and
 /// descends from the removal carries an author's later re-addition, which is the
 /// entry's current text, not a stale one.
 pub fn gate(
@@ -35,6 +35,29 @@ pub fn gate(
     commit: &str,
     text: &str,
     section: &str,
+    keys: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let mut counter = super::NoteCounter::default();
+    gate_with_keys(
+        git,
+        commit,
+        text,
+        section,
+        keys,
+        |oid, snapshot, section, candidates| counter.counts(oid, snapshot, section, candidates),
+    )
+}
+
+/// Reuse decoded immutable snapshots when auditing many candidates from one
+/// object database. Bounds are checked against the complete object listing even
+/// when an already decoded immutable blob supplies its entry counts.
+pub(crate) fn gate_with_keys(
+    git: &dyn crate::ledger::GitRunner,
+    commit: &str,
+    text: &str,
+    section: &str,
+    keys: &std::collections::BTreeSet<String>,
+    mut keys_of: impl FnMut(&str, Option<&str>, &str, &[String]) -> Option<Vec<super::NoteMembership>>,
 ) -> Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,11 +90,8 @@ pub fn gate(
             "changelog history: more than 131072 reachable commits; increase the audited bound before cutting",
         ));
     }
-    let candidates: Vec<_> = note_keys(text, section)
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let present: BTreeSet<_> = note_keys(text, section).into_iter().collect();
+    let candidates: Vec<_> = keys.intersection(&present).cloned().collect();
     if candidates.len() > HISTORY_ENTRIES {
         return Err(Error::new(
             "changelog history: more than 256 entries; increase the audited bound before cutting",
@@ -156,7 +176,11 @@ pub fn gate(
                     "changelog history: exceeds 8 MiB per snapshot or 32 GiB total; increase the audited bound before cutting",
                 ));
             }
-            objects.push((*oid, size));
+            if let Some(held) = keys_of(oid, None, section, &candidates) {
+                membership.insert(*oid, held);
+            } else {
+                objects.push((*oid, size));
+            }
         }
         let mut cursor = 0;
         while cursor < objects.len() {
@@ -192,15 +216,10 @@ pub fn gate(
                 // back is the release gate's repeated-entry refusal. A recut ships its
                 // existing version section, so after the roll Unreleased belongs to the next
                 // release and cannot witness this one's membership.
-                let skip = (section != "Unreleased" && super::has_section(snapshot, section))
-                    .then_some("Unreleased");
-                let keys = super::every_note_key(snapshot, skip);
                 membership.insert(
                     oid,
-                    candidates
-                        .iter()
-                        .map(|key| keys.contains(key))
-                        .collect::<Vec<_>>(),
+                    keys_of(oid, Some(snapshot), section, &candidates)
+                        .ok_or_else(|| Error::new("changelog history: snapshot was not decoded"))?,
                 );
                 rest = rest
                     .get(size..)
@@ -212,18 +231,22 @@ pub fn gate(
             }
         }
     }
-    let absent = vec![false; candidates.len()];
+    let absent = vec![super::NoteMembership::default(); candidates.len()];
     let held = |oid: &str| membership.get(oid).unwrap_or(&absent);
     // Each restoring merge's parents' snapshots. A parent equal to the merge has no raw
     // edge, so its blob is read by name; every such blob is one this audit already read.
     let restoring: BTreeSet<&str> = edges
         .iter()
         .filter(|(_, merge, before, after)| {
-            *merge && held(before).iter().zip(held(after)).any(|(b, a)| *a && !*b)
+            *merge
+                && held(before)
+                    .iter()
+                    .zip(held(after))
+                    .any(|(b, a)| b.active == 0 && a.active > 0)
         })
         .map(|(at, ..)| *at)
         .collect();
-    let mut holders: BTreeMap<&str, Vec<(&str, &Vec<bool>)>> = BTreeMap::new();
+    let mut holders: BTreeMap<&str, Vec<(&str, &Vec<super::NoteMembership>)>> = BTreeMap::new();
     if !restoring.is_empty() {
         let mut queried = Vec::new();
         for merge in &restoring {
@@ -294,25 +317,39 @@ pub fn gate(
     for (at, merge, before, after) in edges {
         let (before, after) = (held(before), held(after));
         for (idx, key) in candidates.iter().enumerate() {
-            if merge && after[idx] && !before[idx] {
+            if merge && before[idx].active == 0 && after[idx].active > 0 {
                 restores[idx].insert(at);
             }
-            if before[idx] && !after[idx] {
+            if before[idx].copies > after[idx].copies
+                && ((before[idx].active > 0 && after[idx].active == 0) || after[idx].copies == 0)
+            {
                 for restored in &restores[idx] {
                     if !descends(at, restored)? {
                         continue;
                     }
                     let mut reauthored = false;
                     for (parent, snapshot) in holders.get(restored).map_or(&[][..], Vec::as_slice) {
-                        if snapshot[idx] && descends(at, parent)? {
+                        if snapshot[idx].active > 0 && descends(at, parent)? {
                             reauthored = true;
                             break;
                         }
                     }
+                    // Entry identity is presence in the selected window, not
+                    // formatting multiplicity. Reducing two stale copies to
+                    // one never re-authors the surviving obsolete entry.
                     if !reauthored {
+                        if after[idx].anywhere > after[idx].copies {
+                            return Err(Error::new(format!(
+                                "{CHANGELOG_FILE}: [{section}] resurrects an entry reserved for [Unreleased] \
+                                 by {at}, copied back by merge {restored}: {key}\nfix: keep this \
+                                 unshipped change in [Unreleased] for the next release; retain \
+                                 [{section}]'s corrected notes"
+                            )));
+                        }
                         return Err(Error::new(format!(
                             "{CHANGELOG_FILE}: [{section}] resurrects an entry removed or rewritten \
-                             by {at}, restored by merge {restored}: {key} — remove the stale entry"
+                             by {at}, restored by merge {restored}: {key}\nfix: reconcile the merge \
+                             with that correction; retain the unshipped change using its current wording"
                         )));
                     }
                 }

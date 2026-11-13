@@ -136,8 +136,11 @@ fn nothing_named(sys: &Fake, git: Cmd) {
     );
 }
 
+/// `path` a finished checkout of alice's `name` at `pin`, there before the pass, its index
+/// written.
 pub(in crate::init_github) fn existing(sys: &Fake, who: &User, path: &Path, name: &str, pin: &str) {
     existing_as(sys, who, path, "alice", name, pin, NoLazyFetch::Flag);
+    repos::tests::script_index(sys, path);
 }
 
 fn existing_as(
@@ -152,15 +155,12 @@ fn existing_as(
     let git = || local(sys, who, Some(path), off);
     let ordinary = || checkout::git(sys, who, Some(path));
     sys.on(
-        &ordinary()
-            .args([
-                "rev-parse",
-                "--is-inside-work-tree",
-                "--show-prefix",
-                "--show-toplevel",
-            ])
-            .display(),
-        Ran::ok(&format!("true\n\n{}\n", path.display())),
+        &ordinary().args(repos::WORKTREE_READ).display(),
+        Ran::ok(&format!(
+            "true\n\n{}\n{}\n",
+            path.display(),
+            repos::tests::fake_index(path).display()
+        )),
     );
     sys.on(
         &ordinary()
@@ -174,6 +174,9 @@ fn existing_as(
             .display(),
         Ran::ok("false\n"),
     );
+    // A finished checkout's HEAD names a commit that is there; its index is where the checkout
+    // that wrote it put it.
+    repos::tests::script_head(sys, who, path, Ran::ok(&format!("{pin}\n")));
     sys.on(
         &super::super::repos::partial_listing(ordinary()).display(),
         Ran::exit(1, ""),
@@ -300,19 +303,24 @@ fn download_as(
         PIN,
         NoLazyFetch::Flag,
     );
-    sys.on(
-        &local(sys, who, Some(&stage), NoLazyFetch::Flag)
-            .args(checkout::NO_SIDE_RUNS)
-            .args([
-                "-c",
-                "submodule.recurse=false",
-                "checkout",
-                "--detach",
-                "--no-recurse-submodules",
-                PIN,
-            ])
-            .display(),
-        Ran::ok(""),
+    let checkout = local(sys, who, Some(&stage), NoLazyFetch::Flag)
+        .args(checkout::NO_SIDE_RUNS)
+        .args([
+            "-c",
+            "submodule.recurse=false",
+            "checkout",
+            "--detach",
+            "--no-recurse-submodules",
+            PIN,
+        ])
+        .display();
+    sys.on(&checkout, Ran::ok(""));
+    // The clone has no checkout and no index until the pin's checkout writes the one the
+    // published checkout reads.
+    sys.on_write(
+        &checkout,
+        &repos::tests::fake_index(&parent.join(path)),
+        b"DIRC",
     );
     key
 }
@@ -441,6 +449,8 @@ fn a_git_that_obeys_the_variable_alone_reads_dependencies_without_the_option() {
             b"recorded source",
         );
         existing_as(&sys, &who, &path, "alice", "library", PIN, off);
+        // A finished checkout: its index is written.
+        repos::tests::script_index(&sys, &path);
         if off == NoLazyFetch::Variable {
             sys.simulate(|sys, command| {
                 crate::init_github::git_before_no_lazy_fetch(sys, command, true)

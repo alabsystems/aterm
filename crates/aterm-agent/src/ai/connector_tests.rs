@@ -530,7 +530,7 @@ fn claude_signs_in_only_through_accounts_and_codex_only_when_signed_out() {
 }
 
 /// The vault's refused set is read off the rows: a CLI's login file under its default home
-/// (Muse Code's `~/.config/muse/.auth.json` too), the refresh aterm journals beside Codex's, and
+/// (Muse Code's `~/.config/muse/auth.json` too), the refresh aterm journals beside Codex's, and
 /// a pool row's login under its root, without case and by path components, so a `/`-spelled
 /// name meets a row's file on a host that joins it with `\` (Windows) and a doubled `/` names
 /// the same file. CONTROL: a CLI's settings beside its login, and a pool root's own path, are no
@@ -538,8 +538,8 @@ fn claude_signs_in_only_through_accounts_and_codex_only_when_signed_out() {
 #[test]
 fn a_login_file_is_where_a_connector_row_keeps_its_login() {
     for (name, product) in [
-        ("~/.config/muse/.auth.json", MUSE.product),
-        ("~/.config//muse/.auth.json", MUSE.product),
+        ("~/.config/muse/auth.json", MUSE.product),
+        ("~/.config//muse/auth.json", MUSE.product),
         ("~/.Codex/Auth.json", CODEX.product),
         ("~/.codex/auth.json.refreshed", CODEX.product),
         ("~/.kimi-code/credentials/kimi-code.json", KIMI.product),

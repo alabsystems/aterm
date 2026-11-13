@@ -26,6 +26,10 @@ aterm-codec = { workspace = true }
 # is stored (the metadata sanitizer the design names), and the `story` words
 # (`StoryVerb::TOLD_WORDS`) the `word=` vocabulary spells.
 aterm-messages = { workspace = true }
+# A request's `why=` bound (`control_verbs::REQUEST_WHY_BYTES`), the cap of the `why_text=` that
+# records it, so a line the request admitted is never cut where it is logged. Already in this
+# graph through aterm-messages.
+aterm-types = { workspace = true }
 # The fabric's nine `in` kinds (`WakeClass::ALL`) and three receipt verdicts
 # (`ReceiptVerdict::ALL`), which `vocab::MAIL_KIND_WORDS` and `WORD_WORDS`
 # spell: one list each, astream's. astream-wire has no dependencies and no

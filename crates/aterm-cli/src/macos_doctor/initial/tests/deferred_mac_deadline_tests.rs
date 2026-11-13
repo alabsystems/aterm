@@ -40,7 +40,7 @@ fn failed_follow_up(stages: &mut WithholdingStages, root: &Path, writes: usize) 
     assert_eq!(record.failed[0].tries as usize, writes / 2);
 }
 
-fn first_deferred_failure_after_dock_is_spent()
+fn first_deferred_failure_after_dock_is_paused_longer()
 -> (aterm_tempfile::TempDir, Plan, u64, WithholdingStages, u64) {
     let root = aterm_tempfile::tempdir().unwrap();
     let plan = selected(&[Setting::Widgets, Setting::Dock]);
@@ -49,12 +49,24 @@ fn first_deferred_failure_after_dock_is_spent()
         Withholding::widgets_and_a_dock_that_never_verifies().with_build(build()),
     );
     // The real host advances its clock by 61 seconds per automatic pass. The
-    // ordinary Mac deadline supplies Dock's second try after the first ten passes.
-    for _ in 0..12 {
-        let (report, next) = pass(&mut stages, root.path(), revision);
-        assert!(report.needs_attention());
-        assert_eq!(next, SetupNext::Retry);
-    }
+    // ordinary Mac deadline supplies Dock's second try after the first ten passes,
+    // and its third only twenty minutes after that ([`RETRY`]).
+    // A pass whose try failed leaves a retry; one that puts the Dock off parks on its deadline.
+    let nexts: Vec<SetupNext> = (0..12)
+        .map(|_| {
+            let (report, next) = pass(&mut stages, root.path(), revision);
+            assert!(!report.complete());
+            next
+        })
+        .collect();
+    let tried = |pass| {
+        if pass == 0 || pass == 10 {
+            SetupNext::Retry
+        } else {
+            SetupNext::Park
+        }
+    };
+    assert_eq!(nexts, (0..12).map(tried).collect::<Vec<_>>());
     assert_eq!(stages.doctor.notification_center_writes(), 0);
     let automatic = Automatic::load(root.path(), revision).unwrap();
     assert_eq!(automatic.failed.len(), 1);
@@ -69,10 +81,14 @@ fn first_deferred_failure_after_dock_is_spent()
     failed_follow_up(&mut stages, root.path(), 2);
     let first = load_withheld(root.path()).unwrap().failed[0].at;
     // An ordinary worker pass now honors that deferred pause. It cannot copy an
-    // attempt it never made into Automatic.failed, and its Dock failure is spent.
+    // attempt it never made into Automatic.failed, and its Dock waits out its longer pause.
     let (report, next) = pass(&mut stages, root.path(), revision);
-    assert!(report.needs_attention());
-    assert_eq!(next, SetupNext::Retry);
+    assert!(!report.complete());
+    assert_eq!(
+        next,
+        SetupNext::Park,
+        "both put off: the run parks on their deadlines"
+    );
     assert_eq!(stages.doctor.notification_center_writes(), 2);
     let automatic = Automatic::load(root.path(), revision).unwrap();
     assert_eq!(automatic.failed.len(), 1);
@@ -153,9 +169,10 @@ fn assert_ineligible_debt_does_not_wake(root: &Path, plan: &Plan, due: u64) {
 }
 
 #[test]
-fn deferred_mac_deadline_wakes_a_workstation_whose_other_attempts_are_spent() {
-    let (root, plan, revision, mut stages, first) = first_deferred_failure_after_dock_is_spent();
-    let due = first + SECOND_TRY_AFTER.as_secs();
+fn deferred_mac_deadline_wakes_a_workstation_whose_other_attempts_wait_longer() {
+    let (root, plan, revision, mut stages, first) =
+        first_deferred_failure_after_dock_is_paused_longer();
+    let due = first + RETRY.after(1).as_secs();
     let before = park(root.path(), due - 1);
     let ready = park(root.path(), due);
     assert_eq!(before.mac_settings_retry_due(), None);
@@ -166,17 +183,22 @@ fn deferred_mac_deadline_wakes_a_workstation_whose_other_attempts_are_spent() {
     );
     assert_ineligible_debt_does_not_wake(root.path(), &plan, due);
 
-    // The same recorded follow-up really is eligible after ten minutes. These
-    // actual effects run before the final missing-wake assertion on old source.
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    // The same recorded follow-up really is eligible after ten minutes, and its third try
+    // twenty minutes after its second. These actual effects run before the final
+    // missing-wake assertion on old source.
+    stages.doctor.wait(RETRY.after(1));
     failed_follow_up(&mut stages, root.path(), 4);
-    assert_eq!(park(root.path(), due + 60).mac_settings_retry_due(), None);
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    let second = load_withheld(root.path()).unwrap().failed[0].at;
+    assert_eq!(
+        park(root.path(), second + 60).mac_settings_retry_due(),
+        None
+    );
+    stages.doctor.wait(RETRY.after(1));
     stages.doctor.follow_up(root.path()).unwrap().unwrap();
     assert_eq!(
         stages.doctor.notification_center_writes(),
         4,
-        "no third try"
+        "the third try waits out its longer pause"
     );
     assert_eq!(revision_at(root.path()).unwrap(), revision);
     assert_eq!(
@@ -221,18 +243,18 @@ fn deferred_mac_deadline_uses_follow_up_scope_after_a_real_input_only_choice() {
     stages.doctor.grant();
     stages.doctor.notification_center_never_keeps();
     failed_follow_up(&mut stages, root.path(), 2);
-    let due = load_withheld(root.path()).unwrap().failed[0].at + SECOND_TRY_AFTER.as_secs();
+    let due = load_withheld(root.path()).unwrap().failed[0].at + RETRY.after(1).as_secs();
     let ready = park(root.path(), due);
 
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    stages.doctor.wait(RETRY.after(1));
     failed_follow_up(&mut stages, root.path(), 4);
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), None);
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    stages.doctor.wait(RETRY.after(1));
     stages.doctor.follow_up(root.path()).unwrap().unwrap();
     assert_eq!(
         stages.doctor.notification_center_writes(),
         4,
-        "no third try"
+        "the third try waits out its longer pause"
     );
     assert_eq!(progress(root.path()).unwrap().unwrap(), pending);
     assert_eq!(
@@ -258,8 +280,8 @@ fn unreadable_record<T>(root: &Path, name: &str, read: impl FnOnce() -> T) -> T 
 
 #[test]
 fn deferred_mac_deadline_known_debt_survives_an_unreadable_automatic_cache() {
-    let (root, _, revision, stages, first) = first_deferred_failure_after_dock_is_spent();
-    let due = first + SECOND_TRY_AFTER.as_secs();
+    let (root, _, revision, stages, first) = first_deferred_failure_after_dock_is_paused_longer();
+    let due = first + RETRY.after(1).as_secs();
     let pending = progress(root.path()).unwrap().unwrap();
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), Some(due));
 
@@ -277,7 +299,7 @@ fn deferred_mac_deadline_known_debt_survives_an_unreadable_automatic_cache() {
         assert_eq!(
             park(root.path(), due).mac_settings_retry_due(),
             None,
-            "the known ordinary record is spent; an unknown deferred record proves no due try"
+            "the known ordinary record's next try is later; an unknown deferred record proves no due try"
         );
     });
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), Some(due));
@@ -302,7 +324,7 @@ fn deferred_mac_deadline_known_ordinary_try_survives_an_unreadable_debt_record()
     assert_eq!(automatic.failed[0].tries, 1);
     assert!(load_withheld(root.path()).unwrap().failed.is_empty());
     let pending = progress(root.path()).unwrap().unwrap();
-    let due = automatic.failed[0].at + SECOND_TRY_AFTER.as_secs();
+    let due = automatic.failed[0].at + RETRY.after(1).as_secs();
     assert_eq!(park(root.path(), due - 1).mac_settings_retry_due(), None);
 
     unreadable_record(root.path(), WITHHELD_RECORD, || {

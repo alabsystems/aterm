@@ -560,8 +560,8 @@ pub enum Actor {
     Vendor,
     /// A session, by its sid (an edge-token connection).
     Sid(ShortId),
-    /// Another Mac driving this one over the fleet: `fleet:<host>`, the whole token held
-    /// ([`Actor::fleet`]).
+    /// Another Mac driving this one over the fleet: `fleet:<head>:<sid>`, the whole token held
+    /// ([`Actor::fleet_drive`]).
     Fleet(ShortId),
     /// Not attributable: `-`.
     Nobody,
@@ -569,6 +569,9 @@ pub enum Actor {
 
 /// The prefix of a fleet driver's actor token ([`Actor::Fleet`]).
 pub const FLEET_ACTOR_PREFIX: &str = "fleet:";
+
+/// The characters of a driving node's id a fleet driver's actor token keeps ([`Actor::fleet_drive`]).
+pub const FLEET_NODE_HEAD: usize = 8;
 
 impl Actor {
     /// Wire token for this actor.
@@ -597,15 +600,18 @@ impl Actor {
         }
     }
 
-    /// The fleet driver `host` (another Mac as this one's fleet book names it): `fleet:<host>`,
-    /// each byte outside the id alphabet as `-` and the host cut to fit [`ShortId::MAX`];
-    /// [`Actor::Nobody`] for a host with nothing left.
+    /// The session `sid` of node `node` driving this Mac over the fleet, as every record of a
+    /// drive names it: `fleet:<head>:<sid>`, `<head>` the node id's first [`FLEET_NODE_HEAD`]
+    /// characters (each outside the id alphabet as `-`) and `<sid>` `-` where the drive names no
+    /// session aterm minted ([`aterm_types::control_verbs::is_minted_sid`]), so a whole sid always
+    /// fits [`ShortId::MAX`]; [`Actor::Nobody`] for a node with nothing to name. The sid is the
+    /// driving Mac's claim, scoped by the node its handshake proved.
     #[must_use]
-    pub fn fleet(host: &str) -> Actor {
-        let room = ShortId::MAX - FLEET_ACTOR_PREFIX.len();
-        let host: String = host
+    pub fn fleet_drive(node: &str, sid: Option<&str>) -> Actor {
+        let head: String = node
             .trim()
             .chars()
+            .take(FLEET_NODE_HEAD)
             .map(|c| {
                 if c.is_ascii() && is_id_byte(c as u8) {
                     c
@@ -613,12 +619,15 @@ impl Actor {
                     '-'
                 }
             })
-            .take(room)
             .collect();
-        if host.is_empty() {
+        if head.is_empty() {
             return Actor::Nobody;
         }
-        ShortId::new(&format!("{FLEET_ACTOR_PREFIX}{host}")).map_or(Actor::Nobody, Actor::Fleet)
+        let sid = sid
+            .filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))
+            .unwrap_or("-");
+        ShortId::new(&format!("{FLEET_ACTOR_PREFIX}{head}:{sid}"))
+            .map_or(Actor::Nobody, Actor::Fleet)
     }
 
     /// Parse an [`Actor`] from its wire token.

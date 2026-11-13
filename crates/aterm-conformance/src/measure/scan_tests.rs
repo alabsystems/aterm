@@ -263,8 +263,8 @@ fn status_tokens_are_exact() {
     assert_eq!(row.uint("ribbon_hue_bands"), Ok(7));
     assert_eq!(row.bool("pet_active"), Ok(true));
     assert_eq!(row.bool("cat_active"), Ok(false));
-    let styled = StatusRow::new(r#"trail style="rainbow kitty" resolved=rainbow-kitty"#);
-    assert_eq!(styled.quoted("style"), Some("rainbow kitty"));
+    let styled = StatusRow::new(r#"trail style="rainbow" resolved=rainbow-kitty"#);
+    assert_eq!(styled.quoted("style"), Some("rainbow"));
     assert_eq!(styled.value("resolved"), Some("rainbow-kitty"));
 }
 

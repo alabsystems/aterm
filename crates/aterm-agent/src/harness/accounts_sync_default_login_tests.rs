@@ -77,6 +77,7 @@ impl Bed {
             codex_thread: None,
             agy_conversation: None,
             codex_home: None,
+            xdg_config_home: None,
             codex_login: None,
             now: NOW,
             tz_s: 0,
@@ -125,13 +126,18 @@ impl Bed {
 
     /// The default Codex login signed in as `address`.
     fn login(&self, address: &str) {
+        self.login_at(&self.env.home.as_deref().unwrap().join(".codex"), address);
+    }
+
+    /// A Codex login directory signed in as `address`.
+    fn login_at(&self, dir: &Path, address: &str) {
         let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
             Some(address),
             "plus",
             NOW + 3600,
         );
         fs::write(
-            self.env.home.as_deref().unwrap().join(".codex/auth.json"),
+            dir.join("auth.json"),
             aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
         )
         .unwrap();
@@ -567,12 +573,13 @@ fn a_weekly_limit_does_not_move_a_session_between_one_accounts_two_rows() {
     };
     let enrolled: BTreeSet<String> = ["main", "twin"].map(str::to_owned).into();
     let state = accounts::State::default();
+    let home = aterm_tempfile::TempDir::new().unwrap();
     let target = |from: &Row, login: Option<&str>| {
         crate::harness::accounts_pool::native_quota_target(
             (Cli::Codex, accounts::Mode::Early),
             (&roster, &state, &enrolled),
             from,
-            login,
+            (login, home.path()),
             NOW,
         )
     };
@@ -587,6 +594,52 @@ fn a_weekly_limit_does_not_move_a_session_between_one_accounts_two_rows() {
         accounts::default_login_twin(&roster, Some("x@example.com")).is_none(),
         "CONTROL"
     );
+}
+
+/// A LOGIN THAT NAMES ANOTHER ACCOUNT NEVER FORECASTS A HANDOFF: the source's contradiction holds
+/// the session, and a candidate's contradiction passes it over. CONTROL: once both login files
+/// name their rows, the forecast selects the candidate. The execution-time handoff checks the same
+/// fact separately before a provider read.
+#[test]
+fn a_native_quota_forecast_refuses_each_login_naming_another_account() {
+    let bed = Bed::new();
+    let next_dir = PathBuf::from(bed.dir(Cli::Codex, "next", false));
+    let main = Row {
+        label: "main".into(),
+        email: Some(email("ann")),
+        ..Row::default()
+    };
+    let next = Row {
+        label: "next".into(),
+        dir: Some(next_dir.to_str().unwrap().to_owned()),
+        email: Some(email("zed")),
+        ..Row::default()
+    };
+    let roster = Roster {
+        rows: vec![main.clone(), next],
+    };
+    let enrolled: BTreeSet<String> = ["main", "next"].map(str::to_owned).into();
+    let state = accounts::State::default();
+    let target = || {
+        crate::harness::accounts_pool::native_quota_target(
+            (Cli::Codex, accounts::Mode::Early),
+            (&roster, &state, &enrolled),
+            &main,
+            (Some(&email("ann")), bed.env.home.as_deref().unwrap()),
+            NOW,
+        )
+    };
+
+    bed.login(&email("else"));
+    bed.login_at(&next_dir, &email("zed"));
+    assert_eq!(target(), None, "a mismatching source holds its session");
+
+    bed.login(&email("ann"));
+    bed.login_at(&next_dir, &email("else"));
+    assert_eq!(target(), None, "a mismatching candidate is passed over");
+
+    bed.login_at(&next_dir, &email("zed"));
+    assert_eq!(target(), Some("next".to_owned()), "CONTROL");
 }
 
 /// One thing [`merge_default_twin`] keeps a twin of the default row for, each on a world that folds
@@ -1156,9 +1209,10 @@ fn a_sync_says_a_default_login_no_row_holds() {
         "{words}"
     );
     assert!(
-        words.contains("`aterm harness accounts login main --cli codex`"),
+        words.contains("`aterm harness accounts renew main --cli codex`"),
         "{words}"
     );
+    assert!(!words.contains("accounts login main"), "{words}");
     assert_eq!(bed.rows(cli)[0].email, Some(main.clone()));
 
     bed.login(&main);
@@ -1185,34 +1239,37 @@ fn a_sync_says_a_default_login_no_row_holds() {
 #[test]
 fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
     let cli = Cli::Codex;
-    let bed = Bed::new();
-    let (main, work) = (email("main"), email("work"));
-    let foreign = bed.store(cli).login_dir("main").unwrap();
-    fs::create_dir_all(&foreign).unwrap();
-    fs::write(foreign.join("auth.json"), "{}").unwrap();
-    bed.seed(
-        cli,
-        &[
-            Row {
-                label: "main".into(),
-                email: Some(main.clone()),
-                held_by: Some("m3".into()),
-                ..Row::default()
-            },
-            Row {
-                label: "work".into(),
-                dir: Some(bed.dir(cli, "work", false)),
-                email: Some(work.clone()),
-                ..Row::default()
-            },
-        ],
-    );
-    bed.login(&work);
-    let lab = lab(vec![
-        lab_account(cli, "main", "main", true),
-        lab_account(cli, "work", "work", true),
-    ]);
-    let run = |json: bool| {
+    let setup = || {
+        let bed = Bed::new();
+        let (main, work) = (email("main"), email("work"));
+        let foreign = bed.store(cli).login_dir("main").unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("auth.json"), "{}").unwrap();
+        bed.seed(
+            cli,
+            &[
+                Row {
+                    label: "main".into(),
+                    email: Some(main),
+                    held_by: Some("m3".into()),
+                    ..Row::default()
+                },
+                Row {
+                    label: "work".into(),
+                    dir: Some(bed.dir(cli, "work", false)),
+                    email: Some(work.clone()),
+                    ..Row::default()
+                },
+            ],
+        );
+        bed.login(&work);
+        let lab = lab(vec![
+            lab_account(cli, "main", "main", true),
+            lab_account(cli, "work", "work", true),
+        ]);
+        (bed, foreign, lab)
+    };
+    let run = |bed: &Bed, lab: &Lab, json: bool| {
         let fetch =
             |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1231,7 +1288,9 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
             String::from_utf8(err).unwrap(),
         )
     };
-    let (code, out, err) = run(false);
+
+    let (bed, foreign, lab) = setup();
+    let (code, out, err) = run(&bed, &lab, false);
     assert_eq!(code, ExitCode::FAILURE, "{out}{err}");
     assert!(out.contains("hold cleared: `main`"), "{out}");
     assert!(err.contains("holds a login that names no address"), "{err}");
@@ -1240,9 +1299,10 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
         "{err}"
     );
     assert!(
-        err.contains("`aterm harness accounts login main --cli codex`"),
+        err.contains("`aterm harness accounts renew main --cli codex`"),
         "{err}"
     );
+    assert!(!err.contains("accounts login main"), "{err}");
     assert!(!err.contains("metadata is unchanged"), "{err}");
     let main_row = |rows: &[Row]| {
         rows.iter()
@@ -1257,14 +1317,37 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
     );
     assert_eq!(main_row(&bed.rows(cli)).dir, None, "no row moved");
 
-    let (code, out, _) = run(true);
-    assert_eq!(code, ExitCode::FAILURE);
+    let (json_bed, json_foreign, json_lab) = setup();
+    let (code, out, err) = run(&json_bed, &json_lab, true);
+    assert_eq!(code, ExitCode::FAILURE, "{out}{err}");
     let doc: Value = aterm_json::from_str(out.trim()).unwrap();
-    assert!(doc["default_login_refused"].as_str().is_some(), "{doc}");
-    assert_eq!(doc["default_login_moved_off"]["row"], Value::from("main"));
+    assert_eq!(
+        doc["holds_changed"],
+        aterm_json::json!([{"label": "main", "was": "m3", "now": null}]),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["default_login_refused"],
+        Value::from(format!(
+            "`main`'s managed directory {} holds a login that names no address aterm can read: \
+             move that directory away and sync again; no row moved",
+            json_foreign.display()
+        )),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["default_login_moved_off"],
+        aterm_json::json!({"row": "main", "email": "main@example.com"}),
+        "{doc}"
+    );
+    assert_eq!(
+        main_row(&json_bed.rows(cli)).held_by,
+        None,
+        "as the JSON receipt says"
+    );
 
     fs::rename(&foreign, foreign.with_extension("away")).unwrap();
-    let (code, out, err) = run(false);
+    let (code, out, err) = run(&bed, &lab, false);
     assert_eq!(code, ExitCode::SUCCESS, "CONTROL: {out}{err}");
     assert!(out.contains("on this machine's own login: work"), "{out}");
     let rows = bed.rows(cli);

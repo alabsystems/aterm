@@ -2548,9 +2548,10 @@ fn q_face(ch: usize, free: usize) -> std::sync::Arc<aterm_render::GlyphInk> {
 /// cell's bottom:
 /// - over a blank row below, the rail lies under the whole cell past the judge's ring, and nothing
 ///   of it is left on the band's last row;
-/// - over a letter that stands at the top of its cell, there is no such room: it lies on the one
-///   pixel row the `q` leaves, under the whole cell (at the page's own luminance where the bed
-///   under a letter is, on Solarized Dark and in Sparkle), and a letter reads there at its bar;
+/// - over a letter that stands at the top of its cell, there is no such room: it keeps to its own
+///   band over that letter's ring, the band's first pixel row, in the light the `q` leaves there
+///   (the page's own luminance where the bed under a letter is, on Solarized Dark and in
+///   Sparkle), and a letter reads there at its bar;
 /// - with a `q` that also reaches its cell's bottom it lies on the same row and the `q` is drawn
 ///   over it (the real face's `g` and `y` at 22 px, every descender at 14 px), and with no face
 ///   named it keeps off the cell, as [`a_tail_with_no_air_below_lies_in_its_own_row`] pins it;
@@ -2612,30 +2613,37 @@ fn a_rail_runs_on_past_a_foot_where_the_row_leaves_a_lane() {
             blank.under_q_last
         );
         // Over a letter standing at its cell's top, and over a `q` that reaches its cell's bottom
-        // too: the thread, at the letter's bar.
+        // too: the band's first pixel row, over the letter's ring, at the q's bar.
+        let foot = (crate::rainbow_kitty::ribbon::ROW_RAIL_CH * ch as f32) as usize;
         for free in [1, 0] {
-            let thread = lay(free, 'M');
+            let kept = lay(free, 'M');
             // Solarized Dark's letters take no light, nor does Sparkle's bed ([`BedShape::dim`]
-            // 0): there the thread is at the page's own luminance.
+            // 0): there the band is at the page's own luminance.
             if page != SOLARIZED.0 && style != GlowStyle::Sparkle {
                 assert!(
-                    thread.under_q_last.0 >= cw - 2,
-                    "{style:?} on {page:06x}: with {free} px free the thread under the q lights \
+                    kept.under_q.0 >= cw - 2,
+                    "{style:?} on {page:06x}: with {free} px free the band under the q lights \
                      {:?} of its cell's {cw} px",
-                    thread.under_q_last
+                    kept.under_q
                 );
             }
+            assert_eq!(
+                kept.under_q_last.0, 0,
+                "{style:?} on {page:06x}: with {free} px free the band lies in the M's ring ({:?})",
+                kept.under_q_last
+            );
             let own = crate::color_math::contrast_ratio(ink, page);
             let bar = (0.97 * own).min(4.5);
-            let row = (bottom - 1) * thread.glass.w;
-            for x in cell.clone() {
-                let px = thread.glass.px[row + x];
-                let read = crate::color_math::contrast_ratio(ink, px);
-                assert!(
-                    read >= bar - 0.02,
-                    "{style:?} on {page:06x}: with {free} px free the thread reads {read:.2} \
-                     under the q at x{x}, its bar {bar:.2}"
-                );
+            for y in bottom - foot..bottom {
+                for x in cell.clone() {
+                    let px = kept.glass.px[y * kept.glass.w + x];
+                    let read = crate::color_math::contrast_ratio(ink, px);
+                    assert!(
+                        read >= bar - 0.02,
+                        "{style:?} on {page:06x}: with {free} px free the band reads {read:.2} \
+                         under the q at x{x} y{y}, its bar {bar:.2}"
+                    );
+                }
             }
         }
     }
@@ -2655,11 +2663,12 @@ fn a_rail_runs_on_past_a_foot_where_the_row_leaves_a_lane() {
     );
 }
 
-/// A chosen colour keeps its own chroma on the thread past a foot, as it does in the bed under a
-/// letter ([`crate::cursor_glow::bed::BedShape::under_sat_for`]): floored to Beam's saturation of
-/// 0.85, the pin `#d03a8c`, 0.72, read more vivid there than the colour the user chose.
+/// A chosen colour keeps its own chroma on a rail past a foot with no lane, as it does in the bed
+/// under a letter ([`crate::cursor_glow::bed::BedShape::under_sat_for`]): floored to Beam's
+/// saturation of 0.85, the pin `#d03a8c`, 0.72, read more vivid there than the colour the user
+/// chose.
 #[test]
-fn a_pinned_colour_keeps_its_chroma_on_the_thread_past_a_foot() {
+fn a_pinned_colour_keeps_its_chroma_on_the_rail_past_a_foot() {
     use crate::cursor_glow::bed::{BedShape, FootInk, RowFeet, part_round_feet};
     const PIN: u32 = 0x00D0_3A8C;
     let thread = |shape: BedShape| {
@@ -2668,7 +2677,8 @@ fn a_pinned_colour_keeps_its_chroma_on_the_thread_past_a_foot() {
             x1: 113,
             y0: 0,
             end: 25,
-            below: 26,
+            below: 52,
+            ink: (100, 113),
             light: crate::cursor_glow::dark_bed_budget(FG),
         }];
         let vertex = |x: f32| aterm_render::RibbonVertex {
@@ -2692,8 +2702,10 @@ fn a_pinned_colour_keeps_its_chroma_on_the_thread_past_a_foot() {
                 ink: &ink,
                 y0: 0,
                 end: 26.0,
+                floor: 26.0,
                 band: 3.0,
                 letter_light: Some((BG, shape)),
+                threaded: false,
             }),
             23.0,
             (5.0, 3.0, 2.0),
@@ -2701,8 +2713,8 @@ fn a_pinned_colour_keeps_its_chroma_on_the_thread_past_a_foot() {
         let under = verts[verts.len() / 2];
         assert_eq!(
             (under.spine, under.dn),
-            (25.0, 1.0),
-            "the thread lies on the row's last pixel"
+            (23.0, 3.0),
+            "the rail keeps its band"
         );
         crate::color_math::rgb2hsv(under.color).1
     };
@@ -2718,6 +2730,104 @@ fn a_pinned_colour_keeps_its_chroma_on_the_thread_past_a_foot() {
         floored > own + 0.08,
         "control: an unpinned stop is floored to the bed's saturation ({floored:.3}, the pin's \
          {own:.3})"
+    );
+}
+
+/// THE FORWARD ROUND'S W9, A RAIL WITH NO LANE KEEPS ITS BAND, DIMMED ONLY AT THE INK. On a
+/// grid's last row a rail has no row to dip into past a descender. Laid as a thread on the row's
+/// last pixel, in its letter's light, round the foot's whole cell and a clearance either side, it
+/// read at 1x as a gap of two cells at each descender in the window (`beam-dark-rail-g.last-g`: a
+/// dash under `do`, a gap under `g`). With a `q` whose stem stands in three of its cell's thirteen
+/// columns: the rail keeps its band at every sample, keeps its own light wherever it is more than
+/// the clearance and the ease from the stem, and within the clearance of the stem lies in the
+/// light the letter leaves.
+#[test]
+fn a_rail_with_no_lane_keeps_its_band_dimmed_only_at_the_ink() {
+    use crate::cursor_glow::bed::{BedShape, FootInk, RowFeet, part_round_feet};
+    const RAIL: u32 = 0x0007_74A6;
+    const STEM: (i32, i32) = (105, 108);
+    const CLEAR: f32 = 5.0;
+    const EASE: f32 = 3.0;
+    let light = crate::cursor_glow::dark_bed_budget(FG) * 0.5;
+    let beam = BedShape::of(GlowStyle::Beam, 1.0).expect("Beam lays a bed");
+    let lay = |ink: (i32, i32), threaded: bool| {
+        let feet = [FootInk {
+            x0: 100,
+            x1: 113,
+            y0: 0,
+            end: 26,
+            below: 52,
+            ink,
+            light,
+        }];
+        let vertex = |x: f32| aterm_render::RibbonVertex {
+            x,
+            spine: 23.0,
+            up: 0.0,
+            dn: 3.0,
+            core_up: 0.0,
+            core_dn: 3.0,
+            color: RAIL,
+            cov: 200.0,
+            lift: 0.0,
+            lift_span: 0.0,
+        };
+        let mut verts = vec![vertex(60.0), vertex(160.0)];
+        part_round_feet(
+            &mut verts,
+            &mut Vec::new(),
+            &[(100, 113, 0, 26)],
+            Some(RowFeet {
+                ink: &feet,
+                y0: 0,
+                end: 26.0,
+                floor: 26.0,
+                band: 3.0,
+                letter_light: Some((BG, beam)),
+                threaded,
+            }),
+            23.0,
+            (CLEAR, EASE, 2.0),
+        );
+        verts
+    };
+    let off = |x: f32| (STEM.0 as f32 - x).max(x - STEM.1 as f32);
+    let verts = lay(STEM, false);
+    assert!(verts.len() > 40, "fixture: {} samples", verts.len());
+    for v in &verts {
+        assert_eq!(
+            (v.spine, v.dn, v.core_dn),
+            (23.0, 3.0, 3.0),
+            "at x{} the rail leaves its band",
+            v.x
+        );
+        let off = off(v.x);
+        if off > CLEAR + EASE {
+            assert_eq!(
+                v.color, RAIL,
+                "at x{}, {off} px off the stem, the rail is dimmed to #{:06x}",
+                v.x, v.color
+            );
+        } else if off <= CLEAR {
+            let l = crate::color_math::relative_luminance(v.color);
+            assert!(
+                l <= light + 0.002,
+                "at x{}, {off} px off the stem, the rail reads {l:.4} past the letter's {light:.4}",
+                v.x
+            );
+        }
+    }
+    let thread = lay(STEM, true);
+    assert!(
+        thread.iter().any(|v| (v.spine, v.dn) == (25.0, 1.0)),
+        "control: laid as a thread on the row's last pixel, the rail keeps its band past the stem"
+    );
+    let cell = lay((100, 113), false);
+    assert!(
+        cell.iter()
+            .any(|v| off(v.x) > CLEAR + EASE && v.color != RAIL),
+        "control: dimmed round the foot's whole cell, the rail keeps its own light past the stem's \
+         clearance"
     );
 }
 

@@ -622,6 +622,7 @@ fn an_unsigned_journal_names_the_bytes_it_will_sign() {
         release_id: None,
         release_intent: false,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: vec!["lock".to_string()],
     };
     j.save(&path).unwrap_err();

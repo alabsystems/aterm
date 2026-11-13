@@ -219,7 +219,7 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` asks the same question and runs the same document-durability barrier as ⌘Q.
+    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, logout/restart/shutdown and System Settings' Quit & Reopen. aterm hands the quit to the event loop (`menu::ask_native_terminate`, `menu::offer_terminate`), where `App` asks a person's quit the same question as ⌘Q, asks none of a quit the system or Quit & Reopen asked for (`system_quit::explicit`), and runs the same document-durability barrier for each. AppKit's synchronous `applicationShouldTerminate:` hears `NSTerminateLater` for the system's and Quit & Reopen's quit, then NO when it is cancelled and YES from the loop's exit once the run's end is done (`run_end`), so a logout or restart goes on only after it; it hears `NSTerminateCancel` for a person's quit, which waits on their answer, so AppKit never waits on a person and a logout sent meanwhile still reaches aterm. Asked from inside aterm's own alert or panel, where no reply could come from AppKit's wait, a Quit & Reopen is taken up with AppKit's ask cancelled and a logout is refused.
     fn install_quit_confirm(&self);
 
     /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
@@ -571,7 +571,17 @@ impl AppRt for AppRtMacOS {
         proxy: &EventLoopProxy<Wake>,
         glance: &crate::status_item::Glance,
     ) -> Option<crate::status_item::StatusItemHandle> {
-        crate::status_item::install(proxy, glance)
+        let mut handle = crate::status_item::install(proxy, glance)?;
+        // `aterm fleet access` and another window's lock post this once the stored level
+        // changed: the App reads the file again.
+        let wake = proxy.clone();
+        handle.keep_access_watch(aterm_macos_ui::darwin_notify::Observer::register(
+            aterm_agent::fleet_access::CHANGED,
+            move || {
+                let _ = wake.send_event(Wake::FleetAccessChanged);
+            },
+        ));
+        Some(handle)
     }
 
     fn open_url(&self, url: &str) -> bool {
@@ -863,21 +873,8 @@ pub(crate) const fn option_composes(option_is_alt: bool) -> bool {
 }
 
 #[cfg(test)]
-mod option_as_alt_tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_alt_window_is_both_option_keys_and_a_composing_one_neither() {
-        use aterm_window::platform::macos::OptionAsAlt;
-        assert_eq!(super::option_as_alt_for(true), OptionAsAlt::Both);
-        assert_eq!(super::option_as_alt_for(false), OptionAsAlt::None);
-    }
-
-    #[test]
-    fn only_a_macos_option_that_is_no_alt_composes() {
-        assert!(!super::option_composes(true));
-        assert_eq!(super::option_composes(false), cfg!(target_os = "macos"));
-    }
-}
+#[path = "platform_option_as_alt_tests.rs"]
+mod option_as_alt_tests;
 
 /// How long the NSEvent currently being dispatched sat in the NSApp queue before this code ran, in nanoseconds.
 #[cfg(target_os = "macos")]
@@ -1407,35 +1404,8 @@ fn user_input_age_is_recent(age_seconds: f64, within_seconds: f64) -> bool {
 }
 
 #[cfg(test)]
-mod user_input_probe_tests {
-    use super::user_input_age_is_recent;
-
-    #[test]
-    fn input_age_reducer_is_boundary_exact_and_fail_closed() {
-        assert!(user_input_age_is_recent(0.0, 0.5));
-        assert!(user_input_age_is_recent(0.5, 0.5));
-        assert!(!user_input_age_is_recent(0.500_001, 0.5));
-        assert!(user_input_age_is_recent(f64::NAN, 0.5));
-        assert!(user_input_age_is_recent(-0.001, 0.5));
-        assert!(!user_input_age_is_recent(f64::INFINITY, 0.5));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn hid_idle_input_probe_is_callable_off_the_appkit_main_thread() {
-        let first = super::hid_idle::seconds_since_last_input();
-        let _ = super::recent_user_input_event(std::time::Duration::from_millis(500));
-        let second = super::hid_idle::seconds_since_last_input();
-        assert_eq!(
-            first.is_some(),
-            second.is_some(),
-            "the cached handles answer consistently"
-        );
-        if let (Some(a), Some(b)) = (first, second) {
-            assert!(a >= 0.0 && b >= 0.0, "idle ages are non-negative: {a} {b}");
-        }
-    }
-}
+#[path = "platform_user_input_probe_tests.rs"]
+mod user_input_probe_tests;
 
 /// The X11 twin of the macOS queue age.
 #[cfg(target_os = "linux")]
@@ -1491,159 +1461,12 @@ fn x_server_event_age_ns(server_ms: u32, now_ns: u64, max_age_ms: u32) -> Option
 }
 
 #[cfg(test)]
-mod x_server_event_age_tests {
-    use std::ffi::OsStr;
-
-    use super::{x_event_max_age_ms, x_server_event_age_ns};
-
-    const MS: u64 = 1_000_000;
-    const LOCAL: u32 = 60_000;
-    const FOREIGN: u32 = 2_000;
-
-    #[test]
-    fn age_is_now_minus_the_stamp_with_the_sub_millisecond_remainder_kept() {
-        assert_eq!(
-            x_server_event_age_ns(1_000, 1_004 * MS + MS / 4, LOCAL),
-            Some(4 * MS + MS / 4)
-        );
-        assert_eq!(
-            x_server_event_age_ns(1_000, 1_000 * MS + 600_000, LOCAL),
-            Some(600_000)
-        );
-    }
-
-    #[test]
-    fn the_32_bit_server_clock_wraps_about_every_49_days() {
-        let now_ns = ((1_u64 << 32) + 3) * MS;
-        assert_eq!(
-            x_server_event_age_ns(u32::MAX - 1, now_ns, LOCAL),
-            Some(5 * MS)
-        );
-        assert_eq!(
-            x_server_event_age_ns(u32::MAX - 2_699, now_ns, LOCAL),
-            Some(2_703 * MS)
-        );
-    }
-
-    #[test]
-    fn a_stamp_just_in_the_future_is_granularity_and_reads_as_no_queueing() {
-        assert_eq!(x_server_event_age_ns(1_002, 1_000 * MS, LOCAL), Some(0));
-        assert_eq!(x_server_event_age_ns(1_003, 1_000 * MS, LOCAL), None);
-    }
-
-    #[test]
-    fn a_local_server_prices_a_multi_second_park() {
-        let now_ns = 100_000 * MS;
-        assert_eq!(
-            x_server_event_age_ns(100_000 - 2_722, now_ns, LOCAL),
-            Some(2_722 * MS)
-        );
-        assert_eq!(
-            x_server_event_age_ns(100_000 - 60_000, now_ns, LOCAL),
-            Some(60_000 * MS)
-        );
-        assert_eq!(x_server_event_age_ns(100_000 - 60_001, now_ns, LOCAL), None);
-        assert_eq!(
-            x_server_event_age_ns(100_000 - 2_722, now_ns, FOREIGN),
-            None
-        );
-    }
-
-    #[test]
-    fn a_foreign_server_keeps_the_two_second_window() {
-        assert_eq!(x_server_event_age_ns(1_000, 3_001 * MS, FOREIGN), None);
-        assert_eq!(
-            x_server_event_age_ns(1_000, 3_000 * MS, FOREIGN),
-            Some(2_000 * MS)
-        );
-        assert_eq!(x_server_event_age_ns(500_000, 1_000 * MS, FOREIGN), None);
-        assert_eq!(x_server_event_age_ns(500_000, 1_000 * MS, LOCAL), None);
-    }
-
-    #[test]
-    fn current_time_is_not_a_stamp() {
-        assert_eq!(x_server_event_age_ns(0, 30_000 * MS, LOCAL), None);
-        assert_eq!(
-            x_server_event_age_ns(1, 30_000 * MS, LOCAL),
-            Some(29_999 * MS)
-        );
-    }
-
-    #[test]
-    fn the_cap_follows_the_display_the_process_connects_to() {
-        for local in [":0", ":1", ":1.0", "unix:0", "/tmp/.X11-unix/X1"] {
-            assert_eq!(
-                x_event_max_age_ms(Some(OsStr::new(local))),
-                LOCAL,
-                "{local}"
-            );
-        }
-        for foreign in ["localhost:10.0", "host.example:0", "10.0.0.2:0", ""] {
-            assert_eq!(
-                x_event_max_age_ms(Some(OsStr::new(foreign))),
-                FOREIGN,
-                "{foreign}"
-            );
-        }
-        assert_eq!(x_event_max_age_ms(None), FOREIGN);
-    }
-}
+#[path = "platform_x_server_event_age_tests.rs"]
+mod x_server_event_age_tests;
 
 #[cfg(all(test, target_os = "linux"))]
-mod x11_key_stamp_seam_tests {
-    use aterm_window::platform::x11::{dispatch_with_key_event_server_time, key_event_server_time};
-
-    use super::current_event_queue_age_ns;
-
-    fn monotonic_ms() -> u32 {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `now` is a valid, writable `timespec`.
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) },
-            0
-        );
-        (now.tv_sec as u64 * 1_000 + now.tv_nsec as u64 / 1_000_000) as u32
-    }
-
-    #[test]
-    fn a_key_stamp_reaches_the_age_for_exactly_one_dispatch() {
-        const MS: u64 = 1_000_000;
-        assert_eq!(key_event_server_time(), None);
-        assert_eq!(current_event_queue_age_ns(), None, "no key, no age");
-
-        let stamp = monotonic_ms().wrapping_sub(40);
-        let age = dispatch_with_key_event_server_time(stamp, current_event_queue_age_ns)
-            .expect("the stamp must reach the age inside the dispatch");
-        assert!(
-            (40 * MS..1_000 * MS).contains(&age),
-            "age {age} ns for a 40 ms old stamp"
-        );
-        assert_eq!(
-            key_event_server_time(),
-            None,
-            "withdrawn after the dispatch"
-        );
-        assert_eq!(current_event_queue_age_ns(), None);
-
-        assert_eq!(
-            dispatch_with_key_event_server_time(0, key_event_server_time),
-            Some(0)
-        );
-        assert_eq!(
-            dispatch_with_key_event_server_time(0, current_event_queue_age_ns),
-            None
-        );
-
-        let unwound = std::panic::catch_unwind(|| {
-            dispatch_with_key_event_server_time(stamp, || panic!("a key handler panicked"))
-        });
-        assert!(unwound.is_err());
-        assert_eq!(key_event_server_time(), None);
-    }
-}
+#[path = "platform_x11_key_stamp_seam_tests.rs"]
+mod x11_key_stamp_seam_tests;
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
@@ -1835,36 +1658,8 @@ pub(crate) fn headless_fixture_apprt(mut apprt: PlatformAppRt) -> PlatformAppRt 
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod headless_fixture_tests {
-    use super::{AppRt as _, AppRtMacOS, headless_fixture_apprt};
-    use crate::native_appearance::AppearancePreferences;
-
-    #[test]
-    fn a_headless_fixture_closes_the_native_preferences_arm() {
-        let inert = headless_fixture_apprt(AppRtMacOS {
-            probe_preferences: false,
-        });
-        assert!(!inert.probe_preferences);
-        assert_eq!(
-            inert.native_appearance_preferences(),
-            AppearancePreferences::default()
-        );
-        assert!(!inert.reduce_motion());
-
-        let fixture = headless_fixture_apprt(AppRtMacOS {
-            probe_preferences: true,
-        });
-        assert!(
-            !fixture.probe_preferences,
-            "a headless fixture must not inherit the live native-preference arm"
-        );
-        assert_eq!(
-            fixture.native_appearance_preferences(),
-            AppearancePreferences::default()
-        );
-        assert!(!fixture.reduce_motion());
-    }
-}
+#[path = "platform_headless_fixture_tests.rs"]
+mod headless_fixture_tests;
 
 /// The three display-accessibility reads [`AppRtMacOS`] answers [`AppRt::reduce_motion`] and [`AppRt::native_appearance_preferences`] with, asked once and dropped.
 #[cfg(target_os = "macos")]
@@ -1988,57 +1783,8 @@ pub(crate) fn read_bounded_stdout(
 }
 
 #[cfg(test)]
-mod bounded_read_tests {
-    #[cfg(unix)]
-    use super::read_bounded_stdout;
-
-    #[cfg(unix)]
-    #[test]
-    fn the_bounded_read_returns_stdout_of_a_successful_child() {
-        assert_eq!(
-            read_bounded_stdout(
-                "/bin/sh",
-                &["-c", "printf false"],
-                aterm_spec::wait::MUST_HAPPEN
-            )
-            .as_deref(),
-            Some("false")
-        );
-        assert_eq!(
-            read_bounded_stdout(
-                "/bin/sh",
-                &["-c", "printf false; exit 3"],
-                aterm_spec::wait::MUST_HAPPEN
-            ),
-            None,
-            "a failing exit is not a preference"
-        );
-        assert_eq!(
-            read_bounded_stdout(
-                "/nonexistent/wbgui-no-such-gsettings",
-                &[],
-                aterm_spec::wait::MUST_HAPPEN
-            ),
-            None,
-            "a missing binary is not a preference"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_bounded_read_kills_a_child_that_outlives_the_bound() {
-        let started = std::time::Instant::now();
-        assert_eq!(
-            read_bounded_stdout("/bin/sleep", &["600"], std::time::Duration::from_millis(50)),
-            None
-        );
-        assert!(
-            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-            "the read must not wait for the child: took {:?}",
-            started.elapsed()
-        );
-    }
-}
+#[path = "platform_bounded_read_tests.rs"]
+mod bounded_read_tests;
 
 #[cfg(target_os = "macos")]
 mod reduce_motion {
@@ -2399,245 +2145,7 @@ mod reduce_motion {
     }
 
     #[cfg(test)]
-    mod tests {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use super::{
-            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, POWER_STATE_SYMBOL,
-            ReduceMotionTarget, THERMAL_STATE_NOTIFICATION, WILL_SLEEP_NOTIFICATION, new_target,
-            optional_notification, register,
-        };
-
-        fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
-            for center in [super::workspace_center(), super::default_center()] {
-                if center.is_null() {
-                    continue;
-                }
-                // SAFETY: `-removeObserver:` is `-(void)(id)`; `center` is a live centre and `target` a live observer registered on it.
-                unsafe {
-                    let f: unsafe extern "C-unwind" fn(
-                        aterm_objc::Id,
-                        aterm_objc::Sel,
-                        aterm_objc::Id,
-                    ) = aterm_objc::checked_msg();
-                    f(center, aterm_objc::sel!(removeObserver:), target.as_id());
-                }
-            }
-        }
-
-        fn post_default(name: aterm_objc::Id) {
-            aterm_objc::autoreleasepool(|_| {
-                let center = super::default_center();
-                assert!(!center.is_null(), "no default notification centre");
-                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`; `center` is live, callers keep the NSString name alive, nil sender is legal.
-                unsafe {
-                    let f: unsafe extern "C-unwind" fn(
-                        aterm_objc::Id,
-                        aterm_objc::Sel,
-                        aterm_objc::Id,
-                        aterm_objc::Id,
-                    ) = aterm_objc::checked_msg();
-                    f(
-                        center,
-                        aterm_objc::sel!(postNotificationName:object:),
-                        name,
-                        aterm_objc::Id::NIL,
-                    );
-                }
-            });
-        }
-
-        fn post() {
-            post_named(DISPLAY_OPTIONS_NOTIFICATION);
-        }
-
-        fn post_named(notification: &str) {
-            aterm_objc::autoreleasepool(|_| {
-                let center = super::workspace_center();
-                assert!(!center.is_null(), "no workspace notification centre");
-                let name = aterm_objc::ns_string(notification).expect("NSString");
-                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`; `center` is live, `name` a live +1 NSString, nil sender is legal.
-                unsafe {
-                    let f: unsafe extern "C-unwind" fn(
-                        aterm_objc::Id,
-                        aterm_objc::Sel,
-                        aterm_objc::Id,
-                        aterm_objc::Id,
-                    ) = aterm_objc::checked_msg();
-                    f(
-                        center,
-                        aterm_objc::sel!(postNotificationName:object:),
-                        name.id(),
-                        aterm_objc::Id::NIL,
-                    );
-                }
-            });
-        }
-
-        #[test]
-        fn a_real_workspace_notification_reaches_the_declared_class() {
-            use aterm_objc::{ClassType, class, class_name, superclass_of};
-
-            // SAFETY: these symbols are either absent or immutable Foundation NSString
-            // constants. The known thermal value controls the required pointer dereference.
-            let power_available = unsafe {
-                assert_eq!(
-                    optional_notification(c"aterm_missing_foundation_notification_58495"),
-                    None,
-                    "an unavailable notification must be omitted"
-                );
-                assert_eq!(
-                    optional_notification(c"NSProcessInfoThermalStateDidChangeNotification"),
-                    Some(THERMAL_STATE_NOTIFICATION),
-                    "the resolver reads the exported value, not its address"
-                );
-                optional_notification(POWER_STATE_SYMBOL).is_some()
-            };
-            let hits = Arc::new(AtomicUsize::new(0));
-            let seen = Arc::clone(&hits);
-            let wakes = Arc::new(AtomicUsize::new(0));
-            let woke = Arc::clone(&wakes);
-            let recolors = Arc::new(AtomicUsize::new(0));
-            let recolored = Arc::clone(&recolors);
-            let sleeps = Arc::new(AtomicUsize::new(0));
-            let slept = Arc::clone(&sleeps);
-            let target = new_target(
-                crate::appkit::test_witness(),
-                Box::new(move || {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                }),
-                Box::new(move || {
-                    woke.fetch_add(1, Ordering::SeqCst);
-                }),
-                Box::new(move || {
-                    recolored.fetch_add(1, Ordering::SeqCst);
-                }),
-                Box::new(move || {
-                    slept.fetch_add(1, Ordering::SeqCst);
-                }),
-            )
-            .expect("+alloc/-init produced a ReduceMotionTarget");
-
-            let cls = ReduceMotionTarget::class();
-            assert!(!cls.is_null());
-            assert_eq!(
-                class(c"ATermReduceMotionTarget"),
-                cls,
-                "objc_getClass disagrees with the registered pair"
-            );
-            // SAFETY: `cls` is the class this module just registered, so it and its superclass are live, immortal class objects.
-            unsafe {
-                assert_eq!(class_name(cls), c"ATermReduceMotionTarget");
-                assert_eq!(class_name(superclass_of(cls)), c"NSObject");
-            }
-            // SAFETY: `target` is a live instance; `-respondsToSelector:` is a side-effect-free query.
-            unsafe {
-                let responds: unsafe extern "C-unwind" fn(
-                    aterm_objc::Id,
-                    aterm_objc::Sel,
-                    aterm_objc::Sel,
-                ) -> aterm_objc::Bool = aterm_objc::checked_msg();
-                assert!(
-                    responds(
-                        target.as_id(),
-                        aterm_objc::sel!(respondsToSelector:),
-                        aterm_objc::sel!(reduceMotionDidChange:)
-                    )
-                    .as_bool()
-                );
-            }
-
-            assert!(register(&target), "workspace centre registration failed");
-            post();
-            post();
-            // Foundation delivers these on the global dispatch queue. No AppKit work may
-            // happen in the relay, and a quiet page needs no motion tick to receive it.
-            std::thread::spawn(|| {
-                // SAFETY: Foundation owns these immutable names for the process lifetime.
-                unsafe {
-                    if let Some(name) = optional_notification(POWER_STATE_SYMBOL) {
-                        post_default(name);
-                    }
-                    post_default(THERMAL_STATE_NOTIFICATION);
-                }
-            })
-            .join()
-            .expect("power notification sender");
-            post_named(DID_WAKE_NOTIFICATION);
-            post_named(WILL_SLEEP_NOTIFICATION);
-            let colors_name =
-                aterm_objc::ns_string(super::SYSTEM_COLORS_NOTIFICATION).expect("NSString");
-            post_default(colors_name.id());
-            unregister(&target);
-            post();
-            post_named(DID_WAKE_NOTIFICATION);
-            post_named(WILL_SLEEP_NOTIFICATION);
-            post_default(colors_name.id());
-            // SAFETY: Foundation owns these immutable names for the process lifetime.
-            unsafe {
-                if let Some(name) = optional_notification(POWER_STATE_SYMBOL) {
-                    post_default(name);
-                }
-                post_default(THERMAL_STATE_NOTIFICATION);
-            }
-            assert_eq!(
-                recolors.load(Ordering::SeqCst),
-                1,
-                "NSSystemColorsDidChangeNotification did not reach the colours relay \
-                 exactly once"
-            );
-
-            assert_eq!(
-                hits.load(Ordering::SeqCst),
-                3 + usize::from(power_available),
-                "Foundation/AppKit did not deliver policy notifications to the declared class \
-                 exactly as many times as it was posted"
-            );
-            assert_eq!(
-                wakes.load(Ordering::SeqCst),
-                1,
-                "AppKit did not deliver NSWorkspaceDidWakeNotification to the wake \
-                 selector exactly once"
-            );
-            // The account claims' quiet before sleep (docs/DESIGN-fluid-swarm-2026-10-28.md F19).
-            assert_eq!(
-                sleeps.load(Ordering::SeqCst),
-                1,
-                "AppKit did not deliver NSWorkspaceWillSleepNotification to the sleep \
-                 selector exactly once"
-            );
-        }
-
-        #[test]
-        fn dropping_the_target_drops_its_relay() {
-            struct Spy(Arc<AtomicUsize>);
-            impl Drop for Spy {
-                fn drop(&mut self) {
-                    self.0.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            let drops = Arc::new(AtomicUsize::new(0));
-            let spy = Spy(Arc::clone(&drops));
-            let target = new_target(
-                crate::appkit::test_witness(),
-                Box::new(move || {
-                    let _ = &spy;
-                }),
-                Box::new(|| {}),
-                Box::new(|| {}),
-                Box::new(|| {}),
-            )
-            .expect("target");
-            assert_eq!(drops.load(Ordering::SeqCst), 0);
-            drop(target);
-            assert_eq!(
-                drops.load(Ordering::SeqCst),
-                1,
-                "the generated -dealloc did not drop the relay"
-            );
-        }
-    }
+    mod tests;
 }
 
 #[cfg(target_os = "macos")]
@@ -2930,28 +2438,7 @@ mod vibrancy {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::{MATERIAL_HUD, MATERIAL_SIDEBAR, MATERIAL_UNDER_WINDOW, material_value};
-        use crate::app_config::BackgroundMaterial;
-
-        #[test]
-        fn material_value_maps_the_exposed_materials() {
-            assert_eq!(material_value(BackgroundMaterial::None), None);
-            assert_eq!(material_value(BackgroundMaterial::Hud), Some(MATERIAL_HUD));
-            assert_eq!(
-                material_value(BackgroundMaterial::Sidebar),
-                Some(MATERIAL_SIDEBAR)
-            );
-            assert_eq!(
-                material_value(BackgroundMaterial::UnderWindow),
-                Some(MATERIAL_UNDER_WINDOW)
-            );
-            assert_eq!(
-                (MATERIAL_SIDEBAR, MATERIAL_HUD, MATERIAL_UNDER_WINDOW),
-                (7, 13, 21)
-            );
-        }
-    }
+    mod tests;
 }
 
 /// Pure decision for whether CoreGraphics display lists lack an active drawable display.
@@ -2983,104 +2470,8 @@ pub(crate) fn active_display_unavailable_from(
 }
 
 #[cfg(test)]
-mod surface_colorspace_tests {
-    use super::{SurfaceColorspace, capture_space_after_surface_tag, resolve_surface_colorspace};
-    use crate::app_config::WindowColorspace;
-
-    #[test]
-    fn config_maps_one_to_one_and_names_are_the_cg_constants() {
-        assert_eq!(
-            SurfaceColorspace::from(WindowColorspace::Srgb),
-            SurfaceColorspace::Srgb
-        );
-        assert_eq!(
-            SurfaceColorspace::from(WindowColorspace::DisplayP3),
-            SurfaceColorspace::DisplayP3
-        );
-        assert_eq!(SurfaceColorspace::Srgb.cg_name(), "kCGColorSpaceSRGB");
-        assert_eq!(
-            SurfaceColorspace::DisplayP3.cg_name(),
-            "kCGColorSpaceDisplayP3"
-        );
-        assert_eq!(
-            SurfaceColorspace::ExtendedLinearSrgb.cg_name(),
-            "kCGColorSpaceExtendedLinearSRGB"
-        );
-    }
-
-    #[test]
-    fn hdr_surface_outranks_config_tag() {
-        for cfg in [WindowColorspace::Srgb, WindowColorspace::DisplayP3] {
-            assert_eq!(
-                resolve_surface_colorspace(cfg, true),
-                SurfaceColorspace::ExtendedLinearSrgb,
-                "{cfg:?}: an f16 swapchain must be read as extended-linear"
-            );
-            assert_eq!(
-                resolve_surface_colorspace(cfg, false),
-                SurfaceColorspace::from(cfg),
-                "{cfg:?}: an SDR swapchain follows the config"
-            );
-        }
-    }
-
-    #[test]
-    fn failed_surface_tag_never_claims_the_requested_space() {
-        use aterm_gpu::video_tap::CaptureColorSpace;
-
-        assert_eq!(
-            capture_space_after_surface_tag(None, CaptureColorSpace::Unknown),
-            CaptureColorSpace::Unknown,
-            "initial best-effort failure must make exact capture refuse"
-        );
-        assert_eq!(
-            capture_space_after_surface_tag(None, CaptureColorSpace::Srgb),
-            CaptureColorSpace::Srgb,
-            "failed hot retag leaves the prior compositor tag in effect"
-        );
-        assert_eq!(
-            capture_space_after_surface_tag(
-                Some(SurfaceColorspace::DisplayP3),
-                CaptureColorSpace::Srgb,
-            ),
-            CaptureColorSpace::DisplayP3
-        );
-    }
-
-    /// NEGATIVE CONTROL: when CoreGraphics lists zero active displays (clamshell closed or no
-    /// display connected), `active_display_unavailable_from` refuses with a `Some` reason naming
-    /// the missing display instead of letting a window drive judge an empty monitor list.
-    #[test]
-    fn active_display_unavailable_names_closed_clamshell_and_passes_active_panel() {
-        assert_eq!(
-            super::active_display_unavailable_from(Ok(&[1]), Ok(&[1])),
-            None,
-            "an active display clears the gate"
-        );
-        assert_eq!(
-            super::active_display_unavailable_from(Ok(&[1, 2]), Ok(&[2])),
-            None,
-            "clamshell closed with an external active display clears the gate"
-        );
-        let closed = super::active_display_unavailable_from(Ok(&[1]), Ok(&[]))
-            .expect("clamshell closed with no external active display refuses");
-        assert!(
-            closed.contains("no display is online for drawing")
-                && closed.contains("no active display")
-                && closed.contains("1 online display"),
-            "{closed}"
-        );
-        let headless = super::active_display_unavailable_from(Ok(&[]), Ok(&[]))
-            .expect("no online display at all refuses");
-        assert!(
-            headless.contains("no display is online") && headless.contains("no online display"),
-            "{headless}"
-        );
-        let err = super::active_display_unavailable_from(Ok(&[1]), Err(1000))
-            .expect("active display query error refuses");
-        assert!(err.contains("CGError 1000"), "{err}");
-    }
-}
+#[path = "platform_surface_colorspace_tests.rs"]
+mod surface_colorspace_tests;
 
 /// Opt this application out of macOS diacritic press-and-hold.
 #[cfg(target_os = "macos")]

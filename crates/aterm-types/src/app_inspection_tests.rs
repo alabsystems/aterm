@@ -164,6 +164,8 @@ fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
         Ok(OpenAppRequest::SystemState)
     );
     assert!(parse_open_app("app system-state /extra").is_err());
+    assert_eq!(parse_open_app("app tables"), Ok(OpenAppRequest::Tables));
+    assert!(parse_open_app("app tables /extra").is_err());
     assert!(parse_open_app("app system-state\nact app/v1").is_err());
     assert_eq!(
         parse_open_app("app settings"),

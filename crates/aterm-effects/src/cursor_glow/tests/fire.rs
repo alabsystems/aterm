@@ -5230,7 +5230,7 @@ fn ribbon_light_on_the_bar_above(unheld: bool) -> u64 {
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
     let (row, caret_col) = (4u16, 21u16);
     let mut host = FireHost::new(true, false);
-    let mut c = cfg_for_style_name("rainbow kitty pet", true);
+    let mut c = tall_rainbow_cfg();
     c.dark_theme = true;
     c.intensity = 1.0;
     (c.theme_fg, c.theme_bg) = DARK_PAIR;
@@ -5320,7 +5320,7 @@ fn dark_return_mud_under_the_printed_line(in_guard: bool) -> usize {
         rows
     };
     let mut host = FireHost::new(true, false);
-    let mut c = cfg_for_style_name("rainbow kitty pet", true);
+    let mut c = tall_rainbow_cfg();
     c.dark_theme = true;
     c.intensity = 1.0;
     (c.theme_fg, c.theme_bg) = DARK_PAIR;

@@ -74,6 +74,7 @@ fn journal() -> Journal {
         release_id: None,
         release_intent: false,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: vec![],
     }
 }

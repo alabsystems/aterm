@@ -66,7 +66,9 @@ pub fn between(before: &Members, now: impl IntoIterator<Item = MemberUsage>) -> 
 
 /// Process `p` of a sweep ([`crate::processes`]) as a member ([`MemberUsage`]): its pid and start
 /// (0 where unread), its own CPU time (not its reaped children's), its runnable time, the bytes it
-/// read from and wrote to disk, and its footprints; 0 for each figure the sweep did not read. A
+/// read from and wrote to disk (on Windows the bytes it moved through any handle,
+/// [`ProcessReading::io_read`] and [`ProcessReading::io_written`], which is what says a process
+/// is not idle there), and its footprints; 0 for each figure the sweep did not read. A
 /// group's read ([`crate::group_usage`]) reads each member through this too.
 #[must_use]
 pub fn member(p: &ProcessReading) -> MemberUsage {
@@ -76,9 +78,10 @@ pub fn member(p: &ProcessReading) -> MemberUsage {
         cpu_ns: p.cpu_ns.unwrap_or(0),
         runnable_ns: p.runnable_ns.unwrap_or(0),
         io_bytes: p
-            .disk_read
+            .io_read
+            .or(p.disk_read)
             .unwrap_or(0)
-            .saturating_add(p.disk_written.unwrap_or(0)),
+            .saturating_add(p.io_written.or(p.disk_written).unwrap_or(0)),
         footprint: p.footprint.unwrap_or(0),
         peak_footprint: p.peak_footprint.unwrap_or(0),
     }

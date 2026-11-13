@@ -2053,6 +2053,23 @@ impl<'a, 'b> Page<'a, 'b> {
                 }
                 children.push(node);
                 height += h;
+                if row.subject == Subject::Setting(super::Setting::Repositories)
+                    && !self.app.repositories.is_empty()
+                {
+                    let (table, h) = super::repositories::table(
+                        self.app,
+                        self.view,
+                        inner,
+                        self.spins(Mark::Working),
+                    );
+                    let mut controls = Vec::new();
+                    super::repositories::controls(&table, top + height, &mut controls);
+                    for (key, y, h) in controls {
+                        self.span(key, y, h);
+                    }
+                    children.push(table);
+                    height += h;
+                }
                 if row.subject == vault_row {
                     height += self.push_other_vault(&mut children, top + height, inner);
                 }
@@ -2618,8 +2635,9 @@ fn row_mark(row: &RowView) -> Mark {
         Some(Chip::NeedsYou) => Mark::NeedsYou,
         Some(Chip::Failed) => Mark::Failed,
         Some(Chip::LeftAsIs) => Mark::Off,
-        // As the person left it, after aterm set it: theirs, and settled.
-        None if row.changed_by_you => Mark::Done,
+        // Changed since aterm set it, and left as it is: no check, which only a row in place
+        // earns, and nothing to do.
+        None if row.changed_since => Mark::Off,
         None if !row.managed => Mark::Off,
         None => Mark::Pending,
     }

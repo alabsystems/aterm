@@ -254,6 +254,102 @@ fn a_span_from_an_earlier_boot_is_read_on_the_wall_clock() {
     }
 }
 
+/// A file with no boot (Windows' saves) is read on its boot clock only while that clock agrees
+/// with the wall-clock `deadline` it was saved with: after a restart, whose boot clock starts
+/// again, a span that ended days ago stays off and one with time left keeps only its remainder.
+/// NEGATIVE CONTROL: [`decode`], which counts `ends` whatever clock it is on, revives the ended
+/// span and gives the other its whole span again.
+#[test]
+fn a_span_saved_with_no_boot_is_read_on_the_wall_clock_after_a_restart() {
+    const SPAN: u64 = 8 * HOUR;
+    let saved_at = Clocks {
+        since_boot: 5 * DAY,
+        wall: NOW.wall,
+    };
+    let mode = Mode::activate(Some(SPAN), saved_at);
+    let text = encode(&Saved { mode, boot: None }, saved_at);
+    assert!(!text.contains("boot="), "{text}");
+    let read = |now: Clocks| decode_unstamped(&text, now).map(|saved| saved.mode.settled(now));
+
+    assert_eq!(read(saved_at), Some(mode), "CONTROL: as saved");
+    assert_eq!(
+        read(saved_at + 100),
+        Some(mode),
+        "the same boot, later: `ends` counts, unchanged"
+    );
+    let skewed = Clocks {
+        since_boot: saved_at.since_boot + 100,
+        wall: saved_at.wall + 100 + DRIFT_SECS,
+    };
+    assert_eq!(
+        read(skewed),
+        Some(mode),
+        "readings that wander by the slack"
+    );
+
+    let restarted_days_later = Clocks {
+        since_boot: 600,
+        wall: saved_at.wall + 2 * DAY,
+    };
+    assert_eq!(read(restarted_days_later), Some(Mode::Off), "an ended span");
+    assert!(
+        decode(&text, restarted_days_later).is_some_and(|saved| saved
+            .mode
+            .settled(restarted_days_later)
+            .is_on(restarted_days_later)),
+        "NEGATIVE CONTROL: `ends` read on the new boot's clock revives it"
+    );
+
+    let restarted_an_hour_later = Clocks {
+        since_boot: 600,
+        wall: saved_at.wall + HOUR,
+    };
+    let remainder = Mode::Until {
+        deadline: 600 + SPAN - HOUR,
+        span: SPAN,
+    };
+    assert_eq!(read(restarted_an_hour_later), Some(remainder));
+    assert_ne!(
+        decode(&text, restarted_an_hour_later)
+            .map(|saved| saved.mode.settled(restarted_an_hour_later)),
+        Some(remainder),
+        "NEGATIVE CONTROL: `ends` read on the new boot's clock gives the whole span again"
+    );
+
+    let restarted_past_its_ends = Clocks {
+        since_boot: mode_end(mode) + 10,
+        wall: saved_at.wall + HOUR,
+    };
+    assert_eq!(
+        read(restarted_past_its_ends),
+        Some(Mode::Until {
+            deadline: restarted_past_its_ends.since_boot + SPAN - HOUR,
+            span: SPAN
+        }),
+        "a new uptime already past the old `ends` still has its time on the wall"
+    );
+
+    let by_hand = format!("mode=until\nends={}\nspan={SPAN}\n", mode_end(mode));
+    assert_eq!(
+        decode_unstamped(&by_hand, saved_at),
+        None,
+        "`ends` with no `deadline` to check it against is no mode"
+    );
+    assert_eq!(
+        decode_unstamped("mode=forever\n", restarted_days_later).map(|saved| saved.mode),
+        Some(Mode::Forever),
+        "an untimed mode has no clock to check"
+    );
+}
+
+/// The end of a timed `mode` on its boot clock.
+fn mode_end(mode: Mode) -> u64 {
+    match mode {
+        Mode::Until { deadline, .. } => deadline,
+        Mode::Off | Mode::Forever => panic!("not a span: {mode:?}"),
+    }
+}
+
 /// A saved span keeps its time through the wall clock set back or forward a day, and the file
 /// keeps its end on the wall clock in `deadline`.
 #[test]

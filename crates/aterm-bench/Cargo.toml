@@ -12,8 +12,19 @@ description = "aterm performance harnesses (the examples `verify perf` runs)."
 [dependencies]
 # Shared thread clocks and process retired-work counters.
 libc = { workspace = true }
+# Visual harnesses opt into their libraries; a headless example must not compile them.
+aterm-aos = { workspace = true, optional = true }
+aterm-effects = { workspace = true, optional = true }
+aterm-gpu = { workspace = true, optional = true }
+aterm-render = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `aos_gpu` drains the autorelease pool before its last footprint read.
+aterm-objc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
+aterm-cores = { workspace = true }
 aterm-uds = { workspace = true }
 aterm-json = { workspace = true }
 aterm-core = { workspace = true }
@@ -23,38 +34,31 @@ aterm-grid = { workspace = true }
 aterm-zstd = { workspace = true }
 # The crash-restore harness (the `crash-restore` lane): the journal's writer and recovery.
 aterm-restore = { workspace = true }
-# The effects harness (the `effects` lane): the harness card and cursor glow emitters, the CPU
-# rasterizer and the GPU presenter with its GPU clock.
-aterm-effects = { workspace = true }
-aterm-gpu = { workspace = true }
-aterm-render = { workspace = true }
-# ...and the fixture font it draws, found from the package directory when it runs
+# The effects harness's fixture font, found from the package directory when it runs
 # (`aterm_tempfile::manifest_dir`).
 aterm-tempfile = { workspace = true }
-# ...and its `--light` ground, Default Light, from the shipped theme registry.
+# Its `--light` ground, Default Light, comes from the shipped theme registry.
 aterm-types = { workspace = true }
 # The effects harness declares its thread user-interactive, the QoS the app's render thread has.
 aterm-pty = { workspace = true }
-# The Aos harness (the `aos` lane): checkpoints, the event log and shadow replay of the hosted
-# momentum glow, beside aterm-effects' `MomentumHost`.
-aterm-aos = { workspace = true }
 # The vte-engine harness reads the load average it ran at through the machine reader.
 aterm-sysprobe = { workspace = true }
 
-# `aos_gpu` drains the autorelease pool its Metal jobs ran in before its last footprint read.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-aterm-objc = { workspace = true }
-
 [features]
+# Card and cursor emitters, the CPU rasterizer, and the GPU presenter with its GPU clock.
+effects-harness = ["dep:aterm-effects", "dep:aterm-gpu", "dep:aterm-render"]
+# Checkpoints, the event log and shadow replay beside aterm-effects' MomentumHost.
+aos-harness = ["dep:aterm-aos", "dep:aterm-effects", "dep:aterm-render"]
+prism-glass = ["dep:aterm-effects"]
 # The effects harness's development seams: the pass-economy ablation
 # (`GpuRenderer::set_unorm_ablation`) and the glow ramps' sweep knobs (`--ramp-cost`, the beam
 # runs' cost; `--ramps-fx`, their GPU route). The `effects` lane names this on its command line
 # for its `--release` run (a debug build has the seams anyway). No dependency's manifest turns it
 # on.
-dev-seams = ["aterm-gpu/dev-seams", "aterm-effects/dev-seams"]
+dev-seams = ["effects-harness", "aterm-gpu/dev-seams", "aterm-effects/dev-seams"]
 # Aos M5a's measured child `examples/aos_gpu.rs` (design §12.9); int-bag-mlp is named too, as
 # aterm-gpu's edge to aterm-effects (which `compute` turns it on through) is macOS-only.
-aos-gpu = ["aterm-gpu/compute", "aterm-effects/int-bag-mlp"]
+aos-gpu = ["dep:aterm-objc", "aterm-gpu/compute", "aterm-effects/int-bag-mlp"]
 
 [lints]
 workspace = true
@@ -71,7 +75,16 @@ test = true
 
 [[example]]
 name = "effects_harness"
+required-features = ["effects-harness"]
 test = true
+
+[[example]]
+name = "aos_harness"
+required-features = ["aos-harness"]
+
+[[example]]
+name = "prism_glass_units"
+required-features = ["prism-glass"]
 
 [[example]]
 name = "vte_engine_harness"

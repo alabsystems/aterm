@@ -33,7 +33,7 @@ build-args = [
     "-p", "astream-broker", "-p", "astream-pump",
     "--bin", "asb", "--bin", "aspump",
     "--features",
-    "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/aead",
+    "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/identity",
 ]
 
 [workspace.dependencies]

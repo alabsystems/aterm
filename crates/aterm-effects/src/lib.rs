@@ -46,6 +46,8 @@ pub mod cursor_droplet;
 /// The cursor family's frame step.
 pub mod cursor_fx;
 pub mod cursor_glow;
+/// The `cursor_pet` table.
+pub mod cursor_pet;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
 pub mod cursor_trail;
@@ -66,7 +68,7 @@ pub mod host;
 /// The integer bag-of-ids MLP job kind and its CPU reference (Aos M5a).
 #[cfg(any(test, debug_assertions, feature = "int-bag-mlp"))]
 pub mod int_bag_mlp;
-/// The rainbow kitty that flies in front of the cursor on the `rainbow kitty` trail style.
+/// The flying head no setting selects any more: the celebration's singer, which the pet replaces on the glass.
 pub mod kitty_cursor;
 /// The rainbow kitty pet.
 pub mod kitty_pet;
@@ -85,6 +87,8 @@ pub mod nuke;
 pub mod output_streak;
 /// The pet roster's bake path.
 pub mod pet_baker;
+/// The one seat rule and the one path between seats, for any pet ([`pet_seat::decide`]).
+pub mod pet_seat;
 mod pet_stroke;
 /// Bounded, coherent terminal occupancy and text-free content anchors.
 pub mod pet_world;

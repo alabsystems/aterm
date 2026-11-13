@@ -70,8 +70,9 @@
 //! claim different labels takes the suffix on the label of the one with the lowest id, which a later
 //! concurrent `Admit` can move; and a claim that only the quorums authorize lapses if they do.
 //! An authorized holder-signed bare-number `Name` chooses a new label when no other current
-//! member holds it. Concurrent choices of a free number remain unresolved; a choice already
-//! in another choice's past stands. Free moves release their seat labels for other choices.
+//! member holds it. Among concurrent earliest choices of a free number, the lowest record id
+//! holds it bare and the others take their binding suffix. A choice already in another choice's
+//! past stands. Free moves release their seat labels for other choices.
 //! Existing readers accept this same Name wire record as a display name and retain the old
 //! seat label; membership, authorization and record decoding do not change.
 //!
@@ -276,8 +277,8 @@ pub struct Member {
     pub node_key: Option<[u8; 32]>,
     /// Its host name: from its latest effective `Name`, else from its entry.
     pub name: String,
-    /// Its effective chosen number, else its initial seat label with its binding's suffix when
-    /// another Mac claimed that initial label.
+    /// Its effective number or initial seat label, with its binding's suffix after a concurrent
+    /// number-choice loss or an initial seat clash.
     pub label: String,
     /// The member whose `Admit` let it in; `None` for a founder.
     pub admitted_by: Option<MemberId>,
@@ -395,13 +396,15 @@ type Rank = (u64, RecordId);
 
 impl Membership {
     /// The bare number this member chose in an authorized, holder-signed `Name`, when no other
-    /// member holds or concurrently chooses it. Initial seat names are not chosen claims.
+    /// member holds it and this member wins any concurrent choices. Initial seat names are not
+    /// chosen claims.
     pub fn chosen_label(&self, member: &MemberId) -> Option<&str> {
         self.chosen_labels.get(member).map(String::as_str)
     }
 
-    /// The effective label after a signed number choice, including the seat fallback while
-    /// competing choices are unresolved. Registry mirrors must follow that fallback too.
+    /// The effective label after a signed number choice, including its suffix after a concurrent
+    /// loss or its seat fallback when another member already held the number. Registry mirrors
+    /// must follow that result too.
     pub fn label_after_choice(&self, member: &MemberId) -> Option<&str> {
         self.number_choices
             .contains(member)
@@ -1860,8 +1863,8 @@ impl<'a> Graph<'a> {
         })
     }
 
-    /// Derive current labels from the existing holder-signed Name wire record. Concurrent
-    /// choices of a free number are unresolved; none displaces an incumbent. Free moves
+    /// Derive current labels from the existing holder-signed Name wire record. Earliest causal
+    /// claims compete by record id; none displaces an incumbent. Free moves
     /// release their old number, so chains settle without reserving historical seat labels.
     fn chosen_labels(
         &self,
@@ -1897,35 +1900,86 @@ impl<'a> Graph<'a> {
             if let Some(i) = self.latest(Some(&numbers))
                 && let Body::Name { name } = self.records[i].body()
             {
-                pending.insert(*member, (i, name.clone()));
+                // Repeating a choice does not release it. Only a different numeric choice
+                // starts another tenure; display names never change number ownership.
+                let different: Vec<_> = numbers.iter().copied().filter(|&j| {
+                    self.before(j, i)
+                        && matches!(self.records[j].body(), Body::Name { name: other } if other != name)
+                }).collect();
+                let boundary = self.latest(Some(&different));
+                let claim = numbers.iter().copied().filter(|&j| {
+                    (j == i || self.before(j, i))
+                        && boundary.is_none_or(|boundary| self.before(boundary, j))
+                        && matches!(self.records[j].body(), Body::Name { name: other } if other == name)
+                }).min_by_key(|&j| (self.records[j].sequence(), self.records[j].id()))
+                    .unwrap_or(i);
+                pending.insert(*member, (claim, name.clone()));
             }
         }
         let number_choices = pending.keys().copied().collect();
         let mut chosen = BTreeMap::new();
         loop {
+            // Discard causally later claims before comparing ids. Mixing causality and ids
+            // in a pairwise comparator can cycle across three claims.
+            let mut winners = BTreeMap::new();
+            for (member, (at, label)) in &pending {
+                if pending
+                    .values()
+                    .any(|(earlier, theirs)| theirs == label && self.before(*earlier, *at))
+                {
+                    continue;
+                }
+                let candidate = (self.records[*at].id(), member);
+                let winner = winners.entry(label).or_insert(candidate);
+                *winner = (*winner).min(candidate);
+            }
             let ready: Vec<_> = pending
                 .iter()
-                .filter(|(member, (at, label))| {
+                .filter(|(member, (_, label))| {
                     let number = aterm_types::machine_name::Number::parse(label).ok();
                     let holds = |held: &str| {
                         aterm_types::machine_name::Number::leading(held)
                             .is_some_and(|held| Some(held) == number)
                     };
                     (labels.get(*member) == Some(label)
-                        || !pending.iter().any(|(other, (there, theirs))| {
-                            other != *member && theirs == label && !self.before(*at, *there)
-                        }))
+                        || winners
+                            .get(label)
+                            .is_some_and(|(_, winner)| winner == member))
                         && !labels.iter().any(|(other, held)| {
                             other != *member && standing.members.contains_key(other) && holds(held)
                         })
                         && !unproved.iter().any(|held| holds(held))
                 })
-                .map(|(member, (_, label))| (*member, label.clone()))
+                .map(|(member, (at, label))| (*member, *at, label.clone()))
                 .collect();
             if ready.is_empty() {
                 break;
             }
-            for (member, label) in ready {
+            for (member, at, label) in ready {
+                let incumbent = labels.get(&member) == Some(&label);
+                let concurrent: Vec<_> = pending
+                    .iter()
+                    .filter(|(other, (there, theirs))| {
+                        !incumbent
+                            && **other != member
+                            && *theirs == label
+                            && !self.before(at, *there)
+                            && !self.before(*there, at)
+                    })
+                    .filter_map(|(other, _)| {
+                        let entry = *standing.members.get(other)?;
+                        let (seat, _) = self.entrant(entry, other)?;
+                        let digest = Sha256::digest(seat.binding.bytes());
+                        Some((
+                            *other,
+                            format!("{label}-{:02x}{:02x}", digest[0], digest[1]),
+                        ))
+                    })
+                    .collect();
+                for (other, suffixed) in concurrent {
+                    pending.remove(&other);
+                    labels.insert(other, suffixed);
+                }
                 pending.remove(&member);
                 labels.insert(member, label.clone());
                 chosen.insert(member, label);

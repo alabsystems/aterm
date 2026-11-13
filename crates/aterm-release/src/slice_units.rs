@@ -12,14 +12,14 @@
 //! tree. Both slices then allocate from a private ledger of exactly that unit budget, so tree work
 //! cannot take link memory and two links cannot oversubscribe it.
 //! After a bounded normal-pressure shortage with no claimed blocker, the cut can serialize
-//! the slices and spend part of the compiler margin on its single driver. The private pool
-//! and every compiler claim remain unchanged; this plan refuses unknown units before spawn.
+//! the slices under the complete private compiler pool plus its single live driver. The private
+//! pool and every compiler claim remain unchanged; an unknown unit consumes the whole pool.
 //!
 //! An unknown or unidentified compiler consumes the whole private budget for its learning run.
-//! With no compatible final-link history, each slice instead learns under an exclusive outer
-//! claim; no fixed link estimate or incompatible accounting metric supplies an unmeasured
-//! envelope. Prior compiler rows provision admission only; a successful run retains the new exact
-//! identity. See
+//! With no compatible final-link history, both slices instead learn serially under one continuous
+//! exclusive outer claim; no fixed link estimate or incompatible accounting metric supplies an
+//! unmeasured envelope. Prior compiler rows provision admission only; a successful run retains
+//! the new exact identity. See
 //! `docs/measured/qualify-slice-reservation-2026-11-09.md` and
 //! `docs/measured/slice-memory-claim-2026-11-10.md`.
 
@@ -67,7 +67,6 @@ const REFUSED: &str = "aterm-release: slice unit admission: ";
 struct Budget {
     ledger: PathBuf,
     bytes: u64,
-    driver_in_margin: bool,
 }
 
 /// Native release links in isolation, without executing the product or
@@ -100,7 +99,7 @@ pub(crate) fn measure(root: &Path, takes: u8) -> Result<(), String> {
             "claim_bytes":units.budget.as_ref().map(|_| before.mem),
             "memory_identity":toolchain_key(triple)})
         );
-        let _claim = aterm_capacity::admit(slice_need(triple, None), aterm_capacity::Admit::Wait)
+        let _claim = aterm_capacity::admit(slice_need(triple), aterm_capacity::Admit::Wait)
             .map_err(|e| e.to_string())?;
         // The experiment leaves every other memory claimant out, including
         // while measuring a known unit whose ordinary claim cannot fit beside
@@ -177,7 +176,6 @@ impl Units {
         let budget = bounded.then(|| Budget {
             ledger: budget_ledger.to_owned(),
             bytes: retained_budget(&records, triples),
-            driver_in_margin: false,
         });
         triples
             .iter()
@@ -220,38 +218,32 @@ impl Units {
         if let Some(budget) = &self.budget {
             env.push((BUDGET_LEDGER, budget.ledger.clone().into_os_string()));
             env.push((BUDGET_BYTES, budget.bytes.to_string().into()));
-            if budget.driver_in_margin {
-                env.push((DRIVER_IN_MARGIN, "1".into()));
-            }
         }
         env
     }
 }
 
 pub(crate) const SERIAL_PARENT: &str = "release serial slice memory budget";
-const DRIVER_IN_MARGIN: &str = "ATERM_RELEASE_DRIVER_IN_MARGIN";
+pub(crate) const COLD_PARENT: &str = "release cold slice memory budget";
 
-/// A serial parent can spend part of the compiler claims' existing 20% margin on its
-/// one driver. Every known unit's raw retained peak is at most 5/6 of its rounded claim;
-/// therefore the sum of simultaneous peaks is at most 5/6 of the unchanged private pool.
-/// Keep the driver and at least one GiB beside that bound. An unmeasured unit has no such
-/// bound, so it claims the whole private pool ([`unit_need`]'s unknown claim) and compiles
-/// alone: its learning run assumes only that it peaks below the parent less the driver and
-/// that GiB, as the shared plan's learning claim assumes it fits the private pool. Its
-/// measured peak is retained, so the next build admits it by the bound above.
+/// One continuous exclusive parent for both slices while incomplete unit history is learned.
+/// The native and compat drivers run serially under it, so no unrelated memory claim can enter
+/// between their former per-slice guards and take memory the second learner needs.
+pub(crate) fn cold_parent_need() -> aterm_capacity::Need {
+    aterm_capacity::Need::new(COLD_PARENT)
+        .rank(aterm_capacity::Rank::Release)
+        .mem(DRIVER)
+        // An unclaimed load cannot turn a memory shortage into ALONE admission.
+        .margin(1)
+        .alone()
+}
+
+/// A serial parent's complete reservation: every byte its nested private ledger can admit plus
+/// the one live slice driver. A retained peak is historical evidence, not a cap on the next run;
+/// spending its variability margin on the driver would let live work exceed the parent while
+/// remaining inside its admitted compiler claim.
 pub(crate) fn serial_parent_bytes(budget: u64) -> u64 {
-    // Each claim is at least one GiB. Allow one byte per possible simultaneous
-    // claim for integer division before summing the per-unit 5/6 bounds.
-    // At least one unit is live, so the aggregate also leaves the margin's one-GiB floor.
-    // The parent reserves the pages that run, not the private pool's claims: the pool keeps its
-    // full size inside it ([`BudgetMachine`]), so no claim shrinks.
-    let peaks = budget
-        .saturating_sub(budget / (aterm_capacity::PEAK_MARGIN_DIV + 1))
-        .saturating_add(budget / FLOOR)
-        .min(budget.saturating_sub(aterm_capacity::PEAK_MARGIN_MIN));
-    peaks
-        .saturating_add(DRIVER)
-        .saturating_add(aterm_capacity::PEAK_MARGIN_MIN)
+    budget.saturating_add(DRIVER)
 }
 
 pub(crate) fn serial_need(units: &[Units]) -> Option<aterm_capacity::Need> {
@@ -265,17 +257,9 @@ pub(crate) fn serial_need(units: &[Units]) -> Option<aterm_capacity::Need> {
     )
 }
 
-pub(crate) fn use_serial_margin(units: &mut [Units]) {
-    for unit in units {
-        if let Some(budget) = &mut unit.budget {
-            budget.driver_in_margin = true;
-        }
-    }
-}
-
 /// The complete parent reservation for the slices' shared memory pool: its compiler budget and
-/// one driver allowance for each slice that can run at once. `None` selects exclusive learning
-/// where the retained exact-or-compatible record is incomplete or inconsistent.
+/// one driver allowance for each slice that can run at once. `None` selects the continuous cold
+/// learning parent where the retained exact-or-compatible record is incomplete or inconsistent.
 pub(crate) fn shared_need(units: &[Units], at_once: u64) -> Option<aterm_capacity::Need> {
     let budget = units.first()?.budget.as_ref()?;
     if at_once == 0
@@ -306,18 +290,15 @@ pub(crate) fn live_shared_floor(at_once: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// A slice with a bounded shared parent spends only its driver here. A slice with no compatible
-/// final-link history learns under an exclusive outer claim; an unwrapped diagnostic does too.
-pub(crate) fn slice_need(triple: &str, units: Option<&Units>) -> aterm_capacity::Need {
-    let need = aterm_capacity::Need::new(format!("release slice {triple}"))
+/// The exclusive outer claim for an individually run, unwrapped slice diagnostic. Production's
+/// two-slice build uses [`shared_need`] or [`cold_parent_need`] instead.
+pub(crate) fn slice_need(triple: &str) -> aterm_capacity::Need {
+    aterm_capacity::Need::new(format!("release slice {triple}"))
         .rank(aterm_capacity::Rank::Release)
         // An unclaimed load cannot turn a memory shortage into admission ALONE.
-        .margin(1);
-    if units.is_some_and(|units| units.budget.is_some()) {
-        need.mem(DRIVER)
-    } else {
-        need.mem(DRIVER).alone()
-    }
+        .margin(1)
+        .mem(DRIVER)
+        .alone()
 }
 
 /// The slice's last unit, whose record makes its units claim.
@@ -596,7 +577,6 @@ fn budget_from_environment() -> Result<Option<Budget>, String> {
             Ok(Some(Budget {
                 ledger: ledger.into(),
                 bytes,
-                driver_in_margin: std::env::var_os(DRIVER_IN_MARGIN).is_some(),
             }))
         }
         _ => Err("the private unit budget is incomplete".to_owned()),
@@ -656,24 +636,41 @@ pub(crate) fn entry(args: &[OsString]) -> Option<u8> {
 /// the jobserver's pipes among them where Cargo made its own jobserver
 /// (`--jobserver-fds=4,6`).
 pub(crate) fn compiler(args: &[OsString]) -> Result<aterm_uds::spawnfd::Command, String> {
+    use aterm_uds::spawnfd::Tether as _;
     let program = args.first().ok_or("missing compiler")?;
     #[cfg(unix)]
     let mut command = aterm_uds::spawnfd::transparent(program).into_command();
     #[cfg(not(unix))]
     let mut command = aterm_uds::spawnfd::transparent(program);
     command.args(&args[1..]);
+    // A killed wrapper cannot reap rustc, whose linker may still hold Cargo's output pipe.
+    // Tie the whole compiler group to the wrapper, including the linker and its children.
+    #[cfg(unix)]
+    command.process_group(0);
+    command.tether();
     for name in [
         WRAPPER,
         TRIPLE,
         BUDGET_LEDGER,
         BUDGET_BYTES,
-        DRIVER_IN_MARGIN,
         ROOT,
         "RUSTC_WRAPPER",
     ] {
         command.env_remove(name);
     }
     Ok(command)
+}
+
+/// The crash regression stops a real rustc precisely at its external linker boundary.
+#[cfg(debug_assertions)]
+pub(crate) fn linker_probe_if_asked() {
+    let Some(path) = std::env::var_os("ATERM_RELEASE_TEST_LINKER_READY") else {
+        return;
+    };
+    std::fs::write(path, std::process::id().to_string()).expect("linker crash-probe handshake");
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Run the compiler `args` names for the unit it compiles in `package`

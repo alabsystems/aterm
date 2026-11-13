@@ -23,7 +23,7 @@ pub enum Method {
     /// An admin explicitly approved this recipient.
     Manual,
     /// Ordinary open-vault approval: the admin chose to let in every machine that
-    /// asks, and that choice admits it to Commons like any other (owner, 2026-10-26).
+    /// asks, and that choice admits it to Commons like any other.
     Open,
 }
 

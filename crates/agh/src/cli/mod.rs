@@ -171,6 +171,9 @@ fn run_verb(
     tape: Option<(TapeHeader, Vec<EffectRecord>)>,
 ) -> u8 {
     let name = inv.verb_name();
+    if ctx.caller == "cli" || ctx.caller.starts_with("cli:") {
+        ctx.caller = format!("cli:{name}");
+    }
     let opts = OutputOpts::from_global(&inv.global);
     if inv.flag("--output") == Some("-")
         && let Err(e) = out::refuse_projection_flags(&name, &opts)

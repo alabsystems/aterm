@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_phase::CliHarness;
@@ -75,14 +75,16 @@ pub enum Judgement {
 /// empty `GIT_ALLOW_PROTOCOL` for a git too old to obey it, keep a partial clone's read from
 /// reaching its promisor remote by itself, outside the verifier's remote boundary
 /// ([`crate::remote`]: GitHub only through agh's credential route). The blobs a judgement needs
-/// and the clone lacks are imported explicitly instead ([`Reads::files`]).
+/// and the clone lacks are imported explicitly instead ([`Reads::files`]). A read through `view`
+/// sees `root`'s objects from the view's repository ([`ObjectView`]).
 fn call(
     root: &Path,
     path_env: &OsStr,
     args: &[&str],
     input: Option<&[u8]>,
+    view: Option<&ObjectView>,
 ) -> Result<std::process::Output, String> {
-    let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    let mut git = crate::git_provider::command();
     git.current_dir(root)
         .env("PATH", path_env)
         .arg("--no-optional-locks")
@@ -100,6 +102,10 @@ fn call(
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(view) = view {
+        git.env("GIT_DIR", &view.git_dir)
+            .env("GIT_OBJECT_DIRECTORY", &view.objects);
+    }
     let ran = match input {
         None => aterm_uds::deadline::output_within(&mut git, READ_WAIT).map_err(|e| e.to_string()),
         Some(input) => aterm_uds::deadline::output_with_input_until(
@@ -120,7 +126,7 @@ fn call(
 }
 
 fn git(root: &Path, path_env: &OsStr, args: &[&str]) -> Result<Vec<u8>, String> {
-    succeeded(args, call(root, path_env, args, None)?)
+    succeeded(args, call(root, path_env, args, None, None)?)
 }
 
 fn succeeded(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, String> {
@@ -138,6 +144,16 @@ fn succeeded(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, String
 fn text(root: &Path, path_env: &OsStr, args: &[&str]) -> Result<String, String> {
     String::from_utf8(git(root, path_env, args)?)
         .map_err(|_| format!("git {} returned non-UTF-8 text", args.join(" ")))
+}
+
+/// A clone's object store seen from an empty repository of the clone's object format, which names
+/// no promisor remote: a batch read through it describes an absent object as `missing`, where
+/// git 2.43 reading a partial clone itself with lazy fetch off dies on the first one it lacks
+/// ("could not fetch ... from promisor remote"). Alternates the store lists are still followed.
+struct ObjectView {
+    git_dir: PathBuf,
+    objects: PathBuf,
+    _scratch: aterm_tempfile::TempDir,
 }
 
 /// The file reads one judgement makes, local apart from one explicit import.
@@ -180,19 +196,81 @@ impl Reads<'_> {
         Ok(entries)
     }
 
-    /// Which of `oids` this repository lacks, answered by one local batch read.
-    fn missing(&self, oids: &BTreeSet<&str>) -> Result<Vec<String>, String> {
+    /// This repository's object store, seen from a scratch repository ([`ObjectView`]).
+    fn view(&self) -> Result<ObjectView, String> {
+        let store = text(
+            self.root,
+            self.path_env,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+                "--show-object-format",
+            ],
+        )?;
+        let mut lines = store.lines();
+        let (Some(objects), Some(format), None) = (lines.next(), lines.next(), lines.next()) else {
+            return Err(format!(
+                "git rev-parse named no object store and format: {store:?}"
+            ));
+        };
+        let scratch = aterm_tempfile::tempdir()
+            .map_err(|e| format!("a scratch directory for the object view: {e}"))?;
+        let git_dir = scratch.path().join("view.git");
+        let target = git_dir
+            .to_str()
+            .ok_or("the object view's scratch path is not UTF-8")?;
+        git(
+            self.root,
+            self.path_env,
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--template=",
+                &format!("--object-format={format}"),
+                target,
+            ],
+        )?;
+        Ok(ObjectView {
+            git_dir,
+            objects: PathBuf::from(objects),
+            _scratch: scratch,
+        })
+    }
+
+    /// Which of `oids` this repository lacks, answered by one local batch read through `view`.
+    /// The read first names `anchor`, a commit this repository holds, so a view that does not
+    /// see its store cannot report every object missing.
+    fn missing(
+        &self,
+        view: &ObjectView,
+        anchor: &str,
+        oids: &BTreeSet<&str>,
+    ) -> Result<Vec<String>, String> {
         const ARGS: &[&str] = &["cat-file", "--batch-check=%(objectname) %(objecttype)"];
-        if oids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let input: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+        let input: String = std::iter::once(anchor)
+            .chain(oids.iter().copied())
+            .map(|oid| format!("{oid}\n"))
+            .collect();
         let out = succeeded(
             ARGS,
-            call(self.root, self.path_env, ARGS, Some(input.as_bytes()))?,
+            call(
+                self.root,
+                self.path_env,
+                ARGS,
+                Some(input.as_bytes()),
+                Some(view),
+            )?,
         )?;
         let out = String::from_utf8(out).map_err(|_| "git cat-file returned non-UTF-8 rows")?;
         let mut rows = out.lines();
+        if rows.next().and_then(|row| row.split_once(' ')) != Some((anchor, "commit")) {
+            return Err(format!(
+                "the object view does not see this repository's commit {anchor}"
+            ));
+        }
         let mut missing = Vec::new();
         for oid in oids {
             match rows.next().and_then(|row| row.split_once(' ')) {
@@ -220,41 +298,47 @@ impl Reads<'_> {
             by_commit.entry(commit).or_default().push(path);
         }
         let mut blobs = BTreeMap::new();
+        let anchor = by_commit.keys().next().copied().unwrap_or_default();
         for (commit, paths) in by_commit {
             for (path, oid) in self.entries(commit, &paths)? {
                 blobs.insert((commit, path), oid);
             }
         }
         let oids: BTreeSet<&str> = blobs.values().map(String::as_str).collect();
-        let missing = self.missing(&oids)?;
-        if !missing.is_empty() {
-            let named: Vec<String> = blobs
-                .iter()
-                .filter(|(_, oid)| missing.contains(oid))
-                .map(|((commit, path), _)| format!("{path} at {}", &commit[..12.min(commit.len())]))
-                .collect();
-            let why = self.import(&missing).and_then(|()| {
-                let left = self.missing(&oids)?;
-                if left.is_empty() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "the promisor remote did not supply {}",
-                        left.join(" ")
-                    ))
+        if !oids.is_empty() {
+            let view = self.view()?;
+            let missing = self.missing(&view, anchor, &oids)?;
+            if !missing.is_empty() {
+                let named: Vec<String> = blobs
+                    .iter()
+                    .filter(|(_, oid)| missing.contains(oid))
+                    .map(|((commit, path), _)| {
+                        format!("{path} at {}", &commit[..12.min(commit.len())])
+                    })
+                    .collect();
+                let why = self.import(&missing).and_then(|()| {
+                    let left = self.missing(&view, anchor, &oids)?;
+                    if left.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "the promisor remote did not supply {}",
+                            left.join(" ")
+                        ))
+                    }
+                });
+                if let Err(why) = why {
+                    return Err(format!(
+                        "{} blob{} this partial clone lacks ({}): {why}\nfix: re-run where this \
+                         clone's promisor remote is reachable (GitHub through an agh with `repo \
+                         fetch --objects`), which imports exactly these objects; or import them \
+                         by hand: git fetch --no-tags --no-write-fetch-head <promisor remote> {}",
+                        missing.len(),
+                        if missing.len() == 1 { "" } else { "s" },
+                        named.join(", "),
+                        missing.join(" ")
+                    ));
                 }
-            });
-            if let Err(why) = why {
-                return Err(format!(
-                    "{} blob{} this partial clone lacks ({}): {why}\nfix: re-run where this \
-                     clone's promisor remote is reachable (GitHub through an agh with `repo \
-                     fetch --objects`), which imports exactly these objects; or import them \
-                     by hand: git fetch --no-tags --no-write-fetch-head <promisor remote> {}",
-                    missing.len(),
-                    if missing.len() == 1 { "" } else { "s" },
-                    named.join(", "),
-                    missing.join(" ")
-                ));
             }
         }
         wanted
@@ -272,7 +356,7 @@ impl Reads<'_> {
     /// lazy fetch asks them: `extensions.partialClone`'s, then each `remote.<name>.promisor`.
     fn promisors(&self) -> Result<Vec<String>, String> {
         let read = |args: &[&str]| -> Result<String, String> {
-            let out = call(self.root, self.path_env, args, None)?;
+            let out = call(self.root, self.path_env, args, None, None)?;
             if out.status.code() == Some(1) {
                 return Ok(String::new());
             }
@@ -317,7 +401,7 @@ impl Reads<'_> {
             );
         }
         let make = |root: &Path| {
-            let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+            let mut git = crate::git_provider::command();
             git.current_dir(root).env("PATH", self.path_env);
             git
         };
@@ -380,7 +464,7 @@ fn release_version(text: &str) -> Option<(u64, u64, u64)> {
 
 /// The newest fetched public release tag no newer than the workspace version and reachable from
 /// `head`. Annotated tags contribute their peeled commit; lightweight tags their object.
-fn public_baseline(
+pub(crate) fn public_baseline(
     root: &Path,
     path_env: &OsStr,
     head: &str,
@@ -443,17 +527,19 @@ fn is_source(harness: CliHarness, path: &str) -> bool {
         .any(|source| matches_source(source, path))
 }
 
-/// Judge `head` against the newest fetched public release tag in its ancestry. Every file it
-/// reads comes from the local object store; where a partial clone lacks some of them (a new
-/// public baseline's version files, which nobody here has checked out), exactly those blobs
-/// are imported first in one explicit request to the clone's promisor remote ([`Reads`]).
+/// The newest fetched public release in this candidate's ancestry, shared by harness
+/// debt and the generated changelog line. Missing promisor blobs use the same batched reader.
 ///
 /// # Errors
-/// A git read failed, the workspace version or public baseline is unreadable, or a blob the
-/// judgement needs is absent and could not be imported (offline, say): the message names
-/// each such file and the remedy.
-pub fn judge(root: &Path, head: &str, path_env: &OsStr) -> Result<Judgement, String> {
-    let reads = Reads { root, path_env };
+/// The candidate, workspace version, public baseline or required git object cannot be read.
+pub fn baseline(root: &Path, head: &str, path_env: &OsStr) -> Result<(String, String), String> {
+    let (_, version, commit) = candidate_baseline(&Reads { root, path_env }, head)?;
+    Ok((version, commit))
+}
+
+fn candidate_baseline(reads: &Reads<'_>, head: &str) -> Result<(String, String, String), String> {
+    let root = reads.root;
+    let path_env = reads.path_env;
     let head = text(
         root,
         path_env,
@@ -469,6 +555,21 @@ pub fn judge(root: &Path, head: &str, path_env: &OsStr) -> Result<Judgement, Str
     let current = workspace_version(&manifest)
         .ok_or_else(|| format!("{head}:{MANIFEST} names no workspace.package.version"))?;
     let (version, baseline) = public_baseline(root, path_env, &head, &current)?;
+    Ok((head, version, baseline))
+}
+
+/// Judge `head` against the newest fetched public release tag in its ancestry. Every file it
+/// reads comes from the local object store; where a partial clone lacks some of them (a new
+/// public baseline's version files, which nobody here has checked out), exactly those blobs
+/// are imported first in one explicit request to the clone's promisor remote ([`Reads`]).
+///
+/// # Errors
+/// A git read failed, the workspace version or public baseline is unreadable, or a blob the
+/// judgement needs is absent and could not be imported (offline, say): the message names
+/// each such file and the remedy.
+pub fn judge(root: &Path, head: &str, path_env: &OsStr) -> Result<Judgement, String> {
+    let reads = Reads { root, path_env };
+    let (head, version, baseline) = candidate_baseline(&reads, head)?;
     let changed = changed_between(root, path_env, &baseline, &head)?;
     let moved: Vec<(CliHarness, Vec<String>)> = CliHarness::ALL
         .into_iter()
@@ -522,299 +623,5 @@ pub fn judge(root: &Path, head: &str, path_env: &OsStr) -> Result<Judgement, Str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn run(root: &Path, args: &[&str]) {
-        let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
-        git.current_dir(root).args(args);
-        let out = aterm_uds::deadline::output_within(&mut git, READ_WAIT).unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn write(root: &Path, path: &str, text: &str) {
-        let path = root.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    }
-
-    fn commit(root: &Path, message: &str) {
-        run(root, &["add", "."]);
-        run(root, &["commit", "-qm", message]);
-    }
-
-    fn tag(root: &Path, version: &str) {
-        run(
-            root,
-            &["tag", "-am", "public release", &format!("v{version}")],
-        );
-    }
-
-    fn init(root: &Path) {
-        run(root, &["init", "-q"]);
-        run(root, &["config", "user.name", "A"]);
-        run(root, &["config", "user.email", "a@example.invalid"]);
-    }
-
-    fn manifest(version: &str) -> String {
-        format!("[workspace]\n[workspace.package]\nversion = \"{version}\"\n")
-    }
-
-    #[test]
-    fn a_late_harness_change_is_red_until_the_window_has_one_bump() {
-        let temp = aterm_tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        init(root);
-        write(root, MANIFEST, &manifest("0.173.0"));
-        write(
-            root,
-            CliHarness::ClaudeCode.version_file(),
-            &format!("{}\n", source_line((0, 1))),
-        );
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() {}\n",
-        );
-        commit(root, "public release");
-        tag(root, "0.173.0");
-
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() { changed(); }\n",
-        );
-        commit(root, "harness source before the workspace bump");
-        write(root, MANIFEST, &manifest("0.174.0"));
-        commit(
-            root,
-            "workspace version bump does not reset the public window",
-        );
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let Judgement::Owed { debts, .. } = judge(root, "HEAD", &path).unwrap() else {
-            panic!("unbumped source change passed");
-        };
-        assert_eq!(debts.len(), 1);
-        assert_eq!(debts[0].harness, CliHarness::ClaudeCode);
-
-        // NEGATIVE CONTROL: reverting the landing check makes the preceding assertion pass the
-        // bad tree; moving the compiled version once clears this release window's debt.
-        write(
-            root,
-            CliHarness::ClaudeCode.version_file(),
-            &format!("{}\n", source_line((0, 2))),
-        );
-        commit(root, "bump harness");
-        assert!(matches!(
-            judge(root, "HEAD", &path).unwrap(),
-            Judgement::Clear { .. }
-        ));
-
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() { changed_again(); }\n",
-        );
-        commit(root, "a second source change in the same public window");
-        assert!(matches!(
-            judge(root, "HEAD", &path).unwrap(),
-            Judgement::Clear { .. }
-        ));
-
-        tag(root, "0.174.0");
-        write(root, MANIFEST, &manifest("0.175.0"));
-        commit(root, "next workspace version");
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() { next_public_window(); }\n",
-        );
-        commit(root, "change after the next public release");
-        assert!(matches!(
-            judge(root, "HEAD", &path).unwrap(),
-            Judgement::Owed { .. }
-        ));
-    }
-
-    #[test]
-    fn an_unbumped_source_cannot_hide_behind_a_later_version_or_ledger_commit() {
-        let temp = aterm_tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        init(root);
-        write(root, MANIFEST, &manifest("0.8.0"));
-        write(
-            root,
-            CliHarness::ClaudeCode.version_file(),
-            &format!("{}\n", source_line((0, 3))),
-        );
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() {}\n",
-        );
-        commit(root, "public release");
-        tag(root, "0.8.0");
-        write(
-            root,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() { hidden(); }\n",
-        );
-        commit(root, "unbumped source");
-        write(root, MANIFEST, &manifest("0.9.0"));
-        commit(root, "later workspace bump");
-        write(root, "RELEASES.ledger", "100 0.9.0\n");
-        commit(root, "later abandoned claim");
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        assert!(matches!(
-            judge(root, "HEAD", &path).unwrap(),
-            Judgement::Owed { .. }
-        ));
-    }
-
-    /// Host git under no system or global config and no inherited repository redirect.
-    fn fixture_git(root: &Path, args: &[&str]) -> String {
-        let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
-        git.current_dir(root).args(args);
-        for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"GIT_") {
-                git.env_remove(key);
-            }
-        }
-        git.env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "A")
-            .env("GIT_AUTHOR_EMAIL", "a@example.invalid")
-            .env("GIT_COMMITTER_NAME", "A")
-            .env("GIT_COMMITTER_EMAIL", "a@example.invalid");
-        let out = aterm_uds::deadline::output_within(&mut git, READ_WAIT).unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    }
-
-    /// Whether `root` holds `oid` itself, asked with no lazy fetch.
-    fn holds(root: &Path, oid: &str) -> bool {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        call(root, &path, &["cat-file", "-e", oid], None)
-            .unwrap()
-            .status
-            .success()
-    }
-
-    /// A public release whose version file the candidate edits without bumping, served by a
-    /// local bare repository that answers filtered and exact-object requests, and two blobless
-    /// partial clones of it: the shape of a checkout whose newest public baseline's files
-    /// nobody here has read.
-    fn partial_clones(root: &Path) -> (std::path::PathBuf, [std::path::PathBuf; 2], String) {
-        let work = root.join("work");
-        fs::create_dir_all(&work).unwrap();
-        fixture_git(&work, &["init", "-q", "-b", "main"]);
-        let version_file = CliHarness::ClaudeCode.version_file();
-        write(&work, MANIFEST, &manifest("0.8.0"));
-        write(&work, version_file, &format!("{}\n", source_line((0, 3))));
-        write(
-            &work,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() {}\n",
-        );
-        fixture_git(&work, &["add", "."]);
-        fixture_git(&work, &["commit", "-qm", "public release"]);
-        fixture_git(&work, &["tag", "-am", "public release", "v0.8.0"]);
-        let baseline_blob = fixture_git(&work, &["rev-parse", &format!("v0.8.0:{version_file}")]);
-        write(
-            &work,
-            "crates/aterm-agent/src/harness/upgrade_drive.rs",
-            "fn drive() { changed(); }\n",
-        );
-        write(
-            &work,
-            version_file,
-            &format!("{}\n// edited, not bumped\n", source_line((0, 3))),
-        );
-        write(&work, MANIFEST, &manifest("0.9.0"));
-        fixture_git(&work, &["add", "."]);
-        fixture_git(&work, &["commit", "-qm", "unbumped source"]);
-        let server = root.join("server.git");
-        let server_text = server.to_str().unwrap();
-        fixture_git(root, &["clone", "-q", "--bare", "work", server_text]);
-        fixture_git(&server, &["config", "uploadpack.allowFilter", "true"]);
-        fixture_git(
-            &server,
-            &["config", "uploadpack.allowAnySHA1InWant", "true"],
-        );
-        let clones = ["partial", "offline"].map(|name| {
-            let clone = root.join(name);
-            fixture_git(
-                root,
-                &[
-                    "clone",
-                    "-q",
-                    "--filter=blob:none",
-                    &format!("file://{server_text}"),
-                    clone.to_str().unwrap(),
-                ],
-            );
-            // The verifier's remote boundary admits a local repository by its path.
-            fixture_git(&clone, &["remote", "set-url", "origin", server_text]);
-            clone
-        });
-        (server, clones, baseline_blob)
-    }
-
-    #[test]
-    fn a_partial_clone_imports_exactly_the_baseline_blobs_it_lacks_or_names_them() {
-        let temp = aterm_tempfile::TempDir::new().unwrap();
-        let (server, [partial, offline], baseline_blob) = partial_clones(temp.path());
-        let path = std::env::var_os("PATH").unwrap_or_default();
-
-        // NEGATIVE CONTROL: the clone lacks the baseline's version file, so a read with lazy
-        // fetch off (the judgement before the import, which reported COULD NOT RUN) fails.
-        assert!(!holds(&partial, &baseline_blob));
-        let refs = fixture_git(&partial, &["for-each-ref"]);
-        let Judgement::Owed { debts, .. } = judge(&partial, "HEAD", &path).unwrap() else {
-            panic!("an edited, unbumped version file passed");
-        };
-        assert_eq!(debts.len(), 1);
-        assert_eq!(debts[0].harness, CliHarness::ClaudeCode);
-        assert!(holds(&partial, &baseline_blob), "the import supplied it");
-        assert_eq!(
-            fixture_git(&partial, &["for-each-ref"]),
-            refs,
-            "an import publishes no ref"
-        );
-
-        // With the promisor remote gone the blob stays absent, and the verdict says which file
-        // and how to get it rather than judging without it.
-        fs::rename(&server, temp.path().join("gone.git")).unwrap();
-        let why = judge(&offline, "HEAD", &path).unwrap_err();
-        assert!(!holds(&offline, &baseline_blob));
-        assert!(
-            why.contains("1 blob this partial clone lacks")
-                && why.contains(&format!("{} at ", CliHarness::ClaudeCode.version_file()))
-                && why.contains("importing them from `origin` failed")
-                && why.contains("fix: re-run where this clone's promisor remote is reachable")
-                && why.contains(&format!("<promisor remote> {baseline_blob}")),
-            "{why}"
-        );
-    }
-
-    #[test]
-    fn a_directory_source_matches_only_inside_its_slash_boundary() {
-        assert!(matches_source(
-            "crates/harness/",
-            "crates/harness/reader.rs"
-        ));
-        assert!(!matches_source(
-            "crates/harness/",
-            "crates/harness-extra.rs"
-        ));
-    }
-}
+#[path = "harness_debt_tests.rs"]
+mod tests;

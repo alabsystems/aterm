@@ -439,7 +439,6 @@ impl<'a> Scene<'a> {
     }
 
     /// A pixel's layer, and the band row that owns it (`-1` for none).
-    #[cfg(test)]
     #[must_use]
     pub fn layer_at(&self, x: i64, y: i64) -> (Layer, i64) {
         let i = self.at(x, y);

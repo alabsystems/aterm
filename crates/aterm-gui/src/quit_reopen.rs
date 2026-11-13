@@ -3,15 +3,26 @@
 
 //! System Settings' Quit & Reopen. Once a person turns an access on or off for aterm (Full Disk
 //! Access, say), System Settings asks aterm to quit, with a logout's quit reason (`rlgo`), waits
-//! about three seconds, and reopens only an app that quit by then. aterm asks before it quits, so
-//! it misses that wait. A quit System Settings asked for therefore leaves a helper behind that
-//! opens aterm again once this process is gone.
+//! about three seconds, and reopens only an app that quit by then. aterm answers AppKit's ask to
+//! terminate with `NSTerminateLater` (`menu::defer_quit_for_terminate`), asks the person nothing
+//! for a quit System Settings asked for (`system_quit::explicit`), and lets AppKit end the process
+//! only once its own shutdown is done, which need not fit in that wait (whether it does is not
+//! measured); one System Settings asks for while aterm's own alert or panel is open, where no reply
+//! could come, AppKit hears cancelled, and aterm quits once the alert or panel is answered, well
+//! past that wait. A quit System Settings asked for therefore leaves a helper behind that opens
+//! aterm again once this process is gone, and tries `open` again on `OPEN_RETRY`'s schedule while
+//! it fails, `OPEN_TRIES` times in all. What the helper did it leaves in `<state>`
+//! (`OUTCOME_RECORD`), and the next aterm writes that in its journal (`journal_last_reopen`): the
+//! helper has no journal of its own.
 
+#[cfg(any(target_os = "macos", test))]
+use aterm_types::retry_schedule::Backoff;
 #[cfg(any(target_os = "macos", test))]
 use aterm_uds::process::{Birth, Identity, ProcessPresence};
 use std::ffi::OsString;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
@@ -33,22 +44,43 @@ const REOPEN_SENDERS: [&str; 2] = [
 pub const REOPEN_VERB: &str = "__reopen-after";
 
 /// How long the helper waits for the quitting aterm to be gone before it gives up.
+#[cfg(target_os = "macos")]
 const GONE_CEILING: Duration = Duration::from_secs(120);
 
 /// How long the helper waits for LaunchServices to drop the gone aterm before it opens anyway:
 /// LaunchServices answers an `open` for an app it still lists by bringing that app forward.
+#[cfg(target_os = "macos")]
 const FORGOTTEN_CEILING: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "macos")]
 const FORGOTTEN_TICK: Duration = Duration::from_millis(20);
 
+/// How long one `open` may take.
+#[cfg(target_os = "macos")]
 const OPEN_CEILING: Duration = Duration::from_secs(60);
 
-/// The longest the helper takes, from its start at this process's quit, to open aterm again: its
-/// waits for the quitting aterm to be gone, for LaunchServices to drop it, and for `open`.
-pub(crate) const REOPEN_CEILING: Duration = Duration::from_secs(
-    GONE_CEILING.as_secs() + FORGOTTEN_CEILING.as_secs() + OPEN_CEILING.as_secs(),
-);
+/// The pause before each `open` after one that failed (LaunchServices still taking the gone
+/// aterm down, say): a second after the first failure, doubling to half a minute.
+#[cfg(any(target_os = "macos", test))]
+const OPEN_RETRY: Backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+/// How many times the helper tries `open` in all. With [`OPEN_RETRY`]'s pauses (91 s in all) an
+/// `open` LaunchServices refuses at once gives up a minute and a half after the quitting aterm
+/// is gone; at the very most, every wait run to its ceiling ([`GONE_CEILING`],
+/// `FORGOTTEN_CEILING`, each try's `OPEN_CEILING`), the helper outlives the quit by
+/// 120 + 5 + 8 × 60 + 91 s, under twelve minutes.
+#[cfg(any(target_os = "macos", test))]
+const OPEN_TRIES: u32 = 8;
+
+/// What the last Quit & Reopen helper did, in `<state>`: its unix seconds, its outcome's word
+/// ([`Reopened::word`]) and the `open`s it tried, one line, for the next aterm's journal
+/// ([`journal_last_reopen`]).
+#[cfg(any(target_os = "macos", test))]
+const OUTCOME_RECORD: &str = "quit-reopen-outcome";
+
+/// The most [`OUTCOME_RECORD`] holds.
+#[cfg(any(target_os = "macos", test))]
+const MAX_OUTCOME_BYTES: usize = 256;
 
 /// Whether a quit sent by the program at `path` is System Settings' Quit & Reopen.
 #[cfg(any(target_os = "macos", test))]
@@ -99,29 +131,144 @@ fn parse_reopen_args(args: &[OsString]) -> Option<(Identity, PathBuf)> {
 enum Reopened {
     /// The quitting aterm still ran at the ceiling: nothing was opened.
     StillRunning,
-    /// `open` opened the app.
-    Opened,
-    /// `open` failed.
+    /// `open` opened the app at its `tries`-th try.
+    Opened { tries: u32 },
+    /// `open` failed each of its [`OPEN_TRIES`] tries.
     OpenFailed,
 }
 
+#[cfg(any(target_os = "macos", test))]
+impl Reopened {
+    /// The outcome's word in [`OUTCOME_RECORD`].
+    const fn word(self) -> &'static str {
+        match self {
+            Self::StillRunning => "still-running",
+            Self::Opened { .. } => "opened",
+            Self::OpenFailed => "open-failed",
+        }
+    }
+
+    /// The `open`s tried.
+    const fn tries(self) -> u32 {
+        match self {
+            Self::StillRunning => 0,
+            Self::Opened { tries } => tries,
+            Self::OpenFailed => OPEN_TRIES,
+        }
+    }
+}
+
+/// [`OUTCOME_RECORD`]'s line for `reopened` at `at` (unix seconds). Pure.
+#[cfg(any(target_os = "macos", test))]
+fn outcome_line(at: u64, reopened: Reopened) -> String {
+    format!("{at} {} {}\n", reopened.word(), reopened.tries())
+}
+
+/// [`outcome_line`] read back: the seconds and the outcome; `None` for anything else. Pure.
+#[cfg(any(target_os = "macos", test))]
+fn read_outcome(text: &str) -> Option<(u64, Reopened)> {
+    let mut words = text.strip_suffix('\n')?.split(' ');
+    let (at, word, tries) = (words.next()?, words.next()?, words.next()?);
+    let digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    if words.next().is_some() || !digits(at) || !digits(tries) {
+        return None;
+    }
+    let tries: u32 = tries.parse().ok()?;
+    let reopened = match word {
+        "still-running" if tries == 0 => Reopened::StillRunning,
+        "opened" if (1..=OPEN_TRIES).contains(&tries) => Reopened::Opened { tries },
+        "open-failed" if tries == OPEN_TRIES => Reopened::OpenFailed,
+        _ => return None,
+    };
+    Some((at.parse().ok()?, reopened))
+}
+
+/// The journal's line for the helper's `reopened` at `at`, read `now` (unix seconds, `None`
+/// unread). Pure.
+#[cfg(target_os = "macos")]
+fn journal_line(at: u64, reopened: Reopened, now: Option<u64>) -> String {
+    let ago = now.map_or_else(String::new, |now| {
+        format!(", {} s ago", now.saturating_sub(at))
+    });
+    match reopened {
+        Reopened::Opened { tries } => format!(
+            "quit & reopen: the helper opened aterm again at `open` try {tries} of \
+             {OPEN_TRIES}{ago}"
+        ),
+        Reopened::OpenFailed => format!(
+            "quit & reopen: the helper's {OPEN_TRIES} `open` tries all failed{ago}; aterm was not \
+             opened again"
+        ),
+        Reopened::StillRunning => format!(
+            "quit & reopen: the quitting aterm still ran at the helper's ceiling{ago}; aterm was \
+             not opened again"
+        ),
+    }
+}
+
+/// Leave `reopened` in `state`'s [`OUTCOME_RECORD`] at `at` (unix seconds), in place of what an
+/// earlier helper left.
+///
+/// # Errors
+/// The record could not be written (`config_marker::write_marker`).
+#[cfg(any(target_os = "macos", test))]
+fn note_outcome_in(state: &Path, at: u64, reopened: Reopened) -> std::io::Result<()> {
+    crate::config_marker::write_marker(
+        &state.join(OUTCOME_RECORD),
+        &outcome_line(at, reopened),
+        MAX_OUTCOME_BYTES,
+        crate::durable::Flush::Ordered,
+    )
+}
+
+/// Take what the last helper left in `state` ([`OUTCOME_RECORD`]): its seconds and outcome, the
+/// record removed so no later aterm writes it again; `None` for no record, and for one that
+/// does not read, which is removed too.
+#[cfg(any(target_os = "macos", test))]
+fn take_outcome_in(state: &Path) -> Option<(u64, Reopened)> {
+    let path = state.join(OUTCOME_RECORD);
+    let text = crate::config_marker::read_marker(&path, MAX_OUTCOME_BYTES)?;
+    if let Err(error) = crate::config_marker::remove_marker(&path) {
+        aterm_log::warn!("quit & reopen: the helper's record was not removed: {error}");
+    }
+    read_outcome(&text)
+}
+
+/// Write in this aterm's journal what the last Quit & Reopen helper did, from what it left in
+/// `<state>`: the helper runs with no journal, so its `open`s, or its giving up, reach a journal
+/// only here, at the next launch (the one it opened, when it did).
+#[cfg(target_os = "macos")]
+pub(crate) fn journal_last_reopen() {
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        return;
+    };
+    if let Some((at, reopened)) = take_outcome_in(&state) {
+        aterm_log::info!("{}", journal_line(at, reopened, aterm_time::unix_secs()));
+    }
+}
+
 /// The helper's course: once `gone` says the quitting aterm has exited, wait on `forgotten`
-/// (LaunchServices dropping it, or that wait's ceiling), then `open` the app again.
+/// (LaunchServices dropping it, or that wait's ceiling), then `open` the app again, up to
+/// [`OPEN_TRIES`] times, `pause` taking [`OPEN_RETRY`]'s pause before each (none before the
+/// first).
 #[cfg(any(target_os = "macos", test))]
 fn reopen_once_gone(
     gone: impl FnOnce() -> bool,
     forgotten: impl FnOnce(),
-    open: impl FnOnce() -> bool,
+    mut open: impl FnMut() -> bool,
+    mut pause: impl FnMut(Duration),
 ) -> Reopened {
     if !gone() {
         return Reopened::StillRunning;
     }
     forgotten();
-    if open() {
-        Reopened::Opened
-    } else {
-        Reopened::OpenFailed
+    for tries in 0..OPEN_TRIES {
+        pause(OPEN_RETRY.after(tries));
+        if open() {
+            return Reopened::Opened { tries: tries + 1 };
+        }
     }
+    Reopened::OpenFailed
 }
 
 /// Leave the helper that opens aterm again once this process is gone, when this quit is a
@@ -163,7 +310,8 @@ pub(crate) fn leave_reopen_at_quit() {
     }
 }
 
-/// [`REOPEN_VERB`]: wait for the named aterm process to be gone, then open the bundle named.
+/// [`REOPEN_VERB`]: wait for the named aterm process to be gone, then open the bundle named,
+/// leaving what it did in `<state>` for the next aterm's journal ([`OUTCOME_RECORD`]).
 #[must_use = "return or inspect the reopen helper's exit status"]
 pub fn run_reopen_after(args: &[OsString]) -> std::process::ExitCode {
     #[cfg(target_os = "macos")]
@@ -172,8 +320,13 @@ pub fn run_reopen_after(args: &[OsString]) -> std::process::ExitCode {
             || wait_gone(target, GONE_CEILING),
             || wait_forgotten(target.pid.unsigned_abs(), FORGOTTEN_CEILING),
             || open_bundle(&bundle),
+            std::thread::sleep,
         );
-        return if reopened == Reopened::Opened {
+        if let (Some(state), Some(at)) = (aterm_types::dirs::state_dir(), aterm_time::unix_secs()) {
+            // Nothing reads this helper's output: a record it could not leave is lost with it.
+            let _ = note_outcome_in(&state, at, reopened);
+        }
+        return if matches!(reopened, Reopened::Opened { .. }) {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE
@@ -257,164 +410,5 @@ fn open_bundle(bundle: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn target() -> Identity {
-        Identity {
-            pid: 4663,
-            birth: Birth(123),
-            idversion: aterm_uds::process::KEEPS_PID_VERSIONS.then_some(7),
-        }
-    }
-
-    #[test]
-    fn a_reused_pid_is_gone_but_an_unreadable_birth_is_not() {
-        let expected = Birth(123);
-        assert!(original_gone(
-            expected,
-            ProcessPresence::Present,
-            Some(Birth(124))
-        ));
-        assert!(!original_gone(
-            expected,
-            ProcessPresence::Present,
-            Some(expected)
-        ));
-        for presence in [ProcessPresence::Present, ProcessPresence::Unknown] {
-            assert!(!original_gone(expected, presence, None));
-        }
-    }
-
-    #[test]
-    fn only_system_settings_quit_is_a_quit_and_reopen() {
-        for sender in REOPEN_SENDERS {
-            assert!(sender_reopens(Path::new(sender)), "{sender}");
-        }
-        assert_eq!(
-            REOPEN_SENDERS[0],
-            "/System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/\
-             MacOS/SecurityPrivacyExtension"
-        );
-        for other in [
-            "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock",
-            "/usr/bin/osascript",
-            "/System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex",
-            "/Applications/System Settings.app/Contents/MacOS/System Settings",
-            "/tmp/System/Applications/System Settings.app/Contents/MacOS/System Settings",
-            "System/Applications/System Settings.app/Contents/MacOS/System Settings",
-            "",
-        ] {
-            assert!(!sender_reopens(Path::new(other)), "{other}");
-        }
-        assert_eq!(KEY_SENDER_PID, 0x7370_6964);
-    }
-
-    /// An absolute path to a `.app` on the host the test runs on.
-    fn host_bundle() -> &'static Path {
-        Path::new(if cfg!(windows) {
-            r"C:\Applications\aterm.app"
-        } else {
-            "/Applications/aterm.app"
-        })
-    }
-
-    #[test]
-    fn the_helper_reads_back_only_what_the_quit_wrote() {
-        let bundle = host_bundle();
-        let target = target();
-        let args = reopen_args(target, bundle);
-        assert_eq!(args[0], REOPEN_VERB);
-        assert_eq!(
-            parse_reopen_args(&args[1..]),
-            Some((target, bundle.to_path_buf()))
-        );
-        let app = bundle.to_str().expect("a UTF-8 path");
-        let exe = bundle.join("Contents/MacOS/aterm");
-        let exe = exe.to_str().expect("a UTF-8 path");
-        let token = target.token();
-        let token = token.as_str();
-        let refused: [&[&str]; 6] = [
-            &[],
-            &[token],
-            &[token, app, "more"],
-            &["4663", app],
-            &[token, "Applications/aterm.app"],
-            &[token, exe],
-        ];
-        for words in refused {
-            let args: Vec<OsString> = words.iter().map(OsString::from).collect();
-            assert_eq!(parse_reopen_args(&args), None, "{words:?}");
-        }
-    }
-
-    #[test]
-    fn the_helper_runs_the_bundles_front_door_whatever_name_this_aterm_ran_under() {
-        let bundle = host_bundle();
-        let target = target();
-        let command = reopen_command(target, bundle);
-        let program = Path::new(command.get_program());
-        assert_eq!(program, bundle.join("Contents/MacOS/aterm"));
-        assert_eq!(program.file_name(), Some(std::ffi::OsStr::new("aterm")));
-        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
-        let wrote = reopen_args(target, bundle);
-        assert_eq!(
-            args,
-            wrote.iter().map(OsString::as_os_str).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn the_helper_opens_only_once_the_quitting_aterm_is_gone() {
-        use std::cell::RefCell;
-        let steps = RefCell::new(Vec::new());
-        let run = |gone: bool, opened: bool| {
-            steps.borrow_mut().clear();
-            let reopened = reopen_once_gone(
-                || {
-                    steps.borrow_mut().push("gone");
-                    gone
-                },
-                || steps.borrow_mut().push("forgotten"),
-                || {
-                    steps.borrow_mut().push("open");
-                    opened
-                },
-            );
-            (reopened, steps.borrow().clone())
-        };
-        assert_eq!(run(false, true), (Reopened::StillRunning, vec!["gone"]));
-        assert_eq!(
-            run(true, true),
-            (Reopened::Opened, vec!["gone", "forgotten", "open"])
-        );
-        assert_eq!(
-            run(true, false),
-            (Reopened::OpenFailed, vec!["gone", "forgotten", "open"])
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_wait_ends_at_the_exit_and_not_before() {
-        let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
-        let mut child = aterm_uds::spawnfd::command(&cat)
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .spawn()
-            .expect("spawn cat with held input");
-        let target = i32::try_from(child.id())
-            .ok()
-            .and_then(aterm_uds::process::read_identity)
-            .expect("the child's exact identity");
-        assert!(
-            !wait_gone(target, Duration::ZERO),
-            "a running process read as gone"
-        );
-        child.kill().expect("kill cat");
-        assert!(
-            wait_gone(target, Duration::from_secs(60)),
-            "the exit of an unreaped child was missed"
-        );
-        aterm_uds::deadline::kill_within(&mut child, Duration::from_secs(60));
-    }
-}
+#[path = "quit_reopen_tests.rs"]
+mod tests;

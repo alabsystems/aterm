@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::git_config::WorkerEnv;
+use super::git_config::{WorkerEnv, git_relevant};
 use crate::harness::footer::read_small;
 
 /// The shell a snapshot was made from, by its file name.
@@ -89,7 +89,8 @@ impl ShellStartup {
         self.dot_glob
     }
 
-    /// Each alias and function read.
+    /// Each alias and function read, and each [`READER_ENV`] or git variable the startup may set,
+    /// as a `$NAME` entry.
     #[must_use]
     pub fn names(&self) -> &[(String, String, bool)] {
         &self.names
@@ -112,7 +113,8 @@ impl ShellStartup {
         }
     }
 
-    /// `Err` naming the alias or function `line` may run.
+    /// `Err` naming the alias or function `line` may run, or the reader it may run whose
+    /// variable ([`READER_ENV`]) the startup may set (a `$NAME` entry of [`Self::names`]).
     pub fn admits(&self, line: &str) -> Result<(), String> {
         if self.names.is_empty() {
             return Ok(());
@@ -122,6 +124,15 @@ impl ShellStartup {
         let reparse = REPARSE.iter().any(|w| anywhere(w));
         let heads = command_heads(line);
         for (name, what, alias) in &self.names {
+            if let Some(var) = name.strip_prefix('$') {
+                if let Some(reader) = reader_named(&texts, var) {
+                    return Err(format!(
+                        "`{reader}` reads `{name}`, which {what}: a value this check does not \
+                         read may make it read a file or run a command the line does not name"
+                    ));
+                }
+                continue;
+            }
             let runs = if *alias && !reparse {
                 heads.iter().any(|h| names_word(h, name))
             } else {
@@ -136,6 +147,86 @@ impl ShellStartup {
         }
         Ok(())
     }
+}
+
+/// Each variable of the Bash tool's environment that makes a reader the classifier approves read
+/// a file its words do not name or run a command, with the programs that read it. MEASURED
+/// 2026-11-05 on macOS 27.0.1 (`docs/measured/classifier-audit-3-fixes-2026-10-29.md`): BSD grep
+/// 2.6.0-FreeBSD (`/usr/bin/grep`, `egrep`, `fgrep`, which Claude Code's `grep` shadow falls back
+/// to) puts `$GREP_OPTIONS`'s words before its own, so `GREP_OPTIONS='-e x f' grep y g` reads
+/// `f`; Claude Code's rg 14.1.1 reads the config `$RIPGREP_CONFIG_PATH` names, whose lines are
+/// its flags and operands (an operand read another file, `--pre` ran a command); python 3.9.6
+/// runs a `sitecustomize` from `$PYTHONPATH`. `PYTHONHOME` and `PYTHONUSERBASE` move where it
+/// imports its startup modules from, REASONED from the same. macOS's `/usr/bin/python3` is the
+/// xcrun shim `/usr/bin/git` and `/usr/bin/strings` are (one binary), and
+/// `DEVELOPER_DIR=<dir> /usr/bin/python3 -c 'print(1)'` ran `<dir>/usr/bin/xcrun` (MEASURED the
+/// same day); `SDKROOT` names the SDK that shim reads, REASONED from git's. Each is held by its
+/// name, whatever its value: this reading knows no place the worker writes, so it cannot tell a
+/// planted developer directory from Xcode's ([`readers_of`] adds git to both).
+pub const READER_ENV: &[(&str, &[&str])] = &[
+    ("GREP_OPTIONS", &["grep", "egrep", "fgrep"]),
+    ("RIPGREP_CONFIG_PATH", &["rg"]),
+    ("PYTHONPATH", PYTHON),
+    ("PYTHONHOME", PYTHON),
+    ("PYTHONUSERBASE", PYTHON),
+    ("DEVELOPER_DIR", PYTHON),
+    ("SDKROOT", PYTHON),
+];
+
+/// The python heads the classifier approves (an allowlisted script, `classify::bash`).
+const PYTHON: &[&str] = &["python", "python2", "python3"];
+
+/// The first program `var` ([`READER_ENV`]) redirects that a word of `texts` names, by itself or
+/// as the last part of a path (`/usr/bin/grep`, which no shell function shadows), where any
+/// word naming it may run it (behind `xargs`, `find -exec` or a substitution).
+fn reader_named(texts: &[String], var: &str) -> Option<&'static str> {
+    let readers: Vec<&'static str> = readers_of(var).collect();
+    let word_char = |c: char| c.is_alphanumeric() || "_-.+@%,:=~/".contains(c);
+    texts.iter().find_map(|t| {
+        t.split(|c: char| !word_char(c)).find_map(|w| {
+            let last = w.rsplit('/').next().unwrap_or(w);
+            let last = last
+                .len()
+                .checked_sub(4)
+                .filter(|&at| last.is_char_boundary(at) && last[at..].eq_ignore_ascii_case(".exe"))
+                .map_or(last, |at| &last[..at]);
+            readers.iter().copied().find(|r| *r == last)
+        })
+    })
+}
+
+/// The programs variable `var` redirects: its [`READER_ENV`] readers, and `git` for one that
+/// moves what git loads or which git runs ([`git_startup_var`]).
+fn readers_of(var: &str) -> impl Iterator<Item = &'static str> {
+    READER_ENV
+        .iter()
+        .filter(move |(v, _)| *v == var)
+        .flat_map(|(_, readers)| readers.iter().copied())
+        .chain(git_startup_var(var).then_some("git"))
+}
+
+/// A variable a `.zshenv` may set that changes what git loads or which git runs
+/// (`git_config::git_relevant`'s, past `PATH` and `HOME`, which nearly every `.zshenv` names):
+/// git's probe runs with the worker's own environment, which holds no `.zshenv` export.
+fn git_startup_var(var: &str) -> bool {
+    git_relevant(var) && !matches!(var, "PATH" | "HOME")
+}
+
+/// The [`READER_ENV`] and [`git_startup_var`] variables `text` (a `.zshenv`) names in its code,
+/// in any quoting ([`zshenv_forms`]), so may set, each once.
+fn reader_vars_named(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        for form in zshenv_forms(line) {
+            for word in form.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                let redirects = READER_ENV.iter().any(|(v, _)| *v == word) || git_startup_var(word);
+                if redirects && !out.iter().any(|v| v == word) {
+                    out.push(word.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The most snapshots one check reads before it gives up (and escalates).
@@ -455,12 +546,33 @@ pub fn read(worker: &WorkerEnv, launch: &Path, windows: bool) -> Result<ShellSta
         }
         parse_snapshot(*kind, &text, &path.display().to_string(), &mut state)?;
     }
+    let mut set: Vec<(String, String)> = READER_ENV
+        .iter()
+        .filter(|(var, _)| worker.var(var).is_some())
+        .map(|(var, _)| {
+            (
+                (*var).to_string(),
+                "the worker's environment sets".to_string(),
+            )
+        })
+        .collect();
+    for (source, key, _) in worker.settings_vars(launch, "a command")? {
+        if READER_ENV.iter().any(|(v, _)| *v == key) {
+            set.push((
+                key,
+                format!("Claude Code's settings ({source}) give the Bash tool"),
+            ));
+        }
+    }
     for kind in kinds {
         match kind {
             Kind::Zsh => {
-                let unproven = zshenv(worker)?;
+                let (unproven, named) = zshenv(worker)?;
                 state.extended_glob |= unproven;
                 state.dot_glob |= unproven;
+                for (var, path) in named {
+                    set.push((var, format!("{} may set", path.display())));
+                }
             }
             Kind::Bash => {
                 bash_env(worker)?;
@@ -473,6 +585,9 @@ pub fn read(worker: &WorkerEnv, launch: &Path, windows: bool) -> Result<ShellSta
             state.extended_glob |= kind == Kind::Zsh;
             state.dot_glob = true;
         }
+    }
+    for (var, what) in set {
+        define(&mut state, format!("${var}"), what, false)?;
     }
     Ok(state)
 }
@@ -994,14 +1109,16 @@ const KEEPS_COMMAND: &[&str] = &[
 /// ([`zshenv_hazard`]), or that cannot be read; else whether one of them is not
 /// proven to set no option ([`zshenv_sets_no_option`]), so that `EXTENDED_GLOB`
 /// and `GLOB_DOTS` may be on ([`ShellStartup::may_extended_glob`],
-/// [`ShellStartup::may_dot_glob`]).
-fn zshenv(worker: &WorkerEnv) -> Result<bool, String> {
+/// [`ShellStartup::may_dot_glob`]), and each [`READER_ENV`] or [`git_startup_var`]
+/// variable one names ([`reader_vars_named`]), with that file.
+fn zshenv(worker: &WorkerEnv) -> Result<(bool, Vec<(String, PathBuf)>), String> {
     let dot = worker
         .var("ZDOTDIR")
         .filter(|d| !d.is_empty())
         .or_else(|| worker.var("HOME").filter(|h| !h.is_empty()))
         .map(|d| Path::new(d).join(".zshenv"));
     let mut unproven = false;
+    let mut named = Vec::new();
     for path in dot
         .into_iter()
         .chain(["/etc/zshenv", "/etc/zsh/zshenv"].map(PathBuf::from))
@@ -1019,8 +1136,25 @@ fn zshenv(worker: &WorkerEnv) -> Result<bool, String> {
             ));
         }
         unproven |= !zshenv_sets_no_option(&text);
+        named.extend(
+            reader_vars_named(&text)
+                .into_iter()
+                .map(|v| (v, path.clone())),
+        );
     }
-    Ok(unproven)
+    Ok((unproven, named))
+}
+
+/// A `.zshenv` line's code past a comment ([`zshenv_code`]), as written, with one level of
+/// quoting removed, and with every backslash and quote dropped: the spellings
+/// [`zshenv_hazard`] and [`reader_vars_named`] read a word in.
+fn zshenv_forms(line: &str) -> [String; 3] {
+    let code = zshenv_code(line);
+    [
+        code.to_string(),
+        unquote_once(code),
+        code.replace(['\\', '\'', '"'], ""),
+    ]
 }
 
 /// `line`, a `.zshenv` line, without the comment that ends it, if any.
@@ -1044,12 +1178,7 @@ fn zshenv_code(line: &str) -> &str {
 /// made a word opening with `#` no comment (`docs/measured/classifier-zsh-glob-2026-11-05.md`).
 pub fn zshenv_hazard(text: &str) -> Option<String> {
     for (n, line) in text.lines().enumerate() {
-        let code = zshenv_code(line);
-        let forms = [
-            code.to_string(),
-            unquote_once(code),
-            code.replace(['\\', '\'', '"'], ""),
-        ];
+        let forms = zshenv_forms(line);
         if forms.iter().any(|f| f.contains("()")) {
             return Some(format!("its line {} defines a function", n + 1));
         }

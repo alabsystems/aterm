@@ -495,6 +495,19 @@ impl Device {
         Self::open_identity(paths, identity, false).map(Some)
     }
 
+    /// [`Self::open`], waiting for this device's custody until `deadline` at most: for a caller
+    /// that opens another home's device inside a bounded pass (a writer's successor,
+    /// `aterm_db::generation`).
+    ///
+    /// # Errors
+    /// As [`Self::open`], or the custody is still held at `deadline`.
+    pub fn open_until(paths: &Paths, deadline: std::time::Instant) -> Result<Option<Self>> {
+        let Some(identity) = client::read_identity(paths)? else {
+            return Ok(None);
+        };
+        Self::open_identity_until(paths, identity, false, Some(deadline)).map(Some)
+    }
+
     /// The lab mark of the secrets identity this device was opened from
     /// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` A12): its file's, or, for an identity an older
     /// build made unmarked, `VirtualMachine` when this process runs in a virtual machine
@@ -1645,8 +1658,11 @@ impl Bootstrap {
     /// file as the look first saw it, whose digest a check kept while it stood so, and otherwise
     /// as the file stands now. A look that observes nothing takes the digests on their own calls,
     /// and a look at another vault is not taken. A look judges what it first saw, so this covers a
-    /// wait only where the look first looked at the files after it (a table session's admission
-    /// asks nothing through its look before its open's custody).
+    /// wait only where the look first looked at the files after it: a table session's admission
+    /// asks nothing through its own look before its open's custody, and one lent a look that
+    /// earlier admissions asked through (`aterm-db`'s round group, a look the round keeps across
+    /// read admissions no call on its stream separates) confirms the control anchor, which its own
+    /// control journal read reads, after that read ([`Self::anchor_stands_in`]).
     ///
     /// # Errors
     /// As [`Self::revalidate_custody`].
@@ -1655,7 +1671,39 @@ impl Bootstrap {
             return self.revalidate_custody();
         }
         Self::validate_observation(&self.snapshot, look.observe_commons()?)?;
-        self.immutable_custody_in(look.held_at(&self.paths).map(|(_, glance)| glance))
+        self.immutable_custody_in(look.held_at(&self.paths).map(client::Under::glance))
+    }
+
+    /// Whether `look`, a look that holds this bootstrap's vault ([`client::VaultLook::held_at`]),
+    /// first saw the control anchor as a settled file ([`fsx::Glance::first_settled`]): whether a
+    /// later [`Self::anchor_stands_in`] through it can confirm the anchor at all. It takes no
+    /// `lstat` of the anchor. `false` for a look at another vault, one that holds nothing, or one
+    /// that never looked at the anchor, found none, or found it changed within the settled window
+    /// of when the look began.
+    #[must_use]
+    pub fn anchor_settled_in(&self, look: &client::VaultLook<'_>) -> bool {
+        look.held_at(&self.paths)
+            .is_some_and(|under| under.glance().first_settled(&self.control_anchor()))
+    }
+
+    /// Whether `look`, a look that holds this bootstrap's vault ([`client::VaultLook::held_at`]),
+    /// still shows the control anchor as its glance first saw it ([`fsx::Glance::first_stands`]):
+    /// for a table session that judges its custody through a look taken before its own control
+    /// journal read (`aterm-db`'s round group, which asks this after that read and before the
+    /// custody), so the custody it judges after this stands for the anchor as of after that read,
+    /// as [`Self::revalidate_custody_in`] requires. One fresh `lstat` of the anchor, where
+    /// the look first saw it settled. `false` for a look at another vault, one that holds
+    /// nothing, one that never looked at the anchor, or an anchor that moved or had not settled
+    /// when the look began.
+    #[must_use]
+    pub fn anchor_stands_in(&self, look: &client::VaultLook<'_>) -> bool {
+        look.held_at(&self.paths)
+            .is_some_and(|under| under.glance().first_stands(&self.control_anchor()))
+    }
+
+    /// The control anchor's path, as this bootstrap's custody pins it.
+    fn control_anchor(&self) -> PathBuf {
+        self.journal_dir.join("control.anchor")
     }
 
     /// Whether an open of this bootstrap's vault ([`Self::cached_until`]) would give it back now,
@@ -1692,6 +1740,34 @@ impl Bootstrap {
     /// cannot be read, or the control journal cannot be read or lacks a node of the descriptor.
     pub fn stands(&self) -> Result<()> {
         self.revalidate_custody()?;
+        self.beside_custody(None)
+    }
+
+    /// [`Self::stands`] for a table session whose admission judged this bootstrap's custody
+    /// through `look` and read `journal` as its control view: the vault observed, and the pinned
+    /// files' digests taken, through `look` ([`Self::revalidate_custody_in`]), and the control
+    /// journal judged by `journal` in place of a read of its own ([`Self::beside_custody`]). It
+    /// judges what `stands` judges, the vault and the journal as `look` and `journal` saw them,
+    /// and the rest as it stands now: `aterm-db`'s table-repair round asks it of the bootstrap its
+    /// replica keeps, through its opening batch's look, whose admission judged that custody
+    /// already, so the vault's observation and the digests are judged as that admission judged
+    /// them, under the observation of the state lock it took.
+    ///
+    /// # Errors
+    /// As [`Self::stands`], the control journal judged being `journal`; and `journal` is another
+    /// control folder's than this bootstrap's, or was read under another trust.
+    pub fn stands_in(&self, look: &client::VaultLook<'_>, journal: &Journal) -> Result<()> {
+        self.revalidate_custody_in(look)?;
+        self.beside_custody(Some(journal))
+    }
+
+    /// What [`Self::stands`] judges beside the vault observation and the pinned files' digests:
+    /// the vault's folder and `commons/` this user's and exactly `0700`, each custody lock a
+    /// private file in the vault's folder, the creation claim readable, and the control journal
+    /// holding the descriptor's nodes: `journal` where given, which must be this bootstrap's
+    /// control folder's, read under its trust, and otherwise the journal read now
+    /// ([`descriptor_held`]).
+    fn beside_custody(&self, journal: Option<&Journal>) -> Result<()> {
         let state = aterm_uds::private_file::JudgedDir::private(&self.paths.dir)?;
         for name in ["commons.lock", "commons-device.lock"] {
             state.open(name).map_err(|error| {
@@ -1701,7 +1777,15 @@ impl Bootstrap {
         fsx::private_dir_settled(&self.paths.dir)?;
         fsx::private_dir_settled(&self.paths.dir.join("commons"))?;
         client::creation_requires_device(&self.paths)?;
-        if descriptor_held(&self.journal_dir, &self.descriptor).is_none() {
+        let held = match journal {
+            Some(journal) => {
+                journal.directory() == self.journal_dir
+                    && journal.trust() == self.descriptor.trust()
+                    && holds_nodes(journal, &self.descriptor)
+            }
+            None => descriptor_held(&self.journal_dir, &self.descriptor).is_some(),
+        };
+        if !held {
             return Err(Error::new(
                 "Commons control no longer holds its vault's descriptor",
             ));
@@ -1749,7 +1833,8 @@ impl Bootstrap {
     /// judged through the look ([`Self::revalidate_custody_in`]); a look that observes nothing, or
     /// one at another vault, gives a fresh source read. A caller keeps the look for as long as it
     /// would keep the read: `aterm-db`'s table-repair read batch, whose store opens and store read
-    /// batches stand on the batch's own source read of the vault, as its admission did.
+    /// batches stand on the source read its admission's look stands on: the batch's own, or,
+    /// where the batch is lent its round group's look, the group's first admission's.
     ///
     /// # Errors
     /// As [`Self::local_source_read`], or [`Self::revalidate_custody_in`] where the look holds the
@@ -2014,8 +2099,8 @@ impl Bootstrap {
         look: &client::VaultLook<'_>,
     ) -> Result<Option<super::roster::Access>> {
         match look.held() {
-            Some((lock, glance)) if look.paths() == &self.paths => {
-                self.access_in_observed_with(journal, Some(lock), glance)
+            Some(under) if look.paths() == &self.paths => {
+                self.access_in_observed_with(journal, Some(under))
             }
             _ => self.access_observed_in(journal),
         }
@@ -2034,15 +2119,16 @@ impl Bootstrap {
         journal: &Journal,
         lock: Option<&client::StateLock>,
     ) -> Result<Option<super::roster::Access>> {
-        self.access_in_observed_with(journal, lock, &fsx::Glance::new())
+        let moment = client::Moment::new(&self.paths);
+        self.access_in_observed_with(journal, lock.map(|lock| client::Under::of(lock, &moment)))
     }
 
-    /// [`Self::access_in_observed`], each file looked at through `glance`.
+    /// [`Self::access_in_observed`], under `under`'s observation where given, each file looked at
+    /// through its glance.
     fn access_in_observed_with(
         &self,
         journal: &Journal,
-        lock: Option<&client::StateLock>,
-        glance: &fsx::Glance,
+        under: Option<client::Under<'_>>,
     ) -> Result<Option<super::roster::Access>> {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
@@ -2055,21 +2141,19 @@ impl Bootstrap {
         // this is (`client::swarm_member_heard_now`), read afresh and give such a Mac nothing
         // new. Both memos take the caller's own shared observation for theirs
         // (`client::trusted_commons_log_under`), and the access looks at the vault's files once
-        // for both and for the state its log stands on, through `glance` (`fsx::Glance`).
-        if let Some(lock) = lock
-            && client::local_recipient_denied_under(&self.paths, lock, glance)?
+        // for both and for the state its log stands on, through `under`'s glance (`fsx::Glance`).
+        if let Some(under) = under
+            && client::local_recipient_denied_under(&self.paths, under)?
         {
             return Ok(None);
         }
-        let trusted = match lock {
-            Some(lock) => {
-                client::trusted_commons_log_under(&self.paths, self.trust(), lock, glance)?
-            }
+        let trusted = match under {
+            Some(under) => client::trusted_commons_log_under(&self.paths, self.trust(), under)?,
             None => client::trusted_commons_log_now(&self.paths, self.trust())?,
         };
         let maybe_access = if let Some((log, heads_digest)) = trusted {
-            let lock =
-                lock.ok_or_else(|| Error::new("Commons membership log has no vault observation"))?;
+            let under = under
+                .ok_or_else(|| Error::new("Commons membership log has no vault observation"))?;
             let me = self.device.identity.recipient();
             let req = self.request()?;
             if log.wraps_to(&me)
@@ -2118,8 +2202,7 @@ impl Bootstrap {
                     &self.device.identity,
                     &log,
                     heads_digest,
-                    lock,
-                    glance,
+                    under,
                 )?
             } else {
                 super::roster::current(journal, &self.device.identity)?
@@ -2497,11 +2580,14 @@ fn holds_descriptor(journal_dir: &Path, descriptor: &Descriptor) -> Result<Optio
 fn descriptor_held(journal_dir: &Path, descriptor: &Descriptor) -> Option<Journal> {
     Journal::read_existing(journal_dir, descriptor.trust())
         .ok()
-        .filter(|journal| {
-            std::iter::once(&descriptor.genesis)
-                .chain(&descriptor.repair)
-                .all(|node| journal.node(&node.id()).is_some())
-        })
+        .filter(|journal| holds_nodes(journal, descriptor))
+}
+
+/// Whether `journal` holds every node of `descriptor`: its genesis and each repair node.
+fn holds_nodes(journal: &Journal, descriptor: &Descriptor) -> bool {
+    std::iter::once(&descriptor.genesis)
+        .chain(&descriptor.repair)
+        .all(|node| journal.node(&node.id()).is_some())
 }
 
 fn pin_bytes(trust: Trust) -> Vec<u8> {

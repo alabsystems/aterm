@@ -51,7 +51,7 @@ fn metadata_observation_never_recovers_publication_or_reads_credentials() {
                 logins,
                 "main",
                 None,
-                "/opaque/login",
+                at!("/opaque/login"),
                 None,
                 NOW,
             ))
@@ -64,7 +64,7 @@ fn metadata_observation_never_recovers_publication_or_reads_credentials() {
                 logins,
                 "main",
                 None,
-                "/other/login",
+                at!("/other/login"),
                 None,
                 NOW,
             ))
@@ -102,7 +102,7 @@ fn metadata_observation_refuses_roster_or_publication_changed_during_read() {
                             logins,
                             "main",
                             None,
-                            "/new/login",
+                            at!("/new/login"),
                             None,
                             NOW,
                         ))

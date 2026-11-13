@@ -731,7 +731,8 @@ impl World {
         let probes = run.w.join("setup-token-probes");
         crate::util::create_private_dir_all(&probes).map_err(|e| die("the probes' root", e))?;
         let key = account_key().ok_or_else(|| die("the account", "it cannot be keyed"))?;
-        let (vault, server) = seat_vault(run, &home)?;
+        let (vault, server) = seat_scratch_vault(&run.w.join("vault-server"), &home)
+            .map_err(|why| Fail::die(format!("setup-token-lab: {why}")))?;
         Ok(World {
             home,
             build,
@@ -744,23 +745,26 @@ impl World {
     }
 }
 
-/// The scratch home's vault, created and seated on a server this process runs on loopback, as
-/// the harness's own tests make one: this Mac its first member and admin, its roster and genesis
-/// seeded and its log mirrored.
-fn seat_vault(
-    run: &Run,
+/// The scratch vault of `home`, created and seated on a server this process runs on loopback
+/// with its store under `root`, as the harness's own tests make one: this Mac its first member
+/// and admin, its roster and genesis seeded and its log mirrored. The server runs for as long
+/// as the caller keeps it.
+/// # Errors
+/// What could not be made, in words.
+pub(crate) fn seat_scratch_vault(
+    root: &Path,
     home: &Path,
-) -> Result<(aterm_secrets::client::Paths, aterm_secrets::server::Running), Fail> {
-    let root = run.w.join("vault-server");
-    crate::util::create_private_dir_all(&root).map_err(|e| die("the vault server's folder", e))?;
+) -> Result<(aterm_secrets::client::Paths, aterm_secrets::server::Running), String> {
+    let said = |what: &str, e: &dyn std::fmt::Display| format!("{what}: {e}");
+    crate::util::create_private_dir_all(root).map_err(|e| said("the vault server's folder", &e))?;
     let socket =
-        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| die("the vault's port", e))?;
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| said("the vault's port", &e))?;
     let server = aterm_secrets::server::start(
         socket,
         &aterm_secrets::server::Options {
             listen: "127.0.0.1:0"
                 .parse()
-                .map_err(|e| die("the vault's address", e))?,
+                .map_err(|e| said("the vault's address", &e))?,
             store: root.join("store"),
             advertise: None,
             pins: Vec::new(),
@@ -768,23 +772,20 @@ fn seat_vault(
             keep_awake: false,
         },
     )
-    .map_err(|e| die("the vault server", e))?;
+    .map_err(|e| said("the vault server", &e))?;
     let url = format!("http://{}/v1/lab", server.addr);
     let paths = aterm_secrets::client::Paths::for_home(home);
     aterm_secrets::client::create(&paths, &url, None, Some("lab-mac"))
-        .map_err(|e| die("the vault", e))?;
+        .map_err(|e| said("the vault", &e))?;
     aterm_secrets::client::admin_seed_swarm_roster(&paths, &[])
-        .map_err(|e| die("its roster", e))?;
+        .map_err(|e| said("its roster", &e))?;
     aterm_secrets::client::seed_vault_genesis(&paths, &root.join("lab.genesis"))
-        .map_err(|e| die("its genesis", e))?;
-    aterm_secrets::client::admin_mirror_log(&paths, &[]).map_err(|e| die("its log", e))?;
+        .map_err(|e| said("its genesis", &e))?;
+    aterm_secrets::client::admin_mirror_log(&paths, &[]).map_err(|e| said("its log", &e))?;
     let route = aterm_secrets::client::write_route(&paths, Instant::now() + HANG)
-        .map_err(|e| die("its write route", e))?;
+        .map_err(|e| said("its write route", &e))?;
     if route != aterm_secrets::client::WriteRoute::Seated {
-        return Err(die(
-            "the vault",
-            format!("this Mac is not seated ({route:?})"),
-        ));
+        return Err(format!("the vault: this Mac is not seated ({route:?})"));
     }
     Ok((paths, server))
 }
@@ -1315,8 +1316,8 @@ fn spawn_tab(door: &Door<'_>) -> Result<String, Fail> {
     out.lines()
         .next()
         .and_then(|l| l.strip_prefix("OK "))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
         .ok_or_else(|| die("spawn", format!("no session: {}", out.trim())))
 }
 

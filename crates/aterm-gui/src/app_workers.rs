@@ -11,8 +11,8 @@ use crate::WindowId;
 use crate::app_tabs::{align_terminal_projection_to_active, reorder_with_projection};
 use crate::native_app::{AppViewState, DamageRegion, NativeApp};
 use crate::native_workers::{
-    ATERM_GROUP, WORKERS_TITLE, WorkerRow, WorkersAction, WorkersViewState, chip_title_of,
-    result_to_read, row_state, why_words,
+    ATERM_GROUP, RowGroup, WORKERS_TITLE, WorkerRow, WorkersAction, WorkersViewState,
+    chip_title_of, from_label, result_to_read, row_state, why_words,
 };
 use crate::tab_model::{
     AppInstanceId, Tab, TabIconKind, TabId, TabIndicators, TabPresentation, View, ViewId,
@@ -271,22 +271,45 @@ impl App {
         hosting: &crate::harness_reach::HarnessHosting,
     ) -> WorkerRow {
         let chip = self.overview_chip(handle, hosting);
-        let record = handle
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .task()
-            .cloned();
+        let (record, lineage) = {
+            let timeline = handle
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.task().cloned(),
+                timeline.slog().lineage().map(|id| id.as_str().to_owned()),
+            )
+        };
         let state = row_state(record.as_ref(), chip.need.is_some());
-        let manager = record
-            .as_ref()
-            .map(|task| task.from.clone())
-            .filter(|from| from != crate::task_record::FROM_CTL);
-        let group = manager.as_deref().map_or_else(
-            || ATERM_GROUP.to_owned(),
-            |from| self.worker_group_label(from),
+        // A fleet drive's spawn sits under the Mac that asked, whatever its task names as its
+        // manager (a session on that Mac); a local manager's under that manager.
+        let request = crate::requests_host::placed(handle.sid.as_str(), lineage.as_deref()).filter(
+            |placed| {
+                matches!(
+                    placed.via,
+                    aterm_requests::Via::FleetShell | aterm_requests::Via::FleetWorker
+                )
+            },
         );
+        let (under, group) = match &request {
+            Some(placed) => (
+                RowGroup::From(placed.node.clone()),
+                from_label(&placed.host, &placed.node),
+            ),
+            None => match record
+                .as_ref()
+                .map(|task| task.from.as_str())
+                .filter(|from| *from != crate::task_record::FROM_CTL)
+            {
+                Some(from) => (
+                    RowGroup::Manager(from.to_owned()),
+                    self.worker_group_label(from),
+                ),
+                None => (RowGroup::Aterm, ATERM_GROUP.to_owned()),
+            },
+        };
         let elapsed = record.as_ref().map_or_else(
             || chip.doing.clone(),
             |task| {
@@ -317,7 +340,7 @@ impl App {
         WorkerRow {
             session: handle.local_id,
             group,
-            manager,
+            under,
             state,
             title,
             agent: record
@@ -326,7 +349,10 @@ impl App {
                 .map(|program| program.name().to_owned()),
             elapsed,
             last_words: crate::survey::last_words(handle, state.concluded()),
-            why: record.as_ref().and_then(why_words),
+            why: match &record {
+                Some(record) => why_words(record),
+                None => request.and_then(|placed| placed.end).map(request_end_words),
+            },
             has_result: record.as_ref().is_some_and(result_to_read),
             stoppable: chip.stoppable,
             finished: false,
@@ -505,6 +531,15 @@ impl App {
             self.tab_label_of_session(session)
         );
         self.note_tab_keep(&held);
+        // A drive's spawn kept is the person's: its request says so, and no drive owns it now.
+        let sids: Vec<String> = held
+            .iter()
+            .filter_map(|local| self.session_id_text(*local))
+            .collect();
+        for sid in &sids {
+            crate::control::forget_driven(&aterm_session::SessionId::new(sid));
+        }
+        crate::requests_host::kept(sids, &crate::tab_marks::keep_actor());
         self.session_chrome.remove(&session);
         self.resync_active_or_window(wid);
         true
@@ -728,6 +763,23 @@ impl App {
     }
 }
 
+/// How a concluded request reads beside a row with no task (a fleet drive's plain shell, whose
+/// pane its request's end leaves standing).
+fn request_end_words((out, why): (aterm_requests::Out, aterm_requests::EndWhy)) -> String {
+    use aterm_requests::EndWhy;
+    match why {
+        EndWhy::Idle => format!(
+            "request {}, undriven {} min",
+            out.word(),
+            aterm_requests::LEASE_IDLE_MS / 60_000
+        ),
+        EndWhy::RequesterLeft => format!("request {}, its Mac left the fleet", out.word()),
+        EndWhy::Relaunch => format!("request {} at a relaunch", out.word()),
+        EndWhy::Kept => "request kept".to_owned(),
+        EndWhy::TabsLeft | EndWhy::SpawnRefused => format!("request {}", out.word()),
+    }
+}
+
 /// A retired worker's row on its window's page, under Finished: what it was, how its task ended,
 /// and when its tab closed.
 fn finished_worker_row(session: u64, row: &crate::retired_workers::Retired) -> WorkerRow {
@@ -736,7 +788,11 @@ fn finished_worker_row(session: u64, row: &crate::retired_workers::Retired) -> W
     WorkerRow {
         session,
         group: crate::native_workers::FINISHED_GROUP.to_owned(),
-        manager: Some(record.from.clone()).filter(|from| from != crate::task_record::FROM_CTL),
+        under: if record.from == crate::task_record::FROM_CTL {
+            RowGroup::Aterm
+        } else {
+            RowGroup::Manager(record.from.clone())
+        },
         state: row_state(Some(record), false),
         title: row.title.clone(),
         agent: record.agent.map(|program| program.name().to_owned()),

@@ -2133,7 +2133,7 @@ fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
         pid: 42,
         fabric: fabric.map(str::to_string),
         supervised,
-        bridge_pids: pids,
+        bridge_pids: Some(pids),
         node: Some("n-a".to_string()),
         ..fabric::InstanceView::default()
     };

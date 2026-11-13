@@ -150,8 +150,12 @@ fn cached_origins_build_once_and_keep_independent_git_and_index_paths() {
     let c = Origin::new();
     assert_eq!(git(&c.work, &["rev-parse", "HEAD"]), before);
     for origin in [&a, &b, &c] {
-        let index =
-            fs::read_to_string(origin.work.join("target/verify/test-executables.json")).unwrap();
+        let index = fs::read_to_string(
+            origin
+                .work
+                .join("target/.ubd/main.noindex/verify/test-executables.json"),
+        )
+        .unwrap();
         assert!(
             index.contains(&origin.work.to_string_lossy().to_string()),
             "{index}"
@@ -197,13 +201,13 @@ fn seed_index(root: &Path, bytes: &[u8]) {
 }
 
 fn seed_index_named(root: &Path, bytes: &[u8], name: &str) {
-    let binary = root.join("target/debug/deps").join(name);
+    let binary = root.join("target/.ubd/main.noindex/debug/deps").join(name);
     fs::create_dir_all(binary.parent().unwrap()).unwrap();
     fs::write(&binary, bytes).unwrap();
     let (tree, compiler) = aterm_verify::test_index::identities(root, &targo()).unwrap();
     aterm_verify::test_index::Index::from_messages(tree, compiler, &artifact(root, &binary))
         .unwrap()
-        .write(&root.join("target/verify/test-executables.json"))
+        .write(&root.join("target/.ubd/main.noindex/verify/test-executables.json"))
         .unwrap();
 }
 
@@ -250,7 +254,9 @@ fn generator<'a>(
     move |cmd: &mut Command| {
         assert_eq!(
             Path::new(cmd.get_program()).parent().unwrap(),
-            cmd.get_current_dir().unwrap().join("target/debug/deps")
+            cmd.get_current_dir()
+                .unwrap()
+                .join("target/.ubd/main.noindex/debug/deps")
         );
         assert_eq!(
             PathBuf::from(env_of(cmd, "CARGO_MANIFEST_DIR").unwrap()),
@@ -330,7 +336,9 @@ fn the_indexed_generator_runs_once_per_reserved_identity() {
 fn a_missing_or_changed_binary_compiles_only_the_generator_before_running_it() {
     for changed in [false, true] {
         let o = Origin::new();
-        let binary = o.work.join("target/debug/deps/aterm_gui-0123456789abcdef");
+        let binary = o
+            .work
+            .join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef");
         if changed {
             fs::write(&binary, b"changed").unwrap();
         } else {
@@ -381,7 +389,8 @@ fn an_interrupted_binary_holds_only_its_own_execution() {
     assert_eq!(runs.get(), 0);
     // A stale digest must not let a fallback compiler replace this held path.
     fs::write(
-        o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+        o.work
+            .join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef"),
         b"changed",
     )
     .unwrap();
@@ -421,7 +430,7 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
             cmd.get_program(),
             cmd.get_current_dir()
                 .unwrap()
-                .join("target/debug/deps/aterm_gui-0123456789abcdef")
+                .join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef")
         );
         assert_eq!(
             PathBuf::from(env_of(cmd, "CARGO_MANIFEST_DIR").unwrap()),
@@ -690,7 +699,7 @@ fn main_reader_field_hold_names_a_stale_row_and_lands_the_facts() {
                 let mut status = exit(0);
                 let stdout = if args.iter().any(|a| a == "--no-run") {
                     compiles += 1;
-                    artifact(tree, &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"))
+                    artifact(tree, &o.work.join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef"))
                 } else if args.iter().any(|a| a == fixtures::FIELD_HOLD_TEST) {
                     holds += 1;
                     assert!(args.iter().any(|a| a == "--ignored"));
@@ -698,7 +707,7 @@ fn main_reader_field_hold_names_a_stale_row_and_lands_the_facts() {
                     let release = PathBuf::from(env_of(cmd, fixtures::FIELD_HOLD_RELEASE).unwrap());
                     assert_eq!(release, tree.join(HANDOFF_FIXTURE_ROOT).join("v0.6.0"));
                     assert_eq!(fs::read_to_string(release.join("fields.toml")).unwrap(), fields);
-                    assert_eq!(Path::new(cmd.get_program()), o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"));
+                    assert_eq!(Path::new(cmd.get_program()), o.work.join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef"));
                     if outcome == "unavailable" {
                         return Err(std::io::Error::other("field hold did not start"));
                     } else if outcome == "missing" {
@@ -771,7 +780,7 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
                 let stdout = match calls {
                     1 => {
                         assert!(args.iter().any(|a| a == "--no-run"));
-                        artifact(tree, &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"))
+                        artifact(tree, &o.work.join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef"))
                     }
                     2 => {
                         assert!(args.iter().any(|a| a == "--ignored"));
@@ -1199,7 +1208,9 @@ fn compiled_reader_timelines_execute_the_judged_tree_and_keep_its_field_red() {
             &mut generator(&["history"], &Cell::new(0)),
         )
         .unwrap();
-        let binary = o.work.join("target/debug/deps/aterm_gui-0123456789abcdef");
+        let binary = o
+            .work
+            .join("target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef");
         let mut warmed = String::new();
         if timeline == "failed" {
             // A failed attempt must invalidate an earlier successful index too.
@@ -1438,9 +1449,9 @@ fn main_reader_reopens_warm_but_never_reuses_previous_answers_or_tree() {
             "workspace must be leased"
         );
         let mut calls = 0;
-        let binary = o
-            .work
-            .join(format!("target/debug/deps/aterm_gui-{take:016x}"));
+        let binary = o.work.join(format!(
+            "target/.ubd/main.noindex/debug/deps/aterm_gui-{take:016x}"
+        ));
         fs::write(&binary, format!("compiled tip {take}")).unwrap();
         let reading = reader.read(&targo(), tip.trim(), &pins(7), &mut |cmd| {
             if let Some(out) = field_hold_pass(cmd) {
@@ -1535,7 +1546,9 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
                         status: exit(0),
                         stdout: artifact(
                             cmd.get_current_dir().unwrap(),
-                            &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+                            &o.work.join(
+                                "target/.ubd/main.noindex/debug/deps/aterm_gui-0123456789abcdef",
+                            ),
                         )
                         .into_bytes(),
                         stderr: Vec::new(),

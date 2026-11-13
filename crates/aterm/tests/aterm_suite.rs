@@ -152,7 +152,7 @@ mod worker_spawn_live_headless;
 #[cfg(unix)]
 extern "C" fn widen_test_threads() {
     if std::env::var_os("RUST_TEST_THREADS").is_none() {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(4));
+        let n = aterm_cores::available_parallelism().map_or(4, |n| n.get().saturating_mul(4));
         // SAFETY: load time, before `main`: no other thread exists to read the environment.
         unsafe { std::env::set_var("RUST_TEST_THREADS", n.to_string()) };
     }

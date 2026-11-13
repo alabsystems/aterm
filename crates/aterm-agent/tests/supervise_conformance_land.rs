@@ -100,6 +100,7 @@ fn point(
     left: &[Identity],
 ) -> TurnEndReading {
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase: if at.busy { Phase::Busy } else { Phase::Idle },
         authoritative: true,
         survey: false,
@@ -599,7 +600,7 @@ fn projects(real: &TurnEndState, st: &State) {
     // either end, so a task the model has concluded is never typed into by the host.
     assert_eq!(real.concluded(), done, "what a carry-on reads at {st:?}");
     // Every walk begins after a point, so no person's exchange here opens the session: Land
-    // carries each one on (owner ruling 2026-10-27).
+    // carries each one on.
     assert!(
         !real.left_to_person(),
         "a person's exchange left to them at {st:?}"
@@ -954,7 +955,7 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         assert!(missed.starts_with(&format!("{teller:?} told ")), "{missed}");
     }
     // A done task that is no landing is, under Land, the person's exchange that opens the session
-    // alone (owner ruling 2026-10-27), which the model's walks, begun after a point, never reach:
+    // alone, which the model's walks, begun after a point, never reach:
     // a decider no point was judged in yet tells it theirs, and `LandedForDone` tells it landed.
     for (teller, told) in [
         (Teller::Loop, TaskFace::Theirs),

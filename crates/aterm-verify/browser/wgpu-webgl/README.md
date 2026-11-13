@@ -5,7 +5,7 @@
 
 These are the frames `aterm-gpu-web` presented on a WebGL2 canvas while it
 still drew through wgpu 29's WebGL2 backend (glow over web-sys, wasm-bindgen
-glue), before wasm-platform WP.8 (docs/AUDIT-third-party-2026-10-15.md)
+glue), before wasm-platform WP.8
 replaced that backend with aterm-gpu's own GL arm driven through
 aterm-wasm-abi imports. `verify browser` holds every later module to them:
 the recorded-frame differential (`crates/aterm-verify/src/browser/recorded.rs`).

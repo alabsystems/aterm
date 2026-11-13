@@ -596,7 +596,7 @@ fn sweep(
         });
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
         .min(16);
     let results: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {

@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.198.0"
+version = "0.199.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -164,6 +164,7 @@ dependencies = [
  "aterm-containment",
  "aterm-control",
  "aterm-converge",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-db",
  "aterm-digest",
@@ -213,6 +214,7 @@ dependencies = [
 name = "aterm-a11y"
 version = "0.0.0"
 dependencies = [
+ "aterm-cores",
  "aterm-dbus",
  "aterm-log",
  "aterm-macos-ui",
@@ -236,8 +238,10 @@ dependencies = [
  "aterm-macos-ui",
  "aterm-objc",
  "aterm-png",
+ "aterm-pty",
  "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-template-icon",
  "aterm-time",
  "aterm-types",
  "aterm-uds",
@@ -254,6 +258,7 @@ dependencies = [
  "astream-wire",
  "aterm-capacity",
  "aterm-codec",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-db",
  "aterm-digest",
@@ -333,6 +338,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-aos",
  "aterm-core",
+ "aterm-cores",
  "aterm-effects",
  "aterm-gpu",
  "aterm-grid",
@@ -367,6 +373,7 @@ name = "aterm-bootstrap-verify"
 version = "0.0.0"
 dependencies = [
  "aterm-codec",
+ "aterm-cores",
  "aterm-digest",
  "aterm-json",
  "aterm-tempfile",
@@ -435,6 +442,7 @@ name = "aterm-census"
 version = "0.0.0"
 dependencies = [
  "aterm-codec",
+ "aterm-cores",
  "aterm-digest",
  "aterm-hash",
  "aterm-regex",
@@ -594,6 +602,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-cores"
+version = "0.0.0"
+dependencies = [
+ "aterm-uds",
+]
+
+[[package]]
 name = "aterm-ctl"
 version = "0.0.0"
 dependencies = [
@@ -621,12 +636,14 @@ dependencies = [
  "astream-broker",
  "astream-sys",
  "astream-wire",
+ "aterm-bench",
  "aterm-census",
  "aterm-codec",
  "aterm-ctl",
  "aterm-db-core",
  "aterm-digest",
  "aterm-durable",
+ "aterm-heap-count",
  "aterm-http",
  "aterm-journal",
  "aterm-json",
@@ -722,9 +739,11 @@ dependencies = [
  "aterm-aos",
  "aterm-census",
  "aterm-core",
+ "aterm-cores",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-lexicon",
+ "aterm-messages",
  "aterm-models-aos",
  "aterm-models-effects",
  "aterm-models-misc",
@@ -748,6 +767,7 @@ name = "aterm-font"
 version = "0.0.0"
 dependencies = [
  "aterm-bidi",
+ "aterm-cores",
  "aterm-grapheme",
  "aterm-tempfile",
 ]
@@ -773,6 +793,7 @@ dependencies = [
  "aterm-bits",
  "aterm-codec",
  "aterm-core",
+ "aterm-cores",
  "aterm-digest",
  "aterm-effects",
  "aterm-hash",
@@ -861,7 +882,9 @@ dependencies = [
  "aterm-containment",
  "aterm-control",
  "aterm-core",
+ "aterm-cores",
  "aterm-ctl",
+ "aterm-db",
  "aterm-dbus",
  "aterm-digest",
  "aterm-dirfd",
@@ -917,6 +940,8 @@ dependencies = [
  "aterm-provenance",
  "aterm-pty",
  "aterm-render",
+ "aterm-repository-progress",
+ "aterm-requests",
  "aterm-resource-host",
  "aterm-restore",
  "aterm-sandbox",
@@ -932,6 +957,7 @@ dependencies = [
  "aterm-sysprobe",
  "aterm-telemetry",
  "aterm-tempfile",
+ "aterm-template-icon",
  "aterm-theme-pack",
  "aterm-time",
  "aterm-toml",
@@ -1095,6 +1121,7 @@ dependencies = [
  "aterm-capacity",
  "aterm-codec",
  "aterm-core",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-db",
  "aterm-digest",
@@ -1187,6 +1214,7 @@ dependencies = [
  "astream-sys",
  "astream-wire",
  "aterm-codec",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-digest",
  "aterm-durable",
@@ -1238,6 +1266,7 @@ dependencies = [
  "aterm-objc",
  "aterm-pty",
  "aterm-repo-storage",
+ "aterm-repository-progress",
  "aterm-secrets",
  "aterm-serde",
  "aterm-stamp",
@@ -1259,6 +1288,8 @@ version = "0.0.0"
 dependencies = [
  "aterm-dl",
  "aterm-objc",
+ "aterm-template-icon",
+ "aterm-types",
  "aterm-uds",
 ]
 
@@ -1373,6 +1404,7 @@ dependencies = [
  "aterm-capacity",
  "aterm-cli",
  "aterm-core",
+ "aterm-cores",
  "aterm-db",
  "aterm-db-core",
  "aterm-effects",
@@ -1599,6 +1631,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-agent-names",
  "aterm-core",
+ "aterm-cores",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-regex",
@@ -1690,6 +1723,7 @@ dependencies = [
  "aterm-census",
  "aterm-codec",
  "aterm-converge",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-digest",
  "aterm-dirfd",
@@ -1728,13 +1762,16 @@ dependencies = [
  "aterm-bidi",
  "aterm-codec",
  "aterm-core",
+ "aterm-cores",
  "aterm-effects",
  "aterm-font",
  "aterm-grapheme",
  "aterm-hash",
+ "aterm-macos-ui",
  "aterm-messages",
  "aterm-models-effects",
  "aterm-models-render",
+ "aterm-objc",
  "aterm-png",
  "aterm-spec",
  "aterm-spec-anchor",
@@ -1754,6 +1791,31 @@ dependencies = [
  "aterm-tempfile",
  "libc",
  "ring",
+]
+
+[[package]]
+name = "aterm-repository-progress"
+version = "0.0.0"
+dependencies = [
+ "aterm-json",
+ "aterm-serde",
+ "aterm-tempfile",
+ "aterm-types",
+ "aterm-uds",
+]
+
+[[package]]
+name = "aterm-requests"
+version = "0.0.0"
+dependencies = [
+ "aterm-codec",
+ "aterm-digest",
+ "aterm-durable",
+ "aterm-slog",
+ "aterm-stamp",
+ "aterm-tempfile",
+ "aterm-types",
+ "aterm-uds",
 ]
 
 [[package]]
@@ -1788,6 +1850,7 @@ version = "0.0.0"
 dependencies = [
  "astream-wire",
  "aterm-core",
+ "aterm-cores",
  "aterm-json",
  "aterm-lz4",
  "aterm-models-session",
@@ -1855,11 +1918,13 @@ dependencies = [
  "astream-broker",
  "astream-sys",
  "astream-wire",
+ "aterm-bench",
  "aterm-codec",
  "aterm-db-core",
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
+ "aterm-heap-count",
  "aterm-http",
  "aterm-journal",
  "aterm-json",
@@ -1964,12 +2029,14 @@ dependencies = [
  "aterm-phase",
  "aterm-spec",
  "aterm-tempfile",
+ "aterm-types",
 ]
 
 [[package]]
 name = "aterm-spec"
 version = "0.0.0"
 dependencies = [
+ "aterm-cores",
  "aterm-dirfd",
  "aterm-json",
  "aterm-spec",
@@ -2051,6 +2118,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-template-icon"
+version = "0.0.0"
+dependencies = [
+ "aterm-png",
+]
+
+[[package]]
 name = "aterm-theme-pack"
 version = "0.0.0"
 dependencies = [
@@ -2078,6 +2152,7 @@ dependencies = [
  "aterm-spec",
  "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-toml",
  "aterm-uds",
  "libc",
 ]
@@ -2106,10 +2181,12 @@ dependencies = [
  "aterm-hash",
  "aterm-json",
  "aterm-log",
+ "aterm-models-setup",
  "aterm-models-swarm",
  "aterm-serde",
  "aterm-spec",
  "aterm-spec-anchor",
+ "aterm-stamp",
  "aterm-tempfile",
  "aterm-time",
  "aterm-uds",
@@ -2140,6 +2217,7 @@ dependencies = [
  "agh-fake",
  "astream-sys",
  "aterm-codec",
+ "aterm-cores",
  "aterm-digest",
  "aterm-durable",
  "aterm-json",
@@ -2192,6 +2270,7 @@ dependencies = [
  "aterm-census",
  "aterm-codec",
  "aterm-containment",
+ "aterm-cores",
  "aterm-ctl",
  "aterm-digest",
  "aterm-dirfd",
@@ -2356,6 +2435,16 @@ name = "aterm-winres"
 version = "0.0.0"
 
 [[package]]
+name = "aterm-winship"
+version = "0.0.0"
+dependencies = [
+ "aterm-json",
+ "aterm-png",
+ "aterm-tempfile",
+ "aterm-uds",
+]
+
+[[package]]
 name = "aterm-winsign"
 version = "0.0.0"
 dependencies = [
@@ -2386,6 +2475,7 @@ dependencies = [
 name = "aterm-zstd"
 version = "0.0.0"
 dependencies = [
+ "aterm-cores",
  "aterm-digest",
  "aterm-tempfile",
  "aterm-uds",
@@ -2403,6 +2493,7 @@ dependencies = [
  "aterm-codec",
  "aterm-containment",
  "aterm-converge",
+ "aterm-cores",
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
@@ -2461,6 +2552,7 @@ dependencies = [
  "aterm-capacity",
  "aterm-census",
  "aterm-codec",
+ "aterm-cores",
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",

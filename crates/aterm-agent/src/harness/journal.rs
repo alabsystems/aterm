@@ -14,7 +14,10 @@
 //!   ([`super::accounts::Account::pk`]), the account key of the claims email (design §5).
 //! - [`observe`]: after a transaction's edit, its ledger rows gain that key
 //!   ([`super::accounts::Event::pk`]) and become notes in the journal's vocabulary, with the
-//!   session starts and ends, quota readings and walls the state's diff shows.
+//!   session starts and ends, quota readings and walls the state's diff shows, and each
+//!   account's sign-in word, which is the state's own ([`SignWord`], [`Told`]): a row's note
+//!   states a word only where the store holds it, and a word no row stated is told from the
+//!   state, so the fleet's fold ends on what this Mac's store holds whichever recorder set it.
 //! - [`publish`]: once the transaction is durable, each note goes to the sink, whose `note` is
 //!   one bounded append to the spool with no lock and no allocation (the typing hook).
 //! - [`backfill`]: once per Mac, the local ledger's last 30 days and the state's standing facts;
@@ -29,11 +32,11 @@
 
 #[cfg(unix)]
 use super::accounts::Store;
-use super::accounts::{Auth, Cli, Event, Kind, Roster, State, WindowFig};
+use super::accounts::{Auth, Cli, Event, Kind, Roster, SignInStep, State, WindowFig};
 use super::claims::LeaseKey;
 use super::provider_read::{ProbeEvent, Read};
 use crate::ai::connector::Region;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
@@ -229,7 +232,83 @@ pub const WHYS: &[&str] = &[
     "no-route",
     "failed",
     "blocked",
+    // A sign-in that failed, or answered another account, on an account whose login here still
+    // works: an `error` for the log, never the account's sign-in word ([`observe`]).
+    "sign-in-failed",
+    "wrong-account",
 ];
+
+/// A Mac's sign-in word for one account, as the journal's fold holds it
+/// (`aterm_db::alab::journal::Event::signin`): what the last note about the account's sign-in
+/// leaves there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignWord {
+    /// Signed in (`signed-in`, `renewed`, `auth` saying `ok`).
+    In,
+    /// Signed out (`signed-out`, `displaced`).
+    Out,
+    /// Its login was seen ended (`login-ended`).
+    Ended,
+    /// A sign-in answered another account (`wrong-account`).
+    Wrong,
+    /// A sign-in bound no login (`sign-in-failed`).
+    Failed,
+    /// The Mac holds no word any more (`auth` saying `unseen`).
+    Unknown,
+}
+
+impl SignWord {
+    const ALL: [SignWord; 6] = [
+        Self::In,
+        Self::Out,
+        Self::Ended,
+        Self::Wrong,
+        Self::Failed,
+        Self::Unknown,
+    ];
+
+    /// The fold's word, which `state.json` holds too ([`Told`]).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Ended => "ended",
+            Self::Wrong => "wrong",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The word `text` names.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|word| word.as_str() == text)
+    }
+
+    /// Whether a fleet that holds this word says what a store whose login word is `auth` holds:
+    /// `in` is a login that works and nothing else is; a login signed out is `out`, `ended`, or
+    /// a failed or wrong sign-in of it; with no word on record the fleet holds none, or only how
+    /// the last sign-in of it ended.
+    #[must_use]
+    pub const fn agrees(self, auth: Auth) -> bool {
+        match auth {
+            Auth::Ok => matches!(self, Self::In),
+            Auth::SignedOut => matches!(self, Self::Out | Self::Ended | Self::Wrong | Self::Failed),
+            Auth::Unseen => matches!(self, Self::Unknown | Self::Wrong | Self::Failed),
+        }
+    }
+}
+
+/// What this Mac's journal was last told of one account's sign-in
+/// ([`State::told`](super::accounts::State::told)): the word, and the time its note carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Told {
+    pub word: SignWord,
+    /// Unix seconds. A later word is told under a later time, whatever the clock says, so the
+    /// fold's "newest wins" always takes it.
+    pub t: u64,
+}
 
 /// One journal note: an event about one account, in the journal's closed vocabulary. `Copy`,
 /// with no heap value, so noting one allocates nothing.
@@ -353,6 +432,26 @@ pub fn token_note(event: TokenEvent, account: Key, t: u64, why: Option<&'static 
     let mut note = Note::new(t, event.kind(), account, Cli::Claude, src);
     note.why = why.filter(|why| WHYS.contains(why));
     note
+}
+
+/// The note of what a check of `cli`'s login learned at `t` where no roster row lists that
+/// login, so the accounts store has no record to carry it: `signed-out`, or `auth` `ok` of one
+/// that served. The account is the one the login's own files name (`email`), keyed as the
+/// registry keys an observed login ([`claims_of`]); none without that key, so nothing is ever
+/// said of an account nobody could name.
+#[must_use]
+pub fn unlisted_login_note(cli: Cli, email: &str, working: bool, t: i64) -> Option<Note> {
+    let (realm, email) = claims_of(cli, email)?;
+    let account = realm_key(&realm, &email)?;
+    let mut note = Note::new(
+        secs(t)?,
+        if working { "auth" } else { "signed-out" },
+        account,
+        cli,
+        "cli-output",
+    );
+    note.why = working.then_some("ok");
+    Some(note)
 }
 
 /// The note of a token the capture made for another account than the one asked for
@@ -524,6 +623,55 @@ pub fn quota_notes(cli: Cli, account: Key, read: &super::accounts::TapRead) -> V
     .collect()
 }
 
+/// What an observed account's record learned of its login's sign-in
+/// ([`super::observed_account`]), as a note: `signed-out` (sharp, so the fleet hears it on the
+/// next flush), or `auth` with why `ok` (a read the provider answered) or `unseen` (a login
+/// file rewritten since its sign-out, not yet read). `src` is where it was learned: the login
+/// file ([`ObservedSrc::AuthFile`]'s word) or a provider read (`probe`).
+#[must_use]
+pub fn auth_note(
+    cli: impl Into<ObservedCli>,
+    account: Key,
+    auth: Auth,
+    src: &'static str,
+    t: u64,
+) -> Note {
+    let (kind, why) = match auth {
+        Auth::SignedOut => ("signed-out", None),
+        Auth::Ok => ("auth", Some("ok")),
+        Auth::Unseen => ("auth", Some("unseen")),
+    };
+    let mut note = Note::worded(t, kind, account, cli.into().id(), src);
+    note.why = why;
+    note
+}
+
+/// The `quota` note of a week a provider read reported for an observed account
+/// ([`super::observed_account`]): its share used in tenths of a percent, its reset, read at
+/// `at`, source `probe`. None for a time before the epoch.
+#[must_use]
+pub fn week_note(
+    cli: impl Into<ObservedCli>,
+    account: Key,
+    week: &super::profile::WeeklyFigure,
+) -> Option<Note> {
+    let mut note = Note::worded(secs(week.at)?, "quota", account, cli.into().id(), "probe");
+    note.window = Some("7d");
+    note.pct_x10 = Some(u16::try_from(week.used_x10.min(1000)).unwrap_or(1000));
+    note.reset = secs(week.resets_at);
+    note.res = Some("exact");
+    Some(note)
+}
+
+/// The note of a provider read of an observed account that came to nothing and named no
+/// sign-in wall: an `error` from the `probe`, why `unreadable`.
+#[must_use]
+pub fn read_failed_note(cli: impl Into<ObservedCli>, account: Key, t: u64) -> Note {
+    let mut note = Note::worded(t, "error", account, cli.into().id(), "probe");
+    note.why = Some("unreadable");
+    note
+}
+
 /// The state of a login this Mac observed ([`ObservedLogin`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginState {
@@ -572,6 +720,12 @@ pub trait Sink: Send + Sync {
     /// whether the journal took the note: false where it is off, has no spool, its spool is
     /// full or the note is not one of its events.
     fn note(&self, note: &Note) -> bool;
+    /// Whether a note is kept now, where the sink can say (the journal is on and has a spool).
+    /// While it is not, a transaction records nothing as told ([`observe`]), so the first one
+    /// after it is kept again tells the journal the sign-in words the store then holds.
+    fn taking(&self) -> bool {
+        true
+    }
     /// Take up a login this Mac observed, for the registry: the executable hands it to a thread
     /// of its own and never makes the caller wait. Nothing by default.
     fn observed(&self, _login: &ObservedLogin) {}
@@ -616,6 +770,46 @@ pub fn install(sink: &'static dyn Sink) {
     let _ = SINK.set(sink);
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<Note>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Run `body` with this thread's published notes captured in place of the installed sink, and
+/// return them in the order they were published: a test's stand-in for the process's sink, so a
+/// transaction under it tells the journal as one in the `aterm` executable does.
+#[cfg(any(test, debug_assertions))]
+pub fn capture<T>(body: impl FnOnce() -> T) -> (T, Vec<Note>) {
+    struct Restore(Option<Vec<Note>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURED.with(|held| *held.borrow_mut() = self.0.take());
+        }
+    }
+    let mut restore = Restore(CAPTURED.with(|held| held.borrow_mut().replace(Vec::new())));
+    let out = body();
+    let notes = CAPTURED
+        .with(|held| std::mem::replace(&mut *held.borrow_mut(), restore.0.take()))
+        .unwrap_or_default();
+    std::mem::forget(restore);
+    (out, notes)
+}
+
+/// Whether a note published here is kept: a sink is installed and takes notes (or a test
+/// captures them). Only then does a transaction record what it told the journal
+/// ([`State::told`](super::accounts::State::told)): a process with no journal, or with the
+/// journal off, tells it nothing, and the next transaction of one that keeps notes tells it
+/// what those left.
+fn telling() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if CAPTURED.with(|held| held.borrow().is_some()) {
+        return true;
+    }
+    SINK.get().is_some_and(|sink| sink.taking())
+}
+
 /// Note `note` through the installed sink; nothing without one.
 pub fn note(note: &Note) {
     let _ = note_taken(note);
@@ -625,6 +819,15 @@ pub fn note(note: &Note) {
 /// caller that keeps what it noted, so a note the journal did not take is made again.
 #[must_use]
 pub fn note_taken(note: &Note) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if CAPTURED.with(|held| {
+        held.borrow_mut()
+            .as_mut()
+            .map(|notes| notes.push(*note))
+            .is_some()
+    }) {
+        return true;
+    }
     SINK.get().is_some_and(|sink| sink.note(note))
 }
 
@@ -669,7 +872,7 @@ pub fn observed_claims(
     Some((realm.to_owned(), email))
 }
 
-/// The account key of an unpooled CLI's login, by its realm (`google` for agy, `meta` for Muse)
+/// The account key of an agy or Muse login, by its realm (`google` for agy, `meta` for Muse)
 /// and the login its own files name, through the installed sink: what a provider read of agy or
 /// Muse is attributed to ([`ProbeEvent::login`]). None without a sink or scoped test keyer.
 #[must_use]
@@ -787,41 +990,53 @@ fn window_word(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The note a ledger row becomes, keyed by `pk` (and `to` for a switch or a displacement), or
-/// none for a kind the journal does not take (a sample, a proof, a pin, a warning, a move, a
-/// wall, which the state's diff notes with its reset, and a probe claim, which
-/// [`probe_note`] notes from the read the claim led to), for a sign-in that signed its row in,
-/// whose `renewed` or `signed-in` row notes it, or for a step of one
-/// ([`super::accounts::sign_in_step`]). A failed sign-in carries how it ended as one word, never
-/// its reason line.
-fn of_ledger(cli: Cli, event: &Event, pk: Key, to: Option<Key>) -> Option<Note> {
+/// The note a ledger row becomes, keyed by `pk` (and `to` for a switch or a displacement), with
+/// the sign-in word that note states where it states one; or none for a kind the journal does
+/// not take (a sample, a proof, a pin, a warning, a move, a wall, which the state's diff notes
+/// with its reset, and a probe claim, which [`probe_note`] notes from the read the claim led
+/// to). A sign-in row ([`Kind::SignIn`]) is the step it states itself ([`SignInStep`]): only one
+/// that ended with no login bound is `sign-in-failed`; one that began, one that bound a login
+/// (its `renewed` row says so) and a browser window's end are no sign-in word, and neither is a
+/// row that states no step. A failed one carries how it ended as one closed word
+/// ([`super::accounts::AttemptOutcome::of_sign_in`], beside its writers), never its reason line.
+fn of_ledger(
+    cli: Cli,
+    event: &Event,
+    pk: Key,
+    to: Option<Key>,
+) -> Option<(Option<SignWord>, Note)> {
     let t = secs(event.t)?;
-    let (kind, src, why) = match event.kind {
-        Kind::Rotate => ("switch", "cli-output", None),
-        Kind::ResetUsed | Kind::Reset => ("reset-used", "cli-output", None),
-        Kind::ResetFailed => ("error", "error", Some("reset-failed")),
+    let (kind, src, why, word) = match event.kind {
+        Kind::Rotate => ("switch", "cli-output", None, None),
+        Kind::ResetUsed | Kind::Reset => ("reset-used", "cli-output", None, None),
+        Kind::ResetFailed => ("error", "error", Some("reset-failed"), None),
         Kind::Auth => match Auth::parse(&event.why) {
-            Auth::SignedOut => ("signed-out", "cli-output", None),
-            Auth::Ok => ("auth", "cli-output", Some("ok")),
-            Auth::Unseen => ("auth", "cli-output", Some("unseen")),
+            Auth::SignedOut => ("signed-out", "cli-output", None, Some(SignWord::Out)),
+            // The login reads working again with no sign-in of aterm's to report: the registry's
+            // `signed-in` ("login observed and serving"), from the CLI's own output.
+            Auth::Ok => ("signed-in", "cli-output", None, Some(SignWord::In)),
+            // No recorder writes this word, and `auth` saying `unseen` withdraws the Mac's word.
+            Auth::Unseen => return None,
         },
-        Kind::NoTap => ("error", "error", Some("no-tap")),
-        Kind::Credits => ("credits", "cli-output", None),
-        Kind::Renewed => ("renewed", "signin-flow", None),
-        Kind::SignedIn => ("signed-in", "signin-flow", None),
-        Kind::LoginEnded => ("login-ended", "cli-output", None),
-        Kind::WrongAccount => ("wrong-account", "signin-flow", None),
-        Kind::Epoch => ("auth", "cli-output", Some("epoch")),
-        Kind::SignIn if super::accounts::sign_in_step(&event.why) => return None,
-        Kind::SignIn => match super::accounts::AttemptOutcome::of_sign_in(&event.why) {
-            Some(super::accounts::AttemptOutcome::SignedIn) => return None,
-            outcome => (
+        Kind::NoTap => ("error", "error", Some("no-tap"), None),
+        Kind::Credits => ("credits", "cli-output", None, None),
+        Kind::Renewed => ("renewed", "signin-flow", None, Some(SignWord::In)),
+        Kind::SignedIn => ("signed-in", "signin-flow", None, Some(SignWord::In)),
+        Kind::LoginEnded => ("login-ended", "cli-output", None, Some(SignWord::Ended)),
+        Kind::WrongAccount => ("wrong-account", "signin-flow", None, Some(SignWord::Wrong)),
+        Kind::Epoch => ("auth", "cli-output", Some("epoch"), None),
+        Kind::SignIn => match event.step? {
+            SignInStep::Failed => (
                 "sign-in-failed",
                 "signin-flow",
-                outcome.map(super::accounts::AttemptOutcome::as_str),
+                super::accounts::AttemptOutcome::of_sign_in(&event.why)
+                    .filter(|outcome| outcome.failing())
+                    .map(super::accounts::AttemptOutcome::as_str),
+                Some(SignWord::Failed),
             ),
+            SignInStep::Begun | SignInStep::Window | SignInStep::SignedIn => return None,
         },
-        Kind::Displaced => ("displaced", "signin-flow", None),
+        Kind::Displaced => ("displaced", "signin-flow", None, Some(SignWord::Out)),
         Kind::Wall
         | Kind::Probe
         | Kind::Sample
@@ -838,7 +1053,114 @@ fn of_ledger(cli: Cli, event: &Event, pk: Key, to: Option<Key>) -> Option<Note> 
     if matches!(event.kind, Kind::Rotate | Kind::Displaced) {
         note.to = to;
     }
-    Some(note)
+    Some((word, note))
+}
+
+/// The time a note that tells `word` carries, where it would naturally carry `natural` and the
+/// journal was last told `said`: never before that word's, and after it where the word changes,
+/// so no two words of one account share a second and the newest is the last one told on every
+/// Mac that folds them, whatever order it reads them in.
+fn stamp(natural: u64, said: Option<Told>, word: SignWord) -> u64 {
+    match said {
+        Some(prev) if prev.word != word => natural.max(prev.t.saturating_add(1)),
+        Some(prev) => natural.max(prev.t),
+        None => natural,
+    }
+}
+
+/// Tell the journal each account's sign-in word as `after` holds it, given the notes this
+/// transaction's ledger rows would state (`stated`, in ledger order, by account) and what the
+/// journal was last told (`told`, which this updates).
+///
+/// The word is the store's ([`super::accounts::Account::auth_on_record`]), never a row's alone:
+/// - Of an account's rows, the last whose word [agrees](SignWord::agrees) with the store is
+///   told (a renewal's `renewed`, an ended login's `login-ended`); the others say the same
+///   transaction less exactly and are left out.
+/// - A row whose word the store does not hold states none: a login wall the store refused as
+///   older than the word it holds, and a failed or wrong sign-in of an account whose login here
+///   still works, which is kept for the log as an `error` saying which.
+/// - Where the journal still holds another word than the store (no row stated it: a served
+///   turn, a usage read, a displacement's other account; or a build before [`Told`] said
+///   otherwise), the store's word is told from the state: `signed-in` or `signed-out` from the
+///   CLI's output, `auth` saying `ok` the first time this Mac states a word it already held, and
+///   `auth` saying `unseen` once the store holds no word or no row of the account.
+fn settle(
+    cli: Cli,
+    after: &State,
+    mut stated: BTreeMap<Key, Vec<(SignWord, Note)>>,
+    told: &mut BTreeMap<String, Told>,
+    now: i64,
+    notes: &mut Vec<Note>,
+) {
+    // Of two rows of one account, the one signed in speaks for it, then the one signed out.
+    let rank = |auth: Auth| match auth {
+        Auth::Unseen => 0,
+        Auth::SignedOut => 1,
+        Auth::Ok => 2,
+    };
+    let mut held: BTreeMap<Key, Auth> = BTreeMap::new();
+    for account in after.accounts.values() {
+        let Some(pk) = account.pk.as_deref().and_then(Key::new) else {
+            continue;
+        };
+        let auth = account.auth_on_record();
+        let slot = held.entry(pk).or_insert(auth);
+        if rank(auth) > rank(*slot) {
+            *slot = auth;
+        }
+    }
+    let keys: BTreeSet<Key> = held
+        .keys()
+        .chain(stated.keys())
+        .copied()
+        .chain(told.keys().filter_map(|pk| Key::new(pk)))
+        .collect();
+    for pk in keys {
+        let want = held.get(&pk).copied();
+        let holds = |word: SignWord| want.is_some_and(|auth| word.agrees(auth));
+        let mut said = told.get(pk.as_str()).copied();
+        let rows = stated.remove(&pk).unwrap_or_default();
+        let last = rows.iter().rposition(|(word, _)| holds(*word));
+        for (at, (word, note)) in rows.into_iter().enumerate() {
+            if Some(at) == last {
+                let t = stamp(note.t, said, word);
+                notes.push(Note { t, ..note });
+                said = Some(Told { word, t });
+            } else if !holds(word) {
+                let why = match word {
+                    SignWord::Failed => "sign-in-failed",
+                    SignWord::Wrong => "wrong-account",
+                    _ => continue,
+                };
+                let mut log = Note::new(note.t, "error", pk, cli, "error");
+                log.why = Some(why);
+                notes.push(log);
+            }
+        }
+        let agreed = match (want, said) {
+            (Some(auth), Some(said)) => said.word.agrees(auth),
+            (Some(auth), None) => auth == Auth::Unseen,
+            (None, Some(said)) => said.word == SignWord::Unknown,
+            (None, None) => true,
+        };
+        if !agreed && let Some(at) = secs(now) {
+            let (word, kind, why) = match want {
+                Some(Auth::Ok) if said.is_some() => (SignWord::In, "signed-in", None),
+                Some(Auth::Ok) => (SignWord::In, "auth", Some("ok")),
+                Some(Auth::SignedOut) => (SignWord::Out, "signed-out", None),
+                Some(Auth::Unseen) | None => (SignWord::Unknown, "auth", Some("unseen")),
+            };
+            let t = stamp(at, said, word);
+            let mut note = Note::new(t, kind, pk, cli, "cli-output");
+            note.why = why;
+            notes.push(note);
+            said = Some(Told { word, t });
+        }
+        // A withdrawn word is kept as told too: a word of the account told later is told after it.
+        if let Some(said) = said {
+            told.insert(pk.as_str().to_owned(), said);
+        }
+    }
 }
 
 /// The note a provider usage read is (step 9's report door, [`ProbeEvent`]): a `probe` with
@@ -912,24 +1234,55 @@ fn moved(before: Option<&WindowFig>, after: &WindowFig) -> bool {
 
 /// What one transaction did, as notes: `events` (its ledger rows) gain their account's key,
 /// and each becomes a note where the journal takes its kind; then the sessions `after` gained
-/// or lost, each window reading that moved a point or its reset, and each wall seen or cleared.
-/// Only accounts with a learned key are noted; `now` is the transaction's time.
+/// or lost, each window reading that moved a point or its reset, and each wall seen or cleared;
+/// and each account's sign-in word where the journal does not hold what `after` does
+/// ([`settle`]), which `after` then records as told ([`State::told`](super::accounts::State::told)), so
+/// it is called before the state's image is made. Only accounts with a learned key are noted;
+/// `now` is the transaction's time. In a process whose notes go nowhere (no sink) the rows are
+/// keyed and nothing is recorded as told.
 pub fn observe(
+    cli: Cli,
+    before: &State,
+    after: &mut State,
+    events: &mut [Event],
+    now: i64,
+) -> Vec<Note> {
+    if !telling() {
+        return notes_of(cli, before, after, events, now, None);
+    }
+    let mut told = std::mem::take(&mut after.told);
+    let notes = notes_of(cli, before, after, events, now, Some(&mut told));
+    after.told = told;
+    notes
+}
+
+/// [`observe`]'s notes, the sign-in words settled against `told` where it is given. Without it
+/// (the backfill's replay of a ledger, which no state stands beside row by row) each row's note
+/// is taken as it is.
+fn notes_of(
     cli: Cli,
     before: &State,
     after: &State,
     events: &mut [Event],
     now: i64,
+    told: Option<&mut BTreeMap<String, Told>>,
 ) -> Vec<Note> {
     let key = |label: &str| key_of(after, label).or_else(|| key_of(before, label));
     let mut notes = Vec::new();
+    let mut stated: BTreeMap<Key, Vec<(SignWord, Note)>> = BTreeMap::new();
     for event in events.iter_mut() {
         let Some(pk) = key(&event.account) else {
             continue;
         };
         event.pk = Some(pk.as_str().to_owned());
         let to = event.to.as_deref().and_then(key);
-        notes.extend(of_ledger(cli, event, pk, to));
+        match of_ledger(cli, event, pk, to) {
+            Some((Some(word), note)) if told.is_some() => {
+                stated.entry(pk).or_default().push((word, note));
+            }
+            Some((_, note)) => notes.push(note),
+            None => {}
+        }
     }
     let at = secs(now);
     let session = |kind, label: &str| Some(Note::new(at?, kind, key(label)?, cli, "cli-output"));
@@ -979,6 +1332,9 @@ pub fn observe(
             note.sub = sub;
             notes.push(note);
         }
+    }
+    if let Some(told) = told {
+        settle(cli, after, stated, told, now, &mut notes);
     }
     notes
 }
@@ -1069,7 +1425,7 @@ pub fn backfill(
                 .walls
                 .retain(|_, wall| wall.stands_until().is_some_and(|end| now < end));
         }
-        notes.extend(observe(cli, &quiet, &seeded, &mut events, now));
+        notes.extend(notes_of(cli, &quiet, &seeded, &mut events, now, None));
         for account in state.accounts.values() {
             let Some(pk) = account.pk.as_deref().and_then(Key::new) else {
                 continue;

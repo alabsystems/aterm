@@ -38,7 +38,7 @@ fn pool_hooks(a: &Arc<Accts>) -> Hooks {
         let seat = accounts.seat();
         account_cold_at(&seat, snapshot, mode, || {
             Some(vec![
-                format!("HOME={}", seat.home.display()),
+                format!("{}={}", accounts::HOMEDIR_ENV, seat.home.display()),
                 "PATH=/usr/bin".into(),
             ])
         })

@@ -187,7 +187,7 @@ pub fn usage_error(why: &str) -> String {
     format!("aterm acaffeine: {why}; run `aterm acaffeine --help`")
 }
 
-/// What every command but help says off macOS.
+/// What every command but help says on Linux (Windows has a holder of its own, with no mug).
 pub const MACOS_ONLY: &str = "aterm acaffeine: macOS only";
 
 /// When the span of `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds as the wall clock reads now ([`Clocks::wall_at`]), or `-` when off.
@@ -272,15 +272,25 @@ pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
         }
     };
     if command == Command::Help {
-        return aterm_uds::stdout::answer_exit("aterm acaffeine", USAGE, 0);
+        #[cfg(windows)]
+        let usage = crate::win::USAGE;
+        #[cfg(not(windows))]
+        let usage = USAGE;
+        return aterm_uds::stdout::answer_exit("aterm acaffeine", usage, 0);
     }
     run(command, version)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn run(_command: Command, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
     ExitCode::FAILURE
+}
+
+/// On Windows a holder process keeps the PC awake ([`crate::win`]); there is no mug.
+#[cfg(windows)]
+fn run(command: Command, _version: &str) -> ExitCode {
+    crate::win::run(command)
 }
 
 #[cfg(target_os = "macos")]

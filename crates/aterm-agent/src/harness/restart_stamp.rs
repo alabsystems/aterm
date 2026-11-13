@@ -35,6 +35,49 @@ impl Cause {
     }
 }
 
+/// The host's input counter when it accepted an explicit restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Input {
+    /// The host whose counter was read; another host cannot reuse it.
+    pub host: String,
+    /// The accepted counter; a later key changes it.
+    pub seq: u64,
+}
+
+impl Input {
+    /// The receipt's value in a stamp or a deferred relaunch record.
+    #[must_use]
+    pub fn to_value(&self) -> aterm_json::Value {
+        let mut value = aterm_json::Map::new();
+        value.insert("host".into(), aterm_json::Value::from(self.host.as_str()));
+        value.insert("seq".into(), aterm_json::Value::from(self.seq));
+        aterm_json::Value::Object(value)
+    }
+
+    /// A complete receipt; malformed evidence supplies no input exemption.
+    #[must_use]
+    pub fn from_value(value: &aterm_json::Value) -> Option<Self> {
+        Some(Self {
+            host: value.get("host")?.as_str()?.to_string(),
+            seq: value.get("seq")?.as_u64()?,
+        })
+        .filter(|input| !input.host.is_empty() && !input.host.chars().any(char::is_whitespace))
+    }
+}
+
+/// This host's process incarnation, so a saved counter cannot cross a restart or reboot.
+/// An unread boot or process birth supplies no exemption from the person's input grace.
+#[must_use]
+pub fn input_host() -> Option<String> {
+    let pid = i32::try_from(std::process::id()).ok()?;
+    Some(format!(
+        "{}:{}:{}",
+        super::upgrade_drive::hand_name(),
+        aterm_uds::process::boot_id()?,
+        aterm_uds::process::read_birth(pid)?.0
+    ))
+}
+
 /// One act's stamp: the process it restarts and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stamp {
@@ -46,6 +89,8 @@ pub struct Stamp {
     pub cause: Cause,
     /// When the act stamped it, unix seconds.
     pub at: u64,
+    /// Input accepted by this host before the act, when its counter was readable.
+    pub input: Option<Input>,
 }
 
 impl Stamp {
@@ -82,6 +127,9 @@ impl Stamp {
         o.insert("start".into(), aterm_json::Value::from(self.start.as_str()));
         o.insert("cause".into(), aterm_json::Value::from(self.cause.word()));
         o.insert("at".into(), aterm_json::Value::from(self.at));
+        if let Some(input) = &self.input {
+            o.insert("input".into(), input.to_value());
+        }
         aterm_json::to_string(&aterm_json::Value::Object(o)).unwrap_or_default()
     }
 
@@ -100,6 +148,7 @@ impl Stamp {
                 .to_string(),
             cause: Cause::parse(v.get("cause")?.as_str()?)?,
             at: v.get("at")?.as_u64()?,
+            input: v.get("input").and_then(Input::from_value),
         })
     }
 }
@@ -207,16 +256,18 @@ pub fn prune(state: &Path, name: &str, now: u64) -> bool {
 const FILE_PREFIX: &str = "asked-";
 
 /// The kernel's start time of `pid` in the spelling the harness's snapshot names an agent by
-/// (`relaunch::Snapshot::start`: `ps -o lstart=` in UTC and the C locale, whitespace squashed), so
-/// a stamp and a snapshot of the same process compare equal.
+/// (`relaunch::Snapshot::start`, `upgrade_drive::kernel_start`): on Unix `ps -o lstart=`
+/// in UTC and the C locale, whitespace squashed; on Windows its creation `FILETIME` as a decimal
+/// count, the integer Claude Code writes as its `procStart`. So a stamp and a snapshot of the same
+/// process compare equal.
 #[must_use]
 pub fn kernel_start(pid: u32) -> Option<String> {
-    #[cfg(any(target_vendor = "apple", windows))]
+    #[cfg(target_vendor = "apple")]
     {
         let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)?;
         Some(super::footer::lstart_utc(birth.seconds))
     }
-    #[cfg(not(any(target_vendor = "apple", windows)))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         super::upgrade_drive::kernel_start(pid)
     }

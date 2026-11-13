@@ -1015,7 +1015,7 @@ fn the_sweep_reads_a_fixture_proc() {
         ),
         (
             "proc/1/status",
-            "Name:\tsystemd\nRssAnon:\t    8000 kB\nVmSwap:\t       0 kB\n",
+            "Name:\tsystemd\nUid:\t0\t0\t0\t0\nRssAnon:\t    8000 kB\nVmSwap:\t       0 kB\n",
         ),
         (
             "proc/2/stat",
@@ -1027,13 +1027,16 @@ fn the_sweep_reads_a_fixture_proc() {
         ),
         (
             "proc/4242/status",
-            "Name:\ttmux: server\nRssAnon:\t    2048 kB\nVmSwap:\t    1024 kB\n",
+            "Name:\ttmux: server\nUid:\t1000\t1000\t1000\t1000\nRssAnon:\t    2048 kB\nVmSwap:\t    1024 kB\n",
         ),
         (
             "proc/4300/stat",
             "4300 (zsh) R 4242 4300 4242 34816 4300 4194304 100 0 0 0 5 5 0 0 20 0 1 0 900 0 0\n",
         ),
-        ("proc/4300/status", "Name:\tzsh\nRssAnon:\t    1000 kB\n"),
+        (
+            "proc/4300/status",
+            "Name:\tzsh\nUid:\t1000\t0\t0\t0\nRssAnon:\t    1000 kB\n",
+        ),
         (
             "proc/4400/stat",
             "4400 (old) S 1 4400 4400 0 -1 4194304 0 0 0 0 2 3 0 0 20 0 1 0 50 0 0\n",
@@ -1130,11 +1133,20 @@ fn the_sweep_reads_a_fixture_proc() {
             (4400, RunState::Sleeping, true, false),
         ]
     );
-    // The owner is the entry's uid, which only a Unix file system keeps.
     assert_eq!(
-        sweep.procs.iter().all(|p| p.uid.is_some()),
-        cfg!(unix),
-        "{sweep:?}"
+        sweep
+            .procs
+            .iter()
+            .map(|p| (p.pid, p.uid))
+            .collect::<Vec<_>>(),
+        [
+            (1, Some(0)),
+            (2, Some(0)),
+            (4242, Some(1000)),
+            (4300, Some(1000)),
+            (4400, None),
+        ],
+        "each uid is status's real Uid (0 for a kernel thread); CONTROL: 4400 has no Uid line and is None even on a Unix file system"
     );
     assert!(!sweep.truncated);
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);

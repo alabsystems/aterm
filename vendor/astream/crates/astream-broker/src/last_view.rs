@@ -13,6 +13,45 @@ use astream_wire::Filter;
 
 use crate::BrokerRecord;
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "last_view_island.rs"]
+mod last_view_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{
+    last_view_available_advance, last_view_not_above_pub, last_view_not_before_avail,
+    last_view_prune_clamp,
+};
+#[cfg(clean_islands)]
+pub use last_view_island::{
+    last_view_available_advance, last_view_not_above_pub, last_view_not_before_avail,
+    last_view_prune_clamp,
+};
+
+/// Three-parameter checked `[avail, pub_head]` view-window admission kernel matching
+/// `last_view_window_admits_code_isl` in `last_view_island.rs`, composed over Clean-origin
+/// [`last_view_not_before_avail`] and [`last_view_not_above_pub`].
+#[must_use]
+pub const fn last_view_window_admits_code(avail: u64, pub_head: u64, req_vis: u64) -> u64 {
+    if 0 < last_view_not_before_avail(avail, req_vis) {
+        last_view_not_above_pub(pub_head, req_vis)
+    } else {
+        0
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified partial-prefix maintenance quantum guard (`steps <= max_work`),
+    /// linked via `clean-kernel-defeq` to `last_view_prune_within_quantum_isl`.
+    #[must_use]
+    pub const fn last_view_prune_within_quantum(steps: u64, max_work: u64) -> bool
+    clauses [ensures result == (steps <= max_work)]
+    {
+        steps <= max_work
+    }
+}
+
 /// A checked last-value read could not prove its requested history or read a retained value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LastViewError {
@@ -224,13 +263,13 @@ impl RetireHistory {
     }
 
     pub(crate) fn view(&self, visible: u64) -> Result<LastView, LastViewError> {
-        if visible < self.available {
+        if last_view_not_before_avail(self.available, visible) == 0 {
             return Err(LastViewError::TooOld {
                 requested: visible,
                 available: self.available,
             });
         }
-        if visible > self.published {
+        if last_view_not_above_pub(self.published, visible) == 0 {
             return Err(LastViewError::NotPublished {
                 requested: visible,
                 published: self.published,
@@ -295,14 +334,14 @@ impl RetireHistory {
     /// The owner reports an ACTUAL published head, never a query's requested head.
     /// Limit partial-prefix trimming; a fully visible chain detaches in constant work.
     pub(crate) fn advance(&mut self, visible: u64) -> Result<LastViewGarbage, LastViewError> {
-        if visible < self.published {
+        if last_view_not_before_avail(self.published, visible) == 0 {
             return Err(LastViewError::PublishedBackwards {
                 requested: visible,
                 published: self.published,
             });
         }
         self.published = visible;
-        self.available = self.available.max(visible);
+        self.available = last_view_available_advance(self.available, visible);
         if self.last_offset.is_none_or(|last| last < visible) {
             let history = std::mem::replace(&mut self.head, self.tail.clone());
             let latest = std::mem::take(&mut self.latest);
@@ -311,19 +350,24 @@ impl RetireHistory {
                 _latest: latest,
             });
         }
+        let max_steps = last_view_prune_clamp(PRUNE_WORK as u64, PRUNE_WORK as u64);
         let mut cursor = self.head.clone();
-        for _ in 0..PRUNE_WORK {
-            let Some((event, next)) = cursor.next.get() else {
-                break;
-            };
-            if event.offset >= visible {
-                break;
+        if last_view_prune_within_quantum(max_steps, PRUNE_WORK as u64) {
+            let mut step = 0u64;
+            while step < max_steps {
+                let Some((event, next)) = cursor.next.get() else {
+                    break;
+                };
+                if event.offset >= visible {
+                    break;
+                }
+                if self.latest.get(&event.subject) == Some(&event.offset) {
+                    self.latest.remove(&event.subject);
+                }
+                let next = next.clone();
+                cursor = next;
+                step = step.saturating_add(1);
             }
-            if self.latest.get(&event.subject) == Some(&event.offset) {
-                self.latest.remove(&event.subject);
-            }
-            let next = next.clone();
-            cursor = next;
         }
         if Arc::ptr_eq(&cursor, &self.head) {
             return Ok(LastViewGarbage::empty());

@@ -1,0 +1,39 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-winship"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm-winship — the Windows owner loop: smoke a packaged build headless in an isolated environment, build and stage origin/main, and schedule that daily (dev tool, never shipped)"
+
+[[bin]]
+name = "aterm-winship"
+path = "src/main.rs"
+# No test lives in main.rs; the library holds the whole surface.
+test = false
+
+[lib]
+name = "aterm_winship"
+path = "src/lib.rs"
+
+[dependencies]
+# BUILD.json and the staged-build pointer are read through the workspace's one
+# JSON parser (the untyped `Value`, so no derive and no proc macro).
+aterm-json = { workspace = true }
+# The smoke decodes the frame the headless instance wrote, to refuse an empty
+# or one-colour image.
+aterm-png = { workspace = true }
+# `spawnfd::command` (the one child constructor: no console window flashes on
+# Windows), `deadline::output_within` (a bounded child run) and
+# `atomic_file::write` (temporary beside the file, then a rename).
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

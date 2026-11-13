@@ -441,12 +441,12 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
         row.default_moved,
         Some((
             "main".to_owned(),
-            Step::Login(Cli::Codex, "main".to_owned())
+            Step::Renew(Cli::Codex, "main".to_owned())
         )),
         "CONTROL"
     );
     let target = crate::ai::login::pool_target(Cli::Codex, row);
-    assert_eq!(target, Ok(("main", Cli::Codex.sign_in_verb(false))));
+    assert_eq!(target, Ok(("main", Cli::Codex.sign_in_verb(true))));
 
     pool.lay_moved(MovedWorld::PinOnWorkNoLogin);
     let mut rows = pool.roster().rows;
@@ -455,7 +455,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
     pool.rows(&rows);
     let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
-    assert_eq!(row.default_moved, None, "CONTROL");
+    assert!(!row.moved_refuses_launch(), "CONTROL");
     let target = crate::ai::login::pool_target(Cli::Codex, row).expect("CONTROL");
     assert_eq!(target.0, "work", "CONTROL");
 }
@@ -482,6 +482,13 @@ fn run_line(
 /// A world past what [`LawWorld`] says: the default login names `moved@example.com`, another account
 /// than `main`'s, and the rest of the roster and `main`'s managed directory are as `self` says.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "most worlds are laid only by the moved step law, which runs on Unix"
+    )
+)]
 enum MovedWorld {
     /// `work` is that account and nothing keeps the move from happening.
     ToRow,
@@ -513,6 +520,7 @@ enum MovedWorld {
     TwinNoSource,
 }
 
+#[cfg(unix)]
 const MOVED_WORLDS: [MovedWorld; 14] = [
     MovedWorld::ToRow,
     MovedWorld::ToHeldRow,
@@ -825,6 +833,7 @@ const STEP_SHARES: usize = 3;
 
 /// [`judge_steps`] over each [`MovedWorld`] of either Codex build, each in a pool of its own, and a
 /// launch refused for what its default login names says what ends it.
+#[cfg(unix)]
 fn moved_step_law(floors: &[&str]) {
     let (mut seen, mut wrong) = (BTreeSet::new(), Vec::new());
     for build in [LawBuild::CodexNew, LawBuild::CodexOld] {
@@ -857,8 +866,14 @@ fn moved_step_law(floors: &[&str]) {
 /// [`judge_steps`] on each build, on the moved default logins and on Claude Code's token worlds,
 /// each with the floors it names.
 mod every_step_a_surface_names_can_be_taken {
-    use super::{LawBuild, moved_step_law, step_law};
+    #[cfg(unix)]
+    use super::moved_step_law;
+    use super::{LawBuild, step_law};
 
+    // A floor of `accounts login` is a manual sign-in, which only Unix queues
+    // (`accounts::manual_signin_capability`): off Unix each step that names one refuses.
+
+    #[cfg(unix)]
     #[test]
     fn on_codex_new() {
         step_law(
@@ -898,6 +913,7 @@ mod every_step_a_surface_names_can_be_taken {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn on_grok() {
         step_law(
@@ -932,6 +948,7 @@ mod every_step_a_surface_names_can_be_taken {
         step_law(LawBuild::KimiMissing, &["aterm pkg install kimi"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn where_the_default_login_moved() {
         moved_step_law(&[

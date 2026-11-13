@@ -288,17 +288,33 @@ struct Frame {
 impl Frame {
     /// Whether this frame drew its plain status's bar as `bar`: as tall, docked or stacked alike.
     fn bar_at(&self, bar: Option<StatusBar>) -> bool {
+        bar.zip(self.drawn_bar())
+            .is_some_and(|(bar, (tall, docked))| {
+                bar.docked == docked && (bar.tall - tall).abs() < 0.5
+            })
+    }
+
+    /// Whether this frame drew `bar` shortened: docked or stacked alike, shorter than it and no
+    /// shorter than its least.
+    fn bar_shortened(&self, bar: Option<StatusBar>) -> bool {
+        bar.zip(self.drawn_bar())
+            .is_some_and(|(bar, (tall, docked))| {
+                bar.docked == docked && tall < bar.tall - 0.5 && tall > bar.least - 0.5
+            })
+    }
+
+    /// How tall this frame drew its plain status's bar, and whether docked in the toolbar.
+    fn drawn_bar(&self) -> Option<(f32, bool)> {
         let tall = self
             .screen
             .semantic(&UiKey::new("settings/feedback"))
             .filter(|_| self.drawn.status)
-            .map(|node| node.rect.height);
+            .map(|node| node.rect.height)?;
         let docked = self
             .screen
             .semantic(&UiKey::new("settings/status-dock"))
             .is_some();
-        bar.zip(tall)
-            .is_some_and(|(bar, tall)| bar.docked == docked && (bar.tall - tall).abs() < 0.5)
+        Some((tall, docked))
     }
 
     fn listed(&self, key: &str) -> bool {
@@ -2157,7 +2173,11 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                     .zip(control.as_deref())
                     .is_none_or(|(owed, key)| frame.kept(key).covers(owed)))
         {
-            // The screens under the bar drawn: the choice's, or the least's where the frame drew it.
+            // The screens under the bar drawn: the choice's, or the least's where the frame drew it
+            // or drew it shortened toward it for the control it shows whole as asked (the bar
+            // shortens, down to its one line of words, for the keyboard's control, so the seat R2
+            // needs is the nearest under the least: Windows' faces shortened a 170pt bar to 74pt
+            // over Catppuccin Mocha's card at 190x868 with 2x text).
             let reach = asks.map(|owed| {
                 let (reach, chosen) = framed(&kept_reach_of);
                 let held = ReachOf {
@@ -2167,8 +2187,14 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 let least = (!frame.bar_at(reach.bar))
                     .then(|| sweep.at_least(&held, &reach))
                     .flatten();
+                let shortened = || {
+                    frame.bar_shortened(reach.bar)
+                        && control
+                            .as_deref()
+                            .is_some_and(|key| frame.kept(key).covers(owed))
+                };
                 let reach = match least {
-                    Some((least, _)) if frame.bar_at(least.bar) => least,
+                    Some((least, _)) if frame.bar_at(least.bar) || shortened() => least,
                     _ => reach,
                 };
                 let asked = reach.asked(owed);

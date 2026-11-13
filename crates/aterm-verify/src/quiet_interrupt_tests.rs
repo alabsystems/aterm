@@ -70,6 +70,101 @@ fn unavailable_now_and_ledger_failures_never_invoke_the_timed_callback() {
     }
 }
 
+/// `--admit now` is the cut's bounded-latency rule for AppKit correctness, not a claim that the
+/// machine is quiet. It executes those drivers and says load is merely reported. A measurement
+/// stage is the negative control: it still requires qualified timing admission and starts
+/// nothing when Timing rejects Now.
+#[test]
+fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
+    fn no_timing_admission(_: Need, _: Admit) -> Result<Claim, Error> {
+        panic!("the AppKit immediate path must not ask for timing admission")
+    }
+    fn timing_now(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Timing(aterm_capacity::TimingIssue::Now))
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ctx = Ctx::new(
+        scratch.path().to_owned(),
+        Scope::crate_only("aterm-gui"),
+        EnvSnapshot::default(),
+        scratch.path().join("scratch"),
+    )
+    .with_quiet(Some(Admit::Now))
+    .with_measure_artifact(Some(crate::MeasureArtifact {
+        app: scratch.path().join("fixture.app"),
+        version: None,
+        commit: None,
+    }));
+    let ledger = Ledger::at(scratch.path().join("window-ledger"));
+    let machine = machine();
+    let appkit = std::sync::Mutex::new(crate::Quiet {
+        claim: None,
+        left: 2,
+        admit: no_timing_admission,
+    });
+    let calls = std::cell::Cell::new(0);
+    let attempts = std::cell::Cell::new(0);
+    let refused = crate::run_timed_with(
+        &ctx,
+        &appkit,
+        StageId::RedrawConformance,
+        "AppKit redraw",
+        |need| {
+            attempts.set(attempts.get() + 1);
+            assert_eq!(need.quiet, Some(f64::INFINITY));
+            Ok(None)
+        },
+        || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(
+        refused
+            .is_err_and(|why| why.contains("window admission") && why.contains("started nothing")),
+        "a one-look window shortfall is immediate and never force-admitted"
+    );
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(calls.get(), 0);
+
+    let ((), said) = crate::run_timed_with(
+        &ctx,
+        &appkit,
+        StageId::RedrawConformance,
+        "AppKit redraw",
+        |need| aterm_capacity::admit::try_admit_with(&ledger, &machine, need),
+        || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        said.as_deref(),
+        Some(crate::APPKIT_NOW),
+        "the stage time line must state that load was observed, not refused"
+    );
+
+    let measurement = std::sync::Mutex::new(crate::Quiet {
+        claim: None,
+        left: 1,
+        admit: timing_now,
+    });
+    let result = crate::run_timed_with(
+        &ctx,
+        &measurement,
+        StageId::MeasuringTests,
+        "measurement",
+        |_| panic!("measurement must use Timing, not the immediate window attempt"),
+        || -> Result<(), String> { panic!("a measurement without timing admission must not run") },
+    );
+    assert!(
+        result.is_err_and(|why| why.contains("started nothing")),
+        "the negative control keeps Timing strict"
+    );
+}
+
 /// The machine both sides read: idle, so only the quiet claim this test holds keeps the
 /// stand-in waiting.
 fn machine() -> Fixed {
@@ -175,6 +270,7 @@ fn standin_run_waits_for_the_quiet_machine() {
         Seams {
             stage,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },
@@ -374,6 +470,7 @@ fn a_timed_stage_given_up_behind_a_stuck_holder_is_not_run_and_the_run_goes_on()
         Seams {
             stage: passes,
             prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
             admit_quiet: given_up,
             admit_memory: given_up,
         },

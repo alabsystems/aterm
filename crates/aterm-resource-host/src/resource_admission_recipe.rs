@@ -27,12 +27,74 @@ pub(super) enum Kind {
     Resolver,
     Workload,
     BootstrapGraph,
+    Preflight,
 }
 pub(super) struct Probe {
     worker: Option<preparation::Worker<()>>,
     receive: std::sync::mpsc::Receiver<io::Result<Option<Recipe>>>,
+    calls: Option<std::sync::mpsc::Receiver<ProbeCall>>,
 }
+
+/// The selected command and its original guards move to the custody actor.
+/// Only that actor may run it and return complete stdout after native closure.
+pub(super) struct ProbeCall {
+    pub(super) prepared: preflight::Prepared,
+    pub(super) reply: std::sync::mpsc::SyncSender<io::Result<Vec<u8>>>,
+}
+
+pub(super) type ExecuteProbe<'a> = dyn Fn(spawnfd::Command, Instant) -> io::Result<Vec<u8>> + 'a;
+
+fn request_native(
+    send: &std::sync::mpsc::SyncSender<ProbeCall>,
+    command: spawnfd::Command,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    send.try_send(ProbeCall {
+        prepared: preflight::Prepared::new(command, deadline)?,
+        reply,
+    })
+    .map_err(|_| refused("native recipe preparation owner unavailable"))?;
+    crate::actor::wake();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let reply = receive
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                refused("native recipe preparation lost its owning reply")
+            }
+        })?;
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    reply
+}
+
 impl Probe {
+    pub(super) fn spawn(
+        work: impl FnOnce(&ExecuteProbe<'_>) -> io::Result<Option<Recipe>> + Send + 'static,
+    ) -> io::Result<Self> {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let (request, calls) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("resource-recipe-probe".into())
+            .spawn(move || {
+                let qualified =
+                    work(&|command, deadline| request_native(&request, command, deadline));
+                let _ = send.send(qualified);
+                crate::actor::wake();
+            })?;
+        Ok(Self {
+            receive,
+            worker: Some(preparation::Worker::new(worker)),
+            calls: Some(calls),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn paused() -> (Self, std::sync::mpsc::SyncSender<()>) {
         let (release, wait) = std::sync::mpsc::sync_channel(0);
@@ -47,9 +109,13 @@ impl Probe {
             Self {
                 receive,
                 worker: Some(preparation::Worker::new(worker)),
+                calls: None,
             },
             release,
         )
+    }
+    pub(super) fn take_call(&self) -> Option<ProbeCall> {
+        self.calls.as_ref()?.try_recv().ok()
     }
     pub(super) fn poll(&mut self) -> io::Result<Option<Option<Recipe>>> {
         if !self
@@ -99,6 +165,71 @@ pub(super) struct Recipe {
     pub(super) compiler: Option<compiler::Selection>,
     pub(super) ay: Option<std::sync::Arc<ay::Selection>>,
 }
+
+/// The selected workload and its final capability command are distinct.
+/// A candidate retains its original image/GC selection, but cannot launch
+/// the requested workload until the exact query result is checked.
+enum PreparedRecipe {
+    Direct(Recipe),
+    Capability(CapabilityCandidate),
+}
+
+struct CapabilityCandidate(Recipe);
+
+impl CapabilityCandidate {
+    fn command(&self, request: &Submission) -> io::Result<spawnfd::Command> {
+        let recipe = &self.0;
+        let mut probe = spawnfd::command(&recipe.program);
+        probe
+            .arg0(OsStr::from_bytes(&request.argv[0]))
+            .arg("--resource-capabilities")
+            .env_clear()
+            .envs(recipe.environment.iter().map(|(key, value)| (key, value)))
+            .current_dir(&recipe.cwd)
+            .stderr(spawnfd::Stdio::null());
+        configure_capability_backing(&mut probe, recipe.ay.as_deref(), recipe.compiler.as_ref())?;
+        Ok(probe)
+    }
+
+    fn qualify(self, capability: &aterm_json::Value) -> io::Result<Recipe> {
+        let mut recipe = self.0;
+        let words = recipe
+            .arguments
+            .iter()
+            .map(|word| word.to_str())
+            .collect::<Vec<_>>();
+        let words = words
+            .strip_prefix(&[Some("--resource-worker-v3")])
+            .unwrap_or(&words);
+        let words = words
+            .strip_prefix(&[Some("--resource-subgroups-v3")])
+            .unwrap_or(words);
+        let supported = match recipe.kind {
+            Kind::Ay => ay(capability, words),
+            Kind::Targo => targo(capability, words),
+            _ => false,
+        };
+        if !supported {
+            return Err(refused("command has no qualified resource recipe"));
+        }
+        if recipe
+            .arguments
+            .first()
+            .is_none_or(|arg| arg != "--resource-worker-v3")
+        {
+            recipe.arguments.insert(0, "--resource-worker-v3".into());
+        }
+        if recipe
+            .arguments
+            .get(1)
+            .is_none_or(|arg| arg != "--resource-subgroups-v3")
+        {
+            recipe.arguments.insert(1, "--resource-subgroups-v3".into());
+        }
+        Ok(recipe)
+    }
+}
+
 impl Recipe {
     pub(super) fn probe_in(
         request: &Submission,
@@ -119,21 +250,12 @@ impl Recipe {
             label: request.label.clone(),
             timeout_ms: request.timeout_ms,
         };
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("resource-recipe-probe".into())
-            .spawn(move || {
-                let qualified = match layout {
-                    Some(layout) => Self::qualify_in(&copied, physical, Some(&layout)),
-                    None => Self::qualify(&copied, physical),
-                };
-                let _ = send.send(qualified);
-            })?;
-        Ok(Probe {
-            receive,
-            worker: Some(preparation::Worker::new(worker)),
+        Probe::spawn(move |execute| {
+            let layout = layout.or_else(atpkg::store::resolve_configured);
+            Self::qualify_in_using(&copied, physical, layout.as_ref(), execute)
         })
     }
+    #[cfg(test)]
     pub(super) fn qualify(request: &Submission, physical: u32) -> io::Result<Option<Self>> {
         Self::qualify_in(
             request,
@@ -143,31 +265,80 @@ impl Recipe {
     }
     /// The layout is trusted owner configuration, never a request/environment
     /// authority. Private native qualification supplies its own manager store.
+    #[cfg(test)]
     pub(super) fn qualify_in(
         request: &Submission,
         physical: u32,
         layout: Option<&atpkg::store::Layout>,
     ) -> io::Result<Option<Self>> {
-        Self::qualify_with_ay_selection(request, physical, layout, &|layout| {
-            atpkg::prerequisite::selected_in(
-                layout,
-                atpkg::prerequisite::Prerequisite::Ay,
-                "retained AY resource root",
-                Duration::ZERO,
-            )
-            .map_err(|error| refused(&error))
-        })
+        Self::qualify_in_using(request, physical, layout, &fixture_probe)
+    }
+
+    fn qualify_in_using(
+        request: &Submission,
+        physical: u32,
+        layout: Option<&atpkg::store::Layout>,
+        execute: &ExecuteProbe<'_>,
+    ) -> io::Result<Option<Self>> {
+        Self::qualify_using(
+            request,
+            physical,
+            layout,
+            &|layout| {
+                atpkg::prerequisite::selected_in(
+                    layout,
+                    atpkg::prerequisite::Prerequisite::Ay,
+                    "retained AY resource root",
+                    Duration::ZERO,
+                )
+                .map_err(|error| refused(&error))
+            },
+            execute,
+        )
     }
 
     // The private selector returns an actual signed payload owner, never a
     // boolean/path declaration. Production always uses the configured anchor;
     // qualification can use a separately signed private registry.
+    #[cfg(all(test, target_os = "macos"))]
     fn qualify_with_ay_selection(
         request: &Submission,
         physical: u32,
         layout: Option<&atpkg::store::Layout>,
         select_ay: &dyn Fn(&atpkg::store::Layout) -> io::Result<atpkg::prerequisite::HeldTool>,
     ) -> io::Result<Option<Self>> {
+        Self::qualify_using(request, physical, layout, select_ay, &fixture_probe)
+    }
+
+    fn qualify_using(
+        request: &Submission,
+        physical: u32,
+        layout: Option<&atpkg::store::Layout>,
+        select_ay: &dyn Fn(&atpkg::store::Layout) -> io::Result<atpkg::prerequisite::HeldTool>,
+        execute: &ExecuteProbe<'_>,
+    ) -> io::Result<Option<Self>> {
+        match Self::prepare_with_ay_selection(request, physical, layout, select_ay, execute)? {
+            None => Ok(None),
+            Some(PreparedRecipe::Direct(recipe)) => Ok(Some(recipe)),
+            Some(PreparedRecipe::Capability(candidate)) => {
+                let bytes = execute(
+                    candidate.command(request)?,
+                    Instant::now() + Duration::from_secs(60),
+                )?;
+                let capability = aterm_json::from_slice(&bytes)
+                    .map_err(|_| refused("command has no qualified resource recipe"))?;
+                candidate.qualify(&capability).map(Some)
+            }
+        }
+    }
+
+    fn prepare_with_ay_selection(
+        request: &Submission,
+        physical: u32,
+        layout: Option<&atpkg::store::Layout>,
+        select_ay: &dyn Fn(&atpkg::store::Layout) -> io::Result<atpkg::prerequisite::HeldTool>,
+        execute: &ExecuteProbe<'_>,
+    ) -> io::Result<Option<PreparedRecipe>> {
         // This applies to every native recipe, including AY, before resolving
         // or probing a candidate. Its pathname does not qualify injected code.
         compiler::no_loader_overrides(&request.env)?;
@@ -195,10 +366,6 @@ impl Recipe {
             return Err(refused("requested CPU width exceeds this host"));
         }
         let mut program = resolve(request)?;
-        let executable = program
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned);
         let requested = Path::new(OsStr::from_bytes(&request.argv[0]))
             .file_name()
             .and_then(|name| name.to_str());
@@ -223,7 +390,6 @@ impl Recipe {
             environment.push((key.into(), request.binding.session.clone().into()));
         }
         let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
-        let mut kind = None;
         // Never execute an arbitrary argv merely because its basename claims
         // to be a native capability query. Partial overlap requires the actual
         // manager-selected complete artifact, not PATH or stdout as authority.
@@ -331,7 +497,7 @@ impl Recipe {
                 environment.retain(|(old, _)| old != &key);
                 environment.push((key, value));
             }
-            return Ok(Some(Self {
+            return Ok(Some(PreparedRecipe::Direct(Self {
                 kind: if graph {
                     Kind::BootstrapGraph
                 } else if workload {
@@ -353,7 +519,7 @@ impl Recipe {
                 compiler: workload.then(|| compiler::Selection::HeldSdk(sdk.clone())),
                 metadata_sdk: Some(sdk),
                 ay: None,
-            }));
+            })));
         }
         let ay_selection = if requested == Some("ay") {
             let selected =
@@ -373,7 +539,7 @@ impl Recipe {
             None
         };
         let compiler = if requested == Some("targo") {
-            let Some(selected) = compiler::select(request, &program)? else {
+            let Some(selected) = compiler::select(request, &program, execute)? else {
                 return Ok(None);
             };
             program = selected.targo();
@@ -409,79 +575,33 @@ impl Recipe {
                 environment.push((key, value));
             }
         }
-        if managed.is_some()
-            && [requested, executable.as_deref()]
-                .iter()
-                .any(|name| matches!(name, Some("ay" | "targo")))
-        {
-            let mut probe = spawnfd::command(&program);
-            probe
-                .arg0(OsStr::from_bytes(&request.argv[0]))
-                .arg("--resource-capabilities")
-                .env_clear()
-                .envs(environment.iter().map(|(key, value)| (key, value)))
-                .current_dir(&cwd)
-                .stderr(spawnfd::Stdio::null());
-            configure_capability_backing(&mut probe, ay_selection.as_deref(), compiler.as_ref())?;
-            if let Some(capability) = read_capability(&mut probe, Instant::now()) {
-                let words = arguments
-                    .iter()
-                    .map(|word| word.to_str())
-                    .collect::<Vec<_>>();
-                let words = if words.first() == Some(&Some("--resource-worker-v3")) {
-                    &words[1..]
-                } else {
-                    &words[..]
-                };
-                let words = if words.first() == Some(&Some("--resource-subgroups-v3")) {
-                    &words[1..]
-                } else {
-                    words
-                };
-                if requested == Some("ay") && ay(&capability, words) {
-                    kind = Some(Kind::Ay);
-                }
-                if requested == Some("targo") && targo(&capability, words) {
-                    kind = Some(Kind::Targo);
-                }
-            }
-        }
         // Declaring a budget does not enforce it on arbitrary foreign code.
         // CPU exclusivity/boot-retained closure alone supplies no memory
         // bound, so only actual maintained enforcement recipes may execute.
-        let kind = kind.ok_or_else(|| refused("command has no qualified resource recipe"))?;
+        let kind = match requested {
+            Some("ay") if ay_selection.is_some() => Kind::Ay,
+            Some("targo") if compiler.is_some() => Kind::Targo,
+            _ => return Err(refused("command has no qualified resource recipe")),
+        };
         let managed = managed.ok_or_else(|| refused("qualified artifact unavailable"))?;
         program = managed.target;
         for (key, value) in managed.env.entries() {
             environment.retain(|(existing, _)| existing != key.as_str());
             environment.push((key.as_str().into(), value.as_str().into()));
         }
-        let width = request.cpu_units;
-        if !matches!(kind, Kind::Metadata)
-            && arguments
-                .first()
-                .is_none_or(|arg| arg != "--resource-worker-v3")
-        {
-            arguments.insert(0, "--resource-worker-v3".into());
-        }
-        if !matches!(kind, Kind::Metadata)
-            && arguments
-                .get(1)
-                .is_none_or(|arg| arg != "--resource-subgroups-v3")
-        {
-            arguments.insert(1, "--resource-subgroups-v3".into());
-        }
-        Ok(Some(Self {
-            kind,
-            program,
-            arguments,
-            environment,
-            cwd,
-            width,
-            metadata_sdk: None,
-            compiler,
-            ay: ay_selection,
-        }))
+        Ok(Some(PreparedRecipe::Capability(CapabilityCandidate(
+            Self {
+                kind,
+                program,
+                arguments,
+                environment,
+                cwd,
+                width: request.cpu_units,
+                metadata_sdk: None,
+                compiler,
+                ay: ay_selection,
+            },
+        ))))
     }
     pub(super) fn command(&self, request: &Submission) -> spawnfd::Command {
         let mut command = spawnfd::command(&self.program);
@@ -523,6 +643,19 @@ fn configure_capability_backing(
     }
 }
 
+#[cfg(test)]
+fn fixture_probe(mut command: spawnfd::Command, deadline: Instant) -> io::Result<Vec<u8>> {
+    let limit = preflight::output_limit(&command)?;
+    let output =
+        aterm_uds::deadline::output_until_complete_stdout_with_limit(&mut command, deadline, limit)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(refused("controlled capability probe failed"));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(all(test, target_os = "macos"))]
 fn read_capability(probe: &mut spawnfd::Command, started: Instant) -> Option<aterm_json::Value> {
     let deadline = started + Duration::from_secs(60);
     let output =
@@ -730,324 +863,5 @@ fn managed_artifact_in(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn capability_probe_child_keeps_original_sdk_gc_backing() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let layout = atpkg::store::Layout {
-            prefix: scratch.path().canonicalize().unwrap().join("manager"),
-        };
-        let build = layout.build_dir("trust", 1);
-        std::fs::create_dir_all(&build).unwrap();
-        let atpkg::lease::Hold::Held(lease) = atpkg::lease::hold_for(
-            &layout.prefix,
-            &build,
-            "capability probe SDK backing",
-            Duration::from_secs(30),
-        )
-        .unwrap() else {
-            panic!("private original SDK lease unavailable");
-        };
-        let selection = compiler::Selection::NativeFixture {
-            execution: build,
-            build: 1,
-            lease: std::sync::Arc::new(lease),
-        };
-        let mut probe = spawnfd::command("/usr/bin/true");
-        probe.env_clear();
-        assert!(configure_capability_backing(&mut probe, None, None).is_err());
-        assert!(probe.guard_targets().next().is_none());
-        configure_capability_backing(&mut probe, None, Some(&selection)).unwrap();
-        assert_eq!(probe.guard_targets().count(), 1);
-        let held = aterm_uds::deadline::Held::start(&mut probe).unwrap();
-        drop(probe);
-        drop(selection);
-        let subject = atpkg::lease::Subject::build("trust", 1).unwrap();
-        assert!(matches!(
-            atpkg::lease::reclaim(&layout.prefix, &subject),
-            atpkg::lease::Reclaim::Keep(atpkg::lease::Holders::Held(_))
-        ));
-        let output = held
-            .output_until(
-                crate::fixture_deadline(Instant::now()),
-                Duration::from_secs(2),
-            )
-            .unwrap();
-        assert!(output.status.success());
-        assert!(matches!(
-            atpkg::lease::reclaim(&layout.prefix, &subject),
-            atpkg::lease::Reclaim::Clear(_)
-        ));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn caller_loader_overrides_refuse_before_an_actual_managed_ay_probe() {
-        if !aterm_uds::test_binary::isolated_lifecycle(
-            "actor::owner::recipe::tests::caller_loader_overrides_refuse_before_an_actual_managed_ay_probe",
-        ) {
-            return;
-        }
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let root = scratch.path().canonicalize().unwrap();
-        let layout = atpkg::store::Layout {
-            prefix: root.join("manager"),
-        };
-        let build = layout.build_dir("ay", 1);
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        std::fs::create_dir_all(layout.bin_dir()).unwrap();
-        let program = build.join("bin/ay");
-        std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
-        let runtime_data = build.join("runtime-data");
-        std::fs::write(&runtime_data, b"signed original runtime data").unwrap();
-        atpkg::store::mark_build_ready(&build).unwrap();
-        let name = atpkg::store::ToolName::new("ay").unwrap();
-        atpkg::platform::install_shim_to(&layout.shim(&name), &program).unwrap();
-        let registry = signed_tests::Registry::new(&build);
-        let select = |layout: &atpkg::store::Layout| registry.acquire(layout);
-        let marker = root.join("candidate-ran");
-        let mut request = Submission {
-            binding: Binding {
-                session: "s-a".into(),
-                attempt: [31; 16],
-            },
-            peer_pid: std::process::id(),
-            peer_birth: 1,
-            argv: vec![
-                program.as_os_str().as_bytes().to_vec(),
-                b"bench".to_vec(),
-                b"run".to_vec(),
-            ],
-            cwd: root.as_os_str().as_bytes().to_vec(),
-            env: vec![(
-                b"ATERM_TEST_RECIPE_PROBE_MARKER".to_vec(),
-                marker.as_os_str().as_bytes().to_vec(),
-            )],
-            cpu_units: 1,
-            memory_bytes: 1024 * 1024 * 1024,
-            label: "loader prebirth refusal".into(),
-            timeout_ms: Some(60_000),
-        };
-        // This controlled owner uses its own actual signing anchor. It does
-        // not replace production's pinned anchor or grant resource custody.
-        let qualified = Recipe::qualify_with_ay_selection(&request, 4, Some(&layout), &select);
-        let no_loader_error = qualified.as_ref().err().map(|error| error.to_string());
-        assert!(
-            marker.exists(),
-            "no-loader qualifier must actually reach the candidate probe: {no_loader_error:?}"
-        );
-        std::fs::remove_file(&marker).unwrap();
-        let mut recipe = qualified
-            .unwrap()
-            .expect("actual signed canary qualifies its private profile");
-        let mut command = recipe.command(&request);
-        let original = recipe.ay.take();
-        assert!(recipe.configure_ay(&mut command).is_err());
-        assert!(command.guard_targets().next().is_none());
-        recipe.ay = original;
-        recipe.configure_ay(&mut command).unwrap();
-        let targets = command.guard_targets().collect::<Vec<_>>();
-        assert!(recipe.configure_ay(&mut command).is_err());
-        assert_eq!(command.guard_targets().collect::<Vec<_>>(), targets);
-        let held = aterm_uds::deadline::Held::start(&mut command).unwrap();
-        drop(command);
-        drop(recipe);
-        let subject = atpkg::lease::Subject::build("ay", 1).unwrap();
-        assert!(
-            matches!(
-                atpkg::lease::reclaim(&layout.prefix, &subject),
-                atpkg::lease::Reclaim::Keep(_)
-            ),
-            "the actual stopped child must retain the original lease without Host-side copies"
-        );
-        // The controlled native test image refuses the production-only argv;
-        // require its actual owned exit/drain before checking reclaimability.
-        let output = held
-            .output_until(
-                Instant::now() + Duration::from_secs(60),
-                Duration::from_secs(2),
-            )
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(matches!(
-            atpkg::lease::reclaim(&layout.prefix, &subject),
-            atpkg::lease::Reclaim::Clear(_)
-        ));
-        for key in [b"LD_PRELOAD".as_slice(), b"DYLD_PRINT_LIBRARIES".as_slice()] {
-            for value in [b"unqualified".as_slice(), b"".as_slice()] {
-                request.env.push((key.to_vec(), value.to_vec()));
-                assert!(managed_artifact_in(&layout, "ay", &program).is_some());
-                let result = Recipe::qualify_with_ay_selection(&request, 4, Some(&layout), &select);
-                request.env.pop();
-                assert!(
-                    !marker.exists(),
-                    "an unqualified loader must not reach candidate code"
-                );
-                let error = result.err().unwrap();
-                assert!(
-                    error.to_string().contains("dynamic loader overrides"),
-                    "{error}"
-                );
-            }
-        }
-        // A complete marker/shim and identical executable cannot substitute
-        // for the signed whole payload; refuse changed non-executable data
-        // before even the read-only capability subprocess.
-        std::fs::write(&runtime_data, b"changed runtime data").unwrap();
-        let error = Recipe::qualify_with_ay_selection(&request, 4, Some(&layout), &select)
-            .err()
-            .expect("changed signed payload must refuse");
-        assert!(error.to_string().contains("signed tree"), "{error}");
-        assert!(!marker.exists());
-
-        // A signed package is not automatically an accepted native runtime.
-        // Prove this candidate really runs and has a valid signed selection,
-        // then require the actual qualifier to stop it before execution.
-        std::fs::write(
-            &program,
-            b"#!/bin/sh\nprintf actual-script > \"$ATERM_TEST_RECIPE_PROBE_MARKER\"\n",
-        )
-        .unwrap();
-        atpkg::store::mark_build_ready(&build).unwrap();
-        let script_registry = signed_tests::Registry::new(&build);
-        let script_select = |layout: &atpkg::store::Layout| script_registry.acquire(layout);
-        drop(
-            script_select(&layout)
-                .expect("non-native candidate has actual signed payload authority"),
-        );
-        let mut direct = spawnfd::command(&program);
-        direct
-            .arg("--resource-capabilities")
-            .env_clear()
-            .env("ATERM_TEST_RECIPE_PROBE_MARKER", &marker);
-        let output = aterm_uds::deadline::output_until_complete_stdout_with_limit(
-            &mut direct,
-            Instant::now() + Duration::from_secs(60),
-            8192,
-        )
-        .unwrap();
-        assert!(output.status.success() && marker.exists());
-        std::fs::remove_file(&marker).unwrap();
-        assert!(
-            Recipe::qualify_with_ay_selection(&request, 4, Some(&layout), &script_select).is_err()
-        );
-        assert!(
-            !marker.exists(),
-            "signed source must still pass the native runtime profile before probing"
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn an_actual_native_capability_read_survives_scheduling_delay() {
-        const BODY: &str = r#"{"version":3,"cpu_workers":true,"memory_custody":"resource-inspect-v3","worker_argument":"--resource-worker-v3","subgroup_custody":"host-owned-v3","subgroup_argument":"--resource-subgroups-v3"}"#;
-        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/printf"));
-        let mut command = spawnfd::command(program);
-        command.args(["%s", BODY]);
-        let mut capability =
-            read_capability(&mut command, Instant::now() - Duration::from_secs(3)).unwrap();
-        assert!(targo(&capability, &[Some("--unverified"), Some("build")]));
-        capability.as_object_mut().unwrap().insert(
-            "subgroup_custody".into(),
-            aterm_json::Value::String("foreign".into()),
-        );
-        assert!(!targo(&capability, &[Some("--unverified"), Some("build")]));
-        assert!(read_capability(&mut command, Instant::now() - Duration::from_secs(61)).is_none());
-        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/printf"));
-        let mut malformed = spawnfd::command(program);
-        malformed.args(["%s", "{"]);
-        assert!(read_capability(&mut malformed, Instant::now()).is_none());
-        let program = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
-        let mut failed = spawnfd::command(program);
-        failed.args(["-c", "printf '%s' \"$1\"; exit 7", "fixture", BODY]);
-        assert!(read_capability(&mut failed, Instant::now()).is_none());
-    }
-    #[test]
-    fn malformed_metadata_purpose_cannot_fall_back_to_a_legacy_preparation_probe() {
-        let mut request = Submission {
-            binding: Binding {
-                session: "s-a".into(),
-                attempt: [1; 16],
-            },
-            peer_pid: std::process::id(),
-            peer_birth: 1,
-            argv: vec![
-                b"/does-not-exist/targo".to_vec(),
-                b"--resource-metadata-v1".to_vec(),
-            ],
-            cwd: b"/".to_vec(),
-            env: Vec::new(),
-            cpu_units: 2,
-            memory_bytes: 1024,
-            label: "closed metadata purpose".into(),
-            timeout_ms: Some(600_000),
-        };
-        for extra in [false, true] {
-            if extra {
-                request.cpu_units = 1;
-                request.argv.push(b"unexpected".to_vec());
-            }
-            let error = Recipe::qualify_in(&request, 2, None)
-                .err()
-                .expect("closed profile must refuse");
-            assert!(
-                error.to_string().contains("closed fixed-one request"),
-                "refuse BEFORE executable/store selection: {error}"
-            );
-        }
-        request.argv.pop();
-        for timeout in [None, Some(600_001), Some(u64::MAX)] {
-            request.timeout_ms = timeout;
-            assert!(!metadata_request(&request));
-            let error = Recipe::qualify_in(&request, 2, None).err().unwrap();
-            assert!(error.to_string().contains("closed fixed-one request"));
-        }
-    }
-    #[test]
-    fn original_root_discards_ancestor_jobserver_endpoints() {
-        assert!(stale_fd_var(
-            b"CARGO_JOBSERVER_HANDOFF",
-            b"private-parent-ad"
-        ));
-        for name in [b"MAKEFLAGS".as_slice(), b"CARGO_MAKEFLAGS", b"MFLAGS"] {
-            assert!(stale_fd_var(
-                name,
-                b"-j --jobserver-auth=fifo:/private/ancestor"
-            ));
-            assert!(!stale_fd_var(name, b"-k"));
-        }
-        assert!(!stale_fd_var(b"CARGO_BUILD_JOBS", b"3"));
-    }
-    #[test]
-    fn arbitrary_command_budget_is_not_a_qualified_memory_enforcement_recipe() {
-        let pid = std::process::id();
-        let request = Submission {
-            binding: Binding {
-                session: "s-a".into(),
-                attempt: [1; 16],
-            },
-            peer_pid: pid,
-            peer_birth: aterm_uds::process::read_birth(i32::try_from(pid).unwrap())
-                .unwrap()
-                .0,
-            argv: vec![b"/bin/echo".to_vec(), b"unqualified".to_vec()],
-            cwd: std::env::current_dir()
-                .unwrap()
-                .as_os_str()
-                .as_bytes()
-                .to_vec(),
-            env: Vec::new(),
-            cpu_units: 1,
-            memory_bytes: 1024 * 1024,
-            label: "unqualified".into(),
-            timeout_ms: None,
-        };
-        let error = Recipe::qualify(&request, 2)
-            .err()
-            .expect("arbitrary argv must refuse");
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-    }
-}
+#[path = "resource_admission_recipe_tests.rs"]
+mod tests;

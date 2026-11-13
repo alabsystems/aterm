@@ -9,7 +9,7 @@
 //! account is signed in here (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 6). A row with
 //! a token on file reads as its records say. The upkeep's doors, the renewal door
 //! ([`renewal_due`], §4.15 rule 4) and the session door, open on the records alone, so a lapse
-//! starts no sign-in by itself (the owner's rule for AC1). Each pool lays real credential files
+//! starts no sign-in by itself (the rule for AC1). Each pool lays real credential files
 //! and reads their lapse as every reader does ([`Store::hydrate_lapsed`]).
 
 use super::*;

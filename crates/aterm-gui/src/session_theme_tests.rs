@@ -403,7 +403,8 @@ fn spawn_with_bad_theme_spawns_nothing() {
         Some("NoSuchTheme".to_string()),
         None,
         None,
-        tx,
+        false,
+        tx.into(),
     );
     let error = rx
         .try_recv()

@@ -215,6 +215,7 @@ fn pet_mode_builds_real_song_tenure_without_an_invisible_ordinary_flight() {
         forward_kitty_cursor_motion(
             true,
             true,
+            false,
             crate::cursor_glow::GlowStyle::RainbowKitty,
             Some(CursorCatMotionPulse {
                 at: t0 + Duration::from_millis(i * 40),
@@ -253,63 +254,95 @@ fn pet_mode_builds_real_song_tenure_without_an_invisible_ordinary_flight() {
     );
 }
 
+/// A flight is the flier's: with the pet off nothing is forwarded, beside a walker a pulse
+/// feeds its song alone, and the flying cat earns its flight by typing. A hot reload that
+/// takes the flight's owner away (the trail master, the rainbow, the pet setting) grounds it.
 #[test]
 fn hot_owner_or_style_change_grounds_an_invisible_ordinary_flight() {
     let t0 = Instant::now();
-    let mut earned = crate::kitty_cursor::CursorCat::default();
-    for i in 0..160u64 {
-        forward_kitty_cursor_motion(
-            true,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            Some(CursorCatMotionPulse {
-                at: t0 + Duration::from_millis(i * 40),
-                kind: CursorCatMotionKind::Advance,
-            }),
-            &mut earned,
+    let typed =
+        |cat: &mut crate::kitty_cursor::CursorCat, pet_mode: bool, flies: bool, from: u64| {
+            for i in 0..160u64 {
+                forward_kitty_cursor_motion(
+                    true,
+                    pet_mode,
+                    flies,
+                    crate::cursor_glow::GlowStyle::RainbowKitty,
+                    Some(CursorCatMotionPulse {
+                        at: t0 + Duration::from_secs(from) + Duration::from_millis(i * 40),
+                        kind: CursorCatMotionKind::Advance,
+                    }),
+                    cat,
+                );
+            }
+        };
+    for pet_mode in [false, true] {
+        let mut cat = crate::kitty_cursor::CursorCat::default();
+        typed(&mut cat, pet_mode, false, 0);
+        assert!(
+            !cat.is_active(),
+            "pet_mode={pet_mode}: no flight without the flier"
         );
     }
+    let mut earned = crate::kitty_cursor::CursorCat::default();
+    typed(&mut earned, false, true, 0);
     assert!(
         earned.is_active(),
-        "the control must earn an ordinary flight"
+        "the flying cat earns an ordinary flight"
     );
-
     retire_kitty_cursor_without_owner(
+        true,
         false,
-        false,
+        true,
         crate::cursor_glow::GlowStyle::RainbowKitty,
         0.0,
         &mut earned,
     );
-    assert!(
-        !earned.is_active(),
-        "disabling the trail master must not retain invisible cadence"
-    );
+    assert!(earned.is_active(), "its owner present, the flight stays");
 
-    for i in 0..160u64 {
-        forward_kitty_cursor_motion(
-            true,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            Some(CursorCatMotionPulse {
-                at: t0 + Duration::from_secs(10) + Duration::from_millis(i * 40),
-                kind: CursorCatMotionKind::Advance,
-            }),
-            &mut earned,
-        );
+    // (the trail master, the pet is a walker, the pet flies, the style)
+    for (at, (master, pet_mode, flies, style), why) in [
+        (
+            10,
+            (
+                false,
+                false,
+                true,
+                crate::cursor_glow::GlowStyle::RainbowKitty,
+            ),
+            "disabling the trail master must not retain invisible cadence",
+        ),
+        (
+            20,
+            (true, false, true, crate::cursor_glow::GlowStyle::Lumen),
+            "switching away from the rainbow must ground the old flight",
+        ),
+        (
+            30,
+            (
+                true,
+                false,
+                false,
+                crate::cursor_glow::GlowStyle::RainbowKitty,
+            ),
+            "turning the pet off must ground the flight",
+        ),
+        (
+            40,
+            (
+                true,
+                true,
+                false,
+                crate::cursor_glow::GlowStyle::RainbowKitty,
+            ),
+            "a walker that is not singing owns no flight",
+        ),
+    ] {
+        typed(&mut earned, false, true, at);
+        assert!(earned.is_active(), "the control at {at} s earns a flight");
+        retire_kitty_cursor_without_owner(master, pet_mode, flies, style, 0.0, &mut earned);
+        assert!(!earned.is_active(), "{why}");
     }
-    assert!(earned.is_active(), "the second control must earn a flight");
-    retire_kitty_cursor_without_owner(
-        true,
-        false,
-        crate::cursor_glow::GlowStyle::Lumen,
-        0.0,
-        &mut earned,
-    );
-    assert!(
-        !earned.is_active(),
-        "switching away from rainbow kitty must ground the old flight"
-    );
 }
 
 #[test]

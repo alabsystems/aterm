@@ -70,6 +70,8 @@ pub use fold::{NETWORK_KEY_INFO, fold_network_key};
 pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
+#[cfg(unix)]
+pub(crate) use store::decode_records_before_cut;
 pub use store::{
     MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
     encode_records, on_written,
@@ -725,6 +727,38 @@ impl Record {
             return Err(Error::new("membership record is truncated"));
         }
         Ok(len)
+    }
+
+    /// Whether `wire` is the start of one record and no more: bytes a record's frame begins with
+    /// (its magic and version, a kind this build knows, a parent count and a length it frames),
+    /// stopping short of that frame's end. What an append of whole records leaves on the end of
+    /// a file when it is cut short ([`store::decode_records_before_cut`]); nothing else is: no
+    /// bytes at all, a whole frame, or bytes no frame begins with.
+    #[cfg(any(unix, test))]
+    pub(super) fn is_cut_frame(wire: &[u8]) -> bool {
+        let starts = |at: usize, with: &[u8]| {
+            wire.get(at..)
+                .is_none_or(|rest| rest.iter().zip(with).all(|(have, want)| have == want))
+        };
+        if wire.is_empty() || !starts(0, MAGIC) || !starts(MAGIC.len(), &[VERSION]) {
+            return false;
+        }
+        if wire
+            .get(KIND_AT)
+            .is_some_and(|code| Kind::from_code(*code).is_err())
+        {
+            return false;
+        }
+        let Some(count) = wire.get(FRAME_PREFIX_LEN - 1).copied().map(usize::from) else {
+            return true;
+        };
+        if count > MAX_PARENTS {
+            return false;
+        }
+        if wire.len() < FRAME_PREFIX_LEN + count * 32 + 8 + 4 {
+            return true;
+        }
+        Self::known_frame_header(wire).is_ok_and(|len| wire.len() < len)
     }
 
     /// Length from a complete header, before allocating or reading its body.

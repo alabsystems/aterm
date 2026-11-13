@@ -58,7 +58,7 @@ pub fn default_dir(home: &Path) -> PathBuf {
 pub struct Record {
     /// Wrapper process ID.
     pub pid: u32,
-    /// Wrapper start time in microseconds since the Unix epoch.
+    /// Admission publication time in microseconds since the Unix epoch.
     pub started_us: u64,
     /// Wrapper working directory.
     pub cwd: Option<PathBuf>,
@@ -86,7 +86,24 @@ impl Record {
         let Ok(v) = aterm_json::from_slice::<Value>(bytes) else {
             return RecordRead::Bad;
         };
-        Self::from_value(&v)
+        let parsed = Self::from_value(&v);
+        let RecordRead::Rec(mut record) = parsed else {
+            return parsed;
+        };
+        // The publisher retains its lease descriptors when it hands work to a child.
+        // `started` still names publication; the new child can be born after it.
+        // Admission tickets use from_value directly and keep their own writer PID.
+        if let Some(supervisor) = v.get("supervisor_pid") {
+            let Some(pid) = supervisor
+                .as_u64()
+                .filter(|pid| (2..=i32::MAX as u64).contains(pid))
+                .and_then(|pid| u32::try_from(pid).ok())
+            else {
+                return RecordRead::Bad;
+            };
+            record.pid = pid;
+        }
+        RecordRead::Rec(record)
     }
 
     fn from_value(v: &aterm_json::Value) -> RecordRead {
@@ -381,17 +398,24 @@ fn birth_us(p: &crate::kproc::Record) -> u64 {
         .saturating_add(u64::from(p.start_us))
 }
 
-/// Reads all slots in `dir` at `(mono_ms, now_us)`.
+/// Reads all slots in `dir` and process-bound leases from `adoptions` at `(mono_ms, now_us)`.
+/// The registry belongs to the account, independently of an overridden slot pool.
+/// `None` means its location is unavailable, so no slot can be proved free.
 /// # Errors
 /// Returns [`Unread`] if `dir` is unsupported, missing, refused, or unreadable.
-pub fn observe(dir: &Path, mono_ms: u64, now_us: u64) -> Result<Observation, Unread> {
+pub fn observe(
+    dir: &Path,
+    adoptions: Option<&Path>,
+    mono_ms: u64,
+    now_us: u64,
+) -> Result<Observation, Unread> {
     #[cfg(target_os = "macos")]
     {
-        live::observe_in(dir, mono_ms, now_us, &mut |_| {})
+        live::observe_in(dir, adoptions, mono_ms, now_us, &mut |_| {})
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (dir, mono_ms, now_us);
+        let _ = (dir, adoptions, mono_ms, now_us);
         Err(Unread::Unsupported)
     }
 }
@@ -430,17 +454,20 @@ fn slot_index(name: &str) -> Option<u32> {
 #[derive(Debug)]
 pub struct SlotReader {
     dir: PathBuf,
+    adoptions: Option<PathBuf>,
     book: SlotBook,
     origin: Option<Instant>,
     last: Option<(Instant, SlotsRead)>,
 }
 
 impl SlotReader {
-    /// Creates a reader for `dir`.
+    /// Creates a reader for `dir` and the account's canonical adoption registry.
+    /// An unavailable registry is uncertainty, never evidence of free capacity.
     #[must_use]
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, adoptions: Option<PathBuf>) -> Self {
         Self {
             dir,
+            adoptions,
             book: SlotBook::default(),
             origin: None,
             last: None,
@@ -451,6 +478,21 @@ impl SlotReader {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Fresh registry evidence that `holder` has a process-bound lease in this pool,
+    /// independently of the reader's cached slot observations. `None` means unread evidence.
+    #[must_use]
+    pub fn adoption_holds(&self, holder: Holder) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            adoptions::holds(self.adoptions.as_deref()?, &self.dir, holder)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = holder;
+            None
+        }
     }
 
     /// Returns the current or cached [`SlotsRead`] at `(now, now_us)`.
@@ -476,7 +518,7 @@ impl SlotReader {
         let origin = *self.origin.get_or_insert(now);
         let mono_ms =
             u64::try_from(now.saturating_duration_since(origin).as_millis()).unwrap_or(u64::MAX);
-        let read = match observe(&self.dir, mono_ms, now_us) {
+        let read = match observe(&self.dir, self.adoptions.as_deref(), mono_ms, now_us) {
             Ok(obs) => self.book.judge(obs, m, &mut live_witness()),
             Err(why) => {
                 self.book = SlotBook::default();
@@ -609,6 +651,7 @@ mod live {
     /// Implements [`super::observe`] with a test hook invoked while each slot file is open.
     pub(super) fn observe_in(
         dir: &Path,
+        adoptions: Option<&Path>,
         mono_ms: u64,
         now_us: u64,
         while_open: &mut dyn FnMut(&Path),
@@ -647,6 +690,7 @@ mod live {
         if refused == slots.len() {
             return Err(Unread::Refused);
         }
+        super::adoptions::overlay(adoptions, &named, &mut slots);
         Ok(Observation {
             mono_ms,
             now_us,
@@ -790,6 +834,10 @@ mod live {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "slots_adoptions.rs"]
+mod adoptions;
 
 #[cfg(test)]
 #[path = "slots_tests.rs"]

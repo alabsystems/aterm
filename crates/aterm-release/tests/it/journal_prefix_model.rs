@@ -27,6 +27,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
         release_id,
         release_intent: release_id.is_some(),
         upload_intents: Vec::new(),
+        delete_intent: None,
         done,
     }
 }

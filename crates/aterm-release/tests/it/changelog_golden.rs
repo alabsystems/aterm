@@ -21,6 +21,7 @@ All notable changes to aterm are documented here. The format is based on
   in the Ed25519 update-signing pubkey (updater Tier SIG: clients refuse unsigned
   or wrongly-signed release manifests) and the atpkg root key (the package manager
   verifies its index instead of shipping inert).
+
 - **`aterm-ctl` ships inside the app (CLIENT-2)** — the macOS bundle now includes
   the control-socket CLI co-located next to the executable, and every aterm shell
   gets that directory on its `PATH` automatically.

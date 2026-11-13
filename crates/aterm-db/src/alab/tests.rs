@@ -733,6 +733,9 @@ fn a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent() {
     repair_commons(&lab, 6);
     let second = Registry::at(lab.paths[1].clone());
     let config = lab.paths[1].home.join("config.toml");
+    let vault = aterm_secrets::client::config(&lab.paths[1])
+        .unwrap()
+        .unwrap();
     let projects = |what: &str| {
         assert!(
             matches!(second.lab(&config, None), Ok(Some(LabRead::Projected(..)))),
@@ -767,15 +770,17 @@ fn a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent() {
     );
     assert!(
         second
-            .with_admitted_source::<()>(&config, None, |_| panic!("partial source admitted"))
+            .with_admitted_projection::<()>(&config, &lab.paths[1], &vault, None, |_, _| panic!(
+                "partial source admitted"
+            ))
             .is_err()
     );
-    assert!(second.observe_source(&config).is_err());
+    assert!(second.observe_projection(&config).is_err());
     receive(&lab, 1, scope, &parent);
     assert!(second.view().unwrap().complete, "the parent arrived");
     projects("a history made whole projects");
-    assert!(second.observe_source(&config).unwrap().is_some());
+    second.observe_projection(&config).unwrap();
     second
-        .with_admitted_source(&config, None, |_| Ok(()))
+        .with_admitted_projection(&config, &lab.paths[1], &vault, None, |_, _| Ok(()))
         .unwrap();
 }

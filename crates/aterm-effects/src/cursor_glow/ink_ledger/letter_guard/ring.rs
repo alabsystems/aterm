@@ -149,10 +149,12 @@ impl ReadKey {
 /// the same neighbourhood frame after frame while the lights over it move, and a line's letters
 /// share many, so a trail's cells are read from these; at this many a neighbourhood that does not
 /// fit is read again, as all were. The bound is in reads and a read's size follows its cell's
-/// pixels, so the bytes follow the font: holding 107 to 118 reads of a typed Fire replay, DejaVu
-/// Sans Mono, it retained 0.16 MB at 16 px, 0.34 MB at 22 px, 1.31 MB at 48 px and 3.81 MB at 144 px
-/// (2026-11-05; the slots counted, an allocator's overhead not), until the face's table changes or
-/// its guard goes.
+/// pixels, so the bytes follow the font, and since a read took its cell's core and bed beside its
+/// rings it holds most of its cell's pixels: holding 121 to 126 reads of a burst of Fire typed on a
+/// dark page, DejaVu Sans Mono, it retained 0.36 MB at 16 px, 0.69 MB at 22 px, 3.47 MB at 48 px
+/// and 28.67 MB at 144 px, of which the core and bed lists themselves were 0.07, 0.14, 0.76 and
+/// 7.01 MB (2026-11-11; the slots and each read's lists counted, an allocator's overhead not),
+/// until the face's table changes or its guard goes.
 const READ_SLOTS: usize = 128;
 /// How many of [`READ_SLOTS`] one key can lie in, the latest read first.
 const READ_WAYS: usize = 4;
@@ -181,10 +183,11 @@ struct RingRead {
     own: f32,
     /// The least luminance of the clean solid ink.
     l_min: f32,
-    /// Whether some ring pixel holds text (a glyph's faint rim that rounds to the ground).
-    ring_text: bool,
-    /// Whether some box pixel's colour on the clean frame is not what the frame lays there under
-    /// every light: a cursor trail's fill, or a glyph's ink.
+    /// Whether some pixel a reading reads as the ground (a ring's, the bed's) holds text: a glyph's
+    /// faint rim that rounds to the ground.
+    ground_text: bool,
+    /// Whether some box pixel's ground under every light (its neighbour's `base`) is not the ground
+    /// the clean frame shows there: a cursor trail's fill, which the clean frame does not draw.
     filled: bool,
     /// The cell's core ink and its bed, as box pixels ([`RingCell::whole`]).
     core: Box<[u32]>,
@@ -194,6 +197,12 @@ struct RingRead {
     /// the clean core's median ink.
     whole_own: f32,
     l_core: f32,
+    /// The census's readings on the clean frame ([`RingCell::glass_bar`]): its extreme's ratio
+    /// against the ground (`1` where its cell draws nothing), and its least solid ink pixel's
+    /// against its ring (each ring the ground itself there; infinite where no solid pixel has
+    /// ground within the ring).
+    extreme: f32,
+    census_own: f32,
 }
 
 impl RingRead {
@@ -208,12 +217,14 @@ impl RingRead {
             rings: Box::default(),
             own: f32::INFINITY,
             l_min: f32::INFINITY,
-            ring_text: false,
+            ground_text: false,
             filled: false,
             core: Box::default(),
             bed: Box::default(),
             whole_own: f32::INFINITY,
             l_core: f32::INFINITY,
+            extreme: 1.0,
+            census_own: f32::INFINITY,
         }
     }
 }
@@ -233,8 +244,8 @@ pub(super) struct RingCell {
     pub(super) own: f32,
     /// The least luminance of its clean solid ink.
     pub(super) l_min: f32,
-    /// Whether some ring pixel holds text.
-    pub(super) ring_text: bool,
+    /// Whether some pixel a reading reads as the ground holds text.
+    pub(super) ground_text: bool,
     /// Scratch of a read: the clean frame's colour per box pixel (meaningless where
     /// [`Self::opaque`]), whether the guard knows a box pixel, whether the clean frame shows the
     /// letter's ground there, and whether a glyph lays text there.
@@ -261,7 +272,7 @@ impl RingCell {
         reads: Vec::new(),
         own: f32::INFINITY,
         l_min: f32::INFINITY,
-        ring_text: false,
+        ground_text: false,
         clean: Vec::new(),
         opaque: Vec::new(),
         ground: Vec::new(),
@@ -319,7 +330,7 @@ impl RingCell {
             self.reads[slot] = Some((key, Arc::clone(&read)));
             read
         });
-        (self.own, self.l_min, self.ring_text) = (read.own, read.l_min, read.ring_text);
+        (self.own, self.l_min, self.ground_text) = (read.own, read.l_min, read.ground_text);
         self.current = Some(read);
     }
 
@@ -352,6 +363,8 @@ impl RingCell {
         self.has_text.clear();
         self.has_text.resize(n, false);
         let mut text = Vec::new();
+        // Whether a neighbour's ground under the lights is not the ground the clean frame shows.
+        let mut filled = false;
         // Which neighbour a box pixel lies in, along one axis.
         let side = |v: usize, cell: usize| -> usize {
             if v < ring {
@@ -368,7 +381,10 @@ impl RingCell {
                 match cells[side(y, ch) * 3 + side(x, cw)] {
                     Neighbour::Known {
                         ground: g, base: b, ..
-                    } => (self.clean[k], base[k]) = (g, b),
+                    } => {
+                        (self.clean[k], base[k]) = (g, b);
+                        filled |= b != g;
+                    }
                     Neighbour::Opaque => self.opaque[k] = true,
                 }
             }
@@ -436,8 +452,9 @@ impl RingCell {
         let core_reach = CORE_SHARE * (l_extreme - l_g).abs();
         let (mut core, mut bed) = (Vec::new(), Vec::new());
         let (mut solid, mut ring_at, mut rings) = (Vec::new(), Vec::new(), Vec::<u32>::new());
-        let mut ring_text = false;
+        let mut ground_text = false;
         let mut l_min = f32::INFINITY;
+        let mut census_own = f32::INFINITY;
         let mut li = 0;
         for y in ring..y_end {
             for x in ring..x_end {
@@ -449,6 +466,7 @@ impl RingCell {
                 li += 1;
                 if self.ground[k] {
                     bed.push(k as u32);
+                    ground_text |= self.has_text[k];
                 } else if (lk - l_g).abs() >= core_reach {
                     core.push(k as u32);
                 }
@@ -473,7 +491,7 @@ impl RingCell {
                                 let kk = yy as usize * w + xx as usize;
                                 if self.ground[kk] {
                                     rings.push(kk as u32);
-                                    ring_text |= self.has_text[kk];
+                                    ground_text |= self.has_text[kk];
                                 }
                             }
                             dx += if edge { 1 } else { 2 * d };
@@ -489,6 +507,7 @@ impl RingCell {
                 ring_at.push(from as u32);
                 solid.push((k as u32, y as u32));
                 l_min = l_min.min(lk);
+                census_own = census_own.min(ratio(lk, l_g));
             }
         }
         ring_at.push(rings.len() as u32);
@@ -496,7 +515,7 @@ impl RingCell {
         let own = Self::read_until(
             (&solid, &ring_at, &rings),
             &Clean(&self.clean),
-            f32::NEG_INFINITY,
+            (f32::NEG_INFINITY, 0.0),
             &mut self.ratios,
         );
         // Its whole reading on the clean frame: the bed is the pixels that frame shows the ground.
@@ -506,11 +525,6 @@ impl RingCell {
         } else {
             ratio(l_core, l_g)
         };
-        let filled = base
-            .iter()
-            .zip(&self.clean)
-            .zip(&self.opaque)
-            .any(|((b, c), o)| !o && b != c);
         // What a reading reads: the solid ink and its rings, and the core and its bed, each pixel
         // once.
         let mut is_read = vec![false; n];
@@ -546,12 +560,14 @@ impl RingCell {
             rings: rings.into_boxed_slice(),
             own,
             l_min,
-            ring_text,
+            ground_text,
             filled,
             core: core.into_boxed_slice(),
             bed: bed.into_boxed_slice(),
             whole_own: whole.min(own),
             l_core,
+            extreme,
+            census_own,
         }
     }
 
@@ -593,8 +609,8 @@ impl RingCell {
         &self.current().plain_px
     }
 
-    /// Whether some box pixel's colour on the clean frame is not what the frame lays there under
-    /// every light: a cursor trail's fill, or a glyph's ink.
+    /// Whether some box pixel's ground under every light is not the ground the clean frame shows
+    /// there: a cursor trail's fill.
     pub(super) fn filled(&self) -> bool {
         self.current().filled
     }
@@ -603,32 +619,59 @@ impl RingCell {
     /// medians, each pixel row's lower median, the worst row (infinite with no solid pixel).
     #[cfg(test)]
     pub(super) fn reading(&mut self, px: &impl FramePx) -> f32 {
-        self.read_under(px, f32::NEG_INFINITY)
+        self.read_under(px, (f32::NEG_INFINITY, 0.0))
     }
 
     /// Whether the letter's reading on frame `px` (each solid ink pixel against its ring's channel
     /// medians, each pixel row's lower median, the worst row, infinite with no solid pixel) is at
-    /// least `bar`: the first row under it settles that.
-    pub(super) fn holds(&mut self, px: &impl FramePx, bar: f32) -> bool {
-        self.read_under(px, bar) >= bar
+    /// least `bar`, and each of those solid pixels' own at least `least` (`0` for none): the
+    /// first row under `bar`, or the first pixel under `least`, settles that.
+    ///
+    /// `least` is the census's glyph minimum (`aterm-lab trail-census`, aterm-render's
+    /// `glass_letters_read`), each solid pixel against its ring, which a row's lower median does
+    /// not see under: a light that lifts one pixel of a stroke (the caret's aurora over the
+    /// letter it just printed, on its edge beside the caret) leaves the row's median where it
+    /// was.
+    pub(super) fn holds(&mut self, px: &impl FramePx, bar: f32, least: f32) -> bool {
+        // Negative infinity is a pixel under `least`, which no bar admits; a reading is at least 1.
+        let read = self.read_under(px, (bar, least));
+        read > f32::NEG_INFINITY && read >= bar
     }
 
-    fn read_under(&mut self, px: &impl FramePx, stop: f32) -> f32 {
+    /// The bar the census holds the letter to on a frame that draws the glass, where its ink is
+    /// the theme's (`docs/design/PRISM-GLASS.md` §15.2 1.12's glyph minimum, which binds the
+    /// glass, §15.8 amendment 49): [`GLASS_BAR`], or [`PAGE_SHARE`] of its extreme's reading on
+    /// the bare page where that is less, as aterm-render's `glass_letters_read` holds the theme's
+    /// letters; never past its census reading on the bare page, which no share of the lights
+    /// over it can raise.
+    ///
+    /// [`GLASS_BAR`]: crate::rainbow_kitty::prism_glass::GLASS_BAR
+    /// [`PAGE_SHARE`]: crate::rainbow_kitty::prism_glass::PAGE_SHARE
+    pub(super) fn glass_bar(&self) -> f32 {
+        use crate::rainbow_kitty::prism_glass::{GLASS_BAR, PAGE_SHARE};
+        let read = self.current();
+        (GLASS_BAR as f32)
+            .min(PAGE_SHARE as f32 * read.extreme)
+            .min(read.census_own)
+    }
+
+    fn read_under(&mut self, px: &impl FramePx, until: (f32, f32)) -> f32 {
         let read = self.current.as_deref().expect("a cell is read first");
         Self::read_until(
             (&read.solid, &read.ring_at, &read.rings),
             px,
-            stop,
+            until,
             &mut self.ratios,
         )
     }
 
     /// The reading of solid ink `solid` and its rings `(ring_at, rings)` on frame `px`, or the
-    /// first row's worst so far once it falls under `stop`.
+    /// first row's worst so far once it falls under `stop`, or negative infinity at the first
+    /// solid pixel whose own reading falls under `least`.
     fn read_until(
         (solid, ring_at, rings): (&[(u32, u32)], &[u32], &[u32]),
         px: &impl FramePx,
-        stop: f32,
+        (stop, least): (f32, f32),
         ratios: &mut Vec<f32>,
     ) -> f32 {
         let table = crate::color_math::relative_luminance_table();
@@ -648,6 +691,9 @@ impl RingCell {
                 if (p, g) != (last.0, last.1) {
                     let (li, lg) = (lum(p), lum(g));
                     last = (p, g, (li.max(lg) + 0.05) / (li.min(lg) + 0.05));
+                }
+                if last.2 < least {
+                    return f32::NEG_INFINITY;
                 }
                 ratios.push(last.2);
                 i += 1;

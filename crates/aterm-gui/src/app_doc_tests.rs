@@ -1,0 +1,461 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+
+use amacs::protocol::edit::{AwaitKey, EditOk, EditRequest};
+use amacs::protocol::read::{DOC_READ_CAP, LineRange, format_lines};
+
+use super::*;
+use crate::control_edit::{AwaitCall, EditCall, WaiterId};
+use crate::native_editor::Selection;
+use crate::tab_model::TabId;
+
+struct Fixture {
+    _dir: aterm_tempfile::TempDir,
+    path: PathBuf,
+    /// The file's URI as a client spells it (`/var/…`, not `/private/var/…`).
+    uri: String,
+}
+
+fn fixture(name: &str, bytes: &[u8]) -> Fixture {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-doc-{name}-"))
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+    Fixture {
+        _dir: dir,
+        path,
+        uri,
+    }
+}
+
+fn canonical(path: &Path) -> String {
+    crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(path).unwrap()).unwrap()
+}
+
+fn app() -> App {
+    App::headless_for_test()
+}
+
+fn doc(app: &App, rest: &str) -> String {
+    crate::control_doc::serve_doc(rest, &mut |query| Ok(app.doc_answer(query, Instant::now())))
+}
+
+fn rows(reply: &str) -> Vec<DocRow> {
+    let mut lines = reply.lines();
+    let count: usize = lines
+        .next()
+        .and_then(|header| header.strip_prefix("OK "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("an `OK <n>` header: {reply:?}"));
+    let rows: Vec<DocRow> = lines
+        .map(|line| DocRow::parse(line).unwrap_or_else(|error| panic!("{line}: {error}")))
+        .collect();
+    assert_eq!(rows.len(), count, "{reply}");
+    rows
+}
+
+fn body(reply: &str) -> (u64, &str) {
+    let (header, body) = reply
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("a header line: {reply:?}"));
+    let mut words = header.split_whitespace();
+    assert_eq!(words.next(), Some("OK"), "{reply}");
+    let nbytes: usize = words.next().unwrap().parse().unwrap();
+    assert_eq!(nbytes, body.len(), "the header counts the body");
+    let doc = words
+        .next()
+        .and_then(|word| word.strip_prefix("doc="))
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("doc= in {header}"));
+    assert_eq!(words.next(), None, "{header}");
+    (doc, body)
+}
+
+fn open(app: &mut App, f: &Fixture) -> ViewId {
+    app.open_document_tab(AppKind::Editor, &f.uri).unwrap();
+    app.active_native_view(WindowId(0)).unwrap().1
+}
+
+fn document_of(app: &App, view: ViewId) -> DocumentId {
+    let Some(View::Native(native)) = app.view_store.get(view).copied() else {
+        panic!("view {view:?} is not a native view");
+    };
+    app.native_runtime.document_id(native.instance).unwrap()
+}
+
+fn set_selection(app: &mut App, view: ViewId, anchor: usize, head: usize) {
+    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+        panic!("an Editor view");
+    };
+    let buffer = state.buffer.as_mut().unwrap();
+    buffer.selections = vec![Selection { anchor, head }];
+    buffer.primary = 0;
+}
+
+fn tab_of(app: &App, view: ViewId) -> TabId {
+    app.windows[&WindowId(0)]
+        .tab_set
+        .tabs()
+        .iter()
+        .find(|tab| tab.root.contains(view))
+        .map(|tab| tab.id)
+        .expect("the view's tab")
+}
+
+fn select(app: &mut App, tab: TabId) {
+    let wid = WindowId(0);
+    assert!(app.windows.get_mut(&wid).unwrap().tab_set.switch_to(tab));
+    app.sync_window(wid);
+}
+
+fn caller(app: &mut App) -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(3 << 40);
+    let sid = NEXT.fetch_add(1 << 12, Ordering::Relaxed);
+    app.next_session_id = sid;
+    app.push_stub_tab(WindowId(0), crate::stub_session(sid));
+    app.next_session_id = sid + 1;
+    sid
+}
+
+fn edit_waited(app: &mut App, session: u64, uri: &str) -> (EditOk, Receiver<String>) {
+    app.serve_edits_headless_for_test();
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    let request = EditRequest {
+        uri: uri.to_string(),
+        line: None,
+        create: false,
+        for_word: None,
+        wait: true,
+        read_only: false,
+        secret: None,
+    };
+    app.begin_edit(EditCall {
+        ticket,
+        session,
+        real_uri: crate::control_edit::real_file_uri(uri),
+        request,
+        reply,
+    });
+    let line = answer.try_recv().expect("an inline edit answers at once");
+    let ok = EditOk::parse(&line).unwrap_or_else(|error| panic!("{line:?}: {error}"));
+    static WAITER: AtomicU64 = AtomicU64::new(3 << 40);
+    let (reply, parked) = std::sync::mpsc::channel();
+    app.await_edit(AwaitCall {
+        waiter: WaiterId(WAITER.fetch_add(1, Ordering::Relaxed)),
+        key: AwaitKey::Ticket(ticket),
+        real_uri: None,
+        reply,
+    });
+    (ok, parked)
+}
+
+#[test]
+fn doc_ls_lists_views_cursor_and_selection() {
+    let text = "alpha\nbeta gamma\ndelta\n";
+    let f = fixture("notes.txt", text.as_bytes());
+    let mut app = app();
+    let session = caller(&mut app);
+    let caller_tab = app.windows[&WindowId(0)].tab_set.active_id().unwrap();
+    let person = open(&mut app, &f);
+    let gamma = text.find("gamma").unwrap();
+    set_selection(&mut app, person, gamma, gamma + "gamma".len());
+    select(&mut app, caller_tab);
+    let (edit, _waiting) = edit_waited(&mut app, session, &f.uri);
+    let edit_view = ViewId::from_stored(edit.view);
+    let person_tab = tab_of(&app, person);
+    select(&mut app, person_tab);
+    let doc_id = document_of(&app, person).get();
+    assert_eq!(edit.doc, doc_id, "one document, two views");
+
+    let listed = rows(&doc(&app, "ls"));
+    let mut views = vec![person.get(), edit_view.get()];
+    views.sort_unstable();
+    let row = DocRow {
+        doc: doc_id,
+        uri: canonical(&f.path),
+        seq: app
+            .document_store
+            .snapshot(document_of(&app, person))
+            .unwrap()
+            .seq
+            .0,
+        dirty: false,
+        disk: DiskState::Same,
+        views,
+        tickets: vec![edit.ticket],
+        cursor: Some(ViewPoint {
+            view: person.get(),
+            at: Point { line: 2, col: 11 },
+        }),
+        sel: Some(ViewSpan {
+            view: person.get(),
+            from: Point { line: 2, col: 6 },
+            to: Point { line: 2, col: 11 },
+        }),
+    };
+    assert_eq!(listed, vec![row.clone()]);
+    let foreign = (
+        session + 1_000,
+        hold::Hold {
+            ticket: crate::control_edit::mint_ticket(),
+            view: person.get(),
+        },
+    );
+    hold::set(foreign.0, foreign.1);
+    assert_eq!(rows(&doc(&app, "ls"))[0].tickets, vec![edit.ticket]);
+    hold::clear(foreign.0, foreign.1.ticket);
+    assert_eq!(
+        rows(&doc(&app, &format!("ls uri={}", f.uri))),
+        vec![row.clone()]
+    );
+    let other = fixture("other.txt", b"x\n");
+    assert_eq!(
+        rows(&doc(&app, &format!("ls uri={}", other.uri))),
+        Vec::new()
+    );
+    let markdown = fixture("readme.md", b"# hi\n");
+    app.open_document_tab(AppKind::Markdown, &markdown.uri)
+        .unwrap();
+    let listed = rows(&doc(&app, "ls"));
+    assert_eq!(listed.len(), 2, "Read is a live amacs document view");
+    assert_eq!(listed[0], row);
+    let markdown_view = app.active_native_view(WindowId(0)).unwrap().1;
+    assert_eq!(listed[1].doc, document_of(&app, markdown_view).get());
+
+    let edit_tab = tab_of(&app, edit_view);
+    select(&mut app, edit_tab);
+    let in_front = rows(&doc(&app, "ls"));
+    assert_eq!(
+        in_front[0].cursor,
+        Some(ViewPoint {
+            view: edit_view.get(),
+            at: Point::START
+        })
+    );
+    assert_eq!(in_front[0].sel, None, "a caret selects nothing");
+
+    app.dispatch_native_event(
+        WindowId(0),
+        crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+            "X".to_string(),
+        )),
+    )
+    .unwrap();
+    let typed = rows(&doc(&app, "ls")).remove(0);
+    assert!(typed.dirty && typed.seq > row.seq, "{typed:?}");
+    assert_eq!(typed.cursor.unwrap().at, Point { line: 1, col: 2 });
+
+    std::fs::write(&f.path, b"rewritten\n").unwrap();
+    assert_eq!(rows(&doc(&app, "ls"))[0].disk, DiskState::Changed);
+    std::fs::remove_file(&f.path).unwrap();
+    assert_eq!(rows(&doc(&app, "ls"))[0].disk, DiskState::Missing);
+    let gone = rows(&doc(&app, &format!("ls uri={}", f.uri)));
+    assert_eq!(
+        gone.iter()
+            .map(|row| (row.doc, row.disk))
+            .collect::<Vec<_>>(),
+        vec![(doc_id, DiskState::Missing)]
+    );
+    let read = doc(&app, &format!("read {} lines=1", f.uri));
+    assert_eq!(body(&read).0, doc_id, "{read}");
+    hold::clear(session, edit.ticket);
+}
+
+#[test]
+fn doc_read_prints_anchors_matching_fnv1a() {
+    let bytes = b"fn main() {\r\n    run();\r\n}\r\n";
+    let f = fixture("main.rs", bytes);
+    let mut app = app();
+    let view = open(&mut app, &f);
+    let document = document_of(&app, view);
+    let snapshot = app.document_store.snapshot(document).unwrap();
+
+    let (doc_id, read) = {
+        let reply = doc(&app, &format!("read {} lines=1-2", f.uri));
+        let (doc_id, body) = body(&reply);
+        (doc_id, body.to_string())
+    };
+    assert_eq!(doc_id, document.get());
+    let h6 =
+        |line: &str| format!("{:016x}", aterm_hash::fnv1a_64(line.as_bytes()))[..6].to_string();
+    assert_eq!(
+        read,
+        format!(
+            "1:{}|fn main() {{\n2:{}|    run();\n-- lines=3 seq={}\n",
+            h6("fn main() {"),
+            h6("    run();"),
+            snapshot.seq.0
+        )
+    );
+    let decoded =
+        crate::native_document_io::Decoded::hold(String::from_utf8(bytes.to_vec()).unwrap(), false);
+    let range = LineRange {
+        first: 1,
+        last: Some(2),
+    };
+    assert_eq!(
+        read,
+        format_lines(&decoded.text, snapshot.seq.0, range, DOC_READ_CAP)
+    );
+    let by_id = doc(&app, &format!("read doc={} lines=1-2", document.get()));
+    assert_eq!(body(&by_id).1, read);
+    let whole = doc(&app, &format!("read {}", document.get()));
+    assert!(body(&whole).1.contains("\n3:"), "{whole}");
+    assert!(
+        body(&whole)
+            .1
+            .ends_with(&format!("-- lines=3 seq={}\n", snapshot.seq.0))
+    );
+}
+
+#[test]
+fn doc_read_caps_at_256k_with_next() {
+    let text: String = (1..=12_000)
+        .map(|n| format!("line {n:05} of the long file\n"))
+        .collect();
+    let f = fixture("long.txt", text.as_bytes());
+    let mut app = app();
+    let view = open(&mut app, &f);
+    let document = document_of(&app, view).get();
+
+    let mut rows_read = Vec::new();
+    let mut asked = 1;
+    let mut pages = 0;
+    loop {
+        let reply = doc(&app, &format!("read {document} lines={asked}-"));
+        let (_, page) = body(&reply);
+        let (lines, trailer) = page.rsplit_once("-- ").unwrap();
+        assert!(
+            lines.len() <= DOC_READ_CAP,
+            "{} bytes of lines",
+            lines.len()
+        );
+        pages += 1;
+        rows_read.extend(lines.lines().map(str::to_string));
+        let next = trailer
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("next="));
+        match next {
+            Some(next) => {
+                let next: usize = next.parse().unwrap();
+                assert_eq!(
+                    next,
+                    rows_read.len() + 1,
+                    "next= is the first line not read"
+                );
+                asked = next;
+            }
+            None => break,
+        }
+        assert!(pages < 10, "paging moves on");
+    }
+    assert!(pages >= 2, "the file is past one read's cap");
+    let whole = format_lines(&text, 0, LineRange::ALL, usize::MAX);
+    let expected: Vec<&str> = whole.lines().filter(|row| !row.starts_with("--")).collect();
+    assert_eq!(rows_read, expected);
+}
+
+#[test]
+fn doc_read_unknown_ref_errs() {
+    let f = fixture("one.txt", b"one\n");
+    let markdown = fixture("two.md", b"# two\n");
+    let mut app = app();
+    let view = open(&mut app, &f);
+    let known = document_of(&app, view).get();
+    app.open_document_tab(AppKind::Markdown, &markdown.uri)
+        .unwrap();
+    let shown = app.active_native_view(WindowId(0)).unwrap().1;
+    let markdown_doc = document_of(&app, shown).get();
+    let DocAnswer::Text(read) =
+        app.doc_answer(DocQuery::Read(DocNames::Id(markdown_doc)), Instant::now())
+    else {
+        panic!("the Read workspace remains a live document");
+    };
+    assert_eq!(read.text.as_ref(), "# two\n");
+    let missing = fixture("three.txt", b"three\n");
+    let unknown = known + markdown_doc + 100;
+    for (rest, answer) in [
+        (
+            format!("read {unknown}"),
+            format!("ERR unknown doc {unknown}\n"),
+        ),
+        (
+            format!("read {}", missing.uri),
+            format!("ERR unknown doc {}\n", missing.uri),
+        ),
+        (
+            "read file://host/x".to_string(),
+            "ERR bad uri=file://host/x (remote file URI authorities are not allowed)\n".to_string(),
+        ),
+        (
+            "read".to_string(),
+            format!("ERR usage: {}\n", amacs::protocol::doc::DOC_USAGE),
+        ),
+        (
+            "read notes.txt".to_string(),
+            "ERR bad doc=notes.txt\n".to_string(),
+        ),
+        (
+            format!("apply {known} len=3"),
+            "ERR unsupported doc apply: not served yet\n".to_string(),
+        ),
+        (
+            format!("save {known}"),
+            "ERR unsupported doc save: not served yet\n".to_string(),
+        ),
+    ] {
+        assert_eq!(doc(&app, &rest), answer, "doc {rest}");
+    }
+    assert!(doc(&app, &format!("read {known}")).starts_with("OK "));
+}
+
+#[test]
+fn doc_read_refuses_a_private_edit_s_document_and_reads_an_ordinary_one() {
+    let text = "name\thunter2\n";
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-doc-private-")
+        .tempdir()
+        .unwrap();
+    let folder = dir.path().join("att-edit-t.private.noindex");
+    std::fs::create_dir(&folder).unwrap();
+    let path = folder.join("address.tsv");
+    std::fs::write(&path, text).unwrap();
+    let private = Fixture {
+        uri: crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        path,
+        _dir: dir,
+    };
+    let plain = fixture("address.tsv", text.as_bytes());
+    let mut app = app();
+    let shown = open(&mut app, &private);
+    let secret = document_of(&app, shown).get();
+    for rest in [
+        format!("read {secret}"),
+        format!("read doc={secret} lines=1"),
+        format!("read {}", private.uri),
+        format!("read {}", canonical(&private.path)),
+    ] {
+        assert_eq!(doc(&app, &rest), "ERR refused private doc\n", "doc {rest}");
+    }
+    let listed = doc(&app, "ls");
+    assert_eq!(rows(&listed).len(), 1, "`ls` still lists it");
+    assert!(!listed.contains("hunter2"), "{listed}");
+
+    // The negative control: the same text outside a private edit's folder is read.
+    let shown = open(&mut app, &plain);
+    let ordinary = document_of(&app, shown).get();
+    for rest in [format!("read {ordinary}"), format!("read {}", plain.uri)] {
+        let reply = doc(&app, &rest);
+        let (id, body) = body(&reply);
+        assert_eq!(id, ordinary);
+        assert!(body.contains("hunter2"), "doc {rest}: {reply}");
+    }
+}

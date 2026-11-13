@@ -35,6 +35,8 @@ impl InitialSetupWithheldStopTest {
             aterm_machines::init::Pass::Whole { clones: true },
             false,
             Some(&|_| {}),
+            // The hold is let go unverified: nothing completes the window's run.
+            initial::completes_nothing,
         )?;
         aterm_machines::init::Held::withheld(&held, &[WIDGETS.to_owned()])?;
         drop(held);
@@ -94,7 +96,7 @@ impl InitialSetupWithheldStopTest {
     ) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
         match self.attempt(reserve, stopped) {
             WithheldFollowUp::Held => (InitialSetupObserved::new(Ok(None), None), None),
-            WithheldFollowUp::Finished(finished) => *finished,
+            WithheldFollowUp::Finished(finished) => (finished.observed, finished.reservation),
         }
     }
 
@@ -104,14 +106,33 @@ impl InitialSetupWithheldStopTest {
         reserve: impl FnMut() -> Option<S>,
         stopped: impl Fn(u64) -> bool,
     ) -> WithheldFollowUp<S> {
+        self.attempt_at(Self::NOW, reserve, stopped)
+    }
+
+    /// The fixture's clock, in seconds since the epoch, where a test names no other.
+    pub const NOW: u64 = 1_800_000_000;
+
+    /// [`Self::attempt`] with this Mac's clock at `now`, seconds since the epoch.
+    pub fn attempt_at<S>(
+        &mut self,
+        now: u64,
+        reserve: impl FnMut() -> Option<S>,
+        stopped: impl Fn(u64) -> bool,
+    ) -> WithheldFollowUp<S> {
         follow_up_attempt_at(
             &self.root,
             reserve,
             || Ok(self.host(true)),
             BUILD,
-            || std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+            || std::time::UNIX_EPOCH + std::time::Duration::from_secs(now),
             stopped,
         )
+    }
+
+    /// A follow-up try of the withheld Notification Center item at `at`, seconds since the
+    /// epoch, did not take: its next try waits out the first pause after it ([`next_try`]).
+    pub fn try_did_not_take(&self, at: u64) -> Result<(), String> {
+        record_withheld(&self.root, &[], &[], &[WIDGETS.to_owned()], (BUILD, at))
     }
 
     pub fn notification_center_writes(&self) -> usize {
@@ -214,6 +235,7 @@ impl InitialSetupWithheldStopTest {
                 };
                 Ok(Workstation::of(items))
             }),
+            initial::completes_nothing,
         )
     }
 }

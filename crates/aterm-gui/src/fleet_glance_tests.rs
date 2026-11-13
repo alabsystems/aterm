@@ -795,7 +795,7 @@ fn away_a_glance_that_reached_nobody_waits_the_longest_at_once() {
 
 /// THE GLANCE WAITS FOR THE LAN BROKER: a read dials the fleet's Macs through the broker, so
 /// while the broker does not answer, the glance reads nothing by itself (its tick, a menu
-/// opening); once it answers, it reads. A person's Read the Fleet Now reads all the same.
+/// opening); once it answers, it reads. A person's Refresh Now reads all the same.
 #[test]
 fn the_glance_reads_nothing_by_itself_while_the_lan_broker_does_not_answer() {
     let hang = aterm_spec::wait::MUST_HAPPEN;
@@ -851,7 +851,7 @@ fn the_glance_reads_nothing_by_itself_while_the_lan_broker_does_not_answer() {
     .expect("the thread starts");
     held.kick(Kick::Now);
     runs.recv_timeout(hang)
-        .expect("a person's Read the Fleet Now reads while the broker does not answer");
+        .expect("a person's Refresh Now reads while the broker does not answer");
 }
 
 struct Gated {
@@ -943,7 +943,7 @@ fn the_reader_is_single_flight() {
 /// A KICK THAT COMES ONCE A READ IS OVER IS ANSWERED: the kicks that come while a read runs are
 /// answered by it (but a move of the network,
 /// [`a_move_while_a_read_runs_reads_again_once_it_is_over`]), and one sent once its result is in
-/// the slot (a person's Read the Fleet Now, a move of the network) asks for a read of its own.
+/// the slot (a person's Refresh Now, a move of the network) asks for a read of its own.
 /// NEGATIVE CONTROL: dropping the kicks queued once the slot is written loses that one.
 #[test]
 fn a_kick_once_a_read_is_in_the_slot_reads_again() {
@@ -1202,7 +1202,7 @@ fn a_headless_app_starts_no_fleet_glance() {
     app.start_fleet_glance_with(Box::new(Empty), inert_seams());
     app.start_fleet_glance();
     assert!(app.fleet_glance.is_none());
-    assert!(app.status_item_chrome_line().ends_with(" fleet=off"));
+    assert!(app.status_item_chrome_line().contains(" fleet=off "));
     let mut windowed = crate::App::headless_for_test();
     windowed.headless = false;
     windowed.start_fleet_glance_with(Box::new(Empty), inert_seams());
@@ -1638,6 +1638,47 @@ fn a_hold_this_mac_placed_is_read_back_whatever_its_need() {
     assert!(snap.macs[0].needs.is_empty(), "a hold is no need");
     let blind = parse(&text, None, 0).expect("a survey");
     assert!(blind.macs[0].held_here.is_empty(), "{:?}", blind.macs[0]);
+}
+
+/// A proven peer's fleet access is its header's `access=`: a header with none is an aterm from
+/// before the lock (Full Access), a word this build does not know is Read Only, and a peer
+/// whose key is not proven is read as no level at all, whatever it says.
+#[test]
+fn a_peers_fleet_access_is_its_headers_and_an_unproven_peers_is_not_read() {
+    use aterm_types::fleet_access::FleetAccess::{Full, ReadOnly, ReadWrite};
+    let said = |node: &str, access: Option<&str>| {
+        let mut head = header(node);
+        head.extend(access.map(|word| ("access", word.to_string())));
+        peer(&format!("{node}.local"), &pairs(&head), &[QUIET])
+    };
+    let table = [
+        (None, Some(Full)),
+        (Some("read"), Some(ReadOnly)),
+        (Some("write"), Some(ReadWrite)),
+        (Some("full"), Some(Full)),
+        (Some("wide-open"), Some(ReadOnly)),
+    ];
+    let entries: Vec<String> = table
+        .iter()
+        .enumerate()
+        .map(|(i, (word, _))| said(&format!("n{i}"), *word))
+        .collect();
+    let snap = parse(&format!("[{}]", entries.join(",")), None, 0).expect("a survey");
+    assert_eq!(
+        snap.macs.iter().map(|m| m.access).collect::<Vec<_>>(),
+        table.map(|(_, level)| level),
+        "{snap:?}"
+    );
+    let claimed = unproven(&said("n9", Some("full")));
+    let snap = parse(&format!("[{claimed}]"), None, 0).expect("a survey");
+    assert_eq!(
+        snap.macs
+            .iter()
+            .map(|m| (m.unproven, m.access))
+            .collect::<Vec<_>>(),
+        [(true, None)],
+        "its word alone is no level"
+    );
 }
 
 #[test]
@@ -2269,6 +2310,7 @@ fn snapshot_of_joins_seat_rows() {
         label: label.to_owned(),
         name: format!("{label}.local"),
         node: n.map(principal),
+        node_key: n.map(|n| [n; 32]),
         me: n == Some(1),
         presence: None,
         build: build.map(str::to_owned),
@@ -2304,6 +2346,7 @@ fn snapshot_of_joins_seat_rows() {
             seat_row("m9", None, Some("0.150.0")),
         ],
         unserved: None,
+        observations: Default::default(),
     };
     let book_peer = |n: u8, host: &str| aterm_net::fleet_member::Peer {
         node: None,
@@ -2724,6 +2767,7 @@ fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
         seats: aterm_netplace::words::Seats::default(),
         rows: Vec::new(),
         unserved: None,
+        observations: Default::default(),
     };
     let mut snapshot = snapshot_of(&view, &fleet, &[], None, NOW);
     let mac = |snapshot: &FleetSnapshot, n: u8| {
@@ -2893,4 +2937,68 @@ fn a_decided_need_waits_whatever_the_agent_says() {
         AgentWord::of(Some("unknown"), Some("stalled")),
         AgentWord::Unknown
     );
+}
+
+/// The nodes a lease reads as still in the fleet come only from a fresh, whole read, a Mac
+/// carried from an earlier one among them (it missed one read, and its rows still count), and a
+/// Mac that did not answer is not. NEGATIVE CONTROLS: a read with an answer it cannot name (an
+/// unproven node, no header) or did not keep (past the cap, or a full read), a stale read, a
+/// failed one, one ahead of the clock, and a Mac in no fleet say nothing.
+#[test]
+fn answered_nodes_come_only_from_a_fresh_whole_read_and_count_carried_macs() {
+    let t0 = 1_000_000;
+    let mac = |node: Option<&str>, carried: bool| FleetMac {
+        node: node.map(str::to_owned),
+        read_at_ms: if carried { t0 - 1 } else { t0 },
+        carried,
+        unproven: node.is_none(),
+        ..FleetMac::default()
+    };
+    let answered = vec![mac(Some("N1"), false), mac(Some("n2"), true)];
+    let slot = slot_of(t0, answered.clone(), vec![silent("mac-17.local")]);
+    assert_eq!(
+        answered_nodes(&slot, t0 + 1),
+        Some(aterm_requests::Answered {
+            read_at_ms: t0,
+            nodes: ["n1".to_owned(), "n2".to_owned()].into(),
+        })
+    );
+    let mut unproven = answered.clone();
+    unproven.push(mac(None, false));
+    assert_eq!(
+        answered_nodes(&slot_of(t0, unproven, Vec::new()), t0 + 1),
+        None,
+        "an unproven Mac"
+    );
+    for reason in [Reach::PastCap, Reach::NoHeader] {
+        let kept_out = Unanswered {
+            reason,
+            ..silent("mac-18.local")
+        };
+        assert_eq!(
+            answered_nodes(&slot_of(t0, answered.clone(), vec![kept_out]), t0 + 1),
+            None,
+            "{reason:?}"
+        );
+    }
+    let full: Vec<FleetMac> = (0..MACS_MAX)
+        .map(|n| mac(Some(&format!("{n:032x}")), false))
+        .collect();
+    assert_eq!(
+        answered_nodes(&slot_of(t0, full, Vec::new()), t0 + 1),
+        None,
+        "a full read"
+    );
+    assert_eq!(
+        answered_nodes(&slot, t0 + millis(COUNT_FRESH) + 1),
+        None,
+        "stale"
+    );
+    assert_eq!(answered_nodes(&slot, t0 - 1), None, "ahead of the clock");
+    let mut failed = slot.clone();
+    failed.error = Some("no route".to_owned());
+    assert_eq!(answered_nodes(&failed, t0 + 1), None, "failed");
+    let mut outside = slot;
+    outside.book.in_fleet = false;
+    assert_eq!(answered_nodes(&outside, t0 + 1), None, "in no fleet");
 }

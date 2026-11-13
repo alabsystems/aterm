@@ -4,7 +4,7 @@
 //! Release children use the verifier's accounting without changing their process groups,
 //! output transport, signal forwarding or wait ownership.
 
-use super::{Clock, Host, LiveHost, Own, TreeUsage};
+use super::{Clock, Host, LiveHost, Own, Reading, TreeUsage};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 /// Sample a child's descendants from spawn until its owner finishes waiting. CPU is a lower
 /// bound: short-lived processes between reads and descendants reparented before a read are
-/// absent. Unknown telemetry stays unknown. No process is signalled or reaped here.
+/// absent. Unknown telemetry stays unknown: a read that missed (a process table the kernel held
+/// past its bound) leaves sampling on, and a reading whose last read missed, with none working
+/// after it before the child ended, is no reading. No process is signalled or reaped here.
 pub struct UsageMeter {
     stop: Option<mpsc::Sender<()>>,
     reader: Option<JoinHandle<Option<TreeUsage>>>,
@@ -23,9 +25,9 @@ impl UsageMeter {
     /// membership and cancellation custody are unchanged.
     #[must_use]
     pub fn start(root: u32) -> Self {
-        let host = RootHost::new(root);
+        let host = RootHost::new(root, Kernel);
         let own = Own::default();
-        if let Some(members) = host.read() {
+        if let Reading::Read(members) = host.read() {
             own.book(root, &members);
         }
         let (stop, receive) = mpsc::channel();
@@ -35,12 +37,14 @@ impl UsageMeter {
                 let began = Instant::now();
                 let mut clock = Clock::new(None, &host, root, None).owning(&own);
                 clock.tick();
+                // Its owner stops it after its wait reaped the root (or drops it unfinished,
+                // reading nothing): a read after the stop finds no tree, so the loop's last tick
+                // is its last read.
                 while let Err(mpsc::RecvTimeoutError::Timeout) =
                     receive.recv_timeout(Duration::from_millis(20))
                 {
                     clock.tick();
                 }
-                clock.tick();
                 own.usage(&clock, began.elapsed())
             })
             .ok();
@@ -68,30 +72,74 @@ impl Drop for UsageMeter {
     }
 }
 
+/// Where a [`RootHost`] reads the machine: the kernel's process table, a process group's members
+/// and one process's record. [`Kernel`] reads them live; a test scripts them.
+trait Source: Sync + std::fmt::Debug {
+    /// Every process's record ([`aterm_sysprobe::kproc::records`]).
+    fn records(&self) -> Option<Vec<aterm_sysprobe::kproc::Record>>;
+    /// What each member of `pgid` has used ([`aterm_sysprobe::group_usage`]).
+    fn group(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>>;
+    /// `pid`'s record, a definite absence apart from a failed read
+    /// ([`aterm_sysprobe::kproc::record_read`]).
+    fn record(&self, pid: u32) -> std::io::Result<Option<aterm_sysprobe::kproc::Record>>;
+}
+
+/// The live machine.
+#[derive(Debug)]
+struct Kernel;
+
+impl Source for Kernel {
+    fn records(&self) -> Option<Vec<aterm_sysprobe::kproc::Record>> {
+        aterm_sysprobe::kproc::records()
+    }
+    fn group(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+        aterm_sysprobe::group_usage(pgid)
+    }
+    fn record(&self, pid: u32) -> std::io::Result<Option<aterm_sysprobe::kproc::Record>> {
+        aterm_sysprobe::kproc::record_read(pid)
+    }
+}
+
 /// An accounting host rooted in a process rather than a process group. Each read selects
 /// descendants from one kernel parent table, reads their groups once each, and filters out
 /// unrelated members (including concurrent slices in the same group). The root's birth and
-/// each selected member's parent, group and birth bracket those non-atomic reads.
+/// each selected member's parent, group and birth bracket those non-atomic reads. A read the
+/// machine did not answer (the table or a group unread, a table that does not add up, a tree
+/// past [`super::TEST_TREE_CAP`]) is [`Reading::Missed`]; the root gone or replaced, or a birth
+/// never read, is [`Reading::Over`]. The birth is read once, at [`RootHost::new`], even when that
+/// read fails: a birth first read later could be a process that reused the root's pid after its
+/// owner reaped it.
 #[derive(Debug)]
-struct RootHost {
+struct RootHost<S: Source> {
     root: u32,
     birth: Option<(u64, u32)>,
+    source: S,
 }
 
-impl RootHost {
-    fn new(root: u32) -> Self {
+impl<S: Source> RootHost<S> {
+    fn new(root: u32, source: S) -> Self {
         Self {
             root,
-            birth: aterm_sysprobe::kproc::record(root).map(|r| (r.start_s, r.start_us)),
+            birth: source
+                .record(root)
+                .ok()
+                .flatten()
+                .map(|r| (r.start_s, r.start_us)),
+            source,
         }
     }
 
-    fn read(&self) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
-        let records = aterm_sysprobe::kproc::records()?;
+    fn read(&self) -> Reading {
+        if self.birth.is_none() {
+            return Reading::Over;
+        }
+        let Some(records) = self.source.records() else {
+            return Reading::Missed;
+        };
         self.read_with(
             &records,
-            aterm_sysprobe::group_usage,
-            aterm_sysprobe::kproc::record,
+            |pgid| self.source.group(pgid),
+            |pid| self.source.record(pid),
         )
     }
 
@@ -99,30 +147,38 @@ impl RootHost {
         &self,
         records: &[aterm_sysprobe::kproc::Record],
         mut read_group: impl FnMut(u32) -> Option<Vec<aterm_sysprobe::MemberUsage>>,
-        mut record: impl FnMut(u32) -> Option<aterm_sysprobe::kproc::Record>,
-    ) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
-        let birth = self.birth?;
+        mut record: impl FnMut(u32) -> std::io::Result<Option<aterm_sysprobe::kproc::Record>>,
+    ) -> Reading {
+        let Some(birth) = self.birth else {
+            return Reading::Over;
+        };
+        let born = |r: &aterm_sysprobe::kproc::Record| (r.start_s, r.start_us) == birth;
         let mut by_pid = BTreeMap::new();
         let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for r in records {
             if by_pid.insert(r.pid, r).is_some() {
-                return None;
+                return Reading::Missed;
             }
             children.entry(r.ppid).or_default().push(r.pid);
         }
-        let root = by_pid.get(&self.root)?;
-        if (root.start_s, root.start_us) != birth {
-            return None;
+        match by_pid.get(&self.root) {
+            Some(root) if born(root) => {}
+            _ => return Reading::Over,
         }
         let mut selected = BTreeMap::new();
         let mut groups = BTreeSet::new();
         let mut open = VecDeque::from([self.root]);
         while let Some(pid) = open.pop_front() {
             if selected.len() >= super::TEST_TREE_CAP || selected.contains_key(&pid) {
-                return None;
+                return Reading::Missed;
             }
-            let r = *by_pid.get(&pid)?;
-            groups.insert(u32::try_from(r.pgid).ok()?);
+            let Some(r) = by_pid.get(&pid).copied() else {
+                return Reading::Missed;
+            };
+            let Ok(group) = u32::try_from(r.pgid) else {
+                return Reading::Missed;
+            };
+            groups.insert(group);
             selected.insert(pid, r);
             if let Some(next) = children.get(&pid) {
                 open.extend(next);
@@ -130,11 +186,14 @@ impl RootHost {
         }
         let mut members = Vec::new();
         for group in groups {
-            for m in read_group(group)? {
+            let Some(read) = read_group(group) else {
+                return Reading::Missed;
+            };
+            for m in read {
                 let Some(before) = selected.get(&m.pid) else {
                     continue;
                 };
-                let Some(after) = record(m.pid) else {
+                let Ok(Some(after)) = record(m.pid) else {
                     continue;
                 };
                 if (before.start_s, before.start_us, before.ppid, before.pgid)
@@ -144,13 +203,22 @@ impl RootHost {
                 }
             }
         }
-        let after = record(self.root)?;
-        ((after.start_s, after.start_us) == birth).then_some(members)
+        match record(self.root) {
+            Ok(Some(after)) if born(&after) => Reading::Read(members),
+            Ok(_) => Reading::Over,
+            Err(_) => Reading::Missed,
+        }
     }
 }
 
-impl Host for RootHost {
+impl<S: Source> Host for RootHost<S> {
     fn group_usage(&self, _: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+        match self.read() {
+            Reading::Read(members) => Some(members),
+            Reading::Missed | Reading::Over => None,
+        }
+    }
+    fn group_reading(&self, _: u32) -> Reading {
         self.read()
     }
     fn idle(&self) -> Option<Duration> {
@@ -162,169 +230,5 @@ impl Host for RootHost {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aterm_sysprobe::{MemberUsage, kproc::Record};
-
-    fn process(pid: u32, ppid: u32, pgid: i32) -> Record {
-        Record {
-            pid,
-            ppid,
-            pgid,
-            tpgid: 0,
-            tty: None,
-            uid: 0,
-            comm: String::new(),
-            start_s: 1,
-            start_us: pid,
-            zombie: false,
-        }
-    }
-
-    #[test]
-    fn descendants_cross_groups_without_booking_a_sibling_slice() {
-        let table = [
-            process(10, 1, 1),
-            process(11, 10, 1),
-            process(12, 11, 12),
-            process(20, 1, 1),
-        ];
-        let host = RootHost {
-            root: 10,
-            birth: Some((1, 10)),
-        };
-        let mut groups = Vec::new();
-        let read = host
-            .read_with(
-                &table,
-                |group| {
-                    groups.push(group);
-                    Some(
-                        table
-                            .iter()
-                            .filter(|p| p.pgid == group as i32)
-                            .map(|p| MemberUsage {
-                                pid: p.pid,
-                                start: u64::from(p.pid),
-                                cpu_ns: 1_000_000_000,
-                                ..MemberUsage::default()
-                            })
-                            .collect(),
-                    )
-                },
-                |pid| table.iter().find(|p| p.pid == pid).cloned(),
-            )
-            .unwrap();
-        assert_eq!(groups, [1, 12]);
-        assert_eq!(read.iter().map(|m| m.pid).collect::<Vec<_>>(), [10, 11, 12]);
-        let meter = Own::default();
-        meter.book(10, &read);
-        meter.book(10, &read);
-        let clock = Clock::new(None, &host, 10, None);
-        assert_eq!(
-            meter.usage(&clock, Duration::ZERO).unwrap().cpu,
-            Duration::from_secs(3)
-        );
-    }
-
-    #[test]
-    fn replacement_or_unread_root_cannot_supply_telemetry() {
-        let table = [process(10, 1, 1)];
-        let host = RootHost {
-            root: 10,
-            birth: Some((1, 10)),
-        };
-        assert!(
-            host.read_with(&table, |_| None, |_| Some(table[0].clone()))
-                .is_none()
-        );
-        let host = RootHost {
-            root: 10,
-            birth: Some((2, 10)),
-        };
-        assert!(
-            host.read_with(&table, |_| panic!("replaced root"), |_| None)
-                .is_none()
-        );
-        let host = RootHost {
-            root: 10,
-            birth: Some((1, 10)),
-        };
-        assert!(
-            host.read_with(&table, |_| Some(Vec::new()), |_| None)
-                .is_none()
-        );
-    }
-
-    /// An opt-in measurement, not a timing assertion. The same finite shell workload is run
-    /// ABBA; wait4 is only the independent measurement oracle, never production accounting.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "A1's interleaved local accounting experiment"]
-    fn a1_accounting_abba() {
-        use std::io::Write as _;
-        let own_cpu = || {
-            let me = std::process::id();
-            let group = u32::try_from(aterm_sysprobe::kproc::record(me)?.pgid).ok()?;
-            aterm_sysprobe::group_usage(group)?
-                .into_iter()
-                .find(|m| m.pid == me)
-                .map(|m| m.cpu_ns)
-        };
-        let began_wait = Instant::now();
-        let need = aterm_capacity::Need {
-            cores: 1,
-            ..aterm_capacity::Need::new("A1 accounting experiment")
-        };
-        let claim = aterm_capacity::admit(need, aterm_capacity::Admit::Wait).unwrap();
-        let waiting = began_wait.elapsed().as_secs_f64();
-        for (take, observe) in [false, true, true, false].into_iter().enumerate() {
-            let cpu_before = own_cpu();
-            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-            cmd.args(["-c", "read start; /bin/sh -c 'i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done' & wait"])
-                .stdin(aterm_uds::spawnfd::Stdio::piped());
-            let start = Instant::now();
-            let mut child = cmd.spawn().unwrap();
-            let meter = observe.then(|| UsageMeter::start(child.id()));
-            child.stdin.take().unwrap().write_all(b"start\n").unwrap();
-            let (tx, rx) = mpsc::channel();
-            let waiter = std::thread::spawn(move || {
-                let usage = child.wait_with_rusage().unwrap();
-                let wall = start.elapsed().as_secs_f64();
-                let _ = tx.send((usage, wall));
-            });
-            let mut max_load = 0.0_f64;
-            let (oracle, wall) = loop {
-                if let Some(load) = aterm_sysprobe::load_average() {
-                    max_load = max_load.max(load[0]);
-                }
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(result) => break result,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(e) => panic!("waiter: {e}"),
-                }
-            };
-            waiter.join().unwrap();
-            let measured = meter.and_then(UsageMeter::finish);
-            let observer_cpu = own_cpu()
-                .zip(cpu_before)
-                .map(|(after, before)| after.saturating_sub(before) as f64 / 1e9);
-            println!(
-                "A1-ABBA {}",
-                aterm_json::json!({
-                    "take":take+1, "arm":if observe {"B"} else {"A"}, "S":claim.cores(),
-                    "waiting_s":waiting, "wall_s":wall, "oracle_cpu_s":oracle.cpu.as_secs_f64(),
-                    "observer_cpu_s":observer_cpu,
-                    "total_cpu_s":observer_cpu.map(|cpu|cpu + oracle.cpu.as_secs_f64()),
-                    "sampled_cpu_s":measured.map(|u|u.cpu.as_secs_f64()),
-                    "starved_s":measured.map(|u|u.starved.as_secs_f64()),
-                    "processes":measured.map(|u|u.processes), "max_load1":max_load,
-                })
-            );
-            assert!(oracle.status.success());
-            if observe {
-                assert!(measured.is_some_and(|u| u.cpu > Duration::ZERO && u.processes >= 2));
-            }
-        }
-    }
-}
+#[path = "exec_account_tests.rs"]
+mod tests;

@@ -16,6 +16,33 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Eligible causal-only merges as (writer, sequence) ([`Log::eligible_and_merges`]).
 pub(crate) type Merges = Vec<(Actor, u64)>;
 
+/// A history clock derived from signed claims and causal edges, not an assertion of UTC time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Hlc {
+    /// Maximum signed clock claim observed along this operation's causal ancestry.
+    pub ms: u64,
+    /// Strict causal progress while the maximum claim stays unchanged.
+    pub counter: u64,
+}
+
+impl Hlc {
+    fn after(authored_ms: u64, parent: Option<Self>) -> Result<Self> {
+        match parent {
+            Some(parent) if authored_ms <= parent.ms => Ok(Self {
+                ms: parent.ms,
+                counter: parent
+                    .counter
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("table history logical clock exhausted"))?,
+            }),
+            _ => Ok(Self {
+                ms: authored_ms,
+                counter: 0,
+            }),
+        }
+    }
+}
+
 /// Provenance is evidence, not authority. Authored time is a signed clock claim;
 /// receipt time and offset describe only this replica's first durable retention.
 #[derive(Clone, Debug)]
@@ -358,6 +385,58 @@ impl Log {
             }
         })
     }
+
+    /// Business history ordered by a clock derived before filtering structural or refused
+    /// operations: those signed parents still constrain the clocks of edits that observed them.
+    ///
+    /// # Errors
+    /// An authenticated causal parent has no derived clock, or its logical counter overflows.
+    pub(crate) fn into_causal_history(
+        mut self,
+    ) -> Result<impl Iterator<Item = (Operation, Command, Hlc)>> {
+        let withheld = self
+            .records
+            .iter()
+            .filter_map(|(id, (op, _))| (!op.catalog_eligible).then_some(*id))
+            .collect();
+        let mut clocks = BTreeMap::new();
+        for id in self.index.project_excluding(&withheld).ordered {
+            let operation = &self.records[&id].0;
+            let mut parent_clock = None;
+            for parent in operation
+                .header
+                .parents
+                .iter()
+                .chain(operation.header.previous.iter())
+            {
+                let clock = *clocks
+                    .get(parent)
+                    .ok_or_else(|| Error::new("table history causal clock is incomplete"))?;
+                parent_clock =
+                    Some(parent_clock.map_or(clock, |previous: Hlc| previous.max(clock)));
+            }
+            clocks.insert(id, Hlc::after(operation.authored_ms, parent_clock)?);
+        }
+        let mut ordered = self
+            .eligible
+            .iter()
+            .map(|id| {
+                clocks
+                    .get(id)
+                    .copied()
+                    .map(|clock| (clock, *id))
+                    .ok_or_else(|| Error::new("table history causal clock is incomplete"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_unstable();
+        Ok(ordered.into_iter().filter_map(move |(clock, id)| {
+            let (operation, command) = self.records.remove(&id)?;
+            match command {
+                Some(Command::Merge { .. }) | None => None,
+                Some(command) => Some((operation, command, clock)),
+            }
+        }))
+    }
     /// [`Self::eligible`], and each eligible causal-only merge as its writer and sequence: the
     /// joins `application::append` writes before a record on a wide frontier, which a typed
     /// reader charges to that record's writer (`typed::owned::quota`).
@@ -628,3 +707,7 @@ impl Log {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "log_history_clock_tests.rs"]
+mod history_clock_tests;

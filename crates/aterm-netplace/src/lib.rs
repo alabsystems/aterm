@@ -9,7 +9,8 @@
 //! source), with the ALab LAN axis beside them (here, away since, learning). Who in the lab is up
 //! is presence's, never the place's: a reporter hands that in ([`words::Seats`]). [`place`] decides it, purely; [`words`] says it; [`record`] keeps the keeper's
 //! memory; [`heard`] is the evidence every process notes into; [`facts`] reads the Mac;
-//! [`keeper`] is the one writer and [`keeper::read`] what every reader calls; [`moves`] tells a
+//! [`keeper`] is the one writer and [`keeper::read`] what every reader calls; [`watch`] hears
+//! the files they read and the routes change, so neither looks for a change on a clock; [`moves`] tells a
 //! settled place as a network move, and [`routes`] says which member addresses an automatic LAN
 //! lane dials while away (the seam a future internet path plugs in at). [`proof`] is what a
 //! caller that must not take memory for proof reads (the vault's automatic ALab LAN admission):
@@ -42,6 +43,8 @@ pub mod proof;
 #[cfg(unix)]
 pub mod record;
 pub mod routes;
+#[cfg(unix)]
+pub mod watch;
 pub mod words;
 
 #[cfg(any(test, debug_assertions))]

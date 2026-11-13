@@ -88,7 +88,7 @@ fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
 #[test]
 fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     let base = TrailStatus {
-        style_raw: "rainbow kitty pet",
+        style_raw: "rainbow",
         style: Some(GlowStyle::RainbowKitty),
         unknown: false,
         config_enabled: true,
@@ -206,7 +206,7 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         assert!(line.contains(key), "missing {key:?} in {line}");
     }
     assert!(
-        line.contains(r#"style="rainbow kitty pet""#),
+        line.contains(r#"style="rainbow""#),
         "the raw config string is reported verbatim: {line}"
     );
     assert!(!line.contains('\n'), "the status row is one line: {line}");
@@ -291,7 +291,7 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
 
 fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     TrailStatus {
-        style_raw: "rainbow kitty pet",
+        style_raw: "rainbow",
         style: Some(GlowStyle::RainbowKitty),
         unknown: false,
         config_enabled: true,
@@ -370,7 +370,7 @@ fn the_row_reports_off_and_names_why_a_spelling_fell_back() {
         );
     }
     let honoured = TrailStatus {
-        style_raw: "rainbow kitty",
+        style_raw: "rainbow",
         style: Some(GlowStyle::RainbowKitty),
         unknown: false,
         ..row_for(rk::Flow::default())

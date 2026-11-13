@@ -515,7 +515,7 @@ fn the_real_journal_conforms_to_the_model() {
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let validated = std::sync::Mutex::new(std::collections::BTreeSet::<Step>::new());
-    let threads = std::thread::available_parallelism().map_or(1, |n| usize::from(n).min(4));
+    let threads = aterm_cores::available_parallelism().map_or(1, |n| usize::from(n).min(4));
     let mut reached: std::collections::BTreeSet<State> =
         std::collections::BTreeSet::from([model.init_state()]);
     let (mut refused, mut consumed) = (0usize, 0usize);

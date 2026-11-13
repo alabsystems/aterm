@@ -6,7 +6,7 @@
 use crate::wcag::contrast;
 use aterm_core::render::{CharFg, FireHaloCell, FireMode, FirePatch};
 use aterm_core::terminal::Terminal;
-use aterm_render::{DirtyDecision, Renderer, Theme, compute_dirty_rows};
+use aterm_render::{DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
 
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
@@ -378,4 +378,65 @@ fn halo_sits_under_earlier_columns_ink() {
             "col 4's halo darkened col 3's already-drawn glyph ink on scanline y={y}"
         );
     }
+}
+
+/// Fire halos lie under all ink, frame-wide (SPECS `layer-z-order`): a halo lifts up to
+/// 2 px into the row above, and there it lies under that row's ink, as the GPU's halo
+/// stream (drawn before its glyph stream) lays it. The halo of `█` at (2, 4) leaves the
+/// `█` above it at (1, 4) as it was, through a full render and through the row path; with
+/// the row above blank, the same lift lands in its band, so the halo was not cut short.
+#[test]
+fn halo_sits_under_the_row_aboves_ink() {
+    let mut rend = renderer();
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (4usize, 10usize);
+    let top = rend.grid_top();
+    let (x0, x1) = (rend.pad() + 4 * cw, rend.pad() + 5 * cw);
+    let row1 = top + ch..top + 2 * ch;
+    let frame = |above: bool, haloed: bool| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let above = if above { "\x1b[2;5H\u{2588}" } else { "" };
+        term.process(format!("\x1b[?25l\x1b[38;2;255;255;255m{above}\x1b[3;5H\u{2588}").as_bytes());
+        let mut input = term.cell_frame(rows, cols);
+        input.fire_patch = vec![
+            bright_fire(1, ch, cw, 8 * cw, 255),
+            bright_fire(2, ch, cw, 8 * cw, 255),
+        ];
+        if haloed {
+            input.fire_halo = vec![halo(2, 4, 255)];
+        }
+        input
+    };
+    let band = |px: &[u32], width: usize| -> Vec<u32> {
+        row1.clone()
+            .flat_map(|y| px[y * width + x0..y * width + x1].iter().copied())
+            .collect()
+    };
+
+    let plain = rend.render_input(&frame(true, false));
+    let haloed = rend.render_input(&frame(true, true));
+    assert_eq!(
+        band(&haloed.pixels, haloed.width),
+        band(&plain.pixels, plain.width),
+        "the halo of the row below recoloured the ink of the row above"
+    );
+
+    let mut warm = renderer();
+    let mut wc = WindowCpu::new();
+    for input in [frame(true, false), frame(true, true), frame(true, false)] {
+        let cached = warm.render_input_cached(&mut wc, &input).pixels().to_vec();
+        assert_eq!(
+            cached,
+            rend.render_input(&input).pixels,
+            "the row path draws the lifted halo as a full render does"
+        );
+    }
+
+    let blank = rend.render_input(&frame(false, false));
+    let lifted = rend.render_input(&frame(false, true));
+    assert_ne!(
+        band(&lifted.pixels, lifted.width),
+        band(&blank.pixels, blank.width),
+        "CONTROL: the halo lifts into the blank row above"
+    );
 }

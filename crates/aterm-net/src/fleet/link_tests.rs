@@ -418,6 +418,37 @@ fn a_reproof_left_unanswered_ends_the_link() {
 }
 
 #[test]
+fn withdrawn_local_authority_ends_an_established_link_without_reproof() {
+    let (a, b) = (node(0x5c), node(0x5d));
+    let mac_a = Mac::start(a.clone(), &[&a, &b]);
+    let mac_b = Mac::start(b.clone(), &[&a, &b]);
+    let link = mac_a.dial(&mac_b);
+    mac_a.table.judge();
+    assert!(link.closed().is_none(), "same-authority control stays open");
+    *lock(&mac_a.verdict) = Denied::not_yet_read();
+    mac_a.table.judge();
+    assert!(link.closed().is_none(), "unread is suspended judgment");
+    *lock(&mac_a.verdict) = Denied {
+        members: vec![a.key(), b.key()],
+        unread: true,
+        ..Denied::withdrawn()
+    };
+    let (ended, end) = mpsc::channel();
+    link.on_end(Box::new(move || {
+        let _ = ended.send(());
+    }));
+    mac_a.table.judge();
+    end.recv_timeout(HANG)
+        .expect("withdrawal ends the established link");
+    assert!(
+        link.closed().is_some(),
+        "withdrawal ends retained admission"
+    );
+    assert_eq!(link.reproofs(), (0, 0));
+    assert!(mac_a.table.link_to(b.node()).is_none());
+}
+
+#[test]
 fn a_key_the_log_took_out_ends_its_link_at_the_next_reproof() {
     let (a, b) = (node(0x5a), node(0x5b));
     let mac_a = Mac::start(a.clone(), &[&a, &b]);

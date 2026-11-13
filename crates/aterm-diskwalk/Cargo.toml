@@ -21,8 +21,9 @@ aterm-sysprobe = { workspace = true }
 # the BudgetedWalk model in test and debug builds; release strips them.
 aterm-spec-anchor = { workspace = true }
 
-# fd-relative opens and the portable lister's `readdir` (Unix only: the crate is
-# empty on Windows), and the platform calls the lister arms declare beside them.
+# fd-relative opens and the portable lister's `readdir`, and the platform calls the
+# lister arms declare beside them (Unix only: the Windows arm, handle-relative,
+# declares its own calls in src/win.rs and needs no crate).
 [target.'cfg(unix)'.dependencies]
 aterm-dirfd = { workspace = true }
 libc = { workspace = true }

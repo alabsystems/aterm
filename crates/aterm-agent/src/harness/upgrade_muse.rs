@@ -245,7 +245,7 @@ fn read(argv: &[String]) -> Result<Read, ArgvRefusal> {
 const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", "--config"];
 
 /// The root options that say what a Muse Code run may do unasked: its worker's are its parent's
-/// (owner ruling 2026-11-02), held to [`WORKER_FLOOR`] ([`worker_flags`]).
+/// held to [`WORKER_FLOOR`] ([`worker_flags`]).
 const PERMISSION_FLAGS: &[&str] = &[
     "--approval-judge",
     "--approval-mode",

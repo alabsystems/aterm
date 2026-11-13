@@ -191,7 +191,7 @@ impl TimerDrive {
                 d.session,
                 Some(Autopilot::Cruise),
                 Some(at),
-                crate::autopilot::Surface::Menu,
+                crate::autopilot::Surface::Settings,
             );
             d.hand = 0;
             d.fires = 0;

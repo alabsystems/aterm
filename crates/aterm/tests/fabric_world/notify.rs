@@ -144,18 +144,11 @@ impl Watch {
     }
 
     fn suppressed(&self) -> u64 {
-        std::fs::read_to_string(self.state.join("notify/suppressed"))
-            .ok()
-            .and_then(|s| s.split_whitespace().next()?.parse().ok())
-            .unwrap_or(0)
+        aterm_link::notify::suppressed_count(&self.state)
     }
 
     fn journal(&self) -> Vec<String> {
-        std::fs::read_to_string(self.state.join("notify/journal"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        aterm_link::notify::journal_lines(&self.state)
     }
 }
 
@@ -233,7 +226,8 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
         again.stdout
     );
 
-    std::fs::remove_file(w.state.join("notify/cur/attention")).expect("drop the cursor");
+    aterm_link::notify::rewind_cursor(&w.state, "attention", 0)
+        .expect("the cursor rolled back to the log's start");
     let rescan = w.once("attention", &[]);
     assert!(rescan.status.success(), "{}", rescan.stderr);
     assert_eq!(
@@ -520,7 +514,7 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     let w = Watch::attention(&fleet, "head-restart");
     let mut daemon = w.follow_with("attention", &w.appender(), &["--since", "head"]);
     until("the head cursor to be persisted", || {
-        w.state.join("notify/cur/attention").exists().then_some(())
+        aterm_link::notify::cursor_of(&w.state, "attention").map(|_| ())
     });
     daemon.kill();
     let off = raise_attention(&fleet, "s-one", 1, "arrived while offline");
@@ -568,12 +562,8 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
     until("the second notification command to block", || {
         entered.exists().then_some(())
     });
-    let cursor_path = w.state.join("notify/cur/attention");
-    let cursor: u64 = std::fs::read_to_string(&cursor_path)
-        .expect("first record cursor")
-        .trim()
-        .parse()
-        .expect("numeric cursor");
+    let cursor: u64 =
+        aterm_link::notify::cursor_of(&w.state, "attention").expect("first record cursor");
     assert_eq!(
         cursor,
         first + 1,
@@ -611,10 +601,7 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
         .write_all(b"go\n")
         .expect("write release");
     until("the page checkpoint to persist after the command", || {
-        std::fs::read_to_string(&cursor_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|cursor| *cursor > after_page)
+        aterm_link::notify::cursor_of(&w.state, "attention").filter(|cursor| *cursor > after_page)
     });
     assert!(w.fired().iter().any(|line| offset_of(line) == second));
     assert!(model.fire("HandleRecord", &mut state));

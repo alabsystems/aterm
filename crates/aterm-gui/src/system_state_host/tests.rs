@@ -73,6 +73,7 @@ mod queued_panes {
                 wanted: Access::Accessibility.wanted().into(),
                 note: None,
                 detail: None,
+                read: aterm_types::macos_setup::Read::Unstamped,
             }],
             ..SetupStatus::default()
         }
@@ -218,7 +219,7 @@ fn handlers() -> InitialSetupHandlers {
             APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
             true
         },
-        check: |plan| {
+        check: |plan, _| {
             note(format!("check {}", plan.vault_url));
             CheckStarted {
                 reading: true,
@@ -251,6 +252,7 @@ fn handlers() -> InitialSetupHandlers {
             true
         },
         fda_granted: || {},
+        fda_off: || note("fda off".to_owned()),
         tools_installed: || {},
         join_phrase: |phrase, receipt| {
             note(format!("join phrase {}", phrase.as_str().unwrap_or("")));
@@ -323,6 +325,437 @@ fn indicators(app: &App, instance: AppInstanceId, view: ViewId) -> AppIndicators
         .presentation(instance, view)
         .unwrap()
         .indicators
+}
+
+/// What nobody chose holds no update once it has settled, and the ALab profile's widening holds
+/// none at all, since the successor derives both again. A plan someone chose and that is not durable
+/// holds, whether a person or a control client chose it. NEGATIVE CONTROL: the same Apply inside its
+/// settle holds, and a person's choice queued behind another setup holds.
+#[test]
+fn what_nobody_pressed_holds_no_update() {
+    let mut app = App::headless_for_test();
+    let (_, instance, _) = page(&mut app);
+    let past = Instant::now()
+        .checked_sub(UNPRESSED_APPLY_SETTLE + Duration::from_secs(1))
+        .expect("this machine has been up long enough");
+    for (admission, chosen, since, queued, holds) in [
+        (Admission::Automatic, false, Instant::now(), false, true),
+        (Admission::Client, false, Instant::now(), false, true),
+        (Admission::Person, false, Instant::now(), false, true),
+        (Admission::Automatic, false, past, false, false),
+        (Admission::Client, false, past, false, false),
+        (Admission::Client, true, past, false, true),
+        (Admission::Client, true, past, true, true),
+        (Admission::Person, false, past, false, true),
+        (Admission::Automatic, false, past, true, false),
+        (Admission::Person, false, past, true, true),
+        // Queued behind another setup and nobody's press: aterm's own, until it settles.
+        (Admission::Automatic, false, Instant::now(), true, true),
+        (Admission::Client, false, Instant::now(), true, true),
+    ] {
+        let (_answer, receiver) = mpsc::channel();
+        app.system_state_host.pending_apply = Some(PendingApply {
+            instance,
+            admission,
+            plan: Plan::default(),
+            answer: receiver,
+            release_permissions: true,
+            since,
+            chosen,
+        });
+        app.system_state_host.latest_status.queued = queued;
+        assert_eq!(
+            app.system_state_handoff_pending(),
+            holds,
+            "{admission:?}, chosen: {chosen}, queued: {queued}"
+        );
+        let choice = admission == Admission::Person || chosen;
+        assert_eq!(
+            app.system_state_handoff_hold(),
+            match (holds, choice) {
+                (false, _) => None,
+                (true, true) => Some(crate::native_update_lane_hold::LaneHold::SetupChoice),
+                (true, false) => Some(crate::native_update_lane_hold::LaneHold::SystemState),
+            },
+            "{admission:?}, chosen: {chosen}, queued: {queued}: a choice is its maker's unsaved \
+             work; what nobody chose holds only until it settles"
+        );
+        assert_eq!(
+            app.project_system_state_status(SetupStatus::default())
+                .0
+                .queued_held,
+            choice,
+            "{admission:?}, chosen: {chosen}: what the page calls a choice, with a Stop"
+        );
+    }
+
+    app.system_state_host.pending_apply = None;
+    app.system_state_host.latest_status.queued = true;
+    assert!(
+        app.system_state_handoff_pending(),
+        "a person's choice queued behind another setup is theirs"
+    );
+    assert_eq!(
+        app.system_state_handoff_hold(),
+        Some(crate::native_update_lane_hold::LaneHold::SetupChoice)
+    );
+    app.system_state_host.latest_status.queued_widen = true;
+    assert!(
+        !app.system_state_handoff_pending(),
+        "the ALab profile's widening is nobody's press"
+    );
+}
+
+/// A plan a control client chose holds an update as a person's does, through the page and the Apply
+/// that carry it: it let go after 30 s, which dropped the choice with no word. A client's Choice
+/// over a person's press holds too. CONTROL: a client's Set up now under a saved Stop lets go, since
+/// the Stop stands and it can press again.
+#[test]
+fn a_plan_a_client_chose_holds_an_update_past_the_settle() {
+    let aged = |app: &mut App| {
+        app.system_state_host
+            .pending_apply
+            .as_mut()
+            .expect("the Apply stands")
+            .since = Instant::now()
+            .checked_sub(UNPRESSED_APPLY_SETTLE + Duration::from_secs(1))
+            .expect("this machine has been up long enough");
+    };
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    app.with_gesture_source(true, |app| {
+        press(app, wid, view, "system-state/group/1/leave");
+    });
+    aged(&mut app);
+    assert!(app.system_state_handoff_pending(), "a client's Choice");
+
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    press(&mut app, wid, view, "system-state/group/1/leave");
+    app.with_gesture_source(true, |app| {
+        press(app, wid, view, "system-state/group/2/leave");
+    });
+    aged(&mut app);
+    assert!(
+        app.system_state_handoff_pending(),
+        "a client's Choice over a person's press"
+    );
+
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(Plan::default()),
+            run: Some(crate::InitialSetupRunPolicy {
+                revision: 1,
+                allowed: false,
+            }),
+            observed: vec![aterm_types::macos_setup::Observation {
+                standing: aterm_types::macos_setup::Standing::Differs,
+                now: Some("Docs indexed".into()),
+                ..aterm_types::macos_setup::Observation::unknown(
+                    aterm_types::macos_setup::Subject::Setting(Setting::Spotlight),
+                )
+            }],
+            ..SetupStatus::default()
+        },
+    );
+    app.with_gesture_source(true, |app| {
+        press(app, wid, view, "system-state/headline/start");
+    });
+    assert!(
+        app.system_state_handoff_pending(),
+        "PRECONDITION: the page's Set up now started an Apply"
+    );
+    aged(&mut app);
+    assert!(!app.system_state_handoff_pending(), "a client's Set up now");
+}
+
+/// A STOP LETS GO OF A CHOICE WAITING BEHIND ANOTHER SETUP: nothing could, short of quitting, while
+/// it held every update for as long as that setup stayed up. CONTROL: until the worker lets go of it
+/// the choice still holds.
+#[test]
+fn a_stop_lets_go_of_a_choice_waiting_behind_another_setup() {
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    press(&mut app, wid, view, "system-state/group/1/leave");
+    let held = receipt();
+    calls();
+    fresh(
+        &mut app,
+        SetupStatus {
+            queued: true,
+            ..running()
+        },
+    );
+    assert!(app.system_state_handoff_pending(), "PRECONDITION: it holds");
+    press(&mut app, wid, view, "system-state/stop");
+    assert_eq!(calls(), ["stop"], "the worker hears the Stop");
+    assert!(
+        app.system_state_handoff_pending(),
+        "CONTROL: until the worker lets go"
+    );
+    drop(held);
+    app.resolve_system_state_apply();
+    assert!(app.system_state_host.pending_apply.is_none());
+    fresh(&mut app, SetupStatus::default());
+    assert!(!app.system_state_handoff_pending());
+}
+
+/// A STOP OF A WAITING CHOICE LEAVES THE COMMAND LINE TOOLS ALONE: it also dropped the launch's want
+/// for them (and a press queued behind a macOS dialog), and with the tab up interrupted the installer,
+/// which that wait has nothing to do with. It still lets the permission gate go, and stands until a
+/// press. CONTROL: a Stop of a run withdraws the want, and is no stopped wait.
+#[test]
+fn a_stop_of_a_waiting_choice_leaves_the_tools_install_alone_and_stands_until_a_press() {
+    use crate::clt_install::{Install, LAUNCH_WANT};
+    let stopped_wait = |app: &App| {
+        app.project_system_state_status(SetupStatus::default())
+            .0
+            .stopped_wait
+    };
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    press(&mut app, wid, view, "system-state/group/1/leave");
+    let held = receipt();
+    calls();
+    app.workstation_setup.developer_tools = Install::Wanted(LAUNCH_WANT);
+    app.workstation_setup.developer_tools_want = Some(LAUNCH_WANT);
+    fresh(
+        &mut app,
+        SetupStatus {
+            queued: true,
+            ..running()
+        },
+    );
+    assert!(
+        !app.workstation_setup.setup_unheld(),
+        "PRECONDITION: the choice holds the gate"
+    );
+    press(&mut app, wid, view, "system-state/stop");
+    assert_eq!(calls(), ["stop"], "the worker hears the Stop");
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::Wanted(LAUNCH_WANT)
+    );
+    assert_eq!(
+        app.workstation_setup.developer_tools_want,
+        Some(LAUNCH_WANT)
+    );
+    assert!(stopped_wait(&app));
+    drop(held);
+    app.resolve_system_state_apply();
+    fresh(
+        &mut app,
+        SetupStatus {
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision: 4,
+                allowed: true,
+            }),
+            ..SetupStatus::default()
+        },
+    );
+    assert!(
+        app.workstation_setup.setup_unheld(),
+        "the gate goes with the next status, or the tab it holds never opens"
+    );
+    assert_eq!(
+        app.workstation_setup.developer_tools_want,
+        Some(LAUNCH_WANT)
+    );
+    assert!(stopped_wait(&app), "it stands past the read that goes idle");
+    assert_eq!(
+        app.access_revision(),
+        None,
+        "the page reads as stopped, so no access step starts by itself"
+    );
+    assert!(!app.permission_steps_admitted());
+    assert_eq!(
+        app.workstation_setup.access_revision(),
+        Some(4),
+        "PRECONDITION: the plan's own run still reads allowed"
+    );
+    // The groups went back to the plan the worker holds when the choice was let go.
+    press(&mut app, wid, view, "system-state/group/1/leave");
+    assert!(!stopped_wait(&app), "a press ends it");
+    receipt().accept();
+    app.resolve_system_state_apply();
+    fresh(
+        &mut app,
+        SetupStatus {
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision: 4,
+                allowed: true,
+            }),
+            ..SetupStatus::default()
+        },
+    );
+    assert_eq!(app.access_revision(), Some(4), "and the press admits them");
+    assert!(app.permission_steps_admitted());
+
+    let mut run = App::headless_for_test();
+    let (wid, _, view) = page(&mut run);
+    run.set_system_state_handlers_for_test(handlers());
+    run.workstation_setup.developer_tools = Install::Wanted(LAUNCH_WANT);
+    run.workstation_setup.developer_tools_want = Some(LAUNCH_WANT);
+    fresh(&mut run, running());
+    press(&mut run, wid, view, "system-state/stop");
+    assert_eq!(run.workstation_setup.developer_tools, Install::Unasked);
+    assert_eq!(run.workstation_setup.developer_tools_want, None);
+    assert!(!stopped_wait(&run));
+}
+
+/// A STOPPED WAIT ENDS WITH A PRESS OR A RUN NOBODY STOPPED: it stayed through a run that started
+/// without a press, so when that run ended the page never retried it and read as stopped. A person's
+/// Turn On… asks only for macOS's grants, so it ends the access steps' hold and the plan's changes
+/// still wait. CONTROLS: an offer that goes away unanswered, one whose answer never reached the
+/// worker, and a client's Turn On…, leave it.
+#[test]
+fn a_stopped_wait_ends_with_a_press_or_a_run_nobody_stopped() {
+    let stopped_wait = |app: &App| {
+        app.project_system_state_status(SetupStatus::default())
+            .0
+            .stopped_wait
+    };
+    let stopped_on = |app: &mut App| {
+        let (wid, _, view) = page(app);
+        app.set_system_state_handlers_for_test(handlers());
+        press(app, wid, view, "system-state/group/1/leave");
+        let held = receipt();
+        calls();
+        fresh(
+            app,
+            SetupStatus {
+                queued: true,
+                ..running()
+            },
+        );
+        press(app, wid, view, "system-state/stop");
+        assert!(stopped_wait(app), "PRECONDITION: a stopped wait");
+        drop(held);
+        app.resolve_system_state_apply();
+        fresh(app, SetupStatus::default());
+        calls();
+        assert!(stopped_wait(app), "PRECONDITION: past the idle read");
+    };
+
+    let mut app = App::headless_for_test();
+    stopped_on(&mut app);
+    fresh(
+        &mut app,
+        SetupStatus {
+            running: vec![Setting::Spotlight],
+            ..running()
+        },
+    );
+    assert!(
+        !stopped_wait(&app),
+        "a stage running is a run it did not stop"
+    );
+
+    let mut app = App::headless_for_test();
+    stopped_on(&mut app);
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    assert!(stopped_wait(&app), "an offer alone starts nothing");
+    request.finish(WorkstationSetupDecision::Unavailable);
+    app.tick_system_state(Instant::now());
+    assert!(
+        stopped_wait(&app),
+        "CONTROL: an offer that went away unanswered leaves it"
+    );
+    drop(receive);
+    let allowed = || SetupStatus {
+        permissions: Some(crate::InitialSetupPermissionPolicy {
+            revision: 4,
+            allowed: true,
+        }),
+        ..SetupStatus::default()
+    };
+    fresh(&mut app, allowed());
+    assert_eq!(
+        app.workstation_setup.access_revision(),
+        Some(4),
+        "PRECONDITION: the plan's own run still reads allowed"
+    );
+    assert_eq!(
+        app.access_revision(),
+        None,
+        "the access steps stay held after the offer goes away"
+    );
+
+    let mut app = App::headless_for_test();
+    stopped_on(&mut app);
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .os_window_for_test = true;
+    assert!(app.commit_glassless_native_frame(WindowId(0)));
+    assert!(answer_offer(&mut app));
+    assert!(
+        request.pending(),
+        "PRECONDITION: the answer is queued and the offer still live"
+    );
+    request.finish(WorkstationSetupDecision::Unavailable);
+    app.drain_system_state_actions();
+    assert!(
+        stopped_wait(&app),
+        "CONTROL: an answer that never reached the worker starts no run"
+    );
+    drop(receive);
+
+    let mut app = App::headless_for_test();
+    stopped_on(&mut app);
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    app.user_input_recent = |_| true;
+    app.tick_system_state(Instant::now());
+    let mut answer = receive.try_recv().expect("the page answers the offer");
+    assert!(
+        !stopped_wait(&app),
+        "that offer's run goes whatever the page holds"
+    );
+    drop(answer.receipt.take());
+
+    let mut app = App::headless_for_test();
+    stopped_on(&mut app);
+    let turn_on = |app: &mut App, client: bool| {
+        app.with_gesture_source(client, |app| {
+            app.interact_system_state(WindowId(0));
+            app.run_system_state_action_with_handlers(
+                SystemStateAction::AskForAccess { by_person: !client },
+                Some(handlers()),
+            );
+        });
+    };
+    turn_on(&mut app, true);
+    assert!(
+        stopped_wait(&app),
+        "CONTROL: a client's gesture is no press"
+    );
+    assert!(app.system_state_host.stopped_access());
+    turn_on(&mut app, false);
+    assert!(
+        stopped_wait(&app),
+        "the plan's changes still wait for Set up now or a group"
+    );
+    fresh(&mut app, allowed());
+    assert_eq!(
+        app.access_revision(),
+        Some(4),
+        "a person's Turn On… lets the grants go"
+    );
+    assert!(app.permission_steps_admitted());
 }
 
 /// A status read asked for after everything the host has done so far.
@@ -468,6 +901,7 @@ fn withdrawn_system_state_request_cannot_open_or_hold_a_page() {
             Some(|| true),
             false,
             crate::clt_shim::Shim::default(),
+            false,
         );
         if route != "window" {
             assert!(app.open_system_state_tab());
@@ -530,6 +964,7 @@ fn withdrawn_system_state_offer_restores_policy_only_after_a_fresh_read() {
         Some(|| true),
         false,
         crate::clt_shim::Shim::default(),
+        false,
     );
     app.receive_system_state_status(Some(app.system_state_host.generation), policy());
     assert!(!app.workstation_setup.suppresses_permissions());
@@ -578,6 +1013,7 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
         Some(|| true),
         false,
         crate::clt_shim::Shim::default(),
+        false,
     );
     let (wid, instance, view) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
@@ -648,6 +1084,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
             Some(|| true),
             false,
             crate::clt_shim::Shim::default(),
+            false,
         );
         let (wid, instance, view) = page(&mut app);
         app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
@@ -716,6 +1153,7 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
         Some(|| true),
         false,
         crate::clt_shim::Shim::default(),
+        false,
     );
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
@@ -750,6 +1188,7 @@ fn a_refused_local_decision_keeps_its_permission_hold() {
             Some(|| true),
             false,
             crate::clt_shim::Shim::default(),
+            false,
         );
         let (wid, _, view) = page(&mut app);
         let policy = || SetupStatus {
@@ -878,7 +1317,11 @@ fn a_restore_holds_no_access_step() {
 
 #[test]
 fn refused_automatic_offer_does_not_take_the_active_tab_or_focus() {
-    for busy in [false, true] {
+    use crate::native_app::TextInputEvent;
+    use crate::system_state::PHRASE_FIELD;
+
+    for mode in ["url", "busy", "phrase", "phrase-preedit"] {
+        let busy = mode == "busy";
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let terminal = app.windows[&wid].tab_set.active_index().unwrap();
@@ -886,7 +1329,7 @@ fn refused_automatic_offer_does_not_take_the_active_tab_or_focus() {
         app.set_system_state_handlers_for_test(handlers());
         if busy {
             press(&mut app, wid, view, "system-state/check");
-        } else {
+        } else if mode == "url" {
             // A vault address typed here and not joined yet is the person's.
             type_into(
                 &mut app,
@@ -895,10 +1338,41 @@ fn refused_automatic_offer_does_not_take_the_active_tab_or_focus() {
                 "system-state/url",
                 "http://draft.local/v1/team",
             );
+        } else {
+            app.publish_system_state(fixture_status("vault-asking").unwrap());
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new(PHRASE_FIELD))),
+            )
+            .unwrap();
+            if mode == "phrase" {
+                type_into(&mut app, wid, view, PHRASE_FIELD, "river stone lamp");
+            } else {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    AppEvent::TextInput(TextInputEvent::Preedit {
+                        text: "river".into(),
+                        selection: Some(5..5),
+                    }),
+                )
+                .unwrap();
+                let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+                    panic!("the phrase page remains open")
+                };
+                assert!(model.field_composing(PHRASE_FIELD));
+                assert!(model.text_input(PHRASE_FIELD).unwrap().value().is_empty());
+            }
         }
-        app.switch_tab_in(wid, terminal);
+        // Switching tabs may legitimately cancel an IME composition. Exercise that
+        // incoming-offer race while the composing field is still focused instead.
+        if mode != "phrase-preedit" {
+            app.switch_tab_in(wid, terminal);
+        }
         let active = app.windows[&wid].tab_set.active_id();
         let focus = app.windows[&wid].window_focus;
+        let active_native = app.active_native_view(wid);
         let snapshot = |app: &App| {
             let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
                 panic!("the page must remain live")
@@ -913,6 +1387,7 @@ fn refused_automatic_offer_does_not_take_the_active_tab_or_focus() {
                     .common()
                     .last_focus
                     .clone(),
+                model.field_projection(PHRASE_FIELD),
             )
         };
         let before = snapshot(&app);
@@ -931,7 +1406,7 @@ fn refused_automatic_offer_does_not_take_the_active_tab_or_focus() {
         );
         assert_eq!(app.windows[&wid].tab_set.active_id(), active);
         assert_eq!(app.windows[&wid].window_focus, focus);
-        assert!(app.active_native_view(wid).is_none());
+        assert_eq!(app.active_native_view(wid), active_native);
         assert_eq!(snapshot(&app), before);
         assert!(app.system_state_host.pending.is_none());
         assert!(app.native_runtime.take_system_state_action().is_none());
@@ -1044,7 +1519,7 @@ fn check_again_reads_every_row_for_the_pages_plan_and_says_when_it_did_not_start
     fresh(&mut app, SetupStatus::default());
     // Neither the forced reading nor the check started.
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        check: |_| CheckStarted::default(),
+        check: |_, _| CheckStarted::default(),
         ..handlers()
     });
     press(&mut app, wid, view, "system-state/check");
@@ -1119,6 +1594,7 @@ fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_
         Some(|| true),
         false,
         crate::clt_shim::Shim::default(),
+        false,
     );
     let (wid, _, view) = page(&mut app);
     let mut status = fixture_status("sync-off").unwrap();
@@ -1168,31 +1644,136 @@ fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_
 /// (with nobody at the Mac too: [`a_mac_nobody_touches_admits_its_offer_at_once_and_holds_its_person_stages`]).
 #[test]
 fn the_offer_is_answered_on_the_first_tick_focused_or_not() {
+    use aterm_types::macos_setup::{Observation, Standing, Subject};
+
     for focused in [false, true] {
-        let mut app = App::headless_for_test();
-        app.user_input_recent = |_| true;
-        let (wid, _, _) = page(&mut app);
-        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-        app.window_focus_event(wid, focused);
-        let (send, receive) = mpsc::channel();
-        let request = Request::new(Plan::default(), send);
-        app.attach_system_state_offer(request.clone());
-        app.tick_system_state(Instant::now());
-        let mut answer = receive
-            .try_recv()
-            .expect("the first tick answers the offer");
-        assert_eq!(
-            answer.decision,
-            WorkstationSetupDecision::Begin(Plan::default())
-        );
-        assert!(!answer.chosen, "aterm's own answer, focused {focused}");
-        assert_eq!(
-            answer.receipt.as_ref().unwrap().admission(),
-            Admission::Automatic
-        );
-        answer.receipt.take().unwrap().accept();
-        app.resolve_system_state_apply();
-        assert!(!request.pending());
+        for other_source in [false, true] {
+            let mut app = App::headless_for_test();
+            app.user_input_recent = |_| true;
+            let (wid, _, _) = page(&mut app);
+            app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+            app.window_focus_event(wid, focused);
+            let source = Plan::default().vault_url;
+            let caps = Subject::Setting(Setting::CapsLock);
+            let dock = Subject::Setting(Setting::Dock);
+            let vault = Subject::Setting(Setting::Secrets);
+            let prior = Observation {
+                standing: Standing::InPlace,
+                now: Some("kept Control".into()),
+                ..Observation::unknown(caps)
+            };
+            let current = Observation {
+                standing: Standing::InPlace,
+                now: Some("kept Dock".into()),
+                ..Observation::unknown(dock)
+            }
+            .stamped(1_700_000_000);
+            let joined = Observation {
+                standing: Standing::InPlace,
+                now: Some("kept vault".into()),
+                ..Observation::unknown(vault)
+            }
+            .stamped(1_700_000_000);
+            fresh(
+                &mut app,
+                SetupStatus {
+                    plan: Some(Plan::default()),
+                    finished: true,
+                    permissions: Some(crate::InitialSetupPermissionPolicy {
+                        revision: 7,
+                        allowed: true,
+                    }),
+                    run: Some(crate::InitialSetupRunPolicy {
+                        revision: 7,
+                        allowed: true,
+                    }),
+                    last_known: vec![prior.clone()],
+                    observed: vec![
+                        Observation {
+                            standing: Standing::InPlace,
+                            now: Some("unconfirmed Control".into()),
+                            ..Observation::unknown(caps)
+                        }
+                        .stamped(1_700_000_000),
+                        current.clone(),
+                        joined.clone(),
+                        Observation {
+                            now: Some("undated Dock".into()),
+                            read: aterm_types::macos_setup::Read::Unstamped,
+                            ..current.clone()
+                        },
+                        Observation {
+                            now: Some("zero-date Dock".into()),
+                            read: aterm_types::macos_setup::Read::At(0),
+                            ..current.clone()
+                        },
+                        Observation {
+                            now: Some("withheld vault".into()),
+                            read: aterm_types::macos_setup::Read::Withheld,
+                            ..joined.clone()
+                        },
+                    ],
+                    unconfirmed_observations: vec![caps],
+                    observed_vault_url: Some(source.clone()),
+                    ..SetupStatus::default()
+                },
+            );
+            let mut offered = Plan::default();
+            if other_source {
+                offered.vault_url = "https://other.invalid/vault".into();
+            }
+            let (send, receive) = mpsc::channel();
+            let request = Request::new(offered.clone(), send);
+            app.attach_system_state_offer(request.clone());
+            let retained = &app.system_state_host.latest_status;
+            assert_eq!(
+                retained.last_known,
+                [prior, current, joined],
+                "attaching an automatic retry keeps its last useful values"
+            );
+            assert!(retained.observed.is_empty() && retained.rows.is_empty());
+            assert!(retained.permissions.is_none() && retained.run.is_none());
+            assert!(!retained.finished);
+            assert_eq!(
+                retained.observed_vault_url.as_deref(),
+                Some(source.as_str())
+            );
+            let row = crate::system_state::row_view(dock, retained, offered.selection);
+            assert_eq!(
+                row.value,
+                crate::system_state::RowValue::LastKnown("kept Dock".into())
+            );
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("system-state/row/dock/info"))
+                    .unwrap()
+                    .label
+                    .contains("Last read: kept Dock"),
+                "the actual controller also keeps its visible value"
+            );
+            assert_eq!(
+                compiled
+                    .semantics
+                    .iter()
+                    .any(|node| node.label.contains("kept vault")),
+                !other_source,
+                "only matching-source history is shown"
+            );
+            app.tick_system_state(Instant::now());
+            let mut answer = receive
+                .try_recv()
+                .expect("the first tick answers the offer");
+            assert_eq!(answer.decision, WorkstationSetupDecision::Begin(offered));
+            assert!(!answer.chosen, "aterm's own answer, focused {focused}");
+            assert_eq!(
+                answer.receipt.as_ref().unwrap().admission(),
+                Admission::Automatic
+            );
+            answer.receipt.take().unwrap().accept();
+            app.resolve_system_state_apply();
+            assert!(!request.pending());
+        }
     }
 }
 
@@ -1272,8 +1853,8 @@ fn a_join_while_the_offer_waits_hands_the_vault_and_password_to_the_startup_once
 
 /// A Mac nobody touches (idle ten minutes, or its screen locked) admits its first-launch offer at
 /// the page's first tick, as one a person just used does: the admission and the background stages
-/// it starts wait for nobody (init-on-by-default design §6.1, the owner's ruling of 2026-10-25).
-/// Its person stages wait: the page in front of nobody does not open the sign-outs' `on_screen`
+/// it starts wait for nobody (init-on-by-default design §6.1).
+/// Its person stages wait: the page in front of nobody does not open the worker's `page_front`
 /// port. A page not in front reads neither the input nor the screen.
 #[test]
 fn a_mac_nobody_touches_admits_its_offer_at_once_and_holds_its_person_stages() {
@@ -1743,12 +2324,12 @@ fn nonrun_operation_refusal_or_reading_alone_reserves_no_check_slot() {
         app.set_system_state_handlers_for_test(InitialSetupHandlers {
             restore: || false,
             check: if reading {
-                |_| CheckStarted {
+                |_, _| CheckStarted {
                     reading: true,
                     check: false,
                 }
             } else {
-                |_| CheckStarted::default()
+                |_, _| CheckStarted::default()
             },
             apply: |_, _, _, _| {
                 note("apply".into());
@@ -2132,7 +2713,7 @@ fn check_again_beside_a_waiting_restore_keeps_the_restore() {
     let mut app = App::headless_for_test();
     let (wid, instance, view) = page(&mut app);
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        check: |_| {
+        check: |_, _| {
             note("check".to_owned());
             CheckStarted {
                 reading: true,
@@ -2423,6 +3004,7 @@ mod observation_start {
                     detail: (declined && access == Access::DeveloperTools).then(|| {
                         "You chose Not now. Setting Permissions up again asks again.".into()
                     }),
+                    read: aterm_types::macos_setup::Read::Unstamped,
                 })
                 .collect(),
             ..SetupStatus::default()
@@ -2550,6 +3132,7 @@ mod observation_start {
                 wanted: Setting::Repositories.wanted().into(),
                 note: Some("GitHub refuses your token: renew it in the vault".into()),
                 detail: None,
+                read: aterm_types::macos_setup::Read::Unstamped,
             }],
             ..SetupStatus::default()
         };
@@ -2657,6 +3240,19 @@ mod observation_start {
             return;
         }
         let (mut app, wid, instance, view, saved) = setup(true);
+        app.config.serious_mode = Some(true);
+        // Keep the render-cost feedback latch fixed: it is in the page's paint stamp, and a
+        // present that outran its frame budget on a loaded host would stale the kept raster.
+        app.perf_reduced = true;
+        app.perf_flip_at = Some(Instant::now());
+        app.perf_shed_dwell = Duration::MAX;
+        app.sync_chrome_fonts();
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 14;
+        window.cols = 100;
+        window.present = Some(crate::PresentTarget::Cpu {
+            surface: crate::present::CpuSurface::Scripted(Default::default()),
+        });
         app.window_focus_event(wid, true);
         tick(&mut app, Instant::now());
         assert_eq!(reads().as_slice(), std::slice::from_ref(&saved));
@@ -2689,25 +3285,24 @@ mod observation_start {
         app.dispatch_native_view_event(wid, view, AppEvent::TextInput(TextInputEvent::SelectAll))
             .unwrap();
         let render = |app: &App| {
-            app.native_runtime
-                .render(
-                    instance,
-                    view,
-                    &crate::native_app::ViewCx {
-                        viewport: crate::native_ui::LogicalRect::new(0.0, 0.0, 720.0, 124.0),
-                        animation_phase_ms: 0,
-                        motion: crate::native_app::ViewMotionCx::default(),
-                        terminal_font_px: 13.0,
-                        terminal_scale: 2.0,
-                        semantic_font: None,
-                        document: None,
-                    },
-                )
-                .unwrap();
+            app.compiled_native_ui_for(
+                wid,
+                instance,
+                view,
+                app.native_ui_viewport_for(wid, view).unwrap(),
+            )
+            .unwrap();
         };
         render(&app);
         app.dispatch_native_view_event(wid, view, AppEvent::ScrollPage(1))
             .unwrap();
+        render(&app);
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::RevealControl(UiKey::new("system-state/row/dock")),
+        )
+        .unwrap();
         render(&app);
         let presentation = |app: &App| {
             let Some(crate::native_app::AppViewState::SystemState(state)) =
@@ -2733,21 +3328,79 @@ mod observation_start {
             app.native_selection_text(wid).as_deref(),
             Some("http://draft.invalid/v1/team")
         );
+        // Read the actual presented body, away from the caret, focus marks and window chrome.
+        // A semantic render alone cannot catch a blank frame between focus and its new reading.
+        let body = |app: &mut App| {
+            let ((width, height), pixels) = app
+                .presented_frame_at(wid, Instant::now())
+                .expect("a scripted CPU surface")
+                .expect("the native frame is not held");
+            let artifact = app
+                .retained_native_leaf_artifact(wid, view, true)
+                .expect("the original view has a current presented raster");
+            assert_eq!((artifact.instance, artifact.view), (instance, view));
+            let words = artifact
+                .compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == "system-state/row/dock/words")
+                .expect("the expanded Dock row is painted");
+            assert_eq!(words.rect.intersect(words.clip), Some(words.rect));
+            let origin = (
+                i32::try_from(artifact.device_x).expect("fixture x fits a pixel coordinate"),
+                i32::try_from(artifact.device_y).expect("fixture y fits a pixel coordinate"),
+            );
+            // The revealed, bounded rectangle is inside this fixture's positive-sized glass.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let (left, top, right, bottom) = (
+                (f64::from(origin.0) + f64::from(words.rect.x) * artifact.scale).floor() as usize,
+                (f64::from(origin.1) + f64::from(words.rect.y) * artifact.scale).floor() as usize,
+                (f64::from(origin.0) + f64::from(words.rect.right()) * artifact.scale).ceil()
+                    as usize,
+                (f64::from(origin.1) + f64::from(words.rect.bottom()) * artifact.scale).ceil()
+                    as usize,
+            );
+            assert!(left < right && right <= width && top < bottom && bottom <= height);
+            let body: Vec<u32> = (top..bottom)
+                .flat_map(|y| pixels[y * width + left..y * width + right].iter().copied())
+                .collect();
+            assert!(
+                body.iter().any(|pixel| *pixel != body[0]),
+                "the row's words reached glass, not just a blank background"
+            );
+            ((left, top, right, bottom), body)
+        };
+        let kept_body = body(&mut app);
 
         // System Settings can sit beside this page while the person changes
         // a preference. Losing focus never hides the page from its shown-view
         // tracker, even through ordinary ticks.
         app.window_focus_event(wid, false);
         assert!(!app.windows[&wid].occluded);
+        assert_eq!(
+            body(&mut app),
+            kept_body,
+            "focus loss keeps the body on glass"
+        );
         let next = app.system_state_host.next_tick.unwrap();
         tick(&mut app, next);
         assert_eq!(app.system_state_shown_views(instance), [view]);
         assert_eq!(reads().len(), 1);
 
         app.window_focus_event(wid, true);
+        assert_eq!(
+            body(&mut app),
+            kept_body,
+            "focus return keeps the body before another reading starts"
+        );
         // Follow the scheduled deadline, including time spent handling focus.
         let next = app.system_state_host.next_tick.unwrap();
         tick(&mut app, next);
+        assert_eq!(
+            body(&mut app),
+            kept_body,
+            "the pending reading does not clear the presented body"
+        );
         assert_eq!(
             reads(),
             [saved.clone(), saved],
@@ -2789,6 +3442,7 @@ mod observation_start {
                 .as_deref(),
             Some("fresh Dock reading")
         );
+        assert_ne!(body(&mut app), kept_body, "the fresh value reaches glass");
     }
 
     #[test]
@@ -2814,6 +3468,7 @@ mod observation_start {
                 wanted: Setting::Secrets.wanted().into(),
                 note: Some(code.into()),
                 detail: None,
+                read: aterm_types::macos_setup::Read::Unstamped,
             }],
             ..SetupStatus::default()
         };
@@ -2889,7 +3544,7 @@ mod observation_start {
         // Even when the Check handler could not start its own reading, its
         // explicit observation still reads the exact B review.
         app.set_system_state_handlers_for_test(InitialSetupHandlers {
-            check: |plan| {
+            check: |plan, _| {
                 note(format!("check {}", plan.vault_url));
                 CheckStarted::default()
             },
@@ -3093,7 +3748,7 @@ fn unknown_plan_check_waits_for_the_saved_plan_after_reopen() {
         },
     );
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        check: |plan| {
+        check: |plan, _| {
             assert_eq!(plan, saved_plan());
             note("checked saved plan".into());
             CheckStarted {
@@ -3245,7 +3900,7 @@ fn check_notes_follow_the_exact_dispatched_plan() {
             assert!(!indicators(&app, instance, view).attention);
             let tab = app.windows[&wid].tab_set.active().unwrap();
             assert!(!tab.presentation.indicators.attention);
-            assert!(crate::system_state_access::menu_line(&matching, false).is_none());
+            assert!(crate::system_state_access::menu_line(&matching).is_none());
             // A later field edit hides the note, and a poll of the same status does not restore it.
             type_into(
                 &mut app,
@@ -3328,7 +3983,7 @@ fn vault_readings_follow_the_edited_source_across_polls() {
     assert!(!indicators(&app, instance, view).attention);
     assert!(contains(&app, wid, &independent));
     assert!(
-        crate::system_state_access::menu_line(&old, false).is_some(),
+        crate::system_state_access::menu_line(&old).is_some(),
         "the menu still describes the saved source, not an unsubmitted draft"
     );
 
@@ -3358,7 +4013,7 @@ fn vault_readings_follow_the_edited_source_across_polls() {
 
     let mut unknown = current;
     unknown.observed_vault_url = None;
-    assert!(crate::system_state_access::menu_line(&unknown, false).is_none());
+    assert!(crate::system_state_access::menu_line(&unknown).is_none());
     fresh(&mut app, unknown);
     type_into(&mut app, wid, view, "system-state/url", edited);
     assert!(!contains(&app, wid, new_code));
@@ -3407,7 +4062,7 @@ fn a_pass_overlapping_check_again_is_shown_as_a_run_with_its_stop() {
     let mut app = App::headless_for_test();
     let (wid, _, view) = page(&mut app);
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        check: |_| CheckStarted {
+        check: |_, _| CheckStarted {
             reading: true,
             check: false,
         },
@@ -4766,7 +5421,7 @@ fn the_vault_address_takes_the_text_keys_a_settings_field_takes() {
 
 /// A focused window macOS reports occluded (the screen locked, the display asleep, a
 /// screen saver up: the key window stays key) shows nothing, so System State is not in
-/// front there: the sign-outs and the access dialogs, which all read
+/// front there: the access dialogs and the withheld rows' reads, which all read
 /// `system_state_frontmost`, wait for a page someone sees.
 #[test]
 fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
@@ -4784,7 +5439,7 @@ fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
     app.on_occlusion_changed(wid, true);
     assert!(
         !app.system_state_frontmost(),
-        "an occluded window puts the sign-outs and macOS prompts on a screen nobody sees"
+        "an occluded window puts macOS prompts on a screen nobody sees"
     );
     app.on_occlusion_changed(wid, false);
     assert!(
@@ -4793,12 +5448,12 @@ fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
     );
 }
 
-/// The sign-outs start only with HID input in the last 60 s and an unlocked screen
-/// (init-on-by-default design §6.1, §6.4): the worker's `on_screen` port for the Accounts stage
-/// is what [`App::publish_system_state_front`] publishes, so a focused, visible page with nobody
-/// at the keyboard for ten minutes never opens it, nor does one on a locked screen.
+/// A person stage starts only with HID input in the last 60 s and an unlocked screen
+/// (init-on-by-default design §6.1, §6.4): the worker's `page_front` port is what
+/// [`App::publish_system_state_front`] publishes, so a focused, visible page with nobody at the
+/// keyboard for ten minutes never opens it, nor does one on a locked screen.
 #[test]
-fn ten_idle_minutes_keep_the_sign_outs_from_starting() {
+fn ten_idle_minutes_keep_the_page_front_port_closed() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
@@ -4814,13 +5469,13 @@ fn ten_idle_minutes_keep_the_sign_outs_from_starting() {
     app.screen_away = || false;
     assert!(
         !app.system_state_front_with_a_person(),
-        "a page nobody has touched for ten minutes opens the sign-outs' on_screen gate"
+        "a page nobody has touched for ten minutes opens the page_front gate"
     );
     app.user_input_recent = |_| true;
     app.screen_away = || true;
     assert!(
         !app.system_state_front_with_a_person(),
-        "a locked screen opens the sign-outs' on_screen gate"
+        "a locked screen opens the page_front gate"
     );
     app.screen_away = || false;
     assert!(
@@ -4829,15 +5484,15 @@ fn ten_idle_minutes_keep_the_sign_outs_from_starting() {
     );
 }
 
-/// A sign-out parked for want of a person resumes on their return, with no retry and no press:
-/// the bit the page publishes at each of its ticks (a run going, or a page in front whose
-/// sign-outs are left, which looks each [`PRESENCE_LOOK`]) goes false at the first after the
-/// minute of no input runs out (the stage parks) and true at the first after the person's next
-/// input, which wakes the parked run (`aterm_types::macos_setup::on_system_state_front`); focus
-/// coming back reads presence again. The worker's port reads presence itself as well
-/// ([`crate::system_state_on_screen`]), so it never waits on a tick to close.
+/// A run parked on the page resumes on the person's return, with no retry and no press: the bit
+/// the page publishes at each of its ticks (a run going, or a page in front whose rows are owed
+/// a read, which looks each [`PRESENCE_LOOK`]) goes false at the first after the minute of no
+/// input runs out and true at the first after the person's next input, which wakes the parked
+/// run (`aterm_types::macos_setup::on_system_state_front`); focus coming back reads presence
+/// again. The worker's port reads presence itself as well ([`crate::system_state_on_screen`]),
+/// so it never waits on a tick to close.
 #[test]
-fn a_parked_sign_out_resumes_when_the_person_returns() {
+fn a_parked_run_resumes_when_the_person_returns() {
     if !crate::test_alone::alone() {
         return;
     }
@@ -4859,7 +5514,7 @@ fn a_parked_sign_out_resumes_when_the_person_returns() {
     app.tick_system_state(start);
     assert!(aterm_types::macos_setup::system_state_front());
     let woke = WOKE.load(std::sync::atomic::Ordering::SeqCst);
-    // The minute runs out: the next tick parks the sign-outs.
+    // The minute runs out: the next tick closes the bit.
     app.user_input_recent = |within| within >= Duration::from_secs(2 * 60);
     app.tick_system_state(start + Duration::from_secs(61));
     assert!(!aterm_types::macos_setup::system_state_front(), "parked");
@@ -4892,7 +5547,7 @@ fn page_publishing_front_with_a_background_copy() -> (App, WindowId, WindowId, A
     aterm_types::macos_setup::set_system_state_front(false);
     let mut app = App::headless_for_test();
     app.set_system_state_handlers_for_test(InitialSetupHandlers::inert_for_test());
-    // A person at the page: the published front is the sign-outs' person-stage port.
+    // A person at the page: the published front is the worker's `page_front` port.
     app.user_input_recent = |_| true;
     let (front, instance, _) = page(&mut app);
     let background = WindowId(1);
@@ -5113,6 +5768,7 @@ fn admitted_here(app: &mut App) -> SetupStatus {
         Some(|| true),
         false,
         crate::clt_shim::Shim::default(),
+        false,
     );
     app.hold_initial_setup_permissions();
     app.note_system_state_touch();
@@ -5178,6 +5834,12 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
             wanted: "Control".into(),
             note: None,
             detail: None,
+            // As the native producer dates it: read now.
+            read: aterm_types::macos_setup::Read::At(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+            ),
         }],
         observed_generation: 41,
         caps_live: None,
@@ -5578,18 +6240,17 @@ fn a_page_opened_by_hand_reads_the_status_once() {
         app.tick_system_state(now);
     }
     assert!(!app.system_state_host.status_in_flight);
-    assert_eq!(
-        app.system_state_host.next_status, None,
-        "one read, then none on a settled page"
+    assert!(
+        app.system_state_host.next_status.is_some(),
+        "an open page keeps repository observations fresh"
     );
     let _ = calls();
 }
 
-/// Motion §5.6: an open page whose setup is settled (nothing running, no offer, no press
-/// waiting) owes no wake either: its rows change only on an event. A run going on it polls,
-/// which is the control.
+/// An open page polls even when setup is settled: repositories can change in another
+/// acquisition process, whose atomic observations do not send this window an event.
 #[test]
-fn an_open_settled_page_owes_no_wake() {
+fn an_open_settled_page_refreshes_repository_observations() {
     let mut app = App::headless_for_test();
     // Handlers that start the page's reading, so no refused reading's retry is due either.
     app.set_system_state_handlers_for_test(handlers());
@@ -5601,11 +6262,8 @@ fn an_open_settled_page_owes_no_wake() {
     for _ in 0..3 {
         app.tick_system_state(now);
     }
-    assert_eq!(
-        app.system_state_host.next_status, None,
-        "no read is due on a settled page"
-    );
-    assert_eq!(app.system_state_host.deadline(now, false), None);
+    assert!(app.system_state_host.next_status.is_some());
+    assert!(app.system_state_host.deadline(now, false).is_some());
     let _ = calls();
     // CONTROL: a run going on the open page reads again a second later.
     app.publish_system_state(fixture_status("running").expect("running fixture"));
@@ -5715,6 +6373,7 @@ fn a_joins_answer_wipes_only_the_words_its_try_sent() {
             .expect("the Join reached its worker")
     };
     let mut app = App::headless_for_test();
+    let terminal = app.windows[&WindowId(0)].tab_set.active_index().unwrap();
     let (wid, _, view) = page(&mut app);
     app.publish_system_state(fixture_status("vault-asking").unwrap());
     app.set_system_state_handlers_for_test(handlers());
@@ -5732,6 +6391,27 @@ fn a_joins_answer_wipes_only_the_words_its_try_sent() {
     });
     app.publish_system_state(fixture_status("vault-asking").unwrap());
     let _ = calls();
+    assert!(app.system_state_host.phrase_join.is_some());
+    assert_eq!(field(&app, instance).0, "");
+    let state_tab = app.windows[&wid].tab_set.active_index().unwrap();
+    app.switch_tab_in(wid, terminal);
+    let active = app.windows[&wid].tab_set.active_id();
+    let focus = app.windows[&wid].window_focus;
+    assert!(!app.apprt.probe_preferences && app.windows[&wid].os_window.is_none());
+    app.headless = false;
+    let (send, receive) = mpsc::channel();
+    app.offer_system_state(Request::new(Plan::default(), send));
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        WorkstationSetupDecision::Unavailable,
+        "a closed controller does not retire its host's phrase join"
+    );
+    assert_eq!(app.windows[&wid].tab_set.active_id(), active);
+    assert_eq!(app.windows[&wid].window_focus, focus);
+    assert!(app.system_state_host.pending.is_none() && app.system_state_host.phrase_join.is_some());
+    assert!(calls().is_empty());
+    app.headless = true;
+    app.switch_tab_in(wid, state_tab);
     type_into(&mut app, wid, view, PHRASE_FIELD, "amber cloud pine");
     press(&mut app, wid, view, PHRASE_JOIN);
     assert!(calls().is_empty(), "the first page's try still runs");
@@ -5856,14 +6536,14 @@ fn a_due_token_look_runs_before_the_next_page_refresh() {
     assert!(calls().is_empty(), "one service leaves no due token look");
 }
 
-/// The sign-outs' `on_screen` port reads presence as the worker asks
+/// The worker's `page_front` port reads presence as the worker asks
 /// ([`crate::system_state_on_screen`]). A person at the page walks away between two of the
-/// worker's passes (the sign-outs' 60 s retry), and no event comes: the minute after their last
-/// input runs out, and the port is closed, though the window's published bit still says a person
-/// was there. A page in front whose sign-outs are left still looks again within a second, so
-/// that bit closes too, and the person's return, input anywhere, wakes the parked run. Before,
-/// the port was the published bit alone, a page with nothing running owed no tick to read
-/// presence again, and the worker's next pass opened the sign-outs with nobody there.
+/// worker's reads, and no event comes: the minute after their last input runs out, and the port
+/// is closed, though the window's published bit still says a person was there. A page in front
+/// whose rows are owed a read still looks again within a second, so that bit closes too, and the
+/// person's return, input anywhere, wakes the parked run. Before, the port was the published bit
+/// alone, a page with nothing running owed no tick to read presence again, and the worker's next
+/// read took the withheld rows with nobody there.
 #[test]
 fn the_port_goes_false_when_the_minute_runs_out_with_nothing_running() {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -5883,8 +6563,8 @@ fn the_port_goes_false_when_the_minute_runs_out_with_nothing_running() {
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.windows.get_mut(&wid).unwrap().focused = true;
     let _ = page(&mut app);
-    // A run between two passes: nothing busy, the sign-outs parked for want of a person.
-    fresh(&mut app, sign_outs_waiting_for_a_person());
+    // A run between two passes: nothing busy, its private rows withheld.
+    fresh(&mut app, rows_owed_a_read(true));
     assert!(app.commit_glassless_native_frame(wid));
     app.user_input_recent = |within| IDLE.load(Ordering::SeqCst) < within.as_secs();
     app.screen_away = || false;
@@ -5907,13 +6587,13 @@ fn the_port_goes_false_when_the_minute_runs_out_with_nothing_running() {
     );
     assert!(
         !crate::system_state_on_screen(),
-        "a minute after the last input the port still opens the sign-outs"
+        "a minute after the last input the port still lets withheld rows be read"
     );
     // The page in front looks again within a second, which closes the published bit as well.
     let look = app
         .system_state_host
         .presence_look
-        .expect("a page in front with its sign-outs left looks again");
+        .expect("a page in front with rows owed a read looks again");
     assert!(look <= Instant::now() + PRESENCE_LOOK, "{look:?}");
     assert!(
         app.system_state_host
@@ -5933,10 +6613,8 @@ fn the_port_goes_false_when_the_minute_runs_out_with_nothing_running() {
     assert!(aterm_types::macos_setup::system_state_front());
     assert!(crate::system_state_on_screen());
     assert_eq!(WOKE.load(Ordering::SeqCst), woke + 1);
-    // CONTROL: a finished run has no sign-out left, and its page owes no look.
-    let mut settled = sign_outs_waiting_for_a_person();
-    settled.finished = true;
-    app.system_state_host.latest_status = settled;
+    // CONTROL: a run whose rows were all read owes no look.
+    app.system_state_host.latest_status = rows_owed_a_read(false);
     app.publish_system_state_front();
     assert_eq!(app.system_state_host.presence_look, None);
 }
@@ -5976,20 +6654,26 @@ fn the_lan_door_reads_a_person_as_the_window_does_with_its_fallback() {
     assert!(!person_touched(None, os_away, now));
 }
 
-/// A run whose Accounts stage is parked for want of a person: its last pass found nobody at
-/// System State and only read the signed-in accounts, each row saying so.
-fn sign_outs_waiting_for_a_person() -> SetupStatus {
+/// A run between two passes, nothing busy, whose private rows an ordinary refresh withheld
+/// (`withheld`, so it owes the page a read, [`SetupStatus::owes_a_read`]) or read.
+fn rows_owed_a_read(withheld: bool) -> SetupStatus {
+    use aterm_types::macos_setup::{Observation, Standing, Subject};
     SetupStatus {
         plan: Some(Plan::default()),
-        rows: [Setting::Messages, Setting::FaceTime]
+        observed_vault_url: Some(Plan::default().vault_url),
+        observed: Subject::all()
             .into_iter()
-            .map(|setting| SetupStatusRow {
-                name: format!("{} signed out (alice)", setting.name()),
-                status: "waiting".into(),
-                detail: format!(
-                    "account remains registered; {}",
-                    aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON
-                ),
+            .map(|subject| {
+                let private = matches!(subject, Subject::Setting(setting)
+                    if setting.is_workstation() || setting == Setting::Spotlight);
+                if withheld && private {
+                    Observation::withheld(subject)
+                } else {
+                    Observation {
+                        standing: Standing::InPlace,
+                        ..Observation::unknown(subject)
+                    }
+                }
             })
             .collect(),
         ..SetupStatus::default()
@@ -5997,11 +6681,12 @@ fn sign_outs_waiting_for_a_person() -> SetupStatus {
 }
 
 /// §5.6's idle budget is 0 frames and 0 page timer wakes for an unfinished setup that waits. A
-/// page in front looks for a person each second only while its sign-outs are parked for want of
-/// one: one that waits for Check again (aterm stopped twice in the stage), one that failed, or
-/// one that waits for Accessibility changes nothing on a person's return, so it owes no look and
-/// no wake. Before, round 22's look ran each second while any sign-out row was unsettled,
-/// whatever it waited on, for as long as the page stayed in front.
+/// page in front looks for a person each second only while its rows are owed a read: a sign-out
+/// that waits for Check again (aterm stopped twice in the stage), one that failed, one that waits
+/// for Accessibility, and one that waits for its session or for macOS's Automation answer, which
+/// the run looks again for on its own schedule, change nothing on a person's return, so they owe
+/// no look and no wake. Before, round 22's look ran each second while any sign-out row was
+/// unsettled, whatever it waited on, for as long as the page stayed in front.
 #[test]
 fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
     use aterm_types::macos_setup::{Observation, Standing, Subject};
@@ -6017,7 +6702,7 @@ fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
     let _ = page(&mut app);
     let parked_words = format!(
         "Stopped twice while signing out of Messages and FaceTime; {}",
-        aterm_types::macos_setup::StageRow::HELD_TAIL
+        aterm_types::macos_setup::StageRow::PARKED_TAIL
     );
     let parked = parked_words.as_str();
     let observed: Vec<Observation> = [Setting::Messages, Setting::FaceTime]
@@ -6030,6 +6715,7 @@ fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
             wanted: setting.wanted().into(),
             note: Some(parked.into()),
             detail: None,
+            read: aterm_types::macos_setup::Read::Unstamped,
         })
         .collect();
     let waits = |status: &str, detail: &str| SetupStatus {
@@ -6064,6 +6750,20 @@ fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
             "blocked",
             "aterm has no Accessibility: switch it on in System Settings",
         ),
+        (
+            "its session",
+            "waiting",
+            "this Mac's screen is locked, so nothing was clicked in Messages: it signs out once \
+             this login's screen is unlocked with the keyboard and pointer at rest, and aterm \
+             looks again by itself",
+        ),
+        (
+            "macOS's Automation answer",
+            "waiting",
+            "macOS has had no answer yet to whether aterm may control System Events, which the \
+             sign-out's clicks go through; aterm's window asks macOS once Accessibility is on, \
+             and aterm looks again by itself",
+        ),
     ] {
         app.system_state_host.latest_status = waits(status, detail);
         app.publish_system_state_front();
@@ -6073,8 +6773,12 @@ fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
              the loop for it"
         );
     }
-    // CONTROL: the stage parked for want of a person looks, so the person's return wakes it.
-    app.system_state_host.latest_status = sign_outs_waiting_for_a_person();
+    // CONTROL: the same page with its private rows withheld looks, so the person's return
+    // reads them.
+    app.system_state_host.latest_status = SetupStatus {
+        rows: waits("waiting", parked).rows,
+        ..rows_owed_a_read(true)
+    };
     app.publish_system_state_front();
     assert!(app.system_state_host.presence_look.is_some());
 }
@@ -6154,4 +6858,272 @@ fn a_relaunch_keeps_when_the_join_began_asking() {
         !record.exists(),
         "the record goes once the join stops asking"
     );
+}
+
+/// A page that stood in front while its private rows' reads were withheld (the person away)
+/// looks for the person, and their return with input alone, no focus event, reads the page once
+/// (§3.5): its rows are read rather than left unread until some later focus change. A page
+/// whose rows were all read owes no look.
+#[test]
+fn a_page_in_front_reads_its_withheld_rows_again_when_the_person_comes_back() {
+    use aterm_types::macos_setup::{Observation, Standing, Subject};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !crate::test_alone::alone() {
+        return;
+    }
+    static IDLE: AtomicU64 = AtomicU64::new(0);
+    let finished = |withheld: bool| {
+        let observed = Subject::all()
+            .into_iter()
+            .map(|subject| {
+                let private = matches!(subject, Subject::Setting(setting)
+                    if setting.is_workstation() || setting == Setting::Spotlight);
+                if withheld && private {
+                    Observation::withheld(subject)
+                } else {
+                    Observation {
+                        standing: Standing::InPlace,
+                        ..Observation::unknown(subject)
+                    }
+                }
+            })
+            .collect();
+        SetupStatus {
+            plan: Some(Plan::default()),
+            finished: true,
+            observed_vault_url: Some(Plan::default().vault_url),
+            observed,
+            ..SetupStatus::default()
+        }
+    };
+    for withheld in [true, false] {
+        aterm_types::macos_setup::set_system_state_front(false);
+        IDLE.store(0, Ordering::SeqCst);
+        let mut app = App::headless_for_test();
+        app.set_system_state_handlers_for_test(handlers());
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        let _ = page(&mut app);
+        assert!(app.commit_glassless_native_frame(wid));
+        app.user_input_recent = |within| IDLE.load(Ordering::SeqCst) < within.as_secs();
+        app.screen_away = || false;
+        app.tick_system_state(Instant::now());
+        assert!(
+            app.system_state_host.shown,
+            "PRECONDITION: the page read its rows"
+        );
+        calls();
+        // The person walks away; a pass's end reads the rows with nobody there.
+        IDLE.store(PERSON_PRESENT_WITHIN.as_secs() + 1, Ordering::SeqCst);
+        fresh(&mut app, finished(withheld));
+        app.publish_system_state_front();
+        assert!(!aterm_types::macos_setup::system_state_front());
+        if !withheld {
+            assert_eq!(
+                app.system_state_host.presence_look, None,
+                "CONTROL: a page with every row read owes no look"
+            );
+            IDLE.store(0, Ordering::SeqCst);
+            app.publish_system_state_front();
+            app.tick_system_state(Instant::now());
+            assert!(calls().is_empty(), "CONTROL: the return reads nothing");
+            continue;
+        }
+        let look = app
+            .system_state_host
+            .presence_look
+            .expect("a page in front with withheld rows looks for the person");
+        // The person comes back with input alone: no focus event.
+        IDLE.store(0, Ordering::SeqCst);
+        app.tick_system_state(look);
+        assert_eq!(
+            calls(),
+            [format!("observe {}", Plan::default().vault_url)],
+            "the return reads the page once"
+        );
+        let next = app.system_state_host.next_tick.unwrap();
+        app.tick_system_state(next);
+        assert!(calls().is_empty(), "one return, one reading");
+    }
+}
+
+/// A status that owes a read and arrives while the person is already at the page in front (their
+/// return long past) reads the page once for that status: the look is a level keyed to the
+/// status's generation, not the edge of a return (§3.5). A private reading past its age owes a
+/// read as a withheld one does, and the same status read once reads nothing more. Negative
+/// control: a status whose rows were all read lately reads nothing.
+#[test]
+fn a_status_that_owes_a_read_while_the_person_is_here_reads_the_page_once() {
+    use aterm_types::macos_setup::{Observation, READING_STANDS_SECS, Read, Standing, Subject};
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let now = aterm_time::unix_secs().expect("a clock");
+    let read_at = |at: u64| {
+        move |subject: Subject| Observation {
+            standing: Standing::InPlace,
+            read: Read::At(at),
+            ..Observation::unknown(subject)
+        }
+    };
+    let with = |generation: u64, private: &dyn Fn(Subject) -> Observation| SetupStatus {
+        plan: Some(Plan::default()),
+        finished: true,
+        observed_vault_url: Some(Plan::default().vault_url),
+        observed: Subject::all()
+            .into_iter()
+            .map(|subject| {
+                if subject.reads_privately() {
+                    private(subject)
+                } else {
+                    read_at(now)(subject)
+                }
+            })
+            .collect(),
+        observed_generation: generation,
+        ..SetupStatus::default()
+    };
+    aterm_types::macos_setup::set_system_state_front(false);
+    let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(handlers());
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.windows.get_mut(&wid).unwrap().focused = true;
+    let _ = page(&mut app);
+    assert!(app.commit_glassless_native_frame(wid));
+    app.user_input_recent = |_| true;
+    app.screen_away = || false;
+    app.tick_system_state(Instant::now());
+    assert!(
+        app.system_state_host.shown,
+        "PRECONDITION: the page read its rows"
+    );
+    fresh(&mut app, with(1, &read_at(now)));
+    app.publish_system_state_front();
+    assert!(
+        aterm_types::macos_setup::system_state_front(),
+        "PRECONDITION: the person is at the page"
+    );
+    calls();
+    fresh(&mut app, with(2, &read_at(now)));
+    app.publish_system_state_front();
+    app.tick_system_state(Instant::now());
+    assert!(
+        calls().is_empty(),
+        "CONTROL: a status read lately owes nothing"
+    );
+    type Reading<'a> = &'a dyn Fn(Subject) -> Observation;
+    let stale = read_at(now - READING_STANDS_SECS - 1);
+    let owing: [(u64, &str, Reading<'_>); 2] = [
+        (3, "withheld", &Observation::withheld),
+        (4, "past its age", &stale),
+    ];
+    for (generation, why, private) in owing {
+        fresh(&mut app, with(generation, private));
+        app.publish_system_state_front();
+        app.tick_system_state(Instant::now());
+        assert_eq!(
+            calls(),
+            [format!("observe {}", Plan::default().vault_url)],
+            "a status whose private rows are {why} reads the page once"
+        );
+        app.publish_system_state_front();
+        let next = app.system_state_host.next_tick.unwrap();
+        app.tick_system_state(next);
+        assert!(calls().is_empty(), "{why}: the same status reads once");
+    }
+}
+
+/// A person coming back to this login's screen while the setup run's sign-outs wait ends their
+/// park at once: the window says the session returned at its first look after the screen reads
+/// back (`App::watch_session_return`), once per return, reading the screen at most once a
+/// [`SESSION_LOOK`]. Before, nothing woke the run before its next timed look, up to a quarter
+/// hour after a long lock. NEGATIVE CONTROLS: with no sign-out waiting nothing is said, and a
+/// screen that stays away says nothing.
+#[test]
+fn a_screen_back_while_the_sign_outs_wait_wakes_them_at_once() {
+    thread_local! {
+        static AWAY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    }
+    let returns = || crate::workstation_setup::SESSION_RETURNS.with(std::cell::Cell::get);
+    let away = |away: bool| AWAY.with(|cell| cell.set(away));
+    let row = |status: &str| crate::SetupStatusRow {
+        name: aterm_types::macos_setup::ACCOUNTS_STAGE.name.into(),
+        status: status.into(),
+        detail: "this Mac's screen is locked, so nothing was clicked".into(),
+    };
+    let mut app = App::headless_for_test();
+    app.screen_away = || AWAY.with(std::cell::Cell::get);
+    let t0 = Instant::now();
+    let before = returns();
+
+    app.system_state_host.latest_status.rows = vec![row("applied")];
+    away(true);
+    app.watch_session_return(t0);
+    away(false);
+    app.watch_session_return(t0 + SESSION_LOOK);
+    assert_eq!(returns(), before, "no sign-out waits: nothing is said");
+
+    app.system_state_host.latest_status.rows = vec![row("waiting")];
+    away(true);
+    app.watch_session_return(t0 + 2 * SESSION_LOOK);
+    app.watch_session_return(t0 + 3 * SESSION_LOOK);
+    assert_eq!(returns(), before, "still away: nothing is said");
+    away(false);
+    app.watch_session_return(t0 + 3 * SESSION_LOOK);
+    assert_eq!(returns(), before, "read at most once a look");
+    app.watch_session_return(t0 + 4 * SESSION_LOOK);
+    assert_eq!(returns(), before + 1, "back: the sign-outs look again now");
+    app.watch_session_return(t0 + 5 * SESSION_LOOK);
+    assert_eq!(returns(), before + 1, "once per return");
+}
+
+/// The window is owed the worker's readings from the launch on, and again after a publication
+/// of either kind its loop dropped, until readings the loop took: what the keeper's round asks
+/// (`initial_setup_readings_undelivered`) before it publishes them with nothing changed. The
+/// real publishers are driven against a stand-in for the loop on this thread.
+/// NEGATIVE CONTROLS: a record that begins delivered fails "before anything was published";
+/// `publish_initial_setup_readings` recording nothing fails "readings the loop took";
+/// `publish_initial_setup_status` recording nothing fails "a status no loop took"; and
+/// `readings_sent` storing `true` whatever the loop did fails "readings the loop took".
+#[test]
+fn readings_are_owed_from_the_launch_and_a_dropped_publication_until_the_loop_takes_them() {
+    let window = crate::SetupLoopForTest::before_its_proxy();
+    let owed = initial_setup_readings_undelivered;
+    assert!(owed(), "before anything was published");
+    publish_initial_setup_readings(SetupReadings::default);
+    assert!(owed(), "readings sent before the loop registered its proxy");
+    publish_initial_setup_status(SetupStatus::default());
+    assert!(owed(), "a status sent before the loop registered its proxy");
+
+    window.register();
+    publish_initial_setup_status(SetupStatus::default());
+    assert!(
+        owed(),
+        "a status the loop took hands the window no readings"
+    );
+    publish_initial_setup_readings(SetupReadings::default);
+    assert!(!owed(), "readings the loop took");
+    publish_initial_setup_status(SetupStatus::default());
+    assert!(!owed(), "a status the loop took owes nothing new");
+
+    window.close();
+    publish_initial_setup_status(SetupStatus::default());
+    assert!(owed(), "a status no loop took");
+    window.register();
+    publish_initial_setup_readings(SetupReadings::default);
+    assert!(!owed(), "readings the loop took after a dropped status");
+    window.close();
+    publish_initial_setup_readings(SetupReadings::default);
+    assert!(owed(), "readings no loop took");
+
+    assert_eq!(
+        (window.statuses_sent(), window.readings_sent()),
+        (4, 4),
+        "each publication reached the loop's sender once"
+    );
+    drop(window);
+    // A stand-in ends with its guard: the thread can hold another.
+    drop(crate::SetupLoopForTest::before_its_proxy());
 }

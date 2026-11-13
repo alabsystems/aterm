@@ -10,6 +10,7 @@
 //! Inventory is a set of digests, including forks: a sequence watermark alone hides
 //! two signed records at the same sequence. No clocks, network, retention or I/O.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// SHA-256 content identity, computed and verified by the integrating application.
@@ -110,7 +111,10 @@ impl Header {
         sync_clamp_parent_count(self.parents.len() as u64, MAX_PARENTS as u64) as usize
     }
 
-    fn shaped(&self) -> bool {
+    /// Whether [`Index::insert`] admits this header's shape: a header it refuses as
+    /// [`Refusal::Shape`] is not shaped.
+    #[must_use]
+    pub fn is_shaped(&self) -> bool {
         self.sequence > 0
             && (self.sequence == 1) == self.previous.is_none()
             && self.parents.len() <= MAX_PARENTS
@@ -147,7 +151,7 @@ impl Fork {
     /// Recognize contradictory claims in two distinct, well-shaped headers of
     /// one actor. This performs no signature, payload or authorization check.
     pub fn between(a: &Header, b: &Header) -> Option<Self> {
-        if a.actor != b.actor || a.id == b.id || !a.shaped() || !b.shaped() {
+        if a.actor != b.actor || a.id == b.id || !a.is_shaped() || !b.is_shaped() {
             return None;
         }
         a.claims()
@@ -172,6 +176,58 @@ impl Fork {
 pub struct Index {
     records: BTreeMap<Digest, Header>,
     capacity: usize,
+}
+
+/// A borrowed dense-sequence claim within one actor.
+#[derive(Clone, Copy)]
+struct DotClaim<'a> {
+    sequence: u64,
+    source: &'a Digest,
+    id: &'a Digest,
+}
+
+/// The least source of one dot and the least source claiming a different identity.
+/// Claims may arrive in any order within a sequence bucket, and one may arrive twice.
+/// A header claims a dot at most once (its own claim and its predecessor claim sit at
+/// two sequences), so distinct headers give a dot claims of distinct sources. Then
+/// `first` is the least-source claim inserted and `different` the least-source claim
+/// whose id is not `first`'s, whatever the order of insertion. A repeated header
+/// repeats a claim, source and id alike, and `insert` ignores it: equal to `first`,
+/// its source is not below `first`'s and its id is `first`'s; equal to another claim
+/// already inserted, its source is above `first`'s and either its id is `first`'s or
+/// its source is not below `different`'s.
+struct DotGroup<'a> {
+    first: DotClaim<'a>,
+    different: Option<DotClaim<'a>>,
+}
+
+impl<'a> DotGroup<'a> {
+    fn new(first: DotClaim<'a>) -> Self {
+        Self {
+            first,
+            different: None,
+        }
+    }
+
+    fn insert(&mut self, claim: DotClaim<'a>) {
+        if claim.source < self.first.source {
+            if claim.id != self.first.id {
+                self.different = Some(self.first);
+            }
+            self.first = claim;
+        } else if claim.id != self.first.id
+            && self
+                .different
+                .is_none_or(|other| claim.source < other.source)
+        {
+            self.different = Some(claim);
+        }
+    }
+
+    fn witness(self, actor: Actor) -> Option<Fork> {
+        self.different
+            .map(|other| Fork::sources(actor, *self.first.source, *other.source))
+    }
 }
 
 /// Deterministic projection of the whole known authenticated history.
@@ -202,21 +258,28 @@ impl Index {
     /// # Errors
     /// [`Refusal`] names malformed headers, digest collisions and exhausted capacity.
     pub fn insert(&mut self, header: Header) -> Result<bool, Refusal> {
-        if !header.shaped() {
+        if !header.is_shaped() {
             return Err(Refusal::Shape);
         }
-        if let Some(old) = self.records.get(&header.id) {
-            return if old == &header {
-                Ok(false)
-            } else {
-                Err(Refusal::DigestCollision)
-            };
+        // One search of `records`. The entry holds the map, so the retained count is read
+        // first; a vacant entry left unfilled changes nothing.
+        let retained = self.records.len();
+        match self.records.entry(header.id) {
+            Entry::Occupied(old) => {
+                if old.get() == &header {
+                    Ok(false)
+                } else {
+                    Err(Refusal::DigestCollision)
+                }
+            }
+            Entry::Vacant(slot) => {
+                if !sync_within_capacity(retained as u64, self.capacity as u64) {
+                    return Err(Refusal::Capacity);
+                }
+                slot.insert(header);
+                Ok(true)
+            }
         }
-        if !sync_within_capacity(self.records.len() as u64, self.capacity as u64) {
-            return Err(Refusal::Capacity);
-        }
-        self.records.insert(header.id, header);
-        Ok(true)
     }
 
     /// Every retained digest, including pending records and fork evidence.
@@ -234,23 +297,22 @@ impl Index {
     /// The lexicographically least pair is independent of arrival order.
     /// Applications can transfer authenticated source records as restrictive
     /// evidence without treating their payloads as authorized operations.
+    /// [`forks_of`] answers the same over borrowed headers, with no index built.
     pub fn forks(&self) -> BTreeMap<Actor, Fork> {
-        let mut out = BTreeMap::<Actor, Fork>::new();
-        let mut dots = BTreeMap::new();
-        for header in self.records.values() {
-            for (sequence, id) in header.claims() {
-                let (first_id, source) = *dots
-                    .entry((header.actor, sequence))
-                    .or_insert((id, header.id));
-                if first_id != id {
-                    let fork = Fork::sources(header.actor, source, header.id);
-                    out.entry(header.actor)
-                        .and_modify(|old| *old = (*old).min(fork))
-                        .or_insert(fork);
-                }
-            }
+        let mut retained = self.records.values();
+        let (Some(first), Some(second)) = (retained.next(), retained.next()) else {
+            return BTreeMap::new();
+        };
+        // `records` iterates in id order, so these are the globally least retained
+        // sources. If they contradict and all sources have this actor, no other pair can
+        // improve the witness. This shortcut reads that order, which `forks_of`'s input
+        // does not have; the scan below reads no order.
+        if let Some(fork) = Fork::between(first, second)
+            .filter(|_| retained.all(|header| header.actor == first.actor))
+        {
+            return BTreeMap::from([(first.actor, fork)]);
         }
-        out
+        forks_by_actor(&mut self.records.values().collect::<Vec<_>>())
     }
 
     /// Whether `later` transitively names `earlier` as a dependency. Equality is
@@ -338,6 +400,113 @@ impl Index {
     }
 }
 
+/// [`Index::forks`] of an index holding exactly the set of `headers`, read from the
+/// borrowed headers with no index built.
+///
+/// The headers may come in any order, and one may come more than once: it is still the
+/// one header an index would hold once. Each must be shaped ([`Header::is_shaped`]),
+/// and two headers sharing an id must be equal, which is what [`Index::insert`]
+/// admits; any other input gets an unspecified answer, never a panic.
+pub fn forks_of<'h>(headers: impl IntoIterator<Item = &'h Header>) -> BTreeMap<Actor, Fork> {
+    forks_by_actor(&mut headers.into_iter().collect::<Vec<_>>())
+}
+
+/// One canonical witness per actor whose `headers` contradict, the one fork scan
+/// [`Index::forks`] and [`forks_of`] share. It reads no order of `headers` (it sorts
+/// them by actor, then each actor's by sequence, and finds the least two source IDs by
+/// a scan), and a header given twice cannot change its answer (below).
+fn forks_by_actor(headers: &mut [&Header]) -> BTreeMap<Actor, Fork> {
+    let mut out = BTreeMap::new();
+    // Partition once by actor so dense-sequence sorting never compares actor bytes.
+    // Each actor's witness is independent of every other actor's claims.
+    headers.sort_unstable_by_key(|header| &header.actor);
+    for group in headers.chunk_by_mut(|a, b| a.actor == b.actor) {
+        let mut sources = group.iter().copied();
+        let (Some(mut least), Some(mut second)) = (sources.next(), sources.next()) else {
+            continue;
+        };
+        let actor = least.actor;
+        if second.id < least.id {
+            std::mem::swap(&mut least, &mut second);
+        }
+        for header in sources {
+            if header.id < least.id {
+                second = least;
+                least = header;
+            } else if header.id < second.id {
+                second = header;
+            }
+        }
+        // The two least source IDs bound every possible pair for this actor.
+        // Their contradiction settles even a large, heavily forked history.
+        // In any order, `least` ends with the least ID and `second` with the least
+        // ID of the rest once one copy of `least` is set aside. A repeat of the least
+        // header therefore leaves `second` the same header as `least`, and
+        // `Fork::between` answers `None` for one header twice (`a.id == b.id`): that
+        // falls through to the claim scan, which finds the witness without this
+        // shortcut. A repeat of any other header leaves `second` the true second-least.
+        if let Some(fork) = Fork::between(least, second) {
+            out.insert(actor, fork);
+            continue;
+        }
+        // Equal sequences need no source-ID sort: DotGroup finds the canonical pair
+        // in any tie order, keeping low-dot-density histories inexpensive. After this
+        // sort both claim streams below run in sequence order whatever the input's
+        // order (a predecessor claim sits one below its source's own sequence), and a
+        // repeated header only repeats claims, which DotGroup ignores.
+        group.sort_unstable_by_key(|header| header.sequence);
+        let mut own = group
+            .iter()
+            .map(|header| DotClaim {
+                sequence: header.sequence,
+                source: &header.id,
+                id: &header.id,
+            })
+            .peekable();
+        let mut previous = group
+            .iter()
+            .filter_map(|header| {
+                header
+                    .previous
+                    .as_ref()
+                    .zip(header.sequence.checked_sub(1))
+                    .map(|(id, sequence)| DotClaim {
+                        sequence,
+                        source: &header.id,
+                        id,
+                    })
+            })
+            .peekable();
+        let mut dot: Option<DotGroup<'_>> = None;
+        let mut best: Option<Fork> = None;
+        loop {
+            let next = match (own.peek(), previous.peek()) {
+                (Some(a), Some(b)) if a.sequence <= b.sequence => own.next(),
+                (_, Some(_)) => previous.next(),
+                (Some(_), None) => own.next(),
+                (None, None) => None,
+            };
+            let Some(claim) = next else { break };
+            match dot.as_mut() {
+                Some(held) if held.first.sequence == claim.sequence => held.insert(claim),
+                _ => {
+                    if let Some(fork) = dot.take().and_then(|group| group.witness(actor)) {
+                        best = Some(best.map_or(fork, |old| old.min(fork)));
+                    }
+                    dot = Some(DotGroup::new(claim));
+                }
+            }
+        }
+        if let Some(fork) = dot.and_then(|group| group.witness(actor)) {
+            best = Some(best.map_or(fork, |old| old.min(fork)));
+        }
+        if let Some(fork) = best {
+            out.insert(actor, fork);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +533,24 @@ mod tests {
             }
         }
         walk(&mut Vec::new(), items.to_vec(), visit);
+    }
+    /// The quadratic oracle, written apart from the scan: for each actor, the least
+    /// [`Fork::between`] answer over every ordered pair of `headers`.
+    fn pairwise<'h>(
+        headers: impl IntoIterator<Item = &'h Header> + Clone,
+    ) -> BTreeMap<Actor, Fork> {
+        let mut least = BTreeMap::<Actor, Fork>::new();
+        for a in headers.clone() {
+            for b in headers.clone() {
+                if let Some(fork) = Fork::between(a, b) {
+                    least
+                        .entry(fork.actor)
+                        .and_modify(|old| *old = (*old).min(fork))
+                        .or_insert(fork);
+                }
+            }
+        }
+        least
     }
     #[test]
     fn offline_islands_converge_after_every_delivery_order_and_duplicate() {
@@ -509,43 +696,250 @@ mod tests {
 
     #[test]
     fn fork_witnesses_name_retained_sources_and_are_canonical_in_every_order() {
-        let records = [
-            header(1, 1, 1, None, &[]),
-            header(3, 1, 2, Some(2), &[2]),
-            header(5, 1, 1, None, &[]),
-            header(7, 2, 1, None, &[]),
-        ];
-        permutations(&records, &mut |order| {
-            let mut index = Index::new(8);
-            for h in order {
-                index.insert(h.clone()).unwrap();
+        // A predecessor's source can sort before the matching own claim; a later dot can
+        // also supply the lexicographically least witness of the whole actor.
+        for (records, second) in [
+            (
+                vec![
+                    header(1, 1, 2, Some(2), &[2]),
+                    header(2, 1, 1, None, &[]),
+                    header(3, 1, 1, None, &[]),
+                    header(7, 2, 1, None, &[]),
+                    header(9, 2, 1, None, &[]),
+                ],
+                3,
+            ),
+            (
+                vec![
+                    header(1, 1, 4, Some(8), &[8]),
+                    header(2, 1, 1, None, &[]),
+                    header(3, 1, 2, Some(4), &[4]),
+                    header(5, 1, 3, Some(6), &[6]),
+                    header(7, 2, 1, None, &[]),
+                    header(9, 2, 1, None, &[]),
+                ],
+                5,
+            ),
+        ] {
+            permutations(&records, &mut |order| {
+                let mut index = Index::new(8);
+                for h in order {
+                    index.insert(h.clone()).unwrap();
+                }
+                let expected = pairwise(&records);
+                let forks = index.forks();
+                assert_eq!(forks, expected);
+                assert_eq!(forks[&[1; 48]].first, [1; 32]);
+                assert_eq!(forks[&[1; 48]].second, [second; 32]);
+                assert_eq!(forks[&[2; 48]], Fork::sources([2; 48], [7; 32], [9; 32]));
+                for fork in forks.values() {
+                    assert_eq!(
+                        Fork::between(
+                            index.get(&fork.first).unwrap(),
+                            index.get(&fork.second).unwrap()
+                        ),
+                        Some(*fork)
+                    );
+                }
+                assert_eq!(index.project().quarantined, forks.into_keys().collect());
+            });
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn fork_scan_matches_all_retained_pairs(
+            rows in proptest::collection::vec((0u8..4, 1u64..9, 128u8..255), 0..40),
+            homogeneous in proptest::bool::ANY,
+            order in proptest::strategy::Strategy::prop_shuffle(
+                proptest::strategy::Just((0..40).collect::<Vec<usize>>()),
+            ),
+            repeats in proptest::collection::vec((0usize..40, 0usize..80), 0..6),
+        ) {
+            let mut index = Index::new(rows.len());
+            for (row, (actor, sequence, predecessor)) in rows.into_iter().enumerate() {
+                let mut h = header(
+                    row as u8,
+                    0,
+                    if homogeneous { 2 } else { sequence },
+                    (homogeneous || sequence > 1).then_some(predecessor),
+                    &[],
+                );
+                // Shared prefixes must not merge distinct actor incarnations.
+                h.actor[47] = if homogeneous { 0 } else { actor };
+                h.parents.extend(h.previous);
+                index.insert(h).unwrap();
             }
-            let mut expected = BTreeMap::<Actor, Fork>::new();
-            for a in &records {
-                for b in &records {
-                    if let Some(fork) = Fork::between(a, b) {
-                        expected
-                            .entry(fork.actor)
-                            .and_modify(|old| *old = (*old).min(fork))
-                            .or_insert(fork);
-                    }
+            let expected = pairwise(index.records.values());
+            proptest::prop_assert_eq!(&index.forks(), &expected);
+            // The same set as `forks_of` reads it: in an order the proptest chose (a
+            // shuffle of 0..40 read for the retained rows alone is a uniform order of
+            // them), with some headers given again at chosen places.
+            let retained: Vec<&Header> = index.records.values().collect();
+            let mut read: Vec<&Header> =
+                order.iter().filter_map(|row| retained.get(*row).copied()).collect();
+            for (row, at) in repeats {
+                if let Some(twice) = retained.get(row) {
+                    read.insert(at % (read.len() + 1), twice);
                 }
             }
-            let forks = index.forks();
-            assert_eq!(forks, expected);
-            assert_eq!(forks[&[1; 48]].first, [1; 32]);
-            assert_eq!(forks[&[1; 48]].second, [3; 32]);
-            for fork in forks.values() {
+            proptest::prop_assert_eq!(forks_of(read), expected);
+        }
+    }
+
+    /// Ten shaped headers of two actors, in id order, which is not their sequence order.
+    /// Actor 1: a linked chain 5 <- 3 <- 7 (sequences 1, 2, 3); 6, a second header at
+    /// sequence 2; 2, at sequence 3, linked to that forked branch; 4, at sequence 4, whose
+    /// predecessor 30 is never retained; and 1, at sequence 9, past a gap. Actor 2: 8 and
+    /// 9 at `u64::MAX`, 8 linked to 10 at `u64::MAX - 1` and 9 naming another predecessor
+    /// there.
+    fn fork_pool() -> [Header; 10] {
+        [
+            header(1, 1, 9, Some(31), &[31]),
+            header(2, 1, 3, Some(6), &[6]),
+            header(3, 1, 2, Some(5), &[5]),
+            header(4, 1, 4, Some(30), &[30]),
+            header(5, 1, 1, None, &[]),
+            header(6, 1, 2, Some(5), &[5]),
+            header(7, 1, 3, Some(3), &[3]),
+            header(8, 2, u64::MAX, Some(10), &[10]),
+            header(9, 2, u64::MAX, Some(32), &[32]),
+            header(10, 2, u64::MAX - 1, Some(33), &[33]),
+        ]
+    }
+
+    #[test]
+    fn forks_of_reads_any_order_and_any_repeat_as_forks_of_the_set() {
+        let pool = fork_pool();
+        assert_eq!(
+            pairwise(&pool),
+            BTreeMap::from([
+                ([1; 48], Fork::sources([1; 48], [2; 32], [3; 32])),
+                ([2; 48], Fork::sources([2; 48], [8; 32], [9; 32])),
+            ]),
+            "the pool forks both actors, and actor 1's least pair is not its two least IDs"
+        );
+        for mask in 0..1u32 << pool.len() {
+            let set: Vec<&Header> = pool
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask >> bit & 1 == 1)
+                .map(|(_, h)| h)
+                .collect();
+            let mut index = Index::new(pool.len());
+            for h in &set {
+                assert_eq!(index.insert((*h).clone()), Ok(true));
+            }
+            let expected = pairwise(set.iter().copied());
+            assert_eq!(
+                index.forks(),
+                expected,
+                "Index::forks of subset {mask:#012b}"
+            );
+            let descending: Vec<&Header> = set.iter().rev().copied().collect();
+            let mut rotated = set.clone();
+            rotated.rotate_left(set.len() / 2);
+            for (name, order) in [
+                ("ascending", set.clone()),
+                ("descending", descending),
+                ("rotated", rotated),
+            ] {
                 assert_eq!(
-                    Fork::between(
-                        index.get(&fork.first).unwrap(),
-                        index.get(&fork.second).unwrap()
-                    ),
-                    Some(*fork)
+                    forks_of(order.iter().copied()),
+                    expected,
+                    "forks_of, {name} subset {mask:#012b}"
+                );
+                for twice in &order {
+                    assert_eq!(
+                        forks_of(order.iter().copied().chain([*twice])),
+                        expected,
+                        "forks_of, {name} subset {mask:#012b} with {} again last",
+                        twice.id[0]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Component wall-time measurement; no latency threshold is a correctness assertion.
+    #[test]
+    #[ignore = "isolated optimized fork-scan measurement"]
+    fn fork_scan_measurement() {
+        fn digest(row: usize, compatible_prefix: bool) -> Digest {
+            let mut id = [0; 32];
+            let mixed = if compatible_prefix {
+                row as u64 + 1
+            } else {
+                (row as u64 + 1)
+                    .wrapping_mul(0x9e3779b97f4a7c15)
+                    .rotate_left(17)
+            };
+            id[..8].copy_from_slice(&mixed.to_be_bytes());
+            id
+        }
+        for records in [128usize, 3_000, 8_192] {
+            for (actors, forked, compatible_prefix) in [
+                (1usize, false, false),
+                (64, false, false),
+                (1, true, false),
+                (2, true, false),
+                (64, true, false),
+                (1, true, true),
+                (2, true, true),
+                (64, true, true),
+            ] {
+                let mut index = Index::new(records);
+                for row in 0..records {
+                    let sequence = if compatible_prefix {
+                        if row < actors {
+                            1
+                        } else {
+                            2
+                        }
+                    } else if forked {
+                        1
+                    } else {
+                        row / actors + 1
+                    };
+                    let previous = (sequence > 1).then(|| {
+                        digest(
+                            if compatible_prefix {
+                                row % actors
+                            } else {
+                                row - actors
+                            },
+                            compatible_prefix,
+                        )
+                    });
+                    index
+                        .insert(Header {
+                            id: digest(row, compatible_prefix),
+                            actor: [(row % actors) as u8; 48],
+                            sequence: sequence as u64,
+                            previous,
+                            parents: previous.into_iter().collect(),
+                        })
+                        .unwrap();
+                }
+                let expected = if compatible_prefix {
+                    records.saturating_sub(2 * actors).min(actors)
+                } else if forked {
+                    actors
+                } else {
+                    0
+                };
+                assert_eq!(index.forks().len(), expected);
+                let iterations = 1_000_000 / records;
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    std::hint::black_box(std::hint::black_box(&index).forks());
+                }
+                eprintln!(
+                    "FORK-SCAN records={records} actors={actors} forked={forked} compatible_prefix={compatible_prefix} iterations={iterations} wall_ns_per_scan={}",
+                    started.elapsed().as_nanos() / iterations as u128,
                 );
             }
-            assert_eq!(index.project().quarantined, forks.into_keys().collect());
-        });
+        }
     }
 
     #[test]
@@ -698,19 +1092,7 @@ mod tests {
         };
         let before = state(&index);
         assert!(!before.1.is_empty() && !before.2.pending.is_empty());
-        let too_many: Vec<u8> = (0..=MAX_PARENTS as u8).collect();
-        for (refused, why) in [
-            (header(9, 1, 0, None, &[]), Refusal::Shape),
-            (header(9, 1, 1, Some(1), &[1]), Refusal::Shape),
-            (header(9, 1, 2, None, &[]), Refusal::Shape),
-            (header(9, 1, 2, Some(1), &[]), Refusal::Shape),
-            (header(9, 1, 1, None, &[2, 1]), Refusal::Shape),
-            (header(9, 1, 1, None, &[1, 1]), Refusal::Shape),
-            (header(9, 1, 1, None, &[9]), Refusal::Shape),
-            (header(200, 1, 1, None, &too_many), Refusal::Shape),
-            (header(1, 7, 1, None, &[]), Refusal::DigestCollision),
-            (header(9, 7, 1, None, &[]), Refusal::Capacity),
-        ] {
+        for (refused, why) in refused_headers() {
             assert_eq!(index.insert(refused), Err(why));
             assert_eq!(state(&index), before, "{why:?} changed the index");
         }
@@ -722,11 +1104,56 @@ mod tests {
         assert_eq!(state(&index), before);
     }
 
+    /// What `a_refusal_leaves_the_whole_index_unchanged` offers an index that holds 1, 2
+    /// and 3 at its capacity of 3, each with the refusal it must answer: nine shapes, the
+    /// last under 1's id (the shape is judged before the id is looked up, so it is no
+    /// collision), a collision with 1, and a shaped new header with no room.
+    fn refused_headers() -> [(Header, Refusal); 11] {
+        let too_many: Vec<u8> = (0..=MAX_PARENTS as u8).collect();
+        [
+            (header(9, 1, 0, None, &[]), Refusal::Shape),
+            (header(9, 1, 1, Some(1), &[1]), Refusal::Shape),
+            (header(9, 1, 2, None, &[]), Refusal::Shape),
+            (header(9, 1, 2, Some(1), &[]), Refusal::Shape),
+            (header(9, 1, 1, None, &[2, 1]), Refusal::Shape),
+            (header(9, 1, 1, None, &[1, 1]), Refusal::Shape),
+            (header(9, 1, 1, None, &[9]), Refusal::Shape),
+            (header(200, 1, 1, None, &too_many), Refusal::Shape),
+            (header(1, 1, 0, None, &[]), Refusal::Shape),
+            (header(1, 7, 1, None, &[]), Refusal::DigestCollision),
+            (header(9, 7, 1, None, &[]), Refusal::Capacity),
+        ]
+    }
+
     #[test]
     fn exactly_max_parents_is_shaped() {
         let most: Vec<u8> = (0..MAX_PARENTS as u8).collect();
         let mut index = Index::new(1);
         assert_eq!(index.insert(header(200, 1, 1, None, &most)), Ok(true));
+    }
+
+    #[test]
+    fn is_shaped_is_false_exactly_where_insert_refuses_the_shape() {
+        let most: Vec<u8> = (0..MAX_PARENTS as u8).collect();
+        let headers: Vec<Header> = refused_headers()
+            .map(|(h, _)| h)
+            .into_iter()
+            .chain([header(200, 1, 1, None, &most)])
+            .collect();
+        // Written apart from the code: the nine shape refusals, the collision and the
+        // capacity refusal (both shaped), then exactly MAX_PARENTS parents.
+        let shaped = [
+            false, false, false, false, false, false, false, false, false, true, true, true,
+        ];
+        assert_eq!(headers.len(), shaped.len());
+        for (row, (h, shaped)) in headers.into_iter().zip(shaped).enumerate() {
+            assert_eq!(h.is_shaped(), shaped, "row {row}: is_shaped");
+            assert_eq!(
+                Index::new(1).insert(h) == Err(Refusal::Shape),
+                !shaped,
+                "row {row}: insert"
+            );
+        }
     }
 
     #[test]

@@ -391,7 +391,42 @@ pub fn open(manifest: &Manifest, key: &[u8; 32], wire: &[u8]) -> Result<Opened> 
         wire: wire.to_vec(),
     })
 }
+#[cfg(all(test, unix))]
+thread_local! {
+    static CIPHER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_cipher_constructions() -> usize {
+    CIPHER_CONSTRUCTIONS.get()
+}
+
+/// A comparison token for an already admitted payload key, never a substitute for acquiring it.
+/// HKDF-Extract is HMAC with its first argument as the key; the existing wiping door erases
+/// that key's pads. The fixed domain separates this token from payload subkeys.
+#[cfg(unix)]
+pub(crate) fn payload_key_identity(key: &[u8; 32]) -> PayloadKeyIdentity {
+    PayloadKeyIdentity(aterm_digest::hkdf_extract(
+        key,
+        b"aterm-db/replay-non-cut/1",
+    ))
+}
+
+/// A process-local comparison identity, kept distinct from ciphertext identifiers and signers.
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+pub(crate) struct PayloadKeyIdentity(Digest);
+
+#[cfg(unix)]
+impl PayloadKeyIdentity {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        aterm_digest::ct_eq(&self.0, &other.0)
+    }
+}
+
 pub(crate) fn cipher(key: &[u8; 32], salt: &[u8; 32], header: &[u8]) -> Result<aead::LessSafeKey> {
+    #[cfg(all(test, unix))]
+    CIPHER_CONSTRUCTIONS.set(CIPHER_CONSTRUCTIONS.get() + 1);
     const PREFIX: &[u8] = b"aterm-db/payload/1";
     const STACK_INFO_CAP: usize = 576;
     let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(salt, key));

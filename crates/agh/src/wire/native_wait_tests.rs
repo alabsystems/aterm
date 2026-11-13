@@ -132,6 +132,72 @@ fn required_native_github_defaults_keep_their_original_start_and_recover() {
             }
         }
     }
+    let mut provider = Provider::new(200);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let expired = super::HttpTransport::direct(Arc::new(crate::identity::MapEnv::new()))
+        .bounded(Instant::now(), Arc::clone(&stopped));
+    let error = answered(&expired, &provider.url, Deadlines::JSON, 0).unwrap_err();
+    assert_eq!(
+        (error.phase, error.kind),
+        (Phase::NotSent, WireKind::Timeout)
+    );
+    stopped.store(true, Ordering::Release);
+    let cancelled = super::HttpTransport::direct(Arc::new(crate::identity::MapEnv::new())).bounded(
+        Instant::now() + Duration::from_secs(60),
+        Arc::clone(&stopped),
+    );
+    let error = answered(&cancelled, &provider.url, Deadlines::JSON, 0).unwrap_err();
+    assert_eq!(
+        (error.phase, error.kind),
+        (Phase::NotSent, WireKind::Revoked)
+    );
+    assert_eq!(
+        provider.finish(),
+        0,
+        "expired and stopped jobs send no request"
+    );
+    let mut provider = Provider::new(200);
+    let bounded = super::HttpTransport::direct(Arc::new(crate::identity::MapEnv::new())).bounded(
+        Instant::now() + Duration::from_secs(60),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        answered(&bounded, &provider.url, Deadlines::JSON, 0).unwrap(),
+        200
+    );
+    assert_eq!(
+        provider.finish(),
+        1,
+        "an admitted remaining budget still reaches its owned peer"
+    );
+    // The proxy environment is read inside HTTP request construction, after the transport's
+    // initial admission. Stop there must still prevent the actual connection and request.
+    struct StopAtProxy(Arc<AtomicBool>);
+    impl crate::identity::EnvSource for StopAtProxy {
+        fn var_os(&self, _: &str) -> Option<std::ffi::OsString> {
+            self.0.store(true, Ordering::Release);
+            None
+        }
+    }
+    let mut provider = Provider::new(200);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut transport = super::HttpTransport::new(Arc::new(StopAtProxy(Arc::clone(&stopped))))
+        .bounded(Instant::now() + Duration::from_secs(60), stopped);
+    transport.client = aterm_http::Client::new(
+        aterm_http::Trust::Roots(Vec::new()),
+        aterm_http::ProxyMode::Environment,
+        Duration::from_secs(60),
+    );
+    let error = answered(&transport, &provider.url, Deadlines::JSON, 0).unwrap_err();
+    assert_eq!(
+        (error.phase, error.kind),
+        (Phase::NotSent, WireKind::Revoked)
+    );
+    assert_eq!(
+        provider.finish(),
+        0,
+        "a stopped job never enters the owned provider"
+    );
 }
 
 #[test]

@@ -31,8 +31,8 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = temp_path(path, TEMP_SEQ.fetch_add(1, Ordering::Relaxed))?;
     let _ = std::fs::remove_file(&tmp);
-    if let Err(error) = stage_with(&tmp, bytes, aterm_durable::ordered)
-        .and_then(|()| again_while_refused(|| std::fs::rename(&tmp, path)))
+    if let Err(error) =
+        stage_with(&tmp, bytes, aterm_durable::ordered).and_then(|()| replace(&tmp, path))
     {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
@@ -45,15 +45,51 @@ pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// [`write_durable`] through the temp `tmp`.
 fn replace_via(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     let _ = std::fs::remove_file(tmp);
-    if let Err(error) =
-        stage(tmp, bytes).and_then(|()| again_while_refused(|| std::fs::rename(tmp, path)))
-    {
+    if let Err(error) = stage(tmp, bytes).and_then(|()| replace(tmp, path)) {
         let _ = std::fs::remove_file(tmp);
         return Err(error);
     }
     let _flushed_or_unavailable =
         aterm_durable::Flush::Durable.dir_best_effort(parent_dir(path))?;
     Ok(())
+}
+
+/// Rename the staged `tmp` over `path` ([`again_while_refused`]). On Windows a replace is no
+/// atomic step for a reader: while a rename is under way the old name can be gone and the new
+/// one not there yet, and an open by name in between finds no file (measured: thousands of
+/// opens in a row during one slow rename). There the rename runs under the exclusive
+/// [`replace_lock`], which [`read_durable`] waits on before it takes a missing file for an
+/// absent one.
+fn replace(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    let _replacing = {
+        let lock = replace_lock(path)?;
+        Flock::lock_within(open_lock(&lock, true)?, REPLACE_HANG, &lock)?
+    };
+    again_while_refused(|| std::fs::rename(tmp, path))
+}
+
+/// `.<name>.replace-lock` beside `path`: held exclusively while a writer renames over `path`
+/// and shared by a reader that found no file there ([`replace`], [`read_durable`]). Windows only.
+#[cfg(windows)]
+fn replace_lock(path: &Path) -> io::Result<PathBuf> {
+    let mut lock = String::from(".");
+    lock.push_str(file_name(path)?);
+    lock.push_str(".replace-lock");
+    Ok(path.with_file_name(lock))
+}
+
+/// Windows: once no writer holds `path`'s [`replace_lock`], the name says whether the file is
+/// there. The lock, shared, waited for at most [`REPLACE_HANG`]; `None` where no writer ever
+/// made the lock, so none ever replaced `path` and a missing file is absent.
+#[cfg(windows)]
+fn replace_settled(path: &Path) -> io::Result<Option<Flock>> {
+    let lock = replace_lock(path)?;
+    match open_lock(&lock, false) {
+        Ok(file) => Flock::lock_shared_within(file, REPLACE_HANG, &lock).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// The directory that names `path`: its parent, or `.` for a bare name.
@@ -124,7 +160,7 @@ fn lock_for_update_with(
     let mut lock = String::from(name);
     lock.push_str(".lock");
     let lock = path.with_file_name(lock);
-    let file = open_lock_file(&lock)?;
+    let file = open_lock(&lock, true)?;
     let left = LOCK_WAIT
         .checked_sub(elapsed)
         .filter(|left| !left.is_zero())
@@ -137,11 +173,11 @@ fn lock_for_update_with(
     acquire(file, left, &lock)
 }
 
-/// Open (creating `0600`, never truncating: a lock file is a rendezvous, not data) the lock file at
-/// `path`.
-fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+/// Open (creating `0600` when `create`, never truncating: a lock file is a rendezvous, not data)
+/// the lock file at `path`.
+fn open_lock(path: &Path, create: bool) -> io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).read(true).write(true).truncate(false);
+    opts.create(create).read(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -202,9 +238,42 @@ pub(super) fn read_toml<T: serde::de::DeserializeOwned>(path: &Path, limit: usiz
     aterm_toml::from_str(&text).ok()
 }
 
-/// Read a [`write_durable`] file whole ([`again_while_refused`]).
+/// Read a [`write_durable`] file whole ([`again_while_refused`]). On Windows a file found
+/// missing is read once more after any replace of it under way has finished
+/// ([`replace_settled`]), so a rename in flight never reads as an absent file.
 fn read_durable(path: &Path, limit: usize) -> io::Result<String> {
+    #[cfg(windows)]
+    {
+        read_settled(path, limit, replace_settled)
+    }
+    #[cfg(not(windows))]
+    {
+        read_once(path, limit)
+    }
+}
+
+/// One read of `path` whole ([`again_while_refused`]).
+fn read_once(path: &Path, limit: usize) -> io::Result<String> {
     again_while_refused(|| crate::metadata_io::read_bounded_regular_utf8(path, limit))
+}
+
+/// [`read_once`], and once more where `path` was missing and `settled` answers a guard: what
+/// the name says while the guard is held is the answer.
+#[cfg(any(windows, test))]
+fn read_settled<G>(
+    path: &Path,
+    limit: usize,
+    settled: impl FnOnce(&Path) -> io::Result<Option<G>>,
+) -> io::Result<String> {
+    let first = read_once(path, limit);
+    if first
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        && let Some(_settled) = settled(path)?
+    {
+        return read_once(path, limit);
+    }
+    first
 }
 
 /// Serialize `value` as TOML bytes, refusing more than `limit`.
@@ -221,299 +290,5 @@ pub(super) fn to_toml<T: serde::Serialize>(value: &T, limit: usize) -> io::Resul
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dir(label: &str) -> crate::testdir::Dir {
-        crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
-    }
-
-    #[test]
-    fn windows_replace_waits_for_a_scheduled_file_holder() {
-        let d = dir("scheduled-windows-replace");
-        let staged = d.join("staged");
-        let dest = d.join("dest");
-        std::fs::write(&staged, b"complete").unwrap();
-        std::fs::write(&dest, b"before").unwrap();
-        let mut calls = 0;
-        let result = again_while_refused_windows_at(
-            || {
-                calls += 1;
-                if calls <= 21 {
-                    Err(io::ErrorKind::PermissionDenied.into())
-                } else {
-                    std::fs::rename(&staged, &dest)
-                }
-            },
-            std::time::Instant::now() - Duration::from_secs(1),
-            |_| {},
-        );
-        result.expect("the Windows holder releases before the hang detector");
-        assert_eq!(calls, 22);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"complete");
-        assert!(!staged.exists());
-    }
-
-    #[test]
-    fn windows_refusal_expiry_keeps_the_error_and_unpublished_bytes() {
-        let d = dir("windows-refusal");
-        let staged = d.join("staged");
-        let dest = d.join("dest");
-        std::fs::write(&staged, b"complete").unwrap();
-        std::fs::write(&dest, b"before").unwrap();
-        for (kind, elapsed) in [
-            (io::ErrorKind::PermissionDenied, Duration::from_secs(61)),
-            (io::ErrorKind::NotFound, Duration::ZERO),
-        ] {
-            let mut calls = 0;
-            let out: io::Result<()> = again_while_refused_windows_at(
-                || {
-                    calls += 1;
-                    Err(io::Error::new(kind, std::fmt::Error))
-                },
-                std::time::Instant::now() - elapsed,
-                |_| panic!("an expired wait or unrelated error must not wait again"),
-            );
-            let error = out.unwrap_err();
-            assert_eq!(error.kind(), kind);
-            assert!(error.get_ref().unwrap().is::<std::fmt::Error>());
-            assert_eq!(calls, 1);
-        }
-        assert_eq!(std::fs::read(&staged).unwrap(), b"complete");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"before");
-    }
-
-    #[test]
-    fn digest_update_waits_for_a_scheduled_native_lock_holder() {
-        let d = dir("scheduled-lock");
-        let dest = d.join("x.toml");
-        std::fs::write(&dest, b"unchanged").unwrap();
-        let mut previous = Some(lock_for_update(&dest).unwrap());
-        let held = lock_for_update_with(&dest, Duration::from_secs(6), |file, left, lock| {
-            assert!(
-                matches!(
-                    Flock::try_lock(file.try_clone().unwrap()),
-                    Err(std::fs::TryLockError::WouldBlock)
-                ),
-                "CONTROL: the native predecessor still owns the rendezvous"
-            );
-            drop(previous.take());
-            Flock::lock_within(file, left, lock)
-        })
-        .expect("a scheduled native holder may finish before the hang detector");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"unchanged");
-        let late = lock_for_update_after(&dest, Duration::from_secs(61))
-            .err()
-            .expect("expired");
-        assert_eq!(late.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            matches!(
-                Flock::try_lock(open_lock_file(&d.join("x.toml.lock")).unwrap()),
-                Err(std::fs::TryLockError::WouldBlock)
-            ),
-            "the exhausted wait preserves the actual native holder"
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), b"unchanged");
-        drop(held);
-    }
-
-    #[test]
-    fn a_staged_file_accepts_a_refused_flush_after_writing_its_body() {
-        let d = dir("refused-flush");
-        let tmp = d.join("stage");
-        stage_with(&tmp, b"a = 1\n", |_| {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
-        })
-        .unwrap();
-        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
-    }
-
-    /// A raw Darwin refusal that no std names by a refusal kind, `ENODEV` (what a full flush
-    /// of `/dev/null` answers), is accepted too: staging reads astream's rule, not a list of
-    /// kinds. Darwin's `ENOTSUP` (45) would not show that: the Trust std reads it as
-    /// `Unsupported`, the kind the test above feeds. CONTROL: `ENODEV`'s kind alone is no
-    /// refusal.
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn a_staged_file_accepts_a_darwin_raw_flush_refusal() {
-        let enodev = io::Error::from_raw_os_error(libc::ENODEV);
-        assert!(
-            aterm_durable::refusal_accepted(Err(io::Error::from(enodev.kind()))).is_err(),
-            "CONTROL: std names ENODEV by kind ({enodev:?}); the errno half is untested"
-        );
-        let d = dir("raw-refused-flush");
-        let tmp = d.join("stage");
-        stage_with(&tmp, b"a = 1\n", |_| {
-            Err(io::Error::from_raw_os_error(libc::ENODEV))
-        })
-        .unwrap();
-        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
-    }
-
-    #[test]
-    fn a_staged_file_reports_a_failed_flush_after_writing_its_body() {
-        let d = dir("failed-flush");
-        let tmp = d.join("stage");
-        let error =
-            stage_with(&tmp, b"a = 1\n", |_| Err(io::Error::other(std::fmt::Error))).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(error.get_ref().unwrap().is::<std::fmt::Error>());
-        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
-    }
-
-    #[test]
-    fn accepting_a_flush_refusal_does_not_accept_a_failed_stage_open() {
-        let d = dir("occupied-stage");
-        let tmp = d.join("stage");
-        std::fs::write(&tmp, b"keep").unwrap();
-        let error = stage_with(&tmp, b"replace", |_| {
-            panic!("an unsuccessful open cannot reach the flush")
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        let error = stage_with(&d.join("stage\0"), b"replace", |_| {
-            panic!("an invalid path cannot reach the flush")
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(std::fs::read(tmp).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn each_replace_names_its_flush() {
-        use aterm_durable::{Flush, seam::Recording};
-        let d = dir("flush-tiers");
-        let dest = d.join("x.toml");
-        let recording = Recording::start();
-        write_durable(&dest, b"a = 1\n").unwrap();
-        // The directory's flush is recorded everywhere (on Windows `Flush::dir` only notes
-        // it). The temp's durable flush is recorded on Windows (`durable_data`) and not on
-        // Unix, where it is atpkg's own `fsync`.
-        let durable: &[Flush] = if cfg!(windows) {
-            &[Flush::Durable, Flush::Durable]
-        } else {
-            &[Flush::Durable]
-        };
-        assert_eq!(recording.take(), durable);
-        write_ordered(&dest, b"a = 2\n").unwrap();
-        assert_eq!(recording.take(), [Flush::Ordered, Flush::Ordered]);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
-    }
-
-    #[test]
-    fn a_leftover_temp_is_replaced_or_ignored() {
-        let d = dir("leftover");
-        let dest = d.join("x.toml");
-        let stale = temp_path(&dest, u64::MAX).unwrap();
-        std::fs::write(&stale, b"garbage garbage garbage garbage").unwrap();
-        let foreign = d.join(".x.toml.tmp-1-0");
-        std::fs::write(&foreign, b"garbage").unwrap();
-        replace_via(&stale, &dest, b"a = 1\n").unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"a = 1\n");
-        assert!(
-            !stale.exists(),
-            "the stale temp was replaced and renamed into place"
-        );
-        write_durable(&dest, b"a = 2\n").unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
-        assert!(foreign.exists(), "another pid's temp is left alone");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o644);
-        }
-    }
-
-    #[test]
-    fn a_failed_replace_leaves_no_temp() {
-        let d = dir("fail");
-        let dest = d.join("x.toml");
-        std::fs::create_dir(&dest).unwrap();
-        std::fs::write(dest.join("keep"), b"").unwrap();
-        assert!(write_durable(&dest, b"a = 1\n").is_err());
-        let temps = std::fs::read_dir(&d)
-            .unwrap()
-            .filter(|e| {
-                let name = e.as_ref().unwrap().file_name();
-                name.to_str().unwrap().starts_with(".x.toml.tmp-")
-            })
-            .count();
-        assert_eq!(temps, 0);
-        assert!(dest.join("keep").exists());
-    }
-
-    #[test]
-    fn concurrent_writers_never_tear_the_file() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-        let d = dir("race");
-        let dest = d.join("x.toml");
-        let a = vec![b'A'; 256 * 1024];
-        let b = vec![b'B'; 128 * 1024];
-        write_durable(&dest, &a).unwrap();
-        let done = AtomicBool::new(false);
-        let torn = AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            let writers: Vec<_> = (0..8)
-                .map(|i| {
-                    let (dest, body) = (&dest, if i % 2 == 0 { &a } else { &b });
-                    s.spawn(move || {
-                        for _ in 0..100 {
-                            write_durable(dest, body).unwrap();
-                        }
-                    })
-                })
-                .collect();
-            let reader = s.spawn(|| {
-                while !done.load(Ordering::Relaxed) {
-                    let got = read_durable(&dest, 1024 * 1024).unwrap().into_bytes();
-                    if got != a && got != b {
-                        torn.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-            let written: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
-            done.store(true, Ordering::Relaxed);
-            reader.join().unwrap();
-            for result in written {
-                result.unwrap();
-            }
-        });
-        assert_eq!(torn.load(Ordering::Relaxed), 0, "a reader saw a torn file");
-        let last = std::fs::read(&dest).unwrap();
-        assert!(last == a || last == b);
-    }
-
-    #[test]
-    fn a_dropped_update_lock_is_free_while_a_copy_of_its_descriptor_lives() {
-        let d = dir("lock-dup");
-        let dest = d.join("x.toml");
-        let held = lock_for_update(&dest).unwrap();
-        let childs_copy = held.try_clone().unwrap();
-        drop(held);
-        let again = lock_for_update(&dest).expect("free while its copy lives");
-        drop((again, childs_copy));
-    }
-
-    #[test]
-    fn a_held_update_lock_times_out() {
-        let d = dir("lock-held");
-        let dest = d.join("x.toml");
-        let _held = lock_for_update(&dest).unwrap();
-        let err = lock_for_update_after(&dest, Duration::from_secs(61))
-            .err()
-            .expect("held");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_for_update_refuses_symlink_lock_file() {
-        let d = dir("lock-symlink");
-        let dest = d.join("x.toml");
-        let victim = d.join("victim");
-        std::fs::write(&victim, b"untouched").unwrap();
-        std::os::unix::fs::symlink(&victim, d.join("x.toml.lock")).unwrap();
-        assert!(lock_for_update(&dest).is_err());
-    }
-}
+#[path = "durable_tests.rs"]
+mod tests;

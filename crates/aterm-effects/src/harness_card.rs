@@ -870,11 +870,17 @@ impl CardPalette {
     /// paper the print law's ink.
     #[must_use]
     #[inline]
-    pub const fn letter_on(self, t: f32, ground: u32) -> u32 {
+    pub fn letter_on(self, t: f32, ground: u32) -> u32 {
+        self.letter_with_polarity(t, ground, dark_ground(ground))
+    }
+
+    /// The same letter using the polarity already solved for this ground by `GlassInks`.
+    #[inline]
+    pub(crate) const fn letter_with_polarity(self, t: f32, ground: u32, dark: bool) -> u32 {
         let ground = ground & 0x00FF_FFFF;
         let table = crate::color_math::relative_luminance_table();
         let lg = crate::color_math::relative_luminance_with(table, ground);
-        if lg < 0.5 {
+        if dark {
             line_floor(table, self.letter_dark_with(table, t), lg)
         } else {
             self.text_at_with_bg_lum(table, t, lg)
@@ -888,12 +894,18 @@ impl CardPalette {
     /// print law's ink.
     #[must_use]
     #[inline]
-    pub const fn hero_on(self, k: f32, ground: u32) -> u32 {
+    pub fn hero_on(self, k: f32, ground: u32) -> u32 {
+        self.hero_with_polarity(k, ground, dark_ground(ground))
+    }
+
+    /// The same hero using the polarity already solved for this ground by `GlassInks`.
+    #[inline]
+    pub(crate) const fn hero_with_polarity(self, k: f32, ground: u32, dark: bool) -> u32 {
         let ground = ground & 0x00FF_FFFF;
         let table = crate::color_math::relative_luminance_table();
         let lg = crate::color_math::relative_luminance_with(table, ground);
         let place = tri(k * LINE_HERO_SPREAD + PHI_SETTLED);
-        if lg < 0.5 {
+        if dark {
             line_floor(
                 table,
                 lift_to_luminance_with(table, self.at(place), LINE_HERO_DARK_LUMA_FLOOR),
@@ -2749,7 +2761,7 @@ impl HarnessCard {
         let ground = ground & 0x00FF_FFFF;
         let table = crate::color_math::relative_luminance_table();
         let lg = crate::color_math::relative_luminance_with(table, ground);
-        let dark = lg < 0.5;
+        let dark = dark_ground(ground);
         let clock = match now {
             Some(now) if animate => match self.running(now) {
                 Some(ms) => self.on_ripple(Clock::intro(ms, None), now),
@@ -2911,11 +2923,13 @@ const fn lift_to_luminance_with(
     mix_rgb(rgb, WHITE, short + 4.0 * step)
 }
 
-/// Returns `true` when background `bg` (`0x00RRGGBB`) has WCAG relative luminance below `0.5`.
+/// Whether white text has at least as much contrast as black on `bg` (`0x00RRGGBB`),
+/// using the same ground decision as chrome.
 #[must_use]
 #[inline]
-pub const fn dark_ground(bg: u32) -> bool {
-    relative_luminance(bg) < 0.5
+pub fn dark_ground(bg: u32) -> bool {
+    let [_, r, g, b] = bg.to_be_bytes();
+    !aterm_types::bg_is_light([r, g, b])
 }
 
 /// Minimum WCAG contrast of a dark scene's mark on the ground it is laid on — a field star, a
@@ -3012,11 +3026,11 @@ const fn dark_mark_with(
 /// on paper the letter's ink laid over.
 #[inline]
 #[must_use]
-pub const fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
+pub fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
     let ground = ground & 0x00FF_FFFF;
     let table = crate::color_math::relative_luminance_table();
     let lg = crate::color_math::relative_luminance_with(table, ground);
-    if lg >= 0.5 {
+    if !dark_ground(ground) {
         return (rgb, DecoBlend::Over);
     }
     match dark_mark_with(table, rgb, ground, lg) {

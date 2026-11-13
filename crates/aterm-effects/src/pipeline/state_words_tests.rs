@@ -13,7 +13,7 @@ fn typed(t0: Instant, read_t0: Instant, text: &[u8]) -> (EffectsPipeline, Vec<Ve
     p.t0 = t0;
     p.set_cursor_glow(
         true,
-        "rainbow kitty",
+        "rainbow",
         crate::cursor_fx::TrailColor::Automatic,
         None,
         400,

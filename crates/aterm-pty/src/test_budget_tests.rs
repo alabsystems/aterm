@@ -2,17 +2,23 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use std::time::Duration;
 
 #[test]
 fn lease_child() {
     let Some(dir) = std::env::var_os("ATERM_PTY_LEASE_TEST_DIR") else {
         return;
     };
-    let lease = Lease::take_in(Path::new(&dir), Duration::ZERO, || {});
     if std::env::var_os("ATERM_PTY_LEASE_EXPECT_HELD").is_some() {
-        assert_eq!(lease.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+        let probe = PrivateLock::take(
+            Path::new(&dir),
+            "dense-fixture.lock",
+            Duration::ZERO,
+            "held",
+        );
+        assert_eq!(probe.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
     } else {
-        assert!(lease.is_ok());
+        assert!(Lease::take_in(Path::new(&dir), || {}).is_ok());
     }
     println!("pty-lease-probe-complete");
 }
@@ -42,12 +48,12 @@ fn another_process_observes_the_lease_and_panic_releases_it() {
             "the child must actually execute the lease probe"
         );
     };
-    let lease = Lease::take_in(&dir, Duration::ZERO, || {}).unwrap();
+    let lease = Lease::take_in(&dir, || {}).unwrap();
     child(true);
     drop(lease);
     child(false);
     let panic = std::panic::catch_unwind(|| {
-        let _lease = Lease::take_in(&dir, Duration::ZERO, || {}).unwrap();
+        let _lease = Lease::take_in(&dir, || {}).unwrap();
         panic!("fixture failed");
     });
     assert!(panic.is_err());
@@ -58,16 +64,16 @@ fn another_process_observes_the_lease_and_panic_releases_it() {
 fn an_independent_open_waits_for_the_whole_fixture_and_drop_releases_it() {
     let root = aterm_tempfile::tempdir().unwrap();
     let dir = root.path().join("budget");
-    let mut first = Some(Lease::take_in(&dir, Duration::ZERO, || {}).unwrap());
+    let mut first = Some(Lease::take_in(&dir, || {}).unwrap());
     assert_eq!(
-        Lease::take_in(&dir, Duration::ZERO, || {})
+        PrivateLock::take(&dir, "dense-fixture.lock", Duration::ZERO, "held")
             .err()
             .unwrap()
             .kind(),
         std::io::ErrorKind::WouldBlock,
     );
     let mut observed = false;
-    let second = Lease::take_in(&dir, Duration::from_secs(60), || {
+    let second = Lease::take_in(&dir, || {
         observed = true;
         first.take();
     })
@@ -77,5 +83,5 @@ fn an_independent_open_waits_for_the_whole_fixture_and_drop_releases_it() {
         "the second holder cannot enter while the first is live"
     );
     drop(second);
-    assert!(Lease::take_in(&dir, Duration::ZERO, || {}).is_ok());
+    assert!(PrivateLock::take(&dir, "dense-fixture.lock", Duration::ZERO, "held").is_ok());
 }

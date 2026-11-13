@@ -87,6 +87,7 @@ fn point(
     reach: Reach,
 ) -> TurnEndReading {
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase: if over_shell { Phase::Busy } else { Phase::Idle },
         authoritative: true,
         survey: false,

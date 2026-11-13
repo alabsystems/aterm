@@ -48,6 +48,25 @@ fn previous_box_edges(strip: Strip) -> Vec<(f64, f64)> {
     edges
 }
 
+fn previous_fine_band(strip: &Strip, scale: f64) -> live::FineBand {
+    let slots = strip.spec.slots();
+    let edges = strip.box_edges();
+    let Some((start, slot)) =
+        fine_band_slots(&slots).and_then(|band| Some((band.start, *slots.get(band.start)?)))
+    else {
+        return live::FineBand::default();
+    };
+    let pitch = match (edges.get(start), edges.get(start + 1)) {
+        (Some(a), Some(b)) => b.0 - a.0,
+        (Some(a), None) => a.1 - a.0 + BOX_GAP,
+        _ => 0.0,
+    };
+    live::FineBand {
+        box_px: pitch * scale.max(0.5),
+        period_ms: slot.age_hi_ms - slot.age_lo_ms,
+    }
+}
+
 fn previous_x_at_age(strip: Strip, age_ms: i64) -> Option<f64> {
     if age_ms < -2_000 || age_ms > strip.spec.horizon_ms() {
         return None;
@@ -295,8 +314,27 @@ fn streamed_age_positions_keep_weighted_edges_bit_for_bit() {
             bands: &[],
             ticks: &[],
         },
+        MultiScaleSpec {
+            bands: &[aterm_vitals::ScaleBand {
+                slots: 1,
+                period_ms: 1000,
+                weight: 1,
+                live_now: false,
+            }],
+            ticks: &[],
+        },
+        MultiScaleSpec {
+            bands: &[aterm_vitals::ScaleBand {
+                slots: 3,
+                period_ms: 1000,
+                weight: 1,
+                live_now: true,
+            }],
+            ticks: &[],
+        },
     ];
     let mut compared = 0;
+    let mut fine_compared = 0;
     for spec in specs {
         let horizon = spec.horizon_ms();
         let mut ages = vec![-2001, -2000, -1, 0, 1, horizon - 1, horizon, horizon + 1];
@@ -324,6 +362,16 @@ fn streamed_age_positions_keep_weighted_edges_bit_for_bit() {
                             cell,
                             spec,
                         };
+                        for scale in [f64::NAN, -1.0, 0.25, 0.5, 1.0, 1.5, 2.0, f64::INFINITY] {
+                            let before = previous_fine_band(&strip, scale);
+                            let after = fine_band(&strip, scale);
+                            assert_eq!(
+                                (before.box_px.to_bits(), before.period_ms),
+                                (after.box_px.to_bits(), after.period_ms),
+                                "fine band scale={scale} strip={strip:?}"
+                            );
+                            fine_compared += 1;
+                        }
                         let bits = |pairs: Vec<(f64, f64)>| {
                             pairs
                                 .into_iter()
@@ -350,6 +398,88 @@ fn streamed_age_positions_keep_weighted_edges_bit_for_bit() {
     }
     assert!(compared > 10_000);
     println!("age position bit comparisons: {compared}");
+    println!("fine band bit comparisons: {fine_compared}");
+}
+
+#[test]
+#[ignore = "manual paired fine-band allocation and instruction measurement"]
+fn measure_fine_band() {
+    use aterm_bench::measurement_clock::counters;
+    use std::hint::black_box;
+    type Probe = fn(&Strip, f64) -> live::FineBand;
+    let probes: [(&str, Probe); 2] = [("reference", previous_fine_band), ("candidate", fine_band)];
+    let specs = [
+        MultiScaleSpec::FULL_6H,
+        MultiScaleSpec::FOLD_4H,
+        MultiScaleSpec::COMPACT_6M,
+        MultiScaleSpec::MINI_1M,
+        MultiScaleSpec {
+            bands: &[],
+            ticks: &[],
+        },
+        MultiScaleSpec {
+            bands: &[aterm_vitals::ScaleBand {
+                slots: 1,
+                period_ms: 1000,
+                weight: 1,
+                live_now: false,
+            }],
+            ticks: &[],
+        },
+        MultiScaleSpec {
+            bands: &[aterm_vitals::ScaleBand {
+                slots: 3,
+                period_ms: 1000,
+                weight: 1,
+                live_now: true,
+            }],
+            ticks: &[],
+        },
+    ];
+    for (spec_id, spec) in specs.into_iter().enumerate() {
+        for cols in [1, 19, 64] {
+            for scale in [0.25, 1.0, 2.0] {
+                let strip = Strip {
+                    x: 12.25,
+                    cols,
+                    period_s: 1,
+                    pitch: 5.25,
+                    cell: 3.0,
+                    spec,
+                };
+                let a = previous_fine_band(&strip, scale);
+                let b = fine_band(&strip, scale);
+                assert_eq!(
+                    (a.box_px.to_bits(), a.period_ms),
+                    (b.box_px.to_bits(), b.period_ms)
+                );
+                for (_, probe) in probes {
+                    for _ in 0..100 {
+                        black_box(probe(black_box(&strip), black_box(scale)));
+                    }
+                }
+                for sample in 0..5 {
+                    let order = if sample % 2 == 0 { [0, 1] } else { [1, 0] };
+                    for i in order {
+                        let (variant, probe) = probes[i];
+                        let (_, allocations) = aterm_heap_count::allocations_in(|| {
+                            black_box(probe(black_box(&strip), black_box(scale)))
+                        });
+                        let start = counters();
+                        for _ in 0..5_000 {
+                            black_box(probe(black_box(&strip), black_box(scale)));
+                        }
+                        let instructions = start
+                            .zip(counters())
+                            .map(|(a, b)| b.instructions.saturating_sub(a.instructions));
+                        println!(
+                            "fine spec={spec_id} cols={cols} scale={scale} variant={variant} sample={sample} iterations=5000 allocations={allocations} instructions={instructions:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

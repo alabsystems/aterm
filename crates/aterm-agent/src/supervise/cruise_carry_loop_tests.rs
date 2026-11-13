@@ -3,7 +3,7 @@
 
 //! Tests for Cruise's carry at a break of the agent's own background work
 //! (`Session::cruise_carry`) and the needs such a break's report names (`Session::break_needs`):
-//! CRUISE NEVER PARKS (owner ruling 2026-10-26).
+//! CRUISE NEVER PARKS.
 
 use super::*;
 use crate::supervise::policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
@@ -151,6 +151,133 @@ fn cruise_carries_a_settled_background_break_and_off_and_land_type_nothing() {
             other.requests()
         );
     }
+}
+
+/// The breaks of one turn that ended on its background work, read at `at_s` under Cruise by a
+/// window's hosted loop (`builtin_duties`) whose host reports `authority` and refuses every
+/// write that names no duty it keeps (`Mock::hosted`).
+fn hosted_ran(tag: &str, authority: BuiltinAuthority, at_s: &[i64]) -> Ran {
+    hosted_ran_said(tag, authority, PLAIN, at_s)
+}
+
+/// [`hosted_ran`] over a turn whose report is `said`.
+fn hosted_ran_said(
+    tag: &str,
+    authority: BuiltinAuthority,
+    said: &'static [&'static str],
+    at_s: &[i64],
+) -> Ran {
+    let drawn = move |_| waiting(said);
+    Script {
+        policy: under(Autopilot::Cruise),
+        drawn: &drawn,
+        set: &|m| m.hosted = Some(authority),
+        ..Script::new(tag, Occupancy::Observe, at_s)
+    }
+    .run(&mut |s, _| s.set_builtin_duties(true))
+}
+
+/// A WINDOW'S HOSTED LOOP TYPES THE CARRY UNDER THE TURN END'S DUTY: its host takes a write only
+/// under a duty the built-in keeps, and the carry is the turn end's. Negative control: a carry
+/// typed under no duty (no `duty_guard` in `Session::cruise_carry`) is refused by the host (`ERR
+/// denied supervisor input authority`), journals a `SKIPPED` row and books nothing, at every
+/// look for as long as the break lasts.
+#[test]
+fn a_hosted_loops_carry_goes_under_the_turn_ends_duty() {
+    let ran = hosted_ran(
+        "carry-hosted",
+        BuiltinAuthority::complement(7, []),
+        &[0, 30],
+    );
+    assert!(
+        !ran.noted.iter().any(|l| l.starts_with("SKIPPED ")),
+        "{:#?}",
+        ran.noted
+    );
+    assert_eq!(carries(&ran), 1, "{:#?}", ran.writes());
+    assert!(
+        ran.ledger
+            .contains(&format!("\"rule_id\":\"{RULE_BACKGROUND}\"")),
+        "{}",
+        ran.ledger
+    );
+    assert!(
+        ran.calls.iter().any(|c| c == "break_taken"),
+        "{:?}",
+        ran.calls
+    );
+}
+
+/// A CARRY WHOSE DUTY ANOTHER SUPERVISOR HOLDS IS HELD, AND SAID ONCE: a scoped supervisor that
+/// took the turn end leaves the built-in no write there, so the loop sends none and journals one
+/// `DEFERRED … held:duty:turn-end` row for the break, however many looks find the carry due.
+/// Negative control: a carry that tries the write anyway (no `duty_withheld` hold) is refused at
+/// each look and journals a `SKIPPED` row for each.
+#[test]
+fn a_carry_whose_duty_another_supervisor_holds_is_held_and_said_once() {
+    let ran = hosted_ran(
+        "carry-duty-held",
+        BuiltinAuthority::complement(7, [Scope::TurnEnd]),
+        &[0, 30, 31, 32],
+    );
+    assert!(ran.writes().is_empty(), "{:#?}", ran.writes());
+    assert!(
+        !ran.noted.iter().any(|l| l.starts_with("SKIPPED ")),
+        "{:#?}",
+        ran.noted
+    );
+    let held: Vec<&String> = ran
+        .noted
+        .iter()
+        .filter(|l| l.starts_with("DEFERRED ") && l.contains(RULE_BACKGROUND))
+        .collect();
+    assert_eq!(held.len(), 1, "{:#?}", ran.noted);
+    assert!(held[0].ends_with("held:duty:turn-end"), "{held:?}");
+    assert!(
+        !ran.ledger
+            .contains(&format!("\"rule_id\":\"{RULE_BACKGROUND}\"")),
+        "{}",
+        ran.ledger
+    );
+}
+
+/// A report that ends on a question to the person, in prose.
+const ASKED: &[&str] = &["Both workflows are running. Should I also update the docs?"];
+
+/// A CARRY OVER A PROSE QUESTION IS THE QUESTIONS DUTY'S, as the same ending is at a point
+/// (`duty::action_scope`): where another supervisor took the questions, the built-in types
+/// nothing over a break whose turn ended on one, and says so once (`DEFERRED …
+/// held:duty:questions`). The control: under the same authority a break whose turn asked nothing
+/// is still the turn end's, and is carried. Negative control: a carry that always takes the turn
+/// end's duty is typed over the question here.
+#[test]
+fn a_carry_over_a_prose_question_goes_under_the_questions_duty() {
+    let authority = || BuiltinAuthority::complement(7, [Scope::Questions]);
+    let asked = hosted_ran_said("carry-duty-question", authority(), ASKED, &[0, 30, 31, 32]);
+    assert!(asked.writes().is_empty(), "{:#?}", asked.writes());
+    assert!(
+        !asked.noted.iter().any(|l| l.starts_with("SKIPPED ")),
+        "{:#?}",
+        asked.noted
+    );
+    let held: Vec<&String> = asked
+        .noted
+        .iter()
+        .filter(|l| l.starts_with("DEFERRED ") && l.contains("held:duty:"))
+        .collect();
+    assert_eq!(held.len(), 1, "{:#?}", asked.noted);
+    assert!(held[0].ends_with("held:duty:questions"), "{held:?}");
+
+    let plain = hosted_ran("carry-duty-no-question", authority(), &[0, 30]);
+    assert_eq!(carries(&plain), 1, "{:#?}", plain.writes());
+    assert!(
+        !plain
+            .noted
+            .iter()
+            .any(|l| l.starts_with("SKIPPED ") || l.contains("held:duty:")),
+        "{:#?}",
+        plain.noted
+    );
 }
 
 #[test]

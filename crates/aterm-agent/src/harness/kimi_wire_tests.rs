@@ -15,7 +15,7 @@
 //! `request-question` is an `AskUserQuestion` (measured the same way in `aterm-lab kimi kw2`), an
 //! interaction of kind `question` that names no tool.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use super::fixtures::{
@@ -306,7 +306,15 @@ fn a_surrogate_kimi_cut_from_its_pair_reads_as_the_character_node_writes() {
 
 #[test]
 fn a_home_is_the_folder_of_the_projects_file_kimi_holds_open() {
-    let open = |paths: &[&str]| paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+    // A POSIX absolute path as this host reads one absolute (`C:/h/...` on Windows).
+    let host = |path: &str| {
+        if path.starts_with('/') {
+            PathBuf::from(crate::harness::host_path::abs(path))
+        } else {
+            PathBuf::from(path)
+        }
+    };
+    let open = |paths: &[&str]| paths.iter().map(|path| host(path)).collect::<Vec<_>>();
     // As `lsof -p` named a 2.5.2 Kimi's files in `aterm-lab kimi kr1`, the jail's folders
     // shortened.
     let held = open(&[
@@ -318,7 +326,7 @@ fn a_home_is_the_folder_of_the_projects_file_kimi_holds_open() {
     ]);
     assert_eq!(
         kimi_home_of(&held).as_deref(),
-        Some(Path::new("/h/.kimi-code"))
+        Some(host("/h/.kimi-code").as_path())
     );
     assert_eq!(
         kimi_home_of(&open(&["/h/.kimi-code/config.toml"])),
@@ -335,7 +343,7 @@ fn a_home_is_the_folder_of_the_projects_file_kimi_holds_open() {
             "/h/.kimi-code/projects.json",
             "/h/.kimi-code/projects.json"
         ])),
-        Some(PathBuf::from("/h/.kimi-code")),
+        Some(host("/h/.kimi-code")),
         "one home held twice is one home"
     );
     assert_eq!(
@@ -491,7 +499,7 @@ fn a_request_an_earlier_kimi_left_open_is_not_this_ones() {
 fn a_folder_that_cannot_be_read_leaves_the_record_unread() {
     use std::os::unix::fs::PermissionsExt as _;
     let home = Home::new(&[HEAD, REQUEST]);
-    let lock = |dir: &Path, mode: u32| {
+    let lock = |dir: &std::path::Path, mode: u32| {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
     };
     let read = || {

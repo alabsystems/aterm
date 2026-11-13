@@ -5569,7 +5569,7 @@ fn opened(program: &str, mode: &str) -> Option<(i64, String)> {
         .find(|m| m.word() == mode)
         .expect("a mode");
     let title = format!(
-        "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
+        "autopilot: {mode} \u{2014} {} \u{b7} click: x",
         mode_words(m).chip
     );
     let line = format!(
@@ -5653,9 +5653,7 @@ fn seen_land_a(program: &str) -> Seen {
 fn landed_front(s: &Seen, program: &str, at: i64) -> Option<(i64, String)> {
     let brief =
         aterm_agent::supervise::mode_words::landed_brief(checked::receipt_of(s, T0).as_ref());
-    let title = format!(
-        "autopilot: land, landed 03:24 \u{2014} {brief} \u{b7} click: off \u{b7} right-click: more"
-    );
+    let title = format!("autopilot: land, landed 03:24 \u{2014} {brief} \u{b7} click: off");
     Some((
         T0 + at,
         format!(
@@ -9165,7 +9163,7 @@ fn a_composer_is_waited_for_while_its_screen_moves_and_input_no_one_gave_ends_it
         Ok(ComposerWait::Draft("]10;rgb:d0d0/d0d0/d0d0".into()))
     );
     assert_eq!(clock.get(), 5, "reported at the look that saw it");
-    let status = "</tmp/at.lab-501/aterm-ty2b-9671b4d1/runs/b2cvu-muse/scratch/tmp/tbh-prompt-\
+    let status = "</tmp/.ubd/at.lab-501/aterm-ty2b-9671b4d1/runs/b2cvu-muse/scratch/tmp/tbh-prompt-\
                   5cc2c6c5-b051-4111-b461-496566263d38.md\" [noeol] 1L, 92B";
     let mut vim = vec![
         "]10;rgb:d0d0/d0d0/d0d0]4;0;rgb:0000/0000/0000]4;8;rgb:8a8a/8f8f/9999]4;12;rgb:5c5c/5c5c/ffff",
@@ -9361,7 +9359,7 @@ fn cruise_held(line: &str) -> Seen {
 
 /// Its chip in front on `b42ae72fc3` past a done check (the run's `cruise-n` chip at +368.9 s,
 /// title and all): the mode's own promise, no stop word.
-const CRUISE_ON_MAIN: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Last: kept going at 11:48.\" title=\"autopilot: cruise — keeps going for ever, finding more to do · last: ↻ kept going 11:48, ↻ kept going 11:44 · click: land · right-click: more\"";
+const CRUISE_ON_MAIN: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Last: kept going at 11:48.\" title=\"autopilot: cruise — keeps going for ever, finding more to do · last: ↻ kept going 11:48, ↻ kept going 11:44 · click: land\"";
 
 /// The same chip as §14.3 words it once 3a says the stop: description and title led by it
 /// ([`surfaces::held::stop_heads`]).
@@ -9369,7 +9367,7 @@ fn cruise_said() -> String {
     let [spoken, titled, _] = surfaces::held::stop_heads("cruise", HeldBy::SameReply);
     format!(
         "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" \
-         description=\"{spoken}\" title=\"{titled} · click: land · right-click: more\""
+         description=\"{spoken}\" title=\"{titled} · click: land\""
     )
 }
 

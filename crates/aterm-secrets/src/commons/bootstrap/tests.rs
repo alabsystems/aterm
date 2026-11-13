@@ -1600,6 +1600,140 @@ fn a_journal_read_as_holding_the_descriptor_is_made_durable_first() {
     assert_eq!(recording.take(), []);
 }
 
+/// An open of the vault at `paths` that a bootstrap's judgement is held to: what
+/// `Replica`'s rounds open where the one they keep falls ([`Bootstrap::cached_until`]).
+fn stood_open(paths: &Paths) -> Result<Bootstrap> {
+    use std::time::{Duration, Instant};
+    Bootstrap::cached_until(paths, Instant::now() + Duration::from_secs(60))
+        .map(|bootstrap| bootstrap.expect("a vault this Mac holds"))
+}
+
+/// A vault this Mac created and the bootstrap an open of it gives, which stands.
+fn stood_established() -> (aterm_tempfile::TempDir, Paths, Bootstrap) {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let bootstrap = stood_open(&paths).unwrap();
+    bootstrap.stands().unwrap();
+    (home, paths, bootstrap)
+}
+
+/// A change to a vault a bootstrap was opened from, by what it is, how it is made, and whether
+/// an open then repairs it.
+type StoodChange = (&'static str, fn(&Paths), bool);
+
+/// The changes [`Bootstrap::stands`] refuses a bootstrap after, as an open would give another one,
+/// repair or refuse ([`a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged`]).
+fn stood_changes() -> [StoodChange; 15] {
+    fn mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fn replace(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+    [
+        (
+            "a vault publication",
+            |paths| {
+                let admin = client::admin_open(paths).unwrap();
+                client::admin_publish(paths, &admin, &admin.doc).unwrap();
+            },
+            true,
+        ),
+        (
+            "a replaced history claim",
+            |paths| replace(&paths.dir.join("commons.claim")),
+            false,
+        ),
+        (
+            "a replaced device claim",
+            |paths| replace(&paths.dir.join("commons/device.claim")),
+            false,
+        ),
+        (
+            "a lost device key",
+            |paths| std::fs::remove_file(paths.dir.join("commons/device.age")).unwrap(),
+            false,
+        ),
+        (
+            "a lost network pin",
+            |paths| std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap(),
+            true,
+        ),
+        (
+            "a widened vault folder",
+            |paths| mode(&paths.dir, 0o750),
+            true,
+        ),
+        (
+            "a widened commons folder",
+            |paths| mode(&paths.dir.join("commons"), 0o750),
+            true,
+        ),
+        (
+            "a read-only commons folder",
+            |paths| mode(&paths.dir.join("commons"), 0o500),
+            true,
+        ),
+        (
+            "a sticky vault folder",
+            |paths| mode(&paths.dir, 0o1700),
+            true,
+        ),
+        (
+            "a creation claim open to others",
+            |paths| mode(&paths.dir.join("creation.claim"), 0o640),
+            false,
+        ),
+        (
+            "a lost custody lock",
+            |paths| std::fs::remove_file(paths.dir.join("commons.lock")).unwrap(),
+            true,
+        ),
+        (
+            "a lost device lock",
+            |paths| std::fs::remove_file(paths.dir.join("commons-device.lock")).unwrap(),
+            true,
+        ),
+        (
+            "a custody lock open to others",
+            |paths| mode(&paths.dir.join("commons.lock"), 0o644),
+            false,
+        ),
+        (
+            "a linked control folder",
+            |paths| {
+                let control = paths.dir.join("commons/control");
+                let moved = paths.dir.join("commons/control-moved");
+                std::fs::rename(&control, &moved).unwrap();
+                symlink(&moved, &control).unwrap();
+            },
+            false,
+        ),
+        (
+            "a control journal that lost its history",
+            |paths| {
+                let control = paths.dir.join("commons/control");
+                let moved = paths.dir.join("commons/control-moved");
+                std::fs::rename(&control, &moved).unwrap();
+                std::fs::create_dir(&control).unwrap();
+                mode(&control, 0o700);
+                let anchor = std::fs::read(moved.join("control.anchor")).unwrap();
+                fsx::write_new(&control.join("control.anchor"), &anchor, 0o600).unwrap();
+            },
+            false,
+        ),
+    ]
+}
+
 /// A bootstrap stands ([`Bootstrap::stands`]) while an open of its vault would give it back
 /// unchanged and neither refuse nor write: each change below makes it refuse, and where the open
 /// then repairs (a pin made again, a folder narrowed, a lock made again) the bootstrap it gives
@@ -1610,40 +1744,14 @@ fn a_journal_read_as_holding_the_descriptor_is_made_durable_first() {
 /// replaced history claim`), without the `commons` folder's judgement (`a widened commons folder`)
 /// or the vault folder's (`a sticky vault folder`), with `fsx::private_dir_settled` taking any
 /// owner-only mode (`a read-only commons folder`), without its custody locks' judgement (`a lost
-/// custody lock`), without the creation claim's read (`a creation claim open to others`), and
-/// without the journal's descriptor (`a linked control folder`, `a control journal that lost its
-/// history`). The locks' opens judge the vault's folder too, and so does its mode, so a `stands`
-/// that took that folder's verdict without refusing on it still refuses `a widened vault folder`.
+/// custody lock`; `Bootstrap::beside_custody` without them for either caller, 2026-11-11), without
+/// the creation claim's read (`a creation claim open to others`), and without the journal's
+/// descriptor (`a linked control folder`, `a control journal that lost its history`). The locks'
+/// opens judge the vault's folder too, and so does its mode, so a `stands` that took that folder's
+/// verdict without refusing on it still refuses `a widened vault folder`.
 #[test]
 fn a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged() {
-    use std::time::{Duration, Instant};
-    let open = |paths: &Paths| {
-        Bootstrap::cached_until(paths, Instant::now() + Duration::from_secs(60))
-            .map(|bootstrap| bootstrap.expect("a vault this Mac holds"))
-    };
-    let established = || {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(home.path());
-        client::create(
-            &paths,
-            home.path().join("team.vault").to_str().unwrap(),
-            None,
-            Some("m1"),
-        )
-        .unwrap();
-        let bootstrap = open(&paths).unwrap();
-        bootstrap.stands().unwrap();
-        (home, paths, bootstrap)
-    };
-    let mode = |path: &Path, mode: u32| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    let replace = |path: &Path| {
-        let mut bytes = std::fs::read(path).unwrap();
-        *bytes.last_mut().unwrap() ^= 1;
-        std::fs::write(path, bytes).unwrap();
-    };
-    let (_home, paths, bootstrap) = established();
+    let (_home, paths, bootstrap) = stood_established();
     let writing = std::fs::File::open(paths.dir.join(".lock")).unwrap();
     #[expect(
         clippy::disallowed_methods,
@@ -1655,106 +1763,11 @@ fn a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged() {
     drop(writing);
     bootstrap.stands().unwrap();
 
-    // What each scenario changes, how, and whether the open then repairs it.
-    type Scenario<'a> = (&'a str, &'a dyn Fn(&Paths), bool);
-    let scenarios: [Scenario<'_>; 15] = [
-        (
-            "a vault publication",
-            &|paths| {
-                let admin = client::admin_open(paths).unwrap();
-                client::admin_publish(paths, &admin, &admin.doc).unwrap();
-            },
-            true,
-        ),
-        (
-            "a replaced history claim",
-            &|paths| replace(&paths.dir.join("commons.claim")),
-            false,
-        ),
-        (
-            "a replaced device claim",
-            &|paths| replace(&paths.dir.join("commons/device.claim")),
-            false,
-        ),
-        (
-            "a lost device key",
-            &|paths| std::fs::remove_file(paths.dir.join("commons/device.age")).unwrap(),
-            false,
-        ),
-        (
-            "a lost network pin",
-            &|paths| std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap(),
-            true,
-        ),
-        (
-            "a widened vault folder",
-            &|paths| mode(&paths.dir, 0o750),
-            true,
-        ),
-        (
-            "a widened commons folder",
-            &|paths| mode(&paths.dir.join("commons"), 0o750),
-            true,
-        ),
-        (
-            "a read-only commons folder",
-            &|paths| mode(&paths.dir.join("commons"), 0o500),
-            true,
-        ),
-        (
-            "a sticky vault folder",
-            &|paths| mode(&paths.dir, 0o1700),
-            true,
-        ),
-        (
-            "a creation claim open to others",
-            &|paths| mode(&paths.dir.join("creation.claim"), 0o640),
-            false,
-        ),
-        (
-            "a lost custody lock",
-            &|paths| std::fs::remove_file(paths.dir.join("commons.lock")).unwrap(),
-            true,
-        ),
-        (
-            "a lost device lock",
-            &|paths| std::fs::remove_file(paths.dir.join("commons-device.lock")).unwrap(),
-            true,
-        ),
-        (
-            "a custody lock open to others",
-            &|paths| mode(&paths.dir.join("commons.lock"), 0o644),
-            false,
-        ),
-        (
-            "a linked control folder",
-            &|paths| {
-                let control = paths.dir.join("commons/control");
-                let moved = paths.dir.join("commons/control-moved");
-                std::fs::rename(&control, &moved).unwrap();
-                symlink(&moved, &control).unwrap();
-            },
-            false,
-        ),
-        (
-            "a control journal that lost its history",
-            &|paths| {
-                let control = paths.dir.join("commons/control");
-                let moved = paths.dir.join("commons/control-moved");
-                std::fs::rename(&control, &moved).unwrap();
-                std::fs::create_dir(&control).unwrap();
-                mode(&control, 0o700);
-                let anchor = std::fs::read(moved.join("control.anchor")).unwrap();
-                fsx::write_new(&control.join("control.anchor"), &anchor, 0o600).unwrap();
-            },
-            false,
-        ),
-    ];
-    for (change, apply, repaired) in scenarios {
-        let (_home, paths, bootstrap) = established();
+    for (change, apply, repaired) in stood_changes() {
+        let (_home, paths, bootstrap) = stood_established();
         apply(&paths);
         assert!(bootstrap.stands().is_err(), "{change}: it no longer stands");
-        match open(&paths) {
+        match stood_open(&paths) {
             Ok(reopened) if repaired => {
                 reopened.stands().unwrap_or_else(|error| {
                     panic!("{change}: the open that repaired it gives one that stands: {error}")
@@ -1764,6 +1777,93 @@ fn a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged() {
             Err(error) => assert!(!repaired, "{change}: an open repairs it: {error}"),
         }
     }
+}
+
+/// A bootstrap stands through a table session's look and the control view its admission read
+/// ([`Bootstrap::stands_in`]) exactly where it stands on its own calls ([`Bootstrap::stands`]):
+/// with a writer holding the vault, and after each change
+/// [`a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged`] makes, `stands_in`
+/// through a look taken then, given the journal a session's admission reads then
+/// ([`Journal::read_existing`] of the bootstrap's control folder under its trust), refuses where
+/// `stands` does; where that journal does not read (a linked control folder, a journal that lost
+/// its history), no session is admitted, and `stands` refuses. Through a look that judged the
+/// custody already ([`Bootstrap::revalidate_custody_in`], as a session's admission does),
+/// `stands_in` observes the state lock no more (`client::lock_observations_of`: 0), where `stands`
+/// observes it once (CONTROL); and a journal read from another vault's control folder makes it
+/// refuse.
+///
+/// NEGATIVE CONTROLS (2026-11-11), each failing its step: `stands_in` judging its custody on its
+/// own calls (`revalidate_custody`), one observation of the lock more (`(1, 1)`);
+/// `beside_custody` judging the custody locks only where it is given no journal (for `stands`
+/// alone), `a lost custody lock`; `beside_custody` holding any journal it is given to the
+/// descriptor, `a journal of another vault`.
+#[test]
+fn a_bootstrap_stands_through_a_sessions_look_exactly_where_it_stands_on_its_own_calls() {
+    let read =
+        |bootstrap: &Bootstrap| Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust());
+    let agree = |change: &str, paths: &Paths, bootstrap: &Bootstrap| {
+        let own = bootstrap.stands();
+        match read(bootstrap) {
+            Ok(journal) => {
+                let through = bootstrap.stands_in(&client::VaultLook::new(paths), &journal);
+                assert_eq!(
+                    through.is_err(),
+                    own.is_err(),
+                    "{change}: through a look {through:?}, on its own calls {own:?}"
+                );
+            }
+            Err(error) => assert!(
+                own.is_err(),
+                "{change}: no session reads the journal ({error}), and it does not stand"
+            ),
+        }
+    };
+
+    let (_home, paths, bootstrap) = stood_established();
+    agree("established", &paths, &bootstrap);
+    let writing = std::fs::File::open(paths.dir.join(".lock")).unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's own writer holds the vault's state lock while the bootstrap is judged"
+    )]
+    writing.try_lock().unwrap();
+    agree("a writer holding the vault", &paths, &bootstrap);
+    drop(writing);
+    for (change, apply, _) in stood_changes() {
+        let (_home, paths, bootstrap) = stood_established();
+        apply(&paths);
+        agree(change, &paths, &bootstrap);
+    }
+
+    let (_home, paths, bootstrap) = stood_established();
+    let journal = read(&bootstrap).unwrap();
+    let look = client::VaultLook::new(&paths);
+    bootstrap.revalidate_custody_in(&look).unwrap();
+    let observed = || client::lock_observations_of(&paths);
+    let before = observed();
+    bootstrap.stands_in(&look, &journal).unwrap();
+    let through = observed() - before;
+    drop(look);
+    let before = observed();
+    bootstrap.stands().unwrap();
+    let own = observed() - before;
+    assert_eq!(
+        (through, own),
+        (0, 1),
+        "the state lock's observations: through a look that judged the custody, on its own calls"
+    );
+
+    let (_other_home, _other_paths, other) = stood_established();
+    let foreign = read(&other).unwrap();
+    let refused = bootstrap
+        .stands_in(&client::VaultLook::new(&paths), &foreign)
+        .expect_err("a journal of another vault");
+    assert!(
+        refused
+            .to_string()
+            .contains("Commons control no longer holds its vault's descriptor"),
+        "{refused}"
+    );
 }
 
 #[test]

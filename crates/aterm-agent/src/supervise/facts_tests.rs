@@ -89,15 +89,17 @@ fn call(pgid: u32, birth: Option<u64>, min: u64) -> BackgroundCall {
         pid: pgid + 8,
         pgid,
         birth,
-        exe: "aterm_gui-e0964a".to_string(),
+        episode: 1,
         task: Some("bplle5dxj".to_string()),
         quiet_ms: min * 60_000 + 59_999,
         wait: Some("mutex".to_string()),
+        held_by: None,
     }
 }
 
 fn reading(as_of_ms: i64, calls: Vec<BackgroundCall>) -> FactsReading {
     FactsReading {
+        waiting: 0,
         as_of_ms,
         no_progress: calls,
         held: None,
@@ -105,26 +107,27 @@ fn reading(as_of_ms: i64, calls: Vec<BackgroundCall>) -> FactsReading {
     }
 }
 
-/// THE KEY FOLDS THE GROUP AND THE LEADER'S BIRTH: the same pair is the same
-/// episode, another birth in the same group or another group born at the same
-/// instant is another, and a call whose birth was not read names none.
+/// THE KEY FOLDS THE GROUP, THE LEADER'S BIRTH AND THE ENGINE'S EPISODE: the same three are the
+/// same episode; another birth in the same group, another group born at the same instant, and
+/// another run of the same call are others; a call whose birth was not read names none.
 #[test]
-fn an_episode_key_folds_the_group_and_the_leaders_birth() {
-    let key = EpisodeKey::no_progress(27090, 7);
+fn an_episode_key_folds_the_group_the_leaders_birth_and_the_run() {
+    let key = EpisodeKey::no_progress(27090, 7, 1);
     assert_eq!(key.kind, FactKind::NoProgress);
     assert_eq!(EpisodeKey::of_call(&call(27090, Some(7), 31)), Some(key));
-    assert_ne!(EpisodeKey::no_progress(27090, 8), key);
-    assert_ne!(EpisodeKey::no_progress(27091, 7), key);
+    assert_ne!(EpisodeKey::no_progress(27090, 8, 1), key);
+    assert_ne!(EpisodeKey::no_progress(27091, 7, 1), key);
+    assert_ne!(EpisodeKey::no_progress(27090, 7, 2), key);
     assert_eq!(EpisodeKey::of_call(&call(27090, None, 31)), None);
 }
 
-/// ONCE PER EPISODE, FORGOTTEN ONLY ON A FRESH READING WITHOUT IT: the worst
-/// untold call is the fact, then the next; told, a call stays told through an
-/// absent reading and a stale one; a fresh reading that no longer names it
-/// forgets it, so the same call quiet again is told again. A call with no
-/// birth is never told, and a no-progress reading leaves a told hold alone.
+/// ONCE PER RUN OF NO PROGRESS (rule 3): the worst untold call is the fact, then the next; told,
+/// a call stays told through an absent reading, a stale one, and a fresh one that no longer names
+/// it (a reading that dips is the same run), and only a new run of it (the engine's next episode,
+/// opened by progress) is told again. NEGATIVE CONTROL: the old forgetting, a fresh reading
+/// without it, would tell the same run twice; the dip below says it does not.
 #[test]
-fn a_no_progress_episode_is_told_once_until_a_fresh_reading_no_longer_names_it() {
+fn a_no_progress_episode_is_told_once_a_run_whatever_the_readings_between() {
     let hung = call(27090, Some(1), 31);
     let newer = call(31000, Some(2), 20);
     let r = reading(T0, vec![newer.clone(), hung.clone()]);
@@ -150,25 +153,66 @@ fn a_no_progress_episode_is_told_once_until_a_fresh_reading_no_longer_names_it()
         );
     }
     let stale = T0 + NO_PROGRESS_FRESH_MS + 1;
-    for (seen, now) in [(None, T0), (Some(reading(T0, Vec::new())), stale)] {
+    for (seen, now) in [
+        (None, T0),
+        (Some(reading(T0, Vec::new())), stale),
+        (Some(reading(T0 + 1, vec![newer.clone()])), T0 + 1),
+    ] {
         s.observe(seen.as_ref(), now);
         assert!(s.is_told(first.key), "{seen:?} at {now} forgets nothing");
     }
     assert_eq!(
-        s.pending(Some(&r), stale),
+        s.pending(Some(&r), T0 + 1),
         None,
-        "a stale reading tells nothing"
+        "the same run, named again after a dip, is not told again"
     );
-    s.observe(Some(&reading(T0, vec![newer])), T0);
-    assert!(!s.is_told(first.key), "the call made progress: over");
-    assert!(s.is_told(second.key) && s.is_told(hold(9)), "the rest kept");
+    let again = BackgroundCall {
+        episode: 2,
+        ..hung.clone()
+    };
+    let rerun = reading(T0 + 2, vec![again.clone()]);
     assert_eq!(
-        s.pending(Some(&r), T0).map(|f| f.key),
-        Some(first.key),
-        "quiet again: told again"
+        s.pending(Some(&rerun), T0 + 2).map(|f| f.key),
+        EpisodeKey::of_call(&again),
+        "progress, then quiet again: a new run, told again"
+    );
+    s.observe(Some(&rerun), T0 + NO_PROGRESS_KEEP_MS);
+    assert!(
+        !s.is_told(first.key) && s.is_told(hold(9)),
+        "a told run is kept a day, and only its own kind is dropped"
     );
     let unborn = reading(T0, vec![call(40000, None, 90)]);
     assert_eq!(FactsState::default().pending(Some(&unborn), T0), None);
+}
+
+/// NOTHING IS TOLD WHILE ANOTHER CALL WILL WAKE THE AGENT (rule 4): a reading that names another
+/// live call of the agent's ([`FactsReading::waiting`]) tells no call at no progress, and the
+/// first such call is withheld once, journaled once; the same reading with none waiting tells it.
+/// NEGATIVE CONTROL: with `waiting` at 0 the call is the fact, so the gate is what holds it.
+#[test]
+fn a_call_at_no_progress_waits_while_another_call_of_the_agents_stands() {
+    let hung = call(27090, Some(1), 31);
+    let key = EpisodeKey::of_call(&hung).expect("born");
+    let waits = FactsReading {
+        waiting: 1,
+        ..reading(T0, vec![hung.clone()])
+    };
+    let mut s = FactsState::default();
+    assert_eq!(s.pending(Some(&waits), T0), None, "another call wakes it");
+    assert_eq!(
+        s.withheld(Some(&waits), T0),
+        Some(key),
+        "withheld, journaled"
+    );
+    assert_eq!(s.withheld(Some(&waits), T0 + 1), None, "journaled once");
+    assert!(!s.is_told(key), "withheld is not told");
+    let alone = reading(T0 + 2, vec![hung]);
+    assert_eq!(
+        s.pending(Some(&alone), T0 + 2).map(|f| f.key),
+        Some(key),
+        "CONTROL: nothing else wakes it, so it is told"
+    );
+    assert_eq!(s.withheld(Some(&alone), T0 + 2), None, "nothing withheld");
 }
 
 /// A RESTART TELLS A TOLD CALL NO MORE, AND ANOTHER CALL STILL: a seed holds
@@ -176,8 +220,8 @@ fn a_no_progress_episode_is_told_once_until_a_fresh_reading_no_longer_names_it()
 /// born since is told; an intent alone leaves its episode untold.
 #[test]
 fn a_seed_holds_a_told_call_by_its_own_key_alone() {
-    let told = EpisodeKey::no_progress(27090, 1);
-    let meant = EpisodeKey::no_progress(28000, 3);
+    let told = EpisodeKey::no_progress(27090, 1, 1);
+    let meant = EpisodeKey::no_progress(28000, 3, 1);
     let mut s = FactsState::default();
     s.seed(
         &[
@@ -189,7 +233,7 @@ fn a_seed_holds_a_told_call_by_its_own_key_alone() {
     );
     assert!(s.is_told(told));
     assert!(!s.is_told(meant), "an intent alone was never told");
-    let born_since = EpisodeKey::no_progress(27090, 2);
+    let born_since = EpisodeKey::no_progress(27090, 2, 1);
     assert!(!s.is_told(born_since), "a call born since");
     let r = reading(T0, vec![call(27090, Some(1), 40), call(27090, Some(2), 5)]);
     assert_eq!(s.pending(Some(&r), T0).map(|f| f.key), Some(born_since));
@@ -208,6 +252,7 @@ fn held_calls(pids: &[(u32, u64)]) -> Vec<HeldCall> {
 /// A reading of the held programs alone, as of `as_of_ms`.
 fn held(as_of_ms: i64, pids: &[(u32, u64)]) -> FactsReading {
     FactsReading {
+        waiting: 0,
         as_of_ms,
         no_progress: Vec::new(),
         held: Some(HeldReading {
@@ -345,6 +390,7 @@ fn a_held_part_older_than_the_gate_tells_nothing() {
         (FACT_FRESH_MS - 1_000, true),
     ] {
         let r = FactsReading {
+            waiting: 0,
             as_of_ms: T0 - NO_PROGRESS_FRESH_MS,
             no_progress: Vec::new(),
             held: Some(HeldReading {
@@ -653,6 +699,7 @@ fn a_fact_left_in_the_composer_is_not_the_fact_to_tell() {
 /// minutes old.
 fn leftover(as_of_ms: i64, count: u32) -> FactsReading {
     FactsReading {
+        waiting: 0,
         as_of_ms,
         no_progress: Vec::new(),
         held: None,
@@ -725,14 +772,15 @@ fn a_leftover_is_never_a_breaks_line() {
         s.pending(Some(&r), T0).map(|f| f.key.kind),
         Some(FactKind::Leftover)
     );
-    assert_eq!(s.pending_at_break(Some(&r), T0), None);
+    assert_eq!(s.pending_of(Some(&r), T0, FactKind::rides_breaks), None);
     let both = FactsReading {
         held: held(T0, &[(72955, 600_000)]).held,
         ..r
     };
     s.observe(Some(&both), T0);
     assert_eq!(
-        s.pending_at_break(Some(&both), T0).map(|f| f.key.kind),
+        s.pending_of(Some(&both), T0, FactKind::rides_breaks)
+            .map(|f| f.key.kind),
         Some(FactKind::ProgramCheck)
     );
 }

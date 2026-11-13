@@ -307,6 +307,17 @@ const TABLE: &[Verb] = &[
         run: crate::capacity::verb,
     },
     Verb {
+        name: "app-swap",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg app-swap <staged-app> <installed-app> — atomically place a verified \
+                macOS app; leave the prior app at the staging path for the installer to remove",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_app_swap,
+    },
+    Verb {
         name: "self-uninstall",
         tier: Tier::Occasional,
         usage: "aterm pkg self-uninstall [--dry-run] [--install-dir <dir>] [--bin-dir <dir>] \
@@ -417,6 +428,23 @@ const TABLE: &[Verb] = &[
         applies_machine: false,
         run: cmd_lease,
     },
+    #[cfg(unix)]
+    Verb {
+        name: "admit-executable",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg admit-executable --tool <name>=<build> --socket <absolute-path> — transfer signed executable custody to the original parent",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: |args| match crate::prerequisite::handoff::command(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("atpkg executable handoff refused: {why}");
+                ExitCode::from(1)
+            }
+        },
+    },
     Verb {
         name: "abrew",
         tier: Tier::Daily,
@@ -456,6 +484,16 @@ const fn verb_names() -> [&'static str; TABLE.len()] {
         i += 1;
     }
     out
+}
+
+fn cmd_app_swap(rest: &[String]) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    return crate::selfsetup::app_swap_verb(rest);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = rest;
+        usage_error("app-swap", Some("atomic app placement is macOS-only"))
+    }
 }
 
 fn cmd_self_uninstall(rest: &[String]) -> ExitCode {
@@ -1664,167 +1702,8 @@ pub fn stand_down_exit(
 }
 
 #[cfg(test)]
-mod stand_down_after_wait_tests {
-    use super::{attempted_pass_index_build, pass_ended_since_queued, stood_down_after_wait};
-    use aterm_update_core::pkg_check::{PassOutcome, Stamps};
-
-    #[test]
-    fn a_waited_child_stands_down_behind_any_full_pass_that_ended_since_it_queued() {
-        let now = 1_700_000_020;
-        let ended = |outcome: Option<PassOutcome>, at: i64| Stamps {
-            last_success: (outcome == Some(PassOutcome::Ok)).then_some(at),
-            last_attempt: Some(at),
-            last_outcome: outcome,
-            ..Stamps::default()
-        };
-        for outcome in [PassOutcome::Ok, PassOutcome::Failed, PassOutcome::Offline] {
-            assert_eq!(
-                pass_ended_since_queued(
-                    true,
-                    Some(4),
-                    5,
-                    &ended(Some(outcome), now - 8),
-                    now,
-                    None
-                ),
-                Some((outcome, 8)),
-                "{outcome:?}: the holder ended 8 s ago: stand down"
-            );
-        }
-        assert_eq!(
-            pass_ended_since_queued(
-                true,
-                Some(4),
-                5,
-                &ended(Some(PassOutcome::Ok), now),
-                now,
-                None
-            ),
-            Some((PassOutcome::Ok, 0)),
-            "a same-second end is a moved count: stand down"
-        );
-        let failed = ended(Some(PassOutcome::Failed), now - 8);
-        assert_eq!(
-            pass_ended_since_queued(true, Some(5), 5, &failed, now, None),
-            None,
-            "no end since this child was queued (the record is the previous pass): run"
-        );
-        assert_eq!(
-            pass_ended_since_queued(false, Some(4), 5, &failed, now, None),
-            None,
-            "a lock taken at the first try waited for nobody: run"
-        );
-        assert_eq!(
-            pass_ended_since_queued(true, None, 5, &failed, now, None),
-            None,
-            "not a queued child (no count read at its start): run"
-        );
-        assert_eq!(
-            pass_ended_since_queued(true, Some(0), 0, &failed, now, None),
-            None,
-            "a holder that counted nothing (an older atpkg): run"
-        );
-        assert_eq!(
-            pass_ended_since_queued(
-                true,
-                Some(4),
-                5,
-                &ended(Some(PassOutcome::Ok), now + 30),
-                now,
-                None
-            ),
-            Some((PassOutcome::Ok, 0)),
-            "a stamp ahead of the clock reads as just now"
-        );
-        assert!(stood_down_after_wait(PassOutcome::Ok, 8, "").contains("up to date"));
-        assert!(stood_down_after_wait(PassOutcome::Offline, 8, "").contains("offline"));
-        let line =
-            stood_down_after_wait(PassOutcome::Failed, 8, "update failed: index unreachable");
-        assert!(
-            line.contains("(update failed: index unreachable)"),
-            "{line}"
-        );
-        assert!(
-            stood_down_after_wait(PassOutcome::Failed, 8, " ").contains("(it recorded no reason)")
-        );
-    }
-
-    #[test]
-    fn queued_new_index_runs_after_older_pass_but_same_failed_target_stands_down() {
-        use aterm_update_core::pkg_check::{PassOutcome, Stamps};
-        let model = aterm_models_atpkg::atpkg_published_spacing_model();
-        let mut modeled = model.init_state();
-        for action in ["EndOldOk", "Publish45", "DecideQueued"] {
-            assert!(model.fire(action, &mut modeled), "{action}: {modeled:?}");
-        }
-        let first = 1_700_000_000;
-        let ended = first + 12;
-        let record = |outcome, target: Option<u64>| Stamps {
-            last_success: (outcome == PassOutcome::Ok).then_some(ended),
-            last_attempt: Some(ended),
-            last_outcome: Some(outcome),
-            last_pass_target: target.map(|build| (ended, build)),
-            ..Stamps::default()
-        };
-        let actual = pass_ended_since_queued(
-            true,
-            Some(0),
-            1,
-            &record(PassOutcome::Ok, Some(44)),
-            ended + 1,
-            Some(45),
-        );
-        assert_eq!(actual.is_none(), modeled["queued"] == 1);
-        assert_eq!(actual, None, "queued 45 runs after holder checked 44");
-        for outcome in [PassOutcome::Ok, PassOutcome::Failed, PassOutcome::Offline] {
-            assert_eq!(
-                pass_ended_since_queued(
-                    true,
-                    Some(0),
-                    1,
-                    &record(outcome, Some(45)),
-                    ended + 1,
-                    Some(45)
-                ),
-                Some((outcome, 1)),
-                "the holder already attempted 45: {outcome:?}"
-            );
-        }
-        assert_eq!(
-            pass_ended_since_queued(
-                true,
-                Some(0),
-                1,
-                &record(PassOutcome::Ok, None),
-                ended + 1,
-                Some(45)
-            ),
-            Some((PassOutcome::Ok, 1)),
-            "an old record without a target fails closed"
-        );
-        assert_eq!(
-            pass_ended_since_queued(
-                true,
-                Some(0),
-                1,
-                &record(PassOutcome::Failed, Some(44)),
-                ended + 1,
-                Some(45)
-            ),
-            None,
-            "a newer 45 can run after an older 44 failed"
-        );
-    }
-
-    #[test]
-    fn pass_target_needs_a_real_index_attempt_and_never_downgrades_the_requested_build() {
-        assert_eq!(attempted_pass_index_build(45, 0, false), 0);
-        assert_eq!(attempted_pass_index_build(45, 44, true), 45);
-        assert_eq!(attempted_pass_index_build(44, 45, true), 45);
-        assert_eq!(attempted_pass_index_build(0, 45, true), 45);
-        assert_eq!(attempted_pass_index_build(45, 0, true), 45);
-    }
-}
+#[path = "cli_stand_down_after_wait_tests.rs"]
+mod stand_down_after_wait_tests;
 
 /// The environment variable a spawner sets beside `--wait-lock` to its own pid, so the waiter's "my window is gone" compares against a fact.
 pub const SPAWNER_PID_ENV: &str = "ATPKG_SPAWNER_PID";
@@ -3940,7 +3819,8 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
                 let (name, build) = name
                     .split_once('=')
                     .map_or((name.as_str(), None), |(name, build)| (name, Some(build)));
-                let tool = crate::prerequisite::Prerequisite::named(name).ok_or_else(|| format!("unsupported prerequisite {name:?}; use gitleaks, python3.14, openssl-signing, lake or atpkg-keys"))?;
+                let tool = crate::prerequisite::Prerequisite::named(name)
+                    .ok_or_else(|| format!("unsupported signed prerequisite {name:?}"))?;
                 if let Some(build) = build {
                     let build = build
                         .parse::<u64>()
@@ -4431,6 +4311,7 @@ fn repair_rows(
             class: Some(aterm_converge::Class::Relay),
             explain: None,
             stood_aside: None,
+            waits_on: None,
             essential: false,
             elapsed_ms: None,
         }]
@@ -4628,6 +4509,7 @@ fn repair_store_reconciling(
             class: Some(aterm_converge::Class::Relay),
             explain: None,
             stood_aside: None,
+            waits_on: None,
             essential: false,
             elapsed_ms: None,
         });
@@ -4719,13 +4601,14 @@ fn list_lines(layout: &crate::store::Layout, human: bool) -> Result<Vec<String>,
         });
     }
     let live = crate::active_builds(layout);
+    let pins = crate::pin::pinned_set(layout).map_err(|error| error.to_string())?;
     let mut pinned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for program in installed
         .iter()
         .map(|(program, _)| program)
         .chain(linked.keys())
     {
-        if crate::pin::is_pinned(layout, program) {
+        if pins.contains(program) {
             pinned.insert(program.clone());
         }
     }
@@ -5896,8 +5779,8 @@ fn removed_programs(
 /// The default set on `triple` before `[packages].exclude` narrows it, the one list every
 /// surface completes and judges (`install --default-set`, the update pass that follows
 /// `seed`, `pkg doctor`'s toolset row): every program the index lists, an ALab harness
-/// included ([`crate::manifest::Index::installable`]; owner ruling 2026-10-27, "everything
-/// must be ON BY DEFAULT in atpkg!!!"), and its vendor half ([`vendor_set_here`]).
+/// included ([`crate::manifest::Index::installable`];
+/// docs/OWNER_RULINGS.md, 2026-10-27), and its vendor half ([`vendor_set_here`]).
 pub(crate) fn default_set_here(
     index: &crate::manifest::Index,
     triple: &str,
@@ -6585,51 +6468,8 @@ pub fn seed_unusable_is_informational(body: &str) -> bool {
 }
 
 #[cfg(test)]
-mod seed_unusable_tests {
-    use super::{Narrowing, seed_unusable_is_informational};
-
-    #[test]
-    fn an_unserved_architecture_and_a_removal_are_facts_an_exclusion_is_not() {
-        let unserved =
-            super::unserved_sentence("x86_64-apple-darwin", &["aarch64-apple-darwin".into()]);
-        assert_eq!(
-            unserved,
-            "ALab publishes no build for this machine's architecture (x86_64-apple-darwin) \
-             — it builds for aarch64-apple-darwin; nothing installs here until one is published"
-        );
-        assert!(seed_unusable_is_informational(&unserved), "{unserved}");
-        let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let (removed, _) = Narrowing {
-            excluded: Vec::new(),
-            removed: names(&["ay", "trust"]),
-        }
-        .verdict("aarch64-apple-darwin");
-        assert_eq!(
-            removed,
-            "every ALab program available here was removed on this machine (ay, trust) — \
-             nothing to install. `aterm pkg install <program>` brings one back"
-        );
-        assert!(seed_unusable_is_informational(&removed), "{removed}");
-        let (excluded, _) = Narrowing {
-            excluded: names(&["ay", "clean"]),
-            removed: Vec::new(),
-        }
-        .verdict("aarch64-apple-darwin");
-        assert_eq!(
-            excluded,
-            "[packages].exclude narrows the toolset to nothing installable on this machine \
-             (aarch64-apple-darwin; excluded: ay, clean) — shorten it to receive the toolset"
-        );
-        assert!(!seed_unusable_is_informational(&excluded), "{excluded}");
-        let (both, _) = Narrowing {
-            excluded: names(&["ay"]),
-            removed: names(&["trust"]),
-        }
-        .verdict("aarch64-apple-darwin");
-        assert!(both.contains("excluded: ay; uninstalled: trust"), "{both}");
-        assert!(!seed_unusable_is_informational(&both), "{both}");
-    }
-}
+#[path = "cli_seed_unusable_tests.rs"]
+mod seed_unusable_tests;
 
 /// The prefix of every `atpkg machine` / `atpkg machine apply` verdict sentence, which a window worker keys on to quote the verdict.
 pub const MACHINE_VERDICT_PREFIX: &str = "atpkg machine: ";
@@ -8835,6 +8675,13 @@ fn cmd_rollback_vendor(
     spec: &'static crate::vendor_direct::VendorSpec,
 ) -> ExitCode {
     let program = spec.program;
+    let pinned = match crate::pin::is_pinned(layout, program) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cached = cached_index(layout);
     let policy = crate::vendor_direct::policy::Policy::current(layout, cached.as_ref());
     match crate::vendor_direct::lane::roll_back_by_hand(layout, &policy, spec) {
@@ -8870,7 +8717,7 @@ fn cmd_rollback_vendor(
                     spec,
                     &moved.from,
                     &moved.to,
-                    crate::pin::is_pinned(layout, program),
+                    pinned,
                     alab_channel_of(layout, program, build)
                 )
             );
@@ -9025,7 +8872,7 @@ fn pin_peers_of(
     let group = index
         .program(program)
         .and_then(|p| p.coherence_group.clone());
-    let pins = crate::pin::pinned_set(layout);
+    let pins = crate::pin::pinned_set(layout).ok()?;
     let others = crate::flow::pin_gate_members(
         layout,
         &index,
@@ -9368,7 +9215,7 @@ fn roll_forward_interrupted_activations(
             || !crate::store::build_is_complete(&build_dir)
             || crate::linkmode::is_linked(layout, &program)
             || crate::flow::tombstoned_in_place(layout, [program.as_str()])
-            || crate::pin::is_pinned(layout, &program)
+            || crate::pin::holds_update(layout, &program)
         {
             continue;
         }
@@ -12651,10 +12498,21 @@ fn cmd_update_one(program: &String) -> ExitCode {
             ExitCode::from(1)
         };
     }
+    let pinned = if decision == crate::ApplyDecision::Install {
+        match crate::pin::is_pinned(&layout, program) {
+            Ok(pinned) => pinned,
+            Err(error) => {
+                eprintln!("atpkg: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        false
+    };
     if decision == crate::ApplyDecision::Install
         && plan.current_build_ok
         && let Some(c) = cur
-        && crate::pin::is_pinned(&layout, program)
+        && pinned
     {
         println!(
             "atpkg: {program} not updated — you pinned it at build {c} (`aterm pkg unpin \
@@ -12662,10 +12520,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    if decision == crate::ApplyDecision::Install
-        && cur.is_some()
-        && crate::pin::is_pinned(&layout, program)
-    {
+    if decision == crate::ApplyDecision::Install && cur.is_some() && pinned {
         eprintln!(
             "atpkg: {program} is pinned, but ALab withdrew its current build — updating off \
              it anyway"
@@ -12772,7 +12627,13 @@ fn update_vendor(
         now,
         download_turn: None,
     };
-    let held = crate::pin::is_pinned(layout, program);
+    let held = match crate::pin::is_pinned(layout, program) {
+        Ok(held) => held,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return false;
+        }
+    };
     let outcome = crate::vendor_direct::lane::install_one(&lane, spec, held);
     let mut pass = VendorPass::default();
     report_vendor(layout, &outcome, &mut pass, person, now);
@@ -13008,6 +12869,20 @@ fn vendor_plan_reading(
             );
         }
     };
+    let pins = match crate::pin::pinned_set(layout) {
+        Ok(pins) => pins,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return (
+                VendorPass {
+                    failures: 1,
+                    failed: vec![("*pins*".into(), error.to_string())],
+                    ..Default::default()
+                },
+                vendors,
+            );
+        }
+    };
     let runs: Vec<(&'static crate::vendor_direct::VendorSpec, bool, bool)> =
         crate::vendor_direct::VENDORS
             .iter()
@@ -13022,7 +12897,7 @@ fn vendor_plan_reading(
                     && (installed.contains_key(program)
                         || crate::flow::tombstoned_in_place(layout, [program]))
                 {
-                    Some((spec, true, crate::pin::is_pinned(layout, program)))
+                    Some((spec, true, pins.contains(program)))
                 } else if !installed.contains_key(program)
                     && lanes.complete_the_set
                     && vendor_wanted(cfg, &removed, program)

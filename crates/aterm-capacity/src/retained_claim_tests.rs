@@ -16,6 +16,7 @@ use crate::{
 
 const OWNER_ACTOR: &str = "ATERM_RETAINED_MEMORY_OWNER_ACTOR";
 const OWNER_PENDING: &str = "ATERM_RETAINED_MEMORY_PENDING_ACTOR";
+const OWNER_RESERVATION: &str = "ATERM_RETAINED_RESERVATION_ACTOR";
 
 enum ActorGuard {
     Ready(Box<RetainedClaim>),
@@ -42,14 +43,23 @@ fn retained_memory_owner_actor() {
         return;
     };
     let ledger = Ledger::at(root.join("ledger"));
-    let ordinary = claim(&ledger, need());
+    let reservation = std::env::var_os(OWNER_RESERVATION).is_some();
+    let ordinary = claim(&ledger, if reservation { need().cores(2) } else { need() });
+    let transfer = |original: Claim| {
+        let result = if reservation {
+            original.into_retained_reservation()
+        } else {
+            original.into_retained_guard()
+        };
+        result.map_err(Box::new)
+    };
     let original = if std::env::var_os(OWNER_PENDING).is_some() {
         crate::ledger::fail_detach_after_bytes(1);
-        let (ordinary, _) = ordinary.into_retained_guard().unwrap_err();
+        let (ordinary, _) = *transfer(ordinary).unwrap_err();
         let prefix = std::fs::read(ordinary.path()).unwrap();
         assert!(prefix.ends_with(b"@"));
         crate::ledger::fail_detach_after_bytes(0);
-        let (ordinary, _) = ordinary.into_retained_guard().unwrap_err();
+        let (ordinary, _) = *transfer(ordinary).unwrap_err();
         assert_eq!(
             std::fs::read(ordinary.path()).unwrap(),
             prefix,
@@ -58,7 +68,7 @@ fn retained_memory_owner_actor() {
         assert!(Ledger::at(ledger.dir()).list().is_err());
         ActorGuard::Pending(Box::new(ordinary))
     } else {
-        ActorGuard::Ready(Box::new(ordinary.into_retained_guard().unwrap()))
+        ActorGuard::Ready(Box::new(transfer(ordinary).unwrap()))
     };
     let mut connection =
         aterm_uds::kept_out(|| aterm_uds::CtlStream::connect(root.join("handoff.sock"))).unwrap();
@@ -99,15 +109,25 @@ impl Drop for OwnerChild {
 
 #[test]
 fn actual_owner_sigkill_retains_original_memory_until_receiver_final_close() {
-    owner_crash(false);
+    owner_crash(false, false);
 }
 
 #[test]
 fn actual_owner_crash_after_failed_retry_keeps_intent_error_closed() {
-    owner_crash(true);
+    owner_crash(true, false);
 }
 
-fn owner_crash(pending: bool) {
+#[test]
+fn actual_owner_sigkill_retains_memory_and_admitted_cores_until_final_close() {
+    owner_crash(false, true);
+}
+
+#[test]
+fn actual_owner_crash_keeps_partial_reservation_protocol_error_closed() {
+    owner_crash(true, true);
+}
+
+fn owner_crash(pending: bool, reservation: bool) {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("retained-mem-")
         .tempdir_in("/tmp")
@@ -119,6 +139,9 @@ fn owner_crash(pending: bool) {
     let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     if pending {
         command.env(OWNER_PENDING, "1");
+    }
+    if reservation {
+        command.env(OWNER_RESERVATION, "1");
     }
     let mut owner = OwnerChild(
         command
@@ -238,6 +261,19 @@ fn owner_crash(pending: bool) {
     } else {
         assert_eq!(ledger.list().unwrap()[0].need.mem, 2 * crate::floor::GIB);
         blocked(&ledger, &machine);
+        if reservation {
+            assert_eq!(ledger.list().unwrap()[0].held.unwrap().cores, 2);
+            let room = Fixed::new(Reading::of_gib(8, 6, 8));
+            match Waiter::enter(&ledger, &room, Need::new("CPU contender").cores(8))
+                .unwrap()
+                .poll(&room)
+            {
+                Polled::Admitted(claim) => {
+                    assert!(claim.cores() <= 6, "retained cores were granted twice")
+                }
+                other => panic!("remaining CPU share should be usable: {other:?}"),
+            }
+        }
     }
     drop(pinned);
     until_within(
@@ -261,6 +297,16 @@ fn owner_crash(pending: bool) {
         other => panic!("actual final close restores the original memory budget: {other:?}"),
     }
     assert!(!path.exists());
+    if reservation {
+        let room = Fixed::new(Reading::of_gib(8, 6, 8));
+        match Waiter::enter(&ledger, &room, Need::new("CPU after final close").cores(8))
+            .unwrap()
+            .poll(&room)
+        {
+            Polled::Admitted(claim) => assert_eq!(claim.cores(), 8),
+            other => panic!("actual final close must restore CPU budget: {other:?}"),
+        }
+    }
 }
 
 fn claim(ledger: &Ledger, need: Need) -> Claim {
@@ -564,4 +610,256 @@ fn actual_inherited_memory_adopts_exact_original_record_without_claim_writer() {
         "adopted original memory guard's final close",
         || ledger.list().unwrap().is_empty().then_some(()),
     );
+}
+
+const INHERITED_RESERVATION: &str = "ATERM_INHERITED_RESERVATION_RECEIVER";
+
+#[test]
+fn inherited_reservation_receiver_actor() {
+    let Some(root) = std::env::var_os(INHERITED_RESERVATION) else {
+        return;
+    };
+    let mut connection = aterm_uds::kept_out(|| {
+        aterm_uds::CtlStream::connect(std::path::Path::new(&root).join("handoff.sock"))
+    })
+    .unwrap();
+    connection.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+    connection.set_write_timeout(Some(MUST_HAPPEN)).unwrap();
+    connection.write_all(b"R").unwrap(); // Positive execution proof, not an argv observation.
+    let mut finish = [0];
+    connection.read_exact(&mut finish).unwrap();
+    assert_eq!(&finish, b"F");
+}
+
+#[test]
+fn actual_inherited_reservation_keeps_peak_and_cores_until_receiver_exit() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("retained-res-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let ledger = Ledger::at(root.join("ledger"));
+    let guard = claim(&ledger, need().cores(2))
+        .into_retained_reservation()
+        .unwrap();
+    let original = guard.record().clone();
+    assert_eq!(original.held.unwrap().cores, 2);
+    let listener =
+        aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(root.join("handoff.sock")))
+            .unwrap();
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .inherit_guards(vec![guard.try_clone_fd().unwrap()])
+        .unwrap();
+    let mut receiver = OwnerChild(
+        command
+            .args([
+                "--exact",
+                "retained_claim_tests::inherited_reservation_receiver_actor",
+                "--test-threads=1",
+            ])
+            .env(INHERITED_RESERVATION, &root)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    drop(command); // Only the original owner and actual child retain this description.
+    let (mut connection, _) =
+        until_within(
+            MUST_HAPPEN,
+            "inherited reservation receiver",
+            || match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok(value) => Some(value),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(receiver.0.try_wait().unwrap().is_none());
+                    None
+                }
+                Err(error) => panic!("receiver socket: {error}"),
+            },
+        );
+    connection.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+    connection.set_write_timeout(Some(MUST_HAPPEN)).unwrap();
+    let mut ready = [0];
+    connection.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"R");
+    drop(guard);
+    assert_eq!(ledger.list().unwrap()[0].need, original.need);
+    let machine = Fixed::new(Reading::of_gib(8, 3, 8));
+    machine.set_procs(Some(Procs::of(vec![Proc {
+        pid: original.pid,
+        ppid: 1,
+        charged: 2 * crate::floor::GIB,
+        footprint: 2 * crate::floor::GIB,
+        ..Proc::default()
+    }])));
+    blocked(&ledger, &machine);
+    let room = Fixed::new(Reading::of_gib(8, 6, 8));
+    match Waiter::enter(
+        &ledger,
+        &room,
+        Need::new("CPU while receiver lives").cores(8),
+    )
+    .unwrap()
+    .poll(&room)
+    {
+        Polled::Admitted(claim) => assert!(claim.cores() <= 6),
+        other => panic!("remaining CPU share: {other:?}"),
+    }
+    connection.write_all(b"F").unwrap();
+    let status = until_within(MUST_HAPPEN, "receiver actual final exit", || {
+        receiver.0.try_wait().unwrap()
+    });
+    assert!(status.success());
+    until_within(
+        MUST_HAPPEN,
+        "inherited reservation actual final close",
+        || ledger.list().unwrap().is_empty().then_some(()),
+    );
+    match Waiter::enter(
+        &ledger,
+        &room,
+        Need::new("CPU after receiver exit").cores(8),
+    )
+    .unwrap()
+    .poll(&room)
+    {
+        Polled::Admitted(claim) => assert_eq!(claim.cores(), 8),
+        other => panic!("restored CPU share: {other:?}"),
+    }
+}
+
+#[test]
+fn partial_transfer_cannot_switch_memory_and_reservation_protocols() {
+    for reservation in [false, true] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path());
+        let original = claim(&ledger, need());
+        crate::ledger::fail_detach_after_bytes(1);
+        let (original, _) = if reservation {
+            original.into_retained_reservation()
+        } else {
+            original.into_retained_guard()
+        }
+        .unwrap_err();
+        let path = original.path().to_owned();
+        let prefix = std::fs::read(&path).unwrap();
+        let (original, error) = if reservation {
+            original.into_retained_guard()
+        } else {
+            original.into_retained_reservation()
+        }
+        .unwrap_err();
+        assert!(error.to_string().contains("protocol cannot change"));
+        assert_eq!(std::fs::read(&path).unwrap(), prefix);
+        assert!(ledger.list().is_err());
+        let ready = if reservation {
+            original.into_retained_reservation()
+        } else {
+            original.into_retained_guard()
+        }
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!legacy_head_parses(&bytes));
+        assert!(bytes.ends_with(if reservation {
+            crate::ledger::DETACHED_RESERVATION
+        } else {
+            crate::ledger::DETACHED_MEMORY
+        }));
+        assert_eq!(ledger.list().unwrap()[0].accounting, Accounting::Detached);
+        drop(ready);
+    }
+}
+
+#[test]
+fn reservation_protocol_unknown_version_or_memory_only_relabel_stays_error_closed() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(scratch.path());
+    let guard = claim(&ledger, need().cores(2))
+        .into_retained_reservation()
+        .unwrap();
+    let path = guard.path();
+    let bytes = std::fs::read(path).unwrap();
+    assert!(bytes.ends_with(crate::ledger::DETACHED_RESERVATION));
+    assert!(!bytes.ends_with(crate::ledger::DETACHED_MEMORY));
+    assert!(!legacy_head_parses(&bytes));
+    for marker in [
+        b"@aterm-detached-reservation/2\n".as_slice(),
+        crate::ledger::DETACHED_MEMORY,
+    ] {
+        let body = &bytes[..bytes.len() - crate::ledger::DETACHED_RESERVATION.len()];
+        std::fs::write(path, [body, marker].concat()).unwrap();
+        assert!(
+            ledger.list().is_err(),
+            "an unknown or wrong-budget protocol cannot become Holder or empty capacity"
+        );
+    }
+    std::fs::write(path, &bytes).unwrap();
+    assert_eq!(ledger.list().unwrap()[0].held.unwrap().cores, 2);
+}
+
+#[test]
+fn phased_claims_cannot_detach_before_or_after_actual_step_down() {
+    for reservation in [false, true] {
+        for stepped in [false, true] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let ledger = Ledger::at(scratch.path());
+            let mut original = claim(&ledger, need().run_mem(1 << 30));
+            if stepped {
+                original.step_down().unwrap();
+            }
+            let path = original.path().to_owned();
+            let bytes = std::fs::read(&path).unwrap();
+            let (original, error) = if reservation {
+                original.into_retained_reservation()
+            } else {
+                original.into_retained_guard()
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(original.path(), path);
+            drop(original);
+        }
+    }
+}
+
+#[test]
+fn unsupported_reservation_grants_preserve_original_and_cohort_custody() {
+    for need in [
+        Need::new("no memory").cores(2),
+        need().covers(),
+        need().quiet(100.0),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path());
+        let original = claim(&ledger, need);
+        let path = original.path().to_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (original, error) = original.into_retained_reservation().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(original.path(), path);
+        drop(original);
+    }
+    let fixture = crate::ledger::CohortFixture::new();
+    let mut original = fixture.claim();
+    let attempt = original.arm_cohort().unwrap();
+    let bytes = std::fs::read(original.path()).unwrap();
+    let (mut original, error) = original.into_retained_reservation().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(std::fs::read(original.path()).unwrap(), bytes);
+    assert!(
+        File::from(original.cohort_writer_descriptor().unwrap())
+            .metadata()
+            .unwrap()
+            .is_file()
+    );
+    original.cancel_cohort(attempt.cancel().unwrap()).unwrap();
+    drop(original);
 }

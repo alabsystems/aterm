@@ -412,7 +412,7 @@ fn every_ctl_spawn_answer_marks_its_session_and_a_person_s_tab_is_not_marked() {
     let (sid, wire) = sessions.next().unwrap();
     let (reply, answered) = std::sync::mpsc::channel();
     TabSpawnThen::Reply {
-        reply,
+        reply: reply.into(),
         raise: false,
     }
     .answer(&mut app, crate::WindowId(0), Ok(sid.clone()));
@@ -431,7 +431,7 @@ fn every_ctl_spawn_answer_marks_its_session_and_a_person_s_tab_is_not_marked() {
         Ok(crate::control::control_media::Spawned::plain_for_test(
             sid.clone(),
         )),
-        &reply,
+        reply.into(),
     );
     assert_eq!(answered.recv().unwrap(), Ok(sid));
     assert!(marked(&worker), "a booked spawn (a worker's)");
@@ -440,7 +440,7 @@ fn every_ctl_spawn_answer_marks_its_session_and_a_person_s_tab_is_not_marked() {
     let (reply, answered) = std::sync::mpsc::channel();
     assert!(crate::tab_spawn::answer_ctl_spawn(
         &app,
-        &reply,
+        reply.into(),
         Ok(sid.clone())
     ));
     assert_eq!(answered.recv().unwrap(), Ok(sid));
@@ -456,7 +456,7 @@ fn every_ctl_spawn_answer_marks_its_session_and_a_person_s_tab_is_not_marked() {
     let (sid, refused) = sessions.next().unwrap();
     let (reply, answered) = std::sync::mpsc::channel();
     TabSpawnThen::Reply {
-        reply,
+        reply: reply.into(),
         raise: false,
     }
     .answer(

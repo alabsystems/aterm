@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual renewal or a native enrollment, which only
+// Unix runs (`accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
 use std::cell::RefCell;
 
@@ -198,6 +208,7 @@ impl Bed {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok] {
@@ -389,6 +400,7 @@ fn scheduling_notes_are_emitted_once_even_when_staging_is_checked() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn native_enrollment_runs_existing_provider_once_and_rejects_retargeted_operation() {
     let bed = Bed::new(Cli::Codex);
@@ -450,6 +462,7 @@ fn native_enrollment_runs_existing_provider_once_and_rejects_retargeted_operatio
     assert_eq!(host.emails.borrow().len(), 1);
 }
 
+#[cfg(unix)]
 struct SuccessfulEnrollmentHost {
     calls: std::cell::Cell<usize>,
     now: i64,
@@ -823,6 +836,7 @@ fn a_failed_first_native_seal_cannot_claim_a_recoverable_response() {
     );
 }
 
+#[cfg(unix)]
 impl AccountsHost for SuccessfulEnrollmentHost {
     fn stdin_is_terminal(&self) -> bool {
         false
@@ -869,6 +883,7 @@ impl AccountsHost for SuccessfulEnrollmentHost {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn native_enrollment_publishes_only_verified_staging_and_returns_committed_generation() {
     let bed = Bed::new(Cli::Codex);
@@ -907,6 +922,7 @@ fn native_enrollment_publishes_only_verified_staging_and_returns_committed_gener
     assert_eq!(host.calls.get(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn native_enrollment_keeps_completed_held_artifact_running_without_a_second_provider_attempt() {
     let bed = Bed::new(Cli::Codex);
@@ -1118,6 +1134,7 @@ fn enrollment_proven_before_provider_refusal_does_not_keep_uncertain_custody() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
     struct Typed {

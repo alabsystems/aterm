@@ -1089,7 +1089,7 @@ the same `status_line` (its own `status_command_from_args` is gone, and its test
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 fixture-status-line	contract	fleet_fixture::{status_line,status_payload,run_status_line,status_row,screen}	status_line(a) = the first `--settings <json>` or `--settings=<json>` before a literal `--` whose JSON has statusLine.command c: StatusLine{command: c, every: statusLine.refreshInterval as whole seconds where > 0, else None}; None where no such value. status_payload(s, cwd, l) = a JSON object with session_id (s or null), cwd, model, version and cost.total_api_duration_ms 0, plus rate_limits = J::parse(l) exactly where that is an object. run_status_line(c, p) runs `/bin/sh -c c` (aterm_uds::spawnfd::command) with p on its stdin and CLAUDE_PID = this pid, and is the first line of its stdout with control characters dropped, None where that line is absent or blank. status_row(t, cols) = "  " ++ t where chars(t) ≤ cols − 4, else "  " ++ the first cols − 5 chars of t ++ "…". screen in Idle or Busy with a status row r puts status_row(r, cols) directly under the composer's bottom rule and the mode row under it; with none, the mode row directly under the rule. Against aterm-phase's claude-2.1.318-tap-row-{week,week-100col,week-70col,week-30col,no-figure,silent-command} fixtures the row under the bottom rule equals the measured one at the measured width.	fleet_fixture.rs::{the_status_row_is_where_claude_2_1_318_draws_it,the_settings_name_the_status_command_and_its_refresh,a_run_hands_the_payload_and_shows_the_first_line}	JSON parsing, a child process with piped stdio, char counting	1,8
-outlook-glass-seeds	contract	outlook_captures::{plan,Plan::rate_limits,seed}	plan(c).tapped ⇔ c ∈ {I, J, K}, under autopilot "cruise" (else "off"); the own login is the first roster row (`me` for A–H, `main` for I–K), active in the store, the only row naming an address. seed writes <home>/.claude/fleet-fixture-rate-limits.json exactly where plan.tapped and the own login has a seen window: each window as {used_percentage: pct_x10/10, resets_at: now + reset}; so the tap's reading of status_payload over it holds the store's own week (I 63%, J 75%), and K's payload has no rate_limits (the tap prints NO_WEEK).	outlook_captures.rs::{the_seeds_are_synthetic_and_stay_in_their_world,the_tapped_scenes_hand_the_tap_the_stores_week}	JSON building, the accounts store's writer	1,8
+outlook-glass-seeds	contract	outlook_captures::{plan,Plan::rate_limits,seed}	plan(c).tapped ⇔ c ∈ {I, J, K}, under autopilot "cruise" (else "off"); the own login is the first roster row (`me` for A–H and M, `main` for I–K), the default home's, active in the store and, outside L and M, the only row naming an address. plan(L).outside: its first row, the default home's and the store's active one, is `alt1`, and no row names the profile's address, so the footer shows the profile's login by its own address and the card is of an account outside the pool. plan(c).home and plan(c).vault are held ⇔ c ∈ {L, M}: there every row names a synthetic address, seed writes <home>/.secrets/ai-pool.toml giving the profile's account its home (`m15` in L, this Mac's `m20` in M) and each other row this Mac, and the store's swarm_label is `m20`. A series reading from before the own week began carries the reset of the week it was made in. seed writes <home>/.claude/fleet-fixture-rate-limits.json exactly where plan.tapped and the own login has a seen window: each window as {used_percentage: pct_x10/10, resets_at: now + reset}; so the tap's reading of status_payload over it holds the store's own week (I 63%, J 75%), and K's payload has no rate_limits (the tap prints NO_WEEK).	outlook_captures.rs::{the_seeds_are_synthetic_and_stay_in_their_world,the_tapped_scenes_hand_the_tap_the_stores_week,scene_ms_series_crosses_a_weeks_reset}	JSON building, the accounts store's writer	1,8
 ```
 
 ```tsv
@@ -1099,29 +1099,35 @@ src/fleet_fixture.rs	the_settings_name_the_status_command_and_its_refresh	fixtur
 src/fleet_fixture.rs	a_run_hands_the_payload_and_shows_the_first_line	fixture-status-line	
 src/outlook_captures.rs	the_seeds_are_synthetic_and_stay_in_their_world	outlook-glass-seeds	
 src/outlook_captures.rs	the_tapped_scenes_hand_the_tap_the_stores_week	outlook-glass-seeds	
+src/outlook_captures.rs	scene_ms_series_crosses_a_weeks_reset	outlook-glass-seeds	
 ```
 
-## 32. Case (c)'s Accounts card among the captures
+## 32. The Account card among the captures
 
-`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §7. The captures of scenes A–C showed the
-card's midnight ticks only on Autopilot Off's grey cards with `┄` ahead, so `outlook-captures`
-also shoots scene J's card (case (c) under Cruise): a work row with the projected line, `→`
-hand-offs, names and `╳`, and lanes with their out lines, beside the ticks. The glass scenes'
-other logins were read on this Mac, so their readings are series rows too (as aterm-agent's
-`quota_scenes::Fx::read` writes them) and each lane holds its reading before `▕`. A card is shot
-once its pane's recovery observer has read (the first J capture at 44 cells, Day, 1x, caught
-it busy, `┄` ahead), and its rows are the same after the shot as before it. Read the same way as
-§1.
+`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §7. `outlook-captures` shoots the Account
+card of scenes A, B, C, E and H (Autopilot Off, whose `Forecast` row says there is none and why;
+H's account has no figure and no reading of its week) and of scene J (case (c) under Cruise),
+the one card whose tab aterm can switch, so the one whose `Forecast` row holds the outlook's
+projection. Scenes L and M are the card's own, the states only a Mac in a lab shows: a pool
+file and a scratch vault this lab process serves on loopback with the instance's home seated in
+it (`setup_token_lab::seat_scratch_vault`). L's tab runs on a login outside the roster whose
+home is another Mac and for which the vault holds no token; M's on a pool account at home on
+this Mac for which the vault holds a verified lab token (the stub's labelled one, no credential
+anywhere), over eight days of readings that cross a week's reset. The glass scenes' other logins were read on this
+Mac, so their readings are series rows too (as aterm-agent's `quota_scenes::Fx::read` writes
+them) and J's world is case (c)'s. A card is shot once the account reader's card has arrived and
+its pane's recovery observer has read, and its rows are the same after the shot as before it.
+Read the same way as §1.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-outlook-card-scene-j	contract	outlook_captures::{CARD_SCENES,plan,seed,card_shown,shoot_card}	J ∈ CARD_SCENES and plan(J).autopilot = "cruise". plan(c).read_here ⇔ c ∈ {I, J, K}; seed then writes, for each seen login other than the own one with a week (pct_x10, reset, read), a series fig row {pct_x10, reset: now + reset, at: now + read, src tap} at now + read, so the outlook read from J's world at quota_scenes::T5 on UTC (roster, store, logins, series, Mode::Early) lays card_rows("main", None, true, r, None) equal to quota_scenes::case_c()'s for r ∈ {60, 44}: a work row holding `→`, `╳`, `main`, `alt1`, the projected line and ticks, and three lanes each with a read cell, the out line (Cell::Out, warn) and ticks. card_shown(t) ⇔ t's first line has open=true, fact=account and no rows=0, and t holds no account_progress::OBSERVER_BUSY_FINDING. shoot_card opens the card, and shoots the frame only once card_shown holds and the frame is steady, keeping the shot where `controls fact-menu` reads the same after it as before; SHOWN bounds it as a hang detector.	-	1	-
+outlook-card-scene-j	contract	outlook_captures::{CARD_SCENES,plan,seed,card_lines,card_shown,shoot_card}	CARD_SCENES = {A, B, C, E, H, J, L, M} and plan(J).autopilot = "cruise". plan(c).read_here ⇔ c ∈ {I, J, K}; seed then writes, for each seen login other than the own one with a week (pct_x10, reset, read), a series fig row {pct_x10, reset: now + reset, at: now + read, src tap} at now + read, so the outlook read from J's world at quota_scenes::T5 on UTC (roster, store, logins, series, Mode::Early) gives quota("main", None, true) equal to quota_scenes::case_c()'s, with a week projection on `main`'s row; scene A's world gives another view. card_lines(t) is t's `section` rows (their text) and `fact` rows (name, value) in order, a `fact` row with an empty name directly under a `fact` row joined to that fact's value by a blank, any other row ending the run. card_shown(t) ⇔ t's first line has open=true and fact=account, card_lines(t) holds the facts Token, Budget and Machine, Machine's value is not `not read yet`, and no Forecast value holds outlook::Refusal::ObserverBusy's words. shoot_card opens the card, and shoots the frame only once card_shown holds and the frame is steady, keeping the shot where `controls fact-menu` reads the same after it as before; SHOWN bounds it as a hang detector.	-	1	-
 ```
 
 ```tsv
 file	test	primary	also
-src/outlook_captures.rs	scene_js_card_is_case_cs_its_marks_beside_its_ticks	outlook-card-scene-j	outlook-glass-seeds
-src/outlook_captures.rs	a_card_is_shown_once_its_observer_has_read	outlook-card-scene-j	
+src/outlook_captures.rs	scene_js_world_is_case_cs	outlook-card-scene-j	outlook-glass-seeds
+src/outlook_captures.rs	a_card_is_shown_once_its_reader_and_observer_have_answered	outlook-card-scene-j	
 ```
 
 ## 33. Program outcomes across native handoffs

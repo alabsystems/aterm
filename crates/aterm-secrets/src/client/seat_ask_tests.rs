@@ -312,6 +312,51 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
     world.macs.server.stop();
 }
 
+/// A Mac whose records sit in a layout (its log past the fence) reads the seat a member's
+/// records gave it at its next ask: those records go on the end of the layout's data file in
+/// place, which changes nothing at the records entry (a directory), so the memoized seat is
+/// marked by the data file too ([`seat_ask::Mark`]).
+///
+/// NEGATIVE CONTROL (2026-11-11): with the memo marked by the records entry's length and
+/// modification time, as it was while every records write renamed a file into that directory,
+/// the seated Mac's next ask still answers the memoized seatless read (`the seat is read`).
+#[test]
+fn a_seat_appended_to_a_layouts_data_file_is_read_by_the_next_ask() {
+    use std::os::unix::fs::MetadataExt as _;
+    let _answering = ServersAnswering::set();
+    let world = seatless(false);
+    let s = &world.s;
+    drop(crate::records_storage::write_path(&s.records_file(), true).unwrap());
+    let (entry, data) = (s.records_file(), s.records_data_file().unwrap());
+    assert_eq!(data.parent(), Some(entry.as_path()), "a layout");
+    assert!(seat_ask::asks_for_seat(s), "seatless, and memoized so");
+    let stood = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        (meta.ino(), meta.len(), meta.modified().unwrap())
+    };
+    let (entry_before, data_before) = (stood(&entry), stood(&data));
+
+    let asks = AtomicUsize::new(0);
+    let pair = node_pair(0x5e);
+    let ask = asking(&world, &pair, &asks, aterm_time::unix_millis().unwrap());
+    let mut asked = MembersAsked {
+        network: || Some("home".to_owned()),
+        ..MembersAsked::default()
+    };
+    round(s, &mut asked, &ask);
+    assert_eq!(seat(s), Seat::Seated, "m22 seated s");
+    let data_after = stood(&data);
+    assert_eq!(
+        data_after.0, data_before.0,
+        "the records were appended in place"
+    );
+    assert!(data_after.1 > data_before.1);
+    assert_eq!(stood(&entry), entry_before, "nothing moved at the entry");
+    assert!(!seat_ask::asks_for_seat(s), "the seat is read");
+    drop(ask);
+    world.macs.server.stop();
+}
+
 #[test]
 fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vault() {
     use std::sync::atomic::AtomicBool;

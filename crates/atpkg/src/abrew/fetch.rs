@@ -6,9 +6,61 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Output;
 
-/// The shared child construction keeps curl's default configuration out of both fetch paths.
+/// The file no configuration is read from.
+const NO_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// What every git child of abrew carries, so it asks nobody anything: no prompt on a terminal
+/// (`GIT_TERMINAL_PROMPT=0`), no askpass program (an empty `GIT_ASKPASS` keeps a person's
+/// `core.askPass` from running; git tries it before it looks at the terminal), no window from
+/// ssh's askpass or Git Credential Manager, and no system configuration (on a Mac, the Command
+/// Line Tools' file names the login keychain's credential helper, whose read can raise a
+/// keychain dialog). A git that would have asked fails instead, and says so on its stderr.
+const GIT_ASKS_NOBODY: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", ""),
+    ("SSH_ASKPASS", ""),
+    ("SSH_ASKPASS_REQUIRE", "never"),
+    ("GCM_INTERACTIVE", "never"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", NO_CONFIG),
+];
+
+/// Whether `prog` names git, by its file name.
+fn is_git(prog: &str) -> bool {
+    Path::new(prog)
+        .file_stem()
+        .is_some_and(|name| name == "git")
+}
+
+/// The one git child abrew builds ([`GIT_ASKS_NOBODY`]): a read or write of a repository on
+/// this disk, under the person's own git settings.
+pub(super) fn git(args: &[&str]) -> aterm_uds::spawnfd::Command {
+    command(aterm_uds::os_path!("git"), args)
+}
+
+/// [`git`] for a run that reaches a tap's remote or writes its checkout (clone, fetch, pull,
+/// ls-remote): as the harness's own git, it reads no global configuration either
+/// (`GIT_CONFIG_GLOBAL`, which also leaves `$XDG_CONFIG_HOME/git/config` unread), runs no hook
+/// and no credential helper a repository's own file names, and has no stdin to answer from. A
+/// private tap is reached by an SSH remote whose key the agent already holds.
+pub(super) fn git_remote(args: &[&str]) -> aterm_uds::spawnfd::Command {
+    let mut command = git(&["-c", "core.hooksPath=/dev/null", "-c", "credential.helper="]);
+    command
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", NO_CONFIG)
+        .stdin(aterm_uds::spawnfd::Stdio::null());
+    command
+}
+
+/// The shared child construction keeps curl's default configuration out of both fetch paths,
+/// and gives every git, however its program is spelled, [`GIT_ASKS_NOBODY`].
 fn command(prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(prog);
+    if is_git(prog) {
+        for (name, value) in GIT_ASKS_NOBODY {
+            command.env(name, value);
+        }
+    }
     if prog == "curl" {
         command
             .arg("-q")
@@ -17,6 +69,31 @@ fn command(prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
     }
     command.args(args);
     command
+}
+
+/// [`run_capture`] of a command built here ([`git_remote`]).
+pub(super) fn capture(mut command: aterm_uds::spawnfd::Command) -> Result<Output, String> {
+    command.output().map_err(|e| {
+        format!(
+            "abrew: cannot run {}: {e}",
+            command.get_program().to_string_lossy()
+        )
+    })
+}
+
+/// [`run_inherit`] of a command built here ([`git_remote`]): its stdout and stderr are the
+/// caller's.
+pub(super) fn inherit(mut command: aterm_uds::spawnfd::Command) -> i32 {
+    match command.status() {
+        Ok(s) => s.code().unwrap_or(2),
+        Err(e) => {
+            eprintln!(
+                "abrew: cannot run {}: {e}",
+                command.get_program().to_string_lossy()
+            );
+            2
+        }
+    }
 }
 
 /// Run a child to completion, capturing output.
@@ -742,567 +819,5 @@ fn extract_archive(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn download_setup_errors_name_the_path() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let blocker = tmp.path().join("blocker");
-        std::fs::write(&blocker, b"file").unwrap();
-        let dest = blocker.join("bottle.tar.gz");
-        let error = curl_to_file("https://example.invalid/bottle.tar.gz", &dest, &[])
-            .expect_err("setup must fail");
-        assert!(
-            error.contains(&blocker.display().to_string()),
-            "error names the path: {error}"
-        );
-    }
-
-    #[test]
-    fn sha256_of_known_bytes() {
-        assert_eq!(
-            sha256_bytes(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn unchecked_cache_still_requires_a_file_and_downloads_keep_foreign_partials() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("download");
-        assert!(verify_sha256(&dest, "no_check").is_err());
-        std::fs::write(&dest, b"old").unwrap();
-        assert!(verify_sha256(&dest, "no_check").is_ok());
-        assert!(verify_sha256(&dest, "").is_err());
-        let partial = tmp.path().join("download.partial");
-        std::fs::write(&partial, b"another operation").unwrap();
-        let source = tmp.path().join("source");
-        std::fs::write(&source, b"new").unwrap();
-        curl_to_file(&format!("file://{}", source.display()), &dest, &[]).unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-        assert_eq!(std::fs::read(&partial).unwrap(), b"another operation");
-        assert!(
-            curl_to_file(
-                &format!("file://{}", tmp.path().join("absent").display()),
-                &dest,
-                &[]
-            )
-            .is_err()
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-        assert_eq!(std::fs::read(&partial).unwrap(), b"another operation");
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 3);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mounted_tree_copy_skips_escaping_alias_and_keeps_in_root_links() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let src = tmp.path().join("mnt");
-        let dst = tmp.path().join("out");
-        std::fs::create_dir_all(src.join("Demo.app/Contents")).unwrap();
-        std::fs::write(src.join("Demo.app/Contents/Info.plist"), b"plist").unwrap();
-        std::fs::write(src.join("Demo.app/Contents/tool"), b"executable payload").unwrap();
-        std::fs::set_permissions(
-            src.join("Demo.app/Contents/Info.plist"),
-            std::fs::Permissions::from_mode(0o666),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            src.join("Demo.app/Contents/tool"),
-            std::fs::Permissions::from_mode(0o777),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            src.join("Demo.app/Contents"),
-            std::fs::Permissions::from_mode(0o555),
-        )
-        .unwrap();
-        super::super::prefix::symlink_dir(Path::new("/Applications"), &src.join("Applications"))
-            .unwrap();
-        super::super::prefix::symlink_file(
-            Path::new("Demo.app/Contents/Info.plist"),
-            &src.join("alias"),
-        )
-        .unwrap();
-        let copied = copy_mounted_tree(&src, &dst);
-        std::fs::set_permissions(
-            src.join("Demo.app/Contents"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        copied.unwrap();
-        for (path, mode) in [
-            ("", 0o755),
-            ("Demo.app/Contents", 0o755),
-            ("Demo.app/Contents/Info.plist", 0o644),
-            ("Demo.app/Contents/tool", 0o755),
-        ] {
-            assert_eq!(
-                std::fs::metadata(dst.join(path))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o7777,
-                mode,
-                "{path} uses the staged tree's safe mode"
-            );
-        }
-        assert_eq!(
-            std::fs::read(dst.join("Demo.app/Contents/Info.plist")).unwrap(),
-            b"plist"
-        );
-        assert!(
-            std::fs::symlink_metadata(dst.join("Applications")).is_err(),
-            "escaping Finder alias not copied"
-        );
-        assert_eq!(std::fs::read(dst.join("alias")).unwrap(), b"plist");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "owned helper process; the native detach parent invokes this exact test"]
-    fn dmg_owned_detach_child() {
-        let ready = std::env::var_os("ATERM_TEST_DMG_DETACH_READY").expect("owned ready path");
-        std::fs::write(ready, b"the actual detach fixture ran\n").unwrap();
-        println!("native detach completed");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn required_dmg_cleanup_waits_for_its_native_helper() {
-        for age in [
-            std::time::Duration::from_secs(31),
-            std::time::Duration::from_secs(61),
-        ] {
-            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
-            let observed = aterm_tempfile::tempdir().unwrap();
-            let ready = observed.path().join("native-ready");
-            let root = aterm_tempfile::tempdir().unwrap();
-            let retained = root.path().to_path_buf();
-            let image = root.path().join("owned.dmg");
-            std::fs::write(&image, b"owned image fixture").unwrap();
-            let point = root.path().join("mount");
-            std::fs::create_dir(&point).unwrap();
-            let expected_point = point.clone();
-            let calls = std::cell::Cell::new(0);
-            let mut run = |cmd: &mut aterm_uds::spawnfd::Command, within| {
-                calls.set(calls.get() + 1);
-                assert_eq!(cmd.get_program(), "/usr/bin/hdiutil");
-                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
-                assert_eq!(
-                    args,
-                    [
-                        std::ffi::OsString::from("detach"),
-                        std::ffi::OsString::from("-force"),
-                        std::ffi::OsString::from("-quiet"),
-                        expected_point.as_os_str().to_os_string()
-                    ]
-                );
-                let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-                child
-                    .args([
-                        "abrew::fetch::tests::dmg_owned_detach_child",
-                        "--exact",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env("ATERM_TEST_DMG_DETACH_READY", &ready);
-                run_dmg_helper_started(&mut child, within, std::time::Instant::now() - age)
-            };
-            let guard = MountGuard {
-                root: RetainedImage(Some(root)),
-                image,
-                point,
-                run: &mut run,
-                needs_detach: true,
-                uncertain: None,
-            };
-            let result = guard.finish(Ok(()));
-            assert_eq!(
-                calls.get(),
-                1,
-                "an uncertain native helper is never retried"
-            );
-            if !expired {
-                assert_eq!(
-                    std::fs::read(&ready).unwrap(),
-                    b"the actual detach fixture ran\n"
-                );
-                assert!(
-                    result.is_ok(),
-                    "a scheduled native detach helper is not unconfirmed: {result:?}"
-                );
-                assert!(
-                    !retained.exists(),
-                    "only confirmed cleanup releases the image"
-                );
-            } else {
-                assert!(matches!(result, Err(DmgError::Uncertain(_))));
-                assert!(
-                    !ready.exists(),
-                    "an expired hang detector starts no new helper"
-                );
-                assert!(retained.join("owned.dmg").is_file());
-                assert!(retained.join("mount").is_dir());
-                std::fs::remove_dir_all(&retained).unwrap();
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dmg_helpers_retain_uncertain_inputs_until_cleanup_is_confirmed() {
-        use std::os::unix::process::ExitStatusExt as _;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        fn answer(code: i32) -> Output {
-            Output {
-                status: std::process::ExitStatus::from_raw(code << 8),
-                stdout: Vec::new(),
-                stderr: b"unsupported image".to_vec(),
-            }
-        }
-
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let original = tmp.path().join("caller.dmg");
-        for scenario in [
-            "copied",
-            "refused",
-            "attach-unknown",
-            "detach-unknown",
-            "backstop-unknown",
-            "backstop-refused",
-            "detach-refused",
-            "detach-busy",
-            "busy-backstop-refused",
-            "attach-panic",
-        ] {
-            std::fs::write(&original, b"owned image bytes").unwrap();
-            let out = tmp.path().join(scenario);
-            let scratch = aterm_tempfile::TempDir::new_in(tmp.path()).unwrap();
-            let root = scratch.path().to_path_buf();
-            let mut calls = Vec::new();
-            let mut run = |cmd: &mut aterm_uds::spawnfd::Command, _within| {
-                assert_eq!(cmd.get_program(), "/usr/bin/hdiutil");
-                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
-                if args[0] == "attach" {
-                    let point = std::path::PathBuf::from(&args[5]);
-                    let image = std::path::PathBuf::from(&args[6]);
-                    assert_ne!(image, original, "the caller's path is never attached");
-                    assert_eq!(image.parent(), point.parent());
-                    assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
-                    assert_eq!(point.parent(), Some(root.as_path()));
-                    calls.push("attach");
-                    std::fs::remove_file(&original).unwrap();
-                    assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
-                    if scenario == "attach-panic" {
-                        panic!("injected helper unwind");
-                    }
-                    if scenario == "attach-unknown" {
-                        return Err(aterm_uds::deadline::RunError::TimedOut);
-                    }
-                    if matches!(
-                        scenario,
-                        "refused" | "backstop-unknown" | "backstop-refused"
-                    ) {
-                        return Ok(answer(1));
-                    }
-                    std::fs::create_dir_all(point.join("Demo.app/Contents")).unwrap();
-                    std::fs::write(point.join("Demo.app/Contents/tool"), b"payload").unwrap();
-                    return Ok(answer(0));
-                }
-                assert_eq!(args[0], "detach");
-                let forced = args.iter().any(|arg| arg == "-force");
-                calls.push(if forced { "force" } else { "detach" });
-                assert!(root.join("image.dmg").is_file());
-                if (forced && scenario == "backstop-unknown")
-                    || (!forced && scenario == "detach-unknown")
-                {
-                    return Err(aterm_uds::deadline::RunError::TimedOut);
-                }
-                if !forced && matches!(scenario, "detach-busy" | "busy-backstop-refused") {
-                    return Ok(answer(libc::EBUSY));
-                }
-                Ok(answer(i32::from(
-                    (forced && matches!(scenario, "backstop-refused" | "busy-backstop-refused"))
-                        || (!forced && scenario == "detach-refused"),
-                )))
-            };
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                extract_dmg_with(&original, &out, scratch, &mut run)
-            }));
-            if scenario == "attach-panic" {
-                assert!(result.is_err());
-                assert_eq!(calls, ["attach"], "no late detach after an unknown helper");
-            } else {
-                let result = result.expect("only the injected panic unwinds");
-                match scenario {
-                    "copied" => {
-                        result.unwrap();
-                        assert_eq!(calls, ["attach", "detach"]);
-                    }
-                    "refused" => {
-                        assert!(matches!(result, Err(DmgError::Attach(_))));
-                        assert_eq!(calls, ["attach", "force"]);
-                        assert!(!out.exists(), "an attach refusal copies nothing");
-                    }
-                    "detach-refused" => {
-                        assert!(matches!(result, Err(DmgError::Detach)));
-                        assert_eq!(calls, ["attach", "detach", "force"]);
-                    }
-                    "detach-busy" => {
-                        result.expect("a busy volume the forced detach took down");
-                        assert_eq!(calls, ["attach", "detach", "force"]);
-                    }
-                    "busy-backstop-refused" => {
-                        assert!(
-                            matches!(result, Err(DmgError::Uncertain(_))),
-                            "a busy volume the forced detach left attached"
-                        );
-                        assert_eq!(calls, ["attach", "detach", "force"]);
-                    }
-                    _ => {
-                        assert!(matches!(result, Err(DmgError::Uncertain(_))));
-                        assert_eq!(
-                            calls,
-                            if scenario == "attach-unknown" {
-                                vec!["attach"]
-                            } else if scenario == "detach-unknown" {
-                                vec!["attach", "detach"]
-                            } else {
-                                vec!["attach", "force"]
-                            },
-                            "unknown cleanup is never retried in Drop"
-                        );
-                    }
-                }
-            }
-            let retained = matches!(
-                scenario,
-                "attach-unknown"
-                    | "detach-unknown"
-                    | "backstop-unknown"
-                    | "backstop-refused"
-                    | "busy-backstop-refused"
-                    | "attach-panic"
-            );
-            assert_eq!(root.exists(), retained, "{scenario}");
-            if retained {
-                assert_eq!(
-                    std::fs::read(root.join("image.dmg")).unwrap(),
-                    b"owned image bytes"
-                );
-                assert!(root.join("mount").is_dir());
-                std::fs::remove_dir_all(&root).unwrap();
-            }
-            if matches!(
-                scenario,
-                "copied" | "detach-refused" | "detach-busy" | "detach-unknown"
-            ) {
-                assert_eq!(
-                    std::fs::read(out.join("Demo.app/Contents/tool")).unwrap(),
-                    b"payload"
-                );
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dmg_mount_copy_detaches_and_stages_app() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let src = tmp.path().join("image");
-        std::fs::create_dir_all(src.join("Demo.app/Contents/MacOS")).unwrap();
-        std::fs::write(src.join("Demo.app/Contents/MacOS/demo"), b"bin").unwrap();
-        let mut make = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
-        make.args(["makehybrid", "-quiet", "-hfs", "-o"])
-            .arg(tmp.path().join("demo.dmg"))
-            .arg(&src)
-            .stdin(aterm_uds::spawnfd::Stdio::null());
-        let mut retained = RetainedImage(Some(tmp));
-        let made = run_dmg_helper(&mut make, std::time::Duration::from_secs(60)).unwrap();
-        let tmp = retained.0.take().unwrap();
-        assert!(
-            made.status.success(),
-            "hdiutil makehybrid fixture: {made:?}"
-        );
-        let out = tmp.path().join("payload");
-        extract_dmg(&tmp.path().join("demo.dmg"), &out).unwrap();
-        assert_eq!(
-            std::fs::read(out.join("Demo.app/Contents/MacOS/demo")).unwrap(),
-            b"bin"
-        );
-        // A process holding the volume at the plain detach (a system scanner, on a loaded Mac)
-        // makes hdiutil refuse it busy: the forced detach takes it down and the payload stands.
-        let busy = tmp.path().join("busy");
-        let root = aterm_tempfile::tempdir().unwrap();
-        let point = root.path().join("mount");
-        let (mut held, mut refused) = (None, None);
-        let staged = extract_dmg_with(
-            &tmp.path().join("demo.dmg"),
-            &busy,
-            root,
-            |cmd: &mut aterm_uds::spawnfd::Command, within| {
-                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
-                let plain = args[0] == "detach" && !args.iter().any(|arg| arg == "-force");
-                if plain {
-                    let point = std::path::PathBuf::from(args.last().unwrap());
-                    let file = point.join("Demo.app/Contents/MacOS/demo");
-                    held = Some(std::fs::File::open(file).unwrap());
-                }
-                let out = run_dmg_helper(cmd, within);
-                if plain {
-                    refused = out.as_ref().ok().and_then(|out| out.status.code());
-                }
-                out
-            },
-        );
-        drop(held);
-        let left = point.exists();
-        if left {
-            // Still attached: taken down before the verdict, so a failing run leaves no volume.
-            let mut force = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
-            force
-                .args(["detach", "-force", "-quiet"])
-                .arg(&point)
-                .stdin(aterm_uds::spawnfd::Stdio::null());
-            let _ = run_dmg_helper(&mut force, DMG_DETACH_LIMIT);
-            let _ = std::fs::remove_dir_all(point.parent().unwrap());
-        }
-        assert_eq!(refused, Some(libc::EBUSY), "the held volume refused busy");
-        staged.unwrap();
-        assert!(
-            !left,
-            "the forced detach took the busy volume down and its folder went"
-        );
-        assert_eq!(
-            std::fs::read(busy.join("Demo.app/Contents/MacOS/demo")).unwrap(),
-            b"bin"
-        );
-        std::fs::write(tmp.path().join("junk.dmg"), b"not an image").unwrap();
-        let err = extract_dmg(&tmp.path().join("junk.dmg"), &tmp.path().join("nope")).unwrap_err();
-        assert!(
-            matches!(err, DmgError::Attach(_) | DmgError::Uncertain(_)),
-            "{err}"
-        );
-        assert!(!tmp.path().join("nope").exists());
-    }
-
-    #[test]
-    fn archives_refuse_traversal_and_escaping_links_before_writing() {
-        use crate::extract::fixtures::{ZipMember, gzip_bytes, tar_bytes, zip_bytes, zstd_bytes};
-        type Member<'a> = (&'a str, u8, &'a str, &'a [u8], u32);
-        fn archives(entries: &[Member<'_>]) -> Vec<(&'static str, Vec<u8>)> {
-            let tar = tar_bytes(entries);
-            let members: Vec<_> = entries
-                .iter()
-                .map(|(name, kind, target, bytes, mode)| ZipMember {
-                    name,
-                    mode: match kind {
-                        b'2' => 0o120_777,
-                        b'5' => 0o040_755,
-                        _ => 0o100_000 | mode,
-                    },
-                    data: if *kind == b'2' {
-                        target.as_bytes()
-                    } else {
-                        bytes
-                    },
-                    deflate: false,
-                })
-                .collect();
-            vec![
-                ("tar", tar.clone()),
-                ("gz", gzip_bytes(&tar)),
-                ("zst", zstd_bytes(&tar)),
-                ("zip", zip_bytes(&members, false)),
-            ]
-        }
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, b"owner data").unwrap();
-        let absolute = outside.to_string_lossy();
-        for (index, (name, kind, link)) in [
-            ("../outside", b'0', ""),
-            (absolute.as_ref(), b'0', ""),
-            ("escape", b'2', "../outside"),
-            ("escape", b'2', absolute.as_ref()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let content: &[u8] = if kind == b'0' { b"replaced" } else { b"" };
-            for (format, bytes) in archives(&[(name, kind, link, content, 0o755)]) {
-                let archive = tmp.path().join(format!("bad-{index}.{format}"));
-                std::fs::write(&archive, bytes).unwrap();
-                assert!(
-                    untar(
-                        &archive,
-                        &tmp.path().join(format!("stage-{index}-{format}"))
-                    )
-                    .is_err(),
-                    "accepted {format}: {name} -> {link}"
-                );
-                assert_eq!(std::fs::read(&outside).unwrap(), b"owner data");
-            }
-        }
-        for (format, bytes) in archives(&[("inside", b'0', "", b"safe", 0o644)]) {
-            let archive = tmp.path().join(format!("good.{format}"));
-            let stage = tmp.path().join(format!("good-{format}"));
-            std::fs::write(&archive, bytes).unwrap();
-            untar(&archive, &stage).unwrap();
-            assert_eq!(std::fs::read(stage.join("inside")).unwrap(), b"safe");
-            assert!(untar(&archive, &stage).is_err());
-            assert_eq!(std::fs::read(stage.join("inside")).unwrap(), b"safe");
-            #[cfg(unix)]
-            {
-                let external = tmp.path().join(format!("external-{format}"));
-                std::fs::create_dir(&external).unwrap();
-                let alias = tmp.path().join(format!("alias-{format}"));
-                std::os::unix::fs::symlink(&external, &alias).unwrap();
-                assert!(untar(&archive, &alias).is_err());
-                assert!(std::fs::read_dir(&external).unwrap().next().is_none());
-            }
-        }
-        for (format, bytes) in [
-            ("xz", b"\xfd7zXZ\0".as_slice()),
-            ("bz2", b"BZh91AY".as_slice()),
-            ("empty", b"".as_slice()),
-        ] {
-            let archive = tmp.path().join(format);
-            let stage = tmp.path().join(format!("unsupported-{format}"));
-            std::fs::write(&archive, bytes).unwrap();
-            assert!(untar(&archive, &stage).is_err());
-            assert!(!stage.exists());
-        }
-    }
-
-    #[test]
-    fn headers_and_urls_with_line_breaks_or_nuls_are_refused_before_spawning_curl() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("sub/out.bin");
-        for bad_header in [
-            "Authorization: Bearer a\noutput = /tmp/pwn",
-            "X-Test: a\r\nX-Injected: b",
-            "X-Test: a\0b",
-        ] {
-            assert!(curl_get("https://example.invalid/x", &[bad_header]).is_err());
-            assert!(curl_to_file("https://example.invalid/x", &dest, &[bad_header]).is_err());
-            assert!(head_size("https://example.invalid/x", &[bad_header]).is_none());
-            assert!(!dest.parent().unwrap().exists());
-        }
-        for bad_url in [
-            "https://example.invalid/a\nb",
-            "https://example.invalid/a\rb",
-            "https://example.invalid/a\0b",
-        ] {
-            assert!(curl_get(bad_url, &[]).is_err());
-            assert!(curl_to_file(bad_url, &dest, &[]).is_err());
-            assert!(head_size(bad_url, &[]).is_none());
-        }
-    }
-}
+#[path = "fetch_tests.rs"]
+mod tests;

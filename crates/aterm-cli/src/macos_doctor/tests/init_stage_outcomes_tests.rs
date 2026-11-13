@@ -62,7 +62,13 @@ impl Records for InitAt {
         wait: Option<&dyn Fn(&str)>,
     ) -> Result<Box<dyn Held>, Unheld> {
         self.whole.lock().unwrap().push(pass.whole());
-        Ok(Box::new(init_hold_at(&self.root, pass, false, wait)?))
+        Ok(Box::new(init_hold_at(
+            &self.root,
+            pass,
+            false,
+            wait,
+            initial::complete_explicit_workstation_plan_for_test,
+        )?))
     }
 }
 

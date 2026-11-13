@@ -74,7 +74,7 @@ pub struct WorkerCli {
     /// reaches its provider, and its permission posture held to THE CLI'S PERMISSION FLOOR: the
     /// least-asking posture the CLI's own flags spell that never stops a worker for a person's
     /// box on an ordinary edit or command and keeps the CLI's own sandbox or safety classifier,
-    /// never one that skips them (owner, 2026-11-04: workers are fully automated by default;
+    /// never one that skips them (workers are fully automated by default;
     /// `DESIGN-workers-subagents-2026-11-04.md` §2: "its CLI's most automated mode short of
     /// bypass"). A starter at or above the floor lends its own posture; one below it, or naming
     /// none, lends the floor, which is so what an argv naming nothing lends
@@ -203,7 +203,7 @@ fn claude_mode_flags(mode: &str) -> Vec<String> {
 /// `--permission-mode` or the pill's flag spells it; `None` where the starter names none or is
 /// planning). A worker is fully automated by default (owner, 2026-11-04: "these workers likely
 /// need to be started in auto / yolo mode!"), which supersedes, for this floor, the ruling that a
-/// worker runs with its parent's permissions (owner ruling 2026-11-02). Where `floored`, a
+/// worker runs with its parent's permissions. Where `floored`, a
 /// starter in a mode that stops for a person's box (manual, `acceptEdits`), or one that names
 /// none, lends [`CLAUDE_WORKER_FLOOR`], and one at or above the floor ([`CLAUDE_FLOOR_KEEPS`]:
 /// auto, `dontAsk`, bypass) lends its own, so aterm never raises a worker to bypass. Not
@@ -1227,8 +1227,8 @@ impl Admitted {
     /// This admission for a Claude Code worker whose parent lends it no flags, or whose starter
     /// could not be read ([`StarterRead::Unread`]), typed as the build atpkg's managed twin execs
     /// where its line, with `model`, holds nothing the twin reads as typed: the word would reach
-    /// the twin, which adds yolo. A worker off the floor runs with its parent's permissions (owner
-    /// ruling 2026-11-02), and a read that failed does not know those to be bypass, so that worker
+    /// the twin, which adds yolo. A worker off the floor runs with its parent's permissions,
+    /// and a read that failed does not know those to be bypass, so that worker
     /// starts in the person's settings. A parent lends none only where its route keeps its worker
     /// off the floor ([`starter`]) and it names no mode: at the floor the line names `auto`, which
     /// the twin runs as typed. An unread starter gets no floor, for the reason an unread route gets
@@ -1379,9 +1379,9 @@ enum GroupClaude {
     At(u32),
     /// Every process of the group was read, and none is Claude Code.
     None,
-    /// Not known: no table of its processes, a member that could not be read and no Claude Code
-    /// read beside it, or Claude Codes side by side, none inside another, with nothing to say
-    /// which one the terminal's person drives.
+    /// Not known: no whole listing of its processes, a member that could not be read and no
+    /// Claude Code read beside it, or Claude Codes side by side, none inside another, with
+    /// nothing to say which one the terminal's person drives.
     Unread,
 }
 
@@ -1416,19 +1416,27 @@ fn group_claude(members: &[(u32, MemberRead)], parent: impl Fn(u32) -> Option<u3
 /// The process a Claude Code starter's line is read from, of the group `leader` leads: the leader
 /// where it is Claude Code, else the member of its group that is ([`group_claude`]), where another
 /// program leads the group (`time`, a script with no `exec`, a pipeline's first stage).
+///
+/// The group is listed by itself (`proc_listpids(PROC_PGRP_ONLY)` on macOS,
+/// [`aterm_uds::process::group_members`]) and each member's parent read by itself
+/// ([`aterm_uds::process::read_lineage`]), never off the whole process table: the kernel
+/// answers a `KERN_PROC_ALL` read only once every process on the machine is through an exec in
+/// progress, so on a loaded machine (a freshly signed binary's first exec under assessment
+/// anywhere) that read outran its bound, came back empty, and a lead it could have read went
+/// unread, its worker off the floor. A listing that is not whole reads as not known.
 fn claude_of_group(leader: u32, home: &Path) -> GroupClaude {
     use super::{relaunch::caller_claude, upgrade_drive};
     if caller_claude(leader, home).is_some() {
         return GroupClaude::At(leader);
     }
-    let table = upgrade_drive::table();
-    if table.is_empty() {
+    let Some(listed) = aterm_uds::process::group_members(leader).filter(|listed| listed.complete)
+    else {
         return GroupClaude::Unread;
-    }
-    let members: Vec<(u32, MemberRead)> = table
+    };
+    let members: Vec<(u32, MemberRead)> = listed
+        .pids
         .iter()
-        .map(|(pid, ..)| *pid)
-        .filter(|pid| upgrade_drive::process_group(*pid) == Some(i64::from(leader)))
+        .filter_map(|pid| u32::try_from(*pid).ok())
         .map(|pid| {
             let read = if caller_claude(pid, home).is_some() {
                 MemberRead::Claude
@@ -1444,10 +1452,8 @@ fn claude_of_group(leader: u32, home: &Path) -> GroupClaude {
         })
         .collect();
     group_claude(&members, |pid| {
-        table
-            .iter()
-            .find(|(row, ..)| *row == pid)
-            .map(|(_, ppid, _)| *ppid)
+        let pid = i32::try_from(pid).ok()?;
+        aterm_uds::process::read_lineage(pid).map(|lineage| lineage.parent)
     })
 }
 

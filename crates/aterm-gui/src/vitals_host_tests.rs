@@ -1382,6 +1382,32 @@ fn the_front_tabs_device_reads_beside_homes_only_when_it_is_another() {
     assert_eq!(ids, alone);
 }
 
+/// On Windows home's key is the one the harness's disk watch files that volume under
+/// ([`aterm_agent::harness::disk::volume_of`]), so the Disk row reads the watch's facts for it.
+/// No block device is read there.
+/// NEGATIVE CONTROL: with no disk watch on the shelf (`keyed` false) there is no key.
+#[cfg(windows)]
+#[test]
+fn homes_volume_key_on_windows_is_the_disk_watchs() {
+    let manifest = aterm_tempfile::manifest_dir();
+    let home = manifest.as_path();
+    let no_devices =
+        |_: &[&aterm_sysprobe::volumes::Mount]| -> Vec<aterm_sysprobe::blockio::BlockReading> {
+            panic!("Windows has no block reader to ask")
+        };
+    let watch = aterm_agent::harness::disk::volume_of(home, &aterm_sysprobe::volumes::table())
+        .expect("this checkout's volume");
+
+    let keyed = machine_volumes(home, true, Some(home), no_devices);
+    assert_eq!(keyed.key.as_ref(), Some(&watch.key));
+    assert!(keyed.home.is_some());
+    assert!(keyed.block.is_empty());
+
+    let unwatched = machine_volumes(home, false, Some(home), no_devices);
+    assert_eq!(unwatched.key, None);
+    assert!(unwatched.home.is_some());
+}
+
 /// THE FRONT TAB'S DIRECTORY IS ITS FOCUSED PANE'S REPORT, MADE ON THIS MACHINE: a report naming
 /// no host, `localhost` or this machine's name is the request's front directory; one a shell
 /// over ssh made on another host is none, since this machine's mount table does not hold it.
@@ -1605,7 +1631,10 @@ fn a_full_reading_attributes_the_slot_holders_and_a_hidden_one_does_not() {
     let dir = aterm_tempfile::tempdir().expect("scratch slots");
     std::fs::write(dir.path().join("slot-0"), b"").expect("a free slot");
     let mut reader = Reader::new(Arc::default());
-    reader.slots = aterm_sysprobe::slots::SlotReader::new(dir.path().to_path_buf());
+    reader.slots = aterm_sysprobe::slots::SlotReader::new(
+        dir.path().to_path_buf(),
+        Some(dir.path().join("adopted")),
+    );
     let req = Request {
         self_pid: std::process::id(),
         cadence_ms: 1_000,
@@ -3172,7 +3201,7 @@ fn a_views_age_counts_from_the_probes_read_not_its_adoption() {
     );
     let adopted = read + Duration::from_secs(3);
     assert!(app.adopt_vitals(Audience::None, adopted, false));
-    let (age, calls) = BOARD
+    let crate::vitals_jobs::BoardFacts { age, calls, .. } = BOARD
         .facts(&sid, adopted)
         .expect("a view inside JOBS_FRESH");
     assert_eq!((age, calls.len()), (Duration::from_secs(3), 1));
@@ -3207,7 +3236,7 @@ fn an_earlier_reading_of_an_older_view_does_not_age_a_new_one() {
     );
     let adopted = read + Duration::from_secs(71);
     assert!(app.adopt_vitals(Audience::None, adopted, false));
-    let (age, calls) = BOARD
+    let crate::vitals_jobs::BoardFacts { age, calls, .. } = BOARD
         .facts(&sid, adopted)
         .expect("a new view, a second old");
     assert_eq!((age, calls.len()), (Duration::from_secs(1), 1));
@@ -3395,7 +3424,7 @@ fn with_no_window_the_disk_look_reads_once_and_the_board_names_the_hung_call() {
     let posted = Instant::now();
     let named = |at| match BOARD.evidence(&sid, at) {
         BackgroundEvidence::NoProgress { worst } => Some((worst.pid, worst.quiet_min())),
-        BackgroundEvidence::Unknown => None,
+        BackgroundEvidence::Unknown | BackgroundEvidence::Waiting => None,
     };
     assert_eq!(named(posted), Some((27098, 31)), "the board speaks");
 
@@ -6305,7 +6334,8 @@ fn the_test_reader_never_reads_the_thermal_state() {
         ..Request::default()
     });
     assert!((reader.thermal)().is_none());
-    if !cfg!(target_os = "linux") {
+    // Linux and Windows read a throttle counter beside the thermal state, which a test reads too.
+    if !cfg!(any(target_os = "linux", windows)) {
         assert!(snap.thermal.is_none());
     }
 }
@@ -6376,12 +6406,12 @@ fn the_oss_exact_thermal_state_wins_over_the_counters_estimate() {
     let cached = Instant::now() + Duration::from_secs(3_600);
     reader.counter_throttle = Some((cached, Some(estimate)));
     assert_eq!(
-        reader.machine_sample(&req, 0).thermal,
+        reader.machine_sample(&req, 0, None).thermal,
         Some(thermal_of(2, Some(true)))
     );
     reader.thermal = || None;
     reader.counter_throttle = Some((cached, Some(estimate)));
-    assert_eq!(reader.machine_sample(&req, 0).thermal, Some(estimate));
+    assert_eq!(reader.machine_sample(&req, 0, None).thermal, Some(estimate));
 }
 
 /// With no window, an idle view holding a program at macOS's program check, or a backed-up

@@ -3,7 +3,7 @@
 
 //! No-follow directory marker and symlink target inspection for root discovery.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +40,8 @@ pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marke
     Ok(one)
 }
 
-/// The device and inode of a directory, without listing it or following links.
+/// The device and inode of a directory (its volume's serial number and its file id on Windows),
+/// without listing it or following links.
 ///
 /// # Errors
 /// The path, volume and cloud-placeholder refusals of a walk apply to this
@@ -51,7 +52,11 @@ pub fn directory_identity(dir: &Path, policy: &Policy) -> Result<(u64, u64), Ref
     {
         crate::walk::imp::directory_identity(&canon)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::walk::imp::directory_identity(&canon, policy)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = canon;
         Err(Refusal::Unsupported)
@@ -98,7 +103,28 @@ pub fn markers_at<const N: usize>(
         }
         Ok(out)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let handle = crate::walk::imp::open_checked(&canon, policy)?;
+        let mut out = [None; N];
+        for (slot, name) in out.iter_mut().zip(names) {
+            #[cfg(any(test, debug_assertions))]
+            crate::touched::note(&canon.join(name));
+            let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+            *slot = match crate::win::stat_at(&handle, &wide) {
+                Ok(st) => Some(match st.kind() {
+                    crate::win::Kind::Dir => Marker::Dir,
+                    crate::win::Kind::File => Marker::File,
+                    crate::win::Kind::Link => Marker::Link,
+                }),
+                Err(code) if crate::win::is_gone(code) => None,
+                Err(code) => return Err(crate::walk::imp::stat_refusal(code)),
+            };
+        }
+        Ok(out)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (canon, names);
         Err(Refusal::Unsupported)
@@ -158,7 +184,28 @@ pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Pat
         let target = Path::new(std::ffi::OsStr::from_bytes(&buf));
         Ok(Some(lexical_join(&canon, target)))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let handle = crate::walk::imp::open_checked(&canon, policy)?;
+        #[cfg(any(test, debug_assertions))]
+        crate::touched::note(&canon.join(name));
+        let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+        // Only a link is opened (as itself, for its reparse data): never a regular file.
+        match crate::win::stat_at(&handle, &wide) {
+            Ok(st) if st.kind() == crate::win::Kind::Link => {}
+            Ok(_) => return Ok(None),
+            Err(code) if crate::win::is_gone(code) => return Ok(None),
+            Err(code) => return Err(crate::walk::imp::stat_refusal(code)),
+        }
+        match crate::win::link_target_at(&handle, &wide) {
+            Ok(Some((target, relative))) => Ok(Some(windows_join(&canon, &target, relative))),
+            Ok(None) => Ok(None),
+            Err(code) if crate::win::is_gone(code) => Ok(None),
+            Err(code) => Err(crate::win::code_refusal(code)),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (canon, name);
         Err(Refusal::Unsupported)
@@ -226,7 +273,14 @@ pub fn build_dir_above(start: &Path, policy: &Policy) -> Option<PathBuf> {
 }
 
 fn one_name(name: &str) -> bool {
-    !(name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0'))
+    // On Windows a backslash separates too, and `:` names a stream of the file before it.
+    let elsewhere = cfg!(windows) && name.contains(['\\', ':']);
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || elsewhere)
 }
 
 fn tested(dir: &Path, policy: &Policy) -> Result<PathBuf, Refusal> {
@@ -253,6 +307,35 @@ fn lexical_join(base: &Path, target: &Path) -> PathBuf {
                 out.pop();
             }
             Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+/// Where a link's reparse data points, read by text against the link's directory `base`. An
+/// absolute target is an NT path (`\??\C:\dir`, `\??\UNC\server\share\dir`, `\??\Volume{…}\`); a
+/// relative one has its `.` and `..` resolved by text, and a leading `\` is `base`'s drive root.
+#[cfg(windows)]
+fn windows_join(base: &Path, target: &std::ffi::OsStr, relative: bool) -> PathBuf {
+    let text = target.to_string_lossy();
+    if !relative {
+        let rest = text.strip_prefix(r"\??\").unwrap_or(&text);
+        let spelled = match rest.strip_prefix(r"UNC\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+            None => PathBuf::from(format!(r"\\?\{rest}")),
+        };
+        return canonical(&spelled).unwrap_or(spelled);
+    }
+    let mut out = base.to_path_buf();
+    for c in Path::new(text.as_ref()).components() {
+        match c {
+            Component::Normal(n) => out.push(n),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir => while out.pop() {},
+            Component::CurDir | Component::Prefix(_) => {}
         }
     }
     out

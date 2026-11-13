@@ -1327,7 +1327,7 @@ fn effects_under_a_band_are_the_bandless_frame_translated() {
         t.process(b"a curious cat watched the build fail: fuck\r\n$ ");
     }
     for t in [&mut plain, &mut banded] {
-        t.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
+        t.set_cursor_glow(true, "fire", None, None, 400, 64, 1.0, 2.0, true);
     }
     for ch_ in "burning".chars() {
         for t in [&mut plain, &mut banded] {
@@ -1365,7 +1365,7 @@ fn effects_under_a_band_are_the_bandless_frame_translated() {
     }
     for t in [&mut plain, &mut banded] {
         t.set_cursor_trail(false, 260, 24, None);
-        t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+        t.set_cursor_glow(true, "rainbow", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, 7);
         let _ = t.note_typed_char('p');
         t.process(b"p");

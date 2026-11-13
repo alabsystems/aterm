@@ -1019,6 +1019,15 @@ fn account_keys_follow_the_claims_key() {
         assert_eq!(keys::provider_of_realm(spelling), Some(keys::KIMI));
     }
     assert_eq!(keys::canonical_realm("x"), Some("grok"));
+    // agy's claims realm keys as the Google account it signs in with.
+    for spelling in ["agy", "Antigravity", "gemini", "google"] {
+        assert_eq!(keys::canonical_realm(spelling), Some("google"));
+        assert_eq!(keys::provider_of_realm(spelling), Some(keys::GOOGLE));
+        assert_eq!(
+            keys::account_pk(spelling, alias).unwrap(),
+            keys::account_pk("google", alias).unwrap()
+        );
+    }
     assert_eq!(keys::provider_of_realm("grok"), Some(keys::XAI));
     assert_eq!(keys::provider_of_realm("claude"), Some(keys::ANTHROPIC));
     assert_ne!(

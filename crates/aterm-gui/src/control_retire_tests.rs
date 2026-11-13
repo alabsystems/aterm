@@ -4,7 +4,6 @@
 //! Tests control-socket retirement before cold `exec` and reopening on failure.
 
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -147,7 +146,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
         move || rebind_socket(&published, &mut expected),
         endpoint.clone(),
     );
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(aterm_uds::stop::Stop::new());
     let stopping = stop.clone();
     std::thread::spawn(move || {
         supervisor.run(
@@ -158,7 +157,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
                         .write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
                 }
             },
-            move || stopping.load(Ordering::Acquire),
+            &stopping,
         );
     });
 
@@ -212,5 +211,5 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     assert_answers(&path, "the reopened socket answers");
 
     verbs.release();
-    stop.store(true, Ordering::Release);
+    stop.set();
 }

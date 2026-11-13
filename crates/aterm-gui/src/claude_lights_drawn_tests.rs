@@ -430,6 +430,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         frame_row: 7,
         term_row: 7,
         cols: 100..106,
+        ink: 101..105,
         session,
         face,
         program,
@@ -446,7 +447,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         lights.drawn_chip(3, 0, |row| Some(row) == covered)
     };
     let off = HarnessSwitch::Off(SwitchOff::Master);
-    for program in [Program::Claude, Program::Agy, Program::Muse] {
+    for program in [Program::Claude, Program::Agy, Program::Muse, Program::Kimi] {
         for face in [
             off,
             HarnessSwitch::Off(SwitchOff::Agent(program)),
@@ -465,7 +466,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         Drawn::NoRule,
         "no switch drawn: a tab behind"
     );
-    for program in [Program::Claude, Program::Agy, Program::Muse] {
+    for program in [Program::Claude, Program::Agy, Program::Muse, Program::Kimi] {
         for face in [HarnessSwitch::On, HarnessSwitch::TurningOff] {
             assert_eq!(
                 read(&[switch(program, face, 3)], None),

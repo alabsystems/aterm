@@ -76,17 +76,8 @@ pub(crate) const fn reported_len(len: usize, cap: usize) -> usize {
 }
 
 #[cfg(test)]
-mod reported_len_tests {
-    /// An OS-reported output length never passes the buffer it was given.
-    #[test]
-    fn an_os_reported_length_never_passes_its_buffer() {
-        assert_eq!(super::reported_len(300, 255), 255);
-        assert_eq!(super::reported_len(usize::MAX, 16), 16);
-        assert_eq!(super::reported_len(16, 16), 16);
-        assert_eq!(super::reported_len(4, 255), 4, "control: a length inside the buffer stands");
-        assert_eq!(super::reported_len(0, 255), 0);
-    }
-}
+#[path = "mod_reported_len_tests.rs"]
+mod reported_len_tests;
 
 #[cfg(all(not(windows_platform), not(macos_platform), not(x11_platform), not(wayland_platform),))]
 compile_error!("The platform you're compiling for is not supported by winit");

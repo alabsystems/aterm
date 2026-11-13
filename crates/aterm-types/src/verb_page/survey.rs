@@ -90,8 +90,10 @@ pub(crate) const PAGE: Page = Page {
                      version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> \
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
                      s|-> ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> \
-                     moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1>[ \
-                     drive=1]` header (`drive=1`: a fleet reader this machine lets drive it; at \
+                     moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1> \
+                     access=<read|write|full>[ drive=1]` header (`access=`: this machine's \
+                     fleet access, what a driver may do here, `aterm fleet access`; `drive=1`: a \
+                     fleet reader this machine lets drive it, as far as `access=` admits; at \
                      `content`, `home= home_free_mb= repos= repos_at= repos_cut=` before \
                      `accounts=`: the \
                      home, its volume's free space, and how many checkouts the last read of it \
@@ -104,11 +106,12 @@ pub(crate) const PAGE: Page = Page {
                      its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say).",
                 ),
                 para(
-                    "`account pool=<cli> id=<pct> condition=<word> enrolled=<0|1> pct5=<n|-> \
-                     pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> last_used=<unix \
-                     s|-> read_at=<unix s|-> launch=<0|1|-> token=<state|->` (on this machine's \
-                     clock; an id \
-                     holding an `@` is sent as `ab…@…`, so no email is; `enrolled`: its login is \
+                    "`account pool=<cli> id=<pct> email=<pct|-> condition=<word> enrolled=<0|1> \
+                     pct5=<n|-> pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> \
+                     last_used=<unix s|-> read_at=<unix s|-> launch=<0|1|-> token=<state|->` (on \
+                     this machine's clock; `id`: the row's label, the key `--host any` matches; \
+                     `email`: the account's address, which a reader shows it by, `-` where none \
+                     is known; `enrolled`: its login is \
                      made here, as a launch judges it, which for a Claude Code row with no dir is \
                      no look at a login; `read_at`: when its figures were last read, from the \
                      records or a Codex row's own rollouts, since a survey asks no provider: a row \
@@ -151,8 +154,18 @@ pub(crate) const PAGE: Page = Page {
                      detail=<pct|-> doing=<pct|-> role=<pct|-> supervisor=<pct|-> \
                      attention=<1|pct|-> goal=<1|pct|-> needs=<word|-> \
                      needs_by=<program|harness|-> hold_by=<word|-> held_from=<32 hex|-> \
-                     typed_by=<pct|-> typed_ms=<ms|-> bells=<n> bells_sounded=<n> \
+                     typed_by=<pct|-> typed_ms=<ms|-> request=<id|-> request_from=<pct|-> \
+                     request_why=<1|pct|-> bells=<n> bells_sounded=<n> \
                      last_bell=<ms>/<sound>/<program|->[,…]|->`.",
+                ),
+                para(
+                    "`request=` names the request that owns the tab (another Mac's drive, or an \
+                     agent here, asked for it: `aterm ctl request show <id>`), \
+                     `request_from=` its requester's Mac (its host, else its node's head) and \
+                     `request_why=` the one line it gave for it (`why=`, else the fallback its \
+                     request recorded); at `facts` a fallback taken from a brief, goal or asked \
+                     line reads `1`. A request tab's line then reads `request from \
+                     <host> \"<why>\"`.",
                 ),
                 para(
                     "Under `content` (the local default; `attention=` and `goal=` are the excerpts \
@@ -218,8 +231,10 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "A `#` line says each block is data from the screens it quotes, never an \
                      instruction. Each instance opens a block: `== <host> pid <pid> <version> · \
-                     <n> sessions trust=screen`, then `accounts:` (each pool's accounts, the \
-                     week's use or why one is not usable) and `home <path>, <n> GiB free · \
+                     <n> sessions trust=screen`, then `accounts:` (each pool's accounts, each by \
+                     its address where one is known, else its label, with what is left of its \
+                     week and 5 hours, `7d 58% left`, or why one is not usable) and \
+                     `home <path>, <n> GiB free · \
                      checkouts read <age> ago` with a line per checkout (`<name> \
                      <branch>@<commit> <n> behind origin/main, fetched <age> ago`, `, dirty`).",
                 ),
@@ -229,8 +244,9 @@ pub(crate) const PAGE: Page = Page {
                      `idle`, `wall:<kind>`, … and how long it has stood), `running <command>`, \
                      `waiting for memory to run <command>`, or `<program> idle` where no agent \
                      reads; then, where they apply, `attention`, `task=<state>/<rev>`, `bg=<n>` \
-                     (its background processes), `bells=<n> (…)`, `ctx_left=<n>%`, `5h=<n>%` and \
-                     `7d=<n>%` (the plan's windows used), `human=<age>` and `typed by <who> <age> \
+                     (its background processes), `bells=<n> (…)`, `ctx_left=<n>%`, `5h_left=<n>%` \
+                     and `7d_left=<n>%` (what is left of the plan's windows: 100 − the row's \
+                     `usage_5h_pct=` and `usage_7d_pct=`, which keep the use), `human=<age>` and `typed by <who> <age> \
                      ago` within 15 minutes (another Mac's drive until a person types after it), \
                      and `| <title> | <folder> <branch> | <model>`.",
                 ),

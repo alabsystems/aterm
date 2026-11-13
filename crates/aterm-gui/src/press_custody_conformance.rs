@@ -3,8 +3,6 @@
 
 //! Tier-1 trace conformance for `PressCustody` (who owns the reading position and the highlight), bound to the shipping code.
 
-#![cfg(test)]
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 

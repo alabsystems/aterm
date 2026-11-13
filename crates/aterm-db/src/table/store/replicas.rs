@@ -141,10 +141,20 @@ impl Store {
         if AGREEMENT_MUTANT.get() == 2 {
             return Err(Error::new("injected replica agreement refusal"));
         }
+        // The combined view's index: this store's, with each primary record and source admitted
+        // to it before this store holds them.
+        self.index()?;
+        let mut index = self
+            .index
+            .take()
+            .ok_or_else(|| Error::new("invalid retained table header"))?;
         primary.writers.clear();
+        primary.operation_bytes = 0;
         for (id, stored) in std::mem::take(&mut primary.records) {
             if let Some(existing) = self.records.get(&id) {
-                if existing.wire != stored.wire || existing.quarantine != stored.quarantine {
+                if existing.wire.as_slice() != stored.wire.as_slice()
+                    || existing.quarantine != stored.quarantine
+                {
                     return Err(Error::new(
                         "local table replicas disagree on retained evidence",
                     ));
@@ -152,7 +162,7 @@ impl Store {
                 continue;
             }
             self.admit(&stored.header, stored.wire.len())?;
-            self.index
+            index
                 .insert(stored.header.clone())
                 .map_err(|_| Error::new("combined table index exceeds its bound"))?;
             self.operation_bytes += stored.wire.len();
@@ -180,12 +190,13 @@ impl Store {
             }
             self.admit_proof(&stored.conflict)?;
             if let Some(source) = stored.conflict.discarded() {
-                self.index
+                index
                     .insert(source.header.clone())
                     .map_err(|_| Error::new("combined negative evidence exceeds its bound"))?;
             }
             self.conflicts.insert(key, stored);
         }
+        self.index = OnceLock::from(index);
         // The rows moved into the combined view; this private handle retains
         // both original path/claim/witness checks and has no append handle.
         self.observed_primary = Some(Box::new(primary));

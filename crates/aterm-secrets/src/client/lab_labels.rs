@@ -10,7 +10,7 @@
 //! `[machines]` name, the roster's denied labels (a removed Mac's included: the roster read
 //! overlays the log's removals as denied labels), and each other seat's bare label in the
 //! membership log. Only a Mac holds a number: none is reserved, `m3` included, and no role or
-//! policy list holds one (owner ruling, 2026-11-09). This Mac's own row and seats never free
+//! policy list holds one. This Mac's own row and seats never free
 //! another Mac's hold. A fleet-accounts sheet's numbers hold nothing: a rename onto one binds its
 //! rows to this Mac, which is how the owner names a Mac its sheet already knows.
 

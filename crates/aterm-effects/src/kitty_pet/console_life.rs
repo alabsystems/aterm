@@ -1028,7 +1028,7 @@ impl PetBrain {
         );
     }
 
-    /// As [`Self::observe_console_with_exclusions`], with the host's transient overlays apart (`overlays`: the Autopilot menu, the find bar; [`PetWorld::observe_with_overlays`]).
+    /// As [`Self::observe_console_with_exclusions`], with the host's transient overlays apart (`overlays`: a fact menu's card, the find bar; [`PetWorld::observe_with_overlays`]).
     #[inline]
     pub fn observe_console_with_overlays(
         &mut self,

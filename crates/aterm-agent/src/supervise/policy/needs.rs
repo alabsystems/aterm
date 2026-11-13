@@ -344,28 +344,19 @@ const MENTION_NOUNS: &[&str] = &[
 
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
 
-/// The finite auxiliaries, a closed class: the forms of `be`, `have` and `do` that carry a tense,
-/// the modals, and their negatives. A bare head one follows is the subject of its clause, no head
-/// (`NEEDS YOU can be lost.`, `NEEDS YOU is loud and never blocks.`: [`subject_of`]). The base
-/// forms `be`, `have` and `do` are not among them: a need opens on one as on any imperative
-/// (`NEEDS YOU have the key ready`).
-const FINITE_AUXILIARIES: &[&str] = &[
-    "is",
-    "are",
-    "was",
-    "were",
-    "isn't",
-    "aren't",
-    "wasn't",
-    "weren't",
-    "has",
-    "had",
-    "hasn't",
-    "hadn't",
-    "does",
-    "did",
-    "doesn't",
-    "didn't",
+/// The finite forms of `be`, `have` and `do` that the person's `you` is never the subject of
+/// (`you is`, `you has` are no English) and their negatives: a bare head one follows is the
+/// subject of its clause, a noun, no head (`NEEDS YOU is loud and never blocks.`:
+/// [`subject_of`]). `are`, `were`, `had`, `did`, the modals and the base forms agree with `you`,
+/// so a need opens on one (`NEEDS YOU had better sign in`, `NEEDS YOU have the key ready`).
+const SINGULAR_FINITES: &[&str] = &[
+    "is", "isn't", "was", "wasn't", "has", "hasn't", "does", "doesn't",
+];
+
+/// The modals and their negatives, a closed class. A modal agrees with any subject, so a bare head
+/// before one names its need (`NEEDS YOU must approve the deploy`, `NEEDS YOU can't push: the
+/// token expired`), unless the modal's verb is `be` ([`subject_of`]: `NEEDS YOU can be lost.`).
+const MODALS: &[&str] = &[
     "can",
     "cannot",
     "can't",
@@ -386,37 +377,92 @@ const FINITE_AUXILIARIES: &[&str] = &[
     "wouldn't",
 ];
 
-/// The subjects behind which an auxiliary asks the person a question, a need (`NEEDS YOU can you
-/// sign in to GitHub`, `NEEDS YOU should I force-push main`: [`subject_of`]).
+/// The adverbs [`subject_of`] reads past between a modal and its `be` (`NEEDS YOU can never be
+/// lost.`, `NEEDS YOU can also be raised by codex-alab.`).
+const MODAL_ADVERBS: &[&str] = &[
+    "not", "never", "always", "also", "still", "only", "now", "just",
+];
+
+/// The subjects a singular finite ([`SINGULAR_FINITES`]) opens a question on, a need (`NEEDS YOU
+/// is it OK to force-push main`, `NEEDS YOU was I right to revert the pin`: [`subject_of`]).
 const ASKED_SUBJECTS: &[&str] = &[
-    "you", "i", "we", "they", "he", "she", "it", "someone", "somebody", "anyone", "anybody",
+    "i",
+    "it",
+    "he",
+    "she",
+    "someone",
+    "somebody",
+    "anyone",
+    "anybody",
+    "everyone",
+    "everybody",
 ];
 
 /// Whether `rest`, the words after a bare head (no separator, no qualifier), make the head the
-/// subject of their clause, so no head: they open on a finite auxiliary ([`FINITE_AUXILIARIES`])
-/// and ask nothing. An auxiliary before a subject ([`ASKED_SUBJECTS`]: `NEEDS YOU can you sign in
-/// to GitHub`), or a question mark anywhere in the words (`NEEDS YOU is the key still valid? If
-/// not, rotate it.`; [`asked_below`] reads them on with the rows wrapped under the head's),
-/// asks the person, and a question to the person is a need.
+/// subject of their clause, a noun, so no head: they open on a singular finite
+/// ([`SINGULAR_FINITES`]: `NEEDS YOU is loud`) or on a modal whose verb is `be` ([`MODALS`],
+/// [`MODAL_ADVERBS`]: `NEEDS YOU can be lost.`, `NEEDS YOU should have been raised`), and they
+/// ask the person nothing. They ask, a need, where the singular finite opens on a subject
+/// ([`ASKED_SUBJECTS`]: `NEEDS YOU is it OK to force-push main`), where their first sentence ends
+/// on a question mark ([`sentence_end`]: `NEEDS YOU is the key still valid? If not, rotate it.`,
+/// and not `NEEDS YOU is loud. Why does it matter?`), and where a colon follows their first word,
+/// which opens the need on it (`NEEDS YOU is: approve the deploy`).
 fn subject_of(rest: &str) -> bool {
-    let mut words = rest
+    let lead = rest.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let first = lead
+        .find(|c: char| !c.is_alphanumeric() && !matches!(c, '\'' | '’'))
+        .unwrap_or(lead.len());
+    if lead[first..].trim_start().starts_with(':') {
+        return false;
+    }
+    let mut words = lead
         .split(|c: char| !c.is_alphanumeric() && !matches!(c, '\'' | '’'))
         .map(|w| w.trim_matches(['\'', '’']).replace('’', "'").to_lowercase())
         .filter(|w| !w.is_empty());
-    let Some(first) = words.next() else {
-        return false;
-    };
-    FINITE_AUXILIARIES.contains(&first.as_str())
-        && !words
+    let subject = match words.next() {
+        Some(w) if SINGULAR_FINITES.contains(&w.as_str()) => !words
             .next()
-            .is_some_and(|w| ASKED_SUBJECTS.contains(&w.as_str()))
-        && !rest.contains('?')
+            .is_some_and(|w| ASKED_SUBJECTS.contains(&w.as_str())),
+        Some(w) if MODALS.contains(&w.as_str()) => {
+            let mut verb = words.skip_while(|w| MODAL_ADVERBS.contains(&w.as_str()));
+            match verb.next().as_deref() {
+                Some("be") => true,
+                Some("have") => verb.next().as_deref() == Some("been"),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    subject && sentence_end(rest) != Some('?')
+}
+
+/// The mark the first sentence of `words` ends on outside brackets: a `.`, `!` or `?` that
+/// whitespace or the words' end follows, past any closing mark (`lost.**`, but not `docs?page`,
+/// `v1.2` or `(is it ever hidden? no)`), or `None` where none of them ends a sentence.
+fn sentence_end(words: &str) -> Option<char> {
+    const CLOSERS: &[char] = &['*', '_', '`', '"', '\'', '”', '’', ')', ']'];
+    let mut depth = 0usize;
+    for (at, c) in words.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            '.' | '!' | '?' if depth == 0 => {
+                let after = words[at + c.len_utf8()..].trim_start_matches(CLOSERS);
+                if after.is_empty() || after.starts_with(char::is_whitespace) {
+                    return Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether the words of `text` at byte `at` open on the `you` of a NEEDS YOU token ([`needs_token`],
 /// any case) whose clause has it for its subject ([`subject_of`]: `needs you can be lost`): a
-/// noun naming the head, not the person, so no phrase that opens on that `you` (`you can`)
-/// asks them anything.
+/// noun naming the head, not the person, so no phrase that opens on that `you` (`you can`,
+/// `you must` in `NEEDS YOU must be answered`) asks them anything. Where the clause does not
+/// (`NEEDS YOU must log in to the portal`), the `you` is the person's and its phrase asks.
 pub(super) fn token_you(text: &str, at: usize) -> bool {
     let before = text[..at].trim_end_matches([' ', '\t', '\u{a0}', '\u{202f}', '-', '_']);
     let start = before.trim_end_matches(char::is_alphabetic).len();
@@ -697,9 +743,10 @@ fn need_rest(line: &str) -> Option<&str> {
 /// opens go on with the clause the head sits in, and a qualifier with none after it names the
 /// noun (`No session has a NEEDS YOU (checked all six tabs).`); neither is a need, unless the
 /// qualifier says none (`the NEEDS YOU (none)`). A bare head, one no separator or qualifier
-/// follows, before a finite auxiliary is the subject of its clause, no head ([`subject_of`]:
-/// `NEEDS YOU can be lost.`), unless its words ask the person a question; an imperative or a noun
-/// after it is its need (`NEEDS YOU approve the deploy`, `NEEDS YOU the release credential`).
+/// follows, is no head where its words make it the subject of their clause and ask the person
+/// nothing ([`subject_of`]: `NEEDS YOU is loud`, `NEEDS YOU can be lost.`); a modal and its verb,
+/// an imperative or a noun after it is its need (`NEEDS YOU must approve the deploy`, `NEEDS YOU
+/// approve the deploy`, `NEEDS YOU the release credential`).
 fn head_from(t: &str, named: bool, inside: bool) -> Option<&str> {
     head_parts(t, named, inside)
         .filter(|&(rest, bare)| !(bare && subject_of(rest)))
@@ -1303,23 +1350,24 @@ fn cut_instruction(rest: &str, rows: &[&str]) -> bool {
     false
 }
 
-/// The words of the bare head `rows[i]` opens before a finite auxiliary ([`subject_of`]) where a
-/// row the writer or the screen wrapped under it ([`wraps`]) asks the line's question:
-/// `NEEDS YOU can the release go out` above `today?` asks the person, a need.
-fn asked_below<'a>(rows: &[&'a str], i: usize) -> Option<&'a str> {
-    let (rest, _) = head_parts(past_need_lead(unquoted(rows[i])), false, false)?;
+/// The need's words of the head `rows[i]` opens, as [`need_rest`] reads them, but a bare head is
+/// judged on its line's first sentence read on into the rows the writer or the screen wrapped
+/// under it ([`wraps`]): `NEEDS YOU is the release key still` above `valid?` asks the person, a
+/// need, and `NEEDS YOU can` above `be lost.` is its clause's subject, none ([`subject_of`]).
+fn head_need<'a>(rows: &[&'a str], i: usize) -> Option<&'a str> {
+    let (rest, bare) = head_parts(past_need_lead(unquoted(rows[i])), false, false)?;
+    if !bare {
+        return Some(rest);
+    }
     let mut line = rest.to_string();
     for next in &rows[i + 1..] {
-        if !wraps(&line, next) {
-            return None;
+        if sentence_end(&line).is_some() || !wraps(&line, next) {
+            break;
         }
         line.push(' ');
         line.push_str(unquoted(next).trim_end());
-        if !subject_of(&line) {
-            return Some(rest);
-        }
     }
-    None
+    (!subject_of(&line)).then_some(rest)
 }
 
 const MID_OPENS: &[char] = &['*', '_', '`', '['];
@@ -1476,7 +1524,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
         let opens = if named_above || inside_above {
             head_from(past_need_lead(unquoted(row)), named_above, inside_above)
         } else {
-            need_rest(row).or_else(|| asked_below(&rows, i))
+            head_need(&rows, i)
         };
         let rest = match opens {
             Some(rest) => {

@@ -62,6 +62,10 @@ pub const MOVE_BUDGET_S: u64 = 24 * 3_600;
 
 const _: () = assert!(MOVE_BUDGET_S > STALLED_AFTER_S);
 
+// The agent's own work is told and moved over well inside the move clock, which stays the
+// attention clock of the holds with no bound of aterm's: Autopilot off, a person, a wall.
+const _: () = assert!(upgrade::WORK_TELL_S + upgrade::WORK_DEADLINE_S < MOVE_BUDGET_S);
+
 /// How long no look may have read a record before it reads `unwatched`.
 pub const UNWATCHED_AFTER_S: u64 = 2 * super::WATCH_GAP;
 
@@ -287,6 +291,9 @@ pub struct Row {
     /// ([`upgrade::Step::Tell`]: `St::tells`, `St::told_at`; `0`: never).
     pub agent_tells: u32,
     pub agent_told_at: u64,
+    /// When the restart stops waiting for the agent's own work: the deadline its one line named
+    /// (`St::deadline_at`; `0`: none told).
+    pub agent_deadline_at: u64,
     /// A `/goal` was in force at the last look that read the screen (`St::goal`).
     pub goal: bool,
     /// The launch's relaunch line as the record planned it.
@@ -440,6 +447,7 @@ impl Row {
             own_work_at: st.own_work_at,
             agent_tells: if st.told_to == st.to { st.tells } else { 0 },
             agent_told_at: if st.told_to == st.to { st.told_at } else { 0 },
+            agent_deadline_at: st.deadline_at,
             goal: st.goal,
             line: st.line.clone(),
             fresh: crate::harness::relaunch::starts_afresh(&st.cause),
@@ -508,7 +516,7 @@ impl Row {
                 pid: h.pid,
                 name: h.name.clone(),
                 age_s: now.saturating_sub(h.since),
-                command: String::new(),
+                ..upgrade::Held::default()
             })
             .collect();
         let words = upgrade::held_list(&held);
@@ -990,6 +998,9 @@ impl Row {
             "limited" if self.spend_held() => "it moves once you add credits or raise the cap",
             "limited" => "it moves once the limit resets",
             "login" => "it moves once it is logged in again",
+            crate::harness::upgrade_drive::UNREAD_VERSION => {
+                "each look reads it again, and it moves once it is read"
+            }
             w if w.starts_with("status-stale") && self.quiet => {
                 "it moves once Claude Code says it is idle again, or at once on the owner's \
                  word to upgrade now"
@@ -1510,6 +1521,7 @@ impl Row {
             ("limit_until", self.limit_until),
             ("agent_tells", u64::from(self.agent_tells)),
             ("agent_told_at", self.agent_told_at),
+            ("agent_deadline_at", self.agent_deadline_at),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -1653,6 +1665,10 @@ impl Row {
             Cause::Queued => "its notices wait unread behind its queue".to_string(),
             Cause::Unreached => "aterm cannot reach its tab to ask".to_string(),
             Cause::BuildFails => "its new build fails to start".to_string(),
+            Cause::VersionUnread => {
+                "aterm cannot read the version of its build or of the build it would move to"
+                    .to_string()
+            }
             Cause::NextPoint => NEXT_POINT_CAUSE.to_string(),
             Cause::NoLook => "no look has recorded what it waits on".to_string(),
             Cause::Unclassified(wait) => {
@@ -1676,6 +1692,7 @@ impl Row {
             WaitClass::Queued => Cause::Queued,
             WaitClass::Unreached => Cause::Unreached,
             WaitClass::BuildFails => Cause::BuildFails,
+            WaitClass::VersionUnread => Cause::VersionUnread,
             WaitClass::NextPoint => Cause::NextPoint,
             WaitClass::Unrecorded => Cause::NoLook,
             WaitClass::Unclassified => {
@@ -1767,7 +1784,7 @@ pub(super) enum WaitClass {
     Person,
     /// A usage limit, until its reset.
     Limit,
-    /// A tab, screen, shell integration or process aterm cannot read.
+    /// A tab, screen, shell integration, process or build aterm cannot read.
     TabUnread,
     /// A move already under way.
     UnderWay,
@@ -1779,6 +1796,10 @@ pub(super) enum WaitClass {
     Unreached,
     /// The build it would move to failed to start, and is not proved to start.
     BuildFails,
+    /// The version of its build, or of a build it might move to, could not be read
+    /// ([`crate::harness::upgrade_drive::UNREAD_VERSION`], and Claude Code's
+    /// `version-unreadable` for the build its session runs), so whether it is behind is unknown.
+    VersionUnread,
     /// Nothing holds it now ([`upgrade::NEXT_POINT`]).
     NextPoint,
     /// No look has recorded a wait.
@@ -1799,6 +1820,7 @@ impl WaitClass {
             WaitClass::Queued => "queued",
             WaitClass::Unreached => "unreached",
             WaitClass::BuildFails => "build-fails",
+            WaitClass::VersionUnread => "version-unread",
             WaitClass::NextPoint => "next-point",
             WaitClass::Unrecorded => "unrecorded",
             WaitClass::Unclassified => "unclassified",
@@ -1847,11 +1869,10 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
             | "no-process"
             | "argv-unreadable"
             | "exe-unreadable"
-            | "version-unreadable"
             | "home-unreadable",
             _,
         ) => WaitClass::TabUnread,
-        ("in-flight" | upgrade::PRESSED, _) => WaitClass::UnderWay,
+        ("in-flight" | "confirming" | upgrade::PRESSED, _) => WaitClass::UnderWay,
         (_, "left-typed:screen-unreadable") => WaitClass::TabUnread,
         ("left-typed", _) => WaitClass::Person,
         ("announce-refused", _) => WaitClass::Notice,
@@ -1866,6 +1887,9 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
             _,
         ) => WaitClass::Unreached,
         (crate::harness::upgrade_drive::BUILD_FAILS, _) => WaitClass::BuildFails,
+        (crate::harness::upgrade_drive::UNREAD_VERSION | "version-unreadable", _) => {
+            WaitClass::VersionUnread
+        }
         (upgrade::NEXT_POINT, _) => WaitClass::NextPoint,
         ("", "") => WaitClass::Unrecorded,
         _ => WaitClass::Unclassified,
@@ -1907,6 +1931,10 @@ fn unworded_waiting_line(wait: &str) -> &'static str {
             WaitClass::BuildFails => {
                 "its new build fails to start, so aterm moves no agent onto it; it moves once a \
                  build that starts is installed"
+            }
+            WaitClass::VersionUnread => {
+                "aterm cannot yet read the version of its build or of the build it would move \
+                 to; it reads them again on its own and moves once it can"
             }
             WaitClass::NextPoint => NEXT_POINT_CAUSE,
             WaitClass::Unrecorded | WaitClass::Unclassified => {
@@ -2196,7 +2224,7 @@ enum Cause {
     CouldNotType,
     /// Notices wait unread behind the conversation's queue.
     Queued,
-    /// A tab, screen, shell integration or process aterm cannot read.
+    /// A tab, screen, shell integration, process or build aterm cannot read.
     TabUnread,
     /// A move already under way.
     UnderWay,
@@ -2204,6 +2232,8 @@ enum Cause {
     Unreached,
     /// The build it would move to fails to start.
     BuildFails,
+    /// The version of its build, or of a build it might move to, could not be read.
+    VersionUnread,
     /// Nothing holds it now: the last look found no gate, and its next step goes at the next point.
     NextPoint,
     /// No look has recorded what it waits on.
@@ -2383,7 +2413,7 @@ impl Row {
         let wait = self.wait.strip_prefix("release:").unwrap_or(&self.wait);
         let own = matches!(
             self.cause(),
-            Cause::CouldNotType | Cause::TabUnread | Cause::Unclassified(_)
+            Cause::CouldNotType | Cause::TabUnread | Cause::VersionUnread | Cause::Unclassified(_)
         ) || matches!(
             wait,
             "settling"
@@ -2500,23 +2530,29 @@ impl Row {
             self.wait.strip_prefix("release:").unwrap_or(&self.wait),
             "background" | "background-terminal"
         );
+        // aterm ends that work itself only past the deadline it told the agent, which it tells
+        // only a session its Autopilot carries: the words claim no more than that.
         let why = match (holders > 0, self.goal) {
-            (true, true) => {
-                "aterm never ends running work: its /goal is active and work it started still runs"
-            }
-            (true, false) => "aterm never ends running work, and work it started is still running",
-            (false, true) => "aterm never ends running work, and its /goal is still active",
-            (false, false) if breaking => {
-                "aterm never ends running work, and its background work is still running"
-            }
-            (false, false) => "aterm never ends running work, and it is busy with work of its own",
+            (true, true) => "its /goal is active and work it started still runs",
+            (true, false) => "work it started is still running",
+            (false, true) => "its /goal is still active",
+            (false, false) if breaking => "its background work is still running",
+            (false, false) => "it is busy with work of its own",
         };
-        let then = if self.goal && holders > 0 {
+        let told = match self.agent_deadline_at {
+            0 => None,
+            at if at > now => Some(format!(
+                "aterm told the agent: it restarts at its first turn end in {}",
+                upgrade::span(at - now)
+            )),
+            _ => Some("aterm told the agent: it restarts at its next turn end".to_string()),
+        };
+        let then = if let Some(told) = told.as_deref() {
+            told
+        } else if self.goal && holders > 0 {
             "End its /goal and that work in the tab when it suits you"
         } else if self.goal {
             "End its /goal in the tab when it suits you"
-        } else if self.agent_tells > 0 {
-            "aterm told the agent, and it moves once none of its own work runs"
         } else if holders > 0 || breaking {
             "Stop that work in the tab when it suits you"
         } else {
@@ -3288,8 +3324,12 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "queued" => "it has not read the upgrade's question yet",
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
+        "confirming" => "its last restart is still being checked",
         upgrade::PRESSED => "the owner pressed its update arrow: that press moves it",
         crate::harness::upgrade_drive::BUILD_FAILS => "its new build fails to start",
+        crate::harness::upgrade_drive::UNREAD_VERSION => {
+            "aterm is still reading which build it would move to"
+        }
         "announce-refused:changed" => {
             "aterm could not type its notice: the screen moved as it typed"
         }
@@ -5062,6 +5102,7 @@ pub fn progress_projection(row: &Row, now: u64) -> BTreeMap<&'static str, i64> {
         | WaitClass::Queued
         | WaitClass::Unreached
         | WaitClass::BuildFails
+        | WaitClass::VersionUnread
         | WaitClass::NextPoint
         | WaitClass::Unrecorded
         | WaitClass::Unclassified => 3,

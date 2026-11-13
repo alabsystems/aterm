@@ -649,7 +649,7 @@ fn only_one_line_is_open_at_a_time() {
 /// in turn: no row is drawn twice, and none is both a line's row and the card's.
 #[test]
 fn no_row_appears_twice_on_any_page() {
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let status = status_of(name);
         let mut app = reading(&status);
         let (_, card, _) = drawn(&app);
@@ -738,7 +738,7 @@ fn the_worst_case_secrets_line_open_at_900_by_644_never_scrolls_the_page() {
 #[test]
 fn every_collapsed_page_fits_900_by_644_with_no_scrolling() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let view = SystemStateViewState::default();
         let compiled = compile_in(&app, &view, 900.0, 644.0);
@@ -759,7 +759,7 @@ fn every_collapsed_page_fits_900_by_644_with_no_scrolling() {
 /// 13 pt terminal) and compact, collapsed and with each line open.
 #[test]
 fn every_fixture_renders_at_every_size_with_every_line_open() {
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let mut app = reading(&status_of(name));
         for (w, h) in [
             (900.0, 644.0),
@@ -866,7 +866,7 @@ fn the_default_join_stays_automatic_after_its_initial_observation_interval() {
         !quiet.needs_attention(),
         "the tab is not lit for a calm wait"
     );
-    assert!(crate::system_state_access::menu_line(&quiet.status, false).is_none());
+    assert!(crate::system_state_access::menu_line(&quiet.status).is_none());
 
     let long = reading(&status_of("vault-asking-long"));
     assert!(long.status.joins_quietly());
@@ -958,6 +958,7 @@ fn the_lockup_names_alab_only_on_an_alab_mac() {
     };
     assert!(alab("set-up"));
     assert!(!alab("non-alab"));
+    assert!(!alab("non-alab-absent"));
 
     // Isolate vault evidence from the profile selection's independent ALab signal.
     let mut selection = Selection::none();
@@ -1218,7 +1219,7 @@ fn aterms_own_stopped_sync_asks_no_press_and_is_mended_by_itself() {
 fn no_text_is_cut_at_any_real_window_size() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut cut = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let mut app = reading(&status_of(name));
         for width in [320.0_f32, 400.0, 480.0, 560.0, 640.0, 720.0, 800.0, 900.0] {
             for height in [420.0_f32, 644.0] {
@@ -1306,7 +1307,7 @@ fn the_walk_is_one_card_item_at_its_current_page() {
 #[test]
 fn full_progress_means_every_line_is_done() {
     let mut disagree = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let (lines, _, hero) = drawn(&app);
         if hero.total == 0 || hero.done < hero.total {
@@ -1328,15 +1329,27 @@ fn full_progress_means_every_line_is_done() {
 }
 
 /// §4.4 "success only for done": a Mac in no vault syncs no secret and no identity, so its
-/// Secrets line is never done: it says it is not joined and why.
+/// Secrets line is never done: it says it is not joined and why. Where the vault's address did
+/// not answer, nothing says there is no vault: the line says aterm asks again by itself (H15).
 #[test]
 fn a_mac_in_no_vault_never_reads_secrets_done() {
-    let app = reading(&status_of("non-alab"));
-    let secrets = line_of(&app, Line::Secrets);
-    assert_eq!(
-        (secrets.mark, secrets.phrase.as_str(), secrets.word),
-        (Mark::Off, lines::NO_VAULT_HERE, "not joined")
-    );
+    for (name, phrase, word) in [
+        ("non-alab-absent", lines::NO_VAULT_HERE, "not joined"),
+        ("non-alab", lines::VAULT_ASKS_AGAIN, "asking"),
+    ] {
+        let app = reading(&status_of(name));
+        let secrets = line_of(&app, Line::Secrets);
+        assert_eq!(
+            (
+                secrets.mark,
+                secrets.phrase.as_str(),
+                secrets.word,
+                secrets.quiet
+            ),
+            (Mark::Off, phrase, word, true),
+            "{name}"
+        );
+    }
 }
 
 /// §4.7: the headline is a Heading and the live region says the phase in words of its own, so a
@@ -1344,7 +1357,7 @@ fn a_mac_in_no_vault_never_reads_secrets_done() {
 #[test]
 fn the_live_region_never_repeats_the_heading() {
     let mut twice = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let compiled = compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
         let heading = semantic(&compiled, "system-state/headline");
@@ -1360,7 +1373,7 @@ fn the_live_region_never_repeats_the_heading() {
 #[test]
 fn the_live_region_never_carries_a_count() {
     let mut counted = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let compiled = compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
         let phase = semantic(&compiled, "system-state/phase");
@@ -1510,7 +1523,7 @@ fn the_headline_is_heard_before_the_progress() {
 #[test]
 fn progress_never_says_zero_of_zero() {
     let mut zero = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let compiled = compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
         if semantic(&compiled, "system-state/progress")
@@ -1555,7 +1568,7 @@ fn a_lines_name_is_said_once() {
 #[test]
 fn a_line_label_says_its_state_once() {
     let mut twice = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         for line in drawn(&app).0 {
             if line.label.to_lowercase().matches(line.word).count() > 1 {
@@ -1570,7 +1583,7 @@ fn a_line_label_says_its_state_once() {
 #[test]
 fn the_live_region_names_what_the_card_asks() {
     let mut wrong = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let (_, card, hero) = drawn(&app);
         let needs: Vec<&CardItem> = card.iter().filter(|i| i.mark == Mark::NeedsYou).collect();
@@ -1591,7 +1604,7 @@ fn the_live_region_names_what_the_card_asks() {
 #[test]
 fn a_needs_you_headline_has_its_card_item() {
     let mut bare = Vec::new();
-    for name in FIXTURES {
+    for &name in FIXTURES {
         let app = reading(&status_of(name));
         let (_, card, hero) = drawn(&app);
         let says = hero.headline.to_lowercase().contains("needs you")

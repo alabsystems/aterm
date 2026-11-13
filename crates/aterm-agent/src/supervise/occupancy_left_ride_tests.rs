@@ -121,7 +121,7 @@ fn settled_rows(met: Met) -> Vec<(String, String)> {
 /// THE HUNG CALL'S FACT LEFT WITH THE TURN END'S ACT IT RODE IS SETTLED AT THE NEXT LOOK: the act
 /// written and its Enter refused, the fact is `waiting … left`; at the next point's read (looked
 /// at before the policy decides) a risen count or a live turn seen with the composer clear tells
-/// it (`settled=submitted|turn`, the host told once), and the next act carries it no more; a
+/// it (`settled=submitted|turn`, no person told), and the next act carries it no more; a
 /// composer cleared unsent releases it (`why=cleared`), and that same point's act carries it
 /// again, told then; the session gone releases it (`why=gone`), told never.
 #[test]
@@ -154,15 +154,14 @@ fn a_riders_fact_left_in_the_composer_is_settled_at_the_next_look() {
             .iter()
             .filter(|c| c.starts_with("inform "))
             .collect();
+        assert!(informs.is_empty(), "{met:?}: no person told: {informs:#?}");
         match met {
             Met::Gone => {
                 assert_eq!(ran.told, [false], "{met:?}");
-                assert!(informs.is_empty(), "{met:?}: {informs:#?}");
             }
             Met::Cleared => {
                 assert_eq!(ran.told, [true]);
                 assert!(ran.sent[1][0].ends_with(&riding(BORN)), "{:#?}", ran.sent);
-                assert_eq!(informs, [&format!("inform {}", stuck(BORN))]);
             }
             Met::Sent | Met::Turn => {
                 assert_eq!(ran.told, [true], "{met:?}");
@@ -171,7 +170,6 @@ fn a_riders_fact_left_in_the_composer_is_settled_at_the_next_look() {
                     "{met:?}: told once: {:#?}",
                     ran.sent
                 );
-                assert_eq!(informs, [&format!("inform {}", stuck(BORN))], "{met:?}");
             }
         }
     }
@@ -246,7 +244,7 @@ fn a_wakes_fact_left_with_a_points_act_keeps_its_claim_until_the_look() {
 
 /// THE STUCK LINE LEFT AT A BREAK IS SETTLED AT THE NEXT LOOK, the break's one line meanwhile: the
 /// line written under the owner's `stuck_break_note` and its Enter refused is `waiting … left`;
-/// the next break's read tells it where the count rose or a turn ran (the host told once, nothing
+/// the next break's read tells it where the count rose or a turn ran (no person told, nothing
 /// typed again), and releases it where the composer was cleared, the line typed again past the
 /// session's pace, or the session went.
 #[test]
@@ -271,6 +269,7 @@ fn the_stuck_line_left_at_a_break_is_settled_at_the_next_look() {
             .iter()
             .filter(|c| c.starts_with("inform "))
             .count();
+        assert_eq!(informs, 0, "{met:?}: no person told");
         match met {
             Met::Sent | Met::Turn => {
                 assert!(
@@ -278,15 +277,13 @@ fn the_stuck_line_left_at_a_break_is_settled_at_the_next_look() {
                     "{met:?}: told once: {:#?}",
                     ran.sent
                 );
-                assert_eq!(informs, 1, "{met:?}");
             }
             Met::Cleared => {
                 want.extend(pairs(&[("typed", "door=break")]));
                 assert!(ran.sent[1].is_empty(), "the pace holds it: {:#?}", ran.sent);
                 assert_eq!(ran.sent[2], [stuck(BORN)], "past the pace: {:#?}", ran.sent);
-                assert_eq!(informs, 1);
             }
-            Met::Gone => assert_eq!(informs, 0),
+            Met::Gone => {}
         }
         assert_eq!(words_of(&ran, NO_PROGRESS), want, "{met:?}");
     }

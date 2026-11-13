@@ -9,21 +9,11 @@ use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::session_usage::{ModelTokens, UsageFacts};
 
 use super::{
-    ModelSwitch, Pick, SwitchTarget, Tops, default_mask_for, fact_spoken_of, fact_spoken_with,
-    fact_title, fact_title_with, mask_after, runtime_spoken, tokens_spoken, unread_top,
+    Catalogs, EFFORT_SETTLE, EffortWish, ModelFamily, default_mask_for, effort_stops,
+    fact_spoken_of, fact_spoken_with, fact_title, fact_title_with, mask_after, model_picks,
+    runtime_spoken, tokens_spoken,
 };
 use crate::claude_lights::Fact;
-use crate::claude_slash::{ModelArg, Slash};
-
-/// The target with nothing read and no setting written: the seed list's first model.
-fn unread() -> SwitchTarget {
-    SwitchTarget::unread().expect("the seed's first id is a `/model` argument")
-}
-
-/// [`super::switch_plan`] toward [`unread`].
-fn switch_plan(facts: &FooterFacts, switch: &ModelSwitch) -> super::SwitchPlan {
-    super::switch_plan(facts, switch, unread())
-}
 
 fn facts() -> FooterFacts {
     FooterFacts {
@@ -50,22 +40,30 @@ fn mask(kinds: &[FactKind]) -> FactMask {
         .fold(FactMask::default(), |m, k| m.with(*k, true))
 }
 
-/// A MUSE SESSION STARTS WITHOUT THE FACTS ITS OWN STATUS LINE PRINTS (model, effort,
-/// folder), and with everything aterm alone knows still shown; every other program
-/// starts with nothing hidden.
+/// A MUSE OR KIMI SESSION STARTS WITHOUT THE FACTS ITS OWN STATUS ROWS PRINT, and with
+/// everything aterm alone knows still shown; every other program starts with nothing hidden.
 #[test]
-fn a_muse_session_starts_without_repeating_its_own_status_line() {
+fn a_session_starts_without_repeating_its_own_status_rows() {
     use aterm_phase::Program;
     assert_eq!(
         default_mask_for(Some(Program::Muse)),
         mask(&[FactKind::Model, FactKind::Effort, FactKind::Path])
+    );
+    assert_eq!(
+        default_mask_for(Some(Program::Kimi)),
+        mask(&[
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch,
+            FactKind::Context,
+        ])
     );
     for other in [
         None,
         Some(Program::Claude),
         Some(Program::Codex),
         Some(Program::Grok),
-        Some(Program::Kimi),
         Some(Program::Agy),
         Some(Program::Generic),
     ] {
@@ -113,56 +111,41 @@ fn a_title_names_the_value_and_the_click() {
     assert_eq!(
         title(&shown, Fact::Model),
         (
-            "Opus 5.5 \u{b7} click: back to the default model at auto effort \u{b7} \
-             right-click: model menu"
-                .into(),
-            "click: back to the default model at auto effort".into()
+            "Opus 5.5 \u{b7} click: choose model".into(),
+            "click: choose model".into()
         )
     );
     assert_eq!(
-        title(&shown, Fact::Effort).0,
-        "effort xhigh \u{b7} click: back to the default model at auto effort \u{b7} \
-         right-click: effort menu"
-    );
-    let sonnet = FooterFacts {
-        model: Some("Sonnet 4.5".into()),
-        effort: Some("high".into()),
-        ..facts()
-    };
-    assert_eq!(
-        title(&sonnet, Fact::Model).1,
-        "click: switch to Opus 5.5 xhigh"
-    );
-    let remembered = ModelSwitch {
-        back: Some(Pick {
-            model: ModelArg::new("claude-sonnet-4-5"),
-            effort: Some("high"),
-        }),
-        ..ModelSwitch::default()
-    };
-    assert_eq!(
-        fact_title_with(
-            &shown,
-            Some(cwd),
-            Fact::Model,
-            Some((&remembered, unread()))
+        title(&shown, Fact::Effort),
+        (
+            "effort xhigh \u{b7} click: effort slider".into(),
+            "click: effort slider".into()
         )
-        .1,
-        "click: back to Sonnet 4.5 high"
+    );
+    assert_eq!(
+        fact_title_with(&shown, Some(cwd), Fact::Effort, false),
+        (
+            "effort xhigh \u{b7} click: hide \u{b7} right-click: effort menu".into(),
+            "click: hide".into()
+        ),
+        "no Claude Code: nothing types `/effort`, and a click hides it"
     );
     assert_eq!(
         title(&shown, Fact::Path).0,
-        "/Users//someone/aterm \u{b7} click: hide \u{b7} right-click: copy, new tab",
-        "the absolute working directory, not the rule's `~/aterm`"
+        "/Users//someone/aterm \u{b7} right-click: copy, new tab",
+        "the absolute working directory, not the rule's `~/aterm`, and no click: it has none"
     );
     assert_eq!(
         fact_title(&shown, None, Fact::Path).0,
-        "~/aterm \u{b7} click: hide \u{b7} right-click: copy, new tab",
+        "~/aterm \u{b7} right-click: copy, new tab",
         "with no side published, the rule's own path"
     );
     assert_eq!(
-        title(&shown, Fact::Branch).0,
-        "\u{2387} main \u{b7} click: hide \u{b7} right-click: copy"
+        title(&shown, Fact::Branch),
+        (
+            "\u{2387} main \u{b7} right-click: copy".into(),
+            "right-click: copy".into()
+        )
     );
     assert_eq!(
         title(&shown, Fact::Usage),
@@ -215,7 +198,7 @@ fn a_reader_hears_each_fact_in_words() {
         spoken(Fact::Model, none),
         (
             "Model: Opus 5.5".into(),
-            "Activate to switch back to the default model at auto effort.".into()
+            "Activate to choose the model.".into()
         )
     );
     let sonnet = FooterFacts {
@@ -224,23 +207,16 @@ fn a_reader_hears_each_fact_in_words() {
         ..facts()
     };
     assert_eq!(
-        fact_spoken_with(
-            &sonnet,
-            None,
-            Fact::Effort,
-            none,
-            Some((&ModelSwitch::default(), unread()))
-        )
-        .1,
-        "Activate to switch to Opus 5.5 xhigh."
+        fact_spoken_with(&sonnet, None, Fact::Effort, none, true).1,
+        "Activate for the effort slider."
     );
     assert_eq!(
-        fact_spoken_with(&sonnet, None, Fact::Effort, none, None).1,
+        fact_spoken_with(&sonnet, None, Fact::Effort, none, false).1,
         "Activate to hide it.",
         "no Claude Code: nothing types `/model`, and a press hides the effort"
     );
     assert_eq!(
-        fact_title_with(&sonnet, None, Fact::Model, None).0,
+        fact_title_with(&sonnet, None, Fact::Model, false).0,
         "Sonnet 4.5 \u{b7} click: hide \u{b7} right-click: model menu"
     );
     assert_eq!(spoken(Fact::Effort, none).0, "Effort: xhigh");
@@ -248,14 +224,14 @@ fn a_reader_hears_each_fact_in_words() {
         spoken(Fact::Path, none),
         (
             "Working directory: /Users//someone/aterm".into(),
-            "Activate to hide it. Its menu copies it or opens a new tab there.".into()
+            "Activate for its menu: copy it or open a new tab there.".into()
         )
     );
     assert_eq!(
         spoken(Fact::Branch, none),
         (
             "Branch: main".into(),
-            "Activate to hide it. Its menu copies it.".into()
+            "Activate for its menu: copy it.".into()
         )
     );
     assert_eq!(
@@ -335,33 +311,33 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
         spoken,
         "Account: owner@example.com, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
     );
-    let (title, spoken) = said(&with(Some("weekly 38% used")));
+    let (title, spoken) = said(&with(Some("weekly 62% left")));
     assert!(
-        title.contains("weekly 38% used") && !title.contains("until relaunch"),
+        title.contains("weekly 62% left") && !title.contains("until relaunch"),
         "{title}"
     );
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly 38% used"
+        "Account: owner@example.com, Max 20x, weekly 62% left"
     );
-    let (title, spoken) = said(&with(Some("weekly \u{2265}38% used")));
-    assert!(title.contains("weekly \u{2265}38% used"), "{title}");
+    let (title, spoken) = said(&with(Some("weekly \u{2264}62% left")));
+    assert!(title.contains("weekly \u{2264}62% left"), "{title}");
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly at least 38% used"
+        "Account: owner@example.com, Max 20x, weekly at most 62% left"
     );
     let labelled = FooterFacts {
         account: Some("main".into()),
-        ..with(Some("weekly 38% used"))
+        ..with(Some("weekly 62% left"))
     };
     let (title, spoken) = said(&labelled);
     assert!(
-        title.starts_with("\u{2386} owner@example.com \u{b7} Max 20x \u{b7} weekly 38% used"),
+        title.starts_with("\u{2386} owner@example.com \u{b7} Max 20x \u{b7} weekly 62% left"),
         "{title}"
     );
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly 38% used"
+        "Account: owner@example.com, Max 20x, weekly 62% left"
     );
     for words in [&title, &spoken] {
         assert!(!words.contains("main"), "NEGATIVE CONTROL: {words}");
@@ -376,10 +352,10 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
     };
     let (title, spoken) = said(&unmailed);
     assert!(
-        title.starts_with("\u{2386} main \u{b7} Max 20x \u{b7} weekly 38% used"),
+        title.starts_with("\u{2386} main \u{b7} Max 20x \u{b7} weekly 62% left"),
         "{title}"
     );
-    assert_eq!(spoken, "Account: main, Max 20x, weekly 38% used");
+    assert_eq!(spoken, "Account: main, Max 20x, weekly 62% left");
 }
 
 /// A WATCHING ROTATION IS SAID LAST, where accounts are (design §5.1): the account's title and
@@ -393,7 +369,7 @@ fn a_watching_rotation_follows_the_observed_week_or_its_missing_reading_reason()
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
 
     for (known, eligible) in [(Some(2), Some(1)), (Some(2), None), (None, None)] {
-        for weekly in [Some("weekly 38% used"), None] {
+        for weekly in [Some("weekly 62% left"), None] {
             let mut progress = AccountProgress::unknown(100);
             progress.phase = ProgressPhase::Watching;
             progress.known = known;
@@ -451,7 +427,7 @@ fn a_watching_rotation_follows_the_observed_week_or_its_missing_reading_reason()
             assert_eq!(
                 account_unit(&facts)
                     .first()
-                    .is_some_and(|form| form.iter().any(|segment| segment.text == "38%")),
+                    .is_some_and(|form| form.iter().any(|segment| segment.text == "62% left")),
                 weekly.is_some()
             );
             assert_eq!(
@@ -511,7 +487,7 @@ fn every_recovery_phase_says_the_observation_then_the_rotation() {
         let facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
                 email: Some("owner@example.test".into()),
-                weekly: Some("weekly 38% used".into()),
+                weekly: Some("weekly 62% left".into()),
                 ..Default::default()
             }),
             account_progress: Some(progress),
@@ -590,7 +566,7 @@ fn watching_disclosures_use_the_panes_quota_view_without_inventing_a_profile() {
         let mut facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
                 email: Some("owner@example.test".into()),
-                weekly: Some("weekly 38% used".into()),
+                weekly: Some("weekly 62% left".into()),
                 ..Default::default()
             }),
             account_progress: Some(progress),
@@ -617,7 +593,7 @@ fn watching_disclosures_use_the_panes_quota_view_without_inventing_a_profile() {
                 fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0,
             ] {
                 assert!(said.contains("retained-login"), "{said}");
-                for absent in ["owner@example.test", "weekly 38% used", observed, future] {
+                for absent in ["owner@example.test", "weekly 62% left", observed, future] {
                     assert!(!said.contains(absent), "{said}");
                 }
             }
@@ -636,411 +612,333 @@ fn watching_disclosures_use_the_panes_quota_view_without_inventing_a_profile() {
     }
 }
 
-#[test]
-fn a_switch_goes_to_its_target_remembering_the_session_s_own_and_back() {
-    let on = |model: &str, effort: &str| FooterFacts {
+use aterm_agent::harness::profile::{FablePlan, SubscriptionDisplay};
+use aterm_agent::harness::switch_top::{Baked, BakedModel};
+
+fn on(model: &str, effort: &str) -> FooterFacts {
+    FooterFacts {
         model: Some(model.into()),
         effort: Some(effort.into()),
         ..FooterFacts::default()
-    };
-    let opus = ModelArg::new("claude-opus-5-5");
-    let sonnet = Pick {
-        model: ModelArg::new("claude-sonnet-4-5"),
-        effort: Some("high"),
-    };
-    let toward = switch_plan(&on("Sonnet 4.5", "high"), &ModelSwitch::default());
-    assert_eq!(
-        (toward.model, toward.effort, toward.remember, toward.back),
-        (
-            Slash::Model(opus),
-            Slash::Effort("xhigh"),
-            Some(sonnet),
-            false
-        )
-    );
-    assert_eq!(toward.model.text(), "/model claude-opus-5-5");
-    assert_eq!(toward.effort.text(), "/effort xhigh");
-    let same_model = switch_plan(&on("Opus 5.5", "high"), &ModelSwitch::default());
-    assert_eq!(
-        (same_model.back, same_model.remember.and_then(|p| p.effort)),
-        (false, Some("high")),
-        "Opus 5.5 at another effort is the session's own"
-    );
-    let back = switch_plan(
-        &on("Opus 5.5", "xhigh"),
-        &ModelSwitch {
-            back: Some(sonnet),
-            ..ModelSwitch::default()
-        },
-    );
-    assert_eq!(
-        (
-            back.model.text(),
-            back.effort.text(),
-            back.remember,
-            back.back
-        ),
-        (
-            "/model claude-sonnet-4-5".to_owned(),
-            "/effort high".to_owned(),
-            None,
-            true
-        )
-    );
-    let unknown = switch_plan(&on("Opus 5.5", "xhigh"), &ModelSwitch::default());
-    assert_eq!(
-        (unknown.model.text(), unknown.effort.text()),
-        ("/model default".to_owned(), "/effort auto".to_owned()),
-        "nothing remembered: Claude's own defaults"
-    );
-    let half = switch_plan(
-        &on("Opus 5.5", "high"),
-        &ModelSwitch {
-            back: Some(sonnet),
-            half: true,
-            ..ModelSwitch::default()
-        },
-    );
-    assert_eq!(
-        (half.back, half.remember),
-        (false, None),
-        "a switch stopped half-way keeps the session's own pick"
-    );
-    let gpt = switch_plan(&on("gpt-5-codex", "high"), &ModelSwitch::default());
-    assert_eq!(
-        gpt.remember,
-        Some(Pick {
-            model: None,
-            effort: Some("high")
-        }),
-        "a name no Claude id spells is remembered as the default model"
-    );
+    }
 }
 
-/// The target moves under a switched session (a catalog read after the click, the priority list
-/// or the setting changed): the session still showing what its switch went to goes back to its
-/// own pick, which a switch to the new target would have written over.
-#[test]
-fn a_session_at_its_switch_s_old_target_goes_back_after_the_target_moved() {
-    let on = |model: &str, effort: &str| FooterFacts {
-        model: Some(model.into()),
-        effort: Some(effort.into()),
-        ..FooterFacts::default()
-    };
-    let sonnet = Pick {
-        model: ModelArg::new("claude-sonnet-4-5"),
-        effort: Some("high"),
-    };
-    let toward = switch_plan(&on("Sonnet 4.5", "high"), &ModelSwitch::default());
-    assert_eq!(
-        (toward.remember, toward.to.effort),
-        (Some(sonnet), Some("xhigh"))
-    );
-    let switched = ModelSwitch {
-        back: toward.remember,
-        to: Some(toward.to),
-        ..ModelSwitch::default()
-    };
-    let moved = SwitchTarget {
-        effort: "max",
-        ..unread()
-    };
-    let at_old = on("Opus 5.5", "xhigh");
-    let back = super::switch_plan(&at_old, &switched, moved);
-    assert_eq!(
-        (back.back, back.to, back.remember, back.words()),
-        (true, sonnet, None, "back to Sonnet 4.5 high".to_owned())
-    );
-    let unswitched = super::switch_plan(
-        &at_old,
-        &ModelSwitch {
-            back: Some(sonnet),
-            ..ModelSwitch::default()
-        },
-        moved,
-    );
-    assert_eq!(
-        (unswitched.back, unswitched.to.effort),
-        (false, Some("max")),
-        "CONTROL: a session no switch of aterm's put there goes to the target"
-    );
-    let elsewhere = super::switch_plan(&on("Opus 5.5", "high"), &switched, moved);
-    assert_eq!(
-        (elsewhere.back, elsewhere.to.effort),
-        (false, Some("max")),
-        "a session that left what its switch went to goes to the target"
-    );
-}
-
-/// A session on a 1M-context model keeps its context both ways: the tap's `model.id` names the
-/// variant the display name drops, so the switch types `claude-opus-5-5[1m]` and remembers
-/// `claude-opus-4-6[1m]`. A tap naming another model than the one shown is not read for it.
-#[test]
-fn a_switch_keeps_the_session_s_context_variant() {
-    use aterm_agent::harness::profile::SubscriptionDisplay;
-    let tapped = |shown: &str, id: &str| FooterFacts {
-        model: Some(shown.into()),
-        effort: Some("high".into()),
+/// `facts` on a plan that bills Fable as `fable`, its usage tap naming the model `id`.
+fn subscribed(facts: FooterFacts, id: Option<&str>, fable: Option<FablePlan>) -> FooterFacts {
+    FooterFacts {
         subscription: Some(SubscriptionDisplay {
-            model_id: Some(id.into()),
+            model_id: id.map(str::to_owned),
+            fable,
             ..SubscriptionDisplay::default()
         }),
-        ..FooterFacts::default()
-    };
-    let long = switch_plan(
-        &tapped("Opus 4.6", "claude-opus-4-6[1m]"),
-        &ModelSwitch::default(),
-    );
-    assert_eq!(long.model.text(), "/model claude-opus-5-5[1m]");
-    assert_eq!(
-        long.remember
-            .and_then(|p| p.model)
-            .map(|m| m.as_str().to_owned()),
-        Some("claude-opus-4-6[1m]".to_owned())
-    );
-    let at = FooterFacts {
-        effort: Some("xhigh".into()),
-        ..tapped("Opus 5.5", "claude-opus-5-5[1m]")
-    };
-    let back = switch_plan(
-        &at,
-        &ModelSwitch {
-            back: long.remember,
-            ..ModelSwitch::default()
-        },
-    );
-    assert!(back.back);
-    assert_eq!(back.model.text(), "/model claude-opus-4-6[1m]");
-    let stale = switch_plan(
-        &tapped("Sonnet 4.5", "claude-opus-4-6[1m]"),
-        &ModelSwitch::default(),
-    );
-    assert_eq!(
-        stale.model.text(),
-        "/model claude-opus-5-5",
-        "a tap of another model says nothing of this one's context"
-    );
-}
-
-/// A build's top as the resolver reads it: `model` the list's best the build offers, the
-/// build's catalog saying each model's efforts.
-fn top_of(model: &str, efforts: &[(&str, &[&str])]) -> aterm_agent::harness::switch_top::Top {
-    use aterm_agent::harness::switch_top::{Baked, BakedModel, top};
-    let baked = Baked {
-        latest_per_family: vec![("opus".to_owned(), model.to_owned())],
-        models: efforts
-            .iter()
-            .map(|(id, levels)| BakedModel {
-                id: (*id).to_owned(),
-                family: "opus".to_owned(),
-                display_name: (*id).to_owned(),
-                native_1m: false,
-                efforts: levels.iter().map(|l| (*l).to_owned()).collect(),
-            })
-            .collect(),
-    };
-    top(&[model.to_owned()], Some(baked))
+        ..facts
+    }
 }
 
 const ALL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// With no setting written the target is the top read for the session's build: the priority
-/// list's best model that build offers, at the highest effort its catalog admits for it; with
-/// nothing read, the seed list's first model.
+/// A build's catalog: `(id, display name, native 1M context, efforts)` a model, the first of
+/// each family its newest.
+fn baked(models: &[(&str, &str, bool, &[&str])]) -> Baked {
+    let family = |id: &str| {
+        aterm_agent::harness::claude_model::family_version(id)
+            .expect("a model id")
+            .0
+    };
+    let mut latest: Vec<(String, String)> = Vec::new();
+    for (id, ..) in models {
+        if !latest.iter().any(|(f, _)| *f == family(id)) {
+            latest.push((family(id), (*id).to_owned()));
+        }
+    }
+    Baked {
+        latest_per_family: latest,
+        models: models
+            .iter()
+            .map(|(id, name, native_1m, efforts)| BakedModel {
+                id: (*id).to_owned(),
+                family: family(id),
+                display_name: (*name).to_owned(),
+                native_1m: *native_1m,
+                efforts: efforts.iter().map(|l| (*l).to_owned()).collect(),
+            })
+            .collect(),
+    }
+}
+
+/// THE MODEL CARD'S TWO CHOICES ARE THE BUILD'S NEWEST FABLE AND NEWEST OPUS, each under the
+/// catalog's own name and typed by its id, the session's own checked. No version is aterm's:
+/// another build's catalog gives other models under the same two families.
 #[test]
-fn the_switch_s_target_is_the_build_s_top_model_at_its_highest_effort() {
-    let target = |top| SwitchTarget::of(None, None, top).expect("a target");
-    let unread = unread();
-    assert_eq!(
-        (unread.model.as_str(), unread.effort),
-        (
-            aterm_agent::harness::switch_top::SEED[0],
-            aterm_agent::harness::switch_top::TOP_EFFORT_UNREAD
-        )
+fn the_model_card_offers_the_builds_newest_fable_and_newest_opus() {
+    let build = baked(&[
+        ("claude-fable-5-1", "Fable 5.1", true, ALL),
+        ("claude-opus-5-5", "Opus 5.5", true, ALL),
+        ("claude-opus-5", "Opus 5", false, &ALL[..3]),
+        ("claude-sonnet-5", "Sonnet 5", false, ALL),
+    ]);
+    let included = Some(FablePlan::Included);
+    let picks = model_picks(
+        &subscribed(on("Opus 5.5", "high"), None, included.clone()),
+        Some(&build),
+        0,
     );
-    let newer = top_of("claude-opus-6", &[("claude-opus-6", ALL)]);
-    let to = target(&newer);
-    assert_eq!((to.model.as_str(), to.effort), ("claude-opus-6", "max"));
-    let capped = top_of("claude-opus-6", &[("claude-opus-6", &ALL[..3])]);
-    assert_eq!(target(&capped).effort, "high");
-    for auto in [
-        Some("auto"),
-        Some(""),
-        Some("no such model!"),
-        Some("gpt-5"),
-    ] {
+    let said: Vec<_> = picks
+        .iter()
+        .map(|pick| {
+            (
+                pick.family,
+                pick.label.as_str(),
+                pick.arg.map(|arg| arg.as_str().to_owned()),
+                pick.current,
+                pick.note.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                ModelFamily::Fable,
+                "Fable 5.1",
+                Some("claude-fable-5-1".to_owned()),
+                false,
+                None
+            ),
+            (
+                ModelFamily::Opus,
+                "Opus 5.5",
+                Some("claude-opus-5-5".to_owned()),
+                true,
+                None
+            ),
+        ]
+    );
+    // A session on an older Opus is on neither choice: the Opus choice is the newest.
+    let older = model_picks(
+        &subscribed(on("Opus 5", "high"), None, included.clone()),
+        Some(&build),
+        0,
+    );
+    assert!(older.iter().all(|pick| !pick.current));
+    // A newer build's catalog moves both choices with no word of aterm's changed.
+    let newer = baked(&[
+        ("claude-fable-6", "Fable 6", true, ALL),
+        ("claude-opus-6", "Opus 6", true, ALL),
+    ]);
+    let labels: Vec<_> = model_picks(&on("Fable 6", "high"), Some(&newer), 0)
+        .into_iter()
+        .map(|pick| (pick.label, pick.current))
+        .collect();
+    assert_eq!(
+        labels,
+        [("Fable 6".to_owned(), true), ("Opus 6".to_owned(), false)]
+    );
+}
+
+/// With no catalog read for the session's build a choice is the family's own name and types the
+/// family's alias; a read catalog that offers no model of a family shows that choice and types
+/// nothing for it.
+#[test]
+fn a_build_with_no_catalog_types_the_family_s_alias() {
+    let picks = model_picks(&on("Opus 5.5", "high"), None, 0);
+    let said: Vec<_> = picks
+        .iter()
+        .map(|pick| {
+            (
+                pick.label.as_str(),
+                pick.arg.map(|arg| arg.as_str().to_owned()),
+                pick.current,
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("Fable", Some("fable".to_owned()), false),
+            ("Opus", Some("opus".to_owned()), true),
+        ],
+        "the session's family is the checked one"
+    );
+    let no_fable = baked(&[("claude-opus-5-5", "Opus 5.5", true, ALL)]);
+    let picks = model_picks(&on("Opus 5.5", "high"), Some(&no_fable), 0);
+    assert_eq!(
+        (
+            picks[0].label.as_str(),
+            picks[0].arg,
+            picks[0].note.as_deref()
+        ),
+        ("Fable", None, Some("not offered by this Claude Code build"))
+    );
+    assert_eq!(
+        picks[1].label, "Opus 5.5",
+        "CONTROL: the family it does offer"
+    );
+}
+
+/// A session in the million-token context variant keeps it across a pick: the id is typed with
+/// the suffix, except for a model whose context is that size natively.
+#[test]
+fn a_model_pick_keeps_the_session_s_context_variant() {
+    let build = baked(&[
+        ("claude-fable-5-1", "Fable 5.1", true, ALL),
+        ("claude-opus-5-5", "Opus 5.5", false, ALL),
+    ]);
+    let long = subscribed(on("Opus 4.6", "high"), Some("claude-opus-4-6[1m]"), None);
+    let typed = |facts: &FooterFacts, baked: Option<&Baked>| -> Vec<String> {
+        model_picks(facts, baked, 0)
+            .into_iter()
+            .map(|pick| pick.arg.expect("an argument").as_str().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        typed(&long, Some(&build)),
+        ["claude-fable-5-1", "claude-opus-5-5[1m]"],
+        "the suffix where the model needs it, none where its context is native"
+    );
+    assert_eq!(typed(&long, None), ["fable[1m]", "opus[1m]"]);
+    let short = subscribed(on("Opus 4.6", "high"), Some("claude-opus-4-6"), None);
+    assert_eq!(
+        typed(&short, Some(&build)),
+        ["claude-fable-5-1", "claude-opus-5-5"],
+        "CONTROL: a session in the standard context types no suffix"
+    );
+    // A tap reading of another model than the one shown says nothing of the one shown.
+    let stale = subscribed(on("Sonnet 4.5", "high"), Some("claude-opus-4-6[1m]"), None);
+    assert_eq!(typed(&stale, None), ["fable", "opus"]);
+}
+
+/// The Fable choice says how the plan bills it wherever a pick could spend usage credits; a
+/// plan that includes Fable says nothing, and the Opus choice never carries the line.
+#[test]
+fn the_fable_choice_says_when_it_is_billed_to_usage_credits() {
+    let note = |fable: Option<FablePlan>, now: i64| {
+        let picks = model_picks(&subscribed(on("Opus 5.5", "high"), None, fable), None, now);
+        assert_eq!(picks[1].note, None, "the Opus choice");
+        picks[0].note.clone()
+    };
+    let credits = Some("billed to usage credits on this plan".to_owned());
+    let unread = Some("billing not read: may use usage credits".to_owned());
+    assert_eq!(note(Some(FablePlan::Included), 100), None);
+    assert_eq!(note(Some(FablePlan::CreditsOnly), 100), credits);
+    assert_eq!(
+        note(Some(FablePlan::LimitsEnd(Some(200))), 100),
+        None,
+        "the plan's Fable limits still run"
+    );
+    assert_eq!(note(Some(FablePlan::LimitsEnd(Some(200))), 200), credits);
+    assert_eq!(note(Some(FablePlan::LimitsEnd(None)), 100), credits);
+    assert_eq!(note(Some(FablePlan::Unknown), 100), unread);
+    assert_eq!(note(None, 100), unread, "no profile read");
+    assert_eq!(
+        model_picks(&on("Opus 5.5", "high"), None, 100)[0].note,
+        unread,
+        "no subscription read"
+    );
+}
+
+/// The slider's stops are medium, high and xhigh, less the ones the shown model does not take
+/// where the build's catalog lists it; its thumb stands on the effort shown, on a pick still
+/// standing over it, and on no stop where the level is another or unread.
+#[test]
+fn the_effort_slider_s_stops_are_the_ones_the_shown_model_takes() {
+    let build = baked(&[
+        ("claude-opus-5-5", "Opus 5.5", true, ALL),
+        ("claude-opus-5", "Opus 5", false, &ALL[..3]),
+        ("claude-haiku-4-5", "Haiku 4.5", false, &[]),
+    ]);
+    assert_eq!(
+        effort_stops(&on("Opus 5.5", "high"), Some(&build), None),
+        (vec!["medium", "high", "xhigh"], Some(1))
+    );
+    assert_eq!(
+        effort_stops(&on("Opus 5", "medium"), Some(&build), None),
+        (vec!["medium", "high"], Some(0)),
+        "a model with no xhigh has no such stop"
+    );
+    assert_eq!(
+        effort_stops(&on("Haiku 4.5", "high"), Some(&build), None),
+        (vec![], None),
+        "a model that takes no effort"
+    );
+    assert_eq!(
+        effort_stops(&on("Sonnet 5", "xhigh"), Some(&build), None),
+        (vec!["medium", "high", "xhigh"], Some(2)),
+        "a model the catalog does not list keeps every stop"
+    );
+    assert_eq!(
+        effort_stops(&on("Opus 5", "high"), None, None).0,
+        ["medium", "high", "xhigh"],
+        "no catalog read"
+    );
+    for off in ["low", "max", "auto", ""] {
         assert_eq!(
-            SwitchTarget::of(auto, auto, &newer),
-            Some(to),
-            "{auto:?} is the automatic choice"
+            effort_stops(&on("Opus 5.5", off), Some(&build), None).1,
+            None,
+            "{off:?} is no stop"
         );
     }
-    // The resolver's memo: one read per build, due again once it has stood ten seconds.
-    let mut tops = Tops::default();
+    assert_eq!(
+        effort_stops(&FooterFacts::default(), None, None).1,
+        None,
+        "an unread effort"
+    );
+    assert_eq!(
+        effort_stops(&on("Opus 5.5", "high"), Some(&build), Some("xhigh")).1,
+        Some(2),
+        "a pick stands over the effort shown"
+    );
+    assert_eq!(
+        effort_stops(&on("Opus 5", "high"), Some(&build), Some("xhigh")).1,
+        None,
+        "a pick the model has no stop for"
+    );
+}
+
+/// A pick stands as the thumb while it waits or is typed, and for [`EFFORT_SETTLE`] once its
+/// press ended done; past that the thumb is the footer's again.
+#[test]
+fn an_effort_pick_stands_until_it_has_settled() {
+    let start = std::time::Instant::now();
+    let wish = |until| EffortWish {
+        level: "high",
+        queued: false,
+        until,
+    };
+    assert!(wish(None).stands(start + EFFORT_SETTLE * 10), "in flight");
+    let settling = wish(Some(start + EFFORT_SETTLE));
+    assert!(settling.stands(start));
+    assert!(!settling.stands(start + EFFORT_SETTLE));
+}
+
+/// The resolver's memo: one read per build, due again once it has stood ten seconds; a build
+/// no sweep has cached is held as read, with no catalog.
+#[test]
+fn a_build_s_catalog_is_read_once_and_again_after_ten_seconds() {
+    let newer = baked(&[("claude-opus-6", "Opus 6", true, ALL)]);
+    let older = baked(&[("claude-opus-5", "Opus 5", false, &ALL[..3])]);
+    let mut catalogs = Catalogs::default();
     let start = std::time::Instant::now();
     let later = |s| start + std::time::Duration::from_secs(s);
-    assert!(tops.due(Some("2.1.400"), start) && tops.get(Some("2.1.400")).is_none());
-    tops.hold(Some("2.1.400"), start, newer.clone());
-    assert!(!tops.due(Some("2.1.400"), later(9)), "a fresh read");
+    assert!(catalogs.due(Some("2.1.400"), start) && catalogs.get(Some("2.1.400")).is_none());
+    catalogs.hold(Some("2.1.400"), start, Some(newer.clone()));
+    assert!(!catalogs.due(Some("2.1.400"), later(9)), "a fresh read");
     assert!(
-        tops.due(Some("2.1.300"), later(9)),
+        catalogs.due(Some("2.1.300"), later(9)),
         "another build's is its own"
     );
-    tops.hold(Some("2.1.300"), later(9), capped.clone());
-    assert_eq!(tops.get(Some("2.1.400")).as_deref(), Some(&newer));
-    assert_eq!(tops.get(Some("2.1.300")).as_deref(), Some(&capped));
-    assert!(tops.get(None).is_none(), "a build not read");
-    assert!(tops.due(Some("2.1.400"), later(10)));
-    tops.hold(Some("2.1.400"), later(10), capped.clone());
-    assert_eq!(tops.get(Some("2.1.400")).as_deref(), Some(&capped));
-}
-
-/// `[claude_footer] switch_model` and `switch_effort` each override their half: a model by id
-/// or as the footer shows it, at the written effort, else at that model's own highest.
-#[test]
-fn the_claude_footer_setting_overrides_the_switch_s_target() {
-    let top = top_of(
-        "claude-opus-6",
-        &[
-            ("claude-opus-6", ALL),
-            ("claude-sonnet-5-5", &ALL[..4]),
-            ("claude-haiku-5", &ALL[..3]),
-        ],
+    catalogs.hold(Some("2.1.300"), later(9), Some(older.clone()));
+    assert_eq!(catalogs.get(Some("2.1.400")).as_deref(), Some(&newer));
+    assert_eq!(catalogs.get(Some("2.1.300")).as_deref(), Some(&older));
+    assert!(catalogs.get(None).is_none(), "a build not read");
+    assert!(catalogs.due(Some("2.1.400"), later(10)));
+    catalogs.hold(Some("2.1.400"), later(10), None);
+    assert!(
+        catalogs.get(Some("2.1.400")).is_none(),
+        "a build no sweep cached"
     );
-    let of = |model, effort| {
-        let to = SwitchTarget::of(model, effort, &top).expect("a target");
-        (to.model.as_str().to_owned(), to.effort)
-    };
-    assert_eq!(
-        of(Some("claude-sonnet-5-5"), Some("medium")),
-        ("claude-sonnet-5-5".to_owned(), "medium")
-    );
-    assert_eq!(
-        of(Some("Sonnet 5.5"), None),
-        ("claude-sonnet-5-5".to_owned(), "xhigh"),
-        "the footer's name, at that model's own highest effort"
-    );
-    assert_eq!(
-        of(Some("claude-haiku-5[1m]"), None),
-        ("claude-haiku-5[1m]".to_owned(), "high")
-    );
-    assert_eq!(
-        of(None, Some("high")),
-        ("claude-opus-6".to_owned(), "high"),
-        "the effort alone, on the automatic model"
-    );
-    assert_eq!(
-        of(Some("claude-fable-7"), None),
-        (
-            "claude-fable-7".to_owned(),
-            aterm_agent::harness::switch_top::TOP_EFFORT_UNREAD
-        ),
-        "a model the build's catalog does not list"
-    );
-    let config = crate::app_config::Config::parse(
-        "[claude_footer]\nswitch_model = \"Sonnet 5.5\"\nswitch_effort = \" High \"\n",
-    )
-    .expect("the keys parse");
-    assert_eq!(
-        (
-            config.claude_footer_switch_model(),
-            config.claude_footer_switch_effort()
-        ),
-        (Some("Sonnet 5.5"), Some("High"))
-    );
-    let auto = crate::app_config::Config::parse(
-        "[claude_footer]\nswitch_model = \"auto\"\nswitch_effort = \"\"\n",
-    )
-    .expect("the keys parse");
-    assert_eq!(
-        (
-            auto.claude_footer_switch_model(),
-            auto.claude_footer_switch_effort(),
-            crate::app_config::Config::default().claude_footer_switch_model()
-        ),
-        (None, None, None)
-    );
-}
-
-/// The model's and the effort's hover titles and spoken words name the target a click types,
-/// whatever it resolved to, and the way back once the session shows it.
-#[test]
-fn a_title_and_a_reader_name_the_target_the_click_switches_to() {
-    let on = |model: &str, effort: &str| FooterFacts {
-        model: Some(model.into()),
-        effort: Some(effort.into()),
-        ..FooterFacts::default()
-    };
-    let target = SwitchTarget::of(
-        Some("claude-fable-6"),
-        None,
-        &top_of("claude-opus-6", &[("claude-fable-6", ALL)]),
-    )
-    .expect("a target");
-    let own = ModelSwitch::default();
-    let away = on("Opus 5.5", "xhigh");
-    assert_eq!(
-        fact_title_with(&away, None, Fact::Model, Some((&own, target))),
-        (
-            "Opus 5.5 \u{b7} click: switch to Fable 6 max \u{b7} right-click: model menu".into(),
-            "click: switch to Fable 6 max".into()
-        ),
-        "no stale name: Opus 5.5 at xhigh is the session's own here"
-    );
-    assert_eq!(
-        fact_title_with(&away, None, Fact::Effort, Some((&own, target))).1,
-        "click: switch to Fable 6 max"
-    );
-    assert_eq!(
-        fact_spoken_with(
-            &away,
-            None,
-            Fact::Model,
-            FactMask::default(),
-            Some((&own, target))
-        ),
-        (
-            "Model: Opus 5.5".into(),
-            "Activate to switch to Fable 6 max.".into()
-        )
-    );
-    let plan = super::switch_plan(&away, &own, target);
-    assert_eq!(
-        (plan.model.text(), plan.effort.text()),
-        ("/model claude-fable-6".to_owned(), "/effort max".to_owned())
-    );
-    let remembered = ModelSwitch {
-        back: plan.remember,
-        ..ModelSwitch::default()
-    };
-    let at = on("Fable 6", "max");
-    assert_eq!(
-        fact_title_with(&at, None, Fact::Model, Some((&remembered, target))).1,
-        "click: back to Opus 5.5 xhigh"
-    );
-    assert_eq!(
-        fact_spoken_with(
-            &at,
-            None,
-            Fact::Effort,
-            FactMask::default(),
-            Some((&remembered, target))
-        )
-        .1,
-        "Activate to switch back to Opus 5.5 xhigh."
-    );
-    // A target written in its 1M-context variant is typed once, not suffixed again.
-    let long = SwitchTarget::of(Some("claude-fable-6[1m]"), Some("high"), &unread_top())
-        .expect("a target");
-    let tapped = FooterFacts {
-        subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
-            model_id: Some("claude-opus-4-6[1m]".into()),
-            ..Default::default()
-        }),
-        ..on("Opus 4.6", "high")
-    };
-    assert_eq!(
-        super::switch_plan(&tapped, &own, long).model.text(),
-        "/model claude-fable-6[1m]"
+    assert!(
+        !catalogs.due(Some("2.1.400"), later(11)),
+        "and that is a read"
     );
 }

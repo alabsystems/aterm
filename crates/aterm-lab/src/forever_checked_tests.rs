@@ -253,10 +253,7 @@ fn the_landed_title_says_its_own_receipt() {
         s.window.chip = vec![(T0 + 41_000, chip_line.to_string())];
         s.window.title = vec![(
             T0 + 41_000,
-            format!(
-                "autopilot: land, landed 14:05 \u{2014} {explained} \u{b7} click: off \u{b7} \
-                 right-click: more"
-            ),
+            format!("autopilot: land, landed 14:05 \u{2014} {explained} \u{b7} click: off"),
         )];
         s
     };

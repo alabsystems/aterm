@@ -572,30 +572,47 @@ fn process_cpu() -> Duration {
 /// One repair round between `a` (initiator) and `b` (responder) over loopback TLS.
 fn loopback_round(
     listener: &TcpListener,
+    ends: (&Endpoint, &Endpoint),
+    repairs: (&mut PeerRepair, &mut PeerRepair),
+) {
+    let [(), ()] = loopback_round_through(listener, ends, repairs, |_, exchange| exchange());
+}
+
+/// [`loopback_round`], each side's connection and exchange run inside `side` on that side's
+/// own thread (the responder's a scoped thread of its own), given the side's index (0 the
+/// initiator's, 1 the responder's, as the pair's): what `side` made of the initiator's, then of
+/// the responder's.
+fn loopback_round_through<T: Send>(
+    listener: &TcpListener,
     (a, b): (&Endpoint, &Endpoint),
     (ra, rb): (&mut PeerRepair, &mut PeerRepair),
-) {
+    side: impl Fn(usize, &mut dyn FnMut()) -> T + Sync,
+) -> [T; 2] {
     let address = listener.local_addr().unwrap();
     thread::scope(|threads| {
         let server = threads.spawn(|| {
-            let connection = Connection::admit(
-                aterm_uds::accept(
-                    listener,
-                    aterm_uds::AcceptWait::Forever,
-                    aterm_uds::AcceptedMode::Blocking,
+            side(1, &mut || {
+                let connection = Connection::admit(
+                    aterm_uds::accept(
+                        listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
                 )
-                .unwrap()
-                .0,
-                LinkScope::Loopback,
-            )
-            .unwrap();
-            b.exchange(connection, Side::Responder, rb).unwrap();
+                .unwrap();
+                b.exchange(connection, Side::Responder, rb).unwrap();
+            })
         });
-        let connection =
-            Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap();
-        a.exchange(connection, Side::Initiator, ra).unwrap();
-        server.join().unwrap();
-    });
+        let initiated = side(0, &mut || {
+            let connection =
+                Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap();
+            a.exchange(connection, Side::Initiator, ra).unwrap();
+        });
+        [initiated, server.join().unwrap()]
+    })
 }
 
 /// What a Commons repair round that moves nothing costs: a converged loopback pair of log-backed
@@ -661,6 +678,214 @@ fn quiet_catalog_rounds_move_nothing_and_visit_both_tables() {
     quiet_rounds(SUITE_ROUNDS, Workload::Catalog);
 }
 
+/// A quiet round checks its application table's subscription (`Directory::permits`' read of the
+/// catalog) where the table's data leaves or enters this Mac, not at each admission (`Gate`): over
+/// a converged catalog pair, each round the initiator spends on the application table reads the
+/// catalog for it 5 times (the conflict and operation inventories' authorizes, each batch's send
+/// boundary, and the matching inventory's read, which it observes), and each round it spends on
+/// the catalog none, since the catalog is always permitted. Witness asks are off, so no round's
+/// admissions depend on the time since the last ask.
+/// NEGATIVE CONTROL: `Round::table`'s enrollment read, `retain_primary`'s read, the conflict
+/// round's proof inventory read or the operation inventory's read (`table`'s `inventory_gated`)
+/// back on `Round::local` gives 6; `send_batch`'s admission or `receive_batch`'s empty-batch
+/// admission back on it gives 7, each of those running twice a round. Every admission checking
+/// the subscription, as before `Gate`, gave 13.
+#[test]
+fn a_quiet_table_round_reads_its_permission_once_per_boundary() {
+    let WarmCatalogPair {
+        pair,
+        ends: (a, b),
+        repairs: (mut ra, mut rb),
+        listener,
+    } = warm_catalog_pair();
+    let catalog = crate::catalog::scope(pair.lab.bootstrap(0).trust()).digest();
+    let application = pair.scope.digest();
+    let mut reads = Vec::new();
+    for _ in 0..4 {
+        let before = crate::catalog::test_permit_reads();
+        loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        let read = crate::catalog::test_permit_reads() - before;
+        let report = ra.application().expect("a completed application round");
+        let table = report.table.expect("a converged pair selects a table");
+        if table == application {
+            assert!(
+                report.matching_inventory.is_some(),
+                "CONTROL: a quiet application round observes its matching inventory"
+            );
+        }
+        reads.push((table, read));
+    }
+    let of = |kind: Digest| -> Vec<usize> {
+        reads
+            .iter()
+            .filter(|(table, _)| *table == kind)
+            .map(|(_, read)| *read)
+            .collect()
+    };
+    assert_eq!(
+        (of(application), of(catalog)),
+        (vec![5, 5], vec![0, 0]),
+        "the catalog's reads in each application round and each catalog round"
+    );
+}
+
+/// A quiet round reads each ring's state once, where its selection lists the ring tables it
+/// holds (`existing_ring_subscriptions`): the application table lies outside every ring's reach
+/// (`Ring::reach`), so its permission (`Directory::permits`) reads no ring's state, and a
+/// converged pair lacks no table its peer lists, so the take-up (`ring_tables_among`) reads none.
+/// Over a converged catalog pair, the initiator reads each state once in every round, whether it
+/// spends the round on the application table or on the catalog. Witness asks are off, so no
+/// round's admissions depend on the time since the last ask.
+/// NEGATIVE CONTROL: the take-up reading every ring's window (`ring_tables_among` without its
+/// empty-set return and its reach filter) gives 2 a round; `Directory::ring_of` without its reach
+/// filter gives 6 in application rounds (1 in catalog rounds). Before the reach, the base read
+/// each state 7 times in an application round and twice in a catalog round.
+#[test]
+fn a_quiet_round_reads_each_ring_state_once() {
+    use crate::catalog::ring::{CLAIMS, JOURNAL, RECOVERIES};
+    use aterm_uds::private_file::tally;
+    let WarmCatalogPair {
+        pair,
+        ends: (a, b),
+        repairs: (mut ra, mut rb),
+        listener,
+    } = warm_catalog_pair();
+    let names = [&CLAIMS, &RECOVERIES, &JOURNAL].map(|ring| ring.state_name());
+    let claims = crate::table::store::claim_dir_of(&pair.lab.bootstrap(0)).unwrap();
+    for name in &names {
+        assert!(claims.join(name).is_file(), "CONTROL: {name} is written");
+    }
+    let catalog = crate::catalog::scope(pair.lab.bootstrap(0).trust()).digest();
+    let application = pair.scope.digest();
+    let mut rounds = Vec::new();
+    for _ in 0..4 {
+        let ((), read) = tally::counted(|| {
+            loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        });
+        let report = ra.application().expect("a completed application round");
+        let table = report.table.expect("a converged pair selects a table");
+        let reads = names.clone().map(|name| {
+            read.iter()
+                .find(|seen| seen.name == name)
+                .map_or(0, |seen| seen.reads)
+        });
+        rounds.push((table, reads));
+    }
+    let of = |kind: Digest| -> Vec<[usize; 3]> {
+        rounds
+            .iter()
+            .filter(|(table, _)| *table == kind)
+            .map(|(_, reads)| *reads)
+            .collect()
+    };
+    assert_eq!(
+        (of(application), of(catalog)),
+        (vec![[1; 3]; 2], vec![[1; 3]; 2]),
+        "each ring state's reads [claims, recoveries, journal] in each application round and \
+         each catalog round"
+    );
+}
+
+/// A converged catalog pair ([`catalog_pair`]) ready for quiet rounds: its endpoints, with
+/// witness asks off so no round's admissions depend on the time since the last ask, their
+/// repairs and the listener, after 8 warm-up rounds.
+struct WarmCatalogPair {
+    pair: Pair,
+    ends: (Endpoint, Endpoint),
+    repairs: (PeerRepair, PeerRepair),
+    listener: TcpListener,
+}
+
+/// [`WarmCatalogPair`], its warm-up asserted to converge the pair.
+fn warm_catalog_pair() -> WarmCatalogPair {
+    let pair = catalog_pair();
+    let endpoint = |n| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        Endpoint::from_bootstrap_until(&pair.lab.bootstrap(n), deadline)
+            .unwrap()
+            .unwrap()
+            .with_commons_until(
+                pair.lab.paths[n].clone(),
+                pair.lab.paths[n].home.join("config.toml"),
+                deadline,
+            )
+            .unwrap()
+            .with_witnesses(false)
+    };
+    let (a, b) = (endpoint(0), endpoint(1));
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    for _ in 0..8 {
+        loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+    }
+    let [left, right] = catalog_inventories(&pair);
+    assert_eq!(left, right, "CONTROL: the warm-up converges the pair");
+    WarmCatalogPair {
+        pair,
+        ends: (a, b),
+        repairs: (ra, rb),
+        listener,
+    }
+}
+
+/// LAW U3: a quiet round opens no private directory to judge it. Over a converged catalog
+/// pair, every directory either side's exchange judges in 4 quiet rounds
+/// (`aterm_uds::private_file::tally::directories`, counted on each side's own thread) is
+/// judged from its path's attributes (astream-sys's `owner_private_dir_by_path`), so neither
+/// side's `opened` lists one. Durable writes still open a directory to flush it; that is no
+/// judgement.
+///
+/// CONTROL: in each of the 4 rounds, each side judged its own claim directory (`claim_dir_of`
+/// its bootstrap) at least once, so each side's count saw every round.
+///
+/// NEGATIVE CONTROL, applied by hand once to aterm-uds's private_file.rs and reverted: `dir_is`
+/// calling `dir_is_opened` whatever the path's attributes answered lists every judged
+/// directory as opened on both sides.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_quiet_round_opens_no_private_directory() {
+    use aterm_uds::private_file::tally;
+    let WarmCatalogPair {
+        pair,
+        ends: (a, b),
+        repairs: (mut ra, mut rb),
+        listener,
+    } = warm_catalog_pair();
+    let claims = [0, 1].map(|n| crate::table::store::claim_dir_of(&pair.lab.bootstrap(n)).unwrap());
+    let mut claims_judged = [[0; 2]; 4];
+    let mut judgements = [0; 2];
+    let mut opened = Vec::new();
+    for (round, claimed) in claims_judged.iter_mut().enumerate() {
+        let sides =
+            loopback_round_through(&listener, (&a, &b), (&mut ra, &mut rb), |_, exchange| {
+                tally::directories(exchange).1
+            });
+        for (n, side) in sides.into_iter().enumerate() {
+            for (dir, times) in &side.judged {
+                judgements[n] += times;
+                if *dir == claims[n] {
+                    claimed[n] += times;
+                }
+            }
+            opened.extend(
+                side.opened
+                    .into_iter()
+                    .map(|(dir, times)| (round, n, dir, times)),
+            );
+        }
+    }
+    assert!(
+        claims_judged.iter().flatten().all(|times| *times >= 1),
+        "CONTROL: each side judged its claim directory {claims_judged:?} times per round, of \
+         {judgements:?} judgements in all"
+    );
+    assert_eq!(
+        opened,
+        Vec::new(),
+        "(round, side, directory, times) opened to be judged, of {judgements:?} judgements"
+    );
+}
+
 #[test]
 #[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --catalog --sustained"]
 fn a_sustained_quiet_catalog_pair_reports_its_cpu() {
@@ -687,6 +912,167 @@ fn a_sustained_quiet_pair_over_a_long_log_reports_its_cpu() {
 #[test]
 fn quiet_rounds_over_a_vault_history_move_nothing() {
     quiet_rounds(SUITE_ROUNDS, Workload::LongLog(41));
+}
+
+/// One side's quiet round as [`a_rounds_read_admissions_share_one_look_until_its_stream_is_called`]
+/// counts it: the read admissions through its group (own, lent, reopened: `grouped`), its round
+/// admissions' hooks and how many of those found the vault's state lock held, and its catalog
+/// permit reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grouping {
+    grouped: (u32, u32, u32),
+    hooks: u32,
+    held: u32,
+    permits: usize,
+}
+
+/// LAW G-L1: a round's read admissions with no call on its stream between them share one look
+/// at the vault (`GroupLook`). Over quiet rounds of a converged catalog pair and of a pair over a
+/// 41-rotation log, warmed as [`quiet_rounds`] warms them (8 catalog rounds, 2 otherwise) and
+/// checked converged, then run as if their files had settled long ago
+/// (`aterm_secrets::client::test_as_if_later`, so the group's first look finds the control anchor
+/// settled), each side's read admissions through its group are counted (own, lent, reopened) per
+/// round: initiator (12, 9, 0) and responder (16, 5, 0) in a round on the catalog, (12, 10, 0)
+/// and (16, 6, 0) on the application table, and (12, 6, 0) and (16, 2, 0) over the long log, whose
+/// rounds have no Commons storage to select. At every round admission (`policy::Admissions`,
+/// before its sources) a raw exclusive try of the side's state lock finds it held at exactly the
+/// lent ones, where the group's look holds it shared, and takes it at the rest; the opening batch
+/// has no such hook and no quiet round writes, so own plus lent is one more than the hooks. The
+/// rounds move nothing, open no bootstrap, and read the catalog for the application table's
+/// permission 5 times on each side, as before.
+/// NEGATIVE CONTROL (2026-11-12): `GroupLook::keep` dropping its look gives lent 0 and no hook
+/// finds the lock held (`each side's (own, lent, reopened) admissions`: left
+/// `[(21, 0, 0), (21, 0, 0)]`, right `[(12, 9, 0), (16, 5, 0)]`, `held: 0`).
+#[test]
+fn a_rounds_read_admissions_share_one_look_until_its_stream_is_called() {
+    use std::{cell::Cell, rc::Rc};
+    for workload in [Workload::Catalog, Workload::LongLog(41)] {
+        let catalog = workload == Workload::Catalog;
+        let pair = quiet_pair(workload);
+        let a = quiet_endpoint(&pair, 0, catalog);
+        let b = quiet_endpoint(&pair, 1, catalog);
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        for _ in 0..if catalog { 8 } else { 2 } {
+            loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        }
+        if catalog {
+            let [left, right] = catalog_inventories(&pair);
+            assert_eq!(left, right, "CONTROL: the warm-up converges the pair");
+        } else {
+            let [left, right] = table_inventories(&pair);
+            assert_eq!(left, right, "CONTROL: the warm-up converges the pair");
+        }
+        let catalog_table = crate::catalog::scope(pair.lab.bootstrap(0).trust()).digest();
+        let opens = [a.test_bootstrap_opens(), b.test_bootstrap_opens()];
+        let mut visited = BTreeSet::new();
+        for _ in 0..4 {
+            let sides =
+                loopback_round_through(&listener, (&a, &b), (&mut ra, &mut rb), |n, exchange| {
+                    let dir = pair.lab.paths[n].dir.clone();
+                    let hooks = Rc::new(Cell::new((0, 0)));
+                    let counted = Rc::clone(&hooks);
+                    let _hook = super::policy::Admissions::install(move |_| {
+                        let (lock, _) =
+                            aterm_uds::private_file::open_private(&dir, ".lock").unwrap();
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "the probe asks whether a group's look holds the state lock"
+                        )]
+                        let attempt = lock.try_lock();
+                        let (hooks, held) = counted.get();
+                        match attempt {
+                            Ok(()) => {
+                                lock.unlock().unwrap();
+                                counted.set((hooks + 1, held));
+                            }
+                            Err(std::fs::TryLockError::WouldBlock) => {
+                                counted.set((hooks + 1, held + 1));
+                            }
+                            Err(error) => panic!("state lock probe failed: {error}"),
+                        }
+                    });
+                    let (own, lent, reopened) = grouped();
+                    let permits = crate::catalog::test_permit_reads();
+                    aterm_secrets::client::test_as_if_later(Duration::from_secs(3600), exchange);
+                    let after = grouped();
+                    let (hooks, held) = hooks.get();
+                    Grouping {
+                        grouped: (after.0 - own, after.1 - lent, after.2 - reopened),
+                        hooks,
+                        held,
+                        permits: crate::catalog::test_permit_reads() - permits,
+                    }
+                });
+            let mut tables = [&ra, &rb].map(|repair| {
+                let application = repair.application().expect("a completed application round");
+                assert_eq!(
+                    application.sent
+                        + application.received
+                        + application.keys_sent
+                        + application.keys_received
+                        + application.conflicts_sent
+                        + application.conflicts_received,
+                    0,
+                    "a quiet round moved records"
+                );
+                application.table.expect("a converged pair selects a table")
+            });
+            tables.sort_unstable();
+            assert_eq!(tables[0], tables[1], "both sides repaired one table");
+            let table = tables[0];
+            visited.insert(table);
+            let (counts, permits) = if !catalog {
+                ([(12, 6, 0), (16, 2, 0)], 0)
+            } else if table == catalog_table {
+                ([(12, 9, 0), (16, 5, 0)], 0)
+            } else {
+                assert_eq!(table, pair.scope.digest());
+                ([(12, 10, 0), (16, 6, 0)], 5)
+            };
+            assert_eq!(
+                sides.map(|side| side.grouped),
+                counts,
+                "each side's (own, lent, reopened) admissions: {sides:?}"
+            );
+            for side in sides {
+                let (own, lent, _) = side.grouped;
+                assert_eq!(
+                    side.held, lent,
+                    "the lock is held at exactly the lent admissions"
+                );
+                assert_eq!(
+                    own + lent,
+                    side.hooks + 1,
+                    "every read admission is grouped"
+                );
+                assert_eq!(
+                    side.permits, permits,
+                    "the catalog's permit reads: {side:?}"
+                );
+            }
+        }
+        assert_eq!(
+            visited.len(),
+            workload.tables() as usize,
+            "the rounds visit every table"
+        );
+        assert_eq!(
+            [a.test_bootstrap_opens(), b.test_bootstrap_opens()],
+            opens,
+            "a quiet round takes the bootstrap its side kept and opens none"
+        );
+    }
+}
+
+/// Each Mac's operation IDs of `pair`'s explicitly listed table.
+fn table_inventories(pair: &Pair) -> [BTreeSet<Digest>; 2] {
+    std::array::from_fn(|n| {
+        let bootstrap = pair.lab.bootstrap(n);
+        let session = Session::observe(&bootstrap).unwrap();
+        let store = Store::observe(&session, &pair.paths[n], pair.scope).unwrap();
+        store.inventory(&session).unwrap().copied().collect()
+    })
 }
 
 /// [`a_quiet_pair_over_a_long_log_reports_its_cpu`] where the second Mac was admitted after the
@@ -968,10 +1354,9 @@ fn quiet_rounds(measured: u32, workload: Workload) {
     quiet_rounds_observed(measured, workload, false);
 }
 
-fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool) {
-    let catalog = workload == Workload::Catalog;
-    let warm = if catalog { 8 } else { 2 };
-    let pair = match workload {
+/// The pair `workload` repairs ([`quiet_rounds`]).
+fn quiet_pair(workload: Workload) -> Pair {
+    match workload {
         Workload::Explicit => log_pair(),
         Workload::Catalog => catalog_pair(),
         Workload::LongLog(epochs) => pair_from_lab_with(
@@ -985,25 +1370,34 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
             Holder::Handoff,
         ),
         Workload::LargeTable(records) => large_table_pair(records),
-    };
-    let endpoint = |n| {
-        if catalog {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            Endpoint::from_bootstrap_until(&pair.lab.bootstrap(n), deadline)
-                .unwrap()
-                .unwrap()
-                .with_commons_until(
-                    pair.lab.paths[n].clone(),
-                    pair.lab.paths[n].home.join("config.toml"),
-                    deadline,
-                )
-                .unwrap()
-        } else {
-            pair.endpoint(n, true)
-        }
-    };
-    let a = endpoint(0);
-    let b = endpoint(1);
+    }
+}
+
+/// The endpoint of `pair`'s Mac `n` for [`quiet_rounds`]: with Commons storage for a catalog
+/// workload, else over the pair's explicit table.
+fn quiet_endpoint(pair: &Pair, n: usize, catalog: bool) -> Endpoint {
+    if catalog {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        Endpoint::from_bootstrap_until(&pair.lab.bootstrap(n), deadline)
+            .unwrap()
+            .unwrap()
+            .with_commons_until(
+                pair.lab.paths[n].clone(),
+                pair.lab.paths[n].home.join("config.toml"),
+                deadline,
+            )
+            .unwrap()
+    } else {
+        pair.endpoint(n, true)
+    }
+}
+
+fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool) {
+    let catalog = workload == Workload::Catalog;
+    let warm = if catalog { 8 } else { 2 };
+    let pair = quiet_pair(workload);
+    let a = quiet_endpoint(&pair, 0, catalog);
+    let b = quiet_endpoint(&pair, 1, catalog);
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     for _ in 0..warm {
@@ -1245,20 +1639,33 @@ fn history_read_counts_value(
     })
 }
 
-/// A replica's rounds take the bootstrap it keeps while that stands (`Bootstrap::stands`), and
-/// open one afresh, and keep it, only once it falls: quiet rounds open none, a vault publication
-/// makes the next round open one and the round after it none, and a device claim replaced since
-/// the open makes the next round meet that open's refusal.
+/// A replica's rounds take the bootstrap it keeps while that stands (`Bootstrap::stands_in`
+/// through the round's opening batch, `Replica::opening`, else `Bootstrap::stands`), and open one
+/// afresh, and keep it, only once it falls: quiet rounds open none, a vault publication makes the
+/// next round open one and the round after it none, and so does a lost device custody lock, which
+/// the opening batch's admission does not judge and its judgement of the kept bootstrap does; a
+/// round whose opening batch refuses its peer, no member, opens none; and a device claim replaced
+/// since the open makes the next round meet that open's refusal. The rounds that take the kept
+/// bootstrap and run take it through their opening batch's try (`Replica::test_kept_takes`): each
+/// quiet round and the round after each fresh open; the rounds that open afresh, and the round
+/// whose opening batch refuses its peer, take it through none.
 ///
-/// NEGATIVE CONTROL: `Replica::bootstrap` opening at every round fails the quiet rounds' count;
+/// NEGATIVE CONTROLS: `Replica::bootstrap` opening at every round fails the quiet rounds' count;
 /// one taking what it keeps unchecked fails at the publication (the round's own admission meets
 /// the changed vault); one returning the refusal of what it kept in place of opening fails at the
-/// publication.
+/// publication. `Replica::opening`'s try without its judgement of the kept bootstrap
+/// (`Session::bootstrap_stands`) fails the lost device lock's open (2026-11-11); one that opens
+/// afresh on any refusal of its try fails the refused peer's (2026-11-11); one whose judgement
+/// always refuses (`session.bootstrap_stands()?` an unconditional `Err`), and one with no try at
+/// all, either of which leaves every open count as it was, fail the quiet rounds' takes, 0 where 4
+/// (2026-11-11).
 #[test]
 fn a_replica_keeps_its_bootstrap_while_it_stands() {
     use aterm_secrets::client;
     let pair = log_pair();
     let replica = pair.replica(0);
+    let takes = replica.test_kept_takes();
+    let taken = || replica.test_kept_takes() - takes;
     for _ in 0..4 {
         replica.round(None).unwrap();
     }
@@ -1267,6 +1674,7 @@ fn a_replica_keeps_its_bootstrap_while_it_stands() {
         0,
         "quiet rounds take the bootstrap the replica opened"
     );
+    assert_eq!(taken(), 4, "each quiet round takes it through its try");
     let paths = &pair.lab.paths[0];
     let admin = client::admin_open(paths).unwrap();
     client::admin_publish(paths, &admin, &admin.doc).unwrap();
@@ -1276,12 +1684,46 @@ fn a_replica_keeps_its_bootstrap_while_it_stands() {
         1,
         "a vault publication makes the next round open afresh"
     );
+    assert_eq!(taken(), 4, "the round that opens afresh takes none");
     replica.round(None).unwrap();
     assert_eq!(
         replica.test_bootstrap_opens(),
         1,
         "the round after it takes the bootstrap that open kept"
     );
+    assert_eq!(taken(), 5, "the round after it takes it through its try");
+    std::fs::remove_file(paths.dir.join("commons-device.lock")).unwrap();
+    replica.round(None).unwrap();
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        2,
+        "a lost device lock makes the next round open afresh"
+    );
+    assert_eq!(taken(), 5, "the round that opens afresh takes none");
+    replica.round(None).unwrap();
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        2,
+        "the round after it takes the bootstrap that open kept"
+    );
+    assert_eq!(taken(), 6, "the round after it takes it through its try");
+    let stranger: Actor = [0xa5; 48];
+    let refused = replica
+        .round(stranger)
+        .err()
+        .expect("a peer that is no member refuses the round");
+    assert!(
+        refused
+            .to_string()
+            .contains("table repair peer is not a current member"),
+        "{refused}"
+    );
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        2,
+        "a round whose opening batch refuses its peer opens none"
+    );
+    assert_eq!(taken(), 6, "a round whose try refuses its peer takes none");
     let claim = paths.dir.join("commons/device.claim");
     let mut bytes = std::fs::read(&claim).unwrap();
     *bytes.last_mut().unwrap() ^= 1;
@@ -1298,19 +1740,55 @@ fn a_replica_keeps_its_bootstrap_while_it_stands() {
     );
 }
 
+/// A round's try on the bootstrap its replica keeps (`Replica::opening`) waits for nothing: with
+/// the vault's state lock gone under the kept bootstrap, and on the other side with its vault's
+/// folder gone, the try finds no source in its one look and the round runs as it did before the
+/// try, meeting that run's refusal, and no source read sleeps on this thread
+/// (`generation::SOURCE_READ_SLEEPS`).
+///
+/// NEGATIVE CONTROL (2026-11-11): the try's sources read by `local_source_reads_until` with the
+/// admission deadline in place of its one try sleeps through that deadline's minute, waiting for
+/// the lock that is gone (1,118 sleeps when it ran: `state lock: the try waits for nothing`).
+#[test]
+fn a_rounds_try_on_its_kept_bootstrap_waits_for_nothing() {
+    let pair = log_pair();
+    let sleeps = || crate::generation::SOURCE_READ_SLEEPS.get();
+    let refused = |n: usize, take: &dyn Fn(&Paths)| {
+        let replica = pair.replica(n);
+        replica.round(None).unwrap();
+        take(&pair.lab.paths[n]);
+        let before = sleeps();
+        let refused = replica.round(None).err().map(|error| error.to_string());
+        (refused, sleeps() - before)
+    };
+    let lock = refused(0, &|paths| {
+        std::fs::remove_file(paths.dir.join(".lock")).unwrap()
+    });
+    let folder = refused(1, &|paths| {
+        std::fs::rename(&paths.dir, paths.dir.with_file_name("vault-aside")).unwrap();
+    });
+    for ((refused, slept), gone) in [(lock, "state lock"), (folder, "vault folder")] {
+        assert_eq!(slept, 0, "{gone}: the try waits for nothing");
+        let refused = refused.unwrap_or_else(|| panic!("{gone}: the round refuses"));
+        assert!(
+            refused.contains("table repair lost secrets custody"),
+            "{gone}: {refused}"
+        );
+    }
+}
+
 /// A table round's reads stand on the check each store's open ran in their session
 /// (`Round::store`), and its matching inventory on the operation inventory's fence
 /// (`Round::fenced_observation`): over the explicit pair, whose first Mac holds a record the
 /// second lacks until the first round sends it, each of the initiator's rounds checks each store
-/// it opens once. The first round opens its store four times (its tables' witnesses, the conflict
-/// proof inventory, the operation inventory and the batch that sends the record) and observes no
-/// matching inventory, since the two inventories differ; each later round opens it twice (the
-/// conflict proof inventory and the operation inventory) and observes one. The inventory reads
-/// checked each store again, seven checks for the first round's four opens and six for a later
-/// round's three, whose third open was the matching inventory's (2026-11-09).
-/// NEGATIVE CONTROL: `Round::inventory`, the conflict round's proof inventory or
-/// `table_witnesses` reading through a checked accessor fails it, and so does the matching
-/// inventory reading the store again where its fence stands.
+/// it opens once. The first round opens its store three times (the conflict proof inventory,
+/// the operation inventory and the batch that sends the record) and observes no matching
+/// inventory, since the two inventories differ. Its witnesses inspect receipts without opening
+/// a store. Each later round opens it twice, for the two inventories, and observes one matching
+/// inventory on the operation read's fence.
+/// NEGATIVE CONTROLS: operation or proof inventories calling checked accessors fail the equality
+/// of checks and opens. A witness opening a store fails the first round's count, and a matching
+/// inventory reading the store again where its fence stands fails the later rounds' count.
 #[test]
 fn each_round_checks_a_store_once_as_it_opens() {
     let pair = log_pair();
@@ -1329,9 +1807,8 @@ fn each_round_checks_a_store_once_as_it_opens() {
     }
     assert_eq!(
         opened[0],
-        (4, false),
-        "the first round with a peer reads its tables' witnesses and sends the record its peer \
-         lacks"
+        (3, false),
+        "the first round sends the record its peer lacks, with no store opened for witnesses"
     );
     assert!(
         opened[1..].iter().all(|round| *round == (2, true)),

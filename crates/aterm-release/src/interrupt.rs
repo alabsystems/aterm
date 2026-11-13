@@ -29,6 +29,10 @@ mod imp {
 
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
     static COUNT: AtomicU32 = AtomicU32::new(0);
+    /// The `SIGTERM`s among [`COUNT`].
+    static TERMS: AtomicU32 = AtomicU32::new(0);
+    /// The `SIGTERM`s this process sent itself on its own account ([`stop_self`]).
+    static OWN: AtomicU32 = AtomicU32::new(0);
     static EXEC_HANDOFF_INSTALLED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "C" {
@@ -36,12 +40,21 @@ mod imp {
         fn sigismember(set: *const libc::sigset_t, sig: i32) -> i32;
     }
 
-    extern "C" fn on_signal(sig: i32) {
+    extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        // SAFETY: installed with SA_SIGINFO; the packet lives throughout this call.
+        unsafe { aterm_uds::signal_origin::capture(sig, info) };
         let _ = SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+        // TERMS before COUNT: a reader that loads COUNT first ([`foreign`]) then finds every
+        // TERM it counted there in TERMS too, so this process's own stop never reads as a
+        // signal from elsewhere, not even while its handler runs.
+        if sig == SIGTERM {
+            TERMS.fetch_add(1, Ordering::SeqCst);
+        }
         COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     fn try_install() -> io::Result<()> {
+        aterm_uds::signal_origin::start().map_err(io::Error::other)?;
         for sig in EXEC_SIGNALS {
             // SAFETY: a null new action only reads `sig`'s disposition into the live `old`.
             let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -53,12 +66,12 @@ mod imp {
             }
             // Querying before installing avoids the old signal(SIG_IGN) probe, which could
             // discard a signal held pending across exec before the handler was in place.
-            // SAFETY: `on_signal` lives for the process, touches only lock-free atomics, and the
-            // native set is initialized before sigaction reads the complete value.
+            // SAFETY: the SA_SIGINFO handler lives for the process, uses only lock-free
+            // atomics and a nonblocking pipe write; its native mask is initialized here.
             let installed = unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-                action.sa_flags = libc::SA_RESTART;
+                action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
                 if libc::sigemptyset(&raw mut action.sa_mask) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -338,7 +351,12 @@ mod imp {
     /// The signal that interrupted the release, if one did.
     pub fn caught() -> Option<i32> {
         let sig = SIGNAL.load(Ordering::SeqCst);
-        (sig != 0).then_some(sig)
+        if sig != 0 {
+            let _ = aterm_uds::signal_origin::records();
+            Some(sig)
+        } else {
+            None
+        }
     }
 
     /// Sends `sig` to `pid`.
@@ -347,6 +365,42 @@ mod imp {
         unsafe {
             kill(pid, sig);
         }
+    }
+
+    /// Sends this process `SIGTERM` on its own account: the release stopping itself (its fleet
+    /// line lost to another holder, `line_claim`'s `fail`). It is caught ([`caught`]) and
+    /// forwarded to a running step's group ([`Running::enter`]) as a person's would be, so that
+    /// step ends and no other step child starts; a child that settles this stop still starts,
+    /// unless a signal from elsewhere was caught too ([`caught_foreign`], [`Running::settling`]).
+    pub fn stop_self() {
+        OWN.fetch_add(1, Ordering::SeqCst);
+        if let Ok(pid) = i32::try_from(std::process::id()) {
+            send(pid, SIGTERM);
+        }
+    }
+
+    /// The signals caught from elsewhere than [`stop_self`]: every one caught but the
+    /// `SIGTERM`s this process sent itself, each of which it catches once (none where it
+    /// inherited `SIGTERM` ignored, which [`install`] keeps). Only a `SIGTERM` from elsewhere can
+    /// read as the release's own, in two ways: while the own one is in flight ([`stop_self`]
+    /// counted it and the handler has not caught it yet), one from elsewhere already caught,
+    /// before [`stop_self`] or after it, does until the own one is caught; and one that merges
+    /// with the own while that is pending (the kernel keeps one pending signal of a kind) does
+    /// for good.
+    fn foreign() -> u32 {
+        // COUNT first: each own SIGTERM it holds was counted in OWN before it was sent and in
+        // TERMS before COUNT ([`on_signal`]), so the later loads hold it too.
+        let caught = COUNT.load(Ordering::SeqCst);
+        let own = OWN.load(Ordering::SeqCst).min(TERMS.load(Ordering::SeqCst));
+        caught.saturating_sub(own)
+    }
+
+    /// Whether a signal from elsewhere than this process's own stop ([`stop_self`]) was caught:
+    /// a person's ^C, a closed terminal's `SIGHUP`, a `SIGTERM` another process sent (but for
+    /// one that reads as the own, [`foreign`]). It refuses a settlement's child as [`caught`]
+    /// refuses every other.
+    pub fn caught_foreign() -> bool {
+        foreign() > 0
     }
 
     /// How long after the send of the first signal to a running step's group ended a later caught
@@ -420,20 +474,28 @@ mod imp {
     impl Running {
         /// Starts forwarding caught signals for the process group led by `leader`.
         pub fn enter(leader: u32) -> Self {
-            Self::forwarding(leader, None)
+            Self::forwarding(leader, None, all_caught)
         }
 
         /// [`Running::enter`] for a qualify branch's child, which its branch's stop ends too:
         /// once `stop` fires the group is sent `sig`, and [`BranchStop::GRACE`] later `SIGKILL`.
         pub fn enter_stoppable(leader: u32, stop: BranchStop, sig: i32) -> Self {
-            Self::forwarding(leader, Some((stop, sig)))
+            Self::forwarding(leader, Some((stop, sig)), all_caught)
         }
 
-        fn forwarding(leader: u32, stop: Option<(BranchStop, i32)>) -> Self {
+        /// [`Running::enter`] for a child that settles this process's own stop ([`stop_self`]):
+        /// that stop, which the release already answered by starting it, is never forwarded to
+        /// it; a signal from elsewhere is ([`caught_foreign`]), as the signal that interrupted
+        /// the release ([`caught`]: the own `SIGTERM` when that came first).
+        pub fn settling(leader: u32) -> Self {
+            Self::forwarding(leader, None, foreign)
+        }
+
+        fn forwarding(leader: u32, stop: Option<(BranchStop, i32)>, counted: fn() -> u32) -> Self {
             let done = Arc::new(AtomicBool::new(false));
             let thread = i32::try_from(leader).ok().map(|group| {
                 let done = Arc::clone(&done);
-                std::thread::spawn(move || forward(group, &done, stop.as_ref()))
+                std::thread::spawn(move || forward(group, &done, stop.as_ref(), counted))
             });
             Self {
                 done,
@@ -452,12 +514,23 @@ mod imp {
         }
     }
 
-    /// Every 50 ms until `done`, sends `group` what [`Stop`] answers for the signals caught so
-    /// far, read then: the signal that interrupted the release, or `SIGKILL` ([`forward_with`]).
+    /// Every signal this process caught ([`COUNT`]).
+    fn all_caught() -> u32 {
+        COUNT.load(Ordering::SeqCst)
+    }
+
+    /// Every 50 ms until `done`, sends `group` what [`Stop`] answers for the signals `counted`
+    /// so far ([`all_caught`], or for a settlement [`foreign`]), read then: the signal
+    /// that interrupted the release, or `SIGKILL` ([`forward_with`]).
     /// A branch's fired `stop` counts as one more signal caught, and as a second once
     /// [`BranchStop::GRACE`] passed, so it is answered as a person's stop and then a second one;
     /// with no signal caught, the group is sent the branch's.
-    fn forward(group: i32, done: &AtomicBool, stop: Option<&(BranchStop, i32)>) {
+    fn forward(
+        group: i32,
+        done: &AtomicBool,
+        stop: Option<&(BranchStop, i32)>,
+        counted: fn() -> u32,
+    ) {
         let active = || !done.load(Ordering::SeqCst);
         let stopped = || {
             stop.and_then(|(stop, _)| stop.fired_for())
@@ -465,25 +538,64 @@ mod imp {
         };
         forward_with(&Forwarding {
             active: &active,
-            caught: &|| COUNT.load(Ordering::SeqCst) + stopped(),
-            signal: &|| match SIGNAL.load(Ordering::SeqCst) {
-                0 => stop.map_or(SIGTERM, |(_, sig)| *sig),
-                caught => caught,
-            },
+            caught: &|| counted() + stopped(),
+            signal: &|| caught().unwrap_or_else(|| stop.map_or(SIGTERM, |(_, sig)| *sig)),
             clock: &std::time::Instant::now,
-            send: &|sig| signal_group(group, sig, &active),
+            send: &|sig| {
+                #[cfg(test)]
+                SENDS.fetch_add(1, Ordering::SeqCst);
+                signal_group(group, sig, &active);
+            },
             pause: &|| {
+                #[cfg(test)]
+                LOOKS.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 !done.load(Ordering::SeqCst)
             },
         });
     }
 
+    /// The looks every [`forward`] of this process ended, each counted as its pause begins,
+    /// after whatever that look sent.
+    #[cfg(test)]
+    static LOOKS: AtomicU32 = AtomicU32::new(0);
+    /// The signals every [`forward`] of this process sent its group, each counted as its send
+    /// begins.
+    #[cfg(test)]
+    static SENDS: AtomicU32 = AtomicU32::new(0);
+
+    /// What this process caught and its forwarders did so far ([`counts_for_test`]).
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct Counts {
+        /// Every signal caught ([`COUNT`]): the release's own stops and those from elsewhere.
+        pub caught: u32,
+        /// The looks every forwarder ended ([`LOOKS`]): a look whose answer was a send ended
+        /// after that send.
+        pub looks: u32,
+        /// The signals every forwarder sent its group ([`SENDS`]).
+        pub sends: u32,
+    }
+
+    /// The signals this process caught and what its forwarders did, so a test can wait for a
+    /// signal it sent to be caught, or for a forwarder to have looked, instead of for a time.
+    /// The counts are process-global and never cleared, so only a test's re-executed child
+    /// reads them; only this crate's test binaries call it, so the seam is `cfg(test)`.
+    #[cfg(test)]
+    pub fn counts_for_test() -> Counts {
+        Counts {
+            caught: COUNT.load(Ordering::SeqCst),
+            looks: LOOKS.load(Ordering::SeqCst),
+            sends: SENDS.load(Ordering::SeqCst),
+        }
+    }
+
     /// What [`forward_with`] reads, sends and waits by.
     pub(super) struct Forwarding<'a> {
         /// The step still owns forwarding; false once its guard starts closing.
         pub(super) active: &'a dyn Fn() -> bool,
-        /// The signals this process has caught ([`COUNT`]).
+        /// The signals counted so far: every one this process caught ([`COUNT`]), or for a
+        /// settlement those from elsewhere ([`foreign`]), and a branch's fired stop.
         pub(super) caught: &'a dyn Fn() -> u32,
         /// The signal that interrupted the release ([`SIGNAL`]).
         pub(super) signal: &'a dyn Fn() -> i32,
@@ -589,6 +701,10 @@ mod imp {
     pub fn caught() -> Option<i32> {
         None
     }
+    pub fn stop_self() {}
+    pub fn caught_foreign() -> bool {
+        false
+    }
     pub struct Running;
     impl Running {
         pub fn enter_stoppable(_leader: u32, _stop: BranchStop, _sig: i32) -> Self {
@@ -597,10 +713,114 @@ mod imp {
         pub fn enter(_leader: u32) -> Self {
             Self
         }
+        pub fn settling(_leader: u32) -> Self {
+            Self
+        }
     }
 }
 
 pub use imp::*;
+
+/// A child whose dedicated group was established by its actual spawn, not a later pid query.
+pub(crate) struct GroupChild {
+    child: aterm_uds::spawnfd::Child,
+    drained: bool,
+}
+
+impl GroupChild {
+    pub(crate) fn spawn(command: &mut aterm_uds::spawnfd::Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let child = command.spawn_in_dedicated_process_group()?;
+        #[cfg(not(unix))]
+        let child = command.spawn()?;
+        Ok(Self {
+            child,
+            drained: false,
+        })
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    pub(crate) fn drain(&mut self) -> std::io::Result<()> {
+        if self.drained {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        drain_child_group(&mut self.child)?;
+        self.drained = true;
+        Ok(())
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.drain()?;
+        self.child.wait()
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.child.owns_unreaped() {
+            let _ = self.child.kill();
+            let _ = self.drain();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// End a completed child's remaining group before returning its budget or compiler tokens.
+/// The unreaped leader pins the group identity; Trust's daemon and its children remain spared.
+#[cfg(unix)]
+fn drain_child_group(child: &mut aterm_uds::spawnfd::Child) -> std::io::Result<()> {
+    let group = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    if !child.owns_unreaped() {
+        return Err(std::io::Error::other(
+            "slice group leader was already reaped",
+        ));
+    }
+    child.wait_exited()?;
+    loop {
+        if let Some(table) = listing() {
+            let work = table.iter().any(|row| {
+                if row.pgid != group
+                    || row.pid == group
+                    || matches!(
+                        aterm_uds::process::process_presence(row.pid),
+                        aterm_uds::process::ProcessPresence::Exited
+                            | aterm_uds::process::ProcessPresence::Absent
+                    )
+                {
+                    return false;
+                }
+                // Only a positively identified daemon ancestry is exempt. A missing
+                // ancestor is not safe to signal, but it is not evidence of drain either.
+                let mut at = row;
+                for _ in 0..=table.len() {
+                    if is_trustd(&at.name) {
+                        return false;
+                    }
+                    let Some(parent) = table.iter().find(|p| p.pid == at.parent) else {
+                        break;
+                    };
+                    at = parent;
+                }
+                true
+            });
+            if !work {
+                return Ok(());
+            }
+            imp::signal_group(group, SIGKILL, &|| true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 /// One process as a listing of every process reads it ([`listing`]), for [`signalled`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -762,533 +982,5 @@ fn stat_proc(stat: &str, pid: i32) -> Option<Proc> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A TERM queued after the old image blocks the handoff set stays pending across a real
-    /// native exec, then reaches the new image's handler only after it is installed. HUP, which
-    /// was already blocked, stays blocked. NEGATIVE CONTROL: a corrupted private description is
-    /// refused and restores nothing, leaving the queued TERM blocked until that probe exits.
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn a_queued_signal_survives_exec_and_a_malformed_handoff_restores_nothing() {
-        use std::time::Duration;
-
-        for refused in [true, false] {
-            let mut actor = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-release"));
-            actor.env(EXEC_PROBE_STAGE_ENV, "actor");
-            if refused {
-                actor.env(EXEC_PROBE_REFUSE_ENV, "1");
-            }
-            let output =
-                aterm_uds::deadline::output_within(&mut actor, Duration::from_secs(60)).unwrap();
-            assert!(
-                output.status.success(),
-                "signal exec actor failed ({:?}): stdout={} stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            let output = String::from_utf8_lossy(&output.stdout);
-            let expected = if refused {
-                "signal-exec-refused-malformed-handoff"
-            } else {
-                "signal-exec-caught-queued-term-after-handler-install"
-            };
-            assert!(output.contains(expected), "missing {expected}: {output}");
-        }
-    }
-
-    /// A guard that closed before its worker was scheduled must not read stale signals,
-    /// wait, or dispatch to the completed step's former numeric process group.
-    #[cfg(unix)]
-    #[test]
-    fn an_already_closed_forwarder_never_looks_or_sends() {
-        forward_with(&Forwarding {
-            active: &|| false,
-            caught: &|| panic!("a closed step's signal count was read"),
-            signal: &|| panic!("a closed step's signal was read"),
-            clock: &|| panic!("a closed step's clock was read"),
-            send: &|_| panic!("a completed step's old group was signalled"),
-            pause: &|| panic!("a closed step waited before checking cancellation"),
-        });
-    }
-
-    /// Closing while a signal/clock observation is in progress fences either dispatch,
-    /// including escalation after a previously sent first stop. No native signal is sent.
-    #[cfg(unix)]
-    #[test]
-    fn cancellation_during_a_look_fences_first_and_escalated_sends() {
-        use std::cell::{Cell, RefCell};
-        use std::time::{Duration, Instant};
-        for cancel_look in [1, 2] {
-            let active = Cell::new(true);
-            let look = Cell::new(1);
-            let sends = RefCell::new(Vec::new());
-            let t0 = Instant::now();
-            forward_with(&Forwarding {
-                active: &|| active.get(),
-                caught: &|| {
-                    if look.get() == cancel_look {
-                        active.set(false);
-                    }
-                    look.get()
-                },
-                signal: &|| SIGHUP,
-                clock: &|| t0 + Duration::from_secs(u64::from(look.get())),
-                send: &|sig| sends.borrow_mut().push(sig),
-                pause: &|| {
-                    look.set(look.get() + 1);
-                    active.get()
-                },
-            });
-            assert_eq!(
-                *sends.borrow(),
-                if cancel_look == 1 {
-                    vec![]
-                } else {
-                    vec![SIGHUP]
-                },
-                "the cancelled look must not send its first stop or escalation"
-            );
-        }
-    }
-
-    /// One stop that reaches the release along several paths sends the step's group one signal;
-    /// a stop found [`ESCALATE_AFTER`] or more after the first send ended ([`Stop::sent`]) kills
-    /// the group, and so does each after it. The clock is the test's: each answer is asked at a
-    /// moment it names. NEGATIVE CONTROLS: kill on any signal found after the first, and the
-    /// burst of copies kills the group; take only the time from [`Stop::sent`], and a copy caught
-    /// while the first send ran, found the interval after it ended, kills the group.
-    #[cfg(unix)]
-    #[test]
-    fn copies_of_one_stop_count_once_and_a_later_stop_kills_the_group() {
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut stop = Stop::default();
-        assert_eq!(stop.next(0, at(0)), None, "nothing caught");
-        assert_eq!(
-            stop.next(2, at(50)),
-            Some(Pass::First),
-            "the first stop, and a copy"
-        );
-        stop.sent(3, at(400));
-        assert_eq!(
-            stop.next(5, at(450)),
-            None,
-            "a burst of copies found after it ended"
-        );
-        assert_eq!(
-            stop.next(6, at(1399)),
-            None,
-            "a copy found just inside the interval after the send ended"
-        );
-        assert_eq!(stop.next(6, at(9000)), None, "nothing caught since");
-        assert_eq!(
-            stop.next(7, at(9000)),
-            Some(Pass::Kill),
-            "a person's second stop"
-        );
-        assert_eq!(
-            stop.next(9, at(9050)),
-            Some(Pass::Kill),
-            "and each after it"
-        );
-
-        let mut stop = Stop::default();
-        assert_eq!(stop.next(1, at(0)), Some(Pass::First));
-        stop.sent(2, at(2000));
-        let after = at(2000) + ESCALATE_AFTER;
-        assert_eq!(
-            stop.next(2, after),
-            None,
-            "a copy caught while the first send ran, found the interval after it ended"
-        );
-        assert_eq!(
-            stop.next(3, after),
-            Some(Pass::Kill),
-            "a stop found the interval after the first send ended"
-        );
-    }
-
-    /// The signals [`forward_with`] sends for a run of looks on the test's clock: the first send
-    /// takes `first_send_ms` and `copies_in_send` copies are caught while it runs; each pause
-    /// lasts its milliseconds and catches its count of signals. Each send is listed with the
-    /// milliseconds from the start at which it began.
-    #[cfg(unix)]
-    fn forwarded(
-        first_send_ms: u64,
-        copies_in_send: u32,
-        pauses: &[(u64, u32)],
-    ) -> Vec<(i32, u64)> {
-        use std::cell::{Cell, RefCell};
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let clock = Cell::new(t0);
-        let caught = Cell::new(0u32);
-        let sends = RefCell::new(Vec::new());
-        let next = Cell::new(0usize);
-        let since = |at: Instant| u64::try_from(at.duration_since(t0).as_millis()).unwrap();
-        forward_with(&Forwarding {
-            active: &|| true,
-            caught: &|| caught.get(),
-            signal: &|| SIGHUP,
-            clock: &|| clock.get(),
-            send: &|sig| {
-                let first = sends.borrow().is_empty();
-                sends.borrow_mut().push((sig, since(clock.get())));
-                if first {
-                    caught.set(caught.get() + copies_in_send);
-                    clock.set(clock.get() + Duration::from_millis(first_send_ms));
-                }
-            },
-            pause: &|| {
-                let Some(&(ms, signals)) = pauses.get(next.get()) else {
-                    return false;
-                };
-                next.set(next.get() + 1);
-                clock.set(clock.get() + Duration::from_millis(ms));
-                caught.set(caught.get() + signals);
-                true
-            },
-        });
-        sends.into_inner()
-    }
-
-    /// The forwarding loop sends the signal that interrupted the release once for the first stop,
-    /// however long that send takes: a copy caught while it runs, or found within
-    /// [`ESCALATE_AFTER`] after it ended, sends nothing, and a stop found that long after it
-    /// ended sends `SIGKILL`. NEGATIVE CONTROLS: time the interval from the look that found the
-    /// first signal (drop [`Stop::sent`]), and the copy found 50 ms after a 2 s send kills the
-    /// group; take only the time from [`Stop::sent`], not the copies caught by then, and the copy
-    /// caught during the send but found by a thread that looked again 1.5 s after it kills the
-    /// group; send nothing for [`Pass::Kill`], and the person's second stop sends nothing; send
-    /// `SIGTERM` for the first stop, and the `SIGHUP` that interrupted the release is not sent.
-    #[cfg(unix)]
-    #[test]
-    fn a_copy_caught_during_a_slow_first_send_counts_once_and_a_later_stop_kills() {
-        assert_eq!(
-            forwarded(2000, 1, &[(50, 1), (50, 1), (1000, 1)]),
-            [(SIGHUP, 50), (SIGKILL, 3100)],
-            "the stop at 50 ms, a copy caught during its 2 s send, one found 50 ms after it, \
-             and a second stop found 1050 ms after it"
-        );
-        assert_eq!(
-            forwarded(2000, 1, &[(50, 1), (1500, 0)]),
-            [(SIGHUP, 50)],
-            "a copy caught during the send, found 1.5 s after it ended"
-        );
-        assert_eq!(
-            forwarded(0, 0, &[(50, 1), (50, 1), (949, 1), (1, 1)]),
-            [(SIGHUP, 50), (SIGKILL, 1050)],
-            "a copy 50 ms and one 999 ms after an instant send, then a stop 1000 ms after it"
-        );
-    }
-
-    /// The rows of a `pid ppid pgid name` table, one process a line; a line that does not read
-    /// is skipped.
-    fn rows(table: &str) -> Vec<Proc> {
-        table
-            .lines()
-            .filter_map(|line| {
-                let mut rest = line.trim_start();
-                let mut num = || -> Option<i32> {
-                    let end = rest.find(char::is_whitespace)?;
-                    let n = rest[..end].parse().ok()?;
-                    rest = rest[end..].trim_start();
-                    Some(n)
-                };
-                let (pid, parent, pgid) = (num()?, num()?, num()?);
-                Some(Proc {
-                    pid,
-                    parent,
-                    pgid,
-                    name: rest.trim_end().to_string(),
-                })
-            })
-            .collect()
-    }
-
-    /// The release (400) started the step's group 500; its member 502 is a trustd, and 503 and
-    /// 504 its solvers.
-    #[test]
-    fn the_interrupt_spares_a_trustd_and_its_solvers() {
-        let listing = rows(
-            "\
-            1     0     1 /sbin/launchd\n\
-          500   400   500 /bin/sh\n\
-          501   500   500 /Users//x/Library/Application Support/aterm/pkg/trust/bin/targo\n\
-          502   501   500 /Users//x/Library/Application Support/aterm/pkg/trust/bin/trustd\n\
-          503   502   500 z3\n\
-          504   503   500 z3-worker\n\
-          505   500   500 sleep\n\
-          600   500   600 /usr/libexec/trustd\n\
-          601     1   777 /bin/sh\n\
-          garbage line\n",
-        );
-        assert_eq!(signalled(&listing, 500, 400), [500, 501, 505]);
-        assert_eq!(signalled(&listing, 777, 400), [601]);
-        assert!(signalled(&listing, 999, 400).is_empty());
-    }
-
-    /// Below the process that started the step (`home`, 10), a parent the listing lacks (20) or
-    /// a loop of reused pids (31, 32) spares a member, since what was not read could be a
-    /// trustd; from `home` up, one the listing lacks (7, above the shell 8) is no trustd, and a
-    /// trustd there spares every member `home` started, as `ps`'s listing did. NEGATIVE
-    /// CONTROLS: take a parent the listing lacks below `home` for no trustd, and 21 is
-    /// signalled; answer a loop's end with a signal, and 31 and 32 are; take one lacking above
-    /// `home` for a trustd, and only the orphan 13 is; end the climb at `home` unjudged, and the
-    /// trustd above it spares nothing.
-    #[test]
-    fn a_climb_spares_what_it_could_not_read_below_home_and_judges_homes_own_parents() {
-        let table = |shell: &str| {
-            rows(&format!(
-                "\
-                 8     7     8 {shell}\n\
-                10     8    10 aterm-release\n\
-                11    10    11 targo\n\
-                12    11    11 rustc\n\
-                13     1    11 orphan\n\
-                21    20    11 cc\n\
-                31    32    11 a\n\
-                32    31    11 b\n"
-            ))
-        };
-        assert_eq!(
-            signalled(&table("zsh"), 11, 10),
-            [11, 12, 13],
-            "what home started, and an orphan of it"
-        );
-        assert_eq!(
-            signalled(&table("trustd"), 11, 10),
-            [13],
-            "under a trustd, only the orphan launchd took"
-        );
-        let mut under_one = table("zsh");
-        under_one.push(Proc {
-            pid: 1,
-            parent: 0,
-            pgid: 1,
-            name: "trustd".to_string(),
-        });
-        assert_eq!(
-            signalled(&under_one, 11, 10),
-            [11, 12],
-            "a trustd at pid 1 spares the orphan it took"
-        );
-    }
-
-    /// `/proc/<pid>/stat` reads as the row of the pid it names, its name between the first `(`
-    /// and the last `)`. NEGATIVE CONTROL: drop the pid check, and the text of another pid reads
-    /// as this one's.
-    #[test]
-    fn a_proc_stat_line_reads_as_the_row_of_its_own_pid() {
-        let stat = "4242 (a) b (trustd)) S 4200 4100 4100 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 \
-                    123 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
-        assert_eq!(
-            stat_proc(stat, 4242),
-            Some(Proc {
-                pid: 4242,
-                parent: 4200,
-                pgid: 4100,
-                name: "a) b (trustd)".to_string(),
-            })
-        );
-        assert_eq!(stat_proc(stat, 4243), None, "the text of another pid");
-        assert_eq!(stat_proc("4242 (sh", 4242), None, "a cut line");
-    }
-
-    /// The lines `from` carries, read on a thread: each `Some`, then `None` at its end.
-    #[cfg(unix)]
-    fn lines(
-        from: impl std::io::Read + Send + 'static,
-    ) -> std::sync::mpsc::Receiver<Option<String>> {
-        use std::io::BufRead as _;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in std::io::BufReader::new(from).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Some(line)).is_err() {
-                    return;
-                }
-            }
-            let _ = tx.send(None);
-        });
-        rx
-    }
-
-    /// The next of `lines`, within the one-minute hang detector.
-    #[cfg(unix)]
-    #[track_caller]
-    fn next(lines: &std::sync::mpsc::Receiver<Option<String>>, what: &str) -> Option<String> {
-        lines
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|e| panic!("{what}: nothing within the one-minute hang detector: {e}"))
-    }
-
-    /// `child`'s exit status, within the one-minute hang detector.
-    #[cfg(unix)]
-    #[track_caller]
-    fn ended(child: &mut aterm_uds::spawnfd::Child, what: &str) -> std::process::ExitStatus {
-        let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(
-                std::time::Instant::now() < bound,
-                "{what} did not end within the one-minute hang detector"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-
-    /// A real process group of this test's own: a leader shell, a grandchild shell it started,
-    /// and a stand-in named `trustd` (a copy of a shell, joined to the group) running `cat`, its
-    /// child. One SIGTERM sent to the group ends the leader by that signal (its wait status) and
-    /// the grandchild by its own handler (the line it prints), and their output pipe ends. The
-    /// stand-in's `cat` still echoes a line written after the send returned (a SIGTERM sent
-    /// before that write would have ended it first), then ends at its input's end with status 0,
-    /// and the stand-in exits 0. Each process here ends by itself once this test's pipes close.
-    /// NEGATIVE CONTROLS: send the leader alone, and the grandchild never prints `TERM`; judge a
-    /// member by its own name only, not climbing, and the trustd's `cat` ends by the signal
-    /// (`cat 143`) instead of echoing; take no member for a trustd, and nothing echoes either;
-    /// spare what descends from a trustd but not the trustd, and it dies by SIGTERM before it
-    /// prints `cat 0`.
-    #[cfg(unix)]
-    #[test]
-    fn a_real_group_is_signalled_but_for_a_trustd_and_what_it_runs() {
-        use aterm_uds::spawnfd::{Stdio, command};
-        use std::io::Write as _;
-        use std::os::unix::process::ExitStatusExt as _;
-        let mut kept =
-            aterm_uds::deadline::KeptUntilRan::new(crate::test_scratch_dir("interrupt").keep());
-        let trustd = kept.path().join("trustd");
-        let shell = if cfg!(target_vendor = "apple") {
-            "/bin/dash"
-        } else {
-            "/bin/sh"
-        };
-        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new(shell), &trustd);
-        // The copy shows it runs from its file (macOS has assessed its first exec) by a line it
-        // writes, before anything may remove it; one macOS still holds at the hang detector
-        // ends the test COULD NOT RUN.
-        let mut proof = command(&trustd)
-            .args(["-c", "echo ran"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        aterm_uds::deadline::prints(&mut proof, "ran", aterm_uds::deadline::ECHO_HANG);
-        let _ = proof.wait();
-        kept.ran();
-        // The group starts with the signals that end a process at their defaults, set here, not
-        // this test binary's: a shell started ignoring SIGTERM (a `nohup` or `&` runner's
-        // choice, which every exec keeps) can trap none, and neither ends nor says `TERM`.
-        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
-        let mut leader = command("/bin/sh")
-            .args([
-                "-c",
-                "/bin/sh -c 'trap \"echo TERM \\$\\$; exit 0\" TERM; echo up $$; \
-                 while kill -0 $PPID 2>/dev/null; do /bin/sleep 1; done' & read -r _",
-            ])
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        drop(start);
-        let group = i32::try_from(leader.id()).unwrap();
-        let from_group = lines(leader.stdout.take().unwrap());
-        let up = next(&from_group, "the grandchild").expect("the grandchild's first line");
-        let grandchild = up
-            .strip_prefix("up ")
-            .expect("the grandchild says it is up");
-        let grandchild_pid = grandchild
-            .parse::<i32>()
-            .expect("the grandchild says its pid");
-        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
-        let mut standin = command(&trustd)
-            .args(["-c", "echo up; /bin/cat; echo \"cat $?\""])
-            .process_group(group)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        drop(start);
-        let from_standin = lines(standin.stdout.take().unwrap());
-        let mut to_standin = standin.stdin.take().unwrap();
-        assert_eq!(next(&from_standin, "the stand-in").as_deref(), Some("up"));
-        to_standin.write_all(b"before\n").unwrap();
-        assert_eq!(
-            next(&from_standin, "its cat").as_deref(),
-            Some("before"),
-            "the trustd's cat runs in the group"
-        );
-
-        let home = i32::try_from(std::process::id()).unwrap();
-        let standin_pid = i32::try_from(standin.id()).unwrap();
-        imp::signal_group_with(group, SIGTERM, &|| true, &|| {
-            Some(vec![
-                Proc {
-                    pid: group,
-                    parent: home,
-                    pgid: group,
-                    name: "sh".to_string(),
-                },
-                Proc {
-                    pid: grandchild_pid,
-                    parent: group,
-                    pgid: group,
-                    name: "sh".to_string(),
-                },
-                Proc {
-                    pid: standin_pid,
-                    parent: home,
-                    pgid: group,
-                    name: "trustd".to_string(),
-                },
-            ])
-        });
-
-        let status = ended(&mut leader, "the leader");
-        assert_eq!(
-            status.signal(),
-            Some(SIGTERM),
-            "the leader ends by the signal: {status}"
-        );
-        assert_eq!(
-            next(&from_group, "the grandchild"),
-            Some(format!("TERM {grandchild}")),
-            "the grandchild ends by its own handler"
-        );
-        assert_eq!(
-            next(&from_group, "the group's pipe"),
-            None,
-            "and nothing holds the pipe"
-        );
-        let wrote = to_standin.write_all(b"after\n").map_err(|e| e.kind());
-        let echoed = next(&from_standin, "its cat");
-        assert_eq!(
-            (wrote, echoed.as_deref()),
-            (Ok(()), Some("after")),
-            "the trustd's cat echoes after the send"
-        );
-        drop(to_standin);
-        assert_eq!(
-            next(&from_standin, "its cat's end").as_deref(),
-            Some("cat 0"),
-            "its cat ends at its input's end, and the stand-in reports it"
-        );
-        let status = ended(&mut standin, "the stand-in");
-        assert_eq!(
-            status.code(),
-            Some(0),
-            "the trustd stand-in exits by itself: {status}"
-        );
-    }
-}
+#[path = "interrupt_tests.rs"]
+mod tests;

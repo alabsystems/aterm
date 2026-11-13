@@ -112,7 +112,7 @@ fn a_failed_write_ends_the_writing_never_the_reading() {
             },
             tag: b"sid=s-unit".to_vec(),
         },
-        Frame::Bye,
+        Frame::Bye { keep: Vec::new() },
     ];
     for frame in &frames {
         let fd = matches!(frame, Frame::Register { .. }).then(|| null.as_fd());
@@ -337,7 +337,7 @@ fn offer_to_a_second_window(fail_dup: bool) -> OfferSeen {
         let (own, own_rdev) = a_pty_master();
         write_frame(&b, &hello_app(), None).expect("hello B");
         write_frame(&b, &claim(own_rdev, 1), Some(own.as_fd())).expect("claim B");
-        write_frame(&b, &Frame::Bye, None).expect("bye B");
+        write_frame(&b, &Frame::Bye { keep: Vec::new() }, None).expect("bye B");
         server.test_fail_next_dup = fail_dup;
         for _ in 0..3 {
             server.step(0).expect("turn");

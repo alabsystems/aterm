@@ -405,7 +405,7 @@ fn composed_cursor_body_shape_reaches_pure_mixed_and_retained_frames() {
         "Retain projects the prior complete body without a second effect tick"
     );
 
-    let (mut rainbow, rainbow_wid, _) = pure_fixture("rainbow kitty");
+    let (mut rainbow, rainbow_wid, _) = pure_fixture("rainbow");
     for index in 0..8 {
         rainbow
             .windows
@@ -533,6 +533,7 @@ fn observe_cat_pulse_route(
     forward_kitty_cursor_motion(
         true,
         false,
+        true,
         crate::cursor_glow::GlowStyle::RainbowKitty,
         replay_pulse,
         &mut window.fx.companions_mut().cursor_cat,
@@ -690,7 +691,7 @@ fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     let t0 = Instant::now();
@@ -780,7 +781,7 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
 
 #[test]
 fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_take() {
-    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, session) = mixed_fixture("rainbow");
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
     let t0 = Instant::now();
     let advance = |app: &mut App, at: Instant| {
@@ -1042,7 +1043,7 @@ fn mixed_advance_translates_scroll_anchors() {
 
 #[test]
 fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
-    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, session) = mixed_fixture("rainbow");
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(Instant::now())));
     let v2_owns_frame = app.windows[&wid].fx.cursor().glow.v2_owns_frame();
@@ -1208,7 +1209,7 @@ fn composed_hello(
 ) {
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
@@ -1824,20 +1825,20 @@ fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
     for (route, steps) in rows {
         let (mut app, wid, terms) = match route {
             Route::PureSplit => {
-                let (app, wid, _) = pure_fixture("rainbow kitty");
+                let (app, wid, _) = pure_fixture("rainbow");
                 let terms = visible_terminal_handles(&app, wid);
                 assert_eq!(terms.len(), 2, "a two-pane split");
                 (app, wid, terms)
             }
             Route::Mixed => {
-                let (app, wid, session) = mixed_fixture("rainbow kitty");
+                let (app, wid, session) = mixed_fixture("rainbow");
                 let term = app.pool.get(session).expect("terminal leaf").term.clone();
                 (app, wid, vec![term])
             }
             Route::HeadlessSingleCapture => {
                 let mut app = App::headless_for_test();
                 app.config.cursor_trail = Some(true);
-                app.config.cursor_trail_style = Some("rainbow kitty".into());
+                app.config.cursor_trail_style = Some("rainbow".into());
                 app.config.trail_sounds = Some(false);
                 let wid = WindowId(0);
                 let term = app
@@ -1878,7 +1879,7 @@ fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
 
 #[test]
 fn headless_split_capture_holds_advance_and_retain_without_ticking_effects() {
-    let (mut app, wid, _) = pure_fixture("rainbow kitty");
+    let (mut app, wid, _) = pure_fixture("rainbow");
     let terms = visible_terminal_handles(&app, wid);
     let t0 = Instant::now();
     let retained_at = t0 + Duration::from_millis(37);
@@ -1960,7 +1961,7 @@ fn headless_split_capture_holds_advance_and_retain_without_ticking_effects() {
 
 #[test]
 fn capture_preparation_reports_exact_hold_unavailable_and_clean_reopen() {
-    let (mut app, wid, _) = pure_fixture("rainbow kitty");
+    let (mut app, wid, _) = pure_fixture("rainbow");
     let terms = visible_terminal_handles(&app, wid);
     let t0 = Instant::now();
     for term in &terms {
@@ -1999,7 +2000,7 @@ fn capture_preparation_reports_exact_hold_unavailable_and_clean_reopen() {
         CapturePreparation::Unavailable
     ));
 
-    let (mut mixed, mixed_wid, session) = mixed_fixture("rainbow kitty");
+    let (mut mixed, mixed_wid, session) = mixed_fixture("rainbow");
     let mixed_term = mixed
         .pool
         .get(session)
@@ -2032,7 +2033,7 @@ fn capture_preparation_reports_exact_hold_unavailable_and_clean_reopen() {
 fn headless_single_capture_never_relocks_after_its_authorized_snapshot() {
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     let term = app
@@ -2115,7 +2116,7 @@ fn primed_pure_capture_fixture(
 fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses() {
     let t0 = Instant::now();
 
-    let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("rainbow kitty");
+    let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("rainbow");
     let mixed_term = mixed
         .pool
         .get(mixed_session)
@@ -2149,7 +2150,7 @@ fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses(
         observe_cat_pulse_route(&mut mixed, mixed_wid, mixed_tick, "mixed live");
     bind_extracted_cat_pulse_route("mixed live", classified, pending, delivered, replay_changed);
 
-    let (mut split, split_wid, split_term) = pure_fixture("rainbow kitty");
+    let (mut split, split_wid, split_term) = pure_fixture("rainbow");
     assert!(
         split
             .prepare_terminal_capture_grid_with_cursor_fx(
@@ -2224,7 +2225,7 @@ fn extracted_composed_style_gate_consumes_pulse_before_route_change() {
         );
     }
 
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     let switched = fire_tick + Duration::from_millis(16);
     assert!(
         app.prepare_heterogeneous_input_scratch_with_cursor_fx(
@@ -2655,7 +2656,7 @@ fn present_mixed(app: &mut App, wid: WindowId) {
 /// once a mixed frame was drawn the cat buys the window no frame cadence.
 #[test]
 fn a_mixed_frame_grounds_the_cat_it_does_not_draw() {
-    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, _) = mixed_fixture("rainbow");
     present_mixed(&mut app, wid);
     let t0 = Instant::now();
     // Typing at 60 ms summons the cat within 3.6 s (`summon_latency_is_bounded_across_typing_cadences`).
@@ -2704,7 +2705,7 @@ fn a_celebration_at_a_mixed_tab_runs_out_and_settles() {
     use aterm_effects::kitty_sing::{
         CelebrateOn, SING_BAR_SECONDS, SING_WIND_DOWN, song_signature,
     };
-    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, session) = mixed_fixture("rainbow");
     present_mixed(&mut app, wid);
     let t0 = Instant::now();
     {
@@ -2748,7 +2749,7 @@ fn a_celebration_at_a_mixed_tab_runs_out_and_settles() {
 #[test]
 fn a_celebration_waits_out_a_mixed_tab_s_native_focus() {
     use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
-    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, session) = mixed_fixture("rainbow");
     present_mixed(&mut app, wid);
     assert!(
         app.windows[&wid].front_terminal().is_some(),
@@ -2815,7 +2816,7 @@ fn a_celebration_waits_out_a_mixed_tab_s_native_focus() {
 #[test]
 fn a_mixed_frame_buys_the_pet_no_frames() {
     use crate::VisibleContentRoute::{Heterogeneous, Terminal};
-    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, _) = mixed_fixture("rainbow");
     let route = app
         .active_visible_content_route(wid)
         .expect("a visible route");
@@ -2911,7 +2912,7 @@ fn a_mixed_frame_buys_the_pet_no_frames() {
 /// hello's whole hold instead of a cat whose greeting expired off screen.
 #[test]
 fn a_mixed_frame_pauses_the_collection_hello_it_does_not_draw() {
-    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    let (mut app, wid, _) = mixed_fixture("rainbow");
     present_mixed(&mut app, wid);
     assert!(
         app.windows[&wid].front_terminal().is_some(),

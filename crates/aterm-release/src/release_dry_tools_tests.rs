@@ -380,3 +380,195 @@ fn private_bump_tree_matches_the_real_bump_edits() {
         .stdout_utf8();
     assert_eq!(actual, planned);
 }
+
+/// The `--bump` candidate of [`BumpFixture`]'s base: 0.5.0 to 0.6.0, the bump unwritten.
+#[cfg(unix)]
+fn unwritten_bump(fixture: &BumpFixture) -> Candidate {
+    Candidate {
+        commit: fixture.base.clone(),
+        version: "0.6.0".into(),
+        why: "fixture".into(),
+        bump_from: Some("0.5.0".into()),
+        carry: Vec::new(),
+    }
+}
+
+/// THE PRIVATE BUMP'S OWN PLUMBING FAILING JUDGES NOTHING. While another release-input
+/// judgment of the clone holds input.lock, a dry bump's private checkout cannot be taken: the
+/// dry run could not run, and says to retry once that judgment ends.
+/// NEGATIVE CONTROL: preview_bump_from_origin mapped the busy lock (and each git failure of
+/// the private bump) through cut_refusal without could_not_run, so a dry run said "a real run
+/// would refuse" with the remedy "the cut's own remedy, above".
+#[cfg(unix)]
+#[test]
+fn a_busy_private_bump_checkout_could_not_run_and_names_its_retry() {
+    let mut fixture = BumpFixture::new(false);
+    let c = unwritten_bump(&fixture);
+    let held = crate::input_record::claim(&fixture.real.release).unwrap();
+    let r = fixture.preview(&c).unwrap_err();
+    assert!(r.could_not_run, "{} / {}", r.why, r.remedy);
+    assert!(r.why.starts_with("private bump checkout"), "{}", r.why);
+    assert!(
+        r.remedy
+            .contains("retry once no other release-input judgment"),
+        "{}",
+        r.remedy
+    );
+    assert!(!r.remedy.contains("the cut's own remedy"), "{}", r.remedy);
+    drop(held);
+    fixture.preview(&c).unwrap();
+}
+
+/// THE PRIVATE BUMP'S CLEANUP REMEDY IS A COMMAND THAT RUNS AS PASTED. The private checkout
+/// lives under the clone's git directory, whose path can hold a space or a quote; the remedy
+/// names it as one shell word.
+/// NEGATIVE CONTROL: the remedy interpolated the path bare, so `git -C /a b/… restore` split
+/// it into two words and restored nothing.
+#[test]
+fn the_private_bump_cleanup_remedy_names_its_checkout_as_one_shell_word() {
+    let place = Path::new("/Users//o/My Repos/it's/.git/aterm-release/input");
+    let remedy = private_bump_cleanup_remedy(place);
+    assert!(
+        remedy.ends_with(
+            "git -C '/Users//o/My Repos/it'\\''s/.git/aterm-release/input' restore \
+             --source=HEAD --staged --worktree -- ."
+        ),
+        "{remedy}"
+    );
+    let plain = private_bump_cleanup_remedy(Path::new("/repo/.git/aterm-release/input"));
+    assert!(
+        plain.contains("git -C /repo/.git/aterm-release/input restore"),
+        "{plain}"
+    );
+}
+
+/// A BUMP STILL TO BE WRITTEN OWES ITS HARNESS VERSIONS TO ITS OWN COMMIT. The real launcher
+/// judges the un-bumped base before it bumps, and the bump commit writes the harness versions
+/// the window owes: that preflight refuses nothing and returns the line naming exactly the
+/// versions the bump commit writes, for the launcher to say. R itself, and a dry run's private
+/// bump that already carries them, stay held to the strict gate and owe nothing to say.
+/// NEGATIVE CONTROL: commit_gates_from_origin always asked the strict gate, so a real
+/// `ship release --bump` whose window owed a harness version was refused at its pre-bump
+/// preflight, before the commit that writes it; then it discarded the gate's line, so the
+/// versions the preflight owed were never shown.
+#[cfg(unix)]
+#[test]
+fn the_base_of_an_unwritten_bump_owes_its_harness_versions_to_the_bump() {
+    let mut fixture = BumpFixture::new(false);
+    let c = unwritten_bump(&fixture);
+    let bare = fixture.root.path().join("origin.git");
+    let harness = |found: &[Refusal]| -> Vec<String> {
+        found
+            .iter()
+            .filter(|r| r.why.starts_with("harness versions"))
+            .map(|r| r.why.clone())
+            .collect()
+    };
+    let private = fixture.preview(&c).unwrap();
+    let subject = crate::ledger::git_ok(
+        &GitCli::new(&fixture.repo),
+        &["log", "-1", "--format=%s", &private],
+    )
+    .unwrap()
+    .stdout_utf8();
+    let writes = subject
+        .trim()
+        .rsplit_once(" (")
+        .and_then(|(_, names)| names.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("the private bump writes no harness version: {subject}"));
+    assert!(writes.starts_with("alab "), "{subject}");
+
+    let origin = crate::github_remote::claim_fixture(&fixture.repo, &bare);
+    let base = fixture.real.commit_gates_from_origin(&c, true, Ok(origin));
+    assert_eq!(harness(&base.found), Vec::<String>::new());
+    assert_eq!(
+        base.notes,
+        [format!(
+            "harness versions since v0.5.0: the bump commit writes {writes}"
+        )],
+        "the base preflight names what the bump commit writes"
+    );
+
+    // Negative control: the same tree released as it is (no bump) owes, and refuses.
+    let plain = Candidate {
+        bump_from: None,
+        ..c.clone()
+    };
+    let origin = crate::github_remote::claim_fixture(&fixture.repo, &bare);
+    let found = fixture
+        .real
+        .commit_gates_from_origin(&plain, true, Ok(origin));
+    assert_eq!(harness(&found.found).len(), 1, "{found:#?}");
+    assert!(
+        harness(&found.found)[0].contains("unchanged harness version"),
+        "{found:#?}"
+    );
+    assert_eq!(found.notes, Vec::<String>::new());
+
+    // The dry run's private bump carries the writes, and the strict gate passes it.
+    let private = Candidate {
+        commit: private,
+        ..c.clone()
+    };
+    let origin = crate::github_remote::claim_fixture(&fixture.repo, &bare);
+    let found = fixture
+        .real
+        .commit_gates_from_origin(&private, true, Ok(origin));
+    assert_eq!(harness(&found.found), Vec::<String>::new());
+    assert_eq!(found.notes, Vec::<String>::new());
+}
+
+/// A DRY BUMP'S REFUSAL CARRIES THE LOG IT WOULD NAME: the dry run's logs are scratch, which
+/// the backend removes when the run ends ([`Real`]'s `Drop`), so a refusal of the bump's edit
+/// whose cause the commit step's log holds carries that log's last lines and sends the reader
+/// to them; a run that keeps its logs names the log.
+/// NEGATIVE CONTROL: edit_bump's refusals said "read the commit step's log" in a dry run too,
+/// a file the same run removed on exit (here a nested lock the bump moves, which locked
+/// metadata refuses since no manifest is beside it).
+#[cfg(unix)]
+#[test]
+fn a_dry_bumps_refusal_carries_the_log_it_would_name() {
+    let mut fixture = BumpFixture::new(false);
+    let nested = fixture.repo.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        nested.join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"nested\"\nversion = \"0.5.0\"\n",
+    )
+    .unwrap();
+    let git = GitCli::new(&fixture.repo);
+    crate::ledger::git_ok(&git, &["add", "nested/Cargo.lock"]).unwrap();
+    crate::ledger::git_ok(&git, &["commit", "-qm", "a nested lock with no manifest"]).unwrap();
+    fixture.base = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
+    let c = unwritten_bump(&fixture);
+    let logs = fixture.real.logs.clone();
+    let r = fixture.preview(&c).unwrap_err();
+    assert!(r.why.contains("nested/Cargo.lock"), "{}", r.why);
+    assert!(!r.remedy.contains("commit step's log"), "{}", r.remedy);
+    // A dry refusal prints its detail lines, then its fix line (Run::note_dry_refusal): the
+    // remedy points up at them.
+    assert!(r.remedy.contains("output above"), "{}", r.remedy);
+    assert!(r.remedy.contains("the bump is undone"), "{}", r.remedy);
+    assert!(
+        r.detail
+            .iter()
+            .any(|line| line.contains("lock-bump-validation: nested/Cargo.lock")),
+        "{:?}",
+        r.detail
+    );
+    fixture.real.scratch_logs = false;
+    let kept = fixture.preview(&c).unwrap_err();
+    assert!(
+        kept.remedy
+            .starts_with("read the commit step's log; the bump is undone"),
+        "{}",
+        kept.remedy
+    );
+    fixture.real.scratch_logs = true;
+    drop(fixture);
+    assert!(!logs.exists(), "the dry run's logs outlived it");
+}

@@ -522,6 +522,7 @@ fn world() -> World {
             window_sessions: vec![7],
             cwd: Some("/Users//a/my proj".into()),
             fg_pgid: Some(201),
+            request: None,
         },
         tabs: vec![TabFact {
             key: 7,
@@ -1052,6 +1053,53 @@ fn procs_rows_carry_labels_states_and_base_units() {
     q.top = 1;
     let r = render_text(&q, &c);
     assert!(all_text(&r).contains("more=2 rows"), "{}", all_text(&r));
+}
+
+/// A process's wait, peak and write rate are read only by macOS's sweep: elsewhere each unread
+/// one says `not_sampled`, never `refused` or `warming`, which no wait would end. NEGATIVE
+/// CONTROL: on macOS the same row keeps `warming` for its rates and `refused` for its peak, and
+/// a refused row `refused` for all three.
+#[test]
+fn a_process_figure_no_sweep_reads_is_not_sampled() {
+    let mut s = snapshot();
+    let row = &mut s.procs[0];
+    (row.wait, row.peak, row.write_bps, row.refused) = (None, None, None, false);
+    let mut refused = row.clone();
+    refused.refused = true;
+    let row = row.clone();
+    let words = |family: &'static str, r: &ProcView| {
+        let mut w = world();
+        w.machine.family = family;
+        let c = ctx(&w, Some(&s), true, true);
+        let j = proc_json(&c, &s, r);
+        ["wait_mc", "peak_bytes", "write_bytes_per_s"]
+            .map(|key| j.get(key).cloned().expect("a figure or why"))
+    };
+    let why = |words: [&str; 3]| words.map(Jv::why);
+    for family in ["Linux", "Windows"] {
+        for r in [&row, &refused] {
+            assert_eq!(
+                words(family, r),
+                why(["not_sampled"; 3]),
+                "{family}, refused={}",
+                r.refused
+            );
+        }
+    }
+    assert_eq!(words("macOS", &row), why(["warming", "refused", "warming"]));
+    assert_eq!(words("macOS", &refused), why(["refused"; 3]));
+    let mut w = world();
+    w.machine.family = "Linux";
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    let pid = row.pid;
+    assert!(
+        text.contains(&format!("proc pid={pid} "))
+            && text.contains("wait_mc=unavailable(not_sampled) fp_bytes=",)
+            && text
+                .contains("peak_bytes=unavailable(not_sampled) write_bps=unavailable(not_sampled)"),
+        "{text}"
+    );
 }
 
 /// Each process row carries its age at the reading, and each program its oldest member's, a
@@ -2868,4 +2916,97 @@ fn sys_prints_the_os_thermal_word_and_reserves_throttled_for_counted_throttling(
         .map(|e| e.label)
         .collect();
     assert_eq!(labels, ["thermal critical"]);
+}
+
+/// `scope=request` reads the request's tabs, says whose they are, and states its totals with
+/// each unread figure `unavailable`, never 0. NEGATIVE CONTROL: `scope=tab` has no request line.
+#[test]
+fn scope_request_names_its_request_and_its_unread_totals_are_unavailable() {
+    let s = snapshot();
+    let mut w = world();
+    w.target.request = Some(crate::sys::RequestFacts {
+        id: "r-20261111-1200-87be5228-01".into(),
+        sessions: vec![7, 8],
+        tabs: 2,
+        cpu_s: Some(12),
+        peak_mb: None,
+        written_mb: Some(3),
+        claims: 1,
+        claimed_mb: None,
+    });
+    let c = ctx(&w, Some(&s), true, true);
+    for view in ["procs", "jobs", "disk"] {
+        let reply = render_text(
+            &SysQuery::parse(&format!("{view} scope=request")).unwrap(),
+            &c,
+        );
+        let text = all_text(&reply);
+        assert!(
+            text.contains(
+                "request=r-20261111-1200-87be5228-01 tabs=2 cpu_s=12 peak_mb=unavailable(not_sampled) \
+                 disk_written_mb=3 claims=1 claimed_mb=unavailable(not_sampled)"
+            ),
+            "{view}: {text}"
+        );
+        assert!(
+            text.contains("request r-20261111-1200-87be5228-01 (2 tabs)"),
+            "{view}: {text}"
+        );
+        let json = render_json(
+            &SysQuery::parse(&format!("{view} scope=request --json")).unwrap(),
+            &c,
+        );
+        assert_eq!(json.get("scope"), Some(&Jv::s("request")), "{view}");
+        let request = json.get("request").expect("the request's totals");
+        assert_eq!(request.get("cpu_s"), Some(&Jv::u(12)));
+        assert_eq!(request.get("peak_mb"), Some(&Jv::why("not_sampled")));
+        let v = contract_violations(&json);
+        assert!(v.is_empty(), "{view}: {v:?}");
+        let tab = all_text(&render_text(
+            &SysQuery::parse(&format!("{view} scope=tab")).unwrap(),
+            &c,
+        ));
+        assert!(!tab.contains("request="), "{view}: {tab}");
+    }
+    assert_eq!(scope_keys(&c, ScopeArg::Request), vec![7, 8]);
+    // A target no request owns reads its own tab: the host refuses the scope before this.
+    w.target.request = None;
+    let c = ctx(&w, Some(&s), true, true);
+    assert_eq!(scope_keys(&c, ScopeArg::Request), vec![7]);
+}
+
+/// `sys disk` with no walker's sizes says what each platform measures: on Windows that the
+/// walker has measured nothing yet and that no process's disk writes are read; on macOS (and
+/// Linux) the sentence it always said. NEGATIVE CONTROL: the macOS reading never says the
+/// Windows sentence, nor the Windows one that writers are measured.
+#[test]
+fn an_unmeasured_disk_says_what_its_platform_measures() {
+    let s = snapshot();
+    let mut w = world();
+    let mac = all_text(&render_text(
+        &query(View::Disk, false),
+        &ctx(&w, Some(&s), true, true),
+    ));
+    assert!(
+        mac.contains(
+            "are unavailable(not_sampled) here (no disk walker measures them); free space and \
+             writers are measured"
+        ),
+        "{mac}"
+    );
+    assert!(!mac.contains("disk writes are not"), "{mac}");
+    w.machine.family = "Windows";
+    let win = all_text(&render_text(
+        &query(View::Disk, false),
+        &ctx(&w, Some(&s), true, true),
+    ));
+    assert!(
+        win.contains(
+            "are unavailable(not_sampled) here (the disk walker has measured none yet; a \
+             headless instance starts it at the first ask); free space is measured, each \
+             process's disk writes are not"
+        ),
+        "{win}"
+    );
+    assert!(!win.contains("writers are measured"), "{win}");
 }

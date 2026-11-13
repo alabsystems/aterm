@@ -431,12 +431,12 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
                         .collect()
                 };
                 if now < end {
-                    assert!(lines[0].contains("100% used") && lines[0].contains("at its limit"));
+                    assert!(lines[0].contains("0% left") && lines[0].contains("at its limit"));
                 } else {
                     assert!(lines[0].contains("not read since"));
                     assert!(!lines[0].contains('%') && !lines[0].contains("at its limit"));
                 }
-                assert!(lines[1].contains("100% used") && lines[1].contains("at its limit until"));
+                assert!(lines[1].contains("0% left") && lines[1].contains("at its limit until"));
                 assert!(lines[2].contains("reset unknown") && lines[2].contains("at its limit"));
             }
         }
@@ -636,9 +636,9 @@ fn the_limits_hint_promises_no_sign_in_of_another_macs_account() {
         &f.roster,
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"other\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             label = \"other\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"other@example.test\"\n",
-            home.join(".aterm/logins/other").display()
+            crate::harness::host_path::toml(&home.join(".aterm/logins/other"))
         ),
     )
     .unwrap();

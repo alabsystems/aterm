@@ -21,10 +21,10 @@
 //! (its tab switched back to, the pane scrolled back to the bottom, a sibling split closed) is
 //! not at its first frame. The row's cells are in the glass's tokens by role, its chart's
 //! letters in the hue of their column, its local midnights ticks of one device pixel at the
-//! foot of the cells that draw a level ([`push_ticks`], which the Accounts card's work row and
-//! lanes share, [`crate::autopilot_menu`]); its lead, chart and tail are each a
+//! foot of the cells that draw a level ([`push_ticks`]); its lead, chart and tail are each a
 //! hit of [`Fact::Account`], the chart's naming the column under the pointer
-//! ([`RowPart::Chart`]). Lit, the lead and the tail are underlined and the chart's inks lift.
+//! ([`RowPart::Chart`]). Lit, the lead and the tail wear the glass's one hover (§1.5) from their
+//! first glyph to their last, which is each one's hit, and the chart keeps its inks.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use aterm_agent::harness::quota_view::{CELL_PLACES, QuotaLine, QuotaView, Role};
 use aterm_agent::harness::tap;
 use aterm_core::render::{FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace};
 use aterm_core::terminal::{RenderCell, Script, UnderlineStyle};
-use aterm_effects::glass_inks::{GlassInks, field};
+use aterm_effects::glass_inks::{GlassInks, HoverPart, field};
 
 #[cfg(doc)]
 use super::FooterFacts;
@@ -182,7 +182,7 @@ impl QuotaRow {
 
     /// The row composed from `key` ([`compose_cells`]), its midnights' ticks over its chart
     /// ([`push_ticks`]) in the inks of what each stands on ([`TickInks`]: the pane's ground, or a
-    /// glyph that inks the tick's foot; line E has no wash).
+    /// glyph that inks the tick's foot).
     fn compose(&mut self, key: QuotaKey) {
         if self.key == Some(key) {
             return;
@@ -201,13 +201,9 @@ impl QuotaRow {
             &self.line.ticks,
             (0, self.line.chart.len()),
             key.cell,
-            |i| {
-                chart
-                    .get(i)
-                    .map_or(TickOn::Ground, |c| TickOn::of(c.0, false))
-            },
+            |i| chart.get(i).map_or(TickOn::Ground, |c| TickOn::of(c.0)),
         );
-        let inks = TickInks::new(key.glass.track(), key.glass.key().ground, None);
+        let inks = TickInks::new(key.glass.track(), key.glass.key().ground);
         self.ticks = tick_content(&ticks, inks);
         self.key = Some(key);
     }
@@ -271,64 +267,93 @@ impl Grace {
     }
 }
 
-/// The ink a quota row's cell of `role` wears at palette position `t` (§1.3), lit or at rest:
-/// lit, every ink but a warning's and the projected line's lifts one step toward the ink.
-const fn ink(glass: &GlassInks, role: Role, t: f32, lit: bool) -> u32 {
-    match (role, lit) {
-        (Role::Lit, false) => glass.lit(),
-        (Role::Lit | Role::Mark | Role::Line, true) | (Role::Line, false) => glass.letter(t),
-        (Role::Value, false) => glass.value(),
-        (Role::Value, true) => glass.lit(),
-        (Role::Quiet | Role::Track, true) => glass.value(),
-        (Role::Quiet, false) => glass.quiet(),
-        (Role::Mark, false) => glass.mark(t),
-        (Role::Warn, _) => glass.warn(),
-        (Role::Track, false) => glass.track(),
+/// The ink a quota row's cell of `role` wears at rest at palette position `t` (§1.3).
+const fn ink(glass: &GlassInks, role: Role, t: f32) -> u32 {
+    match role {
+        Role::Lit => glass.lit(),
+        Role::Line => glass.letter(t),
+        Role::Value => glass.value(),
+        Role::Quiet => glass.quiet(),
+        Role::Mark => glass.mark(t),
+        Role::Warn => glass.warn(),
+        Role::Track => glass.track(),
     }
 }
 
+/// The cells of `part` of `line` its ink lies in: from its first glyph to its last, the blanks
+/// between them too and none at either end; empty for a part with no glyph. A hover underlines
+/// these and they are the part's hit ([`QuotaWrite::parts`]).
+fn inked(line: &QuotaLine, part: &Range<usize>) -> Range<usize> {
+    let glyph = |i: &usize| line.cells.get(*i).is_some_and(|(ch, ..)| *ch != ' ');
+    match (part.clone().find(glyph), part.clone().rev().find(glyph)) {
+        (Some(first), Some(last)) => first..last + 1,
+        _ => part.start..part.start,
+    }
+}
+
+/// The lead's cells of `line` to the chart, or to the tail where no chart is drawn, and the
+/// tail's from there to the line's end: the two runs of words either side of the chart.
+fn words(line: &QuotaLine) -> (Range<usize>, Range<usize>) {
+    let len = line.cells.len();
+    let (lead_end, tail_start) = if line.chart.is_empty() {
+        let at = line.tail.start.min(len);
+        (at, at)
+    } else {
+        (line.chart.start, line.chart.end)
+    };
+    (0..lead_end, tail_start..len)
+}
+
 /// `line`'s cells in `key`'s tokens into `out` (cleared first), then blanks to `key.cells`: each
-/// cell the ink of its role at its pane column's place in the field, bold where the line says;
-/// lit, the lead's and the tail's glyphs underlined in their own ink, and the chart's lit by its
-/// inks alone ([`ink`]): an underline is drawn whatever a cell's glyph, and under a one-eighth
-/// line at level 2 to 8, a `╳` or the `▕` it would read as a second line at level 1.
+/// cell the ink of its role at its pane column's place in the field, bold where the line says.
+/// Lit, the lead and the tail wear the glass's one hover ([`GlassInks::hovered`]) over their
+/// inked cells ([`inked`]), a warning's glyphs keeping their ink; the chart keeps its inks and
+/// takes no line: an underline is drawn whatever a cell's glyph, and under a one-eighth line at
+/// level 2 to 8, a `╳` or the `▕` it would read as a second line at level 1.
 fn compose_cells(line: &QuotaLine, key: &QuotaKey, out: &mut Vec<RenderCell>) {
     out.clear();
     let blank = RenderCell {
         script: Script::Normal,
         ..key.blank
     };
+    let (lead, tail) = words(line);
+    let (lead, tail) = (inked(line, &lead), inked(line, &tail));
     for (i, &(ch, role, bold)) in line.cells.iter().enumerate() {
         let t = field(INDENT + i, key.cols);
-        let fg = rgb_of(ink(&key.glass, role, t, key.lit));
-        let underlined = key.lit && ch != ' ' && !line.chart.contains(&i);
-        out.push(RenderCell {
+        let cell = RenderCell {
             ch,
-            fg,
+            fg: rgb_of(ink(&key.glass, role, t)),
             bold,
-            underline: if underlined {
-                UnderlineStyle::Single
-            } else {
-                UnderlineStyle::None
-            },
-            underline_color: underlined.then_some(fg),
+            underline: UnderlineStyle::None,
+            underline_color: None,
             ..blank
+        };
+        let part = if line.chart.contains(&i) {
+            HoverPart::Chart
+        } else if role == Role::Warn {
+            HoverPart::Warn
+        } else {
+            HoverPart::Text
+        };
+        let hit = line.chart.contains(&i) || lead.contains(&i) || tail.contains(&i);
+        out.push(if key.lit && hit {
+            crate::claude_lights::hovered_cell(&key.glass, cell, part)
+        } else {
+            cell
         });
     }
     out.resize(key.cells.max(out.len()), blank);
 }
 
-/// What a midnight's tick stands on (§1.3, §1.4, §2.2), which its ink is read against
-/// ([`TickInks`], whose palette base it names, [`Self::ink`]): the row's ground (a blank cell, `┄`,
-/// the projected line above the tick's foot quarter), a glyph that inks that quarter (a measured
+/// What a midnight's tick stands on (§1.3, §2.2), which its ink is read against ([`TickInks`],
+/// whose palette base it names, [`Self::ink`]): the row's ground (a blank cell, `┄`, the
+/// projected line above the tick's foot quarter), or a glyph that inks that quarter (a measured
 /// step, whose block fills it from level 2 and half of it at level 1, or the projected line at
-/// level 1, `▁`, or 2, `🭻`, which lies inside it), or the warn wash a card lane's out line stands
-/// on.
+/// level 1, `▁`, or 2, `🭻`, which lies inside it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TickOn {
     Ground,
     Fill,
-    Wash,
 }
 
 impl TickOn {
@@ -338,18 +363,15 @@ impl TickOn {
         match self {
             TickOn::Ground => 0,
             TickOn::Fill => 2,
-            TickOn::Wash => 4,
         }
     }
 
-    /// What a tick stands on in a cell that draws `glyph`, on a warn wash or not: a measured
-    /// step (`▁` to `█`) or the projected line at level 2 (`🭻`, level 1 being `▁`) inks the
-    /// tick's foot quarter; any other glyph stands clear of it, on the wash or the ground.
-    pub(crate) fn of(glyph: char, wash: bool) -> Self {
+    /// What a tick stands on in a cell that draws `glyph`: a measured step (`▁` to `█`) or the
+    /// projected line at level 2 (`🭻`, level 1 being `▁`) inks the tick's foot quarter; any
+    /// other glyph stands clear of it, on the ground.
+    pub(crate) fn of(glyph: char) -> Self {
         if ('\u{2581}'..='\u{2588}').contains(&glyph) || glyph == '\u{1fb7b}' {
             TickOn::Fill
-        } else if wash {
-            TickOn::Wash
         } else {
             TickOn::Ground
         }
@@ -357,54 +379,37 @@ impl TickOn {
 }
 
 /// The inks of a row's midnights' ticks by what each stands on, in [`TickOn`]'s order (§1.3):
-/// the glass's track on the ground (Claude's rule grey floored to 3:1 there); the ground's own
-/// ink across a glyph that inks the tick's foot, a notch through a measured step or a low
+/// the glass's track on the ground (Claude's rule grey floored to 3:1 there); and the ground's
+/// own ink across a glyph that inks the tick's foot, a notch through a measured step or a low
 /// projected line that stands from it as far as it stands from the ground (a mark is floored to
 /// 3:1 on a dark ground and 4.5:1 on Day, a letter to 4.5:1, §4.1), where the track, solved on
 /// the ground alone, can take a step's luminance (1.0:1 on Night's violet steps) or strike
-/// through the line; and the track floored to 3:1 on a warn wash, which would hold it near
-/// 2.4:1.
+/// through the line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TickInks(pub(crate) [u32; 3]);
+pub(crate) struct TickInks(pub(crate) [u32; 2]);
 
 impl TickInks {
-    /// The inks of ticks drawn in `track` on a row of `ground` (`0x00RRGGBB` each), its warn cells
-    /// on `wash` where they stand on one.
-    pub(crate) fn new(track: u32, ground: u32, wash: Option<u32>) -> Self {
-        let on_wash = wash.map_or(track, |wash| {
-            aterm_effects::color_math::floor_contrast_keeping_hue(
-                track,
-                wash,
-                aterm_effects::cli_marks::ICON_CONTRAST,
-            )
-        });
-        TickInks([track, ground & 0x00FF_FFFF, on_wash])
-    }
-
-    /// The colour a tick of palette base `ink` ([`TickOn::ink`]) draws in.
-    #[cfg(test)]
-    pub(crate) fn color(self, ink: u32) -> u32 {
-        let at = usize::try_from(ink / 2).unwrap_or(0);
-        self.0.get(at).copied().unwrap_or(self.0[0])
+    /// The inks of ticks drawn in `track` on a row of `ground` (`0x00RRGGBB` each).
+    pub(crate) const fn new(track: u32, ground: u32) -> Self {
+        TickInks([track, ground & 0x00FF_FFFF])
     }
 
     /// The layer's palette: each ink twice, as a rect reads its base entry and the next.
-    pub(crate) fn palette(self) -> [FxInk; 6] {
-        let [ground, fill, wash] = self.0.map(|ink| FxInk::over(ink, 255));
-        [ground, ground, fill, fill, wash, wash]
+    pub(crate) fn palette(self) -> [FxInk; 4] {
+        let [ground, fill] = self.0.map(|ink| FxInk::over(ink, 255));
+        [ground, ground, fill, fill]
     }
 }
 
-/// A drawn row's midnights' ticks (§1.3, §1.4, §2.2: line E's chart, the Accounts card's work
-/// row and lanes) into `out`: one at each of `places` (from the row's left edge,
-/// [`CELL_PLACES`] a cell, each in a cell that takes one, [`Chart::ticks`]) that falls before the
+/// Line E's chart's midnights' ticks (§1.3, §2.2) into `out`: one at each of `places` (from the
+/// row's left edge, [`CELL_PLACES`] a cell, each in a cell that takes one, [`Chart::ticks`]) that
+/// falls before the
 /// row's `room`-th cell, one device pixel wide at the foot of a cell `cw` by `ch` pixels on the
 /// row whose top is `top`, a quarter of the cell tall, at its exact place, in the ink of what
 /// `on` says it stands on in its cell (counted from the row's left edge, [`TickInks`]). A tick,
 /// not a full-height hairline: only `▕` stands a whole cell high, so now never reads as one
-/// more midnight, and no tick meets a `▔` at a cell's head to read as `T`; on a card lane,
-/// whose top quarter stays clear under its item's words, a tick at the foot stands a cell's
-/// height from them. Nothing in a cell of no size.
+/// more midnight, and no tick meets a `▔` at a cell's head to read as `T`. Nothing in a cell of
+/// no size.
 ///
 /// [`Chart::ticks`]: aterm_agent::harness::quota_view::Chart::ticks
 pub(crate) fn push_ticks(
@@ -450,27 +455,9 @@ pub(crate) fn tick_content(ticks: &[FxRect], inks: TickInks) -> Option<Arc<FxCon
     })
 }
 
-/// Whether `content` draws `ticks` in `inks` as [`tick_content`] seals them, so a frame whose
-/// ticks have not moved hands the content on and seals none.
-pub(crate) fn draws_ticks(content: &FxContent, ticks: &[FxRect], inks: TickInks) -> bool {
-    content.palette() == inks.palette()
-        && content.items().len() == ticks.len()
-        && content
-            .items()
-            .iter()
-            .zip(ticks)
-            .all(|(item, tick)| matches!(item, FxItem::Rect(r) if r == tick))
-}
-
 /// The stable FX layer id of `session`'s quota row's ticks.
 const fn tick_id(session: u64) -> u64 {
     layer_id(session ^ 0x7175_6f74_612d_7469)
-}
-
-/// The stable FX layer id of the ticks on the drawn rows of `session`'s open card
-/// ([`crate::autopilot_menu`]).
-pub(crate) const fn card_tick_id(session: u64) -> u64 {
-    layer_id(session ^ 0x6361_7264_2d74_6963)
 }
 
 /// One pane's quota row, as the write puts it on the glass.
@@ -485,35 +472,26 @@ pub(super) struct QuotaWrite {
     pub(super) ground: RenderCell,
     /// The row's own cells; the rest of the write blanks the tap's words.
     pub(super) line: usize,
-    /// Every cell written.
-    pub(super) cells: usize,
     /// The chart's cells in the row, and its cells a day.
     pub(super) chart: Range<usize>,
     pub(super) per_day: u8,
-    /// The tail's first cell.
-    pub(super) tail: usize,
+    /// The lead's and the tail's inked cells in the row ([`inked`]), either one empty where it
+    /// has no glyph.
+    pub(super) lead: Range<usize>,
+    pub(super) tail: Range<usize>,
     /// The midnights' ticks, placed.
     pub(super) ticks: Option<FxLayer>,
 }
 
 impl QuotaWrite {
-    /// The row's hits, `(frame columns, part)`: its lead to the chart (or the tail), the chart,
-    /// and the tail to the write's end; each nonempty.
+    /// The row's hits, `(frame columns, part)`: its lead's inked cells, the chart, and its
+    /// tail's inked cells; each nonempty. A hit is the cells a hover underlines and the chart
+    /// between them: never a blank before the lead, after the tail, or over the tap's words.
     pub(super) fn parts(&self) -> impl Iterator<Item = ((usize, usize), RowPart)> + '_ {
-        let lead_end = if self.chart.is_empty() {
-            self.tail.min(self.cells)
-        } else {
-            self.chart.start
-        };
-        let tail_start = if self.chart.is_empty() {
-            lead_end
-        } else {
-            self.chart.end
-        };
         [
-            (0..lead_end, RowPart::Lead),
+            (self.lead.clone(), RowPart::Lead),
             (self.chart.clone(), RowPart::Chart(self.per_day)),
-            (tail_start..self.cells, RowPart::Tail),
+            (self.tail.clone(), RowPart::Tail),
         ]
         .into_iter()
         .filter(|(cells, _)| !cells.is_empty())
@@ -601,11 +579,13 @@ impl PaneFooter {
             lit,
             cell,
         };
-        let (len, chart, per_day, tail) = (
+        let (lead, tail) = words(line);
+        let (len, chart, per_day, lead, tail) = (
             line.cells.len(),
             line.chart.clone(),
             line.per_day,
-            line.tail.start,
+            inked(line, &lead),
+            inked(line, &tail),
         );
         self.quota.compose(key);
         let col = region.col_off + INDENT;
@@ -634,9 +614,9 @@ impl PaneFooter {
             col,
             ground: blank,
             line: len,
-            cells: key.cells,
             chart,
             per_day,
+            lead,
             tail,
             ticks,
         })

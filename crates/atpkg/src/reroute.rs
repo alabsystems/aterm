@@ -1475,63 +1475,63 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             if let Some(say) = say {
                 eprintln!("{say}");
             }
-            if upstream == "cargo"
-                && !machine.passthrough
-                && let Err(error) = crate::build_cache::registered::observe_command(
-                    &args,
-                    crate::build_cache::Tool::Cargo,
-                    cwd.as_deref(),
-                )
-            {
-                eprintln!("atpkg: {error}; no build started");
-                return ExitCode::from(75);
-            }
             let placed = if upstream == "cargo" && !machine.passthrough {
-                upstream_cargo_placement(
-                    &target,
+                let identity = (machine.resolve)(&target, explicit_toolchain(&args)).identity;
+                match checked_cargo_placement(
                     &args,
-                    &machine,
-                    &crate::build_cache::with_build_dir_here,
-                )
+                    upstream_cargo_tool(&identity),
+                    cwd.as_deref(),
+                    |placement_machine| {
+                        upstream_cargo_placement(&args, &identity, &|args, tool| {
+                            placement_for(args, tool, placement_machine)
+                        })
+                    },
+                ) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        eprintln!("atpkg: {error}; no build started");
+                        return ExitCode::from(75);
+                    }
+                }
             } else {
                 None
             };
             let build_dir = placed
-                .as_deref()
-                .filter(|placed| {
-                    crate::build_cache::loses_config(placed, crate::build_cache::Tool::Cargo)
-                })
-                .and_then(crate::build_cache::directory_from_placed_args)
+                .as_ref()
+                .filter(|(tool, placed)| crate::build_cache::loses_config(placed, *tool))
+                .and_then(|(_, placed)| crate::build_cache::directory_from_placed_args(placed))
                 .map(str::to_owned);
-            let args = placed.unwrap_or(args);
+            let args = placed.map(|(_, args)| args).unwrap_or(args);
             exec_upstream(&target, &args, build_dir.as_deref())
         }
         Plan::Quiet { copy, args } => exec_branded(layout, &copy, &args, None),
         Plan::Branded { say, copy, args } => {
             eprintln!("{say}");
-            if upstream == "cargo"
-                && let Err(error) = crate::build_cache::registered::observe_command(
+            let placed = if upstream == "cargo" {
+                match checked_cargo_placement(
                     &args,
                     crate::build_cache::Tool::Targo,
                     cwd.as_deref(),
-                )
-            {
-                eprintln!("atpkg: {error}; no build started");
-                return ExitCode::from(75);
-            }
-            let placed = if upstream == "cargo" {
-                crate::build_cache::with_build_dir_here(&args, crate::build_cache::Tool::Targo)
+                    |placement_machine| {
+                        placement_for(&args, crate::build_cache::Tool::Targo, placement_machine)
+                            .map(|args| (crate::build_cache::Tool::Targo, args))
+                    },
+                ) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        eprintln!("atpkg: {error}; no build started");
+                        return ExitCode::from(75);
+                    }
+                }
             } else {
                 None
             };
             let build_dir = placed
-                .as_deref()
-                .filter(|placed| {
-                    crate::build_cache::loses_config(placed, crate::build_cache::Tool::Cargo)
-                })
-                .and_then(crate::build_cache::directory_from_placed_args)
+                .as_ref()
+                .filter(|(tool, placed)| crate::build_cache::loses_config(placed, *tool))
+                .and_then(|(_, placed)| crate::build_cache::directory_from_placed_args(placed))
                 .map(str::to_owned);
-            let args = placed.unwrap_or(args);
+            let args = placed.map(|(_, args)| args).unwrap_or(args);
             exec_branded(layout, &copy, &args, build_dir.as_deref())
         }
         Plan::Shim { shim, args } => {
@@ -1546,24 +1546,58 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
 
 type Decide<'a> = dyn Fn(&[String], crate::build_cache::Tool) -> Option<Vec<String>> + 'a;
 
-fn upstream_cargo_placement(
-    target: &Path,
+type CargoPlacement = (crate::build_cache::Tool, Vec<String>);
+
+fn placement_for(
     args: &[String],
-    machine: &Machine<'_>,
-    decide: &Decide<'_>,
+    tool: crate::build_cache::Tool,
+    machine: &crate::build_cache::Machine<'_>,
 ) -> Option<Vec<String>> {
-    use crate::build_cache::Tool;
-    decide(args, Tool::Cargo)?;
-    match (machine.resolve)(target, explicit_toolchain(args)).identity {
+    if cfg!(target_os = "macos") {
+        crate::build_cache::with_build_dir(args, tool, machine)
+    } else {
+        None
+    }
+}
+
+fn checked_cargo_placement(
+    args: &[String],
+    original_tool: crate::build_cache::Tool,
+    cwd: Option<&Path>,
+    select: impl FnOnce(&crate::build_cache::Machine<'_>) -> Option<CargoPlacement>,
+) -> std::io::Result<Option<CargoPlacement>> {
+    use crate::build_cache::registered;
+    registered::with_live_machine(cwd, |machine| {
+        let placed = select(machine);
+        if let Some((tool, words)) = &placed {
+            registered::observe_placed_command_with(args, words, *tool, machine)?;
+        } else {
+            registered::observe_command_with(args, original_tool, machine)?;
+        }
+        Ok(placed)
+    })
+}
+
+fn upstream_cargo_tool(identity: &crate::upstream_identity::Identity) -> crate::build_cache::Tool {
+    match identity {
+        crate::upstream_identity::Identity::Known(vv) if vv.trust.is_some() => {
+            crate::build_cache::Tool::CargoCompat
+        }
+        _ => crate::build_cache::Tool::Cargo,
+    }
+}
+
+fn upstream_cargo_placement(
+    args: &[String],
+    identity: &crate::upstream_identity::Identity,
+    decide: &Decide<'_>,
+) -> Option<CargoPlacement> {
+    match identity {
         crate::upstream_identity::Identity::Known(vv)
             if crate::build_cache::release_reads_build_dir(&vv.release) =>
         {
-            let tool = if vv.trust.is_some() {
-                Tool::Targo
-            } else {
-                Tool::Cargo
-            };
-            decide(args, tool)
+            let tool = upstream_cargo_tool(identity);
+            decide(args, tool).map(|args| (tool, args))
         }
         _ => None,
     }
@@ -1576,7 +1610,10 @@ fn upstream_cargo_args(
     machine: &Machine<'_>,
     decide: &Decide<'_>,
 ) -> Vec<String> {
-    upstream_cargo_placement(target, &args, machine, decide).unwrap_or(args)
+    let identity = (machine.resolve)(target, explicit_toolchain(&args)).identity;
+    upstream_cargo_placement(&args, &identity, decide)
+        .map(|(_, args)| args)
+        .unwrap_or(args)
 }
 
 struct Machine<'a> {

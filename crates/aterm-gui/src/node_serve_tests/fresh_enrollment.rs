@@ -140,6 +140,7 @@ impl Drop for Vault {
 }
 
 fn publish_fleet(issuer: &Machine, code: &str, root: &Path) {
+    aterm_agent::fleet_vault::take_fixture(&issuer.state, Some(&issuer.vault)).unwrap();
     client::admin_seed_swarm_roster(&issuer.vault, &[]).unwrap();
     client::seed_vault_genesis(&issuer.vault, &root.join("genesis")).unwrap();
     let node = node_identity(&issuer.state).unwrap();
@@ -271,6 +272,17 @@ fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
     let url = format!("http://{}/v1/test", server.addr);
     let _vault = Vault(Some(server));
     let created = client::create(&issuer.vault, &url, None, Some("m1")).unwrap();
+    // The issuer's key was seeded above; explicitly bind that fixture state to its vault.
+    let config = client::config(&issuer.vault).unwrap().unwrap();
+    write_held(&issuer.state, Began::Here, |book| {
+        book.keep_vault(Some(&format!(
+            "# take 01010101010101010101010101010101\nname {}\nkey {}\n",
+            aterm_codec::hex::encode_lower(config.name.as_bytes()),
+            aterm_codec::hex::encode_lower(&config.signer.unwrap()),
+        )))
+    })
+    .unwrap()
+    .unwrap();
     publish_fleet(&issuer, &code, root.path());
     let issuer_node = Node::start(&issuer, issuer_listener);
     let newcomer_node = Node::start(&newcomer, newcomer_listener);
@@ -336,9 +348,19 @@ fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
             (Instant::now() + DIAL_WITHIN, DIAL_WITHIN),
         )
     };
+    // The default join grants the drive; the newcomer's fleet access, Read Only as it joins,
+    // is its person's to raise before a member starts a job there.
+    aterm_agent::fleet_access::set(
+        &newcomer.state,
+        aterm_types::fleet_access::FleetAccess::Full,
+        aterm_agent::fleet_access::By::Cli,
+    )
+    .expect("store Full Access");
     let mut driven = dial().expect("the default join must yield usable authenticated control");
     assert_eq!(driven.node, newcomer_id.node());
-    driven.write_all(b"spawn agent=claude len=11\n").unwrap();
+    driven
+        .write_all(super::drive_bytes("spawn agent=claude len=11\n").as_bytes())
+        .unwrap();
     driven.flush().unwrap();
     assert_eq!(
         read_line_raw(&mut driven, 4096).unwrap().unwrap(),

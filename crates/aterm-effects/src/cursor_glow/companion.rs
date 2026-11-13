@@ -347,6 +347,23 @@ impl CursorGlow {
             (&filled, &letters),
             (&feet, &sole_boxes[..n]),
         );
+        // The ribbon's rail in its row's foot band parts round each foot's ink, by the face.
+        let mut foot_ink = std::mem::take(&mut self.keep_foot_ink_scratch);
+        self.foot_ink(geom, &feet, &mut foot_ink);
+        self.v2.note_foot_spans(
+            foot_ink
+                .iter()
+                .map(|f| crate::rainbow_kitty::companion::FootSpan {
+                    x0: f.x0,
+                    x1: f.x1,
+                    y0: f.y0,
+                    end: f.end,
+                    below: f.below,
+                    ink: f.ink,
+                }),
+            self.caret_thin,
+        );
+        self.keep_foot_ink_scratch = foot_ink;
         self.keep_letters_scratch = letters;
         self.keep_feet_scratch = feet;
         self.keep_out_scratch = boxes;
@@ -457,11 +474,12 @@ impl CursorGlow {
 
     /// What lies round each cell of `feet` in this frame, by the host's face
     /// ([`Self::observe_glyph_ink`]): how far down its own glyph inks, how far down the row
-    /// below is free of ink under it and the cells either side, and the light its letter leaves
-    /// ([`foot_ring_light`]). A glyph the face does not place leaves nothing, and neither does a
-    /// cell the frame lays deep ink in ([`FrameText::deep`]: an underline's stroke, a combining
-    /// mark, a subscript, ink its glyph's raster does not hold), a row the frame did not read or
-    /// a grid's last row. With no face named, `out` is left empty.
+    /// below is free of ink under it and the cells either side, and the columns of its ink within
+    /// the judge's ring of the row's foot band and the light its letter leaves there
+    /// ([`foot_ring`]). A glyph the face does not place leaves nothing, and neither does a cell
+    /// the frame lays deep ink in ([`FrameText::deep`]: an underline's stroke, a combining mark, a
+    /// subscript, ink its glyph's raster does not hold) or a row the frame did not read: their ink
+    /// may lie anywhere in the cell. With no face named, `out` is left empty.
     #[inline]
     pub(super) fn foot_ink(
         &self,
@@ -479,10 +497,17 @@ impl CursorGlow {
         let deep_read = !self.feet_deep_unread && !self.lanes_deep_unread;
         #[cfg(not(any(test, debug_assertions)))]
         let deep_read = true;
+        #[cfg(any(test, debug_assertions))]
+        let deep_rastered = self.deep_light_rastered;
+        #[cfg(not(any(test, debug_assertions)))]
+        let deep_rastered = false;
+        // The first of a cell's pixel rows whose ring the foot band reaches.
+        let ring_from =
+            ch - bed::row_rail_depth(geom.ch as f32) as i32 - crate::cursor_glow::LETTER_GUARD_RING;
         // By glyph, ink and ground.
         let mut keys = [None::<(u8, u32, u32)>; 8];
-        let mut lights = [0.0_f32; 8];
-        let mut next_light = 0;
+        let mut rings = [None::<crate::cursor_glow::ink_ledger::FootRing>; 8];
+        let mut next_ring = 0;
         let mut i = 0;
         while i < feet.len() {
             let (x0, x1, y0, y1) = feet[i];
@@ -495,15 +520,14 @@ impl CursorGlow {
                 // holds: read by the glyph alone, an underlined `c`'s lane ran Phaser's rail at
                 // its whole light against the stroke over the context page's selected row, the
                 // letter at 1.11:1 on Solarized Dark (2026-11-06).
+                let deep = deep_read && self.frame_text.deep(row, col);
                 let end = match ink.cell_box(self.frame_text.glyph(row, col)) {
-                    _ if deep_read && self.frame_text.deep(row, col) => y1,
+                    _ if deep => y1,
                     Some([_, _, _, end]) => (y0 + i32::from(end)).min(y1),
                     None => y1,
                 };
                 let mut below = y1 + ch;
-                if row + 1 >= geom.rows as i32 {
-                    below = y1;
-                } else {
+                if row + 1 < geom.rows as i32 {
                     let mut c = col - 1;
                     while c <= col + 1 {
                         below = below.min(match self.frame_text.pair(row + 1, c) {
@@ -521,29 +545,42 @@ impl CursorGlow {
                     }
                 }
                 // A row's feet are a few glyphs in a colour or two, and a row of them is read
-                // every frame the rail lies in it.
-                let light = match self.frame_text.pair(row, col) {
-                    Some((Some(fg), ground)) => {
+                // every frame the rail lies in it. A deep cell's raster tells neither where its
+                // ink lies nor how it reads: read off the glyph, a `p` over a curly underline in
+                // a grey a step under its ink's (`#c1c1c1` under `#d0d0d0`) took the light its
+                // glyph could bear, and read 4.10 of its own 10.32 under Phaser's rail on the
+                // grid's last row (the forward round's M-M4).
+                let ring = match self.frame_text.pair(row, col) {
+                    Some((Some(fg), ground)) if !deep || deep_rastered => {
                         let key = (
                             self.frame_text.glyph(row, col),
                             fg & 0x00FF_FFFF,
                             ground & 0x00FF_FFFF,
                         );
                         match keys.iter().position(|k| *k == Some(key)) {
-                            Some(at) => lights[at],
+                            Some(at) => rings[at],
                             None => {
-                                let light = foot_ring_light(ink, key.0, key.1, key.2);
-                                let at = next_light % keys.len();
-                                (keys[at], lights[at]) = (Some(key), light);
-                                next_light += 1;
-                                light
+                                let ring = foot_ring(ink, key.0, (key.1, key.2), ring_from);
+                                let at = next_ring % keys.len();
+                                (keys[at], rings[at]) = (Some(key), Some(ring));
+                                next_ring += 1;
+                                Some(ring)
                             }
                         }
                     }
-                    Some((None, ground)) => {
-                        crate::color_math::relative_luminance(ground & 0x00FF_FFFF)
-                    }
-                    None => 0.0,
+                    _ => None,
+                };
+                let (light, cols) = match (ring, self.frame_text.pair(row, col)) {
+                    (Some(ring), _) => (ring.light, ring.cols),
+                    (None, Some((_, ground))) => (
+                        crate::color_math::relative_luminance(ground & 0x00FF_FFFF),
+                        None,
+                    ),
+                    (None, None) => (0.0, None),
+                };
+                let ink_cols = match cols {
+                    Some((a, b)) if !deep => (x + a, x + b),
+                    _ => (x, x + cw),
                 };
                 out.push(bed::FootInk {
                     x0: x,
@@ -551,6 +588,7 @@ impl CursorGlow {
                     y0,
                     end,
                     below,
+                    ink: ink_cols,
                     light,
                 });
                 x += cw;

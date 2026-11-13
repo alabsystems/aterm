@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-requests"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The per-Mac request journal (ATERM-KI-1109-3): what other Macs and this Mac's agents asked of it, one record per intent, kept in the state home's requests/ as k=v lines with the content tier beside them."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The control wire's one percent escape (`aterm_codec::pct`), which every value of a record is
+# written in, as the session log writes its values.
+aterm-codec = { workspace = true }
+# A brief's `sha256=` (`Sha256::digest`).
+aterm-digest = { workspace = true }
+# Each append is finished by an ordered flush (`aterm_durable::ordered`), and a compaction's
+# replacement by `Flush::Ordered`.
+aterm-durable = { workspace = true }
+# The log's line cap (`MAX_RECORD_BYTES`) and its clamp of an encoded value at a character
+# boundary (`field::clamp_encoded`), so a request record reads in the log's own line shape.
+aterm-slog = { workspace = true }
+# A request id's UTC date (`civil::civil_from_days`).
+aterm-stamp = { workspace = true }
+# The request grammar this store records: `request_id`, `request_why`'s caps and the requester's
+# token shapes (`requester_token`, `REQUESTER_ACCOUNT_BYTES`), and the hidden characters a
+# fallback why drops (`hidden_char::is_hidden_char`).
+aterm-types = { workspace = true }
+# Locked, newline-framed appends with torn-row repair (`line_log::hold`), and a compaction's
+# whole-file replacement (`atomic_file::write_flushed`).
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+# Each store test's own folder.
+aterm-tempfile = { workspace = true }

@@ -632,3 +632,314 @@ fn the_hold_help_enumerates_exactly_the_halt_set() {
         listed.len(),
     );
 }
+
+/// A request's `why=` is one trimmed, visible line of at most 200 characters and 256 encoded
+/// bytes with no quote. NEGATIVE CONTROLS: nothing, 201 characters, a second line, a line or
+/// paragraph separator, a value of only hidden characters, a bidi override, a quote, and a
+/// line short in characters but long once encoded are refused.
+#[test]
+fn a_requests_why_is_one_short_visible_line() {
+    use super::{REQUEST_WHY_BYTES, REQUEST_WHY_MAX, request_why};
+    assert_eq!(
+        request_why("  rebuild the m72 cache "),
+        Ok("rebuild the m72 cache")
+    );
+    assert!(request_why(&"w".repeat(REQUEST_WHY_MAX)).is_ok());
+    assert!(
+        request_why("cr\u{e9}er le cache \u{2014} m72").is_ok(),
+        "accents fit"
+    );
+    for refused in [
+        "",
+        "   ",
+        "two\nlines",
+        "two\u{2028}lines",
+        "two\u{2029}paragraphs",
+        "\u{200b}",
+        "\u{feff}\u{00ad}\u{2060}",
+        "look \u{202e}txt.exe",
+        "zero\u{200b}width",
+        "a \"quoted\" word",
+    ] {
+        assert!(request_why(refused).is_err(), "{refused:?}");
+    }
+    assert!(request_why(&"w".repeat(REQUEST_WHY_MAX + 1)).is_err());
+    // 100 characters, 300 bytes encoded: within the characters, past what the record keeps.
+    let wide = "\u{e9}".repeat(50) + &" w".repeat(25);
+    assert_eq!(wide.chars().count(), 100);
+    assert!(aterm_codec::pct::encoded_len(&wide) > REQUEST_WHY_BYTES);
+    assert!(request_why(&wide).is_err());
+    // Each line the check admits is kept whole by the record it lands in.
+    let spaced = "w ".repeat(42) + "w";
+    assert_eq!(aterm_codec::pct::encoded_len(&spaced), 42 * 4 + 1);
+    assert!(request_why(&spaced).is_ok());
+}
+
+/// A REQUESTER LINE READS BACK AS ITSELF: every part named, none named, and an account with a
+/// space and an accent percent-encoded on the wire.
+#[test]
+fn requester_line_round_trips() {
+    use super::Requester;
+    let sid = "s-0123456789abcdef0123";
+    for requester in [
+        Requester::of(
+            Some(sid),
+            Some("claude"),
+            Some("Opus 5.5"),
+            Some("a\u{e9}…@example.com"),
+        ),
+        Requester::of(Some(sid), None, None, Some("team acct")),
+        Requester::default(),
+    ] {
+        let line = requester.line();
+        assert!(
+            line.ends_with('\n') && !line[..line.len() - 1].contains('\n'),
+            "{line:?}"
+        );
+        assert!(line.len() - 1 <= super::REQUESTER_LINE_MAX, "{line:?}");
+        assert_eq!(Requester::parse(&line), Ok(requester.clone()), "{line:?}");
+        assert_eq!(
+            Requester::parse(line.trim_end_matches('\n')),
+            Ok(requester.clone())
+        );
+    }
+    let named = Requester::of(
+        Some(sid),
+        Some("claude"),
+        Some("Opus 5.5"),
+        Some("team acct"),
+    );
+    assert_eq!(
+        named.line(),
+        format!("requester sid={sid} program=claude model=opus-5.5 account=team%20acct\n")
+    );
+    assert_eq!(
+        Requester::default().line(),
+        "requester sid=- program=- model=- account=-\n"
+    );
+    // The longest of every part still fits the line the driven Mac reads.
+    let longest = Requester::of(
+        Some(sid),
+        Some(&"p".repeat(super::REQUESTER_TOKEN_MAX)),
+        Some(&"m".repeat(super::REQUESTER_TOKEN_MAX)),
+        Some(&"a".repeat(super::REQUESTER_ACCOUNT_BYTES)),
+    );
+    assert!(longest.program().is_some() && longest.account().is_some());
+    assert!(longest.line().len() - 1 <= super::REQUESTER_LINE_MAX);
+}
+
+/// A REQUESTER LINE NAMES ITS FOUR KEYS ONCE EACH, IN ORDER, AND NOTHING ELSE. NEGATIVE
+/// CONTROLS: another verb, a request line sent first, a missing, repeated, unknown, reordered or
+/// extra key, and a doubled space are each refused; the well-formed line is taken.
+#[test]
+fn requester_refuses_unknown_or_repeated_key() {
+    use super::Requester;
+    assert!(Requester::parse("requester sid=- program=- model=- account=-").is_ok());
+    for refused in [
+        "",
+        "survey",
+        "@s-0123456789abcdef0123 status",
+        "requester",
+        "requester sid=- program=- model=-",
+        "requester sid=- program=- model=- account=- account=-",
+        "requester sid=- program=- model=- account=- extra=1",
+        "requester sid=- sid=- program=- model=- account=-",
+        "requester program=- sid=- model=- account=-",
+        "requester sid=- program=- model=- host=-",
+        "requester sid=- program=-  model=- account=-",
+        "requester sid=- program=- model=- account=- ",
+        "REQUESTER sid=- program=- model=- account=-",
+        "requester sid - program=- model=- account=-",
+    ] {
+        assert!(Requester::parse(refused).is_err(), "{refused:?}");
+    }
+}
+
+/// A REQUESTER'S SID IS ONE ATERM MINTED. NEGATIVE CONTROLS: a short, long, uppercase or
+/// non-hex sid, a chosen name and an alias are refused on the wire and left out by
+/// [`super::Requester::of`].
+#[test]
+fn requester_refuses_unminted_sid() {
+    use super::{Requester, is_minted_sid};
+    let minted = "s-0123456789abcdef0123";
+    assert!(is_minted_sid(minted));
+    let line = |sid: &str| format!("requester sid={sid} program=- model=- account=-");
+    assert_eq!(
+        Requester::parse(&line(minted)).map(|r| r.sid().map(str::to_owned)),
+        Ok(Some(minted.to_owned()))
+    );
+    for unminted in [
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
+        "s-0123456789abcdefg123",
+        "x-0123456789abcdef0123",
+        "worker",
+        "s-7725",
+    ] {
+        assert!(!is_minted_sid(unminted), "{unminted}");
+        assert!(Requester::parse(&line(unminted)).is_err(), "{unminted}");
+        assert_eq!(Requester::of(Some(unminted), None, None, None).sid(), None);
+    }
+}
+
+/// A REQUESTER'S PROGRAM AND MODEL ARE LOWERCASE WORDS OF AT MOST 32 BYTES: the driving Mac
+/// names a footer's `Opus 5.5` `opus-5.5`, and the driven Mac takes that. NEGATIVE CONTROLS: the
+/// raw `Opus 5.5`, an uppercase word, a 33-byte word and a percent-encoded one are refused on the
+/// wire, never cut; an account past 64 encoded bytes or with a hidden character is refused too.
+#[test]
+fn requester_refuses_oversize_or_uppercase_model() {
+    use super::{REQUESTER_TOKEN_MAX, Requester, requester_token};
+    assert_eq!(requester_token("Opus 5.5").as_deref(), Some("opus-5.5"));
+    assert_eq!(
+        requester_token("  codex-alab ").as_deref(),
+        Some("codex-alab")
+    );
+    assert_eq!(requester_token("-"), None);
+    assert_eq!(requester_token("gpt (high)"), None);
+    assert_eq!(requester_token(&"m".repeat(REQUESTER_TOKEN_MAX + 1)), None);
+    let model = |model: &str| format!("requester sid=- program=claude model={model} account=-");
+    assert_eq!(
+        Requester::parse(&model("opus-5.5")).map(|r| r.model().map(str::to_owned)),
+        Ok(Some("opus-5.5".to_owned()))
+    );
+    assert!(Requester::parse(&model(&"m".repeat(REQUESTER_TOKEN_MAX))).is_ok());
+    for refused in [
+        "Opus 5.5",
+        "Opus%205.5",
+        "OPUS-5.5",
+        "opus_5.5",
+        &"m".repeat(REQUESTER_TOKEN_MAX + 1),
+    ] {
+        assert!(Requester::parse(&model(refused)).is_err(), "{refused:?}");
+    }
+    let account = |account: &str| format!("requester sid=- program=- model=- account={account}");
+    assert!(Requester::parse(&account(&"a".repeat(64))).is_ok());
+    for refused in [
+        "a".repeat(65),
+        "%E9".repeat(22),
+        "two%0Alines".to_owned(),
+        "zero%E2%80%8Bwidth".to_owned(),
+        "a%20".to_owned(),
+        "lower%e9case".to_owned(),
+        "raw\u{e9}".to_owned(),
+    ] {
+        assert!(Requester::parse(&account(&refused)).is_err(), "{refused:?}");
+    }
+    assert_eq!(
+        Requester::of(None, None, None, Some(&"a".repeat(65))).account(),
+        None,
+        "left out, never cut"
+    );
+}
+
+#[test]
+fn request_id_refuses_what_aterm_never_mints() {
+    use super::request_id;
+    for minted in [
+        "r-20261109-1411-87be5228-01",
+        "r-20261109-1411-local-02",
+        "r-20261231-2359-n87be522-100",
+    ] {
+        assert_eq!(request_id(minted), Ok(minted), "{minted}");
+    }
+    for never in [
+        "",
+        "r-",
+        "R-20261109-1411-87be5228-01",
+        "r-2026119-1411-87be5228-01",
+        "r-20261109-141-87be5228-01",
+        "r-20261109-1411--01",
+        "r-20261109-1411-87BE5228-01",
+        "r-20261109-1411-87be52281-01",
+        "r-20261109-1411-87be5228-1",
+        "r-20261109-1411-87be5228-00",
+        "r-20261109-1411-87be5228-001",
+        "r-20261109-1411-87be5228-01-",
+        "r-20261109-1411-87be5228-01 ",
+        "r-20261109-1411-87be:228-01",
+    ] {
+        assert!(request_id(never).is_err(), "{never:?}");
+    }
+}
+
+/// `request claim` (and review, keep, reply) writes this Mac's request journal, names no session and is the owner's (a
+/// drive reaches it as Owner once the lock admitted it). NEGATIVE: it is no fleet verb, so a
+/// member with no drive grant never runs it.
+#[test]
+fn request_row_is_write_meta_status() {
+    let s = spec("request").expect("request is in the table");
+    assert_eq!(s.op, Write);
+    assert_eq!(s.framing, Status);
+    assert_eq!(s.target, Meta);
+    assert_eq!(s.access, Access::OwnerOnly);
+    assert!(
+        !s.fleet,
+        "a drive is admitted by its kind, not the fleet list"
+    );
+    assert!(
+        s.summary
+            .starts_with("request claim|show|review|keep|reply "),
+        "{}",
+        s.summary
+    );
+}
+
+#[test]
+fn request_forms_show_is_read_lines_reply_waits() {
+    use super::{Access, Framing, Json, Lane, OpClass, spec_for};
+    let of = |rest: &str| spec_for("request", rest).expect("request resolves");
+    let show = of("show r-20261109-1411-87be5228-01");
+    assert_eq!(
+        (show.op, show.framing, show.lane),
+        (OpClass::Read, Framing::Lines, Lane::Rpc)
+    );
+    let json = of("show r-20261109-1411-87be5228-01 --json");
+    assert_eq!(json.framing, Framing::Lines);
+    let reply = of("reply r-20261109-1411-87be5228-01 -- thanks");
+    assert_eq!(
+        (reply.op, reply.framing, reply.lane),
+        (OpClass::Write, Framing::Status, Lane::Wait)
+    );
+    // NEGATIVE: the acts and the claim are writes answered on one line, on the row's lane.
+    for rest in [
+        "review r-20261109-1411-87be5228-01 note=ok",
+        "keep r-20261109-1411-87be5228-01",
+        "claim path=/tmp/x",
+    ] {
+        let form = of(rest);
+        assert_eq!(
+            (form.op, form.framing, form.lane),
+            (OpClass::Write, Framing::Status, Lane::Rpc),
+            "{rest}"
+        );
+    }
+    assert_eq!(show.row.access, Access::OwnerOnly);
+    // A write row emits no JSON for `--json`: `show` reads it as its own word.
+    assert_eq!(show.row.json, Json::None);
+}
+
+#[test]
+fn requests_row_is_read_owner_only_json() {
+    use super::{Access, Framing, Json, OpClass, Target, spec_for};
+    let requests = spec_for("requests", "state=unreviewed").expect("requests resolves");
+    assert_eq!(requests.row.name, "requests");
+    assert_eq!(
+        (requests.op, requests.framing, requests.row.access),
+        (OpClass::Read, Framing::Lines, Access::OwnerOnly)
+    );
+    assert_eq!(requests.row.target, Target::Meta);
+    assert_eq!(requests.row.json, Json::Emits);
+    assert!(
+        !requests.row.fleet,
+        "a drive grant reads it as Owner; a fleet read without one is step 5e's"
+    );
+    // NEGATIVE: `request` (no s) is its own row.
+    assert_eq!(
+        spec_for("request", "show r-20261109-1411-87be5228-01")
+            .expect("request resolves")
+            .row
+            .name,
+        "request"
+    );
+}

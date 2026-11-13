@@ -997,6 +997,22 @@ fn serve_handshake(
     ))
 }
 
+#[cfg(feature = "handshake")]
+fn serve_roam(broker: &Broker, ep: &str, key: &[u8; 32]) -> Result<io::Result<BrokerHandle>, u8> {
+    Ok(broker.serve_udp_roaming(ep, *key))
+}
+#[cfg(not(feature = "handshake"))]
+fn serve_roam(
+    _broker: &Broker,
+    _ep: &str,
+    _key: &[u8; 32],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    Err(fail_exit(
+        2,
+        "--listen roam: requires asb built with `--features handshake`",
+    ))
+}
+
 #[cfg(feature = "identity")]
 fn serve_identity(
     broker: &Broker,
@@ -3013,6 +3029,7 @@ enum ListenSpec {
     Unix(String),
     Sealed(String),
     Handshake(String),
+    Roam(String),
     Identity(String),
     Certified(String),
     Tcp(String),
@@ -3021,7 +3038,7 @@ enum ListenSpec {
 fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
     let Some((scheme, addr)) = raw.split_once(':') else {
         return Err(usage_error(&format!(
-            "--listen {raw:?}: expected unix:<path>, sealed:<host:port>, handshake:<host:port>, identity:<host:port>, certified:<host:port>, or tcp:<host:port>"
+            "--listen {raw:?}: expected unix:<path>, sealed:<host:port>, handshake:<host:port>, roam:<host:port>, identity:<host:port>, certified:<host:port>, or tcp:<host:port>"
         )));
     };
     if addr.is_empty() {
@@ -3035,6 +3052,8 @@ fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
         Ok(ListenSpec::Sealed(addr.to_string()))
     } else if scheme == "handshake" {
         Ok(ListenSpec::Handshake(addr.to_string()))
+    } else if scheme == "roam" {
+        Ok(ListenSpec::Roam(addr.to_string()))
     } else if scheme == "identity" {
         Ok(ListenSpec::Identity(addr.to_string()))
     } else if scheme == "certified" {
@@ -3043,7 +3062,7 @@ fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
         Ok(ListenSpec::Tcp(addr.to_string()))
     } else {
         Err(usage_error(&format!(
-            "--listen {raw:?}: unknown scheme {scheme:?} (expected unix, sealed, handshake, identity, certified, or tcp)"
+            "--listen {raw:?}: unknown scheme {scheme:?} (expected unix, sealed, handshake, roam, identity, certified, or tcp)"
         )))
     }
 }
@@ -3070,6 +3089,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
     let mut has_unix = false;
     let mut has_sealed = false;
     let mut has_handshake = false;
+    let mut has_roam = false;
     let mut has_identity = false;
     let mut has_certified = false;
     let mut has_tcp_plain = false;
@@ -3090,6 +3110,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             }
             ListenSpec::Sealed(_) => has_sealed = true,
             ListenSpec::Handshake(_) => has_handshake = true,
+            ListenSpec::Roam(_) => has_roam = true,
             ListenSpec::Identity(_) => has_identity = true,
             ListenSpec::Certified(_) => has_certified = true,
             ListenSpec::Tcp(_) => has_tcp_plain = true,
@@ -3153,7 +3174,8 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             "--allow-plaintext applies only to --listen tcp:<addr>",
         )));
     }
-    let has_any_tcp = has_sealed || has_handshake || has_identity || has_certified || has_tcp_plain;
+    let has_any_tcp =
+        has_sealed || has_handshake || has_roam || has_identity || has_certified || has_tcp_plain;
     let allow_remote = cli.has("--allow-remote");
     if !has_any_tcp && allow_remote {
         return Err(AsbErr::Exit(usage_error(
@@ -3181,13 +3203,14 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             ListenSpec::Unix(_) => {}
             ListenSpec::Sealed(ep)
             | ListenSpec::Handshake(ep)
+            | ListenSpec::Roam(ep)
             | ListenSpec::Identity(ep)
             | ListenSpec::Certified(ep)
             | ListenSpec::Tcp(ep) => check_tcp_loopback(ep, allow_remote)?,
         }
     }
     let key_src = cli.key_source()?;
-    if has_sealed || has_handshake {
+    if has_sealed || has_handshake || has_roam {
         if has_sealed && cfg!(not(feature = "aead")) {
             return Err(AsbErr::Exit(fail_exit(
                 2,
@@ -3200,14 +3223,20 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
                 "--listen handshake: requires asb built with `--features handshake`",
             )));
         }
+        if has_roam && cfg!(not(feature = "handshake")) {
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                "--listen roam: requires asb built with `--features handshake`",
+            )));
+        }
         if key_src.is_none() {
             return Err(AsbErr::Exit(usage_error(
-                "--listen sealed:/handshake: needs a key (--key-env NAME or --key-file PATH)",
+                "--listen sealed:/handshake:/roam: needs a key (--key-env NAME or --key-file PATH)",
             )));
         }
     } else if key_src.is_some() {
         return Err(AsbErr::Exit(usage_error(
-            "--key-env/--key-file apply only to --listen sealed: or --listen handshake:",
+            "--key-env/--key-file apply only to --listen sealed:, --listen handshake:, or --listen roam:",
         )));
     }
     let host_key_file = cli.kv.get("--host-key-file").cloned();
@@ -3366,6 +3395,14 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
                     return Err(AsbErr::Exit(2));
                 };
                 (ep.as_str(), serve_handshake(&broker, ep, key)?)
+            }
+            ListenSpec::Roam(ep) => {
+                let Some(key) = psk.as_ref() else {
+                    drop(handles);
+                    discard_created_log(&log, created_here, broker);
+                    return Err(AsbErr::Exit(2));
+                };
+                (ep.as_str(), serve_roam(&broker, ep, key)?)
             }
             ListenSpec::Identity(ep) => {
                 let Some((seed, peers)) = id_material.as_ref() else {

@@ -24,9 +24,12 @@ const LAVENDER_PIN: u32 = 0x00B0_B0C8;
 const PINK_PIN: u32 = 0x00D0_3A8C;
 /// A pick close to the dark page (the gallery's `pin-page` on dark).
 const SLATE_PIN: u32 = 0x0020_242C;
-/// A light pink, the pink pin's bolt at its lightest: its bolt's clip falls short of its halo
-/// ([`a_chosen_colour_s_bolt_caret_reads_against_its_own_halo`]).
+/// A light pink, the pink pin's bolt at its lightest.
 const LIGHT_PINK_PIN: u32 = 0x00FF_76C1;
+/// A hot pink, its red channel at its end: lifted in lightness with its hue and chroma kept,
+/// its bolt clips at once, so the lift takes it past its clip or nowhere
+/// ([`a_chosen_colour_s_bolt_caret_reads_against_its_own_halo`]).
+const HOT_PINK_PIN: u32 = 0x00FF_4FA8;
 
 /// A channel off its clean twin's by more than this is the effects' (`trail-contrast`'s
 /// `diff_vs_clean`).
@@ -348,15 +351,18 @@ fn caret_reading(k: &Kept, page: u32) -> f64 {
 /// It is lifted in lightness alone, its hue and chroma kept
 /// (`aterm_effects::cursor_fx::chosen_bolt_over_halo`). Every frame of the typing scene, its
 /// caret read as `trail-contrast` reads it (its ink against the closer of the page and the halo
-/// round it) at 4.5:1 or more: slate, pink and a light pink on dark, the near-neutral pin on
-/// GitHub Light. Where the lift meets a channel's end short of the bar it goes on toward white
+/// round it) at 4.5:1 or more: slate, pink, a light pink and a hot pink on dark, the
+/// near-neutral pin on GitHub Light. Where the lift meets a channel's end short of the bar it goes on toward white
 /// (dark) or black (paper), keeping its hue: the pink pin's bolt read 4.41:1 at its clip with
 /// every light of the trail worn in the pin (`CursorGlow::hold_pinned_lights`), and since the
 /// letter guard reads each letter by the ring round its strokes (round 27) the light pink pin's
-/// (the pink pin's bolt at its lightest, `#ff76c1`) reads 4.14 there. Negative controls
+/// (the pink pin's bolt at its lightest, `#ff76c1`) read 4.14 there on the Mac's SF Mono; on
+/// Windows' Iosevka Term NL it reads 5.05 unlifted. The hot pink pin (`#ff4fa8`), its red
+/// channel at its end, can be lifted only past its clip. Negative controls
 /// (`EffectsPipeline::set_chosen_bolt_lift(false)` alone, the slate pin): some frame's caret
-/// reads under 4.5; (`EffectsPipeline::set_chosen_bolt_past_clip(false)` alone, the light pink
-/// pin): some frame's caret reads under 4.5.
+/// reads under 4.5; (`EffectsPipeline::set_chosen_bolt_past_clip(false)` alone, the hot pink
+/// pin, which the lift then leaves where it was): some frame's caret reads under 4.5 (3.64:1
+/// on SF Mono, 3.74 on Iosevka Term NL).
 #[test]
 fn a_chosen_colour_s_bolt_caret_reads_against_its_own_halo() {
     let worst_with = |look: Look, pin: u32, controls: &dyn Fn(&mut EffectsPipeline)| {
@@ -372,6 +378,7 @@ fn a_chosen_colour_s_bolt_caret_reads_against_its_own_halo() {
         (DARK, SLATE_PIN),
         (DARK, PINK_PIN),
         (DARK, LIGHT_PINK_PIN),
+        (DARK, HOT_PINK_PIN),
         (GITHUB_LIGHT, PAPER_PIN),
     ] {
         let (c, at) = worst(look, pin, true);
@@ -386,12 +393,12 @@ fn a_chosen_colour_s_bolt_caret_reads_against_its_own_halo() {
         c < 4.5,
         "negative control: unlifted, the slate bolt still reads {c:.2}:1"
     );
-    let (c, _) = worst_with(DARK, LIGHT_PINK_PIN, &|fx| {
+    let (c, _) = worst_with(DARK, HOT_PINK_PIN, &|fx| {
         fx.set_chosen_bolt_past_clip(false)
     });
     assert!(
         c < 4.5,
-        "negative control: stopped at its clip, the light pink bolt still reads {c:.2}:1"
+        "negative control: stopped at its clip, the hot pink bolt still reads {c:.2}:1"
     );
 }
 

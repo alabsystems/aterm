@@ -117,6 +117,13 @@ mod metadata_io;
 /// takes around it.
 mod meter;
 mod native_defaults;
+
+/// Whether a native qualification world's offered launcher is this producer's loaded file.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn native_launcher_for_test(path: &std::path::Path) -> bool {
+    native_defaults::Launcher::of_current_image(Some(path)).is_some()
+}
 pub mod net;
 /// Where atpkg's unasked notices go.
 pub mod notice;

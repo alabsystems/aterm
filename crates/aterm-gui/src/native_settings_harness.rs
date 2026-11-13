@@ -64,7 +64,7 @@ pub(super) fn parse_timer_action(action: &str) -> Option<(u64, TimerChoice)> {
             (!minutes_str.is_empty() && minutes_str.bytes().all(|b| b.is_ascii_digit()))
                 .then_some(())?;
             let minutes: u32 = minutes_str.parse().ok()?;
-            crate::autopilot_menu::LAND_IN_MINUTES
+            crate::autopilot_timers::LAND_IN_MINUTES
                 .contains(&minutes)
                 .then_some(TimerChoice::In(minutes))?
         }
@@ -1443,7 +1443,7 @@ fn timer_choices(key: &str, rows: Vec<(UiNode, f32)>) -> (UiNode, f32) {
 
 /// WHAT A TIMER'S OPENING REVEALS: its first choice ([`scroll::row_parts`]).
 fn timer_opening_reveal(session: Option<u64>) -> UiKey {
-    let first = TimerChoice::In(crate::autopilot_menu::LAND_IN_MINUTES[0]);
+    let first = TimerChoice::In(crate::autopilot_timers::LAND_IN_MINUTES[0]);
     UiKey::new(match session {
         Some(local_id) => timer_action(local_id, first),
         None => crate::harness_screen::every_action(EveryPress::Timer(first)),
@@ -1690,24 +1690,25 @@ fn every_row(
     let mut total = height;
     if open {
         let moved = sessions_words(every.moved(timer));
-        let mut choices: Vec<(EveryPress, String, String)> = crate::autopilot_menu::LAND_IN_MINUTES
-            .iter()
-            .map(|&minutes| {
-                let hours = minutes / 60;
-                let words = if hours == 1 {
-                    "1 hour".to_string()
-                } else {
-                    format!("{hours} hours")
-                };
-                (
-                    EveryPress::Timer(TimerChoice::In(minutes)),
-                    format!("Cruise every session for {words}, then land, {moved}"),
-                    words,
-                )
-            })
-            .collect();
+        let mut choices: Vec<(EveryPress, String, String)> =
+            crate::autopilot_timers::LAND_IN_MINUTES
+                .iter()
+                .map(|&minutes| {
+                    let hours = minutes / 60;
+                    let words = if hours == 1 {
+                        "1 hour".to_string()
+                    } else {
+                        format!("{hours} hours")
+                    };
+                    (
+                        EveryPress::Timer(TimerChoice::In(minutes)),
+                        format!("Cruise every session for {words}, then land, {moved}"),
+                        words,
+                    )
+                })
+                .collect();
         if let Some(at) = offer {
-            let when = crate::autopilot_menu::when(at);
+            let when = crate::autopilot_timers::when(at);
             choices.push((
                 EveryPress::Timer(TimerChoice::At),
                 format!("Cruise every session, then land at {when}, {moved}"),
@@ -1879,7 +1880,7 @@ fn session_timer(
         |visual: &str| (crate::native_ui::native_button_label_width(visual) + 40.0).min(inner);
     let mut faces: Vec<String> = Vec::new();
     if open {
-        for minutes in crate::autopilot_menu::LAND_IN_MINUTES {
+        for minutes in crate::autopilot_timers::LAND_IN_MINUTES {
             let hours = minutes / 60;
             faces.push(if hours == 1 {
                 "1 hour".to_string()
@@ -1888,7 +1889,7 @@ fn session_timer(
             });
         }
         if let Some(at) = offer {
-            faces.push(format!("at {}", crate::autopilot_menu::when(at)));
+            faces.push(format!("at {}", crate::autopilot_timers::when(at)));
         }
         if row.armed_at_ms.is_some() {
             faces.push("Cancel".to_string());
@@ -1926,7 +1927,7 @@ fn session_timer(
         };
     let mut buttons = Vec::new();
     if open {
-        for minutes in crate::autopilot_menu::LAND_IN_MINUTES {
+        for minutes in crate::autopilot_timers::LAND_IN_MINUTES {
             let hours = minutes / 60;
             let words = if hours == 1 {
                 "1 hour".to_string()
@@ -1944,15 +1945,15 @@ fn session_timer(
         if let Some(at) = offer {
             let (mut node, width) = button(
                 timer_action(row.local_id, TimerChoice::At),
-                format!("Cruise, then land at {}", crate::autopilot_menu::when(at)),
-                &format!("at {}", crate::autopilot_menu::when(at)),
+                format!("Cruise, then land at {}", crate::autopilot_timers::when(at)),
+                &format!("at {}", crate::autopilot_timers::when(at)),
                 enabled,
                 None,
             );
             if let UiContent::Button(control) = &mut node.content {
                 control.spec.description = Some(format!(
                     "Cruise until {}, then land",
-                    crate::autopilot_menu::spoken_when(at)
+                    crate::autopilot_timers::spoken_when(at)
                 ));
             }
             buttons.push((node, width));

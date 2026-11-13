@@ -23,7 +23,45 @@ fn setup_with(stages: Vec<StageRow>, finished: bool) -> Setup {
         finished,
         cancelled: false,
         stages,
+        plan: Selection::all(),
+        current: None,
+        clock: Some(NOW),
     }
+}
+
+/// The clock as a test's running aterm answers.
+const NOW: u64 = 1_800_000_000;
+
+/// A finished [`setup_with`] whose running aterm answered `current` of the Mac settings at
+/// [`NOW`], its plan `plan`.
+fn setup_reading(
+    stages: Vec<StageRow>,
+    plan: Selection,
+    current: Option<WorkstationObservation>,
+) -> Setup {
+    Setup::Read {
+        begun: true,
+        finished: true,
+        cancelled: false,
+        stages,
+        plan,
+        current,
+        clock: Some(NOW),
+    }
+}
+
+/// The running aterm's read-back of `verified` as wanted `ago` seconds before [`NOW`].
+fn read_back(verified: Selection, ago: u64) -> aterm_machines::init::ReadBack {
+    aterm_machines::init::ReadBack {
+        rows: verified,
+        read_at: Some(NOW - ago),
+        ..aterm_machines::init::ReadBack::default()
+    }
+}
+
+/// The running aterm's completion with `verified` read as wanted `ago` seconds before [`NOW`].
+fn complete(verified: Selection, ago: u64) -> WorkstationObservation {
+    WorkstationObservation::Complete(read_back(verified, ago))
 }
 
 #[test]
@@ -51,6 +89,9 @@ fn unbegun() -> Setup {
             stage(SECRETS, "pending", ""),
             stage("GitHub repositories", "pending", ""),
         ],
+        plan: Selection::all(),
+        current: None,
+        clock: None,
     }
 }
 
@@ -78,6 +119,7 @@ fn row(outcome: Outcome, remedy: Option<Remedy>) -> ItemReport {
             remedy,
         }),
         stood_aside: None,
+        waits_on: None,
         essential: false,
         elapsed_ms: None,
     }
@@ -115,7 +157,10 @@ fn a_step_is_there_exactly_when_one_is_due() {
             vec![stage(
                 "GitHub repositories",
                 "waiting",
-                "Stopped twice while cloning GitHub repositories; it waits for Check again.",
+                &format!(
+                    "Stopped twice while cloning GitHub repositories; {}",
+                    aterm_types::macos_setup::StageRow::PARKED_TAIL
+                ),
             )],
             false,
         ),
@@ -549,18 +594,23 @@ fn repos_say_what_they_wait_on() {
         repos_area(&setup_with(Vec::new(), true), true, true, &none_owed()).level,
         Level::Off
     );
-    let held = setup_with(
+    // A stage aterm parked after it stopped there twice waits out its pause and runs again by
+    // itself: aterm's own step, never a person's.
+    let parked = setup_with(
         vec![stage(
             "GitHub repositories",
             "waiting",
-            "Stopped twice while cloning GitHub repositories; it waits for Check again.",
+            &format!(
+                "Stopped twice while cloning GitHub repositories; {}",
+                aterm_types::macos_setup::StageRow::PARKED_TAIL
+            ),
         )],
         false,
     );
-    assert_eq!(
-        who(&repos_area(&held, true, true, &none_owed())),
-        Some(Who::Person)
-    );
+    let area = repos_area(&parked, true, true, &none_owed());
+    assert_eq!((area.level, who(&area)), (Level::Working, Some(Who::Aterm)));
+    let area = setup_area(&parked).unwrap();
+    assert_eq!((area.level, who(&area)), (Level::Working, Some(Who::Aterm)));
 }
 
 /// Where no setup clones them (off macOS), the repositories read the clone `aterm init` owes: one
@@ -642,8 +692,292 @@ fn a_stopped_setup_is_off_not_finished() {
     let area = setup_area(&stopped).unwrap();
     assert_eq!(area.level, Level::Off, "{area:?}");
     assert!(area.says.contains("GitHub repositories"), "{}", area.says);
-    let applied = setup_with(vec![stage(SECRETS, "applied", "")], true);
+    let mut vault_only = Selection::none();
+    vault_only.set(Setting::Secrets, true);
+    let applied = setup_reading(vec![stage(SECRETS, "applied", "")], vault_only, None);
     assert_eq!(setup_area(&applied).unwrap().level, Level::Ok);
+}
+
+/// A finished run's record says only that its steps ended: its stage rows read `applied` from
+/// the run's ledger, never from this Mac's settings or grants, so on their own they claim no
+/// current setting, and the area is not `ok`.
+#[test]
+fn a_finished_record_alone_claims_no_current_settings() {
+    let finished = setup_with(
+        vec![
+            stage("Selected Mac settings", "applied", ""),
+            stage("aterm permissions", "applied", ""),
+        ],
+        true,
+    );
+    let area = setup_area(&finished).unwrap();
+    assert_ne!(area.level, Level::Ok, "{area:?}");
+    assert!(!area.says.contains("completed"), "{}", area.says);
+    assert!(consistent(&area), "{area:?}");
+}
+
+/// The setup area is `ok` on the running aterm's own reading alone: every selected row it reads
+/// privately read back as wanted, told with its age, and as set up when last read once that
+/// reading is past its standing, never as in place now. Anything short of a dated read-back (no
+/// answer, one that verifies only some of them, rows nothing read, one dated after this Mac's
+/// clock, which has no age to tell, a wait, a person's step) is `unknown`, never `working` or a
+/// person's `due`: a run with no step left runs nothing. NEGATIVE CONTROL: the young reading that
+/// covers the plan is `ok` as of now.
+#[test]
+fn the_setup_area_is_ok_only_on_the_running_aterms_reading() {
+    let stages = || {
+        vec![
+            stage("Selected Mac settings", "applied", ""),
+            stage("aterm permissions", "applied", ""),
+        ]
+    };
+    let mut plan = Selection::none();
+    plan.set(Setting::Dock, true);
+    plan.set(Setting::CapsLock, true);
+    plan.set(Setting::Permissions, true);
+    let mut dock = Selection::none();
+    dock.set(Setting::Dock, true);
+    let stands = aterm_types::macos_setup::READING_STANDS_SECS;
+    for (current, level, said) in [
+        (None, Level::Unknown, ""),
+        (
+            Some(WorkstationObservation::Unavailable("no answer".into())),
+            Level::Unknown,
+            "",
+        ),
+        (Some(complete(dock, 60)), Level::Unknown, ""),
+        (
+            Some(WorkstationObservation::Waiting("checking".into())),
+            Level::Unknown,
+            "",
+        ),
+        (
+            Some(WorkstationObservation::Permission("needs: dock".into())),
+            Level::Unknown,
+            "",
+        ),
+        (
+            Some(WorkstationObservation::Unread {
+                rows: "capslock".into(),
+                read_back: read_back(dock, 60),
+            }),
+            Level::Unknown,
+            "not read yet: capslock",
+        ),
+        (
+            Some(complete(plan.private(), stands + 1)),
+            Level::Ok,
+            "last read each selected setting, 11 min ago; not read since",
+        ),
+        (
+            Some(WorkstationObservation::Complete(
+                aterm_machines::init::ReadBack {
+                    read_at: Some(NOW + 60),
+                    ..read_back(plan.private(), 0)
+                },
+            )),
+            Level::Unknown,
+            "at a time this Mac's clock cannot date",
+        ),
+        (
+            Some(complete(plan.private(), 60)),
+            Level::Ok,
+            "read each selected setting as wanted 60 s ago",
+        ),
+    ] {
+        let area = setup_area(&setup_reading(stages(), plan, current.clone())).unwrap();
+        assert_eq!(area.level, level, "{current:?}: {area:?}");
+        assert!(consistent(&area), "{area:?}");
+        assert!(!area.says.contains("completed"), "{}", area.says);
+        assert!(area.says.contains(said), "{current:?}: {}", area.says);
+        if area.says.contains("last read") {
+            assert!(
+                !area.says.contains("as wanted"),
+                "a reading past its standing is never one of now: {}",
+                area.says
+            );
+        }
+    }
+}
+
+/// What the running aterm answers of a finished Mac short of a full reading, as
+/// `check_background_workstation` parses its `setup status`: a grant that reads off and waits on
+/// a person's press (a Permission), a `done` whose verified bits leave the Dock out (no single
+/// dated reading of it), and a front door that took the connection and said nothing in time
+/// (Silent, a Waiting). None is aterm at work or a person's step this area would take, so none
+/// reads `working` or `due`, and none `ok`.
+#[test]
+fn a_finished_macs_answer_short_of_a_full_reading_is_neither_working_nor_due() {
+    let stages = || {
+        vec![
+            stage("Selected Mac settings", "applied", ""),
+            stage("aterm permissions", "applied", ""),
+        ]
+    };
+    let mut plan = Selection::none();
+    plan.set(Setting::Dock, true);
+    plan.set(Setting::Permissions, true);
+    let mut not_dock = plan.private();
+    not_dock.set(Setting::Dock, false);
+    for current in [
+        WorkstationObservation::Permission("background setup needs a person's action: fda".into()),
+        complete(not_dock, 60),
+        WorkstationObservation::Waiting("background setup has not answered yet".into()),
+    ] {
+        let area = setup_area(&setup_reading(stages(), plan, Some(current.clone()))).unwrap();
+        assert_eq!(area.level, Level::Unknown, "{current:?}: {area:?}");
+        assert_ne!(who(&area), Some(Who::Person), "{current:?}: {area:?}");
+        assert!(consistent(&area), "{area:?}");
+    }
+}
+
+/// The window's own `setup status` answer, read as `aterm status` reads it: one grammar from
+/// writer to reader. A finished Mac nobody watches (Full Disk Access and the debugger on offer,
+/// the Dock as the person changed it, trackpad scrolling set for the next login, every private
+/// row read back two hours ago) is `ok`, said as set up when last read with its age and what each
+/// row is, never as in place now; before schema 4 the same Mac read `pending:fda;needs:fda`, then
+/// `unread:` once ten minutes passed, and stayed unknown forever. NEGATIVE CONTROLS: the base
+/// plan with Rust in Spotlight never read is not `ok` (its `verified` speaks for Spotlight too, so
+/// a Mac with no profile is not read as set up on rows nothing read), and a grant that reads off
+/// is a person's step that keeps it from `ok`.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_windows_answer_of_a_finished_mac_nobody_watches_reads_set_up_when_last_read() {
+    use aterm_types::macos_setup::{
+        ACCESS_OFFERED, Access, CHANGED_SINCE, DEBUGGER_NOT_ASKED, Observation, Plan, Read,
+        Standing, Subject,
+    };
+    const READ: u64 = NOW - 2 * 3600;
+    let reading = |subject: Subject, standing: Standing, note: Option<&str>| Observation {
+        subject,
+        standing,
+        now: None,
+        after_login: None,
+        wanted: subject.wanted().to_string(),
+        note: note.map(str::to_owned),
+        detail: None,
+        read: Read::At(READ),
+    };
+    let finished = |plan: Selection, changes: Vec<Observation>| {
+        let mut observed: Vec<_> = Subject::all()
+            .into_iter()
+            .map(|subject| reading(subject, Standing::InPlace, None))
+            .collect();
+        for change in changes {
+            if let Some(slot) = observed
+                .iter_mut()
+                .find(|row| row.subject == change.subject)
+            {
+                *slot = change;
+            }
+        }
+        aterm_gui::SetupStatus {
+            observed_vault_url: Some(Plan::default().vault_url),
+            plan: Some(Plan::from(plan)),
+            observed,
+            finished: true,
+            ..aterm_gui::SetupStatus::default()
+        }
+    };
+    let read_by_status = |status: &aterm_gui::SetupStatus, plan: Selection| {
+        let answer = aterm_gui::setup_status_answer_for_test(status, NOW);
+        let seen = aterm_cli::macos_doctor::background_workstation_of_reply(&answer, judged(plan));
+        (
+            answer,
+            setup_area(&setup_reading(Vec::new(), plan, Some(seen))).unwrap(),
+        )
+    };
+    let nobody_watches = finished(
+        Selection::all(),
+        vec![
+            reading(
+                Subject::Access(Access::FullDiskAccess),
+                Standing::NotNeeded,
+                Some(ACCESS_OFFERED),
+            ),
+            reading(
+                Subject::Access(Access::Debugger),
+                Standing::NotNeeded,
+                Some(DEBUGGER_NOT_ASKED),
+            ),
+            reading(
+                Subject::Setting(Setting::Dock),
+                Standing::Differs,
+                Some(CHANGED_SINCE),
+            ),
+            reading(
+                Subject::Setting(Setting::TrackpadScrolling),
+                Standing::AtLogin,
+                None,
+            ),
+        ],
+    );
+    let (answer, area) = read_by_status(&nobody_watches, Selection::all());
+    assert!(
+        answer.contains("setup=read-back:") && answer.contains(";offered:fda,debugger"),
+        "{answer}"
+    );
+    assert_eq!(area.level, Level::Ok, "{answer}: {area:?}");
+    assert!(consistent(&area), "{area:?}");
+    for words in [
+        format!(
+            "set up as System State last read each selected setting other than Dock, {} ago; \
+             not read since",
+            aterm_machines::init::age_words(2 * 3600)
+        ),
+        "Trackpad scrolling takes full effect at your next login".to_owned(),
+        "Dock changed since aterm set it, which setup leaves as it is".to_owned(),
+    ] {
+        assert!(area.says.contains(&words), "{words}: {}", area.says);
+    }
+    assert!(
+        !area.says.contains("as wanted") && !area.says.contains("you changed"),
+        "{}",
+        area.says
+    );
+
+    let mut base = Selection::none();
+    base.set(Setting::Spotlight, true);
+    base.set(Setting::Permissions, true);
+    let spotlight_unread = finished(
+        base,
+        vec![Observation::withheld(Subject::Setting(Setting::Spotlight))],
+    );
+    let (answer, area) = read_by_status(&spotlight_unread, base);
+    assert_ne!(area.level, Level::Ok, "CONTROL {answer}: {area:?}");
+    assert!(area.says.contains("spotlight"), "{}", area.says);
+
+    let off = finished(
+        Selection::all(),
+        vec![reading(
+            Subject::Access(Access::FullDiskAccess),
+            Standing::NeedsYou,
+            None,
+        )],
+    );
+    let (answer, area) = read_by_status(&off, Selection::all());
+    assert!(answer.contains(";needs:fda"), "CONTROL {answer}");
+    assert_ne!(area.level, Level::Ok, "CONTROL {answer}: {area:?}");
+}
+
+/// A record with no step left whose run is not marked finished (not admitted, or a Workstation
+/// row a pending Restore stopped) says what it holds, never that the run reached its end.
+/// NEGATIVE CONTROL: the finished record says so.
+#[test]
+fn an_unfinished_record_with_nothing_left_never_says_its_run_ended() {
+    let stages = vec![
+        stage("Selected Mac settings", "applied", ""),
+        stage("aterm permissions", "stopped", "Not applied by this run."),
+    ];
+    let open = setup_with(stages.clone(), false);
+    let area = setup_area(&open).unwrap();
+    assert_ne!(area.level, Level::Ok, "{area:?}");
+    assert!(!area.says.contains("reached its end"), "{}", area.says);
+    let ended = setup_with(vec![stage("Selected Mac settings", "applied", "")], true);
+    assert!(
+        setup_area(&ended).unwrap().says.contains("reached its end"),
+        "CONTROL"
+    );
 }
 
 /// A CLI nobody asked for is a note on demand and never a step, whatever its state; one that
@@ -703,6 +1037,7 @@ fn the_fleet_line_is_this_macs_presence_row() {
         label: label.to_owned(),
         name: format!("{label}-mini"),
         node: Some(format!("n-{label}00000000000000")),
+        node_key: None,
         me,
         presence: Some(Presence::Up),
         build: Some(build.to_owned()),
@@ -731,6 +1066,7 @@ fn the_fleet_line_is_this_macs_presence_row() {
             row("m2", false, "0.159.0+g4ef9cd6144", false),
         ],
         unserved: None,
+        observations: Default::default(),
     };
     assert_eq!(
         fleet_area(

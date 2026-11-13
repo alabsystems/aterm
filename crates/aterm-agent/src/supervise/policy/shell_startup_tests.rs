@@ -797,3 +797,172 @@ fn a_startup_verdict_names_a_line_by_its_number_never_its_text() {
     );
     assert!(!why.contains(secret), "{why}");
 }
+
+/// `admits` for `line` under `state` names the startup's `$var` (a `READER_ENV` or git
+/// variable it may set).
+fn fails_by(state: &ShellStartup, line: &str, var: &str) {
+    let why = state.admits(line).expect_err(line);
+    assert!(why.contains(&format!("`${var}`")), "{line}: {why}");
+}
+
+/// A `READER_ENV` variable the worker's environment sets fails a line that may run a reader it
+/// redirects, by name or by a path's last part, behind `xargs`, `find -exec` or a substitution
+/// (`GREP_OPTIONS='-e x f'` makes BSD grep read `f`, MEASURED 2026-11-05 on macOS 27.0.1); a
+/// startup that sets none, or only another, passes the line.
+#[test]
+fn a_reader_variable_the_worker_sets_fails_the_lines_running_its_reader() {
+    let s = Scratch::new("reader-env");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    let clean = s.read(&s.worker("/bin/zsh", &[])).expect("a clean startup");
+    for line in ["grep x f", "rg x", "python3 r.py"] {
+        assert_eq!(clean.admits(line), Ok(()), "{line}");
+    }
+    let env = s
+        .read(&s.worker("/bin/zsh", &["GREP_OPTIONS=-e x /etc/passwd"]))
+        .expect("a startup");
+    for line in [
+        "grep x f",
+        "egrep x f",
+        "/usr/bin/fgrep x f",
+        "find . -exec grep x {} +",
+        "ls | xargs grep x",
+        "echo $(gr''ep x f)",
+    ] {
+        fails_by(&env, line, "GREP_OPTIONS");
+    }
+    // NEGATIVE CONTROL: another reader, or the name inside a longer word.
+    for line in ["rg x", "cat grep.txt", "cat my-grep"] {
+        assert_eq!(env.admits(line), Ok(()), "{line}");
+    }
+    let python = s
+        .read(&s.worker("/bin/zsh", &["PYTHONPATH=/tmp/x"]))
+        .expect("a startup");
+    fails_by(&python, "python3 r.py", "PYTHONPATH");
+    assert_eq!(python.admits("grep x f"), Ok(()));
+}
+
+/// A `READER_ENV` variable Claude Code's settings for the launch directory give the Bash tool
+/// fails a line running its reader, as one the worker's environment sets does.
+#[test]
+fn a_reader_variable_claude_codes_settings_give_fails_the_lines_running_its_reader() {
+    let s = Scratch::new("reader-settings");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    std::fs::create_dir_all(s.project().join(".claude")).expect(".claude");
+    std::fs::write(
+        s.project().join(".claude/settings.json"),
+        "{\"env\": {\"RIPGREP_CONFIG_PATH\": \"/x/rg.conf\", \"LANG\": \"C\"}}",
+    )
+    .expect("settings");
+    let settings = s.read(&s.worker("/bin/zsh", &[])).expect("a startup");
+    fails_by(&settings, "rg -n x src", "RIPGREP_CONFIG_PATH");
+    // NEGATIVE CONTROL: another reader.
+    assert_eq!(settings.admits("grep x f"), Ok(()));
+}
+
+/// A `.zshenv` that names a `READER_ENV` variable in its code, in any quoting, fails a line
+/// running its reader. bash reads no `.zshenv`.
+#[test]
+fn a_reader_variable_a_zshenv_names_fails_the_lines_running_its_reader() {
+    let s = Scratch::new("reader-zshenv");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    let zshenv = s.home().join(".zshenv");
+    for text in [
+        "export RIPGREP_CONFIG_PATH=\"$HOME/.ripgreprc\"\n",
+        "typeset -x RIPGREP_CONFIG_PATH=~/.rg\n",
+        "export RIPGREP_\\CONFIG_PATH=~/.rg\n",
+        "export \"RIPGREP_CONFIG_PATH\"=~/.rg\n",
+    ] {
+        std::fs::write(&zshenv, text).expect("zshenv");
+        let state = s.read(&s.worker("/bin/zsh", &[])).expect(text);
+        fails_by(&state, "rg x", "RIPGREP_CONFIG_PATH");
+    }
+    // NEGATIVE CONTROL: a .zshenv naming no such variable, or one only inside a longer name or
+    // a comment.
+    for text in [
+        "export PATH=\"$HOME/bin:$PATH\"\n",
+        "export MY_RIPGREP_CONFIG_PATHS=x\n",
+        "# export RIPGREP_CONFIG_PATH=~/.rg\n",
+    ] {
+        std::fs::write(&zshenv, text).expect("zshenv");
+        let state = s.read(&s.worker("/bin/zsh", &[])).expect(text);
+        assert_eq!(state.admits("rg x"), Ok(()), "{text}");
+    }
+    let b = Scratch::new("reader-zshenv-bash");
+    b.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
+    std::fs::write(b.home().join(".zshenv"), "export GREP_OPTIONS=-r\n").expect("zshenv");
+    let bash = b.read(&b.worker("/bin/bash", &[])).expect("a bash startup");
+    assert_eq!(bash.admits("grep x f"), Ok(()));
+}
+
+/// macOS's `/usr/bin/python3` is the xcrun shim `/usr/bin/git` is, and `DEVELOPER_DIR=<dir>`
+/// made it run `<dir>/usr/bin/xcrun` (MEASURED 2026-11-05 on macOS 27.0.1), so a `DEVELOPER_DIR`
+/// or `SDKROOT` the worker's environment, Claude Code's settings or a `.zshenv` may set fails a
+/// python line and a git read, whatever its value; a startup that sets neither passes both.
+#[test]
+fn an_xcrun_shim_variable_the_startup_may_set_fails_python_and_git() {
+    let s = Scratch::new("xcrun-shim");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    let clean = s.read(&s.worker("/bin/zsh", &[])).expect("a clean startup");
+    for line in ["python3 tools/r.py", "git status --short"] {
+        assert_eq!(clean.admits(line), Ok(()), "{line}");
+    }
+    for var in ["DEVELOPER_DIR", "SDKROOT"] {
+        let kv = format!("{var}=/Applications/Xcode.app");
+        let env = s
+            .read(&s.worker("/bin/zsh", &[kv.as_str()]))
+            .expect("a startup");
+        for line in [
+            "python3 tools/r.py",
+            "/usr/bin/python3 tools/r.py",
+            "git status --short",
+        ] {
+            fails_by(&env, line, var);
+        }
+        // NEGATIVE CONTROL: a reader no xcrun shim runs.
+        assert_eq!(env.admits("cat README.md"), Ok(()), "{var}");
+    }
+    std::fs::create_dir_all(s.project().join(".claude")).expect(".claude");
+    let settings = s.project().join(".claude/settings.json");
+    std::fs::write(&settings, "{\"env\": {\"DEVELOPER_DIR\": \"./dev\"}}").expect("settings");
+    let state = s.read(&s.worker("/bin/zsh", &[])).expect("a startup");
+    fails_by(&state, "python3 tools/r.py", "DEVELOPER_DIR");
+    std::fs::remove_file(&settings).expect("settings gone");
+    std::fs::write(s.home().join(".zshenv"), "export SDKROOT=\"$HOME/sdk\"\n").expect("zshenv");
+    let state = s.read(&s.worker("/bin/zsh", &[])).expect("a startup");
+    fails_by(&state, "python3 tools/r.py", "SDKROOT");
+    fails_by(&state, "git log -1", "SDKROOT");
+}
+
+/// A `.zshenv` that names a variable moving what git loads or which git runs
+/// (`git_config::git_relevant`'s past `PATH` and `HOME`) fails a git read, as git's probe runs
+/// with the worker's own environment; one that names `PATH`, git's pager, or such a name only in
+/// a comment does not.
+#[test]
+fn a_git_variable_a_zshenv_names_fails_a_git_read() {
+    let s = Scratch::new("git-zshenv");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    let zshenv = s.home().join(".zshenv");
+    for (text, var) in [
+        ("export GIT_EXTERNAL_DIFF=/tmp/x\n", "GIT_EXTERNAL_DIFF"),
+        ("export XDG_CONFIG_HOME=\"$HOME/.cfg\"\n", "XDG_CONFIG_HOME"),
+        (
+            "DEVELOPER_DIR=/tmp/dev; export DEVELOPER_DIR\n",
+            "DEVELOPER_DIR",
+        ),
+    ] {
+        std::fs::write(&zshenv, text).expect("zshenv");
+        let state = s.read(&s.worker("/bin/zsh", &[])).expect(text);
+        fails_by(&state, "git diff HEAD~1", var);
+        assert_eq!(state.admits("cat README.md"), Ok(()), "{text}");
+    }
+    // NEGATIVE CONTROL: PATH, git's pager, or a git variable only in a comment.
+    for text in [
+        "export PATH=\"$HOME/bin:$PATH\"\n",
+        "# export GIT_DIR=/tmp/x\n",
+        "export GIT_PAGER=delta\n",
+    ] {
+        std::fs::write(&zshenv, text).expect("zshenv");
+        let state = s.read(&s.worker("/bin/zsh", &[])).expect(text);
+        assert_eq!(state.admits("git log -1"), Ok(()), "{text}");
+    }
+}

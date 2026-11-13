@@ -486,7 +486,7 @@ fn the_every_row_moves_with_the_rows_above_it_and_its_presses_wait_for_a_look() 
         .partition(|(key, _)| key.starts_with("harness/session/all/"));
     assert_eq!(
         every.len(),
-        4 + crate::autopilot_menu::LAND_IN_MINUTES.len(),
+        4 + crate::autopilot_timers::LAND_IN_MINUTES.len(),
         "{every:?}"
     );
     assert!(every.iter().all(|(_, look)| **look), "{every:?}");

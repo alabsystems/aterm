@@ -1,30 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aCaffeine status-item click classification, right-click menu composition, and menu item tags.
+//! aCaffeine right-click menu composition and menu item tags. What a click on the mug means
+//! (toggle, or this menu) is `aterm_types::status_click`.
 
 use crate::launchd::Startup;
 use crate::model::{Choice, Clocks, Mode, Pause, describe_left};
-
-/// What a click on the mug does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Click {
-    /// Turn keeping awake on (forever) or off.
-    Toggle,
-    /// Open the menu.
-    Menu,
-}
-
-/// Classify a status-item click as [`Click::Menu`] (right/Control-click) or [`Click::Toggle`].
-#[inline]
-#[must_use]
-pub const fn classify_click(right_button: bool, control_held: bool) -> Click {
-    if right_button || control_held {
-        Click::Menu
-    } else {
-        Click::Toggle
-    }
-}
 
 /// One user action from the menu, carried by the item's tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

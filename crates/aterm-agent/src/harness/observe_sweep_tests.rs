@@ -59,8 +59,8 @@ fn claude_roster(own: &Path) -> Roster {
         &format!(
             "[[account]]\nlabel = \"m22\"\nclass = \"dedicated\"\nemail = \"{BRONTO}\"\n\n\
              [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"{STEGO}\"\n\
-             dir = \"{}\"\n",
-            own.display()
+             dir = {}\n",
+            crate::harness::host_path::toml(own)
         ),
     )
     .unwrap()
@@ -405,4 +405,67 @@ fn a_row_on_its_vault_token_is_its_tokens_account_not_its_stale_profile() {
     // No keyer: the lab cannot key the row, so its token entry is unknown and it is unread.
     let unkeyed = claude_places(&roster, home.path(), &on_token);
     assert_eq!(unkeyed[1].seen, Observation::Unread);
+}
+
+/// One CLI's login places are its default home, where no row names it, and each row's
+/// directory, each read as a process started there would read it, and each place's account is
+/// the row its file's address answers to, else the account no row lists; a Mac whose home is
+/// not known reads nothing, leaving each row's place to its row.
+/// NEGATIVE CONTROL: with `Place::who` naming the default home for every row (dropping the
+/// row's directory), the `m22` place reads as the row with no directory's belief, not its own
+/// file: the `Agrees` match fails.
+#[test]
+fn one_clis_places_and_the_account_each_runs_on() {
+    let home = home("places-of");
+    write(&home.path().join(".claude.json"), &profile(UNICORN));
+    let dir = home.path().join("logins").join("m22");
+    write(&profile::profile_in_home(&dir), &profile(BRONTO));
+    let row = |dir: Option<&str>| Row {
+        label: "m22".into(),
+        email: Some(BRONTO.into()),
+        dir: dir.map(str::to_owned),
+        ..Row::default()
+    };
+    let none = Roster::default();
+    let got = places_of(Cli::Claude, &none, Some(home.path()), &OnToken::none());
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].row, None);
+    assert_eq!(got[0].seen.email(), Some(UNICORN));
+
+    let rows = Roster {
+        rows: vec![row(Some(dir.to_str().unwrap()))],
+    };
+    let got = places_of(Cli::Claude, &rows, Some(home.path()), &OnToken::none());
+    let seen: Vec<_> = got
+        .iter()
+        .map(|place| (place.row.map(|row| row.label.as_str()), place.seen.email()))
+        .collect();
+    assert_eq!(seen, [(None, Some(UNICORN)), (Some("m22"), Some(BRONTO))]);
+    assert!(matches!(
+        got[1].reconciled(&rows),
+        accounts::Reconciled::Agrees(row) if row.label == "m22"
+    ));
+
+    let default_row = Roster {
+        rows: vec![row(None)],
+    };
+    let got = places_of(
+        Cli::Claude,
+        &default_row,
+        Some(home.path()),
+        &OnToken::none(),
+    );
+    assert_eq!(got.len(), 1, "the default home is the row's place");
+    assert!(matches!(
+        got[0].reconciled(&default_row),
+        accounts::Reconciled::Unlisted(seen) if seen.email == UNICORN
+    ));
+
+    let unread = places_of(Cli::Claude, &rows, None, &OnToken::none());
+    assert_eq!(unread.len(), 1, "no home: the rows alone");
+    assert_eq!(unread[0].seen, Observation::Unread);
+    assert!(matches!(
+        unread[0].reconciled(&rows),
+        accounts::Reconciled::Unread(Some(row)) if row.label == "m22"
+    ));
 }

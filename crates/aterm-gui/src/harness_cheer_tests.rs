@@ -27,7 +27,7 @@ fn cheer_app(behind: bool) -> (App, String, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.motion = Some("full".into());
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();

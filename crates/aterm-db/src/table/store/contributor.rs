@@ -5,6 +5,11 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OMIT_REGION: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 /// One canonical local replica, without initializing or repairing its storage.
 /// A missing replica is a local storage fact, never authenticated table absence.
 /// The caller retains all applicable control guards until this value is dropped;
@@ -16,7 +21,145 @@ pub(crate) struct Contributor {
     region: Region,
     claim_dir: PathBuf,
     parents: Vec<PathBuf>,
-    present: Option<(Option<aterm_journal::ReadGuard>, Store)>,
+    present: Option<Present>,
+    store: Option<Store>,
+}
+
+struct Present {
+    guard: Option<aterm_journal::ReadGuard>,
+    identity: Digest,
+    fence: Fence,
+}
+
+/// Stable identities of the two local enrollments, not their advancing heads.
+/// Missing and empty unclaimed directories have the same absent identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplicaRevision {
+    primary: Option<Digest>,
+    recovery: Option<Digest>,
+}
+
+/// A bounded union that cannot outlive its retained control context.
+/// Moving records into the union never releases either physical data guard.
+pub(crate) struct OwnedTable<'c, 'a, 's, 'v> {
+    context: &'c crate::generation::RetainedContext<'a, 's, 'v>,
+    contributors: [Contributor; 2],
+    revision: ReplicaRevision,
+    scope: Scope,
+    store: Option<Store>,
+}
+
+impl<'c, 'a, 's, 'v> OwnedTable<'c, 'a, 's, 'v> {
+    pub(crate) fn observe(
+        context: &'c crate::generation::RetainedContext<'a, 's, 'v>,
+        scope: Scope,
+    ) -> Result<Self> {
+        context.check()?;
+        let session = context.session();
+        let mut primary = Contributor::observe(
+            session,
+            &Contributor::location(session, scope, Region::Primary)?,
+            scope,
+            Region::Primary,
+        )?;
+        let mut recovery = Contributor::observe(
+            session,
+            &Contributor::location(session, scope, Region::Recovery)?,
+            scope,
+            Region::Recovery,
+        )?;
+        let revision = ReplicaRevision {
+            primary: primary.present.as_ref().map(|p| p.identity),
+            recovery: recovery.present.as_ref().map(|p| p.identity),
+        };
+        #[cfg(test)]
+        match OMIT_REGION.get() {
+            1 => {
+                primary.store.take();
+            }
+            2 => {
+                recovery.store.take();
+            }
+            _ => {}
+        }
+        let store = match (primary.store.take(), recovery.store.take()) {
+            (Some(primary), Some(recovery)) => {
+                Some(recovery.with_observed_primary(session, primary)?)
+            }
+            (primary, recovery) => primary.or(recovery),
+        };
+        let table = Self {
+            context,
+            contributors: [primary, recovery],
+            revision,
+            scope,
+            store,
+        };
+        table.check()?;
+        Ok(table)
+    }
+
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    pub(crate) fn session(&self) -> &Session<'s> {
+        self.context.session()
+    }
+
+    pub(crate) fn context(&self) -> &'c crate::generation::RetainedContext<'a, 's, 'v> {
+        self.context
+    }
+
+    pub(crate) fn is_absent(&self) -> bool {
+        self.store.is_none() && self.revision.primary.is_none() && self.revision.recovery.is_none()
+    }
+
+    pub(crate) fn revision(&self) -> ReplicaRevision {
+        self.revision
+    }
+
+    pub(crate) fn require_store(&self) -> Result<&Store> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| Error::new("required local table is absent"))
+    }
+
+    pub(crate) fn only_primary(&self) -> bool {
+        self.revision.primary.is_some() && self.revision.recovery.is_none()
+    }
+
+    pub(crate) fn is_at(&self, directory: &crate::catalog::Directory) -> Result<bool> {
+        Ok(!directory.is_recovery()
+            && self.contributors[0].path == directory.path(self.scope)?
+            && self.contributors[1].path == directory.recovery().path(self.scope)?)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        self.context.check()?;
+        for contributor in &self.contributors {
+            contributor.check(self.context.session())?;
+        }
+        if let Some(store) = &self.store {
+            store.check(self.context.session())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_custody(&self) -> Result<()> {
+        self.context.check_custody()?;
+        for contributor in &self.contributors {
+            contributor.check_custody()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_guards_for_test(&mut self) {
+        for contributor in &mut self.contributors {
+            contributor.release_guard_for_test();
+        }
+    }
 }
 
 impl Contributor {
@@ -102,8 +245,8 @@ impl Contributor {
         );
         parents.push(claim_dir.clone());
         Self::check_parents(&parents)?;
-        let present = if Self::absent(&claim_dir, path, scope)? {
-            None
+        let (present, store) = if Self::absent(&claim_dir, path, scope)? {
+            (None, None)
         } else {
             let guard = aterm_journal::ReadGuard::take(path, "table", std::time::Instant::now())
                 .map_err(|error| {
@@ -122,7 +265,18 @@ impl Contributor {
                 true,
                 region,
             )?;
-            Some((Some(guard), store))
+            let identity = store.custody_id(session)?;
+            let fence = store
+                .fence()
+                .ok_or_else(|| Error::new("contributor has no observed custody"))?;
+            (
+                Some(Present {
+                    guard: Some(guard),
+                    identity,
+                    fence,
+                }),
+                Some(store),
+            )
         };
         let contributor = Self {
             path: path.into(),
@@ -131,15 +285,16 @@ impl Contributor {
             claim_dir,
             parents,
             present,
+            store,
         };
         contributor.check(session)?;
         Ok(contributor)
     }
 
+    #[cfg(test)]
     pub(crate) fn require_store(&self) -> Result<&Store> {
-        self.present
+        self.store
             .as_ref()
-            .map(|(_, store)| store)
             .ok_or_else(|| Error::new("required replica contributor is absent"))
     }
 
@@ -151,9 +306,12 @@ impl Contributor {
             return Err(Error::snapshot_changed());
         }
         self.check_custody()?;
+        if let Some(store) = &self.store {
+            return store.check(session);
+        }
         match &self.present {
-            Some((_, store)) => store.check(session),
-            None => Ok(()),
+            Some(present) if !present.fence.stands(session)? => Err(Error::snapshot_changed()),
+            _ => Ok(()),
         }
     }
 
@@ -162,12 +320,12 @@ impl Contributor {
     pub(crate) fn check_custody(&self) -> Result<()> {
         Self::check_parents(&self.parents)?;
         match &self.present {
-            Some((guard, _)) => {
-                if let Some(guard) = guard {
-                    guard.check()?;
-                }
-                Ok(())
-            }
+            Some(present) => present
+                .guard
+                .as_ref()
+                .ok_or_else(Error::snapshot_changed)?
+                .check()
+                .map_err(Into::into),
             None if Self::absent(&self.claim_dir, &self.path, self.scope)? => Ok(()),
             None => Err(Error::snapshot_changed()),
         }
@@ -175,8 +333,8 @@ impl Contributor {
 
     #[cfg(test)]
     pub(crate) fn release_guard_for_test(&mut self) {
-        if let Some((guard, _)) = &mut self.present {
-            guard.take();
+        if let Some(present) = &mut self.present {
+            present.guard.take();
         }
     }
 }

@@ -52,6 +52,7 @@ fn a_stage_diagnostic_is_durable_before_its_held_sibling_finishes() {
                 Seams {
                     stage,
                     prepare_cells: None,
+                    prepare_build_dir: |_| Ok(()),
                     ..LIVE
                 },
             );

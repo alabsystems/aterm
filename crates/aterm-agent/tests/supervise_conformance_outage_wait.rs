@@ -146,6 +146,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
     let showing = st["kind"] > 0 && st["turn"] == 0;
     let connection = st["kind"] == 1;
     TurnEndReading {
+        launch_model: aterm_agent::supervise::policy::turn_end::LaunchModel::Unread,
         phase: if showing { Phase::Idle } else { Phase::Busy },
         authoritative: true,
         survey: false,

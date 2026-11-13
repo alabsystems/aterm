@@ -91,7 +91,7 @@ fn replay(scenario: &str) {
         &world.work,
         &mut Seams {
             git: &git_cmd,
-            judge: &mut |root, base| {
+            judge: &mut |root, base, _| {
                 if !judged.is_empty() && scenario == "wide" {
                     // Replay the old and new base choices on this exact merged checkout and
                     // stable target path. Warm the changed inputs before the ABBA takes.
@@ -163,7 +163,7 @@ fn replay(scenario: &str) {
                     };
                     moved = rival_moves(&world, "crates/a/src/lib.rs", &main_source);
                 }
-                if out.status.success() {
+                Ran::Ended(if out.status.success() {
                     ran(exit::PASS, vec![row("test", "ok")], elapsed.as_secs())
                 } else {
                     ran(
@@ -171,10 +171,11 @@ fn replay(scenario: &str) {
                         vec![red("test", &["-p a --lib -- contract"])],
                         elapsed.as_secs(),
                     )
-                }
+                })
             },
             branch: &mut |_, _| crates(&["a"]),
             lane: &mut |_, _| Lane::Pass,
+            recheck: &mut |_, _| panic!("a source edit is never rechecked"),
             say: &mut |line| said.push(line.to_owned()),
         },
     );

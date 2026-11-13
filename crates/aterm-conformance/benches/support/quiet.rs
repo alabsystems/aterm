@@ -12,8 +12,8 @@ use std::process::ExitCode;
 /// immediate admission cannot qualify an acceptance callback. A machine that stays busy through
 /// its patience, or a timing hold that ends before the matrix does, runs it unqualified: each
 /// reason is a `measure <target>: unqualified — <why>` line and the rows' own verdict stands
-/// (owner ruling 2026-11-05: a busy machine never blocks a release). Blind, unknown or forced
-/// admission takes no row.
+/// (a busy machine never blocks a release: the row is named, not counted red). Blind, unknown or
+/// forced admission takes no row.
 /// A ledger that cannot be used refuses the run before any row opens a window.
 /// A bad `--admit` is a usage error (2); an interrupt that ends the wait is
 /// COULD NOT RUN (3), no row taken.

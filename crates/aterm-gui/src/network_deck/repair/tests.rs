@@ -38,6 +38,7 @@ fn snapshot() -> NetworkStateSnapshot {
         reachability: Reachability::LastSeen,
         instances: None,
         samples: Vec::new(),
+        lease_ms: None,
     });
     snapshot.services.accounts.availability = ServiceAvailability::Cached;
     snapshot.services.secrets.availability = ServiceAvailability::Unknown;

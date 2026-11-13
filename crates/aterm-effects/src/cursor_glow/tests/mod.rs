@@ -125,10 +125,19 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     }
 }
 
-fn cfg_for_style_name(raw: &str, enabled: bool) -> GlowConfig {
-    let mut c = cfg(GlowStyle::parse(raw), enabled);
-    c.ribbon_tall = !GlowStyle::style_names_underline_ribbon(raw);
-    c.ribbon_flat = GlowStyle::style_names_flat_ribbon(raw);
+/// The rainbow engine's config with the tall ribbon body. The one `rainbow` theme draws the
+/// underline; the tall body is a shape no built-in theme picks, and these tests keep it drawing
+/// as theme data.
+fn tall_rainbow_cfg() -> GlowConfig {
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    assert!(c.ribbon_tall && !c.ribbon_flat);
+    c
+}
+
+/// The `rainbow` theme's config: the underline.
+fn underline_rainbow_cfg() -> GlowConfig {
+    let mut c = cfg(GlowStyle::RainbowKitty, true);
+    c.ribbon_tall = false;
     c
 }
 

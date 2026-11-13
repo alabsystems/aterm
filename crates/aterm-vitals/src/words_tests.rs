@@ -1527,8 +1527,8 @@ fn details_lead_with_kept_state_clauses() {
                 None,
                 Words,
                 f(&[
-                    "weekly 34% used (account), read 10:38",
-                    "weekly 34% used, 10:38"
+                    "weekly 66% left (account), read 10:38",
+                    "weekly 66% left, 10:38"
                 ])
             ),
             input.clone(),

@@ -915,7 +915,7 @@ impl HeldStore {
     }
 
     /// Hold `h` at its offset, in place of what the store held there.
-    fn insert(&mut self, h: Held) {
+    pub(crate) fn insert(&mut self, h: Held) {
         let bytes = retention::record_bytes(&h.rec);
         let subject = h.rec.subject.clone();
         if let Some(old) = self.entries.insert(h.rec.seq.0, h) {
@@ -926,7 +926,7 @@ impl HeldStore {
         *n = n.saturating_add(1);
     }
 
-    fn remove_entry(&mut self, off: u64) {
+    pub(crate) fn remove_entry(&mut self, off: u64) {
         if let Some(h) = self.entries.remove(&off) {
             self.forgo(&h);
         }

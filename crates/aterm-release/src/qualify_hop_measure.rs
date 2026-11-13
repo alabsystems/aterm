@@ -164,7 +164,7 @@ fn two_historical_trees() {
                     // exclusive learning admission. Match the cut's warm target, source,
                     // release profile and sealed environment; only omit its executable wrapper.
                     let _memory = aterm_capacity::admit(
-                        crate::slice_units::slice_need(triple, None),
+                        crate::slice_units::slice_need(triple),
                         aterm_capacity::Admit::Wait,
                     )
                     .unwrap();

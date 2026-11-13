@@ -9,7 +9,50 @@ use shared_provider::ObservationError;
 
 pub(super) enum Outcome {
     Renewed,
-    Reauthenticate(shared_provider::KimiRejectedSnapshot),
+    Reauthenticate(shared_provider::KimiRejectedSnapshot, Box<Rejected>),
+}
+
+/// The issuer refused a published profile's refresh token for good (`invalid_grant`): the
+/// row's login has ended, whatever the reauthentication that follows comes to or is held by.
+/// Held until the attempt that met the refusal ends, then recorded once through the store's
+/// transaction, so the row reads signed out to every pick, its ledger and the journal: where
+/// the row is still on the login that was refused (the same directory and renewal generation).
+/// A sign-in that took has renewed it by then, and nothing is written. It is written at the
+/// attempt's end and not at the refusal because the attempt's recovery authority is keyed to
+/// the row's authentication facts as they stood ([`pool_admission::snapshot_current`]).
+pub(super) struct Rejected {
+    store: accounts::Store,
+    roster: PathBuf,
+    label: String,
+    dir: Option<String>,
+    generation: Option<u64>,
+    at: i64,
+}
+
+impl Drop for Rejected {
+    fn drop(&mut self) {
+        let _ = self.store.transact_pool_logins_within(
+            &accounts::LOCK_LADDER,
+            &self.roster,
+            self.at,
+            &mut None,
+            |raw, state, logins| {
+                let binding = logins.get(&self.label);
+                if raw.row(&self.label).is_none()
+                    || binding.and_then(|binding| binding.dir.as_deref()) != self.dir.as_deref()
+                    || binding.map(|binding| binding.renewal_generation) != self.generation
+                {
+                    return Ok(Vec::new());
+                }
+                Ok(accounts::note_login_end(
+                    state,
+                    logins,
+                    &self.label,
+                    self.at,
+                ))
+            },
+        );
+    }
 }
 
 pub(super) struct Attempt<'a> {
@@ -137,6 +180,18 @@ impl Attempt<'_> {
         let _claim = super::super::browser_window::ProfileLock::claim(&path)
             .map_err(|_| unavailable("Kimi published profile is held or unavailable"))?;
         let deadline = std::time::Instant::now() + AUTH_CHECK_BUDGET;
+        // The refused login's end, written when the value drops ([`Rejected`]).
+        let rejected = || Rejected {
+            store: self.store.clone(),
+            roster: self.roster.to_owned(),
+            label: self.row.label.clone(),
+            dir: before.clone(),
+            generation: records
+                .logins
+                .get(&self.row.label)
+                .map(|binding| binding.renewal_generation),
+            at: host.now().max(self.now),
+        };
         let proof = match host.kimi_native_profile(
             &path,
             region,
@@ -161,6 +216,8 @@ impl Attempt<'_> {
                 let snapshot = shared_provider::kimi_rejected_snapshot(&path, region, expected)
                     .map_err(shared_provider::kimi_observation_error)?
                     .ok_or_else(|| unavailable("Kimi rejection no longer matches its profile"))?;
+                // From here every way out leaves the refused login's end on record.
+                let rejected = rejected();
                 let raw = records
                     .raw_roster
                     .row(&self.row.label)
@@ -208,13 +265,23 @@ impl Attempt<'_> {
                 }
                 admission.current(None).map_err(unavailable)?;
                 snapshot.check_current().map_err(unavailable)?;
-                return Ok(Some(Outcome::Reauthenticate(snapshot)));
+                return Ok(Some(Outcome::Reauthenticate(snapshot, Box::new(rejected))));
             }
-            result => result?.ok_or_else(|| {
-                ObservationError::RecoveryRequired(
-                    "Kimi published profile has no verifiable native credential".into(),
-                )
-            })?,
+            result => {
+                // The refresh this read made was refused for good just now: the receipt of it
+                // matches the profile's files, and nothing follows in this attempt.
+                if matches!(&result, Err(ObservationError::RecoveryRequired(_)))
+                    && shared_provider::kimi_rejected_snapshot(&path, region, expected)
+                        .is_ok_and(|snapshot| snapshot.is_some())
+                {
+                    drop(rejected());
+                }
+                result?.ok_or_else(|| {
+                    ObservationError::RecoveryRequired(
+                        "Kimi published profile has no verifiable native credential".into(),
+                    )
+                })?
+            }
         };
         if !accounts::email_matches(expected, proof.identity()) {
             return Err(ObservationError::RecoveryRequired(

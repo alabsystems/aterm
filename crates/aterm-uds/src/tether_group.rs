@@ -10,19 +10,30 @@
 //! Linux by init, or the nearest subreaper) and running on (Git ends none of them on a
 //! `SIGTERM`), so the watcher of a group leader signals the group, never a single member of it.
 //!
-//! The group is the child's for as long as the watcher lives, by its anchor: before it leaves the
-//! child's group, the watcher forks a child of its own that exits at once and that it never reaps,
-//! so the group always holds that zombie. XNU keeps a group while any member, a zombie included,
-//! is in it, and allocates no pid that names a live group, so the group id names the child's group
-//! and no other until the watcher exits and launchd reaps the anchor
-//! (`kill(-pgid, 0)` answers `EPERM` while only the anchor is left, `ESRCH` once it is reaped).
-//! Linux frees a pid only once no process holds it as its pid, its group's or its session's, a
-//! zombie included until it is reaped, so the same holds there (`kill(-pgid, 0)` answers `0`
-//! while only the anchor is left, as Linux signals a zombie).
+//! A watcher knows its group one of two ways ([`GroupControl::census`]). From Linux 6.9 it holds
+//! a pidfd of the child, opened while the child led the group, and the kernel signals the group by
+//! it (`pidfd_send_signal` with `PIDFD_SIGNAL_PROCESS_GROUP`, [`GroupPidfd`]): it reaches the
+//! processes whose group is the pid the descriptor names, by the kernel's own record of that pid
+//! (its `struct pid`, which the descriptor keeps) rather than its number, which a later group may
+//! reuse, so the group is the one the child led even after the child was reaped or left it; its
+//! signal `0` answers `ESRCH` once no process, zombie or live, is left in it. Measured on Linux 6.17: after the leader was reaped a member
+//! still answers, `ESRCH` once it exits; a group holding only an unreaped zombie answers `0`.
+//!
+//! Elsewhere, on Darwin and on an older Linux, the group is the child's for as long as the
+//! watcher lives by its anchor ([`Listed`]): before it leaves the child's group, the watcher forks
+//! a child of its own that exits at once and that it never reaps, so the group always holds that
+//! zombie. XNU keeps a group while any member, a zombie included, is in it, and allocates no pid
+//! that names a live group, so the group id names the child's group and no other until the
+//! watcher exits and launchd reaps the anchor (`kill(-pgid, 0)` answers `EPERM` while only the
+//! anchor is left, `ESRCH` once it is reaped). Linux frees a pid only once no process holds it as
+//! its pid, its group's or its session's, a zombie included until it is reaped, so the same holds
+//! there (`kill(-pgid, 0)` answers `0` while only the anchor is left, as Linux signals a zombie).
 //! Every member a group signal reaches is therefore in the child's group: a member the watcher
 //! never saw, the leader's death before the watcher's first look, or a member forked unsignalled
 //! as a signal landed whose parent then died changes nothing. The watcher signals only before it
-//! exits, so no reuse of the id can come between a read and a signal.
+//! exits, so no reuse of the id can come between a read and a signal. Such a watcher judges the
+//! group empty by listings ([`live`]), which only a `/proc` that lists every process can make
+//! whole on Linux.
 
 use std::time::{Duration, Instant};
 
@@ -38,8 +49,15 @@ pub(super) const KILL_ROUNDS: Duration = Duration::from_secs(5);
 const PAUSE: Duration = Duration::from_millis(20);
 
 /// How long [`linger`] waits before it reads the group again when no exit can wake it: the
-/// listing did not read, or a member's exit could not be watched.
+/// listing did not read, a member's exit could not be watched, or the census names no member
+/// ([`GroupPidfd`]).
 pub(super) const UNWATCHED_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long [`linger`] waits on its listed members' exits before it lists the group again: a
+/// member can leave the group without exiting (`setsid`, `setpgid`; a daemon's detach), which no
+/// exit watch sees, and the group, the anchor alone, is then empty. It bounds how long a watcher
+/// outlives such a group; each wake costs one listing.
+pub(super) const MEMBER_RECHECK: Duration = Duration::from_secs(5);
 
 /// What woke [`GroupControl::wait`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +89,23 @@ impl Readiness {
 
 /// What [`end_group`] and [`linger`] read and do: the kernel, or a test's script.
 pub(super) trait GroupControl {
+    /// The live members of group `pgid` as one read finds them: by listings ([`live`]) where the
+    /// group is held by an anchor, by the kernel's own count where it signals the group by pidfd
+    /// ([`GroupPidfd`]).
+    fn census(&mut self, pgid: i32) -> Live;
+    /// `sig` to every member of group `pgid`.
+    fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()>;
+    /// Waits for the parent's exit or exec or for one of `members` to exit, at most `patience`
+    /// when it is given.
+    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke;
+    /// The clock.
+    fn now(&mut self) -> Instant;
+    /// Sleeps `pause`.
+    fn nap(&mut self, pause: Duration);
+}
+
+/// The reads a census by listings takes ([`live`]), for a group its watcher holds by an anchor.
+pub(super) trait Listed {
     /// The caller's actual, exited child, held unreaped for this entire watch.
     fn anchor(&self) -> i32;
     /// `pid`'s process group as it reads now: `None` when gone, a zombie, another user's, or
@@ -80,15 +115,6 @@ pub(super) trait GroupControl {
     fn presence(&mut self, pid: i32) -> ProcessPresence;
     /// The pids of group `pgid`'s members, and whether the listing is whole; `None` when unread.
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)>;
-    /// `sig` to every member of group `pgid` (`kill(-pgid, sig)`).
-    fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()>;
-    /// Waits for the parent's exit or exec or for one of `members` to exit, at most `patience`
-    /// when it is given.
-    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke;
-    /// The clock.
-    fn now(&mut self) -> Instant;
-    /// Sleeps `pause`.
-    fn nap(&mut self, pause: Duration);
 }
 
 /// Ends this owned group only with positive execution evidence, renewed
@@ -112,17 +138,8 @@ struct Guarded<'a, C, R> {
 }
 
 impl<C: GroupControl, R: FnMut() -> Readiness> GroupControl for Guarded<'_, C, R> {
-    fn anchor(&self) -> i32 {
-        self.control.anchor()
-    }
-    fn group_of(&mut self, pid: i32) -> Option<i32> {
-        self.control.group_of(pid)
-    }
-    fn presence(&mut self, pid: i32) -> ProcessPresence {
-        self.control.presence(pid)
-    }
-    fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
-        self.control.listing(pgid)
+    fn census(&mut self, pgid: i32) -> Live {
+        self.control.census(pgid)
     }
     fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
         if !(self.readiness)().allows_signal() {
@@ -151,18 +168,21 @@ pub(super) struct GroupEnded {
     pub termed: bool,
     /// A `SIGKILL` went to the group (a member outlived the grace).
     pub killed: bool,
-    /// A whole listing found no live member left.
+    /// A census found no live member left ([`Live::Empty`]).
     pub emptied: bool,
 }
 
-/// The live members of a group as one read finds them.
+/// The live members of a group as one read finds them ([`GroupControl::census`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Live {
-    /// A fresh whole listing contains only the caller's owned exited anchor.
+pub(super) enum Live {
+    /// No member is left: a fresh whole listing contains only the caller's owned exited anchor
+    /// ([`live`]), or the kernel finds no process in the group, or two whole listings no live one
+    /// ([`GroupPidfd`]).
     Empty,
     /// These read live in the group (a listing that was not whole may hold more).
     Members(Vec<i32>),
-    /// The listing did not read, or was not whole and found none.
+    /// Not shown empty, and no member named: the listing did not read, or was not whole and
+    /// found none, or the kernel counts a member without naming it ([`GroupPidfd`]).
     Unknown,
 }
 
@@ -170,7 +190,7 @@ enum Live {
 /// Empty requires a fresh whole listing of the caller's pinned anchor alone.
 /// Earlier ended/absent pids cannot prove it: another member can fork after a
 /// listing, reusing an earlier absent pid, then exit before its own read.
-fn live(control: &mut impl GroupControl, pgid: i32) -> Live {
+pub(super) fn live(control: &mut impl Listed, pgid: i32) -> Live {
     let Some((pids, whole)) = control.listing(pgid) else {
         return Live::Unknown;
     };
@@ -203,15 +223,15 @@ fn live(control: &mut impl GroupControl, pgid: i32) -> Live {
     }
 }
 
-/// Ends group `pgid`, the one the watched child led when its watcher armed, whose anchor the
-/// caller holds: a `SIGTERM` to the group, then, for `grace`, a wait for it to empty, then
-/// `SIGKILL` rounds for up to [`KILL_ROUNDS`] until it has. A group already empty gets nothing.
-/// The caller has seen the child's thread run, or the child exit.
+/// Ends group `pgid`, the one the watched child led when its watcher armed, which the caller
+/// holds (by its anchor, or by the child's pidfd): a `SIGTERM` to the group, then, for `grace`, a
+/// wait for it to empty, then `SIGKILL` rounds for up to [`KILL_ROUNDS`] until it has. A group
+/// already empty gets nothing. The caller has seen the child's thread run, or the child exit.
 pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupControl) -> GroupEnded {
     const SIGTERM: i32 = 15;
     const SIGKILL: i32 = 9;
     let mut ended = GroupEnded::default();
-    if live(control, pgid) == Live::Empty {
+    if control.census(pgid) == Live::Empty {
         ended.emptied = true;
         return ended;
     }
@@ -220,7 +240,7 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
     let until = crate::deadline::saturating_after(control.now(), grace);
     let mut pause = Duration::from_millis(1);
     loop {
-        if live(control, pgid) == Live::Empty {
+        if control.census(pgid) == Live::Empty {
             ended.emptied = true;
             return ended;
         }
@@ -238,7 +258,7 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
         }
         control.nap(pause);
         pause = (pause * 2).min(PAUSE);
-        if live(control, pgid) == Live::Empty {
+        if control.census(pgid) == Live::Empty {
             ended.emptied = true;
             return ended;
         }
@@ -249,19 +269,20 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
 }
 
 /// The watch on group `pgid` once the child that led it exited first, with the parent still
-/// there: `false` once a fresh whole listing contains only its pinned exited anchor,
-/// `true` once the parent exits or execs first, when the caller ends the group ([`end_group`]).
-/// Each read follows a wake: a listed member's exit, or [`UNWATCHED_RECHECK`] when the listing
-/// did not establish that result. On Darwin, whose listing shows a zombie, other exited members
-/// conservatively keep this watch until reaped or the parent ends; Linux's lists none, and an
-/// exited member, which can fork nothing, is passed by. A listed member's exit wakes another
-/// read, including when it forked after enumeration; an unread or changed membership uses the
-/// bounded recheck.
+/// there: `false` once a census finds it empty ([`Live::Empty`]), `true` once the parent exits or
+/// execs first, when the caller ends the group ([`end_group`]). Each census follows a wake: a
+/// listed member's exit or [`MEMBER_RECHECK`], whichever comes first, since a member can leave
+/// the group without exiting; or [`UNWATCHED_RECHECK`] when the census named no member. On
+/// Darwin, whose listing shows a zombie, and by the kernel's count alone ([`GroupPidfd`] where no
+/// listing can be whole), other exited members conservatively keep this watch until reaped or the
+/// parent ends; Linux's listing shows none, and an exited member, which can fork nothing, is
+/// passed by. A listed member's exit wakes
+/// another census, including when it forked after enumeration.
 pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
     loop {
-        let woke = match live(control, pgid) {
+        let woke = match control.census(pgid) {
             Live::Empty => return false,
-            Live::Members(members) => control.wait(&members, None),
+            Live::Members(members) => control.wait(&members, Some(MEMBER_RECHECK)),
             Live::Unknown => control.wait(&[], Some(UNWATCHED_RECHECK)),
         };
         if woke == Woke::Parent {
@@ -304,7 +325,7 @@ pub(super) struct GroupLive<'a> {
 }
 
 #[cfg(target_vendor = "apple")]
-impl GroupControl for GroupLive<'_> {
+impl Listed for GroupLive<'_> {
     fn anchor(&self) -> i32 {
         self.anchor.pid
     }
@@ -317,6 +338,13 @@ impl GroupControl for GroupLive<'_> {
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
         crate::process::group_members(u32::try_from(pgid).ok()?)
             .map(|listing| (listing.pids, listing.complete))
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl GroupControl for GroupLive<'_> {
+    fn census(&mut self, pgid: i32) -> Live {
+        live(self, pgid)
     }
     fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
         live_signal(pgid, sig)
@@ -396,14 +424,18 @@ impl GroupControl for GroupLive<'_> {
     }
 }
 
-/// The kernel's [`GroupControl`] on Linux: Darwin's reads, with a pidfd of each member in place
-/// of the kqueue's watch, waited on beside `parent`, the watcher's descriptor of the parent's end
+/// The kernel's [`GroupControl`] where a Linux watcher holds its group by an anchor: on a kernel
+/// older than 6.9, which signals no group by pidfd ([`GroupPidfd`]), one whose child's pidfd
+/// probe failed, and in a test that asks for it (`super::BY_LISTING_VAR`). Darwin's reads, with a pidfd of each member in place of the kqueue's
+/// watch, waited on beside `parent`, the watcher's descriptor of the parent's end
 /// (`super::parent_end`). Linux's listing passes every exited process by, a zombie included
 /// ([`group_members`](crate::process::group_members)), so each listing of the watched group here
 /// adds the anchor, which stays in it until it is reaped: it was forked there, and a zombie moves
 /// to no other group. Another exited member is passed by as that listing passes it; it can fork
-/// nothing more. One that forked before it exited, while the listing walked `/proc`, hides no
-/// member behind it: the listing reads every id allocated behind its walk, or is not whole.
+/// nothing more. A walk of `/proc` is no snapshot: the listing follows the ids allocated behind it
+/// (`procfs::chased_group_of`), yet a fork the kernel has numbered but not yet made visible can be
+/// missed by one listing whose forker exits before its own row is read. [`live`] proves a group
+/// empty only by two whole listings in a row, which such a relay would have to outrun twice.
 #[cfg(target_os = "linux")]
 pub(super) struct GroupLive<'a> {
     /// The watcher's descriptor of the parent's end, readable once it exited, or execed (from
@@ -416,7 +448,7 @@ pub(super) struct GroupLive<'a> {
 }
 
 #[cfg(target_os = "linux")]
-impl GroupControl for GroupLive<'_> {
+impl Listed for GroupLive<'_> {
     fn anchor(&self) -> i32 {
         self.anchor.pid
     }
@@ -434,52 +466,216 @@ impl GroupControl for GroupLive<'_> {
         }
         Some((pids, listing.complete))
     }
+}
+
+#[cfg(target_os = "linux")]
+impl GroupControl for GroupLive<'_> {
+    fn census(&mut self, pgid: i32) -> Live {
+        live(self, pgid)
+    }
     fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
         live_signal(pgid, sig)
     }
     fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
-        use std::os::fd::AsRawFd as _;
-        let mut patience = patience;
-        let mut exits = Vec::with_capacity(members.len());
-        for &pid in members {
-            match super::pidfd_open(pid, 0) {
-                // The pidfd names the member listed while its pid still reads in the group with
-                // the pidfd open: a pid reused since by a process outside it reads otherwise, and
-                // the group is read again.
-                Ok(exit) => match self.group_of(pid) {
-                    Some(group) if group == self.pgid => exits.push(exit),
-                    Some(_) => return Woke::Other,
-                    None => match self.presence(pid) {
-                        ProcessPresence::Absent | ProcessPresence::Exited => return Woke::Other,
-                        ProcessPresence::Present | ProcessPresence::Unknown => {
-                            exits.push(exit);
-                            patience = Some(UNWATCHED_RECHECK);
-                        }
-                    },
+        members_or_parent(self.parent, self.pgid, members, patience)
+    }
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn nap(&mut self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// [`GroupControl::wait`] on Linux: a pidfd of each of `members` of group `pgid`, waited on
+/// beside `parent`, the watcher's descriptor of the parent's end, up to `patience`
+/// ([`parent_or_exit`]); [`UNWATCHED_RECHECK`] at most where a member's exit cannot be watched.
+#[cfg(target_os = "linux")]
+fn members_or_parent(parent: i32, pgid: i32, members: &[i32], patience: Option<Duration>) -> Woke {
+    let mut patience = patience;
+    let mut exits = Vec::with_capacity(members.len());
+    for &pid in members {
+        match super::pidfd_open(pid, 0) {
+            // The pidfd names the member listed while its pid still reads in the group with the
+            // pidfd open: a pid reused since by a process outside it reads otherwise, and the
+            // group is read again.
+            Ok(exit) => match crate::process::read_lineage(pid)
+                .and_then(|lineage| i32::try_from(lineage.pgid).ok())
+            {
+                Some(group) if group == pgid => exits.push(exit),
+                Some(_) => return Woke::Other,
+                None => match crate::process::process_presence(pid) {
+                    ProcessPresence::Absent | ProcessPresence::Exited => return Woke::Other,
+                    ProcessPresence::Present | ProcessPresence::Unknown => {
+                        exits.push(exit);
+                        patience = Some(UNWATCHED_RECHECK);
+                    }
                 },
-                // A member already gone: read the group again now.
-                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Woke::Other,
-                // One whose exit cannot be watched: read it again after a while.
-                Err(_) => patience = Some(UNWATCHED_RECHECK),
-            }
+            },
+            // A member already gone: read the group again now.
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Woke::Other,
+            // One whose exit cannot be watched: read it again after a while.
+            Err(_) => patience = Some(UNWATCHED_RECHECK),
         }
-        let mut fds: Vec<libc::pollfd> = std::iter::once(self.parent)
-            .chain(exits.iter().map(|exit| exit.as_raw_fd()))
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
-        let timeout = patience.map_or(-1, |p| i32::try_from(p.as_millis()).unwrap_or(i32::MAX));
-        let count = libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX);
-        // SAFETY: `fds` is a live array of `count` pollfds, which `poll` reads and writes and
-        // does not retain.
-        let got = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
-        if got > 0 && fds[0].revents != 0 {
-            Woke::Parent
-        } else {
-            Woke::Other
+    }
+    parent_or_exit(parent, &exits, patience)
+}
+
+/// Waits up to `patience` (none: for as long as it takes) for `parent`, the watcher's descriptor
+/// of the parent's end, or one of `exits`, members' pidfds, to read: [`Woke::Parent`] once the
+/// parent's does.
+#[cfg(target_os = "linux")]
+fn parent_or_exit(parent: i32, exits: &[std::os::fd::OwnedFd], patience: Option<Duration>) -> Woke {
+    use std::os::fd::AsRawFd;
+    let mut fds: Vec<libc::pollfd> = std::iter::once(parent)
+        .chain(exits.iter().map(AsRawFd::as_raw_fd))
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let timeout = patience.map_or(-1, |p| i32::try_from(p.as_millis()).unwrap_or(i32::MAX));
+    let count = libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX);
+    // SAFETY: `fds` is a live array of `count` pollfds, which `poll` reads and writes and does not
+    // retain.
+    let got = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+    if got > 0 && fds[0].revents != 0 {
+        Woke::Parent
+    } else {
+        Woke::Other
+    }
+}
+
+/// `PIDFD_SIGNAL_PROCESS_GROUP` (Linux 6.9): `pidfd_send_signal`'s scope of every process whose
+/// group is the pid the pidfd names (the kernel's `kill_pgrp_info` over that `struct pid`).
+#[cfg(target_os = "linux")]
+const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 1 << 2;
+
+/// `sig` to every process whose group is the pid `pidfd` names, the group that process leads or
+/// led, `pidfd_send_signal(pidfd, sig, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`; `sig` `0` sends none
+/// and answers whether one is there.
+///
+/// # Errors
+/// The kernel's: `ESRCH` once no process, zombie or live, is in that group, `EPERM` when none
+/// there may be signalled by this one, `EINVAL` before Linux 6.9 (the scope unknown), `ENOSYS`
+/// before Linux 5.1.
+#[cfg(target_os = "linux")]
+pub(super) fn signal_by_pidfd(pidfd: i32, sig: i32) -> std::io::Result<()> {
+    // SAFETY: `pidfd_send_signal` takes a descriptor, a signal, a null info pointer (the kernel
+    // fills its own) and flags; it touches no memory of ours.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            PIDFD_SIGNAL_PROCESS_GROUP,
+        )
+    };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The kernel's [`GroupControl`] on Linux 6.9 and later: the group whose id is the pid of the
+/// watched child's pidfd, which the watcher opened while it shared the child's group and the child
+/// led it and waited on the watcher's arming, so the descriptor names that child and its group. A
+/// group signal goes by the kernel's record of that pid ([`signal_by_pidfd`]), never by the
+/// group's number, so no later group that reuses the number can be reached, and the watcher needs
+/// no anchor to hold the number: the descriptor keeps the record, a process joins the group by its
+/// number only while a member holds it, and none joins once the group emptied.
+///
+/// The census is signal `0`'s answer first: [`Live::Empty`] at `ESRCH`, no process left in the
+/// group. The kernel counts a zombie awaiting its reaping (an exited leader whose parent has not
+/// reaped it yet, a member reparented to a pid 1 that never reaps), which can fork nothing, so
+/// where a listing here can be whole (`whole`, `process::group_listing_can_be_whole`) the
+/// group's listing by its number, which passes zombies by, decides the rest: its live members
+/// ([`Live::Members`], whose exits a wait watches), or [`Live::Empty`] after two whole listings in
+/// a row with none. A number whose group emptied since, its last zombie reaped, may name a later
+/// group by then, whose members only keep the watch: nothing is ever signalled by the number.
+/// Where no listing can be whole, [`Live::Unknown`], so an exited member keeps the watch until it
+/// is reaped or the parent ends, and an end at the parent's exec, its unreaped zombie child the
+/// leader, spends the grace and [`KILL_ROUNDS`] on it.
+#[cfg(target_os = "linux")]
+pub(super) struct GroupPidfd {
+    /// The watcher's descriptor of the parent's end (`super::parent_end`).
+    pub parent: i32,
+    /// The watched child's pidfd.
+    pub leader: i32,
+    /// The group's number, the watched child's pid, which its listing and its members' reads
+    /// name.
+    pub pgid: i32,
+    /// Whether a listing of the group here can be whole.
+    pub whole: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl GroupControl for GroupPidfd {
+    fn census(&mut self, pgid: i32) -> Live {
+        if matches!(signal_by_pidfd(self.leader, 0), Err(e) if e.raw_os_error() == Some(libc::ESRCH))
+        {
+            return Live::Empty;
+        }
+        if !self.whole {
+            return Live::Unknown;
+        }
+        let listed = || crate::process::group_members(u32::try_from(pgid).ok()?);
+        match listed() {
+            Some(first) if !first.pids.is_empty() => Live::Members(first.pids),
+            Some(first)
+                if first.complete
+                    && listed().is_some_and(|again| again.complete && again.pids.is_empty()) =>
+            {
+                Live::Empty
+            }
+            _ => Live::Unknown,
+        }
+    }
+    fn signal_group(&mut self, _pgid: i32, sig: i32) -> std::io::Result<()> {
+        signal_by_pidfd(self.leader, sig)
+    }
+    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
+        members_or_parent(self.parent, self.pgid, members, patience)
+    }
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn nap(&mut self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// How a Linux watcher holds the group its child leads: by the child's pidfd where the kernel
+/// signals a group by one ([`GroupPidfd`]), else by its anchor and listings ([`GroupLive`]).
+#[cfg(target_os = "linux")]
+pub(super) enum Holding<'a> {
+    /// By the child's pidfd (Linux 6.9 and later).
+    Pidfd(GroupPidfd),
+    /// By the watcher's anchor, judged by listings.
+    Anchor(GroupLive<'a>),
+}
+
+#[cfg(target_os = "linux")]
+impl GroupControl for Holding<'_> {
+    fn census(&mut self, pgid: i32) -> Live {
+        match self {
+            Self::Pidfd(held) => held.census(pgid),
+            Self::Anchor(held) => held.census(pgid),
+        }
+    }
+    fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
+        match self {
+            Self::Pidfd(held) => held.signal_group(pgid, sig),
+            Self::Anchor(held) => held.signal_group(pgid, sig),
+        }
+    }
+    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
+        match self {
+            Self::Pidfd(held) => held.wait(members, patience),
+            Self::Anchor(held) => held.wait(members, patience),
         }
     }
     fn now(&mut self) -> Instant {

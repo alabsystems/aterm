@@ -201,6 +201,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         release_id: Some(55),
         release_intent: true,
         upload_intents: Vec::new(),
+        delete_intent: None,
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "publish")

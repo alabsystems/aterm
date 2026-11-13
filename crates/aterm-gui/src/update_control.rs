@@ -266,326 +266,284 @@ pub(crate) fn status_activation<'a>(
     live.map_or(published, Snapshot::staged)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Windows: the build staged on this machine (`aterm_update::windows`), as this window
+/// announces it. Memory only: the pointer file and the record beside the executable are the
+/// durable facts, read again at every look.
+#[cfg(windows)]
+struct WindowsStaged {
+    /// The staged build the strip label and the palette row offer to install.
+    shown: Option<(u64, String)>,
+    /// An installer this window started is running.
+    installing: bool,
+    /// How that installer ended, until the main thread reads it.
+    finished: Option<Result<aterm_update::windows::Applied, String>>,
+    /// The build this window has already said is installed (its own installer's success, or
+    /// the restart note for one laid under it): said once, and not offered here again.
+    told_installed: Option<u64>,
+}
 
-    fn status() -> aterm_update::UpdateStatus {
-        aterm_update::UpdateStatus {
-            enabled: true,
-            installable: true,
-            current_build: 10,
-            staged_build: Some(11),
-            staged_version: Some("test".into()),
-            staged_commit: Some("a".repeat(40)),
-            staged_dmg_sha256: Some("b".repeat(64)),
-            changelog: None,
-            outcome: String::new(),
-            updated_at: String::new(),
-            failing_checks: 0,
-            failing_kind: String::new(),
-            failing_applies: 0,
-            failing_since: String::new(),
-            failing_persistent: false,
-            failing_checks_kind: String::new(),
-            channel_unreadable: false,
-            linux: None,
-        }
-    }
+#[cfg(windows)]
+static WINDOWS_STAGED: std::sync::Mutex<WindowsStaged> = std::sync::Mutex::new(WindowsStaged {
+    shown: None,
+    installing: false,
+    finished: None,
+    told_installed: None,
+});
 
-    #[test]
-    fn automatic_check_requires_both_live_and_readable_persisted_policy() {
-        let settings = |auto_apply| aterm_update::CheckSettings {
-            source: aterm_update::Source {
-                owner: "owner".into(),
-                repo: "repo".into(),
-            },
-            auto_apply,
-        };
-        assert!(admit_check_settings(settings(true), None).is_none());
-        for live in [false, true] {
-            for disk in [false, true] {
-                assert_eq!(
-                    admit_check_settings(settings(live), Some(settings(disk)))
-                        .unwrap()
-                        .auto_apply,
-                    live && disk
-                );
-            }
-        }
-        let mut repointed = settings(true);
-        repointed.source.repo = "changed".into();
-        assert!(admit_check_settings(settings(true), Some(repointed)).is_none());
-    }
-
-    #[test]
-    fn control_check_announces_every_completion_without_inventing_a_stage() {
-        let mut status = status();
-        let mut sent = false;
-        announce_stage(&status, |wake| {
-            assert!(matches!(wake, Wake::UpdateStaged { build: 11, .. }));
-            sent = true;
-        });
-        assert!(sent, "a manual socket check must wake the GUI reducer");
-        status.enabled = false;
-        announce_stage(&status, |wake| {
-            assert!(matches!(wake, Wake::UpdateCheckCompleted))
-        });
-        status.enabled = true;
-        status.staged_build = Some(10);
-        announce_stage(&status, |wake| {
-            assert!(matches!(wake, Wake::UpdateCheckCompleted))
-        });
-        status.staged_build = None;
-        announce_stage(&status, |wake| {
-            assert!(matches!(wake, Wake::UpdateCheckCompleted))
-        });
-    }
-
-    #[test]
-    fn control_posture_requires_the_same_artifact_and_a_real_retry() {
-        let mut status = status();
-        let mut snapshot = Snapshot {
-            enabled: true,
-            owner: None,
-            repo: None,
-            auto_apply: true,
-            staged: Some(StagedUpdate {
-                build: 11,
-                version: "test".into(),
-                commit: status.staged_commit.clone(),
-                dmg_sha256: status.staged_dmg_sha256.clone().unwrap(),
-                changelog: None,
-                generation: 1,
-            }),
-            posture: Some(ApplyPosture::Automatic),
-            phase: Some(ApplyPhase::PreferOutputGap),
-            restored_hold: false,
-            lane_hold: None,
-            account_work_hold: false,
-            applying: false,
-            retry_scheduled: false,
-        };
-        assert_eq!(snapshot.apply_posture(&status), "automatic-idle");
-        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
-        snapshot.retry_scheduled = true;
-        assert_eq!(snapshot.apply_posture(&status), "automatic");
-        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
-        status.enabled = false;
-        assert_eq!(
-            snapshot.apply_posture(&status),
-            "automatic",
-            "turning off checks does not disable an admitted staged installation"
-        );
-        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
-        snapshot.applying = true;
-        assert_eq!(snapshot.apply_posture(&status), "applying");
-        snapshot.applying = false;
-        status.enabled = true;
-        status.staged_commit = status.staged_commit.map(|s| s.to_uppercase());
-        status.staged_dmg_sha256 = status.staged_dmg_sha256.map(|s| s.to_uppercase());
-        assert_eq!(snapshot.apply_posture(&status), "automatic");
-        snapshot.posture = Some(ApplyPosture::AtNextLaunch);
-        assert_eq!(snapshot.apply_posture(&status), "next-launch");
-        assert_eq!(
-            snapshot.apply_phase(&status),
-            None,
-            "a build that installs at the next launch promises no phase"
-        );
-        snapshot.posture = Some(ApplyPosture::ManualByConfig);
-        assert_eq!(snapshot.apply_posture(&status), "manual-config");
-        assert_eq!(
-            snapshot.apply_phase(&status),
-            None,
-            "no phase is promised for a lane that will not apply by itself"
-        );
-        assert_eq!(
-            snapshot.apply_policy_reason(&status),
-            Some("update.auto_apply=false")
-        );
-        status.staged_dmg_sha256 = Some("c".repeat(64));
-        assert_eq!(snapshot.apply_posture(&status), "unreconciled");
-        assert_eq!(snapshot.apply_policy_reason(&status), None);
-        status.staged_dmg_sha256 = None;
-        assert_eq!(snapshot.apply_posture(&status), "unreconciled");
-        let stage = snapshot.staged.as_mut().unwrap();
-        stage.dmg_sha256 = crate::native_updater_service::installed_activation_digest(
-            stage.build,
-            stage.commit.as_deref().unwrap(),
-        );
-        assert_eq!(snapshot.apply_posture(&status), "manual-config");
-        status.staged_commit = Some("d".repeat(40));
-        assert_eq!(snapshot.apply_posture(&status), "unreconciled");
-        status.staged_build = None;
-        status.enabled = false;
-        assert_eq!(snapshot.apply_posture(&status), "disabled");
-        status.enabled = true;
-        assert_eq!(snapshot.apply_posture(&status), "none");
-    }
-
-    #[test]
-    fn the_restored_agents_hold_is_named_while_it_holds() {
-        let status = status();
-        let mut snapshot = Snapshot {
-            enabled: true,
-            owner: None,
-            repo: None,
-            auto_apply: true,
-            staged: Some(StagedUpdate {
-                build: 11,
-                version: "test".into(),
-                commit: status.staged_commit.clone(),
-                dmg_sha256: status.staged_dmg_sha256.clone().unwrap(),
-                changelog: None,
-                generation: 1,
-            }),
-            posture: Some(ApplyPosture::Automatic),
-            phase: Some(ApplyPhase::Land),
-            restored_hold: true,
-            lane_hold: None,
-            account_work_hold: false,
-            applying: false,
-            retry_scheduled: true,
-        };
-        assert_eq!(snapshot.apply_phase(&status), Some("land"));
-        assert_eq!(snapshot.apply_held(&status), Some("restored-agents"));
-        snapshot.restored_hold = false;
-        assert_eq!(snapshot.apply_held(&status), None);
-        snapshot.restored_hold = true;
-        snapshot.posture = Some(ApplyPosture::ManualByConfig);
-        assert_eq!(
-            snapshot.apply_held(&status),
-            None,
-            "a lane that will not apply by itself is held by nothing"
-        );
-
-        snapshot.posture = Some(ApplyPosture::Automatic);
-        snapshot.lane_hold = Some("setup-draft");
-        assert_eq!(
-            snapshot.apply_held(&status),
-            Some("restored-agents"),
-            "the restored agents' hold is said while it holds"
-        );
-        snapshot.restored_hold = false;
-        assert_eq!(
-            snapshot.apply_held(&status),
-            Some("setup-draft"),
-            "the hold the lane named past its ladder is the status's"
-        );
-        snapshot.posture = Some(ApplyPosture::ManualByConfig);
-        assert_eq!(snapshot.apply_held(&status), None);
-    }
-
-    #[test]
-    fn an_accepted_apply_names_account_work_only_until_its_exact_drain_finishes() {
-        use crate::app_account_work::Continuation;
-        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
-
-        let mut status = status();
-        let mut app = App::headless_for_test();
-        let attempt = ApplyAttemptTicket::for_test(
-            status.staged_build.unwrap(),
-            status.staged_commit.as_deref().unwrap(),
-            status.staged_dmg_sha256.as_deref().unwrap(),
-        );
-        attempt.make_current_apply_for_test(&mut app.native_updater_service);
-        assert_eq!(Snapshot::capture(&app).apply_held(&status), None);
-        #[cfg(unix)]
-        let next_attempt = app.next_update_handoff_id;
-        let continuation = || Continuation::Handoff {
-            mode: ApplyMode::Immediate,
-            attempt: Some(attempt.clone()),
-            same_image: None,
-            #[cfg(unix)]
-            next_attempt,
-        };
-        let work = app.account_work.enter().unwrap();
-        assert!(!app.accounts_drained_before(continuation()));
-        let waiting = Snapshot::capture(&app);
-        assert_eq!(waiting.apply_posture(&status), "applying");
-        assert_eq!(waiting.apply_held(&status), Some("account-work"));
-        status.staged_dmg_sha256 = Some("c".repeat(64));
-        assert_eq!(
-            waiting.apply_held(&status),
-            None,
-            "another artifact has no matching hold"
-        );
-        status.staged_dmg_sha256 = Some("b".repeat(64));
-        drop(work);
-        assert!(app.accounts_drained_before(continuation()));
-        let ready = Snapshot::capture(&app);
-        assert_eq!(ready.apply_posture(&status), "applying");
-        assert_eq!(ready.apply_held(&status), None);
-    }
-
-    fn installed_activation(build: u64) -> StagedUpdate {
-        let commit = "a".repeat(40);
-        StagedUpdate {
-            build,
-            version: format!("build {build}"),
-            dmg_sha256: crate::native_updater_service::installed_activation_digest(build, &commit),
-            commit: Some(commit),
-            changelog: None,
-            generation: 1,
-        }
-    }
-
-    #[test]
-    fn only_an_activation_is_published() {
-        let activation = installed_activation(12);
-        assert_eq!(activation_to_publish(Some(&activation)), Some(activation));
-        let download = StagedUpdate {
-            dmg_sha256: "b".repeat(64),
-            ..installed_activation(12)
-        };
-        assert_eq!(activation_to_publish(Some(&download)), None);
-        assert_eq!(activation_to_publish(None), None);
-    }
-
-    #[test]
-    fn the_live_stage_outranks_the_published_one() {
-        let live = |staged| Snapshot {
-            enabled: true,
-            owner: None,
-            repo: None,
-            auto_apply: true,
-            staged,
-            posture: None,
-            phase: None,
-            restored_hold: false,
-            lane_hold: None,
-            account_work_hold: false,
-            applying: false,
-            retry_scheduled: false,
-        };
-        let published = installed_activation(12);
-        assert_eq!(status_activation(Some(&live(None)), Some(&published)), None);
-        let current = live(Some(installed_activation(13)));
-        assert_eq!(
-            status_activation(Some(&current), Some(&published)),
-            current.staged.as_ref()
-        );
-        assert_eq!(status_activation(None, Some(&published)), Some(&published));
-    }
-
-    #[test]
-    fn control_source_is_the_live_gui_configuration() {
-        let mut app = App::headless_for_test();
-        let config = app.config.update.get_or_insert_with(Default::default);
-        config.owner = Some("first-owner".into());
-        config.repo = Some("first-repo".into());
-        config.enabled = Some(false);
-        let first = Snapshot::capture(&app);
-        let config = app.config.update.as_mut().unwrap();
-        config.owner = Some("second-owner".into());
-        config.repo = Some("second-repo".into());
-        config.enabled = Some(true);
-        let second = Snapshot::capture(&app);
-        assert_eq!(first.owner.as_deref(), Some("first-owner"));
-        assert!(!first.enabled);
-        assert!(second.enabled);
-        assert_eq!(first.repo.as_deref(), Some("first-repo"));
-        assert_eq!(second.owner.as_deref(), Some("second-owner"));
-        assert_eq!(second.repo.as_deref(), Some("second-repo"));
+/// The running image, as the staged-build status names it.
+#[cfg(windows)]
+fn windows_running() -> aterm_update::windows::Running<'static> {
+    aterm_update::windows::Running {
+        version: crate::build_info::version(),
+        commit: crate::build_info::git_commit(),
+        build_number: crate::running_build_number(),
     }
 }
+
+/// What a notice leaves on the window: the build its install row offers, and the build whose
+/// restart note is due. A build laid under the window (by the build loop, a shell, another
+/// window or this one) takes the row down and is said once; a withdrawn offer takes the row
+/// down and says nothing.
+#[cfg(windows)]
+fn windows_mark_after(
+    told_installed: Option<u64>,
+    notice: &aterm_update::windows::Notice,
+) -> (
+    Option<(u64, String)>,
+    Option<&aterm_update::windows::StagedBuild>,
+) {
+    use aterm_update::windows::Notice;
+    match notice {
+        Notice::Nothing => (None, None),
+        // A dist that lays no record leaves the build "offered" after this window installed
+        // it: what this window installed is not offered here again.
+        Notice::Offered(staged) if told_installed == Some(staged.build_number) => (None, None),
+        Notice::Offered(staged) => (Some((staged.build_number, staged.version.clone())), None),
+        Notice::Installed(staged) => (
+            None,
+            (told_installed != Some(staged.build_number)).then_some(staged),
+        ),
+    }
+}
+
+/// Start the staged-build watch: two small file reads at launch and every
+/// `aterm_update::windows::WATCH_EVERY` on its own thread, and a wake only when what the
+/// window should say changes.
+#[cfg(windows)]
+pub(crate) fn spawn_windows_staged_watch(proxy: aterm_window::event_loop::EventLoopProxy<Wake>) {
+    let watching = aterm_update::windows::spawn_watch(
+        windows_running(),
+        Box::new(move |notice| {
+            let _ = proxy.send_event(Wake::StagedBuildNotice(notice));
+        }),
+    );
+    if !watching {
+        aterm_log::info!("update: no staged-build watch (no %LOCALAPPDATA%, or no thread)");
+    }
+}
+
+/// The staged build this window offers, for a republish of the update state.
+#[cfg(windows)]
+pub(crate) fn windows_staged_shown() -> Option<(u64, String)> {
+    WINDOWS_STAGED.lock_or_recover().shown.clone()
+}
+
+/// `update status` on Windows: the running build against the staged and the installed one.
+#[cfg(windows)]
+pub(crate) fn windows_status_line() -> String {
+    let running = windows_running();
+    format!(
+        "{}\n",
+        aterm_update::windows::control_line(running, &aterm_update::windows::here(running))
+    )
+}
+
+/// `update apply` on Windows, answered before the window runs the installer: what was asked
+/// for, or why there is nothing to install.
+#[cfg(windows)]
+pub(crate) fn windows_apply_reply() -> String {
+    let build = crate::running_build_number();
+    let here = aterm_update::windows::here(windows_running());
+    match here.installable() {
+        Ok(staged)
+            if WINDOWS_STAGED.lock_or_recover().told_installed == Some(staged.build_number) =>
+        {
+            format!(
+                "ERR build {} ({}) is already installed; restart aterm to use it\n",
+                staged.build_number, staged.version
+            )
+        }
+        Ok(staged) => format!(
+            "OK apply requested: build {} ({}) over build {build}; the installer stops nothing, \
+             and aterm.log and Messages carry its verdict\n",
+            staged.build_number, staged.version
+        ),
+        Err(why) => format!("ERR {why}\n"),
+    }
+}
+
+#[cfg(windows)]
+impl App {
+    /// The staged-build watch, or an installer this window ran, reports what the window should
+    /// now say: report the installer's verdict, then put up or take down the install row.
+    pub(crate) fn windows_staged_notice(&mut self, notice: &aterm_update::windows::Notice) {
+        let finished = WINDOWS_STAGED.lock_or_recover().finished.take();
+        match finished {
+            Some(Ok(applied)) => {
+                WINDOWS_STAGED.lock_or_recover().told_installed = Some(applied.staged.build_number);
+                self.post_message(
+                    aterm_messages::Message::new(
+                        aterm_messages::tags::UPDATE,
+                        aterm_messages::Severity::Success,
+                        format!("Installed {}", applied.staged.name()),
+                    )
+                    .line("new windows and shells use it; this window keeps running the old build")
+                    .line("restart aterm to move this window onto it")
+                    .key("update-staged-install"),
+                );
+            }
+            Some(Err(why)) => {
+                self.post_message(
+                    aterm_messages::Message::new(
+                        aterm_messages::tags::UPDATE,
+                        aterm_messages::Severity::Warn,
+                        "The staged build did not install",
+                    )
+                    .sentence(why)
+                    .line("`aterm update apply` shows why")
+                    .key("update-staged-install"),
+                );
+            }
+            None => {}
+        }
+        self.windows_follow_notice(notice);
+    }
+
+    /// Put up or take down the install row for `notice`, and say once that a build was laid
+    /// under this window. `true` when that was said now.
+    fn windows_follow_notice(&mut self, notice: &aterm_update::windows::Notice) -> bool {
+        let (shown, restart) = {
+            let mut state = WINDOWS_STAGED.lock_or_recover();
+            let (shown, restart) = windows_mark_after(state.told_installed, notice);
+            state.shown.clone_from(&shown);
+            if let Some(staged) = restart {
+                state.told_installed = Some(staged.build_number);
+            }
+            (shown, restart)
+        };
+        if let Some(staged) = restart {
+            self.post_message(
+                aterm_messages::Message::new(
+                    aterm_messages::tags::UPDATE,
+                    aterm_messages::Severity::Info,
+                    format!("{} is installed", staged.name()),
+                )
+                .line("new windows and shells use it; this window keeps running the old build")
+                .line("restart aterm to move this window onto it")
+                .key("update-staged-install"),
+            );
+        }
+        self.windows_set_staged_mark(shown);
+        restart.is_some()
+    }
+
+    /// Put up the install row and the strip's mark for `shown`, or take them down.
+    fn windows_set_staged_mark(&mut self, shown: Option<(u64, String)>) {
+        self.relaunch =
+            shown.map(|(build, version)| crate::relaunch_notice::RelaunchNotice { build, version });
+        self.refresh_version_menu();
+        self.palette_refresh_live();
+        self.request_redraw_all_windows();
+    }
+
+    /// The Apply row, the strip's update mark and `update apply` on Windows: install the staged
+    /// build on a worker thread, stopping nothing. A row this window still shows for a build
+    /// that is no longer offered (the pointer moved on, the dist went, or the build was laid
+    /// under the window since the last look) follows this look and says why nothing installs;
+    /// it never falls through to the network updater's page. `false` when this window offered
+    /// nothing and nothing is offered (the caller's own answer stands).
+    pub(crate) fn windows_apply_staged_update(&mut self) -> bool {
+        let running = windows_running();
+        let here = aterm_update::windows::here(running);
+        let staged = match here.installable() {
+            Ok(staged) => staged.clone(),
+            Err(why) => {
+                if WINDOWS_STAGED.lock_or_recover().shown.is_none() {
+                    return false;
+                }
+                // Said already when the build was laid under the window: the restart note.
+                if !self.windows_follow_notice(&here.notice()) {
+                    self.post_message(
+                        aterm_messages::Message::new(
+                            aterm_messages::tags::UPDATE,
+                            aterm_messages::Severity::Info,
+                            "Nothing to install",
+                        )
+                        .sentence(why)
+                        .key("update-staged-install"),
+                    );
+                }
+                return true;
+            }
+        };
+        let Some(proxy) = self.proxy.clone() else {
+            return false;
+        };
+        let busy = {
+            let mut state = WINDOWS_STAGED.lock_or_recover();
+            if state.installing {
+                Some("The staged build is still installing")
+            } else if state.told_installed == Some(staged.build_number) {
+                Some("The staged build is already installed \u{2014} restart aterm to use it")
+            } else {
+                state.installing = true;
+                None
+            }
+        };
+        if let Some(said) = busy {
+            self.post_message(
+                aterm_messages::Message::new(
+                    aterm_messages::tags::UPDATE,
+                    aterm_messages::Severity::Info,
+                    said,
+                )
+                .key("update-staged-install"),
+            );
+            return true;
+        }
+        let standing = here.standing;
+        let worker = std::thread::Builder::new()
+            .name("aterm-staged-install".into())
+            .spawn(move || {
+                let result = std::env::current_exe()
+                    .map_err(|error| format!("cannot locate this executable ({error})"))
+                    .and_then(|exe| {
+                        aterm_update::windows::apply(
+                            &standing,
+                            &exe,
+                            aterm_update::windows::ApplyMode::Staged,
+                            aterm_update::windows::InstallerOutput::Capture,
+                        )
+                    });
+                {
+                    let mut state = WINDOWS_STAGED.lock_or_recover();
+                    state.installing = false;
+                    state.finished = Some(result);
+                }
+                // Look again: the installer laid the build's record, or it did not install.
+                let notice = aterm_update::windows::here(running).notice();
+                let _ = proxy.send_event(Wake::StagedBuildNotice(notice));
+            });
+        if let Err(error) = worker {
+            WINDOWS_STAGED.lock_or_recover().installing = false;
+            aterm_log::warn!("update: could not start the staged install: {error}");
+            return false;
+        }
+        aterm_log::info!("update: installing staged {}", staged.name());
+        true
+    }
+}
+
+#[cfg(test)]
+#[path = "update_control_tests.rs"]
+mod tests;

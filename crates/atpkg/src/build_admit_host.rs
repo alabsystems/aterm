@@ -23,6 +23,10 @@ use std::{
 
 const SETTLEMENT_RETRY: Duration = Duration::from_millis(100);
 
+#[path = "build_admit_returning.rs"]
+mod returning;
+use returning::{Retained, ReturnMode};
+
 /// A refusal before dispatch, returning the original admission and resources.
 /// Once installed in the owner, a failed launch keeps its ticket instead.
 pub struct RetainedRefused<T> {
@@ -110,6 +114,9 @@ pub struct Ticket {
 pub struct Completion {
     pub id: JobId,
     pub result: io::Result<JobOutcome>,
+    // Only this table's actual finish constructs a return capability. The public
+    // result and job identity remain observations, not resource-release authority.
+    returned: Option<returning::Returned>,
 }
 
 /// Readiness hints only. No bit establishes child state, signal acceptance or drain.
@@ -362,6 +369,48 @@ impl Jobs {
         retained: T,
         dispatch: impl FnOnce(&mut NativeJob, &mut spawnfd::Command),
     ) -> Result<Ticket, RetainedRefused<T>> {
+        self.submit_retained_mode_with(
+            held,
+            command,
+            grace,
+            retained,
+            ReturnMode::DropAfterSettlement,
+            dispatch,
+        )
+    }
+
+    /// Retain an original materialization bundle through native settlement and
+    /// return it in this job's own successful completion. A failed completion
+    /// keeps its bundle; no observation can reconstruct it or claim seed validity.
+    ///
+    /// # Errors
+    /// A preflight refusal returns the untouched admission and bundle before dispatch.
+    pub fn submit_returning<T: Send + 'static>(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+        retained: T,
+    ) -> Result<Ticket, RetainedRefused<T>> {
+        self.submit_retained_mode_with(
+            held,
+            command,
+            grace,
+            retained,
+            ReturnMode::ReturnAfterSuccess,
+            NativeJob::dispatch,
+        )
+    }
+
+    fn submit_retained_mode_with<T: Send + 'static>(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+        retained: T,
+        mode: ReturnMode,
+        dispatch: impl FnOnce(&mut NativeJob, &mut spawnfd::Command),
+    ) -> Result<Ticket, RetainedRefused<T>> {
         let prepared = (|| {
             self.check_owner()?;
             if self.jobs.len() == self.limit || !held.cohort {
@@ -398,7 +447,7 @@ impl Jobs {
                 cleanup_issued: false,
                 usage: None,
                 failure: None,
-                retained: Some(Box::new(retained)),
+                retained: Some(Retained::new(mode, retained)),
                 settled: false,
                 settlement_retry: None,
                 settlement_failure: None,
@@ -500,8 +549,12 @@ impl Jobs {
             .map(|id| {
                 let job = self.jobs.remove(&id.sequence).expect("completed owned job");
                 let mut policy: JobEvents<'_> = &mut |event| events(&id, event);
-                let result = job.finish(&mut policy, say);
-                Completion { id, result }
+                let (result, returned) = job.finish(&mut policy, say);
+                Completion {
+                    id,
+                    result,
+                    returned,
+                }
             })
             .collect())
     }
@@ -577,7 +630,7 @@ struct NativeJob {
     cleanup_issued: bool,
     usage: Option<Rusage>,
     failure: Option<io::Error>,
-    retained: Option<Box<dyn Send>>,
+    retained: Option<Retained>,
     settled: bool,
     settlement_retry: Option<Instant>,
     settlement_failure: Option<io::Error>,
@@ -779,6 +832,19 @@ impl NativeJob {
         mut self,
         events: &mut JobEvents<'_>,
         say: &mut dyn FnMut(&str),
+    ) -> (io::Result<JobOutcome>, Option<returning::Returned>) {
+        let result = self.finish_outcome(events, say);
+        let returned = self
+            .retained
+            .take()
+            .and_then(|resources| resources.complete(result.as_ref().ok().copied()));
+        (result, returned)
+    }
+
+    fn finish_outcome(
+        &mut self,
+        events: &mut JobEvents<'_>,
+        say: &mut dyn FnMut(&str),
     ) -> io::Result<JobOutcome> {
         let mut held = self.held.take().expect("owned admission");
         let settlement = match if self.settled {
@@ -834,7 +900,7 @@ impl NativeJob {
             peak,
             say,
         );
-        self.failure.map_or(Ok(outcome), Err)
+        self.failure.take().map_or(Ok(outcome), Err)
     }
 }
 

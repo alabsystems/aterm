@@ -5,6 +5,10 @@
 //! The dev shim: `aterm agh` and argv0 `agh` are the shipped forms.
 
 fn main() -> std::process::ExitCode {
+    if let Err(error) = agh::git::HelperHost::Direct.record() {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }

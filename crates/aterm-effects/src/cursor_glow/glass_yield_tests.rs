@@ -489,24 +489,36 @@ fn a_cap_read_up_to_a_bound_is_read_on_past_it() {
 /// After-land R0: the yield reads a word's glyphs as one ([`WordJudge`]) and publishes
 /// exactly what judging each glyph on its own did (`per_glyph_cap`, the reading before: every
 /// glyph scanning every composite's grounds and reading every level of its own), the cells'
-/// scales with it: on GitHub Light and Default Light, in the page's ink and two app inks, over
-/// the bundled face's rasters at 1x and 2x, under gradient quads and wedge ramps of the shipped
-/// spectrum and of three deep lights, at full to faint alpha. The work is counted, not timed:
-/// past their margins the word reads fewer levels than its glyphs read in turn by their margins
-/// (r25 K8-1's reading), and under a fifth of what they read with none (63 thousand, 4.0
-/// million and 408 million on after-land round 3's bars); and reading each composite only up
-/// to the cap the word already took, fewer than reading each to its own cap
-/// ([`WordMutant::Unbounded`], 165 thousand), which publishes the same. One-colour glass, a
-/// pinned colour's, lays every word the same composites, so what one word kept is what the
-/// next word reads, and a yield held across the frames reads its memo: both publish the same.
-/// The negative controls read a word as its first glyph, take a ground read once as kept
-/// whether it kept or not, and take a ground one word kept as kept for the next
-/// ([`WordMutant`]): each publishes what the glyphs judged in turn do not.
+/// scales with it: on GitHub Light and Default Light, in the page's ink and app inks, over the
+/// rasters of the renderer's default face ([`aterm_render::Renderer::from_system`]) at 1x and
+/// 2x, under gradient quads and wedge ramps of the shipped spectrum and of three deep lights, at
+/// full to faint alpha. The work is counted, not timed: past their margins the word reads fewer
+/// levels than its glyphs read in turn by their margins (r25 K8-1's reading), and under a fifth
+/// of what they read with none (46 thousand, 737 thousand and 481 million in Linux's bundled
+/// JetBrains Mono); and reading each composite only up to the cap the word already took, fewer
+/// than reading each to its own cap ([`WordMutant::Unbounded`], 59 thousand), which publishes
+/// the same. One-colour glass, a pinned colour's, lays every word the same composites, so what
+/// one word kept is what the next word reads, and a yield held across the frames reads its
+/// memo: both publish the same. The negative controls read a word as its first glyph, take a
+/// ground read once as kept whether it kept or not, and take a ground one word kept as kept for
+/// the next ([`WordMutant`]): each publishes what the glyphs judged in turn do not.
+///
+/// The last control bites only where a word reads, past its margins, a ground another word read
+/// otherwise past its own, which the first three lines hold in some faces and not in others.
+/// The fourth is there to hold such words whatever the face: `oo` in six reds 3 to 25 levels
+/// apart (#c4262e to #dd3f47), whose bars one glass reaches at neighbouring grounds, the gaps
+/// many so that no one gap decides it. On the first three lines alone the control published
+/// otherwise in none of the 104 frames in Linux's bundled JetBrains Mono, and in 3 in DejaVu
+/// Sans Mono, the system face a build of aterm-effects alone finds there; with the fourth, in
+/// 85 and 91, and in 76 to 100 in six other faces at hand (Linux arm64, 2026-11-11).
 #[test]
 fn a_word_judged_as_one_yields_as_its_glyphs_judged_in_turn() {
     use crate::rainbow_kitty::prism_glass::{GLASS_LEN, Palette};
     const TEXT: &[u8] = b"The quick brown fox jumps over\r\n\x1b[38;2;196;38;46mred\x1b[39m \
-        words \x1b[38;2;5;80;174mblue\x1b[39m %@{} mm\r\nlazy dog 0123 ,;:\"' wwiill";
+        words \x1b[38;2;5;80;174mblue\x1b[39m %@{} mm\r\nlazy dog 0123 ,;:\"' wwiill\r\n\
+        \x1b[38;2;196;38;46moo\x1b[39m \x1b[38;2;199;41;49moo\x1b[39m \
+        \x1b[38;2;203;45;53moo\x1b[39m \x1b[38;2;208;50;58moo\x1b[39m \
+        \x1b[38;2;214;56;64moo\x1b[39m \x1b[38;2;221;63;71moo\x1b[39m";
     const DEEP: [u32; 3] = [0x0080_40C0, 0x00C0_6020, 0x0020_8080];
     let (mut frames, mut cut, mut differ) = (0, 0, [0; 3]);
     let (mut word_reads, mut glyph_reads, mut margin_reads) = (0_u64, 0_u64, 0_u64);
@@ -528,7 +540,7 @@ fn a_word_judged_as_one_yields_as_its_glyphs_judged_in_turn() {
                 aterm_render::Renderer::from_system(px, aterm_render::Theme::default()).unwrap();
             renderer.debug_block_on_lazy_fallbacks();
             let (cw, ch) = renderer.cell_size();
-            let mut term = Terminal::new(3, 40);
+            let mut term = Terminal::new(4, 40);
             let rgb = |c: u32| {
                 format!(
                     "rgb:{:02x}/{:02x}/{:02x}",
@@ -539,7 +551,7 @@ fn a_word_judged_as_one_yields_as_its_glyphs_judged_in_turn() {
             };
             term.process(format!("\x1b]10;{}\x07\x1b]11;{}\x07", rgb(fg), rgb(page)).as_bytes());
             term.process(TEXT);
-            let mut base = term.cell_frame(3, 40);
+            let mut base = term.cell_frame(4, 40);
             base.cursor_visible = false;
             let _ = renderer.render_input(&base);
             let ink = renderer.glyph_ink_for(&base);
@@ -561,7 +573,7 @@ fn a_word_judged_as_one_yields_as_its_glyphs_judged_in_turn() {
                 let fade = [255_u8, 200, 120][v % 3];
                 let mut quads = Vec::new();
                 let mut ramps = GlowRamps::default();
-                for row in 0..3_u16 {
+                for row in 0..4_u16 {
                     let i0 = v * 37 + usize::from(row) * 61;
                     let i1 = i0 + 9 + v;
                     let x0 = ((v * 3 + usize::from(row) * 5) % 9) as i32 * cw;
@@ -1030,28 +1042,32 @@ fn grey_glass_word_caps(word: &str, ink: &str) -> Vec<u8> {
 #[test]
 fn each_solid_level_of_an_app_ink_keeps_the_bar_of_its_own_reading() {
     let word = uncored_word("180;63;180");
-    let caps = grey_glass_word_caps(word, "180;63;180");
+    let caps = grey_glass_word_caps(&word, "180;63;180");
     assert!(
         caps.iter().all(|&k| k == 0),
         "`{word}` in #b43fb4 under a grey glass takes {caps:?}"
     );
-    let least = with_least_level_bar(|| grey_glass_word_caps(word, "180;63;180"));
+    let least = with_least_level_bar(|| grey_glass_word_caps(&word, "180;63;180"));
     assert!(
         least.iter().any(|&k| k > 0),
         "control: at its dimmest level's bar `{word}` in #b43fb4 takes no wash ({least:?})"
     );
 }
 
-/// The first of `wow` and `xxx` in `ink` (`r;g;b`) on Default Light at 24 px no glyph of which
-/// holds the word from every glass by its core alone: a core whose letter bar lies over its
-/// own reading, as one reading AA as the judges read it and under AA's level in hand does,
-/// keeps the word whole whatever its solid levels' bars. Under macOS's SF Mono, where
-/// amendment 65's control was measured, #b43fb4's is `wow`: that control's caps, [255, 255,
-/// 255, 223, 178, 148, ...], were `wow`'s, and a core holding it would have left them 0.
-/// Under Linux's bundled JetBrains Mono (14 x 28 px cells) `o`'s core (coverage 253) reads
-/// 4.4976, `x`'s (248) 4.32, and the word is `xxx`, whose caps under the control are those
-/// (Linux arm64, 2026-11-07).
-fn uncored_word(ink: &str) -> &'static str {
+/// The first of `wow`, `xxx` and each lowercase letter three times over, in `ink` (`r;g;b`) on
+/// Default Light at 24 px, no glyph of which holds the word from every glass by its core alone:
+/// a core whose letter bar lies over its own reading, as one reading AA as the judges read it
+/// and under AA's level in hand does, keeps the word whole whatever its solid levels' bars.
+/// Under macOS's SF Mono, where amendment 65's control was measured, #b43fb4's is `wow`: that
+/// control's caps, [255, 255, 255, 223, 178, 148, ...], were `wow`'s, and a core holding it
+/// would have left them 0. Under Linux's bundled JetBrains Mono (14 x 28 px cells) `o`'s core
+/// (coverage 253) reads 4.4976, `x`'s (248) 4.32, and the word is `xxx`, whose caps under the
+/// control are those (Linux arm64, 2026-11-07). Windows' Iosevka Term NL is hinted, and most of
+/// its cores are the whole ink, which #b43fb4 reads at 4.5447, at AA as the judges read it: in
+/// its 14 x 28 px cells `w`'s core (254) reads 4.5212 and `x`'s (255) 4.5447, so neither word
+/// is one, and the first letter whose core reads under AA is `o` (252, 4.4175): the word is
+/// `ooo` (Windows x64, 2026-11-11).
+fn uncored_word(ink: &str) -> String {
     use crate::rainbow_kitty::prism_glass::colour::{contrast, luminance};
     let mut renderer = aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default())
         .expect("the bundled face");
@@ -1060,8 +1076,9 @@ fn uncored_word(ink: &str) -> &'static str {
         .split(';')
         .map(|c| c.parse::<u32>().expect("a channel"))
         .fold(0, |rgb, c| rgb << 8 | c);
-    ["wow", "xxx"]
+    ["wow".to_string(), "xxx".to_string()]
         .into_iter()
+        .chain(('a'..='z').map(|c| c.to_string().repeat(3)))
         .find(|word| {
             let input = page(format!("\x1b[38;2;{ink}m{word}\x1b[39m").as_bytes());
             let glyphs = renderer.glyph_ink_for(&input);

@@ -75,4 +75,25 @@ fn a_root_says_where_it_lies() {
         "volume"
     );
     assert_eq!(r("/tmp/../Volumes/X").under(Some("/Users//a")), "volume");
+    // An unrooted home prefixes nothing, not even the relative paths it would match.
+    assert_eq!(r("Users/a/x").under(Some("Users/a")), "volume");
+    assert_eq!(r("/Users//a/x").under(Some("")), "volume");
+}
+
+/// Windows spellings: a drive-qualified home holds its own folders only, and a rooted path
+/// with no drive is not inside it (the comparison keeps the prefix).
+#[cfg(windows)]
+#[test]
+fn a_root_says_where_it_lies_in_windows_spelling() {
+    let r = |p: &str| Root {
+        path: p.into(),
+        ..Root::default()
+    };
+    assert_eq!(r(r"C:\Users\a\x").under(Some(r"C:\Users\a")), "home");
+    assert_eq!(r(r"C:\Users\a").under(Some(r"C:\Users\a\")), "home");
+    assert_eq!(r(r"C:\Users\alice\x").under(Some(r"C:\Users\a")), "volume");
+    assert_eq!(r(r"D:\Users\a\x").under(Some(r"C:\Users\a")), "volume");
+    assert_eq!(r(r"\Users\a\x").under(Some(r"C:\Users\a")), "volume");
+    assert_eq!(r(r"C:\Users\a\x").under(Some("C:Users")), "volume");
+    assert_eq!(r(r"C:\x").under(Some(r"C:\")), "volume");
 }

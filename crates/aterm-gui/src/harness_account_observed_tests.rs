@@ -297,3 +297,44 @@ fn a_session_on_a_mac_that_lists_no_account_is_sighted() {
         },
     );
 }
+
+/// THE ACCOUNTS CARD NAMES THE ACCOUNT ON A MAC THAT LISTS NONE: with no row to judge the login
+/// against, the card still says the address the session's login file names, and that no account
+/// is listed, never "unknown".
+/// NEGATIVE CONTROL: with the card returning at `RosterUnread::Nothing` before it reads the login
+/// (as it did), its account is `None` and its inventory unknown.
+#[test]
+fn the_card_on_a_mac_that_lists_no_account_names_the_observed_address() {
+    let a = Accts::new();
+    std::fs::write(
+        a.tmp.path().join("home").join(".claude.json"),
+        format!(r#"{{"oauthAccount":{{"emailAddress":"{UNICORN}"}}}}"#),
+    )
+    .unwrap();
+    a.spawn("s-card", ACCT_TALK_A, "main");
+    std::fs::write(a.roster_path(), "").unwrap();
+    let idle = a.worker("s-card", &on());
+    // The card reads a process whose start the kernel says: this test's own.
+    let pid = std::process::id();
+    let mut snapshot = idle.kept.lock().unwrap().snapshot.clone().unwrap();
+    let env = a.procs.lock().unwrap().remove(&snapshot.pid).unwrap();
+    snapshot.pid = pid;
+    snapshot.start = aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap();
+    a.procs.lock().unwrap().insert(pid, env);
+    a.tabs
+        .lock()
+        .unwrap()
+        .insert(snapshot.tab.clone(), snapshot.clone());
+    idle.kept.lock().unwrap().snapshot = Some(snapshot);
+    let request = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+    let card = idle
+        .read_account_progress(&request, AccountPoint::TurnEnd, None, None)
+        .expect("the card")
+        .value;
+    assert_eq!(card.account.as_deref(), Some(UNICORN));
+    assert_eq!(card.known, Some(0));
+    assert_eq!(
+        card.details.first().map(String::as_str),
+        Some("No accounts are listed")
+    );
+}

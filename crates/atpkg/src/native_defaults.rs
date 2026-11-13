@@ -40,8 +40,8 @@ impl Launcher {
     /// A physical path to this image: a retained older helper cannot acquire a new verb.
     pub fn of_current_image(offered: Option<&Path>) -> Option<Self> {
         let offered = std::fs::canonicalize(offered?).ok()?;
-        let running = std::fs::canonicalize(crate::stub::unchanged_running_exe()?).ok()?;
-        if observe(&offered)? != observe(&running)? {
+        observe(&offered)?;
+        if !crate::stub::is_running_image(&offered) {
             return None;
         }
         Self::at(offered)
@@ -88,8 +88,14 @@ fn observe(candidate: &Path) -> Option<Observation> {
     })
 }
 
+/// Off Unix no executable can be observed (no mode bits, no device and inode), so no
+/// observation exists: two launchers never compare equal and none is admitted.
 #[cfg(not(unix))]
-fn observe(_: &Path) -> Option<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum Observation {}
+
+#[cfg(not(unix))]
+fn observe(_: &Path) -> Option<Observation> {
     None
 }
 

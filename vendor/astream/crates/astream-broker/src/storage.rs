@@ -312,29 +312,62 @@ impl Backing {
         }
     }
 
-    /// Every byte of the file as stored (empty when it cannot be read): the
-    /// inspection path, never the hot one.
-    pub(crate) fn stored(&self, path: &Path) -> Vec<u8> {
-        match self {
-            Backing::Os(_) => {
-                let Ok(b) = std::fs::read(path) else {
-                    return Vec::new();
-                };
-                b
-            }
-            #[cfg(any(test, debug_assertions))]
-            Backing::Sim(s) => {
-                let mut all = Vec::new();
-                s.read_log(&mut all);
-                all
-            }
-        }
+    /// The first `len` bytes of the file (fewer where it ends), read through the
+    /// log's own descriptor. Reserve only the actual prefix, fallibly, rather than
+    /// allocating the requested length before discovering a shorter file.
+    pub(crate) fn stored(&self, len: u64) -> io::Result<Vec<u8>> {
+        let len = len.min(self.len()?);
+        let capacity =
+            usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut out = stored_buffer(capacity)?;
+        // No resize(len): each append is bounded by the stack buffer, and the
+        // complete output fits the capacity already reserved without aborting.
+        self.copy_stored(len, &mut out)?;
+        Ok(out)
     }
 
-    /// The real file, for the paths that exist only on disk (retention's rewrite and
-    /// the permissions it copies); `Unsupported` on a simulated log.
+    /// Copy up to `len` bytes through the log's own descriptor, with fixed scratch
+    /// space. A short file ends the copy; read/write errors preserve their error.
+    /// Every read is POSITIONAL, as cold reads and appends are on every OS.
+    pub(crate) fn copy_stored<W: Write>(&self, len: u64, out: &mut W) -> io::Result<u64> {
+        let mut buf = [0u8; STORED_CHUNK];
+        let mut at = 0u64;
+        while at < len {
+            let remaining = len - at;
+            let want = if remaining > STORED_CHUNK as u64 {
+                STORED_CHUNK
+            } else {
+                remaining as usize
+            };
+            let window = buf
+                .get_mut(..want)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let got = self.read_some_at(at, window)?;
+            if got == 0 {
+                break;
+            }
+            // Keep the positional-read contract local: even a bad byte count
+            // cannot select outside the window or advance past the requested end.
+            let bytes = window
+                .get(..got)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let next = at
+                .checked_add(got as u64)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            if next > len {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            out.write_all(bytes)?;
+            at = next;
+        }
+        Ok(at)
+    }
+
+    /// The real file, shared (the log's own descriptor, as the [`FlushHandle`]s share it),
+    /// for the paths that exist only on disk (retention's rewrite, its copy and the
+    /// permissions it copies); `Unsupported` on a simulated log.
     #[cfg_attr(not(feature = "retention"), allow(dead_code))]
-    pub(crate) fn os(&self) -> io::Result<&File> {
+    pub(crate) fn os(&self) -> io::Result<&Arc<File>> {
         match self {
             Backing::Os(f) => Ok(f),
             #[cfg(any(test, debug_assertions))]
@@ -344,6 +377,18 @@ impl Backing {
             )),
         }
     }
+}
+
+/// Inspection copies keep one fixed buffer regardless of the committed log's size.
+const STORED_CHUNK: usize = 64 * 1024;
+
+/// Fallible output reservation, kept separate so capacity overflow is testable
+/// without manufacturing an enormous file or exhausting the process allocator.
+fn stored_buffer(capacity: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    Ok(out)
 }
 
 /// The length in bytes of `file` via `fstat` / `metadata`.
@@ -400,16 +445,34 @@ fn read_once_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<usize> {
 /// what the cursor write cost: one call per append, no handle, no lock and no second
 /// call. The alternatives each cost or miss something:
 ///
-/// - AN APPEND-ONLY HANDLE (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`; `O_APPEND`) is a
-///   second open of the file: it can fail where taking the shared descriptor cannot
-///   ([`Backing::flush_handle`] says why that matters), retention's rewrite replaces the
-///   file under it, and on Windows the whole-file exclusive lock the open takes
-///   (`LockFileEx` through the log's own handle, `lock_exclusive`) denies reads and writes
-///   through any other handle of the file, this process's included. And it writes at the
-///   FILE's end, not the log's: the rollback truncate would have to go through the other
-///   handle, since an append-only one may not shorten the file.
+/// - AN APPEND-ONLY HANDLE (`FILE_APPEND_DATA` without `FILE_WRITE_DATA` on Windows;
+///   `O_APPEND` on Unix) is a second open of the file: it can fail where taking the shared
+///   descriptor cannot ([`Backing::flush_handle`] says why that matters), retention's
+///   rewrite replaces the file under it, and on Windows the whole-file exclusive lock the
+///   open takes (`LockFileEx` through the log's own handle, `lock_exclusive`) denies reads
+///   and writes through any other handle of the file, this process's included. And it
+///   writes at the FILE's end, not the log's: after a write that failed partway, the next
+///   append lands past the torn bytes unless the rollback's truncate took, and on Windows
+///   that truncate would have to go through the other handle, since one without
+///   `FILE_WRITE_DATA` may not shorten the file (an `O_APPEND` descriptor on Unix may).
 /// - A SEPARATE READ HANDLE for the cold reads and the scan is the same second open, with
 ///   the same lock in the way, and must be replaced in step with every retention rewrite.
+///   That lock is why the live log is read through its own descriptor, and by position
+///   wherever a read can overlap an append: the cold reads, the open's scan, retention's
+///   copy (`compact::KeptCopy`, which reads with no lock held while the writer appends,
+///   safe because no append depends on the cursor) and the inspection read
+///   ([`Backing::stored`]). Two reads a Windows build makes are not positional reads
+///   through it. One is [`Backing::read_to_end`], a cursor read through the log's own
+///   descriptor, which a replica's tail truncation (`BrokerLog::truncate_replica_to`)
+///   makes where nothing overlaps it: under `&mut` on a bare log, and on a broker behind
+///   the compaction gate (`Broker::truncate_replica_to` takes it first), which the copy
+///   holds. The other is an offline seal's check of the log it pins
+///   (`offline_seal::changed_since`, which `settle` in the open and `pending` in
+///   `check_open` run under their lock and before any append): it reads the newest frame
+///   through a second open of the path, which on Windows succeeds and whose read the lock
+///   refuses, so the open or the check fails there. Only a seal's marker and staged log
+///   beside the log reach it, and the seal that writes them is Unix-only (it reads the
+///   plaintext log through its name too, where the lock is advisory and refuses no read).
 /// - A CURSOR RESTORE (seek back to the end after every read, under the lock) misses the
 ///   batch written OUTSIDE the lock: the batch's write can run between a reader's read
 ///   and its restore, at the cursor the read left, and a restore that runs while the
@@ -442,7 +505,7 @@ fn write_all_at(file: &File, mut bytes: &[u8], mut at: u64) -> io::Result<()> {
 
 /// `pread` the whole of `buf` from byte `start` of `file`.
 #[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, start)
 }
@@ -450,7 +513,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
 /// The whole of `buf` from byte `start` of `file`, by `seek_read`s, which leave the file
 /// cursor at the end of what they read (nothing writes at the cursor).
 #[cfg(windows)]
-fn read_exact_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         let n = file.seek_read(buf, start)?;
@@ -666,5 +729,135 @@ impl Dir {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+    use crate::test_scratch::Scratch;
+
+    fn backing(bytes: &[u8]) -> (Scratch, PathBuf, Backing) {
+        let root = Scratch::new("inspection-storage");
+        let path = root.path().join("log");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        (root, path, Backing::from_file(file))
+    }
+
+    #[test]
+    fn enormous_requested_prefix_reserves_only_the_actual_file_length() {
+        let (_root, _path, file) = backing(b"the whole short file");
+        let bytes = file.stored(u64::MAX).unwrap();
+        assert_eq!(bytes, b"the whole short file");
+        assert!(bytes.capacity() < STORED_CHUNK);
+        assert_eq!(file.stored(9).unwrap(), b"the whole");
+        assert!(file.stored(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_reservation_returns_out_of_memory_without_panicking() {
+        // Deterministic capacity overflow exercises the real fallible allocator
+        // entry point without trying to exhaust the test process's heap.
+        let error = stored_buffer(usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        fail_at: Option<usize>,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let room = self
+                .fail_at
+                .map_or(usize::MAX, |end| end.saturating_sub(self.bytes.len()));
+            if room == 0 {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            let count = bytes.len().min(997).min(room);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn positional_copy_handles_short_writes_and_preserves_partial_errors() {
+        let data: Vec<_> = (0..3 * STORED_CHUNK + 73).map(|i| i as u8).collect();
+        let (_root, _path, file) = backing(&data);
+        let mut out = ShortWriter {
+            bytes: Vec::new(),
+            fail_at: None,
+        };
+        assert_eq!(
+            file.copy_stored(u64::MAX, &mut out).unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(out.bytes, data);
+        assert_eq!(file.stored(u64::MAX).unwrap(), data);
+
+        let partial = STORED_CHUNK + 123;
+        let mut out = ShortWriter {
+            bytes: Vec::new(),
+            fail_at: Some(partial),
+        };
+        assert_eq!(
+            file.copy_stored(u64::MAX, &mut out).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(out.bytes, data[..partial]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_keeps_reading_the_original_descriptor_after_path_replacement() {
+        let (_root, path, file) = backing(b"original inode");
+        let renamed = path.with_extension("old");
+        std::fs::rename(&path, &renamed).unwrap();
+        std::fs::write(&path, b"replacement inode").unwrap();
+        assert_eq!(file.stored(u64::MAX).unwrap(), b"original inode");
+        let mut copied = Vec::new();
+        file.copy_stored(u64::MAX, &mut copied).unwrap();
+        assert_eq!(copied, b"original inode");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement inode");
+    }
+
+    #[test]
+    #[ignore = "manual sparse-file inspection above 256 MiB, with fixed RAM"]
+    fn inspection_streams_a_large_sparse_file_without_a_full_log_allocation() {
+        const SIZE: u64 = (256 << 20) + 37;
+        let (_root, _path, file) = backing(b"begin");
+        file.resize_file(SIZE).unwrap();
+        file.write_at(b"end", SIZE - 3).unwrap();
+        struct Counter(u64);
+        impl Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= STORED_CHUNK);
+                if self.0 == 0 {
+                    assert!(bytes.starts_with(b"begin"));
+                }
+                self.0 += bytes.len() as u64;
+                if self.0 == SIZE {
+                    assert!(bytes.ends_with(b"end"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Counter(0);
+        assert_eq!(file.copy_stored(u64::MAX, &mut out).unwrap(), SIZE);
+        assert_eq!(out.0, SIZE);
     }
 }

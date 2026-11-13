@@ -1365,7 +1365,8 @@ pub(crate) fn launch_load_failure(notice: &str) -> Message {
         ))
     } else {
         Why::YourAction(Reason::new(
-            "aterm.toml did not load, so the window's settings except [harness] are at their defaults",
+            "aterm.toml did not load, so the window's settings except [harness] and [update]'s two \
+             switches are at their defaults",
         ))
     };
     let ask = Ask::flash(
@@ -1398,6 +1399,46 @@ pub(crate) fn cpu_renderer_no_effect(key: &str, rest: &str) -> Message {
     })
     .record()
     .key(format!("render.cpu.{key}").as_str())
+}
+
+pub(crate) const KEY_CURSOR_NAMES: &str = "config.cursor-names";
+
+/// The record of aterm.toml's one-time cursor migration
+/// (`native_config_service::admit_cursor_migration`): what each name is now, and the pet
+/// written beside it.
+pub(crate) fn cursor_names_renamed(migration: &crate::prefs::CursorMigration) -> Message {
+    let mut msg = Message::new(tags::CONFIG, Severity::Info, "Cursor settings updated");
+    for sentence in migration.sentences() {
+        msg = msg.line(sentence);
+    }
+    msg.line("aterm.toml was updated once; an old style name is no longer accepted")
+        .action(Intent::OpenSettings {
+            route: SettingsRoute::CursorStyles.path().to_string(),
+        })
+        .record()
+        .key(KEY_CURSOR_NAMES)
+}
+
+/// The record of a cursor migration whose aterm.toml could not be written (`why`): aterm
+/// draws what the file meant, and the file's owner writes the new lines.
+pub(crate) fn cursor_names_unwritten(
+    migration: &crate::prefs::CursorMigration,
+    why: &str,
+) -> Message {
+    let mut msg = Message::new(
+        tags::CONFIG,
+        Severity::Info,
+        "Cursor settings need updating in aterm.toml",
+    );
+    for sentence in migration.sentences() {
+        msg = msg.line(sentence);
+    }
+    msg.line(format!(
+        "aterm.toml could not be written ({why}); aterm reads it this way until it says so itself"
+    ))
+    .action(Intent::OpenConfigEditor { line: None })
+    .record()
+    .key(KEY_CURSOR_NAMES)
 }
 
 /// Builds a log record when the Windows client-area backdrop is declined.
@@ -2611,7 +2652,7 @@ pub(crate) fn autopilot_set(
     let message = match cancelled {
         Some(at) => message.line(format!(
             "the {} landing time is cancelled",
-            crate::autopilot_menu::when(at)
+            crate::autopilot_timers::when(at)
         )),
         None => message,
     };
@@ -2642,7 +2683,7 @@ pub(crate) fn autopilot_timer_set(
         Severity::Info,
         format!(
             "Autopilot cruises until {}",
-            crate::autopilot_menu::when(until)
+            crate::autopilot_timers::when(until)
         ),
     )
     .line(atpkg::progress::sanitize_for_tty(
@@ -6554,27 +6595,6 @@ pub(crate) fn stall_on_work_record(
     .line(format!(
         "{name}'s turn ended, and its own background work has run {minutes} min under words \
          that stood still"
-    ))
-    .record()
-    .key(&stall_record_key(sid))
-}
-
-/// Builds the warning log record when a supervised tab's child command stops making progress.
-pub(crate) fn stall_no_progress_record(
-    sid: &str,
-    place: &str,
-    agent: aterm_phase::Program,
-    pid: u32,
-    minutes: u64,
-) -> Message {
-    let name = resume_agent_word(agent);
-    Message::new(
-        tags::HARNESS,
-        Severity::Warn,
-        fitted_title(&format!("{name} has stalled"), place),
-    )
-    .line(format!(
-        "{name} waits on a background call (pid {pid}) that has made no progress for {minutes} min"
     ))
     .record()
     .key(&stall_record_key(sid))

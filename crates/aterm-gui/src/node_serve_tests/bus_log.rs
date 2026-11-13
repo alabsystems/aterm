@@ -281,7 +281,8 @@ fn bus_stream(
 /// `bus.log` and lets members drive it; B's `Bus` stream for it is admitted, handed the ring
 /// minted for B, and B posts mail as itself, which lands on A's `bus.log` where A's local
 /// clients read it; B's post as A is refused. Under a content grant (no member may drive A),
-/// the same stream is refused as an ungranted drive is.
+/// the same stream is refused as an ungranted drive is. While A's fleet access is Read Only the
+/// stream is refused as a locked drive is, and served from Read and Write.
 #[test]
 fn a_members_bus_log_stream_is_admitted_as_a_driver_and_served_its_ring() {
     let scratch = aterm_tempfile::tempdir().expect("tempdir");
@@ -315,6 +316,30 @@ fn a_members_bus_log_stream_is_admitted_as_a_driver_and_served_its_ring() {
         .table
         .dial(mac_a.addr, DIAL_WITHIN)
         .expect("B dials A's one listener");
+
+    // The stream is the mesh's cross-Mac message path: A's grant admits B as a driver, and A's
+    // fleet access, Read Only until its person raises it, refuses the stream below Read and
+    // Write, in the lock's words and not an ungranted driver's.
+    let locked = bus_stream(&link)
+        .err()
+        .expect("a Read Only Mac serves no member its bus.log");
+    assert_eq!(
+        locked.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{locked}"
+    );
+    assert!(
+        locked
+            .to_string()
+            .contains("ERR denied access=read needs=write: "),
+        "{locked}"
+    );
+    aterm_agent::fleet_access::set(
+        &state_a,
+        aterm_types::fleet_access::FleetAccess::ReadWrite,
+        aterm_agent::fleet_access::By::Cli,
+    )
+    .expect("store Read and Write");
 
     let principal_a = astream_broker::identity_principal(id_a.key().bytes());
     let principal_b = astream_broker::identity_principal(id_b.key().bytes());

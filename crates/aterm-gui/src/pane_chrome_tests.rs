@@ -1641,8 +1641,13 @@ fn gpu_and_cpu_on_the_bundled_font() -> (aterm_gpu::GpuRenderer, aterm_render::R
     }
 }
 
-/// The same law on the GPU: on Metal the layers land the bytes the retired
-/// quads land there, and the CPU's.
+/// Whether this host's GPU backend is held to the CPU's bytes: Metal is;
+/// Direct3D 11 and GL blend the same layers in their own float arithmetic
+/// and claim no byte parity with the CPU, only with themselves.
+const GPU_LANDS_THE_CPUS_BYTES: bool = cfg!(target_os = "macos");
+
+/// The same law on the GPU: on every backend the layers land the bytes the
+/// retired quads land there, and on Metal the CPU's.
 #[test]
 fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_gpu() {
     let (mut gpu, mut cpu) = gpu_and_cpu_on_the_bundled_font();
@@ -1658,9 +1663,12 @@ fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_gpu() {
         let got = gpu.render_input(&mut win, &layered, None).pixels;
         assert!(
             got == want,
-            "{rgb:?}@{alpha}: Metal: the layers land the quads' bytes"
+            "{rgb:?}@{alpha}: the GPU: the layers land the quads' bytes"
         );
         assert_eq!(cpu.cell_size(), cell, "both backends lay the same cells");
+        if !GPU_LANDS_THE_CPUS_BYTES {
+            continue;
+        }
         let cpu_got = cpu.render_input(&layered).pixels.clone();
         let cpu_bare = cpu.render_input(&page).pixels.clone();
         let gpu_bare = gpu.render_input(&mut win, &page, None).pixels;
@@ -1758,8 +1766,8 @@ fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_cpu() {
     assert_cut_at_the_card("CPU", width, card, [&bare, &whole, &cut]);
 }
 
-/// The same cut on Metal, landing the CPU's bytes wherever the two arms
-/// share the ground.
+/// The same cut on the GPU, landing on Metal the CPU's bytes wherever the
+/// two arms share the ground.
 #[test]
 fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_gpu() {
     let (mut gpu, mut cpu) = gpu_and_cpu_on_the_bundled_font();
@@ -1776,7 +1784,10 @@ fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_gpu() {
     let bare = gpu.render_input(&mut win, &page, None).pixels;
     let whole = gpu.render_input(&mut win, &layered, None).pixels;
     let f = gpu.render_input(&mut win, &covered, None);
-    assert_cut_at_the_card("Metal", f.width, card, [&bare, &whole, &f.pixels]);
+    assert_cut_at_the_card("GPU", f.width, card, [&bare, &whole, &f.pixels]);
+    if !GPU_LANDS_THE_CPUS_BYTES {
+        return;
+    }
     let cpu_bare = cpu.render_input(&page).pixels.clone();
     let cpu_cut = cpu.render_input(&covered).pixels.clone();
     assert!(

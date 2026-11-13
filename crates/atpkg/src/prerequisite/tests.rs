@@ -12,6 +12,198 @@ use crate::sig::testkit;
 const TRIPLE: &str = "aarch64-apple-darwin";
 
 #[test]
+fn executable_handoff_survives_sender_process_exit() {
+    use std::io::BufRead as _;
+    const NAME: &str = "prerequisite::tests::executable_handoff_survives_sender_process_exit";
+    const PREFIX: &str = "ATPKG_TEST_HANDOFF_PREFIX";
+    const SOCKET: &str = "ATPKG_TEST_HANDOFF_SOCKET";
+    if let Some(prefix) = std::env::var_os(PREFIX) {
+        let fixture = Fixture::new(Prerequisite::Codex);
+        let layout = Layout {
+            prefix: prefix.into(),
+        };
+        let session = Session::resolve(
+            &fixture,
+            &layout,
+            &testkit::anchor(),
+            BuildFloor {
+                index_build: 0,
+                roster_seq: 0,
+            },
+            testkit::NOW,
+            TRIPLE,
+        )
+        .unwrap();
+        let tool = session.acquire_build(Prerequisite::Codex, 7).unwrap();
+        let mut stream = aterm_uds::CtlStream::connect(std::env::var_os(SOCKET).unwrap()).unwrap();
+        tool.send_handoff(&mut stream).unwrap();
+        return;
+    }
+    if !crate::testdir::isolated_lifecycle(NAME) {
+        return;
+    }
+    struct Sender(aterm_uds::spawnfd::Child);
+    impl Drop for Sender {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = Fixture::new(Prerequisite::Codex);
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let socket_dir = aterm_tempfile::Builder::new()
+        .prefix("handoff-")
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = socket_dir.path().join("s");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut child = Sender(
+        aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(PREFIX, &fixture.layout.prefix)
+            .env(SOCKET, &socket)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stream = loop {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "sender exited before transfer"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sender connection hang detector"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => panic!("accept sender: {error}"),
+        }
+    };
+    // The small fixture frame fits in the socket. Prove custody while its
+    // descriptors are still queued in the kernel and the original sender is gone.
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sender exit hang detector"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert!(status.success(), "original sender exits successfully");
+    let subject = Subject::build("codex", 7).unwrap();
+    assert!(matches!(
+        crate::lease::reclaim(&fixture.layout.prefix, &subject),
+        crate::lease::Reclaim::Keep(_)
+    ));
+    let mut marker = [0];
+    let received = aterm_uds::fdpass::recv_with_fds(&stream, &mut marker, 2).unwrap();
+    assert_eq!((received.bytes, marker, received.fds.len()), (1, *b"X", 2));
+    let mut frame = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut frame)
+        .unwrap();
+    let receipt: super::handoff::Receipt = aterm_json::from_str(&frame).unwrap();
+    assert_eq!(receipt.root, fixture.root.canonicalize().unwrap());
+    assert!(
+        child.0.wait().unwrap().success(),
+        "original sender exits successfully"
+    );
+    let subject = Subject::build("codex", 7).unwrap();
+    assert!(
+        matches!(
+            crate::lease::reclaim(&fixture.layout.prefix, &subject),
+            crate::lease::Reclaim::Keep(_)
+        ),
+        "a dead sender does not release received custody"
+    );
+    drop(received);
+    assert!(matches!(
+        crate::lease::reclaim(&fixture.layout.prefix, &subject),
+        crate::lease::Reclaim::Clear(_)
+    ));
+}
+
+#[test]
+fn executable_handoff_retains_original_custody_after_sender_drops() {
+    use std::io::BufRead as _;
+    if !crate::testdir::isolated_lifecycle(
+        "prerequisite::tests::executable_handoff_retains_original_custody_after_sender_drops",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new(Prerequisite::Codex);
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let session = fixture.session(TRIPLE).unwrap();
+    let tool = session.acquire_build(fixture.want, 7).unwrap();
+    let (mut sender, receiver) = aterm_uds::CtlStream::pair().unwrap();
+    tool.send_handoff(&mut sender).unwrap();
+    drop(sender);
+    drop(tool);
+    let mut marker = [0];
+    let mut received = aterm_uds::fdpass::recv_with_fds(&receiver, &mut marker, 2).unwrap();
+    assert_eq!((received.bytes, marker), (1, *b"X"));
+    assert_eq!(received.fds.len(), 2);
+    let image = std::fs::File::from(received.fds.pop().unwrap());
+    let lease = received.fds.pop().unwrap();
+    let mut frame = String::new();
+    std::io::BufReader::new(receiver)
+        .read_line(&mut frame)
+        .unwrap();
+    let receipt: super::handoff::Receipt = aterm_json::from_str(&frame).unwrap();
+    assert_eq!((receipt.protocol, receipt.build), (1, 7));
+    assert_eq!(receipt.program, "codex");
+    assert_eq!(
+        receipt.executable,
+        fixture.executable().canonicalize().unwrap()
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = image.metadata().unwrap();
+    assert_eq!(
+        (receipt.device, receipt.inode, receipt.size),
+        (metadata.dev(), metadata.ino(), metadata.len())
+    );
+    let subject = Subject::build("codex", 7).unwrap();
+    assert!(matches!(
+        crate::lease::reclaim(&fixture.layout.prefix, &subject),
+        crate::lease::Reclaim::Keep(_)
+    ));
+    drop(image);
+    drop(lease);
+    assert!(matches!(
+        crate::lease::reclaim(&fixture.layout.prefix, &subject),
+        crate::lease::Reclaim::Clear(_)
+    ));
+}
+
+#[test]
+fn executable_handoff_refuses_changed_image_before_sending_custody() {
+    use std::io::Read as _;
+    let fixture = Fixture::new(Prerequisite::Codex);
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let session = fixture.session(TRIPLE).unwrap();
+    let tool = session.acquire_build(fixture.want, 7).unwrap();
+    std::fs::write(fixture.executable(), b"changed after admission").unwrap();
+    let (mut sender, mut receiver) = aterm_uds::CtlStream::pair().unwrap();
+    assert!(tool.send_handoff(&mut sender).is_err());
+    drop(sender);
+    assert_eq!(receiver.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
 fn persistent_manifest_bytes_avoid_fetches_but_recheck_each_admission() {
     let mut fixture = Fixture::new(Prerequisite::Gitleaks);
     fixture.cache_source = Some("fixture:one".into());
@@ -896,6 +1088,7 @@ fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_dro
         Prerequisite::Lake,
         Prerequisite::AtpkgKeys,
         Prerequisite::Ay,
+        Prerequisite::Codex,
     ] {
         let fixture = Fixture::new(want);
         let session = fixture.session(TRIPLE).unwrap();
@@ -945,54 +1138,62 @@ fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_dro
 
 #[test]
 fn first_party_selected_and_named_leases_take_the_version_from_the_signed_package() {
-    let mut fixture = Fixture::new(Prerequisite::AtpkgKeys);
-    fixture.change_package("version=\"0.0.0\"", "version=\"0.1.0\"");
-    crate::store::mark_build_ready(&fixture.root).unwrap();
-    let session = fixture.session(TRIPLE).unwrap();
-    let selected = session.acquire(fixture.want).unwrap();
-    assert_eq!(selected.version(), "0.1.0");
-    assert_eq!(selected.program(), "atpkg-keys");
-    selected.validate().unwrap();
-    drop(selected);
-    let named = session.acquire_build(fixture.want, 7).unwrap();
-    assert_eq!(named.version(), "0.1.0");
-    assert_eq!(named.path(), fixture.executable().canonicalize().unwrap());
-    named.validate().unwrap();
+    for want in [Prerequisite::AtpkgKeys, Prerequisite::Codex] {
+        let mut fixture = Fixture::new(want);
+        fixture.change_package("version=\"0.0.0\"", "version=\"0.1.0\"");
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        let session = fixture.session(TRIPLE).unwrap();
+        let selected = session.acquire(fixture.want).unwrap();
+        assert_eq!(selected.version(), "0.1.0");
+        assert_eq!(selected.program(), want.program());
+        selected.validate().unwrap();
+        drop(selected);
+        let named = session.acquire_build(fixture.want, 7).unwrap();
+        assert_eq!(named.version(), "0.1.0");
+        assert_eq!(named.path(), fixture.executable().canonicalize().unwrap());
+        named.validate().unwrap();
+    }
 }
 
 #[test]
 fn first_party_admission_refuses_forged_identity_environment_target_and_payload() {
-    for case in [
-        "signature",
-        "program",
-        "command",
-        "environment",
-        "target",
-        "payload",
-    ] {
-        let mut fixture = Fixture::new(Prerequisite::AtpkgKeys);
-        crate::store::mark_build_ready(&fixture.root).unwrap();
-        match case {
-            "signature" => fixture.signature[0] ^= 1,
-            "program" => fixture.change_package("program=\"atpkg-keys\"", "program=\"different\""),
-            "command" => {
-                fixture.change_package("exposes=[\"atpkg-keys\"]", "exposes=[\"different\"]")
+    for want in [Prerequisite::AtpkgKeys, Prerequisite::Codex] {
+        for case in [
+            "signature",
+            "program",
+            "command",
+            "environment",
+            "target",
+            "payload",
+        ] {
+            let mut fixture = Fixture::new(want);
+            crate::store::mark_build_ready(&fixture.root).unwrap();
+            match case {
+                "signature" => fixture.signature[0] ^= 1,
+                "program" => fixture.change_package(
+                    &format!("program=\"{}\"", want.program()),
+                    "program=\"different\"",
+                ),
+                "command" => fixture.change_package(
+                    &format!("exposes=[\"{}\"]", want.executable()),
+                    "exposes=[\"different\"]",
+                ),
+                "environment" => fixture
+                    .change_package("exposes=[", "shim_env=[\"LEAN_CC=/usr/bin/cc\"]\nexposes=["),
+                "target" => fixture.change_package(TRIPLE, "x86_64-apple-darwin"),
+                "payload" => {
+                    std::fs::write(fixture.executable(), b"changed after signed publication")
+                        .unwrap()
+                }
+                _ => unreachable!(),
             }
-            "environment" => {
-                fixture.change_package("exposes=[", "shim_env=[\"LEAN_CC=/usr/bin/cc\"]\nexposes=[")
-            }
-            "target" => fixture.change_package(TRIPLE, "x86_64-apple-darwin"),
-            "payload" => {
-                std::fs::write(fixture.executable(), b"changed after signed publication").unwrap()
-            }
-            _ => unreachable!(),
+            let session = fixture.session(TRIPLE).unwrap();
+            assert!(session.acquire(fixture.want).is_err(), "selected {case}");
+            assert!(
+                session.acquire_build(fixture.want, 7).is_err(),
+                "named {case}"
+            );
         }
-        let session = fixture.session(TRIPLE).unwrap();
-        assert!(session.acquire(fixture.want).is_err(), "selected {case}");
-        assert!(
-            session.acquire_build(fixture.want, 7).is_err(),
-            "named {case}"
-        );
     }
 }
 

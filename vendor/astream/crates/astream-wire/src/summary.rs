@@ -264,7 +264,9 @@ impl Summary {
                     bucket.count = bucket.count.saturating_add(n);
                 }
             }
-            Err(at) => self.buckets.insert(at, Bucket { index, count: n }),
+            Err(_) => {
+                self.buckets = merge_buckets(&self.buckets, &[Bucket { index, count: n }]);
+            }
         }
     }
 
@@ -380,7 +382,7 @@ impl Summary {
     /// The canonical encoding (module docs).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.encoded_len());
+        let mut out = Vec::with_capacity(self.encoded_len().min(MAX_SUMMARY_LEN));
         self.encode_into(&mut out);
         out
     }
@@ -581,7 +583,7 @@ impl Summary {
 
 /// The sorted union of two bucket lists, adding counts of shared indices.
 fn merge_buckets(a: &[Bucket], b: &[Bucket]) -> Vec<Bucket> {
-    let mut out = Vec::with_capacity(a.len().saturating_add(b.len()));
+    let mut out = Vec::with_capacity(a.len().saturating_add(b.len()).min(BUCKET_COUNT as usize));
     let mut a = a.iter().peekable();
     let mut b = b.iter().peekable();
     loop {
@@ -1240,11 +1242,14 @@ impl Rollup {
         let mut removed = 0usize;
         for by_len in self.rows.values_mut() {
             if let Some(by_start) = by_len.get_mut(&grain) {
-                let kept = by_start.split_off(&first_kept);
-                for by_origin in by_start.values() {
-                    removed = removed.saturating_add(by_origin.len());
-                }
-                *by_start = kept;
+                by_start.retain(|&start, by_origin| {
+                    if start >= first_kept {
+                        true
+                    } else {
+                        removed = removed.saturating_add(by_origin.len());
+                        false
+                    }
+                });
                 if by_start.is_empty() {
                     by_len.remove(&grain);
                 }
@@ -1567,10 +1572,13 @@ impl<'a> Reader<'a> {
             let b = self.byte()?;
             let group = u128::from(b & 0x7f);
             let room = bits.saturating_sub(shift);
-            if room < 7 && group >> room != 0 {
+            if room < 7 && group.checked_shr(room).unwrap_or(0) != 0 {
                 return Err(DecodeError::VarintOverflow);
             }
-            value |= group << shift;
+            let Some(shifted) = group.checked_shl(shift) else {
+                return Err(DecodeError::VarintOverflow);
+            };
+            value |= shifted;
             if b & 0x80 == 0 {
                 if b == 0 && shift > 0 {
                     return Err(DecodeError::NonMinimalVarint);

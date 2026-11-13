@@ -213,8 +213,8 @@ fn a_child_that_cannot_start_names_auth_add() {
     assert!(!Dirs::under(root.path()).config_file().exists());
 }
 
-/// Owner ruling 2026-10-26 (a): an agent imports as a person does, so neither a stderr that
-/// is no terminal nor a terminal stdin stops the import.
+/// An agent imports as a person does, so neither a stderr that is no terminal nor a terminal
+/// stdin stops the import.
 #[test]
 fn import_runs_without_a_terminal() {
     for stdin_terminal in [false, true] {

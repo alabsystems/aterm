@@ -1,26 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Parallel replay pool bounded by `RUST_TEST_THREADS` or machine parallelism.
+//! Parallel replay pool bounded by the cores this process may use (`aterm_cores`): a test's
+//! grant from the verifier, else the machine's parallelism.
 
 /// Evaluates `f` across `items` on a bounded thread pool and returns results in order.
 #[inline]
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let configured = match std::env::var("RUST_TEST_THREADS") {
-        Ok(v) if !v.trim().starts_with('+') => match v.trim().parse::<usize>() {
-            Ok(n) if n > 0 => Some(n),
-            _ => None,
-        },
-        _ => None,
-    };
-    let threads = match configured {
-        Some(n) => n,
-        None => match std::thread::available_parallelism() {
-            Ok(n) => n.get(),
-            Err(_) => 4,
-        },
+    let threads = match aterm_cores::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(_) => 4,
     }
     .min(items.len());
     let next = AtomicUsize::new(0);

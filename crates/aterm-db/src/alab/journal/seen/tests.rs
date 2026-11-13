@@ -329,12 +329,50 @@ fn a_live_claim_is_a_use_and_a_lapsed_one_says_nothing() {
 
 /// A sighting states no sign-in word to the window's reader either, so one Mac's `ended` is not
 /// read as `in` by a later `seen`; a login that ended does state its word.
-/// NEGATIVE CONTROL: with `Kind::Seen` giving `in` in `event_state`, `` left: Some("in") right:
-/// None ``.
+/// NEGATIVE CONTROL: with `Kind::Seen` giving `in` in `Event::signin`, `` left: Some("in")
+/// right: None ``.
 #[test]
 fn a_sighting_states_no_sign_in_word() {
     let ann = account("ann@example.test");
-    assert_eq!(event_state(&ev(1, Kind::Seen, ann)), None);
-    assert_eq!(event_state(&ev(1, Kind::LoginEnded, ann)), Some("ended"));
-    assert_eq!(event_state(&ev(1, Kind::SignedIn, ann)), Some("in"));
+    assert_eq!(ev(1, Kind::Seen, ann).signin(), None);
+    assert_eq!(ev(1, Kind::LoginEnded, ann).signin(), Some("ended"));
+    assert_eq!(ev(1, Kind::SignedIn, ann).signin(), Some("in"));
+}
+
+/// What a peer reads of a Mac's published sign-in words: `auth` saying `ok` (a login that reads
+/// working again, as a Mac states its standing word) is `in` over an older `signed-out`; `auth`
+/// saying `unseen` withdraws the Mac's word, so the account has none there, and neither an older
+/// event read after it nor that Mac's older `use` row restores one; a later sign-in does. An
+/// `auth` with any other reason states nothing.
+/// NEGATIVE CONTROLS: with the `Kind::Auth` arm of `Event::signin` removed, the heal is not
+/// heard: `` left: Some("out") right: Some("in") ``; with `drop_withdrawn` not called, the
+/// withdrawn word is given to readers: `` left: Some("unknown") right: None ``.
+#[test]
+fn an_auth_word_heals_and_withdraws_a_macs_sign_in_word() {
+    const MAC: &str = "000000000000000000000000000000aa";
+    let ann = account("ann@example.test");
+    let auth = |t, why: &str| Event {
+        why: Word::new(why),
+        ..ev(t, Kind::Auth, ann)
+    };
+    let word = |events: &[Event], uses: &[(Pk, Value)]| {
+        Seen::of_published(MAC, events, uses, 1_000)
+            .signins
+            .get(ann.as_str())
+            .and_then(|by_mac| by_mac.get(MAC))
+            .map(|signed| signed.state)
+    };
+    let out = ev(100, Kind::SignedOut, ann);
+    assert_eq!(word(&[out, auth(200, "ok")], &[]), Some("in"), "healed");
+    assert_eq!(word(&[out, auth(200, "epoch")], &[]), Some("out"));
+    // The batch a peer reads is in event order, and a week's tables come in any order.
+    let healed = ev(150, Kind::SignedIn, ann);
+    assert_eq!(word(&[auth(200, "unseen"), out, healed], &[]), None);
+    let stale = aterm_json::json!({"signin": {"state": "in", "t": 150, "cli": "claude"}});
+    assert_eq!(word(&[out, auth(200, "unseen")], &[(ann, stale)]), None);
+    assert_eq!(
+        word(&[auth(200, "unseen"), ev(300, Kind::Renewed, ann)], &[]),
+        Some("in"),
+        "a later sign-in is a word again"
+    );
 }

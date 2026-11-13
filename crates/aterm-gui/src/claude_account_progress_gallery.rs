@@ -559,6 +559,7 @@ fn account_progress_gallery() {
             independent_work: Vec::new(),
             next_at,
             own_claim: None,
+            stay: None,
         };
         if name.contains("independent-") {
             progress
@@ -838,7 +839,7 @@ fn account_progress_gallery() {
                     })
                     .into(),
             };
-            let (mut accounts, _) = crate::fact_menu::account_menu_rows_from(
+            let mut accounts = crate::fact_menu::account_menu_rows_from(
                 &roster,
                 &Default::default(),
                 &Default::default(),
@@ -856,7 +857,7 @@ fn account_progress_gallery() {
             let facts = crate::fact_menu::FactMenuFacts {
                 account_progress: menu_progress,
                 title: if name.contains("newest-short") {
-                    "Accounts · tab 1".into()
+                    "Account · tab 1".into()
                 } else {
                     String::new()
                 },
@@ -866,7 +867,6 @@ fn account_progress_gallery() {
                     0
                 },
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
-                pool_unpinned: true,
                 accounts,
                 accounts_refused: if recheck_unavailable {
                     Some(detail.into())
@@ -1228,6 +1228,7 @@ fn network_history_gallery() {
             reachability: Reachability::Reachable,
             instances: None,
             samples: Vec::new(),
+            lease_ms: None,
         });
         let repair_scene = name.contains("-repair-");
         if repair_scene {

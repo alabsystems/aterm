@@ -108,6 +108,9 @@ unsafe extern "system" {
         exe_name: *mut u16,
         size: *mut u32,
     ) -> i32;
+    /// The I/O `process` has done since it started (`winbase.h`): operation and byte counts of
+    /// its reads, its writes and its other requests, through files, pipes and sockets alike.
+    fn GetProcessIoCounters(process: Handle, io_counters: *mut IoCounters) -> i32;
     /// Creation, exit, kernel and user times of `process` (`processthreadsapi.h`), each a
     /// 4-byte-aligned `FILETIME` (`exit_time` is undefined until the process exits).
     fn GetProcessTimes(
@@ -784,6 +787,34 @@ fn process_times(h: BorrowedHandle<'_>) -> Option<(u64, u64, u64)> {
     (ok != 0).then(|| (creation.ticks(), kernel.ticks(), user.ticks()))
 }
 
+/// `IO_COUNTERS` (`winnt.h`): six 64-bit counts.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct IoCounters {
+    /// `ReadOperationCount`.
+    read_operations: u64,
+    /// `WriteOperationCount`.
+    write_operations: u64,
+    /// `OtherOperationCount`.
+    _other_operations: u64,
+    /// `ReadTransferCount`, bytes.
+    read_bytes: u64,
+    /// `WriteTransferCount`, bytes.
+    write_bytes: u64,
+    /// `OtherTransferCount`, bytes.
+    _other_bytes: u64,
+}
+const _: () = assert!(std::mem::size_of::<IoCounters>() == 48);
+
+/// `h`'s I/O counts (`GetProcessIoCounters`), or `None`.
+fn io_counters(h: BorrowedHandle<'_>) -> Option<IoCounters> {
+    let mut io = IoCounters::default();
+    // SAFETY: `h` is a live process handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`;
+    // `io` is a writable `IO_COUNTERS`.
+    let ok = unsafe { GetProcessIoCounters(h.as_raw_handle(), &raw mut io) };
+    (ok != 0).then_some(io)
+}
+
 /// `PROCESS_BASIC_INFORMATION` of `h` (`NtQueryInformationProcess`, class 0), or `None`.
 fn basic_info(h: BorrowedHandle<'_>) -> Option<ProcessBasicInformation> {
     let mut info = ProcessBasicInformation::default();
@@ -812,6 +843,10 @@ pub(crate) fn basic_peb(h: BorrowedHandle<'_>) -> Option<u64> {
 /// [`crate::jobs::JobsReader`]'s reading of `pid` on Windows: creation `FILETIME`, CPU time,
 /// parent pid (zeroed when a younger process holds the parent's pid, as [`crate::windows::processes`]
 /// clears it), image name, and whether its handle is signalled (`Zombie`), all from one handle.
+/// Its I/O counts stand where the Unix arms read theirs: the read and write operations as the
+/// calls made (Linux counts the same family), the bytes written as the logical writes, and the
+/// bytes read and written as the disk's (Windows counts a pipe's and a socket's with a file's, as
+/// the sweep does), so the stuck engine sees a process that only reads or writes as working.
 pub(crate) fn job_facts(pid: u32) -> Option<crate::jobs::ProcFacts> {
     if pid == 0 {
         return None;
@@ -841,6 +876,7 @@ pub(crate) fn job_facts(pid: u32) -> Option<crate::jobs::ProcFacts> {
         .clone()
         .map_or_else(String::new, crate::windows::short_image_name);
     let cpu_ns = user_ticks.saturating_add(kernel_ticks).saturating_mul(100);
+    let io = io_counters(h);
     Some(crate::jobs::ProcFacts {
         pid,
         ppid,
@@ -854,6 +890,10 @@ pub(crate) fn job_facts(pid: u32) -> Option<crate::jobs::ProcFacts> {
         },
         counters: Some(crate::jobs::Counters {
             cpu_ns,
+            syscalls: io.map(|io| io.read_operations.saturating_add(io.write_operations)),
+            disk_read: io.map(|io| io.read_bytes),
+            disk_written: io.map(|io| io.write_bytes),
+            logical_writes: io.map(|io| io.write_bytes),
             ..crate::jobs::Counters::default()
         }),
         ..crate::jobs::ProcFacts::default()

@@ -66,8 +66,14 @@ pub(super) fn bind(child: &Worker) -> Result<Identity> {
     Ok(lineage.identity)
 }
 
+/// Whether `group` is shown empty: two whole listings in a row with no member, as a Linux walk of
+/// `/proc` is no snapshot (a fork in flight can be missed by one listing whose forker then exits;
+/// `procfs::chased_group_of`), which such a relay would have to outrun twice.
 pub(super) fn empty_group(group: u32) -> bool {
-    process::group_members(group).is_some_and(|members| members.complete && members.pids.is_empty())
+    (0..2).all(|_| {
+        process::group_members(group)
+            .is_some_and(|members| members.complete && members.pids.is_empty())
+    })
 }
 
 pub(super) fn run(

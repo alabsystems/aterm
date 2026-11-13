@@ -1088,6 +1088,28 @@ fn observed_signed_in_beats_catalog_pending() {
     assert_eq!(rows[0]["status"], json!("pending"));
 }
 
+/// A held account a Mac runs keeps the owner's word first and says the Mac runs it: a paused,
+/// broken or banned row is never shown as plainly signed in (which reads as usable), nor as its
+/// hold alone (which hides that a Mac runs it anyway). An active one is left as it is.
+/// NEGATIVE CONTROLS: with `shown_seen` leaving a held status alone (as before), `` left:
+/// "paused" right: "paused · signed in on m65 (cheetah)" ``; with every status replaced, the
+/// active row reads `` left: "signed in · on m65 (cheetah)" right: "active" ``.
+#[test]
+fn a_held_account_a_mac_runs_keeps_its_hold_and_says_so() {
+    let seen = seen_on(&fleet(), &[], &named, NOW);
+    for hold in ["paused", "broken", "banned"] {
+        let mut rows = vec![json!({"ac": UNICORN, "status": hold})];
+        shown_seen(&mut rows, &seen, NOW);
+        assert_eq!(
+            rows[0]["status"],
+            json!(format!("{hold} \u{b7} signed in on m65 (cheetah)"))
+        );
+    }
+    let mut rows = vec![json!({"ac": UNICORN, "status": "active"})];
+    shown_seen(&mut rows, &seen, NOW);
+    assert_eq!(rows[0]["status"], json!("active"));
+}
+
 fn heard(uuid: &str, account: &str, tab: &str, t_ms: u64, ended: bool) -> Heard {
     Heard {
         uuid: uuid.to_owned(),

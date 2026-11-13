@@ -2,16 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! `outlook-captures` ([`cmd_outlook_captures`]): the accounts outlook as the window draws it
-//! (`docs/DESIGN-accounts-outlook-2026-10-25.md` §11, *Lab captures*). One private headless
+//! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`). One private headless
 //! instance per scene, look and scale, its HOME seeded with synthetic identities only
 //! (`me@example.test`, `alt1`, `alt2`, `pool1`): a Claude Code profile, the roster, the accounts
 //! store and `me`'s series ([`seed`]). Its one tab runs the lab's `claude` fixture
 //! ([`crate::fleet_fixture::claude`], by a link of that name), so the footer reads the profile it
-//! was seeded with. Each scene's footer is shot at the three widths of §2.4, and the Accounts card
-//! of the covered, gap and never-read scenes and of the glass's case (c) (J) at 60 and 44 cells
-//! ([`CARD_SCENES`]); beside each png the card's rows (`controls fact-menu`) and a
-//! `manifest-<tag>.tsv` row. `--aterm` points the same seeds at another build (main's, for the
-//! shots side by side).
+//! was seeded with. Each scene's footer is shot at the three widths of §2.4, and the Account card
+//! of the covered, gap, never-read, no-pace and no-figure scenes, of the glass's case (c) (J) and
+//! of the two card scenes L and M at 60 and 44 cells ([`CARD_SCENES`]); beside each png the
+//! card's rows (`controls fact-menu`) and a `manifest-<tag>.tsv` row. `--aterm` points the same
+//! seeds at another build (main's, for the shots side by side).
+//!
+//! L and M are the card's own scenes, the two a Mac in a lab shows and no other scene seeds: a
+//! pool file (`~/.secrets/ai-pool.toml`) that gives each account its home Mac and names this Mac
+//! `m20`, and a scratch vault this lab process serves on loopback with the instance's home
+//! seated in it ([`crate::setup_token_lab::seat_scratch_vault`]). L's tab runs on a login no
+//! roster row names, whose home is another Mac and for which the vault holds no token; M's runs
+//! on a pool row whose home is this Mac and for which the vault holds a verified lab token
+//! ([`crate::stub::labelled_oauth_token`], no credential anywhere).
 //!
 //! Scenes I, J and K are the harness glass's cases (b), (c) and (d)
 //! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1, §6 S5, §7), under Cruise, their
@@ -19,18 +27,17 @@
 //! (`<aterm> harness tap`) as its statusLine, which the fixture runs with `main`'s seeded figures
 //! as its payload's `rate_limits` ([`crate::fleet_fixture::RATE_LIMITS`]) and prints under its
 //! bottom rule, so line E is the quota row the window draws over the tap's words; every glass
-//! scene's reading is this Mac's, so each account's lane holds it. J's card is case (c)'s on the
-//! rainbow's palette (the design's §1.4): its work row's projected line, `→` hand-offs, the names
-//! after them and `╳`, and the lanes' out lines `🭷`, beside the midnights' ticks. The scenes A to
-//! H run no statusLine: their line D carries the account unit as the fallback, and their cards
-//! are Autopilot Off's.
+//! scene's reading is this Mac's, so the outlook holds it. J's card is a tab aterm can switch:
+//! its `Forecast` row is the outlook's projection for the tab's account (the design's §1.4). The
+//! scenes A to H run no statusLine: their line D carries the account unit as the fallback, and
+//! their cards are Autopilot Off's, whose `Forecast` row says there is none and why.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::accounts::{self, Class, TapRead, WindowFig, WindowRead};
 use aterm_agent::harness::tap;
-use aterm_agent::harness::{account_progress, account_series};
+use aterm_agent::harness::{account_series, outlook};
 
 use crate::band::Band;
 use crate::instance::{
@@ -45,20 +52,25 @@ const D: i64 = 86_400;
 /// The scenes of §2.4: A covered, B a gap, C an alt never read, D a 5-hour stop, E no pace yet,
 /// F walled, G an aged figure, H no figure; and the glass design's line E: I one account out
 /// before its reset (case (b)), J three accounts whose work moves then waits (case (c)), K no
-/// figure yet (case (d)).
-pub const SCENES: [char; 11] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+/// figure yet (case (d)). And the Account card's own: L a login outside this Mac's pool whose
+/// home is another Mac, M a pool account with a vault token whose home is this Mac.
+pub const SCENES: [char; 13] = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+];
 
-/// The scenes whose Accounts card is shot: covered, a gap, an alt never read (§8.2), and the glass
-/// design's case (c) under Cruise (J), whose card draws on the rainbow's palette what the grey
-/// cards of Autopilot Off never do beside a midnight's tick: the projected line, `→` hand-offs
-/// and the names after them, `╳`, and each lane's out line `🭷` (its §1.4).
-pub const CARD_SCENES: [char; 4] = ['A', 'B', 'C', 'J'];
+/// The scenes whose Account card is shot: covered, a gap, an alt never read (§8.2), no pace yet,
+/// no figure and no history (H), the glass design's case (c) under Cruise (J), the one card here
+/// whose tab aterm can switch, so the one whose `Forecast` row holds a projection (its §1.4),
+/// and the card's own two (L, M).
+pub const CARD_SCENES: [char; 8] = ['A', 'B', 'C', 'E', 'H', 'J', 'L', 'M'];
 
 /// The footer's three widths of §2.4, as pane columns.
 pub const WIDTHS: [(&str, u16); 3] = [("wide", 170), ("medium", 100), ("narrow", 70)];
 
-/// The card's two widths (§8.4): 60 cells beside its drawn rows, and 44, as pane columns.
-pub const CARD_WIDTHS: [(&str, u16); 2] = [("card60", 100), ("card44", 48)];
+/// The card's two widths (§8.4): 60 cells beside its drawn rows, and 44, as pane columns. The
+/// narrow pane is the card's 44 cells and its border, no more: a card with a chart takes every
+/// cell a pane has up to 60, so a wider pane would shoot it at more than 44.
+pub const CARD_WIDTHS: [(&str, u16); 2] = [("card60", 100), ("card44", 46)];
 
 /// The pane's rows.
 const LINES: u16 = 40;
@@ -123,12 +135,78 @@ pub struct Plan {
     read_here: bool,
     /// The Autopilot mode the instance runs under.
     autopilot: &'static str,
+    /// The tab's login is in no roster row: the profile in the default home names `me`, and
+    /// the roster's first row, the default home's, names another account. The footer shows a
+    /// default home's profile by its own address whatever its row expects, so the card is of
+    /// an account outside this Mac's pool.
+    outside: bool,
+    /// The pool file: the lab name of the home Mac of the tab's account ([`THIS_MAC`] for this
+    /// one), every other row's home this Mac; or no pool file, as on a Mac in no lab.
+    home: Option<&'static str>,
+    /// The scratch vault the instance's home is seated in, or none.
+    vault: Option<Vault>,
 }
 
+/// What a scene's scratch vault holds for the tab's account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vault {
+    /// No token.
+    Empty,
+    /// A verified lab token, made on this Mac.
+    Token,
+}
+
+/// The lab name the card scenes' store and pool file give this Mac.
+const THIS_MAC: &str = "m20";
+
 impl Plan {
-    /// This Mac's own login: the roster's first row.
+    /// This Mac's own login: the roster's first row, or `me` where no row names it.
     fn own(&self) -> &'static str {
+        if self.outside {
+            return "me";
+        }
+        self.default_row()
+    }
+
+    /// The row of the default home, which has no folder of its own: the roster's first.
+    fn default_row(&self) -> &'static str {
         self.rows.first().map_or("me", |row| row.0)
+    }
+
+    /// The address the roster gives the row `label`: the profile's for the own login's row;
+    /// in a card scene with a pool file each other row its own too (an account is named by its
+    /// address, and the pool file lists an account by it), elsewhere none.
+    fn email_of(&self, label: &str) -> Option<String> {
+        if label == self.own() {
+            Some(ME_EMAIL.into())
+        } else {
+            self.home.map(|_| format!("{label}@example.test"))
+        }
+    }
+
+    /// The pool file's text at `now`, where the scene has one: the tab's account at its home
+    /// since 40 days (set on the accounts sheet where that is another Mac, assigned where it
+    /// is this one), each other row assigned to this Mac since 30.
+    fn pool_file(&self, now: i64) -> Option<String> {
+        let home = self.home?;
+        let stamp = |ago: i64| crate::util::utc_iso(now - ago);
+        let account = |email: &str, mac: &str, why: &str, since: i64| {
+            let used = stamp(D);
+            format!(
+                "\n[[account]]\nprovider = \"claude\"\nemail = \"{email}\"\nwarm = [\"{mac}\"]\n\
+                 since = [\"{}\"]\nwhy = [\"{why}\"]\nused = [\"{}\"]\n",
+                stamp(since),
+                &used[..10]
+            )
+        };
+        let why = if home == THIS_MAC { "fill" } else { "pin" };
+        let mut text = String::from("version = 1\n");
+        text.push_str(&account(ME_EMAIL, home, why, 40 * D));
+        for (label, _) in self.rows.iter().filter(|row| row.0 != self.own()) {
+            let email = self.email_of(label).unwrap_or_default();
+            text.push_str(&account(&email, THIS_MAC, "fill", 30 * D));
+        }
+        Some(text)
     }
 
     /// The own login's seen figures.
@@ -329,6 +407,28 @@ pub fn plan(scene: char) -> Plan {
             profile: Some((75, 20, 0)),
             ..tapped()
         },
+        'L' => Plan {
+            rows: vec![
+                ("alt1", Class::Preferred),
+                ("alt2", Class::Preferred),
+                ("pool1", Class::Pool),
+            ],
+            seen: vec![("alt1", alt1(120))],
+            profile: Some((16, 3, 0)),
+            outside: true,
+            home: Some("m15"),
+            vault: Some(Vault::Empty),
+            ..untapped()
+        },
+        'M' => Plan {
+            rows: vec![("me", Class::Preferred), ("alt1", Class::Preferred)],
+            seen: vec![("me", me(390, 600, 0)), ("alt1", alt1(120))],
+            series: week_of_work(),
+            profile: Some((39, 60, 0)),
+            home: Some(THIS_MAC),
+            vault: Some(Vault::Token),
+            ..untapped()
+        },
         _ => Plan {
             rows: vec![("main", Class::Preferred)],
             seen: Vec::new(),
@@ -337,6 +437,31 @@ pub fn plan(scene: char) -> Plan {
             ..tapped()
         },
     }
+}
+
+/// Scene M's series: `me`'s week as eight days of work read it, a reading every two hours of
+/// each working day. The week before ran to 97% used, 3 d 10 h 30 min ago it began again
+/// (`me`'s week resets [`ME_WEEK`] on, so it began a week before that), and this one stands at
+/// 39% now.
+fn week_of_work() -> Vec<(i64, u32)> {
+    let began = ME_WEEK - 7 * D;
+    let mut out = Vec::new();
+    // The hours of the eight days back, oldest first.
+    for ago in (0..=8 * 24).rev().step_by(2) {
+        let at = -(ago * H);
+        // Nothing is read overnight: eight of every twenty-four hours.
+        if (ago / 2) % 12 >= 8 {
+            continue;
+        }
+        let pct_x10 = if at < began {
+            // The week before: from 55% eight days back to 97% at its end.
+            970 - u32::try_from((began - at) * 420 / (8 * D + began)).unwrap_or(0)
+        } else {
+            390 - u32::try_from(-at * 390 / -began).unwrap_or(0)
+        };
+        out.push((at, pct_x10));
+    }
+    out
 }
 
 /// The rest of a plan of the scenes A to H: `me`'s plan rows, no statusLine, Autopilot off.
@@ -350,6 +475,9 @@ fn untapped() -> Plan {
         tapped: false,
         read_here: false,
         autopilot: "off",
+        outside: false,
+        home: None,
+        vault: None,
     }
 }
 
@@ -413,9 +541,10 @@ fn profile(plan: &Plan, now: i64) -> String {
 
 /// Seed `world` for `plan` at `now`: the profile in its HOME, the roster beside its
 /// `aterm.toml`, a placeholder file in each other login's folder, the store's readings with the
-/// own login active, its series (and, where every reading is this Mac's, each other login's
-/// week as its series row), the plan rows and, where the fixture runs the tap, its statusLine
-/// payload's `rate_limits`. Nothing outside `world` is written.
+/// default home's row active, the own login's series (and, where every
+/// reading is this Mac's, each other login's week as its series row), the plan rows, where the
+/// fixture runs the tap its statusLine payload's `rate_limits`, and where the scene has a pool
+/// file that file and this Mac's lab name in the store. Nothing outside `world` is written.
 /// # Errors
 /// A file could not be written, or the store refused a reading.
 pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
@@ -432,7 +561,7 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     }
     let mut rows = Vec::new();
     for &(label, class) in &plan.rows {
-        let dir = (label != own).then(|| world.home.join("logins").join(label));
+        let dir = (label != plan.default_row()).then(|| world.home.join("logins").join(label));
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).map_err(|e| io(label, e))?;
             crate::util::write_fresh(&dir.join("a-login-file"), "{}").map_err(|e| io(label, e))?;
@@ -443,7 +572,7 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
             dir: dir.map(|d| d.to_string_lossy().into_owned()),
             // The own login names the profile's address, so the footer's gate reads its profile
             // under a roster of several rows.
-            email: (label == own).then(|| ME_EMAIL.into()),
+            email: plan.email_of(label),
             ..accounts::Row::default()
         });
     }
@@ -454,7 +583,19 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     std::fs::create_dir_all(&state_dir).map_err(|e| io("state", e))?;
     let store = accounts::Store::at(&state_dir);
     let (mut state, _) = store.load(now)?;
-    state.active = Some(own.into());
+    // The store believes the default home runs its row, whatever login the profile names.
+    state.active = Some(plan.default_row().into());
+    if let Some(text) = plan.pool_file(now) {
+        // The pool file names Macs by their lab names; the store says which is this one.
+        state.swarm_label = Some(THIS_MAC.into());
+        let secrets = world.home.join(".secrets");
+        crate::util::create_private_dir_all(&secrets).map_err(|e| io("pool file", e))?;
+        crate::util::write_fresh(
+            &secrets.join(aterm_agent::harness::ai_pool::AI_POOL_FILE),
+            text,
+        )
+        .map_err(|e| io("pool file", e))?;
+    }
     let window = |seen: Option<(u32, i64, i64)>| {
         seen.map(|(pct_x10, reset, _)| WindowRead {
             pct_x10,
@@ -483,10 +624,14 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     store.save(&state).map_err(|e| io("store", e))?;
     for &(offset, pct_x10) in &plan.series {
         let at = now + offset;
-        let reset = plan
+        let mut reset = plan
             .own_seen()
             .and_then(|s| s.week)
             .map_or(now + ME_WEEK, |(_, reset, _)| now + reset);
+        // A reading from before this week began is of the week that reset then.
+        while at < reset - 7 * D {
+            reset -= 7 * D;
+        }
         let fig = WindowFig {
             pct_x10,
             reset,
@@ -564,15 +709,17 @@ struct Opts {
 
 const HELP: &str =
     "usage: targo --unverified lab outlook-captures --out DIR [--aterm ATERM] [--tag NAME]
-       [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
+       [--scenes ABCDEFGHIJKLM] [--look day|night|both] [--scale 1|2|both]
 
 The accounts outlook on a private headless instance per scene, look and scale, seeded with
-synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B, C and J scenes'
-Accounts card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E (its cases
-(b), (c) and (d), under Cruise): the fixture runs the build's usage tap as its statusLine and
-prints its row under the bottom rule, which the glass takes over. J's card is case (c)'s on the
-Cruise palette: the work row's projected line, its hand-offs, names and gap, and the lanes' out
-lines, beside the midnights' ticks. Writes
+synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B, C, E, H, J, L
+and M scenes' Account card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E
+(its cases (b), (c) and (d), under Cruise): the fixture runs the build's usage tap as its
+statusLine and prints its row under the bottom rule, which the glass takes over. J's card is the
+one whose tab aterm can switch: its Forecast row holds the projection. L and M are the card's
+own: a pool file gives each account its home Mac and a scratch vault served on loopback seats
+the instance's home; L's tab runs on a login outside the roster whose home is another Mac and
+which has no vault token, M's on a pool account at home here with a verified lab token. Writes
 outlook-<tag>-<scene>-<width>-<look>-<scale>x.png, the card's rows beside each card png, and
 manifest-<tag>.tsv.
 ";
@@ -662,6 +809,101 @@ struct Lab {
     world: World,
     /// The fixture runs the usage tap as its statusLine ([`Plan::tapped`]).
     tapped: bool,
+    /// The scratch vault's server, where the scene has a vault: it runs while the instance
+    /// does, which reads the vault through it.
+    _vault: Option<aterm_secrets::server::Running>,
+}
+
+/// How long a vault write may take: a hang detector, not a budget.
+#[cfg(debug_assertions)]
+const VAULT: Duration = Duration::from_secs(60);
+
+/// Seat `world`'s home in a scratch vault this process serves ([`Plan::vault`]) and, where the
+/// scene holds a token, write the tab's account a lab token there and verify it as the Mac
+/// that made it: the account keyed as the harness keys it, the token the stub's labelled one
+/// (no credential anywhere), its end a year on.
+/// A debug lab image only, as `setup-token-lab` is: the scratch vault and the account's key are
+/// made through seams no release build has.
+/// # Errors
+/// The vault could not be made or seated, the account could not be keyed, or a write was
+/// refused.
+#[cfg(debug_assertions)]
+fn seat(world: &World, holds: Vault, now: i64) -> Result<aterm_secrets::server::Running, Fail> {
+    use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Meta, Verified};
+    use aterm_secrets::client::{MemberWritten, OnBusy};
+    let die = |what: &str, why: &dyn std::fmt::Display| {
+        Fail::die(format!("outlook-captures: {what}: {why}"))
+    };
+    let (vault, server) =
+        crate::setup_token_lab::seat_scratch_vault(&world.dir.join("vault-server"), &world.home)
+            .map_err(|why| die("the scratch vault", &why))?;
+    if holds == Vault::Empty {
+        return Ok(server);
+    }
+    let key = aterm_agent::harness::journal::with_keyer(
+        |realm, email| aterm_db::typed::keys::account_pk(realm, email).ok(),
+        || aterm_agent::harness::journal::claude_email_key(ME_EMAIL),
+    )
+    .and_then(|key| Key::parse(key.as_str()))
+    .ok_or_else(|| die("the token", &"the account cannot be keyed"))?;
+    let at = u64::try_from(now).unwrap_or(0);
+    let here = claude_token::seat_here(&vault)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "lab-mac".to_owned());
+    let meta = Meta {
+        email: ME_EMAIL.into(),
+        account_id: String::new(),
+        minted_at: at.saturating_sub(20 * 86_400),
+        expires_at: at + 345 * 86_400,
+        expiry_from: ExpiryFrom::Printed,
+        minted_on: here.clone(),
+        cli: "2.1.318".into(),
+        verified: None,
+    };
+    let wrote = |written: aterm_secrets::Result<MemberWritten>, what: &str| match written {
+        Ok(MemberWritten::Refused(why)) => Err(die(what, &why)),
+        Ok(MemberWritten::Busy) => Err(die(what, &"the vault is busy")),
+        Ok(_) => Ok(()),
+        Err(why) => Err(die(what, &why)),
+    };
+    let busy = || OnBusy::Refuse(Instant::now() + VAULT);
+    wrote(
+        claude_token::write(
+            &vault,
+            &key,
+            &aterm_secrets::SecretBytes::from(crate::stub::labelled_oauth_token("capture")),
+            &meta,
+            busy(),
+        ),
+        "the token's write",
+    )?;
+    wrote(
+        claude_token::verify(
+            &vault,
+            &key,
+            Verified {
+                on: here,
+                at: at.saturating_sub(19 * 86_400),
+                by: "windows".into(),
+                seven_day_resets_at: None,
+                five_hour_resets_at: None,
+            },
+            busy(),
+        ),
+        "the token's verification",
+    )?;
+    Ok(server)
+}
+
+/// A release lab image has no vault seam, so it shoots no scene that has a vault (L, M).
+/// # Errors
+/// Always: the scene needs a debug lab image.
+#[cfg(not(debug_assertions))]
+fn seat(_: &World, _: Vault, _: i64) -> Result<aterm_secrets::server::Running, Fail> {
+    Err(Fail::die(
+        "outlook-captures: scenes L and M need a debug lab image for the vault seam",
+    ))
 }
 
 /// The `--settings` value that names `aterm`'s usage tap as the fixture's statusLine, exactly as
@@ -698,6 +940,11 @@ fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result
     let config = with_harness_keys(&config, &[format!("autopilot = {:?}", plan.autopilot)]);
     let world = World::new(&config)?;
     let now = crate::util::now_secs();
+    // The vault first: it makes the home's `.secrets`, which the pool file then joins.
+    let vault = plan
+        .vault
+        .map(|holds| seat(&world, holds, now))
+        .transpose()?;
     seed(&world, &plan, now).map_err(Fail::die)?;
     let bin = world.dir.join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| Fail::die(format!("bin: {e}")))?;
@@ -736,6 +983,7 @@ fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result
         inst,
         world,
         tapped: plan.tapped,
+        _vault: vault,
     })
 }
 
@@ -856,20 +1104,99 @@ fn resize(inst: &Instance, (from, cols): (u16, u16), scratch: &Path) -> Result<(
     })
 }
 
-/// Whether `card`, the words of `controls fact-menu`, says the Accounts card is open on the
-/// account with its rows, as the outlook draws them: not while the pane's recovery observer is
-/// busy, a moment (until its next read, a second on) in which the card withdraws every
-/// projection and says so ([`account_progress::OBSERVER_BUSY_FINDING`]), which a capture of a
-/// scene's card is not.
-fn card_shown(card: &str) -> bool {
-    let head = card.lines().next().unwrap_or_default();
-    head.contains("open=true")
-        && head.contains("fact=account")
-        && !head.contains("rows=0")
-        && !card.contains(account_progress::OBSERVER_BUSY_FINDING)
+/// A row of the card as `controls fact-menu` words it, of the kinds a capture reads.
+#[derive(Debug, PartialEq, Eq)]
+enum CardLine {
+    /// A section's heading: its title.
+    Section(String),
+    /// A named fact: its name and its whole value, the rows it wraps over joined by a blank.
+    Fact(String, String),
 }
 
-/// Open the Accounts card and shoot it as `png` once it is drawn: `controls fact-menu` says it is
+/// The Rust-quoted string after `key=` in `line` (`text="a \"b\""`), unquoted. `None` where
+/// the line has no such field or its string does not close.
+fn quoted(line: &str, key: &str) -> Option<String> {
+    let from = line.find(&format!(" {key}=\""))? + key.len() + 3;
+    let mut out = String::new();
+    let mut chars = line[from..].chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'u' => {
+                    let hex: String = chars.by_ref().skip(1).take_while(|c| *c != '}').collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+}
+
+/// The sections and facts of `card`, the words of `controls fact-menu`, in the card's order. A
+/// fact's value that wraps is one fact here: a `fact` row with no name directly under a `fact`
+/// row continues it, and any other row (a `section` among them) ends it.
+fn card_lines(card: &str) -> Vec<CardLine> {
+    let mut out: Vec<CardLine> = Vec::new();
+    let mut open = false;
+    for line in card.lines() {
+        let kind = line
+            .strip_prefix("fact-menu ")
+            .and_then(|rest| rest.split(' ').next());
+        match kind {
+            Some("section") => {
+                out.extend(quoted(line, "text").map(CardLine::Section));
+                open = false;
+            }
+            Some("fact") => {
+                let (Some(label), Some(text)) = (quoted(line, "label"), quoted(line, "text"))
+                else {
+                    open = false;
+                    continue;
+                };
+                match out.last_mut() {
+                    Some(CardLine::Fact(_, value)) if open && label.is_empty() => {
+                        value.push(' ');
+                        value.push_str(&text);
+                    }
+                    _ => out.push(CardLine::Fact(label, text)),
+                }
+                open = true;
+            }
+            _ => open = false,
+        }
+    }
+    out
+}
+
+/// Whether `card`, the words of `controls fact-menu`, says the Account card is open on the
+/// account with its worker's answers: its `Token`, `Budget` and `Machine` facts are there, and
+/// `Machine` no longer says `not read yet`, which it says until the account reader's card
+/// arrives. Not while the pane's recovery observer is busy, a moment (until its next read, a
+/// second on) in which the `Forecast` fact says there is none for that reason
+/// ([`outlook::Refusal::ObserverBusy`]), which a capture of a scene's card is not.
+fn card_shown(card: &str) -> bool {
+    let head = card.lines().next().unwrap_or_default();
+    let lines = card_lines(card);
+    let fact = |name: &str| {
+        lines.iter().find_map(|line| match line {
+            CardLine::Fact(label, value) if label == name => Some(value.as_str()),
+            _ => None,
+        })
+    };
+    head.contains("open=true")
+        && head.contains("fact=account")
+        && fact("Token").is_some()
+        && fact("Budget").is_some()
+        && fact("Machine").is_some_and(|said| said != "not read yet")
+        && !fact("Forecast")
+            .is_some_and(|said| said.contains(&outlook::Refusal::ObserverBusy.words()))
+}
+
+/// Open the Account card and shoot it as `png` once it is drawn: `controls fact-menu` says it is
 /// shown ([`card_shown`]), the frame holds still, and its rows are the same after the shot as
 /// before it, so the png and the rows beside it are one card. Its controls text and the image
 /// verb's verdict line. [`SHOWN`] is a hang detector.
@@ -1382,244 +1709,5 @@ pub fn cmd_outlook_perf(args: &[String]) -> Res {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A full series ([`full_series`]) is shaped as a compaction leaves one, `day` rows and
-    /// hourly figures before the raw week, near [`account_series::BOUND_BYTES`] and within it;
-    /// and the memo's tails hold exactly what the report's whole read holds of it
-    /// ([`resolver_cost`]'s check). Control: a whole read that skips the outlook's view
-    /// (`outlook::series_of` without `account_series::outlook_view`) holds the `day` rows no tail
-    /// holds, and the check fails.
-    #[test]
-    fn a_full_series_is_near_the_bound_and_its_tails_read_what_the_whole_read_reads() {
-        let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
-        let now = 1_792_956_600;
-        seed(&world, &plan('A'), now).expect("seeded");
-        let roster = accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml"))
-            .expect("the roster");
-        let dir = harness_state(&world);
-        let (state, _) = accounts::Store::at(&dir).load(now).expect("the store");
-        full_series(&dir, &roster, &state, now).expect("grown");
-        for row in &roster.rows {
-            let path = account_series::path_of(&dir, &row.label, &state.machine).expect("a path");
-            let text = std::fs::read_to_string(&path).expect("a series");
-            let len = text.len() as u64;
-            assert!(
-                len <= account_series::BOUND_BYTES
-                    && len > account_series::BOUND_BYTES - 128 * 1024,
-                "{}: {len} bytes",
-                row.label
-            );
-            assert!(text.contains(r#""k":"day""#), "{}: day rows", row.label);
-        }
-        let cost = resolver_cost(2).expect("the tails' rows are the whole read's");
-        assert!(cost.contains("series rows"), "{cost}");
-    }
-
-    /// Every scene seeds its own login first and as this Mac's own (`me`, `main` in the glass
-    /// scenes I to K), writes only inside its world, and C's `pool1` is never read; B's and C's
-    /// `alt1` stand at 92%. Control: A reads `pool1`.
-    #[test]
-    fn the_seeds_are_synthetic_and_stay_in_their_world() {
-        for scene in SCENES {
-            let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
-            let now = 1_792_956_600;
-            let plan = plan(scene);
-            let own = if scene < 'I' { "me" } else { "main" };
-            assert_eq!(plan.rows.first().map(|r| r.0), Some(own), "{scene}");
-            seed(&world, &plan, now).expect("seeded");
-            let profile = std::fs::read_to_string(world.home.join(".claude.json")).expect("read");
-            assert!(profile.contains(ME_EMAIL), "{scene}: {profile}");
-            let roster = std::fs::read_to_string(world.cfg.join("aterm").join("accounts.toml"))
-                .expect("read");
-            assert!(
-                roster.contains(ME_EMAIL) && roster.matches('@').count() == 1,
-                "{scene}: only me names an address: {roster}"
-            );
-            let (state, _) = accounts::Store::at(&harness_state(&world))
-                .load(now)
-                .expect("the store loads");
-            assert_eq!(state.active.as_deref(), Some(own));
-            let read = |label: &str| state.accounts.contains_key(label);
-            match scene {
-                'C' => assert!(!read("pool1"), "C: pool1 is never read"),
-                'A' => assert!(read("pool1"), "CONTROL: A reads pool1"),
-                'H' => assert!(!read("me"), "H: me has no figure"),
-                'K' => assert!(!read("main"), "K: main has no figure"),
-                _ => {}
-            }
-            if matches!(scene, 'B' | 'C') {
-                let alt1 = &state.accounts["alt1"];
-                let week = alt1.windows.get(accounts::WEEK_LIMIT).expect("a week");
-                assert_eq!(week.pct_x10, 920, "{scene}");
-            }
-        }
-    }
-
-    /// The outlook a window reads from `world` at `now`, on UTC, as its memo reads it
-    /// ([`resolver_cost`]'s reads): the roster, the store, the logins and the series.
-    fn outlook_of(world: &World, now: i64) -> aterm_agent::harness::outlook::Outlook {
-        use aterm_agent::harness::outlook;
-        let roster = accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml"))
-            .expect("the roster");
-        let dir = harness_state(world);
-        let store = accounts::Store::at(&dir);
-        let (state, _) = store.load(now).expect("the store");
-        let enrolled = accounts::enrolled(&roster);
-        let renewals = store
-            .load_logins(now)
-            .map(|(logins, _)| outlook::renewals_of(&roster, &logins))
-            .unwrap_or_default();
-        let series = outlook::series_of(&dir, &roster, &state.machine, now);
-        outlook::outlook(&outlook::Inputs {
-            roster: &roster,
-            state: &state,
-            enrolled: &enrolled,
-            series: &series,
-            renewals: &renewals,
-            mode: accounts::Mode::Early,
-            credits: false,
-            now,
-            offset: |_| 0,
-        })
-    }
-
-    /// SCENE J'S CARD IS CASE (C)'S, ITS MARKS BESIDE ITS TICKS: J is a card scene under Cruise,
-    /// and seeded at the glass design's now (aterm-agent's `quota_scenes::T5`) the outlook read
-    /// from its world lays the Accounts card at 60 and 44 cells row for row as
-    /// `quota_scenes::case_c` does (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4): a
-    /// work row with the projected line, `→` hand-offs, the names after them and `╳`, and three
-    /// lanes, each with its reading before `▕` and its out line `🭷`, every one with midnights'
-    /// ticks. NEGATIVE CONTROL: a seed that writes only the own login's series (as the scenes A
-    /// to H do) leaves `alt1`'s and `alt2`'s lanes with no reading, so their cards differ.
-    #[test]
-    fn scene_js_card_is_case_cs_its_marks_beside_its_ticks() {
-        use aterm_agent::harness::outlook::{CardInk, CardRow};
-        use aterm_agent::harness::quota_scenes;
-        use aterm_agent::harness::quota_view::{Cell, GAP_MARK, HANDOFF_MARK};
-        let plan = plan('J');
-        assert!(CARD_SCENES.contains(&'J') && plan.autopilot == "cruise");
-        let now = quota_scenes::T5;
-        let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
-        seed(&world, &plan, now).expect("seeded");
-        let ours = outlook_of(&world, now);
-        // The world's own row names the profile's address, and an account is named by its
-        // email (design §2.5, 2026-11-09), so case (c)'s own row names it too.
-        let mut case = quota_scenes::case_c();
-        case.roster.rows[0].email = Some(ME_EMAIL.into());
-        let case = case.outlook();
-        for room in [60, 44] {
-            let rows = ours.card_rows("main", None, true, room, None);
-            assert_eq!(
-                rows,
-                case.card_rows("main", None, true, room, None),
-                "{room}"
-            );
-            let (work, ticks) = rows
-                .iter()
-                .find_map(|row| match row {
-                    CardRow::Plot { cells, ticks, .. }
-                        if cells.iter().map(|c| c.0).take(4).eq("work".chars()) =>
-                    {
-                        Some((cells, ticks))
-                    }
-                    _ => None,
-                })
-                .expect("the work row");
-            let text: String = work.iter().map(|c| c.0).collect();
-            assert!(
-                [HANDOFF_MARK, GAP_MARK].iter().all(|m| text.contains(*m))
-                    && text.contains(&format!("{HANDOFF_MARK}me"))
-                    && text.contains("alt1")
-                    && work.iter().any(|c| c.1 == CardInk::Ahead)
-                    && !ticks.is_empty(),
-                "{room}: {text}"
-            );
-            let lanes: Vec<_> = rows
-                .iter()
-                .filter_map(|row| match row {
-                    CardRow::Account { lane, .. } => lane.as_ref(),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(lanes.len(), 3, "{room}");
-            for lane in lanes {
-                let text: String = lane.cells.iter().map(|c| c.0).collect();
-                assert!(
-                    lane.cells.iter().any(|c| c.1 == CardInk::Read)
-                        && lane.cells.contains(&(Cell::Out.glyph(), CardInk::Warn))
-                        && !lane.ticks.is_empty(),
-                    "{room}: {text}"
-                );
-            }
-        }
-    }
-
-    /// A CARD IS SHOT ONCE ITS OBSERVER HAS READ: `controls fact-menu`'s words of an open
-    /// Accounts card with rows say it is shown ([`card_shown`]); the same card while the pane's
-    /// recovery observer is busy, which withdraws its projection until the next read (the first
-    /// capture of J's card at 44 cells, Day, 1x, drew `┄` ahead under `Account observer is
-    /// busy`), does not, nor does a closed card, another fact's or one with no rows. NEGATIVE
-    /// CONTROL: the open card's head alone (all the capture once read) takes the busy card.
-    #[test]
-    fn a_card_is_shown_once_its_observer_has_read() {
-        let head = "fact-menu open=true session=s-1 fact=account rows=17 selected=7";
-        let shown = format!("{head}\nfact-menu plot index=5 text=\"work ▃▅▅▆▕🭶🭶→🭶→→╳→main\"\n");
-        let busy = format!(
-            "{head}\nfact-menu label index=4 text=\"{}\"\n",
-            account_progress::OBSERVER_BUSY_FINDING
-        );
-        assert!(card_shown(&shown), "{shown}");
-        assert!(!card_shown(&busy), "{busy}");
-        for not in [
-            "fact-menu open=false session=s-1 fact=account rows=17 selected=7",
-            "fact-menu open=true session=s-1 fact=model rows=4 selected=0",
-            "fact-menu open=true session=s-1 fact=account rows=0 selected=0",
-        ] {
-            assert!(!card_shown(not), "{not}");
-        }
-    }
-
-    /// The glass scenes' fixture hands its statusLine `main`'s week as the store holds it: the
-    /// tap's reading of the seeded payload ([`crate::fleet_fixture::status_payload`]) says the
-    /// store's figure and reset, so the tap's words, the lead and the chart agree (case (b) 63%,
-    /// case (c) 75%); case (d) seeds no `rate_limits`, so the tap says `week · no figure yet`.
-    /// NEGATIVE CONTROL: scene A, whose fixture runs no statusLine, seeds none either.
-    #[test]
-    fn the_tapped_scenes_hand_the_tap_the_stores_week() {
-        let now = 1_792_956_600;
-        let vars = tap::TapVars {
-            sid: Some("s-01".into()),
-            pid: Some("7".into()),
-            ..tap::TapVars::default()
-        };
-        for (scene, x10) in [('I', Some(630)), ('J', Some(750)), ('K', None), ('A', None)] {
-            let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
-            let plan = plan(scene);
-            assert_eq!(plan.tapped, scene != 'A', "{scene}");
-            seed(&world, &plan, now).expect("seeded");
-            let seeded =
-                std::fs::read_to_string(world.home.join(crate::fleet_fixture::RATE_LIMITS)).ok();
-            let payload =
-                crate::fleet_fixture::status_payload(Some("s"), &world.home, seeded.as_deref());
-            let reading = tap::Reading::of_stdin(&payload, &vars, now).expect("a reading");
-            let (store, _) = accounts::Store::at(&harness_state(&world))
-                .load(now)
-                .expect("the store loads");
-            let held = store
-                .accounts
-                .get(plan.own())
-                .and_then(|a| a.windows.get(accounts::WEEK_LIMIT))
-                .map(|w| (w.pct_x10, w.reset));
-            let tapped = reading.seven_day.map(|w| (w.x10(), w.resets_at));
-            assert_eq!(tapped.map(|t| t.0), x10, "{scene}: {payload}");
-            if x10.is_some() {
-                assert_eq!(tapped, held, "{scene}: the tap's week is the store's");
-            } else {
-                assert!(seeded.is_none(), "{scene}: no rate_limits seeded");
-                assert_eq!(reading.week_words(now, None), tap::NO_WEEK, "{scene}");
-            }
-        }
-    }
-}
+#[path = "outlook_captures_tests.rs"]
+mod tests;

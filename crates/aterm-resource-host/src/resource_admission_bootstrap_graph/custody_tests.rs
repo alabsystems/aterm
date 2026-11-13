@@ -340,6 +340,8 @@ fn source_deadline_and_writable_original_are_not_admitted() {
     assert!(source.revoked.load(Ordering::Acquire));
 }
 
+// Mapped guards are Darwin's native spawn actions; elsewhere `inherit_guards_at` refuses.
+#[cfg(target_os = "macos")]
 #[test]
 fn native_child_reads_the_same_accepted_unlinked_source_record_description() {
     let inputs = Inputs::new();

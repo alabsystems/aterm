@@ -767,6 +767,77 @@ fn a_draft_still_being_journaled_is_waited_out() {
     assert!(rig.start("start"));
 }
 
+/// aterm's own journal write does not hold the update as aterm's with no bound: past the
+/// backstop a draft still on the worker is named as the person's unsaved text, which may hold,
+/// and is still never handed over before it is in its journal.
+#[test]
+fn a_draft_write_past_the_backstop_is_named_as_the_persons_unsaved_work() {
+    let mut rig = Rig::new("writing-overdue");
+    rig.parent.hold_journal_appends_for_test();
+    rig.type_key("draft", "a", &["Type", "Plan"]);
+    rig.parent.tick_lane_hold_clocks(std::time::Instant::now());
+    let Err(reasons) = rig.parent.revalidate_native_update_safety() else {
+        panic!("held");
+    };
+    assert_eq!(
+        App::update_blocker_for_person(&reasons),
+        None,
+        "inside the backstop the write is aterm's to finish: {reasons:?}"
+    );
+    rig.parent
+        .backdate_own_document_work_for_test(crate::app_native::OWN_WORK_BACKSTOP);
+    let Err(reasons) = rig.parent.revalidate_native_update_safety() else {
+        panic!("a draft not yet in its journal still holds the update");
+    };
+    assert!(
+        reasons
+            .iter()
+            .all(|reason| reason.starts_with(crate::app_native::DIRTY_DOCUMENTS_BLOCK)),
+        "past the backstop every line names the person's unsaved text: {reasons:?}"
+    );
+    assert_eq!(
+        App::update_blocker_for_person(&reasons),
+        Some(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+    );
+    assert!(!rig.start("start refused past the backstop"));
+    rig.run_held("the append lands", &["Land"]);
+    let now = std::time::Instant::now();
+    rig.parent.tick_lane_hold_clocks(now);
+    assert!(
+        !rig.parent.own_document_work_overdue(now),
+        "the clock stops at the first attempt that finds the work done"
+    );
+    assert!(rig.start("start"));
+}
+
+/// A journal write for a clean document protects no text: past the backstop one that never
+/// lands stops holding the update. A late landing while parked still holds the commit.
+#[test]
+fn a_clean_documents_stalled_journal_write_stops_holding_at_the_backstop() {
+    let mut rig = Rig::new("clean-reseat-stalls");
+    rig.parent.hold_journal_reseats_for_test();
+    rig.parent.pending_update_handoff = Some(parked_record(FORKED));
+    assert!(
+        rig.parent
+            .reduce_returned_handoff_completion(rejected(FORKED))
+            .is_some()
+    );
+    assert_eq!(rig.parent.held_journal_reseats_for_test().len(), 1);
+    assert_eq!(rig.parent.document_store.dirty(rig.document), Some(false));
+    let Err(reasons) = rig.parent.revalidate_native_update_safety() else {
+        panic!("the re-seat on the worker holds inside the backstop");
+    };
+    assert_eq!(reasons, ["Wait: a draft journal write is in flight"]);
+    rig.parent.tick_lane_hold_clocks(std::time::Instant::now());
+    rig.parent
+        .backdate_own_document_work_for_test(crate::app_native::OWN_WORK_BACKSTOP);
+    rig.parent
+        .revalidate_native_update_safety()
+        .expect("a clean document's write that never lands protects no text");
+    assert!(rig.parent.run_held_journal_reseat_for_test());
+    rig.assert_file_untouched();
+}
+
 #[test]
 fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

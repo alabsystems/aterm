@@ -58,7 +58,9 @@ pub use crate::att::View;
 pub use roll::Rolled;
 #[cfg(unix)]
 pub use store::{
-    Discovered, Inventory, LabRead, Observed, Registry, Seeded, SourceRead, SourceRevision,
+    CatalogAbsenceRead, CatalogAbsenceRevision, Discovered, Inventory, LabRead, LocalSourceRead,
+    LocalSourceRevision, Observed, ProjectionRead, ProjectionRevision, Registry, Seeded,
+    SourceRead, SourceRevision,
 };
 #[cfg(unix)]
 pub(crate) mod upkeep;

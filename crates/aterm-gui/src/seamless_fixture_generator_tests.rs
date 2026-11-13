@@ -604,6 +604,7 @@ fn fx_tab(root: crate::restore::RestoredSplitTree) -> crate::restore::RestoredTa
         zoomed: false,
         parked: false,
         ephemeral: false,
+        fleet: false,
     }
 }
 
@@ -4222,6 +4223,8 @@ fn fx_carried_state_desk() -> FxDesk {
     let mut parked_worker = fx_tab(worker);
     parked_worker.parked = true;
     parked_worker.ephemeral = true;
+    // Another Mac's drive asked for it, as a drive's worker parks (`Tab::fleet`).
+    parked_worker.fleet = true;
     let mut behind = fx_window(
         ROWS,
         COLS,
@@ -4741,6 +4744,7 @@ fn fx_variants_desk() -> FxDesk {
                 zoomed: false,
                 parked: false,
                 ephemeral: false,
+                fleet: false,
             }
         } else {
             fx_tab(leaf)

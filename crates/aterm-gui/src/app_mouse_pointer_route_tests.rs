@@ -700,7 +700,7 @@ fn a_hover_report_to_a_sibling_keeps_the_fronts_typed_move_licence() {
     let mut f = stacked();
     let (app, wid) = (&mut f.app, f.wid);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_owned());
+    app.config.cursor_trail_style = Some("rainbow".to_owned());
     app.recompute_sparkle();
     let geom = crate::cursor_glow::Geom {
         cw: 8,

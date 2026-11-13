@@ -201,14 +201,18 @@ fn native_seed_does_not_fall_back_when_the_host_head_is_unavailable() {
         &["fetch", "-q", world.authority.to_str().unwrap(), "main"],
     );
     git(&world.checkout, &["reset", "--hard", "FETCH_HEAD"]);
-    // The local graph contains the exact re-pin, but the selected authority is absent.
-    world
-        .fake
-        .apply(agh_fake::Change::Hide { slug: SLUG.into() });
+    // The local graph and REST still name the exact re-pin. Only the selected
+    // Git authority's main is absent, so either fallback would wrongly pass.
+    git(&world.authority, &["update-ref", "-d", "refs/heads/main"]);
+    world.fake.clear_seen();
     let reasons = world.refusals();
     assert!(
-        reasons.iter().any(|why| why.contains("owner-bound main")),
-        "{reasons:?}"
+        !reasons.is_empty(),
+        "an unavailable Git head must not fall back to local or REST main"
+    );
+    assert!(
+        world.fake.seen().is_empty(),
+        "the unavailable native head is decided without REST requests"
     );
     world.fake.assert_clean();
 }
@@ -225,10 +229,20 @@ fn native_lineage_reads_the_current_owner_ledger_without_moving_tracking_refs() 
     world
         .fake
         .apply(agh_fake::Change::Hide { slug: SLUG.into() });
+    assert_eq!(
+        lineage_switch::read(&world.ctx, &world.checkout).unwrap(),
+        Switch::Live,
+        "REST visibility does not determine the Git authority's ledger"
+    );
+    git(&world.authority, &["update-ref", "-d", "refs/heads/main"]);
     assert!(matches!(
         lineage_switch::read(&world.ctx, &world.checkout).unwrap(),
         Switch::Unknown(_)
     ));
     assert_eq!(world.refs(), refs);
+    assert!(
+        world.fake.seen().is_empty(),
+        "native lineage observations consume no REST requests"
+    );
     world.fake.assert_clean();
 }

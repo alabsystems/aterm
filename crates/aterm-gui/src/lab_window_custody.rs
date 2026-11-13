@@ -13,6 +13,30 @@ struct Custody {
 
 static HELD: std::sync::OnceLock<Custody> = std::sync::OnceLock::new();
 
+/// Transfer only a copy of the actual admitted lane, never a path-derived grant.
+/// The control ingress separately requires the local instance-owner principal.
+pub(crate) fn send_proof(stream: &aterm_uds::CtlStream, challenge: &str) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let held = HELD.get().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no original lab window custody",
+        )
+    })?;
+    let mut wire = aterm_types::lab_window_guard::CUSTODY_PREFIX.to_vec();
+    wire.extend_from_slice(challenge.as_bytes());
+    wire.push(b'\n');
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+    let sent = aterm_uds::fdpass::send_with_fds(stream, &wire, &[held.lane.as_fd()])?;
+    if sent != wire.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "partial custody proof",
+        ));
+    }
+    Ok(())
+}
+
 /// Retain only already-validated, close-only descriptions from the earliest entry.
 /// No argument or environment marker creates a reservation here.
 /// # Errors
@@ -126,63 +150,5 @@ impl Drop for Inherit {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failed_exec_and_partial_setup_restore_inheritance_flags() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let file = std::fs::File::create(dir.path().join("guard")).unwrap();
-        let fd = file.as_raw_fd();
-        // SAFETY: file owns this descriptor throughout this test.
-        let flags = || unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        let original = flags();
-        assert_ne!(original & libc::FD_CLOEXEC, 0);
-        {
-            let _inherit = inherit_descriptors(vec![fd]).unwrap();
-            assert_eq!(flags() & libc::FD_CLOEXEC, 0);
-        }
-        assert_eq!(flags(), original);
-        assert!(inherit_descriptors(vec![fd, -1]).is_err());
-        assert_eq!(flags(), original);
-    }
-
-    #[test]
-    fn successor_replaces_consumed_numbers_and_preserves_payload() {
-        let args = [
-            "--window",
-            "--lab-window-guard",
-            "7",
-            "--lab-window-memory-guard",
-            "8",
-            "old.claim",
-            "-e",
-            "tool",
-            "--lab-window-guard",
-            "99",
-        ]
-        .map(OsString::from)
-        .to_vec();
-        let offer = aterm_types::lab_window_guard::GuardBundle {
-            lane: 31,
-            memory: Some(aterm_types::lab_window_guard::MemoryRef {
-                descriptor: 32,
-                claim: "original.claim".into(),
-            }),
-        };
-        let mut replaced = replace_offer(args.clone(), Some(offer.clone()));
-        assert_eq!(
-            replace_offer(replaced.clone(), Some(offer.clone())),
-            replaced
-        );
-        assert_eq!(
-            aterm_types::lab_window_guard::take(&mut replaced).unwrap(),
-            Some(offer)
-        );
-        assert_eq!(
-            replaced,
-            ["--window", "-e", "tool", "--lab-window-guard", "99"].map(OsString::from)
-        );
-        assert_eq!(replace_offer(args, None), replaced);
-    }
-}
+#[path = "lab_window_custody_tests.rs"]
+mod tests;

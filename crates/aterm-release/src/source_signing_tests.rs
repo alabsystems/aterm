@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+
+fn helper_artifact(manifest: &str, executable: &str) -> String {
+    aterm_json::json!({
+        "reason": "compiler-artifact", "manifest_path": manifest,
+        "target": {"name": "atpkg-keys", "kind": ["bin"]},
+        "executable": executable,
+    })
+    .to_string()
+}
+
+#[test]
+fn helper_build_uses_the_candidate_and_cargos_reported_output() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let output = repo.join("custom target/gate/atpkg-keys");
+    aterm_verify::standin(&output, "exit 0");
+    let manifest = repo.join("crates/atpkg-keys/Cargo.toml");
+    let env = aterm_verify::EnvSnapshot {
+        home: repo.to_path_buf(),
+        ..Default::default()
+    };
+    let helper = prepare_helper(repo, None, &env, |args, _plan| {
+        assert!(args.iter().any(|arg| arg == "--locked"));
+        assert_eq!(args.last(), Some(&repo.join("Cargo.toml").into_os_string()));
+        Ok(helper_artifact(manifest.to_str().unwrap(), output.to_str().unwrap()).into_bytes())
+    })
+    .unwrap();
+    assert_eq!(helper, output);
+    let wrong = helper_artifact(
+        "/foreign/crates/atpkg-keys/Cargo.toml",
+        "/foreign/bin/atpkg-keys",
+    );
+    assert!(built_helper(repo, wrong.as_bytes()).is_err());
+    let relative = helper_artifact(manifest.to_str().unwrap(), "relative/helper");
+    assert!(built_helper(repo, relative.as_bytes()).is_err());
+    let ambiguous = format!(
+        "{}\n{}",
+        helper_artifact(manifest.to_str().unwrap(), "/one"),
+        helper_artifact(manifest.to_str().unwrap(), "/two")
+    );
+    assert!(built_helper(repo, ambiguous.as_bytes()).is_err());
+    assert!(prepare_helper(repo, None, &env, |_, _| Err("compiler failed".into())).is_err());
+}
+
+#[test]
+fn an_explicit_helper_is_not_replaced_by_a_build() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let helper = repo.join("chosen/helper");
+    aterm_verify::standin(&helper, "exit 0");
+    let env = aterm_verify::EnvSnapshot {
+        home: repo.to_path_buf(),
+        ..Default::default()
+    };
+    assert_eq!(
+        prepare_helper(repo, Some(helper.as_os_str()), &env, |_, _| panic!(
+            "must not build"
+        ))
+        .unwrap(),
+        helper
+    );
+    assert!(
+        prepare_helper(
+            repo,
+            Some(repo.join("missing").as_os_str()),
+            &env,
+            |_, _| panic!("must not build")
+        )
+        .is_err()
+    );
+    assert!(
+        prepare_helper(
+            repo,
+            Some(OsStr::new("relative/helper")),
+            &env,
+            |_, _| panic!("must not build")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn missing_ring_refuses_before_running_a_signer() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let tools = Tools {
+        openssl: "/openssl".into(),
+        keys: "/keys".into(),
+        prerequisites: crate::managed_prerequisites::Tools::Simulated,
+    };
+    assert!(
+        tools
+            .check_ring(home.path(), 0, &["master"], |_, _| panic!(
+                "no signer may run without a ring"
+            ))
+            .is_err()
+    );
+}
+
+struct Fixture {
+    home: aterm_tempfile::TempDir,
+    master: String,
+    key: Vec<u8>,
+    public: String,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        use aterm_update_core::roster::{Machine, Roster};
+        use atpkg_keys::provision::{MACHINE_KEY_REL, MACHINE_PUB_REL, RELEASE_ROSTER_REL};
+        let home = aterm_tempfile::tempdir().unwrap();
+        let (master_key, master) = atpkg_keys::generate().unwrap();
+        let (key, public) = atpkg_keys::generate().unwrap();
+        let key_path = home.path().join(MACHINE_KEY_REL);
+        let roster_path = home.path().join(RELEASE_ROSTER_REL);
+        std::fs::create_dir_all(roster_path.parent().unwrap()).unwrap();
+        std::fs::write(&key_path, &key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(
+            home.path().join(MACHINE_PUB_REL),
+            format!("id = \"test\"\npubkey = \"{public}\"\n"),
+        )
+        .unwrap();
+        let roster = Roster {
+            schema: 1,
+            roster_seq: 1,
+            valid_until: "9999-12-31T00:00:00Z".into(),
+            machines: vec![Machine {
+                id: "test".into(),
+                pubkey: public.clone(),
+                added_at: String::new(),
+                not_after: None,
+            }],
+            revoked: vec![],
+        }
+        .to_toml()
+        .unwrap();
+        crate::provision::publish_proven_pair(
+            &roster_path,
+            roster.as_bytes(),
+            &atpkg_keys::sign(&master_key, roster.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        Self {
+            home,
+            master,
+            key,
+            public,
+        }
+    }
+
+    fn tools(&self) -> Tools {
+        Tools {
+            openssl: "/fixture/openssl".into(),
+            keys: "/fixture/keys".into(),
+            prerequisites: crate::managed_prerequisites::Tools::Simulated,
+        }
+    }
+
+    fn invoke(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        damage_signature: bool,
+    ) -> Result<Vec<u8>, String> {
+        match args[0].to_str().unwrap() {
+            "pubkey" => {
+                assert_eq!(program, Path::new("/fixture/keys"));
+                Ok(self.public.as_bytes().to_vec())
+            }
+            "sign" => {
+                assert_eq!(program, Path::new("/fixture/keys"));
+                let message = std::fs::read(&args[2]).unwrap();
+                let mut sig = atpkg_keys::sign(&self.key, &message).unwrap();
+                if damage_signature {
+                    sig[0] ^= 1;
+                }
+                std::fs::write(&args[3], sig).unwrap();
+                Ok(vec![])
+            }
+            "pkeyutl" if args[1] == "-sign" => {
+                assert_eq!(program, Path::new("/fixture/openssl"));
+                let message = std::fs::read(&args[8]).unwrap();
+                std::fs::write(&args[10], atpkg_keys::sign(&self.key, &message).unwrap()).unwrap();
+                Ok(vec![])
+            }
+            "pkeyutl" => {
+                assert_eq!(program, Path::new("/fixture/openssl"));
+                let pem = std::fs::read_to_string(&args[4]).unwrap();
+                let encoded = pem.lines().nth(1).unwrap();
+                let der = aterm_codec::base64::decode_strict(encoded.as_bytes()).unwrap();
+                let public = aterm_codec::base64::decode_strict(self.public.as_bytes()).unwrap();
+                assert_eq!(&der[12..], public);
+                let message = std::fs::read(&args[7]).unwrap();
+                let signature = std::fs::read(&args[9]).unwrap();
+                let public: [u8; 32] = public.try_into().unwrap();
+                if !<&[u8; 64]>::try_from(signature.as_slice()).is_ok_and(|signature| {
+                    astream_aead::signature::verify(&public, &message, signature)
+                }) {
+                    return Err("independent verification rejected the signature".to_string());
+                }
+                Ok(vec![])
+            }
+            other => panic!("unexpected invocation: {other}"),
+        }
+    }
+}
+
+#[test]
+fn complete_ring_must_sign_and_independently_verify() {
+    let f = Fixture::new();
+    for damage in [false, true] {
+        let result = f
+            .tools()
+            .check_ring(f.home.path(), 100, &[&f.master], |p, a| {
+                f.invoke(p, a, damage)
+            });
+        assert_eq!(result.is_ok(), !damage);
+    }
+    let result = f
+        .tools()
+        .check_ring(f.home.path(), 100, &[&f.master], |_, _| {
+            Ok(b"another key".to_vec())
+        });
+    assert!(result.unwrap_err().contains("identity disagree"));
+}
+
+#[test]
+fn missing_or_untrusted_roster_never_runs_the_signer() {
+    use atpkg_keys::provision::RELEASE_ROSTER_REL;
+    let f = Fixture::new();
+    let sig = f
+        .home
+        .path()
+        .join(RELEASE_ROSTER_REL)
+        .with_extension("toml.sig");
+    std::fs::write(&sig, [0u8; 64]).unwrap();
+    assert!(
+        f.tools()
+            .check_ring(f.home.path(), 100, &[&f.master], |_, _| panic!(
+                "untrusted ring"
+            ))
+            .is_err()
+    );
+    std::fs::remove_file(sig).unwrap();
+    assert!(
+        f.tools()
+            .check_ring(f.home.path(), 100, &[&f.master], |_, _| panic!(
+                "incomplete ring"
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn authority_requires_the_publishers_canonical_roster_pair() {
+    let f = Fixture::new();
+    let canonical = f
+        .home
+        .path()
+        .join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+    let legacy = f.home.path().join(".aterm/roster/aterm-machines.toml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    std::fs::rename(
+        canonical.with_extension("toml.sig"),
+        legacy.with_extension("toml.sig"),
+    )
+    .unwrap();
+    assert!(Tools::ring_authority(f.home.path(), 100, &[&f.master]).is_err());
+    std::fs::rename(&legacy, &canonical).unwrap();
+    assert!(Tools::ring_authority(f.home.path(), 100, &[&f.master]).is_err());
+    std::fs::rename(
+        legacy.with_extension("toml.sig"),
+        canonical.with_extension("toml.sig"),
+    )
+    .unwrap();
+    assert!(Tools::ring_authority(f.home.path(), 100, &[&f.master]).is_ok());
+}
+
+/// The fixture's grant is roster generation 1: a retained floor at 1 admits it and one at
+/// 2 refuses it. Each floor is written as the vault writes it (0600 in a 0700 directory),
+/// so the verdict turns on its generation, never on a file mode its reader refuses.
+#[test]
+fn current_source_signing_refuses_a_grant_below_the_retained_floor() {
+    let fixture = Fixture::new();
+    let authority = || Tools::ring_authority(fixture.home.path(), 100, &[&fixture.master]);
+    authority().expect("no retained floor admits the grant");
+    let paths = aterm_secrets::client::Paths::for_home(fixture.home.path());
+    aterm_uds::private_file::ensure_private_dir(&paths.dir).unwrap();
+    let retain = |floor: &[u8]| {
+        aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", floor)
+            .unwrap();
+    };
+    retain(b"1\n");
+    authority().expect("a floor at the grant's own generation admits it");
+    retain(b"2\n");
+    let refused = authority().expect_err("a floor above the grant refuses it");
+    assert!(
+        refused.contains(crate::machines::current_roster::BELOW_RETAINED_FLOOR),
+        "{refused}"
+    );
+}
+
+#[test]
+fn checked_tools_are_handed_to_the_publisher() {
+    let f = Fixture::new();
+    let mut cmd = command("/publisher");
+    f.tools().apply(&mut cmd);
+    let env: Vec<_> = cmd.get_envs().collect();
+    assert!(env.contains(&(
+        OsStr::new("PUBLISH_OPENSSL"),
+        Some(OsStr::new("/fixture/openssl"))
+    )));
+    assert!(env.contains(&(OsStr::new("ATPKG_KEYS"), Some(OsStr::new("/fixture/keys")))));
+}

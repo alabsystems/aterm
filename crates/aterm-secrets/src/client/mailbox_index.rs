@@ -74,7 +74,9 @@ fn write(paths: &Paths, stamp: [u8; 32], value: &SecretBytes) -> crate::Result<(
     if text.len() > MAX_INDEX {
         return Err(Error::new("mailbox component index is too large"));
     }
-    fsx::write_atomic(&paths.dir.join(INDEX), text.as_bytes(), 0o600)
+    // Every verified read of the registered entry comes here with the text the index already
+    // holds: readers judge the index by what it says, never by its file's times.
+    fsx::write_atomic_if_changed(&paths.dir.join(INDEX), text.as_bytes(), 0o600).map(|_| ())
 }
 
 fn read(paths: &Paths) -> crate::Result<Option<Index>> {

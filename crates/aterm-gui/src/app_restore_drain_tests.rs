@@ -65,6 +65,7 @@ fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
                 zoomed: false,
                 parked: false,
                 ephemeral: false,
+                fleet: false,
             })
             .collect(),
     }

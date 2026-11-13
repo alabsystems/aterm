@@ -74,7 +74,7 @@ fn compare(scenarios: Vec<corpus::Scenario>) -> Vec<String> {
     }
     let jobs = std::sync::Mutex::new(scenarios.into_iter().zip(&want).enumerate());
     let found = std::sync::Mutex::new(Vec::new());
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let threads = aterm_cores::available_parallelism().map_or(4, std::num::NonZero::get);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {

@@ -607,8 +607,12 @@ impl Guard<'_> {
                         approved.expected_principal,
                     )?);
                     Ok(vec![
-                        accounts::Event::new(now, accounts::Kind::SignIn, &policy.row.label)
-                            .because(accounts::SHARED_PREPARATION_BEGUN),
+                        accounts::Event::sign_in(
+                            now,
+                            &policy.row.label,
+                            accounts::SignInStep::Begun,
+                        )
+                        .because(accounts::SHARED_PREPARATION_BEGUN),
                     ])
                 })?;
                 *token = begun;

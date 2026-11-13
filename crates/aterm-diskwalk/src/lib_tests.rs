@@ -255,6 +255,24 @@ fn an_override_adds_a_protected_root_and_its_ancestors_turn_broad() {
 }
 
 #[test]
+fn windows_denies_every_root_the_configuration_names_and_no_other() {
+    let home = Path::new(HOME);
+    let named = [String::from("~/Documents"), String::from("~/Secrets")];
+    // A root a Mac protects by default is denied on Windows when it is named, like any other.
+    assert_eq!(
+        Deny::named_roots(home, &named, true),
+        vec![p("/Users//a/Documents"), p("/Users//a/Secrets")]
+    );
+    assert_eq!(Deny::named_roots(home, &[], true), Vec::<PathBuf>::new());
+    // Off Windows: the named roots, and every path whose `stat` can prompt.
+    let unix = Deny::named_roots(home, &named, false);
+    for root in ["/Users//a/Documents", "/Users//a/Secrets", "/Users//a/Desktop"] {
+        assert!(unix.contains(&p(root)), "{root}");
+    }
+    assert!(Deny::named_roots(home, &[], false).contains(&p("/Users//a/Documents")));
+}
+
+#[test]
 fn unsafe_mount_points_are_named_for_their_parent() {
     let t = table();
     assert_eq!(

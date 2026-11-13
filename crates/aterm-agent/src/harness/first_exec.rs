@@ -44,20 +44,18 @@ struct Mark {
 
 /// The only arguments a prepared policy-bearing launch may receive.
 pub(crate) enum ProbeWord {
-    Version,
     Help,
 }
 
 impl ProbeWord {
     fn word(&self) -> &'static str {
         match self {
-            Self::Version => "--version",
             Self::Help => "--help",
         }
     }
 }
 
-/// The command and the mark come from one inspection. Neither probe reopens a wrapper or
+/// The command and the mark come from one inspection. No probe reopens a wrapper or
 /// alias to select the executable after this admission.
 pub(crate) struct Prepared {
     pub(crate) command: aterm_uds::spawnfd::Command,
@@ -531,11 +529,16 @@ impl Launch {
         let named = text.and_then(super::twin::twin_binary);
         #[cfg(unix)]
         if managed || named.is_some() {
-            let current =
-                aterm_uds::tether::executable().map(|executable| atpkg::platform::ProbeForwarder {
-                    executable: executable.to_path_buf(),
-                    parent_pid: std::process::id(),
-                });
+            let current = if forwarder.is_none() {
+                aterm_uds::tether::prepared_executable()
+                    .map_err(std::io::Error::other)?
+                    .map(|executable| atpkg::platform::ProbeForwarder {
+                        executable: executable.to_path_buf(),
+                        parent_pid: std::process::id(),
+                    })
+            } else {
+                None
+            };
             let forwarder = forwarder.or(current.as_ref()).ok_or_else(|| {
                 std::io::Error::other("no unchanged in-place probe forwarder is available")
             })?;

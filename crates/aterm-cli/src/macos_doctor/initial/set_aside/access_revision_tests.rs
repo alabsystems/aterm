@@ -63,11 +63,11 @@ fn check_reapproval(damaged: bool) {
         AccessOutcome::Declined,
     )
     .unwrap();
-    assert!(
-        permission_rows(state, old_approval)
-            .iter()
-            .all(|row| row.status == "ok"),
-        "Not now completes its own approval"
+    let rows = permission_rows(state, old_approval);
+    assert_eq!(
+        SetupNext::of(&rows),
+        SetupNext::Done,
+        "Not now completes its own approval: {rows:?}"
     );
 
     if damaged {

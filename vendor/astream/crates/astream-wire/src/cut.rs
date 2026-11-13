@@ -25,7 +25,8 @@
 //! cause is included.
 
 use crate::Offset;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 
 // The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
 // `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
@@ -238,14 +239,20 @@ impl<K: Ord + Clone> CausalCut<K> {
     /// whenever an edge's effect is admitted by the cut (`effect.1 <= cut[effect.0]`)
     /// and its cause is not, advance `cut[cause.0]` to `edge.cause.1`.
     ///
-    /// Iterates to a fixed point so transitive causal chains (`A -> B -> C`) are
-    /// closed in one call. Because each step strictly raises the frontier of at
-    /// least one edge's cause to that edge's `cause.1`, at most `edges.len()`
-    /// rounds can make progress. Returns the total number of causal edge repairs
-    /// applied (`0` if `self` was already consistent).
+    /// Closes transitive causal chains (`A -> B -> C`) in one call. Edges are indexed
+    /// by effect stream and threshold; each becomes eligible only once as frontiers
+    /// advance. Work is `O(E log E + E log S)` and scratch is `O(E)`, for `E` edges
+    /// and `S` streams, rather than repeated full scans of all edges.
+    ///
+    /// Returns the total number of causal edge repairs applied (`0` if already
+    /// consistent). Repairs retain the input-order, round-by-round schedule of a
+    /// full-scan fixed point, including its count when several edges raise the same
+    /// stream in stages.
     pub fn heal(&mut self, edges: &[CausalEdge<K>]) -> usize {
+        // Most delivered bursts are already consistent or close in one scan.
+        // Keep those paths allocation-free and retain their former repair order.
         let mut repairs = 0usize;
-        for _ in 0..edges.len() {
+        for _ in 0..edges.len().min(2) {
             let mut changed = false;
             for edge in edges {
                 if self.includes(&edge.effect.0, edge.effect.1)
@@ -257,7 +264,61 @@ impl<K: Ord + Clone> CausalCut<K> {
                 }
             }
             if !changed {
-                break;
+                return repairs;
+            }
+        }
+        // Each productive scan repairs a previously unsatisfied cause threshold,
+        // so E scans suffice even when there is no following unchanged scan.
+        if edges.len() <= 2 {
+            return repairs;
+        }
+        // Descending thresholds let pop() consume the newly admitted prefix without
+        // moving any remaining entries. Keys borrow the edges, never the cut.
+        let mut waiting: BTreeMap<&K, Vec<(Offset, usize)>> = BTreeMap::new();
+        for (idx, edge) in edges.iter().enumerate() {
+            waiting
+                .entry(&edge.effect.0)
+                .or_default()
+                .push((edge.effect.1, idx));
+        }
+        let mut ready = BinaryHeap::new();
+        for (&stream, effects) in &mut waiting {
+            effects.sort_unstable_by(|a, b| b.cmp(a));
+            if let Some(frontier) = self.offset_of(stream) {
+                while effects.last().is_some_and(|&(off, _)| off <= frontier) {
+                    if let Some((_, idx)) = effects.pop() {
+                        ready.push(Reverse((0usize, idx)));
+                    }
+                }
+            }
+        }
+
+        while let Some(Reverse((round, idx))) = ready.pop() {
+            let Some(edge) = edges.get(idx) else {
+                continue;
+            };
+            // The effect was admitted when queued and frontiers only advance.
+            // A cause admitted in the meantime needs no further work: this edge
+            // can never become violated again.
+            if self.includes(&edge.cause.0, edge.cause.1) {
+                continue;
+            }
+            self.advance(edge.cause.0.clone(), edge.cause.1);
+            repairs = repairs.saturating_add(1);
+            if let Some(effects) = waiting.get_mut(&edge.cause.0) {
+                while effects.last().is_some_and(|&(off, _)| off <= edge.cause.1) {
+                    if let Some((_, next_idx)) = effects.pop() {
+                        // A full scan has already visited earlier indices in this
+                        // round. Later indices are repaired in the current round;
+                        // earlier ones wait for the next, preserving repair counts.
+                        let next_round = if next_idx <= idx {
+                            round.saturating_add(1)
+                        } else {
+                            round
+                        };
+                        ready.push(Reverse((next_round, next_idx)));
+                    }
+                }
             }
         }
         repairs
@@ -394,6 +455,229 @@ mod tests {
         assert!(cut.is_consistent(&edges));
         assert_eq!(cut.offset_of(&"coder"), Some(Offset(4)));
         assert_eq!(cut.offset_of(&"planner"), Some(Offset(10)));
+    }
+
+    /// The former algorithm, retained as an independent semantic oracle. Its
+    /// repair count depends on input order as well as the closure's final state.
+    fn heal_by_full_scans<K: Ord + Clone>(
+        cut: &mut CausalCut<K>,
+        edges: &[CausalEdge<K>],
+    ) -> usize {
+        let mut repairs = 0usize;
+        for _ in 0..edges.len() {
+            let mut changed = false;
+            for edge in edges {
+                if cut.includes(&edge.effect.0, edge.effect.1)
+                    && !cut.includes(&edge.cause.0, edge.cause.1)
+                {
+                    cut.advance(edge.cause.0.clone(), edge.cause.1);
+                    repairs += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        repairs
+    }
+
+    #[test]
+    fn heal_matches_full_scan_closure_and_repair_count() {
+        fn next(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn offset(rng: &mut u64) -> Offset {
+            match next(rng) % 8 {
+                0 => Offset(0),
+                1 => Offset(u64::MAX),
+                _ => Offset(next(rng) % 32),
+            }
+        }
+        for seed in 1..=2_000u64 {
+            let mut rng = seed;
+            let mut cut = CausalCut::new();
+            for stream in 0..16 {
+                if next(&mut rng) % 3 == 0 {
+                    cut.set(stream, offset(&mut rng));
+                }
+            }
+            let count = next(&mut rng) % 100;
+            let mut edges = Vec::new();
+            for _ in 0..count {
+                edges.push(CausalEdge {
+                    cause: (next(&mut rng) % 16, offset(&mut rng)),
+                    effect: (next(&mut rng) % 16, offset(&mut rng)),
+                });
+            }
+            let original = cut.clone();
+            let mut expected = cut.clone();
+            let expected_repairs = heal_by_full_scans(&mut expected, &edges);
+            let repairs = cut.heal(&edges);
+            assert_eq!(cut, expected, "closure, seed {seed}");
+            assert_eq!(repairs, expected_repairs, "repair count, seed {seed}");
+            assert!(cut.dominates(&original));
+            assert!(cut.is_consistent(&edges));
+            assert_eq!(cut.heal(&edges), 0);
+            // Reversing edges changes the schedule, but never the least closure.
+            edges.reverse();
+            let mut reversed = original;
+            reversed.heal(&edges);
+            assert_eq!(reversed, cut, "edge order, seed {seed}");
+        }
+    }
+
+    #[test]
+    fn heal_preserves_scan_order_when_a_newly_enabled_earlier_edge_waits_a_round() {
+        let edges = [
+            CausalEdge {
+                cause: (0, Offset(3)),
+                effect: (1, Offset(1)),
+            },
+            CausalEdge {
+                cause: (1, Offset(1)),
+                effect: (2, Offset(1)),
+            },
+            CausalEdge {
+                cause: (0, Offset(5)),
+                effect: (2, Offset(1)),
+            },
+            CausalEdge {
+                cause: (2, Offset(1)),
+                effect: (3, Offset(1)),
+            },
+            CausalEdge {
+                cause: (3, Offset(1)),
+                effect: (4, Offset(1)),
+            },
+            CausalEdge {
+                cause: (4, Offset(1)),
+                effect: (5, Offset(1)),
+            },
+        ];
+        let mut cut = CausalCut::new();
+        cut.set(5, Offset(1));
+        // The reverse chain exhausts the two fast scans. In the indexed phase,
+        // edge 1 enables edge 0, but edge 2 must run before edge 0 in the next
+        // round. A FIFO worklist would perform six repairs here.
+        assert_eq!(cut.heal(&edges), 5);
+        assert_eq!(cut.offset_of(&0), Some(Offset(5)));
+        assert!(cut.is_consistent(&edges));
+    }
+
+    /// Count stream comparisons to bound all dependency-index/frontier lookups,
+    /// rather than depending on machine-specific timing for the complexity gate.
+    #[test]
+    fn heal_reverse_chain_work_is_bounded_by_edges_times_log_streams() {
+        use std::cell::Cell;
+        thread_local! {
+            static COMPARES: Cell<usize> = const { Cell::new(0) };
+        }
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Key(usize);
+        impl Ord for Key {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                COMPARES.with(|c| c.set(c.get().saturating_add(1)));
+                self.0.cmp(&other.0)
+            }
+        }
+        impl PartialOrd for Key {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        for n in [256usize, 1_024, 4_096] {
+            let edges: Vec<_> = (0..n)
+                .map(|i| CausalEdge {
+                    cause: (Key(i), Offset(1)),
+                    effect: (Key(i + 1), Offset(1)),
+                })
+                .collect();
+            let mut cut = CausalCut::new();
+            cut.set(Key(n), Offset(1));
+            COMPARES.with(|c| c.set(0));
+            assert_eq!(cut.heal(&edges), n);
+            let comparisons = COMPARES.with(Cell::get);
+            let bound = 32 * n * (n.ilog2() as usize + 1);
+            assert!(
+                comparisons <= bound,
+                "{n} edges: {comparisons} comparisons > {bound}"
+            );
+            assert!(cut.is_consistent(&edges));
+        }
+    }
+
+    /// Run explicitly to measure the adversarial reverse-chain case against the
+    /// old full-scan implementation; timing is evidence, never a pass threshold.
+    #[test]
+    #[ignore = "manual causal-closure benchmark"]
+    fn heal_reverse_chain_benchmark() {
+        use std::time::Instant;
+        for n in [1usize, 8, 64, 1_000, 4_000] {
+            let reversed: Vec<_> = (0..n)
+                .map(|i| CausalEdge {
+                    cause: (i, Offset(1)),
+                    effect: (i + 1, Offset(1)),
+                })
+                .collect();
+            let mut forward = reversed.clone();
+            forward.reverse();
+            for (name, edges, consistent) in [
+                ("consistent", &reversed, true),
+                ("forward", &forward, false),
+            ] {
+                let mut original = CausalCut::new();
+                if consistent {
+                    for stream in 0..=n {
+                        original.set(stream, Offset(1));
+                    }
+                } else {
+                    original.set(n, Offset(1));
+                }
+                let repeats = if n <= 64 { 2_000 } else { 100 };
+                // Prepare clones outside the measured sections to time healing.
+                let mut old: Vec<_> = (0..repeats).map(|_| original.clone()).collect();
+                let mut new = old.clone();
+                let started = Instant::now();
+                for cut in &mut old {
+                    std::hint::black_box(heal_by_full_scans(cut, edges));
+                }
+                let old_time = started.elapsed();
+                let started = Instant::now();
+                for cut in &mut new {
+                    std::hint::black_box(cut.heal(edges));
+                }
+                let new_time = started.elapsed();
+                assert_eq!(old, new);
+                eprintln!("{name} {n} edges ({repeats} repeats): full scans {old_time:?}, indexed {new_time:?}, {:.2}x", old_time.as_secs_f64() / new_time.as_secs_f64());
+            }
+        }
+        for n in [1_000usize, 2_000, 4_000] {
+            let edges: Vec<_> = (0..n)
+                .map(|i| CausalEdge {
+                    cause: (i, Offset(1)),
+                    effect: (i + 1, Offset(1)),
+                })
+                .collect();
+            let mut slow = CausalCut::new();
+            slow.set(n, Offset(1));
+            let mut fast = slow.clone();
+            let started = Instant::now();
+            let slow_repairs = heal_by_full_scans(&mut slow, &edges);
+            let slow_time = started.elapsed();
+            let started = Instant::now();
+            let fast_repairs = fast.heal(&edges);
+            let fast_time = started.elapsed();
+            assert_eq!(fast, slow);
+            assert_eq!(fast_repairs, slow_repairs);
+            eprintln!(
+                "{n} edges: full scans {slow_time:?}, indexed {fast_time:?}, {:.1}x",
+                slow_time.as_secs_f64() / fast_time.as_secs_f64()
+            );
+        }
     }
 
     #[test]

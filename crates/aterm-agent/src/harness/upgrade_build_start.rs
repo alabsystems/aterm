@@ -551,10 +551,6 @@ pub fn probe(exe: &Path, holds: &Path) -> Probe {
 
 /// [`probe`] with an explicit bound; with no `holds`, the program is not held.
 pub(super) fn probe_within(exe: &Path, limit: Duration, holds: Option<&Path>) -> Probe {
-    let now = std::time::Instant::now();
-    let deadline = now
-        .checked_add(limit)
-        .unwrap_or_else(|| now + Duration::from_secs(3600));
     let Ok(crate::harness::first_exec::Prepared {
         command: mut cmd,
         mut hold,
@@ -575,6 +571,12 @@ pub(super) fn probe_within(exe: &Path, limit: Duration, holds: Option<&Path>) ->
         crate::harness::first_exec::never_started(&mut hold);
         return Probe::NoExec;
     };
+    // Image custody and immutable wrapper capture precede execution. Their cost
+    // cannot consume the build's run allowance before its child has even started.
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(limit)
+        .unwrap_or_else(|| now + Duration::from_secs(3600));
     #[cfg(unix)]
     let group = libc::pid_t::try_from(child.id()).ok();
     loop {

@@ -2374,7 +2374,7 @@ fn by_r1(actor: &ExitActor) -> String {
         ExitActor::Ctl => "ctl".to_string(),
         ExitActor::Harness => "harness".to_string(),
         ExitActor::Bridge => "bridge".to_string(),
-        ExitActor::Fleet(token) => token.clone(),
+        ExitActor::Fleet { token, .. } => token.clone(),
     }
 }
 

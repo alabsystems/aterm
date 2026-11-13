@@ -316,6 +316,10 @@ pub struct JobProc {
     /// observed slot holders whose known stalls remain dependencies. None means unproven or
     /// absent evidence; this never denotes a grant.
     pub build_admission: Option<Vec<u32>>,
+    /// The aterm serving this process's control connection holds an `await` of it parked now, the
+    /// process matched by its pid and birth ([`WaitName::AtermWait`]); `false` for every other
+    /// process, and where no aterm vouches for one.
+    pub aterm_wait: bool,
     /// Its state.
     pub state: ProcState,
     /// A debugger traces it (a debugger's child at a breakpoint is no job-control stop).
@@ -755,7 +759,8 @@ pub struct Want {
 /// made of. Its figures are the passes' (every 2 s while a job runs): `ended_ms` is the pass that
 /// found it gone, `peak_bytes` and `cpu_ns` the most any pass read, so lower bounds. An agent
 /// call whose leader's exit the host read ends at its leader's own moment
-/// ([`Self::leader_exited_ms`]); any other at the pass that found it gone.
+/// ([`Self::leader_exited_ms`]); any other at the pass that found it gone. Its leader's own start
+/// is kept beside it where a pass read the leader's age ([`Self::leader_born_ms`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ended {
     /// Its tab's key (the session id).
@@ -785,6 +790,14 @@ pub struct Ended {
     /// When an agent call's leader ended, host ms, as the host read it ([`LeaderExit::at_ms`]):
     /// set exactly where [`Self::ended_by`] is.
     pub leader_exited_ms: Option<u64>,
+    /// When an agent call's leader started, host ms: the first pass that read the process the
+    /// call's start names took its age ([`JobProc::age_ms`]) as its probe began
+    /// ([`JobTick::probe_ms`]), and this is that clock less the age. `None` where no pass read its
+    /// age under that start, where the age is longer than that clock has run (a leader older than
+    /// the reader whose passes keep it, or one a pass first read after a sleep longer than its
+    /// start on that clock: the age counts a sleep, the pass's clock does not; no moment on it
+    /// names such a start), and for every other kind.
+    pub leader_born_ms: Option<u64>,
     /// The program an agent call ran: its leader's name once that names no shell (the leader
     /// `exec`ed the program, or the agent ran it with no wrapper), else the last a member other
     /// than its leader showed, the wrapper's own children first and the wrapper's forks (its
@@ -995,6 +1008,9 @@ pub enum WaitName {
     Memory,
     /// A native held legacy build-slot admission ticket; no grant is implied.
     BuildAdmission,
+    /// An `await` aterm's control server holds parked for it ([`JobProc::aterm_wait`]): the
+    /// process waits on what it asked aterm to wait for.
+    AtermWait,
     /// The person's foreground job reads a password (canonical, no echo).
     TtyPassword,
     /// The shell's own `read` builtin.
@@ -1044,6 +1060,7 @@ impl WaitName {
             Self::Translating => "translating",
             Self::Memory => "memory",
             Self::BuildAdmission => "build-admission",
+            Self::AtermWait => "aterm-wait",
             Self::TtyPassword => "tty-password",
             Self::TtyBuiltinRead => "tty-builtin-read",
             Self::TtyRaw => "tty-raw",
@@ -1215,11 +1232,12 @@ pub struct JobRow {
     pub mu_from: Option<MuFrom>,
     /// The verdict.
     pub verdict: Verdict,
-    /// An agent's call quiet at φ ≥ 8 whose members used under [`NO_PROGRESS_CPU_NS_PER_MIN`].
+    /// An agent's call quiet or stuck at φ ≥ 8 whose members, with the children they reaped, used
+    /// under [`NO_PROGRESS_CPU_NS_PER_MIN`] over the suspect run.
     pub no_progress: bool,
     /// A descendant call with current CPU work or progress within [`RUNNING_WINDOW_MS`]
-    /// (leader pid and start).
-    /// This qualifies the local verdict; it neither credits output nor changes resource totals.
+    /// (leader pid and start). The job's next step restarts its suspect run on it, and a waiter on
+    /// the job counts it as progress; it credits no output and changes no resource total.
     pub working_descendant: Option<(u32, u64)>,
     /// The suspect episode this verdict belongs to (each says a rank once).
     pub episode: u32,

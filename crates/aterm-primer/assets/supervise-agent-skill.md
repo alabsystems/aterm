@@ -20,7 +20,8 @@ aterm ctl @self spawn agent=claude - <<'EOF'
 EOF
 ```
 
-It prints `OK <sid>` (`@<sid>`), starts in this folder (`cwd=<path>` names another;
+It prints `OK <sid> req=<id>` (the sid is the first word: `@<sid>`; `req=` names the request
+this Mac records for it), starts in this folder (`cwd=<path>` names another;
 `agent=claude|codex|agy|muse`) and opens as a background tab of your window. The task is
 delivered as its first prompt (never typed or pasted) with one line of fact naming who
 started it and how its work ends (under `land`, its final report returns as its result;
@@ -41,7 +42,14 @@ under `cruise`, no report ends it).
   every member), pass `--host <h>`: `aterm ctl --host <h> spawn agent=claude cwd=<absolute
   path there> - < task`, then `aterm ctl --host <h> await task @<w> since=0` (`aterm help
   workers`, ON ANOTHER MAC). Without a drive grant, read fleet sessions with `aterm ctl
-  survey --fleet`.
+  survey --fleet`. A spawn there also needs that Mac at Full Access (`access=full` in its
+  survey header; every Mac starts at `access=read`, Read Only) and a `turn`, `key`, `send`,
+  `hold` or `close` needs `access=write`: an act above its level answers `ERR denied
+  access=<level> needs=<level>: …`. Only that Mac's person raises it (its menu-bar lock, or
+  `aterm fleet access full` there); never raise another Mac's level yourself, record the
+  refusal and place the work on a Mac that takes it (`--host any` picks only Macs at Full
+  Access). A manager on a Read Only Mac gets no report mail from its workers on other Macs:
+  read them with `await task` and `@<w> result`.
 - Every worker this Mac starts, here or with `--host`, gets a row on this Mac's board:
   its Mac, state, conclusion, landing and a digest of its task, never the task's text. Name
   it with `label=<word>` on the spawn (`aterm ctl --host <h> spawn agent=claude
@@ -287,8 +295,8 @@ reads its output. For a hand-driven agent:
 - Pass on the owner's direction, never invented review gates ("wait for sign-off"); when a
   worker asks for a decision with no owner gate, tell it to decide. A worker that holds its own
   build, test, commit or push to main for someone's go-ahead gets it from you, never from a
-  person (owner ruling 2026-10-29; Cruise and Land type the owner's standing go-ahead,
-  `go-ahead@v1`, themselves), but a hold a person gave it still stands. If a credential,
+  person (Cruise and Land type the standing go-ahead, `go-ahead@v1`, themselves), but a hold a
+  person gave it still stands. If a credential,
   permission or external service is unavailable, record the unavailable operation and move to
   work that can proceed. Do not issue alerts, nags or routine `NEEDS YOU` requests.
 - Respect active keyboard input (`human_ms=` < 120000) and other lease holders; read unknown

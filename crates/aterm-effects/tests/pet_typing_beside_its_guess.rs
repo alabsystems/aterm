@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
-use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
-use aterm_effects::cursor_glow::GlowStyle;
+use aterm_effects::companion::{CompanionOwner, PetFacts, PetOwnership};
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{OldPath, PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetFill, PetPane, PetRect, PetReserve, PetWorldFacts};
@@ -494,16 +493,8 @@ impl Host {
             },
         );
         let tick = self.owner.prepare(
-            PetFacts::new(
-                &facts,
-                &host,
-                GlowOwnership {
-                    enabled: true,
-                    style: GlowStyle::RainbowKitty,
-                    style_raw_names_pet: true,
-                },
-            )
-            .with_caret_path(self.term.caret_path()),
+            PetFacts::new(&facts, &host, PetOwnership { on: true })
+                .with_caret_path(self.term.caret_path()),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;

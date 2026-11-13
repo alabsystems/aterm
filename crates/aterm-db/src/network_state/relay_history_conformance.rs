@@ -33,6 +33,7 @@ fn peer(slot: u64, at: u64, reachability: Reachability) -> PeerObservation {
             at_ms: at,
             state: reachability,
         }],
+        lease_ms: None,
     }
 }
 

@@ -185,6 +185,8 @@ struct Script {
     answers: RefCell<VecDeque<crate::Result<bool>>>,
     histories: Cell<u32>,
     stored: RefCell<Vec<String>>,
+    /// Whether the login keychain would ask for its password.
+    locked: Cell<bool>,
 }
 
 impl Script {
@@ -230,6 +232,7 @@ impl Script {
         let mut tools = Tools {
             authorized_ring: &test_authorized_ring,
             developer_dir,
+            keychain_answers: &|| !self.locked.get(),
             history: &mut history,
             store: &mut store,
         };
@@ -337,8 +340,12 @@ fn an_expired_successful_check_recovers_a_missing_profile_without_restart() {
     ));
     let expired = rounds.checked.as_ref().unwrap().1 + NOTARY_RECHECK;
     assert!(matches!(
-        script.with_tools(&clt, |tools| rounds
-            .step_with_clock(&paths, tools, || expired)),
+        script.with_tools(&clt, |tools| rounds.step_with_clock(
+            &paths,
+            tools,
+            || expired,
+            aterm_time::unix_secs
+        )),
         Step::Ran(Ok(_))
     ));
     assert_eq!(script.stored.borrow().len(), 1);
@@ -437,6 +444,7 @@ fn notary_authentication_cannot_install_a_superseded_entry_or_use_revoked_author
         let mut tools = Tools {
             authorized_ring: &test_authorized_ring,
             developer_dir: &clt,
+            keychain_answers: &|| true,
             history: &mut history,
             store: &mut store,
         };
@@ -515,14 +523,19 @@ fn a_failure_never_reads_as_stored_and_retries_after_backoff() {
     assert!(script.stored.borrow().is_empty(), "nothing replaced");
     assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
     assert_eq!(script.runs(), 1, "tried once by this subscriber");
-    let retried_at = rounds.tried.as_ref().unwrap().1 + Duration::from_secs(61);
+    let retried_at = Failed::read(&paths).unwrap().at + 61;
     let recovered = Script::answering(vec![Ok(true)]);
     assert!(matches!(
-        recovered.with_tools(&clt, |tools| rounds
-            .step_with_clock(&paths, tools, || retried_at)),
+        recovered.with_tools(&clt, |tools| rounds.step_with_clock(
+            &paths,
+            tools,
+            Instant::now,
+            || Some(retried_at)
+        )),
         Step::Ran(Ok(_))
     ));
     assert_eq!(recovered.runs(), 1);
+    assert_eq!(Failed::read(&paths), None, "a success ends the backoff");
     let script = Script::answering(vec![Ok(false), Ok(false)]);
     let mut rounds = NotaryRounds::default();
     assert!(matches!(
@@ -530,6 +543,162 @@ fn a_failure_never_reads_as_stored_and_retries_after_backoff() {
         Step::Ran(Err(why)) if why.contains("did not authenticate")
     ));
     assert!(rounds.checked.is_none(), "no success recorded");
+}
+
+/// One round at wall second `at` of a subscriber that has just started.
+fn restarted_at(script: &Script, paths: &Paths, at: u64) -> Step {
+    script.with_tools(&clt, |tools| {
+        NotaryRounds::default().step_with_clock(paths, tools, Instant::now, || Some(at))
+    })
+}
+
+/// A failed attempt is on disk: a subscriber that restarts inside the backoff runs nothing,
+/// and each further failure of the same entry doubles the wait. Control: the same restarted
+/// subscriber runs notarytool once the wait has passed, and a success removes the record.
+#[test]
+fn a_failure_backs_off_across_restarts_and_longer_each_time() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let unavailable = || Err(Error::new("Apple is unavailable"));
+    let script = Script::answering(vec![unavailable(), unavailable(), Ok(true)]);
+    let start = 1_000_000;
+    assert!(matches!(
+        restarted_at(&script, &paths, start),
+        Step::Ran(Err(_))
+    ));
+    let first = Failed::read(&paths).expect("the failure is on disk");
+    assert_eq!(
+        (first.at, first.failures, first.unanswered),
+        (start, 1, false)
+    );
+    assert_eq!(restarted_at(&script, &paths, start + 59), Step::Quiet);
+    assert_eq!(
+        script.runs(),
+        1,
+        "a restart inside the backoff runs nothing"
+    );
+    assert!(matches!(
+        restarted_at(&script, &paths, start + 60),
+        Step::Ran(Err(_))
+    ));
+    assert_eq!(Failed::read(&paths).unwrap().failures, 2);
+    assert_eq!(restarted_at(&script, &paths, start + 60 + 119), Step::Quiet);
+    assert_eq!(script.runs(), 2, "the second failure waits twice as long");
+    assert!(matches!(
+        restarted_at(&script, &paths, start + 60 + 120),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(Failed::read(&paths), None);
+    // However often it fails, the wait is at most a day.
+    let often = Failed {
+        failures: u32::MAX,
+        ..first
+    };
+    assert_eq!(often.wait(), NOTARY_RETRY_MAX);
+}
+
+/// A run cut off at its deadline is the mark of a dialog nobody answered, not of a network:
+/// it waits the whole day at once. Control: an ordinary failure at the same moment is tried
+/// again after a minute.
+#[test]
+fn a_run_nobody_answered_waits_a_day() {
+    let start = 1_000_000;
+    let day = NOTARY_RETRY_MAX.as_secs();
+    let cut_off = || {
+        Err(Error::new(
+            "notarytool authentication did not complete within its minute",
+        ))
+    };
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![cut_off(), Ok(true)]);
+    assert!(matches!(
+        restarted_at(&script, &paths, start),
+        Step::Ran(Err(_))
+    ));
+    assert!(Failed::read(&paths).unwrap().unanswered);
+    assert_eq!(restarted_at(&script, &paths, start + day - 1), Step::Quiet);
+    assert_eq!(script.runs(), 1);
+    assert!(matches!(
+        restarted_at(&script, &paths, start + day),
+        Step::Ran(Ok(_))
+    ));
+
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![Err(Error::new("Apple is unavailable")), Ok(true)]);
+    assert!(matches!(
+        restarted_at(&script, &paths, start),
+        Step::Ran(Err(_))
+    ));
+    assert!(matches!(
+        restarted_at(&script, &paths, start + 60),
+        Step::Ran(Ok(_))
+    ));
+}
+
+/// While the login keychain would ask for its password, neither a round nor the explicit sync
+/// runs notarytool: the round says what it waits for, the sync refuses. Control: the same
+/// round with the keychain unlocked runs it.
+#[test]
+fn a_locked_login_keychain_runs_no_notarytool() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![Ok(true)]);
+    script.locked.set(true);
+    let mut rounds = NotaryRounds::default();
+    assert_eq!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Waits(WAITS_FOR_KEYCHAIN)
+    );
+    assert_eq!(
+        script
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap_err()
+            .to_string(),
+        WAITS_FOR_KEYCHAIN
+    );
+    assert_eq!(script.runs(), 0);
+    assert_eq!(Failed::read(&paths), None, "a wait is no failed attempt");
+    script.locked.set(false);
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(script.runs(), 1);
+}
+
+/// The sync a release asks for always runs, whatever a round recorded, and what it finds is
+/// what the next round reads: its failure backs the rounds off, its success ends a backoff.
+#[test]
+fn the_explicit_sync_ignores_a_backoff_and_records_its_own_outcome() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![
+        Err(Error::new("Apple is unavailable")),
+        Err(Error::new("Apple is unavailable")),
+        Ok(true),
+    ]);
+    let mut rounds = NotaryRounds::default();
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Err(_))
+    ));
+    assert!(
+        script
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .is_err()
+    );
+    assert_eq!(script.runs(), 2, "the explicit sync ran inside the backoff");
+    assert_eq!(Failed::read(&paths).unwrap().failures, 2);
+    assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
+    assert!(
+        script
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(Failed::read(&paths), None);
 }
 
 /// The subscriber's live round never accepts a fixture's master as a release anchor; it says

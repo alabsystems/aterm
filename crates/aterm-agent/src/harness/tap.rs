@@ -101,8 +101,8 @@ pub const CHAIN_MAX: usize = 4096;
 /// carrying tap would otherwise exec itself without end), and prints its own row.
 pub const CARRIED_ENV: &str = "ATERM_TAP_CARRIED";
 
-/// THE `--settings` VALUE FOR `exe`, carrying the owner's own statusLine where `carry` (owner
-/// ruling R-12): `<exe> harness tap --carry`, so the tap writes its reading and then runs the
+/// THE `--settings` VALUE FOR `exe`, carrying the owner's own statusLine where `carry`:
+/// `<exe> harness tap --carry`, so the tap writes its reading and then runs the
 /// owner's command ([`owner_command`]) on the same payload, whose row is the one shown;
 /// `<exe> harness tap` where not. Its length does not depend on the owner's command: a relaunch
 /// line with room for the plain tap has room for this one but [`CARRY_FLAG`]'s eight bytes.
@@ -357,7 +357,8 @@ pub struct Reading {
     /// `context_window.remaining_percentage`, rounded: how much of the model's context window
     /// is left, as Claude Code counts it (`None` before the first reply).
     pub ctx_left: Option<u8>,
-    /// How long the verb took up to its write, microseconds.
+    /// How long the run that wrote the file's text took up to its write, microseconds: a
+    /// re-report the file already says ([`heard_again`]) leaves the text, and so this, as it was.
     pub dur_us: u64,
     /// The row Claude Code shows for the run that wrote it, decided before the write
     /// ([`run_carrying`] asks for the owner's command first); `None` for a payload not yet
@@ -497,10 +498,10 @@ impl Reading {
     }
 
     /// THE ROW THE TAP PRINTS (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2): the week
-    /// alone, `week 63% used · resets Sat 10:00`, its figure said as
-    /// [`super::outlook::Figure::Exact`] says it (a figure under 100 is never `100%`) and its
+    /// alone, `week 37% left · resets Sat 10:00`, its figure what is left as
+    /// [`super::outlook::Figure::Exact`] says it (`0% left` only of a reading of 100) and its
     /// reset as [`super::outlook::when`] says it on the local clock `offsets` give; [`NO_WEEK`]
-    /// with no week figure. It says `week 63% used` and no reset where:
+    /// with no week figure. It says `week 37% left` and no reset where:
     /// - the reset is not ahead of `now` (Claude Code drops a window at its reset, so only a
     ///   clock apart from the vendor's leaves one);
     /// - the reset lies further ahead than a week's can ([`accounts::believed_reset`], a week and
@@ -515,14 +516,14 @@ impl Reading {
             return NO_WEEK.to_owned();
         };
         let x10 = u16::try_from(week.x10().min(1000)).unwrap_or(1000);
-        let used = super::outlook::Figure::Exact(x10).words();
+        let left = super::outlook::Figure::Exact(x10).words();
         let reset = accounts::believed_reset(Some(week.resets_at), now).filter(|t| *t > now);
         match (reset, offsets) {
             (Some(reset), Some(offsets)) => {
                 let reset = super::outlook::when(reset, now, offsets);
-                format!("week {used} used{RESETS}{reset}")
+                format!("week {left}{RESETS}{reset}")
             }
-            _ => format!("week {used} used"),
+            _ => format!("week {left}"),
         }
     }
 
@@ -685,10 +686,10 @@ impl Reading {
 /// THE TAP'S WORDS AT THE HEAD OF `text`, a row read from its third cell (Claude Code indents
 /// the statusLine two): their width in cells where `text` starts with exactly a line the tap
 /// prints ([`Reading::week_words`], [`NO_WEEK`]) and ends there or at a blank; `None` for any
-/// other text: an owner's own row, the five-hour-and-week row of builds before this one (`5h 42%
-/// · 7d 61%`), a figure the tap never prints (`101%`, `07%`, `63.5%`), one run on into a
-/// word (`week 63% usedX`), or one Claude Code cut with `…` at `cols − 3` in a narrow pane
-/// (`week 63% used · rese…`, `week 63% used …`), whose reset clause is not whole.
+/// other text: an owner's own row, a row of builds before this one (`5h 42% · 7d 61%`, `week 63%
+/// used`), a figure the tap never prints (`101%`, `07%`, `63.5%`), one run on into a
+/// word (`week 37% leftX`), or one Claude Code cut with `…` at `cols − 3` in a narrow pane
+/// (`week 37% left · rese…`, `week 37% left …`), whose reset clause is not whole.
 ///
 /// It reads the tap's grammar and stops where its form ends, never at a gap
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2): Claude Code's own notice may sit one
@@ -705,13 +706,13 @@ pub fn parse_line(text: &str) -> Option<usize> {
     };
     let rest = text.get(words..)?;
     // A blank ends the words, unless Claude's cut (`…` at `cols − 3`) is the next thing on the
-    // row: a row cut just after `used ` is a cut row, not the bare form beside a notice.
+    // row: a row cut just after `left ` is a cut row, not the bare form beside a notice.
     let cut = rest.trim_start_matches(' ').starts_with('\u{2026}');
     (rest.is_empty() || (rest.starts_with(' ') && !cut)).then(|| text[..words].chars().count())
 }
 
 /// The length in bytes of a figure's row at the head of `text` ([`parse_line`]): `week `, a whole
-/// percent from 0 to 100 as [`super::outlook::Figure::Exact`] prints one, ` used`, then
+/// percent from 0 to 100 as [`super::outlook::Figure::Exact`] prints one, ` left`, then
 /// optionally [`RESETS`] and a reset as [`super::outlook::when`] says it.
 fn week_len(text: &str) -> Option<usize> {
     let rest = text.strip_prefix("week ")?;
@@ -723,9 +724,12 @@ fn week_len(text: &str) -> Option<usize> {
     {
         return None;
     }
-    let rest = rest.get(digits..)?.strip_prefix("% used")?;
+    let rest = rest
+        .get(digits..)?
+        .strip_prefix("% ")?
+        .strip_prefix(super::left::WORD)?;
     // The reset clause is whole or absent: its separator with anything short of a whole clause
-    // after it is a row Claude cut inside it (`week 63% used · rese…`), never the bare form.
+    // after it is a row Claude cut inside it (`week 37% left · rese…`), never the bare form.
     let reset = match rest.strip_prefix(RESETS) {
         Some(when) => RESETS.len() + super::outlook::when_len(when)?,
         None if rest.starts_with(" \u{b7}") => return None,
@@ -797,20 +801,20 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
 }
 
 /// WHEN `reading`'S FIGURES WERE FIRST REPORTED since its process was last
-/// served: the `at` of the reading already at `path` where that names the
+/// served: the `at` of the reading already in its file (`held`, the file's
+/// text; `None` where it has none that reads) where that names the
 /// same tab and process with the same `api_ms`, and every window `reading`
 /// carries is the held one's — a re-report, which Claude Code makes every
 /// [`TAP_REFRESH_S`] seconds while idle, or one a window only dropped out of
 /// at its reset (Claude Code hands a window only while it runs), which tells
 /// nothing new of the rest — else the reading's own. A window that newly
 /// appears or moves is a new report.
-fn first_reported(path: &Path, reading: &Reading) -> i64 {
+fn first_reported(held: Option<&str>, reading: &Reading) -> i64 {
     let figure = |w: Option<Window>| w.map(|w| (w.x10(), w.resets_at));
     let kept = |held: Option<Window>, now: Option<Window>| {
         figure(now).is_none_or(|now| figure(held) == Some(now))
     };
-    read_regular(path)
-        .and_then(|text| Reading::of_json(&text))
+    held.and_then(Reading::of_json)
         .filter(|held| {
             (held.sid.as_str(), held.pid, held.api_ms)
                 == (reading.sid.as_str(), reading.pid, reading.api_ms)
@@ -818,6 +822,50 @@ fn first_reported(path: &Path, reading: &Reading) -> i64 {
                 && kept(held.seven_day, reading.seven_day)
         })
         .map_or(reading.at, |held| held.at.min(reading.at))
+}
+
+/// A RE-REPORT THE FILE ALREADY SAYS WRITES NO BYTES: where `held`, the text of the file at
+/// `path`, is `stamped`'s own text but for the time its run took ([`Reading::dur_us`], which no
+/// reader takes), the file's modification time alone moves to now, and this says so. That time
+/// is what every reader of the file's age reads ([`Reading::read`]'s `started` bound and its
+/// returned stamp, [`Silence::step`]'s `file_age`, [`sweep`]), so the file is as fresh as a
+/// rewrite leaves it, with no new file, no data and no directory entry written: Claude Code
+/// re-runs the tap every [`TAP_REFRESH_S`] seconds while idle, each run re-reporting the figures
+/// the file holds. `false` where the text differs in anything else (a figure, the stamp, the
+/// row, an older build's spelling), where there is no file, or where its time could not be
+/// moved: the caller then writes the reading whole ([`write_reading`]).
+fn heard_again(path: &Path, held: Option<&str>, stamped: &Reading) -> bool {
+    let Some(held) = held else {
+        return false;
+    };
+    let Some(dur_us) = Reading::of_json(held).map(|held| held.dur_us) else {
+        return false;
+    };
+    let same = Reading {
+        dur_us,
+        ..stamped.clone()
+    };
+    same.to_json() == held && touch(path).is_ok()
+}
+
+/// Move the modification time of the regular file at `path` to now, opened without following a
+/// symlink and without changing its bytes.
+fn touch(path: &Path) -> io::Result<()> {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = open.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the reading is not a regular file",
+        ));
+    }
+    file.set_modified(std::time::SystemTime::now())
 }
 
 /// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes, the rest
@@ -837,7 +885,9 @@ fn read_bytes(stdin: &mut dyn Read) -> Option<Vec<u8>> {
 }
 
 /// Write the reading the payload `payload` gives for the tab and process `vars` name into
-/// `dir` ([`first_reported`]'s stamp), saying Claude Code shows `row` for it, and return it.
+/// `dir` ([`first_reported`]'s stamp), saying Claude Code shows `row` for it, and return it. A
+/// re-report the file already says moves the file's time and writes nothing else
+/// ([`heard_again`]).
 fn record(
     payload: Option<&str>,
     vars: &TapVars,
@@ -853,12 +903,16 @@ fn record(
     if let Some(dir) = dir
         && let Some(name) = file_name(&reading.sid, reading.pid)
     {
+        let path = dir.join(&name);
+        let held = read_regular(&path);
         let stamped = Reading {
-            at: first_reported(&dir.join(&name), &reading),
+            at: first_reported(held.as_deref(), &reading),
             dur_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             ..reading.clone()
         };
-        let _ = write_reading(dir, &name, &stamped.to_json());
+        if !heard_again(&path, held.as_deref(), &stamped) {
+            let _ = write_reading(dir, &name, &stamped.to_json());
+        }
     }
     Some(reading)
 }
@@ -1258,7 +1312,7 @@ pub struct LaunchFacts<'a> {
     pub profile_store: bool,
 }
 
-/// THE `--settings` VALUE A CLAUDE CODE LAUNCH CARRIES FROM ITS START (owner ruling R-12: the
+/// THE `--settings` VALUE A CLAUDE CODE LAUNCH CARRIES FROM ITS START (the
 /// harness reads the week itself, so a session needs no relaunch for its figures): [`gate`]'s,
 /// judged on the launch's own environment ([`LaunchFacts`]), for an interactive launch only
 /// ([`launch_admits`]), in an aterm tab, with the harness on for it, under the account's own
@@ -1365,7 +1419,7 @@ pub fn settings_admit(settings: &[(String, Source)], user: Option<&str>) -> bool
     settings_line(settings, user).is_some()
 }
 
-/// WHAT THE SETTINGS CHAIN LEAVES THE TAP (owner ruling R-12): `Some(None)` where every
+/// WHAT THE SETTINGS CHAIN LEAVES THE TAP: `Some(None)` where every
 /// document was read and none sets a statusLine (the plain tap), `Some(Some(cmd))` where the
 /// one statusLine the chain sets is the owner's own in the user's `settings.json` (`user`), a
 /// plain command line ([`netwatch::Settings::status_command`]), so the tap carries it

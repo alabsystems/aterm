@@ -896,7 +896,7 @@ pub const ASK_FOR: Duration = Duration::from_secs(60);
 
 /// The volume mounted at `mount`'s free bytes now; 0 where unread.
 fn free_on(mount: &Path) -> u64 {
-    Live.read(Some(mount)).volume.map_or(0, |v| v.free)
+    Live.volume(mount).map_or(0, |v| v.free)
 }
 
 /// `work` (the build cache's pass) on a thread of its own, waited for until `stopped` says an
@@ -941,7 +941,7 @@ fn cache_on(mount: &Path) -> bool {
         ]
         .iter()
         .filter(|c| c.is_dir())
-        .any(|c| Live.read(Some(c)).volume.is_some_and(|v| v.mount == mount))
+        .any(|c| Live.volume(c).is_some_and(|v| v.mount == mount))
     })
 }
 
@@ -1040,7 +1040,7 @@ fn pct_encode(text: &str) -> String {
 /// another named is left out, so no bytes are named twice. The sizing stops once `stopped`
 /// says an interrupt came.
 fn largest_on(mount: &Path, own: &[PathBuf], stopped: Stopped<'_>) -> Vec<(PathBuf, u64)> {
-    let on = |p: &Path| Live.read(Some(p)).volume.is_some_and(|v| v.mount == mount);
+    let on = |p: &Path| Live.volume(p).is_some_and(|v| v.mount == mount);
     let mut found: Vec<PathBuf> = own.iter().filter(|d| on(d)).cloned().collect();
     let home = aterm_types::dirs::home_dir();
     let caches = home.iter().flat_map(|h| {

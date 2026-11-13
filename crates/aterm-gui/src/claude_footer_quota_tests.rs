@@ -24,7 +24,7 @@ use crate::claude_lights::{Fact, FactHit, RowPart};
 use crate::{App, VisibleContentRoute, WindowId};
 
 /// The tap's words as the fixtures' stand-in command prints them.
-const WORDS: &str = "week 63% used \u{b7} resets Sat 10:00";
+const WORDS: &str = "week 37% left \u{b7} resets Sat 10:00";
 
 /// The rows of every fixture pane.
 const ROWS: usize = 24;
@@ -367,11 +367,23 @@ fn the_glass_stops_two_cells_before_claudes_notice() {
 }
 
 /// THE GLASS COVERS THE TAP'S WORDS BESIDE A CLOSE NOTICE (§5.2): in manual mode Claude sets its
-/// notice one blank after the words (`-credits-manual-60col`); the span is then the words alone,
-/// a rung that fits them is laid there, and the notice keeps its cells.
+/// notice one blank after the words (`-credits-manual-60col`); the span is then the words alone
+/// (32 cells), a rung that fits them is laid there (case (a)'s `main 60% left  ↺ Sat 10:00`), and
+/// the notice keeps its cells. Where no rung fits the words, the row stays Claude's: case (b)'s
+/// narrowest rung, `main 37% left  ╳ ~Thu 12 Nov 04:00`, takes 34 cells (2026-11-09: the figure
+/// says `left`, never a bare `63%`), so its pane lays no hit there and line D carries the unit.
+/// Negative control: a figure laid without its word (`main 63%  ╳ …`, 29 cells) claims case
+/// (b)'s row.
 #[test]
 fn the_glass_covers_the_taps_words_beside_a_close_notice() {
-    let view = case("b");
+    let narrow = case("b");
+    let (app, wid, _, _) = claimed("claude-2.1.318-tap-row-week-credits-manual-60col", &narrow);
+    assert!(
+        row_hits(&app, wid).is_empty(),
+        "case (b) fits no rung in 32 cells"
+    );
+    assert!(line_d_unit(&app, wid), "line D carries case (b)'s unit");
+    let view = case("a");
     let words = WORDS.chars().count();
     let (app, wid, _, rows) = claimed("claude-2.1.318-tap-row-week-credits-manual-60col", &view);
     let tap = bottom(&rows) + 1;
@@ -420,7 +432,7 @@ fn the_launch_effort_hint_keeps_its_cells() {
 fn a_cut_row_is_never_claimed() {
     // Every width the tap's words do not fit, as Claude cuts them (the lab stand-in's
     // `status_row`: `cols − 5` cells of the words, then `…`): S5b's parser read the cuts at 19
-    // and 20 columns (`week 63% used …`, `week 63% used ·…`) as the bare form.
+    // and 20 columns (`week 37% left …`, `week 37% left ·…`) as the bare form.
     for cols in 5..WORDS.chars().count() + 4 {
         let kept: String = WORDS.chars().take(cols - 5).collect();
         let row = format!("  {kept}\u{2026}");
@@ -539,11 +551,12 @@ fn the_grace_is_the_sessions_not_the_leafs() {
 /// THE QUOTA ROW READS AND LIGHTS AS ONE (§1.3, §2.6): at rest each cell of case (b) wears its
 /// role's token at its column's place in the field (the lit ink, the values', the quiet ink, the
 /// measured levels the marks' hue, the projected line the letters', the warnings warn), bold
-/// where the line says; lit, every glyph but the warnings and the projected line lifts one step,
-/// and every glyph of the lead and the tail is underlined in its own ink, but none of the
-/// chart's: an underline is drawn whatever the glyph, and under a level-2-to-8 line, a `╳` or
-/// `▕` it reads as a second line at level 1 (as S5 first lit it). NEGATIVE CONTROL: the measured
-/// levels' ink is not the projected line's.
+/// where the line says; lit, the lead and the tail each wear the glass's one hover from their
+/// first glyph to their last (every glyph the lit ink, a warning's its own, one lit underline
+/// under glyphs and the blanks between them, no weight changed), and the chart's cells and the
+/// blanks outside the words are as at rest: an underline is drawn whatever the glyph, and under
+/// a level-2-to-8 line, a `╳` or `▕` it reads as a second line at level 1 (as S5 first lit it).
+/// NEGATIVE CONTROL: the measured levels' ink is not the projected line's.
 #[test]
 fn the_quota_row_reads_and_lights_as_one() {
     let view = case("b");
@@ -568,6 +581,9 @@ fn the_quota_row_reads_and_lights_as_one() {
     compose_cells(&line, &key(false), &mut rest);
     compose_cells(&line, &key(true), &mut lit);
     assert_eq!(rest.len(), 166);
+    let (lead, tail) = super::words(&line);
+    let (lead, tail) = (super::inked(&line, &lead), super::inked(&line, &tail));
+    let lit_ink = rgb_of(glass.lit());
     for (i, &(ch, role, bold)) in line.cells.iter().enumerate() {
         let t = field(INDENT + i, cols);
         let want = match role {
@@ -585,27 +601,39 @@ fn the_quota_row_reads_and_lights_as_one() {
             "cell {i} {role:?}"
         );
         assert_eq!(rest[i].underline, UnderlineStyle::None, "cell {i}");
-        if line.chart.contains(&i) {
+        if lead.contains(&i) || tail.contains(&i) {
+            // The glass's one hover: lit whatever the role and the column, a warning's glyph
+            // its own ink, one lit underline under glyph and inner blank alike, no new weight.
+            let ink = if role == Role::Warn {
+                glass.warn()
+            } else {
+                glass.lit()
+            };
+            assert_eq!(lit[i].fg, rgb_of(ink), "cell {i} {ch:?} {role:?}");
             assert_eq!(
-                lit[i].underline,
-                UnderlineStyle::None,
-                "chart cell {i} {ch:?}"
+                (lit[i].underline, lit[i].underline_color),
+                (UnderlineStyle::Single, Some(lit_ink)),
+                "cell {i} {ch:?}"
             );
-            assert_eq!(lit[i].underline_color, None, "chart cell {i}");
-        } else if ch != ' ' {
-            assert_eq!(lit[i].underline, UnderlineStyle::Single, "cell {i}");
-            assert_eq!(lit[i].underline_color, Some(lit[i].fg), "cell {i}");
-        }
-        if ch != ' ' {
-            let lifts = !matches!(role, Role::Warn | Role::Line);
-            assert_eq!(lit[i].fg != rest[i].fg, lifts, "cell {i} {ch:?} {role:?}");
+            assert_eq!(lit[i].bold, rest[i].bold, "cell {i}: no weight changes");
+        } else {
+            // The chart keeps the inks it is read by and takes no line; a blank outside the
+            // words is no part of the row.
+            assert_eq!(lit[i], rest[i], "cell {i} {ch:?} {role:?}");
         }
     }
+    for part in [&lead, &tail] {
+        assert!(!part.is_empty(), "case (b) has a lead and a tail");
+        assert_ne!(line.cells[part.start].0, ' ', "from its first glyph");
+        assert_ne!(line.cells[part.end - 1].0, ' ', "to its last");
+        assert!(
+            part.clone().any(|i| line.cells[i].0 == ' '),
+            "CONTROL: a blank between its glyphs, underlined with them"
+        );
+    }
     assert!(
-        line.chart
-            .clone()
-            .any(|i| line.cells[i].1 == Role::Mark && lit[i].fg != rest[i].fg),
-        "lit, the chart's measured levels lift"
+        line.chart.start > lead.end || tail.start > line.chart.end,
+        "CONTROL: a blank between the words and the chart, which no line runs under"
     );
     assert!(rest[line.cells.len()..].iter().all(|c| c.ch == ' '));
     let ink_of = |role: Role| {
@@ -623,9 +651,10 @@ fn the_quota_row_reads_and_lights_as_one() {
 }
 
 /// THE QUOTA ROW READS, LIGHTS AND OPENS THE ACCOUNTS CARD (§2.6): the pointer on any part of
-/// the row lights the account, and with it every part of the row (the lead and the tail
-/// underlined, the chart's inks lifted), and the lead reads the account's title; a click on it
-/// opens the Accounts card through the account's own route. CONTROL: at rest nothing on the row
+/// the row lights the account, and with it the row's words (the lead and the tail, each hit
+/// underlined from its first glyph to its last; the chart keeps its inks), and the lead reads
+/// the account's title; a click on it
+/// opens the Account card through the account's own route. CONTROL: at rest nothing on the row
 /// is underlined, and the chart wears its resting inks.
 #[test]
 fn the_quota_row_reads_lights_and_opens_the_accounts_card() {
@@ -653,7 +682,9 @@ fn the_quota_row_reads_lights_and_opens_the_accounts_card() {
     for hit in &hits {
         hover(&mut app, wid, (hit.frame_row, hit.cols.0));
         assert_eq!(
-            app.windows[&wid].claude_lights.lit_fact(session),
+            app.windows[&wid]
+                .claude_lights
+                .lit_fact(session, aterm_agent::harness::footer::FactMask::default()),
             Some(FactKind::Account),
             "{:?}",
             hit.part
@@ -665,9 +696,27 @@ fn the_quota_row_reads_lights_and_opens_the_accounts_card() {
                     "{:?}: the chart is not underlined",
                     hit.part
                 );
-                assert_ne!(inks(&app, h), resting, "{:?}: the chart lifts", hit.part);
+                assert_eq!(
+                    inks(&app, h),
+                    resting,
+                    "{:?}: the chart keeps its inks",
+                    hit.part
+                );
             } else {
-                assert!(underlined(&app, h), "{:?}: the whole row lights", hit.part);
+                // The hit is the ink: every cell of it underlined, from a glyph to a glyph.
+                let cells = &app.windows[&wid].input_scratch.cells[h.frame_row][h.cols.0..h.cols.1];
+                assert!(
+                    cells.iter().all(|c| c.underline == UnderlineStyle::Single),
+                    "{:?}: the whole row lights, each word run under one line",
+                    hit.part
+                );
+                assert!(
+                    cells.first().is_some_and(|c| c.ch != ' ')
+                        && cells.last().is_some_and(|c| c.ch != ' '),
+                    "{:?}: {:?}'s hit runs from its first glyph to its last",
+                    hit.part,
+                    h.part
+                );
             }
         }
     }
@@ -770,7 +819,12 @@ fn leaving_or_unclaiming_the_quota_chart_clears_its_reading_and_cursor() {
 
     let (blank_x, blank_y) = px_of(&app, wid, (0, 0));
     app.on_cursor_moved(wid, blank_x, blank_y);
-    assert_eq!(app.windows[&wid].claude_lights.lit_fact(session), None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .lit_fact(session, aterm_agent::harness::footer::FactMask::default()),
+        None
+    );
     assert_eq!(app.windows[&wid].claude_lights.quota_column, None);
     assert_eq!(
         app.windows[&wid]
@@ -789,7 +843,12 @@ fn leaving_or_unclaiming_the_quota_chart_clears_its_reading_and_cursor() {
     probe::publish(&app, session, facts_with(Some(view), false));
     frame(&mut app, wid);
     app.refresh_glass_cursor_for_frame(wid);
-    assert_eq!(app.windows[&wid].claude_lights.lit_fact(session), None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .lit_fact(session, aterm_agent::harness::footer::FactMask::default()),
+        None
+    );
     assert_eq!(app.windows[&wid].claude_lights.quota_column, None);
     assert_eq!(
         app.windows[&wid]
@@ -1007,10 +1066,10 @@ fn no_midnight_strikes_a_letter() {
                 |i| {
                     chart
                         .get(i)
-                        .map_or(super::TickOn::Ground, |c| super::TickOn::of(c.0, false))
+                        .map_or(super::TickOn::Ground, |c| super::TickOn::of(c.0))
                 },
             );
-            let inks = super::TickInks::new(0x0088_8888, 0x00F8_FAFD, None);
+            let inks = super::TickInks::new(0x0088_8888, 0x00F8_FAFD);
             let rects: Vec<FxRect> =
                 super::tick_content(&laid, inks).map_or_else(Vec::new, |content| {
                     content
@@ -1111,7 +1170,9 @@ fn line_es_resets_are_drawn_as_the_glasss_marks() {
 #[test]
 fn the_kitty_keeps_off_the_painted_cells() {
     use aterm_effects::pet_world::PetRect;
-    let view = case("b");
+    // Case (a), whose narrowest rung fits the words beside the close notice (case (b)'s does not,
+    // `the_glass_covers_the_taps_words_beside_a_close_notice`).
+    let view = case("a");
     let words = WORDS.chars().count();
     let line = laid(&view, words);
     assert!(

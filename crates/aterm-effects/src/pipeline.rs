@@ -13,7 +13,7 @@ use aterm_render::{GlowQuad, InkCell, RainHalo, WordDecoration, theme_is_dark};
 use crate::matrix_rain::{RainCell, RainLayers};
 use aterm_render::sprites::{FreeSprite, SpriteLayers, WORD_SPRITE_SALT};
 
-use crate::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
+use crate::companion::{CompanionOwner, ContrastFallback, PetFacts, PetOwnership};
 use crate::cursor_fx::{CursorFx, CursorFxInput, brighten, compose_caret_style_override};
 use crate::cursor_glow::{Geom, GlowConfig, GlowStyle};
 use crate::cursor_momentum::MOMENTUM_GLOW_TAU_S;
@@ -186,6 +186,21 @@ struct CursorCoordinateSpace {
     chrome_head: u16,
 }
 
+/// `row`'s first `cols` cells as the glow engine's row probe reads a row (`'\0'` at a wide
+/// glyph's continuation, blanks to `cols`), into `out`.
+fn probe_chars(row: &[aterm_core::terminal::RenderCell], cols: usize, out: &mut Vec<char>) {
+    let slice = &row[..row.len().min(cols)];
+    out.clear();
+    out.reserve(cols);
+    let mut i = 0;
+    while i < slice.len() {
+        let cell = &slice[i];
+        out.push(if cell.wide { '\0' } else { cell.ch });
+        i += 1;
+    }
+    out.resize(cols, ' ');
+}
+
 /// The scroll decision both hosts take.
 #[inline]
 const fn content_scroll_decision(
@@ -257,6 +272,10 @@ pub struct EffectsPipeline {
     pending_keys: u32,
     /// Reused row material for the glow engine's row probe (`CursorGlow::observe_row`).
     row_probe_scratch: Vec<char>,
+    /// The rows over and under the caret's, read for the row probe's flanks where a test asks
+    /// for them ([`Self::set_probe_flanks`]): `None` while it does not.
+    #[cfg(any(test, debug_assertions))]
+    probe_flanks: Option<(Vec<char>, Vec<char>)>,
     /// The caret row the flying head last sat in the sky seat over
     /// ([`crate::rainbow_kitty::companion::SeatQuery::held_sky`]).
     flying_sky_row: Option<u16>,
@@ -305,8 +324,6 @@ pub struct EffectsPipeline {
     look: crate::companion_look::LookPolicy,
     /// The companions beside the resident pet ([`crate::companions`]).
     companions: crate::companions::Companions,
-    /// The glow style string named a pet at the last [`Self::set_cursor_glow`].
-    pet_style_named: bool,
     /// Output-streak engine.
     streak: Option<Box<OutputStreak>>,
     /// The streak knobs, kept across off/on toggles.
@@ -411,6 +428,8 @@ impl EffectsPipeline {
             bar_unanchored: false,
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
+            #[cfg(any(test, debug_assertions))]
+            probe_flanks: None,
             flying_sky_row: None,
             flying_fit: crate::rainbow_kitty::companion::HeadFit::WHOLE,
             flying_fit_goal: None,
@@ -431,7 +450,6 @@ impl EffectsPipeline {
             companion: CompanionOwner::default(),
             look: crate::companion_look::LookPolicy::default(),
             companions: crate::companions::Companions::default(),
-            pet_style_named: false,
             streak: None,
             streak_cfg: StreakConfig::default(),
             streak_reduced_motion: false,
@@ -853,13 +871,6 @@ impl EffectsPipeline {
         let color = color.masked();
         self.glow_trail_color = color;
         self.glow_explicit_accent = accent.is_some();
-        self.pet_style_named = GlowStyle::style_names_any_pet(style);
-        self.companion
-            .set_species(if GlowStyle::style_names_dog_pet(style) {
-                PetSpecies::Dog
-            } else {
-                PetSpecies::Cat
-            });
         self.glow_request = Some(GlowRequest {
             knobs: crate::cursor_fx::GlowKnobs {
                 enabled,
@@ -878,6 +889,19 @@ impl EffectsPipeline {
         if !enabled {
             self.cursor.glow.reset();
         }
+    }
+
+    /// Test seam: draw the rainbow's ribbon body in a shape no built-in theme picks (the tall
+    /// body, or the tall body held flat), until the next [`Self::set_cursor_glow`]. The `rainbow`
+    /// theme is the underline; the other bodies stay engine data the replays still judge.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_ribbon_shape(&mut self, tall: bool, flat: bool) {
+        if let Some(request) = self.glow_request.as_mut() {
+            request.spelling.ribbon_tall = tall;
+            request.spelling.ribbon_flat = flat;
+        }
+        self.resolve_glow();
     }
 
     /// Set only the glow's trail colour.
@@ -1064,6 +1088,18 @@ impl EffectsPipeline {
     #[must_use]
     pub fn thin_caret_ground(&self) -> Option<u32> {
         self.cursor.glow.thin_caret_read.map(|(_, ground)| ground)
+    }
+
+    /// A test's host: with `on`, [`Self::apply`]'s row probe carries the rows over and under
+    /// the caret's (`RowProbe::flanks`), read off the frame's cells, as the window's host hands
+    /// them (`aterm-gui`'s `app_render`). [`Self::apply`] hands none by itself, so a row whose
+    /// next row holds letters is not known to (the rainbow ribbon draws its rail under it), and
+    /// no star lands by a row nobody read: a replay that is to draw what the window draws on
+    /// such a row asks for them.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_probe_flanks(&mut self, on: bool) {
+        self.probe_flanks = on.then(Default::default);
     }
 
     /// A test's negative control: `on == false` pins the frame's `head_dx` to `0.5`, so every
@@ -1292,10 +1328,17 @@ impl EffectsPipeline {
         self.cursor.glow.set_bed_page_lit(on);
     }
 
-    /// Opt the resident pet in (or out).
+    /// Opt the resident pet in (or out). The pet is the host's `cursor_pet` setting: it walks
+    /// beside every trail style and beside the plain cursor.
     #[inline]
     pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
         self.companion.set_enabled_seed(enabled, seed);
+    }
+
+    /// Which animal the resident pet is ([`crate::cursor_pet`]).
+    #[inline]
+    pub const fn set_cursor_pet_species(&mut self, species: PetSpecies) {
+        self.companion.set_species(species);
     }
 
     /// The host's stable reduce-motion preference for every effect.
@@ -1969,20 +2012,28 @@ impl EffectsPipeline {
         let probe_row = if let Some((row, caret)) = cur
             && let Some(render_row) = input.cells.get(usize::from(row))
         {
-            let slice = &render_row[..render_row.len().min(input.cols)];
-            self.row_probe_scratch.clear();
-            self.row_probe_scratch.reserve(input.cols);
-            let mut i = 0;
-            while i < slice.len() {
-                let cell = &slice[i];
-                self.row_probe_scratch
-                    .push(if cell.wide { '\0' } else { cell.ch });
-                i += 1;
-            }
-            self.row_probe_scratch.resize(input.cols, ' ');
+            probe_chars(render_row, input.cols, &mut self.row_probe_scratch);
             Some((row, caret))
         } else {
             None
+        };
+        // The flanks a test's host asked for: each neighbour row the frame holds, off the grid
+        // where it holds none (the window's `row > 0` and `row + 1 < rows`).
+        #[cfg(any(test, debug_assertions))]
+        let flank_rows = match (probe_row, self.probe_flanks.as_mut()) {
+            (Some((row, _)), Some((above, below))) => {
+                let row = usize::from(row);
+                let over = row.checked_sub(1).and_then(|r| input.cells.get(r));
+                let under = input.cells.get(row + 1).filter(|_| row + 1 < input.rows);
+                if let Some(cells) = over {
+                    probe_chars(cells, input.cols, above);
+                }
+                if let Some(cells) = under {
+                    probe_chars(cells, input.cols, below);
+                }
+                Some((over.is_some(), under.is_some()))
+            }
+            _ => None,
         };
 
         let mut trail_cfg = self.trail_cfg;
@@ -2047,6 +2098,15 @@ impl EffectsPipeline {
                     caret,
                     trust: crate::cursor_glow::ProbeTrust::Full,
                     cols: &self.row_probe_scratch,
+                    #[cfg(any(test, debug_assertions))]
+                    flanks: match (flank_rows, self.probe_flanks.as_ref()) {
+                        (Some((over, under)), Some((above, below))) => Some((
+                            over.then_some(above.as_slice()),
+                            under.then_some(below.as_slice()),
+                        )),
+                        _ => None,
+                    },
+                    #[cfg(not(any(test, debug_assertions)))]
                     flanks: None,
                 }),
                 None => None,
@@ -2114,7 +2174,7 @@ impl EffectsPipeline {
         })
         .with_reduced_motion(!animate)
         .with_serious(self.serious);
-        if self.pet_style_named && self.glow_cfg.enabled && self.companion.enabled() {
+        if self.companion.enabled() {
             let pet_world = crate::pet_world::PetWorldFacts::read(term, term.render_identity());
             let _ = self.companion.observe_console(
                 input,
@@ -2127,10 +2187,8 @@ impl EffectsPipeline {
             PetFacts::new(
                 &facts,
                 &host,
-                GlowOwnership {
-                    enabled: self.glow_cfg.enabled,
-                    style: self.glow_cfg.style,
-                    style_raw_names_pet: self.pet_style_named,
+                PetOwnership {
+                    on: self.companion.enabled(),
                 },
             )
             .with_focused(focused),

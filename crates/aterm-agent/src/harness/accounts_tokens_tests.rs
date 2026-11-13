@@ -11,7 +11,7 @@ use super::*;
 use crate::harness::align::Captured;
 use crate::harness::cli::{AccountsCmd, Cmd, run_accounts};
 use crate::harness::setup_token::tests::{World, token as sentinel};
-use aterm_secrets::claude_token::{Check, Verified};
+use aterm_secrets::claude_token::{Check, Mismatch, Verified};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::Path;
@@ -81,6 +81,7 @@ impl Scratch {
             codex_thread: None,
             agy_conversation: None,
             codex_home: None,
+            xdg_config_home: None,
             codex_login: None,
             now: i64::try_from(NOW).unwrap(),
             sid: "s-test".to_owned(),

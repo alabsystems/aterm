@@ -34,8 +34,8 @@ usage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|
                         else the Cargo registry, fetched when missing)
   --out <dir>           gen only: write into a checkout-shaped output tree
   --target-dir <dir>    record/oracle/oracle-052 build dir (default: $ORACLE_TARGET_DIR, else
-                        <root>/win32-oracle/target.noindex; for oracle-052,
-                        <root>/crates/aterm-windows-sys-052/tests/oracle/target.noindex)
+                        <root>/win32-oracle/.ubd/target.noindex; for oracle-052,
+                        <root>/crates/aterm-windows-sys-052/tests/oracle/.ubd/target.noindex)
   --stock <toolchain>   oracle/oracle-052 only: stock rustup toolchain (default: the checkout's
                         stock pin, aterm_toolchain::rustup::STOCK_PIN)
   --no-format           gen only: skip trustfmt on emitted Rust
@@ -702,7 +702,7 @@ fn start() -> Result<u8> {
         answerable(&root, &format!("{}/Cargo.toml", facade052::WORKSPACE))?;
         let tools = tools(&root, stock.as_deref())?;
         let target =
-            target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
+            target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join(".ubd/target.noindex"));
         let _held = hold_target(&target, &verb, &root, &mut |line| println!("{line}"))?;
         return facade052::gate(&root, &tools, &target);
     }
@@ -710,7 +710,7 @@ fn start() -> Result<u8> {
     // oracle and record build win32-oracle/ frozen. gen and check only read
     // the registry copy its lock pins, so they resolve it only when none is
     // unpacked, and run offline from one a prune left.
-    let target = target.unwrap_or_else(|| root.join("win32-oracle/target.noindex"));
+    let target = target.unwrap_or_else(|| root.join("win32-oracle/.ubd/target.noindex"));
     let _held = if verb == "oracle" || verb == "record" {
         answerable(&root, REFERENCE)?;
         Some(hold_target(&target, &verb, &root, &mut |line| {

@@ -219,6 +219,8 @@ unsafe extern "C" {
     /// success.
     pub fn notify_get_state(token: c_int, state: *mut u64) -> u32;
     pub fn notify_cancel(token: c_int) -> u32;
+    /// Posts `name` to every process registered for it; 0 on success.
+    pub fn notify_post(name: *const c_char) -> u32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

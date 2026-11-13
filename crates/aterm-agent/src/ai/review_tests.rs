@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here run a Codex review, which needs native credential custody,
+// which only Unix has (`codex_source_gate`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::*;
-use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, KIMI, MUSE};
+#[cfg(unix)]
+use crate::ai::connector::MUSE;
+use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, KIMI};
 use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::permission::Level;
 use crate::ai::state::{Mark, State};
@@ -13,6 +25,8 @@ fn machine(installed: &[&str]) -> crate::ai::testing::Box3 {
     let machine = bare_machine(installed);
     // The real native profile is private before credential fixtures create
     // nested login directories; reviewer HOME overrides remain independent.
+    // Only Unix has native credential custody (`codex_source_gate`).
+    #[cfg(unix)]
     drop(crate::harness::codex_source_gate::SourceWorkLease::for_home(&machine.home).unwrap());
     machine
 }
@@ -312,6 +326,7 @@ fn candidates_skip_the_asker_and_the_limited_and_keep_the_unmeasured() {
     assert!(got[0].1.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_not() {
     let b = machine(&["claude", "codex"]);
@@ -399,6 +414,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_and_level() {
     let b = machine(&["claude", "codex"]);
@@ -520,6 +536,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
     assert_eq!(codex.args.last().map(String::as_str), Some("-"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_codex_review_holds_source_exclusion_until_its_owned_runner_returns() {
     use crate::harness::codex_source_gate::PublicationLock;
@@ -581,6 +598,7 @@ fn a_codex_review_holds_source_exclusion_until_its_owned_runner_returns() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_primers_marker_never_reaches_the_asker_and_a_failure_says_why() {
     assert_eq!(
@@ -767,6 +785,7 @@ fn change_with(diff: &str) -> Change {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_outcome_under_another_home_is_recorded_nowhere() {
     let b = machine(&["codex"]);
@@ -820,6 +839,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_limit_keeps_the_cli_out_of_reviews_for_a_while() {
     let b = machine(&["codex"]);
@@ -937,6 +957,7 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn a_review_auth_completion_cannot_end_a_newer_successful_login() {
     let (record, expected) = review_auth_after_login(Some(200));
@@ -948,6 +969,7 @@ fn a_review_auth_completion_cannot_end_a_newer_successful_login() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_review_auth_completion_cannot_end_a_same_second_replacement_login() {
     let (record, expected) = review_auth_after_login(Some(100));
@@ -959,6 +981,7 @@ fn a_review_auth_completion_cannot_end_a_same_second_replacement_login() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_review_auth_completion_still_records_the_login_it_started_under() {
     let (record, replacement) = review_auth_after_login(None);
@@ -1010,6 +1033,7 @@ fn review_at(c: &'static Connector, level: Level) -> (Vec<Answer>, Vec<Vec<Strin
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn each_reviewer_runs_at_the_level_in_its_own_flags() {
     let has = |args: &[String], want: &[&str]| args.windows(want.len()).any(|w| w == want);
@@ -1516,6 +1540,7 @@ fn review_on_frozen_login_with_env(
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn reviewers_keep_the_frozen_login_instead_of_inherited_credential_overrides() {
     let mut wrong = Vec::new();
@@ -1636,6 +1661,7 @@ fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
 /// nothing is run, and the answer names the pin of the default row as its fix where that row can
 /// serve. Where it stands at a wall, the answer says so and offers no pin (the next read of the
 /// wall would end it). The default row's review needs no such build.
+#[cfg(unix)]
 #[test]
 fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth_path() {
     use crate::ai::facts::CliAccounts;
@@ -1768,6 +1794,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_account_serves() {
     use crate::ai::facts::{Machine, gather};
@@ -2292,6 +2319,7 @@ impl ReviewPool {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_review_result_cannot_heal_or_limit_a_replacement_login() {
     use crate::harness::accounts::{self, Auth, Cli};
@@ -2453,6 +2481,7 @@ fn a_review_result_cannot_heal_or_limit_a_replacement_login() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_in_flight_review_cannot_restore_a_cleared_quota_wall() {
     use crate::harness::accounts::{self, Cli};
@@ -2500,6 +2529,7 @@ fn an_in_flight_review_cannot_restore_a_cleared_quota_wall() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_isolated_review_cannot_heal_or_extend_default_login_health() {
     use crate::ai::store::{Ended, How, Outcome};
@@ -2920,6 +2950,7 @@ fn a_review_that_heals_an_unbound_login_retains_its_served_time() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_later_review_wave_uses_current_selection_and_refuses_unusable_accounts() {
     use crate::harness::accounts::{self, Auth, Cli};
@@ -3028,6 +3059,7 @@ fn a_later_review_wave_uses_current_selection_and_refuses_unusable_accounts() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_roster_created_between_review_waves_controls_the_later_login() {
     use crate::harness::accounts::Cli;
@@ -3106,6 +3138,7 @@ fn a_roster_created_between_review_waves_controls_the_later_login() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_roster_created_during_an_unmanaged_review_rejects_its_old_health_result() {
     use crate::harness::accounts::{Auth, Cli};
@@ -3165,6 +3198,7 @@ fn codex_storage(pool: &ReviewPool, mode: &str) {
     .unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn completed_codex_health_does_not_cross_credential_backends() {
     use crate::harness::accounts::Cli;
@@ -3234,6 +3268,7 @@ fn legacy_health_is_retained_without_guessing_a_codex_backend() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_preparation_cannot_publish_into_a_restored_health_store() {
     use crate::harness::accounts::Cli;
@@ -3281,6 +3316,7 @@ fn review_preparation_refreshes_codex_storage_mode() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn review_outcomes_do_not_cross_codex_storage_changes() {
     use crate::harness::accounts::Cli;
@@ -3505,6 +3541,7 @@ pub(crate) fn review_storage_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn review_storage_conforms_to_current_backend() {
     let model = aterm_models_harness::account_review_storage_model();
@@ -3538,6 +3575,7 @@ fn review_storage_conforms_to_current_backend() {
     assert!(!model.check_invariant("FileEvidence", &bad));
 }
 
+#[cfg(unix)]
 #[test]
 fn invalid_codex_storage_configuration_refuses_reviews_and_health() {
     use crate::harness::accounts::Cli;
@@ -4133,6 +4171,7 @@ fn review_preparation_conforms_to_current_account_scope() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_prepared_credential_needs_execution_authority_before_review_or_launch() {
     use crate::harness::accounts::Cli;
@@ -4201,6 +4240,7 @@ fn a_claude_review_skips_a_prepared_credential_for_an_authorized_one() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_prepared_pin_never_falls_through_to_another_account() {
     use crate::harness::accounts::Cli;
@@ -4560,6 +4600,7 @@ fn review_cases() -> [ReviewCase; 11] {
 /// another row by rotation). THE GAP: a new read of `enabled` that goes around `accounts_for`, in
 /// either path, shows only at those two, and a wall or a sign-out under those two switches no
 /// longer runs.
+#[cfg(unix)]
 #[test]
 fn a_pooled_review_takes_what_a_launch_takes() {
     use crate::harness::accounts::Cli;
@@ -4718,7 +4759,9 @@ fn a_read_with_room_outranks_a_full_rollout_reading_older_than_it() {
         ]
         .concat();
         std::fs::write(&log, body).unwrap();
-        std::fs::File::open(&log)
+        std::fs::File::options()
+            .write(true)
+            .open(&log)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at as u64))
             .unwrap();
@@ -4837,7 +4880,8 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
     struct OnlyGit;
     impl Runner for OnlyGit {
         fn run(&self, job: &Job<'_>) -> Result<Ran, RunFailed> {
-            if job.program.file_name().is_some_and(|name| name == "git") {
+            let git = std::ffi::OsString::from(format!("git{}", std::env::consts::EXE_SUFFIX));
+            if job.program.file_name() == Some(git.as_os_str()) {
                 LiveRunner.run(job)
             } else {
                 Ok(ran(0, "fine", ""))
@@ -4879,6 +4923,22 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
     let outside = pool.b.dir.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
 
+    // Review's declared tool path must select the same genuine kept Git as repository setup.
+    // The OS-only path can instead select Apple's dispatcher, which needs activated Xcode.
+    let review_git = crate::test_program::git();
+    let review_path = std::env::join_paths([
+        review_git.parent().expect("kept Git has a parent"),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap()
+    .into_string()
+    .expect("fixture Git path is UTF-8");
+    assert_eq!(
+        crate::ai::change::git_program(Some(&review_path), &repo),
+        Some(std::fs::canonicalize(review_git).unwrap())
+    );
+
     let reads = AtomicUsize::new(0);
     let room = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
         reads.fetch_add(1, Ordering::SeqCst);
@@ -4899,7 +4959,7 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
             home: Some(pool.b.home.clone()),
             vars: vec![
                 ("HOME".to_string(), pool.b.home.display().to_string()),
-                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("PATH".to_string(), review_path.clone()),
             ],
             config: Some(cfg),
             aterm_state: Some(pool.b.state.clone()),

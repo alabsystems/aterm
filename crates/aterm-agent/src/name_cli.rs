@@ -13,17 +13,22 @@ pub const USAGE: &str = "\
 aterm name — this machine's name: its NAME (`m8`, or `unnumbered` until it is numbered) and nickname
 
   aterm name [--json]
+  aterm name sync [--json]
   aterm name set <mN|N> [--nick <word>] [--dry-run] [--json]
   aterm name nick <word> | --random  [--dry-run] [--json]
 
   `aterm name` prints `m8 Heron  class=seeded fleet=in node=<node id>` (`fleet=` is in,
-  joining, out, or unread where the vault's state cannot be read), or with `--json` one
+  joining, out, paused where custody refuses traffic, or unread where the vault's state cannot be read), or with `--json` one
   object of its fields; the first run to find no `machine-name.toml` makes it. `set` chooses
   this machine's number, optionally its nickname in the same change; a number another signed
   node currently holds is refused. A successful set also records the explicit naming policy
   and publishes the checked fleet name. On macOS the existing setup authorization changes all three system names,
   generated from the saved number and nickname. Missing authorization stays pending; this
   command does not open a password prompt.
+  `sync` aligns only the three macOS names with the fresh saved number and nickname,
+  using that same existing authorization. It chooses no number or nickname, creates no
+  missing name, and writes no naming policy or fleet record. A hold, unavailable permission,
+  or collision alias stays pending (exit 1); this command never opens a password prompt.
   `nick` sets the
   nickname to <word> (one argument: quote `Blue Heron`) or to a noun drawn again, as a chosen
   nickname, and prints the name as it then stands; `--dry-run` changes no nickname (a first
@@ -38,6 +43,8 @@ enum Mode {
     Help,
     /// The name, as a line or (`--json`) one object.
     Show { json: bool },
+    /// `sync`: align only macOS's names with the saved naming intent.
+    Sync { json: bool },
     /// `set`: choose the number and optionally a nickname in one change.
     Set { to: Name, dry_run: bool, json: bool },
     /// `nick`: set the nickname, then show the name as `Show` does.
@@ -71,8 +78,10 @@ fn parse(argv: &[OsString]) -> Result<Mode, String> {
     if words.first() == Some(&"set") {
         return parse_set(&words[1..]);
     }
+    let sync = words.first() == Some(&"sync");
+    let words = if sync { &words[1..] } else { &words[..] };
     let mut json = false;
-    for word in words {
+    for &word in words {
         match word {
             "-h" | "--help" => return Ok(Mode::Help),
             "--json" if json => return Err("`--json` is given twice".to_owned()),
@@ -81,7 +90,11 @@ fn parse(argv: &[OsString]) -> Result<Mode, String> {
             arg => return Err(format!("`{arg}` is no `aterm name` argument")),
         }
     }
-    Ok(Mode::Show { json })
+    Ok(if sync {
+        Mode::Sync { json }
+    } else {
+        Mode::Show { json }
+    })
 }
 
 fn parse_set(words: &[&str]) -> Result<Mode, String> {
@@ -170,11 +183,19 @@ fn parse_nick(words: &[&str]) -> Result<Mode, String> {
 }
 
 /// `aterm name …`: `argv[1..]` in, exit code out (2 for a usage error or a platform that keeps no
-/// machine name, 1 for a name that cannot be read, made or changed).
-pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
+/// machine name, 1 for a name that cannot be read, made, changed or synchronized).
+/// `sync_saved` is the application's OS-only saved-intent operation; only `sync` calls it.
+pub fn main_entry(
+    argv: Vec<OsString>,
+    sync_saved: impl FnOnce() -> Result<Option<String>, String>,
+) -> ExitCode {
     match parse(&argv) {
         Ok(Mode::Help) => aterm_uds::stdout::answer_exit("aterm name", USAGE, 0),
         Ok(Mode::Show { json }) => show(json),
+        Ok(Mode::Sync { json }) => {
+            let (text, code) = sync_report(sync_saved(), json);
+            aterm_uds::stdout::answer_exit("aterm name sync", &text, code)
+        }
         Ok(Mode::Set { to, dry_run, json }) => set(&to, dry_run, json),
         Ok(Mode::Nick { to, dry_run, json }) => nick(&to, dry_run, json),
         Err(why) => {
@@ -182,6 +203,30 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn sync_report(result: Result<Option<String>, String>, json: bool) -> (String, u8) {
+    let (status, message, code) = match result {
+        Ok(Some(message)) => ("aligned", message, 0),
+        Ok(None) => (
+            "pending",
+            "the saved name has no admitted macOS projection; no names changed".to_owned(),
+            1,
+        ),
+        Err(why) => ("pending", why, 1),
+    };
+    let text = if json {
+        let mut object = aterm_json::Map::new();
+        object.insert("status".into(), aterm_json::Value::String(status.into()));
+        object.insert("message".into(), aterm_json::Value::String(message));
+        let mut text = aterm_json::to_string(&aterm_json::Value::Object(object))
+            .expect("string fields are JSON");
+        text.push('\n');
+        text
+    } else {
+        format!("{status}: {message}\n")
+    };
+    (text, code)
 }
 
 /// `aterm name set`: aterm.toml's naming policy is read first (a dry run's too), so a naming

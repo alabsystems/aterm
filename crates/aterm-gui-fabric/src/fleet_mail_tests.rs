@@ -436,6 +436,37 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
     );
     assert!(refused.facts.lock().unwrap().is_empty());
     assert_eq!(refused.drives.lock().unwrap().len(), 1);
+
+    // A manager's Mac at Read Only refuses the post under the lock's head: one drive, one
+    // record, and the record says what still reads the worker instead of quoting a fault.
+    use aterm_types::fleet_access::{DriveKind, FleetAccess};
+    let answer = FleetAccess::ReadOnly
+        .refusal(DriveKind::Post)
+        .expect("Read Only takes no mail");
+    let wire = format!("{answer}; not `post`\n");
+    let locked = Session {
+        drive: Some(Box::new(move |_, _| Ok(wire.clone()))),
+        ..session(&scratch.path().join("locked/inbox.toml"))
+    };
+    let unsent = report(&locked, to, "s-12345678.need.1", line).expect_err("refused");
+    let crate::report::Unsent::Answered { answer, .. } = &unsent else {
+        panic!("{unsent:?}");
+    };
+    assert_eq!(
+        FleetAccess::refused_at(answer),
+        Some((FleetAccess::ReadOnly, FleetAccess::ReadWrite)),
+        "{answer}"
+    );
+    assert!(
+        !unsent.to_string().contains(answer.as_str()),
+        "the record quotes no fault: {unsent}"
+    );
+    assert!(locked.facts.lock().unwrap().is_empty());
+    assert_eq!(
+        locked.drives.lock().unwrap().len(),
+        1,
+        "sent once, never again"
+    );
 }
 
 /// A REPORT FROM A SESSION LEAVING THE ROSTER GOES BY DIRECT FLEET MAIL EVEN TO A MAC THE MESH

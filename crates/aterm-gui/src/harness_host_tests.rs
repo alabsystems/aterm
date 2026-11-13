@@ -929,7 +929,7 @@ fn a_hung_landing_look_holds_the_restored_queue_one_bound_at_most() {
                 .attempts
                 .iter()
                 .find(|at| at.agent.sid == sid)
-                .map(|at| (at.landed, at.tried))
+                .map(|at| (at.looking, at.landed, at.tried))
         };
         let said_now = || said.lock().unwrap().clone();
         let over = || {
@@ -938,7 +938,7 @@ fn a_hung_landing_look_holds_the_restored_queue_one_bound_at_most() {
         };
         if hangs {
             until("the next tab's step, while the first's look is out", || {
-                queued(b).is_none_or(|(landed, _)| landed)
+                queued(b).is_none_or(|(looking, landed, _)| looking || landed)
             });
             assert_eq!(
                 said_now(),
@@ -947,8 +947,9 @@ fn a_hung_landing_look_holds_the_restored_queue_one_bound_at_most() {
             );
             assert_eq!(
                 (queued(a), queued(b)),
-                (Some((true, 1)), Some((true, 1))),
-                "both kept as landings no read reaches yet"
+                (Some((true, false, 1)), Some((true, false, 1))),
+                "both kept as landings whose look is not back: nothing yet says an agent holds \
+                 either tab"
             );
             said.lock().unwrap().push("let go".to_string());
             *gate.0.lock().unwrap() = true;
@@ -993,6 +994,91 @@ fn a_hung_landing_look_holds_the_restored_queue_one_bound_at_most() {
             publish_snapshot(sid, None);
         }
     }
+}
+
+/// A landing's look that did not come back, one past its bound or one never started behind
+/// another still out, says nothing of its agent: once looks come back and find nothing in either
+/// tab, each agent is left to the roster as a first look leaves it, and neither relaunch is made
+/// again. The control, a look that found the agent first, is
+/// [`a_landing_look_not_back_says_nothing_of_its_agent`]'s.
+#[test]
+fn a_landing_whose_look_did_not_come_back_is_not_relaunched_again() {
+    let _lane = crate::message_inbox::own_lane_for_test();
+    let (a, b) = ("s-lo-a", "s-lo-b");
+    let world = Arc::new(World::default());
+    let said: Arc<Mutex<Vec<String>>> = Arc::default();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut h = hooks(&world, parking_body(&world));
+    let acted = Arc::clone(&said);
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _, _| {
+        acted.lock().unwrap().push(format!("act {sid}"));
+        "adopted".to_string()
+    });
+    let (looked, g, first) = (Arc::clone(&said), Arc::clone(&gate), AtomicBool::new(true));
+    h.acts.snapshot = Arc::new(move |sid| {
+        looked.lock().unwrap().push(format!("look {sid}"));
+        if sid == a && first.swap(false, Ordering::SeqCst) {
+            let (open, opened) = &*g;
+            let _ = opened
+                .wait_timeout_while(
+                    open.lock().unwrap(),
+                    aterm_spec::wait::MUST_HAPPEN,
+                    |open| !*open,
+                )
+                .unwrap();
+        }
+        None
+    });
+    h.acts.adopted_gone = Arc::new(|_, _| None);
+    h.acts.point_read = POINT_READ_BOUND;
+    let host = HostHandle::start(on(), false, false, h);
+    host.relaunch_restored(vec![restored(a, "in tab 1"), restored(b, "in tab 2")]);
+    let kept = |sid: &str| {
+        host.shared
+            .restored
+            .lock()
+            .unwrap()
+            .attempts
+            .iter()
+            .find(|at| at.agent.sid == sid)
+            .map(|at| (at.acting, at.tried))
+    };
+    until("both relaunched, the first's look still out", || {
+        [a, b].iter().all(|sid| kept(sid) == Some((false, 1)))
+    });
+    assert_eq!(
+        *said.lock().unwrap(),
+        [format!("act {a}"), format!("look {a}"), format!("act {b}")],
+        "the first's look out past its bound, the second's never started"
+    );
+    said.lock().unwrap().push("let go".to_string());
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    until("both landings over", || {
+        let queue = host.shared.restored.lock().unwrap();
+        queue.attempts.is_empty() && !queue.running
+    });
+    let said = said.lock().unwrap().clone();
+    let count = |word: String| said.iter().filter(|w| **w == word).count();
+    assert_eq!(
+        (count(format!("act {a}")), count(format!("act {b}"))),
+        (1, 1),
+        "each relaunched once, its agent left to the roster: {said:?}"
+    );
+    let let_go = said.iter().position(|w| w == "let go").unwrap();
+    for sid in [a, b] {
+        assert!(
+            said[let_go..].contains(&format!("look {sid}")),
+            "{sid} looked at once looks came back: {said:?}"
+        );
+    }
+    let queue = host.shared.restored.lock().unwrap();
+    assert!(
+        queue.missed.is_empty() && queue.said.is_empty(),
+        "both left to the roster as relaunched"
+    );
+    drop(queue);
+    host.shutdown_and_join();
 }
 
 #[test]
@@ -1331,6 +1417,7 @@ fn landing_attempt(tried: u32, landed: bool) -> RestoredAttempt {
         agent_seen: false,
         carried: false,
         landed,
+        looking: false,
         faults: 0,
         in_flight_only: false,
         revoked: Arc::default(),
@@ -1351,6 +1438,7 @@ fn queued_attempt(agent: RestoredAgent, order: usize) -> RestoredAttempt {
         agent_seen: false,
         carried: false,
         landed: false,
+        looking: false,
         faults: 0,
         in_flight_only: false,
         revoked: Arc::default(),
@@ -1398,6 +1486,56 @@ fn a_restored_landing_the_record_says_died_is_relaunched_again() {
         }
         LandingEnd::Keep(_) => panic!("left to the roster"),
     }
+}
+
+/// A look that did not come back ([`LandingLook::Out`]) keeps its attempt for another look and
+/// learns nothing: no try spent, its line still typed, and a first look that did not come back
+/// leaves the next one first, whose Gone leaves the agent to the roster. CONTROL: once a look found
+/// the agent holding its tab, a look that did not come back unlearns nothing, and a later Gone
+/// makes the relaunch again.
+#[test]
+fn a_landing_look_not_back_says_nothing_of_its_agent() {
+    fn keep(attempt: RestoredAttempt, look: LandingLook) -> RestoredAttempt {
+        match restored_landing_ends(attempt, look, LANDED_LOOK, RESTORED_FIRST_PAUSE) {
+            LandingEnd::Keep(attempt) => attempt,
+            LandingEnd::Over(_, last, step) => panic!("{look:?}: kept, not over: {last:?} {step}"),
+        }
+    }
+    let before = Instant::now();
+    let out = keep(landing_attempt(1, false), LandingLook::Out);
+    assert!(
+        out.looking && !out.landed,
+        "looked at again, nothing learned"
+    );
+    assert!(out.typed(), "its line was typed: a handoff carries it");
+    assert_eq!(
+        (out.tried, out.pause),
+        (1, RESTORED_FIRST_PAUSE),
+        "no try spent, no back-off"
+    );
+    assert!(out.due >= before + LANDED_LOOK, "looked at again");
+    let out = keep(out, LandingLook::Out);
+    assert!(out.looking && !out.landed, "nor by a second");
+    match restored_landing_ends(out, LandingLook::Gone, LANDED_LOOK, RESTORED_FIRST_PAUSE) {
+        LandingEnd::Over(_, last, step) => {
+            assert_eq!(
+                (last, step),
+                (Outcome::Relaunched, "landed"),
+                "left to the roster"
+            );
+        }
+        LandingEnd::Keep(_) => panic!("left to the roster, never relaunched again"),
+    }
+
+    let held = keep(landing_attempt(1, false), LandingLook::Unread);
+    assert!(held.landed && !held.looking, "a look found its agent");
+    let held = keep(held, LandingLook::Out);
+    assert!(held.landed && !held.looking, "and one not back unlearns it");
+    let again = keep(held, LandingLook::Gone);
+    assert!(
+        !again.landed && !again.looking && !again.typed(),
+        "it exited before any read reached it: its relaunch is made again"
+    );
 }
 
 #[test]
@@ -3655,7 +3793,7 @@ fn a_crashs_surviving_record_is_what_the_layout_names_through_the_back_off() {
         let record = SessionFile {
             pid: snap(sid).pid,
             session_id: session.to_string(),
-            cwd: "/".to_string(),
+            cwd: snap(sid).cwd,
             version: "2.1.281".to_string(),
             status: "busy".to_string(),
             status_updated_at_ms: 1,
@@ -4255,6 +4393,48 @@ fn a_restart_carry_held_by_keys_is_tried_again_once_its_own_grace_lets_them_go()
             relaunch::CARRY_EVERY
         ],
         "control: with no key, each miss climbs the back-off"
+    );
+}
+
+#[test]
+fn a_self_claimed_restart_waits_for_new_keys_then_hands_back_an_unread_exit() {
+    let a = Arc::new(Acting::default());
+    a.unreadable.store(true, Ordering::SeqCst);
+    let hooks = a.hooks();
+    let job = left_job("s-self-restart-keys", Program::Codex, &on());
+    with_kept(&job, |k| {
+        k.relaunches
+            .exited_as(OnExit::Asked, false, Instant::now())
+            .expect("an explicit restart owns its exit");
+    });
+    let mut attempts = 0;
+    let unread = relaunch_until_with(
+        &job,
+        &hooks,
+        Duration::ZERO,
+        &|| OnExit::Asked,
+        Some(&|| 120),
+        GoneUnread::HandedBack,
+        || {
+            attempts += 1;
+            if attempts == 1 {
+                *a.human_ms.lock().unwrap() = Some(0);
+                "wait:held".to_string()
+            } else {
+                *a.human_ms.lock().unwrap() = None;
+                "done:resumed".to_string()
+            }
+        },
+    );
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        a.pauses.lock().unwrap()[..2],
+        [Duration::ZERO, Duration::from_secs(121)],
+        "new keys time the owed line instead of the crash back-off"
+    );
+    assert!(
+        unread,
+        "the relaunched self-supervised process owns its unread exit"
     );
 }
 
@@ -7131,6 +7311,14 @@ struct Acting {
     /// A relaunched agent is owed its continuation (an `adopted` relaunch
     /// sets it, a `done` carry-on clears it — the state file's part).
     owed: AtomicBool,
+    /// The carry-on's look runs past its clock: nothing is owed once a carry-on is taken,
+    /// whatever its word, and the look still stands to be closed.
+    look_over: AtomicBool,
+    /// What each close of the tab's looks answers ([`Acts::close_looks`]), in turn; nothing
+    /// closed once spent.
+    closes: Mutex<VecDeque<&'static str>>,
+    /// The closes asked for.
+    closed: AtomicUsize,
     /// The agent whose record [`Self::owed`] is (`None`: any asker's): a
     /// worker that carries one agent's record alone ([`carries_only`]) is
     /// owed nothing of another's.
@@ -7370,7 +7558,8 @@ fn snap(sid: &str) -> Snapshot {
         program: std::path::PathBuf::from("/opt/claude"),
         argv: vec!["/opt/claude".to_string()],
         session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-        cwd: "/".to_string(),
+        // The root this host reads as absolute (`C:/` on Windows), as a relaunch's facts require.
+        cwd: crate::test_host::abs("/"),
         version: Some("2.1.281".to_string()),
         run: aterm_agent::harness::relaunch::AgentRun::Claude,
         dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
@@ -7542,6 +7731,7 @@ impl Acting {
                 start: self.start_of(sid, pid),
                 cause,
                 at: aterm_time::unix_secs().unwrap_or(0),
+                input: None,
             },
         )
         .expect("the stamp");
@@ -7654,6 +7844,7 @@ impl Acting {
         let (a26, a25b) = (w(self), w(self));
         let (a27, a28, a29) = (w(self), w(self), w(self));
         let (a5e, a5d) = (w(self), w(self));
+        let a_close = w(self);
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
@@ -7881,7 +8072,15 @@ impl Acting {
                     {
                         a9.owed.store(false, Ordering::SeqCst);
                     }
+                    if a9.look_over.load(Ordering::SeqCst) {
+                        a9.owed.store(false, Ordering::SeqCst);
+                    }
                     step.to_string()
+                }),
+                close_looks: Arc::new(move |_| {
+                    a_close.closed.fetch_add(1, Ordering::SeqCst);
+                    let step = a_close.closes.lock().unwrap().pop_front();
+                    step.map(str::to_string)
                 }),
                 settle: Arc::new(move |_| {
                     a25.settled.fetch_add(1, Ordering::SeqCst);
@@ -10002,14 +10201,34 @@ fn the_recorder_is_handed_this_process_wall_for_the_account_its_environment_name
 
 const STAND_IN_ENV: &str = "ATERM_HARNESS_HOST_TEST_STAND_IN";
 
+/// This test binary run again as [`a_stand_in_agent_when_asked`], in an empty environment. It
+/// runs one test at a time on every host, whatever this run's thread count (a cleared
+/// environment leaves libtest the host's core count), so libtest writes `test <name> ... `,
+/// with no newline, before the stand-in's body on every run.
+#[cfg(target_os = "macos")]
+fn stand_in_agent() -> aterm_uds::spawnfd::Command {
+    let mut command =
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+    command
+        .args([
+            "harness_host::tests::a_stand_in_agent_when_asked",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(STAND_IN_ENV, "1");
+    command
+}
+
 #[test]
 fn a_stand_in_agent_when_asked() {
     use std::io::{Read as _, Write as _};
     if std::env::var_os(STAND_IN_ENV).is_none() {
         return;
     }
+    // `ready` starts a line of its own, past libtest's unterminated `test <name> ... `.
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"ready\n");
+    let _ = out.write_all(b"\nready\n");
     let _ = out.flush();
     let _ = std::io::stdin().read(&mut [0u8; 1]);
 }
@@ -10018,34 +10237,22 @@ fn a_stand_in_agent_when_asked() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_windows_acts_read_the_transcript_of_the_process_in_the_tab() {
-    use aterm_uds::spawnfd::{Stdio, command};
-    use std::io::BufRead as _;
+    use aterm_uds::spawnfd::Stdio;
     let tmp = aterm_tempfile::Builder::new()
         .prefix("aterm-hh-wall-tail-")
         .tempdir()
         .expect("temp dir");
     let (home, alt) = (tmp.path().join("home"), tmp.path().join("claude-alt"));
     std::fs::create_dir_all(&home).unwrap();
-    let mut stand_in = command(std::env::current_exe().expect("the test binary"));
+    let mut stand_in = stand_in_agent();
     stand_in
-        .args([
-            "harness_host::tests::a_stand_in_agent_when_asked",
-            "--exact",
-        ])
-        .env_clear()
-        .env(STAND_IN_ENV, "1")
         .env("HOME", &home)
         .env("CLAUDE_CONFIG_DIR", &alt)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = stand_in.spawn().expect("the stand-in");
-    let out = child.stdout.take().expect("its stdout");
-    let ready = std::io::BufReader::new(out)
-        .lines()
-        .map_while(Result::ok)
-        .any(|line| line == "ready");
-    assert!(ready, "the stand-in never ran");
+    aterm_uds::deadline::prints(&mut child, "ready", aterm_uds::deadline::ECHO_HANG);
     let pid = child.id();
     let start = "Thu Oct 8 18:04:23 2026";
     let talk = "da373640-37c2-443b-b001-4b6cab95a6cf";
@@ -10126,7 +10333,6 @@ fn the_windows_acts_read_a_limits_reset_in_the_agents_own_home() {
 #[test]
 fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     use aterm_uds::spawnfd::{Child, Command, Stdio, command};
-    use std::io::BufRead as _;
     let now = aterm_time::unix_secs().expect("clock") + 86_400;
     let stamp = aterm_agent::harness::usage::rfc3339_utc(i64::try_from(now - 60).unwrap());
     const TALK: &str = "0badf00d-1111-2222-3333-444455556666";
@@ -10202,24 +10408,12 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
             .stderr(Stdio::null())
             .spawn()
             .expect("the stand-in");
-        let out = child.stdout.take().expect("its stdout");
-        let ready = std::io::BufReader::new(out)
-            .lines()
-            .map_while(Result::ok)
-            .any(|line| line == "ready");
-        assert!(ready, "the stand-in never ran");
+        aterm_uds::deadline::prints(&mut child, "ready", aterm_uds::deadline::ECHO_HANG);
         child
     };
     let stand_in = |env: &[(&str, &str)]| {
-        let mut command = command(std::env::current_exe().expect("the test binary"));
-        command
-            .args([
-                "harness_host::tests::a_stand_in_agent_when_asked",
-                "--exact",
-            ])
-            .env_clear()
-            .env(STAND_IN_ENV, "1")
-            .envs(env.iter().copied());
+        let mut command = stand_in_agent();
+        command.envs(env.iter().copied());
         running(command)
     };
     let end = |mut child: Child| {
@@ -11280,6 +11474,9 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
     }
 }
 
+/// Unix alone: a Kimi row's login is an overlay home of symbolic links, which aterm makes only
+/// on Unix (`accounts_overlay::NO_LINKS`), so elsewhere no move has a line to start it on.
+#[cfg(unix)]
 #[test]
 fn a_measured_kimi_wall_advises_the_healthy_row() {
     let a = Accts::new();
@@ -11313,6 +11510,9 @@ fn a_measured_kimi_wall_advises_the_healthy_row() {
     ));
 }
 
+/// Unix alone, as [`a_measured_kimi_wall_advises_the_healthy_row`]: the row's overlay home
+/// needs symbolic links.
+#[cfg(unix)]
 #[test]
 fn a_scoped_kimi_wall_needs_no_builtin_snapshot() {
     let a = Accts::new();
@@ -11411,16 +11611,17 @@ fn a_scoped_account_move_waits_for_the_childs_login_claim() {
         &accounts_pool::LoginEnv {
             label: "work".to_string(),
             var: "KIMI_CODE_HOME",
-            value: Some("/tmp/account home".to_string()),
+            value: Some(crate::test_host::abs("/tmp/account home")),
         }
     ));
     let rows = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
+    let payload = format!(
+        "cause=account to=work home={}",
+        crate::test_host::abs("/tmp/account%20home")
+    );
     assert_eq!(
         rows.last().map(|row| (row.kind, row.payload.as_ref())),
-        Some((
-            crate::restart_act::RESTART_EVENT,
-            "cause=account to=work home=/tmp/account%20home"
-        ))
+        Some((crate::restart_act::RESTART_EVENT, payload.as_str()))
     );
 }
 
@@ -20750,20 +20951,14 @@ fn a_workers_canary_reads_its_own_sessions_stuck_call_from_the_jobs_board() {
     );
     match worker("s-hung", &BOARD).background_jobs() {
         BackgroundEvidence::NoProgress { worst } => {
-            assert_eq!(
-                (worst.pid, worst.exe.as_str(), worst.quiet_min()),
-                (
-                    27098,
-                    &"aterm_gui-e0964a"[..crate::vitals_jobs::COMM_BYTES],
-                    31
-                )
-            );
+            assert_eq!((worst.pid, worst.quiet_min()), (27098, 31));
         }
         other => panic!("the hung call is named: {other:?}"),
     }
     assert_eq!(
         worker("s-calm", &BOARD).background_jobs(),
-        BackgroundEvidence::Unknown
+        BackgroundEvidence::Waiting,
+        "a call that progresses wakes the agent"
     );
     assert_eq!(
         worker("s-hung", Acts::inert().jobs_board).background_jobs(),
@@ -20772,7 +20967,8 @@ fn a_workers_canary_reads_its_own_sessions_stuck_call_from_the_jobs_board() {
 }
 
 /// The worker's facts ([`IdleHost::facts`]) are its own session's `no_progress` agent calls, worst
-/// first, whose leader is proved alive at the ask ([`Acts::leader_lives`]); a view past
+/// first, whose leader is proved alive at the ask ([`Acts::leader_lives`]), with a count of its
+/// live calls that progress (and the evidence `Waiting` on them); a view past
 /// [`crate::vitals_jobs::JOBS_FRESH`], or a board no view was posted to, reads nothing.
 #[test]
 fn a_workers_facts_are_its_sessions_calls_that_made_no_progress_proved_alive() {
@@ -20825,12 +21021,13 @@ fn a_workers_facts_are_its_sessions_calls_that_made_no_progress_proved_alive() {
         .map(|c| (c.pid, c.birth, c.quiet_min()))
         .collect();
     assert_eq!(named, [(27098, Some(12), 31), (501, Some(11), 20)]);
+    assert_eq!(reading.waiting, 1, "502 progresses");
     let now_ms = i64::try_from(aterm_time::unix_millis().expect("the clock")).unwrap();
     assert!(reading.fresh_at(now_ms), "{} at {now_ms}", reading.as_of_ms);
     assert_eq!(
         worker(&BOARD).background_jobs(),
-        BackgroundEvidence::Unknown,
-        "the canary's evidence asks every call"
+        BackgroundEvidence::Waiting,
+        "a live call that progresses stands between the agent and its next step"
     );
     let old = Instant::now()
         .checked_sub(crate::vitals_jobs::JOBS_FRESH + Duration::from_secs(1))
@@ -21378,6 +21575,83 @@ fn unread_looks_climb_their_own_short_ladder_and_spend_none_of_the_steps_waits()
     host.shutdown_and_join();
 }
 
+/// A LOOK WHOSE READ FAILED LETS GO OF A QUIET ROUND'S HOLD ON THE TURN END
+/// ([`UpgradeRun::waits_at_turn_end`]). A quiet round's settle, or its wait on the agent's own
+/// wake, held the turn end. The next look's read fails (`Due::Unread`, which `due_among` answers
+/// for as long as the managed build is unread), and the worker no longer owns the turn end, with
+/// or without a turn between, so the Autopilot's continuation is not withheld while the read
+/// fails. The hold returns once the read does, because the failed look spent none of the point's
+/// looks.
+///
+/// NEGATIVE CONTROLS: the ask flow's READY'd settle keeps its hold through the failed look. With
+/// the unread arm's let-go removed, each quiet case fails ([true, true, true]). Keyed on the last
+/// step's word (`settles_here(&run.last)`) instead of the hold, the case with a turn between fails,
+/// because the turn clears that word and the hold still stands.
+#[test]
+fn an_unread_look_lets_go_of_a_quiet_rounds_hold_and_keeps_a_ready_sessions() {
+    let world = Arc::new(World::default());
+    let owned = |cfg: &SupervisorConfig, steps: [&'static str; 2], turn: bool| {
+        let unread = Arc::new(AtomicBool::new(false));
+        let words: Arc<Mutex<VecDeque<&'static str>>> = Arc::new(Mutex::new(steps.into()));
+        let (u, w) = (Arc::clone(&unread), Arc::clone(&words));
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.pause = Arc::new(|pause| pause);
+        hooks.acts = Acts {
+            due: Arc::new(move |_| {
+                if u.load(Ordering::SeqCst) {
+                    Due::Unread(upgrade_drive::UNREAD_VERSION)
+                } else {
+                    Due::Yes
+                }
+            }),
+            step: Arc::new(move |_, _, _| {
+                w.lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("a scripted step")
+                    .to_string()
+            }),
+            ..Acts::inert()
+        };
+        let idle = idle_host("s-unread", Program::Claude, switched(cfg), hooks);
+        let look = |failed: bool, word: &str| {
+            unread.store(failed, Ordering::SeqCst);
+            let step = idle.at_idle_on(IdlePoint::default()).expect("a step");
+            assert_eq!(step.line, format!("upgrade step={word}"));
+            *idle.look_at.lock().unwrap() = None;
+            idle.owns_turn_end()
+        };
+        let first = look(false, steps[0]);
+        if turn {
+            idle.turn_ran();
+        }
+        let unread_look = look(true, &format!("wait:{}", upgrade_drive::UNREAD_VERSION));
+        let back = look(false, steps[1]);
+        [first, unread_look, back]
+    };
+    let settle = ["wait:settling", "wait:settling"];
+    assert_eq!(
+        owned(&on(), settle, false),
+        [true, false, true],
+        "a quiet settle's hold is let go at the failed look and taken again once the read returns"
+    );
+    assert_eq!(
+        owned(&on(), settle, true),
+        [true, false, true],
+        "the same with a turn between: the hold the turn left standing is let go"
+    );
+    assert_eq!(
+        owned(&on(), ["wait:not-idle", "wait:not-idle"], false),
+        [true, false, true],
+        "a quiet round's wait on the agent's own wake is let go the same way"
+    );
+    assert_eq!(
+        owned(&asking(), ["announced:1", "wait:settling"], false),
+        [true, true, true],
+        "CONTROL: the ask flow's READY'd session keeps its hold through the failed look"
+    );
+}
+
 #[test]
 fn the_quiet_upgrades_wait_on_the_agents_work_owns_no_turn_end() {
     let a = Arc::new(Acting::default());
@@ -21663,12 +21937,17 @@ fn a_turn_between_two_looks_starts_the_pauses_over() {
     let lapses = [true, true, false];
     let (pauses, owns) = looks(true);
     assert_eq!(pauses[..3], [LATER[0]; 3], "a turn between each");
-    assert_eq!(owns[..3], lapses, "a turn between: the hold still lapses");
+    assert_eq!(
+        owns[..3],
+        [true; 3],
+        "a turn between: each of the round's first turn ends is held for its own looks"
+    );
     let (pauses, owns) = looks(false);
     assert_eq!(
         pauses[..3],
-        [LATER[0], LATER[1], LATER[2]],
-        "no turn between: the ladder"
+        [LATER[0], LATER[0], LATER[2]],
+        "no turn between: the looks that hold the turn end come at the first rung, and the \
+         ladder climbs from the look that lets it go"
     );
     assert_eq!(owns[..3], lapses, "no turn between");
 }
@@ -21747,6 +22026,278 @@ fn a_carry_on_a_persons_keys_hold_does_not_climb_the_ladder() {
     looks(true, "wait:off", &LATER[..2]);
 }
 
+/// A QUIET ROUND'S SETTLE HOLDS EACH OF ITS FIRST TURN ENDS FOR ITS OWN LOOKS
+/// ([`UpgradeRun::settle_owned`]). The test drives a worker's own `at_idle_on` and `turn_ran`, with
+/// a turn between each look. The worker owns each of the round's first
+/// [`upgrade_drive::QUIET_SETTLE_POINTS`] turn ends after its settle look, and after each turn it
+/// asks for the next point (`wants`, its park), so its step comes at the next turn end too. Past
+/// those points it owns no turn end: a session whose settle keeps failing loses a bounded time to
+/// it. Counted once a round, as the settle's looks once were, a round that spent them at one turn
+/// end (a look a person or the agent's own wake disturbed) owned no later one.
+///
+/// NEGATIVE CONTROLS: with no turn between, one point's settle owns only its
+/// [`upgrade_drive::OWNED_SETTLE_LOOKS`] looks; `wait:not-idle`, which an agent's own wake renews
+/// at every turn, and the ask flow's settle keep the round's bound. With `settles_here` false, the
+/// first case fails as [true, true, false, false, false]; with the round's bound dropped from
+/// `quiet_settle_owned`, as [true; 5].
+#[test]
+fn a_quiet_settle_holds_each_of_its_first_turn_ends_for_its_own_looks() {
+    let world = Arc::new(World::default());
+    let bound = usize::try_from(upgrade_drive::OWNED_SETTLE_LOOKS).unwrap();
+    let points = usize::try_from(upgrade_drive::QUIET_SETTLE_POINTS).unwrap();
+    let looks = points + 2;
+    let owned = |cfg: &SupervisorConfig, word: &'static str, turns: bool| {
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.pause = Arc::new(|pause| pause);
+        hooks.acts = Acts {
+            due: Arc::new(|_| Due::Yes),
+            step: Arc::new(move |_, _, _| word.to_string()),
+            ..Acts::inert()
+        };
+        let idle = idle_host("s-settle", Program::Claude, switched(cfg), hooks);
+        (0..looks)
+            .map(|n| {
+                let step = idle.at_idle_on(IdlePoint::default()).expect("a step");
+                assert_eq!(step.line, format!("upgrade step={word}"));
+                assert!(!step.moved, "{word}: nothing moved yet");
+                let owns = idle.owns_turn_end();
+                if turns {
+                    idle.turn_ran();
+                    assert!(
+                        idle.wants(),
+                        "{word} look {n}: after the turn the worker asks for the next point"
+                    );
+                }
+                *idle.look_at.lock().unwrap() = None;
+                owns
+            })
+            .collect::<Vec<bool>>()
+    };
+    let mut held = vec![true; points];
+    held.resize(looks, false);
+    let mut lapses = vec![true; bound];
+    lapses.resize(looks, false);
+    assert_eq!(
+        owned(&on(), "wait:settling", true),
+        held,
+        "a quiet settle with a turn between each look: each of the round's first turn ends held"
+    );
+    assert_eq!(
+        owned(&on(), "wait:settling", false),
+        lapses,
+        "one point's quiet settle: held for its looks, then the loop's"
+    );
+    assert_eq!(
+        owned(&on(), "wait:not-idle", true),
+        lapses,
+        "the agent's own wake at every turn keeps the round's bound"
+    );
+    assert_eq!(
+        owned(&asking(), "wait:settling", true),
+        lapses,
+        "the ask flow's settle keeps the round's bound"
+    );
+}
+
+/// THE QUIET SETTLE'S HOLD ON THE TURN END REFINES `UpgradeQuietSettleTurnEnd`. A real worker is
+/// driven through every sequence of [`QUIET_SETTLE_DEPTH`] of the model's actions within a round:
+/// a settle look (`wait:settling`, the model's `HostDecides` and then `HostCounts`), another bounded
+/// wait at the point (`wait:not-idle`) and a turn. After each settle look the worker owns the turn
+/// end exactly when the model's `owns` holds, every law holds at every state, and an owning look
+/// names its next look at the first rung. One walk is spelled out and crosses the round's start
+/// (a look with nothing due): another wait spends a look of its point, the round's count spans the
+/// turns, and nothing due starts it over.
+///
+/// NEGATIVE CONTROLS: every mutant of the model, walked beside the worker, disagrees with it at
+/// some settle look of the enumerated walks. A failure names the first walk that tells each mutant
+/// apart. `Buggy = 1` (no round bound) owns a fourth turn end. `Buggy = 2` (a point's count kept
+/// across a turn) lets go of a fresh one. `Buggy = 3` (no point bound) owns a point's third look.
+/// `Buggy = 4` (a held turn end booked at each of its held looks) lets go of the third turn end
+/// after the first was held twice. `Buggy = 5` (the point's hold forgotten) lets go of the third
+/// turn end's second look. Two mutants of the worker itself, at those last two places, each fail
+/// the walk against the committed model: `held_points` booked at every held look
+/// (`Some(true) if !self.point_held || true`), and `this_held` dropped from `quiet_settle_owned`.
+#[test]
+fn the_quiet_settle_conforms_to_its_turn_end_model() {
+    use upgrade_drive::{OWNED_SETTLE_LOOKS, QUIET_SETTLE_POINTS, first_look};
+    const ACTIONS: [&str; 3] = ["HostSettles", "OtherWait", "TurnRuns"];
+    let world = Arc::new(World::default());
+    let model = aterm_models_harness::upgrade_quiet_settle_turn_end_model();
+    let constant = |name: &str| {
+        model
+            .consts
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .expect("a constant")
+    };
+    assert_eq!(constant("Looks"), i64::from(OWNED_SETTLE_LOOKS));
+    assert_eq!(constant("Points"), i64::from(QUIET_SETTLE_POINTS));
+    let laws: Vec<&str> = model.invariants.iter().map(|i| i.name).collect();
+    let mutants: Vec<(i64, aterm_spec::derive::Model)> = model
+        .mutant_dials()
+        .into_iter()
+        .map(|dial| (dial, aterm_spec::interp::with_buggy(&model, dial)))
+        .collect();
+    let parts = |action: &'static str| -> &'static [&'static str] {
+        match action {
+            "HostSettles" => &["HostDecides", "HostCounts"],
+            "OtherWait" => &["OtherWait"],
+            "TurnRuns" => &["TurnRuns"],
+            "RoundStarts" => &["RoundStarts"],
+            other => panic!("no action {other}"),
+        }
+    };
+    // What the worker and each mutant said at each settle look of `actions`.
+    let walk = |actions: &[&'static str]| -> Vec<(bool, Vec<bool>)> {
+        assert!(
+            i64::try_from(actions.len()).unwrap() <= constant("Steps"),
+            "the model's Steps covers the walk {actions:?}"
+        );
+        let script: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match *a {
+                "HostSettles" => Some("wait:settling"),
+                "OtherWait" => Some("wait:not-idle"),
+                _ => None,
+            })
+            .collect();
+        let nothing = Arc::new(AtomicBool::new(false));
+        let none = Arc::clone(&nothing);
+        let (idle, paused) = attended_worker_with(&world, &script, move |hooks| {
+            hooks.acts.due = Arc::new(move |_| {
+                if none.load(Ordering::SeqCst) {
+                    Due::No
+                } else {
+                    Due::Yes
+                }
+            });
+        });
+        let mut st = model.init_state();
+        let mut wrong: Vec<_> = mutants.iter().map(|(_, m)| m.init_state()).collect();
+        let mut seen = Vec::new();
+        for (n, &action) in actions.iter().enumerate() {
+            paused.lock().unwrap().clear();
+            match action {
+                "HostSettles" | "OtherWait" => {
+                    let step = idle.at_idle().expect("a look");
+                    assert!(
+                        step.line.starts_with("upgrade step=wait:"),
+                        "{actions:?} {n}: {step:?}"
+                    );
+                }
+                "TurnRuns" => idle.turn_ran(),
+                "RoundStarts" => {
+                    nothing.store(true, Ordering::SeqCst);
+                    assert!(
+                        idle.at_idle().is_none(),
+                        "{actions:?} {n}: nothing due takes no step"
+                    );
+                    nothing.store(false, Ordering::SeqCst);
+                }
+                other => panic!("no action {other}"),
+            }
+            *idle.look_at.lock().unwrap() = None;
+            for part in parts(action) {
+                assert!(
+                    model.fire(part, &mut st),
+                    "{actions:?} {n}: {part} at {st:?}"
+                );
+                for law in &laws {
+                    assert!(
+                        model.check_invariant(law, &st),
+                        "{actions:?} {n}: {law} at {st:?}"
+                    );
+                }
+                for ((dial, m), w) in mutants.iter().zip(&mut wrong) {
+                    assert!(
+                        m.fire(part, w),
+                        "Buggy={dial} {actions:?} {n}: {part} at {w:?}"
+                    );
+                }
+            }
+            if action == "HostSettles" {
+                let owns = idle.owns_turn_end();
+                assert_eq!(
+                    i64::from(owns),
+                    st["owns"],
+                    "{actions:?} look {n}: the real worker against the model at {st:?}"
+                );
+                if owns {
+                    assert_eq!(
+                        *paused.lock().unwrap(),
+                        [first_look()],
+                        "{actions:?} look {n}: an owning look's next look"
+                    );
+                }
+                seen.push((owns, wrong.iter().map(|w| w["owns"] == 1).collect()));
+            }
+        }
+        seen
+    };
+
+    let mut told: Vec<Option<Vec<&str>>> = vec![None; mutants.len()];
+    let mut actions = [ACTIONS[0]; QUIET_SETTLE_DEPTH];
+    let walks = ACTIONS
+        .len()
+        .pow(u32::try_from(QUIET_SETTLE_DEPTH).unwrap());
+    for code in 0..walks {
+        let mut rest = code;
+        for slot in &mut actions {
+            *slot = ACTIONS[rest % ACTIONS.len()];
+            rest /= ACTIONS.len();
+        }
+        for (owns, said) in walk(&actions) {
+            for (first, wrong) in told.iter_mut().zip(said) {
+                if wrong != owns && first.is_none() {
+                    *first = Some(actions.to_vec());
+                }
+            }
+        }
+    }
+    for ((dial, _), first) in mutants.iter().zip(&told) {
+        assert!(
+            first.is_some(),
+            "NEGATIVE CONTROL Buggy={dial}: no walk of {QUIET_SETTLE_DEPTH} actions tells it from \
+             the worker"
+        );
+    }
+    assert_eq!(
+        mutants.iter().map(|(dial, _)| *dial).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5],
+        "the mutants this test names, each told apart above: {told:?}"
+    );
+
+    let points = usize::try_from(QUIET_SETTLE_POINTS).unwrap();
+    let mut mixed = vec![
+        "OtherWait",
+        "HostSettles",
+        "HostSettles",
+        "TurnRuns",
+        "HostSettles",
+    ];
+    for _ in 1..points {
+        mixed.extend(["TurnRuns", "HostSettles"]);
+    }
+    mixed.extend(["RoundStarts", "HostSettles"]);
+    let owned: Vec<bool> = walk(&mixed).iter().map(|(owns, _)| *owns).collect();
+    let mut want = vec![true, false];
+    want.extend(std::iter::repeat_n(true, points - 1));
+    want.extend([false, true]);
+    assert_eq!(
+        owned, want,
+        "another wait spends a look of its point; the round's count spans the turns; nothing due \
+         starts it over"
+    );
+}
+
+/// How many of the model's actions each enumerated walk of
+/// [`the_quiet_settle_conforms_to_its_turn_end_model`] takes. That is enough for a fourth fresh turn
+/// end (`Buggy = 1`'s), and for the round's third turn end after a first held twice (the worker's
+/// `held_points` booked at every held look) or at that turn end's second look (`this_held`
+/// dropped).
+const QUIET_SETTLE_DEPTH: usize = 7;
+
 #[test]
 fn a_re_armed_round_owns_its_first_settle() {
     let mut run = UpgradeRun::default();
@@ -21817,9 +22368,10 @@ fn attended_worker_with(
 }
 
 /// What a quiet upgrade round may type the tab's agent reaches the upgrade's step, at an idle
-/// point and at a break ([`WorkerIdle::upgrade_tell`]): nothing with the tab's Autopilot off, its
-/// task landed under Land, or a guard holding a host's fact there (under Cruise, only the person's
-/// grace), and the restart verb only where the tab offers and promises that restart.
+/// point and at a break ([`WorkerIdle::upgrade_tell`]): nothing with the tab's Autopilot off or a
+/// guard holding a host's fact there (under Cruise, only the person's grace); no line, but still
+/// a move over what yields, once its task landed under Land ([`upgrade_drive::Tell::Silent`]);
+/// and the restart verb only where the tab offers and promises that restart.
 #[test]
 fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() {
     use upgrade_drive::Tell;
@@ -21871,8 +22423,23 @@ fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() 
     };
     assert_eq!(
         run(Some(Autopilot::Land), Some(true), landed),
+        [Tell::Silent; 2],
+        "no line after a land's defense, and its autopilot still carries it"
+    );
+    assert!(
+        run(Some(Autopilot::Off), Some(true), landed)
+            .iter()
+            .all(|t| *t == Tell::Off),
+        "the person's setting outranks a landed task"
+    );
+    let landed_held = IdlePoint {
+        held: Some(Guard::Person),
+        ..landed
+    };
+    assert_eq!(
+        run(Some(Autopilot::Land), Some(true), landed_held),
         [Tell::Off; 2],
-        "nothing after a land's defense"
+        "a person's grace outranks it too"
     );
     for guard in [Guard::Person, Guard::Exchange, Guard::Managed] {
         let held = IdlePoint {
@@ -24023,6 +24590,7 @@ fn closing_a_restored_queue_during_its_read_preserves_the_snapshot_and_debt() {
                 agent_seen: false,
                 carried: false,
                 landed: true,
+                looking: false,
                 faults: 0,
                 in_flight_only: false,
             });
@@ -24593,6 +25161,50 @@ fn a_relaunched_agent_is_carried_on_where_its_loop_parks() {
     );
     assert_eq!(a.stepped.load(Ordering::SeqCst), 0, "no upgrade step");
     host.shutdown_and_join();
+}
+
+/// With `[harness] upgrade` off no upgrade step sweeps, so the idle point that finds nothing owed
+/// closes its tab's looks itself ([`Acts::close_looks`]): a look that ran past its clock is
+/// closed at the next idle point, its lost line told once, and no upgrade step is taken. A close
+/// the sweep lock refused (`busy:another-sweep`) is looked at again later, and that look closes
+/// it: nothing else comes back to it while the switch is off.
+#[test]
+fn an_idle_point_closes_a_look_past_its_clock_with_the_upgrade_off() {
+    let lost = |notes: &[HostNote]| {
+        notes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    HostNote::Relaunch {
+                        said: RelaunchSay::NotRestored,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    for closes in [vec!["done:lost"], vec!["busy:another-sweep", "done:lost"]] {
+        let asked = closes.len();
+        let a = Arc::new(Acting::default());
+        *a.carry.lock().unwrap() = ["continued"].into();
+        *a.closes.lock().unwrap() = closes.into();
+        a.owed.store(true, Ordering::SeqCst);
+        a.look_over.store(true, Ordering::SeqCst);
+        a.open.lock().unwrap().insert("s-c".to_string());
+        a.set(&[("s-c", Program::Claude)]);
+        let mut no_upgrade = on();
+        no_upgrade.set("upgrade", "false").unwrap();
+        let host = HostHandle::start(no_upgrade, false, false, a.hooks());
+        until(
+            &format!("the look closed at idle point {asked} after the carry-on, its loss told"),
+            || a.closed.load(Ordering::SeqCst) >= asked && lost(&a.notes.lock().unwrap()) == 1,
+        );
+        assert_eq!(a.carried.load(Ordering::SeqCst), 1, "one carry-on");
+        assert_eq!(a.stepped.load(Ordering::SeqCst), 0, "no upgrade step");
+        host.shutdown_and_join();
+        assert_eq!(lost(&a.notes.lock().unwrap()), 1, "told once");
+    }
 }
 
 #[test]
@@ -29810,6 +30422,47 @@ fn the_real_look_conforms_to_the_upgrade_look_model() {
     }
 }
 
+/// A look's restore line recorded lost by an upgrade step's sweep (the look ran past its own
+/// clock, so it was no carry-on's to close) is recorded for the person as the carry-on's is, at
+/// an idle point and at a break of the agent's own background work; at the idle point the move
+/// still due behind the look, which that step's lanes left for the next look, is looked at again.
+#[test]
+fn a_look_lost_by_an_upgrade_step_is_recorded_and_the_move_behind_it_looked_at_again() {
+    let world = Arc::new(LookWorld::default());
+    let mut idle = LookWorld::attached(&world);
+    world.readable.store(true, Ordering::SeqCst);
+    let lost = Arc::new(AtomicUsize::new(0));
+    idle.hooks.note = {
+        let lost = Arc::clone(&lost);
+        Arc::new(move |note| {
+            if matches!(
+                note,
+                HostNote::Relaunch {
+                    said: RelaunchSay::NotRestored,
+                    ..
+                }
+            ) {
+                lost.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    idle.hooks.acts.step = Arc::new(|_, _, _| "done:lost".to_string());
+    idle.hooks.acts.notice = Arc::new(|_, _, _| "done:lost".to_string());
+    assert!(idle.wants(), "the attach's look");
+    let said = idle.at_idle().expect("the step's word");
+    assert_eq!(said.line, "upgrade step=done:lost");
+    assert_eq!(lost.load(Ordering::SeqCst), 1, "recorded at the idle point");
+    assert!(
+        idle.look_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some(),
+        "the move still due is looked at again"
+    );
+    assert!(idle.at_background().is_none(), "a break says nothing of it");
+    assert_eq!(lost.load(Ordering::SeqCst), 2, "recorded at the break");
+}
+
 /// The body of the `claude` stand-in: it leads its pty, takes its TERM disposition first
 /// (`$1`: `deaf` ignores it, as a Claude Code whose JS thread spins does; `gated` removes its
 /// record and then waits at `$HOME/gate`, a fifo, before it exits 0, a graceful end the test
@@ -30661,6 +31314,7 @@ fn the_real_restart_act_conforms_to_its_model() {
                         start: agent.start.clone(),
                         cause: restart_stamp::Cause::Asked,
                         at: aterm_time::unix_secs().expect("clock") - 35,
+                        input: None,
                     },
                 )
                 .expect("the stamp");
@@ -30782,6 +31436,11 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
         let (a, host) = agent.world();
         agent.claim();
         let pid = agent.pid;
+        let _ = agent
+            .ctx
+            .human_input
+            .note(crate::metrics::now_us(), crate::human_input::Gesture::Other);
+        let accepted_input = agent.ctx.human_input.seq();
         let stamp_now = || {
             restart_stamp::read(a.stamp_dir(), &agent.sid)
                 .filter(|s| s.names(agent.upid(), &agent.start))
@@ -30814,6 +31473,12 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
             step(&seen, "act A stamped and sent its SIGTERM");
             stamp_now().expect("act A's stamp")
         });
+        if joined {
+            let _ = agent
+                .ctx
+                .human_input
+                .note(crate::metrics::now_us(), crate::human_input::Gesture::Other);
+        }
         let second = crate::restart_act::begin(
             agent.master,
             &format!("pid={pid}"),
@@ -30822,6 +31487,14 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
             aterm_slog::Actor::Ctl,
         )
         .expect("act B passes its fences");
+        assert_eq!(
+            stamp_now().and_then(|stamp| stamp.input),
+            Some(restart_stamp::Input {
+                host: restart_stamp::input_host().expect("the live host's identity"),
+                seq: accepted_input,
+            }),
+            "the first act captures its input counter; a join cannot accept newer input"
+        );
         seen.stamped = stamp_now().is_some();
         seen.inflight = true;
         seen.fresh = !joined;
@@ -31018,6 +31691,7 @@ fn the_restart_ends_a_survivor_at_its_deadline_whatever_it_heard() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Asked,
         at: aterm_time::unix_secs().expect("clock"),
+        input: None,
     };
     for (n, (deaf, stalled)) in [(false, false), (true, false), (true, true)]
         .into_iter()
@@ -31280,6 +31954,7 @@ fn a_stamped_program_stopped_inside_its_grace_is_ended_once_it_leads_again() {
         start: start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: aterm_time::unix_secs().expect("clock") + 1 - aterm_agent::harness::relaunch::STALE_S,
+        input: None,
     };
     let watched = crate::restart_act::escalate(
         &Arc::downgrade(&agent.ctx),
@@ -31485,6 +32160,7 @@ fn stale_stamp(agent: &RealAgent) -> restart_stamp::Stamp {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: aterm_time::unix_secs().expect("clock") - aterm_agent::harness::relaunch::STALE_S - 1,
+        input: None,
     }
 }
 
@@ -32019,6 +32695,7 @@ fn a_look_that_carries_an_asked_exit_rings_nothing() {
                 start: agent.start.clone(),
                 cause: restart_stamp::Cause::Asked,
                 at: aterm_time::unix_secs().expect("clock"),
+                input: None,
             },
         )
         .expect("the act's stamp");
@@ -32069,6 +32746,7 @@ fn a_watch_lets_its_program_go_once_its_tabs_stamp_names_another() {
         start: restart_stamp::kernel_start(shell).expect("the shell's start"),
         cause: restart_stamp::Cause::Asked,
         at: aterm_time::unix_secs().expect("clock"),
+        input: None,
     };
     restart_stamp::write(a.stamp_dir(), &sid, &other).expect("another act's stamp, replacing it");
     job.fg();
@@ -32476,6 +33154,7 @@ fn the_restart_acts_kill_waits_out_another_hand() {
             start: agent.start.clone(),
             cause: restart_stamp::Cause::Asked,
             at,
+            input: None,
         };
         let said = crate::restart_act::escalate(
             &Arc::downgrade(&agent.ctx),
@@ -32519,6 +33198,7 @@ fn a_stamp_that_no_longer_stands_is_no_acts_to_finish() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Asked,
         at,
+        input: None,
     };
     let stale = stamp_at(now - aterm_agent::harness::relaunch::STALE_S - 120);
     assert!(stale.stands_for(now).is_zero());
@@ -32695,6 +33375,7 @@ fn a_restart_after_its_programs_watch_let_go_gets_a_watch_of_its_own() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: stamped + 33 - aterm_agent::harness::relaunch::STALE_S,
+        input: None,
     };
     restart_stamp::write(a.stamp_dir(), &agent.sid, &cut).expect("the stamp a Commit cut");
     assert!(crate::restart_act::carry(
@@ -47405,9 +48086,23 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
 }
 
 /// Where the stand-in of [`a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it`]
-/// writes its `off`'s marker.
+/// writes its `off`'s marker, and where its host's quit step writes its own.
 #[cfg(unix)]
 const WINDOW_OFF_MARKER: &str = "ATERM_TEST_WINDOW_CLAIMS_OFF_MARKER";
+#[cfg(unix)]
+const WINDOW_HOST_STEP_MARKER: &str = "ATERM_TEST_WINDOW_HOST_STEP_MARKER";
+
+/// The stand-in host's quit step (`crate::host_quit::install`): a marker that it ran, written
+/// only after the window's `off` left its own.
+#[cfg(unix)]
+fn window_host_step_marks() {
+    let off_ran = std::env::var_os(WINDOW_OFF_MARKER).is_some_and(|off| Path::new(&off).exists());
+    if let Some(marker) = std::env::var_os(WINDOW_HOST_STEP_MARKER)
+        && off_ran
+    {
+        std::fs::write(marker, b"step").expect("the host step's marker");
+    }
+}
 
 /// The stand-in's `off`: a marker that it ran.
 #[cfg(unix)]
@@ -47424,13 +48119,19 @@ fn window_off_marks() {
 /// dies of that SIGTERM as it did before. A stand-in process of this test is the window, its `off`
 /// a marker.
 ///
+/// THE SAME SIGNAL RUNS THE HOST'S QUIT STEP, after the claims went out and before the process
+/// dies: the step the window's host installs (production's stops the Commons runtime, which
+/// closes the network history; the stand-in's leaves a marker once `off`'s is there).
+///
 /// NEGATIVE CONTROL: drop the stand-in's `arm_claims_off_as_the_window_dies` call (the window
-/// unarmed, as before), and it dies of its SIGTERM with no marker.
+/// unarmed, as before), and it dies of its SIGTERM with no marker. Drop `crate::host_quit::run()`
+/// from the armed quit, or run it before `off`, and the step's marker is missing.
 #[cfg(unix)]
 #[test]
 fn a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it() {
     use std::os::unix::process::ExitStatusExt as _;
     if std::env::var_os(WINDOW_OFF_MARKER).is_some() {
+        crate::host_quit::install(window_host_step_marks);
         // The stand-in starts with SIGTERM at its default (`StandIn`), which the arming needs.
         arm_claims_off_as_the_window_dies(window_off_marks);
         let pid = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
@@ -47442,8 +48143,12 @@ fn a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it() {
     }
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     let marker = scratch.path().join("off");
+    let step = scratch.path().join("step");
     let mut stand_in = crate::test_alone::StandIn::this_test();
-    stand_in.command().env(WINDOW_OFF_MARKER, &marker);
+    stand_in
+        .command()
+        .env(WINDOW_OFF_MARKER, &marker)
+        .env(WINDOW_HOST_STEP_MARKER, &step);
     let ran = stand_in.spawn().selected();
     let status = ran.status.expect("the stand-in exited");
     assert_eq!(
@@ -47455,6 +48160,11 @@ fn a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it() {
     assert!(
         marker.exists(),
         "the window died of its SIGTERM with its claims standing\n{}",
+        ran.stderr
+    );
+    assert!(
+        step.exists(),
+        "the window died of its SIGTERM with its host's quit step not run after its claims\n{}",
         ran.stderr
     );
 }
@@ -48250,7 +48960,7 @@ fn a_claim_that_typed_nothing_is_no_read() {
     );
 }
 
-/// The owner's rule on Claude Code's panel: after a read, time alone makes no other one due, however
+/// The rule on Claude Code's panel: after a read, time alone makes no other one due, however
 /// long the sample ages; only a turn run on the session does. Entering `/usage` reports the read
 /// with its row and why. CONTROL: the same aged sample after `turn_ran` is claimed, so `NotUsed` is
 /// the only thing that held it back.

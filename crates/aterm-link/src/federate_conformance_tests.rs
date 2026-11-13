@@ -492,7 +492,7 @@ fn the_mail_route_conforms_to_the_fabric_routing_model() {
         })
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
+    let workers = aterm_cores::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
         .min(8);
     let judged: usize = std::thread::scope(|s| {

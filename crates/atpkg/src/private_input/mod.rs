@@ -269,6 +269,16 @@ impl Producer {
         &self.inner.as_ref().expect("live producer").contents_path
     }
 
+    /// Recheck the actual original materializing namespace and lifecycle lock.
+    /// This permits a retained materialization operation to check its producer
+    /// before dispatch and after native completion, without publishing READY.
+    /// It does not inspect or authenticate the contents.
+    /// # Errors
+    /// Original identity/state drift or loss of the creating owner refuses.
+    pub fn check_current(&self) -> io::Result<()> {
+        self.inner.as_ref().expect("live producer").check(BUILDING)
+    }
+
     /// Transfer this same owner after the caller finishes materialization.
     /// This records only the lifecycle transition, never content validation.
     ///

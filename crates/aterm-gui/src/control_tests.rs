@@ -5,32 +5,24 @@ const EVENTUALLY: std::time::Duration = std::time::Duration::from_secs(60);
 
 const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
+/// The control host hands its account service the app's own work epoch: a renewal a peer asks
+/// for is admitted only while the app admits account work. CONTROL: the same request before
+/// the drained epoch reopens finds admission closed.
 #[test]
-fn account_service_context_carries_the_apps_epoch_and_browser_policy_to_harmless_services() {
+fn account_service_context_carries_the_apps_epoch_to_harmless_services() {
     const ID: &str = "f950f950f950f950f950f950f950f950";
     const CALLER: &str = "gui-account-service-context";
-    const URL: &str = "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state";
     let mut app = crate::App::headless_for_test();
     let serving = AccountServices {
         lifetime: app.account_work.clone(),
         source_registry: Arc::new(Default::default()),
-        interactive_browser: true,
-    };
-    let headless = AccountServices {
-        lifetime: app.account_work.clone(),
-        source_registry: Arc::new(Default::default()),
-        interactive_browser: false,
     };
     app.account_drain = crate::app_account_work::Drain::for_launch(&app.account_work, true);
     let start = format!("start={ID}");
-    let challenge = format!(
-        "{start} url={}",
-        aterm_agent::harness::open_url::percent_encode(URL)
-    );
     let open = std::cell::Cell::new(false);
     let called = std::cell::Cell::new(0);
-    // These callbacks observe the actual shared epoch and preserve the actual request codecs.
-    // They do not implement admission/dedup or invoke any service Run. Agent Book controls
+    // This callback observes the actual shared epoch and preserves the actual request codec.
+    // It does not implement admission/dedup or invoke any service Run. Agent Book controls
     // exercise those separately with harmless work, including regression/mutant cases.
     let renew =
         |lifetime: &aterm_agent::harness::account_work::Lifetime, caller: &str, rest: &str| {
@@ -44,18 +36,6 @@ fn account_service_context_carries_the_apps_epoch_and_browser_policy_to_harmless
             assert_eq!(lifetime.enter().is_some(), open.get());
             "harmless renewal effect".to_string()
         };
-    let browser =
-        |lifetime: &aterm_agent::harness::account_work::Lifetime, caller: &str, rest: &str| {
-            called.set(called.get() + 1);
-            assert_eq!(caller, CALLER);
-            assert_eq!(rest, challenge);
-            assert!(matches!(
-                aterm_agent::harness::challenge_relay::Request::parse(rest),
-                Ok(aterm_agent::harness::challenge_relay::Request::Start(_))
-            ));
-            assert_eq!(lifetime.enter().is_some(), open.get());
-            "harmless browser effect".to_string()
-        };
     for reopened in [false, true] {
         if reopened {
             app.resume_drained_accounts();
@@ -65,25 +45,8 @@ fn account_service_context_carries_the_apps_epoch_and_browser_policy_to_harmless
             serving.renew_with(CALLER, &start, renew),
             "harmless renewal effect"
         );
-        assert_eq!(
-            serving.challenge_with(CALLER, &challenge, browser),
-            "harmless browser effect"
-        );
-        let before = called.get();
-        assert_eq!(
-            headless
-                .challenge_with(CALLER, &challenge, browser)
-                .split_ascii_whitespace()
-                .next(),
-            Some("ERR")
-        );
-        assert_eq!(
-            called.get(),
-            before,
-            "lifecycle reopening never grants browser authority"
-        );
     }
-    assert_eq!(called.get(), 4);
+    assert_eq!(called.get(), 2);
 }
 
 #[test]
@@ -5271,14 +5234,14 @@ fn app_route_denies_an_edge_before_it_looks() {
     );
 }
 
-/// The retired program-coordinate popup is refused with or without a session selector.
+/// A menu target takes no program coordinate, with or without a session selector.
 #[test]
-fn legacy_program_menu_coordinates_are_refused() {
+fn program_menu_coordinates_are_refused() {
     use crate::control::control_media::OpenRoute;
     for line in [
-        "@7 open autopilot-menu at=20,40 by=keys",
-        "open autopilot-menu at=20,40 by=keys",
-        "@. open autopilot-menu at=20,40 by=keys",
+        "@7 open tab-menu at=20,40 by=keys",
+        "open tab-menu at=20,40 by=keys",
+        "@. open tab-menu at=20,40 by=keys",
     ] {
         let Head { rest, .. } = control_request::head(line);
         assert!(matches!(
@@ -6333,8 +6296,8 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("open", "menu close", owner),
         ("open", "palette close", owner),
         ("open", "update close", owner),
-        ("open", "autopilot-menu", owner),
-        ("open", "autopilot-menu at=20,40 by=keys", owner),
+        ("open", "tab-menu", owner),
+        ("open", "fact-menu path", owner),
         ("spawn", "connected=controller of=s-abc", owner),
         (
             "spawn",
@@ -11736,7 +11699,7 @@ fn rainbow_kitty_window() -> (crate::App, crate::WindowId, std::fs::File) {
         crate::App::headless_for_test_with_sink(Arc::new(aterm_session::sink::SinkWriter::new(wr)));
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
+    app.config.cursor_trail_style = Some("rainbow".into());
     app.config.trail_sounds = Some(false);
     let wid = crate::WindowId(0);
     app.windows.get_mut(&wid).expect("fixture window").focused = true;
@@ -20807,10 +20770,18 @@ fn fleet_binary_input_records_authenticated_actor_not_request_text() {
             let line = read_request_line(&mut reader).expect("request line");
             let mut out = Vec::new();
             let driver = remote.then(|| {
-                crate::fabric::DrivingAs::enter(crate::fabric::Driver {
-                    node: "authenticated-node".to_owned(),
-                    host: "m72 / remote=desk".to_owned(),
-                })
+                crate::fabric::DrivingAs::requested(
+                    crate::fabric::Driver {
+                        node: "authenticated-node".to_owned(),
+                        host: "m72 / remote=desk".to_owned(),
+                    },
+                    aterm_types::control_verbs::Requester::of(
+                        Some("s-0123456789abcdef0123"),
+                        Some("claude"),
+                        None,
+                        None,
+                    ),
+                )
             });
             assert!(run_feed_bin(
                 &line,
@@ -20838,7 +20809,7 @@ fn fleet_binary_input_records_authenticated_actor_not_request_text() {
             assert_eq!(
                 rows[0].by,
                 if remote {
-                    Actor::fleet("m72 / remote=desk")
+                    Actor::fleet_drive("authenticated-node", Some("s-0123456789abcdef0123"))
                 } else {
                     Actor::Ctl
                 }
@@ -22036,7 +22007,12 @@ fn a_drive_reads_a_reaped_workers_result_and_waits_on_its_end() {
             gate(&line),
             Ok(DriveLine::Act {
                 line: line.clone(),
-                write: None
+                act: DriveAct {
+                    kind: DriveKind::Read,
+                    sid: None,
+                    hold: None,
+                    shell: false,
+                },
             }),
             "{line}"
         );
@@ -22071,7 +22047,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     let spawned = |sid: &SessionId| sid.as_str() == W;
     let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false, &|_| false);
     let wrote = |line: &str| match gate(line) {
-        Ok(DriveLine::Act { write, .. }) => write.map(|act| act.verb),
+        Ok(DriveLine::Act { act, .. }) => (act.kind != DriveKind::Read).then(|| act.kind.word()),
         other => panic!("{line:?} was not admitted: {other:?}"),
     };
     assert_eq!(gate("survey"), Ok(DriveLine::Fleet));
@@ -22119,25 +22095,18 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     ] {
         assert!(gate(refused).is_err(), "{refused}");
     }
-    let challenge = format!(
-        "claude-challenge start=0123456789abcdef0123456789abcdef url={}",
-        aterm_agent::harness::open_url::percent_encode(
-            "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state"
-        )
-    );
-    assert_eq!(wrote(&challenge), Some("claude-challenge"));
-    assert_eq!(
-        wrote("claude-challenge poll=0123456789abcdef0123456789abcdef"),
-        None
-    );
+    // No verb makes this Mac open a browser for another Mac's sign-in: the challenge relay a
+    // peer of an older build still asks for is refused like any unknown verb, start and poll.
     for refused in [
-        "claude-challenge",
-        "claude-challenge start=x",
-        "claude-challenge start=0123456789abcdef0123456789abcdef url=not-a-flow",
-        "claude-challenge run=0123456789abcdef0123456789abcdef",
-        "@s-00000000000000aa claude-challenge poll=0123456789abcdef0123456789abcdef",
+        format!(
+            "claude-challenge start=0123456789abcdef0123456789abcdef url={}",
+            aterm_agent::harness::open_url::percent_encode(
+                "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state"
+            )
+        ),
+        "claude-challenge poll=0123456789abcdef0123456789abcdef".to_owned(),
     ] {
-        assert!(gate(refused).is_err(), "{refused}");
+        assert!(gate(&refused).is_err(), "{refused}");
     }
     for read in [
         format!("@{W} status"),
@@ -22177,9 +22146,9 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     for (way, on) in [("on", true), ("off", false)] {
         match gate(&format!("hold {W} {way}")) {
             Ok(DriveLine::Act {
-                write: Some(DriveAct {
+                act: DriveAct {
                     hold: Some(ask), ..
-                }),
+                },
                 ..
             }) => assert_eq!(ask.on, on, "{way}"),
             other => panic!("{way}: {other:?}"),
@@ -22414,7 +22383,11 @@ fn every_drive_refusal_names_the_word_it_refuses() {
         match gate(line) {
             Ok(DriveLine::Act {
                 line,
-                write: Some(DriveAct { verb: "spawn", .. }),
+                act:
+                    DriveAct {
+                        kind: DriveKind::Spawn,
+                        ..
+                    },
             }) => assert_eq!(line, admitted),
             other => panic!("{line}: a worker's Autopilot was refused: {other:?}"),
         }
@@ -22422,6 +22395,8 @@ fn every_drive_refusal_names_the_word_it_refuses() {
     #[cfg(unix)]
     {
         let store = crate::session_store::new_store();
+        // The gate's own refusal: this Mac's fleet access admits the spawn.
+        let _level = FleetAccessForTest::set(FleetAccess::Full);
         let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
             node: "03".repeat(16),
             host: "mac-03".to_owned(),
@@ -22453,6 +22428,8 @@ fn every_drive_refusal_names_the_word_it_refuses() {
 #[cfg(unix)]
 fn a_driven_proxy_forward_after_handoff_never_uses_the_owners_token() {
     use std::io::{BufRead, BufReader, Write};
+    // The post is admitted: this Mac's fleet access is no part of what the test is about.
+    let _level = FleetAccessForTest::set(FleetAccess::Full);
     let driver = crate::fabric::Driver {
         node: "03".repeat(16),
         host: "mac-03".to_owned(),
@@ -22549,6 +22526,8 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
         node: "03".repeat(16),
         host: "mac-03".to_owned(),
     };
+    // The grants and the scope are what this test turns: the level admits every act.
+    let _level = FleetAccessForTest::set(FleetAccess::Full);
     let (passed, scope, _) = drive_admission(Request::parse(line.clone()), drive, &store).unwrap();
     assert_eq!((passed.line(), scope), (line.as_str(), drive));
     assert!(
@@ -22583,7 +22562,7 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
         let typing = format!("@{} send hi", sid.as_str());
         let (_, scope, write) = drive_admission(Request::parse(typing), drive, &store).unwrap();
         assert_eq!(scope, Scope::Owner);
-        assert_eq!(write.map(|act| act.verb), Some("send"));
+        assert_eq!(write.map(|act| act.kind), Some(DriveKind::Send));
     }
     assert!(
         crate::fabric::serving_driver().is_none(),
@@ -22596,7 +22575,7 @@ fn a_drives_record_names_what_moved() {
     let sid = SessionId::new("s-0000000000d71e00");
     let hold = |on, held| DriveAct {
         shell: false,
-        verb: "hold",
+        kind: DriveKind::Hold,
         sid: Some(sid.clone()),
         hold: Some(HoldAsk { on, held }),
     };
@@ -22634,21 +22613,41 @@ fn a_drives_record_names_what_moved() {
             "{act:?} {reply:?} {holds_now}"
         );
     }
-    let act = |verb| DriveAct {
+    let act = |kind| DriveAct {
         shell: false,
-        verb,
+        kind,
         sid: Some(sid.clone()),
         hold: None,
     };
-    assert_eq!(drive_record(&act("send"), "OK\n", false), Some("send"));
     assert_eq!(
-        drive_record(&act("send"), "ERR halted reason=- origin=remote\n", false),
+        drive_record(&act(DriveKind::Send), "OK\n", false),
+        Some("send")
+    );
+    assert_eq!(
+        drive_record(
+            &act(DriveKind::Send),
+            "ERR halted reason=- origin=remote\n",
+            false
+        ),
         None
     );
     assert_eq!(
-        drive_record(&act("close"), "OK closed\n", false),
+        drive_record(&act(DriveKind::Close), "OK closed\n", false),
         Some("closed")
     );
+    // A read, mail and a fleet service leave no record of a session driven, whatever answers.
+    for kind in [
+        DriveKind::Read,
+        DriveKind::ShellRead,
+        DriveKind::Post,
+        DriveKind::MailSeen,
+        DriveKind::Vault,
+        DriveKind::ServiceRepair,
+        DriveKind::AccountsRenew,
+        DriveKind::BusLog,
+    ] {
+        assert_eq!(drive_record(&act(kind), "OK\n", false), None, "{kind:?}");
+    }
 
     let store = crate::session_store::new_store();
     let driver = crate::fabric::Driver {
@@ -22659,7 +22658,7 @@ fn a_drives_record_names_what_moved() {
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
     let spawn = DriveAct {
         shell: false,
-        verb: "spawn",
+        kind: DriveKind::Spawn,
         sid: None,
         hold: None,
     };
@@ -22672,7 +22671,7 @@ fn a_drives_record_names_what_moved() {
     assert_eq!(drive_spawned_by(&worker), Some(driver.node.clone()));
     let close = DriveAct {
         shell: false,
-        verb: "close",
+        kind: DriveKind::Close,
         sid: Some(worker.clone()),
         hold: None,
     };
@@ -22706,7 +22705,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     assert_eq!(drive_owned(&worker, &driver.node), None, "not spawned yet");
     let spawn = DriveAct {
         shell: false,
-        verb: "spawn",
+        kind: DriveKind::Spawn,
         sid: None,
         hold: None,
     };
@@ -22719,7 +22718,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     assert_eq!(drive_owned(&other, &driver.node), None, "another session");
     let close = DriveAct {
         shell: false,
-        verb: "close",
+        kind: DriveKind::Close,
         sid: Some(worker.clone()),
         hold: None,
     };
@@ -22731,7 +22730,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     let shell = SessionId::new("s-0000000000f00d03");
     let opened = DriveAct {
         shell: true,
-        verb: "spawn",
+        kind: DriveKind::Spawn,
         sid: None,
         hold: None,
     };
@@ -22778,7 +22777,7 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
     let fresh = SessionId::new("s-0000000000f00d12");
     let spawn = DriveAct {
         shell: false,
-        verb: "spawn",
+        kind: DriveKind::Spawn,
         sid: None,
         hold: None,
     };
@@ -22808,6 +22807,50 @@ fn a_drives_close_named_after_its_verb_is_told_the_form() {
     assert!(!other.contains("@s-… close"), "{other}");
 }
 
+/// A DRIVE'S FIRST LINE IS ITS REQUESTER, read a byte at a time so the request behind it is left
+/// whole for the connection's serve (`serve_fleet`).
+/// NEGATIVE CONTROLS: a drive whose first line is a request, one whose requester is malformed,
+/// one past the line's bound, and one that hangs up before any line are each refused.
+#[cfg(unix)]
+#[test]
+fn fleet_drive_without_requester_line_is_refused() {
+    use aterm_types::control_verbs::Requester;
+    let asked = Requester::of(Some("s-0123456789abcdef0123"), Some("claude"), None, None);
+    let (mut near, mut far) = CtlStream::pair().expect("a pair");
+    far.write_all(format!("{}survey\n", asked.line()).as_bytes())
+        .expect("the lines");
+    assert_eq!(read_requester(&mut near), Ok(asked.clone()));
+    let mut rest = [0u8; 7];
+    near.read_exact(&mut rest).expect("the request behind it");
+    assert_eq!(&rest, b"survey\n");
+    for sent in [
+        "survey\n".to_owned(),
+        "@s-0123456789abcdef0123 turn hello\n".to_owned(),
+        "requester sid=- program=- model=-\n".to_owned(),
+        format!(
+            "requester sid=- program=- model=- account={}\n",
+            "a".repeat(300)
+        ),
+    ] {
+        let (mut near, mut far) = CtlStream::pair().expect("a pair");
+        far.write_all(sent.as_bytes()).expect("the line");
+        assert!(read_requester(&mut near).is_err(), "{sent:?}");
+    }
+    let (mut near, far) = CtlStream::pair().expect("a pair");
+    drop(far);
+    assert!(read_requester(&mut near).is_err(), "a hang-up names no one");
+    // Even a complete buffered frame cannot renew an expired connection-wide deadline.
+    let (mut near, mut far) = CtlStream::pair().expect("a pair");
+    far.write_all(asked.line().as_bytes())
+        .expect("the requester");
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    assert!(read_requester_until(&mut near, expired).is_err());
+    let mut first = [0];
+    near.read_exact(&mut first)
+        .expect("expired read took no bytes");
+    assert_eq!(first, [b'r']);
+}
+
 #[test]
 fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
     let ctx = test_ctx();
@@ -22820,6 +22863,75 @@ fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
     assert_eq!(
         caller.who,
         crate::typed_by::Who::Word("mac-03 over the fleet".to_owned())
+    );
+}
+
+/// A turn and an input mark a fleet drive types are the drive's (the requests design (2026-11-09)
+/// §5): the turn ledger and the session log's `input` mark both say `by=fleet:<node>:-`, the node
+/// as the drive's tab marks spell its host and `-` for the session the drive does not name, never
+/// `ctl`, the owner token its admitted line is served under. NEGATIVE CONTROL: the same turn off a
+/// drive is `ctl`.
+#[test]
+fn a_fleet_drives_turn_is_recorded_by_fleet_not_ctl() {
+    use crate::turn_ledger::TurnBy;
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let paste = |_: &str| true;
+    let press = |_: &str| true;
+    let turn = || {
+        let driver = crate::control::turn_driver(Scope::Owner, &h.ctx);
+        let io = TurnIo {
+            paste: &paste,
+            press: &press,
+            by: control_session::turn_by(Scope::Owner, driver.as_ref()),
+            ..TurnIo::paste_only()
+        };
+        let reply = cmd_turn(&h.term, &store, 0, "timeout=300 idle=1 next", &h.ctx, &io);
+        assert!(reply.starts_with("OK "), "{reply}");
+        control_session::cmd_history(&h.ctx, "")
+            .lines()
+            .last()
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    let word = "fleet:87be5228:s-0123456789abcdef0123";
+    {
+        let _driving = crate::fabric::DrivingAs::requested(
+            crate::fabric::Driver {
+                node: "87be5228".repeat(4),
+                host: "192.168.1.172 (node 87be5228)".to_owned(),
+            },
+            aterm_types::control_verbs::Requester::of(
+                Some("s-0123456789abcdef0123"),
+                None,
+                None,
+                None,
+            ),
+        );
+        assert_eq!(
+            control_session::turn_by(Scope::Owner, None),
+            TurnBy::Fleet(word.to_owned())
+        );
+        assert_eq!(
+            control_session::log_actor(Scope::Owner, &h.ctx).word(),
+            word
+        );
+        let row = turn();
+        assert!(
+            row.split_whitespace().any(|w| w == format!("by={word}")),
+            "{row}"
+        );
+    }
+    let row = turn();
+    assert!(
+        row.split_whitespace().any(|w| w == "by=ctl"),
+        "CONTROL: {row}"
+    );
+    assert_eq!(
+        control_session::log_actor(Scope::Owner, &h.ctx),
+        aterm_slog::Actor::Ctl,
+        "CONTROL"
     );
 }
 
@@ -22881,20 +22993,23 @@ fn a_signal_names_the_program_that_asked_it_but_never_the_harness() {
     );
 }
 
+// The drive's spawn gate serves only a Unix node (`drive_gate` is `cfg(any(unix, test))`), and
+// its absolute `cwd=/private/tmp` is relative on Windows.
+#[cfg(unix)]
 #[test]
 fn plain_fleet_shell_grammar_cannot_carry_commands_tasks_or_extra_placement() {
     let no = |_: &SessionId| false;
     let gate = |line: &str| drive_gate(line, &no, &no, &no, &|_| false);
-    let Ok(DriveLine::Act {
-        line,
-        write: Some(act),
-    }) = gate("spawn cwd=/private/tmp")
+    let Ok(DriveLine::Act { line, act }) = gate("spawn cwd=/private/tmp why=\"check the disk\"")
     else {
         panic!("the explicit plain shell is admitted");
     };
-    assert_eq!(line, "spawn cwd=/private/tmp raise=false");
+    assert_eq!(
+        line,
+        "spawn cwd=/private/tmp why=\"check the disk\" raise=false"
+    );
     assert!(act.shell);
-    assert_eq!(act.verb, "spawn");
+    assert_eq!(act.kind, DriveKind::Spawn);
     for line in [
         "spawn",
         "spawn cwd=relative",
@@ -22910,8 +23025,99 @@ fn plain_fleet_shell_grammar_cannot_carry_commands_tasks_or_extra_placement() {
         "spawn cwd=/tmp window=0",
         "spawn cwd=/tmp connected=controlled",
         "spawn cwd=/tmp\nversion",
+        "spawn cwd=/tmp why=a why=b",
     ] {
         assert!(gate(line).is_err(), "{line}");
+    }
+}
+
+/// A plain fleet shell says what it is for (the requests design (2026-11-09) §5, decision 2):
+/// without `why=` it is refused, and the refusal names the form; a `why=` that is empty, over 200
+/// characters or a second line is refused naming the word. NEGATIVE CONTROL: a worker, which has
+/// its brief, needs none, and the same shell with a `why=` is admitted. Unix only, as the drive's
+/// spawn gate is.
+#[cfg(unix)]
+#[test]
+fn a_plain_fleet_shell_without_a_why_is_refused_naming_the_form() {
+    let no = |_: &SessionId| false;
+    let gate = |line: &str| drive_gate(line, &no, &no, &no, &|_| false);
+    let refused = gate("spawn cwd=/private/tmp").expect_err("no why=");
+    assert!(
+        refused.contains("a plain fleet shell is spawn cwd=") && refused.contains("why="),
+        "{refused}"
+    );
+    assert!(refused.contains("names no why="), "{refused}");
+    for line in [
+        "spawn cwd=/private/tmp why=".to_owned(),
+        format!("spawn cwd=/private/tmp why={}", "w".repeat(201)),
+        "spawn cwd=/private/tmp why=\"a\tb\"".to_owned(),
+    ] {
+        let refused = gate(&line).expect_err(&line);
+        assert!(refused.contains("why="), "{line}: {refused}");
+    }
+    assert!(
+        gate("spawn cwd=/private/tmp why=look").is_ok(),
+        "CONTROL: the same shell with a why"
+    );
+    assert!(
+        gate("spawn agent=claude cwd=/private/tmp len=5").is_ok(),
+        "CONTROL: a worker has its brief"
+    );
+    assert!(
+        gate(&format!(
+            "spawn agent=claude cwd=/private/tmp why={} len=5",
+            "w".repeat(201)
+        ))
+        .is_err(),
+        "a worker's why= is held to the same line"
+    );
+}
+
+/// A drive's spawn joins a request it was given (`req=<id>`, the id an earlier spawn's reply
+/// named), on either form. NEGATIVE CONTROLS: an id aterm never mints and a second `req=` are
+/// refused naming the word. Unix only, as the drive's spawn gate is.
+#[cfg(unix)]
+#[test]
+fn a_drive_spawn_takes_one_req_of_request_id_shape() {
+    let no = |_: &SessionId| false;
+    let gate = |line: &str| drive_gate(line, &no, &no, &no, &|_| false);
+    let id = "r-20261109-1411-87be5228-01";
+    let Ok(DriveLine::Act { line, .. }) =
+        gate(&format!("spawn cwd=/private/tmp why=look req={id}"))
+    else {
+        panic!("a plain shell joins its request");
+    };
+    assert_eq!(
+        line,
+        format!("spawn cwd=/private/tmp why=look req={id} raise=false")
+    );
+    assert!(
+        gate(&format!(
+            "spawn agent=claude cwd=/private/tmp req={id} len=5"
+        ))
+        .is_ok(),
+        "a worker joins its request"
+    );
+    for (line, word) in [
+        (
+            "spawn cwd=/private/tmp why=look req=r-1".to_owned(),
+            "req=r-1".to_owned(),
+        ),
+        (
+            format!("spawn cwd=/private/tmp why=look req={id} req={id}"),
+            format!("req={id}"),
+        ),
+        (
+            "spawn agent=claude cwd=/private/tmp req=x len=5".to_owned(),
+            "req=x".to_owned(),
+        ),
+        (
+            format!("spawn agent=claude cwd=/private/tmp req={id} req={id} len=5"),
+            format!("req={id}"),
+        ),
+    ] {
+        let refused = gate(&line).expect_err(&line);
+        assert!(refused.contains(&format!("`{word}`")), "{line}: {refused}");
     }
 }
 
@@ -22972,7 +23178,7 @@ fn owned_shell_reads_and_close_recheck_driver_and_human_adoption() {
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
     assert!(record_driven_shell(&store, sid.as_str(), &driver.node));
     let read = DriveAct {
-        verb: "shell-read",
+        kind: DriveKind::ShellRead,
         sid: Some(sid.clone()),
         hold: None,
         shell: false,
@@ -23013,7 +23219,7 @@ fn owned_shell_reads_and_close_recheck_driver_and_human_adoption() {
         "the UI close recheck refuses adoption"
     );
     let close = DriveAct {
-        verb: "close",
+        kind: DriveKind::Close,
         sid: Some(sid),
         hold: None,
         shell: false,
@@ -23157,16 +23363,23 @@ fn a_drives_home_relative_cwd_resolves_in_this_macs_home_and_stays_there() {
         format!("spawn agent=claude cwd={} len=5 raise=false", real("trust"))
     );
     assert_eq!(
-        spawn("cwd=$HOME/trust/src/", here).expect("a shell in $HOME/trust/src"),
-        format!("spawn cwd={} raise=false", real("trust/src"))
+        spawn("cwd=$HOME/trust/src/ why=build", here).expect("a shell in $HOME/trust/src"),
+        format!("spawn cwd={} why=build raise=false", real("trust/src"))
     );
     assert_eq!(
-        spawn("cwd=\"~/My Project\" raise=false", here).expect("a folder with a space"),
-        format!("spawn cwd=\"{}\" raise=false", real("My Project"))
+        spawn(
+            "cwd=\"~/My Project\" why=\"read its notes\" raise=false",
+            here
+        )
+        .expect("a folder with a space"),
+        format!(
+            "spawn cwd=\"{}\" why=\"read its notes\" raise=false",
+            real("My Project")
+        )
     );
     assert_eq!(
-        spawn("cwd=~", here).expect("the home itself"),
-        format!("spawn cwd={} raise=false", real(""))
+        spawn("cwd=~ why=look", here).expect("the home itself"),
+        format!("spawn cwd={} why=look raise=false", real(""))
     );
     for (rest, said) in [
         ("cwd=~/missing", "no such folder ~/missing"),
@@ -23197,12 +23410,12 @@ fn a_drives_home_relative_cwd_resolves_in_this_macs_home_and_stays_there() {
     .expect("a guarded folder by the data volume");
     std::os::unix::fs::symlink("loop", home.join("loop")).expect("a loop");
     assert_eq!(
-        spawn("cwd=~/t", here).expect("a link to $HOME/trust"),
-        format!("spawn cwd={} raise=false", real("trust"))
+        spawn("cwd=~/t why=look", here).expect("a link to $HOME/trust"),
+        format!("spawn cwd={} why=look raise=false", real("trust"))
     );
     assert_eq!(
-        spawn("cwd=~/back", here).expect("out and back in"),
-        format!("spawn cwd={} raise=false", real("trust/src"))
+        spawn("cwd=~/back why=look", here).expect("out and back in"),
+        format!("spawn cwd={} why=look raise=false", real("trust/src"))
     );
     for (rest, said) in [
         ("cwd=~/docs", "for a folder macOS guards"),
@@ -23437,4 +23650,348 @@ fn a_typed_turn_whose_head_types_no_key_writes_its_rest_only_where_the_pace_fits
         [InputEvent::KeySequence(b"hello world".to_vec())],
         "the rest as its keys' bytes, in one write: {out}"
     );
+}
+
+/// EVERY LINE A DRIVE SERVES HAS ONE KIND, read off its selector, verb and at most one word of
+/// its arguments (the design's §2.3), and the gate passes it as that kind. A `spawn` is a spawn
+/// whatever follows it: the lock judges a malformed one as a spawn, and only then does the gate
+/// refuse its grammar. CONTROL: a verb a drive does not serve, a selector on `hold` and a
+/// `close` with none have no kind, and the gate refuses each in the same words.
+#[test]
+fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
+    use DriveKind as K;
+    const W: &str = "s-00000000000000aa";
+    const GONE: &str = "s-00000000000000dd";
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    // An absolute folder: Windows' names a drive.
+    const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+    let hosts = |sid: &SessionId| sid.as_str() == W;
+    let kept = |sid: &SessionId| sid.as_str() == GONE;
+    let yes = |_: &SessionId| true;
+    let gate = |line: &str| drive_gate(line, &hosts, &yes, &yes, &kept);
+    let kind = |line: &str| drive_kind(&Request::parse(line.to_owned()).head());
+    let image = "ab".repeat(32);
+    let mut table: Vec<(String, K)> = vec![
+        ("board".to_owned(), K::Read),
+        (
+            r#"service-repair {"schema":1,"op":"inspect","payload":{"job":"server"}}"#.to_owned(),
+            K::Read,
+        ),
+        (
+            format!(
+                r#"service-repair {{"schema":1,"op":"prepare","payload":{{"job":"server","image":"{image}","nonce":"0123456789abcdef"}}}}"#
+            ),
+            K::Read,
+        ),
+        (
+            r#"service-repair {"schema":1,"op":"recover","payload":{"job":"subscriber"}}"#
+                .to_owned(),
+            K::ServiceRepair,
+        ),
+        (format!("accounts-renew poll={NONCE}"), K::Read),
+        (format!("accounts-renew start={NONCE}"), K::AccountsRenew),
+        (format!("await task @{W} since=0"), K::Read),
+        (format!("await task @{GONE}:3 any"), K::Read),
+        (format!("@{W} status"), K::Read),
+        (format!("@{W} text"), K::Read),
+        (format!("@{W} screen"), K::Read),
+        (format!("@{W} result"), K::Read),
+        (format!("@{GONE} result"), K::Read),
+        (format!("@{W} inbox"), K::Read),
+        (format!("@{W} inbox fleet since=f0"), K::Read),
+        (format!("@{W} inbox peek"), K::Read),
+        (format!("@{W} blocks"), K::ShellRead),
+        (format!("@{W} blocktext 3 trim"), K::ShellRead),
+        (format!("@{W} await idle 500 timeout=1000"), K::ShellRead),
+        (format!("@{W} post key=k kind=note -- hi"), K::Post),
+        (format!("@{W} inbox seen f1"), K::MailSeen),
+        (format!("@{W} inbox seen f1 forget"), K::MailSeen),
+        (format!("@{W} inbox  seen"), K::MailSeen),
+        (format!("@{W} turn timeout=20000 hi"), K::Turn),
+        (format!("@{W} key Enter"), K::Key),
+        (format!("@{W} send hi"), K::Send),
+        (format!("hold {W} on reason=build"), K::Hold),
+        (format!("hold {W} off"), K::Hold),
+        (format!("@{W} close"), K::Close),
+        (format!("spawn agent=claude cwd={CWD} len=5"), K::Spawn),
+        (format!("spawn cwd={CWD} why=\"check the disk\""), K::Spawn),
+        (format!("request claim path={CWD}"), K::Claim),
+        (
+            format!("request claim path={CWD} req=r-20261111-1200-87be5228-01"),
+            K::Claim,
+        ),
+        ("requests".to_owned(), K::Read),
+        ("requests state=unreviewed --json".to_owned(), K::Read),
+        (
+            "request show r-20261111-1200-87be5228-01".to_owned(),
+            K::Read,
+        ),
+    ];
+    if cfg!(unix) {
+        table.push(("vault status".to_owned(), K::Read));
+        table.push((
+            format!("vault approve abcd-efgh-ijkl-mnop {NONCE}"),
+            K::Vault,
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (line, want) in &table {
+        assert_eq!(kind(line), Ok(*want), "{line}");
+        match gate(line) {
+            Ok(DriveLine::Act { act, .. }) => assert_eq!(act.kind, *want, "{line}"),
+            other => panic!("{line}: the gate did not pass it: {other:?}"),
+        }
+        seen.insert(want.word());
+    }
+    // The fleet's own verbs are reads that keep the fleet scope.
+    for line in ["survey", "survey content", "version", "setup status"] {
+        assert_eq!(kind(line), Ok(K::Read), "{line}");
+        assert_eq!(gate(line), Ok(DriveLine::Fleet), "{line}");
+    }
+    // Every kind but the mesh's stream, which is no line, has a line here.
+    let lines: std::collections::BTreeSet<&str> = DriveKind::ALL
+        .into_iter()
+        .filter(|kind| *kind != K::BusLog && (cfg!(unix) || *kind != K::Vault))
+        .map(DriveKind::word)
+        .collect();
+    assert_eq!(seen, lines);
+
+    // A spawn is a spawn, a hold a hold and a session's verb its kind, well formed or not, a
+    // hosted session or not: the gate refuses each after the lock has judged it.
+    for (line, want) in [
+        ("spawn", K::Spawn),
+        ("spawn cwd=nowhere-at-all/x", K::Spawn),
+        ("spawn agent=claude cwd=\"/tmp len=5", K::Spawn),
+        ("spawn agent=nobody identity=x", K::Spawn),
+        ("spawn cwd=~/../elsewhere", K::Spawn),
+        ("hold", K::Hold),
+        ("hold s-00000000000000ee sideways", K::Hold),
+        ("@s-00000000000000ee turn hi", K::Turn),
+        ("@s-00000000000000ee close now", K::Close),
+        ("@7 send hi", K::Send),
+        ("@. post -- hi", K::Post),
+        ("@s-00000000000000ee inbox seen", K::MailSeen),
+    ] {
+        assert_eq!(kind(line), Ok(want), "{line}");
+        assert!(gate(line).is_err(), "{line}: the gate refuses it");
+    }
+
+    // CONTROL: no kind, and the gate's refusal is the table's, word for word.
+    for line in [
+        "frobnicate",
+        "settings set columns 80",
+        "close s-00000000000000aa",
+        "board accept @s-00000000000000aa passed",
+        "await idle 5",
+        "accounts-renew start=x",
+        "@s-00000000000000aa hold on",
+        "@s-00000000000000aa spawn agent=claude len=5",
+        "@s-00000000000000aa meta set autopilot land",
+        "@s-00000000000000aa board",
+        "request",
+        "request review r-20261111-1200-87be5228-01",
+        "@s-00000000000000aa request claim path=/tmp",
+    ] {
+        let refused = kind(line).expect_err(line);
+        assert_eq!(gate(line), Err(refused), "{line}");
+    }
+}
+
+/// THE LOCK CAPS A GRANTED DRIVER AT EVERY LEVEL: each kind's line is admitted exactly where
+/// the level is at least what the kind needs, and refused elsewhere under
+/// [`aterm_types::control_verbs::DRIVE_LOCKED`] with the level in force, the level needed and
+/// the word refused, with one audit line. A refused line never reaches the gate, so no session,
+/// ownership or path is looked at for it: a refused `spawn 'cwd=~/…'` walks no folder. With no
+/// level set a test thread reads its scratch state, which holds none: Read Only, the default.
+/// CONTROL: at Full Access the same lines reach the gate, which judges each as before.
+#[test]
+#[cfg(unix)]
+fn the_lock_caps_a_granted_driver_before_the_gate_looks_at_anything() {
+    use DriveKind as K;
+    use FleetAccess as A;
+    let store = crate::session_store::new_store();
+    let (target, _rx) = pipe_session(92);
+    let sid = target.sid.clone();
+    store.write().unwrap().register(target);
+    let drive = Scope::Fleet {
+        content: true,
+        drive: true,
+    };
+    let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "05".repeat(16),
+        host: "mac-05".to_owned(),
+    });
+    let w = sid.as_str();
+    let lines = [
+        (format!("@{w} status"), K::Read),
+        (format!("@{w} inbox"), K::Read),
+        ("board".to_owned(), K::Read),
+        (format!("await task @{w} since=0"), K::Read),
+        (
+            "accounts-renew start=0123456789abcdef0123456789abcdef".to_owned(),
+            K::AccountsRenew,
+        ),
+        (format!("@{w} post key=k kind=note -- hi"), K::Post),
+        (format!("@{w} inbox seen f1"), K::MailSeen),
+        (format!("@{w} turn hi"), K::Turn),
+        (format!("@{w} key Enter"), K::Key),
+        (format!("@{w} send hi"), K::Send),
+        (format!("hold {w} on"), K::Hold),
+        (format!("@{w} close"), K::Close),
+        ("spawn cwd=/private/tmp".to_owned(), K::Spawn),
+        ("spawn agent=claude len=5".to_owned(), K::Spawn),
+        (
+            "spawn cwd=~/no-such-folder-of-this-home".to_owned(),
+            K::Spawn,
+        ),
+        ("spawn".to_owned(), K::Spawn),
+        ("request claim path=/private/tmp".to_owned(), K::Claim),
+        (
+            "request claim path=~/no-such-folder-of-this-home".to_owned(),
+            K::Claim,
+        ),
+    ];
+    let judge = |line: &str| {
+        FLEET_AUDITED.with(|audited| audited.borrow_mut().clear());
+        DRIVE_GATED.with(|gated| gated.set(0));
+        let answer = drive_admission(Request::parse(line.to_owned()), drive, &store);
+        (
+            answer,
+            DRIVE_GATED.with(std::cell::Cell::get),
+            FLEET_AUDITED.with(|audited| audited.take()),
+        )
+    };
+    let check = |level: A| {
+        for (line, kind) in &lines {
+            let (answer, gated, audited) = judge(line);
+            if level.admits(*kind) {
+                assert_eq!(gated, 1, "{level:?}: {line} reaches the gate");
+                if let Err(refused) = &answer {
+                    assert!(
+                        !refused.starts_with(aterm_types::control_verbs::DRIVE_LOCKED),
+                        "{level:?}: {line}: the gate's own refusal, not the lock's: {refused}"
+                    );
+                }
+                continue;
+            }
+            let Err(refused) = answer else {
+                panic!("{level:?}: {line} was admitted");
+            };
+            assert_eq!(
+                FleetAccess::refused_at(&refused),
+                Some((level, kind.needs())),
+                "{level:?}: {line}: {refused}"
+            );
+            assert!(
+                refused.ends_with(&format!("; not `{}`\n", kind.word())),
+                "{refused}"
+            );
+            assert_eq!(gated, 0, "{level:?}: {line} never reaches the gate");
+            assert!(
+                matches!(audited.as_slice(), [line]
+                    if line.contains("mac-05 driving: fleet access") && line.ends_with(level.word())),
+                "{level:?}: one audit line: {audited:?}"
+            );
+        }
+    };
+    // No level set: the scratch state holds no file, so the default is in force.
+    assert_eq!(fleet_access_now(), A::ReadOnly);
+    check(A::ReadOnly);
+    for level in FleetAccess::ALL {
+        let _level = FleetAccessForTest::set(level);
+        assert_eq!(fleet_access_now(), level);
+        check(level);
+    }
+    assert_eq!(fleet_access_now(), A::ReadOnly, "the guard put it back");
+
+    // What an admitted line hands on: a read has no act, a write its kind.
+    let _full = FleetAccessForTest::set(A::Full);
+    let Ok((_, scope, act)) = judge(&format!("@{w} inbox")).0 else {
+        panic!("a read was refused");
+    };
+    assert_eq!((scope, act), (Scope::Owner, None));
+    let Ok((_, scope, act)) = judge(&format!("@{w} inbox seen f1")).0 else {
+        panic!("a write was refused at Full Access");
+    };
+    assert_eq!(
+        (scope, act.map(|act| act.kind)),
+        (Scope::Owner, Some(K::MailSeen))
+    );
+    // The lock is a ceiling, never a grant: a reader's connection is not driven at Full Access.
+    let reader = Scope::Fleet {
+        content: true,
+        drive: false,
+    };
+    let Ok((_, scope, act)) =
+        drive_admission(Request::parse(format!("@{w} send hi")), reader, &store)
+    else {
+        panic!("a reader's line is the fleet gate's to refuse");
+    };
+    assert_eq!((scope, act), (reader, None));
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_driven_shell_as_a_tab_ends_its_drivers_custody() {
+    let mut app = crate::App::headless_for_test();
+    let local = crate::app_workers_tests::land_worker(&mut app);
+    let sid = app
+        .store
+        .read()
+        .unwrap()
+        .by_local(local)
+        .unwrap()
+        .sid
+        .clone();
+    let other = crate::app_workers_tests::land_worker(&mut app);
+    let other_sid = app
+        .store
+        .read()
+        .unwrap()
+        .by_local(other)
+        .unwrap()
+        .sid
+        .clone();
+    let node = "8a29".repeat(8);
+    assert!(record_driven_shell(&app.store, sid.as_str(), &node));
+    assert!(record_driven_shell(&app.store, other_sid.as_str(), &node));
+    assert_eq!(drive_close_admission(&app.store, local, &node), Some(true));
+    assert!(app.keep_as_tab(local));
+    assert!(!drive_owns_shell(&app.store, &sid, &node));
+    assert_eq!(drive_close_admission(&app.store, local, &node), None);
+    assert_eq!(drive_close_admission(&app.store, other, &node), Some(true));
+    assert!(app.close_control_session(local, Some(&node)).is_err());
+    assert!(app.store.read().unwrap().by_sid(&sid).is_some());
+    forget_driven_shell(&other_sid);
+}
+
+/// A drive reads its own requests (`requests`, `request show`) as it reads a board, and claims a
+/// folder for one; reviewing, keeping and replying are the driven Mac's person's, and the
+/// refusal says so before anything is looked at.
+#[test]
+fn a_drive_request_show_and_requests_are_reads_and_review_is_refused() {
+    let kind = |line: &str| drive_kind(&Request::parse(line.to_owned()).head());
+    const ID: &str = "r-20261111-1200-87be5228-01";
+    for line in [
+        "requests",
+        &format!("request show {ID}"),
+        &format!("request show {ID} --json"),
+    ] {
+        assert_eq!(kind(line), Ok(DriveKind::Read), "{line}");
+    }
+    assert_eq!(kind("request claim path=/tmp"), Ok(DriveKind::Claim));
+    for line in [
+        format!("request review {ID} note=ok"),
+        format!("request keep {ID}"),
+        format!("request reply {ID} -- hi"),
+    ] {
+        let refused = kind(&line).expect_err(&line);
+        assert!(
+            refused.contains("review, keep and reply are this Mac's person's")
+                && refused.ends_with(&format!("; not `{}`", drive_word(&line))),
+            "{refused}"
+        );
+    }
+    // NEGATIVE: a `request` aimed at a session is no drive's.
+    assert!(kind(&format!("@s-00000000000000aa request show {ID}")).is_err());
 }

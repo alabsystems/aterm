@@ -490,7 +490,7 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
         assert!(line.contains(" '--chrome' "), "{line}");
         assert!(
             line.contains(" '--permission-mode' 'auto' "),
-            "auto mode, whatever the person's Claude Code settings (owner, 2026-11-04): {line}"
+            "auto mode, whatever the person's Claude Code settings: {line}"
         );
         assert!(
             line.contains(" '--tools' 'ToolSearch' "),
@@ -1033,7 +1033,12 @@ fn a_landed_claim_worker_is_named_for_its_offer_and_holds_its_link() {
     let session = app.next_session_id;
     app.next_session_id += 1;
     let parent = app.new_tab_parent(crate::WindowId(0));
-    app.install_tab_session_parked(crate::WindowId(0), crate::stub_session(session), parent);
+    app.install_tab_session_parked(
+        crate::WindowId(0),
+        crate::stub_session(session),
+        parent,
+        false,
+    );
     app.sync_window(crate::WindowId(0));
     let sid = live(&app, session).sid.as_str().to_owned();
     let offer = credit_offers::parse(profile_text(false).as_bytes())

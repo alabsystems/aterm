@@ -320,7 +320,7 @@ impl std::fmt::Debug for Credential {
 pub enum LoadError {
     /// No file or no variable (or an empty variable).
     Missing,
-    /// `PrivateFileError::NotPrivate`'s text.
+    /// `PrivateFileError::NotPrivate`'s or `PrivateFileError::Writable`'s text.
     Loose(String),
     /// The file or its directory is a symlink.
     Symlink,
@@ -677,6 +677,38 @@ pub(crate) fn chmod_remedy(dir: &Path, file: &Path, home: &Path) -> Option<Strin
     }
 }
 
+/// The chmod that clears the group and other write bits of each `(path, mode)`, `mode` its
+/// permission bits now, and the chmods that put back the bits each had, as [`private_fix`]
+/// words its inverse: `chmod go-w A B (inverse: chmod g+w A && chmod g+w B)`. The inverse is
+/// symbolic, since a numeric mode would also clear a shared repository's setgid directory bit
+/// where `chmod` takes the number whole (macOS). For a rule that refuses only a write bit,
+/// where [`chmod_remedy`]'s 700 and 600 would also take read bits away.
+#[cfg(unix)]
+pub(crate) fn write_bit_remedy(paths: &[(&Path, u32)]) -> String {
+    let words: Vec<_> = paths
+        .iter()
+        .map(|(path, _)| shell_word(path.display().to_string()))
+        .collect();
+    let inverse: Vec<_> = paths
+        .iter()
+        .zip(&words)
+        .filter_map(|((_, mode), word)| {
+            let who = match (mode & 0o020 != 0, mode & 0o002 != 0) {
+                (true, true) => "go",
+                (true, false) => "g",
+                (false, true) => "o",
+                (false, false) => return None,
+            };
+            Some(format!("chmod {who}+w {word}"))
+        })
+        .collect();
+    format!(
+        "chmod go-w {} (inverse: {})",
+        words.join(" "),
+        inverse.join(" && ")
+    )
+}
+
 /// Computes the [`PrivateFix`] for `file` in `dir`.
 #[cfg(unix)]
 pub(crate) fn private_fix(dir: &Path, file: &Path, home: &Path, held: Held<'_>) -> PrivateFix {
@@ -793,6 +825,7 @@ fn load_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
         Ok(read) => credential_from(profile, &buf[..read.len], Some((read.dev, read.ino))),
         Err(PrivateFileError::Missing) => Err(LoadError::Missing),
         Err(PrivateFileError::NotPrivate(why)) => Err(LoadError::Loose(why.to_string())),
+        Err(PrivateFileError::Writable(writable)) => Err(LoadError::Loose(writable.to_string())),
         Err(PrivateFileError::Symlink) => Err(LoadError::Symlink),
         Err(PrivateFileError::Malformed(why)) => Err(LoadError::Malformed(why)),
         Err(PrivateFileError::Io(e)) => Err(LoadError::Io(e.to_string())),
@@ -823,6 +856,7 @@ fn load_loose_file(profile: &Profile, path: &Path) -> Result<Credential, LoadErr
         ),
         Err(PrivateFileError::Missing) => Err(LoadError::Missing),
         Err(PrivateFileError::NotPrivate(why)) => Err(LoadError::Loose(why.to_string())),
+        Err(PrivateFileError::Writable(writable)) => Err(LoadError::Loose(writable.to_string())),
         Err(PrivateFileError::Symlink) => Err(LoadError::Symlink),
         Err(PrivateFileError::Malformed(why)) => Err(LoadError::Malformed(why)),
         Err(PrivateFileError::Io(e)) => Err(LoadError::Io(e.to_string())),

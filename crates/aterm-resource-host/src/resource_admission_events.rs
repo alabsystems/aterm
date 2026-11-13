@@ -14,7 +14,7 @@ use std::{
 };
 
 pub(in super::super) struct Events {
-    stream: CtlStream,
+    endpoint: Endpoint,
     binding: Binding,
     output: VecDeque<Vec<u8>>,
     sent: usize,
@@ -39,12 +39,53 @@ pub(in super::super) struct Events {
     #[cfg(all(test, target_os = "macos"))]
     audit: Option<std::fs::File>,
 }
+
+enum Endpoint {
+    Socket(CtlStream),
+    Local {
+        send: std::sync::mpsc::SyncSender<Event>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+/// Only the original actor's private preflight path owns this endpoint.
+/// Cancellation requests cleanup; only a real owning event settles it.
+pub(in super::super) struct LocalEvents {
+    pub(in super::super) receive: std::sync::mpsc::Receiver<Event>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl LocalEvents {
+    pub(in super::super) fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl Events {
     pub(in super::super) fn new(fd: OwnedFd, binding: Binding) -> io::Result<Self> {
         let stream = CtlStream::from(fd);
         stream.set_nonblocking(true)?;
-        Ok(Self {
-            stream,
+        Ok(Self::with_endpoint(Endpoint::Socket(stream), binding))
+    }
+
+    pub(in super::super) fn local(binding: Binding) -> (Self, LocalEvents) {
+        let (send, receive) = std::sync::mpsc::sync_channel(4);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self::with_endpoint(
+                Endpoint::Local {
+                    send,
+                    cancelled: cancelled.clone(),
+                },
+                binding,
+            ),
+            LocalEvents { receive, cancelled },
+        )
+    }
+
+    fn with_endpoint(endpoint: Endpoint, binding: Binding) -> Self {
+        Self {
+            endpoint,
             binding,
             output: VecDeque::new(),
             sent: 0,
@@ -65,7 +106,7 @@ impl Events {
             sent_frames: Vec::new(),
             #[cfg(all(test, target_os = "macos"))]
             audit: None,
-        })
+        }
     }
     #[cfg(all(test, target_os = "macos"))]
     pub(in super::super) fn audit_to(&mut self, mut file: std::fs::File) {
@@ -77,6 +118,15 @@ impl Events {
         self.audit = Some(file);
     }
     pub(in super::super) fn emit(&mut self, event: Event) -> io::Result<()> {
+        if let Endpoint::Local { send, .. } = &self.endpoint {
+            if self.failed || send.try_send(event).is_err() {
+                self.failed = true;
+                return Err(io::Error::other(
+                    "private native probe lifecycle unavailable",
+                ));
+            }
+            return Ok(());
+        }
         if self.accounted {
             match event {
                 Event::Refused { .. } => {
@@ -107,7 +157,11 @@ impl Events {
         self.enqueue(bytes)
     }
     pub(in super::super) fn account(&mut self) -> io::Result<()> {
-        if self.metadata_root.is_some() || self.prepared || self.accounted {
+        if self.metadata_root.is_some()
+            || self.prepared
+            || self.accounted
+            || matches!(self.endpoint, Endpoint::Local { .. })
+        {
             return Err(io::Error::other("accounting purpose or phase differs"));
         }
         self.accounted = true;
@@ -346,11 +400,11 @@ impl Events {
         Ok(())
     }
     pub(in super::super) fn flush(&mut self) {
+        let Endpoint::Socket(stream) = &self.endpoint else {
+            return;
+        };
         while let Some(frame) = self.output.front() {
-            match aterm_uds::fdpass::send_vectored(
-                &self.stream,
-                &[IoSlice::new(&frame[self.sent..])],
-            ) {
+            match aterm_uds::fdpass::send_vectored(stream, &[IoSlice::new(&frame[self.sent..])]) {
                 Ok(0) => {
                     self.failed = true;
                     break;
@@ -459,7 +513,9 @@ impl Events {
         }
     }
     pub(in super::super) fn abandon(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Endpoint::Socket(stream) = &self.endpoint {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         self.failed = true;
     }
     pub(in super::super) fn drained(&mut self) -> bool {
@@ -471,11 +527,17 @@ impl Events {
         if self.failed {
             return true;
         }
+        let stream = match &self.endpoint {
+            Endpoint::Socket(stream) => stream,
+            Endpoint::Local { cancelled, .. } => {
+                return cancelled.load(std::sync::atomic::Ordering::Acquire);
+            }
+        };
         if self.cancel_requested {
             // A valid cancellation keeps its observation channel alive for
             // the actual outcome. Any extra byte/replay withdraws that channel.
             let mut extra = [0; 1];
-            match (&self.stream).read(&mut extra) {
+            match (&*stream).read(&mut extra) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -511,7 +573,7 @@ impl Events {
             if room == 0 {
                 break;
             }
-            match (&self.stream).read(&mut buffer[..room.min(256)]) {
+            match (&*stream).read(&mut buffer[..room.min(256)]) {
                 Ok(0) => {
                     self.failed = true;
                     return true;
@@ -558,80 +620,5 @@ impl Events {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write as _;
-    fn pair() -> (Events, CtlStream) {
-        let (host, client) = CtlStream::pair().unwrap();
-        let binding = Binding {
-            session: "s-a".into(),
-            attempt: [7; 16],
-        };
-        (Events::new(host.into(), binding).unwrap(), client)
-    }
-    #[test]
-    fn cancellation_preserves_partial_frame_without_blocking_another_tick() {
-        let (mut events, mut client) = pair();
-        let cancel = Cancel {
-            binding: events.binding.clone(),
-        }
-        .encode()
-        .unwrap();
-        let header = (cancel.len() as u32).to_be_bytes();
-        client.write_all(&header[..2]).unwrap();
-        assert!(!events.cancelled());
-        client.write_all(&header[2..]).unwrap();
-        client.write_all(&cancel[..3]).unwrap();
-        assert!(!events.cancelled());
-        client.write_all(&cancel[3..]).unwrap();
-        assert!(events.cancelled());
-    }
-    #[test]
-    fn disconnect_and_oversized_header_withdraw_only_the_controller() {
-        let (mut events, client) = pair();
-        drop(client);
-        assert!(events.cancelled());
-        let (mut events, mut client) = pair();
-        client.write_all(&u32::MAX.to_be_bytes()).unwrap();
-        assert!(events.cancelled());
-        assert!(events.input.len() <= 256);
-    }
-    #[test]
-    fn exact_cancel_keeps_actual_terminal_observable_but_replay_refuses() {
-        let (mut events, mut client) = pair();
-        let payload = Cancel {
-            binding: events.binding.clone(),
-        }
-        .encode()
-        .unwrap();
-        client
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .unwrap();
-        client.write_all(&payload).unwrap();
-        assert!(events.cancelled());
-        assert!(!events.failed);
-        events
-            .emit(Event::Finished {
-                outcome: aterm_types::resource_admission::Outcome::Signal(15),
-                cause: aterm_types::resource_admission::CompletionCause::Cancelled,
-                runtime_ns: 1,
-            })
-            .unwrap();
-        let bytes = aterm_ctl::resource_admission_transport::read_frame(
-            &client,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        assert!(matches!(
-            EventFrame::decode(&bytes, &events.binding).unwrap().event,
-            Event::Finished {
-                cause: aterm_types::resource_admission::CompletionCause::Cancelled,
-                ..
-            }
-        ));
-        client.write_all(&[0]).unwrap();
-        assert!(events.cancelled());
-        assert!(events.failed);
-        assert!(events.emit(Event::Queued).is_err());
-    }
-}
+#[path = "resource_admission_events_tests.rs"]
+mod tests;

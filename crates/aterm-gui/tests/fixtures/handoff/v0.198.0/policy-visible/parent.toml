@@ -1,0 +1,93 @@
+# What the v0.198.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.198.0"
+producer_commit = "9e0f9ca2c8d8"
+outgoing_build = 1794388184
+park_carry_ceiling = "visible"
+manifest = "seamless-42424-00000000000000000000000001000011.toml"
+nonce = "00000000000000000000000001000011"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "a4e1d775d3c2b1fe7a96e29d36e6ca31f2904343104fa7f1c364c3d6bf2e4964"
+layout_digest = "34ec11a6db5b7d0b64ad70328e9f6223c5f93daa5e6a21bbe674f3e00aaa01d1"
+proof_target_build = 1794474584
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 200, 40000], [1, 201, 40001], [2, 202, 40002]]
+proof_count = 3
+proof_digest = "5e9ce3b2c959fcf1d8887715aaa1740aa7fd5a113d8c37055d3c7bd09fbce479"
+ready_wire = "41535231000000035e9ce3b2c959fcf1d8887715aaa1740aa7fd5a113d8c37055d3c7bd09fbce479"
+commit_wire = "41534331000000035e9ce3b2c959fcf1d8887715aaa1740aa7fd5a113d8c37055d3c7bd09fbce479"
+files = ["seamless-42424-00000000000000000000000001000011.layout.toml", "seamless-42424-00000000000000000000000001000011.s0.ctl", "seamless-42424-00000000000000000000000001000011.s0.grid", "seamless-42424-00000000000000000000000001000011.s1.ctl", "seamless-42424-00000000000000000000000001000011.s1.grid", "seamless-42424-00000000000000000000000001000011.s2.altgrid", "seamless-42424-00000000000000000000000001000011.s2.ctl", "seamless-42424-00000000000000000000000001000011.s2.grid", "seamless-42424-00000000000000000000000001000011.toml"]
+
+[[session]]
+local_id = 0
+rows = 42
+cols = 120
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 1471
+fg_holder = 40000
+absolute_row_counter = 1501
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "visible-only"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+repaint = false
+history_dropped = 1459
+
+[[session]]
+local_id = 1
+rows = 42
+cols = 119
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "9797979797979797979797979797979797979797979797979797979797979797"
+history_take = 0
+history_lost = 236
+fg_holder = 41001
+absolute_row_counter = 278
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 3
+shell_marks = 9
+shell_completed_seq = 60
+rung = "visible-only"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+repaint = false
+history_dropped = 236
+
+[[session]]
+local_id = 2
+rows = 42
+cols = 240
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41002
+absolute_row_counter = 42
+alt_absolute_row_counter = 42
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "visible-only"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+repaint = false
+history_dropped = 0
+

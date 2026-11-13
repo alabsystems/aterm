@@ -719,14 +719,19 @@ const STANDIN_QUIET: &str = "ATERM_CAPACITY_TEST_STANDIN_QUIET";
 const STANDIN_CREDIT: &str = "ATERM_CAPACITY_TEST_STANDIN_CREDIT";
 /// Set, the stand-in's disk claim is scratch ([`Need::scratch`]).
 const STANDIN_SCRATCH: &str = "ATERM_CAPACITY_TEST_STANDIN_SCRATCH";
+/// Set, the stand-in instead holds a cold Release memory claim ALONE.
+const STANDIN_RELEASE_ALONE: &str = "ATERM_CAPACITY_TEST_STANDIN_RELEASE_ALONE";
+/// Set, the stand-in instead holds an Ordinary memory claim ALONE.
+const STANDIN_ORDINARY_ALONE: &str = "ATERM_CAPACITY_TEST_STANDIN_ORDINARY_ALONE";
 #[cfg(unix)]
 const STANDIN_TEST: &str = "tests::standin_holds_a_claim_then_dies";
 
 /// Run by [`a_dead_holder_releases_its_claim_on_the_next_poll`] in a process of its own:
 /// holds a 30 GiB claim (of disk where [`STANDIN_DISK`] says, the quiet machine where
-/// [`STANDIN_QUIET`] does) in the ledger under the directory [`STANDIN`] names, credited with
-/// the pid [`STANDIN_CREDIT`] names where it names one, says so, and once told to dies by
-/// `SIGKILL`, with the claim still held.
+/// [`STANDIN_QUIET`] does, or a 2 GiB cold Release claim ALONE where
+/// [`STANDIN_RELEASE_ALONE`] says) in the ledger under the directory [`STANDIN`] names,
+/// credited with the pid [`STANDIN_CREDIT`] names where it names one, says so, and once told to
+/// dies by `SIGKILL`, with the claim still held.
 #[test]
 fn standin_holds_a_claim_then_dies() {
     let Some(dir) = std::env::var_os(STANDIN).map(PathBuf::from) else {
@@ -738,13 +743,27 @@ fn standin_holds_a_claim_then_dies() {
     let quiet: Option<f64> = std::env::var(STANDIN_QUIET)
         .ok()
         .and_then(|b| b.parse().ok());
-    let (m, need) = match (disk, quiet) {
-        (Some(gib), _) => (
+    let release_alone = std::env::var_os(STANDIN_RELEASE_ALONE).is_some();
+    let ordinary_alone = std::env::var_os(STANDIN_ORDINARY_ALONE).is_some();
+    let (m, need) = match (disk, quiet, release_alone, ordinary_alone) {
+        (Some(gib), _, _, _) => (
             on(vol(200, 100, 10)),
             Need::new("stand-in A").disk(gib * GIB, "/vol"),
         ),
-        (None, Some(bound)) => (mac48(), Need::new("stand-in A").quiet(bound)),
-        (None, None) => (mac48(), Need::new("stand-in A").mem_gib(30)),
+        (None, Some(bound), _, _) => (mac48(), Need::new("stand-in A").quiet(bound)),
+        (None, None, true, false) => (
+            mac48(),
+            Need::new("release cold learner")
+                .rank(crate::Rank::Release)
+                .mem_gib(2)
+                .alone(),
+        ),
+        (None, None, false, true) => (
+            mac48(),
+            Need::new("ordinary isolated work").mem_gib(2).alone(),
+        ),
+        (None, None, false, false) => (mac48(), Need::new("stand-in A").mem_gib(30)),
+        (None, None, true, true) => panic!("stand-in ALONE rank is ambiguous"),
     };
     let need = if std::env::var_os(STANDIN_SCRATCH).is_some() {
         need.scratch()
@@ -797,6 +816,18 @@ fn standin_needing(s: &Scratch, disk: Option<u64>) -> (aterm_uds::spawnfd::Child
 #[cfg(unix)]
 fn standin_quiet(s: &Scratch, bound: f64) -> (aterm_uds::spawnfd::Child, u32) {
     standin_with(s, &[(STANDIN_QUIET, bound.to_string())])
+}
+
+/// [`standin`], holding a cold Release memory claim ALONE.
+#[cfg(unix)]
+fn standin_release_alone(s: &Scratch) -> (aterm_uds::spawnfd::Child, u32) {
+    standin_with(s, &[(STANDIN_RELEASE_ALONE, "1".to_owned())])
+}
+
+/// [`standin`], holding an Ordinary memory claim ALONE.
+#[cfg(unix)]
+fn standin_ordinary_alone(s: &Scratch) -> (aterm_uds::spawnfd::Child, u32) {
+    standin_with(s, &[(STANDIN_ORDINARY_ALONE, "1".to_owned())])
 }
 
 /// [`standin`], with `envs` set to say what its claim is.
@@ -1428,6 +1459,60 @@ fn a_stop_does_not_veto_an_immediate_admit_now_grant() {
     assert_eq!(claim.record().need.what, "now with a prior stop");
 }
 
+/// A WAITER THAT TAKES THE LEDGER'S LOCK AGAIN WRITES NOTHING INTO IT: it takes the lock at
+/// every look (every two seconds by default), and the pid the file names is already its own, so
+/// the file keeps the time set an hour back. A file that names anyone else (another pid, its own
+/// with a digit more, nothing) is written over with this process's pid, which a waiter kept out
+/// then names. Negative control: a `try_turn` that truncates and writes at every take moves the
+/// file's time at the first take after it was set back.
+#[test]
+fn taking_the_ledgers_lock_again_writes_nothing() {
+    let s = scratch("turn-again");
+    drop(s.ledger.try_turn().expect("the lock").expect("free"));
+    let path = s.ledger.dir().join("ledger.lock");
+    let own = format!("{}\n", std::process::id());
+    assert_eq!(std::fs::read_to_string(&path).expect("the lock"), own);
+    let stale = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let set_back = || {
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(stale))
+            .expect("set the lock's time back");
+    };
+    let time = || {
+        std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("the lock's time")
+    };
+    set_back();
+    let turn = s.ledger.try_turn().expect("the lock").expect("free");
+    let moved = |time: std::time::SystemTime| time > stale + Duration::from_secs(1800);
+    assert!(!moved(time()), "the same holder wrote nothing");
+    assert_eq!(std::fs::read_to_string(&path).expect("the lock"), own);
+    assert_eq!(
+        s.ledger.try_turn().expect("the lock").err(),
+        Some(Some(std::process::id())),
+        "a waiter kept out still names the holder"
+    );
+    drop(turn);
+    for other in [
+        "1\n".to_owned(),
+        format!("{}7\n", std::process::id()),
+        String::new(),
+    ] {
+        std::fs::write(&path, &other).expect("another holder's lock");
+        set_back();
+        drop(s.ledger.try_turn().expect("the lock").expect("free"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the lock"),
+            own,
+            "{other:?}"
+        );
+        assert!(moved(time()), "{other:?}: written over");
+    }
+}
+
 /// An explicit resource override does not authorize unreadable ledger state. The same request
 /// can override a resource shortage once the ledger works.
 #[test]
@@ -1732,6 +1817,274 @@ fn admit_now_cannot_bypass_a_release_core_reservation() {
         crate::Forced::Admitted(claim, _) => assert_eq!(claim.cores(), 14),
         other => panic!("negative control: released room stays blocked: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+const RELEASE_MEMORY_TURN: &str = "ATERM_CAPACITY_TEST_RELEASE_MEMORY_TURN";
+#[cfg(unix)]
+const RELEASE_MEMORY_TURN_TEST: &str = "tests::standin_queues_a_release_memory_turn";
+
+/// The independent Release waiter for
+/// [`admit_now_cannot_bypass_a_release_or_leading_memory_turn`].
+#[cfg(unix)]
+#[test]
+fn standin_queues_a_release_memory_turn() {
+    let Some(dir) = std::env::var_os(RELEASE_MEMORY_TURN).map(PathBuf::from) else {
+        return;
+    };
+    let machine = Fixed::new(Reading::of_gib(96, 36, 28));
+    let need = if dir.join("leading").exists() {
+        Need::new("leading memory").mem_gib(42).margin(1).leads()
+    } else {
+        Need::new("release memory")
+            .rank(crate::Rank::Release)
+            .mem_gib(42)
+            // Match the slice parent: unclaimed load cannot authorize ALONE admission.
+            .margin(1)
+    };
+    let waiter = Waiter::enter(&Ledger::at(dir.join("ledger")), &machine, need)
+        .expect("queue the Release memory turn");
+    let (waiter, short) = waits(waiter, &machine);
+    assert!(
+        short
+            .shorts
+            .iter()
+            .any(|item| matches!(item, Short::Memory { .. }))
+    );
+    std::fs::write(dir.join("ready"), "").expect("publish the queued Release turn");
+    let parent = std::os::unix::process::parent_id();
+    let started = std::time::Instant::now();
+    while !dir.join("stop").exists()
+        && std::os::unix::process::parent_id() == parent
+        && started.elapsed() < MUST_HAPPEN
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        dir.join("stop").exists(),
+        "the parent ended without the stand-in"
+    );
+    drop(waiter);
+}
+
+/// `--admit now` cannot spend memory a queued Release or same-rank lead needs before it is held.
+/// This is decided after ancestor filtering, so it changes no anti-ABBA escape for work inside a
+/// held parent. NEGATIVE CONTROL: removing the guard admits the forced stage at the 36 GiB
+/// reading. At 59 GiB the same stage is safe backfill, so it remains an immediate normal grant.
+#[cfg(unix)]
+#[test]
+fn admit_now_cannot_bypass_a_release_or_leading_memory_turn() {
+    let s = scratch("release-memory-override");
+    let m = Fixed::new(Reading::of_gib(96, 36, 28));
+    struct StandIn {
+        child: aterm_uds::spawnfd::Child,
+        dir: PathBuf,
+        finished: bool,
+    }
+    impl StandIn {
+        fn finish(&mut self) {
+            std::fs::write(self.dir.join("stop"), "").expect("stop the Release stand-in");
+            let status = self.child.wait().expect("reap the Release stand-in");
+            self.finished = true;
+            assert!(status.success(), "the Release stand-in succeeded: {status}");
+        }
+    }
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            if !self.finished {
+                let _ = std::fs::write(self.dir.join("stop"), "");
+                let _ = self.child.wait();
+            }
+        }
+    }
+    fn spawn_turn(dir: &Path) -> StandIn {
+        let child = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                RELEASE_MEMORY_TURN_TEST,
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(RELEASE_MEMORY_TURN, dir)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::inherit())
+            .spawn()
+            .expect("the protected memory stand-in");
+        StandIn {
+            child,
+            dir: dir.to_path_buf(),
+            finished: false,
+        }
+    }
+    fn await_turn(stand_in: &mut StandIn) {
+        until_within(MUST_HAPPEN, "the protected memory turn to queue", || {
+            if let Some(status) = stand_in
+                .child
+                .try_wait()
+                .expect("inspect the protected memory stand-in")
+            {
+                panic!("the protected memory stand-in ended before queueing: {status}");
+            }
+            stand_in.dir.join("ready").exists().then_some(())
+        });
+    }
+
+    let mut release = spawn_turn(s.dir.path());
+    await_turn(&mut release);
+    let tree = enter(
+        &s,
+        &m,
+        Need::new("same-rank tree override")
+            .rank(crate::Rank::Release)
+            .mem_gib(16),
+    );
+    match tree.force(&m).unwrap() {
+        crate::Forced::Turn(waiter, short) => {
+            assert!(
+                short
+                    .shorts
+                    .iter()
+                    .any(|item| matches!(item, Short::Memory { .. }))
+            );
+            drop(waiter);
+        }
+        other => panic!("same-rank release parent was overridden: {other:?}"),
+    }
+    let ordinary = enter(&s, &m, Need::new("ordinary override").mem_gib(16));
+    let ordinary = match ordinary.force(&m).unwrap() {
+        crate::Forced::Turn(waiter, short) => {
+            assert!(
+                short
+                    .shorts
+                    .iter()
+                    .any(|item| matches!(item, Short::Memory { .. }))
+            );
+            waiter
+        }
+        other => panic!("Release memory reservation was overridden: {other:?}"),
+    };
+    m.set(Reading::of_gib(96, 59, 28));
+    match ordinary.force(&m).unwrap() {
+        crate::Forced::Admitted(claim, None) => {
+            assert_eq!(claim.record().need.what, "ordinary override");
+            drop(claim);
+        }
+        other => panic!("safe backfill behind the Release turn was blocked: {other:?}"),
+    }
+    release.finish();
+
+    std::fs::remove_file(s.dir.path().join("ready")).expect("clear the Release ready marker");
+    std::fs::remove_file(s.dir.path().join("stop")).expect("clear the Release stop marker");
+    std::fs::write(s.dir.path().join("leading"), "").expect("select the leading memory turn");
+    m.set(Reading::of_gib(96, 36, 28));
+    let mut leading = spawn_turn(s.dir.path());
+    await_turn(&mut leading);
+    let ordinary = enter(&s, &m, Need::new("ordinary behind lead").mem_gib(16));
+    match ordinary.force(&m).unwrap() {
+        crate::Forced::Turn(waiter, short) => {
+            assert!(
+                short
+                    .shorts
+                    .iter()
+                    .any(|item| matches!(item, Short::Memory { .. }))
+            );
+            drop(waiter);
+        }
+        other => panic!("leading memory reservation was overridden: {other:?}"),
+    }
+    leading.finish();
+}
+
+/// `--admit now` cannot enter beside an unrelated cold Release slice that holds memory ALONE.
+/// This keeps both the physical memory bound and the order with a Release core pool: a forced
+/// verifier cannot hold memory and then wait for those cores. NEGATIVE CONTROL: deleting the
+/// guard or checking only `Short::Memory` admits the forced stage here. Once the Release holder
+/// ends, the same waiter admits normally. An otherwise identical Ordinary holder remains
+/// overridable, so this guard does not silently redefine `Now` for unrelated isolation.
+#[cfg(unix)]
+#[test]
+fn admit_now_cannot_bypass_a_held_release_alone_claim() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    struct StandIn {
+        child: aterm_uds::spawnfd::Child,
+        dir: PathBuf,
+        finished: bool,
+    }
+    impl StandIn {
+        fn finish(&mut self) -> std::process::ExitStatus {
+            std::fs::write(self.dir.join("die"), "").expect("tell the ALONE holder to end");
+            let status = self.child.wait().expect("reap the ALONE holder");
+            self.finished = true;
+            status
+        }
+    }
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            if !self.finished {
+                let _ = std::fs::write(self.dir.join("die"), "");
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    let s = scratch("release-alone-override");
+    let m = mac48();
+    let (child, pid) = standin_release_alone(&s);
+    let mut release = StandIn {
+        child,
+        dir: s.dir.path().to_path_buf(),
+        finished: false,
+    };
+    let forced = enter(&s, &m, Need::new("ordinary forced stage").mem_gib(3));
+    let forced = match forced.force(&m).expect("force looks") {
+        crate::Forced::Turn(waiter, short) => {
+            assert_eq!(
+                short.shorts,
+                [Short::Alone {
+                    pid,
+                    what: "release cold learner".to_owned(),
+                }]
+            );
+            waiter
+        }
+        other => panic!("the held cold Release claim was overridden: {other:?}"),
+    };
+    let status = release.finish();
+    assert_eq!(status.signal(), Some(9), "the stand-in dies by SIGKILL");
+    match forced.force(&m).expect("force after the holder ended") {
+        crate::Forced::Admitted(claim, None) => {
+            assert_eq!(claim.record().need.what, "ordinary forced stage");
+            drop(claim);
+        }
+        other => panic!("the waiter stayed blocked after the Release ended: {other:?}"),
+    }
+
+    std::fs::remove_file(s.dir.path().join("held")).expect("clear the old holder marker");
+    std::fs::remove_file(s.dir.path().join("die")).expect("clear the old death marker");
+    let (child, ordinary_pid) = standin_ordinary_alone(&s);
+    let mut ordinary = StandIn {
+        child,
+        dir: s.dir.path().to_path_buf(),
+        finished: false,
+    };
+    let forced = enter(&s, &m, Need::new("ordinary override control").mem_gib(3));
+    match forced.force(&m).expect("force beside Ordinary ALONE") {
+        crate::Forced::Admitted(claim, Some(short)) => {
+            assert_eq!(
+                short.shorts,
+                [Short::Alone {
+                    pid: ordinary_pid,
+                    what: "ordinary isolated work".to_owned(),
+                }]
+            );
+            drop(claim);
+        }
+        other => panic!("an Ordinary ALONE holder became protected: {other:?}"),
+    }
+    let status = ordinary.finish();
+    assert_eq!(status.signal(), Some(9), "the stand-in dies by SIGKILL");
 }
 
 /// A Release that was queued before repeatable Background work asked to enter ends that work,
@@ -8674,4 +9027,50 @@ fn a_claim_that_leads_says_so_in_its_record() {
     assert_eq!(phased.need.run_mem, Some(GIB / 2));
     assert_eq!(phased.need.mem_now(), GIB / 2);
     drop((lead, plain));
+}
+
+#[test]
+fn observed_nonblocking_attempts_preserve_admission_and_leave_no_denied_reservation() {
+    use crate::admit::{AdmissionAttempt, try_admit_observed_with, try_admit_with};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path());
+    let machine = Fixed::new(Reading::of_gib(96, 35, 28));
+    let need = || {
+        Need::new("observed release parent")
+            .rank(crate::Rank::Release)
+            .mem_gib(44)
+            .margin(1)
+    };
+    let AdmissionAttempt::Waiting(short) =
+        try_admit_observed_with(&ledger, &machine, need()).unwrap()
+    else {
+        panic!("observation cannot admit a release parent short of memory");
+    };
+    assert!(
+        short
+            .shorts
+            .iter()
+            .any(|short| matches!(short, crate::admit::Short::Memory { .. }))
+    );
+    assert!(
+        ledger.list().unwrap().is_empty(),
+        "a denied look retains no queue position"
+    );
+    assert!(try_admit_with(&ledger, &machine, need()).unwrap().is_none());
+    assert!(ledger.list().unwrap().is_empty());
+    let AdmissionAttempt::Unreachable(_) =
+        try_admit_observed_with(&ledger, &machine, Need::new("too large").mem_gib(96)).unwrap()
+    else {
+        panic!("an unreachable need cannot enter the queue");
+    };
+    assert!(ledger.list().unwrap().is_empty());
+    let AdmissionAttempt::Admitted(claim) =
+        try_admit_observed_with(&ledger, &machine, Need::new("small").mem_gib(1)).unwrap()
+    else {
+        panic!("observation cannot refuse a fitting ordinary claim");
+    };
+    assert_eq!(claim.record().need.mem, GIB);
+    assert_eq!(ledger.list().unwrap().len(), 1);
+    drop(claim);
+    assert!(ledger.list().unwrap().is_empty());
 }

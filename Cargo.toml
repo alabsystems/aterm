@@ -10,13 +10,14 @@ members = ["crates/*"]
 # `--workspace` and `-p` still reach every member. List new crates here unless
 # they are publication tools or check runners.
 default-members = [
+    "crates/aterm-repository-progress",
     "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
     "crates/aterm-acaffeine", "crates/aterm-cap", "crates/aterm-capacity", "crates/aterm-resource-host",
     "crates/aterm-cfg-if", "crates/aterm-cg", "crates/aterm-cli", "crates/aterm-codec",
     "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
-    "crates/aterm-converge",
+    "crates/aterm-converge", "crates/aterm-cores",
     "crates/aterm-core", "crates/aterm-ctl",
     "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
     "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
@@ -35,14 +36,14 @@ default-members = [
     "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser",
     "crates/aterm-phase", "crates/aterm-png", "crates/aterm-policy", "crates/aterm-predict",
     "crates/aterm-primer", "crates/aterm-provenance",
-    "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-restore",
+    "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-requests", "crates/aterm-restore",
     "crates/aterm-rle", "crates/aterm-repo-storage",
     "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
     "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
     "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
     "crates/aterm-spec-models", "crates/aterm-stamp", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
-    "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
+    "crates/aterm-template-icon", "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
     "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
     "crates/aterm-vz", "crates/aterm-vz-agent",
@@ -84,7 +85,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.198.0"
+version = "0.199.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -208,6 +209,7 @@ aterm-log = { path = "crates/aterm-log" }
 aterm-lz4 = { path = "crates/aterm-lz4" }
 # Syn-free parser and template layer shared by workspace proc macros.
 aterm-machines = { path = "crates/aterm-machines" }
+aterm-repository-progress = { path = "crates/aterm-repository-progress" }
 aterm-macro-support = { path = "crates/aterm-macro-support" }
 aterm-mesh = { path = "crates/aterm-mesh" }
 aterm-messages = { path = "crates/aterm-messages" }
@@ -249,6 +251,8 @@ aterm-pty = { path = "crates/aterm-pty" }
 # byte, nesting (250 levels), and step ceilings for untrusted user patterns.
 aterm-regex = { path = "crates/aterm-regex" }
 aterm-render = { path = "crates/aterm-render" }
+# The per-Mac request journal (ATERM-KI-1109-3).
+aterm-requests = { path = "crates/aterm-requests" }
 # Headless crash-restore journal layout, records, writer, keyframe policy, and recovery.
 aterm-restore = { path = "crates/aterm-restore" }
 aterm-rle = { path = "crates/aterm-rle" }
@@ -272,12 +276,17 @@ aterm-spec = { path = "crates/aterm-spec", features = ["anchors"] }
 # while stock compilers and the lint driver use `aterm-spec-macros`.
 aterm-spec-anchor = { path = "crates/aterm-spec-anchor" }
 aterm-spec-macros = { path = "crates/aterm-spec-macros" }
+# The cores a pool may use: the machine's parallelism, bounded by the grant aterm-verify
+# hands each test binary (ATERM_TEST_CORES). clippy.toml bans std's reading elsewhere.
+aterm-cores = { path = "crates/aterm-cores" }
 # The binary's identity record, read at run time (A20): no library compiles a version,
 # commit, build number or index hint in.
 aterm-stamp = { path = "crates/aterm-stamp" }
 aterm-sysprobe = { path = "crates/aterm-sysprobe" }
 aterm-telemetry = { path = "crates/aterm-telemetry" }
 aterm-tempfile = { path = "crates/aterm-tempfile" }
+# Menu-bar template icons: a signed-distance shape supersampled to coverage and encoded as PNG.
+aterm-template-icon = { path = "crates/aterm-template-icon" }
 aterm-theme-pack = { path = "crates/aterm-theme-pack" }
 # Workspace clock: `std::time` re-export on native and a
 # `performance.now()`/`Date.now()` shim on wasm32 (where `std::time::Instant::now()`

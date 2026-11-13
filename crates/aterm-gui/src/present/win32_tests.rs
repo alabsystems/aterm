@@ -698,9 +698,10 @@ fn a_painted_buffer_not_presented_is_not_on_the_window() {
     Glass::resize(&mut surface, 64, 48);
     surface.frame(&mut |buf| paint_into(buf, 64, &[], 7), &Commit::Whole);
     let shown = window.readback();
-    let mut buffer = surface.buffer_mut().expect("a sized surface");
-    paint_into(&mut buffer, 64, &[], 8);
-    drop(buffer);
+    {
+        let mut buffer = surface.buffer_mut().expect("a sized surface");
+        paint_into(&mut buffer, 64, &[], 8);
+    }
     assert_eq!(window.readback(), shown);
     assert_ne!(shown[1], pattern(8, 1, 0));
 }

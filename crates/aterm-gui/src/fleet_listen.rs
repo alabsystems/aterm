@@ -655,22 +655,53 @@ mod denial_cache_model_tests;
 /// [`receive_pushed_facts`], `served_live`, the vault-join judge) refuse while this answers `None`
 /// too, but they run
 /// only past the handshake gate ([`denied_under`]), which refuses every proved dialer while it
-/// does, and once a list is read this never answers `None` again: theirs is a second line, which
+/// does. A vault-tenure mismatch also answers `None`, independently of any cached list. Theirs
+/// is a second line, which
 /// no test reaches (a test reads no vault). The gate and the cache are what the tests hold
 /// (`denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive`, and the node job's
-/// `a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has`).
+/// `unknown_custody_cannot_use_a_cached_deny_list`).
 #[cfg(unix)]
 fn denied_nodes_now() -> Option<Arc<[String]>> {
-    let observed = match vault_here() {
-        Ok(None) => return Some(Arc::from(&[][..])),
-        Ok(Some(paths)) => aterm_secrets::client::swarm_denial_snapshot_now(&paths),
-        Err(why) => Err(aterm_secrets::Error::new(why)),
+    let state = aterm_types::dirs::state_dir()?;
+    let vault = vault_here().ok()?;
+    if !aterm_agent::fleet_vault::traffic_in_effect(&state, vault.as_ref()) {
+        return None;
+    }
+    let observed = match vault {
+        None => return Some(Arc::from(&[][..])),
+        Some(paths) => aterm_secrets::client::swarm_denial_snapshot_now(&paths),
     };
     let (denied, said) = update_denied_nodes_cache(&mut DENIED_NODES.lock_or_recover(), observed);
     if let Some(line) = said {
         note_fleet(&line, denied.is_none());
     }
     denied
+}
+
+#[cfg(unix)]
+fn capture_traffic_here() -> Option<aterm_agent::fleet_vault::Traffic> {
+    let state = aterm_types::dirs::state_dir()?;
+    let vault = vault_here().ok()?;
+    aterm_agent::fleet_vault::Traffic::capture(&state, vault.as_ref())
+}
+
+/// Both listener hosts bind live membership policy to the take captured by their generation.
+#[cfg(unix)]
+fn denial_under_take(
+    traffic: aterm_agent::fleet_vault::Traffic,
+    policy: impl Fn() -> Arc<aterm_net::fleet::Denied> + Send + Sync + 'static,
+) -> aterm_net::fleet::DenyFn {
+    Arc::new(move || {
+        if !traffic.current() {
+            return Arc::new(aterm_net::fleet::Denied::withdrawn());
+        }
+        let verdict = policy();
+        if traffic.current() {
+            verdict
+        } else {
+            Arc::new(aterm_net::fleet::Denied::withdrawn())
+        }
+    })
 }
 
 /// Whether `node` may still drive this Mac under `grants`: a grant admits it under the key `bound`
@@ -853,15 +884,43 @@ pub(crate) fn denied_under(
     Arc::new(aterm_net::fleet::Denied::under(denied_nodes, log))
 }
 
+/// Ordinary fleet handshakes and mesh links require custody as well as peer membership.
+/// Withdrawal is distinct from an unread peer log: an existing link must end immediately
+/// when its table judges the local fleet against another vault.
+#[cfg(unix)]
+pub(crate) fn denied_for_fleet(
+    state: &std::path::Path,
+    vault: Option<&aterm_secrets::client::Paths>,
+    denied_nodes: Option<&[String]>,
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
+) -> Arc<aterm_net::fleet::Denied> {
+    if aterm_agent::fleet_vault::tenure(state, vault) != aterm_agent::fleet_vault::Tenure::Here {
+        Arc::new(aterm_net::fleet::Denied::withdrawn())
+    } else {
+        denied_under(denied_nodes, log)
+    }
+}
+
+#[cfg(unix)]
+fn window_denied() -> Arc<aterm_net::fleet::Denied> {
+    let (Some(state), Ok(vault)) = (aterm_types::dirs::state_dir(), vault_here()) else {
+        return Arc::new(aterm_net::fleet::Denied::withdrawn());
+    };
+    denied_for_fleet(
+        &state,
+        vault.as_ref(),
+        denied_nodes_now().as_deref(),
+        window_log().as_deref(),
+    )
+}
+
 /// Hand this process's fleet dialers the verdict this Mac's listener judges each dialer by
-/// ([`denied_under`] of the swarm's deny list and [`window_log`], read for each dial), so with the
+/// ([`denied_for_fleet`] of local custody, the swarm's deny list and [`window_log`], read for each dial), so with the
 /// mesh switch on both ends of this Mac judge a peer's key by one standing
 /// (`aterm_net::fleet_member::judge_mesh_by`). Inert with the switch off.
 #[cfg(unix)]
 pub fn judge_mesh_dials() {
-    aterm_net::fleet_member::judge_mesh_by(Arc::new(|| {
-        denied_under(denied_nodes_now().as_deref(), window_log().as_deref())
-    }));
+    aterm_net::fleet_member::judge_mesh_by(Arc::new(window_denied));
 }
 
 /// The key this Mac holds a node to now ([`bound_or_admitted_in`] of its keyring, [`window_log`]
@@ -916,6 +975,135 @@ fn lift_undriving_holds(
             &format!("fleet: {lifted} remote hold(s) lifted: their nodes may drive no more"),
             false,
         );
+    }
+}
+
+/// What this process has seen of this Mac's fleet access ([`observe_access`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AccessSeen {
+    /// The level at its last look; `None` before the first.
+    level: Option<aterm_types::fleet_access::FleetAccess>,
+    /// A drop below Read and Write this process saw, whose remote holds still stand: when it
+    /// has rested long enough for them to be lifted.
+    resting: Option<Instant>,
+    /// The menu-bar lock holds a raise its person already clicked for: the drop is on its way
+    /// back up, and the holds wait for where it settles.
+    raising: bool,
+}
+
+/// What one look at the level found ([`access_seen`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessLook {
+    /// The level changed since the last look: from, to.
+    change: Option<(
+        aterm_types::fleet_access::FleetAccess,
+        aterm_types::fleet_access::FleetAccess,
+    )>,
+    /// A drop below Read and Write has rested: how many remote holds were lifted.
+    lifted: Option<usize>,
+    /// When to look again: a drop that has not rested yet.
+    again: Option<Instant>,
+}
+
+#[cfg(unix)]
+static ACCESS_SEEN: Mutex<AccessSeen> = Mutex::new(AccessSeen {
+    level: None,
+    resting: None,
+    raising: false,
+});
+
+/// This process sees this Mac's fleet access at `level`, stated `age` ago where the file says
+/// when (each fleet line a window serves, and the App after its own write, on the change
+/// notification and at its lock's clock). A change since the last look is journalled; `by`
+/// says what changed it, where the caller made the change (`the menu-bar lock`).
+///
+/// A drop below Read and Write refuses every write at once, and lifts every remote hold once
+/// the level has rested there for [`aterm_types::fleet_access::SETTLE`], as a revoked grant
+/// does ([`lift_undriving_holds`]): its holder can lift it no more, so this Mac does. The rest
+/// is the lock's own rule turned round: a click moves the level one step on, so the way from
+/// Full Access down to Read and Write passes Read Only, and a hold another Mac's person placed
+/// is not ended by a level that was on the bar for a second. `raising` says the lock holds a
+/// raise its person already clicked for (`None`: as last told); the holds then wait for where
+/// the level settles. Answers when to look again, where a drop is still resting: the App wakes
+/// for it, and a window with no status item looks at its next fleet line.
+#[cfg(unix)]
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "a test's level is its thread's, never this process's: tests call access_seen"
+    )
+)]
+pub(crate) fn observe_access(
+    level: aterm_types::fleet_access::FleetAccess,
+    age: Option<Duration>,
+    by: Option<&str>,
+    raising: Option<bool>,
+) -> Option<Instant> {
+    let mut seen = ACCESS_SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    let look = access_seen(&mut seen, (level, age), raising, Instant::now(), &|| {
+        crate::control::lift_ungranted_remote_holds(&|_| false)
+    });
+    drop(seen);
+    if let Some((was, now)) = look.change {
+        let by = by.map(|by| format!(" ({by})")).unwrap_or_default();
+        note_fleet(
+            &format!("fleet: access {} \u{2192} {}{by}", was.word(), now.word()),
+            false,
+        );
+    }
+    if let Some(lifted) = look.lifted.filter(|lifted| *lifted > 0) {
+        note_fleet(
+            &format!(
+                "fleet: {lifted} remote hold(s) lifted: fleet access rests at {}, so no other \
+                 Mac may hand them back",
+                level.label()
+            ),
+            false,
+        );
+    }
+    look.again
+}
+
+/// [`observe_access`] over what was `seen` before, at `now`: the change of level, the remote
+/// holds `lift` lifted (it answers how many) where a drop below Read and Write has rested, and
+/// when to look again. The first look finds no change: nothing changed that this process saw.
+#[cfg(unix)]
+fn access_seen(
+    seen: &mut AccessSeen,
+    (level, age): (aterm_types::fleet_access::FleetAccess, Option<Duration>),
+    raising: Option<bool>,
+    now: Instant,
+    lift: &dyn Fn() -> usize,
+) -> AccessLook {
+    use aterm_types::fleet_access::{FleetAccess, SETTLE};
+    if let Some(raising) = raising {
+        seen.raising = raising;
+    }
+    let change = seen
+        .level
+        .replace(level)
+        .filter(|was| *was != level)
+        .map(|was| (was, level));
+    if level >= FleetAccess::ReadWrite {
+        seen.resting = None;
+    } else if change.is_some_and(|(was, _)| was >= FleetAccess::ReadWrite) {
+        // Rested already for as long as the file says the level has stood.
+        seen.resting = Some(now + SETTLE.saturating_sub(age.unwrap_or_default()));
+    }
+    let lifted = match seen.resting {
+        Some(due) if due <= now && !seen.raising => {
+            seen.resting = None;
+            Some(lift())
+        }
+        _ => None,
+    };
+    AccessLook {
+        change,
+        lifted,
+        again: seen.resting.filter(|_| !seen.raising),
     }
 }
 
@@ -1474,6 +1662,17 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
         (desk.revision, desk.mesh)
     };
     loop {
+        let Some(traffic) = capture_traffic_here() else {
+            stand_fleet(
+                generation,
+                Standing::Refused("vault"),
+                "fleet traffic paused: this Mac's fleet tenure does not match its current vault",
+            );
+            if wait_fleet_unchanged(generation) {
+                continue;
+            }
+            return;
+        };
         if let Some(line) = window_yields_port(mesh, node_job_running_now) {
             let serving = served_now();
             lift_undriving_holds(
@@ -1542,6 +1741,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
             .spawn({
                 let (stop, rekeyed, secret) =
                     (Arc::clone(&stop), Arc::clone(&rekeyed), secret.clone());
+                let traffic = traffic.clone();
                 let proved = node
                     .as_ref()
                     .map(|node| (node.node().to_owned(), node.key()));
@@ -1550,6 +1750,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         (generation, addr),
                         (&stop, &rekeyed),
                         (&secret, proved),
+                        &traffic,
                     );
                 }
             });
@@ -1593,7 +1794,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     let serving = served_now();
                     (serving.scope, serving.ops())
                 }),
-                Arc::new(|| denied_under(denied_nodes_now().as_deref(), window_log().as_deref())),
+                denial_under_take(traffic, window_denied),
             ),
             members_ask(),
             &stop,
@@ -1604,13 +1805,22 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     let proof = served.peer_node().cloned();
                     return served.answer(|stream| {
                         stream.set_read_timeout(Some(within))?;
-                        register_member(stream, (peer, proof.as_ref()), (addr, &join_secret))
+                        let authorize = stream.authorization();
+                        register_member(
+                            stream,
+                            (peer, proof.as_ref()),
+                            (addr, &join_secret),
+                            &|| authorize().is_ok(),
+                        )
                     });
                 }
                 if op == FleetOp::Book {
                     return served.answer(|stream| {
                         stream.set_write_timeout(Some(within))?;
-                        share_book(stream, peer, (addr, &serving_generation))
+                        let authorize = stream.authorization();
+                        share_book(stream, peer, (addr, &serving_generation), &|| {
+                            authorize().is_ok()
+                        })
                     });
                 }
                 if op == FleetOp::Facts {
@@ -1618,7 +1828,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     return served.answer(|stream| {
                         stream.set_read_timeout(Some(within))?;
                         stream.set_write_timeout(Some(within))?;
-                        receive_pushed_facts(stream, proof.as_ref(), peer)
+                        let authorize = stream.authorization();
+                        receive_pushed_facts(stream, proof.as_ref(), peer, &|| authorize().is_ok())
                     });
                 }
                 if op == FleetOp::MailCode {
@@ -1687,6 +1898,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         driver,
                         Some(driver_key),
                         true,
+                        crate::control::DriveRequester::OnStream,
                     ) {
                         return Err(std::io::Error::other(
                             "this aterm's control server is not serving",
@@ -1733,8 +1945,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
     }
 }
 
-/// LAN TOOLSET SHARING, on by default (owner ruling 2026-10-27: "everything must be ON BY
-/// DEFAULT in atpkg!!!"): while a fleet generation listens, serve this Mac's kept toolset
+/// LAN TOOLSET SHARING, on by default (docs/OWNER_RULINGS.md, 2026-10-27): while a fleet
+/// generation listens, serve this Mac's kept toolset
 /// archives ([`atpkg::peers::share`]) on the fleet listener's IP at
 /// [`atpkg::peers::DEFAULT_PORT`], each connection from a fleet member's LAN address alone
 /// ([`unit_members`], read again at most every [`aterm_net::fleet::KEY_READ_EVERY`]), until
@@ -2160,6 +2372,7 @@ fn register_member<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     (peer, proof): (Option<SocketAddr>, Option<&aterm_net::fleet::NodeProof>),
     (addr, secret): (SocketAddr, &aterm_net::fleet::FleetSecret),
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other(
@@ -2174,6 +2387,7 @@ fn register_member<S: std::io::Read + std::io::Write>(
         (peer, proof),
         (addr, secret),
         (&denied, log.as_deref()),
+        current,
     )
 }
 
@@ -2187,6 +2401,7 @@ fn register_member_at<S: std::io::Read + std::io::Write>(
     (peer, proof): (Option<SocketAddr>, Option<&aterm_net::fleet::NodeProof>),
     (addr, secret): (SocketAddr, &aterm_net::fleet::FleetSecret),
     (denied, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     use aterm_net::fleet_member::{Issuer, read_node_id, serve_join_with_denied};
     let Some(peer) = peer else {
@@ -2214,6 +2429,7 @@ fn register_member_at<S: std::io::Read + std::io::Write>(
         member,
         now_ms,
         (denied, log),
+        current,
     )? {
         Ok((recorded, member)) => aterm_log::info!("{}", registration_note(recorded, &member)),
         Err(why) => aterm_log::warn!(
@@ -2258,6 +2474,7 @@ fn share_book<S: std::io::Write>(
     stream: &mut S,
     peer: Option<SocketAddr>,
     (addr, ended): (SocketAddr, &Stop),
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other("a book read with no state directory"));
@@ -2270,6 +2487,7 @@ fn share_book<S: std::io::Write>(
         peer,
         (&denied, log.as_deref()),
         (addr, ended),
+        current,
     )
 }
 
@@ -2283,12 +2501,13 @@ fn share_book_at<S: std::io::Write>(
     peer: Option<SocketAddr>,
     (denied, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
     (addr, ended): (SocketAddr, &Stop),
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     use aterm_net::fleet_member::{
         read_node_id, read_node_identity, self_entry_while, serve_book_with_log,
     };
     let gone = || std::io::Error::other("the fleet listener generation ended");
-    if ended.is_set() {
+    if ended.is_set() || !current() {
         return Err(gone());
     }
     let now_ms = aterm_time::unix_millis();
@@ -2302,11 +2521,12 @@ fn share_book_at<S: std::io::Write>(
                 &me,
                 (&host, addr.port(), aterm_stamp::app_version()),
                 ended,
+                current,
             )
         })
         .transpose()?
         .flatten();
-    if ended.is_set() {
+    if ended.is_set() || !current() {
         return Err(gone());
     }
     let node = || {
@@ -2331,6 +2551,7 @@ fn receive_pushed_facts<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     proof: Option<&aterm_net::fleet::NodeProof>,
     peer: Option<SocketAddr>,
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other(
@@ -2339,7 +2560,14 @@ fn receive_pushed_facts<S: std::io::Read + std::io::Write>(
     };
     let denied = denied_nodes_now().ok_or_else(|| std::io::Error::other(DENY_LIST_UNREAD))?;
     let log = window_log();
-    receive_pushed_facts_at(stream, &state, proof, peer, (&denied, log.as_deref()))
+    receive_pushed_facts_at(
+        stream,
+        &state,
+        proof,
+        peer,
+        (&denied, log.as_deref()),
+        current,
+    )
 }
 
 #[cfg(unix)]
@@ -2349,6 +2577,7 @@ fn receive_pushed_facts_at<S: std::io::Read + std::io::Write>(
     proof: Option<&aterm_net::fleet::NodeProof>,
     peer: Option<SocketAddr>,
     (denied, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
+    current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let peer = peer.map_or_else(|| "a peer".to_owned(), |peer| peer.to_string());
     match aterm_net::fleet_member::serve_facts_with_denied(
@@ -2359,6 +2588,7 @@ fn receive_pushed_facts_at<S: std::io::Read + std::io::Write>(
         |payload| {
             aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(payload).map(|f| f.node)
         },
+        current,
     )? {
         Ok(node) => {
             aterm_log::debug!("fleet: stored pushed survey facts from node {node} ({peer})")
@@ -2486,7 +2716,7 @@ pub(crate) fn push_facts_to_issuer(
     secret: &aterm_net::fleet::FleetSecret,
     payload: &str,
 ) -> Result<FactsPushOutcome, String> {
-    push_facts_to_issuer_with_denied(state_dir, secret, (&[], None), payload)
+    push_facts_to_issuer_with_denied(state_dir, secret, (&[], None), payload, &|| true)
 }
 
 /// Keep `payload` (`OK <n>\n…` C16 survey facts, this Mac's own) here, where this Mac computes its
@@ -2499,10 +2729,14 @@ pub(crate) fn push_facts_to_issuer_with_denied(
     secret: &aterm_net::fleet::FleetSecret,
     (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
     payload: &str,
+    current: &dyn Fn() -> bool,
 ) -> Result<FactsPushOutcome, String> {
     use aterm_net::fleet_member::{
         Via, push_facts_to_bound_peer, read_node_identity, read_peers, store_pushed_facts_with_key,
     };
+    if !current() {
+        return Err("fleet custody changed".into());
+    }
     let parsed = aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(payload)?;
     let me = read_node_identity(state_dir)
         .map_err(|e| e.to_string())?
@@ -2524,6 +2758,7 @@ pub(crate) fn push_facts_to_issuer_with_denied(
         (denied_nodes, log),
         payload,
         FACTS_PUSH_WITHIN,
+        current,
     )?;
     Ok(FactsPushOutcome::PushedRemote {
         host: peer.host.clone(),
@@ -2532,7 +2767,10 @@ pub(crate) fn push_facts_to_issuer_with_denied(
 }
 
 #[cfg(unix)]
-fn push_facts_heartbeat(secret: &aterm_net::fleet::FleetSecret) {
+fn push_facts_heartbeat(
+    secret: &aterm_net::fleet::FleetSecret,
+    traffic: &aterm_agent::fleet_vault::Traffic,
+) {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return;
     };
@@ -2549,7 +2787,7 @@ fn push_facts_heartbeat(secret: &aterm_net::fleet::FleetSecret) {
         here.host.as_deref(),
         at_ms,
         here.instances,
-        false,
+        (here.access, false),
     );
     // No deny list read yet: this Mac's facts go to no one until one is.
     let Some(denied) = denied_nodes_now() else {
@@ -2557,9 +2795,13 @@ fn push_facts_heartbeat(secret: &aterm_net::fleet::FleetSecret) {
         return;
     };
     let log = window_log();
-    if let Err(why) =
-        push_facts_to_issuer_with_denied(&state, secret, (&denied, log.as_deref()), &payload)
-    {
+    if let Err(why) = push_facts_to_issuer_with_denied(
+        &state,
+        secret,
+        (&denied, log.as_deref()),
+        &payload,
+        &|| traffic.current(),
+    ) {
         aterm_log::debug!(
             "fleet: survey facts heartbeat push skipped: {}",
             aterm_log::sanitize_record(&why)
@@ -2651,6 +2893,7 @@ fn watch_fleet_generation(
         &aterm_net::fleet::FleetSecret,
         Option<(String, aterm_net::fleet::NodeKey)>,
     ),
+    traffic: &aterm_agent::fleet_vault::Traffic,
 ) {
     use aterm_net::fleet::KEY_FILE;
     use aterm_net::fleet_member::{NODE_FILE, NODE_KEY_FILE, read_node_identity};
@@ -2688,6 +2931,11 @@ fn watch_fleet_generation(
             );
             return;
         }
+        if !traffic.current() {
+            rekeyed.store(true, Ordering::Release);
+            stop.set();
+            return;
+        }
         let why = match read_fleet_key() {
             Ok(now) if now == *secret && node_now() == proved => {
                 follow_serving(generation, addr);
@@ -2699,14 +2947,14 @@ fn watch_fleet_generation(
                 let busy = hb_in_flight.load(Ordering::Acquire);
                 if facts_due {
                     last_facts_push = std::time::Instant::now();
-                    push_facts_heartbeat(secret);
+                    push_facts_heartbeat(secret, traffic);
                 }
                 if last_census_refresh.elapsed() >= CENSUS_REFRESH_EVERY {
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
                 if let Some(woke) = heartbeat.dispatch_when_free(now, busy, || {
-                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight))
+                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight), traffic)
                 }) {
                     say_heartbeat_woke("fleet listener", woke);
                 }
@@ -2742,11 +2990,12 @@ fn spawn_member_heartbeat(
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
     (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
+    traffic: &aterm_agent::fleet_vault::Traffic,
 ) -> bool {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return false;
     };
-    // A record of the vault the fleet state is of, adopted where an older build left none.
+    // Widen only an existing matching vault record.
     let vault = vault_here().ok().flatten();
     aterm_agent::fleet_vault::keep(&state, vault.as_ref());
     let mut log = window_log();
@@ -2774,6 +3023,7 @@ fn spawn_member_heartbeat(
         secret,
         (ended, in_flight),
         (denied, log, crate::network_moved::alab_tcp()),
+        traffic.clone(),
     )
 }
 
@@ -2827,6 +3077,7 @@ fn spawn_member_heartbeat_at(
     secret: aterm_net::fleet::FleetSecret,
     (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
     (denied, log, browse): HeartbeatReach,
+    traffic: aterm_agent::fleet_vault::Traffic,
 ) -> bool {
     use aterm_net::fleet_member::{Registration, heartbeat_members_while, read_node_identity};
     if ended.is_set() {
@@ -2868,6 +3119,7 @@ fn spawn_member_heartbeat_at(
                 }
             }
             let _guard = Guard(flag);
+            let current = || traffic.current();
             let within = heartbeat_within();
             let hb_deadline = std::time::Instant::now() + within;
             let hints = || {
@@ -2886,9 +3138,10 @@ fn spawn_member_heartbeat_at(
                 within,
                 (log.as_deref(), &denied, &hints),
                 &ended,
+                &current,
             ) {
                 Ok(answered) => {
-                    if ended.is_set() {
+                    if ended.is_set() || !current() {
                         return;
                     }
                     // Each answer proved its node to this Mac, and the round noted it in the
@@ -2900,7 +3153,7 @@ fn spawn_member_heartbeat_at(
                     {
                         let keyring = aterm_net::fleet_member::Keyring::read(&state);
                         for done in &answered {
-                            if ended.is_set() {
+                            if ended.is_set() || !current() {
                                 return;
                             }
                             let peer = aterm_net::fleet_member::Peer {
@@ -2922,6 +3175,7 @@ fn spawn_member_heartbeat_at(
                                 (&denied, log.as_deref()),
                                 &payload,
                                 Duration::from_secs(3),
+                                &current,
                             );
                         }
                     }
@@ -3096,1660 +3350,8 @@ fn note_fleet(line: &str, refusal: bool) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Which vault a process reads follows where its state root resolved, and nothing else
-    /// (ATERM-KI-1105-10, [`vault_under`]): on the account's own state it reads the account's
-    /// vault, with `CI` set as without; under a private root it reads none; on the account's own
-    /// state with no vault to be found it reads none and says why. A test binary runs under its
-    /// scratch root, so no test reads the person's vault.
-    ///
-    /// NEGATIVE CONTROL (2026-11-05): `vault_under` deciding by the environment
-    /// (`private_root` or `ATERM_STATE_HOME` or `CI` set, a mutation inside the rule; the base
-    /// read the environment in the predicate that feeds it, [`state_root_is_private`]'s place)
-    /// fails "`CI` on the account's own state reads its vault". That predicate put back to the
-    /// base's reading fails no test of this crate, as `cfg!(test)` holds it true here; `aterm`'s
-    /// `unit_peers` test holds it.
-    #[cfg(unix)]
-    #[test]
-    fn the_vault_a_process_reads_follows_where_its_state_root_resolved() {
-        if !crate::test_alone::alone() {
-            return;
-        }
-        let home = aterm_tempfile::tempdir().unwrap();
-        let vault = aterm_secrets::client::Paths::for_home(home.path());
-        let found = || Ok(vault.clone());
-        crate::test_env::scoped("CI", "1", || {
-            assert_eq!(
-                vault_under(false, found),
-                Ok(Some(vault.clone())),
-                "`CI` on the account's own state reads its vault"
-            );
-        });
-        assert_eq!(
-            vault_under(false, found),
-            Ok(Some(vault.clone())),
-            "the account's own state reads its vault"
-        );
-        assert_eq!(
-            vault_under(true, || panic!("a private state root reads no vault")),
-            Ok(None),
-            "a private state root reads none"
-        );
-        let unfound = vault_under(false, || {
-            Err(aterm_secrets::Error::new("no home directory"))
-        });
-        assert!(
-            unfound
-                .as_ref()
-                .is_err_and(|why| why.contains("no home directory")),
-            "the account's own state with no vault to be found reads none and says why: \
-             {unfound:?}"
-        );
-        assert!(
-            aterm_types::dirs::runs_under_private_state_root() && state_root_is_private(),
-            "PRECONDITION: a test binary runs under its scratch root"
-        );
-        assert_eq!(vault_here(), Ok(None), "a test reads no vault");
-    }
-
-    /// The window's grants admit by the vault the process reads ([`grants_under`] of the rule's
-    /// answer, [`vault_under`], as [`window_grants`] reads them of [`vault_here`];
-    /// ATERM-KI-1105-10): beside a fleet state taken under the vault configured they admit as
-    /// made, beside one taken under another vault none does, `"*"` included, `CI` set or not, and
-    /// on the account's own state with no vault to be found none does, as the node job then
-    /// serves none, and why is said; under a private state root, which reads no vault, they admit
-    /// as made.
-    ///
-    /// NEGATIVE CONTROLS (2026-11-05): `grants_under` reading a vault that cannot be found as
-    /// none (its `Err` arm admitting by [`in_effect`] under no vault, the window's reading before
-    /// 2026-11-05) fails "on the account's own state with no vault to be found no grant admits";
-    /// `vault_under` deciding by the environment (as in the rule's own test) fails "beside a
-    /// fleet taken under another vault no grant admits, `CI` set or not". A `window_grants` that
-    /// takes its vault from anything but [`vault_here`] fails no test: in a test binary the rule
-    /// reads no vault, as such a revert would.
-    #[cfg(unix)]
-    #[test]
-    fn the_windows_grants_admit_only_beside_the_vault_its_fleet_was_taken_under() {
-        if !crate::test_alone::alone() {
-            return;
-        }
-        let root = aterm_tempfile::tempdir().unwrap();
-        let state = root.path().join("state");
-        aterm_secrets::fsx::ensure_private_dir(&state).unwrap();
-        aterm_net::fleet_member::write_held(&state, aterm_net::fleet_member::Began::Here, |book| {
-            book.write_key(&[0x5a; 24]).expect("write fleet key");
-        })
-        .expect("write_held");
-        let vault = aterm_secrets::client::Paths::for_home(root.path());
-        let configure = |name: &str, signer: u8| {
-            aterm_secrets::fsx::ensure_private_dir(&vault.dir).unwrap();
-            aterm_secrets::fsx::write_atomic(
-                &vault.dir.join("source.toml"),
-                format!(
-                    "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = \"{}\"\n\
-                     host = \"m22\"\n",
-                    aterm_secrets::b64::encode_padded(&[signer; 32])
-                )
-                .as_bytes(),
-                0o600,
-            )
-            .unwrap();
-        };
-        configure("alab", 1);
-        aterm_agent::fleet_vault::keep(&state, Some(&vault));
-        assert!(
-            aterm_net::fleet_member::read_vault(&state)
-                .unwrap()
-                .is_some(),
-            "PRECONDITION: the fleet state records the vault \"alab\""
-        );
-        let all = || {
-            vec![
-                aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-                    .expect("the default grant"),
-            ]
-        };
-        let found = || Ok(vault.clone());
-        let unfound = || Err(aterm_secrets::Error::new("no home directory"));
-        /// `grants` beside `state` under the vault the rule names for `private_root` and `live`.
-        fn under(
-            grants: Vec<aterm_net::fleet::DriveGrant>,
-            state: Option<&std::path::Path>,
-            private_root: bool,
-            live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
-        ) -> (Vec<aterm_net::fleet::DriveGrant>, Option<String>) {
-            let vault = vault_under(private_root, live);
-            grants_under(grants, state, vault.as_ref().map(Option::as_ref))
-        }
-        let (admitted, said) = under(all(), Some(&state), false, found);
-        assert_eq!(
-            (admitted.len(), said),
-            (1, None),
-            "the grant made under the vault the fleet was taken under admits"
-        );
-        let (admitted, said) = under(all(), Some(&state), false, unfound);
-        assert_eq!(
-            admitted,
-            Vec::new(),
-            "on the account's own state with no vault to be found no grant admits"
-        );
-        assert!(
-            said.as_deref()
-                .is_some_and(|why| why.contains("no home directory")),
-            "and why is said: {said:?}"
-        );
-        assert_eq!(
-            under(Vec::new(), Some(&state), false, unfound),
-            (Vec::new(), None),
-            "with no grant there is nothing to say"
-        );
-        assert_eq!(
-            under(all(), None, false, unfound).0,
-            Vec::new(),
-            "nor with no state directory"
-        );
-        configure("other", 9);
-        crate::test_env::scoped("CI", "1", || {
-            assert_eq!(
-                under(all(), Some(&state), false, found).0,
-                Vec::new(),
-                "beside a fleet taken under another vault no grant admits, `CI` set or not"
-            );
-        });
-        assert_eq!(
-            under(all(), Some(&state), false, found),
-            (Vec::new(), None),
-            "beside a fleet taken under another vault no grant admits"
-        );
-        assert_eq!(
-            under(all(), Some(&state), true, || panic!("reads no vault"))
-                .0
-                .len(),
-            1,
-            "under a private state root, which reads no vault, the grants admit as made"
-        );
-    }
-
-    /// A `vault-join` is served on the vault its judge read, in the window and the node job alike
-    /// ([`vault_join_on`]; ATERM-KI-1105-10): a process that reads no vault (under a private
-    /// state root) refuses it, a judged one is served on that vault, and one its judge refused
-    /// is refused with the judge's reason.
-    ///
-    /// NEGATIVE CONTROL (2026-11-05): `vault_join_on` serving a join whose judge read no vault on
-    /// another vault anyway (the window read `Paths::live()` for it before; here a vault under a
-    /// scratch path, so the control reads no person's vault) fails "a process that reads no vault
-    /// refuses a vault-join".
-    #[cfg(unix)]
-    #[test]
-    fn a_vault_join_is_served_only_on_the_vault_its_judge_read() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let vault = aterm_secrets::client::Paths::for_home(home.path());
-        let judged = aterm_agent::vault_join::Judged {
-            node: [7; 32],
-            fleet: false,
-            book: aterm_secrets::client::Book::default(),
-        };
-        let refused = vault_join_on(Ok(judged), None);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|why| why.contains("follows no vault")),
-            "a process that reads no vault refuses a vault-join: {refused:?}"
-        );
-        assert_eq!(
-            vault_join_on(Ok(judged), Some(vault.clone())),
-            Ok((judged, vault.clone())),
-            "a judged vault-join is served on the vault its judge read"
-        );
-        let why = "this Mac has no state directory".to_owned();
-        assert_eq!(
-            vault_join_on(Err(why.clone()), Some(vault)),
-            Err(why),
-            "one its judge refused is refused with the judge's reason"
-        );
-    }
-
-    /// With MESH off a window still listens, leaving the port only to a node job that holds it;
-    /// with MESH on it leaves the port to the node service, the one listener on this Mac.
-    #[test]
-    fn with_the_mesh_off_a_window_still_listens_and_with_it_on_leaves_the_port_to_the_node() {
-        // MESH off, no node job: the window binds the port itself.
-        assert_eq!(window_yields_port(false, || false), None);
-        // MESH off, a node job holds the port: the window leaves it, as before the mesh.
-        assert_eq!(
-            window_yields_port(false, || true),
-            Some("fleet served by systems.alab.aterm-node")
-        );
-        // MESH on: the node service is the one listener, held or not; the job is not even asked.
-        assert!(
-            window_yields_port(true, || unreachable!("no port lock is read"))
-                .is_some_and(|line| line.contains("the one listener"))
-        );
-    }
-
-    /// A detached book response that passed its early generation check must not publish its
-    /// old listener endpoint after waiting on the descriptor lock and then being canceled.
-    #[cfg(unix)]
-    #[test]
-    fn an_ended_book_response_keeps_the_current_listener_descriptor() {
-        use aterm_net::fleet_member::{hold_book, lock_waiting_told, node_identity, self_entry};
-
-        let state = aterm_tempfile::tempdir().unwrap();
-        let me = node_identity(state.path()).unwrap();
-        self_entry(
-            state.path(),
-            &me,
-            ("127.0.0.1", 7200, aterm_stamp::app_version()),
-        )
-        .unwrap();
-        let descriptor = state.path().join("fleet-self-entry");
-        let committed = std::fs::read(&descriptor).unwrap();
-        let ended = Stop::new();
-        let within = aterm_spec::wait::MUST_HAPPEN;
-        let (waiting, waited) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let held = hold_book(state.path()).unwrap();
-            let worker = scope.spawn(|| {
-                let mut response = Vec::new();
-                let result = lock_waiting_told(within, waiting, || {
-                    share_book_at(
-                        &mut response,
-                        state.path(),
-                        None,
-                        (&[], None),
-                        ("127.0.0.1:7100".parse().unwrap(), &ended),
-                    )
-                });
-                (result, response)
-            });
-            waited.recv_timeout(within).unwrap();
-            ended.set();
-            drop(held);
-            let (result, response) = worker.join().unwrap();
-            assert!(result.is_err());
-            assert!(response.is_empty());
-            assert_eq!(std::fs::read(descriptor).unwrap(), committed);
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wildcard_heartbeats_keep_the_automatic_joins_lan_address() {
-        let routes = [
-            Some("10.0.0.2".parse().unwrap()),
-            Some("192.168.1.102".parse().unwrap()),
-            Some("2001:db8::1".parse().unwrap()),
-        ];
-        assert_eq!(
-            own_host_from("0.0.0.0:7100".parse().unwrap(), || routes).as_deref(),
-            Some("192.168.1.102")
-        );
-        assert_eq!(
-            own_host_from("0.0.0.0:7100".parse().unwrap(), || [None; 3]),
-            None
-        );
-        for address in ["127.0.0.1:7100", "[::1]:7100", "192.168.1.2:7100"] {
-            let address: SocketAddr = address.parse().unwrap();
-            assert_eq!(
-                own_host_from(address, || panic!("an explicit bind needs no route")),
-                Some(address.ip().to_string())
-            );
-        }
-    }
-
-    /// What a Mac whose keyring binds each node as `bound` says holds: a node under that key.
-    fn held_by(
-        bound: impl Fn(&str) -> Option<aterm_net::fleet::NodeKey>,
-    ) -> impl Fn(&str, aterm_net::fleet::NodeKey) -> bool {
-        move |node, key| bound(node) == Some(key)
-    }
-
-    /// A drive the membership log admits is held, as its admission was, with no book entry for its
-    /// node here; a book that binds the node to another key the log admits is that member's, and
-    /// a key the log took out is held nowhere.
-    /// NEGATIVE CONTROL: judge by the keyring alone (`bound_in(keys, log, node) == Some(key)`):
-    /// the log-admitted drive with no book entry is not held, and the cut hangs it up.
-    #[cfg(unix)]
-    #[test]
-    fn a_drive_the_log_admits_is_held_with_no_book_entry_for_its_node() {
-        use aterm_net::fleet::NodeKey;
-        use aterm_net::fleet_member::{Keyring, MemberKeys, Peer, Standing, Via};
-        let (member, other, removed) = (
-            NodeKey::from_bytes([0x31; 32]),
-            NodeKey::from_bytes([0x32; 32]),
-            NodeKey::from_bytes([0x33; 32]),
-        );
-        let node = "6d".repeat(16);
-        let log: MemberKeys = [
-            (member, Standing::Member),
-            (other, Standing::Member),
-            (removed, Standing::Out("removed".to_owned())),
-        ]
-        .into_iter()
-        .collect();
-        let none = Keyring::default();
-        assert!(
-            holds_in(&none, Some(&log), &node, member),
-            "a key the log admits, with no book entry for its node"
-        );
-        assert!(
-            !holds_in(&none, None, &node, member),
-            "with no log, the book decides"
-        );
-        assert!(
-            !holds_in(&none, Some(&log), &node, removed),
-            "a key the log took out"
-        );
-        let bound_to = |key: NodeKey| {
-            Keyring::of(&[Peer {
-                node: Some(node.clone()),
-                key: Some(key),
-                key_from: None,
-                host: "m9.local".to_owned(),
-                addr: None,
-                port: 7100,
-                version: None,
-                seen_ms: None,
-                via: Via::Joined,
-                fleet: None,
-                signed: None,
-            }])
-        };
-        assert!(
-            !holds_in(&bound_to(other), Some(&log), &node, member),
-            "the book binds the node to another member's key"
-        );
-        assert!(
-            holds_in(&bound_to(removed), Some(&log), &node, member),
-            "the book still binds the node to the key the log took out"
-        );
-        let star = Serving {
-            scope: FleetScope::Content,
-            grants: vec![
-                aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-                    .expect("the all-member grant"),
-            ],
-        };
-        let driver =
-            aterm_net::fleet::DriveGrant::from_word(&format!("{node}:{}", "31".repeat(32)))
-                .expect("the driver's grant");
-        assert!(star.serves(
-            true,
-            Some(&driver),
-            &|node, key| holds_in(&none, Some(&log), node, key),
-            &[]
-        ));
-
-        // Remote holds (`lift_undriving_holds` and `remote_holder`) keep a log-admitted driver's
-        // hold while the log admits its key (even with no book entry or an old retired key in the
-        // book), and lift it once the log takes its key out or `peers rm` removes a book-only
-        // driver.
-        assert_eq!(
-            bound_or_admitted_in(&none, Some(&log), Some(member), &node),
-            Some(member),
-            "log-admitted driver with no book entry keeps its bound key for remote holds"
-        );
-        assert!(still_drives(
-            &star.grants,
-            || bound_or_admitted_in(&none, Some(&log), Some(member), &node),
-            &node,
-            &[],
-        ));
-        assert_eq!(
-            bound_or_admitted_in(&bound_to(removed), Some(&log), Some(member), &node),
-            Some(member),
-            "log-admitted driver whose book entry still holds its retired key keeps its hold"
-        );
-        assert_eq!(
-            bound_or_admitted_in(&bound_to(removed), Some(&log), Some(removed), &node),
-            None,
-            "a Mac the membership log removed drives no more even while the book names it"
-        );
-        let founder = NodeKey::from_bytes([0x34; 32]);
-        assert_eq!(
-            bound_or_admitted_in(&bound_to(founder), Some(&log), Some(founder), &node),
-            Some(founder),
-            "a book-admitted founder not yet in the log keeps its hold while in the book"
-        );
-        assert_eq!(
-            bound_or_admitted_in(&none, Some(&log), Some(founder), &node),
-            None,
-            "a book-only driver loses its hold once peers rm removes it from the book"
-        );
-        // Negative controls: `bound_in` alone drops the log-admitted driver with no book entry,
-        // and `keys.bound` alone keeps a Mac the membership log removed.
-        assert_eq!(bound_in(&none, Some(&log), &node), None);
-        assert_eq!(bound_to(removed).bound(&node), Some(removed));
-    }
-
-    /// A Commons peer heard again after a silence makes one fleet heartbeat due at once, named
-    /// by its source, between the interval's own; the next look makes none, and the interval's
-    /// own still comes.
-    /// NEGATIVE CONTROL: unhook the clock from the signal (a `due` that reads only the interval),
-    /// or the beacon source from the Commons peers (a look that hears no one): no heartbeat is
-    /// due before the interval, and the wake reason reads `Timer`.
-    #[cfg(unix)]
-    #[test]
-    fn a_new_commons_beacon_sends_one_heartbeat() {
-        use crate::network_moved::tests::{HANG, peer};
-        use crate::network_moved::{Heard, Moved, Woke, spawn_source};
-        use aterm_types::network_state::Reachability::{LastSeen, Reachable};
-        let moved = std::sync::Arc::new(Moved::new());
-        let now = std::time::Instant::now();
-        let every = Duration::from_secs(3600);
-        let mut heartbeat = HeartbeatClock::new(Some(now), every, moved.watch());
-        let mut seen = moved.watch();
-        let (looks, looked) = std::sync::mpsc::channel();
-        let mut heard = Heard::new(1);
-        assert!(spawn_source(
-            "test-commons",
-            std::sync::Arc::clone(&moved),
-            (Woke::Beacon, Duration::ZERO),
-            move || {
-                let peers: Vec<_> = looked.recv().ok()?;
-                Some(heard.look(&peers))
-            }
-        ));
-        assert_eq!(
-            heartbeat.dispatch_when_free(now, false, || true),
-            None,
-            "the interval has not run out"
-        );
-        looks
-            .send(vec![peer(7, LastSeen)])
-            .expect("the beacon source runs");
-        looks
-            .send(vec![peer(7, Reachable)])
-            .expect("the beacon source runs");
-        assert_eq!(seen.wait(HANG), Woke::Beacon);
-        assert_eq!(
-            heartbeat.dispatch_when_free(now, false, || true),
-            Some(Woke::Beacon),
-            "one heartbeat at once"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(now, false, || true),
-            None,
-            "and only one"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(now + every, false, || true),
-            Some(Woke::Timer)
-        );
-    }
-
-    /// A HEARTBEAT A MOVE MAKES DUE WAITS OUT THIS MAC'S SPREAD (docs/DESIGN-fluid-swarm-2026-10-28.md,
-    /// F4's follow-up): with ~35 Macs back on the LAN at once, each registers with the issuer at
-    /// its own offset after the move, not at the move's instant; then once, as before.
-    /// NEGATIVE CONTROL: a `due` that takes the move by the wall clock (`take()`) or a signal
-    /// that ignores its spread fails one of the first two: the heartbeat comes before the spread,
-    /// or not at it.
-    #[cfg(unix)]
-    #[test]
-    fn a_heartbeat_a_move_makes_due_waits_out_this_macs_spread() {
-        use crate::network_moved::{Moved, Woke};
-        let spread = Duration::from_millis(2_500);
-        let moved = std::sync::Arc::new(Moved::spread_by(spread));
-        let t0 = std::time::Instant::now() + Duration::from_secs(3600);
-        let every = Duration::from_secs(3 * 3600);
-        let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
-        moved.tell_at(Woke::Route, t0);
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0, false, || true),
-            None,
-            "not before this Mac's spread"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0 + spread, false, || true),
-            Some(Woke::Route),
-            "at this Mac's spread"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0 + spread, false, || true),
-            None,
-            "and only one"
-        );
-    }
-
-    /// A MOVE TOLD WHILE A HEARTBEAT ROUND IS OUT STILL GETS A ROUND: back home alone (no herd
-    /// spread), the route move starts a round at once, often while the LAN is still down, and
-    /// the settled place's move comes seconds later while that round is out. It is not taken
-    /// then (a round could not start), and once the round ends it is due, once.
-    /// NEGATIVE CONTROL: `dispatch_when_free` taking the move whatever `busy` says answers it
-    /// while the round is out, where the
-    /// caller drops it, and "not while a round is out" fails.
-    #[cfg(unix)]
-    #[test]
-    fn a_move_told_while_a_round_is_out_still_gets_a_round() {
-        use crate::network_moved::{Moved, Woke};
-        let moved = std::sync::Arc::new(Moved::new());
-        let t0 = std::time::Instant::now() + Duration::from_secs(3600);
-        let every = Duration::from_secs(3 * 3600);
-        let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
-        moved.tell_at(Woke::Place, t0);
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0, true, || true),
-            None,
-            "not while a round is out"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0 + Duration::from_secs(3), false, || true),
-            Some(Woke::Place),
-            "once it ended"
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(t0 + Duration::from_secs(3), false, || true),
-            None,
-            "and only one"
-        );
-
-        // A free dispatcher can still refuse to start (for example, the OS could
-        // not create its worker). No thread exhaustion is needed to judge this
-        // production clock/dispatch boundary: refusal is its actual bool result.
-        let at = t0 + Duration::from_secs(10);
-        moved.tell_at(Woke::Route, at);
-        let starts = std::cell::Cell::new(0);
-        let refused = heartbeat.dispatch_when_free(at, false, || {
-            starts.set(starts.get() + 1);
-            false
-        });
-        assert_eq!(starts.get(), 1, "a real dispatch decision was reached");
-        assert_eq!(
-            heartbeat.dispatch_when_free(at + Duration::from_secs(1), false, || {
-                starts.set(starts.get() + 1);
-                true
-            }),
-            Some(Woke::Route),
-            "dispatch refusal must retain the network move for the next free tick"
-        );
-        assert_eq!(starts.get(), 2);
-        assert_eq!(refused, None, "a refused dispatch started no round");
-        assert_eq!(
-            heartbeat.dispatch_when_free(at + Duration::from_secs(1), false, || {
-                panic!("an accepted generation must not dispatch twice")
-            }),
-            None
-        );
-
-        // A newer move arriving inside an accepted dispatch belongs to the next
-        // round; acknowledgement may consume only the generation it selected.
-        let next = at + Duration::from_secs(2);
-        moved.tell_at(Woke::Place, next);
-        assert_eq!(
-            heartbeat.dispatch_when_free(next, false, || {
-                moved.tell_at(Woke::Route, next);
-                true
-            }),
-            Some(Woke::Place)
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(next, false, || true),
-            Some(Woke::Route)
-        );
-        assert_eq!(heartbeat.dispatch_when_free(next, false, || true), None);
-
-        // A refused ordinary timer also remains due; failure cannot start a new
-        // three-minute interval without a round having started.
-        let timer = next + every;
-        assert_eq!(heartbeat.dispatch_when_free(timer, false, || false), None);
-        assert_eq!(
-            heartbeat.dispatch_when_free(timer + Duration::from_secs(1), false, || true),
-            Some(Woke::Timer)
-        );
-        assert_eq!(
-            heartbeat.dispatch_when_free(timer + Duration::from_secs(1), false, || true),
-            None
-        );
-
-        // The timer may start before a new move's herd spread expires. It does
-        // not acknowledge that not-yet-due generation.
-        let spread = Duration::from_millis(2_500);
-        let spread_moves = std::sync::Arc::new(Moved::spread_by(spread));
-        let mut delayed = HeartbeatClock::new(Some(t0), every, spread_moves.watch());
-        let timer = t0 + every;
-        spread_moves.tell_at(Woke::Route, timer);
-        assert_eq!(
-            delayed.dispatch_when_free(timer, false, || true),
-            Some(Woke::Timer)
-        );
-        assert_eq!(
-            delayed.dispatch_when_free(timer + spread, false, || true),
-            Some(Woke::Route)
-        );
-        assert_eq!(
-            delayed.dispatch_when_free(timer + spread, false, || true),
-            None
-        );
-    }
-
-    /// A DRIVE IS NAMED BY ITS PROVEN NODE.
-    #[cfg(unix)]
-    #[test]
-    fn a_drive_is_named_by_the_node_it_proved() {
-        let (n, m) = ("1a2b3c4d".repeat(4), "9f8e7d6c".repeat(4));
-        let knows = [n.clone(), m.clone()];
-        assert_eq!(
-            driver_name(&n, Some("mac-11.local"), &knows),
-            "mac-11.local (node 1a2b3c4d)"
-        );
-        assert_ne!(
-            driver_name(&n, Some("mac-11.local"), &knows),
-            driver_name(&m, Some("mac-11.local"), &knows),
-            "a node that names itself as another Mac reads as itself"
-        );
-        for unshown in [None, Some("the message bus"), Some("")] {
-            assert_eq!(
-                driver_name(&n, unshown, &knows),
-                "node 1a2b3c4d",
-                "{unshown:?}"
-            );
-        }
-        // NEGATIVE CONTROL: name the node by its first eight characters again, and the holder
-        // reads as the node it shares them with.
-        let (holder, reader) = (
-            "c0ffee34a18b0000000000000000000a".to_owned(),
-            "c0ffee34a27c0000000000000000000b".to_owned(),
-        );
-        assert_eq!(
-            driver_name(&holder, Some("127.0.0.1"), &[holder.clone(), reader]),
-            "127.0.0.1 (node c0ffee34a1)",
-            "a head another node this Mac knows shares is never the name"
-        );
-    }
-
-    /// THE JOIN'S AUDIT LINE NAMES THE MEMBER AS THE BOOK DOES.
-    #[cfg(unix)]
-    #[test]
-    fn a_registration_names_the_member_by_its_fleet_address_and_node() {
-        use aterm_net::fleet_member::{Peer, Recorded, Via};
-        let member = Peer {
-            node: Some("6f860a011103430d".to_owned()),
-            key: None,
-            key_from: None,
-            host: "lab-mini".to_owned(),
-            addr: Some(std::net::IpAddr::from([127, 0, 0, 1])),
-            port: 58054,
-            version: Some("0.105.0".to_owned()),
-            seen_ms: Some(1),
-            via: Via::Joined,
-            fleet: None,
-            signed: None,
-        };
-        for recorded in [Recorded::New, Recorded::Updated] {
-            let note = registration_note(recorded, &member);
-            assert!(note.contains(" 127.0.0.1:58054 "), "{note}");
-            assert!(note.contains("6f860a011103430d"), "{note}");
-        }
-        assert_ne!(
-            registration_note(Recorded::New, &member),
-            registration_note(Recorded::Updated, &member)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_held_place_names_the_act_that_moves_the_listener() {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 58733));
-        let dir = aterm_tempfile::tempdir().expect("scratch folder");
-        let state = dir.path().join("state");
-        aterm_uds::private_file::ensure_private_dir(&state).unwrap();
-        let held = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
-        assert!(
-            held.starts_with("fleet listener: 127.0.0.1:58733 is held by another process")
-                && held.contains(": `aterm fleet join --port <n>` moves it; tried again every"),
-            "{held}"
-        );
-        aterm_uds::private_file::write_private(
-            &state,
-            aterm_net::fleet_member::CODE_FILE,
-            b"code\n",
-        )
-        .unwrap();
-        let issuer = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
-        assert!(
-            issuer.contains(": `aterm fleet init --rotate --port <n>` moves it (every member"),
-            "{issuer}"
-        );
-        let absent = unbound_line(addr, std::io::ErrorKind::AddrNotAvailable, Some(&state));
-        assert!(
-            absent.contains("is not an address of this machine yet") && !absent.contains("moves"),
-            "{absent}"
-        );
-    }
-
-    #[test]
-    fn every_move_of_the_listener_is_noted() {
-        let mut desk = FleetDesk {
-            wanted: None,
-            generation: 0,
-            revision: 0,
-            configured: false,
-            started: false,
-            thread_spawned: false,
-            standing: Standing::Off,
-            said: String::new(),
-            stop: None,
-            mesh: false,
-        };
-        let at = |place: &str, level: &str| format!("fleet listening on {place} (serving {level})");
-        assert!(noted_move(
-            &mut desk,
-            Standing::Listening,
-            &at("127.0.0.1:52510", "facts")
-        ));
-        assert!(
-            !noted_move(
-                &mut desk,
-                Standing::Listening,
-                &at("127.0.0.1:52510", "facts")
-            ),
-            "a rekey where it was"
-        );
-        assert!(noted_move(
-            &mut desk,
-            Standing::Listening,
-            &at("127.0.0.1:52506", "facts")
-        ));
-        assert!(noted_move(
-            &mut desk,
-            Standing::Listening,
-            &at("0.0.0.0:52506", "content")
-        ));
-        let held = "fleet listener: 0.0.0.0:52506 is held by another process";
-        assert!(noted_move(&mut desk, Standing::Retrying, held));
-        assert!(
-            !noted_move(&mut desk, Standing::Retrying, held),
-            "tried again"
-        );
-        assert_eq!(desk.standing, Standing::Retrying);
-    }
-
-    #[test]
-    fn the_listener_follows_listen_and_allow() {
-        let table = |listen: Option<&str>, allow: Option<&str>| FleetConfig {
-            listen: listen.map(str::to_owned),
-            allow: allow.map(str::to_owned),
-            watch: None,
-            drive_from: None,
-        };
-        assert_eq!(fleet_wanted(None), None);
-        assert_eq!(fleet_wanted(Some(&table(None, Some("content")))), None);
-        assert_eq!(fleet_wanted(Some(&table(Some(""), None))), None);
-        let on = fleet_wanted(Some(&table(Some("0.0.0.0:7100"), None)));
-        assert_eq!(
-            on,
-            Some(Wanted {
-                listen: "0.0.0.0:7100".to_owned(),
-                allow: None,
-                drive_from: Vec::new(),
-            })
-        );
-        assert_ne!(
-            on,
-            fleet_wanted(Some(&table(Some("0.0.0.0:7100"), Some("content"))))
-        );
-        assert_ne!(on, fleet_wanted(Some(&table(Some("0.0.0.0:7101"), None))));
-    }
-
-    #[test]
-    fn the_drive_level_serves_only_the_nodes_its_list_names() {
-        let node = "ab".repeat(16);
-        let grant = format!("{node}:{}", "cd".repeat(32));
-        let wanted = |allow: Option<&str>, from: &[&str]| {
-            fleet_wanted(Some(&FleetConfig {
-                listen: Some("0.0.0.0:7100".to_owned()),
-                allow: allow.map(str::to_owned),
-                watch: None,
-                drive_from: Some(from.iter().map(|s| (*s).to_owned()).collect()),
-            }))
-            .expect("a listener")
-        };
-        assert_eq!(level_of(Some("drive")), Some((FleetScope::Content, true)));
-        assert_eq!(level_of(Some("DRIVE")), Some((FleetScope::Content, true)));
-        for (allow, scope) in [
-            (None, FleetScope::Facts),
-            (Some("facts"), FleetScope::Facts),
-            (Some("content"), FleetScope::Content),
-        ] {
-            assert_eq!(level_of(allow), Some((scope, false)), "{allow:?}");
-        }
-        assert_eq!(level_of(Some("steer")), None);
-        let listed = wanted(Some("drive"), &[&node, "mac-03", "", "zz", &grant]);
-        assert_eq!(
-            listed.drive_from,
-            vec![aterm_net::fleet::DriveGrant::from_word(&grant).expect("a grant")],
-            "only a node with its key grants"
-        );
-        assert_eq!(listed.drive_from[0].node, node);
-        assert!(
-            wanted(Some("drive"), &[]).drive_from.is_empty(),
-            "none named: nobody"
-        );
-    }
-
-    #[test]
-    fn a_grant_written_applies_at_once_and_cuts_only_what_it_takes_away() {
-        let grant = |n: u8| {
-            aterm_net::fleet::DriveGrant::from_word(&format!(
-                "{}:{}",
-                format!("{n:02x}").repeat(16),
-                "cd".repeat(32)
-            ))
-            .expect("a grant")
-        };
-        let (a, b) = (grant(0x0a), grant(0x0b));
-        let toml = |listen: &str, allow: &str, from: &[&aterm_net::fleet::DriveGrant]| {
-            format!(
-                "theme = \"Nord\"\n[fleet]\nlisten = \"{listen}\"\nallow = \"{allow}\"\n\
-                 drive_from = [{}]\n",
-                from.iter()
-                    .map(|grant| format!("\"{}\"", grant.word()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let wanted = |text: &str| table_in(text).expect("a [fleet] that reads");
-        let running = wanted(&toml("127.0.0.1:7100", "drive", &[&b]));
-        let now = |text: &str| serving_now(running.as_ref(), Some(text));
-        let drive = |grants: Vec<aterm_net::fleet::DriveGrant>| Serving {
-            scope: FleetScope::Content,
-            grants,
-        };
-        let both = toml("127.0.0.1:7100", "drive", &[&a, &b]);
-        assert_eq!(
-            now(&both),
-            drive(vec![a.clone(), b.clone()]),
-            "a grant added drives at once"
-        );
-        assert_eq!(
-            now(&toml("127.0.0.1:7100", "DRIVE", &[&b])),
-            drive(vec![b.clone()])
-        );
-        assert_eq!(
-            serving_now(
-                wanted(&toml("127.0.0.1:7100", "content", &[])).as_ref(),
-                Some(&both)
-            ),
-            drive(vec![a.clone(), b.clone()]),
-            "so does the first, which raises the level to drive"
-        );
-        assert_eq!(
-            now(&toml("127.0.0.1:7100", "facts", &[&a, &b])),
-            Serving {
-                scope: FleetScope::Facts,
-                grants: Vec::new()
-            }
-        );
-        let unrelated = format!(
-            "font_px = \"not a number\"\n{}",
-            toml("127.0.0.1:7100", "content", &[])
-        );
-        for gone in [
-            toml("127.0.0.1:7100", "content", &[]),
-            toml("", "drive", &[&a, &b]),
-            toml("127.0.0.1:7100", "steer", &[&a, &b]),
-            "theme = \"Nord\"\n".to_owned(),
-            String::new(),
-            unrelated,
-        ] {
-            assert_eq!(now(&gone), drive(Vec::new()), "{gone}");
-        }
-        for broken in [
-            "[fleet\n".to_owned(),
-            "theme = Nord\n".to_owned(),
-            "[fleet]\nallow = 5\n".to_owned(),
-        ] {
-            assert_eq!(
-                now(&broken),
-                drive(vec![b.clone()]),
-                "a [fleet] that does not read leaves the running grants: {broken}"
-            );
-        }
-        assert_eq!(
-            serving_now(running.as_ref(), None),
-            drive(vec![b.clone()]),
-            "so does an aterm.toml that cannot be read"
-        );
-
-        let bound = |node: &str| {
-            [&a, &b]
-                .into_iter()
-                .find(|grant| grant.node == node)
-                .map(|grant| grant.key)
-        };
-        let served = now(&toml("127.0.0.1:7100", "drive", &[&b]));
-        assert!(
-            served.serves(true, Some(&b), &held_by(bound), &[]),
-            "a drive whose grant stands"
-        );
-        assert!(
-            served.serves(true, None, &held_by(bound), &[])
-                && served.serves(false, None, &held_by(bound), &[])
-        );
-        assert!(
-            !served.serves(true, Some(&a), &held_by(bound), &[]),
-            "a drive whose grant went"
-        );
-        let facts = now(&toml("127.0.0.1:7100", "facts", &[]));
-        assert!(
-            !facts.serves(true, None, &held_by(bound), &[])
-                && facts.serves(false, None, &held_by(bound), &[])
-        );
-        assert!(!now(&toml("127.0.0.1:7100", "content", &[])).serves(
-            true,
-            Some(&b),
-            &held_by(bound),
-            &[]
-        ));
-
-        let place = |listen: &str, allow: &str| wanted(&toml(listen, allow, &[&a]));
-        let here = place("127.0.0.1:7100", "content");
-        for stays in [
-            place("127.0.0.1:7100", "drive"),
-            place("127.0.0.1:7100", "facts"),
-        ] {
-            assert!(in_place(here.as_ref(), stays.as_ref()), "{stays:?}");
-        }
-        for moves in [
-            place("127.0.0.1:7101", "content"),
-            place("127.0.0.1:7100", "steer"),
-            None,
-        ] {
-            assert!(!in_place(here.as_ref(), moves.as_ref()), "{moves:?}");
-        }
-        assert!(!in_place(None, here.as_ref()));
-    }
-
-    #[test]
-    fn a_node_drives_on_while_a_grant_names_it_with_the_key_it_is_bound_to() {
-        let grant = |n: u8, key: u8| {
-            aterm_net::fleet::DriveGrant::from_word(&format!(
-                "{}:{}",
-                format!("{n:02x}").repeat(16),
-                format!("{key:02x}").repeat(32)
-            ))
-            .expect("a grant")
-        };
-        let (a, b) = (grant(0x0a, 0xcd), grant(0x0b, 0xcd));
-        let grants = [a.clone(), b];
-        let (key, other) = (a.key, grant(0x0a, 0xef).key);
-        assert!(still_drives(&grants, || Some(key), &a.node, &[]));
-        assert!(
-            !still_drives(&grants, || Some(other), &a.node, &[]),
-            "its issuer's book binds it to another key"
-        );
-        assert!(
-            !still_drives(&grants, || None, &a.node, &[]),
-            "its issuer's book names it no more"
-        );
-        assert!(
-            !still_drives(
-                &grants,
-                || unreachable!("no grant names it"),
-                &"0c".repeat(16),
-                &[],
-            ),
-            "no grant names it"
-        );
-        assert!(!still_drives(&[], || Some(key), &a.node, &[]));
-        let all = aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-            .expect("the all-member grant");
-        let every = [all.clone()];
-        assert!(still_drives(&every, || Some(other), &a.node, &[]));
-        assert!(!still_drives(&every, || None, &a.node, &[]));
-        let drive = Serving {
-            scope: FleetScope::Content,
-            grants: vec![all],
-        };
-        let (c, bound) = (grant(0x0c, 0xef), |node: &str| {
-            (node == a.node).then_some(key)
-        });
-        assert!(drive.serves(true, Some(&a), &held_by(bound), &[]));
-        assert!(
-            !drive.serves(true, Some(&c), &held_by(bound), &[]),
-            "under `*`, a drive of a node no book here binds"
-        );
-        assert!(
-            !drive.serves(true, Some(&a), &|_, key| key == other, &[]),
-            "under `*`, a drive admitted under a key its node is bound to no more"
-        );
-        let named = Serving {
-            grants: vec![a.clone()],
-            ..drive.clone()
-        };
-        assert!(named.serves(true, Some(&a), &held_by(bound), &[]));
-        assert!(
-            !named.serves(true, Some(&a), &|_, _| false, &[]),
-            "under its own grant, a drive of a node no book here binds"
-        );
-        assert!(
-            !Serving {
-                grants: vec![grant(0x0a, 0xef)],
-                ..drive
-            }
-            .serves(true, Some(&a), &held_by(bound), &[]),
-            "a named grant of another key"
-        );
-    }
-
-    #[cfg(unix)]
-    static OPEN_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    #[cfg(unix)]
-    #[test]
-    fn a_change_that_takes_a_connection_away_as_it_is_admitted_refuses_or_cuts_it() {
-        let _guard = OPEN_TEST_LOCK.lock_or_recover();
-        let grant = aterm_net::fleet::DriveGrant::from_word(&format!(
-            "{}:{}",
-            "5e".repeat(16),
-            "cd".repeat(32)
-        ))
-        .expect("a grant");
-        let drive = |grants: Vec<aterm_net::fleet::DriveGrant>| Serving {
-            scope: FleetScope::Content,
-            grants,
-        };
-        let entered = |grant: &aterm_net::fleet::DriveGrant| {
-            OPEN.lock_or_recover()
-                .iter()
-                .any(|open| open.driver.as_ref() == Some(grant))
-        };
-        let (near, _far) = aterm_uds::CtlStream::pair().expect("a line");
-        let bound = |_: &str| Some(grant.key);
-        let refused = Opened::served(
-            true,
-            Some(grant.clone()),
-            &near,
-            || drive(Vec::new()),
-            &held_by(bound),
-        )
-        .expect("held");
-        assert!(
-            refused.is_none() && !entered(&grant),
-            "its grant taken back while its admission read the issuer's book"
-        );
-        let facts = || Serving {
-            scope: FleetScope::Facts,
-            grants: Vec::new(),
-        };
-        assert!(
-            Opened::served(true, None, &near, facts, &held_by(bound))
-                .expect("held")
-                .is_none(),
-            "a read at content once it serves facts"
-        );
-        let open = Opened::served(
-            true,
-            Some(grant.clone()),
-            &near,
-            || drive(vec![grant.clone()]),
-            &held_by(bound),
-        )
-        .expect("held")
-        .expect("its grant stands");
-        assert!(entered(&grant));
-        assert!(
-            cut_unserved(&drive(Vec::new()), &held_by(bound)) >= 1 && !entered(&grant),
-            "taken back once it is held: the cut that follows hangs it up"
-        );
-        drop(open);
-        let all = || {
-            drive(vec![
-                aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-                    .expect("the all-member grant"),
-            ])
-        };
-        let open = Opened::served(true, Some(grant.clone()), &near, all, &held_by(bound))
-            .expect("held")
-            .expect("`*` admits a node bound here");
-        cut_unserved(&all(), &held_by(bound));
-        assert!(
-            entered(&grant),
-            "`*` serves a node bound here to its key still"
-        );
-        assert!(
-            cut_unserved(&all(), &|_, _| false) >= 1 && !entered(&grant),
-            "under `*`, a drive whose node no book binds any more is cut too"
-        );
-        drop(open);
-    }
-
-    #[test]
-    fn the_slots_are_a_share_of_the_descriptor_limit() {
-        let most = aterm_net::fleet::MAX_SLOTS;
-        assert_eq!(slots_for(Some(256), 64), 8, "a Dock-launched app's 256");
-        assert_eq!(slots_for(Some(512), 128), most);
-        assert_eq!(
-            slots_for(None, 1024),
-            most,
-            "an unreadable limit bounds nothing"
-        );
-        assert_eq!(slots_for(Some(1 << 20), 8), 8, "the control server's cap");
-        assert_eq!(slots_for(Some(16), 8), 1, "a configured listener serves");
-    }
-
-    /// `units=` SAYS WHERE LAN SHARING STANDS, AS THE DOCTOR'S ROW DECIDES IT
-    /// (`atpkg::peers::Serves`), one word for each place.
-    #[test]
-    fn the_units_word_says_where_lan_sharing_stands() {
-        use atpkg::peers::Serves;
-        let at = SocketAddr::from(([10, 0, 0, 2], atpkg::peers::DEFAULT_PORT));
-        let words = [
-            Some(Serves::Serving(at)),
-            Some(Serves::Idle),
-            Some(Serves::NoMember),
-            Some(Serves::Off),
-            None,
-        ]
-        .map(units_word);
-        assert_eq!(words, ["serving", "idle", "no-member", "off", "-"]);
-        assert_eq!(
-            units_word(Some(Serves::of(true, Some(at), 3))),
-            "off",
-            "the person's off stands over a live server"
-        );
-    }
-
-    /// `units=` READS NO FILE ON THE EVENT LOOP: one read is out at a time, started once none has
-    /// landed or the last is [`UNITS_WORD`]'s `every` old; a `status` waits for it until `wait`
-    /// after it started, and answers a word younger than `stale`, else `-`.
-    #[test]
-    fn the_units_word_is_read_off_the_event_loop_one_read_at_a_time() {
-        let UnitsTiming { every, wait, stale } = UNITS_WORD;
-        let t0 = Instant::now();
-        let mut held = UnitsWord::UNREAD;
-        assert!(held.ask(t0, every), "none read: the first asks");
-        assert!(!held.ask(t0, every), "one read at a time");
-        assert_eq!(held.wait_left(t0, wait), Some(wait));
-        assert_eq!(held.wait_left(t0 + wait, wait), None, "waited for once");
-        assert_eq!(held.answer(t0, stale), "-", "none landed");
-        held.landed(Some("serving"), t0);
-        assert_eq!(held.wait_left(t0, wait), None, "none out");
-        assert!(!held.ask(t0 + every / 2, every));
-        assert_eq!(held.answer(t0 + every / 2, stale), "serving");
-        assert!(held.ask(t0 + every, every), "a word this old is read again");
-        held.landed(None, t0 + every);
-        assert!(
-            held.ask(t0 + every, every),
-            "a read that never ran keeps the word and is asked again"
-        );
-        assert_eq!(held.answer(t0 + every, stale), "serving");
-        assert_eq!(
-            held.answer(t0 + stale, stale),
-            "-",
-            "a word as old as the bound is no answer while its read is out"
-        );
-        held.landed(Some("off"), t0 + stale);
-        assert!(!held.ask(t0 + stale, every));
-        assert_eq!(held.answer(t0 + stale, stale), "off");
-    }
-
-    /// A `status` AFTER A QUIET SPELL SAYS WHAT THE STORE HOLDS NOW, NOT THE WORD LAST READ: the
-    /// read it starts lands before it answers (the person's off over an earlier `serving`).
-    #[test]
-    fn a_status_after_a_quiet_spell_answers_the_read_it_started() {
-        static DESK: UnitsDesk = UnitsDesk::new();
-        DESK.land(Some("serving"));
-        let reads = std::sync::atomic::AtomicUsize::new(0);
-        let read_off = |desk: &'static UnitsDesk| {
-            reads.fetch_add(1, Ordering::Relaxed);
-            std::thread::spawn(move || desk.land(Some("off")));
-            true
-        };
-        // The word in hand is already old (`every` zero); the wait is a hang detector, and no
-        // answer here is held to a clock.
-        let hang = Duration::from_secs(60);
-        let quiet = UnitsTiming {
-            every: Duration::ZERO,
-            wait: hang,
-            stale: hang,
-        };
-        assert_eq!(DESK.word(quiet, read_off), "off");
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-        let fresh = UnitsTiming {
-            every: hang,
-            ..quiet
-        };
-        assert_eq!(
-            DESK.word(fresh, |_| unreachable!("the word is fresh")),
-            "off",
-            "a fresh word is answered as it stands"
-        );
-        assert_eq!(
-            DESK.word(quiet, |_| false),
-            "off",
-            "a read that could not start keeps the word while it is young"
-        );
-    }
-
-    /// Facts stay on the Mac that made them and go to the fleet issuer its book names, never one
-    /// known by a name, so neither case reads this host's own names.
-    #[cfg(unix)]
-    #[test]
-    fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
-        use aterm_agent::survey_facts::SwarmSurveyFacts;
-        use aterm_net::fleet::{FleetOp, FleetScope, FleetSecret, Listening, NodeIdentity};
-        use aterm_net::fleet_member::{
-            Began, Peer, Via, node_identity, read_pushed_facts, serve_facts, write_held,
-        };
-
-        let secret = FleetSecret::new(&[0x44; 24]).expect("secret");
-        let holder_dir = aterm_tempfile::tempdir().expect("holder dir");
-        let member_dir = aterm_tempfile::tempdir().expect("member dir");
-
-        let holder_id: NodeIdentity = node_identity(holder_dir.path()).expect("holder node");
-        let member_id: NodeIdentity = node_identity(member_dir.path()).expect("member node");
-
-        // 1. The issuer (its book names no issuer but itself) keeps its own facts alone.
-        let holder_facts = SwarmSurveyFacts {
-            release_lines: Vec::new(),
-            node: Some(holder_id.node().to_owned()),
-            label: Some("fixture-holder".to_owned()),
-            roster_unread: false,
-            version: "0.146.0".to_owned(),
-            window: true,
-            window_last: Some(1_793_160_000),
-            sessions: 2,
-            ssh_host_key: Some("SHA256:holderkey".to_owned()),
-            accounts: Vec::new(),
-            accounts_unread: Vec::new(),
-            session_accounts: std::collections::BTreeMap::new(),
-            moves: None,
-            server_heard: Vec::new(),
-            home: None,
-            home_free_mb: None,
-            repos: None,
-        };
-        let holder_payload = holder_facts.to_survey_reply(
-            100,
-            Some("fixture-holder.local"),
-            1_793_160_000_000,
-            1,
-            false,
-        );
-        assert_eq!(
-            push_facts_to_issuer(holder_dir.path(), &secret, &holder_payload).expect("local store"),
-            FactsPushOutcome::StoredLocally(holder_id.node().to_owned()),
-        );
-        assert_eq!(
-            read_pushed_facts(holder_dir.path()),
-            vec![(holder_id.node().to_owned(), holder_payload.clone())],
-        );
-
-        // 2. A member (`m7`) dials the issuer its book names over `FleetOp::Facts`.
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        let stop = Arc::new(Stop::new());
-        let holder_state = holder_dir.path().to_path_buf();
-        let listening = Listening {
-            secret: secret.clone(),
-            scope: FleetScope::Facts,
-            node: Some(holder_id.clone()),
-            serves: SERVES,
-            slots: 4,
-            per_source: 4,
-            lifetime: aterm_spec::wait::MUST_HAPPEN,
-        };
-        let server_stop = Arc::clone(&stop);
-        let server = std::thread::spawn(move || {
-            aterm_net::fleet::serve_offering_with_ask_within(
-                &listener,
-                (
-                    &listening,
-                    Arc::new(|| (FleetScope::Facts, SERVES)),
-                    Arc::new(|| Arc::new(aterm_net::fleet::Denied::default())),
-                ),
-                None,
-                &server_stop,
-                aterm_spec::wait::MUST_HAPPEN,
-                move |served, op| {
-                    assert_eq!(op, FleetOp::Facts);
-                    let proof = served.peer_node().cloned();
-                    let state = holder_state.clone();
-                    served.answer(|stream| {
-                        let _ = serve_facts(stream, proof.as_ref(), &state, |payload| {
-                            SwarmSurveyFacts::from_survey_reply(payload).map(|f| f.node)
-                        })?;
-                        Ok(())
-                    })
-                },
-                |_| {},
-            );
-        });
-
-        write_held(member_dir.path(), Began::Here, |book| {
-            book.write_key(&[0x44; 24]).unwrap();
-            book.update(|peers| {
-                peers.push(Peer {
-                    host: "fixture-holder.local".to_owned(),
-                    addr: Some("127.0.0.1".parse().unwrap()),
-                    port,
-                    via: Via::Issuer,
-                    node: Some(holder_id.node().to_owned()),
-                    version: Some("0.146.0".to_owned()),
-                    seen_ms: Some(1_793_160_000_000),
-                    key: Some(holder_id.key()),
-                    key_from: None,
-                    fleet: None,
-                    signed: None,
-                });
-                Ok(())
-            })
-            .unwrap();
-        })
-        .unwrap();
-
-        let member_facts = SwarmSurveyFacts {
-            release_lines: Vec::new(),
-            node: Some(member_id.node().to_owned()),
-            label: Some("m7".to_owned()),
-            roster_unread: false,
-            version: "0.146.0".to_owned(),
-            window: false,
-            window_last: Some(1_793_150_000),
-            sessions: 0,
-            ssh_host_key: Some("SHA256:memberkey".to_owned()),
-            accounts: Vec::new(),
-            accounts_unread: Vec::new(),
-            session_accounts: std::collections::BTreeMap::new(),
-            moves: None,
-            server_heard: Vec::new(),
-            home: None,
-            home_free_mb: None,
-            repos: None,
-        };
-        let member_payload =
-            member_facts.to_survey_reply(200, Some("m7.local"), 1_793_160_000_000, 0, false);
-        assert_eq!(
-            push_facts_to_issuer(member_dir.path(), &secret, &member_payload).expect("remote push"),
-            FactsPushOutcome::PushedRemote {
-                host: "fixture-holder.local".to_owned(),
-                port,
-            },
-        );
-
-        // The member keeps its own facts besides, for the census it computes (F17).
-        assert_eq!(
-            read_pushed_facts(member_dir.path()),
-            vec![(member_id.node().to_owned(), member_payload.clone())],
-        );
-
-        // Negative control 1: forging another node's `node=` on `member_id`'s connection is rejected.
-        let mut forged = member_facts;
-        forged.node = Some(holder_id.node().to_owned());
-        let forged_payload =
-            forged.to_survey_reply(200, Some("m7.local"), 1_793_160_000_000, 0, false);
-        let err = push_facts_to_issuer(member_dir.path(), &secret, &forged_payload)
-            .expect_err("forged node id must be refused");
-        assert!(err.contains("ERR node-mismatch"), "{err}");
-
-        // Negative control 2: spoofing the listener's own `node_id` with a different Ed25519 key
-        // is rejected with `ERR key-mismatch` and never overwrites `holder_dir`'s own facts.
-        let spoof_holder =
-            NodeIdentity::from_seed(holder_id.node(), &[0x99; 32]).expect("spoof holder id");
-        let spoof_err = aterm_net::fleet_member::push_facts_to_peer(
-            "fixture-holder.local",
-            Some("127.0.0.1".parse().unwrap()),
-            port,
-            (&secret, Some(&spoof_holder)),
-            &forged_payload,
-            aterm_spec::wait::MUST_HAPPEN,
-        )
-        .expect_err("spoofed holder key must be refused");
-        assert!(spoof_err.contains("ERR key-mismatch"), "{spoof_err}");
-
-        stop.set();
-        let _ = server.join();
-
-        let stored = read_pushed_facts(holder_dir.path());
-        assert_eq!(stored.len(), 2);
-        assert!(
-            stored
-                .iter()
-                .any(|(n, p)| n == holder_id.node() && p == &holder_payload)
-        );
-        assert!(
-            stored
-                .iter()
-                .any(|(n, p)| n == member_id.node() && p == &member_payload)
-        );
-    }
-
-    /// A local `hold off` ends a remote hold whose node no grant here admits (or that this Mac
-    /// cannot be driven by at all) while no deny list was ever read, without waiting for one;
-    /// where the answer turns on the deny list, the hold stands while none was read, and a list
-    /// that names the node ends it; otherwise the dial judges.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with `holder_after` reading the deny list before it looks at
-    /// `ready` (the order the review found: an unread list stood every hold, even one no grant
-    /// admits), this fails (`left: Again(..), right: Gone("it may drive this Mac no more")`).
-    #[cfg(unix)]
-    #[test]
-    fn a_hold_off_ends_an_ungranted_remote_hold_before_any_deny_list_is_read() {
-        use crate::fabric::Holder;
-        let node = "9a".repeat(16);
-        let key = aterm_net::fleet::NodeKey::from_bytes([0xcd; 32]);
-        let unread = || None;
-        let dialed = |_| -> Holder { panic!("no dial where the deny list decides") };
-        assert_eq!(
-            holder_after(
-                &node,
-                Err("it may drive this Mac no more"),
-                |k| *k,
-                unread,
-                dialed
-            ),
-            Holder::Gone("it may drive this Mac no more".to_owned())
-        );
-        assert_eq!(
-            holder_after(&node, Ok(key), |k| *k, unread, dialed),
-            Holder::Again(DENY_LIST_UNREAD.to_owned())
-        );
-        let naming = || Some(Arc::from(vec![node.clone()]));
-        assert_eq!(
-            holder_after(&node, Ok(key), |k| *k, naming, dialed),
-            Holder::Gone("it is on the swarm roster's deny-list".to_owned())
-        );
-        assert_eq!(
-            holder_after(
-                &node,
-                Ok(key),
-                |k| *k,
-                || Some(Arc::from(Vec::new())),
-                |_| Holder::Drives
-            ),
-            Holder::Drives
-        );
-    }
-
-    /// A deny list that stays unread says why, once for each new cause and never again for the
-    /// same one (the read runs per dialer and per tick), and says so once more when a list is
-    /// read at last; a failed read after that keeps the list and records its new cause once.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` saying nothing while the
-    /// list is unread (the shape before: a standing cause looked like "try again", logged at
-    /// `debug!` where it was logged at all), this fails (`an unread list says why`).
-    #[cfg(unix)]
-    #[test]
-    fn an_unread_deny_list_says_why_once_for_each_cause() {
-        use aterm_secrets::client::{
-            SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why,
-        };
-
-        let mut cache = DeniedCache::new();
-        let failed = |why: &str| Err(aterm_secrets::Error::new(why.to_owned()));
-        let (denied, said) =
-            update_denied_nodes_cache(&mut cache, failed(".lock: owned by uid 0, not this user"));
-        assert!(denied.is_none());
-        let said = said.expect("an unread list says why");
-        assert!(
-            said.contains(DENY_LIST_UNREAD) && said.contains("owned by uid 0"),
-            "{said}"
-        );
-        assert_eq!(
-            update_denied_nodes_cache(&mut cache, failed(".lock: owned by uid 0, not this user")),
-            (None, None),
-            "the same cause is said once"
-        );
-        let said =
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy))).1;
-        assert!(
-            said.is_some_and(|said| said.contains(&Why::WriterBusy.to_string())),
-            "a new cause is said again"
-        );
-        let (denied, said) =
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())));
-        assert!(denied.is_some());
-        assert!(
-            said.is_some_and(|said| said.contains("admitted again")),
-            "a list read at last is said"
-        );
-        let (denied, said) = update_denied_nodes_cache(&mut cache, failed("transient"));
-        assert!(
-            denied.is_some(),
-            "a failed read retains the authoritative list"
-        );
-        assert!(
-            said.is_some_and(|said| said.contains("transient")),
-            "a new retained-list cause is recorded"
-        );
-        assert!(
-            update_denied_nodes_cache(&mut cache, failed("transient"))
-                .1
-                .is_none(),
-            "a repeated failure is quiet"
-        );
-        assert!(
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())))
-                .1
-                .is_some(),
-            "recovery is recorded once"
-        );
-        assert!(
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())))
-                .1
-                .is_none(),
-            "an unchanged current list is quiet"
-        );
-    }
-
-    /// No deny list until one was read, then the last one read through a mid-apply or failed
-    /// read, and an open drive cut once its node is denied.
-    ///
-    /// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` answering an empty list
-    /// while none was read (the shape before), the first read is a list (`assertion failed:
-    /// update_denied_nodes_cache(&mut cache, Ok(None)).is_none()`).
-    #[cfg(unix)]
-    #[test]
-    fn denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive() {
-        use aterm_secrets::client::{
-            SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why,
-        };
-
-        let _guard = OPEN_TEST_LOCK.lock_or_recover();
-        let mut cache = DeniedCache::new();
-        // Never read: a mid-apply read and a failed one leave no list, which the handshake reads
-        // as unread and refuses every dialer under, never as a list that names no one.
-        assert!(
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy)))
-                .0
-                .is_none()
-        );
-        let failed =
-            update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("wide"))).0;
-        assert!(failed.is_none());
-        assert!(denied_under(failed.as_deref(), None).unread);
-
-        let revoked_node = "9a".repeat(16);
-        let good_node = "9b".repeat(16);
-        let updated = update_denied_nodes_cache(
-            &mut cache,
-            Ok(Snapshot::Available(vec![revoked_node.clone()])),
-        )
-        .0
-        .expect("a list read now");
-        assert_eq!(&*updated, std::slice::from_ref(&revoked_node));
-        assert!(!denied_under(Some(&updated), None).unread);
-
-        // A transient lock or parse error retains the last authoritative deny-list.
-        assert_eq!(
-            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy)))
-                .0
-                .as_deref(),
-            Some(std::slice::from_ref(&revoked_node))
-        );
-        assert_eq!(
-            update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("transient")))
-                .0
-                .as_deref(),
-            Some(std::slice::from_ref(&revoked_node))
-        );
-
-        // Open drive for `revoked_node` is cut as soon as it enters `deny_nodes`, while `good_node`
-        // (negative control) remains open under `"*"`.
-        let grant_of = |node: &str, key_byte: u8| {
-            aterm_net::fleet::DriveGrant::from_word(&format!(
-                "{node}:{}",
-                format!("{key_byte:02x}").repeat(32)
-            ))
-            .expect("grant")
-        };
-        let revoked_grant = grant_of(&revoked_node, 0xcd);
-        let good_grant = grant_of(&good_node, 0xef);
-        let all = Serving {
-            scope: FleetScope::Content,
-            grants: vec![
-                aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-                    .expect("all"),
-            ],
-        };
-        let bound = |node: &str| {
-            if node == revoked_node {
-                Some(revoked_grant.key)
-            } else if node == good_node {
-                Some(good_grant.key)
-            } else {
-                None
-            }
-        };
-        let (near_revoked, _far_revoked) = aterm_uds::CtlStream::pair().expect("pair");
-        let (near_good, _far_good) = aterm_uds::CtlStream::pair().expect("pair");
-        let open_revoked = Opened::served_with_denied(
-            true,
-            Some(revoked_grant.clone()),
-            &near_revoked,
-            || all.clone(),
-            &held_by(bound),
-            &[],
-        )
-        .expect("io")
-        .expect("admitted before revocation");
-        let open_good = Opened::served_with_denied(
-            true,
-            Some(good_grant.clone()),
-            &near_good,
-            || all.clone(),
-            &held_by(bound),
-            &[],
-        )
-        .expect("io")
-        .expect("admitted good node");
-
-        let cut =
-            cut_unserved_with_denied(&all, &held_by(bound), std::slice::from_ref(&revoked_node));
-        assert_eq!(cut, 1, "only the denied node's open drive must be cut");
-        let still_open = |grant: &aterm_net::fleet::DriveGrant| {
-            OPEN.lock_or_recover()
-                .iter()
-                .any(|o| o.driver.as_ref() == Some(grant))
-        };
-        assert!(!still_open(&revoked_grant));
-        assert!(still_open(&good_grant));
-        drop((open_revoked, open_good));
-    }
-}
+#[path = "fleet_listen_tests.rs"]
+mod tests;
 
 #[cfg(unix)]
 #[path = "node_serve.rs"]

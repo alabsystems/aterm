@@ -16,8 +16,9 @@ use super::super::guard::row_guard;
 use super::tests::{row_of, with_focus};
 use super::*;
 
-const LONG: QuestionPriority = QuestionPriority::LongTerm;
-const SHORT: QuestionPriority = QuestionPriority::ShortTerm;
+const RECOMMENDED: QuestionPriority = QuestionPriority::Word(PriorityWord::Recommended);
+const LONG: QuestionPriority = QuestionPriority::Word(PriorityWord::LongTerm);
+const SHORT: QuestionPriority = QuestionPriority::Word(PriorityWord::ShortTerm);
 const LAND: QuestionPriority = QuestionPriority::Land;
 const COLS: u16 = 120;
 
@@ -177,7 +178,7 @@ fn the_policy_texts_keep_their_rules() {
         "no person sets Land's priority"
     );
     assert!(is_question_rule(LAND.rule_id()));
-    assert_eq!(QuestionPriority::Recommended.text(), None);
+    assert_eq!(RECOMMENDED.text(), None);
     for rule in [
         RULE_ALLOW_ONCE,
         RULE_PROSE_LONG_TERM,
@@ -927,7 +928,7 @@ fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_
 }
 
 fn assert_r10_is_the_recommended_paths(rows: &[String], p: QuestionPriority) {
-    let recommended = decided(rows, QuestionPriority::Recommended, None);
+    let recommended = decided(rows, RECOMMENDED, None);
     match (recommended, decided(rows, p, None)) {
         (
             Decision::Approve {
@@ -968,7 +969,7 @@ fn decide_answers_by_the_contexts_priority() {
         std::sync::Arc::new(crate::supervise::policy::LiveProbe),
     );
     assert!(ctx.answer_questions, "answered by default");
-    assert_eq!(ctx.question_priority, QuestionPriority::Recommended);
+    assert_eq!(ctx.question_priority, RECOMMENDED);
     assert_eq!(
         (
             ctx.question_own,
@@ -1165,7 +1166,7 @@ fn the_recommended_decisions_ignore_memory_and_pane_width() {
             answer_question(
                 p,
                 rows,
-                QuestionPriority::Recommended,
+                RECOMMENDED,
                 own,
                 (false, false),
                 Pane {
@@ -1853,7 +1854,7 @@ fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
         (
             "recommended",
             long_review.clone(),
-            QuestionPriority::Recommended,
+            RECOMMENDED,
             Some(LONG),
             "answers the supervisor did not give",
         ),
@@ -1929,7 +1930,7 @@ fn a_dialog_under_land_writes_the_land_text() {
             unproven.starts_with("policy land: the worker decides"),
             "{unproven}"
         );
-        let (what, rule, _, _) = did(&decided(&rows, QuestionPriority::Recommended, None));
+        let (what, rule, _, _) = did(&decided(&rows, RECOMMENDED, None));
         assert!(
             matches!(what, Did::Enter(_, AnswerTarget::Option(_))),
             "the control: {what:?}"
@@ -2051,14 +2052,7 @@ fn a_text_priority_escalates_nowhere_the_recommended_answer_is_taken() {
     let (mut cells, mut answered, mut person_held, mut latch_held) = (0, 0, 0, 0);
     for (name, rows, prompt) in question_captures() {
         for cols in [80u16, 120, 200] {
-            let recommended = decide(
-                &prompt,
-                &rows,
-                QuestionPriority::Recommended,
-                None,
-                false,
-                cols,
-            );
+            let recommended = decide(&prompt, &rows, RECOMMENDED, None, false, cols);
             if !approves(&recommended) {
                 continue;
             }

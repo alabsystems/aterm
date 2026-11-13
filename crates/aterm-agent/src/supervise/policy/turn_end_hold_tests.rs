@@ -388,8 +388,7 @@ fn the_hold_ends_at_a_landing_another_mode_and_off() {
         ..idle("You're welcome!", Some(Duration::from_secs(5)))
     });
     at(&mut st, &thanks, now + 5 * MIN);
-    // A person's message mid-landing is no exchange of theirs: Land carries the task on (owner
-    // ruling 2026-10-27).
+    // A person's message mid-landing is no exchange of theirs: Land carries the task on.
     assert_eq!(st.face(), TaskFace::Open);
     assert!(!st.left_to_person());
     assert!(

@@ -1889,7 +1889,7 @@ fn commons_custody(paths: &Paths) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
 }
 
 /// A member the current Commons epochs leave out of control is a member still: its log seats it
-/// (owner, 2026-11-02: membership is the log, Commons control governs application data), so it
+/// (membership is the log, Commons control governs application data), so it
 /// has a desk, under the anchor it pinned, and allows by its seat. A Mac on its home ALab LAN that
 /// proves itself to that desk is let in through the log, with nobody: the member's `Admit` and
 /// `[everyone]` `Wrap`s, the log bundle the new Mac writes, and the records the member posts, which

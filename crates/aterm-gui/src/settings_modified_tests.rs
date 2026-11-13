@@ -1591,7 +1591,7 @@ fn keep_tools_up_to_date_is_turned_on_over_the_retired_switch() {
 fn a_tried_style_saves_what_its_preview_shows_from_an_old_classic() {
     use aterm_effects::cursor_glow::GlowStyle;
     let drawn = |raw: &str, color: aterm_effects::cursor_fx::TrailColor| {
-        let presentation = crate::app_config::resolve_trail_presentation(raw);
+        let presentation = crate::app_config::resolve_trail_presentation(raw, "off");
         let style = presentation.style.style;
         let mono =
             style == Some(GlowStyle::Classic) && (presentation.classic_mono || color.chosen());

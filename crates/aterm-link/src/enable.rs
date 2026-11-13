@@ -6738,7 +6738,8 @@ pub const PERSON_HOLD_LIFT: &str = "the person at the window took it over (Take 
 /// What lifts another Mac's hold (`origin=remote`, the step-in).
 pub const REMOTE_HOLD_LIFT: &str = "another Mac holds it over the fleet: that Mac's `aterm ctl \
      --host <this Mac> hold <sid> off` lifts it, or the person here takes it with Take Over and \
-     hands it back, or runs `aterm fleet allow content` here; `aterm fleet peers rm <its node>` \
+     hands it back, or runs `aterm fleet allow content` here, or lowers its fleet access to Read \
+     Only (`aterm fleet access read`) here; `aterm fleet peers rm <its node>` \
      (the survey's `held_from=`) here also drops grants naming that node, but an all-member \
      grant can admit a valid signed entry merged back from another member's book";
 
@@ -7043,7 +7044,7 @@ fn running_bridge(instances: &[fabric::InstanceView], node: &str) -> Option<u32>
         .find(|i| {
             i.node.as_deref() == Some(node)
                 && i.reason.as_deref() != Some("state-locked")
-                && (!i.bridge_pids.is_empty()
+                && (i.bridge_pids.as_ref().is_some_and(|pids| !pids.is_empty())
                     || i.supervised == Some(true)
                     || matches!(i.fabric.as_deref(), Some("connected" | "stalled" | "stale")))
         })

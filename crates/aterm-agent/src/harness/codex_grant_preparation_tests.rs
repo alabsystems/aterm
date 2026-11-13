@@ -259,6 +259,7 @@ fn legacy_unfenced_partial_and_foreign_source_never_gain_repair_authority() {
                         reference: None,
                         facts: None,
                         response_digest: None,
+                        retirement: None,
                     })
                     .unwrap();
                 let mut anchor = CatalogueAnchorWriter::new(&store, &held, request, env.now);

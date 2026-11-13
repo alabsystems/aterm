@@ -72,16 +72,37 @@ fn summary(why: &str) -> String {
         .to_owned()
 }
 
-pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
+pub(super) fn run_args(root: &Path, args: &[String]) -> Result<(), String> {
+    let (head, since) = match args {
+        [head] => (head, None),
+        [head, flag, value] if flag == "--since" => (
+            head,
+            Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "--since requires Unix seconds")?,
+            ),
+        ),
+        _ => return Err("expected --census REF [--since UNIX_SECONDS]".into()),
+    };
     // Resolve once so a moving local ref cannot mix snapshots.
     let head = judged::git(
         root,
         &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
     )?;
-    let records = judged::records(root, Some(&head), judged::deadline())?;
+    let records = match since {
+        Some(since) => judged::history(root, &head, since)?,
+        None => judged::records(root, Some(&head), judged::deadline())?,
+    };
     let mut states = BTreeMap::<String, usize>::new();
     let mut causes = BTreeMap::<String, usize>::new();
     for record in &records {
+        if since.is_some() {
+            println!(
+                "attempt: {}",
+                aterm_json::to_string(record).map_err(|e| e.to_string())?
+            );
+        }
         *states.entry(record.state.clone()).or_default() += 1;
         if matches!(record.state.as_str(), "cancelled" | "could-not-run") {
             let why = cause(record);
@@ -99,7 +120,7 @@ pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
     let completed =
         states.get("pass").copied().unwrap_or(0) + states.get("red").copied().unwrap_or(0);
     println!(
-        "journal={head} trees={} completed={completed} states={states:?}",
+        "journal={head} records={} completed={completed} states={states:?} since={since:?}",
         records.len()
     );
     let mut ranked: Vec<_> = causes.into_iter().collect();
@@ -111,54 +132,5 @@ pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn bootstrap_stop_census_keeps_stage_and_environment_kind() {
-        let cause = |pid| {
-            format!(
-                "sample exit=75\nwatch bootstrap stopped: code=Some(75) kind=environment condition=refusal for {pid}"
-            )
-        };
-        assert_eq!(summary(&cause(41)), "watch bootstrap environment");
-        assert_eq!(summary(&cause(41)), summary(&cause(42)));
-        assert_eq!(
-            summary(
-                "sample exit=75\nwatch stage=tree stopped: code=Some(75) kind=run-stop condition=stopping"
-            ),
-            "watch stage=tree run-stop"
-        );
-    }
-
-    #[test]
-    fn preemption_census_ranks_conditions_across_distinct_senders() {
-        let ledger = |pid| {
-            format!(
-                "tree: metrics\ncapacity background preemption: signal=15 sender_pid={pid}; ledger observation failed: planted refusal\nverify: COULD NOT RUN — siblings unrun"
-            )
-        };
-        let release = "tree: metrics\ncapacity background preemption: signal=15 sender_pid=43; Release claim pid=44 what=ledger observation failed: test text\nverify: COULD NOT RUN — siblings unrun";
-        assert_eq!(summary(&ledger(41)), "capacity ledger observation failed");
-        assert_eq!(summary(&ledger(42)), summary(&ledger(41)));
-        assert_eq!(summary(release), "Release claim preemption");
-        assert_ne!(summary(release), summary(&ledger(41)));
-        assert_eq!(
-            summary(
-                "capacity background stopped before admission: ledger observation failed: planted; detail"
-            ),
-            "capacity ledger observation failed"
-        );
-        assert_eq!(
-            summary("tree: metrics\naterm-verify: the child was killed by signal 15"),
-            "child signal=15"
-        );
-    }
-
-    #[test]
-    fn named_cause_wins_and_historical_absence_is_not_attributed() {
-        let mut record: Record = aterm_toml::from_str("commit='c'\ntree='t'\nhost='h'\nverifier=''\ninputs=''\ntoken='k'\nstate='cancelled'\nstarted=0\nupdated=1\nlease_until=0\nrows=[]").unwrap();
-        assert!(cause(&record).starts_with("unknown"));
-        record.cause = "sample signal=15; sender unavailable".into();
-        assert_eq!(cause(&record), record.cause);
-    }
-}
+#[path = "watch_census_tests.rs"]
+mod tests;

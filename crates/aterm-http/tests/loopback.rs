@@ -173,20 +173,6 @@ impl Guard for Revocable {
 fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = aterm_uds::accept(
-            &listener,
-            aterm_uds::AcceptWait::Forever,
-            aterm_uds::AcceptedMode::Blocking,
-        ) {
-            let mut seen = Vec::new();
-            let _ = stream.read_to_end(&mut seen);
-            let _ = tx.send(seen);
-        } else {
-            let _ = tx.send(Vec::new());
-        }
-    });
 
     let guard = Arc::new(Revocable(AtomicBool::new(false)));
     let error = client()
@@ -197,14 +183,15 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
         .expect_err("revoked authority must fail the request");
     assert!(error.is_revoked(), "{error:?}");
 
-    let seen = rx
-        .recv_timeout(HANG_DETECTOR)
-        .expect("the stub reports what it read");
-    assert!(
-        !seen.windows(26).any(|w| w == b"SENSITIVE-TERMINAL-CONTEXT"),
-        "revoked request still leaked its body: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
+    // Pre-revoked authority refuses before opening a socket, so no peer can receive
+    // a header or body. Inspect the owned listener synchronously; no server thread waits.
+    let error = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Nonblocking,
+    )
+    .expect_err("a pre-revoked request must not connect");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
 }
 
 #[test]

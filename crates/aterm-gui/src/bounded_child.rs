@@ -151,6 +151,22 @@ pub(crate) fn run_bounded_observing(
     )
 }
 
+/// `program args` as a command this window runs of its own: stdin null, stdout and stderr
+/// captured, and without `ATERM_PARENT_SESSION_ID`. A window started from another aterm's tab
+/// inherits that tab's session id, but nothing it runs is run in that tab: the `aterm ctl --host`
+/// its menu runs (Take Over, Hand Back, Step In) would otherwise name that tab as the fleet
+/// drive's requester (`aterm_ctl::requester_here`, ATERM-KI-1109-3).
+fn owned_command(program: &Path, args: &[String]) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command(program);
+    command
+        .args(args)
+        .env_remove(aterm_types::domain::ENV_PARENT_SESSION_ID)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 fn run_with_readers(
     program: &Path,
     args: &[String],
@@ -161,12 +177,7 @@ fn run_with_readers(
 ) -> Result<Ran, String> {
     let stdout = reader("stdout", &mut start)?;
     let stderr = reader("stderr", &mut start)?;
-    let mut command = aterm_uds::spawnfd::command(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = owned_command(program, args);
     if cap.is_some() {
         command.tether();
     }
@@ -230,104 +241,5 @@ pub(crate) fn fence(text: &str) -> String {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_bounded_child_is_read_or_killed_at_its_cap() {
-        let scratch = aterm_tempfile::TempDir::new().expect("owned reader setup scratch");
-        let absent = scratch.path().join("not-a-program");
-        for cap in [Some(Duration::from_secs(60)), None] {
-            for refuse in [1, 2] {
-                let mut starts = Vec::new();
-                let refused = std::thread::scope(|scope| {
-                    let mut workers = Vec::new();
-                    let ran = run_with_readers(
-                        &absent,
-                        &[],
-                        cap,
-                        |which, work| {
-                            starts.push(which.to_string());
-                            if starts.len() == refuse {
-                                return Err(io::Error::other("injected reader refusal"));
-                            }
-                            workers.push(
-                                std::thread::Builder::new()
-                                    .name("bounded-reader-setup-control".to_string())
-                                    .spawn_scoped(scope, work)?,
-                            );
-                            Ok(())
-                        },
-                        Instant::now,
-                        || {},
-                    );
-                    for worker in workers {
-                        assert!(worker.join().is_ok(), "the cancelled idle reader ended");
-                    }
-                    ran
-                });
-                assert_eq!(starts, ["stdout", "stderr"][..refuse]);
-                assert!(
-                    refused.is_err_and(|e| e.contains("injected reader refusal")),
-                    "reader refusal, not the missing program's spawn"
-                );
-            }
-        }
-        let past = Instant::now();
-        let (finished, output) = sync_channel(1);
-        finished.send(b"ready".to_vec()).unwrap();
-        assert_eq!(collect(output, Some(past), "stdout").unwrap(), "ready");
-        let (held_open, output) = sync_channel(1);
-        assert!(collect(output, Some(past), "stderr").is_err());
-        drop(held_open);
-        let (finished, output) = sync_channel(1);
-        finished.send(b"uncut".to_vec()).unwrap();
-        assert_eq!(collect(output, None, "stdout").unwrap(), "uncut");
-
-        let ran = run_bounded(
-            Path::new("/bin/sh"),
-            &[
-                "-c".to_string(),
-                "echo out; echo err >&2; exit 3".to_string(),
-            ],
-            Some(Duration::from_secs(60)),
-        )
-        .expect("it answered");
-        assert_eq!(
-            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
-            (Some(3), "out\n", "err\n")
-        );
-        let uncut = run_bounded(
-            Path::new("/bin/sh"),
-            &[
-                "-c".to_string(),
-                "printf uncut; printf diagnostic >&2".to_string(),
-            ],
-            None,
-        )
-        .expect("the uncut command answered on its own");
-        assert_eq!(
-            (uncut.code, uncut.stdout.as_str(), uncut.stderr.as_str()),
-            (Some(0), "uncut", "diagnostic")
-        );
-        let started = Instant::now();
-        let hung = run_bounded(
-            Path::new("/bin/sleep"),
-            &["600".to_string()],
-            Some(Duration::from_millis(200)),
-        );
-        assert!(hung.is_err(), "{hung:?}");
-        assert!(
-            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-            "the cap ended it"
-        );
-        assert!(
-            run_bounded(
-                Path::new("/no/such/aterm"),
-                &[],
-                Some(Duration::from_secs(1))
-            )
-            .is_err()
-        );
-    }
-}
+#[path = "bounded_child_tests.rs"]
+mod tests;

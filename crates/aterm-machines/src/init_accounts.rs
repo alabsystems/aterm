@@ -6,7 +6,7 @@
 use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, User};
 use crate::plist::{self, Entries};
-use crate::port::{AccessibilityWalk, Cmd, RunFailed, System};
+use crate::port::{AccessibilityWalk, AutomationConsent, Cmd, RunFailed, SessionReach, System};
 use aterm_types::macos_setup::{Selection, Setting};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -78,37 +78,97 @@ impl Service {
 const POLL: Duration = Duration::from_millis(250);
 
 /// How long a run at a terminal waits for a person: to switch Accessibility on once macOS
-/// asked, and to click Sign Out by hand where it stays off.
+/// asked, to answer macOS's Automation question, and to click Sign Out by hand where
+/// Accessibility stays off. A run with no terminal waits for none of them.
 const PATIENCE: Duration = Duration::from_secs(2 * 60);
+
+/// How long System Events, started for macOS to answer whether it may be controlled
+/// ([`System::automation_consent`] reads nothing of a target that is not running), takes at most
+/// to be read.
+const SYSTEM_EVENTS_START: Duration = Duration::from_secs(5);
+
+/// System Events' bundle id, which `open -b` starts (a background app: nothing comes on screen).
+const SYSTEM_EVENTS: &str = "com.apple.systemevents";
 
 /// How long the clicks and the deregistration that follows them may take.
 const SIGN_OUT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Why the sign-out waits while another macOS dialog this process started is up.
-const DIALOG_UP: &str = "another macOS dialog is still up: answer it, and the next pass signs \
-                         out (`aterm init --sign-out`)";
+/// Why the sign-out clicked nothing while another macOS dialog or page this process started was
+/// up: its clicks never come up beside one. It is a wait that passes by itself ([`LOOKS_AGAIN`]):
+/// the worker looks again the moment that dialog ends, and on its own schedule.
+pub(crate) const DIALOG_UP: &str = "another macOS dialog or page of aterm's was up, so nothing was \
+                                   clicked; aterm looks again by itself";
 
-/// Why it waits for macOS's Automation permission to control System Events.
+/// Why it waits for macOS's Automation permission to control System Events, which the person
+/// (or a standing answer) refused: System Settings lists that switch.
 const AUTOMATION_OFF: &str = "macOS Automation permission to control System Events is off: \
                               switch it on in System Settings \u{25b8} Privacy & Security \
                               \u{25b8} Automation, then run `aterm init --sign-out`";
 
-/// Why a sign-out waits when nobody is at this Mac as its clicks are to start: the words end as
-/// the Accounts stage's do while it is parked for want of a person, which System State reads to
-/// look for their return ([`aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON`]).
-pub(crate) fn away() -> String {
+/// How the words of a sign-out that waits on what passes by itself end ([`looks_again`]): a
+/// locked screen, another login, the keys in use, or a macOS question nobody answered yet. It
+/// clicked nothing, counts no failed try, and its next pass looks again on its own schedule.
+const LOOKS_AGAIN: &str = "aterm looks again by itself";
+
+/// Why it waits while macOS has had no answer to its Automation question for System Events, or
+/// none aterm could read: no System Settings switch exists for it yet, so the words name none,
+/// and the window asks the question ([`aterm_types::macos_setup::StageRow::AUTOMATION_UNANSWERED`]).
+fn automation_unanswered(consent: AutomationConsent) -> String {
+    let what = if consent == AutomationConsent::Unanswered {
+        "macOS has had no answer yet to whether aterm may control System Events"
+    } else {
+        "macOS's answer to whether aterm may control System Events has not been read"
+    };
     format!(
-        "nobody is at this Mac now; signing out {}",
-        aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON
+        "{what}, which the sign-out's clicks go through; {}, and {LOOKS_AGAIN}",
+        aterm_types::macos_setup::StageRow::AUTOMATION_UNANSWERED
     )
 }
 
-/// Whether `row` is a sign-out that found nobody at this Mac right before its clicks
-/// ([`System::person_present`]): it clicked nothing, and waits for a person.
+/// Why a sign-out of `service` clicked nothing for `user`'s session (`why`,
+/// [`SessionReach::waits`]).
+fn session_wait(service: Service, why: &str) -> String {
+    format!(
+        "{why}, so nothing was clicked in {}: it signs out once this login's screen is unlocked \
+         with the keyboard and pointer at rest, and {LOOKS_AGAIN}",
+        service.name()
+    )
+}
+
+/// Why `user`'s session cannot take a sign-out's clicks now ([`System::session_reach`]), or
+/// `None`. At a person's own terminal the person who ran the command is there and asked for the
+/// clicks, so their own keys there hold nothing; a lock or another login still does. A coding
+/// agent's terminal is no person's: the keys in use are the person's, typing elsewhere, and the
+/// clicks wait for them to rest as an unattended run's do.
+fn session_waits(sys: &dyn System, user: &User) -> Option<&'static str> {
+    match sys.session_reach(user) {
+        SessionReach::KeysInUse if sys.has_tty() && sys.agent_ancestor().is_none() => None,
+        reach => reach.waits(),
+    }
+}
+
+/// Why a sign-out of `service` stands aside where the app macOS holds responsible for this run
+/// has no Accessibility, which its clicks need: System Settings lists that switch, and the
+/// grant's access-record line wakes the run once it is on.
+fn no_accessibility(sys: &dyn System, service: Service) -> aterm_converge::StoodAside {
+    aterm_converge::StoodAside::Permission(format!(
+        "{} has no Accessibility, which clicking {}'s Sign Out needs: switch it on in System \
+         Settings \u{25b8} Privacy & Security \u{25b8} Accessibility, then run `aterm init \
+         --sign-out`",
+        responsible(sys),
+        service.name()
+    ))
+}
+
+/// Whether `row` is a sign-out that stood aside on what passes by itself ([`LOOKS_AGAIN`]):
+/// its next try is a quiet look on a schedule of its own, never a failed try.
 #[must_use]
-pub fn found_nobody(row: &crate::model::ItemReport) -> bool {
+pub fn looks_again(row: &crate::model::ItemReport) -> bool {
     signs_out(&row.id)
-        && matches!(&row.stood_aside, Some(aterm_converge::StoodAside::Waiting(why)) if *why == away())
+        && matches!(
+            &row.stood_aside,
+            Some(aterm_converge::StoodAside::Waiting(why)) if why.ends_with(LOOKS_AGAIN)
+        )
 }
 
 /// The one Apple event that asks macOS's Automation question for System Events before any app
@@ -118,11 +178,11 @@ pub fn found_nobody(row: &crate::model::ItemReport) -> bool {
 const AUTOMATION_ASK: &str = "tell application id \"com.apple.systemevents\" to count processes";
 
 /// The run's Accessibility request and Automation answer, shared by its sign-out items: each is
-/// asked for once, and neither wait repeats for the second app.
+/// asked for (or read) once, and neither wait repeats for the second app.
 #[derive(Default)]
 struct Consent {
     asked: Mutex<bool>,
-    automation: Mutex<Option<bool>>,
+    automation: Mutex<Option<AutomationConsent>>,
 }
 
 struct SignOut {
@@ -239,24 +299,40 @@ impl Item for SignOut {
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.stand(None);
-        // macOS's Accessibility and Automation dialogs, and an app left open for the person's
-        // click, are each a dialog this process started: only one is up at a time (System
-        // State design §6), so the sign-out holds the one slot from its first question to its
-        // last click.
-        let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
-            aterm_types::macos_setup::DIALOG_WAIT,
-        ) else {
+        let tty = sys.has_tty();
+        // With no terminal nothing here asks macOS anything or opens an app for a person: the
+        // session, the Accessibility grant and macOS's Automation answer are only read, before
+        // the dialog slot, so a dialog of aterm's that is up (the window's own Automation
+        // question among them) never holds this worker; the slot is taken for the clicks alone.
+        if !tty {
+            if self.stands_for_the_session(sys) {
+                return Ok(());
+            }
+            if !accessibility_ready(sys)? {
+                self.stand(Some(no_accessibility(sys, self.service)));
+                return Ok(());
+            }
+            if self.stands_for_automation(sys)? {
+                return Ok(());
+            }
+        }
+        // macOS's Accessibility and Automation dialogs, an app left open for the person's
+        // click, and the clicks themselves each put something of this process's on screen:
+        // only one is up at a time (System State design §6). At a terminal the sign-out holds
+        // the one slot from its first question to its last click, waiting for it as the person
+        // there does; with none it takes the slot only if it is free, and a dialog up is a wait
+        // the worker looks at again the moment it ends ([`DIALOG_UP`]).
+        let Some(_dialog) = sys.macos_dialog(tty) else {
             self.stand(Some(aterm_converge::StoodAside::Waiting(DIALOG_UP.into())));
             return Ok(());
         };
-        if !self.accessible(sys)? {
-            return self.by_hand(sys);
-        }
-        if !self.automation(sys)? {
-            self.stand(Some(aterm_converge::StoodAside::Permission(
-                AUTOMATION_OFF.into(),
-            )));
-            return Ok(());
+        if tty {
+            if !self.accessible(sys)? {
+                return self.by_hand(sys);
+            }
+            if self.stands_for_automation(sys)? {
+                return Ok(());
+            }
         }
         let deadline = Instant::now() + SIGN_OUT_DEADLINE;
         let labels = localized_labels(sys, &self.user, self.service, Some(deadline))?;
@@ -264,24 +340,60 @@ impl Item for SignOut {
             signout_cmd(&self.user, self.service, &labels),
             Some(deadline),
         )?;
+        // The clicks take the front: only into this login's own screen, unlocked, with the
+        // person's keys and pointer at rest, so a click never lands in their work or behind the
+        // lock screen. Read right before them, and again after any wait for an update's handoff.
+        if self.stands_for_the_session(sys) {
+            return Ok(());
+        }
         // The admitted setup runs automatically. Keep the update boundary through the click
         // sequence, so an update cannot interrupt an operation that is unsafe to repeat.
         let ran = {
-            let _boundary = sys
-                .update_boundary()
-                .hold(
-                    aterm_types::update_boundary::GuardedItem::SignOutSequence,
-                    || Ok::<(), std::convert::Infallible>(()),
-                )
-                .unwrap_or_else(|never| match never {});
+            let held = sys.update_boundary().hold(
+                aterm_types::update_boundary::GuardedItem::SignOutSequence,
+                || session_waits(sys, &self.user).map_or(Ok(()), Err),
+            );
+            let _boundary = match held {
+                Ok(held) => held,
+                Err(why) => {
+                    self.stand(Some(aterm_converge::StoodAside::Waiting(session_wait(
+                        self.service,
+                        why,
+                    ))));
+                    return Ok(());
+                }
+            };
             sys.run_complete_stdout(&command)
         }
         .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
-        match ran.out().trim() {
-            "permission-blocked" if ran.success() => {
+        let outcome = ran.out();
+        let outcome = outcome.trim();
+        // A click the script could not make, or its app gone from the front, is the session's
+        // doing when the session no longer reads open (locked, switched away, the person's own
+        // keys): that waits, as a lock found before the clicks does, and is no failed try. Read
+        // open still, it is this try's own failure.
+        if !(ran.success()
+            && matches!(
+                outcome,
+                "automation-blocked" | "accessibility-blocked" | "sign-out-requested"
+            ))
+            && self.stands_for_the_session(sys)
+        {
+            return Ok(());
+        }
+        match outcome {
+            // macOS refused the Apple events (-1743): the Automation switch System Settings
+            // lists is off.
+            "automation-blocked" if ran.success() => {
                 self.stand(Some(aterm_converge::StoodAside::Permission(
                     AUTOMATION_OFF.into(),
                 )));
+                return Ok(());
+            }
+            // System Events refused the clicks for want of assistive access (-25211): that is
+            // Accessibility, whose switch, and whose grant's wake, are its own.
+            "accessibility-blocked" if ran.success() => {
+                self.stand(Some(no_accessibility(sys, self.service)));
                 return Ok(());
             }
             "not-frontmost" if ran.success() => {
@@ -313,6 +425,13 @@ impl Item for SignOut {
             .clone()
     }
 
+    /// A session that cannot take the clicks stands the sign-out aside before anything is
+    /// journaled or asked; [`Self::apply`] reads it again right before its clicks.
+    fn stands_aside(&self, sys: &dyn System, _ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
+        session_waits(sys, &self.user)
+            .map(|why| aterm_converge::StoodAside::Waiting(session_wait(self.service, why)))
+    }
+
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         self.reading.detail()
     }
@@ -321,6 +440,36 @@ impl Item for SignOut {
 impl SignOut {
     fn stand(&self, aside: Option<aterm_converge::StoodAside>) {
         *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = aside;
+    }
+
+    /// Whether this login's session cannot take the clicks now ([`session_waits`]): then the
+    /// sign-out stands aside, waiting, and looks again by itself ([`session_wait`]).
+    fn stands_for_the_session(&self, sys: &dyn System) -> bool {
+        let Some(why) = session_waits(sys, &self.user) else {
+            return false;
+        };
+        self.stand(Some(aterm_converge::StoodAside::Waiting(session_wait(
+            self.service,
+            why,
+        ))));
+        true
+    }
+
+    /// Whether macOS's Automation answer for System Events ([`Self::automation`]) keeps the
+    /// clicks from going: refused, the sign-out stands aside on the switch System Settings
+    /// lists; unanswered or unread, it waits, naming no switch, and looks again by itself.
+    fn stands_for_automation(&self, sys: &dyn System) -> Result<bool, String> {
+        let aside = match self.automation(sys)? {
+            AutomationConsent::Allowed => return Ok(false),
+            AutomationConsent::Refused => {
+                aterm_converge::StoodAside::Permission(AUTOMATION_OFF.into())
+            }
+            unanswered @ (AutomationConsent::Unanswered | AutomationConsent::Unread) => {
+                aterm_converge::StoodAside::Waiting(automation_unanswered(unanswered))
+            }
+        };
+        self.stand(Some(aside));
+        Ok(true)
     }
 
     /// Whether the app macOS holds responsible for this run holds Accessibility, which the
@@ -412,13 +561,7 @@ impl SignOut {
     /// deregisters. Otherwise, or once that wait ends, it stands aside naming the app the grant
     /// goes to.
     fn by_hand(&self, sys: &dyn System) -> Result<(), String> {
-        let refused = aterm_converge::StoodAside::Permission(format!(
-            "{} has no Accessibility, which clicking {}'s Sign Out needs: switch it on in System \
-             Settings \u{25b8} Privacy & Security \u{25b8} Accessibility, then run `aterm init \
-             --sign-out`",
-            responsible(sys),
-            self.service.name()
-        ));
+        let refused = no_accessibility(sys, self.service);
         if !sys.has_tty() {
             self.stand(Some(refused));
             return Ok(());
@@ -444,9 +587,13 @@ impl SignOut {
         Ok(())
     }
 
-    /// Ask macOS's Automation question for System Events once for both sign-outs, before any app
-    /// opens: `false` when the person (or a standing answer) refused it or its wait timed out.
-    fn automation(&self, sys: &dyn System) -> Result<bool, String> {
+    /// macOS's Automation answer for System Events, read once for both sign-outs before any app
+    /// opens and without asking ([`System::automation_consent`]); System Events, a background app,
+    /// is started first where it is not running, since macOS reads nothing of a target that is
+    /// not. Only a run at a terminal asks macOS's question itself, where neither answer is on
+    /// record, and waits up to [`PATIENCE`] for the person there: a question nobody answered in
+    /// that time is still [`AutomationConsent::Unanswered`], never a refusal.
+    fn automation(&self, sys: &dyn System) -> Result<AutomationConsent, String> {
         let mut answer = self
             .consent
             .automation
@@ -455,6 +602,36 @@ impl SignOut {
         if let Some(answer) = *answer {
             return Ok(answer);
         }
+        let mut read = sys.automation_consent();
+        if read == AutomationConsent::Unread {
+            let start = Cmd::new(OPEN)
+                .args(["-g", "-j", "-b", SYSTEM_EVENTS])
+                .as_user(&self.user)
+                .in_session();
+            if sys.run(&start).is_ok_and(|ran| ran.success()) {
+                for _ in 0..ticks(SYSTEM_EVENTS_START) {
+                    sys.sleep(POLL);
+                    read = sys.automation_consent();
+                    if read != AutomationConsent::Unread {
+                        break;
+                    }
+                }
+            }
+        }
+        if matches!(
+            read,
+            AutomationConsent::Unanswered | AutomationConsent::Unread
+        ) && sys.has_tty()
+        {
+            read = self.ask_automation(sys)?;
+        }
+        *answer = Some(read);
+        Ok(read)
+    }
+
+    /// Ask macOS's Automation question for System Events at a terminal, waiting up to
+    /// [`PATIENCE`] for the person's answer.
+    fn ask_automation(&self, sys: &dyn System) -> Result<AutomationConsent, String> {
         say(&format!(
             "signing out of {} clicks its Sign Out through System Events: allow {} in macOS's \
              Automation dialog (System Settings \u{25b8} Privacy & Security \u{25b8} Automation), \
@@ -467,24 +644,20 @@ impl SignOut {
             .as_user(&self.user)
             .in_session()
             .budget(PATIENCE);
-        let allowed = match sys.run(&ask) {
-            Ok(ran) if ran.success() => true,
-            Ok(ran) if ran.err().contains("-1743") => false,
-            Ok(ran) => {
-                return Err(format!(
-                    "the Automation question for System Events did not answer: {}",
-                    ran.describe()
-                ));
-            }
-            Err(RunFailed::TimedOut(_)) => false,
-            Err(why) => {
-                return Err(format!(
-                    "could not ask for Automation permission to control System Events: {why}"
-                ));
-            }
-        };
-        *answer = Some(allowed);
-        Ok(allowed)
+        match sys.run(&ask) {
+            Ok(ran) if ran.success() => Ok(AutomationConsent::Allowed),
+            Ok(ran) if ran.err().contains("-1743") => Ok(AutomationConsent::Refused),
+            // osascript's own Apple-event timeout, or the run's: nobody answered in time.
+            Ok(ran) if ran.err().contains("-1712") => Ok(AutomationConsent::Unanswered),
+            Err(RunFailed::TimedOut(_)) => Ok(AutomationConsent::Unanswered),
+            Ok(ran) => Err(format!(
+                "the Automation question for System Events did not answer: {}",
+                ran.describe()
+            )),
+            Err(why) => Err(format!(
+                "could not ask for Automation permission to control System Events: {why}"
+            )),
+        }
     }
 
     /// Whether the account deregistered within `patience`, read every [`POLL`] in this process;
@@ -897,7 +1070,8 @@ on run argv
     on error errorText number errorNumber
         my closeOwnedSettings(appName, settingsWindow, closeSettings)
         my restoreApplications(appName, wasRunning, priorApp)
-        if errorNumber is -1743 or errorNumber is -25211 then return "permission-blocked"
+        if errorNumber is -1743 then return "automation-blocked"
+        if errorNumber is -25211 then return "accessibility-blocked"
         if errorNumber is 1001 then return "not-frontmost"
         error errorText
     end try
@@ -1003,675 +1177,5 @@ on closeOwnedSettings(appName, settingsWindow, closeSettings)
 end closeOwnedSettings"#;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::{self, NoJournal};
-    use crate::items::defaults::tests::{ctx, user};
-    use crate::model::{Mode, Outcome};
-    use crate::port::{Fake, Ran};
-
-    fn fixture() -> (Fake, Ctx, SignOut) {
-        let user = user("alice", 501);
-        let mut ctx = ctx(std::slice::from_ref(&user));
-        ctx.console = Some(user.clone());
-        ctx.disrupt = true;
-        let item = SignOut {
-            service: Service::Messages,
-            user,
-            blocked: Mutex::new(None),
-            reading: crate::init_observe::LastReading::default(),
-            consent: std::sync::Arc::default(),
-        };
-        let mut sys = Fake::root();
-        sys.responsible = Some("aterm".into());
-        (sys, ctx, item)
-    }
-
-    /// The runs a sign-out makes once Accessibility is on: the Automation question, the
-    /// labels, and the clicks answering `clicked`.
-    fn clicks(sys: &Fake, item: &SignOut, clicked: &str) {
-        sys.on(&automation_ask(item).display(), Ran::ok("System Events"));
-        let labels = Labels {
-            panes: vec!["iMessage".into()],
-            sign_out: vec!["Sign Out".into()],
-        };
-        sys.on(
-            &labels_cmd(&item.user, item.service).display(),
-            Ran::ok(r#"{"panes":["iMessage"],"sign_out":["Sign Out"]}"#),
-        );
-        sys.on(
-            &signout_cmd(&item.user, item.service, &labels).display(),
-            Ran::ok(clicked),
-        );
-    }
-
-    fn automation_ask(item: &SignOut) -> Cmd {
-        Cmd::new(OSASCRIPT)
-            .args(["-e", AUTOMATION_ASK])
-            .as_user(&item.user)
-            .in_session()
-            .budget(PATIENCE)
-    }
-
-    /// Signed in for the first `reads` readings of the account, signed out after.
-    fn signed_in_for(sys: &Fake, item: &SignOut, reads: usize) {
-        for _ in 0..reads {
-            store(sys, item, DISABLED);
-        }
-        store(sys, item, "<dict/>");
-        prefs(sys, item, EMPTY_PREFS);
-    }
-
-    fn count(sys: &Fake, call: &str) -> usize {
-        sys.calls().iter().filter(|c| c.as_str() == call).count()
-    }
-
-    fn prefs(sys: &Fake, item: &SignOut, body: &str) {
-        let cmd = Cmd::new("/usr/bin/defaults")
-            .args(["export", item.service.domain(), "-"])
-            .as_user(&item.user);
-        sys.on(&cmd.display(), Ran::ok(body));
-    }
-
-    fn store(sys: &Fake, item: &SignOut, xml: &str) {
-        let path = store_path(&item.user);
-        sys.file(
-            path.to_str().unwrap(),
-            b"\x1f\x8bcompressed account fixture",
-        );
-        let gzip = Cmd::new(GZIP)
-            .args(["-dc", "--"])
-            .arg(path)
-            .as_user(&item.user);
-        sys.on(&gzip.display(), Ran::ok("binary account fixture"));
-        let convert = Cmd::new(PLUTIL)
-            .args(["-convert", "xml1", "-o", "-", "--", "-"])
-            .as_user(&item.user);
-        sys.on(&convert.display(), Ran::ok(xml));
-    }
-
-    fn uncompressed_store(sys: &Fake, item: &SignOut, xml: &str) {
-        let path = store_path(&item.user);
-        sys.file(path.to_str().unwrap(), b"bplist00account fixture");
-        let convert = Cmd::new(PLUTIL)
-            .args(["-convert", "xml1", "-o", "-", "--"])
-            .arg(path)
-            .as_user(&item.user);
-        sys.on(&convert.display(), Ran::ok(xml));
-    }
-
-    const EMPTY_PREFS: &str =
-        "<dict><key>ActiveAccounts</key><array/><key>OnlineAccounts</key><array/></dict>";
-    const DISABLED: &str = "<dict><key>com.apple.ids.service.com.apple.madrid</key><dict><key>Accounts</key><dict><key>private-account-id</key><dict><key>AuthToken</key><string>private-token</string></dict></dict><key>EnabledAccounts</key><array/></dict></dict>";
-
-    #[test]
-    fn disabled_and_disconnected_still_requires_durable_signout() {
-        let (sys, ctx, item) = fixture();
-        store(&sys, &item, DISABLED);
-        prefs(&sys, &item, EMPTY_PREFS);
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
-        let printed = format!("{:?}", item.probe(&sys, &ctx));
-        assert!(!printed.contains("private-account-id"));
-        assert!(!printed.contains("private-token"));
-        // System State reads it as signed in, from the probe, not the printed line.
-        assert_eq!(
-            item.detail(&sys, &ctx),
-            Some(crate::init_observe::Reading::SignedIn.token())
-        );
-    }
-
-    #[test]
-    fn absent_registrations_do_not_open_apps_or_request_permissions() {
-        let (sys, ctx, item) = fixture();
-        store(&sys, &item, "<dict/>");
-        prefs(&sys, &item, EMPTY_PREFS);
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
-        assert!(sys.calls().iter().all(|c| !c.contains("osascript")));
-        assert_eq!(item.detail(&sys, &ctx), None);
-    }
-
-    #[test]
-    fn an_uncompressed_account_store_reads_signed_out_without_decompression() {
-        let (sys, ctx, item) = fixture();
-        uncompressed_store(&sys, &item, "<dict/>");
-        prefs(&sys, &item, EMPTY_PREFS);
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
-        assert!(sys.calls().iter().all(|call| !call.contains(GZIP)));
-        assert_eq!(item.detail(&sys, &ctx), None);
-    }
-
-    #[test]
-    fn an_uncompressed_account_store_still_detects_a_registered_account() {
-        let (sys, ctx, item) = fixture();
-        uncompressed_store(&sys, &item, DISABLED);
-        prefs(&sys, &item, EMPTY_PREFS);
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
-        assert_eq!(
-            item.detail(&sys, &ctx),
-            Some(crate::init_observe::Reading::SignedIn.token())
-        );
-    }
-
-    #[test]
-    fn a_malformed_uncompressed_account_store_is_never_reported_signedout() {
-        let (sys, ctx, item) = fixture();
-        let path = store_path(&item.user);
-        sys.file(path.to_str().unwrap(), b"bplist00malformed account fixture");
-        let convert = Cmd::new(PLUTIL)
-            .args(["-convert", "xml1", "-o", "-", "--"])
-            .arg(path)
-            .as_user(&item.user);
-        sys.on(&convert.display(), Ran::exit(1, "invalid property list"));
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
-    }
-
-    #[test]
-    fn unreadable_or_truncated_account_store_is_never_reported_signedout() {
-        let (sys, ctx, item) = fixture();
-        let path = store_path(&item.user);
-        sys.stat_fails(path.to_str().unwrap(), io::ErrorKind::PermissionDenied);
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
-        let (sys, ctx, item) = fixture();
-        store(&sys, &item, "<dict/>");
-        prefs(&sys, &item, EMPTY_PREFS);
-        let gzip = Cmd::new(GZIP)
-            .args(["-dc", "--"])
-            .arg(store_path(&item.user))
-            .as_user(&item.user);
-        sys.refuse_complete_stdout(&gzip.display(), "record exceeded limit");
-        assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
-    }
-
-    /// The sign-out clicks are not repeated safely, so they hold the update boundary while
-    /// they run (init-on-by-default design §6.7): an update's handoff waits for them, boundedly.
-    /// Before, nothing held the guard, and a handoff could cut the clicks in half.
-    #[test]
-    fn the_sign_out_clicks_hold_the_update_boundary() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 1);
-        let labels = Labels {
-            panes: vec!["iMessage".into()],
-            sign_out: vec!["Sign Out".into()],
-        };
-        let clicking = signout_cmd(&item.user, item.service, &labels).display();
-        let held = std::sync::Arc::new(AtomicBool::new(false));
-        let seen = std::sync::Arc::clone(&held);
-        sys.simulate(move |sys, cmd| {
-            if cmd.display() == clicking {
-                seen.store(
-                    sys.boundary
-                        .is_held(aterm_types::update_boundary::GuardedItem::SignOutSequence),
-                    Ordering::SeqCst,
-                );
-            }
-            None
-        });
-        item.apply(&sys, &ctx).expect("signed out");
-        assert!(
-            held.load(Ordering::SeqCst),
-            "the clicks ran under the guard: {:?}",
-            sys.calls()
-        );
-    }
-
-    /// The clicks of a sign-out ready to click (Accessibility on, Automation answered, the
-    /// labels read), as [`signout_cmd`] runs them.
-    fn clicking(item: &SignOut) -> String {
-        let labels = Labels {
-            panes: vec!["iMessage".into()],
-            sign_out: vec!["Sign Out".into()],
-        };
-        signout_cmd(&item.user, item.service, &labels).display()
-    }
-
-    /// Run `item`'s apply on a worker while an update's handoff is pending on this thread, and
-    /// once the clicks wait for it, call `meanwhile` (minutes passing) and refuse the handoff.
-    fn apply_behind_a_handoff(
-        sys: &Fake,
-        ctx: &Ctx,
-        item: &SignOut,
-        meanwhile: impl FnOnce(),
-    ) -> Result<(), String> {
-        let latch = sys.boundary.latch_handoff(Duration::from_secs(60));
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| item.apply(sys, ctx));
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while sys.boundary.waiting() == 0 {
-                assert!(Instant::now() < deadline, "the sign-out never waited");
-                aterm_uds::deadline::poll_yield();
-            }
-            assert_eq!(
-                count(sys, &clicking(item)),
-                0,
-                "nothing clicks while the handoff is pending"
-            );
-            meanwhile();
-            drop(latch);
-            worker.join().unwrap()
-        })
-    }
-
-    /// A sign-out is a person stage (init-on-by-default design §6.4): its clicks wait for a
-    /// pending update handoff (§6.7), up to minutes, and once that handoff is refused it reads
-    /// presence again before it clicks. The person walked away meanwhile: nothing is clicked,
-    /// and the sign-out stands aside, calmly, in the words the page looks for the person's
-    /// return by. Before, it clicked at once on the presence its stage read before the wait.
-    #[test]
-    fn an_admitted_sign_out_continues_after_a_handoff_without_a_presence_gate() {
-        use std::sync::atomic::Ordering;
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 1);
-        apply_behind_a_handoff(&sys, &ctx, &item, || {
-            sys.away.store(true, Ordering::SeqCst);
-        })
-        .expect("standing aside is no failure");
-        assert_eq!(
-            count(&sys, &clicking(&item)),
-            1,
-            "the admitted sign-out continues after the handoff: {:?}",
-            sys.calls()
-        );
-        assert_eq!(item.stood_aside(), None);
-        assert_eq!(sys.boundary.any_held(), None, "it took no guard");
-        // CONTROL: the person stays, and the clicks go once the handoff is refused.
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 1);
-        apply_behind_a_handoff(&sys, &ctx, &item, || {}).expect("signed out");
-        assert_eq!(count(&sys, &clicking(&item)), 1, "{:?}", sys.calls());
-        assert_eq!(item.stood_aside(), None);
-    }
-
-    /// Each sign-out reads presence itself, right before its own clicks, Messages and FaceTime
-    /// alike: the person who was there for Messages' minute of clicks and walked away before
-    /// FaceTime's gets no FaceTime clicks. Before, the Accounts stage read presence once for
-    /// both.
-    #[test]
-    fn each_admitted_sign_out_runs_even_after_the_person_walks_away() {
-        use std::sync::atomic::Ordering;
-        let (sys, ctx, messages) = fixture();
-        let facetime = SignOut {
-            service: Service::FaceTime,
-            user: messages.user.clone(),
-            blocked: Mutex::new(None),
-            reading: crate::init_observe::LastReading::default(),
-            consent: std::sync::Arc::clone(&messages.consent),
-        };
-        sys.trusts(&[true]);
-        clicks(&sys, &messages, "sign-out-requested");
-        clicks(&sys, &facetime, "sign-out-requested");
-        signed_in_for(&sys, &messages, 1);
-        messages.apply(&sys, &ctx).expect("Messages signed out");
-        assert_eq!(count(&sys, &clicking(&messages)), 1, "{:?}", sys.calls());
-        // The person walks away during Messages' clicks.
-        sys.away.store(true, Ordering::SeqCst);
-        signed_in_for(&sys, &facetime, 1);
-        facetime
-            .apply(&sys, &ctx)
-            .expect("standing aside is no failure");
-        assert_eq!(
-            count(&sys, &clicking(&facetime)),
-            1,
-            "FaceTime completes its admitted setup: {:?}",
-            sys.calls()
-        );
-        assert_eq!(facetime.stood_aside(), None);
-    }
-
-    /// Away from a terminal (System State, which asks for Accessibility itself) a sign-out
-    /// without it asks nothing, opens nothing and waits for nothing: it stands aside naming the
-    /// app the grant goes to.
-    #[test]
-    fn permission_refusal_does_not_launch_an_account_app() {
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[false]);
-        item.apply(&sys, &ctx)
-            .expect("permission block is a structured outcome");
-        let Some(aterm_converge::StoodAside::Permission(why)) = item.stood_aside() else {
-            panic!("{:?}", item.stood_aside());
-        };
-        assert!(why.starts_with("aterm has no Accessibility"), "{why}");
-        assert_eq!(sys.calls(), ["ax-trusted"]);
-    }
-
-    /// At a terminal, macOS is asked once and the trust read every 250 ms in this process: the
-    /// moment it flips the sign-out goes on in the same run, with no exit 77, no `sleep` child
-    /// and no keystroke; the deregistration that follows is read in this process too.
-    #[test]
-    fn trust_that_flips_while_init_waits_signs_out_in_the_same_run() {
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.trusts(&[false, false, false, false, true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 2);
-        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
-        assert_eq!(rows[0].stood_aside, None);
-        assert_eq!(count(&sys, "ax-request"), 1);
-        assert_eq!(count(&sys, "sleep 250ms"), 3 + 1, "{:?}", sys.calls());
-        let calls = sys.calls();
-        assert!(
-            calls
-                .iter()
-                .all(|c| !c.contains("/bin/sleep") && !c.contains("keystroke")),
-            "{calls:?}"
-        );
-        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
-        assert!(at("ax-request") < at(AUTOMATION_ASK) && at(AUTOMATION_ASK) < at("Sign Out"));
-    }
-
-    /// In the aterm window that runs it, the run's Accessibility ask goes to the window's
-    /// permission walk: macOS's own dialog is not asked for, and the grant is read every 250 ms
-    /// until it flips. NEGATIVE CONTROL: with no window to walk it, macOS is asked.
-    #[test]
-    fn the_aterm_window_walks_the_runs_accessibility_ask() {
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.walks = AccessibilityWalk::Taken;
-        sys.trusts(&[false, false, false, true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 2);
-        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
-        assert_eq!(count(&sys, "ax-walk"), 1);
-        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
-        let calls = sys.calls();
-        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
-        assert!(at("ax-walk") < at(AUTOMATION_ASK) && at(AUTOMATION_ASK) < at("Sign Out"));
-
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.trusts(&[false, true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 2);
-        let _ = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
-        assert_eq!((count(&sys, "ax-walk"), count(&sys, "ax-request")), (1, 1));
-    }
-
-    /// The window's answer holds macOS's own dialog back. The owner's Not now on the walk's
-    /// Accessibility page asks nothing: the app comes forward for the person's own Sign Out
-    /// click, which the run reads. A walk showing other pages gets no dialog beside them: the
-    /// run reads the grant until it flips and signs out. NEGATIVE CONTROL: with no window to
-    /// walk it, macOS is asked (`the_aterm_window_walks_the_runs_accessibility_ask`).
-    #[test]
-    fn a_not_now_on_the_walks_page_or_a_walk_of_other_pages_raises_no_macos_dialog() {
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.walks = AccessibilityWalk::NotNow;
-        sys.trusts(&[false]);
-        let open = Cmd::new(OPEN)
-            .args(["-b", "com.apple.MobileSMS"])
-            .as_user(&item.user)
-            .in_session();
-        sys.on(&open.display(), Ran::ok(""));
-        signed_in_for(&sys, &item, 3);
-        item.apply(&sys, &ctx).unwrap();
-        assert_eq!(item.stood_aside(), None, "signed out by the person's click");
-        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
-        assert_eq!(count(&sys, &open.display()), 1, "the app came forward");
-        assert!(sys.calls().iter().all(|c| !c.contains(AUTOMATION_ASK)));
-
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.walks = AccessibilityWalk::OtherPages;
-        sys.trusts(&[false, false, false, true]);
-        clicks(&sys, &item, "sign-out-requested");
-        signed_in_for(&sys, &item, 2);
-        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
-        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
-    }
-
-    /// Trust that never flips: after two minutes of reads (480, every 250 ms), the app comes
-    /// forward for the person's own Sign Out click, read for two minutes more; still signed in,
-    /// the row stands aside naming the app. The run's other sign-out neither asks nor waits for
-    /// Accessibility again.
-    #[test]
-    fn trust_that_never_flips_asks_for_the_click_then_names_the_app() {
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.responsible = Some("Terminal".into());
-        sys.trusts(&[false]);
-        let open = Cmd::new(OPEN)
-            .args(["-b", "com.apple.MobileSMS"])
-            .as_user(&item.user)
-            .in_session();
-        sys.on(&open.display(), Ran::ok(""));
-        store(&sys, &item, DISABLED);
-        prefs(&sys, &item, EMPTY_PREFS);
-        item.apply(&sys, &ctx).unwrap();
-        let Some(aterm_converge::StoodAside::Permission(why)) = item.stood_aside() else {
-            panic!("{:?}", item.stood_aside());
-        };
-        assert!(why.starts_with("Terminal has no Accessibility"), "{why}");
-        assert!(why.contains("`aterm init --sign-out`"), "{why}");
-        assert_eq!(count(&sys, "ax-request"), 1);
-        assert_eq!(count(&sys, &open.display()), 1);
-        assert_eq!(count(&sys, "sleep 250ms"), 480 + 480);
-        assert!(sys.calls().iter().all(|c| !c.contains(AUTOMATION_ASK)));
-
-        let other = SignOut {
-            service: Service::FaceTime,
-            user: item.user.clone(),
-            blocked: Mutex::new(None),
-            reading: crate::init_observe::LastReading::default(),
-            consent: std::sync::Arc::clone(&item.consent),
-        };
-        let facetime = Cmd::new(OPEN)
-            .args(["-b", "com.apple.FaceTime"])
-            .as_user(&item.user)
-            .in_session();
-        sys.on(&facetime.display(), Ran::ok(""));
-        sys.on(
-            &Cmd::new("/usr/bin/defaults")
-                .args(["export", Service::FaceTime.domain(), "-"])
-                .as_user(&item.user)
-                .display(),
-            Ran::ok("<dict><key>ActiveAccounts</key><array><string>a</string></array></dict>"),
-        );
-        let before = count(&sys, "sleep 250ms");
-        other.apply(&sys, &ctx).unwrap();
-        assert_eq!(count(&sys, "ax-request"), 1, "asked once for the run");
-        assert_eq!(
-            count(&sys, "sleep 250ms") - before,
-            480,
-            "the click's wait alone"
-        );
-
-        // The person clicks Sign Out by hand: the run goes on, signed out.
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.trusts(&[false]);
-        sys.on(&open.display(), Ran::ok(""));
-        signed_in_for(&sys, &item, 3);
-        item.apply(&sys, &ctx).unwrap();
-        assert_eq!(item.stood_aside(), None);
-    }
-
-    /// The app left the front before a click: the script clicks nothing more and the row fails
-    /// without reading for a deregistration it did not ask for.
-    #[test]
-    fn an_app_that_leaves_the_front_ends_the_clicks() {
-        let (mut sys, ctx, item) = fixture();
-        sys.tty = true;
-        sys.trusts(&[true]);
-        clicks(&sys, &item, "not-frontmost");
-        let why = item.apply(&sys, &ctx).unwrap_err();
-        assert!(why.starts_with("Messages left the front"), "{why}");
-        assert!(
-            sys.calls().iter().all(|c| !c.contains("defaults")),
-            "{:?}",
-            sys.calls()
-        );
-    }
-
-    /// A refused Automation question stands aside before any app opens.
-    #[test]
-    fn a_refused_automation_question_opens_no_app() {
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        sys.on(
-            &automation_ask(&item).display(),
-            Ran::exit(
-                1,
-                "execution error: Not authorized to send Apple events to System Events. (-1743)",
-            ),
-        );
-        item.apply(&sys, &ctx).unwrap();
-        assert_eq!(
-            item.stood_aside(),
-            Some(aterm_converge::StoodAside::Permission(
-                AUTOMATION_OFF.into()
-            ))
-        );
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|c| !c.contains("Sign Out") && !c.contains(OPEN))
-        );
-    }
-
-    /// An unanswered Automation question is a permission block, not a generic failure, and the
-    /// second sign-out does not repeat its two-minute wait.
-    #[test]
-    fn an_automation_timeout_is_shared_by_both_sign_outs() {
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        sys.time_out(&automation_ask(&item).display());
-        item.apply(&sys, &ctx).unwrap();
-        assert_eq!(
-            item.stood_aside(),
-            Some(aterm_converge::StoodAside::Permission(
-                AUTOMATION_OFF.into()
-            ))
-        );
-        let other = SignOut {
-            service: Service::FaceTime,
-            user: item.user.clone(),
-            blocked: Mutex::new(None),
-            reading: crate::init_observe::LastReading::default(),
-            consent: std::sync::Arc::clone(&item.consent),
-        };
-        other.apply(&sys, &ctx).unwrap();
-        assert_eq!(
-            other.stood_aside(),
-            Some(aterm_converge::StoodAside::Permission(
-                AUTOMATION_OFF.into()
-            ))
-        );
-        assert_eq!(
-            count(&sys, &automation_ask(&item).display()),
-            1,
-            "{:?}",
-            sys.calls()
-        );
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|c| !c.contains("Sign Out") && !c.contains(OPEN))
-        );
-    }
-
-    #[test]
-    fn a_consent_request_is_answered_in_this_process() {
-        for (readings, expected) in [
-            (Some(false), Some(false)),
-            (Some(true), Some(true)),
-            (None, None),
-        ] {
-            let sys = Fake::root();
-            if let Some(trusted) = readings {
-                sys.trusts(&[trusted]);
-            }
-            assert_eq!(request_accessibility(&sys).ok(), expected);
-            assert_eq!(sys.calls(), ["ax-request"]);
-        }
-    }
-
-    #[test]
-    fn unsupported_localized_labels_refuse_before_launching_the_app() {
-        let (sys, ctx, item) = fixture();
-        sys.trusts(&[true]);
-        sys.on(&automation_ask(&item).display(), Ran::ok("System Events"));
-        sys.on(
-            &labels_cmd(&item.user, item.service).display(),
-            Ran::ok(r#"{"panes":[],"sign_out":[]}"#),
-        );
-        assert!(item.apply(&sys, &ctx).is_err());
-        assert_eq!(sys.calls().len(), 3, "{:?}", sys.calls());
-        assert!(sys.calls().iter().all(|c| !c.contains("keystroke")));
-    }
-
-    #[test]
-    fn an_expired_shared_deadline_refuses_before_running_another_child() {
-        let (sys, _ctx, item) = fixture();
-        let expired = Instant::now() - Duration::from_secs(60);
-        assert!(localized_labels(&sys, &item.user, item.service, Some(expired)).is_err());
-        assert!(sys.calls().is_empty());
-    }
-
-    #[test]
-    fn ui_exit_success_requires_removal_and_readback() {
-        for removed in [false, true] {
-            let (sys, ctx, item) = fixture();
-            sys.trusts(&[true]);
-            clicks(&sys, &item, "sign-out-requested");
-            if removed {
-                signed_in_for(&sys, &item, 2);
-            } else {
-                store(&sys, &item, DISABLED);
-                prefs(&sys, &item, EMPTY_PREFS);
-            }
-            let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
-            assert_eq!(
-                rows[0].outcome,
-                if removed {
-                    Outcome::Changed
-                } else {
-                    Outcome::Failed
-                }
-            );
-            assert!(sys.calls().iter().all(|c| !c.contains("private-token")));
-            assert!(sys.calls().iter().all(|c| !c.contains("/bin/sleep")));
-        }
-    }
-
-    #[test]
-    fn sign_out_applescript_walks_ui_elements_and_matches_catalyst_descriptions() {
-        assert!(
-            !SIGN_OUT.contains("entire contents"),
-            "macOS 27 Tahoe System Events returns 0 elements for `entire contents` on Messages/FaceTime windows"
-        );
-        assert!(SIGN_OUT.contains("UI elements of containerElement"));
-        assert!(SIGN_OUT.contains("description of elementRef as string"));
-        assert!(SIGN_OUT.contains("AXMenuItemCmdChar"));
-        assert!(SIGN_OUT.contains("with timeout of 45 seconds"));
-        assert!(SIGN_OUT.contains("error errorText"));
-    }
-
-    /// The script never types a key, and every click it makes for the sign-out comes right after
-    /// a look that the app is still in front.
-    #[test]
-    fn every_sign_out_click_follows_a_frontmost_check_and_nothing_is_typed() {
-        assert!(!SIGN_OUT.contains("keystroke"));
-        let lines: Vec<&str> = SIGN_OUT.lines().map(str::trim).collect();
-        let clicks: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| {
-                !line.starts_with("--") && line.contains("click ") && !line.contains("closeButton")
-            })
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(clicks.len(), 4, "{clicks:?}");
-        for at in clicks {
-            assert_eq!(lines[at - 1], "my mustBeFront(appName)", "{}", lines[at]);
-        }
-    }
-}
+#[path = "init_accounts_tests.rs"]
+mod tests;

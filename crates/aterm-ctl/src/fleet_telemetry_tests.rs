@@ -97,6 +97,26 @@ fn a_task_row_says_its_conclusion_and_why_in_the_rows_words() {
     );
 }
 
+/// A sender's row goes to this Mac's state folder's log, the one its board's task rows go to:
+/// with no [`crate::board::HereGuard`], [`here_log`] is the log [`log_of`] finds beside
+/// [`Board::here`]'s folder (a test binary's own state). NEGATIVE CONTROL: under a guard, it
+/// is the log beside the guard's board, and none for a folder not named `board`.
+#[cfg(unix)]
+#[test]
+fn a_senders_row_goes_to_the_log_its_boards_task_rows_go_to() {
+    let state = aterm_types::dirs::state_dir().expect("a state folder");
+    assert_eq!(here_log(), Some(aterm_telemetry::log::dir_in(&state)));
+    let board = Board::here().expect("this Mac's board");
+    assert_eq!(here_log(), log_of(board.dir()));
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    {
+        let _here = crate::board::HereGuard::at(&tmp.path().join(crate::board::DIR));
+        assert_eq!(here_log(), Some(aterm_telemetry::log::dir_in(tmp.path())));
+    }
+    let _here = crate::board::HereGuard::at(&tmp.path().join("elsewhere"));
+    assert_eq!(here_log(), None);
+}
+
 /// A board in a scratch state folder, its workers started an hour ago (fresh, never pruned):
 /// `apply` merges one seen row, `tasks` reads the task rows the state's log holds.
 struct Scratch {
@@ -154,21 +174,7 @@ impl Scratch {
 
     /// Hold the log's lock, as another writer's long append does, until the guard drops.
     fn hold_log(&self) -> std::fs::File {
-        std::fs::create_dir_all(&self.log).expect("the log's folder");
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.log.join(".lock"))
-            .expect("lock file");
-        aterm_uds::file_lock::lock_exclusive_until(
-            &held,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            "the test holds the telemetry lock",
-        )
-        .expect("hold the lock");
-        held
+        hold_lock(&self.log)
     }
 
     /// The rows the log's gap lines say were lost.
@@ -343,8 +349,8 @@ impl Drop for Immutable {
 /// One board row's failed write leaves every other row the apply paid written: a row that
 /// owed a task row the apply's append wrote no longer owes it, so no later write says it a
 /// second time, and no give-up says lost a row the log holds. The apply answers the failure.
-/// The row whose write failed keeps its file as it was, so the next apply tells its end
-/// again: a second row of one end, never none. NEGATIVE CONTROL: the failed row is the
+/// The row whose write failed keeps its file as it was, its close unkept and its row not
+/// appended, so the next apply tells its end once. NEGATIVE CONTROL: the failed row is the
 /// first the apply holds, so stopping at it writes no other.
 #[cfg(target_os = "macos")]
 #[test]
@@ -378,9 +384,731 @@ fn one_board_rows_failed_write_leaves_every_other_row_the_apply_paid_written() {
     at.apply(&close("s-9b1"), 4_000);
     assert!(!at.open("s-9b1"));
     assert_eq!(at.tasks("s-9b2").len(), 1, "written once");
-    assert_eq!(at.tasks("s-9b1").len(), 2, "told again, never lost");
+    assert_eq!(at.tasks("s-9b1").len(), 1, "told once its row was kept");
     assert_eq!(at.dropped(), 0);
     assert!(at.unsaid().is_empty());
+}
+
+/// Hold the lock of the log in `log`, as another writer's long append does, until the guard
+/// drops.
+fn hold_lock(log: &std::path::Path) -> std::fs::File {
+    std::fs::create_dir_all(log).expect("the log's folder");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(log.join(".lock"))
+        .expect("lock file");
+    aterm_uds::file_lock::lock_exclusive_until(
+        &held,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        "the test holds the telemetry lock",
+    )
+    .expect("hold the lock");
+    held
+}
+
+/// Fault the `nth` write (from 1) of the board row of `sid` on this thread, until the guard
+/// drops ([`crate::board::fault_writes`]).
+fn fault_write(
+    sid: &'static str,
+    nth: usize,
+    fault: crate::board::WriteFault,
+) -> crate::board::FaultedWrites {
+    let mut writes = 0;
+    crate::board::fault_writes(move |row| {
+        if row.sid != sid {
+            return None;
+        }
+        writes += 1;
+        (writes == nth).then_some(fault)
+    })
+}
+
+/// A row whose write fails after its pay's append wrote what it owed (as an exit there
+/// would leave it) is paying, never owing: the next pay asks the log, which holds the row,
+/// so it is told and written no second time; and where the log's lock refuses every ask
+/// until [`OWED_KEPT`] after its close, it is dropped unsaid, never said lost while the log
+/// holds it, and its end, told by the paying write, stays told, so a reopen and a second
+/// close to it write no second row. A row whose append was refused and whose write after it
+/// failed too is paying a row the log does not hold: the next pay writes it once. NEGATIVE
+/// CONTROL: a row whose paying write fails keeps its file as it was, and the append writes
+/// none of it.
+#[test]
+fn a_row_paying_when_its_write_failed_is_settled_by_what_the_log_holds() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9d1", "s-9d2", "s-9d3", "s-9d4"]);
+    let close = |sid: &str| {
+        format!(
+            "@{sid} rev=3 state=closed task_state=exited agent=claude conclusion=finished \
+             why=exit-status exit=0 task_news=1"
+        )
+    };
+    let paying = |sid: &str| {
+        let row = at.board.row(sid).expect("a row");
+        (row.owed.len(), row.paying.len(), row.told)
+    };
+    let kept = u64::try_from(OWED_KEPT.as_millis()).expect("ms");
+    for sid in ["s-9d1", "s-9d2"] {
+        let faulted = fault_write(sid, 2, Before);
+        assert!(
+            at.board.apply(&[close(sid)], at.t0 + 1_000).is_err(),
+            "the write after the append failed"
+        );
+        drop(faulted);
+        assert_eq!(at.tasks(sid).len(), 1, "the append wrote it");
+        assert!(!at.open(sid), "the paying write kept the close");
+        assert_eq!(
+            paying(sid),
+            (0, 1, Some("ok.exit".to_owned())),
+            "paying, never owing, its end told"
+        );
+    }
+    at.board
+        .settle(&["s-9d1".to_owned()], at.t0 + 2_000)
+        .expect("settled");
+    assert_eq!(at.tasks("s-9d1").len(), 1, "written no second time");
+    assert_eq!(paying("s-9d1"), (0, 0, Some("ok.exit".to_owned())));
+    let held = at.hold_log();
+    // Reopened at its close's rev and closed again while paying: the end it pays is its end.
+    at.apply(
+        "@s-9d2 rev=3 state=exited agent=claude conclusion=finished why=exit-status exit=0 \
+         task_news=1",
+        1_500,
+    );
+    assert!(at.open("s-9d2"));
+    at.apply(&close("s-9d2"), 1_600);
+    assert_eq!(
+        paying("s-9d2"),
+        (0, 1, Some("ok.exit".to_owned())),
+        "no second row of its end"
+    );
+    at.board
+        .settle(&["s-9d2".to_owned()], at.t0 + kept)
+        .expect("settled");
+    assert_eq!(
+        paying("s-9d2"),
+        (0, 1, Some("ok.exit".to_owned())),
+        "kept while unjudged"
+    );
+    at.board
+        .settle(&["s-9d2".to_owned()], at.t0 + 1_000 + kept)
+        .expect("settled");
+    assert_eq!(
+        paying("s-9d2"),
+        (0, 0, Some("ok.exit".to_owned())),
+        "dropped unsaid, its end told"
+    );
+
+    // Refused by the log's lock, and the write after it failed: paying, though not written.
+    let faulted = fault_write("s-9d3", 2, Before);
+    assert!(at.board.apply(&[close("s-9d3")], at.t0 + 3_000).is_err());
+    drop(faulted);
+    assert_eq!(paying("s-9d3"), (0, 1, Some("ok.exit".to_owned())));
+    drop(held);
+    assert!(at.tasks("s-9d3").is_empty());
+    let faulted = fault_write("s-9d4", 1, Before);
+    assert!(at.board.apply(&[close("s-9d4")], at.t0 + 3_000).is_err());
+    drop(faulted);
+    assert!(at.open("s-9d4"), "its file kept as it was");
+    assert!(at.tasks("s-9d4").is_empty(), "the append wrote none of it");
+    // Reopened and closed again once its paying row was dropped unsaid: the end it told.
+    at.apply(
+        "@s-9d2 rev=3 state=exited agent=claude conclusion=finished why=exit-status exit=0 \
+         task_news=1",
+        kept + 2_000,
+    );
+    assert!(at.open("s-9d2"));
+    at.apply(&close("s-9d2"), kept + 3_000);
+    at.board
+        .settle(&["s-9d3".to_owned()], at.t0 + 4_000)
+        .expect("settled");
+    at.apply(&close("s-9d4"), 5_000);
+    for sid in ["s-9d1", "s-9d2", "s-9d3", "s-9d4"] {
+        assert_eq!(at.tasks(sid).len(), 1, "{sid} written once");
+    }
+    assert_eq!(paying("s-9d3"), (0, 0, Some("ok.exit".to_owned())));
+    assert_eq!(at.dropped(), 0, "none said lost");
+    assert!(at.unsaid().is_empty(), "{:?}", at.unsaid());
+}
+
+/// A row paying a line a later aterm wrote (a word this aterm's rows do not write) asks the
+/// log for it as its file holds it: the log holds it, so it is told and written no second
+/// time, though this aterm would write it otherwise. NEGATIVE CONTROL (by hand: the line
+/// asked for as this aterm writes it: not found, written again).
+#[test]
+fn a_paying_line_a_later_aterm_wrote_is_asked_for_as_it_was_written() {
+    let at = Scratch::new(&["s-9f1"]);
+    let mut row = worker("s-9f1", at.t0);
+    let mine = task_row(&row, None, at.t0 + 1_000, "m101", Digest::dir("/facts")).line();
+    let (body, _) = mine
+        .strip_suffix('\n')
+        .and_then(|line| line.rsplit_once(" sum="))
+        .expect("a sealed line");
+    let later = aterm_telemetry::row::sealed(format!("{body} later=1"));
+    let read = owed_row(&later).expect("this aterm reads it");
+    assert_ne!(read.line(), later, "and writes it otherwise");
+    assert_eq!(
+        aterm_telemetry::direct::write_kept(at.log.clone(), std::slice::from_ref(&later)),
+        aterm_telemetry::direct::Kept::Written,
+        "the later aterm's append took it"
+    );
+    // Its paying write told its end, as this aterm's does.
+    row.paying = vec![later];
+    row.told = Some(told_of(&read));
+    at.board
+        .record(&row)
+        .expect("its write after failed: paying");
+    at.board
+        .settle(&["s-9f1".to_owned()], at.t0 + 2_000)
+        .expect("settled");
+    assert_eq!(at.tasks("s-9f1").len(), 1, "written no second time");
+    let row = at.board.row("s-9f1").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told),
+        (0, 0, Some(told_of(&read)))
+    );
+}
+
+/// An append that failed and could not be cut back leaves its rows paying, never owing: the
+/// next pay asks the log, which holds what the write left, so none is written twice and none
+/// said lost. NEGATIVE CONTROL (by hand: such an append taken as refused, its rows owed
+/// again: a second row).
+#[test]
+fn an_append_left_uncut_leaves_its_rows_paying_for_the_log_to_settle() {
+    let at = Scratch::new(&["s-9a7"]);
+    crate::board::pay_says(aterm_telemetry::direct::Kept::Unsure);
+    at.apply(
+        "@s-9a7 rev=3 state=closed task_state=exited agent=claude conclusion=finished \
+         why=exit-status exit=0 task_news=1",
+        1_000,
+    );
+    let row = at.board.row("s-9a7").expect("a row");
+    assert_eq!((row.owed.len(), row.paying.len()), (0, 1), "paying");
+    assert_eq!(at.tasks("s-9a7").len(), 1, "what the write left");
+    at.board
+        .settle(&["s-9a7".to_owned()], at.t0 + 2_000)
+        .expect("settled");
+    assert_eq!(at.tasks("s-9a7").len(), 1, "written no second time");
+    assert_eq!(at.owes("s-9a7"), (0, Some("ok.exit".to_owned())));
+    assert_eq!(at.dropped(), 0);
+    assert!(at.unsaid().is_empty(), "none said lost: {:?}", at.unsaid());
+}
+
+/// A ROW TELLS THE END IT PAYS BEFORE ITS APPEND, AND A SETTLE KEEPS A NEWER ONE (TM-1
+/// review): a board writer that knows no `paying=` (an older aterm, which keeps it and
+/// `was_told=` as words it does not know) reads the paying row's `told=` as the end it pays,
+/// and one that reopened the row and told a newer end since keeps that end: a close to it
+/// read while the row still pays the older writes no second row, the settle its apply makes
+/// keeps it, and a reopen and a further close to it write none either. NEGATIVE CONTROLS (by
+/// hand): the settle telling the paying line's end: `told=` back at the older end, and the
+/// newer written twice; the close's check reading the paying line's end before `told=`: the
+/// newer written twice.
+#[test]
+fn a_paying_rows_end_is_told_before_its_append_and_a_settle_keeps_a_newer_one() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9b1"]);
+    let faulted = fault_write("s-9b1", 2, Before);
+    assert!(
+        at.board
+            .apply(
+                &["@s-9b1 rev=3 state=closed task_state=exited agent=claude \
+                   conclusion=finished why=exit-status exit=0 task_news=1"
+                    .to_owned()],
+                at.t0 + 1_000,
+            )
+            .is_err(),
+        "the write after the append failed"
+    );
+    drop(faulted);
+    let mut row = at.board.row("s-9b1").expect("a row");
+    assert_eq!(
+        (row.paying.len(), row.told.as_deref()),
+        (1, Some("ok.exit")),
+        "its end told before the append"
+    );
+    // An older aterm's writes, which leave `paying=` and `was_told=` as they found them: a
+    // reopen, and a close to a newer end, which it writes and tells.
+    let paid = std::mem::take(&mut row.paying);
+    let was = row.was_told.take();
+    at.board.record(&row).expect("recorded");
+    at.apply(
+        "@s-9b1 rev=4 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        2_000,
+    );
+    at.apply(
+        "@s-9b1 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        3_000,
+    );
+    assert_eq!(
+        at.board.row("s-9b1").expect("a row").told.as_deref(),
+        Some("fail.stalled")
+    );
+    // ... and a reopen at that close's rev, before this aterm reads the row again.
+    at.apply(
+        "@s-9b1 rev=5 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        3_500,
+    );
+    let mut row = at.board.row("s-9b1").expect("a row");
+    assert!(row.is_open());
+    row.paying = paid;
+    row.was_told = was;
+    at.board.record(&row).expect("recorded");
+    at.apply(
+        "@s-9b1 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        4_000,
+    );
+    let row = at.board.row("s-9b1").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told.as_deref()),
+        (0, 0, Some("fail.stalled")),
+        "no second row of the newer end owed, and the newer end kept"
+    );
+    at.apply(
+        "@s-9b1 rev=5 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        5_000,
+    );
+    assert!(at.open("s-9b1"), "a row at the close's rev reopens it");
+    at.apply(
+        "@s-9b1 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        6_000,
+    );
+    assert_eq!(
+        at.tasks("s-9b1")
+            .iter()
+            .map(|r| (r.outcome, r.stop))
+            .collect::<Vec<_>>(),
+        [(Outcome::Ok, Stop::Exit), (Outcome::Fail, Stop::Stalled)],
+        "each end written once"
+    );
+}
+
+/// A PAYING ROW THE LOG LACKS, PAST A NEWER END TOLD SINCE, IS GIVEN UP (TM-1 review): a
+/// board writer that knows no `paying=` (an older aterm) reopened the row and wrote a newer
+/// end while it paid a row the log never took, which written now would follow the newer one:
+/// it is said lost once, the newer end stays told and the log's last task row, and a reopen
+/// and a second close to that end write no second row. NEGATIVE CONTROL (by hand: the row
+/// the log lacks owed again whatever was told since): the older end written after the newer,
+/// `told=` back at it, and the newer end written twice.
+#[test]
+fn a_paying_row_the_log_lacks_past_a_newer_end_told_since_is_given_up() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9c1"]);
+    let held = at.hold_log();
+    let faulted = fault_write("s-9c1", 2, Before);
+    assert!(
+        at.board
+            .apply(
+                &["@s-9c1 rev=3 state=closed task_state=exited agent=claude \
+                   conclusion=finished why=exit-status exit=0 task_news=1"
+                    .to_owned()],
+                at.t0 + 1_000,
+            )
+            .is_err(),
+        "the append refused, and the write after it failed"
+    );
+    drop(faulted);
+    drop(held);
+    let mut row = at.board.row("s-9c1").expect("a row");
+    assert_eq!(
+        (
+            row.paying.len(),
+            row.told.as_deref(),
+            row.was_told.as_deref()
+        ),
+        (1, Some("ok.exit"), None),
+        "paying a row the log does not hold, its end told"
+    );
+    assert!(at.tasks("s-9c1").is_empty());
+    // An older aterm's writes, which leave `paying=` and `was_told=` as they found them: a
+    // reopen, and a close to a newer end, which it writes and tells.
+    let paid = std::mem::take(&mut row.paying);
+    let was = row.was_told.take();
+    at.board.record(&row).expect("recorded");
+    at.apply(
+        "@s-9c1 rev=4 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        2_000,
+    );
+    at.apply(
+        "@s-9c1 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        3_000,
+    );
+    let mut row = at.board.row("s-9c1").expect("a row");
+    assert_eq!(row.told.as_deref(), Some("fail.stalled"));
+    row.paying = paid;
+    row.was_told = was;
+    at.board.record(&row).expect("recorded");
+    at.board
+        .settle(&["s-9c1".to_owned()], at.t0 + 4_000)
+        .expect("settled");
+    let row = at.board.row("s-9c1").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told.as_deref()),
+        (0, 0, Some("fail.stalled")),
+        "given up, the newer end kept"
+    );
+    assert_eq!(at.unsaid().len(), 1, "the row it gave up, said lost");
+    at.apply(
+        "@s-9c1 rev=5 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        5_000,
+    );
+    assert!(at.open("s-9c1"), "a row at the close's rev reopens it");
+    at.apply(
+        "@s-9c1 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        6_000,
+    );
+    assert_eq!(
+        at.tasks("s-9c1")
+            .iter()
+            .map(|r| (r.outcome, r.stop))
+            .collect::<Vec<_>>(),
+        [(Outcome::Fail, Stop::Stalled)],
+        "the newer end the last, written once"
+    );
+}
+
+/// A PAYING ROW THE LOG LACKS, REFUSED AGAIN, TELLS THE END BEFORE IT (TM-1 review): its
+/// paying write told its end, which the log never took, so where the log's lock refuses the
+/// append that pays it again, the row owes it told the end it told before its first paying
+/// write (`was_told=`), and once it is given up, a later close to that end is written.
+/// NEGATIVE CONTROL (by hand: the end that pay's paying write found told put back): `told=`
+/// left at an end the log never held, and the later close neither written nor said lost.
+#[test]
+fn a_paying_row_the_log_lacks_refused_again_tells_the_end_before_it() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9c2"]);
+    let close = "@s-9c2 rev=3 state=closed task_state=exited agent=claude \
+                 conclusion=finished why=exit-status exit=0 task_news=1";
+    let held = at.hold_log();
+    let faulted = fault_write("s-9c2", 2, Before);
+    assert!(at.board.apply(&[close.to_owned()], at.t0 + 1_000).is_err());
+    drop((faulted, held));
+    assert!(at.tasks("s-9c2").is_empty());
+    // The log's lock taken by another writer once the settle's ask found the row absent, at
+    // the paying write of its pay.
+    let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let taken = std::rc::Rc::clone(&lock);
+    let log = at.log.clone();
+    let faulted = crate::board::fault_writes(move |row| {
+        if row.sid == "s-9c2" && !row.paying.is_empty() {
+            taken.borrow_mut().get_or_insert_with(|| hold_lock(&log));
+        }
+        None
+    });
+    at.board
+        .settle(&["s-9c2".to_owned()], at.t0 + 2_000)
+        .expect("settled");
+    drop(faulted);
+    assert!(lock.borrow().is_some(), "the append refused");
+    let row = at.board.row("s-9c2").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told, row.was_told),
+        (1, 0, None, None),
+        "owed again, told the end before it"
+    );
+    let kept = u64::try_from(OWED_KEPT.as_millis()).expect("ms");
+    at.board
+        .settle(&["s-9c2".to_owned()], at.t0 + 1_000 + kept)
+        .expect("settled");
+    assert_eq!(at.owes("s-9c2"), (0, None), "given up");
+    drop(lock);
+    at.apply(
+        "@s-9c2 rev=3 state=exited agent=claude conclusion=finished why=exit-status exit=0 \
+         task_news=1",
+        kept + 2_000,
+    );
+    assert!(at.open("s-9c2"));
+    at.apply(close, kept + 3_000);
+    assert_eq!(
+        at.tasks("s-9c2")
+            .iter()
+            .map(|r| (r.outcome, r.stop))
+            .collect::<Vec<_>>(),
+        [(Outcome::Ok, Stop::Exit)],
+        "the later close written"
+    );
+    assert_eq!(at.dropped(), 1, "the row given up, said lost once");
+    assert!(at.unsaid().is_empty(), "{:?}", at.unsaid());
+}
+
+/// A PAYING ROW THE LOG LACKS TELLS AGAIN THE END THE LOG HELD BEFORE IT (TM-1 review):
+/// a worker's close to `ok.exit` is written; a later close to `fail.stalled` is refused by the
+/// log's lock and the write after it fails, so its row is paying a row the log does not hold,
+/// `told=` that row's end and `was_told=` `ok.exit`. The settle that finds it absent, its
+/// append refused again, owes it told `ok.exit`; once it is given up, a reopen and a close
+/// back to `ok.exit` write no second row, since the log's last task row is that end; the
+/// row given up is left for the next append to say lost. NEGATIVE CONTROL (by hand: the settle restoring no end, `None`): `told=` lost, and the
+/// close back to `ok.exit` written twice.
+#[test]
+fn a_paying_row_the_log_lacks_tells_again_the_end_the_log_held_before_it() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9c3"]);
+    at.apply(
+        "@s-9c3 rev=3 state=closed task_state=exited agent=claude conclusion=finished \
+         why=exit-status exit=0 task_news=1",
+        1_000,
+    );
+    assert_eq!(at.owes("s-9c3"), (0, Some("ok.exit".to_owned())));
+    at.apply(
+        "@s-9c3 rev=4 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        2_000,
+    );
+    assert!(at.open("s-9c3"));
+    let held = at.hold_log();
+    let faulted = fault_write("s-9c3", 2, Before);
+    assert!(
+        at.board
+            .apply(
+                &["@s-9c3 rev=5 state=closed task_state=stalled agent=claude \
+                   conclusion=failed why=held task_news=1"
+                    .to_owned()],
+                at.t0 + 3_000,
+            )
+            .is_err()
+    );
+    drop((faulted, held));
+    let row = at.board.row("s-9c3").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told, row.was_told),
+        (
+            0,
+            1,
+            Some("fail.stalled".to_owned()),
+            Some("ok.exit".to_owned())
+        ),
+        "paying a row the log does not hold"
+    );
+    // The log's lock taken by another writer once the settle's ask found the row absent.
+    let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let taken = std::rc::Rc::clone(&lock);
+    let log = at.log.clone();
+    let faulted = crate::board::fault_writes(move |row| {
+        if row.sid == "s-9c3" && !row.paying.is_empty() {
+            taken.borrow_mut().get_or_insert_with(|| hold_lock(&log));
+        }
+        None
+    });
+    at.board
+        .settle(&["s-9c3".to_owned()], at.t0 + 4_000)
+        .expect("settled");
+    drop(faulted);
+    assert!(lock.borrow().is_some(), "the append refused");
+    let row = at.board.row("s-9c3").expect("a row");
+    assert_eq!(
+        (row.owed.len(), row.paying.len(), row.told, row.was_told),
+        (1, 0, Some("ok.exit".to_owned()), None),
+        "owed again, told the end the log held before it"
+    );
+    let kept = u64::try_from(OWED_KEPT.as_millis()).expect("ms");
+    at.board
+        .settle(&["s-9c3".to_owned()], at.t0 + 3_000 + kept)
+        .expect("settled");
+    assert_eq!(
+        at.owes("s-9c3"),
+        (0, Some("ok.exit".to_owned())),
+        "given up"
+    );
+    drop(lock);
+    at.apply(
+        "@s-9c3 rev=5 state=exited agent=claude conclusion=finished why=exit-status exit=0 \
+         task_news=1",
+        kept + 4_000,
+    );
+    assert!(at.open("s-9c3"));
+    at.apply(
+        "@s-9c3 rev=6 state=closed task_state=exited agent=claude conclusion=finished \
+         why=exit-status exit=0 task_news=1",
+        kept + 5_000,
+    );
+    assert_eq!(
+        at.tasks("s-9c3")
+            .iter()
+            .map(|r| (r.outcome, r.stop))
+            .collect::<Vec<_>>(),
+        [(Outcome::Ok, Stop::Exit)],
+        "the close back to the end the log holds written no second time"
+    );
+    assert_eq!(
+        (at.dropped(), at.unsaid().len()),
+        (0, 1),
+        "the row given up left for the next append to say lost"
+    );
+}
+
+/// A PAYING ROW DROPPED UNSAID BESIDE ONE STILL PAYING IS TOLD (TM-1 review, reproduced by
+/// the sixth review): a close to `ok.exit` is written; a close to `fail.stalled` (A) is owed
+/// under the log's held lock; a close to `fail.unknown` (B) close to [`OWED_KEPT`] later
+/// pays both, its append refused and the write after it failed, and the log comes to hold A
+/// but not B (an append cut after its first line). A settle that cannot read the log once A
+/// is past its time drops A unsaid and keeps B, and takes A's end as the one told before B.
+/// The settle that finds B absent, its append refused, owes it told A's end, and once B is
+/// given up a reopen and a close to `ok.exit` are written: the log's last task row is the
+/// worker's end. NEGATIVE CONTROL (by hand: the drop leaving `was_told=` as it was, as
+/// before the sixth review): B's settle tells `ok.exit`, an end older than A, and the close
+/// to `ok.exit` writes nothing, so the log ends at A.
+#[test]
+fn a_paying_row_dropped_unsaid_beside_one_still_paying_is_told() {
+    use crate::board::WriteFault::Before;
+    let at = Scratch::new(&["s-9c4"]);
+    let kept = u64::try_from(OWED_KEPT.as_millis()).expect("ms");
+    at.apply(
+        "@s-9c4 rev=3 state=closed task_state=exited agent=claude conclusion=finished \
+         why=exit-status exit=0 task_news=1",
+        1_000,
+    );
+    at.apply(
+        "@s-9c4 rev=4 state=stalled agent=claude conclusion=failed why=held task_news=1",
+        2_000,
+    );
+    let held = at.hold_log();
+    at.apply(
+        "@s-9c4 rev=5 state=closed task_state=stalled agent=claude conclusion=failed \
+         why=held task_news=1",
+        3_000,
+    );
+    assert_eq!(at.owes("s-9c4"), (1, Some("ok.exit".to_owned())), "A owed");
+    let b_at = kept - 60_000;
+    at.apply(
+        "@s-9c4 rev=6 state=working agent=claude task_news=1",
+        b_at - 1_000,
+    );
+    let faulted = fault_write("s-9c4", 2, Before);
+    assert!(
+        at.board
+            .apply(
+                &["@s-9c4 rev=7 state=closed task_state=failed agent=claude \
+                   conclusion=failed why=could-not-finish task_news=1"
+                    .to_owned()],
+                at.t0 + b_at,
+            )
+            .is_err()
+    );
+    drop((faulted, held));
+    let row = at.board.row("s-9c4").expect("a row");
+    assert_eq!(
+        (row.paying.len(), row.was_told.as_deref()),
+        (2, Some("ok.exit")),
+        "paying A and B"
+    );
+    assert_eq!(
+        aterm_telemetry::direct::write_kept(at.log.clone(), &row.paying[..1]),
+        aterm_telemetry::direct::Kept::Written,
+        "the log holds A"
+    );
+    let held = at.hold_log();
+    at.board
+        .settle(&["s-9c4".to_owned()], at.t0 + 3_000 + kept + 1_000)
+        .expect("settled");
+    drop(held);
+    let row = at.board.row("s-9c4").expect("a row");
+    assert_eq!(
+        (row.paying.len(), row.was_told.as_deref()),
+        (1, Some("fail.stalled")),
+        "A dropped unsaid, its end told before B"
+    );
+    let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let taken = std::rc::Rc::clone(&lock);
+    let log = at.log.clone();
+    let faulted = crate::board::fault_writes(move |row| {
+        if row.sid == "s-9c4" && !row.paying.is_empty() {
+            taken.borrow_mut().get_or_insert_with(|| hold_lock(&log));
+        }
+        None
+    });
+    at.board
+        .settle(&["s-9c4".to_owned()], at.t0 + 3_000 + kept + 2_000)
+        .expect("settled");
+    drop(faulted);
+    assert!(lock.borrow().is_some(), "B's append refused");
+    assert_eq!(
+        at.owes("s-9c4"),
+        (1, Some("fail.stalled".to_owned())),
+        "B owed again, told A's end"
+    );
+    at.board
+        .settle(&["s-9c4".to_owned()], at.t0 + b_at + kept)
+        .expect("settled");
+    assert_eq!(
+        at.owes("s-9c4"),
+        (0, Some("fail.stalled".to_owned())),
+        "B given up"
+    );
+    drop(lock);
+    at.apply(
+        "@s-9c4 rev=7 state=exited agent=claude conclusion=finished why=exit-status exit=0 \
+         task_news=1",
+        2 * kept,
+    );
+    assert!(at.open("s-9c4"));
+    at.apply(
+        "@s-9c4 rev=8 state=closed task_state=exited agent=claude conclusion=finished \
+         why=exit-status exit=0 task_news=1",
+        2 * kept + 1_000,
+    );
+    assert_eq!(
+        at.tasks("s-9c4")
+            .iter()
+            .map(|r| (r.outcome, r.stop))
+            .collect::<Vec<_>>(),
+        [
+            (Outcome::Ok, Stop::Exit),
+            (Outcome::Fail, Stop::Stalled),
+            (Outcome::Ok, Stop::Exit)
+        ],
+        "the log's last task row is the worker's end"
+    );
+    assert_eq!(at.dropped(), 1, "B given up, said lost once");
+}
+
+/// A board write whose folder's flush fails after its rename published the row is kept:
+/// its file holds the row, so what the row gave up is said lost, and its apply or settle
+/// answers no failure. NEGATIVE CONTROL: a write refused before its rename keeps the file as
+/// it was and says nothing.
+#[test]
+fn a_write_its_rename_published_says_what_its_row_gave_up() {
+    use crate::board::WriteFault::{After, Before};
+    let at = Scratch::new(&["s-9e1", "s-9e2"]);
+    let given_up = |sid: &str| {
+        let mut row = worker(sid, at.t0);
+        let mut build = task_row(&row, None, at.t0, "m101", Digest::dir("/facts"));
+        build.kind = Kind::Build;
+        row.owed = vec![build.line()];
+        at.board.record(&row).expect("recorded");
+    };
+    given_up("s-9e1");
+    let faulted = fault_write("s-9e1", 1, Before);
+    assert!(at.board.settle(&["s-9e1".to_owned()], at.t0).is_err());
+    drop(faulted);
+    assert_eq!(at.owes("s-9e1").0, 1, "its file as it was");
+    assert!(at.unsaid().is_empty(), "nothing said");
+    let faulted = fault_write("s-9e1", 1, After);
+    at.board
+        .settle(&["s-9e1".to_owned()], at.t0)
+        .expect("its row published");
+    drop(faulted);
+    assert_eq!(at.owes("s-9e1").0, 0);
+    assert_eq!(at.unsaid().len(), 1, "the line it gave up, said lost");
+
+    let held = at.hold_log();
+    at.apply(
+        "@s-9e2 rev=3 state=closed task_state=done agent=claude conclusion=finished \
+         why=landed task_news=1",
+        1_000,
+    );
+    drop(held);
+    let faulted = crate::board::fault_writes(|row| (row.sid == "s-9e2").then_some(After));
+    at.board
+        .settle(&["s-9e2".to_owned()], at.t0 + 2_000)
+        .expect("each write published");
+    drop(faulted);
+    assert_eq!(at.tasks("s-9e2").len(), 1);
+    assert_eq!(at.owes("s-9e2"), (0, Some("ok.unknown".to_owned())));
 }
 
 /// A task row its board gives up is said lost exactly once: a write that fails

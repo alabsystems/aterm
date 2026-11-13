@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
+// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+#![cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "some helpers serve only the tests gated `cfg(unix)`"
+    )
+)]
+
 use super::super::shared_renewal::{self, Authority, Grant};
 use super::*;
 use std::cell::Cell;
@@ -120,6 +130,7 @@ fn login_homes(env: &Env) -> std::collections::BTreeSet<PathBuf> {
     entries.map(|entry| entry.unwrap().path()).collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_shared_grant_is_consumed_once_and_ordinary_renewal_cannot_bypass_its_pin() {
     let (_tmp, env) = fixture("shared-renew-once");
@@ -176,6 +187,7 @@ fn a_shared_grant_is_consumed_once_and_ordinary_renewal_cannot_bypass_its_pin() 
     assert_eq!(login_homes(&env), homes);
 }
 
+#[cfg(unix)]
 #[test]
 fn stopping_during_provider_io_keeps_staging_and_blocks_binding_and_nonce_replay() {
     let (_tmp, env) = fixture("shared-renew-stopped");
@@ -226,6 +238,7 @@ fn stopping_during_provider_io_keeps_staging_and_blocks_binding_and_nonce_replay
     assert_eq!(login_homes(&env), homes);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_matching_email_cannot_publish_a_different_provider_uuid() {
     let (_tmp, env) = fixture("shared-renew-principal");
@@ -279,6 +292,7 @@ impl Authority for PrincipalOverride<'_> {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_changed_approved_uuid_is_refused_before_staging_or_provider_entry() {
     let (_tmp, env) = fixture("shared-renew-changed-principal");
@@ -314,6 +328,7 @@ fn a_changed_approved_uuid_is_refused_before_staging_or_provider_entry() {
     assert_eq!(host.calls.get(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn explicit_bootstrap_can_learn_the_provider_uuid_from_a_successful_login() {
     let (_tmp, env) = fixture("shared-renew-bootstrap");
@@ -556,6 +571,7 @@ pub(crate) fn transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn guarded_workflow_conforms_and_reentry_or_lost_custody_is_a_negative_control() {
     let model = aterm_models_harness::shared_renewal_model();
@@ -1366,6 +1382,7 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
     ]
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_checkpoint_failure_preserves_consumption_and_recovers_only_completed_evidence() {
     for after_checkpoint in [false, true] {
@@ -1404,6 +1421,7 @@ pub(crate) fn checkpoint_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_checkpoint_transitions_conform_and_lost_or_replayed_results_are_detected() {
     let model = aterm_models_harness::shared_checkpoint_model();

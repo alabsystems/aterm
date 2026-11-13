@@ -1039,45 +1039,37 @@ fn search_previews_only_a_visible_matching_setting() {
 }
 
 #[test]
-fn renderer_preview_carries_rainbow_variant_identity_from_config() {
+fn renderer_preview_carries_the_style_and_the_pet_from_config() {
     use crate::settings_preview::PreviewTrailCompanion;
     use aterm_effects::kitty_pet::PetSpecies;
 
     let motion = crate::native_app::ViewMotionCx::default();
-    for (raw, expected) in [
-        (
-            "rainbow kitty underline",
-            PreviewTrailCompanion::Pet(PetSpecies::Cat),
-        ),
-        (
-            "rainbow kitty tall",
-            PreviewTrailCompanion::Pet(PetSpecies::Cat),
-        ),
-        (
-            "rainbow kitty pet",
-            PreviewTrailCompanion::Pet(PetSpecies::Cat),
-        ),
-        (
-            "rainbow dog pet",
-            PreviewTrailCompanion::Pet(PetSpecies::Dog),
-        ),
-        ("rainbow kitty flying", PreviewTrailCompanion::FlyingKitty),
+    for (style, kind) in [
+        ("rainbow", PreviewTrailStyle::RainbowKitty),
+        ("laser", PreviewTrailStyle::Laser),
+        ("off", PreviewTrailStyle::Off),
     ] {
-        let config: Config = aterm_toml::from_str(&format!(
-            "cursor_trail = true\ncursor_trail_style = {raw:?}\n"
-        ))
-        .unwrap();
-        let mut state = SettingsViewState::new(&config);
-        state.navigate(SettingsRoute::CursorMotion);
-        let preview = renderer_preview_spec(&state, 900, motion, 13.0, 1.0)
-            .unwrap_or_else(|| panic!("preview for {raw}"));
+        for (pet, expected) in [
+            ("off", PreviewTrailCompanion::None),
+            ("cat", PreviewTrailCompanion::Pet(PetSpecies::Cat)),
+            ("dog", PreviewTrailCompanion::Pet(PetSpecies::Dog)),
+        ] {
+            let config: Config = aterm_toml::from_str(&format!(
+                "cursor_trail_style = {style:?}\ncursor_pet = {pet:?}\n"
+            ))
+            .unwrap();
+            let mut state = SettingsViewState::new(&config);
+            state.navigate(SettingsRoute::CursorMotion);
+            let preview = renderer_preview_spec(&state, 900, motion, 13.0, 1.0)
+                .unwrap_or_else(|| panic!("preview for {style} beside {pet}"));
 
-        assert_eq!(preview.cursor.trail_style, PreviewTrailStyle::RainbowKitty);
-        assert_eq!(
-            preview.cursor.effective_trail_style_raw(),
-            prefs::cursor_trail_style_canonical(raw).unwrap()
-        );
-        assert_eq!(preview.cursor.trail_companion(), expected, "{raw}");
+            assert_eq!(preview.cursor.trail_style, kind, "{style} beside {pet}");
+            assert_eq!(
+                preview.cursor.trail_companion(),
+                expected,
+                "{style} beside {pet}"
+            );
+        }
     }
 }
 
@@ -5173,7 +5165,8 @@ struct Core;
 
 impl Core {
     fn take() -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        // Every test thread's sweeps share this gate, so it holds the whole binary's grant.
+        let cores = aterm_cores::binary_parallelism().map_or(1, std::num::NonZero::get);
         let (running, freed) = &SWEEP_JOBS;
         let mut now = running
             .lock()
@@ -7007,10 +7000,12 @@ fn legacy_trail_master_and_empty_style_read_as_the_saved_cursor_style() {
             "cursor_trail = false\ncursor_trail_style = \"fire\"\n".to_string(),
             "off",
         ),
+        // A retired name the one-time rewrite did not reach is no style: the default is drawn.
         (
             trail_drawn("cursor_trail_style = \"nyan\"\n"),
-            "rainbow kitty flying",
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
         ),
+        (trail_drawn("cursor_trail_style = \"LASER\"\n"), "laser"),
         (String::new(), platform),
         ("cursor_trail_style = \"\"\n".to_string(), platform),
     ] {
@@ -7449,13 +7444,13 @@ fn choosing_a_style_writes_the_style_alone() {
         vec![style(prefs::DEFAULT_CURSOR_TRAIL_STYLE)]
     );
 
-    let from_legacy_off = file_after("cursor_trail = false\n", "rainbow dog pet");
+    let from_legacy_off = file_after("cursor_trail = false\n", "phaser");
     assert!(
         !from_legacy_off.contains("cursor_trail ="),
         "the retired switch is gone: {from_legacy_off}"
     );
     assert!(
-        from_legacy_off.contains("cursor_trail_style = \"rainbow dog pet\""),
+        from_legacy_off.contains("cursor_trail_style = \"phaser\""),
         "{from_legacy_off}"
     );
     assert_eq!(
@@ -7463,11 +7458,8 @@ fn choosing_a_style_writes_the_style_alone() {
         crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
         "the glow stays off where its own default is on: {from_legacy_off}"
     );
-    let from_empty = file_after("", "rainbow dog pet");
-    assert_eq!(
-        from_empty.trim(),
-        "cursor_trail_style = \"rainbow dog pet\""
-    );
+    let from_empty = file_after("", "phaser");
+    assert_eq!(from_empty.trim(), "cursor_trail_style = \"phaser\"");
 
     let legacy_off = SettingsViewState::new(
         &aterm_toml::from_str::<Config>("cursor_trail = false\ncursor_trail_style = \"comet\"\n")
@@ -7535,7 +7527,7 @@ fn a_drawn_cursor_preview_shows_its_style_at_a_large_text_size() {
                     &crate::widget::SemanticFontCandidate::default(),
                 ),
             );
-            for tried in [None, Some("rainbow kitty underline"), Some("comet")] {
+            for tried in [None, Some("rainbow"), Some("comet")] {
                 let (mut runtime, instance, view) =
                     cursor_styles_runtime(&trail_drawn("line_height = 2\n"));
                 {
@@ -7625,11 +7617,7 @@ fn cursor_styles_land_with_a_list_in_view_at_common_sizes() {
             unreachable!()
         };
         let room = state.scroll_plan().expect("the list's plan").room();
-        let styles = [
-            "off",
-            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-            "rainbow kitty underline",
-        ];
+        let styles = ["off", prefs::DEFAULT_CURSOR_TRAIL_STYLE, "rainbow"];
         let saved = prefs::DEFAULT_CURSOR_TRAIL_STYLE;
         let landing = std::iter::once(saved).chain(
             styles
@@ -7704,7 +7692,7 @@ fn cursor_style_status_names_the_one_actionable_visibility_gate() {
 #[test]
 fn cursor_tuning_reset_clears_only_the_selected_styles_knobs() {
     let (mut runtime, instance, view) = cursor_styles_runtime(
-        "cursor_trail_style = \"rainbow kitty underline\"\n\
+        "cursor_trail_style = \"rainbow\"\n\
          cursor_trail_intensity = 0\n\
          cursor_trail_ms = 900\n\
          cursor_trail_accent = \"#112233\"\n\
@@ -7714,14 +7702,8 @@ fn cursor_tuning_reset_clears_only_the_selected_styles_knobs() {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!();
         };
-        let card = cursor_style_tuning_card(
-            state,
-            "rainbow kitty underline",
-            SettingsWidth::Wide,
-            560.0,
-            2_000.0,
-        )
-        .expect("the advanced card");
+        let card = cursor_style_tuning_card(state, "rainbow", SettingsWidth::Wide, 560.0, 2_000.0)
+            .expect("the advanced card");
         assert!(
             card.rows
                 .iter()
@@ -7760,8 +7742,8 @@ fn the_serious_mode_note_stays_in_view_while_styles_are_tried() {
         for (step, value) in [
             "off",
             prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-            "rainbow dog pet",
-            "rainbow kitty flying",
+            "comet",
+            "fire",
             "phaser",
         ]
         .into_iter()
@@ -7806,7 +7788,7 @@ fn a_cursor_styles_check_gives_up_its_tail_where_it_costs_a_too_tall_name_a_line
             value: "rainbow-kitty-flat".to_string(),
             name: "Flat rainbow kitty".to_string(),
             description: "A flat rainbow trails the cursor".to_string(),
-            group: CursorStyleGroup::Companions,
+            group: CursorStyleGroup::Trails,
             default: false,
         };
         let lines = |width: f32| {
@@ -7921,7 +7903,7 @@ fn a_too_tall_default_style_says_so_in_its_description() {
             value: "rainbow-kitty-pet".to_string(),
             name: "Rainbow kitty".to_string(),
             description: "A kitty runs behind the cursor".to_string(),
-            group: CursorStyleGroup::Companions,
+            group: CursorStyleGroup::Trails,
             default: true,
         };
         let lines = |text: &str, width: f32| {
@@ -8127,7 +8109,7 @@ fn page_keys_move_the_cursor_style_highlight_with_the_list() {
         .dispatch(
             instance,
             view,
-            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("rainbow dog pet")))),
+            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("phaser")))),
         )
         .unwrap();
     compile_settings_view(&runtime, instance, view, &cx);
@@ -8152,7 +8134,7 @@ fn page_keys_move_the_cursor_style_highlight_with_the_list() {
         );
         (focus, shown)
     };
-    assert_ne!(focus.as_str(), cursor_style_row_key("rainbow dog pet"));
+    assert_ne!(focus.as_str(), cursor_style_row_key("phaser"));
     runtime
         .dispatch(instance, view, AppEvent::StepFocus(1))
         .unwrap();
@@ -8243,7 +8225,7 @@ fn home_and_end_reach_the_list_ends_from_a_row_on_screen() {
     let (mut runtime, instance, view) = cursor_styles_runtime(&trail_drawn(""));
     let cx = view_cx_at(1_074.0, 684.0);
     compile_settings_view(&runtime, instance, view, &cx);
-    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    let dog = UiKey::new(cursor_style_row_key("phaser"));
     runtime
         .dispatch(instance, view, AppEvent::FocusChanged(Some(dog)))
         .unwrap();
@@ -8577,7 +8559,7 @@ fn trail_colour_rows_name_the_style_s_real_default() {
     for (style, own, chip) in [
         ("fire", "Amber (default)", Some(rgb(0x00FF_9632))),
         ("water", "Aqua (default)", Some(rgb(0x0032_DCDE))),
-        ("rainbow kitty", "Pink (default)", Some(rgb(0x00FF_66CC))),
+        ("rainbow", "Pink (default)", Some(rgb(0x00FF_66CC))),
         ("phaser", "Shifting colors (default)", None),
     ] {
         for shape in ["bar", "block"] {
@@ -8674,12 +8656,12 @@ fn trail_colour_rows_name_the_style_s_real_default() {
 }
 
 #[test]
-fn a_saved_trail_alias_selects_its_row_in_the_picker() {
+fn a_saved_trail_style_in_capitals_selects_its_row_in_the_picker() {
     let options = || prefs::CURSOR_TRAIL_STYLES.iter().map(|s| (*s).to_string());
     let picker = ChoicePicker::new(
         prefs::EDIT_CURSOR_TRAIL_STYLE,
         options(),
-        "nyan rainbow",
+        "LASER",
         true,
         true,
         prefs::DEFAULT_CURSOR_TRAIL_STYLE,
@@ -8687,15 +8669,15 @@ fn a_saved_trail_alias_selects_its_row_in_the_picker() {
     assert_eq!(picker.options.len(), prefs::CURSOR_TRAIL_STYLES.len());
     assert_eq!(
         picker.options[picker.selected].value.as_deref(),
-        Some("rainbow kitty flying")
+        Some("laser")
     );
     let flying = prefs::CURSOR_TRAIL_STYLES
         .iter()
-        .position(|s| *s == "rainbow kitty flying")
+        .position(|s| *s == "laser")
         .expect("listed");
     assert_eq!(
         cycle_choice(
-            choice_row_value(prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow"),
+            choice_row_value(prefs::EDIT_CURSOR_TRAIL_STYLE, "LASER"),
             prefs::CURSOR_TRAIL_STYLES,
             true,
         )
@@ -8748,11 +8730,12 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
     };
     assert_eq!(classic_mono(""), Some(cursor_style_row_key("classic")));
     assert_eq!(
-        search_page_hits(&state, SearchQuery::of(&state, "flat"))
+        search_page_hits(&state, SearchQuery::of(&state, "rainbow kitty"))
             .into_iter()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
             .and_then(|hit| hit.focus),
-        Some(cursor_style_row_key("rainbow kitty flat"))
+        Some(cursor_style_row_key("rainbow")),
+        "the rainbow kitty is found by its label"
     );
     assert_eq!(
         classic_mono(&trail_drawn("cursor_trail_style = \"classic mono\"\n")),
@@ -8918,7 +8901,7 @@ fn tuning_a_style_does_not_read_says_so() {
     assert!(note(on, prefs::EDIT_CURSOR_TRAIL_INTENSITY).is_empty());
 
     for (style, default) in [
-        ("rainbow kitty pet", Config::RAINBOW_KITTY_BLOOM_RADIUS),
+        ("rainbow", Config::RAINBOW_KITTY_BLOOM_RADIUS),
         ("fire", Config::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT),
     ] {
         let state = SettingsViewState::new(
@@ -14315,6 +14298,106 @@ fn a_linux_short_landscape_page_paints_a_failed_checks_cause() {
     }
 }
 
+/// A CHECK THAT STOPPED ANSWERING REACHES EVERY RUNG: only the long headline could see it, so a window
+/// too narrow for that sentence painted "Current", and the notes card said "the newest version" under
+/// it at any width. Automatic checks being off hides it no more. CONTROLS: the same page with no such
+/// check says current, and what outranks it in the long ladder outranks it here.
+#[test]
+fn compact_update_rungs_never_call_a_page_current_under_a_check_that_stopped_answering() {
+    let checked = || {
+        let mut status = update_status(false);
+        status.updated_at = "2026-09-23T12:00:00Z".to_string();
+        status
+    };
+    let state = |unanswered: bool, automatic: bool| {
+        let state = UpdateState::from_status(1, "0.1.0", Some(&checked()), false)
+            .with_automatic_checks(automatic, automatic);
+        if unanswered {
+            state.with_check_unanswered()
+        } else {
+            state
+        }
+    };
+    let words = |projection: &UpdateProjection| {
+        (
+            compact_update_headline(projection),
+            compact_update_summary_detail(projection).to_string(),
+            compact_update_detail_minimum(projection),
+        )
+    };
+    for automatic in [true, false] {
+        let said = state(true, automatic).projection();
+        assert_eq!(
+            said.headline,
+            crate::native_updater_service::CHECK_DID_NOT_ANSWER
+        );
+        assert!(said.check_unanswered);
+        assert_eq!(
+            words(&said),
+            (
+                "No answer".to_string(),
+                "Check didn\u{2019}t answer".to_string(),
+                "No answer.".to_string()
+            ),
+            "automatic checks {automatic}"
+        );
+        assert!(
+            !update_notes_lines(&said).join(" ").contains("newest"),
+            "the notes card says nothing of the newest version"
+        );
+    }
+    let quiet = state(false, true).projection();
+    assert!(!quiet.check_unanswered);
+    assert_eq!(
+        words(&quiet),
+        (
+            "Current".to_string(),
+            "Up to date".to_string(),
+            "Up to date.".to_string()
+        ),
+        "CONTROL: nothing gave up"
+    );
+    assert!(
+        update_notes_lines(&quiet).join(" ").contains("newest"),
+        "CONTROL: a checked, healthy page says newest"
+    );
+    let ready = UpdateState::from_status(1, "0.1.0", Some(&update_status(true)), false)
+        .with_check_unanswered()
+        .projection();
+    assert!(
+        !ready.check_unanswered,
+        "CONTROL: a stage outranks it in the long ladder, so the rungs do not say it"
+    );
+    assert_eq!(compact_update_headline(&ready), "Ready");
+
+    let claims_current = |state: UpdateState, width: f32, height: f32| {
+        let pages = update_route_pages(state, width, height);
+        let summary = pages.iter().any(|page| {
+            page.paint
+                .iter()
+                .any(|n| n.key.as_str() == "updates/summary")
+        });
+        let painted = pages.iter().flat_map(painted_texts).collect::<Vec<_>>();
+        let current = painted.iter().any(|text| {
+            text == "Current"
+                || text.to_lowercase().contains("up to date")
+                || text.contains("newest version")
+        });
+        (summary, current, painted)
+    };
+    at_each_text_scale(&[2.0], "a check that stopped answering", |_| {
+        let mut summarized = 0;
+        for (width, height) in [(568.0, 320.0), (568.0, 300.0), (480.0, 700.0)] {
+            let (summary, current, painted) = claims_current(state(true, true), width, height);
+            summarized += usize::from(summary);
+            assert!(!current, "{width}x{height}: {painted:?}");
+            let (_, control, painted) = claims_current(state(false, true), width, height);
+            assert!(control, "CONTROL: {width}x{height}: {painted:?}");
+        }
+        assert!(summarized > 0, "CONTROL: some window lists the summary");
+    });
+}
+
 #[test]
 fn compact_update_rungs_never_call_a_page_current_while_checks_are_off() {
     let healthy = |running: bool, saved: bool| {
@@ -17712,10 +17795,12 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             SettingsRoute::Terminal,
             SettingsRoute::Security,
         ] {
-            let leading = usize::from(matches!(
-                route,
-                SettingsRoute::CursorMotion | SettingsRoute::Sound
-            ));
+            // The leading card's controls: Cursor & Motion's style and pet, Sound's one.
+            let leading = match route {
+                SettingsRoute::CursorMotion => 2,
+                SettingsRoute::Sound => 1,
+                _ => 0,
+            };
             let (mut runtime, instance, view) = setup();
             let (total, expected_controls) = {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -21261,7 +21346,7 @@ fn a_search_takes_loose_hits_only_where_nothing_starts_a_word() {
     };
 
     let cat = SearchQuery::of(&state, "cat");
-    for key in [KEYWORD_KITTIES_KEY, prefs::EDIT_CURSOR_TRAIL_STYLE] {
+    for key in [KEYWORD_KITTIES_KEY, prefs::EDIT_CURSOR_PET] {
         assert!(finds(key, cat), "cat finds {key}");
     }
     for key in [prefs::EDIT_ALLOW_NOTIFICATIONS, prefs::EDIT_BELL_SOUND] {
@@ -23943,8 +24028,10 @@ fn leaving_serious_mode_keeps_an_old_classic_mono_in_the_cursor_color() {
         let snapshot = service.snapshot();
         let config = &snapshot.config;
         let theme_cursor = 0x0009_69DA;
-        let presentation =
-            crate::app_config::resolve_trail_presentation(config.cursor_trail_style_raw());
+        let presentation = crate::app_config::resolve_trail_presentation(
+            config.cursor_trail_style_raw(),
+            config.cursor_pet_raw(),
+        );
         let glow = crate::app_config::resolve_cursor_glow(
             config.cursor_glow_inputs(true, theme_cursor, presentation),
             presentation,
@@ -25159,7 +25246,7 @@ fn sound_rows_say_inactive_exactly_where_their_voices_are_silent() {
     use crate::motion::{MotionEffect, MotionMode, MotionPolicy};
     use aterm_effects::sound_policy::{Voice, VoiceTerms, voice_gain};
     let availability = audited_availability();
-    let base = "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"\n\
+    let base = "cursor_trail = true\ncursor_trail_style = \"rainbow\"\n\
                 [output_streak]\nenabled = true\n";
     let rows: [(&str, &[Voice]); 7] = [
         (prefs::EDIT_TRAIL_SOUNDS, &Voice::ALL),
@@ -25622,17 +25709,13 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
 #[test]
 fn every_cursor_style_spelling_reads_as_its_list_name() {
     for (spelling, name) in [
-        ("rainbow kitty pet", "Rainbow kitty"),
-        ("rainbow kitty", "Rainbow kitty"),
-        ("Rainbow Kitty Tall", "Rainbow kitty"),
-        ("kitty", "Rainbow kitty"),
-        ("rainbow kitty underline", "Rainbow underline"),
-        ("  nyan underline  ", "Rainbow underline"),
-        ("nyan", "Flying kitty"),
-        ("dog pet", "Rainbow dog"),
-        ("rainbow dog", "Rainbow dog"),
+        ("rainbow", "Rainbow kitty"),
+        ("  RAINBOW  ", "Rainbow kitty"),
         ("laser", "Lightning"),
-        ("lightning", "Lightning"),
+        // A retired name is no style: it reads as the default drawn in its place.
+        ("nyan", "Rainbow kitty (unknown \"nyan\")"),
+        ("rainbow dog", "Rainbow kitty (unknown \"rainbow dog\")"),
+        ("lightning", "Rainbow kitty (unknown \"lightning\")"),
         ("classic lumen", "Classic"),
         ("classic mono", "Classic"),
         ("off", "Off"),
@@ -25647,14 +25730,15 @@ fn every_cursor_style_spelling_reads_as_its_list_name() {
     for &value in prefs::CURSOR_TRAIL_STYLES {
         let label = setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, value);
         assert_eq!(
-            prefs::cursor_trail_style_canonical(&label.to_ascii_lowercase()),
-            Some(value),
+            aterm_effects::cursor_glow::spellings::row(value).map(|row| row.label),
+            Some(label.as_str()),
             "{value:?} is labelled {label:?}"
         );
     }
     assert_eq!(
-        setting_choice_label(prefs::EDIT_WINDOW_THEME, "rainbow kitty underline"),
-        "Rainbow kitty underline"
+        setting_choice_label(prefs::EDIT_WINDOW_THEME, "rainbow"),
+        "Rainbow",
+        "another key's value takes the plain label, not the style's"
     );
     assert_ne!(
         setting_choice_label(prefs::EDIT_THEME, "laser"),
@@ -40180,18 +40264,16 @@ fn an_outside_change_takes_the_preview_from_the_chosen_style() {
 
 #[test]
 fn a_tried_style_says_it_is_not_saved() {
-    let (mut runtime, instance, view) =
-        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"rainbow\"\n");
     compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
-    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    let dog = UiKey::new(cursor_style_row_key("phaser"));
     runtime
         .dispatch(instance, view, AppEvent::FocusChanged(Some(dog.clone())))
         .unwrap();
     let spec = cursor_styles_spec(&runtime, view);
     assert_eq!(spec.style_trial, Some(StyleTrial::Keyboard));
     assert!(
-        spec.semantic_value()
-            .contains("trying Rainbow dog (not saved"),
+        spec.semantic_value().contains("trying Phaser (not saved"),
         "{}",
         spec.semantic_value()
     );
@@ -40199,7 +40281,7 @@ fn a_tried_style_says_it_is_not_saved() {
         .dispatch(
             instance,
             view,
-            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("rainbow kitty pet")))),
+            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("rainbow")))),
         )
         .unwrap();
     let spec = cursor_styles_spec(&runtime, view);
@@ -40227,11 +40309,10 @@ fn a_tried_style_says_it_is_not_saved() {
 
 #[test]
 fn a_tried_styles_hint_says_what_its_gesture_does() {
-    let (mut runtime, instance, view) =
-        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"rainbow\"\n");
     compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
-    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
-    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    let underline = UiKey::new(cursor_style_row_key("comet"));
+    let dog = UiKey::new(cursor_style_row_key("phaser"));
     let painted = |spec: &SettingsPreviewSpec| {
         let mut prims = Vec::new();
         spec.paint(
@@ -40270,7 +40351,7 @@ fn a_tried_styles_hint_says_what_its_gesture_does() {
         assert!(!words.contains("Return"), "{case}: {words}");
         let spoken = spec.semantic_value();
         assert!(
-            spoken.contains("trying Rainbow underline (not saved; click saves"),
+            spoken.contains("trying Comet (not saved; click saves"),
             "{case}: {spoken}"
         );
         assert!(!spoken.contains("Return"), "{case}: {spoken}");
@@ -40279,7 +40360,7 @@ fn a_tried_styles_hint_says_what_its_gesture_does() {
     set(&mut runtime, None, Some(dog.clone()));
     let spec = cursor_styles_spec(&runtime, view);
     assert_eq!(spec.style_trial, Some(StyleTrial::Keyboard));
-    assert_eq!(spec.cursor.trail_style_label(), "Rainbow dog");
+    assert_eq!(spec.cursor.trail_style_label(), "Phaser");
     assert!(painted(&spec).contains("Return to save"));
     assert!(spec.semantic_value().contains("Return saves"));
     {
@@ -40322,16 +40403,15 @@ fn a_tried_styles_hint_says_what_its_gesture_does() {
 
 #[test]
 fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
-    let (mut runtime, instance, view) =
-        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"rainbow\"\n");
     compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
     let length = UiKey::new(format!(
         "settings/control/{}",
         prefs::EDIT_CURSOR_TRAIL_LENGTH
     ));
     let preview = UiKey::new("settings/preview/cursor-styles");
-    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
-    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+    let dog = UiKey::new(cursor_style_row_key("phaser"));
+    let underline = UiKey::new(cursor_style_row_key("comet"));
     let painted = |spec: &SettingsPreviewSpec| {
         let mut prims = Vec::new();
         spec.paint(
@@ -40375,7 +40455,7 @@ fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
     set(
         &mut runtime,
         None,
-        &UiKey::new(cursor_style_row_key("rainbow kitty pet")),
+        &UiKey::new(cursor_style_row_key("rainbow")),
     );
     let _ = cursor_styles_spec(&runtime, view);
     set(&mut runtime, None, &preview);
@@ -40394,16 +40474,13 @@ fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
     let spec = cursor_styles_spec(&runtime, view);
     assert_eq!(spec.style_trial, Some(StyleTrial::Kept));
     assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_STYLE);
-    assert_eq!(spec.cursor.trail_style_label(), "Rainbow dog");
+    assert_eq!(spec.cursor.trail_style_label(), "Phaser");
     let words = painted(&spec);
     assert!(words.contains("Trying"), "{words}");
     assert!(!words.contains("Trail length"), "{words}");
     let spoken = spec.semantic_value();
     assert!(
-        spoken.contains(&format!(
-            "trying Rainbow dog ({})",
-            StyleTrial::Kept.spoken()
-        )),
+        spoken.contains(&format!("trying Phaser ({})", StyleTrial::Kept.spoken())),
         "{spoken}"
     );
 
@@ -40421,10 +40498,8 @@ fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
         painted(&spec)
     );
     assert!(
-        spec.semantic_value().contains(&format!(
-            "trying Rainbow underline ({})",
-            StyleTrial::Pointer.spoken()
-        )),
+        spec.semantic_value()
+            .contains(&format!("trying Comet ({})", StyleTrial::Pointer.spoken())),
         "{}",
         spec.semantic_value()
     );
@@ -40432,10 +40507,9 @@ fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
 
 #[test]
 fn a_hover_goes_with_its_page() {
-    let (mut runtime, instance, view) =
-        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"rainbow\"\n");
     compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
-    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+    let underline = UiKey::new(cursor_style_row_key("comet"));
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();

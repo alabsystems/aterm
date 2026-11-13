@@ -616,9 +616,84 @@ fn step_one_and_a_dry_run_judge_the_origins_ledger_and_a_synced_run_its_own() {
     assert_eq!(w.real(true).engine, w.copy());
 }
 
+/// THE FIRST REAL RUN OF A CLONE REACHES ITS INPUT JUDGMENT WITH AN ENGINE, AND A DRY RUN STILL
+/// MAKES NONE: step 1's input judgment seals the HEAD of the engine it hands its verifier
+/// children ([`crate::input_record::context`]), a step before the sync, so step 1's fetch of
+/// both origins ([`Backend::fetch`], here handed aterm's as a fleet refresh hands it) makes the
+/// release's copy from the engine's origin where the clone has none, as the named checkout's
+/// committer, and step 2 syncs it. With the sync its only maker, a clone that had never released
+/// ended its first real run at that seal (git: "cannot change to
+/// '<clone>/.git/aterm-release/.ubd/engine'") and needed a copy made by hand.
+/// NEGATIVE CONTROLS: before that fetch the same seal cannot be made; a dry run's fetch leaves
+/// no copy and seals the checkout it was named; and a copy that cannot be put in place ends
+/// step 1 COULD NOT RUN in the copy's own words.
+#[test]
+fn step_one_of_a_first_real_run_makes_the_engine_its_input_judgment_seals() {
+    let w = World::new();
+    let tip = git_in(&w.repo, &["rev-parse", "HEAD"]);
+    let step_one_fetch = |real: &mut Real| {
+        real.prefetched_origin = Some(crate::github_remote::FetchedOrigin {
+            main: tip.clone(),
+            tags: String::new(),
+        });
+        Backend::fetch(real)
+    };
+    // What the input judgment asks of the engine it was handed, as it asks it.
+    let sealed = |real: &Real| {
+        crate::input_record::context(
+            &w.repo,
+            &real.engine,
+            "seal",
+            &aterm_uds::spawnfd::command("/usr/bin/true"),
+        )
+    };
+
+    let mut dry = w.real(true);
+    step_one_fetch(&mut dry).unwrap();
+    assert!(!w.copy().exists(), "a dry run makes no engine");
+    assert_eq!(dry.engine, w.shared);
+    sealed(&dry).unwrap();
+
+    let mut real = w.real(false);
+    assert_eq!(real.engine, w.copy(), "a real run's engine is its own");
+    assert!(
+        sealed(&real).is_err(),
+        "no engine yet: what ended a first run"
+    );
+    step_one_fetch(&mut real).unwrap();
+    assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
+    assert_eq!(
+        git_in(&w.copy(), &["config", "user.email"]),
+        SHARED_EMAIL,
+        "made as the named checkout's committer"
+    );
+    assert!(real.engine_unready().is_none());
+    let first = sealed(&real).unwrap();
+
+    // Step 2 still brings the copy to its origin's main, which the next judgment then seals.
+    w.peer_lands_code("pub-next");
+    real.engine_sync().unwrap();
+    assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
+    assert_ne!(sealed(&real).unwrap(), first);
+
+    // A clone whose copy cannot be put in place: something that is no checkout is in its way.
+    let blocked = World::new();
+    std::fs::create_dir_all(blocked.copy().join("stray")).unwrap();
+    let mut real = blocked.real(false);
+    let refused = step_one_fetch(&mut real).unwrap_err();
+    assert!(refused.could_not_run, "{refused:?}");
+    assert!(
+        refused
+            .why
+            .contains("could not place the native publication engine copy"),
+        "{refused:?}"
+    );
+    assert!(!blocked.copy().join(".git").exists());
+}
+
 /// EVERY CHILD OF A REAL RUN IS HANDED THE RELEASE'S ENGINE, AND A BACKEND NAMED THAT COPY RUNS
 /// IT IN PLACE: `PUBLICATION_ENGINE` names the copy for each child (`pub` itself, `ship cut`,
-/// which reads its ledger, `verify`, which reads its baseline), even before step 2 makes it; a
+/// which reads its ledger, `verify`, which reads its baseline), even before step 1 makes it; a
 /// backend named the copy (by hand, or as a release older than the engine handover execs R's
 /// cutter) keeps it and syncs it from its own origin.
 /// NEGATIVE CONTROL: a dry run with no copy hands the checkout it was named.

@@ -11,10 +11,10 @@ mod proposal_conditional;
 pub use proposal_conditional::proposal_conditional_model;
 mod publication_chain;
 pub use publication_chain::publication_chain_model;
-mod native_source;
-pub use native_source::native_source_model;
 mod native_projection;
 pub use native_projection::native_projection_model;
+mod local_source;
+pub use local_source::local_source_model;
 mod catalog_admission;
 pub use catalog_admission::catalog_admission_model;
 mod physical_contributor;
@@ -88,6 +88,8 @@ mod vault_network_refresh;
 pub use vault_network_refresh::vault_network_refresh_model;
 mod table_recovery;
 pub use table_recovery::table_recovery_model;
+mod writer_succession;
+pub use writer_succession::writer_succession_model;
 mod recovery_decision;
 pub use recovery_decision::recovery_decision_model;
 mod recovery_dispatch;
@@ -112,6 +114,8 @@ mod alab_journal;
 pub use alab_journal::alab_journal_model;
 mod storage_release;
 pub use storage_release::storage_release_model;
+mod shared_file;
+pub use shared_file::{SHARED_FILE_LAWS, shared_file_model};
 
 /// Bounded executions of the durable fixed-share reservation API. Initial pins
 /// are assumed coherent across consumers; this model grants no provider access.
